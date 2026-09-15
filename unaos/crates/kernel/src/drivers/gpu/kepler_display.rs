@@ -474,7 +474,7 @@ pub unsafe fn takeover_display(
     // this line — the draw, the hold, the register dumps — is untouched.
     let repainted = crate::video::fbcon::panel_console_resume();
     serial_println!(":: kdisp: console-repaint rows={} ::", repainted);
-    kdisp_phase!("panel_console_resume");
+    kdisp_phase!("panel_console_resume"); #[cfg(all(feature = "nvidia-kepler", feature = "beam"))] beam_probe(bar0); // BEAMX86 (rmbp A5) — the beam source's ONE call site, folded onto this line so the knob-off image cannot shift. Strictly AFTER the console resume (the head is repointed, the pattern cleared, the surface settled, so the raster this samples is the one presents will be ordered against) and strictly BEFORE the compositor activation below, so the first window present is already bracketed. Read-only and bounded: 4 heads x 45 ms = 180 ms, every head sampled even after one ARMS, because a NONE that names only the chosen head is not diagnosable from a flight log and the per-head census is what makes it so. Negligible beside the 1.12 s x5 `fb-draw hold` this same function already spends.
 
     // WC-X86 seam. Strictly AFTER the console resume above, and for the same reason the console
     // resume is strictly after the calibration draw: this is the first line at which the panel is
@@ -504,6 +504,205 @@ pub unsafe fn takeover_display(
 #[inline]
 fn is_live(val: u32) -> bool {
     val != 0 && val != 0xFFFFFFFF && (val & 0xFFF00000) != 0xBAD00000
+}
+
+// ── BEAMX86 (rmbp A5) — the x86 beam source ───────────────────────────────────────────────────────
+//
+// THE DEFECT. `video/beam.rs` is the tearing FIX and it is already written: every panel present is
+// bracketed against the raster position, and `[wc-h]/[wc-k]/[strip] torn=` becomes the OBSERVED beam
+// crossing instead of the duration predicate that read 0 while the panel tore. The whole mechanism
+// hangs off ONE arch hook, `crate::arch::scanout_beam() -> Option<(vline, vtotal)>`, and on x86 that
+// hook was a constant `None` — so on the rMBP the bracket folded to a no-op and the shell window
+// tore under `storm` (`[wc-h] win=2 torn=111 banded=13085`, flight 6 boot 1). The Orin answers the
+// same hook from `display_tegra::beam_probe`; this is its x86 twin, and it is deliberately the SAME
+// SHAPE — probe once at boot, validate BEHAVIOURALLY, publish through a single gate word, and read
+// one register per call at runtime.
+//
+// THE REGISTER, and its cleanroom provenance. `HEAD_STAT` — envytools/rnndb/display/g80_pdisplay.xml
+// line 647: offset 0x6000, stride 0x800, length 4 (GK104-). `+0x340` is VERT, `vline[15:0]` and
+// `vblank_count[31:16]`; `+0x344` is HORZ. The read-only decode above (`:: kdisp: head[h] stat`)
+// already reads exactly this word on all four heads, and the `fb-draw head-stat` dump at :436 exists
+// because the LIVE head is the one whose vline/vblank ADVANCES — which is the test this probe
+// automates. Register names and offsets from rnndb only; no nouveau code was read or transcribed.
+//
+// WHERE `vtotal` COMES FROM, and why it is SAMPLED. rnndb cites no lines-per-frame register in this
+// bank, and the only raster-shaped word this file knows about is a VALUE match in the known-value
+// scan above (`0x07380BAF | 0x0BAF0738 => "raster"`) at an offset that is discovered at runtime, not
+// cited — reading it would be a blind read from an uncited address, which this module's standing
+// rules forbid. So `vtotal` is MEASURED the way the Orin's probe measures it: sample VERT across at
+// least two frames and take `max(vline) + 1`. The head's EVO `SIZE` readback is recorded on the same
+// witness line so the flight can cross-check the two (they must agree to within the vblank rows —
+// SIZE is the ACTIVE raster, `vtotal` the total, so `vtotal >= size_half` is the expected relation,
+// never equality). A zero-compare is never a verdict: the probe ARMS only if the line counter was
+// seen to ADVANCE and `vblank_count` was seen to CHANGE, so two identical samples give NONE, not
+// `vtotal = 1`.
+//
+// KNOB-OFF. Every item below is `all(nvidia-kepler, beam)`-gated and APPENDED AT THE FILE TAIL, so
+// neither `./arroyo knoboff beam` nor `./arroyo knoboff nvidia-kepler` can see a line shift from it;
+// the single call site is folded onto an existing statement line inside `takeover_display`.
+
+/// BEAMX86 — absolute VA of the LIVE head's `HEAD_STAT.VERT` word, or 0 until (unless) the probe
+/// ARMED one this boot. This is the ONLY gate `scanout_beam` needs, and it is published LAST.
+#[cfg(all(feature = "nvidia-kepler", feature = "beam"))]
+static BEAM_VERT_VA: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// BEAMX86 — lines per frame as the probe measured it (the highest vline seen, plus one).
+#[cfg(all(feature = "nvidia-kepler", feature = "beam"))]
+static BEAM_VTOTAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// BEAMX86 — the probe runs ONCE per boot, verdict or no verdict. A second call is a no-op and
+/// prints nothing (the witness line is the single-shot record of what this boot found).
+#[cfg(all(feature = "nvidia-kepler", feature = "beam"))]
+static BEAM_PROBED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// BEAMX86 — `HEAD_STAT` base, PDISPLAY-relative (g80_pdisplay.xml:647).
+#[cfg(all(feature = "nvidia-kepler", feature = "beam"))]
+const BEAM_OFF_HEAD_STAT: usize = 0x6000;
+/// BEAMX86 — per-head stride of the `HEAD_STAT` bank.
+#[cfg(all(feature = "nvidia-kepler", feature = "beam"))]
+const BEAM_HEAD_STRIDE: usize = 0x800;
+/// BEAMX86 — `VERT` within a head's `HEAD_STAT`: `vline[15:0]`, `vblank_count[31:16]`.
+#[cfg(all(feature = "nvidia-kepler", feature = "beam"))]
+const BEAM_OFF_VERT: usize = 0x340;
+/// BEAMX86 — GK104 head count, the same four this file's read-only decode already walks.
+#[cfg(all(feature = "nvidia-kepler", feature = "beam"))]
+const BEAM_HEADS: usize = 4;
+/// BEAMX86 — sampling window per head, in ms: 2.7 frames at 60 Hz, so a raster wraps at least twice.
+#[cfg(all(feature = "nvidia-kepler", feature = "beam"))]
+const BEAM_SAMPLE_MS: u64 = 45;
+/// BEAMX86 — hard iteration cap per head. `crate::arch::ms()` is the APIC tick; if it were ever
+/// stopped when this ran, a pure time-budget loop would spin forever inside the takeover. The cap
+/// makes the probe BOUNDED by construction and the `samples=` field says which bound ended it.
+#[cfg(all(feature = "nvidia-kepler", feature = "beam"))]
+const BEAM_SPIN_CAP: u32 = 8_000_000;
+
+/// BEAMX86 — find and ARM the Kepler head's raster-position register. Called ONCE from
+/// `takeover_display`, after `panel_console_resume` (the head is repointed, the pattern cleared and
+/// the console re-homed, so the head is known-good and scanning) and BEFORE the compositor is
+/// activated, so the very first present is already bracketed. READ-ONLY: every access below is
+/// `mmio_read`; there is no `mmio_write` in this function. Prints exactly one `:: BEAMX86:` line.
+///
+/// # Safety
+/// `bar0` must be the mapped BAR0 base this module's other reads already use.
+#[cfg(all(feature = "nvidia-kepler", feature = "beam"))]
+pub unsafe fn beam_probe(bar0: usize) {
+    use core::sync::atomic::Ordering;
+    if BEAM_PROBED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    // The panel's row count, for the sanity test below. `None` (no GOP info) drops the test rather
+    // than the probe: a raster that advances and wraps is still a raster.
+    let panel_h = crate::video::fbcon::current_info()
+        .map(|i| i.height as u32)
+        .unwrap_or(0);
+
+    // Per-head census, kept so the ONE witness line can say what every head did — a NONE that names
+    // only the chosen head is not diagnosable from a flight log.
+    let mut c_adv = [0u32; BEAM_HEADS];
+    let mut c_vbd = [0u32; BEAM_HEADS];
+    let mut chosen: Option<(usize, u32, u32, u32, u32, u32, u32)> = None; // head, vtotal, samples, vbd, max, adv, evo_size
+
+    for head in 0..BEAM_HEADS {
+        let vert_off = regs::NV_PDISPLAY_BASE + BEAM_OFF_HEAD_STAT + head * BEAM_HEAD_STRIDE + BEAM_OFF_VERT;
+        let first = mmio_read(bar0, vert_off);
+        // NOT `is_live`: a VERT of literal 0 is a legal reading (line 0 of frame 0). Only the
+        // unmapped patterns disqualify a head before it is sampled.
+        if first == 0xFFFF_FFFF || (first & 0xFFF0_0000) == 0xBAD0_0000 {
+            continue;
+        }
+        let mut prev = first & 0xFFFF;
+        let mut max = prev;
+        let mut vb_last = (first >> 16) & 0xFFFF;
+        let (mut adv, mut vbd, mut samples, mut spins) = (0u32, 0u32, 0u32, 0u32);
+        let t0 = crate::arch::ms();
+        loop {
+            if crate::arch::ms().wrapping_sub(t0) > BEAM_SAMPLE_MS {
+                break;
+            }
+            spins = spins.saturating_add(1);
+            if spins >= BEAM_SPIN_CAP {
+                break;
+            }
+            let w = mmio_read(bar0, vert_off);
+            samples = samples.saturating_add(1);
+            let v = w & 0xFFFF;
+            let vb = (w >> 16) & 0xFFFF;
+            if vb != vb_last {
+                vbd = vbd.saturating_add(1);
+                vb_last = vb;
+            }
+            if v > prev {
+                adv = adv.saturating_add(1);
+            }
+            if v > max {
+                max = v;
+            }
+            prev = v;
+            core::hint::spin_loop();
+        }
+        c_adv[head] = adv;
+        c_vbd[head] = vbd;
+        if chosen.is_some() {
+            continue;
+        }
+        let vtotal = max.saturating_add(1);
+        // THE VERDICT TEST. The line counter must have been seen to climb (`adv`), the frame counter
+        // must have been seen to tick at least twice (`vbd` — two frames is the brief's floor and is
+        // what makes `max` a whole-frame maximum rather than a partial sweep), the derived total must
+        // be a real number of lines, and — when a panel height is known — it must cover the panel and
+        // not exceed four times it. Any one of these failing leaves this head unarmed.
+        if adv > 0
+            && vbd >= 2
+            && vtotal > 1
+            && (panel_h == 0 || (vtotal >= panel_h && max < panel_h.saturating_mul(4)))
+        {
+            // EVO core SIZE for this head — the same candidate-A word the read-only decode above
+            // reads (`evo_base + 0x8`), recorded for the register-vs-sampled cross-check.
+            let evo_size = mmio_read(bar0, regs::NV_PDISPLAY_BASE + 0x400 + head * 0x300 + 0x60 + 0x8);
+            chosen = Some((head, vtotal, samples, vbd, max, adv, evo_size));
+        }
+    }
+
+    if let Some((head, vtotal, samples, vbd, max, adv, evo_size)) = chosen {
+        BEAM_VTOTAL.store(vtotal, Ordering::Relaxed);
+        // Published LAST, with Release: it is the gate `scanout_beam` reads, and a reader that sees
+        // a non-zero address must also see the vtotal above.
+        BEAM_VERT_VA.store(bar0 + regs::NV_PDISPLAY_BASE + BEAM_OFF_HEAD_STAT + head * BEAM_HEAD_STRIDE + BEAM_OFF_VERT, Ordering::Release);
+        serial_println!(
+            ":: BEAMX86: head={} vtotal={} samples={} vblank_delta={} -> ARMED :: max_vline={} adv={} panel_h={} evo_size={:08X} size_hi={} size_lo={} sample_ms={} census_adv=[{},{},{},{}] census_vbd=[{},{},{},{}] — vtotal is SAMPLED (max vline + 1 over {} ms, rnndb cites no lines-per-frame register in HEAD_STAT); evo_size is the ACTIVE raster readback, so vtotal >= the matching half by the vblank rows is the expected relation, never equality. arch::scanout_beam() now answers and every panel present is bracketed. READ-ONLY: writes=0 ::",
+            head, vtotal, samples, vbd, max, adv, panel_h, evo_size,
+            (evo_size >> 16) & 0xFFFF, evo_size & 0xFFFF, BEAM_SAMPLE_MS,
+            c_adv[0], c_adv[1], c_adv[2], c_adv[3],
+            c_vbd[0], c_vbd[1], c_vbd[2], c_vbd[3],
+            BEAM_SAMPLE_MS,
+        );
+    } else {
+        serial_println!(
+            ":: BEAMX86: head=none vtotal=0 samples=0 vblank_delta=0 -> NONE :: panel_h={} sample_ms={} census_adv=[{},{},{},{}] census_vbd=[{},{},{},{}] — no head's VERT behaved as a raster (the line counter must CLIMB and vblank_count must tick twice inside {} ms; two identical samples is NONE, never vtotal=1). arch::scanout_beam() stays None for this boot, no present is held, and torn= stays the duration predicate. READ-ONLY: writes=0 ::",
+            panel_h, BEAM_SAMPLE_MS,
+            c_adv[0], c_adv[1], c_adv[2], c_adv[3],
+            c_vbd[0], c_vbd[1], c_vbd[2], c_vbd[3],
+            BEAM_SAMPLE_MS,
+        );
+    }
+}
+
+/// BEAMX86 — the raster position, `(vline, lines_per_frame)`, or `None` until (unless) `beam_probe`
+/// ARMED a head this boot. ONE `read_volatile`, no lock, no print, no allocation: this is called
+/// from the compositor's IRQ-masked present path at polling rate.
+#[cfg(all(feature = "nvidia-kepler", feature = "beam"))]
+#[inline]
+pub fn scanout_beam() -> Option<(u32, u32)> {
+    use core::sync::atomic::Ordering;
+    let va = BEAM_VERT_VA.load(Ordering::Acquire);
+    if va == 0 {
+        return None;
+    }
+    let vt = BEAM_VTOTAL.load(Ordering::Relaxed);
+    // SAFETY: `va` was computed from the BAR0 base this module's reads already use and published by
+    // `beam_probe` only after that very word was read repeatedly and behaved as a raster counter;
+    // this is a read.
+    let v = (unsafe { core::ptr::read_volatile(va as *const u32) }) & 0xFFFF;
+    Some((v.min(vt.saturating_sub(1)), vt))
 }
 
 

@@ -3595,9 +3595,27 @@ KERNEL_CFG_MATRIX=(
   # carries the ARMED polarity under type-check (every default leg carries the disarmed one), and
   # naming it on a literal x86 leg is what puts the `UNAOS_BAR1EXP` knob under the KNOB→BUILDER
   # WIRING CHECK below.
+  # BEAMX86 (rmbp A5, appended 2026-09-15): `beam` is APPENDED at the end, and it is the first time
+  # this knob appears on an x86 leg at all. Until now `beam` was named ONLY by `arm-tegra-jd1dc-beam`,
+  # which makes it "aarch64-only" by `x86_cfg_universe`'s rule ("named by an arm-* leg and NOT by any
+  # x86-* leg") — so it was SUBTRACTED from the mix universe and no x86 compile anywhere carried it.
+  # That was correct while `arch/x86_64/mod.rs::scanout_beam` was a constant `None`; it is a hole now
+  # that the x86 arm calls `kepler_display::scanout_beam`, because the ARMED configuration this leg
+  # describes — `nvidia-kepler` + `beam`, which is exactly what the flight line
+  # `UNAOS_KEPLER=1 … UNAOS_BEAM=1 ./arroyo esp-x86` builds — would have been type-checked by nothing.
+  # It belongs on THIS leg rather than a leg of its own (the `x86-vsyncpace` shape) because the shipped
+  # rMBP desktop carries it: x86-all already has `nvidia-kepler,nvidia-kepler-takeover,wc,witness`, so
+  # naming `beam` here compiles the probe, the arch arm AND the `wcg`/`wm`/`strip` bracket consumers in
+  # one leg, by construction rather than by an index-derived mask. The two DEFAULT legs still carry the
+  # disarmed polarity (constant `None`, `video::beam`'s inline const twins), so both polarities of every
+  # `#[cfg]` in the family are compiled.
+  # UNIVERSE SIDE EFFECT, stated because this one is NOT none (unlike `wcdvalve`'s): `beam` was
+  # arm-named-only, so naming it here ADDS it to `x86_cfg_universe` (+1 feature). The derived mix-leg
+  # count is the smallest n with C(n, n/2) >= N and does not move for this: C(9,4) = 126 still covers
+  # it. Read the live board/mix counts on `./arroyo check`'s own summary line, never from this prose.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the

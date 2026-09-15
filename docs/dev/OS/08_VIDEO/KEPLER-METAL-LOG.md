@@ -8,6 +8,58 @@ QEMU behavior. Newest sitting first.
 > in [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) (R19; rmbp-ledger B10). This file stays the
 > per-sitting narrative; the register is the verdict table.**
 
+## PENDING METAL — BEAMX86 (rmbp ledger A5, `fixed-unflown`): does the Kepler head's `VERT` behave as a raster?
+
+**Nothing below is a metal fact yet.** It is the witness the next flight scores, written down before
+the flight so the scoring cannot drift into the reading. Build knob: add `UNAOS_BEAM=1` to the flight
+line (it joins `UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1 UNAOS_WC=1`; `beam` alone does nothing on x86
+because the probe lives inside `kepler_display::takeover_display`).
+
+**THE ONE LINE TO SCORE**, printed exactly once, from inside `takeover_display` after
+`:: kdisp: console-repaint rows=` and before the `wc` activation:
+
+```
+:: BEAMX86: head=<h> vtotal=<n> samples=<k> vblank_delta=<d> -> ARMED ::
+     max_vline=… adv=… panel_h=… evo_size=… size_hi=… size_lo=… sample_ms=45
+     census_adv=[…,…,…,…] census_vbd=[…,…,…,…] …
+```
+
+* `-> ARMED` means one head's `HEAD_STAT.VERT` (`NV_PDISPLAY_BASE + 0x6000 + head*0x800 + 0x340`,
+  `vline[15:0]` / `vblank_count[31:16]`, g80_pdisplay.xml:647) was seen to CLIMB and its
+  `vblank_count` to tick at least twice inside 45 ms, and `vtotal = max(vline) + 1` cleared the panel
+  height. `arch::scanout_beam()` then answers and every panel present is bracketed.
+* `-> NONE` is a real answer, not a failure to run: the `census_adv`/`census_vbd` arrays say what
+  each of the four heads did, so a NONE is diagnosable from the log alone. Two identical samples give
+  NONE, never `vtotal=1`.
+
+**The three numbers this flight owes, in order of what they settle:**
+
+1. **`vtotal` vs `evo_size`.** `vtotal` is SAMPLED, because rnndb cites no lines-per-frame register
+   in this bank — the only raster-shaped word this file knows of (`0x07380BAF`/`0x0BAF0738`, the
+   `"raster"` key in the known-value scan) sits at an offset discovered by VALUE, not cited, and this
+   module does not read uncited addresses. `evo_size` is the head's EVO `SIZE` readback
+   (`0x610400 + head*0x300 + 0x60 + 0x8`) carried on the same line for cross-check. Expected relation
+   is `vtotal >= the matching half of evo_size`, by the vblank rows — NEVER equality. If `vtotal` is
+   BELOW both halves, the sampled window did not cover a whole frame and the number is not a vtotal.
+   Sitting #4's `size=078004FE` was read from the OTHER candidate block (`0x616100`, stride
+   collapsing, all four heads identical) and is not the word this line prints; do not compare them.
+2. **Which head, and whether it is the panel's.** `head=` here is the head whose counter MOVES, which
+   is not necessarily `found_head` (the head whose scanout address MATCHED). If they differ, that is
+   a fact worth its own sitting. The standing caveat from sitting #5 — that the panel may be the
+   iGPU's and Kepler display takeover a dead end on this box — is the reason the probe is bolted to
+   the END of `takeover_display`: it cannot run on a boot where the takeover declined, so an `ARMED`
+   line is also evidence that a Kepler head is driving the surface presents go to.
+3. **`[wc-h] torn=` under `storm`, which is the actual verdict.** Baseline is F6 boot 1:
+   `[wc-h] win=2 torn=111 banded=13085`, with the eight vug windows at torn 3–10. With `-> ARMED`,
+   `torn=` stops being the duration predicate and becomes the OBSERVED beam crossing (`beam=obs` on
+   the rollup), and the shell window's count is expected to COLLAPSE toward the vug windows' range.
+   A `-> ARMED` line with `torn=` unchanged is the interesting failure: it would mean the counter
+   that advances is not the raster the panel scans from.
+
+**Control that must accompany the flight image** (the probe cannot run in QEMU — q35 has no Kepler,
+so a q35 log with zero `BEAMX86` lines proves nothing about the code being present):
+`LC_ALL=C grep -a -o -F 'BEAMX86' target/x86_64_esp/kernel.elf | wc -l` on the flight artifact.
+
 ## Sitting #43 (GR25 Boot A, capture `~/unaos-bench/capture/gr25-bootA/ttyUSB0.log`) — two ladder gates answered, and CE-LADDER armed
 
 Design of record for the copy-engine work: `~/unaos-bench/scratch/gr24/CE-LADDER-draft.md`
