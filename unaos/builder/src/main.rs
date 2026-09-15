@@ -505,6 +505,16 @@ fn main() {
     // knob armed only in arroyo ships the rung absent while the banner says otherwise —
     // the s42/INSTGUI failure, and the reason this leg is not optional.
     if std::env::var("UNAOS_IVB3D").is_ok() { feats.push("gen7"); }
+    // GEN7-3D R8: UNAOS_IVB3D_R8=1 arms the framebuffer-geometry BCS blit — the rung after R7's
+    // metal-verified 16x16 blit (drivers/gpu/gen7.rs, `mod r8`). It runs only on a boot whose R7
+    // verdict is `r7-blit-verified`, writes nothing into the panel (the destination is CPU-readable
+    // scratch at the framebuffer's pitch; the Kepler owns the panel), and captures/restores/re-reads
+    // every register it touches. `gen7` is pushed alongside because the banner and the artifact must
+    // agree — cargo would resolve the implication anyway, but the `⚡ kernel features:` line is built
+    // from THIS list, and a banner that omits `gen7` is the BANNERCERT lie. Kept in sync with
+    // arroyo's mapping: the builder REBUILDS the kernel for media, so a knob armed only in arroyo
+    // ships the rung absent while the banner says otherwise — the s42/INSTGUI failure.
+    if std::env::var("UNAOS_IVB3D_R8").is_ok() { feats.push("gen7"); feats.push("gen7r8"); }
     // GMUX-IGD: UNAOS_GMUX_IGD=1 arms the display-mux switch to the integrated GPU with an
     // unwind-stack restore on the same call stack (round 13 removed the timed auto-revert).
     // Kept in sync with arroyo's mapping — the builder rebuilds the kernel, so a knob
