@@ -788,15 +788,101 @@ Three properties, each load-bearing:
 * **Bounded anyway.** `drain_into`'s slot guard bounds the loop at `SLOTS` + 1 iterations, so "every
   staged line" is a finite statement, and `raw_write_str`'s TX-ready poll is itself bounded — a machine
   whose UART never drains degrades rather than hanging the shutdown.
-* **Raw, not `serial_println!`.** The witness must not be able to take the very branch it reports on.
-  `raw_write_str` acquires nothing (it is the WEDGE-2 / panic primitive), so the bytes are on the wire
-  before the next instruction, which at these call sites is the SMC.
+* **Raw, but the whole SINK SET** (SINKDRAIN, 2026-09-15). The witness must not be able to take the
+  very branch it reports on, so this never re-enters `_print` and takes none of `_print`'s locks —
+  but see the subsection below: until SINKDRAIN "raw" also meant *one arch port*, which is a far
+  narrower claim than "everywhere `_print` goes", and on one board it meant nowhere at all.
 
 `lines=0` and a missing line are different facts, which is the point of printing the count: an empty
 ring says so, and a capture with no `ring drained` line at all says the machine died before this point.
 
 The Pi arms get the drain too. They do not power anything off — they print an honest refusal and park
 in `hlt_loop` — and a park is likewise a context with no next print.
+
+### SINKDRAIN — the drain's sink is `_print`'s SINK SET, not one arch port
+
+Trunk queue §5 (2026-09-15, RBTDRAIN's finding, measured on the cable); `rmbp-ledger` A3.
+
+`power_drain` emptied the ring into `arch::serial::raw_write_str` — on x86 the 16550 at 0x3F8 and
+nothing else — and wrote its own tally through that same single port. **`_print` does not write to
+one sink.** On x86 it writes to the UART *and* to the FTDI mirror ring (`arch/x86_64/serial.rs`'s
+`ftdi::mirror` tap), and the 2012 rMBP has no 16550, so that cable is the machine's only console. On
+that board a line DEFERRED into the staging ring under contention was therefore CONSUMED by the power
+verb into a port that does not exist — before any FTDI flush could carry it — and
+`[pwrreboot] ring drained lines=N` never reached a human either. PWRDRAIN and S5DRAIN are both correct
+and both a no-op for that reader: they prove the ring is EMPTIED and say nothing about WHICH SINKS
+received it, and that second half had never been asserted anywhere.
+
+RBTDRAIN measured the two facts one line apart in one run: the cable's tail carried
+`[pwrreboot] reboot verb invoked …` and `[pwrreboot] ftdi flushed bytes=210 transfers=4 exhausted=0`
+(both through `_print`), while `[pwrreboot] ring drained lines=0 bytes=0` appeared **only** in
+`target/serial.log`. This is not rMBP-only in principle: any board whose console is not the arch's
+raw port has it.
+
+The fix is `serial_ring::sink_write(s)` — one already-formatted line to every sink `_print` reaches on
+this arch, taking none of `_print`'s locks:
+
+| arch | the sink set `sink_write` writes | why that set |
+| --- | --- | --- |
+| x86_64 | `raw_write_str` (the 16550, where one exists) **and** `xhci::ftdi::mirror` | both are in `arch/x86_64/serial.rs`'s `_print` |
+| aarch64 | `raw_write_str` (PL011 / Tegra 16550) only | that arch's `_print` mirrors to fbcon and the selftest ring, never to this cable |
+
+```
+[pwrshutoff] ring drained lines=61 bytes=4148 mirror=ok
+```
+
+The ` mirror=` field is x86-only, and so is the leg that produces it; the aarch64 tally is the
+pre-SINKDRAIN literal with the pre-SINKDRAIN argument count. `ok` means the mirror took every line of
+this drain, `SKIPPED` means at least one could not be placed — a delta across the drain, never a boot
+total, because a tally reading `SKIPPED` for a line lost an hour earlier is not actionable.
+
+Three things make this safe on a path whose next statement is the SMC:
+
+* **`ftdi::mirror`, not a private copy of its body.** That function already carries, audited, every
+  discipline this call site needs: `try_lock` ONLY (a power path can never block on it, and the mirror
+  can never invert against the primary wire), its own bounded fallback (stage into the tap's
+  `LineRing`, then one free retry at the ring), and its own tap accounting, so a line it cannot place
+  is COUNTED rather than lost in silence — which is what lets the tally say `SKIPPED` as a measurement
+  instead of an assumption. A second spelling of a contended-sink policy is how two divergent policies
+  happen; SERWIT-1B PARITY above is this module's own scar from exactly that.
+* **It cannot loop.** `mirror` never calls `_print` and never touches the staging ring. A drained line
+  re-submitted to `_print` would be re-staged into the ring it was just drained out of.
+* **The raw UART still runs first, unconditionally.** Nothing that used to reach the wire stops
+  reaching it; where there is no 16550 that leg is the bounded TX-ready poll it always was.
+
+The mechanism is UNGATED — transport correctness, not an instrument, in every build of both arches
+(the LOCKFIX / S5DRAIN / RBTDRAIN precedent). Only the witness is behind `witness`.
+
+#### The fixture, and why PWRDRAIN could not have caught this
+
+`serial_ring::sinkdrain_selftest`, x86, one-shot on `mirror_service` and last of the four. It stages
+`SINKDRAIN_FILL` lines each carrying the token `SINKDRAIN-CABLE`, calls
+`power_drain("sinkdrain-test")` with the firmware call left off, and then **asks the cable's ring what
+it received** — `ftdi::peek_recent`, the capture ring's existing `try_lock`-only, non-consuming read
+path, which returns the newest bytes. The fixture runs on the x86 BSP main loop, so no `drain_ftdi`
+pass can intervene between the drain and the peek, and `None` from `peek_recent` is read as "busy"
+and retried under a bound, never as "empty".
+
+```
+:: SINKDRAIN: staged=8 drained=8 on_cable=8 — a power verb's drain reaches `_print`'s SINK SET … -> PASS ::
+```
+
+It deliberately has **no `uart_absent()` SKIP**, unlike DRAINCAP, SERWIT-1B and PWRDRAIN. Those skip
+because a machine with no 16550 never stages (SERWIT-1D) and they have nothing to exercise; this one
+is the opposite case by construction, because the board with no 16550 is the board the defect is
+about. It stages directly rather than through `_print`, so it runs identically in both configurations,
+and on the rMBP it is the only fixture in this file that can go red for the right reason. The cost is
+stated rather than discovered: a staged-and-drained line charges `EMITTED`, which SERWIT-1D's
+`emitted == 0` clause forbids on that board — harmless, because `serwit_verdict`'s window closes during
+the boot fixtures while this runs on entry to the main loop. PWRDRAIN and S5DRAIN charge `EMITTED` the
+same way, and have since SO31.
+
+**The go-red** is to delete the `ftdi::mirror` leg from `sink_write`, i.e. the tree exactly as it stood
+before this change. It compiles; the lines and the tally still leave through the 16550 and still empty
+the ring, so **PWRDRAIN and S5DRAIN stay green** — that they cannot see the mutation is the whole
+reason this fixture exists — while SINKDRAIN reads `on_cable=0 tally_on_cable=false` and prints
+`-> FAIL`, which mbench's `DEFAULT_FORBIDS` turns into a non-zero exit from
+`UNAOS_USBSERIAL=1 UNAOS_WC=1 ./arroyo test`.
 
 ### The fixture
 

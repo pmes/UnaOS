@@ -766,10 +766,10 @@ const _: () = assert!(
 //   * **Bounded anyway.** `drain_into`'s slot guard bounds the LOOP at [`SLOTS`] + 1 iterations, so
 //     "every staged line" is a finite statement, and the arch's TX-ready poll under `raw_write_str` is
 //     itself bounded — a machine whose UART never drains degrades instead of hanging the shutdown.
-//   * **Raw, not `serial_println!`.** The witness must not be able to take the very branch it is
-//     reporting on. `raw_write_str` acquires nothing (it is the WEDGE-2 / panic primitive), so the
-//     line is synchronously on the wire before the next instruction runs — which, at these call
-//     sites, is the SMC.
+//   * **Raw, but the WHOLE SINK SET** (SINKDRAIN). The witness must not be able to take the very
+//     branch it is reporting on, so this never re-enters `_print` — but "raw" used to mean ONE arch
+//     port, and a board whose console is not that port (the rMBP: no 16550, the console is the FTDI
+//     cable) got nothing at all. [`sink_write`] is the fix: every sink, none of `_print`'s locks.
 //
 // The witness is `[pwrreboot]` / `[pwrshutoff]`, `power.rs`'s own families, subsystem-named and never
 // board-named (`docs/dev/LAWS.md` §3). Both tokens are 11+ bytes with their brackets, so they survive
@@ -779,20 +779,20 @@ const _: () = assert!(
 /// Flush the whole staging ring at a power verb, then say what was flushed. `tag` is the caller's
 /// witness family without brackets (`"pwrshutoff"`, `"pwrreboot"`).
 ///
-/// Emits `[<tag>] ring drained lines=N bytes=M` through the same raw writer, so the reader of a
-/// capture can tell "the ring was empty" (`lines=0`) from "the ring held 61 lines and they made it"
-/// — and, if that line is itself missing from a capture, that the machine died before this point.
+/// Emits `[<tag>] ring drained lines=N bytes=M` (x86 also ` mirror=ok|SKIPPED`) through the same
+/// SINK SET, so the reader of a capture can tell "the ring was empty" (`lines=0`) from "it held 61
+/// lines and they made it" — and, if that line is missing, that the machine died before this point.
 ///
 /// Returns the same `(lines, bytes)` it printed, so [`pwrdrain_selftest`] can assert on the numbers
 /// rather than on the shape of a string. The power verbs ignore it: past their call site there is no
 /// code left to react.
 pub fn power_drain(tag: &str) -> (u64, usize) {
     let mut lines = 0u64;
-    let mut bytes = 0usize;
+    let mut bytes = 0usize; let _mirror0 = mirror_dropped(); // SINKDRAIN: the mirror's loss ledger BEFORE this drain, so the tally below reports what the added sink actually took rather than asserting it.
     drain(|s| {
         lines += 1;
         bytes += s.len();
-        crate::arch::serial::raw_write_str(s);
+        sink_write(s);
     });
     // Marker-sized scratch, not slot-sized: the same reasoning as [`MARKER_LEN`], and this frame sits
     // on the stack of a verb that is about to hand the machine to the firmware.
@@ -803,12 +803,12 @@ pub fn power_drain(tag: &str) -> (u64, usize) {
         n: 0,
         truncated: false,
     };
-    let _ = write!(w, "[{}] ring drained lines={} bytes={}\n", tag, lines, bytes);
+    #[cfg(target_arch = "x86_64")] let _ = write!(w, "[{}] ring drained lines={} bytes={} mirror={}\n", tag, lines, bytes, mirror_note(_mirror0)); #[cfg(not(target_arch = "x86_64"))] let _ = write!(w, "[{}] ring drained lines={} bytes={}\n", tag, lines, bytes); // SINKDRAIN — the aarch64 spelling is the PRE-SINKDRAIN one, literal for literal and argument for argument, because that arch's `_print` sink set is the UART alone: there is no mirror to report and nothing in this line may move. Both statements ride ONE physical line so no `panic::Location` below shifts on either arch.
     let n = w.n;
     if let Ok(s) = core::str::from_utf8(&buf[..n]) {
         // Deliberately NOT counted in `EMITTED`, for the same reason `report_losses`' marker is not:
         // nobody submitted it, and counting it would corrupt the conservation law.
-        crate::arch::serial::raw_write_str(s);
+        sink_write(s);
     }
     (lines, bytes)
 }
@@ -1695,7 +1695,7 @@ pub fn mirror_service() {
     // PWRDRAIN (SO31 part 3) — the power-verb full drain. Same one-shot call site and same contract;
     // it is last because it deliberately fills the ring to SLOTS and then empties it completely, and
     // a fixture that leaves the ring as it found it should not do so before one that reads it.
-    #[cfg(feature = "witness")] pwrdrain_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] s5drain_selftest(); // S5DRAIN (trunk queue §5, 2026-09-12) — PWRDRAIN's twin for the x86 route that does NOT go through `power.rs`: `video/crystal.rs`'s Shut Down and `video/instgui.rs` call `arch::acpi_power::poweroff()` directly. x86-only because the defect is: on aarch64 the desktop's Shut Down is `power::crystal_shutdown`, which has drained since SO31. Last, and after PWRDRAIN, for PWRDRAIN's own stated reason — it fills the ring to SLOTS and empties it again, so it must not run before a fixture that reads the ring. ⚠ LINE-NEUTRAL append; the body is a FILE-TAIL append, so no `panic::Location` in this file moves.
+    #[cfg(feature = "witness")] pwrdrain_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] s5drain_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] sinkdrain_selftest(); // S5DRAIN (trunk queue §5, 2026-09-12) — PWRDRAIN's twin for the x86 route that does NOT go through `power.rs`: `video/crystal.rs`'s Shut Down and `video/instgui.rs` call `arch::acpi_power::poweroff()` directly. x86-only because the defect is: on aarch64 the desktop's Shut Down is `power::crystal_shutdown`, which has drained since SO31. Last, and after PWRDRAIN, for PWRDRAIN's own stated reason — it fills the ring to SLOTS and empties it again, so it must not run before a fixture that reads the ring. SINKDRAIN (2026-09-15) joins this same physical line for the same reason and runs LAST of all: it fills and empties the ring like the two above it AND then reads the FTDI mirror ring's tail, so anything after it would be measuring that fixture's own traffic. ⚠ LINE-NEUTRAL append; both bodies are FILE-TAIL appends, so no `panic::Location` in this file moves.
 }
 
 /// One-shot: has the SERWIT-2 verdict been emitted yet?
@@ -2367,6 +2367,334 @@ fn s5drain_selftest() {
             want_bytes,
             residue,
             lost
+        );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// SINKDRAIN — a power verb's drain goes to `_print`'s SINK SET, not to one arch port
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Trunk queue §5 (2026-09-15, RBTDRAIN's finding, MEASURED on the cable); `rmbp-ledger` A3; doc
+// `docs/dev/OS/02_KERNEL_CORE/serial_transport.md` §"The power verbs drain first".
+//
+// ### The defect
+// [`power_drain`] emptied the staging ring into `crate::arch::serial::raw_write_str` — on x86 the
+// 16550 at 0x3F8 and NOTHING ELSE — and wrote its own `[<tag>] ring drained lines=N bytes=M` tally
+// through the same single port. `_print` does not write to one sink; on x86 it writes to the UART
+// **and** the FTDI mirror ring (`arch/x86_64/serial.rs`, the `ftdi::mirror` tap), which on the 2012
+// rMBP is the machine's ONLY console. So on that board every line a contended `_print` had DEFERRED
+// into the ring was CONSUMED by the power verb into a port that does not exist, and the witness that
+// was supposed to report the flush went with it. PWRDRAIN (SO31) and S5DRAIN (SO39) are both correct
+// and both a no-op for the reader there: they proved the ring was emptied and said nothing about
+// WHICH SINKS received it — which is the half that had never been asserted anywhere.
+//
+// RBTDRAIN measured the two facts one line apart in one run: the cable's tail carried
+// `[pwrreboot] reboot verb invoked …` and `[pwrreboot] ftdi flushed bytes=210 …` (those go through
+// `_print`), while `[pwrreboot] ring drained lines=0 bytes=0` appeared ONLY in `target/serial.log`.
+//
+// ⚠ NOT rMBP-only in principle: any board whose console is not the arch's raw port has it.
+//
+// ### The fix, and why it is UNGATED
+// [`sink_write`] — one already-formatted line to every sink `_print` reaches on this arch, taking
+// none of `_print`'s locks. This is TRANSPORT CORRECTNESS, not an instrument, so it ships in every
+// build of both arches; the LOCKFIX / S5DRAIN / RBTDRAIN precedent is the same one. Only the witness
+// below is behind `witness`.
+//
+// ### Why `ftdi::mirror` and not a private copy of its body
+// Because that function already carries, audited, every discipline this call site needs, and a second
+// spelling of a contended-sink policy is exactly how two divergent policies happen (SERWIT-1B PARITY
+// is this module's own scar from that). `mirror` is `try_lock`-ONLY, so a power path can never block
+// on it and the mirror can never invert against the primary wire; it drains its own staging ring into
+// the capture ring under that lock; its fallback is bounded (stage into the tap's `LineRing`, then one
+// free retry at the ring) and its failures are COUNTED in [`TAP_FTDI`] rather than lost in silence —
+// which is what lets the tally below say `mirror=SKIPPED` as a measurement instead of an assumption.
+//
+// And it does NOT loop. `mirror` never calls `_print` and never touches THIS module's staging ring;
+// a drained line re-submitted to `_print` would be re-staged into the very ring it was just drained
+// out of, which is the one shape this function may not have.
+//
+// ### aarch64 is untouched, and that is a statement about the sink set
+// `arch/aarch64/serial.rs`'s `_print` mirrors to fbcon and the selftest ring and NEVER to this cable,
+// so on that arch the sink set is the UART alone and parity with `_print` means changing nothing.
+// The mirror leg and the tally's ` mirror=` suffix are both `#[cfg(target_arch = "x86_64")]`, the
+// aarch64 tally is the pre-SINKDRAIN literal with the pre-SINKDRAIN argument count, every mechanism
+// edit in this file was made LINE-NEUTRAL and this whole block is a FILE-TAIL append — so no
+// `panic::Location` on that arch moves. Structural, not measured: no aarch64 image was built here.
+
+/// SINKDRAIN — deliver ONE already-formatted line to the same set of sinks `_print` reaches on this
+/// arch, taking none of `_print`'s locks and never re-entering the staging ring.
+///
+/// The caller is [`power_drain`], i.e. a verb whose next statement is the SMC or the PM1_CNT write.
+/// Everything here is therefore `try_lock`-only or lock-free and bounded; see the block above.
+fn sink_write(s: &str) {
+    // The arch's raw, lock-free, bounded UART primitive — unchanged, and still FIRST. Where a 16550
+    // exists this is the shortest path to a human and the one the panic and WEDGE-2 paths share;
+    // where it does not, it is a bounded TX-ready poll that times out into the void, exactly as it
+    // did before this function existed. Nothing that used to reach the wire stops reaching it.
+    crate::arch::serial::raw_write_str(s);
+    // The FTDI mirror ring — the bench rMBP's ONLY console, and x86-only because it is in `_print`'s
+    // sink set on x86 only. `format_args!("{}", s)` re-presents the already-formatted line as
+    // `Arguments` without a copy and without an allocation; `mirror` pushes it into the capture ring
+    // (or, contended, into its own `LineRing`, which the next acquisition of that ring folds in — and
+    // on a power path that acquisition is RBTDRAIN's `ftdi_flush_sync`).
+    #[cfg(target_arch = "x86_64")]
+    crate::drivers::xhci::ftdi::mirror(format_args!("{}", s));
+}
+
+/// SINKDRAIN — the FTDI mirror's cumulative loss count, so [`power_drain`] can report whether the
+/// sink it gained actually took the lines instead of asserting that it did.
+///
+/// A literal 0 on any arch where that mirror is not in `_print`'s sink set, which is what keeps
+/// [`mirror_note`]'s x86-only spelling honest rather than merely absent.
+#[inline]
+fn mirror_dropped() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        TAP_FTDI.dropped.load(Ordering::Relaxed)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
+/// SINKDRAIN — `ok` when the mirror took every line this drain handed it, `SKIPPED` when at least one
+/// line could not be placed (the capture ring contended AND its staging ring full).
+///
+/// `base` is [`mirror_dropped`] read before the drain, so this is the WINDOW's delta and not a boot
+/// total — a tally that read `SKIPPED` because something lost a line an hour earlier would be an
+/// instrument nobody could act on. The raw UART leg has already run for those lines either way; this
+/// word says which half of the sink set the reader is holding.
+#[cfg(target_arch = "x86_64")]
+fn mirror_note(base: u64) -> &'static str {
+    if TAP_FTDI.dropped.load(Ordering::Relaxed) == base {
+        "ok"
+    } else {
+        "SKIPPED"
+    }
+}
+
+// ── SINKDRAIN, the witness ───────────────────────────────────────────────────────────────────────
+//
+// ### What it exercises, and what makes it different from PWRDRAIN
+// PWRDRAIN fills the ring, calls [`power_drain`] and asserts the ring is EMPTY afterwards. Every one
+// of those clauses is still true on a tree with this defect, because "empty" is a claim about the
+// RING and the defect is about the SINKS. This fixture asserts the other half: it stages lines, calls
+// `power_drain` exactly as a verb does (minus the firmware call — the one statement a fixture may not
+// execute, for PWRDRAIN's stated reason), and then ASKS THE CABLE'S RING what it received.
+//
+// The measurement is `ftdi::peek_recent`, the capture ring's existing read path: `try_lock` only, no
+// mutation, no consumption, so looking does not change what the cable later replays. It returns the
+// NEWEST bytes, and this fixture runs from `mirror_service` — the x86 BSP main loop, IF=1, no locks —
+// so between `power_drain` returning and the peek there is no `drain_ftdi` pass on this core and the
+// newest bytes in that ring are this fixture's own.
+//
+// ### Why there is NO `uart_absent()` SKIP, unlike the three fixtures above it
+// Those three skip on a machine with no 16550 because nothing is ever staged there (SERWIT-1D) and
+// they have nothing to exercise. This one is the opposite case by construction: the board with no
+// 16550 is the board the defect is ABOUT. It stages directly rather than through `_print`, so it runs
+// identically in both configurations, and on the rMBP it is the only fixture in this file that can go
+// red for the right reason. The cost is that a staged-and-drained line charges `EMITTED`, which
+// SERWIT-1D's `emitted == 0` clause forbids on that board — harmless here and stated rather than
+// discovered: `serwit_verdict` is printed during the boot fixtures and this runs on entry to the main
+// loop, so its window has closed. PWRDRAIN and S5DRAIN charge `EMITTED` the same way for the same
+// reason and have since SO31.
+//
+// ### The go-red
+// Delete the `ftdi::mirror` leg from [`sink_write`] — i.e. route the drain back to the raw port only,
+// which is the tree exactly as it stood before this commit. It compiles. The staged lines and the
+// tally still leave through the 16550 and still empty the ring, so PWRDRAIN and S5DRAIN stay green;
+// this fixture reads `on_cable=0 tally_on_cable=false` and prints `-> FAIL`, which mbench's
+// `DEFAULT_FORBIDS` turns into a non-zero exit from `UNAOS_USBSERIAL=1 UNAOS_WC=1 ./arroyo test`.
+// That the other two fixtures cannot see the mutation is the point of this one existing.
+
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static SINKDRAIN_DONE: AtomicBool = AtomicBool::new(false);
+
+/// The token every SINKDRAIN fill line carries. 15 bytes, far past LLVM's <=8-byte immediate
+/// encoding, so `LC_ALL=C grep -a -o -F` finds it in the artifact and `awk 'index($0,…)'` finds it in
+/// a capture; it appears in no other line in the tree, which is what makes counting it in the capture
+/// ring a measurement rather than an estimate.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+const SINKDRAIN_TOKEN: &str = "SINKDRAIN-CABLE";
+
+/// 32 bytes of ballast, so a fill line is wide enough to be a real line and narrow enough that the
+/// whole fill fits the peek window below with room to spare for foreign traffic.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+const SINKDRAIN_PAD: &str = "0123456789ABCDEF0123456789ABCDEF";
+
+/// Lines the fixture stages. Deliberately NOT [`SLOTS`]: this fixture's claim is about SINKS, not
+/// about depth or budget, and a fill that filled the ring would put 4 KiB through the cable's 256 KiB
+/// capture ring on every witness boot for no added evidence.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+const SINKDRAIN_FILL: u64 = 8;
+
+/// Width of one fill line, `"[sinkdrain] fill NN " + TOKEN + " " + PAD + "\n"`: 17 + 2 + 15 + 1 + 32
+/// + 1. Named so the window arithmetic below is checked by the compiler rather than trusted.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+const SINKDRAIN_LINE_LEN: usize = 17 + 2 + 15 + 1 + 32 + 1;
+
+/// How much of the capture ring's tail the fixture reads back. A stack frame on the main loop, so it
+/// is sized to the claim and not padded: the fill plus its tally plus 300 B of slack for whatever
+/// another core printed into the mirror during the drain.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+const SINKDRAIN_PEEK_B: usize = 1024;
+
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+const _: () = assert!(
+    SINKDRAIN_LINE_LEN <= SLOT_LEN,
+    "a fixture fill line must not truncate, or the line the cable is checked for is not the one staged"
+);
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+const _: () = assert!(
+    SINKDRAIN_FILL as usize * SINKDRAIN_LINE_LEN + 128 <= SINKDRAIN_PEEK_B,
+    "the peek window must hold the whole fill AND its tally, or `on_cable` measures the window"
+);
+
+/// Non-overlapping occurrences of `needle` in `hay`. Alloc-free and bounded by `hay.len()`; the
+/// fixture's only reader of the capture ring's bytes.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+fn count_occurrences(hay: &[u8], needle: &[u8]) -> u64 {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return 0;
+    }
+    let mut n = 0u64;
+    let mut i = 0usize;
+    while i + needle.len() <= hay.len() {
+        if &hay[i..i + needle.len()] == needle {
+            n += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
+/// SINKDRAIN, once per boot, x86 only. Called from [`mirror_service`], last of the four.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+fn sinkdrain_selftest() {
+    if SINKDRAIN_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let base_dropped = DROPPED.load(Ordering::Relaxed);
+    let base_mirror_dropped = TAP_FTDI.dropped.load(Ordering::Relaxed);
+    // Start from an empty ring AND a cleared loss-pending count, for PWRDRAIN's reason: `drain` runs
+    // `report_losses`, whose marker would otherwise ride the measured drain. Through `sink_write`, so
+    // the pre-clear does not itself lose a line on a board with no 16550 — which would be this
+    // fixture committing the defect it exists to catch.
+    drain(sink_write);
+
+    let mut staged = 0u64;
+    for i in 0..SINKDRAIN_FILL {
+        // `try_stage` is the exact call `defer_contended` makes when a contended producer defers, so
+        // the ring state this measures IS the contended state and not a model of it. Going through
+        // `defer_contended` itself would need the ring FULL to reach its retry arm, which is
+        // SERWIT-1B's claim, not this one. `note_submitted` for each line that landed, so the
+        // conservation law covers them (a line charged to `EMITTED` with no matching `SUBMITTED` is
+        // the accounting lie SERWIT-1D closed).
+        if try_stage(format_args!(
+            "[sinkdrain] fill {:02} {} {}\n",
+            i, SINKDRAIN_TOKEN, SINKDRAIN_PAD
+        )) {
+            note_submitted();
+            staged += 1;
+        } else {
+            break;
+        }
+    }
+
+    // The measured call — the same one `platform_shutdown` and `acpi_power::s5_ring_flush` make, with
+    // the firmware call left off. The tag is a fixture tag on purpose: `[pwrshutoff]`/`[pwrreboot]`
+    // are `power.rs`'s families and a fixture must not put a verb's witness on the wire.
+    let (drained, bytes) = power_drain("sinkdrain-test");
+
+    // Ask the CABLE'S ring what it received. Bounded retry rather than one shot: `peek_recent`
+    // answers `None` when the capture ring is momentarily held by another core's `mirror`, and `None`
+    // is "busy", never "empty" — reading it as empty would false-fail this gate on ordinary overlap.
+    let mut peek = [0u8; SINKDRAIN_PEEK_B];
+    let mut seen = 0usize;
+    let mut tries = 0u32;
+    loop {
+        if let Some(n) = crate::drivers::xhci::ftdi::peek_recent(&mut peek) {
+            seen = n;
+            break;
+        }
+        tries += 1;
+        if tries >= 1024 {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let on_cable = count_occurrences(&peek[..seen], SINKDRAIN_TOKEN.as_bytes());
+    // The needle carries THIS fixture's tag, and that is a measured requirement rather than a
+    // stylistic one: the first cut of this clause looked for `] ring drained lines=` and the go-red
+    // run scored it TRUE on a tree with the mirror leg deleted — `PWRDRAIN`'s own verdict QUOTES its
+    // witness (`the witness \`[pwrshutoff] ring drained lines=64 …\` is on the wire above this
+    // verdict`) and that verdict reaches the cable through `_print`, not through `power_drain`. A
+    // conjunct satisfied by another line's prose is a constant, and a constant in a PASS predicate is
+    // what `docs/dev/LAWS.md` §5 calls a check that cannot fire. `[sinkdrain-test]` appears in no
+    // other line in the tree, so this one is two-valued: 1 on the green cable, 0 on the go-red's.
+    let tally_on_cable = count_occurrences(&peek[..seen], b"[sinkdrain-test] ring drained lines=") > 0;
+
+    // "Empty" is a claim about the ring, so ask the ring, not the counter — PWRDRAIN's clause, kept
+    // so a regression that broke the drain itself cannot hide behind a green sink clause.
+    let mut residue = 0u64;
+    drain(|s| {
+        residue += 1;
+        sink_write(s);
+    });
+
+    let lost = DROPPED.load(Ordering::Relaxed) - base_dropped;
+    let mirror_lost = TAP_FTDI.dropped.load(Ordering::Relaxed) - base_mirror_dropped;
+    // `drained >= staged` for PWRDRAIN's stated reason (a foreign line can be staged between the fill
+    // loop and the drain, and foreign traffic can only ADD). `on_cable == staged` is strict and is the
+    // claim itself; interference can only make it SMALLER, so this clause can false-fail on an
+    // unlucky run and can never false-pass — the direction LAWS §5 asks for.
+    let pass = staged == SINKDRAIN_FILL
+        && drained >= staged
+        && on_cable == staged
+        && tally_on_cable
+        && residue == 0
+        && lost == 0
+        && mirror_lost == 0;
+
+    if pass {
+        serial_println!(
+            ":: SINKDRAIN: staged={} drained={} on_cable={} — a power verb's drain reaches `_print`'s \
+             SINK SET, not one arch port: {} line(s) staged into the ring went out the raw 16550 AND \
+             landed in the FTDI capture ring ({} B of its tail read back), the tally \
+             `[sinkdrain-test] ring drained lines={} bytes={}` is on the cable too (tally_on_cable={}), \
+             ring EMPTY after (residue={}), 0 dropped on either transport (mirror_lost={}). Before \
+             this, all {} lines and the tally went to 0x3F8 alone — which the bench rMBP does not have \
+             -> PASS ::",
+            staged,
+            drained,
+            on_cable,
+            staged,
+            seen,
+            drained,
+            bytes,
+            tally_on_cable,
+            residue,
+            mirror_lost,
+            staged
+        );
+    } else {
+        serial_println!(
+            ":: SINKDRAIN: FAIL — staged={} drained={} on_cable={} tally_on_cable={} peeked={}B \
+             peek_tries={} residue={} dropped={} mirror_dropped={} -> FAIL ::",
+            staged,
+            drained,
+            on_cable,
+            tally_on_cable,
+            seen,
+            tries,
+            residue,
+            lost,
+            mirror_lost
         );
     }
 }
