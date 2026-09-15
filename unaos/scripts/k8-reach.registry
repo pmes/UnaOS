@@ -36,6 +36,7 @@ UNAOS_INSTGUI              TODO  seeded 2026-09-06; 4 Pi-live cfg site(s)
 UNAOS_IRQSTORAGE           TODO  seeded 2026-09-06; 1 Pi-live cfg site(s)
 UNAOS_IVB                  TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_IVB3D                TODO  seeded 2026-09-06; no Pi-live cfg site
+UNAOS_IVB3D_R8   NA   --evidence: gen7r8 2 sites, 0 Pi-live, 0 negated [implies: gen7, intel-ivb]; both sites are in drivers/gpu/gen7.rs, which carries a file-level `#![cfg(target_arch = "x86_64")]` (gen7.rs:122), so a Pi image never lexes the file. The rung drives the Ivy Bridge IGD's BCS blitter through BAR0 of PCI 0:2.0 — there is no such device on a BCM2711 — and its one call site is the tail of `blit()` (gen7.rs:5663), reached only from `igpu::init` under `all(target_arch = "x86_64", feature = "gen7")` (igpu.rs:660). Its parent UNAOS_IVB3D is the TODO row above.
 UNAOS_JD1DC                TODO  seeded 2026-09-06; 19 Pi-live cfg site(s)
 UNAOS_KDISP_HOLD           TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_KEPLER               TODO  seeded 2026-09-06; 1 Pi-live cfg site(s)
