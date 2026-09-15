@@ -249,14 +249,27 @@ pub fn flush_framebuffer_rows(_addr: usize, _row_len: usize, _rows: usize, _stri
 }
 
 /// BEAM — the scan-out's current raster line and the frame's line count, when this platform can
-/// read one. x86 answers `None`: the Kepler path has a live `VERT` (vline, vblank_count) register
-/// (`drivers/gpu/kepler_display.rs`) that nothing consumes yet, and wiring it is that track's own
-/// arc — `video::beam` folds to a no-op on `None`, so the x86 present path is byte-for-byte what
-/// it was. The signature is the arch-neutral question ("where is the beam"); only the answer is
+/// read one. Kepler with `beam` armed (BEAMX86, rmbp A5): `kepler_display::scanout_beam`, which
+/// answers `Some` only after `kepler_display::beam_probe` ARMED a head at boot — the head of the
+/// `HEAD_STAT` bank whose `VERT` word (`vline[15:0]`, `vblank_count[31:16]`, g80_pdisplay.xml:647)
+/// was OBSERVED to climb and to wrap, with `vtotal` SAMPLED as `max(vline) + 1` — and `None` for the
+/// whole boot otherwise. Every other x86 build answers `None`: the UEFI GOP publishes no raster
+/// position this kernel reads, and QEMU's q35 has no Kepler, so the probe cannot run there.
+/// `video::beam` folds to a no-op on `None`, so those present paths are byte-for-byte what they
+/// were. The signature is the arch-neutral question ("where is the beam"); only the answer is
 /// per-arch, which is why it lives here and not behind a `target_arch` gate in `video/`.
 ///
-/// Appended at the file tail for the reason `flush_framebuffer_rows` states.
+/// Appended at the file tail for the reason `flush_framebuffer_rows` states — and the OFF arm stays
+/// a CONSTANT `None`, which is what keeps `./arroyo knoboff beam` and `./arroyo knoboff
+/// nvidia-kepler` byte-identical.
 #[inline]
 pub fn scanout_beam() -> Option<(u32, u32)> {
-    None
+    #[cfg(all(feature = "nvidia-kepler", feature = "beam"))]
+    {
+        crate::drivers::gpu::kepler_display::scanout_beam()
+    }
+    #[cfg(not(all(feature = "nvidia-kepler", feature = "beam")))]
+    {
+        None
+    }
 }

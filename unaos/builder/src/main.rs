@@ -414,6 +414,19 @@ fn main() {
     // banner claims it is on (the s42/INSTGUI and WXN-M3b failure). Kept in sync with arroyo.
     if std::env::var("UNAOS_KEPLER_CE").is_ok() { feats.push("nvidia-kepler-ce"); }
     if std::env::var("UNAOS_KDISP_HOLD").is_ok() { feats.push("nvidia-kepler-kdisp-hold"); }
+    // BEAMX86: UNAOS_BEAM=1 arms the x86 beam SOURCE — `kepler_display::beam_probe`, which samples
+    // the live head's HEAD_STAT.VERT at the end of the Kepler takeover seam so `arch::scanout_beam()`
+    // answers and `video::beam` stops folding every panel present to a no-op. It sits with the Kepler
+    // family because that is what it needs to REACH its call site: UNAOS_KEPLER +
+    // UNAOS_KEPLER_TAKEOVER, plus UNAOS_WC for the presents it brackets. DEFAULT OFF => the probe and
+    // the arch arm are unlinked and `scanout_beam()` is a constant `None` => byte-identical media.
+    // THIS list is what reaches the kernel binary for MEDIA builds, and the failure mode here is the
+    // nastiest one in this file's collection: the metal witness `:: BEAMX86: … -> ARMED ::` would be
+    // ABSENT FROM THE WIRE, which is indistinguishable from a head that never scanned, so a knob
+    // wired into arroyo alone would not merely disable the fix — it would make the flight read as a
+    // NEGATIVE RESULT about the hardware. Kept in sync with arroyo; `./arroyo check`'s KNOB→BUILDER
+    // WIRING CHECK goes red if this line is dropped.
+    if std::env::var("UNAOS_BEAM").is_ok() { feats.push("beam"); }
     // WC-X86: UNAOS_WC=1 arms the window compositor on the x86 panel path (video/desktop_uefi.rs) — activated
     // at the END of the Kepler takeover seam, after `fbcon::panel_console_resume`. x86_64-only
     // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs
