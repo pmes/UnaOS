@@ -39,7 +39,7 @@
 // verb's own announce can die with it.
 //
 // RBTDRAIN (rmbp-ledger A3, same doc section): PWRDRAIN is only the FIRST of TWO buffers on the 2012
-// rMBP. `power_drain` writes `_print`'s SINK SET through `serial_ring::sink_write` (SINKDRAIN 091a11a6) —
+// rMBP. `power_drain` writes `_print`'s SINK SET via `sink_write` (SINKDRAIN): the 16550 at 0x3F8 — which this
 // laptop does not have — and the FTDI MIRROR RING, and that ring reaches the cable only when the xHCI
 // device-service pass runs. A power verb is a context with no next pass, so on the rMBP the staged
 // lines arrived one buffer short of a human and the whole reboot ladder died there. Every x86 verb
