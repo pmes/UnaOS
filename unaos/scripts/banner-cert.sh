@@ -52,7 +52,28 @@
 #      This script refuses to run with a shorter token registered.
 #   3. Cut the token at the first `{` — `format_args!` splits a format string into the literal
 #      pieces BETWEEN its holes, so only the piece before the first hole is one contiguous string.
-#   4. MEASURE it: build media with the feature armed and
+#   4. NEVER seed from a literal a `const fn` consumes. BANNERCERT2 found `ga10bprobe5` seeded on the
+#      64-hex-character vendor digest at `ga10b_fw.rs:75` — which is the argument to
+#      `const fn hx(s: &str) -> [u8; 32]`, evaluated at COMPILE TIME. Only the 32 decoded bytes reach
+#      the image; the ASCII string never exists in any artifact on any arch, so that row measured 0 on
+#      a build that carried the feature and would have measured 0 forever. A token must be a literal
+#      the RUNNING code prints or compares, not one the compiler folds away.
+#   5. THE ROW'S `cond` MUST NAME THE CALLER'S GATE, not only the module's. Same finding, same row: the
+#      whole `ga10b_fw` module is gated on `ga10bprobe5` alone — and with neither of its two callers
+#      compiled in (`ga10b_ignite`, under `ga10bprobe5a`; the QEMU fixture at `main.rs:1749`, under
+#      `witness`) the linker garbage-collects the module and every byte of its `.rodata` with it. A
+#      feature can be in the cargo feature set, compile, and still put NOTHING in the artifact because
+#      nothing calls it. Seed the cond from the call sites (`grep -rn '<module>::'`), not from the
+#      `pub mod` line.
+#   6. A FEATURE CAN BE COMPILED IN AND ITS LITERAL STILL ABSENT BECAUSE THE CONFIGURATION MAKES THAT
+#      CODE UNREACHABLE — the negated-cond case, and BANNERCERT2 met it on the Pi. `witness`'s token
+#      lives in `kernel_main`'s post-GUI tail; `main.rs:79` declares in its own `cfg_attr` that
+#      `baremetal`, `bootlog`, `usbdebug` and `tegra` each make that tail unreachable, and the
+#      compiler is told so. So a `UNAOS_WITNESS=1 ./arroyo kernel8` image carries the whole witness
+#      battery and CANNOT carry that string — a row with no cond called it a MISSING and would have
+#      red-lined every Pi desktop build. Write the cond as `!baremetal,!bootlog,!usbdebug,!tegra`,
+#      copied from the `cfg_attr` rather than guessed.
+#   7. MEASURE it: build media with the feature armed and
 #      `LC_ALL=C grep -a -o -F -- '<token>' <artifact> | wc -l` must be > 0. Mark the row `measured`.
 #      A row seeded from source reading alone is marked `unmeasured-here` and stays that way until
 #      an artifact for that arch proves it.
@@ -66,9 +87,24 @@
 #           The single word `-` means NO CERTIFYING STRING EXISTS; `cond` then carries the reason.
 #           Such a row prints NOWITNESS — loud, named, counted in the summary, never silent.
 #   cond    comma-separated features that must ALSO be on the banner for the token to exist at all
-#           (the literal sits under a nested cfg). When one is off the row prints UNVERIFIABLE with
-#           the name of the feature that made it so — again loud, never silent. `-` for none.
-#   state   measured | unmeasured-here   (which arch's artifact has actually proven this token)
+#           (the literal sits under a nested cfg, OR its module is dead-stripped unless one of these
+#           compiles a CALLER in — see seeding steps 5 and 6). Commas are AND. Two term forms beyond a bare
+#           name, each added by BANNERCERT2 because a real row needed it:
+#             `a+b`  OR-GROUP — either alternative makes the literal exist. The shape of a module
+#                    with two independently gated callers (`ga10bprobe5a+witness` for `ga10b_fw`).
+#             `!a`   NEGATED — the literal exists only when `a` is OFF, because `a` makes the code
+#                    the literal lives in UNREACHABLE. `witness`'s token sits in `kernel_main`'s
+#                    post-GUI tail, and `main.rs:79` says in its own `cfg_attr` that `baremetal`,
+#                    `bootlog`, `usbdebug` and `tegra` each make that tail unreachable — so on a Pi
+#                    `kernel8` image `witness` IS compiled and that literal provably is not.
+#           When a term is unsatisfied the row prints UNVERIFIABLE naming it — loud, never silent,
+#           never a pass. `-` for none.
+#   state   measured | measured(N) | unmeasured-here — which artifact has actually proven this token.
+#           `measured(N)` carries the HIT COUNT the proving artifact returned, which is the strongest
+#           form: a later re-seed that drops the count to a different number is visible without a
+#           rebuild of the old image. The 28 x86 rows are plain `measured` (their counts are in the
+#           BANNERCERT arc report); every aarch64 row was measured by BANNERCERT2 and carries its N.
+#           The summary counts anything starting `measured` as measured.
 
 set -u
 
@@ -90,7 +126,7 @@ fi
 # ---------------------------------------------------------------------------------------------
 bc_table() {
 cat <<'TABLE'
-witness|:: U1a: no application processors online — ring-3 demo SKIPPED ::|-|measured
+witness|:: U1a: no application processors online — ring-3 demo SKIPPED ::|!baremetal,!bootlog,!usbdebug,!tegra|measured
 wc|[wc-x] activate DECLINE reason=fb-not-ready latch=released|-|measured
 wcg-paygo|[wc-g] paygo win=|witness|measured
 wcdvalve|[wc-d] valve CLOSED util~|witness|measured
@@ -118,21 +154,25 @@ intel-ivb|:: igpu: VERDICT: Present but BAR not decoding|-|measured
 gen7|:: gen7: r6 next=STOP-window-or-register-block-out-of-range|-|measured
 gmux_igd|:: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD|intel-ivb|measured
 unaos_ivb|@boot iGPU trace 1 (pre-EBS) collected.|-|measured
-tegra|:: tegra: JB5 — XUSB domain not ON at handoff|-|unmeasured-here
-tegrasmp|:: AARCH64 SMP: ORIN-SMP-3 — DTB /cpus named no cores (dtb=@|-|unmeasured-here
-sdmmc|:: TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd|tegra|unmeasured-here
-ga10bprobe5|ceeae9ec72ef80f24c70473f9fff02588d1ab56a30d18b688469c331370ce12a|-|unmeasured-here
-baremetal|:: UnaOS bare-metal — Pi 4 microSD-slot boot, serial console (no framebuffer) ::|-|unmeasured-here
-skip_xhci|:: xHCI bring-up SKIPPED (skip_xhci feature): video only, no USB ::|-|unmeasured-here
-smp7|[smp7] cores online=|baremetal|unmeasured-here
-v3d|:: V3D: CT1 did not idle within budget|-|unmeasured-here
-vugpar|:: [spread2] window|baremetal|unmeasured-here
-piusb|early/bringup_inner (P38 context, right before the first RC read)|-|unmeasured-here
-genet|SKIP (no reply — pre-cable / no DHCP is the honest pre-metal state)|baremetal|unmeasured-here
-nettest|:: NET20-GATE: mdns host-name publish battery|baremetal|unmeasured-here
-pirast|:: PI-RAST: no mailbox framebuffer (headless boot) — cube demo skipped ::|-|unmeasured-here
-desktop_firmware|[pidesk] activate DECLINE reason=no-panel|-|unmeasured-here
-quarry|[quarry] DECLINE reason=dock-cannot-host-full-strip panel=|-|unmeasured-here
+tegra|:: tegra: JB5 — XUSB domain not ON at handoff|-|measured(1)
+tegrasmp|:: AARCH64 SMP: ORIN-SMP-3 — DTB /cpus named no cores (dtb=@|-|measured(1)
+apsrun|:: [apsrun] cpu |-|measured(2)
+bsptick|:: [orinbsptick] arming PERIODIC CNTP at EL|tegra|measured(1)
+bsprun|:: [orinbsprun] boot core |tegra|measured(1)
+sdmmc|:: TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd|tegra|measured(1)
+ga10bprobe5|[ga10bfw] window_need=|ga10bprobe5a+witness|measured(1)
+ga10bprobe5a|[ga10bprobe5a] -> REFUSED reason=|tegra|measured(13)
+baremetal|:: UnaOS bare-metal — Pi 4 microSD-slot boot, serial console (no framebuffer) ::|-|measured(1)
+skip_xhci|:: xHCI bring-up SKIPPED (skip_xhci feature): video only, no USB ::|-|measured(1)
+smp7|[smp7] cores online=|baremetal|measured(1)
+v3d|:: V3D: CT1 did not idle within budget|-|measured(1)
+vugpar|:: [spread2] window|baremetal|measured(1)
+piusb|early/bringup_inner (P38 context, right before the first RC read)|-|measured(1)
+genet|SKIP (no reply — pre-cable / no DHCP is the honest pre-metal state)|baremetal|measured(1)
+nettest|:: NET20-GATE: mdns host-name publish battery|baremetal|measured(1)
+pirast|:: PI-RAST: no mailbox framebuffer (headless boot) — cube demo skipped ::|-|measured(1)
+desktop_firmware|[pidesk] activate DECLINE reason=no-panel|-|measured(1)
+quarry|[quarry] DECLINE reason=dock-cannot-host-full-strip panel=|-|measured(1)
 wedge2|-|no gated string literal anywhere under cfg(feature="wedge2") — the knob only re-times an existing path; certify it from its serial witness, not from the artifact|unmeasured-here
 TABLE
 }
@@ -153,8 +193,15 @@ TABLE
 # `if std::env::var("UNAOS_NOSDWRITE").is_err() { feats.push("sdwrite"); }` beside its siblings in
 # the same arc. The cert then read 28/28 with `SDWRITE-POSTURE` hits>0, and the row came out. That
 # round trip is the whole intended lifetime of a row here: register, fix, delete.
+#
+# IT IS OCCUPIED AGAIN, BY THE FIRST ARMED AARCH64 RUN (2026-09-15, BANNERCERT2, `./arroyo esp-arm`
+# with no knobs at all — the most default build this tree has). One row, `ehcihid`, and it is the
+# same CLASS as sdwrite seen from the other arch: a feature that is DEFAULT-ON in arroyo, named on
+# the banner of every aarch64 media build, and structurally incapable of putting one byte in an
+# aarch64 artifact. The fix is one line and it is NOT in this gate's reach — see the row.
 bc_registered() {
 cat <<'REGISTERED'
+ehcihid|arroyo names `ehcihid` on EVERY aarch64 banner and no aarch64 artifact can carry it. `drivers/mod.rs:9` gates the whole module `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`, so on aarch64 the feature emits nothing: measured on this arc's `esp-arm` ELF, the row token has 0 hits AND `LC_ALL=C grep -a -o -F 'EHCI-HID'` has 0 — not a rotted token, an absent feature. WHY IT REACHES THE BANNER: `arroyo:337` appends it default-on (`[ -z "${UNAOS_NOEHCIHID:-}" ]`), and `arm_features` (arroyo:2206) — which strips TWENTY x86-only names from the aarch64 cargo line so aarch64 media stay byte-identical — strips its own TWIN `kbdwit` at :2218 and does NOT strip `ehcihid`. THE FIX IS ONE LINE, `f="${f//,ehcihid,/,}"` beside the kbdwit strip, and it is deliberately NOT taken here because it is not free: removing a name from the cargo feature set shifts `-Cmetadata`, so it re-hashes EVERY aarch64 media image once — a one-time sha256 break on the Pi and Orin flight cards that the boards' seats must call, exactly as each of the other twenty strips was called when it landed. OWNER: the aarch64 seats (orin + pi), one line in `arm_features`; until then this row keeps the lie named, counted and un-green instead of red-lining every aarch64 media build for a defect no aarch64 executor introduced.
 REGISTERED
 }
 
@@ -196,7 +243,7 @@ while IFS='|' read -r f tok cond state; do
         echo "   immediate-encodes short literals out of .rodata, so this row can never certify."
         exit 2
     fi
-    case "$state" in measured) nmeas=$((nmeas+1)) ;; *) nunmeas=$((nunmeas+1)) ;; esac
+    case "$state" in measured*) nmeas=$((nmeas+1)) ;; *) nunmeas=$((nunmeas+1)) ;; esac
 done < <(bc_table)
 
 for f in ${BANNER//,/ }; do
@@ -219,11 +266,22 @@ for f in ${BANNER//,/ }; do
     skip=""
     if [ "$cond" != "-" ]; then
         for c in ${cond//,/ }; do
-            bc_in_list "$c" "$BANNER" || { skip="$c"; break; }
+            case "$c" in
+                '!'*)  # a NEGATED term: this feature must be OFF or the literal's code is unreachable
+                    bc_in_list "${c#!}" "$BANNER" && { skip="NOT ${c#!}"; break; } ;;
+                *+*)   # an OR-group: ANY one of the alternatives makes the literal exist
+                    _bc_sat=""
+                    for alt in ${c//+/ }; do bc_in_list "$alt" "$BANNER" && { _bc_sat=1; break; }; done
+                    [ -n "$_bc_sat" ] || { skip="${c//+/ or }"; break; } ;;
+                *)  bc_in_list "$c" "$BANNER" || { skip="$c"; break; } ;;
+            esac
         done
     fi
     if [ -n "$skip" ]; then
-        echo "feature=${f} witness=${tok} hits=- -> UNVERIFIABLE (its literal also needs '${skip}', which this build does not carry)"
+        case "$skip" in
+            NOT\ *) echo "feature=${f} witness=${tok} hits=- -> UNVERIFIABLE (its literal needs '${skip}', and this build carries '${skip#NOT }' — that configuration makes the code the literal lives in UNREACHABLE, so its absence proves nothing about the feature)" ;;
+            *)      echo "feature=${f} witness=${tok} hits=- -> UNVERIFIABLE (its literal also needs '${skip}', which this build does not carry)" ;;
+        esac
         unver=$((unver+1)); continue
     fi
 

@@ -5620,6 +5620,25 @@ check_kernel_cfg() {
         return 1
     fi
     echo -e "${COLOR_GREEN}✅ knob→builder wiring OK (every x86-leg-named knob is read by the media builder)${COLOR_RESET}"
+    # ── GATE-KNOBPARITY (BANNERCERT2, 2026-09-15) — the half the probe above structurally cannot see ─
+    # The wiring check immediately above parses ONE idiom: `[ -n "${UNAOS_X:-}" ] && _feats=...`. It is
+    # a good probe and it caught `rastmc`. It could not catch `sdwrite`, because `sdwrite` is not armed
+    # by a positive knob at all — arroyo appends it DEFAULT-ON (`[ -z "${UNAOS_NOSDWRITE:-}" ]`,
+    # arroyo:2000), so it never matched the `-n` sed pattern, rode the banner of every verb, and every
+    # x86 media image cut since A60 shipped without it. `scripts/banner-cert.sh` found that on the
+    # ARTIFACT on its first armed run; this is the vocabulary half of the same answer, and it needs no
+    # build: it compares every name arroyo can append to `$_feats` (both idioms, plus the `case`-arm and
+    # in-function appends), every name `builder/src/main.rs` pushes, and every feature
+    # `crates/kernel/Cargo.toml` declares, and reds on the sdwrite class — a default-on arroyo name the
+    # media builder does not push.
+    #
+    # EXTENDED HERE RATHER THAN ADDED AS A SECOND STAGE, deliberately: the two probes answer the same
+    # question about the same two files and share this function's `return 1`, so `check` keeps ONE
+    # knob-wiring verdict instead of two that can disagree about which is authoritative. The script is
+    # its own file only so it can be run (and gone red) by hand: `bash unaos/scripts/knob-parity.sh`.
+    # Exit 2 from it is a PARSE FAILURE (a control probe missed a name this tree provably contains) —
+    # no verdict, and red, because an unchecked check is never a silent pass.
+    bash "$WORKSPACE_DIR/scripts/knob-parity.sh" "$WORKSPACE_DIR" || return 1
     echo -e "${COLOR_GREEN}✅ kernel cfg coverage OK (${_n} legs)${COLOR_RESET}"
 }
 
@@ -6180,8 +6199,34 @@ test_selfhost() {
 
 # aarch64 ESP for the Raspberry Pi 4 (UEFI / Path A). Copy onto a FAT32 SD card alongside the
 # Tianocore RPi4 EDK2 firmware (RPI_EFI.fd + the Pi firmware blobs).
+# ── BANNERCERT2 (2026-09-15): the aarch64 half of GATE-BANNERCERT ────────────────────────────────
+# `esp_x86` has run `scripts/banner-cert.sh` on its staged kernel since BANNERCERT. The three aarch64
+# media verbs printed a banner and certified NOTHING — which is the wrong way round, because the
+# incident that made this gate exist was on the JETSON path (docs/dev/QUEUE.md §5, 2026-09-13: five of
+# six spellings of the jetson verb built a feature set the banner did not describe, and the
+# `esp-jetson-img` step rebuilt kernel.elf over the first one; the artifact was the only witness).
+#
+# WHICH LIST IS THE CLAIM UNDER TEST, AND WHY IT IS NOT `$_feats`. On aarch64 the kernel is compiled
+# from `$(arm_features)`, not from `$KERNEL_FEATURES` — `arm_features` STRIPS twenty x86-only names
+# (smolnet, kbdwit, sdhcblk, deadman, the wifi/bt families, gen7, noaspm …) so that aarch64 media stay
+# byte-identical whether or not the x86 track armed them. `build_kernel_aarch64` prints that stripped
+# list as `⚡ aarch64 effective features:` exactly when it differs from the banner, and THAT is the
+# line an operator is told to read for an aarch64 build. Feeding `$_feats` here instead would make the
+# gate red on every stripped name — a gate that fails on a documented, measured, byte-identity-enforced
+# strip is a gate nobody keeps. So the effective list is the claim, and it is the honest one: it is
+# what cargo was handed.
+banner_cert_arm() {   # banner_cert_arm <artifact>
+    local _bc_feats; _bc_feats="$(arm_features)"; _bc_feats="${_bc_feats#--features }"
+    # `|| exit $?` and not `|| return`: a MISSING (banner named it, the artifact does not carry it), a
+    # LEAK, or a NO VERDICT (a banner feature with no row in the table, or no artifact on disk) must
+    # STOP the verb — the whole point is that no card gets cut from media whose own log lied about it.
+    bash "${WORKSPACE_DIR}/scripts/banner-cert.sh" "$1" "$_bc_feats" || exit $?
+}
+
 esp_arm() {
     prepare_aarch64
+    # BANNERCERT2: the ELF the aarch64 firmware loads, certified before the media is announced.
+    banner_cert_arm "${ESP_DIR_ARM}/kernel.elf"
     pack_source_along "$ESP_DIR_ARM"
     echo -e "${COLOR_GREEN}✅ aarch64 ESP: ${ESP_DIR_ARM}${COLOR_RESET}"
     echo -e "   kernel.elf sha256: $(sha256_of "${ESP_DIR_ARM}/kernel.elf")"
@@ -6366,6 +6411,12 @@ esp_jetson() {
     # blob above — see the three reasons in the staging block below.
     build_user_el0_elf_images
     prepare_aarch64
+    # BANNERCERT2 — certified INSIDE `esp_jetson`, not at a call site, and this placement is the whole
+    # point: `esp-jetson-img` calls this function, the dispatcher accepts six spellings of the verb, and
+    # the 2026-09-13 incident was precisely a second step rebuilding kernel.elf over the first one's.
+    # Certifying here means every spelling and every caller gets the same verdict on the same bytes, and
+    # `jetson_card_image` below can only ever copy an ELF that has already answered for its banner.
+    banner_cert_arm "${ESP_DIR_ARM}/kernel.elf"
     stage_jetson_el0_images
     pack_source_along "$ESP_DIR_ARM"
     echo -e "${COLOR_GREEN}✅ Jetson ESP (tegra): ${ESP_DIR_ARM}${COLOR_RESET}"
@@ -8032,6 +8083,21 @@ kernel8() {
     "$TOOLBIN/llvm-objcopy" -O binary \
       "${WORKSPACE_DIR}/target/aarch64-base/release/unaos-kernel" "$KERNEL8_DIR/kernel8.img"
     cp "${WORKSPACE_DIR}/scripts/pi-baremetal-config.txt" "$KERNEL8_DIR/config.txt"
+
+    # ── BANNERCERT2: the Pi banner is a claim too, and its list is a SEPARATE one ──────────────────
+    # `$K8_FEATS` is curated — it deliberately does not draw from `$_feats` — so the Pi image is the one
+    # artifact in this tree whose banner comes from a list no other gate reads. That makes it the most
+    # exposed of the three, not the least: a name added to the ladder above and to no cargo feature, or
+    # a feature whose module is arch-gated away, prints green and reaches the card as nothing.
+    #
+    # WHICH ARTIFACT, AND WHY THE FLAT IMAGE AND NOT THE ELF. Both are on disk here
+    # (`target/aarch64-base/release/unaos-kernel` is what the objcopy above just read). The ELF is the
+    # easier target and the WEAKER question: it carries non-allocatable sections — debug info, symbol
+    # and string tables — whose bytes the VideoCore ROM never loads, so a token found only there would
+    # certify a string that is not in the booted image. `llvm-objcopy -O binary` emits exactly the
+    # ALLOCATABLE sections, which is exactly what the Pi executes, and `LC_ALL=C grep -a -o -F` reads a
+    # flat binary as happily as an ELF. So the image is certified: same question, strictly stronger.
+    bash "${WORKSPACE_DIR}/scripts/banner-cert.sh" "$KERNEL8_DIR/kernel8.img" "$K8_FEATS" || exit $?
 
     # PIUSB-16: stock Pi GPU firmware blobs (start4.elf/fixup4.dat) + base DTB + the miniuart-bt overlay,
     # fetched from the OFFICIAL raspberrypi/firmware repo at the pinned FW_TAG (see the FW_* vars above)
