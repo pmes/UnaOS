@@ -97,6 +97,14 @@ pub enum FileSystemError {
     NotFound,
     #[error("Is a directory")]
     IsADirectory,
+    /// RMDIR (SO18): the directory named for removal still holds entries — the
+    /// POSIX `ENOTEMPTY`. Deliberately a DISTINCT variant from
+    /// [`IsADirectory`](Self::IsADirectory): `unlink` refuses a directory
+    /// because of its KIND, `rmdir` refuses one because of its CONTENTS, and a
+    /// caller that cannot tell those apart cannot render the two errors an
+    /// operator has to act on differently (`-EISDIR` vs `-ENOTEMPTY`).
+    #[error("Directory not empty")]
+    DirectoryNotEmpty,
     #[error("Attribute not found")]
     AttributeNotFound,
     #[error("Cannot move a directory into itself or its descendants")]
@@ -1722,6 +1730,110 @@ impl<D: BlockDevice> UnaFS<D> {
             let msg = SMessage::FileEvent {
                 path: format!("inode:{}", inode_id),
                 event: format!("Unlinked:{}", name),
+            };
+            let _ = self.publish("system/fs/change", msg);
+        }
+
+        Ok(inode_id)
+    }
+
+    /// RMDIR (SO18): remove the EMPTY directory `name` from directory
+    /// `parent_id` — the directory entry, the child's own (empty) entry-list
+    /// blocks, its spilled attributes, its inode block and its inode-map slot,
+    /// all in ONE CoW transaction, exactly as [`unlink`](Self::unlink) does for
+    /// a file. Returns the freed (logical) inode id.
+    ///
+    /// # Why this is `unlink`'s twin and not a new mechanism
+    /// A UnaFS directory IS an object with a serialized `Vec<DirEntry>` for its
+    /// data; nothing about unhooking its NAME differs from unhooking a file's.
+    /// The only thing `unlink` could not decide is whether removing it is
+    /// SAFE, so it refused every directory unconditionally
+    /// ([`IsADirectory`](FileSystemError::IsADirectory)). This verb answers
+    /// that question — the directory must be EMPTY — and then runs the same
+    /// removal. There is no orphan window: the emptiness test and the removal
+    /// are both inside the one transaction that the closing
+    /// [`maybe_commit`](Self::maybe_commit) flips.
+    ///
+    /// # Refusals
+    /// * [`NotFound`](FileSystemError::NotFound) — no such name in `parent_id`.
+    /// * [`NotADirectory`](FileSystemError::NotADirectory) — the name is a file
+    ///   or a symlink (use [`unlink`](Self::unlink)).
+    /// * [`DirectoryNotEmpty`](FileSystemError::DirectoryNotEmpty) — the child
+    ///   still holds entries. Recursion is a CALLER's verb (`rm -r` composes
+    ///   `read_dir` + `unlink` + this one); the primitive removes exactly one
+    ///   empty directory so a half-walked tree can never be half-deleted here.
+    /// * [`IsADirectory`](FileSystemError::IsADirectory) — the target is the
+    ///   VOLUME ROOT. The root has no parent entry to unhook and the superblock
+    ///   names it, so it is unremovable by construction; the guard is kept
+    ///   anyway because a corrupt parent listing could otherwise name it.
+    ///
+    /// # Open-handle semantics
+    /// Identical to [`unlink`](Self::unlink): the id is invalidated at once and
+    /// logical ids are never recycled, so a stale id can never alias a new
+    /// object.
+    ///
+    /// # ACL
+    /// Deliberately NOT evaluated here, exactly as `unlink` does not evaluate
+    /// it: the U6 `owner`/`grants:<principal>` rows are attributes this crate
+    /// stores but does not interpret, and the ONE write-side evaluator lives in
+    /// the kernel VFS adapter (`fs/vfs.rs::native_write_authz`), which authorizes
+    /// BEFORE calling this. A second copy of the rule here is how two divergent
+    /// ACLs happen.
+    pub fn rmdir(&mut self, parent_id: u64, name: &str) -> Result<u64, FileSystemError> {
+        let mut entries = self.ls(parent_id)?;
+        let pos = entries
+            .iter()
+            .position(|e| e.name == name)
+            .ok_or(FileSystemError::NotFound)?;
+        if entries[pos].kind != FileKind::Directory {
+            return Err(FileSystemError::NotADirectory);
+        }
+        let inode_id = entries[pos].inode_id;
+        if inode_id == self.superblock.root_inode {
+            return Err(FileSystemError::IsADirectory);
+        }
+
+        // EMPTINESS IS PROVEN, NOT ASSUMED FROM `size`. A directory that once
+        // held entries and had them all removed carries a non-zero `size` (the
+        // serialized EMPTY vector), so a `size == 0` test would refuse a
+        // legitimately empty directory. `ls` is the one reader that answers the
+        // question the verb actually asks.
+        if !self.ls(inode_id)?.is_empty() {
+            return Err(FileSystemError::DirectoryNotEmpty);
+        }
+
+        // From here down this is `unlink`'s body verbatim, on a directory inode.
+        let inode = self.read_inode(inode_id)?;
+
+        // 1. Scrub the attribute index (a directory carries owner/grants rows).
+        self.remove_catalog_entries_inner(|e| e.inode_id == inode_id)?;
+
+        // 2. Unhook the name from the parent.
+        entries.remove(pos);
+        let dir_data = crate::codec::serialize(&entries)?;
+        self.rewrite_data_inner(parent_id, &dir_data)?;
+
+        // 3. Release everything the inode owned — including the blocks holding
+        //    its own (now empty) entry list.
+        for extents in inode.large_attributes.values() {
+            self.decref_extents(extents);
+        }
+        self.decref_extents(&inode.chunks);
+        let pb = self.imap.get(inode_id as usize).copied().unwrap_or(0);
+        if pb != 0 {
+            let index = self.inode_index_extents_at(pb)?;
+            self.decref_extents(&index);
+            self.refmap.decref(pb);
+        }
+        self.imap_clear(inode_id);
+
+        self.maybe_commit()?;
+
+        #[cfg(feature = "std")]
+        {
+            let msg = SMessage::FileEvent {
+                path: format!("inode:{}", inode_id),
+                event: format!("DirRemoved:{}", name),
             };
             let _ = self.publish("system/fs/change", msg);
         }

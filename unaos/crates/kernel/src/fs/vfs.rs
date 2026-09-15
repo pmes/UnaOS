@@ -1830,10 +1830,47 @@ impl VfsBackend for NativeBackend {
         .map_err(unafs_err)?
     }
 
-    // NOTE: `remove_dir` is deliberately NOT implemented — see the trait's note. The UnaFS crate
-    // carries no directory removal, so this backend inherits the default refusal and `rmdir` on a
-    // native path prints `-ENOTSUP`. That is the honest answer and it is the negative leg the
-    // VFSROUTE transcript asserts.
+    /// RMDIR (SO18): the native volume can remove a directory. **This method is the whole of the
+    /// SO18 fix at this layer, and what it replaces is a COMMENT saying it could not exist.**
+    ///
+    /// VFSROUTE gave `remove_dir` a refusing default and `NativeBackend` inherited it, because the
+    /// UnaFS crate carried no directory removal at all — so on every board whose root is UnaFS
+    /// (Pi, Orin) `rmdir /D` and `rm -r /D` printed an honest `-ENOTSUP` and the capability was
+    /// simply absent. `UnaFS::rmdir` is that primitive; this is the trait method over it.
+    ///
+    /// It is `unlink`'s body with ONE question added and one swapped:
+    /// * authorize FIRST, through the same `native_write_authz` — the same U6 `owner` /
+    ///   `grants:<principal>` rows, the same `RIGHT_WRITE` bit. A directory is an object with an
+    ///   ACL like any other; removing one is a write to it.
+    /// * a FILE is [`VfsError::NotADirectory`] (where `unlink` answers `IsADirectory` for the
+    ///   mirror case) — the trait's contract, and what makes the shell able to say "use `rm`".
+    /// * the VOLUME ROOT is [`VfsError::IsADirectory`]: `native_parent` finds no leaf to unhook in
+    ///   a bare `""`/`"/"`, which is the trait's stated spelling for "the root is never removable".
+    /// * a NON-EMPTY directory is [`VfsError::Backend`]`("not-empty")` — the ONE spelling
+    ///   `fs_rmdir` tests for to print `-ENOTEMPTY`. It is mapped from the crate's own
+    ///   `DirectoryNotEmpty` rather than guessed at from a locate-first re-scan, because the
+    ///   emptiness test and the removal must be inside the crate's single CoW transaction; a
+    ///   check made out here would be a TOCTOU window between two mount calls.
+    fn remove_dir(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
+        let path = native_abs(rel);
+        crate::fs::unafs::with_unafs(|fs| {
+            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            native_write_authz(fs, id, principal)?;
+            let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;
+            if !matches!(native_kind(ino.kind), NodeKind::Dir) {
+                return Err(VfsError::NotADirectory); // a file is `unlink`'s business
+            }
+            let (parent_id, leaf) = native_parent(fs, rel)?; // bare root -> IsADirectory
+            fs.rmdir(parent_id, &leaf).map(|_| ()).map_err(|e| match e {
+                ::unafs::fs::FileSystemError::DirectoryNotEmpty => VfsError::Backend("not-empty"),
+                ::unafs::fs::FileSystemError::NotADirectory => VfsError::NotADirectory,
+                ::unafs::fs::FileSystemError::IsADirectory => VfsError::IsADirectory,
+                ::unafs::fs::FileSystemError::NotFound => VfsError::NoSuchPath,
+                _ => VfsError::Backend("unafs-rmdir"),
+            })
+        })
+        .map_err(unafs_err)?
+    }
 
     fn remove_attr(&self, rel: &str, key: &str, principal: &str) -> Result<(), VfsError> {
         let path = native_abs(rel);
@@ -2479,5 +2516,134 @@ impl FatBackend {
             source,
             root: String::new(),
         }
+    }
+}
+
+// =========================================================================================
+// RMDIR-UNAFS (SO18) — the native directory-removal wire fixture.
+//
+// APPENDED AT THE FILE TAIL, like the `impl FatBackend` block above it and for the same reason:
+// `panic::Location` embeds source line numbers, so a function inserted mid-file moves every panic
+// site below it in the knob-off image. A tail append moves nothing above it.
+//
+// WHY A WIRE FIXTURE AND NOT ONLY A HOST TEST. `unafs`'s own `cargo test` proves `UnaFS::rmdir` over
+// a `MemDevice`: the emptiness refusal, the block round-trip, the root guard. What it cannot reach is
+// the half SO18 is actually about — the VFS route (`Vfs::remove_dir` -> `NativeBackend::remove_dir`),
+// the U6 ACL evaluator that only exists in the kernel, and DURABILITY: that the removal survived a
+// genuine remount of the card rather than living in one mount's in-RAM tree. So this drives the real
+// volume through the real `MountTable`, then drops the shared mount and re-reads.
+//
+// It is `witness`-gated and self-cleaning. Self-cleaning is not politeness here: `k3_mount_selftest`
+// bit5 requires the native root to hold the staged K3 fixtures and the `acl-*` rows AND NOTHING ELSE,
+// and until this arc a directory could not be cleaned up at all — which is exactly why the VFSROUTE
+// transcript beside it has no positive `mkdir` leg. This fixture's own subject is the verb that makes
+// the cleanup possible, so a leak here would red bit5 and say so.
+// =========================================================================================
+
+/// RMDIR-UNAFS: prove `remove_dir` on the NATIVE (UnaFS) volume end to end — the capability SO18
+/// records as absent on every board whose root is UnaFS.
+///
+/// Seven legs, each a claim `NativeBackend::remove_dir` makes:
+/// 1. **create** — `mkdir /RMDIRW` through the table, owned by a non-kernel principal (so the U6
+///    `owner` row exists and leg 5 has something to refuse against), and a file planted inside it.
+/// 2. **not-empty** — removing it is refused `Backend("not-empty")`, and the child is still there.
+/// 3. **not-a-dir** — aiming the verb at the FILE is refused `NotADirectory` (that is `rm`'s job).
+/// 4. **root** — the volume root is refused `IsADirectory`; it is never removable.
+/// 5. **acl** — with the directory now empty, a STRANGER is refused `Denied` by the same
+///    `native_write_authz` that guards `unlink`, and the directory is still there afterwards.
+/// 6. **remove** — the OWNER removes it, and it is gone from the live listing.
+/// 7. **durable** — drop the shared mount (`force_remount`) and re-read from the card: still gone.
+///
+/// One uncounted `:: RMDIR-UNAFS: … -> PASS ::` line; honest skip on media with no unafs volume.
+/// Go-red is by mutation: delete the emptiness test in `UnaFS::rmdir` and leg 2 succeeds -> FAIL.
+#[cfg(all(target_arch = "aarch64", feature = "witness"))]
+pub fn rmdir_unafs_witness() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::fs::unafs::locate().is_err() {
+        serial_println!(":: RMDIR-UNAFS: no unafs volume — skipped ::");
+        return;
+    }
+
+    const D: &str = "/RMDIRW";
+    const F: &str = "/RMDIRW/INSIDE.TXT";
+    const OWNER: &str = "rmdir-owner";
+    const STRANGER: &str = "rmdir-stranger";
+
+    let mt = {
+        let mut t = MountTable::new();
+        t.mount("/", Box::new(NativeBackend::new("native")));
+        t
+    };
+
+    // Clear anything an interrupted earlier run left behind, as KERNEL (which every ACL admits).
+    let _ = mt.unlink(F, KERNEL_PRINCIPAL);
+    let _ = mt.remove_dir(D, KERNEL_PRINCIPAL);
+
+    // --- leg 1: create, owned.
+    let made_dir = mt.create(D, NodeKind::Dir, OWNER).is_ok();
+    let made_file = mt.create(F, NodeKind::File, OWNER).is_ok();
+
+    // --- leg 2: a NON-EMPTY directory is refused, and the refusal changes nothing.
+    let notempty = mt.remove_dir(D, OWNER);
+    let notempty_ok = notempty == Err(VfsError::Backend("not-empty"));
+    let child_survived = mt.stat(F).is_ok();
+
+    // --- leg 3: the verb aimed at a FILE.
+    let notdir_ok = mt.remove_dir(F, OWNER) == Err(VfsError::NotADirectory);
+
+    // --- leg 4: the volume root.
+    let root_ok = mt.remove_dir("/", OWNER) == Err(VfsError::IsADirectory);
+
+    // --- leg 5: empty it, then the WRONG PRINCIPAL.
+    let emptied = mt.unlink(F, OWNER).is_ok();
+    let denied = mt.remove_dir(D, STRANGER);
+    let denied_ok = denied == Err(VfsError::Denied);
+    let survived_denial = mt.stat(D).is_ok();
+
+    // --- leg 6: the owner removes it.
+    let removed = mt.remove_dir(D, OWNER);
+    let removed_ok = removed == Ok(());
+    let gone_live = mt.stat(D).is_err();
+
+    // --- leg 7: DURABLE. Drop the shared mount so the next call re-reads the committed root off
+    // the card — an in-RAM-only removal cannot survive this.
+    crate::fs::unafs::force_remount();
+    let gone_remount = mt.stat(D).is_err()
+        && match mt.read_dir("/") {
+            Ok(rows) => !rows.iter().any(|e| e.name == "RMDIRW"),
+            Err(_) => false,
+        };
+
+    let ok = made_dir
+        && made_file
+        && notempty_ok
+        && child_survived
+        && notdir_ok
+        && root_ok
+        && emptied
+        && denied_ok
+        && survived_denial
+        && removed_ok
+        && gone_live
+        && gone_remount;
+
+    if ok {
+        serial_println!(
+            ":: RMDIR-UNAFS: native directory removal — mkdir {} owned by {}, non-empty refused, file refused -ENOTDIR, root refused, stranger refused -EACCES, owner removed, gone across a remount -> PASS ::",
+            D, OWNER
+        );
+    } else {
+        // Self-clean even on a red leg, so one failure cannot red `k3_mount_selftest` bit5 too.
+        let _ = mt.unlink(F, KERNEL_PRINCIPAL);
+        let _ = mt.remove_dir(D, KERNEL_PRINCIPAL);
+        serial_println!(
+            ":: RMDIR-UNAFS: native directory removal -> FAIL (mkdir={} file={} notempty={:?} child={} notdir={} root={} emptied={} denied={:?} survived={} removed={:?} gone={} durable={}) ::",
+            made_dir, made_file, notempty, child_survived, notdir_ok, root_ok,
+            emptied, denied, survived_denial, removed, gone_live, gone_remount
+        );
     }
 }
