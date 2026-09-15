@@ -1031,3 +1031,97 @@ message at all. Silence by a different route.
 Both arches now run the same staging discipline (`try_lock` + defer + shared ring) and the same panic
 escape hatch, so there is one serial transport to reason about rather than two. This is shared
 verification infrastructure; the Pi seat gates on it too.
+
+## FTDIRX — the FTDI console learns to RECEIVE (x86, `ftdirx`, default OFF)
+
+Everything above is about bytes leaving the machine. On the 2012 rMBP there was no other kind: the
+board has no 16550, its only console is an FTDI FT232R cable on xHCI, and that driver was TX-only by
+its own admission — `drivers/xhci/ftdi.rs`'s header said bulk-IN RX was "a STUB deferred to a future
+arc". So a bench operator could read a boot and could not answer it, and every interactive verdict
+on that machine was a photograph of the panel plus a USB keyboard. `ftdirx` is the other direction.
+
+**It is `orinrx` for the other board, and deliberately the same shape.** The Orin's UART RX drain
+(`arch/aarch64/serial.rs`'s `serialrx::drain`) polls the port once per console-pump pass and pushes
+each byte as `pal::Event::Key`. This does exactly that from a USB endpoint: `service_ftdi` keeps ONE
+Normal TRB outstanding on bulk-IN `0x81`, and on each completion pushes the packet's data bytes onto
+the same `pal::EVENT_QUEUE` the xHCI HID decoder feeds — so `x86_input_service`'s `next_event` drain
+sees a cable byte exactly as it sees a keystroke, and nothing downstream of the queue knows or cares
+which it was. The feature name is the TRANSPORT, not the board, for the same reason `serialrx` is.
+
+### The two bytes that are not data
+
+**Every FTDI bulk-IN packet is prefixed by TWO modem-status bytes** (Linux
+`drivers/usb/serial/ftdi_sio.h`: byte 0 is the modem status register, byte 1 the line status
+register). They are not payload and must never reach the key path: pushed through, a typed `help\n`
+arrives at the shell as `\x01\x60help\n`. This is the one thing the arc could get silently wrong,
+which is why the fixture's go-red is exactly "delete the strip" rather than something contrived.
+
+**The go-red is the RX witness, not the shell's answer, and that is a measured correction.** Running
+the fixture with the strip deleted (2026-09-15) turned the wire red exactly where it should — the
+first byte received read `byte=0xb1 '.'` instead of `byte=0x68 'h'`, and the rollup read `rx=24` for
+`packets=8` instead of `rx=8` for `packets=8`, i.e. three bytes delivered per packet typed. But the
+shell still ran the typed command, because QEMU's two status bytes happen to be `0xb1` and `0x00`,
+and `handle_key` discards both as non-printable. That is luck, not design: an FT232 whose modem
+status lands in the printable range would type junk into the shell, and a fixture that asserted only
+"the shell answered" would have passed the broken build. So the assertion is the conservation law —
+`rx` equals the bytes typed and `packets` equals the packets sent — with the shell's answer as the
+downstream confirmation, not as the discriminator.
+
+A packet of two bytes or fewer carries no data at all — it is the chip's idle poll, emitted once per
+latency-timer tick (16 ms by default; `FTDI_SIO_SET_LATENCY_TIMER` is declared beside the other
+vendor requests but this arc does not issue it). Those are counted as `idle=` and dropped. (QEMU 10.2's FT232 model NAKs an IN token when it has no
+data rather than answering with a bare status packet, so `idle=0` on every QEMU capture; the counter
+is there for the cable, where the latency-timer poll is real.) Counting
+them rather than ignoring them is what separates a cable that is quiet from a cable that is dead —
+the two look identical from a `rx=0` alone.
+
+### What is where, and why
+
+| Half | Lives in | Why there |
+|---|---|---|
+| Status-byte strip, counters, the single `push_event` intake | `drivers/xhci/ftdi.rs`, tail module `ftdirx` | FT232 protocol; arch-neutral, beside the rest of the chip's constants |
+| Arm the TRB, claim its completion, re-arm | `drivers/xhci/mod.rs`, tail `impl XhciController` | it needs a transfer ring, and that is where transfer rings are |
+
+**The event-ring dispatch does not deliver bytes.** It stores four relaxed words and returns; the
+packet is handed to `push_event` from the main-loop service pass instead. That is LOCKFIX: the
+event-queue lock must never be taken from inside `drain_event_ring_once`, which runs from every
+synchronous pump in the driver.
+
+**Exactly one TRB is outstanding, ever** — the completion is consumed before a new one is pushed, so
+the IN ring cannot over-arm. The unarmed window between a retired TD and the re-arm is the same one
+PRTSCLOST measures on the HID endpoints, and here it is harmless in a way it is not there: the FT232
+buffers received bytes in its own 256-byte RX FIFO and NAKs nothing away, so a byte typed while the
+endpoint is dark is still waiting for the next IN token. A HID state change inside that window is
+gone forever; a typed character is not.
+
+### Byte-identity, and why the code is in tail blocks
+
+`#[cfg]` does not buy byte-identity on its own: `panic::Location` embeds the source LINE, so a
+cfg-erased block inserted ABOVE existing code still moves every panic site below it, in an image
+that contains none of the feature (LEDGER P7). Both files here are compiled into images that are
+supposed to be unmoved — `drivers/xhci/mod.rs` reaches the Pi's `kernel8.img` — so the new code is
+appended past the last statement of each file, and the four sites inside the files proper (the
+completion claim, the service call, and three teardown drops) are LINE-NEUTRAL appends folded onto
+existing lines, before those lines' first `//`. Measured, not reasoned about:
+`./arroyo knoboff ftdirx <baseline>` builds the knob-off image at both trees in one directory and
+compares them, with an armed control probe.
+
+### Typing at QEMU
+
+The U2.5 gate attaches QEMU's `-device usb-serial` with a **file** chardev, and a file cannot be
+written INTO — there was no way to send bytes toward the kernel. The builder knob
+`UNAOS_FTDIRX_INJECT=<unix socket path>` swaps that file for a listening socket chardev, which is
+bidirectional; `scripts/ftdi_inject.py` connects to it and writes. Unset, the file chardev is
+byte-for-byte what it was, so every existing U2.5 run and its `target/ftdi.log` capture are
+untouched. On metal none of this exists: the cable is the chardev and the operator is the injector.
+
+The injector waits for `:: U2.5: FTDI console up` in the KERNEL'S SERIAL log — a different channel
+from the cable — before it writes. Not because early bytes would be lost (the FT232 holds them), but
+because a run that typed into a console which never came up would otherwise be indistinguishable
+from a run whose RX path is broken.
+
+Witnesses on the wire: `:: FTDIRX: first byte rx=<n> byte=… ::` once, and
+`:: FTDIRX: rx=… packets=… idle=… errors=… result=OK ::` on the log-scale doubling throttle
+`note_ftdi_pump` already uses — so a session of typing costs O(log n) lines for n bytes, which is
+what makes a rollup safe on a console whose own output shares the cable. It does not promise a final
+total: the last line is the last power-of-two milestone (a 10-byte session ends at `rx=8`).

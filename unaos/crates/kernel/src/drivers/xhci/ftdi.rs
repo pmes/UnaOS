@@ -443,3 +443,219 @@ pub unsafe fn drain_into(dst: *mut u8, max: usize) -> usize {
     ring.len -= n;
     n
 }
+
+// ── FTDIRX — the FTDI console learns to RECEIVE (rmbp A9, the x86 half of LEDGER S29) ────────────
+//
+// The module header above says, in as many words, that bulk-IN RX was "a STUB deferred to a future
+// arc". This is that arc. The x86 half of the kernel had exactly one console — the FT232 cable on
+// xHCI — and it was write-only: a bench operator could READ a boot but could not TYPE into it, so
+// every interactive verdict on the 2012 rMBP was still a photograph of the panel plus a USB
+// keyboard. After this module a byte typed on the bench side of the cable reaches
+// `pal::EVENT_QUEUE` exactly as a UART byte does on the Orin (`arch/aarch64/serial.rs`'s
+// `serialrx::drain`, whose shape this copies), and `x86_input_service`'s `next_event` drain then
+// forwards it to the shell like any keystroke.
+//
+// WHAT IS PROTOCOL AND WHAT IS CONTROLLER. This module holds only the FT232 side of the arc — the
+// two-byte modem-status prefix, the counters and the single intake that reaches `push_event`. The
+// TRB/doorbell half (arm one Normal TRB on bulk-IN, claim its completion, re-arm) lives beside the
+// TX pump in `drivers::xhci::mod`, because that is where a transfer ring is. The split is the same
+// one the header already draws for TX, and it is what keeps this file arch-neutral.
+//
+// ⚠ TAIL MODULE ON PURPOSE. Knob-off this whole block is `#[cfg]`-erased and there is nothing below
+// it to shift, so every panic `Location` in this file — and therefore the knob-off loadable image —
+// is untouched (LEDGER P7; `./arroyo knoboff ftdirx`). A statement added ABOVE would not be.
+#[cfg(feature = "ftdirx")]
+pub mod ftdirx {
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+
+    /// **EVERY FTDI bulk-IN packet is prefixed by TWO modem-status bytes** (Linux
+    /// `drivers/usb/serial/ftdi_sio.h`: byte 0 = the modem status register, byte 1 = the line
+    /// status register). They are not data and must never reach the key path — pushed through, a
+    /// typed `help\n` arrives as `\x01\x60help\n` and the shell sees garbage. Stripping them is the
+    /// one thing this arc could get silently wrong, which is why the go-red mutation in the gate is
+    /// "delete the strip".
+    pub const STATUS_BYTES: usize = 2;
+
+    /// Bytes per IN transfer: 64, the FT232's full-speed bulk max packet size — ONE wire packet per
+    /// TRB, so a short packet always retires the TD and the completion's residue is exact.
+    pub const CHUNK: usize = 64;
+
+    /// Byte offset of the RX landing zone inside the FTDI slot's `scsi_data_buffer`.
+    ///
+    /// The FTDI slot never runs BOT, so that 32 KiB buffer is free — `drain_ftdi` already reuses its
+    /// first `FTDI_TX_CHUNK` (64) bytes as the TX staging area. RX takes
+    /// a DISJOINT window rather than a second allocation: 1 KiB in is far past anything TX touches,
+    /// is 64-byte aligned, and the buffer is 64 KiB-ALIGNED and 32 KiB long, so `[1024, 1088)`
+    /// cannot cross a 64 KiB boundary (xHCI 1.2 §4.11.7.1 — the same rule that sizes the buffer).
+    pub const BUF_OFFSET: usize = 1024;
+
+    /// FTDI vendor request `FTDI_SIO_SET_LATENCY_TIMER` (Linux `ftdi_sio.h`), bmRequestType 0x40,
+    /// wValue = milliseconds. The FT232's default is 16 ms: with no data to send the chip still
+    /// answers an IN token every latency tick with a bare 2-byte status packet, and with data it
+    /// waits up to that long before shipping a short packet. NOT issued by this arc's bring-up —
+    /// 16 ms is already under a typist's inter-key gap and changing it would move the TX-side
+    /// vendor-setup sequence that the U2.5 witness covers. Declared here so the next arc that wants
+    /// a faster cable has the number and its provenance rather than a magic 0x09.
+    pub const FTDI_SIO_SET_LATENCY_TIMER: u8 = 0x09;
+
+    /// Is a Normal TRB outstanding on the bulk-IN endpoint right now? Exactly one, ever — the
+    /// re-arm happens only after its completion has been consumed, so the ring can never over-arm.
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    /// The armed TRB's physical address; the completion is matched against it.
+    static TRB_PHYS: AtomicU64 = AtomicU64::new(0);
+    static SLOT: AtomicU8 = AtomicU8::new(0);
+    static DCI: AtomicU8 = AtomicU8::new(0);
+    /// Set by the event-ring dispatch, consumed by the main-loop service pass. The dispatch does
+    /// NOTHING else — LOCKFIX: `push_event` takes the event-queue lock and must never be reached
+    /// from inside `drain_event_ring_once`.
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static CODE: AtomicU8 = AtomicU8::new(0);
+    /// The completion's TRB Transfer Length field = bytes NOT transferred (the residue).
+    static RESIDUE: AtomicU32 = AtomicU32::new(0);
+
+    /// Bytes delivered to the PAL queue (the header's `rx=`).
+    static RX: AtomicU64 = AtomicU64::new(0);
+    /// IN completions consumed, of any size.
+    static PACKETS: AtomicU64 = AtomicU64::new(0);
+    /// Completions carrying ONLY the two status bytes (or fewer) — the FT232's idle latency-timer
+    /// poll. Counted and dropped; a cable that is merely quiet must not look like a cable that is
+    /// dead, and this is the number that tells them apart.
+    static IDLE: AtomicU64 = AtomicU64::new(0);
+    /// Completions with a non-success, non-short completion code.
+    static ERRORS: AtomicU64 = AtomicU64::new(0);
+    static FIRST_LOGGED: AtomicBool = AtomicBool::new(false);
+    /// Last `rx=` a rollup reported; the next fires when `rx` has at least DOUBLED it. The
+    /// log-scale throttle `note_ftdi_pump` uses, for the same reason: a console that is being typed
+    /// into must not spend its own bandwidth narrating itself, while the LAST such line still
+    /// carries the run's true totals.
+    static REPORTED: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether a TRB is outstanding (the service pass arms one when this is false).
+    #[inline]
+    pub fn armed() -> bool {
+        ARMED.load(Ordering::Relaxed)
+    }
+
+    /// Record the TRB the service pass has just pushed, BEFORE its doorbell.
+    #[inline]
+    pub fn arm(slot: u8, dci: u8, trb_phys: u64) {
+        SLOT.store(slot, Ordering::Relaxed);
+        DCI.store(dci, Ordering::Relaxed);
+        TRB_PHYS.store(trb_phys, Ordering::Relaxed);
+        DONE.store(false, Ordering::Relaxed);
+        ARMED.store(true, Ordering::Relaxed);
+    }
+
+    /// Drop all RX state: the console's slot is gone (teardown) or the sink went dark. The next
+    /// service pass with a live console arms a fresh TRB on whatever slot it then has.
+    #[inline]
+    pub fn reset() {
+        ARMED.store(false, Ordering::Relaxed);
+        DONE.store(false, Ordering::Relaxed);
+        TRB_PHYS.store(0, Ordering::Relaxed);
+        SLOT.store(0, Ordering::Relaxed);
+        DCI.store(0, Ordering::Relaxed);
+    }
+
+    /// EVENT-RING DISPATCH HALF. Claim a Transfer Event for the armed bulk-IN TRB — matched by slot
+    /// + endpoint + TRB address, or by any error on our endpoint (an error event can name a
+    /// different TRB of the same TD). Returns true iff the event was ours, in which case the caller
+    /// consumes it. `DONE` is a FIRST-WRITE LATCH: a duplicate Success for an already-recorded
+    /// completion (the Panther Point `XHCI_SPURIOUS_SUCCESS` quirk this driver already defends
+    /// against on EP0 and on the HID reads) is consumed without overwriting the residue.
+    ///
+    /// LOCKFIX: this runs inside `drain_event_ring_once` and takes NO lock, prints nothing and
+    /// touches no ring — it stores four relaxed words. Everything else waits for the main loop.
+    pub fn claim(slot_id: u8, endpoint_id: u8, param: u64, code: u8, transfer_len: u32) -> bool {
+        if !ARMED.load(Ordering::Relaxed)
+            || SLOT.load(Ordering::Relaxed) != slot_id
+            || DCI.load(Ordering::Relaxed) != endpoint_id
+        {
+            return false;
+        }
+        let is_error = code != 1 && code != 13;
+        if param != TRB_PHYS.load(Ordering::Relaxed) && !is_error {
+            return false;
+        }
+        if !DONE.swap(true, Ordering::Relaxed) {
+            CODE.store(code, Ordering::Relaxed);
+            RESIDUE.store(transfer_len, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// MAIN-LOOP HALF. Take the completed transfer, if one has landed: `(completion code, residue)`.
+    /// Disarms, so the caller re-arms after delivering the bytes.
+    pub fn take_done() -> Option<(u8, u32)> {
+        if !DONE.load(Ordering::Relaxed) {
+            return None;
+        }
+        DONE.store(false, Ordering::Relaxed);
+        ARMED.store(false, Ordering::Relaxed);
+        Some((CODE.load(Ordering::Relaxed), RESIDUE.load(Ordering::Relaxed)))
+    }
+
+    /// Note a failed IN completion. The read is re-armed regardless (the TransferRing recycles and
+    /// CErr lets the controller retry) — an FTDI console that stops receiving on one bad packet is
+    /// worse than one that drops it, and the count is what says which happened.
+    pub fn note_error(code: u8) {
+        ERRORS.fetch_add(1, Ordering::Relaxed);
+        PACKETS.fetch_add(1, Ordering::Relaxed);
+        serial_println!(":: FTDIRX: IN completion code={} errors={} — re-arming ::",
+            code, ERRORS.load(Ordering::Relaxed));
+    }
+
+    /// **THE ONE INTAKE.** `pkt` is one bulk-IN packet exactly as the FT232 sent it: two modem-status
+    /// bytes, then zero or more data bytes. Strip the two, push the rest as `Event::Key`.
+    ///
+    /// A packet of [`STATUS_BYTES`] or fewer is the chip's idle latency-timer poll — it carries no
+    /// data, and pushing its status bytes would type `\x01\x60` into the shell every 16 ms. Counted,
+    /// not delivered.
+    ///
+    /// Called ONLY from the main-loop service pass (never the event dispatch), so `push_event`'s
+    /// event-queue lock and this function's `serial_println!` are both taken in the context every
+    /// other console print already uses.
+    pub fn deliver(pkt: &[u8]) {
+        PACKETS.fetch_add(1, Ordering::Relaxed);
+        if pkt.len() <= STATUS_BYTES {
+            IDLE.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        for &b in &pkt[STATUS_BYTES..] {
+            crate::pal::push_event(crate::pal::Event::Key(b));
+            let n = RX.fetch_add(1, Ordering::Relaxed) + 1;
+            if !FIRST_LOGGED.swap(true, Ordering::Relaxed) {
+                // THE WITNESS. One line, the first real byte only: it splits "the cable never
+                // received" from "the cable received and the shell ignored it", which is the exact
+                // split an attended bench sitting cannot make from the panel.
+                serial_println!(
+                    ":: FTDIRX: first byte rx={} byte={:#04x} '{}' idle={} ::",
+                    n, b,
+                    if (0x20u8..0x7f).contains(&b) { b as char } else { '.' },
+                    IDLE.load(Ordering::Relaxed)
+                );
+            }
+        }
+        rollup();
+    }
+
+    /// The scoreable rollup, on the same log-scale throttle `note_ftdi_pump` uses: printed when
+    /// `rx` has at least doubled the last reported count, so a burst of typing costs a handful of
+    /// lines over a whole session — O(log n) lines for n bytes, which is what makes it safe on a
+    /// console whose own output shares the cable.
+    fn rollup() {
+        let rx = RX.load(Ordering::Relaxed);
+        let reported = REPORTED.load(Ordering::Relaxed);
+        if rx < reported.saturating_mul(2).max(1) {
+            return;
+        }
+        REPORTED.store(rx, Ordering::Relaxed);
+        serial_println!(
+            ":: FTDIRX: rx={} packets={} idle={} errors={} result=OK ::",
+            rx,
+            PACKETS.load(Ordering::Relaxed),
+            IDLE.load(Ordering::Relaxed),
+            ERRORS.load(Ordering::Relaxed)
+        );
+    }
+}
