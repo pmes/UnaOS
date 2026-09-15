@@ -1187,3 +1187,28 @@ Neither decides anything about `/`. They exist for INSTALL-SELF and FRGUARD, whi
 volume the loader came off so they can refuse to erase or substitute it. `shell::vfs_mount_table`
 deliberately does not call `locate_boot_volume`: a serial the firmware handed over is precisely the
 assumption §14.1 exists to avoid making.
+
+## 15. NSGEN (LEDGER SR3) — the namespace generation
+
+`MountTable`'s write half advances one arch-neutral counter, `fs::NS_GEN` (`fs/mod.rs`), exactly once
+per SUCCEEDED mutation that can change what a directory listing says: `create`, `write`, `truncate`,
+`unlink`, `rename`, `remove_dir`. The bump is `fs::ns_bump`, wrapped around the existing
+resolve-then-dispatch line at each of those six methods — so it is above the backend dispatch and
+every backend, present and future, inherits it without implementing anything; and because it wraps a
+`Result` it fires only on `Ok`, so a refusal (`mkdir` onto an existing name, a write to a read-only
+volume, a cross-volume `mv`) moves nothing. It is a lock-free `AtomicU64`, `Release` on the bump and
+`Acquire` on the read, never reset, and a consumer's only legitimate question about it is "did it
+move since I last looked". This is what SR3 was missing: the one consumer that had an invalidation
+stamp — Quarry's listing cache (`video/quarry/live.rs::volume_gen`) — was keyed on
+`block::usb_publish_gen()` alone, so a USB stick arriving cleared the cache and a `mkdir`, `rmdir`,
+`rm`, `mv` or size-changing write did not, on any board (and on x86 the stamp was the literal `0`, so
+that cache could never clear at all). `volume_gen` now ADDS the two monotone numbers on aarch64 —
+block epoch plus namespace generation — which preserves the USB event through the same function
+rather than replacing it, and reads the namespace generation alone on x86, where there is no block
+epoch behind this file's arch gate. Wire proof: `:: QUARRYSTAMP: … -> PASS ::`
+(`video/quarry/live.rs::stamp_selftest`, `witness`), which drives `MountTable::create`/`write`/
+`unlink`/`remove_dir` — the same functions `shell::fs_mkdir` / `fs_rmdir` / `fs_rm` call — and asserts
++1 per mutation, 0 for a listing (on the mock volume AND on the live `vfs_mount_table()`), and 0 for
+each of the two refusal shapes. It runs over `vfs::nsgen_mock_table()`'s in-RAM volume rather than the
+boot disk deliberately: the claim is about the seam, not the medium, and a live-FAT fixture on x86
+would owe a new row in `fs/fat.rs`'s X86 FAT-MUTATOR ROSTER (see `NsMockBackend`'s header).

@@ -474,23 +474,45 @@ fn mount_prefixes() -> Vec<String> {
     Vec::new()
 }
 
-/// The block layer's hot-plug epoch — [`Model::collect_cached`]'s invalidation stamp.
+/// [`Model::collect_cached`]'s invalidation stamp: the block layer's hot-plug epoch **plus the VFS
+/// namespace generation** ([`crate::fs::NS_GEN`]).
 ///
-/// `usb_publish_gen` is advanced by every geometry publish and every retraction (PA35's storage
-/// race: two devices on a recycled slot id were otherwise indistinguishable). It is a single
-/// `Acquire` load of an `AtomicU64`, which is what makes it safe to ask on every cache access —
-/// re-reading the MOUNT TABLE to detect the same event would cost the full USB volume probe this
-/// cache exists to stop paying. It is not FAT-specific and it is not namespace-specific: it says
-/// "the set of block devices under this namespace changed", which is precisely the event that can
-/// make a cached listing a lie, and it will mean the same thing when ORIN's UnaFS is the backend.
+/// # SR3 — what this used to be, and why one of the two facts was not enough
+///
+/// This was `usb_publish_gen()` and nothing else, and the doc that stood here said the number was
+/// "not FAT-specific and not namespace-specific". The second half was FALSE in the direction that
+/// mattered: `USB_PUBLISH_GEN` is advanced only inside `drivers/block.rs`'s `publish_usb_geometry`,
+/// reached from the xHCI mass-storage arrival — so a USB stick arriving invalidated the cache and a
+/// `mkdir`, `rmdir`, `rm`, `mv` or a size-changing write did NOT, on any board. RMDIR (LEDGER SO18)
+/// landed `rmdir` on the native volume the same week, which is a directory that can now VANISH while
+/// Quarry keeps listing it. `register_sd` (Pi) and `register_tegra_sd` (Orin) advance that counter
+/// zero times, so a card event never invalidated it either; and on x86 this function was a literal
+/// `0`, which means the cache could never invalidate at all for the life of a `Model`.
+///
+/// # The shape of the fix: two monotone numbers, added
+///
+/// The block epoch answers "the set of block devices changed"; `fs::NS_GEN` answers "a name appeared,
+/// vanished or changed size under some mount" (`fs/mod.rs`, advanced by `MountTable`'s write half —
+/// arch-neutral, in `fs/`, never in a driver). Both are monotone and neither is ever reset, so their
+/// sum is monotone and MOVES IF AND ONLY IF EITHER MOVES. That is the whole invalidation predicate
+/// `collect_cached` needs, and it is why the USB half is preserved by addition rather than replaced:
+/// a stick arrival still advances this stamp, through the same function, exactly as before.
+///
+/// Still two `Acquire` loads of an `AtomicU64` and no lock, so it is still safe to ask on every cache
+/// access and on an input band — re-reading the MOUNT TABLE to detect the same events would cost the
+/// full USB volume probe this cache exists to stop paying.
 #[cfg(target_arch = "aarch64")]
 fn volume_gen() -> u64 {
-    crate::drivers::block::usb_publish_gen()
+    crate::drivers::block::usb_publish_gen().wrapping_add(crate::fs::ns_gen())
 }
 
 #[cfg(not(target_arch = "aarch64"))]
 fn volume_gen() -> u64 {
-    0
+    // SR3: this arm was `0` — a constant, so `collect_cached` never cleared. `usb_publish_gen` is
+    // NOT added here because the block-layer epoch stays behind the arch gate this file has always
+    // carried (see the module's "one arch gate" note); the namespace generation is arch-neutral and
+    // is the fact x86 was missing entirely.
+    crate::fs::ns_gen()
 }
 
 // ── The duplicate-root rule (pure) ──────────────────────────────────────────────────────────────
@@ -3130,6 +3152,11 @@ pub fn selftest() {
     // the x86 battery reaches) prints nothing twice.
     #[cfg(feature = "facet")]
     crate::video::facet::selftest();
+    // QUARRYSTAMP (SR3) — chained for the same reason and in the same shape, and it is the leg of
+    // this family that runs identically on both arches: no panel, no window, no medium. Ahead of the
+    // verdict below so a DECLINE in the geometry legs cannot take the invalidation proof with it;
+    // its own `DONE` latch makes the second chain (from `door_selftest`) a no-op.
+    stamp_selftest();
     match selftest_result() {
         Ok((a, b)) => serial_println!(
             ":: QUARRY: geometry+scroll+tree+hit+dedupe+exec+dblclick+cache+launch+wheel — 640x480 surf_px={} 1920x1200 surf_px={} dbl={}ms cache={} wheel={}rows :: PASS ::",
@@ -3212,6 +3239,11 @@ pub fn door_selftest() {
     // it is not lost to a battery that already ran the door legs.
     #[cfg(feature = "facet")]
     crate::video::facet::selftest();
+    // QUARRYSTAMP (SR3) — the invalidation-stamp proof, chained here for the reason the FACETPNG
+    // block above states: this is the arm the x86 battery reaches (`crystal::selftest`'s tail), and
+    // `selftest` — the arm aarch64's desktop reaches — is the other one. Ahead of this function's own
+    // `DONE` swap, so a battery that already ran the door legs does not lose it.
+    stamp_selftest();
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) {
         return;
@@ -3277,4 +3309,111 @@ pub fn door_selftest() {
             if ok { "PASS" } else { "FAIL" }
         );
     }
+}
+
+// ── QUARRYSTAMP (LEDGER SR3) — the cache-invalidation stamp advances for NAMESPACE mutations ──────
+
+/// SR3's fixture: **[`volume_gen`] — the one number [`Model::collect_cached`] compares — advances
+/// once per successful listing-changing mutation the VFS performs, and NOT for a listing, NOT for a
+/// refusal.**
+///
+/// # What it drives, and why that is the shell's path
+///
+/// Every leg calls a `MountTable` method: `create`, `write`, `unlink`, `remove_dir`. Those are not
+/// near the shell verbs' path, they ARE it — `shell::fs_mkdir` is `mt.create(&path, NodeKind::Dir,
+/// SHELL_PRINCIPAL)`, `fs_rmdir` is `mt.remove_dir(&path, SHELL_PRINCIPAL)`, and `SHELL_PRINCIPAL`
+/// is `KERNEL_PRINCIPAL`; the verbs' own bodies add only the console line and the errno spelling.
+/// The bump sits in `MountTable`, ABOVE the backend dispatch, so the volume underneath is not part
+/// of the claim — which is why the mutating legs run on `vfs::nsgen_mock_table()`'s in-RAM volume
+/// (that function's header carries the full argument, including the `fs/fat.rs` X86 FAT-MUTATOR
+/// ROSTER row a live-FAT fixture would have owed).
+///
+/// # The legs, and which of them can fail for the right reason
+///
+/// 1. **control, LISTING** — `read_dir("/")` on the mock, then on the LIVE table
+///    (`shell::vfs_mount_table()`, the same call `reload_roots` makes): the stamp must not move. A
+///    counter bumped by reads would clear the cache on the very operation the cache exists for.
+/// 2. **mkdir** — `create(kind=Dir)`: +1. This is the RMDIR-era mutation SR3's row names first.
+/// 3. **create + write** — a file and a size-changing write: +1 each (`DirEnt::size` is listed).
+/// 4. **control, REFUSAL** — the same `mkdir` again (`Backend("exists")`) and a `mkdir` as a
+///    principal the volume denies: the stamp must not move for either. This is the leg that makes
+///    `ns_bump`'s `is_ok()` a claim rather than an implementation detail.
+/// 5. **rm + rmdir** — `unlink` then `remove_dir`: +1 each, and the volume is left as it was found.
+///
+/// **Go-red:** delete the `ns_bump` wrapper at ONE seam in `fs/vfs.rs` (e.g. `MountTable::create`)
+/// and the two `create` legs stop stepping — `mutations=3` instead of 5, `-> FAIL`.
+///
+/// Uncounted single line, the `[quarry]` family's idiom, and it touches no window, no focus and no
+/// medium — so it may run on either battery's chain without disturbing the fixture beside it.
+#[cfg(feature = "witness")]
+pub fn stamp_selftest() {
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL};
+    use core::sync::atomic::AtomicBool;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    const D: &str = "/QSTAMP";
+    const F: &str = "/QSTAMP/Q.TXT";
+    let mt = crate::fs::vfs::nsgen_mock_table();
+    let before = volume_gen();
+    let mut at = before;
+    // 1a. A LISTING moves nothing.
+    let _ = mt.read_dir("/");
+    let quiet_list = volume_gen() == at;
+    // 1b. …and neither does a listing of the LIVE namespace, through the call `reload_roots` makes.
+    let live = crate::shell::vfs_mount_table();
+    let live_mounts = live.prefixes().len();
+    let _ = live.read_dir("/");
+    let quiet_live = volume_gen() == at;
+    // 2. mkdir.
+    let made = mt.create(D, NodeKind::Dir, KERNEL_PRINCIPAL).is_ok();
+    let step_mkdir = volume_gen() == at + 1;
+    at = volume_gen();
+    // 3. create + a size-changing write.
+    let touched = mt.create(F, NodeKind::File, KERNEL_PRINCIPAL).is_ok();
+    let step_create = volume_gen() == at + 1;
+    at = volume_gen();
+    let wrote = mt.write(F, 0, b"quarry stamp", KERNEL_PRINCIPAL).is_ok();
+    let step_write = volume_gen() == at + 1;
+    at = volume_gen();
+    // 4. The two refusals — an existing name, and a principal the volume denies.
+    let eexist = mt.create(D, NodeKind::Dir, KERNEL_PRINCIPAL).is_err();
+    let denied = mt.create("/QSTAMP2", NodeKind::Dir, "nobody").is_err();
+    let quiet_refusal = volume_gen() == at;
+    // 5. rm + rmdir, and the self-clean.
+    let removed = mt.unlink(F, KERNEL_PRINCIPAL).is_ok();
+    let step_unlink = volume_gen() == at + 1;
+    at = volume_gen();
+    let rmdired = mt.remove_dir(D, KERNEL_PRINCIPAL).is_ok();
+    let step_rmdir = volume_gen() == at + 1;
+    let clean = matches!(mt.read_dir("/"), Ok(rows) if rows.is_empty());
+    let after = volume_gen();
+    let mutations = after.wrapping_sub(before);
+    let ok = quiet_list
+        && quiet_live
+        && made
+        && step_mkdir
+        && touched
+        && step_create
+        && wrote
+        && step_write
+        && eexist
+        && denied
+        && quiet_refusal
+        && removed
+        && step_unlink
+        && rmdired
+        && step_rmdir
+        && clean
+        && mutations == 5; // create(dir) + create(file) + write + unlink + remove_dir — the five SUCCEEDED mutations; the two refusals and the two listings are the zeroes.
+    serial_println!(
+        ":: QUARRYSTAMP: before={} after={} mutations={} seam=fs::vfs::MountTable live_mounts={} \
+         quiet_list={} quiet_live={} mkdir={}/{} create={}/{} write={}/{} eexist={} denied={} \
+         quiet_refusal={} rm={}/{} rmdir={}/{} clean={} -> {} ::",
+        before, after, mutations, live_mounts,
+        quiet_list, quiet_live, made, step_mkdir, touched, step_create, wrote, step_write,
+        eexist, denied, quiet_refusal, removed, step_unlink, rmdired, step_rmdir, clean,
+        if ok { "PASS" } else { "FAIL" }
+    );
 }
