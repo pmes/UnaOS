@@ -1204,8 +1204,10 @@ writes both the drained lines *and* its own tally through `arch::serial::raw_wri
 `_print`, so on this laptop PWRDRAIN empties the staging ring into a port that does not exist. A line
 DEFERRED under contention is therefore consumed there before the FTDI flush can ever see it. What
 RBTDRAIN does carry is everything `_print` reached the mirror ring with — which is every line on a
-quiet path, and the verb's own announces on any path. Closing the rest means giving `power_drain` a
-sink that is `_print`'s SET and not one port (`serial_ring.rs`), and is reported rather than taken.
+quiet path, and the verbs' own announces on any path. Closing the rest means giving `power_drain` a
+sink that is `_print`'s SET and not one arch port — a change to the shared `serial_ring.rs`, carried
+as a `· NEW` row in trunk `docs/dev/QUEUE.md` §5 rather than taken here. It is not rMBP-only in
+principle: any board whose console is not the arch's raw port has it.
 
 **Why the witness is printed after the flush it reports and before the flush that carries it.** Print
 first and the counts do not exist yet — a line claiming a flush it has not performed is the precise
@@ -1261,17 +1263,20 @@ the flush from `reboot()`'s signature line, and the same run's capture ends mid-
 `ring drained`, no `ftdi flushed`, nothing. That is the defect this section describes, reproduced on
 demand.
 
-**Scope, stated rather than implied — the S5 port did not get the fold.** `platform_shutdown` calls
-the flush, so the shell's `shutdown` puts its announces and `ring drained` tally on the cable. But
-`poweroff()`'s port flush is `s5_ring_flush`, the STAGING ring, and there is no FTDI flush at that
-port — so two things are still open there:
+### The S5 port gets the same fold, for S5DRAIN's own reason
 
-* the `[pwrshutoff] ftdi flushed …` line goes into the mirror ring and nothing takes it back out. On
-  the reboot route its twin is carried by `reboot()`'s first statement; on the S5 route that tally is
-  a serial-log fact and not yet a cable fact.
-* `video/crystal.rs`'s Shut Down and `video/instgui.rs` call `acpi_power::poweroff` DIRECTLY and
-  reach S5 with the mirror ring unflushed altogether. Their *staging* ring is flushed — that is what
-  S5DRAIN fixed — and this is the same argument one buffer further along.
+`poweroff()`'s signature line now reads `s5_ring_flush(); ftdi_flush_sync(…)` — the staging drain
+S5DRAIN put there, then the mirror drain, in that order so S5DRAIN's "first statement" property is
+unmoved. Both run before the `discover()` failure arm's `hlt_loop` park and before the
+`interrupts::disable()` deeper in the body, which the FTDI pump requires.
 
-One statement folded onto `poweroff()`'s signature, exactly as this arc folded one onto `reboot()`'s,
-closes all three at the port. It is outside RBTDRAIN's brief and was reported rather than taken.
+It is at the PORT and not only at the verb because that is S5DRAIN's argument one buffer further
+along. `power::shutdown` flushes in its own announce order, but `video/crystal.rs`'s **Shut Down**
+and `video/instgui.rs` call `acpi_power::poweroff` **directly**, and before this fold those two
+routes — the desktop press most likely to land while the compositor is printing — reached S5 with the
+mirror ring unflushed altogether. It also carries `platform_shutdown`'s own
+`[pwrshutoff] ftdi flushed …` tally, which is written into the ring one call earlier and would
+otherwise have nothing left to take it out.
+
+So both x86 power ports now drain both buffers, and the table at the top of this section has no row
+left where a route reaches firmware with the cable's tail unsent.

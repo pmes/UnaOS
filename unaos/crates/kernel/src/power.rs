@@ -241,16 +241,13 @@ fn platform_shutdown() -> ! {
     // above and `ring drained lines=N bytes=M` ON THE CABLE, which on this laptop is the whole of
     // what an operator sees.
     //
-    // ⚠ WHAT IT DOES NOT DO, said plainly rather than left to be discovered: the `[pwrshutoff] ftdi
-    // flushed …` line it prints goes INTO the ring like any other, and on the S5 route nothing takes
-    // it back out — `poweroff()`'s port flush is `s5_ring_flush`, the STAGING ring, and there is no
-    // FTDI flush at that port. On the reboot route `acpi_power::reboot`'s first statement is exactly
-    // that flush and so carries its twin. So this tally is a serial-log fact and not yet a cable
-    // fact, and the same gap covers `video/crystal.rs`'s Shut Down and `video/instgui.rs`, which
-    // call `acpi_power::poweroff` DIRECTLY and reach S5 with the MIRROR ring unflushed altogether
-    // (their STAGING ring is flushed — that is what S5DRAIN fixed). One statement folded onto
-    // `poweroff()`'s signature, exactly as this arc folded one onto `reboot()`'s, closes all three at
-    // the port. It is outside RBTDRAIN's brief; it is REPORTED as a STOP, not taken.
+    // The `[pwrshutoff] ftdi flushed …` line this prints goes INTO the ring like any other, and what
+    // takes it back out is `acpi_power::poweroff`'s own FTDI flush, folded onto that function's
+    // signature line beside `s5_ring_flush` — the S5 twin of the fold on `acpi_power::reboot`. The
+    // two compose exactly as the reboot pair does: this call reports in the verb's announce order,
+    // the PORT's call is the one no caller can skip, and it is what carries this tally to the cable.
+    // That fold is also why `video/crystal.rs`'s Shut Down and `video/instgui.rs` — which call
+    // `poweroff` DIRECTLY, bypassing this function entirely — now reach the cable at all.
     ftdi_flush_witness("pwrshutoff");
     crate::arch::acpi_power::poweroff();
 }

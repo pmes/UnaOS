@@ -33,7 +33,38 @@
 #
 # Usage:
 #   scripts/ftdi_inject.py <socket> --text 'help\n' [--after SECS] [--wait-for-log PATH]
-#                                   [--hold SECS] [--capture PATH] [--timeout SECS] [--gap MS]
+#                                   [--wait-for-text TEXT] [--hold SECS] [--capture PATH]
+#                                   [--timeout SECS] [--gap MS]
+#
+# THE EXACT ENV, both halves, because neither works alone (run them from `unaos/`, injector FIRST —
+# it retries the connect while the kernel builds, and the connect is what plugs the FT232 in):
+#
+#   SOCK=<abs path>/ftdi0.sock
+#   python3 scripts/ftdi_inject.py "$SOCK" \
+#       --wait-for-log "$PWD/target/serial.log" --text 'help\n' \
+#       --hold 90 --timeout 2400 --capture <abs path>/cable.log &
+#   UNAOS_USBSERIAL=1 UNAOS_FTDIRX=1 UNAOS_FTDIRX_INJECT="$SOCK" \
+#   UNAOS_WC=1 UNAOS_QEMU_FULL=1 ./arroyo test 90
+#
+#   UNAOS_USBSERIAL=1     attaches the emulated FT232 at all (a BUILDER knob, not a kernel feature)
+#   UNAOS_FTDIRX=1        compiles the RX half — without it the cable is write-only and nothing types
+#   UNAOS_FTDIRX_INJECT=  swaps the file chardev for the listening socket this script connects to;
+#                         NOTE it REPLACES target/ftdi.log, so --capture is the cable's only record
+#
+# RBTDRAIN (rmbp-ledger A3) adds `--wait-for-text` and two more env terms, for a verb that ENDS THE
+# RUN (`reboot`). Same two commands, with:
+#
+#       --wait-for-text ':: zeolite: metrics' --text 'reboot\n'
+#   ... UNAOS_QEMU_EXTRA="-no-reboot" ./arroyo test 90
+#
+#   --wait-for-text       hold off until the boot has reached the COMPLETE marker of
+#                         scripts/specs/x86-test.spec. Typing `reboot` at console-up instead resets
+#                         the machine long before that marker, and `./arroyo test` then reports
+#                         TRUNCATED — correctly, and for a reason unrelated to what is being measured.
+#   UNAOS_QEMU_EXTRA=-no-reboot   the x86 builder's QEMU line does NOT carry -no-reboot (the two
+#                         aarch64 lines in `arroyo` do), so without this the reset RESTARTS the guest
+#                         and the capture's tail is a second boot instead of the reboot ladder. With
+#                         it, the reset EXITS QEMU and the last bytes on the cable are the ladder.
 #
 # Exit status: 0 = every byte written; 1 = the socket never accepted a connection, or the console-up
 # witness never appeared, within the timeout. The gate reads this, so it must never be 0 on a no-op.
