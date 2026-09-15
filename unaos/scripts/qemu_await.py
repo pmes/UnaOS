@@ -41,6 +41,17 @@ ACCUMULATOR read out of a fast capture is a FLOOR, not a final value, and a peri
 instrument's window count shrinks with the wall. `UNAOS_QEMU_FULL=1` exists for that
 and is the form an arc's DONE gate runs.
 
+TWO MODES, ONE PREDICATE
+------------------------
+The default mode above TAILS a log a live QEMU is still writing, and its product is a
+STOPPING DECISION. `--settled` asks the same `complete()` predicate of a capture that is
+already over, and its product is a FACT ABOUT THE RUN: did it reach its end-of-run
+marker? That second mode exists because `./arroyo test` does not own its QEMU — the wall
+lives in `builder/src/main.rs`, which spawns, sleeps and kills — so there is nothing left
+for a tail to shorten, while the question a tail answers is precisely the one that verb's
+verdict was missing. See `settled()` for its output and exits. Neither mode decides a
+verdict, and neither invents a marker.
+
 OUTPUT (one line, on stdout):
     AWAIT status=<complete|cap|nosignal> complete_at=<s|-> forbid_hits=<n> wall=<s>
 EXIT: 0 completed (or nosignal, which is an honest answer), 3 cap reached without
@@ -74,14 +85,84 @@ def load_mbench():
     return mod
 
 
+def settled(a, matcher):
+    """SETTLED MODE — ask the SAME predicate of a capture that is already over.
+
+    `--settled` exists because one QEMU verb does not own its own QEMU: `./arroyo test`
+    hands the wall to `builder/src/main.rs`, which spawns QEMU, sleeps the whole
+    `UNAOS_TEST_SECS` and kills it. Nothing in `arroyo` is holding that process, so the
+    tailing path above has nothing to shorten — but the QUESTION the tail answers is
+    exactly the question that verb's verdict was missing: DID THIS RUN REACH ITS END?
+
+    So this mode reads the finished log once and answers only that. It decides no
+    verdict and it shortens no wall; it reports whether an end-of-run marker landed, and
+    the caller turns that into `-> TRUNCATED` or hands the log to its own fault scan.
+    The marker is still `mbench`'s, still read off the spec the caller names — this is
+    the same derived-never-invented rule as the tail, evaluated after the fact.
+
+    OUTPUT (one line, on stdout; every value is space-free so the caller's awk split
+    on `key=value` fields cannot be broken by guest text):
+        SETTLED status=<complete|truncated|nosignal> complete_at=<logline|-> \
+forbid_hits=0 wall=0.0 [reason=<why>] [stopped_at=<logline>]
+    The line the capture stopped on is quoted VERBATIM on stderr instead, where it can
+    carry spaces without turning the machine line into a parsing hazard.
+    EXIT: 0 reached a marker (or nosignal, an honest answer), 3 the capture never
+    reached one, 2 the log could not be read.
+    """
+    try:
+        with open(a.log, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        # A MISSING LOG IS NOT A FINISHED RUN. Reported truncated, never complete: the
+        # caller's `-> TRUNCATED` is the honest verdict for "there is nothing here".
+        print("SETTLED status=truncated complete_at=- forbid_hits=0 wall=0.0 reason=no-log")
+        return 3
+    except OSError as e:                             # noqa: BLE001
+        print(f"qemu_await: read error on {a.log}: {e}", file=sys.stderr)
+        return 2
+
+    # An UNTERMINATED tail (no closing newline) is direct evidence the writer was killed
+    # mid-write — mbench's own truncation signal, set here for the same reason it sets it
+    # in run_replay. The final fragment is still FED, so a marker that landed whole but
+    # lost its newline to the kill is not thrown away.
+    if data and not data.endswith(b"\n"):
+        matcher.unterminated = True
+    lines = data.split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    for raw in lines:
+        matcher.feed_raw(raw)
+
+    seen = [d for d in matcher.markers() if d.hits]
+    if seen:
+        first = min(seen, key=lambda d: d.first_lineno)
+        print(f"SETTLED status=complete complete_at={first.first_lineno} "
+              f"forbid_hits=0 wall=0.0")
+        return 0
+    # WHERE IT STOPPED is the useful half of a truncation report — the boot phase the
+    # capture died in, quoted verbatim, so the reader is not sent back to the log to
+    # find out how far it got. On STDERR: guest text contains spaces, and a machine line
+    # whose last field can swallow the parse is a hazard, not a convenience.
+    print(f"qemu_await: {a.label}: the capture stops at line {matcher.last_lineno}: "
+          f"{matcher.last_text[:200]}", file=sys.stderr)
+    print(f"SETTLED status=truncated complete_at=- forbid_hits=0 wall=0.0 "
+          f"stopped_at={matcher.last_lineno}")
+    return 3
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="wait for a QEMU run to finish")
     ap.add_argument("--log", required=True, help="the serial capture QEMU is writing")
     ap.add_argument("--spec", required=True, help="the spec whose COMPLETE markers end the run")
-    ap.add_argument("--cap", type=float, required=True, help="hard cap in seconds (the verb's own wall)")
+    ap.add_argument("--cap", type=float, default=None, help="hard cap in seconds (the verb's own wall)")
     ap.add_argument("--grace", type=float, default=20.0, help="seconds to keep reading after completion")
     ap.add_argument("--label", default="qemu-run", help="verb name, for the human line on stderr")
+    ap.add_argument("--settled", action="store_true",
+                    help="the capture is FINISHED: read it once and report whether the run "
+                         "reached a COMPLETE marker (see SETTLED MODE in the module docstring)")
     a = ap.parse_args(argv)
+    if not a.settled and a.cap is None:
+        ap.error("--cap is required unless --settled is given")
 
     try:
         mb = load_mbench()
@@ -102,8 +183,13 @@ def main(argv=None):
     # claim "cap reached" — which reads like a regression and is not one. Say so at once
     # and let the caller pay the wall deliberately.
     if not matcher.markers():
-        print("AWAIT status=nosignal complete_at=- forbid_hits=0 wall=0.0")
+        print(f"{'SETTLED' if a.settled else 'AWAIT'} status=nosignal complete_at=- "
+              f"forbid_hits=0 wall=0.0")
         return 0
+
+    # SETTLED MODE: the same predicate, asked of a capture that is already over.
+    if a.settled:
+        return settled(a, matcher)
 
     t0 = time.time()
     deadline = t0 + a.cap
