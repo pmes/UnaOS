@@ -42,7 +42,7 @@ After the sitting: re-flash the stick with a normal build, or pull it out and la
 10. The `DisplayUnwind` stack forcefully restores the muxes LIFO: `DDC`, then `DISPLAY`, then
    `EXTERNAL` — the SAME order as the forward writes (upstream `apple-gmux` uses
    DDC→DISPLAY→EXTERNAL in both directions). `DDC` and `DISPLAY` are restored to the DIS
-   constants; `EXTERNAL` is restored to **the validated pre-image it found** (0x21 on a
+   constants; `EXTERNAL` is restored to **the validated pre-image it found** (0x21 on a  <!-- SUPERSEDED 2026-09-15 by GMUX-2 (igpu.rs `ext_restore_target`): EXTERNAL is restored only where the status read maps to a cited write encoding; 0x21 has none, so the restore is SKIPPED and printed, and EXTERNAL abstains from the gmux= vote. -->
    Kepler-owned boot), never a blanket constant. It never re-reads the live mux to decide
    what to write back: a timed-out gmux read returns `0xFFFFFFFF`, which truncates to `0xFF`
    and would leave a dark panel.
@@ -119,7 +119,7 @@ leaves the port Kepler-owned. `EXT=0x03` (fully-DIS) is equally accepted. The ga
 EXTERNAL against exactly those two named constants and the unwind writes back **the member it
 validated**, never a blanket DIS: forcing a Kepler-owned port to DIS is not a restore, it is a
 silent state change. `sw_ext_state=` / `ext_state=` on the pre-switch line name which one was
-found, and the `EXTERNAL restored to ...` line after the revert names which one was written back.
+found, and the `EXTERNAL restored to ...` line after the revert names which one was written back.  <!-- SUPERSEDED 2026-09-15 by GMUX-2 (igpu.rs `ext_restore_target`): EXTERNAL is restored only where the status read maps to a cited write encoding; 0x21 has none, so the restore is SKIPPED and printed, and EXTERNAL abstains from the gmux= vote. -->
 
 `DDC` stays strict DIS (`DDC=0x02` in every capture), and so does `READ_DISPLAY` (`DISP=0x03` —
 every recorded `DISP=0x03` is the READ register, 0x11). `SWITCH_DISPLAY` (`SW_DISP=`) is printed
@@ -161,7 +161,7 @@ the two `READ_*` ports vote in `gmux=`.)
 | `LADDER ... why=edid-header-corrupt` | The EDID was read but lacks the valid 8-byte header. | Safe. Pull the stick (unless `gmux=FAILED` co-fired, which demands a power cycle). |
 | `LADDER ... why=edid-checksum-bad` | The EDID was read but its checksum failed. | Safe. Pull the stick (unless `gmux=FAILED` co-fired, which demands a power cycle). |
 | `REFUSED: pre-switch-not-accepted` | A pre-switch read was outside the accepted set: `DDC`/`DISPLAY` must be DIS, `EXTERNAL` must be DIS **or** Kepler-owned `0x21`. Also fires on the `0xFFFFFFFF` timeout sentinel. **No write was issued**, the panel never blanked. | Safe. Report the `pre-switch state` line verbatim — `sw_ext_state=UNACCEPTED` / `ext_state=UNACCEPTED` names the culprit. |
-| `EXTERNAL restored to kepler-owned` | The port was Kepler-owned going in and was put back Kepler-owned. **`READ_EXT=0x21` afterwards is CORRECT, not a failure.** | Nothing. |
+| `EXTERNAL restored to kepler-owned` | The port was Kepler-owned going in and was put back Kepler-owned. **`READ_EXT=0x21` afterwards is CORRECT, not a failure.** | Nothing. |  <!-- SUPERSEDED 2026-09-15 by GMUX-2 (igpu.rs `ext_restore_target`): EXTERNAL is restored only where the status read maps to a cited write encoding; 0x21 has none, so the restore is SKIPPED and printed, and EXTERNAL abstains from the gmux= vote. -->
 | `PRE-SWITCH DPCD REV: 0x..` | **The positive control answered BEFORE any mux moved.** AUX already reaches the panel without the switch; the flight's question is answered by this line alone. | Note it. This is the headline result either way. |
 | `PRE-SWITCH DPCD Read Failed: ...` | The control did not answer pre-switch. Only now does the post-switch attempt mean anything: if the post-switch read succeeds, the muxes carry AUX. | Note it. Compare against the post-switch `DPCD REV` line. |
 | `why=aux-short-read` | **KNOWN AND ACCEPTED — not a defect.** A legal partial I2C reply; upstream i915 clamps here instead of erroring. Seeing it is itself proof that AUX *answered*. | Nothing. Record the line. |

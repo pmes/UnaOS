@@ -368,7 +368,7 @@ was written for. Both EXTERNAL registers are relaxed — the recorded `0x21` was
 
 The restore follows the validation: EXTERNAL goes back to the value that was found, not to a blanket
 DIS, because forcing a Kepler-owned port to DIS is not a restore but a silent state change. The
-MATCH verdict likewise compares EXTERNAL against the validated pre-image, so a correct restore on a
+MATCH verdict likewise compares EXTERNAL against the validated pre-image, so a correct restore on a  <!-- SUPERSEDED 2026-09-15 by GMUX-2: EXTERNAL abstains from the MATCH vote when its restore was SKIPPED (no cited write encoding for the 0x21 status). -->
 Kepler-owned machine reports MATCH rather than FAILED. The `0xFFFFFFFF` sentinel is neither
 constant, so it can never pass the gate; anything outside the set REFUSES with
 `pre-switch-not-accepted` before a mux is touched.
