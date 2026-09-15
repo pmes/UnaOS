@@ -186,7 +186,7 @@ pub mod clock;
 pub mod logts;
 pub mod console;
 pub mod user;
-pub mod splash;
+pub mod splash; // FC-2 (GATE-FC2, 2026-09-15): measured as an instance — refs=3, ALL under target_arch="x86_64" (`bootpace.rs:168`, `main.rs:233`, `video/fbcon.rs:1554`) — and deliberately NOT gated here, because rmbp-ledger B6 ("Cross-arch splash: `splash.rs` stays, call sites x86-gated", open, Peter asked by name) owns this declaration. Registered in `scripts/fc2.registry`; B6's seat rules.
 // VUGRAS (hw-jetson): the RAS localizer instrument riding the vug frame loop. Declared
 // unconditionally (its public surface is knob-inert); the sweep call sites are tegra-lane.
 pub mod vugras;

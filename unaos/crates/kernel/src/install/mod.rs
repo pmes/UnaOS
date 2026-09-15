@@ -40,14 +40,14 @@ pub mod selfguard;
 
 // INSTALL-PI: the Pi 4 emmc2 microSD installer flow (three-gate escalation), driving this same engine
 // onto the seated card via `drivers::emmc2`. `piinstall`-gated (⇒ baremetal); compiled out otherwise.
-#[cfg(feature = "piinstall")]
+#[cfg(all(target_arch = "aarch64", feature = "piinstall"))] // FC-2 (GATE-FC2): the arch term is NOT redundant with `piinstall ⇒ baremetal ⇒ pi`. Cargo implication carries features, never `target_arch`, so an x86 build with `piinstall` set compiled this whole flow — `drivers::emmc2`, the three-gate escalation — into the image, and its ONE consumer is `main.rs:503`, which sits inside an `all(target_arch = "aarch64", feature = "baremetal")` body. Measured by `scripts/fc2-check.sh`: refs=1, all-under target_arch="aarch64". Edited IN PLACE on the existing attribute line: no line added, nothing below moves.
 pub mod pi;
 
 // INSTALL-PI-2: the buffered self-clone payload primitive (snapshot the source boot tree into memory,
 // then mirror it onto the freshly-formatted ESP). The engine's payload seam for a SAME-device clone
 // (the Pi reads its source from and installs onto the one seated card). `piinstall_confirm`-gated —
 // compiled only where the destructive Pi install that uses it is.
-#[cfg(feature = "piinstall_confirm")]
+#[cfg(all(target_arch = "aarch64", feature = "piinstall_confirm"))] // FC-2 (GATE-FC2), the CASCADE from `pi` above and the reason this is a gate and not an audit: `clone`'s four consumers are all in `install/pi.rs` (:312, :321, :364, :381), so the moment `pi` carried the arch term this declaration was the wider one. Same argument, same measurement (`scripts/fc2-check.sh`: refs=4, all-under target_arch="aarch64"), same in-place edit on the existing attribute line — no line added.
 pub mod clone;
 
 use crate::drivers::block;

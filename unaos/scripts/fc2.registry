@@ -1,0 +1,18 @@
+# GATE-FC2 registry — every module declared WIDER than every path that can reach it, and why.
+# Format: <module path>  <reason>.  One line each, `#` starts a comment.
+#
+# MUST REACH ZERO. This file is not an allowlist to grow: every row is a module whose body is
+# compiled into images that cannot call it. A row is legitimate only while the DECLARATION carries
+# a ruling that this gate is not entitled to overturn — a deliberate, written decision about what
+# the module's absence means. "It builds fine" is not a reason; the gate already knows it builds.
+#
+# A ROW CITES THE MEASUREMENT, not a reason string alone (the k8-reach.registry rule, pi 7,
+# 2026-09-06). `bash scripts/fc2-check.sh` prints every site behind a row; quote what it printed.
+#
+# Seeded 2026-09-15 by GATE-FC2's landing commit, at d6b3c9a7. The census then: 162 declarations,
+# 162 referenced, 4 findings — two fixed on their declaration lines in that same commit
+# (`install::pi`, and `install::clone`, which the first fix then exposed), three here.
+
+splash        NOT a ruling of this gate's to make: rmbp-ledger B6 — "Cross-arch splash: `splash.rs` stays, call sites x86-gated" — is OPEN and Peter asked for it by name, and B6's JOB (the call sites) is already done in this tree, which is precisely why fc2-check reports the declaration. Measured: refs=3, all under target_arch=x86_64 — `bootpace.rs:168` and `main.rs:233` (both `all(x86_64, not(any(usbdebug, bootlog|…, witness)))`) and `video/fbcon.rs:1554`, inside `milestone`'s `all(x86_64, not(any(usbdebug, witness)))` block. So aarch64 images carry the whole boot-crystal splash with nothing able to call it. Whether the right end state is a gated declaration or a splash that finally runs on both arches is B6's question, and B6's row says "cross-arch". The fix, when that is ruled, is ONE line: fold `#[cfg(target_arch = "x86_64")]` onto `lib.rs:189`. Owner: the seat that holds B6.
+rtpi          Deliberate, and the decl's own comment (lib.rs:226-232) is the ruling: the module is declared under `feature = "rtpi"` ALONE so a knob-off build carries not even the shim's symbols, and "within the feature the real impl is still x86-only; an aarch64 `rtpi` build gets the inline shim". fc2-check measures refs=6, all under target_arch=x86_64 (arch/x86_64/sched.rs:4382/4409/4411/4586/4590, main.rs:7054) — so the aarch64 shim has no caller and this IS the shape. Narrowing the decl to x86 is a ruling on what `UNAOS_RTPI=1` means on aarch64, which belongs to the seat that owns R1, not to this gate's landing commit.
+video::desktop_firmware  Pi/Orin tenancy gate, owned by hw-pi4 and hw-jetson. fc2-check measures refs=13, all under feature=aarch64_el0 (arch/aarch64/syscall.rs:16408 — that module is itself gated on aarch64_el0 — plus twelve main.rs sites inside `all(aarch64, baremetal)` bodies, and `baremetal = ["pi", "aarch64_el0"]`). So `desktop_firmware` WITHOUT the EL0 ring compiles the whole desktop and reaches none of it. Whether that pairing should be spelled on the declaration is a product ruling about what a ringless `UNAOS_DESKTOP_FIRMWARE` image is for; it is not mechanical, and this seat does not hold those files.
