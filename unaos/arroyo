@@ -2879,12 +2879,16 @@ scan_serial_faults() { # $1 = log file, $2 = label used in the quoted lines
 # OWN CHECKER already asserts, and nothing else:
 #   kernel8-test   scripts/specs/pi4-regression.spec — the spec `test_kernel8` replays through
 #                  mbench, which declares two COMPLETE end-of-run markers.
+#   test           scripts/specs/x86-test.spec — ONE COMPLETE marker, measured off two full-wall
+#                  runs (TESTTRUNC). It does NOT come through this helper: this verb's QEMU is
+#                  spawned by `builder/src/main.rs`, so FASTTEST runs the SAME `qemu_await.py`
+#                  over the SAME spec from inside the builder (`qemu_test_wall`), which is the
+#                  process that holds the pid. Read the TESTTRUNC block above `test_x86_64`.
 #   test-arm       NONE. Its checker is `scan_serial_faults` above: negative-only, no notion of the
-#   test           run having finished, and no spec anywhere replays target/serial-arm.log or is
-#   install-pi     what `./arroyo test` asserts. They therefore KEEP THE FULL WALL and say so.
-#                  (docs/dev/LEDGER.md row SR7 (renamed from S33 at orin 25's fold) carries this as owed; S8 already names `test`/
-#                  `test-arm` as negative-only GATE-BLINDNESS. Declaring a completion source for an
-#                  x86 spec is rmbp's call, not this lane's — an invented marker would be a gate
+#   install-pi     run having finished, and no spec anywhere replays target/serial-arm.log. They
+#                  therefore KEEP THE FULL WALL and say so. (docs/dev/LEDGER.md row SR7 (renamed
+#                  from S33 at orin 25's fold) carries what is still owed; S8 already names
+#                  `test-arm` as negative-only GATE-BLINDNESS. An invented marker would be a gate
 #                  asserting a line nobody chose.)
 # `scripts/qemu_await.py` drives mbench's OWN shipped predicate — `Matcher.complete()`, the one
 # `run_follow()` stops on ("Follow-mode EARLY EXIT") — which fires only once EVERY REQUIRE and
@@ -3134,12 +3138,16 @@ SERIAL_LOG="${WORKSPACE_DIR}/target/serial.log"
 # through `mbench`'s own `Matcher` (via `qemu_await.py --settled`) rather than grepped for here, so
 # the harness cannot disagree with the replay about what "the run finished" means.
 #
-# WHY `--settled` AND NOT THE TAIL. Every other QEMU verb runs through `qemu_wait_or_complete`,
-# which can shorten a run because it OWNS the QEMU process. `test` does not: the wall lives in
-# `builder/src/main.rs`, which spawns QEMU, sleeps `UNAOS_TEST_SECS` and kills it, and nothing in
-# this script is holding that pid. So this verb still pays its full wall — LEDGER SR7's owed item is
-# unchanged and is a SEPARATE fix in the builder — while the question the tail would have answered
-# is asked of the finished capture instead. The verdict is what was missing; the seconds are not.
+# WHY `--settled` AND NOT THE TAIL, HERE. Every other QEMU verb runs through
+# `qemu_wait_or_complete`, which can shorten a run because it OWNS the QEMU process. `test` does
+# not: QEMU is spawned by `builder/src/main.rs` and nothing in THIS SCRIPT is holding that pid. The
+# TAIL therefore runs where the pid is — FASTTEST put `qemu_await.py` (default mode, same spec)
+# inside the builder's `qemu_test_wall`, so the run now ends at completion + grace and SR7's owed
+# half is paid. What stays here is the VERDICT, and it is a separate question from the seconds: the
+# builder's tail decided WHEN TO STOP READING, and `--settled` asks the finished capture whether
+# the end of the run is actually IN IT. Two readings, one predicate, and the second one is the only
+# one a pass may rest on — a stopping decision that went wrong (a killed waiter, a lost stamp)
+# cannot talk this verb into rc=0, because the verdict re-reads the capture from scratch.
 X86_TEST_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-test.spec"
 
 # Ask the settled capture whether the run reached its end. Sets three globals for the caller:
@@ -3206,27 +3214,70 @@ test_x86_64() {
     cd "$WORKSPACE_DIR/builder"
     local xt0 xwall
     xt0=$(date +%s.%N)
-    UNAOS_SERIAL_LOG="$SERIAL_LOG" UNAOS_TEST_SECS="$secs" cargo +nightly run --release
+    # FASTTEST: the SPEC travels to the builder on the same channel as the wall seconds, because
+    # the builder is what holds the QEMU pid and therefore what can end the run early. The grace
+    # is passed EXPLICITLY so `QEMU_GRACE_DEFAULT` above stays the single source of that number —
+    # the builder carries a 20.0 of its own, but only for a bare `cargo run` with no arroyo.
+    UNAOS_SERIAL_LOG="$SERIAL_LOG" UNAOS_TEST_SECS="$secs" UNAOS_TEST_SPEC="$X86_TEST_SPEC" \
+        UNAOS_QEMU_GRACE="${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
     if [ -n "$qmp_pid" ]; then wait "$qmp_pid" 2>/dev/null || true; fi
-    # QEMU-FAST: `test` STILL PAYS ITS FULL WALL — the wall lives in builder/src/main.rs's
-    # `thread::sleep` (the builder owns this QEMU, not this script), so shortening it is a builder
-    # change and stays owed in LEDGER SR7. What this verb no longer lacks is a COMPLETION VERDICT:
-    # see the TESTTRUNC block above `test_x86_64` for why those are two different things, and why
-    # the second one is the half that was letting a loaded box hide reds.
+    # QEMU-FAST, SR7's owed half, now paid: `test` no longer sits out a blind wall. The wall lives
+    # in builder/src/main.rs (the builder owns this QEMU, not this script), so the WAIT was plumbed
+    # through there — `qemu_test_wall` runs the SAME `scripts/qemu_await.py` over the SAME spec the
+    # other verbs stop on, and ends the run at completion + grace. Every non-`complete` outcome
+    # still pays the full wall, and UNAOS_QEMU_FULL=1 keeps the whole one (LAWS §5).
+    #
+    # THE BUILDER REPORTS BACK IN A FILE, not on stdout: its stdout is `cargo run`'s and is not
+    # captured here, so it writes the waiter's one `AWAIT` line beside the log at `<log>.await`.
+    # The builder REMOVES that file as the first statement of its wall, before anything can write
+    # to it, so a line found here is this run's or there is none — and NO FILE MEANS `mode=full`,
+    # which is the honest reading of "the fast path did not report". This is the only thing read
+    # from it; the VERDICT still comes from `--settled` over the capture below, so a stamp that is
+    # missing, stale or lying can never buy a pass.
     xwall=$(awk -v a="$xt0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1f", b-a}')
+    local xmode=full xcat="-" xfh=0 xastatus="" xqwall="-" xawait="${SERIAL_LOG}.await"
+    if [ -f "$xawait" ]; then
+        xastatus=$(awk '/^AWAIT /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="status")print a[2]}}' "$xawait")
+        xcat=$(awk '/^AWAIT /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="complete_at")print a[2]}}' "$xawait")
+        xfh=$(awk '/^AWAIT /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="forbid_hits")print a[2]}}' "$xawait")
+        xqwall=$(awk '/^AWAIT /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="wall")print a[2]}}' "$xawait")
+    fi
+    # The same three-valued reading `qemu_wait_or_complete` uses, and `fastcap` is recorded as the
+    # `full` it PAID with the distinction kept in `note=`.
+    case "$xastatus" in
+      complete) xmode=fast ;;
+      cap)      xmode=fastcap; xcat="-" ;;
+      *)        xmode=full;    xcat="-" ;;
+    esac
     # The capture is FINISHED here — the builder has already killed QEMU and `cargo run` has
     # returned — which is precisely the precondition `--settled` needs and the same ordering rule
     # `qemu_run_sidecar` documents: nothing further can land in the log.
     x86_test_completion "$SERIAL_LOG"
-    case "$X86_TEST_VERDICT" in
-      complete) echo -e "${COLOR_GREEN}⚡ test: the run REACHED its completion marker (serial.log line ${X86_TEST_LINE}); full wall ${xwall}s.${COLOR_RESET}" ;;
-      *)        echo -e "${COLOR_YELLOW}⚡ test: completion verdict '${X86_TEST_VERDICT}' after a full wall of ${xwall}s — see the verdict below.${COLOR_RESET}" ;;
+    # `wall=` is the VERB's wall and has always included the cargo build; `qemu_wall=` is the
+    # waiter's own measurement of the QEMU span, which is the number a reader comparing against
+    # `cap=` actually wants, so both are recorded rather than one being passed off as the other.
+    case "$xmode" in
+      fast)    qemu_run_sidecar "$SERIAL_LOG" "mode=fast" "completion_at=${xcat}" \
+                   "grace=${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}" "wall=${xwall}" "cap=${secs}" \
+                   "spec=${X86_TEST_SPEC}" "sha=${UNAOS_GIT_SHA:-unstamped}" "label=test" \
+                   "forbid_hits_in_grace=${xfh:-0}" "qemu_wall=${xqwall}" \
+                   "completion=${X86_TEST_VERDICT}" "complete_line=${X86_TEST_LINE}" ;;
+      fastcap) qemu_run_sidecar "$SERIAL_LOG" "mode=full" "completion_at=-" \
+                   "grace=${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}" "wall=${xwall}" "cap=${secs}" \
+                   "spec=${X86_TEST_SPEC}" "sha=${UNAOS_GIT_SHA:-unstamped}" "label=test" \
+                   "note=fast-requested-no-completion-inside-cap" "qemu_wall=${xqwall}" \
+                   "completion=${X86_TEST_VERDICT}" "complete_line=${X86_TEST_LINE}" ;;
+      *)       qemu_run_sidecar "$SERIAL_LOG" "mode=full" "completion_at=-" \
+                   "grace=${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}" "wall=${xwall}" "cap=${secs}" \
+                   "spec=${X86_TEST_SPEC}" "sha=${UNAOS_GIT_SHA:-unstamped}" "label=test" \
+                   "completion=${X86_TEST_VERDICT}" "complete_line=${X86_TEST_LINE}" ;;
     esac
-    qemu_run_sidecar "$SERIAL_LOG" "mode=full" "completion_at=-" \
-        "grace=${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}" "wall=${xwall}" "cap=${secs}" \
-        "spec=${X86_TEST_SPEC}" "sha=${UNAOS_GIT_SHA:-unstamped}" "label=test" \
-        "completion=${X86_TEST_VERDICT}" "complete_line=${X86_TEST_LINE}"
+    case "${xmode}:${X86_TEST_VERDICT}" in
+      fast:complete) echo -e "${COLOR_GREEN}⚡ test: FAST exit — the run REACHED its completion marker (serial.log line ${X86_TEST_LINE}) at +${xcat}s + ${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}s grace; QEMU wall ${xqwall}s of a ${secs}s cap, verb wall ${xwall}s (build included). UNAOS_QEMU_FULL=1 for the whole wall.${COLOR_RESET}" ;;
+      *:complete)    echo -e "${COLOR_GREEN}⚡ test: the run REACHED its completion marker (serial.log line ${X86_TEST_LINE}); full wall ${xwall}s.${COLOR_RESET}" ;;
+      *)             echo -e "${COLOR_YELLOW}⚡ test: completion verdict '${X86_TEST_VERDICT}' after a ${xmode} wall of ${xwall}s — see the verdict below.${COLOR_RESET}" ;;
+    esac
 
     echo ""
     echo -e "${COLOR_PURPLE}════════════ SERIAL LOG (${SERIAL_LOG}) ════════════${COLOR_RESET}"
