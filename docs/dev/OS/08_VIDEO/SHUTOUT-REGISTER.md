@@ -238,20 +238,43 @@ nothing guards it across boots, so every boot from that stick switches the mux a
 | G2 `TEARDOWN HUNT TRACE` — four-point firmware-teardown hunt | `UNAOS_IVB` | `:: igpu: TEARDOWN HUNT TRACE ::` (`igpu.rs:459`, n=1) | s8 boot 1, 2026-07-22: **Point-0 is ALL-DEAD too** — pipes/planes/PP_STATUS/PP_CONTROL/DPLL_A read `0x00000000` at all four points, first-instruction-adjacent bootloader entry included; `DP_A=0x1C` constant | the "firmware tears iGPU scanout down during our bootloader window" theory is **dead**: panel power and the PLL were never on at any observable instant. The CF8-failed-read caveat was itself refuted — a failed read would have zeroed `DP_A` too | G1 | **shut-out (the teardown theory); proven (the census)** |
 | G3 `PROTOCOL PROVEN` — gmux indexed handshake | `UNAOS_GMUX_IGD` | `:: igpu: PROTOCOL PROVEN (version plausible)` (`igpu.rs:499`, n=1) | s10 boot 1, 2026-07-22: **version 3.2.19** via the 32-bit indexed read; `MAX_BRIGHTNESS=0x3FF` as a second proof. Gate PASSED | s9's attempt **failed under the 3×8-bit read variant** — the version self-test returned implausible tuples and the gate correctly held, printing raw bytes only. s8 had already flagged the shape: `idx_SWITCH` and `idx_POWER` returned identical bytes twice, the signature of a missing ready-wait between index write and value read. **A read-width error, not a protocol absence** | G1 | **proven** |
 | G4 `SW_DISPLAY` — who owns the panel | `UNAOS_GMUX_IGD` | `:: igpu: SW_DISPLAY` (`igpu.rs:509`, n=1) | s10: **`SW_DISPLAY=0x03 (DISCRETE)`, `SW_DDC=0x02 (DISCRETE)`, `DISC_POWER=0x03 (ON)`**, stable at Boot **and** Kernel | — | G3 | **proven** — the Kepler dGPU owns the panel at every observed instant. This **formally reversed** sitting #5's gmux/iGPU redirect and made "iGPU-all-dead" the **expected** state rather than a paradox |
-| G5 `igpu-dpy rung=00 census` | `UNAOS_GMUX_IGD` | `:: igpu-dpy: rung=00 name=census` (`igpu.rs:1271`, n=1) | flight 5, 2026-08-28: **never reached** | G6 refused upstream of it | G6 | **never-run** |
-| G6 pre-switch gate | `UNAOS_GMUX_IGD` | `:: igpu-dpy: pre-switch state DDC=` (`igpu.rs:1214`, n=1) · `pre-switch-not-accepted` (`igpu.rs:1245`, n=1) | flight 5: `:: igpu: [GMUX] REFUSED: pre-switch-not-accepted (status: 0x00000000) ::` → `:: igpu-dpy: LADDER highest=00/10 name=harness ok=0 pending=0 gmux=UNTOUCHED why=pre-switch-not-accepted elapsed_ms=1 ::` | the gate demands `DDC == GMUX_DDC_DIS` **and** `READ_DISPLAY == GMUX_DISPLAY_DIS` **and both** EXTERNAL registers ∈ {`GMUX_EXTERNAL_DIS`, `GMUX_EXTERNAL_KEPLER_OWNED` (0x21)}. At least one read on that boot fell outside. **The capture already contains the answer** — `igpu-dpy: pre-switch state` prints at `igpu.rs:1214`, *before* the gate returns at `:1245`, so the offending register is named on the wire and has never been read back | G3 | **shut-out — with the discriminating datum already captured and unread** |
-| G7 gmux switch to IGD | `UNAOS_GMUX_IGD` | `:: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD` (`igpu.rs:1419`, n=1) | **never reached on metal** | G6 | G6 | **never-run** — and the inherited claim that it "switches and restores on the same call stack" is **false**: it does not switch at all (flight 5 §3.1). Ledger A7's `GMUX_SWITCH_EXTERNAL=0x01` blocker is therefore a statement about a rung that has never run |
-| G8 ladder rollup | `UNAOS_GMUX_IGD` | `:: igpu-dpy: LADDER highest=` (`igpu.rs:1495`, n=1) | flight 5: `highest=00/10` | — | all | **open** (the instrument works; it reports 0 of 10) |
+| G5 `igpu-dpy rung=00 census` | `UNAOS_GMUX_IGD` | `:: igpu-dpy: rung=00 name=census` (`igpu.rs:1285`, n=1) | flight 5, 2026-08-28: **never reached** | G6 refused upstream of it | G6 | **never-run** |
+| G6 pre-switch gate | `UNAOS_GMUX_IGD` | `:: igpu-dpy: pre-switch state DDC=` (`igpu.rs:1231`, n=1) · `pre-switch-not-accepted` (`igpu.rs:1254`, n=1) | flight 5: `:: igpu: [GMUX] REFUSED: pre-switch-not-accepted (status: 0x00000000) ::` → `:: igpu-dpy: LADDER highest=00/10 name=harness ok=0 pending=0 gmux=UNTOUCHED why=pre-switch-not-accepted elapsed_ms=1 ::` | the gate demands `DDC == GMUX_DDC_DIS` **and** `READ_DISPLAY == GMUX_DISPLAY_DIS` **and both** EXTERNAL registers ∈ {`GMUX_EXTERNAL_DIS`, `GMUX_EXTERNAL_KEPLER_OWNED` (0x21)}. At least one read on that boot fell outside. **The capture already contains the answer** — `igpu-dpy: pre-switch state` prints at `igpu.rs:1231`, *before* the gate returns at `:1254`, so the offending register is named on the wire and has never been read back | G3 | **shut-out — with the discriminating datum already captured and unread** |
+| G7 gmux switch to IGD | `UNAOS_GMUX_IGD` | `:: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD` (`igpu.rs:1441`, n=1) | **never reached on metal** | G6 | G6 | **never-run** — and the inherited claim that it "switches and restores on the same call stack" is **false**: it does not switch at all (flight 5 §3.1). Ledger A7's `GMUX_SWITCH_EXTERNAL=0x01` blocker is therefore a statement about a rung that has never run |
+| G8 ladder rollup | `UNAOS_GMUX_IGD` | `:: igpu-dpy: LADDER highest=` (`igpu.rs:1529`, n=1) | flight 5: `highest=00/10` | — | all | **open** (the instrument works; it reports 0 of 10) |
 | G9 iGPU BLT ring (console acceleration) | `UNAOS_IVB` | `:: igpu-blt: ring=absent why=no-active-surface` (`igpu.rs:892`, n=1) | flight 5 and every flight: `ring=absent why=no-active-surface — every iGPU display plane is off (gmux routes the panel elsewhere); CPU path carries the console` | it needs an **active iGPU display plane** to prove scanout extent, and G4 proves there is none while the Kepler owns the panel | G7 opening | **shut-out under "the Kepler owns the panel"** |
 
 **What would change the verdict**
 
-- **G6** — one `awk` over the flight-5 capture for `igpu-dpy: pre-switch state`. The flight already
-  paid for this datum; nobody has read it. It names which of DDC / READ_DISPLAY / SWITCH_EXTERNAL /
-  READ_EXTERNAL sat outside the accepted set, and that is the whole next question. **This is the
-  cheapest open item in the register — it costs no boot at all.**
-- **G7 / G5 / A7** — unreachable until G6 accepts. Nothing about residency ("make the switch
-  stay") can be designed before then; there is nothing to make stay.
+- **G6** — ~~one `awk` over the flight-5 capture~~ **READ, and FIXED; what would change the verdict
+  now is one armed boot.** GMUX-1 (`docs/dev/evidence/rmbp-0915/GMUX-1-PRESWITCH.md`) read the datum
+  the flight had already paid for: the single failing term of the four was `SW_EXT=0x01`, the read of
+  `GMUX_SWITCH_EXTERNAL` (**0x40, the WRITE-TARGET port**) scored against the STATUS encodings, while
+  every register that *reports* mux state — `DDC`=0x02, `READ_DISPLAY`=0x03, `READ_EXTERNAL`=0x21 —
+  read its accepted value. A wrong read, ours. **GMUX-2 (this register's own next rung; ledger A7,
+  `fixed-unflown`)** put the gate on the status ports only and stopped the unwind writing a value it
+  never read as state. The next verdict is therefore scored at the glass, on these lines:
+  1. `:: igpu-dpy: pre-switch state … SW_EXT=0x… SW_EXT_ST=0x… … gate=… ::` (`igpu.rs:1231`) — the
+     census now prints **both** halves of the 0x40/0x41 pair and the verdict token. `gate=ACCEPT`
+     means the three status reads were all in their accepted sets; `gate=REFUSE:<port>@<idx>` names
+     which status port reports a state this rung was not written for; `gate=UNREADABLE:<port>@<idx>`
+     says the gmux did not answer at all (0x00 / 0xFF / the 0xFFFFFFFF timeout sentinel) — that is
+     **not** a mux-state finding, and it is the one outcome that sends this row back to G3.
+  2. Then either `:: igpu-dpy: rung=00 name=census ok=1 …` (`igpu.rs:1285`) — G6 ACCEPTS and G5
+     opens — or the same `pre-switch-not-accepted` (`igpu.rs:1254`; the `why` token is deliberately
+     unchanged so old captures still compare) with `gate=` naming the port.
+  A `gate=ACCEPT` whose `SW_EXT` is still `0x01` is the *expected* shape, not a contradiction: 0x40
+  is printed and no longer gated, exactly as `SW_DISP` already was.
+- **G7 / G5 / A7** — unreachable until G6 accepts, and GMUX-2 is the attempt to make it accept.
+  Residency ("make the switch stay") still cannot be designed before a boot reaches G7. One shape to
+  score when it does: the unwind no longer restores `SWITCH_EXTERNAL` from the 0x40 read, so on a
+  Kepler-owned machine (`READ_EXTERNAL=0x21`, for which this tree has no cited status→write map) the
+  wire carries `:: igpu-dpy: restore ext=SKIPPED (write-target port, no state read) ::`
+  (`igpu.rs:1262`) and `:: igpu: [GMUX] EXTERNAL restore=SKIPPED …` at the revert, and EXTERNAL does
+  **not** vote in the `gmux=MATCH|FAILED` verdict. That is deliberate — scoring a register we chose
+  not to restore would report `FAILED` for a healthy flight — but it means **G7's first metal run
+  leaves the external mux on IGD until power-cycle.** If that costs anything at the glass, the fix is
+  a cited status→write encoding for 0x21, not a re-armed blind write-back.
 - **G9** — its condition is G7's success, not its own code. It is correct to decline.
 - **G2** — the teardown theory is shut out under *the four points we can observe*. If a future
   bootchain moves Point-1 earlier than the firmware's own handoff, the question re-opens; s7 named
