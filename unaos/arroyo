@@ -2844,7 +2844,19 @@ FAULT_PATTERNS='-> FAIL|FAIL ::|FAIL — |PANIC|panicked at |EXCEPTION:'
 # returns 1 if any matched, 0 on a clean log. awk, not grep: control bytes in the serial logs break grep.
 scan_serial_faults() { # $1 = log file, $2 = label used in the quoted lines
     local logf="$1" lbl="${2:-serial}"
-    [ -f "$logf" ] || return 0
+    # S8: A LOG THAT IS NOT THERE IS NOT A CLEAN LOG. This line used to read
+    # `[ -f "$logf" ] || return 0` — the scan's one input missing, and the answer was the same
+    # `0` a spotless boot gets. That is exactly the shape LAWS §5 names ("a check that cannot
+    # fire is an absent one"): with no file the awk below cannot produce a finding for ANY tree,
+    # so the zero was a fact about the harness being read as a fact about the kernel. Every
+    # caller already guards an EMPTY log with its own exit 4, so reaching here with no file at
+    # all means the capture path broke — red, and name the path, because "no faults" would send
+    # the reader to look at the kernel.
+    if [ ! -f "$logf" ]; then
+        echo -e "  ✖ ${lbl}: no log at ${logf} — the fault scan had nothing to read."
+        echo -e "  ✖ ${lbl}: a scan with no input cannot go red; this is a BROKEN CAPTURE, not a clean run."
+        return 1
+    fi
     awk -v p="$FAULT_PATTERNS" -v lbl="$lbl" '
         $0 ~ p { n++; if (n <= 20) printf("  ✖ %s:%d: %s\n", lbl, FNR, $0) }
         END { if (n > 20) printf("  ✖ … and %d more matching line(s)\n", n - 20); exit (n ? 1 : 0) }
@@ -2870,7 +2882,7 @@ scan_serial_faults() { # $1 = log file, $2 = label used in the quoted lines
 #   test-arm       NONE. Its checker is `scan_serial_faults` above: negative-only, no notion of the
 #   test           run having finished, and no spec anywhere replays target/serial-arm.log or is
 #   install-pi     what `./arroyo test` asserts. They therefore KEEP THE FULL WALL and say so.
-#                  (docs/dev/LEDGER.md row S33 carries this as owed; S8 already names `test`/
+#                  (docs/dev/LEDGER.md row SR7 (renamed from S33 at orin 25's fold) carries this as owed; S8 already names `test`/
 #                  `test-arm` as negative-only GATE-BLINDNESS. Declaring a completion source for an
 #                  x86 spec is rmbp's call, not this lane's — an invented marker would be a gate
 #                  asserting a line nobody chose.)
@@ -3100,6 +3112,70 @@ test_aarch64() {
 #   ./arroyo test 30       # 30s run
 SERIAL_LOG="${WORKSPACE_DIR}/target/serial.log"
 
+# ── TESTTRUNC: A TRUNCATED RUN IS NOT A PASS ────────────────────────────────────────────────────
+# THE DEFECT, measured twice by the orin session (docs/dev/QUEUE.md §5, the 2026-09-13 RASTWIN row):
+# the SAME `./arroyo test` on the SAME tree exited 1 on an idle box and 0 under load. Idle, the rast
+# demo took 3,553 ms and the boot reached the failing fixture; loaded, the demo took 6,662 ms, the
+# boot never got there before the wall, and the verdict came back GREEN. It came back green because
+# the only checker on this path was `scan_serial_faults` — a NEGATIVE-ONLY test. "No `-> FAIL` in the
+# log" is satisfied perfectly by a log that stops before the `-> FAIL` would have been printed, so
+# the gate passed BECAUSE it ran out of wall. That is the worst polarity a gate can have: a loaded
+# box is exactly what a session with several executors produces, so the harness got quieter about
+# reds precisely when reds became most likely.
+#
+# THE FIX IS A POSITIVE CLAIM, and it has to be, because no amount of negative evidence can
+# distinguish "nothing went wrong" from "not much happened". The run is a pass only if the capture
+# CONTAINS THE END OF THE RUN: one COMPLETE marker, declared in the spec below, naming the last
+# fixture a healthy default x86 boot prints. Marker present -> the fault scan decides, exactly as
+# before. Marker absent -> `-> TRUNCATED`, rc=1, and never rc=0.
+#
+# THE MARKER IS DERIVED, NEVER INVENTED — the same rule QEMU-FAST above is built on. It lives in a
+# spec file, it was MEASURED off a full-wall run rather than chosen from the source, and it is read
+# through `mbench`'s own `Matcher` (via `qemu_await.py --settled`) rather than grepped for here, so
+# the harness cannot disagree with the replay about what "the run finished" means.
+#
+# WHY `--settled` AND NOT THE TAIL. Every other QEMU verb runs through `qemu_wait_or_complete`,
+# which can shorten a run because it OWNS the QEMU process. `test` does not: the wall lives in
+# `builder/src/main.rs`, which spawns QEMU, sleeps `UNAOS_TEST_SECS` and kills it, and nothing in
+# this script is holding that pid. So this verb still pays its full wall — LEDGER SR7's owed item is
+# unchanged and is a SEPARATE fix in the builder — while the question the tail would have answered
+# is asked of the finished capture instead. The verdict is what was missing; the seconds are not.
+X86_TEST_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-test.spec"
+
+# Ask the settled capture whether the run reached its end. Sets three globals for the caller:
+#   X86_TEST_VERDICT  complete | truncated | nosignal | unknown
+#   X86_TEST_LINE     the log line the marker landed on, or "-"
+#   X86_TEST_MARKER   the marker's pattern, quoted back in the TRUNCATED line
+# Globals rather than a return value because a `local` assigned from `$(…)` swallows the exit
+# status — the same `set -e` trap the k8_script guard below carries a note about.
+x86_test_completion() { # $1 = log file
+    local logf="$1" out="" rc=0
+    X86_TEST_VERDICT=unknown; X86_TEST_LINE="-"
+    X86_TEST_MARKER=$(awk '/^COMPLETE /{ sub(/^COMPLETE[ \t]+/, ""); print; exit }' \
+                          "$X86_TEST_SPEC" 2>/dev/null)
+    [ -n "$X86_TEST_MARKER" ] || X86_TEST_MARKER="(no COMPLETE directive in ${X86_TEST_SPEC})"
+    if [ ! -f "$X86_TEST_SPEC" ]; then
+        echo -e "${COLOR_RED}✖ test: the completion spec ${X86_TEST_SPEC} is MISSING — this verb cannot say whether the run finished.${COLOR_RESET}"
+        return 0
+    fi
+    out=$(python3 "${WORKSPACE_DIR}/scripts/qemu_await.py" --settled --log "$logf" \
+              --spec "$X86_TEST_SPEC" --label test) || rc=$?
+    X86_TEST_VERDICT=$(printf '%s\n' "$out" | awk '/^SETTLED /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="status")print a[2]}}')
+    X86_TEST_LINE=$(printf '%s\n' "$out" | awk '/^SETTLED /{for(i=2;i<=NF;i++){split($i,a,"=");if(a[1]=="complete_at")print a[2]}}')
+    [ -n "$X86_TEST_LINE" ] || X86_TEST_LINE="-"
+    case "$X86_TEST_VERDICT" in
+      complete|truncated|nosignal) ;;
+      *)
+        # THE OUTCOME THAT MUST NOT BE SILENT, and the reason this is not `|| true`: a broken
+        # checker that fell through to "clean" would restore the exact defect this block exists to
+        # remove, with the gate looking healthier than before. Unknown is NOT a pass below.
+        echo -e "${COLOR_RED}✖ test: the completion checker produced no verdict line (rc ${rc}) — scripts/qemu_await.py --settled is BROKEN. This run gets NO pass.${COLOR_RESET}"
+        X86_TEST_VERDICT=unknown
+        ;;
+    esac
+    return 0
+}
+
 test_x86_64() {
     local secs="${1:-20}"
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP
@@ -3133,20 +3209,24 @@ test_x86_64() {
     UNAOS_SERIAL_LOG="$SERIAL_LOG" UNAOS_TEST_SECS="$secs" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
     if [ -n "$qmp_pid" ]; then wait "$qmp_pid" 2>/dev/null || true; fi
-    # QEMU-FAST: `test` is NOT exempt — it has no COMPLETION SIGNAL, which is a different thing.
-    # Its checker is `scan_serial_faults` below: negative-only, with no notion of the run having
-    # finished, and nothing in scripts/specs/ is what this verb asserts (x86-witness.spec DOES carry
-    # two structural COMPLETE markers, but it is scoped to a paygo/witness/logts-armed METAL
-    # capture, so adopting it here would be asserting a spec this verb does not run — and x86 specs
-    # are rmbp's lane). So the full wall stands, and the capture's SIDECAR says so rather than
-    # leaving a reader to guess. The wall itself lives in builder/src/main.rs's `thread::sleep`
-    # (the builder owns this QEMU, not this script), so when rmbp declares a completion source the
-    # wait has to be plumbed through there — recorded as owed in LEDGER S33, not silently skipped.
+    # QEMU-FAST: `test` STILL PAYS ITS FULL WALL — the wall lives in builder/src/main.rs's
+    # `thread::sleep` (the builder owns this QEMU, not this script), so shortening it is a builder
+    # change and stays owed in LEDGER SR7. What this verb no longer lacks is a COMPLETION VERDICT:
+    # see the TESTTRUNC block above `test_x86_64` for why those are two different things, and why
+    # the second one is the half that was letting a loaded box hide reds.
     xwall=$(awk -v a="$xt0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1f", b-a}')
-    echo -e "${COLOR_YELLOW}⚡ test: no completion signal declared for this verb — full wall ${xwall}s, saved 0s.${COLOR_RESET}"
+    # The capture is FINISHED here — the builder has already killed QEMU and `cargo run` has
+    # returned — which is precisely the precondition `--settled` needs and the same ordering rule
+    # `qemu_run_sidecar` documents: nothing further can land in the log.
+    x86_test_completion "$SERIAL_LOG"
+    case "$X86_TEST_VERDICT" in
+      complete) echo -e "${COLOR_GREEN}⚡ test: the run REACHED its completion marker (serial.log line ${X86_TEST_LINE}); full wall ${xwall}s.${COLOR_RESET}" ;;
+      *)        echo -e "${COLOR_YELLOW}⚡ test: completion verdict '${X86_TEST_VERDICT}' after a full wall of ${xwall}s — see the verdict below.${COLOR_RESET}" ;;
+    esac
     qemu_run_sidecar "$SERIAL_LOG" "mode=full" "completion_at=-" \
-        "grace=${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}" "wall=${xwall}" "cap=${secs}" "spec=-" \
-        "sha=${UNAOS_GIT_SHA:-unstamped}" "label=test"
+        "grace=${UNAOS_QEMU_GRACE:-$QEMU_GRACE_DEFAULT}" "wall=${xwall}" "cap=${secs}" \
+        "spec=${X86_TEST_SPEC}" "sha=${UNAOS_GIT_SHA:-unstamped}" "label=test" \
+        "completion=${X86_TEST_VERDICT}" "complete_line=${X86_TEST_LINE}"
 
     echo ""
     echo -e "${COLOR_PURPLE}════════════ SERIAL LOG (${SERIAL_LOG}) ════════════${COLOR_RESET}"
@@ -3164,7 +3244,27 @@ test_x86_64() {
         echo -e "${COLOR_RED}❌ x86_64 test FAILED — the serial log carries fault text (lines above). Log at ${SERIAL_LOG}${COLOR_RESET}"
         return 1
     fi
-    echo -e "${COLOR_GREEN}✅ Test run complete. Full log saved at ${SERIAL_LOG}${COLOR_RESET}"
+    # TESTTRUNC: the POSITIVE half of the verdict, and it runs AFTER the fault scan on purpose —
+    # mbench's `run_verdict` already fixed this precedence for the replay path ("a FORBID hit is
+    # positive evidence of a fault; a short log never excuses it"), and the shell twin must not
+    # order it the other way, or the same capture would be called TRUNCATED here and FAIL there.
+    # Both are rc=1; what differs is which sentence the reader is sent to investigate.
+    if [ "$X86_TEST_VERDICT" != complete ]; then
+        case "$X86_TEST_VERDICT" in
+          truncated)
+            echo -e "${COLOR_RED}❌ x86_64 test -> TRUNCATED (did not reach ${X86_TEST_MARKER} in ${secs}s; rc=1)${COLOR_RESET}" ;;
+          nosignal)
+            echo -e "${COLOR_RED}❌ x86_64 test -> TRUNCATED (no COMPLETE marker declared in ${X86_TEST_SPEC}, so nothing can say this run finished; rc=1)${COLOR_RESET}" ;;
+          *)
+            echo -e "${COLOR_RED}❌ x86_64 test -> TRUNCATED (the completion checker gave no verdict; rc=1)${COLOR_RESET}" ;;
+        esac
+        echo -e "${COLOR_RED}  A run that stopped before its last fixture is NOT a pass: the faults it would have"
+        echo -e "  shown had not happened yet, so a clean fault scan proves nothing about them."
+        echo -e "  Give it more wall (\`./arroyo test $((secs * 2))\`) or a quieter box, then re-read."
+        echo -e "  Log at ${SERIAL_LOG}; the run stamp is beside it at ${SERIAL_LOG}.run${COLOR_RESET}"
+        return 1
+    fi
+    echo -e "${COLOR_GREEN}✅ Test run complete — the boot reached its last fixture (serial.log line ${X86_TEST_LINE}) and the log is clean. Full log saved at ${SERIAL_LOG}${COLOR_RESET}"
 }
 
 # --- Utility Functions ---

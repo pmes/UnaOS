@@ -27,9 +27,13 @@ distinguishable from a broken pattern: it carries a feature or symbol that
 certainly exists and refuses to give a verdict when the probe is not seen. A
 control failure is a broken gate, not a clean tree, and it is reported as such.
 
-**Where they run.** They run inside `check_both` in `unaos/arroyo`, after the
-compile legs; `test` and `test-arm` do not run them. Each has its own failure
+**Where they run.** Most run inside `check_both` in `unaos/arroyo`, after the
+compile legs; `test` and `test-arm` do not run those. Each has its own failure
 line in `check_both` so that a red is attributed to the gate that produced it.
+GATE-TESTTRUNC below is the exception, and its section says so: it is held to the
+same standard — invariant, control, recorded go-red, legitimate update — but it
+asserts a property of a QEMU RUN rather than of the tree, so it lives on the x86
+`test` legs and `check` cannot see it.
 
 ---
 
@@ -345,6 +349,81 @@ are recorded in the commit rather than absorbed.
 or — for a hole another track must claim — add it to the allowlist in
 `check_kernel_cfg` with its owner named. Removing an allowlist entry without
 adding the leg reintroduces a silent hole.
+
+---
+
+## GATE-TESTTRUNC — a run that stopped early cannot be a pass
+
+**Where this one runs, because it is the exception to the header above.** Not in
+`check_both`: it asserts a property of a QEMU RUN, so it lives on the x86 `test`
+legs (`test_x86_64` in `unaos/arroyo`, and therefore `test`, `test-fat` and
+`test-selfhost`, which all enter through it). `./arroyo check` cannot see it and
+is not asked to.
+
+**Invariant.** `./arroyo test` exits 0 only if `target/serial.log` contains the
+`COMPLETE` marker declared in `unaos/scripts/specs/x86-test.spec` — the last
+fixture of the x86 boot ladder. A capture without it is `-> TRUNCATED`, rc=1.
+
+**Why a gate.** The verdict on this path was `scan_serial_faults`, and it is
+NEGATIVE-ONLY: it reports the absence of fault text. A log that stops before the
+fault would have been printed satisfies that perfectly, so a boot that ran out of
+wall was indistinguishable from a boot that went well. The orin session measured
+the consequence twice on one tree (`docs/dev/QUEUE.md` §5, the 2026-09-13 RASTWIN
+row): idle, the rast demo took 3,553 ms, the boot reached the failing fixture and
+`./arroyo test` exited **1**; under load the demo took 6,662 ms, the boot never
+got there, and the SAME command on the SAME tree exited **0**. The polarity is
+what makes it a gate rather than a nicety — a loaded box is exactly what a
+session running several executors produces, so the harness went quiet about reds
+at the moment reds became most likely. No amount of negative evidence fixes that;
+only a positive claim that the run reached its end does.
+
+**Mechanism.** `x86_test_completion` (arroyo) runs `scripts/qemu_await.py
+--settled` over the FINISHED capture and reads back one `SETTLED status=` value.
+`--settled` is the existing completion waiter's other mode: same `mbench.Matcher`,
+same `COMPLETE` directives, asked of a capture that is already over instead of one
+still being written. It exists because `test` does not own its QEMU — the wall is
+`builder/src/main.rs`'s `thread::sleep` — so there is nothing for a tail to
+shorten, while the question a tail answers is exactly the one the verdict lacked.
+The verdict is three-valued on that status: `complete` hands the log to the
+unchanged fault scan; `truncated`, `nosignal` and a broken checker are each rc=1
+with their own reason on stdout. The fault scan is checked FIRST, matching
+`mbench.run_verdict`'s recorded precedence (a fault is positive evidence and a
+short log never excuses it), so one capture cannot be called TRUNCATED here and
+FAIL by the replay.
+
+**Control.** The spec's zero is distinguishable from a rotted pattern because the
+same spec over the same box produces both outcomes on demand, and both were run:
+a 120 s wall settles `complete` naming the log line, an 8 s wall settles
+`truncated`. A stale marker would report `truncated` for both. The marker itself
+was measured rather than read out of the source — a default boot (1537 lines) and
+a `UNAOS_WC=1` boot (2149 lines, 612 more, all of them EARLIER) end their ladder
+at the same zeolite block, which is why a compositor line would have been the
+wrong choice and would have red-flagged every healthy default run.
+
+**Goes red when** the capture does not reach the marker. **GO-RED proof by
+mutation, the wall being the thing mutated:** `UNAOS_WC=1 ./arroyo test 8` — a
+wall that cannot reach the marker — exits **1** with
+`❌ x86_64 test -> TRUNCATED (did not reach :: zeolite: metrics …forwarded upstream :: in 8s; rc=1)`
+and a sidecar reading `completion=truncated` / `complete_line=-`; the same tree at
+`UNAOS_WC=1 UNAOS_QEMU_FULL=1 ./arroyo test 120` exits **0** with
+`completion=complete` / `complete_line=1984`. Before the change, the 8 s run
+exited 0.
+
+**Companion, same commit:** `scan_serial_faults` on a MISSING log returned 0 — the
+scan's one input absent, answered with the same 0 a spotless boot gets (LEDGER
+S8). It now returns 1 naming the path. Proved by lifting the function into a probe
+harness: missing log → rc=1 with the two-line reason; a clean capture → rc=0 and a
+capture carrying `-> FAIL` → rc=1, both unchanged, so the pattern list itself did
+not move.
+
+**Legitimate update.** When the boot grows a fixture after zeolite, the marker
+becomes EARLY rather than wrong — it stops covering the new tail and never
+false-reds. Move it in the commit that adds the fixture, re-measure the default
+and `UNAOS_WC=1` runs, and rewrite the MEASURED block in the spec with the new
+line numbers. Do not add a second `COMPLETE` to cover two configurations: markers
+are OR-ed (`Matcher.complete()` takes `any(d.hits …)`), so a second one can only
+weaken the file. Lengthening a wall (`./arroyo test 90`) is the right response to
+a red on a loaded box; deleting the marker is not.
 
 ---
 
