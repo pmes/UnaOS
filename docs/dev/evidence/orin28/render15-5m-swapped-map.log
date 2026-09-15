@@ -1,0 +1,803 @@
+[ INFO]: crates/bootloader/src/main.rs@792: KELF min=0x0 max=0x265208 pg=614
+[ INFO]: crates/bootloader/src/main.rs@805: Allocated kernel at 0x25ac9d000
+[ INFO]: crates/bootloader/src/main.rs@925: Found DTB at 0x25f501000, size: 837900 bytes
+[ INFO]: crates/bootloader/src/main.rs@961: boot volume FAT serial 0x93d5c1ff (extended BPB BS_VolID)
+[ INFO]: crates/bootloader/src/main.rs@1208: JB8[pre-EBS]: FPCI CFG_0=0x01200020 CFG_1=0x08000524 (mem=0 busmaster=1) CFG_4=0x0180ff05 CFG_7=0x000001ff
+[ INFO]: crates/bootloader/src/main.rs@1235: JB8[pre-EBS]: FALCON CPUCTL=0xffffffff (halted=1 stopped=1) BOOTVEC=0xffffffff fw codetag=0x00000000 codesize=0x0000c85f
+[ INFO]: crates/bootloader/src/main.rs@1248: JB8[pre-EBS]: xHC cap=0x01200020 USBSTS=0x00000010 CNR=0
+[ INFO]: crates/bootloader/src/main.rs@1277: JB9d[pre-EBS]: MBOX probe SKIPPED ? falcon CSB reads all-ones (CPUCTL=0xffffffff); the block is not answering, so the owner-claim/MSG_ENABLED writes would be a poke into a dead aperture (JB9d-GUA
+RD)
+[ INFO]: crates/bootloader/src/main.rs@1165: JB6: dummy ACPI 2.0 table installed (RSDP @0x25e042000, XSDT @0x25e042040) ? XUSB Falcon teardown wil:l:  sFeRlGfU-AsRkDi:p b
+o�o�tM mvIonlsutmael lsPerroitaolc=o0lxI9n3tde5rcf1afcfe :� �2�7 ADBeFf0a5u5l-tB-1wBr8i-t4eC 2s6u-b8s0t4i8t-u7t4i8oFn3 7gBuAaAr2dD FA R0ME
+D ::
+:: tegra: mmu live (EL2) — RAM Normal-WB + Tegra Device-nGnRE mapped ::
+:: tegra: dark-window guard — 89 byte(s) dropped pre-map ::
+:: video: edid present=1 hdr=OK sum=OK native=1920x1080 pclk_khz=148500 ext=1 len=256 ::
+:: tegra: mmu regs — SCTLR 0x30c5183d->0x30c5183d TCR=0x80813519 MAIR=0x4404ff TTBR0=0x25aeec000 RAM-GiB-mask=0x3fc ::
+:: tegra: XCARVE-6 carveout exclusion — 6 protected window(s) UNMAPPED from the cacheable map (SNOC-firewalled DRAM, no software writer) ::
+:: tegra:   window[0] [0x26b800000,0x26c180000) 9728 KiB @ GiB 9 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[1] [0xbe000000,0xc4000000) 98304 KiB @ GiB 2 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[2] [0x26c400000,0x279e00000) 223232 KiB @ GiB 9 (source: QUIRK (DTB silent; extent = bounded GUESS)) ::
+:: tegra:   window[3] [0x26c180000,0x26c400000) 2560 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: tegra:   window[4] [0x26b5f0000,0x26b7f0000) 2048 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: tegra:   window[5] [0x279e00000,0x27a670000) 8640 KiB @ GiB 9 (source: DTB /reserved-memory) ::
+:: AARCH64 exception vectors installed (VBAR_EL2 = 0x25ad61000) ::
+:: tegra: JM7 — GOP fb addr=0x0 size=0x0 1920x1080 stride=2048 bpp=4 ::
+:: tegra: JD1 — simple-fb /chosen/framebuffer: 1920x1080 stride=8192 fmt='x8r8g8b8' memory-region[0x1d1] reg[] ::
+:: tegra: JD1 — resv /reserved-memory/framebuffer@2,79E00000 reg[0x2 0x79e00000 0x0 0x870000] ::
+:: tegra: JD1 — scanout: base=0x279e00000 size=0x870000 1920x1080 stride=8192B fmt=x8r8g8b8 (Bgr) src=memory-region sane=true ::
+:: tegra: fb L2 repair — 5 block(s) re-mapped in GiB 9 [0x279e00000,0x27a670000) ::
+:: tegra: JD1 — panel LIVE: inherited scanout mapped + fbcon mirroring the boot log ::
+:: tegra: JB1d — MIDR=0x410fd421 (r0p1) — reading CPUECTLR_EL1 (IMPDEF) next ::
+:: tegra: JB1d — CPUECTLR_EL1=0xa000400b40543000 (erratum-1941500 bit8=0) ::
+:: tegra: JB1a — DTB @0x25f501000 size=0xcc90c ::
+:: tegra: JB1a — /bpmp mboxes[0x125 0x0 0x13] shmem[0x126 0x127] memory-region[] ::
+:: tegra: JB1a — ph 0x126 = /sram@40000000/sram@70000 reg[0x70000 0x1000] | parent /sram@40000000 reg[0x0 0x40000000 0x0 0x80000] ranges[0x0 0x0 0x40000000 0x80000] ::
+:: tegra: JB1a — ph 0x127 = /sram@40000000/sram@71000 reg[0x71000 0x1000] | parent /sram@40000000 reg[0x0 0x40000000 0x0 0x80000] ranges[0x0 0x0 0x40000000 0x80000] ::
+:: tegra: JB1a — no bpmp/shmem reserved-memory children ::
+:: tegra: JB1b — geom: shmem_tx=0x40070000 shmem_rx=0x40071000 hsp=0x3c00000 db_master=19 DAIF=0b1111 ::
+:: tegra: JB1b — touching HSP @0x3c00000 (dimensioning) ::
+:: tegra: JB1b — HSP dim=0x8a228 (nSM=8 nSS=2 nAS=2) db_base=0x3c90000 bpmp_db=0x3c90300 enable=0xc0060002 ::
+:: tegra: JB1b — touching SYSRAM: txq=0x40070300 rxq=0x40071300 pre-sync counts/state tx=[0x0 0x0 0x0] rx=[0x0 0x1 0x0] ::
+:: tegra: JB1b — IVC channel ESTABLISHED ::
+:: tegra: JB1b — MRQ_PING err=0 reply=0xab5466 (want 0xab5466) -> PASS ::
+:: tegra: JB5 — PG 12 GET_STATE (read-only) err=0 = 0x1 ::
+:: tegra: JB5 — PG 10 GET_STATE (read-only) err=0 = 0x1 ::
+:: tegra: JB5 — FPCI CFG first touch @0x03600000 (raw handoff) ::
+:: tegra: JB5 — handoff FPCI: CFG_0=0x229810de CFG_1=0x00b00006 (io=0 mem=1 busmaster=1) CFG_4=0x0360000c CFG_7=0x0365000c ::
+:: tegra: JB5 — minimal BAR2 route: CFG_1 rb=0x00b00006 CFG_4 rb=0x0360000c CFG_7 rb=0x0365000c ::
+:: tegra: JB5 — witness[raw-handoff]: cap0=0x01200020 USBSTS=0x00000011 (CNR=0 HCH=1) CPUCTL=0xffffffff (halted=1 stopped=1) mbox_owner=0x0 ::
+:: tegra: JB6 — CSB page-sel 0x9c: pre=0x00000000 wrote=0x1234 rb=0x00001234 STICKS=true ::
+:: tegra: JB6 — BAR2[0x000] = 0x00140009 ::
+:: tegra: JB6 — BAR2[0x004] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x008] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x00c] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x010] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x09c] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e0] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e4] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x0e8] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x100] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x104] = 0x00000000 ::
+:: tegra: JB6 — BAR2[0x110] = 0x00000000 ::
+:: tegra: JB6 — CSB[0x00000] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00100] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00104] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00110] page_want=0x0 page_rb=0x00000000 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x00f00] page_want=0x7 page_rb=0x00000007 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x01000] page_want=0x8 page_rb=0x00000008 val=0xffffffff ::
+:: tegra: JB6 — CSB[0x40000] page_want=0x200 page_rb=0x00000200 val=0xffffffff ::
+:: tegra: JB11 [raw-handoff] — Falcon fw-header census: BAR2+0x1000 (IOCTL_CFGTBL_READ) -> BAR2+0x01c; no xHCI operational register is written ::
+:: tegra: JB11 [raw-handoff] — CNR gate: USBSTS=0x00000011 CNR=0 after 1 poll(s) / ~1 us — READY (mainline waits for exactly this before reading the header) ::
+:: tegra: JB11 [raw-handoff] — fw ident: magic="XUSBFW.." (0x0000574642535558) version_id=0x80050003 (Version: 80.05) ::
+:: tegra: JB11 [raw-handoff] — fw built: created=1676000890 (epoch) = 2023-02-10T03:48:10Z UTC ::
+:: tegra: JB11 [raw-handoff] — fw image: boot_codetag=0x00000000 boot_codesize=51295 B rodata_img_offset=0x00000000 fwimg_len=196608 B cksum=0x000094ba ::
+:: tegra: JB11 [raw-handoff] — fw L2 IMEM: start=0x00000000 end=0x00000000 (span=0 B) ::
+:: tegra: JB11 [raw-handoff] — verdict: Falcon ANSWERING — the resident firmware served its own header over BAR2; no inherited-state wall on the header path ::
+:: tegra: JB7 — Falcon clock census (read-only MRQ_CLK IS_ENABLED): 9 DTB + 4 leaf ::
+:: tegra: JB7 — CLK 267 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 269 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 268 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 275 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 14 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 272 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 103 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 14 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 100 IS_ENABLED (dtb) err=0 = 1 ::
+:: tegra: JB7 — CLK 267 IS_ENABLED (leaf) err=0 = 1 ::
+:: tegra: JB7 — CLK 269 IS_ENABLED (leaf) err=0 = 1 ::
+:: tegra: JB7 — CLK 270 IS_ENABLED (leaf) err=0 = 0 ::
+:: tegra: JB7 — CLK 271 IS_ENABLED (leaf) err=0 = 0 ::
+:: tegra: JB0 — fan PWM3 clk 107 enable -> err=0 ::
+:: tegra: JB0 — fan PWM3 reset 70 deassert -> err=0 ::
+:: tegra: JB0 — touching fan PWM3 CSR @0x32a0000 (always-on, not PG-gated) ::
+:: tegra: JB0 — fan ON (~40% duty): CSR<-0x80660000 (readback 0x80660000) -> PASS ::
+:: tegra: JB1c — XUSB ids from DTB: 9 clocks, 0 resets, 2 power-domains ::
+:: tegra: JB1c — PG 12 ON -> err=0 ::
+:: tegra: JB1c — PG 10 ON -> err=0 ::
+:: tegra: JB1c — CLK 267 enable -> err=0 ::
+:: tegra: JB1c — CLK 269 enable -> err=0 ::
+:: tegra: JB1c — CLK 268 enable -> err=0 ::
+:: tegra: JB1c — CLK 275 enable -> err=0 ::
+:: tegra: JB1c — CLK 14 enable -> err=0 ::
+:: tegra: JB1c — CLK 272 enable -> err=0 ::
+:: tegra: JB1c — CLK 103 enable -> err=0 ::
+:: tegra: JB1c — CLK 14 enable -> err=0 ::
+:: tegra: JB1c — CLK 100 enable -> err=0 ::
+:: tegra: JB1c — probing XUSB host @0x3610000 (was EL3-fatal in JX1) ::
+:: tegra: JB1c — XUSB ALIVE: xHCI v1.20 CAPLENGTH=0x20 HCSPARAMS1=0x08000524 HCCPARAMS1=0x0180ff05 USBCMD=0x00000000 USBSTS=0x00000011 -> PASS ::
+:: tegra: JB2a — port 1 CONNECTED: PORTSC=0x00081603 (PLS=0 speed=5) ::
+:: tegra: JB2a — port 6 CONNECTED: PORTSC=0x00040ee1 (PLS=7 speed=3) ::
+:: tegra: JB2a — port 7 CONNECTED: PORTSC=0x00000603 (PLS=0 speed=1) ::
+:: tegra: JB2a — port survey done (8 ports scanned) ::
+:: UnaOS aarch64 kernel — Jetson Orin Nano (Tegra234), headless serial console ::
+:: AARCH64 boot diag: EL=2  CNTFRQ=31250000 Hz  MMU=on  DAIF(DAIF)=0b1111 ::
+:: tegra: JM4 — bringing up Tegra234 GIC-600 + generic timer (boot core) ::
+:: AARCH64 GICv3 init (GICD=0xf400000, GICR=0xf440000, 992 INTIDs) ::
+:: GIC self-SGI delivered (v3) ::
+:: AARCH64 generic timer armed (CNTFRQ=31250000 Hz, 250 Hz tick, INTID 30) ::
+:: AARCH64 timer diag: CNTP_CTL=0x5 (ISTATUS=1)  GICD PPI30 pending=true ::
+AARCH64: timer heartbeat live (first tick).
+:: AARCH64 timer LIVE: IRQ delivery confirmed; idle = WFI ::
+:: AARCH64 Memory Init ::
+:: tegra: HEAP-GUARD — DTB /reserved-memory contributed 3 carveout range(s) (cap 48) to the exclusion set ::
+:: tegra: DMA-WINDOW STOP — Tegra RC node is okay but carries NO dma-ranges property = 0x0 / 0x0; inbound-DMA window NOT derivable (heap falls back to the RAS-2 heuristic) ::
+[el0heap] heap ladder rung 256 MiB: REFUSED — window [0x24a89d000, 0x25ac9d000) does not contain the flown span [0x267fca000, 0x26b3ca000) (would relocate the heap)
+[el0heap] heap ladder rung 192 MiB: REFUSED — window [0x24e89d000, 0x25ac9d000) does not contain the flown span [0x267fca000, 0x26b3ca000) (would relocate the heap)
+[el0heap] heap ladder rung 128 MiB: REFUSED — window [0x25289d000, 0x25ac9d000) does not contain the flown span [0x267fca000, 0x26b3ca000) (would relocate the heap)
+[el0heap] heap ladder rung 96 MiB: REFUSED — window [0x25489d000, 0x25ac9d000) does not contain the flown span [0x267fca000, 0x26b3ca000) (would relocate the heap)
+[el0heap] heap ladder rung 64 MiB: REFUSED — window [0x25689d000, 0x25ac9d000) does not contain the flown span [0x267fca000, 0x26b3ca000) (would relocate the heap)
+[el0heap] heap ladder: every rung refused; seating the flown 48 MiB window at base 0x267fca000
+:: tegra: [ga10b4nc] rung-4 DMA window reserved [0x80200000, 0x80400000) (2048 KiB) — the NEXT clean L2-split block after NET4A's [0x80000000, +2048 KiB); 3 candidate(s) scanned, 1 rejected ::
+:: tegra: [net4A] sub-4GiB Normal-NC DMA window reserved [0x80000000, 0x80200000) (2048 KiB) — lowest clean L2-split block in [0x80000000, 0x100000000); low-DRAM census: 2 Usable region(s) / 1983 MiB usable, 1 carveout(s) below 4 GiB, 2 candidate block(s) scanned (rejected: carveout=0 heap/nc=0 window=0 unsplit=0) ::
+:: tegra: HEAP-GUARD — kernel heap [0x2683ca000, 0x26b3ca000) (48 MiB), highest clean window (RAS-2 heuristic — NO PCIe dma-ranges in DTB, inbound-DMA window NOT derivable; degraded), clear of 162 carveout range(s) (UEFI-reserved + DTB /reserved-memory) ::
+:: tegra: [net4B] Normal-NC DMA window reserved [0x268000000, 0x268200000) (2048 KiB), carved just below the heap in the same clean+DMA span ::
+:: KERNEL HEAP ALLOCATED ::
+:: tegra: JB1b — touching HSP @0x3c00000 (dimensioning) ::
+:: tegra: JB1b — HSP dim=0x8a228 (nSM=8 nSS=2 nAS=2) db_base=0x3c90000 bpmp_db=0x3c90300 enable=0xc0060002 ::
+:: tegra: [ga10bprobe4a] BPMP channel reopened from DTB geometry (no IVC re-sync): txq=0x40070300 rxq=0x40071300 state tx=0x0 rx=0x0 ::
+[ga10bprobe4a] rung 4a (BCR WRITABILITY CENSUS inside rung 3's PROVEN power+clock bracket, re-proven THIS boot; no ignition; symmetric restore; RETURNS) — six BCR DMA address writes + one dmacfg write WITHOUT the lock bit, each announced and read back, stop at first mismatch, restore all seven to zero. bcr_ctrl is NOT written by 4a. Summary vocabulary: BCR-ALLHELD | BCR-SOMEHELD | BCR-NONEHELD | BCR-SELFLOCKED | BCR-STICKY | REFUSED reason=<no-gpu-node|no-power-domains|pg-timeout|pg-on-refused|pg-readback-not-on|bcr-locked|bcr-dmacfg-unreadable|bcr-ctrl-unreadable|no-dma-window>. SELFLOCKED and STICKY spend the power cycle and end in SYSTEM_OFF.
+[ga10bprobe4a] gpu@ node: BAR0=0x17000000 (DTB reg[0], EXT) power-domain-id=35 (DTB power-domains, EXT) clocks=3 (DTB clocks, EXT): 304 41 236 0 0 0 0 0
+[ga10bprobe4a] BPMP MRQ_PG GET_STATE (read-only) id=35 — the pre-state, before anything is driven
+[ga10bprobe4a] pg-before id=35 err=0 state=0x1
+[ga10bprobe4a] pg-readback id=35 err=0 state=0x1
+[ga10bprobe4a] clk 304 IS_ENABLED (before) err=0 = 0
+[ga10bprobe4a] clk 304 ENABLE — BPMP request; if this is the LAST line the transaction hung the boot
+[ga10bprobe4a] clk 304 ENABLE err=0
+[ga10bprobe4a] clk 41 IS_ENABLED (before) err=0 = 0
+[ga10bprobe4a] clk 41 ENABLE — BPMP request; if this is the LAST line the transaction hung the boot
+[ga10bprobe4a] clk 41 ENABLE err=0
+[ga10bprobe4a] clk 236 IS_ENABLED (before) err=-22 = 0
+[ga10bprobe4a] clk 304 IS_ENABLED (after) err=0 = 1
+[ga10bprobe4a] clk 41 IS_ENABLED (after) err=0 = 1
+[ga10bprobe4a] clk 236 IS_ENABLED (after) err=-22 = 1
+[ga10bprobe4a] clocks: 2 of 3 running after this rung's enables (236 answering err=-22 is the rung-3 datum, expected)
+[ga10bprobe4a] about-to-read priscv_bcr_dmacfg reg=0x1711166c (P1: lock_locked bit31 must be 0) — if this is the LAST line, THAT read was EL3-fatal
+[ga10bprobe4a] priscv_bcr_dmacfg @0x66c = 0x00000000 lock_locked=0
+[ga10bprobe4a] about-to-read priscv_bcr_ctrl reg=0x17111668 (P2: baseline; rung 3 read 0x00000110) — if this is the LAST line, THAT read was EL3-fatal
+[ga10bprobe4a] bcr_ctrl_before=0x00000110 bcr_ctrl_baseline_changed=0 (a value other than 0x00000110 is a datum, not a stop)
+:: tegra: NET-4B — DMA window [0x80200000, 0x80400000) (2048 KiB) mapped Normal-NC (MAIR AttrIdx 2) in EL2 + EL1-twin table(s) ::
+[ga10bprobe4a] dmabuf_pa=0x80200000 dmabuf_size=0x200000 (this kernel's OWN block, Normal-NC, below 4 GiB, clear of every carveout the heap dodges and of the NIC's window) fmcdata_off=0x80000 pkc_off=0x100000
+[ga10bprobe4a] dmabuf_pattern=0x4a10b4a5 filled 2048 KiB, dsb sy
+[ga10bprobe4a] about-to-WRITE priscv_bcr_fmccode_lo reg=0x17111678 val=0x80200000 (BCR DMA address, A-step) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe4a] priscv_bcr_fmccode_lo @0x678 wrote=0x80200000 read=0x80200000 held=1
+[ga10bprobe4a] about-to-WRITE priscv_bcr_fmccode_hi reg=0x1711167c val=0x00000000 (BCR DMA address, A-step) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe4a] priscv_bcr_fmccode_hi @0x67c wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe4a] about-to-WRITE priscv_bcr_fmcdata_lo reg=0x17111680 val=0x80280000 (BCR DMA address, A-step) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe4a] priscv_bcr_fmcdata_lo @0x680 wrote=0x80280000 read=0x80280000 held=1
+[ga10bprobe4a] about-to-WRITE priscv_bcr_fmcdata_hi reg=0x17111684 val=0x00000000 (BCR DMA address, A-step) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe4a] priscv_bcr_fmcdata_hi @0x684 wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe4a] about-to-WRITE priscv_bcr_pkcparam_lo reg=0x17111670 val=0x80300000 (BCR DMA address, A-step) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe4a] priscv_bcr_pkcparam_lo @0x670 wrote=0x80300000 read=0x80300000 held=1
+[ga10bprobe4a] about-to-WRITE priscv_bcr_pkcparam_hi reg=0x17111674 val=0x00000000 (BCR DMA address, A-step) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe4a] priscv_bcr_pkcparam_hi @0x674 wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe4a] about-to-WRITE priscv_bcr_dmacfg reg=0x1711166c val=0x00000002 (target_noncoherent_system ONLY; the lock_locked bit is DELIBERATELY NOT SET) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe4a] priscv_bcr_dmacfg @0x66c wrote=0x00000002 read=0x00000002 held=1
+[ga10bprobe4a] about-to-WRITE priscv_bcr_fmccode_lo reg=0x17111678 val=0x00000000 (restore to zero, as found) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe4a] priscv_bcr_fmccode_lo @0x678 wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe4a] about-to-WRITE priscv_bcr_fmccode_hi reg=0x1711167c val=0x00000000 (restore to zero, as found) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe4a] priscv_bcr_fmccode_hi @0x67c wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe4a] about-to-WRITE priscv_bcr_fmcdata_lo reg=0x17111680 val=0x00000000 (restore to zero, as found) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe4a] priscv_bcr_fmcdata_lo @0x680 wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe4a] about-to-WRITE priscv_bcr_fmcdata_hi reg=0x17111684 val=0x00000000 (restore to zero, as found) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe4a] priscv_bcr_fmcdata_hi @0x684 wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe4a] about-to-WRITE priscv_bcr_pkcparam_lo reg=0x17111670 val=0x00000000 (restore to zero, as found) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe4a] priscv_bcr_pkcparam_lo @0x670 wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe4a] about-to-WRITE priscv_bcr_pkcparam_hi reg=0x17111674 val=0x00000000 (restore to zero, as found) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe4a] priscv_bcr_pkcparam_hi @0x674 wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe4a] about-to-WRITE priscv_bcr_dmacfg reg=0x1711166c val=0x00000000 (restore to zero, as found) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe4a] priscv_bcr_dmacfg @0x66c wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe4a] about-to-read priscv_bcr_dmacfg reg=0x1711166c (lock_after) — if this is the LAST line, THAT read was EL3-fatal
+[ga10bprobe4a] bcrheld=7/7 dmabuf_pa=0x80200000 lock_after=0 unreadable=0 -> BCR-ALLHELD
+[ga10bprobe4a] clk 41 DISABLE (restore) err=0
+[ga10bprobe4a] clk 304 DISABLE (restore) err=0
+[ga10bprobe4a] restored: pg=0x1 (was 1) clocks-disabled=2 of 2 enabled here — BCR registers verified back to zero above
+[ga10bprobe4a] rung 4a complete — RETURNING to the boot (no SYSTEM_OFF; the flight is a full boot)
+:: SDMMC: ORIN-SDMMC-1 Tegra234 microSD READ-ONLY recon (DTB @0x25f501000 size=0xcc90c) ::
+:: SDMMC:   M1: candidate /bus@0/mmc@3400000 reg=0x03400000(size 0x20000) status=okay removable cd-gpios compat='nvidia,tegra234-sdhci|nvidia,tegra186-sdhci|' ::
+:: SDMMC:   M1: candidate /bus@0/mmc@3460000 reg=0x03460000(size 0x20000) status=disabled removable no-cd compat='nvidia,tegra234-sdhci|nvidia,tegra186-sdhci|' ::
+:: SDMMC:   M1: picked /bus@0/mmc@3400000 @ 0x03400000 (size 0x20000) as the microSD slot ::
+:: SDMMC:   M1: controller window 0x03400000(+0x20000) is in the GiB-0 device window (already Device-nGnRE) ::
+:: SDMMC:   M1: live SDHCI — CAPABILITIES=0x3f6ccc8c (base-clk 204 MHz, 8-bit=1, ADMA2=1), spec-version reg=0x05 (SDHCI ?) ::
+:: tegra: JB1b — geom: shmem_tx=0x40070000 shmem_rx=0x40071000 hsp=0x3c00000 db_master=19 DAIF=0b1101 ::
+:: tegra: JB1b — touching HSP @0x3c00000 (dimensioning) ::
+:: tegra: JB1b — HSP dim=0x8a228 (nSM=8 nSS=2 nAS=2) db_base=0x3c90000 bpmp_db=0x3c90300 enable=0xc0060002 ::
+:: tegra: JB1b — touching SYSRAM: txq=0x40070300 rxq=0x40071300 pre-sync counts/state tx=[0x29 0x0 0x29] rx=[0x29 0x0 0x29] ::
+:: tegra: JB1b — IVC channel ESTABLISHED ::
+:: tegra: JB1b — MRQ_PING err=0 reply=0xab5466 (want 0xab5466) -> PASS ::
+:: SDMMC:   CLKPROOF: CLK 120 IS_ENABLED = 1 ::
+:: SDMMC:   CLKPROOF: CLK 219 IS_ENABLED = 1 ::
+:: SDMMC:   CLKPROOF: all 2 node clock(s) proven enabled ::
+:: SDMMC:   FWALL: vendor block DISABLED — metal conviction: SError with clocks proven on (boots 4e+5); ladder runs without pad snapshot/restore ::
+:: SDMMC:   M2: vendor snapshot SKIPPED — core clock not proven (CLKPROOF); ladder runs without pad snapshot/restore ::
+:: SDMMC:   M2: SRST_ALL (controller software reset) ::
+:: SDMMC:   M2: bus power 3.3 V applied (CONTROL0=0x00000f00) ::
+:: SDMMC:   M2: card detected (Present State 0x01fb00f0) ::
+:: SDMMC:   M2: card-detect present=0 src=sdhci-bit18 raw=0x01fb00f0 (bit16 Card-Inserted=1, bit17 State-Stable=1, bit18 CD-pin-level=0; DTB cd-gpios on the M1 line is the board's own detect and needs a GPIO driver to read) ::
+:: SDMMC:   M2: 400 kHz identification clock running (CONTROL1=0x000eff07, base 204 MHz) ::
+:: SDMMC:   M2: CMD0 GO_IDLE ok ::
+:: SDMMC:   M2: CMD8 SEND_IF_COND ok (R7 echo 0x1aa) ::
+:: SDMMC:   M2: card-detect OVERRIDDEN — bit18=0 but CMD8 answered; bit18 is not this board's signal ::
+:: SDMMC:   M2: CMD55 APP_CMD (before ACMD41) ok ::
+:: SDMMC:   M2: ACMD41 SD_SEND_OP_COND ok ::
+:: SDMMC:   M2: ACMD41 power-up complete in 4 round(s) — OCR 0xc0ff8000 (CCS=1) ::
+:: SDMMC:   M2: CMD2 ALL_SEND_CID ok ::
+:: SDMMC:   M2: CID manufacturer(MID)=0x03 OEM(OID)='SD' product(PNM)='SS32G' rev=0x80 serial(PSN)=0x19f1bca4 date=12/2014 ::
+:: SDMMC:   M2: CMD3 SEND_RELATIVE_ADDR ok ::
+:: SDMMC:   M2: CMD9 SEND_CSD ok ::
+:: SDMMC:   M2: capacity 62333952 blocks (30436 MiB, CSD v2), addressing block (SDHC/SDXC), v2 (CMD8 ok) ::
+:: SDMMC:   M2: CMD7 SELECT_CARD ok ::
+:: SDMMC:   M2: CMD16 SET_BLOCKLEN 512 ok ::
+:: SDMMC:   M2: identified — RCA 0xaaaa, bus 1-bit, default-speed (<=25 MHz) [4-bit/HS negotiation deferred] ::
+:: SDMMC:   M3: sector 0 first 16 bytes = 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: SDMMC:   M3: sector-0 signature = MBR (0x55AA boot signature; classic partition table) ::
+:: SDMMC: ORIN-SDMMC-1 DONE — microSD censused: 62333952 blocks (30436 MiB, CSD v2), sector-0 MBR (0x55AA boot signature; classic partition table) (READ-ONLY; no card write) ::
+:: TEGRA-SD: block backend published — 62333952 sectors (read-write — the block layer admits ordinary writes; SDWRITE) ::
+:: tegra: JB3 — DTB: /bus@0/usb@3610000 sid=0xe -> /bus@0/iommu@8000000 reg0=0x08000000 reg1=0x07000000 (2 inst) compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB9h — inherit path (JB3 fabric chain retired; fabric untouched) ::
+:: tegra: JB3 — census /bus@0/iommu@8000000: reg0=0x08000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — census /bus@0/iommu@10000000: reg0=0x10000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — census /bus@0/iommu@12000000: reg0=0x12000000 compat='nvidia,tegra234-smmu|nvidia,smmu-500' ::
+:: tegra: JB3 — MC pre-attach INTSTATUS=0x00000000 ERR_STATUS=0x0000007f ERR_ADR=0x01010001 ::
+:: tegra: JB2b — usb@3610000 dma-coherent: YES (Normal-WB rings, no cache maintenance) ::
+:: tegra: JB2b — attaching the shared xHCI driver @0x3610000 (platform, polled, no PCIe) ::
+:: tegra: JB9g — no-HCRST takeover: halted (USBSTS=0x00000011), inherited FW state preserved ::
+xHCI: CapBase=0x3610000, OpBase=0x3610020, Version=0x120
+xHCI: MaxSlots=36, MaxPorts=8
+xHCI: Supported Protocol: USB 3.1 ports 1..4
+xHCI: Supported Protocol: USB 2.0 ports 5..8
+:: tegra: JB2b — programming interrupter + rings (runtime regs) ::
+:: X200: xhci pointer-programming begins t=656602341 (cntpct) ::
+xHCI: CNR cleared after 1 polls
+xHCI: RuntimeBase=0x3630000, IR0 Base=0x3630020
+[xhciint] ERDP initialized to 0x00000002683cd540 (hi-first, EHB clear)
+xHCI: Interrupter 0 enabled (IMAN.IE set, interrupt-driven).
+xHCI: DCBAAP set to 0x2683ce580
+xHCI: scratchpad: 3 buffer(s) x 4096 bytes; DCBAA[0]=0x2683cf000 (heap PA in [0x2683ca000,0x26b3ca000))
+xHCI: CRCR set to 0x2683cc541
+xHCI: CONFIG register set to 36 (MaxSlotsEn).
+xHCI: Controller Started!
+xHCI: [aarch64] RS=1 witness: USBCMD=0x5(RS=1 INTE=1) USBSTS=0x18(HCH=0 HSE=0 CNR=0 HCE=0) CRCR=0x0000000000000000(CRR=0 CS=0 CA=0 RCS=0) DCBAAP=0x00000002683ce580 DCBAAP_raw64=0x00000002683ce580
+xHCI: [aarch64] RS=1 witness: IR0=0x3630020 IMAN=0x3(IP=1 IE=1) ERSTSZ=1 ERSTBA=0x00000002683ce540 ERDP=0x00000002683cd548(EHB=1) ERST[0].ring=0x00000002683cd540
+xHCI: Max Ports = 8
+xHCI: Port 1 already powered. Status: 0x81603
+xHCI: Port 2 already powered. Status: 0x2a0
+xHCI: Powering on Port 3
+xHCI: Powering on Port 4
+xHCI: Port 5 already powered. Status: 0x2a0
+xHCI: Port 6 already powered. Status: 0x40ee1
+xHCI: Port 7 already powered. Status: 0x603
+xHCI: Port 8 already powered. Status: 0x2a0
+xHCI: port settle complete before CCS scan (settle_ms=150)
+xHCI: ccs-margin settle_ms=150 ppc=0 ports=8 first_assert_ms=[p1:0/pre p2:none/pre p3:none/on p4:none/on p5:none/pre p6:0/pre p7:0/pre p8:none/pre] latest=0 margin_ms=150 result=CCSMARGIN
+xHCI: Port 7 connected (Status: 0x603); queued for enumeration.
+xHCI: Port 6 connected (Status: 0xee1); queued for enumeration.
+xHCI: Port 1 connected (Status: 0x1603); queued for enumeration.
+xHCI: === Enumerating Port 1 (PORTSC=0x1603) ===
+xHCI: [enum port 1] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 1] stage -> await-reset
+xHCI: [enum port 1] issuing hot reset (attempt 1).
+:: X200: xhci RS=1 (controller may DMA from here) t=666429415 (cntpct) ::
+xHCI: [Event] Port Status Change. Port=6
+xHCI: [Event] Port Status Change. Port=1
+xHCI: [Port 1] reset complete (PED=1); settling before enable.
+xHCI: [enum port 1] stage -> reset-settle
+xHCI: JB9i eviction completion: slot 1 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 2 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 3 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 4 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 5 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 6 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 7 code 1 (reclaimed).
+xHCI: JB9i eviction completion: slot 8 code 11 (was not enabled — fine).
+:: tegra: JB9i — inherited-slot eviction: DISABLE_SLOT 1..8 issued + drained ::
+xHCI: [enum port 1] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 1...
+xHCI: [enum port 1] stage -> enable-slot
+xHCI: [Event] Command Completion. Ptr=0x2683cc5c0, Slot=1, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 1
+xHCI: Proceeding to Address Device (Slot 1, Port 1)...
+xHCI: Addressing Device (Slot 1, Port 1)...
+xHCI: DCBAAP[1] linked to 0x2683d3000
+xHCI: Port 1 speed 5 -> EP0 MPS 512
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683cf040
+xHCI: [enum port 1] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc5d0, Slot=1, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 1
+xHCI: >>> SLOT 1 ENABLED & ADDRESSED <<<
+xHCI: Requesting Device Descriptor for Slot 1...
+xHCI: [enum port 1] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 1
+>>> VENDOR ID : [0bda]
+>>> PRODUCT ID: [0489]
+xHCI: Device Found. Class=0x9 Sub=0x0 Proto=0x3
+xHCI: >>> HUB DETECTED (slot 1) <<<
+xHCI: === Enumerating Port 6 (PORTSC=0xee1) ===
+xHCI: [enum port 6] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 6] stage -> await-reset
+xHCI: [enum port 6] issuing hot reset (attempt 1).
+xHCI: === HUB BRING-UP (slot 1) ===
+xHCI: HUB slot 1 SET_CONFIGURATION(1) -> code 1 (OK)
+xHCI: HUB slot 1 speed 5 (SS) desc-type 0x2a: 4 downstream ports (characteristics 0x0009)
+xHCI: HUB slot 1 SET_HUB_DEPTH(0) -> code 1 (OK)
+xHCI: HUB slot 1 configure-input: route 0x0 speed 5 (SS) ports 4 hub-bit 1 ttt 0 add-flags 0x1
+xHCI: HUB slot 1 marked as hub (4 ports)
+xHCI: [Event] Port Status Change. Port=6
+xHCI: [Port 6] reset complete (PED=1); settling before enable.
+xHCI: [enum port 6] stage -> reset-settle
+xHCI: HUB slot 1 status-change Configure-Endpoint code 17
+xHCI: === HUB slot 1 bring-up complete ===
+xHCI: [enum port 6] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 6...
+xHCI: [enum port 6] stage -> enable-slot
+xHCI: [Event] Command Completion. Ptr=0x2683cc600, Slot=2, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 2
+xHCI: Proceeding to Address Device (Slot 2, Port 6)...
+xHCI: Addressing Device (Slot 2, Port 6)...
+xHCI: DCBAAP[2] linked to 0x2683de380
+xHCI: Port 6 speed 3 -> EP0 MPS 64
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683ddb40
+xHCI: [enum port 6] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc610, Slot=2, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 2
+xHCI: >>> SLOT 2 ENABLED & ADDRESSED <<<
+xHCI: Requesting Device Descriptor for Slot 2...
+xHCI: [enum port 6] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 2
+>>> VENDOR ID : [0bda]
+>>> PRODUCT ID: [5489]
+xHCI: Device Found. Class=0x9 Sub=0x0 Proto=0x2
+xHCI: >>> HUB DETECTED (slot 2) <<<
+xHCI: === Enumerating Port 7 (PORTSC=0x603) ===
+xHCI: [enum port 7] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.
+xHCI: [enum port 7] stage -> await-reset
+xHCI: [enum port 7] issuing hot reset (attempt 1).
+xHCI: === HUB BRING-UP (slot 2) ===
+xHCI: HUB slot 2 SET_CONFIGURATION(1) -> code 1 (OK)
+xHCI: HUB slot 2 speed 3 (HS/FS) desc-type 0x29: 4 downstream ports (characteristics 0x00a9)
+xHCI: HUB slot 2 configure-input: route 0x0 speed 3 (HS/FS) ports 4 hub-bit 1 ttt 1 add-flags 0x1
+xHCI: HUB slot 2 marked as hub (4 ports)
+xHCI: [Event] Port Status Change. Port=7
+xHCI: [Port 7] reset complete (PED=1); settling before enable.
+xHCI: [enum port 7] stage -> reset-settle
+xHCI: HUB slot 2 port 1: device connected; enumerating...
+xHCI: HUB port 1 reset OK (status 0x100503, hot reset, xHCI speed 3)
+xHCI: HUB downstream slot 3 device class=0x0 vid=0bda pid=0326 (route 0x1 tier 1)
+xHCI: >>> HUB DOWNSTREAM MASS STORAGE (slot 3, bulk in 0x82/512 out 0x1/512) <<<
+xHCI: Configuring Bulk Endpoints for Slot 3 (IN 0x82 dci5 mps512, OUT 0x1 dci2 mps512)...
+xHCI: Input Context Configured for Bulk Transport.
+xHCI: Endpoints Configured (Slot 3). Storage ready.
+xHCI: HUB slot 2 port 2: device connected; enumerating...
+xHCI: HUB port 2 reset OK (status 0x100303, hot reset, xHCI speed 2)
+xHCI: HUB downstream slot 4 device class=0x0 vid=1c4f pid=0034 (route 0x2 tier 1)
+xHCI: >>> POINTER INTERRUPT IN EP FOUND: 0x81, MPS: 4, Interval: 10, RELATIVE boot-mouse (proto 2) <<<
+xHCI: Configuring HID Endpoints for Slot 4 (mouse(rel)) in one Configure-Endpoint (max DCI 3).
+xHCI: [Event] Command Completion. Ptr=0x2683cc680, Slot=4, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 4
+xHCI: HID Endpoints Configured (Slot 4). Proceeding to Set Configuration...
+xHCI: Sending SET_CONFIGURATION(1) to Slot 4
+xHCI: HUB slot 2 port 3: device connected; enumerating...
+xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<
+:: MOUSE-1: HID pointer detected vid:pid=0000:0000 proto=2 relative ep=0x81 mps=4 interval=10 == witness ::
+:: MOUSE-1: 1 reports, last dx=0 dy=0 buttons=0x00 == witness ::
+xHCI: HUB port 3 reset OK (status 0x100503, hot reset, xHCI speed 3)
+xHCI: HUB downstream slot 5 device class=0x0 vid=058f pid=6362 (route 0x3 tier 1)
+xHCI: >>> HUB DOWNSTREAM MASS STORAGE (slot 5, bulk in 0x82/512 out 0x1/512) <<<
+xHCI: storage slot 3 already active; ignoring the hubbed device.
+xHCI: HUB slot 2 port 4: device connected; enumerating...
+xHCI: HUB port 4 reset OK (status 0x100303, hot reset, xHCI speed 2)
+xHCI: HUB downstream slot 6 device class=0x0 vid=1c4f pid=0002 (route 0x4 tier 1)
+xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: 0x81, MPS: 8, Interval: 10 <<<
+xHCI: >>> POINTER INTERRUPT IN EP FOUND: 0x82, MPS: 3, Interval: 10, ABSOLUTE tablet (proto 0) <<<
+xHCI: Configuring HID Endpoints for Slot 6 (keyboard+pointer(abs)) in one Configure-Endpoint (max DCI 5).
+xHCI: [Event] Command Completion. Ptr=0x2683cc6d0, Slot=6, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 6
+xHCI: HID Endpoints Configured (Slot 6). Proceeding to Set Configuration...
+xHCI: Sending SET_CONFIGURATION(1) to Slot 6
+xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<
+:: MOUSE-1: HID pointer detected vid:pid=0000:0000 proto=0 absolute ep=0x82 mps=3 interval=10 == witness ::
+xHCI: HUB slot 2 status-change Configure-Endpoint code 8
+xHCI: === HUB slot 2 bring-up complete ===
+xHCI: SET_PROTOCOL(boot) OK for keyboard (slot 6, iface 0).
+[hidkeys] set-idle ok slot=6 iface=0
+xHCI: SET_PROTOCOL(boot) OK for boot-mouse (slot 4, iface 0).
+xHCI: [enum port 7] settle done; requesting slot.
+xHCI: Sending ENABLE_SLOT command for Port 7...
+xHCI: [enum port 7] stage -> enable-slot
+:: tegra: JB2b — keyboard ARMED (slot 6, root port 6) -> PASS ::
+xHCI: [Event] Command Completion. Ptr=0x2683cc6f0, Slot=7, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 7
+xHCI: Proceeding to Address Device (Slot 7, Port 7)...
+xHCI: Addressing Device (Slot 7, Port 7)...
+xHCI: DCBAAP[7] linked to 0x2683eb900
+xHCI: Port 7 speed 1 -> EP0 MPS 8
+xHCI: Input Context Initialized (Manual Offsets). Phys=0x2683eb0c0
+xHCI: [enum port 7] stage -> address-device
+xHCI: [Event] Command Completion. Ptr=0x2683cc700, Slot=7, Code=1
+xHCI: >>> COMMAND SUCCESS <<<
+xHCI: SLOT ID ALLOCATED: 7
+xHCI: >>> SLOT 7 ENABLED & ADDRESSED <<<
+xHCI: [tegra fs-mps] slot 7 (FS port 7): learning MPS0 before full descriptor.
+xHCI: [enum port 7] stage -> fs-mps-learn
+xHCI: [tegra fs-mps] slot 7 bMaxPacketSize0 = 64
+xHCI: [tegra fs-mps] slot 7 EP0 MPS0 -> 64 (Evaluate Context OK)
+xHCI: Requesting Device Descriptor for Slot 7...
+xHCI: [enum port 7] stage -> dev-desc
+xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<
+>>> SYSTEM ALERT: NEW HARDWARE DETECTED <<<
+>>> [CONTACT ESTABLISHED] SLOT 7
+>>> VENDOR ID : [13d3]
+>>> PRODUCT ID: [3549]
+xHCI: Device Found. Class=0xe0 Sub=0x1 Proto=0x1
+xHCI: no driver for device class 0xe0 (slot 7, 13d3:3549); releasing port.
+xHCI: Port enumeration queue drained.
+xHCI: === STORAGE BRING-UP (TUR/INQUIRY/READ CAPACITY) ===
+xHCI: storage SET_CONFIGURATION(1) OK (slot 3)
+:: BOT: pump budget=150000000 used=452 peak=452 route=0x1 depth=1 slot=3 n=1 nowait=0 timeouts=0 IMAN=0x2 USBSTS=0x10 result=OK ::
+:: BOT: pump budget=150000000 used=39874414 peak=39874414 route=0x1 depth=1 slot=3 n=2 nowait=0 timeouts=0 IMAN=0x2 USBSTS=0x10 result=OK ::
+:: USBLUN: get-max-lun slot=3 intf=0 result=ok raw=0x01 max_lun=1 — the device declares 2 logical unit(s) ::
+:: USBLUN: lun=0/1 inquiry="Generic-" "USB3.0 CRW   -SD" capacity=63404032x512 verdict=PRESENT reason=none ::
+:: BOT: dtl_vs_moved slot=3 dir=in dtl=8 moved=0 residue=8 cc=13 verdict=short-in-allowed ::
+:: BOT: residue_disagree slot=3 dir=in dtl=8 host_moved=0 dev_residue=0 dev_moved=8 bstatus=1 ::
+xHCI: BOT CSW residue disagrees with the transfer event (dtl 8, host moved 0, device says 8 moved) — phase fault
+:: BOT: csw_bytes slot=3 why=residue-disagree tag_want=0x00000007 b=55 53 42 53 07 00 00 00 00 00 00 00 01 ::
+:: USBLUN: census-transfer slot=3 cdb0=0x25 err=TransferError(13) — one attempt, no recovery ladder, no surrender: probing one logical unit must never cost a disk another unit already proved ::
+:: BOT: resync stage=stop-ep dci=5 dir=in ok=yes cc=1 why=ok epstate=1->3 ::
+:: BOT: strand when=pre slot=3 cause=TransferError(13) pipe=in dci=5 epstate=3 enq=12 cycle=1 ntrb=16 ctxdeq=0x2683cef81 dcs=1 ctxdeq_valid=yes gap=0 live=0 gen=19 ::
+:: BOT: resync stopev dci=5 dir=in epstate_read=1 ev_stopped=0 ev_stopped_li=1 ev_any=1 stopev_n=0 stopev_fresh=no stopev_dci=255 stopev_trb=0x0 stopev_res=none — Transfer Events posted by THIS pipe's Stop/Reset Endpoint (xHCI 1.2 §4.6.9) ::
+:: BOT: resync stage=set-deq dci=5 dir=in ok=yes cc=1 why=ok epstate=3->3 want=0x2683cef81 ctxdeq=0x2683cef81->0x2683cef81 ::
+:: BOT: resync stage=stop-ep dci=2 dir=out ok=yes cc=1 why=ok epstate=1->3 ::
+:: BOT: strand when=pre slot=3 cause=TransferError(13) pipe=out dci=2 epstate=3 enq=7 cycle=1 ntrb=16 ctxdeq=0x2683cf8f1 dcs=1 ctxdeq_valid=yes gap=0 live=0 gen=19 ::
+:: BOT: resync stopev dci=2 dir=out epstate_read=1 ev_stopped=0 ev_stopped_li=1 ev_any=1 stopev_n=0 stopev_fresh=no stopev_dci=255 stopev_trb=0x0 stopev_res=none — Transfer Events posted by THIS pipe's Stop/Reset Endpoint (xHCI 1.2 §4.6.9) ::
+:: BOT: resync stage=set-deq dci=2 dir=out ok=yes cc=1 why=ok epstate=3->3 want=0x2683cf8f1 ctxdeq=0x2683cf8f1->0x2683cf8f1 ::
+:: BOT: strand when=post slot=3 cause=TransferError(13) pipe=in dci=5 epstate=3 enq=12 cycle=1 ntrb=16 ctxdeq=0x2683cef81 dcs=1 ctxdeq_valid=yes gap=0 live=0 gen=19 ::
+:: BOT: strand when=post slot=3 cause=TransferError(13) pipe=out dci=2 epstate=3 enq=7 cycle=1 ntrb=16 ctxdeq=0x2683cf8f1 dcs=1 ctxdeq_valid=yes gap=0 live=0 gen=19 ::
+:: BOT: clean slot=3 cause=TransferError(13) in_resync=ok out_resync=ok in_live=0 out_live=0 undrained=0 ::
+:: USBLUN: lun=1/1 inquiry="Generic-" "USB3.0 CRW   -SD" capacity=none verdict=FAILED reason=cap-bot:TransferError(13) ::
+:: USBLUN: census slot=3 max_lun=1 luns=2 present=1 first_present=0 ::
+:: USBLUN: publish lun=0/1 present=1 source=first-present — every CBW for this device now carries this LUN ::
+:: BOT: [botclaim] issue-context slot=3 cdb0=0x12 epin=3 epout=3 — transaction born onto non-Running pipe(s). Reading key: 2 (Halted), or 3 (Stopped) behind a FAILED set-deq, means any timeout below is inherited from the earlier wedge — not caused by the issuing path; 3 behind a clean resync restarts on this doorbell and is healthy ::
+:: BOT: deqprobe slot=3 dci=5 enq=14 running_epstate=1 running_ctxdeq=0x2683cef81 -> stopped_epstate=3 stopped_ctxdeq=0x2683cefa1 stop_ok=yes stop_cc=1 stop_why=ok restore_ok=yes epstate_after=3 verdict=ctxdeq-stale-under-running (the running read was a birth value; only the stopped read is a position) ::
+xHCI: Disk 'Generic-' 'USB3.0 CRW   -SD' block_size=512 num_blocks=63404032 (30959 MiB)
+:: USBREG: publish slot=3 lun=0 ix=0 block_size=512 num_blocks=63404032 disks=1 ::
+:: BOT: portreg why=bringup port=1 usb3 portsc=0x00001603 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=5 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: portreg why=bringup port=6 usb2 portsc=0x00000e03 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=3 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: portreg why=bringup port=7 usb2 portsc=0x00000603 ccs=1 ped=1 oca=0 pr=0 pls=0(U0) pp=1 speed=1 cas=0 csc=0 pec=0 prc=0 plc=0 cec=0 pmsc=0x00000000 l1s=0(invalid) rwe=0 hird=0 l1slot=0 hle=0 li=0x00000000 result=PORTREG ::
+:: BOT: knobs ring_trbs=16 botring64=off-16trb cbw=always-awaited order=console-first pump=spin+hlt result=KNOBS ::
+xHCI: storage ready.
+:: SPACE: [wait=620ms(n=1) setcfg=3ms(n=1) tur=1297ms(n=2) sense=3ms(n=1) inq=57ms(n=1) rdcap=3ms(n=1) pub=82ms(n=1) resid=270ms] {cbw=0ms(n=9) data=27ms(n=7) csw=1276ms(n=9) peak=1275ms@csw} ftdi=0ms(n=0) total=2335ms sum=2065ms per_ms=31250 result=SPACE ::
+:: PIUSB: [piusb35] databuf phys=0x2683e0000 in_trb=0x2683ceec0 cbw=0x2683cefc0 csw=0x2683cf980 | rc-inbound=[0x0,0x100000000) offset=0 (1:1) | databuf in_window=false below_3G=false — CBW(DMA-read)+CSW(DMA-write→Passed) share this pool; address theory HOLDS — data buffer is OUT of the reachable inbound window; move BOT buffers to a low DMA pool ::
+xHCI: READ(10) LBA0 CSW status=Passed residue=0
+xHCI: SECTOR 0 SIGNATURE:                      
+xHCI: [IRQ] xHCI interrupts taken so far: 0
+:: PIUSB: [piusb25] storage enumerated: slot 3 bulk_in=0x82 bulk_out=0x01 block_size=512 num_blocks=63404032 (30959 MiB) ::
+:: PIUSB: [piusb25] READ(10) LBA0 CSW=Passed residue=0 — first 16 bytes: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: PIUSB: [piusb25] boot-sector sanity: 0x55AA=true type=unrecognized/raw ::
+:: PIUSB: [piusb34] LBA0 re-read post-invalidate: CSW=Passed residue=0 — 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: BOT: [botseq] mount-first attempted lba0=ok matrices=deferred ::
+:: tegra: JB2b — HID: 1 keyboard(s), 2 pointer(s) armed ::
+:: tegra: JD3 — mass storage ready (slot 3); panel shell ls/cat live ::
+:: tegra: JB5 — witness[post-attach]: cap0=0x01200020 USBSTS=0x00000010 (CNR=0 HCH=0) CPUCTL=0xffffffff (halted=1 stopped=1) mbox_owner=0x0 ::
+:: tegra: JB3 — inst0 post-attach faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0xfb51_2edd852f SYNR0=0x00000002 SYNR1=0x00004102 (sid=0x4102) ::
+:: tegra: JB3 — inst0 CB0: SCTLR=0x03b8c70c FSR=0x00000000 FAR=0x1efff_fef3d57c ::
+:: tegra: JB3 — inst1 post-attach faults: sGFSR=0x00000000 (ICF=0 USF=0 SMCF=0 EF=0 MULTI=0) sGFAR=0x2eb7_175816d9 SYNR0=0x0000000a SYNR1=0x000019eb (sid=0x19eb) ::
+:: tegra: JB3 — inst1 CB0: SCTLR=0x29f5c70a FSR=0x00000000 FAR=0x179d9_3224ede4 ::
+:: tegra: JB3 — MC post-attach INTSTATUS=0x00000000 ERR_STATUS=0x0000007f ERR_ADR=0x01010001 ::
+:: tegra: JD2 — EL1 console pump task spawned (boot core) ::
+[ga10bprobe5a] rung 5a ARMED (UNAOS_GA10B_PROBE5=4) triple=acr-gsp map=swapped — the VENDOR IGNITION: rung 4b's seven writes with ONLY THE PAYLOAD changed. ONE DELTA FROM render15-5a: triple=acr-gsp map=canonical is the flown configuration; triple=safety-scheduler is the SECOND TRIPLE arm (A72) and map=swapped is the MAPPING arm (A73, fmccode<-…data…, fmcdata<-…text…). The BCR lock makes a boot ONE ignition, so the two arms never share a power cycle. Order: zero-MMIO phase (window, pattern, the three vendor files read from /boot/GA10B/ through the VFS, sized, placed 256-aligned, digested in the window — any refusal RETURNS with zero MMIO) -> rung 4a's bracket and BCR census re-proven -> rung 4c's pre-ignition census -> addresses at the three placements (form=raw shift=0) -> bcr_dmacfg noncoherent|lock (SPENDS THE POWER CYCLE) -> bcr_ctrl 0x111 -> priscv_cpuctl startcpu -> bounded br_retcode poll -> the oracles -> verdict -> SYSTEM_OFF. Verdict vocabulary: ACR-ACCEPTED | BROM-VERDICT-FAIL code=<retcode> | BROM-VERDICT-PASS-UNWITNESSED code=<retcode> | BROM-NOVERDICT | IGNITION-SKIPPED reason=<bcr-not-allheld|bcr-addr-refused> | BCR-CTRL-REFUSED | REFUSED reason=<image-absent|image-size|image-digest|image-window|image-unaligned|no-dma-window|no-gpu-node|no-power-domains|pg-timeout|pg-on-refused|pg-readback-not-on|bcr-locked|bcr-dmacfg-unreadable|bcr-ctrl-unreadable>. F21 warning: a fabric RAS from a real image whose DMA reach we do not bound may need a manual power cut
+[ga10bprobe5a] addr_encoding=raw shift=0 from=flown(4b raw; A51/A55) (P5x: rung 4e, UNAOS_GA10B_PROBE4=5, is the flight that settles the encoding; until its verdict is in docs/dev/evidence/ this build carries the form its knob value named and says so here)
+:: tegra: NET-4B — DMA window [0x80200000, 0x80400000) (2048 KiB) mapped Normal-NC (MAIR AttrIdx 2) in EL2 + EL1-twin table(s) ::
+[ga10bprobe5a] dmabuf_pa=0x80200000 dmabuf_size=0x200000 dmabuf_pattern=0x4a10b4a5 filled 2048 KiB, dsb sy (this kernel's OWN block, Normal-NC, below 4 GiB; the unwritten tail stays the pattern)
+:: PART: mbr-raw handle=global dev_blocks=63404032 sig=55aa ::
+:: PART: mbr-raw handle=global e1 = 00 ff ff ff 0c ff ff ff 00 08 00 00 00 f8 03 00 ::
+:: PART: mbr-raw handle=global e2 = 00 ff ff ff 7f ff ff ff 00 00 04 00 00 00 10 00 ::
+:: PART: mbr-raw handle=global e3 = 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: PART: mbr-raw handle=global e4 = 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: PART: mbr handle=global slot=1 type=0x0c boot=0x00 start=2048 count=260096 end=262144 ACCEPT ::
+:: PART: mbr handle=global slot=2 type=0x7f boot=0x00 start=262144 count=1048576 end=1310720 ACCEPT ::
+:: PART: mbr handle=global slot=3 REJECT Empty ::
+:: PART: mbr handle=global slot=4 REJECT Empty ::
+:: PART: mbr census handle=global protective=0 accepted=2 rejected=0 ::
+:: PART: fat mounted from MBR slot 1 — extent LBA 2048..262112 (260064 sectors), FAT16 vol@LBA2048 volsec=260064 bps=512 spc=8 nfat=2 fatsz=256sec reserved=32 fat@LBA2080 data@LBA2592 clusters=32440 rootdir@LBA2592 (0sec) ::
+:: PART: mbr-raw handle=usb dev_blocks=63404032 sig=55aa ::
+:: PART: mbr-raw handle=usb e1 = 00 ff ff ff 0c ff ff ff 00 08 00 00 00 f8 03 00 ::
+:: PART: mbr-raw handle=usb e2 = 00 ff ff ff 7f ff ff ff 00 00 04 00 00 00 10 00 ::
+:: PART: mbr-raw handle=usb e3 = 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: PART: mbr-raw handle=usb e4 = 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: PART: mbr handle=usb slot=1 type=0x0c boot=0x00 start=2048 count=260096 end=262144 ACCEPT ::
+:: PART: mbr handle=usb slot=2 type=0x7f boot=0x00 start=262144 count=1048576 end=1310720 ACCEPT ::
+:: PART: mbr handle=usb slot=3 REJECT Empty ::
+:: PART: mbr handle=usb slot=4 REJECT Empty ::
+:: PART: mbr census handle=usb protective=0 accepted=2 rejected=0 ::
+:: PART: mbr-raw handle=tegra-sd dev_blocks=62333952 sig=55aa ::
+:: PART: mbr-raw handle=tegra-sd e1 = 00 ff ff ff 0c ff ff ff 00 08 00 00 00 f8 03 00 ::
+:: PART: mbr-raw handle=tegra-sd e2 = 00 ff ff ff 7f ff ff ff 00 00 04 00 00 00 10 00 ::
+:: PART: mbr-raw handle=tegra-sd e3 = 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: PART: mbr-raw handle=tegra-sd e4 = 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ::
+:: PART: mbr handle=tegra-sd slot=1 type=0x0c boot=0x00 start=2048 count=260096 end=262144 ACCEPT ::
+:: PART: mbr handle=tegra-sd slot=2 type=0x7f boot=0x00 start=262144 count=1048576 end=1310720 ACCEPT ::
+:: PART: mbr handle=tegra-sd slot=3 REJECT Empty ::
+:: PART: mbr handle=tegra-sd slot=4 REJECT Empty ::
+:: PART: mbr census handle=tegra-sd protective=0 accepted=2 rejected=0 ::
+:: PART: unafs span check — slot=2 type=0x7f part=[262144..1310720) span_base=262144 span_blocks=131072 sb_blocks=131072 fits=yes magic=ok ::
+:: [unafsbind] mount=native handle=global ::
+[vfs] root = boot volume serial=0x93d5c1ff source=tegra-sd match=/KERNEL.ELF sha=07c29a62 unafs=present-on-other-handle matches=1 home=- files=1 aliased=usb->global window_off=0x25ad0b060 window_len=4096 file_off=0x5e060 candidates=17 disks=global=present usb=present sdhc=unbuilt tegra-sd=present ::
+[vfs] volume mounted /volumes/________ source=global rw=yes label_raw=0002000000010006000000 ::
+[vfs] unafs volume on global — unnamed, not mounted ::
+[vfs] root mount / = fat boot volume source=tegra-sd rw=yes ::
+[vfs] boot mount /boot = fat boot volume source=tegra-sd rw=yes ::
+[vfs] apps mount /apps = fat boot volume source=tegra-sd rooted=APPS ::
+[ga10bfw] loader — dir=/boot/GA10B window=0x80200000..0x80400000 (three ordinary files read through the VFS, sized and sha256-verified, placed 256-byte-aligned; ZERO MMIO on every path; vocabulary: LOADED | REFUSED reason=<absent|size|digest|window>)
+[ga10bfw] expect role=fmcdata file=/boot/GA10B/acr-gsp.text.encrypt.bin.prod bytes=28672 sha256=ceeae9ec72ef80f24c70473f9fff02588d1ab56a30d18b688469c331370ce12a
+[ga10bfw] expect role=fmccode file=/boot/GA10B/acr-gsp.data.encrypt.bin.prod bytes=9472 sha256=e5cd6c6af29929e2944c3a63e4074b6c94d5c2345103566253450d6fa0cb2492
+[ga10bfw] expect role=pkcparam file=/boot/GA10B/acr-gsp.manifest.encrypt.bin.out.bin.prod bytes=2048 sha256=03f3ecc6c1fa2be3a1f5c1ca4d13442a17c9f69958eb3fba492990626dee2320
+[ga10bfw] window_need=0x9d00 window_have=0x200000
+[ga10bfw] about-to-read /boot/GA10B/acr-gsp.text.encrypt.bin.prod (VFS stat + read: a media read, not an MMIO access)
+[ga10bfw] file=acr-gsp.text.encrypt.bin.prod bytes=28672 sha=match pa=0x80200000 off=0x0 role=fmcdata got=ceeae9ec72ef80f24c70473f9fff02588d1ab56a30d18b688469c331370ce12a
+[ga10bfw] about-to-read /boot/GA10B/acr-gsp.data.encrypt.bin.prod (VFS stat + read: a media read, not an MMIO access)
+[ga10bfw] file=acr-gsp.data.encrypt.bin.prod bytes=9472 sha=match pa=0x80207000 off=0x7000 role=fmccode got=e5cd6c6af29929e2944c3a63e4074b6c94d5c2345103566253450d6fa0cb2492
+[ga10bfw] about-to-read /boot/GA10B/acr-gsp.manifest.encrypt.bin.out.bin.prod (VFS stat + read: a media read, not an MMIO access)
+[ga10bfw] file=acr-gsp.manifest.encrypt.bin.out.bin.prod bytes=2048 sha=match pa=0x80209500 off=0x9500 role=pkcparam got=03f3ecc6c1fa2be3a1f5c1ca4d13442a17c9f69958eb3fba492990626dee2320
+[ga10bfw] -> LOADED total=40192 window=0x80200000..0x80209d00 sections=3 digests_ok=3 fmccode_off=0x0 fmcdata_off=0x7000 pkcparam_off=0x9500
+[ga10bprobe5a] image loaded: triple=acr-gsp map=swapped total=40192 window=0x80200000..0x80209d00 image_sections=3 image_digests_ok=3
+[ga10bprobe5a] section=fmccode file=acr-gsp.data.encrypt.bin.prod triple=acr-gsp map=swapped size=9472 off=0x7000 pa=0x80207000 reg_lo=0x80207000 reg_hi=0x00000000 form=raw aligned256=1
+[ga10bprobe5a] section=fmcdata file=acr-gsp.text.encrypt.bin.prod triple=acr-gsp map=swapped size=28672 off=0x0 pa=0x80200000 reg_lo=0x80200000 reg_hi=0x00000000 form=raw aligned256=1
+[ga10bprobe5a] section=pkcparam file=acr-gsp.manifest.encrypt.bin.out.bin.prod triple=acr-gsp map=swapped size=2048 off=0x9500 pa=0x80209500 reg_lo=0x80209500 reg_hi=0x00000000 form=raw aligned256=1
+[ga10bprobe5a] pre-ignition dmabuf fmcdata @0x80200000 = 0xfb105e88 0xd746ba7f 0x23819b88 0xa003cfca (first 4 words of the placed section, CPU side)
+[ga10bprobe5a] pre-ignition dmabuf fmccode @0x80207000 = 0x3d8d3ac7 0x8caefcd1 0xfc7798c5 0x468e7ec1 (first 4 words of the placed section, CPU side)
+[ga10bprobe5a] pre-ignition dmabuf pkcparam @0x80209500 = 0x380bb422 0x9bf53a9c 0x4ee34df3 0x88f9bb85 (first 4 words of the placed section, CPU side)
+[ga10bprobe5a] gpu@ node: BAR0=0x17000000 power-domain-id=35 clocks=3: 304 41 236 0 0 0 0 0
+:: tegra: JB1b — touching HSP @0x3c00000 (dimensioning) ::
+:: tegra: JB1b — HSP dim=0x8a228 (nSM=8 nSS=2 nAS=2) db_base=0x3c90000 bpmp_db=0x3c90300 enable=0xc0060002 ::
+:: tegra: [ga10bprobe4a] BPMP channel reopened from DTB geometry (no IVC re-sync): txq=0x40070300 rxq=0x40071300 state tx=0x0 rx=0x0 ::
+[ga10bprobe5a] BPMP MRQ_PG GET_STATE (read-only) id=35 — the pre-state, before anything is driven
+[ga10bprobe5a] pg-before id=35 err=0 state=0x1
+[ga10bprobe5a] pg-readback id=35 err=0 state=0x1
+[ga10bprobe5a] clk 304 IS_ENABLED (before) err=0 = 0
+[ga10bprobe5a] clk 304 ENABLE — BPMP request; if this is the LAST line the transaction hung the boot
+[ga10bprobe5a] clk 304 ENABLE err=0
+[ga10bprobe5a] clk 41 IS_ENABLED (before) err=0 = 0
+[ga10bprobe5a] clk 41 ENABLE — BPMP request; if this is the LAST line the transaction hung the boot
+[ga10bprobe5a] clk 41 ENABLE err=0
+[ga10bprobe5a] clk 236 IS_ENABLED (before) err=-22 = 0
+[ga10bprobe5a] clk 304 IS_ENABLED (after) err=0 = 1
+[ga10bprobe5a] clk 41 IS_ENABLED (after) err=0 = 1
+[ga10bprobe5a] clk 236 IS_ENABLED (after) err=-22 = 1
+[ga10bprobe5a] clocks: 2 of 3 running after this rung's enables (236 answering err=-22 is the rung-3 datum, expected)
+[ga10bprobe5a] about-to-read priscv_bcr_dmacfg reg=0x1711166c (P1: lock_locked bit31 must be 0) — if this is the LAST line, THAT read was EL3-fatal
+[ga10bprobe5a] priscv_bcr_dmacfg @0x66c = 0x00000000 lock_locked=0
+[ga10bprobe5a] about-to-read priscv_bcr_ctrl reg=0x17111668 (P2: baseline; rung 3 read 0x00000110) — if this is the LAST line, THAT read was EL3-fatal
+[ga10bprobe5a] bcr_ctrl_before=0x00000110 bcr_ctrl_baseline_changed=0 (a value other than 0x00000110 is a datum, not a stop)
+[ga10bprobe5a] about-to-WRITE priscv_bcr_fmccode_lo reg=0x17111678 val=0x80207000 raw_pa=0x80207000 form=raw shift=0 (BCR DMA address, P5 census A-step) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_fmccode_lo @0x678 wrote=0x80207000 read=0x80207000 raw_pa=0x80207000 form=raw held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_fmccode_hi reg=0x1711167c val=0x00000000 raw_pa=0x80207000 form=raw shift=0 (BCR DMA address, P5 census A-step) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_fmccode_hi @0x67c wrote=0x00000000 read=0x00000000 raw_pa=0x80207000 form=raw held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_fmcdata_lo reg=0x17111680 val=0x80200000 raw_pa=0x80200000 form=raw shift=0 (BCR DMA address, P5 census A-step) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_fmcdata_lo @0x680 wrote=0x80200000 read=0x80200000 raw_pa=0x80200000 form=raw held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_fmcdata_hi reg=0x17111684 val=0x00000000 raw_pa=0x80200000 form=raw shift=0 (BCR DMA address, P5 census A-step) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_fmcdata_hi @0x684 wrote=0x00000000 read=0x00000000 raw_pa=0x80200000 form=raw held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_pkcparam_lo reg=0x17111670 val=0x80209500 raw_pa=0x80209500 form=raw shift=0 (BCR DMA address, P5 census A-step) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_pkcparam_lo @0x670 wrote=0x80209500 read=0x80209500 raw_pa=0x80209500 form=raw held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_pkcparam_hi reg=0x17111674 val=0x00000000 raw_pa=0x80209500 form=raw shift=0 (BCR DMA address, P5 census A-step) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_pkcparam_hi @0x674 wrote=0x00000000 read=0x00000000 raw_pa=0x80209500 form=raw held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_dmacfg reg=0x1711166c val=0x00000002 (target_noncoherent_system ONLY; the lock_locked bit is DELIBERATELY NOT SET) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_dmacfg @0x66c wrote=0x00000002 read=0x00000002 held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_fmccode_lo reg=0x17111678 val=0x00000000 (restore to zero, as found) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_fmccode_lo @0x678 wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_fmccode_hi reg=0x1711167c val=0x00000000 (restore to zero, as found) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_fmccode_hi @0x67c wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_fmcdata_lo reg=0x17111680 val=0x00000000 (restore to zero, as found) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_fmcdata_lo @0x680 wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_fmcdata_hi reg=0x17111684 val=0x00000000 (restore to zero, as found) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_fmcdata_hi @0x684 wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_pkcparam_lo reg=0x17111670 val=0x00000000 (restore to zero, as found) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_pkcparam_lo @0x670 wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_pkcparam_hi reg=0x17111674 val=0x00000000 (restore to zero, as found) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_pkcparam_hi @0x674 wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_dmacfg reg=0x1711166c val=0x00000000 (restore to zero, as found) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_dmacfg @0x66c wrote=0x00000000 read=0x00000000 held=1
+[ga10bprobe5a] about-to-read priscv_bcr_dmacfg reg=0x1711166c (lock_after) — if this is the LAST line, THAT read was EL3-fatal
+[ga10bprobe5a] bcrheld=7/7 dmabuf_pa=0x80200000 form=raw lock_after=0 unreadable=0 -> BCR-ALLHELD
+[ga10bprobe5a] pass 1 — PRE-ignition census of 30 registers (after the census restore, before the ignition; read-only)
+[ga10bprobe5a] pre-ignition address class fuse (KNOWN — read on this die by rungs 1-4c without fault; BAR0=0x17000000)
+[ga10bprobe5a] about-to-read pre-ignition fuse_opt_sec_debug_en reg=0x17821040 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition fuse_opt_sec_debug_en @0x821040 = 0x00000000
+[ga10bprobe5a] about-to-read pre-ignition fuse_opt_wpr_enabled reg=0x178205ec — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition fuse_opt_wpr_enabled @0x8205ec = 0x00000001
+[ga10bprobe5a] about-to-read pre-ignition fuse_opt_vpr_enabled reg=0x1782067c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition fuse_opt_vpr_enabled @0x82067c = 0x00000001
+[ga10bprobe5a] pre-ignition address class mc (KNOWN — read on this die by rungs 1-4c without fault; BAR0=0x17000000)
+[ga10bprobe5a] about-to-read pre-ignition mc_enable reg=0x17000200 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition mc_enable @0x200 = 0x40000000
+[ga10bprobe5a] about-to-read pre-ignition mc_elpg_enable reg=0x1700020c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition mc_elpg_enable @0x20c = 0x2000000c
+[ga10bprobe5a] pre-ignition address class top (KNOWN — read on this die by rungs 1-4c without fault; BAR0=0x17000000)
+[ga10bprobe5a] about-to-read pre-ignition top_device_info_cfg reg=0x170224fc — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition top_device_info_cfg @0x224fc = 0x01430072
+[ga10bprobe5a] about-to-read pre-ignition top_num_gpcs reg=0x17022430 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition top_num_gpcs @0x22430 = 0x00000002
+[ga10bprobe5a] pre-ignition address class gsp-falcon-v1 (KNOWN — read on this die by rungs 1-4c without fault; BAR0=0x17000000)
+[ga10bprobe5a] about-to-read pre-ignition gsp_falcon_hwcfg reg=0x17110108 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition gsp_falcon_hwcfg @0x110108 = 0x80420100
+[ga10bprobe5a] about-to-read pre-ignition gsp_falcon_dmactl reg=0x1711010c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition gsp_falcon_dmactl @0x11010c = -UNREADABLE reason=pri-error val=0xbadf5620
+[ga10bprobe5a] about-to-read pre-ignition gsp_falcon_idlestate reg=0x1711004c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition gsp_falcon_idlestate @0x11004c = -UNREADABLE reason=pri-error val=0xbadf5620
+[ga10bprobe5a] about-to-read pre-ignition gsp_falcon_irqmask reg=0x17110018 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition gsp_falcon_irqmask @0x110018 = -UNREADABLE reason=pri-error val=0xbadf5620
+[ga10bprobe5a] about-to-read pre-ignition gsp_falcon_irqdest reg=0x1711001c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition gsp_falcon_irqdest @0x11001c = -UNREADABLE reason=pri-error val=0xbadf5620
+[ga10bprobe5a] about-to-read pre-ignition gsp_falcon_cpuctl_v1 reg=0x17110100 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition gsp_falcon_cpuctl_v1 @0x110100 = -UNREADABLE reason=pri-error val=0xbadf5620
+[ga10bprobe5a] about-to-read pre-ignition gsp_falcon_hwcfg2 reg=0x171100f4 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition gsp_falcon_hwcfg2 @0x1100f4 = 0x0001a733
+[ga10bprobe5a] about-to-read pre-ignition gsp_falcon_mailbox0 reg=0x17110040 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition gsp_falcon_mailbox0 @0x110040 = 0x00000000
+[ga10bprobe5a] pre-ignition address class gsp-priscv-bcr (KNOWN — read on this die by rungs 1-4c without fault; BAR0=0x17000000)
+[ga10bprobe5a] about-to-read pre-ignition priscv_bcr_ctrl reg=0x17111668 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition priscv_bcr_ctrl @0x111668 = 0x00000110
+[ga10bprobe5a] about-to-read pre-ignition priscv_bcr_dmacfg reg=0x1711166c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition priscv_bcr_dmacfg @0x11166c = 0x00000000
+[ga10bprobe5a] about-to-read pre-ignition priscv_bcr_pkcparam_lo reg=0x17111670 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition priscv_bcr_pkcparam_lo @0x111670 = 0x00000000
+[ga10bprobe5a] about-to-read pre-ignition priscv_bcr_pkcparam_hi reg=0x17111674 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition priscv_bcr_pkcparam_hi @0x111674 = 0x00000000
+[ga10bprobe5a] about-to-read pre-ignition priscv_bcr_fmccode_lo reg=0x17111678 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition priscv_bcr_fmccode_lo @0x111678 = 0x00000000
+[ga10bprobe5a] about-to-read pre-ignition priscv_bcr_fmccode_hi reg=0x1711167c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition priscv_bcr_fmccode_hi @0x11167c = 0x00000000
+[ga10bprobe5a] about-to-read pre-ignition priscv_bcr_fmcdata_lo reg=0x17111680 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition priscv_bcr_fmcdata_lo @0x111680 = 0x00000000
+[ga10bprobe5a] about-to-read pre-ignition priscv_bcr_fmcdata_hi reg=0x17111684 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition priscv_bcr_fmcdata_hi @0x111684 = 0x00000000
+[ga10bprobe5a] about-to-read pre-ignition priscv_boot_vector_lo reg=0x17111380 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition priscv_boot_vector_lo @0x111380 = -UNREADABLE reason=pri-error val=0xbadf5620
+[ga10bprobe5a] about-to-read pre-ignition priscv_boot_vector_hi reg=0x17111384 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition priscv_boot_vector_hi @0x111384 = -UNREADABLE reason=pri-error val=0xbadf5620
+[ga10bprobe5a] about-to-read pre-ignition priscv_riscv_irqmask reg=0x17111528 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition priscv_riscv_irqmask @0x111528 = -UNREADABLE reason=pri-error val=0xbadf5620
+[ga10bprobe5a] about-to-read pre-ignition priscv_riscv_irqdest reg=0x1711152c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition priscv_riscv_irqdest @0x11152c = -UNREADABLE reason=pri-error val=0xbadf5620
+[ga10bprobe5a] about-to-read pre-ignition priscv_cpuctl reg=0x17111388 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition priscv_cpuctl @0x111388 = 0x00000010
+[ga10bprobe5a] about-to-read pre-ignition priscv_br_retcode reg=0x1711165c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition priscv_br_retcode @0x11165c = 0x00000000
+[ga10bprobe5a] pre-ignition address class pmu-falcon2 (KNOWN — read on this die by rungs 1-4c without fault; BAR0=0x17000000)
+[ga10bprobe5a] about-to-read pre-ignition pmu_falcon2_cpuctl reg=0x1710b388 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] pre-ignition pmu_falcon2_cpuctl @0x10b388 = 0x00000010
+[ga10bprobe5a] pre-ignition census: readable=21/30 unreadable=9 -> PRECENSUS-DONE
+[ga10bprobe5a] the IGNITION — B0 the six addresses at the placed sections, B1 the lock, B2 the trigger, B4 startcpu, B5 the bounded poll (16 samples, 10 ms apart)
+[ga10bprobe5a] about-to-WRITE priscv_bcr_fmccode_lo reg=0x17111678 val=0x80207000 raw_pa=0x80207000 form=raw shift=0 (BCR DMA address, B0 re-write at the placed section) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_fmccode_lo @0x678 wrote=0x80207000 read=0x80207000 raw_pa=0x80207000 form=raw held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_fmccode_hi reg=0x1711167c val=0x00000000 raw_pa=0x80207000 form=raw shift=0 (BCR DMA address, B0 re-write at the placed section) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_fmccode_hi @0x67c wrote=0x00000000 read=0x00000000 raw_pa=0x80207000 form=raw held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_fmcdata_lo reg=0x17111680 val=0x80200000 raw_pa=0x80200000 form=raw shift=0 (BCR DMA address, B0 re-write at the placed section) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_fmcdata_lo @0x680 wrote=0x80200000 read=0x80200000 raw_pa=0x80200000 form=raw held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_fmcdata_hi reg=0x17111684 val=0x00000000 raw_pa=0x80200000 form=raw shift=0 (BCR DMA address, B0 re-write at the placed section) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_fmcdata_hi @0x684 wrote=0x00000000 read=0x00000000 raw_pa=0x80200000 form=raw held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_pkcparam_lo reg=0x17111670 val=0x80209500 raw_pa=0x80209500 form=raw shift=0 (BCR DMA address, B0 re-write at the placed section) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_pkcparam_lo @0x670 wrote=0x80209500 read=0x80209500 raw_pa=0x80209500 form=raw held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_pkcparam_hi reg=0x17111674 val=0x00000000 raw_pa=0x80209500 form=raw shift=0 (BCR DMA address, B0 re-write at the placed section) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_pkcparam_hi @0x674 wrote=0x00000000 read=0x00000000 raw_pa=0x80209500 form=raw held=1
+[ga10bprobe5a] about-to-WRITE priscv_bcr_dmacfg reg=0x1711166c val=0x80000002 (target_noncoherent_system | lock_locked — THIS SPENDS THE POWER CYCLE: the BCR cannot be reprogrammed again until a cold boot) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_dmacfg @0x66c wrote=0x80000002 read=0x80000002 lock_latched=1 (the lock took)
+[ga10bprobe5a] about-to-WRITE priscv_bcr_ctrl reg=0x17111668 val=0x00000111 (the ACKED SEQ brom_config value; baseline was 0x00000110) — if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_bcr_ctrl @0x668 wrote=0x00000111 read=0x00000111 held=1
+[ga10bprobe5a] SEQ step 3 (priscv_boot_vector lo/hi) DELIBERATELY OMITTED — unreadable on this die (0xbadf5620), an unverifiable mutation; the SEQ marks it optional and we take the option, exactly as 4b did
+[ga10bprobe5a] about-to-WRITE priscv_cpuctl reg=0x17111388 val=0x00000001 (startcpu_true) — THE IGNITION, with NVIDIA's signed ACR image behind the descriptor. if this is the LAST line, THAT WRITE was fatal and the boot ended inside it
+[ga10bprobe5a] priscv_cpuctl @0x388 wrote=0x00000001 read=0x00000080 (STARTCPU is write-only: the read is the immediate post-state, not a readback)
+[ga10bprobe5a] about-to-read priscv_br_retcode reg=0x1711165c sample=1/16 — if this is the LAST line, THAT read was EL3-fatal
+[ga10bprobe5a] br_retcode=0x00000002 br_result=0x2 sample=1/16
+[ga10bprobe5a] about-to-read post-ignition priscv_cpuctl reg=0x17111388 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_cpuctl halted=1 (raw=0x00000010)
+[ga10bprobe5a] about-to-read post-ignition falcon_hwcfg2 reg=0x171100f4 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition hwcfg2 lockdown=1 (raw=0x0001a733) -> POSTLOCK-HELD
+[ga10bprobe5a] about-to-read post-ignition gsp_falcon_cpuctl_v1 reg=0x17110100 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition gsp_falcon_cpuctl_v1 readable=0 (raw=0xbadf5620) -> V1MIRROR-CLOSED
+[ga10bprobe5a] about-to-read post-ignition gsp_falcon_mailbox0 reg=0x17110040 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] mbox-arg-written=none mbox-post-read=0x00000000 mbox-post-meaning=unchanged (no argument address was written to MAILBOX0/1 in 5a — the boot-params channel is Hopper-documented and GA10B-unverified, brief §1.4; a non-zero low byte here is the FMC's own error code, F23, the best failure on the list)
+[ga10bprobe5a] about-to-read series priscv_br_retcode reg=0x1711165c samples=20 settle_ms=10 — if this is the LAST line, THAT read was EL3-fatal
+[ga10bprobe5a] series sample=1/20 t_ms=0 br_retcode=0x00000002 br_result=0x2 reason_bits=0x00000000 (distinct #1)
+[ga10bprobe5a] series priscv_br_retcode @0x65c = distinct=1 first=0x00000002@1 last=0x00000002@1 reason_bits_or=0x00000000 samples=20 elapsed_ms=200 -> BRSERIES-STABLE
+[ga10bprobe5a] pass 2 — POST-ignition census of 30 registers diffed against pass 1; the BCR eight against what 5a WROTE (read-only)
+[ga10bprobe5a] post-ignition address class fuse (KNOWN — read on this die by rungs 1-4c without fault; BAR0=0x17000000)
+[ga10bprobe5a] about-to-read post-ignition fuse_opt_sec_debug_en reg=0x17821040 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition fuse_opt_sec_debug_en @0x821040 = 0x00000000 diff=same pre=0x00000000
+[ga10bprobe5a] about-to-read post-ignition fuse_opt_wpr_enabled reg=0x178205ec — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition fuse_opt_wpr_enabled @0x8205ec = 0x00000001 diff=same pre=0x00000001
+[ga10bprobe5a] about-to-read post-ignition fuse_opt_vpr_enabled reg=0x1782067c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition fuse_opt_vpr_enabled @0x82067c = 0x00000001 diff=same pre=0x00000001
+[ga10bprobe5a] post-ignition address class mc (KNOWN — read on this die by rungs 1-4c without fault; BAR0=0x17000000)
+[ga10bprobe5a] about-to-read post-ignition mc_enable reg=0x17000200 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition mc_enable @0x200 = 0x40000000 diff=same pre=0x40000000
+[ga10bprobe5a] about-to-read post-ignition mc_elpg_enable reg=0x1700020c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition mc_elpg_enable @0x20c = 0x2000000c diff=same pre=0x2000000c
+[ga10bprobe5a] post-ignition address class top (KNOWN — read on this die by rungs 1-4c without fault; BAR0=0x17000000)
+[ga10bprobe5a] about-to-read post-ignition top_device_info_cfg reg=0x170224fc — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition top_device_info_cfg @0x224fc = 0x01430072 diff=same pre=0x01430072
+[ga10bprobe5a] about-to-read post-ignition top_num_gpcs reg=0x17022430 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition top_num_gpcs @0x22430 = 0x00000002 diff=same pre=0x00000002
+[ga10bprobe5a] post-ignition address class gsp-falcon-v1 (KNOWN — read on this die by rungs 1-4c without fault; BAR0=0x17000000)
+[ga10bprobe5a] about-to-read post-ignition gsp_falcon_hwcfg reg=0x17110108 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition gsp_falcon_hwcfg @0x110108 = 0x80420100 diff=same pre=0x80420100
+[ga10bprobe5a] about-to-read post-ignition gsp_falcon_dmactl reg=0x1711010c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition gsp_falcon_dmactl @0x11010c = -UNREADABLE reason=pri-error val=0xbadf5620 diff=same pre=0xbadf5620
+[ga10bprobe5a] about-to-read post-ignition gsp_falcon_idlestate reg=0x1711004c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition gsp_falcon_idlestate @0x11004c = -UNREADABLE reason=pri-error val=0xbadf5620 diff=same pre=0xbadf5620
+[ga10bprobe5a] about-to-read post-ignition gsp_falcon_irqmask reg=0x17110018 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition gsp_falcon_irqmask @0x110018 = -UNREADABLE reason=pri-error val=0xbadf5620 diff=same pre=0xbadf5620
+[ga10bprobe5a] about-to-read post-ignition gsp_falcon_irqdest reg=0x1711001c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition gsp_falcon_irqdest @0x11001c = -UNREADABLE reason=pri-error val=0xbadf5620 diff=same pre=0xbadf5620
+[ga10bprobe5a] about-to-read post-ignition gsp_falcon_cpuctl_v1 reg=0x17110100 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition gsp_falcon_cpuctl_v1 @0x110100 = -UNREADABLE reason=pri-error val=0xbadf5620 diff=same pre=0xbadf5620
+[ga10bprobe5a] about-to-read post-ignition gsp_falcon_hwcfg2 reg=0x171100f4 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition gsp_falcon_hwcfg2 @0x1100f4 = 0x0001a733 diff=same pre=0x0001a733
+[ga10bprobe5a] about-to-read post-ignition gsp_falcon_mailbox0 reg=0x17110040 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition gsp_falcon_mailbox0 @0x110040 = 0x00000000 diff=same pre=0x00000000
+[ga10bprobe5a] post-ignition address class gsp-priscv-bcr (KNOWN — read on this die by rungs 1-4c without fault; BAR0=0x17000000)
+[ga10bprobe5a] about-to-read post-ignition priscv_bcr_ctrl reg=0x17111668 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_bcr_ctrl @0x111668 = 0x00000111 diff=written-by-5a pre=0x00000110 intact=1
+[ga10bprobe5a] post-ignition priscv_bcr_ctrl expected=0x00000111 intact=1
+[ga10bprobe5a] about-to-read post-ignition priscv_bcr_dmacfg reg=0x1711166c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_bcr_dmacfg @0x11166c = 0x80000002 diff=written-by-5a pre=0x00000000 intact=1
+[ga10bprobe5a] post-ignition priscv_bcr_dmacfg expected=0x80000002 intact=1
+[ga10bprobe5a] about-to-read post-ignition priscv_bcr_pkcparam_lo reg=0x17111670 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_bcr_pkcparam_lo @0x111670 = 0x80209500 diff=written-by-5a pre=0x00000000 intact=1
+[ga10bprobe5a] post-ignition priscv_bcr_pkcparam_lo expected=0x80209500 intact=1
+[ga10bprobe5a] about-to-read post-ignition priscv_bcr_pkcparam_hi reg=0x17111674 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_bcr_pkcparam_hi @0x111674 = 0x00000000 diff=written-by-5a pre=0x00000000 intact=1
+[ga10bprobe5a] post-ignition priscv_bcr_pkcparam_hi expected=0x00000000 intact=1
+[ga10bprobe5a] about-to-read post-ignition priscv_bcr_fmccode_lo reg=0x17111678 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_bcr_fmccode_lo @0x111678 = 0x80207000 diff=written-by-5a pre=0x00000000 intact=1
+[ga10bprobe5a] post-ignition priscv_bcr_fmccode_lo expected=0x80207000 intact=1
+[ga10bprobe5a] about-to-read post-ignition priscv_bcr_fmccode_hi reg=0x1711167c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_bcr_fmccode_hi @0x11167c = 0x00000000 diff=written-by-5a pre=0x00000000 intact=1
+[ga10bprobe5a] post-ignition priscv_bcr_fmccode_hi expected=0x00000000 intact=1
+[ga10bprobe5a] about-to-read post-ignition priscv_bcr_fmcdata_lo reg=0x17111680 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_bcr_fmcdata_lo @0x111680 = 0x80200000 diff=written-by-5a pre=0x00000000 intact=1
+[ga10bprobe5a] post-ignition priscv_bcr_fmcdata_lo expected=0x80200000 intact=1
+[ga10bprobe5a] about-to-read post-ignition priscv_bcr_fmcdata_hi reg=0x17111684 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_bcr_fmcdata_hi @0x111684 = 0x00000000 diff=written-by-5a pre=0x00000000 intact=1
+[ga10bprobe5a] post-ignition priscv_bcr_fmcdata_hi expected=0x00000000 intact=1
+[ga10bprobe5a] about-to-read post-ignition priscv_boot_vector_lo reg=0x17111380 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_boot_vector_lo @0x111380 = -UNREADABLE reason=pri-error val=0xbadf5620 diff=same pre=0xbadf5620
+[ga10bprobe5a] about-to-read post-ignition priscv_boot_vector_hi reg=0x17111384 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_boot_vector_hi @0x111384 = -UNREADABLE reason=pri-error val=0xbadf5620 diff=same pre=0xbadf5620
+[ga10bprobe5a] about-to-read post-ignition priscv_riscv_irqmask reg=0x17111528 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_riscv_irqmask @0x111528 = -UNREADABLE reason=pri-error val=0xbadf5620 diff=same pre=0xbadf5620
+[ga10bprobe5a] about-to-read post-ignition priscv_riscv_irqdest reg=0x1711152c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_riscv_irqdest @0x11152c = -UNREADABLE reason=pri-error val=0xbadf5620 diff=same pre=0xbadf5620
+[ga10bprobe5a] about-to-read post-ignition priscv_cpuctl reg=0x17111388 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_cpuctl @0x111388 = 0x00000010 diff=same pre=0x00000010
+[ga10bprobe5a] about-to-read post-ignition priscv_br_retcode reg=0x1711165c — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition priscv_br_retcode @0x11165c = 0x00000002 diff=changed pre=0x00000000
+[ga10bprobe5a] post-ignition address class pmu-falcon2 (KNOWN — read on this die by rungs 1-4c without fault; BAR0=0x17000000)
+[ga10bprobe5a] about-to-read post-ignition pmu_falcon2_cpuctl reg=0x1710b388 — if this is the LAST line, THAT read was EL3-fatal and the boot ended inside it
+[ga10bprobe5a] post-ignition pmu_falcon2_cpuctl @0x10b388 = 0x00000010 diff=same pre=0x00000010
+[ga10bprobe5a] bcr post-ignition: intact=8/8 altered=0 unreadable=0 -> POSTBCR-INTACT
+[ga10bprobe5a] post-ignition census: readable=21/30 unreadable=9 became_readable=0 became_unreadable=0 changed_ex_bcr_retcode=0 -> MAPDIFF-SAME
+[ga10bprobe5a] about-to-read post-ignition dmabuf fmcdata pa=0x80200000 size=28672 (a CPU read of this kernel's OWN Normal-NC window — DRAM the descriptor pointed at, not a GPU register) — if this is the LAST line, THAT read was fatal
+[ga10bprobe5a] post-ignition dmabuf fmcdata @0x80200000 = 0xfb105e88 0xd746ba7f 0x23819b88 0xa003cfca words_changed_first4=0 sha256_intact=1 (pre: 0xfb105e88 0xd746ba7f 0x23819b88 0xa003cfca)
+[ga10bprobe5a] about-to-read post-ignition dmabuf fmccode pa=0x80207000 size=9472 (a CPU read of this kernel's OWN Normal-NC window — DRAM the descriptor pointed at, not a GPU register) — if this is the LAST line, THAT read was fatal
+[ga10bprobe5a] post-ignition dmabuf fmccode @0x80207000 = 0x3d8d3ac7 0x8caefcd1 0xfc7798c5 0x468e7ec1 words_changed_first4=0 sha256_intact=1 (pre: 0x3d8d3ac7 0x8caefcd1 0xfc7798c5 0x468e7ec1)
+[ga10bprobe5a] about-to-read post-ignition dmabuf pkcparam pa=0x80209500 size=2048 (a CPU read of this kernel's OWN Normal-NC window — DRAM the descriptor pointed at, not a GPU register) — if this is the LAST line, THAT read was fatal
+[ga10bprobe5a] post-ignition dmabuf pkcparam @0x80209500 = 0x380bb422 0x9bf53a9c 0x4ee34df3 0x88f9bb85 words_changed_first4=0 sha256_intact=1 (pre: 0x380bb422 0x9bf53a9c 0x4ee34df3 0x88f9bb85)
+[ga10bprobe5a] post-ignition dmabuf-scan @0x80200000 = sections_intact=3/3 tail_words_changed=0/514240 (tail from 0x80209d00) -> DMABUF-UNTOUCHED (UNTOUCHED says nothing WROTE the window; whether the ROM READ it leaves no trace here — the oracles that say so are the lockdown drop and the v1 mirror)
+[ga10bprobe5a] verdict br_retcode=0x00000002 br_result=0x2 samples=1/16 lock_latched=1 post_lockdown=1 v1_readable=0 halted=1 oracles_agree=0 form=raw shift=0 triple=acr-gsp map=swapped image_sections=3 image_digests_ok=3 -> BROM-VERDICT-FAIL code=0x00000002
+[ga10bprobe5a] F19: a real signed image (triple=acr-gsp map=swapped), digests verified in the window, addresses form=raw, and the ROM still says FAIL. Do not iterate images this session: record the identity. The OTHER ADDRESS FORM is not a candidate — rung 4e measured raw and pa>>8 IDENTICAL. What is left is the arm this build is NOT: triple=safety-scheduler (UNAOS_GA10B_PROBE5=3) and map=swapped (=4), ONE BOOT EACH — and if both also FAIL the door is not opening by this route and the ladder reports rather than iterates
+[ga10bprobe5a] flight done — powering OFF; the dark board is the ready-for-cold-boot signal
+[pwrshutoff] shutdown verb invoked — dispatching the platform mechanism
+[pwrshutoff] PSCI SYSTEM_OFF (0x84000008) via SMC — firmware owns the machine from here
+[pwrshutoff] ring drained lines=0 bytes=0
+��Shutdown state requested 0
