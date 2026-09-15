@@ -374,7 +374,7 @@ pub fn paint(name: &str, r: Rect, mut compose_row: impl FnMut(&mut [u32], usize)
     if w == 0 || h == 0 || w > MAX_STRIP_W {
         return bar_decline(name, DECL_GEOM); // TEARSCOPE — counted, still `false`
     }
-    let fb = *super::WRITER.lock();
+    let Some(fb) = super::panel_snapshot() else { return bar_decline(name, DECL_LOCK); }; // LOCKFIX B1 — WAS `*super::WRITER.lock()`, a BLOCKING acquire, and this primitive runs in the PRESENT TAIL with interrupts MASKED (`wcg`'s composite chain), which is the one context the WEDGE-8 rule forbids waiting in: a masked waiter can neither be preempted nor take a timer tick, so it is the F4 death outright. `panel_snapshot` is LOCKFIX's PAINT-path door (`video/mod.rs`) and keeps the uncontended path byte-for-byte what it was — it BLOCKS when interrupts are enabled, exactly as this line always did, and only `try_lock`s when masked. A refusal is a contended LEAF lock, which is precisely what `DECL_LOCK` already counts and what `decl_lock=` in this file's own `scope=bar` rollup already prints, so no counter, no array widening and no new per-pass print is added (LAWS §1(e)). The decline is the one this primitive already owes on contention: `false`, signature still unmatched, the next composite pass repaints. ⚠ LINE-NEUTRAL: 1 line out, 1 line in.
     if !fb.is_ready() {
         return bar_decline(name, DECL_READY); // TEARSCOPE
     }
@@ -460,7 +460,7 @@ pub fn erase_rect(r: Rect) -> bool {
     if w == 0 || h == 0 || w > MAX_STRIP_W {
         return false;
     }
-    let fb = *super::WRITER.lock();
+    let Some(fb) = super::panel_snapshot() else { return false; }; // LOCKFIX B1 — the `erase_rect` twin of the acquire in `paint` above, same door and same reason: this runs from the composite tail (`crystal::compose`'s vacate arm calls it MASKED) and a blocking wait there is the F4 death. UNCOUNTED on purpose, unlike `paint`'s: `erase_rect` has no `name` and no census row — it is the raw primitive under `vacate`, and `vacate` IS the counted wrapper (`strip::vacate` = this plus the census, as `menubar::compose` states at its own call). Adding a census here would double-count every vacate the wrapper already records. The refusal returns the `false` every other decline in this function returns, which callers already read as "still owed, still in the slot — the next pass retries" (`crystal::compose`'s erase arm says exactly that). ⚠ LINE-NEUTRAL: 1 line out, 1 line in.
     if !fb.is_ready() || !fb.word4() {
         return false;
     }
@@ -899,7 +899,7 @@ const _: () = {
 /// equal, and this is the only copy.
 const FRAME_US: u64 = 16_667;
 
-/// Decline reason: the shared [`SCRATCH`] was contended, so this pass painted nothing.
+/// Decline reason: a LEAF lock this pass needs was contended, so it painted nothing — the shared [`SCRATCH`], or (since LOCKFIX B1) the PANEL itself, refused by `video::panel_snapshot` because this primitive runs MASKED in the present tail and may not wait there. One bucket for both deliberately: the operator-visible effect is identical (nothing painted, signature unmatched, next pass repaints) and splitting it would add a counter and a rollup field for a distinction no reader acts on.
 const DECL_LOCK: usize = 0;
 /// Decline reason: the surface is not ready.
 const DECL_READY: usize = 1;

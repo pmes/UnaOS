@@ -792,11 +792,11 @@ pub fn compose() -> bool {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
     }
     let (pw, ph) = {
-        let fb = *super::WRITER.lock();
-        if !fb.is_ready() {
+        // LOCKFIX B1 — WAS `let fb = *super::WRITER.lock();` plus a separate `is_ready` arm. `compose` is the dock's PRESENT TAIL and runs MASKED inside `wcg`'s composite chain, where the WEDGE-8 rule forbids waiting: a masked waiter can neither be preempted nor take a timer tick, so a contended blocking acquire here is the F4 death outright. `panel_snapshot` is LOCKFIX's PAINT-path door (`video/mod.rs`) and leaves the uncontended path byte-for-byte what it was — it still BLOCKS when interrupts are ENABLED, exactly as this line always did, and only `try_lock`s when masked. `.filter(is_ready)` folds the old readiness arm into the same `else`, so BOTH refusals (panel held, surface unready) take the arm the unready case has always taken and the two stay indistinguishable to every caller, which they already were. No counter and no print is added — LAWS §1(e) on per-pass witnesses; the effect a reader can see is the one this pass already had on a decline: nothing painted, signature unmatched, next composite repaints. ⚠ LINE-NEUTRAL: 5 lines out, 5 in.
+        let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) else {
             LEDGER.pass(crate::arch::now_cycles().saturating_sub(t0));
             return false;
-        }
+        };
         (fb.width(), fb.height())
     };
     let layout = Layout::for_panel(n, pw, ph);

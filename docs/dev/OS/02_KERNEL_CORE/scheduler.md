@@ -2972,6 +2972,77 @@ users run, not desktop furniture. `arch/aarch64/syscall.rs` is nonetheless kept 
 | pre-arc control, `c4ee2280`, same host + knobs, four runs | 117/117 (3), 117/117 (4), **116/117 (10)**, 117/117 (6). The control is the one that dropped a required witness, and it produced the same classes: `[wc-g] COHER`/`RACE-BLIT`, `[dragperf] coalesced=0`, and `[wc-d] verify win=1 … -> FAIL` — the console-vs-compositor residue PARITY.md §6.9c assigns to `exec-shellport`'s pacing lane, and quarry.md §14.6's host-load lane. **No class appears armed that the control does not also produce, and the armed runs never lost a witness.** Honest note: this host is loaded (the runs are interleaved with other aarch64 QEMUs), which is why the arc is judged on paired runs rather than on an absolute count |
 | **go-red retained** | `pal_width_hint` reverted to `WRITER.lock()` in a scratch build, nothing else changed: `✂️ MBENCH TRUNCATED — 40/117, 337 lines`. Byte-for-byte the same truncation INWEDGE recorded, so the leg still convicts a blocking acquire. Call site restored and re-verified |
 
+### LOCKFIX-B1 — the x86 half of "held everywhere it applies" was never held (`exec-rmbp-lockfix`)
+
+**The heading above says `aarch64 + x86`. For `click_pointer_pos` it was true of one arch only**, and
+this subsection is that correction plus its repair. The bullet list above names
+`arch::aarch64::syscall::click_pointer_pos` with its arch, correctly — and then the caller list two
+paragraphs later says `click_pointer_pos` **unqualified**, alongside `wheel_route` and the router
+hints, which reads as the whole population. `video/mod.rs`'s own door comment does the same thing:
+`panel_info_nonblocking`'s three named callers are "`quarry::live::wheel_route`,
+`syscall::click_pointer_pos`, the router's `pal_*_hint` geometry reads", with no arch on the middle
+one. Both sentences were false on x86 for the whole of LOCKFIX, POSFIX and everything after.
+`arch/x86_64/syscall.rs::click_pointer_pos` kept `crate::video::WRITER.lock().info()` — a **blocking**
+acquire on the preemptible input band, the exact shape the rule exists to forbid — reachable from
+`wc_click_route`'s `Event::Button` arm (once per button edge) and `wc_drag_motion` (once per drag
+pass). rmbp-ledger **B1**.
+
+**Why no instrument caught it for four arcs.** `inwedge_selftest`, the leg whose whole job is to hold
+`WRITER` and prove the input band declines, is
+`#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]` — it cannot run on x86, and what it
+drives there is the router's `pal_width_hint`, not this function. The x86 battery had a large click
+family (`hittest`, `clickroute`, `clickband`, `wmdirect`, `dmgovlp`, `ptrdead`) and not one leg in it
+took the panel lock and then drove the input band across it. So the arch that had the defect had no
+gate for it, and the arch that had the gate had no defect — which is why a **re-derivation** found
+this and a re-reading never would (LAWS §5).
+
+**The fix, and what it deliberately is not.** One line: the x86 `click_pointer_pos` now reads through
+`video::panel_info_nonblocking()`, byte-for-byte the aarch64 twin's body. It is **not** a cached
+`FbInfo` static, which is the other shape available and was considered and rejected: the door already
+exists, the twin already uses it, and a cache would be a *second* mechanism answering a question one
+mechanism already answers — while silently removing this site from `panel_census`, the denominator
+`[inwedge]` reports. Under the old code the x86 input band contributed **zero** to that census, so the
+census was measuring a population that excluded the only real input-band panel read this arch has; the
+door is what makes the number honest, not just the path safe.
+
+**And the furniture's five masked blocking acquisitions**, the row's second half — `strip::paint`,
+`strip::erase_rect`, `dock::compose`, `menubar::compose`, `crystal::compose`. These are the PAINT
+population, not the input one, so the door is `panel_snapshot()` (block when unmasked, `try_lock` when
+masked), not `panel_info_nonblocking()`. All five run in the present tail inside `wcg`'s composite
+chain with interrupts masked, which is the one context WEDGE-8 forbids waiting in. **The uncontended
+path does not move**: `panel_snapshot` still blocks when interrupts are enabled, exactly as every one
+of these lines always did. Each refusal takes the arm the file already had for a decline — `paint`
+counts `DECL_LOCK` (already printed as `decl_lock=` in `strip`'s `scope=bar` rollup, so **no counter,
+no array widening and no new per-pass print** was added — LAWS §1(e)); the three `compose` twins
+ledger the pass and return `false` through the same `else` as the pre-existing `is_ready` arm, folded
+into it with `.filter(is_ready)`; `erase_rect` returns its plain `false` and stays **uncounted on
+purpose**, because `strip::vacate` is its counted wrapper and censusing both would double-count every
+vacate.
+
+**The new leg: `lockfix_b1_selftest`** (`arch/x86_64/syscall.rs`, tail, `witness`-gated, folded onto
+`ptrdead_selftest`'s battery line). It holds `WRITER` on this core and drives `click_pointer_pos()`
+across it. **At the base sha this leg does not fail, it HANGS** — a blocking acquire of a
+non-reentrant spin `Mutex` this very function holds — which is `inwedge_selftest`'s own go-red shape
+and is boot-8 reproduced on a QEMU that can deliver no HID at all. Asserted: the held half **refused**
+(the counted door was entered and declined, not completed), and the released half **recovered** (with
+nothing held the same call completes a read — the control, without which a hard-wired refusal would
+pass). The returned coordinates are **observed and not asserted**, and the reason is worth keeping:
+`pal::cursor::pos(0, 0)` is `*POS.lock().get_or_insert((0, 0))`, so it clamps to `(0, 0)` only while
+the pointer position is still unset, and by battery time earlier fixtures have set it — asserting
+`(0, 0)` would be a leg that passes on boot order rather than on behaviour.
+
+**Witness shape:**
+`:: LOCKFIX-B1: click_pointer_pos across a held WRITER — held: refused+1 read+0 at=(x,y) | released:
+read+1 tries=1 real_w=640 :: PASS ::`
+
+**Line-neutrality:** all five source files are byte-for-byte the same LINE COUNT as the baseline
+(`23883`, `1562`, `2546`, `1701`, `1364`), so no `core::panic::Location` below any edit renumbers;
+the one addition is appended at `syscall.rs`'s TAIL and its call site is a `{ … }` block folded under
+an existing `#[cfg]` line. **Knob-off byte-identity is NOT claimed** for the tree as a whole, on the
+same PARITY.md §5.3 precedent LOCKFIX and POSFIX both took: the six-site fix is ungated and ships, and
+it is a correctness fix on a path users run. What line-neutrality buys is that the delta is confined
+to the six functions that changed instead of to every panic site below them.
+
 ### POSFIX — the last two blocking takes on the input path (aarch64 + x86, `exec-posfix`)
 
 LOCKFIX closed the rule's `WRITER` population and, in the same breath, named two residuals of the
