@@ -736,6 +736,28 @@ _feats=""
 # of every FECS access and reads the runlist array PRE-SUBMIT. Implies nvidia-kepler; does
 # NOT require UNAOS_KEPLER_FIFO. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_KEPLER_CE:-}" ] && _feats="${_feats}nvidia-kepler-ce,"
+# SHUTRESTORE (rmbp, 2026-09-15) — the SEVEN refuted Kepler rungs whose CODE had been deleted, each
+# back behind a knob of its own. RULINGS R19 (Peter, 2026-09-05): "you take a path that does not work
+# out so you shut it out but after very many boots its discovered that path needs to be open for
+# later paths to succeed" — the code and the knob are KEPT, never trashed. The register of what each
+# rung is and what it is still wanted for is docs/dev/OS/08_VIDEO/SHUTOUT-REGISTER.md §7.
+#
+# ALL SEVEN DEFAULT OFF, and nothing here changes an unarmed boot: every restored site sits under its
+# own feature inside the existing `nvidia-kepler` cfg region, so a knob-off image links not one byte
+# of any of them. Each feature implies nvidia-kepler (Cargo-side). The three FIFO rungs additionally
+# need UNAOS_KEPLER_FIFO to REACH their call site (kepler::init's fifo leg) and the four display
+# rungs need UNAOS_KEPLER_TAKEOVER to reach theirs (kepler_display::takeover_display) — arming one
+# without its parent is not an error, it is simply a rung that never runs, which the absent witness
+# token says plainly. Kept in sync with crates/kernel/Cargo.toml AND builder/src/main.rs; all seven
+# are named on the literal `x86-all` leg, which is what puts them under the KNOB→BUILDER WIRING
+# CHECK and what type-checks their ARMED polarity alongside nvidia-kepler/takeover/fifo.
+[ -n "${UNAOS_KEPLER_USERD_SNOOP:-}" ] && _feats="${_feats}nvidia-kepler-userdsnoop,"
+[ -n "${UNAOS_KEPLER_PFIFO_FLUSH:-}" ] && _feats="${_feats}nvidia-kepler-pfifoflush,"
+[ -n "${UNAOS_KEPLER_CTRL_ADDR:-}" ] && _feats="${_feats}nvidia-kepler-ctrladdr,"
+[ -n "${UNAOS_KEPLER_REPOINT:-}" ] && _feats="${_feats}nvidia-kepler-repoint,"
+[ -n "${UNAOS_KEPLER_LATCH_ARM:-}" ] && _feats="${_feats}nvidia-kepler-latcharm,"
+[ -n "${UNAOS_KEPLER_PITCH_LADDER:-}" ] && _feats="${_feats}nvidia-kepler-pitchladder,"
+[ -n "${UNAOS_KEPLER_GOP_OVERLAP:-}" ] && _feats="${_feats}nvidia-kepler-gopoverlap,"
 # WC-X86: UNAOS_WC=1 arms the window compositor on the x86 panel path (video/desktop_uefi.rs) — it activates
 # at the END of the Kepler takeover seam, routes the console into a window, and ARMS the desktop app.
 # The desktop's second window is no longer kernel-drawn (kernel-apps eviction move #1): the seam
@@ -3756,9 +3778,30 @@ KERNEL_CFG_MATRIX=(
   # arm-named-only, so naming it here ADDS it to `x86_cfg_universe` (+1 feature). The derived mix-leg
   # count is the smallest n with C(n, n/2) >= N and does not move for this: C(9,4) = 126 still covers
   # it. Read the live board/mix counts on `./arroyo check`'s own summary line, never from this prose.
+  # SHUTRESTORE (rmbp, appended 2026-09-15): the SEVEN restored R19 rungs —
+  # `nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,
+  # nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap` — are APPENDED at the
+  # end. They belong on THIS leg rather than on legs of their own, and rather than being left to the
+  # derived mix array, for the `beam` reason one paragraph up, sharpened: every one of the seven is
+  # code INSIDE a `nvidia-kepler` module and four of them sit inside `takeover_display`, so the only
+  # configuration in which their restored bodies are compiled at all is one that ALSO carries
+  # `nvidia-kepler` (+ `nvidia-kepler-takeover` for the display four, `nvidia-kepler-fifo` for the
+  # FIFO three). GATE-CFG-MIX's covering array guarantees ORDERED PAIRS (Y on, X off) and never
+  # both-ON for a chosen pair — two popcount-4 masks over 9 bits can be disjoint — so a mix leg
+  # carrying a rung ALONGSIDE `nvidia-kepler` is luck of the mask indices and stale the moment a
+  # feature lands (the `x86-vsyncpace` REVIEW C3 lesson, and the same argument `wcdvalve` carries
+  # above). x86-all already names nvidia-kepler + takeover + fifo, so naming the seven here compiles
+  # all seven ARMED bodies by construction rather than by a derived mask, in one leg. The two DEFAULT
+  # legs still carry the disarmed polarity, so both polarities of every new `#[cfg]` are compiled.
+  # UNIVERSE SIDE EFFECT: none beyond the seven new declarations themselves. No arm-* leg names any
+  # of them, so they were already IN `x86_cfg_universe` under the unclaimed => assume-x86 rule the
+  # moment they were declared in Cargo.toml; naming them here removes nothing and adds no leg. The
+  # derived mix-leg count is the smallest n with C(n, n/2) >= N and does not move for seven:
+  # C(9,4) = 126 still covers it. Read the live board/mix counts on `./arroyo check`'s own summary
+  # line, never from this prose.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the

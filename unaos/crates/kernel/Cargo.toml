@@ -59,6 +59,28 @@ noaspm = ["nvidia-kepler"]
 nvidia-kepler-takeover = []
 nvidia-kepler-fifo = []
 nvidia-kepler-kdisp-hold = []
+# SHUTRESTORE (R19) — the seven refuted Kepler rungs whose CODE had been deleted, each back behind a
+# knob of its own. RULINGS R19 (Peter, 2026-09-05): a path that failed once gets shut out, and many
+# boots later it turns out later paths need it open — so the code and the knob are KEPT, never
+# trashed. docs/dev/OS/08_VIDEO/SHUTOUT-REGISTER.md §7 is the record of which rung is which and what
+# each one is still wanted for. ALL SEVEN DEFAULT OFF: every restored site sits under its own
+# feature inside the existing `nvidia-kepler` cfg region, so an unarmed build links not one byte of
+# any of them and no rung reaches the boot path unasked. Each implies `nvidia-kepler` so the gate at
+# its site is self-sufficient. Kept in sync with arroyo AND builder/src/main.rs.
+#   KF6 USERD_SNOOP (0x2a1c) poll-area arm + its witness-conditional restore — `UNAOS_KEPLER_USERD_SNOOP=1`
+nvidia-kepler-userdsnoop = ["nvidia-kepler"]
+#   KF8 PFIFO_FLUSH (0x70000) trigger + bounded BUSY poll, the `flush-executed` witness — `UNAOS_KEPLER_PFIFO_FLUSH=1`
+nvidia-kepler-pfifoflush = ["nvidia-kepler"]
+#   KF9 PBDMA CTRL_ADDR TARGET audit: 3 PBDMAs x 4 encodings, every write read back and put back — `UNAOS_KEPLER_CTRL_ADDR=1`
+nvidia-kepler-ctrladdr = ["nvidia-kepler"]
+#   KD6 the 0x6101E0 `repoint` experiment (the register is now the armed-state WITNESS) — `UNAOS_KEPLER_REPOINT=1`
+nvidia-kepler-repoint = ["nvidia-kepler"]
+#   KD7 EVO assembly write + UPDATE latch, the `asm-stuck`/`armed-followed` verdicts — `UNAOS_KEPLER_LATCH_ARM=1`
+nvidia-kepler-latcharm = ["nvidia-kepler"]
+#   the display parameter ladders: `lin-step` (linear pitch 0x4000) and `bwpg-step` (block-linear matrix) — `UNAOS_KEPLER_PITCH_LADDER=1`
+nvidia-kepler-pitchladder = ["nvidia-kepler"]
+#   the `gop-overlap` detector — the probe that found the confound of the whole s18–s26 campaign — `UNAOS_KEPLER_GOP_OVERLAP=1`
+nvidia-kepler-gopoverlap = ["nvidia-kepler"]
 # CE-LADDER: `UNAOS_KEPLER_CE=1` — read-only copy-engine reconnaissance on the GK107
 # (drivers/gpu/kepler_ce.rs), run from `kepler::init` BEFORE the fifo leg so it sits above
 # every FECS access and sees the runlist array pre-submit. Rungs R1 (PTOP device-info

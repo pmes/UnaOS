@@ -284,6 +284,20 @@ pub unsafe fn takeover_display(
     let pre_shadow = mmio_read(bar0, shadow_reg);
     serial_println!(":: kdisp: latch pre asm={:08X} armed={:08X} shadow={:08X} ::", pre_asm, pre_armed, pre_shadow);
 
+    // ── SHUTRESTORE (R19) — the deleted display rungs, back behind their own knobs ──────────
+    // RULINGS R19: a rung that FAILED once keeps its CODE and its KNOB, because many boots later a
+    // later path can turn out to need the earlier one OPEN. Three display rungs had been deleted
+    // outright (docs/dev/OS/08_VIDEO/SHUTOUT-REGISTER.md §7); each is restored below as a
+    // self-contained, reversible probe behind a DEFAULT-OFF feature of its own. `takeover_display`'s
+    // control flow is unchanged — none of them returns, none of them is on the boot path without its
+    // knob, and with every knob off not one of these lines exists.
+    #[cfg(feature = "nvidia-kepler-repoint")]
+    repoint_surface(bar0, found_head.unwrap_or(0), gop_vram_offset);
+    #[cfg(feature = "nvidia-kepler-latcharm")]
+    latch_arm_update(bar0, asm_reg, armed_reg, shadow_reg, update_reg, pre_asm);
+    #[cfg(feature = "nvidia-kepler-pitchladder")]
+    pitch_ladders(bar0, bar1, asm_reg, armed_reg, shadow_reg, update_reg, pre_asm, expected_height);
+
     // --- Pull 15: Mirror Surface Params (Recon) ---
     let run_recon = false;
     if run_recon {
@@ -411,6 +425,17 @@ pub unsafe fn takeover_display(
         if surf2_bytes == gop_bytes { "exact" } else { "SIZE-MISMATCH" },
         gop_vram_offset, total_bytes, gop_vram_offset, gop_bytes);
 
+    // SHUTRESTORE (R19) — the `gop-overlap` detector, restored behind its own knob. This is the
+    // probe that FOUND the confound of the whole s18–s26 campaign (a pattern painted into the
+    // surface the firmware was already scanning proves nothing about the latch), and the commit
+    // that replaced it with the `cover=` line above deleted it rather than keeping it. The
+    // cover check answers a different question — extent, not intersection — so the two are not
+    // substitutes: point the rung at a surf2 that is NOT the GOP base and `gop-overlap` is the
+    // only line that can say the photo is void. Default OFF => neither the call nor the detector
+    // exists in an unarmed build.
+    #[cfg(feature = "nvidia-kepler-gopoverlap")]
+    gop_overlap_probe(gop_vram_offset, surf2_bytes, gop_vram_offset, gop_bytes);
+
     // 1.12 s hold (standing length — Peter's camera calibration, s21)
     // Predictions with hold off: kepler=1521 -> ~400 ms, gui=3408 -> ~2290 ms — which would be the largest single boot win left on the machine.
     #[cfg(feature = "nvidia-kepler-kdisp-hold")]
@@ -497,6 +522,331 @@ pub unsafe fn takeover_display(
     // Completed fb-draw cycle: return the gop pointer so the late recap
     // (kepler.rs, printed inside the FTDI-ring window) can prove this leg ran.
     Some(gop_vram_offset)
+}
+
+// ══ SHUTRESTORE (R19) — the display rungs whose code had been deleted ════════════════════════════
+//
+// Restored from our OWN git history, unchanged in substance, into today's file structure. Each one
+// lives behind a DEFAULT-OFF feature of its own inside the existing `nvidia-kepler` cfg region, so
+// an unarmed build is byte-identical by construction and no rung reaches the boot path unasked.
+// Witness tokens are VERBATIM — `repoint`, `asm-stuck`, `armed-followed`, `lin-step`, `bwpg-step`,
+// `gop-overlap` — because the register, the specs and every past capture key on those exact strings.
+//
+// | rung | knob | feature | restored from |
+// | KD6 `repoint` 0x6101E0        | UNAOS_KEPLER_REPOINT      | nvidia-kepler-repoint      | 896faee0 |
+// | KD7 latch arm + UPDATE        | UNAOS_KEPLER_LATCH_ARM    | nvidia-kepler-latcharm     | bfeedd94 |
+// | display parameter ladders     | UNAOS_KEPLER_PITCH_LADDER | nvidia-kepler-pitchladder  | eee60395 / 04b494be |
+// | `gop-overlap` detector        | UNAOS_KEPLER_GOP_OVERLAP  | nvidia-kepler-gopoverlap   | bfeedd94 |
+
+/// KD6 — the pull-5 repoint-the-surface experiment (0x6101E0 only), restored from 896faee0.
+///
+/// Refuted at s15 with the `rb-stuck` verdict; the deleting commit ("kepler-display pull 7 assembly
+/// write and UPDATE latch") gave no reason beyond having moved on, so R19 says KEEP. It matters now
+/// because 0x6101E0 is known to be the ARMED-STATE WITNESS: a later arc wants to read it, and the
+/// one piece of code that ever wrote it and put it back was gone.
+///
+/// Fully reversible: the original value is read first, restored last, and the restore is READ BACK
+/// (a restore that is written but never read is a success echo that cannot fail).
+#[cfg(feature = "nvidia-kepler-repoint")]
+unsafe fn repoint_surface(bar0: usize, head: usize, gop_vram_offset: usize) {
+    let repoint_reg = regs::NV_PDISPLAY_BASE + 0x01E0; // 0x6101E0
+    let orig_ptr = mmio_read(bar0, repoint_reg);
+    let hs_base = regs::NV_PDISPLAY_BASE + 0x6000 + (head * 0x800);
+    let pre_vert = mmio_read(bar0, hs_base + 0x340);
+    let pre_horz = mmio_read(bar0, hs_base + 0x344);
+    serial_println!(":: kdisp: repoint pre 6101E0={:08X} stat vert={:08X} horz={:08X} ::", orig_ptr, pre_vert, pre_horz);
+
+    if orig_ptr == 0xFFFFFFFF || (orig_ptr & 0xFFF00000) == 0xBAD00000 {
+        serial_println!(":: kdisp: repoint ABSENT/POISON rb={:08X} — no write attempted ::", orig_ptr);
+        return;
+    }
+
+    // The rung's write. `gop_vram_offset >> 8` is the same 256-byte-granular surface pointer the
+    // s15 run used (it hard-coded 0x00016000, the then-current GOP offset); deriving it keeps the
+    // experiment pointed at a real surface on a machine whose GOP has moved.
+    let new_ptr = (gop_vram_offset >> 8) as u32;
+    mmio_write(bar0, repoint_reg, new_ptr);
+    let rb = mmio_read(bar0, repoint_reg);
+    serial_println!(":: kdisp: repoint wrote={:08X} rb={:08X} ::", new_ptr, rb);
+
+    // Bounded panel window (~5 s) — the camera length Peter calibrated at s21.
+    for t in 1..=5 {
+        for _ in 0..60_000_000 { core::hint::spin_loop(); }
+        let vert = mmio_read(bar0, hs_base + 0x340);
+        let horz = mmio_read(bar0, hs_base + 0x344);
+        serial_println!(":: kdisp: repoint hold t={}s stat vert={:08X} horz={:08X} ::", t, vert, horz);
+    }
+
+    mmio_write(bar0, repoint_reg, orig_ptr);
+    let rb_restored = mmio_read(bar0, repoint_reg);
+    serial_println!(":: kdisp: repoint restored rb={:08X} ::", rb_restored);
+}
+
+/// KD7 — the EVO assembly write + UPDATE latch, restored from bfeedd94.
+///
+/// SHUTOUT-REGISTER §7 is explicit that this rung is BLOCKED ON §2 (no pushbuffer), not refuted:
+/// "when a pushbuffer exists this is the first thing to re-run". Its write half was the one piece
+/// of the apparatus that vanished — today's tree still declares `update_reg` and never uses it.
+///
+/// One deliberate difference from the s28 original, stated rather than hidden: the original
+/// `return None`d out of `takeover_display` when the assembly register refused the write. A rung
+/// must not change the takeover's contract, so this restore LOGS the same verdict and returns
+/// normally; the caller's control flow is identical with the knob on or off.
+#[cfg(feature = "nvidia-kepler-latcharm")]
+unsafe fn latch_arm_update(
+    bar0: usize,
+    asm_reg: usize,
+    armed_reg: usize,
+    shadow_reg: usize,
+    update_reg: usize,
+    pre_asm: u32,
+) {
+    let new_ptr = pre_asm;
+
+    // Step 2: Latch Sequence
+    mmio_write(bar0, asm_reg, new_ptr);
+    let rb_asm = mmio_read(bar0, asm_reg);
+
+    if rb_asm != new_ptr {
+        serial_println!(":: kdisp: latch skip — asm rb={:08X} want={:08X} ::", rb_asm, new_ptr);
+        let final_asm = mmio_read(bar0, asm_reg);
+        let final_armed = mmio_read(bar0, armed_reg);
+        let final_shadow = mmio_read(bar0, shadow_reg);
+        serial_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
+        serial_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
+        return;
+    }
+
+    mmio_write(bar0, update_reg, 0x00000000);
+
+    // 5 s hold (standing length — Peter's camera calibration, s21)
+    serial_println!(":: kdisp: pm-step hold begin (photo B — post-latch) ::");
+    for t in 1..=5 {
+        for _ in 0..60_000_000 { core::hint::spin_loop(); }
+        serial_println!(":: kdisp: pm-step hold t={}s ::", t);
+        // Dump on the FIRST and LAST tick: a latch that reverts mid-hold is
+        // invisible to a single sample.
+        if t == 1 || t == 5 {
+            serial_println!(":: kdisp: pm-step reg-dump t={} ptr={:08X} ptr_hi={:08X} size={:08X} store={:08X} fmt={:08X} ::",
+                t,
+                mmio_read(bar0, 0x640460),
+                mmio_read(bar0, 0x640464),
+                mmio_read(bar0, 0x640468),
+                mmio_read(bar0, 0x64046C),
+                mmio_read(bar0, 0x640470));
+            // Armed/shadow readouts separate "armed a truncated value" from
+            // "UPDATE never propagated" — currently byte-identical states.
+            serial_println!(":: kdisp: pm-step reg-dump t={} armed={:08X} shadow={:08X} ::",
+                t, mmio_read(bar0, armed_reg), mmio_read(bar0, shadow_reg));
+            for off in (0x4B8..=0x4C8).step_by(4) {
+                serial_println!(":: kdisp: pm-step reg-dump off={:03X} val={:08X} ::", off, mmio_read(bar0, 0x640000 + off));
+            }
+            // Which head is actually live: the one whose vline/vblank advances.
+            for h in 0..4usize {
+                let vert = mmio_read(bar0, 0x610000 + 0x6000 + h * 0x800 + 0x340);
+                serial_println!(":: kdisp: pm-step head-stat t={} h={} vert={:08X} ::", t, h, vert);
+            }
+        }
+    }
+    serial_println!(":: kdisp: pm-step hold end ::");
+
+    // Step 3: Restore
+    mmio_write(bar0, asm_reg, pre_asm);
+    mmio_write(bar0, update_reg, 0x00000000);
+
+    // 1 s recovery gap
+    for _ in 0..15_000_000 { core::hint::spin_loop(); }
+    serial_println!(":: kdisp: pm-step done ::");
+
+    serial_println!(":: kdisp: latch verdict asm-stuck=y ::");
+}
+
+/// The display parameter ladders — `lin-step` (pull 17, eee60395) and `bwpg-step` (pull 14,
+/// 04b494be), restored together because they are one experiment in two coordinate systems: does
+/// the head read the surface LINEAR at pitch 0x4000, or block-linear at some (block-width,
+/// pitch-in-gobs) pair?
+///
+/// SHUTOUT-REGISTER §7: "superseded by KD8, and correctly so — but 'superseded' is a different word
+/// from 'deleted'." KD8 answers the question for the surface the firmware handed us; it says
+/// nothing about a surface we allocate ourselves, which is what the copy-engine arc will need.
+#[cfg(feature = "nvidia-kepler-pitchladder")]
+unsafe fn pitch_ladders(
+    bar0: usize,
+    bar1: usize,
+    asm_reg: usize,
+    armed_reg: usize,
+    shadow_reg: usize,
+    update_reg: usize,
+    pre_asm: u32,
+    expected_height: u32,
+) {
+    // The scratch surface both ladders paint into — deliberately NOT the GOP base, which is the
+    // whole point of the `gop-overlap` detector above.
+    let surf2_offset: usize = 0x1600000;
+    let dst = (bar1 + surf2_offset) as *mut u8;
+    let new_ptr = (surf2_offset >> 8) as u32;
+
+    let latch_and_hold = |label: &str, total_bytes: usize| -> bool {
+        mmio_write(bar0, asm_reg, new_ptr);
+        let rb_asm = mmio_read(bar0, asm_reg);
+        if rb_asm != new_ptr {
+            serial_println!(":: kdisp: latch skip — asm rb unchanged ::");
+            let final_asm = mmio_read(bar0, asm_reg);
+            let final_armed = mmio_read(bar0, armed_reg);
+            let final_shadow = mmio_read(bar0, shadow_reg);
+            serial_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
+            serial_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
+            return false;
+        }
+        mmio_write(bar0, update_reg, 0x00000000);
+        // 5 s per hold — the bench needs camera time between cycles (Peter, s21 prep).
+        for t in 1..=5 {
+            for _ in 0..60_000_000 { core::hint::spin_loop(); }
+            serial_println!(":: kdisp: {} hold t={}s ::", label, t);
+        }
+        // Restore, then a 1 s recovery gap.
+        mmio_write(bar0, asm_reg, pre_asm);
+        mmio_write(bar0, update_reg, 0x00000000);
+        for _ in 0..15_000_000 { core::hint::spin_loop(); }
+        serial_println!(":: kdisp: {} done bytes={:08X} ::", label, total_bytes);
+        true
+    };
+
+    // ── Rung A: `lin-step` — LINEAR fill at pitch 0x4000 (pull 17) ──────────────────────────
+    let pitch_bytes: usize = 16384;
+    let total_bytes = expected_height as usize * pitch_bytes;
+    for y in 0..expected_height as usize {
+        let block_color: u32 = match (y / 64) % 8 {
+            0 => 0xFFFF0000, // RED
+            1 => 0xFF00FF00, // GREEN
+            2 => 0xFF0000FF, // BLUE
+            3 => 0xFFFFFF00, // YELLOW
+            4 => 0xFF00FFFF, // CYAN
+            5 => 0xFFFF00FF, // MAGENTA
+            6 => 0xFFFFFFFF, // WHITE
+            _ => 0xFF404040, // GRAY
+        };
+        let row_color = if y % 64 == 0 { 0xFF000000u32 } else { block_color };
+        let row_base = y * pitch_bytes;
+        for x in 0..(pitch_bytes / 4) {
+            let final_color: u32 = if x >= 2880 {
+                0xFF000000 // BLACK padding
+            } else if x < 256 {
+                0xFFFFFFFF // WHITE left-edge ruler
+            } else if x < 264 {
+                0xFF000000 // BLACK spacer
+            } else {
+                row_color
+            };
+            let target_ptr = dst.add(row_base + (x * 4)) as *mut u32;
+            core::ptr::write_volatile(target_ptr, final_color);
+        }
+    }
+    serial_println!(":: kdisp: lin-step pitch=4000 fill done bytes={:08X} ::", total_bytes);
+    latch_and_hold("lin-step pitch=4000", total_bytes);
+
+    // ── Rung B: `bwpg-step` — block-linear, the block-width vs pitch-in-gobs matrix (pull 14) ──
+    let gob_width_bytes: usize = 64;
+    let gob_height: usize = 8;
+    let gob_size_bytes: usize = 512;
+    let bh: usize = 4;
+    let cycles: [(usize, usize); 4] = [(2, 192), (2, 256), (4, 192), (4, 256)];
+
+    for &(bw, pg) in cycles.iter() {
+        let blocks_per_row = pg / bw;
+        let padded_width_px = pg * 16;
+        let gob_rows = (expected_height as usize + gob_height - 1) / gob_height;
+        let num_block_rows = (gob_rows + bh - 1) / bh;
+        let total_bytes = num_block_rows * bw * bh * blocks_per_row * gob_size_bytes;
+
+        for y in 0..expected_height as usize {
+            let block_color: u32 = match (y / 64) % 8 {
+                0 => 0xFFFF0000,
+                1 => 0xFF00FF00,
+                2 => 0xFF0000FF,
+                3 => 0xFFFFFF00,
+                4 => 0xFF00FFFF,
+                5 => 0xFFFF00FF,
+                6 => 0xFFFFFFFF,
+                _ => 0xFF404040,
+            };
+            let row_color = if y % 64 == 0 { 0xFF000000u32 } else { block_color };
+
+            let gob_y = y / gob_height;
+            let inner_y = y % gob_height;
+            let blk_y = gob_y / bh;
+            let gob_inner_y = gob_y % bh;
+
+            for x in 0..padded_width_px {
+                let final_color: u32 = if x >= 2880 {
+                    0xFF000000
+                } else if x < 256 {
+                    0xFFFFFFFF
+                } else if x < 264 {
+                    0xFF000000
+                } else {
+                    row_color
+                };
+
+                let px_byte_x = x * 4;
+                let gob_x = px_byte_x / gob_width_bytes;
+                let inner_x = px_byte_x % gob_width_bytes;
+
+                let blk_col = gob_x / bw;
+                let gob_inner_x = gob_x % bw;
+
+                let blk_index = (blk_y * blocks_per_row) + blk_col;
+                let gob_inner_index = (gob_inner_y * bw) + gob_inner_x;
+
+                let target_byte_addr = (blk_index * bw * bh * gob_size_bytes)
+                                     + (gob_inner_index * gob_size_bytes)
+                                     + (inner_y * gob_width_bytes)
+                                     + inner_x;
+
+                let target_ptr = dst.add(target_byte_addr) as *mut u32;
+                core::ptr::write_volatile(target_ptr, final_color);
+            }
+        }
+        serial_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} fill done bytes={:08X} ::", bw, pg, total_bytes);
+        // The hold label carries the cycle so a capture can tell the four apart.
+        mmio_write(bar0, asm_reg, new_ptr);
+        let rb_asm = mmio_read(bar0, asm_reg);
+        if rb_asm != new_ptr {
+            serial_println!(":: kdisp: latch skip — asm rb unchanged ::");
+            let final_asm = mmio_read(bar0, asm_reg);
+            let final_armed = mmio_read(bar0, armed_reg);
+            let final_shadow = mmio_read(bar0, shadow_reg);
+            serial_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
+            serial_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
+            return;
+        }
+        mmio_write(bar0, update_reg, 0x00000000);
+        for t in 1..=5 {
+            for _ in 0..60_000_000 { core::hint::spin_loop(); }
+            serial_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} hold t={}s ::", bw, pg, t);
+        }
+        mmio_write(bar0, asm_reg, pre_asm);
+        mmio_write(bar0, update_reg, 0x00000000);
+        for _ in 0..15_000_000 { core::hint::spin_loop(); }
+        serial_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} done ::", bw, pg);
+    }
+
+    serial_println!(":: kdisp: latch verdict asm-stuck=y ::");
+}
+
+/// The `gop-overlap` detector (restored from bfeedd94) — the probe that FOUND the confound of the
+/// whole s18–s26 campaign.
+///
+/// If the scratch surface we paint intersects the firmware's GOP framebuffer, a photo of our
+/// pattern proves nothing about the latch: we simply painted into the surface already being
+/// scanned. It LOGS and never aborts — an abort would kill the sitting, and a void result that is
+/// named is worth more than a boot that stopped.
+#[cfg(feature = "nvidia-kepler-gopoverlap")]
+fn gop_overlap_probe(surf2_offset: usize, surf2_bytes: usize, gop_offset: usize, gop_bytes: usize) {
+    let overlap = surf2_offset < gop_offset + gop_bytes && gop_offset < surf2_offset + surf2_bytes;
+    serial_println!(":: kdisp: fb-draw gop-overlap={} surf2={:08X}+{:08X} gop={:08X}+{:08X} ::",
+        if overlap { "YES-RESULT-VOID" } else { "no" },
+        surf2_offset, surf2_bytes, gop_offset, gop_bytes);
 }
 
 /// Returns false for zero, 0xFFFFFFFF, and the 0xBAD0xxxx pattern that our

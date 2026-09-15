@@ -60,6 +60,54 @@ because the probe lives inside `kepler_display::takeover_display`).
 so a q35 log with zero `BEAMX86` lines proves nothing about the code being present):
 `LC_ALL=C grep -a -o -F 'BEAMX86' target/x86_64_esp/kernel.elf | wc -l` on the flight artifact.
 
+## TREE CHANGE — SHUTRESTORE (2026-09-15): the seven deleted rungs are back behind knobs
+
+**No metal in this entry, and nothing here is a fact about silicon.** It is recorded in the metal
+log because it changes what a flight *can* ask the GK107, and a reader who finds these knobs on a
+flight line needs to know where they came from.
+
+**What changed.** [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) §7 listed seven refuted rungs whose
+CODE had been deleted — `grep` returning 0 hits for every one of their witness tokens. RULINGS R19
+(Peter, 2026-09-05) says a path that failed once and got shut out must keep its code and its knob,
+because many boots later a later path can turn out to need it open. All seven are restored from our
+own git history, each behind a default-OFF feature of its own, inside the existing `nvidia-kepler`
+cfg region. §7 is now the record of the restore rather than a list of absences; the per-rung rows in
+§1 and §2 carry `code: restored … behind <knob>`.
+
+**What an unarmed boot does differently: nothing.** Every restored site is under its own
+`#[cfg(feature = …)]`, all seven default OFF, so a knob-off image links not one byte of any of them
+and no rung is wired into the boot path unconditionally. The takeover path's behaviour with no rung
+knob is unchanged — BEAMX86's probe inside `takeover_display` is exactly where it was.
+
+**What a flight would arm** — each knob on top of the parent that gets it to its call site:
+
+| knob | what it runs | parent it needs | witness token to `awk` for |
+| --- | --- | --- | --- |
+| `UNAOS_KEPLER_USERD_SNOOP=1` | KF6: arm 0x2a1c, and restore it iff the channel witness comes back stripped | `UNAOS_KEPLER=1 UNAOS_KEPLER_FIFO=1` | `USERD_SNOOP (0x2a1c) orig=` |
+| `UNAOS_KEPLER_PFIFO_FLUSH=1` | KF8: trigger 0x70000, bounded BUSY poll | `UNAOS_KEPLER=1 UNAOS_KEPLER_FIFO=1` | `flush-executed 0x70000 pre=` |
+| `UNAOS_KEPLER_CTRL_ADDR=1` | KF9: the 3 PBDMA × 4 TARGET audit, every write read back and put back | `UNAOS_KEPLER=1 UNAOS_KEPLER_FIFO=1` | `ctrladdr pbdma` |
+| `UNAOS_KEPLER_REPOINT=1` | KD6: write 0x6101E0, 5 s panel window, restore + readback | `UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1` | `repoint pre 6101E0=` |
+| `UNAOS_KEPLER_LATCH_ARM=1` | KD7: EVO assembly write + UPDATE, the `pm-step` dumps | `UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1` | `latch verdict asm-stuck=` |
+| `UNAOS_KEPLER_PITCH_LADDER=1` | `lin-step` (linear pitch 0x4000) then the four `bwpg-step` block-linear cycles | `UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1` | `lin-step pitch=4000` · `bwpg-step bw=` |
+| `UNAOS_KEPLER_GOP_OVERLAP=1` | the detector that says a photo is VOID because we painted the scanned surface | `UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1` | `fb-draw gop-overlap=` |
+
+**Cost, counted rather than guessed.** These are camera-length rungs, not instrument rungs, and the
+restored code carries the original's own loop counts unchanged. One "hold" is five ticks of
+`for _ in 0..60_000_000 { spin_loop() }`; the original s21 code calls that a 5 s hold, and today's
+`nvidia-kepler-kdisp-hold` block in the same file annotates the identical loop as **1.12 s total**,
+so the wall-clock is CPU-speed-dependent and the honest unit is *ticks*, not seconds. Counting
+holds: `REPOINT` = 1 hold. `LATCH_ARM` = 1 hold + a 15 M-spin recovery gap. `PITCH_LADDER` = 5 holds
++ 5 recovery gaps (one `lin-step` cycle plus four `bwpg-step` cycles), and it is much the largest of
+the three for a second reason the holds do not show: its fills are ~7.4 M volatile VRAM dword writes
+for `lin-step` and a comparable figure per `bwpg-step` cycle. **Arm one rung at a time on a flight,
+never the whole set** — the boot's phase timings stop being comparable to every prior sitting
+otherwise, and `:: kdisp: inner phase` is the instrument that would go unreadable.
+
+**The control that must accompany any such flight** — the probe cannot run in QEMU (q35 has no
+Kepler, so a q35 log with zero rung lines proves nothing about the code being present):
+`LC_ALL=C grep -a -o -F '<witness token>' target/x86_64_esp/kernel.elf | wc -l` on the flight
+artifact, per LAWS §5. The same rule the BEAMX86 entry above carries.
+
 ## Sitting #43 (GR25 Boot A, capture `~/unaos-bench/capture/gr25-bootA/ttyUSB0.log`) — two ladder gates answered, and CE-LADDER armed
 
 Design of record for the copy-engine work: `~/unaos-bench/scratch/gr24/CE-LADDER-draft.md`

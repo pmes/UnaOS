@@ -1653,6 +1653,99 @@ pub fn init(gpu: &GpuInfo) {
                                         serial_println!(":: kepler: sched-status {} err={:08X} ({}) stat={:08X} ::", label, err, err_str, stat);
                                     };
 
+                                    // ══ SHUTRESTORE (R19) — the deleted FIFO rungs, back behind their own knobs ═════
+                                    //
+                                    // RULINGS R19 (Peter, 2026-09-05): "you take a path that does not work out so you
+                                    // shut it out but after very many boots its discovered that path needs to be open
+                                    // for later paths to succeed" — a rung that FAILED keeps its CODE and its KNOB.
+                                    // Three FIFO-ladder rungs' code had been deleted outright at pulls 14/15 with no
+                                    // reason recorded beyond having moved on (SHUTOUT-REGISTER.md §7). They are
+                                    // restored here at the PRE-INIT point they originally occupied, each behind a
+                                    // DEFAULT-OFF feature of its own, so an unarmed build is byte-identical and none
+                                    // of them is on the boot path without its knob.
+                                    //
+                                    // | rung | knob | feature | restored from |
+                                    // | KF6 USERD_SNOOP  | UNAOS_KEPLER_USERD_SNOOP  | nvidia-kepler-userdsnoop  | 7124e4e1 |
+                                    // | KF8 PFIFO_FLUSH  | UNAOS_KEPLER_PFIFO_FLUSH  | nvidia-kepler-pfifoflush  | 7420e06f |
+                                    // | KF9 CTRL_ADDR    | UNAOS_KEPLER_CTRL_ADDR    | nvidia-kepler-ctrladdr    | 3620c7d5 |
+
+                                    // KF6 — USERD_SNOOP (0x2a1c). Refuted at s10 as "tested inert on GK107", and the
+                                    // scrub comment that replaced it said "Never re-propose" — which is exactly the
+                                    // shut-out R19 forbids: the "writes read as zero" question it was asked about was
+                                    // never EXPLAINED, only set aside. The original value is captured here and put
+                                    // back below iff the channel witness comes back stripped, which is the original
+                                    // rung's own restore condition, verbatim.
+                                    #[cfg(feature = "nvidia-kepler-userdsnoop")]
+                                    let snoop_orig = {
+                                        let orig = mmio_read(bar0, 0x2a1c);
+                                        serial_println!(":: kepler: USERD_SNOOP (0x2a1c) orig={:08X} ::", orig);
+                                        mmio_write(bar0, 0x2a1c, 1);
+                                        orig
+                                    };
+
+                                    // KF8 — PFIFO_FLUSH (0x70000). The *flushable* form was refuted at s12; a
+                                    // coherence step under a RUNNING FECS is a different experiment, and it cannot be
+                                    // run at all while the only code that ever touched this register is absent.
+                                    // Read-trigger-poll-report, bounded at 10000 spins, no restore needed (the
+                                    // register is a trigger, not state).
+                                    #[cfg(feature = "nvidia-kepler-pfifoflush")]
+                                    {
+                                        let flush_pre = mmio_read(bar0, 0x70000);
+                                        if flush_pre == 0xFFFFFFFF || flush_pre == 0xBAD0BA20 {
+                                            serial_println!(":: kepler: PFLUSH (0x70000) ABSENT/POISON pre={:08X} ::", flush_pre);
+                                        } else {
+                                            mmio_write(bar0, 0x70000, 1); // TRIGGER
+                                            let mut flush_post = mmio_read(bar0, 0x70000);
+                                            let mut iters = 0;
+                                            while (flush_post & 2) != 0 && iters < 10000 { // Poll BUSY bit (bit 1)
+                                                core::hint::spin_loop();
+                                                flush_post = mmio_read(bar0, 0x70000);
+                                                iters += 1;
+                                            }
+                                            serial_println!(":: kepler: flush-executed 0x70000 pre={:08X} post={:08X} iters={} ::", flush_pre, flush_post, iters);
+                                        }
+                                    }
+
+                                    // KF9 — the PBDMA CTRL_ADDR TARGET audit. Refuted 12/12 at s13, and what went
+                                    // with it was twelve clean REVERSIBLE writes' worth of apparatus: three PBDMAs
+                                    // x four TARGET encodings, each written, read back, and put straight back to the
+                                    // value it held. The s13 original re-ran the whole channel bringup inside the
+                                    // target loop; that surrounding code no longer exists in this shape, so what is
+                                    // restored here is the AUDIT itself — the census and its reversibility — and the
+                                    // per-target bringup re-run is carried as an rmbp-queue `· NEW` row.
+                                    #[cfg(feature = "nvidia-kepler-ctrladdr")]
+                                    for pbdma_idx in 0..3usize {
+                                        let pbdma_base = 0x40000 + (pbdma_idx * 0x2000);
+                                        let ctrl_addr_low_off = pbdma_base + 0x08;
+                                        let ctrl_addr_high_off = pbdma_base + 0x0C;
+
+                                        let pre_low = mmio_read(bar0, ctrl_addr_low_off);
+                                        let pre_high = mmio_read(bar0, ctrl_addr_high_off); // report-only; TARGET is in low
+
+                                        if pre_low == 0xFFFFFFFF || pre_low == 0xBAD0BA20 {
+                                            serial_println!(":: kepler: ctrladdr pbdma{} ABSENT? rb={:08X} ::", pbdma_idx, pre_low);
+                                            continue;
+                                        }
+                                        serial_println!(":: kepler: ctrladdr pbdma{} pre={:08X} hi={:08X} ::", pbdma_idx, pre_low, pre_high);
+
+                                        for target in 0..4u32 {
+                                            let wrote = (pre_low & !0x3) | target;
+                                            mmio_write(bar0, ctrl_addr_low_off, wrote);
+                                            let rb = mmio_read(bar0, ctrl_addr_low_off);
+                                            if rb != wrote {
+                                                serial_println!(":: kepler: ctrladdr pbdma{} RO? wrote={:08X} rb={:08X} ::", pbdma_idx, wrote, rb);
+                                                mmio_write(bar0, ctrl_addr_low_off, pre_low); // restore
+                                                continue;
+                                            }
+                                            serial_println!(":: kepler: ctrladdr pbdma{} try target={} wrote={:08X} rb={:08X} ::", pbdma_idx, target, wrote, rb);
+                                            // Every write is put back before the next one — the audit leaves the
+                                            // PBDMA exactly as it found it, and the restore is READ BACK.
+                                            mmio_write(bar0, ctrl_addr_low_off, pre_low);
+                                            let rb_restored = mmio_read(bar0, ctrl_addr_low_off);
+                                            serial_println!(":: kepler: ctrladdr pbdma{} restored rb={:08X} ::", pbdma_idx, rb_restored);
+                                        }
+                                    }
+
                                     // Milestone 1: Method-Mirror Backing-Store Beacon Test
                                     // Pass 0: Baseline dump
                                     let mut rows = 0;
@@ -2370,7 +2463,20 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     let ch_1_0_pre = mmio_read(bar0, 0x800000 + (1 * 8));
                                     let ch_1_4_pre = mmio_read(bar0, 0x800004 + (1 * 8));
                                     serial_println!(":: kepler: PFIFO_CHAN[1] pre-submit: 00={:08X} 04={:08X} ::", ch_1_0_pre, ch_1_4_pre);
-                                    
+
+                                    // SHUTRESTORE (R19) — KF6 USERD_SNOOP's second half, restored verbatim from
+                                    // 7124e4e1: the rung leaves 0x2a1c ARMED when the channel witness holds, and puts
+                                    // the original value back when the witness comes back stripped. Without this
+                                    // line the arm above would be a one-way write; with it the rung is exactly the
+                                    // reversible probe it was at s10. Default OFF => neither half exists.
+                                    #[cfg(feature = "nvidia-kepler-userdsnoop")]
+                                    if (ch_1_0_pre & 0xC0000000) != 0xC0000000 {
+                                        serial_println!(":: kepler: WITNESS FAILED - bits stripped. Restoring USERD_SNOOP={:08X} ::", snoop_orig);
+                                        mmio_write(bar0, 0x2a1c, snoop_orig);
+                                    } else {
+                                        serial_println!(":: kepler: USERD_SNOOP (0x2a1c) left armed — witness held ::");
+                                    }
+
                                     // Witness check
                                     if (ch_1_0_pre & 0xC0000000) != 0xC0000000 {
                                         serial_println!(":: kepler: WITNESS STRIPPED. Restoring inst_off+0x0C ::");
