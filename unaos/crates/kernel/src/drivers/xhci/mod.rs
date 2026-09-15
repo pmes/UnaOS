@@ -4365,7 +4365,7 @@ impl XhciController {
                                     }
                                 }
                             }
-                        }
+                        } #[cfg(feature = "ftdirx")] { if ftdi::ftdirx::claim(slot_id as u8, endpoint_id as u8, param, completion_code as u8, transfer_len) { return; } } // FTDIRX (rmbp A9) — THE BULK-IN COMPLETION, claimed BESIDE its bulk-OUT twin above and for the same reason: the FTDI slot is distinct from the storage slot, so slot_id + the IN dci disambiguate this event from any BOT transfer, and the armed TRB address (or any error on our endpoint) claims exactly our own Normal TRB before the async enumeration FSM below can drop it as stale. `claim` stores four relaxed words and returns — LOCKFIX: `push_event` takes the event-queue lock and MUST NOT be reached from inside the event-ring dispatch, so the bytes are delivered by `service_ftdi_rx` on the next main-loop pass instead. ⚠ LINE-NEUTRAL append: this file is compiled into the Pi kernel8.img and a line added anywhere in it moves every panic `Location` below it; the knob-off byte-identity of BOTH arches is what `./arroyo knoboff ftdirx` measures.
 
                         // An EP0 transfer for the port being ENUMERATED failed (STALL on a
                         // descriptor fetch / SET_CONFIGURATION, babble, transaction error...).
@@ -6275,7 +6275,7 @@ impl XhciController {
                 self.ftdi_slot = 0;
                 self.ftdi_pending_bringup = false;
                 self.ftdi_pending = None;
-                ftdi::set_live(false);
+                ftdi::set_live(false); #[cfg(feature = "ftdirx")] ftdi::ftdirx::reset(); // FTDIRX (rmbp A9) — the RX TRB is armed only while the console is live, so the slot that owned it going away DROPS it here beside the TX state it sits next to. Without this a hot-plugged replacement console would find `armed()` true against a freed TransferRing and never arm a read of its own. ⚠ LINE-NEUTRAL append.
             }
             self.hid_setproto_pending.retain(|s| *s != i as u8);
             self.hid_halt_pending.retain(|(s, _)| *s != i as u8);
@@ -6483,7 +6483,7 @@ impl XhciController {
                 self.ftdi_slot = 0;
                 self.ftdi_pending_bringup = false;
                 self.ftdi_pending = None;
-                ftdi::set_live(false); // the console's slot is torn down — stop the drain
+                ftdi::set_live(false); #[cfg(feature = "ftdirx")] ftdi::ftdirx::reset(); // FTDIRX (rmbp A9) — the RX TRB is armed only while the console is live, so the slot that owned it going away DROPS it here beside the TX state it sits next to. Without this a hot-plugged replacement console would find `armed()` true against a freed TransferRing and never arm a read of its own. ⚠ LINE-NEUTRAL append. // the console's slot is torn down — stop the drain
             }
             self.hid_setproto_pending.retain(|s| *s != i as u8);
             self.hid_halt_pending.retain(|(s, _)| *s != i as u8);
@@ -13359,7 +13359,7 @@ impl XhciController {
             crate::bootpace::record("ftdi-up");
             ftdi::set_live(true);
         }
-        self.drain_ftdi();
+        self.drain_ftdi(); #[cfg(feature = "ftdirx")] self.service_ftdi_rx(); // FTDIRX (rmbp A9) — THE RX HALF OF THE CONSOLE, the one statement this path never had. TX-first on purpose: the drain above is the console's own output and stays ahead of the input that provokes it, so an echoed prompt reaches the wire before the next typed byte is taken off it. Arms one Normal TRB on bulk-IN once the sink is live (the `set_live(true)` directly above), consumes each completion, strips the FT232's TWO modem-status bytes and pushes the rest as `Event::Key` — the same queue the xHCI HID decoder feeds, so `x86_input_service`'s `next_event` drain sees a cable byte exactly as it sees a keystroke. Same shape as `serialrx::drain` on the Orin (arch/aarch64/serial.rs), one pass per device-service pass. DEFAULT OFF. ⚠ LINE-NEUTRAL append: panic `Location` records embed line numbers and this file is compiled into the Pi kernel8.img.
     }
 
     /// PTBURST — bytes staged into ONE bulk-OUT transfer. **64, the FT232's full-speed bulk max packet
@@ -14655,7 +14655,7 @@ impl XhciController {
                 self.ftdi_slot = 0;
                 self.ftdi_pending_bringup = false;
                 self.ftdi_pending = None;
-                ftdi::set_live(false);
+                ftdi::set_live(false); #[cfg(feature = "ftdirx")] ftdi::ftdirx::reset(); // FTDIRX (rmbp A9) — the RX TRB is armed only while the console is live, so the slot that owned it going away DROPS it here beside the TX state it sits next to. Without this a hot-plugged replacement console would find `armed()` true against a freed TransferRing and never arm a read of its own. ⚠ LINE-NEUTRAL append.
             }
             self.hid_setproto_pending.retain(|s| *s != i as u8);
             self.hid_halt_pending.retain(|(s, _)| *s != i as u8);
@@ -15847,6 +15847,116 @@ impl XhciController {
                 ring_base + (idx as u64 * core::mem::size_of::<Trb>() as u64);
             self.ring_doorbell(slot_id, dci as u32); KBD_REARM_COUNT.fetch_add(1, Ordering::Relaxed); // PRTSCLOST — counted AFTER the doorbell, because the doorbell is the instant the endpoint stops being unarmed: a count taken before it would claim a window this function had not yet closed. `MOUSE_REARM_COUNT`'s twin (`queue_mouse_read` bumps its own). ⚠ FOLDED.
             xdbg!("xHCI: Keyboard Read Queued.");
+        }
+    }
+}
+
+// ── FTDIRX (rmbp A9 / LEDGER S29, x86 half) — the controller half of the FTDI RX console ──────────
+//
+// The protocol half (the two modem-status bytes, the counters, the single `push_event` intake) is
+// `ftdi::ftdirx`, arch-neutral and in the file that already holds the FT232's constants. THIS is the
+// part that needs a transfer ring: arm one Normal TRB on the console's bulk-IN endpoint, take the
+// completion the event dispatch claimed for us, hand the packet over, re-arm.
+//
+// ⚠ TAIL BLOCK ON PURPOSE. This file is compiled into the Pi's `kernel8.img` and into both kernel
+// images knoboff measures, and `panic::Location` embeds the source LINE — so a `#[cfg]`-erased
+// block ANYWHERE ABOVE would still shift every panic site below it and move a knob-off image that
+// contains none of this code (LEDGER P7). Appended past the last statement in the file, it shifts
+// nothing. The four sites inside the file proper are line-neutral appends for the same reason.
+#[cfg(feature = "ftdirx")]
+impl XhciController {
+    /// Bytes per bulk-IN transfer — `ftdi::ftdirx::CHUNK`, the FT232's full-speed bulk MPS.
+    const FTDI_RX_CHUNK: usize = ftdi::ftdirx::CHUNK;
+
+    /// Main-loop hook: service the FTDI console's RECEIVE direction. Called once per device-service
+    /// pass from [`Self::service_ftdi`], directly after the TX drain.
+    ///
+    /// EXACTLY ONE TRB IS OUTSTANDING, EVER. The completion is consumed here before a new one is
+    /// pushed, so the IN ring can never over-arm — the failure mode `queue_keyboard_read`'s
+    /// `expect_phys` latch exists to catch on the HID endpoints, avoided here by construction
+    /// because there is one consumer and it is this function.
+    ///
+    /// The window between a retired TD and this re-arm is the same unarmed window PRTSCLOST
+    /// measures on the keyboard, and it is bounded by the device-service pass period — which for
+    /// the console is the right trade: an FT232 holds received bytes in a 256-byte RX FIFO and NAKs
+    /// nothing away, so a byte typed while the endpoint is dark is still there on the next IN token.
+    /// That is the difference between this endpoint and an interrupt-IN HID endpoint, where a state
+    /// change inside the dark window is gone forever.
+    fn service_ftdi_rx(&mut self) {
+        // The sink going dark (teardown, or `disable_ftdi_tx` on a wedged cable) drops the read.
+        // Checked FIRST so a dead console cannot leave `armed()` true against a freed ring.
+        if !ftdi::is_live() {
+            ftdi::ftdirx::reset();
+            return;
+        }
+        let slot = self.ftdi_slot;
+        if slot == 0 {
+            return;
+        }
+        let (in_ep, data_phys) = {
+            let s = &self.slots[slot as usize];
+            let dp = match s.scsi_data_buffer {
+                Some(p) => p as u64,
+                None => return,
+            };
+            (s.bulk_in_ep, dp)
+        };
+        if in_ep == 0 {
+            return;
+        }
+        // Endpoint address 0x81 -> DCI 3: (ep & 0x0F) * 2 + 1 for an IN direction.
+        let in_dci = ((in_ep & 0x0F) * 2) + 1;
+        // A window of the FTDI slot's staging buffer DISJOINT from the TX one (see
+        // `ftdi::ftdirx::BUF_OFFSET`). The slot never runs BOT, so nothing else reads or writes it.
+        let rx_phys = data_phys + ftdi::ftdirx::BUF_OFFSET as u64;
+
+        // 1. CONSUME. `transfer_len` on a Transfer Event is the RESIDUE — the bytes the TD did NOT
+        //    move — so the packet is `CHUNK - residue` long. A short packet (code 13) is the normal
+        //    case here and is not an error: the FT232 answers every IN token with at most one
+        //    packet, and a typed line is a handful of bytes.
+        if let Some((code, residue)) = ftdi::ftdirx::take_done() {
+            if code == 1 || code == 13 {
+                let n = Self::FTDI_RX_CHUNK.saturating_sub(residue as usize);
+                // XHCI-COHERENCE: the landing zone was DMA-WRITTEN by the controller and is about to
+                // be CPU-read; invalidate so the read sees the wire's bytes and not a stale line.
+                // No-op on x86, load-bearing on the aarch64 targets this file also compiles for.
+                dma_coherency::inval(rx_phys as usize, Self::FTDI_RX_CHUNK);
+                let pkt = unsafe {
+                    core::slice::from_raw_parts(rx_phys as *const u8, n.min(Self::FTDI_RX_CHUNK))
+                };
+                ftdi::ftdirx::deliver(pkt);
+            } else {
+                ftdi::ftdirx::note_error(code);
+            }
+        }
+
+        // 2. RE-ARM. Nothing outstanding => push one Normal TRB (IOC set, so it raises a Transfer
+        //    Event) and ring the IN doorbell. A ring that refuses the push leaves `armed()` false
+        //    and the next pass tries again rather than losing the endpoint permanently.
+        if !ftdi::ftdirx::armed() {
+            // XHCI-COHERENCE: evict any dirty line of the landing zone before the controller is
+            // allowed to DMA into it — the producer-side twin of the invalidate above, and the same
+            // order `queue_keyboard_read` uses.
+            dma_coherency::clean(rx_phys as usize, Self::FTDI_RX_CHUNK);
+            let wait_trb_phys = {
+                let ring = match self.slots[slot as usize].bulk_in_ring.as_mut() {
+                    Some(r) => r,
+                    None => return,
+                };
+                let base = ring.get_ptr();
+                match ring.push(Trb {
+                    parameter: rx_phys,
+                    status: Self::FTDI_RX_CHUNK as u32,
+                    control: (1 << 10) | (1 << 5), // Type 1 (Normal) | IOC
+                }) {
+                    Ok(idx) => base + (idx as u64) * core::mem::size_of::<Trb>() as u64,
+                    Err(_) => return,
+                }
+            };
+            // Recorded BEFORE the doorbell: the controller may complete the transfer between these
+            // two statements, and the dispatch must already know which TRB to match.
+            ftdi::ftdirx::arm(slot, in_dci, wait_trb_phys);
+            self.ring_doorbell(slot, in_dci as u32);
         }
     }
 }

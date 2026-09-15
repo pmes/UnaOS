@@ -536,6 +536,15 @@ fn main() {
     // maps the EXPLICIT UNAOS_TEGRASMP=1 knob for parity only. UNAOS_NOTEGRASMP is a no-op here (nothing
     // to suppress on x86 media). Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_TEGRASMP").is_ok() { feats.push("tegrasmp"); }
+    // FTDIRX (rmbp A9 / LEDGER S29, x86 half): UNAOS_FTDIRX=1 gives the FTDI console its RECEIVE
+    // half — one Normal TRB outstanding on the FT232's bulk-IN 0x81, the two modem-status bytes
+    // stripped, the rest pushed as `pal::Event::Key`. MUST be listed here and not only in `arroyo`:
+    // THIS list is the one the x86 kernel that actually boots is built from, and a knob mapped there
+    // alone is the rastmc failure — the `⚡ kernel features:` banner says the feature is on and the
+    // image carries none of it, which for an RX arc reads exactly like "the cable received nothing".
+    // Needs UNAOS_USBSERIAL=1 to have a cable at all, and UNAOS_FTDIRX_INJECT=<path> (below) to have
+    // anything to receive under QEMU. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_FTDIRX").is_ok() { feats.push("ftdirx"); }
     if !feats.is_empty() {
         let list = feats.join(",");
         kernel_cmd.arg("--features").arg(&list);
@@ -1032,12 +1041,32 @@ fn main() {
     // chardev is a file at target/ftdi.log, so the kernel's FTDI console driver enumerates it and
     // replays the boot log out bulk-OUT — the metal cable (arriving ~2026-07-08) behaves the same.
     // NOTE: `is_ok()` treats an EMPTY value as SET (the known knob trap) — `UNAOS_USBSERIAL=` is ON.
+    //
+    // FTDIRX (rmbp A9): a `file` chardev CANNOT BE WRITTEN INTO. That is fine for a TX-only console
+    // and fatal for an RX gate — there is no way to type at the emulated cable. `UNAOS_FTDIRX_INJECT`
+    // = a UNIX socket path swaps the file for a LISTENING socket chardev, which is bidirectional:
+    // `scripts/ftdi_inject.py <path>` connects to it once the console is up and writes the bytes the
+    // kernel must receive, and everything QEMU would have written to the file comes back over the
+    // same socket instead. DEFAULT UNSET keeps today's file chardev BYTE-FOR-BYTE, so every existing
+    // U2.5 run and its `target/ftdi.log` capture are untouched. `server=on,wait=off` so QEMU creates
+    // the socket and boots WITHOUT waiting for a peer — the injector attaches seconds later, mid-boot,
+    // exactly as a bench operator plugs into a running machine.
     if usbserial {
-        let ftdi_log = target_dir.join("ftdi.log");
-        let _ = std::fs::remove_file(&ftdi_log); // start each run with a fresh capture file
-        cmd.arg("-chardev").arg(format!("file,id=ftdi0,path={}", ftdi_log.display()))
-           .arg("-device").arg("usb-serial,bus=xhci.0,chardev=ftdi0");
-        println!("   U2.5: FTDI usb-serial attached; console capture -> {}", ftdi_log.display());
+        match std::env::var("UNAOS_FTDIRX_INJECT") {
+            Ok(sock) if !sock.is_empty() => {
+                let _ = std::fs::remove_file(&sock); // a stale socket file makes QEMU refuse to bind
+                cmd.arg("-chardev").arg(format!("socket,id=ftdi0,path={sock},server=on,wait=off"))
+                   .arg("-device").arg("usb-serial,bus=xhci.0,chardev=ftdi0");
+                println!("   U2.5 + FTDIRX: FTDI usb-serial attached; console is a UNIX socket -> {sock}");
+            }
+            _ => {
+                let ftdi_log = target_dir.join("ftdi.log");
+                let _ = std::fs::remove_file(&ftdi_log); // start each run with a fresh capture file
+                cmd.arg("-chardev").arg(format!("file,id=ftdi0,path={}", ftdi_log.display()))
+                   .arg("-device").arg("usb-serial,bus=xhci.0,chardev=ftdi0");
+                println!("   U2.5: FTDI usb-serial attached; console capture -> {}", ftdi_log.display());
+            }
+        }
     }
 
     // SMP: bring up multiple CPUs so the kernel's AP-startup path has application

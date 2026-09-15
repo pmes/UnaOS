@@ -3126,6 +3126,22 @@ facet = ["quarry"]
 # its own feature list from env and never reads `$KERNEL_FEATURES`). Witness on the wire:
 # `:: USBLUN: census SKIPPED ::` in place of the `:: USBLUN: ... ::` family.
 nousblun = []
+# FTDIRX (rmbp A9 / LEDGER S29, x86 half) — THE FTDI CONSOLE LEARNS TO RECEIVE. On the 2012 rMBP the
+# only console is an FT232 cable on xHCI and it was TX-only: `drivers/xhci/ftdi.rs`'s header said in as
+# many words that bulk-IN RX was "a STUB deferred to a future arc". Armed, `service_ftdi` keeps ONE
+# Normal TRB outstanding on bulk-IN 0x81 (64 B, the FS bulk MPS), strips the TWO modem-status bytes the
+# FT232 prefixes to EVERY packet (Linux `ftdi_sio.h`) and pushes the rest as `pal::Event::Key` onto the
+# same queue the xHCI HID decoder feeds — so a byte typed on the bench side of the cable reaches the
+# shell exactly as a UART byte does on the Orin (`orinrx`, whose `serialrx::drain` shape this copies).
+# A 2-byte packet is the chip's idle latency-timer poll: counted, never delivered.
+# DEFAULT OFF => both the ftdi.rs tail module and the mod.rs tail impl are `#[cfg]`-erased and the four
+# in-file sites are LINE-NEUTRAL appends, so the knob-off loadable image is byte-identical on both
+# arches (`./arroyo knoboff ftdirx`). Enable via `UNAOS_FTDIRX=1`; the QEMU-side injector chardev is the
+# separate BUILDER knob `UNAOS_FTDIRX_INJECT=<unix socket path>` (it needs `UNAOS_USBSERIAL=1` too).
+# x86_64 in effect (that is where the cable is), but the code is arch-neutral and compiles on aarch64.
+# Witnesses on the wire: `:: FTDIRX: first byte rx=… ::` (one-shot) and `:: FTDIRX: rx=… result=OK ::`
+# (log-scale rollup). Kept in sync with arroyo.
+ftdirx = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

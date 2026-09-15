@@ -2089,6 +2089,31 @@ fi
 # `genet` (Cargo feature). Runs at the top of `genet_bringup` and prints `:: NET-GATE: ... PASS [w=0x..] ::`.
 # Pair with UNAOS_PI=1 on the kernel8-test battery: `UNAOS_NETTEST=1 UNAOS_PI=1 ./arroyo kernel8-test`.
 [ -n "${UNAOS_NETTEST:-}" ] && _feats="${_feats}nettest,genet,"
+# FTDIRX (rmbp A9 / LEDGER S29, x86 half): UNAOS_FTDIRX=1 lets the rMBP's FTDI console RECEIVE.
+# `service_ftdi` gains its RX half — ONE Normal TRB outstanding on the FT232's bulk-IN 0x81 (64 B, the
+# full-speed bulk MPS), the TWO modem-status bytes the chip prefixes to EVERY packet stripped (Linux
+# `drivers/usb/serial/ftdi_sio.h`), the rest pushed as `pal::Event::Key` onto the same queue the xHCI
+# HID decoder feeds. A 2-byte packet is the chip's idle latency-timer poll: counted (`idle=`), never
+# delivered. This is `orinrx` for the other board — the Orin's UART RX drain and this one push through
+# the identical `push_event` intake, which is why the feature is SUBSYSTEM-named (`ftdirx`, the FTDI
+# transport) and not board-named.
+#
+# DEFAULT OFF, and the default image is unmoved: the ftdi.rs module and the mod.rs `impl` are TAIL
+# blocks and the four in-file sites are LINE-NEUTRAL appends, so `./arroyo knoboff ftdirx <baseline>`
+# is exit 0 on both arches. NO `_feats` companions are appended — `ftdirx` is self-sufficient
+# (`ftdirx = []` in Cargo), the console it extends is already compiled into every x86 kernel, and the
+# ARMED polarity is type-checked by whichever `x86-mix-*` leg of GATE-CFG-MIX carries it (the universe
+# is DERIVED from Cargo.toml's `[features]`, so declaring it there is what puts it under coverage —
+# see the GATE-CFG-MIX note; do NOT name it on an arm-* leg or it leaves the x86 universe).
+#
+# THE CABLE IS NOT THE KNOB. `UNAOS_USBSERIAL=1` (a BUILDER knob, ~line 102) is what attaches the
+# emulated FT232 at all, and its chardev is a FILE — which cannot be written INTO. To type at a QEMU
+# run, add the builder's `UNAOS_FTDIRX_INJECT=<unix socket path>`: it swaps the file chardev for a
+# listening socket, and `scripts/ftdi_inject.py` connects to it and writes. Metal needs neither: the
+# cable is the chardev. Witnesses on the wire: `:: FTDIRX: first byte rx=… ::` (one-shot) and
+# `:: FTDIRX: rx=… packets=… idle=… errors=… result=OK ::` (a rollup on `note_ftdi_pump`'s log-scale
+# doubling throttle, so it is the last MILESTONE and not a final total). Kept in sync with Cargo.toml.
+[ -n "${UNAOS_FTDIRX:-}" ] && _feats="${_feats}ftdirx,"
 # ── BANNER-DEDUP (orin 3, 2026-08-22) — the banner must not misreport its own composition ─────────
 #
 # THE SYMPTOM. An armed jetson build printed `tegra` THREE times:
