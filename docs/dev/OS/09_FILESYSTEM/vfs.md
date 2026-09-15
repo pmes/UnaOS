@@ -826,6 +826,86 @@ Call sites: aarch64 after `emmc2::probe()` (the `midden_witness` tail), x86 from
 `midden_witness`'s own x86 site is at boot step 5, before `pci::init` and the storage publish, where
 a routing leg would assert against an empty namespace and be dead rather than quiet.
 
+### 13.8 RMDIR (SO18) — the native volume removes directories now
+
+> **This subsection SUPERSEDES two sentences above it, and they are left in place as history.**
+> §13.2's table row reads `remove_dir … native UnaFS: **not implemented** — the crate has none`, and
+> §13.7's `vfsroute.rmdir` row reads `-ENOTSUP … the CAPABILITY proof`. Both were true and both are
+> now false: the crate has a `rmdir`, `NativeBackend` implements the trait method over it, and the
+> `-ENOTSUP` a `rmdir /D` printed on every board whose root is UnaFS is gone.
+
+**What was missing, and where.** VFSROUTE gave `VfsBackend::remove_dir` a refusing default so a
+volume that cannot remove a directory says so in the type system instead of falling through to some
+other filesystem. `NativeBackend` inherited that refusal — not as a posture, but because
+`unafs::UnaFS` carried no directory removal at all (`unlink` answered `IsADirectory` for every
+directory, unconditionally). So FAT was the only volume in the namespace that could remove one, and
+two things followed that LEDGER SO18 records: no positive native `mkdir` transcript could exist (a
+created directory could never be cleaned up, and `k3_mount_selftest` bit5 reds on a leaked fixture),
+and `mv -f` onto a native directory destination could not tree-replace.
+
+**The primitive.** `UnaFS::rmdir(parent_id, name) -> Result<u64>` in `unaos/libs/fs/unafs/src/fs.rs`,
+written as `unlink`'s twin because that is what it is: a UnaFS directory is an object whose data is a
+serialized `Vec<DirEntry>`, and unhooking its NAME is byte-for-byte the same work as unhooking a
+file's. `unlink`'s blanket refusal was never about the mechanism — it was about the one question
+`unlink` could not answer, *is this safe*. `rmdir` answers it (the directory must be EMPTY) and then
+runs the same removal: scrub the catalog, unhook the entry, release the child's own entry-list
+blocks, its spilled attributes, its inode block and its inode-map slot — all inside the ONE CoW
+transaction the closing `maybe_commit` flips, so there is no orphan window.
+
+Two details are load-bearing:
+
+* **Emptiness is read through `ls`, never off `size`.** A directory that once held entries and had
+  them all removed carries a NON-ZERO `size` — the serialized empty vector — so a `size == 0` test
+  would refuse a legitimately empty directory. The host KAT
+  (`tests/mutation_logic.rs::rmdir_removes_an_empty_directory_and_round_trips_its_blocks`) drives
+  exactly that state and asserts `size > 0` before the successful removal.
+* **`DirectoryNotEmpty` is a NEW error variant, distinct from `IsADirectory`.** `unlink` refuses a
+  directory because of its KIND; `rmdir` refuses one because of its CONTENTS. A caller that cannot
+  tell those apart cannot print the two different things an operator has to do about them.
+
+**The trait method.** `NativeBackend::remove_dir` in `fs/vfs.rs` is `unlink`'s body with one question
+added and one swapped. It authorizes FIRST through the same `native_write_authz` — the same U6
+`owner` / `grants:<principal>` rows and the same `RIGHT_WRITE` bit, because a directory is an object
+with an ACL like any other and removing one is a write to it. Its refusals are the trait's stated
+contract, not new spellings:
+
+| target | answer | shell renders |
+| --- | --- | --- |
+| a FILE | `NotADirectory` | `not a directory (-ENOTDIR)` — use `rm` |
+| the VOLUME ROOT | `IsADirectory` (`native_parent` finds no leaf to unhook) | `is a directory (-EISDIR)`; `fs_rmdir` catches `/` earlier and says `-EBUSY` |
+| a NON-EMPTY directory | `Backend("not-empty")` | `directory not empty (-ENOTEMPTY)` |
+| a principal without the write right | `Denied` | `permission denied (-EACCES)` |
+
+`Backend("not-empty")` is MAPPED from the crate's `DirectoryNotEmpty` rather than decided out here by
+a locate-first re-scan, and that is deliberate: the emptiness test and the removal have to be inside
+the crate's single transaction. A check made in the adapter would be a TOCTOU window between two
+mount calls.
+
+**The witness.** `rmdir_unafs_witness` (file-tail append in `fs/vfs.rs`, `witness`-gated, wired into
+the u7 launcher chain immediately after `vfs2_native_write_witness`) drives the live card through the
+real `MountTable`: create `/RMDIRW` owned by a non-kernel principal, plant a file in it, prove the
+non-empty refusal leaves the child alone, prove the file and root refusals, empty it, prove a
+STRANGER is refused, let the owner remove it — then `force_remount()` and re-read, so the PASS line
+is a claim about the CARD and not about one mount's in-RAM tree. One uncounted
+`:: RMDIR-UNAFS: … -> PASS ::` line; honest skip where no unafs volume is present. Go-red is by
+mutation: delete the emptiness test in `UnaFS::rmdir` and the non-empty leg succeeds, which reds the
+line and (via mbench's default `-> FAIL` forbid) the leg.
+
+**What §13.7's transcript became.** `vfsroute.rmdir` asserted `-ENOTSUP` against a FILE target
+(`/VFSR1.TXT`) and called it the CAPABILITY proof. That answer no longer exists anywhere, so the
+leg's CLAIM moved with the capability: it now requires `-ENOTDIR` and the name still listed. The
+ROUTING half it was really carrying is untouched and still two-sided — a `rmdir` riding `fat.rs`
+would not find `VFSR1.TXT` on the boot partition at all and would say `-ENOENT`, so `-ENOTDIR` can
+only have come from the volume that owns the path.
+
+The transcript's own residual — *"there is no positive native `mkdir` transcript, and there cannot be
+one until the crate can remove a directory"* — is CLOSED, and the doc comments in `shell.rs` that
+stated it (`fs_rmdir`, the RELICS `mkdir` leg, `vfsroute_native_witness`) say so. The legs there are
+deliberately left non-mutating: each is two-sided as written and its subject is routing, while the
+positive `mkdir`+`rmdir` pair is carried on the wire by `rmdir_unafs_witness`, which creates,
+refuses, removes and re-reads across a genuine remount. Folding a positive pair into the VFSROUTE
+transcript as well is a queue row, not a one-line edit.
+
 
 ## 14. BOOTROOT (orin 22) — what `/` IS, and why the kernel is not told
 

@@ -574,3 +574,135 @@ fn unlink_refuses_directories_and_missing_names() {
     // The refusals must not have disturbed the directory.
     assert_eq!(fs.ls(root_id).unwrap().len(), 1);
 }
+
+// --- M4: rmdir (RMDIR / SO18) ------------------------------------------------
+//
+// `unlink`'s twin, and tested as its twin: the same four questions the M1 block
+// asks of a file removal (name gone, free space round-trips, refusals leave the
+// volume untouched, the mutated volume re-mounts clean), asked of a DIRECTORY.
+//
+// The ACL leg is NOT here on purpose. This crate stores `owner`/`grants:<p>` as
+// ordinary attributes and interprets none of them — the one write-side evaluator
+// is `fs/vfs.rs::native_write_authz` in the kernel, which authorizes before it
+// calls `rmdir`, exactly as it does before `unlink`. The wrong-principal refusal
+// is therefore proven where it lives: the RMDIR-UNAFS wire fixture.
+
+#[test]
+fn rmdir_removes_an_empty_directory_and_round_trips_its_blocks() {
+    let mut fs = fresh_fs(5000);
+    let root_id = fs.superblock.root_inode;
+
+    // Seed first, so the root's directory block and the catalog exist before
+    // the baseline snapshot and their rewrites net to zero across the removal.
+    let keeper_id = fs.create_file(root_id, "keeper.txt".to_string()).unwrap();
+    fs.set_attribute(
+        keeper_id,
+        "tag".to_string(),
+        AttributeValue::String("keep".to_string()),
+    )
+    .unwrap();
+
+    let free_before = fs.free_blocks();
+
+    let dir_id = fs.mkdir(root_id, "scratch".to_string()).unwrap();
+    // Give the directory an owner row (what NativeBackend::create plants) so the
+    // removal has a catalog entry to scrub, and CONTENTS, so the emptiness test
+    // below is exercised against a directory that reached non-zero `size` and
+    // came back — the case a naive `size == 0` check gets wrong.
+    fs.set_attribute(
+        dir_id,
+        "owner".to_string(),
+        AttributeValue::String("una".to_string()),
+    )
+    .unwrap();
+    let child_id = fs.create_file(dir_id, "inside.txt".to_string()).unwrap();
+    fs.write_data(child_id, 0, b"transient").unwrap();
+    assert!(fs.free_blocks() < free_before, "creation must consume blocks");
+
+    // NON-EMPTY IS REFUSED, and refusing changes nothing.
+    assert!(matches!(
+        fs.rmdir(root_id, "scratch"),
+        Err(FileSystemError::DirectoryNotEmpty)
+    ));
+    assert_eq!(fs.ls(dir_id).unwrap().len(), 1);
+    assert_eq!(fs.resolve_path("/scratch/inside.txt").unwrap(), child_id);
+
+    // Empty it, and the SAME call now succeeds — the directory's `size` is
+    // non-zero here (it holds a serialized EMPTY vector), which is precisely
+    // why emptiness is read through `ls` and never off `size`.
+    fs.unlink(dir_id, "inside.txt").unwrap();
+    assert!(fs.read_inode(dir_id).unwrap().size > 0);
+    let freed = fs.rmdir(root_id, "scratch").expect("rmdir failed");
+    assert_eq!(freed, dir_id);
+
+    // Unreachable by name, by path, and by the attribute index.
+    let entries = fs.ls(root_id).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, "keeper.txt");
+    assert!(fs.resolve_path("/scratch").is_err());
+    assert!(fs.query("owner == \"una\"").unwrap().is_empty());
+
+    // Every block the directory and its child consumed came back.
+    assert_eq!(
+        fs.free_blocks(),
+        free_before,
+        "free-space accounting must round-trip across mkdir+rmdir"
+    );
+
+    // The survivor is untouched, and the mutated volume re-mounts clean.
+    assert_eq!(fs.resolve_path("/keeper.txt").unwrap(), keeper_id);
+    let device = fs.device.clone();
+    drop(fs);
+    let mut fs2 = UnaFS::mount(device).expect("re-mount after rmdir failed");
+    let report = fs2.fsck(false).expect("fsck");
+    assert!(
+        report.is_clean(),
+        "volume must re-mount clean after rmdir: {report:?}"
+    );
+    assert!(fs2.resolve_path("/scratch").is_err());
+    assert_eq!(fs2.resolve_path("/keeper.txt").unwrap(), keeper_id);
+}
+
+#[test]
+fn rmdir_refuses_files_missing_names_and_the_volume_root() {
+    let mut fs = fresh_fs(5000);
+    let root_id = fs.superblock.root_inode;
+    fs.mkdir(root_id, "home".to_string()).unwrap();
+    fs.create_file(root_id, "plain.txt".to_string()).unwrap();
+
+    // A FILE is -ENOTDIR, not -EISDIR: `rmdir` and `unlink` refuse the other's
+    // kind with DIFFERENT errors, which is what lets a shell print two verbs'
+    // worth of advice.
+    assert!(matches!(
+        fs.rmdir(root_id, "plain.txt"),
+        Err(FileSystemError::NotADirectory)
+    ));
+    assert!(matches!(
+        fs.rmdir(root_id, "nope"),
+        Err(FileSystemError::NotFound)
+    ));
+
+    // THE ROOT IS NEVER REMOVABLE. It is unnameable in any parent listing, so
+    // the only way to aim at it is to plant its id under a name — which is what
+    // a corrupt listing would look like — and the guard must hold there too.
+    let mut entries = fs.ls(root_id).unwrap();
+    entries.push(unafs::fs::DirEntry {
+        name: "loop".to_string(),
+        inode_id: root_id,
+        kind: FileKind::Directory,
+    });
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let data = unafs::codec::serialize(&entries).unwrap();
+    // The planted listing is strictly longer than the one it replaces, so a
+    // write at offset 0 overwrites every old byte and grows the directory.
+    fs.write_data(root_id, 0, &data).unwrap();
+    assert!(matches!(
+        fs.rmdir(root_id, "loop"),
+        Err(FileSystemError::IsADirectory)
+    ));
+
+    // No refusal disturbed anything: home, plain.txt and the planted name.
+    assert_eq!(fs.ls(root_id).unwrap().len(), 3);
+    assert!(fs.resolve_path("/home").is_ok());
+    assert!(fs.resolve_path("/plain.txt").is_ok());
+}

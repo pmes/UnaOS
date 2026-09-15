@@ -16529,7 +16529,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     crate::fs::vfs::vfs2_fat_write_witness();
     u7stk!("after:vfs2_fat_write");
     crate::fs::vfs::vfs2_native_write_witness();
-    u7stk!("after:vfs2_native_write");
+    u7stk!("after:vfs2_native_write"); #[cfg(feature = "witness")] crate::fs::vfs::rmdir_unafs_witness(); // RMDIR-UNAFS (LEDGER SO18) — native directory REMOVAL, the capability VFSROUTE could only refuse. Here, immediately after the native write witness, for that witness's own stated reason: this is the pass that already holds a live writable UnaFS volume reached from a task with a real stack, and this fixture's own `force_remount` drops the shared mount, so it must run AFTER every K8/F2/K6 witness whose block accounting is read off that mount and BEFORE nothing that needs it. Self-cleaning (`k3_mount_selftest` bit5 reds on a leaked fixture). ⚠ LINE-NEUTRAL append: the statement is first and the comment last, so nothing here is commented out, and no new source line moves a `panic::Location` below it in this 20k-line file (LEDGER P7). Body: a FILE-TAIL append in `fs/vfs.rs`. Knob-off the `#[cfg]` erases the statement before MIR.
     // VFS-1 (adoption): the routing battery for the seam every path verb now shares — /boot reaches
     // the FAT backend, a bare path reaches native UnaFS, the boundary negatives (/fatty.bin,
     // /usbfoo) stay native, and a read-only backend refuses every mutating verb through the table.
