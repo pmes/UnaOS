@@ -20,7 +20,7 @@ RAST-1 merged the platform-neutral `rast` rasterizer with an x86/virt-only demo.
   `UNAOS_RAST=1 ./arroyo test-arm` witnesses the identical arch-neutral render under
   QEMU. Edit is **line-count-neutral** (comment trimmed to the original 8-line block)
   so it introduces no panic-line shift.
-- **aarch64/tegra wire-in (the Orin panel).** `tegra_rast_demo_maybe()` runs at the
+- **aarch64/tegra wire-in (the Orin panel).** `rast_demo_maybe()` runs at the
   EL1 tail of `tegra_early_stop` — post-drop, right before `run_capstone_boot_core` —
   and draws the spinning cube through the **JD1-inherited scanout** (no mode-set, no
   scanout reprogramming). It builds a `Screen` over `video::WRITER` (seeded by JD1,

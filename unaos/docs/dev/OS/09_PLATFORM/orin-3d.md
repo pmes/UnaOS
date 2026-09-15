@@ -28,7 +28,7 @@ documented in
 [`docs/dev/OS/08_VIDEO/rasterizer.md`](../../../../../docs/dev/OS/08_VIDEO/rasterizer.md);
 this section records only the Orin-side facts.
 
-- **Wire-in.** `unaos/crates/kernel/src/main.rs::tegra_rast_demo_maybe()` (file
+- **Wire-in.** `unaos/crates/kernel/src/main.rs::rast_demo_maybe()` (file
   tail, gated `all(feature = "tegra", feature = "rast", target_arch = "aarch64")`),
   called from the tail of `tegra_early_stop` post-drop at EL1, on the *same source
   line* as the `run_capstone_boot_core` terminus (`main.rs:2459`). The same-line

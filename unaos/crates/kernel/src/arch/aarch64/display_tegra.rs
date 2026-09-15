@@ -2692,7 +2692,7 @@ pub fn orin_conwin() -> bool {
         // can have run, so the strongest thing it can say is "the route is installed at this instant",
         // never "no later detach freezes it". That second half is a BEHAVIOURAL guarantee owned by the
         // guards on the two detach sites — `main.rs`'s phase-2 line and, as of this arc, the
-        // `tegra_rast_demo_maybe` line that used to detach unguarded AFTER this rung had installed the
+        // `rast_demo_maybe` line that used to detach unguarded AFTER this rung had installed the
         // route and printed `live=LIVE` — and not by this field. A read-back that could close the gap
         // needs `GUI_ACTIVE` exposed from `video/fbcon.rs`; that file is outside this arc's lane.
         if fbcon::console_is_routed() { "LIVE" } else { "FROZEN" },
@@ -4645,7 +4645,7 @@ pub fn sup_present_census(tick: u64) {
 // ORIN-RASTGLASS — the RAST cube's glass read-back. `rast`-gated (no new knob), DEFAULT OFF with it.
 // =================================================================================================
 //
-// THE DEFECT THIS ADDRESSES. `main.rs::tegra_rast_demo_maybe` is the only paint path on this arch
+// THE DEFECT THIS ADDRESSES. `main.rs::rast_demo_maybe` is the only paint path on this arch
 // with NO read-back. It prints `:: RAST: tegra — first 3D pixels on the Orin panel ::`, blits ~180
 // frames through `Screen`, and returns — and every one of those statements is about what the code
 // DID, not about what is on the panel. So when the cube did not appear on boot7j
@@ -4732,7 +4732,7 @@ const RG_RUNS: usize = 4;
 #[cfg(feature = "rast")]
 const RG_RUN: usize = 32;
 /// ORIN-RASTGLASS — the latched `post` verdict, as an index into `RG_VERDICTS`. `u8::MAX` == the
-/// probe has not run, which is itself a reportable state (`RAST-UNRUN`): `tegra_rast_demo_maybe`
+/// probe has not run, which is itself a reportable state (`RAST-UNRUN`): `rast_demo_maybe`
 /// returns before the paint site on a headless boot, so an absent `post` means RAST declined and
 /// named its own reason on its own line.
 #[cfg(feature = "rast")]
@@ -4873,7 +4873,7 @@ pub fn orin_rast_glass(phase: &str) -> u8 {
     // WRITER copied out and released in one statement (ORIN-WM1's rule); nothing below takes a lock.
     let fb = *crate::video::WRITER.lock();
     if !fb.is_ready() {
-        serial_println!("[orinrast] phase={} -> NO-RAST-INK reason=no-panel (JD1 seeded no scanout; there is no glass to read, and tegra_rast_demo_maybe named the same condition on its own line). No panel is not painted — this must never adjudicate as painted", phase);
+        serial_println!("[orinrast] phase={} -> NO-RAST-INK reason=no-panel (JD1 seeded no scanout; there is no glass to read, and rast_demo_maybe named the same condition on its own line). No panel is not painted — this must never adjudicate as painted", phase);
         return 3;
     }
     let i = fb.info();
@@ -4917,7 +4917,7 @@ pub fn orin_rast_glass(phase: &str) -> u8 {
     v
 }
 
-/// ORIN-RASTGLASS — the `post` sample: fired from `tegra_rast_demo_maybe`'s terminus line the instant
+/// ORIN-RASTGLASS — the `post` sample: fired from `rast_demo_maybe`'s terminus line the instant
 /// `rast_demo::run` returns, and LATCHED. Nothing is dispatched on this core between the last blit
 /// and this read, so it is the one measurement that can establish whether RAST's paint ever reached
 /// the scan-out — every later sample can only report the state it finds.
@@ -4933,7 +4933,7 @@ pub fn orin_rast_glass_post() {
 /// `post` into the lifecycle verdict — the answer to "why did the cube not appear".
 ///
 /// Lifecycle ladder (first match wins), each reachable and none constant:
-///   * `RAST-UNRUN`                — no `post` sample was ever latched, so `tegra_rast_demo_maybe`
+///   * `RAST-UNRUN`                — no `post` sample was ever latched, so `rast_demo_maybe`
 ///     returned before its paint site: a headless boot, or `rast` armed on an image with no scanout.
 ///     **UNRUN, never PASS** — `orin_tenant_census`'s `IDLE-NO-TENANTS` discipline.
 ///   * `RAST-NEVER-PAINTED`        — `post` says RAST's backdrop was not on the glass immediately

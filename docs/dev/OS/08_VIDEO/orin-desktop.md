@@ -336,7 +336,7 @@ remove.
 point "has to be chosen inside `tegra_early_stop`, after the heap and the
 scheduler are up". The statement is appended to the line that ends
 `tegra_early_stop` — `el1_oneshot_proof(); tegra_el0_start_maybe();
-tegra_desk_arm(); tegra_rast_demo_maybe(); run_capstone_boot_core(0);` — the
+tegra_desk_arm(); rast_demo_maybe(); run_capstone_boot_core(0);` — the
 last instruction on this path, because everything the cascade needs holds there
 and nowhere earlier: panel seeded (JD1), heap carved (step 3c), IRQs live (JM4),
 SMP secondaries kicked off (JM5 — `wm::reserve_stage` sizes one stage entry per
@@ -1328,7 +1328,7 @@ detach taken, unchanged.
 
 ⚠ **AMENDED 2026-08-28 — this subsection was true of the site it quotes and FALSE of the image.**
 The codegen above is `jd2_console_pump`'s detach, and it was correct. It was not the only detach on
-the terminus line. `tegra_rast_demo_maybe` carried a **second, unguarded** `fbcon::detach()`
+the terminus line. `rast_demo_maybe` carried a **second, unguarded** `fbcon::detach()`
 (`main.rs:6964`) that runs AFTER `orin_conwin()` on the same line (`main.rs:2717`), so on every
 image carrying **both** `orinconwin` and `rast` the route was installed and then silenced two
 statements later. ⚠ Scope it exactly: without `rast` the whole helper is the `#[inline(always)]`
@@ -2486,8 +2486,8 @@ this changes the finding above: a spec scores a *capture*, and no capture exists
 #### D1 — the console window was detached the instant it was installed, and `live=` could not see it
 
 **The behaviour.** The terminus line (`main.rs:2717`) runs `orin_conwin()` **before**
-`tegra_rast_demo_maybe()`. The phase-2 detach in `jd2_console_pump` has been guarded since rung 4
-(`main.rs:2873`, `if !tegra_conwin_live() { … }`), but the twin inside `tegra_rast_demo_maybe`
+`rast_demo_maybe()`. The phase-2 detach in `jd2_console_pump` has been guarded since rung 4
+(`main.rs:2873`, `if !tegra_conwin_live() { … }`), but the twin inside `rast_demo_maybe`
 (`main.rs:6964`) was **bare**. So on every image carrying both knobs, rung 4 installed the
 console-window route, printed `live=LIVE`, and then reached the unguarded `fbcon::detach()` two
 statements later: `GUI_ACTIVE` set, `fbcon::_print` returning at its first test, and the "LIVE"
