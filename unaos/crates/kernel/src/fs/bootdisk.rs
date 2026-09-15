@@ -576,7 +576,7 @@ fn disk_census() -> String {
             out.push_str(BlockSource::UsbN(ix as u8).name());
             out.push_str("=present");
         }
-    }
+    } push_ahci_census(&mut out); // AHCIBOOT: the SATA disks, APPENDED after the USB rung and never interleaved — the four original fields keep their exact spelling and order, so every capture and doc that greps `global=` / `usb=` / `sdhc=` / `tegra-sd=` reads the line it always did, and a machine with no SATA disk renders the string unchanged. AHCI's own report named the gap this closes: the capture read `handles=global=present sdhc=present` with no `ahci=` term at all.
     out
 }
 
@@ -2105,5 +2105,213 @@ fn sdwrite_fixture(mt: &crate::fs::vfs::MountTable, src: BlockSource) {
         ":: SDWRITE: root={} wrote={} readback=match deleted=1 -> PASS ::",
         src.name(),
         wrote
+    );
+}
+
+// =========================================================================================
+// AHCIBOOT (rmbp-ledger B89, second rung) — the SATA disks enter the walk, and the wire fixture
+// that proves the whole chain end to end.
+//
+// APPENDED AT THE FILE TAIL, and the one change above is a LINE-NEUTRAL fold, for the reason the
+// RMDIR-UNAFS block already states: `panic::Location` embeds source line numbers, so a line
+// inserted mid-file moves every panic site below it in the knob-OFF image.
+//
+// ### The walk needed ONE change, and it is not in this file
+//
+// `walk_and_witness` iterates `fat::live_sources()`. That function is where USBREG expanded the USB
+// rung over the block registry, and it is where this arc expands the SATA rung over the AHCI
+// registry — appended at the END of the list. So the walk gains the SATA disks without a second
+// walker, which is the invariant `ALL_SOURCES`' own doc comment states: a board that grows a disk
+// gains it in both places or in neither. Every consequence follows from that one line:
+//
+//   * `admit` deduplicates a SATA disk against the USB stick by the SAME `fat::same_device`
+//     proof every other pair goes through — and the AHCI registry's key is the HBA PORT, from the
+//     enumerator, so two identically sized SATA disks are two disks and the walk says so;
+//   * each SATA volume is probed BY CONTENT — `mount_source` tries superfloppy, then GPT, then the
+//     MBR slots, reading sector 0 and each partition's BPB off the medium (LAWS §3: root is the
+//     volume the kernel was found on, BY CONTENT);
+//   * `plan` hands every non-root SATA volume a `/volumes/<LABEL>` point with its OWN write posture,
+//     which for a SATA volume is always READ-ONLY; and
+//   * root binding is unchanged where a machine still boots off USB, because the SATA rung is
+//     APPENDED and `plan` picks the FIRST disk carrying this kernel. A SATA disk becomes `/` only
+//     when nothing earlier carries the kernel — which is exactly the "UnaOS installed on and
+//     booting from the internal disk" case B89 is aiming at.
+//
+// ### Why the fixture does not call `survey()`
+//
+// `survey` CACHES its first answer for the boot, and this fixture runs at PCI enumeration time —
+// long before USB storage finishes its deferred SCSI bring-up. Driving the cached walk from here
+// would latch a survey taken with no USB disk registered and hand every later caller a root of
+// NONE: the hazard `fs/users.rs` already records in as many words. So the fixture walks the SATA
+// rung directly, through the very functions the walk uses, and leaves the cache untouched.
+
+/// AHCIBOOT: append ` ahci<p>=present` for every live SATA disk, in registry-index order.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+fn push_ahci_census(out: &mut String) {
+    for ix in 0..crate::drivers::block::MAX_AHCI_DISKS {
+        if let Some(port) = crate::drivers::block::ahci_port_at(ix) {
+            out.push(' ');
+            out.push_str(BlockSource::Ahci(port).name());
+            out.push_str("=present");
+        }
+    }
+}
+
+/// No SATA handle in this image, so the census string is byte-identical to its pre-AHCIBOOT self.
+#[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
+#[inline(always)]
+fn push_ahci_census(_out: &mut String) {}
+
+/// AHCIBOOT: the marker file the QEMU fixture stages on the SATA disk's FAT volume.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+const AHCIBOOT_FILE: &str = "AHCIBOOT.TXT";
+
+/// AHCIBOOT: how many bytes of it, and what they are.
+///
+/// 4096 bytes — EIGHT whole sectors — on purpose, and the size is the instrument. A whole-sector run
+/// goes through `fat::read_sectors`, i.e. the COUNTED `read_blocks_ahci_port` path, so the fixture
+/// exercises the multi-sector arm rather than only the single-sector one a short file would touch.
+/// The content is generated, not stored: byte `i` is `b'A' + (i % 26)`, which the host stages with
+/// the same rule. A read that returns zeros — the go-red mutation — fails the comparison on byte 0.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+const AHCIBOOT_BYTES: usize = 4096;
+
+/// AHCIBOOT: the expected byte at offset `i` of [`AHCIBOOT_FILE`].
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+#[inline]
+fn ahciboot_expect(i: usize) -> u8 {
+    b'A' + (i % 26) as u8
+}
+
+/// AHCIBOOT: FNV-1a 64 over the bytes that came back — a READABLE FINGERPRINT for the wire, not the
+/// verdict. The verdict is the byte-by-byte comparison against [`ahciboot_expect`], which is why a
+/// non-cryptographic digest is enough here and why nothing downstream keys on this number.
+///
+/// **It is not `sha=` and the reason is a real finding, not a preference.** `crate::hash` — which
+/// carries this tree's one SHA-256 — is `#[cfg]`-gated on a feature list (`lib.rs:103-109`:
+/// `installdemo`, `install_target`, `piinstall`, `selfhost`, `holocron`, `selfup`, `facet`, `login`,
+/// `ga10bprobe5`) that `ahci` is not on. `./arroyo check`'s `x86-all` leg carries several of those,
+/// so the first cut of this fixture COMPILED GREEN under `check` and then failed to build the
+/// `test` artifact with `E0433: cannot find hash in crate` — LAWS §5's "an instrument's presence is
+/// proven in the artifact, never in the check", paid for in one build. Adding `feature = "ahci"` to
+/// that list is a one-term same-line append (the convention that line already documents) and is the
+/// right fix, but it is a MODULE DECLARATION LINE in `lib.rs`, which this brief forbids touching
+/// (FC2CHECK). Reported instead of taken; until then the wire says `fnv=` and means it.
+///
+/// The constants are FNV-1a 64's own (offset basis 0xcbf29ce484222325, prime 0x100000001b3), the
+/// same pair `video::paper::fnv1a` uses — it is `pub(super)` and therefore unreachable from here,
+/// so this is a second CALL SITE of one published algorithm rather than a second policy.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+fn ahciboot_fnv1a(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in data {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// AHCIBOOT: the wire fixture — every SATA volume this machine has, listed BY CONTENT, and the
+/// marker file read back through the VFS over the AHCI source.
+///
+/// Driven from `drivers::ahci::probe`'s tail: the last statement of the one enumeration pass, with
+/// every HBA and port lock released and the kernel heap long since up (`main.rs` allocates it before
+/// `pci::init`). It is the only site on the x86 boot path that runs AFTER the AHCI registry is
+/// populated and does not require an operator — `fs::bootdisk::bind` is reached from
+/// `shell::vfs_mount_table`, whose SATA-bearing arm is `target_arch = "aarch64"`, so on x86 the walk
+/// itself is never driven on a headless boot (measured: `[vfs]` 0 lines on the AHCI arc's capture).
+/// That is a REPORTED gap, not one this arc closes — see the module doc and this arc's report.
+///
+/// **It is a READER and nothing else.** It mounts, lists, reads and drops. No sector is written, and
+/// none could be: `write_block_ahci` refuses in every cfg and the image compiles no ATA write opcode.
+///
+/// It can say NO in distinguishable ways, which is why all of them print:
+/// * no `[bootdisk]` line at all → the AHCI registry is empty, i.e. no SATA disk answered IDENTIFY.
+///   The producing path still ran and said so on the closing line, so the silence is never read as
+///   a pass (LAWS §5);
+/// * `[bootdisk] … vol=- ` → the disk is readable and carries no FAT volume this reader accepts;
+/// * `-> FAIL` → a SATA volume carried the marker file and the bytes that came back are not the
+///   bytes the host staged. `-> FAIL` is in `mbench.py`'s `DEFAULT_FORBIDS`, so that reds the run.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn ahciboot_selftest() {
+    use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
+    static RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if RAN.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+
+    let mut sata = 0u32;
+    let mut volumes = 0u32;
+    let mut staged = 0u32;
+
+    // The SATA rung of the walk's own source list — `fat::live_sources()`, filtered to the sources
+    // this arc appended. Reading it here rather than re-deriving it from the registry is the point:
+    // if the expansion were missing, this loop would find nothing and the closing line would say so.
+    for src in crate::fs::fat::live_sources() {
+        let port = match src {
+            BlockSource::Ahci(p) => p,
+            _ => continue,
+        };
+        sata += 1;
+        let blocks = fat::source_blocks(src).unwrap_or(0);
+        // BY CONTENT: `volume_serials` walks the superfloppy BPB, every GPT entry and every MBR slot
+        // and parses each candidate's BPB off the medium. It is the same candidate set `mount_source`
+        // trusts, so a volume named here is a volume the mount path can bind.
+        let serials = fat::volume_serials(src);
+        let (label, vol_id) = match fat::mount_source(src) {
+            Ok(fs) => (sanitize_label(&fs.label_raw()).0, fs.volume_fingerprint().0),
+            Err(_) => (String::from("-"), 0),
+        };
+        if vol_id != 0 || label != "-" {
+            volumes += 1;
+        }
+        serial_println!(
+            "[bootdisk] volume source=ahci port={} vol={} serial=0x{:08x} blocks={} volumes_by_content={} ::",
+            port, label, vol_id, blocks, serials.len()
+        );
+
+        // The marker file, read through the VFS — a `FatBackend` over this source at `/`, exactly
+        // the backend `bind` mounts a home-soil volume with. That is what makes this a proof about
+        // the CHAIN (VFS -> FAT -> BlockSource::Ahci -> block registry -> AHCI driver -> the wire)
+        // rather than about any one layer.
+        let mut mt = MountTable::new();
+        mt.mount(
+            "/",
+            alloc::boxed::Box::new(FatBackend::new_source("ahciboot", KERNEL_PRINCIPAL, true, src)),
+        );
+        let path = alloc::format!("/{}", AHCIBOOT_FILE);
+        if mt.stat(&path).is_err() {
+            continue;
+        }
+        staged += 1;
+        let got = match mt.read(&path, 0, AHCIBOOT_BYTES) {
+            Ok(v) => v,
+            Err(_) => {
+                serial_println!(
+                    ":: AHCIBOOT: source=ahci port={} vol={} found={} bytes=0 fnv=---------------- -> FAIL ::",
+                    port, label, AHCIBOOT_FILE
+                );
+                continue;
+            }
+        };
+        let fnv = ahciboot_fnv1a(&got);
+        let ok = got.len() == AHCIBOOT_BYTES
+            && got.iter().enumerate().all(|(i, b)| *b == ahciboot_expect(i));
+        serial_println!(
+            ":: AHCIBOOT: source=ahci port={} vol={} found={} bytes={} fnv={:016x} -> {} ::",
+            port,
+            label,
+            AHCIBOOT_FILE,
+            got.len(),
+            fnv,
+            if ok { "PASS" } else { "FAIL" }
+        );
+    }
+
+    // The closing census. It prints unconditionally, so "no SATA disk" and "the fixture never ran"
+    // are different lines on the wire rather than the same silence.
+    serial_println!(
+        "[bootdisk] ahci census: sata_sources={} with_fat_volume={} carrying_{}={} ::",
+        sata, volumes, AHCIBOOT_FILE, staged
     );
 }
