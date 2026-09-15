@@ -597,6 +597,14 @@ _feats=""
 # builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature disabled while the
 # banner claims it is on (s42/INSTGUI, WXN-M3b).
 [ -n "${UNAOS_PRTSCRST:-}" ] && _feats="${_feats}prtscrst,"
+# XHCIKBD (rmbp 2026-09-15, rmbp-ledger B45): UNAOS_XHCIKBD=1 arms the x86 headless test's xHCI KEYBOARD
+# leg — the builder moves the ONE QEMU usb-kbd onto xhci.0 (EHCI driver still on), `test_x86_64` runs
+# the burst typist (scripts/qmp_type.py --bursts) over the same QMP socket the screendump shooter
+# uses, and the kernel's `xhcikbd_note` (drivers/xhci/mod.rs tail) prints
+# `:: XHCIKBD: reports= restated= lost= … -> PASS|FAIL ::` on the F12 sentinel. Implies `witness`
+# (Cargo.toml). A GATE knob, never a flight knob: it goes on `test`, not on media. Default OFF =>
+# scorer + statics + call site vanish. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_XHCIKBD:-}" ] && _feats="${_feats}xhcikbd,"
 # INSTALL-CORE: UNAOS_INSTALLDEMO=1 arms the installer engine + its x86 boot witness (GPT writer +
 # FAT32 formatter + extent content-verify). The builder attaches a dedicated BLANK scratch disk over
 # the usb-storage slot under this knob (see builder/src/main.rs), against which the engine writes a
@@ -3215,15 +3223,57 @@ test_x86_64() {
     # start). The shooter runs in the background: it retries the QMP connect while the builder
     # compiles, waits UNAOS_QMP_WAIT (default secs-3) after QEMU appears, then dumps — inside the
     # builder's kill window. `|| true` guards keep this additive under `set -e`.
-    local qmp_pid=""
-    if [ -n "${UNAOS_QMP_SHOT:-}" ]; then
-        local qmp_port="${UNAOS_QMP_PORT:-4464}"
+    local qmp_pid="" qmp_port="" typist_pid=""
+    # XHCIKBD (B45): the burst typist rides the SAME QMP socket as the shooter — one port, one
+    # `-qmp` in UNAOS_QEMU_EXTRA, armed when either consumer wants it. Never a second QMP path.
+    if [ -n "${UNAOS_QMP_SHOT:-}" ] || [ -n "${UNAOS_XHCIKBD:-}" ]; then
+        qmp_port="${UNAOS_QMP_PORT:-4464}"
         while lsof -iTCP:"$qmp_port" -sTCP:LISTEN >/dev/null 2>&1; do qmp_port=$((qmp_port + 1)); done
         export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -qmp tcp:127.0.0.1:${qmp_port},server,nowait"
+    fi
+    if [ -n "${UNAOS_QMP_SHOT:-}" ]; then
         python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port "$qmp_port" --connect-timeout 600 \
             --wait "${UNAOS_QMP_WAIT:-$((secs - 3))}" --out "${UNAOS_QMP_SHOT}" 2>/dev/null &
         qmp_pid=$!
         echo -e "${COLOR_YELLOW}⚡ QMP screendump armed: port ${qmp_port} -> ${UNAOS_QMP_SHOT}${COLOR_RESET}"
+    fi
+    # XHCIKBD (rmbp 2026-09-15, B45/B44): the xHCI KEYBOARD leg's typist. With UNAOS_XHCIKBD=1 the
+    # builder has put the one usb-kbd on xhci.0 and compiled the `xhcikbd` scorer; this typist waits
+    # for the guest to print EVERY marker below into $SERIAL_LOG — the xHCI keyboard configured with
+    # SET_IDLE 0 (`[hidkeys] set-idle ok`: the restated convictor is meaningless before that), under
+    # UNAOS_WC the desktop's theme line (the desktop is up; its service pass is the pump), and the
+    # boot battery's LAST one-shot fixture (`:: zeolite: resolver bound :53`, the final `::` line
+    # before the periodic rollups on both the plain and the WC wire) — then settles 5 s, then types
+    # XHCIKBD_BURSTS bursts 2 s apart. ONE BURST = the stall key F11 (the kernel spins 600 ms in the
+    # completion branch on its press edge — the deliberately slow pass), then 20 ms apart its
+    # release and XHCIKBD_PAIRS alternating a/b press+release pairs, one `input-send-event` per
+    # event; after 1 s of quiet the F12 sentinel, on whose press edge the kernel prints
+    # `:: XHCIKBD: … -> PASS|FAIL ::`.
+    #   ⚠ XHCIKBD_BURSTS / XHCIKBD_PAIRS MUST EQUAL `XHCIKBD_BURSTS` / `XHCIKBD_BURST_PAIRS` in
+    #   drivers/xhci/mod.rs (the counters line) — the kernel computes `expected=` from its constants,
+    #   and a mismatch makes `lost=` a lie in either direction. 19 events per burst (release + 9
+    #   pairs) is the size that separates zero TRBs armed during the stall (QEMU's usb-kbd queues 16:
+    #   3 lost) from KBD_INFLIGHT=4 (each absorbs one: none lost) — the scorer's doc in mod.rs says
+    #   why the events are 20 ms apart (QEMU delivers one report per 8 ms polling interval).
+    #   WHY AFTER THE BATTERY, MEASURED (xhcikbd-logs/02): with the stream 3 s after the theme line
+    #   — inside APPPIN/WINX-3/WINX-7's window launches — the wire showed `armgap_us=1063003`: the
+    #   x86 pump went 1.06 s between two drains, so two bursts fell into ONE unarmed window. That is
+    #   a real fact about the boot battery's pump cadence (its own row), not the question this leg
+    #   asks — the leg scores the DRIVER's window, so the bursts land where the pump is at its
+    #   steady ~1 ms cadence and the stall is the fixture's own.
+    # The typist's own transcript lands BESIDE the capture (target/xhcikbd-typist.log), never in it.
+    local XHCIKBD_BURSTS=4 XHCIKBD_PAIRS=9
+    if [ -n "${UNAOS_XHCIKBD:-}" ]; then
+        local -a _xk_markers=(--marker '[hidkeys] set-idle ok')
+        if [ -n "${UNAOS_WC:-}" ]; then _xk_markers+=(--marker '[crispy] theme='); fi
+        _xk_markers+=(--marker ':: zeolite: resolver bound :53')
+        python3 "${WORKSPACE_DIR}/scripts/qmp_type.py" --port "$qmp_port" --connect-timeout 600 \
+            "${_xk_markers[@]}" --marker-log "$SERIAL_LOG" --marker-timeout "$(( secs > 20 ? secs - 15 : secs ))" \
+            --wait 5 --bursts "$XHCIKBD_BURSTS" --burst "$XHCIKBD_PAIRS" --burst-keys a,b --burst-gap 2.0 \
+            --stall-key f11 --event-gap 0.02 --sentinel f12 --sentinel-delay 1.0 --postwait 0 \
+            2> "${WORKSPACE_DIR}/target/xhcikbd-typist.log" &
+        typist_pid=$!
+        echo -e "${COLOR_YELLOW}⚡ XHCIKBD typist armed: port ${qmp_port}, ${XHCIKBD_BURSTS} bursts x (F11 stall + ${XHCIKBD_PAIRS} pairs, 20 ms apart) + F12 sentinel, transcript -> target/xhcikbd-typist.log${COLOR_RESET}"
     fi
 
     echo -e "${COLOR_CYAN}⚡ Headless x86_64 test (${secs}s). Serial -> ${SERIAL_LOG}${COLOR_RESET}"
@@ -3234,6 +3284,7 @@ test_x86_64() {
     UNAOS_SERIAL_LOG="$SERIAL_LOG" UNAOS_TEST_SECS="$secs" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
     if [ -n "$qmp_pid" ]; then wait "$qmp_pid" 2>/dev/null || true; fi
+    if [ -n "$typist_pid" ]; then wait "$typist_pid" 2>/dev/null || true; fi
     # QEMU-FAST: `test` STILL PAYS ITS FULL WALL — the wall lives in builder/src/main.rs's
     # `thread::sleep` (the builder owns this QEMU, not this script), so shortening it is a builder
     # change and stays owed in LEDGER SR7. What this verb no longer lacks is a COMPLETION VERDICT:
@@ -3264,6 +3315,22 @@ test_x86_64() {
         echo -e "${COLOR_RED}✖ test: no serial bytes captured at ${SERIAL_LOG} — QEMU produced nothing."
         echo -e "  This run carries NO verdict: not a pass, not a regression. Exit 4.${COLOR_RESET}"
         return 4
+    fi
+    # XHCIKBD (B45): an ARMED fixture whose wire carries no verdict line is not a pass — the typist
+    # never reached the guest (marker timeout, QMP refused, port race) or the guest never scored
+    # (sentinel lost, decoder never ran). Checked BEFORE the fault scan so a run that both lacks the
+    # line and carries fault text reports the more actionable of the two first. The typist's own
+    # transcript is printed here from its sidecar so the reason is in the same log as the verdict.
+    if [ -n "${UNAOS_XHCIKBD:-}" ]; then
+        echo -e "${COLOR_PURPLE}──────── XHCIKBD typist transcript (target/xhcikbd-typist.log) ────────${COLOR_RESET}"
+        cat "${WORKSPACE_DIR}/target/xhcikbd-typist.log" 2>/dev/null || echo "(no typist transcript)"
+        local _xk_n
+        _xk_n=$(awk 'index($0, ":: XHCIKBD:") { n++ } END { print n + 0 }' "$SERIAL_LOG")
+        if [ "$_xk_n" -eq 0 ]; then
+            echo -e "${COLOR_RED}❌ x86_64 test FAILED — UNAOS_XHCIKBD armed but the wire carries no ':: XHCIKBD:' verdict line: the burst never reached the guest or the sentinel never scored. Not a pass. Log at ${SERIAL_LOG}${COLOR_RESET}"
+            return 1
+        fi
+        awk 'index($0, ":: XHCIKBD:") { printf("  XHCIKBD %s:%d: %s\n", "serial.log", FNR, $0) }' "$SERIAL_LOG"
     fi
     if ! scan_serial_faults "$SERIAL_LOG" "serial.log"; then
         echo -e "${COLOR_RED}❌ x86_64 test FAILED — the serial log carries fault text (lines above). Log at ${SERIAL_LOG}${COLOR_RESET}"
@@ -3640,7 +3707,7 @@ KERNEL_CFG_MATRIX=(
   # it. Read the live board/mix counts on `./arroyo check`'s own summary line, never from this prose.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -7095,6 +7162,16 @@ kernel8() {
     if [ -n "${UNAOS_PRTSCRST:-}" ]; then
         K8_FEATS="${K8_FEATS},prtscrst"
         echo -e "${COLOR_YELLOW}  • UNAOS_PRTSCRST: kernel8 carries the Print Screen self-test (PRTSCR-ST)${COLOR_RESET}"
+    fi
+    # XHCIKBD (B45) — UNAOS_XHCIKBD=1 adds the `xhcikbd` feature: the burst scorer at the tail of
+    # drivers/xhci/mod.rs, which prints `:: XHCIKBD: … -> PASS|FAIL ::` on an F12 press after keyboard
+    # traffic. The shared xHCI keyboard decoder it scores IS the Pi's decoder, so the knob is reachable
+    # here (k8-reach) — the arroyo typist that drives it is x86's `test`, but an operator at the Pi's
+    # keyboard (or k8_type through UNAOS_K8_SCRIPT) can type the burst and F12 by hand. OFF => the
+    # scorer, its statics and its call site are not compiled and the image is byte-identical.
+    if [ -n "${UNAOS_XHCIKBD:-}" ]; then
+        K8_FEATS="${K8_FEATS},xhcikbd"
+        echo -e "${COLOR_YELLOW}  • UNAOS_XHCIKBD: kernel8 carries the xHCI keyboard burst scorer (XHCIKBD)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_K2_LEAVE:-}" ]; then
         K8_FEATS="${K8_FEATS},k2_leave"

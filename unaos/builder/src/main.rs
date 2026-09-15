@@ -396,6 +396,11 @@ fn main() {
     // note in arroyo. Mapped here as well as there, because a knob mapped in only one of the two
     // ships the feature disabled while the banner claims it is on (s42/INSTGUI, WXN-M3b).
     if std::env::var("UNAOS_PRTSCRST").is_ok() { feats.push("prtscrst"); }
+    // XHCIKBD (B45): UNAOS_XHCIKBD=1 arms the x86 headless test's xHCI KEYBOARD leg — the burst scorer
+    // in drivers/xhci/mod.rs (`xhcikbd_note`) — and, below, moves the one QEMU usb-kbd onto the xHCI
+    // bus so the scorer has a device to score. A GATE knob, never a flight knob. Kept in sync with
+    // arroyo's mapping (the KNOB→BUILDER WIRING CHECK reads this line).
+    if std::env::var("UNAOS_XHCIKBD").is_ok() { feats.push("xhcikbd"); }
     // K-GPU: UNAOS_KEPLER=1 arms the GK107 (GT 650M) driver — probe/EVO-decode/PFIFO are further
     // gated by UNAOS_KEPLER_TAKEOVER / UNAOS_KEPLER_FIFO (option_env!, compile-time). Kept in sync
     // with arroyo's mapping. (The builder rebuilds the kernel, so this MUST be here or the feature
@@ -1003,10 +1008,19 @@ fn main() {
     // (two keyboards would leave the routing to QEMU's whim). QEMU cannot model the RMH hub
     // tier: its only hub is full-speed and wedges the machine at firmware if placed on the EHCI
     // bus — Topology A (hub walk + splits) is metal-first by construction.
-    if ehcihid {
+    // XHCIKBD (B45): UNAOS_XHCIKBD=1 puts the ONE usb-kbd on the xHCI bus instead, with the EHCI driver
+    // still compiled and running (its bus simply carries no keyboard) — a NEW LEG for the shared xHCI
+    // keyboard decoder, not a swap of the default, and not NOEHCIHID. One keyboard, never two: with two
+    // QEMU routes `input-send-event`/`send-key` to whichever handler it likes, and the fixture's count
+    // would then be a fact about QEMU's routing. Kept in sync with arroyo.
+    let xhcikbd = std::env::var("UNAOS_XHCIKBD").is_ok();
+    if ehcihid && !xhcikbd {
         cmd.arg("-device").arg("usb-kbd,bus=ehci.0");
     } else {
         cmd.arg("-device").arg("usb-kbd,bus=xhci.0");
+        if xhcikbd {
+            println!("   UNAOS_XHCIKBD: usb-kbd on the xHCI bus (EHCI driver still on, no keyboard on it) — XHCIKBD burst-fixture target");
+        }
     }
     // EHCI-4 M2 gate (UNAOS_EHCITABLET=1): move the usb-tablet onto the EHCI bus so the driver's
     // report-protocol POINTER path is exercised end-to-end — QEMU's usb-tablet is a non-boot
