@@ -191,8 +191,8 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   job is cut down to its metal-specific part and the rest is routed to the trunk queue ("isolate down to the
   specific metal requirement as far as possible so as to maximize shared code"). A queue is kept current as work
   happens, never at close, and lives in git, never in a plans directory (rmbp 19, 2026-09-11: 16 items existed only
-  outside the repo). All four branches stay level so any track can merge to main at any time. Enforcer: warning
-  only until `ledger-check.sh` learns the queue files.
+  outside the repo). All four branches stay level so any track can merge to main at any time. Enforcer: GATE-LEDGER
+  (`unaos/scripts/ledger-check.sh`), which reads all four queue files for conflict markers and for ledger ids that resolve.
 - **Nothing durable lives in a round's scratch** (R32): tools go to `~/unaos-bench/tools/`, records
   to `docs/dev/evidence/<round>/`. A tool's name carries no round number; a record's does (R33).
   **Never write to `/tmp`** (Peter, standing since 2026-08-19: 3-day clear and RAM-backed; it
