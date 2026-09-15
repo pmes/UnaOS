@@ -3174,6 +3174,42 @@ nousblun = []
 # (log-scale rollup). Kept in sync with arroyo.
 ftdirx = []
 
+# AHCI (rmbp-ledger B89, first rung): `UNAOS_AHCI=1` arms `drivers/ahci.rs` — the SATA host
+# controller driver, READ-ONLY. It finds the controller by PCI class (0x01/0x06 progif 0x01, never
+# by bdf), takes it through the BIOS/OS handoff when `CAP2.BOH` says there is one, maps ABAR (BAR5,
+# not BAR0 — on the bench rMBP BAR0 is the legacy IDE I/O window at 0x3080 and a driver that mapped
+# it would be reading sixteen bytes of I/O space as a register block), and for every implemented
+# port reporting a plain SATA disk (`PxSSTS.DET == 3`, `PxSIG == 0x00000101`) brings the port up
+# with the ClearBusy discipline, runs IDENTIFY DEVICE and reads LBA 0.
+#
+# READ-ONLY IS A PROPERTY OF THE IMAGE, not a policy: the file can issue exactly two ATA opcodes,
+# `IDENTIFY DEVICE` (0xEC) and `READ DMA EXT` (0x25). `WRITE DMA EXT` and every other writing opcode
+# are absent, so an armed image contains no path that could mutate a sector. `block::write_block_ahci`
+# is therefore a refusing stub — the pre-`sdw` `write_block_sdhc` shape, and for the same reason.
+# `install/` is never told the handle exists (rmbp-ledger B91: the internal SSD carries a live
+# Catalina install, and a target list that could name it is one operator slip from erasing it).
+#
+# Polled, never interrupt-driven: `GHC.IE` and every `PxIE` stay 0 and completion is polled on
+# `PxCI`/`PxIS` against a TSC deadline (`arch::ms()` is unusable — the APIC tick does not advance
+# with interrupts masked, and this runs inside `pci::init`). Everything happens in one pass at
+# enumeration time, so no service loop gains a call and no input band gains a lock.
+#
+# Default OFF => `drivers/ahci.rs` is not lexed at all (the `#[cfg]`-erased `pub mod` is the one case
+# LAWS §5 names as byte-safe), the AHCI registry arms in `drivers/block.rs` are a FILE-TAIL append
+# that compiles to nothing, and the call site in `arch/x86_64/pci.rs` is a LINE-NEUTRAL append that
+# vanishes — so no `core::panic::Location` line number anywhere moves. x86_64 only (the enumeration
+# seam is `arch::pci` config space; the FILE is arch-neutral in name and shape, since AHCI exists on
+# aarch64 boards too), and stripped from aarch64 builds by arroyo's `arm_features` so aarch64 media
+# stay byte-identical whichever way this knob points.
+#
+# Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs` — the builder rebuilds the x86
+# kernel from its own env list, so a knob wired only in arroyo ships the driver DISABLED while the
+# `⚡ kernel features:` banner claims it is on (the s42/INSTGUI and WXN-M3b lesson), and for THIS
+# driver the failure is quiet in the worst way: no `:: AHCI: ... ::` witness reads exactly like a
+# machine with no SATA controller in it, which is a different finding entirely.
+# See docs/dev/OS/07_USB_STORAGE/ahci.md.
+ahci = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

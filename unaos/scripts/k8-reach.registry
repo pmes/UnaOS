@@ -10,6 +10,7 @@
 # look decisive and neither is. `NA  x86 only` is a second classifier with no proof and
 # worse recall; `NA  --evidence: 11 sites, 0 Pi-live (all under drivers/gpu, x86 mod tree)`
 # is checkable by the next seat.
+UNAOS_AHCI   NA   --evidence: ahci 17 sites, 0 Pi-live, 0 negated — 16 classified X86 and 1 PROSE (the module doc quoting its own gate). Every code site is the SAME conjunction, `all(target_arch = "x86_64", feature = "ahci")`: the `pub mod ahci` declaration in drivers/mod.rs, the AHCI registry block at the tail of drivers/block.rs, and the one enumeration hook appended in arch/x86_64/pci.rs. There is no arch-neutral consumer to mis-sort (the `nvidia-kepler`-in-`video/wm.rs` trap this file's header names) and no x86-gated callee reached from a Pi-live caller (the `rastmc` trap): drivers/ahci.rs is not lexed on aarch64 at all, so a K8_FEATS arm would arm nothing. Not merely absent from the Pi image but UNBUILDABLE there as written — the enumeration seam is `arch::pci` config space, which the aarch64 tree does not provide. The FILE is deliberately arch-neutral in name and shape (AHCI exists on aarch64 boards), so if an aarch64 board ever grows an ABAR route this row is the place that has to change. Added 2026-09-15 with the driver's first rung (rmbp-ledger B89).
 UNAOS_BAR1EXP              TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_BCMARECON            TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_BCMAS1               TODO  seeded 2026-09-06; no Pi-live cfg site

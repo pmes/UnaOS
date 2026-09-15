@@ -2632,3 +2632,198 @@ const NATIVE_SDHC_VETO: &str = "the native root rides the internal SD reader, wh
 #[cfg(all(feature = "sdwrite", target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
 const NATIVE_TEGRA_SD_VETO: &str = "the native root rides the microSD and this build refuses every \
                                     write to it (UNAOS_NOSDWRITE=1 / no `sdwrite` feature)";
+
+// ══════════ AHCI (rmbp-ledger B89, first rung) — the SATA disks as their own registry ════════════
+//
+// `drivers/ahci.rs` brings up every implemented AHCI port that holds a plain SATA disk, IDENTIFYs
+// it and reads sectors from it. This section is where those disks become BLOCK DEVICES.
+//
+// ### It is an ARRAY, keyed on the AHCI PORT, and the key comes from the ENUMERATOR
+//
+// USBREG's rule, applied one controller over: the key is the port index the HBA's `PI` mask handed
+// us, never anything read off the medium. A machine with two SATA disks (which the bench rMBP is —
+// B89 names both) publishes two entries, and two disks imaged off each other cannot merge, because
+// nothing here ever compares content. The registry INDEX is an address and is stable for the boot;
+// this arc has no hot-plug and therefore no retraction, so it also has no holes.
+//
+// ### It is READ-ONLY, and that is a property of the image, not a policy
+//
+// `write_block_ahci` refuses unconditionally with a one-shot witness, and it can afford to be that
+// blunt because `drivers/ahci.rs` compiles no WRITE opcode at all — the whole file can issue
+// exactly `IDENTIFY DEVICE` (0xEC) and `READ DMA EXT` (0x25). The refusal is the honest answer a
+// total dispatch needs, in the same shape and for the same reason as the pre-`sdw` SDHC stub, not a
+// switch someone can flip. Writes are the next arc.
+//
+// ### It deliberately does NOT claim the global slot, and no installer can name it
+//
+// `register_ahci` never touches [`BLOCK_DEVICE`]: the boot volume every existing caller reads
+// through [`info`] is untouched, exactly as SDHC-4b's third handle leaves it untouched. And nothing
+// in `install/` can reach these entries — rmbp-ledger B91 is why: the internal SSD this driver
+// enumerates carries a live Catalina install, and a target list that could name it is one operator
+// slip from erasing it. The write arc brings a partition-mode installer; until then the device is
+// invisible to every write path in the tree.
+//
+// ### ⚠ WHAT IS NOT HERE YET, and what it costs
+//
+// There is no `BlockHandle::Ahci` and no `fs::fat::BlockSource::Ahci`, so `fs::bootdisk`'s walk
+// cannot yet see these disks. That is not an oversight — see the module doc of `drivers/ahci.rs`
+// and this arc's report. Adding the handle variant makes four EXHAUSTIVE matches outside this file
+// non-exhaustive (`install/mod.rs` x2, `wifi/firmware.rs`, `fs/unafs.rs` x4), and `install/mod.rs`
+// is the one file this arc is forbidden to touch. The entry points below are the whole seam those
+// arms would dispatch to when the handle lands.
+
+/// AHCI: one published SATA disk — its geometry plus the HBA PORT it lives on.
+///
+/// The port is registry state rather than a field of [`BlockDeviceInfo`], for USBREG's reason: a
+/// `BlockDeviceInfo` is a GEOMETRY record that five unrelated backends construct, and only this one
+/// has AHCI ports. `info.slot_id` carries the port number too, so an identity built from the
+/// geometry record alone still names the right disk.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+#[derive(Clone, Copy)]
+pub struct AhciDisk {
+    pub info: BlockDeviceInfo,
+    pub port: u8,
+}
+
+/// AHCI: how many SATA disks the registry can hold. Mirrors [`MAX_USB_DISKS`]; the bench rMBP has
+/// two and QEMU q35 exposes six ports of which the fixture uses two.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub const MAX_AHCI_DISKS: usize = crate::drivers::ahci::MAX_AHCI_DISKS;
+
+/// AHCI: the SATA block registry. Index-addressed, stable for the boot.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub static AHCI_DISKS: Mutex<[Option<AhciDisk>; MAX_AHCI_DISKS]> =
+    Mutex::new([None; MAX_AHCI_DISKS]);
+
+/// AHCI: the registry entry at `ix`, if any.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn ahci_disk(ix: usize) -> Option<AhciDisk> {
+    if ix >= MAX_AHCI_DISKS {
+        return None;
+    }
+    AHCI_DISKS.lock()[ix]
+}
+
+/// AHCI: geometry of the SATA disk at `ix`.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn ahci_info_ix(ix: usize) -> Option<BlockDeviceInfo> {
+    ahci_disk(ix).map(|d| d.info)
+}
+
+/// AHCI: geometry of the PRIMARY SATA disk — registry entry 0.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn ahci_info() -> Option<BlockDeviceInfo> {
+    ahci_info_ix(0)
+}
+
+/// AHCI: how many registry entries hold a disk. Counts OCCUPANCY, not the highest index.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn ahci_disk_count() -> usize {
+    AHCI_DISKS.lock().iter().filter(|e| e.is_some()).count()
+}
+
+/// AHCI: publish one SATA disk's geometry at registry index `ix`.
+///
+/// Called once per port from `ahci::bring_up_port`, AFTER IDENTIFY DEVICE has decoded — so a
+/// registered disk is one the log has already said something true about, which is the ordering
+/// `register_sdhc` established and the reason the registry is worth trusting.
+///
+/// Refuses a zero-sector disk rather than publishing a device every bound check would reject one
+/// call later: an instrument that can say NO. The global [`BLOCK_DEVICE`] is never touched.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn register_ahci(ix: usize, port: u8, num_blocks: u64, model: &[u8; 40]) -> bool {
+    if ix >= MAX_AHCI_DISKS {
+        serial_println!(":: AHCI: REFUSED to register port={} — registry index {} is out of range ::", port, ix);
+        return false;
+    }
+    if num_blocks == 0 {
+        serial_println!(":: AHCI: REFUSED to register port={} — num_blocks=0 (nothing to address) ::", port);
+        return false;
+    }
+    let mut product = [b' '; 16];
+    product.copy_from_slice(&model[..16]);
+    let dev = BlockDeviceInfo {
+        // The AHCI port IS the slot key. It is not an xHCI slot id, and it never collides with one
+        // in any consumer: `unpublish_usb_geometry` only ever walks `USB_DISKS` and `BLOCK_DEVICE`,
+        // neither of which this function writes.
+        slot_id: port,
+        block_size: SECTOR_BYTES as u32,
+        num_blocks,
+        vendor: *b"SATA    ",
+        product,
+    };
+    AHCI_DISKS.lock()[ix] = Some(AhciDisk { info: dev, port });
+    let mib = num_blocks.saturating_mul(SECTOR_BYTES as u64) / (1024 * 1024);
+    serial_println!(
+        ":: AHCI: registered port={} as registry index {} — blocks={} ({} MiB) READ-ONLY \
+         (global BLOCK_DEVICE untouched, installer not told) ::",
+        port, ix, num_blocks, mib
+    );
+    true
+}
+
+/// AHCI: read one block (`lba`) from the SATA disk at registry index `ix`, DIRECTLY through the
+/// AHCI driver, bypassing the backend selector — the read twin of [`read_block_usb_ix`]. Geometry
+/// is re-read from the registry on every call, as every other entry point here does, and
+/// `ahci::read_block_at` re-guards the LBA against the port's own sector count one layer down.
+/// Takes no xHCI lock at all, so it cannot interact with the boot volume's transport.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn read_block_ahci_ix(ix: usize, lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let dev = ahci_info_ix(ix).ok_or(BlockError::NotReady)?;
+    if lba >= dev.num_blocks {
+        return Err(BlockError::BadLba);
+    }
+    crate::drivers::ahci::read_block_at(ix, lba, buf).map_err(|_| BlockError::Io)?;
+    Ok(dev.block_size as usize)
+}
+
+/// AHCI: the primary-disk form of [`read_block_ahci_ix`] — registry entry 0.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn read_block_ahci(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    read_block_ahci_ix(0, lba, buf)
+}
+
+/// AHCI: the counted twin of [`read_block_ahci_ix`] — `buf.len() / block_size` consecutive blocks in
+/// one call. Bounded by the shared [`span_blocks`] rules so they cannot drift between handles.
+///
+/// The driver's primitive is a SINGLE-sector READ DMA EXT, so this LOOPS it — byte-for-byte the same
+/// disk traffic a per-sector caller produces, in the same order, exactly the shape
+/// `read_blocks_sdhc`'s write twin uses for the same reason. A multi-sector PRDT would lift this
+/// with no change above the seam.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn read_blocks_ahci_ix(ix: usize, lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let dev = ahci_info_ix(ix).ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+    let bs = dev.block_size as usize;
+    for i in 0..count {
+        read_block_ahci_ix(ix, lba + i as u64, &mut buf[i * bs..(i + 1) * bs])?;
+    }
+    Ok(buf.len())
+}
+
+/// AHCI: the primary-disk form of [`read_blocks_ahci_ix`].
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn read_blocks_ahci(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    read_blocks_ahci_ix(0, lba, buf)
+}
+
+/// AHCI: one-shot latch so the refusal below names itself once instead of per retry.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+static AHCI_WRITE_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// AHCI: every write is refused, in every cfg this arc can be built in.
+///
+/// This is not a policy that could be configured away: `drivers/ahci.rs` contains no WRITE opcode,
+/// so there is no ladder for this function to call even if it wanted to. It exists so a future total
+/// dispatch fails CLOSED and says why, which is the same direction USBFALL F1's
+/// `guard_default_write_backend` and the pre-`sdw` `write_block_sdhc` stub fail in.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub fn write_block_ahci(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> {
+    if !AHCI_WRITE_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(
+            ":: AHCI: WRITE refused — this arc is READ-ONLY and the image carries no ATA write \
+             opcode for the SATA disks (first, once) ::"
+        );
+    }
+    Err(BlockError::NotReady)
+}

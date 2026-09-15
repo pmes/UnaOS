@@ -38,3 +38,15 @@ pub mod gpu;
 // vrom). x86_64-only; all knobs off => unlinked, media byte-identical.
 #[cfg(all(target_arch = "x86_64", any(feature = "thermprobe", feature = "pcilink", feature = "vromprobe")))]
 pub mod bench_ride;
+
+// AHCI (rmbp-ledger B89, first rung): the SATA host controller — READ-ONLY (UNAOS_AHCI=1). Enumerate
+// implemented ports, IDENTIFY the disks, read sectors, publish under `BlockHandle::Ahci`. No WRITE
+// opcode is compiled into this file and `install/` is never told about the handle (B91: an installer
+// that could target the internal SSD is one slip from erasing Catalina). x86_64-gated because the
+// enumeration seam is `arch::pci` config space; the FILE is arch-neutral in name and shape — AHCI
+// exists on aarch64 boards too, and only `hba_take`'s BAR read is x86. Knob off => the module is
+// never lexed (the `#[cfg]`-erased `pub mod` is the one case LAWS §5 names as byte-safe) and media
+// are byte-identical. DECLARED LAST so the knob-off line numbering of every module above is
+// untouched.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+pub mod ahci;
