@@ -2586,7 +2586,7 @@ pub static MOUSE_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
 /// population from `MOUSE_DISCARD_REARM_COUNT`: counted (and printed) separately so a metal
 /// capture can tell which hole it just watched get plugged. Halting errors are NOT counted here —
 /// they go to `service_hid_halts`, which prints its own line.
-pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_RESTATED_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_LAST: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_GAP: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_GAPMAX: AtomicU64 = AtomicU64::new(0); pub static KBD_ARMGAP_MAX: AtomicU64 = AtomicU64::new(0); // PRTSCLOST (orin 17) — the KEYBOARD twin of the five pointer counters to the left, plus the one quantity neither endpoint had: HOW LONG THE INTERRUPT-IN ENDPOINT SAT UNARMED. WHY. `set_hid_idle` sends SET_IDLE duration 0 = INDEFINITE (`sync_control(.., 0x0A, 0x0000, ..)` in this file; `[hidkeys] set-idle ok slot=5 iface=0` on render8's wire), so a boot keyboard reports ONLY on a state change and NEVER resends; and exactly ONE Normal TRB is outstanding on the read, re-armed only from this file's completion dispatch (`queue_keyboard_read` is the LAST statement of the keyboard branch, after the decode and after `set_hid_leds`' EP0 control transfer). Between the controller retiring a TD and software re-arming, the endpoint has no TD, the controller issues no IN token, and every state change inside that window is lost FOREVER — a press+release pair inside it disappears with no line anywhere, which is render8's PRTSCLOST signature: three fast Print Screen presses, ONE `:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::`. `rearm`/`discard`/`errrearm`/`dup`/`nobuf` mirror `MOUSE_*` exactly so `[kbdpoll]` scores like `[ptrpoll]`. `restated` = a report whose six keycodes equal the previous report's; under SET_IDLE 0 a state change CANNOT produce that, so `restated>0` is direct evidence an intermediate report was lost — and is exactly what makes the level-diffed `hid_print_screen_edge` return false for a real press, i.e. the silent swallow is DOWNSTREAM of the loss, not its cause. `KBD_DRAIN_*`/`KBD_ARMGAP_MAX` are in `arch::now_cycles()` units: every `drain_event_ring_once` stamps the gap since the previous drain, and the keyboard completion latches the gap that preceded IT — an UPPER BOUND on the unarmed window, and the number that decides between a pump-cadence fault and a guard fault. Ungated relaxed adds and one counter read per drain, exactly like the three siblings to the left. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below. // CLICKDEAD v2 — the guard's SILENT exit, counted as TWO populations because it is two different faults wearing one `return;`. DUP = `param == mouse_prev_phys` with the buffer and ring still present: the known Panther-Point duplicate Success for a TD already consumed, which the guard recognises and deliberately does not re-arm (a fresh read is supposed to be outstanding); if that assumption is wrong the fix is in the guard's discrimination. NOBUF = `mouse_data_buffer`/`mouse_ring` gone: a teardown/allocation defect, where re-arming would be WRONG because there is nothing to arm; the fix is in the slot's soft state. Conflating them would make `dup>0` mean two incompatible repairs. PRECEDENCE: `!have_buf` is tested FIRST, so a dup that arrives after the buffer is gone scores NOBUF — the missing buffer is the actionable fault. Ungated relaxed adds, exactly like the three siblings above (`MOUSE_REARM_COUNT`'s doc, this file:2373-2377: "Bumped unconditionally (cheap relaxed adds); only the knob-gated witness prints"). Read by `arch/aarch64/display_tegra.rs`'s `[ptrpoll]` as `dup=` and `nobuf=`. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below.
+pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_RESTATED_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_LAST: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_GAP: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_GAPMAX: AtomicU64 = AtomicU64::new(0); pub static KBD_ARMGAP_MAX: AtomicU64 = AtomicU64::new(0); #[cfg(feature = "xhcikbd")] pub static XHCIKBD_REPORTS: AtomicU64 = AtomicU64::new(0); #[cfg(feature = "xhcikbd")] pub static XHCIKBD_SCORED: AtomicU64 = AtomicU64::new(0); #[cfg(feature = "xhcikbd")] pub static XHCIKBD_STALLS: AtomicU64 = AtomicU64::new(0); #[cfg(feature = "xhcikbd")] pub const XHCIKBD_BURST_PAIRS: u64 = 9; #[cfg(feature = "xhcikbd")] pub const XHCIKBD_BURSTS: u64 = 4; #[cfg(feature = "xhcikbd")] pub const XHCIKBD_STALL_MS: u64 = 600; // PRTSCLOST (orin 17) — the KEYBOARD twin of the five pointer counters to the left, plus the one quantity neither endpoint had: HOW LONG THE INTERRUPT-IN ENDPOINT SAT UNARMED. WHY. `set_hid_idle` sends SET_IDLE duration 0 = INDEFINITE (`sync_control(.., 0x0A, 0x0000, ..)` in this file; `[hidkeys] set-idle ok slot=5 iface=0` on render8's wire), so a boot keyboard reports ONLY on a state change and NEVER resends; and exactly ONE Normal TRB is outstanding on the read, re-armed only from this file's completion dispatch (`queue_keyboard_read` is the LAST statement of the keyboard branch, after the decode and after `set_hid_leds`' EP0 control transfer). Between the controller retiring a TD and software re-arming, the endpoint has no TD, the controller issues no IN token, and every state change inside that window is lost FOREVER — a press+release pair inside it disappears with no line anywhere, which is render8's PRTSCLOST signature: three fast Print Screen presses, ONE `:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::`. `rearm`/`discard`/`errrearm`/`dup`/`nobuf` mirror `MOUSE_*` exactly so `[kbdpoll]` scores like `[ptrpoll]`. `restated` = a report whose six keycodes equal the previous report's; under SET_IDLE 0 a state change CANNOT produce that, so `restated>0` is direct evidence an intermediate report was lost — and is exactly what makes the level-diffed `hid_print_screen_edge` return false for a real press, i.e. the silent swallow is DOWNSTREAM of the loss, not its cause. `KBD_DRAIN_*`/`KBD_ARMGAP_MAX` are in `arch::now_cycles()` units: every `drain_event_ring_once` stamps the gap since the previous drain, and the keyboard completion latches the gap that preceded IT — an UPPER BOUND on the unarmed window, and the number that decides between a pump-cadence fault and a guard fault. Ungated relaxed adds and one counter read per drain, exactly like the three siblings to the left. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below. // CLICKDEAD v2 — the guard's SILENT exit, counted as TWO populations because it is two different faults wearing one `return;`. DUP = `param == mouse_prev_phys` with the buffer and ring still present: the known Panther-Point duplicate Success for a TD already consumed, which the guard recognises and deliberately does not re-arm (a fresh read is supposed to be outstanding); if that assumption is wrong the fix is in the guard's discrimination. NOBUF = `mouse_data_buffer`/`mouse_ring` gone: a teardown/allocation defect, where re-arming would be WRONG because there is nothing to arm; the fix is in the slot's soft state. Conflating them would make `dup>0` mean two incompatible repairs. PRECEDENCE: `!have_buf` is tested FIRST, so a dup that arrives after the buffer is gone scores NOBUF — the missing buffer is the actionable fault. Ungated relaxed adds, exactly like the three siblings above (`MOUSE_REARM_COUNT`'s doc, this file:2373-2377: "Bumped unconditionally (cheap relaxed adds); only the knob-gated witness prints"). Read by `arch/aarch64/display_tegra.rs`'s `[ptrpoll]` as `dup=` and `nobuf=`. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below.
 
 /// Acknowledge an xHCI interrupt at the hardware level so the interrupter can raise again.
 /// Safe to call from interrupt context: it takes NO locks and does NO allocation — it clears
@@ -5141,7 +5141,7 @@ impl XhciController {
                                                 }
                                             }
 
-                                            if cur_keys == prev_keys && modifiers == self.slots[slot_id as usize].keyboard_prev_mods { KBD_RESTATED_COUNT.fetch_add(1, Ordering::Relaxed); } self.slots[slot_id as usize].keyboard_prev_mods = modifiers; self.slots[slot_id as usize].keyboard_prev_keys = cur_keys; // PRTSCLOST — a report whose six keycodes are byte-identical to the previous report's. SET_IDLE was sent with duration 0 (INDEFINITE, `set_hid_idle` in this file), so the device reports ONLY on a state change and a restated report is IMPOSSIBLE from one — every one of them means at least one intermediate report never reached this decoder. It is also the exact condition under which `hid_print_screen_edge` (and the `HID_LOCK_KEYS` diff below) returns false for a genuine press: `prev_keys` still holds 0x46 because the RELEASE was the report that was lost. Counted BEFORE the store so `prev_keys` is still this report's predecessor. ⚠ FOLDED onto the existing store — no line added.
+                                            if cur_keys == prev_keys && modifiers == self.slots[slot_id as usize].keyboard_prev_mods { KBD_RESTATED_COUNT.fetch_add(1, Ordering::Relaxed); } self.slots[slot_id as usize].keyboard_prev_mods = modifiers; self.slots[slot_id as usize].keyboard_prev_keys = cur_keys; #[cfg(feature = "xhcikbd")] xhcikbd_note(&cur_keys, &prev_keys); // PRTSCLOST — a report whose six keycodes are byte-identical to the previous report's. SET_IDLE was sent with duration 0 (INDEFINITE, `set_hid_idle` in this file), so the device reports ONLY on a state change and a restated report is IMPOSSIBLE from one — every one of them means at least one intermediate report never reached this decoder. It is also the exact condition under which `hid_print_screen_edge` (and the `HID_LOCK_KEYS` diff below) returns false for a genuine press: `prev_keys` still holds 0x46 because the RELEASE was the report that was lost. Counted BEFORE the store so `prev_keys` is still this report's predecessor. ⚠ FOLDED onto the existing store — no line added.
 
                                             // PRTSCR: the Print Screen press edge. `prev_keys` is the
                                             // LOCAL copy taken before the loops above, so the store on
@@ -15849,4 +15849,100 @@ impl XhciController {
             xdbg!("xHCI: Keyboard Read Queued.");
         }
     }
+}
+
+// XHCIKBD (rmbp 2026-09-15, rmbp-ledger B45) — the x86 headless test's xHCI KEYBOARD fixture: the
+// scorer for `UNAOS_XHCIKBD=1 ./arroyo test`. TAIL APPEND, below every pre-existing line of this
+// file, so nothing above moves (kernel8.img panic-`Location` byte-identity, `./arroyo knoboff
+// xhcikbd`); its statics ride the counters line at `KBD_ARMGAP_MAX` and its one call site rides the
+// `KBD_RESTATED_COUNT` line in the keyboard completion branch, both `#[cfg(feature = "xhcikbd")]`.
+//
+// THE LEG. Until this knob the headless x86 test put QEMU's `usb-kbd` on the EHCI bus (builder
+// `ehcihid` default), so the xHCI keyboard completion branch above — the shared decoder every
+// board types through — was exercised by NO gate anywhere (B45 measured it: no `[hidkeys]` on the
+// x86 wire). `UNAOS_XHCIKBD=1` moves the ONE `usb-kbd` onto `xhci.0` with the EHCI driver still
+// compiled and running, and `scripts/qmp_type.py --bursts` types `XHCIKBD_BURSTS` bursts. EACH
+// BURST IS: the STALL KEY (F11, HID 0x44 — types nothing, chords nothing) pressed, then, 20 ms
+// apart, its release and `XHCIKBD_BURST_PAIRS` alternating a/b press+release pairs, one
+// `input-send-event` per event; then 2 s of quiet. After the last burst the SENTINEL (F12, HID 0x45)
+// is pressed once, and its press edge prints the score.
+//
+// THE STALL — THE DELIBERATELY SLOW PASS. On the stall key's press edge `xhcikbd_note` spins
+// `XHCIKBD_STALL_MS` inside the completion branch: the shape of render8's 92 ms present or a prtscr
+// slice, or the x86 boot battery's 1.06 s (xhcikbd-logs/02), made deterministic and long enough to
+// hold the whole stream. Under the single-TRB driver the call sits between the retired TD and its
+// re-arm (`queue_keyboard_read` is the branch's last statement), so the endpoint is DARK for the
+// entire stall; under B44 the top-up ran at the `rep8` line above this call, so N TRBs are armed
+// throughout it. That difference is what the score measures.
+//
+// WHY THE STREAM IS SHAPED AS IT IS (MEASURED, xhcikbd-logs/03 and /05). QEMU's usb-kbd delivers at
+// most ONE report per endpoint polling interval (8 ms for this HS device) no matter how many TRBs
+// wait, and queues at most 16 undelivered key events (hw/input/hid.c `QUEUE_LENGTH`), dropping the
+// rest: a 20-event burst injected atomically arrived as exactly 17 at BOTH depths. So the events are
+// spaced wider than the interval (20 ms), which lets every armed TRB absorb one during the stall,
+// and the stream is 19 events (release + 9 pairs): with ZERO TRBs armed 16 survive and 3 are lost;
+// with four, 3 or 4 are absorbed and 15-16 queue — none lost. On metal the device buffers NOTHING,
+// so the leg understates the defect: every edge in a dark window is gone there.
+//
+// THE SCORE, printed once, on the sentinel's press edge:
+//   :: XHCIKBD: reports=<n> restated=<r> lost=<l> expected=<e> stalls=<k> armgap_us=<g> gapmax_us=<m> rearm=<a> discard=<d> dup=<u> nobuf=<b> -> PASS|FAIL ::
+// `reports` = keyboard reports decoded before the sentinel (stall key edges included);
+// `expected` = bursts × (2 + 2 × pairs) = 80; `lost` = expected − reports (saturating);
+// `restated` = `KBD_RESTATED_COUNT` (under SET_IDLE 0 a byte-identical repeat is impossible, so
+// restated>0 is an intermediate report that never arrived — the counters line's doc); `stalls` =
+// stall-key edges seen (a control: 0 means the stream never reached the decoder and the verdict is
+// about nothing). PASS iff lost == 0 && restated == 0 && stalls == bursts. `-> FAIL` is in arroyo's
+// FAULT_PATTERNS, so the leg's exit status carries the verdict; arroyo separately reds a run whose
+// wire has no XHCIKBD line at all (a typist that never reached the guest is not a pass).
+#[cfg(feature = "xhcikbd")]
+fn xhcikbd_hz() -> u64 {
+    // `now_cycles()` is arch-neutral but its rate is not — the same fold `video::strip::cycles_to_us`
+    // makes, copied because that module is `wc`-gated and this fixture is not.
+    #[cfg(target_arch = "x86_64")]
+    let hz = crate::arch::apic::tsc_hz();
+    #[cfg(target_arch = "aarch64")]
+    let hz = crate::arch::timer::cntfrq();
+    if hz == 0 { 1_250_000_000 } else { hz }
+}
+
+#[cfg(feature = "xhcikbd")]
+fn xhcikbd_us(cycles: u64) -> u64 {
+    cycles.saturating_mul(1_000_000) / xhcikbd_hz()
+}
+
+/// XHCIKBD — the keyboard completion branch calls this AFTER the restated count and the
+/// prev-keys store, with this report's and the previous report's six keycodes. Every report that
+/// is not the sentinel's press edge is counted; the stall key's press edge additionally holds
+/// this pass for `XHCIKBD_STALL_MS`; the sentinel's press edge scores, once.
+#[cfg(feature = "xhcikbd")]
+fn xhcikbd_note(cur_keys: &[u8; 6], prev_keys: &[u8; 6]) {
+    const STALL_KEY: u8 = 0x44; // F11
+    const SENTINEL: u8 = 0x45; // F12
+    if !(cur_keys.contains(&SENTINEL) && !prev_keys.contains(&SENTINEL)) {
+        XHCIKBD_REPORTS.fetch_add(1, Ordering::Relaxed);
+        if cur_keys.contains(&STALL_KEY) && !prev_keys.contains(&STALL_KEY) {
+            XHCIKBD_STALLS.fetch_add(1, Ordering::Relaxed);
+            let t0 = crate::arch::now_cycles();
+            let budget = XHCIKBD_STALL_MS.saturating_mul(xhcikbd_hz()) / 1000;
+            while crate::arch::now_cycles().wrapping_sub(t0) < budget { core::hint::spin_loop(); }
+        }
+        return;
+    }
+    if XHCIKBD_SCORED.swap(1, Ordering::Relaxed) != 0 { return; }
+    let reports = XHCIKBD_REPORTS.load(Ordering::Relaxed);
+    let expected = XHCIKBD_BURSTS * (2 + 2 * XHCIKBD_BURST_PAIRS);
+    let restated = KBD_RESTATED_COUNT.load(Ordering::Relaxed);
+    let stalls = XHCIKBD_STALLS.load(Ordering::Relaxed);
+    let lost = expected.saturating_sub(reports);
+    serial_println!(
+        ":: XHCIKBD: reports={} restated={} lost={} expected={} stalls={} armgap_us={} gapmax_us={} rearm={} discard={} dup={} nobuf={} -> {} ::",
+        reports, restated, lost, expected, stalls,
+        xhcikbd_us(KBD_ARMGAP_MAX.load(Ordering::Relaxed)),
+        xhcikbd_us(KBD_DRAIN_GAPMAX.load(Ordering::Relaxed)),
+        KBD_REARM_COUNT.load(Ordering::Relaxed),
+        KBD_DISCARD_REARM_COUNT.load(Ordering::Relaxed),
+        KBD_DUP_DROP_COUNT.load(Ordering::Relaxed),
+        KBD_NOBUF_DROP_COUNT.load(Ordering::Relaxed),
+        if lost == 0 && restated == 0 && stalls == XHCIKBD_BURSTS { "PASS" } else { "FAIL" }
+    );
 }

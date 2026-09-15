@@ -740,6 +740,15 @@ hcronst = ["holocron"]
 # unattended write is behind the knob. DEFAULT OFF => the selftest and its call sites vanish and
 # every shipped image is byte-alike. Kept in sync with arroyo and builder/src/main.rs.
 prtscrst = []
+# XHCIKBD (rmbp 2026-09-15, rmbp-ledger B45): the x86 headless test's xHCI KEYBOARD leg. `UNAOS_XHCIKBD=1`
+# puts QEMU's one usb-kbd on xhci.0 (the EHCI driver stays on; its bus just carries no keyboard) and
+# arms the burst scorer at the tail of drivers/xhci/mod.rs (`xhcikbd_note`, printing
+# `:: XHCIKBD: reports= restated= lost= … -> PASS|FAIL ::` on the F12 sentinel). Implies `witness`
+# because the score quotes KBD_ARMGAP_MAX, which only the witness-stamped drain measures. FIXTURE ONLY:
+# the N-outstanding-TD repair it scores (B44) is ungated driver code on both arches. A GATE knob, never
+# a flight knob. DEFAULT OFF => the scorer, its statics and its one call site vanish. Kept in sync with
+# arroyo and builder/src/main.rs.
+xhcikbd = ["witness"]
 # SMOLNET-DEFAULT (2026-07-17): the mature smoltcp TCP/IP stack (ROADMAP §1b) is the DEFAULT x86 net
 # path — the shell's ping/arp/ifconfig, the socket syscall family (SOCK-2..7), the DNS sinkhole
 # (zeolite), and the boot witnesses. Pulls in the x86-only smoltcp optional dependency and compiles
