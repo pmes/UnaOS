@@ -591,7 +591,7 @@ actually lost during boot 11.
 | Rung | What | Risk | Depends on |
 |---|---|---|---|
 | 0 | `rp-boot` baseline for `secsta`/`bridgectl` | none (read) | **landed with this document** |
-| 1 | W1C the secondary-status latch at arm time, so every later sample is a delta | low | rung 0's reading |
+| 1 | W1C the secondary-status latch at arm time, so every later sample is a delta | low | **landed, WIDENED, and knob-gated: BAR1WEDGE (§11). It clears THREE latches, not one — secondary status was the only one anybody had noticed** |
 | 2 | **Condemn-and-survive**: `COMP_SEALED` + PANEL CONDEMNED + the loud serial block | low, no PCIe write | §5 |
 | 3 | A recovery task immune by construction (§4) — never enters `wm`, never sends on a channel | low | rung 2 |
 | 4 | Sacrificial endpoint probe → a real classifier (§3.2) | medium — may lose a core, by design | rung 3 |
@@ -608,3 +608,198 @@ cannot be made while the machine is wedged.
 permission; it cannot darken anything that is not already frozen; and it converts boot 11's
 outcome from *"nothing ran right the whole time it was booted"* into a machine that says exactly
 what died, keeps narrating, and hands back the core it was holding.
+
+---
+
+## 11. BAR1WEDGE — the wedge-theory ladder, and every register field decoded
+
+**Status: IMPLEMENTED, knob-gated, DEFAULT OFF (`UNAOS_BAR1WEDGE=1`, Cargo feature `bar1wedge`,
+`drivers/gpu/pcihealth.rs` file tail). Never flown.** Unlike everything in §§2–10, this section is
+not a plan: the instrument exists and the next flight can score it. What it is *for* is §11.1's W4 —
+the one coded, never-flown experiment the shut-out register names for ledger A1.
+
+Sections 1–10 above are about **recovery**: what to do once the wedge has happened. This section is
+about **the wedge itself** — the ladder of theories, written in the form `RULINGS.md` R19 requires
+(every rung records the conditions it failed under, its code and its knob are KEPT, and nothing is
+ever "ruled out"), and the register facts a boot has to carry for the next rung to mean anything.
+
+### 11.1 The wedge-theory ladder
+
+| # | theory | armed by | last metal verdict | failed under | depends on | status |
+| --- | --- | --- | --- | --- | --- | --- |
+| W1 | the GK107 drops into an ASPM low-power state under a quiescent link and stops accepting transactions | `UNAOS_NOASPM` (register §6 P3) | boot 11: `[pcih] aspm cleared rp 0043->0040 ep 0043->0040`, **wedged anyway at 118 s**; flight 4 repeated it, three strikes | WC-typed BAR1 aperture (PAT PA4), sustained compositor paint bursts, Kepler FIFO+CE present *and* (rmbp-5 boot 17) absent, ASPM confirmed cleared on BOTH ends | — | **shut-out as a cure; proven as a mechanism.** The switch stays armed: a different failure (L1 substate entry under an idle desktop, a retrain) needs the same lever |
+| W2 | the link itself faults or retrains under the burst | — (P4 reads it every kepler boot) | boot 9 `lnksta=d881` (Link Training SET), boot 11 `lnksta=d081` (CLEAR) — same wedge either way | link up and trained at the sample; no AER capability on the Ivy Bridge PEG root port (`aer=n`) to corroborate | W1 | **shut-out — with a caveat this arc found and §11.2 states: two of the bits in `d081` are RW1C latches this kernel had never cleared, so "the link is clean" was read off a register that was partly reporting the whole boot, not the instant** |
+| W3 | the holder is parked in a non-posted READ-BACK out of the aperture | — | boot 15's ISR row trace: 99 samples, one a second, `row=897` throughout — the holder is stopped inside one STORE, not slow and not reading (`engine.md` §WCSER-ISR) | — | — | **refuted.** Recorded, not deleted |
+| W4 | **WC store-buffer / posted-write backpressure**: the CPU's write-combining buffers drain into a host interface that stops accepting them, and the core dies holding the store | `UNAOS_BAR1EXP=uc` (register §6 P5), scored by `UNAOS_BAR1WEDGE=1` | **NEVER FLOWN.** Flight 5 declined to arm it: *"UC is ~6.8x slower and would corrupt the power numbers"* | — | W1 (ASPM excluded), W2, W3 | **never-run — the ranked next rung.** UC retypes the aperture so the write path is strongly ordered and unbuffered; a wedge under UC exonerates memory type, a wedge-free UC boot convicts the WC drain |
+| W5 | PCIe credit exhaustion / the GPU's own BAR1 window path (M2/M3 of `phase31-root.md`) | — | — | — | W4 (it is what W4's UC arm discriminates *against*) | **never-run** |
+| W6 | the root port's completion timeout never fires, so a core stalled on the aperture can never be released at all | `UNAOS_BAR1WEDGE` prints the configuration; nothing yet exercises it | never flown — the value has never been READ, let alone tested | — | — | **never-run.** This is the number §3.2's sacrificial probe and §8.2's "is the core freed?" both rest on, and it is a boot-time constant that cost nothing to print and had never been printed |
+| W7 | `secsta` bit 13 (Received Master Abort) is the wedge's signature — the endpoint stopped answering | — | boots 8, 9 and 11 all read `secsta=2000` at the wedge | **UNFALSIFIABLE AS READ** (§1.3): a W1C latch this kernel never cleared, and ordinary bus enumeration sets it. `[pcih] rp-boot` (landed with this document) narrowed it to "before or after `pci::init`"; BAR1WEDGE's arm-time clear narrows it to "after `pci::init`". The EHCI driver's own `0..=255` walk is the named remaining contributor | — | **open** |
+
+**What would change a verdict**
+
+- **W2** — re-read it from a boot whose LNKSTA bandwidth latches were cleared at arm time. If
+  `lnksta` at the wedge still carries bits [15:14] after the clear, the link retrained *during this
+  boot* and W2 re-opens as "bandwidth renegotiation under burst", which is not the same claim as
+  "link training error" and was never separately tested. If they read 0, W2's shut-out is stronger
+  than it has ever been, because for the first time the reading is about the instant.
+- **W4** — fly `UNAOS_BAR1EXP=uc` with `UNAOS_BAR1WEDGE=1` on a boot scored **wedge / no-wedge**,
+  never throughput. Both knobs, or the flight is unscorable: see §11.3.
+- **W7** — one boot. Either `d_secsta=0000` at the first stall, and the master-abort reading is dead
+  (with it, §3.1's table has no entries left and §3.2's sacrificial probe becomes the only route to a
+  classifier); or `d_secsta=2000`, and the latch moved after `pci::init` — still not proof it moved
+  at the wedge, because of the EHCI walk, but a much smaller window than the one boot 11 had.
+
+### 11.2 The registers BAR1WEDGE prints, field by field
+
+Sources: **PCI Express Base Specification Revision 3.0** (§7.8 PCI Express Capability Structure;
+§7.10 Advanced Error Reporting Capability) and the **PCI-to-PCI Bridge Architecture Specification
+Revision 1.2** (§3.2.5 configuration-space registers). Offsets marked `cap + …` are relative to the
+root port's PCIe capability header, which `find_cap` bounds; `0x1E`/`0x3E` are absolute type-1
+header offsets. **RW1C** = write-1-to-clear: the bit latches on the event and stays set until
+something writes a 1 to it. This kernel had never written a 1 to any of them.
+
+#### Link Status — `cap + 0x12`, 16-bit, PCIe r3.0 §7.8.8
+
+| bits | field | in the quoted `lnksta=d081` | what it says |
+| --- | --- | --- | --- |
+| [3:0] | Current Link Speed | `0x1` | 2.5 GT/s — Gen1 rate |
+| [9:4] | Negotiated Link Width | `0x08` | x8 |
+| [10] | Undefined in r3.0 (reserved) | 0 | — |
+| [11] | Link Training | 0 | the LTSSM was not retraining **at the instant of this read**. Boot 9's `d881` has it SET; both boots wedged |
+| [12] | Slot Clock Configuration | 1 | the port uses the platform's reference clock |
+| [13] | Data Link Layer Link Active | 0 | **meaningful only if Link Capabilities [20] (DLL Link Active Reporting Capable) is set** — the census's `lnkcap=` field is where to check. On a non-hot-plug CPU-integrated PEG port it is normally 0, in which case this bit is 0 on a perfectly healthy link and says nothing |
+| [14] | Link Bandwidth Management Status | **1** | **RW1C.** Set when the link retrained because bandwidth was renegotiated (or the port's speed/width was changed by software) |
+| [15] | Link Autonomous Bandwidth Status | **1** | **RW1C.** Set when the link autonomously changed speed or width for reliability or power |
+
+**This is the finding of the decode, and it is about evidence rather than about hardware.** `d081`
+has been quoted three times as "the link is clean and trained at the wedge". Bits [15:14] of it are
+since-boot latches, so the honest reading of `d081` was always *"clean at this instant, and at some
+point since power-on the link renegotiated its bandwidth at least once"* — which is a fact about the
+whole boot, printed in the same field as facts about the instant, with nothing to separate them.
+Exactly the `secsta` trap of §1.3, in the register the ladder trusted most. The arm-time clear is
+what separates them.
+
+#### Link Control — `cap + 0x10`, 16-bit, PCIe r3.0 §7.8.7
+
+Read by the existing sampler **and then discarded** — `rp_at_wedge` loads the LNKCTL|LNKSTA dword
+and keeps only the top half. So until this rung, no capture had the wedge-time value of any of these.
+
+| bits | field | in the census's `lnkctl=0043` | note |
+| --- | --- | --- | --- |
+| [1:0] | ASPM Control | `0b11` = L0s+L1 | `0040` under `UNAOS_NOASPM`; this is the field the P3 clear writes |
+| [3] | Read Completion Boundary | 0 | |
+| [4] | Link Disable | 0 | **must stay 0.** A stolen CF8 store landing here is the catastrophe the PCIH-NOCF8 refusal in `census` exists to prevent, and printing it at the wedge is how we would ever find out |
+| [5] | Retrain Link | 0 | write-1 to trigger; reads back 0 |
+| [6] | Common Clock Configuration | 1 | the `0x40` in `0043` |
+| [7] | Extended Synch | 0 | |
+| [8] | Enable Clock Power Management | 0 | |
+
+#### Device Status — `cap + 0x0A`, 16-bit, PCIe r3.0 §7.8.5
+
+| bits | field | in `devsta=0000` | note |
+| --- | --- | --- | --- |
+| [0] | Correctable Error Detected | 0 | **RW1C** |
+| [1] | Non-Fatal Error Detected | 0 | **RW1C** |
+| [2] | Fatal Error Detected | 0 | **RW1C** |
+| [3] | Unsupported Request Detected | 0 | **RW1C** |
+| [4] | AUX Power Detected | 0 | read-only |
+| [5] | Transactions Pending | 0 | read-only — set while the port has issued non-posted requests that have not completed. **`devsta=0000` at the wedge therefore says the ROOT PORT had no outstanding non-posted request of its own**, which is consistent with W3's refutation (the holder is in a posted store) and is the closest thing the existing capture has to a positive statement about traffic |
+
+#### Device Capabilities 2 — `cap + 0x24`, 32-bit, PCIe r3.0 §7.8.15
+
+| bits | field | note |
+| --- | --- | --- |
+| [3:0] | Completion Timeout Ranges Supported | one bit per class: A = 50 µs–10 ms, B = 10 ms–250 ms, C = 250 ms–4 s, D = 4 s–64 s |
+| [4] | Completion Timeout Disable Supported | whether [4] of Device Control 2 does anything |
+
+#### Device Control 2 — `cap + 0x28`, 16-bit, PCIe r3.0 §7.8.16
+
+**The register W6 turns on, and nothing in this tree had ever read it.**
+
+| bits | field | encodings (r3.0 Table 7-20) |
+| --- | --- | --- |
+| [3:0] | Completion Timeout Value | `0x0` 50 µs–50 ms (default) · `0x1` 50–100 µs (A) · `0x2` 1–10 ms (A) · `0x5` 16–55 ms (B) · `0x6` 65–210 ms (B) · `0x9` 260–900 ms (C) · `0xA` 1–3.5 s (C) · `0xD` 4–13 s (D) · `0xE` 17–64 s (D) · all others reserved |
+| [4] | Completion Timeout Disable | **1 = the timeout mechanism is OFF and a non-posted request that is never answered is never abandoned.** If Apple's firmware leaves this set, §3.2's sacrificial endpoint probe does not merely "probably survive" — it is guaranteed not to, and §8.2's hope that an SBR frees the seized core loses its main mechanism |
+
+These two registers exist only from **PCIe capability version 2** (PCI Express Capabilities Register,
+`cap + 0x02` bits [3:0], §7.8.2). On a version-1 capability `cap + 0x24` is whatever the device put
+there next, so the rung checks the version first and prints `v2=0` / `cto rp UNREADABLE` rather than
+a fiction.
+
+#### Secondary Status — bridge offset `0x1E`, 16-bit, PCI-to-PCI r1.2 §3.2.5.7
+
+| bits | field | in `secsta=2000` | note |
+| --- | --- | --- | --- |
+| [8] | Master Data Parity Error | 0 | **RW1C** |
+| [10:9] | DEVSEL Timing | 0 | read-only |
+| [11] | Signaled Target Abort | 0 | **RW1C** |
+| [12] | Received Target Abort | 0 | **RW1C** |
+| [13] | **Received Master Abort** | **1** | **RW1C** — the `0x2000`. Every config probe of an absent device below this bridge sets it, which is why §1.3 calls the reading ambiguous |
+| [14] | Received System Error | 0 | **RW1C** |
+| [15] | Detected Parity Error | 0 | **RW1C** |
+
+#### Bridge Control — bridge offset `0x3E`, 16-bit, PCI-to-PCI r1.2 §3.2.5.18
+
+Sampled at boot by the `[pcih] rp-boot` line and **not touched by this rung**. Bit [6] is Secondary
+Bus Reset; §6.2's pulse is a read-modify-write of this register and every other bit in it (VGA
+enable, ISA enable, error forwarding, the parity/SERR enables) must be carried through unchanged.
+
+#### AER — `aer + 0x04` and `aer + 0x10`, 32-bit, PCIe r3.0 §7.10.2 / §7.10.5
+
+Uncorrectable Error Status (`+0x04`): [4] Data Link Protocol Error · [12] Poisoned TLP · [13] Flow
+Control Protocol Error · **[14] Completion Timeout** · [15] Completer Abort · [16] Unexpected
+Completion · [17] Receiver Overflow · [18] Malformed TLP · [19] ECRC Error · [20] Unsupported Request
+Error. Correctable Error Status (`+0x10`): [0] Receiver Error · [6] Bad TLP · [7] Bad DLLP ·
+[8] REPLAY_NUM Rollover · [12] Replay Timer Timeout · [13] Advisory Non-Fatal Error. All RW1C.
+
+**On the bench machine there is nothing here to read, and that is itself the fact.** The census has
+printed `rp … aer=n` on every boot since 8: the Ivy Bridge PEG root port genuinely has no AER
+extended capability. The *endpoint* has one (`ep … aer=y`), and the sampler will never read it —
+that is the module's first refusal, and it is not negotiable while the endpoint's host interface is
+the thing under suspicion. Recovering the endpoint's AER log is a job for the recovery task of §4,
+after a condemn, through `ep_ecam_page()`.
+
+### 11.3 What the flight prints, and what each outcome means for A1
+
+Flight line: the existing rMBP line **plus `UNAOS_BAR1WEDGE=1`**, and — for the rung that pays —
+**plus `UNAOS_BAR1EXP=uc`**. Both, or the boot is not the experiment: `bar1wedge` without
+`bar1exp=uc` is a baseline WC boot with a better instrument (worth one boot on its own), and
+`bar1exp=uc` without `bar1wedge` is flight 5's refusal repeated — a single bit that the 6.8x
+slowdown can explain away.
+
+At kepler init, three lines:
+
+```
+:: BAR1WEDGE: rung=first-stall armed=UNAOS_BAR1WEDGE aperture=uc rp=0:1.0 capver=2 v2=1 baseline=lnksta=d081(2.5GT/s x8) lnkctl=0043(aspm=L0sL1) devsta=0000 secsta=2000 devctl2=.... aer=n ::
+[pcih] bar1wedge cto rp devcap2=........ ranges=. cto_dis_sup=. devctl2=.... value=... dis=. — the bound a non-posted read to a silent endpoint completes within
+[pcih] bar1wedge sticky-cleared at-arm lnksta d081->1081 devsta 0000->0000 secsta 2000->0000 (w1c written c000/0000/2000) — EHCI's later bus walk can still re-latch secsta; this narrows the window, it does not close it
+```
+
+Then, at every `[wcser] PASS OVERDUE … == tripwire ::` crossing, beside the unchanged
+`[pcih] rp-at-wedge` line:
+
+```
+[pcih] wedge-sample n=1 first=1 aperture=uc lnksta=.... d_lnksta=.... (...) lnkctl=.... lnkctl0=0043 aspm=... lnkdis=0 retrain=0 devsta=.... d_devsta=.... secsta=.... d_secsta=.... devctl2=.... cto=... dis=. aer=n uesta=00000000 cesta=00000000
+```
+
+Read `n=1` — that is the first stall, the sample this rung exists for. Read it with
+`awk 'index($0,"[pcih]")'`, never a bare `grep`.
+
+| what the wire says | what it means for ledger A1 |
+| --- | --- |
+| `aperture=uc` present and **no `[wcser] PASS OVERDUE` in a full `storm`** | W4 CONVICTED: the WC posted-write drain is the wedge, and the fix is a memory-type or fencing change on the blit path rather than anything in PCIe. The knob-off baseline (`aperture=wc`, same boot length, same storm) is the control and must wedge, or the boot proves only that the storm was weak |
+| `aperture=uc` and the wedge happens anyway | W4 EXONERATED and the aperture's memory type leaves the ladder: the store is not being held by CPU write-combining. W5 (credits / the GPU window path) becomes the head of the ladder with nothing above it |
+| `lnkdis=1` at any crossing | STOP EVERYTHING. The link was disabled by software, and the only software that writes LNKCTL is this kernel — PCIH-NOCF8's stolen-store hazard would be realised, not theoretical |
+| `d_lnksta=c000` (or either bit alone) at `n=1` | the link renegotiated bandwidth **during this boot**, after `pci::init`. W2 re-opens as "bandwidth renegotiation under burst" — a claim never separately tested, and not the "link training error" W2 was shut out on |
+| `d_lnksta=0000` across every crossing | W2's shut-out is confirmed on an instrument that can finally tell the instant from the boot |
+| `d_secsta=0000` at `n=1` | W7 DEAD: nothing master-aborted below the bridge after `pci::init`, so the `secsta=2000` of boots 8/9/11 was enumeration residue. §3.1's classifier table is then EMPTY and §3.2's sacrificial probe is the only remaining route to one |
+| `d_secsta=2000` at `n=1` | the latch moved after `pci::init`. Not yet proof it moved at the wedge — the EHCI bus walk is the named alternative — but the window is now minutes rather than the whole boot, and the next rung (a second clear once enumeration completes) closes it |
+| `dis=1` in the `cto` line | W6 CONVICTED without a flight of its own: completion timeouts are disabled on this port, §3.2's prober is guaranteed to be lost rather than "probably" surviving, and §8.2's argument that an SBR frees the seized core loses its mechanism |
+| `dis=0` with a `value=` in class A or B | the prober survives within tens of milliseconds; §3.2's rung is cheap and §3.3's classifier is buildable |
+| `v2=0` / `cto rp UNREADABLE` | the root port's PCIe capability is version 1 or sits too high in config space. W6 stays unanswerable on this machine and the reason is on the wire instead of being inferred from a missing line |
+| the `:: BAR1WEDGE:` line is ABSENT on a boot whose banner claims `bar1wedge` | the build is the defect, not the hardware. Check the artifact with `LC_ALL=C grep -a -o -F ':: BAR1WEDGE:'` before reading anything else into the boot |
+
+**Absence controls for this flight, pre-registered:** `fb-wc` must be ABSENT and
+`:: x86 bar1exp: UC arm ARMED` PRESENT on the UC leg (they are alternatives at the same site); the
+reverse on the WC control leg. `[pcih] rp-boot` and `[pcih] rp-at-wedge` must be present on BOTH
+legs and unchanged in shape — this rung adds lines and clears latches, it removes nothing.

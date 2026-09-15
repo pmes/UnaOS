@@ -775,6 +775,29 @@ if [ -n "${UNAOS_BAR1EXP:-}" ] && [ "${UNAOS_BAR1EXP}" != "uc" ]; then
     exit 1
 fi
 [ -n "${UNAOS_BAR1EXP:-}" ] && _feats="${_feats}bar1exp-uc,"
+# BAR1WEDGE (rmbp A1, appended 2026-09-15 — LAST line of the kepler block): UNAOS_BAR1WEDGE=1 arms the
+# FIRST-STALL REGISTER BLOCK in drivers/gpu/pcihealth.rs (file tail), the falsifier that makes the
+# never-flown UC arm above SCORABLE. Without it a `UNAOS_BAR1EXP=uc` flight yields one bit — wedge or
+# no wedge — and the ~6.8x UC slowdown alone explains a quiet boot; with it every crossing says which
+# memory type the aperture carries (`aperture=uc|wc`, taken from `bar1exp-uc` itself, not from the
+# operator's memory of this line) and what the root port's link and error state was AT THE FIRST STALL.
+# Three parts, ROOT PORT ONLY, endpoint never touched: (1) a boot baseline + the completion-timeout
+# decode — Device Capabilities 2 / Device Control 2, PCIe r3.0 §7.8.15/§7.8.16, the bound within which
+# a non-posted read to a silent endpoint completes, and a number nobody has printed; (2) an ARM-TIME
+# W1C clear of the three sticky latches (LNKSTA[15:14] §7.8.8, DEVSTA[3:0] §7.8.5, Secondary Status
+# PCI-to-PCI r1.2 §3.2.5.7) so later readings are deltas against a known zero — rung 1 of
+# docs/dev/OS/08_VIDEO/PCIE-RP-RECOVERY.md §10; writes only RW1C bits it read as SET, on the BSP inside
+# pci::init, the same phase the noaspm leg writes LNKCTL from; (3) one `[pcih] wedge-sample` line per
+# tripwire crossing, READ-ONLY and ECAM-only, carrying LNKCTL (the existing sampler loads that dword and
+# discards the control half), the deltas, and the completion-timeout fields. Wire: one
+# `:: BAR1WEDGE: rung=first-stall armed=UNAOS_BAR1WEDGE ... ::` at kepler init, then
+# `[pcih] bar1wedge cto ...`, `[pcih] bar1wedge sticky-cleared at-arm ...`, and `[pcih] wedge-sample n=...`.
+# The unconditional census and the `[pcih] rp-at-wedge` line are UNCHANGED and keep riding every kepler
+# boot; this knob adds lines and clears latches, it removes nothing. Implies nvidia-kepler (Cargo-side).
+# Decode table for every field: PCIE-RP-RECOVERY.md §11. Default OFF => no statics, no clear, no new
+# witness string. Kept in sync with builder/src/main.rs (the two-place trap; this map line is
+# parser-conformant so the KNOB→BUILDER WIRING CHECK covers it, and `x86-all` names the feature).
+[ -n "${UNAOS_BAR1WEDGE:-}" ] && _feats="${_feats}bar1wedge,"
 # R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
 # (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only, never a mean; pure
 # measurement, changes no scheduling/locking/present behaviour. x86_64-only in effect (the real impl is
@@ -3705,9 +3728,26 @@ KERNEL_CFG_MATRIX=(
   # arm-named-only, so naming it here ADDS it to `x86_cfg_universe` (+1 feature). The derived mix-leg
   # count is the smallest n with C(n, n/2) >= N and does not move for this: C(9,4) = 126 still covers
   # it. Read the live board/mix counts on `./arroyo check`'s own summary line, never from this prose.
+  # BAR1WEDGE (rmbp A1, appended 2026-09-15, LAST on the line): `bar1wedge` — the first-stall register
+  # block at the tail of drivers/gpu/pcihealth.rs. It is a BRAND-NEW knob, so it enters
+  # `x86_cfg_universe` as "unclaimed => assume x86" either way and naming it here removes nothing; what
+  # naming it on a LITERAL x86 leg buys is the two things a derived mix leg cannot promise. First, the
+  # ARMED polarity of its `#[cfg]` items is compiled by construction rather than by an index-derived
+  # mask (the `x86-vsyncpace` REVIEW C3 lesson, and `wcdvalve`'s: a both-ON mix leg that happens to
+  # exist today is luck of the mask indices, and this feature's items need `nvidia-kepler` ON with it).
+  # Second — the load-bearing half — it is what puts `UNAOS_BAR1WEDGE` under the KNOB→BUILDER WIRING
+  # CHECK below, and this knob is squarely in that trap's blast radius: its whole product is witness
+  # lines, so a knob wired into arroyo alone would ship media whose banner claims the instrument and
+  # whose wire carries none of it — a flight that reads as a NEGATIVE RESULT about the hardware
+  # (BEAMX86's failure mode, one line above, in a rung whose entire purpose is evidence). This leg
+  # already carries `nvidia-kepler` and `bar1exp-uc`, so it also compiles the `aperture=uc` arm of the
+  # `cfg!(feature = "bar1exp-uc")` expression that labels every BAR1WEDGE line. UNIVERSE SIDE EFFECT:
+  # the table gains one knob and the universe gains one; the derived mix-leg count is the smallest n
+  # with C(n, n/2) >= N and does not move (C(9,4) = 126). Read the live board/mix counts on
+  # `./arroyo check`'s own summary line, never from this prose.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,bar1wedge"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the

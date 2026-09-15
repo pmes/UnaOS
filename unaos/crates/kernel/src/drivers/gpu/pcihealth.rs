@@ -515,6 +515,12 @@ pub fn census(ep_bus: u8, ep_slot: u8, ep_func: u8) {
     RP_PCIE_CAP.store(rp_cap as u32, Ordering::Relaxed);
     RP_ECAM.store(rp_ecam, Ordering::Relaxed);
     RP_AER.store(rp_aer as u32, Ordering::Relaxed);
+    // BAR1WEDGE (default OFF, `UNAOS_BAR1WEDGE=1`): the first-stall instrument's boot half —
+    // baseline cache, the completion-timeout decode, and the arm-time W1C clear of the three
+    // sticky latches. See the BAR1WEDGE block at the file tail. Nothing above this line moves.
+    #[cfg(feature = "bar1wedge")]
+    bw_arm(rb, rs, rf, rp_cap, rp_ecam, rp_aer);
+
     // Release pairs with the sampler's Acquire: a reader that sees READY sees the cache.
     PCIH_READY.store(true, Ordering::Release);
 }
@@ -584,6 +590,10 @@ pub fn rp_at_wedge() {
             lnksta, devsta, secsta
         );
     }
+    // BAR1WEDGE (default OFF): the first-stall block, on the same crossing and the same refusals
+    // (root port only, ECAM only, READ only). See the file tail.
+    #[cfg(feature = "bar1wedge")]
+    bw_sample(ecam, cap, aer, lnksta, devsta, secsta);
 }
 
 // ── aarch64 shims — kepler::init type-checks on aarch64 (it aborts at runtime before the GPU
@@ -592,3 +602,341 @@ pub fn rp_at_wedge() {
 pub fn census(_ep_bus: u8, _ep_slot: u8, _ep_func: u8) {}
 #[cfg(not(target_arch = "x86_64"))]
 pub fn rp_at_wedge() {}
+
+// ── BAR1WEDGE — the FIRST-STALL register block (`UNAOS_BAR1WEDGE=1`, feature `bar1wedge`) ────────
+//
+// THE RUNG THIS IS, AND WHY IT IS THIS ONE. The shut-out register (`SHUTOUT-REGISTER.md` §6) names
+// exactly one coded, never-flown experiment for ledger A1: P5, the BAR1 UC retype
+// (`UNAOS_BAR1EXP=uc`, `arch/x86_64/memory.rs`). Its code exists; what does not exist is a way to
+// SCORE a boot that carries it. A UC boot yields one bit — wedge or no wedge — and that bit is not
+// a refutation, because the UC arm also runs the aperture ~6.8x slower: "no wedge under UC" is
+// equally explained by "the paint burst never reached the rate that wedges". The falsifier the
+// flight needs is a register block taken at the FIRST stall — not after the core is dead, and not
+// as a value with nothing to compare it to.
+//
+// Three things were missing from the existing sampler, and all three are read-only root-port facts:
+//
+//   1. **LNKCTL is read and thrown away.** `rp_at_wedge` loads the LNKCTL|LNKSTA dword and keeps
+//      only the top half. So the ASPM state IN FORCE AT THE WEDGE has never been on the wire — only
+//      the state `census` printed ~100 s earlier — and neither has Link Disable or Retrain Link.
+//      P3's verdict ("ASPM is shut out as a cure") rests on the boot-time line alone.
+//   2. **The completion-timeout configuration is never read.** Device Control 2 [3:0] is the bound
+//      within which a non-posted read to a silent endpoint returns all-ones instead of never
+//      returning, and [4] can disable the mechanism outright. That number is the load-bearing
+//      unknown of `PCIE-RP-RECOVERY.md` §3.2 (can the sacrificial prober survive?) and §8.2 (can the
+//      seized core ever be freed?), and it is a boot-time constant nobody has ever printed.
+//   3. **Every sticky latch is boot residue until something clears it.** §1.3 of that document says
+//      so for secondary status and recommends the W1C clear "for the next arc"; §10's order of work
+//      makes it rung 1. It is true of two more fields nobody had noticed: LNKSTA[15:14] (Link
+//      Bandwidth Management Status, Link Autonomous Bandwidth Status) are RW1C, they are BOTH SET in
+//      the `lnksta=d081` that three boots have quoted as evidence, and this kernel has never cleared
+//      them either. So `d081` has been read as a live reading of a clean link when two of its bits
+//      are since-boot latches.
+//
+// WHAT THIS RUNG DOES, therefore: cache the root port's boot values, print the completion-timeout
+// decode once, CLEAR the three W1C latches at arm time so every later sample is a delta against a
+// known zero, and print one complete `[pcih] wedge-sample` line per tripwire crossing carrying the
+// missing fields plus the delta against that baseline — and naming, on the same line, which memory
+// type the panel aperture carries this boot (`aperture=uc|wc`), so a BAR1UC flight's wire is
+// self-labelling instead of depending on the operator's memory of the knob line.
+//
+// THE CLEAR IS AT ARM TIME AND NOWHERE ELSE. `census` runs on the BSP inside `pci::init`, the same
+// sequential boot phase the `noaspm` leg already writes LNKCTL from, so a CF8 write here carries the
+// exact hazard profile of a write this module already makes. The sampler keeps BOTH of its defining
+// refusals — root port only, ECAM only — and gains a third: it never writes. A W1C from the ~1 kHz
+// tripwire band would be a new store into a shared bridge register issued from the timer ISR while a
+// core is wedged, to buy a per-crossing delta; that trade is refused here and named in
+// `PCIE-RP-RECOVERY.md` as the rung above this one.
+//
+// RESIDUAL, STATED RATHER THAN ARGUED AWAY: `census` runs inside `pci::init`, and the EHCI driver's
+// own `0..=255` bus walk happens LATER, so a master abort it provokes can re-latch secondary status
+// after this clear. The clear narrows the window from "the whole boot" to "after `pci::init`"; it
+// does not close it. Closing it needs a second clear once enumeration is complete — a second call
+// site, in another file, and therefore not this change.
+//
+// Every register and every field printed below is decoded, with its spec section, in
+// `docs/dev/OS/08_VIDEO/PCIE-RP-RECOVERY.md` §11. Specs: PCI Express Base Specification Revision
+// 3.0 §7.8 (PCI Express Capability Structure) and §7.10 (Advanced Error Reporting Capability);
+// PCI-to-PCI Bridge Architecture Specification Revision 1.2 §3.2.5.7 (Secondary Status).
+
+/// Bytes of the PCIe capability this rung reads, measured from its header: Device Control 2 sits at
+/// `+0x28` and is 16-bit, so `+0x29` is the last byte touched and `0x2A` is the span that must fit
+/// inside the legacy 256-byte config region.
+///
+/// KEPT SEPARATE FROM [`PCIE_CAP_SPAN`] ON PURPOSE. Widening the span `find_cap` is called with
+/// would make a root port whose PCIe capability sits above 0xD6 fail `cap_fits` — and `find_cap`
+/// returning 0 costs the census line, the ASPM clear AND the wedge sampler, three instruments that
+/// ride every Kepler boot unconditionally, to satisfy a rung that is default OFF. This span is
+/// therefore checked at the point of use, and a capability too high to carry it loses the v2 fields
+/// and nothing else (`v2=0` on the wire).
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+pub const PCIE_CAP_SPAN_V2: u16 = 0x2A;
+
+/// Link Status RW1C bits (PCIe r3.0 §7.8.8): [14] Link Bandwidth Management Status, [15] Link
+/// Autonomous Bandwidth Status. Everything else in the register is read-only.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+pub const LNKSTA_W1C: u16 = 0xC000;
+/// Device Status RW1C bits (PCIe r3.0 §7.8.5): [0] Correctable Error Detected, [1] Non-Fatal Error
+/// Detected, [2] Fatal Error Detected, [3] Unsupported Request Detected. [4] AUX Power Detected and
+/// [5] Transactions Pending are read-only.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+pub const DEVSTA_W1C: u16 = 0x000F;
+/// Secondary Status RW1C bits (PCI-to-PCI Bridge r1.2 §3.2.5.7): [8] Master Data Parity Error,
+/// [11] Signaled Target Abort, [12] Received Target Abort, [13] Received Master Abort, [14] Received
+/// System Error, [15] Detected Parity Error. [9:10] are the read-only DEVSEL timing field.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+pub const SECSTA_W1C: u16 = 0xF900;
+
+/// Sentinel for "this boot could not read the PCIe capability v2 registers". Chosen because a real
+/// 16-bit register read can never produce it, so the sampler never has to carry a second flag.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+const BW_NO_V2: u32 = 0xFFFF_FFFF;
+
+/// Root-port LNKSTA immediately AFTER the arm-time W1C clear — the zero every later sample deltas
+/// against. Same for the three siblings below.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+static BW_LNKSTA0: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+static BW_DEVSTA0: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+static BW_SECSTA0: AtomicU32 = AtomicU32::new(0);
+/// Root-port LNKCTL at boot, for the at-wedge comparison the census line alone cannot make.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+static BW_LNKCTL0: AtomicU32 = AtomicU32::new(0);
+/// Root-port Device Control 2 at boot, or [`BW_NO_V2`].
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+static BW_DEVCTL2: AtomicU32 = AtomicU32::new(BW_NO_V2);
+/// Tripwire crossings this boot. `n=1` is the FIRST STALL — the sample this rung exists for.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+static BW_SAMPLES: AtomicU32 = AtomicU32::new(0);
+
+/// The memory type the panel aperture carries on THIS build, named on every BAR1WEDGE line so a
+/// capture says which arm of the P5 experiment flew without anyone consulting the knob line.
+/// `bar1exp-uc` is the one knob that retypes it (`arch/x86_64/memory.rs`, `set_framebuffer_wc`).
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+fn bw_aperture() -> &'static str {
+    if cfg!(feature = "bar1exp-uc") { "uc" } else { "wc" }
+}
+
+/// Decode the Completion Timeout Value field, Device Control 2 [3:0] (PCIe r3.0 §7.8.16, Table 7-20).
+/// The ranges are the spec's letter classes; a device need only implement the default and whichever
+/// classes Device Capabilities 2 [3:0] advertises.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+fn bw_cto_str(devctl2: u16) -> &'static str {
+    match devctl2 & 0xF {
+        0x0 => "50us-50ms(default)",
+        0x1 => "50us-100us(A)",
+        0x2 => "1ms-10ms(A)",
+        0x5 => "16ms-55ms(B)",
+        0x6 => "65ms-210ms(B)",
+        0x9 => "260ms-900ms(C)",
+        0xA => "1s-3.5s(C)",
+        0xD => "4s-13s(D)",
+        0xE => "17s-64s(D)",
+        _ => "reserved",
+    }
+}
+
+/// Decode Link Status [3:0], Current Link Speed (PCIe r3.0 §7.8.8).
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+fn bw_speed_str(lnksta: u16) -> &'static str {
+    match lnksta & 0xF {
+        0x1 => "2.5GT/s",
+        0x2 => "5.0GT/s",
+        0x3 => "8.0GT/s",
+        _ => "unknown",
+    }
+}
+
+/// BAR1WEDGE, boot half. Called from [`census`] with the root port's bdf, its PCIe capability offset
+/// (already bounded by `cap_fits(cap, PCIE_CAP_SPAN)`), its verified ECAM page and its AER offset.
+///
+/// CF8 reads and three CF8 W1C writes, on the BSP, inside `pci::init` — the same phase and the same
+/// accessors the `noaspm` leg uses. Each write carries ONLY the RW1C bits that were read as SET, so
+/// no bit this rung did not observe is ever written, and a register with nothing latched is not
+/// written at all.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+fn bw_arm(rb: u8, rs: u8, rf: u8, cap: u8, ecam: u64, aer: u16) {
+    debug_assert!(cap_fits(cap, PCIE_CAP_SPAN), "pcih: bw_arm cap out of region");
+    // PCI Express Capabilities Register (§7.8.2) [3:0] = Capability Version. Device Capabilities 2 /
+    // Device Control 2 exist only from version 2; on a version-1 capability `cap + 0x24` is whatever
+    // capability the device put there next, and reading it as DEVCAP2 would print a fiction.
+    let pciecap = unsafe { crate::arch::pci::read_config_16(rb, rs, rf, cap + 0x02) };
+    let capver = (pciecap & 0xF) as u8;
+    let v2 = capver >= 2 && cap_fits(cap, PCIE_CAP_SPAN_V2);
+    let (devcap2, devctl2) = if v2 {
+        unsafe {
+            (
+                crate::arch::pci::read_config_32(rb, rs, rf, cap + 0x24),
+                crate::arch::pci::read_config_16(rb, rs, rf, cap + 0x28),
+            )
+        }
+    } else {
+        (0u32, 0u16)
+    };
+    let (lnkctl, lnksta, devsta, secsta) = unsafe {
+        (
+            crate::arch::pci::read_config_16(rb, rs, rf, cap + 0x10),
+            crate::arch::pci::read_config_16(rb, rs, rf, cap + 0x12),
+            crate::arch::pci::read_config_16(rb, rs, rf, cap + 0x0A),
+            crate::arch::pci::read_config_16(rb, rs, rf, 0x1E),
+        )
+    };
+
+    serial_println!(
+        ":: BAR1WEDGE: rung=first-stall armed=UNAOS_BAR1WEDGE aperture={} rp={}:{}.{} capver={} \
+         v2={} baseline=lnksta={:04x}({} x{}) lnkctl={:04x}(aspm={}) devsta={:04x} secsta={:04x} \
+         devctl2={:04x} aer={} ::",
+        bw_aperture(),
+        rb,
+        rs,
+        rf,
+        capver,
+        v2 as u8,
+        lnksta,
+        bw_speed_str(lnksta),
+        (lnksta >> 4) & 0x3F,
+        lnkctl,
+        aspm_str(lnkctl),
+        devsta,
+        secsta,
+        devctl2,
+        if aer != 0 { "y" } else { "n" }
+    );
+
+    // The completion-timeout facts, printed once because they are boot-time constants. This is the
+    // number `PCIE-RP-RECOVERY.md` §3.2 needs to say whether a sacrificial endpoint probe returns,
+    // and §8.2 needs to say whether a core stalled on a non-posted read can ever be released.
+    if v2 {
+        serial_println!(
+            "[pcih] bar1wedge cto rp devcap2={:08x} ranges={:x} cto_dis_sup={} devctl2={:04x} \
+             value={} dis={} — the bound a non-posted read to a silent endpoint completes within",
+            devcap2,
+            devcap2 & 0xF,
+            (devcap2 >> 4) & 1,
+            devctl2,
+            bw_cto_str(devctl2),
+            (devctl2 >> 4) & 1
+        );
+    } else {
+        serial_println!(
+            "[pcih] bar1wedge cto rp UNREADABLE capver={} cap={:02x} — PCIe capability version < 2, \
+             or a {}-byte body would leave the 256-byte config region; no completion-timeout fact \
+             this boot",
+            capver, cap, PCIE_CAP_SPAN_V2
+        );
+    }
+
+    // The root port's AER pair at boot, when it has AER at all. On the Ivy Bridge PEG port of the
+    // bench machine the census has read `aer=n` on every boot since 8, so this is expected to be
+    // silent there — and that silence is the fact, recorded rather than inferred from a missing line.
+    if aer != 0 && ecam != 0 {
+        let (unc, cor) = unsafe { (ecam_read32(ecam, aer + 0x04), ecam_read32(ecam, aer + 0x10)) };
+        serial_println!(
+            "[pcih] bar1wedge aer-boot rp uesta={:08x} cesta={:08x}",
+            unc, cor
+        );
+    }
+
+    // ── The arm-time W1C clear ───────────────────────────────────────────────────────────────────
+    let ls_w1c = lnksta & LNKSTA_W1C;
+    let ds_w1c = devsta & DEVSTA_W1C;
+    let ss_w1c = secsta & SECSTA_W1C;
+    unsafe {
+        if ls_w1c != 0 {
+            crate::arch::pci::write_config_16(rb, rs, rf, cap + 0x12, ls_w1c);
+        }
+        if ds_w1c != 0 {
+            crate::arch::pci::write_config_16(rb, rs, rf, cap + 0x0A, ds_w1c);
+        }
+        if ss_w1c != 0 {
+            crate::arch::pci::write_config_16(rb, rs, rf, 0x1E, ss_w1c);
+        }
+    }
+    // Read back rather than assume: a latch that does not clear is itself a finding, and the
+    // baseline the sampler deltas against must be what the hardware says, never what was intended.
+    let (lnksta1, devsta1, secsta1) = unsafe {
+        (
+            crate::arch::pci::read_config_16(rb, rs, rf, cap + 0x12),
+            crate::arch::pci::read_config_16(rb, rs, rf, cap + 0x0A),
+            crate::arch::pci::read_config_16(rb, rs, rf, 0x1E),
+        )
+    };
+    serial_println!(
+        "[pcih] bar1wedge sticky-cleared at-arm lnksta {:04x}->{:04x} devsta {:04x}->{:04x} \
+         secsta {:04x}->{:04x} (w1c written {:04x}/{:04x}/{:04x}) — EHCI's later bus walk can still \
+         re-latch secsta; this narrows the window, it does not close it",
+        lnksta, lnksta1, devsta, devsta1, secsta, secsta1, ls_w1c, ds_w1c, ss_w1c
+    );
+
+    BW_LNKSTA0.store(lnksta1 as u32, Ordering::Relaxed);
+    BW_DEVSTA0.store(devsta1 as u32, Ordering::Relaxed);
+    BW_SECSTA0.store(secsta1 as u32, Ordering::Relaxed);
+    BW_LNKCTL0.store(lnkctl as u32, Ordering::Relaxed);
+    BW_DEVCTL2.store(if v2 { devctl2 as u32 } else { BW_NO_V2 }, Ordering::Relaxed);
+}
+
+/// BAR1WEDGE, wedge half. Called from [`rp_at_wedge`] on every tripwire crossing, with the three
+/// registers that function has already loaded — no register is read twice for this line.
+///
+/// READ ONLY, ROOT PORT ONLY, ECAM ONLY. It adds two loads to the crossing (the LNKCTL|LNKSTA dword
+/// for the control half, and Device Control 2 when the boot found it readable), takes no lock,
+/// allocates nothing, and branches on two relaxed atomics. The crossing is at most 1 Hz.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+fn bw_sample(ecam: u64, cap: u16, aer: u16, lnksta: u16, devsta: u16, secsta: u16) {
+    let n = BW_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+    let lnkctl = unsafe { (ecam_read32(ecam, cap + 0x10) & 0xFFFF) as u16 };
+    let d2 = BW_DEVCTL2.load(Ordering::Relaxed);
+    let devctl2 = if d2 == BW_NO_V2 {
+        None
+    } else {
+        Some(unsafe { (ecam_read32(ecam, cap + 0x28) & 0xFFFF) as u16 })
+    };
+    // Delta = bits SET NOW that the post-clear baseline did not carry. Zero means the latch has not
+    // moved since `pci::init`; nonzero names exactly which bits the interval added.
+    let d_lnksta = lnksta & !(BW_LNKSTA0.load(Ordering::Relaxed) as u16);
+    let d_devsta = devsta & !(BW_DEVSTA0.load(Ordering::Relaxed) as u16);
+    let d_secsta = secsta & !(BW_SECSTA0.load(Ordering::Relaxed) as u16);
+    let (unc, cor) = if aer != 0 {
+        unsafe { (ecam_read32(ecam, aer + 0x04), ecam_read32(ecam, aer + 0x10)) }
+    } else {
+        (0, 0)
+    };
+    serial_println!(
+        "[pcih] wedge-sample n={} first={} aperture={} lnksta={:04x} d_lnksta={:04x} ({} x{} \
+         training={} bwmgmt={} autobw={}) lnkctl={:04x} lnkctl0={:04x} aspm={} lnkdis={} retrain={} \
+         devsta={:04x} d_devsta={:04x} secsta={:04x} d_secsta={:04x} devctl2={:04x} cto={} dis={} \
+         aer={} uesta={:08x} cesta={:08x}",
+        n,
+        (n == 1) as u8,
+        bw_aperture(),
+        lnksta,
+        d_lnksta,
+        bw_speed_str(lnksta),
+        (lnksta >> 4) & 0x3F,
+        (lnksta >> 11) & 1,
+        (lnksta >> 14) & 1,
+        (lnksta >> 15) & 1,
+        lnkctl,
+        BW_LNKCTL0.load(Ordering::Relaxed) as u16,
+        aspm_str(lnkctl),
+        (lnkctl >> 4) & 1,
+        (lnkctl >> 5) & 1,
+        devsta,
+        d_devsta,
+        secsta,
+        d_secsta,
+        devctl2.unwrap_or(0),
+        match devctl2 {
+            Some(v) => bw_cto_str(v),
+            None => "unreadable",
+        },
+        match devctl2 {
+            Some(v) => ((v >> 4) & 1) as u8,
+            None => 0,
+        },
+        if aer != 0 { "y" } else { "n" },
+        unc,
+        cor
+    );
+}

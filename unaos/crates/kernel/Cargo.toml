@@ -56,6 +56,23 @@ nvidia-kepler = []
 # byte-identical. Kept in sync with arroyo AND builder/src/main.rs (the mapping this note used
 # to flag as an outstanding follow-up landed).
 noaspm = ["nvidia-kepler"]
+# PCIH / BAR1WEDGE: `UNAOS_BAR1WEDGE=1` — the FIRST-STALL register block for ledger A1
+# (drivers/gpu/pcihealth.rs, file tail; decode table in
+# docs/dev/OS/08_VIDEO/PCIE-RP-RECOVERY.md §11). It is the falsifier the never-flown BAR1 UC
+# experiment (`bar1exp-uc`, shut-out register §6 rung P5) needs to be scorable: a UC boot otherwise
+# yields one bit — wedge or no wedge — which the ~6.8x UC slowdown alone can explain. Arms three
+# things, all on the ROOT PORT and none on the endpoint: a boot baseline + the completion-timeout
+# decode (Device Capabilities/Control 2, PCIe r3.0 §7.8.15/§7.8.16) printed once; an ARM-TIME W1C
+# clear of the three sticky latches (LNKSTA[15:14] §7.8.8, DEVSTA[3:0] §7.8.5, Secondary Status
+# PCI-to-PCI r1.2 §3.2.5.7) so every later reading is a delta against a known zero — rung 1 of
+# PCIE-RP-RECOVERY §10's order of work; and one complete `[pcih] wedge-sample` line per tripwire
+# crossing carrying LNKCTL (which the existing sampler reads and discards), the deltas, and the
+# aperture memory type this build carries. The sampler half is READ-ONLY and keeps the module's two
+# refusals (root port only, ECAM only). The unconditional census + `rp-at-wedge` sampler ride EVERY
+# kepler boot regardless of this knob; the knob arms only what is new. Implies `nvidia-kepler` (it
+# runs at kepler init and from the kepler-gated tripwire call). x86_64 only in effect. DEFAULT OFF
+# => no statics, no clear, no new witness string. Kept in sync with arroyo AND builder/src/main.rs.
+bar1wedge = ["nvidia-kepler"]
 nvidia-kepler-takeover = []
 nvidia-kepler-fifo = []
 nvidia-kepler-kdisp-hold = []
