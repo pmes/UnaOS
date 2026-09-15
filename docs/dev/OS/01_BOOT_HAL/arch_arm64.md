@@ -3866,7 +3866,7 @@ missing/dir/past-EOF all honest (bench card `unaos/scripts/jd19-bench.md`).
 The platform-neutral software rasterizer (RAST-1) wired to the JD1 panel. With the `rast` knob
 armed, `tegra_early_stop` runs the spinning flat-shaded z-buffered cube demo through the **inherited
 scanout** — no mode-set, no scanout reprogramming — as the last panel content before CAPSTONE. The
-call is `tegra_rast_demo_maybe()` at the EL1 tail (post-drop, right before `run_capstone_boot_core`):
+call is `rast_demo_maybe()` at the EL1 tail (post-drop, right before `run_capstone_boot_core`):
 it builds a `Screen` over `video::WRITER` (seeded by JD1, mapped into both translation tables so the
 carveout is reachable at EL1), detaches fbcon's mirror, then calls the shared, arch-neutral
 `rast_demo::run()` — **call-never-edit** on the panel surface (the same present path RAST-1 proved on

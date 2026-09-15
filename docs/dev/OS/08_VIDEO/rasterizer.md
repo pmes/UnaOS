@@ -342,7 +342,7 @@ so the same code serves three panels; the wire-in differs per platform:
   witnesses the demo — `UNAOS_RAST=1 ./arroyo test-arm` prints the two `RAST:` lines
   on aarch64 (a smaller ramfb panel, e.g. 800×600, and a much higher fps).
 - **aarch64/tegra — the Jetson Orin Nano panel** (RAST-TEGRA): wired at the tail of
-  `tegra_early_stop` (`tegra_rast_demo_maybe`), post-drop at EL1, right before
+  `tegra_early_stop` (`rast_demo_maybe`), post-drop at EL1, right before
   `run_capstone_boot_core`. It draws the cube through the **JD1-inherited scanout**
   — no mode-set, no scanout reprogramming; it builds a `Screen` over `video::WRITER`
   (seeded by JD1, mapped into both translation tables so it is reachable at EL1) and
@@ -360,7 +360,7 @@ so the same code serves three panels; the wire-in differs per platform:
   numbers and perturbs `.rodata` even knob-off.
 
 - **aarch64/pi — the Raspberry Pi 4 / BCM2711 panel** (PI-RAST): wired at
-  `main.rs::pi_rast_demo_maybe`, called on the GUI-handoff `fbcon::detach()` line in
+  `main.rs::rast_demo_maybe`, called on the GUI-handoff `fbcon::detach()` line in
   `kernel_main`'s aarch64/baremetal block. Like tegra this is an **inherited scanout**
   — the panel is whatever the VideoCore firmware handed back through the mailbox
   (`mailbox::init_framebuffer` → `video::WRITER`); there is no mode-set, no scanout
@@ -420,7 +420,7 @@ platform-neutral.
   (`kernel/src/lib.rs:120-121`) and is deliberately **not** arch-gated, so
   x86/virt, aarch64/virt and aarch64/tegra all link the same code.
 - Call sites: the shared GUI path at `kernel/src/main.rs:1452`, and the Orin
-  terminus line at `main.rs:2459` → `tegra_rast_demo_maybe` (`main.rs:5102`).
+  terminus line at `main.rs:2459` → `rast_demo_maybe` (`main.rs:5102`).
 - `rast` is a workspace member (`unaos/Cargo.toml:10`) and appears in the
   curated feature sets for `x86-all`, `arm-pi` and `arm-tegra`
   (`unaos/arroyo:1591,1595,1600`).

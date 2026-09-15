@@ -3095,7 +3095,7 @@ conviction's capture, at an operator-attended arc boundary.
 `UNAOS_PIDESK=1 UNAOS_PIRAST=1 ./arroyo kernel8-test 300` (107/108, byte-identical across runs), was
 *not* in the reaper or in the fs code the fixture exercises — it was **where the reaper was spawned**.
 The `spawn_auto("orphan-reaper", …)` call lived in the panel-service block, which runs **after**
-`pi_rast_demo_maybe()`, while the whole EL0 fixture cascade (U11-reap included) is already running on
+`rast_demo_maybe()`, while the whole EL0 fixture cascade (U11-reap included) is already running on
 the APs. A teardown-orphaned chain queued by that fixture therefore waited on a service that did not
 exist yet, and U11-reap's bounded 5 s CHECKPOINT-3 poll passed only when the raster demo happened to
 finish inside it. The evidence is the log order: the reaper's `freed teardown-orphaned chain

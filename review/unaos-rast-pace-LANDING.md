@@ -36,7 +36,7 @@ honestly: a visible, platform-consistent spin.
 The change is confined to `rast_demo.rs`, which is `#[cfg(feature = "rast")]`-gated at
 `lib.rs:53` and fully unlinked knob-off. No edit to the `rast` crate, panel/`Screen`
 code, shared wiring, `arroyo`, or the knob. The tail-positioned tegra runner
-(`tegra_rast_demo_maybe`) and its same-line-as-terminus call site in `main.rs` are
+(`rast_demo_maybe`) and its same-line-as-terminus call site in `main.rs` are
 untouched, so no panic `Location` line shifts — knob-off byte-identity holds (proven
 below).
 
