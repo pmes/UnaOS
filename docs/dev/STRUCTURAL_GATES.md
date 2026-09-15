@@ -479,33 +479,41 @@ leading `@boot ` routes the check to `EFI/BOOT/BOOTX64.EFI` beside the artifact
 (`unaos_ivb` is a cross-crate boot-info ABI knob whose code is in the bootloader,
 not the kernel, and whose witness is therefore in the other binary).
 
-**WHAT IT FOUND ON ITS FIRST ARMED RUN, which is why the gate landed with one
-registered divergence.** `esp-x86` on the rmbp flight-7 knob line: 27 of 28
-banner features certified in the artifact, and `sdwrite` did not. It is a real
-banner lie, not a bad token. `arroyo:1992` appends `sdwrite` to `$_feats`
-unconditionally, so the banner names it on every verb — but the x86 MEDIA kernel
-is compiled by `builder/src/main.rs`, which composes its OWN feature list from env
-knobs and has no `sdwrite` entry. The same `esp-x86` log prints both lists and
-they differ by exactly that name: arroyo's `⚡ kernel features:` ends
-`…,gmux_igd,sdwrite` (28), the builder's own `   kernel features:` ends
-`…,gmux_igd,smolnet` (27). In the artifact, `SDWRITE-POSTURE` has 0 hits while
-`:: USBREG` — printed from the same `witness`-gated `unafsroot_selftest` — has 3,
-so the enclosing code is live and the feature simply is not compiled in. This is
-the `rastmc` defect that `builder/src/main.rs:136-143` already records in its own
-comment ("printed in the feature banner, `strings` on the ELF had no `RAST-MC` in
-it"), a second time, on a different knob — which is the argument for the gate
-rather than for a one-off grep.
+**WHAT IT FOUND ON ITS FIRST ARMED RUN, and fixed in the same arc.** `esp-x86` on
+the rmbp flight-7 knob line: 27 of 28 banner features certified in the artifact,
+and `sdwrite` did not. A real banner lie, not a bad token. `arroyo:1992` appends
+`sdwrite` to `$_feats` unconditionally, so the banner names it on every verb — but
+the x86 MEDIA kernel is compiled by `builder/src/main.rs`, which composes its OWN
+feature list from env knobs and had no `sdwrite` entry. The same `esp-x86` log
+printed both lists and they differed by exactly that name: arroyo's
+`⚡ kernel features:` ended `…,gmux_igd,sdwrite` (28), the builder's own
+`   kernel features:` ended `…,gmux_igd,smolnet` (27). In the artifact,
+`SDWRITE-POSTURE` had 0 hits while `:: USBREG` — printed from the same
+`witness`-gated `unafsroot_selftest` — had 3, so the enclosing code was live and
+the feature simply was not compiled in: every x86 media image cut since A60 landed
+shipped without it while the build log said otherwise. This is the `rastmc` defect
+that `builder/src/main.rs` already records in its own comment ("printed in the
+feature banner, `strings` on the ELF had no `RAST-MC` in it"), and the s42/INSTGUI
+and GMUX-IGD lesson, a third time — and the first one a gate found rather than a
+person. The ruling was that arroyo is right and `sdwrite` rides every image, so
+the builder gained
+`if std::env::var("UNAOS_NOSDWRITE").is_err() { feats.push("sdwrite"); }` beside
+its siblings and the cert reads 28/28. This is the argument for a standing gate
+rather than for a remembered grep: three occurrences, two found by hand years
+apart, the third found on the first run of the thing that looks every time.
 
-**Registered divergences, and why one exists on day one.** The fix is one line in
-`builder/src/main.rs` or in `arroyo`'s knob map, both owned elsewhere, so the gate
-carries a `bc_registered` table with exactly that row: the whole finding, the
-exact one-line fix, an owner, and the instruction to delete the row in the commit
-that fixes it. Such a row prints
+**Registered divergences, and why the table is empty.** A feature the banner names
+that the artifact provably does not carry, whose fix is owned elsewhere, can be
+entered in `bc_registered` with the whole finding, the exact fix and an owner. Such
+a row prints
 `-> MISSING (REGISTERED DIVERGENCE — not a finding, and it must reach zero)` with
 its reason, is counted on its own field of the summary, and does not red the
-build. An UNREGISTERED MISSING still reds. The shape is GATE-LEDGER's registered
+build; an UNREGISTERED MISSING still reds. The shape is GATE-LEDGER's registered
 field-count exception, verbatim, and it is held to the same standard: not a
-finding, not a pass, and it must reach zero.
+finding, not a pass, and it must reach zero. The table is EMPTY today and has been
+occupied exactly once — `sdwrite` sat in it for as long as it took to get the
+ruling above, then came out in the commit that fixed it. That round trip is the
+whole intended lifetime of a row: register, fix, delete.
 
 **Control.** Three separate ways a zero is kept distinguishable from a rotted
 pattern. (1) The OFF side: five features the flight line does not arm carry

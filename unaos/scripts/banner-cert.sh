@@ -25,11 +25,13 @@
 #                                  The banner is the claim under test; passing anything else makes
 #                                  the gate vacuous.
 #
-# WHAT IT FOUND ON ITS FIRST ARMED RUN (2026-09-15, rmbp flight-7 knob line, `esp-x86`): the x86
-# MEDIA path has this defect TODAY. `arroyo:1992` puts `sdwrite` on the banner unconditionally, and
-# `builder/src/main.rs` — which is what compiles the kernel the media actually boots — never reads
-# it. One `esp-x86` run prints both lists, and they differ by exactly that name. See the REGISTERED
-# DIVERGENCE table below; the fix is one line in a file this gate does not own.
+# WHAT IT FOUND ON ITS FIRST ARMED RUN (2026-09-15, rmbp flight-7 knob line, `esp-x86`), AND FIXED
+# IN THE SAME ARC: `arroyo:1992` put `sdwrite` on the banner of every verb while
+# `builder/src/main.rs` — which is what compiles the kernel the media actually boots — never read
+# it, so every x86 media image cut since A60 shipped without the feature the log claimed. One
+# `esp-x86` run printed both lists and they differed by exactly that name. Ruling: arroyo is right,
+# `sdwrite` rides every image; the builder gained the knob beside its siblings and the cert now
+# reads 28/28. The gate found it; nobody was looking.
 #
 # OUTPUT:  one line per feature — `feature=<f> witness=<token> hits=<n> -> OK|MISSING|...`
 # EXIT:    0 every named feature certified (registered divergences, below, do not red)
@@ -142,9 +144,17 @@ TABLE
 # already holds one known row open this way rather than deleting the check or the row. An
 # UNREGISTERED MISSING still reds, which is the point; this list is short on purpose, and a row
 # here is a debt with a name on it, not an exemption.
+#
+# IT IS EMPTY, AND IT HAS BEEN OCCUPIED ONCE. On this gate's first armed run (2026-09-15,
+# `esp-x86`, flight-7 knob line) `sdwrite` was a MISSING: arroyo named it on the banner of every
+# verb and `builder/src/main.rs`, which is what compiles the kernel the media boots, had no entry
+# for it. It was registered here for exactly as long as it took to get the ruling — arroyo is
+# right, `sdwrite` rides every image — and the builder gained
+# `if std::env::var("UNAOS_NOSDWRITE").is_err() { feats.push("sdwrite"); }` beside its siblings in
+# the same arc. The cert then read 28/28 with `SDWRITE-POSTURE` hits>0, and the row came out. That
+# round trip is the whole intended lifetime of a row here: register, fix, delete.
 bc_registered() {
 cat <<'REGISTERED'
-sdwrite|FOUND BY THIS GATE ON ITS FIRST ARMED RUN, 2026-09-15, and it is the defect this gate was written for. `arroyo:1992` appends `sdwrite` to `$_feats` UNCONDITIONALLY, so the `⚡ kernel features:` banner names it on every verb — but the x86 MEDIA kernel is compiled by `builder/src/main.rs`, which composes its OWN feature list from env knobs and has no `sdwrite` entry (`grep -c sdwrite builder/src/main.rs` = 0; that file's own comment at :136-143 records the same class of bug on `rastmc`: "printed in the feature banner, `strings` on the ELF had no `RAST-MC` in it"). MEASURED TWO WAYS in one log: (1) the media ELF carries `SDWRITE-POSTURE` 0 times while `:: USBREG`, printed from the SAME witness-gated `unafsroot_selftest`, appears 3 times — so the enclosing code is live and the feature is simply not compiled in; (2) `esp-x86` prints BOTH lists and they differ by exactly this name — arroyo's `⚡ kernel features:` ends `…,gmux_igd,sdwrite` and the builder's own `   kernel features:` ends `…,gmux_igd,smolnet`, 28 against 27. THE FIX IS ONE LINE AND IT IS NOT THIS FILE: either `builder/src/main.rs` gains `if std::env::var("UNAOS_NOSDWRITE").is_err() { feats.push("sdwrite"); }` beside its siblings, or `arroyo:1992` stops claiming `sdwrite` on the paths the builder owns. Both are knob-mapping lines with other owners. Owner: seat. Delete this row in the commit that fixes it.
 REGISTERED
 }
 

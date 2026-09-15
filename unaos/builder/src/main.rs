@@ -193,6 +193,25 @@ fn main() {
     // feature; the x86 image is the one `./arroyo test` boots and the one the rMBP bench boots.
     // Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_NOUSBLUN").is_ok() { feats.push("nousblun"); }
+    // SDWRITE (A60): the native root's write POSTURE — `fs/vfs.rs`'s `NativeBackend` write-veto
+    // forward and, under `witness`, leg 8 of the boot-path battery
+    // (`fs::bootdisk::sdwrite_posture_selftest`, which prints `:: SDWRITE-POSTURE: posture=…`).
+    // DEFAULT-ON, opted out with UNAOS_NOSDWRITE=1 — the same polarity `arroyo:1992` has carried
+    // unconditionally since the orin session, because `sdwrite` is meant to ride EVERY image.
+    //
+    // CAUGHT BY BANNERCERT (`scripts/banner-cert.sh`) ON ITS FIRST ARMED RUN, 2026-09-15: this is
+    // the rastmc failure named just above, and the s42/INSTGUI and GMUX-IGD lesson, a THIRD time —
+    // and the first one a gate found instead of a person. arroyo put `sdwrite` on the
+    // `⚡ kernel features:` banner of every verb; THIS list, the one the x86 kernel that actually
+    // boots is built from, had no entry for it. A single `esp-x86` run printed both lists and they
+    // differed by exactly this name (arroyo's ended `…,gmux_igd,sdwrite`, 28 names; this builder's
+    // own `   kernel features:` ended `…,gmux_igd,smolnet`, 27), and the staged ELF carried
+    // `SDWRITE-POSTURE` 0 times while `:: USBREG` — printed from the SAME `witness`-gated
+    // `unafsroot_selftest` — appeared 3 times, so the enclosing code was live and the feature simply
+    // was not compiled in. Every x86 media image cut since A60 landed shipped without it while the
+    // build log said otherwise. Kept in sync with arroyo's mapping; `esp-x86` now reds on exactly
+    // this class instead of announcing the media.
+    if std::env::var("UNAOS_NOSDWRITE").is_err() { feats.push("sdwrite"); }
     // WALK-QUIET (GR18): UNAOS_SMCWALK=1 restores the #KEY index walk's PER-NAME output. The walk and
     // its one-line summary are always-on under `smc`; this buys back the 493-line inventory dump that
     // Boot V measured at ~3.5 s of displaced storage bring-up. Does NOT imply `smc` — inert without
