@@ -496,14 +496,51 @@ a red on a loaded box; deleting the marker is not.
 ## GATE-BANNERCERT — the banner and the artifact must agree
 
 **Where this one runs, because it is the second exception to the header above.**
-Not in `check_both`: it asserts a property of a BUILT IMAGE, so it lives at the
-end of `esp_x86` in `unaos/arroyo`, after the builder has written
-`target/x86_64_esp/kernel.elf` and after GATE-RODATA, before the media is
-announced. `./arroyo check` cannot see it and is not asked to. It is wired on the
-x86 media path ONLY; `esp_arm`, `esp_jetson` and `kernel8` are three separate
-functions with three separate banner sites (`arroyo:6189` prints the jetson
-banner from its own `$_feats`, `arroyo:7852` prints the Pi banner from `K8_FEATS`)
-and are named in the arc report as unwired, for the seat.
+Not in `check_both`: it asserts a property of a BUILT IMAGE, so it lives inside
+the media verbs of `unaos/arroyo`, after the kernel has been written and before
+the media is announced. `./arroyo check` cannot see it and is not asked to.
+
+**ALL FOUR media verbs are wired** (BANNERCERT2, 2026-09-15 — the first three
+months of this gate's life were x86 only, which was the wrong way round, since
+the incident that created it was on the jetson path):
+
+| verb | artifact certified | banner list passed |
+|---|---|---|
+| `esp_x86` | `target/x86_64_esp/kernel.elf` (the staged ELF the firmware loads) | `${_feats%,}` |
+| `esp_arm` | `target/aarch64_esp/kernel.elf` | `$(arm_features)` |
+| `esp_jetson` | `target/aarch64_esp/kernel.elf` | `$(arm_features)` |
+| `kernel8` | `$KERNEL8_DIR/kernel8.img` (the FLAT binary) | `$K8_FEATS` |
+
+Three details in that table are load-bearing.
+
+*Which artifact on the Pi.* Both the ELF
+(`target/aarch64-base/release/unaos-kernel`) and the flat `kernel8.img` the
+`llvm-objcopy` produces from it are on disk. The ELF is the easier target and the
+WEAKER question: it carries non-allocatable sections — debug info, symbol and
+string tables — whose bytes the VideoCore ROM never loads, so a token found only
+there would certify a string that is not in the booted image. `-O binary` emits
+exactly the allocatable sections, which is exactly what the Pi executes, and
+`LC_ALL=C grep -a -o -F` reads a flat binary as happily as an ELF. The image is
+certified: same question, strictly stronger.
+
+*Which list is the claim on aarch64, and why it is not `$_feats`.* The aarch64
+kernel is compiled from `$(arm_features)`, not `$KERNEL_FEATURES` — that function
+STRIPS twenty x86-only names (`smolnet`, `kbdwit`, `sdhcblk`, `deadman`, the
+wifi/bt families, `gen7`, `noaspm` …) so aarch64 media stay byte-identical
+whether or not the x86 track armed them, and `build_kernel_aarch64` prints the
+stripped list as `⚡ aarch64 effective features:` exactly when it differs from the
+banner. That effective line is what an operator is told to read for an aarch64
+build, and it is what cargo was handed, so it is the claim under test. Feeding
+`$_feats` instead would red every aarch64 build on a documented, measured,
+byte-identity-enforced strip — a gate nobody would keep.
+
+*Why `esp_jetson` certifies INSIDE the function.* `esp_jetson_img` is a bare call
+to `esp_jetson`, the dispatcher accepts six spellings across the two jetson
+verbs, and the 2026-09-13 incident was precisely a second step rebuilding
+`kernel.elf` over the first one's. Certifying inside the function means every
+spelling and every caller gets the same verdict on the same bytes, and
+`jetson_card_image` can only ever copy an ELF that has already answered for its
+banner.
 
 **Invariant.** For every feature named on the `⚡ kernel features:` line of a
 build, the artifact that build produced contains that feature's CERTIFYING
@@ -538,12 +575,31 @@ the control rows, then a one-line summary. Tokens are cut at the first `{`
 because `format_args!` splits a format string into the literal pieces between its
 holes, and every token must be ≥ 9 bytes or LLVM immediate-encodes it out of
 `.rodata`; the script refuses to run at all (exit 2) if a shorter one is
-registered, so a broken row cannot read as a clean build. Two qualifiers exist: a
-leading `!` inverts a row (the token must be ABSENT when the feature is on, for
-the features whose only gated literal is the not-compiled-in message), and a
-leading `@boot ` routes the check to `EFI/BOOT/BOOTX64.EFI` beside the artifact
+registered, so a broken row cannot read as a clean build. Two TOKEN qualifiers
+exist: a leading `!` inverts a row (the token must be ABSENT when the feature is
+on, for the features whose only gated literal is the not-compiled-in message), and
+a leading `@boot ` routes the check to `EFI/BOOT/BOOTX64.EFI` beside the artifact
 (`unaos_ivb` is a cross-crate boot-info ABI knob whose code is in the bootloader,
 not the kernel, and whose witness is therefore in the other binary).
+
+`cond` — "what else must be true for this literal to exist at all" — gained two
+TERM forms in BANNERCERT2, each because a real row needed it, and both print
+UNVERIFIABLE (loud, named, never a pass and never a red) when unsatisfied:
+
+* `a+b` — an OR-GROUP. The shape of a module with two INDEPENDENTLY GATED
+  CALLERS. `ga10b_fw` is gated on `ga10bprobe5` alone, but its only callers are
+  `ga10b_ignite` (under `ga10bprobe5a`) and the QEMU fixture at `main.rs:1749`
+  (under `witness`); with neither compiled in the linker garbage-collects the
+  whole module and its `.rodata` with it. A feature can be in the cargo feature
+  set, compile, and still put NOTHING in the artifact because nothing calls it —
+  so a row's cond is seeded from the CALL SITES, not from the `pub mod` line.
+* `!a` — a NEGATED term: the literal exists only when `a` is OFF, because `a`
+  makes the code it lives in unreachable. `witness`'s token sits in
+  `kernel_main`'s post-GUI tail, and `main.rs:79` declares in its own `cfg_attr`
+  that `baremetal`, `bootlog`, `usbdebug` and `tegra` each make that tail
+  unreachable; the compiler is told so and deletes it. A `UNAOS_WITNESS=1
+  ./arroyo kernel8` image therefore carries the entire witness battery and cannot
+  carry that string. Copy the cond from the `cfg_attr`; do not guess it.
 
 **WHAT IT FOUND ON ITS FIRST ARMED RUN, and fixed in the same arc.** `esp-x86` on
 the rmbp flight-7 knob line: 27 of 28 banner features certified in the artifact,
@@ -568,7 +624,7 @@ its siblings and the cert reads 28/28. This is the argument for a standing gate
 rather than for a remembered grep: three occurrences, two found by hand years
 apart, the third found on the first run of the thing that looks every time.
 
-**Registered divergences, and why the table is empty.** A feature the banner names
+**Registered divergences, and why the table is empty again.** A feature the banner names
 that the artifact provably does not carry, whose fix is owned elsewhere, can be
 entered in `bc_registered` with the whole finding, the exact fix and an owner. Such
 a row prints
@@ -576,10 +632,34 @@ a row prints
 its reason, is counted on its own field of the summary, and does not red the
 build; an UNREGISTERED MISSING still reds. The shape is GATE-LEDGER's registered
 field-count exception, verbatim, and it is held to the same standard: not a
-finding, not a pass, and it must reach zero. The table is EMPTY today and has been
-occupied exactly once — `sdwrite` sat in it for as long as it took to get the
-ruling above, then came out in the commit that fixed it. That round trip is the
-whole intended lifetime of a row: register, fix, delete.
+finding, not a pass, and it must reach zero. `sdwrite` sat in it for exactly as
+long as it took to get the ruling above, then came out in the commit that fixed
+it — that round trip is the whole intended lifetime of a row: register, fix,
+delete.
+
+THE SECOND OCCUPANT, and it made the same round trip inside two commits.
+BANNERCERT2's first armed aarch64 run — `./arroyo esp-arm` with NO knobs, the most
+default build this tree has — found that **every aarch64 banner named `ehcihid`
+and no aarch64 artifact could carry one byte of it**. `drivers/mod.rs:9` gates the
+whole module `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`;
+`arroyo:337` appends the feature default-on; and `arm_features`, which strips
+x86-only names from the aarch64 cargo line precisely so aarch64 media stay
+byte-identical, stripped its own TWIN `kbdwit` and not the driver that twin
+instruments. Measured: the row token 0 hits AND
+`LC_ALL=C grep -a -o -F 'EHCI-HID'` 0 — an absent feature, not a rotted token.
+
+It was REGISTERED rather than fixed on the spot for one reason, and the reason is
+worth keeping because it is the only case where a strip is not free: every one of
+`arm_features`' other strips was added while its feature was OFF by default, so
+nothing observable moved. `ehcihid` is default-ON, so removing the name shifts
+cargo's `-Cmetadata` for the DEFAULT aarch64 build and re-hashes every Pi and Orin
+card cut after it. The executor put the finding, the exact one-line fix and the
+owner in the registry and asked. **The ruling (Peter, 2026-09-15): the recorded
+card shas are history in MANIFEST files, not a contract; a lie in the banner is.**
+`arm_features` gained `f="${f//,ehcihid,/,}"` beside the kbdwit strip, the
+registry row came out in the same commit, and the emitted CODE is unchanged — the
+module was never in an aarch64 image to begin with. Two occupants, two round
+trips, an empty table after each: register, fix, delete.
 
 **Control.** Three separate ways a zero is kept distinguishable from a rotted
 pattern. (1) The OFF side: five features the flight line does not arm carry
@@ -596,13 +676,23 @@ than being quietly absent from the table.
 **Seeding a row is a MEASUREMENT, not a reading.** Find a literal whose only
 occurrences sit under `#[cfg(feature = "<f>")]`, or inside a module whose
 `pub mod` is so gated, or under a feature `<f>` implies in `Cargo.toml`; cut it at
-the first `{`; then build media with the feature armed and prove hits > 0. The
-`state` column records which: `measured` rows were proven against an x86 artifact,
-`unmeasured-here` rows were read out of the source and await an artifact for their
-arch. 28 of the table's 44 token rows are `measured` (the whole rmbp flight-7 knob
-line); the 15 aarch64 rows (orin `tegra`/`tegrasmp`/`sdmmc`/`ga10bprobe5`, the Pi
-desktop line) are `unmeasured-here` and are inert until the aarch64 call sites are
-wired.
+the first `{`; then build media with the feature armed and prove hits > 0. Two
+further traps, both met and both now numbered steps of the script's recipe:
+NEVER seed from a literal a `const fn` consumes (`ga10bprobe5` was seeded on the
+64-hex-character vendor digest at `ga10b_fw.rs:75`, which is the argument to
+`const fn hx(s: &str) -> [u8; 32]` — only the 32 decoded bytes ever reach an
+image, so that row measured 0 on a build that carried the feature and would have
+measured 0 forever), and mind the two `cond` forms above, which exist because a
+feature can be compiled in and its literal still absent.
+
+The `state` column records what proved the row: `measured` (the 28 x86 rows, from
+the rmbp flight-7 artifact) or `measured(N)`, which also carries the HIT COUNT the
+proving artifact returned, so a later re-seed that changes the count is visible
+without rebuilding the old image. **The table is 48 rows: 47 measured, 1 NOWITNESS
+(`wedge2`), and NO `unmeasured-here` row left** — BANNERCERT2 measured every
+aarch64 row against a real artifact (`esp-arm` with no knobs; `esp-jetson` on the
+orin flight line from the newest staged MANIFEST, plus one `UNAOS_GA10B_PROBE5=1`
+run for the rung-5 pair; `kernel8` on LAWS §9's Pi desktop line of record).
 
 **Goes red when** the banner names a feature the artifact does not carry (MISSING,
 rc=1), the artifact carries a feature the banner never named (LEAK, rc=1), or the
@@ -734,6 +824,79 @@ the measurement behind it. The registry is not an allowlist to grow: its header
 says it must reach zero, and a row is legitimate only while the declaration
 carries a deliberate written decision about what the module's absence means. "It
 builds fine" is not a reason; the gate already knows it builds.
+## GATE-KNOBPARITY — the three feature vocabularies must agree
+
+**Where it runs.** Inside `check_both`'s kernel-cfg-coverage gate in
+`unaos/arroyo`, immediately after the existing `knob→builder wiring` probe and
+sharing that function's `return 1`. It is an EXTENSION of that probe, not a
+second stage, on purpose: both answer the same question about the same two files,
+and `check` should carry ONE knob-wiring verdict rather than two that can
+disagree about which is authoritative. The work itself is a script,
+`unaos/scripts/knob-parity.sh`, only so that it can be run — and gone red — by
+hand. It builds nothing; it reads three files.
+
+**Invariant.** Every feature name arroyo can append to `$_feats` with NO
+environment set (default-on: `[ -z "${UNAOS_NO…:-}" ]`, or unguarded) is pushed by
+`builder/src/main.rs`. Such a name is on the `⚡ kernel features:` banner of every
+x86 media verb by construction, and the builder's list is the only one that
+reaches the kernel an x86 media image boots, so a name in the first and not the
+second is a lie on every card cut from that tree.
+
+**Why a gate, and why the probe above could not be it.** The wiring probe parses
+ONE idiom — `[ -n "${UNAOS_X:-}" ] && _feats="${_feats}<names>,"` — and demands
+that every such knob whose feature a literal x86 cfg leg names be read by the
+builder. It caught `rastmc`. It could not catch `sdwrite`, and the reason is
+purely structural: `sdwrite` is not armed by a positive knob at all
+(`arroyo:2000` appends it default-on), so it never matched the `-n` pattern. It
+rode the banner of every verb and every x86 media image cut since A60 shipped
+without it. GATE-BANNERCERT found that on the ARTIFACT on its first armed run —
+but one artifact at a time, and only for a feature that was on that run's banner
+AND had a token row. This gate is the vocabulary half of the same answer: it
+compares the sets and answers for every name at once, with no build.
+
+**Mechanism.** Three sets, counted before anything is quantified:
+(a) every name arroyo can append to `$_feats`, with line numbers — both idioms,
+plus the `case`-arm appends (`ga10bprobe5a`), the `&& { … }` compound ones
+(`bsprun`) and `esp_jetson`'s in-function forcing; (b) every
+`feats.push("<name>")` in `builder/src/main.rs`; (c) every feature declared in
+`crates/kernel/Cargo.toml`'s `[features]`. It prints |a| |b| |c| and the three
+difference sets unfiltered, then reds on a\b restricted to the default-on subset
+of (a). At the fold: a=146 (5 default-on), b=82, c=185; a\b=64, a\c=0, b\c=0.
+
+**Why only that subset reds.** a\b at large is 64 names and is NOT a defect —
+most of arroyo's map is knob-gated and much of it is aarch64-only (`tegra`, the
+ga10b probes, the whole orin ladder), where the build invokes cargo directly and
+the builder is not in the path. Deciding which of those SHOULD be in the builder
+needs the cfg matrix, which is the wiring probe's job. The default-on subset needs
+no judgement: those names are on every x86 media banner with no env set at all.
+a\c and b\c should both be EMPTY; a non-empty one is a feature name Cargo does not
+declare, i.e. a path that has never been built.
+
+**Control.** Six control probes, each asserting a name this tree provably
+contains: `wc`, `sdwrite` and `tegra` in (a) (the last proves the in-function
+`esp_jetson` appends are seen), `smolnet` in the default-on SUBSET of (a) (the
+classifier, not the extractor), `wc` in (b), `witness` in (c). A miss exits **2**
+with no verdict, because a parser that broke reads exactly like a tree that is
+clean. `sdwrite` is deliberately NOT a control on the builder side — the go-red
+drill removes that very line and must produce a finding, not a broken gate.
+
+**Goes red when** a default-on arroyo name is not pushed by the builder (rc=1),
+or a control probe misses (rc=2). **GO-RED proof by mutation:** comment out
+`builder/src/main.rs`'s `feats.push("sdwrite")` line and the script prints
+`❌ knob-parity: sdwrite — default-on in arroyo (arroyo:2000,2009 …) and NOT
+pushed by builder/src/main.rs` and exits **1**; restored, `git diff` on that file
+is empty and it exits **0**. THE FIRST RUN OF THAT DRILL CAME BACK GREEN, and the
+reason is worth keeping: a plain `grep feats.push` matches the COMMENTED-OUT
+line. That is this gate's own failure mode seen from the inside — a name present
+in the file and compiled into nothing — so the extractor now truncates every line
+at its first `//` before matching, and a commented-out push reads as unwired,
+which is what it is.
+
+**Legitimate update.** A new default-on knob needs its builder line in the same
+commit. Widening (a)'s extractor is always safe. Narrowing the red — e.g.
+excluding a name because "it is aarch64-only" — costs the gate its whole point
+and must be argued for; the correct fix for an aarch64-only default-on name is
+that it should not be appended at top level in the first place.
 
 ---
 
