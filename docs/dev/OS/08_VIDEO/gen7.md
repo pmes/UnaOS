@@ -79,7 +79,7 @@ are off-limits and are not a source for anything in this ladder.
 | --- | --- | --- | --- |
 | R1 | `recon` | none | GT block dark; `GTFIFOCTL` the only structured read |
 | R2 | `wake` | 3 GT power-management regs, all reversed | `gt-still-dark` — **scored on an instrument since proved blind; a re-score is owed** (§2.2) |
-| R3 | `forcewake` | 1 forcewake request reg per candidate, released in-rung | acquires fly; the well does not open on the battery |
+| R3 | `forcewake` | 1 forcewake request reg per candidate, released in-rung | acquires fly; flight 4 read `gt-live-already by=none` with no ack decoded, and the battery that scored "does not open" is the instrument §2.2 records as blind — SHUTOUT-REGISTER §4 carries the reading |
 | R4 / R4b | `claim` | ≤3 GGTT PTEs, all restored | GGTT PTE round-trip **proven** |
 | R5 | `execute` | 2 GGTT PTEs + 4 RCS ring regs, all restored | `enable-void` — **failed under *no hold in force*, and R6 re-opened it by changing that one condition** (§2.5) |
 | R6 | `rearm` | as R5, **under a held wake**, + 1 GTT-flush reg | **`r6-sentinel-hit by=mt … attempts=1/3`** — flight 4, both boots |
@@ -603,14 +603,14 @@ witness is reachable. The honest gates are:
    A knob-gated change type-checked only knob-off is **not** gated: the armed run is required,
    and the banner must actually read `...,intel-ivb,unaos_ivb,gen7`.
 2. The x86-fat knob-off battery, proving the disarmed image is unchanged.
-3. **`strings` on the armed `esp-x86` artifact**, proving every verdict token is present in
+3. **`LC_ALL=C grep -a -o -F` on the armed `esp-x86` artifact (never `strings` — LAWS §5, counts moved 320→322)**, proving every verdict token is present in
    the shipped ELF — not merely compiled behind a `cfg`.
 4. **The R7 teardown-gate go-red** (§3.1) — for any change to the unmap/free gate, a
    demonstration that a non-idle engine cannot reach the page free, not an argument that it
    cannot.
 5. **Metal.** The falsifiers above.
 
-One deliberate `strings` exception: `r6-ring-addr-illegal` (and R5's identical
+One deliberate certification exception: `r6-ring-addr-illegal` (and R5's identical
 `ring-addr-illegal`) does not appear in the artifact, because `ring_gtt_addr` is a
 compile-time constant and rustc proves the branch dead. That is the `RING_BUFFER_START`
 bits[31:29] invariant being discharged **at compile time** — stronger than a runtime check,
