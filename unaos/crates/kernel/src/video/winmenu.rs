@@ -2518,3 +2518,163 @@ fn instgui_round(pw: usize, ph: usize) {
 fn instgui_round(_pw: usize, _ph: usize) {
     serial_println!(":: APPQUIT: app=instgui not compiled (x86_64 + UNAOS_WC + UNAOS_INSTGUI) — no dialog to quit :: SKIP ::");
 }
+
+// ---------------------------------------------------------------------------
+// SHOTMENU — SO2's TYPEFACE HALF, HELD OPEN ACROSS THE QMP SHOT
+// (TAIL-APPENDED: nothing above this line moved — PARITY.md §5.3)
+// ---------------------------------------------------------------------------
+
+/// SHOTMENU fixture — **the drop-down is on the glass WHEN THE CAMERA FIRES.**
+///
+/// ## Why a second menu fixture exists at all
+///
+/// [`selftest`] already proves SO2's PLACEMENT from the wire: leg 3 asserts `x == title-x` and
+/// `y == bar bottom`, and the `[winmenu] open … font=` token names the face. What it cannot prove is
+/// the half the SO2 ledger row still calls owed — *"the TYPEFACE half is still unproven on the glass
+/// — no capture has a drop-down open"* — because [`selftest`] DISMISSES the menu, closes its window
+/// and restores the bar before it returns. Every capture since render8 has therefore been taken over
+/// a desktop with no menu down, and `font=chrome20-bold` has been the only evidence there is.
+///
+/// This fixture is the camera's fixture. It opens the app menu through the SAME routed press
+/// [`selftest`]'s leg 2 uses and then **deliberately does not clean up**: no `dismiss`, no
+/// `wm::close`, no `focus_changed` back, no `set_enabled(saved)`. The menu is still down, over a
+/// still-enabled bar, owned by a still-focused window, when `qmp_shoot.py` dumps the framebuffer at
+/// `UNAOS_QMP_WAIT` (arroyo default `secs - 3`). That is the whole point and it is why this is a
+/// SEPARATE surface rather than a flag on [`selftest`]: a fixture that leaves state standing may
+/// never be one that other legs run after.
+///
+/// ## Where it sits, and why "last" had to be MEASURED rather than assumed
+///
+/// Called from the FOLDED closing brace of the x86 DEMO CHAIN in `arch/x86_64/syscall.rs` — after
+/// `zeolite_launcher`, the tenth and final launcher — and NOT from the witness ladder's tail.
+///
+/// The first cut of this fixture did sit at the ladder's tail, folded after
+/// `dock::apppin_selftest()`, on the reasoning that APPPIN is the last fixture that moves focus. The
+/// capture came back EMPTY, and the wire said why: `:: SHOTMENU: … aligned=true :: PASS ::` and then,
+/// fourteen lines later, `[winmenu] dismiss reason=app-owner-change kind=app owner=1`.
+/// `winx_launcher` — which hosts the whole witness ladder — is only the FIRST of ten launchers on
+/// that task, and the eight ring-3 demos chained after it (`winx2`, `winx3`, `winx7`, `winx8`,
+/// `pulsew`, `sock2`..`sock4`, `zeolite`) each spawn windows that take focus. An app-owner change
+/// dismisses an open dropdown on the next composite (see [`app_window_changed`]), so the ladder's
+/// tail is not late enough; only the chain's tail is.
+///
+/// Waiting at the ladder's tail until the chain settled was the other candidate and is WRONG: those
+/// nine launchers run on this same task, so a wait there starves the very work it waits for.
+///
+/// The boot's last focus-moving event is the final `[dock] tile remove … reason=close` of the ring-3
+/// sweep, which lands before `zeolite_launcher` prints. From this statement to the camera the desktop
+/// is quiescent and the menu stays down.
+///
+/// ## The app name is the measurement
+///
+/// The window is titled `Glass`, so that string is painted TWICE by two different files from two
+/// different models: once as the bar's caption (`menubar::compose_row`, at `text_x(0)`) and once
+/// inside the drop-down's `About Glass` row ([`compose_item_row`], `FLAG_APPNAME`). Same face, same
+/// weight, same cell => byte-identical ink coverage for the same character. The witness prints the
+/// panel-absolute origin of BOTH blocks and the cell metrics, so the PNG scorer reads pixels at
+/// stated coordinates instead of hunting for glyphs:
+///
+/// ```text
+/// [winmenu] drop x=40 title_x=40 y=34 bar_h=34 font=chrome20-bold -> ALIGNED
+/// [winmenu] shotmenu name=Glass cell=7x13 bar_glyph=(40,10) menu_glyph=(61,43) ::
+/// ```
+///
+/// `-> OFF(dx=..,dy=..)` is the go-red shape: revert the `text_x` anchor in [`layout_open_rect`] to
+/// the press box (`s.x[k]`) and `dx` reads `TPAD`.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+pub fn shotmenu_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // `selftest`'s fixture surface, same shape and the same extent contract (`w * 4 <= stride`,
+    // `h * stride <= len`). Opaque mid-slate so the 8x8 row is findable on the capture if anyone
+    // ever wants to confirm which window owned the bar.
+    static SURF: [u32; 64] = [0x0033_3355; 64];
+    const FIX_W: usize = 8;
+    const FIX_STRIDE: usize = 32;
+    const _: () = assert!(FIX_W * 4 <= FIX_STRIDE && FIX_W * FIX_STRIDE <= 64 * 4);
+    let (pw, ph) = panel();
+    if pw == 0 || ph == 0 {
+        serial_println!(":: SHOTMENU: no panel :: SKIP ::");
+        return;
+    }
+    menubar::set_enabled(true);
+    // Kernel furniture band, one past `selftest`'s `0x51`.
+    const OWNER: u64 = wm::KERNEL_OWNER_BASE + 0x52;
+    let win = wm::create(
+        OWNER,
+        SURF.as_ptr() as usize,
+        core::mem::size_of_val(&SURF),
+        FIX_W as u32,
+        FIX_W as u32,
+        FIX_STRIDE as u32,
+        b"Glass",
+    );
+    if win == wm::WIN_NONE {
+        serial_println!(":: SHOTMENU: wm::create declined (table full) :: SKIP ::");
+        return;
+    }
+    // FOCUS then composite, for `selftest` leg 1's reason: the bar names the FOCUSED window from its
+    // own `dock_scan` every pass, so a forced caption would survive exactly one composite.
+    wm::focus_changed(OWNER);
+    wm::composite();
+    let s = bar_boxes(pw, ph);
+    let named = s.app && s.app_owner == win && s.n >= 1 && s.label_of(0) == b"Glass";
+
+    // The ROUTED press, at the app box's centre — `strip::press_route`, the one shared furniture
+    // router both arch click paths call, never `press_at` directly.
+    let (_bx, by, _bw, bh) = s.bar;
+    let px = (s.x[0] + s.w[0] / 2) as i32;
+    let py = (by + bh / 2) as i32;
+    let consumed = strip::press_route(px, py);
+    // A second composite so the drop-down's pixels are ON the panel before this returns; the camera
+    // fires tens of seconds later, but a fixture that left the paint owed would be lying about what
+    // it proved.
+    wm::composite();
+
+    let title_x = s.text_x(0);
+    let bar_bottom = by + bh;
+    let r = open_rect(pw, ph);
+    let (mx, my, mw, mh) = r.unwrap_or((0, 0, 0, 0));
+    // The right-edge clamp is the one legitimate way `x` may differ from `title_x`, so it is named
+    // rather than tolerated — exactly as `selftest`'s leg 3 names it.
+    let clamped = r.is_some() && mx + mw == pw && title_x + mw > pw;
+    let dx = mx as i64 - title_x as i64;
+    let dy = my as i64 - bar_bottom as i64;
+    let aligned = r.is_some() && (dx == 0 || clamped) && dy == 0;
+
+    // The two blocks the PNG scorer compares, panel-absolute, from the SAME expressions the painters
+    // use: the bar's caption band is `(bh - CELL_H) / 2` (`menubar::compose_row`'s `ty0`, handed to
+    // `draw_bar_row` so the two baselines cannot drift), and the row's band is `(ITEM_H - CELL_H) / 2`
+    // past `item_top` (`compose_item_row`'s `vpad`/`gtop`).
+    let bar_gx = title_x;
+    let bar_gy = by + (bh - CELL_H) / 2;
+    // `About` is 5 glyphs and the painter puts the name one cell past it.
+    let menu_gx = mx + BORDER + PADX + CHECK_GLYPHS * CELL_W + 6 * CELL_W;
+    let menu_gy = my + item_top(APP_MENU_DEFAULT, 0) + (ITEM_H - CELL_H) / 2;
+
+    serial_println!(
+        "[winmenu] drop x={} title_x={} y={} bar_h={} font={} -> {}",
+        mx, title_x, my, bh, menubar::BAR_FONT_NAME,
+        if aligned { "ALIGNED" } else { "OFF" }
+    );
+    if !aligned {
+        serial_println!("[winmenu] drop OFF(dx={},dy={}) clamped={}", dx, dy, clamped);
+    }
+    serial_println!(
+        "[winmenu] shotmenu name=Glass cell={}x{} bar_glyph=({},{}) menu_glyph=({},{}) \
+         drop={}x{}+{}+{} ::",
+        CELL_W, CELL_H, bar_gx, bar_gy, menu_gx, menu_gy, mw, mh, mx, my
+    );
+    let ok = named && consumed && is_open() && r.is_some() && aligned;
+    serial_println!(
+        ":: SHOTMENU: win={} named={} routed_open={} held=true aligned={} dx={} dy={} \
+         font={} panel={}x{} :: {} ::",
+        win, named, consumed && is_open(), aligned, dx, dy,
+        menubar::BAR_FONT_NAME, pw, ph,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    // NO dismiss. NO wm::close. NO focus restore. NO set_enabled(saved). The menu is HELD DOWN for
+    // the camera — that is this fixture's entire contract and the reason it is last.
+}
