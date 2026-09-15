@@ -1115,9 +1115,28 @@ fn main() {
     // decodes X/Y/buttons to pal::Event::MouseAbsolute. Default: tablet stays on xHCI (the xHCI HID
     // tests keep their pointer). Only meaningful with the driver active (ignored under NOEHCIHID).
     let ehci_tablet = ehcihid && std::env::var("UNAOS_EHCITABLET").is_ok();
+    // XHCIHUB (rmbp 2026-09-15, LEDGER S1/S2): UNAOS_XHCIHUB=1 MOVES the xHCI pointer behind a
+    // `usb-hub` on a root port instead of attaching it to the root port directly — the QEMU
+    // reproduction of the two hub defects the Orin bench carries: the hub's interrupt-IN
+    // status-change endpoint failing Configure-Endpoint (S1), and a hub-attached pointer whose
+    // `MOUSE-1` witness prints `vid:pid=0000:0000` (S2). It MOVES rather than ADDS because two
+    // pointers would leave which one QMP `input-send-event` reaches to QEMU's routing — the same
+    // "one keyboard, never two" reasoning as the XHCIKBD block above, and the fixture's whole point
+    // is that the pointer under test is the HUB-DOWNSTREAM one. The keyboard is NOT moved: it keeps
+    // its default EHCI bus so `[hidkeys]` measures exactly what it measured before.
+    // Port 4 is chosen explicitly: qemu-xhci's default `p2=4` puts USB2 ports at 1..4 (QEMU's only
+    // hub model is FULL-SPEED, so it must land on a USB2 port), the auto-assigned devices above take
+    // the lowest free ports, and UNAOS_HUBSTORAGE's hub already claims port 1 — so port 4 cannot
+    // collide with either. NOTE: `is_ok()` — an EMPTY value is ON, like every other knob here.
+    // UNSET => not one argument changes and the QEMU command line is byte-identical.
+    let xhcihub = !ehci_tablet && std::env::var("UNAOS_XHCIHUB").is_ok();
     if ehci_tablet {
         cmd.arg("-device").arg("usb-tablet,bus=ehci.0");
         println!("   UNAOS_EHCITABLET: usb-tablet on the EHCI bus — EHCI-4 M2 report-pointer path target");
+    } else if xhcihub {
+        cmd.arg("-device").arg("usb-hub,bus=xhci.0,port=4,id=hubh")
+           .arg("-device").arg("usb-tablet,bus=xhci.0,port=4.1");
+        println!("   UNAOS_XHCIHUB: usb-hub on xHCI root port 4 with the usb-tablet behind it (port 4.1) — XHCIHUB hub status-change + hub-downstream pointer fixture");
     } else {
         cmd.arg("-device").arg("usb-tablet,bus=xhci.0");
     }
