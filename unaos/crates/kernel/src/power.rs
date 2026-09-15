@@ -39,7 +39,7 @@
 // verb's own announce can die with it.
 //
 // RBTDRAIN (rmbp-ledger A3, same doc section): PWRDRAIN is only the FIRST of TWO buffers on the 2012
-// rMBP. `power_drain` ends in `serial::_print`, whose x86 sinks are the 16550 at 0x3F8 — which this
+// rMBP. `power_drain` writes `_print`'s SINK SET through `serial_ring::sink_write` (SINKDRAIN 091a11a6) —
 // laptop does not have — and the FTDI MIRROR RING, and that ring reaches the cable only when the xHCI
 // device-service pass runs. A power verb is a context with no next pass, so on the rMBP the staged
 // lines arrived one buffer short of a human and the whole reboot ladder died there. Every x86 verb
@@ -180,7 +180,7 @@ fn platform_reboot() -> ! {
     // witness, so a capture could not tell a flushed ring from a ring that was never reached. The
     // count goes on the wire here; the second drain downstream then finds the ring empty.
     crate::serial_ring::power_drain("pwrreboot");
-    // RBTDRAIN (rmbp-ledger A3): the drain above ends in `serial::_print`, and on THIS laptop
+    // RBTDRAIN (rmbp-ledger A3): the drain above writes `_print`'s sink set via `sink_write` (SINKDRAIN), not `_print` itself, and on THIS laptop
     // `_print`'s x86 sinks are a 16550 that does not exist and the FTDI MIRROR RING. So everything
     // flushed a line ago is now one buffer from the cable and no closer to a human: the ring reaches
     // the wire only when the xHCI device-service pass runs, and past this point there is no next
