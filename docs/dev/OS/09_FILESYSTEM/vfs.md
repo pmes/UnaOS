@@ -891,10 +891,20 @@ is a claim about the CARD and not about one mount's in-RAM tree. One uncounted
 mutation: delete the emptiness test in `UnaFS::rmdir` and the non-empty leg succeeds, which reds the
 line and (via mbench's default `-> FAIL` forbid) the leg.
 
-**What §13.7's transcript must become.** `vfsroute.rmdir` asserts `-ENOTSUP` against a FILE target
-(`/VFSR1.TXT`) and therefore now reads `-ENOTDIR` and reds. The leg's CLAIM has to change with the
-capability: it is no longer a capability refusal to assert, it is the typed per-kind refusal. That
-edit is in `shell.rs` and is the one file this arc did not touch — see the arc's report.
+**What §13.7's transcript became.** `vfsroute.rmdir` asserted `-ENOTSUP` against a FILE target
+(`/VFSR1.TXT`) and called it the CAPABILITY proof. That answer no longer exists anywhere, so the
+leg's CLAIM moved with the capability: it now requires `-ENOTDIR` and the name still listed. The
+ROUTING half it was really carrying is untouched and still two-sided — a `rmdir` riding `fat.rs`
+would not find `VFSR1.TXT` on the boot partition at all and would say `-ENOENT`, so `-ENOTDIR` can
+only have come from the volume that owns the path.
+
+The transcript's own residual — *"there is no positive native `mkdir` transcript, and there cannot be
+one until the crate can remove a directory"* — is CLOSED, and the doc comments in `shell.rs` that
+stated it (`fs_rmdir`, the RELICS `mkdir` leg, `vfsroute_native_witness`) say so. The legs there are
+deliberately left non-mutating: each is two-sided as written and its subject is routing, while the
+positive `mkdir`+`rmdir` pair is carried on the wire by `rmdir_unafs_witness`, which creates,
+refuses, removes and re-reads across a genuine remount. Folding a positive pair into the VFSROUTE
+transcript as well is a queue row, not a one-line edit.
 
 
 ## 14. BOOTROOT (orin 22) — what `/` IS, and why the kernel is not told

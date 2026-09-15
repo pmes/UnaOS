@@ -616,11 +616,14 @@ fn fs_mkdir(console: &mut Console, arg: &str) {
 /// JD7 `rmdir`: remove an EMPTY directory. The root is refused locally (`-EBUSY` — it is unnameable
 /// on every volume); a file target is `-ENOTDIR`; a non-empty directory is `-ENOTEMPTY`.
 ///
-/// **This is the verb that shows the rule working.** The native UnaFS backend implements no
-/// `remove_dir` (the crate has none), so `rmdir /SOMEDIR` on the native volume prints
-/// `-ENOTSUP` — the volume's own honest answer. Before VFSROUTE the verb was FAT-direct on both
+/// **This is the verb that shows the rule working.** Before VFSROUTE it was FAT-direct on both
 /// arches, so the same keystroke walked the FAT boot partition looking for a name that lives on a
-/// different volume: at best `-ENOENT`, at worst a directory removed off the wrong card.
+/// different volume: at best `-ENOENT`, at worst a directory removed off the wrong card. VFSROUTE
+/// routed it to the volume that owns the path, where the native UnaFS backend could only answer
+/// `-ENOTSUP` — honest, and a capability that was simply absent (LEDGER SO18). RMDIR closed it:
+/// `UnaFS::rmdir` is the crate primitive and `NativeBackend::remove_dir` the trait method over it,
+/// so `rmdir /SOMEDIR` now REMOVES an empty directory on the native volume and every refusal above
+/// is a fact about the OBJECT (`-ENOTDIR` / `-ENOTEMPTY` / `-EACCES`), never about the volume.
 fn fs_rmdir(console: &mut Console, arg: &str) {
     use crate::fs::vfs::VfsError;
     let Some((mt, path)) = vfs_write_open(console, "rmdir", arg) else { return };
@@ -3320,18 +3323,23 @@ fn shell_relics_witness() {
 /// the bit, so the fixtures' self-clean discipline stays protected."* Every file this transcript
 /// creates is deleted before it returns.
 ///
-/// A DIRECTORY cannot be. The UnaFS crate has no directory removal at all (`unlink` returns
-/// `IsADirectory` unconditionally; ROADMAP §F2's own scope note: *"the crate has no `rmdir`"*), so a
-/// leg that created `/RELICD` would leave it there — invisible in QEMU, where the card is re-staged
-/// every run, and a permanent K3-mount red on any metal Pi from its second boot onward. So the
-/// `mkdir` leg proves the ROUTING without mutating: it aims `mkdir` at a name that exists ONLY on
-/// the native volume (the file the `write` leg just made) and requires the refusal to be the NATIVE
-/// crate's `FileExists`. A `mkdir` still riding fat.rs would not find that name on the FAT boot
-/// partition at all — it would CREATE a directory and report success — so the leg is two-sided
-/// against exactly the failure it exists to catch. **Residual, stated rather than hidden:** there is
-/// no POSITIVE native `mkdir` transcript, and there cannot be one until the crate can remove a
-/// directory. What carries the positive half meanwhile is `touch`/`write`, which reach the volume
-/// through the same `unafs_split` + `resolve_path(parent)` + create-in-parent path.
+/// A DIRECTORY could not be, when this leg was written: the UnaFS crate had no directory removal at
+/// all (`unlink` returned `IsADirectory` unconditionally; ROADMAP §F2's own scope note: *"the crate
+/// has no `rmdir`"*), so a leg that created `/RELICD` would leave it there — invisible in QEMU,
+/// where the card is re-staged every run, and a permanent K3-mount red on any metal Pi from its
+/// second boot onward. So the `mkdir` leg proves the ROUTING without mutating: it aims `mkdir` at a
+/// name that exists ONLY on the native volume (the file the `write` leg just made) and requires the
+/// refusal to be the NATIVE crate's `FileExists`. A `mkdir` still riding fat.rs would not find that
+/// name on the FAT boot partition at all — it would CREATE a directory and report success — so the
+/// leg is two-sided against exactly the failure it exists to catch.
+///
+/// **The residual this paragraph used to state is CLOSED (RMDIR, LEDGER SO18).** The crate has a
+/// `rmdir` and `NativeBackend` implements `remove_dir`, so a created directory can be cleaned up and
+/// a positive native `mkdir` transcript is now possible. This leg is left non-mutating on purpose —
+/// its subject is the routing refusal and it is two-sided as written; the positive `mkdir`+`rmdir`
+/// pair is carried on the wire by `fs/vfs.rs`'s `rmdir_unafs_witness`
+/// (`:: RMDIR-UNAFS: … -> PASS ::`), which creates, refuses, removes and re-reads across a genuine
+/// remount.
 ///
 /// Runs after `emmc2::probe()` at the aarch64 `midden_witness` call site, so the volume is mounted —
 /// unlike the x86 call site, which is why the native half is gated to this arch and this feature.
@@ -4548,13 +4556,18 @@ pub fn vfs_aclsym_witness() {
 ///
 /// `fs/unafs.rs`'s `k3_mount_selftest` bit5 requires the native root to hold the staged fixtures and
 /// `acl-*` rows and NOTHING ELSE. Every file this transcript creates is deleted before it returns; a
-/// DIRECTORY cannot be, because the UnaFS crate has no directory removal at all. So there is no
-/// positive `mkdir` leg here — instead `mkdir` is aimed at the file `touch` just made and must be
-/// refused `-EEXIST`, which is a ROUTING proof (a `mkdir` still riding fat.rs would not find that
-/// name on the boot partition and would create a directory and report success), and `rmdir` is aimed
-/// at the same name and must be refused `-ENOTSUP`, which is the CAPABILITY proof: the native
-/// backend implements no directory removal, so the verb prints the volume's own answer instead of
-/// falling through to the FAT walker — the exact silent fallback this arc deletes.
+/// DIRECTORY could not be, when these legs were written, because the UnaFS crate had no directory
+/// removal at all. So there is no positive `mkdir` leg here — instead `mkdir` is aimed at the file
+/// `touch` just made and must be refused `-EEXIST`, which is a ROUTING proof (a `mkdir` still riding
+/// fat.rs would not find that name on the boot partition and would create a directory and report
+/// success), and `rmdir` is aimed at the same name and must be refused because of that name's KIND.
+///
+/// **RMDIR (LEDGER SO18) changed what leg 3 asserts, and the change is the arc working.** The crate
+/// has a `rmdir` and `NativeBackend` implements `remove_dir`, so the `-ENOTSUP` capability refusal
+/// this leg used to require no longer exists anywhere: the verb resolves the name, authorizes it,
+/// sees a FILE and says `-ENOTDIR`. The leg still carries its routing claim two-sidedly (a FAT-direct
+/// `rmdir` would answer `-ENOENT` about the boot partition), and the POSITIVE `mkdir`+`rmdir` pair
+/// this transcript could never hold is carried on the wire by `fs/vfs.rs`'s `rmdir_unafs_witness`.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal", feature = "witness"))]
 fn vfsroute_native_witness() {
     fn verdict(name: &str, ok: bool, got: &str) {
@@ -4586,13 +4599,19 @@ fn vfsroute_native_witness() {
     verdict("vfsroute.mkdir", eexist && still_file,
         &alloc::format!("said={} eexist={} still_file={}", said, eexist, still_file));
 
-    // 3. `rmdir`: the CAPABILITY refusal — the native backend implements no directory removal, so
-    //    the verb prints `-ENOTSUP` and nothing anywhere is removed.
+    // 3. `rmdir` aimed at a FILE: the PER-KIND refusal, and nothing anywhere is removed.
+    //
+    //    This leg used to require `-ENOTSUP` and call it the CAPABILITY proof. RMDIR (LEDGER SO18)
+    //    shipped the capability, so that answer no longer exists and the claim had to move with it:
+    //    `NativeBackend::remove_dir` now resolves the name, authorizes it, sees a FILE and answers
+    //    `NotADirectory`. The ROUTING half the leg was really carrying is intact and is still
+    //    two-sided — a `rmdir` riding fat.rs would not find `VFSR1.TXT` on the boot partition at all
+    //    and would say `-ENOENT`, so `-ENOTDIR` can only come from the volume that owns the path.
     let said = say(&|c: &mut Console| fs_rmdir(c, F));
-    let enotsup = said.contains("-ENOTSUP");
+    let enotdir = said.contains("-ENOTDIR");
     let untouched = listed("VFSR1.TXT");
-    verdict("vfsroute.rmdir", enotsup && untouched,
-        &alloc::format!("said={} enotsup={} untouched={}", said, enotsup, untouched));
+    verdict("vfsroute.rmdir", enotdir && untouched,
+        &alloc::format!("said={} enotdir={} untouched={}", said, enotdir, untouched));
 
     // 4. `rm`, and the SELF-CLEAN — asserted, not assumed (bit5 fails on a leaked fixture).
     let said = say(&|c: &mut Console| fs_rm(c, F, false));
