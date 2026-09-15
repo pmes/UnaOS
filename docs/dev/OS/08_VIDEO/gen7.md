@@ -66,6 +66,10 @@ are off-limits and are not a source for anything in this ladder.
 
 ## 2. Ladder state, R1 through R7
 
+> **Metal verdicts live in [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) §4 (R19/B10), which
+> supersedes the `pending metal` cells below and §2.7's "held dark": R6 and R7 both flew and
+> **passed** on flight 4 (`docs/dev/evidence/rmbp8/FLIGHT4-POSTMORTEM.md` §3.1).**
+
 | Rung | Name | Writes | Metal verdict |
 | --- | --- | --- | --- |
 | R1 | `recon` | none | GT block dark; `GTFIFOCTL` the only structured read |
