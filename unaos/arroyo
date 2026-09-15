@@ -5851,6 +5851,19 @@ esp_x86() {
     # itself), so the .rodata gate runs here too — on the STAGED image, which is the ELF the
     # firmware actually loads. A gate that only covers the QEMU path is not a gate on the boot media.
     gate_x86_rodata_no_code "${WORKSPACE_DIR}/target/x86_64_esp/kernel.elf"
+    # BANNERCERT — the banner this run printed is now a CLAIM the artifact has to answer for.
+    # `$_feats` is the very string the `⚡ kernel features:` line was composed from at script load
+    # (top of file), so this asks the produced ELF whether it carries a certifying string for each
+    # feature that line named, and whether it carries a control string for a few it did NOT name.
+    # It runs HERE, after the builder has written the staged kernel.elf and before the media is
+    # announced, so a lying banner reds `esp-x86` instead of shipping a card that boots and prints
+    # nothing. THE INCIDENT: arroyo:1147's metal gate once keyed on one of six spellings of the
+    # jetson verb, five spellings built a feature set the banner did not describe, and neither
+    # `./arroyo check` nor the banner nor the diff could see it — only `LC_ALL=C grep -a -o -F` on
+    # the artifact could (docs/dev/QUEUE.md §5, 2026-09-13; LAWS §5). Exit 1 = MISSING or LEAK,
+    # exit 2 = NO VERDICT (a banner feature with no row in the table); both stop the verb.
+    bash "${WORKSPACE_DIR}/scripts/banner-cert.sh" \
+         "${WORKSPACE_DIR}/target/x86_64_esp/kernel.elf" "${_feats%,}" || exit $?
     pack_source_along "${WORKSPACE_DIR}/target/x86_64_esp"
     echo -e "${COLOR_GREEN}✅ x86 ESP: ${WORKSPACE_DIR}/target/x86_64_esp/ (incl. HELLO.BIN for the U2 loader)${COLOR_RESET}"
     local _kelf="${WORKSPACE_DIR}/target/x86_64_esp/kernel.elf"
@@ -8504,7 +8517,7 @@ battery() {
         # otherwise red a perfectly good build. These steps already carry the verdict that matters —
         # their command's own exit status, which `check` and `esp-jetson` set correctly.
         local faultscan=1
-        if [ "$1" = "--build" ]; then faultscan=0; shift; fi
+        if [ "$1" = "--build" ]; then faultscan=0; shift; fi   # BANNERCERT alias sweep (QUEUE §5 item (a), measured 2026-09-15 at 9a7b09a4): `grep -n -E '"\$\{1:-\}" = |"\$1" = ' unaos/arroyo` returns exactly TWO lines — :1147, which is the ⚠ PROSE quoting the defect that was already fixed there (the live gate beside it is a `case` over all six jetson spellings), and THIS line, a function-local argument test on `battery`'s own `$1`, not a verb gate at all. So no single-spelling VERB gate survives in this file; the remaining exposure is not "another `= "verb"` somewhere" but a feature armed with no witness in the artifact, which is what scripts/banner-cert.sh now answers.
         local name="$1" pattern="$2" logf="${3%%:*}" vf="${3#*:}"; shift 3
         echo -e "${COLOR_CYAN}⚡ battery: ${name}${COLOR_RESET}"
         if "$@" > "$logf" 2>&1; then local crc=0; else local crc=$?; fi
