@@ -445,19 +445,37 @@ declared last leg of `witness_battery` and the obvious candidate for a tail
 assertion, is the wrong line to assert: present @1887 under `UNAOS_WC=1`, ABSENT
 from the default boot.
 
-**A REQUIRE in `x86-test.spec` is measurably inert — do not add one (LAWS §5).**
-`qemu_await.py`'s `settled()` answers on `matcher.markers()` alone and never calls
-`Matcher.complete()`, so REQUIRE and COUNT cannot reach `./arroyo test`'s verdict.
-Probed with one unsatisfiable `REQUIRE` appended to the spec, over the SAME healthy
-capture: `--settled` returned `status=complete … rc=0` (invisible) while
-`mbench --replay` returned `❌ FAIL — 0/1 required witnesses … rc=1` (scored).
-**Owed, and the reason this is a trap rather than a nicety:** `settled()`'s own
-docstring says it "asks the same `complete()` predicate", so code and documentation
-disagree and a reader is told the REQUIRE will fire. Making `settled()` call
-`Matcher.complete()` is a ~3-line change in `unaos/scripts/qemu_await.py`. It is
-NOT needed for the LOCKFIX shape — the ordering above covers it — and becomes
-needed only if a ladder fixture is moved onto a task that can skip or wedge
-independently of the zeolite resolver.
+**A REQUIRE in `x86-test.spec` WAS measurably inert, and is not any more — FIXED
+(LADDERTAIL, second commit).** `qemu_await.py`'s `settled()` answered on
+`matcher.markers()` alone and never called `Matcher.complete()`, so REQUIRE and
+COUNT could not reach `./arroyo test`'s verdict: a positive witness added to this
+spec would have sat in the file looking load-bearing while being incapable of
+reddening anything — LAWS §5's "a check that cannot fire is an absent one", made
+worse by the function's own docstring promising the opposite predicate. `settled()`
+now gates on `matcher.complete()`, so both of `qemu_await.py`'s modes score the
+same three things and TWO MODES, ONE PREDICATE is true of the code as well as of
+the header.
+
+**GO-RED for that fix, replay-only (no QEMU), recorded here.** One unsatisfiable
+`REQUIRE :: NOSUCHFIXTURE-ZZZ: … :: PASS ::` appended to a COPY of the spec, asked
+of the SAME healthy `UNAOS_WC=1` capture; plus the unchanged spec over that capture
+and over the wedged one, which must not move:
+
+| probe | before | after |
+|---|---|---|
+| bogus REQUIRE, healthy capture | `status=complete complete_at=1980` rc=**0** | `status=truncated reason=short-witnesses:1 stopped_at=2148` rc=**3** |
+| unchanged spec, healthy capture | `status=complete complete_at=1980` rc=0 | `status=complete complete_at=1980` rc=**0** |
+| unchanged spec, wedged capture | `status=truncated stopped_at=1652` rc=3 | `status=truncated stopped_at=1652` rc=**3** |
+
+The two refusals stay DISTINGUISHABLE, which is the point of the new field: a hole
+in the ladder reports `reason=short-witnesses:<n>` and names the short patterns on
+stderr, a short wall reports only `stopped_at`. **Blast radius is nil today and
+that was checked rather than assumed:** `x86_test_completion` (`arroyo:3194`) is the
+only `--settled` caller in the tree and `x86-test.spec` is the only spec it passes
+— 0 REQUIRE/COUNT — so every current verdict is byte-identical; `mbench.py
+--self-test` 35/35. The fix is NOT what closes the LOCKFIX row (the ordering above
+already did); it removes the trap waiting for the next seat that reaches for a tail
+witness.
 
 **And not every tail witness is assertable even then.** `[ptrdead] backlog` is a
 known Class-3 flake under host load (`docs/dev/FIXTURE_FLAKES.md`): asserting it

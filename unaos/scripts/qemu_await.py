@@ -133,12 +133,33 @@ forbid_hits=0 wall=0.0 [reason=<why>] [stopped_at=<logline>]
     for raw in lines:
         matcher.feed_raw(raw)
 
+    # THE PREDICATE IS `complete()`, NOT THE MARKER LIST. This asked `markers()` alone
+    # until 2026-09-15 (LADDERTAIL), which made every REQUIRE and COUNT in a settled
+    # spec INERT: `./arroyo test` read this status, so a positive witness added to
+    # `x86-test.spec` sat in the file looking load-bearing while being incapable of
+    # reddening anything — LAWS §5's "a check that cannot fire is an absent one", with
+    # the docstring above promising the opposite. Both modes now score the same three
+    # things, which is the whole claim of TWO MODES, ONE PREDICATE.
     seen = [d for d in matcher.markers() if d.hits]
-    if seen:
+    if seen and matcher.complete():
         first = min(seen, key=lambda d: d.first_lineno)
         print(f"SETTLED status=complete complete_at={first.first_lineno} "
               f"forbid_hits=0 wall=0.0")
         return 0
+    # REACHED THE END, SHORT OF A WITNESS is a HOLE IN THE LADDER, not a short wall, and
+    # the two must not read alike. The status stays within the caller's enum — anything
+    # outside it is reported as a broken checker — so the distinction rides a `reason=`
+    # field, space-free like every other value here, with the short patterns on stderr
+    # where they may carry spaces.
+    short = [d for d in matcher.directives
+             if d.kind in ("REQUIRE", "COUNT") and not d.satisfied()]
+    if seen and short:
+        print(f"qemu_await: {a.label}: the capture REACHED its end-of-run marker at line "
+              f"{min(d.first_lineno for d in seen)} but {len(short)} required witness(es) "
+              f"never printed: " + " | ".join(d.pattern for d in short[:5]), file=sys.stderr)
+        print(f"SETTLED status=truncated complete_at=- forbid_hits=0 wall=0.0 "
+              f"reason=short-witnesses:{len(short)} stopped_at={matcher.last_lineno}")
+        return 3
     # WHERE IT STOPPED is the useful half of a truncation report — the boot phase the
     # capture died in, quoted verbatim, so the reader is not sent back to the log to
     # find out how far it got. On STDERR: guest text contains spaces, and a machine line

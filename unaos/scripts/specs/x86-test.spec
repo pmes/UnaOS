@@ -16,20 +16,23 @@
 # positive per-witness assertions, they belong in a spec a verb actually REPLAYS (x86-fat.spec is
 # that spec for `test-fat`'s chain), not in the file that only marks the end.
 #
-# THAT PARAGRAPH IS NOW MEASURED RATHER THAN ARGUED (LADDERTAIL, rmbp seat, 2026-09-15). The claim
-# "a REQUIRE added here would be scored by nothing" was tested against the two consumers, one spec
-# file carrying one unsatisfiable `REQUIRE :: NOSUCHFIXTURE-ZZZ: … :: PASS ::` appended to this one,
-# both asked of the SAME healthy capture (the 2148-line `UNAOS_WC=1` run below):
+# THE SECOND HALF OF THAT PARAGRAPH IS NOW HISTORY, NOT THE LIVE REASON (LADDERTAIL, rmbp seat,
+# 2026-09-15). "A REQUIRE added here would be scored by nothing" was TRUE as written: `settled()`
+# answered on `matcher.markers()` alone and never called `Matcher.complete()`, so one unsatisfiable
+# `REQUIRE :: NOSUCHFIXTURE-ZZZ: … :: PASS ::` appended to a COPY of this file, asked of the SAME
+# healthy capture (the 2148-line `UNAOS_WC=1` run below), split its two consumers:
 #
-#   qemu_await.py --settled   SETTLED status=complete complete_at=1980 … rc=0   <- the REQUIRE is INVISIBLE
-#   arroyo mbench --replay    ❌ MBENCH FAIL — 0/1 required witnesses      rc=1   <- the REQUIRE is SCORED
+#   qemu_await.py --settled   status=complete complete_at=1980           rc=0  <- the REQUIRE was INVISIBLE
+#   arroyo mbench --replay    FAIL — 0/1 required witnesses              rc=1  <- the REQUIRE was SCORED
 #
-# `settled()` builds `seen = [d for d in matcher.markers() if d.hits]` and answers on that list
-# alone; it never calls `Matcher.complete()`, so REQUIRE and COUNT cannot reach `./arroyo test`'s
-# verdict at all. Note that `qemu_await.py`'s own SETTLED MODE docstring says it "asks the same
-# `complete()` predicate" — the DOCSTRING IS WRONG about its own function, and that divergence is
-# the reason this paragraph had to be re-proved instead of read. Anyone about to add a positive
-# witness to this file should re-run the two-line probe above before trusting either text.
+# `settled()` now gates on `matcher.complete()`, and that same probe returns
+# `status=truncated reason=short-witnesses:1 stopped_at=2148` rc=3. A REQUIRE here WOULD fire today.
+#
+# IT STILL SHOULD NOT BE ADDED — for the FIRST half of the paragraph above (this file answers one
+# question; per-witness assertions belong in a spec a verb REPLAYS), and because, measured below,
+# the marker already sits AFTER the ladder's last verdict. A REQUIRE would restate what the ordering
+# already guarantees, while handing a flaky fixture a new way to turn a red into an inconclusive.
+# Add one only in the case named at the bottom of this header.
 #
 # THE MARKER WAS MEASURED, NOT CHOSEN FROM THE SOURCE — the QEMU-FAST rule ("the predicate is
 # derived, never invented") applied to a capture instead of to a running log. Two full-wall runs at
@@ -112,9 +115,13 @@
 # If a ladder fixture is ever moved onto a task that can be skipped or can wedge INDEPENDENTLY of
 # the zeolite resolver, then a capture could carry the marker with a fixture missing, and this file
 # would stop covering the tail WITHOUT ever false-redding — a silent loss, not a red. The instrument
-# for that case is a per-fixture REQUIRE, and it cannot be added here until `qemu_await.py`'s
-# `settled()` scores REQUIRE/COUNT (i.e. calls `Matcher.complete()`, as its own docstring already
-# claims it does). Until then a REQUIRE in this file is measurably inert — see the probe up top.
+# for that case is a per-fixture REQUIRE, and as of LADDERTAIL's second commit one WILL be scored
+# here: `settled()` gates on `Matcher.complete()`, so a short witness settles
+# `truncated reason=short-witnesses:<n>` and `./arroyo test` exits 1. Two rules if that day comes —
+# assert only lines the DEFAULT boot honestly prints (`APPPIN` is WC-only; see above), and never
+# assert a known flake (`[ptrdead] backlog` is a Class-3 flake in docs/dev/FIXTURE_FLAKES.md, and
+# asserting it would convert a loaded-box flake into an INCONCLUSIVE verdict — the exact inversion
+# GATE-TESTTRUNC exists to remove).
 
 # The last fixture of the x86 boot ladder: the ring-3 DNS sinkhole reporting the queries it served.
 COMPLETE :: zeolite: metrics .*queries seen, .*blocked \(sinkholed\), .*forwarded upstream ::
