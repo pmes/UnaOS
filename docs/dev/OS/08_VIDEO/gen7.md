@@ -66,19 +66,24 @@ are off-limits and are not a source for anything in this ladder.
 
 ## 2. Ladder state, R1 through R7
 
-> **Metal verdicts live in [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) §4 (R19/B10), which
-> supersedes the `pending metal` cells below and §2.7's "held dark": R6 and R7 both flew and
-> **passed** on flight 4 (`docs/dev/evidence/rmbp8/FLIGHT4-POSTMORTEM.md` §3.1).**
+> **The metal record for every rung is [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) §4
+> (R19 / ledger B10), and where this document and that register disagree, the register's
+> quoted capture is the record.** The cells and prose below were corrected on 2026-09-15
+> (GEN7DOC) against **flight 4, 2026-08-28, both boots** — in-tree reading
+> `docs/dev/evidence/rmbp8/FLIGHT4-POSTMORTEM.md` §3.1, capture
+> `~/unaos-bench/capture/rmbp8-flight4/ttyUSB0.log` (sealed, 2 343 810 B, 15 910 lines;
+> boot 1 = L1–8871, boot 2 = L8872–15910). Read the register for the conditions each
+> failure is recorded under; this file keeps the design.
 
 | Rung | Name | Writes | Metal verdict |
 | --- | --- | --- | --- |
 | R1 | `recon` | none | GT block dark; `GTFIFOCTL` the only structured read |
-| R2 | `wake` | 3 GT power-management regs, all reversed | `gt-still-dark` |
+| R2 | `wake` | 3 GT power-management regs, all reversed | `gt-still-dark` — **scored on an instrument since proved blind; a re-score is owed** (§2.2) |
 | R3 | `forcewake` | 1 forcewake request reg per candidate, released in-rung | acquires fly; the well does not open on the battery |
 | R4 / R4b | `claim` | ≤3 GGTT PTEs, all restored | GGTT PTE round-trip **proven** |
-| R5 | `execute` | 2 GGTT PTEs + 4 RCS ring regs, all restored | `enable-void` — `RING_CTL` write did not latch |
-| R6 | `rearm` | as R5, **under a held wake**, + 1 GTT-flush reg | *pending metal* |
-| R7 | `blit` | as R6 on the **BCS**, 3 GGTT PTEs + 4 BCS ring regs | *pending metal — DARK, see §2.7* |
+| R5 | `execute` | 2 GGTT PTEs + 4 RCS ring regs, all restored | `enable-void` — **failed under *no hold in force*, and R6 re-opened it by changing that one condition** (§2.5) |
+| R6 | `rearm` | as R5, **under a held wake**, + 1 GTT-flush reg | **`r6-sentinel-hit by=mt … attempts=1/3`** — flight 4, both boots |
+| R7 | `blit` | as R6 on the **BCS**, 3 GGTT PTEs + 4 BCS ring regs | **`r7-blit-verified … best_dst_match=256/256`, `dst_crc==src_crc`** — flight 4, both boots |
 
 ### 2.1 R1 — `recon` (read-only)
 
@@ -100,13 +105,25 @@ Drives the IVB Sync-Flush workaround (`IVB-V1P3 §1.1.10.9`, pp.70-71): `INSTPM 
 0x00010001`, `RCS_WAKE 0x2700 = 0`, poll `0x22AC[3:0] == 0`, re-park `INSTPM` on every exit
 path.
 
-**Verdict on metal: `gt-still-dark`** — `trans_untouched=0/14`. Two lessons the later rungs
+**Verdict on metal: `gt-still-dark`** — `trans_untouched=0/14`
+(flight 4, both boots: `r2 verdict=gt-still-dark trans_all=0/17 trans_untouched=0/14 struct=0
+varies=0 poll_ack=1 poll_iters=0 rung=R2 wrote=3 reparked=1`). Three lessons the later rungs
 are built on. First, `poll_ack=1 poll_iters=0` was **not** an ack: `0x22AC` read zero on the
 first look and `== 0` was the pass condition, so a power-gated window that returns zero for
 everything passed the poll on iteration zero. Every ack test from R3 onward is a
 **transition** test with a stable-zero precondition. Second, draining a command streamer is
 not the same act as powering one — the Sync-Flush sequence is a VT-d workaround, not a
 general forcewake protocol, and the module never pretended otherwise.
+
+**Third, and it is a correction to this rung's own verdict: the 17-register GT battery R2 was
+scored on is not a liveness witness on this part.** The same flight-4 boots that produced
+`gt-still-dark` also read `battery_moved=0/17` on R6 and R7 — through a *verified* 1 KiB
+engine-side DMA (§2.7). A rung that takes "the battery moved" as its wake proof scores a
+demonstrably working boot dead, which is what happened here. `gt-still-dark` therefore records
+**"the battery did not move"**, not "the GT is dark", and R2 is owed a re-score against a
+behavioural witness — a ring arm, a sentinel — with the transition-test ack R3 onward already
+uses. Conditions and the queue row: `SHUTOUT-REGISTER.md` §4 (R2), `docs/dev/OS/rmbp-queue.md`
+GEN7R2.
 
 ### 2.3 R3 — `forcewake`
 
@@ -147,7 +164,14 @@ Claims two GGTT slots (a ring page and a target page), maps a minimal RCS ring, 
 **Verdict on metal, three boot legs: `enable-void`.** The PTEs landed. The four submission
 registers were programmed. `RING_CTL` was written `0x00000001` and read back `0x00000000`.
 The enable did not latch. R5's own `next=` named the suspect:
-`R6-must-hold-forcewake-and-rearm`.
+`STOP-RING_CTL-enable-did-not-latch-likely-forcewake-released-R6-must-hold-forcewake-and-rearm`.
+
+**It was right, and R5's failure is now a "failed under", not a property of the part.** On
+flight 4 R5 printed `r5 verdict=enable-void … ctl_wrote=00000001 ctl_readback=00000000` on both
+boots, and minutes later in the same boots R6 wrote the identical enable bit with the acquire
+still held and read back `ctl_readback=00000001`. One condition changed — the hold — and the
+write latched. R5's recorded condition is **no forcewake hold in force**; the rung's code and
+knob stay (R19).
 
 ### 2.6 R6 — `rearm` (the wake that makes RING_CTL latch)
 
@@ -155,6 +179,31 @@ R3 releases its forcewake acquire *inside its own rung*, by design — R3's job 
 the acquire, not to keep it. So by the time R5 wrote `RING_CTL`, no hold was in force. R6 is
 the experiment that follows: acquire a candidate, **keep the hold across the whole
 arm / submit / drain / disable / restore**, and only then release.
+
+**Metal verdict — flight 4, 2026-08-28, both boots: `r6-sentinel-hit`.** The rung flew and
+passed; this section's design is confirmed, not pending.
+
+```
+[  15736ms] :: gen7: r6 verdict=r6-sentinel-hit by=mt mode=scratch-fill wake=gt-live-already
+            attempts=1/3 any_ctl_enabled=1 best_ctl_readback=00000001 any_head_moved=1
+            any_sentinel=1 battery_moved=0/17 fw_restored=1 fw_evidence=real
+            ring_regs_restored=1 ptes_restored=1 smear_post=0 reclaim=leaked
+            tlb=tlb-flush-write-silent rung=R6
+            note=hold-was-kept-ACROSS-the-arm-and-the-teardown-no-display-register-touched ::
+```
+
+(boot 1, L1483; boot 2 prints the same fields at `[12191ms]`, L10385.) Head advanced
+`0 → 0x20` and sentinel `5EED1234` landed. The first candidate in the order below —
+`mt`, `class=BDW-ONLY` — took it on `attempts=1/3`; `renfw` and `gtforceawake` were never
+reached, so neither has a metal reading. The pre-registered falsifier (`ctl_readback==0x1`,
+`head_moved=1`, `sentinel_hit=1`) is satisfied field-for-field, and
+`r6-enable-void-under-every-hold` — the decisive negative that would have ended the x86
+engine-offload programme — did **not** fire.
+
+Two residuals from that boot, both carried forward rather than closed here: `fw_evidence=real`
+on R6 against `fw_evidence=blind` on R7 (§2.7), and `battery_moved=0/17` while the enable
+latched and the sentinel landed — the reading that retroactively blinds R2's instrument
+(§2.2).
 
 #### The preheld guard, retired
 
@@ -256,10 +305,22 @@ the write stays under full capture / restore / re-read and keeps its own three-w
 (`never-fetched` **OR** `flush-verdict`), where `never-fetched` is an independent structural
 proof: no candidate's `RING_CTL` enable ever read back set, the head never moved, and no
 sentinel ever landed — so no engine access was ever issued through either GGTT address and
-there is no cached translation to invalidate. On the machine R5 flew on, `never-fetched` is
-the leg that fires, and it is the stronger of the two. **A register whose read decode is
+there is no cached translation to invalidate. **A register whose read decode is
 unspecified — pinned write semantic or not — is never the sole reason a page goes back to
 the heap.**
+
+**On metal both legs are shut, and that is structural rather than a boot's luck.** On the
+machine R5 flew on, `never-fetched` was the leg that fired. The moment R6 and R7 succeeded it
+stopped firing — an enable that reads back set, a head that moves and a sentinel that lands are
+exactly the three things `never-fetched` denies — while `0x101008` read `0` both before and
+after the write on flight 4, both boots (`tlb=tlb-flush-write-silent`), so `flush-verdict` did
+not fire either. The result on the wire is `reclaim=leaked pages=3 bytes=12288
+reason=no-invalidation-evidence` on R7, and the same refusal on R5 and R6:
+**r5 (2) + r6 (2) + r7 (3) = 7 pages / 28 672 B per armed boot, bounded and one-shot.** The
+invariant behaved exactly as written. What flight 4 made unreachable is the *expectation* of
+`reclaim=freed` carried in the falsifiers below — see §2.7's watch line 1, and the queued
+decision `GEN7TLB` in `docs/dev/OS/rmbp-queue.md`: pin an alternative GGTT-invalidation
+witness, or promote the bounded leak to documented-accepted and delete the expectation.
 
 #### Cycle bounds
 
@@ -284,15 +345,20 @@ datum, but it no longer decides when to stop: an iteration count is not a time, 
 | `r6-sentinel-hit` | **The win.** The enable latched under a held wake and the GT executed the command. |
 | `r6-ring-would-not-disable` | **Safety override.** The PTEs are left claimed under a possibly-live engine; it dominates every exec reading. |
 
-#### The metal falsifier
+#### The metal falsifier, and how it was met
 
 Stated before the boot: **with a wake held, `ctl_readback==0x1`, `head_moved=1`,
 `sentinel_hit=1`.**
 
-If `ctl_readback` stays `0x00000000` under **every** candidate hold, the engine register
-domain is not writable on this part on any documented register, and the x86 engine-offload
-programme is dead on documented registers. That is a finding worth the boot, and the rung
+If `ctl_readback` stayed `0x00000000` under **every** candidate hold, the engine register
+domain was not writable on this part on any documented register, and the x86 engine-offload
+programme was dead on documented registers. That was a finding worth the boot, and the rung
 states it in those words on its `next=` line.
+
+**Flight 4 met the falsifier, both boots**, on the first candidate and the first attempt:
+`best_ctl_readback=00000001 any_head_moved=1 any_sentinel=1 attempts=1/3 by=mt`. The
+alternative — `r6-enable-void-under-every-hold` — did not print on either boot. The engine
+register domain **is** writable on this part under a kept hold.
 
 ### 2.7 R7 — `blit` (the BCS moves pixels, or says why not)
 
@@ -306,16 +372,49 @@ a seeded source page into a destination page.
 Three pages instead of two: `ring`, `src`, `dst`. Three GGTT slots (`0x10000`, `0x10001`,
 `0x10002`), the R5/R6 window extended by one.
 
-#### R7 is DARK, and dark means writes-nothing, not does-nothing
+#### R7 flew, and `write_ok()` was never a launch switch
 
-The 2D encodings were **[EXT-UNPINNED]** when R7 was built; as of 2026-08-27 every one of
-them is **[PINNED]** against the IVB PRM (the table at the end of this section). R7 is still
-held dark by the same `write_ok()` gate R4/R5/R6 use — opening it for a metal flight is the
-seat's call, now made with the pins in hand — and on any `UNAOS_IVB3D=1` boot
-`blit()` still performs its full read-only census before that gate: ~130 MMIO reads (the entry
-battery, the BCS ring-register images, the GGTT window and its neighbours, the six far probes,
-`GTFIFOCTL` twice) plus one PCI config read of the host bridge's `BDSM`. That census is the
-rung's value while it waits, and it must stay reachable.
+**Metal verdict — flight 4, 2026-08-28, both boots: `r7-blit-verified`. The BCS copied
+pixels.**
+
+```
+[  15744ms] :: gen7: r7 cand=mt class=BDW-ONLY col=exec ctl_wrote=00000001
+            ctl_readback=00000001 ctl_enabled=1 head_at_arm=00000000 head_post=00000040
+            head_moved=1 tail=00000040 sentinel_seed=DA7A5EED sentinel_post=0B75C0DE
+            sentinel_hit=1 dst_match=256/256 dst_crc=D7994E3D src_crc=D7994E3D armed=1
+            iters=3 cyc=7396 budget=50000000 ::
+[  15744ms] :: gen7: r7 cand=mt col=drain ring_idle=1 drain_iters=0 drain_cyc=28
+            head_drain=00000040 tail=00000040 sentinel_drain=0B75C0DE sentinel_hit=1
+            dst_match=256/256 dst_crc=D7994E3D exec_sentinel_hit=1 exec_dst_match=256/256
+            settled=1 ::
+[  15744ms] :: gen7: r7 verdict=r7-blit-verified by=mt mode=scratch-fill wake=gt-live-already
+            engine=BCS attempts=1/3 … any_copy=1 best_dst_match=256/256 battery_moved=0/17
+            fw_restored=1 fw_evidence=blind ring_regs_restored=1 all_disabled=1
+            all_ring_idle=1 ptes_restored=1 smear_post=0 reclaim=leaked
+            tlb=tlb-flush-write-silent rung=R7 ::
+```
+
+Boot 1 at `[15744ms]` (L1565); boot 2 repeats every field at `[12199ms]` (L10467), differing
+only in `cyc=7112`. `dst_crc == src_crc` on both boots, so the bytes-not-DWords pitch ruling
+at the end of this section is metal-proven.
+
+**Correction to this section's premise, and it was a misreading of our own code.** `write_ok()`
+is not a launch gate and never was: it is `GtWake::write_ok()` (`gen7.rs:1351`), which returns
+true for `GtWake::Woke | GtWake::LiveAlready` — R3's wake verdict, nothing else. There is no
+seat-held switch behind it to open. On flight 4 R3 returned `gt-live-already`, so every rung
+printed `write_ok=1` on its own `begin` line — `r5 begin … write_ok=1`, `r6 begin … write_ok=1`,
+`r7 begin … write_ok=1` — and R7 wrote. The sentence that said R7 was "held dark by the same
+`write_ok()` gate" described a gate that does not exist; what actually holds R7 dark is a boot
+whose R3 returns `Dark` or `WokeNoAck`.
+
+On such a boot R7 still performs its full read-only census before the gate: ~130 MMIO reads
+(the entry battery, the BCS ring-register images, the GGTT window and its neighbours, the six
+far probes, `GTFIFOCTL` twice) plus one PCI config read of the host bridge's `BDSM`. That
+census is the rung's value on an unconfirmed wake, and it must stay reachable.
+
+The 2D encodings were **[EXT-UNPINNED]** when R7 was built; as of 2026-08-27 every one of them
+is **[PINNED]** against the IVB PRM (the table at the end of this section), and flight 4 then
+executed them.
 
 #### The two witnesses, and the rule that each speaks alone
 
@@ -453,29 +552,43 @@ Type[31:29], Opcode[28:23], DWord Length = *Total Length − 2*); the §2.2.5 la
 the same arithmetic with the length field at [5:0] and [7:6] MBZ — identical bits for the
 value 2.
 
-**Nothing remains unpinned — R7 is flight-eligible.** The `write_ok()` gate stays closed
-until the seat opens it; that is a launch decision, not a missing pin.
+**Nothing remained unpinned, R7 flew, and every constant above was exercised on silicon.**
 
-#### The metal falsifier, and the watch lines
+#### The metal falsifier, and what the watch lines read
 
 Stated before the boot: **with a wake held, `ctl_readback==0x1`, `head_moved=1`,
-`sentinel_hit=1`, `dst_match=256/256`.**
-
-Three things silicon must confirm that no host gate can:
+`sentinel_hit=1`, `dst_match=256/256`.** **Flight 4 satisfied it field-for-field on both
+boots.** Three things silicon had to confirm that no host gate can, and what it answered:
 
 1. **The drain gate never fires spuriously.** On a healthy boot expect
    `all_ring_idle=1 engine_quiesced=1` and `reclaim=freed`. An `r7-ring-drain-timeout` on a run
    that otherwise looks clean means `DRAIN_BUDGET_CYC` (≈8 ms) is too short for a 1 KiB blit on
    this part — raise the budget, do **not** relax the gate.
+   **Read on metal: half met.** `all_ring_idle=1 all_disabled=1` and no drain timeout on either
+   boot, in `drain_iters=0 drain_cyc=28` of a 20 M-cycle allowance. But `reclaim=freed` did not
+   appear and **cannot**: the flush register is silent on this part and the engine did fetch, so
+   neither reclaim leg can fire (§2.6). This expectation is the one part of the falsifier that
+   was wrong about the machine rather than about the rung — GEN7TLB's decision.
 2. **The flush framing.** If R7 returns `r7-head-stuck` or `r7-sentinel-miss` where R6 — same
    hold, same ring, one command — returned `r6-sentinel-hit`, the delta is the `MI_FLUSH_DW`
    block mis-framing the store that follows it, **not** the 2D block. The encoding is now
    pinned (Vol1 Part4 §2.2.5), so that signature would mean the store's privilege/address or
    a misread of the pin — re-derive from the Part4 PDF before touching code.
+   **Read on metal: not exercised.** R6 and R7 both passed, so the signature never arose. The
+   tripwire stays armed for R8.
 3. **`settled=`.** `settled=0` with `col=drain` at 256 is the barrier doing its job late and is
    informative, not a failure. `settled=0` with `col=drain` *below* `col=exec` would mean the
    engine wrote `dst_page` after we thought it was idle — that is the G1 hazard observed live,
    and it is a STOP.
+   **Read on metal: `settled=1`, both boots**, with `col=exec` and `col=drain` both at
+   `dst_match=256/256`. The G1 STOP condition is excluded **by measurement**, not by argument.
+
+**One residual the flight added.** R7 reports `fw_evidence=blind` and
+`classification=fw-no-decode` on the same line as a verified 1 KiB engine DMA (R6, one rung
+earlier, read `fw-req-decodes-no-ack fw_evidence=real`). The hold works — the blit is the proof
+— and the *evidence channel* does not. **R8 must not gate on a forcewake ack decode**; the
+hold-across-the-arm discipline plus behavioural witnesses is the only currency this part
+honours. `SHUTOUT-REGISTER.md` §4 (R3) records the conditions.
 
 ---
 
@@ -507,9 +620,11 @@ R7 carries the same exception for `r7-ring-addr-illegal`, for the same reason.
 
 ### 3.1 The R7 teardown-gate go-red
 
-`./arroyo check` proves the gate compiles. It cannot prove the gate *refuses*, because R7 is
-dark and QEMU has no Ivy Bridge IGD — the drain timeout the gate exists to catch is
-unreachable in every environment available to a session.
+`./arroyo check` proves the gate compiles. It cannot prove the gate *refuses*, and neither can
+metal: QEMU has no Ivy Bridge IGD, and on the one flight that armed R7 the engine quiesced
+cleanly (`all_ring_idle=1 engine_quiesced=1`, `drain_iters=0`, both boots), so the drain
+timeout the gate exists to catch did not occur. It is unreachable in every environment
+available to a session and was not produced by the rung passing either.
 
 So the gate is proven where it can be: the three `const fn`s between the
 `R7-TEARDOWN-GATE-BEGIN` / `-END` markers in `gen7.rs` are **extracted verbatim** by a host
@@ -537,14 +652,24 @@ thing proven is the shipped source, not a paraphrase of it.
 ## 4. Where the ladder stands
 
 The GT **fabric** is alive: `GTFIFOCTL` is structured and moves, and the GGTT PTE round-trip
-is proven on metal at R4/R4b. The **engine register block** has so far refused every write —
-R2's `INSTPM` did not latch, R5's `RING_CTL` did not latch. R6 is the rung that decides
-whether that refusal is the absence of a held wake or a property of the part. Either answer
-moves the GEN7-vs-Kepler decision; only one of them keeps the ladder alive.
+is proven on metal at R4/R4b. The **engine register block** refused every write up to R5 —
+R2's `INSTPM` did not latch, R5's `RING_CTL` did not latch — and R6 was the rung that decided
+whether that refusal was the absence of a held wake or a property of the part.
 
-R7 is built and **held dark** — but no longer behind unpinned encodings: as of 2026-08-27
-every R7 constant is pinned against the IVB PRM (§2.7), all six confirmed exactly as coded.
-Its teardown safety and its witness logic were already correct independently of that pin, so
-opening the `write_ok()` gate for a metal flight is the only thing left between R7 and its
-falsifier. That opening is the seat's launch decision. Its read-only census runs on every
-armed boot in the meantime.
+**It was the absence of a held wake.** On flight 4, 2026-08-28, both boots, R6 kept R3's
+acquire across the whole arm and the identical `RING_CTL` write latched
+(`r6-sentinel-hit by=mt … attempts=1/3`), and R7 then moved the same envelope to the **BCS**
+with a real `XY_SRC_COPY_BLT` and copied 1 KiB of pixels
+(`r7-blit-verified … best_dst_match=256/256`, `dst_crc == src_crc = D7994E3D`). Enable-void →
+sentinel-hit → blit-verified is **deterministic on this part**, not marginal: same candidate
+(`mt`, `class=BDW-ONLY`), same `attempts=1/3`, 7 396 and 7 112 cycles against a 50 M allowance.
+All six R7 constants pinned in §2.7 were exercised on silicon and none was contradicted.
+
+What the ladder hands its successor is engineering, not physics, and R7 says it in its own
+words on the wire:
+`r7 next=DONE-the-BCS-copies-pixels-under-a-held-wake-wire-bring_up_blt_ring-to-the-held-wake-and-fix-blitter_copy_rect-DW0-client-field`
+(boot 1, L1566). Three decisions are queued in `docs/dev/OS/rmbp-queue.md` §GPU LADDERS, each
+with its conditions in `SHUTOUT-REGISTER.md` §4: **GEN7R8** (the production blitter, which must
+not gate on a forcewake ack decode), **GEN7TLB** (the `reclaim=freed` expectation, structurally
+unreachable as coded), and **GEN7R2** (re-score R2 against a behavioural witness, its 17-register
+battery having been proved blind by the very boots that passed).
