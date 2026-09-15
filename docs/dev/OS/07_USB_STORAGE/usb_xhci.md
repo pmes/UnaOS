@@ -2068,6 +2068,92 @@ storm cannot be reproduced headless; the ack-completeness is verifiable in code 
 connection hot-plug/teardown path stays green (§7d witnesses unchanged). The cure — the
 reader-with-no-card plug/unplug no longer storms — rides the next rMBP sitting.
 
+### 7i. XHCINTD — N outstanding keyboard TDs, and XHCIKBD, the x86 leg that scores them (B44/B45, 2026-09-15)
+
+**The defect (PRTSCLOST, orin 17; orin-ledger A41 / rmbp-ledger B44).** `set_hid_idle` sends
+SET_IDLE duration 0 = INDEFINITE, so a boot keyboard reports ONLY on a state change and never
+resends. Until this arc exactly ONE Normal TRB was outstanding on the keyboard interrupt-IN, and it
+was re-armed as the LAST statement of the completion branch — after the ASCII decode, the key-up
+diff, the PrintScreen edge and `set_hid_leds`, a synchronous EP0 control transfer. From the instant
+the controller retired the TD until software re-armed, the endpoint had no TD, the controller
+issued no IN token, and every state change in that window was gone forever: render8's three fast
+Print Screens, ONE `:: PRTSCR: … down` line. `KBD_ARMGAP_MAX` (the drain gap preceding a real
+report) measured the window at 92 ms on the Orin (a present) and **1.06 s on the x86 QEMU boot
+battery** (`docs/dev/evidence/rmbp-0915/xhcikbd/RUNS.md` run 02: the pump between APPPIN/WINX
+window launches).
+
+**The repair (`drivers/xhci/mod.rs`, ungated, both arches — the tail-append helpers plus folds on
+the existing lines).** `KBD_INFLIGHT = 4` Normal TRBs stay outstanding, each into its OWN 64-byte
+buffer carved from the keyboard's existing 512-byte `data_buffer` (`KBD_BUF_STRIDE`; the stride is
+the aarch64 D-cache line, so the consumer-side `inval` of one buffer cannot touch a sibling still
+armed; a device whose MPS exceeds the stride runs at depth 1 = the old behaviour). The dup-Success
+guard (§7e) tests SET MEMBERSHIP instead of one expectation: `kbd_retire` searches the armed set
+(`keyboard_armed_trb/_buf[..keyboard_armed_n]`, oldest first), pops through the match, counts
+skipped entries into `KBD_SKIPPED_COUNT`, records `keyboard_prev_phys` at the retirement (under N
+"the expectation before this one" is another TRB still armed), and hands back the buffer that TD
+was DMA-written into. The completion branch copies the eight bytes to the stack, **tops the ring
+back up to N before decoding**, and decodes the copy. The non-halting error arm retires the
+erroring TD before topping up (a leaked entry per error would fill the set — four errors, dead
+keyboard); halt recovery clears the set beside the two expectations it already cleared.
+**HIDLEDDEFER:** the lock-LED SET_REPORT no longer runs inside the completion branch at all — the
+branch toggles the bitmap and sets `keyboard_leds_dirty`; `service_hid_leds` (beside
+`service_hid_halts`, inside `service_hid_setproto`, every board's polled service pass) issues the
+control transfer one pass later. The completion path therefore holds no wait and no nested
+dispatch (LOCKFIX's rule), which is also what makes re-arm-before-decode safe without the
+re-entrancy argument orin 17's cut needed. Prior design: exec-orin17-xhcintd `0019ec7a` (content
+re-cut here; their patch fails `git apply --check` on this tree) and DUPGUARD `28899d5c` (the
+set/retire discrimination is a free function over the arrays, `kbd_retire_set`, so their fixture
+can call the driver's own decision when it folds). The `[kbdpoll]` verdict rows in
+`display_tegra.rs` are the Orin's file and were not touched. The pointer path (`MOUSE_*`, the
+CLICKDEAD guard) keeps its shape.
+
+**The leg (`UNAOS_XHCIKBD=1 UNAOS_WC=1 ./arroyo test 90`, feature `xhcikbd` = fixture only, implies
+`witness`).** B45 measured that the headless x86 test put QEMU's `usb-kbd` on the EHCI bus, so the
+xHCI keyboard completion branch — the decoder every board types through — was gated nowhere.
+Under the knob the builder puts the ONE `usb-kbd` on `xhci.0` with the EHCI driver still compiled
+and running (one keyboard, never two: QEMU routes injected keys to whichever handler it likes),
+`test_x86_64` runs `scripts/qmp_type.py --bursts` over the screendump shooter's QMP socket, and
+the kernel scores on the F12 sentinel:
+
+```
+:: XHCIKBD: reports=<n> restated=<r> lost=<l> expected=<e> stalls=<k> armgap_us=<g> gapmax_us=<m> rearm=<a> discard=<d> dup=<u> nobuf=<b> outstanding=<o>/<w> skipped=<s> leddefer=<f> -> PASS|FAIL ::
+```
+
+The typist waits for `[hidkeys] set-idle ok` (SET_IDLE 0 applied — the restated convictor is
+meaningless before it), the desktop's theme line, and the boot battery's last one-shot fixture
+line, settles 5 s, then types 4 bursts 2 s apart. **One burst** = the STALL KEY (F11) pressed —
+on its press edge `xhcikbd_note` spins 600 ms inside the completion branch, the deliberately slow
+pass: a 92 ms present made deterministic and long enough to hold the stream — then, 20 ms apart,
+its release and 9 alternating a/b press+release pairs, one `input-send-event` per event. After
+the last burst and 1 s of quiet the sentinel (F12) is pressed once. **Why the stream is shaped
+so (measured, RUNS.md runs 03 and 05):** QEMU's `usb-kbd` delivers at most ONE report per
+endpoint polling interval (8 ms for this HS device) no matter how many TRBs wait, and queues at
+most 16 undelivered key events (hw/input/hid.c `QUEUE_LENGTH`), dropping the rest — an atomic
+20-event burst arrived as exactly 17 at BOTH depths, so it could not tell one TRB from four.
+Spacing the events wider than the interval lets each armed TRB absorb one during the stall, and
+19 events per burst (release + 9 pairs) then means: single-TRB driver, endpoint dark for the whole
+stall (the re-arm is the branch's last statement) → 16 survive, 3 lost per burst; N=4 re-armed
+before the decode → 3-4 absorbed by the TRBs, the rest queue, none lost. `restated`
+(`KBD_RESTATED_COUNT`) convicts independently: a lost release makes the next press of that key a
+byte-identical report, which SET_IDLE 0 makes impossible. `stalls=` is the control (0 = the
+stream never reached the decoder). PASS iff `lost == 0 && restated == 0 && stalls == bursts`;
+`-> FAIL` is in arroyo's `FAULT_PATTERNS`, and arroyo separately reds a run whose wire has no
+XHCIKBD line (a typist that never reached the guest is not a pass). `UNAOS_XHCIKBD` is a GATE
+knob: it goes on `test`, never on a flight line. Read `docs/dev/evidence/rmbp-0915/xhcikbd/RUNS.md` for the three
+runs that define the leg (06/07/08): red on the single-TRB driver, green with the repair, red again with
+the repair reverted.
+
+**What QEMU can and cannot say.** QEMU's 16-deep queue stands in for a real keyboard's ZERO, and
+its one-report-per-interval pacing is also USB's: on metal every edge in a dark window is lost
+outright, so the leg understates the defect and overstates nothing. N=4 at an 8 ms interval covers
+32 ms of darkness, not a 92 ms present — the repair narrows the window to what the endpoint can
+absorb, and `KBD_ARMGAP_MAX` stays the number that says how dark the pump still lets it get. What it proves is the driver's own window — N TDs armed, re-arm before decode, no wait on
+the path. The Orin's 92 ms present and the rMBP's FTDI-carrying drain are the metal walls; under a
+fast triple Print Screen the wire should now show three `:: PRTSCR: PrintScreen (HID 0x46) down on
+xHCI -> capture armed ::` lines and `[kbdpoll] … restated=0` (the `outstanding=`/`skipped=` gauges
+`KBD_OUTSTANDING`/`KBD_SKIPPED_COUNT` exist for `[kbdpoll]` to print; that line is the Orin's file and
+lane, untouched here).
+
 ---
 
 ## 8. Status and limitations
