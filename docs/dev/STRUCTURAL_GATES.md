@@ -427,6 +427,144 @@ a red on a loaded box; deleting the marker is not.
 
 ---
 
+## GATE-BANNERCERT — the banner and the artifact must agree
+
+**Where this one runs, because it is the second exception to the header above.**
+Not in `check_both`: it asserts a property of a BUILT IMAGE, so it lives at the
+end of `esp_x86` in `unaos/arroyo`, after the builder has written
+`target/x86_64_esp/kernel.elf` and after GATE-RODATA, before the media is
+announced. `./arroyo check` cannot see it and is not asked to. It is wired on the
+x86 media path ONLY; `esp_arm`, `esp_jetson` and `kernel8` are three separate
+functions with three separate banner sites (`arroyo:6189` prints the jetson
+banner from its own `$_feats`, `arroyo:7852` prints the Pi banner from `K8_FEATS`)
+and are named in the arc report as unwired, for the seat.
+
+**Invariant.** For every feature named on the `⚡ kernel features:` line of a
+build, the artifact that build produced contains that feature's CERTIFYING
+STRING — a literal that is in the image if and only if the feature is compiled
+in. For a small set of features the banner did NOT name, the artifact does not
+contain their control string.
+
+**Why a gate.** The banner is a claim made by the knob→feature map at the top of
+`arroyo`, evaluated at script load; the artifact is what cargo actually built.
+Nothing in the tree connected the two. `arroyo:1147` armed the GA10B rung-5
+ignition with `[ "${1:-}" = "esp-jetson" ]` against SIX accepted spellings of the
+jetson verbs, so five of six built a feature set the banner did not describe —
+and the `esp-jetson-img` step that follows `esp-jetson` in the same chain rebuilt
+the parent feature alone and overwrote `kernel.elf` (`docs/dev/QUEUE.md` §5, the
+2026-09-13 row). Every instrument in the tree was green: the diff was green,
+`./arroyo check` was green, and the banner printed the rung. `LC_ALL=C grep -a -o
+-F` on the built ELF found the rung's bytes 0 against a good card's 79. A card cut
+from that media boots, prints nothing, and looks like a clean flight — one power
+cycle spent on nothing, with clean-looking evidence. That is LAWS §5: an
+instrument's presence is proven in the artifact, never in the diff, the check or
+the banner. This gate is that proof, charged automatically at every x86 media
+build instead of by an operator who remembers to grep.
+
+**Mechanism.** `unaos/scripts/banner-cert.sh <artifact> <banner-feature-list>`.
+`esp_x86` passes `${_feats%,}` — the very string the banner line was composed
+from, not `$KERNEL_FEATURES` and not the knob line, because the banner is the
+claim under test. The script carries the token registry as a table IN THE SCRIPT:
+`feature|token|cond|state`, one row per feature, and asks
+`LC_ALL=C grep -a -o -F -- "<token>" <artifact> | wc -l` for each. It prints one
+line per feature — `feature=<f> witness=<token> hits=<n> -> OK|MISSING|…` — then
+the control rows, then a one-line summary. Tokens are cut at the first `{`
+because `format_args!` splits a format string into the literal pieces between its
+holes, and every token must be ≥ 9 bytes or LLVM immediate-encodes it out of
+`.rodata`; the script refuses to run at all (exit 2) if a shorter one is
+registered, so a broken row cannot read as a clean build. Two qualifiers exist: a
+leading `!` inverts a row (the token must be ABSENT when the feature is on, for
+the features whose only gated literal is the not-compiled-in message), and a
+leading `@boot ` routes the check to `EFI/BOOT/BOOTX64.EFI` beside the artifact
+(`unaos_ivb` is a cross-crate boot-info ABI knob whose code is in the bootloader,
+not the kernel, and whose witness is therefore in the other binary).
+
+**WHAT IT FOUND ON ITS FIRST ARMED RUN, and fixed in the same arc.** `esp-x86` on
+the rmbp flight-7 knob line: 27 of 28 banner features certified in the artifact,
+and `sdwrite` did not. A real banner lie, not a bad token. `arroyo:1992` appends
+`sdwrite` to `$_feats` unconditionally, so the banner names it on every verb — but
+the x86 MEDIA kernel is compiled by `builder/src/main.rs`, which composes its OWN
+feature list from env knobs and had no `sdwrite` entry. The same `esp-x86` log
+printed both lists and they differed by exactly that name: arroyo's
+`⚡ kernel features:` ended `…,gmux_igd,sdwrite` (28), the builder's own
+`   kernel features:` ended `…,gmux_igd,smolnet` (27). In the artifact,
+`SDWRITE-POSTURE` had 0 hits while `:: USBREG` — printed from the same
+`witness`-gated `unafsroot_selftest` — had 3, so the enclosing code was live and
+the feature simply was not compiled in: every x86 media image cut since A60 landed
+shipped without it while the build log said otherwise. This is the `rastmc` defect
+that `builder/src/main.rs` already records in its own comment ("printed in the
+feature banner, `strings` on the ELF had no `RAST-MC` in it"), and the s42/INSTGUI
+and GMUX-IGD lesson, a third time — and the first one a gate found rather than a
+person. The ruling was that arroyo is right and `sdwrite` rides every image, so
+the builder gained
+`if std::env::var("UNAOS_NOSDWRITE").is_err() { feats.push("sdwrite"); }` beside
+its siblings and the cert reads 28/28. This is the argument for a standing gate
+rather than for a remembered grep: three occurrences, two found by hand years
+apart, the third found on the first run of the thing that looks every time.
+
+**Registered divergences, and why the table is empty.** A feature the banner names
+that the artifact provably does not carry, whose fix is owned elsewhere, can be
+entered in `bc_registered` with the whole finding, the exact fix and an owner. Such
+a row prints
+`-> MISSING (REGISTERED DIVERGENCE — not a finding, and it must reach zero)` with
+its reason, is counted on its own field of the summary, and does not red the
+build; an UNREGISTERED MISSING still reds. The shape is GATE-LEDGER's registered
+field-count exception, verbatim, and it is held to the same standard: not a
+finding, not a pass, and it must reach zero. The table is EMPTY today and has been
+occupied exactly once — `sdwrite` sat in it for as long as it took to get the
+ruling above, then came out in the commit that fixed it. That round trip is the
+whole intended lifetime of a row: register, fix, delete.
+
+**Control.** Three separate ways a zero is kept distinguishable from a rotted
+pattern. (1) The OFF side: five features the flight line does not arm carry
+control rows, asserted ABSENT on every build that does not name them, so a
+pattern that matched nothing would still have to explain why the five it is
+supposed to miss are the only ones missing. (2) NO VERDICT is loud and is not
+zero: a banner feature with no row exits **2** by name, and a row whose artifact
+is not on disk does the same — an unchecked check is never silently skipped
+(LAWS §5). (3) The one feature with no certifiable literal in the tree, `wedge2`
+(the knob only re-times an existing path and adds no gated string), is a `-`
+row that prints `NOWITNESS` with its reason and is counted in the summary, rather
+than being quietly absent from the table.
+
+**Seeding a row is a MEASUREMENT, not a reading.** Find a literal whose only
+occurrences sit under `#[cfg(feature = "<f>")]`, or inside a module whose
+`pub mod` is so gated, or under a feature `<f>` implies in `Cargo.toml`; cut it at
+the first `{`; then build media with the feature armed and prove hits > 0. The
+`state` column records which: `measured` rows were proven against an x86 artifact,
+`unmeasured-here` rows were read out of the source and await an artifact for their
+arch. 28 of the table's 44 token rows are `measured` (the whole rmbp flight-7 knob
+line); the 15 aarch64 rows (orin `tegra`/`tegrasmp`/`sdmmc`/`ga10bprobe5`, the Pi
+desktop line) are `unmeasured-here` and are inert until the aarch64 call sites are
+wired.
+
+**Goes red when** the banner names a feature the artifact does not carry (MISSING,
+rc=1), the artifact carries a feature the banner never named (LEAK, rc=1), or the
+gate could not reach a verdict (rc=2). **GO-RED proof by mutation, both failure
+modes run:** with the flight-7 knob line on `esp-x86` — the same command that had
+just exited **0** — the registry row for `nvidia-kepler-fifo` was re-pointed at
+`[NVIDIA] Starting PFIFO initialisation`, one letter off the literal in the image.
+The verb printed
+`feature=nvidia-kepler-fifo witness=[NVIDIA] Starting PFIFO initialisation hits=0 -> MISSING`
+and exited **1**; the registered `sdwrite` row on the same run stayed a divergence
+rather than masking it, so one registered row does not blunt the others. Reverted,
+the script is byte-identical to the pre-mutation file and the verb exits 0. The
+rc=2 mode was run separately: the script against the same artifact with a banner
+naming an unknown feature prints
+`feature=notafeature witness=<UNREGISTERED> hits=- -> UNREGISTERED` and exits
+**2**.
+
+**Legitimate update.** A new knob in `arroyo`'s map needs a row here in the same
+commit — the next build that arms it exits 2 by name until it has one, and that
+is the intended failure, not a nuisance. When a token's source line is deleted or
+reworded, the row is re-seeded by the recipe above (measure, do not guess) in the
+commit that moves the literal. Do NOT "fix" a MISSING by deleting the row: a row
+removed is a feature nothing checks, which is the exact state that shipped the
+:1147 card. Widening the control list is always safe; narrowing it costs a
+control and should be argued for.
+
+---
+
 **Landed but not yet sectioned here:** GATE-ROOTS (`scripts/check-roots.sh`, every
 binary target is a named root of `check`) and GATE-APPEND (`scripts/append-position.sh`,
 LEDGER P7's trailing-comment trap) are both wired into `check_both` and green; their
