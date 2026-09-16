@@ -549,6 +549,22 @@ fn main() {
     // crates/kernel/Cargo.toml; `./arroyo check`'s KNOB→BUILDER WIRING CHECK goes red if this line
     // is dropped. DEFAULT OFF => mod ctxbind and both call sites unlinked => byte-identical media.
     if std::env::var("UNAOS_KEPLER_KFCTXBIND").is_ok() { feats.push("nvidia-kepler-kfctxbind"); }
+    // KDHEAD (shut-out register §1 rung KD14): UNAOS_KEPLER_KDHEAD=1 arms the BRACKETED PER-HEAD
+    // DECODE at the tail of drivers/gpu/kepler_display.rs — KD3's per-head EVO/CRTC decode re-run
+    // with KD4's HEAD_STAT reading as the control bracket (borrowed from BEAMX86's one per-head
+    // census, never re-sampled) and the per-head stride MEASURED across five candidate blocks
+    // instead of assumed, with a two-pass filter so a counter cannot make a collapsed stride look
+    // like four distinct heads. READ-ONLY: writes=0. THIS list is what reaches the kernel binary for
+    // MEDIA builds, and this knob's ENTIRE product is witness lines — so a knob wired into arroyo
+    // alone would put `nvidia-kepler-kdhead` in the banner and not one `:: KDHEAD:` string in the
+    // image, and a flight with no `heads_distinct=` line would read as "the per-head blocks are
+    // dead", which is KD3's own shut-out verdict reached a second time from a build defect, on the
+    // one rung whose purpose is to correct it (BEAMX86's failure mode, and BAR1WEDGE's, KFBIND's and
+    // KFCTXBIND's above, verbatim). Kept in sync with arroyo AND crates/kernel/Cargo.toml;
+    // `./arroyo check`'s KNOB→BUILDER WIRING CHECK goes red if this line is dropped. DEFAULT OFF =>
+    // every item, the call site and the census publication inside beam_probe are unlinked =>
+    // byte-identical media.
+    if std::env::var("UNAOS_KEPLER_KDHEAD").is_ok() { feats.push("nvidia-kepler-kdhead"); }
     // R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
     // (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only; pure measurement,
     // no scheduling/locking/present change. x86_64-only in effect; DEFAULT OFF => empty inline shims,

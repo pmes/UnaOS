@@ -851,8 +851,14 @@ fi
 # crates/kernel/Cargo.toml AND builder/src/main.rs (the four-place trap); the map line is
 # parser-conformant so the KNOB→BUILDER WIRING CHECK covers it, and `x86-all` names the feature.
 [ -n "${UNAOS_KEPLER_KFBIND:-}" ] && _feats="${_feats}nvidia-kepler-kfbind,"
-# KFCTXBIND (rmbp, shut-out register §2 rung KF28, appended 2026-09-15 — LAST line of the kepler
-# block): UNAOS_KEPLER_KFCTXBIND=1 arms the KF18/KF19 RE-RUN in drivers/gpu/kepler_fifo.rs
+# KFCTXBIND (rmbp, shut-out register §2 rung KF28, appended 2026-09-15 — was the LAST line of the
+# kepler block until KDHEAD was appended below it the same day; the claim is corrected rather than
+# left to rot, exactly as KFBIND corrected BAR1WEDGE's and KFCTXBIND corrected KFBIND's. ⚠ THE
+# CORRECTION IS THE THIRD IN A ROW AND THE PATTERN IS THE FINDING: a comment that names its own line
+# as LAST is false the moment the next rung lands, so a rung appending here fixes the one above it
+# before writing its own — which is also the cheapest way to be sure the append went to the END of
+# the block and not into the middle of it):
+# UNAOS_KEPLER_KFCTXBIND=1 arms the KF18/KF19 RE-RUN in drivers/gpu/kepler_fifo.rs
 # (`mod ctxbind`, beside KF27) with the FECS context-ucode precondition MEASURED and the PBDMA base
 # DERIVED. §2's "what would change the verdict" asks for exactly one thing on KF18/KF19: re-run the
 # bind "with FECS context microcode resident and running — the one condition never varied across ten
@@ -890,6 +896,51 @@ fi
 # (the four-place trap); the map line is parser-conformant so the KNOB→BUILDER WIRING CHECK covers it,
 # and `x86-all` names the feature.
 [ -n "${UNAOS_KEPLER_KFCTXBIND:-}" ] && _feats="${_feats}nvidia-kepler-kfctxbind,"
+# KDHEAD (rmbp, shut-out register §1 rung KD14, appended 2026-09-15 — LAST line of the kepler block):
+# UNAOS_KEPLER_KDHEAD=1 arms the PER-HEAD DECODE, BRACKETED, at the tail of
+# drivers/gpu/kepler_display.rs. §1 records KD3 `head-raw` as shut-out and its "what would change the
+# verdict" names exactly one thing: "re-run the per-head decode with KD4's HEAD_STAT as the bracket
+# and the per-head stride re-derived for the 917D class. The rung failed because it had no control
+# read, not because the heads are dead; KD4 proves head 0 scans." THREE PARTS, ALL READ-ONLY
+# (writes=0, no mmio_write, no write_volatile, no allocation).
+# (1) THE CONTROL BRACKET IS BORROWED, NOT RE-TAKEN. KD3's whole defect is that four byte-identical
+# reads were scored as "the heads are dead" with nothing in the same capture saying whether any head
+# scanned. BEAMX86's `beam_probe` already samples HEAD_STAT.VERT on all four heads for 45 ms each and
+# keeps a per-head census (`adv` = the line counter climbed, `vbd` = vblank_count ticked); it now
+# PUBLISHES that census and this rung reads it. A second sampler would cost another 180 ms inside the
+# takeover AND would be a different sample than the one the beam gate armed on, so a disagreement
+# between them would be unattributable. live = adv>0 AND vbd>=2; a decode read against a DARK head is
+# scored `DARK-NOT-SCORED`, never "wrong" (R19). ⚠ The bracket needs UNAOS_BEAM=1 on the same boot —
+# without it the stride census still runs and every decode is WITHHELD behind `bracket=absent`, and
+# such a capture may never be read as a statement about the hardware.
+# (2) THE STRIDE IS MEASURED, NOT ASSUMED. The same word is read at head 0 and heads 1..3 across five
+# candidate blocks the tree or a sitting names — `headstat` (0x616000/0x800, KD4's own bank),
+# `armed100` (0x616100/0x800, sitting #4's three offsets verbatim), `evocore` (0x610460/0x300,
+# candidate A), `headval` (0x610A00/0x540, candidate B) and `mirror` (0x640400/0x300, the EVO core
+# method mirror KD8 decoded) — and `heads_distinct=<n>/4` says whether the claimed stride separates
+# heads at all. Four identical words IS the sitting-#4 collapse and that block is not decoded. Every
+# block is read TWICE with a settle, because a COUNTER defeats the test in the WRONG direction: four
+# reads of one collapsed counter come back different and would score as a working stride, so a word
+# that moved is excluded from the distinctness tuple and `stable=` says how many survived.
+# (3) THE DECODE runs only where the stride separated heads AND the bracket says the head is live:
+# the mode geometry, the surface address and the pitch, each printed with the citation CLASS of its
+# slicing ([TREE]/[METAL sN]/[EXT]/[UNPINNED], falcon_microcode_spec.md §0.1), compared against the
+# GOP framebuffer the takeover already inherited. `-> AGREE` on the live head pins the decode BY
+# OBSERVATION and re-opens KD3; `-> DISAGREE` names the first field that differs, which is a finding
+# about the slicing and not about the silicon.
+# Implies nvidia-kepler AND nvidia-kepler-takeover (Cargo-side) — the call site is below
+# `takeover_display`'s trace-only early return, so without the takeover the rung could never be
+# reached. Deliberately does NOT imply `beam`: the two knobs are independent and the rung prints its
+# own posture either way; the flight line carries UNAOS_BEAM=1 so the bracket exists. Wire:
+# `:: KDHEAD: bracket source=…`, `:: KDHEAD: gop …`, one `:: KDHEAD: block=… head=… w=[…]` per head
+# per block, one `:: KDHEAD: block=… heads_distinct=n/4 …` per block, the
+# `:: KDHEAD: head=… live=… geom=…x… surface=… pitch=… vs gop=… -> AGREE|DISAGREE|UNREADABLE ::`
+# decode lines, and `:: KDHEAD: end rung=KD14 … writes=0 ::`. Default OFF => every item, the call
+# site, the census publication inside beam_probe and every `:: KDHEAD:` string are unlinked and media
+# are byte-identical. Kept in sync with crates/kernel/Cargo.toml AND builder/src/main.rs (the
+# four-place trap); the map line is parser-conformant so the KNOB→BUILDER WIRING CHECK covers it, and
+# `x86-all` names the feature at the END of its list.
+[ -n "${UNAOS_KEPLER_KDHEAD:-}" ] && _feats="${_feats}nvidia-kepler-kdhead,"
 # R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
 # (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only, never a mean; pure
 # measurement, changes no scheduling/locking/present behaviour. x86_64-only in effect (the real impl is
@@ -4109,7 +4160,26 @@ KERNEL_CFG_MATRIX=(
   # table gains one knob and the universe gains one (brand-new, so "unclaimed => assume x86" either
   # way and naming it here removes nothing); read the live board/mix counts on `./arroyo check`'s own
   # summary line, never from this prose.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind"
+  #
+  # `nvidia-kepler-kdhead` — the bracketed per-head decode at the tail of
+  # drivers/gpu/kepler_display.rs (register §1 rung KD14), APPENDED AT THE END of the list below. It
+  # belongs on THIS leg for the two reasons the seven SHUTRESTORE features and KFBIND/KFCTXBIND
+  # establish, plus a third that is this rung's own. FIRST, the type-check: every item is inside a
+  # `nvidia-kepler` module and its call site is inside `takeover_display`, so the only configuration
+  # that compiles one byte of its ARMED body carries `nvidia-kepler` AND `nvidia-kepler-takeover`
+  # with it — a TRIPLE, and whether an index-derived mix mask ever delivers one is luck. x86-all
+  # names all three. SECOND, the KNOB→BUILDER WIRING CHECK: this rung's entire product is witness
+  # lines, so a knob wired into arroyo alone would ship media whose banner claims the instrument and
+  # whose wire carries no `:: KDHEAD:` string — and a flight with no `heads_distinct=` line would be
+  # read as "the per-head blocks are dead", which is KD3's shut-out verdict reached a second time
+  # from a build defect (BEAMX86's, BAR1WEDGE's, KFBIND's and KFCTXBIND's failure mode, verbatim —
+  # and in this rung's case it would corrupt the very reading it exists to correct). THIRD, and
+  # unique here: the rung reads a per-head census `beam_probe` publishes only under
+  # `all(nvidia-kepler, beam, nvidia-kepler-kdhead)`, so that publication compiles in exactly ONE
+  # configuration — this leg is the only place in the build that type-checks it, because x86-all
+  # already carries `beam`. Drop either name from this list and the bracket half of the rung is
+  # compiled by nothing.
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the

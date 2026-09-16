@@ -68,12 +68,28 @@ compositor activation at the end of the seam.
 | KD11 `fbcon-probe` — 8-row glyph-block visibility test | `UNAOS_KEPLER_TAKEOVER` | `:: kdisp: fbcon-probe drawn rows=8` (`kepler_display.rs:490`, n=1) | s30: serial says `drawn rows=8`; Peter: "NO graphic visible — only the main calibration draw" | the probe was **under-sized**: three 8×8-px blocks at 220 ppi are ~0.7 mm dots laid over the calibration colour bands. Recorded at the sitting as INCONCLUSIVE, not as a measured null | KD9 | **open** (inconclusive, superseded by KD12) |
 | KD12 `console-repaint` — kernel console on the panel | `UNAOS_KEPLER_TAKEOVER` | `:: kdisp: console-repaint rows=` (`kepler_display.rs:501`, n=1) | s33 boot 2, 2026-07-25: `console-repaint rows=4` with `fbcon: glyphs-active base=90020000 pitch=16384 cell=48x48`; Peter: the console "prints text very well" | — | KD10 | **proven** |
 | KD13 `wcx_activate` — compositor takes the seam | `UNAOS_WC` | `:: kdisp: inner phase wcx_activate` (`kepler_display.rs:519`, n=1) | s40, 2026-07-26: `[wc-x] console-window win=1 panel=2880x1800` … `[wc-x] present win=2 rows=1104..1630 ok=true` | s39 failed first: `[wc-x] activate DECLINE reason=fb-not-ready` — `video::WRITER` was seeded at main.rs step 3, **after** the Kepler takeover where activation runs. Fixed by seeding WRITER beside `fbcon::init` (5701b9a8); the rung passed on the next boot unchanged | KD12 | **proven** |
+| KD14 `kdhead` — the per-head decode, BRACKETED | `UNAOS_KEPLER_KDHEAD` (`nvidia-kepler-kdhead`, implies `nvidia-kepler` + `nvidia-kepler-takeover`); **`UNAOS_BEAM` supplies the bracket** | `:: KDHEAD: bracket source=` (`kepler_display.rs`, n=2 — one arm per posture) · `:: KDHEAD: gop ` (n=1) · `heads_distinct=` (n=3) · `:: KDHEAD: head=` (n=1, the decode line) · `:: KDHEAD: end rung=KD14` (n=1) · the two non-verdicts `DARK-NOT-SCORED` (n=4) and `NO-BRACKET-NOT-SCORED` (n=3) — **code: landed 2026-09-15 behind `nvidia-kepler-kdhead`, default OFF, READ-ONLY (`writes=0`)** | — never flown | — | **KD4** for the control read itself (`head[0] stat underflow=`, [METAL s11]) and **BEAMX86** for taking it: the rung does NOT re-sample, it reads the per-head census `beam_probe` publishes, so bracket and beam gate cannot disagree — without `UNAOS_BEAM=1` on the same boot it prints `bracket=absent`, withholds every decode, and the capture says on its own wire that it is not a statement about the hardware. Also KD1 (the class probe) and KD2 (the GOP base every decode is compared against) | **never-run** |
 
 **What would change the verdict**
 
-- **KD3** — re-run the per-head decode with KD4's HEAD_STAT as the bracket and the per-head stride
-  re-derived for the 917D class. The rung failed because it had no control read, not because the
-  heads are dead; KD4 proves head 0 scans.
+- **KD3** — ~~re-run the per-head decode with KD4's HEAD_STAT as the bracket and the per-head stride
+  re-derived for the 917D class~~ **BUILT, 2026-09-15, as KD14 `kdhead` above — and only a boot can
+  move this row.** The rung failed because it had no control read, not because the heads are dead;
+  KD4 proves head 0 scans. KD14 supplies both halves the re-run needed and neither is the one the
+  row's wording implied, so read what it actually does before scoring it. THE BRACKET IS BORROWED:
+  BEAMX86's `beam_probe` already samples `HEAD_STAT.VERT` on all four heads for 45 ms apiece, so
+  KD14 reads that per-head census rather than taking a second one — a second sample would cost
+  another 180 ms inside the takeover and, worse, would be a different reading than the one the beam
+  gate armed on, making any disagreement between them unattributable. THE STRIDE IS MEASURED, and
+  the measurement has a trap in it that KD3's own conditions do not name: **a counter defeats the
+  test in the wrong direction.** Four reads of ONE collapsed register, taken microseconds apart on a
+  bank that holds `VERT`, `HORZ` and a frame counter, come back with four different values and score
+  as a stride that separates heads. So every block is read twice with a settle and a word that moved
+  is struck from the distinctness tuple; `stable=` says how many survived, and a block where none
+  survived scores `heads_distinct=0/4` — arithmetically impossible for a real reading, since a head
+  is always distinct from nothing, so the zero is the unambiguous "not scored" marker and the
+  `verdict=` field on the same line spells it `UNSCORABLE-all-words-volatile`. What would change THIS row now is one boot that prints
+  `-> AGREE` on a live head: that pins a per-head slicing by observation and re-opens KD3 for good.
 - **KD6** — nothing re-opens a read-only register *as a pointer*. The rung's code was gone, which
   R19 forbids; it is **restored** (SHUTRESTORE, 2026-09-15) behind `UNAOS_KEPLER_REPOINT`, so a
   later arc can re-read 0x6101E0 as the armed-state *witness* it turned out to be, with the one
@@ -84,6 +100,20 @@ compositor activation at the end of the seam.
   needs §2's channel to run, so KD7 is **blocked on the FIFO wall, not refuted by it**.
 - **KD11** — draw at human scale. KD12 already did, and passed; KD11 stays on the books only so
   its "invisible" reading is never cited as a mapping refutation.
+- **KD14** — **built 2026-09-15, never flown.** Its falsifier is pre-registered in
+  `KEPLER-METAL-LOG.md`'s PENDING METAL entry and is three-valued, deliberately, because the three
+  outcomes convict three different things. `-> AGREE` on a head the bracket calls live pins that
+  block's field slicing BY OBSERVATION and re-opens KD3. `-> DISAGREE` names the first field that
+  differs (`mismatch=geom|surface|pitch`) and is a finding about the SLICING — the block answered,
+  the head scans, and our arithmetic on its words is wrong. `separated=0` on the `end` line says
+  every candidate stride collapses and the per-head decode has no block left to stand on, which is
+  s4's reading confirmed by measurement instead of by inference. ⚠ **None of the three is a
+  statement that a head is dead** — that question is answered independently, above the decode, by
+  the bracket line, and a capture whose bracket reads `absent` (no `UNAOS_BEAM=1` on the boot) may
+  not be scored at all. Expected and NOT defects: `headstat` decoding to `decode=none` (s13 settled
+  that this bank exposes no surface address, and `+0x34C` is raster TOTALS **[METAL s13]**, not active
+  geometry),
+  and `evocore`/`headval` reading all-zero exactly as they did at s11.
 
 ---
 

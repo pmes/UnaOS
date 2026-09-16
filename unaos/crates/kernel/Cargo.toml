@@ -155,6 +155,36 @@ nvidia-kepler-kfbind = ["nvidia-kepler", "nvidia-kepler-fifo"]
 # to the one that shipped before this rung, which is why the rung is an inner gated module).
 # Kept in sync with arroyo AND builder/src/main.rs.
 nvidia-kepler-kfctxbind = ["nvidia-kepler", "nvidia-kepler-fifo"]
+# KDHEAD (R19 / shut-out register §1, rung KD14): `UNAOS_KEPLER_KDHEAD=1` — re-run KD3's per-head
+# EVO/CRTC decode with KD4's `HEAD_STAT` reading as the CONTROL BRACKET and the per-head stride
+# MEASURED instead of assumed (`drivers/gpu/kepler_display.rs`, file tail). §1's "what would change
+# the verdict" names exactly one thing for KD3: "re-run the per-head decode with KD4's HEAD_STAT as
+# the bracket and the per-head stride re-derived for the 917D class. The rung failed because it had
+# no control read, not because the heads are dead; KD4 proves head 0 scans." Three parts, all
+# READ-ONLY (`writes=0`). (1) THE BRACKET IS BORROWED, NOT RE-TAKEN: BEAMX86's `beam_probe` already
+# samples `HEAD_STAT.VERT` on all four heads for 45 ms each, and it now publishes that per-head
+# census so this rung can score against the SAME sample the beam gate armed on — a second sampler
+# would cost another 180 ms inside the takeover and would make any disagreement between the two
+# unattributable. A head with `adv>0 && vbd>=2` is LIVE; a decode read against a DARK head prints
+# `DARK-NOT-SCORED`, never "wrong" (R19). (2) THE STRIDE IS MEASURED: the same word is read at head 0
+# and heads 1..3 for five candidate blocks (`headstat` 0x616000/0x800, `armed100` 0x616100/0x800 —
+# s4's own three offsets, `evocore` 0x610460/0x300, `headval` 0x610A00/0x540, `mirror` 0x640400/0x300)
+# and `heads_distinct=<n>/4` says whether the stride separates heads at all; four identical words is
+# the sitting-#4 collapse and the block is not decoded. Every block is read TWICE with a settle,
+# because a COUNTER defeats the test in the wrong direction — four reads of one collapsed counter
+# differ and would score as a working stride — so a word that moved is excluded from the tuple.
+# (3) THE DECODE runs only where the stride separated heads AND the bracket says the head is live:
+# mode geometry, surface address and pitch, each with its slicing's citation class on the wire
+# (falcon_microcode_spec.md §0.1), compared against the GOP framebuffer the takeover inherited.
+# AGREE on a live head pins the decode by observation and re-opens KD3; DISAGREE names the field.
+# Implies `nvidia-kepler` so the gate at its site is self-sufficient, AND `nvidia-kepler-takeover`
+# because the call site is below the takeover's own trace-only early return — arming this knob
+# without the takeover would compile a rung that can never be reached. It does NOT imply `beam`: a
+# `beam`-less build still runs the stride census and prints `bracket=absent` with every decode
+# WITHHELD, which is the honest posture; the flight line carries `UNAOS_BEAM=1`. DEFAULT OFF => every
+# item, the call site and every `:: KDHEAD:` string are unlinked, media byte-identical. Kept in sync
+# with arroyo AND builder/src/main.rs.
+nvidia-kepler-kdhead = ["nvidia-kepler", "nvidia-kepler-takeover"]
 # WC-X86: bring the window compositor (`video::wm`) up on the x86 panel path. Compiles
 # `video/desktop_uefi.rs` — the activation seam and the one kernel-drawn demo window — plus fbcon's
 # CONSOLE-WINDOW route (`panel_console_window_open`: the kernel console becomes an ordinary row in
