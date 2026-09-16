@@ -735,7 +735,7 @@ pub fn read_block_usb_ix(ix: usize, lba: u64, buf: &mut [u8]) -> Result<usize, B
     }
     // WEDGE-8 (F3): a claimed LOAN, not a held lock — the BOT pump below runs with no lock held.
     let mut xhci = claim_xhci_for_io()?;
-    match xhci.storage_read10_on(dev.slot_id, disk.lun, lba as u32, 1) {
+    match xhci.storage_read10_on(dev.slot_id, disk.lun, read10_lba32("read-usb", lba)?, 1) { // LBA32 (SR15): refuse, never truncate — see `read10_lba32` at the file tail.
         Ok(res) if res.status == CswStatus::Passed => {}
         other => {
             io_cause_witness("read-usb", lba, other);
@@ -779,7 +779,7 @@ pub fn write_block_usb_ix(ix: usize, lba: u64, buf: &[u8]) -> Result<(), BlockEr
         core::ptr::write_bytes(dst, 0, dev.block_size as usize);
         core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, n);
     }
-    match xhci.storage_write10_on(dev.slot_id, disk.lun, lba as u32, 1) {
+    match xhci.storage_write10_on(dev.slot_id, disk.lun, read10_lba32("write-usb", lba)?, 1) { // LBA32 (SR15): refuse, never truncate — a wrapped WRITE lands on someone else's sector.
         Ok(res) if res.status == CswStatus::Passed => Ok(()),
         other => {
             io_cause_witness("write-usb", lba, other);
@@ -992,7 +992,7 @@ pub fn unpublish_usb_geometry(slot_id: u8, captured_gen: u64) -> bool {
         return false;
     };
     // Drop an unconsumed attach edge: there is nothing left to mount.
-    USB_STORAGE_READY.store(false, core::sync::atomic::Ordering::Release);
+    USB_STORAGE_READY.store(false, core::sync::atomic::Ordering::Release); USB_PUBLISH_GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel); // USBUNPUB: A RETRACTION IS A GENERATION TOO. Until this call the counter moved only on PUBLISH, so `video/quarry/live.rs::volume_gen` — which ADDS this number to `fs::NS_GEN` — could not see a REMOVAL, and Quarry went on serving a listing of a volume that had physically left until the next ARRIVAL happened to bump it. SR3 covered every mutation UnaOS itself performs; a retraction performed by a human hand was still unheard. Placed HERE, not at the head: AFTER the `departing` unwrap, so a retraction that removed NOTHING moves nothing (a generation is a CHANGE, and every no-op arm above returns `false` having changed no registry), and AFTER both handle clears, so a reader that observes the new generation observes the emptied registry behind it — AcqRel, the ordering both publish sites already use. The gen GUARD at the head of this function compares against the generation the retraction was EARNED against, captured by each caller before its teardown begins, so a tail bump cannot make a retraction refuse itself; the two loop callers in `drivers/xhci/mod.rs` (`:6258`, `:14654`) re-read `usb_publish_gen()` inline on every iteration and the ladder caller (`:11147`) makes one call. Line-neutral append — see the FILE TAIL note below: no `core::panic::Location` in this file moves.
 
     // The removal witness. QEMU cannot hot-unplug a device here, so this line is what proves on the
     // next attended metal boot that the disconnect actually reached the block registry — the exact
@@ -1369,7 +1369,7 @@ pub fn read_block(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
     // WEDGE-8 (F3): a claimed LOAN, not a held lock — the BOT pump below runs with no lock held.
     let mut xhci = claim_xhci_for_io()?;
 
-    match xhci.storage_read10(lba as u32, 1) {
+    match xhci.storage_read10(read10_lba32("read", lba)?, 1) { // LBA32 (SR15): refuse, never truncate — see `read10_lba32` at the file tail.
         Ok(res) if res.status == CswStatus::Passed => {}
         other => {
             // BOTEV: name the concrete SCSI/BOT cause once before it collapses into
@@ -1421,7 +1421,7 @@ pub fn write_block(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
         core::ptr::write_bytes(dst, 0, dev.block_size as usize);
         core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, n);
     }
-    match xhci.storage_write10(lba as u32, 1) {
+    match xhci.storage_write10(read10_lba32("write", lba)?, 1) { // LBA32 (SR15): refuse, never truncate — a wrapped WRITE lands on someone else's sector.
         Ok(res) if res.status == CswStatus::Passed => Ok(()),
         other => {
             // BOTEV: this is the line that turns the flight recorder's `(Io)` into a diagnosis —
@@ -1504,7 +1504,7 @@ pub fn read_blocks(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
     // lock IS the F3 deadlock) and otherwise waits its own bounded, unmasked budget.
     let mut loan = claim_xhci_for_io()?;
     let xhci = &mut *loan;
-    match xhci.storage_read10(lba as u32, count as u16) {
+    match xhci.storage_read10(read10_lba32("read", lba)?, count as u16) { // LBA32 (SR15): the COUNTED form truncated the head argument, so a wrap walked `count` sectors of the wrong disk.
         Ok(res) if res.status == CswStatus::Passed => {}
         other => {
             io_cause_witness("read", lba, other);
@@ -1548,7 +1548,7 @@ pub fn write_blocks(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     let xhci = &mut *loan;
     let dst = xhci.storage_data_ptr().ok_or(BlockError::Io)?;
     unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()); }
-    match xhci.storage_write10(lba as u32, count as u16) {
+    match xhci.storage_write10(read10_lba32("write", lba)?, count as u16) { // LBA32 (SR15): the COUNTED form truncated the head argument, so a wrap OVERWROTE `count` sectors of the wrong disk.
         Ok(res) if res.status == CswStatus::Passed => Ok(()),
         other => {
             io_cause_witness("write", lba, other);
@@ -1574,7 +1574,7 @@ pub fn read_blocks_usb_ix(ix: usize, lba: u64, buf: &mut [u8]) -> Result<usize, 
     // lock IS the F3 deadlock) and otherwise waits its own bounded, unmasked budget.
     let mut loan = claim_xhci_for_io()?;
     let xhci = &mut *loan;
-    match xhci.storage_read10_on(dev.slot_id, disk.lun, lba as u32, count as u16) {
+    match xhci.storage_read10_on(dev.slot_id, disk.lun, read10_lba32("read-usb", lba)?, count as u16) { // LBA32 (SR15): counted form, same rule as the single-block twin above.
         Ok(res) if res.status == CswStatus::Passed => {}
         other => {
             io_cause_witness("read-usb", lba, other);
@@ -1605,7 +1605,7 @@ pub fn write_blocks_usb_ix(ix: usize, lba: u64, buf: &[u8]) -> Result<(), BlockE
     let xhci = &mut *loan;
     let dst = xhci.storage_data_ptr_on(dev.slot_id).ok_or(BlockError::Io)?;
     unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()); }
-    match xhci.storage_write10_on(dev.slot_id, disk.lun, lba as u32, count as u16) {
+    match xhci.storage_write10_on(dev.slot_id, disk.lun, read10_lba32("write-usb", lba)?, count as u16) { // LBA32 (SR15): counted form, same rule as the single-block twin above.
         Ok(res) if res.status == CswStatus::Passed => Ok(()),
         other => {
             io_cause_witness("write-usb", lba, other);
@@ -2910,3 +2910,209 @@ pub fn write_blocks_ahci_port(_port: u8, lba: u64, buf: &[u8]) -> Result<(), Blo
 const NATIVE_AHCI_VETO: &str = "the volume rides an internal SATA disk and the block layer refuses \
                                 every write to it — this image compiles no ATA write opcode at all \
                                 (AHCI / AHCIBOOT)";
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// BLOCKSMALL — LBA32 (LEDGER SR15) and the USBUNPUB fixture.
+//
+// APPENDED AT THE FILE TAIL, for the reason the SDWRITE block above already states: no
+// `core::panic::Location` line in `block.rs` moves, so `./arroyo knoboff <knob> <baseline>` can come
+// out byte-identical. The eight `lba as u32` replacements this arc made ABOVE this line are
+// line-for-line in place, same rule. Nothing here is behind a new knob: the refusal is CORRECTNESS in
+// the shared block layer and rides every build; only the two fixtures are behind `witness`.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// USBUNPUB fixture: **[`unpublish_usb_geometry`] advances [`USB_PUBLISH_GEN`], and only when it
+/// actually retracted something.**
+///
+/// # Why a synthetic pair and not the real stick
+///
+/// QEMU cannot hot-unplug the `usb-storage` device on either the `test` or the `test-arm` leg — the
+/// removal witness in `unpublish_usb_geometry` says so in its own comment, and that is precisely why
+/// this half of the registry shipped with no counter for months. So the leg drives a PUBLISH and a
+/// RETRACTION of a synthetic disk through the real `publish_usb_geometry_lun` /
+/// `unpublish_usb_geometry` entry points — the real registry, the real generation counter, the real
+/// slot-matching rule — exactly as `fs/bootdisk.rs`'s USBREG leg drives `admit`/`plan` with synthetic
+/// disks for the two-card reader no machine in this fleet can present.
+///
+/// # Why it cannot disturb the boot volume
+///
+/// Its entry point is `fs::bootdisk::unafsroot_selftest`, which `main.rs` calls on the heap-up line —
+/// long before xHCI enumeration, so the registry is empty and the fixture's disk takes index 0 and
+/// puts itself back. Belt and braces on top of that ordering: `BLOCK_DEVICE` and `USB_STORAGE_READY`
+/// are SNAPSHOT before and RESTORED after (the publish claims the global at index 0 on the x86 arm and
+/// raises the ready edge; the retraction clears both), and the leg asserts the registry index it took
+/// is empty again. `BOOT_MEDIUM_VERDICT`'s reset is a no-op here because `BM_UNKNOWN` is its initial
+/// value. The synthetic slot id is `0x7f`, and nothing on the wire at heap-up holds any slot at all.
+///
+/// # The legs
+///
+/// 1. **publish steps the counter** — `+1`, and the disk is in the registry under its own slot.
+/// 2. **a STALE retraction is refused and QUIET** — retracting against the generation captured BEFORE
+///    the publish returns `false` (PA35's rule: a newer publish supersedes the retraction) and must
+///    move nothing. This is the control that stops the counter being bumped by a call that changed no
+///    registry; without it a `fetch_add` at the head of the function would pass leg 3 just as well.
+/// 3. **the retraction steps the counter** — `+1`, `true`, and the entry is gone.
+/// 4. **a NO-OP retraction is quiet** — the same slot again, against the current generation: nothing
+///    to remove, `false`, counter unmoved. Together with leg 2 this makes "a generation is a CHANGE" a
+///    claim rather than an implementation detail.
+///
+/// **Go-red:** delete the `fetch_add` from `unpublish_usb_geometry` — `gen_after` equals the
+/// post-publish generation, `retract_step=false`, `-> FAIL`.
+#[cfg(feature = "witness")]
+pub fn usbunpub_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering as O};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, O::Relaxed) {
+        return;
+    }
+    const FX_SLOT: u8 = 0x7f;
+    let saved_global = *BLOCK_DEVICE.lock();
+    let saved_ready = USB_STORAGE_READY.load(O::Acquire);
+    let dev = BlockDeviceInfo {
+        slot_id: FX_SLOT,
+        block_size: SECTOR_BYTES as u32,
+        num_blocks: 64,
+        vendor: *b"UNAOS-FX",
+        product: *b"USBUNPUB FIXTURE",
+    };
+    let g0 = usb_publish_gen();
+    let ix = publish_usb_geometry_lun(dev, 0);
+    let g1 = usb_publish_gen();
+    let placed = ix < MAX_USB_DISKS && usb_disk(ix).map(|d| d.info.slot_id) == Some(FX_SLOT);
+    let publish_step = g1 == g0 + 1;
+    // Leg 2: earned against a generation the publish has already superseded.
+    let stale_refused = !unpublish_usb_geometry(FX_SLOT, g0);
+    let stale_quiet = usb_publish_gen() == g1;
+    // Leg 3: the retraction proper.
+    let retracted = unpublish_usb_geometry(FX_SLOT, g1);
+    let g2 = usb_publish_gen();
+    let retract_step = g2 == g1 + 1;
+    let cleared = usb_disk(ix).is_none();
+    // Leg 4: nothing left to remove.
+    let noop_refused = !unpublish_usb_geometry(FX_SLOT, g2);
+    let noop_quiet = usb_publish_gen() == g2;
+    // Put the two handles back exactly as they were found.
+    *BLOCK_DEVICE.lock() = saved_global;
+    USB_STORAGE_READY.store(saved_ready, O::Release);
+    let pass = placed
+        && publish_step
+        && stale_refused
+        && stale_quiet
+        && retracted
+        && retract_step
+        && cleared
+        && noop_refused
+        && noop_quiet;
+    serial_println!(
+        ":: USBUNPUB: gen_before={} gen_after={} ix={} placed={} publish_step={} \
+         stale_refused={} stale_quiet={} retracted={} retract_step={} cleared={} \
+         noop_refused={} noop_quiet={} -> {} ::",
+        g0, g2, ix, placed, publish_step, stale_refused, stale_quiet, retracted, retract_step,
+        cleared, noop_refused, noop_quiet,
+        if pass { "PASS" } else { "FAIL" }
+    );
+}
+
+/// LBA32 (SR15): the 32-bit sector number a SCSI **READ(10) / WRITE(10)** CDB carries, or a refusal.
+///
+/// # What was wrong, stated exactly
+///
+/// Eight call sites in this file handed `lba as u32` to the BOT pump. `as` on an out-of-range value
+/// does not fail, it TRUNCATES: LBA `0x1_0000_0000` becomes `0`, which is **the boot sector** — a read
+/// that returns the wrong sector as if it were right, and a write that destroys the partition table
+/// with no error anywhere. That is the identical shape `sd_block_arg` (orin ledger A57) removed from
+/// `arch/aarch64/sdmmc_tegra.rs`'s six sites, and this is that shape for this transport.
+///
+/// # Which ceiling, and why it is NOT 4 GiB here
+///
+/// A57's four sites truncated a BYTE OFFSET (`(lba * 512) as u32`), so their ceiling was 4 GiB of
+/// medium. **These eight never multiply.** READ(10)'s CDB bytes 2..5 are a sector number, so the
+/// ceiling is `u32::MAX` **SECTORS** — 2 TiB at 512 B/sector, 4096× further out. The brief's rule is
+/// therefore satisfied by construction and is worth writing down because it is the trap: *the byte
+/// offset must never be truncated before the divide*, and in this file it is never formed at all.
+/// A caller that ever needs a byte offset here must compute it in `u64` and divide first.
+///
+/// # Reachability today — an ACCIDENT, which is why this is a fix and not a comment
+///
+/// The USB geometry that bounds every one of the eight sites comes from `scsi_read_capacity10`
+/// (`drivers/xhci/mod.rs:11864`), whose `last_lba` is itself a `u32`, so `num_blocks` cannot exceed
+/// `0x1_0000_0000` and `lba >= dev.num_blocks` already keeps the argument inside 32 bits. The wrap is
+/// thus UNREACHABLE on this tree — guarded by the width of a reply field, not by anything this layer
+/// decides. The day a READ CAPACITY(16) lands (the command a >2 TiB device requires, and the reason
+/// `last_lba == 0xffff_ffff` is a "ask me again with the 16-byte form" sentinel) the guard evaporates
+/// silently and every site wraps. A refusal costs one compare against a path that costs a USB round
+/// trip, and it converts a future silent mis-address into a stop on the wire.
+///
+/// `op` names the entry point for the witness; the refusal prints and returns
+/// [`BlockError::BadLba`], the same error the geometry bound returns, so no caller learns a new shape.
+fn read10_lba32(op: &str, lba: u64) -> Result<u32, BlockError> {
+    match u32::try_from(lba) {
+        Ok(v) => Ok(v),
+        Err(_) => {
+            serial_println!(
+                ":: BLK: {} REFUSED lba={} — SCSI READ(10)/WRITE(10) addresses a SECTOR with 32 bits \
+                 (ceiling {} sectors = 2 TiB at 512 B); the transfer is refused, never wrapped \
+                 (LBA32, SR15) ::",
+                op, lba, u32::MAX as u64 + 1
+            );
+            Err(BlockError::BadLba)
+        }
+    }
+}
+
+/// LBA32 (SR15) fixture: [`read10_lba32`]'s known-answer test, in the shape `sd_block_arg_selftest`
+/// established for the same defect class on the Orin.
+///
+/// The kernel crate is `no_std` and has no `#[cfg(test)]` idiom, so this is a boot-path witness rather
+/// than a host unit test. It is PURE — no MMIO, no allocation, no disk, no registry — so it runs
+/// wherever `witness` is compiled and disturbs nothing beside it.
+///
+/// **Two positives, each the last value its arm can express**, because an off-by-one at the ceiling is
+/// exactly the defect class: LBA 0 (`0x0000_0000`) and LBA 4,294,967,295 (`0xffff_ffff`).
+///
+/// **Three negative controls**, and they are the point rather than ballast: `1 << 32` — the first
+/// unaddressable sector, and the one whose old value was `0`, i.e. THE BOOT SECTOR — one past it, and
+/// `u64::MAX`. Without them a builder that answered with a number for every input would pass.
+///
+/// **`wrapto=` SHOWS the defect rather than claiming it**: it is `(1u64 << 32) as u32` computed here,
+/// so the wire carries the literal value the eight sites used to hand the CDB. **`byteoff=`** is the
+/// same sector's BYTE offset computed in `u64` (2 TiB), the number that must never be narrowed before
+/// the divide — printed so a reader can see the two ceilings are 4096 apart and not confuse this row
+/// with orin ledger A57's 4 GiB one.
+///
+/// **Go-red, and this fixture's BOUND, stated rather than oversold:** mutate [`read10_lba32`]'s
+/// `u32::try_from` to `Ok(lba as u32)` and the leg reads `refused=0/3 -> FAIL`. Reverting ONE CALL
+/// SITE to `lba as u32` is INVISIBLE here — this is a known-answer test on the helper — and no
+/// behavioural leg can close that gap: the `lba >= dev.num_blocks` geometry bound refuses an
+/// out-of-range LBA with the same [`BlockError::BadLba`] one layer earlier, so a wrapped site and a
+/// refusing site are indistinguishable from any caller on any reachable input. What guards the eight
+/// is the TYPE — this function returns a `Result`, so a site that drops it does not compile into the
+/// same expression — plus LEDGER SR15. A grep gate over the call shape would make it mechanical.
+#[cfg(feature = "witness")]
+pub fn lba32_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering as O};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, O::Relaxed) {
+        return;
+    }
+    let first = read10_lba32("fixture", 0);
+    let last = read10_lba32("fixture", u32::MAX as u64);
+    let refused = read10_lba32("fixture", 1u64 << 32).is_err() as u32
+        + read10_lba32("fixture", (1u64 << 32) + 1).is_err() as u32
+        + read10_lba32("fixture", u64::MAX).is_err() as u32;
+    // What the eight sites used to compute for the first refused vector: 0 — LBA 0, the boot sector.
+    let wrapto = (1u64 << 32) as u32;
+    // The byte offset of that same sector, in u64 and never narrowed: 2 TiB. A57's ceiling is 4 GiB;
+    // these two rows are the same defect class at ceilings 4096 apart, and this number says so.
+    let byteoff = (1u64 << 32).saturating_mul(SECTOR_BYTES as u64);
+    let pass = first == Ok(0) && last == Ok(0xffff_ffff) && refused == 3 && wrapto == 0;
+    serial_println!(
+        ":: LBA32: first={:#010x} last={:#010x} refused={}/3 wrapto={:#010x} byteoff={} -> {} ::",
+        first.unwrap_or(0xdead_beef),
+        last.unwrap_or(0xdead_beef),
+        refused,
+        wrapto,
+        byteoff,
+        if pass { "PASS" } else { "FAIL" }
+    );
+}

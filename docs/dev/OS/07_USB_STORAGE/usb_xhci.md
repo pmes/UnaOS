@@ -9164,6 +9164,60 @@ metal expectation after this lands is **more HID devices enumerating to a workin
 fewer** — a root-port HS keyboard that was silent should type.
 
 
+## 36. BLOCKSMALL — the block registry's two small silences (LEDGER SR15 / QUEUE §3, 2026-09-15)
+
+### 36.1 USBUNPUB — a removal is a generation too
+
+`drivers/block.rs::publish_usb_geometry_lun` has advanced `USB_PUBLISH_GEN` on every arrival since
+PA35, and `video/quarry/live.rs::volume_gen()` ADDS that counter to `fs::NS_GEN` to decide whether a
+cached listing is stale — but `unpublish_usb_geometry`, the retraction half, held no `fetch_add` at
+all: it LOADED the counter only to compare it against the caller's `captured_gen`. So an ARRIVAL
+invalidated Quarry's cache and a REMOVAL invalidated nothing, and the desktop went on offering a
+volume that had physically left until the next arrival happened to bump the number. SR3 closed every
+mutation UnaOS itself performs; this was the one a human hand performs. The fix is one `fetch_add`
+placed AFTER the `departing` unwrap and after both handle clears — after, because a generation is a
+CHANGE and each of the three arms above that point (`captured_gen` superseded, slot 0, nothing
+matched) returns `false` having altered no registry, and because a reader that observes the new
+generation must observe the emptied registry behind it. Bumping at the tail cannot make a retraction
+refuse itself: every caller captures its generation before its teardown begins, the two sweep loops
+in `drivers/xhci/mod.rs` (`:6258`, `:14654`) re-read `usb_publish_gen()` inline per iteration, and the
+rescue ladder (`:11147`) makes one call. QEMU can hot-unplug nothing on either headless leg, so the
+witness drives the real entry points with a synthetic disk at slot `0x7f` from the heap-up line
+(`fs/bootdisk.rs::unafsroot_selftest`), where the registry is still empty and a publish/retract pair
+can disturb no boot volume; `BLOCK_DEVICE` and `USB_STORAGE_READY` are snapshot and restored anyway.
+Wire: `:: USBUNPUB: gen_before=… gen_after=… publish_step=… stale_refused=… retracted=…
+retract_step=… noop_refused=… -> PASS ::`. The two quiet legs are load-bearing — a `fetch_add` at the
+HEAD of the function would satisfy `retract_step` and fail them.
+
+### 36.2 LBA32 — the SCSI READ(10) sector argument refuses instead of wrapping
+
+Eight sites in `drivers/block.rs` handed `lba as u32` to the BOT pump (`storage_read10` /
+`storage_write10` and their `_on` twins, single-block and counted). `as` does not fail on an
+out-of-range value, it TRUNCATES, and LBA `0x1_0000_0000` truncates to `0` — the boot sector: a read
+that returns the wrong sector as if it were right, a write that destroys the partition table with no
+error anywhere. That is the shape orin ledger A57 removed from `arch/aarch64/sdmmc_tegra.rs`, and the
+ceiling here is NOT A57's: READ(10)'s CDB bytes 2..5 are a SECTOR number, not a byte offset, so the
+limit is `u32::MAX` sectors — 2 TiB at 512 B, 4096x further out than A57's 4 GiB. No byte offset is
+ever formed in this file, which is the invariant worth stating because it is the trap: the byte
+offset must never be narrowed before the divide. **Reachability today is an accident, and that is the
+argument for fixing it rather than commenting it**: the geometry that bounds all eight sites comes
+from `scsi_read_capacity10` (`drivers/xhci/mod.rs:11864`), whose `last_lba` is itself a `u32`, so
+`num_blocks <= 0x1_0000_0000` and the existing `lba >= dev.num_blocks` guard keeps the argument inside
+32 bits — guarded by the width of a reply field, not by anything this layer decides. The day a READ
+CAPACITY(16) lands (the command a >2 TiB device requires, and the reason `last_lba == 0xffff_ffff` is
+a "ask again with the 16-byte form" sentinel) that guard evaporates silently and all eight wrap. One
+helper, `read10_lba32(op, lba) -> Result<u32, BlockError>`, refuses with a named witness and
+`BlockError::BadLba` — the same error the geometry bound already returns, so no caller learns a new
+shape — and all eight call it, line for line in place. Wire: `:: LBA32: first=0x00000000
+last=0xffffffff refused=3/3 wrapto=0x00000000 byteoff=2199023255552 -> PASS ::`, where `wrapto` is the
+value the old expression handed the CDB for the first unaddressable sector (zero, the boot sector) and
+`byteoff` is that sector's offset computed in `u64`, printed so the two ceilings cannot be confused. **Go-red, and the fixture's bound stated rather than oversold:** mutating the helper's `u32::try_from` back to `Ok(lba as u32)` gives `refused=0/3 -> FAIL`; reverting one CALL SITE to `lba as u32` is INVISIBLE to the fixture, and no behavioural leg can close that gap — the `lba >= dev.num_blocks` geometry bound refuses an out-of-range LBA with the same `BlockError::BadLba` one layer earlier, so a wrapped and an unwrapped site are indistinguishable from any caller on any reachable input. The type is what guards the eight; a grep gate over the call shape would make it mechanical and is not built.
+**Not fixed here, and deliberately: `drivers/emmc2.rs`** (the Pi's SD path, read-only for this arc)
+builds its block-addressed argument as a bare `lba as u32` at `:736` and `:805` — the one bound
+`sd_block_arg` and `sdhc.rs::lba_arg` both have and it lacks. Its byte-addressed arm IS checked. Same
+accidental guard (`lba >= card.num_blocks`, CSD-derived), same missing refusal. Ledgered in SR15;
+the edit belongs to the Pi seat.
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10), the EHCI-1/2 scout + shared wake (§9/§9a), and the ISRARM completion interrupt (§33).
