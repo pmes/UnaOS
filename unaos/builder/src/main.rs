@@ -517,6 +517,20 @@ fn main() {
     // KNOB→BUILDER WIRING CHECK goes red if this line is dropped. DEFAULT OFF => feature unlinked
     // => byte-identical media.
     if std::env::var("UNAOS_BAR1WEDGE").is_ok() { feats.push("bar1wedge"); }
+    // KFBIND (shut-out register §2 rung KF27): UNAOS_KEPLER_KFBIND=1 arms the PBDMA BASE DERIVATION
+    // at drivers/gpu/kepler_fifo.rs — the PTOP device-info sweep, the DERIVED-vs-LEGACY base
+    // comparison that audits the `0x40000 + i*0x2000` guess every PBDMA verdict since s#6 is read
+    // through, and `IB_GET` (USERD +0x88) read as the falsifier for the first time in the campaign.
+    // READ-ONLY: writes=0, restored=n/a, and the bind/enable write the rung is NAMED for prints as
+    // `skipped write=... reason=uncited`. THIS list is what reaches the kernel binary for MEDIA
+    // builds, and this knob's ENTIRE product is witness lines — so a knob wired into arroyo alone
+    // would put `nvidia-kepler-kfbind` in the banner and not one `:: KFBIND:` string in the image,
+    // and the flight would read as a negative result about the GK107 (`still-dark`) rather than as a
+    // build that never carried the instrument (BEAMX86's failure mode, and BAR1WEDGE's above,
+    // verbatim). Kept in sync with arroyo AND crates/kernel/Cargo.toml; `./arroyo check`'s
+    // KNOB→BUILDER WIRING CHECK goes red if this line is dropped. DEFAULT OFF => module and both
+    // call sites unlinked => byte-identical media.
+    if std::env::var("UNAOS_KEPLER_KFBIND").is_ok() { feats.push("nvidia-kepler-kfbind"); }
     // R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
     // (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only; pure measurement,
     // no scheduling/locking/present change. x86_64-only in effect; DEFAULT OFF => empty inline shims,

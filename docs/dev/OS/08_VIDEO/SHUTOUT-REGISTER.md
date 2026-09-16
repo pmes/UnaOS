@@ -121,6 +121,7 @@ eliminations across sittings #8–#43; the wall has never moved a byte.
 | KF24 `bar1-identity` | `UNAOS_KEPLER_CE` | `:: kepler: bar1-identity VERDICT` (`kepler.rs:3791`, n=1) | s43 (GR25 Boot A): `bar1-identity scratch_off=02015000 magic=CEA50BA5 bar1_rb=CEA50BA5 … pramin_read=CEA50BA5 win_restored=Y` → `VERDICT IDENTITY — … BAR1 offsets ARE physical VRAM addresses on this part; every FIFO pointer in this driver is fine and the paged-BAR1 root cause is CLOSED as a false alarm` | — | KF12 | **proven** — the highest-risk open question in the study, closed as a **false alarm**, which retroactively **keeps** the fence arc's ten eliminations valid |
 | KF25 `mirror-hdr` / `beacon` / `latch-delta` — the 0x640000 window | `UNAOS_KEPLER_FIFO` | `:: kepler: mirror-hdr pass0 off=` (`kepler.rs:1756`, n=1) · `:: kepler: beacon none-seen ::` (`kepler.rs:1948`, n=1) · `:: kepler: latch-delta none ::` (`kepler.rs:1765`, n=1) | s20, 2026-07-24: **triple-refuted** — beacons none-seen twice, `latch-delta none`, and the pre-dump was all-zero this boot vs 158 non-zero rows at s19 | contents are **boot-dependent residue**, not live state we can steer; the window is engine-private memory, not a channel mirror. Window parked | KF5 | **shut-out** |
 | KF26 `DISCRIMINATOR pbdma` | `UNAOS_KEPLER_FIFO` | `:: kepler: DISCRIMINATOR pbdma` (`kepler.rs:3509`, n=1) | s43: `DISCRIMINATOR pbdma{0,1,2} ch=00000000 (CHID=0 ACTIVE=0)` — unchanged since s6 | raw, bit31-valid and bit0-valid runlist entry encodings are **all refuted as sufficient** (s8); the channel is never scheduled onto any PBDMA | KF5 | **open** — the downstream symptom of the wall |
+| KF27 `kfbind` — the PBDMA base itself, derived from PTOP instead of guessed | `UNAOS_KEPLER_FIFO` + `UNAOS_KEPLER_KFBIND` | `:: KFBIND: ptop pbdma=` · `:: KFBIND: pbdma[` · `:: KFBIND: userd ` · `:: KFBIND: skipped write=` · `:: KFBIND: verdict base=` · `:: KFBIND: end rung=KF27` (`kepler_fifo.rs`) — **code: landed 2026-09-15 behind `nvidia-kepler-kfbind`, default OFF, READ-ONLY (`writes=0`)** | — never flown | — | KF1 (the `pbdma-count 3` population), KF5 (the witness that scores the boot), KF24 (BAR1 identity — `userd_off` is a physical page, so the channel control area reads are addressable at all), and **CE-R1** for the PTOP table's existence, which is itself `never-run`: if R1 reports `REFUTED-CLEANLY` this rung's derivation half dies with it and its legacy half still scores | **never-run** |
 
 **Where the FIFO ladder actually stands.** The complete elimination, ten sittings of it: runlist
 encodings, USERD variants, flushes, CTRL_ADDR, a powered engine, a reset-pulsed engine, a **live
@@ -134,6 +135,26 @@ the gatekeeper.
 
 **What would change the verdict**
 
+- **KF27 — and it is ranked FIRST, because it is upstream of every other row in this table that
+  quotes a PBDMA value.** `kepler.rs` addresses the PBDMAs at `0x40000 + i * 0x2000`. That number is
+  a **guess made at s#3**, adopted in the same sitting the previous guess (`0x6c0`) returned
+  `0xBAD0011F`, and it has never been derived from anything. Read the two oldest PBDMA facts in this
+  register against it: `bad-read pbdma 40108` returned **POISON at s#4 and ZERO at s#5** — the same
+  address, the same part, two boots apart — and KF26's `ch=00000000 (CHID=0 ACTIVE=0)` has been
+  quoted as a scheduler verdict since s#6. **A zero read at an unproven base is not the sentence
+  "the channel is not scheduled"; it is the sentence "this address returned zero",** and the ladder
+  has been reading the second as the first for ten sittings. Sittings #4 and #5 each closed by
+  asking for exactly this derivation and neither was ever done. KF11→KF14 is the precedent and it is
+  exact: four recorded failures whose causes were *PMC bit 12 clear*, *the wrong base*, *the wrong
+  base again*, and *DMACTL REQUIRE_CTX set* — not one a property of the silicon.
+- **KF27's second half is a defect in our own instrument, and it needs no metal to state.**
+  `kepler.rs`'s beacon-plant argument quotes envytools `docs/hw/fifo/dma-pusher.rst` "Channel
+  control area" — `… IB_GET 0x88, IB_PUT 0x8C` — and then records, two lines later, that this
+  driver's deleted GP_GET/GP_PUT witness (added `1c9e2570`, removed `51b98bab`) read **`0x8C/0x90`**.
+  `0x8C` is IB_PUT, the pointer the HOST writes; `0x90` is not in the enumerated list at all. **The
+  campaign's founding observable, `gp_get=0`, may never have been a reading of GP_GET**, and IB_GET
+  (`0x88`) is read by nothing in this tree today. KF27 reads it. Its falsifier is that one register
+  moving across the submit: `-> FETCHED`, or `-> STILL-DARK under <named conditions>`.
 - **KF6 / KF8 / KF9** — each was refuted *as a sufficient cause of the strip*, under a host that
   had never run FECS ucode. Every one of them is worth re-flying **as the first step of a boot
   where a FECS context machine is being brought up** — that is R19's exact scenario. Their code is
@@ -466,12 +487,12 @@ key on this machine (a clean negative from flight 5), so any wattage baseline mu
 | ladder | rungs | open | shut-out | never-run | proven |
 | --- | --- | --- | --- | --- | --- |
 | §1 Kepler display | 13 | 1 | 3 | 0 | 9 |
-| §2 Kepler FIFO / PBDMA | 26 | 5 | 10 | 0 | 11 |
+| §2 Kepler FIFO / PBDMA | 27 | 5 | 10 | 1 | 11 |
 | §3 Kepler CE | 6 | 0 | 0 | 6 | 0 |
 | §4 gen7 R1–R7 | 9 | 0 | 5 | 0 | 4 |
 | §5 GMUX / iGPU | 9 | 1 | 3 | 2 | 3 |
 | §6 PCIe / ASPM | 5 | 1 | 1 | 1 | 2 |
-| **total** | **68** | **8** | **22** | **9** | **29** |
+| **total** | **69** | **8** | **22** | **10** | **29** |
 
 A rung whose status cell reads "shut-out … ; proven as …" is counted **shut-out**: the hypothesis
 it was flown to test is the thing that failed, and that is what this register is for. **Nothing

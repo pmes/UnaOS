@@ -3312,6 +3312,17 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     serial_println!(":: kepler: recon-post cpuctl={:08X} ::", fecs_read(bar0, 0x409000 + 0x100));
 
 
+                                    // KFBIND phase A (register §2 KF27) — and its placement is the whole
+                                    // point of the rung, so it is a contract and not a convenience:
+                                    // STRICTLY PRE-SUBMIT. The falsifier is whether `IB_GET` advances
+                                    // ACROSS the submit below, so the baseline has to be taken before the
+                                    // runlist page is rebuilt and handed over. It is also above every
+                                    // FECS access that follows, which keeps it clear of the `0x409504`
+                                    // poison law (spec §5.4). READ-ONLY — zero device writes.
+                                    #[cfg(feature = "nvidia-kepler-kfbind")]
+                                    let kfbind_pre =
+                                        crate::drivers::gpu::kepler_fifo::kfbind_pre(bar0, bar1, userd_off);
+
                                     // 3. Submit Runlist
                                     //
                                     // Rebuild the page first. The mirror-window beacon probe planted
@@ -3508,6 +3519,17 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                         let is_active = (ch >> 13) & 1;
                                         serial_println!(":: kepler: DISCRIMINATOR pbdma{} ch={:08X} (CHID={} ACTIVE={}) ::", i, ch, chid_active, is_active);
                                     }
+
+                                    // KFBIND phase B — deliberately IMMEDIATELY BELOW the DISCRIMINATOR
+                                    // loop, because that loop is the reading this rung exists to audit:
+                                    // it decodes `CHID=0 ACTIVE=0` from a dword read at the legacy
+                                    // `0x40000 + i*0x2000` base, and a zero at an unproven base is a
+                                    // READ-ZERO and not a scheduler state. Adjacency puts the audited
+                                    // line and the audit in the same screenful of any capture. The
+                                    // DISCRIMINATOR loop above is UNCHANGED — this rung adds lines and
+                                    // removes none, so every historic `awk` still compares.
+                                    #[cfg(feature = "nvidia-kepler-kfbind")]
+                                    crate::drivers::gpu::kepler_fifo::kfbind_post(bar0, bar1, &kfbind_pre);
 
                                     let final_err = mmio_read(bar0, 0x252c);
                                     let final_stat = mmio_read(bar0, 0x263c);
