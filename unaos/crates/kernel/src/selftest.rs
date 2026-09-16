@@ -892,8 +892,8 @@ fn run_sync_section(
 //
 // FAT mount status, a root-directory walk, and a known-file read (HELLO.BIN): verify the read
 // length and that content came back. `tste` NEVER mutates the volume — no create/write/delete (those
-// stay in the boot-sequenced battery). When no FAT volume is present (e.g. the raw usb.img pattern
-// image under a plain `./arroyo test`) every storage check SKIPs honestly with the reason.
+// stay in the boot-sequenced battery). When no FAT volume is present (e.g. the aarch64 default
+// `usb.img` raw pattern image) storage checks SKIP honestly; the x86 default `usb-boot.img` carries a FAT32 slot since DEFAULTMEDIUM, so plain `./arroyo test` now runs this section for real.
 
 const KNOWN_FILE: &str = "HELLO.BIN";
 

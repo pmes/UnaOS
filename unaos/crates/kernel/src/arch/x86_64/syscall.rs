@@ -21662,9 +21662,9 @@ const FLC_STORAGE_WAIT_MS: u64 = 5000;
 /// revoked-cap-write denial + revoke-discard proof. PASS iff witness == `U9X_WITNESS_ALL` AND torn down AND no
 /// kill AND the revoke check held AND (disk-backed) the on-disk write-back proof held.
 ///
-/// TWO MODES: disk-backed (a FAT volume backs SCRATCH.BIN — `test-fat sf`) requires the on-disk proof; in-memory
-/// (no FAT — plain `./arroyo test` attaches a non-FAT usb.img) runs the M1 core with the flush a no-op and does
-/// ZERO AP disk I/O (the pre-flight is skipped, bounding the no-FAT run). METAL-CONFIRMED on the rMBP
+/// TWO MODES: disk-backed (a FAT volume backs SCRATCH.BIN — since DEFAULTMEDIUM the x86 default `usb-boot.img`
+/// does this too, not only `test-fat sf`) requires the on-disk proof; in-memory (no FAT — the aarch64 default
+/// `usb.img` raw pattern image) runs the M1 core with the flush a no-op and does ZERO AP disk I/O (the pre-flight is skipped, bounding the no-FAT run). METAL-CONFIRMED on the rMBP
 /// (2026-07-08 bench, post xHCI-enumeration fix): on-disk write-back PASSes off a FAT16 SD card; the pre-flight
 /// self-heals a prior boot's persisted pattern (see below) so re-runs stay honest. NOTE: the disk-backed flush
 /// is the FIRST concurrent AP-side xHCI BOT I/O in the tree; the pump is BOUNDED (a 2000-iter timeout -> `Io`),
