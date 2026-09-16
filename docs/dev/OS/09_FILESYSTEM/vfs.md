@@ -846,6 +846,19 @@ mistaken for the end of enumeration. After the fix the same leg reads `waited=14
 because that line is pinned verbatim by `scripts/specs/x86-fat.spec:156`, whose regex fixes
 `waited=[0-9]+ms` ADJACENT to `handles=` with no slack anywhere along it.
 
+**STORWAIT2 (2026-09-16) added a THIRD conjunct, and it is a VETO ahead of both reasons rather than a
+fourth reason:** `drivers::xhci::storage_pending_any()` — STORSLOT's per-record predicate, true while
+a claimed mass-storage device has not finished its SCSI bring-up — because "the BUS is quiet" and
+"the DISKS are up" are two different facts and only the first was being asked (enumeration drains
+BEFORE the deferred SCSI chain runs, and `service_storage` brings up one record per main-loop pass),
+so on a two-stick machine `found` released on the first disk and the one-shot `volid` census missed
+the second (STORSLOT's STOP 1: `USBREG: publish … ix=1` at serial line 1174, the census at 1095).
+`STORAGE_WAIT_MS` is unchanged and a pending bring-up can only DELAY the witness, never release it;
+the vocabulary gains `pending` for the ceiling that expired with one still in flight, which is a
+different fact from a ceiling on a machine that never had a disk. A board with no xHCI answers
+`NotReady` -> `false` and is never held (QEMU `raspi4b`), so the aarch64 `settled=found`, `waited=0ms`
+on pass 1 above is untouched.
+
 ### 13.5 What stopped being printable, and why that is the arc working
 
 Three FAT-specific facts left the output, because a trait that could carry them would be a FAT

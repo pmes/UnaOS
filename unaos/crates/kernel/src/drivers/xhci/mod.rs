@@ -17005,3 +17005,40 @@ impl XhciController {
         );
     }
 }
+
+/// STORWAIT2: **is any claimed mass-storage device still waiting for its SCSI bring-up?** Read-only,
+/// no side effects, no protocol — the free-function form of
+/// [`XhciController::storage_pending_any`], for callers outside this module.
+///
+/// `shell::fatverb_storage_witness`'s bounded wait is the caller, and the question it could not ask
+/// is the difference between "the BUS is quiet" and "the DISKS are up". Those are two facts and not
+/// one: enumeration drains BEFORE the deferred SCSI chain runs (BOOTPACE M2, console-first) and
+/// `service_storage` consumes ONE record's bring-up latch per main-loop pass (STORSLOT), so on a
+/// machine with two sticks the bus goes quiet, the first disk publishes, and the second is still
+/// several passes away. Measured on `UNAOS_USB2=sf … ./arroyo test-fat sf` (STORSLOT's STOP 1):
+/// `USBREG: publish … ix=1` at serial line 1174, the witness's one-shot `volid` census at 1095.
+///
+/// Three answers, each the honest one, and the same three [`enumeration_in_flight`] gives:
+/// * `Ok` — the live state: any record still carrying `pending_bringup`.
+/// * `Busy` — the controller is LOANED, i.e. a BOT transaction or a service pass is running right
+///   now, which on this path is very often the bring-up itself. Conservative `true`; the caller's
+///   ceiling (`STORAGE_WAIT_MS`) bounds the wait either way, so the conservative answer costs at
+///   most one more service pass.
+/// * `NotReady` — no controller was ever installed (`skip_xhci`, or a board with no xHCI at all;
+///   QEMU `raspi4b` is one). No device can be mid-bring-up, so `false` — a board with no xHCI is
+///   never held here and its wait ends exactly where STORWAIT left it.
+///
+/// `claim()` is the shell-safe idiom for this (WEDGE-8, and [`enumeration_in_flight`] above reads
+/// the same way): a masked O(1) take that never waits and never spins on a preempted holder,
+/// returning the loan by RAII. This function issues no TRB, touches no MMIO and mutates no field.
+pub fn storage_pending_any() -> bool {
+    match claim() {
+        Ok(x) => x.storage_pending_any(),
+        Err(XhciClaimError::Busy) => true,
+        Err(XhciClaimError::NotReady) => false,
+    }
+}
+// STORWAIT2 ends here, and this trailing line is deliberate. The block above closes with the same
+// three lines `enumeration_in_flight` does, and git's common-suffix matching deduplicated exactly
+// that shape once in this file already (the XHCIKBD fold: two tail appends, union 3 braces / 4 lines
+// short). A distinct last line keeps a future union arithmetically checkable.

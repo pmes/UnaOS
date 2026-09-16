@@ -4765,9 +4765,39 @@ pub fn fatverb_storage_witness() {
     //             registry has published at least one disk. The medium is as enumerated as it is
     //             going to get; a survey now is a survey of the whole machine.
     //   ceiling — `STORAGE_WAIT_MS` expired. Unchanged, and still the law below.
+    //   pending — the ceiling expired with a claimed storage bring-up STILL in flight (STORWAIT2,
+    //             below). A CEILING LABEL and never a settle reason: it is printed, never returned.
     //
     // The SD reader's mere presence satisfies none of them. It is still surveyed, still mounted, and
     // still LISTED as home soil — it is simply no longer mistaken for the end of enumeration.
+    //
+    // STORWAIT2 — AND THE BRING-UPS, not merely the enumeration.
+    //
+    // STORSLOT made the driver bring up MORE THAN ONE storage device, on consecutive service
+    // passes, and measured what that exposed (its STOP 1, `UNAOS_USB2=sf … ./arroyo test-fat sf`):
+    // the second disk's `USBREG: publish … ix=1` landed at serial line 1174 while this witness's
+    // one-shot `volid` census had already run at 1095, so the capture carried ONE mount family and
+    // the second stick was not LISTED under `/volumes/` at all. BOTH reasons above were answered by
+    // the FIRST disk — `found` binds the root the moment the kernel-carrying stick publishes, and
+    // `usb` asks only that the registry be non-empty and the BUS be quiet, which it already is:
+    // enumeration DRAINS before the deferred SCSI chain runs (BOOTPACE M2, console-first) and
+    // `service_storage` consumes ONE record's bring-up latch per main-loop pass. "The bus is quiet"
+    // and "the disks are up" are two different facts, and only the first was being asked.
+    //
+    // So a claimed storage record whose bring-up has not completed now VETOES EVERY REASON, ahead
+    // of them: `xhci::storage_pending_any()`, STORSLOT's own per-record predicate, read through the
+    // same WEDGE-8 `claim()` idiom `enumeration_in_flight` uses (`Busy` -> conservative true,
+    // `NotReady` -> false). It is a veto and never a reason — a pending bring-up can only DELAY the
+    // witness, never release it — and `STORAGE_WAIT_MS` still bounds the delay, unchanged. The
+    // ceiling then says which kind of expiry it was (`settled=pending` rather than
+    // `settled=ceiling`), because a deadline that expired on a machine still bringing a disk up is
+    // a different fact about that machine than one that expired on a machine which never had one.
+    //
+    // WHERE THIS CHANGES NOTHING, and it is the shared-code half: a board with NO xHCI answers
+    // `NotReady` -> false and never enters the veto — QEMU `raspi4b` is exactly that board — so the
+    // Pi's and the Orin's medium, the card the kernel was read from, still settles `found` on pass
+    // 1 at `waited=0ms`, exactly as STORWAIT left it. A board whose only storage is already up
+    // holds no record with `pending_bringup` set and is likewise untouched.
     //
     // The shape is `desktop_uefi::desktop_app_service`'s, deliberately — including its law that the wait
     // TERMINATES IN A LINE rather than in silence. A boot that genuinely never gets a block device
@@ -4776,9 +4806,15 @@ pub fn fatverb_storage_witness() {
     // the witness rather than out of it, and the census on the line says which it was.
     //
     // Cost: `locate()` is the SO38-cached survey (a bound root is cached for the boot; a no-root walk
-    // is redone only when the set of present sources CHANGES), and the other two terms are one
-    // registry count and one masked O(1) `claim()`. A pass that is going to wait pays no walk.
+    // is redone only when the set of present sources CHANGES), and the other terms are one registry
+    // count and two masked O(1) `claim()`s. A pass that is going to wait pays no walk, and STORWAIT2
+    // vetoes AHEAD of `locate()`, so a pass that is going to wait for a bring-up pays no survey.
     fn settle_reason() -> Option<&'static str> {
+        // STORWAIT2: the veto, ahead of both reasons. A disk this machine is ABOUT to have is a
+        // disk the one-shot census must not be taken without.
+        if crate::drivers::xhci::storage_pending_any() {
+            return None;
+        }
         if matches!(crate::fs::bootdisk::locate(), crate::fs::bootdisk::Verdict::Bound(_)) {
             return Some("found");
         }
@@ -4800,7 +4836,8 @@ pub fn fatverb_storage_witness() {
         if now.saturating_sub(started) < STORAGE_WAIT_MS {
             return;
         }
-        // Fall through: speak on whatever census there is, and say `settled=ceiling` below.
+        // Fall through: speak on whatever census there is, and say `settled=ceiling` below — or
+        // `settled=pending`, when a storage bring-up outlasted the ceiling (STORWAIT2).
     }
     if FATVERB_WITNESS_DONE.swap(true, Ordering::AcqRel) {
         return;
@@ -4809,7 +4846,14 @@ pub fn fatverb_storage_witness() {
     // was there from one whose deadline expired on an empty machine, and it certainly cannot tell
     // either from a boot that waited out a bus and then found its disk — which is the whole defect
     // this pair exists to make unmissable in a capture.
-    let settled = settle.unwrap_or("ceiling");
+    // STORWAIT2: `pending` is a CEILING LABEL, never a settle reason — when a bring-up is still in
+    // flight `settle` is `None` here by construction, so this arm runs only on an expiry, and naming
+    // that expiry apart is what stops a 30 s ceiling on a machine mid-bring-up from reading in a
+    // capture like a 30 s ceiling on a machine that never had a disk. `unwrap_or_else`, not
+    // `unwrap_or`: a settled pass must not pay a second `claim()` for a string it will not use.
+    let settled = settle.unwrap_or_else(|| {
+        if crate::drivers::xhci::storage_pending_any() { "pending" } else { "ceiling" }
+    });
     let waited = match WITNESS_WAIT_SINCE_MS.load(Ordering::Relaxed) {
         0 => 0,
         t => crate::arch::ticks().saturating_sub(t),
