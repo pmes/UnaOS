@@ -1164,6 +1164,79 @@ the measurement behind it. The registry is not an allowlist to grow: its header
 says it must reach zero, and a row is legitimate only while the declaration
 carries a deliberate written decision about what the module's absence means. "It
 builds fine" is not a reason; the gate already knows it builds.
+
+---
+
+## GATE-KNOBBUILD — the knob→builder wiring probe, and the day it red-lined about nothing
+
+**Where it runs.** Inside `check_kernel_cfg` in `unaos/arroyo`, after the
+knob→leg coverage check and immediately before GATE-KNOBPARITY, which extends it
+and shares its `return 1`.
+
+**Invariant.** Every `UNAOS_*` knob in arroyo's top-level `_feats` map whose
+feature is named by a LITERAL x86 cfg leg (the derived `x86-mix-N` legs are
+excluded: their unions hold features media never arms) is READ by
+`builder/src/main.rs`. x86 MEDIA features are rebuilt by the builder from its OWN
+env map, so a knob wired here alone lights the `⚡ kernel features:` banner while
+the kernel the metal boots carries nothing. arroyo warned about that in prose
+four times and the warnings still produced a fifth victim (`rastmc`,
+2026-08-27), which is why it is a check. aarch64 needs no twin: its build invokes
+cargo directly and prints the effective-features line when it differs from the
+banner.
+
+**Mechanism.** One `sed` parses arroyo's own map for
+`[ -n "${UNAOS_X:-}" ] && _feats="${_feats}<names>,"`, and each matched knob whose
+feature is in the literal-x86 set must appear as a quoted string in
+`builder/src/main.rs`. Note WHAT is grepped: the env var name in the builder, not
+the `feats.push`. A rename on one side only is the failure it is built for.
+
+**Control.** `UNAOS_WC->wc` must be parsed out of the knob map. If it is not, the
+map parser is broken and the probe gives NO verdict, loudly, rather than
+reporting an empty difference as a clean tree.
+
+**LEDGER SO6 — the control's finest hour, and the defect it exposed.** On
+2026-09-06 `unaos/arroyo check` run from the REPO ROOT red-lined this probe with
+no defect behind it. `${BASH_SOURCE[0]}` is the path the script was INVOKED with,
+so from the repo root it is RELATIVE — and the probe runs after arroyo has cd'd
+internally, where `unaos/arroyo` no longer resolves. `sed` read nothing, the
+control refused a verdict, and a build was lost to a red about nothing. **It
+failed loudly instead of passing silently, and that is the whole argument for
+the control probe.** Fixed the same day by `981463ea`: the path is
+`$WORKSPACE_DIR/$(basename "${BASH_SOURCE[0]}")`, absolute by construction
+(`WORKSPACE_DIR` is computed by `cd`-ing `dirname "$0"` at load, before any
+internal `cd`), with `basename` keeping the rename case. The builder path was
+already anchored the same way. What `981463ea` did NOT ship is the proof below.
+
+**Goes red when** a mapped, x86-leg-named knob is unread by the builder (the
+`rastmc` shape), or the control misses (no verdict).
+
+**GO-RED proof, three states × BOTH invocation directories, measured 2026-09-15
+at `2946ea30`.** The drill runs against a scratch MIRROR of the tree — `crates`,
+`scripts` and `arroyo` symlinked to the real ones, `builder/src/main.rs` a
+writable copy, and a harness copy of arroyo whose cfg-leg `cargo check` line is
+stubbed to `true` with one extra `cfgonly` dispatch arm. That is the shape this
+file's own standard section prescribes, and it means the mutation never touches
+the tree and no cargo runs. Invoked as `./unaos/arroyo-h cfgonly` from the mirror
+root and as `./arroyo-h cfgonly` from its `unaos/`:
+
+| state | mirror root | from `unaos/` |
+| --- | --- | --- |
+| clean | rc=0, `✅ knob→builder wiring OK` | rc=0, same line |
+| builder stops reading the knob (`UNAOS_WC` renamed to `UNAOS_WINCOMP` in the copy, `feats.push("wc")` left in place) | rc=1, `❌ … UNAOS_WC->wc — mapped in arroyo, named by a literal x86 leg, and UNREAD by builder/src/main.rs` | rc=1, identical |
+| map line broken (the harness's own `UNAOS_WC` map entry renamed) | rc=1, `❌ … control probe FAILED — UNAOS_WC->wc not parsed from this file's knob map` | rc=1, identical |
+
+Same verdict text and same exit code from both directories in all three states,
+which is the SO6 property under test; the copy was restored and diffed back to
+byte-identical with the tree's file after the drill.
+
+**Legitimate update.** A knob whose feature an x86 leg names gets its builder env
+line in the same commit. Excluding a knob from the probe is not an update path —
+GATE-KNOBPARITY exists because the ONE idiom this `sed` parses was already too
+narrow once (`sdwrite`), and narrowing it further is the direction that produced
+both victims.
+
+---
+
 ## GATE-KNOBPARITY — the three feature vocabularies must agree
 
 **Where it runs.** Inside `check_both`'s kernel-cfg-coverage gate in
@@ -1350,6 +1423,78 @@ VERDICT here rather than a wrong one, because the instrument has no power to
 separate the dep's codegen from the knob's. Score that arc on the armed artifact
 instead. Do NOT relax the refusal to get a number out of the tool — a `0` whose
 cache state is unknown is exactly the green SMALLFIX proved means nothing.
+## GATE-BATTERY-EVIDENCE — a leg judges the capture it keeps
+
+**Where it runs.** `battery()`'s `_step` in `unaos/arroyo`. Not in `check_both`:
+it asserts a property of the HARNESS rather than of the tree, which makes
+GATE-TESTTRUNC its sibling, and it is held to the same standard here.
+
+**Invariant.** The file a battery leg takes its verdict from is the file that leg
+leaves behind, and it holds only bytes that leg's own command produced.
+
+**Why a gate, and what it cost (LEDGER SR10).** `_step` accepts
+`logfile[:verdictfile]`, because `kernel8-test` does not echo its serial capture
+to stdout. The step's stdout was kept under `target/battery/`; the VERDICT was
+taken from `test_kernel8`'s fixed `target/serial-pi.log`, read where it lay. Two
+consequences, in opposite directions, out of the same sharing:
+
+* **Forwards.** The next `kernel8-test` overwrites it — and the standing rule for
+  a red leg under load is *re-run it alone*, so the prescribed diagnostic is what
+  destroys the capture that would say why. Measured 2026-09-10: battery step log
+  mtime 12:02:45, verdict file mtime 12:04:35, i.e. the re-run's bytes, not the
+  battery's. The pi4 leg was twice written off as a load flake with nobody able
+  to read its evidence. What the battery DID keep is the step's stdout, which for
+  that leg is mbench's verdict TABLE — the one file whose FORBID rows quote
+  `-> FAIL` as pattern text, which is why the scan was pointed away from it.
+* **Backwards.** Bytes the leg's own command never wrote could reach its verdict:
+  anything left in the shared path between one leg and the next is judged as if
+  it had come off that leg's wire.
+
+**Mechanism.** When a step names a verdict file distinct from its log, `_step`
+now (1) removes the shared path and its `.run` sidecar BEFORE running the
+command, so the leg judges only its own run, and (2) copies the capture to
+`<step>.serial.log` beside the step log afterwards, sidecar beside it at
+`<step>.serial.log.run`, and every scan reads THE COPY. `cp`, not `mv`: the
+callee's own path stays where its verb documents it. The sidecar travels beside
+the capture and is never appended into it — a harness writes beside its evidence
+(LAWS §5), and a `mode=` / `log_sha256=` line inside a serial log is a line
+mbench would then judge. A red step names both files. `test_kernel8` already
+`rm -f`s that log itself, so (1) costs the real leg nothing; it moves the
+invariant off a callee that may change and onto the battery that depends on it.
+
+**Control.** A leg whose OWN run puts `-> FAIL` on the wire must still red — the
+fourth row of the table below. Without it the first three rows are satisfiable by
+a harness that judges nothing at all.
+
+**Goes red when** a leg's command exits nonzero, its pattern is absent from the
+capture, or `FAULT_PATTERNS` matches in it. A leg that produced no capture leaves
+the copy ABSENT, the `awk` scans then fail to open it and the leg reds — the
+honest verdict for a leg with no evidence.
+
+**GO-RED proof, by execution; no QEMU and no build.** A scratch harness extracts
+the real `_step` out of a given `arroyo` and drives it with stubs: leg-A writes a
+clean capture into the shared path and is judged; a later writer then appends
+`fixture: -> FAIL` to that shared path AFTER leg-A's verdict — the "re-run the
+red leg alone" diagnostic, or simply the next leg; leg-B then makes its own clean
+run. Same harness, same stubs, run against the base file and the fixed one:
+
+| assertion | base `2946ea30` | fixed |
+| --- | --- | --- |
+| leg-A green, its own run being clean | PASS | PASS |
+| leg-B green, the poison not being leg-B's evidence | **FAIL** | PASS |
+| the file leg-A JUDGED still holds leg-A's bytes | **FAIL** | PASS |
+| CONTROL: a leg whose own run emits a fault line still reds | PASS | PASS |
+| harness exit | 1 | 0 |
+
+The third row is measured as a sha of leg-A's judged file at its verdict and
+again at the end of the battery: `209829f0…` then `bd955032…` at the base,
+`209829f0…` both times after the fix.
+
+**Legitimate update.** A new leg needing a separate verdict file names it the
+same way and inherits both halves. Pointing a leg's verdict back at a fixed
+shared path, or at any path a second leg also writes, reintroduces this exactly;
+the capture a leg is judged on belongs under `target/battery/` with that leg's
+own name on it.
 
 ---
 

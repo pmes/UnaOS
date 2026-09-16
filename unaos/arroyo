@@ -9131,8 +9131,41 @@ battery() {
         local faultscan=1
         if [ "$1" = "--build" ]; then faultscan=0; shift; fi   # BANNERCERT alias sweep (QUEUE §5 item (a), measured 2026-09-15 at 9a7b09a4): `grep -n -E '"\$\{1:-\}" = |"\$1" = ' unaos/arroyo` returns exactly TWO lines — :1147, which is the ⚠ PROSE quoting the defect that was already fixed there (the live gate beside it is a `case` over all six jetson spellings), and THIS line, a function-local argument test on `battery`'s own `$1`, not a verb gate at all. So no single-spelling VERB gate survives in this file; the remaining exposure is not "another `= "verb"` somewhere" but a feature armed with no witness in the artifact, which is what scripts/banner-cert.sh now answers.
         local name="$1" pattern="$2" logf="${3%%:*}" vf="${3#*:}"; shift 3
+        # ── SR10: THE JUDGED FILE IS THE KEPT FILE ────────────────────────────────────────────────
+        # A step may name a SEPARATE verdict file (`logfile:verdictfile`), because `kernel8-test` does
+        # not echo its serial capture to stdout. That verdict file is a FIXED, SHARED path
+        # (`target/serial-pi.log`) and it was read WHERE IT LAY: the battery kept `$logf` — the step's
+        # stdout, i.e. a verdict TABLE — and judged a file that the NEXT `kernel8-test`, or the
+        # standing "re-run a red leg alone" diagnostic, overwrites. Measured 2026-09-10: battery step
+        # log mtime 12:02:45, verdict file mtime 12:04:35 — the re-run's bytes, not the battery's. So
+        # no red pi4 leg could be diagnosed after any later run, and the prescribed remedy was what
+        # destroyed the evidence; the leg was twice written off as a load flake with nobody able to
+        # read it. The same sharing runs the other way too: bytes this leg's command never produced
+        # could reach this leg's verdict.
+        #
+        # Both halves close here, and neither is optional:
+        #   (1) the shared path and its `.run` sidecar are CLEARED before the command, so a leg judges
+        #       only what its OWN run wrote — not an earlier leg's tail, not a re-run's fault line;
+        #   (2) after the command the capture is COPIED beside the step log as `<step>.serial.log`
+        #       (its sidecar beside it at `<step>.serial.log.run`, never appended INTO the capture —
+        #       a harness writes beside its evidence, LAWS §5), and every scan below reads THE COPY.
+        # `test_kernel8` already `rm -f`s that log itself, so (1) costs the real leg nothing; it makes
+        # the invariant the BATTERY's instead of a callee's, which is where a gate's invariant belongs.
+        local kept="$logf"
+        if [ "$vf" != "$logf" ]; then
+            kept="${logf%.log}.serial.log"
+            rm -f "$vf" "${vf}.run" "$kept" "${kept}.run"
+        fi
         echo -e "${COLOR_CYAN}⚡ battery: ${name}${COLOR_RESET}"
         if "$@" > "$logf" 2>&1; then local crc=0; else local crc=$?; fi
+        if [ "$vf" != "$logf" ]; then
+            # `cp`, not `mv`: the callee's own path stays where its verb documents it. A run that
+            # produced NO capture leaves `$kept` absent on purpose — the awk scans below then fail to
+            # open it and the leg reds, which is the honest verdict for a leg with no evidence.
+            cp -f "$vf" "$kept" 2>/dev/null || :
+            if [ -f "${vf}.run" ]; then cp -f "${vf}.run" "${kept}.run"; fi
+            vf="$kept"
+        fi
         local ok=1
         [ "$crc" -ne 0 ] && ok=0
         if [ -n "$pattern" ]; then
@@ -9148,7 +9181,11 @@ battery() {
         if [ "$ok" -eq 1 ]; then
             results="${results}  ✅ ${name}\n"
         else
-            results="${results}  ❌ ${name}  (log: ${logf})\n"; rc=1
+            # SR10: name BOTH files when they differ — the step log is the verdict table, the kept
+            # copy is the wire, and a reader who is only given the first cannot diagnose the red.
+            local where="log: ${logf}"
+            if [ "$kept" != "$logf" ]; then where="${where}; judged capture: ${kept}"; fi
+            results="${results}  ❌ ${name}  (${where})\n"; rc=1
         fi
     }
 
@@ -9188,8 +9225,11 @@ battery() {
     # ~1700-line capture, so every truncation this gate exists to catch still satisfied it while dozens
     # of tail witnesses were missing. The pattern argument is deliberately EMPTY — the spec's 63
     # REQUIRE/COUNT directives are the assertion now, and the generic `-> FAIL`/`FAIL ::` scan still
-    # runs against target/serial-pi.log (NOT against the step log, which quotes those strings as FORBID
+    # runs against the SERIAL CAPTURE (NOT against the step log, which quotes those strings as FORBID
     # PATTERN TEXT in the verdict table and would false-red on every run).
+    # SR10: the capture named here is `test_kernel8`'s own fixed path; `_step` clears it before the
+    # run and copies it to `$blog_dir/kernel8.serial.log` (+ `.run`) before judging, so the file this
+    # leg's verdict comes from is the file this leg leaves behind.
     _step "pi4 kernel8-test 60 (mbench 63/63)" ""            "$blog_dir/kernel8.log:target/serial-pi.log" "$0" kernel8-test 60
     # A TRUNCATED pi4 step is red — but it is a DIFFERENT red from a regression, and the summary says so
     # rather than leaving the reader to open the log and guess.
@@ -9198,7 +9238,9 @@ battery() {
     fi
     _step --build "esp-jetson (links)"   ""                  "$blog_dir/esp-jetson.log"   env UNAOS_TEGRA=1 "$0" esp-jetson
 
-    local passes; passes=$(awk '/-> PASS|: PASS/{n++} END{print n+0}' "$blog_dir/test-fat.log" target/serial-pi.log 2>/dev/null || echo '?')
+    # SR10: tally over the KEPT pi capture, not the shared path — a concurrent or later
+    # `kernel8-test` moves the shared one and the summary would then count someone else's run.
+    local passes; passes=$(awk '/-> PASS|: PASS/{n++} END{print n+0}' "$blog_dir/test-fat.log" "$blog_dir/kernel8.serial.log" 2>/dev/null || echo '?')
     echo -e "\n${COLOR_PURPLE}════════════ BATTERY SUMMARY ($(( SECONDS - t0 ))s) ════════════${COLOR_RESET}"
     echo -e "$results"
     echo "  PASS lines (fat+pi): $passes   step logs: $blog_dir/"
