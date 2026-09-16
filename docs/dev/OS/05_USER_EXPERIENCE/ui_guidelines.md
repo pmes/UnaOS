@@ -162,3 +162,31 @@ whose outer box covers another's title band — and then, before it takes them d
 ONTO another's title bar through the real `move_to` and asserts that it SAW that. **A detector that
 can only ever print zero is not a detector**, so `control=0` red-lines the verdict even when the live
 scan is clean.
+
+## 9. One cursor, one size, everywhere (SO5)
+
+Peter at the glass, render7, 2026-09-06: *"mouse cursor grows when over desktop background"*. **A
+pointer is one sprite at one size over every surface.** It does not read the surface under it, and a
+surface may not choose the pointer's scale: the arrow's block scale is a function of the PANEL and of
+nothing else (`ui::Metrics::for_height(panel_height).scale`), so a window's own integer upscale —
+WC-D's — reaches its content and stops at its frame.
+
+The defect this rule is written against was not a scale that varied; it was **two sprites**.
+`video::cursor` draws the compositor's arrow into the FRONT buffer at `(ui::BASE_CELL + 1)·s` = 9·s,
+and `pal::cursor` draws a second arrow into whatever back buffer its caller owns, at
+`9·sprite_scale` with `sprite_scale = metrics().scale + 1` — 9·(s+1), one step larger. Which one the
+operator sees is decided by the desktop present's occluder subtraction, not by either module: over a
+window the back buffer's spans are covered and only the 9·s arrow lands, over the backdrop nothing
+covers them and the 9·(s+1) arrow does. Cross a window edge and the size toggles. **Nothing grows — a
+bigger sprite stops being covered**, which is why no "cursor resize" path was ever found by reading
+the draw code.
+
+`pal::cursor::SPRITE_OWNS_PAINT` decides whether both are live. On x86 it is true, `pal::cursor::paint`
+never runs, and the rule holds by construction. On aarch64 it is false and both are live; converging
+the two is the standing fix (`pal.rs`, kernel-core). **A second sprite is the defect even when its
+scale agrees** — two painters for one pointer is two things to keep in step — so the convergence to
+aim at is one sprite, and the equal-scale reading is the floor, not the goal.
+
+Scored, not asserted: `wm::glassfix2_selftest` (behind `witness`) prints each module's own extent and
+the one the present leaves on each surface kind, and `docs/dev/evidence/rmbp-0915/glassfix2/score_shot.py`
+re-derives both from the capture's own panel height rather than re-reading the witness's numbers.
