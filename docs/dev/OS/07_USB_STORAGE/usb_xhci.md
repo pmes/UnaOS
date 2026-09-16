@@ -9010,12 +9010,12 @@ driver never reads LEC.
 ESIT half, and the interval encoding (`bInterval - 1` for HS/SS, `floor(log2(bInterval)) + 3` for
 LS/FS) was already right for both speeds and is unchanged.
 
-**The sibling this arc did NOT touch, and it is a standing item.** `configure_hid_endpoints` writes
-the identical `(mps << 24)` into DW0 at both its keyboard and its pointer endpoint, and the identical
-bare `mps` into DW4. It has never been convicted because every HID device this driver has configured
-is LS/FS behind a Transaction Translator, and the xHC does not police a TT's periodic budget — the
-split-transaction budget is the hub's — so the bad value is accepted and ignored. Fixing it changes
-root-port HID behaviour and belongs to its own arc with its own measurement.
+**The sibling this arc did NOT touch** — `configure_hid_endpoints`, which writes the identical
+`(mps << 24)` into DW0 at both its keyboard and its pointer endpoint and the identical bare `mps` into
+DW4 — was taken up as its own arc, HIDESIT, and is fixed in §35.4 below. ⚠ The reason given here for
+its survival ("every HID device this driver has configured is LS/FS behind a Transaction Translator,
+and the xHC does not police a TT's periodic budget") **was wrong, and HIDESIT's baseline is what
+disproved it.** Read §35.4 for the measured version.
 
 ### 35.2 S2 — a hub-downstream device had no name, and the retry ledger paid for it
 
@@ -9070,6 +9070,92 @@ injection over QMP, and `scripts/qmp_type.py` is key-only (qcodes through `send-
 `input-send-event`; no `abs`, `rel` or `btn`). That clause wants a pointer mode in that script plus an
 `arroyo` typist block, and is owed. With nothing moving the QEMU tablet, `evts=0` is honest, and
 scoring on it would be a gate that fires on every input.
+
+### 35.4 HIDESIT — the same shift at both ROOT-PORT HID endpoints, and why the TT excuse was wrong
+
+`configure_hid_endpoints` built its keyboard and its pointer endpoint context exactly the way
+`configure_hub_interrupt_ep` built the hub's, defect included, at **both** arms:
+
+    ep.add(0).write_volatile((encode_interval(interval) << 16) | (mps << 24));
+    ...
+    ep.add(4).write_volatile(mps);
+
+Same misplacement, same two fields: DW0 bits 31:24 are **Max ESIT Payload Hi** and DW4 splits into
+**Average TRB Length** (15:0) and **Max ESIT Payload Lo** (31:16). An mps-8 boot keyboard therefore
+asked the controller for `8 << 16` = **524288 bytes per service interval**, 65536x what one 8-byte
+boot report needs, and never stated the payload it actually needs.
+
+**Measured at `d186e15c`**, `UNAOS_XHCIKBD=1 UNAOS_WC=1 UNAOS_QEMU_FULL=1 ./arroyo test 90`, rc=1:
+
+    :: HIDESIT: slot=2 kbd ep=0x81 dci=3 speed=3 mps=8 burst=0 bival=7 ival=6/6
+       dw0=0x08060000 dw4=0x00000008 esit=524288 esithi=8 avgtrb=8 want=8 -> FAIL ::
+    :: HIDESIT: slot=3 ptr ep=0x81 dci=3 speed=3 mps=8 burst=0 bival=4 ival=3/3
+       dw0=0x08030000 dw4=0x00000008 esit=524288 esithi=8 avgtrb=8 want=8 -> FAIL ::
+
+**`speed=3` is HIGH SPEED, and both devices are on ROOT PORTS.** That single field retires §35.1's
+explanation for why this arm was never convicted. There is no Transaction Translator anywhere on this
+leg — QEMU's `usb-kbd` and `usb-tablet` attach directly to `xhci.0` and train HS — so the
+"split-transaction budget is the hub's" reasoning never applied to it. The real reason the driver got
+away with it is the one §35.3 already measured for the hub: **QEMU's xHCI model validates no periodic
+budget and no Max ESIT Payload, on a root port exactly as on a hub.** A real xHC budgets an HS
+root-port interrupt endpoint directly, and 524288 B/ESIT against an HS budget of ~3 KB per microframe
+is completion code **8 = Bandwidth Error** (§4.14.2) — the same code the Orin's HS hub returns.
+
+The fix is HUBFIX's, applied at both arms and ungated:
+
+    ep.add(0).write_volatile(encode_interval(interval) << 16);
+    ...
+    ep.add(4).write_volatile(mps | (mps << 16));
+
+Max ESIT Payload for an interrupt endpoint is `wMaxPacketSize x (Max Burst+1) x (Mult+1)`. This
+function writes DW1 bits 15:8 (Max Burst) and DW0 bits 9:8 (Mult) as ZERO at every speed, so the
+product is exactly `mps` and both halves of DW4 are `mps`. Average TRB Length is unchanged — already
+correct, and §6.2.3.6 only requires it non-zero. Max ESIT Payload Hi = 0 is also the only
+always-legal value (§6.2.3.8 makes it RsvdZ when `HCCPARAMS2.LEC = 0`, which this driver never reads).
+
+`encode_interval` is **not** the defect here either, and unlike §35.1 that is checked rather than
+asserted: the witness recomputes the encoding independently of the function and scores the two against
+each other, printing `ival=<submitted>/<recomputed>`. Both endpoints read `6/6` and `3/3` — the HS
+branch (`bInterval - 1`) on bInterval 7 and 4.
+
+**The witness.** `hidesit_note`, behind `witness`, at the tail of `drivers/xhci/mod.rs`, called from
+each arm the instant the five endpoint-context stores are done. It re-reads DW0/DW1/DW4 out of the
+input context the Configure-Endpoint TRB points at, so the numbers are the bytes the xHC is handed
+and not a recomputation, and assembles `esit` as `(DW0[31:24] << 16) | DW4[31:16]` the way the
+controller does — which is why the defect prints as a number 65536x too large rather than as a missing
+field. One line per configured HID endpoint:
+
+    :: HIDESIT: slot=<s> <kbd|ptr> ep=<0xNN> dci=<d> speed=<sp> mps=<m> burst=<b> bival=<i>
+       ival=<submitted>/<recomputed> dw0=<0x…> dw4=<0x…> esit=<n> esithi=<h> avgtrb=<a> want=<w>
+       -> PASS|FAIL ::
+
+PASS iff `esit == want` (= `mps x (burst+1)`) `&& esithi == 0 && avgtrb == mps` and the two interval
+encodings agree. There is **no new knob**: the leg is the existing `UNAOS_XHCIKBD=1` fixture, which
+already puts the keyboard on `xhci.0`, and the pointer is there by default.
+
+**What the fixed run proves, and what it cannot.** Same command, rc=0:
+
+    :: HIDESIT: slot=2 kbd … dw0=0x00060000 dw4=0x00080008 esit=8 esithi=0 avgtrb=8 want=8 -> PASS ::
+    :: HIDESIT: slot=3 ptr … dw0=0x00030000 dw4=0x00080008 esit=8 esithi=0 avgtrb=8 want=8 -> PASS ::
+    :: XHCIKBD: reports=80 restated=0 lost=0 expected=80 stalls=4 … -> PASS ::
+    :: MOUSE-1: HID pointer detected vid:pid=0627:0001 proto=0 absolute ep=0x81 mps=8 interval=4 ==
+
+so the keyboard still types every report and the pointer still enumerates and is detected. The go-red
+restores the shift at the KEYBOARD arm alone and the keyboard line alone reddens, which is the point of
+scoring the two endpoints separately: they are different slots building different input contexts, and
+a fix proved on one proves nothing about the other.
+
+**HIDESIT is fixed-unflown**, for §35.3's reason restated: QEMU accepted the bad context, so the QEMU
+verdict is about the dwords submitted, not about acceptance. **The behaviour change this buys is on
+metal, and it is a real one — some devices will now configure that previously could not.** Any
+High-Speed or SuperSpeed HID device on a root port — a directly-attached HS keyboard or mouse, and on
+the Orin the root-port HS/SS devices generally — was being handed a Max ESIT Payload a conforming xHC
+must refuse, and would have failed Configure-Endpoint with code 8 (HS, Bandwidth Error) or 17 (SS,
+Parameter Error, since a SS endpoint's Max ESIT Payload may not exceed `mps x (MaxBurst+1) x (Mult+1)`).
+LS/FS HID behind a TT is unaffected either way: it was accepted before and is accepted now. So the
+metal expectation after this lands is **more HID devices enumerating to a working endpoint, and none
+fewer** — a root-port HS keyboard that was silent should type.
+
 
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
