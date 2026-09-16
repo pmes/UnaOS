@@ -709,9 +709,12 @@ a leading `@boot ` routes the check to `EFI/BOOT/BOOTX64.EFI` beside the artifac
 (`unaos_ivb` is a cross-crate boot-info ABI knob whose code is in the bootloader,
 not the kernel, and whose witness is therefore in the other binary).
 
-`cond` — "what else must be true for this literal to exist at all" — gained two
-TERM forms in BANNERCERT2, each because a real row needed it, and both print
-UNVERIFIABLE (loud, named, never a pass and never a red) when unsatisfied:
+`cond` — "what else must be true for this literal to exist at all" — has three
+TERM forms beyond a bare feature name, each added because a real row needed it,
+and all three print UNVERIFIABLE (loud, named, never a pass and never a red) when
+unsatisfied. A cond this grammar cannot parse is neither lenient nor strict — it
+is a row whose meaning nobody knows — so the script exits **2** naming the row and
+the term before printing one verdict, exactly as a sub-9-byte token does:
 
 * `a+b` — an OR-GROUP. The shape of a module with two INDEPENDENTLY GATED
   CALLERS. `ga10b_fw` is gated on `ga10bprobe5` alone, but its only callers are
@@ -726,7 +729,45 @@ UNVERIFIABLE (loud, named, never a pass and never a red) when unsatisfied:
   that `baremetal`, `bootlog`, `usbdebug` and `tegra` each make that tail
   unreachable; the compiler is told so and deletes it. A `UNAOS_WITNESS=1
   ./arroyo kernel8` image therefore carries the entire witness battery and cannot
-  carry that string. Copy the cond from the `cfg_attr`; do not guess it.
+  carry that string. Copy the cond from the `cfg_attr`; do not guess it — and then
+  read the code the `cfg_attr` points AT, which is the next bullet's whole story.
+* `!a@except:<t>+<t>…` — a NEGATED term WITH AN EXCEPTION (CERTCOND,
+  2026-09-15). `a` makes the literal unreachable EXCEPT on a build satisfying
+  EVERY term after `@except:`. A term is either an ARCH (`x86_64`, `aarch64`) or a
+  FEATURE; `+` is AND here, not OR, because the spec is ONE configuration copied
+  out of the source's `not(all(…))`. The arch is answered by **the artifact's own
+  ELF header** — `e_machine`, two little-endian bytes at offset `0x12` (`0x3E`
+  x86-64, `0xB7` aarch64) — and never by an argument, so a `cond` can be wrong
+  about the source, which a human can check, and can never be wrong about the
+  bytes under test, which is the thing the gate exists to interrogate. A flat
+  image (`kernel8.img`) has no header: the caller may pass the arch as argument 3,
+  and the census line says which of the two happened on every run. With no header
+  and no argument the arch is `unknown`, every arch term is UNSATISFIED, and the
+  row stays UNVERIFIABLE rather than being guessed in either direction.
+
+  **WHY IT IS A CONJUNCTION AND NOT A BARE ARCH, which is the part worth
+  keeping.** The obvious spelling is `!usbdebug@aarch64`, read "usbdebug only
+  kills this literal on aarch64", and it is wrong for the only row that needs it —
+  wrong in the REDDENING direction. `main.rs:~1155` gates the usbdebug terminal
+  loop, the thing that actually deletes the post-GUI tail, on
+  `all(feature = "usbdebug", not(all(target_arch = "x86_64", feature = "wc")))`.
+  The exemption is an arch AND a feature together, and the loop still compiles on
+  x86_64 WITHOUT `wc` — the knob's original purpose, pre-GUI bring-up on a card
+  with no compositor at all. A bare-arch term would mark that build's `witness`
+  row checkable, find the literal correctly absent, and print MISSING: a false red
+  on a real configuration, where the over-refusal it replaces is only a loud
+  silence. LAWS §5, wrong-strict is worse than wrong-lenient. The term copies the
+  `not(all(…))` it comes from, so it cannot be wrong in a way the source is not.
+
+**AND THE RULE THAT CAME OUT OF NEEDING IT: A `cfg_attr` IS A LINT DIRECTIVE, NOT
+THE GATE.** `main.rs:79` is an `allow(unreachable_code)` naming four features that
+CAN make the tail unreachable. It is deliberately coarse — a lint allowed too
+widely costs nothing — and BANNERCERT2 copied it faithfully into the cond, which
+was the right instinct applied to a document that was never a contract. The gate
+is each feature's OWN early-exit, and one of the four is narrower than the
+`cfg_attr` says. So: a negated term is seeded from the `#[cfg]` on the code that
+does the deleting; a `cfg_attr` or a comment is a POINTER to that code, never the
+source. This is step 6b of the script's seeding recipe.
 
 **WHAT IT FOUND ON ITS FIRST ARMED RUN, and fixed in the same arc.** `esp-x86` on
 the rmbp flight-7 knob line: 27 of 28 banner features certified in the artifact,
@@ -906,8 +947,75 @@ file's own "a check that cannot fire is an absent one" seen from one step back.
 Fixing it needs a `cond` term that can say "`usbdebug` only kills this literal
 when NOT (x86 and `wc`)", i.e. an arch-aware conjunction the cond grammar does
 not have; adding one is a gate-language change and is not folded into a row
-re-seed. **Registered here, and in `docs/dev/QUEUE.md` §5 on the row this arc
-ticks. Owner: whoever next extends the cond grammar.**
+re-seed. ~~**Registered here, and in `docs/dev/QUEUE.md` §5 on the row this arc
+ticks. Owner: whoever next extends the cond grammar.**~~
+
+✓ **FIXED (CERTCOND, 2026-09-15, branch `exec-rmbp-certcond` off `bc9cf442` —
+re-derive the sha at the land). The grammar gained the term, the row was
+re-seeded, and THE FLIGHT-7 CERT NOW READS 28/28 WITH `unverifiable=0`.** The cond
+is `!baremetal,!bootlog,!usbdebug@except:x86_64+wc,!tegra`, state `measured(1)`,
+and the `witness` row on the flight-7 line is
+`feature=witness witness=:: U1a: no application processors online — ring-3 demo SKIPPED :: hits=1 -> OK`
+where it printed UNVERIFIABLE for two arcs. Summary, same command, before → after:
+`ok=27 … unverifiable=1` → `ok=28 missing/leak=0 registered-divergences=0
+unverifiable=0 nowitness=0 noverdict=0`. The coverage the table claimed and the
+coverage it had are now the same number, which is the whole content of the fix:
+nothing about the artifact changed, only what the gate is willing to say about it.
+
+**GO-RED, three mutations on the SAME ARTIFACT with no rebuild** — the point of
+running them on one ELF is that the only variable is the gate:
+
+| # | mutation | result | rc |
+|---|---|---|---|
+| a | cond → `!usbdebug@except:aarch64+wc` (right shape, WRONG ARCH) | the `witness` row returns to `-> UNVERIFIABLE`, the census naming the arch it read from the header: *"the artifact's arch is x86_64, not aarch64"*; summary `ok=27 … unverifiable=1` | **0** |
+| b | cond → `!usbdebug@onlyon:x86_64+` (UNPARSEABLE) | `❌ banner-cert: NO VERDICT — the cond for 'witness' is not in the grammar: term '!usbdebug@onlyon:x86_64+': the only qualifier after '@' is 'except:'`, printed BEFORE any row verdict | **2** |
+| c | CONTROL, the `sdwrite` shape: one letter off a token (`posture=` → `pasture=`) | `feature=sdwrite … hits=0 -> MISSING`, `witness` still OK | **1** |
+
+(a) is rc 0 on purpose and that is the design, not a weak go-red: an UNVERIFIABLE
+has never been a red in this gate and must not become one — it is a statement that
+the gate declined to look, and the row LINE plus the `unverifiable=` field are
+where it is counted. (c) is the control that keeps (a) and (b) honest: the same
+script on the same bytes still reds a real absence, so the two new exits are new
+behaviour and not a gate that stopped looking.
+
+**THREE MORE PROBES ON THE ARCH READER ITSELF, because a new input channel that is
+never fed a wrong value is an unchecked one.** Same artifact, plus a flat copy of
+it made with `llvm-objcopy -O binary`:
+
+| probe | census line | `witness` row |
+|---|---|---|
+| FLAT image, no arch argument | `arch=unknown (FLAT image (no ELF header) and the caller named no arch …)` | UNVERIFIABLE — *"the artifact's arch is unknown, not x86_64"* |
+| FLAT image, caller passes `x86_64` | `arch=x86_64 (FLAT image (no ELF header); the caller named this arch in argument 3)` | `hits=1 -> OK` |
+| ELF, caller LIES and passes `aarch64` | `⚠ argument 3 says 'aarch64' and the ELF header says 'x86_64' — the HEADER wins`, then `arch=x86_64 (read from the artifact's OWN ELF header …)` | `hits=1 -> OK` |
+
+The third is the one that matters and is why the reader is a reader and not a
+parameter: an argument that disagrees with the bytes is announced and discarded.
+The first is the conservative direction on purpose — with nothing to read the arch
+from, the row declines rather than guessing, and rc stays 0.
+
+**THE SWEEP THE FIX OWED: is any OTHER row over-refusing?** The defect is
+"UNVERIFIABLE on an artifact where the row's token measures > 0", and every row of
+the 48 was measured against the SAME flight-7 ELF this arc built, then cross-read
+against its cond's verdict on that build's banner. **`witness` was the only one,
+and after the fix there is none.** Eight other rows have a cond that goes
+unsatisfied on that banner, and all eight measure **0** hits: the `tegra` family
+(`bsptick`, `bsprun`, `sdmmc`, `ga10bprobe5a`) and the `baremetal` family (`smp7`,
+`vugpar`, `genet`, `nettest`). None of them rides an x86 banner, so a real x86 run
+never consults their conds at all, and their zeros are the OFF side working rather
+than the same defect. Every one of the 28 rows the banner DOES name now measures
+≥ 1 — `unaos_ivb` included, at 1 hit in `EFI/BOOT/BOOTX64.EFI` where its `@boot `
+token routes it. The remaining 0-hit rows are all off-banner aarch64 and Pi rows,
+which is what they should read on an x86 artifact. No row is registered as a known
+over-refusal, because there is none left to register.
+
+⚠ **ONE THING NOT TAKEN, and it is one line in a file outside this arc's set.**
+`arroyo`'s `kernel8` call site passes two arguments, so the FLAT `kernel8.img` is
+certified with `arch=unknown`. Nothing regresses — the only arch-qualified term in
+the table is on `witness`, whose cond hits `!baremetal` first on every Pi build and
+never reaches it — but an arch-qualified term added to any Pi row would silently
+stay UNVERIFIABLE there. The fix is to pass `aarch64` as argument 3 from that call
+site (and `x86_64`/`aarch64` from the ELF verbs is unnecessary: they are read from
+the header). Owner: whoever next touches `unaos/arroyo`'s media verbs.
 
 **AND `smolnet` WAS THE SAME DEFECT, FOUND THE SAME DAY — the datum came from
 SMALLFIX, measured twice, and it is the reason 7(a)/7(b) are rules rather than an

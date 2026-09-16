@@ -18,12 +18,21 @@
 # string is ABSENT, which is the same defect seen from the other side (a feature quietly compiled
 # in that the banner never claimed).
 #
-# USAGE:  bash scripts/banner-cert.sh <artifact> <banner-feature-list>
+# USAGE:  bash scripts/banner-cert.sh <artifact> <banner-feature-list> [<arch>]
 #           <artifact>             the built kernel ELF (target/x86_64_esp/kernel.elf)
 #           <banner-feature-list>  exactly the comma-separated list the `⚡ kernel features:` banner
 #                                  printed for this build — NOT $KERNEL_FEATURES, NOT the knob line.
 #                                  The banner is the claim under test; passing anything else makes
 #                                  the gate vacuous.
+#           <arch>                 x86_64 | aarch64. OPTIONAL and IGNORED for an ELF: the script
+#                                  reads the arch out of the artifact's own ELF header (e_machine at
+#                                  offset 0x12) so that no argument and no `cond` can lie about which
+#                                  machine the bytes under test are for. It is read ONLY for a FLAT
+#                                  image (`kernel8.img` has no ELF header), and the census line says
+#                                  which of the two happened on every run. A flat image with no arch
+#                                  argument leaves the arch `unknown`, and an arch-qualified cond
+#                                  term is then UNSATISFIED — the row stays UNVERIFIABLE rather than
+#                                  being guessed in either direction.
 #
 # WHAT IT FOUND ON ITS FIRST ARMED RUN (2026-09-15, rmbp flight-7 knob line, `esp-x86`), AND FIXED
 # IN THE SAME ARC: `arroyo:1992` put `sdwrite` on the banner of every verb while
@@ -73,6 +82,19 @@
 #      battery and CANNOT carry that string — a row with no cond called it a MISSING and would have
 #      red-lined every Pi desktop build. Write the cond as `!baremetal,!bootlog,!usbdebug,!tegra`,
 #      copied from the `cfg_attr` rather than guessed.
+#      6b. AND THEN FOLLOW EACH NEGATED TERM INTO THE CODE THAT MAKES IT TRUE, BECAUSE A `cfg_attr`
+#      IS A LINT DIRECTIVE AND NOT THE GATE (CERTCOND, 2026-09-15). `main.rs:79`'s `cfg_attr` is an
+#      `allow(unreachable_code)` — it names four features that CAN make the tail unreachable, and it
+#      is deliberately coarse, because a lint that is allowed too widely costs nothing. The gate is
+#      each feature's own early-exit, and one of the four is narrower than the `cfg_attr` says:
+#      `usbdebug`'s terminal loop is `#[cfg(all(feature = "usbdebug", not(all(target_arch = "x86_64",
+#      feature = "wc"))))]` (`main.rs:~1155`), so on x86_64 + `wc` — the rMBP's flight configuration —
+#      `usbdebug` is compiled and the tail is NOT deleted. Copied faithfully from a document that was
+#      never a contract, the cond over-refused on exactly the build this tree flies: `witness` printed
+#      UNVERIFIABLE while its token MEASURED 1 hit on that artifact, and the gate's coverage was one
+#      row narrower than its table claimed for two arcs. The term is now
+#      `!usbdebug@except:x86_64+wc`. THE RULE: a negated term is seeded from the `#[cfg]` on the code
+#      that does the deleting, and a `cfg_attr`/comment is a pointer to that code, never the source.
 #   7. SEED FROM THE FEATURE'S *UNCONDITIONAL* CALLER, NOT FROM ITS MOST INTERESTING FUNCTION — and
 #      MEASURE THE ROW ON THE LEANEST BUILD THAT ARMS THE FEATURE, NOT ON THE RICHEST (SMALLFIX3,
 #      2026-09-15). This is step 5's trap with one turn more on it, and it is the one that shipped:
@@ -124,17 +146,40 @@
 #           Such a row prints NOWITNESS — loud, named, counted in the summary, never silent.
 #   cond    comma-separated features that must ALSO be on the banner for the token to exist at all
 #           (the literal sits under a nested cfg, OR its module is dead-stripped unless one of these
-#           compiles a CALLER in — see seeding steps 5 and 6). Commas are AND. Two term forms beyond a bare
-#           name, each added by BANNERCERT2 because a real row needed it:
+#           compiles a CALLER in — see seeding steps 5 and 6). Commas are AND. Three term forms beyond a
+#           bare name, each added because a real row needed it:
 #             `a+b`  OR-GROUP — either alternative makes the literal exist. The shape of a module
 #                    with two independently gated callers (`ga10bprobe5a+witness` for `ga10b_fw`).
+#                    (BANNERCERT2.)
 #             `!a`   NEGATED — the literal exists only when `a` is OFF, because `a` makes the code
-#                    the literal lives in UNREACHABLE. `witness`'s token sits in `kernel_main`'s
-#                    post-GUI tail, and `main.rs:79` says in its own `cfg_attr` that `baremetal`,
-#                    `bootlog`, `usbdebug` and `tegra` each make that tail unreachable — so on a Pi
-#                    `kernel8` image `witness` IS compiled and that literal provably is not.
+#                    the literal lives in UNREACHABLE. `main.rs:79` says in its own `cfg_attr` that
+#                    `baremetal`, `bootlog`, `usbdebug` and `tegra` each make `kernel_main`'s post-GUI
+#                    tail unreachable — so on a Pi `kernel8` image `witness` IS compiled and the
+#                    literal that lives in that tail provably is not. (BANNERCERT2.)
+#             `!a@except:x+y`
+#                    NEGATED WITH AN EXCEPTION — `a` makes the literal unreachable EXCEPT on a build
+#                    that satisfies EVERY term after `@except:`, which may name an ARCH (`x86_64`,
+#                    `aarch64` — matched against the artifact's own ELF header, never against an
+#                    argument) or a FEATURE (matched against the banner). `+` is AND here, not OR:
+#                    the spec is one configuration, copied from the source's `not(all(...))`.
+#                    (CERTCOND, 2026-09-15, and the row that needed it is `witness`.)
 #           When a term is unsatisfied the row prints UNVERIFIABLE naming it — loud, never silent,
-#           never a pass. `-` for none.
+#           never a pass. `-` for none. A cond this grammar cannot parse is exit 2 before any verdict
+#           is printed, the same way a short token is: a gate that cannot read its own table is not a
+#           green one.
+#
+#           WHY THE EXCEPTION FORM IS A CONJUNCTION AND NOT A BARE ARCH (CERTCOND). The obvious
+#           spelling is `!usbdebug@aarch64`, read "usbdebug only kills this literal on aarch64". It is
+#           the WRONG shape for the only row that needs it, and wrong in the reddening direction.
+#           `main.rs:~1155` gates the usbdebug terminal loop — the thing that deletes the post-GUI
+#           tail — on `all(feature = "usbdebug", not(all(target_arch = "x86_64", feature = "wc")))`.
+#           So the exemption is an ARCH *and* A FEATURE together, and the loop still compiles on
+#           x86_64 WITHOUT `wc` (the knob's original purpose: pre-GUI bring-up on a card with no
+#           compositor). A bare-arch term would mark that build's `witness` row checkable, find the
+#           literal correctly absent, and print MISSING — a false red on a real configuration, where
+#           today's over-refusal is only a loud silence. LAWS §5: wrong-strict is worse than
+#           wrong-lenient. The term copies the `not(all(...))` it comes from, so it cannot be wrong in
+#           a way the source is not.
 #   state   measured | measured(N) | unmeasured-here — which artifact has actually proven this token.
 #           `measured(N)` carries the HIT COUNT the proving artifact returned, which is the strongest
 #           form: a later re-seed that drops the count to a different number is visible without a
@@ -162,7 +207,7 @@ fi
 # ---------------------------------------------------------------------------------------------
 bc_table() {
 cat <<'TABLE'
-witness|:: U1a: no application processors online — ring-3 demo SKIPPED ::|!baremetal,!bootlog,!usbdebug,!tegra|measured
+witness|:: U1a: no application processors online — ring-3 demo SKIPPED ::|!baremetal,!bootlog,!usbdebug@except:x86_64+wc,!tegra|measured(1)
 wc|[wc-x] desktop-app DECLINE reason=no-storage name=/|-|measured(1)
 wcg-paygo|[wc-g] paygo win=|witness|measured
 wcdvalve|[wc-d] valve CLOSED util~|witness|measured
@@ -267,18 +312,116 @@ bc_in_list() {  # bc_in_list <needle> <comma-list>
     case ",${2}," in *",${1},"*) return 0 ;; *) return 1 ;; esac
 }
 
+# THE ARCH OF THE BYTES UNDER TEST, read out of the artifact itself. An ELF says what machine it is
+# for in `e_machine`, two little-endian bytes at offset 0x12 (0x3E x86-64, 0xB7 aarch64), after the
+# 4-byte `\x7fELF` magic and the `EI_DATA` endianness byte at offset 5. Reading it here rather than
+# taking it from the command line is the whole point of the arch-qualified cond term: a `cond` can
+# then be wrong about the SOURCE, which a human can check, but it can never be wrong about the
+# ARTIFACT, which is the thing the gate exists to interrogate. A flat image (`kernel8.img`) has no
+# header at all and answers `flat`; the caller may then name the arch, and the census says so.
+bc_arch_of() {  # bc_arch_of <file> -> x86_64 | aarch64 | elf-machine-<n> | flat
+    local magic ei_data b18 b19 m
+    magic="$(LC_ALL=C od -An -tx1 -N 4 -- "$1" 2>/dev/null | tr -d ' \n')"
+    [ "$magic" = "7f454c46" ] || { echo "flat"; return 0; }
+    ei_data="$(LC_ALL=C od -An -tu1 -j 5  -N 1 -- "$1" | tr -d ' \n')"
+    b18="$(    LC_ALL=C od -An -tu1 -j 18 -N 1 -- "$1" | tr -d ' \n')"
+    b19="$(    LC_ALL=C od -An -tu1 -j 19 -N 1 -- "$1" | tr -d ' \n')"
+    if [ "${ei_data:-1}" = "2" ]; then m=$(( b18 * 256 + b19 )); else m=$(( b19 * 256 + b18 )); fi
+    case "$m" in
+        62)  echo "x86_64" ;;
+        183) echo "aarch64" ;;
+        *)   echo "elf-machine-${m}" ;;
+    esac
+}
+
+bc_name_ok() {  # a feature or arch name: the character set arroyo's knob map can actually produce
+    case "$1" in ''|*[!A-Za-z0-9_.-]*) return 1 ;; *) return 0 ;; esac
+}
+
+# THE COND PARSER'S REFUSAL. Prints the reason and returns 0 when <cond> is not in the grammar. A
+# cond the gate cannot parse is not a lenient cond and not a strict one — it is a row whose meaning
+# nobody knows, so it exits 2 before any verdict, exactly as a short token does.
+bc_cond_bad() {  # bc_cond_bad <cond>
+    local cond="$1" c body spec t
+    [ "$cond" = "-" ] && return 1
+    [ -z "$cond" ] && { echo "the cond field is EMPTY (write '-' for no condition)"; return 0; }
+    case "$cond" in *,,*|,*|*,) echo "empty term (a stray comma)"; return 0 ;; esac
+    for c in ${cond//,/ }; do
+        case "$c" in
+            '!'*)
+                body="${c#!}"
+                case "$body" in
+                    *@*)
+                        spec="${body#*@}"; body="${body%%@*}"
+                        case "$spec" in
+                            except:*) spec="${spec#except:}" ;;
+                            *) echo "term '${c}': the only qualifier after '@' is 'except:'"; return 0 ;;
+                        esac
+                        [ -n "$spec" ] || { echo "term '${c}': '@except:' with an empty specification"; return 0; }
+                        case "$spec" in *++*|+*|*+) echo "term '${c}': empty alternative inside '@except:'"; return 0 ;; esac
+                        for t in ${spec//+/ }; do
+                            bc_name_ok "$t" || { echo "term '${c}': '${t}' is not a feature or arch name"; return 0; }
+                        done ;;
+                esac
+                [ -n "$body" ] || { echo "term '${c}': '!' with no feature name"; return 0; }
+                bc_name_ok "$body" || { echo "term '${c}': '${body}' is not a feature name"; return 0; } ;;
+            *@*) echo "term '${c}': '@except:' qualifies a NEGATED term only — write '!<feature>@except:<spec>'"; return 0 ;;
+            *+*)
+                case "$c" in *++*|+*|*+) echo "term '${c}': empty alternative in an OR-group"; return 0 ;; esac
+                for t in ${c//+/ }; do
+                    bc_name_ok "$t" || { echo "term '${c}': '${t}' is not a feature name"; return 0; }
+                done ;;
+            *) bc_name_ok "$c" || { echo "term '${c}': not a feature name"; return 0; } ;;
+        esac
+    done
+    return 1
+}
+
 BOOTART="$(dirname "$ART")/EFI/BOOT/BOOTX64.EFI"
+
+ARCHARG="${3:-}"
+BC_ARCH="$(bc_arch_of "$ART")"
+if [ "$BC_ARCH" = "flat" ]; then
+    if [ -n "$ARCHARG" ]; then
+        case "$ARCHARG" in
+            x86_64|aarch64)
+                BC_ARCH="$ARCHARG"
+                BC_ARCH_SRC="FLAT image (no ELF header); the caller named this arch in argument 3" ;;
+            *)
+                echo "banner-cert: NO VERDICT — argument 3 must be x86_64 or aarch64, got '${ARCHARG}'" >&2
+                exit 2 ;;
+        esac
+    else
+        BC_ARCH="unknown"
+        BC_ARCH_SRC="FLAT image (no ELF header) and the caller named no arch, so every arch-qualified cond term is UNSATISFIED here and its row stays UNVERIFIABLE rather than guessed"
+    fi
+else
+    BC_ARCH_SRC="read from the artifact's OWN ELF header (e_machine at 0x12), never from an argument"
+    if [ -n "$ARCHARG" ] && [ "$ARCHARG" != "$BC_ARCH" ]; then
+        echo "⚠ banner-cert: argument 3 says '${ARCHARG}' and the ELF header says '${BC_ARCH}' — the HEADER wins."
+    fi
+fi
 
 fail=0; noverdict=0; ok=0; unver=0; nowit=0; reg=0; nmeas=0; nunmeas=0
 
 echo "⚡ banner-cert: artifact=${ART}"
 echo "⚡ banner-cert: banner=${BANNER}"
+echo "⚡ banner-cert: arch=${BC_ARCH}  (${BC_ARCH_SRC})"
 
-# Registry self-check FIRST: a token under 9 bytes cannot be trusted to reach .rodata, so a table
-# that carries one is a broken gate, not a green one.
+# Registry self-check FIRST: a token under 9 bytes cannot be trusted to reach .rodata, and a cond
+# this grammar cannot parse is a row whose meaning nobody knows. A table that carries either is a
+# broken gate, not a green one — so both are exit 2 before one verdict is printed.
 while IFS='|' read -r f tok cond state; do
     [ -z "${f:-}" ] && continue
+    # A `-` token is a NOWITNESS row and its `cond` field carries the REASON in prose by design
+    # (see ROW FORMAT above), so it is never parsed as a condition.
     [ "$tok" = "-" ] && continue
+    if why="$(bc_cond_bad "${cond:-}")"; then
+        echo "❌ banner-cert: NO VERDICT — the cond for '${f}' is not in the grammar: ${why}"
+        echo "   cond='${cond:-}'. The forms are: a bare feature; 'a+b' (OR-group); '!a' (negated);"
+        echo "   '!a@except:<arch-or-feature>[+…]' (negated with an exception). Commas are AND."
+        exit 2
+    fi
     probe="${tok#!}"; probe="${probe#@boot }"
     if [ "${#probe}" -lt 9 ]; then
         echo "❌ banner-cert: registry is broken — token for '${f}' is ${#probe} bytes (< 9); LLVM"
@@ -310,7 +453,26 @@ for f in ${BANNER//,/ }; do
         for c in ${cond//,/ }; do
             case "$c" in
                 '!'*)  # a NEGATED term: this feature must be OFF or the literal's code is unreachable
-                    bc_in_list "${c#!}" "$BANNER" && { skip="NOT ${c#!}"; break; } ;;
+                    _bc_neg="${c#!}"; _bc_exc=""
+                    case "$_bc_neg" in
+                        *@except:*) _bc_exc="${_bc_neg#*@except:}"; _bc_neg="${_bc_neg%%@except:*}" ;;
+                    esac
+                    bc_in_list "$_bc_neg" "$BANNER" || continue   # the killer is OFF: nothing to say
+                    if [ -z "$_bc_exc" ]; then skip="NOT ${_bc_neg}"; break; fi
+                    # An EXCEPTION: every term of the spec must hold for the code to survive the
+                    # killer. Arch terms are answered by the artifact's header, feature terms by the
+                    # banner. The FIRST term that fails is the one named, because it is the reason.
+                    _bc_miss=""
+                    for _bc_t in ${_bc_exc//+/ }; do
+                        case "$_bc_t" in
+                            x86_64|aarch64)
+                                [ "$BC_ARCH" = "$_bc_t" ] || { _bc_miss="the artifact's arch is ${BC_ARCH}, not ${_bc_t}"; break; } ;;
+                            *)
+                                bc_in_list "$_bc_t" "$BANNER" || { _bc_miss="this build does not carry '${_bc_t}'"; break; } ;;
+                        esac
+                    done
+                    [ -n "$_bc_miss" ] && { skip="EXC ${_bc_neg}|${_bc_exc}|${_bc_miss}"; break; }
+                    ;;
                 *+*)   # an OR-group: ANY one of the alternatives makes the literal exist
                     _bc_sat=""
                     for alt in ${c//+/ }; do bc_in_list "$alt" "$BANNER" && { _bc_sat=1; break; }; done
@@ -321,6 +483,9 @@ for f in ${BANNER//,/ }; do
     fi
     if [ -n "$skip" ]; then
         case "$skip" in
+            EXC\ *) _bc_s="${skip#EXC }"
+                    _bc_n="${_bc_s%%|*}"; _bc_r="${_bc_s#*|}"; _bc_e="${_bc_r%%|*}"; _bc_w="${_bc_r#*|}"
+                    echo "feature=${f} witness=${tok} hits=- -> UNVERIFIABLE (its literal needs 'NOT ${_bc_n}' EXCEPT on '${_bc_e}'; this build carries '${_bc_n}' and the exception does NOT hold here — ${_bc_w} — so that configuration makes the code the literal lives in UNREACHABLE, and its absence proves nothing about the feature)" ;;
             NOT\ *) echo "feature=${f} witness=${tok} hits=- -> UNVERIFIABLE (its literal needs '${skip}', and this build carries '${skip#NOT }' — that configuration makes the code the literal lives in UNREACHABLE, so its absence proves nothing about the feature)" ;;
             *)      echo "feature=${f} witness=${tok} hits=- -> UNVERIFIABLE (its literal also needs '${skip}', which this build does not carry)" ;;
         esac
