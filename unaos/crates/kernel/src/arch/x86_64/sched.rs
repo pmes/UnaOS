@@ -1557,7 +1557,7 @@ pub fn emit_load_witness(tag: &str) {
     // `current` and the probe returns silently. Every line carries its own task name, so a capture
     // is never ambiguous about which stack it is describing.
     #[cfg(feature = "witness")]
-    emit_stack_witness();
+    { emit_stack_witness(); crate::arch::interrupts::nmi_probe_selftest_once(); } // W5I2 — the NMI-probe self-test rides this same gate, once per boot, on its FIRST call (the BSP's `-prejoin` line: every AP dispatching, no render service yet holding a worker). One-shot inside `once()`; prints its own `:: W5: nmi selftest …` lines. ⚠ SAME-LINE fold, line-NEUTRAL: the block keeps the statement count of this cfg site and no `panic::Location` below moves (`./arroyo knoboff witness 891c4dec`).
 }
 
 /// VUGSPREAD — the PLACEMENT witness. One serial line, emitted from [`emit_load_witness`] so it

@@ -461,3 +461,38 @@ pub fn send_ipi(dest: u32, icr_low: u32) {
         }
     }
 }
+
+/// W5I2 — an NMI IPI to `dest` with a BOUNDED delivery-status wait. `send_ipi`'s xAPIC arm spins
+/// on ICR bit 12 without a bound, which is right for INIT-SIPI at bring-up and wrong for a probe
+/// sent from the one live core the steal just chose: if the destination LAPIC ever failed to
+/// accept the message, the probing core would join the dead one. Same ICR word as
+/// `syscall::nmi_self_fire` (`0x4400` = level-assert | delivery mode 100b, NMI; the Self shorthand
+/// is invalid with NMI delivery, so the physical id is always spelled out). Returns true iff the
+/// APIC reported the IPI delivered (x2APIC has no status bit and returns true at once); false
+/// after the bound, which the caller prints as `icr=busy` and still waits on its own record —
+/// delivery to the LAPIC and recognition by the core are two different facts. Cfg'd with the probe
+/// (`interrupts.rs`, tail block `w5nmi`); a file-tail append, no `panic::Location` here to move.
+#[cfg(any(feature = "witness", feature = "bar1wedge"))]
+pub fn send_nmi_bounded(dest: u32) -> bool {
+    const ICR_NMI: u32 = 0x4400;
+    /// Iterations on the xAPIC delivery-status bit before giving up: a delivered IPI clears it in
+    /// well under a microsecond; a million spins is milliseconds, never a freeze.
+    const ICR_SPINS: u32 = 1_000_000;
+    unsafe {
+        if x2apic() {
+            Msr::new(X2_ICR).write(((dest as u64) << 32) | ICR_NMI as u64);
+            return true;
+        }
+        mmio_write(REG_ICR_HIGH, dest << 24);
+        mmio_write(REG_ICR_LOW, ICR_NMI);
+        let mut spins = 0u32;
+        while mmio_read(REG_ICR_LOW) & (1 << 12) != 0 {
+            if spins >= ICR_SPINS {
+                return false;
+            }
+            spins += 1;
+            core::hint::spin_loop();
+        }
+        true
+    }
+}

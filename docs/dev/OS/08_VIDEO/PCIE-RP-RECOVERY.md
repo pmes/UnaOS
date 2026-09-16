@@ -1172,6 +1172,76 @@ from the sampler path, and the brief's rule (touch `pcihealth.rs` only if the in
 line-neutrally) therefore ends this arc at the design. `pcihealth.rs` is untouched: `git diff
 5ebe29f4 -- unaos/` is empty on this branch.
 
+**I2 IS BUILT (W5I2, 2026-09-16, branch `exec-rmbp-w5i2`, parent 891c4dec; the metal call is NOT
+wired — that is the seat's one line at W5I1's post-steal hook, and this paragraph is what that line
+buys).** `arch::x86_64::interrupts::nmi_probe(core)` (tail block `w5nmi`, cfg
+`any(witness, bar1wedge)`) arms one per-core record, sends an NMI IPI to the core's LAPIC id through
+`apic::send_nmi_bounded` — the `0x4400` ICR word `nmi_self_fire` already uses, with a bounded
+delivery-status wait so the probing core can never be parked by the probe — spins at most 10 ms on
+the record's counter, disarms, and prints ONE line:
+
+```text
+:: W5: nmi core=c<n> taken=<y/n> rip=<hex|-> in_blit=<y/n/?> cs=<hex|-> memcpy=<lo>..<hi> icr=<ok|busy> ::
+```
+
+The NMI handler's half (`w5nmi::record`, called from `nmi_handler`) stores rip and cs and bumps the
+counter when its own LAPIC id is the armed one: no lock, no print, no framebuffer, no GS. Read with
+`awk 'index($0,":: W5: nmi core=")'`. What the three verdicts mean at a steal, on metal:
+
+| line | verdict | what follows |
+|---|---|---|
+| `taken=n` after the 10 ms wait | **hardware-parked**: the core recognises no interrupt at any priority, so the BAR1 store is in flight forever; §12.1 branch (d) confirmed by instrument. Only a reset path can recover the core (§12.4 row 1, and under (d) even that frees nothing — the transaction is lost upstream of the port) | the NMI stays pending on that core, harmlessly; the record is disarmed, so a core that resumes seconds later writes nothing |
+| `taken=y in_blit=y` | the store COMPLETES and the loop does not: the core is executing inside the copy instruction's function and came back to it — a software fault with a rip to name, not a parked store. Every theory on §11.1's ladder is wrong | `rip` minus `memcpy=<lo>` says which of the three `rep movs` it was at (offsets `0x17`, `0x23`, `0x2c` on 891c4dec) |
+| `taken=y in_blit=n` | the core is ELSEWHERE, and the `[wcser]` diagnosis (holder parked in `FrameBuffer::blit`) is wrong for that stall | resolve `rip` against the flight artifact's `nm -n kernel.elf`; the line's `cs=` says ring 0 or 3 |
+
+**What `in_blit` measures, exactly.** `FrameBuffer::blit` (`video/framebuffer.rs:481`) has no
+address range in this kernel: it is inlined into its span-flush caller (`nm` on the 891c4dec
+artifact lists no `blit` symbol), and its `copy_nonoverlapping` lowers to a CALL to
+compiler-builtins' `memcpy` — 47 bytes, `t memcpy` at `0x2f7860` on that artifact, followed by
+`memset` at `0x2f7890`:
+
+```text
+48 89 f8  41 89 c0  41 f7 d8  41 83 e0 07  4c 39 c2  4c 0f 42 c2  4c 89 c1
+f3 a4              rep movsb            (+0x17)
+4c 29 c2  48 89 d1  48 c1 e9 03
+f3 48 a5           rep movsq            (+0x23)
+83 e2 07  48 89 d1
+f3 a4              rep movsb            (+0x2c)
+c3                 ret                  (+0x2e)
+```
+
+Those `rep movs` ARE the CPU stores into the aperture, so the copy site's range is `memcpy`'s: its
+start is the linker's `memcpy as *const ()`, its end the first `ret` (`0xC3`) after the entry — a
+straight-line leaf with no `0xC3` in any operand (the bytes above; re-verify with `objdump -d
+--start-address` on any artifact whose compiler-builtins moved). The image carries no symbol table
+and no unwind table (`readelf --debug-dump=frames`: two FDEs in the whole `.eh_frame`), so there is
+no second source and the line prints the range it used beside the verdict; `in_blit=?` when no `ret`
+is found within 96 bytes, never a guess. A rip in the span-flush loop that CALLS the copy is
+`in_blit=n` by this definition — the copy retired and the loop went round again — and `rip` names it.
+
+**What QEMU proves and what only metal can.** TCG delivers an NMI to a spinning core and to a
+halted core alike; nothing in QEMU holds a store in flight. The x86 witness self-test
+(`nmi_probe_selftest_once`, `cfg(witness)`, riding the tail of `sched::emit_load_witness` on its
+first call — the BSP's `-prejoin` line) spawns a task on the last worker core that enters a
+known asm loop (`unaos_nmi_spin..unaos_nmi_spin_end`, two linker symbols) with IF=0 — WEDGEINJ's
+shape — probes it, releases it, then probes the same core idle in `sti; hlt`:
+
+```text
+:: W5: nmi core=c<t> taken=y rip=<in spin> in_blit=n cs=0x8 memcpy=<lo>..<hi> icr=ok ::
+:: W5: nmi selftest spin core=c<t> taken=y rip_in_spin=y in_blit=n spin=<lo>..<hi> released=y -> PASS ::
+:: W5: nmi core=c<t> taken=y rip=<elsewhere> in_blit=n cs=0x8 memcpy=<lo>..<hi> icr=ok ::
+:: W5: nmi selftest idle core=c<t> taken=y rip_in_spin=n -> PASS (NMI wakes HLT; QEMU cannot produce taken=n, only metal can) ::
+```
+
+`SKIPPED why=…` (no worker core; spin task not dispatched within 200 ms) is neither PASS nor FAIL.
+**`taken=n` after a steal on metal is the only new fact this instrument can carry**, and its
+printing path was exercised in QEMU by the go-red mutation (the handler's record store commented
+out: the self-test then prints `taken=n` and `-> FAIL`, a false negative by construction; evidence
+`docs/dev/evidence/rmbp-0916/w5i2/SELFTEST.md`). The CALLER is reachable from any kernel task with
+the kernel GS, allocates nothing and takes no lock, so the post-steal site — inside a composite
+pass, possibly under the table lock — can call it; a second probe while one is in flight is
+`REFUSED why=busy` on the wire, as are `self`, `offline` and `no-such-core`.
+
 ### 12.4 The repairs W5 would license once I1/I2 answer, with their costs — none implemented
 
 | repair | licensed by | cost | what it does NOT do |

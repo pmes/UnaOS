@@ -526,6 +526,14 @@ extern "x86-interrupt" fn nmi_handler(_stack_frame: InterruptStackFrame) {
     if crate::arch::gdt::rsp_in_nmi_ist(rsp) {
         NMI_ON_IST.store(true, core::sync::atomic::Ordering::Relaxed);
     }
+    // W5I2 — the NMI PROBE's record (tail block `w5nmi`). Keeps every property this handler has:
+    // GS-free (the LAPIC id is read from the APIC, the frame from the IST stack), lock-free, no
+    // print, no framebuffer. It compares its own LAPIC id against the armed target and writes
+    // rip/cs into that core's slot; a LINT1 hardware NMI or a `nmi_self_fire` on any other core
+    // matches nothing and costs one relaxed load. Cfg'd with the probe; the knob-off handler is
+    // this function minus these two lines, and every `panic::Location` in this file is above.
+    #[cfg(any(feature = "witness", feature = "bar1wedge"))]
+    w5nmi::record(&_stack_frame);
 }
 
 /// xHCI MSI-X handler (interrupter 0, IDT vector 0x40). Minimal and lock-free: it
@@ -576,3 +584,380 @@ extern "x86-interrupt" fn ehci_msi_handler(_stack_frame: InterruptStackFrame) {
 /// Local APIC spurious-interrupt handler (vector 0xFF, == APIC SVR low byte). By definition
 /// the APIC did not actually deliver an interrupt here, so we must NOT send an EOI.
 extern "x86-interrupt" fn spurious_handler(_stack_frame: InterruptStackFrame) {}
+
+// =================================================================================================
+// W5I2 — the NMI PROBE of a declared-dead render core (tail block).
+// =================================================================================================
+//
+// THE QUESTION. After WCSER-STEAL takes the compositor gate from a core that has been inside one
+// pass for `COMP_GATE_STEAL_MS`, that core is declared dead and never returns (`revenants=0` on
+// all 96 rollups of flights 8 and 9; PCIE-RP-RECOVERY.md §12.1). Every register the tree can read
+// is flat across the event, and W5SCOPE's branch (d) — the core is parked at retirement on a BAR1
+// store that left its queue and was never acknowledged — is the one branch the capture is
+// consistent with. No instrument has ever tested it. An NMI is the discriminator (§12.3 I2): a core
+// hardware-parked on an in-flight store recognises no interrupt at any priority, so the NMI stays
+// pending forever and the probe reports `taken=n`; a core spinning in software takes it at the
+// next instruction boundary regardless of IF, and its handler can say WHERE it was.
+//
+// THE MECHANISM. `nmi_probe(core)` arms one slot, sends an NMI IPI to that core's LAPIC id through
+// `apic::send_nmi_bounded` (the same `0x4400` ICR word `syscall::nmi_self_fire` uses, with a bounded
+// delivery-status wait so the PROBING core can never be parked by the probe), and spins at most
+// 10 ms on the slot's `TAKEN` counter. The handler side is `record`, called from `nmi_handler`:
+// it stores rip and cs into the slot and bumps the counter — no lock, no print, no framebuffer,
+// no GS. The caller then prints ONE line and returns the verdict to whoever asked.
+//
+// `in_blit` — WHAT IT MEASURES, HONESTLY. `FrameBuffer::blit` (`video/framebuffer.rs`) has no
+// address range in this kernel: it is inlined into its span-flush caller (`nm` on the flight
+// artifact shows no `blit` symbol), and its `copy_nonoverlapping` lowers to a CALL to
+// compiler-builtins' `memcpy`, a 47-byte leaf (`rep movsb` / `rep movsq` / `rep movsb` / `ret`)
+// which IS the instruction that stores into the BAR1 aperture. So the copy site's range is
+// `memcpy`'s, and that is the one range this file can bound exactly: its start is the linker's
+// answer to `memcpy as usize`, its end is the first `ret` (0xC3) after the entry — the function is
+// a straight-line leaf with no 0xC3 byte in any operand (verified on the 891c4dec artifact by
+// `objdump -d`; the bytes are quoted in PCIE-RP-RECOVERY.md §12.3). The kernel keeps no symbol
+// table or unwind table in the loaded image (two FDEs in the whole `.eh_frame`), so there is no
+// second source. The line prints the range it used beside the verdict so a reader with the
+// artifact's `nm -S memcpy` can check the bound; `in_blit=?` is printed when no `ret` is found
+// within the scan, never a guess. A rip inside the SPAN-FLUSH loop that calls the copy is
+// `in_blit=n` by this definition: the copy has retired and the loop went round again, which is a
+// software fault with a rip to name, not a parked store.
+//
+// WHAT QEMU CAN AND CANNOT PROVE. TCG delivers an NMI to a spinning core and to a halted core
+// alike; nothing in QEMU can hold a store in flight forever. The self-test below therefore proves
+// `taken=y` on a known spin loop with the rip inside it and `in_blit=n`, and `taken=y` on an idle
+// (HLT) core as the negative control. `taken=n` on metal is the ONLY new fact this instrument can
+// carry, and it is also the verdict the go-red mutation of `record` reproduces in QEMU (a false
+// negative by construction), which is how the printing path of that verdict was exercised.
+//
+// CFG. Everything here is under `any(witness, bar1wedge)`: `witness` for the self-test's sake and
+// because the x86 battery is the only place it runs in QEMU; `bar1wedge` because it is the knob
+// the W5 instrument family flies under (PCIE-RP-RECOVERY.md §12.3 I1's call at the steal is cfg
+// `bar1wedge`) and the seat's one-line `nmi_probe(dead)` at that post-steal hook must compile
+// whichever of the two that hook carries. The steal machinery itself is ungated x86 code
+// (`video/wm.rs`, the `COMP_GATE` block in `composite`); only its accounting is `witness`. With
+// both knobs off nothing below is compiled, `nmi_handler` is its pre-W5I2 body, and no
+// `panic::Location` in this file sits below the handler — measured, not argued: `./arroyo knoboff
+// witness 891c4dec`.
+#[cfg(any(feature = "witness", feature = "bar1wedge"))]
+pub use w5nmi::{nmi_probe, NmiProbe};
+#[cfg(feature = "witness")]
+pub use w5nmi::selftest::once as nmi_probe_selftest_once;
+
+#[cfg(any(feature = "witness", feature = "bar1wedge"))]
+mod w5nmi {
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+    use crate::arch::gdt::MAX_CPUS;
+    use x86_64::structures::idt::InterruptStackFrame;
+
+    /// LAPIC id the caller is probing; `u32::MAX` = nothing armed. The handler records only when
+    /// its own LAPIC id equals this word, so a hardware LINT1 NMI, a `nmi_self_fire`, or a probe
+    /// NMI that a parked core finally takes seconds later (after the caller disarmed) writes nothing.
+    static TARGET: AtomicU32 = AtomicU32::new(u32::MAX);
+    /// Logical core index of the armed probe — the slot `record` writes. Stored BEFORE `TARGET`
+    /// (Release) and read after it (Acquire), so a matching handler always sees the right slot.
+    static SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
+    /// One probe in flight at a time; a second caller is REFUSED on the wire, never queued.
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    /// Per-core record: the interrupted rip, cs, and a counter that says the record is fresh.
+    static RIP: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    static CS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    static TAKEN: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+    /// Bytes scanned past `memcpy`'s entry for its `ret`. The function is 47 bytes on 891c4dec;
+    /// twice that is the cap, and a miss prints `in_blit=?` rather than extending the scan.
+    const MEMCPY_SCAN: usize = 96;
+    /// Bounded wait for the NMI to be taken. 10 ms is four orders of magnitude above the
+    /// microseconds a spinning core needs, and short enough that the post-steal caller (a live
+    /// core mid-composite) is not a second freeze.
+    const WAIT_MS: u64 = 10;
+
+    /// The handler half. Runs in NMI context on the PROBED core: three loads, two stores, one
+    /// fetch_add; no lock, no print, no GS (`apic_id_u32` reads the LAPIC, the frame is on the IST
+    /// stack). See the tail-block comment for why this is the whole of what an NMI may do here.
+    #[inline]
+    pub(super) fn record(frame: &InterruptStackFrame) {
+        let target = TARGET.load(Ordering::Acquire);
+        if target == u32::MAX || crate::arch::apic::apic_id_u32() != target {
+            return;
+        }
+        let slot = SLOT.load(Ordering::Relaxed);
+        if slot >= MAX_CPUS {
+            return;
+        }
+        RIP[slot].store(frame.instruction_pointer.as_u64(), Ordering::Relaxed);
+        CS[slot].store(frame.code_segment.0 as u64, Ordering::Relaxed);
+        TAKEN[slot].fetch_add(1, Ordering::Release);
+    }
+
+    /// What one probe measured. `in_blit` is `None` when `taken` is false or when `memcpy`'s range
+    /// could not be bounded (printed `?`).
+    #[derive(Clone, Copy)]
+    pub struct NmiProbe {
+        pub taken: bool,
+        pub rip: u64,
+        pub cs: u64,
+        pub in_blit: Option<bool>,
+    }
+
+    /// `[lo, hi)` of compiler-builtins' `memcpy` — the copy instruction `FrameBuffer::blit`'s
+    /// `copy_nonoverlapping` calls — or `None` if no `ret` is found within `MEMCPY_SCAN` bytes.
+    /// Read-only, volatile, kernel text: the bytes are mapped and executable on every core.
+    pub(super) fn memcpy_range() -> Option<(usize, usize)> {
+        unsafe extern "C" {
+            fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8;
+        }
+        let lo = memcpy as *const () as usize;
+        for i in 0..MEMCPY_SCAN {
+            // SAFETY: kernel text at `memcpy`, within a bounded scan; a plain byte read.
+            if unsafe { core::ptr::read_volatile((lo + i) as *const u8) } == 0xC3 {
+                return Some((lo, lo + i + 1));
+            }
+        }
+        None
+    }
+
+    /// `ms` milliseconds in `now_cycles()` units: the calibrated TSC when there is one, else the
+    /// same 2.5e9-per-second guess `arch::HW_WAIT_BUDGET` carries.
+    pub(super) fn tsc_budget(ms: u64) -> u64 {
+        let hz = crate::arch::apic::tsc_hz();
+        let per_ms = if hz != 0 { hz / 1000 } else { 2_500_000 };
+        per_ms.saturating_mul(ms)
+    }
+
+    /// Spin until `cond()` or until `budget` cycles have elapsed; true iff `cond()` held.
+    pub(super) fn spin_until(budget: u64, cond: impl Fn() -> bool) -> bool {
+        let t0 = crate::arch::now_cycles();
+        loop {
+            if cond() {
+                return true;
+            }
+            if crate::arch::now_cycles().wrapping_sub(t0) >= budget {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// `{:#x}..{:#x}` or `?` for the range field of the line.
+    struct Range(Option<(usize, usize)>);
+    impl core::fmt::Display for Range {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self.0 {
+                Some((lo, hi)) => write!(f, "{:#x}..{:#x}", lo, hi),
+                None => write!(f, "?"),
+            }
+        }
+    }
+
+    /// Probe `core` with an NMI and print ONE line:
+    ///
+    /// ```text
+    /// :: W5: nmi core=c<n> taken=<y/n> rip=<hex|-> in_blit=<y/n/?> cs=<hex|-> memcpy=<lo>..<hi> icr=<ok|busy> ::
+    /// ```
+    ///
+    /// `taken=n` after the 10 ms wait is the hardware-parked verdict (the NMI is left pending on
+    /// that core; it is harmless and is recorded by nobody if the core ever resumes, because the
+    /// slot is disarmed). `icr=busy` (xAPIC only) says the local APIC never reported the IPI
+    /// delivered within the send's own bound — the probe still waited and reports what it saw.
+    /// Returns `None` and prints `REFUSED why=<self|offline|no-such-core|busy>` when the question
+    /// cannot be asked: a self-NMI is `nmi_self_fire`'s job, an offline slot has no LAPIC to
+    /// address, and two probes at once would share one record.
+    ///
+    /// Caller context: any kernel task with the kernel GS (it reads `this_cpu()`), interrupts in any
+    /// state; it allocates nothing and takes no lock. The wire is written with `serial_println!`,
+    /// which is `try_lock`-only and cannot block.
+    pub fn nmi_probe(core: usize) -> Option<NmiProbe> {
+        let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+        let slot = crate::arch::percpu::cpu(core);
+        // `init_cpu` writes `cpu_index = index`; a never-initialised slot reads 0, which only the
+        // BSP (always online) legitimately carries. Lock-free and allocation-free, unlike
+        // `smp::online_aps()`, because the post-steal caller sits inside a composite pass.
+        let online = matches!(slot, Some(c) if c.cpu_index as usize == core);
+        let why = if core >= MAX_CPUS {
+            Some("no-such-core")
+        } else if core == me {
+            Some("self")
+        } else if !online {
+            Some("offline")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            serial_println!(":: W5: nmi core=c{} REFUSED why={} ::", core, why);
+            return None;
+        }
+        if BUSY
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            serial_println!(":: W5: nmi core=c{} REFUSED why=busy ::", core);
+            return None;
+        }
+        let apic = slot.map(|c| c.apic_id).unwrap_or(u32::MAX);
+        let before = TAKEN[core].load(Ordering::Acquire);
+        SLOT.store(core, Ordering::Relaxed);
+        TARGET.store(apic, Ordering::Release);
+        let icr_ok = crate::arch::apic::send_nmi_bounded(apic);
+        let taken = spin_until(tsc_budget(WAIT_MS), || {
+            TAKEN[core].load(Ordering::Acquire) != before
+        });
+        TARGET.store(u32::MAX, Ordering::Release);
+        let (rip, cs) = if taken {
+            (RIP[core].load(Ordering::Relaxed), CS[core].load(Ordering::Relaxed))
+        } else {
+            (0, 0)
+        };
+        let range = memcpy_range();
+        let in_blit = match (taken, range) {
+            (true, Some((lo, hi))) => Some((rip as usize) >= lo && (rip as usize) < hi),
+            _ => None,
+        };
+        let yn = |b: Option<bool>| match b {
+            Some(true) => "y",
+            Some(false) => "n",
+            None => "?",
+        };
+        let icr = if icr_ok { "ok" } else { "busy" };
+        if taken {
+            serial_println!(
+                ":: W5: nmi core=c{} taken=y rip={:#x} in_blit={} cs={:#x} memcpy={} icr={} ::",
+                core, rip, yn(in_blit), cs, Range(range), icr
+            );
+        } else {
+            serial_println!(
+                ":: W5: nmi core=c{} taken=n rip=- in_blit=? cs=- memcpy={} icr={} ::",
+                core, Range(range), icr
+            );
+        }
+        BUSY.store(false, Ordering::Release);
+        Some(NmiProbe { taken, rip, cs, in_blit })
+    }
+
+    /// The x86 witness self-test (W5I2 job 2): prove the probe on a known spin loop, then on an
+    /// idle core, once per boot, from the tail of `sched::emit_load_witness` — the existing
+    /// witness ladder site whose first call is the BSP's `-prejoin` line, when every AP has been
+    /// dispatching for a while and no render service yet holds a worker.
+    #[cfg(feature = "witness")]
+    pub mod selftest {
+        use super::{spin_until, tsc_budget};
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        /// Set by the spin loop itself, from INSIDE its address range, so a probe that observes it
+        /// cannot land on an instruction outside `[unaos_nmi_spin, unaos_nmi_spin_end)`.
+        static PARKED: AtomicBool = AtomicBool::new(false);
+        /// The loop's exit condition; the byte the asm polls.
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        /// The task left the loop and is about to exit.
+        static DONE: AtomicBool = AtomicBool::new(false);
+
+        // The known loop, in asm so its range is two linker symbols and not a compiler's guess —
+        // the same shape `syscall.rs` gives `unaos_syscall_entry`/`unaos_syscall_entry_end`.
+        // `rdi` = &RELEASE (polled), `rsi` = &PARKED (set first, inside the range). Leaf, no stack.
+        core::arch::global_asm!(
+            ".globl unaos_nmi_spin",
+            ".globl unaos_nmi_spin_end",
+            "unaos_nmi_spin:",
+            "    mov byte ptr [rsi], 1",
+            "2:  pause",
+            "    cmp byte ptr [rdi], 0",
+            "    je 2b",
+            "    ret",
+            "unaos_nmi_spin_end:",
+        );
+        unsafe extern "C" {
+            fn unaos_nmi_spin(release: *const u8, parked: *mut u8);
+            static unaos_nmi_spin_end: u8;
+        }
+
+        /// The parked task: enters the loop with IF=0 — WEDGEINJ's shape, and the reason an NMI is
+        /// the probe at all — and leaves only when `RELEASE` is set.
+        fn spin_task(_: usize) {
+            crate::arch::without_interrupts(|| unsafe {
+                unaos_nmi_spin(RELEASE.as_ptr() as *const u8, PARKED.as_ptr() as *mut u8)
+            });
+            DONE.store(true, Ordering::Release);
+        }
+
+        fn spin_range() -> (usize, usize) {
+            (unaos_nmi_spin as *const () as usize, &raw const unaos_nmi_spin_end as usize)
+        }
+
+        /// One-shot. Lines, in order (the `:: W5: nmi core=…` lines are `nmi_probe`'s own):
+        ///
+        /// ```text
+        /// :: W5: nmi core=c<t> taken=y rip=<hex> in_blit=n cs=0x8 memcpy=<lo>..<hi> icr=ok ::
+        /// :: W5: nmi selftest spin core=c<t> taken=y rip_in_spin=y in_blit=n spin=<lo>..<hi> released=y -> PASS ::
+        /// :: W5: nmi core=c<t> taken=y rip=<hex> in_blit=n cs=0x8 memcpy=<lo>..<hi> icr=ok ::
+        /// :: W5: nmi selftest idle core=c<t> taken=y rip_in_spin=n -> PASS (NMI wakes HLT; QEMU cannot produce taken=n, only metal can) ::
+        /// ```
+        ///
+        /// `SKIPPED why=…` (no worker core, or the spin task not dispatched within 200 ms) is
+        /// neither PASS nor FAIL: the fixture did not run, and the line says so.
+        pub fn once() {
+            if ONCE.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+            let pool = crate::arch::smp::worker_pool_len();
+            // The LAST worker: the least likely to be carrying a pinned fixture at this moment.
+            let target = (0..pool)
+                .rev()
+                .filter_map(crate::arch::smp::worker_cpu)
+                .find(|&c| c != me);
+            let Some(target) = target else {
+                serial_println!(
+                    ":: W5: nmi selftest SKIPPED why=no-worker-core pool={} me=c{} ::",
+                    pool, me
+                );
+                return;
+            };
+            crate::arch::sched::spawn("nmi-spin", spin_task, 0, target, crate::arch::sched::PRIO_RT);
+            if !spin_until(tsc_budget(200), || PARKED.load(Ordering::Acquire)) {
+                RELEASE.store(true, Ordering::Release);
+                serial_println!(
+                    ":: W5: nmi selftest SKIPPED why=spin-not-parked core=c{} within 200 ms ::",
+                    target
+                );
+                return;
+            }
+            let (lo, hi) = spin_range();
+            let in_spin = |r: Option<super::NmiProbe>| {
+                r.is_some_and(|p| p.taken && (p.rip as usize) >= lo && (p.rip as usize) < hi)
+            };
+            let yn = |b: bool| if b { "y" } else { "n" };
+            // Positive: the parked core takes the NMI inside the loop, and the loop is not the copy.
+            let r1 = super::nmi_probe(target);
+            RELEASE.store(true, Ordering::Release);
+            let released = spin_until(tsc_budget(200), || DONE.load(Ordering::Acquire));
+            let taken1 = r1.is_some_and(|p| p.taken);
+            let blit1 = r1.and_then(|p| p.in_blit);
+            let pass1 = taken1 && in_spin(r1) && blit1 == Some(false) && released;
+            serial_println!(
+                ":: W5: nmi selftest spin core=c{} taken={} rip_in_spin={} in_blit={} spin={:#x}..{:#x} released={} -> {} ::",
+                target,
+                yn(taken1),
+                yn(in_spin(r1)),
+                match blit1 { Some(true) => "y", Some(false) => "n", None => "?" },
+                lo,
+                hi,
+                yn(released),
+                if pass1 { "PASS" } else { "FAIL" }
+            );
+            // Negative control: the same core, now idle in the scheduler's `sti; hlt`, still takes
+            // it — an NMI wakes HLT. What QEMU cannot show is `taken=n`: TCG holds no store in
+            // flight, so that verdict exists only on metal.
+            spin_until(tsc_budget(5), || false);
+            let r2 = super::nmi_probe(target);
+            let taken2 = r2.is_some_and(|p| p.taken);
+            let pass2 = taken2 && !in_spin(r2);
+            serial_println!(
+                ":: W5: nmi selftest idle core=c{} taken={} rip_in_spin={} -> {} (NMI wakes HLT; QEMU cannot produce taken=n, only metal can) ::",
+                target,
+                yn(taken2),
+                yn(in_spin(r2)),
+                if pass2 { "PASS" } else { "FAIL" }
+            );
+        }
+    }
+}
