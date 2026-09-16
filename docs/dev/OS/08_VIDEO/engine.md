@@ -17220,3 +17220,65 @@ witnesses were confirmed present in the artifact by `strings` instead.
 > and should SKIP with a stated reason rather than FAIL, or the valve is suppressing something the
 > compositor's correctness depends on — which would be far more interesting. Decide by evidence, not
 > by relaxing the threshold.
+
+## PTRREPAINT — the desktop present stops erasing the arrow (x86 `wc`, 2026-09-16)
+
+Peter, flights 8 and 9: *"the mouse cursor was flickering a lot too in both boot"*. SCORE89 (rMBP
+ledger A11) put the pointer on the compositor's present path and the flight-8 capture says which
+half of it: over the whole of boot 1 the WINDOW composite never blinked the sprite — `[cursor11]
+px_redrawn` is flat at 4320 across all ten rollups from 202 s to 394 s, **0.00 px/s**, while
+`px_installed` climbs to 59456 — so CURSOR-11's compose-through was doing its job under a storm
+presenting at `[wpace] rate=137.5/s`. What moved was the DESKTOP present: `[flick2] flush_undraw=`
+grew 19 → 152 (0.3–1.6/s steady, 19.7/s in the 203 s burst) against `flush_skip=` 45 → 229, so
+FLICKER-3's narrowing was working too — the arrow is taken down **only by presents whose damage
+meets it**, about 40 % of them, not by every present. Those are the frames Peter saw: on x86 the
+FRONT framebuffer IS the scan-out buffer (`arch::flush_framebuffer_range` is a store fence there,
+a `DC CVAC` sweep on aarch64), so the interval between `cursor::undraw` and `cursor::repaint` inside
+`Screen::flush` is a spriteless panel in front of the display for the length of a desktop blit —
+CURSOR-10's `FlushUnion`, which exists precisely to stop an undraw publishing an arrowless panel,
+buys the non-coherent board an atomicity the coherent board cannot have. The Orin capture is the
+control and it is emphatic: `flush_undraw=5794 flush_skip=1` — it takes that bracket on essentially
+every desktop present and nobody reports a blink, because `pal::cursor::SPRITE_OWNS_PAINT` is false
+there and the arrow the operator sees over the backdrop is the BACK-buffer sprite this present's own
+occluder subtraction CARRIES to glass (SO5, `arch/aarch64/display_tegra.rs`).
+
+The fix is that subtraction, extended to the one surface it had never covered. `DESK_SPRITE_OCC`
+(`video/screen.rs`) joins the sprite's box to the WC-I/SHELLDESK occluder set, so
+`present_background` withholds those spans exactly as it withholds a window's and the arrow is never
+taken down at all — `bracket_needed`'s live-sprite arm now answers `false` for every damage set,
+`FULL_PRESENT` and BRACKETQ included, because the subtraction is decided against that function's
+FINAL damage set rather than the pre-drain one. The other half is `cursor::absorb_desktop`, which
+keeps the withheld copy honest: every pixel the blit would have published is re-saved into
+`sp.saved` out of the BACK buffer — the authoritative, arrow-free copy of what this present means
+the panel to hold — so a later restore hands back the NEW desktop instead of the one this present
+superseded, and the withholding is invisible in both directions. No panel write and no panel read:
+it is `sp.saved` bookkeeping over cached RAM, which is why it can follow the blit instead of being
+threaded through it. The verdict is `[cursor11] … flicker_frames=<n> px_absorbed=<m>`: `n` counts
+presents that PUBLISHED a panel with a live, visible arrow off it (the publication, not the
+decision — a bracket whose damage clipped to nothing is not a flicker, which is what keeps this from
+being a second name for `flush_undraw=`) and must be 0; `m` is its control, because
+`flicker_frames=0 px_absorbed=0` only says the pointer never stood under a desktop present. A
+non-zero `n` now reads `-> FLICKER` ahead of every other rung, so the line cannot say `THROUGH`
+about a boot the operator watched the arrow blink through.
+
+**aarch64 does not move and must not.** `DESK_SPRITE_OCC` is `cfg!(all(target_arch = "x86_64",
+feature = "wc"))` — the `target_arch` term is `SPRITE_OWNS_PAINT`'s hardware reason (which buffer
+owns the arrow's pixels) and the `wc` term is the array-capacity one (only the SHELLDESK arm stages
+through its own `wins`, so only it has room for the extra slot). `DESK_SPRITE_MAX` is therefore 0 on
+aarch64 and on knob-off x86 and those occluder arrays are the ones they have always been, element
+for element; a `const _: () = assert!(!DESK_SPRITE_OCC || SPRITE_OWNS_PAINT)` makes the agreement a
+build failure rather than a sentence. Withholding the box on the Pi or the Orin would delete their
+pointer over the backdrop outright, so the guard is the fix's precondition and not its packaging.
+
+**Residuals, both named rather than closed.** (1) Boot 2 of flight 8 is a DIFFERENT defect and this
+arc does not touch it: there `px_installed` is 0/1008 against `px_redrawn` 4320 → 17740 (up to
+808 px/s) and the line reads `-> BRACKETED` — the compose-through is not reaching the pixels the
+pointer is over, which is CURSOR-11's own arc and the likelier source of *"the mouse movement was
+super choppy"*. (2) `[cursor11]`'s only emitter was `pal::cursor::rollup_tick`, which needs a HID
+pointer talking for five seconds; the x86 QEMU suite's `usb-tablet` delivered exactly ONE report on
+the `f8f8ce8c` baseline, so the whole `[wc-i]`/`[cursor3..11]`/`[flick2]` block printed **zero lines**
+on that gate while aarch64 has a fixture-scope emitter (`arch::aarch64::syscall` → `wm::wci_rollup`)
+and x86 has never had one. `cursor11_desk_tick` gives the line a desktop-present cadence — the
+population `flicker_frames` is actually about — armed only once a desktop present has met a live
+arrow, so a pointerless boot stays as silent as it is today. Giving x86 the fixture-scope call its
+sibling has is the structural repair and it lives in a file this arc did not open.
