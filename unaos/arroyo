@@ -9116,7 +9116,7 @@ test_fat_drop_retry() { # $1 = the logfile _step is capturing (READ here, writte
 
 battery() {
     local t0=$SECONDS rc=0 results=""
-    local blog_dir="target/battery"; mkdir -p "$blog_dir"
+    local blog_dir="${WORKSPACE_DIR}/target/battery"; mkdir -p "$blog_dir"
 
     _step() { # [--build] name, expected-pattern (empty = rc only), logfile[:verdictfile], cmd...
         # kernel8-test doesn't echo its serial log to stdout, so a step may name a separate
