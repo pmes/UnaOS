@@ -304,7 +304,7 @@ static SCHED_GO: AtomicBool = AtomicBool::new(false);
 /// SCHED-NEXT (virt busy-heartbeat): the `virt` BSP sets this ONCE, BEFORE `CPU_ON`, to declare "I
 /// will stage cooperative work — secondaries, wait for my release." It is the clean discriminator
 /// between the paths that share `__secondary_rust_virt`: only `virt` (`start_secondaries`) arms it;
-/// the real Orin (`start_secondaries_tegra`) and the SMP-probe legs stage no work and never arm, so
+/// the real Orin (the `tegrasmp` `start_secondaries`) and the SMP-probe legs stage no work and never arm, so
 /// their secondaries skip the wait entirely and park as before (no added latency, and — the point —
 /// no hang). Set before `CPU_ON` so every secondary that comes online is guaranteed to observe it.
 static SECWORK_ARMED: AtomicBool = AtomicBool::new(false);
@@ -6657,7 +6657,7 @@ pub fn secondary_work_done(cpu: usize) -> bool {
 ///
 /// TWO clean paths (both provably non-hanging), keyed off `SECWORK_ARMED` — which the BSP sets before
 /// `CPU_ON`, so a secondary always observes the true value:
-///   * NOT armed → the tegra (`start_secondaries_tegra`) and SMP-probe callers of this shared tail
+///   * NOT armed → the tegra (`tegrasmp` `start_secondaries`) and SMP-probe callers of this shared tail
 ///     stage no work: return at once, no wait, no drain. Park exactly as before — zero added latency,
 ///     zero hang risk.
 ///   * armed → the `virt` `start_secondaries` WILL stage + release. Wait for `SECWORK_GO` with a

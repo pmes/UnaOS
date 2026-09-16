@@ -198,7 +198,7 @@ rung, and it needs no NVIDIA anything.
 cores … arriving at trunk sync") understated what is on this branch today. The
 tegra image arms `tegrasmp` **by default** (`unaos/arroyo:573` — `UNAOS_TEGRA=1`
 without `UNAOS_NOTEGRASMP=1` adds the feature), so
-`smp_virt::start_secondaries_tegra` (`smp_virt.rs:783`) `CPU_ON`s every DTB
+`smp_virt::start_secondaries` (`smp_virt.rs:783`) `CPU_ON`s every DTB
 `/cpus` secondary before the JM6 drop, and each woken core runs the *shared*
 secondary tail `__secondary_rust_virt` (`smp_virt.rs:253`), which ends in
 `timer::arm_this_core_ap()` + `sched::secondary_run(core)`
@@ -206,7 +206,7 @@ secondary tail `__secondary_rust_virt` (`smp_virt.rs:253`), which ends in
 and enters the preemptive `run()` loop. **The Orin secondaries are therefore
 full scheduler participants — `ONLINE_MASK` members, `CPU_AUTO` placement
 candidates, steal targets — not parked cores.** The line
-`start_secondaries_tegra` still prints, "AP timer PPI stretch deferred (JC3)",
+`start_secondaries` still prints, "AP timer PPI stretch deferred (JC3)",
 is stale with respect to that shared tail; JC3 landed, and the AP arms its own
 local-only tick. (Correcting that log string is a one-word edit in the SMP lane,
 flagged here, not made.)
