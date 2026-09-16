@@ -547,29 +547,29 @@ pub mod cursor {
     ///   `[cursor12]` block sits between two trackpad clicks, and the one that raised a window is
     ///   the last pointer report the kernel sprite ever saw.
     ///
-    /// ### Why the position update belongs here and not in the drain
-    /// The drain already calls [`move_rel`]/[`set_abs`] for events the router did NOT take. Doing it
-    /// there for taken events too would need the taken/not-taken answer at four separate drains, and
-    /// a relative report applied twice would DOUBLE the motion. Applied at the router, on the
-    /// consumed branch only, each report moves the pointer exactly once on exactly one path.
+    /// ### Why the ABSOLUTE update belongs here and not in the drain
+    /// The drain already calls [`set_abs`] for events the router did NOT take. Doing it there for
+    /// taken events too would need the taken/not-taken answer at four separate drains. Applied at
+    /// the router, on the consumed branch only, each absolute report moves the pointer exactly once.
     ///
-    /// The app still receives the report unchanged — this is not a policy change about who gets
-    /// input. It is the statement that the arrow is a property of the SCREEN rather than of the
-    /// shell: on x86 `SPRITE_OWNS_PAINT` is true, the compositor owns the only pointer on the panel,
-    /// and no app draws one of its own.
+    /// ### PTRINSTALL2 (rmbp-ledger B117) — RELATIVE reports are no longer this function's
+    /// A relative report is installed by its PRODUCER, `x86_input_service` (`main.rs`,
+    /// `x86_ptr_install`), the instant it is taken off `EVENT_QUEUE` and before it is offered to the
+    /// render channel — so the arrow tracks the pad at HID rate through a render-core stall, whoever
+    /// holds focus. This function therefore returns on `Event::Mouse`: installing it here too would
+    /// double the motion on the consumed branch, the doubling PTRINSTALL measured and stopped on.
+    /// `MouseAbsolute` keeps its two-branch shape (idempotent, and the tablet fixtures pin its
+    /// resting coordinate). The app still receives every report unchanged: on x86 `SPRITE_OWNS_PAINT`
+    /// is true and the compositor owns the only pointer on the panel.
     ///
     /// Panel geometry is resolved from `video::WRITER` rather than passed in, because the router has
-    /// no `pal` in hand. A framebuffer that is not ready yet, or a degenerate panel, is a no-op —
-    /// there is nothing to clamp against and nothing on the glass to draw on.
-    ///
-    /// Lock discipline is the drain's, unchanged: this runs from the shell's input drain (the sole
-    /// caller of `user_input_route`), unmasked, holding none of `SPRITE`/`WRITER`/`TABLE` — the same
-    /// context the drain's own `move_rel` call at the next arm already runs in.
+    /// no `pal` in hand; a framebuffer that is not ready yet, or a degenerate panel, is a no-op. Lock
+    /// discipline is the drain's: unmasked, holding none of `SPRITE`/`WRITER`/`TABLE`.
     #[cfg(target_arch = "x86_64")]
     pub fn track_routed(ev: &super::Event) {
-        let (dx, dy, abs) = match *ev {
-            super::Event::Mouse { x, y } => (x, y, false),
-            super::Event::MouseAbsolute { x, y } => (x, y, true),
+        let (ax, ay) = match *ev {
+            super::Event::MouseAbsolute { x, y } => (x, y),
+            // PTRINSTALL2: `Event::Mouse` was installed by its producer; a second install doubles it.
             _ => return,
         };
         let (w, h) = {
@@ -583,11 +583,11 @@ pub mod cursor {
         if w <= 0 || h <= 0 {
             return;
         }
-        if abs {
-            set_abs(dx, dy, w, h);
-        } else {
-            move_rel(dx, dy, w, h);
-        }
+        // Absolute only. The relative arm that stood here (`move_rel(dx, dy, w, h)`) is the producer's
+        // now — `main.rs::x86_ptr_install` — and the render service's `Mouse` arm dropped its own
+        // `move_rel` in the same commit, so exactly one install per relative report survives.
+        // ⚠ LINE-NEUTRAL: this fn keeps its line count so no `Location` below it moves on either arch.
+        set_abs(ax, ay, w, h);
     }
 
     /// CURSOR-X86 — put the compositor sprite where the pointer now is, on the report that moved it.
