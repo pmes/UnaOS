@@ -3551,13 +3551,20 @@ X86_FAT_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-fat.spec"
 
 # WHICH SPEC DESCRIBES THIS RUN'S CAPTURE — one answer per fixture, and "none" is a REAL answer
 # that is printed out loud rather than passing quietly.
-#   no UNAOS_FATIMG   `./arroyo test` — x86-test.spec. It pins ONE line (the end-of-run marker) and
-#                     deliberately nothing else; see that file's header. Replaying it adds no
-#                     witness the fault scan did not already have, and that is not the reason it is
-#                     here: it is here because LADDERTAIL measured the file's two consumers
-#                     DISAGREEING (`qemu_await --settled` said complete, `mbench --replay` said
-#                     FAIL, same spec, same capture). Both now run on every `test`, so they cannot
-#                     drift apart again in silence, and the day a REQUIRE is added there it fires.
+#   no UNAOS_FATIMG   `./arroyo test` — x86-default.spec since SPECROWS (2026-09-16), and it USED to
+#                     be x86-test.spec. The swap is a MEASURED correction, not a tidy-up:
+#                     `x86_test_completion` reads x86-test.spec on EVERY leg and `settled()` gates on
+#                     `complete()`, so a REQUIRE there is a pin on all four legs at once — three
+#                     default-medium pins put in that file reddened `test-fat sf` over a capture that
+#                     was complete at line 2200. End-of-run stays in x86-test.spec, where it is
+#                     leg-independent; the default medium's own pins are in x86-default.spec, which
+#                     ONLY this replay reads. WHAT THE SWAP GIVES UP, said plainly: LADDERTAIL wired
+#                     BOTH consumers onto x86-test.spec so they could not drift apart in silence, and
+#                     after this change `--settled` is its only reader. That property is now MOOT
+#                     rather than lost — the drift it guarded against was `settled()` ignoring
+#                     REQUIREs, and this file must never hold one again (the paragraph above is why),
+#                     so the only directive left is a COMPLETE, which `mbench --replay` can never
+#                     fail on by itself. A replay of it would assert nothing.
 #   UNAOS_FATIMG=sf   `./arroyo test-fat sf` (and `UNAOS_FATIMG=sf ./arroyo test`, the invocation
 #                     x86-fat.spec's own header documents) — x86-fat.spec, 32 pinned lines,
 #                     MEASURED 32/32 against this seat's fold-gate capture before being wired.
@@ -3568,6 +3575,15 @@ X86_FAT_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-fat.spec"
 #   UNAOS_SELFHOST    NO SPEC. `test-selfhost` packs SOURCE-ALONG onto the fixture and arms a knob,
 #                     so its capture is not the one x86-fat.spec was measured on; that lane already
 #                     carries its own positive witness (`SELFHOST: src verified … -> PASS ::`).
+#   UNAOS_AHCI        `UNAOS_WC=1 UNAOS_AHCI=1 UNAOS_INSTALLDEMO=1 ./arroyo test` — x86-ahci.spec
+#                     (SPECROWS, 2026-09-16). A DIFFERENT MACHINE, not a longer boot: the ESP moves
+#                     onto a SATA port (`/` becomes `ahci<port>:/kernel.elf` and the bootinfo serial
+#                     AGREES with the bound volume) and INSTALLDEMO replaces the usb-storage backing
+#                     with a blank scratch, so the default medium's MBR — which x86-test.spec pins —
+#                     is not on this leg's wire. Five landed witnesses live only here, and before
+#                     this arm they were replayed against x86-test.spec, i.e. scored by nobody.
+X86_AHCI_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-ahci.spec"
+X86_DEFAULT_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-default.spec"
 X86_REPLAY_SPEC=""   # path of the spec to replay, or "" when none describes this capture
 X86_REPLAY_WHY=""    # why there is none — printed verbatim in the skip line
 x86_pick_capture_spec() {
@@ -3576,8 +3592,34 @@ x86_pick_capture_spec() {
         X86_REPLAY_WHY="UNAOS_SELFHOST is armed — test-selfhost packs SOURCE-ALONG onto the fixture, so this is not the capture x86-fat.spec was measured against. That lane's verdict is its own 'SELFHOST: src verified … -> PASS ::' witness."
         return 0
     fi
+    # SPECROWS: THE SATA LEG IS ASKED FIRST, because its answer does not depend on UNAOS_FATIMG —
+    # INSTALLDEMO OVERRIDES that variable in the builder (main.rs:1093), so a FATIMG-first case would
+    # hand this capture a spec describing an image QEMU never attached.
+    if [ -n "${UNAOS_AHCI:-}" ]; then
+        if [ -n "${UNAOS_INSTALLDEMO:-}" ] && [ -n "${UNAOS_WC:-}" ] \
+           && [ -z "${UNAOS_PART_DISK:-}" ] && [ -z "${UNAOS_NOSTORAGE:-}" ]; then
+            X86_REPLAY_SPEC="$X86_AHCI_SPEC"
+        else
+            # NOT an oversight, and not a hole to be papered over with one of the files above:
+            # x86-ahci.spec's pins were measured on the THREE-KNOB leg and two of them cannot hold
+            # without it — SELFGUARD's census/classify witness rides the `installdemo` fixture, and
+            # QUARRYDOCK's dock census is the compositor's, i.e. absent without UNAOS_WC. Naming the
+            # gap is the point; a spec asserted on a capture nobody has watched pass is the defect.
+            X86_REPLAY_WHY="UNAOS_AHCI is armed but this is not the leg x86-ahci.spec was measured on (it wants UNAOS_INSTALLDEMO + UNAOS_WC, and no UNAOS_PART_DISK / UNAOS_NOSTORAGE): SELFGUARD's census rides the installdemo fixture and QUARRYDOCK's dock census is compositor-only. Use 'UNAOS_WC=1 UNAOS_AHCI=1 UNAOS_INSTALLDEMO=1 ./arroyo test' for the gated run."
+        fi
+        return 0
+    fi
+    # AND THE MEDIUM KNOBS, the same rule one layer down. x86-test.spec's SPECROWS block pins the
+    # DEFAULT stick's partition table; `UNAOS_INSTALLDEMO` and `UNAOS_PART_DISK` REPLACE that stick
+    # (builder/src/main.rs:1093 and :1126, both overriding UNAOS_FATIMG) and `UNAOS_NOSTORAGE`
+    # removes it — so on those legs those pins assert a disk that is not attached, and a red would be
+    # about the fixture rather than about the kernel. Refused out loud, with the knob named.
+    if [ -n "${UNAOS_INSTALLDEMO:-}" ] || [ -n "${UNAOS_PART_DISK:-}" ] || [ -n "${UNAOS_NOSTORAGE:-}" ]; then
+        X86_REPLAY_WHY="a medium knob replaced the usb-storage backing (UNAOS_INSTALLDEMO='${UNAOS_INSTALLDEMO:-}' UNAOS_PART_DISK='${UNAOS_PART_DISK:-}' UNAOS_NOSTORAGE='${UNAOS_NOSTORAGE:-}') — the x86 specs' storage pins describe the DEFAULT stick, and asserting them against a disk QEMU did not attach would be a red about the fixture, not about the kernel."
+        return 0
+    fi
     case "${UNAOS_FATIMG:-}" in
-        "")  X86_REPLAY_SPEC="$X86_TEST_SPEC" ;;
+        "")  X86_REPLAY_SPEC="$X86_DEFAULT_SPEC" ;;
         sf)  X86_REPLAY_SPEC="$X86_FAT_SPEC" ;;
         *)   X86_REPLAY_WHY="UNAOS_FATIMG=${UNAOS_FATIMG} — x86-fat.spec's 32 pinned lines were measured green on the 'sf' layout only. Replaying them here would be asserting a capture nobody has watched pass. Use 'sf' for the gated run." ;;
     esac

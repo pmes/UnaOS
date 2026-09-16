@@ -264,3 +264,59 @@ FORBID :: RING-3 FAULT: task '(?:u1b[^-'][^']*|u1[^b'][^']*|u[^1'][^']*|[^u'][^'
 # scripts/specs/ that is neither named in `arroyo`'s CODE nor carries a RUN-BY line above — and a
 # `RUN-BY: verb:` claim is cross-checked against `arroyo`, so this file cannot claim a runner it
 # does not have. "A replay spec no gate command runs is a silent landmine."
+
+# ── SPECROWS (rmbp seat, 2026-09-16): THE FOUR WITNESSES THIS LEG LANDED WITH NOBODY SCORING ────
+# TAIL-APPENDED, never inserted: `x86-fat.spec:156` and `:2` are cited POSITIONALLY from
+# `crates/kernel/src/shell.rs`, `docs/env-knobs.md` and `docs/dev/QUEUE.md`, so a header insert would
+# silently move both (rmbp-ledger PI5). Every line below is new; not one existing line moved.
+#
+# WHAT THESE FOUR ARE, and why their absence was a hole rather than an oversight. SPECRUN wired this
+# file to `test-fat`, and the 32 pins it wired were MEASURED — i.e. they were the pins that existed
+# THEN. Four witnesses landed on this leg AFTER them, each with a go-red of its own and none with a
+# pinned line, so a regression in any of them rode a green `./arroyo test-fat sf`:
+#
+#   STORWAIT (`60e62d95`)  `:: [fatverb] storage settle:` — the wait that settles on the BOOT
+#                          MEDIUM's enumeration rather than on the SD reader's mere presence. That
+#                          commit's own comment at `shell.rs:4784` says it added a SECOND line
+#                          rather than fold the field into the line `:156` pins, because "editing
+#                          that spec is outside this change's brief" and the spec was unrun. The
+#                          spec is run now, and the debt that comment names is paid HERE: the second
+#                          line is pinned, so the two spellings are one pinned pair, not a stray.
+#   STORSLOT (`265542b9`)  `:: STORSLOT: claim …` + `:: USBREG: publish …` — the per-device storage
+#                          record. Before it, ONE field held the configuring slot, so a second
+#                          mass-storage device overwrote the first and the FIRST was never brought
+#                          up: no SCSI chain, no geometry, no registry row, NO WITNESS. A defect
+#                          whose symptom is silence is exactly the defect a FORBID cannot catch and
+#                          a REQUIRE can.
+#   X86BIND  (`fix-serial`) `:: X86BIND: root=global:/KERNEL.ELF … -> PASS ::` — the root walk's own
+#                          verdict, naming WHICH volume became `/` and by what evidence.
+#
+# THE SHAPE, NOT THE NUMBERS (SPECROWS' rule, and each of these has a reason). `waited=[0-9]+ms`
+# moves with host load — 0 ms, 131 ms and 198 ms are all recorded green on this bench. `slot=`/`ix=`
+# are enumeration order. `disks=` is 1 on the plain leg and 2 under `UNAOS_USB2`, which is why this
+# file can stay the spec for BOTH: the pin says AT LEAST ONE disk was published, and the two-stick
+# fact is the knob-leg's, not this one's. `serial=0x…` is a volume ID that changes every build, and
+# `agrees=` is `no` on this leg by construction (the ESP the firmware booted is not the volume the
+# walk binds) and `yes` on the AHCI leg — so it is matched, not fixed, and x86-ahci.spec pins the
+# `yes` where `yes` is the fact.
+#
+# WHAT *IS* FIXED is the load-bearing half of each line: `settled=found` (the medium answered, as
+# opposed to a deadline expiring), `root=global:/KERNEL.ELF` (this leg's root IS the USB volume) and
+# `layout=true`. MEASURED against this bench's recorded `test-fat sf` captures —
+# `storwait-logs/final-testfat-serial.log` and `defaultmedium-logs/serial-testfat-sf.log` for the
+# settle and X86BIND lines, `storslot-logs/control.serial.log` (one stick) and `…/twostick.serial.log`
+# (two) for STORSLOT/USBREG — plus the live gate run recorded in this commit's body.
+REQUIRE :: \[fatverb\] storage settle: waited=[0-9]+ms settled=found handles=global=(present|absent) sdhc=(present|absent|unbuilt) ::
+REQUIRE :: STORSLOT: claim slot=[0-9]+ ix=[0-9]+ devices=[0-9]+ — mass-storage record taken; SCSI bring-up deferred to the main loop ::
+REQUIRE :: USBREG: publish slot=[0-9]+ lun=[0-9]+ ix=[0-9]+ block_size=[0-9]+ num_blocks=[0-9]+ disks=[1-9][0-9]* ::
+REQUIRE :: X86BIND: root=global:/KERNEL\.ELF serial=0x[0-9a-f]+ by=[a-z]+ bootinfo=0x[0-9a-f]+ agrees=(yes|no) mounts=[0-9]+ layout=true -> PASS ::
+# THE FORBID PARTNERS — three REAL red spellings, each one a string the kernel actually emits, not an
+# invented negation. `settled=ceiling` is the deadline expiring on a machine that never showed the
+# kernel its disk (`shell.rs:4767`); `storage records FULL` is STORSLOT's own array-exhausted arm
+# (`xhci/mod.rs:4128` and `:15321`), a device configured and then forgotten; `root=-` is the root
+# walk's no-volume answer (`root=- reason=kernel-not-found-on-any-volume -> FAIL`). The builtin
+# `-> FAIL` forbid already convicts the third, but only the third, and only by its verdict token —
+# these name the SUBSYSTEM in the replay table, which is the sentence a reader needs.
+FORBID :: \[fatverb\] storage settle: .* settled=ceiling
+FORBID :: STORSLOT: storage records FULL
+FORBID :: X86BIND: root=- 
