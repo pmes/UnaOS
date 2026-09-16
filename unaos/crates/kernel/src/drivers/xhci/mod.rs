@@ -16557,3 +16557,41 @@ fn hidesit_note(arm: &str, slot_id: u8, ep_addr: u8, dci: u32, speed: u32, mps: 
         if pass { "PASS" } else { "FAIL" }
     );
 }
+
+/// STORWAIT: **is root-port enumeration still in flight?** Read-only, no side effects, no protocol.
+///
+/// The one question the storage wait in `shell::fatverb_storage_witness` has to ask and had no way
+/// to. That wait used to key on `drivers::block::program_source().is_some()`, which is a question
+/// about ANY program source — and on a board whose internal SD reader is default-on (`sdhcblk`, the
+/// rMBP's own `sdhci-pci`) the answer is YES before the USB medium the kernel actually booted from
+/// has been addressed, let alone published. The wait then measured `waited=0ms`, the bootdisk survey
+/// ran against a machine that had shown it one card, and `x86bind_witness(settled=true)` latched a
+/// `-> FAIL` about a disk that arrives hundreds of serial lines later (measured at a1e50849 on
+/// `./arroyo test-fat sf`: the witness at serial line 550, the verdict at 560, the root volume
+/// bound at ~1050 once the wait was fixed).
+///
+/// The predicate is exactly the one `service_storage` already uses to pace its own deferred SCSI
+/// bring-up (BOOTPACE M2, this file): `enum_active || !ports_to_enumerate.is_empty()`. One
+/// definition of "the bus is still busy", read from two places, rather than a second one invented
+/// for the caller.
+///
+/// Three answers, and each is the honest one:
+/// * `Ok` — the live state. This is the whole point.
+/// * `Busy` — the controller is LOANED, i.e. a BOT transaction or a service pass is running right
+///   now. Something is in flight; the caller's ceiling (`STORAGE_WAIT_MS`) bounds the wait either
+///   way, so the conservative answer costs at most one more service pass.
+/// * `NotReady` — no controller was ever installed (`skip_xhci`, or a board with no xHCI). Nothing
+///   is in flight and nothing ever will be, so `false`: the caller must not be held here by a bus
+///   that does not exist. Its OTHER conjunct — an empty USB registry — is what keeps such a board
+///   on the ceiling rather than declaring a medium settled that never arrived.
+///
+/// `claim()` is the shell-safe idiom for this (WEDGE-8; `storage_diag` above reads the same way):
+/// a masked O(1) take that never waits, never spins on a preempted holder, and returns the loan by
+/// RAII. This function issues no TRB, touches no MMIO and mutates no field.
+pub fn enumeration_in_flight() -> bool {
+    match claim() {
+        Ok(x) => x.enum_active || !x.ports_to_enumerate.is_empty(),
+        Err(XhciClaimError::Busy) => true,
+        Err(XhciClaimError::NotReady) => false,
+    }
+}
