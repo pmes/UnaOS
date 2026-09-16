@@ -903,6 +903,13 @@ none of them, so it is GREEN and silent: the right disposition for a flake and t
 wrong one for a real R21 regression, which would now SKIP where it used to FAIL. One
 `REQUIRE :: WINMENU: .*:: PASS ::` row in `x86-test.spec` closes it. Reported as a
 STOP by WINMENUFLAKE and not taken — specs were outside that brief's named files.
+CLOSED by WINMENUSPEC (branch `exec-rmbp-winmenuspec` off `fa4dcf0b`, same day): the pin now
+exists — `REQUIRE :: WINMENU: … published=y … app_box=true … :: PASS ::` in `x86-ahci.spec`
+(the `test` verb's WC-armed leg; `crystal::selftest` is `cfg(all(witness, wc))`, so the verdict
+is absent from the knob-free default boot and a REQUIRE in `x86-default.spec` would have been the
+APPPIN trap) and `FORBID :: WINMENU: .* -> SKIP reason=menu-unpublished-after=[0-9]+ms ::` in
+both `x86-ahci.spec` and `x86-default.spec`, so a 250 ms miss on the fold gate's
+`UNAOS_WC=1 ./arroyo test` is a red, not a silent green.
 
 ## Adding an entry
 

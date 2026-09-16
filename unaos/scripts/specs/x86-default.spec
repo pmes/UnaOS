@@ -90,3 +90,25 @@ FORBID :: X86BIND: root=-
 # named in code (X86_DEFAULT_SPEC, and again in `x86_pick_capture_spec`'s case), so it resolves
 # GATED — and if a future change unwires that case, `check` says so by name instead of letting the
 # file rot into prose.
+
+# ── WINMENUSPEC (2026-09-16), TAIL-APPENDED past the contract block, as SPECROWS did to x86-fat.spec ──
+# WINMENU's park timeout, forbidden BY NAME on the leg the fold gate runs (`UNAOS_WC=1 ./arroyo
+# test` replays this file). WINMENUFLAKE (`5f7674c3`) made `winmenu::selftest` wait up to 250 ms for
+# the menubar's publication and print `-> SKIP reason=menu-unpublished-after=<ms>ms` on a miss —
+# never a FAIL, so mbench's DEFAULT_FORBIDS let it through green. After the park a miss is a finding
+# about the compositor and reds this verb (docs/dev/FIXTURE_FLAKES.md Class 6a). One format string
+# at two sites, leg 1 `name=gate` and leg 6 `name=VUG` (`video/winmenu.rs:1880`, `:2006`).
+#
+# NOT HERE, and it is the APPPIN trap this file's own NOT-HERE list names for `[dock] pins=`:
+#   `REQUIRE :: WINMENU: … :: PASS ::`   `crystal::selftest`, the only route to `winmenu::selftest`,
+#                            is called under `#[cfg(all(feature = "witness", feature = "wc"))]`
+#                            (`arch/x86_64/syscall.rs:17532-17533`), so the verdict is ABSENT from
+#                            the knob-free `./arroyo test` this file also serves. The REQUIRE is
+#                            pinned in x86-ahci.spec, whose leg is WC-armed by construction. This
+#                            FORBID is honest on both polarities: the line cannot print without
+#                            the knob, and with it a healthy boot prints the PASS spelling instead.
+# Measured: absent (0 hits) on every recorded default-lane capture on this bench that carries the
+# fixture (`logs/foldgate/seattest1.log`, `quarrydock-logs/serial-unarmed.log`,
+# `defaultmedium-logs/serial-default.log`); present (rc=1, FORBID hit) on the same capture with the
+# kernel's own SKIP spelling injected — the go-red recorded in the WINMENUSPEC commit.
+FORBID :: WINMENU: .* -> SKIP reason=menu-unpublished-after=[0-9]+ms ::
