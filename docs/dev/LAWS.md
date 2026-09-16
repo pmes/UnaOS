@@ -261,7 +261,7 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   verify a branch, make it print and quote the output; to verify a claim about a peer's tree, read
   at their sha (`git show <sha>:<path>`); run a peer's new gate against your tree before folding it.
 - **The structural gates, their recorded go-red proofs and their legitimate update paths** live in
-  `docs/dev/STRUCTURAL_GATES.md` (355 lines, rmbp 11's GATESDOC). Every such gate carries a control
+  `docs/dev/STRUCTURAL_GATES.md` (~1360 lines as of 2026-09-16; rmbp 11's GATESDOC). Every such gate carries a control
   probe so a zero result is distinguishable from a broken pattern. That file is on `hw-rmbp` only and
   arrives when that track lands — cited here, never copied, because a second copy is how two divergent
   ones happen. Read it at the ref: `git show hw-rmbp:docs/dev/STRUCTURAL_GATES.md`.
@@ -309,7 +309,9 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   so fold line-neutral or append at the tail; a cfg'd-out `pub mod` declaration is the exception (the
   file is never lexed) and the module root is not. Folded witnesses survive only by grep: gate a
   re-cut by witness symbol count, never by a clean apply. **A comment inserted mid-line kills the
-  code to its right** with every gate green: code first, comments last, assert the column.
+  code to its right** with every gate green: code first, comments last, assert the column. The CACHE
+  is part of the recipe — one pristine tree hashed 2638 B apart cold vs warm (SMALLFIX 2026-09-16) —
+  so a `knoboff` verdict is trusted only with `warm=yes` printed beside it (GATE-KNOBOFF).
 - **A cfg-widen's gates compile the configuration it turns on, in a fresh tree** (orin 1; pi 7 +
   orin 17 2026-09-06); prove the leg by re-applying the broken change and watching it go red.
 - **Before shipping a check into a brief, feed it a case that must pass and one that must fail**; a

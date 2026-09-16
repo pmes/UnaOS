@@ -30,10 +30,11 @@ control failure is a broken gate, not a clean tree, and it is reported as such.
 **Where they run.** Most run inside `check_both` in `unaos/arroyo`, after the
 compile legs; `test` and `test-arm` do not run those. Each has its own failure
 line in `check_both` so that a red is attributed to the gate that produced it.
-GATE-TESTTRUNC below is the exception, and its section says so: it is held to the
-same standard — invariant, control, recorded go-red, legitimate update — but it
-asserts a property of a QEMU RUN rather than of the tree, so it lives on the x86
-`test` legs and `check` cannot see it.
+GATE-TESTTRUNC and GATE-KNOBOFF below are the two exceptions, and their sections
+say so: both are held to the same standard — invariant, control, recorded go-red,
+legitimate update — but one asserts a property of a QEMU RUN and the other a
+property of a pair of BUILDS, so they live on the x86 `test` legs and in the
+`knoboff` verb respectively, and `check` cannot see either.
 
 ---
 
@@ -1236,6 +1237,119 @@ commit. Widening (a)'s extractor is always safe. Narrowing the red — e.g.
 excluding a name because "it is aarch64-only" — costs the gate its whole point
 and must be argued for; the correct fix for an aarch64-only default-on name is
 that it should not be appended at top level in the first place.
+
+---
+
+## GATE-KNOBOFF — a byte-identity verdict is only as good as its cache state
+
+**Where it runs.** Not in `check_both`. This one lives in the `knoboff` verb
+(`./arroyo knoboff <feature> [baseline-ref]`), which compares the knob-off
+loadable image of your tree against a baseline's. `check` never runs it; a brief
+asks for it by name and the executor quotes its exit status.
+
+**Invariant.** The two images a `knoboff` verdict is computed from were each
+produced by exactly one `unaos-kernel` compile, in this process, against a cache
+in which every dependency was already built — and the `include_bytes!`d
+`unaos/target/user_blob.bin` was the same file for both.
+
+**Why a gate.** The verb already built both images in ONE directory, which
+removes the path delta (SO34). It said nothing about the cache, and the cache
+delta was built into the phase order: on a fresh per-caller key the BASELINE
+build is the one that pays for every dependency and build-std crate, and the tree
+build it is compared against then runs with all of that warm. Cold against warm,
+on every first run, in the one direction the tool could not see. The rmbp seat
+measured what that is worth on 2026-09-16 (SMALLFIX, QUEUE §5): one pristine tree
+with one banner hashed `9d3103c3…` for `kernel8.img` against a cold target dir and
+`0b6f2381…` against a warm one, **2638 bytes apart**, with warm→warm and cold→cold
+each reproducing. A comparison across that boundary answers a question about the
+cache in the words of a question about the source.
+
+The second half was found by the census on its own first run and is worse,
+because it is silent. Cargo fingerprints on mtime, `git reset --hard` rewrites
+only the files that actually differ between two commits, and switching feature
+sets back and forth re-links a `deps/unaos-kernel-<metadata>` artifact an earlier
+run produced. So a docs-only or arroyo-only diff makes cargo compile **nothing**:
+measured here, the second `./arroyo knoboff deadman` against a warm key finished
+in **1.87 s having invoked no compiler at all**, compared three images objcopied
+out of .elf files the previous run had left behind — one of them the cold-built
+baseline — and printed PASS. A gate whose green means "I did not look" is the
+`a-check-that-cannot-fire` shape with a clean exit status.
+
+**Mechanism.** Three parts, all in `unaos/arroyo`'s `knoboff` block.
+
+1. *The census.* `_knoboff_flat` takes a 7th argument and captures THAT build's
+   cargo output to its own file before it joins the shared run log, so its
+   `Compiling <crate>` lines can be attributed to the build whose verdict depends
+   on them. The run prints, unconditionally and before the verdict,
+   `knoboff: warm=<yes|no> compiled_baseline=[…|…] compiled_tree=[…|…]  (x86|arm)`.
+2. *Warm first, score second — conditionally.* `_knoboff_scored_pair` builds,
+   reads its own census, and if that census is anything other than exactly one
+   `unaos-kernel` compile it discards those images, re-dirties the two crate roots
+   (`_knoboff_touch_kernel`) and scores a SECOND build, which now has every
+   dependency warm. A first pass that already says `unaos-kernel` alone IS that
+   warm compile and is scored as it stands, so the extra compile is paid on cold
+   and no-op runs and on no others. The armed control build is not scored for
+   identity, only for inequality, and is left alone — arming a feature may
+   legitimately pull in an optional dependency.
+3. *The `include_bytes!` payload.* `unaos/target/user_blob.bin` is produced by
+   `build_user_blob`, not by cargo; it survives `git clean -fd` (ignored) and no
+   phase of `knoboff` rebuilds it. Its sha256 is recorded immediately before each
+   scored build and a difference is exit 2, naming the file — a byte delta with no
+   source behind it would otherwise be scored as the executor's. Under the default
+   feature sets the site is `baremetal`-gated and both sides read `absent`, which
+   is the ordinary case; under `UNAOS_TEGRA_EL0=1 UNAOS_KNOBOFF_WITH_ENV=1` it
+   reaches the image.
+
+**Control.** The existing armed probe is unchanged and still required: arming the
+feature must move at least one image or there is no verdict. The warm-cache
+assertion adds its own, which is the census line itself — it is printed on every
+run, including the green ones, so a `0` quoted without `warm=yes` beside it is
+visibly an incomplete quotation rather than a silent one.
+
+**The `-s` trap, recorded because it cost a cut.** The first cut tested the
+census file with `[ -s ]`. `paste -sd, -` emits a lone newline for empty input, so
+the one-byte file that means "cargo compiled nothing" passed `-s`, and the no-op
+half of the gate could not fire. It printed `warm=yes compiled_tree=[<none>|<none>]`
+— its own output contradicting its own verdict — on its first run.
+`_knoboff_census_empty` tests CONTENT.
+
+**Goes red when** a scored build compiles any crate but `unaos-kernel`, or
+compiles nothing, or the user_blob moves between the two scored builds: exit
+`2 — NO VERDICT: cache not warm (rebuilt: <crates>)`, which is never a pass.
+**GO-RED proof, measured 2026-09-16 on `hw-rmbp` at `56103466`, five states:**
+
+| # | state | result |
+|---|-------|--------|
+| a1 | warm-up retry removed (harness mutation), fresh per-caller key = genuinely cold | **exit 2**, `warm=no`, census named 43 crates (`alloc,bincode,…,x86_64`) on the baseline and `<none>` on the tree — i.e. the exact cold-vs-stale pair the old code passed |
+| a2 | same key, mutation removed | **exit 0**, `warm=yes`, `compiled_baseline=[unaos-kernel\|unaos-kernel] compiled_tree=[unaos-kernel\|unaos-kernel]` |
+| b1 | dependency touch injected under the scratch worktree (`crates/net/src/lib.rs`, mtime +2 h) | **exit 0** — the retry ABSORBS it (`↻ baseline: first pass compiled [net,unaos-kernel\|…]`, scored pass kernel-only). This is the must-PASS fixture: an arc that edits a dep gets a verdict, not a refusal |
+| b2 | `Compiling` parser mutated to mis-name every crate | **exit 2** naming `unaos-kernel-mutant` |
+| c | control still reds a real move: `xhcikbd`, HEAD `d78241fa` vs baseline `d863eab2` | **exit 1**, `warm=yes`, control fired on both arches, x86 1246172 B and arm 1120995 B differing, both sizes changed |
+
+A known-identical pair (the docs-only `56103466` against its parent `707c293d`)
+returns **exit 0** with `warm=yes`. The reproducibility the discipline buys is
+visible across the table: the scored images are the same bytes from a cold key,
+from a warm key and from a third caller key on the same box (x86
+`1262919d…`/1537216, arm `243e2e99…`/1608416), where before the fix the same
+source pair scored `6c88e301…` cold.
+
+**Cost**, before and after on the same box state (`deadman`, the docs-only pair,
+20 cores under load ~12): COLD 115.61 s → 165.57 s, the `+49.96 s` being the one
+extra kernel-only compile per arch and nothing else; WARM 1.87 s → 95.23 s. The
+warm pair is not a regression to argue about — the 1.87 s it replaces is the run
+that compiled nothing and scored the previous run's artifacts.
+
+**Legitimate update.** Widening what counts as warm is the dangerous direction and
+needs a measurement, not an argument: the whole gate is the claim that a verdict
+computed across a cache boundary is void, and SMALLFIX's 2638 bytes is the price
+of being wrong about it. Adding a crate to the allowed census (there is no
+allowlist today, only `unaos-kernel`) would have to show that crate cannot reach
+the image. The honest standing limit is the opposite one and is not a bug: an arc
+whose diff makes a NON-kernel workspace crate recompile on BOTH passes gets NO
+VERDICT here rather than a wrong one, because the instrument has no power to
+separate the dep's codegen from the knob's. Score that arc on the armed artifact
+instead. Do NOT relax the refusal to get a number out of the tool — a `0` whose
+cache state is unknown is exactly the green SMALLFIX proved means nothing.
 
 ---
 
