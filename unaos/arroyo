@@ -6423,6 +6423,39 @@ check_both() {
         _crc=1
     fi
 
+    # GATE-FOREMAN (FOREMAN-ROOT, rmbp, 2026-09-16): GATE-ROOTS' shape applied to a SECOND
+    # IMPLEMENTATION. `tools/foreman/src/verdict.rs` re-implements `unaos/scripts/mbench.py`'s spec
+    # grammar and verdict table, and `tools/foreman/tests/agreement.rs` asserts the two agree on a
+    # shared corpus — exit code AND rendered table, byte for byte. That test was named NOWHERE in
+    # this script, so nothing ran it, and it had been RED for weeks: QEMU-FAST taught mbench a
+    # `[mode unknown: …]` suffix on the verdict line, SPECRUN taught it ` (pinned at <spec>:<line>)`
+    # and the `FIRST-SHORTFALL` line, and foreman learned none of the three. A checked-in test that
+    # is red and unrun is strictly worse than no test: it reads as coverage in the tree and cannot
+    # catch anything, which is exactly the unnamed-root shape GATE-ROOTS closes for binaries and
+    # GATE-SPECROOTS for specs.
+    #
+    # WHY THE DIVERGENCE MATTERS AND IS NOT COSMETIC. `arroyo`'s `test`/`test-fat` tails quote
+    # mbench's FIRST-SHORTFALL line to name the pin that came up short, and the `[mode …]` suffix is
+    # the THREE-VALUED capture-mode read every consumer must treat as NOT-FULL when it says unknown.
+    # A second table that prints neither is a second opinion that silently disagrees with the one the
+    # bench scores from.
+    #
+    # Root workspace, not `unaos/`: `foreman` is a member of the repo-root `Cargo.toml`, the same
+    # convention as GATE-CORE's `midden_core` above. `--test agreement` is deliberate — it is the
+    # cross-implementation leg, ~3 s, and it skips LOUDLY (never quietly green) if python3 cannot run
+    # mbench.py. TMPDIR is pinned into the tree's own `target/` because the test writes its canned
+    # fixtures through `std::env::temp_dir()` and LAWS forbids /tmp on this bench; the corpus scans
+    # `unaos/target/serial*.log`, and this directory holds none, so it can never enlarge the corpus.
+    local _fmrc=0
+    echo -e "${COLOR_YELLOW}⚡ Host tests: foreman ↔ mbench agreement...${COLOR_RESET}"
+    if (cd "$WORKSPACE_DIR/.." && mkdir -p target/foreman-agreement-tmp \
+            && TMPDIR="$(pwd)/target/foreman-agreement-tmp" cargo test -p foreman --test agreement); then
+        echo -e "${COLOR_GREEN}  ✅ foreman agrees with mbench (verdict table and exit code)${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}  ❌ foreman DISAGREES with mbench — two verdict tables, one bench${COLOR_RESET}"
+        _fmrc=1
+    fi
+
     # GATE-FAMILY: a ratchet on platform-split symbol families — `render_service` /
     # `x86_render_service` / `orin_render_service` and the seven others like it.
     #
@@ -6616,6 +6649,10 @@ check_both() {
 
     if [ "$_crc" -ne 0 ]; then
         echo -e "${COLOR_RED}❌ check FAILED — a shared core's host tests did not pass (see above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_fmrc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — foreman's verdict table no longer agrees with mbench's (see GATE-FOREMAN above)${COLOR_RESET}"
         return 1
     fi
     if [ "$_frc" -ne 0 ]; then

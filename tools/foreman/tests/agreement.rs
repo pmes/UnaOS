@@ -163,6 +163,16 @@ fn agrees_with_mbench_on_the_shared_corpus() {
             write(&tmp, "t-panic.log", &cat(&[TRUNC_HEAD, b"PANIC: something exploded\r\n"])),
             trunc_spec.clone(),
         ),
+        // The end-of-run marker and NOTHING else. The run finished, so both pinned
+        // REQUIREs are a GENUINE shortfall — the only pair in this corpus that
+        // reaches mbench's `(N further pinned line(s) also short)` companion to
+        // FIRST-SHORTFALL. Added with the SPECRUN shapes: without it that branch is
+        // a string no fixture can execute, which is the vacuum this test exists to
+        // refuse.
+        (
+            write(&tmp, "t-both-short.log", b":: RUN-END marker ::\r\n"),
+            trunc_spec.clone(),
+        ),
     ];
 
     // --- every checked-in spec x every capture in the tree -------------------

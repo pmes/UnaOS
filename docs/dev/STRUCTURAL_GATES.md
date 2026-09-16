@@ -1584,6 +1584,97 @@ one helper instead.
 
 ---
 
+## GATE-FOREMAN — a second implementation of the verdict table must agree with the first
+
+**Invariant.** `tools/foreman`'s `verdict` module and `unaos/scripts/mbench.py`
+produce the **same exit code and the same rendered verdict table, byte for byte**,
+over a shared corpus: mbench's eight canned self-test fixtures, one added pair
+that reaches the multi-shortfall branch, and every checked-in
+`unaos/scripts/specs/*.spec` crossed with every `unaos/target/serial*.log` present
+in the checkout. `mbench.py` is the source of truth; foreman follows.
+
+**Why a gate, and the shape it closes.** The agreement test already existed —
+`tools/foreman/tests/agreement.rs`, written with the module it guards. It was
+named nowhere in `unaos/arroyo`, so no verb ran it, and it had been **red** since
+QEMU-FAST landed. That is this tree's unnamed-root shape for a third kind of
+root: GATE-ROOTS closes it for binaries (a binary is nobody's dependency, so a
+binary no leg names is never type-checked), GATE-SPECROOTS closes it for specs (a
+spec nothing replays pins lines nothing evaluates), and a **checked-in test that
+no gate invokes** is the same defect one layer up — strictly worse than no test,
+because it reads as coverage in the tree while catching nothing. The three
+divergences it was sitting on are not cosmetic: mbench had learned QEMU-FAST's
+`[mode unknown: …]` verdict-line suffix — the three-valued capture-mode read
+every consumer must treat as NOT-FULL when it says `unknown` — and SPECRUN's
+` (pinned at <spec>:<line>)` coordinate and `FIRST-SHORTFALL <spec>:<line>` line,
+which `arroyo`'s `test`/`test-fat` tails quote verbatim so the verb and the table
+can never disagree about which pin came up short. foreman had learned none of
+them. A second opinion that silently prints a different table is worth less than
+no second opinion.
+
+**Mechanism.** A `check_both` leg runs `cargo test -p foreman --test agreement`
+from the repo-root workspace, the same convention GATE-CORE uses for
+`midden_core`. The test shells out to `python3 unaos/scripts/mbench.py --replay
+<log> --spec <spec> --quiet` for each pair and compares `(rc, table)` against
+`verdict::evaluate` + `verdict::render_table` on the same pair, reporting **every**
+mismatching pair with the first differing line of each, not just the first. Cost
+is ~3 s. `TMPDIR` is pinned into the tree's own `target/` by the leg: the test
+writes its canned fixtures through `std::env::temp_dir()` and LAWS forbids `/tmp`
+on this bench. That directory can never enlarge the corpus — the capture scan
+matches `unaos/target/serial*.log` only, and the fixtures are named `good.log`,
+`t-cut.log` and the like.
+
+**Control.** Two, and they are the reason this test cannot pass vacuously.
+(a) The test **skips loudly** — `SKIP:` on stderr and a return, never a quiet
+green — if `mbench.py` is absent or `python3` cannot run it; (b) it asserts
+`checked > 0` with the message *"the agreement corpus was empty — nothing was
+proved"*, so a corpus that collapses to zero pairs is a failure rather than a
+pass. The canned half is written by the test itself and is therefore always
+present, which is what makes (b) meaningful in a checkout with no capture in it.
+The hand-rolled SHA-256 the sidecar identity check needs has its own control, and
+it needs one: the corpus carries no valid `.run` sidecar, so a **wrong** digest
+would read as a STALE sidecar and the two tools would still agree. It is
+known-answer tested against the FIPS 180-4 vectors plus the empty message, and
+the streaming path is asserted equal to the one-shot over a million-byte input.
+
+**Goes red when** either implementation's table or exit code moves without the
+other's, on any pair. `check` then prints, through this gate's own failure line,
+`check FAILED — foreman's verdict table no longer agrees with mbench's`.
+
+**GO-RED proof, executed in this gate's landing worktree, two independent
+mutations, each reverted.** The precondition is itself the first measurement: at
+the base commit, with one bench capture staged at `unaos/target/serial.log`, the
+test is **red on 21/21 pairs** (`cargo test -p foreman --test agreement` rc=101).
+With the three strings taught, it is **green, 21/21 pairs identical** (rc=0,
+`agreement: 21 (log, spec) pairs — exit code and verdict table identical`).
+(1) `render_table`'s two lines that append `run_mode_note` removed — the exact
+state the tree shipped in — take it back to **21/21 red** (rc=101), every pair
+naming the `[mode unknown: no run sidecar]` suffix that mbench prints and foreman
+does not. (2) `Directive::note`'s `MISSING` arm reverted to drop `self.origin()`
+reds **14/21**, naming `0 hits — MISSING (pinned at selftest.spec:2)` against a
+bare `0 hits — MISSING`. The two counts differ because the mode suffix is on
+every verdict line and the pin only on a row that came up short, which is the
+distinction the pin was introduced to make.
+
+**Legitimate update.** Change `mbench.py` first — it is the reference — then teach
+`tools/foreman/src/verdict.rs` the same output and re-run the leg. The direction is
+not negotiable: foreman following mbench is the invariant, and a change made only
+in foreman reds this gate by construction. A new output shape that no pair in the
+corpus can reach gets a fixture in `tools/foreman/tests/agreement.rs` in the same
+commit — a branch no fixture executes is the vacuum this gate exists to refuse,
+and the `(N further pinned line(s) also short)` companion to `FIRST-SHORTFALL`
+needed exactly that pair. **What this gate does NOT assert:** that anything on any
+bench runs `foreman`. Nothing does today, measured unfiltered rather than sampled:
+`grep -rl foreman` over the whole bench directory, scratch worktrees excluded,
+returns five files and zero invocations — `media-writer.sh` and two dated backups
+citing `verdict.rs` for their exit-code contract, one capture header using the word
+as an executor's role name, and one commit-log field in a flash MANIFEST. It is
+named in no script, no playbook and no verb, and its live claim on the tree is its
+preflight, which is why every
+`.spec` in this repo is written look-around free (LAWS §5 Specs and scorers). If
+the second implementation is ever retired under R16, this gate goes with it.
+
+---
+
 **Landed but not yet sectioned here:** GATE-ROOTS (`scripts/check-roots.sh`, every
 binary target is a named root of `check`) and GATE-APPEND (`scripts/append-position.sh`,
 LEDGER P7's trailing-comment trap) are both wired into `check_both` and green; their
