@@ -817,6 +817,35 @@ before it starts. Both still hold; the gate simply asks the right thing now.
   becomes an expression compared with itself — the exact defect FATVERB's own note records the first
   cut of that witness making.
 
+#### 13.4a STORWAIT — the storage wait waits for THE BOOT MEDIUM, not for any disk (2026-09-15)
+
+`fatverb_storage_witness` owns the one bounded wait on x86, and `x86bind_witness(settled=true)` is
+driven off its expiry — so whatever that wait asks IS the tree's definition of "enumeration is as
+finished as it is going to get". It used to ask `drivers::block::program_source().is_some()`: *has ANY
+program source answered.* On a board with a second block device that is the wrong disk's answer, and
+the rMBP is that board — `sdhcblk` is default-on and the builder attaches `sdhci-pci` + `sd-card`, so
+the internal SD reader answers on the FIRST pass. Measured at `a1e50849` on `UNAOS_WC=1
+UNAOS_QEMU_FULL=1 ./arroyo test-fat sf 300`: `waited=0ms`, the survey and the witness both latch at
+serial lines 550/560, and the kernel-carrying superfloppy publishes hundreds of lines later — so the
+boot published `X86BIND: root=- reason=kernel-not-found-on-any-volume -> FAIL` about a machine it had
+not yet been shown, TSTE came in 16/2, and one mount row existed where three should. **The contract is
+now the boot medium's ENUMERATION, and the wait ends for exactly one of three named reasons, published
+as `settled=` on its own `:: [fatverb] storage settle: waited=<n>ms settled=<r> handles=<census> ::`
+line**: `found` — the bootdisk survey has BOUND a volume carrying this kernel, so nothing arriving
+later can improve the answer (this is also the aarch64 path, where the medium is the card the kernel
+was read from and is up before the first pass: `settled=found`, `waited=0ms`, pass 1, unchanged);
+`usb` — no root yet, but the bus has gone quiet (`xhci::enumeration_in_flight()` false — no root port
+mid-enumeration and none queued, the same predicate `service_storage` paces its own deferred SCSI
+bring-up on) AND the block layer's USB registry has published at least one disk, so a survey now is a
+survey of the whole machine; `ceiling` — `STORAGE_WAIT_MS` (30 s) expired, unchanged, and the wait
+still TERMINATES IN A LINE rather than in silence. The SD reader's presence satisfies none of the
+three: it is still surveyed, still mounted and still LISTED as home soil, it is simply no longer
+mistaken for the end of enumeration. After the fix the same leg reads `waited=141ms settled=found`,
+`X86BIND: root=global:/KERNEL.ELF … by=content -> PASS`, TSTE 24/0, three mount rows on one volume id.
+`settled=` rides a SECOND line rather than being folded into the `storage witness:` line above it
+because that line is pinned verbatim by `scripts/specs/x86-fat.spec:156`, whose regex fixes
+`waited=[0-9]+ms` ADJACENT to `handles=` with no slack anywhere along it.
+
 ### 13.5 What stopped being printable, and why that is the arc working
 
 Three FAT-specific facts left the output, because a trait that could carry them would be a FAT

@@ -4716,7 +4716,8 @@ pub fn fatverb_storage_witness() {
     if FATVERB_WITNESS_DONE.load(Ordering::Acquire) {
         return;
     }
-    // BOUNDED WAIT FOR A PROGRAM SOURCE — the second half of "not vacuous", and it is not optional.
+    // BOUNDED WAIT FOR THE BOOT MEDIUM TO SETTLE — the second half of "not vacuous", and it is not
+    // optional.
     //
     // Being called from the storage-ready pass is necessary but not sufficient: the pass begins
     // running long before the deferred SCSI bring-up behind `service_storage` finishes, so a witness
@@ -4726,12 +4727,70 @@ pub fn fatverb_storage_witness() {
     // first pass, and the `test-fat sf` shape had nothing at all, so the two differ and neither can
     // be assumed.
     //
+    // STORWAIT — WHAT THE WAIT IS WAITING FOR, and the bug that named it.
+    //
+    // This predicate used to be `drivers::block::program_source().is_none()`: wait until ANY program
+    // source answers. That is the wrong question on every board that has a second block device, and
+    // the rMBP is one — `sdhcblk` is DEFAULT-ON and the builder attaches `sdhci-pci` + `sd-card`, so
+    // the internal SD reader answers `program_source()` on the FIRST pass. MEASURED at a1e50849 on
+    // `UNAOS_WC=1 UNAOS_QEMU_FULL=1 ./arroyo test-fat sf 300`, the leg whose superfloppy DOES carry
+    // `KERNEL.ELF`: `waited=0ms handles=global=absent sdhc=present` at serial line 550, the bootdisk
+    // survey and `x86bind_witness(settled=true)` latching at 560 with
+    // `X86BIND: root=- reason=kernel-not-found-on-any-volume -> FAIL` — a verdict about a machine
+    // that had not yet been shown its own boot disk — TSTE 16/2, one `:: volid: mount` row, rc=1,
+    // and deterministic. Under this predicate the same command is rc=0 with `waited=141ms
+    // settled=found`, `root=global:/KERNEL.ELF … by=content -> PASS`, TSTE 24/0 and three mount rows
+    // on one volume id. The wait was never too short; it was answered by the wrong disk.
+    //
+    // ⚠ WHAT THIS DOES **NOT** FIX, measured rather than assumed, because the brief that named this
+    // arc asserted otherwise: the PLAIN `./arroyo test` leg cannot be green at ANY predicate. Its
+    // usb-storage slot is backed by `builder/src/main.rs:976-985`'s raw `UNA-OS-DISK-001-ALPHA`
+    // pattern — `FS: no FAT filesystem (NotFat)` on the wire — so NO mountable volume on that
+    // machine carries this kernel and `X86BIND -> FAIL` / `vfsroute.refuse -> FAIL` are the CORRECT
+    // answers there. That leg does improve (TSTE 16/2 -> 17/1: `fatverb.writegate` goes green
+    // because the wait now outlasts the read-only reader), and `MISSION SUCCESS` / `usbw. write
+    // lba=131071 ok` are unchanged. Greening it is a FIXTURE change, not a kernel one.
+    //
+    // So the predicate is now the BOOT MEDIUM'S ENUMERATION, and it settles for exactly one of three
+    // named reasons, which the `[fatverb] storage settle:` line below prints as `settled=`:
+    //
+    //   found   — the bootdisk survey has BOUND a volume carrying this kernel. Nothing arriving
+    //             later can improve on that answer, so the wait is over whatever else is in flight.
+    //             This is also what makes the shared code correct on the Pi and the Orin, where the
+    //             medium is the card the kernel was read from and is up before the first pass:
+    //             `settled=found` on pass 1, `waited=0ms`, exactly as before.
+    //   usb     — no kernel-carrying volume yet, but the USB bus has gone QUIET (no root port
+    //             mid-enumeration and none queued — `xhci::enumeration_in_flight`, the same
+    //             predicate `service_storage` paces its own bring-up on) AND the block layer's USB
+    //             registry has published at least one disk. The medium is as enumerated as it is
+    //             going to get; a survey now is a survey of the whole machine.
+    //   ceiling — `STORAGE_WAIT_MS` expired. Unchanged, and still the law below.
+    //
+    // The SD reader's mere presence satisfies none of them. It is still surveyed, still mounted, and
+    // still LISTED as home soil — it is simply no longer mistaken for the end of enumeration.
+    //
     // The shape is `desktop_uefi::desktop_app_service`'s, deliberately — including its law that the wait
     // TERMINATES IN A LINE rather than in silence. A boot that genuinely never gets a block device
     // must still emit these legs (a read verb with no volume is Boot AR's own symptom, and a spec
     // REQUIRE must not go red because the machine had no card in it), so the deadline expires into
     // the witness rather than out of it, and the census on the line says which it was.
-    if crate::drivers::block::program_source().is_none() {
+    //
+    // Cost: `locate()` is the SO38-cached survey (a bound root is cached for the boot; a no-root walk
+    // is redone only when the set of present sources CHANGES), and the other two terms are one
+    // registry count and one masked O(1) `claim()`. A pass that is going to wait pays no walk.
+    fn settle_reason() -> Option<&'static str> {
+        if matches!(crate::fs::bootdisk::locate(), crate::fs::bootdisk::Verdict::Bound(_)) {
+            return Some("found");
+        }
+        if crate::drivers::block::usb_disk_count() > 0
+            && !crate::drivers::xhci::enumeration_in_flight()
+        {
+            return Some("usb");
+        }
+        None
+    }
+    let settle = settle_reason();
+    if settle.is_none() {
         let now = crate::arch::ticks();
         let started = WITNESS_WAIT_SINCE_MS.load(Ordering::Relaxed);
         if started == 0 {
@@ -4741,11 +4800,16 @@ pub fn fatverb_storage_witness() {
         if now.saturating_sub(started) < STORAGE_WAIT_MS {
             return;
         }
-        // Fall through: speak on an empty census, and say so below.
+        // Fall through: speak on whatever census there is, and say `settled=ceiling` below.
     }
     if FATVERB_WITNESS_DONE.swap(true, Ordering::AcqRel) {
         return;
     }
+    // WHY the wait ended, beside HOW LONG it took. `waited=` alone cannot tell a boot whose medium
+    // was there from one whose deadline expired on an empty machine, and it certainly cannot tell
+    // either from a boot that waited out a bus and then found its disk — which is the whole defect
+    // this pair exists to make unmissable in a capture.
+    let settled = settle.unwrap_or("ceiling");
     let waited = match WITNESS_WAIT_SINCE_MS.load(Ordering::Relaxed) {
         0 => 0,
         t => crate::arch::ticks().saturating_sub(t),
@@ -4855,6 +4919,24 @@ pub fn fatverb_storage_witness() {
     serial_println!(
         ":: [fatverb] storage witness: exec={} read={} gate={} waited={}ms handles={} ::",
         bind::name(exec_bound), bind::name(read_bound), bind::name(gate), waited, census
+    );
+    // STORWAIT: WHY the wait ended, on its OWN line and never folded into the one above.
+    //
+    // `waited=` alone cannot separate three completely different boots that all print small numbers:
+    // a medium that was already there (`found`), a bus that had to be waited out and then produced
+    // one (`usb`), and a deadline that expired on a machine which never showed the kernel its disk
+    // (`ceiling`). At a1e50849 the `test-fat sf` leg printed `waited=0ms` and that number was TRUE
+    // and USELESS — the wait had been answered by the internal SD reader, not by the boot medium,
+    // and nothing in the capture said so. `settled=` is the term that would have said it.
+    //
+    // WHY A SECOND LINE rather than one more field on the witness above: that line is pinned
+    // verbatim by `scripts/specs/x86-fat.spec:156`'s REQUIRE, whose regex fixes `waited=[0-9]+ms`
+    // ADJACENT to `handles=`, with no slack anywhere along it. Folding the field in would red a
+    // replay spec no gate command runs — a silent landmine — and editing that spec is outside this
+    // change's brief. One extra line costs a capture nothing and keeps both facts greppable.
+    serial_println!(
+        ":: [fatverb] storage settle: waited={}ms settled={} handles={} ::",
+        waited, settled, census
     );
 
     // VFSROUTE: the routing transcript rides THIS site on x86, and for the same reason the FATVERB
