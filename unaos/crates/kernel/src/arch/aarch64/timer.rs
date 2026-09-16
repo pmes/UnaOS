@@ -402,7 +402,7 @@ const EL1_PROOF_NO_CORE: u32 = u32::MAX;
 ///
 /// IRQEL-CORE — why this is a core id and not a bool. It was `static EL1_PROOF_ARMED: AtomicBool`,
 /// i.e. MACHINE-GLOBAL, and that is the defect boot 5c convicted. ORIN-SMP-3 (`UNAOS_TEGRASMP=1`,
-/// `main.rs` `start_secondaries_tegra`, called BEFORE the JM6 drop) brings five Orin secondaries
+/// `main.rs` `start_secondaries`, called BEFORE the JM6 drop) brings five Orin secondaries
 /// online that (a) stay at EL2 — `smp_virt::secondary_entry` calls `exceptions::install()` there,
 /// which sets HCR_EL2.IMO|FMO|AMO so their physical IRQs target EL2 — and (b) each arm their OWN
 /// periodic 250 Hz PPI 30 via `arm_this_core_ap`. That is ~1250 timer IRQs/s entering this very

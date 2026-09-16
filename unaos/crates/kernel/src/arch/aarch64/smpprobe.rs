@@ -1374,7 +1374,7 @@ fn run_5core_sequence(ctx: &ProbeCtx) {
 //
 //   * leg 21 — the REAL `_secondary_start_virt` entry (its code + per-CPU `SECONDARY_STACKS`),
 //     ONE core. The probe publishes the real path's inputs through the granted publish-only API
-//     (`smp_virt::probe_publish_real_path` — the exact `start_secondaries_tegra` pre-`CPU_ON`
+//     (`smp_virt::probe_publish_real_path` — the exact `start_secondaries` pre-`CPU_ON`
 //     publication; NO `CPU_ON` inside) and observes the real path's own online signal
 //     (`smp_virt::probe_core_online`, the `CORE_READY` visibility grant). The woken core runs the
 //     REAL `__secondary_rust_virt` — its ":: AARCH64 SMP: AP 1 online …" print is EXPECTED (this
@@ -1497,7 +1497,7 @@ unsafe extern "C" {
 }
 
 /// Build the SMP-6 linear-index → affinity table from the DTB `/cpus` oracle (RIDER 5): BSP =
-/// index 0, every OTHER `/cpus` core = 1,2,… in DTB order — the same table `start_secondaries_tegra`
+/// index 0, every OTHER `/cpus` core = 1,2,… in DTB order — the same table `start_secondaries`
 /// builds. Returns the core count (incl. the BSP); 1 = no wakeable secondary.
 fn smp6_aff_table(ctx: &ProbeCtx, aff_by_index: &mut [u32; 8]) -> usize {
     let bsp_aff = gic::this_affinity();
@@ -1544,7 +1544,7 @@ fn run_real_entry_one(ctx: &ProbeCtx) {
     }
     let target = aff_by_index[1];
 
-    // The granted publish-only API: the exact `start_secondaries_tegra` pre-CPU_ON publication
+    // The granted publish-only API: the exact `start_secondaries` pre-CPU_ON publication
     // (BSP affinity + SGI-0 enable, EL2 ctx capture + clean, SECONDARY_STACKS clean+invalidate,
     // AFF_BY_INDEX/N_CORES_PUB) — no CPU_ON inside. Returns the REAL entry PA.
     let entry = super::smp_virt::probe_publish_real_path(&aff_by_index[..n_cores]);
