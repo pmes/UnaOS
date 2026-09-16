@@ -1576,12 +1576,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // published it. They are the same today and stop being the same the moment a steal
             // declares this core dead — see `render_rehome_service`.
             RENDER_ROLE_CPU_X86.store(render_cpu, core::sync::atomic::Ordering::Relaxed);
-            unaos_kernel::arch::sched::spawn(
+            unaos_kernel::arch::sched::spawn_stack(
                 "render",
                 x86_render_service,
                 render_cpu,
                 render_cpu,
-                unaos_kernel::arch::sched::PRIO_NORMAL,
+                unaos_kernel::arch::sched::PRIO_NORMAL, unaos_kernel::arch::sched::RENDER_PATH_STACK_SIZE, // RENDSTACK — the render service comes off the BLANKET 16 KiB onto a MEASURED 32 KiB, the same cure and the same number the Pi applied to `usb-pump`/`input` after dsktp boot 11 (`PUMP_PATH_STACK_SIZE`, this file's tail). QUARRYX86-2 is what made it owed on this arch: its x86 click-router arm (`arch/x86_64/syscall.rs`) drains the dock's Quarry latch by calling `quarry::service()` -> `open()` — a panel read, two VFS `read_dir`s and a surface alloc — and the only two routers that reach it here are `kernel_main` (the BOOT stack, not a `Task` at all) and THIS task. The size comes from the `:: STACK: render high=` readings the `witness` probe now takes on the service dump's ~5 s cadence, not from the Pi's precedent: the RENDSTACK block at the tail of `arch/x86_64/sched.rs` carries the numbers and the margin. `TASK_STACK_SIZE` is untouched — sizing one deep path is the honest fix; raising the blanket charges every kernel task in the system for it. ⚠ FOLDED onto the pre-existing arg line with the call RENAMED in place, never a line added: this file's panic `Location`s are load-bearing and its line count is identical before and after. x86-only by construction — the whole `if` sits under `#[cfg(all(target_arch = "x86_64", not(feature = "rast")))]` (line 1510), so no aarch64 byte moves.
             );
             serial_println!(
                 ":: SCHED-X86: RENDER on core {} + INPUT/usb-pump on core {} ({} AP(s) dispatching) — OS on its own scheduler ::",
@@ -3335,12 +3335,12 @@ fn render_rehome_service() {
     RENDER_ROLE_EPOCH_X86.fetch_add(1, core::sync::atomic::Ordering::Release);
     RENDER_ROLE_CPU_X86.store(rescue, Relaxed);
     RENDER_RESCUE_X86.store(true, SeqCst);
-    unaos_kernel::arch::sched::spawn(
+    unaos_kernel::arch::sched::spawn_stack(
         "render-rehomed",
         x86_render_service,
         rescue,
         rescue,
-        unaos_kernel::arch::sched::PRIO_NORMAL,
+        unaos_kernel::arch::sched::PRIO_NORMAL, unaos_kernel::arch::sched::RENDER_PATH_STACK_SIZE, // RENDSTACK — the REPLACEMENT takes the same size for the same reason, and it is not defensive symmetry: it runs the IDENTICAL body (`x86_render_service`), so it reaches the identical QUARRYX86-2 chain. Sizing the primary and not the rehome would have left the defect wearing the rehome's name — and the boot where this task exists is by definition the boot where the primary already died, i.e. the worst possible one to discover a 16 KiB floor on. `render-rehomed` reports on the same `:: STACK: <task> high=` witness, which is keyed on the task's own name, so a capture says which of the two was measured. ⚠ FOLDED, call RENAMED in place, line count unchanged. This whole fn is `#[cfg(target_arch = "x86_64")]` (line 3254) — aarch64 untouched.
     );
     unaos_kernel::deadman::note_rehome();
     serial_println!(

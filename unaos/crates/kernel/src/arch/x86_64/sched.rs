@@ -87,7 +87,83 @@ use crate::arch::{apic, percpu};
 
 /// Per-task kernel stack. 16 KiB is generous for kernel threads (the deepest thing they do is
 /// `serial_println!` formatting); bump if a workload needs more.
+///
+/// RENDSTACK: still the BLANKET, and still not to be raised. Raising it charges every kernel task
+/// in the system for one path's frame chain; a path that outgrows it takes a right-sized stack of
+/// its own through [`spawn_stack`] with the measurement that sized it. This is the aarch64 note on
+/// `spawn_stack` verbatim, and it is the trade the Pi settled after dsktp boot 11.
 const TASK_STACK_SIZE: usize = 16 * 1024;
+
+/// RENDSTACK — the GUARD SPAN below every x86 kernel stack, one 4 KiB page wide.
+///
+/// It is a POISONED span, not an unmapped page, and that is a measurement rather than a
+/// preference. Every x86 kernel stack is an individual heap allocation (`alloc::vec![0u8; ..]`
+/// in [`spawn_inner`], [`spawn_user_inner`] and [`spawn_user_thread`]); the kernel runs on the
+/// firmware's IDENTITY map with `physical_memory_offset == 0` (`arch/x86_64/memory.rs::init`) and
+/// the heap is a plain window inside it (`allocator::HEAP_SIZE`, 256 MiB, carved from the first
+/// >=16 MiB Usable region). Unmapping a 4 KiB hole inside that window cannot work here for three
+/// independent reasons, any one of which is sufficient:
+///   1. the global allocator is `linked_list_allocator::Heap`, which writes its free-list `Hole`
+///      node INTO the start of a block on `dealloc` — and the start of a stack block would be the
+///      guard. Every task teardown would fault inside the allocator, with the heap lock held.
+///   2. the identity map is the FIRMWARE's, and a 4 KiB hole inside a 2 MiB leaf needs that leaf
+///      split — for a region that also backs xHCI rings and e1000 descriptors handed to devices as
+///      physical==bus addresses. The unmap is not local to the stack.
+///   3. a kernel-space unmap needs a cross-core TLB shootdown. This tree has core-local `invlpg`
+///      plus the `AS_GEN` generation counter for USER leaves only; there is no kernel shootdown.
+/// So the guard is the aarch64 `STACK_REDZONE` shape (`arch/aarch64/sched.rs:41`), widened to a
+/// page: filled with [`GUARD_FILL`], and read by [`guard_state`] at two bytes — the span's TOP
+/// byte (the first thing a dipping SP touches) and its BOTTOM byte (the guard exhausted). It is
+/// UNGATED: it is the protection, not the instrument, so it is present in every x86 image.
+pub const STACK_GUARD: usize = 4096;
+
+/// RENDSTACK — the guard byte. Arbitrary, but must not be a plausible zeroed-frame byte (0x00) or
+/// a plausible pointer byte, so a partially-overwritten guard cannot read as intact. Same value as
+/// the aarch64 twin, so one reader knows both.
+const GUARD_FILL: u8 = 0x5A;
+
+/// RENDSTACK — the high-water paint byte, `witness`-gated exactly like the aarch64 `STACK_POISON`.
+/// A fresh stack's usable span is painted with it at spawn; the deepest point the task EVER reached
+/// is the first byte from the low end that is no longer this value. Poison destroyed stays
+/// destroyed, so the reading is a lifetime high-water and a probe placed after a call still reports
+/// the subtree that call reached. Media builds (`./arroyo esp-x86`) carry none of it.
+#[cfg(feature = "witness")]
+const STACK_POISON: u8 = 0xAB;
+
+/// RENDSTACK — the right-sized kernel stack for the x86 RENDER path, and the only caller of
+/// [`spawn_stack`] in the tree today. 32 KiB. It agrees with the Pi's `PUMP_PATH_STACK_SIZE` /
+/// `RENDER_STACK_SIZE` / `U7_LAUNCH_STACK_SIZE`, and that agreement is a CHECK on the number, not
+/// the source of it — the number comes from this arch's own wire:
+///
+///   * MEASURED, x86, `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_QEMU_FULL=1 ./arroyo test 120` at the
+///     BLANKET 16 KiB — 16 `:: STACK:` lines over a 145.5 s capture: `render` climbs 6552 -> 6704
+///     and then PLATEAUS at **`high=15600 of 16384`** for the last 13 dumps. **784 bytes of
+///     headroom, 95.2 % of the stack consumed** — and that is the ORDINARY pass. This leg presses
+///     nothing: it arms no pointer typist (`UNAOS_XHCIHUB`), so no `[dock] press` is delivered and
+///     the QUARRYX86-2 chain this arc is named for IS NOT IN THAT NUMBER. 16 KiB was not "about to
+///     become" too small; it was already spent.
+///   * THE CHAIN THAT IS NOT IN IT, enumerated on the Pi's armed ELF for the identical
+///     `quarry::open()` body (`main.rs`, the `PUMP_PATH_STACK_SIZE` block): the frames BELOW the
+///     click router are `wc_click_route` 288 + `quarry::live::open` 928 + the deeper of its two
+///     subtrees (repaint 992 + text 1232 + `wm::create_at` 64 + `wm::composite` 6736 = 9024,
+///     against the listing side's 4224) = **10240 B**, itself a floor — it counts no leaf below
+///     `composite` and no preemption frame. Cross-arch, so a bound and not a substitute for the
+///     x86 reading; it is the only enumeration of this chain that exists.
+///   * SO: 32768 - 15600 = **17168 B left above the measured pass**, 1.7x that 10240 B chain, and
+///     32 KiB is 2.1x the measured pass. The same arithmetic at 16 KiB gives **-9456 B**: the
+///     first dock press on this arch runs ~9.2 KiB past its floor.
+///   * CORROBORATED at the NEW size, which is the check that the 15600 was a depth and not an
+///     artefact of the stack it was read on: the same command at 32 KiB reports
+///     **`high=15536 of 32768`** (20 dumps, 120.5 s wall, rc=0). Two independent runs on two
+///     different stack sizes agree to **64 bytes** — a saturating gauge cannot do that, so the
+///     reading is real and `headroom=17232` (52.6 %) is a true margin rather than an unsampled one.
+///
+/// ⚠ THE READING IS A LOWER BOUND ONCE IT SATURATES. [`stack_high_water`] scans UP from the usable
+/// base, so `high <= size` by construction — a pass that stopped exactly at the floor and one that
+/// ran past it both print `high=<size> of <size>`. 15600 is unsaturated and is therefore a real
+/// depth; any FUTURE reading at the size is a floor, and the answer to one is a bigger number plus
+/// the guard's own verdict, never a re-argued guess off a pegged instrument.
+pub const RENDER_PATH_STACK_SIZE: usize = 32 * 1024;
 
 /// Preemption quantum, in local-APIC timer ticks. After this many ticks a running task is
 /// preempted and rotated to the back of its run queue. Small so round-robin sharing is visible.
@@ -1470,6 +1546,18 @@ pub fn emit_load_witness(tag: &str) {
     // `pack` and over-state `spare` for the invisible cores, which is the one direction that makes
     // this witness certify headroom the machine does not have.
     emit_spread_witness(n, seen);
+    // RENDSTACK: the kernel-stack HIGH-WATER of whichever task is driving this dump. Riding this
+    // instrument's existing gate rather than adding a clock is `emit_spread_witness`'s discipline,
+    // and it puts the probe exactly where the sizing evidence is wanted: the PERIODIC caller is the
+    // ~5 s gate inside `x86_render_service` (`main.rs`), so the task read on that cadence is the
+    // render service — the task `RENDER_PATH_STACK_SIZE` sizes — with no plumbing through `main.rs`.
+    // The other two callers are named for honesty, not as an afterthought: `storm_census` (the
+    // shell's `storm` verb) reports whatever task ran it, which is a true reading of a different
+    // task, and the `-prejoin` call runs on the BSP before it joins the scheduler, where there is no
+    // `current` and the probe returns silently. Every line carries its own task name, so a capture
+    // is never ambiguous about which stack it is describing.
+    #[cfg(feature = "witness")]
+    emit_stack_witness();
 }
 
 /// VUGSPREAD — the PLACEMENT witness. One serial line, emitted from [`emit_load_witness`] so it
@@ -2308,6 +2396,7 @@ fn spawn_inner(
     arg: usize,
     target_cpu: usize,
     priority: u8,
+    stack_bytes: usize,
     done_sem: Option<Arc<Semaphore>>,
 ) -> u64 {
     // SMPBAL-X86: the pin contract is decided from the REQUESTED value, before placement resolves it.
@@ -2316,8 +2405,12 @@ fn spawn_inner(
     let target_cpu = pick_cpu(target_cpu, false, name);
     assert!(target_cpu < MAX_CPUS, "spawn: target_cpu out of range");
 
-    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
-    let ctx_rsp = build_initial_frame(&mut stack, task_trampoline);
+    // RENDSTACK: the slab is `stack_bytes` USABLE plus the guard span below it. `paint_stack` lays
+    // the guard and (under `witness`) the high-water poison; `build_initial_frame` is handed the
+    // usable span ONLY, so no frame can be built inside the guard.
+    let mut stack: Box<[u8]> = alloc::vec![0u8; stack_bytes + STACK_GUARD].into_boxed_slice();
+    paint_stack(&mut stack);
+    let ctx_rsp = build_initial_frame(&mut stack[STACK_GUARD..], task_trampoline);
 
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
@@ -2362,7 +2455,26 @@ fn spawn_inner(
 /// Create a fire-and-forget kernel thread at `priority` on `target_cpu`. The task runs `entry(arg)`
 /// and is freed when `entry` returns; there is no way to wait for it (use `spawn_joinable` for that).
 pub fn spawn(name: &'static str, entry: fn(usize), arg: usize, target_cpu: usize, priority: u8) {
-    spawn_inner(name, entry, arg, target_cpu, priority, None);
+    spawn_inner(name, entry, arg, target_cpu, priority, TASK_STACK_SIZE, None);
+}
+
+/// RENDSTACK — [`spawn`] with a CALLER-SIZED kernel stack: the x86 twin of aarch64's `spawn_stack`,
+/// and the honest fix for one deep path. `stack_bytes` is the USABLE span; [`STACK_GUARD`] is added
+/// below it by [`spawn_inner`] as it is for every other task.
+///
+/// A size passed here MUST come with its measurement. The one caller today is the render service
+/// (`main.rs`, both spawn sites), sized from the `:: STACK: render high=` readings the `witness`
+/// probe takes on the service dump's ~5 s cadence — see the RENDSTACK block at the file tail.
+/// Sizing one task is the fix; raising [`TASK_STACK_SIZE`] is not (see its note).
+pub fn spawn_stack(
+    name: &'static str,
+    entry: fn(usize),
+    arg: usize,
+    target_cpu: usize,
+    priority: u8,
+    stack_bytes: usize,
+) {
+    spawn_inner(name, entry, arg, target_cpu, priority, stack_bytes, None);
 }
 
 /// Placeholder `entry` for ring-3 tasks: `spawn_user` stores this in `Task.entry`, but
@@ -2546,8 +2658,10 @@ fn spawn_user_inner(
     let steal_ok = target_cpu == CPU_AUTO;
     let target_cpu = pick_cpu(target_cpu, !preemptible, name);
     assert!(target_cpu < MAX_CPUS, "spawn_user: target_cpu out of range");
-    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
-    let ctx_rsp = build_initial_frame(&mut stack, user_task_trampoline);
+    // RENDSTACK: guard span below the usable stack, same shape as `spawn_inner`'s.
+    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE + STACK_GUARD].into_boxed_slice();
+    paint_stack(&mut stack);
+    let ctx_rsp = build_initial_frame(&mut stack[STACK_GUARD..], user_task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
         id,
@@ -2798,8 +2912,10 @@ pub fn spawn_user_thread(
     let done = Arc::new(Semaphore::new(0));
     done.init(); // reserve the waiter list BEFORE the thread can run + post (alloc-free park)
 
-    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE].into_boxed_slice();
-    let ctx_rsp = build_initial_frame(&mut stack, user_task_trampoline);
+    // RENDSTACK: guard span below the usable stack, same shape as `spawn_inner`'s.
+    let mut stack: Box<[u8]> = alloc::vec![0u8; TASK_STACK_SIZE + STACK_GUARD].into_boxed_slice();
+    paint_stack(&mut stack);
+    let ctx_rsp = build_initial_frame(&mut stack[STACK_GUARD..], user_task_trampoline);
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed);
     let task = Box::new(Task {
         id,
@@ -2971,7 +3087,7 @@ pub fn spawn_joinable(
 ) -> JoinHandle {
     let done = Arc::new(Semaphore::new(0));
     done.init(); // reserve the waiter list BEFORE the task can run + post (alloc-free park)
-    let id = spawn_inner(name, entry, arg, target_cpu, priority, Some(done.clone()));
+    let id = spawn_inner(name, entry, arg, target_cpu, priority, TASK_STACK_SIZE, Some(done.clone()));
     JoinHandle { done, id }
 }
 
@@ -6290,6 +6406,17 @@ fn run() -> ! {
                 // here. Documented in `scheduler.md` under the SCHEDLOAD-X86 limits.
                 ACCT[cpu].account(crate::arch::now_cycles().wrapping_sub(busy_t0), 0);
 
+                // RENDSTACK — read the guard span of the task that JUST RAN, here and not at the
+                // next dispatch. This is the tightest moment the check can be taken: the dip that
+                // matters is transient (a deep call chain that returns before the task parks leaves
+                // `ctx_rsp` back in range, which is precisely the blind spot the aarch64 SPIN-6
+                // bounds test has), and the poison the dip destroyed stays destroyed, so reading it
+                // on the scheduler's OWN stack immediately after the switch returns catches the
+                // overflow one pass after it happened instead of one dispatch later or never. Two
+                // volatile byte reads per switch; `raw` is still live (the `Box::from_raw` that may
+                // free it is below).
+                stack_guard_check(cpu, raw);
+
                 // --- The task switched back to us (yield / preempt / block / exit). IF=0. ---
                 SCHED[cpu].current.store(0, Ordering::Release);
                 SCHED[cpu].current_prio.store(PRIO_IDLE, Ordering::Release);
@@ -7280,4 +7407,184 @@ fn demo_join_timeout(_arg: usize) {
 /// How many demo tasks have finished (for headless verification).
 pub fn demo_done() -> usize {
     DEMO_DONE.load(Ordering::Relaxed)
+}
+
+// =================================================================================================
+// RENDSTACK — the x86 kernel-stack GUARD and HIGH-WATER instrument (tail block).
+// =================================================================================================
+//
+// WHAT WAS MISSING. Before this arc x86 had no stack instrument of any kind: no guard, no canary,
+// no paint, no high-water probe. `spawn_inner` allocated `alloc::vec![0u8; TASK_STACK_SIZE]`, and
+// a 16 KiB overflow walked straight out of the bottom of the slab into whatever heap block the
+// allocator had placed below it — most often another task's parked frame. Nothing on the wire said
+// so. aarch64 has had the paint, the `[u7stk]` probe and the `STACK_REDZONE`/`STACK_HIGHGUARD`
+// absorber since U7STK/SHELLUP; this is that method, mirrored.
+//
+// WHAT CONVICTED THE RENDER TASK. QUARRYX86-2 put `quarry::service()` -> `quarry::open()` — a panel
+// read, two VFS `read_dir`s and a surface alloc — on the x86 click-router arm
+// (`arch/x86_64/syscall.rs`, the QUARRYX86-2 statement). The two routers that reach it on this arch
+// are `kernel_main` (the BOOT stack, which is not a `Task` at all) and `x86_render_service`, which
+// was spawned with the blanket 16 KiB. The Pi cured this exact shape on dsktp boot 11 by
+// right-sizing to 32 KiB (`PUMP_PATH_STACK_SIZE`, `main.rs`) after `usb-pump` banked a ~176-byte
+// preemption frame 256 B BELOW its own low bound and took a core with it.
+//
+// WHY A POISONED SPAN AND NOT AN UNMAPPED PAGE. The three measured reasons are at [`STACK_GUARD`].
+// The short form: these stacks are heap blocks on the firmware's identity map, and
+// `linked_list_allocator` writes its free-list node into the start of a freed block — the guard
+// would be the first thing `dealloc` touched.
+//
+// WHAT THE PAIR COSTS. The guard is two volatile byte reads per context switch and 4 KiB of heap
+// per task, unconditional, in every x86 image. The high-water paint and probe are `witness`-gated:
+// one fill per spawn and one byte scan per ~5 s service dump, so `./arroyo esp-x86` media carries
+// neither symbol.
+
+/// RENDSTACK — lay the guard span, and (under `witness`) the high-water paint, on a fresh slab.
+/// Called from all three x86 spawn paths before `build_initial_frame`, which is handed the usable
+/// span only. The slab arrives zeroed from `alloc::vec![0u8; ..]`, so the non-witness build's
+/// usable span keeps exactly the contents it always had.
+fn paint_stack(stack: &mut [u8]) {
+    stack[..STACK_GUARD].fill(GUARD_FILL);
+    #[cfg(feature = "witness")]
+    stack[STACK_GUARD..].fill(STACK_POISON);
+}
+
+/// RENDSTACK — the guard verdict, `arch/aarch64/sched.rs`'s `guard_state` shape verbatim and for
+/// its reason: the whole span is never scanned on a hot path, only its two ends.
+///   * bit 0 — the span's TOP byte is no longer [`GUARD_FILL`]: a stack pointer crossed the usable
+///     floor and ENTERED the guard. The guard absorbed it; no neighbour was reached.
+///   * bit 1 — its BOTTOM byte is gone too: TRAVERSED. The guard is exhausted and the heap block
+///     below this stack may already hold a smashed parked frame.
+/// Volatile so the pair cannot be hoisted or folded across a switch.
+#[inline]
+fn guard_state(g: &[u8]) -> u32 {
+    let p = g.as_ptr();
+    let n = g.len();
+    unsafe {
+        (if core::ptr::read_volatile(p.add(n - 1)) != GUARD_FILL { 1 } else { 0 })
+            | (if core::ptr::read_volatile(p) != GUARD_FILL { 2 } else { 0 })
+    }
+}
+
+/// RENDSTACK — the `entered` report budget and the id of the last task reported. Both exist because
+/// the aarch64 REDZONE arc paid for the lesson on its first armed run and wrote it down
+/// (`scheduler.md` §2.y): a breached guard is PERSISTENT STATE, not an event — nothing re-paints it
+/// — so one undersized task re-reports on every switch and burns the whole cap on identical lines.
+/// Runs of the same task collapse to one line; a DIFFERENT task still reports immediately. The
+/// TRAVERSED arm is never rate-limited: it fires once and panics.
+static GUARD_REPORTS: AtomicU32 = AtomicU32::new(0);
+static GUARD_LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// RENDSTACK — read the LOW guard of the task that just switched back, and act on it.
+///
+/// WHERE, and why this site and not the dispatch. The low guard is SINGLE-WRITER: only its owner's
+/// SP can reach it, because a neighbour overruns DOWNWARD into the TOP of the slab below and never
+/// into a low guard. So switch-in and switch-out sample the same fact and switch-out samples it
+/// FIRST — it names the overflower at the hop it offended. It is also the only sample that can see
+/// a TRANSIENT dip: a deep chain that returns before the task parks leaves `ctx_rsp` back in range,
+/// which is exactly what the aarch64 SPIN-6 bounds test is structurally blind to. This is the
+/// aarch64 twin's site (`scheduler.md` §2.y, "Switch-out — the outgoing task's LOW redzone"), for
+/// its reasons.
+///
+/// WHAT IT DOES, graduated, because the two ends of the span mean different things:
+///   * ENTERED (bit 0) — the task dipped below its declared floor and the absorber caught it. One
+///     rate-limited `:: STACK: … overflow guard hit …` line, and THE TASK CONTINUES. This is a
+///     SIZING alarm, not a corruption proof: its parked frame is intact and no neighbour was
+///     reached, so killing a healthy task here would trade availability for nothing. It is how the
+///     Pi found a fourth mis-sized task (`shell-run`) without losing a boot.
+///   * TRAVERSED (bit 1) — the absorber is EXHAUSTED. The heap block below this stack may already
+///     hold a smashed parked frame, and resuming its owner means `switch_context` restoring
+///     corrupted callee-saved registers and returning into them: on the Pi that was `ELR=0x1228`,
+///     a dead core and a wedged panel; on x86 it is a fault taken on a stack the handler cannot
+///     itself use — a TRIPLE FAULT and a silent reset with nothing on the wire. So this arm PANICS,
+///     NAMED, and that is the outcome this arc exists to make impossible: a named panic is strictly
+///     more information than a silent reset, and the capture says WHICH task outgrew WHICH size.
+#[inline]
+fn stack_guard_check(cpu: usize, raw: *mut Task) {
+    // SAFETY: `raw` is this core's just-switched-back task; the `Box::from_raw` that may free it is
+    // below this call in `run()`. Fields are read, never written.
+    let task = unsafe { &*raw };
+    let st = guard_state(&task.stack[..STACK_GUARD]);
+    if st == 0 {
+        return;
+    }
+    let usable = task.stack.len() - STACK_GUARD;
+    let low = task.stack.as_ptr() as u64 + STACK_GUARD as u64;
+    let traversed = st & 2 != 0;
+    if traversed
+        || (GUARD_LAST.swap(task.id, Ordering::Relaxed) != task.id
+            && GUARD_REPORTS.fetch_add(1, Ordering::Relaxed) < 16)
+    {
+        serial_println!(
+            ":: STACK: task={} overflow guard hit sp={:#x} cpu={} id={} low={:#x} size={} guard={} {} ::",
+            task.name,
+            task.ctx_rsp,
+            cpu,
+            task.id,
+            low,
+            usable,
+            STACK_GUARD,
+            if traversed { "TRAVERSED" } else { "entered" },
+        );
+    }
+    if traversed {
+        panic!(
+            "STACK: task={} TRAVERSED its {} B guard below a {} B kernel stack — the slab below may \
+             already hold a smashed parked frame. Give this task a MEASURED spawn_stack size; never \
+             raise TASK_STACK_SIZE",
+            task.name, STACK_GUARD, usable,
+        );
+    }
+}
+
+/// RENDSTACK — lifetime high-water of a task's usable stack span, in bytes: the distance from the
+/// TOP down to the deepest byte the task ever touched. Found as the length of the UNTOUCHED run of
+/// [`STACK_POISON`] starting at the usable base.
+///
+/// SATURATING, exactly like the aarch64 `stk_probe`: the scan starts AT the usable base, so
+/// `high == size` is a LOWER BOUND, never a depth — at that point the guard reading is the one that
+/// says how far past the floor it went. A plain byte scan (the aarch64 twin scans words first)
+/// because an x86 kernel stack is a `Box<[u8]>` with alignment 1: the allocator is free to hand
+/// back a base this side cannot assume is 8-aligned, and an unaligned `read_volatile::<u64>` is UB.
+/// The cost is bounded by one pass over the usable span, once per ~5 s service dump.
+#[cfg(feature = "witness")]
+fn stack_high_water(task: &Task) -> usize {
+    let len = task.stack.len() - STACK_GUARD;
+    let mut untouched = 0usize;
+    unsafe {
+        let p = task.stack.as_ptr().add(STACK_GUARD);
+        while untouched < len && core::ptr::read_volatile(p.add(untouched)) == STACK_POISON {
+            untouched += 1;
+        }
+    }
+    len - untouched
+}
+
+/// RENDSTACK — the high-water WITNESS, one line per service dump:
+///
+/// ```text
+/// :: STACK: render high=6208 of 32768 ::
+/// ```
+///
+/// Emitted from the tail of [`emit_load_witness`]. That instrument's PERIODIC caller is the ~5 s
+/// gate inside `x86_render_service`, so the current task on that cadence is the render service
+/// itself and the line needs no plumbing through `main.rs`; its other two callers (`storm_census`,
+/// and the `-prejoin` call on the BSP before it joins the scheduler) are one-shot and are why the
+/// line carries the task NAME rather than assuming one. A no-op outside a scheduled task (no
+/// `current`, which is exactly the `-prejoin` case), which is what makes it safe to hang off a
+/// shared instrument.
+#[cfg(feature = "witness")]
+fn emit_stack_witness() {
+    let cpu = percpu::this_cpu().cpu_index as usize;
+    let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+    if raw.is_null() {
+        return;
+    }
+    // SAFETY: the task running on THIS core; nothing can free its Box underneath us.
+    let task = unsafe { &*raw };
+    serial_println!(
+        ":: STACK: {} high={} of {} ::",
+        task.name,
+        stack_high_water(task),
+        task.stack.len() - STACK_GUARD
+    );
 }
