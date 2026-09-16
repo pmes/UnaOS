@@ -105,7 +105,7 @@ pub mod install;
     feature = "install_target",
     feature = "piinstall",
     feature = "selfhost",
-    feature = "holocron", feature = "selfup", feature = "facet", feature = "login", feature = "ga10bprobe5" // LOGIN: fs/users.rs CRC-32s its store and SHA-256s the credential. ORIN-SELFUP: selfup_tegra streams Sha256 over the payload + every staged file. FACET: `selfhost::inflate` CRC-32s every produced byte, so the PNG viewer's decoder pulls this module in with `selfhost` itself off — SAME-LINE append, no line moved. GA10B-PROBE5 (orin-0912b): the rung-5 firmware loader digests each vendor section IN the DMA window with this Sha256 — one more term on the same line, no line moved.
+    feature = "holocron", feature = "selfup", feature = "facet", feature = "login", feature = "ga10bprobe5", feature = "ahci" // AHCI (SMALLFIX-HASHCFG, rmbp-0915): an `ahci`-only build could not reach this module at all — the tree's ONLY SHA-256 — so AHCIBOOT fell back to FNV for its fixture; the SATA arc digests what it reads, so `ahci` joins the consumer list as ONE MORE TERM on the same line, no line moved. LOGIN: fs/users.rs CRC-32s its store and SHA-256s the credential. ORIN-SELFUP: selfup_tegra streams Sha256 over the payload + every staged file. FACET: `selfhost::inflate` CRC-32s every produced byte, so the PNG viewer's decoder pulls this module in with `selfhost` itself off — SAME-LINE append, no line moved. GA10B-PROBE5 (orin-0912b): the rung-5 firmware loader digests each vendor section IN the DMA window with this Sha256 — one more term on the same line, no line moved.
 ))]
 pub mod hash;
 
