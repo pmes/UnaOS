@@ -116,6 +116,10 @@ pub struct Directive {
     /// A default FORBID, not from the spec file.
     pub builtin: bool,
     pub spec_line: usize,
+    /// Basename of the spec file this directive was written in (mbench's
+    /// `spec_name`). EMPTY for the builtin FORBIDs — they have no spec line, so
+    /// there is nowhere to send a reader, and `origin()` prints nothing.
+    pub spec_name: String,
     rx: Regex,
     pub hits: usize,
     pub first_lineno: Option<usize>,
@@ -128,7 +132,14 @@ pub struct Directive {
 const HIT_LINENO_CAP: usize = 256;
 
 impl Directive {
-    fn new(kind: Kind, pattern: &str, need: usize, builtin: bool, spec_line: usize) -> Result<Self, SpecError> {
+    fn new(
+        kind: Kind,
+        pattern: &str,
+        need: usize,
+        builtin: bool,
+        spec_line: usize,
+        spec_name: &str,
+    ) -> Result<Self, SpecError> {
         let rx = Regex::new(pattern)
             .map_err(|e| SpecError(format!("line {spec_line}: bad regex {pattern:?}: {e}")))?;
         Ok(Directive {
@@ -137,6 +148,7 @@ impl Directive {
             need,
             builtin,
             spec_line,
+            spec_name: spec_name.to_string(),
             rx,
             hits: 0,
             first_lineno: None,
@@ -205,6 +217,19 @@ impl Directive {
         }
     }
 
+    /// ` (pinned at x86-fat.spec:14)` — printed ONLY on a directive that came up
+    /// short (mbench's `Directive.origin`).
+    ///
+    /// A green table is byte-identical to one printed before this existed: the
+    /// coordinate is for the reader who has to go and change something, and that
+    /// reader only appears on a red. Empty for the builtin FORBIDs.
+    pub fn origin(&self) -> String {
+        if self.spec_name.is_empty() || self.spec_line == 0 {
+            return String::new();
+        }
+        format!(" (pinned at {}:{})", self.spec_name, self.spec_line)
+    }
+
     pub fn note(&self) -> String {
         let first = self.first_lineno.unwrap_or(0);
         match self.kind {
@@ -231,12 +256,12 @@ impl Directive {
                     return match self.kind {
                         Kind::Pending => "0 hits — awaiting metal/code (never fails)".to_string(),
                         Kind::Optional => "0 hits (informational)".to_string(),
-                        _ => "0 hits — MISSING".to_string(),
+                        _ => format!("0 hits — MISSING{}", self.origin()),
                     };
                 }
                 let mut n = format!("{} hit(s), first @ line {first}", self.hits);
                 if self.kind == Kind::Count && !self.satisfied() {
-                    n.push_str(&format!(" — SHORT of {}", self.need));
+                    n.push_str(&format!(" — SHORT of {}{}", self.need, self.origin()));
                 }
                 if self.kind == Kind::Pending {
                     n.push_str(" — MATCHED: consider promoting to REQUIRE");
@@ -263,16 +288,25 @@ struct ScanLine {
 /// Parse a `.spec` file and append the default FORBID set (mbench's `parse_spec`).
 pub fn parse_spec(path: &Path) -> Result<Vec<Directive>, SpecError> {
     let bytes = std::fs::read(path).map_err(|e| SpecError(format!("{}: {e}", path.display())))?;
-    parse_spec_bytes(&bytes)
+    parse_spec_bytes_named(&basename(path), &bytes)
 }
 
+/// Bytes with no file behind them: every directive is unpinned, exactly as
+/// mbench's builtin FORBIDs are, so `origin()` prints nothing for them.
 pub fn parse_spec_bytes(bytes: &[u8]) -> Result<Vec<Directive>, SpecError> {
+    parse_spec_bytes_named("", bytes)
+}
+
+/// `parse_spec_bytes` with the spec's BASENAME — mbench pins its rows with
+/// `os.path.basename(path)`, never the full path, so the two agree on a table
+/// rendered from different working directories.
+pub fn parse_spec_bytes_named(spec_name: &str, bytes: &[u8]) -> Result<Vec<Directive>, SpecError> {
     let mut directives = Vec::new();
     for s in scan_spec_bytes(bytes)? {
-        directives.push(Directive::new(s.kind, &s.pattern, s.need, false, s.spec_line)?);
+        directives.push(Directive::new(s.kind, &s.pattern, s.need, false, s.spec_line, spec_name)?);
     }
     for p in DEFAULT_FORBIDS {
-        directives.push(Directive::new(Kind::Forbid, p, 1, true, 0)?);
+        directives.push(Directive::new(Kind::Forbid, p, 1, true, 0, "")?);
     }
     Ok(directives)
 }
@@ -569,6 +603,293 @@ fn basename(p: &Path) -> String {
     p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// QEMU-FAST run sidecar — was this capture a FAST exit or a FULL wall?
+// ---------------------------------------------------------------------------
+//
+// mbench's `read_run_sidecar` / `run_mode_note`, re-implemented here so the two
+// tables can agree on the verdict line. `unaos/arroyo`'s `qemu_wait_or_complete`
+// can end a QEMU run at its completion predicate plus a grace window instead of
+// at the clock, which makes a capture SHORTER than the verb's nominal wall while
+// still carrying every required witness. Sound for pass/fail, NOT sound for
+// anything monotonic — so a reader has to be able to tell the two apart from the
+// capture alone. arroyo writes `<logfile>.run` BESIDE the log, never into it.
+//
+// THE READ IS THREE-VALUED and that is the whole point: "fast", "full", and
+// UNKNOWN — absent, unreadable, malformed, or STALE. Collapsing the third value
+// into either of the first two is the bug this guards against; a reader that
+// infers "not fast, therefore full" is confidently wrong in the unsafe
+// direction. Staleness is DETECTED, not assumed away: the sidecar carries the
+// log's byte length and sha256, so a sidecar left by a previous run of the same
+// verb — which sits at exactly the same path — is caught rather than believed.
+pub const RUN_SIDECAR_SUFFIX: &str = ".run";
+
+fn sidecar_path(log_path: &Path) -> PathBuf {
+    let mut s = log_path.as_os_str().to_os_string();
+    s.push(RUN_SIDECAR_SUFFIX);
+    PathBuf::from(s)
+}
+
+/// Read `<log_path>.run`. Returns `(mode, detail, fields)`, where `mode` is one
+/// of `"fast"`, `"full"`, `"unknown"` — never anything else, and never guessed.
+fn read_run_sidecar(log_path: &Path) -> (&'static str, String, HashMap<String, String>) {
+    let empty = HashMap::new();
+    let Ok(raw) = std::fs::read(sidecar_path(log_path)) else {
+        return ("unknown", "no run sidecar".to_string(), empty);
+    };
+    let raw = String::from_utf8_lossy(&raw);
+
+    let mut fields: HashMap<String, String> = HashMap::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        fields.insert(k.trim().to_string(), v.trim().to_string());
+    }
+
+    let mode = match fields.get("mode").map(String::as_str) {
+        Some("fast") => "fast",
+        Some("full") => "full",
+        _ => {
+            return (
+                "unknown",
+                "run sidecar is malformed (no usable mode=)".to_string(),
+                fields,
+            );
+        }
+    };
+
+    // IDENTITY. Mandatory, not optional.
+    let want_bytes = fields.get("log_bytes").cloned().unwrap_or_default();
+    let want_sha = fields.get("log_sha256").cloned().unwrap_or_default();
+    if want_bytes.is_empty() || want_sha.is_empty() {
+        return (
+            "unknown",
+            "run sidecar carries no log identity".to_string(),
+            fields,
+        );
+    }
+    let Ok(md) = std::fs::metadata(log_path) else {
+        return (
+            "unknown",
+            "run sidecar present but the log could not be identified".to_string(),
+            fields,
+        );
+    };
+    let got_bytes = md.len();
+    let Ok(got_sha) = sha256::hex_of_file(log_path) else {
+        return (
+            "unknown",
+            "run sidecar present but the log could not be identified".to_string(),
+            fields,
+        );
+    };
+    if got_bytes.to_string() != want_bytes || got_sha != want_sha {
+        return (
+            "unknown",
+            format!(
+                "run sidecar is STALE — it describes a {want_bytes}-byte log, this one is \
+                 {got_bytes} bytes"
+            ),
+            fields,
+        );
+    }
+    (mode, String::new(), fields)
+}
+
+/// The one-line `[…]` suffix the verdict line carries (mbench's
+/// `run_mode_note`). ONE implementation, so no consumer can invent a second
+/// reading of the same file.
+pub fn run_mode_note(log_path: &Path) -> String {
+    let (mode, detail, f) = read_run_sidecar(log_path);
+    let get = |k: &str| f.get(k).cloned().unwrap_or_else(|| "?".to_string());
+    match mode {
+        "fast" => format!(
+            "[fast: completion +{}s grace {}s wall {}s]",
+            get("completion_at"),
+            get("grace"),
+            get("wall")
+        ),
+        "full" => format!("[full wall {}s]", get("wall")),
+        _ => format!("[mode unknown: {detail}]"),
+    }
+}
+
+/// SHA-256 over a file, streamed. Hand-rolled rather than pulled in as a
+/// dependency: the sidecar's identity check is the ONLY hash this tool needs,
+/// and `mbench.py` gets it from the standard library — a re-implementation that
+/// must agree byte-for-byte should not also have to agree on a crate version.
+/// Known-answer tested below against the FIPS 180-4 vectors.
+mod sha256 {
+    use std::io::Read;
+    use std::path::Path;
+
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    pub struct Sha256 {
+        h: [u32; 8],
+        buf: [u8; 64],
+        buflen: usize,
+        total: u64,
+    }
+
+    impl Sha256 {
+        pub fn new() -> Self {
+            Sha256 {
+                h: [
+                    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c,
+                    0x1f83d9ab, 0x5be0cd19,
+                ],
+                buf: [0u8; 64],
+                buflen: 0,
+                total: 0,
+            }
+        }
+
+        pub fn update(&mut self, mut data: &[u8]) {
+            self.total = self.total.wrapping_add(data.len() as u64);
+            if self.buflen > 0 {
+                let want = 64 - self.buflen;
+                let take = want.min(data.len());
+                self.buf[self.buflen..self.buflen + take].copy_from_slice(&data[..take]);
+                self.buflen += take;
+                data = &data[take..];
+                if self.buflen == 64 {
+                    let block = self.buf;
+                    self.compress(&block);
+                    self.buflen = 0;
+                }
+            }
+            while data.len() >= 64 {
+                let mut block = [0u8; 64];
+                block.copy_from_slice(&data[..64]);
+                self.compress(&block);
+                data = &data[64..];
+            }
+            if !data.is_empty() {
+                self.buf[..data.len()].copy_from_slice(data);
+                self.buflen = data.len();
+            }
+        }
+
+        pub fn finish(mut self) -> [u8; 32] {
+            // The length field is over the MESSAGE, so it is captured before any
+            // padding is fed through `update` (which counts what it is given).
+            let bitlen = self.total.wrapping_mul(8);
+            let mut pad: Vec<u8> = Vec::with_capacity(72);
+            pad.push(0x80);
+            while (self.buflen + pad.len()) % 64 != 56 {
+                pad.push(0x00);
+            }
+            pad.extend_from_slice(&bitlen.to_be_bytes());
+            self.update(&pad);
+            let mut out = [0u8; 32];
+            for (i, w) in self.h.iter().enumerate() {
+                out[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+            }
+            out
+        }
+
+        fn compress(&mut self, block: &[u8; 64]) {
+            let mut w = [0u32; 64];
+            for i in 0..16 {
+                w[i] = u32::from_be_bytes([
+                    block[i * 4],
+                    block[i * 4 + 1],
+                    block[i * 4 + 2],
+                    block[i * 4 + 3],
+                ]);
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
+            }
+            let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h) = (
+                self.h[0], self.h[1], self.h[2], self.h[3], self.h[4], self.h[5], self.h[6],
+                self.h[7],
+            );
+            for i in 0..64 {
+                let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+                let ch = (e & f) ^ ((!e) & g);
+                let t1 = h
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[i])
+                    .wrapping_add(w[i]);
+                let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+                let maj = (a & b) ^ (a & c) ^ (b & c);
+                let t2 = s0.wrapping_add(maj);
+                h = g;
+                g = f;
+                f = e;
+                e = d.wrapping_add(t1);
+                d = c;
+                c = b;
+                b = a;
+                a = t1.wrapping_add(t2);
+            }
+            self.h[0] = self.h[0].wrapping_add(a);
+            self.h[1] = self.h[1].wrapping_add(b);
+            self.h[2] = self.h[2].wrapping_add(c);
+            self.h[3] = self.h[3].wrapping_add(d);
+            self.h[4] = self.h[4].wrapping_add(e);
+            self.h[5] = self.h[5].wrapping_add(f);
+            self.h[6] = self.h[6].wrapping_add(g);
+            self.h[7] = self.h[7].wrapping_add(h);
+        }
+    }
+
+    /// One-shot, for the known-answer tests. The tool itself only ever hashes a
+    /// file, and that goes through `hex_of_file`.
+    #[cfg(test)]
+    pub fn hex(data: &[u8]) -> String {
+        let mut s = Sha256::new();
+        s.update(data);
+        to_hex(&s.finish())
+    }
+
+    /// Streamed, 1 MiB at a time — mbench reads the same way, and a bench
+    /// capture can be hundreds of megabytes.
+    pub fn hex_of_file(path: &Path) -> std::io::Result<String> {
+        let mut f = std::fs::File::open(path)?;
+        let mut s = Sha256::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            s.update(&buf[..n]);
+        }
+        Ok(to_hex(&s.finish()))
+    }
+
+    fn to_hex(bytes: &[u8; 32]) -> String {
+        let mut out = String::with_capacity(64);
+        for b in bytes {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    }
+}
+
 /// Render the battery-style verdict table — mbench's `verdict_table`, line for
 /// line, so a reader (and a diff) can put the two side by side.
 pub fn render_table(ev: &Evaluation) -> String {
@@ -602,6 +923,12 @@ pub fn render_table(ev: &Evaluation) -> String {
     if !pend.is_empty() {
         summary.push_str(&format!(", pending {pmatched}/{} matched", pend.len()));
     }
+    // QEMU-FAST: say on the verdict line WHICH KIND OF CAPTURE this verdict is
+    // about. Three-valued (see `read_run_sidecar`): a reader who needs a final
+    // accumulator value or a certified-clean tail must see `full` here and
+    // nothing else — `unknown` is not a quiet synonym for it.
+    summary.push(' ');
+    summary.push_str(&run_mode_note(&ev.log_path));
     match verdict {
         Verdict::Pass => out.push_str(&format!("  {} MBENCH PASS — {summary}\n", glyph::OK)),
         Verdict::Truncated => {
@@ -634,6 +961,31 @@ pub fn render_table(ev: &Evaluation) -> String {
         }
         Verdict::Fail => {
             out.push_str(&format!("  {} MBENCH FAIL — {summary}\n", glyph::FAIL));
+            // SPECRUN: ONE line a caller can quote without re-implementing the
+            // match. `arroyo`'s `test`/`test-fat` tails read exactly this line to
+            // put `<spec>:<line>` in their own red, so the verb and the table can
+            // never disagree about WHICH pin came up short. Emitted in SPEC ORDER
+            // (`sorted()` is kind then spec line), so "first" means first in the file.
+            let short: Vec<&Directive> = ev
+                .sorted()
+                .into_iter()
+                .filter(|d| matches!(d.kind, Kind::Require | Kind::Count) && d.failed())
+                .collect();
+            if let Some(d0) = short.first() {
+                out.push_str(&format!(
+                    "       FIRST-SHORTFALL {}:{} {} {}\n",
+                    d0.spec_name,
+                    d0.spec_line,
+                    d0.label(),
+                    d0.pattern
+                ));
+                if short.len() > 1 {
+                    out.push_str(&format!(
+                        "       ({} further pinned line(s) also short — full table above)\n",
+                        short.len() - 1
+                    ));
+                }
+            }
             if !ev.markers().is_empty() {
                 out.push_str(
                     "       (the end-of-run marker was seen — the run completed, so a missing witness here is a GENUINE regression)\n",
@@ -822,5 +1174,94 @@ COUNT 2 (?!never)done\n";
         assert!(parse_spec_bytes(b"MAYBE something\n").is_err());
         assert!(parse_spec_bytes(b"COUNT notanumber x\n").is_err());
         assert!(parse_spec_bytes(b"REQUIRE\n").is_err());
+    }
+
+    /// The hand-rolled hash is the one thing here that is NOT checked by the
+    /// mbench corpus — no fixture carries a valid sidecar, so a wrong digest
+    /// would read as a STALE sidecar and the two tools would still agree. It
+    /// gets its own known answers: FIPS 180-4's two published vectors, the
+    /// empty message, and a multi-block input that exercises the buffering
+    /// path (`update` called with a length that is not a multiple of 64).
+    #[test]
+    fn sha256_matches_the_published_vectors() {
+        assert_eq!(
+            sha256::hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256::hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256::hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        // 1,000,000 'a' — the third published vector, and 15,625 whole blocks.
+        let million = vec![b'a'; 1_000_000];
+        assert_eq!(
+            sha256::hex(&million),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+        // Fed in ragged chunks, the streaming path must give the same answer as
+        // one shot — this is how `hex_of_file` reads a capture.
+        let mut s = sha256::Sha256::new();
+        for chunk in million.chunks(7) {
+            s.update(chunk);
+        }
+        let mut hex = String::with_capacity(64);
+        for b in s.finish() {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        assert_eq!(hex, sha256::hex(&million));
+    }
+
+    /// The third value is not a quiet synonym for `full`: an absent sidecar,
+    /// a malformed one, one with no identity, and a STALE one must each be
+    /// sayable — and none of them may render as `[full …]`.
+    #[test]
+    fn run_mode_is_three_valued() {
+        let dir = std::env::temp_dir().join(format!("foreman-runmode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let log = dir.join("serial.log");
+        std::fs::write(&log, b"hello\n").expect("log writable");
+        let side = dir.join("serial.log.run");
+
+        assert_eq!(run_mode_note(&log), "[mode unknown: no run sidecar]");
+
+        std::fs::write(&side, b"wall=300\n").expect("sidecar writable");
+        assert_eq!(
+            run_mode_note(&log),
+            "[mode unknown: run sidecar is malformed (no usable mode=)]"
+        );
+
+        std::fs::write(&side, b"mode=full\nwall=300\n").expect("sidecar writable");
+        assert_eq!(
+            run_mode_note(&log),
+            "[mode unknown: run sidecar carries no log identity]"
+        );
+
+        let sha = sha256::hex(b"hello\n");
+        std::fs::write(
+            &side,
+            format!("mode=full\nwall=300\nlog_bytes=6\nlog_sha256={sha}\n"),
+        )
+        .expect("sidecar writable");
+        assert_eq!(run_mode_note(&log), "[full wall 300s]");
+
+        std::fs::write(
+            &side,
+            format!("mode=fast\ncompletion_at=11.0\ngrace=20\nwall=31.0\nlog_bytes=6\nlog_sha256={sha}\n"),
+        )
+        .expect("sidecar writable");
+        assert_eq!(run_mode_note(&log), "[fast: completion +11.0s grace 20s wall 31.0s]");
+
+        // STALE: the log grew under a sidecar that still describes the old one.
+        std::fs::write(&log, b"hello\nagain\n").expect("log writable");
+        assert!(
+            run_mode_note(&log).starts_with("[mode unknown: run sidecar is STALE"),
+            "{}",
+            run_mode_note(&log)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
