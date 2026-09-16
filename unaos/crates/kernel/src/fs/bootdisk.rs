@@ -998,14 +998,14 @@ fn walk_and_witness() -> Survey {
 
     let aliased = aliased_field(&disks);
 
-    if let Some(ix) = root_ix {
+    if let Some((ix, f)) = root_ix.and_then(|ix| plan_root_hit(&disks, ix).map(|h| (ix, Found { // PLANWALK (X86BIND's STOP, rmbp-queue): `hits[0]` is reached through a GUARD now, never by indexing — `plan` names a hitless disk in no code path that exists today, and that is exactly the kind of fact that stays true until somebody edits one line in another function. `and_then` collapses the broken-invariant case onto the walk's EXISTING no-root road below, which already prints a reason, so a boot that cannot name its root SAYS SO instead of panicking in the boot path. ⚠ LINE-NEUTRAL: this arm is EIGHT source lines, exactly as many as the `if let Some(ix)` / `let d` / `let f = Found { … };` it replaces, because `panic::Location` embeds source lines and this file's tail blocks record what a mid-file insertion costs. See `plan_root_hit` at the tail for the defect and why a `debug_assert!` was rejected.
+            source: disks[ix].source,
+            path: h.path.clone(),
+            vol_id: disks[ix].id.vol_id,
+            file_off: h.file_off,
+        }))) {
+        // `d` is re-bound here because the witness below reads `d.hits.len()` and `d.source`.
         let d = &disks[ix];
-        let f = Found {
-            source: d.source,
-            path: d.hits[0].path.clone(),
-            vol_id: d.id.vol_id,
-            file_off: d.hits[0].file_off,
-        };
         serial_println!(
             "[vfs] root = boot volume serial=0x{:08x} source={} match={} sha={} unafs={} \
              matches={} home={} files={} aliased={} window_off={:#x} window_len={} \
@@ -1868,7 +1868,7 @@ fn usbreg_selftest() {
         one.len() == 1,
         fat::same_device(&reader, &reader),
         if leg7 { "PASS" } else { "FAIL" }
-    );
+    ); planwalk_selftest(); // PLANWALK (leg 8) — the plan/walk invariant, fed the state that used to PANIC. ⚠ SAME-LINE fold and the BODY is a FILE-TAIL append, so no `panic::Location` in this file moves; the two tail blocks below already record why that matters here. LAST in this battery because it is the only leg that drives a GUARD rather than the planner.
 
 }
 
@@ -2408,5 +2408,93 @@ pub fn ahciboot_selftest() {
     serial_println!(
         "[bootdisk] ahci census: sata_sources={} with_fat_volume={} carrying_{}={} ::",
         sata, volumes, AHCIBOOT_FILE, staged
+    );
+}
+
+// ===================== PLANWALK (2026-09-15) — the plan/walk invariant, in code =====================
+//
+// APPENDED AT THE FILE TAIL so no `core::panic::Location` in this file moves; the one change above is
+// an EIGHT-LINE-FOR-EIGHT-LINE replacement and the fixture's call is a same-line fold. Same
+// discipline, and the same reason, as the SDWRITE and AHCIBOOT blocks above.
+//
+// THE DEFECT, and it was REPORTED rather than found by a gate. `plan` picks `root_ix` with
+// `position(|d| !d.hits.is_empty())`, so the disk it names always has at least one hit — and
+// `walk_and_witness` read `d.hits[0]` on that strength. The two facts lived in two functions with
+// nothing joining them. X86BIND's one-line go-red turned the gap into a KERNEL PANIC in the boot
+// path (`bootdisk.rs:1007 index out of bounds`), on a machine with no console yet, and that seat
+// wrote it into the queue as a STOP. LAWS §5 names the shape: an invariant nobody checks is an
+// invariant nobody has.
+//
+// WHY A FUNCTION AND NOT AN ASSERT. `debug_assert!` is compiled out of every image we ship or boot,
+// so it cannot fire where the defect lives; a `const _` cannot see a runtime index at all. The join
+// has to be code that RUNS in release, and the honest answer to a broken invariant here is not to
+// stop the machine — it is to bind no root and say why, which is a road the walk already has.
+
+/// PLANWALK: the hit `walk_and_witness` may read for the disk `plan` named, or `None` — after one
+/// witness line — when the planner named a disk with no hits at all.
+///
+/// Both refusals are real: `disks.get` answers an index past the end of the list (the shape a future
+/// planner bug would take), and `hits.first()` answers the empty-hits case (the shape X86BIND's
+/// go-red produced). Neither can panic, and the caller's `and_then` sends both onto the walk's
+/// existing no-root road.
+fn plan_root_hit(disks: &[Disk], root_ix: usize) -> Option<&Hit> {
+    let d = disks.get(root_ix)?;
+    match d.hits.first() {
+        Some(h) => Some(h),
+        None => {
+            serial_println!(
+                "[vfs] plan-walk INVARIANT BROKEN root_ix={} hits=0 source={} disks={} :: plan() \
+                 named a disk with no matching file and walk_and_witness would have indexed it — \
+                 no root is bound on this pass ::",
+                root_ix,
+                d.source.name(),
+                disks.len()
+            );
+            None
+        }
+    }
+}
+
+/// PLANWALK: HOMESOIL leg 8 — the guard, fed the state that used to panic.
+///
+/// This is the only place the broken state can be produced on purpose: `plan` cannot name a hitless
+/// disk, which is precisely why nothing was measuring what happens when the two functions disagree.
+///
+/// FALSIFIABLE IN BOTH DIRECTIONS, and the negative one is the point. A disk with NO hits must come
+/// back `None` **and the machine must still be running to print this line** — a panicking guard
+/// never reaches the `serial_println!`, which is the "no panic" half stated as a measurement rather
+/// than as an absence. A disk WITH a hit must come back carrying THAT hit, so a guard that simply
+/// answered `None` to everything would red here instead of silently disabling root binding on every
+/// boot. The third leg drives an index past the end of the list, the other way `get` can be wrong.
+#[cfg(feature = "witness")]
+fn planwalk_selftest() {
+    let mut hitless: Vec<Disk> = Vec::new();
+    assert_admit(
+        &mut hitless,
+        BlockSource::Default,
+        DiskId { num_blocks: 100, vol_id: 0xdead_0001 },
+        Some(synth_dev(9, 100)),
+        *b"NOHITS     ",
+        None,
+    );
+    // The guard's line is the SAME line a real break would print, so say whose it is BEFORE it
+    // appears. LAUNCH-AR's rule, inverted: here it is the FIXTURE that must not be mistaken for the
+    // witness — a reader who meets `INVARIANT BROKEN` in a log is entitled to know which one it is.
+    serial_println!(
+        ":: HOMESOIL: planwalk — the next [vfs] plan-walk INVARIANT BROKEN line is THIS FIXTURE's, \
+         fed a synthetic disk with hits=0; a real one would name the boot walk's own disks ::"
+    );
+    let guarded = plan_root_hit(&hitless, 0).is_none();
+    hitless[0].hits.push(Hit { path: String::from("/KERNEL8.IMG"), file_off: 7 });
+    let control = plan_root_hit(&hitless, 0).map(|h| (h.path.clone(), h.file_off))
+        == Some((String::from("/KERNEL8.IMG"), 7));
+    let past_end = plan_root_hit(&hitless, 9).is_none();
+    let leg8 = guarded && control && past_end;
+    serial_println!(
+        ":: HOMESOIL: planwalk hitless_guarded={} hit_found={} past_end_guarded={} alive=yes :: {} ::",
+        guarded,
+        control,
+        past_end,
+        if leg8 { "PASS" } else { "FAIL" }
     );
 }
