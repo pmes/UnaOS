@@ -2231,6 +2231,37 @@ fi
 # disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson), and for this driver
 # a silent no-op is indistinguishable on the wire from a machine with no SATA controller in it.
 [ -n "${UNAOS_AHCI:-}" ] && _feats="${_feats}ahci,"
+# AHCIWRITE (rmbp-ledger B89, SATA write half): UNAOS_AHCI_WRITE=1 arms the ATA `WRITE DMA EXT`
+# (0x35) path in drivers/ahci.rs. Implies `ahci` (Cargo.toml declares `ahci-write = ["ahci"]`), so
+# this knob alone is sufficient; pairing it with UNAOS_AHCI is harmless and is how the flight lines
+# below spell it, because a reader should see both names on a line that can write a disk.
+#
+# ⚠ THIS IS THE ONLY KNOB IN THIS FILE THAT CAN DESTROY DATA ON PETER'S INTERNAL SSD. Arm it for an
+# INSTALL SITTING and for nothing else — never on a routine flight, never in a saved alias. The
+# design makes the wrong write impossible by construction rather than by care, and the construction
+# is a CAPABILITY: `drivers/ahci.rs`'s `write_block_at` has exactly one caller,
+# `block::write_sectors_granted`, which demands a `block::WriteGrant` whose only constructor is
+# called from `install::partition::mint_grant` — after the pre-flight census has read the whole GPT
+# and the six refusals plus INSTALL-SELF have passed. The grant names ONE partition's LBA range and
+# every sector is re-checked against it at the wire (`[ahci] write REFUSED lba=… outside grant …`),
+# then re-checked again against the device capacity. Three bounds, three files, one write.
+# The PLAIN SATA write path stays shut in this polarity too: `write_block_ahci` returns NotReady, so
+# shell verbs, FAT writes on a SATA-mounted volume and the whole-disk installer engine all still
+# refuse — arming this knob opens one narrow new door and widens none of the old ones.
+#
+# Knob OFF with `ahci` on: the installer's SATA refusal reads `reason=transport-write-disabled
+# transport=ahci knob=UNAOS_AHCI_WRITE` instead of `transport-read-only`, so a build without the
+# feature still cannot write the SSD and says which switch is missing rather than implying the
+# transport is incapable. Knob OFF entirely: not one ATA write opcode is compiled — certify on the
+# ARTIFACT, never on the diff: `LC_ALL=C grep -a -o -F 'WRITE-DMA-EXT-0x35' <elf> | wc -l` is 1 armed
+# and 0 unarmed. The QEMU leg (fixture disk on the ICH9 controller, not on USB):
+#   UNAOS_WC=1 UNAOS_INSTALLDEMO=1 UNAOS_AHCI=1 UNAOS_AHCI_WRITE=1 \
+#   UNAOS_AHCI_DISK=builder/part-fixture.img UNAOS_QEMU_FULL=1 ./arroyo test 120
+# Default OFF => every addition is a file-tail append or a line-neutral rewrite, so no panic
+# `Location` moves and the image is byte-identical. x86_64 only; aarch64 media byte-identical
+# (stripped by arm_features below, exactly as `ahci` itself is).
+# Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
+[ -n "${UNAOS_AHCI_WRITE:-}" ] && _feats="${_feats}ahci-write,"
 # ── BANNER-DEDUP (orin 3, 2026-08-22) — the banner must not misreport its own composition ─────────
 #
 # THE SYMPTOM. An armed jetson build printed `tegra` THREE times:
@@ -2414,6 +2445,18 @@ arm_features() {
     # hash between a default build and a `UNAOS_AHCI=1` one for zero observable change. Stripped =>
     # the x86 track can arm a SATA driver without touching the Pi or Jetson media at all.
     f="${f//,ahci,/,}"
+    # AHCIWRITE rides the same strip, for the same reason and as a consequence of the same fact:
+    # `ahci-write` implies `ahci`, whose only code is the x86-gated `drivers/ahci.rs` plus the
+    # x86-gated registry/capability tails of `drivers/block.rs`, and `install/partition.rs`'s SATA
+    # leg is inside the same `target_arch = "x86_64"` conjunction — so `ahci-write` emits not one
+    # byte of aarch64 CODE. An enabled feature is still hashed into cargo's `-Cmetadata` fingerprint,
+    # so leaving it in (or its implied `ahci`, stripped above) would shift every Pi/Jetson media hash
+    # between a default build and a `UNAOS_AHCI_WRITE=1` one for zero observable change. Stripped =>
+    # the x86 track can arm a SATA WRITE path without touching Pi or Jetson media at all.
+    # Order-independent with the `ahci` strip above: `,ahci-write,` does not contain `,ahci,` as a
+    # substring (the trailing comma is part of the pattern), so neither line can half-rewrite the
+    # other — the same argument the `wifi2`/`wifi` pair above makes about itself.
+    f="${f//,ahci-write,/,}"
     # WIFI-1 (GR25) rides the same strip, for the same reason and by the same mechanism as
     # `bcmarecon` above: `src/wifi/` is declared `#[cfg(all(feature = "wifi", target_arch =
     # "x86_64"))]` and all three main-loop call sites carry the same pair, so `wifi` emits not one
@@ -4050,7 +4093,7 @@ KERNEL_CFG_MATRIX=(
   # counts on `./arroyo check`'s own summary line, never from this prose.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,ahci-write"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the

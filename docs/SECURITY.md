@@ -688,7 +688,8 @@ been watched to fire rather than a guard that has been read.
 | `reason=` | asked | refused because | fixture case |
 |---|---|---|---|
 | `boot-device` | any target on the booted device | INSTALL-SELF: erasing it erases the running system. Asked FIRST — a blank boot device is still a boot device | `selfguard::selftest` decision table + `live_media_leg` |
-| `transport-read-only` | a SATA disk | `drivers/block.rs`'s `Ahci` handle refuses writes in every cfg and the image compiles no ATA write opcode. Named one layer above the transport so the operator reads a policy, not an I/O error | `transport_leg`, every run of the partition fixture |
+| `transport-read-only` | an internal SD card | `drivers/block.rs` refuses that handle's writes in every cfg. Named one layer above the transport so the operator reads a policy, not an I/O error | `transport_leg`, every run of the partition fixture |
+| `transport-write-disabled` + `knob=` | a SATA disk, in a build without `ahci-write` | AHCIWRITE landed the SATA write path behind a default-OFF feature, so the SATA answer is a BUILD fact rather than a standing one. A distinct token from the row above on purpose: "this transport has no write path in any build" and "this build has none, and here is the switch" are different sentences, and the second names its own remedy. The token **disappears** when the knob is on — writes then need a capability, not a transport verdict | `transport_leg`, both polarities asserted |
 | `disk-has-foreign-volumes` | the WHOLE disk | the disk carries somebody else's filesystems; a whole-disk install lays a fresh GPT over all of them. The pre-existing `blank_check` could not answer this — "are the first 64 sectors zero" is false of every partitioned disk on earth, so it never distinguished a stranger's disk from a scratch one | the fixture disk as a whole (foreign=2) |
 | `partition-not-empty` + `content=` | one partition | the content probe found a filesystem. Reported with WHAT: `FAT`, `APFS`, `HFS+`, `UNAFS`, or `unknown`. **`unknown` is not empty** — a probe that cannot name what is there is the strongest reason to leave it alone | part 0 (`content=FAT`), part 1 (`content=APFS`, `NXSB` at +32) |
 | `partition-foreign-type` | one partition | its TYPE GUID is declared as somebody else's OS — Apple APFS/HFS+/Recovery/Core Storage, Linux fs/LVM/RAID/swap, Microsoft Reserved, Windows Recovery. **The second, independent witness**, and it fires even when the bytes read as blank, which is exactly the state of an erased-but-not-repartitioned stranger's volume. Microsoft Basic Data is deliberately absent: that is what Disk Utility stamps on the target | part 1 (`type=apple-apfs`), reached whenever the content probe does not answer first |
@@ -719,8 +720,51 @@ Three structural properties sit under the table, each mechanical rather than arg
   exact extents the writer recorded and SHA-256-checked (the rule `install/clone.rs` already carried
   for the Pi self-clone).
 
-**What the installer still does NOT do, and must not be read as doing.** It does not write to SATA —
-AHCIWRITE is a separate rung and the rMBP's internal SSD is a live disk. It does not make anything
+### The SATA write capability (AHCIWRITE)
+
+The installer **can** now write to SATA, and only in one shape. This subsection is the contract; the
+mechanism is in `docs/dev/OS/07_USB_STORAGE/ahci.md` and the operator procedure in
+`docs/dev/OS/10_INSTALL/partition-install.md`.
+
+The threat is concrete: the bench rMBP's internal SSD carries a live Catalina, and the partition the
+operator wants UnaOS in is on that same disk. R25 says a non-UnaOS disk is a STRANGER — the kernel
+never writes on its own initiative — so the SATA write path is built as a **capability** rather than
+as a permission bit, and the capability is unforgeable at the type level:
+
+- `block::WriteGrant` names one AHCI **port** and one inclusive **LBA range**. Its fields are
+  private, so `WriteGrant { .. }` outside `drivers/block.rs` is a compile error; its only constructor
+  is `WriteGrant::new`, and the tree contains exactly one call to it, in
+  `install::partition::mint_grant`, which runs the whole refusal ladder above itself and mints only
+  on `Ok`. Two greps are the audit and each must print exactly two lines forever:
+  `grep -rn 'WriteGrant::new'` and `grep -rn 'write_block_at'`.
+- `block::write_sectors_granted` is the **only** caller of `ahci::write_block_at`, which is
+  `pub(crate)` to keep that true. Three independent bounds guard one write, in three files:
+  `PartitionTarget::map()` (past the partition → `BadLba`, never a clamp), the grant's own per-sector
+  range check (→ `[ahci] write REFUSED lba=… outside grant …`, a witness with a permanent go-red
+  leg), and the port's IDENTIFY sector count.
+- **The whole-disk engine can never obtain one.** `install/mod.rs`'s `BlockTarget::write_sectors`
+  `Ahci` arm is a refusal in every cfg including the armed one, because a whole-disk target can
+  address LBA 0 and both GPTs — which on this machine is Catalina's partition table. Its
+  `read_sectors` arm is the one thing arming opens, because the pre-flight census must read the
+  stranger's disk before it can refuse it.
+- **The plain SATA write path stays shut.** `write_block_ahci` and its port twins still return
+  `NotReady` with the armed knob, so shell verbs, FAT writes on a SATA-mounted volume and every other
+  caller refuse exactly as before. Arming adds one narrow door and widens none.
+- **INSTALL-SELF is extended to SATA, in the installer rather than in the guard.** `selfguard`'s
+  candidate list is the global and USB handles, so it answers `Eligible` for a SATA identity by its
+  own explicit "do not invent a verdict" arm — and on this machine the boot volume is on the SATA
+  disk. `install/partition.rs` therefore asks `selfguard`'s own question through `BlockSource::Ahci`
+  and refuses `boot-device`. The verdict is printed three-valued, so a DISARMED guard (no boot serial
+  in `BootInfo`) can never be read as a cleared one. The proper home for this is `selfguard`'s
+  candidate list; that is owed and is recorded in rmbp-ledger B89.
+
+Default OFF is the shipped state and the safe state is the one you get by forgetting: without the
+`ahci-write` feature the image compiles **no ATA write opcode at all**, certified on the artifact
+(`LC_ALL=C grep -a -o -F 'WRITE-DMA-EXT-0x35'` — 1 hit armed, 0 unarmed), never on the diff or the
+banner. `UNAOS_AHCI_WRITE=1` belongs on an attended install sitting's flight line and on no other.
+
+**What the installer still does NOT do, and must not be read as doing.** It writes to SATA only
+through the grant above — never whole-disk, never without a census. It does not make anything
 the startup volume: on this firmware that is the operator's `bless` from Recovery, or ⌥ at power-up
 (R3, rmbp-ledger A4). And whether this machine's picker lists a FAT volume that is not ESP-typed is a
 **firmware fact we have not measured** — `docs/dev/OS/10_INSTALL/partition-install.md` marks it

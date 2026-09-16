@@ -3264,6 +3264,41 @@ ftdirx = []
 # machine with no SATA controller in it, which is a different finding entirely.
 # See docs/dev/OS/07_USB_STORAGE/ahci.md.
 ahci = []
+# AHCIWRITE (rmbp-ledger B89, SATA write half) — the ATA WRITE DMA EXT (0x35) path, reachable ONLY
+# through a capability the installer's `PartitionTarget` mints. Implies `ahci` (there is nothing to
+# write to without the enumerator). Default OFF, and OFF is the shipped state.
+#
+# THE METAL THIS EXISTS FOR IS PETER'S LIVE SSD WITH CATALINA ON IT, so the reachability is built as
+# a TYPE rather than as care (LAWS §5's "check it in code"; R25's STRANGER clause):
+#
+#   * `ahci::write_block_at` has exactly ONE caller in the tree — `block::write_sectors_granted`.
+#   * `write_sectors_granted` takes a `block::WriteGrant`, a value type whose fields are PRIVATE and
+#     whose only constructor (`WriteGrant::new`) is called from exactly ONE function,
+#     `install::partition::mint_grant`, and only after the pre-flight census and the whole refusal
+#     ladder have passed. No census, no grant; no grant, no ATA write command is ever issued.
+#   * Every LBA is re-checked at the wire against `[first_lba, last_lba]` and a violation prints
+#     `[ahci] write REFUSED lba=… outside grant …` and moves no byte. Type AND runtime AND witness.
+#   * `block::write_block_ahci` — the PLAIN write path every other caller reaches (shell verbs, FAT
+#     writes on a SATA-mounted volume, the whole-disk installer engine) — still returns `NotReady`
+#     in every cfg, including this one. The grant is a side door for one caller, not an unlocking.
+#   * `install/mod.rs`'s `BlockTarget::write_sectors` `Ahci` arm STAYS a refusal. Only
+#     `PartitionTarget`'s granted path writes.
+#
+# Knob OFF but `ahci` on: the SATA refusal an operator reads becomes `transport-write-disabled`
+# (naming the knob) instead of `transport-read-only`, so a build without this feature still cannot
+# write the SSD and says which switch is missing rather than implying the transport is incapable.
+#
+# Default OFF => not one ATA write opcode is compiled: `LC_ALL=C grep -a -o -F 'WRITE-DMA-EXT-0x35'`
+# on the built ELF is 1 hit armed and 0 hits unarmed. Every addition is a FILE-TAIL append in
+# `drivers/ahci.rs` and `drivers/block.rs` or a LINE-NEUTRAL rewrite, so no `core::panic::Location`
+# line moves; `install/partition.rs` is `installdemo`-gated and reaches no Pi image. x86_64 only, and
+# stripped from aarch64 builds by arroyo's `arm_features` exactly as `ahci` itself is.
+#
+# Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs` — a knob wired only in arroyo
+# ships the write path disabled while the banner claims it is armed (the s42/INSTGUI lesson), and for
+# THIS knob the quiet failure reads on the wire as a working refusal.
+# See docs/dev/OS/07_USB_STORAGE/ahci.md and docs/dev/OS/10_INSTALL/partition-install.md.
+ahci-write = ["ahci"]
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

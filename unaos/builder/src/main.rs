@@ -281,6 +281,17 @@ fn main() {
     // write opcode, and `install/` is never told the handle exists (B91 — Catalina lives on that SSD).
     // Default OFF => module unlinked, media byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_AHCI").is_ok() { feats.push("ahci"); }
+    // AHCIWRITE (rmbp-ledger B89, SATA write half): UNAOS_AHCI_WRITE=1 arms the ATA `WRITE DMA EXT`
+    // (0x35) path. THIS list is what reaches the kernel binary for MEDIA builds, and this is the one
+    // knob in it that can destroy data on Peter's internal SSD, so the s42/INSTGUI failure mode is
+    // the worst it could be here: wired in arroyo alone the banner would claim the write path is
+    // armed while the image refused every write, and the operator would read a working install as a
+    // broken driver — or, the other way round on a later run, trust a banner that was never true.
+    // `ahci-write` implies `ahci` in Cargo.toml, so this push alone is sufficient; the flight lines
+    // still name both env knobs because a reader should see both on a line that can write a disk.
+    // Default OFF => no ATA write opcode is linked (`WRITE-DMA-EXT-0x35` is 0 hits on the ELF) and
+    // media are byte-identical. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
+    if std::env::var("UNAOS_AHCI_WRITE").is_ok() { feats.push("ahci-write"); }
     // BCMA-RECON (GR20): UNAOS_BCMARECON=1 arms drivers/bcma.rs — STRICTLY READ-ONLY recon of the
     // Broadcom WiFi radio (class 0x02 / subclass 0x80), the first arc of the native-BCM4331 path.
     // THIS list is what reaches the kernel binary for MEDIA builds: the builder re-derives the x86
@@ -1140,10 +1151,37 @@ fn main() {
     // The fixture the DONE gate uses is `builder/fat-gpt.img` (`scripts/make-fat-img.sh gpt`): a
     // GPT-partitioned FAT32 disk, so the driver's sector-0 witness reads `kind=GPT` off a real
     // protective MBR rather than off a synthetic one.
+    //
+    // AHCIWRITE: WHEN THE WRITE KNOB IS ARMED THE ATTACHED FILE IS A FRESH COPY, NEVER THE ORIGINAL.
+    // PARTINSTALL already learned this on the USB side (see UNAOS_PART_DISK above): a leg that wrote
+    // into the checked-in fixture would pass once and then measure the disk the previous run left
+    // behind — the re-census, the neighbours sha and the other-disk fingerprint would all be reading
+    // yesterday's result, which is the single most convincing kind of wrong. It is also a safety
+    // property in its own right and that is the larger half: with the write path armed, QEMU is
+    // never pointed at a file the operator handed it directly, so a mistyped path cannot make the
+    // guest write over something that matters. READ-ONLY runs (knob unset) attach the file as-is,
+    // exactly as they did before this arc, so no existing leg's command line changes.
     if let Ok(ahci_disk) = std::env::var("UNAOS_AHCI_DISK") {
-        cmd.arg("-drive").arg(format!("if=none,id=sata0,format=raw,file={}", ahci_disk))
+        let src = {
+            let p = std::path::PathBuf::from(&ahci_disk);
+            if p.is_relative() { workspace_dir.join(p) } else { p }
+        };
+        if !src.exists() {
+            panic!("UNAOS_AHCI_DISK set but {} is missing — run \
+                    `python3 scripts/make-gpt-fixture.py` from unaos/ first", src.display());
+        }
+        let attach = if std::env::var("UNAOS_AHCI_WRITE").is_ok() {
+            let dst = target_dir.join("ahcifixture.img");
+            std::fs::copy(&src, &dst).unwrap();
+            println!("   UNAOS_AHCI_WRITE: fresh copy of the SATA fixture {} -> {} (the guest can write this disk; the source is never opened)",
+                     src.display(), dst.display());
+            dst
+        } else {
+            src
+        };
+        cmd.arg("-drive").arg(format!("if=none,id=sata0,format=raw,file={}", attach.display()))
            .arg("-device").arg("ide-hd,drive=sata0,bus=ide.1");
-        println!("   UNAOS_AHCI_DISK: second SATA disk on ide.1 ({}) — AHCI driver target (ESP keeps ide.0 and bootindex=0)", ahci_disk);
+        println!("   UNAOS_AHCI_DISK: second SATA disk on ide.1 ({}) — AHCI driver target (ESP keeps ide.0 and bootindex=0)", attach.display());
     }
     // EHCI-3 harness: by default (EHCI-4 M1 driver on) the keyboard rides the EHCI bus (QEMU's usb-kbd is
     // HS-capable, so it trains directly on the EHCI root port — Topology B). It REPLACES the

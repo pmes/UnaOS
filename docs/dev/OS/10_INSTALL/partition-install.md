@@ -150,3 +150,118 @@ made to fail has not been verified either.
 **`sfdisk` is absent on this box** (measured by AHCIBOOT), so the fixture's GPT is written by hand in
 `scripts/make-gpt-fixture.py`, mirroring `install/gpt.rs`'s writer constant for constant — the
 kernel's reader is fed the same layout its own writer makes.
+
+---
+
+## The SSD case — AHCIWRITE, and the knob that belongs on ONE flight line only
+
+Everything above was measured over a USB disk, because until AHCIWRITE the SATA transport refused
+every write and the installer said so on the wire (`reason=transport-read-only transport=ahci`). The
+transport half has now landed, and it is the half with the metal risk: the disk the operator names in
+step 3 of the procedure lives on the same controller as Catalina.
+
+### The knob, and where it may appear
+
+| sitting | flight line |
+|---|---|
+| **A routine flight** — any leg that is not installing anything | `UNAOS_AHCI=1` and nothing more. The SATA disks enumerate READ-ONLY and the installer refuses them with `reason=transport-write-disabled transport=ahci knob=UNAOS_AHCI_WRITE`. This is the shipped posture. |
+| **An install sitting** — Peter, attended, at the machine, deliberately | `UNAOS_AHCI=1 UNAOS_AHCI_WRITE=1` on that boot and no other. Destructive; a fresh go; the knob is armed for that boot only and never written into a saved alias, a script default or a card's boot config. |
+
+`UNAOS_AHCI_WRITE=1` is the only knob in `arroyo` that can destroy data on the internal SSD. It is
+default OFF, it is stripped from every aarch64 build, and a build without it compiles no ATA write
+opcode at all — so the safe state is the one you get by forgetting.
+
+### What still refuses, with the knob ON
+
+The knob does not make SATA writable; it makes SATA writable **through a capability**. The refusal
+ladder is unchanged and is asked first, and on top of it:
+
+- **INSTALL-SELF, over SATA.** `selfguard`'s candidate list is the global and USB handles only, so it
+  answers `Eligible` for a SATA identity by its own "do not invent a verdict" arm. On this machine
+  the boot volume and Catalina are on the *same* SATA disk, so `install/partition.rs` asks
+  `selfguard`'s own question — is the boot volume's FAT serial on this device — through
+  `BlockSource::Ahci`, and refuses `reason=boot-device` when it is. The verdict is printed
+  **three-valued** (`install-self=boot-device|eligible|disarmed`): a disarmed guard is not a cleared
+  one. ⚠ The right long-term home for this is `selfguard`'s candidate list itself; see the STOP in
+  rmbp-ledger B89's AHCIWRITE entry.
+- **The whole-disk engine can never obtain a grant.** `install/mod.rs`'s `BlockTarget::write_sectors`
+  `Ahci` arm stays a refusal in every cfg, `ahci-write` included. A whole-disk target can address
+  LBA 0 and both GPTs — on this machine that is Catalina's partition table — so the disk-wide target
+  writes no SATA sector at all. Only `PartitionTarget`, carrying a `WriteGrant` bound to one
+  partition's LBA range, writes.
+- **Every other SATA disk is fingerprinted, not merely unselected.** The fixture SHA-256s the first
+  1 MiB of every SATA disk that is not the target — which includes the ESP the machine booted from —
+  before and after the install, and prints `other-disks untouched=n/n -> PASS`.
+
+### The QEMU leg
+
+```
+cd unaos
+python3 scripts/make-gpt-fixture.py                 # -> builder/part-fixture.img
+UNAOS_WC=1 UNAOS_INSTALLDEMO=1 UNAOS_AHCI=1 UNAOS_AHCI_WRITE=1 \
+  UNAOS_AHCI_DISK=builder/part-fixture.img \
+  UNAOS_QEMU_FULL=1 ./arroyo test 120
+```
+
+The same fixture disk as the USB leg, attached to q35's ICH9 AHCI controller on `ide.1` instead of to
+the usb-storage slot — the ESP keeps `ide.0` and `bootindex=0`, so the boot is unchanged and the
+machine has two SATA disks exactly as the rMBP does. **With the write knob armed the builder attaches
+a FRESH COPY** in `target/ahcifixture.img` and never opens the checked-in image: a leg that wrote into
+its own fixture would pass once and then measure yesterday's disk, and pointing a writable guest at an
+operator-supplied path is the mistake this copy makes impossible.
+
+The leg is still chosen **by content** (R28). `partition::run_fixture` tries the SATA arm first; if no
+SATA disk carries a parseable GPT it falls through to the USB leg byte-for-byte as before, so a run
+without `UNAOS_AHCI_DISK` is unchanged.
+
+### Witness lines to `awk` for
+
+```
+awk 'index($0,"PINSTALL:")'  target/serial*.log
+awk 'index($0,"[ahci] write REFUSED")' target/serial*.log
+```
+
+Measured on the 2026-09-15 run (`target/serial.log`), verbatim:
+
+```
+:: AHCI: write path ARMED — opcode WRITE-DMA-EXT-0x35 (ATA8-ACS, LBA48) compiled and reachable only through a WriteGrant (first, once) ::
+:: PINSTALL: sata disk ix=0 port=1 sectors=262144 install-self=eligible ::
+:: PINSTALL: sata disk ix=1 port=5 sectors=1032192 install-self=boot-device ::
+:: PINSTALL: refusal target=disk=sata-port5 reason=boot-device -> guard OK ::
+:: PINSTALL: fixture start — SATA port=1 carries a valid GPT ::
+:: PINSTALL: refusal target=disk reason=disk-has-foreign-volumes foreign=2 friend=0 -> guard OK ::
+:: PINSTALL: SATA transport WRITABLE under `ahci-write` — no transport refusal, writes still need a grant ::
+:: PINSTALL: other-disk port=5 sha1MiB=0xbbfe59f39e8ad2f6 (pre) ::
+:: PINSTALL: grant minted transport=ahci port=1 part=2 lba=116736..215039 sectors=98304 — every other LBA on this disk is unreachable through it ::
+:: PINSTALL: go-red(b) plain write_sectors on the SATA handle lba=116736 => NotReady, refused ::
+:: PINSTALL: wrote part=2 fat32 tree=4 bytes=61952 verified=4/4 -> PASS ::
+:: [ahci] write REFUSED lba=215040 outside grant port=1 116736..215039 — nothing written ::
+:: PINSTALL: go-red(a) write lba=215040 (grant 116736..215039) refused=1 neighbour-intact=1 -> PASS ::
+:: PINSTALL: neighbours untouched=4/4 -> PASS ::
+:: PINSTALL: other-disk port=5 sha1MiB=0xbbfe59f39e8ad2f6 (post) UNCHANGED ::
+:: PINSTALL: sata other-disks untouched=1/1 -> PASS ::
+```
+
+**Two things in that capture are worth reading twice.** First, **the boot ESP is AHCI port 5 and the
+fixture is port 1** — QEMU's `ide.N` bus names are not the HBA port indices, so never reason about
+"port 0"; read the port off `:: AHCI: port=…` and off the census line, which is what every witness
+here does. Second, **INSTALL-SELF over SATA is ARMED on this fixture and it FIRED**: the boot volume's
+FAT serial was found on port 5, the disk carrying `kernel.elf`, and that disk was refused
+`reason=boot-device` before its GPT was even parsed. The three-valued print is what makes that
+readable — `install-self=eligible` on port 1 and `install-self=boot-device` on port 5 are two
+measurements, not one measurement and one silence.
+
+### Go-red, three, and two of them are PERMANENT legs rather than mutations
+
+- **(a) one LBA past the grant.** Built into the fixture: after the install it asks
+  `write_sectors_granted` for `last_lba + 1`, which on this fixture is **part 3's first sector** — not
+  a synthetic address but the exact byte a real off-by-one would destroy. Expected: the
+  `[ahci] write REFUSED` witness, `refused=1`, and the victim partition's head SHA unchanged
+  (`neighbour-intact=1`). Refused and nothing-moved are two different claims and both are asserted.
+- **(b) the plain path, with the knob ON.** Also built in: `BlockTarget::write_sectors` on the SATA
+  handle, asked with the target partition's own first sector — the most legitimate-looking write in
+  the run — must still answer `NotReady`.
+- **(c) the knob OFF.** Rebuild without `UNAOS_AHCI_WRITE`: the refusal returns as
+  `reason=transport-write-disabled transport=ahci knob=UNAOS_AHCI_WRITE`, and
+  `LC_ALL=C grep -a -o -F 'WRITE-DMA-EXT-0x35'` on the ELF is **0 hits**. This is the one that has to
+  be a rebuild: it is a statement about what the artifact contains, not about what it does.
