@@ -29,11 +29,11 @@
 # `settled()` now gates on `matcher.complete()`, and that same probe returns
 # `status=truncated reason=short-witnesses:1 stopped_at=2148` rc=3. A REQUIRE here WOULD fire today.
 #
-# IT STILL SHOULD NOT BE ADDED — for the FIRST half of the paragraph above (this file answers one
-# question; per-witness assertions belong in a spec a verb REPLAYS), and because, measured below,
-# the marker already sits AFTER the ladder's last verdict. A REQUIRE would restate what the ordering
-# already guarantees, while handing a flaky fixture a new way to turn a red into an inconclusive.
-# Add one only in the case named at the bottom of this header.
+# IT STILL SHOULD NOT BE ADDED — the two reasons above, plus the one SPECROWS MEASURED (2026-09-16):
+# `x86_test_completion` reads THIS FILE on EVERY x86 leg (X86_TEST_SPEC is unconditional) and
+# `settled()` gates on `complete()`, so a REQUIRE here must hold on the DEFAULT, sf, AHCI AND
+# selfhost legs alike or it settles the others `truncated`. Three default-medium pins added here
+# reddened `test-fat sf` over a capture complete at line 2200; they live in x86-default.spec now.
 #
 # THE MARKER WAS MEASURED, NOT CHOSEN FROM THE SOURCE — the QEMU-FAST rule ("the predicate is
 # derived, never invented") applied to a capture instead of to a running log. Two full-wall runs at
