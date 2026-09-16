@@ -9236,17 +9236,69 @@ battery() {
             if [ -f "${vf}.run" ]; then cp -f "${vf}.run" "${kept}.run"; fi
             vf="$kept"
         fi
-        local ok=1
-        [ "$crc" -ne 0 ] && ok=0
+        # ── BATTFAT: A RED LEG NAMES THE RULE THAT FIRED AND QUOTES ITS OWN WITNESS ───────────────
+        # A judged step is red when ANY of four things is true: (a) the command's exit status, (b) a
+        # fault line in the judged capture, (c) the step's expected pattern absent, (d) the run
+        # TRUNCATED. The conjunction itself is not new — what was missing is that the ❌ line said
+        # NONE of it. It named a path and stopped, so a regression, a missing witness, a short boot
+        # and a FALSE red all printed the same sentence, and the only way to tell them apart was to
+        # open the log. That is not a summary; it is a pointer to where the summary would have been.
+        # Each rule below now appends its own name to `$why`, and the fault rule quotes the first
+        # offending line beneath the verdict, so the battery's last screen says what happened.
+        local ok=1 why="" firstfault=""
+        [ "$crc" -ne 0 ] && { ok=0; why="${why}rc=${crc}; "; }
         if [ -n "$pattern" ]; then
-            awk -v p="$pattern" 'BEGIN{f=1} $0 ~ p {f=0} END{exit f}' "$vf" || ok=0
+            awk -v p="$pattern" 'BEGIN{f=1} $0 ~ p {f=0} END{exit f}' "$vf" \
+                || { ok=0; why="${why}pattern absent (${pattern}); "; }
         fi
         # Any fault line in a serial-backed step is a failure. FAULT-SCAN: the pattern set lives in the
         # single FAULT_PATTERNS list (see above the test legs) — this scan used to carry its own copy of
         # the three FAIL spellings and knew nothing about PANIC or EXCEPTION:, which is the same blind
         # spot that let a panicked boot exit 0 from `./arroyo test`.
+        #
+        # QUOTED-WITNESS — the scan skips a line where the HARNESS is QUOTING a pattern rather than a
+        # kernel PRINTING one. `scripts/banner-cert.sh` prints one `feature=<f> witness=<token>
+        # hits=<n> -> <verdict>` (and `control=<f> …`) line per registered witness, and a witness
+        # TOKEN is verbatim kernel text: two of the control probes — `selfhost` and `holocron` — carry
+        # `-> FAIL` INSIDE the token. banner-cert runs inside `esp_x86`, whose stdout is this very
+        # capture, so from BANNERCERT onward every esp-x86-backed leg matched FAULT_PATTERNS on
+        # banner-cert's own table. MEASURED at a1e50849 against the fold-gate `test-fat sf 300`
+        # capture: with the kernel's three real FAILs removed the two `control=` lines still match, so
+        # `x86 test-fat sf 300` could not go green for any tree. A gate that cannot pass is as absent
+        # as one that cannot fail (LAWS §5), and it is worse than absent while it is indistinguishable
+        # from a true red — which is exactly what the unnamed ❌ line above made it.
+        # Skipping these lines costs no coverage: banner-cert's OWN verdict is its exit status and
+        # every call site is `|| exit $?`, so a real missing witness or leak reds this step through
+        # rule (a). This is the same distinction `--build` already draws for compiler output and the
+        # mbench leg already draws for its FORBID-pattern verdict table — now one rule, in one place.
+        # The families are NOT enumerated here (no `:: TSTE:|:: X86BIND:|WINX-|…` list): a gate keyed
+        # on a spelling set is the defect this file keeps re-learning, and the next verdict family
+        # would be born invisible to it. The anchor is the shape of the QUOTER, which is one script.
+        # The absent-capture case is spelled out rather than inherited. The scan this replaces was
+        # `awk … "$vf" || ok=0`, and awk's rc 2 on an unopenable file was doing double duty as SR10's
+        # "a run that produced NO capture reds, because a scan with no input cannot go red". A
+        # `$( … )` capture cannot borrow that: under this script's `set -e` the failing substitution
+        # would abort the whole battery mid-leg, and `2>/dev/null` hides the reason while doing it.
+        # So the absence is TESTED, and — unlike before — it is NAMED.
         if [ "$faultscan" -eq 1 ]; then
-            awk -v p="$FAULT_PATTERNS" 'BEGIN{f=0} $0 ~ p {f=1} END{exit f}' "$vf" || ok=0
+            if [ ! -r "$vf" ]; then
+                ok=0; why="${why}no capture at ${vf}; "
+            else
+                firstfault=$(awk -v p="$FAULT_PATTERNS" -v q='^(feature|control)=[^ ]+ witness=.* hits=' '
+                    $0 ~ q { next }
+                    $0 ~ p { sub(/\r$/, ""); if (length($0) > 200) $0 = substr($0, 1, 200) " …"; print; exit }
+                ' "$vf" || true)
+                [ -n "$firstfault" ] && { ok=0; why="${why}fault line; "; }
+            fi
+        fi
+        # (d) TRUNCATED. TESTTRUNC's rule is UNCHANGED and stays where it lives: `test_x86_64` and
+        # `test_kernel8` decide truncation and exit nonzero for it, so rule (a) already reds the leg
+        # and this adds no second opinion that could disagree with theirs. What it adds is the NAME —
+        # a truncated leg and a regressed leg are different reds and the summary now says which,
+        # instead of sending the reader to the log to find out. Anchored on the three VERDICT
+        # spellings those two verbs emit, never the bare word, which appears in their prose.
+        if awk 'BEGIN{f=1} /-> TRUNCATED|MBENCH TRUNCATED|boot was TRUNCATED/{f=0} END{exit f}' "$vf" 2>/dev/null; then
+            ok=0; why="${why}TRUNCATED; "
         fi
         if [ "$ok" -eq 1 ]; then
             results="${results}  ✅ ${name}\n"
@@ -9255,7 +9307,11 @@ battery() {
             # copy is the wire, and a reader who is only given the first cannot diagnose the red.
             local where="log: ${logf}"
             if [ "$kept" != "$logf" ]; then where="${where}; judged capture: ${kept}"; fi
-            results="${results}  ❌ ${name}  (${where})\n"; rc=1
+            results="${results}  ❌ ${name}  [${why%; }]  (${where})\n"
+            # `results` is rendered with `echo -e`, so a lone backslash in quoted kernel text would be
+            # eaten as an escape; double it here and the printed line matches the log's bytes.
+            [ -n "$firstfault" ] && results="${results}       ↳ first fault line: ${firstfault//\\/\\\\}\n"
+            rc=1
         fi
     }
 
