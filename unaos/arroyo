@@ -9184,6 +9184,122 @@ test_fat_drop_retry() { # $1 = the logfile _step is capturing (READ here, writte
     UNAOS_FATIMG=sf "$0" test 200
 }
 
+# ── BATTCTRL: THE JUDGE IS JUDGED FIRST, AND A JUDGE THAT CANNOT GO GREEN BUYS NO VERDICT ────────
+# THE INCIDENT. `x86 test-fat sf 300` was red on EVERY tree from BANNERCERT to BATTFAT, days of
+# them, because `_step`'s fault scan matched banner-cert's OWN `control=… witness=… -> FAIL …
+# hits=0 -> OK` rows quoted inside the step's capture. BATTFAT fixed the scan. What BATTFAT could
+# not fix — and wrote into its QUEUE §5 row as the open clause — is that NOTHING IN `battery()`
+# EVER ASKED WHETHER A STEP'S JUDGE COULD SAY ✅ AT ALL. So the battery spent an hour of QEMU per
+# run for days, scoring every boot with a rule that had exactly one possible answer, and the red
+# was indistinguishable from a real regression: LAWS §5's "a gate that cannot pass is as absent as
+# one that cannot fail", paid for in wall clock.
+#
+# THE SHAPE, and it is `./arroyo knoboff`'s, deliberately: knoboff refuses a verdict when its
+# control cannot fire — it asserts `warm=yes` and forces the scored compile rather than print PASS
+# off stale ELFs. Same here. Before a single step runs, the judge is handed a capture whose answer
+# is KNOWN, twice:
+#   (A) `scripts/specs/battery-control.capture` as it stands — a clean capture carrying one line
+#       for every judged step's pattern, and carrying banner-cert's quoted rows so that BATTFAT's
+#       exclusion is on the probed path. The judge MUST say ✅.
+#   (B) the same capture with one `:: TSTE: x -> FAIL` line appended. The judge MUST say ❌ AND
+#       MUST name `fault line` — not merely go red, because a red for the wrong rule is a judge
+#       that is broken in a way the summary would misreport.
+# Either control wrong and the battery prints CONTROL FAILED and exits nonzero having run NO step.
+#
+# AND (C): every judged `_step` call site's pattern is required to have a line in the fixture. The
+# call sites are read out of THIS FILE, not from a second list kept beside them — a maintained list
+# of patterns is the same "gate keyed on a spelling set" defect this file keeps re-learning, and it
+# would go stale on the first step added. Read from the source, a step added tomorrow without a
+# control line stops the battery and names itself. That is the half that makes the fix permanent:
+# BATTFAT's defect could not recur, but a step BORN unprovable could, and this is what forbids it.
+#
+# COST: two `cat`s of a 76-line file. No QEMU, no build, no knob.
+BATTERY_CONTROL_FIXTURE="scripts/specs/battery-control.capture"
+
+battery_control_probe() { # $1 = scratch dir for the probe's captures. 0 = judge proven, 1 = no verdict.
+    # `results` and `rc` are `battery()`'s locals and `_step` writes to BOTH of them. Bash is
+    # dynamically scoped, so shadowing them here is what keeps the probe's two verdict lines out of
+    # the battery's summary and the probe's red out of the battery's exit status — this function
+    # reports through its RETURN VALUE, which is the only thing the caller reads. Shadowing, not
+    # save-and-restore: an early `return` cannot then leak a probe verdict into the real run.
+    local results="" rc=0
+    local pdir="$1"; mkdir -p "$pdir"
+    local fx="${WORKSPACE_DIR}/${BATTERY_CONTROL_FIXTURE}"
+    if [ ! -r "$fx" ]; then
+        echo "battery: CONTROL FAILED — the judge cannot tell green from red; no verdict"
+        echo "  the control capture is not readable at ${fx}"
+        return 1
+    fi
+
+    # (C) COVERAGE. `awk -F'"'`: a call site is `_step [--build] "name" "pattern" "log[:vf]" cmd…`,
+    # so the quoted fields land on the even indices — $2 is the name, $4 the pattern. `--build`
+    # steps are skipped (their verdict file is compiler output, which this judge does not scan and
+    # this fixture does not model) and so is an empty pattern (an rc-only step asserts nothing for a
+    # capture to carry). The anchor for probe (A) is the FIRST judged pattern found, so probe (A)
+    # asserts with a pattern a real step uses rather than a token invented for the probe.
+    # BATTERYCWD's lesson, applied to the probe's one input path: `$0` is RELATIVE whenever the
+    # script is invoked as `unaos/arroyo` from the repo root, and the battery's own steps cd all
+    # over the workspace. The probe runs before the first of them, so a bare `$0` would work today
+    # and break silently the day anything cds above it — and "silently" here means the coverage
+    # pass reads an empty file, finds no call sites, and proves nothing. Resolve it once, absolute.
+    local self; self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    local missing=0 anchor="" n="" p=""
+    while IFS=$'\t' read -r n p; do
+        [ -z "$anchor" ] && anchor="$p"
+        if ! awk -v p="$p" 'BEGIN{f=1} $0 ~ p {f=0} END{exit f}' "$fx"; then
+            echo "battery: step ${n} pattern ${p} has no control line — add one to the fixture"
+            missing=1
+        fi
+    # The scan is RANGED to `battery()`'s own body — `^battery() {` to the closing brace in column
+    # zero (`_step`'s own definition closes indented, so it does not end the range). Without the
+    # range this function's two `_step` probe calls below would be read as judged steps and the
+    # coverage check would demand a fixture line for the unexpanded string `$anchor`. A probe must
+    # not be an input to itself.
+    done < <(awk -F'"' '
+        /^battery\(\) \{/ { inb = 1; next }
+        inb && /^\}/      { inb = 0 }
+        !inb              { next }
+        /^[ \t]*_step[ \t]+(--build[ \t]+)?"/ {
+            if ($0 ~ /^[ \t]*_step[ \t]+--build/) next
+            if ($4 == "") next
+            printf("%s\t%s\n", $2, $4)
+        }' "$self")
+    if [ "$missing" -ne 0 ]; then
+        echo "battery: CONTROL INCOMPLETE — a judged step has no control line; no verdict (${fx})"
+        return 1
+    fi
+    if [ -z "$anchor" ]; then
+        echo "battery: CONTROL FAILED — the judge cannot tell green from red; no verdict"
+        echo "  no judged _step call site was found in ${self} — the probe would prove nothing"
+        return 1
+    fi
+
+    # (A) CLEAN -> ✅. `_step` is called exactly as the real steps call it, with `cat` as the
+    # command, so the judged file is a byte copy of the fixture on the real code path: same rc rule,
+    # same pattern rule, same fault scan with the same quoter exclusion, same truncation rule.
+    local shown=""
+    _step "control: clean capture must go green" "$anchor" "${pdir}/control-clean.log" cat "$fx"
+    shown="${shown}${results}"
+    local aok=0; case "$results" in *"✅ control: clean capture"*) aok=1;; esac
+
+    # (B) ONE FAULT LINE -> ❌ NAMING `fault line`.
+    local red="${pdir}/control-red.capture"
+    cp -f "$fx" "$red"
+    printf ':: TSTE: x -> FAIL\n' >> "$red"
+    results=""
+    _step "control: one fault line must go red" "$anchor" "${pdir}/control-red.log" cat "$red"
+    shown="${shown}${results}"
+    local bok=0; case "$results" in *"❌ control: one fault line must go red"*"fault line"*) bok=1;; esac
+
+    if [ "$aok" -eq 1 ] && [ "$bok" -eq 1 ]; then return 0; fi
+    echo "battery: CONTROL FAILED — the judge cannot tell green from red; no verdict"
+    [ "$aok" -eq 1 ] || echo "  (A) the clean control capture did NOT go green — the judge reds a tree it has no finding against"
+    [ "$bok" -eq 1 ] || echo "  (B) the faulted control capture did NOT red on the 'fault line' rule — the judge greens a tree it has a finding against"
+    echo -e "$shown"
+    echo "  control capture: ${fx}   probe logs: ${pdir}/"
+    return 1
+}
+
 battery() {
     local t0=$SECONDS rc=0 results=""
     local blog_dir="${WORKSPACE_DIR}/target/battery"; mkdir -p "$blog_dir"
@@ -9315,6 +9431,16 @@ battery() {
         fi
     }
 
+    # BATTCTRL: the judge is proven before the first step, not after the last one. This sits HERE —
+    # below `_step`'s definition, above every call site — because the probe drives `_step` itself
+    # and because an hour of QEMU behind a blind judge is exactly the waste it exists to prevent.
+    # `control` is DERIVED, never asserted: the only path that reaches the summary sets it to `ok`,
+    # and every other path returns above it, so the summary cannot print a control state it did not
+    # measure.
+    local control="unproven"
+    battery_control_probe "$blog_dir/control" || return 1
+    control="ok"
+
     _step --build "check (both arches)"  ""                  "$blog_dir/check.log"        "$0" check
     _step --build "check (tegra)"        ""                  "$blog_dir/check-tegra.log"  env UNAOS_TEGRA=1 "$0" check
     _step "x86 test 25 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-x86.log"     "$0" test 25
@@ -9367,7 +9493,11 @@ battery() {
     # SR10: tally over the KEPT pi capture, not the shared path — a concurrent or later
     # `kernel8-test` moves the shared one and the summary would then count someone else's run.
     local passes; passes=$(awk '/-> PASS|: PASS/{n++} END{print n+0}' "$blog_dir/test-fat.log" "$blog_dir/kernel8.serial.log" 2>/dev/null || echo '?')
-    echo -e "\n${COLOR_PURPLE}════════════ BATTERY SUMMARY ($(( SECONDS - t0 ))s) ════════════${COLOR_RESET}"
+    # BATTCTRL (2): `control=ok` on the summary's FIRST line, so a CAPTURE of a battery run states
+    # that the judge was proven — a reader of a pasted summary, days later, can tell a green earned
+    # by a working judge from one printed by a judge nobody measured. It is on the header line
+    # rather than appended at the end because a truncated paste keeps the header.
+    echo -e "\n${COLOR_PURPLE}════════════ BATTERY SUMMARY ($(( SECONDS - t0 ))s) control=${control} ════════════${COLOR_RESET}"
     echo -e "$results"
     echo "  PASS lines (fat+pi): $passes   step logs: $blog_dir/"
     echo -e "  ${COLOR_CYAN}⚠ this run clobbered any x86 esp media — rebuild UNAOS_USBDEBUG=1 esp-x86 LAST before flashing${COLOR_RESET}"
