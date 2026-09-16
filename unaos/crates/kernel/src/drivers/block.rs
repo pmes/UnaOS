@@ -992,7 +992,7 @@ pub fn unpublish_usb_geometry(slot_id: u8, captured_gen: u64) -> bool {
         return false;
     };
     // Drop an unconsumed attach edge: there is nothing left to mount.
-    USB_STORAGE_READY.store(false, core::sync::atomic::Ordering::Release);
+    USB_STORAGE_READY.store(false, core::sync::atomic::Ordering::Release); USB_PUBLISH_GEN.fetch_add(1, core::sync::atomic::Ordering::AcqRel); // USBUNPUB: A RETRACTION IS A GENERATION TOO. Until this call the counter moved only on PUBLISH, so `video/quarry/live.rs::volume_gen` — which ADDS this number to `fs::NS_GEN` — could not see a REMOVAL, and Quarry went on serving a listing of a volume that had physically left until the next ARRIVAL happened to bump it. SR3 covered every mutation UnaOS itself performs; a retraction performed by a human hand was still unheard. Placed HERE, not at the head: AFTER the `departing` unwrap, so a retraction that removed NOTHING moves nothing (a generation is a CHANGE, and every no-op arm above returns `false` having changed no registry), and AFTER both handle clears, so a reader that observes the new generation observes the emptied registry behind it — AcqRel, the ordering both publish sites already use. The gen GUARD at the head of this function compares against the generation the retraction was EARNED against, captured by each caller before its teardown begins, so a tail bump cannot make a retraction refuse itself; the two loop callers in `drivers/xhci/mod.rs` (`:6258`, `:14654`) re-read `usb_publish_gen()` inline on every iteration and the ladder caller (`:11147`) makes one call. Line-neutral append — see the FILE TAIL note below: no `core::panic::Location` in this file moves.
 
     // The removal witness. QEMU cannot hot-unplug a device here, so this line is what proves on the
     // next attended metal boot that the disconnect actually reached the block registry — the exact
@@ -2910,3 +2910,106 @@ pub fn write_blocks_ahci_port(_port: u8, lba: u64, buf: &[u8]) -> Result<(), Blo
 const NATIVE_AHCI_VETO: &str = "the volume rides an internal SATA disk and the block layer refuses \
                                 every write to it — this image compiles no ATA write opcode at all \
                                 (AHCI / AHCIBOOT)";
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// BLOCKSMALL — USBUNPUB: the retraction half of the USB registry, and its boot-path witness.
+//
+// APPENDED AT THE FILE TAIL, for the reason the SDWRITE block above already states: no
+// `core::panic::Location` line in `block.rs` moves, so `./arroyo knoboff <knob> <baseline>` can come
+// out byte-identical. The ONE edit this item made ABOVE this line — the `fetch_add` in
+// `unpublish_usb_geometry` — is folded onto the line the attach-edge drop already occupied, same rule.
+// The fix itself is UNGATED (correctness in the shared block layer); only the fixture is behind
+// `witness`.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// USBUNPUB fixture: **[`unpublish_usb_geometry`] advances [`USB_PUBLISH_GEN`], and only when it
+/// actually retracted something.**
+///
+/// # Why a synthetic pair and not the real stick
+///
+/// QEMU cannot hot-unplug the `usb-storage` device on either the `test` or the `test-arm` leg — the
+/// removal witness in `unpublish_usb_geometry` says so in its own comment, and that is precisely why
+/// this half of the registry shipped with no counter for months. So the leg drives a PUBLISH and a
+/// RETRACTION of a synthetic disk through the real `publish_usb_geometry_lun` /
+/// `unpublish_usb_geometry` entry points — the real registry, the real generation counter, the real
+/// slot-matching rule — exactly as `fs/bootdisk.rs`'s USBREG leg drives `admit`/`plan` with synthetic
+/// disks for the two-card reader no machine in this fleet can present.
+///
+/// # Why it cannot disturb the boot volume
+///
+/// Its entry point is `fs::bootdisk::unafsroot_selftest`, which `main.rs` calls on the heap-up line —
+/// long before xHCI enumeration, so the registry is empty and the fixture's disk takes index 0 and
+/// puts itself back. Belt and braces on top of that ordering: `BLOCK_DEVICE` and `USB_STORAGE_READY`
+/// are SNAPSHOT before and RESTORED after (the publish claims the global at index 0 on the x86 arm and
+/// raises the ready edge; the retraction clears both), and the leg asserts the registry index it took
+/// is empty again. `BOOT_MEDIUM_VERDICT`'s reset is a no-op here because `BM_UNKNOWN` is its initial
+/// value. The synthetic slot id is `0x7f`, and nothing on the wire at heap-up holds any slot at all.
+///
+/// # The legs
+///
+/// 1. **publish steps the counter** — `+1`, and the disk is in the registry under its own slot.
+/// 2. **a STALE retraction is refused and QUIET** — retracting against the generation captured BEFORE
+///    the publish returns `false` (PA35's rule: a newer publish supersedes the retraction) and must
+///    move nothing. This is the control that stops the counter being bumped by a call that changed no
+///    registry; without it a `fetch_add` at the head of the function would pass leg 3 just as well.
+/// 3. **the retraction steps the counter** — `+1`, `true`, and the entry is gone.
+/// 4. **a NO-OP retraction is quiet** — the same slot again, against the current generation: nothing
+///    to remove, `false`, counter unmoved. Together with leg 2 this makes "a generation is a CHANGE" a
+///    claim rather than an implementation detail.
+///
+/// **Go-red:** delete the `fetch_add` from `unpublish_usb_geometry` — `gen_after` equals the
+/// post-publish generation, `retract_step=false`, `-> FAIL`.
+#[cfg(feature = "witness")]
+pub fn usbunpub_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering as O};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, O::Relaxed) {
+        return;
+    }
+    const FX_SLOT: u8 = 0x7f;
+    let saved_global = *BLOCK_DEVICE.lock();
+    let saved_ready = USB_STORAGE_READY.load(O::Acquire);
+    let dev = BlockDeviceInfo {
+        slot_id: FX_SLOT,
+        block_size: SECTOR_BYTES as u32,
+        num_blocks: 64,
+        vendor: *b"UNAOS-FX",
+        product: *b"USBUNPUB FIXTURE",
+    };
+    let g0 = usb_publish_gen();
+    let ix = publish_usb_geometry_lun(dev, 0);
+    let g1 = usb_publish_gen();
+    let placed = ix < MAX_USB_DISKS && usb_disk(ix).map(|d| d.info.slot_id) == Some(FX_SLOT);
+    let publish_step = g1 == g0 + 1;
+    // Leg 2: earned against a generation the publish has already superseded.
+    let stale_refused = !unpublish_usb_geometry(FX_SLOT, g0);
+    let stale_quiet = usb_publish_gen() == g1;
+    // Leg 3: the retraction proper.
+    let retracted = unpublish_usb_geometry(FX_SLOT, g1);
+    let g2 = usb_publish_gen();
+    let retract_step = g2 == g1 + 1;
+    let cleared = usb_disk(ix).is_none();
+    // Leg 4: nothing left to remove.
+    let noop_refused = !unpublish_usb_geometry(FX_SLOT, g2);
+    let noop_quiet = usb_publish_gen() == g2;
+    // Put the two handles back exactly as they were found.
+    *BLOCK_DEVICE.lock() = saved_global;
+    USB_STORAGE_READY.store(saved_ready, O::Release);
+    let pass = placed
+        && publish_step
+        && stale_refused
+        && stale_quiet
+        && retracted
+        && retract_step
+        && cleared
+        && noop_refused
+        && noop_quiet;
+    serial_println!(
+        ":: USBUNPUB: gen_before={} gen_after={} ix={} placed={} publish_step={} \
+         stale_refused={} stale_quiet={} retracted={} retract_step={} cleared={} \
+         noop_refused={} noop_quiet={} -> {} ::",
+        g0, g2, ix, placed, publish_step, stale_refused, stale_quiet, retracted, retract_step,
+        cleared, noop_refused, noop_quiet,
+        if pass { "PASS" } else { "FAIL" }
+    );
+}

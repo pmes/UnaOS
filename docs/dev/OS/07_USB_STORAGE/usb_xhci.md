@@ -9071,6 +9071,31 @@ injection over QMP, and `scripts/qmp_type.py` is key-only (qcodes through `send-
 `arroyo` typist block, and is owed. With nothing moving the QEMU tablet, `evts=0` is honest, and
 scoring on it would be a gate that fires on every input.
 
+## 36. BLOCKSMALL — the block registry's two small silences (QUEUE §3, 2026-09-15)
+
+### 36.1 USBUNPUB — a removal is a generation too
+
+`drivers/block.rs::publish_usb_geometry_lun` has advanced `USB_PUBLISH_GEN` on every arrival since
+PA35, and `video/quarry/live.rs::volume_gen()` ADDS that counter to `fs::NS_GEN` to decide whether a
+cached listing is stale — but `unpublish_usb_geometry`, the retraction half, held no `fetch_add` at
+all: it LOADED the counter only to compare it against the caller's `captured_gen`. So an ARRIVAL
+invalidated Quarry's cache and a REMOVAL invalidated nothing, and the desktop went on offering a
+volume that had physically left until the next arrival happened to bump the number. SR3 closed every
+mutation UnaOS itself performs; this was the one a human hand performs. The fix is one `fetch_add`
+placed AFTER the `departing` unwrap and after both handle clears — after, because a generation is a
+CHANGE and each of the three arms above that point (`captured_gen` superseded, slot 0, nothing
+matched) returns `false` having altered no registry, and because a reader that observes the new
+generation must observe the emptied registry behind it. Bumping at the tail cannot make a retraction
+refuse itself: every caller captures its generation before its teardown begins, the two sweep loops
+in `drivers/xhci/mod.rs` (`:6258`, `:14654`) re-read `usb_publish_gen()` inline per iteration, and the
+rescue ladder (`:11147`) makes one call. QEMU can hot-unplug nothing on either headless leg, so the
+witness drives the real entry points with a synthetic disk at slot `0x7f` from the heap-up line
+(`fs/bootdisk.rs::unafsroot_selftest`), where the registry is still empty and a publish/retract pair
+can disturb no boot volume; `BLOCK_DEVICE` and `USB_STORAGE_READY` are snapshot and restored anyway.
+Wire: `:: USBUNPUB: gen_before=… gen_after=… publish_step=… stale_refused=… retracted=…
+retract_step=… noop_refused=… -> PASS ::`. The two quiet legs are load-bearing — a `fetch_add` at the
+HEAD of the function would satisfy `retract_step` and fail them.
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10), the EHCI-1/2 scout + shared wake (§9/§9a), and the ISRARM completion interrupt (§33).

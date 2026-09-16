@@ -1795,7 +1795,7 @@ pub fn unafsroot_selftest() {
     // USBREG (SO33): leg 7 rides the same boot-path entry point, for the same reason — see
     // [`usbreg_selftest`]. It carries its own latch, so calling it here and from
     // `homesoil_selftest` prints it exactly once.
-    usbreg_selftest(); #[cfg(feature = "sdwrite")] sdwrite_posture_selftest(); // SDWRITE (A60) leg 8: the posture/polarity matrix, latched like its siblings.
+    usbreg_selftest(); #[cfg(feature = "sdwrite")] sdwrite_posture_selftest(); crate::drivers::block::usbunpub_selftest(); // SDWRITE (A60) leg 8: the posture/polarity matrix, latched like its siblings. BLOCKSMALL: leg 9 (USBUNPUB — a stick REMOVAL advances the cache-invalidation generation) rides this same entry point, for the reason leg 7 does: it lives in `drivers/block.rs`, which has no boot-path witness seam of its own, and this is the ONE heap-up line x86, virt and the Pi all pass through — so `test`/`test-arm` execute it instead of shipping it reasoned-about. It carries its own latch. Ordering matters and is deliberate: at heap-up the USB registry is still EMPTY (xHCI has not enumerated), which is what makes leg 9's synthetic publish/retract pair unable to disturb a live boot volume. Line-neutral append, this file's stated rule.
     // --- leg 6: UNAFSROOT — the root disk's LAYOUT RULE, driven with every answer it takes. -----
     // `bind_root` is the one place `/`, `/boot` and `/apps` are decided, and until this leg the
     // `present` answer had never executed anywhere (render12: `unafs=absent`, no card carried a
