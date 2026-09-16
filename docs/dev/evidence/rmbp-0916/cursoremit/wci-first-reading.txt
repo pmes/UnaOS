@@ -1,0 +1,20 @@
+# CURSOREMIT first x86 gate reading — 33fb95db, UNAOS_WC=1 UNAOS_QEMU_FULL=1 ./arroyo test 120, rc=0, full wall 132.2 s
+# source: ~/unaos-bench/scratch/rmbp-0915/cursoremit-logs/arroyo-test.log (seat-local), lines selected with awk index() on the tags
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[cursor3] present tail=repaint offers=0 taken=0 -> BRACKETED
+[wc-i] rollup scope=fixture windowed_flushes=7 stale=3 intrusions=2 cursor_passes=246 cursor_brackets=94 -> INTRUDED
+[lockfix] composite scope=fixture drain_skip=0 reserved_assumed=0 pass_skip=0 -> QUIET
+[cursor3] rollup scope=fixture planned=87 offers=135 taken=73 adopt=87 repaint=119 settle=0 ensure=40 straddle=61 disjoint=61 partial=0 lock=0 budget=6 stale=1 -> COMPOSED
+[cursor11] compose-through scope=fixture passes=87 bracketed=30 px_deferred=2952 px_installed=936 px_redrawn=72 flicker_frames=0 px_absorbed=162 absorb_refused=0 -> THROUGH
+[wedge9] sprite-claim scope=fixture refused=7 masked=0 retried=0 owed=0 serviced=1 -> DEFERRED
+[flick2] scope=fixture down_max=928ms down_slow=1 down_last_at=8651ms sess_undraws=29 sess_px=792 sess_lockmiss=0 mask_sess=0 compose_through=0 ct_owner=0 flush_undraw=0 flush_skip=8 drains=99 drain_skip=87 drain_masked=12 burst_last=10ms burst_max=10ms -> SLOW
+[cursor11] compose-through scope=desk passes=87 bracketed=30 px_deferred=2952 px_installed=936 px_redrawn=72 flicker_frames=0 px_absorbed=405 absorb_refused=0 -> THROUGH
+[wedge9] sprite-claim scope=desk refused=12 masked=2 retried=0 owed=0 serviced=5 -> DEFERRED
+[cursor11] compose-through scope=desk passes=87 bracketed=30 px_deferred=2952 px_installed=936 px_redrawn=72 flicker_frames=0 px_absorbed=405 absorb_refused=0 -> THROUGH
+[wedge9] sprite-claim scope=desk refused=12 masked=2 retried=0 owed=0 serviced=5 -> DEFERRED

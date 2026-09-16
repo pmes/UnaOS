@@ -29,7 +29,7 @@ Spec format (unaos/scripts/specs/*.spec) — one directive per line, `#` comment
                           required witness, never fails on its own.
 
 Default FORBID set (always on, per the battery's global FAIL scan):
-    "-> FAIL"   "FAIL ::"   "PANIC"
+    "-> FAIL"   "FAIL ::"   "PANIC"   "-> FLICKER"
 
 TRUNCATION — the third verdict, and why it exists
 -------------------------------------------------
@@ -133,7 +133,24 @@ def clean_line(raw: bytes) -> str:
 # Spec parsing
 # ---------------------------------------------------------------------------
 
-DEFAULT_FORBIDS = [r"-> FAIL", r"FAIL ::", r"PANIC"]
+# CURSOREMIT — `-> FLICKER` joins the always-on set, and it is the only VERDICT TOKEN here that is
+# not the word "fail" in some dress. The justification is that it is a CONTRACT VIOLATION with a
+# contract of zero: `[cursor11] … flicker_frames=<n> … -> FLICKER` counts panel presents published
+# with a live, visible arrow off the glass (PTRREPAINT; `video/cursor.rs::cursor11_rollup`), and
+# `flicker_frames` is required 0 on every board. The rollup's own verdict ladder puts FLICKER above
+# every other rung precisely so the line cannot report a blinking pointer as `THROUGH` — but nothing
+# downstream READ that, so a flicker regression rode a green gate.
+#
+# `-> BRACKETED` is deliberately NOT here, though the same line emits it. BRACKETED is a legitimate
+# state: it means the compose-through did not reach the pixels the pointer was over, which under a
+# present storm is the expensive-but-correct answer (rmbp-ledger A11's chop half, still open). A
+# FORBID on it would red a boot that behaved exactly as designed — wrong-strict, which LAWS §5 rates
+# worse than wrong-lenient.
+#
+# Order is load-bearing beyond this file: `tools/foreman/src/verdict.rs` carries a copy of this list
+# and `cargo test -p foreman --test agreement` asserts the two render byte-identical tables, which
+# compares directives positionally. Append here, append there.
+DEFAULT_FORBIDS = [r"-> FAIL", r"FAIL ::", r"PANIC", r"-> FLICKER"]
 
 KIND_ORDER = {"COMPLETE": 0, "REQUIRE": 1, "COUNT": 2, "PENDING": 3,
               "OPTIONAL": 4, "FORBID": 5}
@@ -795,6 +812,19 @@ CANNED_TAIL = (
     b":: CAPSTONE COMPLETE \xe2\x80\x94 all 6 verified ::\r\n"
 )
 CANNED_BAD = b":: U9: write-back -> FAIL (sector mismatch) ::\r\n"
+# CURSOREMIT — the two `[cursor11]` verdicts the new default FORBID has to tell apart, taken
+# verbatim from `video/cursor.rs::cursor11_rollup`'s format string so a rename of the line breaks
+# this test rather than silently disarming the FORBID. FLICKER must red; BRACKETED must not.
+CANNED_FLICKER = (
+    b"[cursor11] compose-through scope=desk passes=86 bracketed=30 px_deferred=2916 "
+    b"px_installed=972 px_redrawn=72 flicker_frames=3 px_absorbed=1841 absorb_refused=0 "
+    b"-> FLICKER\r\n"
+)
+CANNED_BRACKETED = (
+    b"[cursor11] compose-through scope=desk passes=86 bracketed=30 px_deferred=2916 "
+    b"px_installed=0 px_redrawn=4320 flicker_frames=0 px_absorbed=1841 absorb_refused=0 "
+    b"-> BRACKETED\r\n"
+)
 
 SELFTEST_SPEC = """\
 # mbench self-test spec
@@ -856,6 +886,21 @@ def run_self_test():
         _write(log2, CANNED + CANNED_TAIL + CANNED_BAD)
         rc, _ = muted(run_replay, log2, spec, quiet=True)
         check("replay: default FORBID '-> FAIL' fails the run", rc != 0)
+
+        # 2b. CURSOREMIT — the same for '-> FLICKER', and its CONTROL. A FORBID that cannot be shown
+        #     to fire is an absent one (LAWS §5), and a FORBID that cannot be shown to STAY QUIET on
+        #     the neighbouring verdict is a gate that will red a correct boot. Both halves, always
+        #     asserted together: the flicker log must fail, the bracketed log must pass.
+        log2f = os.path.join(td, "flicker.log")
+        _write(log2f, CANNED + CANNED_FLICKER + CANNED_TAIL)
+        rc, _ = muted(run_replay, log2f, spec, quiet=True)
+        check("replay: default FORBID '-> FLICKER' fails the run", rc != 0)
+        log2b = os.path.join(td, "bracketed.log")
+        _write(log2b, CANNED + CANNED_BRACKETED + CANNED_TAIL)
+        rc, table = muted(run_replay, log2b, spec, quiet=True)
+        check("replay: '-> BRACKETED' is NOT forbidden (control)", rc == 0)
+        if rc != 0:
+            print(table)
 
         # 3. replay FAIL on a missing REQUIRE
         log3 = os.path.join(td, "short.log")
