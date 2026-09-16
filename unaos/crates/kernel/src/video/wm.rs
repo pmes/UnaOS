@@ -4885,7 +4885,7 @@ pub fn composite() { if let Some(term) = super::panel_refuse_term() { super::not
                     let _ = COMP_DEAD_CORE.compare_exchange(usize::MAX, dead, AcqRel, Relaxed);
                     #[cfg(feature = "witness")]
                     {
-                        COMP_STEALS.fetch_add(1, Relaxed);
+                        COMP_STEALS.fetch_add(1, Relaxed); #[cfg(feature = "nvidia-kepler")] crate::drivers::gpu::pcihealth::w5_post_steal(me, dead, held, BLIT_AIM_CORE[dead.min(7)].load(Relaxed)); // W5I1 (PCIE-RP-RECOVERY.md §12.3 I1, rmbp-ledger B119): the post-steal BAR0 dump, from THIS core — the one that just took the gate — never from the sampler path (a non-posted read to the endpoint while the store is stuck cannot pass it and would park the service core; here the link is proven within 70–369 ms to be sinking the next holder's writes). One `:: W5: site=post-steal … ::` line, each register read once, no write, no lock, same print path as `GATE STOLEN` below. Same-line fold, LINE-NEUTRAL: `wm.rs` is ~26k lines and a line here would renumber every panic `Location` below it; cfg-erased knob-off with the call, so no byte moves.
                         COMP_OVERDUE_REPORTED.store(false, Relaxed);
                         // WEDGESRC — latch the death for the blit-debt ledger. Never cleared: the
                         // parked core stays parked, and `[wedge1] BLITAIM dead=[..]` beside a

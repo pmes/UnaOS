@@ -336,7 +336,7 @@ pub fn census(ep_bus: u8, ep_slot: u8, ep_func: u8) {
     let ep_cap = find_cap(ep_bus, ep_slot, ep_func, 0x10, PCIE_CAP_SPAN);
     let ep_ecam = ecam_page_verified(ep_bus, ep_slot, ep_func);
     // PCIH-OWN: record the window before anything else can return early. See `EP_ECAM`.
-    EP_ECAM.store(ep_ecam, Ordering::Relaxed);
+    EP_ECAM.store(ep_ecam, Ordering::Relaxed); w5_cache_bar0(ep_bus, ep_slot, ep_func); // W5I1 — BAR0 base cached here, before any early return, from config 0x10 (kepler::init maps it only after census returns); same-line fold so no line below moves
     let ep_aer = if ep_ecam != 0 { find_ext_cap(ep_ecam, 0x0001, EXT_CAP_SPAN) } else { 0 };
     census_line("ep", ep_bus, ep_slot, ep_func, ep_cap, ep_aer != 0);
 
@@ -1233,3 +1233,168 @@ pub fn note_wifi_census() {
         BW_WALKS_SINCE_ENUM.fetch_add(1, Ordering::Relaxed);
     }
 }
+
+// ── W5I1 — the POST-STEAL BAR0 DUMP from the stealing core (PCIE-RP-RECOVERY.md §12.3, I1) ─────────
+//
+// WHAT IT ANSWERS. W5SCOPE (§12.1) refuted every link-side branch of W5 on flights 8 and 9 with the
+// odometer alone: after each of the seven steals the NEW holder's CPU blits into the same BAR1 window
+// completed within 70–369 ms while the parked core's one store never retired (`revenants=0`). The
+// branch left standing is (d) — a per-core transaction lost or unacknowledged UPSTREAM of the root
+// port — and nothing in the tree has ever asked the DEVICE what it latched about that store. This is
+// the instrument that asks: one shot, from the core that just took the gate, reading the Kepler's
+// host-side BAR0 state and printing one `:: W5: site=post-steal … ::` line beside `GATE STOLEN`.
+//
+// WHY THIS SITE AND NO OTHER — the non-posted-read ordering rule. PCIe r3.0 §2.4.1 Table 2-40: a
+// Non-Posted Request must not pass a Posted Request. A BAR0 or ECAM read of the endpoint issued from
+// the SAMPLER path (the tripwire or the deadman, on the service core, WHILE the store is stuck) would
+// queue behind the stuck posted write if that write were at the root port, would never be
+// transmitted, would run no completion timer, and would park the service core — this laptop's only
+// serial carrier (§1.2, B114). §12.3 says so and refuses that site. Immediately AFTER the steal the
+// situation is different in the only way that matters: the link is PROVEN (on this capture, within
+// 70–369 ms of every steal) to be sinking the next holder's posted writes, so a non-posted read is
+// transmitted and bounded by the 50 ms completion timeout the boot measured (`cto=50us-50ms dis=0`),
+// and the reader is the live core the steal already chose — not the corpse, not the pump. Under
+// branch (d) the read is harmless; under the refuted branches it is the same read `wm.rs`'s next
+// holder is about to make a million times.
+//
+// THE RULES OF THE READ, each one a bound and not a habit:
+//   * exactly the registers §12.3 lists, each read ONCE, in §12.3's order; no loop, no poll, no
+//     retry, and NEVER a write — every one of these is a status latch or a fault record, and a write
+//     here would be the injector this instrument exists to rule out;
+//   * `0xBADFxxxx` is the nonexistent-PRI signature this tree already decodes (`kepler.rs`, the
+//     bar1-identity rung: `(x >> 16) == 0xBADF`) and `0xFFFFFFFF` is a completion timeout's all-ones;
+//     both are PRINTED AS READ — the value is the finding, and a reader who sees `badf` in a field
+//     knows that register does not exist on this part (the UNPINNED set below is nouveau's GF100
+//     family map, never verified on GK107, exactly as `kepler.rs:3799` says of `0x1700`);
+//   * one `serial_println!` through the same path `GATE STOLEN` uses, so the line cannot deadlock on
+//     a lock the dead core holds — this function takes no lock and allocates nothing;
+//   * NO CF8/CFC. The steal runs on an arbitrary core at an arbitrary instant; PCIH-NOCF8 forbids the
+//     unlocked address/data pair there. The endpoint's PCI Status comes through the ECAM page `census`
+//     verified ([`EP_ECAM`], a plain MMIO load), or prints `none` when `census` never verified one.
+//
+// THE REGISTERS (BAR0 byte offsets; `kepler.rs::regs` for the pinned ones):
+//   pinned    PMC_INTR_0 `0x000100` · PFIFO_INTR_0 `0x002100` · PFIFO flush `0x070000` (read only —
+//             bit 1 busy; the trigger write at `kepler.rs:1693` is `nvidia-kepler-pfifoflush`'s and is
+//             not made here)
+//   ep_pcists the endpoint's PCI Status word (config `0x06`, the upper half of the command|status
+//             dword at `0x04`) through the ECAM page `census` cached — the brief's "via config space
+//             through the census path". §12.3's table names the PBUS mirror `0x1804` for the same
+//             word; the config path was chosen because it is INDEPENDENT of BAR0: if every BAR0 field
+//             on the line reads all-ones and `ep_pcists` reads sane, the host interface's PRI path is
+//             dead while the PCIe core still answers config requests, which the mirror could not say
+//   UNPINNED  PBUS_INTR_0 `0x001100` · PRI fault addr/data `0x009084`/`0x009088` · PFIFO fault-unit
+//             mask `0x00259c` · BAR1 fault record `0x002840`/`0x2844`/`0x2848`/`0x284c` (unit 4 on
+//             the GK104 family: inst / vaddr lo / vaddr hi / info)
+//
+// WHERE BAR0 COMES FROM. `census` runs from `kepler::init` BEFORE that function reads and maps BAR0
+// (`kepler.rs:1384`), so the base is cached here from config `0x10` (`w5_cache_bar0`, folded onto the
+// `EP_ECAM.store` line in `census` so no line below it moves). Whether it is MAPPED at steal time is
+// not assumed: `kepler::init` can abort after `census` returns and before or after the map
+// (`probe-abort bar0-unmapped` / `bar1-unmapped` / `bar1-not-64bit`), so the dump asks the live page
+// tables the same question `kepler::init` asks (`arch::memory::translate`) and prints the short
+// `bar0=unmapped` form when the answer is no. On a machine with no GK107 (QEMU q35) `census` never
+// runs, the base stays 0, and the short form is what a steal prints there.
+//
+// `aim=` is `wm.rs`'s `BLIT_AIM_CORE[dead]` — the byte offset INTO THE PANEL SURFACE (`py * fb_row +
+// x0 * bpp`) of the dead core's last `copy_nonoverlapping`, the same value `GATE STOLEN` prints as
+// `blit_aim=`; the surface is at BAR1 + `0x20000` on the bench (`KDHEAD: … vram_off=00020000`), so the
+// BAR1 offset is `aim + 0x20000` and the bus address `0x90000000 + 0x20000 + aim`. It is carried
+// here so `bar1_fault`'s `lo/hi` can be compared against it on one line.
+//
+// SCORING (the outcome table is §12.3's, restated so the wire is readable without the doc):
+//   `bar1_fault=` info valid with lo/hi near aim+0x20000 → the GPU MMU faulted the parked store's
+//     page; (b) reopens as a page-table fault — but a faulted posted write is DROPPED, not held, so a
+//     parked core beside a fault is still (d) and the fault is a second defect
+//   `pbus_intr=` PRI TIMEOUT or `pri_fault=` nonzero → the PRI path wedged; (b) reopens for BAR0
+//     traffic, still not for the posted store
+//   `pfifo_intr=` MMU-fault bit with `fault_mask=0` → a fault `kepler.rs:1429`'s interrupt disable
+//     masked; read the record anyway
+//   all zero → the GPU latched nothing about the parked store; (d) stands alone
+//   every BAR0 field all-ones or `badf` while `ep_pcists` is sane → the PRI path is dead and the PCIe
+//     core is not; the read itself is the finding (and it RETURNED — the completion timeout bounded it)
+//
+// Read with `awk 'index($0,":: W5:")'`. This block is under the module's `nvidia-kepler` gate (the
+// same region `rp_at_wedge`'s call at `wm.rs:10469` sits in) and the call site is folded onto the
+// `COMP_STEALS.fetch_add` line at `wm.rs:4888` under `witness`, so a knob-off image moves by no byte.
+
+/// W5I1 — the endpoint's BAR0 base as `census` read it from config `0x10`/`0x14` (type-bits masked;
+/// the 64-bit high half OR'd in when the BAR says so). 0 until `census` runs, and 0 forever on a
+/// machine with no GK107 or an I/O-space BAR0, which the dump reports as `bar0=unmapped`.
+#[cfg(target_arch = "x86_64")]
+static W5_BAR0: AtomicU64 = AtomicU64::new(0);
+
+/// W5I1 — cache the endpoint's BAR0 base. Called once from [`census`] on the BSP inside `pci::init`,
+/// with the same CF8 accessors and in the same sequential phase every other config read there uses.
+/// Two config reads at most; no write.
+#[cfg(target_arch = "x86_64")]
+fn w5_cache_bar0(bus: u8, slot: u8, func: u8) {
+    let lo = unsafe { crate::arch::pci::read_config_32(bus, slot, func, 0x10) };
+    if lo & 0x1 != 0 || lo == 0xFFFF_FFFF {
+        return; // I/O-space BAR0, or no device answered: nothing MMIO to dump
+    }
+    let mut base = (lo & 0xFFFF_FFF0) as u64;
+    if (lo >> 1) & 0x3 == 0x2 {
+        let hi = unsafe { crate::arch::pci::read_config_32(bus, slot, func, 0x14) };
+        base |= (hi as u64) << 32;
+    }
+    W5_BAR0.store(base, Ordering::Relaxed);
+}
+
+/// W5I1 — one field that is either a 16-bit register or `none`, so the line keeps one token per
+/// field whether or not `census` verified the endpoint's ECAM page.
+#[cfg(target_arch = "x86_64")]
+struct W5Hex16(Option<u16>);
+#[cfg(target_arch = "x86_64")]
+impl core::fmt::Display for W5Hex16 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(v) => write!(f, "{:04x}", v),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// W5I1 — THE POST-STEAL DUMP. Called from `wm::composite`'s steal arm on the core that has just
+/// taken the gate (`from`), immediately after `COMP_STEALS.fetch_add` (`wm.rs:4888`), with the dead
+/// core, the hold length in ms and the dead core's last blit aim. Prints exactly one line and returns;
+/// see the block above for every rule it obeys and every register it reads.
+#[cfg(target_arch = "x86_64")]
+pub fn w5_post_steal(from: usize, dead: usize, held: u64, aim: u64) {
+    let bar0 = W5_BAR0.load(Ordering::Relaxed);
+    if bar0 == 0 || crate::arch::memory::translate(bar0).is_none() {
+        serial_println!(
+            ":: W5: site=post-steal from=c{} dead=c{} held={} bar0=unmapped ::",
+            from, dead, held
+        );
+        return;
+    }
+    // One volatile dword load per register, in §12.3's order. `bar0` is identity-mapped by
+    // `kepler::init`'s `map_mmio_window` (the same base `kepler::mmio_read` dereferences), and every
+    // offset below is inside the 16 MiB BAR0 the census sized.
+    let rd = |off: u64| unsafe { core::ptr::read_volatile((bar0 + off) as *const u32) };
+    let pmc_intr = rd(0x0100);
+    let pfifo_intr = rd(0x2100);
+    let flush = rd(0x7_0000);
+    let ep = EP_ECAM.load(Ordering::Relaxed);
+    let ep_pcists = if ep != 0 { Some((unsafe { ecam_read32(ep, 0x04) } >> 16) as u16) } else { None };
+    let pbus_intr = rd(0x1100);
+    let pri_addr = rd(0x9084);
+    let pri_data = rd(0x9088);
+    let fault_mask = rd(0x259c);
+    let bf_inst = rd(0x2840);
+    let bf_lo = rd(0x2844);
+    let bf_hi = rd(0x2848);
+    let bf_info = rd(0x284c);
+    serial_println!(
+        ":: W5: site=post-steal from=c{} dead=c{} held={} aim={:#x} pmc_intr={:08x} \
+         pfifo_intr={:08x} flush={:08x} ep_pcists={} pbus_intr={:08x} pri_fault={:08x}/{:08x} \
+         fault_mask={:08x} bar1_fault={:08x}/{:08x}/{:08x}/{:08x} ::",
+        from, dead, held, aim, pmc_intr, pfifo_intr, flush, W5Hex16(ep_pcists), pbus_intr,
+        pri_addr, pri_data, fault_mask, bf_inst, bf_lo, bf_hi, bf_info
+    );
+}
+
+/// aarch64 shim — `kepler::init` aborts before any steal can exist there; keeps an armed aarch64
+/// type-check green while emitting nothing, exactly as the shims above do.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn w5_post_steal(_from: usize, _dead: usize, _held: u64, _aim: u64) {}
