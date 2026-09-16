@@ -197,6 +197,63 @@ makes the go-red (restore the `Vec::new()` twin) red it at `mounts=0 table=3 …
 A board whose table binds nothing reports `table=0` and SKIPs, because an empty table honestly
 produces an empty tree and a witness that scored that FAIL would be a disk detector.
 
+### 3.2 LAUNCH ON x86 — the fourth shim, deleted (QUARRYLAUNCH, 2026-09-15)
+
+QUARRYX86 collapsed three shims and named a fourth it deliberately did not take: `launch`'s
+`cfg(not(target_arch = "aarch64"))` arm, which printed
+
+```
+[quarry] launch DECLINE path=… reason=no-vfs-on-this-arch (vfs.md 12.4)
+```
+
+and handed that sentence back to the path bar, so a double-click on a program did nothing on the
+rMBP. It cited the same dead §12.4 the other three did — and by the time it was measured it was
+citing it beside its own refutation, because the boot that printed the DECLINE also printed
+`[quarry] open volumes mounts=["/", "/apps", "/boot"] roots=["/"] tree-rows=7` and a census listing
+the `APPS/` tree. The path the operator double-clicks resolves on x86; the shim said it could not.
+
+**The spawn half was never missing, and this file's own code said so.** `live.rs`'s rmbp-7 note on
+`reap_jobs` reads *"x86 has `arch::syscall::spawn_user_image_bg` and `bg_poll` with the same
+signatures … What is missing on x86 is the mount table"* — and `video/desktop_uefi.rs` has been
+launching `STAT.ELF` through that exact function, with the same `wm::app_name_arm(owner_of_launch(…))`
+naming seam, on every `wc` boot. So the shim is deleted and x86 takes the aarch64 body, exactly as the
+three listing shims did. Nothing is folded in and nothing is invented.
+
+**Two `cfg`s remain inside the one body, and both are hardware facts with the reason stated (LAWS
+§3).** They are `shell::read_el0_image`'s two splits, copied rather than re-argued, because that
+function is this tree's other launcher and answers the same question about the same kind of file:
+
+| split | aarch64 | x86 | why it is a property of the chip |
+|---|---|---|---|
+| read ceiling | `uslots::USER_REGION_SIZE` | `arch::syscall::user_window_size()` | the ring-3 window each arch MAPS |
+| `e_machine` | 183 (EM_AARCH64) | 62 (EM_X86_64) | the instruction set each CPU DECODES |
+
+Everything else — the stat, the directory / empty / oversize refusals, the read, the ELF pre-check,
+the spawn, the window name, the job row and every witness line — is one body. The aarch64 refusal text
+is byte-for-byte what it was (`WANT_NAME` renders `"aarch64"` there). The dispatch is still two-way,
+not one: the ringless arm (`aarch64` with `desktop_firmware` and none of `baremetal` / `tegra_el0` /
+`virt_el0`) keeps its `REFUSED reason=no-el0-layer`, which is a fact about a build with no rings and
+not a board twin. The merged body's predicate is `reap_jobs`'s, character for character — the two are
+the two halves of one job table, and a build that can poll it can launch into it.
+
+**The fixture** is `launch_selftest` (`witness` + `quarry`), chained from both family arms beside
+`vol_selftest`:
+
+```
+:: QUARRYLAUNCH: path=/apps/VUG.ELF bytes=<n> seam=quarry::live::launch->arch::syscall::spawn_user_image_bg
+   jobs=0->1 row=Some((<pid>, <asid>)) line="started pid <pid>" started=true row_added=true
+   match=true -> LAUNCHED ::
+:: QUARRYLAUNCH: cleanup pid=<pid> asid=<asid> -> <verdict> ::
+```
+
+It drives `launch` directly rather than the gesture, on `vol_selftest`'s principle that the thing
+under test must not also be the thing doing the measuring — the gesture-to-`Act::Launch` half above it
+is arch-neutral code the door and press fixtures already drive, so re-driving it would widen the
+fixture without widening the claim. It kills the job it starts and reaps the row, so no job, window or
+ASID survives into the fixtures after it. A board with no program source mounted SKIPs, naming every
+candidate it asked for. **Go-red:** restore the deleted x86 arm and it reds with
+`jobs=0->0 line="no VFS mount table on this arch yet (vfs.md 12.4)" started=false -> FAIL`.
+
 ---
 
 ## 4. Scrolling — the audit, the verdict, and what was built
