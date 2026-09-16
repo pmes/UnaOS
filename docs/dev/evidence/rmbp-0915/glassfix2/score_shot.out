@@ -1,0 +1,44 @@
+PNG 1280x800
+[A] desktop bg (45, 43, 85)
+wire: drop=143x65+40+34 title_x=40 bar_h=34 font=chrome20-bold -> ALIGNED
+[px] drop LEFT edge  x=40 (row y=36; x=39 is desktop)  title glyph cell x=40  dx=0
+[px] drop TOP  edge  y=34 (col x=111; y=33 is bar)  bar bottom=34  dy=0
+[px] "Glass" BAR  (40,7) 45x20 bg=(74, 115, 170) ink=(255, 255, 255)
+[px] "Glass" MENU (125,39) 45x20 bg=(236, 236, 238) ink=(37, 38, 41)
+[px] alpha delta max=0.009 mean=0.0012 >0.25: 0 of 900
+[px] ink px (alpha>0.5) bar=174 menu=174 delta=0
+  bar  000000000046662000000000000000000000000000000
+  menu 000000000046662000000000000000000000000000000
+  bar  004999930048993000000000000000000000000000000
+  menu 004999930048993000000000000000000000000000000
+  bar  059976820000693000000000000000000000000000000
+  menu 059976820000693000000000000000000000000000000
+  bar  199200000000693000025775100004776400004776400
+  menu 199200000000693000025775100004776400004776400
+  bar  496000000000693000059899910059999900059999900
+  menu 396000000000693000059889910059999900059999900
+  bar  594026640000693000001005940079400200079400200
+  menu 594026640000693000000005940079400100079400100
+  bar  594049970000693000015678940049973000049973000
+  menu 594049970000693000015678940049973000049973000
+  bar  496001970000693000099647940003799700003799700
+  menu 496001970000693000089646940003799700003799700
+  bar  199100970000693000297005940000019920000019920
+  menu 199100970000693000297005940000019920000019920
+  bar  069966970035897420199569940087669910087669910
+  menu 069966970035897420199569940087669910087669910
+  bar  005999950199999970059983940079999400079999400
+  menu 005999950199999960059983940079999400079999400
+  bar  000010000000000000000000000000100000000100000
+  menu 000000000000000000000000000000100000000100000
+:: GLASSFIX-PX: dx=0 dy=0 alpha_over_0.25=0 ink_delta=0 :: PASS ::
+[B] open drop-down rect from the wire: 143x65+40+34
+[B] close disc at (29,56) painted 11x24 of 24x24 area=190 cover_x=40 -> COVERED-BY-MENU drop-down at x=40
+[B] discs=1 covered_by_window=0
+[C] re-derived from the PNG: h=800 -> scale=1 compositor=9x9 backbuffer=18x18 owns_paint=1 => over-backdrop 9, over-window 9
+[C] the wire said:           scale=1 compositor=9x9 backbuffer=18x18 => over-backdrop 9, over-window 9, same=1
+[C] independent arithmetic AGREES with the witness
+[C] fixture preconditions: minted=4/4 rows_scanned=4 armed_control=1
+[D] [deskcascade] fit lines=0 verdicts=none  (this desktop opens no console window — `fbcon::CONSOLE_WIN` is WIN_NONE, so the cap has no subject here; CASCADEFIT's rule is measured on the aarch64 leg, see GLASSFIX2.md)
+[D] [wm] tile-fit lines=47 aliased=0
+:: GLASSFIX2-PX: discs=1 covered_by_window=0 sprite_backdrop=9 sprite_window=9 same=1 cascade_overlaps=0 pulse_over_console=0 windows=4 minted=4 control=1 deskcascade=0/0FIT tilefit=47/47DISTINCT wire=PASS :: PASS ::

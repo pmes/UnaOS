@@ -131,3 +131,34 @@ falls back to the unnamed clause it started at. Its verdict:
 
 A full window table makes `row=skip` — that leg alone, never the verdict, so the six legs already
 measured are not thrown away and the wire is never silent about a fixture that ran.
+
+## 8. A window the desktop opens at boot never covers another's title bar (SO12 / S15)
+
+A title bar is the only affordance a window has: its close disc, its drag handle, its name. A desktop
+that opens a window over another window's title bar has opened a window the operator cannot close,
+move or identify — and unlike a drop-down, **nothing dismisses it**. So: **a menu may cover a title
+bar; a window may not.**
+
+Two mechanisms hold the rule, and they are different because the two populations are:
+
+* **Tiled windows** — `wm::place` is a FLOW TILER, not a cascade: rows are laid left to right at
+  `theme::GAP` spacing and wrap, so two tiled boxes cannot share a pixel at all, which is stronger
+  than the Mac's fixed-step cascade. The one arm that could collide is the last-resort clamp, and
+  TILEFIT walks a clamped row UP the work area until its box is distinct, reporting
+  `[wm] tile-fit … alias=none -> DISTINCT`.
+* **Pinned windows** — `place` skips them (`if !r.used || r.compat || r.pinned { continue; }`), so the
+  tiler governs nothing about them, and the pulse monitor is one. CASCADEFIT is that pair's rule:
+  `pulsewin::boot_keepout_top` publishes the pulse's prospective box top less one `BORDER * 2`
+  gutter, and `fbcon::console_work_bottom` caps the console's work-area bottom at it. **The console's
+  HEIGHT shrinks; its width and its `x` do not move** — the complaint is fixed in place, never by
+  relocating the furniture (LAWS §6). Stated on the wire as
+  `[deskcascade] fit console=… pulse=… overlap_rows=N -> FIT|OVERLAP`, so the line is the rule rather
+  than a description of it, and `pulse=none` on a desktop that opens no pulse window is `FIT` because
+  the rule is satisfied, not skipped.
+
+Scored over BOTH populations every boot, not argued: `wm::glassfix2_selftest` (behind `witness`)
+mints four rows through the real `create`, lets the tiler place them, and counts the ordered pairs
+whose outer box covers another's title band — and then, before it takes them down, walks one of them
+ONTO another's title bar through the real `move_to` and asserts that it SAW that. **A detector that
+can only ever print zero is not a detector**, so `control=0` red-lines the verdict even when the live
+scan is clean.

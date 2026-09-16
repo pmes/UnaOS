@@ -26143,7 +26143,7 @@ pub fn dmgovlp_selftest() {
         serial_println!("[dmgovlp] teardown LEAK — {} fixture row(s) still live -> FAIL", leaked);
     }
     // Un-name the synthetic focus owner, drop the shell back, repaint the live set.
-    focus_reset();
+    focus_reset(); glassfix2_selftest(); // GLASSFIX2 — SO5 + SO12/S15, scored on rows this fixture mints and the tiler places. ⚠ SAME-LINE fold, line-NEUTRAL and AHEAD of this line's first `//`: `wm.rs` compiles into the knob-off `kernel8.img` whose byte-identity is the Pi track's standing proof, and panic `Location`s below embed line numbers (PARITY.md §5.3, LEDGER P7 — a statement appended AFTER the `//` would be a comment, compile nothing, and leave the check green). No `cfg` of its own: this function already carries `all(x86_64, witness, wc)`, which is the fixture's exact predicate. HERE and not at the demo chain's tail (SHOTMENU's place) because this fixture reads GEOMETRY, not focus — `dmgovlp_selftest` has just closed every row it minted and reset focus, so the table it leaves is the desktop's own, and no later launcher can dismiss a number the way an app-owner change dismisses an open menu. Definition at this file's tail; see it for both rows' mechanisms.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -28238,4 +28238,276 @@ pub fn cursor12_offer_counts() -> (u64, u64, u64) {
         CUR3_PLANNED.load(Relaxed),
         CUR12_NOHIT.load(Relaxed),
     )
+}
+
+// =================================================================================================
+// GLASSFIX2 — the two desktop glass rows QUEUE §1 still carried: SO5 (one cursor, one size) and
+// SO12 / S15 (no window the desktop opens at boot covers another's title bar).
+// (TAIL-APPENDED: nothing above this line moves, so knob-off panic `Location` line numbers are
+// untouched — PARITY.md §5.3. The one call this arc adds is FOLDED onto an existing statement in
+// `dmgovlp_selftest`, ahead of that line's first `//`, so this file is N->N above its own tail.)
+// =================================================================================================
+//
+// NEITHER ROW WAS OPEN IN THIS TREE, and this fixture is written so that reading is SCORED on the
+// wire rather than argued in a report.
+//
+// ### SO5 — "the mouse cursor grows when over desktop background"
+//
+// There are two arrow sprites in this kernel and they are drawn at two different block scales:
+//
+//   * `video::cursor`, the COMPOSITOR sprite, front buffer, `side = (ui::BASE_CELL + 1) * s` where
+//     `s = ui::Metrics::for_height(PANEL height).scale` (`cursor::draw_locked`, `cursor::block_scale`)
+//     — 9·s px, and derived from the PANEL, so it is one size on every surface by construction;
+//   * `pal::cursor`, the BACK-BUFFER sprite, `extent = 9 * sprite_scale` with
+//     `sprite_scale = metrics().scale + 1` — 9·(s+1) px.
+//
+// WHICH ONE REACHES GLASS is decided by the desktop present's occluder subtraction. Over a WINDOW
+// the back buffer's spans are subtracted and only the compositor's arrow survives; over the BACKDROP
+// nothing subtracts them, so on a board where BOTH sprites are live the backdrop shows the 9·(s+1)
+// arrow and a window shows the 9·s one. Nothing grows: a bigger sprite stops being covered.
+//
+// `pal::cursor::SPRITE_OWNS_PAINT` is what decides whether both are live, and it is
+// `cfg!(target_arch = "x86_64")`. **On x86 it is TRUE**: `draw` / `draw_over` / `repaint_on_move`
+// hand off to `video::cursor` and `pal::cursor::paint` never runs, so there is ONE sprite on the
+// panel, at one size, over every surface — which is the Mac rule, satisfied here by construction
+// rather than by a coincidence of numbers. On aarch64 the constant is FALSE and both are live; that
+// is the board SO5 was seen on, and its fix is the `+ 1` in `pal::cursor::sprite_scale` — a file
+// outside this arc's lane. This fixture computes the predicate the fix will be scored by, and it
+// reads `same=1` here because the x86 desktop already satisfies it, not because it cannot fail: see
+// the go-red in `docs/dev/evidence/rmbp-0915/glassfix2/GLASSFIX2.md`.
+//
+// ### SO12 / S15 — no window over another's title bar
+//
+// The Mac rule the rows state is "a cascade offsets each new window so every title bar stays
+// visible". This desktop satisfies a STRONGER property, and by a different mechanism: [`place`] is a
+// FLOW TILER, not a cascade — it lays rows left to right at `GAP` spacing, wraps, and TILEFIT's
+// cascade arm walks a clamped row UP the work area until its box is distinct — so two tiled windows
+// cannot share a pixel, let alone a title bar. The windows that CAN collide are the ones the tiler
+// skips: `pinned` rows (`place`'s own `if !r.used || r.compat || r.pinned { continue; }`), which is
+// exactly the pulse monitor, and exactly what SO12 and S15 were about. CASCADEFIT (`9b1a0605`) fixed
+// that pair at its source — `pulsewin::boot_keepout_top` publishes the pulse's prospective box top
+// less one `BORDER * 2` gutter and `fbcon::console_work_bottom` caps the console's work area at it,
+// so the console's HEIGHT shrinks and neither its width nor its `x` moves (a fix IN PLACE; LAWS §6).
+//
+// This fixture asks the rows' question of the LIVE table instead of of one placement path: for every
+// ordered pair of live, non-compat windows, does `i`'s outer box cover `j`'s title band
+// (`TITLE_H + BORDER` rows off the top of `j`'s box)? `overlaps=0` is the rule. It then names the
+// pulse/console pair specifically, because that is the pair S15 is written about and the one the
+// tiler does not govern.
+//
+// Half-open spans throughout, which is how `wm` states a box, so two boxes that touch edge to edge
+// overlap on zero rows; and the x test comes FIRST, so the number means "is a title bar covered"
+// rather than "do these share a scanline" — `fbcon::box_overlap_rows`'s rule, restated here for the
+// same reason the sprite arithmetic is restated: a shared helper would make the answer agree by
+// construction and this witness exists to report whether it DOES.
+//
+// THE FIXTURE MINTS ITS OWN ROWS AND CARRIES AN ARMED CONTROL, and both are corrections made by
+// measurement rather than by taste. The first cut read the table as it found it, at the tail of
+// `dmgovlp_selftest` — which has just CLOSED its own six rows — and the wire came back
+// `overlaps=0 n=0`: a rule satisfied over the empty set. So four rows are minted here through the
+// real `create`, and the tiler places them; then, before they are taken down, one of them is walked
+// onto another's title band through the real `move_to` and the scan is re-run, and the fixture
+// reports whether it SAW that (`control=1`). A detector that can only ever print zero is not a
+// detector, and `control=0` red-lines the verdict even when the live scan is clean.
+//
+// Cost: four creates, one move, two passes over a 12-row table and one serial line, once per boot,
+// behind `witness`, at the tail of a fixture that has just done strictly more of all of it.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wc"))]
+pub fn glassfix2_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Relaxed) {
+        return;
+    }
+    /// Four owners, kernel-band and pace-exempt, disjoint from `dmgovlp_selftest`'s 0x40..0x45.
+    const OWNERS: [u64; 4] = [
+        KERNEL_OWNER_BASE + 0x48,
+        KERNEL_OWNER_BASE + 0x49,
+        KERNEL_OWNER_BASE + 0x4A,
+        KERNEL_OWNER_BASE + 0x4B,
+    ];
+    const _: () = assert!(is_kernel_owner(OWNERS[0]) && is_kernel_owner(OWNERS[3]));
+    const _: () =
+        assert!(OWNERS[0] != KERNEL_OWNER_CONSOLE && OWNERS[0] != KERNEL_OWNER_DESKTOP);
+
+    // Panel geometry only — no framebuffer byte is touched, and the guard is a temporary of this
+    // statement, so the table lock below can never be taken under `WRITER` (the cycle `erase`'s
+    // own note warns about).
+    let fb = *super::WRITER.lock();
+    if !fb.is_ready() {
+        serial_println!(":: GLASSFIX2: no panel :: SKIP ::");
+        return;
+    }
+    let (pw, ph) = (fb.info().width, fb.info().height);
+
+    // ---- SO5: one cursor, one size, everywhere ------------------------------------------------
+    // Each module's own expression, RESTATED rather than borrowed — see the header.
+    let s = crate::ui::Metrics::for_height(ph).scale;
+    let comp = (crate::ui::BASE_CELL + 1) * s;
+    let back = 9 * (s + 1);
+    // Over a window the back buffer is subtracted, so the compositor's arrow is the only one that
+    // can land; over the backdrop it lands too, unless this arch has retired it.
+    let over_window = comp;
+    let over_backdrop = if crate::pal::cursor::SPRITE_OWNS_PAINT {
+        comp
+    } else {
+        back
+    };
+    let sprite_same = over_backdrop == over_window;
+
+    // ---- SO12 / S15: no window covers another window's title bar ------------------------------
+    // Half-open spans, `wm`'s own convention, so two boxes that touch edge to edge overlap on zero
+    // rows; and the x test comes FIRST, so the number means "is a title bar covered" rather than
+    // "do these share a scanline" (`fbcon::box_overlap_rows`'s rule, restated — see the header).
+    let rows_over = |a: (usize, usize, usize, usize), b: (usize, usize, usize, usize)| -> usize {
+        if a.0.max(b.0) >= (a.0 + a.2).min(b.0 + b.2) {
+            return 0;
+        }
+        (a.1 + a.3).min(b.1 + b.3).saturating_sub(a.1.max(b.1))
+    };
+    let title_band =
+        |b: (usize, usize, usize, usize)| (b.0, b.1, b.2, (TITLE_H + BORDER).min(b.3));
+    // Every live, non-compat row's outer box, snapshotted with the lock RELEASED before any serial
+    // write (`tile-fit`'s discipline).
+    let census = |bx: &mut [(usize, usize, usize, usize); MAX_WINDOWS],
+                  bid: &mut [WinId; MAX_WINDOWS]|
+     -> usize {
+        let t = table();
+        let mut n = 0usize;
+        for r in t.rows.iter() {
+            if !r.used || r.compat {
+                continue;
+            }
+            bx[n] = outer_box(r);
+            bid[n] = r.id;
+            n += 1;
+        }
+        n
+    };
+    let scan = |bx: &[(usize, usize, usize, usize); MAX_WINDOWS],
+                bid: &[WinId; MAX_WINDOWS],
+                n: usize|
+     -> (usize, WinId, WinId, usize) {
+        let (mut count, mut wa, mut wb, mut wr) = (0usize, WIN_NONE, WIN_NONE, 0usize);
+        for i in 0..n {
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                let rows = rows_over(bx[i], title_band(bx[j]));
+                if rows > 0 {
+                    count += 1;
+                    if rows > wr {
+                        wr = rows;
+                        wa = bid[i];
+                        wb = bid[j];
+                    }
+                }
+            }
+        }
+        (count, wa, wb, wr)
+    };
+
+    // FOUR ROWS, MINTED THROUGH THE REAL `create` SO THE TILER PLACES THEM. Reading the table as
+    // this fixture finds it is not a measurement: `dmgovlp_selftest` has just closed its own six
+    // rows, and the first cut of this fixture read `n=0` and reported `overlaps=0` over nothing —
+    // a verdict that cannot fail is not a verdict. The boxes below are `place`'s, never this
+    // function's; a geometry this fixture chose would be testing its own arithmetic.
+    let surf = &raw const HT_SURF as usize;
+    let len = core::mem::size_of_val(&HT_SURF);
+    let titles: [&[u8]; 4] = [b"gf2a", b"gf2b", b"gf2c", b"gf2d"];
+    let mut w = [WIN_NONE; 4];
+    for i in 0..4 {
+        w[i] = create(
+            OWNERS[i],
+            surf,
+            len,
+            FIX_W as u32,
+            FIX_H as u32,
+            FIX_STRIDE as u32,
+            titles[i],
+        );
+    }
+    let minted = w.iter().filter(|&&id| id != WIN_NONE).count();
+
+    let mut bx = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
+    let mut bid = [WIN_NONE; MAX_WINDOWS];
+    let n = census(&mut bx, &mut bid);
+    let (overlaps, wa, wb, wr) = scan(&bx, &bid, n);
+
+    // THE ARMED CONTROL. A detector that only ever prints zero proves nothing, so before the rows
+    // are taken down one of them is deliberately walked ONTO another's title band through the real
+    // `move_to` verb (the same seam a drag uses), the scan is re-run, and the fixture asserts that
+    // it SAW the violation. `control=1` is the fixture saying its own eyes work on this boot;
+    // `control=0` red-lines the verdict even when the live scan is clean, because a clean scan from
+    // a blind detector is the failure mode this arm exists to catch.
+    let mut control = false;
+    if minted == 4 && n >= 2 {
+        // Target: the first row's title band, entered from one BORDER inside its left edge and one
+        // row below its top, which is inside the band by construction (`TITLE_H` is 34 and the
+        // step is `BORDER` = 5).
+        let victim = bx[0];
+        if move_to(w[3], victim.0 + BORDER, victim.1 + TITLE_H + BORDER + 1) {
+            let mut cbx = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
+            let mut cbid = [WIN_NONE; MAX_WINDOWS];
+            let cn = census(&mut cbx, &mut cbid);
+            control = scan(&cbx, &cbid, cn).0 > 0;
+        }
+    }
+    for &id in w.iter() {
+        if id != WIN_NONE {
+            close(id);
+        }
+    }
+    focus_reset();
+
+    // S15's own pair, named: the pulse monitor's window never covers the console. Both ids are
+    // `WIN_NONE` on a desktop that opened neither — `false`, and honestly so; the `console=`/
+    // `pulse=` fields say which desktop this reading came from.
+    let console = super::fbcon::console_win();
+    let pulse = super::pulsewin::win();
+    let (mut pbox, mut cbox) = (None, None);
+    for i in 0..n {
+        if bid[i] == pulse {
+            pbox = Some(bx[i]);
+        }
+        if bid[i] == console {
+            cbox = Some(bx[i]);
+        }
+    }
+    let pulse_over_console = match (pbox, cbox) {
+        (Some(p), Some(c)) => rows_over(p, c) > 0,
+        _ => false,
+    };
+
+    let pass = sprite_same && overlaps == 0 && !pulse_over_console && minted == 4 && control;
+    serial_println!(
+        ":: GLASSFIX2: sprite same={} backdrop={}x{} window={}x{} scale={} owns_paint={} \
+compositor={}x{} backbuffer={}x{} | cascade overlaps={} worst=win{}-over-win{}:{}rows minted={}/4 \
+n={} control={} panel={}x{} | console=win{} pulse=win{} pulse_over_console={} -> {} ::",
+        sprite_same as u8,
+        over_backdrop,
+        over_backdrop,
+        over_window,
+        over_window,
+        s,
+        crate::pal::cursor::SPRITE_OWNS_PAINT as u8,
+        comp,
+        comp,
+        back,
+        back,
+        overlaps,
+        wa,
+        wb,
+        wr,
+        minted,
+        n,
+        control as u8,
+        pw,
+        ph,
+        console,
+        pulse,
+        pulse_over_console as u8,
+        if pass { "PASS" } else { "FAIL" }
+    );
 }
