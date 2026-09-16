@@ -2644,3 +2644,64 @@ until someone proves a safe non-powergated vblank source.
 - The multi-user chain's Orin status is tracked in ROADMAP §1 (the Jetson lane
   took the panel shell instead of the userspace port); its bring-up is the
   current arc's M1b, not a parity row.
+
+---
+
+## §9 QUARRYDOCK — the file manager has no door on x86, and the dock could not say so
+
+Peter, flights 8 and 9 on the rMBP (2026-09-16, both boots): *"there is no quarry"*. This section is
+the measurement behind that sentence, and it is a **class (a) PORT IT** row running the unusual way —
+the Pi and the Orin have the experience and **x86 does not**.
+
+**What the flight capture says.** `~/unaos-bench/capture/rmbp12-flight8/ttyUSB0.log`, 11,265 lines,
+287 of them `[dock]`. Every census on that wire reads `tiles=3` and names its tiles by `(id, gen)`
+(`[dock] census tiles=3 win:gen=3:1,1:1,2:2`); presses route and windows raise (`[dock] press
+tile=1/3 -> win=1 gen=1 raised=yes`), so the strip and its router are healthy. The dock is simply
+three live rows and no pins. The only line on the whole wire that says why belongs to another
+subsystem: `:: APPQUIT: app=quarry not compiled (UNAOS_QUARRY unset) — no window to quit :: SKIP ::`.
+Zero `[quarry]` lines, zero `[deskquarry]` lines.
+
+**Cause 1 — the image does not carry the module.** `arroyo:1524` maps the knob
+(`[ -n "${UNAOS_QUARRY:-}" ] && _feats="${_feats}quarry,"`) and the flight-8 build line
+(`~/unaos-bench/flash/rmbp/MANIFEST`, `kernel.elf sha256=f4b2ca01…`, built from `hw-rmbp@bf299a37`)
+carries 32 knobs and **not that one**. With `quarry` off, `dock::pin_quarry` is its
+`#[cfg(not(feature = "quarry"))]` twin and `pin_quarry_wanted` is the `false` twin, so the pin set is
+arithmetically correct and empty. Nothing in `video/dock.rs` is at fault for flight 8.
+
+**Cause 2 — and this one survives arming the knob: on x86 there is no door to Quarry at all.**
+Enumerated over `unaos/crates/kernel/src`, comments excluded:
+
+| seam | call sites | gate |
+|---|---|---|
+| `quarry::open()` | `video/desktop_firmware.rs:414` (step 6 of `activate()`) | `desktop_firmware` |
+| `quarry::service()` (drains the reopen latch) | `main.rs:8898` (render service), `arch/aarch64/syscall.rs:14324` (click router) | `desktop_firmware`, both on aarch64 paths |
+| `quarry::request_open()` (sets the latch) | `video/dock.rs:1067`, `main.rs:9480` | `quarry` (shared dock press), aarch64 |
+
+`desktop_firmware` is **not** in the `x86-all` feature leg (`arroyo:4310`; `quarry`, `livecon` and
+`facet` are). So on any x86 image: nothing opens Quarry at boot, and the x86 click router
+(`arch/x86_64/syscall.rs:7497`, `#[cfg(feature = "wc")] if dock::press_at(x, y) { … return true; }`)
+calls `dock::press_at` **directly** — it never reaches the `strip::press_route`-then-`quarry::service`
+pair the aarch64 router uses. `dock::press_at`'s QUARRY-PIN arm latches the open exactly as designed
+(a click router does no directory I/O — Pi boot 11's 16 KiB overflow is why), and on x86 **no pass
+ever drains that latch**. Today the only thing on x86 that reaches this file is a witness selftest:
+`crystal::selftest`'s tail → `quarry::door_selftest` (`video/quarry/live.rs:3297`), which is how
+QUARRYX86 measured the volume list on 2026-09-15 without there ever being a desktop route.
+
+The repair is one statement in the x86 router, the twin of `arch/aarch64/syscall.rs:14324`'s, and it
+is **owed** — it is outside this arc's named files and is reported as a STOP, not taken.
+
+**What this arc built: the dock now states its own pin set.** `[dock] census` names the tiles a strip
+HAS; nothing named the tiles the image was BUILT to carry, which is why flight 8 sent its reader to
+`APPQUIT` to answer a taskbar question. `video/dock.rs`'s QUARRYDOCK block adds one line, printed once
+per boot from `compose` on the first non-empty strip:
+
+```
+[dock] pins=2 quarry=no console=yes shell=yes pulse=no tiles=3 quarry_compiled=no ::
+```
+
+`quarry_compiled` is `cfg!(feature = "quarry")` and is the field that separates the two failures a
+bare `quarry=no` conflates — **not in the image** (flight 8) from **in the image and not pinned**
+(a live Quarry window owns its own row, or the pin declined). Those want opposite repairs, and the
+flight capture forced a guess between them. Arch-neutral: it reads the settled model both chips
+assemble (R16). Go-red is dropping `pin_quarry` from `compose`'s chain — `quarry=no` with
+`quarry_compiled=yes`, which is the second failure and is distinguishable on the wire from the first.

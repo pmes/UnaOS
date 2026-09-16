@@ -786,7 +786,7 @@ pub fn compose() -> bool {
     let n = pin_console(&mut rows, n); let n = pin_shell(&mut rows, n); // CONSOLEPIN — the CONSOLE window's own reopen tile, applied FIRST so the settled strip reads `[quarry] [live rows…] [console] [shell] [pulse]`: the console's pin sits where its live row sat, immediately left of the permanent shell tail. Permanent since APPPIN (R49): the console is a pinned app and its tile is always on the strip. Folded, not added — PARITY.md §5.3.
     // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
     // `[quarry] [live windows…] [shell]`, the macOS order Peter's direction names.
-    let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); settle(&mut rows, n, true); // A30 — the pulse instrument's reopen tile, APPENDED after the shell's so the settled strip reads quarry, live rows, shell, pulse. A no-op unless `pulsewin::ever_armed()`, i.e. on every desktop that never had the window. Folded, not added — PARITY.md §5.3. DOCKID — the model is SETTLED here and only here: reconcile the tile registry against the assembled model (the one mutating call in the block, so the registry has exactly one writer), then sort into strip order. Ordering is what render11's defect was — `[dock] press … tile=4/5 pulse=pin` and `tile=4/5 win=8` one pixel apart, because reopening the furniture teleported win 8's tile from index 1 to index 4. See the DOCKID block at this file's tail. ⚠ FOLDED onto this line rather than added below it — PARITY.md §5.3.
+    let n = pin_quarry(&mut rows, n); let n = pin_pulse(&mut rows, n); settle(&mut rows, n, true); pins_census_once(&rows, n); // QUARRYDOCK — the pin census, ONCE, on the settled model this line just produced: the flight-8 capture's 287 `[dock]` lines could not say whether the image carried a Quarry tile at all, and the only wire answer was another subsystem's `APPQUIT: app=quarry not compiled`. See the QUARRYDOCK block at this file's tail for why the latch is spent on the first NON-EMPTY strip and why `quarry_compiled=` is a separate field. ⚠ FOLDED onto this line rather than added below it, code BEFORE comment — PARITY.md §5.3. // A30 — the pulse instrument's reopen tile, APPENDED after the shell's so the settled strip reads quarry, live rows, shell, pulse. A no-op unless `pulsewin::ever_armed()`, i.e. on every desktop that never had the window. Folded, not added — PARITY.md §5.3. DOCKID — the model is SETTLED here and only here: reconcile the tile registry against the assembled model (the one mutating call in the block, so the registry has exactly one writer), then sort into strip order. Ordering is what render11's defect was — `[dock] press … tile=4/5 pulse=pin` and `tile=4/5 win=8` one pixel apart, because reopening the furniture teleported win 8's tile from index 1 to index 4. See the DOCKID block at this file's tail. ⚠ FOLDED onto this line rather than added below it — PARITY.md §5.3.
     // WCK5 — one relaxed add on the pass that was clobbered, and nothing at all on the quiet pass.
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
@@ -2543,4 +2543,115 @@ pub(super) fn pins_applied(n: usize, present: impl Fn(u64) -> bool) -> usize {
         n += 1;
     }
     n
+}
+
+// =================================================================================================
+// QUARRYDOCK (2026-09-16) — **the pin set, named on the wire, once per boot.**
+// =================================================================================================
+//
+// Peter, flights 8 and 9 on the rMBP: *"there is no quarry"* — both boots. The flight-8 capture
+// (`~/unaos-bench/capture/rmbp12-flight8/ttyUSB0.log`) could not say WHY, and that is the gap this
+// block closes. It holds 287 `[dock]` lines; every census among them reads `tiles=3` and names the
+// live rows by `(id, gen)` — `[dock] census tiles=3 win:gen=3:1,1:1,2:2` — so a reader learns the
+// strip had three tiles and learns NOTHING about which pins the image was built to carry. The one
+// line on that wire that answers the question is not a dock line at all:
+//
+//     :: APPQUIT: app=quarry not compiled (UNAOS_QUARRY unset) — no window to quit :: SKIP ::
+//
+// A taskbar census that cannot state its own pin set sends the next reader to another subsystem's
+// witness to find out what the taskbar contains. So this prints, once, on the first composed strip:
+//
+//     [dock] pins=2 quarry=no console=yes shell=yes pulse=no tiles=3 quarry_compiled=no ::
+//
+// `quarry_compiled` is `cfg!(feature = "quarry")` and is the field that separates the two failures
+// a bare `quarry=no` conflates: **not in the image** (the flight-8 answer — the module is absent,
+// `pin_quarry` is its `#[cfg(not(feature = "quarry"))]` twin, and no press can ever mint a tile) from
+// **in the image and not pinned right now** (a live Quarry window owns its own row, or the pin was
+// declined). Those two want opposite repairs, and the flight capture forced a guess between them.
+//
+// ONE-SHOT, and the latch is spent on the first NON-EMPTY strip rather than the first call: `compose`
+// runs before there is anything to compose (flight 8's first `[dock] live` reports `passes=1
+// paints=0`), and a census of an empty model would report `console=no shell=no` about a desktop that
+// simply had not been built yet. Cost on every later pass is one relaxed load, the same toll
+// `pin_pulse_wanted` already pays.
+//
+// Arch-neutral by construction — it reads the settled model `compose` assembled, which is the same
+// model on both chips (R16: subsystem, never board). The go-red is the brief's: drop `pin_quarry`
+// from `compose`'s chain and this line reads `quarry=no` with `quarry_compiled=yes`, which is the
+// second of the two failures above and is distinguishable on the wire from the first.
+static PINS_CENSUS_DONE: AtomicBool = AtomicBool::new(false);
+
+/// QUARRYDOCK — the file manager's owner id, or `None` when the module is not in this image.
+///
+/// `cfg`-gated in both polarities exactly as [`pin_quarry`] and `pin_quarry_wanted` are, so a build
+/// without the file manager compiles no reference to `quarry::OWNER` and the census still answers.
+#[cfg(feature = "quarry")]
+#[inline(always)]
+fn quarry_owner() -> Option<u64> {
+    Some(crate::video::quarry::OWNER)
+}
+
+/// QUARRYDOCK — the erasing twin. No file manager, no owner, and no live row can be one.
+#[cfg(not(feature = "quarry"))]
+#[inline(always)]
+fn quarry_owner() -> Option<u64> {
+    None
+}
+
+/// QUARRYDOCK — the three-letter answer, so the line is greppable rather than parsed.
+#[inline(always)]
+fn yn(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
+}
+
+/// QUARRYDOCK — **print the pin census once, on the first strip that has tiles.**
+///
+/// Takes the SETTLED model (after `settle`), so the counts are the ones the painter paints and the
+/// router routes over — not the pre-pin scan. A pinned tile is recognised by [`pin_word`], the same
+/// accessor [`census`] names tiles with; a LIVE window belonging to one of the three apps is
+/// recognised by its owner, so `quarry=yes` is true whether the file manager is up or pinned closed.
+fn pins_census_once(rows: &[wm::DockEntry; wm::MAX_WINDOWS], n: usize) {
+    if n == 0 || PINS_CENSUS_DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    if PINS_CENSUS_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let qown = quarry_owner();
+    let mut pins = 0usize;
+    let (mut quarry, mut console, mut shell, mut pulse) = (false, false, false, false);
+    for r in rows[..n].iter() {
+        match pin_word(r.id) {
+            Some(w) => {
+                pins += 1;
+                match w {
+                    "quarry" => quarry = true,
+                    "console" => console = true,
+                    "shell" => shell = true,
+                    _ => pulse = true,
+                }
+            }
+            None => {
+                if qown == Some(r.owner_asid) {
+                    quarry = true;
+                }
+                if r.owner_asid == wm::KERNEL_OWNER_CONSOLE {
+                    console = true;
+                }
+                if r.owner_asid == wm::KERNEL_OWNER_DESKTOP {
+                    shell = true;
+                }
+            }
+        }
+    }
+    serial_println!(
+        "[dock] pins={} quarry={} console={} shell={} pulse={} tiles={} quarry_compiled={} ::",
+        pins,
+        yn(quarry),
+        yn(console),
+        yn(shell),
+        yn(pulse),
+        n,
+        yn(cfg!(feature = "quarry"))
+    );
 }
