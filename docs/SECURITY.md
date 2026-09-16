@@ -664,3 +664,64 @@ The UNAFS-K3 mount became read-WRITE at K4: `fs/unafs.rs`'s `write_sector` route
 ### Process & supply chain
 - [ ] Adversarial review before metal and before merge on every arc (standing rule, `CLAUDE.md`)
 - [ ] Code-signing / "self vs non-self" loader check (design: `dev/OS/04_SECURITY_IMMUNITY/intrusion_detection.md`) — **U2 (x86, 2026-07-02) and M6g (aarch64, 2026-07-03) both landed the loadable-program path but NOT this check**: on both arches the FAT-loaded program is bounded only by size and contained by hardware isolation (ring-3/EL0 + per-page perms + the fault-kill net — see each arch ledger's untrusted-loader item). The gate must cover both loaders. Simple allowlist first, signatures when entropy + crypto land
+
+### Installer — what it refuses to touch
+
+The installer is the one subsystem that destroys data on purpose, so its guards are stated here as a
+table rather than as prose. Two rulings bound it. **R3** (Peter, 2026-09-03): *"if you want to do
+unattended reboots you cannot because there would be nobody to hold down option"* — on the 2012 rMBP
+the startup volume is chosen by a human at Apple's picker or by `bless`, never by us, so the
+installer never makes anything bootable behind the operator's back. **R25** (Peter, 2026-09-08):
+*"another way to think of it is like on the macbook if UnaOS saw catalina and immediately formatted
+the disk as an alien enemy."* A non-UnaOS disk is a **STRANGER**: the kernel never writes, formats or
+installs on its own initiative, and a disk changes only by an operator's explicit act.
+
+Before PARTINSTALL the only guard was **INSTALL-SELF** (`install/selfguard.rs`), which protects the
+disk we BOOTED from. rmbp-ledger B91 named the asymmetry: a good guard pointing the wrong way, which
+*"leaves every OTHER disk a legitimate candidate by construction"*. What follows points the other
+way — at the disk we merely SEE.
+
+Every row is a refusal with a stable `reason=` token on the serial wire, and every row is a
+partition on the QEMU fixture `scripts/make-gpt-fixture.py` builds, so each one is a guard that has
+been watched to fire rather than a guard that has been read.
+
+| `reason=` | asked | refused because | fixture case |
+|---|---|---|---|
+| `boot-device` | any target on the booted device | INSTALL-SELF: erasing it erases the running system. Asked FIRST — a blank boot device is still a boot device | `selfguard::selftest` decision table + `live_media_leg` |
+| `transport-read-only` | a SATA disk | `drivers/block.rs`'s `Ahci` handle refuses writes in every cfg and the image compiles no ATA write opcode. Named one layer above the transport so the operator reads a policy, not an I/O error | `transport_leg`, every run of the partition fixture |
+| `disk-has-foreign-volumes` | the WHOLE disk | the disk carries somebody else's filesystems; a whole-disk install lays a fresh GPT over all of them. The pre-existing `blank_check` could not answer this — "are the first 64 sectors zero" is false of every partitioned disk on earth, so it never distinguished a stranger's disk from a scratch one | the fixture disk as a whole (foreign=2) |
+| `partition-not-empty` + `content=` | one partition | the content probe found a filesystem. Reported with WHAT: `FAT`, `APFS`, `HFS+`, `UNAFS`, or `unknown`. **`unknown` is not empty** — a probe that cannot name what is there is the strongest reason to leave it alone | part 0 (`content=FAT`), part 1 (`content=APFS`, `NXSB` at +32) |
+| `partition-foreign-type` | one partition | its TYPE GUID is declared as somebody else's OS — Apple APFS/HFS+/Recovery/Core Storage, Linux fs/LVM/RAID/swap, Microsoft Reserved, Windows Recovery. **The second, independent witness**, and it fires even when the bytes read as blank, which is exactly the state of an erased-but-not-repartitioned stranger's volume. Microsoft Basic Data is deliberately absent: that is what Disk Utility stamps on the target | part 1 (`type=apple-apfs`), reached whenever the content probe does not answer first |
+| `partition-is-esp` | an ESP-typed partition | an ESP is shared platform property; reformatting it can unboot every other OS on the medium. Overridable only by the operator's explicit `--as-esp`, and that switch excuses **exactly one** content — an ESP-typed slot that is also all-zero. It does not excuse an ESP with a filesystem on it, nor one carrying bytes we could not name: a switch about the type GUID must never widen into a licence to overwrite a live volume | part 3 |
+| `partition-too-small` | one partition | below the FAT32 cluster floor, or no room for the tree plus slack. Prints both `have=` and `need=` — a size refusal that does not say how much was needed cannot be acted on | part 4 |
+| `no-such-partition` | a slot index | not an in-use entry of this table | — (index is named by the caller, not by the fixture) |
+
+Three structural properties sit under the table, each mechanical rather than argued:
+
+- **No write can escape the named partition.** Not by review: `install/partition.rs`'s
+  `PartitionTarget` is an `InstallTarget` whose LBA 0 is the partition's first sector and whose
+  capacity is its length, and whose `map()` returns `BadLba` — never a clamp — for anything past the
+  end. The formatter, the tree writer and the verifier are handed that target and cannot address the
+  disk. Measured per run by a SHA-256 of every neighbour partition's first 4 KiB before and after the
+  install (`neighbours untouched=n/n`) — where the neighbour set is fixed by the FIXTURE, not by the
+  installer's own selection. **That distinction is a go-red finding and is the reason two independent
+  witnesses exist.** The first version of the check took "every partition except the one the installer
+  chose" as its baseline; blinding the APFS content probe then made the installer choose the APFS
+  partition, destroy it, and still report `untouched=4/4 -> PASS`, because the destroyed volume was
+  not in a baseline the thing under test had picked. Both the type-GUID backstop above and the
+  fixture-pinned baseline come from that run.
+- **Nothing writes to LBA 0 or the partition tables in partition mode.** It follows from the above:
+  the target's base is at least the first usable LBA, so the protective MBR, both headers and both
+  entry arrays are unreachable through it. The single exception is `gpt::set_entry_type_guid`, which
+  is off by default, edits exactly one 16-byte field, rewrites both headers with recomputed CRC-32s,
+  and re-validates the whole table off the medium before returning.
+- **Verification is by content, never by return code.** Every file is re-read off the medium at the
+  exact extents the writer recorded and SHA-256-checked (the rule `install/clone.rs` already carried
+  for the Pi self-clone).
+
+**What the installer still does NOT do, and must not be read as doing.** It does not write to SATA —
+AHCIWRITE is a separate rung and the rMBP's internal SSD is a live disk. It does not make anything
+the startup volume: on this firmware that is the operator's `bless` from Recovery, or ⌥ at power-up
+(R3, rmbp-ledger A4). And whether this machine's picker lists a FAT volume that is not ESP-typed is a
+**firmware fact we have not measured** — `docs/dev/OS/10_INSTALL/partition-install.md` marks it
+metal-unproven and `--as-esp` exists as the answer if it turns out to be required.
