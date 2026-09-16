@@ -1,0 +1,7 @@
+# UNAOS_SMP=2 (inline-BSP) lane on the UNTOUCHED tree fa4dcf0b — PTRINSTALL3 attribution run, 2026-09-16
+# UNAOS_QEMU_FULL=1 UNAOS_SMP=2 UNAOS_WC=1 ./arroyo test 150  (rc=1, mode=full completion=complete, 2174 lines); lines selected with awk index()
+# identical field for field on the PTRINSTALL3 tree (527e56fe); x86-wc.spec replay 7/8 required, 3 forbidden on both
+:: SCHED-X86: 1 AP(s) dispatching — the render/service split needs 2 distinct cores; GUI stays inline on the BSP ::
+:: WINX-1: ring-3 windows FAIL — witness=0x7f painted=false presents=2 cleared=true killed=0 done=1 (want 0x7f/true/>=2/true/0/1) ::
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=12/12 adopt=0 repaint=0 max_ms=0 adopt_stretch=0/4 -> FAIL
+:: APPPIN: press1=launch-shell launch1=0:0 quit1=no-teardown tile=lost press2=skipped launch2=0:0 fresh=false sprite planned=0 nohit=18446744073709551615 cleanup=leaked :: FAIL ::
