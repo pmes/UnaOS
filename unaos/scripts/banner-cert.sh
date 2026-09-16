@@ -73,7 +73,43 @@
 #      battery and CANNOT carry that string — a row with no cond called it a MISSING and would have
 #      red-lined every Pi desktop build. Write the cond as `!baremetal,!bootlog,!usbdebug,!tegra`,
 #      copied from the `cfg_attr` rather than guessed.
-#   7. MEASURE it: build media with the feature armed and
+#   7. SEED FROM THE FEATURE'S *UNCONDITIONAL* CALLER, NOT FROM ITS MOST INTERESTING FUNCTION — and
+#      MEASURE THE ROW ON THE LEANEST BUILD THAT ARMS THE FEATURE, NOT ON THE RICHEST (SMALLFIX3,
+#      2026-09-15). This is step 5's trap with one turn more on it, and it is the one that shipped:
+#      the `wc` row was seeded on `[wc-x] activate DECLINE reason=fb-not-ready latch=released`, from
+#      `video/desktop_uefi.rs::activate` — a function whose ONE caller is the Kepler takeover
+#      (`main.rs:1141` says so in prose: "`desktop_uefi::activate` has exactly one caller"). `activate`
+#      is `wc` code by module gate, so the row read as correct, and it MEASURED correct: the seeding
+#      build was the rmbp flight-7 knob line, which arms `UNAOS_KEPLER_TAKEOVER=1`, so the caller was
+#      compiled and the linker kept the function. Every leaner `wc` build — `UNAOS_WC=1 ./arroyo
+#      esp-x86`, and `test-fat`, which is how the compositor is gated in QEMU where no Kepler exists —
+#      drops the whole function and the row MISSINGs at 0 hits, reddening the verb before QEMU starts.
+#      Measured on two x86 artifacts built the same day: with kepler, `wc-x] activate` = 6 hits; without
+#      it, 0 — while `[wc-x]` = 26 in BOTH, so the feature was compiled and printing either way.
+#      TWO RULES COME OUT OF IT. (a) A row's token belongs in the code path the feature's OWN knob
+#      makes live with nothing else armed: `wc`'s is now `desktop_app_service`, whose call site
+#      (`main.rs:5999`) is gated `#[cfg(feature = "wc")]` and nothing more. (b) A row measured only on a
+#      rich knob line is measured on the configuration LEAST likely to expose this defect — so measure
+#      the leanest arming build, or measure both and record that they agree.
+#      AND IT WAS NOT A ONE-OFF: `smolnet` was the SAME DEFECT, found the same day by the same audit,
+#      with `witness` in the caller's gate instead of a kepler knob. Its row was seeded on
+#      `:: SOCK-3: no free address-space slot`, a literal in
+#      `arch/x86_64/syscall.rs::sock3_launcher`. That function is gated
+#      `all(feature = "smolnet", target_arch = "x86_64")` — correct — but its ONLY callers are
+#      `main.rs:902` and `:909`, both `all(target_arch = "x86_64", feature = "witness", feature =
+#      "smolnet")`. `smolnet` is DEFAULT-ON, so it rides every x86 media banner, and `witness` is OFF
+#      for every media verb, so the linker drops the launcher from exactly the builds that ship:
+#      `UNAOS_IVB=1 ./arroyo esp-x86` (no other knobs) exited 1 with `smolnet … hits=0 -> MISSING`.
+#      Measured, with `smoltcp` = 137 hits on that same ELF as the control proving the feature WAS
+#      compiled. Re-seeded on `:: SOCK-1: smoltcp icmp echo` from `smolnet::witness_tick`, whose
+#      caller (`drivers/e1000.rs:1194`, inside `service_net`) carries that same
+#      `all(feature = "smolnet", target_arch = "x86_64")` and nothing else, so it is reached on every
+#      default boot's service pass. BOTH POLARITIES MEASURED: 1 hit on three x86 artifacts (a
+#      witness-free `UNAOS_IVB=1` media build, the flight-7 line, and a no-kepler `UNAOS_WC=1` build);
+#      0 hits on an `esp-arm` artifact, where `arm_features` strips `smolnet`, with `smoltcp` = 0
+#      there as the corroborating control. Two rows, one shape, one day — which is why 7(a) and 7(b)
+#      are rules and not an anecdote.
+#   8. MEASURE it: build media with the feature armed and
 #      `LC_ALL=C grep -a -o -F -- '<token>' <artifact> | wc -l` must be > 0. Mark the row `measured`.
 #      A row seeded from source reading alone is marked `unmeasured-here` and stays that way until
 #      an artifact for that arch proves it.
@@ -127,7 +163,7 @@ fi
 bc_table() {
 cat <<'TABLE'
 witness|:: U1a: no application processors online — ring-3 demo SKIPPED ::|!baremetal,!bootlog,!usbdebug,!tegra|measured
-wc|[wc-x] activate DECLINE reason=fb-not-ready latch=released|-|measured
+wc|[wc-x] desktop-app DECLINE reason=no-storage name=/|-|measured(1)
 wcg-paygo|[wc-g] paygo win=|witness|measured
 wcdvalve|[wc-d] valve CLOSED util~|witness|measured
 logts|:: LOGWIT-1 probe seq=|witness|measured
@@ -140,7 +176,7 @@ sdhcblk|the staged file is FRAGMENTED; the permit describes exactly one LBA inte
 sdwrite|:: SDWRITE-POSTURE: posture=|witness|measured
 bt|vendor-classed: RF/Bluetooth subclass+protocol|-|measured
 btc|REACHED — a BR/EDR link was established|-|measured
-smolnet|:: SOCK-3: no free address-space slot|-|measured
+smolnet|:: SOCK-1: smoltcp icmp echo|-|measured(1)
 wifi|:: wifi: firmware NOT staged — no program-source block device; searched|-|measured
 wifi2|:: wifi2: upload NOT ATTEMPTED uploaded-bytes=|-|measured
 nvidia-kepler|:: kepler: FENCE ABORT dmactl REFUSED|-|measured

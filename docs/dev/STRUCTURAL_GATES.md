@@ -837,6 +837,110 @@ naming an unknown feature prints
 `feature=notafeature witness=<UNREGISTERED> hits=- -> UNREGISTERED` and exits
 **2**.
 
+**THE `wc` ROW, RE-SEEDED — AND THE TRAP IS THAT IT WAS MEASURED CORRECT
+(SMALLFIX3, 2026-09-15).** The row shipped seeded on
+`[wc-x] activate DECLINE reason=fb-not-ready latch=released`, a literal in
+`video/desktop_uefi.rs::activate`. That function is `wc` code by module gate, and
+the seeding run measured it present, so the row passed every test this recipe
+had. It was still wrong, and it BLOCKED THE FLIGHT IMAGE BUILD: QUARRYX86 hit
+`feature=wc … hits=0 -> MISSING` on
+`UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_QEMU_FULL=1 ./arroyo test-fat sf 200` at
+`6f45030c`, exiting 1 before QEMU ever started, and every leaner `UNAOS_WC=1`
+build would have done the same.
+
+The cause is step 5's trap with one more turn on it. `activate` has exactly ONE
+caller — the Kepler takeover — and `main.rs:1141` says so in prose. The seeding
+build was the rmbp flight-7 knob line, which arms `UNAOS_KEPLER_TAKEOVER=1`; the
+caller was compiled, the linker kept the function, and the token measured 1. Drop
+the kepler knobs — which is what QEMU does, because there is no Kepler there —
+and the linker garbage-collects the whole function. **Measured on two x86
+artifacts built the same day, from the same track tip:**
+
+| token | flight-7 (kepler armed) | `UNAOS_WC=1 UNAOS_QUARRY=1` (no kepler) |
+|---|---|---|
+| `[wc-x]` | 26 | 26 |
+| `wc-x] activate` | 6 | **0** |
+| `[wc-x] activate DECLINE reason=fb-not-ready latch=released` | 1 | **0** |
+| `[wc-x] desktop-app DECLINE reason=no-storage name=/` | 1 | 1 |
+
+`[wc-x]` at 26 in BOTH is the control: the feature is compiled and printing on
+either line, so this was never a banner lie — it is a row pointed at a function
+one particular knob line happens to keep. That is a DIFFERENT fact from the
+:1147 defect this gate exists for, and the output could not tell them apart.
+
+The row is now
+`wc|[wc-x] desktop-app DECLINE reason=no-storage name=/|-|measured(1)`, seeded
+from `desktop_uefi::desktop_app_service`, whose call site (`main.rs:5999`) is
+gated `#[cfg(feature = "wc")]` and nothing more — so the literal exists on every
+build that arms the knob and no build that does not. `cond` stays `-` because
+there is no second gate to name. Two rules came out of it and are now steps 7(a)
+and 7(b) of the script's recipe: **a row's token belongs in the code path the
+feature's OWN knob makes live with nothing else armed**, and **a row measured
+only on a rich knob line is measured on the configuration least likely to expose
+this defect** — measure the leanest arming build, or measure both and record that
+they agree.
+
+**The 48-row audit that came with it.** Every row's token was measured against
+BOTH x86 artifacts above and cross-read against the live cert's verdict on the
+flight-7 banner (27 OK, 0 MISSING, 0 LEAK, 1 UNVERIFIABLE, rc 0). No second row
+has the re-seeded row's shape: of the 28 features the flight-7 banner names, 27
+certify with hits ≥ 1 and the 28th is `unaos_ivb`, whose `@boot ` token lives in
+`EFI/BOOT/BOOTX64.EFI` and certifies there (a raw grep of the KERNEL elf reads 0
+for it, which is the routing working, not a finding). The 20 aarch64-only rows
+measure 0 on both x86 artifacts and appear on no x86 banner, which is what they
+should do.
+
+⚠ **ONE FINDING, REGISTERED RATHER THAN FIXED, AND IT RUNS THE OTHER WAY:
+`witness` IS NOT CERTIFIED ON THE FLIGHT-7 LINE, AND ITS TOKEN IS THERE.** The
+row's cond is `!baremetal,!bootlog,!usbdebug,!tegra`, copied by BANNERCERT2 from
+`main.rs:79`'s `cfg_attr`, so the flight-7 line — which arms `UNAOS_USBDEBUG=1` —
+prints `-> UNVERIFIABLE (its literal needs 'NOT usbdebug' …)` and greps nothing.
+But the literal measures **1 hit** on that very artifact, because the usbdebug
+terminal loop that would delete the post-GUI tail is itself compiled out on
+x86 + `wc` (`main.rs:1155`:
+`#[cfg(all(feature = "usbdebug", not(all(target_arch = "x86_64", feature = "wc"))))]`).
+So the cond over-refuses on exactly the configuration the rMBP flies: a row that
+would have certified prints a loud nothing instead. It is not a red and not a
+MISSING — it is coverage silently narrower than the table claims, which is this
+file's own "a check that cannot fire is an absent one" seen from one step back.
+Fixing it needs a `cond` term that can say "`usbdebug` only kills this literal
+when NOT (x86 and `wc`)", i.e. an arch-aware conjunction the cond grammar does
+not have; adding one is a gate-language change and is not folded into a row
+re-seed. **Registered here, and in `docs/dev/QUEUE.md` §5 on the row this arc
+ticks. Owner: whoever next extends the cond grammar.**
+
+**AND `smolnet` WAS THE SAME DEFECT, FOUND THE SAME DAY — the datum came from
+SMALLFIX, measured twice, and it is the reason 7(a)/7(b) are rules rather than an
+anecdote.** `UNAOS_IVB=1 ./arroyo esp-x86` — no other knobs — exited 1 with
+`feature=smolnet witness=:: SOCK-3: no free address-space slot hits=0 -> MISSING`.
+Same shape as `wc`, different knob in the caller's gate. The literal lives in
+`arch/x86_64/syscall.rs::sock3_launcher`, which IS gated
+`all(feature = "smolnet", target_arch = "x86_64")` — the row looked right — but
+its only two callers (`main.rs:902`, `:909`) are
+`all(target_arch = "x86_64", feature = "witness", feature = "smolnet")`, and
+`witness` is OFF for every media verb (LAWS §5's default-quiet-knob rule). So a
+DEFAULT-ON feature that rides every x86 media banner had its certifying string in
+a function no media build links. `smoltcp` measures **137** hits on that same
+ELF — the control proving the feature was compiled and the row simply pointed at
+dropped code.
+
+Re-seeded on `:: SOCK-1: smoltcp icmp echo` from `smolnet::witness_tick`, whose
+caller `drivers/e1000.rs:1194` sits inside `service_net` under that same
+`all(feature = "smolnet", target_arch = "x86_64")` and nothing else — the boot
+connectivity witness, reached on every default boot's service pass. **Both
+polarities measured:**
+
+| artifact | `:: SOCK-1: smoltcp icmp echo` | `:: SOCK-3: no free address-space slot` | `smoltcp` |
+|---|---|---|---|
+| `UNAOS_IVB=1 esp-x86` (witness-free, the build that red) | **1** | 0 | 137 |
+| flight-7 `esp-x86` | 1 | 1 | 147 |
+| `UNAOS_WC=1 UNAOS_QUARRY=1` (no kepler) | 1 | 1 | 147 |
+| `esp-arm` — `arm_features` STRIPS `smolnet`: the OFF control | **0** | 0 | **0** |
+
+The aarch64 row is the OFF side and it is a real control, not an assumption: the
+strip is `arroyo`'s first `arm_features` line, and `smoltcp` at 0 there
+corroborates that the whole stack is absent rather than the pattern being broken.
+
 **Legitimate update.** A new knob in `arroyo`'s map needs a row here in the same
 commit — the next build that arms it exits 2 by name until it has one, and that
 is the intended failure, not a nuisance. When a token's source line is deleted or

@@ -1216,28 +1216,57 @@ fn reap_jobs() {}
 /// ADD lines and break the byte-identity proof (PARITY.md §5.3). The shared thing is the seam that
 /// matters — the mount table for the read, `spawn_user_image_bg` for the spawn — not the printing.
 ///
-/// This is ONE OF THREE arms (it was written as one of two — see the warning below): the x86_64 arm
-/// is the `cfg(not(target_arch = "aarch64"))`
-/// `launch` at the end of this section, and it declines because there is no mount table to resolve
-/// against — NOT because the spawn seam is missing (x86 has `spawn_user_image_bg` and `bg_poll`
-/// too). The counterpart is named here because this body is longer than a reader — or the parity
-/// detector's window — will scan before concluding the other arch has nothing.
+/// QUARRYLAUNCH: **ONE BODY, BOTH ARCHES — and it used to be two.** The x86 arm that stood after it
+/// was the FOURTH shim on the dead `vfs.md` §12.4 citation. QUARRYX86 (`d69fcffd`) collapsed the
+/// other three (`collect`, `mount_prefixes`, `volume_gen`) and named this one as the remainder. It
+/// printed `[quarry] launch DECLINE path=… reason=no-vfs-on-this-arch (vfs.md 12.4)` and handed that
+/// sentence back to the path bar, on the premise "x86 has no VFS mount table". That premise is dead
+/// and was measured dead: VFSROUTE (orin 17) made `shell::vfs_mount_table` arch-neutral, vfs.md §13.3
+/// ("x86 has a namespace now") superseded §12.4, and the SAME BOOT that printed the DECLINE printed
+/// `[quarry] open volumes mounts=["/", "/apps", "/boot"] roots=["/"] tree-rows=7` with a census
+/// listing the `APPS/` tree — so the path the operator double-clicks RESOLVES on x86.
 ///
-/// ⚠ **THE DISPATCH IS THREE-WAY, NOT TWO-WAY (rmbp-7 QUARRY2).** This body needs BOTH halves of the
-/// seam — `uslots::USER_REGION_SIZE` for the ceiling and `arch::syscall::spawn_user_image_bg` for the
-/// spawn — and `arch/aarch64/mod.rs` gates both modules behind
+/// The spawn half was never what was missing, and this file said so itself: the rmbp-7 QUARRY note on
+/// [`reap_jobs`] reads "x86 has `arch::syscall::spawn_user_image_bg` and `bg_poll` with the same
+/// signatures … What is missing on x86 is the mount table". `arch/x86_64/syscall.rs:16937` is that
+/// function, with this body's exact signature, and `video/desktop_uefi.rs:858` already drives it
+/// through the same `wm::app_name_arm(wm::owner_of_launch(…), path)` seam this body uses. So the shim
+/// is deleted and x86 takes this body, exactly as the three listing shims took theirs.
+///
+/// **The two things that stay `cfg`-split, and why they are hardware facts and not a board twin.**
+/// They are `shell::read_el0_image`'s two splits, copied with their reason rather than re-argued —
+/// that function is this tree's other launcher and carries the same pair for the same cause. The size
+/// ceiling is THE RING-3 WINDOW EACH ARCH MAPS (`uslots::USER_REGION_SIZE` on aarch64, the JETSON-EL0
+/// facade over `boot.rs` / `mmu_tegra_el0.rs`; `arch::syscall::user_window_size()` on x86), and the
+/// expected `e_machine` is THE INSTRUCTION SET THE CPU DECODES (183 = EM_AARCH64, 62 = EM_X86_64).
+/// Both are properties of the chip, which is precisely the stated hardware reason LAWS §3 demands of
+/// a `target_arch` in experience-layer code — and the loader re-validates both from scratch either
+/// way, so these pre-checks only sharpen the operator's error text. Everything else is one body: the
+/// stat, the directory / empty / oversize refusals, the read, the ELF pre-check, the spawn, the
+/// window name, the job row, and every witness line.
+///
+/// ⚠ **THE DISPATCH IS STILL THREE-WAY, NOT TWO-WAY (rmbp-7 QUARRY2)** — but the third arm is the
+/// RINGLESS one, not a board twin. This body needs BOTH halves of the seam — a user-window size for
+/// the ceiling and `arch::syscall::spawn_user_image_bg` for the spawn — and `arch/aarch64/mod.rs`
+/// gates both modules behind
 /// `any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")`, because the user address space and the
 /// process table belong to the EL0 layer rather than to the chip. `target_arch = "aarch64"` alone
 /// therefore over-claimed: it named this body for a ringless `desktop_firmware` build that has
-/// neither module, and it failed E0433 at the `CAP` const and again at the spawn call. The conjunct
-/// added here is those modules' own gate, VERBATIM, so `arm-pi` and every tegra-EL0 leg emit exactly
-/// the code they emitted before; the third arm below is the configuration that used to land here and
-/// could not compile. Keep this predicate identical to `arch/aarch64/mod.rs`'s gate on
-/// `pub mod syscall;` / `pub mod uslots` — a narrower copy silently stops Quarry launching on a board
-/// that HAS an EL0 layer, and a wider one is the E0433 back again.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0")
+/// neither module, and it failed E0433 at the ceiling and again at the spawn call. The aarch64
+/// conjunct here is those modules' own gate, VERBATIM, so `arm-pi` and every tegra-EL0 leg emit
+/// exactly the code they emitted before; the arm below is the configuration that used to land here
+/// and could not compile, and it is now the ONLY `cfg` arm left — its `REFUSED reason=no-el0-layer`
+/// is a real fact about a build with no rings. Keep the aarch64 half of this predicate identical to
+/// `arch/aarch64/mod.rs`'s gate on `pub mod syscall;` / `pub mod uslots` — a narrower copy silently
+/// stops Quarry launching on a board that HAS an EL0 layer, and a wider one is the E0433 back again.
+/// The WHOLE predicate is [`reap_jobs`]'s, character for character, and that is not a coincidence to
+/// be tidied away: the two functions are the two halves of one job table, and a build that can poll
+/// it is exactly a build that can launch into it.
+///
+/// Fixture: [`launch_selftest`] (`:: QUARRYLAUNCH: … ::`), which drives this seam on both arches.
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"))
 ))]
 fn launch(path: &str) -> String {
     use crate::fs::vfs::{NodeKind as NK, VfsError};
@@ -1252,7 +1281,13 @@ fn launch(path: &str) -> String {
             VfsError::Backend(s) => alloc::format!("backend: {}", s),
         }
     }
-    const CAP: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64; // JETSON-EL0: uslots facade (boot.rs on pi / mmu_tegra_el0.rs on tegra)
+    // SPLIT 1 OF 2 — the hard read ceiling: the ring-3 window THIS CHIP maps. Not a preference about
+    // the file manager, which is why it is a `target_arch` LAWS §3 allows; `shell::read_el0_image`
+    // carries the identical pair of lines for the identical reason and is the other launcher.
+    #[cfg(target_arch = "aarch64")]
+    let cap: u64 = crate::arch::aarch64::uslots::USER_REGION_SIZE as u64; // JETSON-EL0: uslots facade (boot.rs on pi / mmu_tegra_el0.rs on tegra)
+    #[cfg(not(target_arch = "aarch64"))]
+    let cap: u64 = crate::arch::syscall::user_window_size() as u64;
     // The reap-then-ceiling pre-check moved to [`run_act`] (rmbp-7 QUARRY) — same two steps, same
     // order, same refusal line, but arch-neutral, because the ceiling is Quarry's table's and not
     // this arch's. By the time this body runs the table is reaped and has a free slot.
@@ -1272,8 +1307,8 @@ fn launch(path: &str) -> String {
         serial_println!("[quarry] launch REFUSED path={} reason=empty", path);
         return String::from("empty file");
     }
-    if st.size > CAP {
-        let s = alloc::format!("{} bytes exceeds the {}-byte user window (-E2BIG)", st.size, CAP);
+    if st.size > cap {
+        let s = alloc::format!("{} bytes exceeds the {}-byte user window (-E2BIG)", st.size, cap);
         serial_println!("[quarry] launch REFUSED path={} reason=oversize ({})", path, s);
         return s;
     }
@@ -1285,12 +1320,23 @@ fn launch(path: &str) -> String {
             return s;
         }
     };
+    // SPLIT 2 OF 2 — the expected `e_machine`: the instruction set THIS CHIP decodes. Same hardware
+    // reason, same two constants, same wording as `shell::read_el0_image`'s pair. `WANT_NAME` keeps
+    // the aarch64 refusal text byte-for-byte what it was ("not an aarch64 ELF64 …").
+    #[cfg(target_arch = "aarch64")]
+    const WANT_MACHINE: u16 = 183; // EM_AARCH64
+    #[cfg(not(target_arch = "aarch64"))]
+    const WANT_MACHINE: u16 = 62; // EM_X86_64
+    #[cfg(target_arch = "aarch64")]
+    const WANT_NAME: &str = "aarch64";
+    #[cfg(not(target_arch = "aarch64"))]
+    const WANT_NAME: &str = "x86-64";
     if bytes.len() >= 20 && bytes[0..4] == [0x7F, b'E', b'L', b'F'] {
         let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
-        if bytes[4] != 2 || bytes[5] != 1 || machine != 183 {
+        if bytes[4] != 2 || bytes[5] != 1 || machine != WANT_MACHINE {
             let s = alloc::format!(
-                "not an aarch64 ELF64 (class {} data {} machine {})",
-                bytes[4], bytes[5], machine
+                "not an {} ELF64 (class {} data {} machine {})",
+                WANT_NAME, bytes[4], bytes[5], machine
             );
             serial_println!("[quarry] launch REFUSED path={} reason=elf ({})", path, s);
             return s;
@@ -1327,23 +1373,8 @@ fn launch(path: &str) -> String {
     }
 }
 
-/// x86 has no VFS mount table (`fs/vfs.rs` gates both backends to aarch64, vfs.md §12.4), so there
-/// is nothing here to resolve a path against and this arm SAYS so rather than reaching for
-/// `fat::mount()` — the raw-backend path this arc is forbidden to take. The layout, the gesture, the
-/// double-click predicate and the launchability test all compile and are witnessed on this arch; the
-/// day the x86 VFS adoption lands, this shim collapses into the one above.
-///
-/// This arm's `cfg` is left EXACTLY as written (`not(target_arch = "aarch64")`) by the QUARRY2 fix,
-/// rather than narrowed to `target_arch = "x86_64"`: the third arm below carves its configuration out
-/// of the aarch64 side only, so these three predicates stay disjoint and exhaustive while this one's
-/// emitted code is untouched in every configuration that already compiled.
-#[cfg(not(target_arch = "aarch64"))]
-fn launch(path: &str) -> String {
-    serial_println!("[quarry] launch DECLINE path={} reason=no-vfs-on-this-arch (vfs.md 12.4)", path);
-    String::from("no VFS mount table on this arch yet (vfs.md 12.4)")
-}
-
-/// The THIRD arm (rmbp-7 QUARRY2): aarch64 with `desktop_firmware` but **no EL0 layer** — neither
+/// The SECOND and LAST arm (rmbp-7 QUARRY2; it was the third until QUARRYLAUNCH deleted the x86
+/// shim above it): aarch64 with `desktop_firmware` but **no EL0 layer** — neither
 /// `baremetal` nor `tegra_el0`. Quarry's window, tree, list, scrolling and gestures all compile and
 /// work here; what is absent is the ring-3 machinery underneath the launch seam, so there is no
 /// `arch::syscall::spawn_user_image_bg` to spawn with and no `uslots::USER_REGION_SIZE` to size the
@@ -1354,10 +1385,10 @@ fn launch(path: &str) -> String {
 /// prints `[quarry] launch REFUSED path=… reason=…` and hands the same sentence back to the path bar
 /// (`reason=stat`, `reason=empty`, `reason=oversize`, `reason=job-table-full`, `reason=spawn`), so an
 /// operator who double-clicks a program on a ringless board reads *why* in the window and the serial
-/// log carries the matching line. `REFUSED` rather than the x86 arm's `DECLINE` because the two are
-/// genuinely different findings: x86 has the spawn seam and lacks the *mount table* (a cross-file gate
-/// in `fs/vfs.rs`, vfs.md §12.4), whereas this build has the mount table and lacks the *rings*. Both
-/// are stated in the terms the reader can act on — the feature to turn on is named.
+/// log carries the matching line. `REFUSED` and never `DECLINE`: the vocabulary distinction that word
+/// once carried was against the x86 shim (which had the rings and lacked a mount table), and that
+/// shim is gone — this is the only refusal left, and what it names is a MISSING LAYER the reader can
+/// turn on, which is `REFUSED`'s meaning everywhere else in this file.
 ///
 /// No facade is invented. `arch/aarch64/mod.rs` declines to publish `syscall`/`uslots` outside the EL0
 /// features deliberately, and a `crate::arch::spawn_user_image_bg` shim that answered `Err` here would
@@ -3188,6 +3219,10 @@ pub fn selftest() {
     // and cannot be taken down by a DECLINE below. Its own `DONE` latch makes the `door_selftest`
     // chain a no-op wherever both batteries run.
     vol_selftest();
+    // QUARRYLAUNCH — the launch seam, chained from BOTH battery arms for the reason the three above
+    // are: aarch64's desktop reaches THIS function and x86's reaches `door_selftest`, and x86 is the
+    // arch the fixture exists for. Its own `DONE` latch makes the second chain a no-op.
+    launch_selftest();
     match selftest_result() {
         Ok((a, b)) => serial_println!(
             ":: QUARRY: geometry+scroll+tree+hit+dedupe+exec+dblclick+cache+launch+wheel — 640x480 surf_px={} 1920x1200 surf_px={} dbl={}ms cache={} wheel={}rows :: PASS ::",
@@ -3279,6 +3314,11 @@ pub fn door_selftest() {
     // `mount_prefixes` was `Vec::new()`, and `crystal::selftest`'s tail is the only battery arm that
     // reaches this file there. Ahead of the `DONE` swap below for the same reason as the two above.
     vol_selftest();
+    // QUARRYLAUNCH — and THIS is the chain that matters for it too, for the identical reason: x86 is
+    // the arch whose `launch` was the `no-vfs-on-this-arch` shim, and `crystal::selftest`'s tail is
+    // the only battery arm that reaches this file there. Ahead of the `DONE` swap below with the
+    // three above, so a battery that already ran the door legs does not lose the launch witness.
+    launch_selftest();
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) {
         return;
@@ -3544,5 +3584,118 @@ pub fn vol_selftest() {
         same_list, mounts > 0, rows >= mounts, m.cwd, m.err,
         ok,
         if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// QUARRYLAUNCH — the double-click LAUNCH seam, driven on the arch that until this arc could not take
+/// it. Appended at the FILE TAIL so nothing below it can move a `panic::Location` (LAWS §5).
+///
+/// ### What it claims, and what it deliberately does not
+///
+/// The claim is [`launch`]: that Quarry resolves an absolute path through `shell::vfs_mount_table`,
+/// reads the image, and reaches `arch::syscall::spawn_user_image_bg` WITH A PID COMING BACK — on both
+/// arches, out of one body. That is exactly the sentence the deleted x86 shim made false, so it is the
+/// sentence the fixture has to make falsifiable. The `cfg`-free half above it — the double-click
+/// predicate, the gesture, and [`run_act`]'s reap-then-ceiling pre-check — is arch-neutral code that
+/// the door and press fixtures already drive, so re-driving it here would widen the fixture without
+/// widening the claim. [`launch`] is called directly for the same reason `vol_selftest` reads
+/// `vfs_mount_table().prefixes()` rather than going through `mount_prefixes`: the thing under test
+/// should not also be the thing doing the measuring.
+///
+/// ### Why it is safe to run inside a battery
+///
+/// It leaves the boot as it found it. The job it starts is killed through `arch::syscall::bg_kill`
+/// before the function returns and the table is reaped, so no row, window or ASID survives into the
+/// fixtures that run after — the discipline `winmenu::selftest`, `dock`'s fixture and `door_selftest`
+/// all keep about focus. On x86 it runs on the `winx_launcher` task, which is the task WINX-1 already
+/// spawns ring-3 windows from, so nothing new about ring-3 dispatch is being assumed here.
+///
+/// ### SKIP, and when it is honest
+///
+/// A board with no program source mounted has no ELF to launch, and scoring that FAIL would make this
+/// a storage detector rather than a launch witness — the same line `vol_selftest` draws. It SKIPs,
+/// naming every candidate it asked for, so an empty verdict is never silent.
+///
+/// **Go-red:** restore the deleted x86 arm (`#[cfg(not(target_arch = "aarch64"))] fn launch(_: &str)
+/// -> String { … "no-vfs-on-this-arch" … }`) and this reds on x86 with
+/// `jobs=0->0 line="no VFS mount table on this arch yet (vfs.md 12.4)" started=false -> FAIL`, because
+/// the returned line and the job table are read past the seam, not from it.
+#[cfg(all(
+    feature = "witness",
+    any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"))
+    )
+))]
+pub fn launch_selftest() {
+    use core::sync::atomic::AtomicBool;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // The candidates are the EL0 programs both arches stage into the program source, most-inert
+    // first: VUG is a small window that idles, STAT is the desktop's own second window, PULSE spins.
+    const CANDIDATES: [&str; 3] = ["/apps/VUG.ELF", "/apps/STAT.ELF", "/apps/PULSE.ELF"];
+    let mut pick: Option<(&str, u64)> = None;
+    {
+        let mt = crate::shell::vfs_mount_table();
+        for p in CANDIDATES {
+            if let Ok(s) = mt.stat(p) {
+                if !matches!(s.kind, crate::fs::vfs::NodeKind::Dir) && s.size > 0 {
+                    pick = Some((p, s.size));
+                    break;
+                }
+            }
+        }
+    }
+    let Some((path, size)) = pick else {
+        serial_println!(
+            ":: QUARRYLAUNCH: candidates={:?} — none of them stats as a non-empty file, so this board has no program source mounted to launch from and there is nothing to test :: SKIP ::",
+            CANDIDATES
+        );
+        return;
+    };
+    let before = JOBS.lock().len();
+    let line = launch(path);
+    let after = JOBS.lock().len();
+    let started = line.starts_with("started pid");
+    let row = JOBS.lock().last().map(|j| (j.pid, j.asid));
+    let ok = started && after == before + 1 && row.is_some();
+    serial_println!(
+        ":: QUARRYLAUNCH: path={} bytes={} seam=quarry::live::launch->arch::syscall::spawn_user_image_bg \
+         jobs={}->{} row={:?} line={:?} started={} row_added={} match={} -> {} ::",
+        path, size, before, after, row, line, started, after == before + 1,
+        ok,
+        if ok { "LAUNCHED" } else { "FAIL" }
+    );
+    // Leave the boot as found: kill what this fixture started, then reap the row it left.
+    if let Some((pid, asid)) = row {
+        if ok {
+            let verdict = crate::arch::syscall::bg_kill(pid, asid);
+            serial_println!(
+                ":: QUARRYLAUNCH: cleanup pid={} asid={} -> {} (the fixture never leaves a job, a window or an ASID behind) ::",
+                pid, asid, verdict
+            );
+        }
+    }
+    reap_jobs();
+}
+
+/// The ringless counterpart of [`launch_selftest`] — an aarch64 desktop build with no EL0 layer, so
+/// there is no `arch::syscall` to spawn through and the seam under test is the refusal, not a launch.
+///
+/// It exists so the two battery chains can call the fixture unconditionally instead of repeating the
+/// EL0 predicate at each call site — the same reason [`reap_jobs`] keeps a ringless twin, and stated
+/// there at length.
+#[cfg(all(
+    feature = "witness",
+    not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"))
+    ))
+))]
+pub fn launch_selftest() {
+    serial_println!(
+        ":: QUARRYLAUNCH: this build has no EL0 layer (none of `baremetal` / `tegra_el0` / `virt_el0`), so `arch::syscall::spawn_user_image_bg` is not compiled and the launch seam's only honest answer here is the `REFUSED reason=no-el0-layer` arm :: SKIP ::"
     );
 }
