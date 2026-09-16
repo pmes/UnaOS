@@ -17282,3 +17282,73 @@ and x86 has never had one. `cursor11_desk_tick` gives the line a desktop-present
 population `flicker_frames` is actually about — armed only once a desktop present has met a live
 arrow, so a pointerless boot stays as silent as it is today. Giving x86 the fixture-scope call its
 sibling has is the structural repair and it lives in a file this arc did not open.
+
+## SPANFLUSH — the span-flush "blit wait" cannot be bounded in this file, because there is no wait (x86 `wc`, 2026-09-16)
+
+STOPPED; docs only. Brief: bound the span-flush blit wait so `COMP_GATE` is never held for seconds
+(CHOP's repair (i) above). Measured on `~/unaos-bench/capture/rmbp12-flight8/ttyUSB0.log`, read-only:
+two boots in one file, flight 8 = lines 1–9026 (`aperture=wc`), flight 9 = lines 9027–11265
+(`aperture=uc`), split at the second `ftdi:console-up`.
+
+**What the site is.** `comp_mark(r.id, 33)` (wm.rs:21219) opens the per-row flush loop of the staged
+present; each row or span goes through `blit_traced` (wm.rs:10686), which is three relaxed atomics
+around `FrameBuffer::blit` (framebuffer.rs:481), which is one `core::ptr::copy_nonoverlapping` into
+the panel aperture. There is no fence, no semaphore, no PFIFO get pointer, no Kepler CE submission and
+no loop that polls anything (the population read: every statement of `blit_traced`, `FrameBuffer::blit`
+and the row loop between wm.rs:21219 and the band's `beam::settle`). The compositor's "blit" on x86 is
+a CPU store stream into BAR1. `blit_inflight=1` on the tripwire means
+`BLIT_ISSUED_CORE[c] != BLIT_DONE_CORE[c]`: the holder core entered that copy and has not come out. A
+budget checked "while waiting" has no instruction to run on, because the core is not executing
+instructions. The module's own WEDGEINJ header (wm.rs:9700) states the fault as a store into the
+Kepler BAR1 that never retires, parking the core on one instruction, and its injector reproduces it
+with `cli` and a spin for exactly that reason.
+
+**What the seven holds did.** Literal counts over the whole capture (`LC_ALL=C grep -a -c -F`,
+control `SPAN-FLUSH TIMEOUT` = 0): `PASS OVERDUE` 28, `GATE STOLEN` 7, `REHOMED the render role` 7,
+`is DEAD and its singleton` 7, `revenants=1` 0 — every `[wcser]` rollup of both boots reads
+`revenants=0`, the last at 394355 ms (flight 8, `steals=4`) and 137782 ms (flight 9, `steals=3`).
+Every hold ended the same way and only that way: the steal took the gate at 4016–4303 ms and declared
+the holder dead, and no stolen-from core ever reached `comp_gate_release` afterwards. Six of the seven
+are `at=span-flush blit_inflight=1` — flight 8: c1 `win=9 row=913 blit_aim=0xe44988`, c2 `win=7
+row=331 blit_aim=0x52e1d0`, c3 `win=5 row=524 blit_aim=0x830f20`; flight 9: c1 `win=8 row=1399
+blit_aim=0x15dc030`, c2 `win=6 row=610 blit_aim=0x989878`, c3 `win=5 row=156 blit_aim=0x270f20` —
+each with `blits_retired` identical across its four 1 Hz samples. The seventh (flight 8, c4,
+390982–394285 ms) is `at=pw-exit blit_inflight=0 row=287`: CHOP's "7 of 7 at span-flush" is 6 of 7,
+and the odd one is flight-1's downstream shape (a retired blit, the core wedged after it), not the
+in-copy shape. Flight 9 ran the aperture UC and stalled identically, the reading A1 already carries
+(W4 exonerated, W5 the head). At every one of the 28 samples the root port reads `d_lnksta=0000
+d_devsta=0000 lnkdis=0 retrain=0 aer=n uesta=00000000 cesta=00000000`: the link is up and nothing on
+it names the stall; a posted write has no completion to time out (`cto` bounds non-posted reads).
+
+**The healthy shape, for the number the brief asked for.** `[comp2]` immediately before the first
+stall: `pass_us=6724 max_us=13966 blit_us=6710` (322146 ms) and `pass_us=18239 max_us=35297
+blit_us=18180` (327577 ms, the storm). The worst honest pass on record is 302 ms (wm.rs:9482). The
+stalls are 4016–4303 ms and are not slow passes; they are stopped cores. `COMP_PASS_OVERDUE_MS =
+1_000` (wm.rs:9486) and `COMP_GATE_STEAL_MS = 4_000` (wm.rs:9496) are already the bound, and they are
+the only bound software can put on a core that is not executing: it is enforced from another core,
+and that is the steal.
+
+**Why no code.** The brief's line (`:: [wcser] SPAN-FLUSH TIMEOUT holder=c<n> … -> RELEASED ::`)
+would be printed by the holder on timeout; the holder cannot print. Printed by the stealer it is the
+existing `GATE STOLEN` line under a second name, and "release the pass with the blit still in flight,
+mark the span dirty so the next composite retries it" is what WCSER-STEAL and WCSER-REHOME already do,
+at the stated cost: the core is lost for the boot and its in-flight window with it (`c<n> and its
+in-flight window stay lost`). Flight 8 paid that four times in 63 s and ran its render role on c5 from
+394336 ms; on an eight-core pool a storm of eight stalls ends the desktop, and shortening each freeze
+does not change that count. What IS expressible in this file, and is a decision rather than this arc's
+to take: (a) lower `COMP_GATE_STEAL_MS` (4000 → 1500 stays 5x the 302 ms record) and the freeze becomes
+~1.5–1.8 s per event, one dead core per event unchanged; (b) a signature-specific earlier steal
+(`phase=33`, `blit_inflight=1`, `blits_retired` unchanged across two consecutive 1 Hz probe samples)
+at the same cost with less exposure to a false steal. Neither is a bound on a wait, because there is no
+wait. The repair is upstream of `video/`: why the GK107 stops accepting posted writes to its BAR1
+window under `storm` — `PCIE-RP-RECOVERY.md` §11.3 rung W5, in the Kepler driver files this brief did
+not name.
+
+**What the next flight must show.** Nothing new from this arc. The witness that scores this defect is
+A1's `[pcih] wedge-sample n=…` beside the unchanged `PASS OVERDUE` / `GATE STOLEN` lines. A boot on
+which `[wcser] … revenants=` ever reads non-zero would be the first evidence that a stuck BAR1 store
+can complete, and would reopen the software-bound question; both boots read zero.
+
+**A row this contradicts.** A1's status cell (rmbp-ledger.md) says there was no `REHOMED` and no
+`DEAD c<n>` on either boot; the capture it cites has seven of each, four on flight 8 and three on
+flight 9 (the count command is in B116). The A1 cell is the seat's to amend.
