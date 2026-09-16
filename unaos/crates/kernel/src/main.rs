@@ -6162,21 +6162,21 @@ fn x86_input_service(cpu: usize) {
                 let Some(ev) = unaos_kernel::pal::next_event() else { break };
                 match ev {
                     // Relative motion: fold into anything already owed, else offer it.
-                    Event::Mouse { x, y } => match owed_motion.as_mut() {
+                    Event::Mouse { x, y } => { #[cfg(feature = "wc")] ptrinstall_report(); match owed_motion.as_mut() { // PTRINSTALL (B117) — the REPORT stamp: every relative report the producer takes off the ring is counted here, before the fold/offer decides its fate, and the oldest-pending clock is armed if idle. The arm became a block for exactly this statement; the matching `}` is on this arm's last line. ⚠ LINE-NEUTRAL fold, `wc`-erased; the fn is at this file's tail.
                         Some(acc) => {
                             // `saturating_add` for the reason `pal`'s fold uses it: the sum is
                             // unbounded in principle and a wrapped delta would throw the arrow
                             // across the panel.
                             acc.0 = acc.0.saturating_add(x);
                             acc.1 = acc.1.saturating_add(y);
-                            unaos_kernel::deadman::note_gui_coalesced();
+                            unaos_kernel::deadman::note_gui_coalesced(); #[cfg(feature = "wc")] ptrinstall_coalesced(); // PTRINSTALL — the CUMULATIVE twin of deadman's per-second `in=` first field, so the conservation identity can be read off one line. ⚠ LINE-NEUTRAL fold, `wc`-erased.
                         }
                         None => {
                             if gui_try_send_x86(ev).is_err() {
                                 owed_motion = Some((x, y));
                             }
                         }
-                    },
+                    } }, // PTRINSTALL — closes the block the `Event::Mouse` arm became (see the arm's first line). ⚠ LINE-NEUTRAL fold.
                     // Loss-tolerant filler. The ring does not carry `Timer` today — the heartbeat is
                     // minted below, in this task — so this arm is unreachable in the current tree.
                     // It is written anyway because the POLICY is what is being stated: if a producer
@@ -6883,7 +6883,7 @@ fn x86_render_service(cpu: usize) {
             //
             // Costs one `matches!` on non-pointer events and one atomic load when no drag is live,
             // which is every report on a boot where nobody grabbed a title bar.
-            unaos_kernel::arch::x86_64::syscall::wc_route_tail(raw);
+            unaos_kernel::arch::x86_64::syscall::wc_route_tail(raw); #[cfg(feature = "wc")] ptrinstall_drained(raw); // PTRINSTALL (B117) — the DRAIN stamp, placed AFTER both install branches on purpose: the consumed branch installed inside `wc_route_event` (`pal::cursor::track_routed`) and the declined branch in the `Mouse` arm above, so this is the moment the pointer has been moved for this dispatch and the lag since the oldest report behind it is measured. Counts post-fold dispatches. ⚠ LINE-NEUTRAL fold, `wc`-erased; the fn is at this file's tail.
 
             // Take the next queued event if one is already waiting; otherwise the burst is drained
             // and we fall through to the single present. Never parks, so an empty channel costs one
@@ -7029,7 +7029,7 @@ fn x86_render_service(cpu: usize) {
                 sent.wrapping_sub(recv),
                 cpu,
                 GUI_FOLD_X86.load(Ordering::Relaxed)
-            );
+            ); #[cfg(feature = "wc")] ptrinstall_rollup(); // PTRINSTALL (B117) — rides the depth line's 5 s gate as a SIBLING LINE rather than a term on the depth line: the depth format string is in every x86 image, `wc` on or off, so a term appended there moves the knob-off image (`./arroyo knoboff wc` exit 1); a `wc`-erased statement folded here does not. ⚠ LINE-NEUTRAL fold; the fn is at this file's tail.
             // SCHEDLOAD-X86 load witness, riding the depth line's clock gate — the two are the answer
             // halves of one question and are worth reading as a pair: `depth` says whether the GUI
             // pipe is backed up, `load` says what the other seven cores were doing while it was not.
@@ -9902,4 +9902,143 @@ fn bootclock_report(stamps: (u64, u64, u64)) {
         hz,
         src
     );
+}
+
+// ── PTRINSTALL (rmbp-ledger B117) — the pointer-install ledger, x86 + `wc` ───────────────────────
+//
+// WHAT IT MEASURES. CHOP (exec-rmbp-chop, engine.md "CHOP — residual (1) MEASURED") read flight 8's
+// chop off the channel fold: `[schedx86] depth … fold=` +284 against `sent` +350 in the worst window
+// (5.3 : 1) while `[deadman] hid=` kept delivering, because `x86_render_service` is the only place a
+// relative report is INSTALLED into `pal::cursor` on the SCHED-X86 split — and when it stalls in a
+// span-flush blit wait, nothing installs. That reading is an inference from two counters that were
+// never meant to measure the pointer. These are the counters that are:
+//
+//   * `reports`    relative `Event::Mouse` reports the PRODUCER (`x86_input_service`) took off
+//                  `pal::EVENT_QUEUE` — the HID side's delivery, counted at the ring, before the
+//                  offer/fold decides what happens to each one.
+//   * `installs`   installs made ON THE PRODUCER SIDE, i.e. `pal::cursor::move_rel` called from
+//                  `x86_input_service` at HID rate. **Structurally 0 in this tree**, and that zero is
+//                  the finding on the wire: moving the install here doubles every report while a
+//                  ring-3 app holds focus, because the consumed branch of the router
+//                  (`arch/x86_64/syscall.rs::user_input_route` → `pal::cursor::track_routed`) installs
+//                  the same delta again — CURSOR-VUG's invariant "exactly one tick per report on
+//                  exactly one path" is enforced by that pair, and both are files this arc may not
+//                  touch. The repair is stated in engine.md's PTRINSTALL section; when it lands, the
+//                  producer's `move_rel` charges this counter and `lag_max_ms` collapses to ~0.
+//   * `coalesced`  reports the producer summed into `owed_motion` because the channel refused the
+//                  offer (INPUT-UNGATE's fold) — the CUMULATIVE twin of deadman's per-second `in=`
+//                  first field, so the identity below can be read off one line.
+//   * `drains`     relative dispatches the render service completed, counted AFTER both install
+//                  branches (the `wc_route_tail` line): each is exactly one consumer-side install,
+//                  post-fold (a folded run is one drain).
+//   * `folds`      `GUI_FOLD_X86`, the channel-side fold, unchanged.
+//   * `lag_max_ms` the longest time a relative report waited between the producer taking it off
+//                  the ring and the dispatch that installed it (or the run it was folded into):
+//                  `PTRI_OLDEST_MS` is armed by the first report after an idle drain and cashed by
+//                  the next drain. On flight 8 this is the number CHOP could only infer — the
+//                  seconds-long `span-flush` holds read here directly, as milliseconds.
+//
+// THE IDENTITY, at any instant the pipe is quiet (`inflight=0`, nothing owed, nothing in hand):
+//     reports == drains + folds + coalesced
+// because every report the producer took is either dispatched on its own (`drains`), summed into
+// the dispatch in front of it by the consumer (`folds`), or summed into the producer's owed run
+// (`coalesced`, which then reaches the channel as ONE event and is counted there as a drain or a
+// fold once). With the pipe busy the right-hand side lags by the live occupancy (`inflight` +
+// the owed run + the consumer's `pending`), never by more. PTRCH's own identity `sent == recv +
+// inflight` is untouched — none of these counters is netted out of `GUI_SENT_X86`/`GUI_RECV_X86`.
+//
+// TWO LINES, both `wc`-only:
+//   `[ptrinstall] installs=… reports=… lag_max_ms=… coalesced=… drains=… folds=…` — rides the
+//       `[schedx86] depth` 5 s gate (folded onto that call's closing line) and prints only once a
+//       relative report or a drain has happened, so a pointerless QEMU boot carries none of them.
+//   `:: PTRINSTALL: installs=… reports=… folds=… lag_max_ms=… coalesced=… drains=… ::` — ONE late
+//       line, on the first depth tick at or after `PTRI_LATE_MS` of uptime. It prints on every
+//       `wc` boot including a pointerless one, so the gate certifies the path ran; a fast-mode
+//       QEMU run that ends before that uptime does not carry it (LAWS §5: soaks and accumulators
+//       are read under `UNAOS_QEMU_FULL=1`).
+//
+// KNOB-OFF. Every call site is a LINE-NEUTRAL fold under `#[cfg(feature = "wc")]` and this block
+// sits below every panic site in the file, so the `wc`-off x86 image and both aarch64 images are
+// byte-identical to the baseline (`./arroyo knoboff wc`, measured in the B117 row).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PTRI_REPORTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PTRI_INSTALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PTRI_COALESCED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PTRI_DRAINS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PTRI_LAG_MAX_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The uptime (ms, `.max(1)` so 0 stays "nothing pending") at which the oldest still-uninstalled
+/// relative report was taken off the ring. Armed by `compare_exchange(0, now)` on the producer,
+/// cashed by `swap(0)` on the consumer, so a report that lands between the consumer's read and its
+/// reset is never lost — it simply arms the next window.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PTRI_OLDEST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PTRI_LATE_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Uptime at or after which the one late line prints (on the next depth tick, so up to 5 s later).
+/// 60 s: past every QEMU ladder on the `x86-wc.spec` gate and inside a 150 s full wall; on metal it
+/// is an early summary and the periodic line is the flight's instrument.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+const PTRI_LATE_MS: u64 = 60_000;
+
+/// PTRINSTALL — one relative report taken off the ring by the producer.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[inline]
+fn ptrinstall_report() {
+    use core::sync::atomic::Ordering::Relaxed;
+    PTRI_REPORTS.fetch_add(1, Relaxed);
+    let now = unaos_kernel::arch::ms().max(1);
+    let _ = PTRI_OLDEST_MS.compare_exchange(0, now, Relaxed, Relaxed);
+}
+
+/// PTRINSTALL — one report summed into the producer's owed run.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[inline]
+fn ptrinstall_coalesced() {
+    PTRI_COALESCED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// PTRINSTALL — one relative dispatch completed by the render service (both install branches behind
+/// it). Non-pointer and absolute events are not counted: only relative reports are what the producer
+/// counted, so only they close the identity.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[inline]
+fn ptrinstall_drained(raw: unaos_kernel::pal::Event) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !matches!(raw, unaos_kernel::pal::Event::Mouse { .. }) {
+        return;
+    }
+    PTRI_DRAINS.fetch_add(1, Relaxed);
+    let oldest = PTRI_OLDEST_MS.swap(0, Relaxed);
+    if oldest != 0 {
+        let lag = unaos_kernel::arch::ms().saturating_sub(oldest);
+        PTRI_LAG_MAX_MS.fetch_max(lag, Relaxed);
+    }
+}
+
+/// PTRINSTALL — the periodic line (only once something relative has moved) and the one late line.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn ptrinstall_rollup() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let installs = PTRI_INSTALLS.load(Relaxed);
+    let reports = PTRI_REPORTS.load(Relaxed);
+    let lag = PTRI_LAG_MAX_MS.load(Relaxed);
+    let coalesced = PTRI_COALESCED.load(Relaxed);
+    let drains = PTRI_DRAINS.load(Relaxed);
+    let folds = GUI_FOLD_X86.load(Relaxed);
+    if reports != 0 || drains != 0 {
+        serial_println!(
+            "[ptrinstall] installs={} reports={} lag_max_ms={} coalesced={} drains={} folds={}",
+            installs, reports, lag, coalesced, drains, folds
+        );
+    }
+    if unaos_kernel::arch::ms() >= PTRI_LATE_MS && !PTRI_LATE_DONE.swap(true, Relaxed) {
+        serial_println!(
+            ":: PTRINSTALL: installs={} reports={} folds={} lag_max_ms={} coalesced={} drains={} ::",
+            installs, reports, folds, lag, coalesced, drains
+        );
+    }
 }

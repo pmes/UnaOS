@@ -17282,3 +17282,120 @@ and x86 has never had one. `cursor11_desk_tick` gives the line a desktop-present
 population `flicker_frames` is actually about — armed only once a desktop present has met a live
 arrow, so a pointerless boot stays as silent as it is today. Giving x86 the fixture-scope call its
 sibling has is the structural repair and it lives in a file this arc did not open.
+
+## PTRINSTALL — the pointer-install ledger, and the STOP on moving the install (x86 `wc`, 2026-09-16)
+
+**Brief.** CHOP (above) measured flight 8's chop as a 5.3 : 1 collapse of pointer installs under
+storm (`[schedx86] depth … fold=` +284 against `sent` +350 in the worst window) while the HID side
+kept delivering, and named the cause: on the SCHED-X86 split `x86_render_service` is the only
+consumer of `GUI_CHANNEL_X86` and the only place a relative report is installed into `pal::cursor`,
+so a span-flush blit wait on the render core stalls every install behind it. PTRINSTALL was briefed
+to move the install to the producer (`x86_input_service`, `main.rs`) so the position advances at HID
+rate whatever the render core is doing, and to instrument it. Branch `exec-rmbp-ptrinstall`, parent
+`11ca67f1`; rmbp-ledger **B117**.
+
+**What `move_rel` mutates, and whether the input core may call it while the render core composites
+(brief step 1, read-only in `pal.rs` / `video/cursor.rs` / `video/wm.rs`).** `pal::cursor::move_rel`
+(`pal.rs:514`) is `touch()` — one relaxed store to `LAST_INPUT_MS`; `pos()` + `set_clamped()` — the
+`POS` spinlock, taken only inside `without_interrupts` with a constant-time body (POSFIX's stated
+invariant, `pal.rs:223-235`); then `repaint_on_move()` — on x86 `video::cursor::repaint()` =
+`repaint_deferred().finish()` plus the witness `rollup_tick()` (atomics; `wci_rollup_live` every
+5 s). `repaint_deferred` claims `SPRITE` through `claim_bounded(CLAIM_RETRY_MS = 2 ms)`
+(`cursor.rs:403`): an unmasked caller retries for at most 2 ms and a masked one is refused at once,
+and either refusal is `owe_repaint()` — never a wait. Its panel takes go through `panel_snapshot`
+(`video/mod.rs:446`), a single-statement `Copy` of `WRITER` (blocking only while unmasked, and the
+hold is the copy). `finish()` prints two lines on the first draw only and runs `repair` →
+`wm::damage_intersecting` → `table()`, the IRQ-masked window `TABLE` whose critical sections may not
+block, print or allocate (`wm.rs:403-440`). Nothing in the chain waits on anything the render core
+holds across a span flush: the staged present holds no `SpriteLoan` across mark 33 (`stage_window`,
+`wm.rs:21193-21219` — `compose_into` consumes a `Plan` snapshot, and the loop holds only a
+`beam::hold`), every `WRITER` take in `wm.rs` is a `*WRITER.lock()` copy, and `TABLE` is never held
+across a blit by its own rule. And the concurrency class — one core installing while another
+composites — already exists on x86: the ring-3 present chains (`SYS_WIN_PRESENT`/`SYS_FB_PRESENT`)
+composite from app cores while the render core installs, which is what WEDGE-9's claims and
+CURSOR-4's plan epochs were built for. **So `move_rel` is safe to call from `x86_input_service`,
+whole, with no split needed in `cursor.rs`.** What it buys during a stall is bounded by the same
+facts: the position, hit-tests and drag steering advance at HID rate, and the sprite pixels move
+whenever the claim is granted; a present that stamps the layer's older sprite over the front is the
+CURSOR-11 settlement's case (`px_installed` / `px_redrawn`), unchanged in kind.
+
+**THE STOP, and it is not the split.** The install cannot move to the producer inside `main.rs`
+alone, because the render path installs a relative report in TWO places and only one is in this
+file. Declined branch: the `Event::Mouse` arm of `x86_render_service` (`main.rs:6845`,
+`move_rel`). Consumed branch: `arch/x86_64/syscall.rs:5701-5708` `user_input_route` →
+`pal::cursor::track_routed(&ev)` (`pal.rs`, CURSOR-VUG), which applies the same delta whenever a
+ring-3 app holds focus and its ring has room. CURSOR-VUG's invariant is "exactly one tick per report
+on exactly one path", and `wc_route_tail`'s doc restates it. A producer that installs every report
+while the channel still carries the real delta doubles the motion on the consumed branch — the
+bench case exactly, since a launched vug holds focus. The delta on the channel cannot be zeroed to
+avoid it: `pack_input` (`syscall.rs:5611`) hands ring-3 the delta as `INPUT_EV_MOUSE_REL`, and
+`user-vug/src/main.rs:2056` steers its drag by it. And it cannot be compensated from `main.rs`
+(`move_rel(-dx,-dy)` after a consumed route is three repaints per report with one at the wrong
+position). **The exact change, not made (brief rule 3):**
+(1) `arch/x86_64/syscall.rs:5701-5708` `user_input_route`: delete the
+`crate::pal::cursor::track_routed(&ev);` call on the consumed branch and rewrite the CURSOR-VUG
+paragraph above it — the arrow follows the report where it is produced, whoever holds focus;
+(2) `pal.rs` `track_routed` becomes dead — retire it (its doc block is the record of why it
+existed); (3) `main.rs:6845` the `Mouse` arm keeps `draw_over` and drops `move_rel`;
+(4) `main.rs:6165` the producer's `Event::Mouse` arm calls `move_rel(x, y, w, h)` with the panel
+geometry from `video::WRITER` (`track_routed`'s own `is_ready()` guard, moved) BEFORE the offer/fold,
+and charges `PTRI_INSTALLS`. The `set_abs`/`MouseAbsolute` path is untouched (not folded, not
+doubled: the tablet fixtures assert its resting coordinate). The other three `move_rel` callers in
+`main.rs` (`:1944`, `:3903`, `:5474`) are the inline-BSP configurations that never dispatch
+`x86_input_service` and stay as they are.
+
+**What IS built: the ledger the chop can be read from directly.** Six `wc`-only counters at the
+file tail, four LINE-NEUTRAL folds (`main.rs:6165`, `:6172`, `:6886`, `:7032`; every one before the
+line's first `//`), byte-identical knob-off (`./arroyo knoboff wc 11ca67f1` → exit **0**,
+`warm=yes compiled_baseline=[unaos-kernel|unaos-kernel] compiled_tree=[unaos-kernel|unaos-kernel]`,
+control fired). Terms: `reports` — relative reports the producer took off `pal::EVENT_QUEUE`;
+`installs` — producer-side installs, structurally 0 in this tree and the STOP made visible;
+`coalesced` — reports summed into `owed_motion` (cumulative twin of `[deadman] in=`'s first field);
+`drains` — relative dispatches the render loop completed, stamped after BOTH install branches
+(`wc_route_tail`'s line), post-fold; `folds` — `GUI_FOLD_X86`; `lag_max_ms` — the longest wait
+between the producer taking a relative report and the drain that installed it (or the run it was
+folded into): `PTRI_OLDEST_MS` armed by `compare_exchange(0, now)` on the producer and cashed by
+`swap(0)` on the drain, so no report's stamp is lost. **The identity, at any quiet instant
+(`inflight=0`, nothing owed, nothing in hand): `reports == drains + folds + coalesced`.** With the
+pipe busy the right-hand side lags by the live occupancy and never by more; PTRCH's `sent == recv +
+inflight` is untouched, because none of these is netted out of `GUI_SENT_X86`/`GUI_RECV_X86`.
+Two lines: `[ptrinstall] installs= reports= lag_max_ms= coalesced= drains= folds=` rides the
+`[schedx86] depth` 5 s gate as a SIBLING line (a term appended to the depth format string would
+move the `wc`-off image) and prints only once something relative has moved; the ONE late line
+`:: PTRINSTALL: installs= reports= folds= lag_max_ms= coalesced= drains= ::` prints on the first
+depth tick at or after 60 s of uptime, on every `wc` boot, so a gate can certify the path ran.
+
+**QEMU, the one run (LAWS §4 R38): `UNAOS_QEMU_FULL=1 UNAOS_WC=1 ./arroyo test 150` → rc 0**,
+`target/serial.log.run`: `mode=full wall=161.0 cap=150 completion=complete complete_line=2209`,
+2454 lines, no fault token; banner `witness,ehcihid,kbdwit,sdhcblk,smolnet,wc,sdwrite`. The verb's
+own replay (x86-default.spec) passed; `./arroyo mbench --replay target/serial.log --spec
+scripts/specs/x86-wc.spec --platform x86` → rc 0, **8/8 required, 0 forbidden**; `[ptrdead] …
+fpop12=0 fpop3=0 -> PASS`, `[dmgovlp] verdict passes=12/12 … -> PASS`. The wire:
+`:: PTRINSTALL: installs=0 reports=0 folds=0 lag_max_ms=0 coalesced=0 drains=0 ::` (count 1);
+no `[ptrinstall]` line, correctly — the x86 suite's pointer is a `usb-tablet` (absolute, so
+`MouseAbsolute`, never a relative report) and PTRDEAD's 192 relative events were drained by the
+fixture itself (`fpop12=0 fpop3=0` is the producer stealing none), so `reports=0` is the counter's
+zero control and `0 == 0 + 0 + 0` is the identity at rest. `./arroyo check` → rc 0 (112 ✅ legs,
+79 cfg legs, no new warning). Artifact (`target/x86_64_esp/kernel.elf` of that run, `LC_ALL=C grep
+-a -o -F … | wc -l`): `:: PTRINSTALL: installs=` **1**, `[ptrinstall] installs=` **1**, control
+`PTRINSTALL-CONTROL-ABSENT` 0. **Go-red by mutation** (the late `serial_println!` removed, `UNAOS_WC=1
+./arroyo esp-x86` rebuilt): `:: PTRINSTALL: installs=` **0**, `[ptrinstall] installs=`
+**1** (the unmutated sibling, the control that the build was measured); reverted
+byte-for-byte to the committed source (`cmp`), `./arroyo check` → rc 0, artifact rebuilt and
+re-certified at **1**. The brief's own go-red (producer skips the install, `installs=0` with
+`reports>0`) needs a relative pointer, which no QEMU leg on this arch has — it is flight 10's.
+
+**What flight 10 must show, in this tree.** With a pad talking: `[ptrinstall] installs=0
+reports=N lag_max_ms=L coalesced=C drains=D folds=F` every 5 s beside `[schedx86] depth`, with
+`N == D + F + C` at every quiet sample and `L` reading the longest `[wcser] PASS OVERDUE … at=span-flush
+age_ms=` hold of the boot in the same units — the number CHOP inferred from a fold ratio, measured.
+Once the two-file change above lands: `installs == reports` and `lag_max_ms` at one input-service
+pass (`sleep_ticks(1)`, ~1 ms), with the pointer's POSITION tracking the pad through a span-flush
+stall; whether its PIXELS track through the stall is SPANFLUSH's (B116) — a stalled present owns
+the layer rows it is copying, and no install on any core can publish over them faster.
+
+**Observation, not this arc's (route it):** the `[schedx86] depth` line reads `sent` and `recv` as
+two relaxed loads with no snapshot, so a Timer send/recv landing between them prints `recv > sent`
+and `inflight` wraps: this run's last sample is `sent=541 recv=542 inflight=18446744073709551615`;
+zero such lines in the 11ca67f1 capture of the same lane. Shared x86 code, one sample in 28, cosmetic
+until someone scores `inflight` numerically.
