@@ -16347,11 +16347,11 @@ impl XhciController {
 // as the Orin prints it — baseline `:: MOUSE-1: … vid:pid=0000:0000` one line under
 // `xHCI: HUB downstream slot 3 device class=0x0 vid=0627 pid=0001`.
 //
-// ⚠ `evts` IS REPORTED, NOT SCORED, and this is a gap with a name. The brief's third PASS clause was
+// `evts` IS REPORTED HERE AND SCORED BY THE HARNESS since HIDPTR (arroyo requires evts>0 on the UNAOS_XHCIHUB leg; the pointer typist in scripts/qmp_type.py drives it). The kernel line verdicts four clauses,
 // "the downstream pointer delivers events", which needs pointer injection over QMP; `scripts/qmp_type.py`
 // is KEY-ONLY (`send-key`/`input-send-event` over qcodes, no `abs`/`rel`/`btn`), so that clause needs
 // that script to grow a pointer mode plus an `arroyo` typist block — neither file is in this brief's
-// FILES list, so it is REPORTED rather than taken. `evts` is the downstream pointer's own
+// FILES list, so the fifth clause was taken by the harness rather than here. `evts` is the downstream pointer's own
 // `mouse_report_count`; with nothing moving the QEMU tablet it is legitimately 0, and scoring on it
 // would be a gate that fires on every input, which LAWS §5 calls a constant.
 #[cfg(feature = "witness")] pub static XHCIHUB_SLOT: AtomicU64 = AtomicU64::new(0);
