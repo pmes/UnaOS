@@ -237,6 +237,7 @@ gmux_igd|:: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD|intel-ivb|me
 unaos_ivb|@boot iGPU trace 1 (pre-EBS) collected.|-|measured
 ahci|:: AHCI: port=|-|measured
 bar1wedge|:: BAR1WEDGE: rung=first-stall|-|measured
+bar1exp-uc|:: x86 bar1exp: UC arm ARMED|-|measured
 beam|:: BEAMX86: head=|nvidia-kepler,nvidia-kepler-takeover|measured
 ftdirx|:: FTDIRX: first byte rx=|-|measured
 gen7r8|:: gen7: r8 begin rung=R8 wake=|-|measured
