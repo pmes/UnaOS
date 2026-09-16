@@ -1628,6 +1628,55 @@ steal path (not just placement). Both are `all(feature = "pi", feature =
 and the jetson/virt builds. The `SCHED: task ... -> core N (policy: ...)` line is
 the spawn-placement decision witness (already present from SCHED-3).
 
+### A verdict task is pinned to its launcher's core (aarch64, SMPBALK8)
+
+Measured 2026-09-16 on the Pi 4 QEMU lane (`UNAOS_QEMU_FULL=1 ./arroyo kernel8-test 300`,
+three failing runs at `fa4dcf0b` and `11ca67f1`, two of them on a quiet host): the two
+ERET-SCRUB REQUIREs were absent — not FAIL, absent — and every failing serial carried
+`:: [smpbal] steal 'eret-verdict' c2->c0 (m=1) ::` right after the verdict's own
+`SCHED: task 'eret-verdict' -> core 2 (policy: load-balanced, …)` placement. The
+per-line table is `docs/dev/evidence/rmbp-0915/smpbalk8/SMPBALK8.md`.
+
+**The steal is the balancer working as designed, not a bug.** `steal_ok` is decided once
+at spawn — `requested_cpu == CPU_AUTO` in `spawn_inner` — so a load-balanced kernel task
+is steal-eligible and a caller-pinned one is not; `steal_one` skips `!steal_ok` and the
+cooldown, and a never-migrated task clears the cooldown at once. The `no-migrate` word on
+the `SCHED: task` line is printed for every task (it describes the wake contract, `Task.cpu`
+is the home) and never meant steal-ineligible. The steal line can even precede the
+placement line on the wire (the `fa4dcf0b` serial: steal at line 472, placement at 480)
+because `spawn_inner` pushes onto the run queue before it prints.
+
+**Why a loaded host passes.** `m=1` is `task.migrations`, a count, not a threshold. The
+steal is a race with a window: `m6e_verdict` (caller-pinned on `vcpu`, core 2) pushes the
+verdict onto core 2's queue and returns; core 2 is `running` at that instant, so the victim
+floor is 1 (`sched_spread::steal_floor`), and any online core whose `run()` pass finds its
+own queue empty in the interval before core 2 pops the task takes it. Core 0 is exactly
+there — it has just retired `el0-eretsvc`, which `CPU_AUTO` placed on it. On a quiet host
+the four vCPU threads run concurrently and core 0's idle passes are continuous, so the
+window is hit; under host load the vCPU threads are time-sliced, core 0's passes are sparse,
+and core 2 more often pops its own task first — gate 6 (load 9.55) read 126/126. This is the
+mechanism consistent with the load correlation; it was not proven by a controlled run.
+
+**What is not explained.** Core 0 is an online, scheduling core on this lane (`run_bsp(0)`
+→ `mark_online(0)` → `run()`; `el0-eretsvc` was placed there by `CPU_AUTO` and exited
+there; core 0 stole three more times later in the same run, so its queue was empty again).
+A kernel task dispatched on core 0 after the steal produced no line, and no drop, refuse or
+kill witness fired for it. In one of the three runs `u4-launch`, caller-pinned on core 2 and
+never stolen, also printed neither its PASS nor its FAIL. That is open on the trunk queue.
+
+**The fix (SMPBALK8), the smallest of the three candidates.** `eret_scrub_launch` now
+spawns `eret-verdict` on the caller's core (`percpu::this_cpu().cpu_index`), exactly as
+`main.rs` pins the M6b/M6d/M6f verdicts to `vcpu`; those printed in 3/3 runs, and
+`CPU_AUTO` was the only property separating the ERET verdict from them. The two EL0
+witnesses keep `CPU_AUTO` (slot tasks are `steal_ok = false` anyway). Rejected: making the
+balancer refuse `CPU_AUTO` kernel tasks would delete work stealing, since the balancer
+already honours real pins; making `CPU_AUTO` skip the BSP is a policy core reservation
+(LAWS §3, R35). Cost: the verdict no longer exercises load-balanced placement or the steal
+lane — it is a witness, not workload. The edit is on one existing line of `syscall.rs`
+(zero lines added; `panic::Location` embeds source lines and the file is in every aarch64
+image); the x86 image cannot move (the file is not compiled there) and the aarch64 delta is
+measured by `./arroyo knoboff witness`, quoted in the commit.
+
 ### The BSP joins the scheduler + the GUI handoff (x86_64, SCHED-X86)
 
 x86 had the whole toolkit — run queues, preemption, `Channel`, `spawn` — and used

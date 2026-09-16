@@ -6501,8 +6501,8 @@ pub fn m6e_verdict(_: usize) {
     // exist when their slot allocation succeeded — a witness that can silently not-run is exactly the
     // shape the spec's convictability hardening exists to refuse. Both fixtures live in the SHARED window's
     // code page (`setup()` latched their VAs), need no address-space slot, and write no memory, so they add
-    // no slot pressure and cannot disturb the M6d/M6f slot budget. `CPU_AUTO` places them on an ONLINE
-    // scheduled AP — never the unscheduled BSP, which `spawn_user` forbids.
+    // no slot pressure and cannot disturb the M6d/M6f slot budget. The two EL0 witnesses take `CPU_AUTO`
+    // (slot tasks: `steal_ok = false`); the VERDICT is pinned to this core — see `eret_scrub_launch`.
     eret_scrub_launch();
 }
 
@@ -6520,7 +6520,7 @@ fn eret_scrub_launch() {
     }
     super::sched::spawn_user("el0-eretentry", entry, sp, super::sched::CPU_AUTO);
     super::sched::spawn_user("el0-eretsvc", svc, sp, super::sched::CPU_AUTO);
-    super::sched::spawn("eret-verdict", eret_scrub_verdict, 0, super::sched::CPU_AUTO);
+    super::sched::spawn("eret-verdict", eret_scrub_verdict, 0, super::percpu::this_cpu().cpu_index as usize); // SMPBALK8 — caller-pinned like the M6b/M6d/M6f verdicts (`vcpu`), not `CPU_AUTO`: a CPU_AUTO kernel task is `steal_ok` (sched.rs `spawn_inner`), and in 3/3 failing `kernel8-test` runs (2026-09-16) the wire showed `[smpbal] steal 'eret-verdict' c2->c0` and then neither ERET-SCRUB line, while every sibling verdict pinned to `vcpu` printed. Same line, zero lines added: `panic::Location` embeds source lines and this file is in every aarch64 image.
 }
 
 /// ERET-SCRUB verdict task: wait (bounded, CNTPCT) for both EL0 return-path witnesses, then print the
