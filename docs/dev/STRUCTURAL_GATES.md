@@ -1675,6 +1675,136 @@ the second implementation is ever retired under R16, this gate goes with it.
 
 ---
 
+## GATE-TESTROOTS — every test suite names the command that runs it
+
+**Invariant.** Every test suite in this repo — each crate whose `src/**` carries a
+`#[test]` or a `#[cfg(test)]` module, each `tests/<name>.rs` integration target,
+and each script suite (`*_test.sh`, `run_test.sh`, a `unaos/scripts/*.py` that
+declares `--self-test`) — is **run by a leg of `check`**, or declares the command
+that runs it in a `# RUN-BY:` header, or is **registered by name** in
+`unaos/scripts/tests.registry` with its measurement. Nothing else is a pass.
+`unaos/scripts/test-roots.sh` decides it; the companion leg GATE-HOSTTESTS is what
+makes most of this tree satisfy it.
+
+**Why a gate, and the shape it closes.** This is GATE-ROOTS' argument at the third
+layer, and it is the CLASS that GATE-FOREMAN above closed for exactly one file.
+A `#[test]` is nobody's dependency: `cargo build` never compiles it and no kernel
+leg links it, so unless some command RUNS it, it is a block of assertions no run
+ever evaluates. `tools/foreman/tests/agreement.rs` was that file — checked in with
+the module it guards, named in no line of `arroyo`, **red 21/21 for weeks** while
+the tree read as "check green" — and FOREMAN-ROOT's own QUEUE §5 row left the rest
+owed in writing: *"the sweep of the rest of that class (every `#[test]`,
+`tests/*.rs` and script suite no verb names) is owed"*. This is that sweep.
+
+**The measurement that opened it,** taken over the whole repo at `11ca67f1` before
+a line was written: **59 suites, 2 of them run by anything at all** —
+`midden_core::unit` by GATE-CORE and `foreman::agreement` by GATE-FOREMAN. The
+other 57 were named by nothing. Among them: 19 suites in `unafs` (the filesystem's
+whole KAT and logic battery), `helm::rover_invariants`, `bandy::smessage_kats` (97
+assertions), `net::unit` (29 TCP assertions in a crate the kernel links),
+`rast::golden` (the cross-arch pixel oracle), `mbench.py --self-test` (38 scenarios,
+the scorer every bench verdict in this tree comes from) — and
+`tools/foreman/tests/preflight.rs`, **the sibling of the file FOREMAN-ROOT fixed,
+in the same directory, still unrun after that cut**. That last one is the argument
+for a gate rather than a fix, in one line.
+
+**Where the tree stands after the landing commit:** 59 suites, **49 GATED, 10
+REGISTERED, 0 ORPHAN** — 75 `test result: ok` lines and 533 assertions across the
+47 suites that carry any, run inside `check` for the first time, plus mbench's
+38-scenario self-test. The ten are in
+`scripts/tests.registry`, each with the command that measured it: one that cannot
+run anywhere (`unaos-kernel::unit`), seven belonging to five crates that cannot
+BUILD without a host -devel package the gate must not assume (`resonance`'s three,
+`stria`, `phonolite`, `aether`, `una` — alsa, OpenSSL and GTK build scripts, each
+quoted in the registry), one genuinely red under the gate's own no-`/tmp` discipline
+(`vaire::unit`), and one file whose name reads as a test and is not
+(`run_test.sh`). That file must shrink; every row in it is coverage this tree
+believes it has and does not.
+
+**Mechanism.** Three ways for a suite to have a runner, and exactly three.
+*GATED*: a `cargo test` line of `arroyo`'s CODE reaches it. Full-line comments are
+stripped and backslash continuations are joined before anything is matched — both
+are load-bearing, because GATE-CORE's leg is a one-liner and GATE-FOREMAN's `cd`
+and `cargo test` sit on two physical lines. **The target filter is honoured**:
+`cargo test -p foreman --test agreement` runs `tests/agreement.rs` and NOT
+`tests/preflight.rs`, and a parser that read `-p foreman` alone would have declared
+this class closed while `preflight.rs` stayed unrun. `--workspace`/`--exclude` and
+repeated `-p` expand the same way, per workspace. *DECLARED*: a `# RUN-BY: bench |
+knobleg | script:<path>` header — the GATE-SPECROOTS vocabulary and the same teeth:
+`verb:<name>` is refused outright, because a suite that claims a verb runs it must
+be findable in `arroyo`'s code or the claim is false; a `script:` path that does not
+exist is a DEAD DECLARATION. *REGISTERED*: a row in `scripts/tests.registry`,
+reported by NAME on every run — never silently skipped, because a suite that
+vanishes from the output is indistinguishable from a suite that passed.
+
+**Control.** Fifteen assertions before any verdict — nine on synthetic input whose
+answer is known, three against this tree, three on the instrument's own inputs. A
+`cargo test -p X` inside a full-line comment must NOT resolve gated and the same
+line in code MUST (the resolver that matches everything and the one that matches
+nothing, ruled out together); `--test agreement` across a continuation must cover
+`foreman::agreement` **and must not cover `foreman::preflight` or `foreman::unit`**;
+`--lib --test preflight` must cover **both** `foreman::unit` and `foreman::preflight`
+and **not** `foreman::agreement`, because cargo's target selection is ADDITIVE and a
+reader that treats it as exclusive gets the narrowing exactly backwards;
+`--workspace --exclude Y` must cover a member and not Y. Against the real tree: the
+enumeration must be non-empty, and `midden_core::unit` and `foreman::agreement` must
+both resolve GATED. And three ways the instrument can be handed an input it cannot
+answer over — an unreadable `arroyo`, a registry row with no reason (that is an
+allowlist, not a record), and two crates sharing a package name (suite ids are
+`<pkg>::<target>`, so a collision would merge two rows and let one crate's runner
+launder the other) — are each **exit 2 and no verdict**, because a gate that did not
+run is not a pass.
+
+**One more thing the enumerator has to get right, and did not at first:** the
+attribute match is anchored to the start of a line. `crates/kernel` carries five
+comment blocks explaining that its `#[cfg(test)] mod tests` were deleted on purpose
+— DECRUD-2's is the sharpest, *"the four `#[test]` fns had never been compiled, let
+alone run, on either arch"* — and an unanchored match reads every one of those
+sentences as a suite. That is GATE-SPECROOTS' comment-stripping lesson one layer
+down, and it was found by reading the census rather than by reasoning.
+
+**Goes red when** a suite is added and nothing is taught to run it — the common
+case, and the point: the fix is one `-p` in GATE-HOSTTESTS' list, a `RUN-BY` header,
+or a registry row saying what is wrong with it.
+
+**GO-RED proof, three mutations in this gate's landing worktree, each reverted.**
+(1) A synthetic `tools/sentinel/tests/orphan.rs` — an EMPTY file is enough, the gate
+reads the tree, not the code — takes it to rc=1 naming `sentinel::orphan`, census
+`suites=60 gated=49 registered=10 orphan=1`. (2) The same empty file placed at
+`unaos/crates/rast/tests/orphan.rs` instead resolves **GATED**, and that is correct
+rather than a miss: GATE-HOSTTESTS runs `cargo test -p rast` with no target filter,
+so a new integration target of `rast` really is run the moment it appears. The pair
+is what shows the resolver is answering the question and not a proxy for it.
+(3) Dropping `-p lux` from GATE-HOSTTESTS' list reds it at `lux::decode`, which is
+the "a list rots" failure mode caught by name. And `TESTROOTS_REGISTRY=/dev/null`
+against the unmutated tree reds it too, naming all ten registered suites — the
+registry cannot launder what it records.
+
+## GATE-HOSTTESTS — the suites GATE-TESTROOTS counts as run are actually run
+
+**Invariant.** One `check_both` leg runs every host-runnable suite in this tree that
+is green, in two `cargo test` invocations (one per workspace) on an EXPLICIT `-p`
+list. Explicit and not `--workspace`, for two reasons, both measured:
+`--workspace` on the root workspace cannot pass on this bench at all — `resonance`
+pulls `alsa-sys`, whose build script needs ALSA headers this bench does not have
+(`cargo test -p resonance` rc=101, **zero suites run**, the failure is a build
+failure and would take the whole leg with it) — and an explicit list is the
+ratchet: a new crate's suite is not silently absorbed, it reds GATE-TESTROOTS until
+someone adds it here or writes down why not.
+
+**Why one leg and not thirty.** Cost. One warm `cargo test -p a -p b …` resolves and
+links the selected crates once against a shared dependency build; thirty
+invocations pay thirty times. The wall this leg adds to `check` is quoted in its
+`arroyo` comment block and is re-measured whenever the list changes.
+
+**Control.** This leg is not its own control — GATE-TESTROOTS is. A suite dropped
+from the list does not vanish quietly: it becomes an ORPHAN in the census on the
+very next run, by name. That coupling is why neither gate is useful alone.
+GATE-TESTROOTS without a runner would be satisfiable by registering everything;
+a runner without GATE-TESTROOTS is a list that rots.
+
+---
+
 **Landed but not yet sectioned here:** GATE-ROOTS (`scripts/check-roots.sh`, every
 binary target is a named root of `check`) and GATE-APPEND (`scripts/append-position.sh`,
 LEDGER P7's trailing-comment trap) are both wired into `check_both` and green; their

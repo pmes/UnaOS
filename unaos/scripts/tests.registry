@@ -1,0 +1,56 @@
+# GATE-TESTROOTS registry — every test suite no command in this tree runs, and why.
+# Format: <suite id>  <reason>.  One line each, `#` starts a comment, a row with no reason is
+# exit 2 (an unreadable table is NOT a pass).
+#
+# `bash scripts/test-roots.sh` prints the census this file annotates; a registered suite is
+# REPORTED BY NAME on every run and does not fail the gate. It is named, never silently skipped —
+# that distinction is the whole point of the file, because a suite that vanishes from the output is
+# indistinguishable from a suite that passed.
+#
+# THERE ARE EXACTLY THREE LEGITIMATE KINDS OF ROW, and none of them is "we have not got round to it":
+#
+#   CANNOT RUN HERE   the suite is not runnable by any build this tree performs. The `#[cfg(test)]`
+#                     bodies inside `crates/kernel` are the case: the crate is `#![no_std]`
+#                     UNCONDITIONALLY, so `cargo test -p unaos-kernel` cannot link a test harness on
+#                     the host, and no cross-compiled kernel build compiles a `#[cfg(test)]` module
+#                     either. Those assertions are dead in every image and on every host. The row
+#                     says so; the FIX is a cut that either moves the logic into a host-testable
+#                     core (the `midden_core` / `helm` / `unafs` shape this tree already uses and
+#                     GATE-CORE already runs) or deletes the module.
+#
+#   RED TODAY         the suite runs and fails, or fails to build, HERE AND NOW. The row carries
+#                     the measurement and the id of the cut that owns the fix. A red suite is
+#                     reported by name every run; that is strictly better than the FOREMAN-ROOT
+#                     state, where a suite was red for weeks and nobody could learn it because
+#                     nothing ran it.
+#
+#   NOT A SUITE       the file's NAME reads as a test and its CONTENT is not one — no assertion, no
+#                     verdict, nothing that can fail. It is registered rather than ignored because
+#                     the name is the defect: it is read as coverage by everyone who lists the tree.
+#                     The fix is to give it a verdict or to delete it, and both are somebody's cut.
+#
+# A ROW CITES THE MEASUREMENT, not a reason string alone (the k8-reach.registry rule, pi 7,
+# 2026-09-06): quote the command and what it printed.
+#
+# THIS FILE MUST SHRINK. Every row is coverage this tree believes it has and does not.
+#
+# Seeded 2026-09-16 by GATE-TESTROOTS' landing commit (TESTROOTS), at 11ca67f1. The census then:
+# 59 suites, 2 run by anything at all (`midden_core::unit` by GATE-CORE, `foreman::agreement` by
+# GATE-FOREMAN), 57 named by nothing. The landing commit's GATE-HOSTTESTS leg takes that to 49
+# GATED and 0 ORPHAN; these ten are the remainder, and every one of them is a job, not a state.
+
+# ── CANNOT RUN HERE ───────────────────────────────────────────────────────────────────────────────
+unaos-kernel::unit  CANNOT RUN — `crates/kernel` is `#![no_std]` UNCONDITIONALLY (`src/lib.rs:1`), so no test harness can link on the host and no cross-compiled build compiles a `#[cfg(test)]` module either. Measured: `cd unaos && cargo test -p unaos-kernel` rc=101, 29 s, `rust-lld: error: undefined symbol: main` — Scrt1.o's `_start` looking for a `main` the crate does not have. What is behind it TODAY is small and the tree already knows why: ONE `#[cfg(test)] mod tests` at `src/sched_spread.rs:94` (3 `#[test]` fns over the `const fn` steal-cooldown arithmetic). Five other files carry comment blocks saying their `mod tests` was DELETED deliberately — DECRUD-2 at `gui_watchdog.rs:95-99` states the finding in this gate's own words, "the four `#[test]` fns had never been compiled, let alone run, on either arch" — and `drivers/block.rs:3066`, `drivers/emmc2.rs:933`, `drivers/gpu/igpu.rs:1691`, `drivers/gpu/kepler.rs:4063` and `arch/aarch64/serial.rs:942` each say the same. So the ruling this row records is already made and `sched_spread.rs` is the one site that has not followed it. THE FIX, when a cut takes it: move `steal_cooldown_ms`/`steal_cooled` into a host-testable core the kernel links (the `midden_core` / `helm` / `unafs` shape GATE-CORE and GATE-HOSTTESTS already run), or delete the module as its five neighbours did. Owner: no ledger id yet — REPORTED to QUEUE §5 by TESTROOTS 2026-09-16.
+
+# ── RED TODAY ─────────────────────────────────────────────────────────────────────────────────────
+vaire::unit  RED UNDER THE GATE'S OWN TMPDIR DISCIPLINE, and that is the finding. `cargo test -p vaire` alone is green (64 passed, 77 s) — because `tempfile::tempdir()` lands in /tmp, which LAWS §Scratch forbids on this bench. Pin TMPDIR into the tree as GATE-HOSTTESTS and GATE-FOREMAN both must, and it is `test result: FAILED. 63 passed; 1 failed`: `repo::tests::plan_names_an_unreadable_source_instead_of_failing` (`handlers/vaire/src/repo/tests.rs:104-116`) builds a tempdir that is deliberately NOT a git repo and asserts `WeaveAction::SourceUnreadable`, but a tempdir inside this worktree IS inside a repo — git discovery walks up and finds the enclosing one — so it gets `WeaveAction::Clone`. The assertion is right about the behaviour and wrong about how it obtains a non-repo: it is location-dependent, and no location inside this tree satisfies it. NOT FIXED HERE (it is one line of a file this cut may not touch, and the right fix — a repo ceiling such as `GIT_CEILING_DIRECTORIES`, or asserting against a path that cannot be a repo — is a judgement about vaire's own contract). The other 63 assertions are real coverage this tree does not get until it is fixed. Owner: no ledger id yet — REPORTED to QUEUE §5 by TESTROOTS 2026-09-16.
+resonance::unit  BUILD FAILS on a bench without libasound headers: `cargo test -p resonance` rc=101, 5 s, `error: failed to run custom build command for alsa-sys v0.4.0` — its build script panics at `build.rs:13`, zero suites run. This is a HOST PACKAGE the gate cannot install and must not assume; naming it in GATE-HOSTTESTS' list would turn `check` red on any bench that lacks it. The suite itself has never been observed either way. Owner: no ledger id yet — REPORTED to QUEUE §5 by TESTROOTS 2026-09-16.
+resonance::graph_test  Same crate, same build script, same measurement as `resonance::unit` above — the whole crate fails to build, so no target of it runs.
+resonance::patch_test  Same crate, same build script, same measurement as `resonance::unit` above.
+stria::unit  BUILD FAILS on the same missing libasound headers: `cargo test -p stria` rc=101, 5 s, `error: failed to run custom build command for alsa-sys v0.4.0`, zero suites run. Same class as `resonance::unit`. Owner: no ledger id yet — REPORTED to QUEUE §5 by TESTROOTS 2026-09-16.
+phonolite::unit  BUILD FAILS on the same missing libasound headers: `cargo test -p phonolite` rc=101, 1 s, `error: failed to run custom build command for alsa-sys v0.4.0`, zero suites run. Same class as `resonance::unit`. Owner: no ledger id yet — REPORTED to QUEUE §5 by TESTROOTS 2026-09-16.
+aether::unit  BUILD FAILS on missing OpenSSL headers: `cargo test -p aether` rc=101, 32 s, `error: failed to run custom build command for openssl-sys v0.9.117`, zero suites run. The largest single unrun body in the tree — `src/engine_tests.rs` alone carries 62 `#[test]` fns over the CSS cascade, the net layer and the renderer — and none of it has ever been observed green or red here. Same host-package class as `resonance::unit`. Owner: no ledger id yet — REPORTED to QUEUE §5 by TESTROOTS 2026-09-16.
+una::unit  BUILD FAILS on missing GTK development headers: `cargo test -p una` rc=101, 65 s, `error: failed to run custom build command for gobject-sys v0.22.6`, zero suites run. Same host-package class as `resonance::unit`. Owner: no ledger id yet — REPORTED to QUEUE §5 by TESTROOTS 2026-09-16.
+
+# ── NOT A SUITE AT ALL ────────────────────────────────────────────────────────────────────────────
+script:run_test.sh  NOT A TEST, and its NAME is the defect. `run_test.sh` (repo root, 7 lines) backgrounds `cargo run -p aether-shell --features gtk`, sleeps 4, kills the pid and cats the log. It asserts nothing, returns the exit status of `cat`, and can therefore never fail — while its name reads as coverage to anyone listing the tree, which is the exact confusion GATE-TESTROOTS exists to end. It also writes `/tmp/aether_run.log`, which LAWS §Scratch forbids on this bench. THE FIX is one of two things and neither is this cut's: give it a verdict (a marker it greps for, and a non-zero exit when the marker is absent), or delete it and let `cargo run` be typed directly. Owner: no ledger id yet — REPORTED to QUEUE §5 by TESTROOTS 2026-09-16.
