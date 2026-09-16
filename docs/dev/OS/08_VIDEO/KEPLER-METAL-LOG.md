@@ -8,6 +8,110 @@ QEMU behavior. Newest sitting first.
 > in [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) (R19; rmbp-ledger B10). This file stays the
 > per-sitting narrative; the register is the verdict table.**
 
+## PENDING METAL — KDHEAD (shut-out register §1, rung KD14): does any candidate per-head block actually separate the four heads, and does one of them decode to the surface the firmware handed us?
+
+**Nothing below is a metal fact yet.** It is the witness the next flight scores, written down before
+the flight so the scoring cannot drift into the reading. Build knob: add `UNAOS_KEPLER_KDHEAD=1` to
+the flight line, **and `UNAOS_BEAM=1` with it** — the two rungs share ONE per-head sample and without
+`beam` this rung has no control bracket and withholds its decode on purpose. The flight line is
+therefore `UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1 UNAOS_WC=1 UNAOS_BEAM=1 UNAOS_KEPLER_KDHEAD=1`.
+⚠ Fly it WITHOUT the SHUTRESTORE display write rungs (`UNAOS_KEPLER_REPOINT`,
+`UNAOS_KEPLER_LATCH_ARM`, `UNAOS_KEPLER_PITCH_LADDER`) on the same boot: each of those writes display
+state, and a per-head census taken after one of them is a census of a machine we perturbed.
+
+**WHAT THIS RUNG IS.** Register §1 records KD3 `head-raw` as **shut-out** and its "what would change
+the verdict" names exactly one thing: *"re-run the per-head decode with KD4's HEAD_STAT as the
+bracket and the per-head stride re-derived for the 917D class. The rung failed because it had no
+control read, not because the heads are dead; KD4 proves head 0 scans."* This is that re-run. It
+writes nothing (`writes=0`: every device access is `mmio_read`, there is no `mmio_write` and no
+`write_volatile` in it), and it answers in three parts that are separable on the wire.
+
+**THE BRACKET, and it is BORROWED rather than re-taken.** KD3's whole defect is that four
+byte-identical reads were scored as "the heads are dead" with nothing in the same capture saying
+whether any head was scanning. KD4 is that missing reading (s11: `head[0] stat underflow=0
+vert=0x0493048A horz=0x0000068C`, heads 1–3 zero), and BEAMX86 already automates it across all four
+heads. So `beam_probe` publishes its per-head census and KDHEAD reads it:
+
+```
+:: KDHEAD: bracket source=beamx86-census live=[y,n,n,n] :: census_adv=[…] census_vbd=[…] … ::
+```
+
+`live` is BEAMX86's own test — `adv > 0 && vbd >= 2`. Taking a second 4 × 45 ms sample here would
+cost another 180 ms inside the takeover **and** would be a different sample than the one the beam
+gate armed on, so a disagreement between the two would be unattributable. A head the bracket calls
+DARK gets `DARK-NOT-SCORED` on its decode line, never a verdict (R19). `bracket source=absent` means
+`beam` was not in the build or `beam_probe` did not run; the stride census still prints, every decode
+is withheld, and **that capture is not evidence about the hardware.**
+
+**THE STRIDE, measured, with the trap named.** Five candidate blocks, each named by the tree or by a
+sitting, each read at head 0 and heads 1..3:
+
+| block | base / stride | probe words | provenance |
+| --- | --- | --- | --- |
+| `headstat` | `0x616000` / `0x800` | `+0x308 +0x30C +0x310 +0x34C` | **[EXT]** g80_pdisplay.xml:647 (`HEAD_STAT` off 0x6000, stride 0x800, len 4, GK104-) + **[TREE]**; `+0x308` **[METAL s11]**; `+0x30C`/`+0x310` **[METAL s12+s13]** stable head-0-only config; `+0x34C` **[METAL s13]** `0x07380BAF` = vtotal 0x738 \| htotal 0xBAF |
+| `armed100` | `0x616100` / `0x800` | `+0x00 +0x08 +0x0C` | **[METAL s4]** — sitting #4's own three offsets, the reading this rung re-takes. The ADDR/SIZE/STORAGE field ROLES are **[UNPINNED]** (s4 itself: "addr=0x00000001 is not address-shaped") |
+| `evocore` | `0x610460` / `0x300` | `+0x00 +0x08 +0x0C` | **[TREE]** candidate A + BEAMX86's `evo_size`; layout **[EXT]** nv_evo.xml; that PDISPLAY MMIO mirrors those METHOD offsets is **[UNPINNED]**, read all-zero ×4 at **[METAL s11]** |
+| `headval` | `0x610A00` / `0x540` | `+0x118 +0x120 +0x128` | **[TREE]** candidate B; **[EXT]** g80_pdisplay.xml:371–408 but marked G80:GF119, so **[UNPINNED]** on GK107; all-zero ×4 at **[METAL s11]** |
+| `mirror` | `0x640400` / `0x300` | `+0x20 +0x60 +0x68 +0x6C` | head-0 record `+0x20`/`+0x60` **[METAL s16]**, `+0x68`/`+0x6C` **[METAL s25 / KD8]**; **[TREE]** `fb-draw reg-dump`. **The per-head stride 0x300 is [UNPINNED]** — every sitting read head 0's record only, which is precisely why it is on this table |
+
+```
+:: KDHEAD: block=<name> base=0x… stride=0x… heads_distinct=<n>/4 :: stable=<k>/<p> readable=<r>/4 verdict=… cite=… ::
+```
+
+**The trap, and the reason every block is read TWICE with a settle between: a counter defeats this
+test in the WRONG direction.** If a stride collapses, all four "heads" are one register — and four
+reads of one *counter* taken microseconds apart come back with four different values and score
+`heads_distinct=4/4`, a broken stride reading as a working one. The `headstat` bank holds exactly
+such counters (`+0x340` VERT, `+0x344` HORZ, and the frame counter at `+0x314`, **[METAL s13]**), so
+none of them is probed, and on top of that every probe word that MOVED between the two passes is
+struck from the distinctness tuple. `stable=` says how many survived; a block where none survived
+scores `heads_distinct=0/4`, which is arithmetically impossible for a real reading (a head is always
+distinct from nothing), so the zero is the unambiguous "not scored" marker and `verdict=` on the same
+line reads `UNSCORABLE-all-words-volatile`. A literal zero is a legal reading and is never treated as absent
+— that error is KD3's, in the other direction; only `0xFFFFFFFF` and the `0xBADxxxxx` family count as
+"did not answer", and `readable=` reports them.
+
+**THE DECODE — only where the stride earned it AND the bracket says the head is live:**
+
+```
+:: KDHEAD: head=<h> live=<yes|no> geom=<w>x<h> surface=0x… pitch=<n> vs gop=<w>x<h> 0x… <n> -> AGREE|DISAGREE|UNREADABLE :: block=… mismatch=… slicing=… ::
+```
+
+The comparison is against what the takeover already inherited from the firmware — the GOP
+framebuffer's VRAM offset, its width/height and `stride*bpp` — printed on its own
+`:: KDHEAD: gop …` line so the reference is in the capture and not in someone's memory. The only
+block with a metal-pinned slicing is `mirror` (**[METAL s25]**: `0x640468 = 07080B40` = h1800 w2880
+and `0x64046C = 01004000` = SET_STORAGE bit24 LAYOUT=1 PITCH/LINEAR, pitch `0x4000` = 16384 B/row);
+every other slicing prints its own **[UNPINNED]** tag on the same line. `headstat` decodes to
+`decode=none reason=no-cited-slicing` **by design** — **[METAL s13]** settled that bank in the
+negative ("the scanout surface ADDRESS is not exposed anywhere in these head-block windows") and
+`+0x34C` is raster TOTALS **[METAL s13]**, not the active geometry; printing a slicing we cannot cite would be KD3's error a second
+time.
+
+**The three numbers this flight owes, in order of what they settle:**
+
+1. **`heads_distinct` on `mirror`.** This is the one block whose FIELDS are metal-decoded and whose
+   STRIDE never has been — s16 and s25 both read head 0's record and nothing else. `2/4` or better
+   means the core-channel method stride separates heads on this part and the per-head decode has a
+   block to stand on. `1/4` means the 0x640400 record is one head's record aliased four times, and
+   KD8's whole decode is a head-0 fact only.
+2. **`heads_distinct` on `armed100` — sitting #4's inference, re-taken as a measurement.** s4 read
+   `addr=00000001 size=078004FE storage=0A0006A8` identically on four heads and concluded the stride
+   was collapsing. If this rung reads `1/4` with `stable=3/3`, that inference is now an observation.
+   If it reads `2/4` or more, **s4 was wrong about the stride and right about the field offsets**,
+   which is a different repair entirely and re-opens KD3 from the other end.
+3. **`-> AGREE` anywhere.** One agreement on a live head pins that block's slicing by observation
+   and closes the question KD3 opened in July. `-> DISAGREE` with `mismatch=geom` on a block whose
+   halves are `0x0780`-shaped **[METAL s4]** is the s4 finding again ("this IS display geometry, just sliced
+   wrong") and names the next arithmetic to try. `-> DISAGREE` with `mismatch=surface` on a block
+   that agrees on geometry AND pitch is the strongest single result short of AGREE: it would mean
+   the block is the right one and only the address shift is wrong.
+
+**Control that must accompany the flight image** (the rung cannot run in QEMU — q35 has no Kepler, so
+a q35 log with zero `KDHEAD` lines proves nothing about the code being present):
+`LC_ALL=C grep -a -o -F 'KDHEAD' target/x86_64_esp/kernel.elf | wc -l` on the flight artifact, and
+`⚡ kernel features:` must name `nvidia-kepler-kdhead` **and** `beam`.
+
 ## PENDING METAL — BEAMX86 (rmbp ledger A5, `fixed-unflown`): does the Kepler head's `VERT` behave as a raster?
 
 **Nothing below is a metal fact yet.** It is the witness the next flight scores, written down before

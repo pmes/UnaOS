@@ -499,7 +499,7 @@ pub unsafe fn takeover_display(
     // this line — the draw, the hold, the register dumps — is untouched.
     let repainted = crate::video::fbcon::panel_console_resume();
     serial_println!(":: kdisp: console-repaint rows={} ::", repainted);
-    kdisp_phase!("panel_console_resume"); #[cfg(all(feature = "nvidia-kepler", feature = "beam"))] beam_probe(bar0); // BEAMX86 (rmbp A5) — the beam source's ONE call site, folded onto this line so the knob-off image cannot shift. Strictly AFTER the console resume (the head is repointed, the pattern cleared, the surface settled, so the raster this samples is the one presents will be ordered against) and strictly BEFORE the compositor activation below, so the first window present is already bracketed. Read-only and bounded: 4 heads x 45 ms = 180 ms, every head sampled even after one ARMS, because a NONE that names only the chosen head is not diagnosable from a flight log and the per-head census is what makes it so. Negligible beside the 1.12 s x5 `fb-draw hold` this same function already spends.
+    kdisp_phase!("panel_console_resume"); #[cfg(all(feature = "nvidia-kepler", feature = "beam"))] beam_probe(bar0); #[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))] kdhead_probe(bar0, gop_vram_offset, expected_width, expected_height, fbcon_row_bytes); // BEAMX86 (rmbp A5) — the beam source's ONE call site, folded onto this line so the knob-off image cannot shift. Strictly AFTER the console resume (the head is repointed, the pattern cleared, the surface settled, so the raster this samples is the one presents will be ordered against) and strictly BEFORE the compositor activation below, so the first window present is already bracketed. Read-only and bounded: 4 heads x 45 ms = 180 ms, every head sampled even after one ARMS, because a NONE that names only the chosen head is not diagnosable from a flight log and the per-head census is what makes it so. Negligible beside the 1.12 s x5 `fb-draw hold` this same function already spends. ── KDHEAD (register §1 rung KD14) rides the SAME line, for the same reason and in the same shape: its call sits immediately after beam_probe's because the control bracket it scores every head against IS the census beam_probe just published — the same sample, never a second one — and folding it here means a build without `nvidia-kepler-kdhead` keeps this function's line numbering byte-for-byte. Read-only and bounded: 5 candidate blocks x 4 heads x <=4 words, read twice with one settle spin per block; writes=0. Without `beam` the rung still runs its stride census and prints `bracket=absent`, and every decode is withheld — see the tail block for why a bracketless capture may never be read as a statement about a head.
 
     // WC-X86 seam. Strictly AFTER the console resume above, and for the same reason the console
     // resume is strictly after the calibration draw: this is the first line at which the panel is
@@ -1012,6 +1012,12 @@ pub unsafe fn beam_probe(bar0: usize) {
         }
     }
 
+    // KDHEAD (register §1 rung KD14) borrows THIS census rather than taking a second 4x45 ms sample:
+    // its decode must be bracketed by the same reading the beam gate armed on, or a disagreement
+    // between the two would be unattributable. One cfg'd statement, stores only, no device access.
+    #[cfg(feature = "nvidia-kepler-kdhead")]
+    kdhead_publish_census(&c_adv, &c_vbd);
+
     if let Some((head, vtotal, samples, vbd, max, adv, evo_size)) = chosen {
         BEAM_VTOTAL.store(vtotal, Ordering::Relaxed);
         // Published LAST, with Release: it is the gate `scanout_beam` reads, and a reader that sees
@@ -1056,3 +1062,541 @@ pub fn scanout_beam() -> Option<(u32, u32)> {
 }
 
 
+
+// ── KDHEAD (rmbp, shut-out register §1 rung KD14) — the per-head decode, BRACKETED ────────────────
+//
+// THE RUNG THE REGISTER ASKED FOR. `SHUTOUT-REGISTER.md` §1 records KD3 `head-raw` as **shut-out**,
+// and its "what would change the verdict" names exactly one thing: *"re-run the per-head decode with
+// KD4's HEAD_STAT as the bracket and the per-head stride re-derived for the 917D class. The rung
+// failed because it had no control read, not because the heads are dead; KD4 proves head 0 scans."*
+// This is that rung. It is READ-ONLY (`writes=0`), it runs behind a knob of its own that is DEFAULT
+// OFF, and it answers in three parts that are deliberately separable on the wire.
+//
+// PART 1 — THE CONTROL BRACKET, AND WHY IT IS BORROWED RATHER THAN TAKEN AGAIN. KD3's whole defect
+// is that four byte-identical reads were scored as "the heads are dead" with nothing in the same
+// capture saying whether any head was scanning at all. KD4 (`head[0] stat underflow=0
+// vert=0x0493048A`, **[METAL s11]**) is that missing reading, and BEAMX86 already automates it:
+// `beam_probe` samples `HEAD_STAT.VERT` on all four heads for 45 ms each and keeps a per-head census
+// of how often the line counter climbed (`adv`) and how often `vblank_count` ticked (`vbd`). Taking
+// that sample a SECOND time here would cost another 180 ms inside the takeover AND — worse — would
+// be a different sample than the one the beam gate armed on, so a disagreement between the two would
+// be unattributable. So BEAMX86 publishes its census and this rung READS it. A head with `adv > 0 &&
+// vbd >= 2` is LIVE; anything else is DARK, and a decode read against a DARK head is scored
+// `DARK-NOT-SCORED`, never "wrong" — that is R19's rule applied to this rung's own output.
+//   ⚠ The bracket therefore needs `UNAOS_BEAM=1` on the same boot. Without it the rung still runs
+//   its stride census (part 2, which needs no bracket) and prints `bracket=absent` with every decode
+//   line scored `NO-BRACKET-NOT-SCORED`. A capture with no bracket may never be read as a statement
+//   about the hardware.
+//
+// PART 2 — THE STRIDE, RE-DERIVED RATHER THAN ASSUMED, AND THE COUNTER TRAP. Sitting #4 read
+// `head-raw addr=00000001 size=078004FE storage=0A0006A8` byte-identical on all four heads at
+// `0x616100 + head*0x800` and concluded "the stride is collapsing" (**[METAL s4]**). That inference
+// is testable directly: read the SAME word at head 0 and heads 1..3 and ask whether they DIFFER. If
+// four heads at a claimed stride hand back one value, the stride does not separate heads for that
+// block and every per-head number taken from it is one head's number printed four times.
+//   The trap in that test, and the reason this rung reads every block TWICE with a settle between:
+//   **a counter defeats it in the wrong direction.** `HEAD_STAT.VERT`/`HORZ` and the frame counter at
+//   `+0x314` (**[METAL s13]**) change between two reads microseconds apart, so four reads of ONE
+//   collapsed register return four different values and score as `heads_distinct=4/4` — a stride
+//   that is wrong reading as a stride that works. So each probe word is read at every head, settled,
+//   and read again; a word that MOVED is marked volatile and is EXCLUDED from the distinctness
+//   tuple. Only words that held still at every head vote. `stable=` on the block line says how many
+//   of the block's probe words survived that filter, and a block with `stable=0` scores
+//   `heads_distinct=?` rather than a number.
+//
+// PART 3 — THE DECODE, ONLY WHERE IT IS EARNED. A block is decoded only if its stride actually
+// separated heads AND the bracket says the head is live. The decoded fields are the mode geometry,
+// the surface address and the pitch, each sliced the way a source this bench can cite slices it, and
+// compared against what the takeover already inherited from the firmware — the GOP framebuffer's
+// VRAM offset, its width/height, and `stride*bpp`. `-> AGREE` on the live head pins the decode BY
+// OBSERVATION and re-opens KD3; `-> DISAGREE` names the first field that differs, which is a finding
+// about the slicing and not about the silicon.
+//
+// CITATION CLASSES (falcon_microcode_spec.md §0.1) ride every offset in the tables below and are
+// printed on the wire beside the block they belong to: **[TREE]** = this tree already reads the
+// address; **[METAL sN]** = observed on this bench in sitting N; **[EXT]** = envytools/rnndb names a
+// register this bench has also observed; **[UNPINNED]** = external or inferred with no observation
+// on THIS part — probe-only, never a basis for a write. This rung writes nothing at all, so no
+// UNPINNED claim is ever acted on: it is read, printed, and labelled.
+//
+// KNOB-OFF. Every item below is `all(nvidia-kepler, nvidia-kepler-kdhead)`-gated and APPENDED AT THE
+// FILE TAIL, below BEAMX86's own tail block, so no knob-off line number moves; the single call site
+// is folded onto the existing statement line inside `takeover_display` that already carries
+// BEAMX86's. The census publication is one cfg'd statement INSIDE `beam_probe`, which does not exist
+// in a build without `beam`.
+
+/// KDHEAD — GK104 head count, the same four the read-only decode and BEAMX86 walk.
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))]
+const KDHEAD_HEADS: usize = 4;
+/// KDHEAD — maximum probe words per block (the table's widest row uses all four).
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))]
+const KDHEAD_PROBES: usize = 4;
+/// KDHEAD — settle between the two census passes, so a counter has time to move and be caught.
+/// Same magnitude as the `mirror-sp` volatility check this file already uses (`run_recon` pass 2).
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))]
+const KDHEAD_SETTLE_SPINS: u32 = 1_500_000;
+
+/// KDHEAD — the rung runs ONCE per boot. `takeover_display` has a known double-invocation
+/// (**[METAL s15]**, "full ladder ran twice"), and two copies of this census in one capture would
+/// invite a reader to diff them as if they were a control.
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))]
+static KDHEAD_RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// KDHEAD — BEAMX86's per-head `adv` census, published by `beam_probe` so this rung can bracket its
+/// decode against the SAME sample the beam gate armed on instead of taking a second one.
+#[cfg(all(feature = "nvidia-kepler", feature = "beam", feature = "nvidia-kepler-kdhead"))]
+static KDHEAD_CENSUS_ADV: [core::sync::atomic::AtomicU32; KDHEAD_HEADS] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+/// KDHEAD — BEAMX86's per-head `vblank_delta` census. See `KDHEAD_CENSUS_ADV`.
+#[cfg(all(feature = "nvidia-kepler", feature = "beam", feature = "nvidia-kepler-kdhead"))]
+static KDHEAD_CENSUS_VBD: [core::sync::atomic::AtomicU32; KDHEAD_HEADS] = [
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+    core::sync::atomic::AtomicU32::new(0),
+];
+/// KDHEAD — published LAST, with Release: a reader that sees `true` also sees both arrays above.
+/// `false` means `beam_probe` never ran this boot, which is a DIFFERENT condition from "it ran and
+/// found nothing" and the bracket line says which.
+#[cfg(all(feature = "nvidia-kepler", feature = "beam", feature = "nvidia-kepler-kdhead"))]
+static KDHEAD_CENSUS_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// KDHEAD — BEAMX86 hands its per-head census over. Called from the tail of `beam_probe`'s sampling
+/// loop, with the arrays that boot's ONE sample produced. Pure stores; no read of the device.
+#[cfg(all(feature = "nvidia-kepler", feature = "beam", feature = "nvidia-kepler-kdhead"))]
+fn kdhead_publish_census(adv: &[u32; BEAM_HEADS], vbd: &[u32; BEAM_HEADS]) {
+    use core::sync::atomic::Ordering;
+    for h in 0..KDHEAD_HEADS {
+        KDHEAD_CENSUS_ADV[h].store(adv[h], Ordering::Relaxed);
+        KDHEAD_CENSUS_VBD[h].store(vbd[h], Ordering::Relaxed);
+    }
+    KDHEAD_CENSUS_DONE.store(true, Ordering::Release);
+}
+
+/// KDHEAD — the control bracket, or `None` when BEAMX86 did not sample this boot.
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead", feature = "beam"))]
+fn kdhead_bracket() -> Option<([u32; KDHEAD_HEADS], [u32; KDHEAD_HEADS])> {
+    use core::sync::atomic::Ordering;
+    if !KDHEAD_CENSUS_DONE.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut adv = [0u32; KDHEAD_HEADS];
+    let mut vbd = [0u32; KDHEAD_HEADS];
+    for h in 0..KDHEAD_HEADS {
+        adv[h] = KDHEAD_CENSUS_ADV[h].load(Ordering::Relaxed);
+        vbd[h] = KDHEAD_CENSUS_VBD[h].load(Ordering::Relaxed);
+    }
+    Some((adv, vbd))
+}
+
+/// KDHEAD — no BEAMX86 in this build, so there is no bracket and the rung says so rather than
+/// inventing one. The decode half is withheld; the stride census still runs.
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead", not(feature = "beam")))]
+fn kdhead_bracket() -> Option<([u32; KDHEAD_HEADS], [u32; KDHEAD_HEADS])> {
+    None
+}
+
+/// KDHEAD — one candidate per-head register block: where head 0's record starts, what stride the
+/// source claims separates the heads, which words inside the record to score, and the citation class
+/// of every one of those numbers.
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))]
+struct KdheadBlock {
+    /// Short name, printed in `block=`.
+    name: &'static str,
+    /// BAR0 offset of head 0's record (absolute, the way `mmio_read` takes it).
+    base: usize,
+    /// Claimed per-head stride.
+    stride: usize,
+    /// Sub-offsets read at every head. Only the first `nprobe` entries are used.
+    probe: [usize; KDHEAD_PROBES],
+    /// How many entries of `probe` are live.
+    nprobe: usize,
+    /// Citation class of the base, the stride and the probe offsets, printed on the block line.
+    cite: &'static str,
+}
+
+/// KDHEAD — the candidate blocks, every one of them named by the tree or by a sitting. Nothing here
+/// is invented: `headstat` and `armed100` are the block KD3 and KD4 both read (the same bank, 0x100
+/// apart), `evocore` and `headval` are this file's candidate A and candidate B, and `mirror` is the
+/// EVO core-channel method mirror that KD8 decoded on metal.
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))]
+const KDHEAD_BLOCKS: [KdheadBlock; 5] = [
+    // The bank KD4 proved: `HEAD_STAT`, offset 0x6000 from PDISPLAY, stride 0x800, length 4.
+    // Probe words are chosen to be STABLE ones — the counters in this bank (+0x340 VERT, +0x344
+    // HORZ, +0x314 the frame counter) are deliberately NOT probed, because four reads of one
+    // collapsed counter differ and would score as a working stride. +0x308 is REPORT_UNDERFLOW,
+    // read by KD4 every boot; +0x30C/+0x310 are the stable head-0-only config words s12 and s13
+    // both saw hold their value across passes; +0x34C is the mode-timing word s13 decoded as
+    // vtotal=0x738 | htotal=0xBAF, with head 1 holding a near-reset 0x00050008.
+    KdheadBlock {
+        name: "headstat", base: 0x61_6000, stride: 0x800,
+        probe: [0x308, 0x30C, 0x310, 0x34C], nprobe: 4,
+        cite: "base+stride=[EXT g80_pdisplay.xml:647 HEAD_STAT off=0x6000 stride=0x800 len=4 GK104-] and [TREE kepler_display.rs head-stat reads]; +0x308 [METAL s11 KD4]; +0x30C/+0x310 [METAL s12+s13 stable head-0-only config]; +0x34C [METAL s13 vtotal|htotal 0x07380BAF]",
+    },
+    // The sub-window sitting #4 read as the "ARMED block" and scored byte-identical on four heads.
+    // Same bank as `headstat`, 0x100 in; carried as its OWN row because KD3's verdict is recorded
+    // against these three offsets at this base and the register's re-run must address them by name.
+    KdheadBlock {
+        name: "armed100", base: 0x61_6100, stride: 0x800,
+        probe: [0x000, 0x008, 0x00C, 0x000], nprobe: 3,
+        cite: "base+stride+offsets [METAL s4 head-raw addr=00000001 size=078004FE storage=0A0006A8, byte-identical x4 — the reading this rung re-takes]; the ADDR/SIZE/STORAGE field roles at these offsets are [UNPINNED] (s4: 'addr=0x00000001 is not address-shaped')",
+    },
+    // Candidate A, this file's own: the EVO core method layout read as if PDISPLAY mirrored it —
+    // HEAD at +0x400, stride 0x300, FB_SETTINGS at +0x60, OFFSET_ORIGIN/SIZE/STORAGE at +0x0/+0x8/
+    // +0xC. BEAMX86 reads `+0x8` of head h's record for its `evo_size=` cross-check.
+    KdheadBlock {
+        name: "evocore", base: 0x61_0460, stride: 0x300,
+        probe: [0x000, 0x008, 0x00C, 0x000], nprobe: 3,
+        cite: "[TREE kepler_display.rs candidate A + BEAMX86 evo_size]; layout [EXT nv_evo.xml HEAD array GF119+, G80_EVO_FB_SETTINGS at +0x60 in NV_EVO_CORE]; that PDISPLAY MMIO MIRRORS those method offsets is [UNPINNED] and was read all-zero on four heads at [METAL s11]",
+    },
+    // Candidate B, this file's own: the pre-GF119 HEAD_VAL layout. rnndb marks it G80:GF119, so on
+    // GK107 the whole block is UNPINNED; s11 read it all-zero on four heads.
+    KdheadBlock {
+        name: "headval", base: 0x61_0A00, stride: 0x540,
+        probe: [0x118, 0x120, 0x128, 0x000], nprobe: 3,
+        cite: "[TREE kepler_display.rs candidate B]; [EXT g80_pdisplay.xml:371-408 HEAD_VAL FB_SIZE+0x118 FB_PITCH+0x120 FB_POS+0x128] but marked G80:GF119, so on GK107 base/stride/fields are [UNPINNED]; read all-zero on four heads at [METAL s11]",
+    },
+    // The EVO core-channel METHOD MIRROR at 0x640000 — the one block on this part whose fields were
+    // decoded on metal. s16 found head 0's record at +0x400 (0x640420 = the 0x07380BAF raster
+    // totals, 0x640460 = 0x200 = the GOP surface >>8); s25 (KD8 `mirror-sp`) read 0x640468 =
+    // 07080B40 (h1800 w2880) and 0x64046C = 01004000 (bit24 LAYOUT=PITCH/LINEAR, pitch 0x4000 =
+    // 16384 B/row). The STRIDE between heads is the core-channel method stride 0x300, which is
+    // [UNPINNED] here — s16/s25 only ever read head 0's record, and testing it is this rung's job.
+    KdheadBlock {
+        name: "mirror", base: 0x64_0400, stride: 0x300,
+        probe: [0x020, 0x060, 0x068, 0x06C], nprobe: 4,
+        cite: "head-0 record +0x20/+0x60 [METAL s16], +0x68/+0x6C [METAL s25 KD8 SET_STORAGE bit24 LAYOUT=1 PITCH(LINEAR) pitch=0x4000]; [TREE kepler_display.rs fb-draw reg-dump reads 0x640460..0x640470]; the per-head stride 0x300 is [UNPINNED] — every sitting read head 0's record only",
+    },
+];
+
+/// KDHEAD — what a block's probe words decode to, when this bench can cite a slicing for them.
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))]
+struct KdheadGeom {
+    width: u32,
+    height: u32,
+    /// Surface address as a VRAM byte offset, when the block holds one.
+    surface: Option<u64>,
+    /// Row pitch in bytes, when the block holds one.
+    pitch: Option<u32>,
+    /// How the three above were sliced out of the raw words, with the class of each slicing.
+    cite: &'static str,
+}
+
+/// KDHEAD — slice a block's probe words into geometry / surface / pitch. `None` means this bench
+/// cites NO surface-or-geometry slicing for that block, which is a statement about our sources and
+/// is printed as such — never as a failed read.
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))]
+fn kdhead_decode(name: &str, w: &[u32; KDHEAD_PROBES]) -> Option<KdheadGeom> {
+    match name {
+        // s25's decode, field for field, on whichever head's record we are standing in.
+        "mirror" => Some(KdheadGeom {
+            width: w[2] & 0xFFFF,
+            height: (w[2] >> 16) & 0xFFFF,
+            surface: Some((w[1] as u64) << 8),
+            pitch: Some(w[3] & 0xFFFF),
+            cite: "geom=+0x68 lo16 x hi16 [METAL s25 07080B40 = h1800 w2880]; surface=+0x60 <<8 [METAL s16 0x200 = GOP vram_off 0x20000]; pitch=+0x6C & 0xFFFF [METAL s25 01004000 -> 0x4000]; that the field is exactly 16 bits wide is [UNPINNED]",
+        }),
+        // Candidate A's own slicing, as this file has always read it.
+        "evocore" => Some(KdheadGeom {
+            width: w[1] & 0xFFFF,
+            height: (w[1] >> 16) & 0xFFFF,
+            surface: Some((w[0] as u64) << 8),
+            pitch: Some(w[2] & 0xFFFF),
+            cite: "geom=+0x08 lo16 x hi16, surface=+0x00 <<8, pitch=+0x0C & 0xFFFF — all [UNPINNED]: [EXT nv_evo.xml] gives the METHOD field order, and no sitting has read a non-zero word here to pin it",
+        }),
+        // s4's own reading of its own three words, kept in s4's shape so the re-run is comparable.
+        "armed100" => Some(KdheadGeom {
+            width: w[1] & 0xFFFF,
+            height: (w[1] >> 16) & 0xFFFF,
+            surface: Some((w[0] as u64) << 8),
+            pitch: Some(w[2] & 0xFFFF),
+            cite: "geom=+0x08 lo16 x hi16 [METAL s4 read 078004FE here and called 0x0780=1920 'display geometry, just sliced wrong']; surface=+0x00 <<8 and pitch=+0x0C & 0xFFFF are [UNPINNED] (s4: addr=00000001 is not address-shaped)",
+        }),
+        // HEAD_VAL carries a size and a pitch but no scanout address in the three probed words.
+        "headval" => Some(KdheadGeom {
+            width: w[0] & 0xFFFF,
+            height: (w[0] >> 16) & 0xFFFF,
+            surface: None,
+            pitch: Some(w[1] & 0xFFFF),
+            cite: "geom=FB_SIZE lo16 x hi16, pitch=FB_PITCH & 0xFFFF [EXT g80_pdisplay.xml HEAD_VAL] but G80:GF119-marked, so [UNPINNED] on GK107; FB_POS is a position, not a surface address, so surface=n/a by construction",
+        }),
+        // s13 settled this one, and the answer was negative: the surface address is not exposed in
+        // this bank, and +0x34C holds raster TOTALS, not the active geometry. Saying so is the
+        // honest output; inventing a slicing would be the KD3 error again.
+        _ => None,
+    }
+}
+
+/// KDHEAD — is this word a read that came back at all? `0xFFFFFFFF` is an unmapped BAR and the
+/// `0xBADxxxxx` family is the GK107's nonexistent-PRI-register signature. A literal zero is a
+/// LEGAL reading and is never treated as absent here — KD3's error was in the other direction.
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))]
+fn kdhead_answered(val: u32) -> bool {
+    val != 0xFFFF_FFFF && (val & 0xFFF0_0000) != 0xBAD0_0000
+}
+
+/// KDHEAD — re-run KD3's per-head decode with KD4's control bracket and the stride measured instead
+/// of assumed. Called ONCE from `takeover_display`, immediately after `beam_probe` so the bracket it
+/// borrows is already published, and before the compositor activation.
+///
+/// **READ-ONLY: every device access below is `mmio_read`; there is no `mmio_write`, no
+/// `write_volatile` and no allocation in this function.** It prints `:: KDHEAD:` lines and nothing
+/// else changes.
+///
+/// # Safety
+/// `bar0` must be the mapped BAR0 base this module's other reads already use.
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))]
+pub unsafe fn kdhead_probe(
+    bar0: usize,
+    gop_vram_offset: usize,
+    gop_w: u32,
+    gop_h: u32,
+    gop_pitch: u32,
+) {
+    use core::sync::atomic::Ordering;
+    if KDHEAD_RAN.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    // ── The control bracket, borrowed from BEAMX86's one sample ────────────────────────────────
+    let bracket = kdhead_bracket();
+    let mut live = [false; KDHEAD_HEADS];
+    match bracket {
+        Some((adv, vbd)) => {
+            for h in 0..KDHEAD_HEADS {
+                // BEAMX86's own liveness test, verbatim in substance: the line counter must have
+                // been seen to CLIMB and the frame counter to tick at least twice inside its 45 ms
+                // window. The vtotal sanity BEAMX86 additionally applies is about ARMING a beam
+                // source, not about whether a head scans, so it is deliberately not repeated here.
+                live[h] = adv[h] > 0 && vbd[h] >= 2;
+            }
+            serial_println!(
+                ":: KDHEAD: bracket source=beamx86-census live=[{},{},{},{}] :: census_adv=[{},{},{},{}] census_vbd=[{},{},{},{}] — KD4's control read ([METAL s11] head[0] stat vert=0x0493048A, heads 1-3 zero), taken ONCE by beam_probe over 4 heads x 45 ms and REUSED here rather than re-sampled, so the bracket and the beam gate cannot disagree. live = adv>0 AND vbd>=2. A head that is not live is DARK, and a decode read against it is scored DARK-NOT-SCORED, never wrong (R19) ::",
+                if live[0] { "y" } else { "n" }, if live[1] { "y" } else { "n" },
+                if live[2] { "y" } else { "n" }, if live[3] { "y" } else { "n" },
+                adv[0], adv[1], adv[2], adv[3], vbd[0], vbd[1], vbd[2], vbd[3],
+            );
+        }
+        None => {
+            serial_println!(
+                ":: KDHEAD: bracket source=absent live=[?,?,?,?] :: reason=no-beamx86-census-this-boot — either `beam` is not in this build or beam_probe did not run. The stride census below STILL RUNS and needs no bracket; every decode is WITHHELD and scored NO-BRACKET-NOT-SCORED. Nothing in this capture may be read as a statement about a head being dead — that is precisely KD3's shut-out condition. Fly with UNAOS_BEAM=1 ::"
+            );
+        }
+    }
+
+    serial_println!(
+        ":: KDHEAD: gop w={} h={} vram_off={:08X} pitch={} :: the takeover's inherited truth, every decode below is compared against exactly these four numbers ([TREE] fbcon::current_info + the BAR1-relative offset this function already computed) ::",
+        gop_w, gop_h, gop_vram_offset, gop_pitch
+    );
+
+    let mut n_separated = 0u32;
+    let mut n_decoded = 0u32;
+    let mut n_agree = 0u32;
+    let mut n_disagree = 0u32;
+
+    for blk in KDHEAD_BLOCKS.iter() {
+        // ── Two passes with a settle, so a counter is caught and disqualified ──────────────────
+        // Slots past `nprobe` are never read from the device and carry this module's SENTINEL, so
+        // the dumped rows below can never be misread as a probe that returned zero.
+        let mut pass0 = [[SENTINEL; KDHEAD_PROBES]; KDHEAD_HEADS];
+        let mut pass1 = [[SENTINEL; KDHEAD_PROBES]; KDHEAD_HEADS];
+        for h in 0..KDHEAD_HEADS {
+            for p in 0..blk.nprobe {
+                pass0[h][p] = mmio_read(bar0, blk.base + h * blk.stride + blk.probe[p]);
+            }
+        }
+        for _ in 0..KDHEAD_SETTLE_SPINS {
+            core::hint::spin_loop();
+        }
+        for h in 0..KDHEAD_HEADS {
+            for p in 0..blk.nprobe {
+                pass1[h][p] = mmio_read(bar0, blk.base + h * blk.stride + blk.probe[p]);
+            }
+        }
+
+        // A probe word votes on the stride only if it held still at EVERY head.
+        let mut stable = [false; KDHEAD_PROBES];
+        let mut n_stable = 0usize;
+        for p in 0..blk.nprobe {
+            let mut held = true;
+            for h in 0..KDHEAD_HEADS {
+                if pass0[h][p] != pass1[h][p] {
+                    held = false;
+                }
+            }
+            stable[p] = held;
+            if held {
+                n_stable += 1;
+            }
+        }
+
+        // How many heads ANSWERED at all (a literal zero answers; 0xFFFFFFFF and 0xBADxxxxx do not).
+        let mut n_readable = 0u32;
+        for h in 0..KDHEAD_HEADS {
+            let mut any = false;
+            for p in 0..blk.nprobe {
+                if kdhead_answered(pass0[h][p]) {
+                    any = true;
+                }
+            }
+            if any {
+                n_readable += 1;
+            }
+        }
+
+        // Distinctness over the stable words only.
+        let mut distinct = 0u32;
+        if n_stable > 0 {
+            for h in 0..KDHEAD_HEADS {
+                let mut dup = false;
+                for g in 0..h {
+                    let mut same = true;
+                    for p in 0..blk.nprobe {
+                        if stable[p] && pass0[h][p] != pass0[g][p] {
+                            same = false;
+                        }
+                    }
+                    if same {
+                        dup = true;
+                    }
+                }
+                if !dup {
+                    distinct += 1;
+                }
+            }
+        }
+
+        for h in 0..KDHEAD_HEADS {
+            serial_println!(
+                ":: KDHEAD: block={} head={} at=0x{:06X} w=[{:08X},{:08X},{:08X},{:08X}] again=[{:08X},{:08X},{:08X},{:08X}] nprobe={} ::",
+                blk.name, h, blk.base + h * blk.stride,
+                pass0[h][0], pass0[h][1], pass0[h][2], pass0[h][3],
+                pass1[h][0], pass1[h][1], pass1[h][2], pass1[h][3],
+                blk.nprobe,
+            );
+        }
+
+        let separated = n_stable > 0 && distinct >= 2;
+        if separated {
+            n_separated += 1;
+        }
+        serial_println!(
+            ":: KDHEAD: block={} base=0x{:06X} stride=0x{:X} heads_distinct={}/4 :: stable={}/{} readable={}/4 verdict={} cite={} — heads_distinct counts DISTINCT stable-word tuples; a counter is excluded by the two-pass filter so a collapsed stride cannot masquerade as four different heads, and stable=0 means no word in this block held still and the count is not a stride reading at all ::",
+            blk.name, blk.base, blk.stride, distinct,
+            n_stable, blk.nprobe, n_readable,
+            if n_stable == 0 { "UNSCORABLE-all-words-volatile" }
+            else if n_readable == 0 { "UNREADABLE-no-head-answered" }
+            else if distinct == 1 { "COLLAPSED-stride-does-not-separate-heads-here (the s4 reading, re-taken)" }
+            else { "SEPARATES-heads" },
+            blk.cite,
+        );
+
+        // ── Part 3: decode, only where the stride earned it and the bracket allows ─────────────
+        if !separated {
+            serial_println!(
+                ":: KDHEAD: block={} decode=skipped reason={} :: a decode taken from a block whose stride does not separate the heads is one head's number printed four times, which is exactly KD3's shut-out condition; the block's code and knob are KEPT and the reading above is the record (R19) ::",
+                blk.name,
+                if n_stable == 0 { "all-words-volatile" } else if distinct == 1 { "stride-collapsed" } else { "no-head-answered" },
+            );
+            continue;
+        }
+
+        for h in 0..KDHEAD_HEADS {
+            let geom = match kdhead_decode(blk.name, &pass0[h]) {
+                Some(g) => g,
+                None => {
+                    if h == 0 {
+                        serial_println!(
+                            ":: KDHEAD: block={} decode=none reason=no-cited-slicing :: this bench cites no surface-or-geometry field slicing for this block — [METAL s13] settled it in the negative ('the scanout surface ADDRESS is not exposed anywhere in these head-block windows') and +0x34C is raster TOTALS (vtotal|htotal), not the active geometry. Printing a slicing we cannot cite would be KD3's error a second time ::",
+                            blk.name,
+                        );
+                    }
+                    break;
+                }
+            };
+
+            let mut answered = false;
+            let mut nonzero = false;
+            for p in 0..blk.nprobe {
+                if kdhead_answered(pass0[h][p]) {
+                    answered = true;
+                    if pass0[h][p] != 0 {
+                        nonzero = true;
+                    }
+                }
+            }
+
+            let live_tok = match bracket {
+                None => "unknown",
+                Some(_) if live[h] => "yes",
+                Some(_) => "no",
+            };
+
+            let surf = geom.surface.unwrap_or(0);
+            let pitch = geom.pitch.unwrap_or(0);
+
+            let verdict = if bracket.is_none() {
+                "NO-BRACKET-NOT-SCORED"
+            } else if !live[h] {
+                "DARK-NOT-SCORED"
+            } else if !answered || !nonzero {
+                "UNREADABLE"
+            } else if geom.width == gop_w
+                && geom.height == gop_h
+                && geom.surface.map_or(true, |s| s == gop_vram_offset as u64)
+                && geom.pitch.map_or(true, |p| p == gop_pitch)
+            {
+                n_agree += 1;
+                "AGREE"
+            } else {
+                n_disagree += 1;
+                "DISAGREE"
+            };
+            if verdict == "AGREE" || verdict == "DISAGREE" || verdict == "UNREADABLE" {
+                n_decoded += 1;
+            }
+
+            let mismatch = if verdict != "DISAGREE" {
+                "none"
+            } else if geom.width != gop_w || geom.height != gop_h {
+                "geom"
+            } else if geom.surface.map_or(false, |s| s != gop_vram_offset as u64) {
+                "surface"
+            } else {
+                "pitch"
+            };
+
+            serial_println!(
+                ":: KDHEAD: head={} live={} geom={}x{} surface=0x{:X} pitch={} vs gop={}x{} 0x{:X} {} -> {} :: block={} mismatch={} surface_present={} pitch_present={} slicing={} — AGREE on a live head pins this decode BY OBSERVATION and re-opens KD3; DISAGREE names the field and is a finding about the slicing, not about the silicon; DARK-NOT-SCORED means the bracket says this head does not scan and the read is not evidence either way (R19) ::",
+                h, live_tok, geom.width, geom.height, surf, pitch,
+                gop_w, gop_h, gop_vram_offset, gop_pitch, verdict,
+                blk.name, mismatch,
+                if geom.surface.is_some() { "y" } else { "n" },
+                if geom.pitch.is_some() { "y" } else { "n" },
+                geom.cite,
+            );
+        }
+    }
+
+    serial_println!(
+        ":: KDHEAD: end rung=KD14 bracket={} blocks={} separated={} decoded={} agree={} disagree={} writes=0 :: DEPENDS ON KD4 (the control read, [METAL s11]) and on BEAMX86's sampler for taking it; separated= is how many candidate blocks had a stride that actually distinguishes heads, which is the question s4 answered by inference and this rung answers by measurement. agree>0 on a live head re-opens KD3; agree=0 disagree>0 says which field of which slicing is wrong; separated=0 says every candidate stride collapses and the per-head decode has no block left to stand on — and NONE of those three is a statement that a head is dead, which the bracket line above settles independently ::",
+        match bracket { Some(_) => "beamx86-census", None => "absent" },
+        KDHEAD_BLOCKS.len(), n_separated, n_decoded, n_agree, n_disagree,
+    );
+}
+
+/// KDHEAD — the `headstat` row's base must be the very address KD4 reads, or the rung is bracketing
+/// one bank and decoding another. Checked at compile time rather than asserted in a comment.
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))]
+const _: () = assert!(KDHEAD_BLOCKS[0].base == regs::NV_PDISPLAY_BASE + 0x6000);
+/// KDHEAD — and `armed100` must be that same bank 0x100 in, which is where s4 stood.
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))]
+const _: () = assert!(KDHEAD_BLOCKS[1].base == KDHEAD_BLOCKS[0].base + 0x100);
+/// KDHEAD — `evocore`'s base must be the same word BEAMX86 cross-checks its sampled vtotal against
+/// (`NV_PDISPLAY_BASE + 0x400 + head*0x300 + 0x60`), so the two rungs read one block, not two.
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))]
+const _: () = assert!(KDHEAD_BLOCKS[2].base == regs::NV_PDISPLAY_BASE + 0x400 + 0x60);
