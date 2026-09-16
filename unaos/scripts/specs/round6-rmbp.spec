@@ -163,3 +163,26 @@ FORBID :: WXAUDIT x86: .* TRUNCATED ::
 REQUIRE :: WXAUDIT-NXE: cores=[0-9]+ nxe=[0-9]+ nxe_mask=0x[0-9A-F]+ wp=[0-9]+ wp_mask=0x[0-9A-F]+ -> PASS ::
 REQUIRE :: WXN-FBWC: fb=0x[0-9A-F]+ lvl=[0-9]+ e=0x[0-9A-F]{16} pat=[0-9]+ pcd=[0-9]+ pwt=[0-9]+ w=[0-9]+ fx=[0-9]+ -> LEAF BIT-IDENTICAL ::
 FORBID :: WXN-FBWC: .*-> SKIPPED ::
+
+# ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
+# A PINNED LINE IN THIS FILE IS CHANGED TOGETHER WITH THE KERNEL LINE IT PINS, IN THE SAME COMMIT —
+# re-pinned to the new wording (naming the arc that changed it), or dropped with the reason stated.
+# It is never worked around by teaching the kernel a SECOND spelling of the same witness. That is
+# what an unrun spec cost this tree once: STORWAIT added a second `storage settle:` line rather than
+# edit the `[fatverb] storage witness` REQUIRE this file pins verbatim — a pin no command was
+# reading, and still expensive.
+#
+# WHY THIS BLOCK IS AT THE TAIL AND NOT THE HEAD. Ledger rows, queue rows and kernel comments across
+# this tree cite pinned lines POSITIONALLY (`x86-fat.spec:238`, `pi4-regression.spec:1549`,
+# `jetson-sync1.spec:1839`, `crates/kernel/src/shell.rs:4933` -> `x86-fat.spec:156`). A header insert
+# moves every one of them by the same amount, silently — rmbp-ledger PI5 names tail-append as this
+# repo's safe form for exactly that reason. The contract is ENFORCED, not merely written: see below.
+#
+# WHO RUNS THIS FILE, and the gate that makes the answer mandatory:
+# RUN-BY: bench — ./arroyo mbench --follow ~/rmbp-serial.log --spec scripts/specs/round6-rmbp.spec --timeout 300
+#   No verb replays it: the capture is the rMBP bridge log off a UNAOS_VIDEOBENCH+UNAOS_USBDEBUG build.
+#
+# GATE-SPECROOTS (`scripts/spec-roots.sh`, a leg of `./arroyo check`) reds by name on any spec under
+# scripts/specs/ that is neither named in `arroyo`'s CODE nor carries a RUN-BY line above — and a
+# `RUN-BY: verb:` claim is cross-checked against `arroyo`, so this file cannot claim a runner it
+# does not have. "A replay spec no gate command runs is a silent landmine."

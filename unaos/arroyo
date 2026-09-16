@@ -3454,6 +3454,125 @@ x86_test_completion() { # $1 = log file
     return 0
 }
 
+# ── SPECRUN: the verb REPLAYS the spec that describes its own capture ───────────────────────────
+# THE DEFECT, measured before this block existed (rmbp seat, 2026-09-15; the STOP STORWAIT left at
+# 60e62d95). `scripts/specs/x86-fat.spec` pins 32 witness lines of the x86 U-chain — one of them,
+# `x86-fat.spec:156`, pins a `[fatverb] storage witness` serial line VERBATIM — and NOTHING RAN IT.
+# `grep -n "specs/" arroyo` found the file named in two COMMENTS and nowhere in code, so:
+#
+#   * a kernel change that reds those 32 pins shipped GREEN — the pins were prose, not a gate;
+#   * and an executor who RESPECTED the pins could not change a witness line, because the spec
+#     looked authoritative while being unable to fire. STORWAIT added a SECOND `storage settle:`
+#     line rather than touch the pinned one — a kernel carrying two spellings of one witness,
+#     bought by a file no command reads.
+#
+# A replay spec no gate command runs is a silent landmine: it costs at the moment someone edits the
+# line it pins, and it pays nothing at any other moment.
+#
+# THE FIX IS THE VERB, NOT A NEW GATE. The capture already exists, the tool already exists
+# (`scripts/mbench.py --replay`, the SINGLE verdict authority for the spec path since ad8b52aa), and
+# the verb that produced the capture is the only thing that knows which spec describes it. So the
+# replay becomes a STEP of `test` / `test-fat`, reading the same `target/serial.log` the verdict
+# above just read, and its rc is the verb's rc.
+#
+# WHERE IT SITS IN THE ORDER, and why it is last. `scan_serial_faults` first (a FORBID hit is
+# positive evidence of a fault and nothing excuses it), TESTTRUNC second (a short capture is
+# INCONCLUSIVE), the replay third. That ordering IS the truncation honesty this step owes:
+# `x86-fat.spec` declares no COMPLETE marker of its own, so `mbench` could never call a short
+# capture TRUNCATED for it — instead the capture reaches the replay only after `x86-test.spec`'s
+# MEASURED end-of-run marker has been found in it, and the replay refuses outright on any other
+# verdict (the guard below, which is the rule stated where it can fire, not only in a comment).
+# `32/32 pinned lines` over half a boot would otherwise be the most convincing false green in the
+# tree.
+X86_FAT_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-fat.spec"
+
+# WHICH SPEC DESCRIBES THIS RUN'S CAPTURE — one answer per fixture, and "none" is a REAL answer
+# that is printed out loud rather than passing quietly.
+#   no UNAOS_FATIMG   `./arroyo test` — x86-test.spec. It pins ONE line (the end-of-run marker) and
+#                     deliberately nothing else; see that file's header. Replaying it adds no
+#                     witness the fault scan did not already have, and that is not the reason it is
+#                     here: it is here because LADDERTAIL measured the file's two consumers
+#                     DISAGREEING (`qemu_await --settled` said complete, `mbench --replay` said
+#                     FAIL, same spec, same capture). Both now run on every `test`, so they cannot
+#                     drift apart again in silence, and the day a REQUIRE is added there it fires.
+#   UNAOS_FATIMG=sf   `./arroyo test-fat sf` (and `UNAOS_FATIMG=sf ./arroyo test`, the invocation
+#                     x86-fat.spec's own header documents) — x86-fat.spec, 32 pinned lines,
+#                     MEASURED 32/32 against this seat's fold-gate capture before being wired.
+#   part|gpt|p16      NO SPEC. Not an oversight and not a hole to be papered over with the sf file:
+#                     those three layouts have no measured green capture on this seat, and a gate
+#                     nobody has watched go green is the defect this arc exists to remove. Named in
+#                     the skip line so the gap is visible instead of implied.
+#   UNAOS_SELFHOST    NO SPEC. `test-selfhost` packs SOURCE-ALONG onto the fixture and arms a knob,
+#                     so its capture is not the one x86-fat.spec was measured on; that lane already
+#                     carries its own positive witness (`SELFHOST: src verified … -> PASS ::`).
+X86_REPLAY_SPEC=""   # path of the spec to replay, or "" when none describes this capture
+X86_REPLAY_WHY=""    # why there is none — printed verbatim in the skip line
+x86_pick_capture_spec() {
+    X86_REPLAY_SPEC=""; X86_REPLAY_WHY=""
+    if [ -n "${UNAOS_SELFHOST:-}" ]; then
+        X86_REPLAY_WHY="UNAOS_SELFHOST is armed — test-selfhost packs SOURCE-ALONG onto the fixture, so this is not the capture x86-fat.spec was measured against. That lane's verdict is its own 'SELFHOST: src verified … -> PASS ::' witness."
+        return 0
+    fi
+    case "${UNAOS_FATIMG:-}" in
+        "")  X86_REPLAY_SPEC="$X86_TEST_SPEC" ;;
+        sf)  X86_REPLAY_SPEC="$X86_FAT_SPEC" ;;
+        *)   X86_REPLAY_WHY="UNAOS_FATIMG=${UNAOS_FATIMG} — x86-fat.spec's 32 pinned lines were measured green on the 'sf' layout only. Replaying them here would be asserting a capture nobody has watched pass. Use 'sf' for the gated run." ;;
+    esac
+}
+
+# Replay the capture against that spec. rc 0 = green, 1 = the verb is red.
+x86_spec_replay() { # $1 = the capture (target/serial.log)
+    local logf="$1" rc=0 out="" first=""
+    x86_pick_capture_spec
+    if [ -z "$X86_REPLAY_SPEC" ]; then
+        echo -e "${COLOR_YELLOW}⚠ spec replay SKIPPED — ${X86_REPLAY_WHY}${COLOR_RESET}"
+        return 0
+    fi
+    # THE TRUNCATION RULE, where it can fire. TESTTRUNC above already returns 1 on anything but
+    # `complete`, so this cannot be reached with a short capture today — which is exactly why it is
+    # written down as a guard and not as a comment: the day the order of this function moves, a
+    # half boot must still be refused rather than scored. A capture that did not reach its end
+    # cannot fail a pin (the line had not printed yet) and must never pass one either.
+    if [ "${X86_TEST_VERDICT:-unknown}" != complete ]; then
+        echo -e "${COLOR_RED}❌ spec replay REFUSED — the completion checker called this capture '${X86_TEST_VERDICT:-unknown}', not 'complete'. A truncated capture is never a spec pass: the pins it is missing never got a chance to print. rc=1${COLOR_RESET}"
+        return 1
+    fi
+    if [ ! -f "$X86_REPLAY_SPEC" ]; then
+        echo -e "${COLOR_RED}❌ spec replay: ${X86_REPLAY_SPEC} is MISSING — the step that was supposed to score this capture cannot run, so this run gets NO pass. rc=1${COLOR_RESET}"
+        return 1
+    fi
+    echo ""
+    echo -e "${COLOR_CYAN}⚡ spec replay: asserting the capture against ${X86_REPLAY_SPEC#${WORKSPACE_DIR}/}${COLOR_RESET}"
+    out=$(python3 "${WORKSPACE_DIR}/scripts/mbench.py" --replay "$logf" \
+              --spec "$X86_REPLAY_SPEC" --platform x86 2>&1) || rc=$?
+    printf '%s\n' "$out"
+    # mbench's own exit codes are the verdict: 0 PASS / 1 FAIL / 2 spec error / 3 TRUNCATED.
+    # Everything that is not 0 reds the verb, INCLUDING 2 — a spec this script cannot parse is a
+    # gate that did not run, and a gate that did not run is not a pass.
+    case "$rc" in
+      0)
+        echo -e "${COLOR_GREEN}✔ spec replay: every pinned line in ${X86_REPLAY_SPEC##*/} is present in this capture${COLOR_RESET}"
+        return 0 ;;
+      1)
+        first=$(printf '%s\n' "$out" | awk 'index($0, "FIRST-SHORTFALL") { sub(/^[ \t]*FIRST-SHORTFALL[ \t]*/, ""); print; exit }')
+        if [ -n "$first" ]; then
+            echo -e "${COLOR_RED}❌ spec replay FAILED — first unmatched pinned line: ${first}${COLOR_RESET}"
+        else
+            echo -e "${COLOR_RED}❌ spec replay FAILED — a FORBID in ${X86_REPLAY_SPEC##*/} matched this capture (table above); no pinned line is short.${COLOR_RESET}"
+        fi
+        echo -e "${COLOR_RED}  A pinned line is changed TOGETHER with the kernel line it pins, in the SAME commit."
+        echo -e "  If the kernel's wording changed on purpose, re-pin it in ${X86_REPLAY_SPEC#${WORKSPACE_DIR}/} here and say which arc changed it."
+        echo -e "  Capture at ${logf}${COLOR_RESET}"
+        return 1 ;;
+      3)
+        echo -e "${COLOR_RED}❌ spec replay -> TRUNCATED — mbench says this capture never reached the spec's end-of-run marker. Not a pass and not a regression; give the run more wall. rc=1${COLOR_RESET}"
+        return 1 ;;
+      *)
+        echo -e "${COLOR_RED}❌ spec replay gave NO VERDICT (mbench rc=${rc}) — the spec did not parse or the tool broke. A gate that did not run is not a pass. rc=1${COLOR_RESET}"
+        return 1 ;;
+    esac
+}
+
 test_x86_64() {
     local secs="${1:-20}"
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP
@@ -3732,7 +3851,14 @@ test_x86_64() {
         echo -e "  Log at ${SERIAL_LOG}; the run stamp is beside it at ${SERIAL_LOG}.run${COLOR_RESET}"
         return 1
     fi
-    echo -e "${COLOR_GREEN}✅ Test run complete — the boot reached its last fixture (serial.log line ${X86_TEST_LINE}) and the log is clean. Full log saved at ${SERIAL_LOG}${COLOR_RESET}"
+    # SPECRUN: the POSITIVE PER-WITNESS half, and the last word. Everything above this line is the
+    # absence of bad news plus one end-of-run marker; this is the only step that asserts the boot
+    # printed the things it is supposed to print. Its rc is the verb's rc — `test-fat` inherits it
+    # the same way it inherits the fault scan, by ending in this function.
+    if ! x86_spec_replay "$SERIAL_LOG"; then
+        return 1
+    fi
+    echo -e "${COLOR_GREEN}✅ Test run complete — the boot reached its last fixture (serial.log line ${X86_TEST_LINE}), the log is clean, and every pinned line of its spec is present. Full log saved at ${SERIAL_LOG}${COLOR_RESET}"
 }
 
 # --- Utility Functions ---
@@ -6321,6 +6447,28 @@ check_both() {
         _rrc=1
     fi
 
+    # GATE-SPECROOTS (SPECRUN, rmbp, 2026-09-15): GATE-ROOTS' shape applied to the OTHER kind of
+    # root in this tree. A `.spec` under scripts/specs/ is nobody's dependency either — unless some
+    # command REPLAYS it, nothing ever evaluates its pinned lines, and it is then strictly worse
+    # than absent: it cannot catch a regression, and the next executor to touch the kernel line it
+    # pins still respects it. `x86-fat.spec` was that file — 32 pins, named in two COMMENTS in this
+    # script and in no line of code — and STORWAIT paid for it by teaching the kernel a SECOND
+    # `storage settle:` spelling rather than editing `x86-fat.spec:156`.
+    #   `scripts/spec-roots.sh` reds by name on any spec that is neither named in THIS SCRIPT'S CODE
+    #   (full-line comments stripped — the prose mentions are exactly what made x86-fat.spec look
+    #   run) nor carrying a `# RUN-BY:` header naming the bench/knob-leg/script command that does.
+    #   A `RUN-BY: verb:` claim is cross-checked against this script, so a file cannot talk its way
+    #   into "gated". Controls on synthetic input (a comment-only mention must NOT resolve gated; a
+    #   code mention MUST) plus one fact about this tree (pi4-regression.spec resolves GATED), or
+    #   exit 2 and NO verdict.
+    local _srrc=0
+    "$WORKSPACE_DIR/scripts/spec-roots.sh" "$WORKSPACE_DIR" || _srrc=$?
+    if [ "$_srrc" -eq 0 ]; then
+        echo -e "${COLOR_GREEN}  ✅ spec roots (every replay spec is named by a verb or a declared command)${COLOR_RESET}"
+    else
+        [ "$_srrc" -eq 2 ] && echo -e "${COLOR_RED}❌ spec-roots gate gave NO VERDICT — its control did not fire, which is not a clean tree${COLOR_RESET}"
+    fi
+
     # GATE-FC2 (rmbp, 2026-09-15): LEDGER S5's CLASS — the knob discipline in this tree is stated on
     # CALL SITES, and the DECLARATION is the half nobody checks. `pub mod foo;` with no cfg compiles
     # `foo.rs` into every image — statics linked, panic::Location lines counted — even when every path
@@ -6387,6 +6535,10 @@ check_both() {
     fi
     if [ "$_f2rc" -ne 0 ]; then
         echo -e "${COLOR_RED}❌ check FAILED — a module is declared wider than every path that can reach it (see GATE-FC2 above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_srrc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — a replay spec is named by no verb and declares no runner (see GATE-SPECROOTS above)${COLOR_RESET}"
         return 1
     fi
 }
