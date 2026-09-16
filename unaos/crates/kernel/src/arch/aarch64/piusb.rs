@@ -2612,10 +2612,10 @@ pub fn enumerate() {
             // main-loop path alike, the instant the shared bring-up publishes geometry.
             x.service_storage();
             witness.tick(x);
-            let ready = x.storage_slot != 0 && x.storage_note == "ready";
+            let ready = x.storage_slot() != 0 && x.storage_note() == "ready"; // STORSLOT: the driver's `storage_slot`/`storage_note` FIELDS became accessors onto the PRIMARY storage record when the xHCI driver stopped being single-device; the value read here is the same primary disk it always was.
             (
                 keyboard_armed(x),
-                x.storage_slot,
+                x.storage_slot(),
                 ready,
             )
         };

@@ -1855,7 +1855,7 @@ pub fn jb2b_attach(
             // waits ride `crate::hlt()`, which the timerless EL1 core cannot wake (the JD2/JB2b
             // rule). A no-op until a device is pending, so keyboard-only boots are unaffected.
             x.service_storage();
-            (x.armed_keyboards(), x.armed_pointer_count(), x.storage_slot, x.storage_slot != 0 && x.storage_note == "ready")
+            (x.armed_keyboards(), x.armed_pointer_count(), x.storage_slot(), x.storage_slot() != 0 && x.storage_note() == "ready") // STORSLOT: `storage_slot`/`storage_note` are accessors onto the PRIMARY storage record now (the driver tracks an array of devices); same primary disk, same meaning.
         };
         armed_ptr_count = ptr_count;
         // USB-HID-MULTI: witness each armed keyboard as it comes up (not only the first), so a boot
