@@ -1257,8 +1257,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // loop site. Sits at all THREE storage-ready passes, like `fatverb_storage_witness`,
             // because which pass a given x86 build reaches depends on its knobs; the forward-only
             // state machine inside makes it speak exactly once. Read-only in arc 1.
-            #[cfg(all(target_arch = "x86_64", feature = "wifi"))]
-            unaos_kernel::wifi::service();
+            #[cfg(all(target_arch = "x86_64", feature = "wifi"))] unaos_kernel::wifi::service();
+            #[cfg(all(target_arch = "x86_64", feature = "wifi", feature = "bar1wedge"))] unaos_kernel::drivers::gpu::pcihealth::note_wifi_census(); #[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))] unaos_kernel::drivers::gpu::pcihealth::sticky_clear_post_enum(); // WIFISWEEP (rmbp-ledger B113, shut-out register §6 P7): SECSTA2's post-enumeration sticky clear, MOVED here from the tail of `pci::init` — see the note at the second loop site. First of the three storage-ready passes; both calls latch inside `pcihealth`, so whichever pass a given build reaches, each speaks exactly once. Appended to THIS line, before the comment: knob-off both are cfg-erased and no panic `Location` below moves.
             // PIUSB-27: on the USB storage-ready edge, mount the stick's FAT volume read-only under
             // /fs/usb and emit the witness (aarch64 Pi path; runs with the xHCI lock released).
             #[cfg(target_arch = "aarch64")]
@@ -1741,8 +1741,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // load per iteration for the rest of the boot. Read-only in arc 1 (no MMIO, no device write).
         // Like `fatverb_storage_witness` above, it sits at all THREE storage-ready passes this file
         // carries, because which pass a given x86 build reaches depends on its knobs.
-        #[cfg(all(target_arch = "x86_64", feature = "wifi"))]
-        unaos_kernel::wifi::service();
+        #[cfg(all(target_arch = "x86_64", feature = "wifi"))] unaos_kernel::wifi::service();
+        #[cfg(all(target_arch = "x86_64", feature = "wifi", feature = "bar1wedge"))] unaos_kernel::drivers::gpu::pcihealth::note_wifi_census(); #[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))] unaos_kernel::drivers::gpu::pcihealth::sticky_clear_post_enum(); // WIFISWEEP (rmbp-ledger B113, shut-out register §6 P7) — THE NOTE THE OTHER TWO SITES POINT AT. SECSTA2's second W1C clear of the root port's sticky latches used to be the last statement of `arch::x86_64::pci::init`, on the claim that it stood after "the LAST bus walk of the boot". It did not: `wifi::bus::census` (`wifi/bus.rs:125`) is a full `for bus in 0u16..256` x 32-slot config sweep reached from `wifi::service()` on the line above, and flight 8 measured it at 23516 ms against that clear at 23263 ms — 253 ms LATER — so the baseline the rung stored was taken BEFORE the boot's last walk, a config read to an absent function on bus 1 (the bus under the root port being sampled) master-aborts into that bridge's Secondary Status, and neither `relatch=secsta:2000` nor the storm's `d_secsta=2000 at n=1` could be attributed. HERE is the boot's real "all walks done" point on BOTH builds: with `wifi`, because the sweep has just returned on this very pass; without it, because `wifi::service` is cfg-erased and this is still below `init_network` → `find_device`, the last walk `pci::init` performs (`grep -rn '0\.\.=255\|0u16\.\.256' crates/kernel/src` — every other walker in the kernel is called from inside `pci::init`). `note_wifi_census` runs FIRST so `walks_since_enum=`/`walkers=` on the printed line name what ran since enumeration; both functions latch internally, so a loop site cannot double-count or re-baseline. Same BSP (`SCHED-X86: BSP entered run loop cpu=0`), same CF8 accessors, same `bar1wedge` knob, no new knob; GPACE samples `span` inside `pci::init`, which this call no longer runs in, so the pacing row it was placed to protect is untouched by construction. Appended to THIS line, before the comment: knob-off both statements are cfg-erased and no panic `Location` below moves. LINE SHAPE: `wifi::service()` was folded up onto its own `#[cfg]` attribute line so these two statements get a line of their own WITHOUT changing this file's line count (6/6 in `git diff --numstat`) — GATE-FC2 reads a reference's cfg as the union of every `#[cfg]` ON ITS LINE, so leaving these appended beside `wifi::service()` made `pub mod wifi` look declared wider than every path reaching it and failed `./arroyo check`.
         // PIUSB-27: on the USB storage-ready edge, mount the stick's FAT volume read-only under /fs/usb
         // and emit the witness (aarch64 Pi path; runs here with the xHCI lock released, like probe_once).
         #[cfg(target_arch = "aarch64")]
@@ -6009,8 +6009,8 @@ fn x86_usb_pump(cpu: usize) {
         // WIFI-1 (wifi knob): the Broadcom/bcma firmware-load path — see the note at the second loop
         // site. Third of the three storage-ready passes; the forward-only state machine inside makes
         // it speak exactly once whichever pass a given build reaches. Read-only in arc 1.
-        #[cfg(all(target_arch = "x86_64", feature = "wifi"))]
-        unaos_kernel::wifi::service();
+        #[cfg(all(target_arch = "x86_64", feature = "wifi"))] unaos_kernel::wifi::service();
+        #[cfg(all(target_arch = "x86_64", feature = "wifi", feature = "bar1wedge"))] unaos_kernel::drivers::gpu::pcihealth::note_wifi_census(); #[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))] unaos_kernel::drivers::gpu::pcihealth::sticky_clear_post_enum(); // WIFISWEEP (rmbp-ledger B113, shut-out register §6 P7): SECSTA2's post-enumeration sticky clear, MOVED here from the tail of `pci::init` — see the note at the second loop site. Third of the three storage-ready passes; both calls latch inside `pcihealth`, so whichever pass a given build reaches, each speaks exactly once. Appended to THIS line, before the comment: knob-off both are cfg-erased and no panic `Location` below moves.
         // GUI-WITNESS M3 (witness knob): re-dump the boot-milestone ring to serial on growth.
         //
         // USBDBG-INVERT — and on `usbdebug` too, which is the ONE service the terminal loop provided

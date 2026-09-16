@@ -174,6 +174,9 @@ Closing it needs a second sample taken after enumeration is complete.
 
 **Landed since (SECSTA2, §11.4):** that second sample exists, as a second W1C clear at the tail of
 `pci::init` — and building it corrected the sentence above about *which* enumeration was left.
+(**Amended again by WIFISWEEP, §11.5:** the tail of `pci::init` was not after the boot's last walk
+either — the wifi census sweeps config space 253 ms later — so the clear now runs from the main
+loop, below that sweep.)
 This section, and §11.1's W7 row, named "the EHCI driver's own `0..=255` walk". `ehci::init` is
 called from `arch/x86_64/pci.rs:838` and the Kepler dispatch that reaches `census` from
 `arch/x86_64/pci.rs:1016`: **EHCI walks the bus BEFORE the at-arm clear, and is already wiped by
@@ -644,7 +647,7 @@ ever "ruled out"), and the register facts a boot has to carry for the next rung 
 | W4 | **WC store-buffer / posted-write backpressure**: the CPU's write-combining buffers drain into a host interface that stops accepting them, and the core dies holding the store | `UNAOS_BAR1EXP=uc` (register §6 P5), scored by `UNAOS_BAR1WEDGE=1` | **NEVER FLOWN.** Flight 5 declined to arm it: *"UC is ~6.8x slower and would corrupt the power numbers"* | — | W1 (ASPM excluded), W2, W3 | **never-run — the ranked next rung.** UC retypes the aperture so the write path is strongly ordered and unbuffered; a wedge under UC exonerates memory type, a wedge-free UC boot convicts the WC drain |
 | W5 | PCIe credit exhaustion / the GPU's own BAR1 window path (M2/M3 of `phase31-root.md`) | — | — | — | W4 (it is what W4's UC arm discriminates *against*) | **never-run** |
 | W6 | the root port's completion timeout never fires, so a core stalled on the aperture can never be released at all | `UNAOS_BAR1WEDGE` prints the configuration; nothing yet exercises it | never flown — the value has never been READ, let alone tested | — | — | **never-run.** This is the number §3.2's sacrificial probe and §8.2's "is the core freed?" both rest on, and it is a boot-time constant that cost nothing to print and had never been printed |
-| W7 | `secsta` bit 13 (Received Master Abort) is the wedge's signature — the endpoint stopped answering | — | boots 8, 9 and 11 all read `secsta=2000` at the wedge | **UNFALSIFIABLE AS READ** (§1.3): a W1C latch this kernel never cleared, and ordinary bus enumeration sets it. `[pcih] rp-boot` (landed with this document) narrowed it to "before or after `pci::init`"; BAR1WEDGE's arm-time clear narrows it to "after `pci::init`". The EHCI driver's own `0..=255` walk is the named remaining contributor | — | **open — and narrowed again by SECSTA2 (§11.4), which also CORRECTED the named contributor: `ehci::init` (`arch/x86_64/pci.rs:838`) runs BEFORE the at-arm clear (`arch/x86_64/pci.rs:1016`), so the EHCI walk was never the residual. The second clear now runs after the last walk of `pci::init`, and its `relatch=` field measures what enumeration itself latches instead of leaving it as a hypothesis** |
+| W7 | `secsta` bit 13 (Received Master Abort) is the wedge's signature — the endpoint stopped answering | — | boots 8, 9 and 11 all read `secsta=2000` at the wedge | **UNFALSIFIABLE AS READ** (§1.3): a W1C latch this kernel never cleared, and ordinary bus enumeration sets it. `[pcih] rp-boot` (landed with this document) narrowed it to "before or after `pci::init`"; BAR1WEDGE's arm-time clear narrows it to "after `pci::init`". The EHCI driver's own `0..=255` walk is the named remaining contributor | — | **open — and narrowed again by SECSTA2 (§11.4), which also CORRECTED the named contributor: `ehci::init` (`arch/x86_64/pci.rs:838`) runs BEFORE the at-arm clear (`arch/x86_64/pci.rs:1016`), so the EHCI walk was never the residual. The second clear now runs after the last walk of `pci::init`, and its `relatch=` field measures what enumeration itself latches instead of leaving it as a hypothesis**. **AMENDED AGAIN BY WIFISWEEP (§11.5, ledger B113): "after the last walk of `pci::init`" was not "after the last walk of the BOOT" — the wifi census sweeps config space 253 ms later on any `UNAOS_WIFI` boot, which both flight images carried, so flights 8/9's `relatch=secsta:2000` is not yet attributable to enumeration alone. The clear now runs from the main loop below that sweep and carries `walks_since_enum=`; the reading is owed to the next flight** |
 
 **What would change a verdict**
 
@@ -662,9 +665,13 @@ ever "ruled out"), and the register facts a boot has to carry for the next rung 
   **Amended by SECSTA2 (§11.4):** the EHCI walk is not the alternative — it precedes the at-arm
   clear. With the post-enum clear in, `d_secsta=2000` at `n=1` means the latch moved after EVERY bus
   walk of `pci::init`, and the only named alternative left is a `wifi`-armed boot's own census from
-  the main loop (`wifi/bus.rs:125`) — a knob no A1 flight row asks for (`grep -c UNAOS_WIFI
+  the main loop (`wifi/bus.rs:125`) — ~~a knob no A1 flight row asks for (`grep -c UNAOS_WIFI
   docs/dev/OS/rmbp-queue.md docs/dev/OS/rmbp-ledger.md` = 0/0), and one any boot settles from its own
-  `⚡ kernel features:` banner. The same boot also
+  `⚡ kernel features:` banner.~~ **That dismissal is the defect B113 records: it greps two doc files
+  when the decision needed the flight's own knob line, and BOTH flight images carried
+  `UNAOS_WIFI=1`. WIFISWEEP (§11.5) moves the clear below that census, so on the next flight
+  `d_secsta=2000` at `n=1` means the latch moved after every walk of the boot, not of one function.**
+  The same boot also
   prints `relatch=`, which says whether a bus walk on this machine latches bit 13 at all — the
   premise the whole "enumeration residue" reading rests on, never once measured.
 
@@ -955,14 +962,51 @@ generally do. Score card: the four `relatch`/`post-enum` rows in §11.3.
   bounds. No new knob, no new call site, no QEMU fixture (q35 has no Kepler, see below): `check`
   only.
 
-**Residual, in the same voice.** `wifi::service` (`wifi/bus.rs:125`, buses 0..=255, knob
+**Residual, in the same voice.** ~~`wifi::service` (`wifi/bus.rs:125`, buses 0..=255, knob
 `UNAOS_WIFI`) sweeps config space from the main loop, i.e. after this clear, on every boot that arms
 it. No A1 flight row asks for that knob (`grep -c UNAOS_WIFI docs/dev/OS/rmbp-queue.md
 docs/dev/OS/rmbp-ledger.md` = 0/0) and any boot settles it from its own `⚡ kernel features:`
 banner; on one that did carry it, the window would be "after the first wifi census" and `d_secsta`
-would have that one alternative left.
+would have that one alternative left.~~ **That residual FIRED on flights 8 and 9 and the dismissal
+was the defect — see §11.5.**
 
-**q35 says nothing about this rung.** `sticky_clear_post_enum` is guarded on `PCIH_READY`, which is
+**q35 says nothing about this rung.** ~~`sticky_clear_post_enum` is guarded on `PCIH_READY`, which is
 set only at the end of `pcihealth::census`, which runs only from `kepler::init`. QEMU q35 has no
 GK107, so `census` never runs, `PCIH_READY` stays false, and the post-enum line is honestly absent.
-There is no QEMU fixture for this rung; it is scored on metal, on the A1 flight, or not at all.
+There is no QEMU fixture for this rung; it is scored on metal, on the A1 flight, or not at all.~~
+**Amended by WIFISWEEP (§11.5): q35 still says nothing about the REGISTERS, but it now says
+something about the ORDER — the no-device case prints a refusal line instead of returning silently,
+so `arroyo test` scores where the rung runs even though it cannot score what it read.**
+
+### 11.5 WIFISWEEP — the clear ran BEFORE the last walk, and now runs after it
+
+**Status: IMPLEMENTED behind the SAME knob (`UNAOS_BAR1WEDGE=1`, no new knob), DEFAULT OFF, never
+flown.** Shut-out register §6 rung **P7**, contract amended. Row `rmbp-ledger` **B113**. Code:
+`drivers/gpu/pcihealth.rs`; call site MOVED out of `arch/x86_64/pci.rs` into `main.rs`, at all three
+storage-ready loop passes, immediately after `unaos_kernel::wifi::service()`.
+
+§11.4's own sentence — *"the second call site … is the boot's 'all buses enumerated' point, the tail
+of `pci::init`"* — is true of that **function** and false of the **boot**, and flights 8 and 9 flew
+with the falsifier armed. `wifi::bus::census` (`wifi/bus.rs:125`) is a full `for bus in 0u16..256` ×
+32-slot configuration-space sweep reached from `wifi::service`'s first main-loop pass, and on flight
+8 it ran at **23516 ms against the post-enum clear at 23263 ms — 253 ms later**. A config read to an
+absent function on bus 1 (the bus below the root port under test, `[pcih] ep bdf=1:0.0`)
+master-aborts and sets that bridge's Secondary Status, so the baseline this rung stored was taken
+**before** the boot's last walk: `relatch=secsta:2000` may have been that walk's latch rather than
+enumeration's, and the storm's `d_secsta=2000 at n=1` on both apertures was read against a baseline
+taken too early. The repair is the one B113 asked for first — move the clear below the wifi census —
+and it is the right one rather than the `baseline=at-storm` fallback **because the walks are not
+spread across the boot**: every `0..=255`-shaped walker in the kernel (`PciScanner::{enumerate_buses,
+storage_inventory,find_device}`, `full_census`, `detect_gpus`, `ahci::probe`, `ehci::init`,
+`ehci_scout::{scout,configure_and_relook}`, `bcma::recon`, `vperf::pci_display_probe`) is called from
+inside `pci::init`; `wifi::bus::census` is the only one that is not; and in flight 8 the last wifi
+line is at 23562 ms with the next config access of any kind being the storm's own `rp-at-wedge` at
+331272 ms, five minutes later. The new site is after the last walk on **both** builds — with `wifi`,
+because the sweep has just returned on that pass; without it, because `wifi::service` is cfg-erased
+and the point is still below `init_network` → `find_device`. The rung is one-shot on its own latch
+(a loop calls it forever), the line gains `site=post-wifi walks_since_enum=<n> walkers=<names>` —
+measured at the call site, not inferred from the knob — so the next flight's `relatch=` is
+attributable, and the no-device case prints a refusal carrying the same fields so the order is
+scorable on q35. Write path, BSP, knob and boot pacing are unchanged: CF8/CFC as before, cpu 0 as
+before (`rp_at_wedge`, the one config reader on another core, is ECAM-only by construction), no new
+feature, and GPACE's `span` is sampled inside `pci::init` — which this call no longer runs in at all.
