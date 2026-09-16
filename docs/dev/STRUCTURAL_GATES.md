@@ -1589,3 +1589,252 @@ binary target is a named root of `check`) and GATE-APPEND (`scripts/append-posit
 LEDGER P7's trailing-comment trap) are both wired into `check_both` and green; their
 invariant, control and GO-RED live in their `arroyo` comment blocks and in the
 scripts' headers until a seat gives each a section on the standard above.
+
+---
+
+## GATE-SELFSYNTAX — every shell script this tree ships parses
+
+**Invariant.** `unaos/arroyo` and every `unaos/scripts/**/*.sh` pass `bash -n`.
+It is the **first statement of `check`**, before any compile leg.
+
+**Why a gate.** GATE-ROOTS' argument, applied to the shell. A `.sh` that no leg
+of `check` invokes is syntax-checked by nothing at all, on any run: measured
+before this landed, `bash -n` appeared **zero** times in `unaos/arroyo`, and 13
+of the 22 scripts under `unaos/scripts/` are named by no leg of `check_both` —
+`banner-cert.sh`, `card-watch.sh`, `fat-clusters.sh`, `identify-card.sh`,
+`knob-parity.sh`, `make-fat-img.sh`, `make-pi-img.sh`, `make-pi-install-src.sh`,
+`run_uefi.sh`, and the four bench-connect and card-watch scripts. Those are the
+media builders and the bench-connect scripts, so a defect in one surfaces at the
+BENCH, with a board attached and an operator in front of it. The instance that
+opened the row is the 2026-09-16 fold: git's common-suffix dedup ate a `return 1`
+and its `fi` out of a union of two green `arroyo` edits, and the seat found it
+with `bash -n` after the commit, by hand, because it occurred to them.
+
+**⚠ The `arroyo` half is almost a tautology today, and the gate says so.** A gate
+oversold is the defect this file's standard exists for, so the measurement is
+recorded rather than the hope. A copy of `arroyo` broken in a mid-file function
+body (`sha256_of`, line 6825) and a copy broken in the LAST case arm (line 10751)
+**both** fail `bash -n` at rc=2 **and both** fail `./arroyo state` at rc=2: bash's
+own loader refuses this file whole, because its `case` dispatch is the last
+command and nothing before it exits. On today's `arroyo` the first list entry
+therefore cannot fire on the copy being run. It is kept because it costs
+milliseconds and because the tautology is a property of the file's SHAPE, not of
+bash — measured: `case "$1" in a) echo A; exit 0;; esac` followed by an
+unparseable function runs to **rc=0**, since `exit` stops bash's incremental
+read. One early `exit` in this dispatch and the loader stops covering the tail.
+
+**Mechanism.** A loop over `arroyo` and `find "$WORKSPACE_DIR/scripts" -name
+'*.sh' | sort`, each through `bash -n`; a failure names the file relative to
+`unaos/` and `check` returns 1 through GATE-SELFSYNTAX's own failure line. The
+green line prints the file count, so a `find` that silently stops matching is
+visible as a number that fell rather than as a quiet pass.
+
+**Control.** The count on the success line (23 files today: `arroyo` + 22
+scripts). All 22 scripts parse on this tree.
+
+**Goes red when** any of those files fails `bash -n`.
+
+**GO-RED proof, by mutation on a scratch copy, both halves, 2026-09-16.**
+(a) `scripts/make-pi-img.sh` with its last `fi` removed — the half that fires:
+`bash -n` rc=2 standalone, and `./arroyo check` **rc=1** printing
+`❌ scripts/make-pi-img.sh does not parse` then `❌ check FAILED — a shell script
+in this tree does not parse`. (b) `arroyo` itself broken at `sha256_of` — the
+tautology, reported honestly: `bash -n arroyo` rc=2, and `./arroyo check`
+**rc=2** with bash's own unattributed `syntax error near unexpected token
+'elif'`; the gate never gets to speak, which is exactly what the ⚠ above
+predicts. Unmutated control: `✅ shell syntax (bash -n over arroyo and 23 file(s),
+every verb and every script)`.
+
+**Legitimate update.** Fix the script. There is no allowlist; a script that is
+not meant to be bash is not a `.sh`.
+
+---
+
+## GATE-BRACES — a `.rs` file's braces balance, named before the compiler's wall
+
+**Invariant.** Every `.rs` file under `unaos/crates/` has equal `{` and `}`
+counts outside line comments, nested block comments, strings, raw strings and
+char literals.
+
+**Why a gate.** GATE-APPEND's defect class from the other side: GATE-APPEND
+catches a fold that put a statement where it compiles nothing, this catches a
+fold that left the file unparseable. Git's union of two `.rs` tail-appends is
+subject to **common-suffix dedup** — when both sides end in the same `}\n}\n}`
+the merge keeps one copy and the result is three closing braces short. It
+happened to `crates/kernel/src/drivers/xhci/mod.rs` at the XHCIKBD fold and again
+on 2026-09-16, and on both days what found it was brace arithmetic in a seat's
+own helper. No gate saw either.
+
+**⛔ It is a PRE-CHECK, not a judge.** `cargo check` is the real judge of whether
+the tree compiles and this scan never overrules it: it answers one question, in
+one pass, and names the FILE and the SIGN of the imbalance. The compiler's own
+verdict on an unclosed delimiter points at the END of the file rather than at the
+merge seam, and it arrives behind the whole crate walk. Naming the file and the
+sign is the difference between "rebuild that tail from BOTH parents" and reading
+a wall.
+
+**Where it runs, and why not beside GATE-APPEND.** It is written up beside
+GATE-APPEND and it RUNS at the top of `check_both`, before the first cargo line.
+That is not a preference: `set -e` (`unaos/arroyo:24`) ends the script on a
+failing compile leg, so a brace gate placed after the compile legs could never
+fire for its own defect class — a `.rs` three closing braces short **is** a tree
+whose first cargo leg fails. Measured: the `xhci/mod.rs` mutation below ends the
+run inside the x86_64 leg when the gate sits down there.
+
+**Mechanism.** An inline scanner in `unaos/arroyo` (it is one of the named files
+of this change; no new script). The parser is deliberately small and the
+false-positive half is where the work went: line comments, **nested** block
+comments (Rust's nest — a non-nesting scanner desyncs), string literals, raw
+strings `r#"…"#` at any hash count, and char literals, with the char-literal
+branch distinguishing `'{'` from a lifetime `'a`, which is the one that makes a
+naive counter cry on real Rust. Two populations, kept apart on purpose: the gate
+SCANS the 199 `.rs` files under `crates/`; the parser was validated over 402 —
+those plus the ring-3 roots `libs/`, `handlers/`, `vessels/`, `tools/` — with
+ZERO imbalanced in either. Widening the scan to ring-3 is a one-word change.
+
+**Control.** Five synthetic fixtures run before any verdict, asserting both
+directions: an unmatched brace inside a string, inside a nested block comment,
+inside a raw string, and a `'{'` char literal beside a lifetime must all count
+`(1, 1)`; an unbalanced fixture must count `(2, 1)`. A control failure exits 2
+and prints `NO VERDICT`, and a gate that gave no verdict is not a pass — this
+fired for real during the build, when the unbalanced fixture's expected counts
+were written wrong, and `check` refused rather than passing.
+
+**Goes red when** any scanned file's counts differ.
+
+**GO-RED proof, by mutation on a scratch copy, 2026-09-16.** One closing brace
+removed from `crates/kernel/src/drivers/xhci/mod.rs` — the file the XHCIKBD fold
+actually broke: `./arroyo check` **rc=1**, printing
+`GATE-BRACES: …/xhci/mod.rs: {=2293 }=2292 (+1) — a union lost or duplicated a
+tail (git's common-suffix dedup); rebuild the tail from BOTH parents`, then
+`1 file(s) of 199 do not balance`, then the gate's own `check FAILED` line.
+Unmutated control on the same copy: `GATE-BRACES: 199 .rs file(s) balance`.
+
+**Legitimate update.** Rebuild the tail from both parents of the merge
+(`git merge-file --union` and then count), never by adding a brace until the
+compiler stops complaining.
+
+---
+
+## GATE-LEDGER, THIRD CUT — the fold shapes (QUEUEGATE, 2026-09-16)
+
+Three checks added to `unaos/scripts/ledger-check.sh`, one occasion. On
+2026-09-16 the rmbp seat folded 12 executor branches; every defect below was
+CLEAN-AUTO-MERGED into a tree that `ledger-check.sh` then passed at **rc=0**, and
+each was caught late, by eye, or at the NEXT fold. That is the argument for
+putting them in the gate rather than in a seat's fold helper — a helper is run by
+the seat that wrote it. None of the three imports the ledger contract into the
+queues: a queue row still carries no status enum, no owner and no field count.
+
+### 1. STATE-LINE UNIQUENESS — two queue lines, one a PREFIX of the other
+
+**Invariant.** In each of the four queue files, no two status-marked lines
+(`✓ · ⚠ ⛔`) of 40 characters or more have one as a prefix of the other.
+
+**Why.** At `1878e035` a clean auto-merge left two `✓ Executors cut from
+160176d2 …` lines in `docs/dev/OS/rmbp-queue.md`, the second being the first with
+more text appended. Git merged both sides' edits to the same logical line and
+lost nothing, which is a correct merge of a FILE and a wrong merge of a STATE.
+`ledger-check.sh` was rc=0. The test is PREFIX rather than equality precisely
+because equality sees two different strings and says nothing.
+
+**Scope is the FILE, not the `## STATE` section, and the widening was forced by a
+measurement.** Keying on the section was the first cut — there is no universal
+LINE prefix to key on, since `✓ Executors cut from` is rmbp's alone (QUEUE.md's
+block opens `✓ main <sha> = …`, orin's `✓ hw-jetson <sha> = origin …`, pi's
+`✓ origin/hw-pi4 <sha>; …`), so the section looked like the invariant. It is not:
+by `fb29c268` the duplicated pair had MIGRATED, one copy still in the STATE block
+and one under `## METAL`, and a section-scoped check reports nothing on the very
+tree the row-loss happened in. At `f8f8ce8c` the surviving line sits under
+`## METAL` outright.
+
+**Measured.** Over the last 80 commits on `hw-rmbp`, exactly 7 carry a finding —
+`1878e035` (where the duplicate was merged in) through `3164a3c0`, the contiguous
+run ending at the repair `60c1954d` — and the other 73 are silent. Over all eight
+track heads (`main`, `hw-jetson`, `hw-pi4`, `hw-rmbp` and their `origin/`
+counterparts): zero. One defect, found on every commit that carried it, no false
+reds on any seat's file. The 40-character floor is the false-positive control:
+short marked lines are one-word statuses and pointers, and two of those sharing
+an opening is ordinary.
+
+**Control.** Three synthetic fixtures: a prefix-variant pair must be found; the
+same pair MIGRATED across a `## METAL` heading must be found (this one fails if
+anybody re-scopes the scan to a section); prose repeating the line and two short
+marked lines must be silent.
+
+**GO-RED.** On a scratch copy, the STATE line duplicated with extra text
+appended: **rc=1**, `docs/dev/OS/rmbp-queue.md:30 and docs/dev/OS/rmbp-queue.md:31:
+two queue lines, one a PREFIX of the other`. Reverted → rc=0.
+
+### 2. ROW CONTINUITY — a fold may not lose a row
+
+**Invariant.** At a fold, every row present in BOTH parents is present in the
+working file, unless named `DROPPED <id>` in the merge message or in a STATE
+block. Ledger rows are keyed by id, queue rows by their first 40 characters after
+the status mark.
+
+**Why.** A fold helper grepped both copies of the duplicated STATE line above
+into one 64 KB line and, at the next fold, spliced that line over a conflict
+block holding three METAL rows. `X86BIND` and `AHCIFLY` left
+`docs/dev/OS/rmbp-queue.md` at `fb29c268` and `AHCIWRITE` one merge earlier at
+`a84c8f32`; `ledger-check.sh` was rc=0 throughout, and `60c1954d` had to rebuild
+the rows from git history.
+
+**Armed only at a fold, and that is why it has no false reds.** Comparing every
+tree against a merge base would judge ordinary editing, and queue rows are
+reworded constantly — a reword reads as a deletion at any row granularity. The
+defect class is narrower: a MERGE silently losing a row. So it arms on a merge IN
+PROGRESS (`MERGE_HEAD` present → HEAD and MERGE_HEAD are the two sides, which is
+what makes running `ledger-check` BEFORE the commit worth doing: the fold is
+judged while it is still a working tree and the repair costs an edit rather than
+a reset), or on HEAD already being a merge (its two parents). Anything else is
+NOT ARMED and the census says so. The judged side is always the WORKING file.
+
+**The narrow rule was measured against the wide one and the wide one was
+dropped.** The wide rule adds "present in ONE parent and not in the merge base" —
+a row added on one side and lost. Over the last 60 merges on `hw-rmbp` the narrow
+rule finds exactly **3** rows and every one is a real loss (`X86BIND`, `AHCIFLY`,
+`AHCIWRITE` — the three `60c1954d` had to rebuild); the wide rule finds **6**,
+and the three extra are REWORDS: a row whose first 40 characters were edited on
+one side reads as "added there, lost here". A gate reding an honest rewrite on
+every fold is skipped by the second week.
+
+**Control.** A synthetic three-way fixture: two rows in both parents and absent
+from the result must both be reported, and a row present in the base that one
+parent deliberately struck must NOT be.
+
+**GO-RED.** On a scratch copy at a merge HEAD, the METAL row
+`· A9  serial console is TX-only …` deleted from `docs/dev/OS/rmbp-queue.md`:
+**rc=1**, `row present in BOTH parents and GONE from this tree — 754f9107:25 and
+02357b1b:27 have 'A9 serial console is TX-only (FTDI bulk ', the fold does not`.
+The same mutation with `· DROPPED A9 — struck at this fold on purpose` added to
+the STATE block: **rc=0**. Both directions, one mutation.
+
+### 3. TRAILING TEXT — a ledger row ends at its final pipe
+
+**Invariant.** Every ledger row line ends with `|` after trimming.
+
+**Why, and why FIELD COUNT could not see it.** `rmbp-ledger` rows `A1` and `B89`
+carried appended status text AFTER the row's final pipe — still readable at
+`git show 754f9107:docs/dev/OS/rmbp-ledger.md | sed -n '21p;123p'`. The FIELD
+COUNT check found them only at a LATER fold: the parser does
+`line.strip().strip("|").split("|")`, and with no trailing pipe to strip, a row
+whose trailing text happens to land on the header's own column count parses
+clean and the text is silently absorbed into the last cell. This check names the
+row directly instead of reporting a count two columns downstream.
+
+**Control.** Three fixtures: a row with text after its final pipe on the header's
+own column count must fire; a well-formed row must not; a PARAGRAPH mentioning an
+id must not (prose is never a row).
+
+**GO-RED.** On a scratch copy, `rmbp-ledger.md`'s `B1` row with its final pipe
+removed and status prose appended: **rc=1**, `docs/dev/OS/rmbp-ledger.md:39:
+ledger row does not END with ¦` (the SR11 escape rewriting the delimiter in the
+gate's own output, working as designed). Reverted → rc=0.
+
+**Census.** All three print on every run, armed or not:
+`GATE-LEDGER: FOLD SHAPES — STATE-line uniqueness over 4 queue file(s): N
+finding(s); trailing text over 4 ledger file(s): N finding(s); row continuity
+<armed — why, base <sha> | not armed>: N finding(s)`. SR13's lesson: a verdict
+silent about whether it armed is indistinguishable from one that ran and found
+nothing, and row continuity is deliberately not armed on most trees.

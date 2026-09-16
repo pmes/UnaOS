@@ -694,6 +694,266 @@ for p in QUEUES:
 # not a finding.
 queue_reg_idle = sum(1 for _k in QUEUECITE_REG if _k not in qc_seen and _k.split(":")[0] in QUEUES)
 
+# ── THE FOLD SHAPES (QUEUEGATE, rmbp 2026-09-16) ───────────────────────────────────────────────
+# Three checks, one occasion. On 2026-09-16 this seat folded 12 executor branches and every defect
+# below was CLEAN-AUTO-MERGED into a tree that this script then passed at rc=0. That is the whole
+# argument for putting them here rather than in a seat's fold helper: a helper is run by the seat
+# that wrote it, and the three findings were caught late, by eye, or at the NEXT fold.
+#
+#   (a) 1878e035 — two `✓ Executors cut from 160176d2 …` lines in `docs/dev/OS/rmbp-queue.md`'s
+#       STATE block, the second a strict PREFIX-VARIANT of the first. Git merged both sides' edits
+#       to the same logical line and neither side's text was lost, which is a correct merge of a
+#       file and a wrong merge of a STATE.
+#   (b) fb29c268 — a fold helper grepped BOTH of those copies into one 64 KB line and spliced it
+#       over a conflict block holding three METAL rows; `X86BIND`, `AHCIFLY` and `AHCIWRITE` left
+#       the queue (AHCIWRITE one merge earlier, at a84c8f32). Repaired at 60c1954d by rebuilding
+#       the rows from git history. ledger-check rc=0 at every step.
+#   (d) rmbp-ledger `A1` and `B89` carried appended status text AFTER the row's final pipe. The
+#       FIELD COUNT check found them only at a LATER fold: a row whose trailing text happens to
+#       land on the header's own column count parses clean, and the text is silently absorbed into
+#       the last cell. Live instance, still readable:
+#       `git show 754f9107:docs/dev/OS/rmbp-ledger.md | sed -n '21p;123p'`.
+#
+# ALL THREE ARE CHEAP AND NONE OF THEM IMPORTS THE LEDGER CONTRACT INTO THE QUEUES — the scope
+# restraint the queue block above was written with is kept: a queue row still carries no status
+# enum, no owner and no field count.
+QMARK = "✓·⚠⛔"
+_HEAD_RE = re.compile(r"^##\s")
+_STATE_HEAD = re.compile(r"^##\s.*\bSTATE\b")
+LEDGER_PATHS = set(["docs/dev/LEDGER.md"] + [f"docs/dev/OS/{_s}-ledger.md" for _s in ("rmbp", "orin", "pi")])
+
+def _marked(line):
+    """The queue's own row shape: a status mark, then the row. Returns the row, whitespace-collapsed."""
+    s = line.strip()
+    if not s or s[0] not in QMARK:
+        return None
+    return re.sub(r"\s+", " ", s[1:]).strip()
+
+def _state_sections(text):
+    """[(heading lineno, heading, [(lineno, line)])] for every `## …STATE…` section.
+
+    Used for the `DROPPED <id>` escape below, NOT for the uniqueness check — see _state_dupes.
+    """
+    out = []
+    cur = None
+    for i, l in enumerate(text.split("\n"), 1):
+        if _HEAD_RE.match(l):
+            cur = (i, l, []) if _STATE_HEAD.match(l) else None
+            if cur:
+                out.append(cur)
+        elif cur is not None:
+            cur[2].append((i, l))
+    return out
+
+# THE LENGTH FLOOR IS THE FALSE-POSITIVE CONTROL. Short marked lines in these files are one-word
+# statuses and pointers (`· x86 legs (R39): …`) and two of them sharing an opening is ordinary.
+# 40 chars is where a queue line is carrying a claim.
+STATE_MIN = 40
+
+def _state_dupes(text):
+    """[(line_a, line_b, shorter_text)] — two marked lines, one a PREFIX of the other.
+
+    PREFIX, not equality, and the incident is why: the second `✓ Executors cut from 160176d2 …`
+    line was the first with more text appended. An equality test sees two different strings and
+    says nothing. The prefix test is the shape a same-line merge actually produces.
+
+    WHOLE FILE, NOT THE `## STATE` SECTION, and the widening was forced by a measurement rather
+    than chosen. Keying on the section was the first cut: there is no universal LINE prefix to key
+    on (`✓ Executors cut from` is rmbp's alone — QUEUE.md's block opens `✓ main <sha> = …`, orin's
+    `✓ hw-jetson <sha> = origin …`, pi's `✓ origin/hw-pi4 <sha>; …`), so the section looked like
+    the invariant. It is not: by fb29c268 the duplicated pair had MIGRATED, one copy still in the
+    STATE block and one under `## METAL`, and a section-scoped check reports nothing on the very
+    tree the row-loss happened in. At f8f8ce8c the surviving line sits under `## METAL` outright.
+    The file is the scope.
+    MEASURED, and the numbers are why this is affordable: over the last 80 commits on `hw-rmbp`
+    exactly 7 carry a finding — 1878e035 (where the duplicate was merged in) through 3164a3c0, the
+    contiguous run that ends at the repair 60c1954d — and the other 73 are silent. Over all eight
+    track heads (`main`, `hw-jetson`, `hw-pi4`, `hw-rmbp` and their `origin/` counterparts): zero.
+    One defect, found on every commit that carried it, no false reds on any seat's file.
+    """
+    marked = [(i, m) for i, l in enumerate(text.split("\n"), 1)
+              for m in (_marked(l),) if m and len(m) >= STATE_MIN]
+    found = []
+    for a in range(len(marked)):
+        for b in range(a + 1, len(marked)):
+            ia, la = marked[a]
+            ib, lb = marked[b]
+            if lb.startswith(la) or la.startswith(lb):
+                found.append((ia, ib, la if len(la) <= len(lb) else lb))
+    return found
+
+def _show(ref, path):
+    """That path's content at that ref, or None when the ref does not carry the file."""
+    r = subprocess.run(["git", "show", f"{ref}:{path}"], capture_output=True, text=True)
+    return None if r.returncode else r.stdout
+
+def _rows_of(text, path):
+    """{row key: first line number}. A ledger row is its ID; a queue row is its first 40 chars."""
+    out = {}
+    if text is None:
+        return None
+    for i, l in enumerate(text.split("\n"), 1):
+        if path in LEDGER_PATHS:
+            m = re.match(r"^\|\s*\**([A-Z]+[0-9]+)", l)
+            if m:
+                out.setdefault(m.group(1), i)
+        else:
+            m = _marked(l)
+            if m and len(m) >= 20:
+                out.setdefault(m[:40], i)
+    return out
+
+def _row_losses(W, A, B, M):
+    """Rows absent from the working file W that BOTH parents had. Three-way, at row granularity.
+
+    THE RULE IS NARROW ON PURPOSE AND THE WIDE ONE WAS MEASURED AND DROPPED. The wide rule adds
+    "present in ONE parent and not in the merge base" — a row added on one side and lost. It is
+    correct in principle and it false-reds in practice: over the last 60 merges on `hw-rmbp` the
+    narrow rule finds exactly 3 rows and every one is a real loss (`X86BIND` and `AHCIFLY` at
+    fb29c268, `AHCIWRITE` at a84c8f32 — the three the repair commit 60c1954d had to rebuild from
+    history), while the wide rule finds 6 and the three extra are REWORDS: a row whose first 40
+    chars were edited on one side reads as "added there, lost here". A gate reding an honest
+    rewrite on every fold is a gate that gets skipped by the second week, which is the trade the
+    ABSENCE pattern list above was already cut down for. Narrow catches every row this class has
+    ever actually cost, at zero false positives over 60 folds.
+    """
+    return sorted(k for k in (set(A) & set(B)) if k not in W)
+
+# GO-RED CONTROLS, RUN BEFORE ANY VERDICT AND ON SYNTHETIC INPUT, the way GATE-SPECROOTS does it.
+# A scan that matches nothing reports zero, and zero reads as a clean tree; these make the zero
+# distinguishable from a broken pattern. Each control asserts BOTH directions — the shape that must
+# fire, and the near-miss that must stay silent — because a check that reds on everything is as
+# useless as one that reds on nothing. A control failure is exit 2, and a gate that gave no verdict
+# is NOT a pass.
+_CTL = []
+_ctl_state_red = ("## STATE — control fixture\n"
+                  "✓ Executors cut from 160176d2 this session (branches exec-rmbp-*, worktrees)\n"
+                  "· an unrelated state line, long enough to clear the forty-character floor\n"
+                  "✓ Executors cut from 160176d2 this session (branches exec-rmbp-*, worktrees) and two more\n")
+_ctl_state_green = ("## STATE — control fixture\n"
+                    "✓ Executors cut from 160176d2 this session (branches exec-rmbp-*, worktrees)\n"
+                    "· an unrelated state line, long enough to clear the forty-character floor\n"
+                    "· a short line\n"
+                    "· a short line\n"
+                    "prose repeating Executors cut from 160176d2 this session (branches exec-rmbp-*, worktrees)\n"
+                    "prose repeating Executors cut from 160176d2 this session (branches exec-rmbp-*, worktrees)\n")
+_ctl_state_cross = ("## STATE — control fixture\n"
+                    "✓ Executors cut from 160176d2 this session (branches exec-rmbp-*, worktrees)\n"
+                    "## METAL — the pair MIGRATED across a heading at fb29c268; the file is the scope\n"
+                    "✓ Executors cut from 160176d2 this session (branches exec-rmbp-*, worktrees) and more\n")
+if len(_state_dupes(_ctl_state_red)) != 1:
+    _CTL.append("STATE-LINE UNIQUENESS: the prefix-variant fixture was not found")
+if len(_state_dupes(_ctl_state_cross)) != 1:
+    _CTL.append("STATE-LINE UNIQUENESS: the migrated pair was not found; the scan is section-scoped again")
+if len(_state_dupes(_ctl_state_green)) != 0:
+    _CTL.append("STATE-LINE UNIQUENESS: prose or a short line was judged; only marked rows over the floor are")
+
+_ctl_q = "docs/dev/OS/rmbp-queue.md"
+_ctl_A = _rows_of("· X86BIND x86 binds / by content, a row long enough to be a row\n"
+                  "· AHCIFLY score the read-only AHCI driver on the rMBP's own metal\n"
+                  "· STRUCK a row that one side deliberately removed at this fold\n", _ctl_q)
+_ctl_M = dict(_ctl_A)
+_ctl_B = {k: v for k, v in _ctl_A.items() if not k.startswith("STRUCK")}
+if len(_ctl_B) != len(_ctl_A) - 1:
+    _CTL.append("ROW CONTINUITY: the fixture's struck row was not built; the row parser changed shape")
+_ctl_W = {}
+_ctl_loss = _row_losses(_ctl_W, _ctl_A, _ctl_B, _ctl_M)
+if len(_ctl_loss) != 2:
+    _CTL.append(f"ROW CONTINUITY: the two-parent fixture yielded {len(_ctl_loss)} loss(es), expected 2")
+if any(k.startswith("STRUCK") for k in _ctl_loss):
+    _CTL.append("ROW CONTINUITY: a row one parent deliberately struck was reported as a loss")
+
+def _tail_bad(line):
+    """A ledger row that does not END with `|` after trimming — trailing text outside the table."""
+    s = line.rstrip()
+    return bool(re.match(r"^\|\s*\**[A-Z]+[0-9]+", s)) and not s.endswith("|")
+
+# The near-miss half matters most here: the FIELD COUNT check above cannot see this shape when the
+# trailing text lands on the header's own column count, because `strip("|")` has no trailing pipe to
+# strip and the split comes out the same length. The fixture is exactly that case.
+if not _tail_bad("| A1 | item | rmbp | flies | open | ev | closed by 1234abcd, and then prose"):
+    _CTL.append("TRAILING TEXT: a row with text after its final pipe was not reported")
+if _tail_bad("| A1 | item | rmbp | flies | open | ev | closed by 1234abcd |"):
+    _CTL.append("TRAILING TEXT: a well-formed row was reported")
+if _tail_bad("prose about A1 that ends without a pipe"):
+    _CTL.append("TRAILING TEXT: a PARAGRAPH was judged; prose is never a row")
+if _CTL:
+    for _c in _CTL:
+        say("NO VERDICT — control failed: " + _c)
+    say("NO VERDICT — a gate whose control did not fire is not a clean tree")
+    sys.exit(2)
+
+# (c) STATE-LINE UNIQUENESS — over the queue files that are in this tree.
+state_dupes = 0
+for p in QUEUES:
+    for ia, ib, txt in _state_dupes(open(p, errors="replace").read()):
+        state_dupes += 1
+        red.append(f"{p}:{ia} and {p}:{ib}: two queue lines, one a PREFIX of the other — a same-line "
+                   f"merge kept BOTH sides and neither was lost, so the merge is clean and the STATE "
+                   f"is wrong (1878e035). Keep one: {txt[:60]}…")
+
+# (d) TRAILING TEXT — a ledger row ends at its final pipe or it is not a row.
+tail_bad = 0
+for p in files:
+    for ln, line in enumerate(open(p, errors="replace").read().split("\n"), 1):
+        if _tail_bad(line):
+            tail_bad += 1
+            red.append(f"{p}:{ln}: ledger row does not END with `|` — the text after the final cell "
+                       f"delimiter is outside the table and is silently absorbed into the last cell "
+                       f"when the count happens to match (A1/B89 at 754f9107): …{line.rstrip()[-48:]}")
+
+# (b) ROW CONTINUITY — ARMED ONLY AT A FOLD, and that is the whole reason it has no false reds.
+#
+# Comparing every tree against a merge base would judge ordinary editing: queue rows are reworded
+# constantly and a reword reads as a deletion at any row granularity. The defect class is narrower
+# than that — it is a MERGE silently losing a row — so the check arms exactly there:
+#   * a merge IN PROGRESS (`MERGE_HEAD` present) → HEAD and MERGE_HEAD are the two sides. This is
+#     the half that makes "run ledger-check BEFORE the commit" worth doing: the fold is judged
+#     while it is still a working tree and the repair costs an edit rather than a reset.
+#   * HEAD is already a merge → its two parents, judged against the WORKING file, so a repair made
+#     after the commit is seen.
+#   * anything else → NOT ARMED, and the census says so. Silence about the posture is what SR13
+#     cost this repo once already.
+# The judged side is always the WORKING file, never HEAD's blob.
+rowcont = "not armed (HEAD is not a merge and no merge is in progress)"
+row_losses = 0
+_mh = _rev("MERGE_HEAD")
+if _mh:
+    _p1, _p2, _why = _head_sha, _mh, "merge IN PROGRESS (HEAD + MERGE_HEAD)"
+else:
+    _pp = subprocess.run(["git", "log", "--format=%P", "-1", "HEAD"],
+                         capture_output=True, text=True).stdout.split()
+    _p1, _p2, _why = (_pp[0], _pp[1], "HEAD is a merge (both parents)") if len(_pp) >= 2 else (None, None, "")
+if _p1 and _p2:
+    _mbr = subprocess.run(["git", "merge-base", _p1, _p2], capture_output=True, text=True)
+    _base = _mbr.stdout.strip() if _mbr.returncode == 0 else None
+    # DROPPED IS THE AUTHOR'S ESCAPE, and it is deliberately cheap: a row struck on purpose at a
+    # fold is named `DROPPED <id>` in the merge commit message or in the file's own STATE block.
+    # It has to be cheap or the gate teaches people to delete rows quietly to keep it green.
+    _msg = subprocess.run(["git", "log", "--format=%B", "-1", "HEAD"],
+                          capture_output=True, text=True).stdout
+    _dropped = set(re.findall(r"DROPPED\s+([A-Za-z0-9_-]+)", _msg))
+    for p in sorted(set(QUEUES) | set(files)):
+        for _hl, _h, _body in _state_sections(open(p, errors="replace").read()):
+            for _i, _l in _body:
+                _dropped |= set(re.findall(r"DROPPED\s+([A-Za-z0-9_-]+)", _l))
+        _W = _rows_of(open(p, errors="replace").read(), p)
+        _A = _rows_of(_show(_p1, p), p)
+        _B = _rows_of(_show(_p2, p), p)
+        if _A is None or _B is None:
+            continue
+        _M = _rows_of(_show(_base, p), p) if _base else {}
+        for k in _row_losses(_W, _A, _B, _M or {}):
+            _first = (k.split() or [""])[0]
+            if _first in _dropped or _first.strip("*`") in _dropped or k in _dropped:
+                continue
+            row_losses += 1
+            red.append(f"{p}: row present in BOTH parents and GONE from this tree — "
+                       f"{_p1[:8]}:{_A[k]} and {_p2[:8]}:{_B[k]} have {k!r}, the fold does not. "
+                       f"Rebuild it from git history, or name it `DROPPED <id>` in the merge message "
+                       f"or the STATE block (fb29c268 lost three METAL rows this way)")
+    rowcont = f"armed — {_why}, base {(_base or '(none)')[:8]}"
+
 # A REGISTRATION THAT NO LONGER MATCHES ANYTHING IS ITSELF A FINDING — the allowlist has to be
 # falsifiable or it becomes the place defects go to be forgotten. Skipped for a file not in this tree.
 for _k, _why in ABSENCE_REG.items():
@@ -727,6 +987,12 @@ say(f"CENSUS — queue files scanned {len(QUEUES)}/4"
     + f", deferred-keepable ids {len(queue_deferred)}, grandfathered ids {len(queue_registered)}"
     + f" (+{queue_reg_idle} registered id(s) not cited in this tree)"
     + f"; cross-ref deferrals {len(deferred)}, grandfathered {len(DEFERRAL_REG)}")
+# THE FOLD SHAPES SAY THEIR POSTURE TOO — SR13's lesson applied to the newest checks: a row-
+# continuity verdict that is silent about whether it ARMED is indistinguishable from one that ran
+# and found nothing, and this one is not armed on most trees by design.
+say(f"FOLD SHAPES — STATE-line uniqueness over {len(QUEUES)} queue file(s): {state_dupes} finding(s)"
+    f"; trailing text over {len(files)} ledger file(s): {tail_bad} finding(s)"
+    f"; row continuity {rowcont}: {row_losses} finding(s)")
 if registered:
     say(f"FIELD COUNT — {len(registered)} registered exception(s); NOT findings, and each must reach zero:")
     for r in registered: detail(r)
@@ -763,7 +1029,7 @@ if red:
     _notation_note()
     sys.exit(1)
 _defnote = f", {len(deferred)} cross-branch ref(s) deferred" if deferred else ""
-say(f"OK — {rows_seen} rows in {len(files)} ledger file(s) + RULINGS + {len(QUEUES)} queue file(s): ids unique, field counts match their header, absence claims name an enumeration (lexical sampler — see the header), status ∈ enum, owners known, cross-refs resolve{_defnote}, every deferral names an owner and an expiry, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>, no conflict markers, every queue citation resolves")
+say(f"OK — {rows_seen} rows in {len(files)} ledger file(s) + RULINGS + {len(QUEUES)} queue file(s): ids unique, field counts match their header, absence claims name an enumeration (lexical sampler — see the header), status ∈ enum, owners known, cross-refs resolve{_defnote}, every deferral names an owner and an expiry, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>, no conflict markers, every queue citation resolves, one STATE line per claim, every ledger row ends at its final pipe, no row lost at a fold")
 _notation_note()
 PY
 # GO-RED PROOF (tree mutation, run before shipping; each reverted after):
@@ -805,3 +1071,21 @@ PY
 #         `B70`   cited by a new QUEUE.md row   -> rc 0 (the must-pass half: a real id resolves)
 #         `- **A66** - probe` appended to orin-ledger.md -> RED, stale queue-citation registration
 #                            (the allowlist is falsifiable by the id it grandfathers coming true)
+#
+# GO-RED PROOF, THIRD CUT (QUEUEGATE 2026-09-16; the fold shapes. Every mutation below was executed
+# on a SCRATCH COPY of the queue/ledger files, never on the tree's, and each is named in the commit
+# body with its exit line):
+#   STATE      a duplicated STATE line in rmbp-queue.md (the second a strict prefix-variant of the
+#              first, 1878e035's own shape)        -> RED, naming the file and BOTH line numbers
+#              the two-section fixture (same line under `## STATE` and `## CLOSE STATE`) -> GREEN
+#   ROWCONT    a METAL row present in both parents and deleted from the working file -> RED by name
+#              the same row named `DROPPED X86BIND` in the STATE block                 -> GREEN
+#              a tree that is not at a fold -> NOT ARMED, printed in the census, never a silent zero
+#   TAIL       a ledger row with text after its final pipe, on the header's own column count (so the
+#              FIELD COUNT check cannot see it)    -> RED naming the row and the tail
+# HISTORY, not synthetic: the three checks were measured against the commits that cost them.
+#   `python3` over the four queue files at 1878e035 -> 1 STATE finding; at f8f8ce8c -> 0.
+#   The narrow row rule over the last 60 merges on hw-rmbp -> exactly 3 findings, all real
+#   (X86BIND + AHCIFLY at fb29c268, AHCIWRITE at a84c8f32), 0 false. The wide rule -> 6, 3 of them
+#   rewords; dropped, and the numbers are in _row_losses.
+#   `git show 754f9107:docs/dev/OS/rmbp-ledger.md | sed -n '21p;123p'` is A1/B89 with the tail.
