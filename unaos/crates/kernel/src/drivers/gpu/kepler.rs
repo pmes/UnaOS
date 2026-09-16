@@ -3323,6 +3323,23 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     let kfbind_pre =
                                         crate::drivers::gpu::kepler_fifo::kfbind_pre(bar0, bar1, userd_off);
 
+                                    // KFCTXBIND phase A (register §2 KF28) — and its placement is a
+                                    // CONTRACT, in both directions. It must be BELOW KF18's
+                                    // CHAN_CUR/CHAN_NEXT bind and its `recon-post cpuctl` (a few lines
+                                    // up), because the FECS census exists to read the state that bind
+                                    // actually left behind — a census taken above it would measure a
+                                    // precondition nobody was in. And it must be STRICTLY PRE-SUBMIT,
+                                    // because the falsifier is whether `IB_GET` advances ACROSS the
+                                    // submit below. It is also above every FECS access that follows,
+                                    // which keeps its ten census reads clear of the `0x409504` poison
+                                    // law (spec §5.4) — and the rung provably never reads that offset
+                                    // itself (a `const _` in the module, not a comment). READ-ONLY:
+                                    // zero device writes.
+                                    #[cfg(feature = "nvidia-kepler-kfctxbind")]
+                                    let kfctxbind_pre =
+                                        crate::drivers::gpu::kepler_fifo::ctxbind::kfctxbind_pre(
+                                            bar0, bar1, inst_off, userd_off, chan_id as usize);
+
                                     // 3. Submit Runlist
                                     //
                                     // Rebuild the page first. The mirror-window beacon probe planted
@@ -3530,6 +3547,18 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     // removes none, so every historic `awk` still compares.
                                     #[cfg(feature = "nvidia-kepler-kfbind")]
                                     crate::drivers::gpu::kepler_fifo::kfbind_post(bar0, bar1, &kfbind_pre);
+
+                                    // KFCTXBIND phase B — below KF27's phase B for the same reason
+                                    // KF27's sits below the DISCRIMINATOR loop: the audited reading and
+                                    // the audit belong in one screenful. The two rungs are forbidden to
+                                    // FLY together (KEPLER-METAL-LOG.md's KF28 entry) and neither
+                                    // feature implies the other, so on any real boot exactly one of
+                                    // these two lines has a body. The DISCRIMINATOR loop and KF27 above
+                                    // are UNCHANGED — this rung adds lines and removes none, so every
+                                    // historic `awk` still compares.
+                                    #[cfg(feature = "nvidia-kepler-kfctxbind")]
+                                    crate::drivers::gpu::kepler_fifo::ctxbind::kfctxbind_post(
+                                        bar0, bar1, &kfctxbind_pre);
 
                                     let final_err = mmio_read(bar0, 0x252c);
                                     let final_stat = mmio_read(bar0, 0x263c);

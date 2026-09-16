@@ -147,6 +147,117 @@ LC_ALL=C grep -a -o -F 'KFBIND' target/x86_64_esp/kernel.elf | wc -l     # must 
 plus `nvidia-kepler-kfbind` in the `⚡ kernel features:` banner. A banner without the artifact hits
 is the BEAMX86 failure mode and the flight must not be scored.
 
+## PENDING METAL — KFCTXBIND (shut-out register §2, rung KF28): has anyone ever READ the condition all ten shut-outs are recorded under?
+
+**Nothing below is a metal fact.** It is the witness the next flight scores, written down before the
+flight so the scoring cannot drift into the reading. Build knob: add `UNAOS_KEPLER_KFCTXBIND=1` to
+the flight line, on top of `UNAOS_KEPLER=1 UNAOS_KEPLER_FIFO=1` (the feature implies both in Cargo,
+but the *call sites* are inside `kepler::init`'s fifo leg, so `UNAOS_KEPLER_FIFO` must be on the
+line to REACH them). READ-ONLY: **zero device writes**, `writes=0 restored=n/a`.
+
+**⛔ ORDERING LAW, and it is the reason this entry exists as a separate flight.**
+
+1. **Fly AFTER KF27's flight has answered.** This rung reads PBDMA state, and KF26 has been reading
+   that state at an unproven address since s#6. It gates itself on a derived base and prints
+   `skipped reason=kf27-base-unresolved` rather than adding an eleventh elimination at the tenth's
+   address — but a `skipped` boot is a wasted boot, and KF27's flight is what makes it unlikely.
+2. **NEVER on the same boot as KF27.** A capture carrying both rungs has two verdicts about one
+   submit, and KF27's `STILL-DARK under:` string hard-codes the conditions of a boot in which only
+   KF27 acted. `nvidia-kepler-kfctxbind` therefore does **not** imply `nvidia-kepler-kfbind`; the
+   dependency is evaluated at RUNTIME (this rung re-runs KF27's base ladder read-only, over KF27's
+   own PTOP address, extraction, window and probe offsets) and never by Cargo.
+
+**⭐ What this rung is FOR, and what it is careful not to claim.** §2's "what would change the
+verdict" asks, of KF18/KF19, for one thing: *re-run the bind with FECS context microcode resident
+and running — the one condition never varied across ten eliminations.* **This rung does not satisfy
+that condition and does not pretend to.** There is no context-switch microcode in this tree to be
+resident: `falcon_microcode_spec.md`'s CLEANROOM POLICY NOTICE forbids the vendor blob outright, and
+the ECHO / POKE / heartbeat images this driver uploads are probes, not a context machine. What the
+rung does is **measure the condition** — and that has never been done. All ten shut-outs in §2 are
+recorded under "no FECS ctx ucode running", and **not one capture in the campaign contains a reading
+that establishes it.** The `ctx-ucode=` token is that reading. It is the same class of defect KF27
+found in `gp_get`: a sentence the ladder has been asserting for ten sittings without an instrument
+behind it.
+
+**THE LINES TO SCORE**, in the order they print. Phase A sits BELOW KF18's `CHAN_CUR`/`CHAN_NEXT`
+bind (so the census reads the state that bind left behind) and STRICTLY pre-submit (so `IB_GET` has
+a baseline); phase B sits below the `DISCRIMINATOR` loop.
+
+```
+:: KFCTXBIND: begin knob=UNAOS_KEPLER_KFCTXBIND rung=KF28 … writes=0 restored=n/a depends=KF27-base-resolution ::
+:: KFCTXBIND: base-probe DERIVED[i]|LEGACY[i] base=… status=… <cls> chan=… <cls> … answers=Y|n ::
+:: KFCTXBIND: base class=<BASE CLASS> derived_n=… derived_base=… ctl=held …
+    ── if the class is not DERIVED-WINS or BOTH-ANSWER, the next line is the LAST: ──
+:: KFCTXBIND: skipped reason=kf27-base-unresolved class=… ::
+:: KFCTXBIND: fecs <name>=<val> <cls> addr=… cls=[METAL <sitting>] ::          (x10)
+:: KFCTXBIND: ctx-ucode=<TOKEN> cpuctl=… stopped=Y|n imemc=… ctl=held …
+:: KFCTXBIND: inst <name>=<val> <cls> off=… cls=[TREE-UNAUDITED] ::            (x9)
+:: KFCTXBIND: inst pdb +200=… +204=… cls=[UNPINNED C8+C9, layered] …
+:: KFCTXBIND: chan_ctrl[i] fw-bound=0x… ours=0x… w1=0x… nibble_diff=0x… self=Y|n ::   (x8)
+:: KFCTXBIND: chan_ctrl census slots=8 ours_chid=1 … fw_bound_slots=<n> …
+:: KFCTXBIND: pbdma pre-submit base=… / :: KFCTXBIND: userd pre-submit … ib_get=… ::
+:: KFCTXBIND: skipped write=chan_ctrl_enable reason=uncited — …                (x4)
+        … kepler::init's own runlist submit + playlist echo + DISCRIMINATOR loop …
+:: KFCTXBIND: pbdma post-submit … / chan_ctrl[i] post … / userd post-submit … ::
+:: KFCTXBIND: verdict base=… ctx-ucode=… chan_ctrl=skipped-uncited ib_get <pre>-><post> … -> <FETCH VERDICT> under {…} ::
+:: KFCTXBIND: end rung=KF28 base=… ctx-ucode=… fetch=… ::
+```
+
+**What each outcome means — pre-registered, so the flight cannot be read after the fact.**
+
+*The gate (`base class=`), which decides whether anything below it ran:*
+
+| outcome | reading |
+| --- | --- |
+| `DERIVED-WINS` / `BOTH-ANSWER` | the gate OPENS. Every reading below is taken at a base this boot observed to answer, which is the thing no PBDMA verdict in §2 has ever had |
+| anything else | `skipped reason=kf27-base-unresolved`. **Not a statement about the bind, the channel, or the FECS ucode: nothing was measured.** The boot is spent; fly KF27 first and come back |
+
+*The precondition (`ctx-ucode=`), which is the rung's primary product:*
+
+| outcome | reading |
+| --- | --- |
+| `absent-by-construction-halted` | `CPUCTL` (`+0x100` — **[METAL s26/s28/s31/s34]**) bit 4 `STOPPED` (**[EXT s28]** — rnndb's bit meaning for a register this bench has read at rest on this part) SET: the falcon is halted (`0x10`, §2's documented rest value, s26/s31/s34). Nothing is executing, so no context machine is. **The condition §2's ten shut-outs assert is now OBSERVED rather than assumed**, and every one of those rows may cite this line instead of an inference |
+| `absent-by-construction-running-probe-image` | `CPUCTL` bit 4 CLEAR (**[EXT s28]**, corroborated by s30's whole heartbeat run at `cpuctl=00000000`) — the core is executing, and on this tree that can only be one of our own ECHO/POKE/heartbeat probes, because no other image exists to upload. **A running falcon is not a running context machine**, and the token says so rather than letting `cpuctl=0` be read as "ucode resident" |
+| `void-poisoned` | `CPUCTL` (`+0x100` — **[METAL s26/s28/s31/s34]**) or `IMEMC` (`+0x180` — **[METAL s26/s28]**) reads POISON. Something above this rung touched `0x409504` (`WRCMD_CMD` — **[METAL s31/s32/s34]**, §5.4's poison law), or the unit is wedged. The census is uninterpretable and the ORDERING is the finding |
+| `void-bracket` | `NV_PMC_BOOT_0` moved across the census |
+| *(there is no `resident` arm)* | deliberate. An arm that could print `resident` from these registers would be claiming a running falcon is a running context machine — the exact inference this rung exists to stop |
+
+*The encoding instrument (`fw_bound_slots=`), which is what the skipped write is waiting for:*
+
+| outcome | reading |
+| --- | --- |
+| `fw_bound_slots > 0` | a channel-table slot we never wrote carries a real value. **Diff its top nibble against ours (`nibble_diff=`) and the enable/bind encoding is CITED BY OBSERVATION ON THIS PART** — §0.1 promotes it from UNPINNED to a sitting, and `skipped write=chan_ctrl_enable` becomes a write the next rung may legally make |
+| `fw_bound_slots = 0` | the firmware left no bound channel in the first 8 slots. The encoding STAYS UNPINNED and the write stays skipped. An honest null, and not a failure of the instrument |
+
+*The falsifier (`-> …`), on `IB_GET` (USERD `+0x88` — **[EXT]**, envytools `docs/hw/fifo/dma-pusher.rst`
+"Channel control area" as quoted by `kepler.rs`, for a channel-control-area this bench reads through the
+KF24-proven BAR1 identity), read at the DERIVED base:*
+
+| outcome | reading |
+| --- | --- |
+| `-> FETCHED` | IB_GET advanced across the submit. **K-GPU-3's wall since July has moved, at a base this boot proved answers, with the ctx-ucode precondition on the record rather than assumed.** |
+| `-> STILL-DARK under {…}` | IB_GET did not move, and the brace NAMES every condition as a value this boot read (R19, never "ruled out"). ⚠ **READ IT WITH THE `ctx-ucode=` TOKEN.** This is the ELEVENTH elimination only if that token ever reads something other than `absent-by-construction-*` — and today it cannot. A still-dark here is therefore a statement about the *instrument*, not about the GK107 |
+| `-> VOID-USERD` | IB_GET reads POISON/ABSENT: the channel control area did not answer |
+| `-> VOID` | the phase-B control bracket moved |
+
+**Control that must accompany the flight image** — the rung cannot run in QEMU (q35 has no Kepler,
+so a q35 log with zero `KFCTXBIND` lines proves nothing about the code being present), so the
+artifact is the only witness that the build carried it (s42's INSTGUI lesson, BANNERCERT's
+enforcement):
+
+```
+LC_ALL=C grep -a -o -F 'KFCTXBIND' target/x86_64_esp/kernel.elf | wc -l     # must be > 0
+```
+
+plus `nvidia-kepler-kfctxbind` in the `⚡ kernel features:` banner. A banner without the artifact
+hits is the BEAMX86 failure mode and the flight must not be scored.
+
+**Carry KF6/KF8/KF9 on the same boot** — `UNAOS_KEPLER_USERD_SNOOP=1 UNAOS_KEPLER_PFIFO_FLUSH=1
+UNAOS_KEPLER_CTRL_ADDR=1`, all restored by SHUTRESTORE. §2 asks for exactly that: each was refuted
+only under a host that had never run FECS ucode, and this is the boot that puts a reading on that
+condition. They write and restore their own registers; this rung writes nothing, so its `writes=0`
+claim is about ITSELF and the boot's restore ledger is theirs to carry.
+
 ## TREE CHANGE — SHUTRESTORE (2026-09-15): the seven deleted rungs are back behind knobs
 
 **No metal in this entry, and nothing here is a fact about silicon.** It is recorded in the metal
