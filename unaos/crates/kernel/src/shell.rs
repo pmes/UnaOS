@@ -3053,7 +3053,7 @@ fn shell_basics_witness() {
     // gate proves it too — the same trick `midden.resolve` uses to test elision on the Pi.
     let facts = midden_facts();
     let empty: &[&str] = &[];
-    let basics = ["grep", "wc", "df", "mount", "env", "set", "history", "sleep", "which"];
+    let basics = ["grep", "wc", "df", "mount", "env", "set", "history", "sleep", "which", #[cfg(feature = "installdemo")] "install"]; // INSTALLVERB: B47's class, and the reason this leg exists at all — a verb whose `match` arm ships while the table stays silent goes to bare-name resolution and answers "Unknown command" about a word the kernel carries. The element is `cfg`-gated on the SAME feature as the arm, so the assertion is exactly "registered iff compiled". ⚠ SAME-LINE fold, line-neutral.
     let mut missing = String::new();
     for w in basics {
         let mut vol = midden_core::NameList(empty);
@@ -5506,7 +5506,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         // is, which is what `df` answers and what `df`/`mount` already print. A bare `fdisk` is a
         // usage line, not a listing — there is no partition EDITOR here, and a verb that silently
         // did the read-only half of an interactive tool would be teaching the wrong reflex.
-        "fdisk" => {
+        #[cfg(feature = "installdemo")] "install" => { install_verb(console, &args); } "fdisk" => { // INSTALLVERB (rmbp-ledger B89 fourth rung, B91): the OPERATOR path to PARTINSTALL. `install` alone is a read-only census over every registered disk carrying the refusal each partition would give; `install <disk> <slot> [--as-esp]` installs into that ONE partition through `install::partition::install_into_partition`. There is NO whole-disk spelling — the block at this file's tail says why the grammar refuses to admit one (R25). ⚠ SAME-LINE fold, LINE-NEUTRAL: `shell.rs` is compiled into every image and one added source line would move every `panic::Location` record below it (LEDGER P7); the body is a FILE-TAIL append, where nothing below it can move. Knob-off (`installdemo` absent) this arm is `cfg`-erased and `midden_core::HOST_VERBS` does not carry the word either, so the image is byte-identical.
             if args.first().copied() != Some("-l") {
                 console.println("usage: fdisk -l  (list block devices; no partition editor here)");
                 return took_screen;
@@ -7942,4 +7942,403 @@ fn x86bind_witness(mt: &crate::fs::vfs::MountTable, settled: bool) {
             );
         }
     }
+}
+
+// =====================================================================================
+// INSTALLVERB — THE OPERATOR PATH TO PARTINSTALL.
+//
+// PARTINSTALL built the partition installer and proved it from an unattended fixture. Its own
+// report named what was missing, and it is the whole of this block: *"there is no `install` verb in
+// shell.rs; `install_into_partition` exists as API and nothing calls it"*. A capability no operator
+// can reach is a library, not an installer.
+//
+// WHAT THE VERB IS, IN ONE SENTENCE: `install` alone is a READ-ONLY CENSUS over every disk the
+// block registry holds, and `install <disk> <slot>` installs into exactly that one partition
+// through [`crate::install::partition::install_into_partition`]. There is NO whole-disk form of
+// this verb — not a flag, not a bare argument, not a confirmation prompt. RULINGS R25 (Peter,
+// 2026-09-08): *"if UnaOS saw catalina and immediately formatted the disk as an alien enemy"* — a
+// verb that could name a DISK is one typo away from being that sentence, so the grammar does not
+// admit one. The whole-disk engine keeps exactly the reach it had: `run_demo`'s unattended fixture
+// and the GUI's blank-scratch path, and the GUI now withholds it on any disk with a foreign volume
+// (video/instgui.rs, rmbp-ledger B91).
+//
+// EVERY REFUSAL IS THE API'S OWN. This verb never decides whether a partition may be written. It
+// calls `check_partition` for the PREVIEW and `install_into_partition` for the act, and prints what
+// they return — `Refusal::say` puts the stable `reason=` token on the wire, unchanged, so the
+// operator, the fixture and `docs/SECURITY.md`'s refusal table all read the same word. A verb that
+// paraphrased a refusal would be a second policy, and two policies is how a guard gets lost.
+//
+// WHY THE CENSUS IS THE BARE FORM AND IT STOPS THERE. The dangerous verb shape is the one that acts
+// on its best guess when the operator only asked a question. `install` is the question; nothing it
+// does can write a byte (`census` and `check_partition` are read-only by construction, and the
+// preview binds no writable partition target). The operator then names the disk and the slot they
+// read off that census — two words, both from the machine's own output, neither a default.
+// =====================================================================================
+
+/// INSTALLVERB: the tree size the PREVIEW asks `check_partition` about.
+///
+/// ⚠ WHY IT IS A CONSTANT HERE AND NOT THE ENGINE'S OWN NUMBER, said out loud because it is the one
+/// approximation in this block. `install/partition.rs`'s `demo_tree()` — the thing whose
+/// `total_bytes` the REAL install measures against — is private, and that file is held by AHCIWRITE
+/// this round, so the verb cannot ask it. So the preview asks about a number that is deliberately
+/// LARGER than any tree the installer writes today (the four-file boot tree is 61,952 B), which
+/// fixes the direction of the only possible error: the preview can say `partition-too-small` about
+/// a slot the real ladder would accept, and can NEVER say a slot is installable that the real
+/// ladder then refuses for size. A preview that erred the other way would be an installer promising
+/// room it does not have. The REAL answer is always the one `install_into_partition` prints, and it
+/// is printed on the same wire one line later. A one-line `pub fn demo_tree_bytes()` in
+/// `install/partition.rs` retires this constant; it is reported, not taken.
+#[cfg(feature = "installdemo")]
+pub const INSTALL_PREVIEW_TREE_BYTES: usize = 64 * 1024;
+
+/// INSTALLVERB: how much of a neighbour partition's head the verb fingerprints, before and after an
+/// install, to MEASURE — not assert — that nothing escaped the named partition. The same 8-sector
+/// window `install/partition.rs`'s own fixture uses, so the two answers are comparable.
+#[cfg(feature = "installdemo")]
+const INSTALL_NEIGHBOUR_SECTORS: u64 = 8;
+
+/// INSTALLVERB: every disk the block registry holds, each under the name the operator types.
+///
+/// The names are TRANSPORT-shaped (`global`, `usb0`, `sdhc`, `ahci0`) because that is what the
+/// registry actually distinguishes — a name like "disk 1" is a position in a list that is rebuilt
+/// every time something enumerates, which is the defect INSTALL-SEL spent an arc removing. The
+/// USB rung is de-duplicated against the global slot exactly as the graphical chooser does it (one
+/// stick published into both handles is ONE disk), by slot id.
+#[cfg(feature = "installdemo")]
+fn install_disks() -> Vec<(String, crate::drivers::block::BlockDeviceId)> {
+    use crate::drivers::block;
+    let mut out: Vec<(String, block::BlockDeviceId)> = Vec::new();
+    let mut global_slot: Option<u8> = None;
+    if let Some(i) = block::info() {
+        global_slot = Some(i.slot_id);
+        out.push((String::from("global"), i.id(block::BlockHandle::Global)));
+    }
+    for ix in 0..block::MAX_USB_DISKS {
+        if let Some(u) = block::usb_info_ix(ix) {
+            if global_slot == Some(u.slot_id) && ix == 0 {
+                continue; // the one stick under two names — the chooser's own dedupe
+            }
+            out.push((alloc::format!("usb{}", ix), u.id(block::BlockHandle::Usb)));
+        }
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    if let Some(s) = block::sdhc_info() {
+        out.push((String::from("sdhc"), s.id(block::BlockHandle::Sdhc)));
+    }
+    // AHCI: listed BECAUSE it is refused. The rMBP's internal SSD is the disk Peter's goal is about
+    // (rmbp-ledger B89) and the disk R25 is about (Catalina lives on it), so a census that silently
+    // omitted it would be telling the operator their machine has fewer disks than it has. It appears
+    // with every other disk, and its refusal — `transport-read-only`, until AHCIWRITE lands a write
+    // path — is printed beside it.
+    #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+    for ix in 0..block::MAX_AHCI_DISKS {
+        if let Some(d) = block::ahci_disk(ix) {
+            out.push((
+                alloc::format!("ahci{}", d.port),
+                d.info.id(block::BlockHandle::Ahci { port: d.port }),
+            ));
+        }
+    }
+    out
+}
+
+/// INSTALLVERB: SHA-256 of one partition's first [`INSTALL_NEIGHBOUR_SECTORS`] sectors, read
+/// through the DISK target at the partition's absolute LBA. Read-only.
+#[cfg(feature = "installdemo")]
+fn install_head_sha<T: crate::install::InstallTarget>(
+    t: &T,
+    e: &crate::install::gpt::GptEntryView,
+) -> Result<[u8; 32], crate::install::InstallError> {
+    let n = core::cmp::min(INSTALL_NEIGHBOUR_SECTORS, e.sectors()) as usize;
+    let mut buf = alloc::vec![0u8; n * 512];
+    t.read_sectors(e.first_lba, &mut buf)?;
+    Ok(crate::install::hash::sha256(&buf))
+}
+
+/// INSTALLVERB: the read-only census of ONE disk, on the console and on the wire. Returns `true`
+/// when the disk carried a GPT this kernel could read.
+#[cfg(feature = "installdemo")]
+fn install_census_disk(
+    console: &mut Console,
+    name: &str,
+    id: crate::drivers::block::BlockDeviceId,
+) -> bool {
+    use crate::install::{partition, InstallTarget};
+    serial_println!(
+        ":: INSTALLVERB: census disk={} transport={} ::",
+        name,
+        partition::transport_name(id.handle)
+    );
+    let t = match crate::install::BlockTarget::bind_id(id) {
+        Ok(t) => t,
+        Err(e) => {
+            console.println(&alloc::format!("{}: not bindable ({:?})", name, e));
+            serial_println!(":: INSTALLVERB: census disk={} bind err={:?} ::", name, e);
+            return false;
+        }
+    };
+    let c = match partition::census(&t) {
+        Ok(c) => c,
+        // NOT READABLE THROUGH THE INSTALLER AT ALL — and this is a DIFFERENT SENTENCE from "this
+        // disk has no partition table", which is why it is a separate arm. `install/mod.rs`'s
+        // `BlockTarget` answers `NotReady` for every handle that is not `Global`/`Usb` (the SDHC
+        // arm, the Tegra arm, and the AHCI arm B91 put there), so on the bench rMBP the SATA disk
+        // Catalina lives on lands HERE. Telling an operator "no readable GPT" about that disk would
+        // be a lie in the one place a lie costs the most: it reads as "there is nothing on it".
+        Err(crate::install::InstallError::NotReady) => {
+            console.println(&alloc::format!(
+                "{}: present, NOT censused — the installer cannot read this transport yet (nothing is claimed about what is on it)",
+                name));
+            serial_println!(
+                ":: INSTALLVERB: census disk={} transport={} UNREADABLE-HERE err=NotReady — install/mod.rs's BlockTarget reads only global/usb (B91); the disk is PRESENT and its content is UNKNOWN, not empty ::",
+                name,
+                partition::transport_name(id.handle)
+            );
+            return false;
+        }
+        Err(e) => {
+            // A readable transport whose table does not parse. NOT an error and NOT an invitation: a
+            // disk with no partition table is simply not a partition-install target, and this verb
+            // has no whole-disk form.
+            console.println(&alloc::format!(
+                "{}: no readable GPT ({:?}) — this verb installs into partitions only", name, e));
+            serial_println!(":: INSTALLVERB: census disk={} gpt=unreadable err={:?} ::", name, e);
+            return false;
+        }
+    };
+    partition::print_census(&t.id(), &c);
+    console.println(&alloc::format!(
+        "{}: {} partitions  foreign={} friend={} empty={}",
+        name, c.rows.len(), c.foreign, c.friend, c.empty));
+    // THE WHOLE-DISK QUESTION IS ASKED AND ANSWERED, and the answer is never an offer. It is
+    // printed because an operator reading a census is entitled to know that the disk as a whole is
+    // protected and why — but no spelling of this verb can act on it.
+    match partition::check_whole_disk(&c) {
+        Err(r) => {
+            r.say(&alloc::format!("{}:disk", name));
+            console.println(&alloc::format!(
+                "  whole disk: refused ({}) — and this verb has no whole-disk form in any case",
+                r.reason()));
+        }
+        Ok(()) => console.println(
+            "  whole disk: carries no foreign volume (the verb still installs into partitions only)"),
+    }
+    for row in &c.rows {
+        let mib = row.entry.sectors() * 512 / (1024 * 1024);
+        match partition::check_partition(&c, id, row.entry.index, INSTALL_PREVIEW_TREE_BYTES, false)
+        {
+            Err(r) => {
+                r.say(&alloc::format!("{}:part{}", name, row.entry.index));
+                console.println(&alloc::format!(
+                    "  part{}  {:>6} MiB  content={}  REFUSED {}",
+                    row.entry.index, mib, row.content.tag(), r.reason()));
+            }
+            Ok(()) => {
+                serial_println!(
+                    ":: INSTALLVERB: preview target={}:part{} content={} sectors={} -> INSTALLABLE ::",
+                    name, row.entry.index, row.content.tag(), row.entry.sectors());
+                console.println(&alloc::format!(
+                    "  part{}  {:>6} MiB  content={}  installable: install {} {}",
+                    row.entry.index, mib, row.content.tag(), name, row.entry.index));
+            }
+        }
+    }
+    true
+}
+
+/// INSTALLVERB: `install <disk> <slot> [--as-esp]` — the act.
+///
+/// The neighbour fingerprints around the call are the verb's own measurement and not the engine's
+/// claim: `PartitionTarget`'s bounds check is what MAKES the write stay inside the partition, and
+/// this is what CHECKS it, on the operator's own disk, in the operator's own transcript. Taken
+/// before the write and compared after, over every partition except the target.
+#[cfg(feature = "installdemo")]
+fn install_into(
+    console: &mut Console,
+    name: &str,
+    id: crate::drivers::block::BlockDeviceId,
+    index: u32,
+    as_esp: bool,
+) {
+    use crate::install::partition;
+    let before: Vec<(u32, [u8; 32])> = match crate::install::BlockTarget::bind_id(id) {
+        Err(e) => {
+            console.println(&alloc::format!("{}: not bindable ({:?})", name, e));
+            serial_println!(":: INSTALLVERB: install disk={} bind err={:?} ::", name, e);
+            return;
+        }
+        Ok(t) => match partition::census(&t) {
+            Err(e) => {
+                console.println(&alloc::format!("{}: no readable GPT ({:?})", name, e));
+                serial_println!(":: INSTALLVERB: install disk={} gpt=unreadable err={:?} ::", name, e);
+                return;
+            }
+            Ok(c) => {
+                let mut v = Vec::new();
+                for row in &c.rows {
+                    if row.entry.index == index {
+                        continue;
+                    }
+                    match install_head_sha(&t, &row.entry) {
+                        Ok(s) => v.push((row.entry.index, s)),
+                        Err(e) => {
+                            // A neighbour we cannot fingerprint is a neighbour we cannot clear
+                            // afterwards, so the install does not happen. The safe direction.
+                            console.println(&alloc::format!(
+                                "{}: cannot read part{} to fingerprint it ({:?}) — refusing to install",
+                                name, row.entry.index, e));
+                            serial_println!(
+                                ":: INSTALLVERB: neighbour part={} pre-read err={:?} — install not attempted ::",
+                                row.entry.index, e);
+                            return;
+                        }
+                    }
+                }
+                v
+            }
+        },
+    };
+    serial_println!(
+        ":: INSTALLVERB: install target={}:part{} as_esp={} neighbours={} ::",
+        name, index, as_esp as u8, before.len());
+    // THE CALL. Every guard, and every refusal's wording, belongs to the API.
+    let w = match partition::install_into_partition(id, index, as_esp) {
+        Ok(w) => w,
+        Err(e) => {
+            // `install_into_partition` has already put the refusal on the wire with its stable
+            // `reason=` token (`Refusal::say`). This line is the operator's copy, not a second
+            // verdict — and it says NOTHING WAS WRITTEN, which is the fact they need.
+            console.println(&alloc::format!(
+                "install refused ({:?}) — nothing was written to {} (see the console log for the reason)",
+                e, name));
+            serial_println!(
+                ":: INSTALLVERB: install target={}:part{} err={:?} — nothing written ::",
+                name, index, e);
+            return;
+        }
+    };
+    if w.verified != w.files || w.files == 0 {
+        serial_println!(
+            ":: INSTALLVERB: wrote part={} files={} bytes={} verified={}/{} -> FAIL ::",
+            w.index, w.files, w.bytes, w.verified, w.files);
+        console.println(&alloc::format!(
+            "install part{}: {} of {} files verified — the volume is NOT trustworthy",
+            w.index, w.verified, w.files));
+        return;
+    }
+    serial_println!(
+        ":: INSTALLVERB: wrote part={} files={} bytes={} verified={}/{} -> PASS ::",
+        w.index, w.files, w.bytes, w.verified, w.files);
+    console.println(&alloc::format!(
+        "install part{}: FAT32 + boot tree, {} files, {} bytes, verified {}/{}",
+        w.index, w.files, w.bytes, w.verified, w.files));
+    // --- the neighbours, measured again. ---
+    let Ok(t) = crate::install::BlockTarget::bind_id(id) else {
+        serial_println!(":: INSTALLVERB: neighbours unmeasured — the disk left after the write ::");
+        return;
+    };
+    let Ok(after) = partition::census(&t) else {
+        serial_println!(":: INSTALLVERB: post-write census — GPT no longer parses -> FAIL ::");
+        console.println("WARNING: the partition table no longer parses after the install.");
+        return;
+    };
+    let mut untouched = 0usize;
+    for (ix, sha) in &before {
+        let Some(row) = after.row(*ix) else {
+            serial_println!(":: INSTALLVERB: neighbour part={} vanished from the table -> FAIL ::", ix);
+            return;
+        };
+        match install_head_sha(&t, &row.entry) {
+            Ok(now) if &now == sha => untouched += 1,
+            Ok(_) => serial_println!(":: INSTALLVERB: neighbour part={} CHANGED across the install ::", ix),
+            Err(e) => serial_println!(":: INSTALLVERB: neighbour part={} post-read failed ({:?}) ::", ix, e),
+        }
+    }
+    if untouched == before.len() {
+        serial_println!(":: INSTALLVERB: neighbours untouched={}/{} -> PASS ::", untouched, before.len());
+        console.println(&alloc::format!(
+            "neighbours untouched: {}/{} partitions byte-identical", untouched, before.len()));
+    } else {
+        serial_println!(":: INSTALLVERB: neighbours untouched={}/{} -> FAIL ::", untouched, before.len());
+        console.println(&alloc::format!(
+            "WARNING: {} of {} neighbour partitions CHANGED", before.len() - untouched, before.len()));
+    }
+}
+
+/// INSTALLVERB: the verb itself. See the block comment above for the grammar and why it has no
+/// whole-disk form.
+#[cfg(feature = "installdemo")]
+fn install_verb(console: &mut Console, args: &[&str]) {
+    // `install --gui` (x86 + the compositor) hands the same two steps to the graphical installer,
+    // so an operator who closed the window can get it back without rebooting. It OPENS a dialog and
+    // nothing else — every guard downstream of it is the same one this verb calls.
+    if args.first().copied() == Some("--gui") {
+        #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))]
+        {
+            serial_println!(":: INSTALLVERB: --gui — installer window requested (opens on the next main-loop pass) ::");
+            crate::video::instgui::request_open();
+            console.println("installer window opening: Enter censuses the disk, Enter again installs.");
+        }
+        #[cfg(not(all(target_arch = "x86_64", feature = "wc", feature = "instgui")))]
+        console.println("install: --gui needs the window compositor and the graphical installer (this build has neither)");
+        return;
+    }
+    let disks = install_disks();
+    if disks.is_empty() {
+        console.println("install: no block device is registered yet.");
+        serial_println!(":: INSTALLVERB: census disks=0 — nothing registered ::");
+        return;
+    }
+    // --- the bare form: the census, and it STOPS. ---
+    if args.is_empty() {
+        console.println("install: read-only census (name a disk and a partition to install)");
+        serial_println!(":: INSTALLVERB: census disks={} ::", disks.len());
+        for (name, id) in &disks {
+            install_census_disk(console, name, *id);
+        }
+        console.println("usage: install <disk> <slot> [--as-esp]   (one partition; never a whole disk)");
+        return;
+    }
+    // --- the acting form. ---
+    let name = args[0];
+    let Some((_, id)) = disks.iter().find(|(n, _)| n == name) else {
+        let mut names = String::new();
+        for (n, _) in &disks {
+            if !names.is_empty() {
+                names.push(' ');
+            }
+            names.push_str(n);
+        }
+        console.println(&alloc::format!("install: no disk named `{}`. This machine has: {}", name, names));
+        serial_println!(":: INSTALLVERB: no disk named {} — have: {} ::", name, names);
+        return;
+    };
+    let id = *id;
+    let Some(slot) = args.get(1).and_then(|s| s.parse::<u32>().ok()) else {
+        // NO DEFAULT SLOT, deliberately. `install <disk>` with no partition is the exact shape that
+        // would have to mean "the whole disk" or "whichever slot I picked for you", and both are
+        // the thing R25 forbids. It is a usage line.
+        console.println("install: name the partition too — `install <disk> <slot>` (see `install` for the census)");
+        serial_println!(":: INSTALLVERB: disk={} with no slot — refused, no default target ::", name);
+        return;
+    };
+    // `--as-esp` ONLY as the explicit third word: never inferred, never a default, and never
+    // accepted in place of the slot. It changes one 16-byte type GUID after a successful write and
+    // the operator asks for it knowingly (`install/partition.rs`'s own doc says why it exists).
+    let as_esp = match args.get(2).copied() {
+        None => false,
+        Some("--as-esp") => true,
+        Some(other) => {
+            console.println(&alloc::format!(
+                "install: `{}` is not a word this verb takes (only `--as-esp`, as the third word)", other));
+            serial_println!(":: INSTALLVERB: unknown third word `{}` — refused ::", other);
+            return;
+        }
+    };
+    if args.len() > 3 {
+        console.println("install: too many words — `install <disk> <slot> [--as-esp]`");
+        serial_println!(":: INSTALLVERB: too many words — refused ::");
+        return;
+    }
+    install_into(console, name, id, slot, as_esp);
 }

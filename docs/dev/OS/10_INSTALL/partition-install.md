@@ -44,15 +44,57 @@ The "do not invent a verdict" arm stays, for identities the census truly does no
    Apply. Note the new volume's size — that is how you will identify it in step 3.
 2. **Boot UnaOS** from the USB stick (⌥ at the chime, pick the stick — R3: there is nobody to hold
    down ⌥ for an unattended reboot, so this step is a human, every time).
-3. **Read the census before anything else.** The installer prints one `:: PINSTALL: census part=N …`
-   line per partition with its type GUID, LBA range and probed **content**. Find the row whose
-   `content=empty` and whose `sectors=` matches the volume you just made. **That number `N` is the
-   partition index you name.** Do not count rows: `N` is the GPT slot, and the two differ on any disk
-   that has ever had a partition deleted.
-4. **Install into that partition, by index.** Every other partition on the disk is refused with a
-   named reason, and the run ends with `wrote part=N … -> PASS` followed by
-   `neighbours untouched=n/n -> PASS`. If the neighbours line is not PASS, **stop and report it** —
-   that is the invariant this whole arc exists to hold.
+3. **Type `install`, and read the census before anything else.** The bare verb is **read-only** and
+   it **stops**: it prints one row per partition of every disk the block registry holds, with the
+   probed **content** and the refusal that partition would give, and writes nothing.
+
+   ```
+   > install
+   install: read-only census (name a disk and a partition to install)
+   global: 5 partitions  foreign=2 friend=0 empty=3
+     whole disk: refused (disk-has-foreign-volumes) — and this verb has no whole-disk form in any case
+     part0       8 MiB  content=FAT    REFUSED partition-not-empty
+     part1      48 MiB  content=APFS   REFUSED partition-not-empty
+     part2      48 MiB  content=empty  installable: install global 2
+     part3       4 MiB  content=ESP    REFUSED partition-is-esp
+     part4       1 MiB  content=empty  REFUSED partition-too-small
+   ahci0: present, NOT censused - the installer cannot read this transport yet (nothing is claimed about what is on it)
+   usage: install <disk> <slot> [--as-esp]   (one partition; never a whole disk)
+   ```
+
+   **That last row is a third answer and not a polite "no".** `install/mod.rs`'s `BlockTarget`
+   reads only the `Global`/`Usb` handles — the SDHC, Tegra and AHCI arms all answer `NotReady`
+   (B91 put the AHCI one there) — so on the rMBP the internal SSD is LISTED, because it is a disk
+   this machine has, and is reported as unread rather than as unpartitioned. Saying "no readable
+   GPT" about the disk Catalina lives on would read as "there is nothing on it". AHCIWRITE's read
+   half is what turns this row into a census.
+
+   Find the row whose `content=empty` that the verb calls installable and whose size matches the
+   volume you just made. **That number is the GPT slot you name.** Do not count rows: the index is
+   the slot, and the two differ on any disk that has ever had a partition deleted. The disk NAME is
+   the transport (`global`, `usb0`, `sdhc`, `ahci0`), not a position in a list.
+4. **Install into that partition, by index: `install <disk> <slot>`.** The verb has **no whole-disk
+   form** — not a flag, not a bare argument. R25 is the reason the grammar cannot express one.
+
+   ```
+   > install global 2
+   install part2: FAT32 + boot tree, 4 files, 61952 bytes, verified 4/4
+   neighbours untouched: 4/4 partitions byte-identical
+   ```
+
+   and on the wire, `:: INSTALLVERB: wrote part=2 files=4 bytes=61952 verified=4/4 -> PASS ::`
+   followed by `:: INSTALLVERB: neighbours untouched=4/4 -> PASS ::`. If the neighbours line is not
+   PASS, **stop and report it** — that is the invariant this whole arc exists to hold. Naming a
+   partition that is not yours prints the engine's own refusal and moves no byte:
+
+   ```
+   > install global 1
+   install refused (NotBlank) — nothing was written to global (see the console log for the reason)
+   ```
+   `:: PINSTALL: refusal target=part1 reason=partition-not-empty content=APFS -> guard OK ::`
+
+   `--as-esp` is accepted **only** as the explicit third word (`install global 2 --as-esp`), never
+   inferred and never in place of the slot. `install --gui` reopens the graphical installer below.
 5. **Make it bootable from macOS Recovery.** ⌘R at the chime → Utilities → Terminal →
    `sudo bless --mount /Volumes/<the new volume> --setBoot`. UnaOS does not do this and will not:
    R3 puts firmware boot selection in the operator's hands on this machine, and `bless` is that act.
@@ -78,6 +120,25 @@ refusals goes through `install/partition.rs`'s `PartitionTarget`, an `InstallTar
 the partition's first sector and whose capacity is its length; an address past the end returns
 `BadLba`, never a clamp. The formatter, tree writer and verifier are handed that target and cannot
 name a sector on the disk. The neighbours SHA is the measurement of it.
+
+---
+
+## The graphical installer — two presses, and the first one only reads
+
+`video/instgui.rs` is a face on the same engine and holds no authority of its own. Its go-button used
+to be one attended Enter away from the **whole-disk** engine, which on this machine is the engine
+aimed at Catalina's disk (rmbp-ledger **B91**).
+
+| press | screen | what it does | writes? |
+|---|---|---|---|
+| Enter on the chooser | *Choose a target disk* | commits the disk identity, then takes the **census** (`partition::census`) and paints it: one row per partition with its content and, for each, the refusal `check_partition` gave | no |
+| w / s | *What is on this disk* | step between **installable** partitions only — selection cannot rest on a row the engine would refuse, so the next press cannot be aimed at a stranger's volume | no |
+| Enter again | *What is on this disk* | `install_into_partition(disk, slot, as_esp: false)` for that ONE partition. There is no key in the dialog that sets `--as-esp` | **yes, inside the partition** |
+| `d` | *What is on this disk* | the whole-disk demo — **offered only when the census found no volume that is not ours**. On any other disk the key prints `whole-disk target REFUSED at the affordance` and does nothing | no |
+| Enter on the warning | *Erase and install?* | the whole-disk engine, and the guard is **asked again here** — an affordance check alone is a UI filter, not a guard | **yes, the whole disk** |
+
+So there is no path from this dialog to the whole-disk engine on a disk carrying a foreign volume:
+the affordance is absent, the reason is on the glass in its place, and the go re-asks.
 
 ---
 
@@ -120,6 +181,30 @@ UNAOS_WC=1 UNAOS_INSTALLDEMO=1 UNAOS_AHCI=1 \
   UNAOS_QEMU_FULL=1 ./arroyo test 120
 ```
 
+**INSTALLVERB: the OPERATOR leg adds `UNAOS_INSTGUI=1` and a typist, and the first knob is not
+cosmetic.** `main.rs`'s two `install_probe_once` call sites are gated
+`all(feature = "installdemo", not(feature = "instgui"))` — *"INSTGUI supersedes the auto-probe: when
+the graphical installer is armed, the attended Enter on its warning screen is the ONLY trigger"*. So
+with `UNAOS_INSTGUI=1` the unattended fixture does **not** run, part 2 is still empty when the
+prompt arrives, and what installs into it is the operator. That is the whole point of the leg: the
+same disk, written by a human's two words instead of by a boot probe.
+
+```
+UNAOS_QEMU_EXTRA="-qmp tcp:127.0.0.1:4478,server,nowait" \
+UNAOS_WC=1 UNAOS_INSTGUI=1 UNAOS_INSTALLDEMO=1 UNAOS_AHCI=1 \
+  UNAOS_PART_DISK=builder/part-fixture.img UNAOS_QEMU_FULL=1 ./arroyo test 180
+# and, against that QMP port, in order (scripts/qmp_type.py --text '<line>' --enter):
+#   install                 -> the census, read-only
+#   install global 2        -> the install
+#   install global 1        -> GO-RED: the APFS slot, refused
+#   install --gui           -> the window; then Enter (census), Enter (second press)
+```
+
+Keys are real: `send-key` → the emulated keyboard → HID → the same console the operator types into.
+`install --gui` sets a flag that `instgui::service()` honours on the next main-loop pass rather than
+creating the window on the shell's stack — the first cut called `open()` inline and faulted
+(`site=fbcon::panic_screen`, `#DB`), which is why the dialog has exactly one spawn place.
+
 `UNAOS_PART_DISK` is a **builder** knob (it changes what QEMU attaches and adds no byte to any
 image), so it carries no kernel feature and no four-place wiring; the kernel half rides the existing
 `installdemo` feature. The leg is chosen **by content**, not by a knob: `partition::probe_once`
@@ -142,6 +227,44 @@ Witness lines to `awk` for (`awk 'index($0,"PINSTALL:")'` on `target/serial*.log
 and its five `census part=` rows, four `refusal … reason=` lines plus the SATA one,
 `wrote part=2 fat32 tree=4 bytes=61952 verified=4/4 -> PASS`, the post-write re-census, and
 `neighbours untouched=4/4 -> PASS` (all four non-target slots, not only the two foreign ones).
+
+On the OPERATOR leg the same disk is written by the verb, so the verdicts are
+`awk 'index($0,"INSTALLVERB:")'` and `awk 'index($0,"instgui")'`:
+
+```
+:: INSTALLVERB: census disks=3 ::
+:: INSTALLVERB: census disk=global transport=global ::
+:: INSTALLVERB: census disk=ahci5 transport=ahci UNREADABLE-HERE err=NotReady — install/mod.rs's BlockTarget reads only global/usb (B91); the disk is PRESENT and its content is UNKNOWN, not empty ::
+:: PINSTALL: census part=2 type=ebd0a0a2 lba=116736..215039 sectors=98304 content=empty ::
+:: INSTALLVERB: preview target=global:part2 content=empty sectors=98304 -> INSTALLABLE ::
+:: PINSTALL: refusal target=global:part4 reason=partition-too-small have=1048576B need=34662912B -> guard OK ::
+:: INSTALLVERB: wrote part=2 files=4 bytes=61952 verified=4/4 -> PASS ::
+:: INSTALLVERB: neighbours untouched=4/4 -> PASS ::
+:: PINSTALL: refusal target=part1 reason=partition-not-empty content=APFS -> guard OK ::
+:: INSTALLVERB: install target=global:part1 err=NotBlank — nothing written ::
+[wc-x] instgui census step=1 gpt=1 parts=5 installable=0 whole_disk_offered=0 — READ-ONLY, nothing written
+[wc-x] instgui install-go step=2 part=4 (attended Enter on the census screen)
+:: PINSTALL: refusal target=part4 reason=partition-too-small have=1048576B need=34659328B -> guard OK ::
+```
+
+**The two `need=` numbers differ by 3,584 B on purpose, and the difference is the one approximation
+in the verb.** The preview asks `check_partition` about `shell.rs`'s `INSTALL_PREVIEW_TREE_BYTES`
+(64 KiB) because `demo_tree()`'s real 61,952 B is private to `install/partition.rs`; the constant is
+deliberately the LARGER of the two, so the preview can only ever be pessimistic — it can call a slot
+too small that the engine would take, and can never call one installable that the engine then
+refuses for size. The engine's number is the one that decides.
+
+**The neighbour invariant, measured off the image by the HOST after the run** (`dd` + `sha256sum` over
+each partition's extent of `builder/part-fixture.img` versus `target/partfixture.img`, the copy QEMU
+actually wrote). This is independent of anything the kernel claims:
+
+| extent | pristine | after the operator install |
+|---|---|---|
+| LBA 0..33 (protective MBR + header + entry array) | `2d088e15…` | `2d088e15…` **identical** |
+| part 0 FOREIGN-FAT | `bc06d5b0…` | `bc06d5b0…` **identical** |
+| part 1 FOREIGN-APFS | `bd17276b…` | `bd17276b…` **identical** (and it is the slot the go-red named) |
+| part 2 UNAOS-TARGET | `152ba99d…` | `5b609830…` **changed — the only one** |
+| parts 3+4 ESP + TINY | `c036cbb7…` | `c036cbb7…` **identical** |
 
 **Go-red, both recorded, and (a) paid for two design changes before it would fire.**
 

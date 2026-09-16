@@ -4,8 +4,19 @@
 //! INSTGUI — the first graphical installer (x86, `wc` + `instgui` features).
 //!
 //! A kernel-owned compositor window, drawn in the CRISPY theme's const table
-//! ([`super::theme`]), that walks Peter through: **choose disk → erase warning →
-//! install → verdict**. It is a *face* on the installer engine, never a new
+//! ([`super::theme`]), that walks Peter through: **choose disk → census → install
+//! one partition → verdict**.
+//!
+//! ### INSTALLVERB: the go-button is two presses, and the first one only reads
+//! The dialog's first form ran the WHOLE-DISK engine on one attended Enter. On the bench rMBP that
+//! button is aimed at the disk Catalina lives on (rmbp-ledger B91), and RULINGS R25 is about
+//! exactly that disk: *"if UnaOS saw catalina and immediately formatted the disk as an alien
+//! enemy"*. So the press that used to install now takes the read-only census
+//! ([`crate::install::partition::census`]) and paints what is on the medium; the SECOND press, on a
+//! partition the engine's own ladder passed, calls
+//! [`crate::install::partition::install_into_partition`] for that ONE partition. The whole-disk
+//! engine is reachable from this dialog only when the census found no volume that is not ours —
+//! asked at the affordance and asked again at the go. It is a *face* on the installer engine, never a new
 //! authority: every write still goes through [`crate::install`]'s engine, whose
 //! blank-check refusal and verify ladder are untouched. The GUI cannot arm
 //! anything the engine would refuse; a non-blank target surfaces the engine's
@@ -47,6 +58,14 @@ static mut SURF: Surf = Surf([0; W * H]);
 #[derive(Clone, Copy, PartialEq)]
 enum State {
     Choose,
+    /// INSTALLVERB: **the first press, and it writes nothing.** The go-button used to run the
+    /// whole-disk engine on the disk the operator had just highlighted — on the bench rMBP, that
+    /// button is pointed at Catalina's disk (rmbp-ledger B91). It now runs the READ-ONLY census
+    /// (`install::partition::census`) and paints what is actually on the medium, partition by
+    /// partition, with the refusal each one would give. The SECOND press, on a selected empty
+    /// partition, is the only thing in this dialog that can write, and it writes through
+    /// `install_into_partition` — one partition, never the disk.
+    Census,
     Warn,
     Running,
     Done(bool),
@@ -78,6 +97,55 @@ static CLOSES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::ne
 static SUSPEND_MIRROR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Which list row is selected (the device list is tiny; a u8 outlives it).
 static SEL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// INSTALLVERB: one partition as the census painted it. A SNAPSHOT, not a live read — the census is
+/// taken once, on the press that enters [`State::Census`], and the screen shows exactly what that
+/// read found. Re-probing on every repaint would let the glass and the go disagree, which is the
+/// defect INSTALL-SEL spent an arc removing one level up.
+#[derive(Clone, Copy)]
+struct PartRow {
+    index: u32,
+    mib: u64,
+    /// What the content probe found (`empty`, `FAT`, `APFS`, `HFS+`, `UNAFS`, `ESP`, `unknown`).
+    tag: &'static str,
+    /// **Is this slot EMPTY — nobody's?** This, and not the full refusal ladder, is what selection
+    /// turns on, and the split is deliberate. The question the DIALOG must answer structurally is
+    /// R25's: never offer somebody else's volume. Every other question — size, ESP type, transport,
+    /// boot device — belongs to the engine, which re-asks all of them at the go and names the one it
+    /// refuses on. Keying selection on the preview instead would make the dialog's reach depend on
+    /// `INSTALL_PREVIEW_TREE_BYTES`, an APPROXIMATION of the tree size (see its doc in `shell.rs`),
+    /// so an over-estimate would silently hide a partition the engine would have taken.
+    empty: bool,
+    /// The engine's PREVIEW verdict for this slot, as `check_partition` returned it: `None` when
+    /// every guard passed, `Some(reason)` carrying the API's own stable token otherwise.
+    refusal: Option<&'static str>,
+}
+
+/// INSTALLVERB: **a request to open the dialog, to be honoured by the MAIN LOOP and not by the
+/// caller.** `install --gui` arrives on the console's key path, deep inside the shell's dispatch,
+/// and [`open`] is a spawn-place operation: it takes `wm::spawn_geometry`, creates a window, takes
+/// the framebuffer's info lock and presents. Called straight from that context the first attempt
+/// FAULTED — `[panel-owner] panel-ownership-handover … site=fbcon::panic_screen` and a `#DB` with a
+/// junk frame, on the very pass the window was created. So the verb sets this flag and [`service`],
+/// which already runs every main-loop pass and is where `desktop_uefi::activate` opens the dialog
+/// from, does the opening. Same door as the boot path, one place, no second spawn context.
+static OPEN_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// INSTALLVERB: the census the current dialog is showing, or empty when none has been taken.
+static PARTS: spin::Mutex<alloc::vec::Vec<PartRow>> = spin::Mutex::new(alloc::vec::Vec::new());
+/// INSTALLVERB: which partition row is highlighted. Selection can only rest on an installable row
+/// (see [`step_part`]), so the second press can never be aimed at a stranger's volume.
+static PSEL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// INSTALLVERB: did the chosen disk carry a GPT this kernel could read? Three-valued in effect —
+/// `false` here plus [`WHOLE_OK`] `true` is the blank scratch (no table at all, the whole-disk demo's
+/// own disk); `true` plus `WHOLE_OK` `false` is Peter's rMBP.
+static HAS_GPT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// INSTALLVERB: **may the whole-disk engine be offered for this disk at all?** `false` the moment
+/// the census finds one foreign or friend volume — R25 (*"if UnaOS saw catalina and immediately
+/// formatted the disk as an alien enemy"*), and rmbp-ledger B91's ordering constraint: the guard
+/// lands before the SATA write path that would make the rMBP's internal SSD reachable. Set ONLY by
+/// [`run_census`], from `partition::check_whole_disk`'s own answer, and re-asked at the go.
+static WHOLE_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// INSTALL-SEL: the identity the operator COMMITTED to when they left the chooser, plus the row it
 /// occupied on their screen (carried for the witness only).
@@ -158,6 +226,131 @@ fn step_selectable(devs: &[Option<Row>; 2], n: usize, cur: usize, dir: isize) ->
             return cur;
         }
         if devs[i as usize].is_some_and(|r| !r.boot) {
+            return i as usize;
+        }
+    }
+}
+
+// ------------------------------------------------- INSTALLVERB: the census --
+
+/// INSTALLVERB: the SHORT form of a refusal, for a 28-cell row. The FULL token — `partition-not-
+/// empty`, `partition-foreign-type`, `transport-read-only` — is on the serial wire from
+/// `Refusal::say`, unchanged and unparaphrased, because that token is the API and the docs' refusal
+/// table is keyed on it. This is the glass's abbreviation of it and nothing else reads it.
+fn glass_reason(token: &'static str) -> &'static str {
+    match token {
+        "partition-not-empty" => "in use",
+        "partition-foreign-type" => "not ours",
+        "partition-is-esp" => "ESP",
+        "partition-too-small" => "too small",
+        "transport-read-only" => "read-only",
+        "boot-device" => "boot disk",
+        "no-such-partition" => "no slot",
+        _ => "refused",
+    }
+}
+
+/// INSTALLVERB: take the census of the committed disk and publish it for the screen.
+///
+/// READ-ONLY, top to bottom: `census` probes each partition's head through the DISK target,
+/// `check_whole_disk` and `check_partition` are pure functions over what it found, and no writable
+/// partition target is built anywhere in here. Every refusal it evaluates is ALSO said on the wire
+/// by the API itself, so a run that only censused still leaves the full verdict table in the log.
+fn run_census(id: block::BlockDeviceId) {
+    use crate::install::{partition, InstallTarget};
+    let mut rows: alloc::vec::Vec<PartRow> = alloc::vec::Vec::new();
+    let mut has_gpt = false;
+    let mut whole_ok = false;
+    match crate::install::BlockTarget::bind_id(id) {
+        Err(e) => {
+            serial_println!("[wc-x] instgui census — the disk did not bind ({:?}); nothing read, nothing written", e);
+        }
+        Ok(t) => match partition::census(&t) {
+            Err(e) => {
+                // NO READABLE GPT. That is the blank scratch disk the whole-disk demo exists for,
+                // and it is the ONE shape in which that demo stays reachable: there are no
+                // partitions to census, so there is no foreign volume to stand it down.
+                // PARTINSTALL's words for the other case: "stood down by content".
+                serial_println!(
+                    "[wc-x] instgui census — no readable GPT ({:?}): no partitions to install into, and the whole-disk demo stays available on this disk",
+                    e
+                );
+                whole_ok = true;
+            }
+            Ok(c) => {
+                has_gpt = true;
+                partition::print_census(&t.id(), &c);
+                whole_ok = match partition::check_whole_disk(&c) {
+                    Ok(()) => true,
+                    Err(r) => {
+                        r.say("instgui:disk");
+                        false
+                    }
+                };
+                for row in &c.rows {
+                    let refusal = match partition::check_partition(
+                        &c,
+                        id,
+                        row.entry.index,
+                        crate::shell::INSTALL_PREVIEW_TREE_BYTES,
+                        false,
+                    ) {
+                        Ok(()) => None,
+                        Err(r) => {
+                            r.say(&alloc::format!("instgui:part{}", row.entry.index));
+                            Some(r.reason())
+                        }
+                    };
+                    rows.push(PartRow {
+                        index: row.entry.index,
+                        mib: row.entry.sectors() * 512 / (1024 * 1024),
+                        tag: row.content.tag(),
+                        empty: row.content.is_installable(),
+                        refusal,
+                    });
+                }
+            }
+        },
+    }
+    let installable = rows.iter().filter(|r| r.refusal.is_none()).count();
+    HAS_GPT.store(has_gpt, Ordering::Relaxed);
+    WHOLE_OK.store(whole_ok, Ordering::Relaxed);
+    // Open on a slot that is nobody's — preferring one the preview also passed, so the highlight
+    // lands on the partition an operator would pick when there is one.
+    PSEL.store(
+        rows.iter()
+            .position(|r| r.empty && r.refusal.is_none())
+            .or_else(|| rows.iter().position(|r| r.empty))
+            .unwrap_or(0) as u8,
+        Ordering::Relaxed,
+    );
+    *PARTS.lock() = rows;
+    serial_println!(
+        "[wc-x] instgui census step=1 gpt={} parts={} installable={} whole_disk_offered={} — READ-ONLY, nothing written",
+        has_gpt as u8,
+        PARTS.lock().len(),
+        installable,
+        whole_ok as u8
+    );
+}
+
+/// INSTALLVERB: the next EMPTY partition row in `dir`, or `cur` when there is none that way.
+///
+/// Rows carrying somebody's filesystem are stepped over the way the device chooser steps over the
+/// boot device, and that is the structural half of the R25 guard on this screen: selection CANNOT
+/// rest on a stranger's volume, so the second press cannot be aimed at one. Rows that are empty but
+/// which the engine would refuse for another reason (too small, ESP-typed, a transport that cannot
+/// write) DO take the highlight, carry that reason on the glass, and get it again from the engine
+/// itself when pressed — see [`PartRow::empty`] for why the dialog does not arbitrate those.
+fn step_part(cur: usize, dir: isize) -> usize {
+    let parts = PARTS.lock();
+    let mut i = cur as isize;
+    loop {
+        i += dir;
+        if i < 0 || i >= parts.len() as isize {
+            return cur;
+        }
+        if parts[i as usize].empty {
             return i as usize;
         }
     }
@@ -348,6 +541,60 @@ fn repaint() {
                 button(px, W - 190, H - 52, 160, b"Continue", true);
             }
         }
+        State::Census => {
+            // INSTALLVERB: THE FIRST PRESS' SCREEN. Nothing here can write; it is the census, on
+            // glass, in the same words the serial log carries. What the operator is being shown is
+            // the DISK'S OWN CONTENT — read off the medium, not read off the partition table's
+            // declarations — because that is what decides whether a slot is ours to take.
+            text(px, lx, 20, b"What is on this disk", theme::CONTENT_TEXT);
+            fill(px, lx, 42, W - 2 * lx, 2, theme::FRAME_LINE);
+            let parts = PARTS.lock();
+            let psel = PSEL.load(Ordering::Relaxed) as usize;
+            let whole_ok = WHOLE_OK.load(Ordering::Relaxed);
+            let has_gpt = HAS_GPT.load(Ordering::Relaxed);
+            let selectable = parts.iter().any(|p| p.empty);
+            if !has_gpt {
+                text(px, lx, 62, b"No partition table here.", theme::CONTENT_TEXT);
+                text(px, lx, 62 + CELL + 6, b"Nothing to install into.", theme::TITLE_TEXT_INACTIVE);
+            }
+            for (i, pr) in parts.iter().enumerate() {
+                let ry = 62 + i * (CELL + 10);
+                if ry + CELL > H - 118 {
+                    break; // the fixture disk has five; a bigger table simply paints what fits
+                }
+                let sel = i == psel && pr.empty;
+                fill(px, lx, ry - 3, W - 2 * lx, CELL + 6, if sel { theme::SCROLL_THUMB } else { theme::CONTENT_FILL });
+                if sel {
+                    rect(px, lx, ry - 3, W - 2 * lx, CELL + 6, theme::ACCENT);
+                }
+                let label = match pr.refusal {
+                    None => "install here",
+                    Some(t) => glass_reason(t),
+                };
+                let line = alloc::format!("p{} {:>5}M {:<7} {}", pr.index, pr.mib, pr.tag, label);
+                let fg = if pr.refusal.is_none() { theme::CONTENT_TEXT } else { theme::TITLE_TEXT_INACTIVE };
+                text(px, lx + 6, ry, line.as_bytes(), fg);
+            }
+            // THE WHOLE-DISK AFFORDANCE, AND WHERE IT IS NOT. On a disk carrying anything that is
+            // not ours the button is not disabled, not confirmed twice, not hidden behind a
+            // modifier — it is ABSENT, and the reason is on the glass in place of it. R25.
+            let ry = H - 116;
+            if whole_ok {
+                text(px, lx, ry, b"d  erase the WHOLE disk", theme::CONTENT_TEXT);
+            } else {
+                text(px, lx, ry, b"Whole-disk install is not", theme::TITLE_TEXT_INACTIVE);
+                text(px, lx, ry + CELL + 2, b"offered: this disk holds", theme::TITLE_TEXT_INACTIVE);
+                text(px, lx, ry + 2 * (CELL + 2), b"volumes that are not ours.", theme::TITLE_TEXT_INACTIVE);
+            }
+            text(px, lx, H - 52 + 4, if selectable {
+                b"w/s pick  Enter install  Esc".as_slice()
+            } else {
+                b"Esc back   q halt".as_slice()
+            }, theme::TITLE_TEXT_INACTIVE);
+            if selectable {
+                button(px, W - 190, H - 52, 160, b"Install", true);
+            }
+        }
         State::Warn => {
             // The warning panel: CRISPY has no alarm red by design; the accent
             // frame + pressed-face field + explicit words carry the weight.
@@ -393,8 +640,12 @@ fn repaint() {
                     text(px, lx + 14, 72 + 3 * (CELL + 6), b"Esc back, then choose again.", theme::TITLE_TEXT_INACTIVE);
                 }
             }
-            text(px, lx, 200, b"The engine refuses non-blank", theme::TITLE_TEXT_INACTIVE);
-            text(px, lx, 200 + CELL + 4, b"targets (blank-check guard).", theme::TITLE_TEXT_INACTIVE);
+            // INSTALLVERB: say WHICH engine this screen arms. It is the WHOLE-DISK one, and this
+            // screen is now reachable only from a census that found nothing on the disk that is not
+            // ours — so the sentence names the disk, not a blank-check.
+            text(px, lx, 200, b"This erases the WHOLE disk.", theme::CONTENT_TEXT);
+            text(px, lx, 200 + CELL + 4, b"The census found nothing here", theme::TITLE_TEXT_INACTIVE);
+            text(px, lx, 200 + 2 * (CELL + 4), b"that is not ours.", theme::TITLE_TEXT_INACTIVE);
             if bound.is_some() {
                 text(px, lx, H - 92, b"Enter install    Esc back", theme::TITLE_TEXT_INACTIVE);
                 button(px, W - 190, H - 52, 160, b"Install", true);
@@ -422,10 +673,10 @@ fn repaint() {
                 text(px, lx, 84 + CELL + 6, b"payload verified extent-by-", theme::CONTENT_TEXT);
                 text(px, lx, 84 + 2 * (CELL + 6), b"extent. See console verdicts.", theme::CONTENT_TEXT);
             } else {
-                text(px, lx, 84, b"The engine declined - most", theme::CONTENT_TEXT);
-                text(px, lx, 84 + CELL + 6, b"often the blank-check guard", theme::CONTENT_TEXT);
-                text(px, lx, 84 + 2 * (CELL + 6), b"(target not blank). Console", theme::CONTENT_TEXT);
-                text(px, lx, 84 + 3 * (CELL + 6), b"has the exact refusal.", theme::CONTENT_TEXT);
+                text(px, lx, 84, b"The installer declined and", theme::CONTENT_TEXT);
+                text(px, lx, 84 + CELL + 6, b"wrote nothing. The console", theme::CONTENT_TEXT);
+                text(px, lx, 84 + 2 * (CELL + 6), b"log names the exact reason", theme::CONTENT_TEXT);
+                text(px, lx, 84 + 3 * (CELL + 6), b"it gave.", theme::CONTENT_TEXT);
             }
             text(px, lx, H - 92, b"Esc close", theme::TITLE_TEXT_INACTIVE);
             button(px, W - 190, H - 52, 160, b"Close", true);
@@ -539,6 +790,11 @@ pub fn close() {
     }
     *STATE.lock() = State::Closed;
     *PENDING.lock() = None;
+    // INSTALLVERB: the census dies with the dialog. It is a SNAPSHOT of one disk at one instant,
+    // and a snapshot kept across a close would be the stalest possible thing to reopen onto.
+    *PARTS.lock() = alloc::vec::Vec::new();
+    WHOLE_OK.store(false, Ordering::Relaxed);
+    HAS_GPT.store(false, Ordering::Relaxed);
     // The console gets the glass back and repaints everything it accumulated.
     super::fbcon::console_present_suspend(false); SUSPEND_MIRROR.store(false, Ordering::Release); CLOSES.fetch_add(1, Ordering::Release); // QUITLEAK — the mirror on the same line as the call, and the counter that says this path ran: a bypassed `Quit` reaches neither, which is what `winmenu::appquit_selftest` scores.
     serial_println!(
@@ -547,6 +803,13 @@ pub fn close() {
         SUSPEND_MIRROR.load(Ordering::Acquire) as u32,
         CLOSES.load(Ordering::Relaxed)
     );
+}
+
+/// INSTALLVERB: ask for the dialog on the next main-loop pass. The shell's `install --gui` calls
+/// this and returns; nothing is created on the caller's stack. Idempotent, and harmless when the
+/// dialog is already up ([`open`] returns on a non-`Closed` state).
+pub fn request_open() {
+    OPEN_REQ.store(true, Ordering::Relaxed);
 }
 
 /// QUITLEAK — **the dialog's window id, or [`wm::WIN_NONE`].** `winmenu`'s `Quit` arm asks this
@@ -571,6 +834,11 @@ pub fn is_open() -> bool {
 /// dialog opens) and repaint only when it actually changed, so this costs nothing per frame
 /// on a settled machine.
 pub fn service() {
+    // INSTALLVERB: honour a deferred open FIRST, on the main loop, where every other window in this
+    // module is created. See [`OPEN_REQ`] for the fault that put this here rather than at the verb.
+    if OPEN_REQ.swap(false, Ordering::Relaxed) {
+        open();
+    }
     // INSTALL-SEL: the WARNING screen is now live too — its device name is resolved from the registry
     // on every paint, so a disk that vanishes while the operator is reading the warning must flip that
     // screen to its "no longer attached" face rather than leaving a stale name on glass in front of an
@@ -695,12 +963,112 @@ pub fn consume_key(c: u8) -> bool {
                 "[wc-x] instgui selected row {} -> {:?} slot {} ({} sectors)",
                 sel, row.id.handle, row.id.slot_id, row.id.num_blocks
             );
-            *STATE.lock() = State::Warn;
+            // INSTALLVERB: **THE FIRST PRESS ENDS HERE, IN A READ.** It used to end on the erase
+            // warning, one Enter away from `run_gui` and the whole-disk engine — which on the bench
+            // rMBP is the engine pointed at Catalina's disk (rmbp-ledger B91). It now takes the
+            // census and shows it. The operator's next decision is made against what is ACTUALLY on
+            // the medium rather than against a sentence about blank-checks.
+            run_census(row.id);
+            *STATE.lock() = State::Census;
+            repaint();
+        }
+        // INSTALLVERB: the census screen's keys. w/s step between INSTALLABLE partitions only.
+        (State::Census, b'w') | (State::Census, b'A') => {
+            let s = PSEL.load(Ordering::Relaxed) as usize;
+            PSEL.store(step_part(s, -1) as u8, Ordering::Relaxed);
+            repaint();
+        }
+        (State::Census, b's') | (State::Census, b'B') => {
+            let s = PSEL.load(Ordering::Relaxed) as usize;
+            PSEL.store(step_part(s, 1) as u8, Ordering::Relaxed);
+            repaint();
+        }
+        (State::Census, b'\x1b') => {
+            *PARTS.lock() = alloc::vec::Vec::new();
+            *STATE.lock() = State::Choose;
+            repaint();
+        }
+        // INSTALLVERB: **THE SECOND PRESS — the only key in this dialog that writes.** It installs
+        // into the ONE partition the highlight names, through
+        // `install::partition::install_into_partition`, which re-runs its own census and its whole
+        // refusal ladder at go-time: the snapshot on screen selects a target, it never authorises
+        // one. `as_esp` is `false` here and there is no key that makes it true — the type-GUID edit
+        // is an operator asking for it knowingly at the verb, not a button.
+        (State::Census, b'\r') | (State::Census, b'\n') => {
+            let pending = *PENDING.lock();
+            let Some((id, _)) = pending else {
+                serial_println!("[wc-x] instgui install-go with NO committed target — refusing");
+                *STATE.lock() = State::Gone;
+                repaint();
+                return true;
+            };
+            let sel = PSEL.load(Ordering::Relaxed) as usize;
+            let target = PARTS.lock().get(sel).copied();
+            let Some(pr) = target.filter(|p| p.empty) else {
+                // Selection cannot rest on a refused row, so reaching this means there is no
+                // installable row at all. Say so and stay put; an installer must not invent a
+                // target because a key was pressed.
+                serial_println!(
+                    "[wc-x] instgui Enter on the census with no empty partition — nothing to install into, nothing written"
+                );
+                repaint();
+                return true;
+            };
+            *STATE.lock() = State::Running;
+            repaint();
+            serial_println!(
+                "[wc-x] instgui install-go step=2 part={} (attended Enter on the census screen)",
+                pr.index
+            );
+            match crate::install::partition::install_into_partition(id, pr.index, false) {
+                Ok(w) if w.verified == w.files && w.files > 0 => {
+                    serial_println!(
+                        ":: INSTGUI: wrote part={} files={} bytes={} verified={}/{} -> PASS ::",
+                        w.index, w.files, w.bytes, w.verified, w.files
+                    );
+                    *STATE.lock() = State::Done(true);
+                }
+                Ok(w) => {
+                    serial_println!(
+                        ":: INSTGUI: wrote part={} files={} bytes={} verified={}/{} -> FAIL ::",
+                        w.index, w.files, w.bytes, w.verified, w.files
+                    );
+                    *STATE.lock() = State::Done(false);
+                }
+                Err(e) => {
+                    // The refusal itself is already on the wire in the API's own words, with its
+                    // stable `reason=` token (`Refusal::say`). This line is the GUI's disposition,
+                    // not a second verdict.
+                    serial_println!(
+                        "[wc-x] instgui part-install part={} refused ({:?}) — nothing was written",
+                        pr.index, e
+                    );
+                    *STATE.lock() = State::Done(false);
+                }
+            }
+            repaint();
+        }
+        // INSTALLVERB: `d` — the WHOLE-DISK demo, and the only door left to it in this dialog. It
+        // opens only when the census found no volume that is not ours; on any other disk the key
+        // does nothing but say why. Checked HERE and again at the go below, because a guard asked
+        // once at the affordance is a UI filter and not a guard.
+        (State::Census, b'd') => {
+            if WHOLE_OK.load(Ordering::Relaxed) {
+                serial_println!(
+                    "[wc-x] instgui whole-disk demo requested — the census found no foreign volume on this disk"
+                );
+                *STATE.lock() = State::Warn;
+            } else {
+                serial_println!(
+                    ":: INSTGUI: whole-disk target REFUSED at the affordance — this disk carries volumes that are not ours (R25) -> guard OK ::"
+                );
+            }
             repaint();
         }
         (State::Warn, b'\x1b') => {
-            *PENDING.lock() = None;
-            *STATE.lock() = State::Choose;
+            // INSTALLVERB: back to the CENSUS the operator came from, with the commitment intact —
+            // the disk has not changed and re-reading it would only cost them their place.
+            *STATE.lock() = State::Census;
             repaint();
         }
         (State::Warn, b'\r') | (State::Warn, b'\n') => {
@@ -718,6 +1086,19 @@ pub fn consume_key(c: u8) -> bool {
                 repaint();
                 return true;
             };
+            // INSTALLVERB: **THE GUARD, ASKED AGAIN AT THE GO.** `d` already refused to open this
+            // screen for a disk with volumes that are not ours; this is the same question at the
+            // instant the engine would run, because the affordance and the act are different
+            // moments and only the second one writes. There is no path from this dialog to the
+            // whole-disk engine that does not pass through both.
+            if !WHOLE_OK.load(Ordering::Relaxed) {
+                serial_println!(
+                    ":: INSTGUI: whole-disk go REFUSED — the census found volumes that are not ours on this disk (R25); nothing written -> guard OK ::"
+                );
+                *STATE.lock() = State::Census;
+                repaint();
+                return true;
+            }
             *STATE.lock() = State::Running;
             repaint();
             serial_println!("[wc-x] instgui install-go (attended Enter on warn screen)");
