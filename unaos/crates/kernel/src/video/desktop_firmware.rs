@@ -353,7 +353,7 @@ pub fn activate() -> bool {
     // `strip::press_route` ahead of every window arm. Stated on the wire because "the bar is painted"
     // and "the bar is live" are two claims and a capture should not have to infer the second.
     serial_println!(
-        "[pidesk] crystal LIVE — press the crystal for the SHARD menu (About is real on aarch64; Sleep/Restart/Shut Down print their honest unimplemented lines — no PSCI wiring on this track yet)"
+        "[pidesk] crystal LIVE — press the crystal for the SHARD menu (About real; Sleep the ONE honest stub, no S3 suspend path; Restart and Shut Down psci_wired={} — where a secure monitor answers the smc they ACT, crystal::fire -> power::crystal_restart / power::crystal_shutdown = PSCI SYSTEM_RESET / SYSTEM_OFF, and where none does they print their honest unimplemented lines)", !cfg!(feature = "pi")
     );
 
     // SHARD-PRESS (PA41) — and that claim is now WITNESSED rather than asserted. This is the Pi's

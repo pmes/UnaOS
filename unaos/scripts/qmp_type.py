@@ -48,6 +48,15 @@
 #
 #   python3 scripts/qmp_type.py --port 4464 --marker '[hidkeys] set-idle ok' \
 #       --marker-log target/serial.log --wait 5 --bursts 4 --burst 9 --burst-gap 2 --sentinel f12
+#
+# XHCIHUB (rmbp 2026-09-15) — the POINTER mode, `--pointer N`, is the third mode and the first that
+# is not a keyboard: it sends `input-send-event` MOVE and BUTTON events (QMP `InputEventKind` `abs`
+# / `rel` / `btn`) so the `:: XHCIHUB:` scorer's `evts=` field counts reports the hub-downstream
+# usb-tablet actually delivered. Same `Qmp` class, same port, same `--marker` gate as the bursts.
+# See the `move_event` / `btn_event` block below for the schema names and what `value` means.
+#
+#   python3 scripts/qmp_type.py --port 4464 --marker ':: MOUSE-1: HID pointer detected' \
+#       --marker-log target/serial.log --wait 1 --pointer 12 --pointer-kind abs --postwait 0
 
 import argparse
 import json
@@ -110,6 +119,32 @@ def key_event(name, down):
     return {"type": "key", "data": {"down": down, "key": {"type": "qcode", "data": name}}}
 
 
+# XHCIHUB (rmbp 2026-09-15, LEDGER S1/S2) — the POINTER half of `input-send-event`, and the three
+# QMP schema names it needs, cited rather than guessed (qemu `qapi/ui.json`):
+#   * `InputEventKind` — the `type` field of an `InputEvent`. The four kinds are `key`, `btn`,
+#     `rel` and `abs`; everything above this line uses `key`, everything below uses the other three.
+#   * `InputMoveEvent` — the payload of BOTH `rel` and `abs`: `{ axis: InputAxis, value: int }`,
+#     where `InputAxis` is `x` or `y`. The kind is what says how `value` reads — a DELTA for `rel`
+#     (a usb-mouse) or an ABSOLUTE position for `abs` (a usb-tablet, which is the device
+#     `UNAOS_XHCIHUB=1` parks behind the hub). An `abs` value is scaled 0 .. 0x7FFF on both axes
+#     (`INPUT_EVENT_ABS_MAX`), NOT in pixels, so the sweep below is resolution-independent.
+#   * `InputBtnEvent` — the payload of `btn`: `{ button: InputButton, down: bool }`, `InputButton`
+#     being `left` / `middle` / `right` / `wheel-up` / `wheel-down` / `side` / `extra` / …
+# One `input-send-event` carries a LIST of events and syncs once at the end, so an x and a y of the
+# same step are sent together and the guest sees one report per step rather than two half-moves.
+ABS_MAX = 0x7FFF
+
+
+def move_event(kind, axis, value):
+    """One `InputMoveEvent`, carried as kind `abs` (absolute position, 0..ABS_MAX) or `rel` (delta)."""
+    return {"type": kind, "data": {"axis": axis, "value": int(value)}}
+
+
+def btn_event(button, down):
+    """One `InputBtnEvent` — `button` is an `InputButton` name, `down` its edge."""
+    return {"type": "btn", "data": {"button": button, "down": bool(down)}}
+
+
 def wait_for_marker(path, text, timeout):
     """XHCIKBD: block until the serial log at `path` contains `text` (bytes search — the log may
     carry control bytes). Returns True on hit, False on timeout. The file may not exist yet:
@@ -152,6 +187,14 @@ def main():
     ap.add_argument("--event-gap", type=float, default=0.02, help="seconds between the events of one burst")
     ap.add_argument("--sentinel", default="f12", help="qcode pressed once after the bursts ('' = none)")
     ap.add_argument("--sentinel-delay", type=float, default=1.0, help="quiet seconds before the sentinel")
+    # XHCIHUB pointer mode (see the `move_event`/`btn_event` block). Default OFF: `--pointer 0` is
+    # the old script exactly, and no pre-existing caller changes behaviour.
+    ap.add_argument("--pointer", type=int, default=0, help="XHCIHUB: pointer MOVES to inject (0 = off)")
+    ap.add_argument("--pointer-kind", default="abs", choices=("abs", "rel"), help="InputEventKind for the moves: abs (usb-tablet) or rel (usb-mouse)")
+    ap.add_argument("--pointer-gap", type=float, default=0.05, help="seconds between pointer events")
+    ap.add_argument("--pointer-clicks", type=int, default=1, help="button press+release pairs after the moves")
+    ap.add_argument("--pointer-button", default="left", help="InputButton name for --pointer-clicks")
+    ap.add_argument("--pointer-rel-step", type=int, default=24, help="--pointer-kind rel: pixels per axis per move")
     a = ap.parse_args()
 
     qmp = Qmp(connect(a.host, a.port, a.connect_timeout))
@@ -215,6 +258,37 @@ def main():
             if "error" in r:
                 raise SystemExit(f"[qmp] sentinel {a.sentinel!r} failed: {r['error']}")
             print(f"[qmp] sentinel {a.sentinel!r} pressed after {a.sentinel_delay:.1f}s quiet", file=sys.stderr)
+
+    if a.pointer > 0:
+        # XHCIHUB — MOVE the pointer, so `evts=` on the `:: XHCIHUB:` line is a fact about the
+        # hub-downstream device's interrupt-IN pipe rather than a reading of a pointer nobody
+        # touched. Every step is a DISTINCT position (an `abs` device re-reporting the same
+        # coordinates delivers nothing), spaced `--pointer-gap` so each report clears the
+        # endpoint's polling interval instead of queueing behind the previous one — the same
+        # pacing argument the burst block above makes for keys, and the reason the moves are not
+        # one atomic `input-send-event`.
+        moves = 0
+        for i in range(a.pointer):
+            if a.pointer_kind == "abs":
+                frac = (i + 1) / (a.pointer + 1)
+                evs = [move_event("abs", "x", ABS_MAX * frac), move_event("abs", "y", ABS_MAX * (1.0 - frac))]
+            else:
+                step = a.pointer_rel_step if i % 2 == 0 else -a.pointer_rel_step
+                evs = [move_event("rel", "x", step), move_event("rel", "y", step)]
+            r = qmp.execute("input-send-event", {"events": evs})
+            if "error" in r:
+                raise SystemExit(f"[qmp] pointer move {i + 1}/{a.pointer} failed: {r['error']}")
+            moves += 1
+            time.sleep(a.pointer_gap)
+        clicks = 0
+        for _ in range(a.pointer_clicks):
+            for down in (True, False):
+                r = qmp.execute("input-send-event", {"events": [btn_event(a.pointer_button, down)]})
+                if "error" in r:
+                    raise SystemExit(f"[qmp] pointer button {a.pointer_button!r} down={down} failed: {r['error']}")
+                time.sleep(a.pointer_gap)
+            clicks += 1
+        print(f"[qmp] pointer: {moves} {a.pointer_kind} moves + {clicks} {a.pointer_button} click(s), {a.pointer_gap * 1000:.0f} ms apart", file=sys.stderr)
 
     time.sleep(a.postwait)
 

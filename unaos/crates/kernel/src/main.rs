@@ -8559,8 +8559,8 @@ fn tegra_desk_furn() -> bool {
     // `-> RAISED` or `MISS-SHELL` — the press reaching a window or the desktop means the menu band
     // did not consume it, which is the bar not being live however painted it looks.
     serial_println!(
-        "[orinfurn] crystal LIVE corner={:?} — press the crystal for the SHARD menu (About is real on aarch64; Sleep/Restart/Shut Down print their honest unimplemented lines — no PSCI wiring on this track). UNFLOWN on Orin metal",
-        menubar::crystal_corner_abs(pw, ph)
+        "[orinfurn] crystal LIVE corner={:?} — press the crystal for the SHARD menu (About real; Sleep the ONE honest stub, no S3 suspend path; Restart and Shut Down psci_wired={} — where a secure monitor answers the smc they ACT, crystal::fire -> power::crystal_restart / power::crystal_shutdown = PSCI SYSTEM_RESET / SYSTEM_OFF, and where none does they print their honest unimplemented lines). UNFLOWN on Orin metal",
+        menubar::crystal_corner_abs(pw, ph), !cfg!(feature = "pi")
     );
     true
 }
