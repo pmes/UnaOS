@@ -4827,10 +4827,10 @@ pub fn composite() { if let Some(term) = super::panel_refuse_term() { super::not
         // even though `[deadman] pmp≈990` says the machine is otherwise alive.
         //
         // So: a holder that has been in-pass past [`COMP_GATE_STEAL_MS`] is declared dead and its
-        // gate is taken. The bound is 4x the tripwire's own overdue bound, which is itself 3x the
-        // worst honest pass this compositor has ever measured (302 ms), so no legal pass can reach
-        // it. The cost of a false steal is two cores compositing at once for one pass; the cost of
-        // not stealing is the whole desktop, measured, three boots running.
+        // gate is taken. The bound is 1.5x the tripwire's own overdue bound and 5x the worst honest
+        // pass this compositor has ever measured (302 ms; STEALMS lowered it from 4_000, which was
+        // 13x), so no legal pass can reach it. A false steal costs two cores compositing at once for
+        // one pass; not stealing costs the whole desktop, measured, three boots running.
         //
         // The revenant hazard is closed at the RELEASE sites, not here: if the parked core ever
         // does return, its store completes into a framebuffer (harmless — it writes pixels) and it
@@ -9487,13 +9487,13 @@ const COMP_PASS_OVERDUE_MS: u64 = 1_000;
 
 /// WCSER-STEAL — a holder in-pass longer than this is DEAD and its gate is taken.
 ///
-/// Priced at 4x [`COMP_PASS_OVERDUE_MS`], which is itself 3x the worst honest pass this
-/// compositor has ever measured (302 ms), so no legal pass can reach it. It is a liveness bound,
-/// not a performance one: the thing it fires on has been measured three times and is not slow, it
-/// is stopped — boot 15's trace read `row=897` seventeen times in a row, one sample a second,
-/// without the row advancing once.
+/// Priced at 5x the worst honest pass this compositor has ever measured (302 ms) and 1.5x
+/// [`COMP_PASS_OVERDUE_MS`], so no legal pass can reach it (STEALMS 2026-09-16: 4_000 -> 1_500;
+/// flights 8/9 held seven times, every hold ended in this steal at 4016-4303 ms and no stolen core
+/// returned, so the bound WAS the freeze's length). Liveness, not performance: the thing it fires
+/// on is stopped — boot 15's trace read `row=897` seventeen times in a row, the row never advancing.
 #[cfg(target_arch = "x86_64")]
-const COMP_GATE_STEAL_MS: u64 = 4_000;
+const COMP_GATE_STEAL_MS: u64 = 1_500;
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // WCSER-PICK — THE STEAL HANDS THE GATE TO THE WORST POSSIBLE CORE, AND IT DOES SO BY DESIGN.
