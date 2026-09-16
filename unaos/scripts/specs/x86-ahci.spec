@@ -102,3 +102,35 @@ FORBID :: STORSLOT: storage records FULL
 # named in code (X86_AHCI_SPEC, and again in `x86_pick_capture_spec`'s case), so it resolves GATED.
 # If a future change unwires the picker's AHCI arm, this file becomes an ORPHAN and `check` says so
 # by name — which is the whole point of that gate: the spec cannot quietly stop being run.
+
+# ── WINMENUSPEC (2026-09-16), TAIL-APPENDED past the contract block, as SPECROWS did to x86-fat.spec ──
+# WINMENU — the window-menu fixture (`video/winmenu.rs`, `winmenu::selftest`; legs A10, SO2, SO3 and
+# R36). WINMENUFLAKE (`5f7674c3`, folded at `85d8bf82`) made the fixture park up to 250 ms for the
+# menubar's publication and answer `-> SKIP reason=menu-unpublished-after=<ms>ms` when it never
+# lands. Until this block NO spec pinned `:: WINMENU: … :: PASS ::` (`grep -l WINMENU
+# scripts/specs/*.spec` was empty), so the fixture was scored by mbench's DEFAULT_FORBIDS alone and a
+# SKIP was green and silent — the right disposition for a flake, the wrong one for a real R21
+# regression, which after the park would SKIP where it used to FAIL (docs/dev/FIXTURE_FLAKES.md
+# Class 6a). The REQUIRE closes that: a boot on this leg that does not reach the PASS verdict is red.
+#
+# WHY THE REQUIRE LIVES HERE AND NOT IN x86-default.spec — the QUARRYDOCK argument above, one
+# fixture along. `crystal::selftest`, the ONLY route to `winmenu::selftest`, is called under
+# `#[cfg(all(feature = "witness", feature = "wc"))]` (`arch/x86_64/syscall.rs:17532-17533`), so
+# the verdict line is ABSENT from every x86 boot without `UNAOS_WC`; x86-default.spec is replayed
+# by the knob-free `./arroyo test` and a REQUIRE there would red a healthy plain boot. This leg
+# carries UNAOS_WC by construction (the picker refuses to name this file otherwise). The numbers
+# are matched loosely and the six leg verdicts are fixed at `true`: `box=`/`drop=`/`title-x=` move
+# with the font and the panel, `waited=`/`prog_waited=` are the park's rate instrument (a PASS that
+# waited is a compositor that declined and recovered, visible on purpose), and `owner=` is the
+# window id the bar was holding at the read. The pin is scoped to `published=y`, so the REQUIRE can
+# never be satisfied by a SKIP line, whose fields stop at `published=n`.
+# Measured: the WINMENUFLAKE fold gate (`UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_QEMU_FULL=1 ./arroyo test
+# 120`, `owner=1 published=y waited=0ms prog_waited=0ms`), and this block's own gate — the
+# command at the top of this file — recorded in the WINMENUSPEC commit.
+REQUIRE :: WINMENU: win=[0-9]+ name=gate box=[0-9]+x[0-9]+\+[0-9]+ title-x=[0-9]+ drop=[0-9]+x[0-9]+\+[0-9]+\+[0-9]+ font=[a-z0-9-]+ panel=[0-9]+x[0-9]+ owner=[0-9]+ published=y waited=[0-9]+ms prog_waited=[0-9]+ms app_box=true routed_open=true geometry=true escape=true quit_closes=true app_name_late=true :: PASS ::
+# The FORBID is the park's timeout, both publish points (leg 1 `name=gate`, leg 6 `name=VUG` — one
+# format string at two sites, `winmenu.rs:1880` and `:2006`). After a 250 ms wait a miss is a
+# finding about the compositor, not a flake, and it is convicted by name rather than left to the
+# REQUIRE's silence. `no panel` and `table full`, the fixture's two other SKIP spellings, are not
+# forbidden: neither is reachable on a healthy boot, and the REQUIRE above goes short on either.
+FORBID :: WINMENU: .* -> SKIP reason=menu-unpublished-after=[0-9]+ms ::
