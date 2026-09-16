@@ -602,7 +602,7 @@ actually lost during boot 11.
 |---|---|---|---|
 | 0 | `rp-boot` baseline for `secsta`/`bridgectl` | none (read) | **landed with this document** |
 | 1 | W1C the secondary-status latch at arm time, so every later sample is a delta | low | **landed, WIDENED, and knob-gated: BAR1WEDGE (§11). It clears THREE latches, not one — secondary status was the only one anybody had noticed** |
-| 1b | **SECSTA2** — a SECOND W1C clear once enumeration is complete, so the first-stall deltas are measured against the end of the bus walks and not against `pci::init`'s Kepler dispatch; it also prints `relatch=`, which bits enumeration ITSELF sets, measured rather than assumed (§11.4) | low — the at-arm clear's own write path, one shot, on the BSP | **landed, behind the same `UNAOS_BAR1WEDGE` knob (§11.4; shut-out register §6 P7)**. Rung 1 |
+| 1b | **SECSTA2** — a SECOND W1C clear once enumeration is complete, so the first-stall deltas are measured against the end of the bus walks and not against `pci::init`'s Kepler dispatch; it also prints `relatch=`, which bits enumeration ITSELF sets, measured rather than assumed (§11.4). **DEVSTA (2026-09-15) closed its one named leftover**: Device Status (`cap + 0x0A`) is re-baselined with the other two, so all three `wedge-sample` deltas now measure the same window | low — the at-arm clear's own write path, one shot, on the BSP | **landed, behind the same `UNAOS_BAR1WEDGE` knob (§11.4; shut-out register §6 P7)**. Rung 1 |
 | 2 | **Condemn-and-survive**: `COMP_SEALED` + PANEL CONDEMNED + the loud serial block | low, no PCIe write | §5 |
 | 3 | A recovery task immune by construction (§4) — never enters `wm`, never sends on a channel | low | rung 2 |
 | 4 | Sacrificial endpoint probe → a real classifier (§3.2) | medium — may lose a core, by design | rung 3 |
@@ -809,7 +809,10 @@ Then, at every `[wcser] PASS OVERDUE … == tripwire ::` crossing, beside the un
 ```
 
 Read `n=1` — that is the first stall, the sample this rung exists for. Read it with
-`awk 'index($0,"[pcih]")'`, never a bare `grep`.
+`awk 'index($0,"[pcih]")'`, never a bare `grep`. Since the DEVSTA close (§11.4) all three deltas on
+this line — `d_lnksta`, `d_secsta`, `d_devsta` — are measured from the SAME baseline, the read-back
+at the end of enumeration; before it, `d_devsta` alone was measured from `pci::init`'s Kepler
+dispatch, so the three could not be compared with each other.
 
 | what the wire says | what it means for ledger A1 |
 | --- | --- |
@@ -820,6 +823,9 @@ Read `n=1` — that is the first stall, the sample this rung exists for. Read it
 | `d_lnksta=0000` across every crossing | W2's shut-out is confirmed on an instrument that can finally tell the instant from the boot |
 | `relatch=secsta:2000` on the `sticky-cleared post-enum` line | **enumeration on this machine DOES latch Received Master Abort** — the premise §1.3 argued from, measured for the first time. The `secsta=2000` of boots 8/9/11 is then fully explained without the wedge, and W7's reading dies on evidence rather than on an argument about what bus walks generally do. It also makes the post-enum baseline load-bearing rather than tidy: `d_secsta` at `n=1` is now the only master-abort reading worth quoting |
 | `relatch=secsta:0000` | no bus walk below this bridge master-aborted at all this boot, so `secsta` was NOT being set by enumeration after the at-arm clear. A `d_secsta=2000` at `n=1` then has one named alternative left (a `wifi`-armed boot's own census, `wifi/bus.rs:125` — a knob no A1 flight row asks for, `grep -c UNAOS_WIFI docs/dev/OS/rmbp-queue.md docs/dev/OS/rmbp-ledger.md` = 0/0, and one the boot's own `⚡ kernel features:` banner settles) and otherwise points at the wedge |
+| `relatch=devsta:0004` (Unsupported Request Detected) or any nonzero `devsta:` bit | **enumeration on this machine latches a Device Status error bit** — the same measurement `relatch=secsta:` makes, for the register that records the root port's OWN errors rather than the bridge's secondary side. Whatever `d_devsta` then reads at `n=1` is about the burst and not about the bus walks, which before the DEVSTA close it could not be, because `d_devsta` was measured from the Kepler dispatch while its neighbours were measured from the end of enumeration |
+| `relatch=devsta:0000` with `devsta=0000->0000` | the expected reading, and now an asserted one rather than an assumed one: nothing between the at-arm clear and the end of enumeration set a correctable, non-fatal, fatal or unsupported-request bit on the root port. A nonzero `d_devsta` at `n=1` then belongs to the burst |
+| `devsta=....->0004` (the after value nonzero) | a latch that did not clear, read exactly as the `secsta=....->2000` row below: a sticky `1` after a plain RW1C write is a hardware fact worth its own rung, and every later `d_devsta` on that boot is measured against a nonzero baseline that the line prints |
 | `relatch=lnksta:c000` (or either bit alone) | the link renegotiated bandwidth DURING ENUMERATION — before any compositor paint. Whatever `d_lnksta` then reads at `n=1` is about the burst and not about boot-time link churn, which is the confound that made `d081` unreadable in the first place |
 | the `sticky-cleared post-enum` line is ABSENT on a boot whose `:: BAR1WEDGE:` line is present | the call site did not run. It is guarded on `PCIH_READY` and sits at the tail of `pci::init`, so its absence with the arm line present means `pci::init` did not reach its end — a boot that died in the GPU/SDHC/NIC tail, which is itself the finding |
 | `secsta=....->2000` (the after value nonzero) | a latch that did not clear. The write is a plain RW1C to a bridge status register, so a sticky `1` in the read-back is a hardware fact worth its own rung, and every later `d_secsta` on that boot is measured against a nonzero baseline (the line prints it, so nothing is silently wrong) |
@@ -868,12 +874,12 @@ for the same reason as the AHCI hook three statements above it: a cfg'd-OFF bloc
 `panic::Location` line numbers below it, and knob-off x86 image byte-identity is this rung's stated
 invariant.
 
-**What it does.** Re-read Secondary Status (`0x1E`) and Link Status (`cap + 0x12`) on the root port;
-compute `relatch` = the RW1C bits set now that the at-arm read-back did not carry; write the
-observed-set RW1C bits back (never a bit that was not read as set, never a register with nothing
-latched, never a control register); read back; print; and store the read-back as the baseline
-`bw_sample`'s `d_secsta`/`d_lnksta` delta against. The at-arm values stay on the wire in the same
-line, so nothing is lost by overwriting the statics.
+**What it does.** Re-read Secondary Status (`0x1E`), Link Status (`cap + 0x12`) and Device Status
+(`cap + 0x0A`) on the root port; compute `relatch` = the RW1C bits set now that the at-arm read-back
+did not carry; write the observed-set RW1C bits back (never a bit that was not read as set, never a
+register with nothing latched, never a control register); read back; print; and store the read-backs
+as the baselines `bw_sample`'s `d_secsta` / `d_lnksta` / `d_devsta` delta against. The at-arm values
+stay on the wire in the same line, so nothing is lost by overwriting the statics.
 
 **`relatch=` is the finding.** Everything §1.3 argues rests on a premise nobody had measured: that
 ordinary bus enumeration sets bit 13 on THIS bridge. `relatch=secsta:2000` measures it true;
@@ -892,11 +898,22 @@ generally do. Score card: the four `relatch`/`post-enum` rows in §11.3.
   path is CF8/CFC, exactly the at-arm one, so PCIH-NOCF8's refusal (which is about the ~1 kHz
   non-BSP tripwire band) is untouched and there is no ECAM mapping whose writability would have to
   be re-verified at this later point.
-* **NOT re-baselined: Device Status.** `BW_DEVSTA0` still holds its at-arm value, so `d_devsta` on
-  the `wedge-sample` line deltas against the Kepler dispatch while `d_secsta`/`d_lnksta` delta
-  against the end of enumeration. The line says so, in those words. Nothing observed needs the
-  third — `devsta=0000` at boot and at the wedge on every capture there has ever been — and closing
-  it is two lines in `sticky_clear_post_enum`, left to a seat rather than taken silently.
+* **Device Status: WAS the deliberate leftover, now CLOSED (DEVSTA, 2026-09-15).** SECSTA2 left
+  `BW_DEVSTA0` holding its at-arm value, so `d_devsta` on the `wedge-sample` line deltaed against
+  the Kepler dispatch while `d_secsta`/`d_lnksta` deltaed against the end of enumeration, and it
+  named the close as "two lines in `sticky_clear_post_enum`, left to a seat rather than taken
+  silently". Those two lines are now in: `cap + 0x0A` is read, its `DEVSTA_W1C` bits are cleared on
+  the same write path, and the read-back is stored, so **all three deltas measure the same window**
+  and the line carries `devsta=<before>-><after>` and `relatch=… devsta:<bits>` beside the other
+  two. The VALUE is still `devsta=0000` on every capture there has ever been; what changed is the
+  reading hazard — three deltas on one line read as one measurement, and one of them silently was
+  not. A `d_devsta=0004` (Unsupported Request Detected, the bit a read of a wedged BAR is likeliest
+  to set) could have been latched by any of the three post-at-arm walks in the table above with
+  nothing on the wire to say so; `relatch=devsta:` is now that measurement. No new register mapping
+  was verified for it: `cap + 0x0A` is the offset `bw_arm`'s at-arm clear already reads and writes
+  through CF8, and `0x0A < 0x12` puts it inside the span `cap_fits(cap, PCIE_CAP_SPAN)` already
+  bounds. No new knob, no new call site, no QEMU fixture (q35 has no Kepler, see below): `check`
+  only.
 
 **Residual, in the same voice.** `wifi::service` (`wifi/bus.rs:125`, buses 0..=255, knob
 `UNAOS_WIFI`) sweeps config space from the main loop, i.e. after this clear, on every boot that arms

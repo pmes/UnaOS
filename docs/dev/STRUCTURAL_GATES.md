@@ -1495,6 +1495,92 @@ same way and inherits both halves. Pointing a leg's verdict back at a fixed
 shared path, or at any path a second leg also writes, reintroduces this exactly;
 the capture a leg is judged on belongs under `target/battery/` with that leg's
 own name on it.
+## GATE-LBA32 — a 64-bit LBA may not be narrowed to 32 bits with `as`
+
+**Invariant.** Over `crates/kernel/src/drivers/**` and `crates/kernel/src/fs/**`,
+with comments and string literals stripped: every `<expr> as u32` whose operand
+names an LBA — an identifier token containing `lba` or `sector`, in any case, that
+is not SCREAMING_SNAKE — is a finding, unless the function enclosing it is
+registered in `unaos/scripts/lba32.registry` **and still carries a refusal**.
+
+**Why a gate, and this one is unusual: it is the only thing that can guard these
+call sites at all.** Three files in this tree have paid for the same defect — a
+`u64` sector number handed to a 32-bit field with `as`. `as` on an out-of-range
+value does not fail, it TRUNCATES: LBA `0x1_0000_0000` becomes `0`, THE BOOT
+SECTOR, so a read returns the wrong sector as if it were right and a write
+destroys the partition table and returns success. Orin ledger **A57** folded
+`arch/aarch64/sdmmc_tegra.rs`'s six sites onto `sd_block_arg`; **SR15**
+(BLOCKSMALL) folded `drivers/block.rs`'s eight onto `read10_lba32`; **SR15**
+(EMMC2LBA) folded `drivers/emmc2.rs`'s two onto `card_block_arg`. Each shipped a
+known-answer fixture — and SR15 states, in its own row, the bound every one of
+them hits: *reverting one CALL SITE to a bare cast is invisible to the fixture*,
+because the `lba >= num_blocks` geometry bound one line earlier refuses an
+out-of-range LBA with the same error, so a wrapped site and a refusing site are
+indistinguishable from any caller on any reachable input. **No behavioural leg can
+close that gap.** SR15's closing sentence asked for this gate by name: "a grep
+gate over the call shape … would make it mechanical and is not built."
+
+**Mechanism.** `unaos/scripts/lba32-check.sh`. It strips comments and string,
+raw-string and char literals (preserving columns and newlines, so a reported line
+number and the source a reader opens agree), then for every `as u32` it walks
+BACKWARDS from the keyword to find the operand: a `)` walks to its matching `(`
+with the callee, which is how A57's `(lba * 512) as u32` is caught; otherwise a run
+of identifier/path/field characters, which catches `hdr.start_lba as u32`. The
+enclosing function is the last `fn <name>` above the line. Two exclusions are
+load-bearing and both are in the control fixture: SCREAMING_SNAKE names (a
+`SECTOR_BYTES`/`SECTOR_SIZE` is a sector SIZE, never a sector NUMBER — without this
+the gate fires eight times on a clean tree and is skipped within the week), and
+anything inside a comment or a literal (this tree *prints* the defect on the wire,
+`wrapto=`/`wrapblk=`, and discusses it in prose far more often than its code
+commits it).
+
+**The registry is re-checked, not trusted.** A row names a function whose
+narrowing is proven by a refusal INSIDE that same function — the `sd_block_arg`
+shape, `if lba > u32::MAX as u64 { … }` standing above `Some(lba as u32)`. Every
+run re-reads the registered body and requires a refusal token (`u32::try_from`,
+`try_into`, `> u32::MAX`, `>= u32::MAX`, `checked_mul`); a helper gutted back to a
+bare cast loses its cover and the row becomes a finding. That is what stops the
+registry laundering the defect it exists to record.
+
+**Control.** Eight, over a synthetic in-memory file, before any verdict — three
+that MUST fire and five that MUST stay silent, each killing one stage of the
+analyser: `ctrl_bare` (the bare cast), `ctrl_mul` (the parenthesised byte-offset
+shape), `ctrl_gutted` (REGISTERED but with no refusal left — the control that
+proves the registry is re-checked rather than obeyed); and `ctrl_helper`
+(registered and refusing), `ctrl_tryfrom`, `ctrl_comment`, `ctrl_string`,
+`ctrl_const`. Any control wrong exits **2** — no verdict — and `check` prints that
+a gate which gave no verdict is not a pass.
+
+**Goes red when** an LBA-named operand is narrowed with `as u32` in an
+unregistered function, or in a registered one that no longer refuses (exit 1), or
+a control misbehaves (exit 2).
+
+**GO-RED proof, recorded in this gate's landing commit, two independent
+mutations.** (1) SOURCE: `drivers/emmc2.rs`'s `read_block_512` call site reverted
+from `card_block_arg("CMD17", card.block_addressing, lba)?` to `lba as u32` takes
+the probe from **rc=0** (`1 on an LBA-named operand (1 registered, 0 not)`) to
+**rc=1**, naming `drivers/emmc2.rs:740 read_block_512() — unregistered`; restoring
+the call returns it to rc=0. That is the exact mutation no fixture in this tree can
+see, which is the gate's whole reason to exist. (2) WIRING: `LBA32_REGISTRY=/dev/null
+./arroyo check` against the UNMUTATED tree strips the one legitimate row, so the
+probe reds on `card_block_arg` itself and `check` reds through this gate's own
+failure line — proving the probe's exit code reaches `check`'s verdict without
+recompiling anything.
+
+**What it found on its first run** (at the EMMC2LBA commit; census 41 files, 562
+`as u32` casts, 1 LBA-named, 1 registered, 0 unregistered): a clean tree, which is
+the expected and the dangerous answer — hence the three must-fire controls. The
+registry's header names what was measured clean and therefore absent
+(`read10_lba32` and `lba_arg` use `u32::try_from` and form no cast at all;
+`fs/fat.rs`'s four hits are the const exclusion; `fs/bootdisk.rs`,
+`drivers/ahci.rs` and `drivers/xhci/**` have none) so nobody re-derives it.
+
+**Legitimate update.** Route the narrowing through the transport's refusal helper
+(`read10_lba32` / `lba_arg` / `card_block_arg` / `sd_block_arg`), or — if the
+function IS that helper — add a row to `unaos/scripts/lba32.registry` citing what
+`bash unaos/scripts/lba32-check.sh` printed for it. A second row in the same file
+is the state A57 found and fixed (six sites, two shapes) and should be a fold onto
+one helper instead.
 
 ---
 

@@ -6491,6 +6491,30 @@ check_both() {
         [ "$_f2rc" -eq 2 ] && echo -e "${COLOR_RED}❌ fc2 gate gave NO VERDICT — its control did not fire, which is not a clean tree${COLOR_RESET}"
     fi
 
+    # GATE-LBA32 (rmbp, 2026-09-15): LEDGER SR15's CLASS, and the only thing that can guard its CALL
+    # SITES. Three files have now paid for a `u64` LBA narrowed with `as` — `sdmmc_tegra.rs`'s six
+    # (orin A57), `block.rs`'s eight (BLOCKSMALL) and `emmc2.rs`'s two (EMMC2LBA) — and `as`
+    # TRUNCATES, so LBA 0x1_0000_0000 becomes 0, the boot sector. Each fix shipped a known-answer
+    # fixture on its HELPER, and SR15 states the bound every one of them hits: reverting one CALL
+    # SITE to a bare cast is invisible to them, because the `lba >= num_blocks` geometry bound one
+    # line earlier refuses with the same error, so no behavioural leg can tell a wrapped site from a
+    # refusing one. A structural one can. `scripts/lba32-check.sh` scans `drivers/**` and `fs/**` for
+    # `as u32` on an LBA-named operand; `scripts/lba32.registry` holds each transport's single
+    # narrowing point and is RE-CHECKED every run — a registered helper with no refusal left in it
+    # becomes a finding, so the registry cannot launder the defect it records. Eight controls run
+    # before any verdict (three must fire, five must stay silent — including the SCREAMING_SNAKE
+    # const exclusion, without which this gate cries eight times on a clean tree and is skipped
+    # within the week), and a control failure exits 2 because a gate that gave no verdict is NOT a
+    # pass. Go-red proven two ways: one `emmc2.rs` call site reverted to `lba as u32` (rc=1), and
+    # `LBA32_REGISTRY=/dev/null` against the unmutated tree (rc=1) for this wiring.
+    local _lbrc=0
+    "$WORKSPACE_DIR/scripts/lba32-check.sh" || _lbrc=$?
+    if [ "$_lbrc" -eq 0 ]; then
+        echo -e "${COLOR_GREEN}  ✅ lba32 (no 64-bit LBA narrowed to 32 bits outside a registered refusal)${COLOR_RESET}"
+    else
+        [ "$_lbrc" -eq 2 ] && echo -e "${COLOR_RED}❌ lba32 gate gave NO VERDICT — its control fixture did not behave, which is not a clean tree${COLOR_RESET}"
+    fi
+
     if [ "$_urc" -ne 0 ]; then
         echo -e "${COLOR_RED}❌ check FAILED — userspace crates did not compile (see above)${COLOR_RESET}"
         return 1
@@ -6541,6 +6565,10 @@ check_both() {
     fi
     if [ "$_srrc" -ne 0 ]; then
         echo -e "${COLOR_RED}❌ check FAILED — a replay spec is named by no verb and declares no runner (see GATE-SPECROOTS above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_lbrc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — a 64-bit LBA is narrowed to 32 bits with \`as\` outside a registered refusal (see GATE-LBA32 above)${COLOR_RESET}"
         return 1
     fi
 }

@@ -1,0 +1,35 @@
+# GATE-LBA32 registry — every function under `crates/kernel/src/{drivers,fs}/**` that narrows a
+# 64-bit LBA to 32 bits with `as`, and the refusal that makes it safe.
+# Format: <path relative to crates/kernel/src>::<fn>  <reason, citing the measurement>.
+# `#` starts a comment; the key and the reason are separated by TWO spaces.
+#
+# A ROW IS RE-CHECKED EVERY RUN, NOT TRUSTED. `lba32-check.sh` re-reads the registered function's
+# body and requires a refusal token in it (`u32::try_from`, `try_into`, `> u32::MAX`, `>= u32::MAX`,
+# `checked_mul`). A helper gutted back to a bare cast loses its cover and the row becomes a finding
+# — which is control 3 of the gate's fixture (`ctrl_gutted`), run before any verdict. So this file
+# cannot launder the defect it records.
+#
+# MUST STAY SMALL, AND FOR A DIFFERENT REASON THAN GATE-FC2's REGISTRY. A row here is not a debt: it
+# is the ONE place in a transport where the narrowing legitimately happens, because a 32-bit card
+# argument or CDB field is a hardware fact. What must stay at one row per transport is the COUNT —
+# a second row in the same file means two shapes to copy from, which is precisely the state orin
+# ledger A57 found in `sdmmc_tegra.rs` (six sites, two of them checked, four not) and fixed by
+# hoisting to one.
+#
+# MEASURED CLEAN AND THEREFORE ABSENT, named so nobody re-derives it (`bash scripts/lba32-check.sh`,
+# 2026-09-15, at the EMMC2LBA commit — 1 registered finding, 0 unregistered):
+#
+#   * `drivers/block.rs::read10_lba32` (BLOCKSMALL, SR15) — the eight SCSI READ(10)/WRITE(10) sites
+#     route through it and it is written with `u32::try_from`, so it forms NO cast and needs no row.
+#   * `drivers/sdhc.rs::lba_arg` — same, `u32::try_from` on both arms.
+#   * `fs/fat.rs` — its four `SECTOR_SIZE as u32` are a sector SIZE, excluded by the const rule; the
+#     volume itself is bounded at `parse_bpb` (`fat.rs:1537` refuses `part_lba + tot_sec` past
+#     `u32::MAX + 1`).
+#   * `fs/bootdisk.rs`, `drivers/ahci.rs`, `drivers/xhci/**` — 0 LBA-named narrowings.
+#
+# OUT OF THIS GATE'S SCOPE, named for the same reason: `arch/aarch64/sdmmc_tegra.rs::sd_block_arg`
+# (orin A57) is the identical shape to the row below — `if lba > u32::MAX as u64 { return None; }`
+# above `Some(lba as u32)` — and would be registered here if `arch/**` were scanned. It is not: the
+# brief scopes this gate to `drivers/**` and `fs/**`.
+
+drivers/emmc2.rs::card_block_arg  EMMC2LBA (SR15). The one narrowing point for the BCM2711 EMMC2 SD path, and both call sites (`read_block_512`, `write_block_512`) go through it. Measured: one cast, `Some(lba as u32)` on the block-addressed arm, standing under `if lba > u32::MAX as u64 { … return Err(BlockError::BadLba); }` in the same function — the `sd_block_arg` shape, kept rather than replaced by `u32::try_from` so that a reader comparing the two files sees one shape. The byte-addressed arm forms its cast on `byte_off`, which is not LBA-named and is already bounded by `checked_mul(512).filter(|&b| b <= u32::MAX as u64)`. Fixture: `emmc2lba_selftest`, four ceiling positives and four negative controls.
