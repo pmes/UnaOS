@@ -6673,6 +6673,69 @@ BRACEPY
         _fmrc=1
     fi
 
+    # GATE-HOSTTESTS (TESTROOTS, rmbp, 2026-09-16): the leg that makes the tree SATISFY
+    # GATE-TESTROOTS below instead of merely being measured by it. Every host-runnable test suite in
+    # this repo that is green runs here — 75 `test result: ok` lines and 533 assertions across the
+    # 47 suites that carry any, in two cargo invocations (one per workspace), plus mbench's own
+    # 38-scenario self-test. Before it, the count of suites any command in this tree ran was TWO,
+    # out of 59: GATE-CORE's `midden_core` and GATE-FOREMAN's one foreman target.
+    #
+    # AN EXPLICIT `-p` LIST, NOT `--workspace`, and both halves of that were measured, not assumed:
+    #   (a) `--workspace` on the root workspace CANNOT PASS on a bench without the native -devel
+    #       packages, and the failure is a BUILD failure that takes the whole leg with it, not a
+    #       skip. Five crates are in that state here, each named in `scripts/tests.registry` with
+    #       the build-script that refused: `resonance`/`stria`/`phonolite` (alsa-sys, no libasound
+    #       headers), `aether` (openssl-sys), `una` (gobject-sys/GTK).
+    #   (b) An explicit list is the RATCHET. A crate that grows a suite is not silently absorbed —
+    #       it reds GATE-TESTROOTS by name until someone adds it here or writes down why not. That
+    #       coupling is the whole design: GATE-TESTROOTS without this leg would be satisfiable by
+    #       registering everything, and this leg without GATE-TESTROOTS is a list that rots.
+    #
+    # `midden_core` is absent deliberately — GATE-CORE above is its named leg and owns its meaning.
+    # `foreman` is here UNFILTERED on purpose: GATE-FOREMAN runs `--test agreement` only, so
+    # `tests/preflight.rs` (the spec-preflight end-to-end, 2 assertions) and the 38 unit tests under
+    # `src/` were still run by nothing after FOREMAN-ROOT — the sibling file in the same directory.
+    # TMPDIR is pinned into the tree's own `target/` for the same reason GATE-FOREMAN pins it: these
+    # suites write fixtures through `std::env::temp_dir()` and LAWS §Scratch forbids /tmp on this
+    # bench. `vaire` is the one crate that discipline costs us and it is REGISTERED, not dropped
+    # quietly — see `scripts/tests.registry`.
+    #
+    # COST, measured on this bench with `date +%s` either side: 66 s warm (a second consecutive run),
+    # 164 s when the root workspace's test harnesses have to be rebuilt, plus 1 s for the unaos-side
+    # invocation and 5 s for mbench. Under the ~2 min that would put it behind a strict knob, so it
+    # runs by default; re-measure and re-quote here whenever the list changes.
+    local _htrc=0
+    echo -e "${COLOR_YELLOW}⚡ Host tests: every green host-runnable suite (GATE-HOSTTESTS)...${COLOR_RESET}"
+    if (cd "$WORKSPACE_DIR/.." && mkdir -p target/host-tests-tmp \
+            && TMPDIR="$(pwd)/target/host-tests-tmp" cargo test \
+                -p gneiss_pal -p quartzite -p elessar -p unafs -p ibus -p helm -p pca9685 \
+                -p bandy -p euclase -p vein -p matrix -p comscan -p aule -p tabula -p midden \
+                -p principia -p vertex -p foreman -p pulse -p lux); then
+        echo -e "${COLOR_GREEN}  ✅ host suites, root workspace (20 crates)${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}  ❌ a root-workspace host test suite FAILED${COLOR_RESET}"
+        _htrc=1
+    fi
+    # `net` and `rast` are members of the KERNEL workspace, and both are `#![cfg_attr(not(test),
+    # no_std)]` precisely so a plain `cargo test` can run them on the host: net's 29 TCP assertions
+    # guard a crate the kernel links, and rast's golden images are the "same scene ⇒ same pixels on
+    # both arches" oracle. Neither was run by anything.
+    if (cd "$WORKSPACE_DIR" && cargo test -p net -p rast); then
+        echo -e "${COLOR_GREEN}  ✅ host suites, kernel workspace (net, rast)${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}  ❌ a kernel-workspace host test suite FAILED${COLOR_RESET}"
+        _htrc=1
+    fi
+    # mbench's own self-test: 38 scenarios, no hardware, and it is the SCORER every bench verdict in
+    # this tree comes from — `test`, `test-fat`, `kernel8-test` and every `--replay` quote its table.
+    # `./arroyo mbench --self-test` has always been typeable and was run by no gate.
+    if python3 "$WORKSPACE_DIR/scripts/mbench.py" --self-test; then
+        echo -e "${COLOR_GREEN}  ✅ mbench self-test (the scorer every verdict in this tree comes from)${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}  ❌ mbench self-test FAILED — no verdict this tree prints can be trusted${COLOR_RESET}"
+        _htrc=1
+    fi
+
     # GATE-FAMILY: a ratchet on platform-split symbol families — `render_service` /
     # `x86_render_service` / `orin_render_service` and the seven others like it.
     #
@@ -6805,6 +6868,37 @@ BRACEPY
         [ "$_srrc" -eq 2 ] && echo -e "${COLOR_RED}❌ spec-roots gate gave NO VERDICT — its control did not fire, which is not a clean tree${COLOR_RESET}"
     fi
 
+    # GATE-TESTROOTS (TESTROOTS, rmbp, 2026-09-16): GATE-ROOTS' shape applied to the THIRD kind of
+    # root, and the CLASS that GATE-FOREMAN one leg above closed for exactly one file. A `#[test]`
+    # is nobody's dependency either — `cargo build` never compiles it and no kernel leg links it —
+    # so unless a command RUNS it, it is a block of assertions that no run ever evaluates.
+    # `tools/foreman/tests/agreement.rs` was that file: checked in with the module it guards, named
+    # in NO line of this script, and RED 21/21 for weeks while the tree read as "check green".
+    # FOREMAN-ROOT's own QUEUE §5 row left the sweep owed — "every #[test], tests/*.rs and script
+    # suite no verb names" — and this is that sweep. The measurement at the seeding, over the WHOLE
+    # repo: 59 suites, 2 of them run by anything (`midden_core::unit` by GATE-CORE and
+    # `foreman::agreement` by GATE-FOREMAN), 57 named by nothing at all.
+    #   `scripts/test-roots.sh` reds by name on any suite that is neither run by a `cargo test` line
+    #   of THIS SCRIPT'S CODE (full-line comments stripped and backslash continuations joined — the
+    #   GATE-FOREMAN leg needs both) nor carrying a `# RUN-BY:` header naming the command that does,
+    #   nor registered in `scripts/tests.registry` with its reason. THE TARGET FILTER IS HONOURED:
+    #   `--test agreement` runs `tests/agreement.rs` and NOT `tests/preflight.rs`, and a parser that
+    #   read `-p foreman` alone would have declared this whole class closed while preflight stayed
+    #   unrun. Cargo's target selection is ADDITIVE (`--lib --test preflight` selects BOTH), which is
+    #   the other half a coarser reader gets backwards. That pair is a control, not a comment:
+    #   fifteen assertions run before any verdict — nine on synthetic input whose answer is known,
+    #   three against this tree (the enumeration is non-empty; `midden_core::unit` and
+    #   `foreman::agreement` both resolve GATED), and three on inputs the instrument cannot answer
+    #   over (an unreadable arroyo, a registry row with no reason, two crates sharing a package
+    #   name). Any of them failing is exit 2 and NO verdict.
+    local _trrc=0
+    "$WORKSPACE_DIR/scripts/test-roots.sh" "$WORKSPACE_DIR/.." || _trrc=$?
+    if [ "$_trrc" -eq 0 ]; then
+        echo -e "${COLOR_GREEN}  ✅ test roots (every test suite is run by a leg, a declared command, or registered)${COLOR_RESET}"
+    else
+        [ "$_trrc" -eq 2 ] && echo -e "${COLOR_RED}❌ test-roots gate gave NO VERDICT — its control did not fire, which is not a clean tree${COLOR_RESET}"
+    fi
+
     # GATE-FC2 (rmbp, 2026-09-15): LEDGER S5's CLASS — the knob discipline in this tree is stated on
     # CALL SITES, and the DECLARATION is the half nobody checks. `pub mod foo;` with no cfg compiles
     # `foo.rs` into every image — statics linked, panic::Location lines counted — even when every path
@@ -6903,6 +6997,14 @@ BRACEPY
     fi
     if [ "$_srrc" -ne 0 ]; then
         echo -e "${COLOR_RED}❌ check FAILED — a replay spec is named by no verb and declares no runner (see GATE-SPECROOTS above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_trrc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — a test suite is run by no leg and declares no runner (see GATE-TESTROOTS above)${COLOR_RESET}"
+        return 1
+    fi
+    if [ "$_htrc" -ne 0 ]; then
+        echo -e "${COLOR_RED}❌ check FAILED — a host test suite that GATE-TESTROOTS counts as run did not pass (see GATE-HOSTTESTS above)${COLOR_RESET}"
         return 1
     fi
     if [ "$_lbrc" -ne 0 ]; then
