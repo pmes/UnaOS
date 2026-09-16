@@ -3756,6 +3756,105 @@ ELF grep on render3b's image now counts 3 `u7stk` tokens and 4 `boot-core` (cont
 = 1). Both readings saturate exactly as §2.x says: `hw=len headroom=0` is a lower bound, and the
 honest follow-up is a larger stack or a wider window on the next flight.
 
+### 2.aa RENDSTACK — x86 had no stack instrument at all, and the render service was at 95 % (x86_64, `exec-rmbp-rendstack`)
+
+Everything above §2.z is aarch64. Until this arc **x86 had no guard, no canary, no
+paint and no high-water probe**: `spawn_inner` allocated
+`alloc::vec![0u8; TASK_STACK_SIZE]`, and an overflow walked out of the bottom of
+that heap block into whatever the allocator had placed below it, silently.
+QUARRYX86-2 made that owed — its click-router arm (`arch/x86_64/syscall.rs`)
+drains the dock's Quarry latch by calling `quarry::service()` → `open()` (panel
+read, two VFS `read_dir`s, surface alloc), and on x86 the routers that reach it
+are `kernel_main` (the boot stack, not a `Task`) and `x86_render_service`, which
+was spawned with the blanket 16 KiB.
+
+**Guard page or poison sentinel? Same question as §2.y, same answer, three x86
+reasons.** (1) the global allocator is `linked_list_allocator`, which writes its
+free-list `Hole` node **into the start of a freed block** — and the start of a
+stack block would be the guard, so every task teardown would fault inside the
+allocator with the heap lock held; (2) the kernel runs on the **firmware's
+identity map** (`physical_memory_offset == 0`) and the heap is a window inside it
+that also backs xHCI rings and e1000 descriptors handed to devices as
+physical==bus addresses — a 4 KiB hole needs a live 2 MiB leaf split, and the
+unmap is not local to the stack; (3) a kernel-space unmap needs a cross-core TLB
+shootdown, and this tree has core-local `invlpg` plus `AS_GEN` for **user** leaves
+only. So: `STACK_GUARD` = one page (4096 B) of `GUARD_FILL` below every x86 kernel
+stack, read by `guard_state` at its two ends — the aarch64 shape exactly.
+
+**Where it is checked, and why only there.** The low guard is **single-writer** —
+a neighbour overruns *downward* into the top of the slab below and can never reach
+a low guard — so switch-in and switch-out sample the same fact and switch-out
+samples it first. One call, in `run()` immediately after `switch_context` returns,
+on the scheduler's own stack. It is also the only sample that can see a
+**transient** dip: a deep chain that returns before the task parks leaves
+`ctx_rsp` back in range.
+
+**Graduated action, §2.y's table.** `entered` → one rate-limited
+`:: STACK: task=… overflow guard hit …` line and **the task continues** (a sizing
+alarm, not a corruption proof). `TRAVERSED` → **panic, NAMED**: the absorber is
+spent, the block below may already hold a smashed parked frame, and resuming its
+owner means returning into corrupted callee-saved registers — on x86 a fault taken
+on a stack the handler cannot use, i.e. a triple fault and a silent reset with
+nothing on the wire. Reports carry a 16-line cap and a `GUARD_LAST` task id, for
+§2.y's measured reason: a breached guard is *persistent state*, nothing re-paints
+it, so without the id one task burns the whole cap on identical lines.
+
+**The measurement, and it is the finding.** `UNAOS_WC=1 UNAOS_QUARRY=1
+UNAOS_QEMU_FULL=1 ./arroyo test 120` at the **blanket 16 KiB**, 16 `:: STACK:`
+lines over a 145.5 s capture (rc=0, MBENCH 6/6, spec replay green):
+
+| task | reading | headroom | note |
+|---|---|---|---|
+| `render` | 6552 → 6704 → **`high=15600 of 16384`**, plateaued for the last 13 dumps | **784 B (4.8 %)** | the **ordinary** pass — this leg arms no pointer typist (`UNAOS_XHCIHUB`), delivers no `[dock] press`, so the QUARRYX86-2 chain is **not in this number** |
+| `u7x-launch` | `overflow guard hit sp=0x333df60 … size=16384 guard=4096 entered` | dipped **below** its floor | absorbed; the machine ran on and the leg still passed — see "the second task" below |
+
+So 16 KiB was not *about to* become too small; it was already spent. The frames
+below the click router, enumerated on the Pi's armed ELF for the identical
+`quarry::open()` body (§2.x): `wc_click_route` 288 + `quarry::live::open` 928 +
+the deeper subtree (repaint 992 + text 1232 + `wm::create_at` 64 +
+`wm::composite` 6736 = 9024, against the listing side's 4224) = **10240 B**, itself
+a floor. `32768 − 15600 = 17168 B` left above the measured pass — 1.7× that chain;
+`16384 − 15600 = 784 B` would have put the first dock press ~9.2 KiB past the
+floor. `RENDER_PATH_STACK_SIZE` is therefore 32 KiB, which is also 2.1× the
+measured pass and the number the Pi settled on for `render`, `u7-launch` and the
+pump path. **`TASK_STACK_SIZE` is untouched**: sizing one deep path is the fix;
+raising the blanket charges every kernel task in the system for it.
+
+**Corroborated at the new size.** The same command at 32 KiB reports
+`:: STACK: render high=15536 of 32768 ::` — 20 dumps, 120.5 s wall, rc=0, MBENCH
+6/6. Two independent runs on two *different* stack sizes agree to **64 bytes**,
+which is the check that 15600 was a real depth and not an artefact of the stack it
+was read on; `headroom=17232` (52.6 %) is therefore a sampled margin, not an
+assumed one. The `u7x-launch` guard hit reproduces on this run too
+(`sp=0x3342210`, a different address because the render allocation moved), so it
+is a property of that task and not a one-off.
+
+⚠ **The gauge saturates, exactly as §2.x says.** `stack_high_water` scans up from
+the usable base, so `high ≤ size` by construction. Both readings here are
+unsaturated and are therefore real depths; any future reading *at* the size is a
+lower bound, and the answer to one is a bigger number plus the guard's verdict —
+never a re-argued guess off a pegged instrument.
+
+**The second task, and it is a STOP not taken here.** `u7x-launch`
+(`arch/x86_64/syscall.rs:23795`, plain `spawn`) dips below its 16 KiB floor into
+the guard on an ordinary run, with its parked `ctx_rsp` back in range — the x86
+twin of the `shell-run` finding §2.y made on aarch64, and structurally invisible
+to any park-time bounds test. It is also the twin of the Pi's `u7-launch`, which
+was sized to 32 KiB (`U7_LAUNCH_STACK_SIZE`) while its x86 counterpart was left on
+the blanket. The repair is one call: `spawn` → `sched::spawn_stack(…, 32 * 1024)`
+at that line. Out of this arc's named files; reported, not taken.
+
+**Cost.** Guard: two volatile byte reads per context switch and 4 KiB of heap per
+task, **unconditional** — a protection that only exists on witness builds does not
+protect the build that dies at the bench (§2.y's rule). High-water paint and
+probe: `witness`-gated, one fill per spawn and one byte scan per ~5 s service
+dump, so `./arroyo esp-x86` media carries neither symbol. The probe hangs off
+`emit_load_witness`, whose periodic caller is the ~5 s gate inside
+`x86_render_service` — so it needs no plumbing through `main.rs`, and both
+`main.rs` spawn sites stay line-neutral (9905 lines before and after). A byte scan
+rather than aarch64's word-then-byte scan: an x86 kernel stack is a `Box<[u8]>`
+with `align: 1`, so an unaligned `read_volatile::<u64>` would be UB.
+
 ---
 
 ## 3. Blocking and synchronization primitives
