@@ -1182,6 +1182,67 @@ list — none of them fits in `pcihealth.rs` alone):**
 | **I2 — NMI probe of the dead core** | after the steal, IPI an NMI to the declared-dead core; the NMI handler prints its RIP and the aperture address in RDI/RSI if inside the copy. A core parked at retirement on an unacknowledged transaction recognises no interrupt at any priority — the NMI stays pending forever, harmlessly; a core spinning in software with IF=0 (the WEDGEINJ shape) takes it within microseconds | `:: W5: nmi core=c<n> rip=<x> in_blit=<y/n> ::` present, or the pre-registered `:: W5: nmi sent core=c<n> ::` alone | line within 100 ms → the metal fault is SOFTWARE and every theory on the ladder is wrong; absent → the core is hardware-parked, (d) confirmed by the cheapest instrument there is. Nothing in the tree has ever asserted "stuck store" by instrument; WEDGEINJ assumes it | `arch/x86_64` (APIC NMI IPI + handler), `video/wm.rs` (call at the steal) |
 | **I3 — the 500 ms hook** | the branch `held >= 500` at `deadman.rs:344`, calling a `pcihealth` sampler 500 ms before the tripwire | the same RP fields, 500 ms earlier | the RP fields are flat at 1000 ms on 28 samples; 500 ms earlier they are flat too. Named because the brief asked; not recommended | `deadman.rs` |
 
+**I1 — BUILT (W5I1, 2026-09-16, branch `exec-rmbp-w5i1`, parent 891c4dec; ledger B119).** The
+instrument above is in the tree, at exactly the site this table names and under exactly its rules.
+The call is ONE statement folded onto the `COMP_STEALS.fetch_add` line at `wm.rs:4888` (line-neutral,
+`git diff --numstat` 1/1 on `wm.rs`), cfg `nvidia-kepler` inside the steal arm's existing `witness`
+block, on the core that has just won the `COMP_HOLDER_CORE` compare-exchange — so it runs after the
+gate is taken and before `GATE STOLEN` prints. The function is `pcihealth::w5_post_steal` (the W5I1
+block at the tail of `drivers/gpu/pcihealth.rs`, under the module's `nvidia-kepler` gate): BAR0's base
+is cached at `census` from config `0x10`/`0x14` (`w5_cache_bar0`, folded onto the `EP_ECAM.store`
+line so nothing below it moves — `census` runs before `kepler::init` maps the BAR at `:1384`); at the
+steal it asks the live page tables whether that base is mapped (`arch::memory::translate`, the same
+test `kepler::init` makes) and prints the short form `:: W5: site=post-steal from=c<n> dead=c<n>
+held=<ms> bar0=unmapped ::` when it is not — which is also what a machine with no GK107 prints, since
+`census` never runs there and the base stays 0. Otherwise it issues exactly eleven volatile dword
+loads, in this table's order, each once, no loop, no retry, no write, no lock: PMC_INTR_0 `0x100`,
+PFIFO_INTR `0x2100`, PFIFO flush `0x70000` (read only), then the endpoint's PCI Status, then the
+UNPINNED set — PBUS_INTR_0 `0x1100`, PRI fault `0x9084`/`0x9088`, fault-unit mask `0x259c`, BAR1
+fault record `0x2840`/`0x2844`/`0x2848`/`0x284c` — and prints, through the same `serial_println!`
+path `GATE STOLEN` uses:
+
+`:: W5: site=post-steal from=c<stealer> dead=c<n> held=<ms> aim=<hex> pmc_intr=<8x> pfifo_intr=<8x>
+flush=<8x> ep_pcists=<4x|none> pbus_intr=<8x> pri_fault=<8x>/<8x> fault_mask=<8x>
+bar1_fault=<8x>/<8x>/<8x>/<8x> ::`
+
+Two things are stated because they differ from the row above. (1) `ep_pcists` is the endpoint's PCI
+Status word read through the ECAM page `census` verified (`EP_ECAM`, config `0x06` as the upper half
+of the dword at `0x04`), not the PBUS mirror at BAR0 `0x1804`: the brief asked for "the endpoint's
+PCI status via config space read through the census path", and the config path is INDEPENDENT of
+BAR0 — if every BAR0 field on the line reads all-ones or `badf` while `ep_pcists` reads sane, the PRI
+path is dead and the PCIe core is not, which the mirror could not distinguish. The mirror is not read
+as well, to keep the dump to one read per fact. It prints `none` when `census` verified no page
+(never on the bench: `ep … aer=y` proves the page). No CF8/CFC is used from the steal core
+(PCIH-NOCF8). (2) `aim=` is `BLIT_AIM_CORE[dead]`, the SAME value `GATE STOLEN` prints as
+`blit_aim=` — the byte offset into the panel surface, so the BAR1 offset is `aim + 0x20000` and the
+bus address `0x90000000 + 0x20000 + aim` on the bench; no new bookkeeping was added in `wm.rs`.
+`0xBADFxxxx` and `0xFFFFFFFF` are printed as read: the first is the nonexistent-PRI signature the
+bar1-identity rung decodes (`kepler.rs:3831`), the second a completion timeout's all-ones, and both
+are findings about the register, not about the store. `pri_fault`/`bar1_fault`/`fault_mask` are
+words that clear no FAULT_PATTERNS term (`-> FAIL`, `FAIL ::`, `PANIC`, …) and no spec FORBID, so
+the line cannot red a run by its own vocabulary.
+
+Gates on the build: `./arroyo knoboff nvidia-kepler 891c4dec` (the knob-off loadable images did not
+move, control fired, `warm=yes`), `./arroyo check` rc=0 both arches, and one QEMU run `UNAOS_WC=1
+UNAOS_QUARRY=1 UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1 UNAOS_QEMU_FULL=1 ./arroyo test 120` in which
+the line is ABSENT (`awk 'index($0,":: W5:")'` = 0; `GATE STOLEN` = 0 — q35 never steals) and its
+reachability is certified on the artifact: `LC_ALL=C grep -a -o -F ':: W5: site=post-steal'
+target/x86_64_esp/kernel.elf | wc -l` = 2 (the short and the long form share that prefix; the
+known-absent control `post-stealX` = 0, ` bar0=unmapped ::` = 1). Go-red, measured twice: the
+brief's mutation — `COMP_GATE_STEAL_MS` 4_000 → 1 for one run — did NOT fire on q35, and the capture
+says why: `[wcser] scope=live entered=253 declined=1`, `max_us=109202`, so no second core ever
+arrives at a held gate and the Pool rung's 250 ms grace is never reached; the constant was reverted
+byte-identically (line 9496 identical to HEAD, `wm.rs` numstat 1/1). The tree's own injector then
+forced the steal at the UNMODIFIED bound: `UNAOS_WEDGEINJ=1 UNAOS_DEADMAN=1` added to the same knob
+line parks the render core at 30 s, and the run printed `:: W5: site=post-steal from=c5 dead=c1
+held=4284 bar0=unmapped ::` immediately before `:: [wcser] GATE STOLEN from c1 by c5 after 4284ms …
+pick=any …` — same stealer, same corpse, same hold, the `bar0=unmapped` form because q35 has no
+GK107 (rc=0, full wall 120.3 s, MBENCH 6/6). `banner-cert.sh` gained no row: its table is keyed one row per FEATURE and
+`nvidia-kepler` already has one (`:: kepler: probe-abort bar0-unmapped`); a second row for the same
+key would be unreachable (`awk … {print; exit}` takes the first), and the file's row shape admits no
+second token per feature, so the W5 line's artifact witness is the `grep -F` above, quoted in the
+ledger row. I2 (the NMI probe) is W5I2's, in `arch/x86_64`, and is not part of this build.
+
 I1 and I2 together answer W5 on one flight: I2 says whether the core is parked in hardware, I1
 says whether the device latched anything about the store it is parked on. Neither can be reached
 from the sampler path, and the brief's rule (touch `pcihealth.rs` only if the instrument fits there
