@@ -891,6 +891,10 @@ the retype and spoken from `bootpace::service_dump` as `:: x86 bar1exp: UC arm A
 via=<create|retype> leaves=<n> range=<lo>..<hi> ::`, the ring is 1 MiB, and `:: FTDI-CAP: replayed=…
 cap=… lost=… head_cut=…` states the capture's own integrity on every boot — so the controls below
 are scorable as written on the next flight, and `via=` additionally reports WHICH path armed UC.**
+**FBWCWIT closed the twin PHASE31WIT left open: the WC leg's own `:: x86 fb-wc: retyped …` sits at
+the identical t~0 site and was equally evicted, so it is now ALSO latched and spoken late, as
+`:: x86 fb-wc: ARM=wc leaves=<n> range=<lo>..<hi> ::` from the same `bootpace::service_dump` call —
+naming the arm explicitly, since `fb-wc` alone is already the (unreachable) t~0 prefix.**
 
 **Absence controls for this flight, pre-registered:** `fb-wc` must be ABSENT and
 `:: x86 bar1exp: UC arm ARMED` PRESENT on the UC leg (they are alternatives at the same site); the
