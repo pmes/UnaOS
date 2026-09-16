@@ -1013,6 +1013,70 @@ fn bw_sample(ecam: u64, cap: u16, aer: u16, lnksta: u16, devsta: u16, secsta: u1
 // "after enumeration", and a `d_secsta` reading has that one named alternative left. No A1 flight
 // row asks for the knob (`grep -c UNAOS_WIFI docs/dev/OS/rmbp-queue.md docs/dev/OS/rmbp-ledger.md`
 // = 0/0), and any given boot settles it from its own `⚡ kernel features:` banner.
+//
+// ── WIFISWEEP — that residual FIRED, and the dismissal above is the defect (rmbp-ledger B113) ──
+//
+// Flights 8 and 9 both carried `UNAOS_WIFI=1`. The grep two paragraphs up asked "does a queue file
+// name this knob" when the decision needed "does the FLIGHT LINE arm it", and the answer on the
+// wire was yes. Flight 8's capture, measured rather than argued:
+//
+//   [  23263ms] [pcih] bar1wedge sticky-cleared post-enum … relatch=secsta:2000 …
+//   [  23516ms] :: wifi: brcm net function 03:00.0 … (Ethernet) — NOT the radio, skipped ::
+//   [  23516ms] :: wifi: radio 04:00.0 device=0x4331 … MATCH ::
+//
+// 253 ms AFTER the clear, a full `for bus in 0u16..256` x 32-slot config-space sweep. A config read
+// to an absent function on bus 1 — the bus BELOW the root port under test (`[pcih] ep bdf=1:0.0`) —
+// master-aborts and sets that bridge's Secondary Status. So the baseline this rung stored was taken
+// BEFORE the last walk of the boot, the `wedge-sample`'s `d_secsta=2000 at n=1` (both apertures,
+// both flights) was read against it, and `relatch=secsta:2000` could have been that later walk's
+// latch as easily as enumeration's. The rung's own doc sentence — "after the LAST bus walk of the
+// boot" — was FALSE on every boot that armed the wifi knob.
+//
+// WHERE THE LAST WALK ACTUALLY IS, MEASURED IN THE SOURCE AND IN THE CAPTURE. Every `0..=255`-shaped
+// config walk in this kernel (`grep -rn '0\.\.=255\|0u16\.\.256' crates/kernel/src`) is one of:
+// `PciScanner::{enumerate_buses,storage_inventory,find_device}`, `full_census`, `detect_gpus`,
+// `ahci::probe`, `ehci::init`, `ehci_scout::{scout,configure_and_relook}`, `bcma::recon`,
+// `vperf::pci_display_probe` — ALL of them called from inside `arch::x86_64::pci::init` — and
+// `wifi::bus::census` (`wifi/bus.rs:125`), the ONE that is not: it is reached from
+// `wifi::service`'s first pass on the main loop (`main.rs`, three storage-ready sites). Nothing
+// after it walks config space: in flight 8 the last of its lines is at 23562 ms and the next config
+// access of any kind is the storm's own `rp-at-wedge` sample at 331272 ms, five minutes later. The
+// walks are therefore NOT spread across the boot — they end, once, on the first main-loop pass —
+// so the honest fix is the one B113 asked for first ("move the post-enum clear below the wifi
+// census") and not the `baseline=at-storm` fallback.
+//
+// SO THE CALL SITE MOVED, from the tail of `pci::init` to the main loop IMMEDIATELY AFTER
+// `wifi::service()`, at all three of the storage-ready passes `main.rs` carries (the same three
+// `wifi::service` itself sits at, for the same reason: which pass a given x86 build reaches depends
+// on its knobs). That point is after the last config walk on BOTH builds — with `wifi`, because the
+// census has just returned on this very pass; without it, because `wifi::service` is cfg-erased and
+// the point is still below `init_network`'s `find_device`, the last walk `pci::init` performs. The
+// rung is now one-shot on a latch of its own ([`BW_POST_ENUM_DONE`]) because a loop site calls it
+// every iteration forever.
+//
+// AND THE LINE NOW SAYS WHAT RAN IN BETWEEN. `walks_since_enum=<n>` / `walkers=<names>` count the
+// post-enumeration config-space walks this boot recorded through [`note_wifi_census`], so the next
+// flight's `relatch=` is attributable instead of ambiguous: `walks_since_enum=1 walkers=wifi-census`
+// says the reading covers enumeration AND the wifi sweep (nothing is left to blame at the wedge);
+// `walks_since_enum=0 walkers=none` says it covers enumeration alone. The count is MEASURED, not
+// inferred from the knob: it is bumped at the call site, after `wifi::service()` has returned from
+// the pass on which its forward-only state machine ran `bus::census()`.
+//
+// THE NO-DEVICE CASE NOW SPEAKS, which is what makes the order scorable off metal. The old body
+// returned silently when `PCIH_READY` was false, so a q35 boot printed nothing and no gate could
+// score WHERE this rung runs. It now prints one refusal line naming the same `site=` /
+// `walks_since_enum=` fields, so `arroyo test` on q35 — which has no Kepler and no bcm4331, but does
+// run the wifi census and park — witnesses the ORDER (refusal AFTER the wifi line) even though it
+// can witness nothing about the registers.
+//
+// WHAT DID NOT CHANGE, and each was re-checked rather than assumed: the write path (CF8/CFC, the
+// at-arm one, same two bounded offsets); the BSP (the main loop runs on cpu 0 — `SCHED-X86: BSP
+// entered run loop cpu=0` — and `wifi::service`, the config accessor next to it, is on that same
+// loop, so the unlocked CF8 address/data pair is no more exposed than it already was; `rp_at_wedge`,
+// the one config reader on another core, is ECAM-only by construction and never touches CF8); the
+// knob (`bar1wedge`, no new one); and boot pacing (GPACE samples `span` inside `pci::init`, and this
+// call is now outside that function entirely, so a knob-ON boot's tiling row is untouched — the
+// reason the old site sat below the GPACE block now holds trivially).
 
 /// Bytes of the legacy type-1 header this rung reads and writes: Secondary Status is 16-bit at
 /// `0x1E`, so `0x20` is the span. Below [`LEGACY_CFG_LEN`] by construction — named so the claim is
@@ -1020,18 +1084,37 @@ fn bw_sample(ecam: u64, cap: u16, aer: u16, lnksta: u16, devsta: u16, secsta: u1
 #[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
 pub const SECSTA_END: u16 = 0x20;
 
-/// BAR1WEDGE, POST-ENUMERATION half. Called ONCE, from the tail of `arch::x86_64::pci::init`, after
-/// the last bus walk of the boot. Re-reads the root port's Secondary Status, Link Status and Device
-/// Status, prints what enumeration re-latched since the at-arm clear, clears the RW1C bits a second
-/// time, and makes the read-backs the baseline all three of `bw_sample`'s `d_secsta` / `d_lnksta` /
-/// `d_devsta` delta against (DEVSTA joined them here; see the section header for why).
+/// BAR1WEDGE, POST-ENUMERATION half. Called from the main loop IMMEDIATELY AFTER `wifi::service()`
+/// (three sites in `main.rs`, the three storage-ready passes) — WIFISWEEP moved it there from the
+/// tail of `arch::x86_64::pci::init`, which was NOT after the last config walk of the boot on any
+/// boot that armed `UNAOS_WIFI`; see the WIFISWEEP block above for the flight-8 measurement. Speaks
+/// exactly ONCE per boot ([`BW_POST_ENUM_DONE`]) because a loop site calls it forever.
 ///
-/// Guarded on `PCIH_READY`, which is set only at the end of [`census`] — so on a machine with no
-/// GK107 (QEMU q35, every non-kepler boot) this returns without reading or writing anything, and
-/// the post-enum line is honestly absent rather than printed against a root port nobody resolved.
+/// Re-reads the root port's Secondary Status, Link Status and Device Status, prints what the boot's
+/// walks re-latched since the at-arm clear, clears the RW1C bits a second time, and makes the
+/// read-backs the baseline all three of `bw_sample`'s `d_secsta` / `d_lnksta` / `d_devsta` delta
+/// against (DEVSTA joined them here; see the section header for why).
+///
+/// On a machine with no GK107 (QEMU q35, every non-kepler boot) `PCIH_READY` is false and no
+/// register is read or written — but one REFUSAL line is printed, carrying the same `site=` and
+/// `walks_since_enum=` fields, so the ORDER this rung runs in is scorable off metal.
 #[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
 pub fn sticky_clear_post_enum() {
+    // One shot, and the latch is taken ABOVE the `PCIH_READY` gate so the refusal is one-shot too.
+    if BW_POST_ENUM_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let walks = BW_WALKS_SINCE_ENUM.load(Ordering::Relaxed);
     if !PCIH_READY.load(Ordering::Acquire) {
+        serial_println!(
+            "[pcih] bar1wedge post-enum clear REFUSED reason=no-root-port (PCIH_READY=0 — \
+             `census` never armed, so this machine has no GK107 and no bridge above it) \
+             site=post-wifi walks_since_enum={} walkers={} — printed anyway, as the ORDER witness: \
+             this line stands exactly where the clear would have run, below the LAST config-space \
+             walk of the boot",
+            walks,
+            bw_walkers()
+        );
         return;
     }
     let bdf = RP_BDF.load(Ordering::Relaxed);
@@ -1089,17 +1172,64 @@ pub fn sticky_clear_post_enum() {
         )
     };
     serial_println!(
-        "[pcih] bar1wedge sticky-cleared post-enum rp={}:{}.{} secsta={:04x}->{:04x} \
-         lnksta={:04x}->{:04x} devsta={:04x}->{:04x} relatch=secsta:{:04x} lnksta:{:04x} \
-         devsta:{:04x} at-arm=secsta:{:04x} lnksta:{:04x} devsta:{:04x} (w1c written \
-         {:04x}/{:04x}/{:04x}) — relatch is what ENUMERATION set after the at-arm clear; \
-         wedge-sample d_secsta/d_lnksta/d_devsta ALL delta against THIS baseline (DEVSTA joined \
-         them here — SECSTA2's named leftover, closed)",
-        rb, rs, rf, secsta, secsta1, lnksta, lnksta1, devsta, devsta1, relatch_ss, relatch_ls,
-        relatch_ds, at_arm_ss, at_arm_ls, at_arm_ds, ss_w1c, ls_w1c, ds_w1c
+        "[pcih] bar1wedge sticky-cleared post-enum rp={}:{}.{} site=post-wifi \
+         walks_since_enum={} walkers={} secsta={:04x}->{:04x} lnksta={:04x}->{:04x} \
+         devsta={:04x}->{:04x} relatch=secsta:{:04x} lnksta:{:04x} devsta:{:04x} \
+         at-arm=secsta:{:04x} lnksta:{:04x} devsta:{:04x} (w1c written {:04x}/{:04x}/{:04x}) — \
+         relatch is what EVERY config-space walk of this boot set after the at-arm clear: \
+         enumeration, plus the walkers named above (WIFISWEEP — this clear now runs BELOW the \
+         wifi census, not above it); wedge-sample d_secsta/d_lnksta/d_devsta ALL delta against \
+         THIS baseline",
+        rb, rs, rf, walks, bw_walkers(), secsta, secsta1, lnksta, lnksta1, devsta, devsta1,
+        relatch_ss, relatch_ls, relatch_ds, at_arm_ss, at_arm_ls, at_arm_ds, ss_w1c, ls_w1c, ds_w1c
     );
 
     BW_SECSTA0.store(secsta1 as u32, Ordering::Relaxed);
     BW_LNKSTA0.store(lnksta1 as u32, Ordering::Relaxed);
     BW_DEVSTA0.store(devsta1 as u32, Ordering::Relaxed);
+}
+
+/// WIFISWEEP. One-shot latch for [`sticky_clear_post_enum`]: its call site is now a main-loop one
+/// (three of them), so without this the rung would clear and re-baseline on every iteration and the
+/// `relatch=` field — the whole finding — would read `0000` from the second pass onward.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+static BW_POST_ENUM_DONE: AtomicBool = AtomicBool::new(false);
+
+/// WIFISWEEP. Config-space bus walks recorded since `pci::init` returned, i.e. since the end of
+/// enumeration. Bumped only through the `note_*` functions below, each of which is idempotent, so
+/// this counts WALKS and not loop passes.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+static BW_WALKS_SINCE_ENUM: AtomicU32 = AtomicU32::new(0);
+
+/// WIFISWEEP. True once the wifi arc's `bus::census()` sweep has run. Separate from the counter so
+/// [`bw_walkers`] can NAME the walk rather than only count it.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+static BW_WIFI_CENSUS_NOTED: AtomicBool = AtomicBool::new(false);
+
+/// WIFISWEEP. The post-enumeration walkers this boot actually ran, for the `walkers=` field. A
+/// name list and not a knob reading: `wifi-census` appears only after [`note_wifi_census`] has been
+/// reached, which happens on the pass `wifi::service()` performed the sweep on.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+fn bw_walkers() -> &'static str {
+    if BW_WIFI_CENSUS_NOTED.load(Ordering::Relaxed) {
+        "wifi-census"
+    } else {
+        "none"
+    }
+}
+
+/// WIFISWEEP. Record that the wifi arc's one config-space sweep (`wifi::bus::census`,
+/// `wifi/bus.rs:125` — `for bus in 0u16..256` x 32 slots) has run.
+///
+/// Called from `main.rs` IMMEDIATELY AFTER `unaos_kernel::wifi::service()`, under
+/// `all(target_arch = "x86_64", feature = "wifi", feature = "bar1wedge")`, at each of the three
+/// storage-ready passes. Correct by the arc's own shape: `wifi::service` is forward-only and runs
+/// `bus::census()` on its FIRST call and never again, so "service has returned at least once" and
+/// "the sweep has happened exactly once" are the same fact. Idempotent, so the loop cannot inflate
+/// the count — 1 is the honest answer however many times the loop turns.
+#[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))]
+pub fn note_wifi_census() {
+    if !BW_WIFI_CENSUS_NOTED.swap(true, Ordering::Relaxed) {
+        BW_WALKS_SINCE_ENUM.fetch_add(1, Ordering::Relaxed);
+    }
 }
