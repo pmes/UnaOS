@@ -2586,7 +2586,7 @@ pub static MOUSE_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0);
 /// population from `MOUSE_DISCARD_REARM_COUNT`: counted (and printed) separately so a metal
 /// capture can tell which hole it just watched get plugged. Halting errors are NOT counted here —
 /// they go to `service_hid_halts`, which prints its own line.
-pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_RESTATED_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_LAST: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_GAP: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_GAPMAX: AtomicU64 = AtomicU64::new(0); pub static KBD_ARMGAP_MAX: AtomicU64 = AtomicU64::new(0); #[cfg(feature = "xhcikbd")] pub static XHCIKBD_REPORTS: AtomicU64 = AtomicU64::new(0); #[cfg(feature = "xhcikbd")] pub static XHCIKBD_SCORED: AtomicU64 = AtomicU64::new(0); #[cfg(feature = "xhcikbd")] pub static XHCIKBD_STALLS: AtomicU64 = AtomicU64::new(0); #[cfg(feature = "xhcikbd")] pub const XHCIKBD_BURST_PAIRS: u64 = 9; #[cfg(feature = "xhcikbd")] pub const XHCIKBD_BURSTS: u64 = 4; pub static KBD_OUTSTANDING: AtomicU64 = AtomicU64::new(0); pub static KBD_SKIPPED_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DEPTH_WANT: AtomicU64 = AtomicU64::new(0); pub static KBD_LED_DEFERRED: AtomicU64 = AtomicU64::new(0); pub const KBD_INFLIGHT: usize = 4; pub const KBD_BUF_STRIDE: usize = 64; #[cfg(feature = "xhcikbd")] pub const XHCIKBD_STALL_MS: u64 = 600; // PRTSCLOST (orin 17) — the KEYBOARD twin of the five pointer counters to the left, plus the one quantity neither endpoint had: HOW LONG THE INTERRUPT-IN ENDPOINT SAT UNARMED. WHY. `set_hid_idle` sends SET_IDLE duration 0 = INDEFINITE (`sync_control(.., 0x0A, 0x0000, ..)` in this file; `[hidkeys] set-idle ok slot=5 iface=0` on render8's wire), so a boot keyboard reports ONLY on a state change and NEVER resends; and exactly ONE Normal TRB is outstanding on the read, re-armed only from this file's completion dispatch (`queue_keyboard_read` is the LAST statement of the keyboard branch, after the decode and after `set_hid_leds`' EP0 control transfer). Between the controller retiring a TD and software re-arming, the endpoint has no TD, the controller issues no IN token, and every state change inside that window is lost FOREVER — a press+release pair inside it disappears with no line anywhere, which is render8's PRTSCLOST signature: three fast Print Screen presses, ONE `:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::`. `rearm`/`discard`/`errrearm`/`dup`/`nobuf` mirror `MOUSE_*` exactly so `[kbdpoll]` scores like `[ptrpoll]`. `restated` = a report whose six keycodes equal the previous report's; under SET_IDLE 0 a state change CANNOT produce that, so `restated>0` is direct evidence an intermediate report was lost — and is exactly what makes the level-diffed `hid_print_screen_edge` return false for a real press, i.e. the silent swallow is DOWNSTREAM of the loss, not its cause. `KBD_DRAIN_*`/`KBD_ARMGAP_MAX` are in `arch::now_cycles()` units: every `drain_event_ring_once` stamps the gap since the previous drain, and the keyboard completion latches the gap that preceded IT — an UPPER BOUND on the unarmed window, and the number that decides between a pump-cadence fault and a guard fault. Ungated relaxed adds and one counter read per drain, exactly like the three siblings to the left. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below. // CLICKDEAD v2 — the guard's SILENT exit, counted as TWO populations because it is two different faults wearing one `return;`. DUP = `param == mouse_prev_phys` with the buffer and ring still present: the known Panther-Point duplicate Success for a TD already consumed, which the guard recognises and deliberately does not re-arm (a fresh read is supposed to be outstanding); if that assumption is wrong the fix is in the guard's discrimination. NOBUF = `mouse_data_buffer`/`mouse_ring` gone: a teardown/allocation defect, where re-arming would be WRONG because there is nothing to arm; the fix is in the slot's soft state. Conflating them would make `dup>0` mean two incompatible repairs. PRECEDENCE: `!have_buf` is tested FIRST, so a dup that arrives after the buffer is gone scores NOBUF — the missing buffer is the actionable fault. Ungated relaxed adds, exactly like the three siblings above (`MOUSE_REARM_COUNT`'s doc, this file:2373-2377: "Bumped unconditionally (cheap relaxed adds); only the knob-gated witness prints"). Read by `arch/aarch64/display_tegra.rs`'s `[ptrpoll]` as `dup=` and `nobuf=`. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below. // XHCINTD (rmbp 2026-09-15, B44; prior design orin 17 exec-orin17-xhcintd 0019ec7a) — PRTSCLOST's REPAIR, folded onto the same line as its witness. `KBD_INFLIGHT` = how many Normal TRBs the keyboard interrupt-IN keeps outstanding AT ONCE, and it is the whole repair: with ONE TRB the endpoint is unarmed from the instant the controller retires a TD until software re-arms, and under SET_IDLE 0 every key edge in that window is lost FOREVER; with N the controller always has an IN to issue, a retirement never empties the ring, and the window never opens. `KBD_BUF_STRIDE` = 64: each outstanding TRB needs its OWN report buffer (the controller may DMA into any of them), carved out of the keyboard's existing 512-byte 64-aligned `data_buffer` at a 64-byte stride (4 x 64 = 256 <= 512, allocation unchanged); 64 is the aarch64 D-cache line, so the consumer-side `inval` of a retired buffer cannot touch a sibling still armed. `KBD_OUTSTANDING` is a GAUGE (stored, not added): TRBs armed right now, N in steady state — the number that falsifies this fix if it decays. `KBD_DEPTH_WANT` = the depth `kbd_top_up` last aimed at (N, or 1 for a device whose MPS exceeds the stride — the only honest denominator). `KBD_SKIPPED_COUNT` = armed TRBs a completion stepped OVER (the FIFO is popped through the match): non-zero means the controller retired out of order or an event was missed — a different fault from the dup guard's, kept out of it. `KBD_LED_DEFERRED` (HIDLEDDEFER) = lock-LED SET_REPORTs a completion HANDED to `service_hid_leds` instead of issuing itself: the synchronous EP0 control transfer is off the completion path entirely (LOCKFIX's rule: nothing on the input path waits), so the branch between retire and re-arm holds no wait at all. ⚠ FOLDED onto this line — same reason as everything else on it.
+pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static MOUSE_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DISCARD_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DUP_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_NOBUF_DROP_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_RESTATED_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_LAST: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_GAP: AtomicU64 = AtomicU64::new(0); pub static KBD_DRAIN_GAPMAX: AtomicU64 = AtomicU64::new(0); pub static KBD_ARMGAP_MAX: AtomicU64 = AtomicU64::new(0); #[cfg(feature = "xhcikbd")] pub static XHCIKBD_REPORTS: AtomicU64 = AtomicU64::new(0); #[cfg(feature = "xhcikbd")] pub static XHCIKBD_SCORED: AtomicU64 = AtomicU64::new(0); #[cfg(feature = "xhcikbd")] pub static XHCIKBD_STALLS: AtomicU64 = AtomicU64::new(0); #[cfg(feature = "xhcikbd")] pub const XHCIKBD_BURST_PAIRS: u64 = 9; #[cfg(feature = "xhcikbd")] pub const XHCIKBD_BURSTS: u64 = 4; pub static KBD_OUTSTANDING: AtomicU64 = AtomicU64::new(0); pub static KBD_SKIPPED_COUNT: AtomicU64 = AtomicU64::new(0); pub static KBD_DEPTH_WANT: AtomicU64 = AtomicU64::new(0); pub static KBD_LED_DEFERRED: AtomicU64 = AtomicU64::new(0); pub const KBD_INFLIGHT: usize = 4; pub const KBD_BUF_STRIDE: usize = 64; pub static MOUSE_PRESS_LOST: AtomicU64 = AtomicU64::new(0); pub static MOUSE_RELEASE_ORPHAN: AtomicU64 = AtomicU64::new(0); pub static MOUSE_PRESS_RECOVERED: AtomicU64 = AtomicU64::new(0); pub static MOUSE_ARMGAP_MAX: AtomicU64 = AtomicU64::new(0); pub static MOUSE_RESTATED_COUNT: AtomicU64 = AtomicU64::new(0); #[cfg(feature = "xhcikbd")] pub const XHCIKBD_STALL_MS: u64 = 600; // PRTSCLOST (orin 17) — the KEYBOARD twin of the five pointer counters to the left, plus the one quantity neither endpoint had: HOW LONG THE INTERRUPT-IN ENDPOINT SAT UNARMED. WHY. `set_hid_idle` sends SET_IDLE duration 0 = INDEFINITE (`sync_control(.., 0x0A, 0x0000, ..)` in this file; `[hidkeys] set-idle ok slot=5 iface=0` on render8's wire), so a boot keyboard reports ONLY on a state change and NEVER resends; and exactly ONE Normal TRB is outstanding on the read, re-armed only from this file's completion dispatch (`queue_keyboard_read` is the LAST statement of the keyboard branch, after the decode and after `set_hid_leds`' EP0 control transfer). Between the controller retiring a TD and software re-arming, the endpoint has no TD, the controller issues no IN token, and every state change inside that window is lost FOREVER — a press+release pair inside it disappears with no line anywhere, which is render8's PRTSCLOST signature: three fast Print Screen presses, ONE `:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::`. `rearm`/`discard`/`errrearm`/`dup`/`nobuf` mirror `MOUSE_*` exactly so `[kbdpoll]` scores like `[ptrpoll]`. `restated` = a report whose six keycodes equal the previous report's; under SET_IDLE 0 a state change CANNOT produce that, so `restated>0` is direct evidence an intermediate report was lost — and is exactly what makes the level-diffed `hid_print_screen_edge` return false for a real press, i.e. the silent swallow is DOWNSTREAM of the loss, not its cause. `KBD_DRAIN_*`/`KBD_ARMGAP_MAX` are in `arch::now_cycles()` units: every `drain_event_ring_once` stamps the gap since the previous drain, and the keyboard completion latches the gap that preceded IT — an UPPER BOUND on the unarmed window, and the number that decides between a pump-cadence fault and a guard fault. Ungated relaxed adds and one counter read per drain, exactly like the three siblings to the left. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below. // CLICKDEAD v2 — the guard's SILENT exit, counted as TWO populations because it is two different faults wearing one `return;`. DUP = `param == mouse_prev_phys` with the buffer and ring still present: the known Panther-Point duplicate Success for a TD already consumed, which the guard recognises and deliberately does not re-arm (a fresh read is supposed to be outstanding); if that assumption is wrong the fix is in the guard's discrimination. NOBUF = `mouse_data_buffer`/`mouse_ring` gone: a teardown/allocation defect, where re-arming would be WRONG because there is nothing to arm; the fix is in the slot's soft state. Conflating them would make `dup>0` mean two incompatible repairs. PRECEDENCE: `!have_buf` is tested FIRST, so a dup that arrives after the buffer is gone scores NOBUF — the missing buffer is the actionable fault. Ungated relaxed adds, exactly like the three siblings above (`MOUSE_REARM_COUNT`'s doc, this file:2373-2377: "Bumped unconditionally (cheap relaxed adds); only the knob-gated witness prints"). Read by `arch/aarch64/display_tegra.rs`'s `[ptrpoll]` as `dup=` and `nobuf=`. ⚠ FOLDED onto this line, never lines of their own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below. // XHCINTD (rmbp 2026-09-15, B44; prior design orin 17 exec-orin17-xhcintd 0019ec7a) — PRTSCLOST's REPAIR, folded onto the same line as its witness. `KBD_INFLIGHT` = how many Normal TRBs the keyboard interrupt-IN keeps outstanding AT ONCE, and it is the whole repair: with ONE TRB the endpoint is unarmed from the instant the controller retires a TD until software re-arms, and under SET_IDLE 0 every key edge in that window is lost FOREVER; with N the controller always has an IN to issue, a retirement never empties the ring, and the window never opens. `KBD_BUF_STRIDE` = 64: each outstanding TRB needs its OWN report buffer (the controller may DMA into any of them), carved out of the keyboard's existing 512-byte 64-aligned `data_buffer` at a 64-byte stride (4 x 64 = 256 <= 512, allocation unchanged); 64 is the aarch64 D-cache line, so the consumer-side `inval` of a retired buffer cannot touch a sibling still armed. `KBD_OUTSTANDING` is a GAUGE (stored, not added): TRBs armed right now, N in steady state — the number that falsifies this fix if it decays. `KBD_DEPTH_WANT` = the depth `kbd_top_up` last aimed at (N, or 1 for a device whose MPS exceeds the stride — the only honest denominator). `KBD_SKIPPED_COUNT` = armed TRBs a completion stepped OVER (the FIFO is popped through the match): non-zero means the controller retired out of order or an event was missed — a different fault from the dup guard's, kept out of it. `KBD_LED_DEFERRED` (HIDLEDDEFER) = lock-LED SET_REPORTs a completion HANDED to `service_hid_leds` instead of issuing itself: the synchronous EP0 control transfer is off the completion path entirely (LOCKFIX's rule: nothing on the input path waits), so the branch between retire and re-arm holds no wait at all. ⚠ FOLDED onto this line — same reason as everything else on it.
 
 /// Acknowledge an xHCI interrupt at the hardware level so the interrupter can raise again.
 /// Safe to call from interrupt context: it takes NO locks and does NO allocation — it clears
@@ -2968,7 +2968,7 @@ pub struct DeviceSlot {
     /// its own `note_buttons` press/release pair (ehci/mod.rs); `CLICK1_PREV_MASK` is a CONSUMER-side
     /// press-only filter and is deliberately not the same thing. 0 = no button held. Shared xHCI
     /// code: x86 xHCI mice track this identically.
-    pub mouse_prev_buttons: u8,
+    pub mouse_prev_buttons: u8, pub mouse_prev_rep: [u8; 6], pub mouse_prev_len: u8, // PTRPRESS (rmbp 2026-09-15, S30) — THE PREVIOUS REPORT'S BYTES, and the reason the pointer needed them. `mouse_prev_buttons` to the left is a LEVEL, and a level cannot tell a lost edge from no edge: when a report is lost (the interrupt-IN sits unarmed between a retirement and `queue_mouse_read`, the pointer's single-TD hole — this file's `KBD_INFLIGHT` doc says why the keyboard needed N TDs, and `queue_mouse_read` is STILL the last statement of the pointer branch) a press+release pair vanishes with no trace, and a release lost alone leaves the level stuck DOWN forever, because a boot pointer under SET_IDLE 0 reports ONLY on a change and NEVER resends. `KBD_RESTATED_COUNT`'s argument, applied to the pointer: a report BYTE-IDENTICAL to its predecessor is impossible from a change-reporting device, so one proves at least one intermediate report never reached this decoder. Six bytes is the whole boot report either shape (rel: buttons, dx, dy, wheel; abs: buttons, x-lo, x-hi, y-lo, y-hi) and `mouse_prev_len` is the residual-derived `report_len` clamped to it, so the comparison is over the bytes the controller actually delivered and never over the 512-byte window's stale tail. ⚠ FOLDED onto the existing field — no line added (kernel8.img panic-`Location` byte-identity).
 
     pub is_keyboard: bool,
     pub keyboard_ep: u8,
@@ -3128,7 +3128,7 @@ impl DeviceSlot {
             mouse_expect_phys: 0,
             mouse_prev_phys: 0,
             mouse_report_count: 0,
-            mouse_prev_buttons: 0,
+            mouse_prev_buttons: 0, mouse_prev_rep: [0; 6], mouse_prev_len: 0, // PTRPRESS — seeded empty beside its sibling; `mouse_prev_len` 0 means "no predecessor", which is what makes the FIRST report of a slot unable to score as restated. ⚠ FOLDED.
             is_keyboard: false,
             keyboard_ep: 0,
             keyboard_mps: 0,
@@ -3214,7 +3214,7 @@ impl DeviceSlot {
         self.mouse_expect_phys = 0;
         self.mouse_prev_phys = 0;
         self.mouse_report_count = 0;
-        self.mouse_prev_buttons = 0;
+        self.mouse_prev_buttons = 0; self.mouse_prev_rep = [0; 6]; self.mouse_prev_len = 0; // PTRPRESS — cleared on slot reuse beside its sibling, or a recycled slot would compare a new device's first report against a dead one's last and score a false restated. ⚠ FOLDED.
         // UVUG-5: a keyboard slot is being torn down (detach / disconnect / enum-recovery). Signal the
         // host-side typematic tracker BEFORE clearing `is_keyboard`, so it can drop a key held at unplug —
         // under SET_IDLE(0) that key's `KeyUp` will NEVER arrive, and without this the repeat synthesiser
@@ -4460,7 +4460,7 @@ impl XhciController {
                                         self.hid_halt_pending.push((slot_id as u8, true));
                                     }
                                 } else {
-                                    MOUSE_ERROR_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+                                    MOUSE_ERROR_REARM_COUNT.fetch_add(1, Ordering::Relaxed); if self.slots[slot_id as usize].mouse_prev_buttons != 0 { MOUSE_PRESS_LOST.fetch_add(1, Ordering::Relaxed); MOUSE_PRESS_RECOVERED.fetch_add(1, Ordering::Relaxed); self.slots[slot_id as usize].mouse_prev_buttons = 0; self.slots[slot_id as usize].mouse_prev_len = 0; crate::pal::push_pointer_report(None, Some(crate::pal::Event::Button(0))); } // PTRPRESS (S30) — THE OTHER HALF OF THE RECOVERY, and the half that is metal-only: an error re-arm retires a TD this driver cannot account for, so any button edge the device made across it is GONE and, under SET_IDLE 0, will never be resent. If the level says a button is DOWN at that instant the release is the edge that can be missing, and nothing downstream will ever lift it — the stuck click. Synthesise it here, ungated (driver correctness, every board), and clear `mouse_prev_len` with it so the first report AFTER the hole has no predecessor to be compared against: it was never decoded, and scoring it as restated would convict the hole twice. ⚠ FOLDED onto the existing count.
                                     self.queue_mouse_read(slot_id as u8);
                                 }
                                 return;
@@ -4952,7 +4952,7 @@ impl XhciController {
                                             // does not re-fire. Shared xHCI code: x86 xHCI mice gain
                                             // the same correct release edge (a fix, not a risk —
                                             // EHCI keeps its own emit).
-                                            let prev_btn = self.slots[slot_id as usize].mouse_prev_buttons;
+                                            let prev_btn = self.slots[slot_id as usize].mouse_prev_buttons; #[cfg(feature = "witness")] if ptrpress_hole(buttons, prev_btn) { self.queue_mouse_read(slot_id as u8); return; } { let g = KBD_DRAIN_GAP.load(Ordering::Relaxed); if g > MOUSE_ARMGAP_MAX.load(Ordering::Relaxed) { MOUSE_ARMGAP_MAX.store(g, Ordering::Relaxed); } } let rlen = report_len.min(6); let restated = { let s = &self.slots[slot_id as usize]; rlen != 0 && s.mouse_prev_len as usize == rlen && s.mouse_prev_rep[..rlen] == data_data[..rlen] }; { let s = &mut self.slots[slot_id as usize]; s.mouse_prev_len = rlen as u8; s.mouse_prev_rep[..rlen].copy_from_slice(&data_data[..rlen]); } let prev_btn = if restated { MOUSE_RESTATED_COUNT.fetch_add(1, Ordering::Relaxed); if buttons != 0 { MOUSE_PRESS_LOST.fetch_add(1, Ordering::Relaxed); MOUSE_PRESS_RECOVERED.fetch_add(1, Ordering::Relaxed); crate::pal::push_pointer_report(None, Some(crate::pal::Event::Button(0))); self.slots[slot_id as usize].mouse_prev_buttons = 0; 0 } else { MOUSE_RELEASE_ORPHAN.fetch_add(1, Ordering::Relaxed); prev_btn } } else { prev_btn }; // PTRPRESS (S30) — THE PRESS-RECOVERY SEAM, three things folded onto the line that reads the level. (1) ARMGAP: `KBD_DRAIN_GAP` is stamped by `drain_event_ring_once` for BOTH endpoints (it is the one place that knows when software looked at the ring), so latching it here gives the POINTER the upper bound on its own unarmed window that PRTSCLOST gave the keyboard — the pointer had no such latch, and `queue_mouse_read` is still the LAST statement of this branch with ONE TD outstanding, so the window is real on every board. (2) RESTATED: a report whose delivered bytes are identical to its predecessor's. A pointer under SET_IDLE 0 reports only on a change, so this is impossible from the device and proves an intermediate report was lost — `KBD_RESTATED_COUNT`'s argument, and the only signal a LEVEL-diffed decoder can have that an EDGE went missing. Split into the two faults it is: buttons DOWN = the release fell in the hole and the level is stuck down (`press_lost`, Peter at the glass: a click that never lifts); buttons UP = a whole press+release pair fell in the hole and the click was swallowed (`release_orphan` — the release the decoder saw arrive with no press behind it). (3) RECOVERY, ungated because it is driver correctness on every board: on the stuck-down case synthesise the release the device can never resend — push `Button(0)` and drop the level to 0 — so the consumer's held-state tracker lifts and THIS report's still-down mask then reads as a fresh press edge instead of no edge at all. The swallowed-pair case is NOT synthesised: recovering it would mean inventing a click nobody made, and the counter is the honest answer. ⚠ FOLDED onto the existing `let` — no line added.
                                             let edge = buttons != prev_btn;
                                             #[cfg(feature = "usbdebug")]
                                             if edge {
@@ -4969,7 +4969,7 @@ impl XhciController {
                                                     None
                                                 },
                                             );
-                                            self.slots[slot_id as usize].mouse_prev_buttons = buttons;
+                                            self.slots[slot_id as usize].mouse_prev_buttons = buttons; #[cfg(feature = "witness")] ptrpress_note(slot_id as u8, buttons, prev_btn); // PTRPRESS — the fixture's one call site, AFTER the edge is delivered and BEFORE `queue_mouse_read` below, which is exactly the instant the endpoint goes dark. ⚠ FOLDED onto the existing store.
 
                                             // WHEEL — pushed SEPARATELY, and deliberately outside
                                             // the DRAGGLIDE pairing above. That pairing exists to
@@ -13822,7 +13822,7 @@ impl XhciController {
         // PIUSB-39 F1: drain any halted HID interrupt-IN endpoints first — they are dead until
         // un-halted, and the recovery is synchronous like everything else in this hook. Hooked
         // here so no caller outside the driver changes.
-        self.service_hid_halts(); self.service_hid_leds(); #[cfg(feature = "witness")] self.xhcihub_score(); // XHCIHUB — the scorer's only hook. This pass runs every main loop in the same safe polled context, which is what the fixture needs: the hub facts are recorded during bring-up but the downstream pointer's report count is not final until the device has had time to speak, so the score waits for the first report or for XHCIHUB_SETTLE_MS, whichever comes first, and prints exactly once. A no-op on every boot with no hub. ⚠ FOLDED. // HIDLEDDEFER — push any lock-LED bitmap a completion toggled since the last pass (the SET_REPORT that used to run inside the completion branch). Same safe polled context as the halts drain. ⚠ FOLDED.
+        self.service_hid_halts(); self.service_hid_leds(); #[cfg(feature = "witness")] self.xhcihub_score(); #[cfg(feature = "witness")] self.ptrpress_score(); // PTRPRESS — the scorer's only hook, beside its sibling and for the same reason: the counters are final only after the injected stream has ended, so the score is a DEADLINE off the first button edge rather than a condition on any one report. A no-op on every boot whose pointer is never clicked. ⚠ FOLDED. // XHCIHUB — the scorer's only hook. This pass runs every main loop in the same safe polled context, which is what the fixture needs: the hub facts are recorded during bring-up but the downstream pointer's report count is not final until the device has had time to speak, so the score waits for the first report or for XHCIHUB_SETTLE_MS, whichever comes first, and prints exactly once. A no-op on every boot with no hub. ⚠ FOLDED. // HIDLEDDEFER — push any lock-LED bitmap a completion toggled since the last pass (the SET_REPORT that used to run inside the completion branch). Same safe polled context as the halts drain. ⚠ FOLDED.
         while let Some(slot) = self.hid_setproto_pending.pop() {
             // Only BOOT interfaces accept SET_PROTOCOL: proto 1 (keyboard) and proto 2 (relative
             // boot mouse). The absolute-pointer path (proto 0, e.g. usb-tablet / consumer-control)
@@ -15784,7 +15784,7 @@ impl XhciController {
             };
             if armable {
                 if is_mouse {
-                    MOUSE_ERROR_REARM_COUNT.fetch_add(1, Ordering::Relaxed);
+                    MOUSE_ERROR_REARM_COUNT.fetch_add(1, Ordering::Relaxed); if self.slots[slot as usize].mouse_prev_buttons != 0 { MOUSE_PRESS_LOST.fetch_add(1, Ordering::Relaxed); MOUSE_PRESS_RECOVERED.fetch_add(1, Ordering::Relaxed); self.slots[slot as usize].mouse_prev_buttons = 0; self.slots[slot as usize].mouse_prev_len = 0; crate::pal::push_pointer_report(None, Some(crate::pal::Event::Button(0))); } // PTRPRESS — the HALT-recovery twin of the error-arm synthesis above, and the stronger case: CLEAR_FEATURE(HALT) plus a moved TR Dequeue Pointer means every TD on that endpoint is abandoned. ⚠ FOLDED.
                     self.queue_mouse_read(slot);
                     Self::piusb39_witness("halt");
                 } else {
@@ -16556,4 +16556,151 @@ fn hidesit_note(arm: &str, slot_id: u8, ep_addr: u8, dci: u32, speed: u32, mps: 
         dw0, dw4, esit, esithi, avgtrb, want,
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// PTRPRESS (rmbp 2026-09-15, LEDGER S30) — the POINTER press-recovery fixture, and the answer to
+// "clicks not registering". TAIL APPEND, below every pre-existing line of this file, so nothing
+// above moves (kernel8.img panic-`Location` byte-identity); its five counters ride the counters
+// line at `MOUSE_ERROR_REARM_COUNT`, its two slot fields ride `mouse_prev_buttons`, and its three
+// call sites ride existing lines in the pointer completion branch and the two error re-arms.
+//
+// THE GAP S30 NAMED. `drivers/ehci/mod.rs` has `note_buttons` and prints
+// `:: PTR: … press seen= delivered= recovered= …`; the xHCI pointer branch pushes straight to
+// `pal::push_pointer_report` with a LEVEL diff against `mouse_prev_buttons` and counts nothing. A
+// level diff is blind to a lost edge by construction: if the report carrying an edge never reaches
+// the decoder, the level simply never changes and there is no line anywhere. Two faults hide in
+// that blindness and they need different repairs:
+//   * the RELEASE is lost — the level stays DOWN, every consumer's held-state tracker stays armed,
+//     and the device will never resend it (SET_IDLE 0: report on change only). A stuck click.
+//   * a PRESS and its RELEASE are both lost — the click is swallowed whole and nothing anywhere
+//     saw a button at all. The symptom Peter reads at the glass.
+//
+// WHY THE HOLE EXISTS AT ALL, MEASURED IN THIS FILE: `queue_mouse_read` is the LAST statement of
+// the pointer completion branch and arms exactly ONE Normal TRB. Between the controller retiring
+// that TD and software re-arming it the endpoint has no TD, the controller issues no IN token, and
+// every state change inside the window is lost forever. That is PRTSCLOST's keyboard argument,
+// unchanged, on the other endpoint — and the keyboard's repair (XHCINTD: `KBD_INFLIGHT` TDs
+// outstanding, `kbd_retire`/`kbd_top_up`) has NOT been applied here. `MOUSE_ARMGAP_MAX` is the
+// number that says how big the hole is on this board; see the doc on the completion-branch line.
+//
+// THE DETECTOR. `MOUSE_RESTATED_COUNT` — a report whose delivered bytes are byte-identical to its
+// predecessor's — is the only evidence a level-diffed decoder can have, and it is conclusive:
+// a change-reporting device cannot send one. Split by the button bits it carries, it is exactly
+// the two faults above (`MOUSE_PRESS_LOST` when down, `MOUSE_RELEASE_ORPHAN` when up).
+//
+// THE REPAIR is ungated (driver correctness, every board) and is the stuck-down half only:
+// synthesise the release the device can never resend. The swallowed-pair half is counted and NOT
+// synthesised — inventing a click nobody made is a worse failure than reporting a lost one.
+//
+// THE SCORE, printed ONCE from the same service pass `xhcihub_score` hangs on, `PTRPRESS_SETTLE_MS`
+// after the FIRST button edge this boot (a deadline and not a condition, so a boot whose pointer is
+// never clicked prints nothing and an armed fixture that printed nothing is arroyo's red, never a
+// quiet pass):
+//   :: PTRPRESS: reports=<n> press_lost=<p> release_orphan=<o> recovered=<r> armgap_us=<g> restated=<t> edges=<e> held=<h> holed=<i> rearm=<a> discard=<d> dup=<u> nobuf=<b> errrearm=<x> -> PASS|FAIL ::
+// `edges` is the CONTROL — button edges actually delivered downstream; `edges=0` means the burst
+// never reached the decoder and the verdict is about nothing, so it FAILS. `held` is the level at
+// score time: non-zero is a button this driver still believes is down after the burst ended, which
+// is the stuck click itself. PASS iff `press_lost == recovered && release_orphan == 0 && held == 0
+// && edges > 0 && holed == 1 && press_lost >= 1`. `holed` is the second control — the fixture's own
+// injected hole (see `ptrpress_hole`), without which the repair would be scored against a fault that
+// never happened. `-> FAIL` is in arroyo's FAULT_PATTERNS, so the leg's exit status carries it.
+//
+// THE STALL — THE DELIBERATELY SLOW PASS, one-shot, on the first button press edge. Same device as
+// XHCIKBD's F11: it holds the completion branch (and therefore the pump) for `PTRPRESS_STALL_MS`
+// with the pointer's single TD already retired and not yet re-armed, which is the hole made
+// deterministic and long enough for the typist's burst to land inside it. Without it the hole is
+// the pump's ordinary cadence and the fixture would be measuring the harness's luck.
+#[cfg(feature = "witness")] pub static PTRPRESS_SCORED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static PTRPRESS_EDGES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static PTRPRESS_REPORTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static PTRPRESS_SLOT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static PTRPRESS_FIRST_EDGE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static PTRPRESS_STALLED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "witness")] pub static PTRPRESS_HOLED: AtomicU64 = AtomicU64::new(0);
+/// How long after the FIRST button edge the score is printed. Must outlast the whole injected
+/// stream (the stall, the burst, the quiet, and the settling pair) or the line would score a
+/// fixture still in flight.
+#[cfg(feature = "witness")] pub const PTRPRESS_SETTLE_MS: u64 = 6000;
+/// The one-shot stall held inside the pointer completion branch on the first press edge.
+#[cfg(feature = "witness")] pub const PTRPRESS_STALL_MS: u64 = 900;
+
+/// PTRPRESS — THE INJECTED HOLE, and the reason this leg can score the repair at all.
+///
+/// QEMU CANNOT PRODUCE THE DEFECT. Measured on this leg (ptrpress-logs/02, 30 button edges
+/// injected, `edges=20` delivered, `armgap_us=668983`): the emulated tablet BUFFERS what the dark
+/// window would otherwise lose and, when its queue overflows, coalesces whole press+release PAIRS
+/// away — so edges vanish, `held` stays consistent, and no report is ever restated. A real boot
+/// pointer buffers NOTHING and re-states NOTHING: under SET_IDLE 0 it reports only on a change, so
+/// a release lost in the window is lost forever and the level is stuck down until the device is
+/// unplugged. The fault this arc repairs is therefore unreachable on the emulator, and a verdict
+/// that cannot fail is not a gate (LAWS §5).
+///
+/// So the fixture INJECTS it, exactly as XHCIKBD injects its stall: ONE report — the first release
+/// edge after the stall has fired — is swallowed before the decode, which is byte-for-byte what a
+/// report lost in the unarmed window looks like to everything downstream (no edge delivered, level
+/// unchanged, previous-report bytes unchanged) and is what the endpoint does on metal every time
+/// the window is open. `witness` is OFF for every boot and media verb (`unaos/arroyo:44`), so no
+/// image that reaches a card carries this. One-shot and keyed on the stall, so a leg whose pointer
+/// is never clicked never reaches it; `holed` on the score line is the control that says it fired,
+/// and a PASS requires it.
+#[cfg(feature = "witness")]
+fn ptrpress_hole(buttons: u8, prev_btn: u8) -> bool {
+    if PTRPRESS_STALLED.load(Ordering::Relaxed) == 0 { return false; }
+    if buttons != 0 || prev_btn == 0 { return false; }
+    PTRPRESS_HOLED.swap(1, Ordering::Relaxed) == 0
+}
+
+/// PTRPRESS — cycles to microseconds, over `xhcihub_hz()` (the same fold, already `witness`-gated;
+/// `xhcikbd_us` is behind a knob this leg does not arm).
+#[cfg(feature = "witness")]
+fn ptrpress_us(cycles: u64) -> u64 { cycles.saturating_mul(1_000_000) / xhcihub_hz() }
+
+/// PTRPRESS — the pointer completion branch calls this AFTER the edge has been pushed and BEFORE
+/// `queue_mouse_read`, which is the instant the endpoint goes dark. Records the slot and the first
+/// edge (the score's clock), counts the edges actually delivered, and holds the one-shot stall.
+#[cfg(feature = "witness")]
+fn ptrpress_note(slot_id: u8, buttons: u8, prev_btn: u8) {
+    PTRPRESS_REPORTS.fetch_add(1, Ordering::Relaxed);
+    if PTRPRESS_SLOT.load(Ordering::Relaxed) == 0 { PTRPRESS_SLOT.store(slot_id as u64, Ordering::Relaxed); }
+    if buttons == prev_btn { return; }
+    PTRPRESS_EDGES.fetch_add(1, Ordering::Relaxed);
+    let now = crate::arch::now_cycles();
+    let _ = PTRPRESS_FIRST_EDGE.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+    if buttons != 0 && PTRPRESS_STALLED.swap(1, Ordering::Relaxed) == 0 {
+        let budget = PTRPRESS_STALL_MS.saturating_mul(xhcihub_hz()) / 1000;
+        while crate::arch::now_cycles().wrapping_sub(now) < budget { core::hint::spin_loop(); }
+    }
+}
+
+#[cfg(feature = "witness")]
+impl XhciController {
+    /// PTRPRESS — the scorer, hooked on the same service pass as `xhcihub_score`. Silent until a
+    /// button edge has been decoded; then prints once, `PTRPRESS_SETTLE_MS` later.
+    fn ptrpress_score(&mut self) {
+        let t0 = PTRPRESS_FIRST_EDGE.load(Ordering::Relaxed);
+        if t0 == 0 || PTRPRESS_SCORED.load(Ordering::Relaxed) != 0 { return; }
+        let budget = PTRPRESS_SETTLE_MS.saturating_mul(xhcihub_hz()) / 1000;
+        if crate::arch::now_cycles().wrapping_sub(t0) < budget { return; }
+        if PTRPRESS_SCORED.swap(1, Ordering::Relaxed) != 0 { return; }
+        let slot = PTRPRESS_SLOT.load(Ordering::Relaxed) as usize;
+        let held = if slot != 0 && slot < self.slots.len() { self.slots[slot].mouse_prev_buttons } else { 0 };
+        let lost = MOUSE_PRESS_LOST.load(Ordering::Relaxed);
+        let orphan = MOUSE_RELEASE_ORPHAN.load(Ordering::Relaxed);
+        let recovered = MOUSE_PRESS_RECOVERED.load(Ordering::Relaxed);
+        let edges = PTRPRESS_EDGES.load(Ordering::Relaxed);
+        let holed = PTRPRESS_HOLED.load(Ordering::Relaxed);
+        let pass = holed == 1 && lost >= 1 && lost == recovered && orphan == 0 && held == 0 && edges > 0;
+        serial_println!(
+            ":: PTRPRESS: reports={} press_lost={} release_orphan={} recovered={} armgap_us={} restated={} edges={} held={:#04x} holed={} rearm={} discard={} dup={} nobuf={} errrearm={} -> {} ::",
+            PTRPRESS_REPORTS.load(Ordering::Relaxed), lost, orphan, recovered,
+            ptrpress_us(MOUSE_ARMGAP_MAX.load(Ordering::Relaxed)),
+            MOUSE_RESTATED_COUNT.load(Ordering::Relaxed), edges, held, holed,
+            MOUSE_REARM_COUNT.load(Ordering::Relaxed),
+            MOUSE_DISCARD_REARM_COUNT.load(Ordering::Relaxed),
+            MOUSE_DUP_DROP_COUNT.load(Ordering::Relaxed),
+            MOUSE_NOBUF_DROP_COUNT.load(Ordering::Relaxed),
+            MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed),
+            if pass { "PASS" } else { "FAIL" }
+        );
+    }
 }
