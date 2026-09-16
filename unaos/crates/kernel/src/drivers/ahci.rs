@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! AHCI — the Serial ATA host controller, read-only first rung (`UNAOS_AHCI=1`, default OFF).
+//! AHCI — the Serial ATA host controller (`UNAOS_AHCI=1`, default OFF; writes need `ahci-write`).
 //!
 //! # SCOPE — what this arc does, and the three things it deliberately does NOT do
 //!
@@ -12,19 +12,19 @@
 //! IDENTIFY DEVICE (ATA `0xEC`), read LBA 0 with READ DMA EXT (ATA `0x25`), and publish the disk
 //! into `drivers::block`'s registry as a READ source.
 //!
-//! **Does NOT — 1: it never writes to the disk.** There is no WRITE command word anywhere in this
-//! file. The two ATA opcodes it can issue are `IDENTIFY DEVICE` (0xEC) and `READ DMA EXT` (0x25);
-//! `WRITE DMA EXT` (0x35) and every other writing opcode are absent, so an image built with this
-//! knob on carries no code path that could mutate a sector even if something above it asked. The
-//! block-layer entry point pair mirrors that: [`read_block_ahci`] serves reads and the write twin
-//! in `drivers/block.rs` is a refusing stub, exactly the shape SDHC-4b used before `sdw` existed.
-//! Writes are the NEXT arc.
+//! **Does NOT — 1: the opcode census is EXACTLY TWO without `ahci-write`, EXACTLY THREE with it.**
+//! Off: `IDENTIFY DEVICE` (0xEC) and `READ DMA EXT` (0x25), and no writing opcode exists anywhere in
+//! the image. On (AHCIWRITE): `WRITE DMA EXT` (0x35) joins them in [`write_block_at`] at this file's
+//! tail — and its ONLY caller is `block::write_sectors_granted`, which demands a `block::WriteGrant`
+//! the installer's `PartitionTarget` mints after its census. The plain block-layer write twin in
+//! `drivers/block.rs` keeps refusing in BOTH polarities. Prove the polarity on the artifact, never
+//! here: `LC_ALL=C grep -a -o -F 'WRITE-DMA-EXT-0x35' <elf>` is 1 hit armed and 0 hits unarmed.
 //!
-//! **Does NOT — 2: the installer never sees this device.** `install/` is not touched by this arc
-//! and must not learn about the handle until the write arc lands. The reason is concrete and it is
-//! rmbp-ledger B91: the bench rMBP's internal SSD carries a live Catalina install, and an installer
-//! that could enumerate it as a target is one operator slip away from erasing it. A read-only
-//! handle that no installer can name cannot do that.
+//! **Does NOT — 2: no installer reaches this device except through a grant.** Unarmed, `install/`'s
+//! two `Ahci` arms both refuse (rmbp-ledger B91: the bench rMBP's internal SSD carries a live
+//! Catalina). Armed, the READ arm opens so the pre-flight census can look before anything writes,
+//! the WRITE arm stays a refusal, and the only write path is `PartitionTarget`'s granted one, bound
+//! to one partition's LBA range by a capability minted after every refusal in the ladder passed.
 //!
 //! **Does NOT — 3: no interrupts.** `GHC.IE` and every `PxIE` stay 0; command completion is polled
 //! on `PxCI`/`PxIS` against a TSC deadline, the same bounded-budget discipline the xHCI BOT pump
@@ -80,8 +80,8 @@
 //!
 //! # Next arc
 //!
-//! Writes: `WRITE DMA EXT` (0x35) behind its own knob, then a partition-mode installer that can
-//! target a free partition on this disk without going near the volume Catalina lives on.
+//! Landed: PARTINSTALL (the partition-mode installer) and AHCIWRITE (`WRITE DMA EXT` behind
+//! `ahci-write`). Next is multi-sector PRDT runs and the attended operator flow on real metal.
 
 use spin::Mutex;
 
@@ -914,4 +914,97 @@ pub fn probe() {
         "[ahci] done: implemented-ports={} published={} (READ-ONLY arc — no WRITE opcode is compiled into this image)",
         seen, next_ix
     ); #[cfg(feature = "witness")] crate::fs::bootdisk::ahciboot_selftest(); // AHCIBOOT (B89 second rung): the wire fixture, folded onto this line so knob-off byte identity is untouched. It runs HERE because this is the last statement of the one enumeration pass — registry populated, every HBA and port lock released, heap up — and because on x86 nothing else on a headless boot runs after it: `shell::vfs_mount_table`'s `bootdisk::bind` arm is `target_arch = "aarch64"`. Default-quiet (`witness`), like `homesoil_selftest`.
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// AHCIWRITE (rmbp-ledger B89, SATA write half) — `WRITE DMA EXT`, behind `ahci-write`.
+//
+// APPENDED AT THE FILE TAIL, and that is a byte-identity requirement rather than a style: a
+// `#[cfg]`'d-off block still shifts every `core::panic::Location` line below it (LAWS §5), and this
+// file has plenty — every slice index in `sector0_kind` and `id_word` carries one. At the tail,
+// nothing is below it to move, so `ahci-write` OFF is byte-for-byte the image AHCI shipped.
+//
+// ### THE ONE THING THIS SECTION IS FOR, stated before the code
+//
+// Peter's internal SSD has Catalina on it. The arc's whole design premise is that the wrong write
+// must be impossible BY CONSTRUCTION, not by care, so this function is deliberately NOT a peer of
+// `read_block_at`: it is private to the crate's write capability and has exactly ONE caller in the
+// tree, `drivers::block::write_sectors_granted`, which will not call it without a `WriteGrant`
+// minted by `install::partition::mint_grant` after the census and the whole refusal ladder passed.
+// `grep -rn 'write_block_at' unaos/crates/kernel/src` is the audit, and it prints two lines: this
+// declaration and that one call.
+//
+// ### The spec, cited
+//
+// ATA8-ACS `WRITE DMA EXT` (0x35) is the 48-bit DMA write: the same Register H2D FIS shape as
+// `READ DMA EXT` (0x25) with the opposite data direction, LBA in the six LBA bytes, sector count in
+// the two count bytes, device register bit 6 (LBA mode) set. AHCI 1.3.1 §5.5 issues it exactly as
+// the read is issued — command header slot 0, one PRDT entry, `PxCI` bit 0 — with §4.2.2's `W` bit
+// (DW0 bit 6) set, which is what tells the HBA the PRDT is a SOURCE of data rather than a sink.
+// [`issue`] already carries that `write` parameter and already sets that bit; this arc adds no new
+// register discipline, no new wait, and no second command slot.
+
+/// ATA8-ACS `WRITE DMA EXT`. THE THIRD AND LAST OPCODE THIS FILE CAN ISSUE, and only with
+/// `ahci-write` compiled in — see the SCOPE block at the head of the module.
+#[cfg(feature = "ahci-write")]
+const ATA_WRITE_DMA_EXT: u8 = 0x35;
+
+/// AHCIWRITE: one-shot arming witness. It carries the opcode census token the DONE gate counts on
+/// the ELF (`WRITE-DMA-EXT-0x35`), and that token appears in EXACTLY ONE string literal in the whole
+/// tree, so a census of the artifact is a census of this code path's presence — an instrument proven
+/// in the artifact and not in the diff (LAWS §5).
+#[cfg(feature = "ahci-write")]
+static WRITE_ARMED_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Write one 512-byte sector to `port_ix` (a REGISTRY INDEX, the same key [`read_block_at`] takes)
+/// from `buf`. Bounded and synchronous: one `WRITE DMA EXT`, polled against [`T_CMD_MS`], D2H status
+/// and error decoded by [`issue`] and printed on any failure.
+///
+/// ⚠ **DO NOT GIVE THIS A SECOND CALLER.** It is `pub(crate)`, not `pub`, and the crate's single call
+/// site is `drivers::block::write_sectors_granted`, which holds a `WriteGrant` naming the only LBA
+/// range an install was cleared to touch. A direct caller would be a write to Peter's live SSD with
+/// no census, no refusal ladder and no bound — the exact thing rmbp-ledger B91 and RULINGS R25 are
+/// about. If a second caller is ever genuinely needed, it goes through the grant too.
+///
+/// Symmetric with the read in every other respect: the same port lock across the command (one
+/// command slot means two callers must serialise, which is correctness and not tuning), the same
+/// LBA48 requirement (this arc issues no 28-bit write), and the same per-port bound on
+/// `num_sectors`, which is the LAST of three independent bounds — the grant's range check and the
+/// `PartitionTarget`'s `map()` are the other two, and they live in different files on purpose.
+#[cfg(feature = "ahci-write")]
+pub(crate) fn write_block_at(port_ix: usize, lba: u64, buf: &[u8]) -> Result<(), ()> {
+    if buf.len() < SECTOR_BYTES || port_ix >= MAX_AHCI_DISKS {
+        return Err(());
+    }
+    let guard = PORTS.lock();
+    let p = match guard[port_ix] {
+        Some(p) => p,
+        None => return Err(()),
+    };
+    if lba >= p.num_sectors {
+        serial_println!(
+            "[ahci] port {} WRITE refused lba={} beyond device capacity {} sectors",
+            p.port, lba, p.num_sectors
+        );
+        return Err(());
+    }
+    // WRITE DMA EXT is a 48-bit command. A device without the 48-bit Address feature set cannot
+    // serve it, and this arc issues no 28-bit write, so such a device stays read-only — named here
+    // rather than discovered as a task-file abort three layers up.
+    if !p.lba48 {
+        serial_println!("[ahci] port {} WRITE refused — device reports no LBA48 and no 28-bit write is compiled", p.port);
+        return Err(());
+    }
+    if !WRITE_ARMED_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(
+            ":: AHCI: write path ARMED — opcode WRITE-DMA-EXT-0x35 (ATA8-ACS, LBA48) compiled and reachable only through a WriteGrant (first, once) ::"
+        );
+    }
+    // Stage the payload into the port's DMA buffer, which the HBA will now READ FROM rather than
+    // write into. Same buffer, same bus address, opposite direction — the direction lives entirely
+    // in the command header's W bit (AHCI 1.3.1 §4.2.2) and in the ATA opcode.
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), p.dma as *mut u8, SECTOR_BYTES);
+    }
+    issue(&p, ATA_WRITE_DMA_EXT, lba, 1, SECTOR_BYTES, true)
 }

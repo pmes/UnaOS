@@ -324,14 +324,96 @@ change is folds.
   bootinfo=0xfabe1afd agrees=yes mounts=4 layout=true -> PASS ::`, with the SD card listed at
   `/volumes/UNAOS SDHC4` rather than bound. The SATA rung of `fat::live_sources` that the first rung
   appended is the rung the root was found on. See rmbp-ledger B89 (third rung) and LEDGER SO38.
-* **Writes**, and the partition-mode installer behind B91's stranger guard (rmbp-queue `AHCIWRITE`).
+* ~~**Writes**, and the partition-mode installer behind B91's stranger guard~~ — **LANDED**: the
+  installer is PARTINSTALL and the write path is AHCIWRITE, below.
 
 ---
 
 ## Next arc
 
-1. **Writes.** `WRITE DMA EXT` (0x35) behind its own knob, with the same refuse-by-default posture
-   `sdw` established for the SD path.
+1. ~~**Writes.**~~ **LANDED — AHCIWRITE, below.** `WRITE DMA EXT` (0x35) behind `ahci-write`, with a
+   posture stricter than `sdw`'s: refuse-by-default plus a capability, not a knob alone.
 2. **The x86 `bootdisk::bind` arm**, so the volumes this arc can now find are actually mounted.
-3. **A partition-mode installer.** B91's stranger guard first, then an installer that can target a
-   free partition without going near the volume Catalina lives on.
+3. ~~**A partition-mode installer.**~~ **LANDED — PARTINSTALL.**
+4. **Multi-sector PRDT runs.** Every transfer here is one sector; the PRDT has room for eight
+   entries and `read_blocks_ahci_ix` / `write_sectors_granted` both loop the single-sector primitive.
+   Lifting that is invisible above the seam.
+
+---
+
+## AHCIWRITE — the write path, and why it is a capability
+
+`UNAOS_AHCI_WRITE=1` (feature `ahci-write`, which implies `ahci`). **Default OFF, and OFF is the
+shipped state.** This is the only knob in `arroyo` that can destroy data on the bench rMBP's internal
+SSD, which has Catalina on it, so the whole design premise is that the wrong write is impossible **by
+construction rather than by care** — RULINGS R25's STRANGER clause expressed in the type system.
+
+### The opcode census is the polarity
+
+Unarmed, `drivers/ahci.rs` can issue exactly two ATA opcodes: `IDENTIFY DEVICE` (0xEC) and
+`READ DMA EXT` (0x25). Armed, exactly three: `WRITE DMA EXT` (0x35) joins them, in `write_block_at`
+at the file's tail. **Certify that on the ARTIFACT, never on the diff, the banner or the check**
+(LAWS §5):
+
+```
+LC_ALL=C grep -a -o -F 'WRITE-DMA-EXT-0x35' <kernel.elf> | wc -l     # 1 armed, 0 unarmed
+```
+
+The token lives in exactly one string literal in the whole tree — the one-shot arming witness
+`:: AHCI: write path ARMED — opcode WRITE-DMA-EXT-0x35 … ::` — so a census of the artifact is a
+census of the code path.
+
+### The chain, and the two greps that audit it
+
+| link | where | what stops a second one |
+|---|---|---|
+| `ahci::write_block_at` | `drivers/ahci.rs`, file tail | `pub(crate)`, with exactly ONE caller in the tree |
+| `block::write_sectors_granted` | `drivers/block.rs`, file tail | takes a `&WriteGrant` by value type; will not write without one |
+| `block::WriteGrant` | `drivers/block.rs`, file tail | **private fields** — `WriteGrant { .. }` outside that module is a compile error, not a review finding |
+| `WriteGrant::new` | same | called from exactly ONE function |
+| `install::partition::mint_grant` | `install/partition.rs` | runs `check_partition` itself — census, INSTALL-SELF, transport, existence, ESP, content, foreign type, size — and mints only on `Ok` |
+
+```
+grep -rn 'write_block_at'  unaos/crates/kernel/src     # declaration + one call
+grep -rn 'WriteGrant::new' unaos/crates/kernel/src     # declaration + mint_grant
+```
+
+Both are two lines. If either ever prints three, the chain has a second door.
+
+### Three bounds, in three files, for one write
+
+1. `PartitionTarget::map()` (`install/partition.rs`) — `BadLba`, never a clamp, for anything past the
+   partition's length; the LBA it returns is ABSOLUTE.
+2. `write_sectors_granted` (`drivers/block.rs`) — every sector re-checked against the granted
+   `[first_lba, last_lba]`, with a witness:
+   `:: [ahci] write REFUSED lba=… outside grant port=… …..… — nothing written ::`.
+3. `write_block_at` (`drivers/ahci.rs`) — re-checked against the port's own IDENTIFY sector count.
+
+They are deliberately in three files: one mistake has to be made three times to reach the medium. The
+grant carries ABSOLUTE LBAs for the same reason — a translation bug upstream surfaces here as an
+out-of-grant refusal instead of a plausible-looking relative number passing through.
+
+### What arming does NOT open
+
+`write_block_ahci`, `write_block_ahci_port` and `write_blocks_ahci_port` still return `NotReady` with
+their one-shot witness **in this polarity too**. So `BlockHandle::Ahci`'s arm in the block dispatch,
+the FAT writer on a SATA-mounted volume, every shell verb and `install/mod.rs`'s whole-disk
+`BlockTarget::write_sectors` all still refuse. Arming the knob adds one narrow door; it widens none.
+`install/mod.rs`'s `read_sectors` arm is the one thing that DOES open, because the pre-flight census
+has to read the stranger's disk before anything can refuse it.
+
+### Knob off, with `ahci` on
+
+The installer's SATA refusal changes token: `reason=transport-write-disabled transport=ahci
+knob=UNAOS_AHCI_WRITE` instead of `transport-read-only`. Two different sentences on purpose — "this
+transport has no write path in any build" versus "this BUILD has none, and here is the switch" — and
+the second one names its own remedy. A build without the feature still cannot write the SSD.
+
+### Byte identity, knob off
+
+Every addition is a **file-tail append** (`drivers/ahci.rs`, `drivers/block.rs`) or a **line-neutral
+rewrite** (the SCOPE block's doc lines; both `Ahci` match arms in `install/mod.rs`, which are single
+folded lines). `block.rs` is compiled into `kernel8.img`, so its tail rule is load-bearing.
+`install/partition.rs` is `installdemo`-gated at its `pub mod` declaration and reaches no Pi image, so
+its line count is free. `arm_features` strips `ahci-write` exactly as it strips `ahci`, so aarch64
+media are byte-identical whichever way the knob points.

@@ -2908,8 +2908,8 @@ pub fn write_blocks_ahci_port(_port: u8, lba: u64, buf: &[u8]) -> Result<(), Blo
 /// AHCIBOOT: the SATA root's standing write refusal, as [`handle_write_veto`] reports it.
 #[cfg(all(feature = "sdwrite", target_arch = "x86_64", feature = "ahci"))]
 const NATIVE_AHCI_VETO: &str = "the volume rides an internal SATA disk and the block layer refuses \
-                                every write to it — this image compiles no ATA write opcode at all \
-                                (AHCI / AHCIBOOT)";
+                                every write through this handle — the only SATA write path there \
+                                is belongs to the installer's grant (AHCI / AHCIBOOT / AHCIWRITE)";
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 // BLOCKSMALL — LBA32 (LEDGER SR15) and the USBUNPUB fixture.
@@ -3115,4 +3115,127 @@ pub fn lba32_selftest() {
         byteoff,
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// AHCIWRITE (rmbp-ledger B89, SATA write half) — the WRITE CAPABILITY, behind `ahci-write`.
+//
+// APPENDED AT THE FILE TAIL, for the reason the BLOCKSMALL and SDWRITE blocks above already state:
+// `block.rs` is compiled into `kernel8.img`, a `#[cfg]`'d-off block still moves every
+// `core::panic::Location` below it (LAWS §5), and at the tail there is nothing below to move. Knob
+// off, this whole section is not lexed as code and the Pi image is byte-for-byte what it was.
+//
+// ### WHY A CAPABILITY AND NOT A FLAG
+//
+// The disk this path can reach is the rMBP's internal SSD, and Catalina is on it (rmbp-ledger B91,
+// RULINGS R25: a non-UnaOS disk is a STRANGER). A boolean "writes are allowed now" would be a
+// statement about the code that exists today; a VALUE that has to be produced, carried and shown at
+// the wire is a statement about every caller there will ever be. So:
+//
+//   * [`WriteGrant`]'s fields are PRIVATE to this module. There is no literal-struct construction of
+//     one anywhere in the tree, in any cfg — `WriteGrant { .. }` outside `drivers/block.rs` is a
+//     compile error, not a review finding.
+//   * Its one constructor is [`WriteGrant::new`], and the tree contains exactly ONE call to it:
+//     `install::partition::mint_grant`, which runs only after `census()` has read the whole GPT and
+//     `check_partition()` has passed every refusal in the ladder (boot device, transport, existence,
+//     ESP, content, foreign type, size).
+//   * [`write_sectors_granted`] is the ONE caller of `drivers::ahci::write_block_at`, which is
+//     `pub(crate)` precisely so that stays true. Two greps are the whole audit:
+//         grep -rn 'write_block_at'  unaos/crates/kernel/src   -> declaration + this call
+//         grep -rn 'WriteGrant::new' unaos/crates/kernel/src   -> declaration + mint_grant
+//   * The PLAIN path is UNCHANGED. [`write_block_ahci`], [`write_block_ahci_port`] and
+//     [`write_blocks_ahci_port`] still return `NotReady` with the same one-shot witness, in this cfg
+//     as in every other, so `BlockHandle::Ahci`'s arm in `handle_dispatch`, the FAT writer on a
+//     SATA-mounted volume, every shell verb and the whole-disk installer engine all still refuse.
+//     Arming this knob does not widen any door that was already there; it adds one narrow new one.
+
+/// AHCIWRITE: permission to write ONE inclusive LBA range on ONE AHCI port, and nothing else.
+///
+/// Opaque by construction — the fields are private and the only constructor is [`WriteGrant::new`].
+/// `Copy` so the installer can hand it down through `PartitionTarget` without lifetime ceremony;
+/// that costs nothing, because possessing one is already the permission and copying a permission
+/// grants no range a caller did not already hold.
+///
+/// The LBAs are ABSOLUTE disk LBAs, not partition-relative ones. That is deliberate and it is the
+/// half that makes the check meaningful: `PartitionTarget::map()` has already translated, so the
+/// number this type sees is the number the HBA will see, and a translation bug upstream shows up
+/// here as an out-of-grant refusal instead of passing a plausible-looking relative LBA through.
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+#[derive(Clone, Copy)]
+pub struct WriteGrant {
+    port: u8,
+    first_lba: u64,
+    last_lba: u64,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+impl WriteGrant {
+    /// THE ONE CONSTRUCTOR. Called from exactly one place in the tree —
+    /// `install::partition::mint_grant` — after the census and the refusal ladder.
+    ///
+    /// ⚠ **DO NOT ADD A SECOND CALL SITE.** The refusal ladder is what makes a grant mean anything;
+    /// a grant minted anywhere else is a write to a stranger's disk with the guards skipped. A new
+    /// caller belongs behind `mint_grant`, not beside it.
+    pub fn new(port: u8, first_lba: u64, last_lba: u64) -> Self {
+        Self { port, first_lba, last_lba }
+    }
+    pub fn port(&self) -> u8 {
+        self.port
+    }
+    pub fn first_lba(&self) -> u64 {
+        self.first_lba
+    }
+    pub fn last_lba(&self) -> u64 {
+        self.last_lba
+    }
+    /// Is `lba` inside this grant? Inclusive at both ends, and it is the ONLY predicate
+    /// [`write_sectors_granted`] consults.
+    pub fn allows(&self, lba: u64) -> bool {
+        lba >= self.first_lba && lba <= self.last_lba
+    }
+}
+
+/// AHCIWRITE: write `buf.len()/block_size` consecutive sectors at ABSOLUTE `lba` on the port the
+/// grant names — the ONLY path in this tree that reaches `drivers::ahci::write_block_at`.
+///
+/// Every sector is checked against the grant INDIVIDUALLY before it is issued, so a run that starts
+/// inside the grant and walks off the end is refused at the first offending sector and the sectors
+/// before it are the only bytes that moved. The refusal prints
+/// `[ahci] write REFUSED lba=<n> outside grant port=<p> <first>..<last>` — a witness, not a silent
+/// `Err`, because a guard nobody can see fire is an absent one (LAWS §5), and this one has a go-red
+/// fixture (`install::partition::grant_go_red`).
+///
+/// Three independent bounds guard one write and they live in three files on purpose: the
+/// `PartitionTarget`'s `map()` (install/partition.rs) refuses anything past the partition's length,
+/// this range check (drivers/block.rs) refuses anything outside the granted extent, and
+/// `ahci::write_block_at` (drivers/ahci.rs) refuses anything past the device's own sector count. A
+/// single mistake has to be made three times, in three files, to reach the medium.
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+pub fn write_sectors_granted(grant: &WriteGrant, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    let ix = ahci_ix_of_port(grant.port()).ok_or(BlockError::NotReady)?;
+    let dev = ahci_info_ix(ix).ok_or(BlockError::NotReady)?;
+    let bs = dev.block_size as usize;
+    if bs == 0 || buf.is_empty() || buf.len() % bs != 0 {
+        return Err(BlockError::BadLba);
+    }
+    let count = buf.len() / bs;
+    for i in 0..count {
+        let abs = lba.checked_add(i as u64).ok_or(BlockError::BadLba)?;
+        if !grant.allows(abs) {
+            serial_println!(
+                ":: [ahci] write REFUSED lba={} outside grant port={} {}..{} — nothing written ::",
+                abs,
+                grant.port(),
+                grant.first_lba(),
+                grant.last_lba()
+            );
+            return Err(BlockError::BadLba);
+        }
+        if abs >= dev.num_blocks {
+            return Err(BlockError::BadLba);
+        }
+        crate::drivers::ahci::write_block_at(ix, abs, &buf[i * bs..(i + 1) * bs])
+            .map_err(|_| BlockError::Io)?;
+    }
+    Ok(())
 }

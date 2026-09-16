@@ -354,10 +354,17 @@ pub enum Refusal {
     /// The bound device is the volume this kernel booted from — INSTALL-SELF, unchanged by this arc
     /// and asked FIRST, because "this is the disk you are running from" outranks every other reason.
     BootDevice,
-    /// The transport cannot write. Today this is every SATA disk: `drivers/block.rs`'s `Ahci` handle
-    /// refuses writes in every cfg and the image compiles no ATA write opcode. Named here, one layer
-    /// above the transport, so the answer an operator reads is a policy and not an I/O error.
+    /// The transport cannot write AT ALL, in any build. The internal SD card and the Orin's microSD
+    /// are this: `drivers/block.rs` refuses their writes in every cfg. Named here, one layer above
+    /// the transport, so the answer an operator reads is a policy and not an I/O error.
     TransportReadOnly { transport: &'static str },
+    /// AHCIWRITE: the transport COULD write, and this image was not built to. SATA when `ahci-write`
+    /// is off — a distinct token from [`Refusal::TransportReadOnly`] on purpose, because the two
+    /// sentences an operator needs are different: "this transport has no write path anywhere" versus
+    /// "this BUILD has none, and here is the switch". Carries the knob so the refusal names its own
+    /// remedy instead of leaving the reader to search for it. Disappears entirely when the knob is
+    /// on, and a build without the knob still cannot write the SSD — which is the safety property.
+    TransportWriteDisabled { transport: &'static str, knob: &'static str },
 }
 
 impl Refusal {
@@ -371,6 +378,7 @@ impl Refusal {
             Refusal::PartitionTooSmall { .. } => "partition-too-small",
             Refusal::BootDevice => "boot-device",
             Refusal::TransportReadOnly { .. } => "transport-read-only",
+            Refusal::TransportWriteDisabled { .. } => "transport-write-disabled",
         }
     }
 
@@ -409,6 +417,13 @@ impl Refusal {
                 self.reason(),
                 transport
             ),
+            Refusal::TransportWriteDisabled { transport, knob } => serial_println!(
+                ":: PINSTALL: refusal target={} reason={} transport={} knob={} -> guard OK ::",
+                who,
+                self.reason(),
+                transport,
+                knob
+            ),
             _ => serial_println!(
                 ":: PINSTALL: refusal target={} reason={} -> guard OK ::",
                 who,
@@ -431,9 +446,32 @@ pub fn transport_writable(h: block::BlockHandle) -> bool {
         block::BlockHandle::Sdhc => false,
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
         block::BlockHandle::TegraSd => false,
-        #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+        // AHCIWRITE: SATA is the one transport whose answer is a BUILD fact rather than a standing
+        // one. Without `ahci-write` the image compiles no ATA write opcode, so the answer is the
+        // same flat NO the other two give. With it, the transport can write — but only through the
+        // grant `mint_grant` produces, and only into the LBA range that grant names; the plain
+        // `write_block_ahci` path this predicate does NOT speak for is still a refusal in both
+        // polarities. So a `true` here means "there is a path, if you earn a capability", never
+        // "writes are open", and `check_partition` is the only caller that can earn one.
+        #[cfg(all(target_arch = "x86_64", feature = "ahci", not(feature = "ahci-write")))]
         block::BlockHandle::Ahci { .. } => false,
+        #[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+        block::BlockHandle::Ahci { .. } => true,
     }
+}
+
+/// WHICH refusal a non-writable transport earns. Split out of [`check_partition`] so the two
+/// sentences stay distinguishable on the wire: `transport-read-only` is "this transport has no write
+/// path in any build of UnaOS", `transport-write-disabled` is "this BUILD has none, and the knob
+/// that would add it is named in the line". Only SATA can be the second, and only when `ahci` is
+/// compiled without `ahci-write`; every other transport keeps the token it always printed, so no
+/// existing fixture or doc row changes meaning.
+fn transport_refusal(h: block::BlockHandle) -> Refusal {
+    #[cfg(all(target_arch = "x86_64", feature = "ahci", not(feature = "ahci-write")))]
+    if matches!(h, block::BlockHandle::Ahci { .. }) {
+        return Refusal::TransportWriteDisabled { transport: "ahci", knob: "UNAOS_AHCI_WRITE" };
+    }
+    Refusal::TransportReadOnly { transport: transport_name(h) }
 }
 
 /// The transport's name for the wire.
@@ -477,8 +515,24 @@ pub fn check_partition(
     if super::selfguard::refuses(id) {
         return Err(Refusal::BootDevice);
     }
+    // AHCIWRITE — THE SATA HALF OF INSTALL-SELF, and it exists because the guard above CANNOT see a
+    // SATA disk. `selfguard::live()` builds its candidate set from `block::info()` + `block::usb_info()`
+    // only, so `classify()` on an `Ahci` identity falls through to its "not a candidate we evaluated"
+    // arm and answers `Eligible`. On the bench rMBP the boot volume and Catalina are BOTH on the
+    // internal SATA disk, so a SATA installer with no boot-device question is the one shape B91
+    // forbids. This asks the same question `selfguard` asks — is the boot volume's FAT serial on this
+    // device — over the handle it cannot reach, and it is asked in `check_partition` so it is asked
+    // by the fixture, by the operator entry point and by `mint_grant` alike.
+    // ⚠ STOP-WORTHY AND REPORTED: the RIGHT home for this is `selfguard`'s candidate list, which this
+    // brief does not name among its files. Until that lands this is the second of two guards, not a
+    // replacement, and its verdict is printed three-valued by `sata_boot_verdict` so a DISARMED
+    // build (no boot serial in `BootInfo`) is never mistaken for a cleared one.
+    #[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+    if sata_is_boot_device(id.handle) {
+        return Err(Refusal::BootDevice);
+    }
     if !transport_writable(id.handle) {
-        return Err(Refusal::TransportReadOnly { transport: transport_name(id.handle) });
+        return Err(transport_refusal(id.handle));
     }
     let row = census.row(index).ok_or(Refusal::NoSuchPartition)?;
     if row.entry.is_esp() && !as_esp {
@@ -508,6 +562,83 @@ pub fn check_partition(
         return Err(Refusal::PartitionTooSmall { have_bytes: have, need_bytes: need });
     }
     Ok(())
+}
+
+/// AHCIWRITE — **THE ONE FUNCTION IN THE TREE THAT CONSTRUCTS A `block::WriteGrant`.**
+///
+/// It runs the whole refusal ladder itself rather than trusting a caller to have run it: a grant is
+/// the permission to write Peter's SSD, and a permission whose precondition is "the caller promised"
+/// is a permission with no precondition. So `check_partition` is called HERE, on this census, for
+/// this index, and the grant is produced only on its `Ok`.
+///
+/// The extent is the GPT entry's own `first_lba..=last_lba`, read off the medium by
+/// `gpt::read_table` and probed by `probe_content` — never a number the caller supplied. Combined
+/// with `PartitionTarget::map()` (which already refuses anything past the partition's length) the
+/// two agree by construction, and the grant's runtime check is what would print the disagreement.
+///
+/// Returns the empty capability for every non-SATA handle: those transports write through the paths
+/// they always did and need no capability, so an armed build changes nothing about them.
+///
+/// ⚠ **DO NOT ADD A SECOND MINTER.** `grep -rn 'WriteGrant::new' unaos/crates/kernel/src` must print
+/// exactly two lines forever — the declaration in `drivers/block.rs` and the one call below.
+#[allow(clippy::result_large_err)]
+pub fn mint_grant(
+    census: &Census,
+    id: block::BlockDeviceId,
+    index: u32,
+    tree_bytes: usize,
+    as_esp: bool,
+) -> Result<MaybeGrant, Refusal> {
+    check_partition(census, id, index, tree_bytes, as_esp)?;
+    #[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+    if let block::BlockHandle::Ahci { port } = id.handle {
+        let row = census.row(index).ok_or(Refusal::NoSuchPartition)?;
+        serial_println!(
+            ":: PINSTALL: grant minted transport=ahci port={} part={} lba={}..{} sectors={} — every other LBA on this disk is unreachable through it ::",
+            port,
+            index,
+            row.entry.first_lba,
+            row.entry.last_lba,
+            row.entry.sectors()
+        );
+        return Ok(Some(block::WriteGrant::new(port, row.entry.first_lba, row.entry.last_lba)));
+    }
+    Ok(no_grant())
+}
+
+/// AHCIWRITE: the SATA half of INSTALL-SELF — is the boot volume's FAT serial on THIS SATA disk?
+///
+/// `selfguard` cannot answer this. Its candidate list is `block::info()` plus `block::usb_info()`
+/// (`selfguard::live`), so an `Ahci` identity is not a candidate it evaluated and `classify` answers
+/// `Eligible` by its own explicit "do not invent a verdict" arm. That is correct for `selfguard` and
+/// wrong for this arc, because on the bench rMBP the boot volume and Catalina are on the SAME SATA
+/// disk. This asks `selfguard`'s own question — `boot_volume_serial()` against the FAT serials found
+/// on the device — through `BlockSource::Ahci`, the source `fat::volume_serials` already dispatches.
+///
+/// False when the guard is DISARMED (no boot serial in `BootInfo`), which is not "cleared": see
+/// [`sata_boot_verdict`], which prints all three states so a disarmed build is legible on the wire.
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+pub fn sata_is_boot_device(h: block::BlockHandle) -> bool {
+    let block::BlockHandle::Ahci { port } = h else { return false };
+    let Some(boot) = super::selfguard::boot_volume_serial() else { return false };
+    crate::fs::fat::volume_serials(crate::fs::fat::BlockSource::Ahci(port)).contains(&boot)
+}
+
+/// AHCIWRITE: the three-valued witness for [`sata_is_boot_device`]. `disarmed` is its own answer and
+/// must never be read as `eligible` — a guard that cannot decide has not decided (LAWS §5's
+/// three-valued rule, the same shape as a capture's unknown mode).
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+fn sata_boot_verdict(port: u8) -> &'static str {
+    match super::selfguard::boot_volume_serial() {
+        None => "disarmed",
+        Some(b) => {
+            if crate::fs::fat::volume_serials(crate::fs::fat::BlockSource::Ahci(port)).contains(&b) {
+                "boot-device"
+            } else {
+                "eligible"
+            }
+        }
+    }
 }
 
 /// The WHOLE-DISK question, asked of the same census. This is the arm that did not exist before: the
@@ -544,7 +675,36 @@ pub struct PartitionTarget<'a, T: InstallTarget> {
     sectors: u64,
     index: u32,
     id: String,
+    /// AHCIWRITE: the SATA write capability, when this target was bound to one. `None`/`()` means
+    /// every write goes to the underlying disk target exactly as it always did — which for a SATA
+    /// disk is `install/mod.rs`'s `Ahci` arm, i.e. a refusal. So a `PartitionTarget` built WITHOUT a
+    /// grant cannot write SATA even in an armed build, and that is why the field exists rather than
+    /// a global switch: the capability travels with the object that was cleared to use it.
+    ///
+    /// `allow(dead_code)` because in an UNARMED build the type is `()` and nothing reads it — which
+    /// is the correct state and not an oversight: there is no SATA write path for it to feed.
+    #[allow(dead_code)]
+    grant: MaybeGrant,
 }
+
+/// AHCIWRITE: the grant slot's type, so `PartitionTarget` has one shape in every cfg instead of a
+/// `#[cfg]`'d field and two constructors. In an armed x86 build it is a real optional capability; in
+/// every other build it is the unit type, the field is zero-sized, and [`no_grant`] is the only value
+/// that exists — so the unarmed build cannot even NAME a grant, let alone carry one.
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+pub type MaybeGrant = Option<block::WriteGrant>;
+/// See [`MaybeGrant`] above — the unarmed spelling.
+#[cfg(not(all(target_arch = "x86_64", feature = "ahci-write")))]
+pub type MaybeGrant = ();
+
+/// The empty capability. Every pre-AHCIWRITE caller passes this and behaves exactly as it did.
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+pub const fn no_grant() -> MaybeGrant {
+    None
+}
+/// See [`no_grant`] above — the unarmed spelling.
+#[cfg(not(all(target_arch = "x86_64", feature = "ahci-write")))]
+pub const fn no_grant() -> MaybeGrant {}
 
 impl<'a, T: InstallTarget> PartitionTarget<'a, T> {
     /// Bind to one entry of a census the caller has already read. Refuses an extent that escapes
@@ -556,7 +716,22 @@ impl<'a, T: InstallTarget> PartitionTarget<'a, T> {
             return Err(InstallError::BadLba);
         }
         let id = alloc::format!("part{}@{}..{}", e.index, e.first_lba, e.last_lba);
-        Ok(Self { disk, first_lba: e.first_lba, sectors: e.sectors(), index: e.index, id })
+        Ok(Self {
+            disk,
+            first_lba: e.first_lba,
+            sectors: e.sectors(),
+            index: e.index,
+            id,
+            grant: no_grant(),
+        })
+    }
+
+    /// AHCIWRITE: attach the write capability this target was cleared for. Consuming-builder shape
+    /// so a grant can only be attached at construction, never swapped into a target that is already
+    /// half way through an install.
+    pub fn with_grant(mut self, g: MaybeGrant) -> Self {
+        self.grant = g;
+        self
     }
 
     pub fn index(&self) -> u32 {
@@ -592,7 +767,20 @@ impl<T: InstallTarget> InstallTarget for PartitionTarget<'_, T> {
         self.disk.read_sectors(abs, buf)
     }
     fn write_sectors(&mut self, lba: u64, buf: &[u8]) -> Result<(), InstallError> {
+        // `map` FIRST, always: the bound check that makes invariant 1 mechanical runs before either
+        // route is chosen, so the grant below never sees an LBA the partition did not already own.
+        // The two checks are independent and they are meant to agree — a disagreement is a bug in
+        // the minting, and the grant's own refusal witness is what would print it.
         let abs = self.map(lba, buf.len())?;
+        // AHCIWRITE: the ONE write path that reaches a SATA sector. `write_sectors_granted` re-checks
+        // `abs` against the granted extent at the wire and refuses with a witness, then
+        // `ahci::write_block_at` re-checks it against the device's own capacity — three bounds in
+        // three files for one write. Without a grant this falls through to `self.disk`, which for a
+        // SATA handle is `install/mod.rs`'s arm and still refuses.
+        #[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+        if let Some(g) = self.grant {
+            return block::write_sectors_granted(&g, abs, buf).map_err(super::map_blk);
+        }
         self.disk.write_sectors(abs, buf)
     }
 }
@@ -681,9 +869,10 @@ fn write_partition<T: InstallTarget>(
     disk: &mut T,
     e: &gpt::GptEntryView,
     tree: &super::clone::SnapTree,
+    grant: MaybeGrant,
 ) -> Result<Written, InstallError> {
     let index = e.index;
-    let mut pt = PartitionTarget::new(disk, e)?;
+    let mut pt = PartitionTarget::new(disk, e)?.with_grant(grant);
     let sectors = pt.capacity_sectors();
     let part_lba = pt.first_lba();
 
@@ -761,12 +950,17 @@ pub fn install_into_partition(
     let c = census(&disk)?;
     print_census(&disk.id(), &c);
     let tree = demo_tree();
-    if let Err(r) = check_partition(&c, sel, index, tree.total_bytes, as_esp) {
-        r.say(&alloc::format!("part{}", index));
-        return Err(refusal_error(r));
-    }
+    // AHCIWRITE: `mint_grant` IS the refusal ladder plus the capability, so the operator path asks
+    // the guards exactly once and cannot reach the write without the answer it produced.
+    let grant = match mint_grant(&c, sel, index, tree.total_bytes, as_esp) {
+        Ok(g) => g,
+        Err(r) => {
+            r.say(&alloc::format!("part{}", index));
+            return Err(refusal_error(r));
+        }
+    };
     let entry = c.row(index).ok_or(InstallError::BadArg)?.entry;
-    let w = write_partition(&mut disk, &entry, &tree)?;
+    let w = write_partition(&mut disk, &entry, &tree, grant)?;
     if as_esp {
         gpt::set_entry_type_guid(&mut disk, index, &gpt::ESP_TYPE_GUID)?;
         serial_println!(":: PINSTALL: part={} type GUID set to ESP (--as-esp) ::", index);
@@ -780,7 +974,9 @@ pub fn install_into_partition(
 fn refusal_error(r: Refusal) -> InstallError {
     match r {
         Refusal::BootDevice => InstallError::BootDevice,
-        Refusal::TransportReadOnly { .. } => InstallError::NotReady,
+        Refusal::TransportReadOnly { .. } | Refusal::TransportWriteDisabled { .. } => {
+            InstallError::NotReady
+        }
         Refusal::PartitionTooSmall { .. } => InstallError::TooSmall,
         Refusal::NoSuchPartition => InstallError::BadArg,
         Refusal::PartitionForeignType { .. } => InstallError::NotBlank,
@@ -817,6 +1013,14 @@ fn head_sha<T: InstallTarget>(t: &T, e: &gpt::GptEntryView) -> Result<[u8; 32], 
 /// written here rather than left implicit because the next reader will be deciding whether to widen
 /// it, and the answer is no.
 pub fn run_fixture() -> bool {
+    // AHCIWRITE: the SATA leg is tried FIRST and takes the boot when a SATA disk carries a GPT.
+    // Selection is by CONTENT, not by a second knob (R28) — the same rule that chose between this
+    // fixture and `run_demo`. On a run with no `UNAOS_AHCI_DISK` nothing answers and the USB leg
+    // below is byte-for-byte the behaviour PARTINSTALL landed.
+    #[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+    if sata_fixture() {
+        return true;
+    }
     let Ok(mut disk) = super::BlockTarget::bind() else { return false };
     let Ok(c) = census(&disk) else {
         // No parseable GPT. Not a partition-install disk; say so once and hand the leg back.
@@ -911,7 +1115,7 @@ pub fn run_fixture() -> bool {
     }
 
     // --- THE WRITE. ---
-    let w = match write_partition(&mut disk, &entry, &tree) {
+    let w = match write_partition(&mut disk, &entry, &tree, no_grant()) {
         Ok(w) => w,
         Err(e) => {
             // `err={:?} -> FAIL ::`, not `=> FAIL ({:?}) ::`. mbench installs `-> FAIL` and `FAIL ::`
@@ -975,15 +1179,36 @@ pub fn run_fixture() -> bool {
 /// letting silence read as "SATA is allowed". A guard you cannot see is indistinguishable from one
 /// that is not there (LAWS §5), and so is a guard whose build does not contain it.
 fn transport_leg() {
-    #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+    // AHCIWRITE made this leg FOUR-valued, and each value is a different build:
+    //   no `ahci`          — the arm is not compiled; say so rather than let silence read as "allowed".
+    //   `ahci` alone       — `transport-write-disabled`, naming the knob that would add the path.
+    //   `ahci-write`       — the transport reports writable, and the refusal is GONE by design.
+    //   any of the above but the predicate disagrees with the build — `-> FAIL`.
+    // The third case is the one that used to be the failure line, so the assertion is INVERTED with
+    // the polarity rather than deleted: an armed build that still refused, or an unarmed build that
+    // did not, both red. A gate that only fires in one polarity is half a gate (LAWS §5).
+    #[cfg(all(target_arch = "x86_64", feature = "ahci", not(feature = "ahci-write")))]
     {
         let h = block::BlockHandle::Ahci { port: 0 };
         if transport_writable(h) {
             serial_println!(
-                ":: PINSTALL: SATA transport reports WRITABLE — AHCIWRITE has not landed and this must be a refusal => FAIL ::"
+                ":: PINSTALL: SATA transport reports WRITABLE without `ahci-write` — the knob is the only thing that may open it => FAIL ::"
             );
         } else {
-            Refusal::TransportReadOnly { transport: transport_name(h) }.say("disk=sata");
+            transport_refusal(h).say("disk=sata");
+        }
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+    {
+        let h = block::BlockHandle::Ahci { port: 0 };
+        if transport_writable(h) {
+            serial_println!(
+                ":: PINSTALL: SATA transport WRITABLE under `ahci-write` — no transport refusal, writes still need a grant ::"
+            );
+        } else {
+            serial_println!(
+                ":: PINSTALL: SATA transport refuses writes with `ahci-write` compiled — the knob did not reach the image => FAIL ::"
+            );
         }
     }
     #[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
@@ -1010,4 +1235,336 @@ pub fn probe_once() -> bool {
     let took = run_fixture();
     STATE.store(if took { TOOK } else { DECLINED }, Ordering::Relaxed);
     took
+}
+
+// ---------------------------------------------------------------------------------------------
+// AHCIWRITE — the SATA fixture leg. `installdemo` + `ahci-write`, x86_64 only.
+// ---------------------------------------------------------------------------------------------
+//
+// THE SAME LADDER AS THE USB LEG, OVER THE TRANSPORT THAT CAN DESTROY PETER'S DISK. It is a separate
+// function rather than a parameter on `run_fixture` because it has three obligations the USB leg does
+// not: it must ask the boot-device question `selfguard` cannot answer for a SATA handle, it must
+// fingerprint every OTHER SATA disk (the ESP the machine booted from is one of them) and prove it
+// byte-identical across the install, and it must fire the two go-reds that only exist once a grant
+// does. Everything in between — census, whole-disk refusal, per-partition refusals, the neighbours
+// baseline pinned by the FIXTURE and not by the installer's own selection — is the same ladder, and
+// the go-red finding recorded in `run_fixture` above applies here unchanged.
+
+/// How much of a non-target SATA disk is fingerprinted before and after the install. One mebibyte
+/// covers the protective MBR, both the primary GPT header and its entry array, and the head of the
+/// first partition — i.e. every structure a stray write near LBA 0 would land in.
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+const BOOTDISK_FINGERPRINT_BYTES: usize = 1024 * 1024;
+
+/// SHA-256 of the first [`BOOTDISK_FINGERPRINT_BYTES`] of a SATA disk, read DIRECTLY through the AHCI
+/// port rather than through any `InstallTarget` — deliberately: the thing under test is the install
+/// target's bounds, and a baseline taken through the object being tested is the go-red this file
+/// already records once. Chunked so no single call exceeds the block layer's per-op cap.
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+fn sata_disk_sha(port: u8) -> Option<[u8; 32]> {
+    let info = block::ahci_info_port(port)?;
+    let bs = info.block_size as usize;
+    if bs == 0 {
+        return None;
+    }
+    let want = core::cmp::min(BOOTDISK_FINGERPRINT_BYTES as u64, info.num_blocks * bs as u64) as usize;
+    let want = (want / bs) * bs;
+    if want == 0 {
+        return None;
+    }
+    let mut buf = alloc::vec![0u8; want];
+    let chunk = 64 * bs; // 32 KiB — far under MAX_BLOCKS_PER_OP, and the AHCI read is per-sector anyway
+    let mut off = 0usize;
+    while off < want {
+        let n = core::cmp::min(chunk, want - off);
+        block::read_blocks_ahci_port(port, (off / bs) as u64, &mut buf[off..off + n]).ok()?;
+        off += n;
+    }
+    Some(hash::sha256(&buf))
+}
+
+/// The first eight bytes of a digest, as one hex number — enough to compare two fingerprints by eye
+/// in a serial window, and the full comparison is done in code, not by the reader.
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+fn sha_head(s: &[u8; 32]) -> u64 {
+    u64::from_be_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])
+}
+
+/// The SATA leg. Returns `true` when it took the boot (a SATA disk carried a parseable GPT), `false`
+/// when no SATA disk answered — in which case `run_fixture` falls through to the USB leg exactly as
+/// it did before this arc, and a run with no `UNAOS_AHCI_DISK` is unchanged.
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+fn sata_fixture() -> bool {
+    // --- CENSUS OF THE CONTROLLER, before any disk is chosen. Every published port gets a line with
+    //     its boot-device verdict, THREE-VALUED: a disarmed guard is not a cleared one.
+    let mut ports: Vec<u8> = Vec::new();
+    for ix in 0..block::MAX_AHCI_DISKS {
+        let Some(port) = block::ahci_port_at(ix) else { continue };
+        let sectors = block::ahci_info_ix(ix).map(|i| i.num_blocks).unwrap_or(0);
+        serial_println!(
+            ":: PINSTALL: sata disk ix={} port={} sectors={} install-self={} ::",
+            ix,
+            port,
+            sectors,
+            sata_boot_verdict(port)
+        );
+        ports.push(port);
+    }
+    if ports.is_empty() {
+        return false;
+    }
+
+    // --- CHOOSE THE DISK BY CONTENT, and refuse the rest by name. A disk that is the boot device is
+    //     refused BEFORE its GPT is even parsed — "this is the disk you are running from" outranks
+    //     every other reason, exactly as `check_partition`'s ladder orders it.
+    let mut chosen: Option<(u8, super::BlockTarget, Census)> = None;
+    for &port in &ports {
+        let Some(info) = block::ahci_info_port(port) else { continue };
+        let id = info.id(block::BlockHandle::Ahci { port });
+        if sata_is_boot_device(id.handle) {
+            Refusal::BootDevice.say(&alloc::format!("disk=sata-port{}", port));
+            continue;
+        }
+        let Ok(disk) = super::BlockTarget::bind_id(id) else {
+            serial_println!(":: PINSTALL: sata port={} bind refused — not in the live registry ::", port);
+            continue;
+        };
+        match census(&disk) {
+            Ok(c) => {
+                if chosen.is_none() {
+                    chosen = Some((port, disk, c));
+                } else {
+                    serial_println!(":: PINSTALL: sata port={} also carries a GPT (not selected) ::", port);
+                }
+            }
+            Err(_) => serial_println!(
+                ":: PINSTALL: sata port={} carries no parseable GPT — not a partition-install disk ::",
+                port
+            ),
+        }
+    }
+    let Some((port, mut disk, c)) = chosen else { return false };
+
+    let id_str = disk.id();
+    let sel = disk.identity();
+    serial_println!(":: PINSTALL: fixture start — SATA port={} carries a valid GPT ::", port);
+    print_census(&id_str, &c);
+
+    let tree = demo_tree();
+
+    // --- REFUSAL 1: the whole disk. Same expectation as the USB leg: the fixture carries foreign
+    //     volumes, so an ACCEPT here is the failure.
+    match check_whole_disk(&c) {
+        Err(r) => r.say("disk"),
+        Ok(()) => {
+            serial_println!(
+                ":: PINSTALL: whole-disk target ACCEPTED on a disk with no foreign volumes — the fixture expects a refusal here => FAIL ::"
+            );
+            return true;
+        }
+    }
+
+    // --- REFUSALS 2..n: every partition, each by its own reason.
+    let mut target: Option<gpt::GptEntryView> = None;
+    for row in &c.rows {
+        match check_partition(&c, sel, row.entry.index, tree.total_bytes, false) {
+            Err(r) => r.say(&alloc::format!("part{}", row.entry.index)),
+            Ok(()) => {
+                if target.is_none() {
+                    target = Some(row.entry);
+                    serial_println!(
+                        ":: PINSTALL: part={} passes every guard — fixture names it the target ::",
+                        row.entry.index
+                    );
+                } else {
+                    serial_println!(":: PINSTALL: part={} also eligible (not selected) ::", row.entry.index);
+                }
+            }
+        }
+    }
+
+    transport_leg();
+
+    let Some(entry) = target else {
+        serial_println!(":: PINSTALL: no eligible partition on this SATA disk => FAIL ::");
+        return true;
+    };
+
+    // The fixture states its own expectation — see the go-red paragraph in `run_fixture`.
+    const FIXTURE_TARGET_INDEX: u32 = 2;
+    if entry.index != FIXTURE_TARGET_INDEX {
+        serial_println!(
+            ":: PINSTALL: selection part={} but the fixture built part{} as the only writable slot => FAIL ::",
+            entry.index, FIXTURE_TARGET_INDEX
+        );
+    }
+
+    // --- BASELINES, all taken BEFORE the grant exists. Neighbour partitions on the target disk, and
+    //     the whole first mebibyte of every OTHER SATA disk — which on this fixture is the ESP the
+    //     machine booted from, the one disk no install may touch under any circumstances.
+    let mut before: Vec<(u32, [u8; 32])> = Vec::new();
+    for row in &c.rows {
+        if row.entry.index == FIXTURE_TARGET_INDEX {
+            continue;
+        }
+        match head_sha(&disk, &row.entry) {
+            Ok(s) => before.push((row.entry.index, s)),
+            Err(e) => {
+                serial_println!(":: PINSTALL: neighbour part={} pre-read failed ({:?}) => FAIL ::", row.entry.index, e);
+                return true;
+            }
+        }
+    }
+    let mut disks_before: Vec<(u8, [u8; 32])> = Vec::new();
+    for &p in &ports {
+        if p == port {
+            continue;
+        }
+        match sata_disk_sha(p) {
+            Some(s) => {
+                serial_println!(
+                    ":: PINSTALL: other-disk port={} sha1MiB={:#018x} (pre) ::",
+                    p,
+                    sha_head(&s)
+                );
+                disks_before.push((p, s));
+            }
+            None => serial_println!(":: PINSTALL: other-disk port={} pre-fingerprint unavailable ::", p),
+        }
+    }
+
+    // --- THE CAPABILITY. Everything above was read-only; this is the first moment a SATA write is
+    //     possible at all, and it is possible only for `entry`'s LBA range.
+    let grant = match mint_grant(&c, sel, entry.index, tree.total_bytes, false) {
+        Ok(g) => g,
+        Err(r) => {
+            r.say(&alloc::format!("part{}", entry.index));
+            serial_println!(":: PINSTALL: grant refused for the slot the ladder just cleared -> FAIL ::");
+            return true;
+        }
+    };
+    if grant.is_none() {
+        serial_println!(":: PINSTALL: no grant minted for a SATA target — the write path is unreachable -> FAIL ::");
+        return true;
+    }
+
+    // --- GO-RED (b), BEFORE the write: the PLAIN path must still refuse. `BlockTarget`'s `Ahci`
+    //     write arm is the door every non-granted caller uses (shell verbs, the FAT writer, the
+    //     whole-disk engine), and arming the knob must not have opened it. Asked with the target's
+    //     OWN first sector, i.e. the most legitimate-looking write in the whole run.
+    {
+        let zero = [0u8; SECTOR];
+        match disk.write_sectors(entry.first_lba, &zero) {
+            Err(InstallError::NotReady) => serial_println!(
+                ":: PINSTALL: go-red(b) plain write_sectors on the SATA handle lba={} => NotReady, refused ::",
+                entry.first_lba
+            ),
+            other => serial_println!(
+                ":: PINSTALL: go-red(b) plain write_sectors on the SATA handle returned {:?}, expected NotReady -> FAIL ::",
+                other
+            ),
+        }
+    }
+
+    // --- THE WRITE, through the grant.
+    let w = match write_partition(&mut disk, &entry, &tree, grant) {
+        Ok(w) => w,
+        Err(e) => {
+            serial_println!(":: PINSTALL: write part={} err={:?} -> FAIL ::", entry.index, e);
+            return true;
+        }
+    };
+    if w.verified != w.files || w.files == 0 {
+        serial_println!(
+            ":: PINSTALL: wrote part={} fat32 tree={} bytes={} verified={}/{} -> FAIL ::",
+            w.index, w.files, w.bytes, w.verified, w.files
+        );
+        return true;
+    }
+    serial_println!(
+        ":: PINSTALL: wrote part={} fat32 tree={} bytes={} verified={}/{} -> PASS ::",
+        w.index, w.files, w.bytes, w.verified, w.files
+    );
+
+    // --- GO-RED (a): one LBA past the grant. The sector immediately after the target partition is
+    //     the NEXT partition's first sector, so this is not a synthetic address — it is the byte a
+    //     real off-by-one would destroy. Fingerprint it, ask for the write, expect the refusal
+    //     witness, fingerprint again: refused AND nothing moved are two different claims.
+    if let Some(g) = grant {
+        let past = g.last_lba() + 1;
+        let victim = c.rows.iter().find(|r| r.entry.first_lba == past).map(|r| r.entry);
+        let vsha = victim.as_ref().and_then(|e| head_sha(&disk, e).ok());
+        let payload = [0xA5u8; SECTOR];
+        let rc = block::write_sectors_granted(&g, past, &payload);
+        let refused = rc.is_err();
+        let intact = match (victim.as_ref(), vsha) {
+            (Some(e), Some(s0)) => head_sha(&disk, e).map(|s1| s1 == s0).unwrap_or(false),
+            _ => true, // no neighbour at that LBA on this fixture; the refusal is the whole claim
+        };
+        serial_println!(
+            ":: PINSTALL: go-red(a) write lba={} (grant {}..{}) refused={} neighbour-intact={} -> {} ::",
+            past,
+            g.first_lba(),
+            g.last_lba(),
+            refused as u8,
+            intact as u8,
+            if refused && intact { "PASS" } else { "FAIL" }
+        );
+    }
+
+    // --- RE-CENSUS and the neighbours.
+    let Ok(after_census) = census(&disk) else {
+        serial_println!(":: PINSTALL: post-write census — GPT no longer parses => FAIL ::");
+        return true;
+    };
+    print_census(&id_str, &after_census);
+
+    let mut untouched = 0usize;
+    for (index, sha) in &before {
+        let Some(row) = after_census.row(*index) else {
+            serial_println!(":: PINSTALL: neighbour part={} vanished from the table => FAIL ::", index);
+            return true;
+        };
+        match head_sha(&disk, &row.entry) {
+            Ok(now) if &now == sha => untouched += 1,
+            Ok(_) => serial_println!(":: PINSTALL: neighbour part={} CHANGED across the install ::", index),
+            Err(e) => serial_println!(":: PINSTALL: neighbour part={} post-read failed ({:?}) ::", index, e),
+        }
+    }
+    if untouched == before.len() {
+        serial_println!(":: PINSTALL: neighbours untouched={}/{} -> PASS ::", untouched, before.len());
+    } else {
+        serial_println!(":: PINSTALL: neighbours untouched={}/{} -> FAIL ::", untouched, before.len());
+    }
+
+    // --- THE BOOT DISK. The ESP this kernel booted from is on the same controller, and the claim is
+    //     not "we did not select it" but "its bytes did not move".
+    let mut disks_same = 0usize;
+    for (p, s0) in &disks_before {
+        match sata_disk_sha(*p) {
+            Some(s1) if &s1 == s0 => {
+                disks_same += 1;
+                serial_println!(
+                    ":: PINSTALL: other-disk port={} sha1MiB={:#018x} (post) UNCHANGED ::",
+                    p,
+                    sha_head(&s1)
+                );
+            }
+            Some(s1) => serial_println!(
+                ":: PINSTALL: other-disk port={} sha1MiB {:#018x} -> {:#018x} CHANGED ::",
+                p,
+                sha_head(s0),
+                sha_head(&s1)
+            ),
+            None => serial_println!(":: PINSTALL: other-disk port={} post-fingerprint unavailable ::", p),
+        }
+    }
+    serial_println!(
+        ":: PINSTALL: sata other-disks untouched={}/{} -> {} ::",
+        disks_same,
+        disks_before.len(),
+        if disks_same == disks_before.len() { "PASS" } else { "FAIL" }
+    );
+
+    true
 }
