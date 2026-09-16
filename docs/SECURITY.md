@@ -718,6 +718,13 @@ Three structural properties sit under the table, each mechanical rather than arg
 - **Verification is by content, never by return code.** Every file is re-read off the medium at the
   exact extents the writer recorded and SHA-256-checked (the rule `install/clone.rs` already carried
   for the Pi self-clone).
+- **INSTALLVERB: the whole-disk engine is unreachable from the operator's two faces on any disk that
+  carries a foreign volume.** The shell verb has no whole-disk spelling at all — `install` is a
+  read-only census and `install <disk> <slot>` names one partition, so the grammar cannot express
+  the sentence R25 forbids; and `video/instgui.rs`'s go-button is now a census first, offering the
+  whole-disk demo only when `check_whole_disk` passes on the chosen disk, asked at the affordance and
+  asked again at the go. `run_demo`'s unattended fixture keeps the reach it always had, behind
+  `installdemo` and a disk the build attached for it.
 
 **What the installer still does NOT do, and must not be read as doing.** It does not write to SATA —
 AHCIWRITE is a separate rung and the rMBP's internal SSD is a live disk. It does not make anything

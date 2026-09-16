@@ -25,3 +25,8 @@ std = []
 # forwarded by the kernel's `login` feature (`login = ["midden_core/login"]`), so a knob-off image
 # carries the pre-LOGIN table byte for byte (`./arroyo knoboff login`). Default OFF.
 login = []
+# INSTALLVERB (rmbp-ledger B89 fourth rung, B91): the `install` host verb — the operator path to the
+# partition installer — exists where the installer engine is built, forwarded by the kernel's
+# `installdemo` feature (`installdemo = ["midden_core/installdemo"]`), so a knob-off image carries the
+# pre-INSTALLVERB table byte for byte. Same shape as `login` above. Default OFF.
+installdemo = []

@@ -2113,7 +2113,7 @@ desktop_firmware = []
 # The engine refuses to write unless the target's leading sectors are blank (never-touch-a-seated-card
 # discipline). Default OFF => the module + call site vanish and every image is byte-identical to
 # baseline. See docs/dev/OS/10_INSTALL/installer_engine.md.
-installdemo = []
+installdemo = ["midden_core/installdemo"] # INSTALLVERB: forwards `midden_core/installdemo` so the `install` HOST_VERBS row exists ONLY knob-on — the same shape, and for the same reason, as `login = ["midden_core/login"]` above. A knob-off image carries the pre-INSTALLVERB verb table byte for byte.
 
 # INSTALL-PI: the `UNAOS_PIINSTALL` family — the installer engine's first LIVE end-to-end execution, on
 # the Pi 4 emmc2 microSD target (crates/kernel/src/install/pi.rs), provable in QEMU raspi4b (which models
