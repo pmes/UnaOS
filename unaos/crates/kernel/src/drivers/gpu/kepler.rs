@@ -3845,6 +3845,31 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                         }
                                     }
 
+                                    // KFUNWEDGE (register §2 rung KF29) — the un-wedge experiment, and its
+                                    // placement is the strongest ordering contract in this file after the
+                                    // terminal poke's own. It is the LAST kepler statement that READS the
+                                    // FECS unit, sitting immediately above the poke block below, because
+                                    // its stimulus is not merely an unproven offset — it is `0x409504`
+                                    // itself, the offset falcon_microcode_spec.md §5.4 is NAMED for, read
+                                    // ON PURPOSE. §5.4's rule is "put unproven offsets last, after every
+                                    // proven read has completed", and here that is literal: every display
+                                    // leg, every FIFO verdict, the ucode and heartbeat legs, the recon
+                                    // block, bar1-identity and both halves of KF27/KF28 are already
+                                    // complete and already printed when this fires.
+                                    //
+                                    // ⚠ A KFUNWEDGE BOOT IS SACRIFICIAL, AND IT CHANGES THE POKE BELOW.
+                                    // The Kepler drives this machine's panel, so a wedged PRI ring may
+                                    // take the display until a POWER CYCLE; fly the rung LAST in a sitting
+                                    // and ALONE (never with BEAMX86, KDHEAD, UNAOS_KEPLER_KFBIND or
+                                    // UNAOS_KEPLER_KFCTXBIND). And the terminal poke's own evidence — §10:
+                                    // "the LAST kepler statement", with the write's meaning resting on its
+                                    // being the boot's only access to the offset — is VOID on this boot,
+                                    // because the read above it came first. The `fecs-ledger` line prints
+                                    // `504_read_idx` and `504_write_idx` so the capture STATES that
+                                    // ordering rather than leaving a reader to assume it.
+                                    #[cfg(feature = "nvidia-kepler-kfunwedge")]
+                                    crate::drivers::gpu::kepler_fifo::unwedge::kfunwedge(bar0);
+
                                     // ================= TERMINAL POKE — MUST BE LAST =================
                                     // ⛔ ORDERING CONTRACT. This is the LAST kepler statement of the
                                     // boot. Nothing below it, and nothing later in `init()`, may touch
@@ -4050,6 +4075,32 @@ pub fn fecs_write(bar0: usize, offset: usize, val: u32) {
         );
     }
     unsafe { core::ptr::write_volatile((bar0 + offset) as *mut u32, val) }
+}
+
+/// KFUNWEDGE (shut-out register §2 rung KF29) — the FECS access ledger, as one read.
+///
+/// Returns `(accesses, first_offset, read_504_touched, read_504_index,
+/// write_504_touched, write_504_index)`: the same six values the `fecs-ledger` line prints
+/// at the end of the boot, taken BEFORE the rung fires its deliberate `0x409504` read.
+///
+/// It exists so KFUNWEDGE's `pre` line can state, on the wire, that nothing above it had
+/// already poisoned the unit — a "before" reading taken after someone else's fault is an
+/// "after" reading wearing the wrong label, which is exactly the confusion `falcon_microcode_
+/// spec.md` §5.4 was written to stop. The six statics are `pub` and could be loaded
+/// individually; one accessor keeps the six loads adjacent and keeps the rung from growing a
+/// second opinion about which of them matter.
+///
+/// `pub(crate)` and feature-gated: default OFF unlinks it with the rung it serves.
+#[cfg(feature = "nvidia-kepler-kfunwedge")]
+pub(crate) fn fecs_poison_ledger() -> (u32, u32, bool, u32, bool, u32) {
+    (
+        FECS_ACCESS_COUNT.load(Ordering::SeqCst),
+        FECS_FIRST_OFFSET.load(Ordering::SeqCst),
+        FECS_504_READ_TOUCHED.load(Ordering::SeqCst),
+        FECS_504_READ_INDEX.load(Ordering::SeqCst),
+        FECS_504_WRITE_TOUCHED.load(Ordering::SeqCst),
+        FECS_504_WRITE_INDEX.load(Ordering::SeqCst),
+    )
 }
 
 pub unsafe fn mmio_read(base: usize, offset: usize) -> u32 {

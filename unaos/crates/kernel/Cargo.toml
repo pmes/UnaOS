@@ -155,6 +155,37 @@ nvidia-kepler-kfbind = ["nvidia-kepler", "nvidia-kepler-fifo"]
 # to the one that shipped before this rung, which is why the rung is an inner gated module).
 # Kept in sync with arroyo AND builder/src/main.rs.
 nvidia-kepler-kfctxbind = ["nvidia-kepler", "nvidia-kepler-fifo"]
+# KFUNWEDGE (shut-out register §2 rung KF29): the UN-WEDGE EXPERIMENT, and the only rung in this
+# tree that DELIBERATELY BREAKS THE HARDWARE IT IS MEASURING. §2's KF21 row has said the same thing
+# for ten sittings: "the poison register is writable without consequence to the boot. Reading it
+# first is what poisons; writing it last is harmless. The un-wedge experiment ('does a PRING clear
+# recover the unit?') remains UNEXERCISED — nothing has ever wedged on a boot that went looking."
+# The instrument was designed and LANDED once (pull 30, 0e26447e) and flew at s34, where all five
+# probed offsets read clean, so the un-wedge half never executed and the code was later removed.
+# The missing ingredient was never the clear; it was a wedge that fires ON PURPOSE. So this rung,
+# in order: (1) a read-only baseline of the PRING fault words this tree has cited — PBUS_INTR
+# (0x1100, read 0000000C and W1C'd on this part at s33) and the PIBUS trio 0x120120/0x120124/
+# 0x120128 (all read real 00000000 at s33) — plus cpuctl, mailbox0 and the out-of-unit control;
+# (2) EXACTLY ONE host read of 0x409504 (WRCMD_CMD), the access falcon_microcode_spec.md §5.4 is
+# named for, through kepler::fecs_read so the campaign's own access ledger counts it; (3) an
+# OBSERVE pass — do the fault bits reach the ring, does the unit return poison for everything, and
+# is NV_PMC_BOOT_0 (outside the unit) still real, which is what BOUNDS the damage; (4) a CLEAR that
+# writes back EXACTLY the bits read as SET, a clear in a W1C register and a no-op by construction in
+# a plain RW one, skipped with its reason when nothing is latched; (5) a RE-READ scoring UNWEDGED /
+# STILL-POISONED / POISON-CONFINED / NOT-POISONED / VOID-*, every arm naming its conditions (R19).
+# ⚠ SACRIFICIAL. The Kepler drives the rMBP panel, so the operator may LOSE THE DISPLAY until a
+# POWER CYCLE, and a poison is NOT RESTORABLE — the rung reports `restored=IMPOSSIBLE` rather than a
+# success echo that cannot fail. Fly it LAST in a sitting and ALONE. DELIBERATELY DOES NOT IMPLY
+# `nvidia-kepler-kfbind` OR `nvidia-kepler-kfctxbind`: a boot carrying either would collect its
+# verdict over a unit this rung wedged, so KF27's base ladder is re-evaluated at RUNTIME (read-only)
+# and the rung prints `skipped reason=kf27-base-unresolved` when it does not favour a derived base.
+# Implies `nvidia-kepler` AND `nvidia-kepler-fifo` — the call site is inside `kepler::init`'s fifo
+# leg, immediately above the terminal poke. DEFAULT OFF => `mod unwedge`, the call site, the
+# `fecs_poison_ledger` accessor in kepler.rs and every `:: KFUNWEDGE:` string are unlinked and media
+# are byte-identical (and a KFBIND-only or KFCTXBIND-only build is byte-identical to the one that
+# shipped before this rung, which is why the rung is an inner gated module).
+# Kept in sync with arroyo AND builder/src/main.rs.
+nvidia-kepler-kfunwedge = ["nvidia-kepler", "nvidia-kepler-fifo"]
 # WC-X86: bring the window compositor (`video::wm`) up on the x86 panel path. Compiles
 # `video/desktop_uefi.rs` — the activation seam and the one kernel-drawn demo window — plus fbcon's
 # CONSOLE-WINDOW route (`panel_console_window_open`: the kernel console becomes an ordinary row in

@@ -549,6 +549,25 @@ fn main() {
     // crates/kernel/Cargo.toml; `./arroyo check`'s KNOB→BUILDER WIRING CHECK goes red if this line
     // is dropped. DEFAULT OFF => mod ctxbind and both call sites unlinked => byte-identical media.
     if std::env::var("UNAOS_KEPLER_KFCTXBIND").is_ok() { feats.push("nvidia-kepler-kfctxbind"); }
+    // KFUNWEDGE (shut-out register §2 rung KF29): UNAOS_KEPLER_KFUNWEDGE=1 arms THE UN-WEDGE
+    // EXPERIMENT at drivers/gpu/kepler_fifo.rs `mod unwedge` — a baseline of the cited PRING fault
+    // words (PBUS_INTR 0x1100 and the PIBUS trio), then EXACTLY ONE deliberate host read of
+    // 0x409504 (the offset falcon_microcode_spec.md §5.4 is named for), then an observe pass with
+    // NV_PMC_BOOT_0 as the out-of-unit control, then a W1C of exactly the bits read as SET, then a
+    // cpuctl re-read scored UNWEDGED / STILL-POISONED / POISON-CONFINED / NOT-POISONED / VOID-*.
+    // ⚠⚠ THIS KNOB SHIPS A SACRIFICIAL BOOT: the Kepler drives the rMBP panel, the operator may
+    // lose the display until a POWER CYCLE, and a poison is NOT restorable (`restored=IMPOSSIBLE`).
+    // Fly it LAST and ALONE — never with BEAMX86, KDHEAD, KFBIND or KFCTXBIND aboard.
+    // THIS list is what reaches the kernel binary for MEDIA builds, and this knob is the worst case
+    // the KNOB→BUILDER WIRING CHECK exists for: a knob wired into arroyo alone would put
+    // `nvidia-kepler-kfunwedge` in the banner and not one `:: KFUNWEDGE:` string in the image — and
+    // the operator would have spent a sacrificial boot, and possibly the panel, on a build that
+    // never carried the rung (BEAMX86's failure mode, and BAR1WEDGE's, KFBIND's and KFCTXBIND's
+    // above, at its most expensive). Kept in sync with arroyo AND crates/kernel/Cargo.toml;
+    // `./arroyo check`'s KNOB→BUILDER WIRING CHECK goes red if this line is dropped. DEFAULT OFF =>
+    // mod unwedge, the call site and kepler.rs's `fecs_poison_ledger` accessor unlinked =>
+    // byte-identical media.
+    if std::env::var("UNAOS_KEPLER_KFUNWEDGE").is_ok() { feats.push("nvidia-kepler-kfunwedge"); }
     // R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
     // (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only; pure measurement,
     // no scheduling/locking/present change. x86_64-only in effect; DEFAULT OFF => empty inline shims,

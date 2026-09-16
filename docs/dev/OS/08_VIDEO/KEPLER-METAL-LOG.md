@@ -258,6 +258,156 @@ only under a host that had never run FECS ucode, and this is the boot that puts 
 condition. They write and restore their own registers; this rung writes nothing, so its `writes=0`
 claim is about ITSELF and the boot's restore ledger is theirs to carry.
 
+## PENDING METAL — KFUNWEDGE (shut-out register §2, rung KF29): ⚠ A SACRIFICIAL BOOT — fire the `0x409504` poison ON PURPOSE, then see whether a PRING clear recovers the unit
+
+**Nothing below is a metal fact.** It is the witness the next flight scores, written down before the
+flight so the scoring cannot drift into the reading. Build knob: add `UNAOS_KEPLER_KFUNWEDGE=1` to
+the flight line, on top of `UNAOS_KEPLER=1 UNAOS_KEPLER_FIFO=1` (the feature implies both in Cargo,
+but the *call site* is inside `kepler::init`'s fifo leg, so `UNAOS_KEPLER_FIFO` must be on the line
+to REACH it).
+
+**⚠⚠ THE SACRIFICIAL-BOOT RULE. READ IT BEFORE THE FLIGHT IS PLANNED, NOT BEFORE IT IS SCORED.**
+
+This is the only rung in the tree that deliberately breaks the hardware it is measuring. It performs
+one host READ of `0x409504` (`WRCMD_CMD`) on purpose. `falcon_microcode_spec.md` §5.4 — the poison
+law — says what that does: *the first access faults immediately and wedges every subsequent read in
+the FECS unit for the rest of the boot.* s31 discovered it, s32 proved it with its own control frame
+(`recon-pre cpuctl=00000000` real, `recon-post cpuctl=BADF1000`, the same register microseconds
+apart), s34 convicted the offset by elimination.
+
+1. **THE OPERATOR MAY LOSE THE PANEL, AND THE RECOVERY IS A POWER CYCLE, NOT A REBOOT.** On this
+   machine the Kepler *is* the display: the x86 compositor's ignition is the Kepler takeover. A
+   wedged PRI ring on the GPU driving the screen may take the glass with it. **The serial capture is
+   the deliverable; expect nothing from the panel.** Have the power button ready and do not read a
+   dark screen as a new failure.
+2. **FLY IT LAST IN THE SITTING, AND ALONE.** Never with BEAMX86, KDHEAD, `UNAOS_KEPLER_KFBIND`
+   (KF27) or `UNAOS_KEPLER_KFCTXBIND` (KF28) on the same boot. Every verdict collected after this
+   rung is void by §5.4, and each of those rungs prints a conditions string that would be written
+   over a boot this one had already poisoned. The code enforces the ORDERING inside the boot (the
+   call site is the last kepler statement before the terminal poke, so every proven read of the boot
+   has already completed and printed); it cannot enforce the operator's knob set. That is this rule.
+3. **A POISON IS NOT RESTORABLE.** The rung reports `restored=IMPOSSIBLE`, not `restored=n/a` and
+   not `restored=Y`. There is no write that un-reads a read. The two W1C write-backs it does perform
+   are clears of latched fault bits, not a restore of the poison, and the rung never claims
+   otherwise — a restore line on a damage that cannot be undone is a success echo that cannot fail.
+4. **THE TERMINAL POKE'S OWN DATUM IS VOID ON THIS BOOT.** `falcon_microcode_spec.md` §10 evidences
+   the terminal `fecs_write(0x409504, 0)` by its being the boot's *only* access to that offset. Here
+   the read comes first. The `fecs-ledger` line prints `504_read_idx=` and `504_write_idx=` so the
+   capture states the ordering instead of leaving a reader to assume it; score the poke's line as
+   VOID on any KFUNWEDGE flight.
+
+**⭐ Why this is owed, and why it has never been done.** §2's KF21 row has said the same sentence for
+ten sittings: *"the poison register is writable without consequence to the boot. Reading it first is
+what poisons; writing it last is harmless. The un-wedge experiment ('does a PRING clear recover the
+unit?') remains UNEXERCISED — nothing has ever wedged on a boot that went looking."* The instrument
+was designed and LANDED once — pull 30 (`0e26447e`), a safest-first chain that would, on the first
+`BADF`, read the PRING fault registers, W1C them and re-read `cpuctl`. It flew at s34 and **all five
+probed offsets read clean**, so the un-wedge half never executed and the code was later removed.
+s33boot1 recorded the same miss in one sentence: *"nothing wedged this boot, so 'PRING clear recovers
+the unit' was not exercised; it needs a boot where the poison deliberately fires."* **The missing
+ingredient was never the clear. It was a wedge that fires on purpose.**
+
+**THE LINES TO SCORE**, in the order they print. The rung is a single call, last before the poke.
+
+```
+:: KFUNWEDGE: begin knob=UNAOS_KEPLER_KFUNWEDGE rung=KF29 … restored=IMPOSSIBLE… sacrificial=YES ::
+:: KFUNWEDGE: base class=<BASE CLASS> derived_n=… legacy_answers=… ctl=held …
+    ── if the class is not DERIVED-WINS or BOTH-ANSWER, the next two lines are the LAST, and
+       NOTHING WAS POISONED — the boot is spent but the unit is intact: ──
+:: KFUNWEDGE: skipped reason=kf27-base-unresolved class=… ::
+:: KFUNWEDGE: end rung=KF29 skipped=kf27-base-unresolved … -> NOT-RUN ::
+:: KFUNWEDGE: pring pre <name>=<val> <cls> addr=… cls=[…] ::                    (x5)
+:: KFUNWEDGE: pring pre pbus_intr_bits raw=… bit2_MMIO_RING_ERR=… bit3_MMIO_FAULT=… ::
+:: KFUNWEDGE: pre pring=0x… cpuctl=0x… mailbox0=0x… ctl=0x… sentinel_504_read=n … ::
+:: KFUNWEDGE: poke-pre about-to-read=0x409504 rung-cited=KF21/KF20 … ::
+:: KFUNWEDGE: poke read=0x409504 value=… <cls> poisoned=<yes|no> family=… ::
+:: KFUNWEDGE: pring post-poke … (x5 + the bits line)
+:: KFUNWEDGE: observe pring=0x… pring_moved=… cpuctl=… mailbox0=… ctl=… unit_poisoned=… control_poisoned=… ::
+:: KFUNWEDGE: clear write=pring_clear_<reg> addr=… w1c=… ::   or
+:: KFUNWEDGE: skipped write=pring_clear_<reg> reason=nothing-latched … ::       (x2 total)
+:: KFUNWEDGE: pring post-clear … (x5 + the bits line)
+:: KFUNWEDGE: verdict base=… poke=… pring a->b->c cpuctl a->b->c … clear={written=n skipped=n} restored=IMPOSSIBLE -> <VERDICT> under {…} ::
+:: KFUNWEDGE: end rung=KF29 poisoned=… clear=… unwedged=… writes=… restored=IMPOSSIBLE ::
+        … then the fecs-ledger line and the TERMINAL POKE, whose datum is VOID here …
+```
+
+**What each outcome means — pre-registered, so the flight cannot be read after the fact.**
+
+*The gate (`base class=`), inherited from KF27 and evaluated read-only on this boot:*
+
+| outcome | reading |
+| --- | --- |
+| `DERIVED-WINS` / `BOTH-ANSWER` | the gate OPENS and the experiment runs |
+| anything else | `skipped reason=kf27-base-unresolved`. **Nothing was measured and, more importantly, NOTHING WAS POISONED** — `0x409504` was not read, the unit is intact, and this boot was not the sacrificial one. Fly KF27 first and come back |
+
+*The stimulus (`poke … poisoned=`):*
+
+| outcome | reading |
+| --- | --- |
+| `poisoned=yes` | the read returned a `BAD0`/`BADF`-family word, which is the nonexistent-PRI-register signature (§5.4, s25) and exactly what s31/s32/s34 read at this offset. The experiment is live |
+| `poisoned=no` | **the poison law did not fire on this boot.** Louder than an un-wedge would have been: three sittings saw it fire on first access, so a clean read here names a CONDITION those three boots did not share, and the register row must be re-scored around it rather than the rung called a failure (R19) |
+
+*The spread (`unit_poisoned=` / `control_poisoned=`), which is the reading s31 inferred and never took:*
+
+| outcome | reading |
+| --- | --- |
+| `unit_poisoned=Y control_poisoned=n` | the damage is BOUNDED TO THE FECS UNIT: `cpuctl`/`mailbox0` are `BADF` while `NV_PMC_BOOT_0`, outside the unit, still returns a real chip ID. s31 inferred this from a PFIFO witness line; this reads it directly, in the same breath |
+| `control_poisoned=Y` | **`-> VOID-CONTROL`.** The whole BAR0 path is down, not the unit. This rung cannot tell a wedged ring from a dead link and says nothing about the un-wedge; every line after the observe step is worthless |
+
+*The ring (`pring_moved=` and the tagged bits), the thing s33's `PBUS_INTR=0x0000000C` never had a control for:*
+
+| outcome | reading |
+| --- | --- |
+| `pring_moved=Y` with bit 2 `MMIO_RING_ERR` newly SET | the fault REACHES the PRI ring's own reporting register. s33's latched `0x0C` is explained, `PBUS_INTR` is promoted from "latched something, meaning TBD" to an instrument, and the `[EXT]` bit names (envytools `docs/hw/bus/pbus.rst`, via PROPOSAL-pull30) are corroborated on this part |
+| `pring_moved=n` with `unit_poisoned=Y` | the unit faults and the ring reports nothing. `PBUS_INTR`/PIBUS are then the WRONG instrument for this fault class on GK107 — a real finding, and one no boot has been able to state |
+
+*The verdict:*
+
+| outcome | reading |
+| --- | --- |
+| `-> UNWEDGED` | the unit was POISONED at the observe step and reads REAL again after the clear. **The question KF21 opened in July is answered**: a PRING W1C recovers a GK107 FECS unit inside the boot, and every future probe of an unproven `0x409xxx` offset becomes survivable — which is worth more than any single offset's value |
+| `-> STILL-POISONED under {clear=written\|skipped, …}` | the clear did not recover it. The poison is not a latch the host can drop, and the brace names the conditions (R19: never "ruled out"). If `clear=skipped` the experiment is INCOMPLETE, not negative: nothing was latched to clear |
+| `-> POISON-CONFINED` | the read returned a fault word for ITSELF and neither `cpuctl` nor `mailbox0` followed it. That CONTRADICTS s31/s32's spread and is a per-offset finding; the clear says nothing either way because nothing was wedged |
+| `-> NOT-POISONED` | see `poisoned=no` above |
+| `-> VOID-BRACKET` / `-> VOID-CONTROL` | `NV_PMC_BOOT_0` moved across the rung, or was itself poison at the observe step. No statement is made |
+
+**Every offset this rung touches, with its class** (§0.1 vocabulary; no rnndb file was opened for
+this worktree, so every external spelling is quoted from a tree document that quotes envytools):
+
+| address | name | class | evidence |
+| --- | --- | --- | --- |
+| `0x409504` | `WRCMD_CMD` — THE STIMULUS | **[METAL s31/s32/s34]** | `falcon_microcode_spec.md` §2 (`+0x504`) and §5.4 |
+| `0x409100` | `CPUCTL` | **[METAL s26/s28/s31/s34]** | §2 (`+0x100`, rest `0x00000010`); s32's control-frame register |
+| `0x409040` | `MAILBOX0` | **[METAL s29]** | §2 (`+0x040`); a second in-unit reading so "poisoned" is not one datum |
+| `0x001100` | `PBUS_INTR` — READ **and** W1C | **[METAL s33]** + **[EXT]** name | read `0000000C` on this part at s33boot1 and W1C'd in that same boot; bits 2 `MMIO_RING_ERR` / 3 `MMIO_FAULT` from envytools `docs/hw/bus/pbus.rst` via PROPOSAL-pull30 |
+| `0x120120` / `0x120124` | `PIBUS INTR_ADDR` / `INTR_VALUE` | **[METAL s33]** + **[EXT]** name | read real `00000000` at s33boot1. **READ ONLY — never written**: they report which access faulted and are not documented as latches |
+| `0x120128` | `PIBUS INTR` — READ **and** W1C | **[METAL s33]** + **[EXT]** W1C | read real `00000000` at s33boot1; pull 30's landed chain carried exactly this conditional write-back |
+| `0x122104` | `PIBUS_MMIO_HUB_ENABLE1` | **[METAL s33]** | read `FFF9F4B0`, bit 4 already SET — the reading that refuted subunit gating (§6 refutation 5). Context only; nothing in the verdict reads it |
+| `0x000000` | `NV_PMC_BOOT_0` | **[TREE]** | the file's standard bracket, doubling here as the out-of-unit control |
+
+**The write discipline, stated once.** The only writes are W1C write-backs of bits *this boot read
+as SET*, in the two registers pull 30 named. Writing back the exact value just read is the
+least-assumptive write available: in a W1C register it clears precisely the latched bits and nothing
+else, and in a plain RW register it is a no-op by construction — so it asserts no field layout, no
+command encoding and no bit meaning beyond "these bits were set a microsecond ago", which is an
+observation of this boot rather than a citation. **A register reading ZERO is not written at all**
+(`skipped write=pring_clear_<reg> reason=nothing-latched`): there is nothing latched to clear, and a
+zero write would assert a semantics this bench has not exercised — the uncited write pull 28's
+standing ban was about.
+
+**Control that must accompany the flight image** — the rung cannot run in QEMU (q35 has no Kepler,
+so a q35 log with zero `KFUNWEDGE` lines proves nothing about the code being present), so the
+artifact is the only witness that the build carried it (s42's INSTGUI lesson, BANNERCERT's
+enforcement) — and here it is worth more than on any other rung, because a banner-only build would
+spend a SACRIFICIAL boot, and possibly the panel, on an image with no instrument in it:
+
+```
+LC_ALL=C grep -a -o -F 'KFUNWEDGE' target/x86_64_esp/kernel.elf | wc -l     # must be > 0
+```
+
+plus `nvidia-kepler-kfunwedge` in the `⚡ kernel features:` banner. A banner without the artifact
+hits is the BEAMX86 failure mode and the flight must not be flown, let alone scored.
+
 ## TREE CHANGE — SHUTRESTORE (2026-09-15): the seven deleted rungs are back behind knobs
 
 **No metal in this entry, and nothing here is a fact about silicon.** It is recorded in the metal
