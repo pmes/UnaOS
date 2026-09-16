@@ -3844,6 +3844,26 @@ was sized to 32 KiB (`U7_LAUNCH_STACK_SIZE`) while its x86 counterpart was left 
 the blanket. The repair is one call: `spawn` → `sched::spawn_stack(…, 32 * 1024)`
 at that line. Out of this arc's named files; reported, not taken.
 
+**U7XSTACK — the second task, taken (`exec-rmbp-u7xstack`, one call).** `u7x-launch`
+is now `spawn_stack(…, 32 * 1024)` at `arch/x86_64/syscall.rs:23795`, folded onto the
+one line (24179 lines before and after) and ungated by design — a size, not an
+instrument, so every x86 image moves by that one immediate and there is no knob-off
+to hold. The number is the Pi's `U7_LAUNCH_STACK_SIZE` **checked on this arch**, not
+inherited: the same `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_QEMU_FULL=1 ./arroyo test 120`
+(rc=0, full wall 130.2 s, completion at serial line 2295, MBENCH 6/6) prints **zero**
+`:: STACK: task=u7x-launch … entered ::` lines —
+`awk 'index($0,":: STACK: task=u7x-launch") && index($0,"entered ::")' target/serial.log | wc -l`
+= 0, against 1 on each of the two captures above by the same command — with the
+`:: U7x: … -> PASS ::` line present as the control that the launcher ran, and
+`:: STACK: render high=15536 of 32768 ::` still printing (22 dumps, the number above
+to the byte). The launcher gets no `high=` line of its own: `emit_stack_witness` reads
+only the task driving the ~5 s service dump, so for every task but the render service
+the guard is the instrument and its silence is the measurement. Go-red by mutation
+(32 KiB → 8 KiB, one run): `entered` at `sp=0x3340e50`, then `TRAVERSED` at
+`sp=0x3340200` and the named panic at `sched.rs:7530`, rc=1 with
+`completion=truncated` — the graduated arm exactly as designed. Reverted; the
+committed immediate is 32 KiB. B115's status carries the same numbers.
+
 **Cost.** Guard: two volatile byte reads per context switch and 4 KiB of heap per
 task, **unconditional** — a protection that only exists on witness builds does not
 protect the build that dies at the bench (§2.y's rule). High-water paint and

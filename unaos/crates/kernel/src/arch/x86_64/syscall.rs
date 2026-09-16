@@ -23792,7 +23792,7 @@ pub fn u7x_probe_once() {
     DONE.store(true, Ordering::Relaxed); // one-shot from here regardless of outcome
 
     let vcpu = crate::arch::smp::worker_cpu(1).unwrap_or(cpu);
-    crate::arch::sched::spawn("u7x-launch", u7x_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL);
+    crate::arch::sched::spawn_stack("u7x-launch", u7x_launcher, cpu, vcpu, crate::arch::sched::PRIO_NORMAL, 32 * 1024); // U7XSTACK — the launcher comes off the BLANKET 16 KiB onto 32 KiB, the twin of the Pi's `U7_LAUNCH_STACK_SIZE` (`main.rs`). MEASURED, not inherited: RENDSTACK's guard (`arch/x86_64/sched.rs`, `stack_guard_check`) caught THIS task dipping below its 16 KiB floor on its first armed run — `:: STACK: task=u7x-launch overflow guard hit … size=16384 guard=4096 entered ::` — with `ctx_rsp` back in range by park time (a TRANSIENT dip no bounds test sees), and it reproduced on the 32 KiB render run at a different address, so it is this task's property. The high-water probe reads only the task driving the ~5 s service dump (the render service), so the launcher has no `high=` line of its own: the guard's silence at 32 KiB is the measurement, quoted in `scheduler.md` §2.aa. `TASK_STACK_SIZE` untouched (sizing one deep path is the fix). ⚠ FOLDED onto the one line, call RENAMED in place: this file is 24179 lines before and after, so no panic `Location` moves. Ungated by design — a size, not an instrument.
 }
 
 // =====================================================================================================
