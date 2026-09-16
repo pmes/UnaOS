@@ -97,7 +97,7 @@ pub enum Verdict {
 struct Cand {
     /// The registry handle + geometry that name the device (compared field-wise; `BlockDeviceId` is
     /// not `PartialEq` in this tree and `drivers::block` is not ours to change).
-    usb: bool,
+    usb: bool, /** SELFGUARD-AHCI: the HBA port when this candidate is a SATA disk, `None` when it is the global/USB rung. [`Port`] is the UNIT TYPE in a knob-off build, so the field is zero-sized, the record's layout does not move, and every comparison over it is a compile-time constant. */ port: Port,
     slot_id: u8,
     num_blocks: u64,
     /// Every FAT volume serial found on the device.
@@ -113,7 +113,7 @@ static CACHE: spin::Mutex<Option<(u64, alloc::vec::Vec<Cand>)>> = spin::Mutex::n
 fn matches(c: &Cand, id: BlockDeviceId) -> bool {
     c.usb == matches!(id.handle, BlockHandle::Usb)
         && c.slot_id == id.slot_id
-        && c.num_blocks == id.num_blocks
+        && c.num_blocks == id.num_blocks && c.port == port_of(id) // SELFGUARD-AHCI: two SATA disks can share a slot id, and a SATA disk can share one with the global rung, so the port is part of the identity. `()` == `()` knob-off.
 }
 
 /// The live candidate set, built by the SAME rule the installer's chooser uses: the global block
@@ -121,22 +121,22 @@ fn matches(c: &Cand, id: BlockDeviceId) -> bool {
 /// published into both handles, and the slot test collapses them to one row). Keeping the two lists
 /// derived from one rule is what makes "the row the operator sees" and "the device the guard judged"
 /// the same thing.
-fn live() -> alloc::vec::Vec<(bool, u8, u64)> {
+fn live() -> alloc::vec::Vec<Cd> {
     let mut out = alloc::vec::Vec::new();
     if let Some(i) = block::info() {
-        out.push((false, i.slot_id, i.num_blocks));
+        out.push((false, i.slot_id, i.num_blocks, NO_PORT));
     }
     if let Some(u) = block::usb_info() {
-        if out.first().map(|&(_, s, _)| s) != Some(u.slot_id) {
-            out.push((true, u.slot_id, u.num_blocks));
+        if out.first().map(|&(_, s, _, _)| s) != Some(u.slot_id) {
+            out.push((true, u.slot_id, u.num_blocks, NO_PORT));
         }
-    }
+    } push_sata(&mut out); // SELFGUARD-AHCI: the SATA rung, APPENDED after the global/USB rungs and read out of `fat::live_sources()` — the ONE census `fs::bootdisk`'s walk already trusts, so the guard judges exactly the disks the root walk can bind. A no-op knob-off, so this call compiles to nothing there.
     out
 }
 
-fn signature(live: &[(bool, u8, u64)]) -> u64 {
-    live.iter().fold(live.len() as u64, |a, &(usb, slot, n)| {
-        a ^ ((usb as u64) << 63) ^ ((slot as u64) << 8) ^ n
+fn signature(live: &[Cd]) -> u64 {
+    live.iter().fold(live.len() as u64, |a, &(usb, slot, n, port)| {
+        mix_port(a ^ ((usb as u64) << 63) ^ ((slot as u64) << 8) ^ n, port) // SELFGUARD-AHCI: identity, not decoration — two SATA disks of equal geometry differ only by port, and a signature that cannot tell them apart serves one disk's verdict for the other. `mix_port` is the identity function knob-off.
     })
 }
 
@@ -150,8 +150,8 @@ fn scan(cache: &mut Option<(u64, alloc::vec::Vec<Cand>)>) {
 
     let boot = boot_volume_serial();
     let mut cands: alloc::vec::Vec<Cand> = alloc::vec::Vec::new();
-    for &(usb, slot_id, num_blocks) in &live {
-        let source = if usb { BlockSource::Usb } else { BlockSource::Default };
+    for &(usb, slot_id, num_blocks, port) in &live {
+        let source = source_of(usb, port);
         let serials = match boot {
             // Disarmed: do not touch the candidates at all. A guard that cannot decide anything has
             // no business reading sectors to prove it.
@@ -163,15 +163,15 @@ fn scan(cache: &mut Option<(u64, alloc::vec::Vec<Cand>)>) {
             Some(b) if serials.contains(&b) => Verdict::BootDevice,
             Some(_) => Verdict::Eligible,
         };
-        cands.push(Cand { usb, slot_id, num_blocks, serials, verdict });
+        cands.push(Cand { usb, slot_id, num_blocks, serials, verdict, port });
     }
 
     // The witness. One line per candidate at list-build time, so the log says what the operator's
     // screen is about to say — and, when the guard excludes something, WHY, in a form that can be
     // read against the media by hand.
-    let excluded = cands.iter().filter(|c| c.verdict == Verdict::BootDevice).count();
+    let excluded = cands.iter().filter(|c| c.verdict == Verdict::BootDevice).count(); census(&cands, boot); // SELFGUARD-AHCI: the census + per-candidate classify witness, emitted from the SAME scan that fills the cache every `classify` reads — so the log's list and the installer's list cannot be two different lists.
     for c in &cands {
-        let handle = if c.usb { "usb" } else { "global" };
+        let handle = label(c.usb, c.port);
         match c.verdict {
             Verdict::Disarmed => serial_println!(
                 ":: install: candidate {}/slot{} ({} sectors) — guard DISARMED, no boot serial to compare ::",
@@ -279,10 +279,10 @@ pub fn live_media_leg() {
     let live = live();
     let mut with_fat = 0usize;
     let mut excluded = 0usize;
-    for &(usb, slot_id, num_blocks) in &live {
-        let source = if usb { BlockSource::Usb } else { BlockSource::Default };
+    for &(usb, slot_id, num_blocks, port) in &live {
+        let source = source_of(usb, port);
         let serials = fat::volume_serials(source);
-        let handle = if usb { BlockHandle::Usb } else { BlockHandle::Global };
+        let handle = handle_of(usb, port);
         let verdict = classify(BlockDeviceId { handle, slot_id, num_blocks });
         if !serials.is_empty() {
             with_fat += 1;
@@ -292,13 +292,13 @@ pub fn live_media_leg() {
         }
         serial_println!(
             ":: INSTALL-SELF: live-media {}/slot{} — {} FAT volume(s) read off the device, first serial=0x{:08x}, boot=0x{:08x} => {:?} ::",
-            if usb { "usb" } else { "global" },
+            label(usb, port),
             slot_id,
             serials.len(),
             serials.first().copied().unwrap_or(0),
             boot,
             verdict
-        );
+        ); // SELFGUARD-AHCI: `handle`/`label` above now render a SATA candidate as `ahci<port>`.
     }
     if with_fat == 0 {
         serial_println!(
@@ -317,8 +317,8 @@ pub fn live_media_leg() {
     // The role-swapped exclusion check described above: real serials off real media, and the real
     // comparison. If this ever answers anything but `BootDevice`, the guard cannot exclude a boot
     // device no matter what the bootloader reports, and the whole arc is inert.
-    for &(usb, slot_id, num_blocks) in &live {
-        let source = if usb { BlockSource::Usb } else { BlockSource::Default };
+    for &(usb, slot_id, num_blocks, port) in &live {
+        let source = source_of(usb, port);
         let serials = fat::volume_serials(source);
         let Some(&first) = serials.first() else { continue };
         let swapped = decide(Some(first), &serials);
@@ -326,14 +326,14 @@ pub fn live_media_leg() {
             serial_println!(
                 ":: INSTALL-SELF: live-media exclusion (role-swapped: boot serial := 0x{:08x} read off {}/slot{}) => EXCLUDED, PASS ::",
                 first,
-                if usb { "usb" } else { "global" },
+                label(usb, port),
                 slot_id
             );
         } else {
             serial_println!(
                 ":: INSTALL-SELF: live-media exclusion (role-swapped: boot serial := 0x{:08x} read off {}/slot{}) => {:?}, expected BootDevice => FAIL ::",
                 first,
-                if usb { "usb" } else { "global" },
+                label(usb, port),
                 slot_id,
                 swapped
             );
@@ -428,10 +428,10 @@ pub fn selftest() {
             }
             let mut excluded = 0usize;
             let mut fat_seen = 0usize;
-            for &(usb, slot_id, num_blocks) in &live {
-                let handle = if usb { BlockHandle::Usb } else { BlockHandle::Global };
+            for &(usb, slot_id, num_blocks, port) in &live {
+                let handle = handle_of(usb, port);
                 let id = BlockDeviceId { handle, slot_id, num_blocks };
-                if !fat::volume_serials(if usb { BlockSource::Usb } else { BlockSource::Default })
+                if !fat::volume_serials(source_of(usb, port))
                     .is_empty()
                 {
                     fat_seen += 1;
@@ -454,3 +454,252 @@ pub fn selftest() {
         }
     }
 }
+
+// ------------------------------------------------------- SELFGUARD-AHCI (B89/B91) --
+//
+// THE DEFECT, recorded by the AHCIWRITE executor and fixed here. Before this block `live()` built
+// its candidate set from `block::info()` + `block::usb_info()` and nothing else. Since AHCIBOOT the
+// tree has `BlockHandle::Ahci { port }`, so an installer CAN be handed a SATA identity — and
+// `classify` had no candidate to match it against, so it fell to the "do not invent a verdict" arm
+// and answered **Eligible**. On the bench rMBP the boot volume and Catalina are on the SAME internal
+// SATA disk, so the graphical chooser and the whole-disk engine would both have been told the disk
+// the OS is running from is a legitimate target. AHCIWRITE worked around it inside its own partition
+// path and left the real fix owed; this is the real fix.
+//
+// THE RULE IS NOT NEW, AND THAT IS THE POINT. Nothing below decides anything about a SATA disk that
+// the USB rung was not already deciding. `decide(boot, serials)` is untouched: a candidate carrying
+// the boot volume's `BS_VolID` is the device we booted from (or a byte clone of it) and is refused;
+// anything else is eligible. All that was missing was the candidate. So the fix is an ENUMERATION
+// fix, not a policy fix, and the "do not invent a verdict" arm in `classify` stays exactly where it
+// was — for identities the census truly does not know, which is now a strictly smaller set.
+//
+// ONE CENSUS, NOT A SECOND ONE. `push_sata` reads `fat::live_sources()`, which is the list
+// `fs::bootdisk`'s root walk and `locate_boot_volume` already walk (`fs/fat.rs:1977`, with the SATA
+// rung appended by `push_ahci_sources` at `fs/fat.rs:5326`). The guard therefore judges exactly the
+// disks the root walk can bind — a disk that can become `/` can never fail to be censused here — and
+// no second enumeration exists to drift away from the first. The SATA rung is APPENDED after the
+// global/USB rungs for the reason `push_ahci_sources` gives one controller over: a machine with no
+// SATA disk gets the list it always got.
+//
+// KNOB-OFF BYTE IDENTITY, which is this arc's standing invariant. `install/selfguard.rs` is compiled
+// unconditionally (`lib.rs:93` `pub mod install;` has no cfg), so it IS in every knob-off x86 image
+// and in every aarch64 image, and a careless fix here would move `panic::Location` records across
+// two boards that never grow a SATA disk. Three things keep it honest:
+//   * Every change INSIDE an existing function is a fold onto an existing line — the file was 456
+//     lines before this block and is 456 lines plus this tail append after it, so nothing below any
+//     edit moved.
+//   * Every AHCI arm is `#[cfg(all(target_arch = "x86_64", feature = "ahci"))]` and every helper has
+//     an `#[inline(always)]` knob-off twin that is byte-for-byte the expression the call site used to
+//     contain inline (`source_of`, `handle_of`, `label`), or a no-op (`push_sata`, `census`), or the
+//     identity function (`mix_port`).
+//   * The one datum that had to be threaded through — the HBA port — is [`Port`], which is
+//     `Option<u8>` under the knob and the UNIT TYPE without it. A `()` field is zero-sized, so
+//     `Cand`'s layout does not move; `port_of` returns `()`; and `c.port == port_of(id)` is a
+//     comparison of two unit values, which is the constant `true`.
+// Measured on the fold, not asserted here (R38 floor: this seat runs `check` plus one QEMU leg).
+
+/// SELFGUARD-AHCI: the HBA port a candidate rides, or nothing at all in a build with no SATA handle.
+///
+/// The unit type is not a trick, it is the honest spelling: in a knob-off image there is no such
+/// thing as a port, and a datum that cannot exist should occupy no bytes and generate no compares.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+type Port = Option<u8>;
+/// SELFGUARD-AHCI: no SATA handle in this image, so a candidate's port is the unit value.
+#[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
+type Port = ();
+
+/// SELFGUARD-AHCI: "this candidate is not a SATA disk", in whichever spelling [`Port`] has.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+const NO_PORT: Port = None;
+/// SELFGUARD-AHCI: the knob-off spelling — the only value [`Port`] has.
+#[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
+const NO_PORT: Port = ();
+
+/// SELFGUARD-AHCI: one live candidate as [`live`] reports it — `(usb, slot_id, num_blocks, port)`.
+type Cd = (bool, u8, u64, Port);
+
+/// SELFGUARD-AHCI: the HBA port carried by an identity, if it names a SATA disk.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+fn port_of(id: BlockDeviceId) -> Port {
+    match id.handle {
+        BlockHandle::Ahci { port } => Some(port),
+        _ => None,
+    }
+}
+/// SELFGUARD-AHCI: no SATA handle exists in this image, so no identity can carry a port.
+#[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
+#[inline(always)]
+fn port_of(_id: BlockDeviceId) -> Port {}
+
+/// SELFGUARD-AHCI: fold the port into the registry signature, so two SATA disks of identical
+/// geometry are two cache entries rather than one.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+fn mix_port(a: u64, p: Port) -> u64 {
+    match p {
+        Some(port) => a ^ 0x5341_5441_0000_0000 ^ ((port as u64) << 24),
+        None => a,
+    }
+}
+/// SELFGUARD-AHCI: nothing to fold in — the identity function, so the signature is the number it
+/// always was.
+#[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
+#[inline(always)]
+fn mix_port(a: u64, _p: Port) -> u64 {
+    a
+}
+
+/// SELFGUARD-AHCI: which FAT source reads this candidate's sectors?
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+fn source_of(usb: bool, p: Port) -> BlockSource {
+    match p {
+        Some(port) => BlockSource::Ahci(port),
+        None => {
+            if usb {
+                BlockSource::Usb
+            } else {
+                BlockSource::Default
+            }
+        }
+    }
+}
+/// SELFGUARD-AHCI: knob-off — the exact expression the call sites used to spell inline.
+#[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
+#[inline(always)]
+fn source_of(usb: bool, _p: Port) -> BlockSource {
+    if usb {
+        BlockSource::Usb
+    } else {
+        BlockSource::Default
+    }
+}
+
+/// SELFGUARD-AHCI: which block identity does this candidate present to [`classify`]?
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+fn handle_of(usb: bool, p: Port) -> BlockHandle {
+    match p {
+        Some(port) => BlockHandle::Ahci { port },
+        None => {
+            if usb {
+                BlockHandle::Usb
+            } else {
+                BlockHandle::Global
+            }
+        }
+    }
+}
+/// SELFGUARD-AHCI: knob-off — the exact expression the call sites used to spell inline.
+#[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
+#[inline(always)]
+fn handle_of(usb: bool, _p: Port) -> BlockHandle {
+    if usb {
+        BlockHandle::Usb
+    } else {
+        BlockHandle::Global
+    }
+}
+
+/// SELFGUARD-AHCI: the candidate's name on the wire — `global`, `usb`, or `ahci<port>`.
+///
+/// Routed through [`BlockSource::name`] so the guard spells a SATA disk exactly as `fs::bootdisk`'s
+/// `X86BIND: root=ahci5:/kernel.elf` and `mbr_census` spell it. One vocabulary, so a reader can put
+/// the guard's verdict and the root walk's answer side by side and see they name one disk.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+fn label(usb: bool, p: Port) -> &'static str {
+    match p {
+        Some(port) => BlockSource::Ahci(port).name(),
+        None => {
+            if usb {
+                "usb"
+            } else {
+                "global"
+            }
+        }
+    }
+}
+/// SELFGUARD-AHCI: knob-off — the exact literals the witness lines used to spell inline.
+#[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
+#[inline(always)]
+fn label(usb: bool, _p: Port) -> &'static str {
+    if usb {
+        "usb"
+    } else {
+        "global"
+    }
+}
+
+/// SELFGUARD-AHCI: append every LIVE SATA disk to the candidate list, read out of the ONE census
+/// `fs::bootdisk`'s walk already trusts ([`fat::live_sources`]).
+///
+/// Geometry comes from `block::ahci_info_port`, the same registry row `BlockHandle::Ahci { port }`
+/// re-resolves through — so the `(slot_id, num_blocks)` the guard remembers is the `(slot_id,
+/// num_blocks)` an identity captured on that disk will present back to [`classify`]. A port that
+/// `live_sources` names but whose registry row has since gone is skipped rather than guessed at: a
+/// candidate the guard cannot measure is not a candidate it should be voting on.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+fn push_sata(out: &mut alloc::vec::Vec<Cd>) {
+    for src in fat::live_sources() {
+        if let BlockSource::Ahci(port) = src {
+            if let Some(d) = block::ahci_info_port(port) {
+                out.push((false, d.slot_id, d.num_blocks, Some(port)));
+            }
+        }
+    }
+}
+/// SELFGUARD-AHCI: no SATA handle in this image, so there is nothing to append. Byte-identical to
+/// pre-SELFGUARD-AHCI, exactly as `fat::push_ahci_sources`' knob-off twin is.
+#[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
+#[inline(always)]
+fn push_sata(_out: &mut alloc::vec::Vec<Cd>) {}
+
+/// SELFGUARD-AHCI: the census witness, and one classify line per candidate.
+///
+/// Emitted from [`scan`], which is the function that FILLS the cache every [`classify`] reads — so
+/// the list in the log and the list the installer is about to be answered from are the same list, by
+/// construction rather than by a second walk that could disagree.
+///
+/// It prints under the `ahci` knob only. That is deliberate and it is what makes the knob-off image
+/// byte-identical: a build with no SATA handle has no SATA rung to census, its candidate set is
+/// exactly the set the existing `:: install: candidate …` lines below already witness, and this
+/// arc's stated invariant is that such an image does not move. The go-red is unaffected — dropping
+/// the AHCI arm means dropping `push_sata`'s push, not the knob, so the census still prints and
+/// reads `sata=0`.
+#[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+fn census(cands: &[Cand], boot: Option<u32>) {
+    let sata = cands.iter().filter(|c| c.port.is_some()).count();
+    let usb = cands.iter().filter(|c| c.usb).count();
+    match (boot, cands.iter().find(|c| c.verdict == Verdict::BootDevice)) {
+        (None, _) => serial_println!(
+            ":: SELFGUARD: census disks={} usb={} sata={} boot=disarmed ::",
+            cands.len(), usb, sata
+        ),
+        (Some(_), None) => serial_println!(
+            ":: SELFGUARD: census disks={} usb={} sata={} boot=none ::",
+            cands.len(), usb, sata
+        ),
+        (Some(_), Some(c)) => serial_println!(
+            ":: SELFGUARD: census disks={} usb={} sata={} boot={}/slot{} ::",
+            cands.len(), usb, sata, label(c.usb, c.port), c.slot_id
+        ),
+    }
+    for c in cands {
+        // The verdict is spelled INSTALL-SELF rather than `BootDevice` because that is the name of
+        // the refusal a reader is looking for, and `reason=` says which of the four rules produced
+        // it — the two Eligible reasons are NOT the same fact ("this disk carries no FAT at all" vs
+        // "it carries FAT volumes and none of them is ours").
+        let (verdict, reason) = match c.verdict {
+            Verdict::Disarmed => ("Disarmed", "no-boot-volume-serial-in-bootinfo"),
+            Verdict::BootDevice => ("INSTALL-SELF", "carries-the-boot-volume-serial"),
+            Verdict::Eligible if c.serials.is_empty() => ("Eligible", "no-FAT-volume-on-this-disk"),
+            Verdict::Eligible => ("Eligible", "no-FAT-volume-carries-the-boot-serial"),
+        };
+        serial_println!(
+            ":: SELFGUARD: classify {}/slot{} ({} sectors, {} FAT volume(s)) -> {} reason={} ::",
+            label(c.usb, c.port), c.slot_id, c.num_blocks, c.serials.len(), verdict, reason
+        );
+    }
+}
+/// SELFGUARD-AHCI: no SATA rung in this image, so no census line — see the note above on why the
+/// witness is knob-gated rather than unconditional.
+#[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
+#[inline(always)]
+fn census(_cands: &[Cand], _boot: Option<u32>) {}
