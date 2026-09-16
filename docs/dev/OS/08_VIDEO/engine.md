@@ -17282,3 +17282,10 @@ and x86 has never had one. `cursor11_desk_tick` gives the line a desktop-present
 population `flicker_frames` is actually about — armed only once a desktop present has met a live
 arrow, so a pointerless boot stays as silent as it is today. Giving x86 the fixture-scope call its
 sibling has is the structural repair and it lives in a file this arc did not open.
+CURSOREMIT (2026-09-16) opens it: `arch/x86_64/syscall.rs`'s fixture ladder now ends in
+`wm::wci_rollup()`, folded onto the APPPIN line under that line's own `all(witness, wc)` cfg so the
+ladder's line count and every panic `Location` below it are unchanged — which puts the whole
+`[wc-i]`/`[cursor3..12]`/`[cursor11]`/`[flick2]` block on the x86 gate at `scope=fixture` with no HID
+pointer in the loop, and, with `-> FLICKER` added to the default FORBID set in
+`unaos/scripts/mbench.py` and to its positional copy in `tools/foreman/src/verdict.rs` in the same
+commit, makes a non-zero `n` red the gate instead of riding it green.

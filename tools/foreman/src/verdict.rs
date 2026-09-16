@@ -18,7 +18,18 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 
 /// The always-on default FORBID set (mbench's `DEFAULT_FORBIDS`).
-pub const DEFAULT_FORBIDS: [&str; 3] = [r"-> FAIL", r"FAIL ::", r"PANIC"];
+///
+/// A COPY, and it must stay one — element for element AND in order. `tests/agreement.rs` asserts
+/// that this module and `mbench.py` render byte-identical verdict tables over a shared corpus, and
+/// the table lists directives positionally, so a set that merely AGREES is not enough. Any edit to
+/// `unaos/scripts/mbench.py`'s `DEFAULT_FORBIDS` is an edit here in the same commit.
+///
+/// CURSOREMIT added `-> FLICKER` (the `[cursor11]` compose-through verdict for a panel present
+/// published with a live arrow off the glass; `flicker_frames` is contractually 0). `-> BRACKETED`
+/// from the same line is deliberately absent — it is a legitimate state under a present storm. The
+/// argument in full is at mbench.py's own declaration; it is not restated here, because two copies
+/// of a rationale is how two divergent ones happen.
+pub const DEFAULT_FORBIDS: [&str; 4] = [r"-> FAIL", r"FAIL ::", r"PANIC", r"-> FLICKER"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
