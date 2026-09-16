@@ -3347,10 +3347,13 @@ test_x86_64() {
     # start). The shooter runs in the background: it retries the QMP connect while the builder
     # compiles, waits UNAOS_QMP_WAIT (default secs-3) after QEMU appears, then dumps — inside the
     # builder's kill window. `|| true` guards keep this additive under `set -e`.
-    local qmp_pid="" qmp_port="" typist_pid=""
+    local qmp_pid="" qmp_port="" typist_pid="" ptr_pid=""
     # XHCIKBD (B45): the burst typist rides the SAME QMP socket as the shooter — one port, one
     # `-qmp` in UNAOS_QEMU_EXTRA, armed when either consumer wants it. Never a second QMP path.
-    if [ -n "${UNAOS_QMP_SHOT:-}" ] || [ -n "${UNAOS_XHCIKBD:-}" ]; then
+    # XHCIHUB (SMALLFIX2): the POINTER typist is the third consumer of that one socket, and is
+    # named here for the same reason — a leg that wants QMP and does not arm the port gets a
+    # typist that retries a connect for its whole `--connect-timeout` and injects nothing.
+    if [ -n "${UNAOS_QMP_SHOT:-}" ] || [ -n "${UNAOS_XHCIKBD:-}" ] || [ -n "${UNAOS_XHCIHUB:-}" ]; then
         qmp_port="${UNAOS_QMP_PORT:-4464}"
         while lsof -iTCP:"$qmp_port" -sTCP:LISTEN >/dev/null 2>&1; do qmp_port=$((qmp_port + 1)); done
         export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -qmp tcp:127.0.0.1:${qmp_port},server,nowait"
@@ -3399,6 +3402,48 @@ test_x86_64() {
         typist_pid=$!
         echo -e "${COLOR_YELLOW}⚡ XHCIKBD typist armed: port ${qmp_port}, ${XHCIKBD_BURSTS} bursts x (F11 stall + ${XHCIKBD_PAIRS} pairs, 20 ms apart) + F12 sentinel, transcript -> target/xhcikbd-typist.log${COLOR_RESET}"
     fi
+    # XHCIHUB (SMALLFIX2, rmbp 2026-09-15; LEDGER S1/S2, trunk QUEUE §2) — the POINTER typist, and
+    # the reason the `evts=` field of `:: XHCIHUB:` stops being decoration. `UNAOS_XHCIHUB=1` is a
+    # BUILDER knob: it parks the xHCI `usb-tablet` behind a `usb-hub` on root port 4. Nothing then
+    # MOVES that tablet, so `evts=0` was the honest reading of a device nobody touched, and HUBFIX
+    # could only report it. This block moves it, through `qmp_type.py --pointer` (QMP
+    # `input-send-event`, `InputEventKind` `abs` for the tablet's absolute axes plus one `btn`
+    # click), so `evts>0` becomes a claim about the hub-downstream interrupt-IN pipe — the third
+    # PASS clause HUBFIX named and could not take.
+    #   ⚠ THE TIMING IS NOT THE KEYBOARD'S, and this is the one thing that cannot be copied from the
+    #   block above. `xhcihub_score` (drivers/xhci/mod.rs) prints ONCE, as soon as the pointer has
+    #   delivered a report OR `XHCIHUB_SETTLE_MS` (8000) has passed since the hub's status-change
+    #   Configure-Endpoint — whichever is FIRST. XHCIKBD's markers wait for the desktop and the
+    #   whole boot battery, which on the measured baseline is ~900 serial lines and far past that
+    #   deadline: a typist armed on those markers would inject into an already-scored fixture and
+    #   `evts=0` would still be what the wire says. So the marker here is the pointer's OWN
+    #   enumeration line — `:: MOUSE-1: HID pointer detected`, serial.log:1020 on the baseline,
+    #   printed ONE line before `status-change endpoint configured` (:1021) which is where the
+    #   settle clock starts — and the moves land seconds inside the window, not after it.
+    # UNAOS_XHCIHUB_NOPTR=1 disarms this typist and NOTHING else — not the scorer below, which
+    # still demands `evts>0`: it is the leg's GO-RED (fixture armed, pointer still, `evts=0`, red).
+    # A HOST knob in `arroyo` only — no kernel feature, no `_feats` entry, no fourth place to keep
+    # in step.
+    # The typist's own transcript lands BESIDE the capture, never in it (target/xhcihub-typist.log).
+    local XHCIHUB_MOVES=12
+    # ⚠ REMOVE THE SIDECAR FIRST, and this line was paid for: the go-red run printed the PREVIOUS
+    # run's transcript — "12 abs moves + 1 left click" — under a leg that injected nothing, because
+    # the disarmed arm writes no file and `cat` happily read the stale one. A stale capture read as
+    # this run's evidence is the three-valued-mode rule (LAWS §5) in miniature: absent must be
+    # distinguishable from old. Unconditional, so the disarmed arm clears it too.
+    rm -f "${WORKSPACE_DIR}/target/xhcihub-typist.log"
+    if [ -n "${UNAOS_XHCIHUB:-}" ] && [ -z "${UNAOS_XHCIHUB_NOPTR:-}" ]; then
+        python3 "${WORKSPACE_DIR}/scripts/qmp_type.py" --port "$qmp_port" --connect-timeout 600 \
+            --marker ':: MOUSE-1: HID pointer detected' --marker-log "$SERIAL_LOG" \
+            --marker-timeout "$(( secs > 20 ? secs - 15 : secs ))" \
+            --wait 1 --pointer "$XHCIHUB_MOVES" --pointer-kind abs --pointer-gap 0.05 \
+            --pointer-clicks 1 --postwait 0 \
+            2> "${WORKSPACE_DIR}/target/xhcihub-typist.log" &
+        ptr_pid=$!
+        echo -e "${COLOR_YELLOW}⚡ XHCIHUB pointer typist armed: port ${qmp_port}, ${XHCIHUB_MOVES} abs moves + 1 left click, 50 ms apart, after ':: MOUSE-1: HID pointer detected'; transcript -> target/xhcihub-typist.log${COLOR_RESET}"
+    elif [ -n "${UNAOS_XHCIHUB:-}" ]; then
+        echo -e "${COLOR_YELLOW}⚡ XHCIHUB pointer typist DISARMED (UNAOS_XHCIHUB_NOPTR=1) — the tablet will not move, evts=0, and the scorer below must red. This is the leg's go-red, not a pass.${COLOR_RESET}"
+    fi
 
     echo -e "${COLOR_CYAN}⚡ Headless x86_64 test (${secs}s). Serial -> ${SERIAL_LOG}${COLOR_RESET}"
     rm -f "$SERIAL_LOG"
@@ -3414,6 +3459,7 @@ test_x86_64() {
     cd "$WORKSPACE_DIR"
     if [ -n "$qmp_pid" ]; then wait "$qmp_pid" 2>/dev/null || true; fi
     if [ -n "$typist_pid" ]; then wait "$typist_pid" 2>/dev/null || true; fi
+    if [ -n "$ptr_pid" ]; then wait "$ptr_pid" 2>/dev/null || true; fi  # XHCIHUB — reaped like its two siblings; its exit code is for the transcript, the VERDICT is the wire's.
     # QEMU-FAST, SR7's owed half, now paid: `test` no longer sits out a blind wall. The wall lives
     # in builder/src/main.rs (the builder owns this QEMU, not this script), so the WAIT was plumbed
     # through there — `qemu_test_wall` runs the SAME `scripts/qemu_await.py` over the SAME spec the
@@ -3498,6 +3544,48 @@ test_x86_64() {
             return 1
         fi
         awk 'index($0, ":: XHCIKBD:") { printf("  XHCIKBD %s:%d: %s\n", "serial.log", FNR, $0) }' "$SERIAL_LOG"
+    fi
+    # XHCIHUB (SMALLFIX2): the third PASS clause, scored HERE and not in the kernel. The kernel's
+    # `xhcihub_score` REPORTS `evts=` and verdicts on the other four clauses (statchg, esit, esithi,
+    # anon, named pointer); it cannot score `evts` itself, because a kernel that demanded evts>0
+    # would red every boot with no typist — including `arroyo x86`, the bench boots and anything a
+    # reader runs by hand — and HUBFIX's own note calls that a gate that fires on every input. The
+    # arming is what makes the clause scoreable, and the arming is arroyo's: it knows whether the
+    # pointer typist ran. So the rule is exactly "typist armed => evts>0", checked on the same wire
+    # the kernel wrote, with the kernel untouched.
+    #   Three ways to red, each with its own named line: no `:: XHCIHUB:` line at all (the fixture
+    #   was armed and the guest never scored — no hub, no downstream pointer, or a truncated run);
+    #   a line with no `evts=` field (the clause cannot be READ, which is not the same as passing);
+    #   and `evts=0`. The `evts=` read is `match`/`substr`, not a field index, because the line's
+    #   field layout has changed once already and a positional read would rot silently.
+    #   ⚠ `evts=0` reds UNCONDITIONALLY, `UNAOS_XHCIHUB_NOPTR=1` included — the knob disarms the
+    #   TYPIST and never the CHECK, because a mutation switch that also switched the gate off would
+    #   be a gate that cannot fire. Disarming it is precisely this leg's go-red, and the red says so.
+    if [ -n "${UNAOS_XHCIHUB:-}" ]; then
+        echo -e "${COLOR_PURPLE}──────── XHCIHUB pointer typist transcript (target/xhcihub-typist.log) ────────${COLOR_RESET}"
+        cat "${WORKSPACE_DIR}/target/xhcihub-typist.log" 2>/dev/null || echo "(no typist transcript — disarmed or never started)"
+        local _xh_n _xh_evts
+        _xh_n=$(awk 'index($0, ":: XHCIHUB:") { n++ } END { print n + 0 }' "$SERIAL_LOG")
+        if [ "$_xh_n" -eq 0 ]; then
+            echo -e "${COLOR_RED}❌ x86_64 test FAILED — UNAOS_XHCIHUB armed but the wire carries no ':: XHCIHUB:' verdict line: the hub never configured its status-change endpoint, or the run ended before the scorer printed. Not a pass. Log at ${SERIAL_LOG}${COLOR_RESET}"
+            return 1
+        fi
+        awk 'index($0, ":: XHCIHUB:") { printf("  XHCIHUB %s:%d: %s\n", "serial.log", FNR, $0) }' "$SERIAL_LOG"
+        _xh_evts=$(awk 'index($0, ":: XHCIHUB:") && match($0, /evts=[0-9]+/) { print substr($0, RSTART + 5, RLENGTH - 5); exit }' "$SERIAL_LOG")
+        if [ -z "$_xh_evts" ]; then
+            echo -e "${COLOR_RED}❌ x86_64 test FAILED — the ':: XHCIHUB:' line carries no 'evts=<n>' field, so the pointer clause cannot be scored at all. A clause that cannot be read is not a passing clause. Log at ${SERIAL_LOG}${COLOR_RESET}"
+            return 1
+        fi
+        if [ "$_xh_evts" -eq 0 ]; then
+            echo -e "${COLOR_RED}❌ x86_64 test FAILED — XHCIHUB pointer clause: the hub-downstream pointer delivered evts=0 reports. Not a pass. Transcript above, log at ${SERIAL_LOG}${COLOR_RESET}"
+            if [ -n "${UNAOS_XHCIHUB_NOPTR:-}" ]; then
+                echo -e "${COLOR_RED}  UNAOS_XHCIHUB_NOPTR=1 is set: this IS the go-red, and the gate fired. Unset it for a scoring run.${COLOR_RESET}"
+            else
+                echo -e "${COLOR_RED}  The typist injected ${XHCIHUB_MOVES} abs moves + 1 click and the device behind the hub stayed silent — the defect this clause exists to catch, not a quiet boot.${COLOR_RESET}"
+            fi
+            return 1
+        fi
+        echo -e "${COLOR_GREEN}✔ XHCIHUB pointer clause: evts=${_xh_evts} > 0 — the hub-downstream pointer delivered reports for the ${XHCIHUB_MOVES} injected abs moves.${COLOR_RESET}"
     fi
     if ! scan_serial_faults "$SERIAL_LOG" "serial.log"; then
         echo -e "${COLOR_RED}❌ x86_64 test FAILED — the serial log carries fault text (lines above). Log at ${SERIAL_LOG}${COLOR_RESET}"

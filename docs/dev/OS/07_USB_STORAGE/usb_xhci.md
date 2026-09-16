@@ -9065,11 +9065,18 @@ Orin bench, where it is the clause that fires. **S1 is fixed-unflown: QEMU prove
 is now spec-shaped, only the Orin can prove the xHC accepts it.** S2 reproduces on QEMU exactly as the
 Orin prints it, and its go-red is the `0000:0000` coming back.
 
-`evts` is **reported, not scored.** Scoring "the downstream pointer delivers events" needs pointer
-injection over QMP, and `scripts/qmp_type.py` is key-only (qcodes through `send-key` /
-`input-send-event`; no `abs`, `rel` or `btn`). That clause wants a pointer mode in that script plus an
-`arroyo` typist block, and is owed. With nothing moving the QEMU tablet, `evts=0` is honest, and
-scoring on it would be a gate that fires on every input.
+`evts` is **scored, and scored in `arroyo` rather than in the kernel** (HIDPTR, 2026-09-15; it was
+reported-only under HUBFIX). `scripts/qmp_type.py --pointer N` injects `input-send-event` moves and a
+button click — QMP `InputEventKind` `abs`/`rel` carrying an `InputMoveEvent` (`{axis, value}`, an
+absolute 0..0x7FFF position or a delta) and `btn` carrying an `InputBtnEvent`, `qapi/ui.json` — and the
+x86 `test` leg arms it whenever `UNAOS_XHCIHUB=1` is set, 12 abs moves plus one left click 50 ms apart.
+The typist waits on the marker `:: MOUSE-1: HID pointer detected` and NOT on XHCIKBD's desktop markers:
+`xhcihub_score` prints once at the first report or `XHCIHUB_SETTLE_MS` after the hub's status-change
+Configure-Endpoint, whichever is first, so a typist gated on the boot battery would inject into an
+already-scored fixture. The verdict lives in `arroyo` because only the harness knows whether a typist
+ran — a kernel clause demanding `evts>0` would red every boot that has no typist, including every bench
+boot. The rule is **typist armed ⇒ `evts>0`**; `UNAOS_XHCIHUB_NOPTR=1` disarms the typist and is the
+leg's go-red.
 
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
