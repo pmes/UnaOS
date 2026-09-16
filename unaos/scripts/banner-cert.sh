@@ -135,6 +135,23 @@
 #      `LC_ALL=C grep -a -o -F -- '<token>' <artifact> | wc -l` must be > 0. Mark the row `measured`.
 #      A row seeded from source reading alone is marked `unmeasured-here` and stays that way until
 #      an artifact for that arch proves it.
+#   9. AND THEN KNOW WHAT THE GREEN ROW DID NOT BUY YOU (PHASE31WIT, rmbp B112, 2026-09-16). A CERT
+#      ROW PROVES THE LITERAL IS PRESENT IN THE ARTIFACT; IT NEVER PROVES THE BOOT REACHED IT, AND IT
+#      NEVER PROVES THE CAPTURE KEPT IT — the flight's own line is the reachability witness, the
+#      replay is the retention witness, and a knob whose product is witness lines needs ALL THREE.
+#      This row is where the three came apart. `bar1exp-uc` certified `measured` off the flown ELF,
+#      and flight 9 proved the arm RAN (`mmio-map … uc=128 wc-kept=0` against flight 8's `uc=113
+#      wc-kept=15`) — yet the literal had ZERO hits in the whole capture, and the arc opened by
+#      hunting a cfg arm that was never wrong. The line was emitted and then discarded: VPERF-WC had
+#      hoisted its emit site to `kernel_main`'s first statement (`BPACE: fb-wc t=0ms`), the bench
+#      rMBP has no 16550 (`uart16550=absent carrier=ftdi-mirror`), and its only carrier is a
+#      drop-oldest ring that does not replay until `ftdi:console-up` at 23437 ms. The control that
+#      settled it needed no build at all: `:: video: WRITER seeded` is UNCONDITIONAL on every x86_64
+#      build, sits three statements later, and was ALSO at zero hits — no cfg arm can explain that,
+#      only an evicted ring. THE RULE: before reading a missing witness as a code defect, measure the
+#      capture against the carrier — replay bytes against ring `CAP`, and whether the log begins
+#      mid-token. `:: FTDI-CAP: replayed=… cap=… lost=… head_cut=…` now states exactly that on every
+#      boot (`drivers/xhci/ftdi.rs::late_verdict`), so it costs one grep and not a flight.
 #
 # ROW FORMAT:  feature|token|cond|state
 #   token   the certifying string. A LEADING `!` inverts the row: the token must be ABSENT when the
@@ -254,7 +271,7 @@ gmux_igd|:: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD|intel-ivb|me
 unaos_ivb|@boot iGPU trace 1 (pre-EBS) collected.|-|measured
 ahci|:: AHCI: port=|-|measured
 bar1wedge|:: BAR1WEDGE: rung=first-stall|-|measured
-bar1exp-uc|:: x86 bar1exp: UC arm ARMED|-|measured
+bar1exp-uc|:: x86 bar1exp: UC arm ARMED via=|-|measured
 beam|:: BEAMX86: head=|nvidia-kepler,nvidia-kepler-takeover|measured
 ftdirx|:: FTDIRX: first byte rx=|-|measured
 gen7r8|:: gen7: r8 begin rung=R8 wake=|-|measured

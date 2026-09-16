@@ -3720,17 +3720,17 @@ pub fn set_framebuffer_wc(fb_base: u64, fb_len: u64) {
         fb_base,
         fb_end
     );
-    // PHASE31ROOT — the armed witness. A flight log carrying THIS line and not the `fb-wc` line
-    // is the UC arm; a log carrying the `fb-wc` line is the baseline. The string below is the
-    // strings-verifiable proof the image is armed (gate law: an instrument that is not in the
-    // image proves nothing).
+    // PHASE31WIT — the armed witness is LATCHED here and emitted later by `bar1exp_witness()` at
+    // this file's tail. It used to `serial_println!` on this spot and was never once observed:
+    // VPERF-WC hoisted this fn to `kernel_main`'s first statement (`BPACE: fb-wc t=0ms`), the bench
+    // rMBP has no 16550, and its only carrier is the drop-oldest FTDI ring. See the tail block.
     #[cfg(feature = "bar1exp-uc")]
-    serial_println!(
-        ":: x86 bar1exp: UC arm ARMED — retyped {} leaf(s) UC (PAT PA3) over {:#x}..{:#x}; panel write-combining SUPPRESSED (PHASE31ROOT) ::",
-        leaves,
-        fb_base,
-        fb_end
-    );
+    {
+        BAR1EXP_LEAVES.store(leaves, Ordering::Relaxed);
+        BAR1EXP_LO.store(fb_base, Ordering::Relaxed);
+        BAR1EXP_HI.store(fb_end, Ordering::Relaxed);
+        BAR1EXP_ARMED.store(true, Ordering::Release);
+    }
     // BPACE HPACE-1: `fb-wc-done d=` is the retype itself — the leaf walk, the 4 KiB `invlpg` sweep
     // over the whole span, and this one line. Everything the retype is BLAMED for costs exactly this
     // much, and the number is now on the wire instead of being assumed small.
@@ -3888,4 +3888,93 @@ pub fn map_mmio_window(pa: u64, size: usize) {
         uc_leaves,
         wc_kept
     );
+}
+
+// ── PHASE31WIT — the UC arm's witness, latched early and spoken late (rmbp B112) ─────────────────
+//
+// SCORE89 opened B112 on a contradiction: `scripts/banner-cert.sh` certified `bar1exp-uc` by the
+// literal `:: x86 bar1exp: UC arm ARMED`, measured present in the flown ELF, and flight 9
+// (2026-09-16, image A, `UNAOS_BAR1EXP=uc`) proved the arm RAN — `:: x86 mmio-map:
+// 0x90000000..0xa0000000 uc=128 wc-kept=0 ::` against flight 8's `uc=113 wc-kept=15` — yet the
+// literal had ZERO hits in the whole capture.
+//
+// THE ARM WAS NEVER THE PROBLEM. `set_framebuffer_wc`'s two `#[cfg(feature = "bar1exp-uc")]` pairs
+// live in one function body and the `fb-wc` / `fb-wc-done` BPACE stamps bracket both, so control
+// flow ran straight through the emit site. The line was emitted and then THROWN AWAY:
+//
+//   * VPERF-WC hoisted `set_framebuffer_wc` to `kernel_main`'s first statement — `BPACE: fb-wc
+//     t=0ms`. Its hoist note claims the line "reaches serial/FTDI"; on this bench it does not.
+//   * The 2012 rMBP has no 16550. The capture's own line says so: `uart16550=absent
+//     carrier=ftdi-mirror`. The ONLY carrier is the FTDI boot-capture ring in
+//     `drivers::xhci::ftdi`, which is drop-oldest and does not replay until `ftdi:console-up`
+//     (23437 ms on flight 8).
+//   * So the ring holds only the LAST `CAP` bytes before the console lives. Measured on the
+//     capture, both boots independently: 260 958 and 258 584 bytes replayed against a 262 144-byte
+//     `CAP` — the ring at capacity, and each replay begins mid-token.
+//
+// THE CONTROL that settles it without building anything: `:: video: WRITER seeded` (`main.rs` step
+// 0a) is UNCONDITIONAL on every x86_64 build and sits three statements after the call. It has ZERO
+// hits in the same capture, on both boots. No cfg arm and no code path can explain that; only an
+// evicted ring can. The baseline's own `:: x86 fb-wc: retyped` is likewise absent from flight 8,
+// which is the build that certainly emitted it.
+//
+// SO THE FIX IS NOT A BETTER STRING AT t=0. Any line emitted there is unobservable on this carrier
+// no matter what it says. The retype latches its facts here and `bar1exp_witness()` speaks them
+// from `bootpace::service_dump` — ungated, main-loop, and demonstrably captured (`BPACE: total
+// gui=` lands at 23534 ms in the very capture that lost the t=0 lines).
+//
+// `via` is measured, not assumed, and it is the discriminator B112 actually wanted: `retype` means
+// THIS walk flipped leaves to UC (`leaves > 0`), `create` means every leaf was already UC when the
+// walk arrived (`leaves == 0`) and the mapping was therefore created UC elsewhere — the
+// `map_mmio_window` path that prints `mmio-map … uc=`. One line now answers which.
+//
+// ⚠ TAIL BLOCK ON PURPOSE (the `ftdirx` precedent in `drivers/xhci/ftdi.rs`). Nothing follows it, so
+// no panic `Location` in this file moves; the in-place edit at the retype was a line-for-line swap,
+// so this file is LINE-NEUTRAL and knob-off it is `#[cfg]`-erased entirely. That property does NOT
+// survive the commit as a whole, and this block will not pretend otherwise: the CAPWIT re-emit and
+// the `CAP` raise in `drivers/xhci/ftdi.rs` are unconditional on every build, so the knob-off x86
+// image DID move. Stated, not left standing (the PANELOWN precedent in `video/fbcon.rs`).
+
+/// PHASE31WIT — leaves the UC retype actually flipped. `0` with [`BAR1EXP_ARMED`] set means the
+/// leaves were already UC on arrival, which is a `via=create` boot.
+#[cfg(feature = "bar1exp-uc")]
+static BAR1EXP_LEAVES: AtomicU32 = AtomicU32::new(0);
+/// PHASE31WIT — the retyped span, as the retype itself saw it.
+#[cfg(feature = "bar1exp-uc")]
+static BAR1EXP_LO: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "bar1exp-uc")]
+static BAR1EXP_HI: AtomicU64 = AtomicU64::new(0);
+/// PHASE31WIT — set once the retype has run. Distinguishes "armed and measured zero leaves" from
+/// "the retype never ran at all"; without it a `leaves=0` line could not tell those apart.
+#[cfg(feature = "bar1exp-uc")]
+static BAR1EXP_ARMED: AtomicBool = AtomicBool::new(false);
+/// PHASE31WIT — spent by the first emit, so the witness is exactly ONE line however many times the
+/// ledger re-dumps.
+#[cfg(feature = "bar1exp-uc")]
+static BAR1EXP_SAID: AtomicBool = AtomicBool::new(false);
+
+/// PHASE31WIT — emit the UC arm's witness once, from a caller that runs AFTER the console carrier
+/// exists. Call it freely and often; it is latched and costs one relaxed load per pass afterwards.
+///
+/// Compiles to an empty fn without `bar1exp-uc`, so the default build carries neither the statics
+/// nor the string and `banner-cert.sh`'s measured token stays a true discriminator of the armed
+/// image.
+pub fn bar1exp_witness() {
+    #[cfg(feature = "bar1exp-uc")]
+    {
+        if !BAR1EXP_ARMED.load(Ordering::Acquire) {
+            return; // the retype has not run yet — say nothing rather than print zeros
+        }
+        if BAR1EXP_SAID.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let leaves = BAR1EXP_LEAVES.load(Ordering::Relaxed);
+        serial_println!(
+            ":: x86 bar1exp: UC arm ARMED via={} leaves={} range={:#x}..{:#x} ::",
+            if leaves > 0 { "retype" } else { "create" },
+            leaves,
+            BAR1EXP_LO.load(Ordering::Relaxed),
+            BAR1EXP_HI.load(Ordering::Relaxed)
+        );
+    }
 }

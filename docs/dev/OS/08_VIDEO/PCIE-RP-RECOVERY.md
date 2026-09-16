@@ -881,7 +881,16 @@ eight-line map set, and the code's own documented UC signature. **And the field 
 for instead is a compile-time constant:** `pcihealth.rs::bw_aperture()` is
 `if cfg!(feature = "bar1exp-uc") { "uc" } else { "wc" }`, so `aperture=uc` on every line above names
 which BUILD flew and never what the page tables carry. Re-state these controls against the
-`mmio-map` pair before the next A1 flight.
+`mmio-map` pair before the next A1 flight. **RESOLVED 2026-09-16 (PHASE31WIT), and the transport was
+worse than "ahead of the FTDI mirror" — the line was emitted, mirrored, and then EVICTED: this
+laptop's only carrier is a drop-oldest ring that does not replay until `ftdi:console-up` (23437 ms),
+and the flight-8/flight-9 replays measure 260 958 and 258 584 bytes against a 262 144-byte cap, i.e.
+pinned at capacity on both boots and each beginning mid-token, with the UNCONDITIONAL `:: video:
+WRITER seeded` absent from both as the control no cfg arm can explain; the witness is now latched at
+the retype and spoken from `bootpace::service_dump` as `:: x86 bar1exp: UC arm ARMED
+via=<create|retype> leaves=<n> range=<lo>..<hi> ::`, the ring is 1 MiB, and `:: FTDI-CAP: replayed=…
+cap=… lost=… head_cut=…` states the capture's own integrity on every boot — so the controls below
+are scorable as written on the next flight, and `via=` additionally reports WHICH path armed UC.**
 
 **Absence controls for this flight, pre-registered:** `fb-wc` must be ABSENT and
 `:: x86 bar1exp: UC arm ARMED` PRESENT on the UC leg (they are alternatives at the same site); the
