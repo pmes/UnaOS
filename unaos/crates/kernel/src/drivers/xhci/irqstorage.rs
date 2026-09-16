@@ -48,9 +48,13 @@ use spin::Mutex as SpinMutex;
 use crate::arch::sched::{self, Semaphore, PRIO_NORMAL};
 use crate::drivers::block;
 
-/// Upper bound on a file name carried in a request — a dotted 8.3 name is at most 12 bytes (matches
-/// the syscall layer's `MAX_NAME`).
-pub const NAME_MAX: usize = 12;
+/// Upper bound on a file name carried in a request. DIRNS (LEDGER SO20) widened it from `12` — a
+/// dotted 8.3 LEAF — to `40`, a PATH, matching the syscall layer's `MAX_NAME` on both arches. This
+/// bound is where x86's EL0 namespace was flattened at the TRANSPORT layer rather than at the
+/// resolver: a request could not CARRY `/apps/STAT.ELF` even once something was willing to walk it.
+/// The cost is 28 bytes on one `BlockRequest`, which lives on the submitter's kernel stack for the
+/// duration of one blocked syscall — never an array, never static.
+pub const NAME_MAX: usize = 40;
 
 /// The kind of transaction a `BlockRequest` carries. S1: the raw single-sector ops (the block-layer
 /// primitive + the `bx-blockreq` self-test). S2: `ReadFile` (a live in-place file-range read,
@@ -91,6 +95,24 @@ pub enum BlockOp {
     /// directory — the file-open path never opens a dir), `-EIO` (no volume / I/O error / a size that does
     /// not fit the `i32` result channel). Allocates nothing, touches no sector beyond the directory walk.
     Stat,
+    /// DIRNS (LEDGER SO20) MKDIR: create the DIRECTORY `name` names, walking to its parent through
+    /// the shared resolver and calling `fat::create_dir` there. IDEMPOTENT — a leaf that is already a
+    /// directory returns `0`; a leaf that exists as a FILE is `-ENOTDIR`, never an overwrite.
+    ///
+    /// Why the service task and not the syscall: x86's IF-masked handler cannot mount or walk the FAT
+    /// (see `Stat`), so every namespace mutation on this arch belongs to the ONE task that drains this
+    /// queue — which is also what keeps it serialized (`fs/fat.rs`'s X86 FAT-MUTATOR ROSTER row 3, the
+    /// single writer). This op adds no new writer and therefore no new roster row.
+    ///
+    /// It is NOT a syscall: no `SYS_MKDIR` number is minted by this arc. Its callers are kernel-side —
+    /// the DIRNS fixture builds the tree it then opens through the real `SYS_OPEN`.
+    MkDir,
+    /// DIRNS (LEDGER SO20) RMDIR: remove the DIRECTORY `name` names. `MkDir`'s twin and, for a
+    /// fixture, its whole point — a witness that plants a tree and cannot remove it is a witness that
+    /// changes the volume it is measuring. IDEMPOTENT (already absent -> `0`); a leaf that is a FILE is
+    /// `-ENOTDIR`; a NON-EMPTY directory is refused by `fat::remove_dir` and surfaces as `-EIO`. Same
+    /// single-writer context as `MkDir` (roster row 3), so it adds no roster row either.
+    RmDir,
 }
 
 /// A storage transaction submitted to the service task. It lives on the SUBMITTER'S kernel stack:
@@ -165,6 +187,14 @@ const EIO: i32 = -5;
 /// from `EIO` so the syscall layer maps it to `-ENOENT` (name not found) vs. `-EIO` (a real I/O error).
 /// Matches the syscall layer's `ENOENT`.
 const ENOENT: i32 = -2;
+/// DIRNS (LEDGER SO20): a PATH component that is a FILE, or a `MkDir` whose leaf already exists as one.
+/// The namespace gave these ops a vocabulary they did not need while every name was a root leaf; kept
+/// DISTINCT from `ENOENT` because "the parent is not a directory" and "it is not there" send a caller
+/// to different fixes. Matches the syscall layer's `ENOTDIR`.
+const ENOTDIR: i32 = -20;
+/// DIRNS: a malformed EL0 path — no leaf at all (`""`, `"/"`), a leaf not representable as 8.3, or a
+/// REFUSED `..` component. Matches the syscall layer's `EINVAL`.
+const EINVAL: i32 = -22;
 
 /// The submission queue: raw `*mut BlockRequest` addresses (stored as `usize` so the static is
 /// `Sync` — the scheduler's `park_waiters` idiom). Pushed by submitters (IF already masked in the
@@ -298,6 +328,29 @@ pub unsafe fn submit_stat(name: &[u8]) -> i32 {
     unsafe { submit(&mut req as *mut BlockRequest) }
 }
 
+/// DIRNS (LEDGER SO20) helper: MKDIR the directory `name` (a path) on the live volume. `0` on success
+/// (created, or already a directory), `-ENOTDIR` when the leaf exists as a file, `-ENOENT` when a
+/// parent component is absent, `-EINVAL` on a malformed path, `-EIO` otherwise. Blocks the caller on
+/// the service task. No data buffer.
+///
+/// SAFETY: the caller must be a scheduled task (so it can block on the service task).
+pub unsafe fn submit_mkdir(name: &[u8]) -> i32 {
+    let mut req = BlockRequest::new_file(BlockOp::MkDir, name, 0, core::ptr::null_mut(), 0);
+    req.done.init();
+    unsafe { submit(&mut req as *mut BlockRequest) }
+}
+
+/// DIRNS (LEDGER SO20) helper: RMDIR the directory `name` (a path) on the live volume. `0` on success
+/// (removed, or already absent), `-ENOTDIR` when the name is a file, `-EIO` when it is not empty.
+/// Blocks the caller on the service task. No data buffer.
+///
+/// SAFETY: the caller must be a scheduled task (so it can block on the service task).
+pub unsafe fn submit_rmdir(name: &[u8]) -> i32 {
+    let mut req = BlockRequest::new_file(BlockOp::RmDir, name, 0, core::ptr::null_mut(), 0);
+    req.done.init();
+    unsafe { submit(&mut req as *mut BlockRequest) }
+}
+
 /// The service task body: pop one request, run it at IF=1, post the submitter. A normal scheduled
 /// kernel task, so its `hlt` inside the BOT pump wakes on the storage MSI-X. Never returns (the
 /// infinite loop makes the effective type `!`; `spawn` wants a `fn(usize)`, so it is left `()`).
@@ -364,7 +417,24 @@ fn service_one(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -
         BlockOp::Grow => service_grow_file(req, fs),
         BlockOp::Delete => service_delete_file(req, fs),
         BlockOp::Stat => service_stat_file(req, fs),
+        BlockOp::MkDir => service_mkdir(req, fs),
+        BlockOp::RmDir => service_rmdir(req, fs),
     }
+}
+
+/// DIRNS (LEDGER SO20): resolve a request's `name` as a PATH to an existing FILE. This is the one
+/// place the file ops below turn a name into an entry, and it calls [`crate::fs::vfs::el0_locate`] —
+/// the SAME resolver `arch/aarch64/syscall.rs`'s `sys_open` calls. That shared call is the whole
+/// point of the arc: before it, aarch64 walked directories (knob-on) while x86 resolved a root 8.3
+/// leaf here, so "what does this path mean" had two answers on one OS.
+///
+/// A bare leaf resolves `(parent = 0, leaf)` and therefore walks exactly the `find_located(name)`
+/// this replaces — every pre-DIRNS x86 file op is byte-identical in behaviour. `..` is refused by the
+/// resolver, so it is refused here too, and the refusal is counted on the same boot-wide witness.
+/// Directories are rejected by the callers, not here, because `MkDir` wants the opposite answer.
+fn resolve_path(fs: &crate::fs::fat::FatFs, name: &str) -> Option<(crate::fs::fat::DirEntry, u64, usize)> {
+    let mut created = false;
+    crate::fs::vfs::el0_locate(fs, name, false, &mut created).ok()
 }
 
 /// S2: a live in-place file-range read. Resolve `name` on the live volume, then `read_at` its
@@ -374,10 +444,8 @@ fn service_one(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -
 fn service_read_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
     let Some(fs) = mounted(fs) else { return EIO };
     let Ok(name) = core::str::from_utf8(&req.name[..req.name_len]) else { return EIO };
-    let (de, _lba, _off) = match fs.find_located(name) {
-        Ok(loc) if !loc.0.is_dir => loc,
-        _ => return EIO,
-    };
+    // DIRNS: a PATH through the shared resolver (a bare leaf walks the old `find_located` exactly).
+    let Some((de, _lba, _off)) = resolve_path(fs, name).filter(|t| !t.0.is_dir) else { return EIO };
     let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     if fs
         .read_at(de.first_cluster(), de.size, req.offset, &mut out, req.len)
@@ -399,10 +467,8 @@ fn service_read_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::Fat
 fn service_write_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
     let Some(fs) = mounted(fs) else { return EIO };
     let Ok(name) = core::str::from_utf8(&req.name[..req.name_len]) else { return EIO };
-    let (de, _lba, _off) = match fs.find_located(name) {
-        Ok(loc) if !loc.0.is_dir => loc,
-        _ => return EIO,
-    };
+    // DIRNS: a PATH through the shared resolver (a bare leaf walks the old `find_located` exactly).
+    let Some((de, _lba, _off)) = resolve_path(fs, name).filter(|t| !t.0.is_dir) else { return EIO };
     let data = unsafe { core::slice::from_raw_parts(req.buf, req.len) };
     match fs.write_at(de.first_cluster(), de.size, req.offset, data) {
         Ok(w) => w as i32,
@@ -417,13 +483,16 @@ fn service_write_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::Fa
 fn service_create_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
     let Some(fs) = mounted(fs) else { return EIO };
     let Ok(name) = core::str::from_utf8(&req.name[..req.name_len]) else { return EIO };
-    match fs.find_located(name) {
-        Ok(_) => 0, // already present — idempotent, no duplicate
-        Err(crate::fs::fat::FatError::NotFound) => match fs.create_in_root(name, 0x20) {
-            Ok(_) => 0,
-            Err(_) => EIO,
-        },
-        Err(_) => EIO, // a real I/O / mount error — do NOT create over it
+    // DIRNS: one call does BOTH halves — the shared resolver locates the leaf in its parent and, when
+    // absent, creates it there (`create_in_dir`, which for the root IS `create_in_root`). The
+    // idempotence this op has always promised is now structural rather than a `find_located` first
+    // step: `el0_locate` only creates on a NotFound, so an already-present name is returned untouched
+    // and no duplicate 8.3 slot can be planted. A real I/O error still never creates over it.
+    let mut created = false;
+    match crate::fs::vfs::el0_locate(fs, name, true, &mut created) {
+        Ok(_) => 0, // present or created
+        Err(crate::fs::vfs::El0LocateError::NotADirectory) => ENOTDIR,
+        Err(_) => EIO,
     }
 }
 
@@ -435,10 +504,8 @@ fn service_create_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::F
 fn service_grow_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
     let Some(fs) = mounted(fs) else { return EIO };
     let Ok(name) = core::str::from_utf8(&req.name[..req.name_len]) else { return EIO };
-    let (de, lba, off) = match fs.find_located(name) {
-        Ok(loc) if !loc.0.is_dir => loc,
-        _ => return EIO,
-    };
+    // DIRNS: a PATH through the shared resolver (a bare leaf walks the old `find_located` exactly).
+    let Some((de, lba, off)) = resolve_path(fs, name).filter(|t| !t.0.is_dir) else { return EIO };
     let data = unsafe { core::slice::from_raw_parts(req.buf, req.len) };
     match fs.write_grow(de.first_cluster(), de.size, lba, off, req.offset, data) {
         Ok((w, _ns, _nf)) => w as i32,
@@ -453,13 +520,18 @@ fn service_grow_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::Fat
 fn service_delete_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
     let Some(fs) = mounted(fs) else { return EIO };
     let Ok(name) = core::str::from_utf8(&req.name[..req.name_len]) else { return EIO };
-    match fs.find_located(name) {
+    // DIRNS: resolved as a PATH. The three outcomes are unchanged — delete a file, refuse a directory,
+    // treat an absent name as already done — but the resolver's error space says WHICH, so a missing
+    // intermediate directory is `NotFound` (idempotent success, the name is certainly gone) and is not
+    // confused with an I/O error the way a flat `find_located` miss would have been.
+    let mut created = false;
+    match crate::fs::vfs::el0_locate(fs, name, false, &mut created) {
         Ok((de, lba, off)) if !de.is_dir => match fs.delete_located(lba, off, de.first_cluster()) {
             Ok(_) => 0,
             Err(_) => EIO,
         },
         Ok(_) => EIO, // a directory under this name — never delete it via the file path
-        Err(crate::fs::fat::FatError::NotFound) => 0, // already gone — idempotent
+        Err(crate::fs::vfs::El0LocateError::NotFound) => 0, // already gone — idempotent
         Err(_) => EIO,
     }
 }
@@ -474,7 +546,11 @@ fn service_delete_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::F
 fn service_stat_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
     let Some(fs) = mounted(fs) else { return EIO };
     let Ok(name) = core::str::from_utf8(&req.name[..req.name_len]) else { return EIO };
-    match fs.find_located(name) {
+    // DIRNS: resolved as a PATH — this is the call that gives x86's `SYS_OPEN` a directory namespace.
+    // `sys_open`'s dynamic arm submits the whole path here and sizes the descriptor off the answer, so
+    // `SYS_OPEN("/apps/STAT.ELF")` now resolves the same tree the aarch64 syscall walks in-process.
+    let mut created = false;
+    match crate::fs::vfs::el0_locate(fs, name, false, &mut created) {
         Ok((de, _lba, _off)) if !de.is_dir => {
             if de.size > i32::MAX as u32 {
                 return EIO; // the size does not fit the i32 result channel — not openable via S7
@@ -482,8 +558,43 @@ fn service_stat_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::Fat
             de.size as i32 // >= 0: the on-disk byte size
         }
         Ok(_) => ENOENT, // a directory under this name — not an openable file
-        Err(crate::fs::fat::FatError::NotFound) => ENOENT, // absent from the live volume
-        Err(_) => EIO,   // a real mount / I/O error
+        Err(crate::fs::vfs::El0LocateError::NotFound) => ENOENT, // absent from the live volume
+        Err(crate::fs::vfs::El0LocateError::NotADirectory) => ENOTDIR, // a component that is a file
+        Err(crate::fs::vfs::El0LocateError::Invalid) => EINVAL, // no leaf, or a refused `..`
+        Err(_) => EIO, // a real mount / I/O error
+    }
+}
+
+/// DIRNS (LEDGER SO20): MKDIR — create the directory `name` names, through the shared resolver's walk
+/// to its parent. Idempotent (already a directory -> `0`); a leaf that exists as a FILE is `-ENOTDIR`.
+/// This is the op that lets x86 BUILD the tree its path opens then walk, so the DIRNS fixture proves
+/// the namespace end to end on this arch instead of depending on what the media script happened to
+/// stage. Single-writer by construction: it runs on this task, roster row 3.
+fn service_mkdir(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
+    let Some(fs) = mounted(fs) else { return EIO };
+    let Ok(name) = core::str::from_utf8(&req.name[..req.name_len]) else { return EIO };
+    match crate::fs::vfs::el0_mkdir(fs, name) {
+        Ok(_) => 0, // created, or already a directory
+        Err(crate::fs::vfs::El0LocateError::NotADirectory) => ENOTDIR,
+        Err(crate::fs::vfs::El0LocateError::NotFound) => ENOENT, // a parent component is absent
+        Err(crate::fs::vfs::El0LocateError::Invalid) => EINVAL,
+        Err(_) => EIO,
+    }
+}
+
+/// DIRNS (LEDGER SO20): RMDIR — `MkDir`'s twin, so a fixture that plants a tree can remove it and
+/// leave the volume as it found it. Idempotent; a FILE under the name is `-ENOTDIR`; a non-empty
+/// directory is refused by `fat::remove_dir` (it scans rather than orphaning a chain) and reports
+/// `-EIO`. Single-writer by construction: it runs on this task, roster row 3.
+fn service_rmdir(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
+    let Some(fs) = mounted(fs) else { return EIO };
+    let Ok(name) = core::str::from_utf8(&req.name[..req.name_len]) else { return EIO };
+    match crate::fs::vfs::el0_rmdir(fs, name) {
+        Ok(_) => 0, // removed, or already absent
+        Err(crate::fs::vfs::El0LocateError::NotADirectory) => ENOTDIR,
+        Err(crate::fs::vfs::El0LocateError::NotFound) => 0, // a parent is gone, so the dir is too
+        Err(crate::fs::vfs::El0LocateError::Invalid) => EINVAL,
+        Err(_) => EIO,
     }
 }
 

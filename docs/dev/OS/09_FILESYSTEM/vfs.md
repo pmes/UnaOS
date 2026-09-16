@@ -989,6 +989,114 @@ refuses, removes and re-reads across a genuine remount. Folding a positive pair 
 transcript as well is a queue row, not a one-line edit.
 
 
+### 13.9 DIRNS (LEDGER SO20) — `SYS_OPEN` takes a path, on both arches, through one resolver
+
+Until this arc every file EL0 could name lived in the volume root. `SYS_OPEN` took an 8.3 **leaf**:
+`MAX_NAME` was 12 and aarch64 called `find_located`, while x86 compared the name against two static
+tables and, knob-on, submitted a root 8.3 name to the storage service task. LOGIN M2 (`e16e04aa`)
+took the first step behind the `login` knob, on aarch64 only, so `/home/<user>` could exist. DIRNS
+makes it the **default** and makes it **shared**.
+
+**The resolver is `fs/vfs.rs`, not either `syscall.rs`.** The two arches reach it from different
+contexts — aarch64 from `sys_open` itself, which may mount and walk; x86 from the storage service
+task, because its IF-masked handler cannot (`irqstorage.rs`'s `Stat` says so in as many words) — so
+the shared thing could not be a syscall helper. `el0_locate(fs, path, create, &mut created)` walks
+the literal FAT directory tree from the volume root and returns the entry plus its on-disk
+`(dir_lba, dir_off)`, the same triple `find_located` always returned. `el0_mkdir` and `el0_rmdir` are
+its namespace twins. Each caller maps the resolver's small error enum into its own errno vocabulary
+in one `match`, at the arch boundary, where the errno constants already live.
+
+**It is deliberately NOT `MountTable`.** The brief for this arc asked for that route and it was
+refused, for three measured reasons: `shell::vfs_mount_table()` builds a table **fresh on every
+call** (on aarch64 that call runs `fs::bootdisk::locate`, which enumerates every disk and compares
+the running kernel's `.text` against candidate files), there is no cached instance anywhere in the
+kernel, and — decisively — `FatBackend::authorize_read` is the **foreign-volume posture**: one
+world-readable mount capability for the whole volume, no per-file owners. Routing `SYS_OPEN` through
+it would have *deleted* the U6/LOGIN owner ACL rather than preserved it. The mount table is the
+shell's namespace; this is EL0's. They may converge the day a backend carries per-object owners, and
+that is its own arc.
+
+**What a path means.** The literal directory tree of the EL0 volume. `/a/b/c` and `a/b/c` are one
+name — empty components are dropped — so a **bare leaf walks exactly the old root-only path**:
+`el0_locate(.., "X", ..)` resolves `(parent = 0, leaf = "X")` and calls `locate_in_dir(0, "X")`,
+which *is* `find_located("X")`, then `create_in_dir(0, ..)`, which *is* `create_in_root(..)`. That
+identity is why every pre-DIRNS fixture is untouched: they all name bare leaves.
+
+One asymmetry a reader must not trip over: `/apps/STAT.ELF` resolves because `APPS` is a **real
+directory** on that volume, while `/boot/X` does **not** — `/boot` is a shell *mount prefix* for the
+volume root (§13.3), not a directory in it. EL0's namespace is the tree; the mount table's prefixes
+are the shell's.
+
+**`..` is refused, not normalised** (`-EINVAL`), announced once per boot and **counted** for the
+life of it (`el0_escape_refusals()`). Normalising would make the resolver's answer depend on a
+path's spelling rather than on the tree — `A/../B` and `B` would be one name, and `A` would not have
+to exist — and it would hand the confinement question to string arithmetic inside a syscall. The
+namespace is walked downward from the root only, so there is no upward step to get right. The guard
+is checked before the leaf test, so `A/..` is refused too. `.` is not special-cased: it is looked up
+literally and misses.
+
+**The x86 root-leaf collapse is a security step, not tidying.** That arch keys its EL0 owner ACL by
+an index into the static `U10_NAMES` table (`OWNED_FILES`) — a byte comparison against constant
+strings. The moment `SYS_OPEN` accepted paths, `"/OWNED.BIN"` stopped being byte-equal to
+`"OWNED.BIN"` while still naming the same on-disk file: it would have missed the owner check and
+then resolved on the live volume as an arbitrary public file. A private file readable by respelling
+its name is a confidentiality break, and it is the same shape as the case-variant hole the dynamic
+path's uppercase canonicalisation already closes. So `sys_open` collapses a single-component path to
+its leaf (`fs::vfs::el0_root_leaf`) **before any table lookup**, and `"/OWNED.BIN"` takes the
+owner-checked path it always did. Anything still carrying a `/` below that point has two or more
+components and cannot be byte-equal to a table entry in any casing, so the case-variant exclusion is
+unchanged for root names and vacuous for paths. aarch64 needs no such step — its ACL is keyed by the
+entry's slot, which is the same slot however the name is spelled — but the collapse lives in `fs/`
+because the property relied on ("these two spellings are one name") belongs to the namespace.
+
+**What each arch gained.**
+
+| | before DIRNS | after |
+|---|---|---|
+| `MAX_NAME` | aarch64 12 (40 knob-on), x86 12 | 40 on both |
+| aarch64 `sys_open` | `find_located`, root only (knob-off) | `el0_locate`, default, no knob |
+| x86 `sys_open` | two static name tables + a root-8.3 `submit_stat` | the same, plus a path through the service task |
+| service-task ops | `find_located` by root leaf; `NAME_MAX` 12 | `el0_locate` by path; `NAME_MAX` 40; `MkDir`/`RmDir` added |
+| x86 `O_CREAT` by path | did not exist | creates the leaf in its parent, then re-stats |
+| owner ACL | aarch64 `(dir_lba, dir_off)`; x86 name-id | unchanged on both |
+
+**What it did NOT do, named so it is visible rather than implied.** No syscall number is minted —
+`MkDir`/`RmDir` are service-task ops with kernel-side callers, not a `SYS_MKDIR`. x86 gains the
+namespace **without owner attributes**: a path-created file there has no owner row at all, because
+`OWNED_FILES` is indexed by name-id and a path has none, so the x86 fixture prints `acl=n/a(SO35)`
+and the aarch64 fixture carries the real ACL leg. On aarch64 a path-created file's owner row still
+lives for the boot only (the native rebuild key is an 8.3 root name). Both are LEDGER **SO35**, which
+DIRNS widens rather than closes.
+
+**The witnesses.** One `:: DIRNS: … -> PASS ::` per arch. aarch64 (`arch/aarch64/syscall.rs`, file
+tail, chained into the u7 pass) drives `open_locate` — the entry `sys_open` itself calls — over the
+live EL0 FAT volume: `abs` (a root file by absolute name), `nested` (two `mkdir`s, create, write,
+**re-open by path, read the bytes back**), `escape`, `acl` (the real `OWNED_FILES` table: owner
+admitted, stranger refused, at a node two directories down), `root` (the bare leaf still names the
+same entry). x86 (`arch/x86_64/syscall.rs`, file tail, beside the S7 witness it generalises) enters
+at `sys_open_dynamic` on a scratch private row — the S7/S8 idiom, because the ring-3 name pointer is
+CFU-1's seam, not this fixture's — and carries `abs`, `nested`, `ocreat`, `escape` and `collapse`.
+Both are self-cleaning at both ends and therefore idempotent across boots and power cuts.
+
+**Go-red**: pin `el0_walk`'s `parent` to `0` — the root-pinned resolver — and `nested` goes FAIL
+(measured on the x86 leg: `nested=FAIL ocreat=FAIL root_alias=true -> FAIL ::`, run rc=1; reverted,
+`vfs.rs` byte-identical afterwards). **The first go-red did not fire on `nested`, and the reason is
+worth more than the fix**: the fixture's SETUP walks the same resolver its CHECK does, so a
+root-pinned build creates `DEEP.TXT` in the volume root and then reads it back from the volume root,
+self-consistently — `nested=ok` on a build with no namespace at all. Only `ocreat`, which carries an
+explicit "and NOT in the root" control, caught it. Both fixtures' `nested` legs now carry that
+control too (`root_alias`), which is what makes them able to fail. A fixture whose setup and
+assertion share the mechanism under test measures nothing about that mechanism.
+
+**Placement is load-bearing, and it was measured.** The aarch64 fixture runs DEAD LAST in the u7
+chain, after BANDY. Parked mid-chain beside `rmdir_unafs_witness` it cost the Pi leg three witnesses
+across two runs — ERET-SCRUB first-entry, U6b, the u7fix park margin — and ~5 300 guest lines of the
+300 s wall, while the same leg at the base commit was 126/126: its FAT directory I/O was contending
+for the EL0 volume's mount loan and for wall time with fixtures that were still running. Moved to
+the tail, the leg is 126/126 with DIRNS PASS. A witness that perturbs the run it is measured in is
+not free, and on a shared volume the cost lands on somebody else's fixture.
+
+
 ## 14. BOOTROOT (orin 22) — what `/` IS, and why the kernel is not told
 
 §4's namespace of record answered "what is mounted where" with a per-board table. This section

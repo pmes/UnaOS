@@ -2826,3 +2826,244 @@ pub fn nsgen_mock_table() -> MountTable {
     mt.mount("/", Box::new(NsMockBackend::new("nsgen")));
     mt
 }
+
+// =====================================================================================================
+// DIRNS (LEDGER SO20) — THE EL0 DIRECTORY NAMESPACE. File tail: nothing above this line moves.
+// =====================================================================================================
+//
+// SO20 said `SYS_OPEN` has no directory namespace: every EL0 file was pinned to the volume root
+// because the syscall took an 8.3 LEAF (`MAX_NAME` 12, `find_located`) on aarch64 and a STATIC name
+// table on x86. LOGIN M2 (e16e04aa) took the first step behind the `login` knob, on aarch64 only.
+// DIRNS makes it the DEFAULT and makes it SHARED: this is the ONE resolver both arches call, and the
+// only place that decides what an EL0 path means.
+//
+// WHERE IT LIVES AND WHY. In `fs/`, not in either `arch/*/syscall.rs`: the two arches reach it from
+// different CONTEXTS (aarch64 from `sys_open` itself, which may mount and walk; x86 from the storage
+// SERVICE TASK, because its IF-masked syscall handler cannot — `drivers/xhci/irqstorage.rs`), so the
+// shared thing cannot be a syscall helper. It is not in `fs/vfs.rs`'s `MountTable` either, and that
+// is deliberate: `MountTable` is built fresh per call by `shell::vfs_mount_table()` (on aarch64 that
+// call enumerates every disk and compares the running kernel's `.text` against candidate files), it
+// allocates, and its FAT backend has NO per-file owners — `FatBackend::authorize_read` is the
+// FOREIGN-VOLUME POSTURE, one world-readable mount capability for the whole volume. Routing
+// `sys_open` through it would have DELETED the U6/LOGIN owner ACL rather than preserved it. The
+// mount table is the shell's namespace; this is EL0's, and the ACL identity stays what U6 made it —
+// the entry's `(dir_lba, dir_off)` slot, wherever in the tree it sits.
+//
+// WHAT A PATH MEANS. The literal FAT directory tree of the EL0 volume, walked from its root.
+// `/a/b/c` and `a/b/c` are the same name (empty components are dropped), so a BARE LEAF walks
+// exactly the old root-only path and every pre-DIRNS fixture is untouched by construction. `..` is
+// REFUSED, never normalised (see `el0_locate`). Note the one asymmetry a reader must not trip over:
+// `/apps/STAT.ELF` resolves because `APPS` is a REAL directory on that volume, while `/boot/X` does
+// NOT — `/boot` is a shell MOUNT PREFIX for the volume root, not a directory in it. EL0's namespace
+// is the tree; the mount table's prefixes are the shell's. See `vfs.md` §13.
+
+/// DIRNS: the shared resolver's error space. Deliberately NOT [`VfsError`]: this resolver is called
+/// from a syscall and from the storage service task, neither of which can afford `VfsError`'s
+/// allocating `Backend(String)` arm, and both of which need `Busy` (the WEDGE-8 retryable driver
+/// loan, which `VfsError` cannot say) kept distinct from `Io`. Each caller maps these to its own
+/// errno vocabulary — one `match`, at the arch boundary, where the errno constants already live.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum El0LocateError {
+    /// A component, or the leaf with no create requested, is absent (`-ENOENT`).
+    NotFound,
+    /// A non-final component resolved to a FILE, or a `mkdir` leaf exists as one (`-ENOTDIR`).
+    NotADirectory,
+    /// No leaf at all, a leaf not representable as 8.3, or a refused `..` (`-EINVAL`).
+    Invalid,
+    /// The directory (or the volume) is full (`-ENOSPC`).
+    NoSpace,
+    /// WEDGE-8: the driver loan is busy — retryable, nothing mutated (`-EAGAIN`).
+    Busy,
+    /// Any other FAT error (`-EIO`).
+    Io,
+}
+
+/// DIRNS: how many EL0 opens have been refused for naming `..`. The escape guard's witness count —
+/// read by the DIRNS fixtures on both arches, so "refused" is a NUMBER on the wire and not an
+/// absence of evidence. A guard that fires on nothing is indistinguishable from a guard that is not
+/// there (LAWS §5: a check that cannot fire is an absent one), so the fixtures drive it and assert
+/// the count MOVED.
+static EL0_ESCAPE_REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// DIRNS: the escape refusal is ANNOUNCED once per boot and COUNTED every time. Once, because a
+/// hostile or buggy loop naming `..` must not be able to flood the wire the gates are counted from
+/// (LAWS: the wire may not lose lines — so nothing else may drown them either); counted, because the
+/// fixture needs a number.
+static EL0_ESCAPE_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// DIRNS: the `..` refusal count for this boot. See [`EL0_ESCAPE_REFUSED`].
+pub fn el0_escape_refusals() -> u32 {
+    EL0_ESCAPE_REFUSED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// DIRNS: the LEAF of an EL0 path — the last non-empty component, or `""` for a path that has none
+/// (`""`, `"/"`, `"///"`). Public because a caller may need to test the leaf BEFORE the walk: the
+/// aarch64 `sys_open` refuses the kernel's own ACL store by leaf name (K1 M4) wherever in the tree
+/// it is named, and it must do so before anything is claimed.
+pub fn el0_path_leaf(path: &str) -> &str {
+    path.split('/').filter(|c| !c.is_empty()).next_back().unwrap_or("")
+}
+
+/// DIRNS: `Some(leaf)` iff `path` names an entry directly in the VOLUME ROOT — exactly one non-empty
+/// component, and not `..`. `"/X"`, `"X"` and `"//X/"` all give `Some("X")`; `"A/X"` gives `None`.
+///
+/// ⚠ **THIS IS A SECURITY SEAM ON x86, not a convenience.** That arch keys its EL0 owner ACL by an
+/// index into the STATIC `U10_NAMES` table (`arch/x86_64/syscall.rs`'s `OWNED_FILES`), so the ACL is
+/// looked up by comparing the requested name against constant strings. The moment `SYS_OPEN` began
+/// accepting paths, `"/OWNED.BIN"` stopped being byte-equal to `"OWNED.BIN"` while still naming the
+/// SAME on-disk file — it would have missed the owner check and then resolved on the live volume as
+/// an arbitrary public file. A private file readable by spelling its name with a leading slash is a
+/// confidentiality break, and it is exactly the shape of the case-variant hole the dynamic path's
+/// uppercase canonicalisation already exists to close. So x86 collapses a single-component path to
+/// its leaf BEFORE any table lookup, and `"/OWNED.BIN"` takes the owner-checked path it always did.
+/// aarch64 has no such seam — its ACL is keyed by the entry's `(dir_lba, dir_off)` slot, which is the
+/// same slot however the name was spelled — but the collapse is defined here, once, because the
+/// property being relied on ("these two spellings are one name") is a property of the NAMESPACE.
+pub fn el0_root_leaf(path: &str) -> Option<&str> {
+    let mut it = path.split('/').filter(|c| !c.is_empty());
+    let first = it.next()?;
+    if it.next().is_some() || first == ".." {
+        return None;
+    }
+    Some(first)
+}
+
+/// DIRNS: walk `path`'s DIRECTORY components from the volume root and return
+/// `(parent_first_cluster, leaf)`. `0` is the volume root, so a bare leaf returns `(0, leaf)` — which
+/// is exactly the pre-DIRNS root-only behaviour, reached through this function instead of around it.
+///
+/// `..` IS REFUSED, NOT NORMALISED, and that is a ruling not an implementation detail. Normalising
+/// would make the resolver's answer depend on a path's SPELLING rather than on the tree (`A/../B`
+/// and `B` would be the same name, and `A` would not have to exist), and it would hand the
+/// confinement question to string arithmetic in a syscall. The EL0 namespace is walked DOWNWARD from
+/// the root, only ever downward, so there is no upward step to get right. `.` is not special-cased:
+/// it is looked up literally and misses, which is honest — FAT's own `.`/`..` slots exist in every
+/// subdirectory and a resolver that consumed them would be walking a tree the ACL does not model.
+fn el0_walk<'p>(
+    fs: &crate::fs::fat::FatFs,
+    path: &'p str,
+) -> Result<(u32, &'p str), El0LocateError> {
+    use crate::fs::fat::FatError;
+    use core::sync::atomic::Ordering;
+    let mut parent: u32 = 0; // the volume root
+    let mut it = path.split('/').filter(|c| !c.is_empty()).peekable();
+    let mut leaf: &str = "";
+    while let Some(c) = it.next() {
+        // The escape guard runs BEFORE the "is this the leaf" test, so `A/..` is refused too — the
+        // leaf position is not a hole in it.
+        if c == ".." {
+            let n = EL0_ESCAPE_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if !EL0_ESCAPE_SAID.swap(true, Ordering::Relaxed) {
+                serial_println!(
+                    "[el0ns] escape refused: `..` is not a component of the EL0 namespace (first of n={} this boot)",
+                    n
+                );
+            }
+            return Err(El0LocateError::Invalid);
+        }
+        if it.peek().is_none() {
+            leaf = c;
+            break;
+        }
+        match fs.locate_in_dir(parent, c) {
+            Ok((de, _, _)) if de.is_dir => parent = de.first_cluster(),
+            Ok(_) => return Err(El0LocateError::NotADirectory), // a component that is a file
+            Err(FatError::NotFound) => return Err(El0LocateError::NotFound),
+            Err(FatError::Busy) => return Err(El0LocateError::Busy),
+            Err(_) => return Err(El0LocateError::Io),
+        }
+    }
+    if leaf.is_empty() {
+        return Err(El0LocateError::Invalid); // no leaf: the bare root is not a file
+    }
+    Ok((parent, leaf))
+}
+
+/// DIRNS: resolve an EL0 `path` to its FAT directory entry and the entry's ON-DISK LOCATION —
+/// `(entry, dir_sector_lba, slot_offset)`, the triple `find_located` has always returned and the
+/// triple the U6 ACL is keyed by. With `create`, a leaf absent from its parent is created there as a
+/// plain 0-length file (`create_in_dir`, which for the root IS `create_in_root`) and `*created` is
+/// set, so the caller knows to record ownership.
+///
+/// The directory walk is READ-ONLY and the create is the caller's LAST fallible step before it
+/// claims anything, so this whole function sits inside `sys_open`'s "fallible lookups first, nothing
+/// claimed yet" window exactly where `find_located` used to. It takes no lock of its own: the
+/// aarch64 caller holds the NAMESPACE lock across it (as it did over `find_located`), and the x86
+/// caller IS the single-writer storage service task.
+pub fn el0_locate(
+    fs: &crate::fs::fat::FatFs,
+    path: &str,
+    create: bool,
+    created: &mut bool,
+) -> Result<(crate::fs::fat::DirEntry, u64, usize), El0LocateError> {
+    use crate::fs::fat::FatError;
+    let (parent, leaf) = el0_walk(fs, path)?;
+    match fs.locate_in_dir(parent, leaf) {
+        Ok(t) => Ok(t),
+        Err(FatError::NotFound) => {
+            if !create {
+                return Err(El0LocateError::NotFound);
+            }
+            match fs.create_in_dir(parent, leaf, 0x20 /* ATTR_ARCHIVE — a plain file */) {
+                Ok(t) => {
+                    *created = true;
+                    Ok(t)
+                }
+                Err(FatError::Unsupported) => Err(El0LocateError::Invalid), // not representable as 8.3
+                Err(FatError::NoSpace) => Err(El0LocateError::NoSpace),
+                Err(FatError::Busy) => Err(El0LocateError::Busy),
+                Err(_) => Err(El0LocateError::Io),
+            }
+        }
+        Err(FatError::Busy) => Err(El0LocateError::Busy),
+        Err(_) => Err(El0LocateError::Io),
+    }
+}
+
+/// DIRNS: create the DIRECTORY `path` names, through the same walk. IDEMPOTENT — a leaf that is
+/// already a directory is success (`false` = "it was already there"), which is what makes it safe
+/// for a fixture to run twice on a card that survives the first run; a leaf that exists as a FILE is
+/// `NotADirectory`, never a silent overwrite. `true` = this call created it.
+///
+/// This is the one namespace verb EL0 gained no syscall for: the aarch64 fixture and the x86 storage
+/// service task's `MkDir` op both call it, so the tree a path open walks is built by the same code
+/// that walks it. A `SYS_MKDIR` number is a separate question and this arc adds no syscall number.
+pub fn el0_mkdir(fs: &crate::fs::fat::FatFs, path: &str) -> Result<bool, El0LocateError> {
+    use crate::fs::fat::FatError;
+    let (parent, leaf) = el0_walk(fs, path)?;
+    match fs.locate_in_dir(parent, leaf) {
+        Ok((de, _, _)) if de.is_dir => Ok(false), // already a directory — idempotent
+        Ok(_) => Err(El0LocateError::NotADirectory), // exists as a file
+        Err(FatError::NotFound) => match fs.create_dir(parent, leaf) {
+            Ok(_) => Ok(true),
+            Err(FatError::Unsupported) => Err(El0LocateError::Invalid),
+            Err(FatError::NoSpace) => Err(El0LocateError::NoSpace),
+            Err(FatError::Busy) => Err(El0LocateError::Busy),
+            Err(_) => Err(El0LocateError::Io),
+        },
+        Err(FatError::Busy) => Err(El0LocateError::Busy),
+        Err(_) => Err(El0LocateError::Io),
+    }
+}
+
+/// DIRNS: remove the DIRECTORY `path` names, through the same walk. `Ok(true)` removed, `Ok(false)`
+/// it was not there (idempotent), `NotADirectory` it exists as a FILE, and the FAT layer's own
+/// non-empty refusal surfaces as `Io` — `fat::remove_dir` scans for emptiness and refuses rather than
+/// orphaning a chain, which is the behaviour SO18/RMDIR established for the native volume and this
+/// keeps for FAT. Its callers are kernel-side, as [`el0_mkdir`]'s are: the namespace verbs EL0 gained
+/// no syscall numbers for, used by the DIRNS fixtures to leave the volume as they found it.
+pub fn el0_rmdir(fs: &crate::fs::fat::FatFs, path: &str) -> Result<bool, El0LocateError> {
+    use crate::fs::fat::FatError;
+    let (parent, leaf) = el0_walk(fs, path)?;
+    match fs.locate_in_dir(parent, leaf) {
+        Ok((de, _, _)) if !de.is_dir => Err(El0LocateError::NotADirectory),
+        Ok(_) => match fs.remove_dir(parent, leaf) {
+            Ok(_) => Ok(true),
+            Err(FatError::Busy) => Err(El0LocateError::Busy),
+            Err(_) => Err(El0LocateError::Io), // includes the non-empty refusal
+        },
+        Err(FatError::NotFound) => Ok(false), // already gone — idempotent
+        Err(FatError::Busy) => Err(El0LocateError::Busy),
+        Err(_) => Err(El0LocateError::Io),
+    }
+}

@@ -8989,9 +8989,10 @@ fn sys_cap_revoke(asid: u64, idx: u64) -> i64 {
     0
 }
 
-/// The longest name `sys_open` accepts: a FAT 8.3 short name is at most "NAMENAME.EXT" = 8 + '.' + 3 = 12
-/// bytes. A longer request cannot name a real entry, so it is rejected as malformed rather than truncated.
-#[cfg(not(feature = "login"))] const MAX_NAME: usize = 12; #[cfg(feature = "login")] const MAX_NAME: usize = 40; // LOGIN M2 — SO20's first ABI step: knob-on a PATH (`HOME/UNA/NOTES.TXT`, at most 5+8+1+12 = 26) fits; knob-off the bound is the original 12, verbatim. ⚠ LINE-NEUTRAL fold.
+/// The longest name `sys_open` accepts. It used to be a single FAT 8.3 short name ("NAMENAME.EXT" = 8
+/// + '.' + 3 = 12 bytes); DIRNS (LEDGER SO20) made the name a PATH, so the bound is now a path's.
+/// A longer request cannot name a real entry, so it is rejected as malformed rather than truncated.
+const MAX_NAME: usize = 40; // DIRNS (SO20): a PATH, not a leaf — 40 bytes holds `/home/<8.3 user>/<8.3 leaf>` (5+8+1+12 = 26) with room for one more level. Was `12` knob-off / `40` knob-on (LOGIN M2's fold); DIRNS deletes the knob and keeps the wide bound on BOTH arches. The `namebuf` this sizes is a stack array in `sys_open`, so the cost is 28 bytes of one syscall frame.
 
 /// U10: `SYS_OPEN` mode bit1 — create the file if it is absent (and endow the write cap, since you create to
 /// write). Bit0 remains RW (U9). `O_CREAT` on an EXISTING file just opens it (idempotent). No `O_TRUNC` /
@@ -9072,25 +9073,17 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     // create writes only one directory sector (no cluster/FAT touched) and is still a "fallible lookup before
     // any resource claim" — its own failures (name / no-space) return cleanly.
     let mut created = false; // U6: did THIS open create a NEW name (-> the caller becomes its owner)?
-    #[cfg(feature = "login")] let (de, dir_lba, dir_off) = match open_locate(&fs, name, mode, &mut created) { Ok(t) => t, Err(e) => return e }; #[cfg(not(feature = "login"))] let (de, dir_lba, dir_off) = match fs.find_located(name) { // LOGIN M2 — knob-on the name may carry `/` components (a directory walk from the root, the leaf found or O_CREAT-created in its parent; a bare leaf walks exactly this statement's path); knob-off this statement is the original root-only find/create, verbatim. ⚠ LINE-NEUTRAL fold.
+    // DIRNS (SO20): the name may carry `/` components, and this is now the DEFAULT — no knob. The
+    // shared resolver walks every component but the last from the volume ROOT, and finds (or, with
+    // O_CREAT, creates) the leaf in its PARENT. A BARE LEAF walks exactly the path this statement
+    // used to take by hand: `el0_locate(.., "X", ..)` resolves `(parent=0, leaf="X")` and calls
+    // `locate_in_dir(0, "X")`, which IS `find_located("X")`, then `create_in_dir(0, ..)`, which IS
+    // `create_in_root(..)`. That identity is why the root-pinned behaviour survives as the trivial
+    // case and why every pre-DIRNS fixture (U1a..U11, U6/U6g, SOCK, VFSROUTE, RMDIR-UNAFS) passes
+    // unchanged — they all name bare leaves. `..` is refused, not normalised (see `el0_locate`).
+    let (de, dir_lba, dir_off) = match open_locate(&fs, name, mode, &mut created) {
         Ok(t) => t,
-        Err(crate::fs::fat::FatError::NotFound) => {
-            if mode & O_CREAT == 0 {
-                return ENOENT; // absent and no O_CREAT
-            }
-            match fs.create_in_root(name, 0x20 /* ATTR_ARCHIVE — a plain file */) {
-                Ok(t) => {
-                    created = true;
-                    t
-                }
-                Err(crate::fs::fat::FatError::Unsupported) => return EINVAL, // name not representable as 8.3
-                Err(crate::fs::fat::FatError::NoSpace) => return ENOSPC,     // root directory full
-                Err(crate::fs::fat::FatError::Busy) => return EAGAIN,        // WEDGE-8: retryable, nothing created
-                Err(_) => return EIO,
-            }
-        }
-        Err(crate::fs::fat::FatError::Busy) => return EAGAIN, // WEDGE-8: retryable, nothing claimed
-        Err(_) => return EIO,
+        Err(e) => return e,
     };
     if de.is_dir {
         return EISDIR; // a directory is not readable through a File handle (no dir ops this arc)
@@ -9171,7 +9164,16 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     // `native_acl_write`'s own with_unafs MOUNT hold is the serializer). Gated on `caller_ppid.kind != NONE` — the anonymous battery never reaches
     // the disk here, so the 23-fixture path stays byte-identical. A persist failure is non-fatal: the in-RAM
     // ACL still enforces THIS boot; only cross-reboot survival is lost (fails closed to PUBLIC at next mount).
-    #[cfg(feature = "login")] if name.contains('/') { return h as i64; } if created && asid != 0 && mode & O_PUBLIC == 0 && caller_ppid.kind != PRIN_NONE { // LOGIN M2 — a PATH-opened file is not persisted by name (the native rebuild key is an 8.3 ROOT name, LEDGER SO35): its owner row lives for the boot. ⚠ LINE-NEUTRAL fold.
+    // DIRNS: a PATH-opened file is not persisted by name, and the guard is now unconditional (it was
+    // knob-on-only because the path open was). The native ACL rebuild key is an 8.3 ROOT name
+    // (`native_persist_create` / `atr_rebuild_into_owned`), so persisting `HOME/UNA/NOTES.TXT` under
+    // the key `HOME/UNA/NOTES.TXT` would either collide with a root file of that spelling or rebuild
+    // onto nothing — it fails OPEN, which is the one direction an ACL may never fail. So the owner
+    // row of a path-created file lives for THIS BOOT only and reverts to public at the next mount.
+    // That residual is LEDGER SO35, stated by LOGIN M2 and unchanged here; it closes when the native
+    // volume carries path-keyed owner attributes, which is not this arc.
+    if name.contains('/') { return h as i64; }
+    if created && asid != 0 && mode & O_PUBLIC == 0 && caller_ppid.kind != PRIN_NONE {
         let _ = native_persist_create(name, de.first_cluster(), dir_lba, dir_off as u32, caller_ppid);
     }
     h as i64
@@ -16567,7 +16569,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // byte-same errno) proven at EL0. Self-cleaning; its own uncounted `:: BANDY-RT: … ::`
     // + `:: BANDY-EQ: … ::` lines. LAST in the chain.
     bandy_rt_launcher(demo_cpu);
-    u7stk!("after:bandy_rt");
+    u7stk!("after:bandy_rt"); #[cfg(feature = "witness")] dirns_witness(); // DIRNS (LEDGER SO20): the EL0 path-open proof, appended to this statement so no source line moves below it (LEDGER P7). It rides DEAD LAST, after BANDY, and that placement was MEASURED not chosen: parked mid-chain beside RMDIR it cost the leg three witnesses across two runs (ERET-SCRUB first-entry, U6b, the u7fix park margin) and ~5 300 guest lines of the 300 s wall, while the base leg was 126/126 — its FAT directory I/O was contending for the EL0 volume's mount loan and for wall time with fixtures that were still running. Nothing in the chain waits on it here, so the only thing it can now delay is the end of the boot. Self-cleaning at both ends; takes its own `fat::mount()`. Knob-off the `#[cfg]` erases the statement before MIR.
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -24577,74 +24579,63 @@ fn user_from_native(s: &[u8]) -> Option<PrincipalRecord> {
 }
 
 // =====================================================================================================
-// LOGIN M2 (`login` knob) — THE PATH OPEN and the HOME ACL PROOF. File tail: nothing above moves.
+// LOGIN M2 + DIRNS — THE PATH OPEN and the HOME ACL PROOF. File tail: nothing above moves.
 // =====================================================================================================
 //
-// SO20 said the EL0 namespace is a flat 8.3 volume root because `sys_open` takes a LEAF. This is the ABI
-// step that ruling asked for, taken only as far as `/home/<user>` needs: knob-on, a name may carry `/`
-// components; every component but the last must resolve to a DIRECTORY (`locate_in_dir` from the root,
-// cluster 0), and the leaf is found — or with O_CREAT created — in the LEAF'S PARENT. A bare leaf walks
-// exactly the old path (`locate_in_dir(0, leaf)` IS `find_located`, `create_in_dir(0, ..)` IS
-// `create_in_root`), so every existing fixture is untouched. The file's ACL identity stays
-// `(dir_lba, dir_off)` — the slot of the entry wherever it sits — so `owned_set_owner`/`owned_access_ok`
-// are unchanged. Error mapping is the original's, plus `-ENOTDIR` for a component that is a file.
+// SO20 said the EL0 namespace is a flat 8.3 volume root because `sys_open` takes a LEAF. LOGIN M2 took
+// the first step behind the `login` knob, as far as `/home/<user>` needed. DIRNS (LEDGER SO20) FINISHED
+// it: the knob is gone, the path open is the DEFAULT, and the WALK ITSELF MOVED OUT OF THIS FILE into
+// `crate::fs::vfs::el0_locate` — the one resolver x86's storage service task calls too, so the two
+// arches cannot drift on what a path means. What is left here is the errno mapping (`el0_errno`) and
+// the K1 M4 ATR guard in its path form (`open_locate`).
+//
+// The shape is M2's, unchanged: every component but the last must resolve to a DIRECTORY, and the leaf
+// is found — or with O_CREAT created — in the LEAF'S PARENT. A bare leaf walks exactly the old path
+// (`locate_in_dir(0, leaf)` IS `find_located`, `create_in_dir(0, ..)` IS `create_in_root`), so every
+// existing fixture is untouched. The file's ACL identity stays `(dir_lba, dir_off)` — the slot of the
+// entry wherever it sits — so `owned_set_owner`/`owned_access_ok` are unchanged. DIRNS added one rule
+// M2 did not have: `..` is REFUSED (`-EINVAL`), never normalised.
 
-/// LOGIN M2: a path component that is a file (sys_open had no directory vocabulary before this).
-#[cfg(feature = "login")]
+/// DIRNS: a path component that is a file (`sys_open` had no directory vocabulary before LOGIN M2).
+/// Unconditional now — the path open is the default, so its errno is part of the standing ABI.
 const ENOTDIR: i64 = -20;
 
-/// LOGIN M2: resolve `name` (a leaf or a `/`-separated path) on the EL0 FAT volume; create the leaf in
-/// its parent on O_CREAT. `Ok((entry, dir_lba, dir_off))`, `Err(errno)` in `sys_open`'s own vocabulary.
-#[cfg(feature = "login")]
+/// DIRNS (SO20): map the SHARED resolver's error space into `sys_open`'s errno vocabulary. This
+/// `match` is the entire arch-specific part of path resolution on aarch64 — the walk itself is
+/// [`crate::fs::vfs::el0_locate`], the same function the x86 storage service task calls, so the two
+/// arches cannot drift on what a path MEANS. (LOGIN M2's `open_locate` held its own copy of the
+/// walk; DIRNS moved the walk to `fs/` and left this mapping behind.)
+fn el0_errno(e: crate::fs::vfs::El0LocateError) -> i64 {
+    use crate::fs::vfs::El0LocateError as E;
+    match e {
+        E::NotFound => ENOENT,
+        E::NotADirectory => ENOTDIR,
+        E::Invalid => EINVAL, // no leaf, a name not representable as 8.3, or a refused `..`
+        E::NoSpace => ENOSPC,
+        E::Busy => EAGAIN, // WEDGE-8: retryable, nothing mutated
+        E::Io => EIO,
+    }
+}
+
+/// DIRNS: resolve `name` (a leaf or a `/`-separated path) on the EL0 FAT volume through the shared
+/// resolver; create the leaf in its parent on `O_CREAT`. `Ok((entry, dir_lba, dir_off))`, `Err(errno)`
+/// in `sys_open`'s own vocabulary. UNCONDITIONAL — LOGIN M2 gated this on `login`; DIRNS makes it the
+/// default, which is SO20's ask.
+///
+/// The K1 M4 rule (the kernel's own ACL store is never reachable through an EL0 File capability) is
+/// enforced HERE in its path form, on the LEAF wherever in the tree it is named — `sys_open` also
+/// checks the whole name up front, and both are kept: the up-front check is the cheap one that fires
+/// before the mount, this one is the one a path cannot slip past.
 fn open_locate(
     fs: &crate::fs::fat::FatFs,
     name: &str,
     mode: u64,
     created: &mut bool,
 ) -> Result<(crate::fs::fat::DirEntry, u64, usize), i64> {
-    use crate::fs::fat::FatError;
-    let mut parent: u32 = 0; // the root
-    let mut it = name.split('/').filter(|c| !c.is_empty()).peekable();
-    let mut leaf: &str = "";
-    while let Some(c) = it.next() {
-        if it.peek().is_none() {
-            leaf = c;
-            break;
-        }
-        match fs.locate_in_dir(parent, c) {
-            Ok((de, _, _)) if de.is_dir => parent = de.first_cluster(),
-            Ok(_) => return Err(ENOTDIR),
-            Err(FatError::NotFound) => return Err(ENOENT),
-            Err(FatError::Busy) => return Err(EAGAIN),
-            Err(_) => return Err(EIO),
-        }
-    }
-    if leaf.is_empty() {
-        return Err(EINVAL);
-    }
-    if leaf.eq_ignore_ascii_case(ATR_NAME) {
+    if crate::fs::vfs::el0_path_leaf(name).eq_ignore_ascii_case(ATR_NAME) {
         return Err(EACCES); // the kernel's own ACL store, wherever it is named (K1 M4's rule, path form)
     }
-    match fs.locate_in_dir(parent, leaf) {
-        Ok(t) => Ok(t),
-        Err(FatError::NotFound) => {
-            if mode & O_CREAT == 0 {
-                return Err(ENOENT);
-            }
-            match fs.create_in_dir(parent, leaf, 0x20 /* ATTR_ARCHIVE — a plain file */) {
-                Ok(t) => {
-                    *created = true;
-                    Ok(t)
-                }
-                Err(FatError::Unsupported) => Err(EINVAL),
-                Err(FatError::NoSpace) => Err(ENOSPC),
-                Err(FatError::Busy) => Err(EAGAIN),
-                Err(_) => Err(EIO),
-            }
-        }
-        Err(FatError::Busy) => Err(EAGAIN),
-        Err(_) => Err(EIO),
-    }
+    crate::fs::vfs::el0_locate(fs, name, mode & O_CREAT != 0, created).map_err(el0_errno)
 }
 
 /// LOGIN M2 fixture (`loginst`): the HOME ACL PROOF, kernel-side, on the real ACL tables and the real
@@ -24697,4 +24688,174 @@ pub fn home_acl_fixture(path: &str) -> bool {
         path, created, owned, anon_refused, owner_ok, same_user_ok, deleted, p_user.kind
     );
     created && owned && anon_refused && owner_ok && same_user_ok && p_user.kind == PRIN_USER
+}
+
+// =====================================================================================================
+// DIRNS (LEDGER SO20) — the aarch64 wire fixture. File tail: nothing above this line moves.
+// =====================================================================================================
+
+/// DIRNS: the fixture's own tree on the EL0 FAT volume. 8.3 names, distinct from every other
+/// fixture's (`grep -rn 'DIRNSD\|DIRNS.TXT'` finds only this block), so a collision on a card that
+/// already carries the demo chain is impossible by construction.
+#[cfg(feature = "witness")]
+const DIRNS_DIR: &str = "DIRNSD";
+#[cfg(feature = "witness")]
+const DIRNS_SUB: &str = "SUB";
+#[cfg(feature = "witness")]
+const DIRNS_ROOTFILE: &str = "/DIRNS.TXT";
+#[cfg(feature = "witness")]
+const DIRNS_NESTED: &str = "/DIRNSD/SUB/DEEP.TXT";
+#[cfg(feature = "witness")]
+const DIRNS_ESCAPE: &str = "/DIRNSD/SUB/../../DIRNS.TXT";
+#[cfg(feature = "witness")]
+const DIRNS_BODY: &[u8] = b"DIRNS-NESTED-PAYLOAD";
+
+/// DIRNS: drop the fixture's tree. Idempotent and best-effort — it runs BEFORE the fixture too, so a
+/// card that kept the tree from a previous boot (QEMU `if=sd` writes back into the image) starts
+/// clean instead of failing `created=true` on the second run. Returns nothing: a cleanup that can
+/// fail the run is a cleanup that makes the run about itself.
+#[cfg(feature = "witness")]
+fn dirns_scrub(fs: &crate::fs::fat::FatFs) {
+    for p in [DIRNS_NESTED, DIRNS_ROOTFILE] {
+        let mut c = false;
+        if let Ok((de, lba, off)) = crate::fs::vfs::el0_locate(fs, p, false, &mut c) {
+            owned_clear(lba, off as u32);
+            let _ = fs.delete_located(lba, off, de.first_cluster());
+        }
+    }
+    if let Ok((de, _, _)) = fs.locate_in_dir(0, DIRNS_DIR) {
+        let _ = fs.remove_dir(de.first_cluster(), DIRNS_SUB);
+    }
+    let _ = fs.remove_dir(0, DIRNS_DIR);
+}
+
+/// **DIRNS (LEDGER SO20) — `SYS_OPEN` has a directory namespace, and this is the aarch64 proof.**
+///
+/// Five legs over the LIVE EL0 FAT volume, driven through `open_locate` — the SAME entry point
+/// `sys_open` calls, so the ATR guard and the errno mapping are the ones EL0 gets, not a copy:
+///
+/// * `abs` — a file at the volume ROOT opened by its ABSOLUTE name (`/DIRNS.TXT`). This is the leg
+///   that proves the leading `/` and the bare leaf are the same name: the resolver drops empty
+///   components, so `/X` walks `(parent=0, leaf="X")`, which is literally `find_located("X")`. It is
+///   also the regression guard for every pre-DIRNS fixture, all of which name bare leaves.
+/// * `nested` — `mkdir /DIRNSD`, `mkdir /DIRNSD/SUB`, create + write + RE-OPEN BY PATH + read back
+///   `/DIRNSD/SUB/DEEP.TXT`, bytes compared. Two directory components, so it proves a WALK and not
+///   just a one-level special case. The read-back is the point: an open that resolves to the wrong
+///   entry, or to a fresh 0-length entry in the root, fails here rather than passing on a handle.
+/// * `escape` — `/DIRNSD/SUB/../../DIRNS.TXT` is REFUSED `-EINVAL`, and the refusal COUNT moved by
+///   exactly one. A target that exists and is openable by its own name is used on purpose: the leg
+///   fails if `..` is normalised (the open would succeed) AND if the guard is dead (the count would
+///   not move), so it cannot be satisfied by a resolver that simply refuses everything.
+/// * `acl` — the U6 owner check at the NESTED node, on the real `OWNED_FILES` table. The file's ACL
+///   identity is still `(dir_lba, dir_off)`, the entry's slot wherever in the tree it sits, so a
+///   path-opened file is owned exactly as a root-opened one: the owner ASID is admitted and a
+///   STRANGER ASID is refused. This is the leg that says DIRNS did not widen the namespace by
+///   weakening the gate on it.
+/// * `root` — a BARE LEAF (`DIRNS.TXT`, no slash) still resolves to the same entry the absolute name
+///   did. The trivial case, asserted rather than assumed, because "the old behaviour survives" is
+///   this arc's load-bearing compatibility claim and LAWS §5 does not let it be argued.
+///
+/// Self-cleaning at both ends. One `-> PASS ::` line; go-red is `el0_walk`'s `parent` pinned to `0`
+/// (the root-pinned resolver), which reds `nested`.
+#[cfg(feature = "witness")]
+pub fn dirns_witness() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(e) => {
+            serial_println!(":: DIRNS: no EL0 FAT volume ({:?}) — honest skip ::", e);
+            return;
+        }
+    };
+    dirns_scrub(&fs); // a card that kept the tree from a prior boot starts clean
+
+    // --- leg 1: abs — create a ROOT file and open it by its ABSOLUTE name. -----------------------
+    let mut created_abs = false;
+    let abs = open_locate(&fs, DIRNS_ROOTFILE, O_CREAT, &mut created_abs);
+    let abs_ok = matches!(abs, Ok(_)) && created_abs;
+
+    // --- leg 2: nested — two mkdirs, then create / write / re-open BY PATH / read back. ----------
+    let md1 = crate::fs::vfs::el0_mkdir(&fs, "/DIRNSD");
+    let md2 = crate::fs::vfs::el0_mkdir(&fs, "/DIRNSD/SUB");
+    let mut created_n = false;
+    let nested_made = open_locate(&fs, DIRNS_NESTED, O_CREAT, &mut created_n);
+    let mut wrote = 0usize;
+    if let Ok((de, lba, off)) = nested_made {
+        if let Ok((n, _sz, _fc)) = fs.write_grow(de.first_cluster(), de.size, lba, off, 0, DIRNS_BODY) {
+            wrote = n;
+        }
+    }
+    // The RE-OPEN is a fresh resolve from the root — not a reuse of the triple above — so it proves
+    // the walk finds the entry the write landed in.
+    let mut c2 = false;
+    let mut body = alloc::vec::Vec::new();
+    let reopen = crate::fs::vfs::el0_locate(&fs, DIRNS_NESTED, false, &mut c2);
+    if let Ok((de, _, _)) = reopen {
+        let _ = fs.read_at(de.first_cluster(), de.size, 0, &mut body, DIRNS_BODY.len());
+    }
+    // THE CONTROL, and it is the difference between a leg that can fail and a leg that cannot.
+    // MEASURED on x86, not anticipated: the go-red (`el0_walk`'s parent pinned to the root) left
+    // `nested=ok`, because the fixture's SETUP walks the same resolver the check does — a root-pinned
+    // build creates DEEP.TXT in the ROOT and reads it back from the ROOT, self-consistently. So the
+    // leg also asserts the leaf is NOT reachable as a bare root name, which the mutation makes false.
+    let root_alias = fs.locate_in_dir(0, "DEEP.TXT").is_ok();
+    let nested_ok = md1.is_ok()
+        && md2.is_ok()
+        && created_n
+        && wrote == DIRNS_BODY.len()
+        && body.as_slice() == DIRNS_BODY
+        && !root_alias;
+
+    // --- leg 3: escape — `..` refused, and the guard's count MOVED. ------------------------------
+    let esc_before = crate::fs::vfs::el0_escape_refusals();
+    let mut c3 = false;
+    let esc = open_locate(&fs, DIRNS_ESCAPE, 0, &mut c3);
+    let esc_after = crate::fs::vfs::el0_escape_refusals();
+    // `matches!`, not `==`: `DirEntry` is not `PartialEq`, so the Result cannot be compared whole.
+    let escape_refused = matches!(esc, Err(e) if e == EINVAL) && esc_after == esc_before + 1 && !c3;
+
+    // --- leg 4: acl — the U6 owner check at the NESTED node, real table, scratch ASIDs. ----------
+    const A_OWNER: u64 = 6;
+    const A_STRANGER: u64 = 7;
+    slot_ppid_clear(A_OWNER);
+    slot_ppid_clear(A_STRANGER);
+    let p_own = slot_ppid_of(A_OWNER);
+    let p_str = slot_ppid_of(A_STRANGER);
+    let g_own = ASID_GEN[A_OWNER as usize].load(Ordering::Acquire);
+    let g_str = ASID_GEN[A_STRANGER as usize].load(Ordering::Acquire);
+    let (mut owned, mut owner_ok, mut stranger_refused) = (false, false, false);
+    if let Ok((_, lba, off)) = reopen {
+        owned = owned_set_owner(lba, off as u32, A_OWNER, g_own, p_own);
+        owner_ok = owned_access_ok(lba, off as u32, A_OWNER, g_own, CAP_READ | CAP_WRITE, p_own);
+        stranger_refused = !owned_access_ok(lba, off as u32, A_STRANGER, g_str, CAP_READ, p_str);
+    }
+    let acl_ok = owned && owner_ok && stranger_refused;
+
+    // --- leg 5: root — the BARE LEAF still names the same entry. ---------------------------------
+    let mut c5 = false;
+    let bare = open_locate(&fs, "DIRNS.TXT", 0, &mut c5);
+    let root_ok = match (bare, abs) {
+        (Ok((_, l1, o1)), Ok((_, l2, o2))) => l1 == l2 && o1 == o2 && !c5,
+        _ => false,
+    };
+
+    dirns_scrub(&fs);
+    let pass = abs_ok && nested_ok && escape_refused && acl_ok && root_ok;
+    serial_println!(
+        ":: DIRNS: abs={} nested={} escape={} acl={} root={} (wrote={} read={} root_alias={} esc={}->{}) -> {} ::",
+        if abs_ok { "ok" } else { "FAIL" },
+        if nested_ok { "ok" } else { "FAIL" },
+        if escape_refused { "refused" } else { "FAIL" },
+        if acl_ok { "refused" } else { "FAIL" },
+        if root_ok { "ok" } else { "FAIL" },
+        wrote,
+        body.len(),
+        root_alias,
+        esc_before,
+        esc_after,
+        if pass { "PASS" } else { "FAIL" }
+    );
 }

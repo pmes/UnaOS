@@ -204,6 +204,22 @@ fi
 # ---------------------------------------------------------------------------------------------
 # THE TOKEN REGISTRY. `measured` rows were proven against an x86 media artifact; `unmeasured-here`
 # rows were read out of the source and await an aarch64 artifact (see the arc report).
+#
+# ⚠ THIS IS A HEREDOC: every line inside it is parsed as a `feature|token|cond|state` row. A `#`
+# comment placed between rows becomes a row whose token is empty, and the registry self-check then
+# reds the whole gate with "token for '# ...' is 0 bytes". Comments go HERE, above the function.
+# (DIRNS learned that the expensive way, 2026-09-15.)
+#
+# `irqstorage` (DIRNS, LEDGER SO20, 2026-09-15) was UNREGISTERED until this row, so ANY media build
+# that armed it — `UNAOS_IRQSTORAGE=1 ./arroyo esp-x86`, and therefore `test-fat` — exited 2 with NO
+# VERDICT and never reached QEMU. That is why the STOR-1 knob-on witnesses are OPTIONAL in
+# x86-fat.spec and why x86's live-storage path had no media gate at all; DIRNS needed one, so it
+# added the row rather than dropping the knob. The token is a literal in `drivers/xhci/irqstorage.rs`
+# and its control is the strongest shape this tree has: the MODULE is gated
+# `#[cfg(all(target_arch = "x86_64", feature = "irqstorage"))] pub mod irqstorage;`
+# (drivers/xhci/mod.rs:25), so knob-off the file is never lexed and the string cannot exist.
+# Measured on the DIRNS artifact: `LC_ALL=C grep -a -c -F` = 1 knob-on, and 0 for a known-absent
+# control string on the same artifact.
 # ---------------------------------------------------------------------------------------------
 bc_table() {
 cat <<'TABLE'
@@ -219,6 +235,7 @@ smc|:: SMC-BATT: sweep failed (present=false)|-|measured
 smcwalk|:: SMC-SCOUT: idx|smc|measured
 sdhcblk|the staged file is FRAGMENTED; the permit describes exactly one LBA interval|-|measured
 sdwrite|:: SDWRITE-POSTURE: posture=|witness|measured
+irqstorage|:: bx-blockreq: no block device|-|measured(1)
 bt|vendor-classed: RF/Bluetooth subclass+protocol|-|measured
 btc|REACHED — a BR/EDR link was established|-|measured
 smolnet|:: SOCK-1: smoltcp icmp echo|-|measured(1)

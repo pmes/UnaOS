@@ -148,6 +148,20 @@ capability-isolated software principals**, not classical login/uid multi-user.
   on-disk attributes will feed; see the aarch64 ledger); the **x86 twin (U6x)**, the
   bandy Ring-3 delegation wrapper, subdirs/LFN/rename, and write-back caching remain
   future. See both ledgers below.)*
+- **DIRNS (LEDGER SO20, 2026-09-15) widened the ACL's SURFACE without widening its
+  REACH, and the difference is the risk.** `SYS_OPEN` now takes a PATH on both arches
+  through one shared resolver (`fs::vfs::el0_locate`; `docs/dev/OS/09_FILESYSTEM/vfs.md`
+  §13.9), so EL0 can name a file two directories down. aarch64's check is unchanged and
+  fully applies — it is keyed by the entry's `(dir_lba, dir_off)` slot, the same slot
+  however the name is spelled — but **x86 keys `OWNED_FILES` by an index into the static
+  `U10_NAMES` table, so a path-created file there has NO owner row and is public**
+  (LEDGER SO35, widened by this arc, not closed). Two guards carry the gap: `..` is
+  REFUSED, never normalised (`-EINVAL`, counted per boot), so no path walks upward out
+  of the namespace; and `sys_open` COLLAPSES a single-component path to its bare leaf
+  (`fs::vfs::el0_root_leaf`) before any name-table lookup, so `"/OWNED.BIN"` cannot miss
+  the owner check the way a case variant once could and then resolve on disk as an
+  arbitrary public file. That collapse is load-bearing on x86 and is asserted by the
+  `collapse` leg of the x86 DIRNS witness.
 - **UnaFS stores the metadata natively**: `owner` and `grants:*` are ordinary
   typed attributes — queryable ("show every file the midi-agent can write"),
   and no on-disk format change is ever needed.
