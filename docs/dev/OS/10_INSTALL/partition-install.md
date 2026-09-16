@@ -14,6 +14,26 @@ guard, INSTALL-SELF, protects the disk we BOOTED from and *"leaves every OTHER d
 candidate by construction"*. The refusal table lives in [`docs/SECURITY.md`](../../../SECURITY.md)
 §"Installer — what it refuses to touch"; this file is the operator procedure and the firmware facts.
 
+**SELFGUARD-AHCI — INSTALL-SELF can see a SATA disk now, and until this it could not.** The guard's
+candidate set was built from `block::info()` + `block::usb_info()` and nothing else, so once AHCIBOOT
+gave the tree `BlockHandle::Ahci { port }` an installer could be handed a SATA identity that matched
+no candidate — `classify` fell to its explicit "do not invent a verdict" arm and answered **Eligible**
+for it. On this machine that is the whole ballgame: the boot volume and Catalina are on the **same**
+internal SATA disk, so the graphical chooser and the whole-disk engine would both have been told the
+disk the OS is running from is a legitimate target. (AHCIWRITE asked the question a second time, and
+locally, in `install/partition.rs`'s `sata_is_boot_device`; that was a workaround and it said so.)
+`install/selfguard.rs`'s `live()` now appends every live SATA disk, read out of **`fat::live_sources()`
+— the same census `fs::bootdisk`'s root walk uses**, so a disk that can become `/` can never fail to
+be judged, and there is no second enumeration to drift. The DECISION did not change: `decide(boot,
+serials)` is untouched and a SATA disk is refused by exactly the rule a USB stick is refused by —
+it carries the boot volume's `BS_VolID`, so it is the device we booted from or a byte clone of it.
+The witness is `:: SELFGUARD: census disks=<n> usb=<n> sata=<n> boot=<identity> ::` followed by one
+`:: SELFGUARD: classify <identity> -> <verdict> reason=<token> ::` per candidate, emitted from the
+same scan that fills the cache every `classify` reads. On the QEMU AHCI leg the ESP carrying
+`kernel.elf` is an `ide-hd` on q35's ICH9 controller, so the census reads `sata=1` and that disk
+classifies `-> INSTALL-SELF` — the first time the exclusion path has had a live fixture at all.
+The "do not invent a verdict" arm stays, for identities the census truly does not know.
+
 ---
 
 ## The operator procedure, in five lines
