@@ -1142,6 +1142,307 @@ static C11_PIX_INSTALLED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "witness")]
 static C11_PIX_REDRAWN: AtomicU64 = AtomicU64::new(0);
 
+/// PTRREPAINT — **panel presents that SCANNED OUT WITHOUT THE ARROW while the arrow was live and
+/// visible.** The number Peter's two sentences from flights 8 and 9 reduce to, and it must be `0`.
+///
+/// Counted at the PUBLICATION, in [`super::screen::Screen::flush`], and not at the decision: a
+/// present that opened the CURSOR-13 bracket and then clipped its damage to nothing put no
+/// spriteless frame in front of the display and is not a flicker. That is the whole difference
+/// between this and `[flick2] flush_undraw=` one line over, which counts the decision and keeps
+/// doing so — the pair is "how often did we plan to take the arrow down" against "how often did the
+/// panel then go out without it".
+///
+/// **Say the obvious thing out loud, because a reader will otherwise over-quote the zero.** With
+/// `screen::DESK_SPRITE_OCC` armed this counter is 0 BY CONSTRUCTION, not by measurement: the arm
+/// that would increment it needs `bracket && live`, and on that configuration `bracket_needed`
+/// answers `false` for every live arrow. It is the arc's INVARIANT — the thing that must stay true
+/// as the compositor changes around it — and its evidence is the MUTATION (set `DESK_SPRITE_OCC` to
+/// `false` and it counts again, which is the baseline's behaviour with this instrument added), not
+/// the zero on its own. The number that says the fix RAN is `px_absorbed`; the number that says the
+/// desktop present stopped bracketing is `[flick2] flush_undraw=` going to 0 with `flush_skip=`
+/// taking the whole live-sprite population. On knob-off x86 and on aarch64 the bracket is still
+/// taken and this counter is a live measurement rather than an invariant.
+///
+/// **Counted only where a bracket IS a scan-out gap**, i.e. where `pal::cursor::SPRITE_OWNS_PAINT`
+/// says the arrow the operator sees is the FRONT-buffer one the bracket takes down. On aarch64 the
+/// visible arrow over the backdrop is a BACK-buffer sprite the desktop present CARRIES to glass
+/// (SO5), so a bracket there blinks nothing — the Orin's `[flick2] flush_undraw=5794 flush_skip=1`
+/// is that board bracketing on essentially every desktop present with no blink ever reported. The
+/// call site carries the term; without it this line would read `-> FLICKER` on every Pi and Orin
+/// boot about a finding that is false there.
+///
+/// Why a present can flicker at all on x86 and not on the Pi: the FRONT framebuffer IS the scan-out
+/// buffer there. `arch::flush_framebuffer_range` is a store fence on x86 and a `DC CVAC` sweep on
+/// aarch64, so CURSOR-10's [`FlushUnion`] — which exists precisely to stop an undraw PUBLISHING an
+/// arrowless panel before the redraw lands — buys the non-coherent board a real atomicity that the
+/// coherent board cannot have. On x86 the writes are the publication, so the only way to keep the
+/// arrow on the glass across a desktop present is to not write over it: see `DESK_SPRITE_OCC`.
+#[cfg(feature = "witness")]
+static C11_FLICKER: AtomicU64 = AtomicU64::new(0);
+
+/// PTRREPAINT — pixels of the sprite's BOX that [`absorb_desktop`] settled out of the back buffer:
+/// the painted ones whose `saved[i]` it re-took, plus the transparent ones it wrote through to the
+/// panel because the copy withheld the whole box and could not withhold a mask. One number for both
+/// arms on purpose — it answers one question, "did the withheld span get settled", and splitting it
+/// would invite a reader to treat half of a single settlement as the whole of it.
+///
+/// **The CONTROL for `flicker_frames`**, and it is not decoration: a boot whose pointer never stood
+/// under a desktop present reports `flicker_frames=0` in the same words a fixed one does, and only a
+/// non-zero count here distinguishes "the mechanism ran and nothing blinked" from "nothing ever
+/// happened". Read the pair or neither.
+#[cfg(feature = "witness")]
+static C11_PIX_ABSORBED: AtomicU64 = AtomicU64::new(0);
+
+/// PTRREPAINT — desktop presents whose [`absorb_desktop`] was REFUSED the sprite loan. The pixels
+/// were still withheld by the copy (the subtraction is decided from a lock-free box snapshot and
+/// cannot be taken back), so their save-under is one present stale until the next full undraw's
+/// `repair` queues the box — the pre-existing CURSORBG handback, doing exactly the job it was
+/// written for. Bounded and counted rather than waited out, on [`claim`]'s standing policy.
+#[cfg(feature = "witness")]
+static C11_ABSORB_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+/// PTRREPAINT — the flicker counter's one call site, from the desktop present that published a
+/// panel with a live arrow off it. See [`C11_FLICKER`].
+#[cfg(feature = "witness")]
+pub fn note_flicker_frame() {
+    C11_FLICKER.fetch_add(1, Ordering::Relaxed);
+}
+
+/// PTRREPAINT — has a desktop present ever met a live, visible sprite on this boot? The arming
+/// condition for [`cursor11_desk_tick`], and the reason a boot with no pointer prints no line at
+/// all rather than a `flicker_frames=0` that means nothing.
+#[cfg(feature = "witness")]
+static C11_DESK_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// PTRREPAINT — `arch::ms()` at the last desktop-cadence emission; 0 = the window is unarmed.
+#[cfg(feature = "witness")]
+static C11_DESK_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// PTRREPAINT — how often the desktop-cadence rollup may print when the counters have MOVED.
+/// `pal::cursor::ROLLUP_EVERY_MS` and [`CB_ROLLUP_MS`] both, so a capture carries this line on the
+/// same 5 s beat as `[strip] rollup`, `[wc-h] rollup` and `[cursor] restore`, and a reader comparing
+/// them is comparing like with like.
+#[cfg(feature = "witness")]
+const C11_DESK_EVERY_MS: u64 = 5_000;
+
+/// PTRREPAINT — and how often it may repeat itself when they have NOT.
+///
+/// The desktop presents forever; the POINTER does not. CURSOR-HIDE takes the arrow off after 1.5 s
+/// without input, `live` goes false, nothing this line reports can move again until the operator
+/// touches the pad — and at the 5 s beat alone that is a byte-identical line, three deep with its
+/// chained rollups, every five seconds for the rest of the boot. Measured on the gate that first
+/// carried this witness: 22 identical `[cursor11] scope=desk` lines in a 120 s run, 66 lines with
+/// the chain, all of them the same 86/30/2916/972/72/0/324/0.
+///
+/// Suppressing the repeat ENTIRELY is the wrong fix and is the trap LAWS §5 names: a reader landing
+/// in a late part of a capture would find no line at all and could not tell a quiet instrument from
+/// a dead one. So an unchanged sample is not dropped, it is SLOWED — one heartbeat a minute, which
+/// keeps the instrument visibly alive at a twelfth of the wire. A sample whose counters moved always
+/// takes the fast beat, so nothing that can change is ever delayed by this: `flicker_frames` going
+/// non-zero IS a change and prints at the next 5 s boundary.
+#[cfg(feature = "witness")]
+const C11_DESK_IDLE_MS: u64 = 60_000;
+
+/// PTRREPAINT — the counter tuple as last EMITTED, so an unchanged sample can be told from a moved
+/// one without re-reading the wire. Packed rather than kept as five statics because the question is
+/// "did this line's content change", which is one question about one line.
+#[cfg(feature = "witness")]
+static C11_DESK_LAST_DIGEST: AtomicU64 = AtomicU64::new(0);
+
+/// PTRREPAINT — **print [`cursor11_rollup`] on the DESKTOP PRESENT's cadence, and the measurement
+/// that says this line had to exist.**
+///
+/// `[cursor11]`'s only emitter is `pal::cursor::rollup_tick`, which fires from a HID POINTER REPORT
+/// and rate-limits to 5 s — so the block needs a pointer that keeps talking for five seconds. That
+/// is an operator at the bench, and it is nobody on the gate: the x86 QEMU suite's `usb-tablet`
+/// delivered exactly ONE report on the `f8f8ce8c` baseline (`:: MOUSE-1: 1 reports`, with the
+/// XHCIHUB typist's 12 injected moves scoring `evts=1`), the limiter's first-report arm consumed
+/// it, and the whole `[wc-i]` / `[cursor3] rollup` / `[cursor5]` / `[cursor6]` / `[cursor8]` /
+/// `[cursor11]` / `[flick2]` block printed ZERO lines on that run. aarch64 has a second, fixture
+/// scope emitter (`arch::aarch64::syscall` calls `wm::wci_rollup`) and x86 has never had one.
+///
+/// A witness that cannot execute in the state it reports on is an absent one (LAWS §5), and
+/// `flicker_frames` is a claim about DESKTOP PRESENTS — so the desktop present is where it can be
+/// sampled with no operator in the loop, and where its population is the one the number describes.
+/// It does not replace the pointer-cadence emission: that one reports a window whose every pass had
+/// a live pointer moving through it, which is a different and narrower population, and `scope=`
+/// keeps the two apart on the wire (`desk` here, `live`/`desktop`/`fixture` there).
+///
+/// **Armed, never vacuous.** Nothing prints until a desktop present has actually met a live, visible
+/// arrow, so a keyboard-only boot and every headless suite that never draws the sprite stay exactly
+/// as silent as they are today — which is what keeps a zero here from being readable as a pass on a
+/// boot that never had a pointer. `px_absorbed=` on the line is the second half of the same guard.
+///
+/// **`swap`, not read-then-write**, on `rollup_tick`'s own argument: two cores can present
+/// concurrently and the limiter must lose a sample rather than duplicate a block.
+///
+/// Safe to print from here: this is the render task, unmasked, at the same seam `desk_amp_flush`
+/// already writes the DRAGWIDE rollup from, and `cursor11_rollup` takes no lock — it loads atomics
+/// and chains two more rollups that do the same.
+#[cfg(feature = "witness")]
+pub fn cursor11_desk_tick(live: bool) {
+    if live {
+        C11_DESK_ARMED.store(true, Ordering::Relaxed);
+    }
+    if !C11_DESK_ARMED.load(Ordering::Relaxed) {
+        return;
+    }
+    // `max(1)` keeps 0 as the "unarmed" sentinel on a clock that legitimately reads 0 early in boot,
+    // exactly as `F2_DOWN_AT_MS` does one screen up.
+    let now = crate::arch::ms().max(1);
+    let last = C11_DESK_LAST_MS.load(Ordering::Relaxed);
+    if last == 0 {
+        let _ = C11_DESK_LAST_MS.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+        return;
+    }
+    let since = now.wrapping_sub(last);
+    if since < C11_DESK_EVERY_MS {
+        return;
+    }
+    // The content test, and it is what decides WHICH beat applies. A cheap order-sensitive mix of
+    // the six counters this line reports — not a checksum, just a value that changes when any of
+    // them does; a collision costs one skipped heartbeat and can never hide a change for longer than
+    // `C11_DESK_IDLE_MS`, because the idle beat prints regardless of the digest.
+    let digest = C11_FLICKER
+        .load(Ordering::Relaxed)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(7)
+        ^ C11_PIX_ABSORBED.load(Ordering::Relaxed).wrapping_mul(31).rotate_left(17)
+        ^ C11_PASSES.load(Ordering::Relaxed).rotate_left(29)
+        ^ C11_BRACKETED.load(Ordering::Relaxed).rotate_left(41)
+        ^ C11_PIX_DEFERRED.load(Ordering::Relaxed).rotate_left(53)
+        ^ C11_PIX_REDRAWN.load(Ordering::Relaxed);
+    // `!= 0` so the FIRST armed sample always prints: a zeroed digest is also the initial value of
+    // the static, and a boot whose counters genuinely mix to 0 would otherwise wait out the idle
+    // beat for its opening line.
+    if digest == C11_DESK_LAST_DIGEST.load(Ordering::Relaxed)
+        && C11_DESK_LAST_MS.load(Ordering::Relaxed) != 0
+        && since < C11_DESK_IDLE_MS
+    {
+        return;
+    }
+    if C11_DESK_LAST_MS.swap(now, Ordering::Relaxed) != last {
+        return;
+    }
+    C11_DESK_LAST_DIGEST.store(digest, Ordering::Relaxed);
+    cursor11_rollup("desk");
+}
+
+/// PTRREPAINT — SETTLE THE SPAN THE DESKTOP COPY WITHHELD, and the sprite box's two halves.
+///
+/// `super::screen::Screen::present_background` has just copied the desktop to the panel with the
+/// sprite's BOX subtracted out of the copy, exactly as it subtracts a window's — so the arrow was
+/// never taken down, which is the fix. But a box is not a mask, and the box has two kinds of pixel
+/// in it. Both are settled here, and neither may be left out:
+///
+/// * **PAINTED pixels** — the arrow and its shadow. The panel must keep OUR colour (that is the
+///   whole point), so nothing is written; what is stale is `sp.saved[i]`, which now describes the
+///   desktop this present SUPERSEDED. It is re-taken from the BACK buffer, so a later restore hands
+///   back the NEW desktop and not the old one — without this the withholding would reappear as the
+///   CURSORBG trail, arriving through a new door.
+/// * **TRANSPARENT pixels** — the rest of the box, where the desktop shows THROUGH the sprite and
+///   the panel is supposed to be carrying this present's pixels. The copy withheld them because
+///   `next_visible_span` subtracts boxes and cannot subtract a mask, so leaving them alone would
+///   FREEZE the desktop inside a rectangle that follows the pointer — the status strip's bars would
+///   stop moving under the arrow. They are written here instead, `back` -> `front`, which is exactly
+///   what the copy would have done and touches no sprite pixel by construction.
+///
+/// So the arrow is never absent from the glass and no published pixel is lost. The box is a few
+/// hundred pixels, so this is a per-pixel loop where the copy uses bulk row `blit`s; that is the
+/// price of subtracting a mask-shaped surface with a rectangle, and it is paid once per present
+/// that actually withheld something.
+///
+/// * `published(x, y)` — the caller's own copy predicate, restated per pixel: inside some clipped
+///   damage rect and outside every SURFACE occluder. The caller owns both sets; this module must
+///   not re-derive either.
+/// * `read_back(x, y)` — the BACK buffer, cached RAM. **Never the front.** Reading the panel here
+///   would read our own arrow back as "what is underneath", which is the stale-restore hazard the
+///   whole save-under discipline exists to prevent, and the write-only-VRAM contract forbids it
+///   besides.
+///
+/// **The scan is [`for_each_sprite_pixel`]'s, written out rather than called.** That helper visits
+/// PAINTED pixels only, and the transparent ones are half of this function's subject; `sprite_color`
+/// — the helper's own oracle, and the single-answer property [`undraw_locked`] relies on — is what
+/// separates the two arms here, so the index `i` advances on exactly the pixels the helper would
+/// have handed out, in the same order, and `saved[i]` cannot drift from what a restore reads.
+///
+/// **Pixels already `off`** are skipped on the painted arm, on [`undraw_locked`]'s rule and for its
+/// reason: a masked undraw handed them back, they are not ours, and `saved[i]` is already known
+/// stale for them. **Pixels in `pend`** need no special case and get none — `pend` is set only where
+/// a window's staged present covers the sprite, and `published` is false under every window by
+/// construction, so the two sets do not meet. Stated rather than asserted because a future occluder
+/// change that broke it would break it silently.
+///
+/// **Busy policy: fail soft, count, never wait** — [`claim`]'s standing rule. A refusal leaves the
+/// withheld span unsettled for one present, which the next full undraw's [`repair`] mends through
+/// CURSORBG's present rect; the panel is never left with the arrow off it either way, because the
+/// withholding already happened and this function only ever writes where the sprite is NOT.
+///
+/// Returns the pixels settled (both arms), for the caller's own accounting; the witness is kept here.
+pub fn absorb_desktop(
+    published: impl Fn(usize, usize) -> bool,
+    read_back: impl Fn(usize, usize) -> Option<u32>,
+) -> usize {
+    let Ok(mut sp) = claim() else {
+        #[cfg(feature = "witness")]
+        C11_ABSORB_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return 0;
+    };
+    if !sp.drawn {
+        return 0;
+    }
+    // LOCKFIX — through `sprite_panel`, like every other panel take in this module: a refusal is a
+    // dying or contended machine and the answer is to leave the span for `repair`, never to wait.
+    let Some(fb) = sprite_panel() else {
+        #[cfg(feature = "witness")]
+        C11_ABSORB_REFUSED.fetch_add(1, Ordering::Relaxed);
+        return 0;
+    };
+    if !fb.is_ready() {
+        return 0;
+    }
+    let (bx, by, bw, bh, s) = (sp.bx, sp.by, sp.bw, sp.bh, sp.s);
+    let off = sp.off;
+    let mut taken = 0usize;
+    let mut i = 0usize;
+    for row in 0..bh {
+        for col in 0..bw {
+            let (x, y) = (bx + col, by + row);
+            match sprite_color(s, col, row) {
+                Some(_) => {
+                    // PAINTED — the save-under is what goes stale; the panel keeps our colour.
+                    if !off.get(i) && i < sp.saved.len() && published(x, y) {
+                        if let Some(px) = read_back(x, y) {
+                            sp.saved[i] = px;
+                            taken += 1;
+                        }
+                    }
+                    i += 1;
+                }
+                None => {
+                    // TRANSPARENT — the desktop shows through here and the copy skipped it. This is
+                    // the copy's own write, performed late and one pixel at a time. It can never
+                    // touch the arrow: `sprite_color` just answered `None` for this exact pixel.
+                    if published(x, y) {
+                        if let Some(px) = read_back(x, y) {
+                            fb.put_pixel(x, y, px);
+                            taken += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // CURSOR-10 — one column-bounded clean for the whole box, after both arms, so a non-coherent
+    // scan-out never sees a half-written span. A no-op on x86, which is the only board that reaches
+    // this function today (`screen::DESK_SPRITE_OCC`); kept because the contract is the panel's, not
+    // the board's.
+    flush_rect(&fb, bx, by, bw, bh);
+    #[cfg(feature = "witness")]
+    C11_PIX_ABSORBED.fetch_add(taken as u64, Ordering::Relaxed);
+    taken
+}
+
 /// CURSOR-11 — a pass that took a real bracket rather than the deferral, counted from `wm`'s two
 /// decline arms. The third source (an incoherent tail) is counted inside [`adopt_overlay`].
 #[cfg(feature = "witness")]
@@ -1163,10 +1464,22 @@ pub fn note_bracketed_pass() {
 /// * The remainder, `px_deferred - px_installed - px_redrawn`, is pixels nothing in the pass touched:
 ///   settled by one front read and no write at all.
 ///
+/// * **`flicker_frames`** (PTRREPAINT) — panel presents that went out with a LIVE, VISIBLE arrow off
+///   the glass. **Zero is the contract**, and `px_absorbed` beside it is what makes a zero mean
+///   something: it counts the pixels the withheld copy actually handed back, so `flicker_frames=0
+///   px_absorbed=0` is "the pointer never stood under a desktop present" and `flicker_frames=0
+///   px_absorbed=N` is the fix, working, N pixels' worth. `absorb_refused` is the loan's fail-soft
+///   arm, expected 0 and never fatal.
+///
 /// `UNWITNESSED` on QEMU raspi4b by construction — no HID pointer report means the sprite is never
 /// drawn, `sprite_plan()` is always `None`, no session is ever opened and every counter here is 0. The
 /// gate proves NO-REGRESSION only; the verdict that carries the fix is `px_installed` dominating
 /// `px_redrawn` on an attended bench boot with the pointer parked over a presenting vug.
+///
+/// PTRREPAINT — the verdict gained a rung above the other three, because a blinking pointer is a
+/// worse answer than any ratio below it: a non-zero `flicker_frames` reads `FLICKER` whatever the
+/// compose-through did, so the line can never say `THROUGH` about a boot the operator watched the
+/// arrow blink through.
 #[cfg(feature = "witness")]
 pub fn cursor11_rollup(scope: &str) {
     let passes = C11_PASSES.load(Ordering::Relaxed);
@@ -1174,7 +1487,12 @@ pub fn cursor11_rollup(scope: &str) {
     let deferred = C11_PIX_DEFERRED.load(Ordering::Relaxed);
     let installed = C11_PIX_INSTALLED.load(Ordering::Relaxed);
     let redrawn = C11_PIX_REDRAWN.load(Ordering::Relaxed);
-    let verdict = if passes == 0 && bracketed == 0 {
+    let flicker = C11_FLICKER.load(Ordering::Relaxed);
+    let absorbed = C11_PIX_ABSORBED.load(Ordering::Relaxed);
+    let refused = C11_ABSORB_REFUSED.load(Ordering::Relaxed);
+    let verdict = if flicker != 0 {
+        "FLICKER"
+    } else if passes == 0 && bracketed == 0 {
         "UNWITNESSED"
     } else if deferred == 0 {
         "NO-DEFERRAL"
@@ -1184,8 +1502,8 @@ pub fn cursor11_rollup(scope: &str) {
         "BRACKETED"
     };
     serial_println!(
-        "[cursor11] compose-through scope={} passes={} bracketed={} px_deferred={} px_installed={} px_redrawn={} -> {}",
-        scope, passes, bracketed, deferred, installed, redrawn, verdict
+        "[cursor11] compose-through scope={} passes={} bracketed={} px_deferred={} px_installed={} px_redrawn={} flicker_frames={} px_absorbed={} absorb_refused={} -> {}",
+        scope, passes, bracketed, deferred, installed, redrawn, flicker, absorbed, refused, verdict
     );
     // WEDGE-9 — chained here rather than given its own call site, on `[cursor8]` → `[cursor11]`'s
     // own precedent: it is this pass's story one layer down, and one seam is easier to keep in step

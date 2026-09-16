@@ -847,7 +847,35 @@ const DESK_STRIP_MAX: usize = 0;
 /// bounded at compile time, so a tenant added to the registry widens this array by construction
 /// rather than silently dropping an occluder — the same guard `wm::OCC_MAX` makes for the window-blit
 /// clip, restated on the desktop side because it is a second array with the same obligation.
-const DESK_OCC_MAX: usize = super::wm::MAX_WINDOWS + DESK_STRIP_MAX;
+///
+/// PTRREPAINT — **is the POINTER SPRITE subtracted from this present, instead of bracketed around
+/// it?** Two terms, and both are load-bearing:
+///
+/// * `pal::cursor::SPRITE_OWNS_PAINT` — the hardware reason, and the only one this file's
+///   `target_arch` term carries. On x86 the arrow lives in the FRONT framebuffer, so a desktop copy
+///   that lands on its box destroys it; on aarch64 it lives in the BACK buffer and this present's
+///   subtraction is exactly what CARRIES it to glass (`arch/aarch64/display_tegra.rs`'s SO5 note
+///   traces the two sprites). Withholding the box there would delete the Pi/Orin pointer over the
+///   backdrop outright, which is why the aarch64 answer is `false` and not an oversight.
+/// * `wc` — the feature knob, and the reason this is not simply the const above. The occluder array
+///   is sized at compile time and `wm::occluders` fills a `[_; MAX_WINDOWS]` by signature, so a
+///   slot for the sprite exists only where the SHELLDESK arm already stages through its own `wins`
+///   array. That arm is `wc`'s. A knob-off x86 build keeps the FLICKER-3 bracket it has today.
+///
+/// The two are checked against each other below rather than left to agree by reading.
+const DESK_SPRITE_OCC: bool = cfg!(all(target_arch = "x86_64", feature = "wc"));
+
+/// PTRREPAINT — the subtraction may never be armed on a board whose arrow is NOT front-buffer-owned.
+/// A compile-time proof rather than a sentence, because the failure mode is a pointer that vanishes
+/// on a board this seat does not boot.
+const _: () = assert!(!DESK_SPRITE_OCC || crate::pal::cursor::SPRITE_OWNS_PAINT);
+
+/// PTRREPAINT — one occluder slot for the sprite, where [`DESK_SPRITE_OCC`] says it is subtracted.
+/// `0` everywhere else, so every other configuration's array is the one it has always had.
+const DESK_SPRITE_MAX: usize = DESK_SPRITE_OCC as usize;
+
+/// SHELLDESK/PTRREPAINT — see [`DESK_SPRITE_MAX`] for the third term.
+const DESK_OCC_MAX: usize = super::wm::MAX_WINDOWS + DESK_STRIP_MAX + DESK_SPRITE_MAX;
 
 /// WC-BBSYNC — "unarmed" for [`DESKTOP_BG_SEED`]. Every colour that reaches this path is an
 /// `0x00RRGGBB` triple (the top byte is unused on both the desktop and the compositor side), so
@@ -1386,7 +1414,17 @@ impl Screen {
         // is re-established by the mover's own `repaint`, and `present_background`'s CURSOR-6 probe
         // (`note_desktop_over_sprite`) now doubles as the detector for that race — a blit that lands
         // on a live sprite is counted there, on either path.
-        let bracket = self.bracket_needed();
+        //
+        // PTRREPAINT — and on the boards that own the arrow in the FRONT buffer the bracket is not
+        // narrowed here, it is GONE: `bracket_needed`'s live-sprite arm now answers `false` for
+        // every damage set, because `present_background` SUBTRACTS the sprite's box from the copy
+        // instead (see [`DESK_SPRITE_MAX`] and the absorb at the tail of that function). `live` is
+        // the second half of the answer — "there was a real arrow on the glass when this present
+        // decided" — and it is what makes the bracket a FLICKER rather than a no-op, so it is what
+        // the new witness counts. See `cursor::note_flicker_frame`.
+        // Read by the `witness` probes alone; a shipped build takes the decision and drops the flag.
+        #[cfg_attr(not(feature = "witness"), allow(unused_variables))]
+        let (bracket, live) = self.bracket_needed();
         if bracket {
             // CURSOR-13 — the DESKTOP bracket. Opens here, closes before the window layer is touched.
             super::cursor::undraw();
@@ -1396,6 +1434,26 @@ impl Screen {
         // is the whole point of that arc: `sprite_plan()` must be able to answer.
         if bracket {
             super::cursor::repaint();
+        }
+        // PTRREPAINT — the PUBLICATION, counted where it happened and not where it was decided.
+        // `bracket && live` says the arrow came off the glass; `last_flush_bytes > 0` says this
+        // present then wrote to the panel with it off, i.e. the scan-out could read a frame with no
+        // pointer in it. A bracket whose damage clipped to nothing publishes no such frame and is
+        // not counted, which is the whole reason this is not a second name for
+        // `[flick2] flush_undraw=` (the DECISION) one line up.
+        //
+        // **`SPRITE_OWNS_PAINT` is the third term and it is not belt-and-braces — without it this
+        // witness would LIE on the Pi and the Orin.** A bracket is a scan-out gap only where the
+        // arrow the operator sees is the FRONT-buffer one this bracket takes down. On aarch64 it is
+        // not: `pal::cursor::paint` keeps a BACK-buffer sprite that this very present carries to
+        // glass (SO5), so the arrow stays on the panel across the bracket and nothing blinks. The
+        // Orin's own capture is the proof — `[flick2] flush_undraw=5794 flush_skip=1`, i.e. it
+        // brackets on essentially every desktop present, and nobody has ever reported a blink there.
+        // Counting those would put `-> FLICKER` on every Pi and Orin boot for the life of the
+        // witness, about a board where the finding is false.
+        #[cfg(feature = "witness")]
+        if bracket && live && crate::pal::cursor::SPRITE_OWNS_PAINT && self.last_flush_bytes > 0 {
+            super::cursor::note_flicker_frame();
         }
         // Only when background pixels actually landed ON a window — which, with the subtraction in
         // place, is the fallback path only. `repaint` self-guards on there being a window layer to
@@ -1409,6 +1467,12 @@ impl Screen {
         // so the once-a-second serial write is never charged to the copy it reports on.
         #[cfg(feature = "witness")]
         desk_amp_flush();
+        // PTRREPAINT — `[cursor11] scope=desk`, on the same rule and at the same seam: the arc's
+        // verdict is about DESKTOP PRESENTS, so it is sampled from one, after the blit it reports
+        // on. `live` arms it, so a boot whose desktop never met a pointer prints nothing at all.
+        // See `cursor::cursor11_desk_tick` for why the pointer-cadence emitter could not carry this.
+        #[cfg(feature = "witness")]
+        super::cursor::cursor11_desk_tick(live);
     }
 
     /// FLICKER-3 — does this present owe the sprite the CURSOR-13 bracket?
@@ -1440,12 +1504,54 @@ impl Screen {
     /// Only the live-sprite decision is counted (`[flick2] flush_undraw=`/`flush_skip=`): the
     /// legacy classes cannot blink an arrow the operator can see, and counting them would bury the
     /// discriminator this exists to put on the wire.
-    fn bracket_needed(&self) -> bool {
+    ///
+    /// ### PTRREPAINT — on a FRONT-BUFFER arrow this arm no longer takes the bracket at all
+    ///
+    /// FLICKER-3 removed the bracket for the presents that could not reach the sprite. What it left
+    /// standing is the class that CAN, and on x86 that class is the flicker Peter watched on flights
+    /// 8 and 9: between `cursor::undraw` and `cursor::repaint` the FRONT framebuffer is the scan-out
+    /// buffer (`arch::flush_framebuffer_range` is a store fence on x86, not a publication step), so
+    /// every one of those presents puts a spriteless panel in front of the display for the length of
+    /// a desktop blit.
+    ///
+    /// The bracket's one justification is "hand a pixel back before a painter in THIS operation
+    /// overwrites it". [`Self::present_background`] now declines to overwrite it instead — the
+    /// sprite's box joins the WC-I/SHELLDESK occluder set, so the copy withholds those spans exactly
+    /// as it withholds a window's, and the arrow is never taken down. The save-under stays true
+    /// because the same function absorbs the withheld pixels out of the BACK buffer before it
+    /// returns. Nothing is invented: this is the subtraction the desktop present has performed for
+    /// every other surface on the panel since WC-I, extended to the one surface that was still
+    /// being sequenced around instead.
+    ///
+    /// So the answer's first half is `false` for every damage set once the arrow is live, visible
+    /// and front-buffer-owned, and `FULL_PRESENT`/BRACKETQ come with it: the subtraction is decided
+    /// inside `present_background` against that function's FINAL damage set, which is a strictly
+    /// better-informed moment than this one (it is after the `PRESENT_RECTS` drain and after
+    /// `mark_full`), so both of those arms are answered there rather than here.
+    ///
+    /// **aarch64 is untouched and must be.** `SPRITE_OWNS_PAINT` is false there, the arrow is a
+    /// BACK-buffer sprite, and this present's subtraction is what CARRIES it to glass — withholding
+    /// its box would delete the Pi/Orin pointer over the backdrop outright. The const gates both
+    /// halves, so that board keeps the FLICKER-3 decision it has today, verbatim.
+    ///
+    /// ### The second return value
+    ///
+    /// `live` — "a real, visible arrow was on the glass when this decision was taken". The three
+    /// early returns answer `false` for it; only the tail answers `true`. [`Self::flush`] pairs it
+    /// with the bytes the present actually published to count `[cursor11] flicker_frames=`.
+    fn bracket_needed(&self) -> (bool, bool) {
         let Some((sx, sy, sw, sh)) = super::cursor::sprite_box() else {
-            return true;
+            return (true, false);
         };
         if !crate::pal::cursor::visible() {
-            return true;
+            return (true, false);
+        }
+        // PTRREPAINT — the withheld-copy answer. Counted through `note_flush_bracket(false)` like
+        // any other skip, so `[flick2] flush_skip=` keeps meaning "presents that left the arrow on
+        // glass" and becomes the whole live-sprite population on this board.
+        if DESK_SPRITE_OCC {
+            super::cursor::note_flush_bracket(false);
+            return (false, true);
         }
         let taken = FULL_PRESENT.load(core::sync::atomic::Ordering::Acquire)
             || (0..self.damage.len).any(|i| {
@@ -1465,7 +1571,7 @@ impl Screen {
             // rect queued".
             || present_rects_meet(sx, sy, sw, sh, self.info.width, self.info.height);
         super::cursor::note_flush_bracket(taken);
-        taken
+        (taken, true)
     }
 
     /// Present the back buffer: copy each damaged rectangle to the framebuffer, row by row (each
@@ -1642,7 +1748,59 @@ impl Screen {
             let n = super::wm::occluders(&mut occ);
             (n, n)
         };
-        let occ = &occ[..nocc];
+        // PTRREPAINT — THE SPRITE JOINS THE OCCLUDER SET, and it is the last entry on purpose.
+        //
+        // Everything above this line is a SURFACE the desktop is beneath; the arrow is not a surface
+        // and does not want to be one — `wm::occ_clip` must keep ignoring it, and so must
+        // `occluders_aged`'s staleness probe. What it shares with them is the only property this
+        // walk needs: the desktop must not write where it stands. So it is subtracted here, at the
+        // one array that performs the subtraction, and nowhere else.
+        //
+        // The test is `bracket_needed`'s damage-meet test, taken at the RIGHT moment. That function
+        // runs before `PRESENT_RECTS` is drained and before `mark_full`; here the damage set is
+        // final, so a `FULL_PRESENT` escalation and a queued present rect (BRACKETQ) are both
+        // already folded into `self.damage.rects[..n]` and need no separate arm. A present whose
+        // final damage misses the sprite subtracts nothing and costs one box test — which is what
+        // keeps the VUG-PAR band path below reachable on the full-screen frames it was built for.
+        //
+        // The geometry is one snapshot from `cursor::sprite_box`, with the same degradation
+        // FLICKER-3 already argues for its own: the pointer may move the instant after the read, and
+        // a sprite that moved INTO a withheld span is re-established by the mover's own `repaint`
+        // while `note_desktop_over_sprite` counts the race. What CANNOT happen any more is the case
+        // that race detector was watching for on this board: a blit landing on a live arrow because
+        // the bracket was open.
+        let sprite_occ = if DESK_SPRITE_OCC && nocc < occ.len() {
+            super::cursor::sprite_box()
+                .filter(|_| crate::pal::cursor::visible())
+                .filter(|&(sx, sy, sw, sh)| {
+                    (0..n).any(|i| {
+                        let d = self.damage.rects[i];
+                        let x1 = d.x1.min(self.info.width);
+                        let y1 = d.y1.min(self.info.height);
+                        d.x0 < x1
+                            && d.y0 < y1
+                            && d.x0 < sx + sw
+                            && sx < x1
+                            && d.y0 < sy + sh
+                            && sy < y1
+                    })
+                })
+        } else {
+            None
+        };
+        let nall = match sprite_occ {
+            Some(b) => {
+                occ[nocc] = b;
+                nocc + 1
+            }
+            None => nocc,
+        };
+        let occ = &occ[..nall];
+        // PTRREPAINT — the SURFACE occluders alone, for the absorb at the tail of this function. The
+        // pixels it has to re-save are the ones THIS set would have let through and the sprite then
+        // withheld; handing it the widened slice would subtract the sprite from its own question and
+        // absorb nothing. Same array, third slice, on `occ_win`'s precedent one paragraph down.
+        let occ_desk = &occ[..nocc];
         // SHELLDESK REVIEW — **the WINDOW PREFIX, and it is a separate slice on purpose.**
         //
         // `occ` is now windows-then-furniture, but WC-I's two witness calls below are about the WINDOW
@@ -1900,6 +2058,49 @@ impl Screen {
             self.front.flush_range(span_start, span_end - span_start);
         }
         self.last_flush_bytes = flushed;
+        // PTRREPAINT — THE ABSORB, and it is the half that keeps the withheld copy honest.
+        //
+        // The loop above did not write the sprite's pixels. The arrow therefore never left the glass
+        // — which is the fix — but `cursor`'s save-under now describes the desktop this present just
+        // SUPERSEDED, and a later `undraw` restoring it would stamp the pre-present desktop back onto
+        // the panel: the CURSORBG trail, arriving through a new door. So every pixel the copy would
+        // have published and withheld is handed to the sprite, which takes it out of the BACK buffer
+        // — the authoritative, arrow-free copy of what this present means the panel to hold — and
+        // stores it as the pixel under the arrow. The next restore then publishes the NEW desktop,
+        // and the withholding is invisible in both directions.
+        //
+        // The box has a second half and `absorb_desktop` settles it too: where the sprite paints
+        // NOTHING the desktop is supposed to show through, and the copy withheld those pixels as
+        // well — `next_visible_span` subtracts boxes and cannot subtract a mask. Left alone they
+        // would FREEZE the desktop in a rectangle that follows the pointer (the strip's bars would
+        // stop moving under the arrow), so they are written `back` -> `front` there, one pixel at a
+        // time, which is this loop's own write performed late. It cannot touch the arrow: the same
+        // `sprite_color` that decides the two arms just answered "paints nothing here".
+        //
+        // Costs nothing on the presents that withhold nothing: `sprite_occ` is `None` and the whole
+        // block is one branch.
+        //
+        // `published` is the copy's own predicate, restated over a pixel instead of a span: inside
+        // some clipped damage rect, outside every SURFACE occluder. It is deliberately not a second
+        // `next_visible_span` walk — the sprite is a few hundred painted pixels and a per-pixel test
+        // against the same two sets cannot drift from the span walk the way a parallel implementation
+        // of it could.
+        if let Some(_sb) = sprite_occ {
+            let dmg = &self.damage;
+            let (pw, ph) = (self.info.width, self.info.height);
+            let back = &self.back;
+            let _absorbed = super::cursor::absorb_desktop(
+                |x, y| {
+                    (0..n).any(|i| {
+                        let d = dmg.rects[i];
+                        x >= d.x0 && x < d.x1.min(pw) && y >= d.y0 && y < d.y1.min(ph)
+                    }) && !occ_desk.iter().any(|&(bx, by, bw, bh)| {
+                        x >= bx && x < bx.saturating_add(bw) && y >= by && y < by.saturating_add(bh)
+                    })
+                },
+                |x, y| back.get_pixel(x, y),
+            );
+        }
         // ORIN-VPAR — the three aarch64 parity verdicts, drained here because this is the one site in
         // this file that is guaranteed reachable on every arch that presents at all (`Screen::new` is
         // NOT: the Pi/Orin desktop path builds `direct` screens deliberately, so a witness hung off
