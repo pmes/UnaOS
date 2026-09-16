@@ -122,6 +122,7 @@ eliminations across sittings #8–#43; the wall has never moved a byte.
 | KF25 `mirror-hdr` / `beacon` / `latch-delta` — the 0x640000 window | `UNAOS_KEPLER_FIFO` | `:: kepler: mirror-hdr pass0 off=` (`kepler.rs:1756`, n=1) · `:: kepler: beacon none-seen ::` (`kepler.rs:1948`, n=1) · `:: kepler: latch-delta none ::` (`kepler.rs:1765`, n=1) | s20, 2026-07-24: **triple-refuted** — beacons none-seen twice, `latch-delta none`, and the pre-dump was all-zero this boot vs 158 non-zero rows at s19 | contents are **boot-dependent residue**, not live state we can steer; the window is engine-private memory, not a channel mirror. Window parked | KF5 | **shut-out** |
 | KF26 `DISCRIMINATOR pbdma` | `UNAOS_KEPLER_FIFO` | `:: kepler: DISCRIMINATOR pbdma` (`kepler.rs:3509`, n=1) | s43: `DISCRIMINATOR pbdma{0,1,2} ch=00000000 (CHID=0 ACTIVE=0)` — unchanged since s6 | raw, bit31-valid and bit0-valid runlist entry encodings are **all refuted as sufficient** (s8); the channel is never scheduled onto any PBDMA | KF5 | **open** — the downstream symptom of the wall |
 | KF27 `kfbind` — the PBDMA base itself, derived from PTOP instead of guessed | `UNAOS_KEPLER_FIFO` + `UNAOS_KEPLER_KFBIND` | `:: KFBIND: ptop pbdma=` · `:: KFBIND: pbdma[` · `:: KFBIND: userd ` · `:: KFBIND: skipped write=` · `:: KFBIND: verdict base=` · `:: KFBIND: end rung=KF27` (`kepler_fifo.rs`) — **code: landed 2026-09-15 behind `nvidia-kepler-kfbind`, default OFF, READ-ONLY (`writes=0`)** | — never flown | — | KF1 (the `pbdma-count 3` population), KF5 (the witness that scores the boot), KF24 (BAR1 identity — `userd_off` is a physical page, so the channel control area reads are addressable at all), and **CE-R1** for the PTOP table's existence, which is itself `never-run`: if R1 reports `REFUTED-CLEANLY` this rung's derivation half dies with it and its legacy half still scores | **never-run** |
+| KF28 `kfctxbind` — KF18/KF19 re-run with the FECS ctx-ucode precondition MEASURED, at the derived base | `UNAOS_KEPLER_FIFO` + `UNAOS_KEPLER_KFCTXBIND` | `:: KFCTXBIND: begin` · `:: KFCTXBIND: base class=` · `:: KFCTXBIND: fecs ` · `:: KFCTXBIND: ctx-ucode=` · `:: KFCTXBIND: inst ` · `:: KFCTXBIND: chan_ctrl[` · `:: KFCTXBIND: skipped write=` · `:: KFCTXBIND: verdict base=` · `:: KFCTXBIND: end rung=KF28` (`kepler_fifo.rs`, `mod ctxbind`) — **code: landed 2026-09-15 behind `nvidia-kepler-kfctxbind`, default OFF, READ-ONLY (`writes=0`)** | — never flown | — | **DEPENDS ON, and the first is enforced IN CODE (R19):** KF27 resolving to `DERIVED-WINS` or `BOTH-ANSWER` on THIS boot — the rung re-runs KF27's base ladder read-only and prints `skipped reason=kf27-base-unresolved` otherwise, because its whole product is a PBDMA state reading and KF26 has read that state at an unproven address since s#6; **KF6 / KF8 / KF9** open (their knobs are restored by §7 and each was refuted only under a host that had never run FECS ucode — carry all three on the same boot); **CE-R5** for an audited instance-block layout, which is `never-run`, so every `inst ` row here is tagged `TREE-UNAUDITED` and claims nothing about what the field IS; KF24 (BAR1 identity — the instance block and channel control area are readable at all); KF18 itself, whose `CHAN_CUR`/`CHAN_NEXT` writes `kepler::init` performs immediately above phase A and which this rung brackets rather than re-issues | **never-run** |
 
 **Where the FIFO ladder actually stands.** The complete elimination, ten sittings of it: runlist
 encodings, USERD variants, flushes, CTRL_ADDR, a powered engine, a reset-pulsed engine, a **live
@@ -164,7 +165,19 @@ the gatekeeper.
 - **KF7** — the open question it created is still open: **does the engine see our instance bytes
   at validate time?** BAR1 self-coherence is proven (KF24); scheduler-side visibility is not.
 - **KF18 / KF19** — re-run the bind **with FECS ctx microcode resident and running**, not as a
-  bare poke. That is the one condition never yet varied.
+  bare poke. That is the one condition never yet varied. ⚠ **KF28 is now landed against this line,
+  and it is the INSTRUMENT, not the condition.** There is no context-switch microcode in this tree
+  to be resident — `falcon_microcode_spec.md`'s CLEANROOM POLICY NOTICE forbids the vendor blob
+  outright, and the ECHO/POKE/heartbeat images this driver uploads are probes, not a context
+  machine — so KF28 does not satisfy the condition and does not pretend to. What it does is
+  **measure** it, and that has never been done: **every one of the ten shut-outs in this table is
+  recorded under "no FECS ctx ucode running", and not one capture in the campaign contains a
+  reading that establishes it.** KF28's `ctx-ucode=` token is that reading, taken from ten §2 rows
+  of `falcon_microcode_spec.md` that each carry a sitting in their evidence column. It is the same
+  class of defect KF27 found in `gp_get=0`: a sentence the ladder has asserted for ten sittings
+  with no instrument behind it. Until a legal ctx image exists, a `STILL-DARK` from KF28 is a
+  statement about the instrument and **not** an eleventh elimination — the rung's own `end` line
+  says so on the wire.
 - **KF21** — the un-wedge experiment needs a boot where the poison **deliberately** fires, then a
   PRING observe/clear and a `cpuctl` re-read in the same boot.
 - **KF25** — the window is parked, not dead; a boot that correlates it against a *working* channel

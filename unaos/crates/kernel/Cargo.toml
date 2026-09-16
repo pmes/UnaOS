@@ -127,6 +127,34 @@ nvidia-kepler-ce = ["nvidia-kepler"]
 # this knob alone would otherwise compile a module nothing can reach. DEFAULT OFF => module and
 # both call sites unlinked, media byte-identical. Kept in sync with arroyo AND builder/src/main.rs.
 nvidia-kepler-kfbind = ["nvidia-kepler", "nvidia-kepler-fifo"]
+# KFCTXBIND (R19 / shut-out register §2, rung KF28): `UNAOS_KEPLER_KFCTXBIND=1` — re-run the
+# KF18 bind and the KF19 post-bind strip with the FECS CONTEXT-UCODE PRECONDITION MEASURED and the
+# PBDMA base DERIVED (drivers/gpu/kepler_fifo.rs, `mod ctxbind`, beside KF27). §2's "what would
+# change the verdict" asks for KF18/KF19 re-run "with FECS context microcode resident and running —
+# the one condition never varied across ten eliminations". This rung does NOT claim to satisfy that
+# condition; it is the instrument that MEASURES it, and the distinction is the design. There is no
+# context-switch microcode in this tree to be resident — falcon_microcode_spec.md's CLEANROOM POLICY
+# NOTICE forbids the vendor blob outright and the ECHO/POKE/heartbeat images this driver uploads are
+# probes, not a context machine — so the census reads `ctx-ucode=absent-by-construction-*` and the
+# STILL-DARK line NAMES it. That is the whole finding: all ten shut-outs are recorded under "no FECS
+# ctx ucode running" and not one capture in the campaign contains a reading that establishes it.
+# R19 GATE: the rung resolves KF27's base ladder ITSELF, read-only, over KF27's own PTOP address,
+# extraction, window and probe offsets, and runs only on `DERIVED-WINS` or `BOTH-ANSWER`; otherwise
+# it prints `:: KFCTXBIND: skipped reason=kf27-base-unresolved ::` and stops, because its entire
+# product is a PBDMA state reading and KF26 has been reading that state at an unproven address since
+# s#6. It deliberately does NOT imply `nvidia-kepler-kfbind`: KEPLER-METAL-LOG.md's KF28 entry
+# forbids flying the two rungs on the same boot. READ-ONLY, zero device writes: the channel CTRL
+# enable/bind this rung is NAMED for is still uncited (kepler.rs writes `0xC0000000 | pageno` and the
+# FENCE `stuck` gate masks `& 0xC0000000`, but nothing in this tree names what those bits MEAN) and
+# prints as `skipped write=chan_ctrl_enable reason=uncited` — with the instrument that would pin it
+# IMPLEMENTED as a read: the `chan_ctrl[i] fw-bound=… ours=…` sweep diffs a firmware-bound slot
+# against the slot we wrote, which is the observation that promotes the encoding from UNPINNED to a
+# sitting (§0.1). Implies `nvidia-kepler` AND `nvidia-kepler-fifo` — both call sites are inside
+# `kepler::init`'s fifo leg. DEFAULT OFF => `mod ctxbind`, both call sites and every
+# `:: KFCTXBIND:` string unlinked, media byte-identical (and a KFBIND-only build is byte-identical
+# to the one that shipped before this rung, which is why the rung is an inner gated module).
+# Kept in sync with arroyo AND builder/src/main.rs.
+nvidia-kepler-kfctxbind = ["nvidia-kepler", "nvidia-kepler-fifo"]
 # WC-X86: bring the window compositor (`video::wm`) up on the x86 panel path. Compiles
 # `video/desktop_uefi.rs` — the activation seam and the one kernel-drawn demo window — plus fbcon's
 # CONSOLE-WINDOW route (`panel_console_window_open`: the kernel console becomes an ordinary row in

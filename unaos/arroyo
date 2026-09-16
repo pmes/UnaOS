@@ -821,7 +821,9 @@ fi
 # witness string. Kept in sync with builder/src/main.rs (the two-place trap; this map line is
 # parser-conformant so the KNOB→BUILDER WIRING CHECK covers it, and `x86-all` names the feature).
 [ -n "${UNAOS_BAR1WEDGE:-}" ] && _feats="${_feats}bar1wedge,"
-# KFBIND (rmbp, shut-out register §2 rung KF27, appended 2026-09-15 — LAST line of the kepler block):
+# KFBIND (rmbp, shut-out register §2 rung KF27, appended 2026-09-15 — was the LAST line of the kepler
+# block until KFCTXBIND was appended below it the same day; the claim is corrected rather than left to
+# rot, exactly as KFBIND itself corrected BAR1WEDGE's entry two blocks above):
 # UNAOS_KEPLER_KFBIND=1 arms the PBDMA BASE DERIVATION in drivers/gpu/kepler_fifo.rs, the rung the
 # register ranks first for K-GPU-3. The wall since July is `gp_get=0` — the PBDMA never fetches entry 0
 # — and sittings #4 and #5 BOTH closed asking for the same thing, which has never been done: "derive the
@@ -849,6 +851,45 @@ fi
 # crates/kernel/Cargo.toml AND builder/src/main.rs (the four-place trap); the map line is
 # parser-conformant so the KNOB→BUILDER WIRING CHECK covers it, and `x86-all` names the feature.
 [ -n "${UNAOS_KEPLER_KFBIND:-}" ] && _feats="${_feats}nvidia-kepler-kfbind,"
+# KFCTXBIND (rmbp, shut-out register §2 rung KF28, appended 2026-09-15 — LAST line of the kepler
+# block): UNAOS_KEPLER_KFCTXBIND=1 arms the KF18/KF19 RE-RUN in drivers/gpu/kepler_fifo.rs
+# (`mod ctxbind`, beside KF27) with the FECS context-ucode precondition MEASURED and the PBDMA base
+# DERIVED. §2's "what would change the verdict" asks for exactly one thing on KF18/KF19: re-run the
+# bind "with FECS context microcode resident and running — the one condition never varied across ten
+# eliminations". THIS RUNG DOES NOT CLAIM TO SATISFY THAT CONDITION; it is the instrument that
+# MEASURES it, and that distinction is the design. No context-switch microcode exists in this tree to
+# be resident: falcon_microcode_spec.md's CLEANROOM POLICY NOTICE forbids the vendor blob outright,
+# and the ECHO/POKE/heartbeat images this driver uploads are probes, not a context machine. So the
+# census reads `ctx-ucode=absent-by-construction-halted` or `...-running-probe-image` and the
+# STILL-DARK line NAMES it as a standing condition — which is the finding: all ten shut-outs in §2 are
+# recorded under "no FECS ctx ucode running" and NOT ONE CAPTURE IN THE CAMPAIGN CONTAINS A READING
+# THAT ESTABLISHES IT. Four parts, all read-only: (1) the R19 GATE — the rung re-evaluates KF27's base
+# ladder ITSELF over KF27's own PTOP address, extraction, window and probe offsets, and runs only on
+# DERIVED-WINS or BOTH-ANSWER, else prints `:: KFCTXBIND: skipped reason=kf27-base-unresolved ::` and
+# stops, because its whole product is a PBDMA state reading and KF26 has read that state at an
+# unproven address since s#6; (2) the FECS census — ten §2 rows, every one with a sitting in its
+# evidence column, and `0x409504` provably unreachable (a `const _`, not a comment); (3) the instance
+# block read back through BAR1 (KF24 identity) with the ADDRESS CLASS beside every word — all
+# TREE-UNAUDITED, because kepler.rs's layout has no Group-A provenance and kepler_ce.rs R5, the rung
+# that would supply one, is never-run — plus the +0x200 PDB candidate on its own UNPINNED line; (4)
+# the ENCODING INSTRUMENT: `chan_ctrl[i] fw-bound=0x... ours=0x...` over the channel table, diffing a
+# slot the FIRMWARE left bound against the slot WE wrote, which is the observation that would promote
+# the enable encoding from UNPINNED to a sitting. The write the rung is NAMED for STAYS SKIPPED
+# (`skipped write=chan_ctrl_enable reason=uncited`): kepler.rs writes `0xC0000000 | pageno` and the
+# FENCE `stuck` gate masks `& 0xC0000000`, but nothing in this tree names what those bits MEAN, and
+# §0.1 makes an UNPINNED claim probe-only. Falsifier: IB_GET (USERD +0x88) advancing across the submit
+# is `-> FETCHED`; unchanged is `-> STILL-DARK under {ctx-ucode=..., base=..., chan_ctrl=skipped, ...}`
+# with every condition a value this boot actually read (R19: never "ruled out"). writes=0, restored=n/a.
+# ⚠ DELIBERATELY DOES NOT IMPLY nvidia-kepler-kfbind: KEPLER-METAL-LOG.md's KF28 entry forbids flying
+# the two rungs on the same boot, so the dependency is evaluated at RUNTIME and never by Cargo.
+# Implies nvidia-kepler AND nvidia-kepler-fifo (Cargo-side) — both call sites are in kepler::init's
+# fifo leg. Wire: `:: KFCTXBIND: begin ...`, `:: KFCTXBIND: base class=...`, the `fecs`/`inst`/
+# `chan_ctrl` census lines, `:: KFCTXBIND: skipped write=...`, and the `verdict`/`end rung=KF28`
+# rollup. Default OFF => mod ctxbind, both call sites and every `:: KFCTXBIND:` string are unlinked
+# and media are byte-identical. Kept in sync with crates/kernel/Cargo.toml AND builder/src/main.rs
+# (the four-place trap); the map line is parser-conformant so the KNOB→BUILDER WIRING CHECK covers it,
+# and `x86-all` names the feature.
+[ -n "${UNAOS_KEPLER_KFCTXBIND:-}" ] && _feats="${_feats}nvidia-kepler-kfctxbind,"
 # R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
 # (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only, never a mean; pure
 # measurement, changes no scheduling/locking/present behaviour. x86_64-only in effect (the real impl is
@@ -4029,7 +4070,8 @@ KERNEL_CFG_MATRIX=(
   # the table gains one knob and the universe gains one; the derived mix-leg count is the smallest n
   # with C(n, n/2) >= N and does not move (C(9,4) = 126). Read the live board/mix counts on
   # `./arroyo check`'s own summary line, never from this prose.
-  # KFBIND (rmbp, shut-out register §2 rung KF27, appended 2026-09-15, LAST on the line):
+  # KFBIND (rmbp, shut-out register §2 rung KF27, appended 2026-09-15 — was LAST on the line until
+  # KFCTXBIND was appended after it the same day; corrected rather than left to rot):
   # `nvidia-kepler-kfbind` — the PBDMA base derivation at drivers/gpu/kepler_fifo.rs. It belongs on
   # THIS leg for the SHUTRESTORE reason two paragraphs up, at its sharpest yet: the feature declares a
   # WHOLE MODULE (`#[cfg(feature = "nvidia-kepler-kfbind")] pub mod kepler_fifo;` in
@@ -4050,7 +4092,24 @@ KERNEL_CFG_MATRIX=(
   # counts on `./arroyo check`'s own summary line, never from this prose.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind"
+  # KFCTXBIND (rmbp, shut-out register §2 rung KF28, appended 2026-09-15, LAST on the line):
+  # `nvidia-kepler-kfctxbind` — the KF18/KF19 re-run at drivers/gpu/kepler_fifo.rs `mod ctxbind`. It
+  # belongs on THIS leg for KFBIND's reason one paragraph up and for one KFBIND does not have: the
+  # rung is an INNER module (`#[cfg(feature = "nvidia-kepler-kfctxbind")] pub mod ctxbind`) inside a
+  # file that is ITSELF declared `#[cfg(feature = "nvidia-kepler-kfbind")] pub mod kepler_fifo;` in
+  # drivers/gpu/mod.rs, so the only configuration in which one byte of it compiles is one carrying
+  # `nvidia-kepler`, `nvidia-kepler-fifo` AND `nvidia-kepler-kfbind` — a QUADRUPLE, which no
+  # index-derived mix mask can be relied on to deliver. x86-all names all four, so naming the feature
+  # here type-checks the rung's ARMED body by construction rather than by luck. It is also what puts
+  # `UNAOS_KEPLER_KFCTXBIND` under the KNOB→BUILDER WIRING CHECK below, and this knob sits squarely in
+  # that trap's blast radius for BEAMX86's exact reason: its entire product is witness lines, so a
+  # knob wired into arroyo alone would ship media whose banner claims the instrument and whose wire
+  # carries no `:: KFCTXBIND:` string — and the flight would then read as an ELEVENTH ELIMINATION
+  # about the GK107 rather than as a build that never carried the rung. UNIVERSE SIDE EFFECT: the
+  # table gains one knob and the universe gains one (brand-new, so "unclaimed => assume x86" either
+  # way and naming it here removes nothing); read the live board/mix counts on `./arroyo check`'s own
+  # summary line, never from this prose.
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the

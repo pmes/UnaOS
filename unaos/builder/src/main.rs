@@ -531,6 +531,24 @@ fn main() {
     // KNOB→BUILDER WIRING CHECK goes red if this line is dropped. DEFAULT OFF => module and both
     // call sites unlinked => byte-identical media.
     if std::env::var("UNAOS_KEPLER_KFBIND").is_ok() { feats.push("nvidia-kepler-kfbind"); }
+    // KFCTXBIND (shut-out register §2 rung KF28): UNAOS_KEPLER_KFCTXBIND=1 arms the KF18/KF19
+    // RE-RUN at drivers/gpu/kepler_fifo.rs `mod ctxbind` — the FECS ctx-ucode precondition CENSUSED
+    // (ten §2 rows, every one with a sitting in its evidence column, and `0x409504` provably
+    // unreachable by a `const _`), the channel's instance block read back through BAR1 with the
+    // ADDRESS CLASS beside every word, the `chan_ctrl[i] fw-bound=… ours=…` sweep that would pin the
+    // enable encoding BY DIFF, and IB_GET scored across the submit at the DERIVED base. The rung
+    // gates itself on KF27's base ladder, re-evaluated read-only on the boot, and prints
+    // `skipped reason=kf27-base-unresolved` when that ladder does not favour a derived base.
+    // READ-ONLY: writes=0, restored=n/a, and the channel CTRL enable/bind the rung is NAMED for
+    // prints `skipped write=chan_ctrl_enable reason=uncited`. THIS list is what reaches the kernel
+    // binary for MEDIA builds, and this knob's ENTIRE product is witness lines — so a knob wired
+    // into arroyo alone would put `nvidia-kepler-kfctxbind` in the banner and not one
+    // `:: KFCTXBIND:` string in the image, and the flight would read as an ELEVENTH ELIMINATION
+    // about the GK107 rather than as a build that never carried the instrument (BEAMX86's failure
+    // mode, and BAR1WEDGE's and KFBIND's above, verbatim). Kept in sync with arroyo AND
+    // crates/kernel/Cargo.toml; `./arroyo check`'s KNOB→BUILDER WIRING CHECK goes red if this line
+    // is dropped. DEFAULT OFF => mod ctxbind and both call sites unlinked => byte-identical media.
+    if std::env::var("UNAOS_KEPLER_KFCTXBIND").is_ok() { feats.push("nvidia-kepler-kfctxbind"); }
     // R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
     // (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only; pure measurement,
     // no scheduling/locking/present change. x86_64-only in effect; DEFAULT OFF => empty inline shims,
