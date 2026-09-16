@@ -224,7 +224,7 @@ btc|REACHED — a BR/EDR link was established|-|measured
 smolnet|:: SOCK-1: smoltcp icmp echo|-|measured(1)
 wifi|:: wifi: firmware NOT staged — no program-source block device; searched|-|measured
 wifi2|:: wifi2: upload NOT ATTEMPTED uploaded-bytes=|-|measured
-nvidia-kepler|:: kepler: FENCE ABORT dmactl REFUSED|-|measured
+nvidia-kepler|:: kepler: probe-abort bar0-unmapped|-|measured
 nvidia-kepler-takeover|:: kdisp: takeover-abort no-gop-info ::|nvidia-kepler|measured
 nvidia-kepler-fifo|[NVIDIA] Starting PFIFO initialization|nvidia-kepler|measured
 nvidia-kepler-ce|VOID — the control bracket moved across this base|-|measured
@@ -235,6 +235,13 @@ intel-ivb|:: igpu: VERDICT: Present but BAR not decoding|-|measured
 gen7|:: gen7: r6 next=STOP-window-or-register-block-out-of-range|-|measured
 gmux_igd|:: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD|intel-ivb|measured
 unaos_ivb|@boot iGPU trace 1 (pre-EBS) collected.|-|measured
+ahci|:: AHCI: port=|-|measured
+bar1wedge|:: BAR1WEDGE: rung=first-stall|-|measured
+beam|:: BEAMX86: head=|nvidia-kepler,nvidia-kepler-takeover|measured
+ftdirx|:: FTDIRX: first byte rx=|-|measured
+gen7r8|:: gen7: r8 begin rung=R8 wake=|-|measured
+nvidia-kepler-kfbind|:: KFBIND: pbdma[|-|measured
+nvidia-kepler-kdhead|:: KDHEAD: end rung=KD14|-|measured
 tegra|:: tegra: JB5 — XUSB domain not ON at handoff|-|measured(1)
 tegrasmp|:: AARCH64 SMP: ORIN-SMP-3 — DTB /cpus named no cores (dtb=@|-|measured(1)
 apsrun|:: [apsrun] cpu |-|measured(2)
