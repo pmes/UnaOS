@@ -35,4 +35,9 @@ MANDATORY HEAD (docs/dev/EXECUTOR-BRIEF.md):
 9. REPORT (short): sha and its parent, `git show --stat`, gate exit codes, the knob line to build
    with, and the exact wire shape the next boot should show. Do not end your turn waiting on your
    own background check — poll it, then commit.
+10. NEVER kill by pattern (`pkill -f`, `killall`, `pgrep | xargs kill`): the bench runs many seats'
+   builds at once and a pattern naming `cargo` or `arroyo check` kills theirs (TESTROOTS killed three peer
+   gate runs this way on 2026-09-16, and a seat then killed a fourth trusting a pid an executor had
+   reported). Stop only your own task, or a pid whose `/proc/<pid>/cwd` you have READ and which is under
+   YOUR worktree — read first, kill in a later command, never both in one. LAWS §4 and §6 say the same.
 ```
