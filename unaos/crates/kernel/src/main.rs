@@ -216,7 +216,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // ACPI RSDP (x86_64) before memory init consumes boot_info
     #[cfg(target_arch = "x86_64")]
-    let rsdp_addr = boot_info.rsdp_addr;
+    let rsdp_addr = boot_info.rsdp_addr; #[cfg(target_arch = "x86_64")] let bootclock = (boot_info.tsc_loader_entry, boot_info.tsc_loader_read, boot_info.tsc_loader_jump); // BOOTCLOCK (rmbp-ledger A12): the loader's three raw rdtsc stamps, lifted HERE for the reason the two extractions above state — `memory::init` at :295 consumes `boot_info`, and the witness cannot print until `apic::calibrate` has measured the TSC rate, which is ~500 lines further down. Copied as a plain `(u64,u64,u64)`, so nothing borrows the struct past this point. ⚠ LINE-NEUTRAL fold and `#[cfg]`-erased on aarch64: no source line is added ahead of any existing `panic::Location`, so the aarch64 kernel images do not move (the field does not exist on aarch64 at all — see crates/boot-info).
 
     // SPLASH-1 (x86 GUI builds only): paint the ray-traced prism boot splash NOW — before the
     // slow bring-up (ACPI, SMP, xHCI enumeration) — replacing the blank pre-GUI panel while boot
@@ -825,7 +825,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Every stamp BEFORE this one was still taken in raw counter ticks; they only become
     // milliseconds because the conversion happens at print time, downstream of this call.
     #[cfg(target_arch = "x86_64")]
-    unaos_kernel::bootpace::record("calib");
+    unaos_kernel::bootpace::record("calib"); #[cfg(target_arch = "x86_64")] bootclock_report(bootclock); // BOOTCLOCK: the ONE line, emitted at the first instant the kernel can convert a cycle count honestly — `apic::calibrate` ran three lines up, so `bootpace::origin_hz()` stops returning 0 exactly here. Earlier would mean either raw cycles or a guessed Hz; later would mean after the first `BPACE` block (`service_dump` runs in the main loop, far below), and this line is meant to be read BEFORE it. LINE-NEUTRAL fold, x86-gated; the fn is at this file's tail — see its header.
 
     // 4c. SMP: start the application processors (INIT-SIPI-SIPI). Each AP brings up its own
     // per-CPU GDT/TSS + local APIC, then waits to enter its scheduler loop; the BSP continues to
@@ -9802,3 +9802,104 @@ fn virt_el0_start_maybe() {
 #[cfg(all(not(feature = "virt_el0"), target_arch = "aarch64"))]
 #[inline(always)]
 fn virt_el0_start_maybe() {}
+
+// ── BOOTCLOCK — the pre-kernel phase, measured (rmbp-ledger A12) ──────────────────────────────────
+//
+// THE QUESTION. Peter, after flights 8 and 9 (2026-09-16): *"both boots took much longer than they
+// have in the past"*. The kernel's own clock says the opposite for every interval it can see —
+// `BPACE: total gui=` 25533 ms (flight 7) / 23286 (8) / 21387 (9), first `[dock] live` 25281 /
+// 23005 / 20611 — so the growth he felt is entirely BEFORE `kernel_main`'s first instruction. That
+// phase is firmware POST, the ⌥ boot picker, and the loader reading a 3.8 MB `kernel.elf` off the
+// SD slot, and until this arc nothing timed any of it. A12 bounded it only from the card-written
+// squawk marks: ≤ 47.7 s and ≤ 49.8 s, INCLUSIVE of Peter's hand at the picker. Upper bounds are
+// not a measurement, and a settle constant cannot be trimmed against one.
+//
+// THE MECHANISM. The x86 UEFI loader takes three `rdtsc` stamps — at its own entry, after the
+// kernel file is read, and at the last instruction before the jump — and carries them raw in
+// `BootInfo` (`crates/boot-info`, ABI-LOCK offsets 256/264/272, `target_arch = "x86_64"` only).
+// This function converts them ONCE, here, with the rate `apic::calibrate` just measured.
+//
+// WHAT EACH TERM IS, AND — this is the part a reader gets wrong — WHAT IT IS NOT:
+//
+//   * `firmware->loader` is the ABSOLUTE stamp at the loader's entry, not a delta. rdtsc counts
+//     from the last processor RESET, so it is firmware POST + the ⌥ picker + the firmware's own
+//     load of `bootloader.efi`, summed. It is NOT a firmware timing: a warm boot's TSC zero need
+//     not be the moment power was applied, and on the bench it contains an unknown amount of
+//     Peter's hand. Read it the way `kernel_main`'s header tells you to read the same counter — an
+//     UPPER BOUND on pre-loader time. What makes it useful anyway is that it is the first
+//     REPEATABLE number for that phase: two flights of the same media are now comparable.
+//   * `loader-read` is open + read of the whole ELF. This is the term A12 nominates, and the one
+//     that grows on its own every arc as the image does.
+//   * `loader-jump` is everything after the read: ELF load, relocation, I-cache maintenance,
+//     ACPI/EDID/boot-volume discovery, the memory-map walk, `exit_boot_services`.
+//   * `kernel-entry` is the RAW counter at `bootpace`'s `entry` stamp — the same origin every
+//     `BPACE t=` is measured from. Printing it raw is what lets a reader join this line to the
+//     BPACE block arithmetically instead of by eyeball: `kernel-entry - tsc_loader_jump` is the
+//     hand-off gap, and `kernel-entry` itself is the whole pre-kernel phase in cycles.
+//
+// THE INSTRUMENT BASELINE (bootpace.md's law: say what it reads when the mechanism did NOT run).
+//   * HEALTHY — three numbers with `ms` suffixes, monotonic stamps, `tsc_hz=<n>(measured)`. In QEMU
+//     the firmware phase is SHORT (tens to hundreds of ms); on the bench rMBP it is tens of
+//     seconds. Those two readings differing by two orders of magnitude is the instrument working,
+//     not a fault.
+//   * DID NOT RUN (a) — boot media carrying a `bootloader.efi` built before this field existed.
+//     `BootInfo` is reached through a `transmute`d pointer and nothing checks versions, so the
+//     bytes are whatever was there: the three fields read 0 (or garbage). The sanity chain below
+//     (`entry != 0`, nondecreasing, and not later than the kernel's own entry stamp — all four
+//     values come off ONE counter, so the ordering is a fact and not a convention) prints
+//     `absent` for all three rather than a fabricated duration. `kernel-entry=` still prints, and
+//     it is still the honest upper bound.
+//   * DID NOT RUN (b) — calibration absent or rejected (no ACPI PM timer). `origin_hz()` is 0, the
+//     three terms print raw `cy` and the line says `tsc_hz=0(uncalibrated)`. Never a guessed Hz:
+//     that is `bootpace`'s rule, and the reason is that a fabricated millisecond is a number a
+//     later arc would trim a real constant against.
+//   The three readings differ, so the instrument can be falsified.
+//
+// FILE-TAIL + a same-line call at the `calib` stamp, per this file's standing `panic::Location`
+// convention: zero source lines are added ahead of any existing Location, and everything here is
+// `#[cfg]`-erased on aarch64, so no aarch64 image moves.
+#[cfg(target_arch = "x86_64")]
+struct BootclockDur {
+    /// `None` = the phase was not measured at all (see DID NOT RUN (a)).
+    raw: Option<u64>,
+    /// The counter's rate; 0 = unknown, and then the value prints as raw ticks.
+    hz: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl core::fmt::Display for BootclockDur {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.raw {
+            None => write!(f, "absent"),
+            Some(v) if self.hz >= 1000 => write!(f, "{}ms", v / (self.hz / 1000)),
+            Some(v) => write!(f, "{}cy", v),
+        }
+    }
+}
+
+/// Emit the one BOOTCLOCK line. `stamps` is the loader's `(entry, read, jump)` triple, lifted out of
+/// `BootInfo` before `memory::init` consumed it.
+#[cfg(target_arch = "x86_64")]
+fn bootclock_report(stamps: (u64, u64, u64)) {
+    let (entry, read, jump) = stamps;
+    // The ledger's clock, not an arch-private one — `bootpace::origin_hz()` is the same rate every
+    // `BPACE t=`/`d=` is divided by, so this line and that block are comparable by construction.
+    let hz = unaos_kernel::bootpace::origin_hz();
+    let kernel_entry = unaos_kernel::bootpace::origin_cycles();
+    let sane = entry != 0 && read >= entry && jump >= read && kernel_entry >= jump;
+    let (fw, rd, jp) = if sane {
+        (Some(entry), Some(read - entry), Some(jump - read))
+    } else {
+        (None, None, None)
+    };
+    let src = if hz >= 1000 { "measured" } else { "uncalibrated" };
+    serial_println!(
+        ":: BOOTCLOCK: firmware->loader={} loader-read={} loader-jump={} kernel-entry={} tsc_hz={}({}) ::",
+        BootclockDur { raw: fw, hz },
+        BootclockDur { raw: rd, hz },
+        BootclockDur { raw: jp, hz },
+        kernel_entry,
+        hz,
+        src
+    );
+}
