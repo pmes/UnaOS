@@ -1889,7 +1889,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 // identically. Compiled out without the knob.
                 #[cfg(all(feature = "usbdebug", feature = "wc"))]
                 usbdebug_event_print(raw);
-                (raw, unaos_kernel::arch::x86_64::syscall::wc_route_event(raw))
+                (raw, { if let unaos_kernel::pal::Event::Mouse { x, y } = raw { x86_ptr_install(x, y); } unaos_kernel::arch::x86_64::syscall::wc_route_event(raw) }) // PTRINSTALL3 (B117) — THE INSTALL ON THIS LOOP: a relative report is installed here, once, by the same `x86_ptr_install` the split's producer calls (`x86_input_service`, :6165), BEFORE either router sees it — so a report a focused ring-3 app CONSUMES (the router answers `Unknown`, the `Mouse` arm below never runs, and `track_routed` is absolute-only since PTRINSTALL2) still moves the arrow, and a DECLINED one is not installed a second time because the `Mouse` arm's `move_rel` is cfg'd off this arch (:1944). One install per relative report on both branches; absolute reports untouched on both. ⚠ LINE-NEUTRAL fold, in every x86 image; the fn is at this file's tail.
             };
             #[cfg(not(target_arch = "x86_64"))]
             let ev = pal.poll_event();
@@ -1941,7 +1941,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                     // and `move_rel` paints nothing.
                     #[cfg(not(target_arch = "x86_64"))]
                     unaos_kernel::pal::cursor::restore(&mut pal);
-                    unaos_kernel::pal::cursor::move_rel(
+                    #[cfg(target_arch = "x86_64")] let _ = (x, y); #[cfg(not(target_arch = "x86_64"))] unaos_kernel::pal::cursor::move_rel( // PTRINSTALL3 (B117): on x86 this report was installed at :1892 before it was routed, so this SHARED arm must not install it again (a `move_rel` here doubled the DECLINED branch); the bindings are consumed so the arm reads the same on both arches. aarch64 keeps this call — it is that arch's only install. ⚠ LINE-NEUTRAL fold.
                         x, y,
                         pal.width() as i32,
                         pal.height() as i32,
@@ -2004,10 +2004,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // Placed after the `match` rather than beside the routers so that the cursor is FRESH on
             // both branches, which is the other half of it — `wc_drag_motion` reads the shared
             // `pal::cursor` position rather than the report's delta:
-            //   * CONSUMED — `user_input_route` -> `pal::cursor::track_routed` applied an ABSOLUTE one
-            //     (CURSOR-VUG). ⚠ PTRINSTALL2 (B117) narrowed it to absolute: on THIS inline loop a
-            //     consumed RELATIVE report is now installed by nobody (reported in B117, not fixed here).
-            //   * DECLINED — the `Mouse`/`MouseAbsolute` arms above have just applied it.
+            //   * RELATIVE — the report was installed ONCE at :1892 (`x86_ptr_install`, PTRINSTALL3) before
+            //     either router saw it, whoever holds focus; the `Mouse` arm above installs nothing on x86.
+            //   * ABSOLUTE — consumed: `user_input_route` -> `pal::cursor::track_routed` (CURSOR-VUG);
+            //     declined: the `MouseAbsolute` arm above has just applied it.
             // The 16 ms throttle measures real time rather than a doubled rate on every branch.
             //
             // Costs one `matches!` on non-pointer events and one atomic load when no drag is live,

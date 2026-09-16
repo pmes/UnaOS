@@ -17642,3 +17642,79 @@ restored byte-identical each time (`sha256sum -c` OK). The zero-control capture 
 outcomes. `./arroyo check` rc 0 (159 ✅ legs; `spec parses: x86-ptr.spec`, `x86-ptr.spec GATED`),
 `bash -n unaos/arroyo` rc 0; no kernel bytes, so no `knoboff` run. Flight 11's watch-list line
 above is now the line QEMU prints, with the pad's numbers in place of the typist's.
+**PTRINSTALL3 — the single-core loop (branch `exec-rmbp-ptrinstall3`, parent fa4dcf0b; B117 stays
+fixed-unflown, 2026-09-16).** The regression the paragraph above reported is closed with the two
+folds it named, both LINE-NEUTRAL (`main.rs` 10081 → 10081, `git diff --numstat` 6/6, every hunk
+1:1): (1) `main.rs:1892` — the inline-BSP loop's `(raw, wc_route_event(raw))` became
+`(raw, { if let Event::Mouse { x, y } = raw { x86_ptr_install(x, y); } wc_route_event(raw) })`, so a
+relative report is installed by the SAME function the split's producer calls, once, BEFORE either
+router sees it; (2) `main.rs:1944` — the shared `Mouse` arm's `move_rel` is now
+`#[cfg(not(target_arch = "x86_64"))]` (aarch64 keeps it: it is that arch's only install), with an
+x86-only `let _ = (x, y);` folded beside it so the bindings are consumed on both arches; the `:2007`
+drag-tail comment was rewritten in place (four lines in, four out) to state the new shape.
+**Exactly one install per relative report on that loop, both branches, read off the code at this
+tree:** `raw = pal.poll_event()` (`:1885`); the install at `:1892` runs for every `Event::Mouse`;
+then `wc_route_event` (`syscall.rs:7306`) asks, in order, `strip::key_escape` (`Key(Esc)` only,
+`crystal.rs:796`/`winmenu.rs:1402`), `quarry::key_route` (`Wheel`/`Key` only, `quarry/live.rs:2114`),
+`wc_focus_key` (`Key`/`KeyUp(Tab)` only, `:5816`), `wc_click_route` (`Button` only, `:7360`) — none
+consumes a `Mouse` — and finally `user_input_route` (`:5701`): CONSUMED → `track_routed` returns on
+the first line for anything but `MouseAbsolute` (`pal.rs`), the router answers `Unknown`, the drain's
+`_ => {}` arm runs, total one install; DECLINED → the `Mouse { x, y }` arm (`:1914`) runs `let _`
+and `draw_over` on x86, total one install. `wc_route_tail` (`:2016`) reads the position and installs
+nothing. `MouseAbsolute` is untouched on both branches (`set_abs` at the router or at the arm).
+
+Gates (`./arroyo check` rc **0**, 158 ✅ legs, 79 cfg legs, no warning names `x`, `y`, `x86_ptr_install`
+or `main.rs:1892`/`:1944`; `bash unaos/scripts/ledger-check.sh` rc 0 before and after). `./arroyo
+knoboff wc fa4dcf0b` → exit **1**, `warm=yes`, control fired on both arches (`x86 armed≠off: YES`,
+`arm armed≠off: YES`), **arm knob-off image BYTE-IDENTICAL** (the proof that the shared arm and the
+comment rewrite moved no aarch64 byte and no `Location`), **x86 knob-off image MOVED** 1,616,480 →
+1,616,608 bytes (+128; 1,128,524 differ) — PTRINSTALL2's class exactly: `x86_ptr_install` is in every
+x86 image and a wc-off single-core boot must install once at the loop too, so this is the intended
+default-image change and not a line shift (a line shift moves both images; the arm twin is identical).
+
+**QEMU — the lane that TAKES the loop, run once (R38): `UNAOS_QEMU_FULL=1 UNAOS_SMP=2 UNAOS_WC=1
+./arroyo test 150` → rc 1.** `UNAOS_SMP` is the builder's core-count knob (`builder/src/main.rs:1466`,
+default 6); at 2 there is ONE AP, `online.first() == online.last()`, the split is declined and the wire
+says so: `:: SCHED-X86: 1 AP(s) dispatching — the render/service split needs 2 distinct cores; GUI
+stays inline on the BSP ::` ×1 (`awk index`), while `worker_cpu(0)` is still `Some`, so the witness
+ladder runs (`UNAOS_SMP=1` has no worker: `u6bx_probe_once` prints `:: U6bx: no application processor
+online … skipped ::` at `syscall.rs:16369`, the ladder never launches, and the zeolite COMPLETE marker
+cannot print — that lane can only settle `truncated`). Sidecar: `mode=full wall=158.1 cap=150
+completion=complete complete_line=1997`, 2174 lines. The pointer fixtures that CAN run on this loop hold
+their pins: `[ptrdead] backlog whole=true nodrop=true order=true pushed=192 entries=1 travel=(192,-192)
+folded=192 dropped=0 fpop12=0 fpop3=0 cpu=1 svc=None -> PASS`, `[wm-act] direct … settle=true lead=true
+… from=(426,305) to=(450,329) -> PASS` (the split lane's exact coordinates), `[clickroute] route … ->
+PASS`, `[vugres] selftest pos=true neg=true -> PASS`, `:: STRIPVAC: … uncovered=1 restored=1 flat=0 … ::
+PASS ::`. The rc 1 is three fault lines the harness's scan flagged, none of them pointer-install:
+`:: WINX-1: ring-3 windows FAIL — witness=0x7f painted=false presents=2 …`, `[dmgovlp] verdict
+passes=12/12 drained=12/12 drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=12/12 adopt=0 repaint=0 max_ms=0
+adopt_stretch=0/4 -> FAIL`, `:: APPPIN: press1=launch-shell launch1=0:0 quit1=no-teardown tile=lost …
+cleanup=leaked :: FAIL ::`; `x86-wc.spec` replay rc 1, **7/8 required, 3 forbidden** (the dmgovlp FORBID
+plus the two default FORBIDs on the same dmgovlp and APPPIN lines). **They cannot reach this change:**
+the code this arc touched runs only for a relative `Event::Mouse` drained by the loop, the suite's
+pointer is a `usb-tablet` (absolute), and the only relative source, PTRDEAD's 192 pushes, was popped
+entirely by the fixture (`fpop12=0 fpop3=0`) — so `x86_ptr_install` at `:1892` executed zero times on
+this capture. What they are is the wc spec's own scope: its RUN-BY is `UNAOS_WC=1 ./arroyo test`, which
+is the builder's `-smp 6`, and "Measured 8/8 against this seat's fold-gate wc capture" — the
+single-core loop was never its corpus; WINX-1 (`painted=false`), DMGOVLP (`drag_evt=0 relay=0
+adopt=0`: damage relay and the present tail) and APPPIN (`launch1=0:0 tile=lost`) are compositor
+present-side fixtures, and on this path the render service that composites for them is never spawned
+(scheduler.md, "Two builds emit neither line"). **Owed, not claimed:** the baseline run of the same
+lane on fa4dcf0b (`UNAOS_QEMU_FULL=1 UNAOS_SMP=2 UNAOS_WC=1 ./arroyo test 150` in a clean fa4dcf0b
+tree) to show the same three lines — R38 gives an executor one run, and that is the second.
+
+**Structurally absent on this lane, and why:** no `[ptrinstall]` line and no `:: PTRINSTALL: …`. Both
+ride the `[schedx86] depth` 5 s gate in `x86_render_service` (`main.rs:7032`), a task the inline
+path never spawns; the counters are the split's instrument. The artifact still carries them (this
+run's `target/x86_64_esp/kernel.elf`, `LC_ALL=C grep -a -o -F … | wc -l`): `GUI stays inline on the BSP`
+**1**, `:: PTRINSTALL: installs=` **1**, `[ptrinstall] installs=` **1**, `PTRINSTALL-CONTROL-ABSENT` 0.
+
+**Go-red: no lane can fire it, stated rather than faked.** The mutation that would red this fold —
+`move_rel` reinstated at `:1944` on x86 (doubling the DECLINED branch) or the `:1892` install removed
+(CONSUMED branch installs nothing) — is visible only to a relative report drained by this loop, and no
+QEMU leg on this arch carries one (PTRINSTALL2's finding, unchanged: `usb-mouse` appears nowhere in
+`arroyo` or `builder/src/main.rs`; the XHCIHUB typist hard-wires `abs`). The owed fixture is the one
+PTRINSTALL2 named, now with the lane beside it: `UNAOS_QEMU_EXTRA="-device usb-mouse,bus=xhci.0"` plus
+the typist with `--pointer-kind rel`, run under `UNAOS_SMP=2` as well as the default, or a metal boot
+with fewer than two APs online (a diagnosis card) — the arrow tracks the pad while a launched app holds
+focus, and at twice the pad's rate with the `:1944` mutation.
