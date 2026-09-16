@@ -570,6 +570,23 @@ still a FAT 8.3 path). `SYS_OPEN` and the `genet` `/fs/usb` route remain follow-
 before. x86 is unchanged by design: `fs/vfs.rs` gates both backends to aarch64, so that arch has no
 mount table to route through and exactly one FAT volume to confuse.
 
+> **THE SHIM THAT SENTENCE AUTHORISED IS RETIRED — 2026-09-15 (QUARRYX86).** The clause above ("x86 is
+> unchanged by design … no mount table to route through") stopped being true when VFSROUTE (orin 17)
+> made `shell::vfs_mount_table` arch-neutral, and §13.3 *"x86 has a namespace now"* superseded it —
+> but it kept being CITED, by code nobody had re-read since. `video/quarry/live.rs` carried three
+> `cfg(target_arch = "aarch64")` shims whose x86 twins answered nothing: `collect` returned
+> `Err("no VFS mount table on this arch yet (vfs.md 12.4)")` — naming this section by number — while
+> `mount_prefixes` returned `Vec::new()` and (before SR3) `volume_gen` returned `0`. `quarry.md` §3.1
+> repeated the reasoning in prose. What convicted them was a measurement, not a reading: VIDSMALL's
+> SR3 capture (`3291384b`) prints `:: QUARRYSTAMP: … live_mounts=3 …` and `[quarry] open volumes
+> mounts=[] roots=[] tree-rows=0` in the SAME boot — three volumes in the table, none in the file
+> manager. All three shims are now ONE arch-neutral body each (R16 no board-named twins; LAWS §3 ONE
+> OS), and the section of that file contains no `target_arch` at all. **A §12.4 citation found
+> anywhere else should be read as stale by construction: this section records what VFS-1 deferred,
+> and §13.3 is where x86's answer lives now.** Fixture: `:: QUARRYVOL: … match=true -> PASS ::`
+> (`video/quarry/live.rs::vol_selftest`, `witness`+`quarry`), which compares Quarry's list against
+> `MountTable::prefixes()` read independently of the code under test.
+
 ### 12.5 The VFS-1 routing witness
 
 `vfs1_routing_witness()` asserts the four claims the seam makes, against the **live** table the

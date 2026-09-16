@@ -436,24 +436,41 @@ static SURF: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
 /// `quarry.md` §5's cost note is counted against.
 static PAINTS: AtomicUsize = AtomicUsize::new(0);
 
-// ── The VFS seam, and its one arch gate ─────────────────────────────────────────────────────────
+// ── The VFS seam ────────────────────────────────────────────────────────────────────────────────
 //
-// The `target_arch` below is NOT a hardware decision and is not Quarry's. `fs/vfs.rs` gates
-// `NativeBackend` and `FatBackend`'s impls to aarch64 (vfs.md §12.4: "x86 is unchanged by design …
-// that arch has no mount table to route through"), so the collector and the mount table simply do not
-// exist on x86 to be called. Quarry compiles, lays out, scrolls and paints identically on both arches;
-// on x86 it opens on an empty volume list and SAYS why, and the day the x86 VFS adoption lands these
-// two shims collapse into one. Nothing else in this file mentions an arch.
+// QUARRYX86: **nothing in this section mentions an arch any more, and the three bodies below are the
+// aarch64 ones.** What stood here was a banner headed "its one arch gate" over three
+// `cfg(target_arch = "aarch64")` functions, each with an x86 twin that answered NOTHING — `collect`
+// an `Err`, `mount_prefixes` a `Vec::new()`, `volume_gen` (before SR3) a literal `0`. The banner's
+// premise was that `fs/vfs.rs` gates `NativeBackend` and `FatBackend` to aarch64 (vfs.md §12.4,
+// "x86 is unchanged by design … that arch has no mount table to route through"), so there was no
+// table on x86 to ask.
+//
+// THAT PREMISE DIED A RELEASE AGO AND THE TWINS OUTLIVED IT. VFSROUTE (orin 17) made
+// `shell::vfs_mount_table` arch-neutral — `shell.rs:7191` carries no `cfg` on the function, and its
+// x86 arm binds the program source at `/`, `/boot` and `/apps` — and vfs.md §13.3 ("x86 has a
+// namespace now") superseded the §12.4 these comments cited. `shell::vfs_ls_collect` (shell.rs:1864)
+// is arch-neutral for the same reason, and `video/facet.rs:970` has been calling the table from x86
+// code all along.
+//
+// The cost was MEASURED, not inferred: VIDSMALL's SR3 capture (3291384b) prints `live_mounts=3` and
+// `[quarry] open volumes mounts=[] roots=[] tree-rows=0` in the SAME run. The rMBP's file manager was
+// empty by construction, beside a mount table with three volumes in it, because Quarry asked these
+// twins instead of the table. R16 (no board-named twins) and LAWS §3 ONE OS: a mounted filesystem is
+// listable because it implements the backend trait, whatever the board — so there is one body each.
+// Fixture: [`vol_selftest`] (`:: QUARRYVOL: … ::`).
 
 /// Collect one directory through the VFS seam. `Ok((true, rows))` for a directory.
-#[cfg(target_arch = "aarch64")]
+///
+/// ARCH-NEUTRAL (QUARRYX86). This is the SAME call the shell's `ls` makes, so Quarry and the shell
+/// cannot disagree about what a directory holds — including the synthesized mount-point rows
+/// `vfs_ls_collect` adds for every prefix bound strictly below `path`, which is where `/boot` and
+/// `/apps` enter the tree under `/`. The x86 twin this replaces returned
+/// `Err("no VFS mount table on this arch yet (vfs.md 12.4)")`; [`Model::expand`] turned that into an
+/// empty child list, so the root row could never grow one, and [`Model::new`]'s landing rule saw no
+/// candidates and stayed on `/`.
 fn collect(path: &str) -> Result<(bool, Vec<DirEnt>), String> {
     crate::shell::vfs_ls_collect(path)
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-fn collect(_path: &str) -> Result<(bool, Vec<DirEnt>), String> {
-    Err(String::from("no VFS mount table on this arch yet (vfs.md 12.4)"))
 }
 
 /// Every mount prefix, sorted. NOT the tree's roots — see [`root_prefixes`], which is the fix for
@@ -461,17 +478,24 @@ fn collect(_path: &str) -> Result<(bool, Vec<DirEnt>), String> {
 ///
 /// This is the one call that costs a `vfs_mount_table()`, and therefore a USB probe, so the model
 /// makes it exactly once per `reload_roots` and remembers the answer in `Model::mounts`.
-#[cfg(target_arch = "aarch64")]
+///
+/// ARCH-NEUTRAL (QUARRYX86), and it needed NO new accessor: [`crate::fs::vfs::MountTable::prefixes`]
+/// already existed, already `pub`, and is already what `vfs_ls_collect` and `vfs_read_target` ask.
+/// **No new lock and no lock discipline to inherit** — `vfs_mount_table()` BUILDS a fresh owned
+/// table per call and returns it by value, so the prefixes are read off a local that nothing else
+/// can see; that is the discipline every other reader keeps (`shell.rs`'s verbs, `video/facet.rs`),
+/// and it is why this stays safe to call from an input band.
+///
+/// The aarch64 body this replaces IS this body — it had no behaviour beyond the listing, so nothing
+/// was folded in and nothing was lost. In particular the USB / `/volumes` mounts are not bound here:
+/// `fs::bootdisk::bind` binds them inside `vfs_mount_table`'s own aarch64 arm (HOMESOIL, orin 22),
+/// so they arrive as ordinary prefixes and aarch64's list is unchanged. The x86 body was
+/// `Vec::new()`, which made `reload_roots` clear the tree and push nothing.
 fn mount_prefixes() -> Vec<String> {
     let mt = crate::shell::vfs_mount_table();
     let mut v: Vec<String> = mt.prefixes().iter().map(|p| String::from(*p)).collect();
     v.sort();
     v
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-fn mount_prefixes() -> Vec<String> {
-    Vec::new()
 }
 
 /// [`Model::collect_cached`]'s invalidation stamp: the block layer's hot-plug epoch **plus the VFS
@@ -501,18 +525,20 @@ fn mount_prefixes() -> Vec<String> {
 /// Still two `Acquire` loads of an `AtomicU64` and no lock, so it is still safe to ask on every cache
 /// access and on an input band — re-reading the MOUNT TABLE to detect the same events would cost the
 /// full USB volume probe this cache exists to stop paying.
-#[cfg(target_arch = "aarch64")]
+///
+/// # QUARRYX86 — the third twin, and why it goes with the other two
+///
+/// SR3 left this function split, with the x86 arm reading `fs::ns_gen()` alone and a comment saying
+/// `usb_publish_gen` was "NOT added here because the block-layer epoch stays behind the arch gate
+/// this file has always carried (see the module's 'one arch gate' note)". That note is the banner
+/// QUARRYX86 deleted, so the stated reason no longer exists — and it was never a HARDWARE reason,
+/// which LAWS §3 requires of a `target_arch` in experience-layer code. `usb_publish_gen`
+/// (`drivers/block.rs:937`) carries no `cfg` and `drivers::block` is compiled on both arches; only
+/// the two `publish_usb_geometry` bodies are split, and both of them advance the counter. So x86 now
+/// reads the same sum, which is strictly MORE invalidation than it had: a stick published on the
+/// rMBP clears Quarry's listing cache, as it always did on the Pi.
 fn volume_gen() -> u64 {
     crate::drivers::block::usb_publish_gen().wrapping_add(crate::fs::ns_gen())
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-fn volume_gen() -> u64 {
-    // SR3: this arm was `0` — a constant, so `collect_cached` never cleared. `usb_publish_gen` is
-    // NOT added here because the block-layer epoch stays behind the arch gate this file has always
-    // carried (see the module's "one arch gate" note); the namespace generation is arch-neutral and
-    // is the fact x86 was missing entirely.
-    crate::fs::ns_gen()
 }
 
 // ── The duplicate-root rule (pure) ──────────────────────────────────────────────────────────────
@@ -3157,6 +3183,11 @@ pub fn selftest() {
     // verdict below so a DECLINE in the geometry legs cannot take the invalidation proof with it;
     // its own `DONE` latch makes the second chain (from `door_selftest`) a no-op.
     stamp_selftest();
+    // QUARRYVOL (QUARRYX86) — the live-mount-table proof, chained in the same shape and for the same
+    // reason: it builds a `Model` against a synthetic geometry, so it needs no panel and no window
+    // and cannot be taken down by a DECLINE below. Its own `DONE` latch makes the `door_selftest`
+    // chain a no-op wherever both batteries run.
+    vol_selftest();
     match selftest_result() {
         Ok((a, b)) => serial_println!(
             ":: QUARRY: geometry+scroll+tree+hit+dedupe+exec+dblclick+cache+launch+wheel — 640x480 surf_px={} 1920x1200 surf_px={} dbl={}ms cache={} wheel={}rows :: PASS ::",
@@ -3244,6 +3275,10 @@ pub fn door_selftest() {
     // `selftest` — the arm aarch64's desktop reaches — is the other one. Ahead of this function's own
     // `DONE` swap, so a battery that already ran the door legs does not lose it.
     stamp_selftest();
+    // QUARRYVOL (QUARRYX86) — and THIS is the chain that matters for it: x86 is the arch whose
+    // `mount_prefixes` was `Vec::new()`, and `crystal::selftest`'s tail is the only battery arm that
+    // reaches this file there. Ahead of the `DONE` swap below for the same reason as the two above.
+    vol_selftest();
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) {
         return;
@@ -3414,6 +3449,100 @@ pub fn stamp_selftest() {
         before, after, mutations, live_mounts,
         quiet_list, quiet_live, made, step_mkdir, touched, step_create, wrote, step_write,
         eexist, denied, quiet_refusal, removed, step_unlink, rmdired, step_rmdir, clean,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+// ── QUARRYVOL (QUARRYX86) — the tree is built from the LIVE mount table, on every arch ────────────
+
+/// QUARRYX86's fixture: **[`mount_prefixes`] returns the mount table's own prefixes, and the tree
+/// [`Model::new`] builds from them has at least one row per mount — on the arch where both of those
+/// used to be zero.**
+///
+/// # What it measures
+///
+/// Three numbers off ONE freshly built [`Model`], the same object [`open`] builds and the same
+/// construction path (`reload_roots` → `expand(0)` → `landing` → `show`), just without a window:
+///
+///  * `table` — `shell::vfs_mount_table().prefixes().len()`, read DIRECTLY from the table rather
+///    than through [`mount_prefixes`]. That is what makes the go-red work: the two sides of the
+///    comparison do not share the code under test.
+///  * `mounts` — `Model::mounts.len()`, i.e. what [`mount_prefixes`] actually handed the model.
+///  * `rows` — `Model::tree.len()`, the number the `[quarry] open volumes … tree-rows=` line prints.
+///
+/// and the verdict is three claims: the two PREFIX LISTS are equal element-for-element (not merely
+/// the same length — a table with three volumes and a shim that invented three others would pass a
+/// count test), `mounts` is non-empty, and `rows >= mounts`. The last one is the FILE MANAGER half:
+/// prefixes in a `Vec` prove nothing if `collect` still refuses, because [`Model::expand`] turns a
+/// collector error into an empty child list and leaves the tree at its single root row. On this
+/// machine the root expands to at least `boot` and `apps` — the synthesized mount rows
+/// `vfs_ls_collect` adds for every prefix bound below `/` — so three mounts cannot yield one row.
+///
+/// # Why `>=` and not `==`
+///
+/// Because [`root_prefixes`] is deliberately NOT a 1:1 map: `/` claims `/boot` and `/apps`, so the
+/// three mounts reduce to ONE root and then re-appear one level down as children, which is the
+/// duplicate-`/boot` rule and the honest shape of one namespace. The row count is therefore
+/// `1 + (directories under /)`, which is bounded below by the mount count and above by nothing this
+/// fixture should pin. `==` would encode this machine's volume list into a fixture that must also
+/// run on a Pi with a stick in it.
+///
+/// # SKIP, and when it is honest
+///
+/// A board whose `vfs_mount_table()` binds nothing (BOOTROOT found no disk; QEMU raspi4b with no
+/// medium) reports `table=0` and SKIPs. That is not the defect this fixture hunts — an empty table
+/// legitimately produces an empty tree, and scoring it FAIL would make the witness a disk detector.
+/// The defect is a NON-EMPTY table beside an empty model, which is exactly the pair VIDSMALL's SR3
+/// capture printed on the rMBP (`live_mounts=3` next to `mounts=[] roots=[] tree-rows=0`).
+///
+/// **Go-red:** point [`mount_prefixes`] at an empty list (`fn mount_prefixes() -> Vec<String> {
+/// Vec::new() }` — literally the x86 twin QUARRYX86 deleted) and this reds with `mounts=0 table=3
+/// rows=1 … match=false -> FAIL`, because `table` is read past the shim.
+///
+/// Uncounted single line, the `[quarry]` family's idiom. It opens no window, takes no focus and
+/// mutates nothing — the geometry is a synthetic 1920x1200 panel handed to [`geometry`], not the
+/// live one — so it may run on either battery's chain beside [`stamp_selftest`].
+#[cfg(feature = "witness")]
+pub fn vol_selftest() {
+    use core::sync::atomic::AtomicBool;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // The table, read WITHOUT `mount_prefixes` — the independent side of the comparison.
+    let table: Vec<String> = {
+        let mt = crate::shell::vfs_mount_table();
+        let mut v: Vec<String> = mt.prefixes().iter().map(|p| String::from(*p)).collect();
+        v.sort();
+        v
+    };
+    let Some(g) = geometry(1920, 1200) else {
+        serial_println!(
+            ":: QUARRYVOL: geometry(1920x1200) declined — no panel geometry to build a Model against :: SKIP ::"
+        );
+        return;
+    };
+    let m = Model::new(g);
+    let mounts = m.mounts.len();
+    let rows = m.tree.len();
+    let same_list = m.mounts == table;
+    if table.is_empty() {
+        serial_println!(
+            ":: QUARRYVOL: mounts={} table=0 rows={} match={} — this board's `shell::vfs_mount_table()` binds no volume, so an empty tree is the honest answer and there is nothing to compare :: SKIP ::",
+            mounts, rows, same_list
+        );
+        return;
+    }
+    let ok = same_list && mounts > 0 && rows >= mounts;
+    serial_println!(
+        ":: QUARRYVOL: mounts={} table={} rows={} seam=fs::vfs::MountTable::prefixes \
+         model={:?} live={:?} roots={} same_list={} nonempty={} rows_ge_mounts={} cwd={} err={:?} \
+         match={} -> {} ::",
+        mounts, table.len(), rows,
+        m.mounts, table,
+        m.tree.iter().filter(|r| r.depth == 0).count(),
+        same_list, mounts > 0, rows >= mounts, m.cwd, m.err,
+        ok,
         if ok { "PASS" } else { "FAIL" }
     );
 }

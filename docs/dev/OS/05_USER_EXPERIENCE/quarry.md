@@ -148,18 +148,54 @@ names no backend, calls no `fat::mount()`, and calls no `unafs::with_unafs()`.
 Two visibility widenings were needed and nothing else: `shell::vfs_ls_collect` and
 `shell::vfs_mount_table` became `pub(crate)`. Both edits are one token; neither changes a line count.
 
-### 3.1 The one `target_arch`, and why it is not Quarry's
+### 3.1 The `target_arch` that used to be here — QUARRYX86 (2026-09-15) deleted it
 
-`fs/vfs.rs` gates `NativeBackend` and `FatBackend`'s impls to aarch64 — `vfs.md` §12.4: *"x86 is
-unchanged by design … that arch has no mount table to route through"*. So on x86 the collector and the
-mount table **do not exist to be called**, and Quarry's two shims (`collect`, `roots`) carry the only
-`cfg(target_arch)` in the module.
+**There is no `target_arch` in Quarry's VFS seam any more, and the promise this section used to end
+on has been kept.** What stood here said that `fs/vfs.rs` gates `NativeBackend` and `FatBackend` to
+aarch64 (`vfs.md` §12.4: *"x86 is unchanged by design … that arch has no mount table to route
+through"*), so the collector and the mount table did not exist on x86 to be called, and that "the day
+the x86 VFS adoption lands, the two shims collapse into one and x86 gets a working file manager with
+no further work here."
 
-It is not a hardware decision and it is not a new one — it mirrors a gate already in the tree. Quarry
-compiles, lays out, scrolls, hit-tests and paints identically on both arches; on x86 it opens on an
-empty volume list and says `no VFS mount table on this arch yet (vfs.md 12.4)` in the list pane rather
-than pretending. The day the x86 VFS adoption lands, the two shims collapse into one and x86 gets a
-working file manager with no further work here.
+That day had already passed and nobody noticed for a release. VFSROUTE (orin 17) made
+`shell::vfs_mount_table` arch-neutral — its x86 arm binds the program source at `/`, `/boot` and
+`/apps` — and `vfs.md` §13.3 *"x86 has a namespace now"* superseded the §12.4 these shims cited. The
+shims outlived their reason, and the cost was a file manager that was empty **by construction** on
+the rMBP: VIDSMALL's SR3 capture (`3291384b`) prints
+
+```
+:: QUARRYSTAMP: … live_mounts=3 …
+[quarry] open volumes mounts=[] roots=[] tree-rows=0
+[quarry] open census ERROR cwd=/ no volumes mounted
+```
+
+in the same boot — three mounts in the table, zero in the window. Three functions were involved, not
+the two this section counted: `collect` (`Err("no VFS mount table on this arch yet")`),
+`mount_prefixes` (`Vec::new()`) and `volume_gen` (a literal `0` until SR3, then `fs::ns_gen()` alone).
+Each is now ONE body, and it is the aarch64 body in every case — `collect` calls
+`shell::vfs_ls_collect`, `mount_prefixes` calls `MountTable::prefixes()` (an accessor that already
+existed; no new one was added and no lock was taken, because `vfs_mount_table()` returns an owned
+table by value), and `volume_gen` adds `usb_publish_gen()` to `fs::ns_gen()`. R16 forbids the
+board-named twin and LAWS §3 states the principle the code now follows: a mounted filesystem is
+listable because it implements the backend trait, whatever the board.
+
+So on x86 Quarry now opens on the real namespace: `/` as the single root (the duplicate-`/boot` rule
+of §2 reduces the three prefixes to one), with `boot` and `apps` hanging under it as the synthesized
+mount rows `vfs_ls_collect` produces, and the boot volume's own files in the list pane.
+
+The fixture is `vol_selftest` (`witness` + `quarry`), chained from both family arms beside
+`stamp_selftest`:
+
+```
+:: QUARRYVOL: mounts=3 table=3 rows=<r> seam=fs::vfs::MountTable::prefixes model=[…] live=[…]
+   roots=1 same_list=true nonempty=true rows_ge_mounts=true cwd=… err=None match=true -> PASS ::
+```
+
+`table` is read by calling `shell::vfs_mount_table().prefixes()` **directly**, not through
+`mount_prefixes`, so the two sides of the comparison do not share the code under test — which is what
+makes the go-red (restore the `Vec::new()` twin) red it at `mounts=0 table=3 … match=false -> FAIL`.
+A board whose table binds nothing reports `table=0` and SKIPs, because an empty table honestly
+produces an empty tree and a witness that scored that FAIL would be a disk detector.
 
 ---
 
