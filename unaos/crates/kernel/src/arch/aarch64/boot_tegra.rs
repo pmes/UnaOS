@@ -347,7 +347,7 @@ static EL1_ROOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 // operator experiences it, and it is why the pointer goes sluggish under load.
 //
 // The `:: AARCH64 SMP: ... AP timer PPI stretch deferred (JC3) ::` line the baton quotes is STALE
-// PROSE in `start_secondaries_tegra` — the BSP prints it before the APs reach `arm_this_core_ap`, and
+// PROSE in `start_secondaries` — the BSP prints it before the APs reach `arm_this_core_ap`, and
 // JC3 promoted the stretch long ago. This arc corrects that line rather than acting on it.
 //
 // WHAT CHANGES: ORIN-EL1AP's seat count, and nothing else about the drop. Candidate C deliberately
@@ -380,7 +380,7 @@ const EL1AP_SEATS: usize = 1;
 #[cfg(any(feature = "orinel1ap", feature = "apsrun"))]
 static EL1AP_SEAT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// ORIN-APSRUN — publish the EL1 root the BSP is going to install, BEFORE `start_secondaries_tegra`
+/// ORIN-APSRUN — publish the EL1 root the BSP is going to install, BEFORE `start_secondaries`
 /// issues its first `CPU_ON`, so no AP ever waits for it.
 ///
 /// WHY THIS EXISTS AND WHY IT IS NOT MERELY AN OPTIMISATION. ORIN-EL1AP's claimant waits for

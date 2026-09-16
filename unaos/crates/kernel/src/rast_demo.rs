@@ -222,7 +222,7 @@ pub fn run(screen: &mut crate::video::Screen) {
 // actually check in.
 //
 // WHERE THE WORKERS RUN — aarch64/tegra. The tegra image arms `tegrasmp` by DEFAULT
-// (`arroyo:573`), so `smp_virt::start_secondaries_tegra` has already brought the DTB-`/cpus`
+// (`arroyo:573`), so `smp_virt::start_secondaries` has already brought the DTB-`/cpus`
 // secondaries online at EL2 before the JM6 drop, and each one entered `sched::secondary_run` ->
 // `mark_online` -> `run()` (ORIN-SMP-RUN, `smp_virt.rs:329-345`). They are real dispatching
 // scheduler cores, so a plain `sched::spawn(..., cpu)` reaches them. The boot core is at EL1 with

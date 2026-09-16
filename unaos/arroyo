@@ -1409,7 +1409,7 @@ _p5_metal=""; case "${1:-}" in esp-jetson|esp_jetson|jetson|esp-jetson-img|esp_j
 # Witnesses on the wire: `:: [virttick] arming PERIODIC CNTP at EL1`, `:: [virttick] tick N taken at EL1`,
 # `:: [virttick] PREEMPTION PASS`. See arch_arm64.md §VIRTPREEMPT.
 [ -n "${UNAOS_VIRT_TICK:-}" ] && _feats="${_feats}virt_tick,"
-# ORIN-SMP-DEFAULT: the real 6-core Orin SMP kick-off (arch/aarch64/smp_virt.rs::start_secondaries_tegra
+# ORIN-SMP-DEFAULT: the real 6-core Orin SMP kick-off (arch/aarch64/smp_virt.rs::start_secondaries
 # + the fdt_tegra `/cpus` presence enumerator) is DEFAULT-ON for tegra builds — metal-proven across
 # SMP-1..8 (entry shape, concurrency, position, image layout, idle/busy heartbeats, count-based
 # determinism). Any tegra build (UNAOS_TEGRA=1, or the `esp-jetson` target which forces tegra) arms
@@ -1625,7 +1625,7 @@ _p5_metal=""; case "${1:-}" in esp-jetson|esp_jetson|jetson|esp-jetson-img|esp_j
 # verdict is the rollup: `el1cores=` must show TWO bits, and `bg` must stop answering el0refuse.
 #
 # `orinel1ap = ["tegrasmp", "tegra_el0"]` (both imply `tegra`), so the knob is self-sufficient:
-# `tegrasmp` because the AP must exist to be dropped (`start_secondaries_tegra` is itself
+# `tegrasmp` because the AP must exist to be dropped (`start_secondaries` is itself
 # `#[cfg(feature = "tegrasmp")]`), `tegra_el0` because an EL1 AP exists to host an EL0 tenant and the
 # spawn surface is gated `any(baremetal, tegra_el0)` — `baremetal` implies `pi`, and `pi` + `tegra` is
 # a hard `compile_error!`, so `tegra_el0` is the only satisfiable term on this board. DEFAULT OFF =>
@@ -1648,7 +1648,7 @@ _p5_metal=""; case "${1:-}" in esp-jetson|esp_jetson|jetson|esp-jetson-img|esp_j
 # here, an idempotent force block in `esp_jetson` for the media path (which forces `tegra` into the
 # feature list without ever setting the UNAOS_TEGRA env var these lines key on), and the explicit
 # positive knob left in place. NESTED INSIDE THE `tegrasmp` OPT-OUT, and that nesting is load-bearing:
-# `apsrun` drops PSCI-woken APs and `start_secondaries_tegra` is itself `#[cfg(feature = "tegrasmp")]`,
+# `apsrun` drops PSCI-woken APs and `start_secondaries` is itself `#[cfg(feature = "tegrasmp")]`,
 # so `UNAOS_NOTEGRASMP=1` must drop `apsrun` with it — a knob whose cores do not exist is a flag with
 # nothing behind it, the exact `bsprun`-without-`bsptick` shape.
 #
@@ -4252,7 +4252,7 @@ KERNEL_CFG_MATRIX=(
   "arm-tegra-xusbfw ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,xusbfw"
   # SMPMARK armed (appended 2026-08-22, ORIN-SMP-3) — `smpmark` gates the three secondary-bring-up
   # marks in `arch/aarch64/smp_virt.rs`. Two of the three (`:P:`, `:R<idx>:`) live inside
-  # `start_secondaries_tegra`, which is itself `#[cfg(feature = "tegrasmp")]`, so only a leg carrying
+  # `start_secondaries`, which is itself `#[cfg(feature = "tegrasmp")]`, so only a leg carrying
   # `tegrasmp` compiles them at all; the third (`:A:`) is in the board-neutral `__secondary_rust_virt`.
   # Without this leg the ARMED polarity would be compiled by NOTHING — the exact tegra_el0 /
   # simmer_test / xusbfw shape, and the reason the standing law is that a cfg widen's gates must
@@ -5292,7 +5292,7 @@ KERNEL_CFG_MATRIX=(
   # conjoined so exactly one NEW row reaches it and no existing row does:
   #     #[cfg(all(feature = "smpmark", feature = "orinfurn", feature = "orinvpar"))] let _pa: u32 = "SMPMARKLEG-PROBE-A";
   #     #[cfg(all(feature = "smpmark", feature = "supstate"))]                       let _pb: u32 = "SMPMARKLEG-PROBE-B";
-  # both appended after the `:P:` mark inside `start_secondaries_tegra` (itself
+  # both appended after the `:P:` mark inside `start_secondaries` (itself
   # `#[cfg(feature = "tegrasmp")]`, which both new rows carry). Result, each leg run as its own
   # `cargo +nightly check --release --target ../../aarch64-unaos.json`:
   #     arm-tegra-furn-vpar-smpmark     EXIT 101   error[E0308] expected `u32`, found `&str`
