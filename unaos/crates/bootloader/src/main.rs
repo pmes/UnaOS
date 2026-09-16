@@ -1386,7 +1386,7 @@ fn acpi_checksum(bytes: &[u8]) -> u8 {
 #[cfg(feature = "unaos_ivb")]
 unsafe fn read_igpu_trace() -> [u32; 11] {
     #[cfg(target_arch = "x86_64")]
-    unsafe {
+    {
         use core::arch::asm;
         
         let outl = |port: u16, val: u32| {
@@ -1435,7 +1435,7 @@ unsafe fn read_igpu_trace() -> [u32; 11] {
 #[cfg(feature = "unaos_ivb")]
 unsafe fn read_gmux_trace() -> [u32; 7] {
     #[cfg(target_arch = "x86_64")]
-    unsafe {
+    {
         use core::arch::asm;
         
         let outb = |port: u16, val: u8| {
