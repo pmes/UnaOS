@@ -985,14 +985,85 @@ fn main() {
         println!("Created usb.img (64MB) with Signature.");
     }
 
+    // DEFAULTMEDIUM: THE DEFAULT x86 STICK, AND WHY IT IS BUILT RATHER THAN KEPT.
+    //
+    // `usb.img` above is the raw `UNA-OS-DISK-001-ALPHA` pattern and nothing else: no BPB, no
+    // 0xAA55, so `fat::mount_source` refuses it through superfloppy, GPT and every MBR slot and the
+    // boot prints `FS: no FAT filesystem (NotFat)`. NO MOUNTABLE VOLUME ON THAT MACHINE CARRIES THIS
+    // KERNEL, so `:: X86BIND: root=- reason=kernel-not-found-on-any-volume … -> FAIL ::` and
+    // `:: TSTE: vfsroute.refuse -> FAIL` were that medium's CORRECT answers — and the default
+    // `./arroyo test` leg was therefore rc=1 on every tree, with the fold gate scoring it by PROSE
+    // ("exactly those two reds are expected"). A red that is expected in prose is the shape LAWS §5
+    // forbids: a leg that cannot go green can no longer say anything when something else breaks.
+    //
+    // The fix is a FIXTURE, not a kernel: give the default machine a volume that carries this
+    // kernel, WITHOUT moving one byte of what the BOT fixture and the write probe read.
+    //
+    // WHAT THE TWO WITNESSES ACTUALLY TOUCH (measured, not assumed):
+    //   * `crates/kernel/src/drivers/xhci/mod.rs:12936` reads LBA 0, BYTES 0..21, and prints
+    //     `MISSION SUCCESS` when they spell `UNA-OS-DISK-001-ALPHA`. Bytes 0..21 of an MBR are
+    //     BOOTSTRAP CODE — the partition table lives at 446 and the signature word at 510 — so the
+    //     pattern and a partition table COEXIST in one sector, with no kernel-side read-offset
+    //     change. They could NOT coexist with a superfloppy, whose BPB owns 0x00..0x3E; that is why
+    //     the `fat-sf.img` shape can never be this leg's medium, and why the superfloppy route would
+    //     have cost a kernel byte move.
+    //   * `xhci/mod.rs:13091` (`usbw_keepout_ceiling`) parses that same sector and puts its scratch
+    //     LBA at the top of the medium but at/above the ceiling; on a 64 MiB raw stick that is
+    //     `usbw. write lba=131071 ok`. TWO things pin that number: the disk stays EXACTLY 131072
+    //     sectors, and the partition must END BELOW 131071 — a volume running to the last sector
+    //     raises the ceiling over every candidate and the probe skips with `on-disk container spans
+    //     the medium`.
+    //
+    // HENCE THE GEOMETRY BELOW, every constant of which is one of those two witnesses' arithmetic:
+    // a 64 MiB (131072-sector) disk; an MBR at LBA 0 carrying the pattern in its boot-code area;
+    // partition 1 = FAT32 at LBA 2048..129024 (the 1 MiB alignment every formatter uses); and an
+    // unallocated tail, so LBA 131071 is OUTSIDE the volume and the RMW+restore probe is genuinely
+    // clear of live data rather than merely near the end of it.
+    //
+    // THE FILESYSTEM IS BUILT BY `scripts/make-fat-img.sh sf`, NOT BY HAND. Its `sf` layout emits a
+    // bare FAT32 volume with no partition table — exactly the payload an MBR partition wants — and
+    // it stages the SAME content tree the `test-fat sf` fixture is calibrated against (the ESP's
+    // kernel.elf, with BOOTX64.EFI renamed to .REM so OVMF still boots the ide-hd ESP at
+    // bootindex=0, plus HELLO.BIN / APPS/*.ELF / SCRATCH.BIN / GROW.BIN / S8W.BIN / BLOCK.TXT and
+    // the LFN + nested-directory fixtures). ONE content tree and ONE formatter, so the default leg
+    // and the sf leg cannot drift apart. Its `part` layout is deliberately NOT used: it needs
+    // `sfdisk` (absent on this bench — `./arroyo fat-img` dies there today) and its partition always
+    // runs to the last sector, which is precisely the geometry that kills `usbw`. The sixteen bytes
+    // of partition entry are written here instead; that is the whole of what sfdisk was for.
+    //
+    // REBUILT EVERY RUN, and that is load-bearing: `fs::bootdisk` matches a candidate file by this
+    // build's early `.text` window AND its build stamp, so an image cached from an older kernel is
+    // not merely stale — it is a volume that does not carry THIS kernel, and the leg would red
+    // exactly as it does today while looking fixed.
+    //
+    // FAILURE IS LOUD AND RED, NEVER SILENT AND GREEN: on a host without mtools/dosfstools the
+    // generator says so on stdout and the slot falls back to `usb.img`, which reds the same two rows
+    // it always did. A fallback that quietly produced a green run would be this arc's own defect.
+    let default_stick = match build_default_medium(&workspace_dir) {
+        Ok(p) => {
+            println!("   DEFAULTMEDIUM: default x86 stick {} — MBR at LBA 0 (UNA-OS-DISK-001-ALPHA at offset 0; \
+                      partition 1 = FAT32, type 0x0c, LBA 2048..129024), 131072 sectors total, tail from LBA \
+                      129024 unallocated (the usbw scratch at LBA 131071 lies outside the volume)", p.display());
+            p
+        }
+        Err(why) => {
+            println!("   ⚠ DEFAULTMEDIUM: could NOT build the kernel-carrying default stick ({}). Falling back to \
+                      the raw pattern image {} — the boot will print `FS: no FAT filesystem (NotFat)` and \
+                      X86BIND / vfsroute.refuse will FAIL, which is that medium's honest answer.",
+                     why, usb_image.display());
+            usb_image.clone()
+        }
+    };
+
     // UNAOS_FATIMG selects a FAT filesystem image (built by scripts/make-fat-img.sh) as the
     // usb-storage backing instead of the raw UNA-OS pattern image, giving the kernel's read-only
     // FAT reader (`ls`/`cat`) a real FAT32 volume to parse. `1`/`part` -> builder/fat.img,
-    // `sf` -> builder/fat-sf.img, or an explicit path. Unset (the default) keeps usb.img so the
-    // BOT "MISSION SUCCESS" pattern test is unchanged. block::info() registers this single device,
+    // `sf` -> builder/fat-sf.img, or an explicit path. Unset (the default) is the DEFAULTMEDIUM
+    // stick built above, which carries the BOT "MISSION SUCCESS" pattern in its MBR boot-code area
+    // AND a kernel-carrying FAT32 volume in partition 1. block::info() registers this single device,
     // mirroring a real single-stick metal boot where the FAT32 ESP stick *is* the block device.
     let stick_image = match std::env::var("UNAOS_FATIMG").ok().as_deref() {
-        None | Some("") => usb_image.clone(),
+        None | Some("") => default_stick.clone(),
         Some("1") | Some("part") => workspace_dir.join("builder/fat.img"),
         Some("gpt") => workspace_dir.join("builder/fat-gpt.img"),
         Some("p16") => workspace_dir.join("builder/fat16.img"),
@@ -1061,7 +1132,7 @@ fn main() {
         }
         Err(_) => stick_image,
     };
-    if stick_image != usb_image && !stick_image.exists() {
+    if stick_image != default_stick && !stick_image.exists() {
         panic!("UNAOS_FATIMG set but {} is missing — run `./arroyo fat-img` first",
             stick_image.display());
     }
@@ -1651,4 +1722,112 @@ fn stage_sdhc4c_volume(path: &std::path::Path) {
         path.display(), SD4C_FIRST_CLUSTER, SD4C_RESERVE_BYTES, first_data_sector,
         extent_start, extent_end, extent_end - extent_start
     );
+}
+
+/// DEFAULTMEDIUM — build `builder/usb-boot.img`, the default x86 `test` stick, and return its path.
+///
+/// The long WHY is at the call site (search `DEFAULTMEDIUM:` in `main`). The short form: the default
+/// medium has to answer BOTH questions the boot asks of it — the BOT fixture's raw signature at
+/// LBA 0 bytes 0..21, and `fs::bootdisk`'s "does any mountable volume carry THIS kernel" — and an
+/// MBR is the one sector layout where those two coexist without a kernel-side read-offset change.
+///
+/// GEOMETRY, and the witness each constant belongs to:
+/// * `DISK_SECTORS` 131072 — `usbw`'s scratch is `num_blocks - 1`; the measured line is
+///   `usbw. write lba=131071 ok` and this is the only size that keeps it.
+/// * `PART_LBA` 2048 — 1 MiB alignment, the same start `make-fat-img.sh`'s `part` layout uses, so
+///   the volume inside is byte-for-byte a volume any formatter would have produced.
+/// * `FS_SECTORS` 126976 (62 MiB) — the partition ends at LBA 129024, BELOW 131071, so
+///   `usbw_keepout_ceiling` reports `mbr-partition-table` with a ceiling the top-of-medium candidate
+///   clears. A volume that ran to the last sector would make the probe skip instead of write.
+///
+/// Errors are returned, never panicked: a host without dosfstools/mtools must still be able to run
+/// `./arroyo test` — it simply gets the old raw stick and the old two reds, said out loud.
+fn build_default_medium(workspace_dir: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    const SECTOR: u64 = 512;
+    const DISK_SECTORS: u64 = 131_072; // 64 MiB — pins `usbw. write lba=131071`
+    const PART_LBA: u64 = 2_048;
+    const FS_MB: u64 = 62;
+    const FS_SECTORS: u64 = FS_MB * 2_048; // 126976 -> partition ends at LBA 129024
+    const SIG: &[u8] = b"UNA-OS-DISK-001-ALPHA";
+    const PART_TYPE_FAT32_LBA: u8 = 0x0c;
+
+    let out = workspace_dir.join("builder/usb-boot.img");
+    let fs_img = workspace_dir.join("builder/usb-boot.fs.img"); // `.img` so the repo `.gitignore` covers a leftover on failure
+    let script = workspace_dir.join("scripts/make-fat-img.sh");
+    if !script.exists() {
+        return Err(format!("{} is missing", script.display()));
+    }
+
+    // The FAT32 payload, with no partition table of its own — `sf` is exactly that. `FAT_IMG_MB`
+    // sizes it to the partition. `UNAOS_SRCFIXTURE` is REMOVED rather than left to the inherited
+    // environment: the SELFHOST lane sets it, and a default stick whose root directory silently
+    // grew two entries would move counts other fixtures assert.
+    let status = Command::new("bash")
+        .arg(&script)
+        .arg("sf")
+        .arg(&fs_img)
+        .env("FAT_IMG_MB", FS_MB.to_string())
+        .env_remove("UNAOS_SRCFIXTURE")
+        .current_dir(workspace_dir)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("could not run {}: {}", script.display(), e))?;
+    if !status.success() {
+        return Err(format!("{} sf exited with {}", script.display(), status));
+    }
+
+    // The payload must be EXACTLY the partition's length. `parse_bpb` refuses a volume whose own
+    // `tot_sec` disagrees with the partition entry that pointed at it (fs/fat.rs, the GR9 gate), so a
+    // mis-sized payload would mount nowhere — and it would do it silently, as a `NotFat`.
+    let fs_len = std::fs::metadata(&fs_img)
+        .map_err(|e| format!("cannot stat {}: {}", fs_img.display(), e))?
+        .len();
+    if fs_len != FS_SECTORS * SECTOR {
+        return Err(format!(
+            "{} is {} bytes, expected {} ({} sectors)",
+            fs_img.display(), fs_len, FS_SECTORS * SECTOR, FS_SECTORS
+        ));
+    }
+
+    let mut dst = std::fs::OpenOptions::new()
+        .create(true).write(true).truncate(true).open(&out)
+        .map_err(|e| format!("cannot create {}: {}", out.display(), e))?;
+    dst.set_len(DISK_SECTORS * SECTOR)
+        .map_err(|e| format!("cannot size {}: {}", out.display(), e))?;
+    dst.seek(SeekFrom::Start(PART_LBA * SECTOR))
+        .map_err(|e| format!("cannot seek {}: {}", out.display(), e))?;
+    let mut src = std::fs::File::open(&fs_img)
+        .map_err(|e| format!("cannot open {}: {}", fs_img.display(), e))?;
+    std::io::copy(&mut src, &mut dst)
+        .map_err(|e| format!("cannot place the volume in {}: {}", out.display(), e))?;
+
+    // The MBR. Bytes 0..21 are the BOT fixture's pattern, sitting in the boot-code area; the table
+    // starts at 446 and the signature word at 510, so nothing the kernel reads overlaps anything
+    // else the kernel reads. The boot flag stays 0x00 — OVMF must keep booting the ide-hd ESP at
+    // bootindex=0, and `make-fat-img.sh` has already renamed this volume's BOOTX64.EFI to .REM for
+    // the same reason. The CHS triples are the usual 0xFE/0xFF/0xFF "past CHS, read the LBA fields"
+    // sentinel; `block::decode_mbr` reads the LBA fields only and validates neither CHS nor the boot
+    // flag (it checks type, extent and disjointness), so this entry is accepted as slot 1.
+    let mut mbr = [0u8; SECTOR as usize];
+    mbr[..SIG.len()].copy_from_slice(SIG);
+    let ent = 446usize; // slot 1 of the primary partition table
+    mbr[ent] = 0x00;
+    mbr[ent + 1..ent + 4].copy_from_slice(&[0xfe, 0xff, 0xff]);
+    mbr[ent + 4] = PART_TYPE_FAT32_LBA;
+    mbr[ent + 5..ent + 8].copy_from_slice(&[0xfe, 0xff, 0xff]);
+    mbr[ent + 8..ent + 12].copy_from_slice(&(PART_LBA as u32).to_le_bytes());
+    mbr[ent + 12..ent + 16].copy_from_slice(&(FS_SECTORS as u32).to_le_bytes());
+    mbr[510] = 0x55;
+    mbr[511] = 0xaa;
+    dst.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("cannot seek {}: {}", out.display(), e))?;
+    dst.write_all(&mbr)
+        .map_err(|e| format!("cannot write the MBR of {}: {}", out.display(), e))?;
+    dst.sync_all()
+        .map_err(|e| format!("cannot flush {}: {}", out.display(), e))?;
+    let _ = std::fs::remove_file(&fs_img);
+    Ok(out)
 }

@@ -892,8 +892,23 @@ The genuine end-of-medium fallback ladder from USB-WRITE-2 (P44: some sticks STA
 against the very last LBA they report) is retained — applied to the right disk, and now clamped to
 the keep-out ceiling.
 
-On the default QEMU media (`builder/usb.img`, a raw pattern image with no container in sector 0)
-the ceiling is 0 and the proof runs at the last LBA exactly as before.
+On the default QEMU media the ceiling is **no longer 0, and the proof still runs at the same LBA** —
+and that pairing is the whole of DEFAULTMEDIUM. The default x86 `test` stick is now
+`builder/usb-boot.img`, rebuilt by `builder/src/main.rs` on every run: an MBR at LBA 0 whose
+**boot-code area** carries the `UNA-OS-DISK-001-ALPHA` pattern this chapter's BOT fixture reads at
+bytes 0..21, a FAT32 partition 1 at LBA 2048..129024 carrying that build's `kernel.elf` (so
+`fs::bootdisk` can bind `/` by content instead of finding no kernel on any volume), and an
+unallocated tail above it. The two readers share one sector because they read **disjoint byte
+ranges** — 0..21 against the table at 446 and the signature word at 510 — which is why this shape
+needed no kernel-side read-offset change; a FAT **superfloppy** could never have been the default
+medium, because a BPB owns 0x00..0x3E and would have displaced the pattern. Measured on the default
+leg: `:: PART: mbr handle=usb slot=1 type=0x0c ... start=2048 count=126976 end=129024 ACCEPT ::`,
+`[usbw] scratch geometry: USB last_lba=131071 (num_blocks=131072), keep-out ceiling=129024
+[mbr-partition-table]`, `[usbw] write lba=131071 ok`, `SECTOR 0 SIGNATURE: UNA-OS-DISK-001-ALPHA`
+and `MISSION SUCCESS` — the same scratch sector as on the raw image, this time **provably outside**
+the volume rather than merely outside a container that did not exist. `builder/usb.img`, the raw
+pattern image with no container in sector 0, is still built and is still what the aarch64 leg
+attaches; on it the ceiling is 0, exactly as the table above says.
 
 ---
 
