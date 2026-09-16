@@ -716,7 +716,7 @@ pub fn onecard_witness() {
     serial_println!(
         ":: ONECARD: boot medium = SD backend, {} blocks ({} MiB) | p1 program volume {} | p2 native volume {} | usb={} — no second medium was consulted to reach this point ::",
         dev.num_blocks, mib, fat, native, usb
-    );
+    );#[cfg(feature = "witness")] emmc2lba_selftest(); // EMMC2LBA (SR15): `card_block_arg`'s known-answer test rides this entry point because it is the one `all(aarch64, baremetal)` call in this file that runs on EVERY boot, and the fixture is pure — no MMIO, no card, no allocation — so it cannot disturb the ONECARD reading above it. Folded onto the closing line rather than appended, the `fs/bootdisk.rs:1893` idiom, so the fixture costs no `core::panic::Location` line movement of its own.
 }
 
 /// Read one 512-byte block at `lba` into `buf` (>= 512 bytes) via a polled single-block CMD17. Returns
@@ -731,13 +731,13 @@ pub fn read_block_512(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
     if lba >= card.num_blocks {
         return Err(BlockError::BadLba);
     }
-    // SDSC uses byte addressing; guard that the byte offset fits the 32-bit ARG1 register.
-    let arg = if card.block_addressing {
-        lba as u32
-    } else {
-        let byte_off = lba.checked_mul(512).filter(|&b| b <= u32::MAX as u64).ok_or(BlockError::BadLba)?;
-        byte_off as u32
-    };
+    // EMMC2LBA (LEDGER SR15): ARG1 is 32 bits wide, so BOTH addressing modes have a ceiling inside
+    // it and BOTH now refuse rather than truncate. The byte-addressed arm was always checked here;
+    // the block-addressed arm handed ARG1 a bare `lba as u32`, and LBA 0x1_0000_0000 would have
+    // become 0 — the BOOT SECTOR, returned as if it were the sector asked for. One helper for both
+    // sites, in the shape `sd_block_arg` (orin A57) and `sdhc.rs::lba_arg` already carry; it is at
+    // the file tail and prints the refusal itself, so this site keeps the `?` it always had.
+    let arg = card_block_arg("CMD17", card.block_addressing, lba)?;
     let base = card.base;
 
     write32(base, INTERRUPT, 0xFFFF_FFFF); // clear stale status
@@ -800,13 +800,13 @@ pub fn write_block_512(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     if lba >= card.num_blocks {
         return Err(BlockError::BadLba);
     }
-    // SDSC uses byte addressing; guard that the byte offset fits the 32-bit ARG1 register (as the read path does).
-    let arg = if card.block_addressing {
-        lba as u32
-    } else {
-        let byte_off = lba.checked_mul(512).filter(|&b| b <= u32::MAX as u64).ok_or(BlockError::BadLba)?;
-        byte_off as u32
-    };
+    // EMMC2LBA (LEDGER SR15): the read path's helper, the same two ceilings, the same refusal — see
+    // `read_block_512` above and `card_block_arg` at the file tail. A wrapped argument is strictly
+    // worse here than on the read path: a truncated `lba as u32` would have made CMD24 OVERWRITE
+    // the boot sector with the caller's data and then return `Ok`, with no error anywhere in the
+    // stack. As on the read path it is the BLOCK-addressed arm that was bare. `op` is what names
+    // this entry point on the refusal line, so a wire capture says which command was refused.
+    let arg = card_block_arg("CMD24", card.block_addressing, lba)?;
     let base = card.base;
 
     write32(base, INTERRUPT, 0xFFFF_FFFF); // clear stale status
@@ -862,4 +862,130 @@ pub fn write_block_512(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
         .map_err(|_| BlockError::Io)?;
     r1_check(base, "CMD13").map_err(|_| BlockError::Io)?;
     Ok(())
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// EMMC2LBA (LEDGER SR15) — the card argument is 32 bits, and BOTH addressing modes hit a ceiling
+// inside it
+//
+// BLOCKSMALL swept the `u64` LBA narrowed with `as` across the tree and closed eight sites in
+// `drivers/block.rs`; it ledgered this file's two as PARTIAL because the Pi's metal SD path was
+// read-only for that arc. These are those two. `read_block_512:735` and `write_block_512:804` built
+// the block-addressed card argument as a bare `lba as u32`: `as` on an out-of-range value does not
+// fail, it TRUNCATES, so LBA `0x1_0000_0000` becomes `0` — the boot sector — and CMD17 returns the
+// wrong sector as if it were right while CMD24 destroys the partition table and answers `Ok`.
+//
+// TWO CEILINGS, BOTH REAL, AND THEY ARE NOT THE SAME NUMBER. On an SDHC/SDXC card ARG1 carries the
+// SECTOR NUMBER, so the ceiling is `u32::MAX` sectors = 2 TiB at 512 B/sector — the same ceiling as
+// `read10_lba32`'s SCSI READ(10) CDB. On an SDSC card ARG1 carries a BYTE OFFSET, so the ceiling is
+// `u32::MAX` bytes = 4 GiB of medium, the last expressible sector being LBA 8,388,607 — orin A57's
+// ceiling, 4096x closer in. Confusing the two is the trap this file's tail exists to stop, so both
+// are named on the wire and both are in the fixture.
+//
+// REACHABILITY TODAY IS AN ACCIDENT, which is the argument for a refusal rather than a comment: the
+// `lba >= card.num_blocks` test one line above each call site bounds the argument, and `num_blocks`
+// is CSD-derived, so an SDXC tops out at 2^32 sectors and the block-addressed wrap cannot be reached
+// on any card this driver has met. That guard is a property of a card's CSD, not of anything this
+// layer decides; a refusal costs one compare against a path that costs a card round trip.
+//
+// SHAPE: this is `sd_block_arg`'s body (`arch/aarch64/sdmmc_tegra.rs`, orin A57) with this file's
+// error type and a wire line, exactly as the brief asked — one helper, both sites. It differs from
+// `sdhc.rs::lba_arg` only in that it SAYS SO when it refuses: a silent `BlockError::BadLba` here
+// would be indistinguishable from the geometry bound above it, and telling those two apart is the
+// whole point of having refused instead of wrapped.
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The 32-bit ARG1 value for a data command at `lba` on this card, or [`BlockError::BadLba`] — a
+/// refusal, never a wrap. `op` names the calling command (`CMD17` / `CMD24`) on the refusal line.
+///
+/// Prints ONLY on refusal: the success path is the boot path and must stay silent. Pure otherwise —
+/// no MMIO, no card, no allocation — which is what lets [`emmc2lba_selftest`] execute it in QEMU.
+fn card_block_arg(op: &str, block_addressing: bool, lba: u64) -> Result<u32, BlockError> {
+    if block_addressing {
+        // SDHC/SDXC: ARG1 IS the sector number. Ceiling `u32::MAX` sectors = 2 TiB at 512 B.
+        if lba > u32::MAX as u64 {
+            serial_println!(
+                ":: [emmc2] lba refused={:#x} reason=exceeds-32-bit op={} mode=block ceiling={} sectors (2 TiB at 512 B) — ARG1 carries the SECTOR NUMBER; refused, never wrapped (EMMC2LBA, SR15) ::",
+                lba, op, u32::MAX as u64 + 1
+            );
+            return Err(BlockError::BadLba);
+        }
+        Ok(lba as u32)
+    } else {
+        // SDSC: ARG1 is a BYTE OFFSET. Ceiling `u32::MAX` bytes = 4 GiB; last sector is 8,388,607.
+        // `checked_mul` also covers the `u64` overflow an absurd LBA would produce, so nothing
+        // reaches the multiply unguarded.
+        match lba.checked_mul(512).filter(|&b| b <= u32::MAX as u64) {
+            Some(byte_off) => Ok(byte_off as u32),
+            None => {
+                serial_println!(
+                    ":: [emmc2] lba refused={:#x} reason=exceeds-32-bit op={} mode=byte ceiling=8388608 sectors (4 GiB at 512 B) — ARG1 carries a BYTE OFFSET; refused, never wrapped (EMMC2LBA, SR15) ::",
+                    lba, op
+                );
+                Err(BlockError::BadLba)
+            }
+        }
+    }
+}
+
+/// EMMC2LBA (SR15) fixture: [`card_block_arg`]'s known-answer test, in the shape
+/// `sd_block_arg_selftest` (orin A57) and `block.rs::lba32_selftest` (BLOCKSMALL) established for
+/// this defect class. The kernel crate is `no_std` with no `#[cfg(test)]` idiom, so this is a
+/// boot-path witness rather than a host unit test; it is pure, so it runs identically on QEMU
+/// `raspi4b` and on the bench Pi.
+///
+/// **Four positives, each the LAST value its arm can express**, because an off-by-one at the ceiling
+/// is precisely the defect class: block-addressed LBA 0 and LBA 4,294,967,295 (`0xffff_ffff`), and
+/// byte-addressed LBA 0 and LBA 8,388,607 (`0xffff_fe00`).
+///
+/// **Four negative controls, and they are the point rather than ballast**: block-addressed `1 << 32`
+/// — the first unaddressable sector, and the one whose old value was `0`, i.e. THE BOOT SECTOR — and
+/// `u64::MAX`; byte-addressed 8,388,608 (exactly 4 GiB, whose old value was also `0`) and `u64::MAX`,
+/// which overflows the multiply outright. Without them a builder that answered with a number for
+/// every input would pass, and the corpus has to be able to produce more than one outcome.
+///
+/// **`wrapblk=` and `wrapbyte=` SHOW the defect instead of claiming it**: they are `(1u64 << 32) as
+/// u32` and `8_388_608u64.wrapping_mul(512) as u32` computed here, so the wire carries the literal
+/// values the two call sites used to hand ARG1. Both are `0x00000000`, and that is the whole row.
+///
+/// **Go-red, and this fixture's BOUND, stated rather than oversold:** mutate the block arm's
+/// `lba > u32::MAX as u64` guard away and the leg reads `refused=2/4 -> FAIL`. Reverting ONE CALL
+/// SITE to `lba as u32` is INVISIBLE here — this is a known-answer test on the helper — and no
+/// behavioural leg can close that gap, because `lba >= card.num_blocks` refuses an out-of-range LBA
+/// with the same [`BlockError::BadLba`] one line earlier. What guards the two sites is the TYPE
+/// (this returns a `Result`, so a site that drops it does not compile into the same expression),
+/// LEDGER SR15, and GATE-LBA32 (`unaos/scripts/lba32-check.sh`), which is the grep gate SR15 said
+/// would make it mechanical.
+#[cfg(feature = "witness")]
+pub fn emmc2lba_selftest() {
+    let blk_first = card_block_arg("fixture", true, 0);
+    let blk_last = card_block_arg("fixture", true, u32::MAX as u64);
+    let byte_first = card_block_arg("fixture", false, 0);
+    let byte_last = card_block_arg("fixture", false, 8_388_607);
+    let refused = card_block_arg("fixture", true, 1u64 << 32).is_err() as u32
+        + card_block_arg("fixture", true, u64::MAX).is_err() as u32
+        + card_block_arg("fixture", false, 8_388_608).is_err() as u32
+        + card_block_arg("fixture", false, u64::MAX).is_err() as u32;
+    // What the two sites used to compute for the first refused vector of each arm: 0, the boot sector.
+    let wrapblk = (1u64 << 32) as u32;
+    let wrapbyte = 8_388_608u64.wrapping_mul(512) as u32;
+    let pass = blk_first == Ok(0)
+        && blk_last == Ok(0xffff_ffff)
+        && byte_first == Ok(0)
+        && byte_last == Ok(0xffff_fe00)
+        && refused == 4
+        && wrapblk == 0
+        && wrapbyte == 0;
+    serial_println!(
+        ":: EMMC2LBA: blk-first={:#010x} blk-last={:#010x} byte-first={:#010x} byte-last={:#010x} \
+         refused={}/4 wrapblk={:#010x} wrapbyte={:#010x} -> {} ::",
+        blk_first.unwrap_or(0xdead_beef),
+        blk_last.unwrap_or(0xdead_beef),
+        byte_first.unwrap_or(0xdead_beef),
+        byte_last.unwrap_or(0xdead_beef),
+        refused,
+        wrapblk,
+        wrapbyte,
+        if pass { "PASS" } else { "FAIL" }
+    );
 }
