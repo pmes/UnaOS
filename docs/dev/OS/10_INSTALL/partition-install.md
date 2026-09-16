@@ -303,6 +303,19 @@ every write and the installer said so on the wire (`reason=transport-read-only t
 transport half has now landed, and it is the half with the metal risk: the disk the operator names in
 step 3 of the procedure lives on the same controller as Catalina.
 
+**THE SITTING ITSELF IS `SITTING-1.md` BESIDE THIS FILE, AND IT OVERRIDES THIS SECTION ON THREE
+POINTS.** This file is the MECHANISM; `docs/dev/OS/10_INSTALL/SITTING-1.md` is what an operator
+follows on Peter's metal — the precondition list, the knob line, the step-by-step witness lines and
+the STOP rules. Read it before arming anything, because it measured three things this section does
+not say: (1) `UNAOS_AHCI_WRITE=1` **also opens the installer's READ** of a SATA disk
+(`install/mod.rs:208`), so the "routine flight, `UNAOS_AHCI=1` alone" row below censuses nothing on
+the SSD — the `ahci0: present, NOT censused` row of step 3 above is what it prints; (2) with
+`installdemo` + `ahci-write` and **no** `instgui`, the unattended fixture writes a real SATA disk **at
+boot** (`main.rs:1817`, `main.rs:6048` → `partition.rs:1021`), so `UNAOS_INSTGUI=1` is a safety knob
+on that line and not a cosmetic one; and (3) the operator path writes `demo_tree()`'s **synthetic**
+four files (`partition.rs:952`, `:805`), so the installed volume's `BOOTX64.EFI` is 12 KiB of filler
+and the ⌥-picker question in *Firmware facts* above cannot yet be answered by starting it.
+
 ### The knob, and where it may appear
 
 | sitting | flight line |
