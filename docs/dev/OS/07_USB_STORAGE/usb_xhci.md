@@ -9233,6 +9233,115 @@ builds its block-addressed argument as a bare `lba as u32` at `:736` and `:805` 
 accidental guard (`lba >= card.num_blocks`, CSD-derived), same missing refusal. Ledgered in SR15;
 the edit belongs to the Pi seat.
 
+## 37. PTRPRESS — the pointer path had no press-recovery accounting (LEDGER S30, 2026-09-15)
+
+S30 was filed from a callee-name grep (`press seen=` hits 1 of 30 driver files, EHCI only) and S31
+immediately downgraded it to NAME-measured. This section is the call-graph reading that settles it,
+and the repair.
+
+### 37.1 The gap, read off the branch and not off a grep
+
+`drivers/xhci/mod.rs`' pointer completion branch decodes `data_data[0]` into `buttons`, diffs it
+against the slot's `mouse_prev_buttons` **level**, and pushes `Event::Button(buttons)` on any change.
+That is the whole accounting: no counter, no recovery, no witness. `drivers/ehci/mod.rs`'
+`note_buttons` prints `:: PTR: … press seen= delivered= recovered= …`; the xHCI path prints
+`:: MOUSE-1:` every 32nd report and nothing about edges at all.
+
+**A level diff is blind to a lost edge by construction.** If the report carrying an edge never
+reaches the decoder the level simply never changes, and there is no line anywhere. Two faults hide
+inside that blindness and they want different repairs:
+
+* the RELEASE is lost — the level stays DOWN, every consumer's held-state tracker stays armed, and
+  the device will never resend it. A stuck click.
+* a PRESS and its RELEASE are both lost — the click is swallowed whole. Peter at the glass: "clicks
+  not registering".
+
+### 37.2 Why the hole exists: the pointer is still single-TD
+
+`queue_mouse_read` arms exactly ONE Normal TRB and is the LAST statement of the pointer completion
+branch. Between the controller retiring that TD and software re-arming it the endpoint has no TD,
+the controller issues no IN token, and every state change inside the window is lost forever. That is
+PRTSCLOST's keyboard argument (§ the `KBD_INFLIGHT` doc in `drivers/xhci/mod.rs`) unchanged, on the
+other endpoint — **and XHCINTD's repair has NOT been applied here.** The keyboard keeps
+`KBD_INFLIGHT` = 4 TRBs outstanding through `kbd_top_up`/`kbd_retire`; the pointer keeps one.
+
+**MEASURED, this arc, on the `UNAOS_XHCIHUB=1 UNAOS_WC=1 UNAOS_QEMU_FULL=1 ./arroyo test 90` leg**
+(`ptrpress-logs/02`, no injected hole, the ordinary boot battery as the pump):
+`armgap_us=668983` — the pointer's interrupt-IN went **669 ms** between the drain that preceded one
+report and the drain that preceded the next — and of **30** button edges injected 20 ms apart only
+`edges=20` reached the decoder. A third of a paced click stream, gone, on the emulator, where the
+device still buffers. **On metal the device buffers nothing and every edge in that window is gone.**
+
+**THE N-TD REPAIR FOR THE POINTER IS THE REAL FIX AND IS THE NEXT RUNG, NOT THIS ONE.** It is the
+`kbd_retire_set` / `kbd_free_buf` / `kbd_top_up` shape mirrored onto `mouse_*`: an armed set on the
+slot, a 64-byte-stride buffer pool inside the existing pointer buffer, arm-into-a-free-buffer in
+`queue_mouse_read`, set-membership in the dup guard, the retired buffer (not `mouse_data_buffer`)
+decoded, and the halt-recovery clear. It is carried with the two numbers above rather than guessed
+at. Its gate is already engineered by XHCIKBD's arithmetic: QEMU's HID device queues 16 undelivered
+events, so a burst of 19 into a dark window loses 3 at depth 1 and 0 at depth 4.
+
+### 37.3 What this arc ships
+
+Five ungated relaxed counters, folded onto the existing counters line beside their `MOUSE_*`/`KBD_*`
+siblings, and two slot fields folded onto `mouse_prev_buttons`:
+
+| name | what it counts |
+| --- | --- |
+| `MOUSE_ARMGAP_MAX` | the pointer's own latch of `KBD_DRAIN_GAP` — the upper bound on its unarmed window, the number the keyboard has had since PRTSCLOST and the pointer did not |
+| `MOUSE_RESTATED_COUNT` | a report whose delivered bytes are byte-identical to its predecessor's |
+| `MOUSE_PRESS_LOST` | a restated report with buttons DOWN — the release fell in the hole, the level is stuck |
+| `MOUSE_RELEASE_ORPHAN` | a restated report with buttons UP — a whole press+release pair fell in the hole, the click was swallowed |
+| `MOUSE_PRESS_RECOVERED` | releases this driver synthesised for a stuck level |
+
+**The detector is `KBD_RESTATED_COUNT`'s argument applied to the pointer, and it is conclusive.**
+A HID pointer under SET_IDLE 0 reports only on a change, so a report identical to its predecessor
+cannot come from the device: one proves at least one intermediate report never reached the decoder.
+`mouse_prev_rep`/`mouse_prev_len` hold the predecessor's bytes over the residual-derived
+`report_len` clamped to 6 — the whole boot report in either shape (rel: buttons, dx, dy, wheel; abs:
+buttons, x, y) — so the comparison never reads the 512-byte DMA window's stale tail.
+
+**The repair is ungated (driver correctness, every board) and is the stuck-down half only:**
+synthesise the release the device can never resend — push `Button(0)` and drop the level — so the
+consumer's held-state tracker lifts and the report's still-down mask reads as a fresh press edge
+instead of no edge at all. The same synthesis rides both error re-arms (the non-halting error arm
+and `service_hid_halts`' CLEAR_FEATURE(HALT) recovery), where a TD is abandoned outright. **The
+swallowed-pair half is counted and NOT synthesised:** inventing a click nobody made is a worse
+failure than reporting a lost one.
+
+### 37.4 The fixture, and what QEMU can and cannot prove
+
+`:: PTRPRESS: reports= press_lost= release_orphan= recovered= armgap_us= restated= edges= held=
+holed= rearm= discard= dup= nobuf= errrearm= -> PASS|FAIL ::`, printed once behind `witness` from
+the service pass `xhcihub_score` hangs on, `PTRPRESS_SETTLE_MS` (6000) after the first button edge —
+a deadline and not a condition, so a leg whose pointer is clicked always prints. It rides
+`UNAOS_XHCIHUB=1`; there is no new knob. `arroyo`'s XHCIHUB typist gained the burst:
+`--pointer-burst 12` press/release pairs 20 ms apart into the dark window, then 2 s of quiet, then
+`--pointer-tail 2` paced pairs — the tail is what makes a stuck level visible, because with the
+release lost the tail's press arrives as a report byte-identical to its predecessor.
+
+**QEMU CANNOT PRODUCE THE DEFECT, and the fixture says so out loud.** Measured (`ptrpress-logs/02`):
+the emulated tablet buffers what the dark window would lose and, when its queue overflows, coalesces
+whole press+release PAIRS away — `edges` drops from 30 to 20, `held` stays consistent, `restated`
+stays 0. A real boot pointer buffers nothing and re-states nothing. So the fixture INJECTS the
+fault the way XHCIKBD injects its stall: a one-shot `PTRPRESS_STALL_MS` (900 ms) hold inside the
+completion branch on the first press edge, and then ONE swallowed report — the first release edge
+after that stall — dropped before the decode, which is byte-for-byte what a report lost in the
+unarmed window looks like downstream. `holed=1` is the control that says the injection fired and a
+PASS requires it; `witness` is OFF for every boot and media verb (`unaos/arroyo:44`), so nothing
+that reaches a card carries it.
+
+PASS iff `holed == 1 && press_lost >= 1 && press_lost == recovered && release_orphan == 0 &&
+held == 0 && edges > 0`.
+
+**Measured, both polarities, same tree, same command:**
+
+| run | line |
+| --- | --- |
+| repair in (`ptrpress-logs/03`) | `reports=17 press_lost=1 release_orphan=0 recovered=1 armgap_us=3647999 restated=1 edges=13 held=0x00 holed=1 … -> PASS ::` |
+| GO-RED, synthesis reverted (`ptrpress-logs/05`) | `reports=28 press_lost=1 release_orphan=0 recovered=0 armgap_us=3226402 restated=1 edges=18 held=0x00 holed=1 … -> FAIL ::` |
+
+`-> FAIL` is in arroyo's FAULT_PATTERNS, so the leg's exit status carries the verdict.
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10), the EHCI-1/2 scout + shared wake (§9/§9a), and the ISRARM completion interrupt (§33).

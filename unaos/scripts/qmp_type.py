@@ -195,6 +195,19 @@ def main():
     ap.add_argument("--pointer-clicks", type=int, default=1, help="button press+release pairs after the moves")
     ap.add_argument("--pointer-button", default="left", help="InputButton name for --pointer-clicks")
     ap.add_argument("--pointer-rel-step", type=int, default=24, help="--pointer-kind rel: pixels per axis per move")
+    # PTRPRESS (S30) — the BUTTON BURST, and it is a different instrument from --pointer-clicks.
+    # A click at --pointer-gap is paced so nothing is lost, which is what the XHCIHUB evts clause
+    # wants. This burst is paced to be lost: the kernel holds its one-shot stall on the first press
+    # edge, the pointer endpoint is dark for the whole of it, and these pairs land inside that
+    # window where the device queue is the only thing holding them. The TAIL pairs are injected
+    # after the queue has drained, slowly, and are what make a stuck level observable — a level
+    # left DOWN turns the tail press into a report byte-identical to its predecessor, which is the
+    # only evidence a level-diffed decoder can have that an edge went missing.
+    ap.add_argument("--pointer-burst", type=int, default=0, help="PTRPRESS: press+release pairs injected into the stall window (0 = off)")
+    ap.add_argument("--pointer-burst-gap", type=float, default=0.02, help="seconds between the burst's individual button events")
+    ap.add_argument("--pointer-settle", type=float, default=2.0, help="seconds of quiet after the burst, before the tail pairs")
+    ap.add_argument("--pointer-tail", type=int, default=0, help="PTRPRESS: paced press+release pairs after the quiet")
+    ap.add_argument("--pointer-tail-gap", type=float, default=0.2, help="seconds between the tail pairs' individual button events")
     a = ap.parse_args()
 
     qmp = Qmp(connect(a.host, a.port, a.connect_timeout))
@@ -289,6 +302,30 @@ def main():
                 time.sleep(a.pointer_gap)
             clicks += 1
         print(f"[qmp] pointer: {moves} {a.pointer_kind} moves + {clicks} {a.pointer_button} click(s), {a.pointer_gap * 1000:.0f} ms apart", file=sys.stderr)
+        # PTRPRESS — the burst, then the quiet, then the tail. One `input-send-event` per edge:
+        # QEMU coalesces every event inside ONE call into a single HID report, so a press and a
+        # release sent together would be a click the device never emits.
+        burst = 0
+        for _ in range(a.pointer_burst):
+            for down in (True, False):
+                r = qmp.execute("input-send-event", {"events": [btn_event(a.pointer_button, down)]})
+                if "error" in r:
+                    raise SystemExit(f"[qmp] pointer burst {a.pointer_button!r} down={down} failed: {r['error']}")
+                time.sleep(a.pointer_burst_gap)
+            burst += 1
+        if burst:
+            print(f"[qmp] pointer burst: {burst} {a.pointer_button} press/release pairs, {a.pointer_burst_gap * 1000:.0f} ms apart", file=sys.stderr)
+        if a.pointer_tail > 0:
+            time.sleep(a.pointer_settle)
+            tail = 0
+            for _ in range(a.pointer_tail):
+                for down in (True, False):
+                    r = qmp.execute("input-send-event", {"events": [btn_event(a.pointer_button, down)]})
+                    if "error" in r:
+                        raise SystemExit(f"[qmp] pointer tail {a.pointer_button!r} down={down} failed: {r['error']}")
+                    time.sleep(a.pointer_tail_gap)
+                tail += 1
+            print(f"[qmp] pointer tail: {tail} pairs after {a.pointer_settle:.1f}s quiet, {a.pointer_tail_gap * 1000:.0f} ms apart", file=sys.stderr)
 
     time.sleep(a.postwait)
 

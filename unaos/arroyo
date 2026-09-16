@@ -3711,6 +3711,19 @@ test_x86_64() {
     # in step.
     # The typist's own transcript lands BESIDE the capture, never in it (target/xhcihub-typist.log).
     local XHCIHUB_MOVES=12
+    # PTRPRESS (S30) — the BUTTON BURST rides this same typist, and it is not the click above.
+    # `--pointer-clicks 1` is paced so nothing is lost (XHCIHUB's `evts` clause wants a report, not a
+    # hole). These pairs are paced so something IS: the kernel holds a one-shot `PTRPRESS_STALL_MS`
+    # (900 ms) stall inside the pointer completion branch on the first press edge, the pointer's ONE
+    # Normal TRB is already retired and not yet re-armed, and 24 button events 20 ms apart (480 ms)
+    # land inside that dark window with only the QEMU device queue holding them. The TAIL pairs are
+    # injected after 2 s of quiet, 200 ms apart — paced so they cannot themselves be lost — and are
+    # what make a stuck level VISIBLE: with the release lost the level is still down, so the tail's
+    # press arrives as a report byte-identical to its predecessor, which is the only evidence a
+    # level-diffed decoder can have that an edge went missing (`MOUSE_RESTATED_COUNT`, xhci/mod.rs
+    # tail). ⚠ No new knob: the burst rides `UNAOS_XHCIHUB=1`, and `UNAOS_XHCIHUB_NOPTR=1` disarms
+    # this typist whole, burst included.
+    local PTRPRESS_PAIRS=12 PTRPRESS_TAIL=2
     # ⚠ REMOVE THE SIDECAR FIRST, and this line was paid for: the go-red run printed the PREVIOUS
     # run's transcript — "12 abs moves + 1 left click" — under a leg that injected nothing, because
     # the disarmed arm writes no file and `cat` happily read the stale one. A stale capture read as
@@ -3722,10 +3735,11 @@ test_x86_64() {
             --marker ':: MOUSE-1: HID pointer detected' --marker-log "$SERIAL_LOG" \
             --marker-timeout "$(( secs > 20 ? secs - 15 : secs ))" \
             --wait 1 --pointer "$XHCIHUB_MOVES" --pointer-kind abs --pointer-gap 0.05 \
-            --pointer-clicks 1 --postwait 0 \
+            --pointer-clicks 1 --pointer-burst "$PTRPRESS_PAIRS" --pointer-burst-gap 0.02 \
+            --pointer-settle 2.0 --pointer-tail "$PTRPRESS_TAIL" --pointer-tail-gap 0.2 --postwait 0 \
             2> "${WORKSPACE_DIR}/target/xhcihub-typist.log" &
         ptr_pid=$!
-        echo -e "${COLOR_YELLOW}⚡ XHCIHUB pointer typist armed: port ${qmp_port}, ${XHCIHUB_MOVES} abs moves + 1 left click, 50 ms apart, after ':: MOUSE-1: HID pointer detected'; transcript -> target/xhcihub-typist.log${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}⚡ XHCIHUB pointer typist armed: port ${qmp_port}, ${XHCIHUB_MOVES} abs moves + 1 left click, 50 ms apart, then PTRPRESS's ${PTRPRESS_PAIRS}-pair burst 20 ms apart and ${PTRPRESS_TAIL} tail pairs after 2 s quiet, after ':: MOUSE-1: HID pointer detected'; transcript -> target/xhcihub-typist.log${COLOR_RESET}"
     elif [ -n "${UNAOS_XHCIHUB:-}" ]; then
         echo -e "${COLOR_YELLOW}⚡ XHCIHUB pointer typist DISARMED (UNAOS_XHCIHUB_NOPTR=1) — the tablet will not move, evts=0, and the scorer below must red. This is the leg's go-red, not a pass.${COLOR_RESET}"
     fi
@@ -8767,7 +8781,16 @@ kernel8() {
     # certify a string that is not in the booted image. `llvm-objcopy -O binary` emits exactly the
     # ALLOCATABLE sections, which is exactly what the Pi executes, and `LC_ALL=C grep -a -o -F` reads a
     # flat binary as happily as an ELF. So the image is certified: same question, strictly stronger.
-    bash "${WORKSPACE_DIR}/scripts/banner-cert.sh" "$KERNEL8_DIR/kernel8.img" "$K8_FEATS" || exit $?
+    # PTRPRESS-K8ARCH (CERTCOND's owed one-liner): the THIRD argument is the arch, and this call is the
+    # one place in this file that needs it. `banner-cert.sh` reads the arch out of the artifact's own ELF
+    # header (e_machine at 0x12) precisely so no argument can lie about the bytes under test — but
+    # `kernel8.img` is FLAT (the objcopy above stripped the header), the reader has nothing to read, and with
+    # no argument the census prints `arch=unknown`, at which point every arch-qualified `cond` term is
+    # UNSATISFIED and its row stays UNVERIFIABLE instead of being checked. Nothing regresses today (the only
+    # arch-qualified term is on `witness`, whose cond hits `!baremetal` first on every Pi build), so this is
+    # the hole closed BEFORE a Pi row needs it rather than after. The other two call sites pass ELFs and are
+    # right to pass nothing.
+    bash "${WORKSPACE_DIR}/scripts/banner-cert.sh" "$KERNEL8_DIR/kernel8.img" "$K8_FEATS" aarch64 || exit $?
 
     # PIUSB-16: stock Pi GPU firmware blobs (start4.elf/fixup4.dat) + base DTB + the miniuart-bt overlay,
     # fetched from the OFFICIAL raspberrypi/firmware repo at the pinned FW_TAG (see the FW_* vars above)
