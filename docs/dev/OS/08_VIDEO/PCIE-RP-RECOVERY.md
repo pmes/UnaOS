@@ -814,21 +814,61 @@ Read `n=1` — that is the first stall, the sample this rung exists for. Read it
 | what the wire says | what it means for ledger A1 |
 | --- | --- |
 | `aperture=uc` present and **no `[wcser] PASS OVERDUE` in a full `storm`** | W4 CONVICTED: the WC posted-write drain is the wedge, and the fix is a memory-type or fencing change on the blit path rather than anything in PCIe. The knob-off baseline (`aperture=wc`, same boot length, same storm) is the control and must wedge, or the boot proves only that the storm was weak |
-| `aperture=uc` and the wedge happens anyway | W4 EXONERATED and the aperture's memory type leaves the ladder: the store is not being held by CPU write-combining. W5 (credits / the GPU window path) becomes the head of the ladder with nothing above it |
+| **⬅ FIRED (flight 9)** `aperture=uc` and the wedge happens anyway | W4 EXONERATED and the aperture's memory type leaves the ladder: the store is not being held by CPU write-combining. W5 (credits / the GPU window path) becomes the head of the ladder with nothing above it |
 | `lnkdis=1` at any crossing | STOP EVERYTHING. The link was disabled by software, and the only software that writes LNKCTL is this kernel — PCIH-NOCF8's stolen-store hazard would be realised, not theoretical |
 | `d_lnksta=c000` (or either bit alone) at `n=1` | the link renegotiated bandwidth **during this boot**, after `pci::init`. W2 re-opens as "bandwidth renegotiation under burst" — a claim never separately tested, and not the "link training error" W2 was shut out on |
-| `d_lnksta=0000` across every crossing | W2's shut-out is confirmed on an instrument that can finally tell the instant from the boot |
-| `relatch=secsta:2000` on the `sticky-cleared post-enum` line | **enumeration on this machine DOES latch Received Master Abort** — the premise §1.3 argued from, measured for the first time. The `secsta=2000` of boots 8/9/11 is then fully explained without the wedge, and W7's reading dies on evidence rather than on an argument about what bus walks generally do. It also makes the post-enum baseline load-bearing rather than tidy: `d_secsta` at `n=1` is now the only master-abort reading worth quoting |
+| **⬅ FIRED (both legs, 28/28 samples)** `d_lnksta=0000` across every crossing | W2's shut-out is confirmed on an instrument that can finally tell the instant from the boot |
+| **⬅ FIRED (both legs)** `relatch=secsta:2000` on the `sticky-cleared post-enum` line | **enumeration on this machine DOES latch Received Master Abort** — the premise §1.3 argued from, measured for the first time. The `secsta=2000` of boots 8/9/11 is then fully explained without the wedge, and W7's reading dies on evidence rather than on an argument about what bus walks generally do. It also makes the post-enum baseline load-bearing rather than tidy: `d_secsta` at `n=1` is now the only master-abort reading worth quoting |
 | `relatch=secsta:0000` | no bus walk below this bridge master-aborted at all this boot, so `secsta` was NOT being set by enumeration after the at-arm clear. A `d_secsta=2000` at `n=1` then has one named alternative left (a `wifi`-armed boot's own census, `wifi/bus.rs:125` — a knob no A1 flight row asks for, `grep -c UNAOS_WIFI docs/dev/OS/rmbp-queue.md docs/dev/OS/rmbp-ledger.md` = 0/0, and one the boot's own `⚡ kernel features:` banner settles) and otherwise points at the wedge |
 | `relatch=lnksta:c000` (or either bit alone) | the link renegotiated bandwidth DURING ENUMERATION — before any compositor paint. Whatever `d_lnksta` then reads at `n=1` is about the burst and not about boot-time link churn, which is the confound that made `d081` unreadable in the first place |
 | the `sticky-cleared post-enum` line is ABSENT on a boot whose `:: BAR1WEDGE:` line is present | the call site did not run. It is guarded on `PCIH_READY` and sits at the tail of `pci::init`, so its absence with the arm line present means `pci::init` did not reach its end — a boot that died in the GPU/SDHC/NIC tail, which is itself the finding |
 | `secsta=....->2000` (the after value nonzero) | a latch that did not clear. The write is a plain RW1C to a bridge status register, so a sticky `1` in the read-back is a hardware fact worth its own rung, and every later `d_secsta` on that boot is measured against a nonzero baseline (the line prints it, so nothing is silently wrong) |
 | `d_secsta=0000` at `n=1` | W7 DEAD: nothing master-aborted below the bridge after `pci::init`, so the `secsta=2000` of boots 8/9/11 was enumeration residue. §3.1's classifier table is then EMPTY and §3.2's sacrificial probe is the only remaining route to one |
-| `d_secsta=2000` at `n=1` | the latch moved after `pci::init`. Not yet proof it moved at the wedge — the EHCI bus walk is the named alternative — but the window is now minutes rather than the whole boot, and the next rung (a second clear once enumeration completes) closes it |
+| **⬅ FIRED (both legs) — but see the flown paragraph: the named alternative is LIVE** `d_secsta=2000` at `n=1` | the latch moved after `pci::init`. Not yet proof it moved at the wedge — the EHCI bus walk is the named alternative — but the window is now minutes rather than the whole boot, and the next rung (a second clear once enumeration completes) closes it |
 | `dis=1` in the `cto` line | W6 CONVICTED without a flight of its own: completion timeouts are disabled on this port, §3.2's prober is guaranteed to be lost rather than "probably" surviving, and §8.2's argument that an SBR frees the seized core loses its mechanism |
-| `dis=0` with a `value=` in class A or B | the prober survives within tens of milliseconds; §3.2's rung is cheap and §3.3's classifier is buildable |
+| **⬅ FIRED, with a caveat (both legs read `value=50us-50ms(default)`, the spec default, `devcap2=00000000 ranges=0`)** `dis=0` with a `value=` in class A or B | the prober survives within tens of milliseconds; §3.2's rung is cheap and §3.3's classifier is buildable |
 | `v2=0` / `cto rp UNREADABLE` | the root port's PCIe capability is version 1 or sits too high in config space. W6 stays unanswerable on this machine and the reason is on the wire instead of being inferred from a missing line |
 | the `:: BAR1WEDGE:` line is ABSENT on a boot whose banner claims `bar1wedge` | the build is the defect, not the hardware. Check the artifact with `LC_ALL=C grep -a -o -F ':: BAR1WEDGE:'` before reading anything else into the boot |
+
+**FLOWN 2026-09-16 — WHICH OUTCOME FIRED (flights 8 WC control and 9 UC experiment, one `storm`
+each; evidence [`docs/dev/evidence/rmbp-0916/flight8-9/FLIGHT8-9.md`](../../evidence/rmbp-0916/flight8-9/FLIGHT8-9.md) §5).**
+The UC leg wedged: `[wcser] PASS OVERDUE holder=c1 … blit_inflight=1` fired **12 times under UC and
+16 times under WC**, so the row that fired is **`aperture=uc` and the wedge happens anyway — W4 is
+EXONERATED**, the panel aperture's memory type leaves the ladder, and W5 (credits / the GPU window
+path) becomes the head with nothing above it. Three more rows fired with it and all three are about
+evidence rather than hardware: `d_lnksta=0000 d_devsta=0000 lnkdis=0` on **all 28 samples of both
+boots**, so W2's shut-out is confirmed on an instrument that can finally tell the instant from the
+boot; `relatch=secsta:2000` on both legs, so **enumeration on this machine DOES latch Received
+Master Abort** — the premise §1.3 argued from, measured for the first time, and W7's residue reading
+dies on evidence rather than on an argument about what bus walks generally do; and `d_secsta=2000`
+at `n=1` on both legs, which **does NOT reach the wedge**, because this flight found the alternative
+this section dismissed to be live: both images carried `UNAOS_WIFI=1 UNAOS_WIFI2=1`, and
+`wifi::bus::census()`'s full `for bus in 0u16..256` configuration sweep ran **253 ms AFTER the
+post-enum sticky clear** (clear at 23263 ms, `:: wifi: brcm net function 03:00.0 …` at 23516 ms),
+below the same bridge — see rmbp-ledger B113, and move the clear below the census before re-reading
+this field. No row fired for `lnkdis=1`, `d_lnksta=c000`, `relatch=secsta:0000`,
+`relatch=lnksta:c000`, `secsta=…->2000`, `d_secsta=0000`, `dis=1`, `v2=0`, or either ABSENT-line
+row: `capver=2 v2=1`, `cto … value=50us-50ms(default) dis=0` (the spec default with
+`devcap2=00000000 ranges=0`, so the port advertises no optional class and the prober is bounded at
+50 ms — §3.2's cheap case), and both `[pcih] rp-boot` and `[pcih] rp-at-wedge` present and unchanged
+in shape on both legs. **Both machines survived**: presents continued, no `PANIC`, no `REHOMED`, no
+`DEAD c<n>`; the UC leg's price is on the present path instead — `[schedx86] depth … inflight=59`,
+shell `longpres=20`, `maxpresent_us=69120` against WC's `0` and `11630` (rmbp-ledger A13).
+
+**⚠ THE ABSENCE CONTROLS BELOW WERE UNSCORABLE ON THIS FLIGHT, and the reason is a defect of our
+own (rmbp-ledger B112).** `:: x86 bar1exp: UC arm ARMED` printed **0 times on the UC leg** and
+`:: x86 fb-wc:` printed **0 times on the WC leg** — neither alternative at that site reached the
+cable, because the retype moved to `main.rs:112`, ahead of the FTDI mirror this laptop depends on,
+while the `BPACE: fb-wc` / `fb-wc-done` stamps inside the same one-shot latch prove the function ran
+on both boots. (`fb-wc` "present" is that BPACE stage stamp, which prints on flight 7 too and is not
+the framebuffer's memory type.) **The arm is nonetheless proven, on a line this section did not
+pre-register:** `:: x86 mmio-map: 0x90000000..0xa0000000 uc=113 (PAT PA3) wc-kept=15 ::` on the WC
+leg against `uc=128 (PAT PA3) wc-kept=0` on the UC leg — the only differing line in each boot's
+eight-line map set, and the code's own documented UC signature. **And the field a reader would reach
+for instead is a compile-time constant:** `pcihealth.rs::bw_aperture()` is
+`if cfg!(feature = "bar1exp-uc") { "uc" } else { "wc" }`, so `aperture=uc` on every line above names
+which BUILD flew and never what the page tables carry. Re-state these controls against the
+`mmio-map` pair before the next A1 flight.
 
 **Absence controls for this flight, pre-registered:** `fb-wc` must be ABSENT and
 `:: x86 bar1exp: UC arm ARMED` PRESENT on the UC leg (they are alternatives at the same site); the

@@ -8,10 +8,75 @@ QEMU behavior. Newest sitting first.
 > in [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) (R19; rmbp-ledger B10). This file stays the
 > per-sitting narrative; the register is the verdict table.**
 
-## PENDING METAL — KDHEAD (shut-out register §1, rung KD14): does any candidate per-head block actually separate the four heads, and does one of them decode to the surface the firmware handed us?
+## FLOWN — KDHEAD (shut-out register §1, rung KD14), flights 8 and 9, 2026-09-16: BOTH QUESTIONS ANSWERED, and KD3 re-opens
 
-**Nothing below is a metal fact yet.** It is the witness the next flight scores, written down before
-the flight so the scoring cannot drift into the reading. Build knob: add `UNAOS_KEPLER_KDHEAD=1` to
+**Capture:** `~/unaos-bench/capture/rmbp12-flight8/ttyUSB0.log`, both boots; scored in
+[`docs/dev/evidence/rmbp-0916/flight8-9/FLIGHT8-9.md`](../../evidence/rmbp-0916/flight8-9/FLIGHT8-9.md) §4.
+Flight line as pre-registered, with `UNAOS_BEAM=1` alongside `UNAOS_KEPLER_KDHEAD=1` and none of the
+SHUTRESTORE display write rungs. **Every line in this block is a metal fact.** The pre-registration
+below it is kept verbatim, unedited, because it is what makes the reading falsifiable.
+
+**THE BRACKET ARMED.** `:: BEAMX86: head=0 vtotal=1852 samples=22025 vblank_delta=2 -> ARMED ::`,
+and the rung borrowed that census rather than re-sampling, exactly as designed:
+
+```
+[  22822ms] :: KDHEAD: bracket source=beamx86-census live=[y,n,n,n] :: census_adv=[5109,0,0,0] census_vbd=[2,0,0,0] …
+[  22822ms] :: KDHEAD: gop w=2880 h=1800 vram_off=00020000 pitch=16384 …
+```
+
+One live head. Heads 1–3 are DARK and every decode on them reads `DARK-NOT-SCORED`, never a verdict.
+
+**THE STRIDE — five blocks, two separate, and the counter trap did not fire.**
+
+| block | `heads_distinct` | `stable` | `readable` | verdict |
+| --- | --- | --- | --- | --- |
+| `headstat` 0x616000 / 0x800 | **4/4** | 3/4 | 4/4 | `SEPARATES-heads`, then `decode=none reason=no-cited-slicing` — by design |
+| `armed100` 0x616100 / 0x800 | **1/4** | 3/3 | 4/4 | `COLLAPSED-stride-does-not-separate-heads-here` |
+| `evocore` 0x610460 / 0x300 | 1/4 | 3/3 | 4/4 | `COLLAPSED-stride-does-not-separate-heads-here` |
+| `headval` 0x610A00 / 0x540 | 1/4 | 3/3 | 4/4 | `COLLAPSED-stride-does-not-separate-heads-here` |
+| **`mirror` 0x640400 / 0x300** | **2/4** | **4/4** | 4/4 | **`SEPARATES-heads`** |
+
+No block scored `heads_distinct=0/4`, so `UNSCORABLE-all-words-volatile` never fired and every
+distinctness reading above is taken from words that survived both passes.
+
+**THE DECODE — one agreement, on the only live head:**
+
+```
+[  22864ms] :: KDHEAD: head=0 live=yes geom=2880x1800 surface=0x20000 pitch=16384 vs gop=2880x1800 0x20000 16384 -> AGREE :: block=mirror mismatch=none surface_present=y pitch_present=y …
+[  22867ms] :: KDHEAD: end rung=KD14 bracket=beamx86-census blocks=5 separated=2 decoded=1 agree=1 disagree=0 writes=0 …
+```
+
+**The three numbers this entry owed, answered in the order it asked for them:**
+
+1. **`mirror` reads `heads_distinct=2/4` with `stable=4/4`.** The core-channel method stride DOES
+   separate heads on this part. KD8's decode is not a head-0-only fact, and the per-head decode has
+   a block to stand on.
+2. **`armed100` reads `heads_distinct=1/4` with `stable=3/3`.** Sitting #4's inference — that its
+   stride collapsed — is now an OBSERVATION. The alternative this entry pre-registered ("s4 was
+   wrong about the stride and right about the field offsets") did not fire.
+3. **`-> AGREE`.** `mirror`'s slicing (geom `+0x68` lo16 × hi16 **[METAL s25]**, surface
+   `+0x60 << 8` **[METAL s16]**, pitch `+0x6C & 0xFFFF` **[METAL s25]**) reproduces the firmware's
+   own 2880×1800, `0x20000`, 16384 exactly. **That pins the slicing BY OBSERVATION and re-opens
+   KD3**, the same way KD4 re-opened it in s11 — and by the same mechanism, a control read the
+   original rung never had.
+
+**Byte-identical on flight 9** (`[  20147ms] … blocks=5 separated=2 decoded=1 agree=1 disagree=0`),
+which is a reproducibility fact rather than a second measurement: the two boots differ by one knob
+that does not touch display.
+
+**`writes=0` held.** Every device access in the rung is `mmio_read`; the end line says so and no
+display register moved.
+
+**⚠ Also measured, and it is a fact about a DIFFERENT rung:** `pitch=16384` on the `gop` line is the
+panel's real pitch, and the shut-out register's R8 row states it as 7 680 B. That is why R8 refused
+itself on this flight — rmbp-ledger B111.
+
+---
+
+### The pre-registration, kept verbatim (what was written down BEFORE the flight)
+
+**Nothing below was a metal fact when it was written.** It is the witness the flight scored, written
+down before the flight so the scoring could not drift into the reading. Build knob: add `UNAOS_KEPLER_KDHEAD=1` to
 the flight line, **and `UNAOS_BEAM=1` with it** — the two rungs share ONE per-head sample and without
 `beam` this rung has no control bracket and withholds its decode on purpose. The flight line is
 therefore `UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1 UNAOS_WC=1 UNAOS_BEAM=1 UNAOS_KEPLER_KDHEAD=1`.
@@ -163,6 +228,68 @@ because the probe lives inside `kepler_display::takeover_display`).
 **Control that must accompany the flight image** (the probe cannot run in QEMU — q35 has no Kepler,
 so a q35 log with zero `BEAMX86` lines proves nothing about the code being present):
 `LC_ALL=C grep -a -o -F 'BEAMX86' target/x86_64_esp/kernel.elf | wc -l` on the flight artifact.
+
+## FLOWN — KFBIND (shut-out register §2, rung KF27), flights 8 and 9, 2026-09-16: NEITHER BASE ANSWERS, and IB_GET has now been read
+
+**Capture:** `~/unaos-bench/capture/rmbp12-flight8/ttyUSB0.log`, both boots; scored in
+[`docs/dev/evidence/rmbp-0916/flight8-9/FLIGHT8-9.md`](../../evidence/rmbp-0916/flight8-9/FLIGHT8-9.md) §4.
+Flown alone, as §2 required: `UNAOS_KEPLER_KFBIND=1` on the standing
+`UNAOS_KEPLER=1 UNAOS_KEPLER_FIFO=1 UNAOS_KEPLER_CE=1` line, no KFCTXBIND, no FIFO write rungs.
+
+**THE PTOP TABLE ANSWERED, AND CE-R1 AGREES WITH IT DWORD FOR DWORD.**
+
+```
+[  23164ms] :: KFBIND: ptop pbdma=4 runlists=[01CD] pbdma0_base=023000 entries=64 nonzero=16 poison=0 refused_out_of_window=12 overflow=0 ctl_pre=0E7150A2 ctl_post=0E7150A2 ctl=held …
+[  23098ms] :: kepler: ce-ptop row i=00..07 [8006183E 00000003 90828C3E 00000007 94A30E3E 0000000B 9C03AA3E 0000000F] ::
+[  23163ms] :: KFBIND:  ptop-row i=00..07 [8006183E 00000003 90828C3E 00000007 94A30E3E 0000000B 9C03AA3E 0000000F] ::
+```
+
+The two independent readers of the PTOP table were compared row by row on both boots: **8 of 8 rows
+and 64 of 64 entries identical, on each boot.** CE-R1's existence precondition for the derivation
+half is met on metal.
+
+**NEITHER BASE ANSWERS — and the rung refused to pretend otherwise.** The four PTOP-derived bases
+(`023000`, `027000`, `02B000`, `02F000`) return `BADF1100 POISON` in every dword; the three legacy
+bases (`040000`, `042000`, `044000`) return clean `00000000 ZERO`. Every `pbdma[n]` line carries
+`answers=n` and the same clause: *"CHID/ACTIVE are DELIBERATELY NOT decoded here: at an unproven
+base a zero is a READ-ZERO, not a scheduler state, and printing 'CHID=0 ACTIVE=0' is the ten-sitting
+error this rung exists to stop"*. The `delta` lines show `same` for every base across the submit.
+
+**IB_GET HAS NOW BEEN READ, for the first time in the campaign, and it does not move.**
+
+```
+[  23172ms] :: KFBIND: userd pre-submit  off=02002000 ib_get=00000000 ZERO ib_put=00000000 ZERO x090=00000000 ZERO dma_put=00000000 ZERO dma_get=00000000 ZERO — … ib_get (0x88) is READ HERE FOR THE FIRST TIME, the deleted witness read 0x8C/0x90 which is IB_PUT and an unnamed word ::
+[  23176ms] :: KFBIND: userd post-submit off=02002000 ib_get=00000000 ZERO ib_put=00000000 ZERO x090=00000000 ZERO dma_put=00000000 ZERO dma_get=00000000 ZERO — … ::
+```
+
+**THE VERDICT, verbatim and unelided, because the `under:` clause IS the result:**
+
+```
+[  23177ms] :: KFBIND: verdict base=NEITHER-ANSWERS — every dword at every base, derived and legacy, is ZERO or POISON with a HELD bracket. That is a statement about the whole PBDMA PRI space on this part and it is the strongest reading this rung can produce without a start/clock sequence it may not guess ib_get 00000000->00000000 ZERO ib_put 00000000->00000000 derived_n=4 ctl_pre=0E7150A2 ctl_post=0E7150A2 ctl=held writes=0 restored=n/a -> STILL-DARK under: PTOP-derived base comparison as scored above, FECS context microcode NOT resident (this boot runs no ctx ucode before the submit), CHAN_CUR/CHAN_NEXT NOT host-populated by this rung, PBDMA start/clock sequence NOT written (uncited, skipped above), runlist submitted via 0x2270/0x2274 and its playlist echo scored by kepler::init's own post-bind line. NOT 'ruled out' (R19): this names the conditions IB_GET did not move under, and IB_GET itself was read here for the first time in the campaign ::
+[  23177ms] :: KFBIND: end rung=KF27 ptop=derived base_cmp=neither fetch=still-dark — one rollup line so a silent rung is distinguishable from a quiet pass ::
+```
+
+**TWO WRITES SKIPPED FOR CITATION, both named on the wire**:
+`skipped write=pbdma_chan_bind reason=uncited` (the CHANNEL register's bind/enable encoding at
+`+0x120` is named by no source in this tree) and `skipped write=pbdma_start_clock reason=uncited`.
+A third, `skipped write=runlist_submit reason=not-skipped-for-citation`, is the correct refusal to
+double-submit what `kepler::init` performs between this rung's two halves. `writes=0` held.
+
+**WHAT THIS SETTLES, AND WHAT IT DOES NOT.** It settles that the base the ladder has used since
+sitting #3 is not better than the PTOP-derived one and that neither reads as a scheduler: the whole
+PBDMA PRI space on this part is ZERO or POISON with the bracket held. It does NOT eliminate
+anything about the GK107 — read the `under:` clause: no FECS ctx ucode ran on this boot, so a
+still-dark IB_GET is a statement about the instrument's preconditions, not about the silicon (R19).
+**Byte-identical on flight 9.**
+
+**CONSEQUENCE FOR KF28.** KFCTXBIND's in-code R19 gate requires KF27 to resolve `DERIVED-WINS` or
+`BOTH-ANSWER` on the same boot. It resolved `NEITHER-ANSWERS`, so KF28 would print
+`skipped reason=kf27-base-unresolved` and it stays unflown — the sequencing held without anyone
+enforcing it by hand.
+
+---
+
+### The pre-registration, kept verbatim (what was written down BEFORE the flight)
 
 ## PENDING METAL — KFBIND (shut-out register §2, rung KF27): is the PBDMA base we have used since sitting #3 the right one, and has anyone ever read IB_GET?
 
