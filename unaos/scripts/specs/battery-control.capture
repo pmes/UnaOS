@@ -1,0 +1,76 @@
+# battery-control.capture — the CONTROL capture for `./arroyo battery`'s own judge.
+#
+# WHAT THIS IS. A short synthetic serial capture that a clean tree would produce: it carries one
+# line for every PASS pattern the battery's judged steps assert, and it carries NONE of the four
+# shapes that red a step (a fault line, a missing pattern, a truncation verdict, a nonzero rc).
+# It is not a boot log and it is never compared against a kernel — it is the known answer that the
+# JUDGE is measured against.
+#
+# WHO READS IT. `battery_control_probe()` in `unaos/arroyo`, once, at the top of `battery()`,
+# before any step runs. It feeds this file to `_step` twice:
+#   (A) as-is                     — the judge MUST say ✅. A judge that cannot say ✅ scores an hour
+#                                   of QEMU and reports red no matter what the kernel did, which is
+#                                   exactly what happened to `x86 test-fat sf 300` from BANNERCERT
+#                                   to BATTFAT: nothing in `battery()` had ever asked whether a
+#                                   step's judge COULD go green.
+#   (B) with one fault line added — the judge MUST say ❌ and MUST name `fault line`. A judge that
+#                                   cannot say ❌ is an absent gate (LAWS §5).
+# If either control comes back wrong the battery prints `CONTROL FAILED` and exits without a
+# verdict, having run no step.
+#
+# THE RULE FOR A NEW JUDGED STEP. The probe reads the battery's `_step` call sites out of `arroyo`
+# itself and requires that EVERY non-empty pattern among them match a line in this file. Add a
+# judged step and you add its witness line here, in the section its step belongs to, or the battery
+# refuses to run and names your step and your pattern. That is deliberate: a step whose pattern has
+# no control line can never be shown to be capable of passing, and a step that cannot pass is the
+# defect this fixture exists to make impossible to introduce a second time. Nothing here is
+# board-specific and nothing here is a spec directive — `scripts/mbench.py` does not read this file.
+#
+# PROVENANCE. Every line below is a real spelling lifted from a green capture on this bench
+# (the `x86 test-fat sf 300` fold-gate capture of 2026-09-15 and the arm/pi legs beside it), with
+# addresses and counters left as they were measured. Keep it short; keep it honest; do not let it
+# grow into a second copy of a boot log.
+
+═════════════════════════ CONTROL CAPTURE (synthetic, clean) ═════════════════════════
+
+⚡ kernel features: witness wc
+
+# ── x86 MISSION leg (`x86 test 25`) ───────────────────────────────────────────────────
+xHCI: >>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<
+
+# ── aarch64 virt MISSION leg (`arm virt v2`) ──────────────────────────────────────────
+xHCI: >>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<
+
+# ── usb-write witnesses, x86 and arm (assertions ON the two MISSION captures) ─────────
+:: PIUSB: [usbw] write lba=131071 ok — RMW+readback+restore, medium byte-identical ::
+:: XHCI: [usbw] write lba=2048 ok — RMW+readback+restore, medium byte-identical ::
+
+# ── x86 test-fat leg (`x86 test-fat sf 300`) ──────────────────────────────────────────
+:: U11m2: cross-process unlink-defers-free — open-across-rows + read-after-unlink OK, delete op HELD past unlink, released at last CLOSE and at TEARDOWN, re-create -EBUSY while pending -> PASS ::
+
+# ── the three shipped EL0 apps loaded off the attached FAT volume ─────────────────────
+:: WINX-2: STAT.ELF end-to-end — loaded (entry 0x10000000000) + windowed + 3 presents, killed + row reaped by the kill (free 9->10/10, exited 0->0), teardown clean -> PASS ::
+:: WINX-8: VUG.ELF end-to-end — loaded (entry 0x100000000b0) + windowed + 3 presents with 2 ring-3 thread(s), killed + row reaped by the kill (free 9->10/10, exited 0->0), teardown clean -> PASS ::
+:: PULSE-W: PULSE.ELF end-to-end — loaded (entry 0x10000000000) + windowed + 3 presents of per-core pulse bars sampled through SYS_CPUPULSE(49) -> PASS ::
+
+# ── aarch64 virt v3 capstone leg (`arm virt v3`) ──────────────────────────────────────
+:: CAPSTONE COMPLETE — all 6 sync primitives verified in one boot ::
+
+# ── banner-cert's own table, QUOTED here on purpose (BATTFAT) ─────────────────────────
+# `scripts/banner-cert.sh` prints one `feature=`/`control=` row per registered witness, and a
+# witness TOKEN is verbatim kernel text — two of the control probes carry a verdict spelling INSIDE
+# the token. banner-cert runs inside `esp_x86`, whose stdout is the battery's capture, so these rows
+# appear in every esp-x86-backed leg's log and they matched the fault scan from BANNERCERT until
+# BATTFAT taught the scan to skip a line where the HARNESS is quoting rather than the kernel
+# printing. They are in this fixture so that probe (A) exercises that exclusion: delete the
+# exclusion from `_step` and probe (A) reds, which is this fixture's go-red.
+feature=witness witness=:: U1a: no application processors online — ring-3 demo SKIPPED :: hits=1 -> OK
+feature=kbdwit witness=SILENCE-ENDED-HALTED hits=1 -> OK
+control=instgui witness=[wc-x] instgui install-go with NO committed target hits=0 -> OK
+control=selfhost witness=:: SELFHOST: src payload holds no regular files -> FAIL :: hits=0 -> OK
+control=holocron witness=:: [hcron] framing fixture leg=roundtrip -> FAIL hits=0 -> OK
+control=videobench witness=:: vperf: fbmem no framebuffer registered :: hits=0 -> OK
+control=irqstorage witness=irqstorage::submit called off a scheduled task hits=0 -> OK
+⚡ banner-cert: ok=2 missing/leak=0 registered-divergences=0 unverifiable=0 nowitness=0 noverdict=0  (table: 7 measured, 0 unmeasured-here)
+
+═════════════════════════ END OF CONTROL CAPTURE ═════════════════════════
