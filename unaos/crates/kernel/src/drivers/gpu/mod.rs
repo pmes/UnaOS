@@ -41,7 +41,19 @@ pub mod kepler_ce;
 /// `decl=target_arch = "x86_64" ... all-under=nvidia-kepler + nvidia-kepler-fifo -> FINDING`.
 /// The declaration now STATES what was already true of it. Default OFF either way: the new
 /// feature is brand-new, so no existing build moves.
-#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-fifo", any(feature = "nvidia-kepler-kfbind", feature = "nvidia-kepler-kfctxbind")))]
+///
+/// ⚠ THE `any(...)` NOW NAMES THREE RUNGS. KFUNWEDGE (§2 rung KF29,
+/// `nvidia-kepler-kfunwedge`) lives in this file as `mod unwedge`, beside `mod ctxbind`, and
+/// DELIBERATELY DOES NOT IMPLY EITHER OF THE OTHER TWO: it is a SACRIFICIAL rung that fires
+/// the `0x409504` poison on purpose, and a boot carrying KF27 or KF28 with it would collect
+/// their verdicts over a unit this rung had already wedged. Its dependency on KF27's base
+/// ladder is therefore a RUNTIME gate — it re-runs that ladder read-only — exactly as KF28's
+/// is, and never a Cargo one. Omitting the atom here would make `UNAOS_KEPLER_KFUNWEDGE=1`
+/// alone a build error, the same `E0433` the KFCTXBIND note above measured. Both parents stay
+/// spelled out for GATE-FC2's reason: all three features imply `nvidia-kepler` +
+/// `nvidia-kepler-fifo`, so this `all(...)` admits exactly the configurations the bare
+/// `any(...)` would. Default OFF: the feature is brand-new, so no existing build moves.
+#[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-fifo", any(feature = "nvidia-kepler-kfbind", feature = "nvidia-kepler-kfctxbind", feature = "nvidia-kepler-kfunwedge")))]
 pub mod kepler_fifo;
 
 #[cfg(feature = "intel-ivb")]

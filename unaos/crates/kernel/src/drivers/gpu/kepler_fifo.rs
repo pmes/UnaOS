@@ -1353,3 +1353,626 @@ pub fn kfctxbind_post(bar0: usize, bar1: usize, pre: &KfctxbindPre) {
     );
 }
 } // mod ctxbind
+
+// KFUNWEDGE lives in an INNER, separately-gated module for the reason `mod ctxbind` above does:
+// this file is declared in `gpu/mod.rs` under a gate that now names three features, so every item
+// below would otherwise compile into a KFBIND-only or KFCTXBIND-only build and shift its
+// `-Cmetadata` and its dead-code surface. Gated here, both of those builds stay byte-identical to
+// the ones that shipped before this rung landed — the property the seat measures on the fold.
+#[cfg(feature = "nvidia-kepler-kfunwedge")]
+pub mod unwedge {
+use super::*;
+// ###########################################################################
+// KFUNWEDGE — the un-wedge experiment. Register §2 row `KF29 kfunwedge`; queue
+// row `rmbp-queue.md` §GPU LADDERS `KFUNWEDGE`. Knob
+// `UNAOS_KEPLER_KFUNWEDGE=1` (feature `nvidia-kepler-kfunwedge`, implies
+// `nvidia-kepler` + `nvidia-kepler-fifo`).
+// ###########################################################################
+//
+// # ⚠⚠ THIS IS A SACRIFICIAL BOOT. READ THIS PARAGRAPH BEFORE ARMING IT.
+//
+// The rung DELIBERATELY performs the one access this campaign has spent three
+// sittings learning not to perform: a HOST READ of `0x409504` (`WRCMD_CMD`).
+// `falcon_microcode_spec.md` §5.4 — the poison law — says what that does:
+// *the first access faults immediately and wedges every subsequent read in the
+// FECS unit for the rest of the boot.* s31 discovered it, s32 proved it with
+// its own control frame (`recon-pre cpuctl=00000000` real, `recon-post
+// cpuctl=BADF1000`, the SAME register microseconds apart), s34 convicted the
+// offset by elimination.
+//
+// Consequences the operator must accept BEFORE arming the knob:
+//
+// * **This boot's display may not survive.** On the rMBP the Kepler IS the
+//   panel: the x86 compositor's ignition is the Kepler takeover. A wedged PRI
+//   ring on the GPU driving the screen may take the panel with it, and the
+//   recovery is a POWER CYCLE, not a reboot. Fly it with the serial capture as
+//   the deliverable and expect nothing from the glass.
+// * **A poison is NOT RESTORABLE.** Every other rung in this file reports
+//   `writes=0 restored=n/a` because it wrote nothing. This one writes — a W1C
+//   of latched fault bits — and still reports the poison itself as
+//   `restored=IMPOSSIBLE`, because there is no write that un-reads a read. The
+//   honest bound is the power cycle, and saying "restored" of anything here
+//   would be a success echo that cannot fail.
+// * **FLY IT LAST, ALONE.** Never on the same boot as BEAMX86, KDHEAD, KF27
+//   (`UNAOS_KEPLER_KFBIND`) or KF28 (`UNAOS_KEPLER_KFCTXBIND`). Every verdict
+//   collected after this rung is void by §5.4, and every rung listed carries
+//   its own conditions string that would be printed over a boot this rung had
+//   already poisoned. The call site enforces the ORDERING (it is the last
+//   kepler statement before the terminal poke); it cannot enforce the operator's
+//   knob set, so the knob set is the operator's discipline and it is written on
+//   the queue row, the register row and the metal log entry as well as here.
+// * **The terminal poke's own datum is VOID on a KFUNWEDGE boot.** §10 of the
+//   spec says the terminal `fecs_write(0x409504, 0)` is evidenced by being the
+//   FIRST and LAST access to that offset in the boot. This rung reads it first.
+//   The `fecs-ledger` line prints `504_read_idx=` and `504_write_idx=` so the
+//   capture states the ordering rather than leaving a reader to assume it.
+//
+// # What has never been done, and why this rung is it
+//
+// §2's KF21 row is explicit, and it has stood unexercised for ten sittings:
+//
+// > **the poison register is writable without consequence to the boot.**
+// > Reading it first is what poisons; writing it last is harmless. The un-wedge
+// > experiment ("does a PRING clear recover the unit?") remains **UNEXERCISED**
+// > — nothing has ever wedged on a boot that went looking.
+//
+// The instrument for it was designed and LANDED once, at pull 30 (`0e26447e`):
+// a safest-first chain over the five unknown CTXCTL offsets that would, on the
+// first `BADF`, read the PRING fault registers, W1C them, and re-read `cpuctl`.
+// It flew at s34 and **all five offsets read clean**, so the un-wedge half
+// never executed and the code was later removed. s33boot1 recorded the same
+// miss in one sentence: *"nothing wedged this boot, so 'PRING clear recovers
+// the unit' was not exercised; it needs a boot where the poison deliberately
+// fires."*
+//
+// So the missing ingredient was never the clear. It was a wedge that fires ON
+// PURPOSE, at a point in the boot where losing the unit costs nothing. That is
+// this rung, and it is the entire content of it.
+//
+// # The three questions one boot of this answers
+//
+// 1. **Does the fault reach the PRI ring's own reporting registers?** s33 read
+//    `PBUS_INTR=0x0000000C` — bits 2 and 3 latched — with all three PIBUS fault
+//    registers zero, on a boot where NOTHING of ours faulted. That reading has
+//    never been taken across a fault we caused. If PBUS_INTR moves here, the
+//    `0x0C` at s33 is explained and the register is promoted from "latched
+//    something, meaning TBD" to an instrument.
+// 2. **Is the poison the FECS unit's, or the endpoint's?** s31 says PFIFO
+//    (`0x2xxx`) is unaffected, but that was inferred from a witness line, not
+//    from a control read taken in the same breath as a poisoned `cpuctl`. This
+//    rung reads `NV_PMC_BOOT_0` immediately after the poison. A real chip ID
+//    beside a `BADF1000` `cpuctl` bounds the damage to the unit; a poisoned
+//    chip ID says the whole BAR0 path is down and the boot's remaining lines
+//    are worthless.
+// 3. **Does a W1C of the latched fault bits recover the unit?** The answer is
+//    the rung's verdict and it has three arms, none of them a guess: see
+//    [`kfunwedge`]'s tail.
+//
+// # Parachute discipline
+//
+// * **Exactly ONE read of `0x409504`, and it goes through `kepler::fecs_read`**
+//   so the campaign's own access ledger (`FECS_ACCESS_COUNT`,
+//   `FECS_504_READ_TOUCHED`, `FECS_504_READ_INDEX`) counts it. A `const _`
+//   below pins the offset, and the baseline census provably cannot contain it.
+// * **The only writes are W1C write-backs of bits this boot READ AS SET**, in
+//   the two registers pull 30 named. Writing back the exact value just read is
+//   the least-assumptive write available: in a W1C register it clears precisely
+//   the latched bits and nothing else, and in a plain RW register it is a
+//   no-op by construction. A register reading ZERO is not written at all —
+//   there is nothing latched to clear and a zero write would assert a meaning
+//   for a field this bench has not observed.
+// * **Bracketed** by `NV_PMC_BOOT_0` like every other rung here, and the
+//   bracket GATES the verdict. Note the bracket is doing real work in this rung
+//   rather than riding along: it is also question 2's control.
+// * **`ZERO` / `POISON` printed, never interpreted** — `classify_fecs_word` is
+//   the single vocabulary, shared with KF27, KF28 and `kepler_ce.rs`.
+// * **R19 gate on KF27**, same as KF28: the rung does not run at an unresolved
+//   PBDMA base. See [`kf27_base_class`].
+
+// ===========================================================================
+// Register numbers — citation class AT THE DEFINITION
+// ===========================================================================
+//
+// Same `falcon_microcode_spec.md` §0.1 vocabulary the two rungs above use:
+//   (sitting id) observed on this bench · DERIVED follows from a proven rule ·
+//   EXT external doc for a register this bench HAS ALSO observed ·
+//   UNPINNED external or inferred with NO corroborating observation — probe
+//   only, never the sole basis for a write.
+//
+// ⚠ NO rnndb FILE WAS OPENED FOR THIS MODULE either. Every external spelling
+// below is quoted from a document IN THIS TREE that quotes envytools —
+// `docs/dev/GEMINI/video/Kepler/PROPOSAL-kepler-fence-pull29.md` and
+// `PROPOSAL-kepler-fence-pull30.md` — and every one of the four fault
+// registers was READ ON THIS PART at s33boot1, which is what makes them EXT
+// (a name for a register this bench has also observed) and not UNPINNED.
+
+/// ⛔ `WRCMD_CMD`, the poison offset. **[METAL s31/s32/s34]** —
+/// `falcon_microcode_spec.md` §2 (`+0x504`, "⛔ FAULTS — poisons the unit") and
+/// §5.4. This is the ONE address this rung exists to touch, and the `const _`
+/// below pins it out of the baseline census so the census cannot fire it early.
+const FECS_WRCMD_CMD: usize = 0x0040_9504;
+
+/// FECS `CPUCTL`. **[METAL s26/s28/s31/s34]** — `falcon_microcode_spec.md` §2
+/// (`+0x100`, rest `0x00000010`). The s32 control frame's register: `recon-pre`
+/// and `recon-post` were both this address, and the pair is the in-boot proof
+/// of the poison law. It is the subject of this rung's before/after.
+const FECS_CPUCTL: usize = 0x0040_9100;
+
+/// FECS `MAILBOX0`. **[METAL s29]** — `falcon_microcode_spec.md` §2 (`+0x040`;
+/// `ucode-post off=040 val=F00DFACE SENTINEL`). A SECOND in-unit address, read
+/// beside `cpuctl` so "the unit is poisoned" is two readings and not one.
+const FECS_MAILBOX0: usize = 0x0040_9040;
+
+/// `PBUS_INTR`. **[METAL s33]** — read `0x0000000C` on this part at s33boot1
+/// (`:: kepler: recon PBUS_INTR=0000000C ::`, KEPLER-METAL-LOG) and W1C'd in
+/// the same boot, so both the register AND the write-back have been exercised
+/// here. The ADDRESS spelling is **[EXT]** (envytools `docs/hw/bus/pbus.rst`,
+/// "PBUS interrupts", as quoted by PROPOSAL-kepler-fence-pull29 §"PRING").
+const PBUS_INTR: usize = 0x0000_1100;
+
+/// `PBUS_INTR` bit 2 — `MMIO_RING_ERR`, "MMIO access from host failed due to
+/// some error in PRING [GF100-]". **[EXT]** — envytools `docs/hw/bus/pbus.rst`
+/// as quoted by PROPOSAL-kepler-fence-pull30 §"Decoding PBUS_INTR=0x0C" and
+/// repeated in pull 31. The bench has observed the bit SET (s33's `0x0C`); the
+/// NAME is the external part.
+const PBUS_INTR_MMIO_RING_ERR: u32 = 1 << 2;
+/// `PBUS_INTR` bit 3 — `MMIO_FAULT`, "MMIO access from host failed due to other
+/// reasons [NV41-]". **[EXT]**, same source and same standing as bit 2.
+const PBUS_INTR_MMIO_FAULT: u32 = 1 << 3;
+
+/// The PIBUS (PRI ring) fault-reporting trio. **[METAL s33]** for existence —
+/// all three read real `00000000` on this part at s33boot1
+/// (`:: kepler: recon PIBUS_INTR_ADDR=00000000 :: VALUE=00000000 INTR=00000000`)
+/// — and **[EXT]** for the names and addresses (envytools `docs/hw/mmio.rst`
+/// plus `rnndb/bus/pibus.xml`, as quoted by PROPOSAL-kepler-fence-pull29:
+/// "`INTR_ADDR` (`0x120120`), `INTR_VALUE` (`0x120124`), and `INTR`
+/// (`0x120128`)"). `INTR_ADDR`/`INTR_VALUE` are REPORTING registers — they say
+/// WHICH access faulted — and only `INTR` is treated as clearable below.
+const PIBUS_INTR_ADDR: usize = 0x0012_0120;
+const PIBUS_INTR_VALUE: usize = 0x0012_0124;
+const PIBUS_INTR: usize = 0x0012_0128;
+
+/// `PIBUS_MMIO_HUB_ENABLE1` (unicast). **[METAL s33]** — read `FFF9F4B0` on this
+/// part, bit 4 (`CTXCTL` enable) already SET, which is the reading that REFUTED
+/// the subunit-gating theory (`falcon_microcode_spec.md` §6 refutation 5).
+/// Carried here read-only and as CONTEXT only: if the poison flips it, that is
+/// a fact worth having; nothing in the verdict ladder reads it.
+const PIBUS_MMIO_HUB_ENABLE1: usize = 0x0012_2104;
+
+/// The baseline census, read BEFORE the deliberate poison. Absolute BAR0
+/// addresses, read-only, and **not one of them is in the FECS unit** — the
+/// `cpuctl`/`mailbox0` pair is read separately and named separately, because
+/// mixing an in-unit read into this list is how a census fires the fault it is
+/// supposed to precede.
+const PRING_CENSUS: [(usize, &str, &str); 5] = [
+    (PBUS_INTR, "pbus_intr", "METAL s33 (=0000000C, W1C'd) + EXT name"),
+    (PIBUS_INTR_ADDR, "pibus_intr_addr", "METAL s33 (=00000000) + EXT name"),
+    (PIBUS_INTR_VALUE, "pibus_intr_value", "METAL s33 (=00000000) + EXT name"),
+    (PIBUS_INTR, "pibus_intr", "METAL s33 (=00000000) + EXT name"),
+    (PIBUS_MMIO_HUB_ENABLE1, "pibus_hub_enable1", "METAL s33 (=FFF9F4B0, bit4 set)"),
+];
+
+/// Index of `pbus_intr` in [`PRING_CENSUS`], and of `pibus_intr`. Pinned by a
+/// `const _`: the clear step addresses these two slots by number.
+const PRING_PBUS_INTR: usize = 0;
+const PRING_PIBUS_INTR: usize = 3;
+
+/// The two registers the clear step may write, and NOTHING else may be added
+/// here without its own metal reading. Both are W1C by the same external
+/// source that names them, and both were read real on this part at s33.
+///
+/// `PIBUS_INTR_ADDR`/`PIBUS_INTR_VALUE` are deliberately ABSENT: they report
+/// the faulting address and data, they are not documented as latches, and a
+/// write-back to a reporting register asserts a semantics nothing here has.
+const PRING_CLEARABLE: [(usize, &str, &str); 2] = [
+    (
+        PBUS_INTR,
+        "pbus_intr",
+        "METAL s33 — the W1C was PERFORMED on this part in the pull-29 boot ('PBUS_INTR=0000000C ... bits 2+3 latched; W1C'd') and again in pull 30's landed chain (0e26447e). Not an EXT-only write",
+    ),
+    (
+        PIBUS_INTR,
+        "pibus_intr",
+        "METAL s33 for the register (read real 00000000) + EXT for W1C (envytools docs/hw/mmio.rst via PROPOSAL-pull29/30, whose landed chain carried exactly this conditional write-back). Written ONLY with bits read SET this boot, which is a no-op by construction if the register is not in fact W1C",
+    ),
+];
+
+/// The PRING registers this rung READS and will NEVER write, each with the
+/// reason — printed verbatim on the wire, the discipline KF27's [`SKIPPED_WRITES`]
+/// and KF28's [`CTXBIND_SKIPPED_WRITES`] set: an absent line reads as a rung that
+/// simply had nothing to write, and here that would hide a judgement.
+///
+/// Note what is NOT in this list: a `reason=uncited` row. The brief that ordered
+/// this rung provided for one — if the PRING clear register were **[UNPINNED]**,
+/// the clear would be a skipped write. It is not. Both registers in
+/// [`PRING_CLEARABLE`] were read real ON THIS PART at s33boot1 and `PBUS_INTR`'s
+/// W1C was PERFORMED there, so the clear rests on an observation of this silicon
+/// and not on an external document alone — which is the line §0.1 draws when it
+/// says EXT may name a register but may never be the sole basis for a write.
+const PRING_NEVER_WRITTEN: [(&str, &str); 2] = [
+    (
+        "pring_clear_pibus_intr_addr",
+        "not-a-latch — 0x120120 REPORTS the address of the faulting access (envytools rnndb/bus/pibus.xml via PROPOSAL-pull29, for a register read real 00000000 on this part at s33). Nothing names it write-1-to-clear, so a write-back here would assert a semantics this bench has not exercised",
+    ),
+    (
+        "pring_clear_pibus_intr_value",
+        "not-a-latch — 0x120124 REPORTS the data of the faulting access, same source and same standing as INTR_ADDR above",
+    ),
+];
+
+const _: () = {
+    // 1. THE POISON LAW, as an assertion rather than a promise: the BASELINE
+    //    census may never contain the poison offset, or the rung fires its own
+    //    experiment before it has taken the "before" reading and the whole boot
+    //    says nothing.
+    let mut i = 0;
+    while i < PRING_CENSUS.len() {
+        assert!(
+            PRING_CENSUS[i].0 != FECS_WRCMD_CMD,
+            "the KFUNWEDGE baseline census may never touch 0x409504 — it is the STIMULUS, not a census row"
+        );
+        // 2. And no census row is in the FECS unit at all. The unit is read by
+        //    `fecs_cpuctl_mailbox` alone, which is what keeps the access ledger
+        //    interpretable.
+        assert!(
+            PRING_CENSUS[i].0 < 0x0040_9000 || PRING_CENSUS[i].0 >= 0x0040_A000,
+            "a PRING census row must lie outside the FECS unit"
+        );
+        i += 1;
+    }
+    assert!(PRING_CENSUS[PRING_PBUS_INTR].0 == PBUS_INTR, "pbus_intr index pinned");
+    assert!(PRING_CENSUS[PRING_PIBUS_INTR].0 == PIBUS_INTR, "pibus_intr index pinned");
+    // 3. Nothing clearable is in the FECS unit or is the poison offset. A W1C
+    //    aimed into the unit would be an uncited write into the block §5.4 put
+    //    under a standing ban.
+    let mut j = 0;
+    while j < PRING_CLEARABLE.len() {
+        assert!(PRING_CLEARABLE[j].0 != FECS_WRCMD_CMD, "the clear may never write 0x409504");
+        assert!(
+            PRING_CLEARABLE[j].0 < 0x0040_0000,
+            "the clear may never write inside PGRAPH or either falcon"
+        );
+        j += 1;
+    }
+    // 4. The two in-unit reads are the two §2 rows this rung claims, and the
+    //    poison offset is neither of them.
+    assert!(FECS_CPUCTL == 0x0040_9000 + 0x100, "cpuctl is the FECS unit base + 0x100");
+    assert!(FECS_MAILBOX0 == 0x0040_9000 + 0x040, "mailbox0 is the FECS unit base + 0x040");
+    assert!(FECS_CPUCTL != FECS_WRCMD_CMD && FECS_MAILBOX0 != FECS_WRCMD_CMD);
+    // 5. KF27's probe window cannot reach the poison offset or the unit — the
+    //    same assertion `mod ctxbind` makes, restated so an edit to either
+    //    constant is caught here too.
+    assert!(!candidate_admissible(0x0040_9000), "the FECS unit must be outside KF27's probe window");
+};
+
+// ===========================================================================
+// The R19 gate — KF27's base ladder, evaluated read-only by this rung
+// ===========================================================================
+
+/// KF27's ladder, restated over KF27's OWN constants, exactly as `mod ctxbind`
+/// restates it and for the same two reasons.
+///
+/// 1. `KEPLER-METAL-LOG.md`'s KF28 entry forbids flying KF27 with another rung
+///    that acts in the same boot, and this rung's whole point is to act — so
+///    `nvidia-kepler-kfunwedge` does not imply `nvidia-kepler-kfbind` and
+///    `KfbindPre` may not exist at all on an armed boot.
+/// 2. R19: the rung may not be scored at an address KF26 has been misreading
+///    since s#6. That applies here even though this rung reads no PBDMA state,
+///    because the register row it writes sits in §2's PBDMA ladder and a rung
+///    that ran under an unresolved base would be filed beside ten verdicts that
+///    were.
+///
+/// Returns `(class-name, usable)`. The class strings are KF27's verdict arms'
+/// leading tokens verbatim, so `awk 'index($0,"DERIVED-WINS")'` finds all three
+/// rungs' captures in one vocabulary.
+fn kf27_base_class(bar0: usize) -> (&'static str, bool) {
+    let br = Bracket::open(bar0);
+
+    let mut derived = [0usize; MAX_DERIVED];
+    let mut derived_n = 0usize;
+    for i in 0..PTOP_ENTRIES {
+        let v = unsafe { mmio_read(bar0, PTOP_DEVICE_INFO + i * 4) };
+        match classify_fecs_word(v) {
+            "POISON" | "ZERO" => continue,
+            _ => {}
+        }
+        let cand = ptop_pri_candidate(v);
+        if !candidate_admissible(cand) {
+            continue;
+        }
+        if derived[..derived_n].contains(&cand) || derived_n == MAX_DERIVED {
+            continue;
+        }
+        derived[derived_n] = cand;
+        derived_n += 1;
+    }
+
+    let mut derived_answers = false;
+    for &b in derived[..derived_n].iter() {
+        if PbdmaSample::read(bar0, b).answers() {
+            derived_answers = true;
+        }
+    }
+    let mut legacy_answers = false;
+    for i in 0..PBDMA_LEGACY_N {
+        if PbdmaSample::read(bar0, PBDMA_LEGACY_BASE + i * PBDMA_LEGACY_STRIDE).answers() {
+            legacy_answers = true;
+        }
+    }
+
+    let (pre, post, held) = br.close(bar0);
+    let class = if !held {
+        "VOID-BRACKET"
+    } else if derived_n == 0 {
+        "LEGACY-ONLY"
+    } else if derived_answers && !legacy_answers {
+        "DERIVED-WINS"
+    } else if legacy_answers && !derived_answers {
+        "LEGACY-WINS"
+    } else if derived_answers && legacy_answers {
+        "BOTH-ANSWER"
+    } else {
+        "NEITHER-ANSWERS"
+    };
+
+    serial_println!(
+        ":: KFUNWEDGE: base class={} derived_n={} legacy_answers={} ctl_pre={:08X} ctl_post={:08X} ctl={} — KF27's OWN ladder re-evaluated READ-ONLY on this boot over KF27's own PTOP address, extraction, window and probe offsets. NOT a KF27 flight: KF27's knob may be off and its lines absent, and the two rungs are FORBIDDEN to fly together ::",
+        class, derived_n,
+        if legacy_answers { "Y" } else { "n" },
+        pre, post,
+        if held { "held" } else { "MOVED — every dword above is uninterpretable" }
+    );
+
+    (class, class == "DERIVED-WINS" || class == "BOTH-ANSWER")
+}
+
+// ===========================================================================
+// Instrument helpers
+// ===========================================================================
+
+/// The five PRING words, read in one pass at a named phase.
+#[derive(Clone, Copy)]
+struct PringSample {
+    vals: [u32; PRING_CENSUS.len()],
+}
+
+impl PringSample {
+    fn read(bar0: usize) -> Self {
+        let mut vals = [0u32; PRING_CENSUS.len()];
+        for (slot, (addr, _, _)) in vals.iter_mut().zip(PRING_CENSUS.iter()) {
+            *slot = unsafe { mmio_read(bar0, *addr) };
+        }
+        Self { vals }
+    }
+
+    fn pbus_intr(&self) -> u32 {
+        self.vals[PRING_PBUS_INTR]
+    }
+
+    /// Print every word with its address, its class and its citation, and — for
+    /// `PBUS_INTR` alone — the two bits this tree has a name for, each tagged.
+    fn print(&self, phase: &str) {
+        for (v, (addr, name, cls)) in self.vals.iter().zip(PRING_CENSUS.iter()) {
+            serial_println!(
+                ":: KFUNWEDGE: pring {} {}={:08X} {} addr={:06X} cls=[{}] ::",
+                phase, name, v, classify_fecs_word(*v), addr, cls
+            );
+        }
+        let p = self.pbus_intr();
+        serial_println!(
+            ":: KFUNWEDGE: pring {} pbus_intr_bits raw={:08X} bit2_MMIO_RING_ERR={} [EXT envytools docs/hw/bus/pbus.rst via PROPOSAL-pull30] bit3_MMIO_FAULT={} [EXT same] other_bits={:08X} [UNTAGGED — this tree names no other PBUS_INTR bit, so a set bit here is PRINTED and NOT decoded] ::",
+            phase, p,
+            if p & PBUS_INTR_MMIO_RING_ERR != 0 { "SET" } else { "clr" },
+            if p & PBUS_INTR_MMIO_FAULT != 0 { "SET" } else { "clr" },
+            p & !(PBUS_INTR_MMIO_RING_ERR | PBUS_INTR_MMIO_FAULT)
+        );
+    }
+}
+
+/// The FECS unit's two proven rows, plus the out-of-unit control, in one
+/// reading. Returns `(cpuctl, mailbox0, pmc_boot_0)`.
+///
+/// `fecs_read`, never a bare `read_volatile`: it is the accessor that keeps the
+/// campaign's FECS access ledger (`FECS_ACCESS_COUNT`, `FECS_FIRST_OFFSET`, the
+/// `0x409504` touch flags) honest, and the `fecs-ledger` line at the end of the
+/// boot is one of this rung's deliverables.
+fn fecs_and_control(bar0: usize) -> (u32, u32, u32) {
+    let cpuctl = crate::drivers::gpu::kepler::fecs_read(bar0, FECS_CPUCTL);
+    let mailbox0 = crate::drivers::gpu::kepler::fecs_read(bar0, FECS_MAILBOX0);
+    let ctl = unsafe { mmio_read(bar0, regs::NV_PMC_BOOT_0) };
+    (cpuctl, mailbox0, ctl)
+}
+
+// ===========================================================================
+// The rung
+// ===========================================================================
+
+/// Runs from `kepler::init` as the LAST kepler statement before the terminal
+/// poke, and that placement is a CONTRACT in the strongest form this file has.
+///
+/// `falcon_microcode_spec.md` §5.4: *put unproven offsets last, after every
+/// proven read has completed.* This rung's stimulus is not merely unproven, it
+/// is the offset the law is NAMED for — so every FECS reading of the boot,
+/// every display leg, every FIFO verdict and both halves of KF27/KF28 are
+/// already complete and already printed when it fires. Nothing after it in the
+/// kepler leg reads the unit except the terminal poke, which is a write with no
+/// readback.
+///
+/// **Stimulus:** the KF27 base sweep's reads, 5 PRING reads ×3 phases, 3 FECS
+/// reads ×3 phases (`cpuctl`, `mailbox0`, and the out-of-unit control), ONE
+/// read of `0x409504`, and up to 2 W1C write-backs of bits observed SET.
+pub fn kfunwedge(bar0: usize) {
+    serial_println!(
+        ":: KFUNWEDGE: begin knob=UNAOS_KEPLER_KFUNWEDGE rung=KF29 subject=\"the un-wedge experiment KF21 opened and ten sittings never ran: fire the 0x409504 poison ON PURPOSE, then observe and clear the PRI ring and re-read cpuctl in the SAME boot\" restored=IMPOSSIBLE-a-poison-is-not-restorable sacrificial=YES — ⚠ THIS BOOT IS SACRIFICIAL. Fly it LAST in a sitting and ALONE: never with BEAMX86, KDHEAD, UNAOS_KEPLER_KFBIND (KF27) or UNAOS_KEPLER_KFCTXBIND (KF28). The Kepler drives the panel on this machine, so the operator may LOSE THE DISPLAY until a POWER CYCLE; the serial capture is the deliverable ::"
+    );
+
+    // ---- 0. The R19 gate ---------------------------------------------------
+    let (base_class, usable) = kf27_base_class(bar0);
+    if !usable {
+        serial_println!(
+            ":: KFUNWEDGE: skipped reason=kf27-base-unresolved class={} — R19: this rung files its verdict in register 2's PBDMA ladder, beside ten eliminations read at an address KF26 has never derived, and it will not add an eleventh row under an unresolved base. NOTHING WAS MEASURED and, more importantly, NOTHING WAS POISONED: 0x409504 was not read, the unit is intact, and this boot is NOT the sacrificial one ::",
+            base_class
+        );
+        serial_println!(
+            ":: KFUNWEDGE: end rung=KF29 skipped=kf27-base-unresolved base={} poisoned=not-attempted clear=not-attempted -> NOT-RUN — one rollup line even when the gate refused, so a silent rung is distinguishable from a quiet pass ::",
+            base_class
+        );
+        return;
+    }
+
+    let br = Bracket::open(bar0);
+
+    // ---- 1. The baseline, read-only, BEFORE anything is poked --------------
+    let pre_pring = PringSample::read(bar0);
+    pre_pring.print("pre");
+    let (pre_cpuctl, pre_mb0, pre_ctl) = fecs_and_control(bar0);
+
+    let (acc, first, r_touched, r_idx, w_touched, w_idx) =
+        crate::drivers::gpu::kepler::fecs_poison_ledger();
+    serial_println!(
+        ":: KFUNWEDGE: pre pring=0x{:08X} cpuctl=0x{:08X} {} mailbox0=0x{:08X} {} ctl=0x{:08X} {} sentinel_504_read={} idx={} sentinel_504_write={} idx={} fecs_accesses={} first_offset={:08X} — pring= is PBUS_INTR, the one PRING word this bench has ever seen carry a nonzero value (0x0000000C at s33). sentinel_504_read MUST read n here: if it reads Y something above this rung already fired the poison and every 'before' value on this line is an AFTER value ::",
+        pre_pring.pbus_intr(),
+        pre_cpuctl, classify_fecs_word(pre_cpuctl),
+        pre_mb0, classify_fecs_word(pre_mb0),
+        pre_ctl, classify_fecs_word(pre_ctl),
+        if r_touched { "Y" } else { "n" }, r_idx,
+        if w_touched { "Y" } else { "n" }, w_idx,
+        acc, first
+    );
+
+    // ---- 2. THE DELIBERATE POISON. Exactly one read, and this is it --------
+    //
+    // The rung it cites: §2 KF21 `terminal-poke 0x409504` — "the poison
+    // register is writable without consequence to the boot. Reading it first is
+    // what poisons; writing it last is harmless." s31 discovered the read-side
+    // law, s32 confirmed it with its own control frame, s34 convicted this
+    // offset by elimination once the other six CTXCTL offsets all read clean.
+    // KF20 is the row that carries the ⚠ silicon law itself.
+    serial_println!(
+        ":: KFUNWEDGE: poke-pre about-to-read=0x409504 rung-cited=KF21/KF20 law=falcon_microcode_spec.md-5.4 cls=[METAL s31/s32/s34] — printed BEFORE the access, the §10 discipline, so the capture proves the ordering even if the unit takes the serial path with it ::"
+    );
+    let poke = crate::drivers::gpu::kepler::fecs_read(bar0, FECS_WRCMD_CMD);
+    let poke_cls = classify_fecs_word(poke);
+    let poisoned = poke_cls == "POISON";
+    serial_println!(
+        ":: KFUNWEDGE: poke read=0x409504 value={:08X} {} poisoned={} family={:04X} — the BAD0/BADF family is the nonexistent-PRI-register signature (spec 5.4, s25); BADF1000 is what s31/s32/s34 read at this exact offset. poisoned=no would mean the read did NOT fault on this boot, which is a bigger finding than the un-wedge and is scored as NOT-POISONED below ::",
+        poke, poke_cls,
+        if poisoned { "yes" } else { "no" },
+        (poke >> 16) as u16
+    );
+
+    // ---- 3. OBSERVE. Did the fault reach the ring, and how far did it spread?
+    let obs_pring = PringSample::read(bar0);
+    obs_pring.print("post-poke");
+    let (obs_cpuctl, obs_mb0, obs_ctl) = fecs_and_control(bar0);
+    let unit_poisoned =
+        classify_fecs_word(obs_cpuctl) == "POISON" || classify_fecs_word(obs_mb0) == "POISON";
+    let control_poisoned = classify_fecs_word(obs_ctl) == "POISON";
+    serial_println!(
+        ":: KFUNWEDGE: observe pring=0x{:08X} pring_moved={} cpuctl=0x{:08X} {} mailbox0=0x{:08X} {} ctl=0x{:08X} {} unit_poisoned={} control_poisoned={} — cpuctl is the SAME register the pre line read, which is s32's control-frame shape exactly. ctl is NV_PMC_BOOT_0, OUTSIDE the FECS unit: a real chip ID beside a poisoned cpuctl BOUNDS the damage to the unit (s31 inferred that from PFIFO; this reads it), and a poisoned ctl says the whole BAR0 path is down and every line after this one is worthless ::",
+        obs_pring.pbus_intr(),
+        if obs_pring.pbus_intr() == pre_pring.pbus_intr() { "n" } else { "Y" },
+        obs_cpuctl, classify_fecs_word(obs_cpuctl),
+        obs_mb0, classify_fecs_word(obs_mb0),
+        obs_ctl, classify_fecs_word(obs_ctl),
+        if unit_poisoned { "Y" } else { "n" },
+        if control_poisoned { "Y" } else { "n" }
+    );
+
+    // ---- 4. CLEAR. W1C, and ONLY bits this boot read as SET -----------------
+    //
+    // The write discipline, stated once: writing back the exact value just READ
+    // is the least-assumptive write available. In a W1C register it clears
+    // precisely the latched bits and nothing else; in a plain RW register it is
+    // a no-op by construction. So the write asserts no field layout, no command
+    // encoding, and no bit meaning beyond "these bits were set a microsecond
+    // ago" — which is an observation of this boot, not a citation.
+    //
+    // A register reading ZERO is NOT written. There is nothing latched to clear,
+    // and a zero write into a register whose semantics this bench has not
+    // exercised would be exactly the uncited write pull 28's ban was about.
+    for (name, reason) in PRING_NEVER_WRITTEN.iter() {
+        serial_println!(":: KFUNWEDGE: skipped write={} reason={} ::", name, reason);
+    }
+
+    let mut cleared = 0usize;
+    let mut skipped = 0usize;
+    for (addr, name, cls) in PRING_CLEARABLE.iter() {
+        let latched = match *addr {
+            a if a == PBUS_INTR => obs_pring.vals[PRING_PBUS_INTR],
+            _ => obs_pring.vals[PRING_PIBUS_INTR],
+        };
+        if latched == 0 {
+            skipped += 1;
+            serial_println!(
+                ":: KFUNWEDGE: skipped write=pring_clear_{} reason=nothing-latched value={:08X} addr={:06X} cls=[{}] — the register answers and holds no set bit, so there is no W1C to perform. Writing 0 would assert a meaning for a field this bench has not exercised ::",
+                name, latched, addr, cls
+            );
+            continue;
+        }
+        if classify_fecs_word(latched) == "POISON" || classify_fecs_word(latched) == "ABSENT" {
+            skipped += 1;
+            serial_println!(
+                ":: KFUNWEDGE: skipped write=pring_clear_{} reason=readback-not-a-value value={:08X} {} addr={:06X} — a W1C of a POISON/ABSENT readback would write a fault signature back into the register ::",
+                name, latched, classify_fecs_word(latched), addr
+            );
+            continue;
+        }
+        serial_println!(
+            ":: KFUNWEDGE: clear write=pring_clear_{} addr={:06X} w1c={:08X} cls=[{}] — writing back EXACTLY the bits read as set one line above: a clear in a W1C register, a no-op by construction in a plain RW one ::",
+            name, addr, latched, cls
+        );
+        unsafe { crate::drivers::gpu::kepler::mmio_write(bar0, *addr, latched) };
+        cleared += 1;
+    }
+
+    // ---- 5. RE-READ, and the verdict ---------------------------------------
+    let post_pring = PringSample::read(bar0);
+    post_pring.print("post-clear");
+    let (post_cpuctl, post_mb0, post_ctl) = fecs_and_control(bar0);
+    let (ctl_pre, ctl_post, held) = br.close(bar0);
+
+    let unit_real_now = classify_fecs_word(post_cpuctl) != "POISON"
+        && classify_fecs_word(post_mb0) != "POISON";
+
+    let verdict = if !held {
+        "VOID-BRACKET — NV_PMC_BOOT_0 moved across the rung, so nothing above is interpretable and no statement is made about the poison, the ring or the clear"
+    } else if control_poisoned {
+        "VOID-CONTROL — the out-of-unit control (NV_PMC_BOOT_0) read POISON at the observe step. The BAR0 path itself is down, not the FECS unit, and this rung cannot tell a wedged ring from a dead link. NOT a statement about the un-wedge"
+    } else if !poisoned && !unit_poisoned {
+        "NOT-POISONED — the deliberate read of 0x409504 returned a non-POISON word and neither cpuctl nor mailbox0 faulted afterwards. The poison law did NOT fire on this boot, so the un-wedge was again not exercised (s33boot1's exact miss) — and that is a LOUDER result than an un-wedge would have been: s31/s32/s34 recorded this offset faulting on first access three times, so a clean read here names a CONDITION those three boots did not share. NOT 'ruled out' (R19): the conditions are the ones printed on this rung's own lines"
+    } else if poisoned && !unit_poisoned {
+        "POISON-CONFINED — the read of 0x409504 returned a fault word, but neither cpuctl nor mailbox0 faulted after it. The offset answers POISON for ITSELF without wedging the unit, which CONTRADICTS s31/s32's spread and is a per-offset finding, not an un-wedge. The clear's outcome below says nothing either way: there was nothing wedged to recover"
+    } else if unit_real_now {
+        "UNWEDGED — the unit was POISONED at the observe step and reads REAL again after the clear. A PRING W1C recovers a GK107 FECS unit inside the boot, the question KF21 opened in July is answered, and every future probe of an unproven 0x409xxx offset can be made survivable"
+    } else {
+        "STILL-POISONED"
+    };
+
+    serial_println!(
+        ":: KFUNWEDGE: verdict base={} poke={:08X} {} poisoned={} unit_poisoned_at_observe={} pring {:08X}->{:08X}->{:08X} cpuctl {:08X}->{:08X}->{:08X} mailbox0 {:08X}->{:08X}->{:08X} ctl {:08X}->{:08X}->{:08X} clear={{written={} skipped={}}} ctl_pre={:08X} ctl_post={:08X} ctl={} restored=IMPOSSIBLE -> {} under {{clear={}, base={}, control={}, sacrificial-boot=YES, rung-ordering=last-kepler-statement-before-the-terminal-poke}} ::",
+        base_class,
+        poke, poke_cls, if poisoned { "yes" } else { "no" },
+        if unit_poisoned { "Y" } else { "n" },
+        pre_pring.pbus_intr(), obs_pring.pbus_intr(), post_pring.pbus_intr(),
+        pre_cpuctl, obs_cpuctl, post_cpuctl,
+        pre_mb0, obs_mb0, post_mb0,
+        pre_ctl, obs_ctl, post_ctl,
+        cleared, skipped,
+        ctl_pre, ctl_post,
+        if held { "held" } else { "MOVED" },
+        verdict,
+        if cleared > 0 { "written" } else { "skipped" },
+        base_class,
+        if control_poisoned { "POISONED" } else { "real" }
+    );
+
+    serial_println!(
+        ":: KFUNWEDGE: end rung=KF29 poisoned={} clear={} unwedged={} writes={} restored=IMPOSSIBLE — a poison is not restorable: there is no write that un-reads a read, and the only bound on this boot's damage is the POWER CYCLE. ⚠ THE TERMINAL POKE BELOW IS NO LONGER THE FIRST ACCESS TO 0x409504 ON THIS BOOT, so spec 10's datum for it is VOID here; the fecs-ledger line states the ordering (504_read_idx < 504_write_idx) rather than leaving it to be assumed ::",
+        if poisoned { "yes" } else { "no" },
+        if cleared > 0 { "written" } else { "skipped" },
+        if held && !control_poisoned && poisoned && unit_poisoned && unit_real_now { "YES" } else { "no" },
+        cleared
+    );
+}
+} // mod unwedge
