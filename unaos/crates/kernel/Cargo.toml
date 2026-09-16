@@ -108,6 +108,25 @@ nvidia-kepler-gopoverlap = ["nvidia-kepler"]
 # boot may run the reconnaissance without building a channel. DEFAULT OFF => module and call
 # site unlinked, media byte-identical. Kept in sync with arroyo AND builder/src/main.rs.
 nvidia-kepler-ce = ["nvidia-kepler"]
+# KFBIND (R19 / shut-out register §2, rung KF27): `UNAOS_KEPLER_KFBIND=1` — derive the GK107
+# PBDMA register base from the PTOP device-info table and read the channel's fetch pointers at
+# the DERIVED base BESIDE the legacy `0x40000 + i*0x2000` guess, in one capture
+# (drivers/gpu/kepler_fifo.rs). Sittings #4 and #5 both closed asking for exactly this and
+# neither has been done: every PBDMA verdict in the register since s#6 — `bad-read pbdma 40108`
+# (POISON at s#4, ZERO at s#5, same address same part) and `DISCRIMINATOR ... CHID=0 ACTIVE=0` —
+# is read through one unproven number, and a zero read at an unproven base is a READ-ZERO, not a
+# scheduler state. The falsifier is `IB_GET` (USERD +0x88; envytools docs/hw/fifo/dma-pusher.rst
+# "Channel control area", as quoted by kepler.rs's beacon-plant argument): the deleted GP_GET
+# witness read 0x8C/0x90, which by that same quoted list is IB_PUT and a word the list does not
+# name — so the campaign's founding `gp_get=0` may never have been a reading of GP_GET at all.
+# READ-ONLY, zero device writes: the bind/enable write the rung is named for needs the PBDMA
+# CHANNEL register's bit encoding, which no source in this tree names, so it is printed as
+# SKIPPED with its reason (falcon_microcode_spec.md §0.1 — an UNPINNED claim may be probed,
+# never written). Implies `nvidia-kepler` so the module gate in gpu/mod.rs is self-sufficient,
+# AND `nvidia-kepler-fifo` because BOTH call sites are inside `kepler::init`'s fifo leg — arming
+# this knob alone would otherwise compile a module nothing can reach. DEFAULT OFF => module and
+# both call sites unlinked, media byte-identical. Kept in sync with arroyo AND builder/src/main.rs.
+nvidia-kepler-kfbind = ["nvidia-kepler", "nvidia-kepler-fifo"]
 # WC-X86: bring the window compositor (`video::wm`) up on the x86 panel path. Compiles
 # `video/desktop_uefi.rs` — the activation seam and the one kernel-drawn demo window — plus fbcon's
 # CONSOLE-WINDOW route (`panel_console_window_open`: the kernel console becomes an ordinary row in

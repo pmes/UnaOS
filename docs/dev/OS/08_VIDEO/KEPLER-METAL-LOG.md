@@ -60,6 +60,93 @@ because the probe lives inside `kepler_display::takeover_display`).
 so a q35 log with zero `BEAMX86` lines proves nothing about the code being present):
 `LC_ALL=C grep -a -o -F 'BEAMX86' target/x86_64_esp/kernel.elf | wc -l` on the flight artifact.
 
+## PENDING METAL — KFBIND (shut-out register §2, rung KF27): is the PBDMA base we have used since sitting #3 the right one, and has anyone ever read IB_GET?
+
+**Nothing below is a metal fact.** It is the witness the next flight scores, written down before the
+flight so the scoring cannot drift into the reading. Build knob: add `UNAOS_KEPLER_KFBIND=1` to the
+flight line, on top of `UNAOS_KEPLER=1 UNAOS_KEPLER_FIFO=1` (the feature implies both in Cargo, but
+the *call sites* are inside `kepler::init`'s fifo leg, so `UNAOS_KEPLER_FIFO` must be on the line to
+REACH them). READ-ONLY: the rung performs **zero device writes** and prints `writes=0 restored=n/a`.
+
+**Why this rung and not another bind.** Sittings #4 and #5 each closed with the same NEXT item, and
+neither has ever been done:
+
+> s#5: "derive the correct GK107 PBDMA register base + the unit start/clock so `40108` reads real
+> status."
+> s#4: "which PBDMA unit is bound to our channel's runlist + its start/enable/clock sequence."
+
+Every PBDMA fact this campaign owns is read through one unproven number. `kepler.rs` addresses the
+units at `0x40000 + i*0x2000` — a guess adopted at s#3 in the same sitting the previous guess
+(`0x6c0`) returned `0xBAD0011F`. At that base `bad-read pbdma 40108` returned **POISON at s#4 and
+ZERO at s#5**, same address, same part; and `DISCRIMINATOR pbdma{0,1,2} ch=00000000 (CHID=0
+ACTIVE=0)` has been quoted as a scheduler verdict since s#6. A zero read at an unproven base is the
+sentence *"this address returned zero"*, not *"the channel is not scheduled"*.
+
+**⭐ The second finding, and it needs no metal to state.** `kepler.rs`'s beacon-plant safety argument
+quotes envytools `docs/hw/fifo/dma-pusher.rst`, "Channel control area": `… IB_GET 0x88, IB_PUT
+0x8C`. Two lines later the same comment records that this driver's deleted GP_GET/GP_PUT witness
+(added `1c9e2570`, removed `51b98bab` at pull 15) read **`0x8C/0x90`**. `0x8C` is IB_PUT — the
+pointer the HOST writes — and `0x90` is not in the enumerated list at all. **The campaign's founding
+observable, `gp_get=0`, may never have been a reading of GP_GET.** Nothing in this tree reads
+`0x88`. This rung does.
+
+**THE LINES TO SCORE**, in the order they print. Phase A sits immediately before the runlist submit;
+phase B immediately below the historic `DISCRIMINATOR` loop, so the audited line and the audit are
+adjacent in the capture.
+
+```
+:: KFBIND: begin knob=UNAOS_KEPLER_KFBIND rung=KF27 … writes=0 restored=n/a …
+:: KFBIND: ptop-row i=00..07 [ … ]                      (x8, the raw table — the datum)
+:: KFBIND: ptop pbdma=<n> runlists=[<mask>] pbdma0_base=<b> entries=64 nonzero=… poison=…
+           refused_out_of_window=… overflow=… ctl_pre=… ctl_post=… ctl=held …
+:: KFBIND: pbdma[i] DERIVED pre-submit base=… status=… <cls> chan=… <cls> … answers=Y|n ::
+:: KFBIND: pbdma[i] LEGACY  pre-submit base=… status=… <cls> chan=… <cls> … answers=Y|n ::
+:: KFBIND: userd pre-submit off=… ib_get=… <cls> ib_put=… <cls> x090=… dma_put=… dma_get=… ::
+:: KFBIND: skipped write=pbdma_chan_bind reason=uncited — …          (x3)
+        … kepler::init's own runlist submit + playlist echo + DISCRIMINATOR loop …
+:: KFBIND: pbdma[i] DERIVED|LEGACY post-submit …  +  :: KFBIND: delta … same|MOVED ::
+:: KFBIND: userd post-submit … ib_get=… ::
+:: KFBIND: verdict base=<BASE VERDICT> ib_get <pre>-><post> <cls> … -> <FETCH VERDICT> ::
+:: KFBIND: end rung=KF27 ptop=… base_cmp=… fetch=… ::
+```
+
+**What each outcome means — pre-registered, so the flight cannot be read after the fact.**
+
+*The base comparison (`verdict base=`), which is this rung's primary product:*
+
+| outcome | reading |
+| --- | --- |
+| `DERIVED-WINS` | a PTOP-derived base returns real values where the legacy base returns only ZERO/POISON. **Every PBDMA verdict in register §2 since s#6 was read at the wrong address and is RE-SCOPED, not retracted** — KF24's shape exactly, and the fourth time KF11→KF14's lesson has repeated |
+| `LEGACY-WINS` | the legacy base answers and no derived candidate does. `0x40000 + i*0x2000` is **promoted from guess to observation** and s#4/s#5's NEXT item is DISCHARGED — which is a real result, not a null one |
+| `BOTH-ANSWER` | both return real values: the same window reached two ways, or two real units. The `base=` fields on the per-unit lines separate them; neither is refuted |
+| `NEITHER-ANSWERS` | every dword at every base is ZERO or POISON with a HELD bracket. A statement about the whole PBDMA PRI space on this part, and the strongest reading available without a start/clock sequence this rung may not guess |
+| `LEGACY-ONLY` | PTOP named no admissible candidate, so the two bases were never compared. **The legacy base is NOT thereby confirmed** — it is simply the only one this boot read |
+| `VOID-BRACKET` | `NV_PMC_BOOT_0` moved across the PTOP sweep. No statement about either base |
+
+*The falsifier (`-> …`), on `IB_GET` (USERD +0x88):*
+
+| outcome | reading |
+| --- | --- |
+| `-> FETCHED` | IB_GET advanced across the submit. **The PBDMA fetched from the GPFIFO and K-GPU-3's wall since July has moved for the first time.** |
+| `-> STILL-DARK under …` | IB_GET did not move, and the line NAMES the conditions (R19, never "ruled out"): derived-base comparison as scored above · FECS context microcode NOT resident · CHAN_CUR/CHAN_NEXT not host-populated by this rung · PBDMA start/clock NOT written (uncited, skipped) · runlist submitted via `0x2270/0x2274`. Even here the rung is not empty: **it is the first capture in the campaign that contains IB_GET at all**, so `gp_get=0` stops being an inference from IB_PUT |
+| `-> VOID-USERD` | IB_GET reads POISON/ABSENT: the channel control area did not answer, which says nothing about whether the PBDMA fetched |
+| `-> VOID` | the phase-B control bracket moved |
+
+**Cross-check available in the same boot, for free.** `UNAOS_KEPLER_CE=1` arms CE-R1, which sweeps
+the SAME PTOP address (`0x022700`) with the SAME `((v & 0xFFF) << 12)` extraction. The two rungs
+must agree dword-for-dword; if they disagree it is a code defect in one of them, not a hardware
+finding. Flying them together also turns CE-R1 from `never-run` into a scored rung at no extra cost.
+
+**Control that must accompany the flight image** — the rung cannot run in QEMU (q35 has no Kepler,
+so a q35 log with zero `KFBIND` lines proves nothing about the code being present), so the artifact
+is the only witness that the build carried it (s42's INSTGUI lesson, BANNERCERT's enforcement):
+
+```
+LC_ALL=C grep -a -o -F 'KFBIND' target/x86_64_esp/kernel.elf | wc -l     # must be > 0
+```
+plus `nvidia-kepler-kfbind` in the `⚡ kernel features:` banner. A banner without the artifact hits
+is the BEAMX86 failure mode and the flight must not be scored.
+
 ## TREE CHANGE — SHUTRESTORE (2026-09-15): the seven deleted rungs are back behind knobs
 
 **No metal in this entry, and nothing here is a fact about silicon.** It is recorded in the metal
