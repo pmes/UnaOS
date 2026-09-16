@@ -17592,3 +17592,53 @@ install before `wc_route_event` at `:1892` and cfg the `:1944` `move_rel` to `no
 "x86_64")` (that arm is shared with aarch64, where it is the only install). Other `wc_route_event`
 callers (`drain_and_route`, the wmdirect legs) push absolute reports or count pops and are unchanged
 in what they assert.
+
+**PTRLANE — `installs == reports > 0` MEASURED in QEMU (branch `exec-rmbp-ptrlane`, parent fa4dcf0b,
+2026-09-16).** The lane "What is NOT measured" above named is built. `./arroyo test-ptr [secs]`
+(default 120) re-execs with `UNAOS_PTRLANE=1 UNAOS_WC=1 UNAOS_QEMU_FULL=1` — a verb rather than a
+knob on `test` because `wc` is a `_feats` entry read at script load (the re-exec is `test-install`'s
+lesson), the late line needs the full wall, and the picker's guard is then one line — attaches
+`-device usb-mouse,bus=xhci.0` through `UNAOS_QEMU_EXTRA` BESIDE the builder's `usb-tablet` (the
+builder is not edited; QMP routes an `input-send-event` by KIND, so a `rel` move reaches only the
+handler with the REL mask and nothing is a bet on QEMU's choice between two devices), and drives
+`scripts/qmp_type.py --pointer-kind rel` — 36 moves 50 ms apart, ±24 px on both axes alternating,
+NO button — held on the mouse's own `:: MOUSE-1: … proto=2 relative` line, `[crispy] theme=` and
+`:: zeolite: resolver bound :53`, then XHCIKBD's measured 5 s settle, so the moves land at ~30 s of
+uptime, after `ptrdead_selftest` has drained its own pushes and inside the window the 60 s late line
+closes. `scripts/specs/x86-ptr.spec` (named in code as `X86_PTR_SPEC`, GATE-SPECROOTS GATED) pins
+both enumeration lines, `:: MOUSE-1: 1 reports` and `32 reports` (delivery below the producer),
+`[ptrinstall] installs=36 reports=36`, `:: PTRINSTALL: installs=36 reports=36 … lag_max_ms=<50`,
+forbids `installs=0 reports=[1-9]` on both lines, and carries x86-wc.spec's `[ptrdead]` line (the
+shared queue was not raided). The count is LITERAL because foreman refuses backreferences, so
+`installs=(\d+) reports=\1` cannot be written; `PTRLANE_MOVES` in `test_x86_64` and the two 36s in
+the spec change together, and a relative report lost anywhere in the pipe reds the lane by name.
+**Why no click, and it is not an omission:** PTRPRESS (`ptrpress_note`, armed on every `witness`
+build) stalls 900 ms on the FIRST button edge and `ptrpress_hole` then swallows the first release
+after it — its injected fault, scored `-> FAIL` 6 s later unless XHCIHUB's burst-and-tail shape
+recovers it — so a lone press leaves the level held, prints a default FORBID, and adds nothing to
+the identity; the moves are the measurement.
+
+The one run (LAWS §4 R38): `./arroyo test-ptr 120` → rc **0**. `target/serial.log.run`: `mode=full
+wall=127.2 cap=120 completion=complete complete_line=2321`, 2590 lines, 0 fault tokens, banner
+`witness,ehcihid,kbdwit,sdhcblk,smolnet,wc,sdwrite`; the typist's transcript (`target/ptrlane-typist.log`,
+beside the capture): `proto=2 relative` seen at +5.3 s, `theme=` at +5.8 s, `zeolite` at +19.5 s,
+`36 rel moves + 0 left click(s), 50 ms apart`. The wire: `:: MOUSE-1: HID pointer detected
+vid:pid=0627:0001 proto=0 absolute ep=0x81 mps=8 interval=4` (line 996) AND `… proto=2 relative
+ep=0x81 mps=4 interval=7` (1090) — the xHCI HID path enumerates the second pointer beside the tablet,
+the first thing this lane was to measure; `:: MOUSE-1: 1 reports, last dx=24 dy=24 buttons=0x00`
+(2353) and `32 reports, last dx=-24 dy=-24` (2385); `[ptrinstall] installs=36 reports=36 lag_max_ms=9
+coalesced=0 drains=36 folds=0` ×20 (first full sample at 2391; the one mid-burst sample, 2380, reads
+`installs=13 reports=13 lag_max_ms=9`); **`:: PTRINSTALL: installs=36 reports=36 folds=0 lag_max_ms=9
+coalesced=0 drains=36 ::`** (2480). `installs == reports` at every sample including the mid-burst
+one, and `36 == 36 + 0 + 0` at every quiet one. `lag_max_ms=9` is the render loop's drain period
+under TCG, not the ~1 ms input-service pass the paragraph above expected — the producer's install
+is at HID rate, the channel's delivery nine milliseconds behind it — pinned below 50 (five times
+the measurement, an order under CHOP's stall). The verb's own replay: **7/7 required, 0 forbidden**.
+Go-red by mutation on the same capture (no second run): the late REQUIRE's `reports=36` → `37` →
+mbench rc 1, `6/7 required`, MISSING named at its spec line; the FORBID pointed at the real shape
+(`installs=36 reports=[1-9]`) → rc 1, `FORBID hit @ line 2480`, 7/7 required, 1 forbidden; the file
+restored byte-identical each time (`sha256sum -c` OK). The zero-control capture of the wc lane
+(34084499, `installs=0 reports=0`) replays against the same spec at 2/7 — the spec has two
+outcomes. `./arroyo check` rc 0 (159 ✅ legs; `spec parses: x86-ptr.spec`, `x86-ptr.spec GATED`),
+`bash -n unaos/arroyo` rc 0; no kernel bytes, so no `knoboff` run. Flight 11's watch-list line
+above is now the line QEMU prints, with the pad's numbers in place of the typist's.
