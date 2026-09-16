@@ -148,12 +148,16 @@ RC_TRUNCATED = 3
 
 
 class Directive:
-    def __init__(self, kind, pattern, need=1, builtin=False, spec_line=0):
+    def __init__(self, kind, pattern, need=1, builtin=False, spec_line=0, spec_name=""):
         self.kind = kind          # REQUIRE | COUNT | OPTIONAL | FORBID | PENDING | COMPLETE
         self.pattern = pattern    # regex source, as written in the spec
         self.need = need          # threshold (COUNT); 1 otherwise
         self.builtin = builtin    # default FORBID, not from the spec file
         self.spec_line = spec_line
+        # SPECRUN: the SOURCE COORDINATE of this pinned line — `x86-fat.spec:14`. Carried on the
+        # directive so the ONE place that knows a pin is short can say WHICH LINE OF WHICH FILE to
+        # go and read. Empty for the builtin FORBIDs, which are in this file, not in any spec.
+        self.spec_name = spec_name
         try:
             self.rx = re.compile(pattern)
         except re.error as e:
@@ -222,6 +226,16 @@ class Directive:
             return GLYPH["ok"] if self.hits else GLYPH["info"]
         return GLYPH["ok"]
 
+    def origin(self):
+        """` (pinned at x86-fat.spec:14)` — printed ONLY on a directive that came up short.
+
+        A green table is byte-identical to what it printed before this existed: the coordinate is
+        for the reader who has to go and change something, and that reader only appears on a red.
+        Empty for the builtin FORBIDs (they have no spec line to send anyone to)."""
+        if not self.spec_name or not self.spec_line:
+            return ""
+        return f" (pinned at {self.spec_name}:{self.spec_line})"
+
     def note(self):
         if self.kind == "COMPLETE":
             if self.hits:
@@ -237,10 +251,10 @@ class Directive:
                 return "0 hits — awaiting metal/code (never fails)"
             if self.kind == "OPTIONAL":
                 return "0 hits (informational)"
-            return "0 hits — MISSING"
+            return f"0 hits — MISSING{self.origin()}"
         n = f"{self.hits} hit(s), first @ line {self.first_lineno}"
         if self.kind == "COUNT" and not self.satisfied():
-            n += f" — SHORT of {self.need}"
+            n += f" — SHORT of {self.need}{self.origin()}"
         if self.kind == "PENDING":
             n += " — MATCHED: consider promoting to REQUIRE"
         return n
@@ -252,6 +266,7 @@ class SpecError(Exception):
 
 def parse_spec(path):
     directives = []
+    sname = os.path.basename(path)
     with open(path, "rb") as f:
         for i, raw in enumerate(f.read().splitlines(), 1):
             line = raw.decode("utf-8", errors="replace").strip()
@@ -263,11 +278,12 @@ def parse_spec(path):
                 sub = parts[1].split(None, 1) if len(parts) > 1 else []
                 if len(sub) != 2 or not sub[0].isdigit():
                     raise SpecError(f"line {i}: COUNT wants '<n> <regex>': {line!r}")
-                directives.append(Directive("COUNT", sub[1], need=int(sub[0]), spec_line=i))
+                directives.append(Directive("COUNT", sub[1], need=int(sub[0]), spec_line=i,
+                                            spec_name=sname))
             elif kind in ("REQUIRE", "OPTIONAL", "FORBID", "PENDING", "COMPLETE"):
                 if len(parts) != 2:
                     raise SpecError(f"line {i}: {kind} wants a regex: {line!r}")
-                directives.append(Directive(kind, parts[1], spec_line=i))
+                directives.append(Directive(kind, parts[1], spec_line=i, spec_name=sname))
             else:
                 raise SpecError(f"line {i}: unknown directive {kind!r}")
     for p in DEFAULT_FORBIDS:
@@ -524,6 +540,18 @@ def verdict_table(matcher, spec_path, log_path, elapsed=None, out=None):
               "regression.", file=out)
     else:
         print(f"  {GLYPH['fail']} MBENCH FAIL — {summary}", file=out)
+        # SPECRUN: ONE line a caller can quote without re-implementing the match. `arroyo`'s
+        # `test`/`test-fat` tails read exactly this line to put `<spec>:<line>` in their own red,
+        # so the verb and the table can never disagree about WHICH pin came up short. Emitted in
+        # SPEC ORDER (`ds` is sorted by kind then spec_line), so "first" means first in the file.
+        short = [d for d in ds if d.kind in ("REQUIRE", "COUNT") and d.failed()]
+        if short:
+            d0 = short[0]
+            print(f"       FIRST-SHORTFALL {d0.spec_name}:{d0.spec_line} {d0.label()} "
+                  f"{d0.pattern}", file=out)
+            if len(short) > 1:
+                print(f"       ({len(short) - 1} further pinned line(s) also short — full "
+                      f"table above)", file=out)
         if matcher.markers():
             # The other half of the honesty claim: say out loud that the run DID reach
             # its end, so a reader knows the shortfall is real and not a short log.

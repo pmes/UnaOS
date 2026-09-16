@@ -1408,3 +1408,26 @@ FORBID :: DOCK: .* :: FAIL ::
 # --- claim holds past the serial budget.
 REQUIRE :: CLICK-BAND: routed menu=true\(open\) outside=true\(dismiss\) dock=true\(.*\) band_lines=3 :: PASS ::
 FORBID :: CLICK-BAND: .* :: FAIL ::
+
+# ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
+# A PINNED LINE IN THIS FILE IS CHANGED TOGETHER WITH THE KERNEL LINE IT PINS, IN THE SAME COMMIT —
+# re-pinned to the new wording (naming the arc that changed it), or dropped with the reason stated.
+# It is never worked around by teaching the kernel a SECOND spelling of the same witness. That is
+# what an unrun spec cost this tree once: STORWAIT added a second `storage settle:` line rather than
+# edit the `[fatverb] storage witness` REQUIRE this file pins verbatim — a pin no command was
+# reading, and still expensive.
+#
+# WHY THIS BLOCK IS AT THE TAIL AND NOT THE HEAD. Ledger rows, queue rows and kernel comments across
+# this tree cite pinned lines POSITIONALLY (`x86-fat.spec:238`, `pi4-regression.spec:1549`,
+# `jetson-sync1.spec:1839`, `crates/kernel/src/shell.rs:4933` -> `x86-fat.spec:156`). A header insert
+# moves every one of them by the same amount, silently — rmbp-ledger PI5 names tail-append as this
+# repo's safe form for exactly that reason. The contract is ENFORCED, not merely written: see below.
+#
+# WHO RUNS THIS FILE, and the gate that makes the answer mandatory:
+# RUN-BY: bench — ./arroyo mbench --replay <rmbp capture> --spec scripts/specs/x86-witness.spec --platform x86
+#   No verb replays it: it asserts a PAYGO+LOGTS+WITNESS-armed rMBP metal boot, not a QEMU capture.
+#
+# GATE-SPECROOTS (`scripts/spec-roots.sh`, a leg of `./arroyo check`) reds by name on any spec under
+# scripts/specs/ that is neither named in `arroyo`'s CODE nor carries a RUN-BY line above — and a
+# `RUN-BY: verb:` claim is cross-checked against `arroyo`, so this file cannot claim a runner it
+# does not have. "A replay spec no gate command runs is a silent landmine."
