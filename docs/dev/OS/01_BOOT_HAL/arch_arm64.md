@@ -4503,14 +4503,14 @@ regression-only (the shared `smp_virt` GICv3 path stays 3/3 + CAPSTONE 6/6).
 
 **Presence + table (M1).** The target list is produced by `fdt_tegra::cpu_affinities` from the
 firmware DTB `/cpus` walk ALONE (a direct `cpu@…` child's `reg` = its MPIDR affinity, cell count from
-`/cpus/#address-cells`; converted to the packed GICR-contiguous form). `start_secondaries_tegra`
+`/cpus/#address-cells`; converted to the packed GICR-contiguous form). `start_secondaries`
 builds the dense linear-index → affinity table (BSP = `gic::this_affinity()` at index 0, each other
 `/cpus` core at 1..N in DTB order), publishes it via the existing `AFF_BY_INDEX`/`N_CORES_PUB` Release
 protocol, and prints each enumerated core's affinity to serial (the bench evidence). If `/cpus` names
 nothing (unmapped/malformed DTB, or a headless handoff without one) it STOPs single-core — never a
 phantom start.
 
-**Kick-off (M2).** `start_secondaries_tegra` runs from `tegra_early_stop` after JM4 (GIC-600 +
+**Kick-off (M2).** `start_secondaries` runs from `tegra_early_stop` after JM4 (GIC-600 +
 generic timer + heap + SMC all live) and **before** the JM6 EL2→EL1 drop, so the BSP is still at EL2.
 It `CPU_ON`s each `/cpus`-named secondary at the `_secondary_start_virt` stub with the linear index as
 context id; each secondary runs the **born-fixed** `__secondary_rust_virt` path (re-derive the index
@@ -4767,7 +4767,7 @@ ORIN-SMP-6 takes them one variable per leg:
 **Lane amendment (Maestro-granted 2026-07-16).** Feeding the real entry requires the real path's
 private publication state, so `smp_virt.rs` gained EXACTLY one `smpprobe`-gated (plus `tegra`)
 publish-only API + one read accessor — `probe_publish_real_path(aff_by_index) -> entry_pa`
-(the exact `start_secondaries_tegra` pre-`CPU_ON` publication: BSP affinity + SGI-0 enable, EL2 ctx
+(the exact `start_secondaries` pre-`CPU_ON` publication: BSP affinity + SGI-0 enable, EL2 ctx
 capture + clean-to-PoC, `SECONDARY_STACKS` clean+invalidate, `AFF_BY_INDEX`/`N_CORES_PUB` Release;
 **no `CPU_ON` inside**) and `probe_core_online(idx)` (the `CORE_READY` Acquire read). Both are
 compiled out knob-off — the default image stays byte-identical to baseline (re-proven this arc).
@@ -5132,14 +5132,14 @@ inherited-slot eviction (the XCARVE-suspect step, and the interplay the bit-63 e
 **The boot-ordering audit (the leg→position mapping, with code evidence).** In `tegra_early_stop`
 (`main.rs`) the relevant order is: JB1c BPMP ungate + JB5/JB9f raw-handoff witnesses → JM4 (GIC-600 +
 generic timer, `percpu::init(0)`) → global heap → **JB2b `jb2b_attach` xHCI takeover (incl. JB9i
-eviction)** → the `smpprobe::run` dispatch (`main.rs`) → the `tegrasmp` `start_secondaries_tegra`
+eviction)** → the `smpprobe::run` dispatch (`main.rs`) → the `tegrasmp` `start_secondaries`
 kick-off → JM6. Two facts fall out of that audit and shape the legs:
 
-1. **The `smpprobe::run` dispatch (leg 23's site) and the `start_secondaries_tegra` kick-off are
+1. **The `smpprobe::run` dispatch (leg 23's site) and the `start_secondaries` kick-off are
    adjacent and BOTH post-xHCI-takeover** — nothing executable sits between them. So position is NOT
    what differed between leg 23 and the real SMP-3 run; and the code delta is also ~nil (leg 23's
    `run_real_entry_rapid` publishes via `smp_virt::probe_publish_real_path`, the line-for-line twin of
-   `start_secondaries_tegra`'s pre-`CPU_ON` publication, then bursts the same `CPU_ON`s into the same
+   `start_secondaries`'s pre-`CPU_ON` publication, then bursts the same `CPU_ON`s into the same
    real `_secondary_start_virt`; the only difference — a print-free burst vs SMP-3's print-per-call
    loop — was itself acquitted by legs 20/22). The residual enumerable delta reduces to the build
    FEATURE / image LAYOUT (`tegrasmp` vs `smpprobe`), which the XCARVE arc proved decides fabric
@@ -5385,7 +5385,7 @@ left standing between the surviving leg images and the original `tegrasmp` image
 **The experiment (BUILD-ONLY — no new kernel surface).** The XCARVE relink pad
 (`XCARVE_RELINK_PAD`, a `#[used]` 16 KiB inert `0xA5` static in its own `.xcarve_relink_pad` section,
 `arch/aarch64/xusb_tegra.rs`) is composed onto the REAL `UNAOS_TEGRASMP=1` image — the exact SMP-3
-kick-off (`smp_virt::start_secondaries_tegra`, the real 6-core Orin bring-up) at a shifted layout.
+kick-off (`smp_virt::start_secondaries`, the real 6-core Orin bring-up) at a shifted layout.
 Both features imply `tegra`; `arroyo` composes `tegrasmp,tegra,xcarve_relink,tegra` and cargo
 de-dups (compose verified: `./arroyo check` green both arches for `UNAOS_TEGRASMP=1` and
 `UNAOS_TEGRASMP=1 UNAOS_XCARVE_RELINK=1`; feature-echo confirms both active). No code changed — the
@@ -5415,7 +5415,7 @@ one answers SMP-8:
 
 | signature | RAS ADDR | class / register set | where it fires | means |
 |---|---|---|---|---|
-| **SMP-3 fault** (the axis under test) | ends `…0200` (`0x8000000000000200`) | IOB `SERR=0x12` / CBB-`0x6` | at `start_secondaries_tegra`, BEFORE the first `CPU_ON` result prints | the SMP-3 wall — the ONLY signature that answers this arc |
+| **SMP-3 fault** (the axis under test) | ends `…0200` (`0x8000000000000200`) | IOB `SERR=0x12` / CBB-`0x6` | at `start_secondaries`, BEFORE the first `CPU_ON` result prints | the SMP-3 wall — the ONLY signature that answers this arc |
 | **SNOC-Carveout / xHCI wall** (unrelated to SMP) | ends `…7767dcXX` (`…dc40`/`…dc80`) | SNOC `SERR=0xd` Illegal-address + Carveout `0x3`, ACI `SERR=0x4` FillWrite `0x9` | at the JB9i inherited-slot eviction (`DISABLE_SLOT 1..8 … drained`) | the xHCI-takeover carveout wall — WALL DATA, retry (may take any boot pre-probe) |
 
 **Pre-registered predictions (verbatim in `scripts/orin-smp8-bench.md`, written BEFORE any boot).**
@@ -5956,7 +5956,7 @@ park, so `UNAOS_GICV3=1 ./arroyo test-arm` proves the fix: after `3/3 secondarie
 reads each secondary's pulse counters back and emits
 `:: AARCH64 SMP: per-core idle heartbeat PASS — 3 online APs report idle (not pinned) ::` with a
 per-AP `busy=0, idle=N` breakdown (observed `idle=2`: park-entry bump + one BSP→AP-SGI wake). CAPSTONE
-6/6 and the 3/3 secondary bring-up are unchanged. The real Orin `start_secondaries_tegra` 6-core path
+6/6 and the 3/3 secondary bring-up are unchanged. The real Orin `start_secondaries` 6-core path
 parks through the identical `__secondary_rust_virt`, so the same honesty holds on metal — the live vug
 pixels (parked APs' bars reading idle/0% busy instead of pinned) are the **accruing metal witness**,
 not this arc's gate.
@@ -6005,7 +6005,7 @@ The idle-heartbeat asserts `idle > 0`; the busy-heartbeat asserts `busy > 0`; a 
 unchanged.
 
 **Shared-tail safety (metal + probe).** `__secondary_rust_virt` is the *shared* real-entry tail for
-the `virt` `start_secondaries`, the real Orin `start_secondaries_tegra`, AND the SMP-probe legs — but
+the `virt` `start_secondaries`, the real Orin `start_secondaries`, AND the SMP-probe legs — but
 only the `virt` BSP arms the work (`SECWORK_ARMED`, set once before any `CPU_ON`) and calls
 `secondary_work_go`. So `run_secondary_work` returns immediately on the tegra/probe paths (not armed →
 **no wait at all**), while an armed `virt` secondary waits on `secondary_work_go` under a generous
@@ -6142,7 +6142,7 @@ workers on the boot core only because the real kick-off was gated behind the opt
 opt-*out*, mirroring the PORTSW-1/SMOLNET default-ON/negative-knob policy.
 
 **What changed — build scripts only; no kernel source, no scheduler logic.** The `tegrasmp` cfg
-already fully gates the kick-off (`smp_virt.rs::start_secondaries_tegra` + the `fdt_tegra` `/cpus`
+already fully gates the kick-off (`smp_virt.rs::start_secondaries` + the `fdt_tegra` `/cpus`
 enumerator, §ORIN-SMP-3), so the promotion is entirely a matter of *which features the build pushes*:
 
 - **`unaos/arroyo`.** Any tegra build now arms `tegrasmp` by default: the `esp-jetson` target (which
@@ -6224,7 +6224,7 @@ AP killed the box while the BSP was still printing". Three short tags, emitted w
 
 | mark | emitted where | what its presence proves |
 |---|---|---|
-| `:P:` | `start_secondaries_tegra`, immediately after the publication block (ctx capture + `SEC_CTX` clean + stack `DC CIVAC` sweep) | the BSP survived publication and is about to issue `CPU_ON` |
+| `:P:` | `start_secondaries`, immediately after the publication block (ctx capture + `SEC_CTX` clean + stack `DC CIVAC` sweep) | the BSP survived publication and is about to issue `CPU_ON` |
 | `:R<idx>:` | same function, immediately after `psci_cpu_on` returns for linear index `<idx>` | the `CPU_ON` SMC **returned** to the BSP |
 | `:A:` | `__secondary_rust_virt`, immediately after `enable_mmu_virt` | that AP crossed MMU-off → MMU-on, i.e. survived the Device window |
 
@@ -12082,7 +12082,7 @@ promoted the deferred stretch long ago: `smp_virt::__secondary_rust_virt` calls
 about) and then `sched::secondary_run(core)`, which `mark_online`s it and enters `run()`. The
 `[bsprun] host` line agrees: `online=0x3f`.
 
-**The line was stale prose.** It is printed by the BSP inside `start_secondaries_tegra`, before any
+**The line was stale prose.** It is printed by the BSP inside `start_secondaries`, before any
 AP has reached its arm, so the BSP was asserting a state it had not measured — and a line that
 asserts an unmeasured state is worse than no line, because it is believed. It cost this arc's first
 diagnosis. It now reports only what the BSP knows (how many checked in) and names the witnesses that
@@ -12117,7 +12117,7 @@ else). `apsrun` widens seven of its `#[cfg]`s to `any(orinel1ap, apsrun)` and ch
 constant**: `boot_tegra::EL1AP_SEATS`, from `1` to unbounded. Three things are genuinely new:
 
 * **`boot_tegra::publish_el1_root`** — publish `mmu_tegra`'s EL1-precise twin (`mmu.ttbr0_el1`)
-  BEFORE the first `CPU_ON`, folded onto the line that carries `start_secondaries_tegra`'s attribute
+  BEFORE the first `CPU_ON`, folded onto the line that carries `start_secondaries`'s attribute
   in `main.rs` (code-before-attribute; zero source lines added, so no `panic::Location` in that file
   moves and the knob-off `kernel8.img` keeps its hash). ORIN-EL1AP's single claimant waited for
   `drop_to_el1` to publish, which is past the entire PCIe/xHCI/SD probe stretch. With one AP that is
@@ -12198,7 +12198,7 @@ is the arc's principal metal risk and it is named here rather than discovered at
 
 ⚠ **QEMU models no Tegra234.** Every site is `tegra`-gated: `boot_tegra.rs` is
 `#[cfg(all(target_arch = "aarch64", feature = "tegra"))]` (`arch/aarch64/mod.rs:29`),
-`start_secondaries_tegra` is `#[cfg(feature = "tegrasmp")]`, and `apsrun` implies `tegrasmp` implies
+`start_secondaries` is `#[cfg(feature = "tegrasmp")]`, and `apsrun` implies `tegrasmp` implies
 `tegra`. The `arm`/`test-arm` QEMU-`virt` legs compile **none** of it, so **no `foreman` spec row can
 red-without / green-with this change** — a row keyed on `[apsrun]` would be a check that cannot fire.
 Both polarities are TYPE-CHECKED (`arm-tegra-apsrun` arms it alongside `orinel1ap`, which is the one

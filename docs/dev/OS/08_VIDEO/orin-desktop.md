@@ -2298,7 +2298,7 @@ The seam did not run. It cannot have faulted, declined, or composited.
 
 ##### ~~"an EL3 RAS Uncorrectable right after core 5"~~ — after the last *enumeration line*, 96 source lines earlier
 
-"Right after core 5" is positional, not causal. `start_secondaries_tegra` dumps every
+"Right after core 5" is positional, not causal. `start_secondaries` dumps every
 enumerated core **before** issuing any PSCI call, deliberately:
 `arch/aarch64/smp_virt.rs:865-873` — "so the metal capture has the full set even if a later
 `CPU_ON` faults (the JM5 attempt-1 lesson: a RAS fault ate the enumeration)". `enumerated
@@ -2306,7 +2306,7 @@ core 5` is therefore the last line printed before the *first* `CPU_ON` SMC. Both
 die there with **no `CPU_ON` line at all**; all three clean legs print
 `CPU_ON AP 1..5 -> SUCCESS` followed by `5/5 secondaries online`.
 
-The seam that faults is `main.rs:2621`, `smp_virt::start_secondaries_tegra(…)` under
+The seam that faults is `main.rs:2621`, `smp_virt::start_secondaries(…)` under
 `#[cfg(feature = "tegrasmp")]` at `:2620`. The terminus line carrying `tegra_desk_furn()` is
 `main.rs:2717` — **96 source lines later**, and reached on neither parked leg.
 

@@ -475,6 +475,11 @@ fn psci_cpu_on(target_mpidr: u64, entry: u64, context_id: u64) -> i64 {
 /// PSCI `AFFINITY_INFO` at core level: is `target_mpidr` a valid, present PE? Returns 0 (ON) / 1 (OFF) /
 /// 2 (ON_PENDING) for a known core, or a negative error (-2 INVALID_PARAMS) for an affinity the firmware
 /// does not populate — the safe presence check that keeps a `CPU_ON` off a fuse-disabled phantom core.
+///
+/// `not(tegrasmp)`: this is the `virt` definition's phantom gate and it has no other caller. The Orin
+/// path's presence oracle is the DTB `/cpus` node ALONE (RIDER 1) and must never issue AFFINITY_INFO —
+/// so on a `tegrasmp` build this function is not merely unused, it is FORBIDDEN, and the cfg says so.
+#[cfg(not(feature = "tegrasmp"))]
 fn psci_affinity_info(target_mpidr: u64) -> i64 {
     psci_call(PSCI_AFFINITY_INFO, target_mpidr, 0, 0)
 }
@@ -509,10 +514,15 @@ fn capture_secondary_ctx() {
     }
 }
 
-/// Confirm + log the PSCI conduit. On the EL2 `virt`/Orin path the conduit is SMC regardless of what the
-/// DTB `method` says for an EL1-guest view, so this is informational. `dtb_addr == 0` (the tegra caller)
-/// skips the FDT parse entirely — the `fdt-0.1.5` parse of the real Orin DTB panics (task cde963a7), and
-/// SMC is used unconditionally — printing only the assumed-SMC line.
+/// Confirm + log the PSCI conduit. On the EL2 `virt` path the conduit is SMC regardless of what the DTB
+/// `method` says for an EL1-guest view, so this is informational. `dtb_addr == 0` skips the FDT parse
+/// entirely — the `fdt-0.1.5` parse of the real Orin DTB panics (task cde963a7), and SMC is used
+/// unconditionally — printing only the assumed-SMC line.
+///
+/// `not(tegrasmp)`: the `virt` definition of `start_secondaries` is the only caller. The Orin path never
+/// reported the conduit (it must not parse that DTB at all), so on a `tegrasmp` build this is not
+/// compiled — which is also the proof that the whole `virt` arm was dead code in every tegra image.
+#[cfg(not(feature = "tegrasmp"))]
 fn report_conduit(dtb_addr: u64, dtb_size: usize) {
     if dtb_addr != 0 {
         unsafe {
@@ -548,28 +558,103 @@ fn wait_until(deadline: u64, mut cond: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// BSP: discover the present cores, bring every secondary online via PSCI `CPU_ON`, then prove the GICv3
-/// cross-core IPI path in both directions. Called from `main.rs` (virt) / `tegra_early_stop` (Orin) only
-/// when `gic::is_v3()`.
+// ── The shared secondary bring-up mechanism (ONEOS3, 2026-09-15) ────────────────────────────────
+//
+// `start_secondaries` has TWO cfg-EXCLUSIVE definitions below — the QEMU-`virt` GICv3 path
+// (`not(tegrasmp)`) and the real 6-core Orin path (`tegrasmp`). They stay two definitions because the
+// boards differ on three axes no parameter spans: the PRESENCE ORACLE (GIC redistributor walk + a PSCI
+// `AFFINITY_INFO` phantom gate, versus the DTB `/cpus` node ALONE), the POSITION of the publication
+// relative to that walk (virt publishes the regime BEFORE it enumerates; Orin enumerates FIRST and
+// STOPs single-core if `/cpus` names nothing, so it must not publish until it knows it will start
+// anyone), and every witness literal they print. What they did NOT differ in, and duplicated anyway
+// until this arc, is the HANDSHAKE — and these five helpers are that handshake, written once.
+//
+// Each is `#[inline(always)]`: the sequence emitted at every call site is the sequence that was
+// written there before, in the same order, so no board's behaviour and no board's timing moves.
+
+/// Publish the BSP's affinity so a woken AP can target it, and enable SGI 0 on the BSP's own CPU
+/// interface so it can RECEIVE the AP → BSP pings (its IRQs are already unmasked by arch/gic init);
+/// then capture the EL2 regime and publish it — and the secondary stacks — for the MMU-off consumers.
 ///
-/// Publication before start: the secondaries read `SEC_CTX` with their MMU OFF (non-cacheable), so it is
-/// cleaned to PoC; `SECONDARY_STACKS` is clean+invalidated so the loader's *cacheable* BSS-zero lines
-/// can't later evict-clobber a secondary's MMU-off stack writes (a no-op in QEMU, load-bearing on metal).
-/// Both complete (`dsb sy`) before the first `CPU_ON`.
-pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
-    // Publish the BSP's affinity so a woken AP can target it, and enable SGI 0 on the BSP's own CPU
-    // interface so it can RECEIVE the AP → BSP pings. Its IRQs are already unmasked (arch/gic init).
-    let bsp_aff = gic::this_affinity();
+/// The secondaries read `SEC_CTX` with their MMU OFF (non-cacheable), so it is cleaned to PoC;
+/// `SECONDARY_STACKS` is clean+invalidated so the loader's *cacheable* BSS-zero lines can't later
+/// evict-clobber a secondary's MMU-off stack writes (a no-op in QEMU, load-bearing on metal). Both
+/// complete (`dsb sy`) before the first `CPU_ON`.
+#[inline(always)]
+fn publish_secondary_ctx(bsp_aff: u32) {
     BSP_AFFINITY.store(bsp_aff, Ordering::Release);
     gic::enable_sgi(IPI_SGI);
-
-    // Capture the EL2 regime, then publish it (and the secondary stacks) for MMU-off consumers.
     capture_secondary_ctx();
     cache::clean_range(&raw const SEC_CTX as usize, core::mem::size_of::<SecondaryCtx>());
     cache::clean_invalidate_range(
         &raw const SECONDARY_STACKS as usize,
         core::mem::size_of::<[SecStack; MAX_CORES]>(),
     );
+}
+
+/// Publish the linear-index → affinity table BEFORE any `CPU_ON`, so a woken secondary can recover its
+/// OWN linear index by matching its live MPIDR affinity (the CORE3-class fix — `__secondary_rust_virt`
+/// no longer trusts the MMU-off-spilled context id). The per-slot Relaxed stores are ordered before a
+/// secondary's reads by the `N_CORES_PUB` Release pairing with the secondary's Acquire; the
+/// stack/SEC_CTX cache maintenance already issued (`dsb sy`) also precedes the first `CPU_ON`.
+#[inline(always)]
+fn publish_index_table(aff_by_index: &[u32; MAX_CORES], n_cores: usize) {
+    for idx in 0..n_cores {
+        AFF_BY_INDEX[idx].store(aff_by_index[idx], Ordering::Relaxed);
+    }
+    N_CORES_PUB.store(n_cores as u32, Ordering::Release);
+}
+
+/// Bounded wait (≤ ~500 ms) for the secondary at linear index `idx` to publish readiness. Returns
+/// whether it checked in; a miss is the caller's WARNING line, never a hang.
+#[inline(always)]
+fn await_core_ready(idx: usize, freq: u64) -> bool {
+    let deadline = timer::cntpct() + freq / 2;
+    wait_until(deadline, || CORE_READY[idx].load(Ordering::Acquire))
+}
+
+/// BSP → AP proof for ONE core: ping it with SGI 0 (targeted by its affinity) and confirm its per-CPU
+/// counter ticks. Returns `(delivered, before, after)`. This direction is individually attributable per
+/// core, so the caller owns the per-core verdict line it prints.
+#[inline(always)]
+fn ping_core(idx: usize, aff: u32, freq: u64) -> (bool, u64, u64) {
+    let before = percpu::cpu(idx).ipis.load(Ordering::Acquire);
+    gic::send_sgi(aff as usize, IPI_SGI);
+    let deadline = timer::cntpct() + freq / 10; // ~100 ms
+    let ok = wait_until(deadline, || percpu::cpu(idx).ipis.load(Ordering::Acquire) > before);
+    let after = percpu::cpu(idx).ipis.load(Ordering::Acquire);
+    (ok, before, after)
+}
+
+/// AP → BSP proof: each online AP pinged the BSP once during its bring-up. Wait (~100 ms) for the BSP's
+/// own counter to grow past `bsp_ipi_before`; returns `(delivered, after)`.
+///
+/// The verdict is "at least one landed", NOT an exact count: a GICv3 SGI is a single pending bit per
+/// (INTID, target), so several APs racing SGI 0 at the BSP before it acknowledges the first coalesce
+/// into fewer distinct IRQs. The v3 IAR carries no source CPU, but only APs send SGI 0 to the BSP (the
+/// BSP never self-sends), so any growth of the BSP's counter is attributable to an AP. (Per-AP distinct
+/// INTIDs for individually-attributable AP→BSP delivery are a deferred delta-list follow-up.)
+#[inline(always)]
+fn await_bsp_ping(freq: u64, bsp_ipi_before: u64) -> (bool, u64) {
+    let deadline = timer::cntpct() + freq / 10;
+    let ok = wait_until(deadline, || {
+        percpu::cpu(0).ipis.load(Ordering::Acquire) > bsp_ipi_before
+    });
+    let bsp_ipi_after = percpu::cpu(0).ipis.load(Ordering::Acquire);
+    (ok, bsp_ipi_after)
+}
+
+/// BSP: discover the present cores, bring every secondary online via PSCI `CPU_ON`, then prove the GICv3
+/// cross-core IPI path in both directions. Called from `main.rs` (virt) only when `gic::is_v3()`.
+///
+/// THE `virt` DEFINITION of `start_secondaries` — its Orin twin is the `tegrasmp` definition below, and
+/// the two are cfg-EXCLUSIVE, so exactly one is ever compiled and the NAME is the subsystem's rather
+/// than a board's (R16). Presence here is the GIC redistributor walk plus the PSCI `AFFINITY_INFO`
+/// phantom gate; the publication, the readiness wait and both IPI proofs are the shared helpers above.
+#[cfg(not(feature = "tegrasmp"))]
+pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
+    let bsp_aff = gic::this_affinity();
+    publish_secondary_ctx(bsp_aff);
 
     report_conduit(dtb_addr, dtb_size);
 
@@ -607,15 +692,7 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
         );
     }
 
-    // Publish the linear-index → affinity table BEFORE any CPU_ON, so a woken secondary can recover its
-    // OWN linear index by matching its live MPIDR affinity (the CORE3-class fix — `__secondary_rust_virt`
-    // no longer trusts the MMU-off-spilled context id). The per-slot Relaxed stores are ordered before a
-    // secondary's reads by the `N_CORES_PUB` Release below pairing with the secondary's Acquire; the
-    // stack/SEC_CTX cache maintenance already issued (`dsb sy`) also precedes the first CPU_ON.
-    for idx in 0..n_cores {
-        AFF_BY_INDEX[idx].store(aff_by_index[idx], Ordering::Relaxed);
-    }
-    N_CORES_PUB.store(n_cores as u32, Ordering::Release);
+    publish_index_table(&aff_by_index, n_cores);
 
     // Presence gate (JM5 attempt-1 fix): the Tegra234 GIC-600 exposes redistributor frames for the whole
     // die's core slots, but the Nano is a 6-core part — a `CPU_ON` to a fuse-disabled phantom core is a
@@ -653,7 +730,7 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
 
     // SCHED-NEXT busy-heartbeat: arm cooperative secondary work BEFORE any CPU_ON, so every secondary
     // that comes online observes it and waits (generously) for our staged-work release rather than
-    // parking idle. This is the `virt`-only path; `start_secondaries_tegra` never arms, so real Orin
+    // parking idle. This is the `virt`-only path; the `tegrasmp` definition never arms, so real Orin
     // secondaries skip the wait entirely (see `sched::run_secondary_work`).
     sched::arm_secondary_work();
 
@@ -685,8 +762,7 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
         if !startable[idx] {
             continue;
         }
-        let deadline = timer::cntpct() + freq / 2;
-        if !wait_until(deadline, || CORE_READY[idx].load(Ordering::Acquire)) {
+        if !await_core_ready(idx, freq) {
             serial_println!(
                 ":: AARCH64 SMP: WARNING AP {} (aff={:#010x}) did not come online ::",
                 idx, aff_by_index[idx]
@@ -694,17 +770,12 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
         }
     }
 
-    // BSP → AP proof: ping each online core with SGI 0 (targeted by its affinity) and confirm its
-    // per-CPU counter ticks. This direction is individually attributable per core.
+    // BSP → AP proof (the shared `ping_core` handshake; this path's own verdict line).
     for idx in 1..n_cores {
         if !CORE_READY[idx].load(Ordering::Acquire) {
             continue;
         }
-        let before = percpu::cpu(idx).ipis.load(Ordering::Acquire);
-        gic::send_sgi(aff_by_index[idx] as usize, IPI_SGI);
-        let deadline = timer::cntpct() + freq / 10; // ~100 ms
-        let ok = wait_until(deadline, || percpu::cpu(idx).ipis.load(Ordering::Acquire) > before);
-        let after = percpu::cpu(idx).ipis.load(Ordering::Acquire);
+        let (ok, before, after) = ping_core(idx, aff_by_index[idx], freq);
         serial_println!(
             ":: AARCH64 SMP: BSP -> AP {} SGI {} (count {} -> {}) ::",
             idx,
@@ -714,20 +785,12 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
         );
     }
 
-    // AP → BSP proof: each online AP pinged the BSP once during its bring-up. The verdict is "at least
-    // one landed", NOT an exact count: a GICv3 SGI is a single pending bit per (INTID, target), so
-    // several APs racing SGI 0 at the BSP before it acknowledges the first coalesce into fewer distinct
-    // IRQs. The v3 IAR carries no source CPU, but only APs send SGI 0 to the BSP (the BSP never
-    // self-sends), so any growth of the BSP's counter is attributable to an AP. (Per-AP distinct INTIDs
-    // for individually-attributable AP→BSP delivery are a deferred delta-list follow-up.)
+    // AP → BSP proof (the shared `await_bsp_ping` handshake; see its note on SGI coalescing — the
+    // verdict is "at least one landed", and the BSP never self-sends SGI 0).
     let online = (1..n_cores)
         .filter(|&c| startable[c] && CORE_READY[c].load(Ordering::Acquire))
         .count();
-    let deadline = timer::cntpct() + freq / 10;
-    let ok = wait_until(deadline, || {
-        percpu::cpu(0).ipis.load(Ordering::Acquire) > bsp_ipi_before
-    });
-    let bsp_ipi_after = percpu::cpu(0).ipis.load(Ordering::Acquire);
+    let (ok, bsp_ipi_after) = await_bsp_ping(freq, bsp_ipi_before);
     serial_println!(
         ":: AARCH64 SMP: AP -> BSP SGI {} ({} online APs pinged, {} delivered; BSP ipi {} -> {}) ::",
         if ok { "OK" } else { "TIMEOUT" },
@@ -838,6 +901,12 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
     );
 }
 
+/// THE `tegrasmp` DEFINITION of `start_secondaries` — the Orin twin of the `virt` definition above,
+/// cfg-EXCLUSIVE with it (`tegrasmp` implies `tegra`, and the `virt` definition is `not(tegrasmp)`), so
+/// exactly one is compiled into any image. It carries the third parameter because its presence oracle
+/// does: `fdt_tegra::cpu_affinities` needs `ram_gib_mask` to walk `/cpus`, and the `virt` walk reads the
+/// redistributors instead and must not pretend to take it. R16: ONE subsystem name, never a board's.
+///
 /// ORIN-SMP-3 — the real 6-core Orin bring-up kick-off (`tegra` + `tegrasmp` gated). Called from
 /// `tegra_early_stop` after JM4 (GIC-600 + generic timer + heap up) and BEFORE the JM6 EL2->EL1 drop,
 /// so the BSP is still at **EL2**: the woken secondaries wake at the caller's EL (EL2) and replay the
@@ -858,7 +927,7 @@ pub fn start_secondaries(dtb_addr: u64, dtb_size: usize) {
 /// under which `CPU_ON` is known to work (the SMP-2 bench verdict). A downgraded firmware = the
 /// operator STOPs at the bench before trusting the run.
 #[cfg(feature = "tegrasmp")]
-pub fn start_secondaries_tegra(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
+pub fn start_secondaries(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64) {
     // RIDER 2 — the firmware precondition, restated so the transcript self-documents.
     serial_println!(
         ":: AARCH64 SMP: ORIN-SMP-3 kick-off — PRECONDITION UEFI t23x_general 39.2.0-gcid-45755727 (or \
@@ -924,19 +993,10 @@ pub fn start_secondaries_tegra(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64
 
     // Publish the EL2 regime + secondary stacks for the MMU-off consumers, then the linear-index table
     // (the CORE3-class fix — a woken secondary recovers its index by matching its live MPIDR affinity,
-    // never the MMU-off-spilled context id). Same publication protocol as the virt path.
-    BSP_AFFINITY.store(bsp_aff, Ordering::Release);
-    gic::enable_sgi(IPI_SGI);
-    capture_secondary_ctx();
-    cache::clean_range(&raw const SEC_CTX as usize, core::mem::size_of::<SecondaryCtx>());
-    cache::clean_invalidate_range(
-        &raw const SECONDARY_STACKS as usize,
-        core::mem::size_of::<[SecStack; MAX_CORES]>(),
-    );
-    for idx in 0..n_cores {
-        AFF_BY_INDEX[idx].store(aff_by_index[idx], Ordering::Relaxed);
-    }
-    N_CORES_PUB.store(n_cores as u32, Ordering::Release); { let a = _secondary_start_virt as *const () as usize; let b = __secondary_rust_virt as *const () as usize; let lo = a.min(b) & !0xfff; let hi = a.max(b).saturating_add(8192); cache::clean_range(lo, hi.saturating_sub(lo).min(1 << 20)); } // APTEXT (orin 13, 2026-09-05; orin-ledger A15): the AP fetches its entry code with the MMU OFF — straight from DRAM, no snoop — while the loader cleaned kernel text only to the PoU (`dc cvau`) and nothing here ever cleaned it to the PoC (SEC_CTX and the stacks are, two lines up; the CODE was not). A text line still dirty in the BSP's cache is garbage to the AP: a wild jump, `Exception reason=1 syndrome=0x82000010` (instruction abort from a lower EL, synchronous external abort), IOB/ACI RAS, `Powering off core` — 5 of 23 historical Orin boots and render3 2/2, all at exactly this step, none with any kernel code of theirs yet run; the toss is the BSP's eviction state and a relink changes it. Clean the MMU-off window's code to the PoC before the first CPU_ON: the asm stub through `__secondary_rust_virt`'s prologue and the inlined `enable_mmu_virt` (8 KiB past its entry is the honest over-bound; no symbol marks its end). ~80 KiB of `dc cvac`, once. REVIEW3 M1: the two symbols are in sections the linker does not order — the range is min..max of both, saturating, capped at 1 MiB, so a relink can never wrap the length. LINE-NEUTRAL append.
+    // never the MMU-off-spilled context id). The SAME shared publication protocol the virt definition
+    // runs, called at THIS path's own position: after the `/cpus` oracle has proven someone to start.
+    publish_secondary_ctx(bsp_aff);
+    publish_index_table(&aff_by_index, n_cores); { let a = _secondary_start_virt as *const () as usize; let b = __secondary_rust_virt as *const () as usize; let lo = a.min(b) & !0xfff; let hi = a.max(b).saturating_add(8192); cache::clean_range(lo, hi.saturating_sub(lo).min(1 << 20)); } // APTEXT (orin 13, 2026-09-05; orin-ledger A15): the AP fetches its entry code with the MMU OFF — straight from DRAM, no snoop — while the loader cleaned kernel text only to the PoU (`dc cvau`) and nothing here ever cleaned it to the PoC (SEC_CTX and the stacks are, two lines up; the CODE was not). A text line still dirty in the BSP's cache is garbage to the AP: a wild jump, `Exception reason=1 syndrome=0x82000010` (instruction abort from a lower EL, synchronous external abort), IOB/ACI RAS, `Powering off core` — 5 of 23 historical Orin boots and render3 2/2, all at exactly this step, none with any kernel code of theirs yet run; the toss is the BSP's eviction state and a relink changes it. Clean the MMU-off window's code to the PoC before the first CPU_ON: the asm stub through `__secondary_rust_virt`'s prologue and the inlined `enable_mmu_virt` (8 KiB past its entry is the honest over-bound; no symbol marks its end). ~80 KiB of `dc cvac`, once. REVIEW3 M1: the two symbols are in sections the linker does not order — the range is min..max of both, saturating, capped at 1 MiB, so a relink can never wrap the length. LINE-NEUTRAL append.
 
     let freq = timer::cntfrq();
     let freq = if freq == 0 { 62_500_000 } else { freq };
@@ -964,9 +1024,9 @@ pub fn start_secondaries_tegra(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64
 
     // Bounded wait (≤ ~500 ms each) for every secondary to publish readiness. A miss = WARNING +
     // continue (the graceful pre-fix mode: a core that never checks in never hangs the boot).
+    // NO `startable` gate — the DTB already IS the presence gate on this path.
     for idx in 1..n_cores {
-        let deadline = timer::cntpct() + freq / 2;
-        if !wait_until(deadline, || CORE_READY[idx].load(Ordering::Acquire)) {
+        if !await_core_ready(idx, freq) {
             serial_println!(
                 ":: AARCH64 SMP: ORIN-SMP-3 WARNING AP {} (aff={:#010x}) did not come online ::",
                 idx, aff_by_index[idx]
@@ -974,16 +1034,12 @@ pub fn start_secondaries_tegra(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64
         }
     }
 
-    // BSP -> AP proof: ping each online core and confirm its per-CPU IPI counter ticks.
+    // BSP -> AP proof (the shared `ping_core` handshake; this path's own verdict line).
     for idx in 1..n_cores {
         if !CORE_READY[idx].load(Ordering::Acquire) {
             continue;
         }
-        let before = percpu::cpu(idx).ipis.load(Ordering::Acquire);
-        gic::send_sgi(aff_by_index[idx] as usize, IPI_SGI);
-        let deadline = timer::cntpct() + freq / 10; // ~100 ms
-        let ok = wait_until(deadline, || percpu::cpu(idx).ipis.load(Ordering::Acquire) > before);
-        let after = percpu::cpu(idx).ipis.load(Ordering::Acquire);
+        let (ok, before, after) = ping_core(idx, aff_by_index[idx], freq);
         serial_println!(
             ":: AARCH64 SMP: ORIN-SMP-3 BSP -> AP {} SGI {} (count {} -> {}) ::",
             idx,
@@ -993,16 +1049,12 @@ pub fn start_secondaries_tegra(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64
         );
     }
 
-    // AP -> BSP proof: each online AP pinged the BSP once during bring-up (see the virt-path note on
-    // SGI coalescing — the verdict is "at least one landed", the BSP never self-sends SGI 0).
+    // AP -> BSP proof (the shared `await_bsp_ping` handshake; see its note on SGI coalescing — the
+    // verdict is "at least one landed", the BSP never self-sends SGI 0).
     let online = (1..n_cores)
         .filter(|&c| CORE_READY[c].load(Ordering::Acquire))
         .count();
-    let deadline = timer::cntpct() + freq / 10;
-    let ok = wait_until(deadline, || {
-        percpu::cpu(0).ipis.load(Ordering::Acquire) > bsp_ipi_before
-    });
-    let bsp_ipi_after = percpu::cpu(0).ipis.load(Ordering::Acquire);
+    let (ok, bsp_ipi_after) = await_bsp_ping(freq, bsp_ipi_before);
     serial_println!(
         ":: AARCH64 SMP: ORIN-SMP-3 AP -> BSP SGI {} ({} online APs pinged, {} delivered; BSP ipi {} -> {}) ::",
         if ok { "OK" } else { "TIMEOUT" },
@@ -1044,17 +1096,17 @@ pub fn start_secondaries_tegra(dtb_addr: u64, dtb_size: usize, ram_gib_mask: u64
 // publication state (`SEC_CTX`, `SECONDARY_STACKS`, `AFF_BY_INDEX`/`N_CORES_PUB`, `BSP_AFFINITY`)
 // and reports online via the private `CORE_READY` — so the probe needs EXACTLY two things from this
 // module: (a) a publish-only entry that performs the same pre-`CPU_ON` publication
-// `start_secondaries_tegra` does (ctx capture + table publication + cache maintenance — it issues
+// the `tegrasmp` `start_secondaries` does (ctx capture + table publication + cache maintenance — it issues
 // NO `CPU_ON`), and (b) read visibility on the online signal. Both are `smpprobe`-gated (plus
 // `tegra`), so the knob-off image — and every non-probe build — is byte-identical to baseline.
 
-/// Publish everything a REAL-entry secondary consumes, exactly as `start_secondaries_tegra` does
+/// Publish everything a REAL-entry secondary consumes, exactly as the `tegrasmp` `start_secondaries` does
 /// before its `CPU_ON` loop, and return the real entry PA (`_secondary_start_virt`). Publish-only:
 /// this function issues NO `CPU_ON` — the caller (`smpprobe.rs`) owns the wake and its record.
 ///
 /// `aff_by_index[0]` must be the BSP's packed affinity; `aff_by_index[1..]` the `CPU_ON` targets in
 /// linear-index order (the probe sources them from the DTB `/cpus` oracle, RIDER 5). Mirrors the
-/// `start_secondaries_tegra` publication protocol line-for-line: BSP affinity + SGI-0 receive
+/// `tegrasmp` `start_secondaries` publication protocol line-for-line: BSP affinity + SGI-0 receive
 /// enable, EL2 regime capture + clean to PoC, secondary-stack clean+invalidate, then the
 /// linear-index table with the `N_CORES_PUB` Release fence.
 #[cfg(all(feature = "tegra", feature = "smpprobe"))]
@@ -1163,7 +1215,7 @@ pub fn probe_core_online(idx: usize) -> bool {
 // configuration is type-checked by the `arm-tegra-smpmark` leg of `KERNEL_CFG_MATRIX`, per the
 // standing law that a cfg widen's gates must compile the configuration the widen turns ON.
 //
-// DARKWIN. Both BSP-side marks run inside `start_secondaries_tegra`, which `tegra_early_stop` calls
+// DARKWIN. Both BSP-side marks run inside the `tegrasmp` `start_secondaries`, which `tegra_early_stop` calls
 // (main.rs:2494) long after it arms the UARTC latch (main.rs:1906, immediately on `mmu_tegra::init`
 // returning), and the AP-side `:A:` runs later still. No mark can be dropped or counted by
 // `serial::tegra_guard`, and none can touch UARTC before the device window is mapped.

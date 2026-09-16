@@ -183,7 +183,7 @@ MISSION; x86 21.7 unregressed; knob-off byte-identity. Metal (visible spin) stag
 ### ORIN-SMP-DEFAULT — tegrasmp default-on, `UNAOS_NOTEGRASMP` opt-out
 
 **What it does.** Promotes the real 6-core Orin SMP kick-off (§ORIN-SMP-3's
-`smp_virt::start_secondaries_tegra` + `/cpus` enumerator) from the opt-*in*
+`smp_virt::start_secondaries` + `/cpus` enumerator) from the opt-*in*
 `UNAOS_TEGRASMP=1` to the tegra **default**, with a new opt-*out* `UNAOS_NOTEGRASMP=1`
 (PORTSW-1/SMOLNET default-ON/negative-knob policy). Build-scripts only — no kernel
 source, no scheduler logic: the `tegrasmp` cfg already fully gates the kick-off, so
@@ -976,7 +976,7 @@ SGI); **22** = RAPID 5-core burst × the replica stub (per-core stacks + per-cor
 `0x5304_01xx16`; plan printed first, burst print-free, poll after); **23** = REAL entry × rapid
 5-core — SMP-3 replayed under instrumentation (runs LAST, runbook-gated on 21+22 surviving). Lane
 amendment (Maestro-granted): `smp_virt.rs` gained exactly one `smpprobe`-gated publish-only API
-(`probe_publish_real_path` — the `start_secondaries_tegra` pre-`CPU_ON` publication, NO `CPU_ON`) +
+(`probe_publish_real_path` — the `start_secondaries` pre-`CPU_ON` publication, NO `CPU_ON`) +
 `probe_core_online` (`CORE_READY` read); both compiled out knob-off.
 
 **How it was tested:** `./arroyo check` both arches knob-off + armed 21/22/23; knob-off byte-identity
@@ -1439,7 +1439,7 @@ builds hash identical (`tegra:` count 109 unchanged); the armed image is a disti
 `tegra:` still 109 (the kick-off's records use the `AARCH64 SMP:` family, not `tegra:`, so validate
 the armed image by hash + `ORIN-SMP-3` string presence). QEMU cannot model the Tegra machine, so the
 metal verdict is the attended Orin bench (LC-orin + Peter) per `unaos/scripts/orin-smp3-bench.md`.
-`arch/aarch64/smp_virt.rs::start_secondaries_tegra` + `fdt_tegra::cpu_affinities` + `arch_arm64.md
+`arch/aarch64/smp_virt.rs::start_secondaries` + `fdt_tegra::cpu_affinities` + `arch_arm64.md
 §ORIN-SMP-3`.
 
 ## aarch64 SMP — ORIN-SMP-2: the JM5 `CPU_ON` firmware-wall INVESTIGATION probe (`UNAOS_SMPPROBE`) — 2026-07-15 ✅ BENCHED — **VERDICT (as amended by the SMP-3 bench): the CPU_ON-CALL fault is gone; the wall is the woken core's EARLY EXECUTION** `hw-jetson`
