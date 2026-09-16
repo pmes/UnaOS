@@ -46,8 +46,16 @@ WORKSPACE_DIR="$(cd "$(dirname "$0")" && pwd)"
 # source availability by construction. UNAOS_NOSRC=1 skips the step (tight media / CI speed). The
 # size-budgeted images (`fat-img`/`test-fat`, `vm-image`, `kernel8`) deliberately do NOT carry it.
 # See docs/dev/OS/10_INSTALL/source_along.md.
+# INSTALLTYPIST (2026-09-16) adds `test-install` to that list, and BOTH of its spellings: it is a
+# battery-class command in exactly the sense this block means — it re-proves a fixture set on a QEMU
+# wall — and the capture x86-install.spec was measured against is witness-armed
+# (`⚡ kernel features: witness,ehcihid,kbdwit,sdhcblk,installdemo,smolnet,wc,instgui,sdwrite,ahci`).
+# Leaving it out would build a DIFFERENT kernel from the one the pins were measured on while the
+# verb's own banner said so and nothing read it — the `esp-jetson` five-of-six-spellings defect at
+# :1342, one verb along. `test_install` re-execs itself through `"$0" test-install`, which re-enters
+# this case and self-arms, the same way `battery`'s sub-invocations do.
 case "${1:-}" in
-    test|test-x86|test_x86|test-fat|test_fat|test-arm|test-aarch64|kernel8-test|test-pi)
+    test|test-x86|test_x86|test-fat|test_fat|test-arm|test-aarch64|kernel8-test|test-pi|test-install|test_install)
         export UNAOS_WITNESS="${UNAOS_WITNESS:-1}" ;;
 esac
 
@@ -3582,14 +3590,39 @@ X86_FAT_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-fat.spec"
 #                     with a blank scratch, so the default medium's MBR — which x86-test.spec pins —
 #                     is not on this leg's wire. Five landed witnesses live only here, and before
 #                     this arm they were replayed against x86-test.spec, i.e. scored by nobody.
+#   UNAOS_INSTTYPIST  `./arroyo test-install` — x86-install.spec (INSTALLTYPIST, 2026-09-16), and
+#                     the only leg in this table whose subject is a KEY PATH rather than a boot
+#                     path: a QMP typist types `install` at the shell prompt and the spec pins what
+#                     the operator's own commands print. It arms the three knobs the SATA arm below
+#                     wants AND `UNAOS_PART_DISK`, which that arm refuses by name — so it is asked
+#                     FIRST, ahead of anything that reads UNAOS_AHCI.
 X86_AHCI_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-ahci.spec"
 X86_DEFAULT_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-default.spec"
+X86_INSTALL_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-install.spec"
 X86_REPLAY_SPEC=""   # path of the spec to replay, or "" when none describes this capture
 X86_REPLAY_WHY=""    # why there is none — printed verbatim in the skip line
 x86_pick_capture_spec() {
     X86_REPLAY_SPEC=""; X86_REPLAY_WHY=""
     if [ -n "${UNAOS_SELFHOST:-}" ]; then
         X86_REPLAY_WHY="UNAOS_SELFHOST is armed — test-selfhost packs SOURCE-ALONG onto the fixture, so this is not the capture x86-fat.spec was measured against. That lane's verdict is its own 'SELFHOST: src verified … -> PASS ::' witness."
+        return 0
+    fi
+    # INSTALLTYPIST: THE TYPED INSTALLER LEG, ASKED BEFORE THE SATA ARM — and the order is
+    # load-bearing, not stylistic. This leg arms UNAOS_AHCI (so the arm below would claim it) and
+    # UNAOS_PART_DISK (so that arm would then REFUSE it and print a skip line), and the capture
+    # would reach the replay step with no spec at all. `UNAOS_INSTTYPIST` is set only by
+    # `test_install`'s re-exec, so nothing else in this script can land here.
+    if [ -n "${UNAOS_INSTTYPIST:-}" ]; then
+        if [ -n "${UNAOS_WC:-}" ] && [ -n "${UNAOS_INSTGUI:-}" ] && [ -n "${UNAOS_INSTALLDEMO:-}" ] \
+           && [ -n "${UNAOS_AHCI:-}" ] && [ -n "${UNAOS_PART_DISK:-}" ]; then
+            X86_REPLAY_SPEC="$X86_INSTALL_SPEC"
+        else
+            # The same "a spec asserted on a capture nobody has watched pass is the defect" rule the
+            # arms below apply. Every pin in x86-install.spec is downstream of ONE of these five
+            # knobs: no PART_DISK means no five-slot fixture and therefore no refusal to pin, no
+            # INSTGUI means the `--gui` burst opens nothing, no WC means no compositor to open it in.
+            X86_REPLAY_WHY="UNAOS_INSTTYPIST is armed but a knob of the typist leg is missing (UNAOS_WC='${UNAOS_WC:-}' UNAOS_INSTGUI='${UNAOS_INSTGUI:-}' UNAOS_INSTALLDEMO='${UNAOS_INSTALLDEMO:-}' UNAOS_AHCI='${UNAOS_AHCI:-}' UNAOS_PART_DISK='${UNAOS_PART_DISK:-}') — x86-install.spec's pins are all downstream of the GPT fixture and the installer window. Use './arroyo test-install' for the gated run."
+        fi
         return 0
     fi
     # SPECROWS: THE SATA LEG IS ASKED FIRST, because its answer does not depend on UNAOS_FATIMG —
@@ -3678,6 +3711,82 @@ x86_spec_replay() { # $1 = the capture (target/serial.log)
     esac
 }
 
+# ── INSTALLTYPIST (rmbp, 2026-09-16): the installer's OPERATOR PATH, driven by a robot ───────────
+# THE HOLE THIS CLOSES, quoted from SPECROWS' STOP in `docs/dev/OS/rmbp-queue.md`: "INSTALLVERB gets
+# NO pin — `install_verb` (shell.rs:8271) is reachable only from the shell's typed \"install\" arm
+# (shell.rs:5509) and no QEMU leg types it, so its census is not on any gated wire; a typist fixture
+# is owed, not a looser regex." INSTALLVERB (f82bc1d2) built the verb and proved it with a shell
+# script OUTSIDE the repo poking `scripts/qmp_type.py` at a port by hand — real evidence, owned by
+# nobody, re-runnable by nobody. This function is that script, in the tree, as a step of a verb.
+#
+# THE KEYS ARE REAL KEYS. `qmp_type.py --text` sends one QMP `send-key` per character to the
+# emulated usb-kbd, so the bytes travel HID -> the shell's key path -> the parser, exactly as a
+# person typing. `:: [midden] cmd="install" -> Host verb=install ::` — pinned in x86-install.spec —
+# is the parser's own echo of the line it read, which is what makes a dropped character a DIFFERENT
+# capture rather than a missing one.
+#
+# ⚠ THE CHAIN NEVER RACES THE PROMPT, and blind sleeps are not how that is achieved. Each burst
+# holds until the guest's serial log carries a line the PREVIOUS burst caused — so a slow boot
+# delays the typist instead of desynchronising it, and a command that never ran stops the chain
+# where it broke instead of typing into a prompt that is not listening. The settle `--wait` on top
+# of each marker is INSTALLVERB's own measured value, kept verbatim: the marker is the correctness
+# gate, the wait is the timing that was watched go green.
+#   Every marker below was counted in INSTALLVERB's capture
+#   (`installverb-logs/run4-serial.log`, `LC_ALL=C grep -a -c -F`) and occurs EXACTLY ONCE, which is
+#   the property a substring marker needs — `wait_for_marker` answers "does the log contain this
+#   yet", and the log only grows, so a line that repeats would let a later burst fire on an earlier
+#   command's output. That is also why `[wc-x] instgui open win=` is NOT a marker here despite being
+#   the obvious one: it occurs TWICE (the installdemo fixture opens its own window at boot, line
+#   1696, before ours at 2390), and the count is the only thing that says so.
+#
+# ⚠ AND IT CANNOT LATCH ONTO A PREVIOUS RUN'S CAPTURE, which is a load-bearing property of the
+# ORDER and is written down here because nothing else states it. This typist is armed a few lines
+# ABOVE `rm -f "$SERIAL_LOG"`, so for a moment the stale log of the last run is still on disk and it
+# contains every marker below. What makes that harmless is that `qmp_type.py` CONNECTS TO QMP BEFORE
+# it reads the first marker, and the QMP socket does not exist until the builder starts QEMU — which
+# is after the `rm`. So the first byte this chain can ever read is a byte of THIS run. The same
+# ordering is what protects the XHCIKBD and XHCIHUB typists; it had not been said anywhere.
+#
+# NO NEW PRIMITIVE IN `qmp_type.py`: `--marker` / `--marker-log` / `--marker-timeout` have been the
+# wait-for-line gate since XHCIKBD, and the chain below is six ordinary invocations of it.
+# The typist's transcript lands BESIDE the capture (target/install-typist.log), never in it (LAWS §5).
+x86_install_typist() { # $1 = QMP port, $2 = the capture arroyo is about to write, $3 = the verb's wall
+    local port="$1" log="$2" secs="$3" budget
+    # One budget per step, sized so a step that will never see its marker still dies INSIDE the
+    # QEMU it is typing into — a typist outliving its guest reports a connect error and no verdict.
+    budget=$(( secs > 40 ? secs - 20 : secs ))
+    local -a q=(python3 "${WORKSPACE_DIR}/scripts/qmp_type.py" --port "$port" --connect-timeout 900
+                --marker-log "$log" --marker-timeout "$budget" --char-delay 0.10 --postwait 0)
+    # 1. `install` — the census. Held until the desktop is up AND the boot battery is over: the
+    #    zeolite line is the LAST one-shot fixture of the boot on both the plain and the WC wire,
+    #    the same pair XHCIKBD's typist waits on and for the same reason.
+    "${q[@]}" --marker '[crispy] theme=' --marker ':: zeolite: resolver bound :53' \
+              --wait 8 --text 'install' --enter || return $?
+    # 2. `install global 2` — the ACT, onto the fixture's one empty big-enough slot. Held on the
+    #    PREVIEW line burst 1 printed: it names the slot burst 2 is about to type, so this marker
+    #    is the census agreeing that the command below is the right one. (The census's literal last
+    #    line is an `ahci5` row, and the port NUMBER in it is the machine's, not the verb's —
+    #    a marker on it would be a bet on enumeration order.)
+    "${q[@]}" --marker ':: INSTALLVERB: preview target=global:part2' \
+              --wait 8 --text 'install global 2' --enter || return $?
+    # 3. `install global 1` — the GO-RED an operator can type: the APFS slot, which must refuse and
+    #    move no byte. Held on the LAST line of burst 2's output, so the write is complete and its
+    #    neighbour fingerprints are already compared before the next command lands.
+    "${q[@]}" --marker ':: INSTALLVERB: neighbours untouched=' \
+              --wait 14 --text 'install global 1' --enter || return $?
+    # 4. `install --gui` — the same engine through the compositor. Held on burst 3's refusal.
+    "${q[@]}" --marker ':: INSTALLVERB: install target=global:part1 err=NotBlank' \
+              --wait 8 --text 'install --gui' --enter || return $?
+    # 5. Enter — the census screen. Held on the verb's own `--gui` line; the window opens on the
+    #    next main-loop pass and the 5 s settle is the measured gap (request at capture line 2377,
+    #    `[wc-x] instgui open win=2` at 2390, this Enter's `selected row 0` at 2404).
+    "${q[@]}" --marker ':: INSTALLVERB: --gui' --wait 5 --enter || return $?
+    # 6. Enter — install-go, onto the UNDERSIZED slot, so the answer is a refusal and not a write.
+    #    Held on the census screen's own READ-ONLY line, which is Enter 5's terminal output.
+    "${q[@]}" --marker '[wc-x] instgui census step=1' --wait 6 --enter || return $?
+    echo "[typist] install sequence typed: install / install global 2 / install global 1 / install --gui + Enter + Enter" >&2
+}
+
 test_x86_64() {
     local secs="${1:-20}"
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP
@@ -3692,13 +3801,17 @@ test_x86_64() {
     # start). The shooter runs in the background: it retries the QMP connect while the builder
     # compiles, waits UNAOS_QMP_WAIT (default secs-3) after QEMU appears, then dumps — inside the
     # builder's kill window. `|| true` guards keep this additive under `set -e`.
-    local qmp_pid="" qmp_port="" typist_pid="" ptr_pid=""
+    local qmp_pid="" qmp_port="" typist_pid="" ptr_pid="" inst_pid=""
     # XHCIKBD (B45): the burst typist rides the SAME QMP socket as the shooter — one port, one
     # `-qmp` in UNAOS_QEMU_EXTRA, armed when either consumer wants it. Never a second QMP path.
     # XHCIHUB (SMALLFIX2): the POINTER typist is the third consumer of that one socket, and is
     # named here for the same reason — a leg that wants QMP and does not arm the port gets a
     # typist that retries a connect for its whole `--connect-timeout` and injects nothing.
-    if [ -n "${UNAOS_QMP_SHOT:-}" ] || [ -n "${UNAOS_XHCIKBD:-}" ] || [ -n "${UNAOS_XHCIHUB:-}" ]; then
+    # INSTALLTYPIST is the FOURTH consumer of that one socket and is named here for the same reason
+    # the third was: a leg that wants QMP and does not arm the port gets a typist that retries a
+    # connect for its whole `--connect-timeout` and types nothing.
+    if [ -n "${UNAOS_QMP_SHOT:-}" ] || [ -n "${UNAOS_XHCIKBD:-}" ] || [ -n "${UNAOS_XHCIHUB:-}" ] \
+       || [ -n "${UNAOS_INSTTYPIST:-}" ]; then
         qmp_port="${UNAOS_QMP_PORT:-4464}"
         while lsof -iTCP:"$qmp_port" -sTCP:LISTEN >/dev/null 2>&1; do qmp_port=$((qmp_port + 1)); done
         export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -qmp tcp:127.0.0.1:${qmp_port},server,nowait"
@@ -3803,6 +3916,18 @@ test_x86_64() {
     elif [ -n "${UNAOS_XHCIHUB:-}" ]; then
         echo -e "${COLOR_YELLOW}⚡ XHCIHUB pointer typist DISARMED (UNAOS_XHCIHUB_NOPTR=1) — the tablet will not move, evts=0, and the scorer below must red. This is the leg's go-red, not a pass.${COLOR_RESET}"
     fi
+    # INSTALLTYPIST — the install sequence, typed. See `x86_install_typist` above for the chain and
+    # why every hold is a marker rather than a sleep.
+    # ⚠ REMOVE THE SIDECAR FIRST, the PTRPRESS lesson three lines up: a disarmed arm writes no file
+    # and a stale transcript would then be read as this run's evidence. Unconditional, so the
+    # unarmed path clears it too.
+    rm -f "${WORKSPACE_DIR}/target/install-typist.log"
+    if [ -n "${UNAOS_INSTTYPIST:-}" ]; then
+        x86_install_typist "$qmp_port" "$SERIAL_LOG" "$secs" \
+            2> "${WORKSPACE_DIR}/target/install-typist.log" &
+        inst_pid=$!
+        echo -e "${COLOR_YELLOW}⚡ INSTALLTYPIST armed: port ${qmp_port}, 4 typed commands + 2 Enters, each held on a witness line the previous one printed; transcript -> target/install-typist.log${COLOR_RESET}"
+    fi
 
     echo -e "${COLOR_CYAN}⚡ Headless x86_64 test (${secs}s). Serial -> ${SERIAL_LOG}${COLOR_RESET}"
     rm -f "$SERIAL_LOG"
@@ -3819,6 +3944,7 @@ test_x86_64() {
     if [ -n "$qmp_pid" ]; then wait "$qmp_pid" 2>/dev/null || true; fi
     if [ -n "$typist_pid" ]; then wait "$typist_pid" 2>/dev/null || true; fi
     if [ -n "$ptr_pid" ]; then wait "$ptr_pid" 2>/dev/null || true; fi  # XHCIHUB — reaped like its two siblings; its exit code is for the transcript, the VERDICT is the wire's.
+    if [ -n "$inst_pid" ]; then wait "$inst_pid" 2>/dev/null || true; fi # INSTALLTYPIST — reaped like the three above. A typist that broke mid-chain leaves its markers unmet and the spec replay reds on the pins that never printed; the transcript says which burst stopped.
     # QEMU-FAST, SR7's owed half, now paid: `test` no longer sits out a blind wall. The wall lives
     # in builder/src/main.rs (the builder owns this QEMU, not this script), so the WAIT was plumbed
     # through there — `qemu_test_wall` runs the SAME `scripts/qemu_await.py` over the SAME spec the
@@ -7262,6 +7388,55 @@ test_selfhost() {
         exit 1
     fi
     scan_serial_faults "$log"
+}
+
+# INSTALLTYPIST: `./arroyo test-install [secs]` — THE INSTALLER, DRIVEN THE WAY AN OPERATOR DRIVES IT.
+#
+# WHAT IT IS. `test_fat`'s shape (arm the fixture, then hand the wall to `test_x86_64`, whose verdict
+# is this verb's verdict) with one thing added: while the guest boots, `x86_install_typist` types the
+# `install` sequence into it over QMP and holds each burst on a witness line the previous one
+# printed. The ordinary verdict chain then runs unchanged — `scan_serial_faults`, the TESTTRUNC
+# completion read, and the spec replay, which `x86_pick_capture_spec` routes to x86-install.spec.
+#
+# ⚠ THIS IS A GATE COMMAND THE SEAT RUNS ON THE FOLD, LIKE `test-fat` — NOT A LEG OF `check`.
+# `check_both` compiles both arches and runs the compile/QEMU legs of the default battery; this verb
+# boots a five-knob x86 machine with a GPT fixture attached and spends its whole wall typing, which
+# is minutes, and is the wrong shape for a type-check gate. It IS named in `check`'s spec-root
+# accounting, and that is the only way it appears there: GATE-SPECROOTS wants every `.spec` under
+# `scripts/specs/` to be named by a command, `X86_INSTALL_SPEC` names x86-install.spec in CODE at the
+# top of `x86_pick_capture_spec`'s block, and so the spec resolves GATED with no `# RUN-BY:` header.
+#
+# ⚠ THE RE-EXEC IS LOAD-BEARING and is `test_selfhost`'s lesson, not a copied idiom. This script's
+# knob -> feature mapping (`_feats`, top of file) is evaluated ONCE at script load, BEFORE dispatch,
+# so a knob exported from inside a lane function never reaches arroyo's own `cargo build`. All four
+# of the knobs below are `_feats` entries — `wc` (:793), `installdemo` (:624), `instgui` (:1001),
+# `ahci` (:2333) — so exporting them here without the re-exec would boot a kernel with the installer
+# compiled OUT while the banner said otherwise, and the leg could only ever report "nothing typed".
+# `UNAOS_INSTTYPIST` doubles as the re-exec's own guard and as the leg marker the spec picker reads.
+# It is a HOST knob in `arroyo` only — no kernel feature, no `_feats` entry, no fourth place to keep
+# in step — the same standing as `UNAOS_XHCIHUB_NOPTR`.
+#
+# UNAOS_QEMU_FULL=1 because this is an arc's DONE gate (LAWS §5): the typist's own chain is minutes
+# of wall and a graced exit could end the run between two bursts.
+test_install() {
+    local secs="${1:-180}"
+    if [ -z "${UNAOS_INSTTYPIST:-}" ]; then
+        exec env UNAOS_INSTTYPIST=1 UNAOS_WC=1 UNAOS_INSTGUI=1 UNAOS_INSTALLDEMO=1 UNAOS_AHCI=1 \
+                 UNAOS_PART_DISK=builder/part-fixture.img UNAOS_QEMU_FULL=1 \
+                 "$0" test-install "$secs"
+    fi
+    # THE FIXTURE IS THE GATE'S SUBJECT, so it is built here rather than assumed: a blank disk
+    # cannot refuse anything, and every refusal pinned in x86-install.spec is a fact about these
+    # five slots. `make-gpt-fixture.py` is deterministic and the builder copies the image afresh
+    # into `target/` on every run (main.rs:1126), so rebuilding it costs nothing and removes the
+    # one way this leg could measure a disk a previous run left behind.
+    echo -e "${COLOR_CYAN}⚡ INSTALLTYPIST: building the five-slot GPT fixture (foreign FAT / APFS / empty / ESP / undersized)...${COLOR_RESET}"
+    (cd "$WORKSPACE_DIR" && python3 scripts/make-gpt-fixture.py -o builder/part-fixture.img) || {
+        echo -e "${COLOR_RED}❌ test-install: the GPT fixture did not build — the leg has no disk to install onto. rc=1${COLOR_RESET}"
+        return 1
+    }
+    echo -e "${COLOR_CYAN}⚡ INSTALLTYPIST: booting the installer leg and typing the install sequence into it (${secs}s, full wall)${COLOR_RESET}"
+    test_x86_64 "$secs"
 }
 
 # aarch64 ESP for the Raspberry Pi 4 (UEFI / Path A). Copy onto a FAT32 SD card alongside the
@@ -10910,6 +11085,12 @@ case "${1:-}" in
     test-selfhost|test_selfhost|selfhost)
         test_selfhost "${2:-sf}" "${3:-180}"
         ;;
+    test-install|test_install)
+        # INSTALLTYPIST: the typed installer leg. Re-execs itself with the five knobs armed (see
+        # test_install), so this arm is entered twice per invocation and the second time carries
+        # UNAOS_INSTTYPIST=1. Fold-gate command, not a leg of `check`.
+        test_install "${2:-180}"
+        ;;
     kernel8|baremetal)
         kernel8
         ;;
@@ -10947,7 +11128,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|clean]"
+        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|clean]"
         exit 1
         ;;
 esac
