@@ -3720,7 +3720,20 @@ pub fn set_framebuffer_wc(fb_base: u64, fb_len: u64) {
         fb_base,
         fb_end
     );
-    // PHASE31WIT — the armed witness is LATCHED here and emitted later by `bar1exp_witness()` at
+    // FBWCWIT — the default arm's own t~0 print above is the twin PHASE31WIT left open: hoisted to
+    // `kernel_main`'s first statement same as the UC arm's, so it is equally invisible on the rMBP's
+    // FTDI-mirror carrier (drop-oldest, no replay until `ftdi:console-up`). The print stays — QEMU's
+    // 16550 sees it fine — but the facts also latch here and `fb_wc_witness()` (file tail, PHASE31WIT's
+    // `bar1exp_witness()` renamed to cover both arms — one caller, bootpace.rs) speaks them once from
+    // a caller that runs after the carrier exists.
+    #[cfg(not(feature = "bar1exp-uc"))]
+    {
+        FBWC_LEAVES.store(leaves, Ordering::Relaxed);
+        FBWC_LO.store(fb_base, Ordering::Relaxed);
+        FBWC_HI.store(fb_end, Ordering::Relaxed);
+        FBWC_ARMED.store(true, Ordering::Release);
+    }
+    // PHASE31WIT — the armed witness is LATCHED here and emitted later by `fb_wc_witness()` at
     // this file's tail. It used to `serial_println!` on this spot and was never once observed:
     // VPERF-WC hoisted this fn to `kernel_main`'s first statement (`BPACE: fb-wc t=0ms`), the bench
     // rMBP has no 16550, and its only carrier is the drop-oldest FTDI ring. See the tail block.
@@ -3919,7 +3932,7 @@ pub fn map_mmio_window(pa: u64, size: usize) {
 // which is the build that certainly emitted it.
 //
 // SO THE FIX IS NOT A BETTER STRING AT t=0. Any line emitted there is unobservable on this carrier
-// no matter what it says. The retype latches its facts here and `bar1exp_witness()` speaks them
+// no matter what it says. The retype latches its facts here and `fb_wc_witness()` speaks them
 // from `bootpace::service_dump` — ungated, main-loop, and demonstrably captured (`BPACE: total
 // gui=` lands at 23534 ms in the very capture that lost the t=0 lines).
 //
@@ -3934,6 +3947,18 @@ pub fn map_mmio_window(pa: u64, size: usize) {
 // survive the commit as a whole, and this block will not pretend otherwise: the CAPWIT re-emit and
 // the `CAP` raise in `drivers/xhci/ftdi.rs` are unconditional on every build, so the knob-off x86
 // image DID move. Stated, not left standing (the PANELOWN precedent in `video/fbcon.rs`).
+//
+// FBWCWIT (rmbp B114) — PHASE31WIT's own report left the twin open: the default (write-combining)
+// arm's `:: x86 fb-wc: retyped …` print sits at the exact same t~0 site (memory.rs, the retype's
+// tail) and is therefore lost to the identical FTDI drop-oldest ring for the identical reason. This
+// block now latches BOTH arms' facts (`FBWC_*` beside `BAR1EXP_*`, one per arm, mutually exclusive
+// by the same `#[cfg(feature = "bar1exp-uc")]` the retype itself branches on) and
+// `bar1exp_witness()` is renamed `fb_wc_witness()` to say so — one caller (`bootpace.rs`'s
+// `service_dump`, the CLOCK-X1 line), so the rename is free. The UC arm's line is UNCHANGED —
+// `:: x86 bar1exp: UC arm ARMED via=…` — so `banner-cert.sh`'s existing token needs no row edit;
+// the default arm gets its OWN new late line, `:: x86 fb-wc: ARM=wc leaves=<n> range=<lo>..<hi> ::`,
+// naming the arm explicitly since (unlike the UC line) `fb-wc` alone was already the t~0 prefix and
+// cannot double as a discriminator on its own.
 
 /// PHASE31WIT — leaves the UC retype actually flipped. `0` with [`BAR1EXP_ARMED`] set means the
 /// leaves were already UC on arrival, which is a `via=create` boot.
@@ -3953,13 +3978,29 @@ static BAR1EXP_ARMED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "bar1exp-uc")]
 static BAR1EXP_SAID: AtomicBool = AtomicBool::new(false);
 
-/// PHASE31WIT — emit the UC arm's witness once, from a caller that runs AFTER the console carrier
-/// exists. Call it freely and often; it is latched and costs one relaxed load per pass afterwards.
-///
-/// Compiles to an empty fn without `bar1exp-uc`, so the default build carries neither the statics
-/// nor the string and `banner-cert.sh`'s measured token stays a true discriminator of the armed
-/// image.
-pub fn bar1exp_witness() {
+/// FBWCWIT — the default arm's mirror of the four `BAR1EXP_*` statics above. Only one of the two
+/// families is ever compiled into a given image (same `#[cfg(feature = "bar1exp-uc")]` split the
+/// retype itself branches on), so there is never a race or a choice between them at runtime.
+#[cfg(not(feature = "bar1exp-uc"))]
+static FBWC_LEAVES: AtomicU32 = AtomicU32::new(0);
+/// FBWCWIT — the retyped span, as the default (WC) arm's retype saw it.
+#[cfg(not(feature = "bar1exp-uc"))]
+static FBWC_LO: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(feature = "bar1exp-uc"))]
+static FBWC_HI: AtomicU64 = AtomicU64::new(0);
+/// FBWCWIT — set once the default arm's retype has run.
+#[cfg(not(feature = "bar1exp-uc"))]
+static FBWC_ARMED: AtomicBool = AtomicBool::new(false);
+/// FBWCWIT — spent by the first emit, so the default arm's witness is exactly ONE line however many
+/// times the ledger re-dumps.
+#[cfg(not(feature = "bar1exp-uc"))]
+static FBWC_SAID: AtomicBool = AtomicBool::new(false);
+
+/// PHASE31WIT/FBWCWIT — emit whichever arm's witness this image carries, once, from a caller that
+/// runs AFTER the console carrier exists. Call it freely and often; each arm is latched and costs
+/// one relaxed load per pass once said. Renamed from `bar1exp_witness` (PHASE31WIT) when FBWCWIT
+/// gave the default arm the same treatment — the UC arm's own line is unchanged.
+pub fn fb_wc_witness() {
     #[cfg(feature = "bar1exp-uc")]
     {
         if !BAR1EXP_ARMED.load(Ordering::Acquire) {
@@ -3975,6 +4016,21 @@ pub fn bar1exp_witness() {
             leaves,
             BAR1EXP_LO.load(Ordering::Relaxed),
             BAR1EXP_HI.load(Ordering::Relaxed)
+        );
+    }
+    #[cfg(not(feature = "bar1exp-uc"))]
+    {
+        if !FBWC_ARMED.load(Ordering::Acquire) {
+            return; // the retype has not run yet — say nothing rather than print zeros
+        }
+        if FBWC_SAID.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        serial_println!(
+            ":: x86 fb-wc: ARM=wc leaves={} range={:#x}..{:#x} ::",
+            FBWC_LEAVES.load(Ordering::Relaxed),
+            FBWC_LO.load(Ordering::Relaxed),
+            FBWC_HI.load(Ordering::Relaxed)
         );
     }
 }
