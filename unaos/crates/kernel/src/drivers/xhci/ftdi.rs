@@ -78,7 +78,26 @@ pub const FTDI_DATA_8N1: u16 = 0x0008;
 /// The console does not come up until ~28.9 s (`ftdi:console-up`), so 4x is headroom against the
 /// pre-console log growing further, not against the present measurement.
 ///
-/// Cost: 256 KiB of `.bss`. It is a zero-initialised `static`, so it adds nothing to either kernel
+/// **1 MiB since PHASE31WIT (rmbp B112/B114) — 256 KiB was not enough either, and the paragraph
+/// above predicted the exact shape of the failure.** It said a saturated ring begins "mid-line, tens
+/// of KiB later, with both `fb-wc` … and `:: X86_64 Memory Init ::` gone". That is precisely what
+/// the 2026-09-16 flight-8/flight-9 capture shows at 256 KiB: replay spans of 260 958 bytes
+/// (flight 8) and 258 584 bytes (flight 9) against a 262 144-byte `CAP` — the ring pinned at
+/// capacity on BOTH boots independently, each replay starting mid-token. What it threw away was what
+/// a whole flight had been staked on: `:: x86 bar1exp: UC arm ARMED` (the UC experiment's only
+/// witness), the baseline's own `:: x86 fb-wc: retyped`, and the unconditional `:: video: WRITER
+/// seeded` — all three at ZERO hits across 11 265 captured lines.
+///
+/// 1 MiB is ~4x the measured pre-console volume: the margin becomes ~786 KiB (~4.0x) where 256 KiB
+/// delivered ~1 KiB (1.004x) — i.e. it was not a margin at all. The accounting below is unchanged in
+/// kind, only in magnitude, and the replay-time argument still holds: the ring replays what the boot
+/// actually printed, so no boot that was not already losing bytes drains any longer than it does
+/// today. A boot that genuinely filled 1 MiB would spend ~91 s draining at 115200 baud — but such a
+/// boot is, at 256 KiB, one that silently discards three quarters of itself, and between
+/// [`emit_verdict`] and the late `:: FTDI-CAP:` line that state is now loud on both channels rather
+/// than inferred from a line nobody was looking for.
+///
+/// Cost: 1 MiB of `.bss`. It is a zero-initialised `static`, so it adds nothing to either kernel
 /// image (`.bss (NOLOAD)` in `pi-baremetal.ld`, NOBITS in the x86 ELF) and nothing to the allocator,
 /// which does not exist yet when the first `_print` reaches [`mirror`].
 ///
@@ -90,7 +109,7 @@ pub const FTDI_DATA_8N1: u16 = 0x0008;
 /// unchanged — more 512-byte bulk-OUTs, each with the same budget the bench measures at
 /// `:: FTDI: tx pump budget=5387698040 used=91103400 … result=OK ::`, ~59x headroom, and no capture in
 /// the tree has ever logged `FTDI TX disabled`.
-const CAP: usize = 256 * 1024;
+const CAP: usize = 1024 * 1024;
 
 /// A fixed, heap-free circular byte buffer. The very first `_print`s predate the allocator, so the
 /// ring must be a `static` with an inline array — never `Vec`. Drop-oldest on overflow.
@@ -164,6 +183,14 @@ static VERDICT_DUE: AtomicBool = AtomicBool::new(true);
 /// overflow loses the head of the boot because the ring ran out of it. Folding them together is how a
 /// full ring would get to hide behind a quiet mutex.
 static ANNOUNCED_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// PHASE31WIT — bytes [`drain_into`] has handed to the cable since boot, i.e. the size of the replay
+/// a bench operator actually received. Compared against [`CAP`] it is the saturation test the
+/// flight-8/flight-9 capture had to be reconstructed by hand to perform.
+static REPLAYED: AtomicU64 = AtomicU64::new(0);
+
+/// PHASE31WIT — spent by the first late `:: FTDI-CAP:` line, so the verdict is exactly one line.
+static LATE_VERDICT_DUE: AtomicBool = AtomicBool::new(true);
 
 /// Lines staged for the cable but not yet copied into the capture ring.
 pub fn staged_in_flight() -> u64 {
@@ -441,7 +468,60 @@ pub unsafe fn drain_into(dst: *mut u8, max: usize) -> usize {
     }
     ring.head = (ring.head + n) % CAP;
     ring.len -= n;
+    // PHASE31WIT: count what the cable actually received, so `late_verdict` can state the replay
+    // size instead of leaving it to be reconstructed by measuring the capture file afterwards.
+    REPLAYED.fetch_add(n as u64, Ordering::Relaxed);
     n
+}
+
+/// PHASE31WIT — the capture's integrity verdict, said AGAIN and LATE, as an ordinary console line.
+///
+/// [`emit_verdict`] already writes a `:: FTDI-CAP:` line, and it is the right design for what it
+/// does: it goes straight into the DMA staging buffer, ahead of the replay, so it cannot itself
+/// evict the bytes it is reporting on. But it is therefore the FIRST thing on the cable — emitted at
+/// the instant the FTDI device comes up, which on a bench is before the operator's `cat
+/// /dev/ttyUSB0` has the port open. The 2026-09-16 flight-8/flight-9 capture proves the gap
+/// empirically: `FTDI-CAP` has ZERO hits across 11 265 lines and two boots, while the ring was
+/// pinned at capacity on both — the one line that existed to announce the loss was itself lost, to
+/// a different mechanism than the loss it was announcing.
+///
+/// So the verdict is said twice, on two channels with different failure modes: once ahead of the
+/// replay where it cannot be evicted, and once here, well inside the live stream, where a late-
+/// attaching operator and every log file will carry it. A diagnostic that can only be read by
+/// someone who was already watching is not a diagnostic.
+///
+/// WAITS FOR THE REPLAY TO FINISH (`ring.len == 0`) before speaking, and that is not politeness:
+/// fired on the first pass after the console goes live it would print `replayed=` at whatever the
+/// first drain happened to have moved — a number that says nothing about saturation, which is the
+/// one thing this line exists to report. An empty ring is the honest moment: everything the cable
+/// was owed is on it. The main loop drains every pass, so this is reached almost immediately; the
+/// verdict's own bytes re-fill the ring afterwards, which is harmless because the latch is spent.
+///
+/// Self-latched to one line; a relaxed load per pass thereafter. Takes no lock while printing — the
+/// ring read is a `try_lock` dropped before the `serial_println!`, because that print re-enters
+/// [`mirror`] and would otherwise meet a lock this function holds. A contended read simply leaves
+/// the verdict owed and retries on the next pass. A failed `try_lock` here means "could not read",
+/// never "nothing was lost" — the distinction [`dropped_bytes`] exists to preserve.
+pub fn late_verdict() {
+    if !LIVE.load(Ordering::Relaxed) || !LATE_VERDICT_DUE.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some((lost, pending)) = RING.try_lock().map(|r| (r.dropped, r.len)) else {
+        return;
+    };
+    if pending != 0 {
+        return; // the replay is still going out the cable — `replayed=` is not final yet
+    }
+    if !LATE_VERDICT_DUE.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    serial_println!(
+        ":: FTDI-CAP: replayed={} cap={} lost={} head_cut={} ::",
+        REPLAYED.load(Ordering::Relaxed),
+        CAP,
+        lost,
+        if lost > 0 { "y" } else { "n" }
+    );
 }
 
 // ── FTDIRX — the FTDI console learns to RECEIVE (rmbp A9, the x86 half of LEDGER S29) ────────────
