@@ -6315,6 +6315,181 @@ ensure_user_blob() {
 }
 
 check_both() {
+    # GATE-SELFSYNTAX (QUEUEGATE, rmbp 2026-09-16) — THE FIRST STATEMENT OF `check`. GATE-ROOTS'
+    # argument, applied to the SHELL: a script nobody's leg invokes is type-checked by nothing.
+    #
+    # MEASURED BEFORE IT WAS ADDED: `bash -n` appeared ZERO times in this script. Nothing checked
+    # the syntax of `arroyo` or of any `scripts/*.sh`, on any run, ever.
+    #
+    # THE INSTANCE (2026-09-16, the 12-branch fold). Git's common-suffix dedup made a union of two
+    # green `arroyo` edits lose a `return 1` and its `fi`. The seat found it with `bash -n` AFTER the
+    # commit, by hand, because it occurred to them; the same dedup three closing braces short in
+    # `xhci/mod.rs` was found the same way. A hand step that has to occur to somebody is the shape
+    # this tree keeps paying for.
+    #
+    # ⚠ THE `arroyo` HALF IS ALMOST A TAUTOLOGY TODAY, AND SAYING SO IS THE POINT — a gate oversold
+    # is the defect this file's own standard exists for. MEASURED, not reasoned: a copy of `arroyo`
+    # broken in a mid-file function body (`sha256_of`, line 6825) and a copy broken in the LAST case
+    # arm (line 10751) BOTH fail `bash -n` at rc=2 and BOTH fail `./arroyo state` at rc=2 — bash's
+    # own loader refuses this file whole, because its `case` dispatch is the last command and nothing
+    # before it exits. So on today's `arroyo` this line cannot fire on the copy being run, and it is
+    # kept for two reasons that are both real: it costs milliseconds, and the tautology is a property
+    # of the file's SHAPE rather than of bash — measured: `case "$1" in a) echo A; exit 0;; esac`
+    # followed by an unparseable function runs to rc=0, because `exit` stops the incremental read.
+    # One early `exit` added to this dispatch and the loader stops covering the tail.
+    #
+    # THE HALF THAT FIRES TODAY IS THE SCRIPTS. 22 `.sh` files live under `unaos/scripts/`, and 13 of
+    # them are named by NO leg of this gate: banner-cert, card-watch, fat-clusters, identify-card,
+    # knob-parity, make-fat-img, make-pi-img, make-pi-install-src, run_uefi, and the four
+    # bench-connect / card-watch scripts. A syntax defect in one of those is invisible to `check` and
+    # surfaces at the BENCH, with a board attached and an operator sitting in front of it — which is
+    # exactly the price GATE-ROOTS was written to stop paying for binaries. All 22 parse today.
+    local _ssrc=0
+    local _ssn=0
+    local _ssf
+    for _ssf in "$WORKSPACE_DIR/arroyo" $(find "$WORKSPACE_DIR/scripts" -name '*.sh' | sort); do
+        _ssn=$((_ssn + 1))
+        bash -n "$_ssf" || { echo -e "${COLOR_RED}  ❌ ${_ssf#$WORKSPACE_DIR/} does not parse${COLOR_RESET}"; _ssrc=1; }
+    done
+    if [ "$_ssrc" -eq 0 ]; then
+        echo -e "${COLOR_GREEN}  ✅ shell syntax (bash -n over arroyo and ${_ssn} file(s), every verb and every script)${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}❌ check FAILED — a shell script in this tree does not parse (see GATE-SELFSYNTAX above)${COLOR_RESET}"
+        return 1
+    fi
+
+    # GATE-BRACES (QUEUEGATE, rmbp 2026-09-16) — GATE-APPEND's defect class from the other side:
+    # GATE-APPEND catches a fold that put a statement where it compiles nothing, this catches a fold
+    # that left the file unparseable. It is WRITTEN UP beside GATE-APPEND and it RUNS here, before
+    # the first cargo line, and that is not a preference — `set -e` (arroyo:24) ends the script on a
+    # failing compile leg, so a brace gate placed down there could never fire for its own defect:
+    # a `.rs` three closing braces short IS a tree whose first cargo leg fails.
+    #
+    # THE INSTANCE. Git's union of two `.rs` tail-appends is subject to COMMON-SUFFIX DEDUP: when
+    # both sides end in the same `}\n}\n}` the merge keeps one copy, and the result is three closing
+    # braces short. It happened to `xhci/mod.rs` at the XHCIKBD fold and again on 2026-09-16, and on
+    # both days the thing that found it was brace arithmetic in a seat's own helper — no gate.
+    #
+    # ⛔ THIS IS A PRE-CHECK, NOT A JUDGE, and saying so is the point. `cargo check` — every leg
+    # below — is the real judge of whether the tree compiles, and this scan never overrules it: it
+    # answers one question (do the braces balance) and answers it in one pass, cheaply, with the
+    # FILE and the SIGN of the imbalance, before the first cargo line. What it buys is measured and
+    # written up in docs/dev/STRUCTURAL_GATES.md under GATE-BRACES: the compiler's own verdict on an
+    # unclosed delimiter points at the END of the file, not at the merge seam, and it arrives behind
+    # the whole crate walk. Naming the file and the sign is the difference between "rebuild that
+    # tail from BOTH parents" and reading a wall.
+    #
+    # THE PARSER IS DELIBERATELY SMALL and the false-positive half is where the work went: `{` and
+    # `}` are counted outside line comments, NESTED block comments, string literals, raw strings
+    # (`r#"…"#`, any hash count) and char literals — with the char-literal branch distinguishing
+    # `'{'` from a lifetime `'a`, which is the one that makes a naive counter cry on real Rust.
+    # MEASURED BEFORE IT SHIPPED, and the two numbers are different populations kept apart on
+    # purpose: the gate SCANS the 199 `.rs` files under `crates/`, and the parser was validated over
+    # 402 — those 199 plus the ring-3 roots (`libs/`, `handlers/`, `vessels/`, `tools/`) — with ZERO
+    # imbalanced in either. A gate that reds on a clean tree is a gate that gets commented out in a
+    # week. Widening the SCAN to ring-3 is a one-word change and is left to whoever wants it gated.
+    #
+    # Controls run before any verdict, on synthetic input, and assert BOTH directions — the shape
+    # that must fire, and three near-misses that must stay silent (an unmatched brace inside a
+    # string, inside a comment, and a `'{'` char literal beside a lifetime). rc 2 is NO VERDICT,
+    # and a gate that gave no verdict is not a pass.
+    local _brrc=0
+    python3 - "$WORKSPACE_DIR/crates" <<'BRACEPY' || _brrc=$?
+import os, sys
+
+def counts(src):
+    """({, }) counted outside comments, strings, raw strings and char literals."""
+    i, n, op, cl = 0, len(src), 0, 0
+    while i < n:
+        c = src[i]
+        if c == '/' and i + 1 < n and src[i + 1] == '/':
+            while i < n and src[i] != '\n':
+                i += 1
+            continue
+        if c == '/' and i + 1 < n and src[i + 1] == '*':
+            d, i = 1, i + 2          # Rust block comments NEST; a non-nesting scanner desyncs here
+            while i < n and d:
+                if src.startswith('/*', i): d, i = d + 1, i + 2
+                elif src.startswith('*/', i): d, i = d - 1, i + 2
+                else: i += 1
+            continue
+        if c == 'r' and i + 1 < n and src[i + 1] in '#"':
+            j, h = i + 1, 0
+            while j < n and src[j] == '#':
+                h, j = h + 1, j + 1
+            if j < n and src[j] == '"':
+                term = '"' + '#' * h
+                k = src.find(term, j + 1)
+                i = n if k < 0 else k + len(term)
+                continue
+        if c == '"':
+            i += 1
+            while i < n:
+                if src[i] == '\\': i += 2; continue
+                if src[i] == '"': i += 1; break
+                i += 1
+            continue
+        if c == "'":
+            # `'\n'` escape · `'{'` char literal · `'a` lifetime — the three shapes, in that order.
+            if i + 2 < n and src[i + 1] == '\\':
+                j = i + 2
+                while j < n and src[j] != "'":
+                    j += 1
+                i = j + 1
+                continue
+            if i + 2 < n and src[i + 2] == "'":
+                i += 3
+                continue
+            i += 1
+            continue
+        if c == '{': op += 1
+        elif c == '}': cl += 1
+        i += 1
+    return op, cl
+
+CTL = []
+if counts("fn a() { let s = \"}}}\"; }") != (1, 1):
+    CTL.append("an unmatched brace inside a STRING was counted")
+if counts("fn a() { /* } /* } */ } */ }") != (1, 1):
+    CTL.append("a brace inside a NESTED block comment was counted")
+if counts("fn a<'x>(b: &'x u8) { let c = '{'; let d = '}'; }") != (1, 1):
+    CTL.append("a char literal beside a lifetime was miscounted")
+if counts("fn a() { let s = r#\"}}\"#; }") != (1, 1):
+    CTL.append("a brace inside a RAW string was counted")
+if counts("fn a() { if b { c() }") != (2, 1):
+    CTL.append("the unbalanced fixture was not reported; the scan cannot fire")
+if CTL:
+    for c in CTL:
+        print("  GATE-BRACES: NO VERDICT — control failed: " + c)
+    sys.exit(2)
+
+bad = files = 0
+for root in sys.argv[1:]:
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d != "target"]
+        for f in fn:
+            if not f.endswith(".rs"):
+                continue
+            p = os.path.join(dp, f)
+            files += 1
+            o, c = counts(open(p, errors="replace").read())
+            if o != c:
+                print(f"  GATE-BRACES: {p}: {{={o} }}={c} ({o - c:+d}) — a union lost or duplicated a "
+                      f"tail (git's common-suffix dedup); rebuild the tail from BOTH parents")
+                bad += 1
+if bad:
+    print(f"  GATE-BRACES: {bad} file(s) of {files} do not balance")
+    sys.exit(1)
+print(f"  GATE-BRACES: {files} .rs file(s) balance")
+BRACEPY
+    if [ "$_brrc" -eq 0 ]; then
+        echo -e "${COLOR_GREEN}  ✅ braces (every .rs balances outside strings and comments)${COLOR_RESET}"
+    else
+        [ "$_brrc" -eq 2 ] && echo -e "${COLOR_RED}❌ braces gate gave NO VERDICT — its control did not fire, which is not a clean tree${COLOR_RESET}"
+        echo -e "${COLOR_RED}❌ check FAILED — a .rs file's braces do not balance (see GATE-BRACES above)${COLOR_RESET}"
+        return 1
+    fi
+
     # GATE-BLOB (above). BEFORE the first cargo invocation, not inside check_kernel_cfg: the DEFAULT
     # aarch64 leg below carries `tegra_el0` too whenever the operator's own knobs do
     # (`UNAOS_TEGRA_EL0=1 ./arroyo check`), so a blob supplied later would be supplied too late.
@@ -6505,6 +6680,15 @@ check_both() {
         echo -e "${COLOR_RED}❌ append-position gate FAILED${COLOR_RESET}"
         return 1
     fi
+
+    # GATE-BRACES lives at the TOP of this function, not here, and the reason is one line of this
+    # script: `set -e` (arroyo:24). A failing `cargo check` leg ENDS the script, so a brace gate
+    # placed after the compile legs could never fire for its own defect class — a `.rs` file three
+    # closing braces short is exactly a tree whose first cargo leg fails, and the run would be over
+    # before this point was reached. Measured, not reasoned: the mutation at crates/kernel/src/
+    # xhci/mod.rs ends the run inside the x86_64 leg. So it is a PRE-check in fact as well as in
+    # name. This pointer stays because GATE-APPEND is where a reader looking for the fold gates
+    # will come.
 
     if "$WORKSPACE_DIR/scripts/knob-hygiene.sh"; then
         echo -e "${COLOR_GREEN}  ✅ knob hygiene (no phantom cfg, no knob wired to nothing)${COLOR_RESET}"

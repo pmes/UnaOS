@@ -178,6 +178,15 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   `git apply && …` without `|| exit`. A fold of two green commits is a new configuration: re-gate the
   union, count conflict markers before `git add`, and `LC_ALL=C grep -a -o -F` every witness in the
   built artifact after any merge that touches one.
+- **Folds** (rmbp 2026-09-16, QUEUEGATE — 12 branches, six defects, every one CLEAN-auto-merged past
+  green gates): a fold is UNION BY ROW ID, never by hunk — a queue/ledger row present in both parents
+  is present in the result or the merge message names it `DROPPED <id>`; every `.rs` union is followed
+  by brace and line arithmetic against BOTH parents (git's common-suffix dedup eats a shared `}`/`fi`
+  tail and the file still reads right); `ledger-check.sh` runs BEFORE the commit, while `MERGE_HEAD`
+  still names the other side and a repair costs an edit, AND after it; and a resolving chain STOPS on
+  its own failure (`|| exit`, never a chain that commits past a red step). Enforcer: GATE-LEDGER's
+  FOLD SHAPES block (STATE-line uniqueness, row continuity, trailing text), GATE-BRACES and
+  GATE-SELFSYNTAX in `./arroyo check`; `docs/dev/STRUCTURAL_GATES.md`.
 - **Ledgers** (Peter 2026-09-05, R13–R15): one per arch (`docs/dev/OS/<track>-ledger.md`) and one
   shared (`docs/dev/LEDGER.md`), gated by `unaos/scripts/ledger-check.sh`. Every finding lands on
   exactly one list the turn it is found; the arc that fixes, flies or drops an item ticks it in the
