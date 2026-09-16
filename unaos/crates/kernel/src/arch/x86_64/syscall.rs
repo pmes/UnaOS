@@ -11529,8 +11529,16 @@ const CREATED_STAGED_SENTINEL: u32 = u32::MAX;
 /// (U9x's writable scratch). Index 2 = GROW.BIN (U10's growable file — a const `0xC1` seed + a disk chain head).
 /// A future file rides by adding its name here + a stage buffer + a `staged_bytes` arm.
 const STAGED_NAMES: [&str; 3] = ["HELLO.BIN", U9X_SCRATCH_NAME, U10_GROW_NAME];
-/// Upper bound on a SYS_OPEN name (the aarch64 twin's `MAX_NAME`): a dotted 8.3 name is at most 12 bytes.
-const MAX_NAME: usize = 12;
+/// Upper bound on a SYS_OPEN name (the aarch64 twin's `MAX_NAME`). DIRNS (LEDGER SO20) widened it
+/// from `12` — a dotted 8.3 LEAF — to `40`, a PATH, the SAME bound the aarch64 twin now carries; a
+/// shared ABI whose two arches disagreed on how long a name may be would not be one.
+///
+/// MEASURED COST, because this constant sizes a STATIC and not just a stack frame: `FILE_DYNNAME` is
+/// `[[[u8; MAX_NAME]; NFILE]; USER_SLOTS + 1]` = 13 x 4 x MAX_NAME, so it grows 624 -> 2080 bytes,
+/// **+1456 bytes of .bss**. Everything else this bounds (`namebuf` in `sys_open` / `sys_unlink` /
+/// `sys_fgrant`, the `canon` buffer in the dynamic path) is a stack array in one syscall frame, +28
+/// bytes each. Nothing else in the tree reads this constant.
+const MAX_NAME: usize = 40;
 
 /// The staged bytes behind staged-file `idx`, or `None` if that stage has not published. Index 0 =
 /// HELLO.BIN = `HELLO_BYTES[..HELLO_LEN]`, gated by `HELLO_STAGED` (Acquire, pairing with the
@@ -13040,7 +13048,15 @@ fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
     // tables are uppercase): a variant of ANY staged/U10 name is EXCLUDED here and falls to `-ENOENT` (its
     // canonical form is handled by the staged/U10 paths above, owner ACL intact), so ONLY a genuinely
     // arbitrary on-disk file — with no U10 name-id in any casing, hence never ownable — reaches the dynamic
-    // open. `open_dynamic_ondisk` then stores + resolves the canonical name (find_located matches it live).
+    // open. `open_dynamic_ondisk` then stores + resolves the canonical name (the resolver matches it live).
+    //
+    // DIRNS (LEDGER SO20): a name reaching here may now be a PATH, and the exclusion above still holds
+    // for one structural reason — `sys_open` has ALREADY collapsed a single-component path to its bare
+    // leaf, so anything that still carries a `/` has TWO OR MORE components and can never be byte-equal
+    // to a `STAGED_NAMES` / `U10_NAMES` entry in any casing. Uppercasing a path is uppercasing each of
+    // its 8.3 components, which is what the on-disk walk wants anyway. So the case-variant exclusion is
+    // unchanged for root names and vacuous for paths, and no spelling of an owned name reaches the
+    // dynamic arm. See `fs::vfs::el0_root_leaf` for why that collapse is the load-bearing part.
     #[cfg(feature = "irqstorage")]
     if s4_sync_storage() {
         let mut canon = [0u8; MAX_NAME];
@@ -13249,7 +13265,9 @@ fn open_dynamic_ondisk(row: usize, name: &str, mode: u64) -> i64 {
     // S8: honor mode bit0. A RW open endows CAP_WRITE (writes route through the overwrite-only dynamic branch
     // in `sys_write_file`); RO keeps the S7 read-only cap. No wstage EITHER way — a dynamic descriptor never
     // stages (FILE_WSTAGE stays 0); its writes go straight to the live volume, its reads straight off it.
-    let rw = mode & 1 != 0;
+    // DIRNS: `O_CREAT` implies write here as it does everywhere else in this ABI (you create to write) —
+    // the staged path and both arches' `rights` computation already read `mode & (1 | O_CREAT)`.
+    let rw = mode & (1 | O_CREAT) != 0;
     // STOR-1 S9: a RW dynamic descriptor must be a PRIVATE single-writer slot (mirroring `sys_open_staged`'s
     // SHARED_ROW refusal) — the S9 grow path advances the offset un-CAS'd on the single-writer assumption, and
     // SHARED_ROW is the multi-tenant kernel window where two tasks could race one writable descriptor. No
@@ -13260,9 +13278,25 @@ fn open_dynamic_ondisk(row: usize, name: &str, mode: u64) -> i64 {
     }
     // Resolve on the LIVE volume via the service task (blocks — the caller is a scheduled AP task, exactly as
     // `sys_read`/`sys_write_file` already block). Returns the on-disk size (`>= 0`) or a negative errno.
-    let rc = unsafe { crate::drivers::xhci::irqstorage::submit_stat(name.as_bytes()) };
+    // DIRNS: `name` is now a PATH, and the service task walks it through the SHARED resolver — this one
+    // call is what gives x86's `SYS_OPEN` a directory namespace.
+    let mut rc = unsafe { crate::drivers::xhci::irqstorage::submit_stat(name.as_bytes()) };
+    // DIRNS: O_CREAT on the dynamic path. Absent + `O_CREAT` -> create the leaf in its parent (the
+    // service task's `Create`, itself resolver-backed and idempotent), then RE-STAT to size the
+    // descriptor off what actually landed rather than off an assumption that it is 0 bytes. Ordered
+    // create-then-stat, both before any descriptor or handle is claimed, so the whole thing stays in
+    // `sys_open`'s "fallible lookups first, nothing claimed yet" window. A create that fails returns
+    // the create's own errno — `-ENOTDIR` for a parent that is a file is a better answer than the
+    // `-ENOENT` the flat path could only give.
+    if rc as i64 == ENOENT && mode & O_CREAT != 0 {
+        let crc = unsafe { crate::drivers::xhci::irqstorage::submit_create(name.as_bytes()) };
+        if crc < 0 {
+            return crc as i64;
+        }
+        rc = unsafe { crate::drivers::xhci::irqstorage::submit_stat(name.as_bytes()) };
+    }
     if rc < 0 {
-        return if rc as i64 == ENOENT { ENOENT } else { EIO }; // ENOENT (absent/dir) vs any other -> EIO
+        return if rc as i64 == ENOENT { ENOENT } else { rc as i64 }; // the service task's own errno
     }
     let size = rc as u32;
     // A dynamic descriptor: NO staged blob (CREATED sentinel, so `staged_bytes`/`STAGED_NAMES.get` fail closed
@@ -13312,6 +13346,18 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     let Ok(name) = core::str::from_utf8(&namebuf[..n]) else {
         return ENOENT; // a non-UTF-8 name matches no staged entry
     };
+    // DIRNS (LEDGER SO20) — THE ROOT-LEAF COLLAPSE, and it is a SECURITY step, not tidying. A path
+    // naming an entry directly in the volume root IS that bare leaf: `/HELLO.BIN` and `HELLO.BIN` are
+    // one name. Done HERE, before `staged_lookup` and before `u10_name_id`, because x86 keys its owner
+    // ACL by an index into the STATIC `U10_NAMES` table — a byte comparison against constant strings.
+    // Without the collapse, `"/OWNED.BIN"` would miss both tables (they hold no leading slash), fall
+    // through to the dynamic on-disk arm, and open the OWNED file as an arbitrary public one: a
+    // private file readable by respelling its name. That is the same hole the dynamic arm's uppercase
+    // canonicalisation was built to close, opened again by the path ABI, and closed again here. It
+    // also gives the collapse its OTHER job for free — an absolute name for a root file resolves
+    // through the staged/U10 paths exactly as the relative one always has, so no pre-DIRNS fixture
+    // changes behaviour and `/GROW.BIN` grows the same file `GROW.BIN` does.
+    let name = crate::fs::vfs::el0_root_leaf(name).unwrap_or(name);
     // 2. Read-only lookup — nothing claimed yet, so a miss returns cleanly. A name NOT in the staged set may be a
     //    live runtime-CREATED file in this row (idempotent / sibling open) or an O_CREAT target (U10 M2/M3); the
     //    dynamic-open path handles those, and returns -ENOENT if the name is neither. The STAGED path below is
@@ -23453,6 +23499,16 @@ fn u11m2_launcher(demo_cpu: usize) {
     // STOR-1 S7: witness an ARBITRARY on-disk file (README.TXT) opens + reads off the pre-stage set (knob-on FAT).
     #[cfg(feature = "irqstorage")]
     s7_openany_witness();
+    // DIRNS (LEDGER SO20): the EL0 path-open proof. Here, beside S7, because this is the pass that
+    // already has the service task up and a block device present — the two things a namespace on this
+    // arch needs — and because S7 is the fixture DIRNS generalises: S7 opened an arbitrary file in the
+    // ROOT, DIRNS opens one two directories down. Self-cleaning. Knob-off the `#[cfg]` erases the call.
+    // BOTH knobs: the fixture's body needs `irqstorage` (the namespace on x86 lives behind the storage
+    // service task) and its LINE needs `witness`. The call site's cfg must be the DEFINITION's cfg, or
+    // a `witness`-only leg names a function that was never compiled — which is exactly what the cfg
+    // coverage gate caught here, on five legs, before any of them reached an image.
+    #[cfg(all(feature = "witness", feature = "irqstorage"))]
+    dirns_witness();
     // STOR-1 S8: witness a RW open of an arbitrary on-disk file (S8W.BIN) overwriting live off the pre-stage set.
     #[cfg(feature = "irqstorage")]
     s8_write_witness();
@@ -23962,5 +24018,162 @@ fn lockfix_b1_selftest() {
         tries,
         real_w,
         if declined && recovered { "PASS" } else { "FAIL" }
+    );
+}
+
+// =====================================================================================================
+// DIRNS (LEDGER SO20) — the x86 wire fixture. File tail: nothing above this line moves.
+// =====================================================================================================
+
+/// **DIRNS (LEDGER SO20) — `SYS_OPEN` has a directory namespace on x86 too, and this is the proof.**
+///
+/// The S7/S8 kernel-side idiom, for the S7/S8 reason: this arch's `sys_open` reaches the live volume
+/// only through the storage service task, and the one part of the syscall a kernel-side caller cannot
+/// drive is the ring-3 NAME POINTER (CFU-1 owns that seam, with its own negative witness). So the
+/// fixture enters at `sys_open_dynamic` — what `sys_open` calls the instant `staged_lookup` misses —
+/// on a scratch PRIVATE address-space row, and everything below that point is production code: the
+/// canonicalisation, the exclusion checks, `open_dynamic_ondisk`, `submit_stat`/`submit_create`, the
+/// service task, and the SHARED resolver `arch/aarch64/syscall.rs` calls in-process.
+///
+/// * `abs` — `/README.TXT`, an ABSOLUTE path to a ROOT entry, resolves and sizes correctly. Before
+///   DIRNS this was `-ENOENT`: `find_located` compares 8.3 slots and no slot is spelled with a slash.
+/// * `nested` — `mkdir /DIRNSD`, `mkdir /DIRNSD/SUB`, create + grow `/DIRNSD/SUB/DEEP.TXT`, then OPEN
+///   IT BY PATH and read its bytes back off the live volume through the descriptor's own stored name.
+///   Two directory components, so it is a WALK; the read-back is what makes it a resolution proof
+///   rather than a "something returned a handle" proof.
+/// * `ocreat` — `O_CREAT` by path creates the leaf IN ITS PARENT (not in the root, which is the bug
+///   this leg exists to catch) and the re-stat sees it there.
+/// * `escape` — `/DIRNSD/SUB/../../README.TXT` is REFUSED and the boot-wide `..` count moves by one.
+///   The target is a file that IS openable by its own name, so the leg fails both if `..` is
+///   normalised and if the guard is dead.
+/// * `collapse` — the SECURITY leg. x86 keys its owner ACL by an index into the static `U10_NAMES`
+///   table, so the path ABI could have let `"/OWNED.BIN"` miss the owner check and then resolve on
+///   disk as an arbitrary public file. `sys_open` collapses a single-component path to its bare leaf
+///   before any table lookup; this asserts the property that fix rests on — every spelling of a root
+///   name still lands on the SAME `u10_name_id` — with a two-component control that must NOT collapse.
+///   Scope, stated: it proves the collapse FUNCTION, not its wiring into `sys_open` (that call sits
+///   above the user-copy seam this fixture cannot cross); the wiring is one line at `sys_open`'s head.
+/// * `acl=n/a(SO35)` — NOT a pass, an ABSENCE, named so nobody reads this line as an ACL proof. A
+///   path-created file on x86 has no owner row at all: `OWNED_FILES` is indexed by `U10_NAMES` name-id
+///   and a path has none. DIRNS shipped the namespace without owner attributes on this arch; the
+///   re-key is LEDGER SO35's and is not this arc. aarch64's `acl=refused` leg is the real one.
+///
+/// Self-cleaning at both ends (the files deleted, the directories removed through `RmDir`), so the
+/// volume is left as found and the fixture is idempotent across boots and power cuts.
+#[cfg(all(feature = "witness", feature = "irqstorage"))]
+fn dirns_witness() {
+    use crate::drivers::xhci::irqstorage as st;
+    // Gate: the namespace on x86 lives behind the service task. Off / no FAT -> silent skip, exactly
+    // as S7/S8 do, so the knob-off chain stays byte-identical.
+    if !s4_sync_storage() {
+        return;
+    }
+    const ABS: &str = "/README.TXT"; // the S7 target, reached here by ABSOLUTE path
+    const DIR1: &str = "/DIRNSD";
+    const DIR2: &str = "/DIRNSD/SUB";
+    const NESTED: &str = "/DIRNSD/SUB/DEEP.TXT";
+    const FRESH: &str = "/DIRNSD/SUB/NEW.TXT";
+    const ESCAPE: &str = "/DIRNSD/SUB/../../README.TXT";
+    const BODY: [u8; 20] = *b"DIRNS-NESTED-PAYLOAD";
+
+    // --- setup: build the tree through the service task (roster row 3, the single writer). ---------
+    let scrub = || unsafe {
+        st::submit_delete(NESTED.as_bytes());
+        st::submit_delete(FRESH.as_bytes());
+        st::submit_rmdir(DIR2.as_bytes());
+        st::submit_rmdir(DIR1.as_bytes());
+    };
+    scrub(); // a card that kept the tree from a prior boot starts clean
+    let md1 = unsafe { st::submit_mkdir(DIR1.as_bytes()) };
+    let md2 = unsafe { st::submit_mkdir(DIR2.as_bytes()) };
+    let cr = unsafe { st::submit_create(NESTED.as_bytes()) };
+    let mut seed = BODY;
+    let gr = unsafe { st::submit_grow(NESTED.as_bytes(), 0, seed.as_mut_ptr(), seed.len()) };
+    let setup_ok = md1 == 0 && md2 == 0 && cr == 0 && gr == BODY.len() as i32;
+
+    let Some(r) = crate::arch::memory::alloc_user_space() else {
+        return; // no scratch address space — silent skip (the S7 idiom)
+    };
+
+    // --- leg 1: abs — an ABSOLUTE path to a ROOT entry. --------------------------------------------
+    let h_abs = sys_open_dynamic(r, ABS, 0);
+    let abs_ok = h_abs >= 0;
+
+    // --- leg 2: nested — open the two-component path and read its bytes back. ----------------------
+    let h_n = sys_open_dynamic(r, NESTED, 0);
+    let mut n_size: u32 = 0;
+    let mut n_name_ok = false;
+    let mut n_read_ok = false;
+    if h_n >= 0 {
+        if let Ok(HandleTarget::File(file_id)) = handle_resolve(r, h_n as u64, CAP_READ) {
+            if let Some(fid) = file_desc_validate(r, file_id) {
+                n_size = FILE_SIZE[r][fid].load(Ordering::Acquire);
+                let mut nb = [0u8; MAX_NAME];
+                let nl = dyn_name_get(r, fid, &mut nb);
+                // The descriptor stores the CANONICAL (uppercased) path it resolved through — the
+                // WHOLE path, not a leaf, which is the byte-level statement that x86 descriptors now
+                // carry a namespace. `NESTED` is already uppercase, so it IS the canonical form.
+                n_name_ok = nl == NESTED.len() && &nb[..nl] == NESTED.as_bytes();
+                let mut kbuf = [0u8; BODY.len()];
+                let rn = unsafe {
+                    st::submit_read_file(&nb[..nl], 0, kbuf.as_mut_ptr(), BODY.len())
+                };
+                n_read_ok = rn == BODY.len() as i32 && kbuf == BODY;
+            }
+        }
+    }
+    // THE CONTROL, and it is the difference between a leg that can fail and a leg that cannot.
+    // MEASURED, not anticipated: the first go-red (`el0_walk`'s parent pinned to the root) left
+    // `nested=ok`, because the fixture's SETUP walks the same resolver the check does — a root-pinned
+    // build creates DEEP.TXT in the ROOT and then reads it back from the ROOT, self-consistently. So
+    // the leg also asserts the leaf is NOT reachable as a bare root name. Under the mutation that
+    // stat succeeds and `nested` goes FAIL, which is what the leg is for.
+    let root_alias = unsafe { st::submit_stat(b"DEEP.TXT") } >= 0;
+    let nested_ok =
+        setup_ok && h_n >= 0 && n_size == BODY.len() as u32 && n_name_ok && n_read_ok && !root_alias;
+
+    // --- leg 3: ocreat — O_CREAT by path lands the leaf in its PARENT, not in the root. ------------
+    let h_c = sys_open_dynamic(r, FRESH, O_CREAT);
+    let in_parent = unsafe { st::submit_stat(FRESH.as_bytes()) } >= 0;
+    let in_root = unsafe { st::submit_stat(b"NEW.TXT") } >= 0; // must NOT have landed here
+    let ocreat_ok = h_c >= 0 && in_parent && !in_root;
+
+    // --- leg 4: escape — `..` refused, and the boot-wide guard count MOVED. ------------------------
+    let esc_before = crate::fs::vfs::el0_escape_refusals();
+    let h_e = sys_open_dynamic(r, ESCAPE, 0);
+    let esc_after = crate::fs::vfs::el0_escape_refusals();
+    let escape_refused = h_e < 0 && esc_after == esc_before + 1;
+
+    // --- leg 5: collapse — every spelling of a root name keeps its owner-ACL name-id. --------------
+    let leaf_slash = crate::fs::vfs::el0_root_leaf("/OWNED.BIN");
+    let leaf_bare = crate::fs::vfs::el0_root_leaf("OWNED.BIN");
+    let control = crate::fs::vfs::el0_root_leaf(NESTED); // two components — must NOT collapse
+    let collapse_ok = match (leaf_slash, leaf_bare) {
+        (Some(a), Some(b)) => {
+            a == b && u10_name_id(a).is_some() && u10_name_id(a) == u10_name_id("OWNED.BIN")
+        }
+        _ => false,
+    } && control.is_none();
+
+    // Teardown: the scratch row through the real funnel, then the tree.
+    crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(r));
+    scrub();
+    let gone = unsafe { st::submit_stat(NESTED.as_bytes()) } < 0;
+
+    let pass = abs_ok && nested_ok && ocreat_ok && escape_refused && collapse_ok && gone;
+    serial_println!(
+        ":: DIRNS: abs={} nested={} ocreat={} escape={} collapse={} acl=n/a(SO35) (setup={} size={} root_alias={} esc={}->{} cleaned={}) -> {} ::",
+        if abs_ok { "ok" } else { "FAIL" },
+        if nested_ok { "ok" } else { "FAIL" },
+        if ocreat_ok { "ok" } else { "FAIL" },
+        if escape_refused { "refused" } else { "FAIL" },
+        if collapse_ok { "ok" } else { "FAIL" },
+        setup_ok,
+        n_size,
+        root_alias,
+        esc_before,
+        esc_after,
+        gone,
+        if pass { "PASS" } else { "FAIL" }
     );
 }
