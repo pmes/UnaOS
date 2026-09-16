@@ -970,6 +970,49 @@ fn main() {
     } else {
         stick_image
     };
+    // PARTINSTALL: UNAOS_PART_DISK=<path> backs the usb-storage slot with a PRE-PARTITIONED GPT disk
+    // instead of the blank scratch above — the fixture `scripts/make-gpt-fixture.py` builds, carrying
+    // a foreign FAT volume, an APFS-signature volume, an empty target, an ESP-typed slot and an
+    // undersized slot. That is the shape of the disk Peter will hand the installer on the rMBP (an
+    // internal SSD he partitioned from Disk Utility, with a foreign volume still on it), and it is
+    // the only way to exercise the refusals: a blank disk cannot refuse anything.
+    //
+    // WHY IT REUSES THE usb-storage SLOT rather than attaching a second USB disk: the block layer is
+    // single-device over xHCI here (the UNAOS_INSTALLDEMO note above), so a genuinely-second
+    // usb-storage would need multi-device support this arc does not build. The boot ESP stays on the
+    // separate `ide-hd` at bootindex=0, so the fixture is still NOT the boot device and INSTALL-SELF
+    // is still asked about a disk it can answer for.
+    //
+    // A FRESH COPY EVERY RUN, into target/: the fixture is written to by design, and a leg that
+    // mutated the checked-in image would pass once and then measure a disk the previous run left
+    // behind — the re-census and the neighbours-untouched sha would both be reading yesterday's
+    // result. Copy, never open in place.
+    //
+    // BUILDER KNOB, not a kernel feature: it changes what QEMU attaches and adds not one byte to any
+    // image, so the four-place knob wiring (arroyo map / builder read / k8-reach.registry row /
+    // arm_features strip) does not apply — the same standing as UNAOS_AHCI_DISK below. The KERNEL
+    // half of this arc rides the existing `installdemo` feature and introduces no knob of its own.
+    // UNSET => not one argument changes and a default run is byte-identical.
+    let stick_image = match std::env::var("UNAOS_PART_DISK") {
+        Ok(src) => {
+            let src = if src.is_empty() {
+                workspace_dir.join("builder/part-fixture.img")
+            } else {
+                let p = std::path::PathBuf::from(&src);
+                if p.is_relative() { workspace_dir.join(p) } else { p }
+            };
+            if !src.exists() {
+                panic!("UNAOS_PART_DISK set but {} is missing — run \
+                        `python3 scripts/make-gpt-fixture.py` from unaos/ first", src.display());
+            }
+            let dst = target_dir.join("partfixture.img");
+            std::fs::copy(&src, &dst).unwrap();
+            println!("   UNAOS_PART_DISK: fresh copy of the GPT fixture {} -> {} (partition-install target; overrides the blank scratch)",
+                     src.display(), dst.display());
+            dst
+        }
+        Err(_) => stick_image,
+    };
     if stick_image != usb_image && !stick_image.exists() {
         panic!("UNAOS_FATIMG set but {} is missing — run `./arroyo fat-img` first",
             stick_image.display());

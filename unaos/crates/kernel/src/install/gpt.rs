@@ -300,3 +300,228 @@ pub fn verify_gpt<T: InstallTarget>(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// PARTINSTALL — the GPT READER / EDITOR, beside the writer above.
+//
+// Everything above this line LAYS a new table over a blank disk. This half READS a table that is
+// already there and, in one narrowly-scoped case, edits ONE field of it. The two halves share the
+// layout constants and `hash::crc32` on purpose: a reader that re-derived the offsets would be a
+// second spec of the same format, and the first divergence between them would be silent.
+//
+// APPENDED AT THE TAIL, deliberately (LAWS §5, byte identity): a `#[cfg]`'d block inserted mid-file
+// still shifts every `panic::Location` line below it, so new code goes after the last existing one.
+//
+// THE EDITOR'S SCOPE. `set_entry_type_guid` changes a partition entry's TYPE GUID and nothing else.
+// It is the only write in this arc that touches the partition tables at all, it is off by default
+// (`--as-esp`), and it rewrites BOTH headers and BOTH array copies with fresh CRCs so a table that
+// validated before the edit validates after it — a half-edited GPT is worse than an unedited one.
+// It never moves a boundary, never adds or removes an entry, and refuses an index that is not
+// already in use.
+// ---------------------------------------------------------------------------------------------
+
+/// The EFI System Partition type GUID, for callers that must recognise an ESP they did not write.
+pub const ESP_TYPE_GUID: [u8; 16] = EFI_SYSTEM_TYPE_GUID;
+/// The Microsoft Basic Data type GUID — what a Disk-Utility-made data partition carries, and what
+/// the partition installer leaves a target as unless the operator asks for `--as-esp`.
+pub const DATA_TYPE_GUID: [u8; 16] = BASIC_DATA_TYPE_GUID;
+
+/// One IN-USE entry of an existing GPT, as read off the medium.
+#[derive(Clone, Copy)]
+pub struct GptEntryView {
+    /// Position in the 128-slot array — the number the operator names, and the number the witness
+    /// prints. Slot position, never "the nth non-empty entry": those differ on a real disk the
+    /// moment a partition is deleted, and a target named by the wrong one is the whole hazard.
+    pub index: u32,
+    pub type_guid: [u8; 16],
+    pub first_lba: u64,
+    pub last_lba: u64, // inclusive
+}
+
+impl GptEntryView {
+    pub fn sectors(&self) -> u64 {
+        self.last_lba - self.first_lba + 1
+    }
+    pub fn is_esp(&self) -> bool {
+        self.type_guid == EFI_SYSTEM_TYPE_GUID
+    }
+    /// The first four bytes of the type GUID, the short form the census line prints. Enough to tell
+    /// ESP from Basic Data from APFS at a glance; the full GUID is on the medium for anyone who
+    /// needs it.
+    pub fn type_short(&self) -> u32 {
+        u32::from_le_bytes([
+            self.type_guid[0],
+            self.type_guid[1],
+            self.type_guid[2],
+            self.type_guid[3],
+        ])
+    }
+}
+
+/// An existing GPT, parsed and CRC-validated off a target.
+pub struct GptTable {
+    pub entries: alloc::vec::Vec<GptEntryView>,
+    pub first_usable: u64,
+    pub last_usable: u64,
+    pub total_sectors: u64,
+}
+
+/// Read and VALIDATE the primary GPT: `EFI PART`, the header CRC over its 92 declared bytes with
+/// the CRC field zeroed, the entry-array CRC, and the array geometry. A table that does not
+/// validate is not a table — this returns `VerifyFailed` rather than handing back entries parsed
+/// out of bytes whose integrity nothing vouched for.
+///
+/// Returns only the IN-USE entries (a zero type GUID is an empty slot per UEFI 2.x §5.3.3), each
+/// carrying its slot index.
+pub fn read_table<T: InstallTarget>(t: &T) -> Result<GptTable, InstallError> {
+    let total_sectors = t.capacity_sectors();
+    if total_sectors < 2 + GPT_ARRAY_SECTORS + 1 {
+        return Err(InstallError::TooSmall);
+    }
+
+    let mut h = [0u8; SECTOR];
+    t.read_sectors(1, &mut h)?;
+    if &h[0..8] != b"EFI PART" {
+        return Err(InstallError::VerifyFailed);
+    }
+    let hdr_size = u32le(&h, 12) as usize;
+    if hdr_size < 92 || hdr_size > SECTOR {
+        return Err(InstallError::VerifyFailed);
+    }
+    let stored = u32le(&h, 16);
+    h[16..20].copy_from_slice(&0u32.to_le_bytes());
+    if super::hash::crc32(&h[0..hdr_size]) != stored {
+        return Err(InstallError::VerifyFailed);
+    }
+
+    let first_usable = u64le(&h, 40);
+    let last_usable = u64le(&h, 48);
+    let entries_lba = u64le(&h, 72);
+    let num_entries = u32le(&h, 80);
+    let entry_size = u32le(&h, 84);
+    let entries_crc = u32le(&h, 88);
+    // Bound every geometry field before it is used as a length or an LBA: these come off the medium
+    // and a hostile or corrupt table must not be able to steer a read.
+    if entry_size < 128 || entry_size % 8 != 0 || num_entries == 0 || num_entries > 512 {
+        return Err(InstallError::VerifyFailed);
+    }
+    let array_bytes = num_entries as u64 * entry_size as u64;
+    let array_sectors = array_bytes.div_ceil(SECTOR as u64);
+    if entries_lba < 2 || entries_lba + array_sectors > total_sectors {
+        return Err(InstallError::VerifyFailed);
+    }
+    if first_usable >= last_usable || last_usable >= total_sectors {
+        return Err(InstallError::VerifyFailed);
+    }
+
+    let mut raw = alloc::vec![0u8; (array_sectors * SECTOR as u64) as usize];
+    t.read_sectors(entries_lba, &mut raw)?;
+    if super::hash::crc32(&raw[..array_bytes as usize]) != entries_crc {
+        return Err(InstallError::VerifyFailed);
+    }
+
+    let mut entries = alloc::vec::Vec::new();
+    for i in 0..num_entries {
+        let o = (i as usize) * entry_size as usize;
+        let e = &raw[o..o + entry_size as usize];
+        if e[0..16].iter().all(|&b| b == 0) {
+            continue; // unused slot
+        }
+        let first_lba = u64le(e, 32);
+        let last_lba = u64le(e, 40);
+        // An entry whose extent is nonsense, or which escapes the usable range, invalidates the
+        // table: the installer is about to reason about "which partition is which" off these
+        // numbers, and a reader that quietly dropped a bad one would shrink the census it uses to
+        // decide whether the disk carries foreign volumes.
+        if last_lba < first_lba || first_lba < first_usable || last_lba > last_usable {
+            return Err(InstallError::VerifyFailed);
+        }
+        let mut type_guid = [0u8; 16];
+        type_guid.copy_from_slice(&e[0..16]);
+        entries.push(GptEntryView { index: i, type_guid, first_lba, last_lba });
+    }
+
+    Ok(GptTable { entries, first_usable, last_usable, total_sectors })
+}
+
+/// THE ONE PARTITION-TABLE WRITE THIS ARC MAKES, and it is off by default.
+///
+/// Set slot `index`'s TYPE GUID to `type_guid`, leaving every other byte of the table — boundaries,
+/// unique GUIDs, names, attributes, the other 127 slots — exactly as found. Both array copies and
+/// both headers are rewritten with recomputed CRCs, then the whole table is re-read and
+/// re-validated through [`read_table`] before this returns Ok, so the medium is never left carrying
+/// a table whose CRC does not match its contents.
+///
+/// Refuses an unused slot: turning an empty entry into a typed one would be CREATING a partition,
+/// which is the operator's act in Disk Utility, not ours.
+pub fn set_entry_type_guid<T: InstallTarget>(
+    t: &mut T,
+    index: u32,
+    type_guid: &[u8; 16],
+) -> Result<(), InstallError> {
+    let total_sectors = t.capacity_sectors();
+
+    // Re-read the primary header for the array geometry AND for every field the rebuilt headers
+    // must preserve. Nothing here is remembered from an earlier call: the table on the medium at
+    // this instant is the only authority.
+    let mut h = [0u8; SECTOR];
+    t.read_sectors(1, &mut h)?;
+    if &h[0..8] != b"EFI PART" {
+        return Err(InstallError::VerifyFailed);
+    }
+    let hdr_size = u32le(&h, 12) as usize;
+    if hdr_size < 92 || hdr_size > SECTOR {
+        return Err(InstallError::VerifyFailed);
+    }
+    let first_usable = u64le(&h, 40);
+    let last_usable = u64le(&h, 48);
+    let p_entries_lba = u64le(&h, 72);
+    let num_entries = u32le(&h, 80);
+    let entry_size = u32le(&h, 84);
+    if index >= num_entries || entry_size < 128 || entry_size % 8 != 0 || num_entries > 512 {
+        return Err(InstallError::BadArg);
+    }
+    let mut disk_guid = [0u8; 16];
+    disk_guid.copy_from_slice(&h[56..72]);
+
+    let array_bytes = num_entries as usize * entry_size as usize;
+    let array_sectors = (array_bytes as u64).div_ceil(SECTOR as u64);
+    let backup_header_lba = total_sectors - 1;
+    let backup_array_lba = total_sectors - 1 - array_sectors;
+    if p_entries_lba < 2 || p_entries_lba + array_sectors > backup_array_lba {
+        return Err(InstallError::VerifyFailed);
+    }
+
+    let mut raw = alloc::vec![0u8; (array_sectors * SECTOR as u64) as usize];
+    t.read_sectors(p_entries_lba, &mut raw)?;
+    let o = index as usize * entry_size as usize;
+    if raw[o..o + 16].iter().all(|&b| b == 0) {
+        return Err(InstallError::BadArg); // an unused slot is not ours to type
+    }
+    raw[o..o + 16].copy_from_slice(type_guid);
+    let entries_crc = super::hash::crc32(&raw[..array_bytes]);
+
+    // Order matters on a medium that can lose power mid-sequence: write both ARRAYS first, then the
+    // headers that point at them. A header written before its array would name a CRC the array does
+    // not yet carry; this order's worst interruption leaves the OLD headers over NEW arrays, which
+    // fails CRC loudly instead of validating against stale contents.
+    t.write_sectors(p_entries_lba, &raw)?;
+    t.write_sectors(backup_array_lba, &raw)?;
+    let primary = build_header(
+        1, backup_header_lba, first_usable, last_usable, &disk_guid, p_entries_lba, entries_crc,
+    );
+    t.write_sectors(1, &primary)?;
+    let backup = build_header(
+        backup_header_lba, 1, first_usable, last_usable, &disk_guid, backup_array_lba, entries_crc,
+    );
+    t.write_sectors(backup_header_lba, &backup)?;
+
+    // Parse-back: the edited table must validate off the medium, and the slot must read back as the
+    // type we asked for. A write that cannot be re-read and re-validated is a failure (the writer
+    // half's rule, applied to the editor).
+    let table = read_table(t)?;
+    match table.entries.iter().find(|e| e.index == index) {
+        Some(e) if &e.type_guid == type_guid => Ok(()),
+        _ => Err(InstallError::VerifyFailed),
+    }
+}

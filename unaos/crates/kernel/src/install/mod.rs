@@ -47,7 +47,7 @@ pub mod pi;
 // then mirror it onto the freshly-formatted ESP). The engine's payload seam for a SAME-device clone
 // (the Pi reads its source from and installs onto the one seated card). `piinstall_confirm`-gated —
 // compiled only where the destructive Pi install that uses it is.
-#[cfg(all(target_arch = "aarch64", feature = "piinstall_confirm"))] // FC-2 (GATE-FC2), the CASCADE from `pi` above and the reason this is a gate and not an audit: `clone`'s four consumers are all in `install/pi.rs` (:312, :321, :364, :381), so the moment `pi` carried the arch term this declaration was the wider one. Same argument, same measurement (`scripts/fc2-check.sh`: refs=4, all-under target_arch="aarch64"), same in-place edit on the existing attribute line — no line added.
+#[cfg(any(all(target_arch = "aarch64", feature = "piinstall_confirm"), feature = "installdemo"))] // FC-2 (GATE-FC2), the CASCADE from `pi` above and the reason this is a gate and not an audit: `clone`'s consumers were all in `install/pi.rs` (:312, :321, :364, :381), so the moment `pi` carried the arch term this declaration was the wider one. Same argument, same measurement (`scripts/fc2-check.sh`), same in-place edit on the existing attribute line — no line added. PARTINSTALL WIDENS IT BY ONE TERM and the declaration is still the union of its consumers: `install/partition.rs` (`installdemo`) mirrors its boot tree through `clone::write_snapshot`, the SAME writer the Pi self-clone uses. The alternative was a second tree writer inside partition.rs — the fork clone.rs's own doc says it is not ("two targets, one engine").
 pub mod clone;
 
 use crate::drivers::block;
@@ -410,7 +410,7 @@ pub fn install_probe_once() {
     // witness rides, so the log carries the guard's decision table and its live verdict for every
     // candidate the machine enumerated — including the disk the engine is about to write.
     selfguard::selftest();
-    run_demo();
+    #[cfg(feature = "installdemo")] let _partition_took_it = partition::probe_once(); #[cfg(not(feature = "installdemo"))] let _partition_took_it = false; if !_partition_took_it { run_demo(); } // PARTINSTALL: the leg is chosen BY CONTENT, not by a new knob (R28: "find your own disk by content"). `partition::probe_once` parses the attached disk's GPT; a disk that HAS a valid table is a partition-install fixture and `run_demo` — whose whole ladder starts with `blank_check` — could only print a `NotBlank` refusal about it. A blank scratch has no parseable table, `probe_once` returns false, and this leg is byte-for-byte the behaviour it always had. Folded onto the existing `run_demo();` line so no `panic::Location` below it moves.
     // INSTALL-SELF: and again AFTER the engine ran, because the engine just put a FAT32 volume on the
     // scratch disk — the harness's only live FAT fixture. This is where the serial reader meets real
     // media instead of synthetic bytes.
@@ -732,3 +732,20 @@ fn demo_multicluster_dir<T: InstallTarget>(
     );
     Ok(())
 }
+
+// PARTINSTALL: the installer lays UnaOS INTO an existing GPT partition, beside foreign volumes it
+// must never touch. rmbp-ledger B91 states the gap — INSTALL-SELF above protects HOME (the disk we
+// booted from) and "leaves every OTHER disk a legitimate candidate by construction" — and RULINGS
+// R25 states the rule: a non-UnaOS disk is a STRANGER. This module is the guard pointing that way:
+// a pre-flight content census, a named refusal per reason, and a target type whose address space IS
+// the partition, so no write can reach a neighbour.
+//
+// DECLARED AT THE FILE'S TAIL, not beside the other `pub mod`s at the head, for the byte-identity
+// rule (LAWS §5): a declaration inserted at line 52 shifts every `panic::Location` in the 680 lines
+// below it, and the exception the law grants covers a cfg'd-OUT declaration (the file is never
+// lexed), not the module root it sits in. Gated on `installdemo` ALONE — the same cfg as its one
+// consumer, the folded call in `install_probe_once` above — so GATE-FC2 measures declaration and
+// references as the same predicate, and so an `install_target`/`piinstall` build (Orin, Pi) does not
+// compile an x86 partition fixture it can never reach.
+#[cfg(feature = "installdemo")]
+pub mod partition;
