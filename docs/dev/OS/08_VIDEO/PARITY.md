@@ -2705,3 +2705,68 @@ bare `quarry=no` conflates — **not in the image** (flight 8) from **in the ima
 flight capture forced a guess between them. Arch-neutral: it reads the settled model both chips
 assemble (R16). Go-red is dropping `pin_quarry` from `compose`'s chain — `quarry=no` with
 `quarry_compiled=yes`, which is the second failure and is distinguishable on the wire from the first.
+
+**STOP 2 IS CLOSED — QUARRYX86-2 (this branch).** The repair is the one statement this section owed,
+folded onto the consumed-press arm at `arch/x86_64/syscall.rs:7497` ahead of its `return true`:
+
+```rust
+#[cfg(feature = "quarry")] crate::video::quarry::service();
+```
+
+It is the twin of `arch/aarch64/syscall.rs:14326`'s and takes the twin's ORDER — drain first, then the
+`CLICK_TARGET_DROP` store, then `return true`; a drain after the return is not a drain. The gate is
+`quarry` and **not** `desktop_firmware`, and that is the whole of why the aarch64 spelling could not be
+copied: `video/mod.rs:685` admits the module on x86 under **`wc`** (`#[cfg(any(all(target_arch =
+"x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]`), which is
+this arm's own gate one line above, and `desktop_firmware` is absent from `x86-all` while `quarry` is
+in it — so the `desktop_firmware` spelling would have compiled to nothing here and repaired nothing.
+`service()` needed no visibility change: it is `pub` in both polarities (`video/quarry.rs:29`'s
+`pub use live::{… service …}` and the `#[inline(always)]` no-op at `:71`), so a `UNAOS_QUARRY`-unset
+image is untouched by construction. Line-neutral: `syscall.rs` is 24179 lines before and after, so no
+panic `Location` moves.
+
+**Measured, and the fixture is new because no existing one could ask the question.** The battery's own
+dock presses come from `dock::selftest`, which calls `press_at` DIRECTLY and never enters
+`wc_click_route_at` — so every `[dock] press` on the flight-8 wire and in every gate before this one
+scored the dock's model, never the ROUTER arm. `scripts/qmp_type.py`'s pointer typist (SMALLFIX2's,
+PTRPRESS's) moves the emulated tablet but not to a named place. The press here is therefore injected
+onto the Quarry TILE, through the real router, over the same QMP socket and the same `Qmp` class: tile
+0 is always Quarry (`pin_quarry` PREPENDS — R50's macOS order), and `Layout::for_panel` +
+`strip::frame_centred` put its centre at `(694 - 54n, 762)` on a 1280x800 panel, a formula the dock
+selftest's own line confirms on the wire (`:: DOCK: strip tiles=6 at x=310 w=660 glyphs=8` — `w=108n+12`,
+`x0=634-54n`). With `n=4` that is `(478,762)`. **Drain in** (`UNAOS_WC=1 UNAOS_QUARRY=1
+UNAOS_QEMU_FULL=1`, press injected):
+
+```
+2318: [dock] press at (477,761) tile=0/4 quarry=pin -> open requested
+2320: [wc-a] create win=2 asid=0xffffff03 surf=768x480 stride=3072 scale=1x at (256,156) z=121
+2323: [wc-fv] focus raise asid=0xffffff03 windows=1 top_win=2 z=122 shell_z=0
+2327: [menubar] menus cap_owner=2 cap=Quarry menu_owner=0 boxes=1 items=app:Quarry@34+66
+2328: [quarry] open win=2 surf=768x480 ts=2 box=778x524 at (251,117) volumes=1 tree-rows=8 list-rows=20 cwd=/
+```
+
+A live Quarry WINDOW, focused, named in the menu bar, listing the volumes — `quarry:pin` became a real
+row. **GO-RED** is the drain removed (the pristine merge `f8f8ce8c`), same fixture, same coordinates:
+
+```
+2326: [dock] press at (477,761) tile=0/4 quarry=pin -> open requested
+2327: [clickroute] press at (477,761) band=dock -> launch-shell deliver=0
+2328: [wc-w] rollup presents=88 …
+```
+
+The latch is set and nothing drains it — no `create`, no `open`, `[quarry] open win=` stays at the 2
+opens the witness selftests had already made BEFORE the press (`:1718`, `:1765`), which is the tile
+that paints and does nothing, exactly as this section described it.
+
+⚠ **The press fixture cannot ride the plain gate run, and that is a property of the fixture, not the
+fix.** `:: PTRPRESS:` scores pointer button EDGES, so an injected press is an extra edge and reds it
+(`edges=1 held=0x01 holed=1`). The gate is therefore run twice: unperturbed for `rc=0` (full wall
+120.4 s, last fixture reached — a truncated run is not a pass), and perturbed for the press witness.
+
+⚠ **`:: WINMENU:` is FLAKY on this leg and it cost a measurement here.** The identical binary reds it on
+one run (`box=0x0+0 … app_box=false routed_open=false … :: FAIL ::`) and passes it on the next
+(`box=48x34+34 … :: PASS ::`); the pristine `f8f8ce8c` passes it too. The two wires differ in the ORDER
+of the VUG window's `[winmenu] app-menu owner=1 name=VUG` against the scorer, not in anything the
+scorer is about — a race between the fixture and the app window's menu registration on a 6-core guest.
+Named here rather than silently re-run: an intermittent scorer makes every future leg on this gate
+argue with its own evidence. Owed a row.
