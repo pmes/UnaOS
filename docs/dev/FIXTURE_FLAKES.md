@@ -566,6 +566,194 @@ idle host, it stops being a load artifact and becomes a launcher defect.
 **Disposition.** On watch. One occurrence, re-run green on the spot; recorded here
 so the next seat spends the minute on the corpus and not on the driver.
 
+---
+
+## Class 5 — a COMPLETED run delivers an INCOMPLETE capture: witnesses go missing with no verdict at all
+
+**The shape, and why it is its own class.** Classes 1-3 are races that make a
+fixture print the WRONG verdict. This class is the one where the fixture prints
+the RIGHT verdict and the line never reaches the capture. The failure therefore
+arrives as a **MISSING REQUIRE on a run that reached its end-of-run marker** —
+and the harness, seeing the marker, says in as many words that the absence must be
+a regression:
+
+```
+  ❌ REQUIRE    :: <TAG>: … -> PASS ::
+       0 hits — MISSING
+  ❌ MBENCH FAIL — 125/126 required witnesses, 0 forbidden hit(s), 23846 lines scanned [full wall 300.1s]
+       (the end-of-run marker was seen — the run completed, so a missing witness here is a GENUINE regression)
+```
+
+**That parenthesis is the trap.** A completed RUN is not a complete CAPTURE. The
+marker proves the boot reached its end; it proves nothing about whether every line
+in between survived the wire.
+
+**The discriminator, and it is free.** Before treating a missing REQUIRE as a
+regression, ask whether the producing path demonstrably ran:
+
+1. **Is the fixture's own BANNER on the wire?** Many fixtures print a banner
+   before their verdict. Banner present + verdict absent = the fixture ran and the
+   line was lost.
+2. **Is a SIBLING line from the same emitter present?** If one `serial_println!`
+   from a statement sequence landed and its immediate neighbour did not, no code
+   path explains it — read the emitter and check for an early return between them.
+   If there is none, the line was lost, not skipped.
+3. **Is there a TORN fragment?** Grep a distinctive interior token of the missing
+   line (not its tag). Zero hits for the interior token = whole-line loss, which is
+   `dropped`, not `torn` — Class 2's asymmetry, one layer out.
+4. **Are there `[mirror] … line(s) dropped` lines in the capture?** They corroborate
+   that loss happened on this boot, though they do NOT account for the primary wire
+   (see the SERWIT-2 caveat below).
+
+Only when all four say the fixture never ran is a missing REQUIRE a regression.
+
+**The SERWIT-2 caveat, measured.** `:: SERWIT-2: … -> PASS ::` does NOT clear this
+class. Both captures below carry SERWIT-2 PASS (`every line accounted for on all 4
+taps, 0 lost on the 3 evidence taps`) *and* lost witnesses. SERWIT-2 conserves over
+the four MIRROR taps (`fbcon`, `ftdi`, `tste`, `flightrec`); the primary PL011
+capture the battery is scored from is not one of them. A green SERWIT-2 is not a
+statement about the log MBENCH reads.
+
+### 5a. `kernel8-test`: `[wc-g] -> COHER` / `-> RACE-BLIT` + `[wc-d] verify -> FAIL` — **known shape (SO7), rate now measured**
+
+**Signature on the wire:**
+
+```
+[wc-g] win=1 seq=0 own=no scale=1x app=… blit=… civac=… after=… fbbad=1830/82944 occluded=0 occ=0/0 us=25054 rectscan_us=10000 slow=yes -> COHER
+[wc-g] win=1 seq=9 own=yes scale=1x … fbbad=1647/82944 … us=9555 rectscan_us=10000 slow=no -> RACE-BLIT
+[wc-g] rollup win=1 scope=window samples=4 coher=2 race=1 blit=0 clean=1 slow=1 maxus=25054 wit_us=48019 frame_us=16667 -> COHER
+[wc-d] verify win=1 surf=288x288 band=none scale=1x at (17,51) panel=640x480 checked=82944 bad_cache=783 bad_ram=829 ram_indep=yes moved=1064 sprite_px=0 nonzero=82944 occluded=0 occ=0/0 cksum=0xd731c913edbb9654 first=(160,132) got=0xc9a6e8 want=0x1e1e1e fills=2->2 fact=0/0 desk=9->9 dact=0/0 -> FAIL
+```
+
+The green counterparts from the SAME tree, one run earlier:
+
+```
+[wc-g] rollup win=1 scope=window samples=4 coher=0 race=0 blit=0 clean=4 slow=1 maxus=17549 wit_us=31948 frame_us=16667 -> CLEAN+SLOW
+[wc-d] verify win=1 … bad_cache=0 bad_ram=0 ram_indep=yes moved=0 … stable=yes -> PASS
+```
+
+**Read `moved=` FIRST, then `maxus=`.** `moved != 0` means the reference moved
+UNDER the verifier, so the sample is invalid and the `bad_*` counters describe a
+race, not content. `maxus` is the starvation tell (25054 µs failing vs 17549 µs
+clean). Note the red line also LACKS the `stable=yes` field the green one carries.
+
+**Rate — measured 2026-09-16 (FLAKERATE, tree `da2a9abc`, 20-core box):
+1 red in 2** `UNAOS_QEMU_FULL=1 ./arroyo kernel8-test 300` runs. **The red was the
+LOWER-load run:** 1-min load 13.35 red, 13.84 green. Prior tallies: orin 16's
+baseline 3 FAIL/5 and patched 4 FAIL/7 (SO7/B26); SO7's stated load threshold was
+~3.9.
+
+**Root cause — attributed, not fixed.** SO7 names it at `wcg.rs:412`: a boot-seam
+concurrent writer, fbcon's glyph raster from print context against the compositor's
+checksum read. `own=no` on the first hit is the "repainted as COLLATERAL" tell.
+
+**⚠ Divergence from SO7's stated shape, banked not folded.** SO7 records the
+observed family as `bad_cache == bad_ram` (91/91, 867/867, 6816/6816) and calls the
+one asymmetric run (145/83) *a SEPARATE observation, not this shape*. The sighting
+above is `bad_cache=783 bad_ram=829` — the **second** asymmetric sighting. Do not
+merge it into the symmetric family without a third.
+
+**The rule for a reader.** Re-run the leg alone; a lone green is the verdict. But
+**do not clear the gate and move on**: bank the line here, because the rate is what
+closes SO7/B26 and a buried green is a lost sample.
+
+**Disposition — WATCH, rate measured, fixture fix already named and not taken.**
+SO7's cheap fix is a distinct `-> MOVED` / `-> RESAMPLE` verdict when `moved != 0`
+— **never a relaxed FORBID**. This sighting is the argument for it: the instrument
+printed `moved=1064` and the fixture rendered FAIL anyway.
+
+### 5b. `kernel8-test`: `:: U5: capabilities … -> PASS ::` missing with its banner on the wire — **measured, 1 in 2**
+
+**Signature on the wire.** The banner lands, the verdict does not:
+
+```
+:: U5: capabilities — rights + CHECK + grant/attenuate/revoke + routed sys_write ::        <- present
+:: U5: capabilities — write-cap OK, no-cap -EACCES, attenuated grant bounded, revoke enforced, teardown-clear clean -> PASS ::   <- ABSENT
+```
+
+scored as `❌ REQUIRE U5: capabilities.*-> PASS  0 hits — MISSING`.
+
+**Trigger conditions.** 1 run in 2, 1-min load 13.35, on a run that saw its
+end-of-run marker (25961 lines, full 300.1 s wall). The other run at 13.84 printed
+both lines.
+
+**Root cause — SUSPECT: whole-line loss on the primary capture.** The banner proves
+the fixture ran. No torn fragment exists. Three `[mirror] … line(s) dropped` lines
+are in the same capture (`fbcon: 8`, `tste: 1`, `tste: 2`) while SERWIT-2 reports
+PASS — see the class caveat above.
+
+**What to capture on recurrence.** Whether the banner is present (it is the whole
+diagnosis); the `[mirror]` lines and their positions; the four `SERWIT-2 tap …`
+lines; the host load; and whether a lone re-run prints both.
+
+**The rule for a reader.** Banner present + verdict absent is NOT a capabilities
+regression. Re-run alone; a lone green is the verdict.
+
+**Disposition — WATCH.** One occurrence at a measured rate of 1 in 2.
+
+### 5c. `kernel8-test`: `:: ERET-SCRUB: first-entry …` absent in BOTH runs — **NOT a flake; recorded here so it is not mistaken for one**
+
+**This entry exists to stop a reader filing it in this class.** `pi4-regression.spec:309`
+requires:
+
+```
+REQUIRE :: ERET-SCRUB: first-entry GPR/FP/TPIDR residue = 0 .*-> PASS ::
+```
+
+and it was MISSING in **2 of 2** FLAKERATE runs (loads 13.84 and 13.35). Two in two
+is a defect, not a rate.
+
+**What is measured, and it is unusual enough to write down.** The emitter,
+`arch/aarch64/syscall.rs:6541` (`eret_scrub_verdict`), prints TWO lines as
+consecutive statements — first-entry (`if/else` at `:6550-:6559`) then
+syscall-return (`if/else` at `:6560-:6569`) — and **all four arms print**, so no
+code path skips line 1 and reaches line 2. In both captures:
+
+- `LC_ALL=C grep -a -c -F 'ERET-SCRUB'` = **1**, and the hit is line 2:
+  `:: ERET-SCRUB: syscall-return preserved x1-x30 + x8 + SP_EL0 + v0-v31 across SYS_YIELD (bitmap=0x0) -> PASS ::`
+- `first-entry` = 0 hits, `TPIDR` = 0 hits, `FPSR` = 0 hits — absent in BOTH its
+  PASS and its FAIL form, with no torn fragment.
+- the producing path ran: `:: SCHED: task 'el0-eretentry' -> core 3 …` and
+  `[el0stkhw] task=72:el0-eretentry …` land immediately before line 2.
+
+**The reading a seat must not take.** `124/126` here is **not** a return-path scrub
+regression — the scrub's sibling witness passed in both runs. Whether this is a
+2-in-2 capture loss or something in the emitter is unresolved and needs a quiet box
+to separate; FLAKERATE could not make the box quiet.
+
+**Disposition — DEFECT, open, owner unassigned.** Filed as a defect, not a flake.
+
+### 5d. Companion finding: a `FAIL` the DEFAULT FORBIDs cannot see
+
+Not a flake, recorded because it will make a reader of this class mis-score a run.
+In a `kernel8-test` run MBENCH scored **`0 forbidden hit(s)`**:
+
+```
+:: PWRDRAIN: FAIL — filled=64 lines=12 bytes=816 want_bytes=4352 residue=0 dropped=0 ::
+```
+
+`mbench.py:136`'s `DEFAULT_FORBIDS` are `-> FAIL`, `FAIL ::`, `PANIC`; this line's
+form is `FAIL — `, with `::` seven fields later, so it matches none of them.
+**Scan a capture for the bare token `FAIL`, not for the three shapes the harness
+knows.** (Done over the four x86 captures of the same arc as a control: `FAIL`
+count equals `-> FAIL` count in all four, so this is a Pi emitter's spelling and
+not a tree-wide hole.)
+
+### The x86 CONTROL for this whole file, measured the same day
+
+FLAKERATE ran four `UNAOS_WC=1 UNAOS_QEMU_FULL=1 ./arroyo test 90` runs on one tree
+(`da2a9abc`) at 1-min load 7.90 / 15.55 / 15.18 / 15.09, peak 20.57 observed
+in-run, and got **byte-identical verdict sets**: 119 distinct witness tags, 78
+`-> PASS`, 22 `:: PASS ::`, 3 `-> FAIL`, every time, all four reaching the
+completion marker. **Zero flakes in four** across DOCKID, `[dmgovlp]` (1c),
+`[ptrdead]` (3), SOCK-4 (1b), DMG-REFUSE (1a), SERWIT-1, PWRDRAIN, S5DRAIN,
+SINKDRAIN, DOCK and APPPIN — every one of them present in all four captures, so the
+zero is a fact about the data and not about the pattern. **The practical
+consequence for this corpus: none of Classes 1-3 reproduced at load ~20 on a
+20-core box**, and a seat meeting one of them should not assume "the box was busy"
+is a sufficient account. Full run table and quotations:
+`docs/dev/evidence/rmbp-0915/flakerate/FLAKERATE.md`.
+
 ## Adding an entry
 
 An entry earns its place when a failure has been seen **more than once**, or once
