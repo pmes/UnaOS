@@ -788,8 +788,8 @@ pub fn service() {
             if n >= MOUNT_REFUSAL_BOUND {
                 // Said ONCE, so silence is never mistaken for "never ran". TWO verdict forms, and the
                 // difference is what the harness carries, not what the kernel did: `NotFat`/`NoDisk` after the
-                // bound means NO FAT VOLUME IS PRESENT AT ALL (QEMU virt's default `usb.img` is a raw signed
-                // pattern image; `UNAOS_FATIMG=sf` gives it one) — that is SKIPPED, a non-forbid, because a
+                // bound means NO FAT VOLUME IS PRESENT AT ALL — true of QEMU virt's aarch64 default `usb.img`
+                // (a raw signed pattern image; `UNAOS_FATIMG=sf` gives it one; the x86 default carries a FAT32 volume since DEFAULTMEDIUM instead) — that is SKIPPED, a non-forbid, because a
                 // leg red for a disk the harness never attached is wrong-strict. Any other refusal on a
                 // registered disk (`Io`, `BadChain`, `Unsupported`, …) IS a defect and takes the FAIL form.
                 SERVICED.store(true, Ordering::Relaxed);

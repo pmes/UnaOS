@@ -648,8 +648,8 @@ pub fn service() {
                 RESERVED.store(2, Ordering::Release);
                 use crate::fs::fat::FatError;
                 match e {
-                    // No FAT boot volume here (a raw/non-FAT stick, or no disk). The NORMAL case for the
-                    // default `test` (raw usb.img) — nowhere to record to, not an error. Silent.
+                    // No FAT boot volume here (a raw/non-FAT stick, or no disk) — the aarch64 default `usb.img`
+                    // is exactly that; the x86 default is FAT32-backed since DEFAULTMEDIUM, so this is no longer its normal case.
                     FatError::NotFat | FatError::NoDisk => {}
                     _ => serial_println!(
                         ":: FR: {} reservation failed ({:?}) — boot log not recorded to disk ::",
@@ -726,9 +726,9 @@ pub fn service() {
             // log grows further. One honest witness (once) — never a panic.
             LAST_FLUSHED.store(len, Ordering::Relaxed);
             match e {
-                // No FAT boot volume here (a raw/non-FAT stick, or no disk). This is the NORMAL case
-                // for the default `test` (raw usb.img) and any non-FAT medium — there is simply
-                // nowhere to record to, not an error. Skip silently (no scary witness line).
+                // No FAT boot volume here (a raw/non-FAT stick, or no disk) — the aarch64 default `usb.img`
+                // is exactly that; the x86 default `usb-boot.img` carries a FAT32 volume since DEFAULTMEDIUM, so
+                // this is no longer its normal case — but still not an error. Skip silently (no scary witness line).
                 FatError::NotFat | FatError::NoDisk => {}
                 // A real write error (I/O stall, full volume, bad chain) AFTER a successful mount —
                 // one honest witness, once.

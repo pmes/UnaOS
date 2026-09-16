@@ -2665,7 +2665,9 @@ fi
 #
 # UNAOS_FATIMG swaps the usb-storage backing to a FAT image (scripts/make-fat-img.sh) so the
 # kernel's read-only FAT reader can be exercised on aarch64 QEMU too. Mirrors the x86 builder knob
-# (builder/src/main.rs). Unset -> usb.img (the raw UNA-OS pattern image). Build with `./arroyo fat-img`.
+# (builder/src/main.rs). Unset -> usb.img (the raw UNA-OS pattern image) — this is the aarch64 STICK_IMG
+# lane; x86 default is usb-boot.img — MBR: raw pattern in sector 0 + FAT32 slot 1; the aarch64 lane
+# stays on usb.img. Build with `./arroyo fat-img`.
 STICK_IMG="${WORKSPACE_DIR}/builder/usb.img"
 case "${UNAOS_FATIMG:-}" in
     "") ;;
