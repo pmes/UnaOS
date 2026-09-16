@@ -9157,18 +9157,81 @@ battery() {
 #     the same executor's later runs land on the same key, so the incremental cache survives, which
 #     is why this is keyed on the caller rather than on the pid. The path is still constant across
 #     the three builds of a run, so the "no path delta" invariant is intact.
-#   * `run-<stamp>-<pid>/` inside it — the log, the working patch and the six flat images. Removed on
-#     a clean PASS and KEPT on any other outcome, with its path printed, so the images that failed can
-#     be inspected.
+#   * `run-<stamp>-<pid>/` inside it — the log, the working patch, the six flat images and the
+#     per-build `Compiling` censuses. Removed on a clean PASS and KEPT on any other outcome, with its
+#     path printed, so the images that failed can be inspected.
 # Same key twice at once (one executor running two knoboffs from one worktree) is the remaining
 # collision and it is held by an `flock` on the caller directory: the second caller WAITS and says so
 # on the wire. Never a silent share — that is the whole finding.
 #
+# A BYTE-IDENTITY CLAIM IS ONLY AS GOOD AS ITS CACHE STATE — GATE-KNOBOFF's warm-cache precondition
+# (SMALLFIX's rmbp finding, QUEUE §5 2026-09-16; this REPRO arc). Everything above is about comparing
+# the right two TREES. This paragraph is about comparing them in the same CACHE, which the first cut
+# assumed and never asserted. SMALLFIX measured `kernel8.img` from one pristine tree hashing
+# `9d3103c3…` against a COLD target dir and `0b6f2381…` against a WARM one — 2638 bytes apart, with
+# warm→warm and cold→cold each reproducing — because the deps and the `include_bytes!`d user_blob
+# rebuilt on the cold side. knoboff already built both images in ONE directory, which removes the path
+# delta; it did nothing about the cache delta, and the cache delta was BUILT IN by the phase order: on
+# a fresh per-caller key the BASELINE build is the one that pays for every dependency and build-std
+# crate, and the tree build that gets compared against it runs with all of that already warm. Cold
+# against warm, every first run, in the direction the tool cannot see.
+#
+# Two things close it, and both are assertions rather than arguments (LAWS §5, "byte identity is
+# measured, never argued"):
+#   * WARM FIRST, SCORE SECOND. Each of the two scored phases ([1/3] and [2/3]) goes through
+#     `_knoboff_scored_pair`: it builds, reads its own census, and — if that census is anything other
+#     than exactly one `unaos-kernel` compile — throws those images away, re-dirties the crate roots
+#     and scores a SECOND build, which now has every dependency warm. A first pass that already says
+#     `unaos-kernel` alone is itself that warm compile and is scored as it stands, so the extra compile
+#     is paid on cold and no-op runs and on no others. The no-op half matters as much as the cold half:
+#     cargo that compiles NOTHING leaves the phase scoring an artifact some EARLIER run produced (see
+#     `_knoboff_touch_kernel` — 1.87 s and no compiler at all, measured here). The armed control build
+#     in [3/3] is not scored for identity, only for inequality, so it is left alone.
+#   * THE CENSUS IS THE PROOF. Every scored build's own `Compiling <crate>` lines are captured
+#     (`_knoboff_flat`'s 7th argument) and the run prints
+#         knoboff: warm=<yes|no> compiled_baseline=[…] compiled_tree=[…]
+#     A scored build that compiled ANY crate but `unaos-kernel` means the two images were produced in
+#     different cache states and the comparison between them is void: exit 2, naming the crates. A
+#     scored build that compiled NOTHING is the same refusal for the other reason — nothing this run
+#     did was measured. `warm=yes` is the only state in which a 0 or a 1 from this tool is a claim,
+#     and LAWS §5 says so in one clause so that a reader of a quoted verdict knows to look for it.
+#     The honest cost of a foreign crate in the census is that an arc which edits a NON-kernel
+#     workspace crate (`crates/net`, `libs/…`) gets NO VERDICT here rather than a wrong one — the dep
+#     recompiles on the tree side and cannot recompile on the baseline side, so the instrument has no
+#     power over that question and says so instead of answering anyway.
+#
+# THE `include_bytes!` HAZARD, which is the same finding one layer down. `arch/aarch64/syscall.rs`
+# bakes `unaos/target/user_blob.bin` into the image with `include_bytes!`. That file is NOT a cargo
+# output: `build_user_blob` produces it from `crates/user-blob` into the tree's own `target/`, it
+# survives `git clean -fd` (ignored), and no phase of knoboff builds it. Under the default feature
+# sets the module is `baremetal`-gated and the blob never reaches these two images at all — but under
+# `UNAOS_TEGRA_EL0=1 UNAOS_KNOBOFF_WITH_ENV=1` it does, and then a blob that changed between the two
+# scored builds is a byte delta with no source behind it. So its sha256 is recorded immediately before
+# each scored build and a difference is exit 2, naming the file. `absent` on both sides is the
+# ordinary case and is fine: a payload that is not embedded cannot move the image.
+#
+# COST, measured on this box 2026-09-16 (`deadman`, the docs-only 56103466/707c293d pair, 20 cores
+# under a load average of ~12), before and after on the same box state:
+#   COLD (fresh per-caller key)   before 115.61 s exit 0   ->  after 165.57 s exit 0    +49.96 s
+#   WARM (immediate re-run)       before   1.87 s exit 0   ->  after  95.23 s exit 0
+# The cold delta IS the one extra kernel-only compile per arch and nothing else. The warm pair is not
+# a regression to argue about, because the 1.87 s it replaces was a run that invoked no compiler at
+# all: cargo found every fingerprint clean, and the three images it compared were objcopied out of
+# .elf files the PREVIOUS run had left in the target dir — one of them the cold-built baseline. That
+# run reported PASS. It is the exact hazard SMALLFIX named, and 95 s is what not having it costs.
+#
+# REPRODUCIBILITY, which is the property the warm discipline actually buys: with it, the scored images
+# are the same bytes from a cold key and from a warm one and from a THIRD caller key on the same box —
+# x86 1262919d…/1537216 and arm 243e2e99…/1608416 across all three runs above. Before it, the same
+# source pair scored 6c88e301… cold. The images stopped depending on which run built them.
+#
 # EXIT STATUS is the deliverable — the brief says "run it and quote the result":
-#   0  knob-off images identical to baseline on every arch checked, control fired
+#   0  knob-off images identical to baseline on every arch checked, control fired, cache warm
 #   1  the knob-off image MOVED (the answer the brief is trying to prevent)
 #   2  no verdict — undeclared feature, dirty env, untracked sources, a MERGE HEAD with no baseline
-#      named, build failure, or a control that did not fire. A 2 is never a pass.
+#      named, build failure, a control that did not fire, a scored build that compiled something
+#      other than the kernel crate (or nothing), or a user_blob that moved between the two scored
+#      builds. A 2 is never a pass.
 _knoboff_arm_csv() {
     local _save="$KERNEL_FEATURES" _out
     KERNEL_FEATURES="${1:+--features $1}"
@@ -9178,10 +9241,18 @@ _knoboff_arm_csv() {
 }
 
 # Build one (arch, feature-set) in the throwaway tree and objcopy the loadable image out.
-# $1 tree  $2 target-dir  $3 x86|arm  $4 features-csv  $5 out-flat  $6 log
+# $1 tree  $2 target-dir  $3 x86|arm  $4 features-csv  $5 out-flat  $6 log  [$7 census-out]
+#
+# $7, when given, receives THIS build's cargo `Compiling <crate>` census as a comma-separated list
+# (an empty file means cargo compiled nothing). It is the only witness to the cache state the byte
+# comparison rests on, and it has to be PER BUILD: every build of the run appends to the one shared
+# log, so a `Compiling` line grepped out of it cannot be attributed to the build whose verdict
+# depends on it.
+# Hence the step capture — cargo's output lands in its own file, is censused, and only then joins the
+# run log, which keeps the existing `tail -20 "$LOG"` diagnostics working unchanged.
 _knoboff_flat() {
-    local _tree="$1" _tgt="$2" _arch="$3" _feats="$4" _out="$5" _log="$6"
-    local _tspec _elf _TOOLBIN
+    local _tree="$1" _tgt="$2" _arch="$3" _feats="$4" _out="$5" _log="$6" _census="${7:-}"
+    local _tspec _elf _TOOLBIN _rc=0
     _TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
     case "$_arch" in
         x86) _tspec="../../x86_64-unaos.json"; _elf="$_tgt/x86_64-unaos/release/unaos-kernel" ;;
@@ -9189,11 +9260,16 @@ _knoboff_flat() {
         *)   echo "knoboff: bad arch $_arch" >&2; return 2 ;;
     esac
     local _fargs=""; [ -n "$_feats" ] && _fargs="--features $_feats"
-    if ! ( cd "$_tree/unaos/crates/kernel" \
-           && CARGO_TARGET_DIR="$_tgt" cargo +nightly build --release \
-              --target "$_tspec" $NIGHTLY_FLAGS $_fargs ) >>"$_log" 2>&1; then
-        return 1
+    local _step="${_log}.step"
+    : > "$_step"
+    ( cd "$_tree/unaos/crates/kernel" \
+      && CARGO_TARGET_DIR="$_tgt" cargo +nightly build --release \
+         --target "$_tspec" $NIGHTLY_FLAGS $_fargs ) >"$_step" 2>&1 || _rc=1
+    if [ -n "$_census" ]; then
+        awk '$1 == "Compiling" { print $2 }' "$_step" | sort -u | paste -sd, - > "$_census"
     fi
+    cat "$_step" >> "$_log"; rm -f "$_step"
+    [ $_rc -eq 0 ] || return 1
     [ -f "$_elf" ] || return 1
     "$_TOOLBIN/llvm-objcopy" -O binary "$_elf" "$_out" >>"$_log" 2>&1 || return 1
     return 0
@@ -9201,6 +9277,84 @@ _knoboff_flat() {
 
 # sha256 + size of a flat image, "sha size" on one line.
 _knoboff_id() { printf '%s %s' "$(sha256_of "$1")" "$(wc -c < "$1" | tr -d ' ')"; }
+
+# A census file rendered for a human — "<none>" when cargo compiled nothing.
+_knoboff_census_show() { local _c; _c="$(cat "$1" 2>/dev/null || true)"; printf '%s' "${_c:-<none>}"; }
+
+# True when a census names no crate at all. CONTENT, never `[ -s ]`: `paste -sd, -` emits a lone
+# newline for empty input, so the one-byte file that means "cargo compiled nothing" passes `-s` — the
+# first cut of this gate tested `-s` and its no-op half could not fire, which the census line caught on
+# its own first run (`compiled_tree=[<none>|<none>]` printed beside `warm=yes`, 2026-09-16). A gate
+# whose own output contradicts its verdict is the shape LAWS §5 calls a check that cannot fire.
+_knoboff_census_empty() { [ -z "$(tr -d '[:space:]' < "$1" 2>/dev/null)" ]; }
+
+# The crates named by the given census files that are NOT the kernel: the reason a verdict is void.
+# The per-file `echo` is not decoration: `cat a b` glues the last name of a to the first name of b
+# whenever a has no trailing newline, and `unaos-kernel` + `net` reading as one crate `unaos-kernelnet`
+# is a FOREIGN name where there was none — the refusal would fire on a clean run. Today every census
+# is written by `paste`, which does emit the newline; a check that depends on that staying true is one
+# edit away from being wrong, and this one costs nothing.
+_knoboff_census_foreign() {
+    local _f
+    for _f in "$@"; do cat "$_f" 2>/dev/null || true; echo; done \
+        | tr ',' '\n' | sed '/^$/d' | { grep -vx 'unaos-kernel' || true; } | sort -u | paste -sd, -
+}
+
+# FORCE THE SCORED KERNEL COMPILE, so that "this run measured it" is true.
+# Cargo fingerprints on mtime, and `git reset --hard` rewrites only the files that actually DIFFER
+# between two commits — so a docs-only (or arroyo-only) diff leaves every kernel source's mtime
+# untouched and cargo compiles nothing at all, while switching feature sets back and forth re-links a
+# `deps/unaos-kernel-<metadata>` artifact an EARLIER run produced. Measured on this tree 2026-09-16:
+# the second `./arroyo knoboff deadman` against a warm key finished in 1.87 s having run no compiler,
+# and the images it scored were objcopied from .elf files the previous run had left behind — one of
+# them built cold. That is the SMALLFIX hazard wearing a green hat. Touching the two crate roots costs
+# one kernel-only compile per arch and makes both SCORED images products of THIS process with the deps
+# already warm, which is the only state in which "byte-identical" is a claim about the source rather
+# than a claim about the cache.
+_knoboff_touch_kernel() {
+    touch "$1/unaos/crates/kernel/src/main.rs" "$1/unaos/crates/kernel/src/lib.rs" 2>/dev/null || true
+}
+
+# sha256 of the `include_bytes!`d EL0 payload, or "absent". See the USER_BLOB paragraph in the header.
+_knoboff_blob_id() {
+    local _b="$1/unaos/target/user_blob.bin"
+    if [ -s "$_b" ]; then sha256_of "$_b"; else printf 'absent'; fi
+}
+
+# Build BOTH arches of one SCORED phase, and guarantee the image it hands back is one kernel compile
+# against an already-warm cache — the precondition the whole comparison rests on (GATE-KNOBOFF).
+#
+# WARM FIRST, SCORE SECOND — BUT ONLY PAY FOR IT WHEN IT WAS COLD. The straight reading of the fix is
+# "build the baseline twice and score the second". Measured here, that costs a whole extra kernel
+# compile per arch on EVERY run (126.17 s against a warm key) and buys nothing on the runs where the
+# first pass was already warm — because a first pass whose census is exactly `unaos-kernel` IS a warm,
+# this-process kernel compile, which is the entire property being bought. So the first pass is scored
+# when its census says it qualifies, and is otherwise treated as the discarded warm-up it turned out
+# to be: `_knoboff_touch_kernel` re-dirties the crate roots and the SECOND pass, with every dependency
+# now built, is the one compared. The retry therefore fires on exactly the two states that make a
+# verdict untrustworthy — a COLD cache (foreign crates in the census) and a NO-OP (an empty census,
+# where the "image" is an artifact some earlier run left behind) — and on nothing else.
+#
+# $1 label  $2 tree  $3 target-dir  $4 x86-csv  $5 arm-csv  $6 out-x86  $7 out-arm  $8 census-x86
+# $9 census-arm.  Sets _kb_rc_x / _kb_rc_a (0 = built).
+_knoboff_scored_pair() {
+    local _lbl="$1" _tree="$2" _tgt="$3" _fx="$4" _fa="$5" _ox="$6" _oa="$7" _cx="$8" _ca="$9"
+    _kb_rc_x=0; _knoboff_flat "$_tree" "$_tgt" x86 "$_fx" "$_ox" "$LOG" "$_cx" || _kb_rc_x=$?
+    _kb_rc_a=0; _knoboff_flat "$_tree" "$_tgt" arm "$_fa" "$_oa" "$LOG" "$_ca" || _kb_rc_a=$?
+    [ $_kb_rc_x -eq 0 ] && [ $_kb_rc_a -eq 0 ] || return 0
+    if [ -z "$(_knoboff_census_foreign "$_cx" "$_ca")" ] \
+       && ! _knoboff_census_empty "$_cx" && ! _knoboff_census_empty "$_ca"; then
+        return 0        # exactly one kernel compile per arch with the deps warm: this IS the scored build
+    fi
+    echo -e "   ${COLOR_YELLOW}↻ $_lbl: first pass compiled [$(_knoboff_census_show "$_cx")|$(_knoboff_census_show "$_ca")] —${COLOR_RESET}"
+    echo -e "   ${COLOR_YELLOW}  it paid for the deps, or it compiled nothing at all. Either way it is a WARM-UP and its${COLOR_RESET}"
+    echo -e "   ${COLOR_YELLOW}  images are discarded: rebuilding the kernel alone against the now-warm cache and scoring${COLOR_RESET}"
+    echo -e "   ${COLOR_YELLOW}  THAT — one extra kernel-only compile per arch, which is what the claim costs.${COLOR_RESET}"
+    _knoboff_touch_kernel "$_tree"
+    _kb_rc_x=0; _knoboff_flat "$_tree" "$_tgt" x86 "$_fx" "$_ox" "$LOG" "$_cx" || _kb_rc_x=$?
+    _kb_rc_a=0; _knoboff_flat "$_tree" "$_tgt" arm "$_fa" "$_oa" "$LOG" "$_ca" || _kb_rc_a=$?
+    return 0
+}
 
 knoboff() {
     local feat="${1:-}" baseline="${2:-}"
@@ -9388,7 +9542,7 @@ knoboff() {
             echo -e "   run directory removed (clean pass); build cache kept at $SCR"
         else
             echo -e "   ${COLOR_YELLOW}run directory KEPT for inspection: $RUN${COLOR_RESET}"
-            echo -e "   (flat-{base,cur,armed}-{x86,arm}.bin · worktree.patch · build.log)"
+            echo -e "   (flat-{base,cur,armed}-{x86,arm}.bin · census-*.txt · worktree.patch · build.log)"
         fi
         return 0
     }
@@ -9439,18 +9593,29 @@ knoboff() {
     local F_BX="$RUN/flat-base-x86.bin"  F_BA="$RUN/flat-base-arm.bin"
     local F_CX="$RUN/flat-cur-x86.bin"   F_CA="$RUN/flat-cur-arm.bin"
     local F_OX="$RUN/flat-armed-x86.bin" F_OA="$RUN/flat-armed-arm.bin"
+    # Per-build censuses. Only the SCORED builds have one; the armed control's is not read at all
+    # (arming a feature legitimately pulls in an optional dependency, and that build is never compared
+    # for identity — only for inequality).
+    local C_BX="$RUN/census-base-x86.txt" C_BA="$RUN/census-base-arm.txt"
+    local C_CX="$RUN/census-cur-x86.txt"  C_CA="$RUN/census-cur-arm.txt"
+    local _kb_rc_x=0 _kb_rc_a=0
 
-    echo -e "${COLOR_YELLOW}⚡ [1/3] baseline ${base_sha:0:8}, knob OFF...${COLOR_RESET}"
+    # [1/3] THE SCORED BASELINE. `_knoboff_scored_pair` warms first and scores second whenever the
+    # first pass was not already a warm kernel-only compile; see its header for why the warm-up is
+    # conditional rather than unconditional.
+    echo -e "${COLOR_YELLOW}⚡ [1/3] baseline ${base_sha:0:8}, knob OFF (scored)...${COLOR_RESET}"
     if ! _knoboff_checkout "$base_sha" ""; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — could not check out $base_sha in $TREE; see $LOG${COLOR_RESET}"; _knoboff_bye 2; return 2; fi
-    rc_base_x=0; _knoboff_flat "$TREE" "$TGT" x86 "$off_csv" "$F_BX" "$LOG" || rc_base_x=$?
-    rc_base_a=0; _knoboff_flat "$TREE" "$TGT" arm "$off_arm" "$F_BA" "$LOG" || rc_base_a=$?
+    local BLOB_B; BLOB_B="$(_knoboff_blob_id "$TREE")"
+    _knoboff_scored_pair "baseline" "$TREE" "$TGT" "$off_csv" "$off_arm" "$F_BX" "$F_BA" "$C_BX" "$C_BA"
+    rc_base_x=$_kb_rc_x; rc_base_a=$_kb_rc_a
 
-    echo -e "${COLOR_YELLOW}⚡ [2/3] current tree, knob OFF...${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}⚡ [2/3] current tree, knob OFF (scored)...${COLOR_RESET}"
     if ! _knoboff_checkout "$head_sha" "$PATCHF"; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — the working diff did not apply onto $head_sha in $TREE; see $LOG${COLOR_RESET}"; _knoboff_bye 2; return 2; fi
-    rc_cur_x=0; _knoboff_flat "$TREE" "$TGT" x86 "$off_csv" "$F_CX" "$LOG" || rc_cur_x=$?
-    rc_cur_a=0; _knoboff_flat "$TREE" "$TGT" arm "$off_arm" "$F_CA" "$LOG" || rc_cur_a=$?
+    local BLOB_C; BLOB_C="$(_knoboff_blob_id "$TREE")"
+    _knoboff_scored_pair "tree" "$TREE" "$TGT" "$off_csv" "$off_arm" "$F_CX" "$F_CA" "$C_CX" "$C_CA"
+    rc_cur_x=$_kb_rc_x; rc_cur_a=$_kb_rc_a
 
     echo -e "${COLOR_YELLOW}⚡ [3/3] current tree, knob ON (control — the comparison must be able to come out unequal)...${COLOR_RESET}"
     rc_on_x=0; _knoboff_flat "$TREE" "$TGT" x86 "$on_csv" "$F_OX" "$LOG" || rc_on_x=$?
@@ -9459,6 +9624,53 @@ knoboff() {
     if [ $rc_base_x -ne 0 ] || [ $rc_base_a -ne 0 ] || [ $rc_cur_x -ne 0 ] || [ $rc_cur_a -ne 0 ]; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — a knob-OFF build failed (x86 base:$rc_base_x arm base:$rc_base_a x86 cur:$rc_cur_x arm cur:$rc_cur_a).${COLOR_RESET}"
         echo -e "         tail of $LOG:"; tail -20 "$LOG" | sed 's/^/         /'
+        _knoboff_bye 2; return 2
+    fi
+
+    # (6b) THE WARM-CACHE PRECONDITION (GATE-KNOBOFF; SMALLFIX, QUEUE §5 2026-09-16). Everything below
+    # compares two images for equality. That comparison is a statement about the SOURCE only if both
+    # images came out of the same cache state, and the census is the only evidence of that. Printed
+    # unconditionally, because a verdict quoted without it cannot be checked.
+    local foreign warm=yes why=""
+    foreign="$(_knoboff_census_foreign "$C_BX" "$C_BA" "$C_CX" "$C_CA")"
+    if [ -n "$foreign" ]; then
+        warm=no; why="a scored build compiled a crate that is not the kernel (rebuilt: $foreign)"
+    elif _knoboff_census_empty "$C_BX" || _knoboff_census_empty "$C_BA" \
+      || _knoboff_census_empty "$C_CX" || _knoboff_census_empty "$C_CA"; then
+        warm=no; why="a scored build compiled NOTHING, so its image is an artifact some earlier run left behind"
+    fi
+    echo -e "   knoboff: warm=${warm} compiled_baseline=[$(_knoboff_census_show "$C_BX")|$(_knoboff_census_show "$C_BA")] compiled_tree=[$(_knoboff_census_show "$C_CX")|$(_knoboff_census_show "$C_CA")]   (x86|arm)"
+    echo -e "   user_blob  baseline ${BLOB_B:0:16}   tree ${BLOB_C:0:16}   (include_bytes! payload, arch/aarch64/syscall.rs)"
+    if [ "$warm" != yes ]; then
+        echo -e "${COLOR_RED}knoboff: 2 — NO VERDICT: cache not warm (rebuilt: ${foreign:-<nothing — see below>})${COLOR_RESET}"
+        echo -e "         $why."
+        echo -e "         SMALLFIX measured 2638 bytes of difference between a COLD and a WARM build of ONE"
+        echo -e "         pristine tree (kernel8.img 9d3103c3… vs 0b6f2381…, QUEUE §5 2026-09-16), so two images"
+        echo -e "         built in different cache states cannot be compared for byte identity at all — the"
+        echo -e "         answer would be about the cache. This is not a failure of your change."
+        echo -e "         TWO CAUSES, and the census above says which:"
+        echo -e "           * a foreign crate in the census => your diff edits a NON-kernel workspace crate"
+        echo -e "             (crates/net, libs/…). It recompiles on the tree side and cannot on the baseline"
+        echo -e "             side, so knoboff has no power over that question and declines it rather than"
+        echo -e "             answering it wrongly. Measure that arc's identity on the armed artifact instead."
+        echo -e "           * an empty census => the forced kernel recompile did not happen. Check that"
+        echo -e "             ${COLOR_YELLOW}$TREE/unaos/crates/kernel/src/{main,lib}.rs${COLOR_RESET} exist and are writable."
+        echo -e "         Do NOT relax this to get a verdict out of the tool: a 0 whose cache state is unknown"
+        echo -e "         is exactly the green SMALLFIX proved means nothing (LAWS §5)."
+        _knoboff_bye 2; return 2
+    fi
+    # The include_bytes! payload is not a cargo output and no phase here builds it, so a difference
+    # between the two scored builds is a byte delta with no source behind it. Under the default sets it
+    # is `baremetal`-gated and reads `absent` on both sides; under UNAOS_TEGRA_EL0 it reaches the image.
+    if [ "$BLOB_B" != "$BLOB_C" ]; then
+        echo -e "${COLOR_RED}knoboff: 2 — NO VERDICT: unaos/target/user_blob.bin MOVED between the two scored builds.${COLOR_RESET}"
+        echo -e "         baseline ${BLOB_B}"
+        echo -e "         tree     ${BLOB_C}"
+        echo -e "         That file is \`include_bytes!\`d by arch/aarch64/syscall.rs, is produced by"
+        echo -e "         \`build_user_blob\` rather than by cargo, and is NOT rebuilt by any phase here — so a"
+        echo -e "         change in it is a byte delta with no source behind it and would be scored as yours."
+        echo -e "         Rebuild it once (\`./arroyo kernel8\`, or delete it and let \`check\` re-make it) and"
+        echo -e "         re-run, so that both scored builds embed the same payload."
         _knoboff_bye 2; return 2
     fi
 
@@ -9516,7 +9728,7 @@ knoboff() {
     done
 
     if [ $rc -eq 0 ]; then
-        echo -e "${COLOR_GREEN}knoboff: PASS — '$feat' OFF is byte-identical to ${base_sha:0:8} on both arches; control fired.${COLOR_RESET}"
+        echo -e "${COLOR_GREEN}knoboff: PASS — '$feat' OFF is byte-identical to ${base_sha:0:8} on both arches; control fired, cache warm.${COLOR_RESET}"
         echo -e "   Scope of that PASS: the x86_64 and aarch64-virt KERNEL images. NOT kernel8.img (built"
         echo -e "   from K8_FEATS, a separate curated list) and NOT any staged media. A pi ack is still a pi ack."
         # WHICH QUESTION THE SHA ANSWERS (pi 7's SP2, 2026-09-06). A before/after digest answers exactly

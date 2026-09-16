@@ -309,7 +309,9 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   so fold line-neutral or append at the tail; a cfg'd-out `pub mod` declaration is the exception (the
   file is never lexed) and the module root is not. Folded witnesses survive only by grep: gate a
   re-cut by witness symbol count, never by a clean apply. **A comment inserted mid-line kills the
-  code to its right** with every gate green: code first, comments last, assert the column.
+  code to its right** with every gate green: code first, comments last, assert the column. The CACHE
+  is part of the recipe — one pristine tree hashed 2638 B apart cold vs warm (SMALLFIX 2026-09-16) —
+  so a `knoboff` verdict is trusted only with `warm=yes` printed beside it (GATE-KNOBOFF).
 - **A cfg-widen's gates compile the configuration it turns on, in a fresh tree** (orin 1; pi 7 +
   orin 17 2026-09-06); prove the leg by re-applying the broken change and watching it go red.
 - **Before shipping a check into a brief, feed it a case that must pass and one that must fail**; a
