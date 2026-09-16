@@ -5686,18 +5686,18 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
 ///
 /// ### CURSOR-VUG — a consumed POINTER report still moves the system arrow
 ///
-/// `Event::Mouse`/`Event::MouseAbsolute` are packable, so before this arc a focused ring-3 app
-/// swallowed every pointer report whole: the shell's drain fell through its catch-all arm and
-/// `pal::cursor::move_rel` was never called again for as long as that app held focus. The arrow
-/// froze, auto-hid 1.5 s later, and was then taken off the panel by the next composite tail that
-/// bracketed its box — which over a PRESENTING window is within a frame and over a static desktop is
-/// never. That asymmetry is Peter's "vug blocks mouse cursor" exactly, and it is also why every
-/// cursor witness stops emitting at the moment a window is raised (`pal::cursor::rollup_tick` hangs
-/// off the same motion path). See [`crate::pal::cursor::track_routed`] for the full ledger.
+/// `Event::Mouse`/`Event::MouseAbsolute` are packable, so before that arc a focused ring-3 app
+/// swallowed every pointer report whole: the shell's drain fell through its catch-all arm, no install
+/// ran while that app held focus, the arrow froze, auto-hid 1.5 s later and was taken off the panel by
+/// the next composite tail over its box — Peter's "vug blocks mouse cursor". See [`crate::pal::cursor::track_routed`].
 ///
-/// The delivery decision is UNTOUCHED — the app receives the report, and the shell still sees
-/// `Event::Unknown`. Only the consumed branch tracks, so a report the router declined is moved by
-/// the drain exactly once, as it always was; a relative report can never be applied twice.
+/// ### PTRINSTALL2 (rmbp-ledger B117) — the arrow follows a RELATIVE report where it is PRODUCED
+/// `x86_input_service` installs every relative report (`main.rs::x86_ptr_install`) the instant it
+/// takes it off the ring, before the channel and this router see it, whoever holds focus — the position
+/// tracks the pad at HID rate through a render-core stall — so the consumed branch here must NOT
+/// install it again (the doubling PTRINSTALL measured and stopped on). `track_routed` is therefore
+/// ABSOLUTE-ONLY: a consumed `MouseAbsolute` tracks here, a declined one in the drain's arm, once either
+/// way. Delivery is UNTOUCHED: the app gets the report (it drags by `INPUT_EV_MOUSE_REL`), the shell `Unknown`.
 pub fn user_input_route(ev: crate::pal::Event) -> crate::pal::Event {
     if user_input_enqueue(ev) {
         crate::pal::cursor::track_routed(&ev);

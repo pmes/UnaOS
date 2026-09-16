@@ -2004,11 +2004,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // Placed after the `match` rather than beside the routers so that the cursor is FRESH on
             // both branches, which is the other half of it — `wc_drag_motion` reads the shared
             // `pal::cursor` position rather than the report's delta:
-            //   * CONSUMED — `user_input_route` -> `pal::cursor::track_routed` has already applied it
-            //     (CURSOR-VUG). Without that arc this line would steer to a stale position.
+            //   * CONSUMED — `user_input_route` -> `pal::cursor::track_routed` applied an ABSOLUTE one
+            //     (CURSOR-VUG). ⚠ PTRINSTALL2 (B117) narrowed it to absolute: on THIS inline loop a
+            //     consumed RELATIVE report is now installed by nobody (reported in B117, not fixed here).
             //   * DECLINED — the `Mouse`/`MouseAbsolute` arms above have just applied it.
-            // Exactly ONE tick per pointer report either way, so a relative report is never applied
-            // twice and the 16 ms throttle measures real time rather than a doubled rate.
+            // The 16 ms throttle measures real time rather than a doubled rate on every branch.
             //
             // Costs one `matches!` on non-pointer events and one atomic load when no drag is live,
             // which is every report on a boot where nobody grabbed a title bar.
@@ -6162,7 +6162,7 @@ fn x86_input_service(cpu: usize) {
                 let Some(ev) = unaos_kernel::pal::next_event() else { break };
                 match ev {
                     // Relative motion: fold into anything already owed, else offer it.
-                    Event::Mouse { x, y } => { #[cfg(feature = "wc")] ptrinstall_report(); match owed_motion.as_mut() { // PTRINSTALL (B117) — the REPORT stamp: every relative report the producer takes off the ring is counted here, before the fold/offer decides its fate, and the oldest-pending clock is armed if idle. The arm became a block for exactly this statement; the matching `}` is on this arm's last line. ⚠ LINE-NEUTRAL fold, `wc`-erased; the fn is at this file's tail.
+                    Event::Mouse { x, y } => { #[cfg(feature = "wc")] ptrinstall_report(); x86_ptr_install(x, y); match owed_motion.as_mut() { // PTRINSTALL (B117) — the REPORT stamp: every relative report the producer takes off the ring is counted here, before the fold/offer decides its fate, and the oldest-pending clock is armed if idle. PTRINSTALL2 — then THE INSTALL: `x86_ptr_install` moves the pointer by this report NOW, on this core, at HID rate, before the channel decides the report's fate; the delta still travels unchanged (a focused app drags by it) and no consumer installs it again. The arm became a block for exactly these statements; the matching `}` is on this arm's last line. ⚠ LINE-NEUTRAL fold, the report stamp `wc`-erased, the install in every x86 image; both fns are at this file's tail.
                         Some(acc) => {
                             // `saturating_add` for the reason `pal`'s fold uses it: the sum is
                             // unbounded in principle and a wrapped delta would throw the arrow
@@ -6837,12 +6837,12 @@ fn x86_render_service(cpu: usize) {
                         }
                     }
                 }
-                unaos_kernel::pal::Event::Mouse { x, y } => {
-                    // CURSOR-X86/CURSOR-WCR: on this target these verbs drive the COMPOSITOR SPRITE in
-                    // the front buffer, so `move_rel` repaints the arrow on the report itself and
-                    // `draw_over` is the idempotent tail; the leading `restore` the back-buffer targets
-                    // need is deliberately absent (it was a duplicated undraw with a wasted publish).
-                    unaos_kernel::pal::cursor::move_rel(x, y, pal.width() as i32, pal.height() as i32);
+                unaos_kernel::pal::Event::Mouse { .. } => {
+                    // PTRINSTALL2 (B117): the POSITION was installed by the PRODUCER (`x86_input_service`
+                    // -> `x86_ptr_install`, this file's tail) the instant it took this report off the
+                    // ring, at HID rate, whatever this core was doing — so this arm no longer calls
+                    // `move_rel` (a second install here would double the motion). `draw_over` stays: the
+                    // idempotent tail that owes the sprite back if a composite took it down (CURSOR-X86).
                     unaos_kernel::pal::cursor::draw_over(&mut pal);
                 }
                 unaos_kernel::pal::Event::MouseAbsolute { x, y } => {
@@ -6875,15 +6875,15 @@ fn x86_render_service(cpu: usize) {
             // Placed after the `match` rather than beside the routers so that the cursor is FRESH on
             // both branches, which is the other half of it — `wc_drag_motion` reads the shared
             // `pal::cursor` position rather than the report's delta:
-            //   * CONSUMED — `user_input_route` -> `pal::cursor::track_routed` has already applied it
-            //     (CURSOR-VUG). Without that arc this line would steer to a stale position.
-            //   * DECLINED — the `Mouse`/`MouseAbsolute` arms above have just applied it.
+            //   * RELATIVE — the PRODUCER installed it (`x86_ptr_install`, PTRINSTALL2) before it was
+            //     ever offered to the channel, whoever holds focus; nothing on this core installs it.
+            //   * ABSOLUTE — consumed: `track_routed` at the router; declined: the arm above.
             // Exactly ONE tick per pointer report either way, so a relative report is never applied
             // twice and the 16 ms throttle measures real time rather than a doubled rate.
             //
             // Costs one `matches!` on non-pointer events and one atomic load when no drag is live,
             // which is every report on a boot where nobody grabbed a title bar.
-            unaos_kernel::arch::x86_64::syscall::wc_route_tail(raw); #[cfg(feature = "wc")] ptrinstall_drained(raw); // PTRINSTALL (B117) — the DRAIN stamp, placed AFTER both install branches on purpose: the consumed branch installed inside `wc_route_event` (`pal::cursor::track_routed`) and the declined branch in the `Mouse` arm above, so this is the moment the pointer has been moved for this dispatch and the lag since the oldest report behind it is measured. Counts post-fold dispatches. ⚠ LINE-NEUTRAL fold, `wc`-erased; the fn is at this file's tail.
+            unaos_kernel::arch::x86_64::syscall::wc_route_tail(raw); #[cfg(feature = "wc")] ptrinstall_drained(raw); // PTRINSTALL (B117) — the DRAIN stamp: the moment this dispatch has run its arms and the drag tail. PTRINSTALL2 moved the relative INSTALL to the producer, so a drain no longer installs anything relative; what `lag_max_ms` now reads is how long the channel and this core held the report behind its install — the delivery lag a focused app's drag sees, not the pointer's. Counts post-fold dispatches. ⚠ LINE-NEUTRAL fold, `wc`-erased; the fn is at this file's tail.
 
             // Take the next queued event if one is already waiting; otherwise the burst is drained
             // and we fall through to the single present. Never parks, so an empty channel costs one
@@ -9917,26 +9917,27 @@ fn bootclock_report(stamps: (u64, u64, u64)) {
 //                  `pal::EVENT_QUEUE` — the HID side's delivery, counted at the ring, before the
 //                  offer/fold decides what happens to each one.
 //   * `installs`   installs made ON THE PRODUCER SIDE, i.e. `pal::cursor::move_rel` called from
-//                  `x86_input_service` at HID rate. **Structurally 0 in this tree**, and that zero is
-//                  the finding on the wire: moving the install here doubles every report while a
-//                  ring-3 app holds focus, because the consumed branch of the router
-//                  (`arch/x86_64/syscall.rs::user_input_route` → `pal::cursor::track_routed`) installs
-//                  the same delta again — CURSOR-VUG's invariant "exactly one tick per report on
-//                  exactly one path" is enforced by that pair, and both are files this arc may not
-//                  touch. The repair is stated in engine.md's PTRINSTALL section; when it lands, the
-//                  producer's `move_rel` charges this counter and `lag_max_ms` collapses to ~0.
+//                  `x86_input_service` at HID rate (`x86_ptr_install`, below). PTRINSTALL left this
+//                  structurally 0 — the second install site, the router's consumed branch
+//                  (`arch/x86_64/syscall.rs::user_input_route` → `pal::cursor::track_routed`), would
+//                  have doubled every report while a ring-3 app held focus. PTRINSTALL2 narrowed
+//                  `track_routed` to ABSOLUTE reports and took `move_rel` out of the render service's
+//                  `Mouse` arm, so on the SCHED-X86 split a relative report is installed exactly once,
+//                  here, and `installs == reports` is the identity every sample must show; the
+//                  `MouseAbsolute` path is untouched on both branches.
 //   * `coalesced`  reports the producer summed into `owed_motion` because the channel refused the
 //                  offer (INPUT-UNGATE's fold) — the CUMULATIVE twin of deadman's per-second `in=`
 //                  first field, so the identity below can be read off one line.
-//   * `drains`     relative dispatches the render service completed, counted AFTER both install
-//                  branches (the `wc_route_tail` line): each is exactly one consumer-side install,
-//                  post-fold (a folded run is one drain).
+//   * `drains`     relative dispatches the render service completed, counted at the `wc_route_tail`
+//                  line: each is exactly one consumer-side DELIVERY (arms + drag tail), post-fold (a
+//                  folded run is one drain). Since PTRINSTALL2 a drain installs nothing relative.
 //   * `folds`      `GUI_FOLD_X86`, the channel-side fold, unchanged.
 //   * `lag_max_ms` the longest time a relative report waited between the producer taking it off
-//                  the ring and the dispatch that installed it (or the run it was folded into):
+//                  the ring and the dispatch that delivered it (or the run it was folded into):
 //                  `PTRI_OLDEST_MS` is armed by the first report after an idle drain and cashed by
 //                  the next drain. On flight 8 this is the number CHOP could only infer — the
-//                  seconds-long `span-flush` holds read here directly, as milliseconds.
+//                  seconds-long `span-flush` holds read here directly, as milliseconds. With the
+//                  install on the producer it is the lag a focused app's drag sees, not the arrow's.
 //
 // THE IDENTITY, at any instant the pipe is quiet (`inflight=0`, nothing owed, nothing in hand):
 //     reports == drains + folds + coalesced
@@ -10041,4 +10042,40 @@ fn ptrinstall_rollup() {
             installs, reports, folds, lag, coalesced, drains
         );
     }
+}
+
+/// PTRINSTALL2 (rmbp-ledger B117) — the PRODUCER-side install of one relative report, x86 only.
+///
+/// Called by `x86_input_service` for every `Event::Mouse` it takes off `pal::EVENT_QUEUE`, BEFORE the
+/// offer/fold decides the report's fate on the channel, so the pointer's POSITION advances at HID rate
+/// whatever the render core is doing — the span-flush stall CHOP measured (flight 8, 5.3 : 1) left it
+/// frozen for seconds and then folded the backlog into one jump. The delta still travels the channel
+/// unchanged: a focused ring-3 app drags by it (`INPUT_EV_MOUSE_REL`, `pack_input`) and
+/// `wc_drag_motion` reads the resulting absolute position. Neither the render service's `Mouse` arm
+/// nor the router's consumed branch (`pal::cursor::track_routed`, now absolute-only) installs it
+/// again, so on the SCHED-X86 split every relative report installs exactly once, here.
+///
+/// Panel geometry comes from `video::WRITER` with the `is_ready()` guard `track_routed` carried for the
+/// same reason: this task has no `pal` in hand, and a framebuffer that is not up yet, or a degenerate
+/// panel, is a no-op. `move_rel` is safe from this core while the render core composites — measured by
+/// PTRINSTALL (engine.md §PTRINSTALL): `POS` is a masked constant-time spinlock, the sprite claim is
+/// `claim_bounded(2 ms)` → `owe_repaint`, `WRITER` is copied, `TABLE` may not block by rule. Charges
+/// `PTRI_INSTALLS` under `wc` so the wire reads `installs == reports`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn x86_ptr_install(dx: i32, dy: i32) {
+    let (w, h) = {
+        let fb = *unaos_kernel::video::WRITER.lock();
+        if !fb.is_ready() {
+            return;
+        }
+        let i = fb.info();
+        (i.width as i32, i.height as i32)
+    };
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    unaos_kernel::pal::cursor::move_rel(dx, dy, w, h);
+    #[cfg(feature = "wc")]
+    PTRI_INSTALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }

@@ -17520,3 +17520,75 @@ two relaxed loads with no snapshot, so a Timer send/recv landing between them pr
 and `inflight` wraps: this run's last sample is `sent=541 recv=542 inflight=18446744073709551615`;
 zero such lines in the 11ca67f1 capture of the same lane. Shared x86 code, one sample in 28, cosmetic
 until someone scores `inflight` numerically.
+
+**PTRINSTALL2 — the four-site change LANDED (branch `exec-rmbp-ptrinstall2`, parent 34084499; B117
+open → fixed-unflown, 2026-09-16).** The change above is made, and one part of it was narrowed by
+measurement. (4) `main.rs:6165` — the producer's `Event::Mouse` arm calls `x86_ptr_install(x, y)`
+(new fn at the file tail, x86-only, every image: panel geometry from `video::WRITER` behind
+`track_routed`'s `is_ready()` guard, then `move_rel`, then `PTRI_INSTALLS` under `wc`) BEFORE the
+offer/fold, folded before the line's first `//` beside the report stamp. (3) `main.rs:6840-6847` — the
+render service's `Mouse` arm keeps `draw_over` and no longer calls `move_rel`. (1)
+`syscall.rs:5687-5700` — the CURSOR-VUG paragraph now says a relative report is installed where it is
+produced, whoever holds focus, and the consumed branch must not install it again; the call on
+`:5703` is unchanged in text. (2) `pal.rs::track_routed` is NARROWED TO `MouseAbsolute`, not
+retired: the function is also the consumed-branch ABSOLUTE install, which "MouseAbsolute untouched"
+protects and which `wmdirect_selftest` leg 3 (`syscall.rs:8249`) drives through the router. The
+go-red measured it — with the absolute arm disabled by one `if false` guard, `UNAOS_WC=1 ./arroyo test
+150` printed `[wm-act] direct … route=false … settle=false lead=false … from=(426,305)
+to=(426,305) -> FAIL` and the `x86-wc.spec` replay went rc 1 (REQUIRE `[wm-act] direct .* -> PASS`
+missed, FORBID `-> FAIL` hit); reverted `cmp`-identical, `./arroyo check` rc 0 again. `track_routed`
+had exactly one code caller (`syscall.rs:5703`; the other ten hits over `crates/kernel/src` are
+comments). Line arithmetic: every mid-file hunk is line-neutral — `wc -l` `main.rs` 10044 → 10081
+(tail only: one comment line in the PTRINSTALL block, 36 lines of `x86_ptr_install`), `syscall.rs`
+24179 → 24179, `pal.rs` 2211 → 2211 — and `./arroyo knoboff wc 34084499` proves it where it
+matters: exit **1**, `warm=yes`, control fired on both arches, **arm knob-off image BYTE-IDENTICAL**
+and the **x86 knob-off image MOVED** (1,616,504 → 1,616,480 bytes, 1,195,944 differ). The x86 move is the
+intended trade, not a line shift: the four sites are x86 desktop code compiled with `wc` off too, and
+a wc-off boot must install once at the producer as well — gating the fix on `wc` would leave that
+image with no relative install at all.
+
+Gates, this tree: `./arroyo check` rc 0 (158 ✅ legs, 79 cfg legs, no warning names the new fn);
+`UNAOS_QEMU_FULL=1 UNAOS_WC=1 ./arroyo test 150` rc 0 (`mode=full wall=157.3 completion=complete
+complete_line=2231`, 2517 lines, 0 fault tokens; banner `witness,ehcihid,kbdwit,sdhcblk,smolnet,wc,
+sdwrite`); `x86-wc.spec` replay rc 0, **8/8 required, 0 forbidden**. The pins, unchanged from
+PTRINSTALL's run of the same lane: `[ptrdead] backlog whole=true nodrop=true order=true pushed=192
+entries=1 travel=(192,-192) folded=192 dropped=0 fpop12=0 fpop3=0 -> PASS` (the fixture drains its own
+pushes with `next_event()` and never routes, so it is independent of the install site); `[dmgovlp]
+verdict passes=12/12 drained=12/12 drag_evt=5 drag_px=38590 relay=3 narrow=3/12 cur=12/12 adopt=25
+repaint=0 max_ms=4 adopt_stretch=4/4 -> PASS` (its drag is damage relay, not pointer events);
+`[wm-act] direct … settle=true lead=true … from=(426,305) to=(450,329) -> PASS`; `[cursor8] repair
+rate scope=fixture requests=5 repairs=2 suppressed_stale=1 suppressed_rate=2 unclocked=0 floor_ms=8
+-> LIMITED`; `[wedge9] sprite-claim scope=fixture refused=0 masked=0 retried=0 owed=0 serviced=0 ->
+QUIET`; `[schedx86] depth sent=562 recv=562 inflight=0 fold=0` at the end; artifact tokens `::
+PTRINSTALL: installs=` 1, `[ptrinstall] installs=` 1, control 0. `x86-default.spec` carries no cursor
+pin (grep for cursor/wedge/ptrdead/dmgovlp/press/drag/vug returns nothing).
+
+**What is NOT measured, and why it is a STOP rather than a claim.** `installs == reports > 0` needs
+a relative pointer. The x86 suite has none: QEMU carries a `usb-tablet` only (`arroyo:3137`,
+absolute → `MouseAbsolute` → `set_abs`, never `x86_ptr_install`), `usb-mouse` appears nowhere in
+`arroyo` or `builder/src/main.rs`, and the QMP typist's `--pointer-kind rel` (`scripts/qmp_type.py:193`)
+has no device to drive because the XHCIHUB lane hard-wires `abs` (`arroyo:3910`). So the wire is
+`:: PTRINSTALL: installs=0 reports=0 folds=0 lag_max_ms=0 coalesced=0 drains=0 ::` ×1 — the zero
+control, `0 == 0` — and the brief's doubling go-red (render-side `move_rel` reinstated) cannot fire
+here: with `reports=0` the two builds print the same line. The missing fixture is a relative-pointer
+lane: `UNAOS_QEMU_EXTRA="-device usb-mouse,bus=xhci.0"` plus the typist with `--pointer-kind rel`
+(whether the xHCI HID driver enumerates a second pointer beside the tablet is the first thing it
+would measure), or flight 11 with the pad. **Flight 11 watch-list line**, no knob beyond
+`UNAOS_WC=1`: `[ptrinstall] installs=N reports=N lag_max_ms=~1 coalesced=C drains=D folds=F` every
+5 s beside `[schedx86] depth`, `installs == reports` at every sample, `N == D + F + C` at quiet ones,
+and the arrow's POSITION tracking the pad through a `[wcser] PASS OVERDUE … at=span-flush` hold
+(`lag_max_ms` now reads the channel's delivery lag — what a focused app's drag sees — not the
+arrow's; the pixels through the hold are SPANFLUSH's, B116). Go-red on the pad: reinstate
+`move_rel` at the render arm and the arrow runs at twice the pad's rate while `installs == reports`
+still prints — the doubling is on the glass, not in the counters, which is why the counters alone
+cannot certify it.
+
+**Reported, not fixed (outside the four sites; the paragraph above says `:1944` stays).** The
+inline-BSP GUI loop (`main.rs:1892`, taken only when fewer than two APs are online or under `rast`)
+routes through the same `user_input_route`, so on THAT loop a consumed RELATIVE report is now
+installed by nobody — the CURSOR-VUG shape, on a path the suite (`-smp 4`) and the bench (8 cores)
+never take. The `:2007` comment states it. The fix is the same principle in two line-neutral folds:
+install before `wc_route_event` at `:1892` and cfg the `:1944` `move_rel` to `not(target_arch =
+"x86_64")` (that arm is shared with aarch64, where it is the only install). Other `wc_route_event`
+callers (`drain_and_route`, the wmdirect legs) push absolute reports or count pops and are unchanged
+in what they assert.
