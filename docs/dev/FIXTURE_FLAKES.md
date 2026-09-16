@@ -754,6 +754,156 @@ consequence for this corpus: none of Classes 1-3 reproduced at load ~20 on a
 is a sufficient account. Full run table and quotations:
 `docs/dev/evidence/rmbp-0915/flakerate/FLAKERATE.md`.
 
+---
+
+## Class 6 — the fixture drives a step that may DECLINE, then scores the value that step was to publish
+
+**The shape, and why it is not Class 1 or Class 5.** Class 1 is a launcher racing a
+ring-3 fixture's *teardown*; Class 5 is the right verdict *lost on the wire*. This
+class is neither: everything is in-kernel, one task, and the line reaches the
+capture intact — it is simply **wrong**, because the fixture treated a request as a
+result. A kernel-side fixture calls a drive step whose signature is `-> ()` and
+whose contract explicitly allows it to decline the whole pass and be re-asked
+later, then reads the state that step was supposed to have published.
+
+**The discriminator, and it is free.** Ask whether the PUBLISHER's own witness ran
+between the drive and the read. If the publisher's line is absent — or present but
+positioned *after* the verdict — the fixture scored a value that had not been
+written yet. A verdict whose fields are all the *zeros of an empty snapshot* rather
+than plausible-but-wrong numbers is the same tell one layer down.
+
+**The rule for a reader.** A red whose numbers are structurally empty (`0x0+0`,
+`passes=0`, `opens=0`) is a fixture that never got to ask its question. That is not
+the subsystem's verdict and must never be re-run away silently — record it here.
+
+### 6a. `:: WINMENU: … app_box=false … :: FAIL ::` — **known, fixed**
+
+**Signature on the wire** (pre-fix; byte-identical across two sessions and two
+trees, which is itself part of the diagnosis — a real red would vary):
+
+```
+:: WINMENU: win=1 name=gate box=0x0+0 title-x=6 drop=0x0+0+0 font=chrome20-bold panel=1280x800 app_box=false routed_open=false geometry=false escape=false quit_closes=false app_name_late=false :: FAIL ::
+[winmenu] selftest passes=0 paints=0 rate=0/1k scan=0cyc/0us paint=0cyc/0us px/paint=0 live=0 bar_owner=0 open=0 publishes=0 clears=0 opens=0 dismisses=0 picks=0 refusals=0
+```
+
+The green counterparts, for contrast:
+
+```
+:: WINMENU: win=1 name=gate box=48x34+34 title-x=40 drop=134x65+40+34 font=chrome20-bold panel=1280x800 app_box=true routed_open=true geometry=true escape=true quit_closes=true app_name_late=true :: PASS ::
+[winmenu] selftest passes=2 paints=2 rate=1000/1k scan=106060cyc/53us paint=1226180cyc/614us px/paint=8710 live=0 bar_owner=0 open=0 publishes=0 clears=0 opens=2 dismisses=2 picks=1 refusals=0
+```
+
+**Read `title-x=6` FIRST.** It is `x[0] + TPAD` (`winmenu.rs`'s `BarSnapshot::text_x`,
+`TPAD == strip::PAD / 2 == 6`), so `title-x=6` means `x[0] == 0` — the snapshot is
+`BarSnapshot::empty()`, handed back by `bar_boxes`'s no-publisher early return
+(`if LIVE == 0 && app_owner == wm::WIN_NONE`). The six falses are one fact, not six.
+
+**The collateral, and it is the loudest tell in the capture.** Leg 2 presses the app
+box's CENTRE, computed off that empty snapshot — so it presses `(0, 0)`, which
+`strip::press_route` falls through winmenu into `crystal::press_at`'s brand-mark
+corner. Every red therefore walks the SHARD menu open and scores its state:
+
+```
+:: SHARD-MENU: crystal_press=open via=corner-zone menu=170x121+0+34 items=4 ::
+```
+
+**It is COUNTABLE, and it separates the two states on 10 captures out of 10.** The
+crystal's own fixture opens the shard from the corner exactly once per boot; leg 2
+and leg 5 of a red winmenu fixture add two more. Over both sessions' ten runs:
+
+```
+LC_ALL=C grep -a -c -F 'via=corner-zone'   # 1 in all eight greens, 3 in both reds
+LC_ALL=C grep -a -c -F 'via=fixture-direct' # 5 in all ten — unchanged, so the delta is real
+```
+
+A seat that sees the crystal moving inside the winmenu fixture's window is looking
+at this class, not at a crystal bug. **Count first: it is one command and it needs
+no line numbers.**
+
+**Trigger conditions — measured 2026-09-16 (WINMENUFLAKE) from the captures on
+disk: 2 red in 10, i.e. 1 in 5 in each of two independent sessions.**
+
+| Session | Command | Runs | Red |
+| --- | --- | --- | --- |
+| INSTALLVERB, 2026-09-15 | `UNAOS_INSTGUI=1` + `wc` | 5 (`baseline`, `run1`-`run4`) | 1 — `recon1.txt`, verdict at `serial.log:1642` |
+| QUARRYX86-2, 2026-09-16 | `UNAOS_WC=1 UNAOS_QUARRY=1 ./arroyo test` | 5 (`recon`, `baseline`, `press`, `press2`, `gored`) | 1 — `test-recon.log:2283` |
+
+The five QUARRYX86-2 runs are distinct runs and not re-readings of one: their
+`[winmenu] selftest … scan=` counters are `0`, `137040`, `74580`, `72290`, `106060`
+cycles. (`serial-press-AFTER.log` and `serial-gored-BEFORE.log` are the serial sides
+of `test-press2` and `test-gored` — same counters, so they are **not** extra runs.)
+
+**Both reds were that session's FIRST run** — the `recon` run in each case, against
+a QEMU that had not run on that box yet. Neither session reproduced it again at any
+load. That correlation is recorded as an observation and is not part of the
+mechanism below; it is what to try first if it ever needs reproducing.
+
+**Root cause — known.** `winmenu::selftest` drove `wm::focus_changed(OWNER)` +
+`wm::composite()` and read `bar_boxes()` on the next line. Only
+`menubar::compose` → `winmenu::set_app_window` ever stores `APP_OWNER`, and
+`wm::composite()` returns `()` and has three documented arms that return early
+without reaching it, every one of them correct and all three saying *"re-ask next
+composite"*:
+
+- x86 `COMP_GATE`'s second-entrant **FOLD** (`wm.rs`, COMPGATE);
+- `menubar::compose`'s `panel_snapshot().filter(is_ready)` arm (LOCKFIX B1);
+- `menubar::compose`'s `if model.menus.busy { return false; }` arm (PANEL V-3).
+
+So one `wm::composite()` is a *request* to publish. The two reds caught both halves
+of that: in QUARRYX86-2's the publication never landed at all before the verdict —
+`[winmenu] app-menu owner=1 name=gate` is **absent**, and the next one
+(`…name=VUG from=program`, line 2285) lands two lines **after** the FAIL at 2283. In
+INSTALLVERB's the composite landed *late* — `[winmenu] app-menu owner=1 name=gate`
+(2250) and `[menubar] menus cap_owner=1 cap=gate … boxes=1 items=app:gate@34+48`
+(2253) are both present, but the fixture's own corner-zone presses (2245, 2251) are
+already above them. Same defect, two interleavings.
+
+**Fix.** `winmenu.rs`'s `await_app_publish(want, name)`: the fixture now parks until
+the bar is holding the window *and the name* it is about to score, re-driving the
+composite (the publisher is inside it, so asking again is the only thing that can
+make the store land), bounded at 250 ms. A timeout is **`-> SKIP reason=menu-unpublished-after=<ms>ms`,
+never a pass and never a FAIL** — the bar not having settled is a statement about
+the compositor's luck this boot, not about whether R21 holds. Both publish points
+carry it: leg 1 (`gate`) and leg 6 (`VUG`). The name is checked as well as the id
+because the gate window and leg 6's program window are **both `win=1`** on every
+capture in the corpus, so an id-only predicate would let leg 6 fire on leg 1's stale
+publication. The verdict line now carries `owner=… published=y waited=<ms>ms
+prog_waited=<ms>ms`, so a PASS that had to wait is visible instead of silent.
+
+**Sibling instruments to check before filing anything here as this class.** Neither
+`:: CRYSTAL-MENU: … :: PASS ::` nor `[menubar] menus …` is a clearance: both are
+green in the reds.
+
+**What to capture on recurrence.** The new fields make this cheap: `published=`,
+`waited=` and `prog_waited=` off the verdict line, plus whether a
+`-> SKIP reason=menu-unpublished-after=` line printed instead. A non-zero `waited=`
+on a PASS is the *same* declining compositor caught and recovered — bank it, it is
+the rate instrument for whether the 250 ms bound is right. Then: whether
+`[winmenu] app-menu owner=… name=gate` is present and where it sits relative to the
+verdict, and whether any `via=corner-zone` shard opens are in the region.
+
+**Disposition — FIXED (fixture ordering only; no product change), on branch
+`exec-rmbp-winmenuflake` off `11ca67f1`.** The menubar never published the wrong
+owner's menu: it published nothing, by design, and the fixture scored the gap. No
+`rmbp-ledger` row — there is no product defect here.
+
+**The go-red, because it is what makes this entry's root cause a measurement
+rather than a story.** Forcing the losing order deterministically — clear the
+publication and answer `published` without waiting, i.e. exactly what the unfixed
+fixture assumed — gives **rc=1 in 2 of 2 runs**, both
+`box=0x0+0 title-x=6 drop=0x0+0+0` with all six legs false and `via=corner-zone`
+at 3: **byte-identical to the two reds above**, from two sessions this seat did
+not run. The new `owner=0` field convicts the mechanism outright — `APP_OWNER` was
+`WIN_NONE` at the read — which is precisely what the old line could not say.
+
+**One gap left open, and a reader of this class should know it.** NO spec REQUIREs
+`:: WINMENU: … :: PASS ::` — `grep WINMENU unaos/scripts/specs/*.spec` is empty, so
+this fixture was only ever scored by `mbench.py`'s `DEFAULT_FORBIDS`. A SKIP matches
+none of them, so it is GREEN and silent: the right disposition for a flake and the
+wrong one for a real R21 regression, which would now SKIP where it used to FAIL. One
+`REQUIRE :: WINMENU: .*:: PASS ::` row in `x86-test.spec` closes it. Reported as a
+STOP by WINMENUFLAKE and not taken — specs were outside that brief's named files.
+
 ## Adding an entry
 
 An entry earns its place when a failure has been seen **more than once**, or once

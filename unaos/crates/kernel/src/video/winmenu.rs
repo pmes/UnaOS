@@ -1713,6 +1713,62 @@ pub fn rollup(scope: &str) {
 // Witness
 // ---------------------------------------------------------------------------
 
+/// WINMENUFLAKE — **park until the BAR has published `want`/`name`, and say how long that took.**
+///
+/// `wm::composite()` returns `()`, and a pass that DECLINES is indistinguishable at the call site
+/// from a pass that published: the compositor's three documented declines — x86 `COMP_GATE`'s
+/// second-entrant FOLD, `menubar::compose`'s LOCKFIX B1 `panel_snapshot()` arm, and PANEL V-3's
+/// `model.menus.busy` arm — all return early having never reached [`set_app_window`], and every one
+/// of them is correct behaviour whose stated remedy is *"re-ask next composite"*. So ONE
+/// `wm::composite()` is a REQUEST to publish, never a publication, and a fixture that reads
+/// [`bar_boxes`] straight after it is reading a value another task races.
+///
+/// That is the whole of the WINMENUFLAKE defect, measured on two captures a day apart
+/// (`docs/dev/FIXTURE_FLAKES.md` Class 6): in the red runs [`APP_OWNER`] was still
+/// [`wm::WIN_NONE`] at leg 1's read, `bar_boxes`'s no-publisher early return handed back
+/// `BarSnapshot::empty()`, and the verdict line printed the empty snapshot's own zeros —
+/// `box=0x0+0 title-x=6` (`title-x` is `x[0] + TPAD` on `x[0] == 0`, so the field is the tell).
+///
+/// The name is checked as well as the id, and that is load-bearing rather than belt-and-braces:
+/// the gate window and leg 6's program window are BOTH `win=1` on every capture in the corpus
+/// (`wm::create` hands the slot straight back after the first is closed), so an id-only predicate
+/// would let leg 6 fire on leg 1's stale publication and prove nothing.
+///
+/// It re-drives the composite rather than sleeping on it: the publisher IS `menubar::compose`
+/// running inside `wm::composite()`, so asking again is the only thing that can make the store
+/// land. Bounded by `PUBLISH_DEADLINE_US` and never by attempts — a holder that is never coming
+/// back is the compositor's own WCSER-STEAL problem, not this fixture's, and the deadline is what
+/// keeps this fixture off the critical path of that argument.
+///
+/// Answers `(published, waited_us)`. A `false` is a SKIP at the call site and NEVER a pass: the
+/// bar not having published is a statement about the compositor's luck this boot, not about
+/// whether R21 holds, and grading it FAIL is what cost two executors a run each.
+#[cfg(feature = "witness")]
+fn await_app_publish(want: wm::WinId, name: &[u8]) -> (bool, u64) {
+    // 250 ms — two orders of magnitude over the slowest furniture paint in the corpus
+    // (`[crystal] selftest … paint=2451031cyc/1228us`, installverb recon1 — quoted because it is
+    // the sibling fixture's paint on the SAME bar, this file's rollup lines being an order of
+    // magnitude under it) and well under any gate's patience. It is a ceiling, not a budget: the
+    // bound is what stops a dead holder wedging the battery, and `waited=` on the verdict line is
+    // what says whether it is the right one — a PASS that waited near it wants this number raised.
+    const PUBLISH_DEADLINE_US: u64 = 250_000;
+    let t0 = crate::arch::now_cycles();
+    loop {
+        let waited = strip::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0));
+        if APP_OWNER.load(Ordering::Acquire) == want {
+            let (buf, len) = app_name();
+            if &buf[..len] == name {
+                return (true, waited);
+            }
+        }
+        if waited >= PUBLISH_DEADLINE_US {
+            return (false, waited);
+        }
+        core::hint::spin_loop();
+        wm::composite();
+    }
+}
+
 /// WINMENU fixture — **A10, SO2 and SO3, each driven through the seam a real gesture uses.**
 ///
 /// Reached from [`super::crystal::selftest`]'s tail, which is the same arrangement `dock::selftest`
@@ -1744,6 +1800,7 @@ pub fn rollup(scope: &str) {
 ///    arms the launcher name AFTER it exists (the order the metal produces), and requires the bar to
 ///    read `VUG` with `[winmenu] app-menu … from=program` beside it. RED on this arc's base, where
 ///    the caption stays `Application` — which render13 boot 1 put on four of six launched windows.
+
 #[cfg(feature = "witness")]
 pub fn selftest() {
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -1797,6 +1854,43 @@ pub fn selftest() {
     let saved_focus = wm::focus_asid();
     wm::focus_changed(OWNER);
     wm::composite();
+    // WINMENUFLAKE — **SEQUENCE the scorer after the publication it asserts on.** See
+    // [`await_app_publish`] for why the `wm::composite()` above is a request and not a publication.
+    // Every leg below is downstream of leg 1's snapshot — leg 2 presses the box's centre, which on
+    // an EMPTY snapshot is `(0, 0)`, i.e. the CRYSTAL's corner zone, so an unpublished bar does not
+    // merely red this fixture, it walks the brand menu open and scores the shard's state instead.
+    // The fingerprint is countable and separates the two states on 10 captures out of 10:
+    // `LC_ALL=C grep -a -c -F 'via=corner-zone'` reads 1 in every green and 3 in both reds, while
+    // `via=fixture-direct` reads 5 in all ten. So the OLD red was not merely a wrong verdict, it
+    // was this fixture pressing another tenant's furniture — three surfaces' state disturbed to
+    // report one. Park first; grade nothing until the bar is holding what leg 1 is about to read.
+    let (published, waited_us) = await_app_publish(win, b"gate");
+    if !published {
+        // NOT A FAIL. The bar never named this window, so not one of the six legs was ever put a
+        // question — a verdict here would be a reading of the compositor's luck. Restore exactly
+        // as the leg-red path below does, and name the wait in the line so a reader can tell this
+        // SKIP from the `no panel` and `table full` ones above without opening the source.
+        if wm::info(win).is_some() {
+            wm::close(win);
+        }
+        dismiss("selftest");
+        wm::focus_changed(saved_focus);
+        menubar::set_enabled(saved_bar);
+        serial_println!(
+            ":: WINMENU: win={} name=gate owner={} published=n waited={}ms panel={}x{} \
+             -> SKIP reason=menu-unpublished-after={}ms ::",
+            win, APP_OWNER.load(Ordering::Acquire), waited_us / 1000, pw, ph, waited_us / 1000
+        );
+        // QUITLEAK — **the siblings still run.** The two SKIPs above this one (`no panel`,
+        // `table full`) return without them and may: neither is reachable on a healthy boot. THIS
+        // one is — it fired 2 runs in 10 before the park — so returning here the way they do would
+        // have taken A30's pulse gate and the app-quit gate off the wire on every occurrence, which
+        // is one flake silencing three fixtures. The `cfg` is spelled out rather than factored into
+        // a helper so the tail line's own siting argument at the foot of this function is untouched.
+        rollup("selftest");
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] { pulsequit_selftest(); appquit_selftest(); }
+        return;
+    }
 
     // Leg 1 — the app box exists, is box 0, and carries the window's own name.
     let s = bar_boxes(pw, ph);
@@ -1871,11 +1965,21 @@ pub fn selftest() {
         FIX_STRIDE as u32,
         b"el0 win 3",
     );
+    // WINMENUFLAKE — leg 6 drives the SAME publish seam as leg 1 and so carries the same park. It
+    // is the second half of the fix and not an extension of it: this leg's whole assertion is that
+    // the bar ENDS UP reading `VUG`, which is a statement about the settled bar, and scoring it off
+    // one composite asks instead whether that composite happened to win — the question leg 1 was
+    // already wrong to ask. `b"VUG"` disambiguates the stale publication: `wprog` takes `win`'s id.
+    let mut prog_waited_us = 0u64;
+    let mut prog_published = true;
     let leg_prog = wprog != wm::WIN_NONE && {
         let unnamed_first = wm::title_source_of(wprog) == wm::TitleSource::Unnamed;
         let armed_late = wm::app_name_arm(PROG_OWNER, "/apps/VUG.ELF");
         wm::focus_changed(PROG_OWNER);
         wm::composite();
+        let (p2, w2) = await_app_publish(wprog, b"VUG");
+        prog_published = p2;
+        prog_waited_us = w2;
         let s2 = bar_boxes(pw, ph);
         let v = unnamed_first
             && armed_late
@@ -1894,11 +1998,34 @@ pub fn selftest() {
     menubar::set_enabled(saved_bar);
 
     let (rx, ry, rw, rh) = r.map(|(x, y, w, h)| (x, y, w, h)).unwrap_or((0, 0, 0, 0));
+    // WINMENUFLAKE — leg 6's bar never settled, so `leg_prog` is a reading of the compositor and
+    // not of WINTITLE-LATE. Same verdict as leg 1's park, same reason, and it names leg 6 so the
+    // two SKIPs are not one signature: a reader must be able to see WHICH publication went missing.
+    if !prog_published {
+        serial_println!(
+            ":: WINMENU: win={} name=VUG owner={} published=n waited={}ms panel={}x{} \
+             -> SKIP reason=menu-unpublished-after={}ms ::",
+            wprog, APP_OWNER.load(Ordering::Acquire), prog_waited_us / 1000, pw, ph,
+            prog_waited_us / 1000
+        );
+        // QUITLEAK — the siblings still run; see leg 1's SKIP above for the argument.
+        rollup("selftest");
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] { pulsequit_selftest(); appquit_selftest(); }
+        return;
+    }
     let ok = leg_box && leg_open && leg_geom && leg_esc && leg_quit && leg_prog;
+    // WINMENUFLAKE — `owner=/published=/waited=` are the STATE THE VERDICT WAS SCORED AGAINST, on
+    // the verdict's own line. Without them a red is a list of six falses with nothing saying whether
+    // the bar was ever holding the window they are about (the two reds in the corpus are exactly
+    // that line), and the reader has to reconstruct it from the absence of a `[winmenu] app-menu`
+    // line thirty rows up. `waited=` is a rate instrument too: a PASS that waited is a compositor
+    // that declined and recovered, which is the sighting this fix would otherwise make invisible.
     serial_println!(
         ":: WINMENU: win={} name=gate box={}x{}+{} title-x={} drop={}x{}+{}+{} font={} panel={}x{} \
+         owner={} published=y waited={}ms prog_waited={}ms \
          app_box={} routed_open={} geometry={} escape={} quit_closes={} app_name_late={} :: {} ::",
         win, s.w[0], bh, s.x[0], s.text_x(0), rw, rh, rx, ry, menubar::BAR_FONT_NAME, pw, ph,
+        s.app_owner, waited_us / 1000, prog_waited_us / 1000,
         leg_box, leg_open, leg_geom, leg_esc, leg_quit, leg_prog,
         if ok { "PASS" } else { "FAIL" }
     );
