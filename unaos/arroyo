@@ -8486,7 +8486,16 @@ kernel8() {
     # certify a string that is not in the booted image. `llvm-objcopy -O binary` emits exactly the
     # ALLOCATABLE sections, which is exactly what the Pi executes, and `LC_ALL=C grep -a -o -F` reads a
     # flat binary as happily as an ELF. So the image is certified: same question, strictly stronger.
-    bash "${WORKSPACE_DIR}/scripts/banner-cert.sh" "$KERNEL8_DIR/kernel8.img" "$K8_FEATS" || exit $?
+    # PTRPRESS-K8ARCH (CERTCOND's owed one-liner): the THIRD argument is the arch, and this call is the
+    # one place in this file that needs it. `banner-cert.sh` reads the arch out of the artifact's own ELF
+    # header (e_machine at 0x12) precisely so no argument can lie about the bytes under test — but
+    # `kernel8.img` is FLAT (the objcopy above stripped the header), the reader has nothing to read, and with
+    # no argument the census prints `arch=unknown`, at which point every arch-qualified `cond` term is
+    # UNSATISFIED and its row stays UNVERIFIABLE instead of being checked. Nothing regresses today (the only
+    # arch-qualified term is on `witness`, whose cond hits `!baremetal` first on every Pi build), so this is
+    # the hole closed BEFORE a Pi row needs it rather than after. The other two call sites pass ELFs and are
+    # right to pass nothing.
+    bash "${WORKSPACE_DIR}/scripts/banner-cert.sh" "$KERNEL8_DIR/kernel8.img" "$K8_FEATS" aarch64 || exit $?
 
     # PIUSB-16: stock Pi GPU firmware blobs (start4.elf/fixup4.dat) + base DTB + the miniuart-bt overlay,
     # fetched from the OFFICIAL raspberrypi/firmware repo at the pinned FW_TAG (see the FW_* vars above)
