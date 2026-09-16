@@ -746,7 +746,31 @@ mount is about three sector reads (LBA 0, the GPT header, one BPB sector per MBR
 figure measured for the C15 knob-cost question). Bounded and irrelevant for `mv`, which asks once. It
 would matter if anything ever asked inside a loop; nothing does today.
 
-### 13.3 x86 has a namespace now
+### 13.3 x86 has a namespace now — and since X86BIND it is BOUND BY CONTENT
+
+> **X86BIND (2026-09-15) superseded the arm this section described.** The `#[cfg]` split is gone:
+> `vfs_mount_table` calls `fs::bootdisk::bind` on BOTH arches, so `/`, `/boot` and `/apps` on x86 are
+> the disk this kernel was FOUND on, exactly as on the Pi and the Orin, and every other enumerated
+> FAT disk is home soil at `/volumes/<LABEL>`. The one arch-specific statement left is an
+> INSTRUMENT, not a policy — the `READ_BIND` stamp, which exists only on x86 (§13.4).
+>
+> Measured on the AHCI fixture (`UNAOS_WC=1 UNAOS_AHCI=1 UNAOS_QEMU_FULL=1 ./arroyo test 90`, rc=0),
+> where the ESP carrying `kernel.elf` is the `ide-hd` on q35's controller:
+>
+> ```
+> [vfs] root = boot volume serial=0xfabe1afd source=ahci5 match=/kernel.elf matches=1 … ahci5=present ::
+> [vfs] resurvey n=1 ms=2376 bound_on_pass=2 … SO38: a no-root survey is not cached … ::
+> :: X86BIND: root=ahci5:/kernel.elf serial=0xfabe1afd by=content bootinfo=0xfabe1afd agrees=yes mounts=4 layout=true -> PASS ::
+> ```
+>
+> `/`, `/boot` and `/apps` carry ONE volume id (the ESP); the SD card is listed beside them at
+> `/volumes/UNAOS SDHC4`, not bound as root. `bootinfo=`/`agrees=` are OBSERVATIONS — root is a byte
+> comparison and never a serial (§14, LAWS §3). Go-red: flipping the loader's serial moves
+> `agrees=yes` to `agrees=no` and leaves the verdict at PASS.
+>
+> The paragraph below is kept as the record of what the x86 arm used to do.
+
+
 
 `vfs_mount_table()` was `#[cfg(target_arch = "aarch64")]` from VFS-1 — because the Pi came first, not
 because a mount table is an aarch64 idea. That gate is what forced every verb to carry two bodies.
@@ -774,6 +798,18 @@ before it starts. Both still hold; the gate simply asks the right thing now.
   different one. It still stamps `WRITE_GATE` and still writes the two-sink refusal
   (`REFUSED READ-ONLY` on the panel, the census on serial), so `fatverb_storage_witness` reads the
   same instrument.
+* **X86BIND made `fatverb.readvol` a CENSUS instead of an identity.** The leg used to require that
+  the read verbs and the exec probe bound the SAME handle. That was right while both asked the same
+  question through the same ladder; once the READ side binds the disk found by content and the exec
+  probe stays on `mount_program_source` — deliberately, see the next bullet — the two independent
+  producers are entitled to DISAGREE, and on the AHCI fixture they do: `exec=sdhc read=ahci
+  same=false`, because the loader's ladder points at the SD reader and the kernel was found on the
+  SATA ESP. The leg now passes on both sides having BOUND something (each counter advanced, neither
+  handle `never`) and PUBLISHES the agreement on its own line:
+  `:: [fatverb] readvol census: exec=<h> read=<h> same=<bool> exec_ran=<b> read_ran=<b> handles=… ::`.
+  A disagreement is a fact about the machine; failing on it would assert that root-by-content must
+  agree with the answer BOOTROOT exists in order not to trust.
+
 * The **exec probe** (`FatVolume::is_file`) deliberately keeps binding `mount_program_source()`
   itself and walking FAT directly (`fat_path_is_file`, the one FAT-direct walk left in `shell.rs`).
   That is not an oversight: the witness compares the probe's stamp with a read verb's, and its value

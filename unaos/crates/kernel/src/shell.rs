@@ -23,7 +23,7 @@ use crate::console::Console;
 // `crate::fs::vfs::{DirEnt, Stat, VfsError}` instead, which is the point: a listing row in this
 // shell is a NAMESPACE fact, not a FAT structure. aarch64 names none of them at all.
 #[cfg(target_arch = "x86_64")]
-use crate::fs::fat::{DirEntry, FatError, FatFs};
+use crate::fs::fat::{DirEntry, FatFs};
 // The in-kernel `vug` demo (the `vug` and `pulse` verbs) is an aarch64 module, and since DECRUD-1 a
 // knob-gated one — see the `pub mod vug` note in `lib.rs`. The verbs that drive it carry the identical
 // gate, so wherever the module is not compiled they are not registered at all and the words fall
@@ -220,12 +220,38 @@ mod bind {
     pub const ADMITTED: u8 = 5;
     /// The write gate REFUSED it as read-only.
     pub const REFUSED_RO: u8 = 6;
+    /// X86BIND: a SATA volume (`ahci<port>`, AHCIBOOT's rung of the walk).
+    ///
+    /// It needs its own code because [`of_name`]'s catch-all is `SDHC`, and once the READ side binds
+    /// the disk found by content that catch-all started RENDERING A SATA ROOT AS `sdhc` — measured on
+    /// the AHCI fixture, where root is `ahci5:/kernel.elf` and the census printed `read=sdhc
+    /// same=true` beside an `exec=sdhc` that really was the SD reader. A census that reports the
+    /// wrong handle is worse than no census: `same=true` was the one claim the leg still makes, and
+    /// it was false. The port is not carried — this instrument answers "which KIND of medium", and
+    /// `[vfs] root =` already names the port.
+    #[cfg(target_arch = "x86_64")]
+    pub const AHCI: u8 = 7;
 
     #[cfg(target_arch = "x86_64")]
     pub fn of(fs: &crate::fs::fat::FatFs) -> u8 {
-        match fs.source_name() {
+        of_name(fs.source_name())
+    }
+
+    /// X86BIND: the SAME mapping, keyed by the source's own name string.
+    ///
+    /// `FatFs::source_name` is `BlockSource::name` (`fs/fat.rs:2337`), so this is one vocabulary and
+    /// not a second derivation — [`of`] above now forwards to it. It exists because the x86 READ
+    /// stamp no longer has a `FatFs` in hand: since X86BIND the mount table binds the root
+    /// `fs::bootdisk` found BY CONTENT, and what that walk reports is a `BlockSource`.
+    #[cfg(target_arch = "x86_64")]
+    pub fn of_name(name: &str) -> u8 {
+        match name {
             "global" => GLOBAL,
             "usb" => USB,
+            // X86BIND: `BlockSource::name` renders a SATA volume as `ahci<port>` (`fs/fat.rs:686`,
+            // `ahci_source_name`), so the KIND is the prefix and the port is the tail. Matched
+            // before the catch-all, which is what used to swallow it into `sdhc`.
+            n if n.starts_with("ahci") => AHCI,
             _ => SDHC,
         }
     }
@@ -239,6 +265,7 @@ mod bind {
             GLOBAL => "global",
             USB => "usb",
             SDHC => "sdhc",
+            AHCI => "ahci",
             ADMITTED => "admitted",
             REFUSED_RO => "refused-ro",
             _ => "?",
@@ -249,8 +276,17 @@ mod bind {
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering as BindOrd};
 
 /// The handle the READ verbs' binding site last bound, and how many times it has bound anything.
-/// VFSROUTE: that site is now `vfs_mount_table`'s x86 arm — the ONE place a verb path binds a
-/// program source — so the instrument is x86-only, like the exec probe it is compared against.
+/// VFSROUTE: that site is `vfs_mount_table`'s x86 stamp — the ONE place a verb path records which
+/// medium the read verbs got — so the instrument is x86-only, like the exec probe it is compared
+/// against.
+///
+/// X86BIND: what it samples CHANGED, and that is the point of the arc. It used to be
+/// `mount_program_source`'s answer — the loader's ladder, `BOOT_VOLUME_SERIAL` and the global/SDHC
+/// fallbacks. It is now the source of the root `fs::bootdisk` bound BY CONTENT. The FATVERB
+/// comparison against `EXEC_BIND` therefore got STRONGER, not weaker: the exec probe still binds
+/// `mount_program_source` itself (`vfs.md` §13.4 — two INDEPENDENT producers), so the leg now asks
+/// "does the disk this kernel was found on agree with the disk the loader's ladder points at?",
+/// which is a question about the machine and no longer an identity over one function.
 #[cfg(target_arch = "x86_64")]
 static READ_BIND: AtomicU8 = AtomicU8::new(bind::NONE);
 #[cfg(target_arch = "x86_64")]
@@ -272,23 +308,15 @@ fn stamp(cell: &AtomicU8, seq: &AtomicU32, code: u8) {
 }
 
 
-/// FATVERB: mount the volume a READ verb should act on — the program source, so `ls` and a bare
-/// name are looking at the same card. Stamps [`READ_BIND`] either way, including on the decline:
-/// "the read verbs asked and got nothing" is a different fact from "the read verbs never asked",
-/// and Boot AR's symptom was the first one.
-#[cfg(target_arch = "x86_64")]
-fn open_read_volume() -> Result<FatFs, FatError> {
-    match crate::fs::fat::mount_program_source() {
-        Ok(fs) => {
-            stamp(&READ_BIND, &READ_BIND_SEQ, bind::of(&fs));
-            Ok(fs)
-        }
-        Err(e) => {
-            stamp(&READ_BIND, &READ_BIND_SEQ, bind::DECLINED);
-            Err(e)
-        }
-    }
-}
+// X86BIND: `open_read_volume` STOOD HERE and is deleted with the x86 arm that was its only caller.
+// It was "mount the volume a READ verb should act on — the program source", i.e. the loader's
+// ladder; the read verbs now act on the volume `fs::bootdisk` found BY CONTENT, so a helper that
+// mounts the program source for them would be the very answer-written-down-in-advance that BOOTROOT
+// removed. The [`READ_BIND`] stamp it carried did NOT go with it — `vfs_mount_table` stamps it from
+// the bound root, so "the read verbs asked and got nothing" (`declined`) is still a different fact
+// on the wire from "the read verbs never asked" (`never`), which was Boot AR's symptom.
+// `mount_program_source` keeps exactly two callers, both deliberate and both INDEPENDENT of the
+// table: the exec probe and `fatverb_storage_witness`'s own veto read (`vfs.md` §13.4).
 
 
 // FATVERB: TWO SINKS, TWO LENGTHS — and that is deliberate, not laziness.
@@ -4656,11 +4684,18 @@ const STORAGE_WAIT_MS: u64 = 30_000;
 /// the review. Each leg DRIVES A REAL VERB and reads the stamp that verb left behind:
 ///
 /// * `fatverb.readvol` runs `ls_path`, the function the `ls`/`dir` dispatch arm calls, and then
-///   requires (a) that the read-verb binding counter ADVANCED across that call, and (b) that the
-///   handle it stamped equals the handle the exec probe stamped. Revert `ls_path` to the old
-///   default-handle `fat::mount` and (a) fails, because a reverted verb never reaches the recorder. Point the
-///   read helper at a different handle and (b) fails. Neither half can be satisfied by evaluating
-///   one expression twice, which is precisely what the first cut did.
+///   requires (a) that the read-verb binding counter ADVANCED across that call, and (b) that BOTH
+///   sides actually bound a handle. Revert `ls_path` to the old default-handle `fat::mount` and (a)
+///   fails, because a reverted verb never reaches the recorder. Neither half can be satisfied by
+///   evaluating one expression twice, which is precisely what the first cut did.
+///
+///   **X86BIND turned (b) from an IDENTITY into a CENSUS.** It used to require that the read handle
+///   EQUALS the exec handle. Once the read side binds the disk found BY CONTENT while the exec probe
+///   deliberately stays on `mount_program_source` (`vfs.md` §13.4 — two independent producers, on
+///   purpose), the two are entitled to differ, and on the AHCI fixture they do: root is the ESP the
+///   walk finds on the SATA rung, `program_source` answers global/SDHC. The agreement is now
+///   PUBLISHED, on its own `:: [fatverb] readvol census: … same=<bool> …` line, instead of being
+///   asserted — a disagreement is a fact about the machine, not a failure.
 ///
 /// * `fatverb.writegate` runs `fs_rm` against a name that cannot exist, and requires that the write
 ///   gate's counter advanced and that its recorded answer matches the mounted source's veto. The
@@ -4752,13 +4787,41 @@ pub fn fatverb_storage_witness() {
     let read_ran = READ_BIND_SEQ.load(BindOrd::Relaxed) > read_seq0;
     let read_bound = READ_BIND.load(BindOrd::Relaxed);
 
+    // X86BIND: **A CENSUS, NOT AN IDENTITY** — the leg PASSes on both sides having BOUND something,
+    // and `same=` is published beside the verdict as an observation instead of being the verdict.
+    //
+    // It used to require `exec_bound == read_bound`. That was right while both sides asked the same
+    // question through the same ladder, and it stopped being right when X86BIND moved the READ side
+    // onto the disk `fs::bootdisk` finds BY CONTENT: `vfs.md` §13.4 keeps the exec probe on
+    // `mount_program_source` DELIBERATELY, so the two stay INDEPENDENT producers rather than one
+    // expression compared with itself. Two independent producers are entitled to disagree, and on a
+    // machine whose loader ladder points somewhere other than the medium carrying this kernel they
+    // WILL — the AHCI fixture is exactly that machine (root is the ESP the walk finds on the SATA
+    // rung; `program_source` answers with the global/SDHC handle). Failing there would be this leg
+    // asserting that root-by-content must agree with the answer BOOTROOT exists in order not to
+    // trust, which is the "boot dumb" rule inverted.
+    //
+    // What stays falsifiable is the half that ever caught anything: each counter must have ADVANCED
+    // and each side must have bound SOMETHING, so a verb reverted to a handle it does not record
+    // still reds this leg (`read=never`), and so does a decline (`read=declined` is not `NONE`, but
+    // it is visible on the census line beside `same=`). `same=false` is a fact for a bench reader.
     verdict(
         "fatverb.readvol",
-        exec_ran && read_ran && exec_bound == read_bound,
+        exec_ran && read_ran && exec_bound != bind::NONE && read_bound != bind::NONE,
         &alloc::format!(
-            "exec_ran={} read_ran={} exec={} read={} handles={}",
-            exec_ran, read_ran, bind::name(exec_bound), bind::name(read_bound), census
+            "exec_ran={} read_ran={} exec={} read={} same={} handles={}",
+            exec_ran, read_ran, bind::name(exec_bound), bind::name(read_bound),
+            exec_bound == read_bound, census
         ),
+    );
+    serial_println!(
+        ":: [fatverb] readvol census: exec={} read={} same={} exec_ran={} read_ran={} handles={} ::",
+        bind::name(exec_bound),
+        bind::name(read_bound),
+        exec_bound == read_bound,
+        exec_ran,
+        read_ran,
+        census
     );
 
     // --- writegate -----------------------------------------------------------------------------
@@ -4804,6 +4867,15 @@ pub fn fatverb_storage_witness() {
     // LAYOUT (orin 18): the namespace transcript rides the same site, for the same reason.
     #[cfg(feature = "witness")]
     layout_witness();
+    // X86BIND: the SETTLED call. This function is the one place on x86 that WAITS for storage
+    // (`STORAGE_WAIT_MS`) and then speaks ANYWAY when the wait expires, so it is the only honest
+    // place to say "enumeration is as finished as it is going to get". The mount-table builder
+    // passes `settled=false` and stays quiet while a root could still arrive; this passes `true`, so
+    // a boot that never binds one gets a `-> FAIL` LINE instead of silence — which is what the
+    // go-red measured missing. Both share one latch, so on a boot that bound a root the leg has
+    // already spoken by here and this is a no-op.
+    #[cfg(feature = "witness")]
+    x86bind_witness(&vfs_mount_table(), true);
 }
 
 /// Run one command. Returns `true` if the command took over the whole screen with its own
@@ -7176,23 +7248,24 @@ fn vfs_path(arg: &str) -> String {
 /// named the Tegra card. Peter, 2026-09-08: "boot cold, boot dumb, presume nothing about the
 /// machine, even though we keep booting the same machine."
 ///
-/// **x86** binds THE PROGRAM SOURCE — `crate::drivers::block::program_source`, resolved through
-/// [`open_read_volume`] so the READ_BIND instrument is stamped exactly as it was when each verb
-/// mounted for itself. That is FATVERB's law, unchanged: the verbs and the exec probe must bind the
-/// same handle, and on a machine booted from the internal SD reader the global slot is the wrong
-/// one. It is bound at BOTH `/` and `/boot`, because `/boot` is the spelling the packaging text, the
-/// staged-image script and `exec_resolve`'s second probe all use for that one volume — the same
-/// two-prefix shape the aarch64 arm uses on the Orin, and honest for the same reason
-/// (`/boot` IS a mount point, so `ls /` showing it is a fact, not decoration).
+/// **x86** used to bind THE PROGRAM SOURCE — `crate::drivers::block::program_source`, the loader's
+/// ladder (`BOOT_VOLUME_SERIAL`, then the global handle, then the SDHC reader). **X86BIND (B89
+/// third rung) deleted that arm.** There is now ONE call for every arch, because the question
+/// "which medium is this kernel's root" has ONE answer in this OS and it is the content one: the
+/// disk that has this kernel on it (LAWS §3, Peter 2026-09-08 — "root is the volume the kernel was
+/// found on, by content"). The two-prefix shape the x86 arm built by hand (`/`, `/boot`, and since
+/// LAYOUT `/apps`, all under ONE volume name so `same_volume` reads one medium) is not lost — it is
+/// exactly what [`crate::fs::bootdisk::bind_root`] builds, from the layout rule's single site.
+///
+/// What survives of the old arm is ONE x86-only statement, and it is an INSTRUMENT, not a policy:
+/// the [`READ_BIND`] stamp. See that static for why the FATVERB comparison got stronger.
 ///
 /// An arch with no volume at all returns an EMPTY table, and the verbs report "no filesystem
 /// mounted (-ENODEV)" — which is a better answer than the pre-VFSROUTE `no FAT filesystem (NoDisk)`
 /// because it does not name a filesystem the operator never asked about.
 pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
     use crate::fs::vfs::MountTable;
-    #[allow(unused_mut)]
     let mut mt = MountTable::new();
-    #[cfg(target_arch = "aarch64")]
     {
         // BOOTROOT (orin 22): `/`, `/boot` and `/apps` over the disk this kernel was FOUND on. The
         // LAYOUT (orin 18) rule that `/apps` carries `/boot`'s volume NAME lives inside `bind` with
@@ -7209,24 +7282,22 @@ pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
         // assignment has to see every disk at once to break collisions, and because a disk deduped
         // away as an alias of the root's device (the Orin's card, published under both `Default` and
         // `Usb`) must not be mounted beside itself.
+        //
+        // X86BIND (B89 third rung): UNGATED. This call was under `#[cfg(target_arch = "aarch64")]`
+        // from VFS-1 and the x86 arm beside it built its own table, so `[vfs]` and `[bootdisk]`
+        // printed ZERO lines on every x86 capture and BOOTROOT had never run on the rMBP. The
+        // module it calls carries no board `cfg` and never did; the split was history, not hardware.
         crate::fs::bootdisk::bind(&mut mt);
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    // X86BIND: the one genuinely arch-specific statement left, and it is an INSTRUMENT. [`READ_BIND`]
+    // and its `fatverb_storage_witness` reader are declared `#[cfg(target_arch = "x86_64")]`, so
+    // there is nothing to stamp on aarch64 — the gate is on the instrument, not on the policy.
+    #[cfg(target_arch = "x86_64")]
     {
-        use crate::fs::vfs::{FatBackend, KERNEL_PRINCIPAL};
-        // FATVERB: the program source, and its READ_BIND stamp, in the one place a verb now binds.
-        if let Ok(fs) = open_read_volume() {
-            let src = fs.source();
-            mt.mount("/", alloc::boxed::Box::new(
-                FatBackend::new_source("fat", KERNEL_PRINCIPAL, true, src)));
-            mt.mount("/boot", alloc::boxed::Box::new(
-                FatBackend::new_source("fat", KERNEL_PRINCIPAL, true, src)));
-            // LAYOUT (orin 18): the programs' directory on that same volume, at its own prefix and
-            // under the SAME volume name (see the aarch64 arm's note on aliasing).
-            mt.mount("/apps", alloc::boxed::Box::new(
-                FatBackend::new_source("fat", KERNEL_PRINCIPAL, true, src)
-                    .rooted(crate::fs::fat::APPS_DIR)));
-        }
+        stamp(&READ_BIND, &READ_BIND_SEQ, match crate::fs::bootdisk::locate() {
+            crate::fs::bootdisk::Verdict::Bound(f) => bind::of_name(f.source.name()),
+            crate::fs::bootdisk::Verdict::None_(_) => bind::DECLINED,
+        }); #[cfg(feature = "witness")] x86bind_witness(&mt, false); // X86BIND: the fixture, folded onto this line so arming `witness` shifts no ungated line (LAWS §5 byte identity). `settled=false`: a table builder cannot know enumeration is finished.
     }
     mt
 }
@@ -7685,3 +7756,108 @@ fn net6_shell_dns(console: &mut Console, host: Option<&str>) {
     }
 }
 
+
+// ===================== X86BIND (B89 third rung) — THE FIXTURE, AT THE FILE TAIL ====================
+//
+// Appended at the tail, and its call site folded onto an existing line, so arming `witness` moves no
+// ungated line in this file (LAWS §5: a cfg'd-off block still shifts `panic::Location` below it).
+
+/// X86BIND: **did x86 bind `/` by CONTENT?** One line, latched, off the table that was just built.
+///
+/// The claim it scores is the one B89's third rung is about: on x86 the root is the volume this
+/// kernel was FOUND on, reached through the same `fs::bootdisk` walk aarch64 drives, and not through
+/// `program_source`'s loader ladder. Before this arc the walk was never driven on x86 at all —
+/// `[vfs]` and `[bootdisk]` were 0 lines on every x86 capture — so a PASS here is also the proof
+/// that the producing path RAN (LAWS §5: an absence is evidence only if the producing path ran).
+///
+/// ⚠ **`bootinfo=` IS REPORTED AND IS NOT THE VERDICT**, deliberately and by law. The root is a byte
+/// comparison, never a serial: `fs/bootdisk.rs` §"the loader's serial is not consulted here at all",
+/// `drivers/block.rs:1208`, and Peter 2026-09-08 — "WTF does it matter what method I choose to boot?
+/// You are assuming too much." So the loader's `BOOT_VOLUME_SERIAL` is printed BESIDE the answer as
+/// an observation about the machine, with `agrees=` saying whether the two coincide, and a
+/// disagreement is a FACT ON THE WIRE, not a failure. A leg that FAILED on `serial != bootinfo`
+/// would be the "boot dumb" rule inverted — it would re-admit the loader as an input to root.
+///
+/// PASS ⇔ a root was bound by content AND the three layout prefixes are in the table.
+/// Go-red: re-latch the NONE survey (`fs/bootdisk::survey` caching a rootless walk again, SO38) —
+/// nothing binds at `/`, and this says `root=- ... -> FAIL ::`. The point of the leg is that the
+/// run does NOT silently fall back to the old program-source table.
+///
+/// ⚠ **IT SPEAKS WHEN THE ANSWER IS SETTLED, NOT WHEN IT IS FIRST ASKED**, and the first cut of
+/// this leg got that wrong in a way worth recording: it latched on its first call, which on x86 is
+/// the mount table built at serial line 156 — before ANY disk has enumerated — so it published
+/// `-> FAIL` about a machine that had not yet been asked the question, and would have gone on
+/// saying it after the root bound correctly 800 lines later. That is SO38's own shape reappearing
+/// in the instrument built to measure SO38. A witness on an asynchronous boot needs a settling
+/// condition, and silence before it is reached is the honest state:
+///
+/// * `Bound` ⇒ speak (PASS/FAIL on the layout) and latch. This is the normal path.
+/// * no root, and the block layer has no global device yet ⇒ **say nothing, do not latch** — the
+///   storage this answer depends on has not arrived.
+/// * no root, and a global device IS registered ⇒ speak FAIL and latch. Storage came up and the
+///   walk still found no disk carrying this kernel, which is a real failure and the go-red's path.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+fn x86bind_witness(mt: &crate::fs::vfs::MountTable, settled: bool) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::Acquire) {
+        return;
+    }
+    // `settled` is the CALLER's, and that is the second thing this leg got wrong. It was
+    // `drivers::block::info().is_some()` — the GLOBAL handle, the predicate `users::service` and
+    // `holocron::load_once` wait on. On the AHCI fixture the global handle is never populated at all
+    // (`handles=global=absent` for the whole boot; the root medium is a SATA disk), so in the go-red
+    // the leg NEVER SPOKE: it was silent about a failure, which is the one thing a witness may not
+    // be (LAWS §5 — an absence is evidence only if the producing path ran). The mount-table path
+    // therefore passes `false` (it cannot know the machine is done enumerating) and
+    // `fatverb_storage_witness` passes `true` — that site already owns a bounded wait and speaks
+    // unconditionally when it expires, so it is the one place that can say "storage is as good as
+    // it is going to get". Bound still speaks immediately from either.
+    let verdict = crate::fs::bootdisk::locate();
+    if matches!(verdict, crate::fs::bootdisk::Verdict::None_(_)) && !settled {
+        return;
+    }
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let prefixes = mt.prefixes();
+    let has = |p: &str| prefixes.iter().any(|q| *q == p);
+    let layout = has("/") && has("/boot") && has("/apps");
+    let bootinfo = crate::drivers::block::boot_volume_serial();
+    match verdict {
+        crate::fs::bootdisk::Verdict::Bound(f) => {
+            // `agrees=unknown` when the loader published no serial at all (0 is its "never stored"
+            // sentinel) — three-valued, because "the loader said nothing" is not "the loader
+            // disagreed" (LAWS §5: a capture's mode is read three-valued; same shape, same reason).
+            let agrees = if bootinfo == 0 {
+                "unknown"
+            } else if bootinfo == f.vol_id {
+                "yes"
+            } else {
+                "no"
+            };
+            serial_println!(
+                ":: X86BIND: root={}:{} serial=0x{:08x} by=content bootinfo=0x{:08x} agrees={} \
+                 mounts={} layout={} -> {} ::",
+                f.source.name(),
+                f.path,
+                f.vol_id,
+                bootinfo,
+                agrees,
+                prefixes.len(),
+                layout,
+                if layout { "PASS" } else { "FAIL" }
+            );
+        }
+        crate::fs::bootdisk::Verdict::None_(r) => {
+            serial_println!(
+                ":: X86BIND: root=- reason={} serial=0x00000000 by=content bootinfo=0x{:08x} \
+                 agrees=unknown mounts={} layout={} -> FAIL ::",
+                r.as_str(),
+                bootinfo,
+                prefixes.len(),
+                layout
+            );
+        }
+    }
+}

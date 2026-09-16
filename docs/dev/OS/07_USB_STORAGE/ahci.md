@@ -313,14 +313,17 @@ change is folds.
   on x86 the home-soil mounts, the `/volumes/<LABEL>` points and the `[vfs] root` witness do not
   happen at all — with or without SATA. This arc makes the walk CAPABLE of seeing a SATA disk and
   proves that capability on the wire through its own fixture; wiring the x86 arm is its own job.
-  **X86BIND (2026-09-15) attempted that job and did not land it** — the wiring compiles, but the
-  default `./arroyo test` fixture has no kernel-carrying volume the kernel can MOUNT, so
-  root-by-content has nothing to find there. `builder/src/main.rs:1042-1043` puts the ESP holding
+  **X86BIND (2026-09-15) DID that job, and this driver is what made it provable.** The wiring is
+  ungated now, and the fixture that demonstrates it is the AHCI one — the default `./arroyo test`
+  has no kernel-carrying volume the kernel can MOUNT, so root-by-content has nothing to find there. `builder/src/main.rs:1042-1043` puts the ESP holding
   `kernel.elf` on `ide-hd,drive=esp,bootindex=0` — visible to the kernel only under `UNAOS_AHCI=1`,
   i.e. **through this driver** — and the usb-storage stick is `usb.img`, the raw
-  `UNA-OS-DISK-001-ALPHA` pattern, not a filesystem. So the fixture that can finally host the x86
-  walk is an AHCI one, and that is the same configuration as "UnaOS installed on the internal
-  disk". See rmbp-ledger B89 (third rung) and LEDGER SO38.
+  `UNA-OS-DISK-001-ALPHA` pattern, not a filesystem. So the fixture that finally hosts the x86 walk
+  is an AHCI one, and that is the same configuration as "UnaOS installed on the internal disk".
+  Measured, rc=0: `:: X86BIND: root=ahci5:/kernel.elf serial=0xfabe1afd by=content
+  bootinfo=0xfabe1afd agrees=yes mounts=4 layout=true -> PASS ::`, with the SD card listed at
+  `/volumes/UNAOS SDHC4` rather than bound. The SATA rung of `fat::live_sources` that the first rung
+  appended is the rung the root was found on. See rmbp-ledger B89 (third rung) and LEDGER SO38.
 * **Writes**, and the partition-mode installer behind B91's stranger guard (rmbp-queue `AHCIWRITE`).
 
 ---
