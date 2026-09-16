@@ -84,7 +84,7 @@ are off-limits and are not a source for anything in this ladder.
 | R5 | `execute` | 2 GGTT PTEs + 4 RCS ring regs, all restored | `enable-void` — **failed under *no hold in force*, and R6 re-opened it by changing that one condition** (§2.5) |
 | R6 | `rearm` | as R5, **under a held wake**, + 1 GTT-flush reg | **`r6-sentinel-hit by=mt … attempts=1/3`** — flight 4, both boots |
 | R7 | `blit` | as R6 on the **BCS**, 3 GGTT PTEs + 4 BCS ring regs | **`r7-blit-verified … best_dst_match=256/256`, `dst_crc==src_crc`** — flight 4, both boots |
-| R8 | `fb_blit` | as R7, **at the panel's pitch**: `1 + 4 + ceil((64+1)·pitch/4096)` GGTT PTEs (128 on the bench panel) + 4 BCS ring regs + 1 GTT-flush reg, all restored | **pending metal.** Verdicts: `r8-fb-blit-verified` (the win) · `r8-fb-blit-verified-spill` · `r8-fb-blit-verified-head-stuck` · `r8-fb-blit-full-sentinel-miss` · `r8-fb-blit-partial` · `r8-sentinel-miss` · `r8-head-stuck`/`-partial` · `r8-enable-void-under-every-hold` · `r8-seed-collision` · `r8-ring-would-not-disable` · `r8-ring-drain-timeout` · the refusals `r8-gated-on-r7`, `r8-gated-on-wake`, `r8-refused-no-bar0`, `r8-refused-bpp-not-32`, `r8-refused-pitch-too-wide`, `r8-refused-panel-too-small`, `r8-refused-surface-too-large`, `r8-refused-bar0-too-small`, `r8-range-owned-refused`, `r8-fill-hypothesis-refuted`, `r8-alloc-failed`, `r8-virt-unmapped`, `r8-phys-above-4g`, `r8-pte-indistinct`, `r8-entry-drifted`, `r8-claim-write-void` (§2.8) |
+| R8 | `fb_blit` | as R7, **at the panel's pitch**: `1 + 4 + ceil((64+1)·pitch/4096)` GGTT PTEs (265 on the bench panel) + 4 BCS ring regs + 1 GTT-flush reg, all restored | **flew flights 8/9 2026-09-16 and refused on its own ceiling (R8CAP, §2.8); pending a metal run that reaches the blit.** Verdicts: `r8-fb-blit-verified` (the win) · `r8-fb-blit-verified-spill` · `r8-fb-blit-verified-head-stuck` · `r8-fb-blit-full-sentinel-miss` · `r8-fb-blit-partial` · `r8-sentinel-miss` · `r8-head-stuck`/`-partial` · `r8-enable-void-under-every-hold` · `r8-seed-collision` · `r8-ring-would-not-disable` · `r8-ring-drain-timeout` · the refusals `r8-gated-on-r7`, `r8-gated-on-wake`, `r8-refused-no-bar0`, `r8-refused-bpp-not-32`, `r8-refused-pitch-too-wide`, `r8-refused-panel-too-small`, `r8-refused-surface-too-large`, `r8-refused-bar0-too-small`, `r8-range-owned-refused`, `r8-fill-hypothesis-refuted`, `r8-alloc-failed`, `r8-virt-unmapped`, `r8-phys-above-4g`, `r8-pte-indistinct`, `r8-entry-drifted`, `r8-claim-write-void` (§2.8) |
 
 ### 2.1 R1 — `recon` (read-only)
 
@@ -671,7 +671,8 @@ honours. `SHUTOUT-REGISTER.md` §4 (R3) records the conditions.
 
 Knob: `UNAOS_IVB3D_R8=1` → features `gen7,gen7r8`. **Default OFF**; `gen7r8 = ["gen7"]`, and the
 rung is `mod r8` inside `gen7.rs` with its single call site at the tail of `blit()`. Status:
-**pending metal.**
+**flown and refused on flights 8 and 9 (2026-09-16); the refusal was the rung's own ceiling, fixed
+below; still pending a metal run that reaches the blit.**
 
 R7 proved the BCS parses `XY_SRC_COPY_BLT` and moves pixels on this part. It proved it in the
 smallest possible case, and that case was degenerate in four ways at once: a **16×16** rectangle,
@@ -681,9 +682,9 @@ failure mode this part could still have. R8 is the identical command with all fo
 
 | Degeneracy R7 left | What R8 exercises | What a failure would mean |
 | --- | --- | --- |
-| pitch = 64 B | the panel's own pitch (`stride × bpp`; 7 680 B at 1920×1200) | the pitch-unit question §2.7 settled *by reading* — at 16×16-in-one-page a wrong unit still lands inside the page, so the read was never tested |
-| origin (0,0) | the **top-right** corner, `X1 = width − 64` | DW2/DW3's X/Y fields were exercised only at zero; an **inclusive** X2 spills into the next row's first pixel, which is the §2.7 residual |
-| one destination page | ~120 pages, one PTE each | the engine's per-page GGTT walk — the premise of a GGTT, and untested until now |
+| pitch = 64 B | the panel's own pitch (`stride × bpp`; **16 384 B** on the bench rMBP) | the pitch-unit question §2.7 settled *by reading* — at 16×16-in-one-page a wrong unit still lands inside the page, so the read was never tested |
+| origin (0,0) | the **top-right** corner, `X1 = width − 64` (2 816 on the bench panel) | DW2/DW3's X/Y fields were exercised only at zero; an **inclusive** X2 spills into the next row's first pixel, which is the §2.7 residual |
+| one destination page | **260 pages**, one PTE each | the engine's per-page GGTT walk — the premise of a GGTT, and untested until now |
 | one source page | 4 pages at a 256-byte source pitch | the same, on the read side |
 
 **It does not touch the panel, and that is a finding rather than a caution.**
@@ -713,8 +714,8 @@ reported as a clean win because the store happened to retire.
 
 Reading a non-zero `spill` is arithmetic, and the two answers are far apart:
 
-- `spill ≈ pitch/4` dwords (1 920 on the bench panel) — one whole extra **row** moved: a pitch-unit
-  error, the §2.7 note coming true.
+- `spill ≈ pitch/4` dwords (**4 096** on the bench panel — the stride in pixels, not the width) — one
+  whole extra **row** moved: a pitch-unit error, the §2.7 note coming true.
 - `spill ≈ R8_RECT_H` dwords (64 — one per row) — one extra **column**: `X2` is **inclusive**. That
   answers the §2.7 residual the PRM does not state, and it answers it in our own surface, which is
   why the destination carries **one slack row past the rectangle**: an inclusive edge lands inside
@@ -741,7 +742,7 @@ report a transition. That is R2's lesson (§2.2) applied prospectively instead o
   go-red harness of §3.1 therefore proves R8's gate as well as R7's, and there is no second copy to
   drift.
 - **Every window PTE is read before any is written.** R4–R7 read three slots and two neighbours;
-  R8's window is `1 + 4 + dst_pages` wide (128 on the bench panel) and **every** slot is censused,
+  R8's window is `1 + 4 + dst_pages` wide (**265** on the bench panel) and **every** slot is censused,
   because "no rung writes a GGTT entry it did not first prove unowned" is a claim about each entry
   and a sampled proof would be a weaker, different claim.
 - **Every write captured, restored and re-read**: the forcewake request register, the four BCS ring
@@ -767,9 +768,75 @@ with `gen7r8` off there is nothing below it to shift and no `panic::Location` li
 `r8-refused-bpp-not-32` · `r8-refused-pitch-too-wide` (BR13's pitch field is 16 bits; a wider panel
 needs an encoding this rung does not carry, so it is refused rather than truncated) ·
 `r8-refused-panel-too-small` (which also refuses `stride < width`, a malformed surface description
-rather than a small one) · `r8-refused-surface-too-large` (ceiling `R8_DST_MAX_BYTES` = 1 MiB; the
-bench panel asks for 123 destination pages). **A rung that silently shrinks its own experiment
-reports a verdict about a different experiment**, so each of these parks and says so.
+rather than a small one) · `r8-refused-surface-too-large` (the window reservation, below). **A rung
+that silently shrinks its own experiment reports a verdict about a different experiment**, so each of
+these parks and says so.
+
+#### R8CAP — the ceiling was a constant, and it refused the experiment (flights 8 and 9, 2026-09-16)
+
+Both flights reached R8 with R7 green on the same boot and neither ran the blit:
+
+```
+:: gen7: r7 verdict=r7-blit-verified by=mt mode=scratch-fill … best_dst_match=256/256 …
+:: gen7: r8 verdict=r8-refused-surface-too-large dst_bytes=1064960 max=1048576 writes=0
+   note=refused-not-trimmed-a-rung-that-shrinks-its-own-experiment-reports-a-verdict-about-a-different-experiment ::
+```
+
+**Where the pitch comes from, measured rather than inferred.** It is the firmware's, and the takeover
+already publishes it: `:: KDHEAD: gop w=2880 h=1800 vram_off=00020000 pitch=16384`. The rung reads the
+same number through `video::WRITER`, which prints it on its own line —
+`fb=panel fb_w=2880 fb_h=1800 stride_px=4096 bpp=4 fb_len=29491200 dst_pitch_bytes=16384 dst_rows=65
+dst_span_bytes=1064960 dst_bytes=1064960 dst_pages=260`. So **16 384 B/row is the real scanout pitch,
+not an over-estimate**: the GOP and the kernel's framebuffer agree, and `fb_len` confirms it a third
+way independently of both (`29 491 200 = 1800 × 16 384`). The rMBP's firmware pads a 2 880-pixel panel
+to a **4 096-pixel stride** — 11 520 B of pixels in a 16 384 B row — and every consumer sees the padded
+stride, which is correct and is what a blit must carry.
+
+Two arithmetic corrections that a reader of the refusal line alone would get wrong, and which are the
+reason (b) below exists: the destination is **65 rows**, not 64 (the rectangle plus the deliberate
+slack row of §2.8's spill argument), so `1064960 / 64 = 16640` is not the pitch — `1064960 / 65 =
+16384` is. And the refusal named a byte count, so the resource that actually ran out was invisible.
+
+**The mechanism.** `R8_DST_MAX_BYTES` was the literal `1024 * 1024` with a comment asserting "the
+bench rMBP's 1920×1200 panel asks for 123" destination pages. The bench rMBP is 2 880×1 800 and asks
+for 260. But the ceiling's real job was never memory at all: it was the sole term sizing the
+fixed PTE table, `let mut ptes = [0u32; 1 + 4 + (R8_DST_MAX_BYTES / 4096)]` — 261 entries — while the
+claim loop walks `win_slots = 1 + src_pages + dst_pages` = **265**. The table was four entries short,
+the ceiling was the thing standing between that and an out-of-range index, and nothing in the file
+said so. **A number that protects an array should be written in the array's terms**; this one was
+written in megabytes, and so it was tuned against a panel the machine does not have.
+
+**The new bound is derived, and the derivation is the window.** `R8_WIN_SLOTS_MAX = 1 + R8_SRC_PAGES +
+R8_DST_MAX_PAGES` is stated once and sizes `ptes`; `R8_DST_MAX_BYTES = R8_DST_MAX_PAGES × 4096` falls
+out of it. `R8_SRC_PAGES` and `R8_DST_ROWS` are derived from the rectangle (replacing a bare `4` and a
+second spelling of `R8_RECT_H + 1`), with `const _: () = assert!(…)` holding the table's size and its
+consumer in the same terms at compile time. The one remaining choice is `R8_MAX_STRIDE_PX = 4096`,
+taken from the `KDHEAD` line above, giving 65 × 4 096 × 4 = 1 064 960 B = **260 destination pages and
+a 265-slot window** — exactly the bench panel, and every narrower one including 3 840-wide UHD at the
+same padded stride.
+
+**What the reservation costs, and why it stops there.** The table is this function's stack frame, at
+4 bytes per slot. The old 261-entry table was 1 044 B inside `fb_blit`'s measured `sub $0xca8,%rsp` =
+**3 240 B** frame; 265 entries is 1 060 B, so the new frame is **≈3 256 B, +16 B**. Reserving instead
+for BR13's widest *encodable* pitch (65 535 B × 65 rows = 1 041 pages, a 1 046-slot window) would cost
+4 184 B of table and put `fb_blit` at a ~6.4 KiB frame — and **no function in this kernel's x86
+artifact has a frame above 4 096 B** (`objdump -d` over every `sub $imm,%rsp`; `fb_blit` at 3 240 B is
+already the second largest). Making the boot path carry the largest stack frame in the kernel, by
+1.6× the established maximum, to cover panels no bench machine has, is a worse trade than a refusal
+that names its own shortfall. So the refusal stays, and it stays **reachable**: a stride between 4 097
+and 16 383 pixels clears `r8-refused-pitch-too-wide` and lands here.
+
+**(b) The refusal now names the shortfall**, scored on slots rather than bytes, so the next flight
+does not have to re-derive it (and get 16 640):
+
+```
+:: gen7: r8 verdict=r8-refused-surface-too-large dst_bytes= max= rows= pitch= stride_px=
+   max_stride_px= slots_have= slots_need= short_by= writes=0 …
+:: gen7: r8 next=STOP-window-reservation-short-raise-R8_MAX_STRIDE_PX-to-cover-stride_px-above-the-cost-is-4-bytes-of-stack-per-slot …
+```
+
+Had that line existed for flight 8 it would have read `rows=65 pitch=16384 stride_px=4096
+slots_have=261 slots_need=265 short_by=4`, and the fix would have been legible from the wire.
 
 #### The metal falsifier, stated before the boot
 
@@ -885,7 +952,7 @@ words on the wire:
 
 **All three queued decisions are taken, 2026-09-15 (GEN7NEXT).**
 
-- **GEN7R8 — built, pending metal (§2.8).** The rung is `fb_blit`, behind `UNAOS_IVB3D_R8`, and it
+- **GEN7R8 — flown 2026-09-16, refused on its own ceiling, ceiling fixed (R8CAP, §2.8).** The rung is `fb_blit`, behind `UNAOS_IVB3D_R8`, and it
   is R7's command at the panel's own geometry: a 64×64×32bpp rectangle at the **top-right corner**
   of a **framebuffer-pitch**, **multi-page** GGTT surface, with a third witness — `spill`, the bytes
   outside the rectangle — that R7's single-page destination could not carry. It blits into
