@@ -17282,3 +17282,47 @@ and x86 has never had one. `cursor11_desk_tick` gives the line a desktop-present
 population `flicker_frames` is actually about — armed only once a desktop present has met a live
 arrow, so a pointerless boot stays as silent as it is today. Giving x86 the fixture-scope call its
 sibling has is the structural repair and it lives in a file this arc did not open.
+
+**CHOP — residual (1) MEASURED, and it is neither the bracket nor the driver** (rmbp, 2026-09-16,
+`exec-rmbp-chop`; same capture, `~/unaos-bench/capture/rmbp12-flight8/ttyUSB0.log`, read-only). The
+`-> BRACKETED` reading above is a compose-through settlement and does not measure pointer motion;
+read as a chop number it answers a different question than the one asked. The install path was
+measured instead, and the arrow is not being deferred by anything in this file: over the whole of
+flight 8 `[wedge9] sprite-claim … refused=11475 masked=8462 retried=5 owed=1 serviced=2633` —
+`retried=5` counts the bounded UNMASKED retries that SUCCEEDED (`claim_bounded`, cursor.rs:403), so
+`repaint`'s own claim essentially never contended, and `owed=1 serviced=2633` is the handoff being
+CASHED rather than lost (`LOST` is the verdict reserved for refusals with nothing cashed and nothing
+pending). `refused` itself is a MIXED population and does not isolate the motion path —
+`owe_repaint` (cursor.rs:465) charges it from every call site, and 8462 of the 11475 are the
+composite side's masked asks — which is why the FOLD counter and not the claim counter is what
+decides this — and `[cursor8] … requests=2658 repairs=2634 suppressed_rate=18 floor_ms=8`
+rate-limits 0.7 % of repairs. Nor is it HID-side: `[deadman] hid=` runs 12–115 reports/s through the
+thirteen storm seconds in which the pad was talking, with `pmp=` (EHCI poll passes) at 316–964/s,
+and `[schedx86] depth sent=` grows 1467 → 2231 across the storm, so the reports reach the channel.
+**What collapses is the install**: `GUI_FOLD_X86` (`[schedx86] … fold=`) is **0 for the whole boot
+up to 326403 ms** and reaches **477** by 385196 ms, against `sent` +764 over the same span — 62 % of
+the events the channel ACCEPTED over that span were folded into another and installed nothing of
+their own, and `fold` is Mouse-only while `sent` counts every class, so the motion-only fraction is
+higher and not lower. Worst window 344857 → 349979 ms: `sent` +350, `fold` +284, so ~66 installs for
+~350 reports (**5.3 : 1, ~13 installs/s**) while `[deadman] hid=` summed 332 over those same
+seconds; the pre-storm control 320755 → 326403 ms is `sent` +26, `fold` +0, **1 : 1**. Flight 9 is
+the same shape: `fold` 24 → 376 against `sent` 242 → 884, with `inflight=59` of the channel's 64
+slots at 91667 ms — 24 folds already stood before that boot's storm, from the 57323 ms burst that
+left `inflight=4`. The cause is upstream of both video files: every long `[deadman]
+gate=<core>/<age>` in either boot is a **blitter stall**, `[wcser] PASS OVERDUE holder=c<N>
+age_ms=1000…4000 … at=span-flush … blit_inflight=1` with `blits_retired` FROZEN across all four
+one-second samples (four in flight 8 — c1 331–334 s, c2 371–374 s, c3 381–384 s, c4 390–393 s — and
+three in flight 9), and in each case the named core is the render core of the preceding `[schedx86]
+depth … (render core N)` line; the first ended `GATE STOLEN from c1 by c0 after 4030ms … REHOMED the
+render role from DEAD c1 to c2`. `x86_render_service` is the only consumer of `GUI_CHANNEL_X86` and
+the only caller of `pal::cursor::move_rel` on the x86 desktop (`main.rs:6845`, and the routed twin
+through `user_input_route` → `track_routed` inside the same drain), so while it is stuck in
+`span-flush` **no pointer position installs at all**; the channel fills, the producer coalesces
+(`main.rs:6172`, `[deadman] in=26/297/1`, `in=41/631/3` — every such second has a gate hold in
+progress) and the drain's own PTRCH fold (`main.rs:6761`) collapses the backlog into one event. One
+install, one jump: that is the step Peter saw. **Neither half of the repair is in `video/cursor.rs`
+or `video/screen.rs`** — during the stall no pointer event has reached either file, so no bracket
+policy can move the arrow. It is (i) bounding or breaking the `span-flush` blit wait so `COMP_GATE`
+is never held for seconds (`video/wm.rs`), or (ii) taking the install off the render task and doing
+it where the report is produced, in `x86_input_service` (`main.rs`), leaving routing and drag
+steering on the channel. Both are files this arc did not open.
