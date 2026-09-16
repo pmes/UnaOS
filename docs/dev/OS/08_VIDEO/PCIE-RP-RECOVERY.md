@@ -1024,6 +1024,22 @@ scorable on q35. Write path, BSP, knob and boot pacing are unchanged: CF8/CFC as
 before (`rp_at_wedge`, the one config reader on another core, is ECAM-only by construction), no new
 feature, and GPACE's `span` is sampled inside `pci::init` — which this call no longer runs in at all.
 
+**STEALMS (2026-09-16) — the steal bound is 1_500 ms; the freeze is shorter and the core is still
+lost.** SPANFLUSH (rmbp-ledger B116) measured what the seven holds of flights 8 and 9 actually cost:
+every one ended in `[wcser] GATE STOLEN … after 4016-4303ms`, `revenants=0`, so the 4_000 ms
+`COMP_GATE_STEAL_MS` (`video/wm.rs:9496`) WAS the length of every freeze Peter felt, 13x the 302 ms
+record honest pass. It is now 1_500 ms — 5x that record and 1.5x the `COMP_PASS_OVERDUE_MS` tripwire
+(the tripwire still fires first, at 1 s). The derived graces move with it: `comp_steal_pick`'s
+`after_render` is 1_500 ms when the corpse is the render core (the only case ever measured) and
+1_750 ms otherwise, and rung 2 (the service core) sits 250 ms above that. Nothing is added to the
+wire. What flight 10+1 must show at the next stall: `[wcser] GATE STOLEN from c<n> by c<m> after
+15xx ms — the holder was in phase 33 …`, never `4xxx`, followed by the same `REHOMED the render role`
+line, and a felt freeze of about 1.5 s instead of 4 s. What it must NOT be read as: a rung of this
+ladder or a fix for A1. The stalled core is DEAD at 1.5 s exactly as it was at 4 s, the per-boot
+`GATE STOLEN` count is unchanged, and W5 stays the head of the ladder and the only repair. Off metal
+(q35, `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_QEMU_FULL=1 ./arroyo test 120`): `GATE STOLEN` = 0, the
+healthy passes peak at `max_us=138358` — 10.8x under the bound — and the go-red was a 1 ms
+bound firing `GATE STOLEN` on an ordinary composite, reverted before the commit.
 ---
 
 ## 12. W5SCOPE — what the capture already says about W5, and the instrument that would say the rest

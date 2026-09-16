@@ -16559,8 +16559,8 @@ per second** through the hold, and ring-3 vessels kept presenting into a gate th
 of them. **The frozen glass is the refusal, not the stuck store.**
 
 So a holder in-pass past `COMP_GATE_STEAL_MS` is declared dead and its gate is taken. The bound is
-**4 s = 4× the overdue tripwire's bound, itself 3× the worst honest pass this compositor has ever
-measured (302 ms)** — 13× that pass in total, so no legal pass can reach it. It is a **liveness**
+**1.5 s since STEALMS (2026-09-16; it was 4 s until then) = 1.5× the overdue tripwire's bound, itself 3× the worst
+honest pass this compositor has ever measured (302 ms)** — 5× that pass in total, so no legal pass can reach it. It is a **liveness**
 bound, not a performance one, and that distinction is licensed by the row trace: the thing it fires
 on has been measured five times and is stopped.
 
