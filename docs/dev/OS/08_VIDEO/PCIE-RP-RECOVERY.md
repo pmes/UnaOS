@@ -1023,3 +1023,176 @@ attributable, and the no-device case prints a refusal carrying the same fields s
 scorable on q35. Write path, BSP, knob and boot pacing are unchanged: CF8/CFC as before, cpu 0 as
 before (`rp_at_wedge`, the one config reader on another core, is ECAM-only by construction), no new
 feature, and GPACE's `span` is sampled inside `pci::init` — which this call no longer runs in at all.
+
+---
+
+## 12. W5SCOPE — what the capture already says about W5, and the instrument that would say the rest
+
+**Status: SCOPING, docs only, no kernel byte moves. Ledger row `rmbp-ledger` B119 (→ A1). Evidence:
+[`docs/dev/evidence/rmbp-0916/w5scope/STALLS.md`](../../evidence/rmbp-0916/w5scope/STALLS.md) — every
+stall of flights 8 and 9 tabled, with the `awk` that produced each column.** Written 2026-09-16
+against tree 5ebe29f4 and the read-only capture `~/unaos-bench/capture/rmbp12-flight8/ttyUSB0.log`.
+Flight 9 falsified W4 (§11.3), leaving W5 — "credits / the GPU window path", `phase31-root.md` M2/M3 —
+at the head of §11.1's ladder. This section scopes W5 before anything is built for it: what the
+seven stalls already measure, which BAR1 the CPU is actually parked in, which BAR0 registers could
+speak, and why the instrument the brief asked for cannot run where the brief put it. The rung that
+does not fit is a STOP, not a code change; §12.3 names the files it needs.
+
+### 12.1 The seven stalls, and the one measurement that reorders W5
+
+`STALLS.md` §1 tables all seven (four on the WC boot, three on the UC boot). One shape: a hold
+crosses the 1 s tripwire, the same `row=` and `blits_retired=` are read on four consecutive seconds,
+the steal takes the gate at 4016–4303 ms, the holder is declared dead, and `revenants=0` stands on
+every one of the 96 `[wcser]` rollups of both boots. Six of the seven are `at=span-flush
+blit_inflight=1` — the holder entered `FrameBuffer::blit`'s `copy_nonoverlapping` into the aperture
+(`video/wm.rs:10686` → `video/framebuffer.rs:481`) and never came out; the seventh (S4, flight 8, c4)
+is `at=pw-exit blit_inflight=0`: its last blit HAD retired and the core died downstream of it, which
+is flight 1's shape and a reminder that "the parked instruction is the BAR1 store" is an inference
+from the odometer, asserted by no instrument.
+
+**The measurement.** After every one of the seven steals, the NEW holder's CPU blits into the same
+BAR1 window completed: the first `[comp2] rollup` after the steal arrives +70, +121, +359, +369 ms
+on flight 8 with `blit_us=47006 / 83991 / 19236 / 22390` (a completed copy of megabytes — S1's
+rollup carries `bytes_pp=24470072`), and within one 5 s rollup on flight 9 (`passes=6 / 26 / 46`).
+Between consecutive stalls on the same boot the odometer moved by 0.1–4.2 million blits, all through
+the aperture the dead core is parked on. Meanwhile the parked core's ONE store never retired:
+`revenants=0` over windows of 60.7, 20.4, 10.1, 41.1, 33.6 and 21.8 s.
+
+**What that does to W5's branches**, each kept on the ladder in R19's form:
+
+| branch | claim | verdict on flights 8/9 | why |
+|---|---|---|---|
+| (a) root-port posted-credit exhaustion (M2) as a STANDING condition | the GK107 stops returning posted credits; the root port's egress fills; every core's posted write into that link waits | **failed under flights 8/9** | posted credits are per link (per VC), not per requester; PCIe r3.0 §2.4.1 Table 2-40 lets no posted request pass an earlier one, so the root port's posted egress is a FIFO. Had the dead core's store been queued there, it would have left ahead of the next holder's blits — which left within 70–369 ms of the steal — and the core would have retired it: a revenant. Seven times, none |
+| (b) the GPU's BAR1 window path stops sinking writes (M3) as a STANDING condition | the endpoint accepts the TLP into its host interface and never services it | **failed under flights 8/9** | same measurement: the same window serviced 0.1–4.2 million later stores per boot while the dead core waited. A device that has stopped servicing its window does not service the next core's copy 70 ms later |
+| (a′)/(b′) TRANSIENT starvation or stall (microseconds to milliseconds, then recovery) | credits or the window pause, the store waits, service resumes | **failed under flights 8/9** | if the store was still queued anywhere between the core and the device when service resumed, it drained with the rest and the core retired it. `revenants=0` for 60.7 s says the store was NOT queued behind a pause. A pause that ends leaves no core dead |
+| (c) the store completes late (a revenant) | `blits_retired` for the dead core advances after the steal | **not observed** | `COMP_REVENANTS` (`wm.rs:10115`, loaded never drained) is 0 on all 96 rollups; the longest window is 60.7 s |
+| **(d) the store left the core's/uncore's queue and the core is still waiting for it** — a per-core transaction that was transmitted, dropped, or never acknowledged between the core and the root port; invisible to every PCIe register because it is upstream of the port | the parked core will never retire regardless of what the link does; `blit_inflight=1` is the only witness it leaves; memory type is not causal (W4) | **the only branch the seven stalls are consistent with**; never tested by an instrument | it is `phase31-root.md` M1's shape with the WC premise removed — M1 said "a WC fill buffer fails to complete its eviction; the store buffer backs up; the core stalls at retirement forever", and flight 9 removed write-combining without removing the stall. What survives is the second half of that sentence. A core parked at retirement on an unacknowledged transaction cannot take an interrupt, an NMI or an IPI; it is exactly the state WEDGEINJ (`wm.rs:9696`) reproduces with `cli` and a spin, which is why nothing on the wire distinguishes the metal fault from the injector |
+
+The honest sentence for the ladder is therefore: **W5 as written (credits / the GPU window path)
+fails under flights 8/9 for any standing or transient condition of the link or the device, because
+the same link and the same window served every other core within a fraction of a second of each
+steal and the parked store never drained.** The branch left standing is CPU-side, and §12.3 says
+what would show it. This is written as a suggestion for the ladder's owner to fold into §11.1
+(that table is another arc's this session), not as an edit to it.
+
+### 12.2 Which BAR1 the CPU blits into, how it was programmed, and what BAR0 could report
+
+**Which window.** BAR1 of `1:0.0` is a 256 MiB 64-bit memory BAR at `0x90000000`
+(`:: x86 mmio-map: 0x90000000..0xa0000000 …`, `[NVIDIA] Initialized VRAM bump allocator. Total BAR1
+visible: 256 MB`), the VRAM aperture: `kepler::init` reads it from config `0x14`/`0x18`
+(`drivers/gpu/kepler.rs:1336-1372`), maps it (`kepler.rs:1384`, `map_mmio_window`) and hands it to
+`VramAllocator` (`kepler.rs:1446`); `takeover_display` re-derives the same base from config
+(`drivers/gpu/kepler_display.rs:70-76`) because `GpuInfo` (`drivers/gpu/detect.rs:4-13`) carries
+BAR0 only. The surface the compositor writes is the firmware GOP framebuffer at BAR1 + `0x20000`
+(`:: KDHEAD: gop w=2880 h=1800 vram_off=00020000 pitch=16384 ::`), reached through `FBCON`/`WRITER`
+(§2, two handles over one physical surface) via `FrameBuffer::blit` (`framebuffer.rs:481`). It is
+**not** the PRAMIN window (BAR0 `0x700000`, steered by the PBUS window register `0x001700`, used by
+exactly one boot-time probe that saves, writes, reads and restores it — `kepler.rs:3804-3819`) and
+not host memory: every compositor store is a CPU store into the VRAM aperture, `blit_aim` is its
+BAR1 byte offset (`wm.rs:10662`), and on the seven stalls it ranges `0x270f20`–`0x15dc030`, all
+inside the first 32 MiB of a 256 MiB aperture over 512 MiB of VRAM.
+
+**How the window was programmed at takeover: it was not.** §2 already states that the takeover
+writes no display register. It is equally true of the aperture: this kernel never reads or writes
+the GPU-side BAR1 mapping (on this generation BAR1 is a paged window with its own instance block
+and page tables; the tree's register table, `kepler.rs:4-28`, names PMC, the PBUS PCI mirror, PFB,
+PFIFO, PGRAPH and PDISPLAY and nothing for BAR1's instance). What the kernel knows about the mapping
+it measured once: the BAR1-identity probe (`kepler.rs:3762-3856`) planted a magic through BAR1 at
+offset `0x02015000`, pointed the PRAMIN window at physical page `0x02015000 >> 12` and read the magic
+back — `VERDICT IDENTITY`, on both flights. So the mapping is whatever Apple's VBIOS/EFI left,
+identity at least at that page, inherited, unprogrammed and unread. A W5 branch that blames the
+window's page tables (a BAR1 fault on a page the identity probe never touched) has one address to
+test against on each stall — `blit_aim` — and no register the tree has ever read.
+
+**BAR0 registers that could report host-interface state**, with what the tree knows about each:
+
+| register | offset | in the tree | reads at runtime today | what it would say |
+|---|---|---|---|---|
+| PMC_INTR_0 | `0x000100` | declared `kepler.rs:9`; PMC_INTR_EN (`0x140`) is written 0 at `kepler.rs:1429` | never read | pending interrupt sources; interrupt delivery is off but the status latches regardless (on this family; unverified on this part) |
+| PFIFO_INTR | `0x002100` | read once at KFBIND (`kepler.rs:2393`; wire `recon pfifo_intr=00000000(ZERO,alive)`) | boot only | host/PFIFO error latch, including the MMU-fault bit on this family |
+| PFIFO flush | `0x070000` | trigger + busy bit, `kepler.rs:1693`, behind `nvidia-kepler-pfifoflush`, never on a flight | never | bit 1 busy = a host flush still in progress |
+| PBUS PCI mirror | `0x001800` / `0x001804` | declared `kepler.rs:13-14` | never read | the endpoint's own vendor/device and status/command words, readable through BAR0 instead of a config request |
+| PBUS_INTR_0 (PRI TIMEOUT / SQUASH / FECSERR), PRI fault address/data | `0x001100`, `0x009084` / `0x009088` | **not in the tree** — hardware facts from nouveau's `nvkm` GF100-family bus code; UNPINNED in this tree's sense (`kepler.rs:3799-3803`: a refusal is reported as a mis-derived rung, never as an answer) | never | whether the PRI ring — the path every BAR0 register read takes — timed out or squashed a request |
+| PFIFO fault unit mask, BAR1 fault record | `0x00259c`; `0x002800 + unit*0x10` (inst / vaddr lo / vaddr hi / info) with BAR1 as fault unit 4 on the GK104 family | **not in the tree**; same provenance and the same UNPINNED status | never | whether the GPU MMU faulted a BAR1 access, and at which aperture address — the one register set that could name `blit_aim` from the device side |
+
+No register in this table reports flow-control credits; PCIe exposes credits to no software on
+either end. The device side of W5(a) is unreadable by construction, and W5(a) was refuted by the
+odometer instead (§12.1).
+
+### 12.3 The instrument, and why its GPU half cannot run where the brief put it
+
+**Where the brief put it.** "From the DEADMAN/sampler path when a hold crosses ~500 ms (before the
+steal)". Two paths already observe every hold: the tripwire, `wcser_overdue_probe`
+(`wm.rs:10411`, `COMP_PASS_OVERDUE_MS = 1_000` at `wm.rs:9486`) on the input-service core, which
+calls `pcihealth::rp_at_wedge` (`wm.rs:10469` → `pcihealth.rs:564`) and, under `bar1wedge`,
+`bw_sample` (`pcihealth.rs:886`); and the deadman, which reads the same two atoms through
+`wm::deadman_gate_sample()` (`wm.rs:26181`) at `deadman.rs:344` once a second — `[deadman] …
+gate=1/435` at 330707 ms is that observer seeing S1's hold at 435 ms, 565 ms before the tripwire.
+Both run on the same service core; both reach the steal with 3 s to spare.
+
+**The GPU half is a non-posted read to the endpoint issued while a posted write to the same
+endpoint is stuck, and that is the one read the brief forbids.** PCIe r3.0 §2.4.1, Table 2-40: a
+Non-Posted Request must not pass a Posted Request. If the dead core's store is queued at the root
+port — which is what W5(a) and W5(b) assert — the sampler's BAR0 read (or an ECAM config read of
+the endpoint, §3.2's sacrificial probe: a config request is non-posted too) queues behind it and is
+never transmitted; the completion timeout the boot measured (`cto=50us-50ms dis=0`) bounds a request
+that HAS been transmitted, so no timer runs and the sampler core parks exactly as the holder did.
+That core is the service core, whose USB pump is this laptop's only serial carrier (§1.2, B114): the
+capture ends at the sample. Under §12.1's branch (d) the read is harmless — but an instrument that
+is safe only if the theory it is testing is false is not an instrument, and `phase31-root.md` M3's
+sentence that a BAR0 read from the stealing core is safe because "non-posted requests use a
+different credit class" is wrong on the ordering rule regardless of credits. **Nothing was built
+against this.**
+
+**What IS safe from the sampler path, and why it is not built either.** The root port's config
+space completes from the root complex; two reads there are new: the primary-side PCI Status
+(`0x06`: [15] Detected Parity Error, [14] Signaled System Error, [13] Received Master Abort,
+[12] Received Target Abort, [8] Master Data Parity Error, all RW1C) and, at boot, the root port's
+extended-capability ID chain (`find_ext_cap` walks it for AER only, `pcihealth.rs:203`; printing
+every ID would say whether Apple's Ivy Bridge PEG port exposes anything beyond the PCIe capability
+at all). Both cost nothing and neither carries a fact about a posted write's fate: 28 samples of
+every RP register the sampler already reads are flat (`STALLS.md` §2), and PCI Status has no
+posted-write field. A line that reads `rp_pcists=0000` on flight 11 with high probability is a line
+that cannot fire, and LAWS §5 calls that an absent check. The `retired=` field the brief's line
+shape asks for cannot be carried from `pcihealth` at all — `blits_retired_total` is private
+(`wm.rs:10703`) — and it is already on the tripwire line the sampler prints beside.
+
+**The three instruments that would discriminate, each named with the files it needs (the STOP
+list — none of them fits in `pcihealth.rs` alone):**
+
+| id | instrument | line it would print | outcome table | files |
+|---|---|---|---|---|
+| **I1 — post-steal BAR0 dump from the stealer** | one shot, immediately after `COMP_STEALS.fetch_add` (`wm.rs:4888`), on the core that just took the gate. At that instant the link is proven (within 70–369 ms on this capture) to be sinking posted writes, so a non-posted read is transmitted and bounded by the 50 ms completion timeout; the reader is the live core the steal already chose. Reads, in this order: PMC_INTR_0 `0x100`, PFIFO_INTR `0x2100`, PFIFO flush `0x70000` (read only), PBUS PCI status mirror `0x1804`; then the UNPINNED set — PBUS_INTR_0 `0x1100`, PRI fault `0x9084`/`0x9088`, fault unit mask `0x259c`, BAR1 fault record `0x2840`/`0x2844`/`0x2848`/`0x284c` — each read once, `0xBADFxxxx` reported as the PRI-error signature the tree already decodes (`kepler.rs:3831`), never written | `:: W5: site=post-steal from=c<stealer> dead=c<n> held=<ms> aim=<bar1 off> pmc_intr=<x> pfifo_intr=<x> flush=<x> ep_pcists=<x> pbus_intr=<x> pri_fault=<addr>/<data> fault_mask=<x> bar1_fault=<inst>/<lo>/<hi>/<info> ::` | `bar1_fault info` valid with `lo/hi` near `aim` → the GPU MMU faulted the parked store's page: the window's inherited page tables are not identity there, (b) reopens as a page-table fault — but a faulted posted write is DROPPED, not held, so a parked core beside a fault is still (d) and the fault is a second defect · `pbus_intr` PRI TIMEOUT or `pri_fault` nonzero → the host interface's PRI path wedged: (b) reopens for BAR0 traffic, still not for the posted store · `pfifo_intr` MMU-fault bit with `fault_mask=0` → a fault the driver's interrupt disable at `kepler.rs:1429` masked; read the record anyway · **all zero** → the GPU latched nothing about the parked store; (d) stands alone | `video/wm.rs` (one call at the steal, cfg `bar1wedge`), `drivers/gpu/pcihealth.rs` (the function; BAR0's base cached at `census` from config `0x10` — one line-neutral read — since `kepler::init` maps it at `:1384` after `census` returns and before any steal) |
+| **I2 — NMI probe of the dead core** | after the steal, IPI an NMI to the declared-dead core; the NMI handler prints its RIP and the aperture address in RDI/RSI if inside the copy. A core parked at retirement on an unacknowledged transaction recognises no interrupt at any priority — the NMI stays pending forever, harmlessly; a core spinning in software with IF=0 (the WEDGEINJ shape) takes it within microseconds | `:: W5: nmi core=c<n> rip=<x> in_blit=<y/n> ::` present, or the pre-registered `:: W5: nmi sent core=c<n> ::` alone | line within 100 ms → the metal fault is SOFTWARE and every theory on the ladder is wrong; absent → the core is hardware-parked, (d) confirmed by the cheapest instrument there is. Nothing in the tree has ever asserted "stuck store" by instrument; WEDGEINJ assumes it | `arch/x86_64` (APIC NMI IPI + handler), `video/wm.rs` (call at the steal) |
+| **I3 — the 500 ms hook** | the branch `held >= 500` at `deadman.rs:344`, calling a `pcihealth` sampler 500 ms before the tripwire | the same RP fields, 500 ms earlier | the RP fields are flat at 1000 ms on 28 samples; 500 ms earlier they are flat too. Named because the brief asked; not recommended | `deadman.rs` |
+
+I1 and I2 together answer W5 on one flight: I2 says whether the core is parked in hardware, I1
+says whether the device latched anything about the store it is parked on. Neither can be reached
+from the sampler path, and the brief's rule (touch `pcihealth.rs` only if the instrument fits there
+line-neutrally) therefore ends this arc at the design. `pcihealth.rs` is untouched: `git diff
+5ebe29f4 -- unaos/` is empty on this branch.
+
+### 12.4 The repairs W5 would license once I1/I2 answer, with their costs — none implemented
+
+| repair | licensed by | cost | what it does NOT do |
+|---|---|---|---|
+| **secondary bus reset on the root port + Kepler re-takeover** (§6) | I1 showing a GPU-side latch (PRI timeout, BAR1 fault) AND I2 showing a hardware-parked core, i.e. (b) alive and the core waiting on the device | §2 and §6.4 in full: the panel goes dark for the boot (no mode-set path, no VBIOS devinit), one attempt ever, rungs 2–5 (condemn, recovery task, endpoint state save) must land first; it frees the core only if the core is waiting on a transaction the reset can complete | under (d) it frees nothing: a transaction lost upstream of the port is not resolved by resetting the device below it. The capture's own evidence (§12.1) is that the device is not holding the store |
+| **remove the CPU blit path**: render into host memory (the compositor already composes into host-side staging buffers and flushes them row by row through the span-flush loop) and let the Kepler copy engine move it into VRAM, so no CPU store ever targets BAR1 | (d) confirmed by I2 (the failing instruction class is the CPU store into the aperture; a copy-engine DMA is the GPU reading host RAM, a different transaction class on the same link) — or any branch, since it removes the instruction that parks | the whole open Kepler channel ladder: the CE leg exists only as a boot-time rung (`KFBIND` KF27, "STILL-DARK" on flights 8/9, `FLIGHT8-9.md` §KF27 — the channel has never executed a method), `kepler_fifo.rs`/`kepler_ce.rs` are 2 441 lines without a metal-proven submission; plus a new hazard class (bus-mastering DMA from system RAM with no IOMMU) and a present latency floor of one CE copy per pass | it does not explain the fault; a CE write into the same window under (b) could stall the CE instead of a core — a cheaper loss (no core dies), but a loss. The IGD route (A7's gmux ladder: `LADDER highest=05/10 gmux=FAILED` on flight 8, `highest=03/10 why=aux-timeout-error` on flight 9) is the other way to stop CPU stores into BAR1 and is its own track |
+| **bounded retry with revenant accounting**: lower `COMP_GATE_STEAL_MS` (4000 → 1500, still 5x the 302 ms record), or a signature-specific earlier steal (`phase=33`, `blit_inflight=1`, `blits_retired` unchanged across two 1 Hz samples), keeping `COMP_REVENANTS` as the reader | nothing new — SPANFLUSH already offered it as a decision (`engine.md` §SPANFLUSH (a)/(b)) | one dead core per event unchanged; the freeze shrinks from ~4.3 s to ~1.5–1.8 s per event; on an eight-core pool a storm of eight stalls still ends the desktop | it is not a bound on a wait (there is no wait) and it does not touch the fault; `revenants=` is already accounted and has read 0 on every rollup since WCSER-STEAL landed |
+
+A fourth line is a suggestion, labelled as one and not a candidate: (d) is the shape of a CPU or
+uncore erratum (a store to an MMIO target that never returns its acknowledgement), and Intel's
+Ivy Bridge specification update is the place such a thing would be listed. Reading it needs a
+download, which under R53 is Peter's.
+
+### 12.5 What flight 11 must show, and how W5 is scored from it
+
+This arc adds no line. The triple that scores W5 on the next `storm` is already on the wire, and
+flight 11 must show it in this order for each stall: `:: [wcser] PASS OVERDUE holder=c<n> …
+blits_retired=<N> … blit_inflight=1 == tripwire ::` (the same `<N>` on `age_ms=1000..4000`), then
+`:: [wcser] GATE STOLEN from c<n> …`, then within 400 ms a `[comp2] rollup … blit_us=<nonzero>`
+and, through the end of the boot, `[wcser] … revenants=0`. That is §12.1's refutation of the
+link-side branches reproduced a third time. A `revenants=1` anywhere reopens (a′)/(b′) and (c) at
+once and is the first evidence a parked BAR1 store can complete. If I1/I2 are built before flight
+11, their lines from §12.3 are pre-registered here with their outcome tables and are read with
+`awk 'index($0,":: W5:")'`.
