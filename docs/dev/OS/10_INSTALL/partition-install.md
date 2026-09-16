@@ -200,6 +200,27 @@ UNAOS_WC=1 UNAOS_INSTGUI=1 UNAOS_INSTALLDEMO=1 UNAOS_AHCI=1 \
 #   install --gui           -> the window; then Enter (census), Enter (second press)
 ```
 
+**INSTALLTYPIST (2026-09-16): that sequence is a VERB now, and the leg is gated.** The block above
+is what INSTALLVERB ran by hand — a shell script outside the repo poking `scripts/qmp_type.py` at a
+port — so its evidence was real and re-runnable by nobody, and SPECROWS had to record the gap as a
+STOP: *"INSTALLVERB gets NO pin … its census is not on any gated wire; a typist fixture is owed, not
+a looser regex."* `./arroyo test-install [secs]` (default 180) is that fixture. It builds the GPT
+disk, arms all five knobs through a re-exec (they are `_feats` entries, so a lane-local `export`
+would build a kernel with the installer compiled out while the banner claimed otherwise), boots the
+leg, types the same four commands and two Enters through the same QMP typist, and then replays the
+capture against `scripts/specs/x86-install.spec` — 26 pinned lines, of which four are
+`:: [midden] cmd="…" -> Host verb=install ::`, the parser's own echo of the text the keyboard
+delivered. **Each burst is held on a witness line the previous burst printed**, never on a sleep:
+the census's `preview … -> INSTALLABLE` gates the install, `neighbours untouched=` gates the go-red,
+`err=NotBlank` gates `--gui`, and `instgui census step=1` gates the committing Enter. A slow boot
+therefore delays the typist instead of desynchronising it, and a command that never ran stops the
+chain where it broke rather than typing into a prompt that is not listening.
+
+Like `test-fat`, this is a **gate command the seat runs on the fold, not a leg of `check`** — it
+boots a five-knob machine with a fixture attached and spends its whole wall typing. It appears in
+`check` only through GATE-SPECROOTS' accounting: `X86_INSTALL_SPEC` names the spec in code, so the
+spec resolves GATED and carries no `# RUN-BY:` header.
+
 Keys are real: `send-key` → the emulated keyboard → HID → the same console the operator types into.
 `install --gui` sets a flag that `instgui::service()` honours on the next main-loop pass rather than
 creating the window on the shell's stack — the first cut called `open()` inline and faulted
