@@ -9218,6 +9218,57 @@ builds its block-addressed argument as a bare `lba as u32` at `:736` and `:805` 
 accidental guard (`lba >= card.num_blocks`, CSD-derived), same missing refusal. Ledgered in SR15;
 the edit belongs to the Pi seat.
 
+## 37. STORSLOT — the xHCI driver publishes MORE THAN ONE mass-storage device (QUEUE, 2026-09-15)
+
+The block layer stopped being single-device at USBREG: `drivers/block.rs` holds `USB_DISKS`, an array
+of `MAX_USB_DISKS` entries keyed on `(xHCI slot, LUN)`, with `usb_disk_count()`, `usb_info_ix()` and
+`BlockSource::UsbN(n)` above it. The **driver** had not. `drivers/xhci/mod.rs` held one field,
+`storage_slot: u8`, with the bring-up latch, the diagnostic note and the BOT retry streak beside it as
+three more driver-globals, so "the storage device" was singular everywhere the mass-storage path was
+read: the BOT pump census, the rescue ladder, every dispose/replug clear, `lsusb`'s role column. A
+second mass-storage device was therefore **lost two different ways**. On a root port its
+Configure-Endpoint completion simply reassigned the field, and because the SCSI chain is deferred
+until the enumeration queue drains (BOOTPACE M2, console-first, §31), the FIRST device was never
+brought up at all — no geometry, no registry entry, no witness. Behind a hub it was refused outright:
+`xHCI: storage slot N already active; ignoring the hubbed device.` The consequence was not only a
+driver limitation: **the x86 QEMU fixture could never carry a boot stick and a target disk at once**,
+which is why `UNAOS_INSTALLDEMO` and `UNAOS_PART_DISK` both REUSE the one usb-storage slot and say so
+in prose (`builder/src/main.rs`), and why the friend-invariance control (two UnaOS disks present) and
+the install-onto-a-second-disk fixture were unbuildable.
+
+**What replaces the field.** `StorageRecord` — slot id (0 = free), note, bring-up latch and
+`fail_streak` — held as `storage: [StorageRecord; STORAGE_SLOTS]`, with `STORAGE_SLOTS` **defined as**
+`block::MAX_USB_DISKS` so the driver can never enumerate more devices than the registry can publish.
+Lookups are by SLOT ID (`storage_ix`), never by index: a dispose, a replug or a surrender clears
+exactly the device it is about (`storage_release`) and leaves the others running. Indices are not
+compacted — an index is an address, the same rule USBREG's own doc gives. **Record 0 is the primary
+and keeps every meaning the old field had:** `storage_slot()` and `storage_note()` read it, the
+unaddressed `storage_read10`/`storage_write10`/`storage_data_ptr` still mean it, and on the one-disk
+machine that is every x86 bench, every Pi bench and every QEMU leg, record 0 IS that disk claimed by
+the same call in the same order. `service_storage` consumes ONE record's latch per main-loop pass,
+lowest index first, so arrival order is registry order and no second SCSI chain spends the first
+device's `BOT_PARK_PASS_LADDERS` allowance. Two consequences are worth naming because they are
+behaviour changes on paths the single field made impossible to get right: the retry streak is now
+charged to the DEVICE (it was global, so any slot's completion — a keyboard's disposal included —
+ended the storage disk's escalation streak; a slot with no record falls back to `bot_fail_streak_anon`
+so the ladder still terminates), and the bring-up's own sector-0 sanity read is ADDRESSED at the
+device that pass brought up (`storage_read10_on`), where the unaddressed call would have photographed
+the primary while reporting the second disk. The deferred probe matrices stay PRIMARY-only — every
+probe in `storage_diag_matrices` addresses `storage_slot()`, so arming them on a second device's
+bring-up would re-run the whole chain, write self-test included, against the first disk.
+
+**The fixture.** `UNAOS_USB2=<sf|1|part|gpt|p16|path>` (builder knob, no kernel feature, no image byte
+moved) attaches a SECOND `usb-storage` on the same xHCI, backed by a fresh copy in `target/usb2.img` —
+a copy because the two sticks are routinely the same layout and QEMU cannot open one raw file twice
+for writing, and because a guest write would otherwise mutate a checked-in fixture. No `bootindex`, so
+the ESP keeps 0 and the first stick keeps 1 and OVMF's order is untouched; refused out loud under
+`UNAOS_NOSTORAGE`, whose whole question is "no block device". Unset, not one QEMU argument changes.
+The line is
+`UNAOS_NOSDHCI=1 UNAOS_USB2=sf UNAOS_WC=1 UNAOS_QEMU_FULL=1 ./arroyo test-fat sf 180`, and the
+witnesses are `:: STORSLOT: claim slot=N ix=M devices=K ::` per device, two
+`:: USBREG: publish … ix=0 …` / `ix=1 …` lines with `disks=2`, and two `:: volid: mount` families with
+`/` still bound by content (`:: X86BIND: … by=content … -> PASS`).
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10), the EHCI-1/2 scout + shared wake (§9/§9a), and the ISRARM completion interrupt (§33).

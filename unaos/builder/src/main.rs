@@ -1163,6 +1163,64 @@ fn main() {
         cmd.arg("-drive").arg(format!("if=none,id=stick,format=raw,file={}", stick_image.display()))
            .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick,bootindex=1");
     }
+    // STORSLOT: UNAOS_USB2=<sf|1|part|gpt|p16|path> attaches a SECOND usb-storage device on the
+    // SAME xHCI controller, so the fixture can carry a boot stick AND a target/friend disk at once.
+    //
+    // WHY THIS COULD NOT EXIST BEFORE. The two blocks above (UNAOS_INSTALLDEMO, UNAOS_PART_DISK)
+    // both say so in prose and both act on it: they REUSE the one usb-storage slot rather than add
+    // a second, because the xHCI driver held ONE `storage_slot` and a second mass-storage device
+    // was overwritten on the root path and refused outright on the hub path. The driver tracks an
+    // array of storage records now (`drivers/xhci/mod.rs`, `StorageRecord`), and the block registry
+    // below it has been an array since USBREG — so a second stick enumerates, is brought up on its
+    // own main-loop pass, publishes at registry index 1 and is reachable as `BlockSource::UsbN(1)`.
+    //
+    // THE GRAMMAR MIRRORS THE FIRST STICK'S. `sf` is `builder/fat-sf.img`, `1`/`part` is
+    // `builder/fat.img`, `gpt` is `builder/fat-gpt.img`, `p16` is `builder/fat16.img`, anything else
+    // is a path — the same table `UNAOS_FATIMG` reads, so one fixture line reads the same both ways.
+    //
+    // A FRESH COPY EVERY RUN, into target/ (the UNAOS_PART_DISK discipline, for two reasons here).
+    // First, the two sticks are routinely the SAME layout, and QEMU cannot open one raw file twice
+    // for writing — the run would die on the image lock instead of attaching a second disk. Second,
+    // a guest that writes to the second stick would mutate a checked-in fixture, so the next run
+    // would measure yesterday's result.
+    //
+    // NO `bootindex`: the ESP keeps bootindex=0 and the first stick bootindex=1, so OVMF's boot
+    // order is exactly what it is today and a second disk can never win the boot. Under
+    // UNAOS_NOSTORAGE the knob is refused out loud rather than quietly turned into a one-stick run —
+    // NOSTORAGE means "the kernel sees no block device", and a second stick would answer a different
+    // question than the one that control leg asks.
+    //
+    // BUILDER KNOB, not a kernel feature: it changes what QEMU attaches and adds not one byte to any
+    // image, so the four-place knob wiring (arroyo map / builder read / k8-reach.registry row /
+    // arm_features strip) does not apply — the same standing as UNAOS_PART_DISK and UNAOS_AHCI_DISK
+    // above. UNSET => not one argument is added and a default run's QEMU command line is
+    // byte-identical to what it was before this arc.
+    if let Ok(usb2) = std::env::var("UNAOS_USB2") {
+        if nostorage {
+            println!("   UNAOS_USB2: REFUSED — UNAOS_NOSTORAGE is set, so no usb-storage is attached at all (the no-block-device control leg); unset one of the two");
+        } else {
+            let src = match usb2.as_str() {
+                "" | "1" | "part" => workspace_dir.join("builder/fat.img"),
+                "gpt" => workspace_dir.join("builder/fat-gpt.img"),
+                "p16" => workspace_dir.join("builder/fat16.img"),
+                "sf" => workspace_dir.join("builder/fat-sf.img"),
+                path => {
+                    let p = std::path::PathBuf::from(path);
+                    if p.is_relative() { workspace_dir.join(p) } else { p }
+                }
+            };
+            if !src.exists() {
+                panic!("UNAOS_USB2 set but {} is missing — run `./arroyo fat-img` from unaos/ first",
+                    src.display());
+            }
+            let dst = target_dir.join("usb2.img");
+            std::fs::copy(&src, &dst).unwrap();
+            cmd.arg("-drive").arg(format!("if=none,id=stick2,format=raw,file={}", dst.display()))
+               .arg("-device").arg("usb-storage,bus=xhci.0,drive=stick2");
+            println!("   UNAOS_USB2: SECOND usb-storage on the xHCI — fresh copy of {} -> {} (no bootindex; the ESP keeps bootindex=0 and the first stick bootindex=1)",
+                     src.display(), dst.display());
+        }
+    }
     // AHCI (B89) fixture: UNAOS_AHCI_DISK=<path> attaches a SECOND SATA disk to q35's built-in ICH9
     // AHCI controller, which QEMU exposes as the `ide.N` buses. The ESP already sits on `ide.0`
     // (`ide-hd,drive=esp,bootindex=0` above), so this lands on `ide.1` — an explicit bus, not the

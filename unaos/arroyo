@@ -2690,6 +2690,24 @@ if [ -n "${UNAOS_NOSDHCI:-}" ]; then
     echo -e "${COLOR_YELLOW}⚡ UNAOS_NOSDHCI: no sdhci-pci/sd-card in QEMU — SDHC-1 probe reports no controller${COLOR_RESET}"
 fi
 
+# STORSLOT (x86 `test`/`test-fat`/`x86`): UNAOS_USB2=<sf|1|part|gpt|p16|path> attaches a SECOND
+# usb-storage device on the SAME xHCI controller, backed by a fresh copy in target/usb2.img (a copy
+# because the two sticks are routinely the same layout and QEMU cannot open one raw file twice for
+# writing, and because a guest write would otherwise mutate a checked-in fixture). The value grammar
+# is UNAOS_FATIMG's, so one fixture line reads the same for both sticks. No bootindex: the ESP keeps
+# bootindex=0 and the first stick bootindex=1, so OVMF's boot order is untouched. Refused out loud
+# under UNAOS_NOSTORAGE, whose question is "the kernel sees NO block device".
+#   UNAOS_NOSDHCI=1 UNAOS_USB2=sf UNAOS_WC=1 UNAOS_QEMU_FULL=1 ./arroyo test-fat sf 180
+# This is a QEMU ARG knob only — no kernel feature, so the media is byte-identical whichever way it
+# points and the four-place knob wiring (map / builder read / k8-reach registry / arm_features) does
+# NOT apply; the same standing as UNAOS_PART_DISK and UNAOS_AHCI_DISK. The builder reads the variable
+# from the inherited environment; echoed here because `./arroyo` is the one place every knob is
+# documented. Kept in sync with builder/src/main.rs. UNSET => not one QEMU argument is added.
+if [ -n "${UNAOS_USB2:-}" ]; then
+    export UNAOS_USB2
+    echo -e "${COLOR_YELLOW}⚡ UNAOS_USB2=${UNAOS_USB2}: a SECOND usb-storage on the xHCI (STORSLOT multi-device fixture)${COLOR_RESET}"
+fi
+
 # --- Build Functions ---
 
 # WXN-x86 SECTION GATE (x86_64 ONLY): no GLOBAL CODE symbol may live in `.rodata`.

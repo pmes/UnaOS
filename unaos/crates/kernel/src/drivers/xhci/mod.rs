@@ -711,7 +711,7 @@ pub fn storage_diag() -> alloc::string::String {
     // WEDGE-8: a shell diagnostic must not take the driver lock directly — it is reachable from
     // contexts the F1 idiom forbids, and `claim()` distinguishes "busy" from "absent" besides.
     match claim() {
-        Ok(x) => alloc::format!("storage: slot {} — {}", x.storage_slot, x.storage_note),
+        Ok(x) => alloc::format!("storage: slot {} — {}", x.storage_slot(), x.storage_note()),
         Err(XhciClaimError::Busy) => alloc::string::String::from("storage: xHCI busy (transaction in flight) — retry"),
         Err(XhciClaimError::NotReady) => alloc::string::String::from("storage: xHCI not initialised (USB bring-up skipped?)"),
     }
@@ -755,8 +755,8 @@ pub fn log_summary_once() {
             budget, peak, sum, if n != 0 { sum / n } else { 0 },
             n, BOT_PUMP_NOWAIT.load(Ordering::Relaxed),
             BOT_PUMP_TIMEOUTS.load(Ordering::Relaxed),
-            x.storage_slot,
-            x.slots[x.storage_slot as usize].route_string, x.slots[x.storage_slot as usize].route_depth,
+            x.storage_slot(),
+            x.slots[x.storage_slot() as usize].route_string, x.slots[x.storage_slot() as usize].route_depth,
             // BOT-PHASE: the phase-desync census. `tag_mismatch=`/`bad_sig=` were one-off prints
             // with no denominator; `undrained=` is fix 1's own regression witness and MUST read 0.
             BOT_TAG_MISMATCH.load(Ordering::Relaxed), BOT_BAD_SIG.load(Ordering::Relaxed),
@@ -3262,6 +3262,80 @@ impl DeviceSlot {
 #[cfg(feature = "tegra")]
 const JB10_FS_EVAL_CTX: bool = true;
 
+/// STORSLOT: how many mass-storage devices the driver tracks at once.
+///
+/// The number is the xHCI half of a pair: [`crate::drivers::block::MAX_USB_DISKS`] is how many USB
+/// disks the block registry can hold, and this is how many DEVICES can reach it. They are kept
+/// equal deliberately — a driver that could enumerate more devices than the registry can publish
+/// would drop the surplus at the publish call with no record of which disk lost, and a registry
+/// wider than the driver would advertise addresses nothing can ever fill.
+pub const STORAGE_SLOTS: usize = crate::drivers::block::MAX_USB_DISKS;
+
+/// STORSLOT: one enumerated mass-storage device's driver-side state.
+///
+/// ### What this replaces, and why one field could not stay one field
+///
+/// Until this record existed the driver held `storage_slot: u8` — ONE slot id — and the note, the
+/// bring-up latch and the BOT retry streak sat beside it as three more driver-global fields. Every
+/// consumer of the mass-storage path therefore meant "the storage device", singular: the BOT pump's
+/// `storage_slot=` census, the rescue ladder's streak, the dispose/replug clears, the `lsusb` role
+/// column. The block layer below it had already stopped being singular (USBREG made
+/// [`crate::drivers::block::USB_DISKS`] an array keyed on `(slot, LUN)`), so the cap was entirely
+/// here: a SECOND mass-storage device overwrote the first on the root path — its Configure-Endpoint
+/// completion simply reassigned the field, and because `service_storage` defers the whole SCSI
+/// chain until the enumeration queue drains (BOOTPACE M2, console-first), the first device was
+/// never brought up at all and never published — and a second device was refused outright on the
+/// hub path ("storage slot N already active; ignoring the hubbed device").
+///
+/// ### Record 0 is the primary, and it keeps every meaning the old field had
+///
+/// [`XhciController::storage_slot`] and [`XhciController::storage_note`] read record 0. On the
+/// one-disk machine that is every x86 bench, every Pi bench and every QEMU leg, record 0 IS that
+/// disk, claimed by the same call in the same order, so the whole single-stick witness set —
+/// `MISSION SUCCESS`, `[usbw] write lba=… ok`, the `:: BOT: … storage_slot=N …` census, `fdisk -l`'s
+/// storage line — is unchanged. A second device takes record 1 and reaches the block registry
+/// through the same `publish_usb_geometry_lun` call the first one makes, landing at registry index
+/// 1 and surfacing as [`crate::fs::fat::BlockSource::UsbN`].
+///
+/// ### The key is the SLOT ID, and lookups are by that key, never by index
+///
+/// `slot` is the xHCI slot id the device addressed on; 0 means the record is free. Every site that
+/// used to ask `self.storage_slot == i` now asks [`XhciController::storage_ix`] for "the record for
+/// THIS slot", so a dispose, a replug or a surrender clears exactly the device it is about and
+/// leaves the others running. Indices are not compacted on a release: an index is an address, and
+/// shuffling live disks down to fill a hole is the mis-route USBREG's own doc records.
+#[derive(Clone, Copy)]
+pub struct StorageRecord {
+    /// xHCI slot id of the mass-storage device this record tracks. 0 = the record is free.
+    pub slot: u8,
+    /// Human-readable progress of THIS device's bring-up, surfaced by the shell `fdisk -l` command.
+    /// On the serial-less rMBP the boot enumeration log is wiped when the GUI takes over, so a
+    /// failed bring-up would otherwise be a silent "no device"; this makes the stall point
+    /// (SET_CONFIGURATION / INQUIRY / READ CAPACITY / ...) visible from the interactive shell.
+    pub note: &'static str,
+    /// Set once THIS device's bulk endpoints are configured; the main loop performs the
+    /// (synchronous) SCSI bring-up + first read in a safe, non-event context. `service_storage`
+    /// consumes ONE record's latch per pass, lowest index first, so two devices are brought up on
+    /// consecutive passes and neither one's chain runs inside the other's.
+    pub pending_bringup: bool,
+    /// Consecutive failed recovery+retry cycles on THIS device. Reset to 0 by ANY transaction that
+    /// completes (including one that completes with a `Failed` CSW — a device that answers is not a
+    /// device that is wedged). Compared against `BOT_RESCUE_N_CONSEC`. Was the driver-global
+    /// `bot_fail_streak`, which charged a second disk's failures and the boot disk's to one counter.
+    pub fail_streak: u32,
+}
+
+impl StorageRecord {
+    /// A free record. The note is the exact string the driver-global `storage_note` was initialised
+    /// to, so `fdisk -l` on a machine with no stick prints what it always printed.
+    const EMPTY: Self = Self {
+        slot: 0,
+        note: "no mass-storage device enumerated",
+        pending_bringup: false,
+        fail_streak: 0,
+    };
+}
+
 pub struct XhciController {
     base_addr: usize,
     op_base: usize,
@@ -3281,11 +3355,13 @@ pub struct XhciController {
     /// VUGRAS candidate-PA dump so both event-ring and ERST bases are witnessed as heap-resident.
     pub erst_table_phys: u64,
 
-    /// Slot id of the enumerated mass-storage device (0 = none).
-    pub storage_slot: u8,
-    /// Set once the storage bulk endpoints are configured; the main loop performs the
-    /// (synchronous) SCSI bring-up + first read in a safe, non-event context.
-    pub storage_pending_bringup: bool,
+    /// STORSLOT: the enumerated mass-storage devices, one [`StorageRecord`] each, index-addressed,
+    /// holes permitted. Record 0 is the PRIMARY — the disk [`Self::storage_slot`],
+    /// [`Self::storage_note`], [`Self::storage_read10`], [`Self::storage_write10`] and every other
+    /// unaddressed storage call have always meant and still mean. This field replaces the
+    /// `storage_slot` / `storage_pending_bringup` / `storage_note` / `bot_fail_streak` quartet that
+    /// made the driver single-device; see [`StorageRecord`] for what each of them became.
+    pub storage: [StorageRecord; STORAGE_SLOTS],
     /// BOTSEQ: armed at the END of the bring-up pass in place of running the PIUSB-36/37/38
     /// matrices + write selftest inline; `service_storage`'s diag branch consumes it on a later
     /// pass. See the arming site for the BOTCLAIM conviction this sequencing answers.
@@ -3313,11 +3389,6 @@ pub struct XhciController {
     ftdi_pass_logged: bool,
     /// One-shot: the FTDI-TX-disabled line has been printed (so a wedged sink logs exactly once).
     ftdi_disabled_logged: bool,
-    /// Human-readable progress of the mass-storage bring-up, surfaced by the shell `fdisk -l`
-    /// command. On the serial-less rMBP the boot enumeration log is wiped when the GUI takes over,
-    /// so a failed bring-up would otherwise be a silent "no device"; this makes the stall point
-    /// (SET_CONFIGURATION / INQUIRY / READ CAPACITY / ...) visible from the interactive shell.
-    pub storage_note: &'static str,
     /// Monotonic CBW tag.
     pub bot_tag: u32,
     /// In-flight BOT transaction, populated by the event handler.
@@ -3334,10 +3405,16 @@ pub struct XhciController {
     /// CBW-FAULT: the CBW TRB address of the transaction currently in flight, 0 when none is.
     /// Published at the push and inherited by every stage record the transaction arms.
     bot_cbw_trb: u64,
-    /// Consecutive failed recovery+retry cycles on `storage_slot`. Reset to 0 by ANY transaction
-    /// that completes (including one that completes with a `Failed` CSW — a device that answers is
-    /// not a device that is wedged). Compared against `BOT_RESCUE_N_CONSEC`.
-    bot_fail_streak: u32,
+    /// STORSLOT: the retry streak charged to a BOT slot that has NO storage record. The counter
+    /// this replaces was driver-global and every BOT slot shared it; the per-device streak now
+    /// lives in [`StorageRecord::fail_streak`], and this is the fallback for the one case that
+    /// record cannot cover — a transfer issued against a slot the driver holds no storage record
+    /// for. It is kept rather than dropped so the escalation ladder behaves EXACTLY as it did for
+    /// such a slot (bounded streak, surrender at `BOT_RESCUE_N_CONSEC`) instead of silently
+    /// becoming un-surrenderable. On every measured path it stays 0: `bot_transfer` is reached only
+    /// through the storage entry points, and each of those addresses a slot a record was claimed
+    /// for at its Configure-Endpoint completion.
+    bot_fail_streak_anon: u32,
     /// Which escalation rungs have already been spent on the current streak: 0 = none, 1 = (a)
     /// Reset Device tried, 2 = (b) port power-cycle tried. Each rung fires at most once per streak,
     /// so a device that keeps failing walks a -> b -> surrender and never loops.
@@ -3558,8 +3635,7 @@ impl XhciController {
             configuring_slot: 0,
             event_ring_phys_base: 0,
             erst_table_phys: 0,
-            storage_slot: 0,
-            storage_pending_bringup: false,
+            storage: [StorageRecord::EMPTY; STORAGE_SLOTS],
             storage_diag_pending: false,
             storage_postpublish_io: false,
             ftdi_configuring_slot: 0,
@@ -3569,12 +3645,11 @@ impl XhciController {
             ftdi_tx_total: 0,
             ftdi_pass_logged: false,
             ftdi_disabled_logged: false,
-            storage_note: "no mass-storage device enumerated",
             bot_tag: 1,
             bot_pending: None,
             bot_failed: None,
             bot_cbw_trb: 0,
-            bot_fail_streak: 0,
+            bot_fail_streak_anon: 0,
             bot_rescue_stage: 0,
             bot_surrendered_slot: 0,
             bot_budget_scale: BOT_BUDGET_SCALE_FIRST,
@@ -4026,17 +4101,35 @@ impl XhciController {
                                 else if self.configuring_slot == slot_id as u8 {
                                     serial_println!("xHCI: Endpoints Configured (Slot {}). Storage ready.", slot_id);
                                     self.configuring_slot = 0;
-                                    // Cache the storage slot and defer the SCSI bring-up + read
-                                    // to the main loop (a safe, non-event context where the
-                                    // synchronous BOT pump can run without re-entrancy).
-                                    self.storage_slot = slot_id as u8;
-                                    self.storage_pending_bringup = true;
-                                    // SPACE: the arm instant — the start of `wait` and of `total`.
-                                    // Stamped HERE and not on entry to `service_storage` because
-                                    // the gap between the two is precisely what this instrument
-                                    // exists to price.
-                                    SPACE_ARMED_AT.store(crate::arch::now_cycles(), Ordering::Relaxed);
-                                    self.storage_note = "endpoints configured; SCSI bring-up pending";
+                                    // STORSLOT: claim this device's OWN storage record and defer
+                                    // the SCSI bring-up + read to the main loop (a safe, non-event
+                                    // context where the synchronous BOT pump can run without
+                                    // re-entrancy). This used to be `self.storage_slot = slot_id`,
+                                    // ONE field — so a SECOND mass-storage device's completion
+                                    // overwrote the first, and because the bring-up is deferred
+                                    // until the enumeration queue drains (BOOTPACE M2,
+                                    // console-first) the first device was never brought up at all:
+                                    // no SCSI chain, no geometry, no registry entry, no witness.
+                                    // The record is keyed on the slot, so the first device keeps
+                                    // its latch and both are brought up, one per main-loop pass.
+                                    match self.storage_claim(slot_id as u8) {
+                                        Some(ix) => {
+                                            self.storage[ix].pending_bringup = true;
+                                            self.storage[ix].note =
+                                                "endpoints configured; SCSI bring-up pending";
+                                            // SPACE: the arm instant — the start of `wait` and of
+                                            // `total`. Stamped HERE and not on entry to
+                                            // `service_storage` because the gap between the two is
+                                            // precisely what this instrument exists to price.
+                                            SPACE_ARMED_AT.store(crate::arch::now_cycles(), Ordering::Relaxed);
+                                            serial_println!(
+                                                ":: STORSLOT: claim slot={} ix={} devices={} — mass-storage record taken; SCSI bring-up deferred to the main loop ::",
+                                                slot_id, ix, self.storage_count());
+                                        }
+                                        None => serial_println!(
+                                            ":: STORSLOT: storage records FULL ({} devices) — slot {} configured its endpoints but is NOT brought up and publishes nothing; the disks already tracked are untouched ::",
+                                            STORAGE_SLOTS, slot_id),
+                                    }
                                     // Storage setup is done; move on to the next connected port.
                                     self.start_next_port();
                                 }
@@ -6240,11 +6333,9 @@ impl XhciController {
             if self.configuring_slot == i as u8 {
                 self.configuring_slot = 0;
             }
-            if self.storage_slot == i as u8 {
-                self.storage_slot = 0;
-                self.storage_pending_bringup = false;
-                self.storage_note = "storage device disconnected";
-            }
+            // STORSLOT: release the record for THIS slot and no other — a disconnect on one
+            // disk must not blank the driver's view of the disks still plugged in.
+            self.storage_release(i as u8, "storage device disconnected");
             // USB-UNPLUG: the xHCI-level teardown above only clears the CONTROLLER's binding. The
             // block registry this device published into on attach (`block::publish_usb_geometry`,
             // called from the SCSI bring-up) is a separate global, and until this call it kept the
@@ -6459,17 +6550,15 @@ impl XhciController {
             if !self.slots[i].active || self.slots[i].port_id != port {
                 continue;
             }
-            if self.storage_slot == i as u8 && self.storage_note == "ready" {
+            if self.storage_note_of(i as u8) == "ready" {
                 continue;
             }
             if self.configuring_slot == i as u8 {
                 self.configuring_slot = 0;
             }
-            if self.storage_slot == i as u8 {
-                self.storage_slot = 0;
-                self.storage_pending_bringup = false;
-                self.storage_note = "storage slot disposed after an enumeration stall";
-            }
+            // STORSLOT: this slot's record only (the `ready` paranoia guard above already let a
+            // published disk out; a record for any OTHER slot is a different device entirely).
+            self.storage_release(i as u8, "storage slot disposed after an enumeration stall");
             // U2.5: mirror the storage clears for the FTDI console fields. Without this, a disposed
             // slot id that later gets REUSED (hot-plug) would still match the stale
             // `ftdi_configuring_slot`/`ftdi_slot` — the Configure-Endpoint completion dispatch checks
@@ -8521,7 +8610,7 @@ impl XhciController {
             /// SET_CONFIGURATION, the TUR loop, INQUIRY and READ CAPACITY on QEMU's `usb-storage`.
             const BOT_WEDGE_AFTER: u64 = 24;
             static BOT_WEDGE_N: AtomicU64 = AtomicU64::new(0);
-            if slot_id != 0 && slot_id == self.storage_slot {
+            if slot_id != 0 && slot_id == self.storage_slot() {
                 let n = BOT_WEDGE_N.fetch_add(1, Ordering::Relaxed) + 1;
                 if n > BOT_WEDGE_AFTER {
                     if n == BOT_WEDGE_AFTER + 1 {
@@ -9071,7 +9160,7 @@ impl XhciController {
     /// TD shape, mid-size transfer, and posted-write visibility. Bounded (~10 ms + transfers).
     #[cfg(target_arch = "aarch64")]
     fn piusb36_matrix(&mut self) {
-        let slot = self.storage_slot;
+        let slot = self.storage_slot();
         if slot == 0 { serial_println!(":: PIUSB: [piusb36] no storage slot — matrix skipped ::"); return; }
         let databuf = match self.slots[slot as usize].scsi_data_buffer {
             Some(p) => p as u64,
@@ -9191,7 +9280,7 @@ impl XhciController {
     /// Four read-only steps, each witnessed. aarch64-only; never compiled on x86.
     #[cfg(target_arch = "aarch64")]
     fn piusb37_matrix(&mut self) {
-        let slot = self.storage_slot;
+        let slot = self.storage_slot();
         if slot == 0 { serial_println!(":: PIUSB: [piusb37] no storage slot — matrix skipped ::"); return; }
         let (databuf, cbw_phys) = {
             let s = &self.slots[slot as usize];
@@ -9407,7 +9496,7 @@ impl XhciController {
     /// step (READ(16) may be supported there — the recovery path stays correct either way).
     #[cfg(target_arch = "aarch64")]
     fn piusb38_matrix(&mut self) {
-        let slot = self.storage_slot;
+        let slot = self.storage_slot();
         if slot == 0 { serial_println!(":: PIUSB: [piusb38] no storage slot — matrix skipped ::"); return; }
         let databuf = match self.slots[slot as usize].scsi_data_buffer {
             Some(p) => p as u64,
@@ -11145,16 +11234,17 @@ impl XhciController {
         self.bot_park_note_surrender(slot_id);
         self.bot_surrendered_slot = slot_id;
         let retracted = crate::drivers::block::unpublish_usb_geometry(slot_id, ladder_gen);
-        if self.storage_slot == slot_id {
-            self.storage_slot = 0;
-            self.storage_pending_bringup = false;
-            self.storage_note = "storage device FAILED (BOT rescue surrendered)";
-        }
+        // STORSLOT: read the streak off the record BEFORE releasing it — the verdict line below
+        // reports what this disk spent, and the release zeroes it. The counter it reads was
+        // driver-global until this arc, so a surrender printed whatever streak the LAST failing
+        // disk had left behind; it now prints this disk's own.
+        let streak = self.bot_fail_streak_of(slot_id);
+        self.storage_release(slot_id, "storage device FAILED (BOT rescue surrendered)");
         // THE verdict line. One per surrendered disk, naming the fault class, what the ladder spent,
         // and whether the block layer heard about it.
         serial_println!(
             ":: BOT: SURRENDER slot={} cause={:?} streak={} recoveries={} recover_ok={} retry_ok={} retry_fail={} resetdev={} portcycle={} retracted={} — disk marked FAILED and retracted; NO further transfers to this slot until it is replugged ::",
-            slot_id, cause, self.bot_fail_streak,
+            slot_id, cause, streak,
             BOT_RECOVER_COUNT.load(Ordering::Relaxed), BOT_RECOVER_OK.load(Ordering::Relaxed),
             BOT_RETRY_OK.load(Ordering::Relaxed), BOT_RETRY_FAIL.load(Ordering::Relaxed),
             BOT_RESCUE_RESET_DEVICE.load(Ordering::Relaxed),
@@ -11182,7 +11272,15 @@ impl XhciController {
     /// device is answering, so whatever streak it was on is over) and when a slot is disposed or
     /// re-enumerated (a fresh device inherits nothing).
     fn bot_rescue_clear(&mut self, slot_id: u8) {
-        self.bot_fail_streak = 0;
+        // STORSLOT: clear THIS device's streak. The counter was driver-global, so any slot's
+        // completion — and any slot's disposal, including a keyboard's — ended the storage disk's
+        // escalation streak. The rung counter `bot_rescue_stage` stays global on purpose: the
+        // ladder is synchronous and `bot_ladder_slot` admits one at a time, so it describes the
+        // ladder in flight rather than a device.
+        match self.storage_ix(slot_id) {
+            Some(ix) => self.storage[ix].fail_streak = 0,
+            None => self.bot_fail_streak_anon = 0,
+        }
         self.bot_rescue_stage = 0;
         // [piusb41] PA34 + S1Z: a completed transaction ends the fold streak ONLY when it was a
         // REAL completion — the fold's own `Ok` return is a member of the streak, not its end.
@@ -11290,8 +11388,7 @@ impl XhciController {
             self.bot_ladder_slot = 0;
             return Err(cause);
         }
-        self.bot_fail_streak = self.bot_fail_streak.saturating_add(1);
-        let streak = self.bot_fail_streak;
+        let streak = self.bot_bump_fail_streak(slot_id);
         // Exponential back-off: a device wedged mid-internal-stall is made worse by being hammered.
         let backoff = (BOT_RESCUE_BACKOFF_MS << (streak - 1).min(3)).min(BOT_RESCUE_BACKOFF_MAX_MS);
         serial_println!(
@@ -11940,19 +12037,136 @@ impl XhciController {
         self.bot_transfer(slot, &cdb, data_phys, len, Direction::Out)
     }
 
+    // ---- STORSLOT: the storage RECORDS — one per enumerated mass-storage device ---------------
+    //
+    // Every one of these is a lookup BY SLOT ID. The index a record happens to sit at is an
+    // address, not an identity: record 0 is the primary because it is the first device published
+    // since the array was last empty, exactly as `block::USB_DISKS` entry 0 is the primary disk.
+    // Nothing here compacts the array, so a disk that leaves takes its address out of service and
+    // the next arrival fills the lowest free one.
+
+    /// STORSLOT: index of the record tracking `slot`, if any. Slot 0 is the xHCI "no slot"
+    /// sentinel and is never a device, so it never matches a live record.
+    fn storage_ix(&self, slot: u8) -> Option<usize> {
+        if slot == 0 {
+            return None;
+        }
+        self.storage.iter().position(|r| r.slot == slot)
+    }
+
+    /// STORSLOT: claim a record for a freshly configured mass-storage device and answer its index.
+    ///
+    /// Three cases, in the order USBREG's `registry_place` uses and for the same reasons: a record
+    /// already holding this slot is REUSED (a re-enumeration of the same device must not consume a
+    /// second address); otherwise the LOWEST free record is taken (so a machine that has lost every
+    /// disk refills record 0 and the primary meaning is restored); otherwise the driver is FULL and
+    /// answers `None` — loudly at the call site, never by evicting a live device.
+    fn storage_claim(&mut self, slot: u8) -> Option<usize> {
+        if slot == 0 {
+            return None;
+        }
+        if let Some(ix) = self.storage_ix(slot) {
+            return Some(ix);
+        }
+        let ix = self.storage.iter().position(|r| r.slot == 0)?;
+        self.storage[ix] = StorageRecord { slot, ..StorageRecord::EMPTY };
+        Some(ix)
+    }
+
+    /// STORSLOT: release the record tracking `slot` — and ONLY that record. Answers whether one was
+    /// held. The note is written onto the freed record because that is where `fdisk -l` reads it
+    /// from: the driver-global `storage_note` this replaces was set to exactly these strings on
+    /// exactly these paths, so a one-disk machine's diagnostic text is unchanged.
+    fn storage_release(&mut self, slot: u8, note: &'static str) -> bool {
+        match self.storage_ix(slot) {
+            Some(ix) => {
+                self.storage[ix] = StorageRecord { note, ..StorageRecord::EMPTY };
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// STORSLOT: the note on the record tracking `slot`, or `""` when no record does. `""` is never
+    /// a note any path writes, so a caller comparing against `"ready"` cannot be answered by a
+    /// device the driver is not tracking.
+    fn storage_note_of(&self, slot: u8) -> &'static str {
+        match self.storage_ix(slot) {
+            Some(ix) => self.storage[ix].note,
+            None => "",
+        }
+    }
+
+    /// STORSLOT: set the note on the record tracking `slot`. A slot with no record is a no-op —
+    /// the bring-up chain always has one (it is claimed at the Configure-Endpoint completion that
+    /// armed the bring-up), and a note written after a disconnect must not resurrect a record.
+    fn storage_set_note(&mut self, slot: u8, note: &'static str) {
+        if let Some(ix) = self.storage_ix(slot) {
+            self.storage[ix].note = note;
+        }
+    }
+
+    /// STORSLOT: the PRIMARY record's slot id (0 = no storage device). This is what the
+    /// `storage_slot` FIELD was, and every unaddressed storage call still means it.
+    pub fn storage_slot(&self) -> u8 {
+        self.storage[0].slot
+    }
+
+    /// STORSLOT: the PRIMARY record's note. This is what the `storage_note` FIELD was.
+    pub fn storage_note(&self) -> &'static str {
+        self.storage[0].note
+    }
+
+    /// STORSLOT: how many records hold a device. Counts OCCUPANCY, not the highest index — a hole
+    /// left by a disconnect is not a disk.
+    pub fn storage_count(&self) -> usize {
+        self.storage.iter().filter(|r| r.slot != 0).count()
+    }
+
+    /// STORSLOT: is any device waiting for its SCSI bring-up? The driver-global
+    /// `storage_pending_bringup` this replaces answered the same question for the one device that
+    /// could exist.
+    pub fn storage_pending_any(&self) -> bool {
+        self.storage.iter().any(|r| r.pending_bringup)
+    }
+
+    /// STORSLOT: charge one failed recovery+retry cycle to `slot` and answer the new streak. A slot
+    /// with no record is charged to `bot_fail_streak_anon` — see that field for why the fallback
+    /// exists rather than the charge being dropped.
+    fn bot_bump_fail_streak(&mut self, slot: u8) -> u32 {
+        match self.storage_ix(slot) {
+            Some(ix) => {
+                self.storage[ix].fail_streak = self.storage[ix].fail_streak.saturating_add(1);
+                self.storage[ix].fail_streak
+            }
+            None => {
+                self.bot_fail_streak_anon = self.bot_fail_streak_anon.saturating_add(1);
+                self.bot_fail_streak_anon
+            }
+        }
+    }
+
+    /// STORSLOT: the streak currently charged to `slot`, without charging anything.
+    fn bot_fail_streak_of(&self, slot: u8) -> u32 {
+        match self.storage_ix(slot) {
+            Some(ix) => self.storage[ix].fail_streak,
+            None => self.bot_fail_streak_anon,
+        }
+    }
+
     // ---- Public storage API used by the block layer / shell ----
 
     /// Pointer to the storage slot's data buffer. MULTIBLK: this now addresses
     /// [`STORAGE_DATA_BYTES`] bytes, not one block — the block layer stages up to
     /// [`STORAGE_MAX_BLOCKS`] sectors here for a single READ(10)/WRITE(10).
     pub fn storage_data_ptr(&self) -> Option<*mut u8> {
-        if self.storage_slot == 0 { return None; }
-        self.slots[self.storage_slot as usize].scsi_data_buffer
+        if self.storage_slot() == 0 { return None; }
+        self.slots[self.storage_slot() as usize].scsi_data_buffer
     }
 
     /// READ(10) into the storage data buffer for the cached storage slot.
     pub fn storage_read10(&mut self, lba: u32, blocks: u16) -> Result<BotResult, BotError> {
-        let slot = self.storage_slot;
+        let slot = self.storage_slot();
         if slot == 0 { return Err(BotError::NoDevice); }
         // BOTSEQ: while the deferred diagnostics are armed, ANY transaction through this
         // block-layer API is post-publish traffic — the mount attempt reaching the wire (the
@@ -11965,7 +12179,7 @@ impl XhciController {
 
     /// WRITE(10) from the storage data buffer for the cached storage slot.
     pub fn storage_write10(&mut self, lba: u32, blocks: u16) -> Result<BotResult, BotError> {
-        let slot = self.storage_slot;
+        let slot = self.storage_slot();
         if slot == 0 { return Err(BotError::NoDevice); }
         // BOTSEQ: see storage_read10 — post-publish block-layer traffic releases the deferred
         // diagnostics on the next service_storage pass.
@@ -11975,7 +12189,7 @@ impl XhciController {
 
     // ---- USBREG: the ADDRESSED storage API — one transfer, one (slot, LUN) -------------------
     //
-    // The three calls above take their target from `self.storage_slot` and their logical unit from
+    // The three calls above take their target from the PRIMARY record and their logical unit from
     // whatever `slots[slot].bot_lun` holds. That is correct for ONE disk and silently wrong for two:
     // USBLUN's selection writes `bot_lun` once, at bring-up, so a read of the second card in a
     // multi-slot reader would leave the field pointing at that card and the NEXT read of the boot
@@ -12307,8 +12521,12 @@ impl XhciController {
 
     /// Full SCSI bring-up: TEST UNIT READY (with retry) -> INQUIRY -> READ CAPACITY,
     /// then publish geometry to the block-device registry.
-    fn bring_up_storage(&mut self) -> Result<(), BotError> {
-        let slot = self.storage_slot;
+    ///
+    /// STORSLOT: the device is a PARAMETER. It used to be read off the driver-global
+    /// `storage_slot`, which is why "the storage device" could only ever be one — `service_storage`
+    /// now hands this the slot of whichever record's bring-up latch it is consuming, and each
+    /// device's chain runs against its own record's note and its own retry streak.
+    fn bring_up_storage(&mut self, slot: u8) -> Result<(), BotError> {
         if slot == 0 { return Err(BotError::NoDevice); }
         // BOT-PARK: the gate that closes the metal cycle. Everything below this line — the fresh
         // clean slate, the two-strike allowance, the whole bring-up chain — is what a parked device
@@ -12323,7 +12541,7 @@ impl XhciController {
                 slot,
                 id.map(|i| i.port).unwrap_or(0), id.map(|i| i.route).unwrap_or(0),
                 id.map(|i| i.vid).unwrap_or(0), id.map(|i| i.pid).unwrap_or(0));
-            self.storage_note = "storage device PARKED (BOT retry budget exhausted)";
+            self.storage_set_note(slot, "storage device PARKED (BOT retry budget exhausted)");
             return Err(e);
         }
         // BOT-RESCUE: a freshly enumerated disk inherits no escalation state, even if the
@@ -12343,7 +12561,7 @@ impl XhciController {
         // QEMU's usb-storage tolerates its absence — which is why BOT "worked" in emulation while on
         // real silicon the endpoints stay inactive and every SCSI command fails (device never becomes
         // a block device). The HID and hub paths already SET_CONFIGURATION; storage did not.
-        self.storage_note = "SET_CONFIGURATION";
+        self.storage_set_note(slot, "SET_CONFIGURATION");
         let t_setcfg = crate::arch::now_cycles();
         let setcfg = self.sync_control(slot, 0x00, 0x09, 1, 0, 0, 0, false);
         space_add(SP_SETCFG, t_setcfg);
@@ -12351,13 +12569,13 @@ impl XhciController {
             Ok(1) => serial_println!("xHCI: storage SET_CONFIGURATION(1) OK (slot {})", slot),
             other => {
                 serial_println!("xHCI: storage SET_CONFIGURATION unexpected {:?} (slot {})", other, slot);
-                self.storage_note = "SET_CONFIGURATION failed";
+                self.storage_set_note(slot, "SET_CONFIGURATION failed");
                 return Err(BotError::Stall);
             }
         }
 
         // TEST UNIT READY — USB sticks often report "becoming ready" a few times.
-        self.storage_note = "TEST UNIT READY";
+        self.storage_set_note(slot, "TEST UNIT READY");
         // PH-2: this loop already IS a sense-and-retry loop — it is the one place a `Failed` CSW was
         // handled before this arc. Hold the CHECK CONDITION latch across it so `bot_transfer` keeps
         // propagating `Failed` verbatim here and the loop's own sense/retry cadence is unchanged;
@@ -12405,7 +12623,7 @@ impl XhciController {
             // scored empty; placed before the INQUIRY below because that INQUIRY is the bring-up's
             // first command against the unit it is going to PUBLISH, and which unit that is, is what
             // the census decides. On a single-LUN device this prints one line and changes nothing.
-            self.storage_note = "LUN census";
+            self.storage_set_note(slot, "LUN census");
             let (max_lun, present, first_present, mask) = self.usblun_census(slot);
             present_mask = mask;
             serial_println!(
@@ -12445,12 +12663,12 @@ impl XhciController {
         serial_println!(
             ":: USBLUN: census SKIPPED — built with `nousblun` (UNAOS_NOUSBLUN=1); Get Max LUN is not asked, every CBW carries bCBWLUN=0 and LUN 0 is published, exactly as before USBLUN-M1 ::");
 
-        self.storage_note = "INQUIRY";
+        self.storage_set_note(slot, "INQUIRY");
         let t_inq = crate::arch::now_cycles();
         let inq = self.scsi_inquiry(slot);
         space_add(SP_INQ, t_inq);
         let (vendor, product) = inq?;
-        self.storage_note = "READ CAPACITY";
+        self.storage_set_note(slot, "READ CAPACITY");
         // [piusb40] witness 2 — the post-wedge pipe control. Witness 1 says whether the reply bytes
         // reached DRAM; it says nothing about whether the bulk pipes are still alive afterwards,
         // and "0x25 specifically is cursed" and "the transport died" predict the same silence.
@@ -12552,7 +12770,7 @@ impl XhciController {
         // GUI-WITNESS: the USB block device is up (geometry published). One of the "did storage come
         // up?" milestones a silent boot otherwise can't answer on-panel.
         crate::bootlog::record("block:up");
-        self.storage_note = "ready";
+        self.storage_set_note(slot, "ready");
         // ONSET-2 (M2 witness 1): THE BASELINE. Taken here, at the one moment the whole chain is
         // provably healthy and idle — the device has enumerated, answered TEST UNIT READY, INQUIRY
         // and READ CAPACITY, and no BOT transaction is in flight. Every `portreg why=timeout` line
@@ -12752,8 +12970,8 @@ impl XhciController {
         let mut out = Vec::new();
         out.push(alloc::format!(
             "xHCI ports={} storage_slot={} enum_active={} queued={} note='{}'",
-            self.max_ports, self.storage_slot, self.enum_active,
-            self.ports_to_enumerate.len(), self.storage_note));
+            self.max_ports, self.storage_slot(), self.enum_active,
+            self.ports_to_enumerate.len(), self.storage_note()));
         if self.enum_active {
             // The stall-localizer: WHICH port is in flight and at WHICH step, and for how long
             // (ms via the calibrated TSC) — a photo of this line replaces a debugger.
@@ -12783,7 +13001,7 @@ impl XhciController {
         }
         for (i, slot) in self.slots.iter().enumerate() {
             if !slot.active { continue; }
-            let role = if i as u8 == self.storage_slot { "STORAGE" }
+            let role = if self.storage_ix(i as u8).is_some() { "STORAGE" }
                        else if slot.is_keyboard && slot.is_mouse { "kbd+mouse" }
                        else if slot.is_keyboard { "keyboard" }
                        else if slot.is_mouse { "mouse" }
@@ -12805,20 +13023,20 @@ impl XhciController {
         // attempt, which every platform's storage-ready pass tail issues (piusb27_service on Pi,
         // probe_once on x86) in the SAME pass that armed us — has already reached the wire. So the
         // mount verdict precedes the matrices by construction, and no probe was deleted or changed.
-        if self.storage_diag_pending && !self.storage_pending_bringup {
+        if self.storage_diag_pending && !self.storage_pending_any() {
             if !self.storage_postpublish_io { return; }
             // Same pacing gate as the bring-up: never start the multi-second diagnostic chain
             // while a port (e.g. a hub-cycle re-enumeration) is mid-flight. Latch stays set.
             if self.enum_active || !self.ports_to_enumerate.is_empty() { return; }
             self.storage_diag_pending = false;
-            if self.storage_slot == 0 { return; } // device left before the diagnostics pass
+            if self.storage_slot() == 0 { return; } // device left before the diagnostics pass
             // BOT-PARK: this is a fresh synchronous hand-off from the desktop loop, exactly like
             // the bring-up pass — the diagnostics get their own pass ladder, as they always had.
             self.bot_pass_begin();
             self.storage_diag_matrices();
             return;
         }
-        if !self.storage_pending_bringup { return; }
+        if !self.storage_pending_any() { return; }
         // BOOTPACE M2 — CONSOLE-FIRST. Defer the whole SCSI bring-up until the enumeration queue
         // has drained. The latch is left SET (this is a `return`, not a consume), so the bring-up is
         // not skipped, only postponed to the first main-loop pass on which no port is mid-enumeration.
@@ -12839,8 +13057,17 @@ impl XhciController {
         // fixtures all gate on `block::info()` internally, so they follow the block device's arrival.
         // This changes ORDER only — no protocol timing, no budget, no settle.
         if self.enum_active || !self.ports_to_enumerate.is_empty() { return; }
-        self.storage_pending_bringup = false;
-        if self.storage_slot == 0 { return; }
+        // STORSLOT: consume ONE record's bring-up latch per pass, lowest index first — index order
+        // is arrival order, so the disk that enumerated first is brought up first and takes
+        // registry index 0 with the boot volume on it. One per pass and not a loop over all of
+        // them: `bot_pass_begin` below is what makes `BOT_PARK_PASS_LADDERS` mean anything, and a
+        // second multi-second SCSI chain inside the same pass would spend the first device's
+        // allowance on the second device's ladders. The remaining latches are untouched, so the
+        // next main-loop pass picks up the next disk.
+        let Some(ix) = self.storage.iter().position(|r| r.pending_bringup) else { return; };
+        self.storage[ix].pending_bringup = false;
+        let slot = self.storage[ix].slot;
+        if slot == 0 { return; }
         // BOT-PARK: a new main-loop pass. This is the cooperative half of the retry discipline —
         // `BOT_PARK_PASS_LADDERS` bounds what one pass may spend, and the counter is what makes
         // "one pass" mean anything. Reset here, at the single place the desktop loop hands the
@@ -12863,7 +13090,7 @@ impl XhciController {
         // SPACE: the `{}` per-stage view is scoped to exactly this chain. Armed here and disarmed on
         // BOTH exits, so it can never be read against the boot-long BOT totals.
         SPACE_ACTIVE.store(true, Ordering::Relaxed);
-        let brought_up = self.bring_up_storage();
+        let brought_up = self.bring_up_storage(slot);
         SPACE_ACTIVE.store(false, Ordering::Relaxed);
         match brought_up {
             Ok(()) => serial_println!("xHCI: storage ready."),
@@ -12899,7 +13126,7 @@ impl XhciController {
         // address theory and redirecting to the length/TD-shape (or genuine device-side) discriminator.
         #[cfg(target_arch = "aarch64")]
         {
-            let s = &self.slots[self.storage_slot as usize];
+            let s = &self.slots[slot as usize];
             let databuf = s.scsi_data_buffer.map(|p| p as u64).unwrap_or(0);
             let cbw = s.cbw_buffer.map(|p| p as u64).unwrap_or(0);
             let csw = s.csw_buffer.map(|p| p as u64).unwrap_or(0);
@@ -12925,10 +13152,16 @@ impl XhciController {
         // Sanity read of LBA 0. BOTSEQ: the CSW verdict feeds the `[botseq]` sequencing witness
         // below, so the deferral line can say whether the bring-up chain itself was healthy at
         // the moment the mount was handed the first post-publish slot.
-        let lba0_ok = match self.storage_read10(0, 1) {
+        // STORSLOT: ADDRESSED at the device this pass brought up, not at the primary. The
+        // unaddressed `storage_read10`/`storage_data_ptr` this replaces read record 0 — correct
+        // while only one device could exist, and a silent lie the moment a second one is brought
+        // up: the second disk's sector-0 witness would photograph the FIRST disk. `slot` and the
+        // primary are the same device on every one-disk machine, so the witness set is unchanged.
+        let lun0 = self.slots[slot as usize].bot_lun;
+        let lba0_ok = match self.storage_read10_on(slot, lun0, 0, 1) {
             Ok(res) => {
                 serial_println!("xHCI: READ(10) LBA0 CSW status={:?} residue={}", res.status, res.residue);
-                if let Some(p) = self.storage_data_ptr() {
+                if let Some(p) = self.storage_data_ptr_on(slot) {
                     unsafe {
                         let data = core::slice::from_raw_parts(p as *const u8, 512);
                         let sig = core::str::from_utf8(&data[0..21]).unwrap_or("INVALID");
@@ -12961,9 +13194,9 @@ impl XhciController {
                             };
                             serial_println!(
                                 ":: PIUSB: [piusb25] storage enumerated: slot {} bulk_in={:#04x} bulk_out={:#04x} block_size={} num_blocks={} ({} MiB) ::",
-                                self.storage_slot,
-                                self.slots[self.storage_slot as usize].bulk_in_ep,
-                                self.slots[self.storage_slot as usize].bulk_out_ep,
+                                slot,
+                                self.slots[slot as usize].bulk_in_ep,
+                                self.slots[slot as usize].bulk_out_ep,
                                 bs, nb, mib);
                             serial_println!(
                                 ":: PIUSB: [piusb25] READ(10) LBA0 CSW={:?} residue={} — first 16 bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
@@ -12989,8 +13222,8 @@ impl XhciController {
                 // the first 16 bytes of the freshly-DMA'd + post-invalidate DRAM. On P44 this printed
                 // zeros; on P45 it must match the real boot sector. aarch64-only, read-only.
                 #[cfg(target_arch = "aarch64")]
-                if let Ok(re) = self.storage_read10(0, 1) {
-                    if let Some(p) = self.storage_data_ptr() {
+                if let Ok(re) = self.storage_read10_on(slot, lun0, 0, 1) {
+                    if let Some(p) = self.storage_data_ptr_on(slot) {
                         unsafe {
                             let d = core::slice::from_raw_parts(p as *const u8, 16);
                             serial_println!(
@@ -13023,11 +13256,23 @@ impl XhciController {
         // mount now issued before the matrices, a next metal flight where the mount SURVIVES while
         // matrices are deferred breaks that collinearity: the probes' command mix (read12/read16/
         // pre-sense/induced-stall...), not sequence depth, is what kills the reader.
-        self.storage_diag_pending = true;
-        self.storage_postpublish_io = false;
+        // STORSLOT: armed for the PRIMARY device only. Every probe in `storage_diag_matrices`
+        // (the PIUSB-36/37/38 matrices and `mission_write_selftest`) addresses the primary through
+        // `storage_slot()` / `storage_data_ptr()`, so arming on a SECOND device's bring-up would
+        // re-run the whole chain against the FIRST disk — a duplicate multi-second diagnostic pass
+        // and a second write self-test on a disk that had already passed one. The one-disk boot is
+        // unchanged: there, `ix` is always 0.
+        if ix == 0 {
+            self.storage_diag_pending = true;
+            self.storage_postpublish_io = false;
+        }
         serial_println!(
             ":: BOT: [botseq] mount-first attempted lba0={} matrices=deferred ::",
             if lba0_ok { "ok" } else { "err" });
+        serial_println!(
+            ":: STORSLOT: bringup done slot={} ix={} devices={} diag={} ::",
+            slot, ix, self.storage_count(),
+            if ix == 0 { "armed" } else { "primary-only" });
     }
 
     /// BOTSEQ: the deferred diagnostics pass — the exact PIUSB-36/37/38 matrices + write selftest
@@ -13477,7 +13722,7 @@ impl XhciController {
             // already armed and waiting behind it. That is the exact overlap `wait=` is made of, and
             // scoping it this way keeps the counter from absorbing the console's steady-state
             // traffic — which is not on anyone's critical path and must not look as if it were.
-            let ftdi_t0 = if self.storage_pending_bringup {
+            let ftdi_t0 = if self.storage_pending_any() {
                 Some(crate::arch::now_cycles())
             } else {
                 None
@@ -14643,11 +14888,9 @@ impl XhciController {
             // Scope assertion (traced): a matched slot must be in THIS root port's tree, share the
             // prefix, and never be a root slot.
             debug_assert!(self.slots[i].port_id == hub_root_port && self.slots[i].route_depth > hub_depth);
-            if self.storage_slot == i as u8 {
-                self.storage_slot = 0;
-                self.storage_pending_bringup = false;
-                self.storage_note = "hub-downstream storage disconnected";
-            }
+            // STORSLOT: the record for THIS slot only — a hub port losing one disk leaves the
+            // rest of the subtree's disks tracked.
+            self.storage_release(i as u8, "hub-downstream storage disconnected");
             // USB-UNPLUG: same retraction as the root-port teardown — a disk pulled from a HUB port
             // must leave the block registry too, or the installer keeps listing it. Slot-id matched,
             // so only the slot that actually published geometry is retracted.
@@ -14826,7 +15069,7 @@ impl XhciController {
         if i == 0 || i >= self.slots.len() || !self.slots[i].active {
             return;
         }
-        if self.storage_slot == slot_id && self.storage_note == "ready" {
+        if self.storage_note_of(slot_id) == "ready" {
             return; // paranoia: never dispose a ready storage slot
         }
         self.hubs_pending.retain(|s| *s != slot_id);
@@ -15044,19 +15287,40 @@ impl XhciController {
             serial_println!(
                 "xHCI: >>> HUB DOWNSTREAM MASS STORAGE (slot {}, bulk in {:#x}/{} out {:#x}/{}) <<<",
                 slot_id, in_addr, in_mps, out_addr, out_mps);
-            if self.storage_slot != 0 {
-                serial_println!("xHCI: storage slot {} already active; ignoring the hubbed device.", self.storage_slot);
+            // STORSLOT: this arm used to READ `if self.storage_slot != 0 { ...ignoring... }` —
+            // one field held the one supported device, so a hubbed disk arriving after any other
+            // mass-storage device was dropped on the floor with a log line and nothing else. The
+            // records are an array now, so the refusal is only the genuine FULL case, which
+            // `storage_claim` reports by answering `None`.
+            if self.storage_ix(slot_id).is_none() && self.storage_count() >= STORAGE_SLOTS {
+                serial_println!(
+                    ":: STORSLOT: storage records FULL ({} devices) — the hubbed device on slot {} is not configured ::",
+                    STORAGE_SLOTS, slot_id);
             } else if self.configure_bulk_endpoints_sync(slot_id, in_addr, in_mps, out_addr, out_mps) {
                 // BOT error recovery's Bulk-Only Mass Storage Reset targets this interface.
                 self.slots[slot_id as usize].storage_intf = msc_intf; // PIUSB-38 reset-recovery wIndex
                 // Defer SET_CONFIGURATION + SCSI bring-up to service_storage (same main-loop
                 // context, next hook) — identical hand-off to the root path's async completion.
-                self.storage_slot = slot_id;
-                self.storage_pending_bringup = true;
-                // SPACE: the arm instant, same as the root path's — a hubbed stick pays the same
-                // ladder gap and must be measured by the same clock.
-                SPACE_ARMED_AT.store(crate::arch::now_cycles(), Ordering::Relaxed);
-                self.storage_note = "hub-downstream endpoints configured; SCSI bring-up pending";
+                // STORSLOT: the hub path's claim, the same call the root path makes. `None` here
+                // is unreachable — the FULL case was answered in the arm above and this arm is only
+                // entered when a record is free — but a `None` that silently armed nothing would be
+                // a device the driver configured endpoints for and then forgot, so it is named.
+                match self.storage_claim(slot_id) {
+                    Some(ix) => {
+                        self.storage[ix].pending_bringup = true;
+                        self.storage[ix].note =
+                            "hub-downstream endpoints configured; SCSI bring-up pending";
+                        // SPACE: the arm instant, same as the root path's — a hubbed stick pays the
+                        // same ladder gap and must be measured by the same clock.
+                        SPACE_ARMED_AT.store(crate::arch::now_cycles(), Ordering::Relaxed);
+                        serial_println!(
+                            ":: STORSLOT: claim slot={} ix={} devices={} hub=yes — mass-storage record taken; SCSI bring-up deferred to the main loop ::",
+                            slot_id, ix, self.storage_count());
+                    }
+                    None => serial_println!(
+                        ":: STORSLOT: storage records FULL ({} devices) — hubbed slot {} configured its endpoints but is NOT brought up ::",
+                        STORAGE_SLOTS, slot_id),
+                }
                 serial_println!("xHCI: Endpoints Configured (Slot {}). Storage ready.", slot_id);
             }
             return;
