@@ -242,9 +242,14 @@ up.
    `fs::bootdisk::bind` arm is `#[cfg(target_arch = "aarch64")]`; the x86 arm binds
    `open_read_volume()` instead. The first rung's capture shows it: `[vfs]` appears **0 times** in
    `target/serial.log`. That is a REPORTED gap this arc does not close — see §Owed below.
-2. `survey()` CACHES its first answer for the boot, and this fixture runs at PCI enumeration time,
+2. `survey()` CACHED its first answer for the boot, and this fixture runs at PCI enumeration time,
    long before USB storage finishes its deferred SCSI bring-up. Driving the cached walk from here
    would latch a root of NONE for every later caller — the hazard `fs/users.rs` already records.
+   **SO38 has since fixed the caching half** (X86BIND, 2026-09-15: only a survey that BOUND a root is
+   cached; a rootless one is redone when the present-source set changes — `vfs.md` §14.8). This
+   fixture still does not call `survey()`, and should not: it walks the SATA rung directly through
+   the very functions the walk uses, which is what makes it a proof about the chain rather than
+   about the cache.
 
 So the fixture walks the SATA rung of `fat::live_sources()` directly, through the very functions the
 walk uses, and leaves the cache untouched.
@@ -308,6 +313,14 @@ change is folds.
   on x86 the home-soil mounts, the `/volumes/<LABEL>` points and the `[vfs] root` witness do not
   happen at all — with or without SATA. This arc makes the walk CAPABLE of seeing a SATA disk and
   proves that capability on the wire through its own fixture; wiring the x86 arm is its own job.
+  **X86BIND (2026-09-15) attempted that job and did not land it** — the wiring compiles, but the
+  default `./arroyo test` fixture has no kernel-carrying volume the kernel can MOUNT, so
+  root-by-content has nothing to find there. `builder/src/main.rs:1042-1043` puts the ESP holding
+  `kernel.elf` on `ide-hd,drive=esp,bootindex=0` — visible to the kernel only under `UNAOS_AHCI=1`,
+  i.e. **through this driver** — and the usb-storage stick is `usb.img`, the raw
+  `UNA-OS-DISK-001-ALPHA` pattern, not a filesystem. So the fixture that can finally host the x86
+  walk is an AHCI one, and that is the same configuration as "UnaOS installed on the internal
+  disk". See rmbp-ledger B89 (third rung) and LEDGER SO38.
 * **Writes**, and the partition-mode installer behind B91's stranger guard (rmbp-queue `AHCIWRITE`).
 
 ---
