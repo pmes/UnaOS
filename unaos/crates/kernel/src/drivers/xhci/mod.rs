@@ -15561,12 +15561,12 @@ impl XhciController {
                     slot.data_buffer = Some(alloc::alloc::alloc_zeroed(l));
                 }
                 let ep = base_ptr.add((1 + dci as usize) * CTX_WORDS);
-                ep.add(0).write_volatile((encode_interval(interval) << 16) | (mps << 24));
+                ep.add(0).write_volatile(encode_interval(interval) << 16); // HIDESIT (rmbp 2026-09-15; the sibling HUBFIX/d9c5987b convicted and reported) — DW0 IS INTERVAL (bits 23:16) AND NOTHING ELSE. It used to carry `| (mps << 24)`, and bits 31:24 of an Endpoint Context DW0 are **Max ESIT Payload Hi** (xHCI 1.2 Table 6-9, §6.2.3.8) — the HIGH half of a 32-bit byte count, not a second copy of the packet size. An mps-8 boot keyboard therefore asked the xHC for `8 << 16` = 524288 bytes PER SERVICE INTERVAL, 65536x what one 8-byte boot report needs (measured at d186e15c: `dw0=0x08060000 … esit=524288 esithi=8`). HUBFIX excused this arm as "LS/FS behind a TT, whose periodic budget the xHC does not police" — ⚠ THAT PREMISE IS WRONG, and this arc's baseline is what disproved it: QEMU's `usb-kbd`/`usb-tablet` on `xhci.0` train at **speed=3, HIGH SPEED, on a ROOT PORT**, no TT anywhere, and the request was honoured only because QEMU's xHCI model validates no periodic budget at all. A real xHC budgets an HS root-port interrupt endpoint directly and returns completion code 8 (Bandwidth Error) for 524288 B/ESIT against an HS budget of ~3 KB/microframe — the same code the Orin's HS hub returns in RENDER2-AUDIT N2. Writing 0 here is also the only always-legal value: §6.2.3.8 makes Max ESIT Payload Hi RsvdZ whenever HCCPARAMS2.LEC = 0, and this driver never reads LEC. `encode_interval` is UNCHANGED and verified for the HID case by the witness's independent recomputation (`ival=6/6` HS kbd, `3/3` HS pointer). ⚠ FOLDED onto this line, never a line of its own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below.
                 ep.add(1).write_volatile((7 << 3) | (3 << 1) | (mps << 16)); // EP Type 7 (Interrupt IN), CErr 3
                 ep.add(2).write_volatile((phys as u32) | 1);
                 ep.add(3).write_volatile((phys >> 32) as u32);
-                ep.add(4).write_volatile(mps);
-                x200_witness(op_base, &alloc::format!("slot{} kbd TRdeq", slot_id), phys);
+                ep.add(4).write_volatile(mps | (mps << 16)); // HIDESIT — DW4 is TWO fields: **Average TRB Length** (bits 15:0) and **Max ESIT Payload Lo** (bits 31:16), xHCI 1.2 Table 6-9. It used to write `mps` alone, which set a correct Average TRB Length and left Max ESIT Payload Lo ZERO, so the payload this endpoint really needs was never stated in the field that states it and everything the xHC read came from the misplaced high byte in DW0 above. Max ESIT Payload for an interrupt endpoint = wMaxPacketSize x (Max Burst+1) x (Mult+1); DW1 bits 15:8 (Max Burst) and DW0 bits 9:8 (Mult) are written ZERO by this function at every speed, so the product is exactly `mps` and both halves of this word are `mps`. Average TRB Length keeps its old value on purpose: it was already correct, and §6.2.3.6 only requires it to be non-zero (mps is the natural figure for an endpoint that reads one boot report per TD). ⚠ FOLDED onto this line — same kernel8.img reason as DW0's note.
+                x200_witness(op_base, &alloc::format!("slot{} kbd TRdeq", slot_id), phys); #[cfg(feature = "witness")] hidesit_note("kbd", slot_id, ep_addr, dci, speed, mps, interval, base_ptr as usize); // HIDESIT — read the KEYBOARD endpoint context back out of the input context these five stores just filled, so the scorer at the tail of this file reports the dwords the xHC is about to be handed rather than a recomputation of them. ⚠ FOLDED onto the existing witness call — no line added; this file is compiled into the Pi's kernel8.img.
                 add_flags |= 1 << dci;
                 mdci = mdci.max(dci);
                 slot.keyboard_state = 1;
@@ -15585,12 +15585,12 @@ impl XhciController {
                     slot.mouse_data_buffer = Some(alloc::alloc::alloc_zeroed(l));
                 }
                 let ep = base_ptr.add((1 + dci as usize) * CTX_WORDS);
-                ep.add(0).write_volatile((encode_interval(interval) << 16) | (mps << 24));
+                ep.add(0).write_volatile(encode_interval(interval) << 16); // HIDESIT — the POINTER endpoint carried the identical misplaced `(mps << 24)`, and it is a SEPARATE defect on a separate device: the keyboard and the pointer enumerate into different slots and each builds its own input context, so a fix proved on one proves nothing about the other. Measured at d186e15c on the same leg: `slot=3 ptr … dw0=0x08030000 … esit=524288 esithi=8`. Same correction, same citations as the keyboard arm above. ⚠ FOLDED.
                 ep.add(1).write_volatile((7 << 3) | (3 << 1) | (mps << 16)); // EP Type 7 (Interrupt IN), CErr 3
                 ep.add(2).write_volatile((phys as u32) | 1);
                 ep.add(3).write_volatile((phys >> 32) as u32);
-                ep.add(4).write_volatile(mps);
-                x200_witness(op_base, &alloc::format!("slot{} mouse TRdeq", slot_id), phys);
+                ep.add(4).write_volatile(mps | (mps << 16)); // HIDESIT — Max ESIT Payload Lo into DW4 bits 31:16, Average TRB Length unchanged in 15:0. A boot or report-protocol pointer bursts once with Mult 0 at every speed this driver configures, so its Max ESIT Payload is exactly `mps` too. ⚠ FOLDED.
+                x200_witness(op_base, &alloc::format!("slot{} mouse TRdeq", slot_id), phys); #[cfg(feature = "witness")] hidesit_note("ptr", slot_id, ep_addr, dci, speed, mps, interval, base_ptr as usize); // HIDESIT — the POINTER arm's readback; the same scorer, a separate line, because the two endpoints carried the identical defect independently and a fix proved on one is not proved on the other. ⚠ FOLDED onto the existing witness call.
                 add_flags |= 1 << dci;
                 mdci = mdci.max(dci);
                 slot.mouse_state = 1;
@@ -16470,4 +16470,90 @@ impl XhciController {
             if pass { "PASS" } else { "FAIL" }
         );
     }
+}
+
+// HIDESIT (rmbp 2026-09-15, trunk QUEUE §2 `· NEW` row HUBFIX opened) — the ROOT-PORT HID endpoints'
+// Max ESIT Payload readback. TAIL APPEND, below every pre-existing line of this file, so nothing
+// above moves and the only `panic::Location` records that shift are the ones inside this function
+// (LAWS §5 byte identity; this file is compiled into the Pi's kernel8.img). The FIX itself is
+// UNGATED and folded onto the existing `ep.add(0)` / `ep.add(4)` stores in both arms of
+// `configure_hid_endpoints`; only the readback below is `witness`-gated.
+//
+// THE DEFECT, and why it outlived HUBFIX. `configure_hid_endpoints` wrote
+// `(encode_interval(interval) << 16) | (mps << 24)` into Endpoint Context DW0 and a bare `mps` into
+// DW4, at BOTH its keyboard and its pointer endpoint — the same arithmetic HUBFIX convicted in
+// `configure_hub_interrupt_ep` (d9c5987b, LEDGER S1), and HUBFIX's commit message names this
+// function as the standing sibling it deliberately did not touch. DW0 bits 31:24 are **Max ESIT
+// Payload Hi** (xHCI 1.2 Table 6-9, §6.2.3.8), the HIGH half of a 32-bit byte count, and DW4 splits
+// into **Average TRB Length** (15:0) and **Max ESIT Payload Lo** (31:16). So an mps-8 boot keyboard
+// asked the xHC for `8 << 16` = 524288 bytes per service interval — 65536x what it needs — and left
+// the field that states the real payload at zero.
+//
+// WHY IT SURVIVED — AND HUBFIX'S EXCUSE FOR IT IS WRONG, measured here rather than inherited.
+// HUBFIX's note says this arm was never convicted because "every HID device this driver configures
+// is LS/FS behind a Transaction Translator, whose periodic budget the xHC does not police". The
+// baseline this arc took at d186e15c says otherwise: on `UNAOS_XHCIKBD=1` QEMU's `usb-kbd` and
+// `usb-tablet` sit on `xhci.0` ROOT PORTS and train at **speed=3, HIGH SPEED** — no hub, no TT
+// anywhere on the leg — and the 524288-byte request was still honoured. The real reason it survived
+// is simply that QEMU's xHCI model validates NO periodic budget and NO Max ESIT Payload, for a root
+// port exactly as HUBFIX measured for a hub. On a real xHC an HS root-port interrupt endpoint is
+// budgeted directly and 524288 B/ESIT against an HS budget of ~3 KB/microframe is completion code 8
+// (Bandwidth Error) — the same code the Orin's HS hub returns in RENDER2-AUDIT N2. So the devices
+// this fix changes the behaviour of are the ones that could not previously configure at all, and
+// that is why it wanted its own arc and its own measurement instead of riding HUBFIX's.
+//
+// THE FIX. DW0 carries Interval alone — also RsvdZ-correct, since §6.2.3.8 makes Max ESIT Payload Hi
+// RsvdZ whenever HCCPARAMS2.LEC = 0 and this driver never reads LEC — and DW4 carries
+// `mps | (mps << 16)`. Max ESIT Payload for an interrupt endpoint is wMaxPacketSize x (Max Burst+1)
+// x (Mult+1); DW1 bits 15:8 (Max Burst) and DW0 bits 9:8 (Mult) are both written ZERO by this
+// function at every speed, so the product is exactly `mps` and both halves of DW4 are `mps`.
+// Average TRB Length keeps its old value on purpose: it was already correct and §6.2.3.6 only
+// requires it to be non-zero (mps is the natural figure for an interrupt endpoint that reads one
+// report per TD). `encode_interval` is UNCHANGED and verified for the HID case below.
+//
+// THE SCORE, one line per configured HID endpoint, printed from inside the build loop the instant
+// the five stores are done:
+//   :: HIDESIT: slot=<s> <kbd|ptr> ep=<0xNN> dci=<d> speed=<sp> mps=<m> burst=<b> bival=<i>
+//      ival=<e> dw0=<0x…> dw4=<0x…> esit=<n> esithi=<h> avgtrb=<a> want=<w> -> PASS|FAIL ::
+// PASS iff  esit == want (= mps x (burst+1), the 32-bit value both halves encode)  &&  esithi == 0
+// &&  avgtrb == mps  &&  ival == the speed's correct encoding of bInterval. `esit` is assembled as
+// `(DW0[31:24] << 16) | DW4[31:16]`, the way the controller assembles it, so the defect shows up as
+// a number 65536x too large rather than as a missing field. `-> FAIL` is in arroyo's FAULT_PATTERNS,
+// so the leg's exit status carries the verdict.
+//
+// ⛔ WHAT THIS LEG PROVES AND WHAT IT CANNOT. QEMU's xHCI model validates neither the periodic
+// budget nor Max ESIT Payload, so — exactly as HUBFIX measured for the hub — the BAD context was
+// accepted on QEMU and the keyboard typed anyway. This witness therefore scores the DWORDS
+// SUBMITTED, not a completion code: on QEMU the go-red is the defect itself on the wire. Only a
+// metal boot with a High-Speed HID device on a root port can prove the xHC now ACCEPTS what it
+// would have refused, so HIDESIT is fixed-unflown for that half.
+#[cfg(feature = "witness")]
+fn hidesit_note(arm: &str, slot_id: u8, ep_addr: u8, dci: u32, speed: u32, mps: u32, interval: u8, input_ctx_virt: usize) {
+    // Re-read, never recompute: these are the bytes the Configure-Endpoint TRB below points the xHC at.
+    let (dw0, dw1, dw4) = unsafe {
+        let ep = (input_ctx_virt as *const u32).add((1 + dci as usize) * CTX_WORDS);
+        (core::ptr::read_volatile(ep.add(0)), core::ptr::read_volatile(ep.add(1)), core::ptr::read_volatile(ep.add(4)))
+    };
+    let ival = (dw0 >> 16) & 0xFF;
+    let esithi = (dw0 >> 24) & 0xFF;
+    let avgtrb = dw4 & 0xFFFF;
+    let esit = ((esithi as u64) << 16) | (((dw4 >> 16) & 0xFFFF) as u64);
+    let burst = (dw1 >> 8) & 0xFF;
+    let want = (mps as u64) * ((burst as u64) + 1);
+    // The interval clause is a CONTROL on HUBFIX's "enc_interval is correct" finding, restated for
+    // the HID case: HS/SS encode bInterval-1 directly, LS/FS encode floor(log2(bInterval)) + 3
+    // (xHCI 1.2 Table 6-12). Recomputed here independently of `encode_interval` so the two would
+    // have to be wrong the same way to agree.
+    let want_ival = if speed == 3 || speed >= 4 {
+        interval.saturating_sub(1) as u32
+    } else if interval > 0 {
+        (31 - (interval as u32).leading_zeros()) + 3
+    } else { 0 };
+    let pass = esit == want && esithi == 0 && avgtrb == mps && ival == want_ival;
+    serial_println!(
+        ":: HIDESIT: slot={} {} ep={:#04x} dci={} speed={} mps={} burst={} bival={} ival={}/{} dw0={:#010x} dw4={:#010x} esit={} esithi={} avgtrb={} want={} -> {} ::",
+        slot_id, arm, ep_addr, dci, speed, mps, burst, interval, ival, want_ival,
+        dw0, dw4, esit, esithi, avgtrb, want,
+        if pass { "PASS" } else { "FAIL" }
+    );
 }
