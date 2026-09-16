@@ -150,6 +150,48 @@ pub struct BootInfo {
     /// identify its boot device must still be usable.
     pub boot_volume_serial: u32,
 
+    /// BOOTCLOCK: three `rdtsc` stamps taken by the x86 UEFI loader, so the kernel can subtract the
+    /// phase it can otherwise never see. `A12` (rmbp-ledger) is the row: Peter's *"both boots took
+    /// much longer than they have in the past"* was contradicted by the kernel's OWN clock (`BPACE
+    /// total gui=` fell 25533 → 23286 → 21387 ms across flights 7/8/9), which means the growth he
+    /// felt is entirely BEFORE `kernel_main`'s first instruction — firmware POST, the ⌥ boot picker,
+    /// and the loader reading a 3.8 MB `kernel.elf` off the SD slot. Nothing measured that phase.
+    ///
+    /// **x86_64 ONLY, and gated on `target_arch` rather than on a Cargo feature ON PURPOSE.** This
+    /// crate is compiled once per target, and the loader and the kernel for one machine are always
+    /// the SAME `target_arch` (`x86_64-unknown-uefi` + `x86_64-unaos.json`, or the aarch64 pair) —
+    /// so unlike `unaos_ivb`, this gate cannot be armed on one side of the hand-off and not the
+    /// other. The aarch64 layout is therefore untouched, byte for byte: no field is added there, the
+    /// aarch64 loader stamps nothing, and `arch::boot::build_boot_info` (the Pi bare-metal path,
+    /// which never runs a UEFI loader at all) needs no change.
+    ///
+    /// Units are RAW TSC CYCLES, never milliseconds: the loader has no calibrated frequency and a
+    /// guessed Hz is the one thing this instrument must not emit (the `bootpace` rule — a guess is
+    /// sound for a settle and fatal for a measurement). The kernel converts at print time with the
+    /// rate `apic::calibrate` measured, which is why the witness line prints after calibration.
+    ///
+    /// **0 is the absent sentinel on all three**, and it is reachable in practice: existing boot
+    /// media carries a `bootloader.efi` built before this field existed, and `BootInfo` is reached
+    /// through a `transmute`d pointer with nothing checking versions. The kernel prints
+    /// `firmware->loader=absent` rather than a number in that case.
+    ///
+    /// `tsc_loader_entry` is the TSC at the loader's `main()`, i.e. **counted from the last
+    /// processor reset** — so it INCLUDES firmware POST and the operator's hand at the ⌥ picker.
+    /// That is the number Peter felt; read it as an upper bound on pre-loader time, never as a
+    /// firmware timing on its own.
+    #[cfg(target_arch = "x86_64")]
+    pub tsc_loader_entry: u64,
+    /// BOOTCLOCK: the TSC immediately after `kernel.elf` has been read off the boot volume into
+    /// memory (on the bench that is the SDHCI reader and a 3.8 MB ELF). 0 = absent; see
+    /// [`BootInfo::tsc_loader_entry`] for the whole contract.
+    #[cfg(target_arch = "x86_64")]
+    pub tsc_loader_read: u64,
+    /// BOOTCLOCK: the TSC at the last instruction before the loader transmutes the entry point and
+    /// jumps — after ELF load, relocation, ACPI/EDID/volume-serial discovery and
+    /// `exit_boot_services`. 0 = absent; see [`BootInfo::tsc_loader_entry`].
+    #[cfg(target_arch = "x86_64")]
+    pub tsc_loader_jump: u64,
+
     #[cfg(feature = "unaos_ivb")]
     pub igpu_trace_0: [u32; 11],
     #[cfg(feature = "unaos_ivb")]
@@ -218,9 +260,30 @@ const _: () = {
     assert!(offset_of!(BootInfo, boot_volume_serial) == 252, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
 };
 
-/// The size of the common prefix — everything above the `unaos_ivb` fields. `boot_volume_serial`
-/// is the last common field and it ends at 256, so this is also `size_of::<BootInfo>()` on a
-/// default build.
+// --- BootInfo: the BOOTCLOCK stamps. Present only on x86_64 (see the field docs), so their
+// --- assertions are arch-gated too. Every number here was MEASURED the same way as the block
+// --- above: `offset_of!` compiled for `x86_64-unknown-uefi` and `x86_64-unaos.json`, both
+// --- `unaos_ivb` legs (2026-09-16, BOOTCLOCK). `boot_volume_serial` is a `u32` ending at 256 and
+// --- `u64` wants align 8, so the first stamp lands at 256 with NO padding — appending here is free.
+#[cfg(target_arch = "x86_64")]
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(BootInfo, tsc_loader_entry) == 256, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
+    assert!(offset_of!(BootInfo, tsc_loader_read) == 264, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
+    assert!(offset_of!(BootInfo, tsc_loader_jump) == 272, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
+};
+
+/// The size of the common prefix — everything above the `unaos_ivb` fields, and also
+/// `size_of::<BootInfo>()` on a default build.
+///
+/// **Arch-split since BOOTCLOCK (2026-09-16).** `boot_volume_serial` ends at 256 and is the last
+/// field on aarch64, which is why that leg's 256 is unchanged; x86_64 then carries the three
+/// `tsc_loader_*` stamps (3 × `u64` = 24 B, no padding) and ends at 280. The constant is what the
+/// `unaos_ivb` tail's first assertion is written against, so keeping it honest per arch is what
+/// keeps THAT check meaningful rather than merely true.
+#[cfg(target_arch = "x86_64")]
+pub const BOOT_INFO_COMMON_LEN: usize = 280;
+#[cfg(not(target_arch = "x86_64"))]
 pub const BOOT_INFO_COMMON_LEN: usize = 256;
 
 #[cfg(not(feature = "unaos_ivb"))]
@@ -235,13 +298,36 @@ const _: () = assert!(
 // --- and `arroyo` must arm it for the loader and the kernel together. `repr(C)` is what demotes a
 // --- one-sided arm from "every shared field is scrambled" to "the tail is absent"; these
 // --- assertions keep it that way.
-#[cfg(feature = "unaos_ivb")]
+// The tail's own offsets are arch-split since BOOTCLOCK, for the same reason `BOOT_INFO_COMMON_LEN`
+// is: on x86_64 the three `tsc_loader_*` stamps sit in front of it and shift every number by 24.
+// Both legs keep LITERAL offsets rather than `BOOT_INFO_COMMON_LEN + n` arithmetic — a derived
+// number agrees with the struct by construction and so can never catch the mistake these assertions
+// exist for. Measured on both x86_64 targets, 2026-09-16 (BOOTCLOCK). Today no build combines
+// `unaos_ivb` with aarch64 (`arroyo` arms the feature on the two x86 kernel legs and on the
+// `x86_64-unknown-uefi` loader leg only), so the aarch64 leg below is the pre-BOOTCLOCK block kept
+// intact against the day one does.
+#[cfg(all(feature = "unaos_ivb", target_arch = "x86_64"))]
 const _: () = {
     use core::mem::offset_of;
     // The tail starts exactly where the common prefix ends — this is the property that makes a
     // one-sided `unaos_ivb` arm non-catastrophic. If it ever fails, the two feature legs have
     // diverged in their shared region and the loader and kernel no longer see the same fields.
     assert!(offset_of!(BootInfo, igpu_trace_0) == BOOT_INFO_COMMON_LEN, "ABI-LOCK: the unaos_ivb tail no longer starts at the end of the common prefix — the two feature legs have diverged. See the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_0) == 280, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_1) == 324, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_2) == 368, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, gmux_trace_0) == 412, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_valid) == 440, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, kdisp_trace_0) == 444, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, kdisp_trace_valid) == 472, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(core::mem::size_of::<BootInfo>() == 480, "ABI-LOCK: BootInfo size changed on an unaos_ivb build — see the ABI-LOCK note at the top of this file.");
+};
+
+#[cfg(all(feature = "unaos_ivb", not(target_arch = "x86_64")))]
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(BootInfo, igpu_trace_0) == BOOT_INFO_COMMON_LEN, "ABI-LOCK: the unaos_ivb tail no longer starts at the end of the common prefix — the two feature legs have diverged. See the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_0) == 256, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
     assert!(offset_of!(BootInfo, igpu_trace_1) == 300, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
     assert!(offset_of!(BootInfo, igpu_trace_2) == 344, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
     assert!(offset_of!(BootInfo, gmux_trace_0) == 388, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");

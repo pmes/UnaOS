@@ -179,3 +179,53 @@ lock-held write (`ftdi::mirror` and `flight_recorder::capture`, both via a local
 **Default builds are unchanged.** `TapPrefixWriter` and the flags are behind `#[cfg(feature =
 "logts")]`; with the feature off `ring_write` is a plain `fmt::write` and both rings are
 byte-identical to a pre-CLOCK-2b build.
+
+## The pre-kernel phase (BOOTCLOCK, x86)
+
+Every reading above starts at `kernel_main`'s first instruction. On x86 the counter underneath them
+does not: `rdtsc` counts from the last processor reset, so the value at kernel entry already
+contains firmware POST, the operator's time at the ⌥ boot picker, and the loader's read of
+`kernel.elf`. CLOCK-2's `[  12345ms]` prefix subtracts that origin deliberately — it has to, or the
+prefix disagrees with every `BPACE`/`GPACE` figure by seconds — and the effect is that the whole
+pre-kernel phase is subtracted out of the log and never reported anywhere. rmbp-ledger **A12** is
+what that cost: Peter reported flights 8 and 9 as much slower than before, and the kernel's own
+clock showed both *faster* than flight 7 (`BPACE total gui=` 25533 → 23286 → 21387 ms), which
+locates the growth entirely in the phase nothing measured. The only bound A12 could take was from
+the card-written squawk marks — ≤ 47.7 s and ≤ 49.8 s, inclusive of Peter's hand.
+
+**BOOTCLOCK** closes it. The x86 UEFI loader (`crates/bootloader/src/main.rs`) takes three raw
+`rdtsc` stamps — at its own entry, immediately after `kernel.elf` is read into memory, and at the
+last instruction before the jump — and carries them in `BootInfo` as `tsc_loader_entry` /
+`tsc_loader_read` / `tsc_loader_jump` (`crates/boot-info`, ABI-LOCK offsets 256/264/272). They are
+**raw cycles, never milliseconds**: the loader has no calibrated frequency, and `bootpace`'s rule is
+that a guessed Hz is sound for a settle and fatal for a measurement. The kernel converts them once,
+immediately after `apic::calibrate` — the first instant `bootpace::origin_hz()` stops returning 0 —
+and emits one line, before any `BPACE` block:
+
+```
+:: BOOTCLOCK: firmware->loader=<ms> loader-read=<ms> loader-jump=<ms> kernel-entry=<tsc> tsc_hz=<n>(measured) ::
+```
+
+`firmware->loader` is the absolute entry stamp, not a delta, so it is an **upper bound** on
+pre-loader time and contains the picker; `loader-read` is the ELF read alone (the term A12
+nominates, and the one that grows with the image every arc); `loader-jump` is load, relocation,
+ACPI/EDID/volume discovery and `exit_boot_services`. `kernel-entry` is the raw counter at
+`bootpace`'s `entry` stamp, printed unsubtracted so this line joins the BPACE block arithmetically:
+`kernel-entry − tsc_loader_jump` is the hand-off gap.
+
+Two honest null readings, both required to distinguish from a healthy one. Boot media carrying a
+`bootloader.efi` built before the field existed leaves the three values 0 or garbage — `BootInfo`
+is reached through a `transmute`d pointer and nothing checks versions — so a sanity chain (nonzero,
+nondecreasing, and not later than the kernel's own entry stamp, all four values being reads of one
+counter) prints `absent` for the three terms rather than a fabricated duration, while
+`kernel-entry=` still prints. And where calibration never ran or was rejected, the terms print raw
+`cy` with `tsc_hz=0(uncalibrated)`. In QEMU the firmware phase is short — tens to hundreds of
+milliseconds — against tens of seconds on the bench rMBP; that two-order gap is the instrument
+working, not a fault.
+
+**aarch64 is untouched.** The three fields are gated on `target_arch = "x86_64"`, not on a cargo
+feature, which is the strongest gate available here: a loader and a kernel for one machine are
+always compiled for the same `target_arch`, so unlike `unaos_ivb` this knob cannot be armed on one
+side of the hand-off and not the other. The aarch64 `BootInfo` keeps its exact 256-byte layout, the
+aarch64 loader stamps nothing, and the Pi bare-metal path (`arch::boot::build_boot_info`, which runs
+no UEFI loader at all) needs no change.

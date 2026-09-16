@@ -440,7 +440,7 @@ fn bootdiag_dtb() {
 }
 
 #[entry]
-fn main() -> Status {
+fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 = unsafe { core::arch::x86_64::_rdtsc() }; // BOOTCLOCK stamp 1 of 3 (rmbp-ledger A12) — the TSC at the loader's first instruction, before `uefi::helpers::init` and therefore before anything this binary does. rdtsc counts from the last processor RESET, so this value IS firmware POST + the ⌥ boot picker + the firmware's load of this .efi: the pre-kernel phase no UnaOS instrument has ever measured. Carried raw in `BootInfo::tsc_loader_entry`; the kernel divides it by the rate `apic::calibrate` measures, because the loader has no calibrated frequency and a guessed Hz is exactly what this instrument must never emit. ⚠ FOLDED ONTO THE `fn` LINE, and `#[cfg]`-erased on aarch64, so ZERO source lines are added ahead of any existing `panic::Location` in this file and the aarch64 `bootloader.efi` stays byte-identical (this file has three such folds; all three are x86-gated for that reason).
     #[cfg(feature = "unaos_ivb")]
     let (t0, g0) = unsafe { (read_igpu_trace(), read_gmux_trace()) };
 
@@ -737,7 +737,7 @@ fn main() -> Status {
     if let Err(e) = kernel_file.read(kernel_buffer) {
         log::error!("Failed to read kernel.elf: {:?}", e);
         return Status::LOAD_ERROR;
-    }
+    } #[cfg(target_arch = "x86_64")] let tsc_loader_read: u64 = unsafe { core::arch::x86_64::_rdtsc() }; // BOOTCLOCK stamp 2 of 3 — the TSC once `kernel.elf` is in RAM. `tsc_loader_read - tsc_loader_entry` is the loader's OPEN+READ of the whole image (3.8 MB off the rMBP's SD slot on the bench, one volume in QEMU), which is the term A12 nominates as the plausible growth: the file gets bigger every arc and nothing has ever timed the read. Stamped after the error arm, so a failed read never produces a stamp at all. LINE-NEUTRAL fold on the closing brace, x86-gated — see the fold note on `fn main`.
 
     let elf = match xmas_elf::ElfFile::new(kernel_buffer) {
         Ok(elf) => elf,
@@ -983,7 +983,7 @@ fn main() -> Status {
         edid_block,
         edid_block_valid,
         edid_total_len,
-        boot_volume_serial,
+        boot_volume_serial, #[cfg(target_arch = "x86_64")] tsc_loader_entry, #[cfg(target_arch = "x86_64")] tsc_loader_read, #[cfg(target_arch = "x86_64")] tsc_loader_jump: 0, // BOOTCLOCK: stamps 1 and 2 ride the initialiser; stamp 3 is written into the leaked struct after `exit_boot_services`, exactly like `igpu_trace_2` below, so it is seeded 0 here. 0 is also the ABSENT sentinel the kernel prints as `absent`, which is what a pre-BOOTCLOCK `bootloader.efi` sitting on old boot media will produce. LINE-NEUTRAL fold, x86-gated — see the fold note on `fn main`.
         #[cfg(feature = "unaos_ivb")]
         igpu_trace_0: t0,
         #[cfg(feature = "unaos_ivb")]
@@ -1089,7 +1089,7 @@ fn main() -> Status {
     #[cfg(target_arch = "aarch64")]
     let kernel_entry: extern "C" fn(&'static mut BootInfo) -> ! = unsafe {
         core::mem::transmute(entry_point as usize)
-    };
+    }; #[cfg(target_arch = "x86_64")] { boot_info_static.tsc_loader_jump = unsafe { core::arch::x86_64::_rdtsc() }; } // BOOTCLOCK stamp 3 of 3 — the last instruction before the `transmute`d jump. `tsc_loader_jump - tsc_loader_read` covers ELF load + relocation, the I-cache maintenance, ACPI/EDID/boot-volume discovery, the memory-map walk and `exit_boot_services`. Written into the LEAKED struct (boot services are already gone; no allocation happens here) for the same reason `igpu_trace_2` is. LINE-NEUTRAL fold on the aarch64 `let`'s closing brace, x86-gated — see the fold note on `fn main`.
 
     kernel_entry(boot_info_static);
 }
