@@ -1188,6 +1188,26 @@ volume the loader came off so they can refuse to erase or substitute it. `shell:
 deliberately does not call `locate_boot_volume`: a serial the firmware handed over is precisely the
 assumption §14.1 exists to avoid making.
 
+### 14.8 SO38 — a no-root survey is an observation, not an answer (X86BIND, 2026-09-15)
+
+`survey()` used to cache whatever its first walk said, root or no root. That is right on a board
+whose medium is up before anything asks (the Pi's microSD, the Orin's card) and wrong everywhere
+else, because x86 storage arrives asynchronously: xHCI finishes its deferred SCSI bring-up long
+after the shell can build a mount table. Measured on q35 — the first `shell::vfs_mount_table()`
+runs at serial line 156 with `disks=global=absent usb=absent sdhc=absent`; the USB disk publishes
+at line 991. A latched NONE handed every later caller an empty namespace for the rest of the boot.
+
+So only a survey that BOUND a root is cached. A rootless walk goes to `PENDING` with the
+present-source fingerprint it was taken under, and the next caller re-walks as soon as that set
+changes — the fingerprint is what separates "a disk appeared, ask again" from a per-verb FAT walk
+on a machine that has not changed (on QEMU virt, where nothing ever carries this kernel, the
+unconditional form would walk under every verb for the whole boot). `[vfs] resurvey n=<k> …`
+prints once, only when `k>0`, so a board that binds on the first walk keeps a byte-identical
+`[vfs]` block. LEDGER SO38.
+
+**The fix is demand-driven and that is its limit:** it helps only a caller that asks AGAIN after
+storage arrives. Nothing on x86 does today.
+
 ## 15. NSGEN (LEDGER SR3) — the namespace generation
 
 `MountTable`'s write half advances one arch-neutral counter, `fs::NS_GEN` (`fs/mod.rs`), exactly once

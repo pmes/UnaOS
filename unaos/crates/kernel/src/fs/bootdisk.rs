@@ -526,13 +526,79 @@ pub struct Survey {
 /// never holds it.
 static CACHE: Mutex<Option<Survey>> = Mutex::new(None);
 
-/// The full survey — root plus home soil. Cached; the witness prints on the first call only.
+/// SO38 (X86BIND): the LAST no-root answer, and the present-source fingerprint it was taken under.
+///
+/// **A NO-ROOT SURVEY IS NOT AN ANSWER, IT IS AN OBSERVATION WITH A TIMESTAMP** — that is the whole
+/// of this defect. `CACHE` above is for the ANSWER and only ever holds a survey that BOUND a root;
+/// a walk that found none lands here instead, and is reconsidered the moment the machine's disks
+/// change. See [`survey`].
+static PENDING: Mutex<Option<(String, Survey)>> = Mutex::new(None);
+
+/// SO38: how many walks answered "no root" before one bound. `0` on every board whose medium is up
+/// before the first verb (the Pi, the Orin) — this counter is the x86 story and it is on the wire.
+static RESURVEYS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// SO38: which sources have a device behind them RIGHT NOW, as a short stable string.
+///
+/// Registry lookups only — [`fat::source_present`] reads `drivers::block`'s cells and touches no
+/// medium — so asking it per verb costs nothing next to the walk it decides against.
+fn present_fingerprint() -> String {
+    let mut out = String::new();
+    for src in fat::live_sources() {
+        if fat::source_present(src) {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(src.name());
+        }
+    }
+    if out.is_empty() {
+        out.push('-');
+    }
+    out
+}
+
+/// The full survey — root plus home soil.
+///
+/// # SO38 — a NONE is never latched for the boot (X86BIND, 2026-09-15)
+///
+/// This function used to cache whatever the first walk said, root or no root. That is correct on a
+/// board whose medium is up before anything asks (the Pi's microSD, the Orin's card) and WRONG
+/// everywhere else, because x86 storage arrives asynchronously: xHCI finishes its deferred SCSI
+/// bring-up long after the shell can build a mount table. MEASURED on q35 — the first
+/// `shell::vfs_mount_table()` runs at serial line 156 with `disks=global=absent usb=absent
+/// sdhc=absent`, and the USB disk that carries this kernel publishes at line 996. The latched NONE
+/// handed every later caller an EMPTY namespace for the rest of the boot: `/`, `/boot` and `/apps`
+/// unbound, the verbs answering `-ENODEV`, four TSTE legs red. LEDGER SO38, found by LOGIN M1 on
+/// aarch64/virt 2026-09-12 and fixed here because X86BIND is the arc that made it bite.
+///
+/// So: **only a survey that BOUND A ROOT is cached.** A no-root walk goes to [`PENDING`] with the
+/// fingerprint of the sources that were present when it ran, and the next caller re-walks as soon
+/// as that set CHANGES. The fingerprint is the difference between this and a spin: re-walking
+/// because a disk appeared is the point; re-walking twenty times against an unchanged machine is
+/// just cost, and on QEMU virt — where no block device ever carries this kernel, so `root` is
+/// permanently `None` — it would put a full FAT walk under every single verb. Same answer either
+/// way; strictly fewer walks.
 pub fn survey() -> Survey {
     if let Some(v) = CACHE.lock().as_ref() {
         return v.clone();
     }
+    let fp = present_fingerprint();
+    // The machine has not changed since the last walk said "no root", so neither has the answer.
+    if let Some((seen, v)) = PENDING.lock().as_ref() {
+        if *seen == fp {
+            return v.clone();
+        }
+    }
+    // The walk runs OUTSIDE both locks (see [`CACHE`]): a long disk read never holds one.
     let v = walk_and_witness();
-    *CACHE.lock() = Some(v.clone());
+    if v.root.is_some() {
+        *PENDING.lock() = None;
+        *CACHE.lock() = Some(v.clone());
+    } else {
+        RESURVEYS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        *PENDING.lock() = Some((fp, v.clone()));
+    }
     v
 }
 
@@ -959,6 +1025,22 @@ fn walk_and_witness() -> Survey {
             candidates,
             disk_census()
         );
+        // SO38: how long the answer took to become available, said out loud exactly once — on the
+        // walk that finally bound. `n=0` never prints, so a board whose medium is up before the
+        // first verb (the Pi, the Orin) keeps a byte-identical `[vfs]` block and a reader who sees
+        // this line knows the root arrived LATE rather than at once.
+        let resurveys = RESURVEYS.load(core::sync::atomic::Ordering::Relaxed);
+        if resurveys > 0 {
+            serial_println!(
+                "[vfs] resurvey n={} ms={} bound_on_pass={} disks={} :: SO38: a no-root survey is \
+                 not cached — {} earlier walk(s) found none before this disk enumerated ::",
+                resurveys,
+                crate::arch::ticks(),
+                resurveys + 1,
+                disk_census(),
+                resurveys
+            );
+        }
         let root_files = d.hits.len() as u32;
         return Survey { root: Some(f), root_files, reason: None, others };
     }
@@ -1452,6 +1534,19 @@ static MOUNTS_ANNOUNCED: core::sync::atomic::AtomicBool =
 #[cfg(feature = "witness")]
 fn homesoil_selftest() {
     use crate::fs::vfs::{FatBackend, KERNEL_PRINCIPAL};
+    // SO38 (X86BIND): the latch `usbreg_selftest` has always carried, and this one relied on
+    // `walk_and_witness` running exactly once to do without. That stopped being true when a no-root
+    // survey stopped being cached: the walk now re-runs whenever the machine's disk set changes, so
+    // without this the whole leg battery would replay — and re-print its PASS/FAIL lines — once per
+    // change. The legs are synthetic and deterministic, so running them again proves nothing; the
+    // cost is a log a reader stops trusting.
+    {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if DONE.swap(true, Ordering::Relaxed) {
+            return;
+        }
+    }
 
     // --- leg 1: TWO disks carrying this kernel — first wins, second is home soil at its LABEL. ---
     const L_SPARE: [u8; 11] = *b"SPARE      ";
