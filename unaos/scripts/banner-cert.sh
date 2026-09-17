@@ -258,6 +258,7 @@ btc|REACHED — a BR/EDR link was established|-|measured
 smolnet|:: SOCK-1: smoltcp icmp echo|-|measured(1)
 wifi|:: wifi: firmware NOT staged — no program-source block device; searched|-|measured
 wifi2|:: wifi2: upload NOT ATTEMPTED uploaded-bytes=|-|measured
+wifi3|:: wifi2: ucode upload words=|-|measured
 wifi4|:: wifi4: REFUSED reason=wifi3-upload-not-proven|-|measured(1)
 nvidia-kepler|:: kepler: probe-abort bar0-unmapped|-|measured
 nvidia-kepler-takeover|:: kdisp: takeover-abort no-gop-info ::|nvidia-kepler|measured
