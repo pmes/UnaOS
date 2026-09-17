@@ -371,6 +371,7 @@ measured rather than assumed.
 | open | `video/desktop_firmware.rs` step 6 | the Pi's DESKTOP-READY seam, **last** in the sequence: Quarry reads directories and every step before it is pure geometry or a flag, so a slow or declined volume cannot delay the menu bar's paint. This mints no second launcher — Quarry is not a program, it is kernel furniture, the same class as the console window `panel_console_window_open` mints thirty lines above. |
 | keyboard | `arch/aarch64/syscall.rs`, `user_input_enqueue` | folded onto the existing `crystal::key_escape` one-liner, **after** it: an open SHARD menu is modal and its `Esc` beats Quarry's. Before `wc_focus_key`, and Quarry does not bind TAB, so the compositor's key is never hostage. |
 | pointer | `arch/aarch64/syscall.rs`, `wc_click_route` press edge | folded onto the existing `strip::press_route` one-liner, **after** it (the strips composite on top of the window layer). Quarry asks `wm::hit_test` itself and acts only when the top-most window at the point is its own, so folding it in this early can never let it claim a press that landed on a window above it. |
+| pointer (x86) | `arch/x86_64/syscall.rs`, `wc_click_route_at` press edge | QUARRYCLICK. One statement folded onto the `}` that closes the dock arm, calling `wc_quarry_press` at the file's **tail**; the same position as the aarch64 twin — after the furniture bands, ahead of WMDIRECT's chrome arm. See §6.3. |
 | dock tile | `video/dock.rs`, `pin_quarry` | see §6.2. |
 
 ### 6.1 The line-neutrality constraint, and what it forced
@@ -409,9 +410,34 @@ the occlusion registry cannot disagree about the tile count.
 **The press LATCHES rather than opens.** `press_at` runs inside a click router and Quarry's open reads
 directories, so the tile sets a flag and `quarry::service()` drains it from the arch's input-drain
 task — after `pump_usb_into_gui` has dropped its xHCI loan, which is the same context the shell's own
-`ls` reads a volume from. The drain call is folded into the same aarch64 router line as the rest, so
-**x86 has no drain yet**: when the x86 wiring lands it must place `service()` off the render core, for
-the reason `desktop_uefi::desktop_app_service` documents (the render core holds the xHCI lock).
+`ls` reads a volume from. The drain call is folded into the same aarch64 router line as the rest.
+**x86 got its drain in QUARRYX86-2** (`d889369a`), folded onto the dock arm's consumed-press line in
+`wc_click_route_at`; the standing caution is unchanged and still owed — `service()` there runs on
+`kernel_main`'s stack or on `x86_render_service`'s blanket 16 KiB, and the render core holds the xHCI
+lock, for the reason `desktop_uefi::desktop_app_service` documents.
+
+### 6.3 QUARRYCLICK — the x86 arm for the window's own content (2026-09-17)
+
+QUARRYX86-2 made the TILE work on x86 and stopped there; rMBP flight 10 then opened Quarry from the
+dock and found every press *inside* the window inert — three of them, each reading
+`[clickroute] press at (920,604) win=5 owner=0xffffff03 was=0 -> consume deliver=0`, which is the
+router's kernel-furniture arm saying the point resolved to a kernel-owned row with no input ring and
+nobody to hand the press to. The repair needs no new mechanism and no un-gating: `press_route` in
+`video/quarry/live.rs` is the shared entry both arches were always meant to reach — exported by
+`video/quarry.rs` under `feature = "quarry"` with no `target_arch` anywhere near it, documented as
+taking **panel** coordinates, and doing its own `wm::hit_test` and panel→source arithmetic from
+`wm::info(id)`. So x86's arm is one statement folded onto the `}` that closes the dock arm, calling a
+`wc_quarry_press` helper appended at that file's tail (the tail is the one place new lines cost no
+panic `Location`, and a call plus a far-away function is also the shape that merges when another arc
+is editing the same router). Its position is the twin's and is a contract, not a preference: after the
+furniture bands, which composite above every window, and **ahead of** WMDIRECT's chrome arm, so that
+Quarry keeps its own close disc — `control_hit` would otherwise route it to `wc_close_furniture`,
+which reaps the row without ever calling `quarry::close()` and leaves `MODEL`, `SURF` and `WIN` behind
+— while title strip, border and the minimise/zoom discs still fall through to the router and Quarry
+stays draggable and parkable. On the wire the press now reads `-> quarry` where flight 10 read
+`-> consume`, and `press_route` prints one `[quarry] press at (sx,sy) row=N kind=… -> cd|select|launch|miss`
+line of its own — on both arches, because until this arc an in-window press printed nothing at all and
+a capture could not tell a press Quarry handled from a press Quarry never saw.
 
 ---
 

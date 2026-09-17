@@ -7499,7 +7499,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
             clickband_witness(x, y, "dock", crate::video::dock::last_press_outcome());
             #[cfg(feature = "quarry")] crate::video::quarry::service(); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); // QUARRYX86-2 — THE X86 DOOR TO QUARRY, AND IT IS THE DRAIN THAT WAS MISSING, NOT THE LATCH. `dock::press_at`'s QUARRY-PIN arm LATCHES the open (`quarry::request_open`, `video/dock.rs:1067`) and does no directory I/O, deliberately — Pi dsktp boot 11 ran a 16 KiB stack off its bottom with `quarry::open()` at exactly this depth. On aarch64 the latch is drained one call later in the twin arm (`arch/aarch64/syscall.rs:14326`: `strip::press_route(x, y) { quarry::service(); … }`). x86 calls `dock::press_at` DIRECTLY and never reaches that pair, so before this statement a press on the Quarry tile set the latch and NO PASS ON THIS ARCH EVER DRAINED IT — the tile painted and did nothing, which is PARITY §9 cause 2 and QUARRYDOCK's STOP 2. SAME ORDER AS THE TWIN: service FIRST, then the DROP store, then `return true` — the drain must run before the arm returns or the latch survives the press that set it. Gated `quarry` and NOT `desktop_firmware`: `video/mod.rs:685` admits the module on x86 under `wc` (this arm's own gate, one line above) while `desktop_firmware` is absent from the `x86-all` leg (`arroyo:4310`), and `quarry` is IN it — so the aarch64 spelling would have compiled to nothing here and repaired nothing. Knob-off this is the `#[inline(always)]` no-op at `video/quarry.rs:71`, so a `UNAOS_QUARRY`-unset image is untouched by construction. ⚠ STACK: `service()` -> `open()` is a panel read + two VFS `read_dir` + a surface alloc, and on this arch the routers that reach it are `kernel_main` (boot stack) and `x86_render_service`, which is spawned with the BLANKET 16 KiB `TASK_STACK_SIZE` (`main.rs:1581`/`3340`, plain `spawn`) — the Pi cured the same shape by right-sizing to 32 KiB (`PUMP_PATH_STACK_SIZE`). Out of this arc's named files; reported as a STOP, not taken. ⚠ FOLDED onto this pre-existing line, never added below it — this file's panic `Location`s are load-bearing and the line count is 24179 before and after; CODE BEFORE COMMENT, per A10FIX's rule that a folded call written after a `//` is not a call.
             return true;
-        }
+        } #[cfg(all(feature = "wc", feature = "quarry"))] if wc_quarry_press(x, y, cur) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } // QUARRYCLICK — THE X86 DOOR TO QUARRY'S WINDOW CONTENT, and it is the twin of `arch/aarch64/syscall.rs:14326`'s `… || crate::video::quarry::press_route(x, y) { … }`. QUARRYX86-2 (d889369a) drained the dock tile's OPEN latch one line above, so Quarry now opens on this arch; flight 10 then showed every press INSIDE the opened window dying at the kernel-furniture arm below — `[clickroute] press at (920,604) win=5 owner=0xffffff03 was=0 -> consume deliver=0`, three times, because `0xffffff03` is a kernel owner with no input ring and this router had no arm that named Quarry. POSITION IS THE CONTRACT, and it is the twin's: after the furniture bands (menu, dock — they composite above every window) and AHEAD of WMDIRECT's chrome arm, because `quarry::press_route` re-asks `wm::hit_test` itself and claims ONLY the top-most-is-mine case — so it cannot steal a press that landed on a window above it, it declines title strip/border/minimise/zoom (Quarry stays draggable and parkable through the router's own arms), and it DOES claim its own close disc, which is why it must be asked before `control_hit` reaches `wc_close_furniture` — that path reaps the row without ever calling `quarry::close()`, leaving MODEL/SURF live and `WIN` naming a re-issuable slot. COORDINATES ARE PANEL COORDINATES, unconverted: `press_route` is documented "in PANEL coordinates" and does its own panel->source arithmetic from `wm::info(id)` (`sx = (x - info.x) / scale`), so the window-relative conversion the console/shell arms do is exactly what must NOT be done here. Gated `all(wc, quarry)`: `video/mod.rs:685` admits the module on x86 under `wc` alone, and this statement sits at the function's own statement level rather than inside the `#[cfg(feature = "wc")]` dock block above it, so it names both knobs instead of inheriting one. Knob-off this is nothing at all — `wc_quarry_press` is `#[cfg(all(feature = "wc", feature = "quarry"))]` and lives at the TAIL of this file, so no panic `Location` below it moves and a `UNAOS_QUARRY`-unset image is byte-identical by construction. ⚠ FOLDED onto this pre-existing `}`, never added below it: this file is 24179 lines before and after, and CODE BEFORE COMMENT per A10FIX's rule that a folded call written after a `//` is not a call.
         // WMDIRECT — **CHROME IS JUDGED BEFORE THE APP ARMS, AND THAT IS THE WHOLE ROUTING RULE.**
         //
         // *A press on a window's kernel-drawn chrome — close box, title strip, border — is an
@@ -24176,4 +24176,44 @@ fn dirns_witness() {
         gone,
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// ── QUARRYCLICK — the router's Quarry arm, appended at the TAIL ─────────────────────────────────
+//
+// APPENDED HERE, NOT WRITTEN AT THE CALL SITE, for two reasons that are both measurements rather
+// than taste:
+//
+//  1. **Line-neutrality.** `panic::Location` records embed this file's line numbers, so a statement
+//     added anywhere ABOVE existing code moves the knob-off image (PARITY.md §5.3; QUARRYX86-2 paid
+//     the same price one line up and folded for it). The tail is the one place new lines cost
+//     nothing: nothing is below it, so nothing moves, and with `quarry` unset this function is not
+//     compiled at all.
+//  2. **The fold at the land.** A concurrent arc (MENUDROP) is editing the MENUBAR band of this same
+//     router. A call folded onto one pre-existing line plus a function at the far end of the file is
+//     the shape that merges textually; an arm written inline in the press body is the shape that
+//     conflicts.
+//
+// It is the twin of `arch/aarch64/syscall.rs:14326`, which reaches the identical shared entry —
+// `crate::video::quarry::press_route`, exported by `video/quarry.rs` under the `quarry` feature for
+// BOTH arches and gated on no `target_arch` anywhere. Nothing in `video/quarry/` had to be un-gated
+// for this arm to exist; the entry was always reachable from x86 and had simply never been called.
+#[cfg(all(feature = "wc", feature = "quarry"))]
+fn wc_quarry_press(x: i32, y: i32, cur: u64) -> bool {
+    // THE HIT-TEST IS TAKEN BEFORE THE ROUTE, and that ordering is load-bearing: `press_route`'s
+    // close-disc arm calls `quarry::close()`, which reaps the window row — a `hit_test` taken
+    // afterwards would name whatever was underneath it and the witness would report the wrong
+    // window for the one press where the window is gone.
+    let hit = crate::video::wm::hit_test(x, y);
+    if !crate::video::quarry::press_route(x, y) {
+        return false;
+    }
+    let (win, owner) = hit.map(|(w, o, _z)| (w, o)).unwrap_or((crate::video::wm::WIN_NONE, 0));
+    // `how = "quarry"` is the whole point of the line: flight 10's wire read `-> consume deliver=0`
+    // for the same press, which is the kernel-furniture arm below saying "nobody handles this".
+    // `deliver` stays 0 DELIBERATELY and is not a hedge — `clickroute_witness`'s own contract is
+    // that `deliver=` names the ring the press was PUT IN, Quarry is a kernel-owned window with no
+    // input ring at all, and a non-zero there would be false by that contract. The proof of delivery
+    // is the `[quarry] press …` line this call has just printed, one screen further down the wire.
+    clickroute_witness(x, y, win, owner, cur, "quarry", 0);
+    true
 }

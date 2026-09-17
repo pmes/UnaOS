@@ -2339,13 +2339,77 @@ pub fn press_route(x: i32, y: i32) -> bool {
         // A press that hit no row still changed the pane focus (and therefore the selection ink),
         // and it is still CONSUMED — it moved window focus and must not be delivered to whatever
         // lies underneath. So the return carries only the DEFERRED work, never "was it mine".
-        content_press(m, sx, sy)
+        //
+        // QUARRYCLICK — the before/after pair [`press_witness`] reads, taken inside the one lock the
+        // press already holds so the reading cannot race a repaint or a second press.
+        let before = (m.cwd.clone(), m.focus, m.tree_sel, m.list_sel);
+        let a = content_press(m, sx, sy);
+        press_witness(m, sx, sy, &before, &a);
+        a
     };
     // Outside the lock, always: `run_act` may reach the ELF loader and the scheduler.
     run_act(act);
     reap_jobs();
     repaint();
     true
+}
+
+/// QUARRYCLICK — **one line per press that landed inside Quarry's content**, and until this arc an
+/// in-window press printed nothing at all on either arch. `census` fires on open and on `r`, the
+/// launch path speaks only when it launches, and every navigation, expand, collapse and selection
+/// was silent — so a capture could not tell a press Quarry HANDLED from a press Quarry never saw.
+/// That is exactly the question rMBP flight 10 could not answer, and the reason it was read as
+/// "nothing happened" rather than as "the router has no arm for this window".
+///
+/// **It reports the EFFECT, not an intention.** [`content_press`] has nine return points; a witness
+/// at each would be nine chances to drift from what the model actually did. This reads the model on
+/// both sides of the one call instead, so the outcome word is a measurement:
+///
+///  * `launch` — the press produced deferred work that leaves this window ([`Act::Launch`], and
+///    FACET's [`Act::View`]). The only outcome that is read from the act rather than from the model,
+///    because it is the only one that has not happened yet when this runs.
+///  * `cd` — the working directory MOVED. A tree row navigated, or a list row was opened into.
+///  * `select` — no navigation, but the pane focus or one of the two selections changed.
+///  * `miss` — the press was inside the surface and changed nothing: the path bar, the header row,
+///    the dead space past the last row. Still consumed (it moved WINDOW focus), which is precisely
+///    why it owes a line.
+///
+/// `row` is the selection of the pane the press left focused, which for every row press is the row
+/// pressed; `kind` is `dir` for a tree row (the tree carries directories only), the list entry's own
+/// [`NodeKind`] for a list row, and `none` where the press addressed no row.
+fn press_witness(m: &Model, sx: usize, sy: usize, before: &(String, Pane, usize, usize), act: &Act) {
+    let (bcwd, bfocus, btree, blist) = before;
+    let row = match m.focus {
+        Pane::Tree => m.tree_sel,
+        Pane::List => m.list_sel,
+    };
+    let mut out = if matches!(act, Act::Launch(_)) { "launch" } else { "" };
+    #[cfg(feature = "facet")]
+    if matches!(act, Act::View(_)) {
+        out = "launch";
+    }
+    if out.is_empty() {
+        out = if m.cwd != *bcwd {
+            "cd"
+        } else if m.focus != *bfocus || m.tree_sel != *btree || m.list_sel != *blist {
+            "select"
+        } else {
+            "miss"
+        };
+    }
+    let kind = if out == "miss" {
+        "none"
+    } else {
+        match m.focus {
+            Pane::Tree => "dir",
+            Pane::List => match m.list.get(row) {
+                Some(e) if matches!(e.kind, NodeKind::Dir) => "dir",
+                Some(_) => "file",
+                None => "none",
+            },
+        }
+    };
+    serial_println!("[quarry] press at ({},{}) row={} kind={} -> {}", sx, sy, row, kind, out);
 }
 
 /// Route a press already resolved to SOURCE coordinates. Split out from [`press_route`] so the
