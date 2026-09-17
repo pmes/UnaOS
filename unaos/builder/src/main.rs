@@ -576,6 +576,19 @@ fn main() {
     // every item, the call site and the census publication inside beam_probe are unlinked =>
     // byte-identical media.
     if std::env::var("UNAOS_KEPLER_KDHEAD").is_ok() { feats.push("nvidia-kepler-kdhead"); }
+    // CTRLBIND (shut-out register §2 rung KF9b): UNAOS_KEPLER_CTRLBIND=1 arms the PER-TARGET CHANNEL
+    // BRINGUP RE-RUN inside the restored KF9 CTRL_ADDR audit in drivers/gpu/kepler.rs — the half of
+    // KF9 the 2026-09-15 restore could not carry, because the s13 original re-ran the whole channel
+    // bringup inside its target loop and that apparatus was deleted with it. THIS list is what
+    // reaches the kernel binary for MEDIA builds, and this knob's ENTIRE product is witness lines —
+    // so a knob wired into arroyo alone would put `nvidia-kepler-ctrlbind` in the banner and not one
+    // `:: kepler: ctrlbind ` string in the image, and the flight would read as "no TARGET encoding
+    // changes the strip" — a THIRTEENTH ELIMINATION about the GK107 — rather than as a build that
+    // never carried the instrument (BEAMX86's failure mode, and KFBIND's and KDHEAD's above,
+    // verbatim). Kept in sync with arroyo AND crates/kernel/Cargo.toml; `./arroyo check`'s
+    // KNOB→BUILDER WIRING CHECK goes red if this line is dropped. DEFAULT OFF => every call site and
+    // every `:: kepler: ctrlbind ` string unlinked => byte-identical media.
+    if std::env::var("UNAOS_KEPLER_CTRLBIND").is_ok() { feats.push("nvidia-kepler-ctrlbind"); }
     // R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
     // (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only; pure measurement,
     // no scheduling/locking/present change. x86_64-only in effect; DEFAULT OFF => empty inline shims,
