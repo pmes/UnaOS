@@ -41,3 +41,6 @@ their three named subjects are rows here or in the trunk queue.
 
 ## SHARED, ROUTED TO THE TRUNK QUEUE (listed so the cut is visible)
 · SR13 strict trigger, R39 battery selector, S6 board names in shared files (50), SR1/SR9/SR10/SR11/SR12 gate classes, SR2 print-screen wedge, orin-ledger A41 / B44 keyboard report loss — all trunk-queue rows
+
+## BRANCH RESCUE — rmbp-only executor branches on NO track (BRANCHCENSUS 2026-09-17, `docs/dev/evidence/branch-census-0917/VERDICTS.md`)
+· NEW  KFUNWEDGE-RESCUE  `exec-rmbp-kfunwedge` **6c38659d** (2026-09-15, *gpu/kepler: KFUNWEDGE — fire the 0x409504 poison on purpose, then observe, clear and re-read the PRI ring in the same boot*): board-only `drivers/gpu/kepler.rs` + `builder` + `arroyo` + `Cargo.toml` + KEPLER-METAL-LOG.md + SHUTOUT-REGISTER.md; tip is an ancestor of no track branch. ⚠ the KFUNWEDGE `· NEW` row in this file still reads *still UNEXERCISED* while the branch says it is BUILT — the row and the branch disagree. FOLD: `git cherry-pick 6c38659d`, then re-read that row.
