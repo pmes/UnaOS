@@ -21,7 +21,7 @@ impl PciScanner {
     }
 
     pub fn enumerate_buses() -> Option<(u64, u8, u8, u8)> {
-        serial_println!("PCI: Commencing motherboard scan...");
+        serial_println!("PCI: Commencing motherboard scan..."); #[cfg(all(target_arch = "x86_64", feature = "hda"))] crate::drivers::hda::probe(); // HDA (rmbp-ledger B127) — the ONE enumeration hook for the High Definition Audio controller (UNAOS_HDA=1, default OFF). HERE, on the first statement of the kernel's one PCI walk, because it is the only unconditionally-executed statement in a file this arc's brief names: `scan()`'s other two statements are the arms of an `if let` on the xHCI result, so a hook on either would run on one machine and not the other. Everything the driver needs is up by this point — `pci::init` runs at `main.rs:1034`, the heap at `main.rs:296`, and `bcma::recon` maps an MMIO BAR six lines above this function's own call site (`arch/x86_64/pci.rs:875` vs `:881`), so `map_mmio_window` and the frame allocator are both live. ⚠ LINE-NEUTRAL append: `panic::Location` records embed line numbers and the knob-off x86 image byte-identity is this arc's stated invariant, so the statement is APPENDED to an existing line and is `#[cfg]`-erased knob-off. The append goes BEFORE any `//` on this line (LEDGER P7 — after it the statement is a comment, compiles nothing, and the check stays green). ⚠ PACING, said out loud rather than hidden: armed, this charges HDA bring-up to the `pci-scan` BPACE delta stamped at `arch/x86_64/pci.rs:882`. It is a default-OFF dev knob, so no shipped boot pays it. The placement a future fold should prefer is the AHCI-shaped append at `arch/x86_64/pci.rs:1048`, which sits outside every pacing accumulator; that file is not in this arc's brief and was therefore not touched (docs/dev/OS/11_AUDIO/hda.md §5).
 
         for bus in 0..=255 {
             for device in 0..=31 {
@@ -374,5 +374,99 @@ impl PciScanner {
         // Bit 10 (0x400) = Interrupt Disable (1 = Disabled)
         unsafe { crate::arch::pci::write_config_16(bus, slot, func, command_reg_offset, current_val | (1 << 10)) };
         serial_println!("xHCI: PCI Interrupts DISABLED (Bit 10 Set).");
+    }
+
+    /// HDA-1 — AUDIO-CLASS CENSUS (read-only), rmbp-ledger B127. THE SHAPE IS `storage_inventory`'s
+    /// above, deliberately: this walk is a SEPARATE pass, it touches neither `enumerate_buses` nor
+    /// the storage census, and it prints one `[hda]` inventory line per audio-class function it
+    /// finds.
+    ///
+    /// Until this arc the x86 kernel could not see an audio function at all. `enumerate_buses`
+    /// matches EXACTLY ONE class triple (0x0C/0x03/0x30 = xHCI) and returns on the first hit;
+    /// `storage_inventory` matches class 0x01 and class 0x08/0x05. Class 0x04 is the subclass
+    /// space every targeted walk in this kernel structurally cannot match — the same blind spot
+    /// GR20 found for the class-0x02/0x80 radio — which is why no capture this project has taken
+    /// carries an `[hda]` line.
+    ///
+    ///   * class 0x04 / subclass 0x03 — Audio Device (HD Audio). The 2012 rMBP's PCH controller is
+    ///     EXPECTED at 8086:1e20 and QEMU's `intel-hda` reports the same triple; neither is
+    ///     assumed, both are printed.
+    ///   * class 0x04 / any other subclass — Multimedia controller (0x00 video, 0x01 legacy audio
+    ///     device such as AC'97, 0x02 computer telephony, 0x80 other). Inventoried for the record
+    ///     only; there is no driver for any of them.
+    ///
+    /// Returns the class-0x04/0x03 functions as `(bus, slot, func, vendor, device)` in discovery
+    /// order. NO config-space WRITE is issued anywhere in this function: BAR0 is read as the
+    /// firmware left it (never sized, which would need the write-all-ones/restore dance) and no
+    /// COMMAND bit is touched — the claim happens in `drivers/hda.rs::take`, where it is counted.
+    ///
+    /// ⚠ APPENDED AT THE IMPL TAIL, and that is a byte-identity requirement rather than a style:
+    /// a `#[cfg]`-erased item inserted ANYWHERE above still shifts every `panic::Location` line
+    /// below it, and this arc's stated invariant is that `./arroyo knoboff hda` is byte-identical.
+    #[cfg(all(target_arch = "x86_64", feature = "hda"))]
+    pub fn audio_inventory() -> alloc::vec::Vec<(u8, u8, u8, u16, u16)> {
+        let mut hda = alloc::vec::Vec::new();
+        let mut seen = 0u32;
+
+        for bus in 0u16..256 {
+            for slot in 0u8..32 {
+                let vendor_id = unsafe { crate::arch::pci::read_config_16(bus as u8, slot, 0, 0x00) };
+                if vendor_id == 0xFFFF {
+                    continue;
+                }
+                let header_type_reg = unsafe { crate::arch::pci::read_config_32(bus as u8, slot, 0, 0x0C) };
+                let is_multi_function = (((header_type_reg >> 16) & 0x80) as u8) != 0;
+                let max_func = if is_multi_function { 7 } else { 0 };
+
+                for func in 0..=max_func {
+                    if func != 0 {
+                        let v = unsafe { crate::arch::pci::read_config_16(bus as u8, slot, func, 0x00) };
+                        if v == 0xFFFF {
+                            continue;
+                        }
+                    }
+                    let class_reg = unsafe { crate::arch::pci::read_config_32(bus as u8, slot, func, 0x08) };
+                    let class_code = ((class_reg >> 24) & 0xFF) as u8;
+                    let subclass = ((class_reg >> 16) & 0xFF) as u8;
+                    let prog_if = ((class_reg >> 8) & 0xFF) as u8;
+                    if class_code != 0x04 {
+                        continue;
+                    }
+                    let kind = match subclass {
+                        0x00 => "video",
+                        0x01 => "audio-legacy",
+                        0x02 => "telephony",
+                        0x03 => "hd-audio",
+                        _ => "multimedia-other",
+                    };
+
+                    let vend = unsafe { crate::arch::pci::read_config_16(bus as u8, slot, func, 0x00) };
+                    let dev = unsafe { crate::arch::pci::read_config_16(bus as u8, slot, func, 0x02) };
+                    // 0x3C byte 0 is the Interrupt Line the firmware programmed. This driver is
+                    // polled end to end and never uses it; it is printed because it is the one
+                    // fact a later interrupt-driven arc has to start from, and because a `255`
+                    // here is itself a finding (firmware routed the function nowhere).
+                    let irq = (unsafe { crate::arch::pci::read_config_32(bus as u8, slot, func, 0x3C) } & 0xFF) as u8;
+                    seen += 1;
+                    serial_println!(
+                        "[hda] census bdf={}:{}.{} id={:04x}:{:04x} class={:02x} sub={:02x} progif={:02x} ({}) bar0={:#x} irq={}",
+                        bus, slot, func, vend, dev, class_code, subclass, prog_if, kind,
+                        Self::get_bar_address(bus as u8, slot, func), irq
+                    );
+
+                    if subclass == 0x03 {
+                        hda.push((bus as u8, slot, func, vend, dev));
+                    }
+                }
+            }
+        }
+
+        if hda.is_empty() {
+            serial_println!(
+                "[hda] census swept 256 buses x 32 slots: {} class-0x04 function(s), 0 of them HD Audio (class 0x04/0x03)",
+                seen
+            );
+        }
+        hda
     }
 }

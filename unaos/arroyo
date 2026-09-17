@@ -2412,6 +2412,56 @@ fi
 # (stripped by arm_features below, exactly as `ahci` itself is).
 # Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
 [ -n "${UNAOS_AHCI_WRITE:-}" ] && _feats="${_feats}ahci-write,"
+# HDA (rmbp-ledger B127, arc 1): UNAOS_HDA=1 arms drivers/hda.rs — the High Definition Audio
+# controller, the kernel's first audio line. NOTHING IN THIS KERNEL HAS EVER TOUCHED AUDIO, and the
+# reason is structural rather than an omission: `PciScanner::enumerate_buses` matches exactly one
+# class triple (0x0C/0x03/0x30 = xHCI) and returns on the first hit, and the `[PCI-STOR]` census
+# matches class 0x01 and class 0x08/0x05 — class 0x04 is a subclass space no walk in this kernel
+# could reach, the same blind spot GR20 found for the class-0x02/0x80 radio. No capture this project
+# has taken carries an `[hda]` line. Arms: the class-0x04 census, the BAR0 map, the GCTL.CRST reset
+# with the specification's 521us codec-discovery window, STATESTS as the codec presence bitmap, the
+# CORB/RIRB rings in DMA-visible memory, one GET_PARAMETER VENDOR_ID round trip per present codec,
+# and the widget walk (function groups, node types, connection lists, pin default-config decode)
+# that derives the output path. Witnesses: `[hda] census bdf=... id=...`, `[hda] absent`,
+# `[hda] gcap=...`, `[hda] reset crst=1 statests=...`, `[hda] codec=N vid=...`, one
+# `[hda] node=0x..` per widget, `[hda] walk codecs=... speaker_pin=... hp_pin=...`, and a
+# `:: HDA: ... -> PASS|FAIL ::` verdict printed ONLY on a machine whose controller reset and
+# answered — so its silence means "no HDA controller", never "the walk passed".
+# POLLED end to end: INTCTL is never written and every wait is a bounded TSC spin (arch::ms() does
+# not advance inside pci::init). The QEMU fixture is attached by the builder under this same knob
+# (`-device intel-hda -device hda-duplex -audiodev none`), so a bare `UNAOS_HDA=1 ./arroyo test`
+# has a real emulated controller to walk.
+# Default OFF => the module is not lexed, the census is an impl-tail append and the pci.rs call site
+# is a LINE-NEUTRAL `#[cfg]`-erased append, so no panic `Location` moves (`./arroyo knoboff hda`).
+# x86_64 only; aarch64 media byte-identical (stripped by arm_features below, like ahci/sdw/sdhcblk).
+# Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
+# disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson), and for this
+# driver a silent no-op is indistinguishable on the wire from a machine with no audio device in it.
+[ -n "${UNAOS_HDA:-}" ] && _feats="${_feats}hda,"
+# HDATONE (rmbp-ledger B127, arc 2): UNAOS_HDATONE=1 arms the OUTPUT STREAM — a 16-bit stereo 48 kHz
+# sine (440 Hz, one second, about -18 dBFS) on output stream 0. Implies `hda` (Cargo.toml declares
+# `hda-tone = ["hda"]`), so this knob alone is sufficient; pairing it with UNAOS_HDA is harmless and
+# is how the flight line below spells it, because a reader should see both names on a line that can
+# make a noise in the room.
+#
+# ⚠ THIS IS THE ONLY KNOB IN THIS FILE THAT PRODUCES AUDIBLE SOUND. It is its own knob, and NOT
+# part of UNAOS_HDA, for the reason UNAOS_BTC is not part of UNAOS_BT: a boot that did not ask for a
+# tone must be structurally incapable of emitting one. Amplitude is low by construction and the run
+# is bounded at 1200 ms, after which the stream is stopped and every register the run changed is
+# written back.
+#
+# THE PROOF IS WITHOUT EARS, which is what makes this gateable in QEMU at all: LPIB advancing plus
+# at least one polled BCIS, printed as `[hda] tone stream=0 lpib=... bcis=... fifo_ready=...
+# run_ms=...` and scored on `:: HDA-TONE: ... -> PASS|FAIL ::`. On a codec whose walk derived no
+# output path the arc refuses out loud (`[hda] tone REFUSED reason=no-speaker-path`) and issues not
+# one stream register write. The QEMU legs:
+#   UNAOS_HDA=1 ./arroyo test 60
+#   UNAOS_HDA=1 UNAOS_HDATONE=1 ./arroyo test 60
+# Default OFF => the whole tone block is file-tail and cfg-gated, nothing is lexed and no panic
+# `Location` moves (`./arroyo knoboff hda-tone`). x86_64 only; aarch64 media byte-identical
+# (stripped by arm_features below, exactly as `hda` itself is).
+# Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
+[ -n "${UNAOS_HDATONE:-}" ] && _feats="${_feats}hda-tone,"
 # ── BANNER-DEDUP (orin 3, 2026-08-22) — the banner must not misreport its own composition ─────────
 #
 # THE SYMPTOM. An armed jetson build printed `tegra` THREE times:
@@ -2718,6 +2768,27 @@ arm_features() {
     # leaving it in would shift every aarch64 media hash for zero observable change. Stripped =>
     # the x86 track can run the ASPM experiment without touching Pi or Jetson media.
     f="${f//,noaspm,/,}"
+    # HDA (B127) rides the same strip, for the same reason and by the same mechanism as `ahci`
+    # above: `drivers/hda.rs` is declared `#[cfg(all(target_arch = "x86_64", feature = "hda"))]` in
+    # drivers/mod.rs, and its two sites in drivers/pci.rs (the `audio_inventory` census and the
+    # enumeration hook appended to `enumerate_buses`) each carry that same conjunction in their own
+    # attribute — so `hda` emits not one byte of aarch64 CODE. An enabled feature is still hashed
+    # into cargo's `-Cmetadata` fingerprint, so leaving it in would shift every aarch64 media hash
+    # between a default build and a `UNAOS_HDA=1` one for zero observable change. Stripped => the
+    # x86 track can bring up an audio controller without touching Pi or Jetson media.
+    # ⚠ `drivers/pci.rs` IS lexed on aarch64, unlike `drivers/ahci.rs` — which is exactly why both
+    # of its sites carry `target_arch = "x86_64"` in the attribute rather than relying on the
+    # module gate. Without that the aarch64 compile would try to call into a module its own
+    # `#[cfg]` had deleted; the `gen7` entry below records the review that caught the same shape.
+    f="${f//,hda,/,}"
+    # HDATONE (B127) rides the same strip, for the same reason and as a consequence of the same
+    # fact: `hda-tone` implies `hda`, whose only code is the x86-gated `drivers/hda.rs` plus the two
+    # x86-gated sites in drivers/pci.rs, and the tone block is a cfg-gated tail of that same file —
+    # so `hda-tone` emits not one byte of aarch64 CODE. Leaving it in (or its implied `hda`,
+    # stripped above) would shift every Pi/Jetson media hash for zero observable change.
+    # Order-independent with the strip above by its own argument: `,hda-tone,` does not contain
+    # `,hda,` as a substring, because the trailing comma is part of every pattern.
+    f="${f//,hda-tone,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
