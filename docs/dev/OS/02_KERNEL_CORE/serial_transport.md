@@ -1219,6 +1219,55 @@ Witnesses on the wire: `:: FTDIRX: first byte rx=<n> byte=… ::` once, and
 what makes a rollup safe on a console whose own output shares the cable. It does not promise a final
 total: the last line is the last power-of-two milestone (a 10-byte session ends at `rx=8`).
 
+### FTDICR — the wire's Enter is not the defect; a FOCUSED QUARRY EATS IT
+
+Flight 10 (2026-09-17) typed `help\r`, then `date\r`, then `help\r` at the cable, and for a long
+time nothing ran. The RX path was blameless and said so: `rx=5`, `rx=10`, `errors=0`, and the
+per-byte doors printed their own verdicts. **The bytes reached the shell's line buffer and the CRs
+were eaten by the Quarry window**, measured on
+`~/unaos-bench/capture/rmbp12-flight8/ttyUSB0.log` after `=== SQUAWK MARK flight10` (read-only,
+`awk index()`):
+
+```
+[ 252771ms] [quarry] key_route key=0x68 focus=1 took=0     <- 'h' declined, falls to the shell
+[ 252771ms] [quarry] key_route key=0x65 focus=1 took=0     <- 'e'
+[ 252771ms] [quarry] key_route key=0x6c focus=1 took=0     <- 'l'
+[ 252771ms] [quarry] key_route key=0x70 focus=1 took=0     <- 'p'
+[ 252772ms] [quarry] key_route key=0x0d focus=1 took=1     <- CR CONSUMED
+[ 256841ms] [quarry] key_route key=0x0d focus=1 took=1     <- and again
+[ 375912ms] [quarry] key_route key=0x0d focus=0 took=0     <- focus gone: the SAME byte passes
+[ 375931ms] :: [midden] cmd="helpdatehelp" -> TerminalError len=44 ::
+```
+
+Read the last two lines together: the run that "proved" CR was not Enter is the run in which **CR
+submitted the line**, 19 ms after Quarry declined it. Nothing about the byte changed between
+252772 ms and 375912 ms; only `focus` did. `handle_key` (`main.rs`) has always taken
+`c == b'\n' || c == b'\r'`, so the transport never needed a translation.
+
+**The door, not the transport.** `wc_route_event` (`arch/x86_64/syscall.rs`) offers every key to
+`video::strip::key_escape` and then `video::quarry::key_route` BEFORE the shell sees it, and
+Quarry's `b'\r' | b'\n'` arm (`video/quarry/live.rs`) consumes Enter whenever Quarry is focused and
+on glass — **for both spellings and from every transport**. A keyboard Enter typed at the same
+moment is eaten identically; the keyboard only looked privileged because every keyboard Enter in
+that flight (`key=0x0a`, at 143793 ms and 396387 ms) happened to arrive with `focus=0`. So an
+operator at the serial console cannot reach the shell at all while Quarry holds focus, and has no
+way to see why — which is the defect, and it is not in this file's subsystem.
+
+**A normalisation at the FTDI intake would not have fixed it** and is deliberately not shipped: CR
+and LF hit the same Quarry arm, every Enter consumer in the tree already matches both, and the
+Pi/Orin UART path delivers its bytes raw (`arch/aarch64/serial.rs`'s `serialrx::deliver`), so
+translating here would make the two consoles differ for no measured gain. The attempted patch is
+kept out of the tree at `~/unaos-bench/scratch/rmbp-0915/ftdicr-logs/ftdicr-crlf-normalisation.patch`.
+
+**The QEMU lane cannot score this, and that is stated rather than assumed.** `UNAOS_USBSERIAL=1
+UNAOS_FTDIRX=1 UNAOS_FTDIRX_INJECT=<sock> UNAOS_WC=1 UNAOS_QEMU_FULL=1 ./arroyo test 90` with
+`scripts/ftdi_inject.py --text 'help\r'` answers `:: [midden] cmd="help" -> TerminalOutput
+len=3793 ::` — and answers it IDENTICALLY with a CR-to-LF arm compiled in and with it removed, so
+that fixture has no power over this question. The reason is in the two captures: the flight-10
+image is `build=kepler+takeover+fifo+ivb+wc+smc+` with a focused Quarry window, while the QEMU boot
+takes no Kepler takeover and its Quarry is never focused. **Any future fixture for this defect must
+give Quarry focus first, or it is scoring a state the defect cannot occur in.**
+
 ## RBTDRAIN — the reboot ladder was flushed into a ring the reset then killed
 
 `docs/dev/OS/rmbp-ledger.md` A3. On the 2012 rMBP the `reboot` verb **worked** — it resets the
