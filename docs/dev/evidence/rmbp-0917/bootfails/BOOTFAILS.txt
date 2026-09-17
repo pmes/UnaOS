@@ -1,0 +1,83 @@
+BOOTFAILS — the two metal-only fixture reds of rMBP flights 8, 9 and 10, and the one cause under both
+seat rmbp-0915 · branch exec-rmbp-bootfails · parent 4638014e · 2026-09-17
+
+1. THE POPULATION, COUNTED BEFORE ANY CLAIM (LAWS §5, "never quantify over a filtered list")
+   capture: ~/unaos-bench/capture/rmbp12-flight8/ttyUSB0.log (22983 lines at read time; read with
+   awk index(), never grep). Boot boundaries by `=== SQUAWK MARK`: flight 8 from line 10, flight 9
+   from line 6654, flight 10 from line 11269.
+
+   awk 'index($0,"[wc-x]") && index($0,"move-vacate")'   -> 3 lines, one per boot, ALL FAIL:
+     1565  [  23097ms] ... win=2 scale=18x from=(8,8) to=(178,8) box=154x188 painted=false desktop=4/5 stale=0/5 -> FAIL   (flight 8)
+     8257  [  20848ms] ... win=2 scale=18x from=(8,8) to=(178,8) box=154x188 painted=false desktop=4/5 stale=0/5 -> FAIL   (flight 9)
+    13269  [  26434ms] ... win=2 scale=18x from=(8,8) to=(178,8) box=154x188 painted=false desktop=4/5 stale=0/5 -> FAIL   (flight 10)
+
+   awk 'index($0,"[clickroute] route ")'                 -> 3 lines, one per boot, ALL FAIL:
+     2668  [  38631ms] hit=true deliver=true depth=1/2 kernel=true desktop=false nofab=true deflect=true -> FAIL   (flight 8)
+     9329  [  36898ms] hit=true deliver=true depth=1/2 kernel=true desktop=false nofab=true deflect=true -> FAIL   (flight 9)
+    14340  [  41962ms] hit=true deliver=true depth=1/2 kernel=true desktop=false nofab=true deflect=true -> FAIL   (flight 10)
+
+   awk 'index($0,"[dmgovlp]") && index($0,"verdict")'    -> 3 lines, one per boot, ALL FAIL:
+     3170  drag_evt=12 drag_px=383900 relay=4 narrow=8/12 adopt=27 repaint=0 max_ms=8  adopt_stretch=0/4 -> FAIL   (flight 8)
+     9727  drag_evt=8  drag_px=622620 relay=2 narrow=2/12 adopt=13 repaint=2 max_ms=156 adopt_stretch=0/4 -> FAIL   (flight 9)
+    14921  drag_evt=11 drag_px=371490 relay=2 narrow=5/12 adopt=10 repaint=0 max_ms=0  adopt_stretch=0/4 -> FAIL   (flight 10)
+
+   CONCLUSION ON PROVENANCE: all three are PRE-EXISTING metal reds, identical field for field since
+   flight 8 (2026-09-16). NONE of them is new since 11ca67f1 and none is attributable to CURSOREMIT
+   33fb95db, PTRREPAINT bc607ffd, RENDSTACK or PTRINSTALL2 — those folds landed between flight 9 and
+   flight 10 and the flight-8 lines already carry the same values. The flight-10 dmgovlp verdict word,
+   cut in the seat's excerpt, is FAIL, and its discriminator is `adopt_stretch=0/4` (the QEMU lane
+   prints `adopt_stretch=4/4 -> PASS`); dmgovlp is NOT fixed here and is owed a row of its own.
+
+2. THE CAUSE, AND IT IS NOT THE PANEL
+   Both reds need one precondition: the MENU BAR IS ENABLED. `desktop_uefi::activate` enables it
+   (`[wc-x] menubar ENABLED panel=2880x1800 rect=Some((0, 0, 2880, 34))`, capture lines 1525 / 8226 /
+   13229) and `activate` has exactly one caller, the Kepler takeover — so on the QEMU x86 lane the bar
+   is OFF at both fixtures (`[wm] tile-fit ... work=0+724`) and `move_vacate_probe` never runs at all.
+   `UNAOS_FBW`/`UNAOS_FBH` do NOT reach this: they are read by `arch/aarch64/mailbox.rs` only
+   (`grep -rn 'UNAOS_FBW' --include=*.rs` = 1 declaration site, aarch64), so the x86 gate cannot be
+   driven to 2880x1800 with them and a 2880x1800 x86 lane does not exist.
+
+   move-vacate: the probe pins its box at `(EDGE_GAP, EDGE_GAP)` = (8,8). `wm::create_at` clamps a
+   pinned CONTENT origin to `work_top + TITLE_H + BORDER` = 34 + 34 + 5 = 73, and the capture's own
+   `[wc-d] verify win=2 ... at (13,73) panel=2880x1800` (line 13248) is the clamp firing. The probe
+   then reads back at the coordinates it ASKED for (content origin (13,47)), which the window never
+   occupied: `painted=false`, and the title-strip sample `(ax+ow/2, ay+TITLE_H/2)` = (85,25) lands in
+   the bar — neither DESKTOP_BG nor PROBE_COL — which is the 4/5.
+
+   clickroute leg 5: `desktop_pt` is the first of four PANEL corners with `wm::hit_test(..).is_none()`.
+   hit_test answers for WINDOW ROWS only; the bar and the dock are FURNITURE and invisible to it, so
+   (2,2) reads "unowned" and `wc_click_route_at` routes it to the menu band:
+   `14335  [clickroute] press at (2,2) band=menu -> open deliver=0`. Consumed, but the keyboard is
+   never handed to the shell, so `desktop=false`. On this panel ALL FOUR corners are furniture
+   (work area = `work=34+1604`, so rows 0..33 are bar and 1638..1799 are dock).
+   SECOND-ORDER, and it is why `deflect=true` is not a verdict on any of the three boots: the menu leg
+   5 opened stays open, so leg 7's furniture press is eaten by the band as a `dismiss`
+   (`14339  [clickroute] press at (1354,491) band=menu -> dismiss`) and NEVER reaches the furniture
+   arm — no `[clickroute] furniture deflect` line exists in any of the three metal boots, while the
+   QEMU lane prints one.
+
+3. REPRODUCTION AND GO-RED, IN QEMU AT 1280x800 (execution, not re-reading)
+   A scratch harness (never committed; ~/unaos-bench/scratch/rmbp-0915/bootfails-logs/scratch-harness.patch)
+   forces `menubar::set_enabled(true)` around `clickroute_selftest` and drives `move_vacate_probe`
+   from the same seam. `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_QEMU_FULL=1 ./arroyo test 120`:
+
+   UNFIXED tree + harness  (rc=1, the verb's own fault scan reds it):
+     [scratch] bar on panel=1280x800 rect=Some((0, 0, 1280, 34))
+     [wc-x] move-vacate win=1 scale=18x from=(8,8) to=(178,8) box=154x188 painted=false desktop=4/5 stale=0/5 -> FAIL
+     [clickroute] press at (2,2) band=menu -> open deliver=0
+     [clickroute] route hit=true deliver=true depth=1/2 kernel=true desktop=false nofab=true deflect=true -> FAIL
+   -> field for field the metal lines, on a 1280x800 panel. The panel is not the variable; the bar is.
+
+   FIXED tree + harness  (rc=0, spec replay green):
+     [wc-x] move-vacate win=1 scale=18x from=(8,34) to=(178,34) box=154x188 painted=true desktop=5/5 stale=0/5 -> PASS
+     [clickroute] press at (2,36) win=0 owner=0x0 was=1 -> consume deliver=0
+     [clickroute] furniture deflect owner=0xffffff7f keep=0x1 sink=dead — keyboard stays put
+     [clickroute] route hit=true deliver=true depth=1/2 kernel=true desktop=true nofab=true deflect=true -> PASS
+   -> and the `furniture deflect` line now fires, i.e. leg 7 reaches the arm it names.
+
+4. WHAT FLIGHT 11 MUST SHOW
+     [wc-x] move-vacate win=<n> scale=18x from=(8,34) to=(178,34) box=154x188 painted=true desktop=5/5 stale=0/5 -> PASS
+     [clickroute] route hit=true deliver=true depth=1/2 kernel=true desktop=true nofab=true deflect=true -> PASS
+   with `[clickroute] press at (2,36) win=0 owner=0x0 ... -> consume` and one
+   `[clickroute] furniture deflect ...` line beside it. `[dmgovlp] verdict ... adopt_stretch=0/4 -> FAIL`
+   is EXPECTED TO PERSIST: it is not touched by this arc.
