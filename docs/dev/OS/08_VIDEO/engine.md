@@ -17718,3 +17718,152 @@ PTRINSTALL2 named, now with the lane beside it: `UNAOS_QEMU_EXTRA="-device usb-m
 the typist with `--pointer-kind rel`, run under `UNAOS_SMP=2` as well as the default, or a metal boot
 with fewer than two APs online (a diagnosis card) — the arrow tracks the pad while a launched app holds
 focus, and at twice the pad's rate with the `:1944` mutation.
+
+## MENUDROP — the x86 click router had no menubar band (x86 `wc`, 2026-09-17)
+
+**Brief.** Flight 10 (2026-09-17, `capture/rmbp12-flight8/ttyUSB0.log` after `=== SQUAWK MARK
+flight10`): Peter pressed an app name in the menu bar and no menu dropped. The wire names the
+cause with no inference left over — `[clickroute] press at (117,5) win=0 owner=0x0 was=2 ->
+consume deliver=0`, `[clickroute] press at (60,3) win=0 owner=0x0 was=0 -> shell deliver=0`,
+`[clickroute] press at (279,11) win=0 owner=0x0 was=0 -> shell deliver=0`, and at 396429 ms the
+bar's own census for the window he had just launched reads `[menubar] menus cap_owner=6 cap=pulse
+menu_owner=0 boxes=1 items=app:pulse@34+57`. Box 0 spans panel x 34..91; `(60,3)` is inside it.
+The same router answered `[clickroute] press at (1218,1753) band=dock -> background deliver=0`
+(Quarry opened) and `[clickroute] press at (25,11) band=menu -> open` (the crystal corner), so the
+router was alive, the bar was live (`[menubar] live … press=crystal crystal=16x22 toggles=5`), and
+the drop machinery was proven by its own fixture on the same boot (`:: WINMENU:` legs, and
+`[winmenu] open title=Pulse items=3 at (40,34) … kind=app`). Only the metal press never reached it.
+Branch `exec-rmbp-menudrop`, parent `4638014e`; rmbp-ledger **B121**.
+
+**The gap, in one sentence.** `video/strip.rs:779`'s `press_route` is `winmenu::press_at ||
+crystal::press_at || dock::press_at` and the aarch64 router calls it WHOLE
+(`arch/aarch64/syscall.rs:14326`); the x86 router calls `crystal::press_at` and `dock::press_at`
+DIRECTLY — a deliberate GR27 split, so every consumed press names its band on the wire through
+`clickband_witness` (`arch/x86_64/syscall.rs:6247`) — and in splitting them it never grew the
+FIRST arm. A press on a bar title therefore fell past every furniture arm to `wm::hit_test`, which
+knows nothing of the strip, and landed on the desktop.
+
+**What is NOT the gap, stated because three plausible causes were checked and each is alive on
+this arch.** `video/mod.rs` admits `strip`, `menubar`, `crystal`, `winmenu` and `pulsewin` on
+`all(target_arch = "x86_64", feature = "wc")`, the same gate aarch64 rides with
+`desktop_firmware` — no arch arm anywhere in `winmenu.rs`. `menubar::compose` publishes the
+caption and the menu owner on both arches unconditionally (`video/menubar.rs:960` `set_bar_owner`,
+`:965` `set_app_window`), and flight 10 proves it running on x86 for a LAUNCHED ring-3 program:
+`[winmenu] app-menu owner=6 name=pulse from=program kind=default`. `winmenu::press_at`'s hit-test,
+`open_title`, the pick sink and the `Esc` seam are all arch-neutral and all exercised green on
+that same boot by `winmenu::selftest`, which presses through `strip::press_route`. The x86 router
+was the one caller in the tree that did not ask.
+
+**The fix.** One arm, folded into `wc_click_route_at`'s press block ahead of the crystal —
+`wc_menubar_press` (`arch/x86_64/syscall.rs:6254`), called at `:7452`. The ORDER is
+`press_route`'s, not a new one: an open window menu is composited after the SHARD menu so it must
+be judged before it, and `wm::MENU_OCC_MAX` reserves capacity for exactly ONE open dropdown —
+second, this arm would let a press reach the crystal's closed corner arm while a window menu was
+still down. Nothing below is starved: while its menu is down the arm consumes every press, and
+CLOSED it claims only the bar's own title boxes and declines `menubar::crystal_corner_abs`, so the
+corner cell still reaches the crystal. Consumed with `CLICK_PRESS_TARGET` set to `CLICK_TARGET_DROP`
+so the matching release is dropped, the rule the crystal, dock, close and chrome arms already follow.
+
+**The band line, and why the outcome word is derived rather than published.** `crystal` and `dock`
+each carry a `last_press_outcome()`; `winmenu` does not, and this arc owns no line in
+`video/winmenu.rs`. The word therefore comes from the public `is_open()` read either side of the
+call — `open` when the press opened a title, `kept-open` when it switched or swallowed one,
+`closed` when it dismissed or picked — and the module's own adjacent line (`[winmenu] open …`,
+`[winmenu] pick … label=… -> close win=…`, `[winmenu] dismiss reason=…`) separates a pick from a
+dismiss. The shape matches the dock's exactly: `[clickroute] press at (x,y) band=menubar -> <word>
+deliver=0`, against the same `CLICK_BAND_LOG_MAX_X86` budget.
+
+**The fixture, and the hole it fills.** `winmenu::selftest` leg 2 already presses the app box — but
+through `strip::press_route`, which x86 does not call, so it passed on every x86 boot while the
+metal press was inert. That is GR27's lesson one band later, and `menudrop_selftest`
+(`arch/x86_64/syscall.rs:6343`, ladder at `:17540` beside `clickband_selftest`) closes it: it mints
+its own 8x8 kernel-band row, focuses it, PARKS until the bar has published that caption — a single
+`wm::composite()` is a request and not a publication (WINMENUFLAKE, `video/winmenu.rs:1747`), and
+on an empty snapshot the app box centre is `(0, 0)`, i.e. the crystal's corner, so an ungraded race
+would press another tenant's furniture and score the shard — then drives TWO presses at the box
+centre through `wc_click_route_at`, the live seam. The first must open (`is_open()` and a rect on
+the panel), the second must close, and each owes exactly one `band=menubar` line: `band_lines=2` is
+what says the ROUTER's arm ran and not `press_at` alone. Unpublished is a SKIP, never a FAIL.
+
+**THE SECOND HALF IS A STOP, AND THE CAPTURE REFUTES ITS PREMISE.** The brief asked for a ring-3
+app's registered menu (Pulse's `View`) to appear on the x86 bar "the way it does on aarch64". Three
+measurements, in order:
+
+ 1. **The publication line IS on the x86 wire.** Flight 10, 396429 ms: `[winmenu] app-menu owner=6
+    name=pulse from=program kind=default` and `[menubar] menus cap_owner=6 cap=pulse menu_owner=0
+    boxes=1 items=app:pulse@34+57`, after `[dock] tile add win=6 … label=pulse` and `[wc-fv] focus
+    raise asid=0x2 … top_win=6`. The bar named the launched program, and the earlier reading that
+    no `app-menu` line follows the launch is wrong. What the line says is `kind=default` and
+    `menu_owner=0`: the WM's own `About`/`Quit` tree, and no tenant title.
+ 2. **`PULSE.ELF` registers nothing, on EITHER arch, and cannot.** `crates/user-pulse/src/main.rs`
+    contains no menu call of any kind (its whole syscall set is `SYS_EXIT`, `SYS_GETINFO`,
+    `SYS_INPUT_POLL`, `SYS_SLEEP_MS`, `SYS_WIN_CREATE`, `SYS_WIN_PRESENT`, `SYS_WRITE`,
+    `SYS_CPUPULSE`), and `crates/una-abi/src/lib.rs` has no menu verb to call — the numbered set
+    ends at `SYS_CPUPULSE = 49` and the word "menu" does not occur in the file.
+    `BUS_VERB_MENU_PUBLISH` exists only as the DESIGN ledger at `video/menubar.rs:1611`. So this is
+    not an x86 cfg: no ring-3 program on any chip can publish a title today.
+ 3. **The `View` menu belongs to a KERNEL window that x86 never opens.** `video/pulsewin.rs:172-183`
+    holds `VIEW_ITEMS_LAMPS`/`VIEW_ITEMS_SEGS` and their `MenuTitle { label: "View", … }`, published
+    at `:526` through `winmenu::publish`. Every runtime call into that window is
+    `desktop_firmware`-gated — `main.rs:5572`, `main.rs:8898`, `video/desktop_firmware.rs:214` and
+    `:393` — and `desktop_firmware` is bound to `UNAOS_PIDESK` / `UNAOS_TEGRADESK` (`unaos/arroyo:1518`,
+    `:1583`), never to an x86 lane. It is reachable on x86 today from exactly one place, the witness
+    fixture `winmenu::pulsequit_selftest` (`video/winmenu.rs:2151`), and flight 10 shows it working
+    there: `[winmenu] publish owner=4 titles=1 items=2 slot=0 replaced=false app-menu=default` then
+    `[menubar] menus cap_owner=4 cap=Pulse menu_owner=4 boxes=2 items=app:Pulse@34+57,View@91+48`.
+    So the PUBLICATION path is arch-neutral and already proven on x86; what is missing is an
+    operator path to a window that publishes.
+
+The change that would close it is therefore one of two, and neither is in this arc's file list:
+widen the four `desktop_firmware` call sites above to the furniture family's own gate
+(`any(all(x86_64, wc), all(aarch64, desktop_firmware))`) and give the pulse window a launcher on
+x86 — `main.rs` and `video/desktop_firmware.rs`; or give ring-3 the verb (`SYS_MENU_PUBLISH` in
+`una-abi`, a dispatch arm in both `syscall.rs` files, a `publish` whose sink is an input-ring
+enqueue rather than a `fn` pointer, and the call in `user-pulse`), which is the arc `winmenu.rs:80`
+and `menubar.rs:1611` were both written against. REPORTED, NOT TAKEN.
+
+**Gate results (2026-09-17, QEMU q35, bench under peer load 7-9).** `bash unaos/scripts/ledger-check.sh`
+rc 0 before and after (379 rows). `./arroyo check` rc 0 — 158 ✅, 79 cfg legs. ONE QEMU run, the WC
+lane: `UNAOS_QEMU_FULL=1 UNAOS_WC=1 ./arroyo test 150` rc 0, sidecar `mode=full wall=160.9 cap=150
+completion=complete`, 2531 lines; `./arroyo mbench --replay target/serial.log --spec
+scripts/specs/x86-wc.spec --platform x86` rc 0, `MBENCH PASS — 8/8 required witnesses, 0 forbidden
+hit(s), 2531 lines scanned [full wall 160.9s]`. The fixture and its neighbours, verbatim:
+
+```
+[winmenu] app-menu owner=1 name=drop from=declared kind=default
+[menubar] menus cap_owner=1 cap=drop menu_owner=0 boxes=1 items=app:drop@34+48
+[winmenu] open title=drop items=3 at (40,34) title-x=40 font=chrome20-bold kind=app owner=1
+[clickroute] press at (58,17) band=menubar -> open deliver=0
+[winmenu] dismiss reason=title kind=app owner=1
+[clickroute] press at (58,17) band=menubar -> closed deliver=0
+:: MENUDROP: win=1 box=48x34+34 press=(58,17) waited=0ms routed_open=true open=true routed_close=true closed=true band_lines=2 :: PASS ::
+:: CLICK-BAND: routed menu=true(open) outside=true(dismiss) dock=true(background) band_lines=3 :: PASS ::
+```
+
+**Go-red, by mutation and not by reading.** `if false && wc_menubar_press(x, y)` at the arm, rebuilt
+and re-run on the same lane: `:: MENUDROP: win=1 box=48x34+34 press=(58,17) waited=0ms
+routed_open=false open=false routed_close=false closed=false band_lines=0 :: FAIL ::`, `./arroyo test`
+rc 1, ZERO `band=menubar` lines anywhere in the capture — and the metal shape returns verbatim:
+`[clickroute] press at (58,17) win=0 owner=0x0 was=0 -> shell deliver=0`. Reverted and `cmp`-identical
+to the green file. `:: CLICK-BAND: … band_lines=3 :: PASS ::` is unmoved in both runs, which is what
+says this fixture reads its own delta and not GR27's.
+
+**Knob-off.** `./arroyo knoboff wc 4638014e` **exit 0** — `knoboff: PASS — 'wc' OFF is byte-identical
+to 4638014e on both arches; control fired, cache warm`, with `warm=yes` and `control x86 armed≠off:
+YES arm armed≠off: YES`. Byte delta ZERO on both arches. This is NOT the PTRINSTALL2 class and the
+difference is measured rather than planned: PTRINSTALL2's sites compiled with the knob OFF and its
+image legitimately moved, while this arm is `#[cfg(feature = "wc")]` and its fixture
+`#[cfg(all(feature = "witness", feature = "wc"))]`, so a knob-off image contains none of it — and the
+diff is LINE-NEUTRAL (4 lines changed, 0 added; `arch/x86_64/syscall.rs` is 24179 lines before and
+after), so no panic `Location` moved either. Both halves are needed: the cfg alone would still have
+moved the image through the line shift, which is the trap `knoboff` exists to catch.
+
+**What flight 11 must show, and what must NOT change.** A press inside the bar's app box —
+`items=app:<name>@<x>+<w>`, box 0 spans `x .. x+w` — now owes
+`[clickroute] press at (px,py) band=menubar -> open deliver=0` immediately followed by
+`[winmenu] open title=<name> items=3 at (…) kind=app owner=<win>`; a second press there owes
+`band=menubar -> closed deliver=0` with `[winmenu] dismiss reason=title`; a press on a menu ITEM owes
+`[winmenu] pick owner=<win> id=… label=… -> …`. A press on EMPTY bar still reads
+`-> shell deliver=0` and that is correct, not a regression: on flight 10 the bar carried ONE box,
+`app:pulse@34+57` (x 34..91), so of Peter's three presses only `(60,3)` was ever inside a title —
+`(117,5)` and `(279,11)` were on bare strip and had nothing to open.
