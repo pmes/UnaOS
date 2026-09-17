@@ -17404,6 +17404,46 @@ can complete, and would reopen the software-bound question; both boots read zero
 `DEAD c<n>` on either boot; the capture it cites has seven of each, four on flight 8 and three on
 flight 9 (the count command is in B116). The A1 cell is the seat's to amend.
 
+**FALSIFIED on flight 10 (W5SPIN, 2026-09-17). There is a wait, and it is in `present_banded`.**
+The section above is correct about `blit_traced` and `FrameBuffer::blit` — that code still contains
+no poll, no fence and no loop — and wrong about the stalled core, because it inferred the core's
+position from a GAUGE instead of from the core. Flight 10 asked the core directly: `w5_post_steal`
+NMIs the corpse (`pcihealth.rs:1394`), and all three stalls answered
+`:: W5: nmi core=c<n> taken=y rip=… in_blit=n cs=0x8 memcpy=0x79454510..0x7945453f icr=ok ::` —
+c1 at 665828 ms `rip=0x79253da2`, c2 at 668402 ms `rip=0x79253da6`, c3 at 841827 ms `rip=0x79253da6`.
+A core that TAKES an NMI is executing instructions, so "architecturally parked on a single
+instruction" is refuted three times over; and no rip is inside memcpy, so it is not parked in the
+copy either. At the flight-10 load offset `0x7915a000` (wire memcpy `0x79454510` minus ELF memcpy
+`0x2fa510`) those rips resolve on the flown ELF to `video::wm::present_banded + 0x462` and `+ 0x466`
+— ONE function, two instructions four bytes apart, three different cores. Disassembly, with the
+exact `llvm-nm` / `llvm-objdump` commands:
+`docs/dev/evidence/rmbp-0916/w5spin/PRESENT-BANDED-LOOP.txt`.
+
+The loop is `pace_shadow_refresh`'s `PACE_SHADOW[slot].lock()` (wm.rs:2119) inlined into
+`present_banded` — an unbounded test-and-test-and-set on the WPACE-TEXT per-window shadow byte:
+`pause` / `movzbl (%r14)` / `testb %al,%al` / `jne`, with no budget, no counter and no yield. The
+three `at=` values the section leans on (`pw-strip`, `span-flush`, `pw-exit`, and
+`blit_inflight=0` on two of the three) are not three different stalls: `COMP_PASS_WIN` /
+`COMP_PASS_PHASE` / `COMP_PASS_ROW` are global gauges stamped by the gate holder (wm.rs:10130), so
+they name where the holder's PASS was when it last stamped, not where the core is now. The core is
+in the spin. That also explains why the row never advanced and why `blits_retired` froze: nobody is
+blitting, because the one core allowed to blit is spinning for a lock its own suspended pass holds
+(`_shadow_pin`, wm.rs:6231, pinned across `draw_window` + WC-G/WC-D + the staged span-flush).
+
+Consequences for this section's conclusions. "A budget checked while waiting has no instruction to
+run on" is false — the core has instructions to spare and now runs a budget on them (W5SPIN:
+try-lock, 500 µs spin, then `:: [wcser] PRESENT-BANDED SPIN site=<n> waited_us=<n> on=shadow<n> ->
+GAVE-UP ::` and a clean return). "`COMP_PASS_OVERDUE_MS` and `COMP_GATE_STEAL_MS` are already the
+bound, and they are the only bound software can put on a core that is not executing" no longer
+applies to this fault: the core IS executing, the bound belongs where the wait is, and the steal
+stops being the repair. `revenants=0` across every rollup stays true and stops being evidence for
+the stuck-store reading — a spinning core never reaches `comp_gate_release` because it never leaves
+the spin, not because a store never retires. What survives unchanged: the GPU is in a standing
+latch at every stall (`pri_fault=80300001`, `bar1_fault=22010860/8482d000/00000002/00221500`,
+`pbus_intr=0000000c`, `pfifo_intr=00000001`, `ep_pcists=0010`, byte for byte identical at all
+three), the link is up, and why the GK107 drives the pass slow enough to open this window is still
+`PCIE-RP-RECOVERY.md` §11.3 rung W5. The freeze, however, is ours.
+
 ## PTRINSTALL — the pointer-install ledger, and the STOP on moving the install (x86 `wc`, 2026-09-16)
 
 **Brief.** CHOP (above) measured flight 8's chop as a 5.3 : 1 collapse of pointer installs under

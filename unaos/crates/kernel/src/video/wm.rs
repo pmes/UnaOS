@@ -2046,7 +2046,7 @@ static PACE_SHADOW: [Mutex<alloc::vec::Vec<u8>>; MAX_WINDOWS] =
 /// boundary. Set only by [`pace_shadow_refresh`] after a whole-surface fill; cleared when the slot
 /// is re-issued (see [`create_inner`]), which covers every close path with one line.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-static PACE_SHADOW_OK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static PACE_SHADOW_OK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0); #[cfg(all(target_arch = "x86_64", feature = "wc"))] static PACE_SHADOW_WEDGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static WPACE_SHDW_SPIN: [core::sync::atomic::AtomicU64; MAX_WINDOWS] = [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS]; #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] static WPACE_SHDW_WEDGE: [core::sync::atomic::AtomicU64; MAX_WINDOWS] = [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS]; #[cfg(all(target_arch = "x86_64", feature = "wc"))] fn pace_shadow_acquire(slot: usize, site: u32) -> Option<MutexGuard<'static, alloc::vec::Vec<u8>, SpinRelax>> { use core::sync::atomic::Ordering::Relaxed; let bit = 1u32 << slot; if let Some(g) = PACE_SHADOW[slot].try_lock() { if PACE_SHADOW_WEDGED.load(Relaxed) & bit != 0 { PACE_SHADOW_WEDGED.fetch_and(!bit, Relaxed); #[cfg(feature = "witness")] WPACE_SHDW_SPIN[slot].fetch_add(1, Relaxed); serial_println!(":: [wcser] PRESENT-BANDED SPIN site={} waited_us=0 on=shadow{} -> RELEASED ::", site, slot + 1); } return Some(g); } let hz = crate::arch::apic::tsc_hz(); let hz = if hz == 0 { 1_250_000_000u64 } else { hz }; let us = |dt: u64| dt.saturating_mul(1_000_000) / hz; let budget = if PACE_SHADOW_WEDGED.load(Relaxed) & bit != 0 { 0 } else { hz / 2_000 }; let t0 = crate::arch::now_cycles(); loop { core::hint::spin_loop(); if let Some(g) = PACE_SHADOW[slot].try_lock() { let us = us(crate::arch::now_cycles().saturating_sub(t0)); PACE_SHADOW_WEDGED.fetch_and(!bit, Relaxed); #[cfg(feature = "witness")] WPACE_SHDW_SPIN[slot].fetch_add(1, Relaxed); serial_println!(":: [wcser] PRESENT-BANDED SPIN site={} waited_us={} on=shadow{} -> RELEASED ::", site, us, slot + 1); return Some(g); } let waited = crate::arch::now_cycles().saturating_sub(t0); if waited >= budget { #[cfg(feature = "witness")] WPACE_SHDW_WEDGE[slot].fetch_add(1, Relaxed); if PACE_SHADOW_WEDGED.fetch_or(bit, Relaxed) & bit == 0 { serial_println!(":: [wcser] PRESENT-BANDED SPIN site={} waited_us={} on=shadow{} -> GAVE-UP ::", site, us(waited), slot + 1); } return None; } } } // W5SPIN (flight 10, three dead cores at `present_banded+0x462/+0x466`) — THE BOUND ON THE REFRESH-SIDE ACQUIRE. `pace_shadow_refresh`'s doc argued its `lock()` was "bounded" because "the only other holder is a composite pass blitting this same window's shadow". Metal falsified the premise, not the arithmetic: the pass pins the shadow across `draw_window` + WC-G/WC-D + the staged span-flush into the Kepler BAR1, which is milliseconds at best and, on a core PREEMPTED mid-pass, unbounded — and the gauges say the spinner IS the gate holder (the pass gauges are stamped by the holder and the gate is serial, so `win=10 phase=42 row=10` is c1's OWN breadcrumb while c1's rip is in this loop), i.e. the pass and the spinner are the SAME CORE and the pass can never be rescheduled behind a spinner that never yields. Then the 1.5 s steal declares that core DEAD and nothing ever resumes the pass, so the `MutexGuard` is never dropped and the byte stays 1 for the rest of the boot: every later present of that window spins forever and becomes the next dead core (c1 -> c2 -> c3 on flight 10). So: try once, then spin under a 500 us budget (`tsc_hz / 2_000`, with the same uncalibrated 1.25 GHz fallback `wcg::cycles_to_us` uses), and GIVE UP — the caller drops the window to the live-read path, which is the OOM degraded mode this block already documents and accepts. A give-up LATCHES the slot in `PACE_SHADOW_WEDGED`, and a latched slot takes the try-lock only (budget 0), so a genuinely dead holder costs one `cmpxchg` per present instead of 500 us; the first acquisition that succeeds clears the latch and says so. One line per TRANSITION, never per present: `RELEASED` when a spin (or a latched slot) actually got the lock, `GAVE-UP` once per latch. A healthy QEMU run never contends, so it prints neither and `[wpace] spin=0 wedge=0` is the positive reading.
 
 /// WPACE-TEXT witness — shadow creations declined for want of heap. A nonzero count means some
 /// window is on the live-read (tearing-text) path; the wire says so instead of the operator's eyes.
@@ -2116,7 +2116,7 @@ fn pace_shadow_refresh(
     if surf_len == 0 {
         return;
     }
-    let mut buf = PACE_SHADOW[slot].lock();
+    let mut buf = match pace_shadow_acquire(slot, if valid { 2 } else { 1 }) { Some(g) => g, None => { if valid { PACE_SHADOW_OK.fetch_and(!bit, Relaxed); } return; } }; // W5SPIN — bounded, and the GIVE-UP path is the recovery, not just the exit. Site 1 is the create fill, site 2 the band update. On a give-up the VALIDITY BIT IS CLEARED, which is what makes "skip this refresh" safe: a skipped band would otherwise leave the shadow holding older bytes for rows the owner has since redrawn, and the pass would publish them to glass indefinitely if the app never declared that band again. Clearing the bit drops the window onto the live-read path — `pace_shadow_source` answers `Live`, `pace_shadow_refresh` returns at its `!valid && !create` head — and the next COALESCED present arrives with `create = true` and re-copies the WHOLE extent, so the degraded interval is one present (~2 ms for the storming window this pacer exists for), and for a QUIET window the live surface is quiescent anyway, which is this block's own argument for the never-coalesced path. Nothing is left stale on the panel and nothing can tear that could not already tear under `WPACE_SHDW_OOM`. The core RETURNS from the pass either way, which is the whole point: it is never the holder that "had not moved", so it is never declared DEAD and the steal is never needed.
     // NOTE-5 — count only copies that moved bytes, so `shdw` stays comparable to `paced +
     // coalesced` and a degenerate empty band does not inflate it.
     #[cfg_attr(not(feature = "witness"), allow(unused_variables))]
@@ -2285,8 +2285,8 @@ fn wpace_emit(ident: &[(u64, bool, bool, u32); MAX_WINDOWS]) {
         // straddle a span, and `defer` joins the traffic test so a window that only deferred this
         // span still prints its line.
         let shdw = WPACE_SHDW[slot].swap(0, Relaxed);
-        let defer = WPACE_SHDW_DEFER[slot].swap(0, Relaxed);
-        if paced == 0 && coalesced == 0 && tail == 0 && defer == 0 {
+        let defer = WPACE_SHDW_DEFER[slot].swap(0, Relaxed); let spin = WPACE_SHDW_SPIN[slot].swap(0, Relaxed); let wedge = WPACE_SHDW_WEDGE[slot].swap(0, Relaxed); // W5SPIN — ONE TICK PER PRINTED LINE, so the census and the wire cannot disagree: `spin=` counts every `PRESENT-BANDED SPIN … -> RELEASED` (the bounded wait's healthy exit, and the latched-slot recovery that clears the wedge on its first try-lock), `wedge=` every `… -> GAVE-UP`. Swapped with the pair above, before the traffic test, for the same no-straddle reason, and both join that test so a window whose only traffic this span was a contended shadow still prints its line.
+        if paced == 0 && coalesced == 0 && tail == 0 && defer == 0 && spin == 0 && wedge == 0 {
             continue;
         }
         // Healthy paced steady state: `shdw ≈ paced + coalesced` (every non-suppressed present
@@ -2296,7 +2296,7 @@ fn wpace_emit(ident: &[(u64, bool, bool, u32); MAX_WINDOWS]) {
         // glyph.
         let (asid, live, _, _) = ident[slot];
         serial_println!(
-            "[wpace] win={} asid={:#x} live={} mode=panel paced={} coalesced={} tail={} shdw={} defer={} frame_us={}",
+            "[wpace] win={} asid={:#x} live={} mode=panel paced={} coalesced={} tail={} shdw={} defer={} spin={} wedge={} frame_us={}",
             slot + 1,
             asid,
             if live { "yes" } else { "no" },
@@ -2304,7 +2304,7 @@ fn wpace_emit(ident: &[(u64, bool, bool, u32); MAX_WINDOWS]) {
             coalesced,
             tail,
             shdw,
-            defer,
+            defer, spin, wedge,
             PACE_FRAME_US
         );
     }
