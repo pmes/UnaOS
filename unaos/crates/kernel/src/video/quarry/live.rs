@@ -22,9 +22,13 @@
 //!    `arch::aarch64::boot::FB_WIN_MAX_W`/`H` and `arch::x86_64::memory::FB_WIN_MAX_W`/`H` are both
 //!    128, and the x86 side carries a `const` assertion tying them to the 64 KiB window region slot
 //!    (`assert!((FB_WIN_MAX_W * FB_WIN_MAX_H * 4) as usize == FB_WIN_SLOT_SIZE)`). `sys_win_create`
-//!    rejects anything larger with `-EINVAL`. At the 8-px font cell that is **16 columns** — which is
-//!    four characters short of one FAT 8.3 name plus a space, let alone a name column beside a size
-//!    column beside a date column. The deliverable is not expressible in that surface.
+//!    rejects anything larger with `-EINVAL`. QUARRYFONT re-derives this from the face actually
+//!    drawn rather than from the 8-px cell that used to be here: 128 / [`font::Face::cell_w`] is
+//!    **18 columns** at `Face::Body`'s 7-px advance and **14** at `Face::Chrome`'s 9 — the small
+//!    panel gains two columns over the old 16 and the large one loses two, and neither reaches one
+//!    FAT 8.3 name plus a space, let alone a name column beside a size column beside a date column.
+//!    The deliverable is not expressible in that surface, and the arithmetic now says so from the
+//!    same accessor the painter uses.
 //! 2. **There is no directory syscall.** The VFS mount table is `crate::fs::vfs`, kernel-internal;
 //!    the frozen ABI (`una-abi`) has `SYS_OPEN`/`SYS_READ`/`SYS_SEEK`/`SYS_UNLINK`/`SYS_CLOSE` and no
 //!    `readdir`/`stat` (34..=39 are unallocated). `SYS_OPEN` itself does not route through the VFS —
@@ -122,6 +126,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
+use crate::video::font;
 use crate::video::theme;
 use crate::video::wm;
 use crate::fs::vfs::{DirEnt, NodeKind, VfsTime};
@@ -226,7 +231,10 @@ const DOUBLE_CLICK_MS: u64 = 400;
 
 /// Inner padding inside a pane, in source pixels.
 const PAD: usize = 4;
-/// The raw `font8x8` cell, before the text scale.
+/// QUARRYFONT — **the disclosure marker's unit, and no longer a glyph's.** It was the raw `font8x8`
+/// cell that every character was block-replicated out of; the text now comes from the shared
+/// anti-aliased face ([`font::Face`]) whose advance and cell height are its own, and this constant
+/// survives only as the ORNAMENT grid the triangle is drawn on — see [`Geom::mark_w`].
 const BASE_CELL: usize = 8;
 /// Scrollbar gutter width — [`theme::SCROLLBAR_WIDTH`], the role that has existed since the theme
 /// table landed and has never had a consumer. Quarry is the first.
@@ -250,18 +258,42 @@ struct Geom {
     /// Content width/height in source pixels.
     w: usize,
     h: usize,
-    /// Integer text scale over the 8 px `font8x8` cell.
+    /// Integer ORNAMENT scale — the disclosure triangle's unit and the row's vertical padding.
+    /// QUARRYFONT: it is no longer a glyph replication factor. Block-replicating a 1-bit cell
+    /// multiplies the staircase tread and adds no information (fonts.md §2), so the glyphs left
+    /// `font8x8` for [`face`](Self::face) and `ts` kept only the work it was always right for.
     ts: usize,
+    /// QUARRYFONT — which shared atlas the text draws from, resolved once in [`geometry`] from the
+    /// panel. This is fonts.md §6.2's end state: the panel predicate that used to pick a
+    /// replication factor now picks a FACE, which is the only thing about it that was ever a
+    /// legibility decision.
+    face: font::Face,
 }
 
 impl Geom {
+    /// Glyph ADVANCE — the horizontal unit. The face's own, not a cell guess: a 16 px mono Noto
+    /// advances 7 px because that is the width its side bearings give it, where a doubled 8x8 cell
+    /// was square. Every column count, indent and clip in this module is this number.
     #[inline]
-    fn cell(&self) -> usize {
+    fn cell_w(&self) -> usize {
+        self.face.cell_w()
+    }
+    /// Glyph CELL HEIGHT — the vertical unit, including the face's own line-gap padding.
+    #[inline]
+    fn cell_h(&self) -> usize {
+        self.face.cell_h()
+    }
+    /// The disclosure marker's full width, and the tree's indent step. Both triangle forms span
+    /// `2 * (4 * ts)` by construction ([`disclosure`]), so this is the one number that keeps the
+    /// painter's marker, the indent ladder and [`content_press`]'s toggle region in step — it used
+    /// to be `cell()`, back when a glyph cell and the ornament grid were the same 8x8 square.
+    #[inline]
+    fn mark_w(&self) -> usize {
         BASE_CELL * self.ts
     }
     #[inline]
     fn row_h(&self) -> usize {
-        self.cell() + 2 * self.ts
+        self.cell_h() + 2 * self.ts
     }
     /// The path bar across the top of the surface.
     #[inline]
@@ -273,7 +305,7 @@ impl Geom {
     #[inline]
     fn tree_w(&self) -> usize {
         let want = self.w * 5 / 16;
-        let lo = (10 * self.cell() + 2 * PAD + SBW).min(self.w / 2);
+        let lo = (10 * self.cell_w() + 2 * PAD + SBW).min(self.w / 2);
         want.clamp(lo, self.w / 2)
     }
     /// `(x, y, w, h)` of the tree pane, in source pixels.
@@ -316,20 +348,27 @@ impl Rect {
 /// crispywire law `dock::Layout` states: one geometry accessor, never a second copy of the arithmetic
 /// to drift out of step.
 fn geometry(pw: usize, ph: usize) -> Option<Geom> {
-    // The text scale is a legibility decision about the PANEL, and it is the one number here that is
-    // not a proportion: a 640x480 QEMU panel reads at 1x and the 1920x1200 bench panel does not.
+    // QUARRYFONT — the panel predicate is UNCHANGED in what it asks and CHANGED in what it answers.
+    // It was "how many times do I replicate each 1-bit pixel"; it is now "which of the two rasters of
+    // the one face does this panel want", which is the same legibility question with an answer that
+    // carries information instead of multiplying a staircase. `ts` survives beside it as the
+    // ORNAMENT scale — the triangle's unit and the rows' vertical padding — because that is the one
+    // job a replication factor was always right for.
     let ts = if pw >= 1280 { 2 } else { 1 };
-    let cell = BASE_CELL * ts;
+    let face = if pw >= 1280 { font::Face::Chrome } else { font::Face::Body };
+    let (cell_w, cell_h) = (face.cell_w(), face.cell_h());
     // Leave the chrome room. `wm` draws the title strip above the content and a border around it, and
     // a window whose OUTER box does not fit is a window the tiler will fight.
     let avail_w = pw.saturating_sub(2 * wm::BORDER);
     let avail_h = ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER);
-    let w = (pw * 3 / 5).min(CEIL_W).min(avail_w) / cell * cell;
-    let h = (ph * 3 / 5).min(CEIL_H).min(avail_h) / cell * cell;
+    // THE TWO AXES ROUND SEPARATELY, and that is the whole of what the face split costs here: the
+    // surface still holds a whole number of glyph cells, but a glyph cell is no longer square.
+    let w = (pw * 3 / 5).min(CEIL_W).min(avail_w) / cell_w * cell_w;
+    let h = (ph * 3 / 5).min(CEIL_H).min(avail_h) / cell_h * cell_h;
     if w < FLOOR_W || h < FLOOR_H {
         return None;
     }
-    Some(Geom { w, h, ts })
+    Some(Geom { w, h, ts, face })
 }
 
 // ── The model ───────────────────────────────────────────────────────────────────────────────────
@@ -1490,31 +1529,30 @@ fn keyline(px: &mut [u32], g: &Geom, r: Rect, c: u32) {
     fill(px, g, r.x + r.w.saturating_sub(1), r.y, 1, r.h, c);
 }
 
-/// Draw ASCII text, clipped to `max_x`. Uses `font8x8` — the kernel's one font, the same table
-/// `pal::draw_text` and `instgui::text` blit from. Returns the pen x after the last glyph.
+/// QUARRYFONT — draw ASCII text, clipped to `max_x`, through the SHARED anti-aliased face.
+///
+/// The body was a `font8x8::legacy::BASIC_LEGACY` lookup whose every set bit was filled as a
+/// `ts`x`ts` square of flat ink. That is what Peter sees as blocky on the rMBP's 2880x1800 panel,
+/// and the cause is the 1-bit table, not the scale: two ink states give a staircase edge at ANY
+/// size, and replication multiplies the tread without adding information (fonts.md §2). Every other
+/// piece of chrome moved to `font::glyph` at 6ef5c843; this window could not follow because the
+/// module had no SURFACE blit — `draw_row` takes one scanline of a strip's scratch, `draw_glyph_fb`
+/// writes a `FrameBuffer`. FONTS2X added `font::draw_text`, which is exactly this shape, and this
+/// call is the whole of the conversion.
+///
+/// The clip contract is unchanged, which is why no caller here moved: a glyph that does not fit
+/// WHOLE inside the box ends the string, and the return is the pen x after the last glyph drawn.
+/// `g.face` is a field read, and `glyph`'s four-arm match therefore stays live for both rasters —
+/// priced in this commit's body rather than assumed, because `font.rs`'s tail rule says a face the
+/// optimizer cannot see through keeps every atlas in the image.
 fn text(px: &mut [u32], g: &Geom, x: usize, y: usize, s: &[u8], max_x: usize, fg: u32) -> usize {
-    let cell = g.cell();
-    let mut cx = x;
-    for &ch in s {
-        if cx + cell > max_x || cx + cell > g.w {
-            break;
-        }
-        let bitmap = font8x8::legacy::BASIC_LEGACY[ch.min(127) as usize];
-        for (ry, rowbits) in bitmap.iter().enumerate() {
-            for rx in 0..8 {
-                if rowbits & (1 << rx) != 0 {
-                    fill(px, g, cx + rx * g.ts, y + ry * g.ts, g.ts, g.ts, fg);
-                }
-            }
-        }
-        cx += cell;
-    }
-    cx
+    font::draw_text(px, g.w, max_x.min(g.w), g.h, x, y, s, fg, false, g.face)
 }
 
 /// The disclosure marker: a right-pointing triangle when collapsed, down-pointing when expanded.
-/// Drawn rather than spelled, because `font8x8`'s BASIC page has no triangle and a `>`/`v` pair reads
-/// as text the operator might try to select.
+/// Drawn rather than spelled, because neither face's ASCII page has a triangle and a `>`/`v` pair
+/// reads as text the operator might try to select. QUARRYFONT keeps `ts` here: this is ORNAMENT, and
+/// a replication factor is the right unit for a shape the code draws itself.
 fn disclosure(px: &mut [u32], g: &Geom, x: usize, y: usize, open: bool, c: u32) {
     let n = 4 * g.ts;
     for i in 0..n {
@@ -1601,7 +1639,11 @@ fn paint_scrollbar(
 
 fn repaint_locked(m: &Model, px: &mut [u32]) {
     let g = &m.geom;
-    let cell = g.cell();
+    // QUARRYFONT — the two units, named apart. `cell_w` is the glyph ADVANCE and drives every column
+    // count and clip below; `mark_w` is the disclosure triangle's width and drives the indent ladder.
+    // They were one number (`cell()`) only because a doubled 8x8 bitmap is square.
+    let cell_w = g.cell_w();
+    let mark_w = g.mark_w();
     let row_h = g.row_h();
 
     // ── the path bar ────────────────────────────────────────────────────────────────────────────
@@ -1644,7 +1686,7 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
         } else {
             theme::CONTENT_TEXT
         };
-        let indent = PAD + row.depth * cell;
+        let indent = PAD + row.depth * mark_w;
         // Both triangle forms have their centre at `y + 4 * ts` by construction (column/row `i`
         // spans `i ..= i + 2*(n-i)`, whose midpoint is `n`, independent of `i`), so this offset
         // puts the marker's centre exactly on the row's.
@@ -1652,7 +1694,7 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
         text(
             px,
             g,
-            ti.x + indent + cell + g.ts,
+            ti.x + indent + mark_w + g.ts,
             y + g.ts,
             row.name.as_bytes(),
             ti.x + ti.w - tsb,
@@ -1674,17 +1716,17 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     let cols_w = li.w.saturating_sub(lsb).saturating_sub(2 * PAD);
     // Columns degrade rather than overlap: the date goes first, then the size, so a narrow pane still
     // shows names instead of three columns of ellipsis.
-    let (size_cols, date_cols) = if cols_w >= 34 * cell {
+    let (size_cols, date_cols) = if cols_w >= 34 * cell_w {
         (9usize, 16usize)
-    } else if cols_w >= 22 * cell {
+    } else if cols_w >= 22 * cell_w {
         (9, 0)
     } else {
         (0, 0)
     };
-    let name_cols = (cols_w / cell).saturating_sub(size_cols + date_cols + 2);
+    let name_cols = (cols_w / cell_w).saturating_sub(size_cols + date_cols + 2);
     let name_x = li.x + PAD;
-    let size_x = name_x + (name_cols + 1) * cell;
-    let date_x = size_x + (size_cols + 1) * cell;
+    let size_x = name_x + (name_cols + 1) * cell_w;
+    let date_x = size_x + (size_cols + 1) * cell_w;
     let clip = li.x + li.w - lsb;
 
     // Header — outside the scrolled band by construction, so a scrolled list never loses its columns.
@@ -1974,9 +2016,10 @@ pub fn open() {
             .unwrap_or((0, 0, 0))
     };
     serial_println!(
-        "[quarry] open win={} surf={}x{} ts={} box={}x{} at ({},{}) volumes={} tree-rows={} list-rows={} cwd={}",
+        "[quarry] open win={} surf={}x{} ts={} box={}x{} at ({},{}) volumes={} tree-rows={} list-rows={} cwd={} face={} cell={}x{}",
         id, g.w, g.h, g.ts, ow, oh, ox, oy, roots_n, tn, ln,
-        MODEL.lock().as_ref().map(|m| m.cwd.clone()).unwrap_or_default()
+        MODEL.lock().as_ref().map(|m| m.cwd.clone()).unwrap_or_default(),
+        g.face.name(), g.cell_w(), g.cell_h()
     );
     census("open");
     repaint();
@@ -2422,7 +2465,10 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
     let row_h = g.row_h();
     let tp = g.tree_pane();
     let lp = g.list_pane();
-    let cell = g.cell();
+    // QUARRYFONT — the toggle region is the MARKER's width, read from the same accessor the painter
+    // draws the marker with, so the two cannot drift. It was `cell()` when the glyph cell and the
+    // ornament grid were the same square; a 7 px advance is not the width of a 16 px triangle.
+    let mark_w = g.mark_w();
 
     if tp.contains(sx, sy) {
         let ti = tp.inner();
@@ -2467,8 +2513,8 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
         m.click_pane = Pane::Tree;
         // A press ON the disclosure marker toggles; anywhere else on the row navigates. The two
         // regions are derived from the SAME indent the painter used, so they cannot drift.
-        let indent = ti.x + PAD + m.tree[i].depth * cell;
-        if sx >= indent && sx < indent + cell {
+        let indent = ti.x + PAD + m.tree[i].depth * mark_w;
+        if sx >= indent && sx < indent + mark_w {
             if m.tree[i].expanded {
                 m.collapse(i);
             } else {
@@ -2754,7 +2800,17 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     let small = geometry(640, 480).ok_or("geometry declined 640x480")?;
     let bench = geometry(1920, 1200).ok_or("geometry declined 1920x1200")?;
     if small.ts != 1 || bench.ts != 2 {
-        return Err("text scale did not follow the panel");
+        return Err("ornament scale did not follow the panel");
+    }
+    // QUARRYFONT — the panel predicate now answers a FACE, and the leg that used to pin the
+    // replication factor pins that instead. Both claims are kept: `ts` is still the ornament unit.
+    if small.face != font::Face::Body || bench.face != font::Face::Chrome {
+        return Err("text face did not follow the panel");
+    }
+    // The two units are genuinely different numbers now — a doubled 1-bit cell was square and a
+    // proportional face is not — so the split is asserted rather than assumed.
+    if bench.cell_w() == 0 || bench.cell_h() == 0 || bench.mark_w() != BASE_CELL * bench.ts {
+        return Err("geometry's glyph and ornament units disagree");
     }
     if small.w > 640 || small.h > 480 || bench.w > CEIL_W || bench.h > CEIL_H {
         return Err("surface exceeded its panel or its ceiling");

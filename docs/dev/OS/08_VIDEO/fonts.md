@@ -155,7 +155,21 @@ and `video/quarry/live.rs` was not named — so the edits are written down rathe
   upscaled whole, so even a perfect face is resampled 2x. The honest end state is a login surface
   sized in PANEL pixels rather than a 440x240 one magnified — that is a layout arc, not a face one.
 
-### 6.2 `video/quarry/live.rs`
+### 6.2 `video/quarry/live.rs` — **BUILT on hw-rmbp as QUARRYFONT (2026-09-17)**
+
+The edit list below is what was applied, and it was applied as written. What the list did not say,
+and the build measured: the two axes had to be split in `geometry()` as well as in the painter (the
+surface rounds to a whole number of glyph cells, and a glyph cell is no longer square, so a
+1280x800 panel's content goes 768x480 -> 765x480); the disclosure marker needed a unit of its own
+(`Geom::mark_w`, `BASE_CELL * ts` — exactly what `cell()` used to be) because the tree's indent
+ladder and `content_press`'s toggle region are the MARKER's width, not the glyph advance, and a 7 or
+9 px advance is not the width of a 16 px triangle; and the panel predicate reads
+`Face::Body` below 1280 and `Face::Chrome` at or above it, so `ts` survives as the ornament scale
+only. The face is a `Geom` FIELD, not a `const`, which font.rs's tail rule prices at both rasters —
+measured at **-3,160 bytes** on the x86 loadable image, because both atlases are already live in any
+build that has a dock and a panel console and the `font8x8` blit loop this replaced was itself code.
+Wire: `[quarry] open … face=noto20-aa cell=9x20`.
+
 
 * `Geom::ts` (`:254`) stops being a glyph replication factor. `cell()` (`:259-261`) splits into
   `cell_w()`/`cell_h()` over `font::Face`, and `row_h`/`bar_h`/`tree_w` follow the vertical one.
