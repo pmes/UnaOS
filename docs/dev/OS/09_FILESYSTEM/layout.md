@@ -104,6 +104,8 @@ loader: *"WTF does it matter what method I choose to boot? You are assuming too 
 | `/boot` | the FAT volume the kernel's own image was found in                            |
 | `/apps` | the SAME volume, rooted at `APPS/`, under the SAME volume NAME (see §5.1)     |
 | `/`     | that DISK's native UnaFS volume when it has one and the shared mount is riding that disk; otherwise `/boot`'s volume |
+| `/volumes/<NAME>` | every OTHER enumerated disk with a FAT volume, under its own label (HOMESOIL) |
+| `/volumes/data` | CARDROOT, §1.6: `/boot`'s volume rooted at `DATA/`, and only when that directory exists |
 | `/usb`  | unchanged — the stick, and only when it is actually enumerated (honest hot-plug) |
 
 So the Pi's namespace in §1.1 is reproduced exactly, and now for a reason rather than by
@@ -153,6 +155,264 @@ Leg 8 (`fs::bootdisk::sdwrite_posture_selftest`, `witness`) drives the mapping b
 that the FAT-layer veto and the block-layer posture agree for every source in `fat::ALL_SOURCES`, so
 the two views of one answer cannot drift apart again. It runs on QEMU `virt` and on x86; no QEMU
 machine models the Tegra SDHCI, so it tests the REPORT and never the medium.
+
+## 1.6 CARDROOT — what `/` lists on a ONE-MEDIUM boot (rMBP flight 10, 2026-09-17)
+
+Peter, at the bench, after `=== SQUAWK MARK flight10`: *"root appears to be listing files that should
+not be there."* This section is the measurement that answers him, and the options, so the layout call
+is his to make on numbers rather than on an impression. **Nothing here is a defect report: every one
+of the 21 entries is at `/` because a rule in this document put it there.** What flight 10 exposed is
+that three of those rules compose badly on a machine with exactly one medium.
+
+### 1.6.1 The wire
+
+```
+[quarry] open census cwd=/ entries=21 dirs=6 files=15 truncated=false names: APPS/ B43/ EFI/ apps/
+  boot/ volumes/ BLOCK.TXT(197) GROW.BIN*(512) HELLO.BIN*(72) PULSE.ELF*(12568) S8W.BIN*(64)
+  SCRATCH.BIN*(1024) …
+[quarry] open volumes mounts=["/", "/apps", "/boot", "/volumes/EFI"] roots=["/"]
+:: X86BIND: root=sdhc:/kernel.elf … by=content … mounts=4 layout=true -> PASS ::
+```
+
+`layout=true` and `by=content` say the binder did exactly what §1.4 specifies. `/volumes/EFI` is the
+laptop's internal disk, mounted as home soil under its own label — also correct.
+
+### 1.6.2 The census, classified
+
+The card is written FLAT: `~/unaos-bench/scratch/rmbp-0915/logs/foldgate/card-write.sh` (seat-local)
+copies the staged `data/` tree AND the ESP tree to the one FAT root, because the rMBP boots from one
+SD card with one partition. `CARD-LAYOUT.txt` in each staged directory records the two lists. The 21
+entries are the union (`HELLO.BIN` and `hello.txt` exist in both trees; the ESP copy wins), plus the
+three names the mount table contributes synthetically.
+
+| # | entry | class | put there by | can it move? |
+|---|---|---|---|---|
+| 1 | `apps/` | **(a) kernel root** | `shell::vfs_ls_collect`'s synthetic child of `/` for the `/apps` mount | n/a — not on the medium |
+| 2 | `boot/` | **(a) kernel root** | same, for `/boot` | n/a |
+| 3 | `volumes/` | **(a) kernel root** | same, for `/volumes/EFI` | n/a |
+| 4 | `EFI/` | **(b) ESP, the loader's** | `esp-x86` — `EFI/BOOT/BOOTX64.EFI` is what UEFI loads | no — firmware fixed path (§2.1 group 1) |
+| 5 | `kernel.elf` | **(b) ESP, the loader's** | `esp-x86`; also the file `fs::bootdisk` matches itself against | no — §2.1 group 1 |
+| 6 | `APPS/` | **(b) ESP, the kernel's** | `esp-x86`; the directory `/apps` is rooted at | no — it IS the layout |
+| 7 | `HELLO.BIN` | **(b) ESP** (data copy shadowed) | `esp-x86` + the data tree | **no** — EL0 `sys_open` (§2.1 group 3) |
+| 8 | `hello.txt` | **(b) ESP** (data copy shadowed) | `esp-x86` + the data tree | yes, but see §1.6.4 |
+| 9 | `SRC.TGZ` | **(b) ESP** | `pack_source_along` (SOURCE-ALONG) | **no** — SELFHOST-2 verifies it off the program-source volume ROOT (`main.rs:1232`) |
+| 10 | `SRC.SHA` | **(b) ESP** | same | **no** — same reader |
+| 11 | `SCRATCH.BIN` | **(c) data set** | `x86_64_data/` — U9x write fixture | **no** — EL0 `sys_open` |
+| 12 | `GROW.BIN` | **(c) data set** | `x86_64_data/` — U10 growth fixture | **no** — EL0 `sys_open` |
+| 13 | `S8W.BIN` | **(c) data set** | `x86_64_data/` — STOR-1 S8 write witness | **no** — EL0 `sys_open` |
+| 14 | `BLOCK.TXT` | **(c) data set** | `x86_64_data/` — zeolite blocklist, read through S7 `SYS_OPEN` | **no** — EL0 `sys_open` |
+| 15 | `readme.txt` | **(c) data set** | `x86_64_data/` | **no** — STOR-1 S7 opens `README.TXT` dynamically off the volume root, and the DIRNS `abs` leg resolves `/README.TXT` (`arch/x86_64/syscall.rs:23029`, `:24071`) |
+| 16 | `STAT.ELF` | **(c) data set, STALE** | the carried-forward `data/` (see below) | **yes, for free** — byte-identical duplicate of `APPS/STAT.ELF` |
+| 17 | `VUG.ELF` | **(c) data set, STALE** | same | yes, for free — duplicate of `APPS/VUG.ELF` |
+| 18 | `VUGC.ELF` | **(c) data set, STALE** | same | yes, for free — duplicate of `APPS/VUGC.ELF` |
+| 19 | `VUGX.ELF` | **(c) data set, STALE** | same | yes, for free — duplicate of `APPS/VUGX.ELF` |
+| 20 | `PULSE.ELF` | **(c) data set, STALE** | same | yes, for free — duplicate of `APPS/PULSE.ELF` |
+| 21 | `B43/` | **(d) wifi firmware** | carried forward by hand into the staged `data/` | **no** — `wifi/firmware.rs:152` `SEARCH_DIRS` = `/`, `/B43/`, `/FIRMWARE/`, read off the FAT volume root |
+
+**Rows 16-20 are the one genuine accident on the card, and it costs no kernel byte to fix.** Measured
+on the flight-10 staged tree
+(`~/unaos-bench/flash/rmbp/UnaOS-rmbp-esp-rmbp12flight10-20260916T2132Z-fa4dcf0`): all five are
+`sha256`-identical to their `APPS/` siblings, and `APPS/VUGK.ELF` has no root twin. The reason is that
+`~/unaos-bench/tools/stage-x86.sh` **carries `data/` forward from the previous flight's staged
+directory** ("a build tree has no data/"), refreshing the `*.ELF` files in place, so the card's data
+tree still has the SHAPE a 2026-08 data volume had. The CURRENT builder puts every one of those under
+`APPS/` on the data volume — `builder/src/main.rs`, "all but HELLO.BIN under APPS/" — so five root
+entries survive only because the directory that holds them is inherited rather than rebuilt. Only
+`B43/` genuinely has to be carried forward; it is not build-produced.
+
+⚠ **A hazard that the stale shape currently HIDES:** `card-write.sh`'s flat write does
+`cp -a "$f" "$MNT"/` per top-level ESP entry. Rebuild `data/` from `target/x86_64_data/` and it gains
+an `APPS/` of its own, which is copied to the card root FIRST — and the ESP's `APPS` then lands as
+`APPS/APPS`. Whoever refreshes the staging fixes the copy (`cp -a "$S/$f/." "$MNT/$f"` for
+directories) in the same edit, or carries `data/` as a DIRECTORY (option ii), where the collision
+cannot arise at all.
+
+**So the 21 split (a) 3 · (b) 7 · (c) 10 · (d) 1 — and exactly FIVE of the 21 can move.** Rows
+16-20, the stale duplicates. Every other entry on the medium is read from the volume ROOT by a
+contract outside this document: the firmware (rows 4, 5), the EL0 `sys_open` ABI (rows 7, 11-14, 15),
+SELFHOST-2 (rows 9, 10), the wifi firmware loader (row 21), and the layout itself (row 6). That is
+the measurement Peter's question needed, and it is the reason a `DATA/` directory cannot empty `/`
+today however the card is written.
+
+### 1.6.3 What the other boards list at `/`, and why the rMBP is the odd one
+
+The rule in §1.4 is `/` = the disk's native UnaFS volume when it has one, else the FAT boot volume.
+
+* **Pi 4** — `make-pi-img.sh` lays a UnaFS volume down as MBR partition 2, so `/` is NATIVE and lists
+  the K3 fixture set. The card's FAT root — `kernel8.img`, `config.txt`, `start4.elf`, `fixup4.dat`,
+  `bcm2711-rpi-4-b.dtb`, `overlays/`, `APPS/`, `HELLO.BIN`, `K2OWN.BIN`, `K2IMP.BIN`, `MIDDEN.BIN`,
+  `SCRATCH.BIN`, `GROW.BIN` — is at `/boot`, where a card root belongs. That list is LONGER than the
+  rMBP's and nobody has ever complained about it, because it is not `/`.
+* **Jetson Orin** — `unafs=absent` until UNAFSGROW, so `/` WAS the FAT card root, exactly the rMBP's
+  shape (orin-ledger A53, the row that says so in Peter's hearing). Since A53/A60 the card is imaged
+  with a native volume and the Orin's `/` is `native unafs volume source=tegra-sd rw=yes`.
+* **rMBP** — no native volume on the card, and `fs::vfs::NativeBackend` + `fs::unafs` are
+  `#[cfg(target_arch = "aarch64")]`, so `bootdisk::unafs_state` returns `"unbuilt"` on x86 and `/`
+  can never be anything but the FAT boot volume. **The rMBP is the only board left whose `/` IS a
+  card root, and it is the only board where flattening two trees onto one card is visible at `/`.**
+
+### 1.6.4 The options, with costs
+
+**(0) REFRESH THE STAGED `data/` FROM THE BUILD TREE instead of carrying its shape forward.** No
+kernel byte, no card layout change, no decision: it removes rows 16-20 because the current builder
+never put them at a data-volume root in the first place. `/` goes **21 → 16**. Cost: the `APPS/APPS`
+hazard above must be fixed in the same edit, and `B43/` must keep being carried forward. This is a
+bench-tooling change (`~/unaos-bench/tools/stage-x86.sh`, `card-write.sh`), both seat-local, and it is
+worth doing whichever of the four below Peter picks.
+
+**(i) A SECOND PARTITION on the card carrying the data set as its own volume.** The kernel already
+mounts it: HOMESOIL walks every enumerated disk — but a second PARTITION of one disk is not a second
+DISK, and `fs::bootdisk`'s walk is per `BlockSource`, so this needs the partition reader
+(`fs/fat.rs`'s MBR/GPT arm, `docs/dev/OS/09_FILESYSTEM/partitions.md`) to publish slot 2 as a mountable
+volume and the walk to enumerate volumes rather than sources. Cost: kernel work in `fs/fat.rs` and
+`fs/bootdisk.rs`, a card-image builder (`arroyo esp-x86-img`, the shape `esp-jetson-img` already has),
+and `media-writer.sh --image` instead of a file-level write — so the card stops being editable by
+copying files onto it, which is how every rMBP flight has been staged. **It does not fix `/`**: `/`
+would still be the ESP's FAT root, with rows 4-14 and 21 on it.
+
+**(ii) A DATA DIRECTORY on the card (`DATA/`), mounted where the two-device boot puts the data
+VOLUME.** The kernel half is what was BUILT, and it is one rule in `fs/bootdisk.rs` — see §1.6.5.
+Card-side cost: one line in the seat-local `card-write.sh` (`cp -a "$S/data" "$MNT"/data` in place of
+`cp -a "$S"/data/. "$MNT"/`), plus HOISTING out of `data/` the entries that may not move —
+`SCRATCH.BIN`, `GROW.BIN`, `S8W.BIN`, `BLOCK.TXT`, `HELLO.BIN` and `B43/`. **That hoist is the honest
+limit of this option and it is not negotiable from `fs/bootdisk.rs`:** rows 7 and 11-14 are pinned to
+the volume root by EL0's `sys_open` ABI, whose namespace is a flat 8.3 volume root with no directory
+component (§2.1 group 3, §5.2), and row 21 by the firmware loader reading `SEARCH_DIRS` off the FAT
+root. Moving THOSE is a syscall-ABI change plus a `wifi/firmware.rs` change — not a layout change,
+which is the sentence §2.1 group 3 has carried since orin 18 and which this arc has now paid for a
+second time on a second board.
+
+**Measured, not argued: over (0) this option moves ZERO further entries off `/` today.** Once rows
+16-20 are gone by (0), every remaining data entry is one a root reader owns. The kernel rule is
+therefore built and INERT — it is the namespace this card layout will need the day the EL0 ABI grows
+a directory component (§5.2), and it costs nothing standing ready. `/` lands at **16** under (0),
+under (ii), and under (0)+(ii) alike.
+
+⚠ **The pins are read off the code, not executed, and that is stated rather than glossed.** Moving
+`README.TXT` into `DATA/` on the QEMU `sf` medium was run (§1.6.7) and reddened NOTHING: `S7` and
+`DIRNS` emit zero lines on the x86 `test-fat` lane, so this suite cannot convict the row-15 pin.
+The citation is the code — `arch/x86_64/syscall.rs:23029` (`const NAME: &str = "README.TXT"`) and
+`:24071` (`const ABS: &str = "/README.TXT"`) — and the owed fixture is a lane that drives the STOR-1
+witnesses on x86. A pin nothing executes is a pin that will be moved by someone who read only the
+listing.
+
+**(iii) A VFS VIEW RULE hiding non-root entries at `/`.** Cheapest to write and the worst of the
+four, for three reasons that are each independently sufficient. It makes `ls /` DISAGREE with the
+medium, so an operator who copies a file onto the card in a desktop card reader cannot see it on the
+machine that boots from it — a filesystem that lies about its own contents. It needs a LIST of what
+is allowed at `/`, which is a board fact and a build fact in kernel source, and LAWS §3 forbids
+exactly that ("no board, bus, slot, serial or card geometry in kernel source"). And it hides the
+symptom of the composition problem while leaving every file where it was, so the next thing staged
+flat is invisible instead of merely untidy.
+
+**(iv) GIVE THE rMBP CARD A NATIVE VOLUME — i.e. make x86 do what both aarch64 boards already do.**
+This is the option the measurement argues for and it is not in the brief, so it is recorded rather
+than built. `/` becomes the system volume, the card's FAT root becomes `/boot` and stops being the
+thing anybody looks at, and the rMBP joins the rule §1.4 already states instead of being its
+exception. Cost, named: `fs::vfs::NativeBackend`, `fs::unafs` and `bootdisk::unafs_state` are all
+`#[cfg(target_arch = "aarch64")]` — a cfg-widen with real work behind it (the block-handle seam
+`fs/unafs.rs` `handle_write` has no x86 arm) — plus option (i)'s card image, since a native volume is
+a second partition. It subsumes (i) and makes (ii) cosmetic.
+
+**The decision is Peter's**, and it is one sentence: **does `/` on the rMBP stay the card's FAT root
+(and the card gets tidier, option ii), or does the rMBP get a native root like the Pi and the Orin
+(option iv, and `/` stops being a card root at all)?**
+
+### 1.6.5 What was built: the `DATA/` rule
+
+`fs::bootdisk::bind_data`, called from `bind` after `bind_root`. If the boot volume has a `DATA/`
+directory at its root, it is mounted at `/volumes/data` — the same volume, rooted at a directory,
+under the same volume NAME `boot`, which is `/apps`'s shape exactly, so
+`same_volume("/boot", "/volumes/data")` stays true about one card (§5.1's rule).
+
+**It hangs off `bind`, not `bind_root`, and that placement is load-bearing.** `bind_root` is driven
+FOUR times at heap-up by `unafsroot_selftest` (leg 6) with a scratch table, on its own stated premise
+that it is table shape only and that a fixture running ahead of the walk must not be the first thing
+to touch the card. `bind_data` asks the MEDIUM, so from `bind_root` it would touch the card before
+the walk AND latch `absent` from a `Default` source at a moment when no disk has enumerated — the
+mount would then never appear for the rest of the boot. That is SO38's shape (a rootless observation
+cached as an answer) reappearing in a new rule, and it is avoided by putting the rule where the
+question belongs: the root LAYOUT is `bind_root`'s, a fact about the DISK is `bind`'s.
+
+`/volumes/data` and not `/data`: on a TWO-device boot the data set is a separate medium and HOMESOIL
+already mounts it at `/volumes/<its label>`. Putting the one-card data set anywhere else would make
+the same files answer to two different paths depending on how many devices are plugged in.
+
+```
+[vfs] data mount /volumes/data = fat boot volume source=<src> rooted=DATA rw=<yes|no> ::
+```
+
+Three properties worth stating because each is a place this could have gone wrong:
+
+* **It costs one probe per BOOT, not one per verb.** The mount table is rebuilt per verb; probing the
+  medium for a directory every time is the cost §5.1 measured shifting the x86 window-manager battery
+  into two different fixture flakes. The answer is latched in `DATA_PRESENT`.
+* **A real disk labelled `data` outranks the directory.** `MountTable::mount` REPLACES a prefix rather
+  than refusing it, so without the guard the card's directory would silently evict a card the operator
+  is holding. The directory is still reachable at `/boot/data` in that case.
+* **On every medium that exists today it does nothing at all** — no `DATA/` directory, no mount, no
+  witness line. It is inert until a card is written with one.
+
+### 1.6.6 What flight 11's `/` must list
+
+Written down in advance so the next capture is SCORED and not merely read. Against a card staged with
+option (0) alone — the tooling change, no kernel change needed, the shape flight 11 gets if nothing
+else is done:
+
+```
+[quarry] open census cwd=/ entries=16 dirs=6 files=10 …
+  names: APPS/ B43/ EFI/ apps/ boot/ volumes/
+         BLOCK.TXT GROW.BIN HELLO.BIN S8W.BIN SCRATCH.BIN SRC.SHA SRC.TGZ hello.txt kernel.elf readme.txt
+```
+
+`STAT.ELF`, `VUG.ELF`, `VUGC.ELF`, `VUGX.ELF` and `PULSE.ELF` must be **ABSENT from `/` and present
+under `/apps`** — that pair is the verdict, and the absence half is the load-bearing one for the same
+reason `layout.mv`'s is (§6): a file that exists somewhere passes a presence-only test.
+
+Against a card staged with option (ii) as well, `data/` joins the dirs and **no file leaves** (§1.6.4
+(ii): every remaining data entry has a root reader), but one more line must appear:
+
+```
+[vfs] data mount /volumes/data = fat boot volume source=<src> rooted=DATA rw=<yes|no> ::
+[quarry] open volumes mounts=["/", "/apps", "/boot", "/volumes/data", …] roots=["/"]
+```
+
+If that `[vfs] data mount` line is absent while `data/` is in the census, the card carries the
+directory and the rule did not fire — read `DATA_PRESENT`'s probe and `/boot/data` before anything
+else. If the line is present and `/volumes/data` is NOT in the `mounts=[…]` list, a real disk labelled
+`data` took the point first (§1.6.5) and `[vfs] volume mounted /volumes/data source=…` will be on the
+wire above it.
+
+### 1.6.7 What was measured, and the one witness that did not fire
+
+Two boots of the same kernel on two media, which is the pair that makes the rule falsifiable — one
+variable, opposite outcomes:
+
+| medium | `X86BIND` | `ls /` | `/volumes/data` |
+|---|---|---|---|
+| `builder/fat-sf.img` as `test-fat sf` builds it | `mounts=4 layout=true -> PASS` | `AHCIBOOT.TXT APPS B43 BLOCK.TXT EFI GROW.BIN HELLO.BIN HELLO.TXT KERNEL.ELF Long Filename Example.txt MixedCaseName.md README.TXT S8W.BIN SCRATCH.BIN SUBDIR apps boot volumes (11 file, 7 dir)` | absent |
+| the same image with `DATA/` added and `README.TXT` moved into it (`mmd`/`mcopy`/`mdel`) | `mounts=5 layout=true -> PASS` | `… BLOCK.TXT DATA EFI … S8W.BIN SCRATCH.BIN SUBDIR … apps boot volumes` — **no `README.TXT`** | `:: volid: mount /volumes/data name=boot id=Some(8354126049188793961) ::` |
+
+The volume id on that line is the SAME value `/`, `/boot` and `/apps` report on the same boot, which
+is the §5.1 claim the mount owes: one card, one volume identity, four prefixes.
+
+**The `[vfs] data mount …` witness did NOT print, and the reason is not this rule.** `bind` takes
+`announce` from a one-shot latch, and on x86 the FIRST mount table is built at serial line ~156 —
+before any disk enumerates, so `bind` returns early with the latch already consumed (SO38's
+asynchronous-storage story, §1.4). Measured: `[vfs] root mount` appears **0 times** in both captures
+above, and `[vfs] volume mounted` 0 times, on boots whose `/`, `/boot`, `/apps` and
+`/volumes/UNAOS SDHC4` all bound correctly. **Every per-mount `[vfs]` witness on this board is dead,
+has been since X86BIND, and the new one inherits that rather than adding to it.** The fix is to move
+the latch from "the first table built" to "the first table that BOUND A ROOT"; it is not made here
+because it changes `bind`'s announce for every board. What carries the wire meanwhile is
+`:: volid: mount …`, which rides a fixture and therefore runs.
+
+Go-red, on the artifact rather than on a third boot, because the behavioural pair above already has
+two outcomes: deleting the ONE call `bind_data(mt, found.source, announce);` and rebuilding with the
+same verb drops `/volumes/data` from the kernel image `2 → 0` and the witness sentence `1 → 0`, with
+the control string `/volumes/dataX` reading 0 in both (`LC_ALL=C grep -a -o -F` on
+`target/x86_64_esp/kernel.elf`, `./arroyo esp-x86` both sides). Reverted; the source is byte-identical
+(`git diff --numstat` unchanged).
 
 ## 2. The namespace this arc establishes
 
