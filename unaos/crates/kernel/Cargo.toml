@@ -185,6 +185,26 @@ nvidia-kepler-kfctxbind = ["nvidia-kepler", "nvidia-kepler-fifo"]
 # item, the call site and every `:: KDHEAD:` string are unlinked, media byte-identical. Kept in sync
 # with arroyo AND builder/src/main.rs.
 nvidia-kepler-kdhead = ["nvidia-kepler", "nvidia-kepler-takeover"]
+# CTRLBIND (rmbp, shut-out register §2 rung KF9b, 2026-09-17): `UNAOS_KEPLER_CTRLBIND=1` — the half
+# of KF9 the 2026-09-15 SHUTRESTORE could not bring back. The restored `nvidia-kepler-ctrladdr` audit
+# answers "is CTRL_ADDR[1:0] writable" (12/12 yes at s13) and CANNOT answer s13's actual question,
+# "does any TARGET encoding change the strip": the s13 original re-ran the WHOLE channel bringup
+# inside its `for target in 0..4` loop and that apparatus was deleted with the rest. This feature arms
+# the re-run — per TARGET, with the encoding live, through `kepler::try_bind_and_witness`, the seam
+# carved out of `kepler::init` between the channel bind and the `PFIFO_CHAN[1] pre-submit` read (the
+# seam itself is NOT gated: `init` calls it unconditionally, `#[inline(always)]`, exactly where that
+# block sat). IMPLIES `nvidia-kepler-ctrladdr` — the rung lives INSIDE the audit's loop and cannot be
+# armed without it — and through it `nvidia-kepler`. It deliberately does NOT imply
+# `nvidia-kepler-fifo`: like the three restored FIFO rungs, it needs `UNAOS_KEPLER_FIFO` at RUNTIME to
+# REACH its call site (`kepler::init`'s fifo leg), and arming it without the parent is not an error,
+# it is a rung that never runs — which the absent `:: kepler: ctrlbind ` token says plainly.
+# R19 SEQUENCING IS IN CODE: the rung runs only on a (pbdma, target) whose `RO?` check said WRITABLE
+# on THIS boot, and prints `skipped reason=ctrladdr-readonly` otherwise, writing nothing. DEFAULT OFF
+# => every `:: kepler: ctrlbind ` string, the entry capture, the twelve call sites and the
+# PFIFO_CHAN[1] restore are unlinked and media are byte-identical (`./arroyo knoboff
+# nvidia-kepler-ctrlbind`, and `… nvidia-kepler-ctrladdr` measures that the SEAM's extraction did not
+# move the image either). Kept in sync with arroyo AND builder/src/main.rs (the four-place trap).
+nvidia-kepler-ctrlbind = ["nvidia-kepler", "nvidia-kepler-ctrladdr"]
 # WC-X86: bring the window compositor (`video::wm`) up on the x86 panel path. Compiles
 # `video/desktop_uefi.rs` — the activation seam and the one kernel-drawn demo window — plus fbcon's
 # CONSOLE-WINDOW route (`panel_console_window_open`: the kernel console becomes an ordinary row in

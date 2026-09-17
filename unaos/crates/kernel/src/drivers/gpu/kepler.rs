@@ -1713,6 +1713,20 @@ pub fn init(gpu: &GpuInfo) {
                                     // target loop; that surrounding code no longer exists in this shape, so what is
                                     // restored here is the AUDIT itself — the census and its reversibility — and the
                                     // per-target bringup re-run is carried as an rmbp-queue `· NEW` row.
+                                    // ══ KF9b `ctrlbind` (SHUTRESTORE-CTRLADDR-BRINGUP, 2026-09-17) — the channel state this
+                                    // rung disturbs, captured BEFORE it. `try_bind_and_witness` (this file's tail) leaves
+                                    // PFIFO_CHAN[1] +0x00/+0x04 written — its re-entrancy audit names those two words as its
+                                    // WHOLE residue — and the rung re-enters the seam up to twelve times HERE, far above the
+                                    // one place `init` binds the channel. So both words are read first and put back after the
+                                    // audit, and the restore is READ BACK: a restore that is written and never read is a
+                                    // success echo that cannot fail, which is the rule the KF9 audit's own `restored rb=` line
+                                    // applies to CTRL_ADDR twenty lines below. DEFAULT OFF — `nvidia-kepler-ctrlbind` implies
+                                    // `nvidia-kepler-ctrladdr`, so an image without the audit cannot carry the rung.
+                                    #[cfg(feature = "nvidia-kepler-ctrlbind")]
+                                    let ctrlbind_chan_pre = (mmio_read(bar0, 0x800000 + (1 * 8)), mmio_read(bar0, 0x800004 + (1 * 8)));
+                                    #[cfg(feature = "nvidia-kepler-ctrlbind")]
+                                    serial_println!(":: kepler: ctrlbind begin chan00={:08X} chan04={:08X} inst_off={:08X} ::",
+                                        ctrlbind_chan_pre.0, ctrlbind_chan_pre.1, inst_off);
                                     #[cfg(feature = "nvidia-kepler-ctrladdr")]
                                     for pbdma_idx in 0..3usize {
                                         let pbdma_base = 0x40000 + (pbdma_idx * 0x2000);
@@ -1724,6 +1738,11 @@ pub fn init(gpu: &GpuInfo) {
 
                                         if pre_low == 0xFFFFFFFF || pre_low == 0xBAD0BA20 {
                                             serial_println!(":: kepler: ctrladdr pbdma{} ABSENT? rb={:08X} ::", pbdma_idx, pre_low);
+                                            // The rung has nothing to stand on when the PBDMA aperture itself does not answer:
+                                            // no encoding was written, so a bind here would score an untouched CTRL_ADDR and
+                                            // read as a TARGET result. It says why it did not run rather than staying silent.
+                                            #[cfg(feature = "nvidia-kepler-ctrlbind")]
+                                            serial_println!(":: kepler: ctrlbind pbdma{} skipped reason=ctrladdr-absent ::", pbdma_idx);
                                             continue;
                                         }
                                         serial_println!(":: kepler: ctrladdr pbdma{} pre={:08X} hi={:08X} ::", pbdma_idx, pre_low, pre_high);
@@ -1734,16 +1753,57 @@ pub fn init(gpu: &GpuInfo) {
                                             let rb = mmio_read(bar0, ctrl_addr_low_off);
                                             if rb != wrote {
                                                 serial_println!(":: kepler: ctrladdr pbdma{} RO? wrote={:08X} rb={:08X} ::", pbdma_idx, wrote, rb);
+                                                // R19 SEQUENCING, ENFORCED IN CODE (the KF28 precedent): the rung runs only where
+                                                // the audit's own `RO?` check said WRITABLE on THIS boot. This arm is the other
+                                                // side of that check — the encoding did not take, so there is no encoding under
+                                                // test, and the rung writes nothing and claims nothing.
+                                                #[cfg(feature = "nvidia-kepler-ctrlbind")]
+                                                serial_println!(":: kepler: ctrlbind pbdma{} target={} skipped reason=ctrladdr-readonly ::", pbdma_idx, target);
                                                 mmio_write(bar0, ctrl_addr_low_off, pre_low); // restore
                                                 continue;
                                             }
                                             serial_println!(":: kepler: ctrladdr pbdma{} try target={} wrote={:08X} rb={:08X} ::", pbdma_idx, target, wrote, rb);
+                                            // ══ KF9b `ctrlbind` — the per-TARGET CHANNEL BRINGUP RE-RUN, which is the half of s13
+                                            // the 2026-09-15 restore could not bring back. `wrote` is IN CTRL_ADDR right now and
+                                            // read back equal, and the audit's restore is four lines below: this is the only
+                                            // window in which s13's actual question can be asked. The restored audit answers "is
+                                            // CTRL_ADDR[1:0] writable" (12/12 yes at s13) and CANNOT answer "does any TARGET
+                                            // encoding change the strip", because the strip is only observable through a bind and
+                                            // there was no bind up here to run. There is now.
+                                            // NO NEW REGISTER IS TOUCHED: the seam writes PFIFO_CHAN[1] +0x00/+0x04 and reads
+                                            // 0x252c / 0x263c, and `init` writes and reads exactly those four today at the site
+                                            // this seam was carved from. The bringup is re-run, not re-invented.
+                                            #[cfg(feature = "nvidia-kepler-ctrlbind")]
+                                            {
+                                                let bw = try_bind_and_witness(bar0, inst_off);
+                                                serial_println!(":: kepler: ctrlbind pbdma{} target={} ctrl_addr={:08X} bind={} witness={} chan00={:08X} chan04={:08X} sched=err={:08X},stat={:08X} ::",
+                                                    pbdma_idx, target, wrote,
+                                                    if bw.bound { "ok" } else { "fail" },
+                                                    if bw.latched { "latched" } else { "silent" },
+                                                    bw.chan00, bw.chan04, bw.err, bw.stat);
+                                            }
                                             // Every write is put back before the next one — the audit leaves the
                                             // PBDMA exactly as it found it, and the restore is READ BACK.
                                             mmio_write(bar0, ctrl_addr_low_off, pre_low);
                                             let rb_restored = mmio_read(bar0, ctrl_addr_low_off);
                                             serial_println!(":: kepler: ctrladdr pbdma{} restored rb={:08X} ::", pbdma_idx, rb_restored);
                                         }
+                                    }
+                                    // ══ KF9b `ctrlbind` — the seam's residue, unwound and READ BACK ═══════════════════════
+                                    // Reverse order of the seam's own writes: +0x04 first, then +0x00, so the word carrying
+                                    // VALID is the last one written here exactly as it is in the bringup. `init` rewrites both
+                                    // words far below, which is precisely why this restore matters: without it `init` would
+                                    // bind a channel a PROBE had already left armed, and every reading from there down would
+                                    // be taken against a state no unarmed boot ever reaches.
+                                    #[cfg(feature = "nvidia-kepler-ctrlbind")]
+                                    {
+                                        mmio_write(bar0, 0x800004 + (1 * 8), ctrlbind_chan_pre.1);
+                                        mmio_write(bar0, 0x800000 + (1 * 8), ctrlbind_chan_pre.0);
+                                        let rb00 = mmio_read(bar0, 0x800000 + (1 * 8));
+                                        let rb04 = mmio_read(bar0, 0x800004 + (1 * 8));
+                                        serial_println!(":: kepler: ctrlbind chan-restored 00={:08X}(want {:08X}) 04={:08X}(want {:08X}) verdict={} ::",
+                                            rb00, ctrlbind_chan_pre.0, rb04, ctrlbind_chan_pre.1,
+                                            if rb00 == ctrlbind_chan_pre.0 && rb04 == ctrlbind_chan_pre.1 { "clean" } else { "DIRTY" });
                                     }
 
                                     // Milestone 1: Method-Mirror Backing-Store Beacon Test
@@ -2439,30 +2499,30 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     let eng_trig_post = fecs_read(bar0, 0x409c08);
                                     serial_println!(":: kepler: recon eng_trig_post={:08X} ::", eng_trig_post);
 
-                                    // 2. Bind and Enable PFIFO_CHAN for channel 1
-                                    mmio_write(bar0, 0x800000 + (1 * 8), 0); 
-                                    mmio_write(bar0, 0x800004 + (1 * 8), 0x00000400); 
-                                    mmio_write(bar0, 0x800000 + (1 * 8), 0xC0000000 | ((inst_off as u32) >> 12)); 
-
-                                    let err = mmio_read(bar0, 0x252c);
-                                    let stat = mmio_read(bar0, 0x263c);
-                                    // Review C3/C4: an unnamed wedge value must print what the chip
-                                    // actually said, never the retired NO_POLL name.
-                                    let err_c = class_zero(err, "VALUE,unnamed");
-                                    let err_str = if err == 0 || err == 0xFFFFFFFF || err == 0xBAD0BA20 { "absent?" } else { "present" };
-                                    serial_println!(":: kepler: sched-status post-init err={:08X} ({}) stat={:08X} ::", err, err_str, stat);
-
-                                    if err == 0 {
-                                        serial_println!(":: kepler: H3 arm=Worked ::");
-                                    } else if err == 2 {
-                                        serial_println!(":: kepler: H3 arm=Did-not-work (STRIPPED) ::");
-                                    } else {
-                                        serial_println!(":: kepler: H3 arm=Made-it-worse ({}) ::", err_c);
-                                    }
-
-                                    let ch_1_0_pre = mmio_read(bar0, 0x800000 + (1 * 8));
-                                    let ch_1_4_pre = mmio_read(bar0, 0x800004 + (1 * 8));
-                                    serial_println!(":: kepler: PFIFO_CHAN[1] pre-submit: 00={:08X} 04={:08X} ::", ch_1_0_pre, ch_1_4_pre);
+                                    // 2. Bind and Enable PFIFO_CHAN for channel 1 — CARVED OUT 2026-09-17 into
+                                    // `try_bind_and_witness` at the tail of this file (SHUTRESTORE-CTRLADDR-BRINGUP).
+                                    // The three writes, the 0x252c/0x263c bracket, the `sched-status post-init` and
+                                    // `H3 arm=` prints, the two PFIFO_CHAN[1] reads and the `pre-submit` print moved
+                                    // there VERBATIM — same writes, same reads, same order, same strings — so the KF9
+                                    // CTRL_ADDR rung can run the IDENTICAL bringup once per TARGET encoding, which is
+                                    // the apparatus s13 had and the restored audit does not. `init` calls it EXACTLY
+                                    // WHERE THAT BLOCK SAT: nothing runs before or after it that did not before, and
+                                    // the seam is `#[inline(always)]`, so this site's armed codegen is the one it had.
+                                    // THE SEAM DOES NOT RESTORE PFIFO_CHAN[1] and must not: for `init` the bound
+                                    // channel IS the product — the witness check, the POLL-CONTROL leg and the runlist
+                                    // submit below all read the channel this left bound. The RE-ENTERING caller owns
+                                    // that restore; the KF9 rung captures both words and puts them back, read back.
+                                    // Its full re-entrancy audit — statics, allocation, every register it leaves set —
+                                    // is at the seam itself; the short version is that it touches no state but those
+                                    // two PFIFO_CHAN[1] words and reaches no `fecs_*` accounting.
+                                    // ⚠ LINE-NEUTRAL: this replacement is exactly as many lines (24) as the block it
+                                    // replaces, so not one `panic::Location` below this point moved and the knob-off
+                                    // image is measurable against the parent with no line-shift confound in it
+                                    // (`./arroyo knoboff nvidia-kepler-ctrlbind` / `… nvidia-kepler-ctrladdr`).
+                                    let bind_witness = try_bind_and_witness(bar0, inst_off);
+                                    // `ch_1_0_pre` keeps its name — the USERD_SNOOP restore and the witness check
+                                    // below read it, and renaming would be churn in code this change does not touch.
+                                    let ch_1_0_pre = bind_witness.chan00;
 
                                     // SHUTRESTORE (R19) — KF6 USERD_SNOOP's second half, restored verbatim from
                                     // 7124e4e1: the rung leaves 0x2a1c ARMED when the channel witness holds, and puts
@@ -4073,3 +4133,133 @@ pub unsafe fn mmio_write(base: usize, offset: usize, val: u32) {
 // included — strictly more than the old tests sampled — and const evaluation
 // IS performed by the gate. A test that cannot run is a comment that lies
 // about being a test, so it is gone rather than repaired.
+
+// ══ SHUTRESTORE-CTRLADDR-BRINGUP (R19) — the seam KF9's per-TARGET re-run needs ══════════════
+//
+// WHAT THIS IS. `kepler::init` binds channel 1 ONCE, and the s13 original of the KF9 CTRL_ADDR
+// audit (`3620c7d5`, deleted by `51b98bab`) re-ran the WHOLE channel bringup inside its
+// `for target in 0..4` loop, so each of the twelve TARGET encodings got its own validation
+// attempt. The audit is restored (`nvidia-kepler-ctrladdr`, 2026-09-15); its APPARATUS was not,
+// because the surrounding code no longer exists in that shape. This is that apparatus: the bind
+// and its witness, carved out of `init` between the PBDMA bind and the `PFIFO_CHAN[1] pre-submit`
+// read, moved here VERBATIM — same writes, same reads, same order, same four strings — and called
+// once by `init` exactly where the block sat. Nothing about an unarmed boot changes: the seam has
+// one caller (`init`) unless `nvidia-kepler-ctrlbind` is armed, and `#[inline(always)]` puts the
+// body back at that call site.
+//
+// WHY THE AUDIT COULD NOT ANSWER ITS OWN QUESTION WITHOUT IT. The restored rung answers "is
+// CTRL_ADDR[1:0] writable" — 12/12 yes at s13 — and not "does any TARGET encoding change the
+// strip", which is what s13 was flown to ask. The strip is only observable through a bind, and
+// there was no bind to run.
+//
+// RE-ENTRANCY AUDIT (the seam MUST NOT assume it runs once — it runs thirteen times on a CTRLBIND
+// boot). Enumerated rather than asserted:
+//   * statics / once-cells / `static mut`: NONE. The seam calls `mmio_read`/`mmio_write`, which are
+//     bare `read_volatile`/`write_volatile` with no state, and deliberately NOT `fecs_read`/
+//     `fecs_write`, whose `FECS_ACCESS_COUNT`/`FECS_FIRST_OFFSET`/`FECS_504_*` accounting a
+//     re-entry WOULD corrupt (the first-offset cell and the access index are both once-semantics).
+//     The block this was carved from used `mmio_*` already, so that is a property of the original,
+//     not a concession made here.
+//   * allocation: none. No `vram_allocator`, no heap, no `&mut` to anything outside.
+//   * registers READ: 0x252c (PFIFO error), 0x263c (sched status) — reads leave no residue.
+//   * registers WRITTEN, i.e. the residue: PFIFO_CHAN[1] at BAR0 0x800000 + 1*8 and 0x800004 + 1*8.
+//     The seam DOES NOT restore them, and that is deliberate: for `init` the bound channel IS the
+//     product, and a seam that unwound it would not be the block it replaced. The RE-ENTERING
+//     CALLER owns the restore — the KF9 rung captures both words before its first call and puts
+//     them back, read back, after its last (`:: kepler: ctrlbind chan-restored …`).
+//   * serial: `serial_println!` is called thousands of times a boot and is re-entrant; the prints
+//     are kept INSIDE the seam so that the MMIO/serial interleaving a re-entry sees is the one
+//     `init` sees. The cost is that a CTRLBIND boot carries thirteen copies of the three lines
+//     below — the LAST is `init`'s own; score the `:: kepler: ctrlbind …` rollups, never the copies.
+// ⚠ THE ARMED IMAGE MOVES, AND HERE IS THE MEASUREMENT RATHER THAN A CLAIM THAT IT DOES NOT.
+// The DEFAULT (knob-off) image does not move — `./arroyo knoboff nvidia-kepler-ctrlbind` and
+// `./arroyo knoboff nvidia-kepler-ctrladdr` both exit 0, byte-identical to 4638014e on x86 AND
+// aarch64, control fired — and that is the invariant this tree gates on. The ARMED image does:
+// built over `nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,nvidia-kepler-ctrladdr`,
+// `llvm-objcopy -O binary`, ONE directory, this file swapped for `4638014e`'s and back, the flat
+// image goes 1455360 -> 1455868 bytes and `llvm-nm --print-size` puts 414 of that inside
+// `kepler::init` itself (0xa28b -> 0xa429). Measured on the PURE EXTRACTION — baseline plus this
+// seam plus the line-neutral call site, with none of the KF9b rung in the file — so the cause is
+// the carve-out and nothing else.
+// WHY, and what was ruled out. `llvm-nm` finds NO `try_bind_and_witness` symbol in either build:
+// `#[inline(always)]` holds and there is no out-of-line copy. Two shapes were built and MEASURED
+// rather than argued: `pub` vs crate-private made no difference at all, and an 18-byte return
+// (four u32 + two bool) vs a 16-byte one (four u32, verdicts as methods) gave `kepler::init` the
+// SAME 42025 bytes both ways — so it is not external linkage and not the SysV return ABI. What is
+// left is that LLVM optimises the callee, THEN inlines it, and a 41 KB straight-line function
+// re-schedules around the result. The simplest shape is therefore the one kept.
+// WHAT IS PRESERVED, and how it was checked: the seam's body is the replaced block VERBATIM —
+// same writes, same reads, same order, same four format strings — and the MMIO sequence at the
+// site compiles to the same accesses in the same order in both images (disassembly of
+// `kepler::init` filtered to the 0x800008 / 0x80000c / 0x252c / 0x263c operands; see the CTRLBIND
+// commit body). ⚠ QEMU CANNOT ADD TO THAT: it has no Kepler, so a green `arroyo test` proves the
+// image boots, never that this path behaves — the wire proof is owed to the metal flight.
+// `allow(dead_code)` on the struct because a knob-off build reads only `chan00`.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct BindWitness {
+    /// PFIFO_CHAN[1] +0x00 as read back after the bind — the strip witness.
+    chan00: u32,
+    /// PFIFO_CHAN[1] +0x04 as read back after the bind.
+    chan04: u32,
+    /// PFIFO error (0x252c) read in the same bracket `init` reads it.
+    err: u32,
+    /// Scheduler status (0x263c), same bracket.
+    stat: u32,
+    /// `(chan00 & 0xC0000000) == 0xC0000000` — VALID|POLL_ENABLE survived the write.
+    /// The mask is the one `init`'s own witness check and the FENCE `stuck` gate use.
+    latched: bool,
+    /// The bind reached a register that answered at all (not PRI poison / absent).
+    bound: bool,
+}
+
+/// One channel-1 bind and the witness read that scores it. See the block comment above.
+#[inline(always)]
+unsafe fn try_bind_and_witness(bar0: usize, inst_off: usize) -> BindWitness {
+    unsafe {
+        // 2. Bind and Enable PFIFO_CHAN for channel 1
+        mmio_write(bar0, 0x800000 + (1 * 8), 0);
+        mmio_write(bar0, 0x800004 + (1 * 8), 0x00000400);
+        mmio_write(bar0, 0x800000 + (1 * 8), 0xC0000000 | ((inst_off as u32) >> 12));
+
+        let err = mmio_read(bar0, 0x252c);
+        let stat = mmio_read(bar0, 0x263c);
+        // Review C3/C4: an unnamed wedge value must print what the chip
+        // actually said, never the retired NO_POLL name.
+        // `class_zero` is a closure of `init` declared BELOW this seam's call site, so its body is
+        // reproduced here rather than borrowed — same four arms, same strings, same refute text.
+        let err_c = {
+            let c = classify_fecs_word(err);
+            if c == "ZERO" { "ZERO,alive" }
+            else if c == "VALUE" { "VALUE,unnamed" }
+            else if c == "POISON" { "POISON,severed" }
+            else { "ABSENT,severed" }
+        };
+        let err_str = if err == 0 || err == 0xFFFFFFFF || err == 0xBAD0BA20 { "absent?" } else { "present" };
+        serial_println!(":: kepler: sched-status post-init err={:08X} ({}) stat={:08X} ::", err, err_str, stat);
+
+        if err == 0 {
+            serial_println!(":: kepler: H3 arm=Worked ::");
+        } else if err == 2 {
+            serial_println!(":: kepler: H3 arm=Did-not-work (STRIPPED) ::");
+        } else {
+            serial_println!(":: kepler: H3 arm=Made-it-worse ({}) ::", err_c);
+        }
+
+        let chan00 = mmio_read(bar0, 0x800000 + (1 * 8));
+        let chan04 = mmio_read(bar0, 0x800004 + (1 * 8));
+        serial_println!(":: kepler: PFIFO_CHAN[1] pre-submit: 00={:08X} 04={:08X} ::", chan00, chan04);
+
+        BindWitness {
+            chan00,
+            chan04,
+            err,
+            stat,
+            latched: (chan00 & 0xC0000000) == 0xC0000000,
+            // "the bind reached a live register": PRI poison and an absent aperture are the two
+            // readings that make every other field here meaningless, and they are the same two
+            // values the rest of this file refuses a verdict on.
+            bound: chan00 != 0xFFFFFFFF && chan00 != 0xBAD0BA20,
+        }
+    }
+}
