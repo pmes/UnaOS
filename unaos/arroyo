@@ -718,6 +718,28 @@ _feats=""
 # in the image. Kept in sync with builder/src/main.rs. See
 # docs/dev/OS/06_NETWORK_STACK/bcm4331.md.
 [ -n "${UNAOS_WIFI3:-}" ] && _feats="${_feats}wifi3,"
+# WIFI-4: UNAOS_WIFI4=1 arms arc 4's PHY/RADIO rung — bcm4331.md §S5 sub-stages (a) the radio
+# identity register and (b) the PHY's post-upload liveness (`phy_once` in
+# crates/kernel/src/wifi/bringup.rs). ONE device write, and it is an indirect-window SELECTOR on the
+# read path: d11+0x3F6, the radio-register ADDRESS port that both spec generations pin
+# ([SPEC-V3 RadioRegister], [SPEC-V4 802.11/Radio/Registers]), pre-image captured and restored. The
+# radio DATA ports 0x3F8/0x3FA are never written, so no radio-silicon register is set even if the
+# selector were wrong — the same asymmetry that made S4a's SHM_CONTROL probe safe. NOT destructive,
+# unlike UNAOS_WIFI3: nothing is reset, no microcode is displaced, and the rung is GATED on the same
+# boot's wifi3 verdict — without a `-> UPLOADED` line this boot it prints
+# `:: wifi4: REFUSED reason=wifi3-upload-not-proven ::` and touches nothing. So `UNAOS_WIFI4=1` is
+# only ever flown ALONGSIDE `UNAOS_WIFI3=1`, and on a boot where the upload succeeds it costs one
+# more rung with no extra risk class. (b)'s reset SEQUENCE, (c) the 2.4 GHz channel tune and (d) the
+# RX chain are REFUSED by name, not skipped: the AI-wrapper PHY-reset bit position and the
+# HT-PHY/2059 channel tables appear in NEITHER spec generation (bcm-specs.sipsolutions.net /
+# bcm-v4.sipsolutions.net) and this module does not guess a register value. QEMU models no BCM4331
+# (the census refuses at S_START), so the rung is UNREACHABLE in QEMU and the QEMU gate for this
+# feature is compile + artifact strings only. IMPLIES `wifi3` (the Cargo implication pulls
+# wifi3+wifi2+wifi in; pushed alone for the same duplicate-token reason wifi2/wifival/wifi3 are).
+# x86_64-only and stripped by arm_features below. Default OFF => not one byte of the PHY rung in the
+# image. Kept in sync with builder/src/main.rs. See
+# docs/dev/OS/06_NETWORK_STACK/bcm4331.md §S5.
+[ -n "${UNAOS_WIFI4:-}" ] && _feats="${_feats}wifi4,"
 # VPERF M2: the fbcon viewport-cap bench lever (implies videobench). x86_64 only.
 [ -n "${UNAOS_VIDEOCAP:-}" ] && _feats="${_feats}videocap,"
 
@@ -2596,6 +2618,16 @@ arm_features() {
     # `,wifi3,` does not contain `,wifi,` or `,wifi2,` as a substring, because the trailing
     # comma is part of every pattern.
     f="${f//,wifi3,/,}"
+    # WIFI-4 rides the same strip, for the same reason and as a consequence of the same fact:
+    # `wifi4` implies `wifi3`, whose only code is the x86-gated `src/wifi/`, and `phy_once` is a
+    # sibling function inside `bringup.rs` under that same gate — so `wifi4` emits not one byte of
+    # aarch64 CODE. An enabled feature is still hashed into cargo's `-Cmetadata` fingerprint, so
+    # leaving it in (or its implied `wifi3`/`wifi2`/`wifi`, all stripped above) would shift every
+    # Pi/Jetson media hash between a default build and a `UNAOS_WIFI4=1` one for zero observable
+    # change. Order-independent with the strips above by their own argument: `,wifi4,` does not
+    # contain `,wifi,`, `,wifi2,` or `,wifi3,` as a substring, because the trailing comma is part of
+    # every pattern.
+    f="${f//,wifi4,/,}"
     # BT-L0 (GR21) rides the same strip, for the same reason and by the same mechanism as `kbdwit`
     # above: every line `bt` gates lives in `drivers/ehci/mod.rs`, which is declared
     # `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`, so `bt` emits not one byte of
@@ -4632,7 +4664,7 @@ KERNEL_CFG_MATRIX=(
   # configuration — this leg is the only place in the build that type-checks it, because x86-all
   # already carries `beam`. Drop either name from this list and the bracket half of the rung is
   # compiled by nothing.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the

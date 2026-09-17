@@ -368,6 +368,19 @@ fn main() {
     // operator believed the upload was armed. Default OFF => module unlinked, media
     // byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WIFI3").is_ok() { feats.push("wifi3"); }
+    // WIFI-4: UNAOS_WIFI4=1 arms arc 4's PHY/RADIO rung — bcm4331.md §S5(a) the radio identity
+    // register and §S5(b) the PHY's post-upload liveness (`phy_once` in src/wifi/bringup.rs). ONE
+    // device write, an indirect-window SELECTOR on the read path (d11+0x3F6, the radio-register
+    // address port both spec generations pin), pre-image restored; the radio DATA ports are never
+    // written. Not destructive, and GATED on the same boot's wifi3 `-> UPLOADED` verdict — without
+    // it the rung refuses on the wire and touches nothing. Implies `wifi3`. THIS list is what
+    // reaches the kernel binary for MEDIA builds — the builder re-derives the x86 feature set from
+    // ITS OWN env — so a knob wired into arroyo alone would ship the rung DISABLED while the banner
+    // claims it is on (the s42/INSTGUI and WXN-M3b failure), and here that shape has its own sting:
+    // the operator would fly the DESTRUCTIVE wifi3 boot believing it also bought the §S5 rung, and
+    // the absence of `:: wifi4:` lines is indistinguishable from a radio that never answered.
+    // Default OFF => rung unlinked, media byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_WIFI4").is_ok() { feats.push("wifi4"); }
     // BT-L0 (GR21): UNAOS_BT=1 arms the first Bluetooth arc — "does the radio answer?". Lifts the
     // EHCI hub-walk depth cap 2 -> 3 to reach the HCI controller behind the FULL-SPEED Broadcom hub
     // `0a5c:4500`, and — in the SAME change, because either alone is wrong — fixes the

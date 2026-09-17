@@ -598,6 +598,30 @@ wifival = ["wifi2"]
 # Default OFF => byte-identical media. Enable via `UNAOS_WIFI3=1`. Kept in sync with arroyo
 # and builder/src/main.rs. See docs/dev/OS/06_NETWORK_STACK/bcm4331.md.
 wifi3 = ["wifi2"]
+# WIFI-4: arc 4's PHY/RADIO rung — `bcm4331.md` §S5 sub-stages (a) "radio powered and its ID
+# register reading the expected id" and (b) "the PHY reset sequence completing without the MAC
+# hanging" (`phy_once` in `src/wifi/bringup.rs`). (a) is BUILT: one write to the radio-register
+# ADDRESS port (d11+0x3F6 — an indirect-window selector on the read path, the same class as S4a's
+# SHM_CONTROL; the radio DATA ports 0x3F8/0x3FA are never written, so no radio-silicon register is
+# set even if the selector were wrong), then radio register 0x01 read in BOTH orders the two spec
+# generations disagree about, with a gated verdict on the one identity field they both pin
+# (manufacturer 0x17F). The addressing is legal on an HT-PHY only because [SPEC-V3 RadioRegister]
+# exempts offset 1 from the per-PHY-type adjustment table — which lists no rule for PHY type 7 —
+# and that is why the rung reads ONE register and stops. (b)'s read-back predicate is BUILT
+# (PHY_VER/IOCTL/RESET_CTL/MACCTL re-read on the far side of wifi3's destructive reset); (b)'s
+# reset SEQUENCE, (c) the channel tune and (d) the RX chain each print a REFUSED line naming the
+# missing citation — the AI-wrapper PHY-reset bit position and the HT-PHY/2059 channel tables exist
+# in NEITHER spec generation and are not guessed. GATED, on the wire, on the SAME boot's wifi3
+# verdict: without a `-> UPLOADED` line this rung prints
+# `REFUSED reason=wifi3-upload-not-proven` and touches nothing — the shared-address-latch argument
+# its one write rests on assumes a running PSM, and an identity read across a half-finished upload
+# would be a reading of an undefined core reported as if it meant something. QEMU models no
+# BCM4331, so this code is unreachable there (the census refuses at S_START) and the QEMU gate for
+# this feature is compile + artifact strings only; its first armed boot is metal and follows
+# wifi3's. IMPLIES `wifi3` (and through it `wifi2`/`wifi`). x86_64-only and stripped by arroyo's
+# arm_features. Default OFF => byte-identical media. Enable via `UNAOS_WIFI4=1`. Kept in sync with
+# arroyo and builder/src/main.rs. See docs/dev/OS/06_NETWORK_STACK/bcm4331.md §S5.
+wifi4 = ["wifi3"]
 # VPERF video-path bench instrumentation (x86_64 only — the module is additionally target-gated,
 # so aarch64 artifacts are byte-identical with this on or off): scroll/VRAM-read/put_pixel
 # counters + serial-only cadence lines, the effective framebuffer memory-type readout (MTRR +
