@@ -1385,6 +1385,18 @@ pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
 
     let Some(found) = s.root else { return };
     bind_root(mt, found.source, unafs_state(found.source), announce); #[cfg(feature = "sdwritefx")] sdwrite_fixture(mt, found.source); // SDWRITE (A60): the metal fixture, armed by UNAOS_SDWRITE=1, on the root this call just bound.
+    // CARDROOT (B123): `/volumes/data`, and it hangs HERE rather than inside [`bind_root`] for a
+    // reason leg 6 states in its own words. `unafsroot_selftest` drives `bind_root` FOUR times at
+    // HEAP-UP with a scratch table, on the premise that it is "table shape ONLY … touch no disk
+    // until resolved for I/O" and that "a fixture that runs AHEAD of the walk must not be the first
+    // thing to touch the card". [`bind_data`] asks the MEDIUM whether `DATA/` exists, so calling it
+    // from `bind_root` would break both halves of that: it would touch the card before the walk, and
+    // it would latch its answer from a `Default` source at a moment when no disk has enumerated —
+    // `DATA_PRESENT` would read `absent` for the whole boot and the mount would never appear. A data
+    // directory is a fact about the disk, which is what `bind` is about; the ROOT LAYOUT is what
+    // `bind_root` is about. It also puts this mount after the home-soil loop above, which is what
+    // lets its guard see a real card that already claimed the point.
+    bind_data(mt, found.source, announce);
 }
 
 /// UNAFSROOT (orin 24): the ROOT DISK's three mounts, as a function of ONE fact — the
@@ -1485,6 +1497,93 @@ pub(crate) fn bind_root(
             "[vfs] apps mount /apps = fat boot volume source={} rooted={} ::",
             src.name(),
             crate::fs::fat::APPS_DIR
+        );
+    }
+}
+
+/// CARDROOT (rmbp-ledger B123): the DATA SET, when the boot volume carries it as a DIRECTORY.
+///
+/// # The question this answers
+///
+/// On a TWO-DEVICE boot the data set is its own medium and the operator reaches it at
+/// `/volumes/<the stick's label>` (HOMESOIL, §"The other disks"). On a ONE-MEDIUM boot — the rMBP,
+/// which boots from one SD card with one partition — there is no second medium to mount, so
+/// `arroyo esp-x86`'s two trees (`target/x86_64_esp/` and `target/x86_64_data/`) are written to the
+/// SAME FAT root and the data set lands beside the ESP's own files. `/` is that FAT root whenever the
+/// disk carries no native volume, so every data file is an entry of `/`. Flight 10 (2026-09-17)
+/// measured 21 entries there, 13 of them the data tree's.
+///
+/// **This is the ONE kernel-side rule that the tree already supports**, and it is deliberately the
+/// small half: a boot volume that carries a `DATA/` DIRECTORY gets that directory mounted where the
+/// two-device boot puts the data VOLUME, so ONE namespace answers for both card layouts and the
+/// operator types the same path either way. It is the exact shape [`bind_root`] already uses for
+/// `/apps` — the same volume, rooted at a directory, under the SAME volume NAME `boot`, so
+/// `same_volume("/boot", "/volumes/data")` stays true about one card.
+///
+/// What it does NOT do, stated here because the absence is the load-bearing part: it does not, and
+/// cannot, empty `/`. Most of the data set is PINNED to the volume root by two contracts that live
+/// outside this file — EL0's `sys_open`, whose namespace is a flat 8.3 volume root with no directory
+/// component (`docs/dev/OS/09_FILESYSTEM/layout.md` §2.1 group 3, §5.2), and the wifi firmware
+/// loader, which reads `SEARCH_DIRS` (`/`, `/B43/`, `/FIRMWARE/`) off the FAT volume root directly
+/// (`wifi/firmware.rs:152`). Moving those is a syscall-ABI change and a firmware-search change, not
+/// a layout change. §2.1 of that document is the census.
+///
+/// # Cost, and why it is a latch
+///
+/// The mount table is rebuilt PER VERB, and probing the medium for a directory would put a FAT mount
+/// and a root-directory walk under every single verb — the cost §5.1 of the layout document already
+/// measured shifting the x86 window-manager battery into two different fixture flakes. The boot
+/// volume does not grow a `DATA/` directory mid-boot, so the answer is asked ONCE and latched.
+/// `0` = not yet asked, `1` = present, `2` = absent.
+static DATA_PRESENT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// CARDROOT: the on-medium spelling of the data directory. 8.3 by construction, like
+/// [`crate::fs::fat::APPS_DIR`], and every FAT lookup here is case-insensitive, so `data`, `Data` and
+/// `DATA` on the card all reach it.
+pub const DATA_DIR: &str = "DATA";
+
+/// CARDROOT: where it is presented. `/volumes/<NAME>` is where a NON-ROOT medium's volume hangs, and
+/// that is the point: on a two-stick machine the data set is at `/volumes/<label>`, so a one-card
+/// machine putting it anywhere else would make the same files answer to two different paths
+/// depending on how many devices happen to be plugged in.
+pub const DATA_POINT: &str = "/volumes/data";
+
+/// CARDROOT: mount `DATA/` at [`DATA_POINT`] when the boot volume has one. See [`DATA_PRESENT`].
+fn bind_data(mt: &mut crate::fs::vfs::MountTable, src: BlockSource, announce: bool) {
+    use crate::fs::vfs::{FatBackend, KERNEL_PRINCIPAL, NodeKind};
+    // A REAL disk whose label sanitizes to `data` was mounted at this point by [`bind`] already, and
+    // it outranks a directory: `MountTable::mount` REPLACES a prefix rather than refusing it, so
+    // without this the card's directory would silently evict a card the operator is holding. The
+    // directory is still reachable at `/boot/data` in that case, and nothing is lost silently.
+    if mt.prefixes().iter().any(|p| *p == DATA_POINT) {
+        return;
+    }
+    let mut state = DATA_PRESENT.load(core::sync::atomic::Ordering::Relaxed);
+    if state == 0 {
+        // Asked through the table, on `/boot`, which this function's caller bound two statements
+        // ago — so the probe uses the mount the rest of the layout uses and cannot disagree with it.
+        state = match mt.stat("/boot/data") {
+            Ok(st) if matches!(st.kind, NodeKind::Dir) => 1,
+            _ => 2,
+        };
+        DATA_PRESENT.store(state, core::sync::atomic::Ordering::Relaxed);
+    }
+    if state != 1 {
+        return;
+    }
+    let be = FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src).rooted(DATA_DIR);
+    // ONE sample, from the backend being mounted — the §1.5 posture rule, not a second derivation.
+    let rw = !be.read_only();
+    mt.mount(DATA_POINT, alloc::boxed::Box::new(be));
+    if announce {
+        // `/volumes/data` is spelled as a LITERAL in the format string for the reason the
+        // `/volumes/{}` witness in [`bind`] states: an artifact census (`LC_ALL=C grep -a -o -F`)
+        // must be able to find the sentence it certifies.
+        serial_println!(
+            "[vfs] data mount /volumes/data = fat boot volume source={} rooted={} rw={} ::",
+            src.name(),
+            DATA_DIR,
+            if rw { "yes" } else { "no" }
         );
     }
 }
