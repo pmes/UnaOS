@@ -30,8 +30,8 @@ source follow the tree's convention:
 | `[QEMU]` | a fact about the emulated fixture |
 | `[METAL]` | a fact measured on the bench rMBP |
 
-There is no `[METAL]` tag in the file yet. **Arc 1 is built and unflown**; §7 is what the first
-metal boot has to show.
+There is no `[METAL]` tag in the file yet. **Arc 1 and arc 2 are built and unflown**; §7 is what the
+first metal boot has to show.
 
 ---
 
@@ -44,7 +44,7 @@ metal boot has to show.
 | 1c reset | `UNAOS_HDA=1` | `GCTL.CRST` cycles and `STATESTS` names the codecs | built |
 | 1d CORB/RIRB | `UNAOS_HDA=1` | the command ring round-trips — `GET_PARAMETER VENDOR_ID` answers | built |
 | 1e walk | `UNAOS_HDA=1` | every widget, its connections, and the derived output path | built |
-| 2 tone | `UNAOS_HDATONE=1` | a stream runs: LPIB advances and BCIS latches | **the second commit of this series** |
+| 2 tone | `UNAOS_HDATONE=1` | a stream runs: LPIB advances and BCIS latches | built |
 | 3a mixer seam | — | a volume/mute surface userspace can reach | **owed** |
 | 3b Pi twin | — | BCM2711 HDMI / PWM audio, the other half of ROADMAP §6's row | **owed** |
 
@@ -227,9 +227,6 @@ and `mbench`'s `DEFAULT_FORBIDS`.
 
 ## 3. Arc 2 — the tone
 
-> ⚠ **Arc 2 lands in the SECOND commit of this series.** This section describes what that commit
-> builds; at this commit `drivers/hda.rs` ends at its arc-2 banner and writes no stream register.
-
 `UNAOS_HDATONE=1`. **This is the one knob in the tree that makes an audible noise in the room**,
 which is why it is its own feature and not part of `hda`: a boot that did not ask for a tone must be
 structurally incapable of emitting one. That is the construction `btc` uses for the Bluetooth page,
@@ -286,18 +283,37 @@ tone programmed without it is a tone nobody hears.
 
 ```
 [hda] tone stream=0 lpib=<start> -> <end> (max <n>) bcis=<n> fifo_ready=<0|1> run_ms=<n> \
-      sts=<hex> fifoe=<0|1> dese=<0|1> cbl=<n> tag=<n>
-:: HDA-TONE: lpib_advanced=<0|1> bcis=<n> fifo_ready=<0|1> run_ms=<n> -> PASS|FAIL ::
+      sts=<hex> fifoe=<0|1> dese=<0|1> cbl=<n> tag=<n> tag_bound=<hex> tag_ok=<0|1>
+:: HDA-TONE: lpib_advanced=<0|1> bcis=<n> tag_ok=<0|1> fifo_ready=<0|1> run_ms=<n> -> PASS|FAIL ::
 ```
 
-The claim is "the stream ran", and it has **two independent witnesses**: the link position advanced
-(the controller fetched and consumed sample data) and a buffer boundary latched `BCIS` (the BDL was
-walked to the end of at least one descriptor). Either alone is weaker than both — LPIB can be read
-mid-fetch on a stream that stalls immediately after, and a stale `BCIS` is impossible because the bit
-is cleared above before `RUN`. `FIFOE` or `DESE` set at the end fails the verdict outright.
+The claim is "the stream ran", and it has **three witnesses, of two different kinds**.
 
-`BCIS` latches because `IOCE` is set in `SDnCTL`; it reaches no CPU because `INTCTL` stays 0. It is a
-polled flag, and the file says so at the top.
+**Controller side.** The link position advanced (the engine fetched and consumed sample data) and a
+buffer boundary latched `BCIS` (the BDL was walked to the end of at least one descriptor). Either
+alone is weaker than both: LPIB can be read mid-fetch on a stream that stalls immediately after, and
+a stale `BCIS` is impossible because the bit is cleared before `RUN`. `FIFOE` or `DESE` set at the
+end fails the verdict outright. `BCIS` latches because `IOCE` is set in `SDnCTL`; it reaches no CPU
+because `INTCTL` stays 0.
+
+**Link side — and it exists because the controller-side pair was measured to be blind to it.** The
+first version of this arc scored only LPIB and BCIS, and the go-red the brief named (stream tag 0,
+the "unused" tag no link ever carries) **did not fail it**:
+
+```
+[hda] tone stream=0 lpib=0 -> 44160 (max 191960) bcis=2 fifo_ready=1 run_ms=1200 ... tag=0
+:: HDA-TONE: lpib_advanced=1 bcis=2 fifo_ready=1 run_ms=1200 -> PASS ::
+```
+
+That is an honest reading of what those two witnesses see: **the stream engine ran**. They live on
+the controller and say nothing about whether the link carries the samples to a converter. So the
+binding is now checked where it *is* observable — the converter is asked, with
+`GET_CONVERTER_STREAM_CHANNEL`, what it was bound to, and `tag_ok` folds that readback plus
+`tag != 0` into the verdict. It is a programming invariant read at the wire, not a restatement of
+the write.
+
+**What none of the three can see is the room.** A `PASS` with silence from the speakers is a real
+finding on metal and names the next rung; §7 says so.
 
 ### 3.5 Refusal and restore
 
@@ -387,14 +403,19 @@ UNAOS_HDA=1 ./arroyo test 60
 UNAOS_HDA=1 UNAOS_HDATONE=1 ./arroyo test 60
 ```
 
-### Go-red by mutation
+### Go-red by mutation — one per clause of the verdict, each measured
 
-The arc's falsifier is **the stream tag**, and it is the mutation the DONE gate ran: set
-`STREAM_TAG` to 0 in `drivers/hda.rs` and rebuild. A stream tagged 0 is one the link never carries,
-so the fixture's `[hda] tone` line reads a **stuck LPIB and `bcis=0`**, and `:: HDA-TONE: … -> FAIL ::`
-reds the leg through `arroyo`'s FAULT-SCAN list. Reverting restores the pass. The other available
-mutation is the **format** — any `SDnFMT` the codec does not support — which fails the same way
-through a different mechanism.
+| mutation | verdict line measured | leg |
+| :--- | :--- | :--- |
+| `SDnCBL` written 0 (the cyclic buffer is empty, so the engine has nothing to walk) | `lpib_advanced=0 bcis=0 tag_ok=1 → FAIL` | rc 1 |
+| `STREAM_TAG` = 0 (the "unused" tag; the link never carries it) | `lpib_advanced=1 bcis=2 tag_ok=0 → FAIL` | rc 1 |
+| *(the same tag mutation, against the FIRST version of the verdict)* | `lpib_advanced=1 bcis=2 → PASS` — **did not go red** | rc 0 |
+
+Both live mutations red the leg through `arroyo`'s FAULT-SCAN list and `mbench`'s
+`DEFAULT_FORBIDS`; reverting each restores the pass. The third row is kept deliberately: it is the
+measurement that produced the `tag_ok` clause, and deleting it would leave a reader unable to tell
+why the verdict has three terms instead of two (LAWS §5 — record the defended near-miss as a
+counter-example).
 
 ### Byte identity
 
@@ -415,6 +436,58 @@ Both knobs are `./arroyo knoboff hda` / `./arroyo knoboff hda-tone`, exit 0 (byt
 
 ---
 
+## 6a. The QEMU codec's walk, as measured
+
+`UNAOS_HDA=1 UNAOS_HDATONE=1 UNAOS_QEMU_FULL=1 ./arroyo test 120`, rc 0, MBENCH 6/6 required
+witnesses and 0 forbidden hits over 1754 lines, full wall 120.3 s (`mode=full`, `completion_at=-`,
+from the capture's own `.run` sidecar). This is the whole `[hda]` wire of that boot, taken at the
+tip of this series:
+
+```
+[hda] census bdf=0:3.0 id=8086:2668 class=04 sub=03 progif=00 (hd-audio) bar0=0x810c4000 irq=11
+[hda] map bdf 0:3.0 bar0=0x810c4000 len=0x2000 uncacheable
+[hda] gcap=0x4401 oss=4 iss=4 bss=0 nsdo=0 64ok=1 version=1.0
+[hda] reset crst=1 statests=0x0001 codecs=[0]
+[hda] rings corb=0x178ab00 rirb=0x178d700 entries=256/256 corbctl=0x02 rirbctl=0x03 rintcnt=1 intctl=0x00000000(untouched)
+[hda] ring-state after-first-verb corbwp=0x0001 corbrp=0x0001 rirbwp=0x0001 rirbsts=0x01->0x00 corbctl=0x02 rirbctl=0x03 rintcnt=0x0001
+[hda] codec=0 vid=1af4:0022 rev=0x00100101
+[hda] codec=0 fg=0x01 type=0x01 (audio)
+[hda] node=0x02 type=audio-out conns=[] caps=0x0000001d out-amp=1 in-amp=0 amp-override=1 power-ctl=0 digital=0 pincfg=-
+[hda] node=0x03 type=pin conns=[2] pincap=0x00000010 out=1 hp=0 eapd=0 pincfg=0x00004010 (dev=line-out loc=external conn=unknown colour=green portconn=0 assoc=1 seq=0)
+[hda] node=0x04 type=audio-in conns=[5] caps=0x0010011b out-amp=0 in-amp=1 amp-override=1 power-ctl=0 digital=0 pincfg=-
+[hda] node=0x05 type=pin conns=[] pincap=0x00000020 out=0 hp=0 eapd=0 pincfg=0x00805020 (dev=line-in loc=external conn=unknown colour=red portconn=0 assoc=2 seq=0)
+[hda] path codec=0 dac=0x02 -> [3, 2] -> pin=0x03 dev=line-out hops=2
+[hda] walk codecs=1 nodes=4 dacs=1 pins=2 speaker_pin=none hp_pin=none path=found
+[hda] audit stage=walk wrote-cfg=0 wrote-ctrl=56 wrote-stream=0 verbs-get=17 verbs-set=1 wrote-intctl=0(audited) wrote-wallclk=0(audited) wrote-dplbase=0(audited)
+:: HDA: codecs=1 nodes=4 dacs=1 pins=2 path=found -> PASS ::
+[hda] tone arm sd=0 (iss=4 => descriptor 4) fmt=0x0011(readback 0x0011) cbl=192000(readback 192000) lvi=1 bdl=0x178af00 pcm=0x1794800 bytes=192000 tag=1 srst=1/1 ctl=0x00100004
+[hda] tone stream=0 lpib=0 -> 44356 (max 191964) bcis=2 fifo_ready=1 run_ms=1200 sts=0x20 fifoe=0 dese=0 cbl=192000 tag=1 tag_bound=0x10 tag_ok=1
+:: HDA-TONE: lpib_advanced=1 bcis=2 tag_ok=1 fifo_ready=1 run_ms=1200 -> PASS ::
+[hda] audit stage=tone wrote-cfg=0 wrote-ctrl=84 wrote-stream=24 verbs-get=23 verbs-set=9 wrote-intctl=0(audited) wrote-wallclk=0(audited) wrote-dplbase=0(audited)
+[hda] audit stage=end wrote-cfg=0 wrote-ctrl=86 wrote-stream=24 verbs-get=23 verbs-set=9 wrote-intctl=0(audited) wrote-wallclk=0(audited) wrote-dplbase=0(audited)
+```
+
+What is worth reading off it, because it is what the metal boot will be compared against:
+
+- **`oss=4 iss=4`**, so output stream 0's descriptor is number 4, at `0x80 + 4 × 0x20`. The arm line
+  prints the arithmetic (`sd=0 (iss=4 => descriptor 4)`) rather than leaving a reader to do it.
+- **`vid=1af4:0022`** — the QEMU codec, and the only codec id this project has ever read. The rMBP's
+  is still unread; §7.
+- **Four widgets, two pins**, and `speaker_pin=none`: this codec has a line-out and a line-in and no
+  speaker at all, which is why §2.6's rank is over output devices rather than a speaker-only match.
+  **The metal boot is the first time the speaker rank is exercised on anything.**
+- **`wrote-cfg=0`** — the fixture's firmware had already set memory decode and bus master, so the
+  claim needed no config write at all on this machine. On the rMBP this may read 1.
+- **The LPIB values are not reproducible to the byte and must not be pinned in a spec.** 1200 ms of
+  a 1000 ms cyclic buffer wraps once and lands wherever the host's scheduling put it: three runs of
+  this same tip read `44160`, `44180` and `44356`. What is stable, and what the verdict is computed
+  from, is that it MOVED and that `bcis` reached 2.
+- **`[hda] node=0x03 … conns=[2]`** — the connection list is one entry, so the derived path is the
+  shortest one that exists (`dac=0x02 -> pin=0x03`, two hops) and neither the mixer nor the selector
+  branch of the path programming is exercised here. Those are metal-first by construction.
+
+---
+
 ## 7. The metal expectation
 
 The bench machine is a 2012 15" Retina MacBook Pro, MacBookPro10,1, Intel 7-series (Panther Point)
@@ -429,7 +502,7 @@ PCH. **Expected, not assumed** — the census prints what is there:
 | codec count | 1 | `[hda] reset … codecs=[…]` |
 | internal speaker pin | `dev=speaker loc=internal`, EAPD-capable | `[hda] node=…` and `speaker_pin=` |
 | headphone pin | `dev=hp-out loc=external` | `hp_pin=` |
-| the tone | `lpib` advancing, `bcis` ≥ 2 at one second, and **Peter hears 440 Hz from the internal speakers** | `[hda] tone` plus the room |
+| the tone | `lpib` advancing, `bcis` ≥ 2, `tag_ok=1`, and **Peter hears 440 Hz from the internal speakers** | `[hda] tone` plus the room |
 
 The codec's vendor/device id is the one line of §7 nobody in this tree has ever read. A discrete
 GPU's HDMI audio function may also appear in the census on this machine — the GK107 has one — which

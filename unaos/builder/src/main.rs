@@ -305,6 +305,16 @@ fn main() {
     // Default OFF => module unlinked, census and hook cfg-erased, media byte-identical.
     // Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
     if std::env::var("UNAOS_HDA").is_ok() { feats.push("hda"); }
+    // HDATONE (rmbp-ledger B127, arc 2): UNAOS_HDATONE=1 arms the output stream — a 440 Hz sine on
+    // output stream 0. `hda-tone` implies `hda` in Cargo.toml, so this push alone is sufficient;
+    // the flight lines still name both env knobs because a reader should see both on a line that
+    // makes an audible noise. THIS list is what reaches the kernel binary for MEDIA builds, so a
+    // knob wired into arroyo alone would put `hda-tone` in the banner over a kernel with the whole
+    // tone block compiled OUT — and for this arc that failure reads on the wire as a codec that
+    // would not start, which is the opposite conclusion from the true one.
+    // Default OFF => the tone block, the sine generator and every stream write unlinked, media
+    // byte-identical. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
+    if std::env::var("UNAOS_HDATONE").is_ok() { feats.push("hda-tone"); }
     // BCMA-RECON (GR20): UNAOS_BCMARECON=1 arms drivers/bcma.rs — STRICTLY READ-ONLY recon of the
     // Broadcom WiFi radio (class 0x02 / subclass 0x80), the first arc of the native-BCM4331 path.
     // THIS list is what reaches the kernel binary for MEDIA builds: the builder re-derives the x86
@@ -1233,7 +1243,8 @@ fn main() {
     // `intel-hda` controller with one `hda-duplex` codec on it and a NULL audio backend. This is
     // the one driver in this arc's neighbourhood that has a real emulator — unlike the BCM4331
     // radio or the Apple SMC, whose arcs are metal-first by construction — so the walk and the
-    // walk is gateable here rather than metal-first.
+    // stream are both gateable here, and the go-red mutation (wrong format, or stream tag 0) is a
+    // measured leg rather than a reading of the source.
     //   `-audiodev none,id=snd0` is a real backend that consumes samples and produces silence, so
     // the stream engine runs, LPIB advances and BCIS latches with nothing reaching the host's
     // sound card. `audiodev=` is a REQUIRED property of the codec device on the QEMU this tree
@@ -1244,7 +1255,7 @@ fn main() {
     // device, so the fixture and the driver can never disagree about whether this run has a
     // controller in it. UNSET => not one argument is added and a default run's QEMU command line
     // is byte-identical to what it was before this arc.
-    if std::env::var("UNAOS_HDA").is_ok() {
+    if std::env::var("UNAOS_HDA").is_ok() || std::env::var("UNAOS_HDATONE").is_ok() {
         cmd.arg("-device").arg("intel-hda,id=hda0")
            .arg("-device").arg("hda-duplex,bus=hda0.0,audiodev=snd0")
            .arg("-audiodev").arg("none,id=snd0");

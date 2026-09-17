@@ -2390,6 +2390,30 @@ fi
 # disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson), and for this
 # driver a silent no-op is indistinguishable on the wire from a machine with no audio device in it.
 [ -n "${UNAOS_HDA:-}" ] && _feats="${_feats}hda,"
+# HDATONE (rmbp-ledger B127, arc 2): UNAOS_HDATONE=1 arms the OUTPUT STREAM — a 16-bit stereo 48 kHz
+# sine (440 Hz, one second, about -18 dBFS) on output stream 0. Implies `hda` (Cargo.toml declares
+# `hda-tone = ["hda"]`), so this knob alone is sufficient; pairing it with UNAOS_HDA is harmless and
+# is how the flight line below spells it, because a reader should see both names on a line that can
+# make a noise in the room.
+#
+# ⚠ THIS IS THE ONLY KNOB IN THIS FILE THAT PRODUCES AUDIBLE SOUND. It is its own knob, and NOT
+# part of UNAOS_HDA, for the reason UNAOS_BTC is not part of UNAOS_BT: a boot that did not ask for a
+# tone must be structurally incapable of emitting one. Amplitude is low by construction and the run
+# is bounded at 1200 ms, after which the stream is stopped and every register the run changed is
+# written back.
+#
+# THE PROOF IS WITHOUT EARS, which is what makes this gateable in QEMU at all: LPIB advancing plus
+# at least one polled BCIS, printed as `[hda] tone stream=0 lpib=... bcis=... fifo_ready=...
+# run_ms=...` and scored on `:: HDA-TONE: ... -> PASS|FAIL ::`. On a codec whose walk derived no
+# output path the arc refuses out loud (`[hda] tone REFUSED reason=no-speaker-path`) and issues not
+# one stream register write. The QEMU legs:
+#   UNAOS_HDA=1 ./arroyo test 60
+#   UNAOS_HDA=1 UNAOS_HDATONE=1 ./arroyo test 60
+# Default OFF => the whole tone block is file-tail and cfg-gated, nothing is lexed and no panic
+# `Location` moves (`./arroyo knoboff hda-tone`). x86_64 only; aarch64 media byte-identical
+# (stripped by arm_features below, exactly as `hda` itself is).
+# Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
+[ -n "${UNAOS_HDATONE:-}" ] && _feats="${_feats}hda-tone,"
 # ── BANNER-DEDUP (orin 3, 2026-08-22) — the banner must not misreport its own composition ─────────
 #
 # THE SYMPTOM. An armed jetson build printed `tegra` THREE times:
@@ -2699,6 +2723,14 @@ arm_features() {
     # module gate. Without that the aarch64 compile would try to call into a module its own
     # `#[cfg]` had deleted; the `gen7` entry below records the review that caught the same shape.
     f="${f//,hda,/,}"
+    # HDATONE (B127) rides the same strip, for the same reason and as a consequence of the same
+    # fact: `hda-tone` implies `hda`, whose only code is the x86-gated `drivers/hda.rs` plus the two
+    # x86-gated sites in drivers/pci.rs, and the tone block is a cfg-gated tail of that same file —
+    # so `hda-tone` emits not one byte of aarch64 CODE. Leaving it in (or its implied `hda`,
+    # stripped above) would shift every Pi/Jetson media hash for zero observable change.
+    # Order-independent with the strip above by its own argument: `,hda-tone,` does not contain
+    # `,hda,` as a substring, because the trailing comma is part of every pattern.
+    f="${f//,hda-tone,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0

@@ -3387,6 +3387,33 @@ ahci-write = ["ahci"]
 # audio controller in it, which is a different finding entirely.
 # See docs/dev/OS/11_AUDIO/hda.md.
 hda = []
+# HDATONE (rmbp-ledger B127, arc 2) — the OUTPUT STREAM: a 16-bit stereo 48 kHz sine (440 Hz, one
+# second, about -18 dBFS) on output stream 0, through a two-entry BDL, with the stream tag bound to
+# the derived path's converter, the pin powered and output-enabled, EAPD asserted where the pin
+# declares it, and the amplifier unmuted at the codec's own 0 dB offset on every node of the path.
+# Implies `hda` (there is no path to drive without the walk). Default OFF, and OFF is the shipped
+# state.
+#
+# ⚠ THIS KNOB MAKES A NOISE. It is the one feature in this file whose effect is audible in the
+# room, so it is its own knob rather than part of `hda`: a boot that did not ask for a tone must be
+# structurally incapable of emitting one, which is the same construction `btc` uses for the
+# Bluetooth page. The amplitude is deliberately low and the run is bounded at 1200 ms.
+#
+# THE PROOF IS WITHOUT EARS. `LPIB` advancing plus at least one polled `BCIS` (the buffer-boundary
+# latch; `INTCTL` stays 0, so it reaches no CPU) is what the `:: HDA-TONE: ... -> PASS|FAIL ::`
+# verdict is computed from, and every stream register, pin control, EAPD bit, converter format,
+# stream tag, power state and amplifier gain the run changed is read before it is written and
+# written back after. Refuses out loud on a codec whose walk derived no output path
+# (`[hda] tone REFUSED reason=no-speaker-path`) and issues not one stream register write there.
+#
+# Default OFF => the whole `mod tone` block, the sine generator, the BDL and every stream-descriptor
+# write are FILE-TAIL and `#[cfg]`-gated, so none of it is lexed and no `panic::Location` above it
+# moves (`./arroyo knoboff hda-tone`). x86_64 only, and stripped from aarch64 builds by arroyo's
+# `arm_features` exactly as `hda` itself is.
+#
+# Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs`.
+# See docs/dev/OS/11_AUDIO/hda.md.
+hda-tone = ["hda"]
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

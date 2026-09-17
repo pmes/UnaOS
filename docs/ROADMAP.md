@@ -357,7 +357,7 @@ and follow-me demos feeding the drive service's AUTO mode.
 | RTC + NTP | Cheap and load-bearing — land before UnaFS kernel writes (real mtimes) | S |
 | Entropy | RDRAND/jitter; prerequisite for any TLS/WPA future | S |
 | VFS layer | Forced by K3/K4 (FAT + UnaFS coexistence) — plan, don't stumble | M |
-| Audio (kernel) | x86 HDA; Pi HDMI/PWM audio — kernel playback, distinct from the host-native creative lane (§3a) | M each |
+| Audio (kernel) | x86 HDA; Pi HDMI/PWM audio — kernel playback, distinct from the host-native creative lane (§3a). **x86 HDA arc 1+2 built 2026-09-17 (HDA), unflown** — class-0x04 census, `GCTL.CRST` reset, CORB/RIRB rings, the full widget walk with pin-default decode and a derived output path, then a 440 Hz output stream proved without ears (`LPIB` advancing + polled `BCIS`); `UNAOS_HDA=1 UNAOS_HDATONE=1`, `docs/dev/OS/11_AUDIO/hda.md`, rmbp-ledger B127. The Pi half is untouched | M each |
 | Power management | Backlight/battery/idle — Lazarus-machine credibility | S–M each |
 | WiFi/BT | SDIO + firmware + supplicant — distant; Ethernet first | L++ |
 | GPU acceleration | Modesetting beyond GOP is L; real 3D is years — own the CPU/SIMD-render choice near-term | L++ |
