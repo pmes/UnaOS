@@ -7303,7 +7303,7 @@ fn ptrdead_selftest_body() {
 /// **It exists as a function so the witness can drive the REAL chain.** `wmdirect_selftest` asserts
 /// against this call and [`wc_route_tail`], not against a transcription of them — the failure this
 /// closes is a witness that tests the API while the path a pointer report actually takes is inert.
-pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event {
+pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event { #[cfg(feature = "ftdirx")] if let crate::pal::Event::Key(b) = raw { if crate::drivers::xhci::ftdi::ftdirx::claim_origin(b) { static SERIALDOOR_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); if SERIALDOOR_LOG.fetch_add(1, Ordering::Relaxed) < 256 { serial_println!("[serialdoor] key={:#04x} win_focus={:#x} ring={:#x} -> shell (the wire is a console)", b, crate::video::wm::focus_asid(), USER_INPUT_ACTIVE.load(Ordering::Acquire)); } return raw; } } // SERIALDOOR — **THE WIRE IS A CONSOLE, NOT A KEYBOARD** (Peter, 2026-09-17). FIRST in this function, ahead of `strip::key_escape`, `quarry::key_route`, `wc_focus_key` and `user_input_route`, because every one of those is a question about WINDOW FOCUS and a serial byte is not addressed to a window. FTDICR measured the cost of asking them anyway (`docs/dev/OS/02_KERNEL_CORE/serial_transport.md` §FTDICR): on flight 10 a focused Quarry ate every `help\r` at its `b'\r' | b'\n'` arm — `[quarry] key_route key=0x0d focus=1 took=1` — and the SAME byte submitted the line the moment focus left, `focus=0 took=0` with `[midden] cmd=` 19 ms later. Nothing about the byte changed; only `focus` did. So an operator at the cable could not reach the shell at all while a window held focus, and had no way to see why. `return raw` and not `user_input_route(raw)`: the ruling says the SHELL, so the byte skips the focused ring-3 ring too — a program that wants the wire asks for it, it does not inherit it by being frontmost. KEYBOARD-ORIGIN ENTER IS UNTOUCHED: the tag is claimed only for bytes `ftdirx::deliver` actually pushed (`claim_origin` matches the byte at the head of that FIFO), so a keyboard Enter still reaches Quarry and still opens the selection. TWO focus numbers on the witness, because there are two and a reader of flight 10 will otherwise pair the wrong one: `win_focus=` is `wm::focus_asid()`, the WINDOW focus `quarry::key_route` gates on and the one `[quarry] key_route … focus=` reports, while `ring=` is `USER_INPUT_ACTIVE`, the EL0 input ring. A kernel-owned window holds the first and not the second, so `win_focus=0xffffff03 ring=0x0` is the normal shape of this line and is NOT "nothing was focused". Bounded witness, 256 lines — a console being typed into must not spend its own bandwidth narrating itself. Gated `ftdirx` (the module that produces the tag is `#[cfg(feature = "ftdirx")]`, `drivers/xhci/ftdi.rs:547`), so a build without the FTDI console compiles nothing here. ⚠ FOLDED onto this function's signature line, never given a line of its own — this file's panic `Location`s are load-bearing and the line count is unchanged; CODE BEFORE COMMENT (LEDGER P7).
     // CRYSTAL/WINMENU — Escape dismisses an open menu, addressed to the window system exactly as `<TAB>` is, so it is judged in the same place: before either router or a focused app can swallow it.
     // R21 gave the panel a SECOND modal surface (a window's menus, in the bar), so the question goes to the shared `strip::key_escape` seam — beside `strip::press_route`, asked by BOTH arch routers,
     // rather than each naming one surface. It consumes ONLY a bare `Esc` while one of the two menus is open; every other event, and `Esc` with nothing down, falls straight through to the chain below.
@@ -17537,7 +17537,7 @@ fn winx_launcher(demo_cpu: usize) {
     // been unfired witnesses. This drives `wc_click_route_at` (the live seam) at the crystal, at a
     // point outside the open menu, and at the dock strip, and asserts one `band=` line per press.
     #[cfg(all(feature = "witness", feature = "wc"))]
-    { clickband_selftest(); menudrop_selftest(); } // MENUDROP — the MENUBAR band, beside the two bands GR27 proved. Same `cfg` as the line it is folded onto, so no line is added and no panic `Location` moves (the `{ ptrdead_selftest(); lockfix_b1_selftest(); }` idiom, this ladder's own). AFTER `clickband_selftest` because that fixture reads `CLICK_BAND_LOG_X86` as a delta and asserts `owed == 3`: this one adds two more band lines and would red it from in front. BEFORE `wmdirect_selftest`, which is deliberately last (it pins a row against the tiler); this one closes its window and restores the focus it took.
+    { clickband_selftest(); menudrop_selftest(); serialdoor_selftest(); } // MENUDROP — the MENUBAR band, beside the two bands GR27 proved. Same `cfg` as the line it is folded onto, so no line is added and no panic `Location` moves (the `{ ptrdead_selftest(); lockfix_b1_selftest(); }` idiom, this ladder's own). AFTER `clickband_selftest` because that fixture reads `CLICK_BAND_LOG_X86` as a delta and asserts `owed == 3`: this one adds two more band lines and would red it from in front. BEFORE `wmdirect_selftest`, which is deliberately last (it pins a row against the tiler); this one closes its window and restores the focus it took.
     // WMDIRECT — third and last of the click family, and deliberately last: it MOVES a row (a drag
     // is a `move_to`, which pins the row against the tiler) and closes it under a live drag, so it
     // is the most disruptive of the three. Running it after the other two means neither of them can
@@ -24176,4 +24176,174 @@ fn dirns_witness() {
         gone,
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// ── SERIALDOOR — the fixture, and the state the defect can only occur in ────────────────────────
+//
+// FTDICR's own closing sentence is this fixture's contract: *"Any future fixture for this defect
+// must give Quarry focus first, or it is scoring a state the defect cannot occur in."* The inject
+// lane it tried (`UNAOS_FTDIRX_INJECT` + `scripts/ftdi_inject.py --text 'help\r'`) answered
+// `:: [midden] cmd="help" ::` IDENTICALLY with the defect present and with it removed, because the
+// QEMU boot never focuses a window — the fixture had no power over the question it was asked.
+//
+// So this one BUILDS the losing state, twice, and each leg carries its own control:
+//
+//  1. **CONTROL — the key door is LIVE.** With a window menu down, an UNTAGGED `Esc` driven through
+//     `wc_route_event` must be CONSUMED (`Event::Unknown`) and the menu must close. Without this leg
+//     a green "the wire got through" proves nothing: it is what a dead door looks like too.
+//  2. **THE FIX — a TAGGED `Esc` is not the window's.** Menu re-opened, the byte tagged through
+//     `ftdirx::tag_serial_byte`, the SAME event driven through the SAME function: the router must
+//     hand it back (`Event::Key(0x1b)`) and the menu must still be DOWN.
+//  3. **QUARRY's `\r`, the exact shape flight 10 measured** — only when Quarry can be put on the
+//     glass and focused. Untagged `\r` is eaten (`[quarry] key_route key=0x0d focus=1 took=1`);
+//     tagged `\r` is handed back and Quarry never sees it. Reported `skip-<reason>` and NOT failed
+//     where the window cannot be opened: a knob-off Quarry is not this door's defect.
+//  4. **END TO END, informational.** The tagged bytes of `help\r` are pushed through
+//     `ftdirx::inject_serial_byte` — the producer seam `deliver` itself uses — while the fixture's
+//     window still holds focus, so a capture can be asked for `[midden] cmd=` with a window focused.
+//     NOT part of the verdict: the shell drain is another task and this fixture does not own its
+//     scheduling, and a leg whose green depends on another task's luck is the WINMENUFLAKE lesson.
+//
+// Restores the bar, the focus and every window it opened. `#[cfg]`-gated on `ftdirx` as well as
+// `witness`+`wc`, with a SKIP stub below for the knob-off build, so the ladder's call site needs no
+// second `cfg` and stays line-neutral.
+#[cfg(all(feature = "witness", feature = "wc", feature = "ftdirx"))]
+fn serialdoor_selftest() {
+    use core::sync::atomic::AtomicBool;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let (pw, ph) = {
+        let info = crate::video::WRITER.lock().info();
+        (info.width, info.height)
+    };
+    if pw == 0 || ph == 0 {
+        serial_println!(":: SERIALDOOR: no panel :: SKIP ::");
+        return;
+    }
+    static SURF: [u32; 64] = [0; 64];
+    const OWNER: u64 = crate::video::wm::KERNEL_OWNER_BASE + 0x54;
+    let saved_bar = crate::video::menubar::enabled();
+    crate::video::menubar::set_enabled(true);
+    let win = crate::video::wm::create(
+        OWNER,
+        SURF.as_ptr() as usize,
+        core::mem::size_of_val(&SURF),
+        8,
+        8,
+        32,
+        b"wire",
+    );
+    if win == crate::video::wm::WIN_NONE {
+        crate::video::menubar::set_enabled(saved_bar);
+        serial_println!(":: SERIALDOOR: wm::create declined (table full) :: SKIP ::");
+        return;
+    }
+    let saved_focus = crate::video::wm::focus_asid();
+    crate::video::wm::focus_changed(OWNER);
+    // WINMENUFLAKE — park until the bar has published this caption before grading anything; a single
+    // `wm::composite()` is a REQUEST and not a publication, and on an empty snapshot the app box's
+    // centre is (0, 0), i.e. the crystal's corner.
+    let t0 = crate::arch::now_cycles();
+    let mut waited = 0u64;
+    let mut s = crate::video::winmenu::bar_boxes(pw, ph);
+    while !(s.app && s.app_owner == win && s.n >= 1 && s.label_of(0) == b"wire") {
+        waited = crate::video::strip::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0));
+        if waited >= 250_000 {
+            break;
+        }
+        crate::video::wm::composite();
+        s = crate::video::winmenu::bar_boxes(pw, ph);
+    }
+    let published = s.app && s.app_owner == win && s.n >= 1 && s.label_of(0) == b"wire";
+    let (px, py) = ((s.x[0] + s.w[0] / 2) as i32, (s.bar.1 + s.bar.3 / 2) as i32);
+    let open_menu = |x: i32, y: i32| -> bool {
+        let _ = wc_click_route_at(crate::pal::Event::Button(1), x, y);
+        let _ = wc_click_route_at(crate::pal::Event::Button(0), x, y);
+        crate::video::winmenu::is_open()
+    };
+
+    // Leg 1 — CONTROL: the focused-window key door is live and eats an untagged Esc.
+    let armed0 = published && open_menu(px, py);
+    let kbd = wc_route_event(crate::pal::Event::Key(0x1b));
+    let leg_control =
+        armed0 && matches!(kbd, crate::pal::Event::Unknown) && !crate::video::winmenu::is_open();
+
+    // Leg 2 — THE FIX: the same byte, tagged, is handed back and the menu stays down.
+    let armed1 = leg_control && open_menu(px, py);
+    crate::drivers::xhci::ftdi::ftdirx::tag_serial_byte(0x1b);
+    let wire = wc_route_event(crate::pal::Event::Key(0x1b));
+    let leg_wire =
+        armed1 && matches!(wire, crate::pal::Event::Key(0x1b)) && crate::video::winmenu::is_open();
+    // Tidy: an untagged Esc takes the menu back down, on the door this fixture just proved live.
+    let _ = wc_route_event(crate::pal::Event::Key(0x1b));
+
+    // Leg 3 — QUARRY's `\r`. `request_open` + `service` because a router may do no disk I/O and this
+    // is not a router; `focus_changed` because `key_route` gates on `focus_asid() == OWNER`.
+    #[cfg(feature = "quarry")]
+    let (quarry_state, leg_quarry) = {
+        let was_open = crate::video::quarry::is_open();
+        if !was_open {
+            crate::video::quarry::request_open();
+            crate::video::quarry::service();
+        }
+        if crate::video::quarry::is_open() {
+            crate::video::wm::focus_changed(crate::video::quarry::OWNER);
+            let ate = matches!(
+                wc_route_event(crate::pal::Event::Key(0x0d)),
+                crate::pal::Event::Unknown
+            );
+            crate::drivers::xhci::ftdi::ftdirx::tag_serial_byte(0x0d);
+            let passed = matches!(
+                wc_route_event(crate::pal::Event::Key(0x0d)),
+                crate::pal::Event::Key(0x0d)
+            );
+            if !was_open {
+                crate::video::quarry::close();
+            }
+            crate::video::wm::focus_changed(OWNER);
+            (if ate { "ran" } else { "ran-nodoor" }, ate && passed)
+        } else {
+            ("skip-unopened", true)
+        }
+    };
+    #[cfg(not(feature = "quarry"))]
+    let (quarry_state, leg_quarry) = ("skip-knoboff", true);
+
+    // Leg 4 — end to end, INFORMATIONAL. `help\r` through the producer seam, window still focused.
+    for b in b"help\r" {
+        crate::drivers::xhci::ftdi::ftdirx::inject_serial_byte(*b);
+    }
+
+    let (claimed, outstanding, overrun) = crate::drivers::xhci::ftdi::ftdirx::origin_census();
+    if crate::video::wm::info(win).is_some() {
+        crate::video::wm::close(win);
+    }
+    crate::video::wm::focus_changed(saved_focus);
+    crate::video::menubar::set_enabled(saved_bar);
+    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+    serial_println!(
+        ":: SERIALDOOR: win={} box={}x{}+{} waited={}ms control={} wire={} quarry={}({}) \
+         claimed={} outstanding={} overrun={} e2e=pushed :: {} ::",
+        win, s.w[0], s.bar.3, s.x[0], waited / 1000,
+        leg_control, leg_wire, leg_quarry, quarry_state,
+        claimed, outstanding, overrun,
+        if !published {
+            "SKIP"
+        } else if leg_control && leg_wire && leg_quarry {
+            "PASS"
+        } else {
+            "FAIL"
+        }
+    );
+}
+
+/// SERIALDOOR — the knob-off stub. `ftdirx` is DEFAULT OFF, so on the ordinary `./arroyo test` boot
+/// there is no tag producer and nothing to score; saying so on the wire is what keeps a silent
+/// fixture distinguishable from one that ran and passed (LAWS §5, "an absence is evidence only if
+/// the producing path ran").
+#[cfg(all(feature = "witness", feature = "wc", not(feature = "ftdirx")))]
+fn serialdoor_selftest() {
+    serial_println!(":: SERIALDOOR: ftdirx knob off — no tag producer compiled :: SKIP ::");
 }

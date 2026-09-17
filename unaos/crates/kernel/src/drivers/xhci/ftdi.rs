@@ -702,7 +702,7 @@ pub mod ftdirx {
             return;
         }
         for &b in &pkt[STATUS_BYTES..] {
-            crate::pal::push_event(crate::pal::Event::Key(b));
+            note_origin(b); crate::pal::push_event(crate::pal::Event::Key(b)); // SERIALDOOR — **THE ORIGIN TAG, and it is recorded BEFORE the push, never after.** `push_event` takes the event-queue lock and the drain can be running on another core the instant it is released, so a tag written after the push is a tag the door may look for and not find — one serial byte per boot silently taking the keyboard path, which is the class of defect nobody reproduces. Tagging first can only ever be early, and an early tag is harmless: `claim_origin` also matches the BYTE, so a tag with no event behind it is simply never claimed and ages out of the ring. See `note_origin`/`claim_origin` at this module's tail for the FIFO and for the one state it cannot distinguish. ⚠ FOLDED onto the existing push, CODE BEFORE COMMENT (LEDGER P7).
             let n = RX.fetch_add(1, Ordering::Relaxed) + 1;
             if !FIRST_LOGGED.swap(true, Ordering::Relaxed) {
                 // THE WITNESS. One line, the first real byte only: it splits "the cable never
@@ -737,5 +737,107 @@ pub mod ftdirx {
             IDLE.load(Ordering::Relaxed),
             ERRORS.load(Ordering::Relaxed)
         );
+    }
+
+    // ── SERIALDOOR — the ORIGIN TAG ──────────────────────────────────────────────────────────────
+    //
+    // Peter's ruling, 2026-09-17: *the serial console is a console, not a keyboard.* A byte typed at
+    // the cable must reach the SHELL whatever holds window focus; a byte typed on the keyboard keeps
+    // today's behaviour, so a focused Quarry may still open its selection with Enter.
+    //
+    // FTDICR measured the defect on flight 10 (`docs/dev/OS/02_KERNEL_CORE/serial_transport.md`
+    // §FTDICR): `deliver` pushes `Event::Key(b)` into the SAME `pal` queue the HID decoders push into,
+    // so `wc_route_event`'s furniture key doors judge a wire byte exactly as they judge a keystroke —
+    // `[quarry] key_route key=0x0d focus=1 took=1`, and `help\r` never ran. The transport was
+    // blameless: `rx=5`, `errors=0`, and the same byte passed the moment focus left (`focus=0 took=0`,
+    // `[midden] cmd=` 19 ms later).
+    //
+    // WHY A FIFO OF BYTES AND NOT A COUNTER. A counter ("the next N keys are serial") is wrong the
+    // first time a keyboard report interleaves with the cable: the queue is one FIFO shared by both
+    // producers, so a credit would be spent on whichever key came out next. This ring records WHAT was
+    // pushed, in order, and [`claim_origin`] pops only when the byte at the head MATCHES the byte at
+    // the door. The one state it cannot separate is stated rather than hidden: the same byte value
+    // typed on the keyboard while a serial byte of that value is outstanding is claimed as serial, so
+    // that keystroke reaches the shell instead of the focused window. It needs two people typing the
+    // same character into two devices inside one drain pass; it costs one keystroke; and it fails
+    // toward the shell, which is the safe direction (the operator can always get out).
+    //
+    // SPSC and lock-free BY CONSTRUCTION, which is what makes it legal here: the producer is the xHCI
+    // main-loop service pass (`deliver`'s only caller) and the consumer is the key drain, one of each,
+    // so the two indices need no CAS. `note_origin` is the only writer of `ORIGIN_W`, `claim_origin`
+    // the only writer of `ORIGIN_R`.
+    //
+    // ⚠ TAIL OF THE TAIL MODULE. This block is appended BELOW everything in a module that is itself
+    // `#[cfg]`-erased knob-off, so no panic `Location` in this file moves and the knob-off loadable
+    // image is untouched — the rule the module header states, applied to the module's own tail.
+
+    /// SERIALDOOR — outstanding tags. 128 is four full FT232 packets' worth of data bytes (`CHUNK`
+    /// 64 minus `STATUS_BYTES`, so 62 each) and the drain empties the queue every pass, so the ring
+    /// is sized to hold a burst the console can produce between two passes and not to hold a session.
+    const ORIGIN_CAP: u64 = 128;
+    static ORIGIN_RING: [AtomicU8; ORIGIN_CAP as usize] = [const { AtomicU8::new(0) }; ORIGIN_CAP as usize];
+    /// Write and read cursors, monotonic and wrapping; `W - R` is the occupancy.
+    static ORIGIN_W: AtomicU64 = AtomicU64::new(0);
+    static ORIGIN_R: AtomicU64 = AtomicU64::new(0);
+    /// Tags the door actually claimed — the numerator of the census line.
+    static ORIGIN_CLAIMED: AtomicU64 = AtomicU64::new(0);
+    /// Tags DROPPED because the ring was full. A dropped tag is not a lost byte: the byte still
+    /// reaches the door, it is simply judged as a keystroke, which is exactly the pre-arc behaviour.
+    /// Counted rather than swallowed so a capture can say whether the ring was ever the limit.
+    static ORIGIN_OVERRUN: AtomicU64 = AtomicU64::new(0);
+
+    /// Record that the byte about to be pushed came off the WIRE. Producer side; called only from
+    /// [`deliver`], immediately before the push.
+    fn note_origin(b: u8) {
+        let w = ORIGIN_W.load(Ordering::Relaxed);
+        if w.wrapping_sub(ORIGIN_R.load(Ordering::Acquire)) >= ORIGIN_CAP {
+            ORIGIN_OVERRUN.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        ORIGIN_RING[(w % ORIGIN_CAP) as usize].store(b, Ordering::Relaxed);
+        ORIGIN_W.store(w.wrapping_add(1), Ordering::Release);
+    }
+
+    /// **The door's question: is this `Key(b)` the next byte the wire owes?** Consumer side, called
+    /// from `arch::x86_64::syscall::wc_route_event` at the TOP of the key door. Pops and answers
+    /// `true` only when the ring is non-empty AND its head is this exact byte; otherwise the event is
+    /// a keystroke and nothing is consumed.
+    pub fn claim_origin(b: u8) -> bool {
+        let r = ORIGIN_R.load(Ordering::Relaxed);
+        if r == ORIGIN_W.load(Ordering::Acquire) {
+            return false;
+        }
+        if ORIGIN_RING[(r % ORIGIN_CAP) as usize].load(Ordering::Relaxed) != b {
+            return false;
+        }
+        ORIGIN_R.store(r.wrapping_add(1), Ordering::Release);
+        ORIGIN_CLAIMED.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// SERIALDOOR — `(claimed, outstanding, overrun)`. Read by the fixture and by the rollup so a
+    /// capture can say whether every tagged byte was claimed, rather than only that the door fired.
+    pub fn origin_census() -> (u64, u64, u64) {
+        (
+            ORIGIN_CLAIMED.load(Ordering::Relaxed),
+            ORIGIN_W.load(Ordering::Acquire).wrapping_sub(ORIGIN_R.load(Ordering::Acquire)),
+            ORIGIN_OVERRUN.load(Ordering::Relaxed),
+        )
+    }
+
+    /// SERIALDOOR — the fixture's producer seam: tag a byte and push it exactly as [`deliver`] does,
+    /// without a controller. `#[cfg(feature = "witness")]` so no shipped image carries a way to
+    /// synthesise wire bytes.
+    #[cfg(feature = "witness")]
+    pub fn inject_serial_byte(b: u8) {
+        note_origin(b);
+        crate::pal::push_event(crate::pal::Event::Key(b));
+    }
+
+    /// SERIALDOOR — tag a byte WITHOUT pushing it, for a fixture that wants to drive the router
+    /// directly rather than through the queue. Same order as the live path: tag, then deliver.
+    #[cfg(feature = "witness")]
+    pub fn tag_serial_byte(b: u8) {
+        note_origin(b);
     }
 }
