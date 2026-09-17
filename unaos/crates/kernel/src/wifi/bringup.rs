@@ -817,9 +817,17 @@ fn end_line(dl: &Deadline, ok: bool, stage: &str, d11: &str, w: &Writes, restore
     #[cfg(not(feature = "wifi3"))]
     const CORE_REGS_NOTE: &str =
         "audited — MACCTL, SHM_CONTROL, SHM_DATA and RADIO_CONTROL have no write site in this file";
-    #[cfg(feature = "wifi3")]
+    #[cfg(all(feature = "wifi3", not(feature = "wifi4")))]
     const CORE_REGS_NOTE: &str =
         "audited — counted at the wifi3 upload sites; RADIO_CONTROL alone still has no write site in this file";
+    // Under `wifi4` the sentence above would be true and MISLEADING: no d11 register in this
+    // counter's enumerated set gains a site, but the wifi4 rung DOES write a radio-side register —
+    // the ADDRESS port at d11+0x3F6, which is NOT the 0x3E2 this file's b43-lineage naming calls
+    // `RADIO_CONTROL` (see [`D11_RADIO_ADDR`]). That write is counted on wifi4's own `end` line, and
+    // this line says where to look rather than leaving a reader to infer "no radio register moved".
+    #[cfg(feature = "wifi4")]
+    const CORE_REGS_NOTE: &str =
+        "audited — counted at the wifi3 upload sites; RADIO_CONTROL (0x3E2) still has no write site in this file, and wifi4 writes the radio ADDRESS port (0x3F6) instead — counted on the wifi4 end line, not this one";
     let (ev, eu) = fmt_dur(dl.elapsed());
     serial_println!(
         ":: wifi2: end ok={} stage={} d11={} wrote-cfg80={}(selftest={} moves={} restore={}) wrote-cfg0xac={}(moves={} restore={}) wrote-wrapper={}(enable={} unwind={}) wrote-core-regs={}({}) uploaded-bytes={}(audited) restore={} elapsed={}{} ::",
@@ -1403,6 +1411,14 @@ fn reach_d11(bus: u8, dev: u8, func: u8, bar0: u64, d: &D11, pre_win2: u32, w: &
 
     // ── R7: the upload. ─────────────────────────────────────────────────────────────────────────
     upload_gate(bar0, macctl, w);
+    // ── R9: WIFI-4 / S5(a)+(b). Placed HERE and not inside `upload_gate` on purpose: every one of
+    // that function's gate-1/gate-2 early returns comes back to this line, so the wifi4 rung runs —
+    // and prints its refusal — on the paths where the upload never happened as well as on the one
+    // where it did. The window is still on the d11 core (R8's restore lives in `bringup_once`,
+    // after this returns), which is what makes BAR0+0x3F6 the radio address port and not another
+    // core's register. See [`phy_once`].
+    #[cfg(feature = "wifi4")]
+    phy_once(bar0);
     true
 }
 
@@ -1670,6 +1686,17 @@ fn ucode_stream_facts() -> Option<UcodeStream> {
 /// drift between paths. `reason` is empty exactly when the verdict is UPLOADED.
 #[cfg(feature = "wifi3")]
 fn upload_verdict(words: u32, crc: u32, psm: u8, rev: u16, kind: &'static str, reason: &'static str) {
+    // WIFI-4's gate is latched HERE, at the one funnel every exit of [`upload_ucode`] passes
+    // through, rather than by threading a return value back through a dozen `return`s. The point is
+    // that the latch and the WIRE LINE are the same event: if a capture shows `-> UPLOADED` then the
+    // latch is set, and if it shows anything else — or shows nothing at all, because a gate above
+    // returned before the upload was ever attempted — the latch is false and [`phy_once`] refuses.
+    // A second, independent source of truth for "did the upload succeed" is exactly the drift this
+    // funnel was created to prevent.
+    #[cfg(feature = "wifi4")]
+    if kind == "UPLOADED" {
+        UPLOAD_PROVEN.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
     if reason.is_empty() {
         serial_println!(
             ":: wifi2: ucode upload words={} crc={:#010x} psm={} rev={} -> {} ::",
@@ -1954,4 +1981,320 @@ fn upload_ucode(bar0: u64, macctl: u32, w: &mut Writes) {
             upload_verdict(wrote_words, wrote_fnv, psm_run as u8, rev, "FAILED", why);
         }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// WIFI-4 — the PHY/radio rung: `bcm4331.md` §S5 sub-stages **(a)** "radio powered and its ID
+// register reading the expected id" and **(b)** "the PHY reset sequence completing without the MAC
+// hanging". Everything below is `cfg(feature = "wifi4")` (`UNAOS_WIFI4=1`, implies `wifi3`): not one
+// byte of it exists in a default build, or in a `wifi2`/`wifi3` build.
+//
+// ## What this rung does, and the much larger thing it does NOT do
+//
+// §S5 is the crux of the ladder and the stage most likely to end the project. Its honest
+// sub-division has four parts and only the first two carry read-back predicates. This rung
+// implements exactly those two, and prints a REFUSED line naming the missing citation for each of
+// the other two rather than transcribing a table from a source this module may not read:
+//
+// | §S5 | what | here |
+// | --- | --- | --- |
+// | (a) | radio powered, ID register reads the expected id | **IMPLEMENTED** — one address-port write, two read passes, a gated verdict |
+// | (b) | PHY reset sequence completes without the MAC hanging | **SPLIT.** The post-upload read-back predicate is IMPLEMENTED; the reset SEQUENCE is REFUSED — see [`phy_once`]'s `phy-reset` line |
+// | (c) | channel tune to one 2.4 GHz channel | **REFUSED** — no legal source carries an HT-PHY/2059 channel path |
+// | (d) | RX chain enabled | **NOT ATTEMPTED** — depends on (c) |
+//
+// ## Sourcing — and the one sentence that makes (a) legal on THIS part
+//
+// Tags as elsewhere in this file: `[SPEC-V3]` = `bcm-specs.sipsolutions.net`, `[SPEC-V4]` =
+// `bcm-v4.sipsolutions.net` — the b43 open specification, the reverse-engineered HARDWARE
+// documentation that is legal for `src/wifi/` where driver source is not (`bcm4331.md` §S4-W5).
+// `[TREE]` is this repository's own prose, and it is NOT a pin.
+//
+// Both generations pin the ports and the register. What neither generation's per-PHY-type address
+// table covers is PHY type **7**: `[SPEC-V3 RadioRegister]` adjusts for A/B/G only and
+// `[SPEC-V4 802.11/Radio/Registers]` extends that to "PHY Type 3", N and LP — and stops. Type 6
+// (SSLPN), **7 (HT)**, 8 (LCN) and 9 (LCNXN) are named in `[SPEC-V4 802.11/PHY]`'s type table (which
+// is where "7 = HT PHY (Three Stream N)" corroborates [`EXPECT_PHY_TYPE`] from a Group-A source for
+// the first time) but appear in no adjustment rule. That gap would sink this rung — except that
+// `[SPEC-V3 RadioRegister]` states the exemption that covers precisely the one register we want:
+//
+//   > "for all PHY versions, if the offset is 1, do not adjust the offset."
+//
+// Radio register **0x01 is the RadioID**, and it is the single offset whose addressing is pinned
+// independently of PHY type. So (a) is buildable on an HT-PHY from citable facts alone, and a
+// second radio register would not be. That is not a convenience; it is the whole reason this rung
+// reads one register and stops.
+//
+// ## Why the write is argued safe, and the residual that is NOT argued away
+//
+// `0x3F6` is an ADDRESS-WINDOW register — the same class as `SHM_CONTROL`, and the same safety
+// argument §S4a makes for touching that one: it selects which radio register the DATA ports refer
+// to and sets no radio state by itself. This rung never writes `0x3F8`/`0x3FA`, so no radio-silicon
+// register is modified even if the selector were wrong; a wrong selector reads a different word.
+//
+// The residual is real and is on the wire rather than in a comment: this rung's own precondition is
+// that the wifi3 upload SUCCEEDED, which means **the PSM is running**, and the running microcode
+// uses the same shared address latch. We cannot suspend it — no legal source in either generation
+// gives a citable MAC-suspend sequence for this part — so the latch is contended. Two consequences,
+// both bounded and both measured: a lost race gives US a garbage word (detected: the port is read
+// back after every selection, and the id is read twice in the two opposite orders the two spec
+// generations disagree about), and gives the PSM at most ONE mis-addressed radio access (the port
+// is re-addressed by its user before every access, so nothing persists). The found value is
+// restored and the restore is MATCH-verified.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// `[SPEC-V3 RadioRegister]` + `[SPEC-V4 802.11/Radio/Registers]` — the radio-register ADDRESS port
+/// (`[SPEC-V4 802.11/Registers]` names it "Radio Register Address (PHY 2)"), 16 bits, in the d11
+/// core window. **Both spec generations carry this value**, which is why it is Group-A and why the
+/// write below is made at all. It is NOT the `0x3E2` this file's b43-lineage sibling naming calls
+/// `RADIO_CONTROL`: `[SPEC-V4 802.11/Registers]` lists 0x3E2 as "PHY BB Config", and that
+/// disagreement is recorded here rather than resolved — nothing in this tree writes 0x3E2.
+#[cfg(feature = "wifi4")]
+const D11_RADIO_ADDR: u64 = 0x03F6;
+/// `[SPEC-V3 RadioRegister]` + `[SPEC-V4 802.11/Registers]` "Radio Register Data High (PHY 3)".
+/// READ-ONLY in this rung.
+#[cfg(feature = "wifi4")]
+const D11_RADIO_DATA_HI: u64 = 0x03F8;
+/// `[SPEC-V3 RadioRegister]` + `[SPEC-V4 802.11/Registers]` "Radio Register Data Low (PHY 4)".
+/// READ-ONLY in this rung.
+#[cfg(feature = "wifi4")]
+const D11_RADIO_DATA_LO: u64 = 0x03FA;
+/// `[SPEC-V3 RadioID]` + `[SPEC-V4 802.11/Radio/RadioID]` — radio register 0x01 holds the RadioID
+/// and is 32 bits wide, read as two 16-bit halves through the two data ports. The ONE radio offset
+/// whose addressing is PHY-type-independent (`[SPEC-V3 RadioRegister]`: "for all PHY versions, if
+/// the offset is 1, do not adjust the offset"), which is what makes it reachable on an HT-PHY.
+#[cfg(feature = "wifi4")]
+const RADIO_REG_ID: u16 = 0x0001;
+/// `[SPEC-V3 RadioID]` (bits 11-0) + `[SPEC-V4 802.11/Radio/RadioID]` (mask `0x00000FFF`) — both
+/// generations agree on the field, and both name `0x17F` as the one manufacturer they have seen.
+#[cfg(feature = "wifi4")]
+const RADIO_ID_MFG: u32 = 0x0000_0FFF;
+/// `[SPEC-V3 RadioID]` (bits 27-12) + `[SPEC-V4 802.11/Radio/RadioID]` (mask `0x0FFFF000`).
+#[cfg(feature = "wifi4")]
+const RADIO_ID_VER: u32 = 0x0FFF_F000;
+/// `[SPEC-V3 RadioID]` (bits 31-28) + `[SPEC-V4 802.11/Radio/RadioID]` (mask `0xF0000000`).
+#[cfg(feature = "wifi4")]
+const RADIO_ID_REV: u32 = 0xF000_0000;
+/// `[SPEC-V3 RadioID]` "0x17F — probably Broadcom" / `[SPEC-V4 802.11/Radio/RadioID]` "all
+/// documented radios use manufacturer ID 0x17F". **The one value in the whole identity word this
+/// rung gates on**, and it is discriminating: a dark port answers `0x000` or `0xFFF`, and a wrong
+/// offset has to land on another register that happens to carry 0x17F in its low 12 bits.
+#[cfg(feature = "wifi4")]
+const RADIO_MFG_BROADCOM: u32 = 0x17F;
+/// `[TREE]` — **NOT A PIN, and deliberately not gated on.** `bcm4331.md` §S5 calls this board's
+/// radio a "2059"; that is this repository's own prose. Neither generation's radio-version table
+/// carries `0x2059` or any HT-PHY radio at all (`[SPEC-V3 RadioID]`: 0x2050/0x2051/0x2053/0x2055/
+/// 0x2060; `[SPEC-V4 802.11/Radio/RadioID]`: 0x2050/0x2051/0x2055/0x2060/0x2062). Printed as an
+/// ADVISORY comparison, exactly as §S4-W5 residual 4 prints the ucode revision number it cannot pin.
+#[cfg(feature = "wifi4")]
+const RADIO_VER_2059_UNPINNED: u32 = 0x2059;
+
+/// The wifi3 upload verdict, latched at [`upload_verdict`]'s single funnel — see the comment there.
+/// False until a `-> UPLOADED` line has been printed this boot, which is exactly the gate §S5's
+/// sub-stages are conditioned on: the radio identity is read only on a boot that put a running PSM
+/// behind it.
+#[cfg(feature = "wifi4")]
+static UPLOAD_PROVEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Write a u16 into the mapped BAR0 window.
+///
+/// **Exactly one call site**, [`radio_select`] and [`phy_once`]'s restore — both on `d11+0x3F6`, the
+/// radio-register ADDRESS port. It exists as a separate accessor from [`w32`] for the same reason
+/// `w32`'s own doc gives: a general-purpose 16-bit writer in scope is how "this rung writes one
+/// register" quietly stops being true.
+///
+/// # Safety
+/// As [`w32`]: the caller must have mapped and verified the window AND established by a LIVE
+/// `cfg:0x80` readback that BAR0+0 decodes to the d11 core. The one offset written through here is
+/// an indirect-window selector, argued in this section's header.
+#[cfg(feature = "wifi4")]
+unsafe fn w16(base: u64, off: u64, val: u16) {
+    core::ptr::write_volatile((base + off) as *mut u16, val);
+}
+
+/// wifi4's audited write counters. Same law as [`Writes`]: every field is incremented AT its write
+/// site and the `end` line prints the FIELDS, so the zeros are checked by the compiler's
+/// reachability rather than by a reader trusting a literal. Three of the four are zeros this rung
+/// cannot violate without gaining a write site the diff would show.
+#[cfg(feature = "wifi4")]
+struct PhyWrites {
+    /// `d11+0x3F6`, the radio-register address port — the only register this rung writes.
+    radio_addr: u32,
+    /// `d11+0x3F8` / `d11+0x3FA`, the radio DATA ports. No write site exists: writing one would set
+    /// a radio-silicon register, which is what the whole safety argument for (a) rests on NOT doing.
+    radio_data: u32,
+    /// `MACCTL`, `SHM_CONTROL`, `SHM_DATA`, `RADIO_CONTROL` (0x3E2) — no write site in this rung.
+    core_regs: u32,
+    /// Wrapper `IOCTL` / `RESET_CTL` — no write site in this rung. The PHY reset sub-stage that
+    /// would need them is REFUSED for an unpinned bit position, not merely skipped.
+    wrapper: u32,
+}
+
+#[cfg(feature = "wifi4")]
+impl PhyWrites {
+    fn new() -> Self {
+        PhyWrites { radio_addr: 0, radio_data: 0, core_regs: 0, wrapper: 0 }
+    }
+}
+
+/// wifi4's `end` line, printed from [`PhyWrites`]' fields on every exit so the audited counts cannot
+/// diverge between the refusal exits and the normal one.
+#[cfg(feature = "wifi4")]
+fn phy_end(dl: &Deadline, ok: bool, stage: &str, id: u32, pw: &PhyWrites, restore: &str) {
+    let (ev, eu) = fmt_dur(dl.elapsed());
+    serial_println!(
+        ":: wifi4: end ok={} stage={} radio-id={:#010x} wrote-radio-addr={}(audited) wrote-radio-data={}(audited — 0x3F8/0x3FA are READ ports here and have no write site in this rung) wrote-core-regs={}(audited — MACCTL, SHM_CONTROL, SHM_DATA and RADIO_CONTROL(0x3E2) have no write site in this rung) wrote-wrapper={}(audited — no PHY reset and no core reset is performed; see the phy-reset REFUSED line) restore={} elapsed={}{} ::",
+        ok as u8, stage, id, pw.radio_addr, pw.radio_data, pw.core_regs, pw.wrapper, restore, ev, eu
+    );
+}
+
+/// Select a radio register on the shared address latch and prove the selection took.
+///
+/// The read-back is not decoration. The PSM is running (this rung's precondition) and uses the same
+/// latch, so "the port now holds our offset" is a claim with a way of being false, and the id decode
+/// downstream is gated on it.
+#[cfg(feature = "wifi4")]
+fn radio_select(bar0: u64, reg: u16, pw: &mut PhyWrites, leg: &str) -> u16 {
+    let pre = unsafe { r16(bar0, D11_RADIO_ADDR) };
+    unsafe { w16(bar0, D11_RADIO_ADDR, reg) };
+    pw.radio_addr += 1;
+    let (sv, su) = settle(1);
+    let echo = unsafe { r16(bar0, D11_RADIO_ADDR) };
+    serial_println!(
+        ":: wifi4: radio-select {} d11+{:#06x} pre={:#06x} wrote={:#06x} readback={:#06x} took={} settle={}{} — offset 0x01 is written UNADJUSTED: [SPEC-V3 RadioRegister] exempts it from the per-PHY-type address adjustment (\"for all PHY versions, if the offset is 1, do not adjust the offset\"), and no adjustment rule for PHY type 7 exists in either generation ::",
+        leg, D11_RADIO_ADDR, pre, reg, echo, (echo == reg) as u8, sv, su
+    );
+    echo
+}
+
+/// Arc 4 — §S5(a) radio identity and §S5(b) PHY liveness, with (b)'s reset sequence, (c) and (d)
+/// REFUSED by name.
+///
+/// Entered from [`reach_d11`] on every path, armed or refused, with the BAR0 window still on the
+/// d11 core. Gated on this same boot's wifi3 upload verdict; touches nothing when that gate is shut.
+#[cfg(feature = "wifi4")]
+fn phy_once(bar0: u64) {
+    let dl = Deadline::new();
+    let mut pw = PhyWrites::new();
+
+    serial_println!(
+        ":: wifi4: begin — arc 4: bcm4331.md §S5 (a) the radio's own identity register and (b) the PHY's post-upload liveness. WRITES: d11+{:#06x} ONLY — the radio-register ADDRESS port ([SPEC-V3 RadioRegister] + [SPEC-V4 802.11/Radio/Registers]), an indirect-window selector on the READ path, pre-image captured and restored. NOT written: the radio DATA ports {:#06x}/{:#06x} (so no radio-silicon register is set, whatever the selector turns out to address), MACCTL, SHM_CONTROL/SHM_DATA, the wrapper RESET_CTL/IOCTL. No PHY reset, no channel tune, no init table, no RX chain ::",
+        D11_RADIO_ADDR, D11_RADIO_DATA_HI, D11_RADIO_DATA_LO
+    );
+
+    // ── The gate: the SAME BOOT's wifi3 upload verdict. ─────────────────────────────────────────
+    if !UPLOAD_PROVEN.load(core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(
+            ":: wifi4: REFUSED reason=wifi3-upload-not-proven — this rung reads the radio identity only on a boot whose wifi3 rung printed `-> UPLOADED`: a PSM that started and published a revision past the §S4 floor. That is not a formality. The shared-latch argument this rung's ONE write rests on assumes a RUNNING microcode whose accesses re-address the port; and an identity read taken across a half-finished upload would be a reading of a core in an undefined state, reported as if it meant something. This boot printed no such verdict — the upload failed, or a gate above it returned before the upload was attempted. NOTHING has been written: no radio address port, no data port, no core register, no wrapper register ::"
+        );
+        phy_end(&dl, false, "gate", 0, &pw, "N/A");
+        return;
+    }
+
+    // ── S5(a): the radio identity. ──────────────────────────────────────────────────────────────
+    let addr_pre = unsafe { r16(bar0, D11_RADIO_ADDR) };
+    serial_println!(
+        ":: wifi4: radio-addr pre-image d11+{:#06x}={:#06x} — the ONE restore target of this rung. The port is an address LATCH shared with the microcode this boot just started, so it is RECORDED before it moves and put back after, exactly as arc 2 treats cfg:0x80 ::",
+        D11_RADIO_ADDR, addr_pre
+    );
+
+    // Pass 1 — [SPEC-V3 RadioRegister]'s stated order: the HIGH half from PHY3 (0x3F8), then the
+    // LOW half from PHY4 (0x3FA).
+    let echo_a = radio_select(bar0, RADIO_REG_ID, &mut pw, "1/2");
+    let hi_a = unsafe { r16(bar0, D11_RADIO_DATA_HI) };
+    let lo_a = unsafe { r16(bar0, D11_RADIO_DATA_LO) };
+    let id_a = ((hi_a as u32) << 16) | lo_a as u32;
+
+    // Pass 2 — [SPEC-V4 802.11/Radio/Registers] states the OPPOSITE order for this same register
+    // ("two reads — first from PHY4, then PHY3"). The two generations disagree, and nothing in
+    // either says whether a port latches on read. So both orders are executed and compared: this is
+    // the cheap discriminating cross-check that turns the disagreement into a measurement, and it
+    // doubles as a detector for the PSM having moved the latch underneath us.
+    let echo_b = radio_select(bar0, RADIO_REG_ID, &mut pw, "2/2");
+    let lo_b = unsafe { r16(bar0, D11_RADIO_DATA_LO) };
+    let hi_b = unsafe { r16(bar0, D11_RADIO_DATA_HI) };
+    let id_b = ((hi_b as u32) << 16) | lo_b as u32;
+
+    // Restore the found selector BEFORE any verdict is computed — the restore is owed whatever the
+    // reading says, and a verdict path must never be able to skip it.
+    unsafe { w16(bar0, D11_RADIO_ADDR, addr_pre) };
+    pw.radio_addr += 1;
+    let addr_post = unsafe { r16(bar0, D11_RADIO_ADDR) };
+    let restored = addr_post == addr_pre;
+    serial_println!(
+        ":: wifi4: RESTORE d11+{:#06x} <- pre-image {:#06x} readback={:#06x} restored={} — compared against the RECORDED pre-image, never against 0x0001 ::",
+        D11_RADIO_ADDR, addr_pre, addr_post, if restored { "MATCH" } else { "FAILED" }
+    );
+
+    let mfg = id_a & RADIO_ID_MFG;
+    let ver = (id_a & RADIO_ID_VER) >> 12;
+    let rev = (id_a & RADIO_ID_REV) >> 28;
+    let dark = id_a == 0x0000_0000 || id_a == 0xFFFF_FFFF;
+    let order_agree = id_a == id_b;
+    let echo_ok = echo_a == RADIO_REG_ID && echo_b == RADIO_REG_ID;
+    let id_ok = !dark && order_agree && echo_ok && mfg == RADIO_MFG_BROADCOM;
+
+    serial_println!(
+        ":: wifi4: radio-id raw={:#010x} hi={:#06x} lo={:#06x} rev={} ver={:#06x} mfg={:#05x} expected-mfg={:#05x} {} — field layout [SPEC-V3 RadioID] + [SPEC-V4 802.11/Radio/RadioID], both generations agreeing: rev=bits31:28, ver=bits27:12, mfg=bits11:0 ::",
+        id_a, hi_a, lo_a, rev, ver, mfg, RADIO_MFG_BROADCOM,
+        if mfg == RADIO_MFG_BROADCOM { "MATCH" } else { "MISMATCH" }
+    );
+    serial_println!(
+        ":: wifi4: radio-id cross-check order-agree={} (V3 order hi-then-lo={:#010x} vs V4 order lo-then-hi={:#010x} — the two spec generations state OPPOSITE read orders for this one 32-bit register and neither says whether a data port latches on read, so both are executed; agreement means the value is not an artefact of our sequencing) addr-echo={} (0x3F6 read back {:#06x} and {:#06x}, want {:#06x} — a MISMATCH means the running PSM moved the shared latch between our write and our read and the word above is not ours to decode) dark={} ::",
+        order_agree as u8, id_a, id_b, echo_ok as u8, echo_a, echo_b, RADIO_REG_ID, dark as u8
+    );
+    serial_println!(
+        ":: wifi4: radio-id verdict={} gated-on=mfg-is-0x17F+addr-echo+order-agree+not-dark — those four are the WHOLE gate, and every one of them is a Group-A fact or a property of our own reads. The radio VERSION is deliberately NOT in it ::",
+        if id_ok { "VALID" } else { "INVALID" }
+    );
+    serial_println!(
+        ":: wifi4: radio-ver {:#06x} vs {:#06x} {} (ADVISORY, [TREE], NOT GATED — bcm4331.md §S5's \"2059\" is this repository's own prose. Neither generation's radio-version table carries 0x2059 or any HT-PHY radio ([SPEC-V3 RadioID]: 0x2050/0x2051/0x2053/0x2055/0x2060; [SPEC-V4 802.11/Radio/RadioID]: 0x2050/0x2051/0x2055/0x2060/0x2062), so gating on it would be gating on a guess. Same discipline as §S4-W5 residual 4 for the ucode revision number: print what the silicon publishes, gate only on what is cited) ::",
+        ver, RADIO_VER_2059_UNPINNED,
+        if ver == RADIO_VER_2059_UNPINNED { "MATCH" } else { "DIFFERS" }
+    );
+
+    // ── S5(b), the half that has a read-back predicate. ──────────────────────────────────────────
+    //
+    // Every read here is READ-ONLY and every one is taken AFTER the wifi3 prologue's destructive
+    // core reset and the microcode upload that followed it. That ordering is the whole point: §S5(b)
+    // asks whether the PHY survived the reset sequence with the MAC still answering, and the only
+    // way to ask it is to re-read the identity word and the reset state on the far side.
+    let phy = unsafe { r16(bar0, D11_PHY_VER) };
+    let phy_type = (phy >> 8) & 0xF;
+    let ioctl = unsafe { r32(bar0, BAR0_WRAP_OFF + WRAP_IOCTL) };
+    let rctl = unsafe { r32(bar0, BAR0_WRAP_OFF + WRAP_RESET_CTL) };
+    let macctl = unsafe { r32(bar0, D11_MACCTL) };
+    let alive = phy_type == EXPECT_PHY_TYPE
+        && (rctl & RESET_CTL_RESET) == 0
+        && (ioctl & IOCTL_PHY_RESET) == 0
+        && (macctl & MACCTL_PSM_RUN) != 0;
+    serial_println!(
+        ":: wifi4: phy-alive raw={:#06x} analog={} type={} expected={} rev={} ioctl={:#010x} phy-reset={} want=0 resetctl={:#010x} want=0 macctl={:#010x} psm-run={} want=1 verdict={} — [SPEC-V4 802.11/PHY]'s PHY-type table pins 7 = HT PHY (Three Stream N) from a Group-A source, which is the first non-b43-lineage corroboration this tree has for EXPECT_PHY_TYPE. Read-back predicate for §S5(b): a PHY that still decodes to type 7, with the core out of reset and the PSM running, on the far side of a reset that destroyed the resident image ::",
+        phy, (phy >> 12) & 0xF, phy_type, EXPECT_PHY_TYPE, phy & 0xF,
+        ioctl, ((ioctl & IOCTL_PHY_RESET) != 0) as u8,
+        rctl, macctl, ((macctl & MACCTL_PSM_RUN) != 0) as u8,
+        if alive { "PHY-ALIVE" } else { "PHY-SUSPECT" }
+    );
+
+    // ── S5(b), the half that is REFUSED — and what it would take to build it. ────────────────────
+    serial_println!(
+        ":: wifi4: phy-reset REFUSED reason=ai-wrapper-phy-reset-bit-UNPINNED — the SEQUENCE is citable: [SPEC-V4 802.11/CoreReset] orders \"reset the core on the backplane using the flags ORed with PHY Clock Enable and PHY Reset\", then \"wait for the PLL to turn on (150 microseconds)\" ([SPEC-V4 802.11/PHY]: \"between putting the PHY into reset and taking it out, there must be at least a 150 uSec delay for the PLL to settle\"), then take the PHY out of reset. The FLAG VALUES are pinned only for the SSB-era TM State Low register ([SPEC-V4 802.11/CoreFlags]: PHY Reset 0x00080000, PHY Clock Enable 0x00040000, MAC PHY Clock Control Enable 0x00100000) and THIS part is socitype 1 — an AI/BCMA part with an EROM (bcm4331.md §0, Boot AJ) — whose equivalent bits live in the AI wrapper IOCTL at +0x408, a register that appears in NEITHER spec generation (§S4-W5 fact 7 / residual 1: both document only the SSB-era backplane). IOCTL flag values are NOT composed from unpinned sources, which is the same rule the wifi3 prologue obeys by preserving the measured word instead of building one. So no PHY reset is performed and none is faked: what stands is the read-back above. WHAT WOULD SETTLE IT: an AI-wrapper IOCTL bit map for the d11 core from a Group-A source, or a metal reading that discriminates the bit ::"
+    );
+
+    // ── S5(c) and (d). ──────────────────────────────────────────────────────────────────────────
+    serial_println!(
+        ":: wifi4: channel-tune REFUSED reason=htphy-2059-tables-UNPINNED — [SPEC-V4] carries radio pages for 2055/2056/2057/2062/2063 and channel tables for the A and B/G PHYs only; there is no HT-PHY (type 7) channel path and no 2059 radio page in either generation. Checked: /802.11/Radio/, /802.11/Radio/Channel/, /802.11/Radio/Init/, /802.11/Radio/Registers/, /802.11/Radio/RadioID/, /802.11/PHY/, /802.11/CoreReset/, /802.11/CoreFlags/ and the PageIndex on bcm-v4.sipsolutions.net, plus /Radio/, /RadioID/ and /RadioRegister/ on bcm-specs.sipsolutions.net. bcm4331.md §S5 says the tables \"cannot be derived, checked, or reasoned about — only transcribed\", and the only place to transcribe them from is off-limits for this module. NO register is written from a table that exists in no legal source ::"
+    );
+    serial_println!(
+        ":: wifi4: rx-chain NOT ATTEMPTED reason=depends-on-channel-tune — §S5(d) sits on top of (c) and has no read-back predicate of its own before S6 in any case (bcm4331.md §S5: \"(c) and (d) do not, until S6\") ::"
+    );
+
+    phy_end(
+        &dl,
+        id_ok && alive && restored,
+        if id_ok { "phy" } else { "radio-id" },
+        id_a,
+        &pw,
+        if restored { "MATCH" } else { "FAILED" },
+    );
 }
