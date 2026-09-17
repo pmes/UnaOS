@@ -50,3 +50,14 @@ pub mod bench_ride;
 // untouched.
 #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
 pub mod ahci;
+
+// HDA (rmbp-ledger B127): the Intel High Definition Audio controller — the kernel's first audio
+// line (UNAOS_HDA=1 for the census/reset/CORB-RIRB/widget walk, UNAOS_HDATONE=1 for the output
+// stream). x86_64-gated because the enumeration seam is `arch::pci` config space; the FILE is
+// arch-neutral in name and shape — HDA exists on other machines and the Pi's HDMI/PWM audio is its
+// twin, not its replacement (LAWS §3, ONE OS). Knob off => the module is never lexed (the
+// `#[cfg]`-erased `pub mod` is the one case LAWS §5 names as byte-safe) and media are
+// byte-identical. DECLARED LAST, after `ahci` and for the same reason it was: the knob-off line
+// numbering of every module above is untouched.
+#[cfg(all(target_arch = "x86_64", feature = "hda"))]
+pub mod hda;

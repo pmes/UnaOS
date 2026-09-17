@@ -292,6 +292,19 @@ fn main() {
     // Default OFF => no ATA write opcode is linked (`WRITE-DMA-EXT-0x35` is 0 hits on the ELF) and
     // media are byte-identical. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
     if std::env::var("UNAOS_AHCI_WRITE").is_ok() { feats.push("ahci-write"); }
+    // HDA (rmbp-ledger B127, arc 1): UNAOS_HDA=1 arms drivers/hda.rs — the High Definition Audio
+    // controller, the kernel's first audio line. THIS list is what reaches the kernel binary for
+    // MEDIA builds and for every QEMU run that goes through this builder: the builder re-derives
+    // the x86 feature set from env, so a knob wired into arroyo alone ships the driver DISABLED
+    // while the `⚡ kernel features:` banner claims it is on (the s42/INSTGUI and WXN-M3b failure).
+    // This arc is as exposed to that bug as the PCI census and AHCI were, and in the same
+    // direction: a driver that silently did not run prints no `[hda]` line at all, which is
+    // byte-for-byte what a machine with no audio controller in it looks like on the wire — and on
+    // BOTH targets that reading would be wrong, since the rMBP's PCH carries one and the QEMU
+    // fixture attached below IS one. Polled end to end; INTCTL is never written.
+    // Default OFF => module unlinked, census and hook cfg-erased, media byte-identical.
+    // Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
+    if std::env::var("UNAOS_HDA").is_ok() { feats.push("hda"); }
     // BCMA-RECON (GR20): UNAOS_BCMARECON=1 arms drivers/bcma.rs — STRICTLY READ-ONLY recon of the
     // Broadcom WiFi radio (class 0x02 / subclass 0x80), the first arc of the native-BCM4331 path.
     // THIS list is what reaches the kernel binary for MEDIA builds: the builder re-derives the x86
@@ -1216,6 +1229,27 @@ fn main() {
        .arg("-device").arg("ide-hd,drive=esp,bootindex=0")
        .arg("-device").arg("isa-debug-exit,iobase=0xf4,iosize=0x04")
        .arg("-device").arg(xhci_dev);
+    // HDA (B127) fixture: with UNAOS_HDA=1 (or UNAOS_HDATONE=1, which implies it) attach QEMU's
+    // `intel-hda` controller with one `hda-duplex` codec on it and a NULL audio backend. This is
+    // the one driver in this arc's neighbourhood that has a real emulator — unlike the BCM4331
+    // radio or the Apple SMC, whose arcs are metal-first by construction — so the walk and the
+    // walk is gateable here rather than metal-first.
+    //   `-audiodev none,id=snd0` is a real backend that consumes samples and produces silence, so
+    // the stream engine runs, LPIB advances and BCIS latches with nothing reaching the host's
+    // sound card. `audiodev=` is a REQUIRED property of the codec device on the QEMU this tree
+    // builds against (`qemu-system-x86_64 -device help` lists hda-duplex on bus HDA; `-audiodev
+    // help` lists `none` first), and a codec without it refuses to realise.
+    //   BUILDER KNOB SHARED WITH A KERNEL FEATURE, which is the one shape the four-place wiring
+    // note above does NOT cover: the same env var both pushes `hda` into `feats` and attaches the
+    // device, so the fixture and the driver can never disagree about whether this run has a
+    // controller in it. UNSET => not one argument is added and a default run's QEMU command line
+    // is byte-identical to what it was before this arc.
+    if std::env::var("UNAOS_HDA").is_ok() {
+        cmd.arg("-device").arg("intel-hda,id=hda0")
+           .arg("-device").arg("hda-duplex,bus=hda0.0,audiodev=snd0")
+           .arg("-audiodev").arg("none,id=snd0");
+        println!("   UNAOS_HDA: intel-hda controller + hda-duplex codec on a null audiodev — the HDA driver's QEMU target (walk + stream; no host sound card is opened)");
+    }
     // EHCI-1 scout (UNAOS_EHCISCOUT=1): give the read-only EHCI probe a QEMU target. q35's default
     // device set has no EHCI, so attach a standalone `usb-ehci` PCI controller (class 0x0C0320) — no
     // downstream device, so the scout reports the controller's cap/op/PORTSC state with 0 connected

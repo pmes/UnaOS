@@ -3357,6 +3357,36 @@ ahci = []
 # THIS knob the quiet failure reads on the wire as a working refusal.
 # See docs/dev/OS/07_USB_STORAGE/ahci.md and docs/dev/OS/10_INSTALL/partition-install.md.
 ahci-write = ["ahci"]
+# HDA (rmbp-ledger B127, arc 1) — the Intel High Definition Audio controller, `UNAOS_HDA=1`.
+# Nothing in this kernel had ever touched audio before this feature existed: `PciScanner::
+# enumerate_buses` matches exactly one class triple (xHCI) and the `[PCI-STOR]` census matches
+# class 0x01 and class 0x08/0x05, so a class-0x04 function was one this kernel structurally could
+# not see and no capture in the project's history carries an `[hda]` line. Arms the class-0x04
+# census in drivers/pci.rs, the BAR0 map, the `GCTL.CRST` reset with the specification's timing,
+# `STATESTS` as the codec presence bitmap, the CORB/RIRB ring pair in DMA-visible memory, and the
+# widget walk (function groups, node types, connection lists, pin default-configuration decode)
+# that derives the output path the internal speaker sits on.
+#
+# POLLED, never interrupt-driven: `INTCTL` is never written, so `GIE`/`CIE`/`SIE` stay 0 and the
+# controller raises no message; every wait is a bounded TSC spin, because all of this happens
+# inside `pci::init` where `arch::ms()` does not advance. Nothing is registered with any subsystem
+# and no service loop gains a call.
+#
+# Default OFF => `drivers/hda.rs` is not lexed at all (the `#[cfg]`-erased `pub mod` is the one
+# case LAWS §5 names as byte-safe), the census in `drivers/pci.rs` is an IMPL-TAIL append and its
+# call site there is a LINE-NEUTRAL append that vanishes — so no `core::panic::Location` line
+# number anywhere moves (`./arroyo knoboff hda`). x86_64 only (the enumeration seam is `arch::pci`
+# config space; the FILE is arch-neutral in name and shape — HDA exists on other machines and the
+# Pi's HDMI/PWM audio is its twin), and stripped from aarch64 builds by arroyo's `arm_features` so
+# aarch64 media stay byte-identical whichever way this knob points.
+#
+# Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs` — the builder rebuilds the x86
+# kernel from its own env list, so a knob wired only in arroyo ships the driver DISABLED while the
+# `⚡ kernel features:` banner claims it is on (the s42/INSTGUI and WXN-M3b lesson), and for THIS
+# driver the quiet failure is the worst kind: no `[hda]` line reads exactly like a machine with no
+# audio controller in it, which is a different finding entirely.
+# See docs/dev/OS/11_AUDIO/hda.md.
+hda = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
