@@ -1,0 +1,78 @@
+W5SPIN — the loop the three dead cores of flight 10 were parked in.
+
+FLOWN ARTIFACT
+  ~/unaos-bench/flash/rmbp/UnaOS-rmbp-esp-rmbp12flight10-20260916T2132Z-fa4dcf0/kernel.elf
+  built from fa4dcf0b; wm.rs is byte-identical at fa4dcf0b and at this arc's parent 4638014e
+  (`git diff --stat fa4dcf0b 4638014e -- unaos/crates/kernel/src/video/wm.rs` printed nothing),
+  so every address below maps to the source in this commit without a rebase.
+
+LOAD OFFSET
+  wire memcpy 0x79454510 - ELF memcpy 0x2fa510 = 0x7915a000.
+
+SYMBOL
+  $ ~/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-nm \
+      --print-size --demangle kernel.elf | awk 'index($0,"present_banded")'
+  00000000000f9940 00000000000007b3 t unaos_kernel::video::wm::present_banded (.llvm.5523520393854964927)
+  000000000029c6b0 00000000000002d3 t unaos_kernel::video::fbcon::route_present_banded
+
+  0x7915a000 + 0xf9940 = 0x79253940.
+  rip 0x79253da2 - 0x79253940 = 0x462   (flight-10 stall 1, c1)
+  rip 0x79253da6 - 0x79253940 = 0x466   (flight-10 stalls 2 and 3, c2 and c3)
+
+DISASSEMBLY
+  $ cd ~/unaos-bench/flash/rmbp/UnaOS-rmbp-esp-rmbp12flight10-20260916T2132Z-fa4dcf0
+  $ ~/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-objdump \
+      -d --start-address=0xf9d20 --stop-address=0xf9dc0 --demangle kernel.elf
+
+00000000000f9940 <unaos_kernel::video::wm::present_banded (.llvm.5523520393854964927)>:
+   f9d20: 45 31 e4                     	xorl	%r12d, %r12d
+   f9d23: f0                           	lock
+   f9d24: 48 ff 44 f8 f8               	incq	-0x8(%rax,%rdi,8)
+   f9d29: 49 89 eb                     	movq	%rbp, %r11
+   f9d2c: 4d 85 db                     	testq	%r11, %r11
+   f9d2f: 0f 84 ac 01 00 00            	je	0xf9ee1 <...present_banded+0x5a1>
+   f9d35: 48 83 7c 24 10 00            	cmpq	$0x0, 0x10(%rsp)
+   f9d3b: 0f 84 a0 01 00 00            	je	0xf9ee1 <...present_banded+0x5a1>
+   f9d41: 49 83 ff 0b                  	cmpq	$0xb, %r15                  ; slot >= MAX_WINDOWS ?
+   f9d45: 0f 87 96 01 00 00            	ja	0xf9ee1 <...present_banded+0x5a1>
+   f9d4b: bd 01 00 00 00               	movl	$0x1, %ebp
+   f9d50: 44 89 f9                     	movl	%r15d, %ecx
+   f9d53: d3 e5                        	shll	%cl, %ebp                   ; bit = 1u32 << slot
+   f9d55: 8b 05 c5 15 23 00            	movl	0x2315c5(%rip), %eax        # 0x32b320 <...wm::PACE_SHADOW_OK>
+   f9d5b: 44 0f a3 f8                  	btl	%r15d, %eax                 ; let valid = PACE_SHADOW_OK & bit != 0
+   f9d5f: 0f 83 b7 00 00 00            	jae	0xf9e1c <...present_banded+0x4dc>   ; !valid && !create -> return
+   f9d65: 4d 85 d2                     	testq	%r10, %r10                  ; surf_len == 0 ?
+   f9d68: 0f 84 73 01 00 00            	je	0xf9ee1 <...present_banded+0x5a1>
+   f9d6e: 44 89 74 24 08               	movl	%r14d, 0x8(%rsp)
+   f9d73: 4c 89 fa                     	movq	%r15, %rdx
+   f9d76: 48 c1 e2 05                  	shlq	$0x5, %rdx                  ; slot * 32  (size_of::<Mutex<Vec<u8>>>)
+   f9d7a: 48 8d 35 17 46 22 00         	leaq	0x224617(%rip), %rsi        # 0x31e398 <...wm::PACE_SHADOW>
+   f9d81: 4c 8d 34 16                  	leaq	(%rsi,%rdx), %r14           ; r14 = &PACE_SHADOW[slot]
+   f9d85: b1 01                        	movb	$0x1, %cl
+   f9d87: 31 c0                        	xorl	%eax, %eax
+   f9d89: f0                           	lock                              ;  -- Mutex::lock(): first CAS
+   f9d8a: 0f b0 0c 32                  	cmpxchgb	%cl, (%rdx,%rsi)
+   f9d8e: 75 12                        	jne	0xf9da2 <...present_banded+0x462>   ; contended -> enter the spin
+   f9d90: eb 21                        	jmp	0xf9db3 <...present_banded+0x473>   ; taken -> body
+   f9d92: 66 66 66 66 66 2e 0f 1f 84 00 00 00 00 00    	nopw	%cs:(%rax,%rax)
+   f9da0: f3 90                        	pause                             ; <<<< THE LOOP (SpinRelax)
+>> f9da2: 41 0f b6 06                  	movzbl	(%r14), %eax              ; <<<< rip +0x462  (c1, stall 1)
+>> f9da6: 84 c0                        	testb	%al, %al                  ; <<<< rip +0x466  (c2 stall 2, c3 stall 3)
+   f9da8: 75 f6                        	jne	0xf9da0 <...present_banded+0x460>   ; still locked -> pause again
+   f9daa: 31 c0                        	xorl	%eax, %eax
+   f9dac: f0                           	lock                              ; free -> retry the CAS
+   f9dad: 41 0f b0 0e                  	cmpxchgb	%cl, (%r14)
+   f9db1: 75 ef                        	jne	0xf9da2 <...present_banded+0x462>   ; lost the race -> back to the load
+   f9db3: 4c 89 c0                     	movq	%r8, %rax                   ; acquired; the band arithmetic begins
+
+WHAT IT IS
+  A test-and-test-and-set acquire of `PACE_SHADOW[slot]`'s spin byte — `pace_shadow_refresh`'s
+  `let mut buf = PACE_SHADOW[slot].lock();` (unaos/crates/kernel/src/video/wm.rs:2119), inlined
+  into `present_banded`. `PACE_SHADOW` is the WPACE-TEXT per-window present-boundary shadow
+  (wm.rs:2042), 32 bytes per `Mutex<Vec<u8>>` entry — hence the `shlq $0x5`.
+
+  There is no exit from f9da0..f9da8 except the byte going to zero. No budget, no counter, no
+  deadline, no yield. The three dead cores of flight 10 (c1 at 665828 ms, c2 at 668402 ms, c3 at
+  841827 ms) were all inside these four instructions, at two rips four bytes apart, with
+  `taken=y` (they answered the NMI, so they are not architecturally parked) and `in_blit=n`
+  (rip outside memcpy, and `blit_inflight=0` on two of the three tripwires).

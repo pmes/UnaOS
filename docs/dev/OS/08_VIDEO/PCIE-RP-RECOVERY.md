@@ -1343,3 +1343,61 @@ link-side branches reproduced a third time. A `revenants=1` anywhere reopens (a�
 once and is the first evidence a parked BAR1 store can complete. If I1/I2 are built before flight
 11, their lines from §12.3 are pre-registered here with their outcome tables and are read with
 `awk 'index($0,":: W5:")'`.
+
+### 12.6 THE W5 VERDICT — I1 and I2 flew, and they answered: the freeze is SOFTWARE (flight 10, 2026-09-17)
+
+I1 (the post-steal BAR0/BAR1-fault dump) and I2 (the NMI to the corpse) were both on flight 10.
+Read with `awk 'index($0,":: W5:")'` on `~/unaos-bench/capture/rmbp12-flight8/ttyUSB0.log` after
+`=== SQUAWK MARK flight10` (line 11269), flown kernel
+`~/unaos-bench/flash/rmbp/UnaOS-rmbp-esp-rmbp12flight10-20260916T2132Z-fa4dcf0/kernel.elf` from
+`fa4dcf0b`. Three stalls, each `PASS OVERDUE` then `W5 site=post-steal` then `W5 nmi` then
+`GATE STOLEN` then `REHOMED`:
+
+| t (ms) | dead | held | gauge at the tripwire | `blit_inflight` | nmi | rip |
+|---|---|---|---|---|---|---|
+| 665828 | c1 | 1528 | `win=10 phase=42 at=pw-strip row=10` | 0 | `taken=y in_blit=n` | `0x79253da2` |
+| 668402 | c2 | 1750 | `win=7 phase=33 at=span-flush row=134` | 1 | `taken=y in_blit=n` | `0x79253da6` |
+| 841827 | c3 | 1768 | `win=9 phase=49 at=pw-exit row=287` | 0 | `taken=y in_blit=n` | `0x79253da6` |
+
+**I2 decides it. `taken=y` three times: the dead cores answer NMIs, so they are executing.** A core
+parked on a non-retiring posted store cannot; that was the whole discriminator §12.3 built I2 for.
+`in_blit=n` three times: no rip is inside `memcpy=0x79454510..0x7945453f`. And `cs=0x8 icr=ok` says
+the delivery itself was sound, so `taken=y` is a reading and not an artefact. The two rips are four
+bytes apart in ONE function — at the flight-10 load offset `0x7915a000` (wire memcpy `0x79454510`
+minus ELF memcpy `0x2fa510`), `video::wm::present_banded + 0x462` and `+ 0x466`, an unbounded
+test-and-test-and-set on `PACE_SHADOW[slot]`'s byte (`pace_shadow_refresh`, `wm.rs:2119`).
+Disassembly and commands: `docs/dev/evidence/rmbp-0916/w5spin/PRESENT-BANDED-LOOP.txt`.
+
+**Three different `at=` phases, one loop.** `pw-strip`, `span-flush` and `pw-exit` are the pass
+BREADCRUMB gauges (`COMP_PASS_PHASE`, `wm.rs:10130`), stamped by the gate holder and read by the
+probe; they name where the holder's pass was when it last stamped, not where the core is. So the
+stall is not tied to the span-flush phase, `blit_inflight` is not the discriminator it was read as
+(0, 1, 0 across three identical stalls), and the SPANFLUSH reading in
+`docs/dev/OS/08_VIDEO/engine.md` §SPANFLUSH — "there is no wait", "the core is not executing
+instructions" — is FALSIFIED. That section now carries the refutation.
+
+**I1's register latch stands, and is now a CONDITION rather than the cause.** All three dumps are
+identical byte for byte: `pmc_intr=00000000 pfifo_intr=00000001 flush=00000000 ep_pcists=0010
+pbus_intr=0000000c pri_fault=80300001/00000000 fault_mask=00000000
+bar1_fault=22010860/8482d000/00000002/00221500`. `pri_fault` bit 31 set is a latched PRI
+timeout/fault with `pri_data=0`; `pbus_intr=0xc` and `pfifo_intr=1` are latched host-interface
+status; `ep_pcists=0010` is the endpoint's own status word. Identical at 665.8 s, 668.4 s and
+841.8 s — a LATCH that was already set and is not re-armed per stall, so it cannot time the freezes.
+What it explains is why the pass is slow enough for the owner's present to collide with the pinned
+shadow at all. Why the GK107 sits in that latch under `storm` is unchanged and still §11.3 rung W5.
+
+**What this licenses, against §12.4's list.** Not a link-side repair, and not an earlier or
+signature-specific steal: the steal is now the WRONG repair for this fault, because the core it
+declares dead is alive and merely waiting on a lock with no deadline. The repair is the deadline
+(W5SPIN, `video/wm`): bound the refresh-side acquire, give up with a counted printed verdict, drop
+the window to the live-read path and RETURN. A core that returns is never "the holder that had not
+moved", so it is never declared DEAD, its `MutexGuard` is never orphaned, and the c1 to c2 to c3
+cascade — each rehomed core inheriting a lock byte no one will ever clear — cannot start.
+
+**How flight 11 is scored on W5.** Zero `GATE STOLEN`, zero `REHOMED the render role`, zero `is
+DEAD and its singleton`. Where flight 10 printed `GATE STOLEN`, flight 11 must print
+`:: [wcser] PRESENT-BANDED SPIN site=<1|2> waited_us=<n> on=shadow<n> -> GAVE-UP ::` (or
+`-> RELEASED ::` if the collision cleared inside the 500 us budget), followed by the desktop
+continuing on the same core. `[wpace] … spin=<n> wedge=<n>` on the rollup is the census of both
+outcomes per window. A `GATE STOLEN` that still appears with no `PRESENT-BANDED SPIN` line before it
+is a DIFFERENT holder wedge and reopens §12.4 — the I2 probe stays wired to say which.
