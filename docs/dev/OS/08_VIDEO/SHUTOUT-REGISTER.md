@@ -330,10 +330,11 @@ nothing guards it across boots, so every boot from that stick switches the mux a
 | G2 `TEARDOWN HUNT TRACE` — four-point firmware-teardown hunt | `UNAOS_IVB` | `:: igpu: TEARDOWN HUNT TRACE ::` (`igpu.rs:459`, n=1) | s8 boot 1, 2026-07-22: **Point-0 is ALL-DEAD too** — pipes/planes/PP_STATUS/PP_CONTROL/DPLL_A read `0x00000000` at all four points, first-instruction-adjacent bootloader entry included; `DP_A=0x1C` constant | the "firmware tears iGPU scanout down during our bootloader window" theory is **dead**: panel power and the PLL were never on at any observable instant. The CF8-failed-read caveat was itself refuted — a failed read would have zeroed `DP_A` too | G1 | **shut-out (the teardown theory); proven (the census)** |
 | G3 `PROTOCOL PROVEN` — gmux indexed handshake | `UNAOS_GMUX_IGD` | `:: igpu: PROTOCOL PROVEN (version plausible)` (`igpu.rs:499`, n=1) | s10 boot 1, 2026-07-22: **version 3.2.19** via the 32-bit indexed read; `MAX_BRIGHTNESS=0x3FF` as a second proof. Gate PASSED | s9's attempt **failed under the 3×8-bit read variant** — the version self-test returned implausible tuples and the gate correctly held, printing raw bytes only. s8 had already flagged the shape: `idx_SWITCH` and `idx_POWER` returned identical bytes twice, the signature of a missing ready-wait between index write and value read. **A read-width error, not a protocol absence** | G1 | **proven** |
 | G4 `SW_DISPLAY` — who owns the panel | `UNAOS_GMUX_IGD` | `:: igpu: SW_DISPLAY` (`igpu.rs:509`, n=1) | s10: **`SW_DISPLAY=0x03 (DISCRETE)`, `SW_DDC=0x02 (DISCRETE)`, `DISC_POWER=0x03 (ON)`**, stable at Boot **and** Kernel | — | G3 | **proven** — the Kepler dGPU owns the panel at every observed instant. This **formally reversed** sitting #5's gmux/iGPU redirect and made "iGPU-all-dead" the **expected** state rather than a paradox |
-| G5 `igpu-dpy rung=00 census` | `UNAOS_GMUX_IGD` | `:: igpu-dpy: rung=00 name=census` (`igpu.rs:1285`, n=1) | flight 5, 2026-08-28: **never reached** | G6 refused upstream of it | G6 | **never-run** |
-| G6 pre-switch gate | `UNAOS_GMUX_IGD` | `:: igpu-dpy: pre-switch state DDC=` (`igpu.rs:1231`, n=1) · `pre-switch-not-accepted` (`igpu.rs:1254`, n=1) | flight 5: `:: igpu: [GMUX] REFUSED: pre-switch-not-accepted (status: 0x00000000) ::` → `:: igpu-dpy: LADDER highest=00/10 name=harness ok=0 pending=0 gmux=UNTOUCHED why=pre-switch-not-accepted elapsed_ms=1 ::` | the gate demands `DDC == GMUX_DDC_DIS` **and** `READ_DISPLAY == GMUX_DISPLAY_DIS` **and both** EXTERNAL registers ∈ {`GMUX_EXTERNAL_DIS`, `GMUX_EXTERNAL_KEPLER_OWNED` (0x21)}. At least one read on that boot fell outside. **The capture already contains the answer** — `igpu-dpy: pre-switch state` prints at `igpu.rs:1231`, *before* the gate returns at `:1254`, so the offending register is named on the wire and has never been read back | G3 | fixed-unflown — GMUX-1 read the datum (`docs/dev/evidence/rmbp-0915/GMUX-1-PRESWITCH.md`: SW_EXT=0x01 was 0x40, the write target); GMUX-2 scores 0x41 (`gmux_preswitch_decode`, igpu.rs tail) and restores nothing it did not read as state; flies next |
-| G7 gmux switch to IGD | `UNAOS_GMUX_IGD` | `:: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD` (`igpu.rs:1441`, n=1) | **never reached on metal** | G6 | G6 | **never-run** — and the inherited claim that it "switches and restores on the same call stack" is **false**: it does not switch at all (flight 5 §3.1). Ledger A7's `GMUX_SWITCH_EXTERNAL=0x01` blocker is therefore a statement about a rung that has never run |
-| G8 ladder rollup | `UNAOS_GMUX_IGD` | `:: igpu-dpy: LADDER highest=` (`igpu.rs:1529`, n=1) | flight 5: `highest=00/10` | — | all | **open** (the instrument works; it reports 0 of 10) |
+| G5 `igpu-dpy rung=00 census` | `UNAOS_GMUX_IGD` | `:: igpu-dpy: rung=00 name=census` (`igpu.rs:1301`, n=1) | flight 10, 2026-09-17: `:: igpu-dpy: rung=00 name=census ok=1 bdsm=0x8BA00001 ggc=0x00000211 ggtt0=0x8BA00003 ggtt1=0x8BA01003 aux_ctl=0x014300C8 frmcnt=0x00000000 ::`, the same on flights 8 and 9 | flight 5 never reached it: G6 refused upstream | G6 | **proven** — and `aux_ctl=0x014300C8` is the datum GMUXDPCD carries to the rollup as `aux_div=0x0C8`: bits 10:0 are the divider every AUX transaction on this machine inherits from firmware, never a value this tree invents |
+| G6 pre-switch gate | `UNAOS_GMUX_IGD` | `:: igpu-dpy: pre-switch state DDC=` (`igpu.rs:1242`, n=1) · `pre-switch-not-accepted` (`igpu.rs:1265`, n=1) | flight 5: `:: igpu: [GMUX] REFUSED: pre-switch-not-accepted (status: 0x00000000) ::` → `:: igpu-dpy: LADDER highest=00/10 name=harness ok=0 pending=0 gmux=UNTOUCHED why=pre-switch-not-accepted elapsed_ms=1 ::` | the gate demands `DDC == GMUX_DDC_DIS` **and** `READ_DISPLAY == GMUX_DISPLAY_DIS` **and both** EXTERNAL registers ∈ {`GMUX_EXTERNAL_DIS`, `GMUX_EXTERNAL_KEPLER_OWNED` (0x21)}. At least one read on that boot fell outside. **The capture already contains the answer** — `igpu-dpy: pre-switch state` prints at `igpu.rs:1242`, *before* the gate returns at `:1265`, so the offending register is named on the wire and has never been read back. **Settled on metal:** flights 8/9/10 all print `… SW_EXT=0x01 SW_EXT_ST=0x21 DISP=0x03 EXT=0x21 sw_ext_state=UNACCEPTED ext_state=kepler-owned gate=ACCEPT ::` | G3 | **proven** (was fixed-unflown) — GMUX-1 read the datum (`docs/dev/evidence/rmbp-0915/GMUX-1-PRESWITCH.md`: SW_EXT=0x01 was 0x40, the write target); GMUX-2 scores 0x41 (`gmux_preswitch_decode`, igpu.rs tail) and restores nothing it did not read as state; flies next |
+| G7 gmux switch to IGD | `UNAOS_GMUX_IGD` | `:: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD` (`igpu.rs:1584`, n=1) | **REACHED**, flights 8/9/10 (2026-09-16/17): the line prints and DDC echoes `0x01` on all three (`:: igpu: [GMUX] switch read-back mismatch … DDC=0x01 DISP=0x02 EXT=0x01 ::`). Flight 10 has no in-git evidence file yet (a mid-boot slice carries no boot anchor, so GATE-LEDGER refuses it); its lines are quoted verbatim here and in ledger A7/B125 | DISP/EXT do not echo and are advisory by design; DDC is the only proven echo, and it is the one the rung gates on | G6 | **proven** — the mux moves. The flight-5 note that it "does not switch at all" was true of flight 5 and is now superseded; the row it depended on (G6) accepts |
+| G10 `pp` panel-power frame + post-switch settle | `UNAOS_GMUX_IGD` | `:: igpu-dpy: rung=03 name=pp ok=1 pp_write=DECLINED why=pp-bits-uncited` (`igpu.rs:1457`, n=1) · `:: igpu-dpy: rung=03 name=pp SETTLE ms=` (`igpu.rs:1475`, n=1) | **unflown** (new, GMUXDPCD). What it will read is already half-known: flights 8/9/10 all show `PP_CONTROL_PCH=0xABCD0008`, `PP_STATUS_PCH=0x00000000`, `PCH_PP_ON_DELAYS=0x00000000`, `PCH_PP_OFF_DELAYS=0x00000000`, `PCH_PP_DIVISOR=0x00186904` | **it writes nothing, on purpose, and three independent legs hold that.** (i) *No citation.* Raising VDD means a named bit in `PCH_PP_CONTROL` (0xC7204) and this tree holds no legal bit map for it: `gen7.md` names the register once, only to say it is read-only; `gpu_spec.md` does not name it; `gen7.rs`'s `PCH_PP_CONTROL_KEY` cites `0xABCD` as an entropy PATTERN, not a semantic; the only bit naming in tree (`docs/dev/GEMINI/video/iGUI/LADDER-igpu-bringup.md` rung 2) is marked **TBV** against i915 `intel_pps.c` and names PRM Vol 3 Part 4 "Panel Power Sequencing" as the document still needed. (ii) *Metal says it is unnecessary.* Flight 8 reached `highest=05/10 name=end ok=1` — DPCD **and** a header-and-checksum-valid 128-byte EDID — with the PPS in that same state, so the sink answers AUX with the sequencer untouched. `PP_ON_DELAYS=0` is a third, independent blocker: the panel's T1..T12 are unprogrammed and firing the PPS on zero delays is the documented panel-damage path | G7 | **fixed-unflown** — the rung is the census + a `PP_SETTLE_MS`-bounded settle between the mux write and the first AUX attempt, and the declension is printed with its reason token so the missing citation is a wire fact, not a comment |
+| G8 ladder rollup | `UNAOS_GMUX_IGD` | `:: igpu-dpy: LADDER highest=` (`igpu.rs:1689`, n=1) | flight 10, 2026-09-17: `:: igpu-dpy: LADDER highest=03/10 name=dpcd ok=0 pending=2 gmux=MATCH why=aux-timeout-error elapsed_ms=9 ::` — **`03/10 dpcd aux-timeout-error`**. Flight 9 the same; flight 8, one knob apart, `highest=05/10 name=end ok=1 pending=2 gmux=FAILED why=none elapsed_ms=10` | **the pair is not reproducible, and that is the finding.** Same machine, same register readings, and the boot that got FURTHER voted `gmux=FAILED`. Under GMUXDPCD's renumbering `03` is now `pp` and `dpcd` is `04`, so captures must key on `name=`, never on the number | all | **open** — the instrument now reports 6 of 10 at best. The line gained `pp_seen=`/`pp=`/`pp_settle_ms=`/`aux_port=DPA(0x64010)`/`aux_div=`/`dpcd_tries=`, appended after `elapsed_ms=` so every pre-existing field keeps its name, value and order |
 | G9 iGPU BLT ring (console acceleration) | `UNAOS_IVB` | `:: igpu-blt: ring=absent why=no-active-surface` (`igpu.rs:892`, n=1) | flight 5 and every flight: `ring=absent why=no-active-surface — every iGPU display plane is off (gmux routes the panel elsewhere); CPU path carries the console` | it needs an **active iGPU display plane** to prove scanout extent, and G4 proves there is none while the Kepler owns the panel | G7 opening | **shut-out under "the Kepler owns the panel"** |
 
 **What would change the verdict**
@@ -346,14 +347,14 @@ nothing guards it across boots, so every boot from that stick switches the mux a
   read its accepted value. A wrong read, ours. **GMUX-2 (this register's own next rung; ledger A7,
   `fixed-unflown`)** put the gate on the status ports only and stopped the unwind writing a value it
   never read as state. The next verdict is therefore scored at the glass, on these lines:
-  1. `:: igpu-dpy: pre-switch state … SW_EXT=0x… SW_EXT_ST=0x… … gate=… ::` (`igpu.rs:1231`) — the
+  1. `:: igpu-dpy: pre-switch state … SW_EXT=0x… SW_EXT_ST=0x… … gate=… ::` (`igpu.rs:1242`) — the
      census now prints **both** halves of the 0x40/0x41 pair and the verdict token. `gate=ACCEPT`
      means the three status reads were all in their accepted sets; `gate=REFUSE:<port>@<idx>` names
      which status port reports a state this rung was not written for; `gate=UNREADABLE:<port>@<idx>`
      says the gmux did not answer at all (0x00 / 0xFF / the 0xFFFFFFFF timeout sentinel) — that is
      **not** a mux-state finding, and it is the one outcome that sends this row back to G3.
-  2. Then either `:: igpu-dpy: rung=00 name=census ok=1 …` (`igpu.rs:1285`) — G6 ACCEPTS and G5
-     opens — or the same `pre-switch-not-accepted` (`igpu.rs:1254`; the `why` token is deliberately
+  2. Then either `:: igpu-dpy: rung=00 name=census ok=1 …` (`igpu.rs:1301`) — G6 ACCEPTS and G5
+     opens — or the same `pre-switch-not-accepted` (`igpu.rs:1265`; the `why` token is deliberately
      unchanged so old captures still compare) with `gate=` naming the port.
   A `gate=ACCEPT` whose `SW_EXT` is still `0x01` is the *expected* shape, not a contradiction: 0x40
   is printed and no longer gated, exactly as `SW_DISP` already was.
@@ -362,11 +363,42 @@ nothing guards it across boots, so every boot from that stick switches the mux a
   score when it does: the unwind no longer restores `SWITCH_EXTERNAL` from the 0x40 read, so on a
   Kepler-owned machine (`READ_EXTERNAL=0x21`, for which this tree has no cited status→write map) the
   wire carries `:: igpu-dpy: restore ext=SKIPPED (write-target port, no state read) ::`
-  (`igpu.rs:1262`) and `:: igpu: [GMUX] EXTERNAL restore=SKIPPED …` at the revert, and EXTERNAL does
+  (`igpu.rs:1273`) and `:: igpu: [GMUX] EXTERNAL restore=SKIPPED …` at the revert, and EXTERNAL does
   **not** vote in the `gmux=MATCH|FAILED` verdict. That is deliberate — scoring a register we chose
   not to restore would report `FAILED` for a healthy flight — but it means **G7's first metal run
   leaves the external mux on IGD until power-cycle.** If that costs anything at the glass, the fix is
   a cited status→write encoding for 0x21, not a re-armed blind write-back.
+- **G10 / G8 — the AUX timeout, and what the next boot must print.** Flight 10's rollup is
+  `highest=03/10 name=dpcd ok=0 … why=aux-timeout-error elapsed_ms=9`; flight 8's, on the same
+  machine one knob apart, is `highest=05/10 name=end ok=1`. **An intermittent fault, and that alone
+  shuts out three explanations at once.** "Wrong AUX channel" cannot be intermittent, and the
+  channel is named anyway: `DP_A` (`0x64000`) is the only DP port on this part with any residue
+  (`0x0000001C`, constant at all four teardown-hunt points) while `DP_B`/`DP_C`/`DP_D` read
+  `0x00000000` in **both** the CPU and the PCH block, and the tree's own citation on the wire says
+  eDP on Port A is CPU-attached. "Wrong divider" cannot be intermittent either, and it is inherited
+  from firmware's `aux_ctl`, not invented. "VDD is off" cannot be intermittent, and flight 8
+  positively refutes it: the sink returned DPCD **and** a checksum-valid EDID with
+  `PP_CONTROL_PCH=0xABCD0008` / `PP_STATUS=0x00000000` — the exact PPS state flight 10 timed out
+  under. What is left is **timing**: flight 10 stamps the `[GMUX] switched` line and the AUX verdict
+  in the *same millisecond*, so the ladder re-routes the panel's AUX pair electrically and then
+  interrogates the sink with no settle, once, aborting on the first 1600 µs hardware timeout — and
+  1600 µs was already the maximum the field encodes (flight 10's failing status `0x5D4000C8`, bits
+  27:26 = 0b11). GMUXDPCD spends a settle and retries. The next boot scores it on these lines:
+  1. `:: igpu-dpy: rung=03 name=pp ok=1 pp_write=DECLINED why=pp-bits-uncited pp_window=KEYED delays_programmed=0 pp_unwind=0 pp_ctl=0x… pp_sts=0x… on_delays=0x… off_delays=0x… div=0x… ::` (`igpu.rs:1457`)
+     — the PPS frame **after** the mux moved, which no flight has ever printed; then
+     `:: igpu-dpy: rung=03 name=pp SETTLE ms=210 budget=not-a-cited-T3 moved=<0|1> …` (`igpu.rs:1475`).
+     `moved=1` would say the sequencer is live and sequencing on its own and re-opens the PPS half.
+  2. `:: igpu-dpy: rung=04 name=dpcd try=<n>/7 ok=<0|1> …` (`igpu.rs:1507`/`:1524`), one line per
+     attempt, each carrying the PPS read at that instant. **A boot where try=1 fails and a later
+     try succeeds settles the intermittency by itself**; seven failures with byte-identical status
+     settle it the other way and send this row back to the channel question with evidence.
+  3. The rollup's new tail: `… pp_seen=both pp=0x…/0x…->0x…/0x… pp_settle_ms=210
+     aux_port=DPA(0x64010) aux_div=0x0C8 dpcd_tries=<n> ::` (`igpu.rs:1689`).
+  **What is missing, named exactly:** `PCH_PP_CONTROL` (`0xC7204`) bit 0 (power-state target) and
+  bit 3 (VDD override), from **Intel PRM Vol 3 Part 4, "Panel Power Sequencing"** — and, if that
+  half is ever built, the `PP_ON_DELAYS` (`0xC7208`) T1..T8 field layout from the same section,
+  because this part reads `0x00000000` there and a PPS fired on zero delays is the panel-damage
+  path. Until that document is in tree the write half stays declined, on the wire, with its token.
 - **G9** — its condition is G7's success, not its own code. It is correct to decline.
 - **G2** — the teardown theory is shut out under *the four points we can observe*. If a future
   bootchain moves Point-1 earlier than the firmware's own handoff, the question re-opens; s7 named
@@ -510,7 +542,7 @@ gmux=UNTOUCHED why=pre-switch-not-accepted`, which falsified the inherited claim
 "switches and restores on the same call stack" — it does not switch at all, so ledger A7's
 `GMUX_SWITCH_EXTERNAL=0x01` residency blocker describes a rung that has never executed. The
 cheapest item in this entire register is the fix for that: the gate prints `igpu-dpy: pre-switch
-state DDC=… SW_DISP=… SW_EXT=… DISP=… EXT=…` at `igpu.rs:1214` **before** it refuses at `:1245`, so
+state DDC=… SW_DISP=… SW_EXT=… DISP=… EXT=…` at `igpu.rs:1242` **before** it refuses at `:1265`, so
 the flight-5 capture already named the offending register; GMUX-1 read it back on 2026-09-15 (a wrong READ of the write-target port 0x40) and GMUX-2 fixed the gate the same day — no boot
 required. On power management, the picture is narrower and cleaner: P3 proved the ASPM clear works
 on the wire (`aspm cleared rp 0043->0040 ep 0043->0040`) and proved it is **not** the cure for the

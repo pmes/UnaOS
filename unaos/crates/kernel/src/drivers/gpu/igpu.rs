@@ -1188,6 +1188,17 @@ pub unsafe fn gmux_igd_switch() {
     let mut pp_before: Option<(u32, u32)> = None;
     let mut pp_after: Option<(u32, u32)> = None;
     let mut mux_reads = (0, 0, 0);
+    // GMUXDPCD: the three things flight 10's `why=aux-timeout-error` could not tell an operator
+    // apart, hoisted out of the harness closure so the LADDER line carries them on EVERY exit
+    // path. `aux_div` is the divider the rung actually programmed into `DPA_AUX_CH_CTL[10:0]`
+    // (inherited from firmware's own `aux_ctl`, never invented here) and, with the `aux_port=`
+    // token, says WHICH channel was driven; `dpcd_tries` is how many AUX attempts rung 4 spent;
+    // `pp_settle_ms` is how long rung 3 waited between the mux write and the first attempt. A
+    // capture carrying only `why=aux-timeout-error` cannot separate "wrong channel", "sink
+    // unpowered" and "asked too soon" — these three tokens can.
+    let mut aux_div = 0u32;
+    let mut dpcd_tries = 0u32;
+    let mut pp_settle_ms = 0u64;
 
     // Will be captured dynamically based on live pre-image
     let mut pre_ddc: Option<u32> = None;
@@ -1282,6 +1293,11 @@ pub unsafe fn gmux_igd_switch() {
             return Err(("aux-divider-unusable", 0));
         }
 
+        // GMUXDPCD: the divider is INHERITED, and that is the point — `clock_divider` is
+        // firmware's own `aux_ctl[10:0]`, so it is whatever the part was left programmed with for
+        // the channel at `regs::DPA_AUX_CH_CTL`. Hoisting it (and the offset, on the LADDER line's
+        // `aux_port=` token) is what turns "AUX timed out" into a statement about a NAMED channel.
+        aux_div = clock_divider;
         serial_println!(":: igpu-dpy: rung=00 name=census ok=1 bdsm=0x{:08X} ggc=0x{:08X} ggtt0=0x{:08X} ggtt1=0x{:08X} aux_ctl=0x{:08X} frmcnt=0x{:08X} ::",
             bdsm, ggc, ggtt0, ggtt1, aux_ctl, frmcnt);
 
@@ -1369,18 +1385,148 @@ pub unsafe fn gmux_igd_switch() {
             return Err(("mux-switch-failed", 0));
         }
 
+        // ═══════════════════════════════════════════════════════════════════════════════════
+        // RUNG 3 — `pp`: THE PANEL-POWER FRAME, AND THE SETTLE THE SWITCH OWES THE SINK.
+        //
+        // It writes NOTHING. That is a finding, not an omission, and both halves of the reason
+        // are on the wire below.
+        //
+        // WHY NO PPS WRITE (half one — the citation is missing). Raising panel VDD means setting
+        // a named bit in `PCH_PP_CONTROL` (0xC7204). This tree does not carry a legal bit map for
+        // that register. What it carries is: the LOCATION (`igpu.rs` census, "[CITATION: Intel PRM
+        // Vol 3, South Display Engine Registers] GMBUS and Panel Power Sequencer (PPS) are
+        // PCH-attached"), and the 0xABCD unlock KEY as a Wall-D entropy pattern (`gen7.rs`
+        // CONTROL_FRAME row `PCH_PP_CONTROL_KEY`, the one CRITICAL MMIO row of that frame).
+        // `docs/dev/OS/08_VIDEO/gen7.md` names 0xC7204 once and only to say it is READ ONLY; the
+        // cleanroom `gpu_spec.md` does not name it at all. The one place in tree that names bit 0
+        // / bit 2 / bit 3 — `docs/dev/GEMINI/video/iGUI/LADDER-igpu-bringup.md` rung 2 — marks the
+        // whole map **TBV** and sources it to i915 `intel_pps.c` NAMING, then names the document
+        // still needed: PRM Vol 3 Part 4 "Panel Power Sequencing". A guessed bit in a panel-power
+        // sequencer is the one guess on this machine that can end at damaged hardware, and the
+        // same doc says why in one line: `PP_ON_DELAYS`/`PP_OFF_DELAYS` read 0 on this part, so
+        // the panel's T1..T12 are NOT programmed, and "firing the PPS with zero delays is the
+        // single most likely way to damage or hard-hang the panel". So the write is declined and
+        // the declension is printed with its reason token.
+        //
+        // WHY NO PPS WRITE (half two — METAL SAYS IT IS NOT NEEDED). Flight 8 (2026-09-16) ran
+        // this ladder to `LADDER highest=05/10 name=end ok=1`, which this file only reaches after
+        // the DPCD native read, the I2C-over-AUX EDID address write, eight 16-byte EDID reads, the
+        // EDID header compare and the checksum — i.e. **the eDP sink answered AUX**, with the PPS
+        // in exactly the state flight 10 timed out under (`PP_CONTROL_PCH=0xABCD0008`,
+        // `PP_STATUS=0x00000000`). A sink that answers with the sequencer untouched is not a sink
+        // waiting on VDD. The 0xABCD0008 = forced-VDD reading is therefore CORROBORATED by flight
+        // 8, not falsified — and the flight 9/10 timeouts are an INTERMITTENT fault, which "VDD is
+        // off" cannot be.
+        //
+        // WHAT IS LEFT, AND IS BUILT HERE. Flight 10's own timestamps: the gmux switch and the
+        // first DPCD attempt are stamped in the SAME millisecond (`[26522ms]` for both the
+        // `[GMUX] switched` line and the AUX verdict), and the whole ladder is `elapsed_ms=9`. The
+        // ladder re-routes the panel's AUX pair electrically and then interrogates the sink with
+        // no settle at all, once, aborting on the first 1600 µs hardware timeout. So rung 3 spends
+        // a bounded settle — writing nothing, reading the PPS across it so the wait is itself a
+        // measurement — and rung 4 retries instead of asking once.
         highest = 3;
+        rung_name = "pp";
+        let cycles_per_ms = crate::arch::hw_wait_budget() / 2000;
+
+        let pp_ctl_entry = mmio_read(bar0, regs::PCH_PP_CONTROL);
+        let pp_sts_entry = mmio_read(bar0, regs::PCH_PP_STATUS);
+        let pp_on_entry = mmio_read(bar0, regs::PCH_PP_ON_DELAYS);
+        let pp_off_entry = mmio_read(bar0, regs::PCH_PP_OFF_DELAYS);
+        let pp_div_entry = mmio_read(bar0, regs::PCH_PP_DIVISOR);
+
+        // Wall D for this rung, borrowed whole from `gen7.rs`'s CONTROL_FRAME: the 0xABCD unlock
+        // key in 31:16 is sixteen bits of entropy that no dead bus, floating line or zero-filled
+        // window can produce by accident, and it does not move with panel power state. Without it
+        // every other pp_* number on this line is noise and must not be read as a panel state.
+        // Note the asymmetry that keeps it honest: the KEY is scored, the LOW byte is not —
+        // `gen7.rs` learned that the hard way (review caught that a legitimate 0xABCD0008 ->
+        // 0xABCD0009 would have voided its control frame and burned a boot), and this inherits it.
+        //
+        // ⚠ IT IS A TOKEN, NOT A REFUSAL, AND THAT IS DELIBERATE (R19). The PPS is in the SOUTH
+        // display engine; `DPA_AUX_CH_CTL` (0x64010) is in the NORTH one. A south window that is
+        // not decoding says nothing about whether the AUX channel decodes, so refusing here would
+        // shut out rungs 4 and 5 — which flight 8 proves can pass — on the strength of a register
+        // neither of them uses. This rung writes nothing and so cannot fail: it reports.
+        let pp_window = if (pp_ctl_entry & 0xFFFF_0000) == 0xABCD_0000 { "KEYED" } else { "DEAD" };
+
+        // `delays_programmed` is the second, independent blocker on any future PPS write, and it
+        // is measured rather than remembered: a boot whose firmware DOES program the T-delays
+        // would print 1 here and that is the day this rung's write half becomes designable.
+        let delays_programmed = if pp_on_entry != 0 && pp_off_entry != 0 { 1 } else { 0 };
+        serial_println!(":: igpu-dpy: rung=03 name=pp ok=1 pp_write=DECLINED why=pp-bits-uncited pp_window={} delays_programmed={} pp_unwind=0 pp_ctl=0x{:08X} pp_sts=0x{:08X} on_delays=0x{:08X} off_delays=0x{:08X} div=0x{:08X} ::",
+            pp_window, delays_programmed, pp_ctl_entry, pp_sts_entry, pp_on_entry, pp_off_entry, pp_div_entry);
+
+        // The settle. TSC-bounded, never `arch::ms()`-bounded: `now_cycles()` advances regardless
+        // of EFLAGS.IF or whether the APIC-timer ISR runs, and a panel delay measured on a stopped
+        // clock is either instantaneous or infinite. `PP_SETTLE_MS` is a BUDGET, not a cited T3 —
+        // it is named that way at its definition and on the wire, because this tree cannot cite a
+        // T3 either. Reading the PPS across the wait makes the wait falsifiable: `moved=1` would
+        // say the sequencer is live and sequencing on its own, `moved=0` that it is static and the
+        // settle is buying the SINK time, not the sequencer.
+        let settle_deadline = crate::arch::now_cycles() + cycles_per_ms.saturating_mul(PP_SETTLE_MS);
+        while crate::arch::now_cycles() < settle_deadline {
+            core::hint::spin_loop();
+        }
+        pp_settle_ms = PP_SETTLE_MS;
+        let pp_ctl_settled = mmio_read(bar0, regs::PCH_PP_CONTROL);
+        let pp_sts_settled = mmio_read(bar0, regs::PCH_PP_STATUS);
+        let pp_moved = if pp_ctl_settled != pp_ctl_entry || pp_sts_settled != pp_sts_entry { 1 } else { 0 };
+        serial_println!(":: igpu-dpy: rung=03 name=pp SETTLE ms={} budget=not-a-cited-T3 moved={} pp_ctl=0x{:08X}->0x{:08X} pp_sts=0x{:08X}->0x{:08X} elapsed_ms={} ::",
+            PP_SETTLE_MS, pp_moved, pp_ctl_entry, pp_ctl_settled, pp_sts_entry, pp_sts_settled, get_elapsed_ms());
+
+        highest = 4;
         rung_name = "dpcd";
         let window_deadline = crate::arch::now_cycles() + (crate::arch::hw_wait_budget() * 1);
 
+        // GMUXDPCD: the software retry window. The HARDWARE timeout is already at its maximum
+        // encoding and has been since before flight 8 — `DP_AUX_CH_CTL_TIME_OUT_1600US` is
+        // `3 << 26`, and flight 10's own failing status `0x5D4000C8` carries bits 27:26 = 0b11,
+        // so the 1600 µs arm of the 400/600/800/1600 µs field was the one in force. There is
+        // nothing left to lengthen on the hardware side; the only remaining lever is to ASK
+        // AGAIN. `dp_aux_transfer` already retries seven deep, but only on an AUX DEFER reply —
+        // a TIME_OUT_ERROR returns to the caller on the first occurrence, and flight 10's dpcd
+        // rung (numbered 3 then, 4 now) called it exactly ONCE — which is why its whole ladder is
+        // `elapsed_ms=9`. `DPCD_TRIES` mirrors that same in-file seven (it is inherited
+        // from this file's own defer loop, NOT cited to the DP spec, and is named that way at its
+        // definition). Every attempt prints its own verdict WITH the PPS read at that instant, so
+        // a capture where attempt 1 fails and attempt 3 succeeds settles the intermittency
+        // question by itself, and one where all seven fail with byte-identical status settles it
+        // the other way.
         let mut dpcd_rev = [0u8; 1];
-        if let Err(e) = dp_aux_transfer(bar0, clock_divider, DP_AUX_NATIVE_READ, 0x00000, 1, &[], &mut dpcd_rev, window_deadline) {
+        let mut dpcd_err: Option<(&'static str, u32)> = None;
+        for attempt in 1..=DPCD_TRIES {
+            dpcd_tries = attempt;
+            match dp_aux_transfer(bar0, clock_divider, DP_AUX_NATIVE_READ, 0x00000, 1, &[], &mut dpcd_rev, window_deadline) {
+                Ok(()) => {
+                    dpcd_err = None;
+                    break;
+                }
+                Err((e, stat)) => {
+                    dpcd_err = Some((e, stat));
+                    serial_println!(":: igpu-dpy: rung=04 name=dpcd try={}/{} ok=0 why={} status=0x{:08X} pp_ctl=0x{:08X} pp_sts=0x{:08X} elapsed_ms={} ::",
+                        attempt, DPCD_TRIES, e, stat,
+                        mmio_read(bar0, regs::PCH_PP_CONTROL), mmio_read(bar0, regs::PCH_PP_STATUS),
+                        get_elapsed_ms());
+                    if attempt >= DPCD_TRIES || crate::arch::now_cycles() >= window_deadline {
+                        break;
+                    }
+                    let gap_deadline = crate::arch::now_cycles() + cycles_per_ms.saturating_mul(DPCD_RETRY_GAP_MS);
+                    while crate::arch::now_cycles() < gap_deadline {
+                        core::hint::spin_loop();
+                    }
+                }
+            }
+        }
+        if let Some(e) = dpcd_err {
             pp_after = Some((mmio_read(bar0, regs::PCH_PP_CONTROL), mmio_read(bar0, regs::PCH_PP_STATUS)));
             return Err(e);
         }
+        serial_println!(":: igpu-dpy: rung=04 name=dpcd try={}/{} ok=1 dpcd_rev=0x{:02X} elapsed_ms={} ::",
+            dpcd_tries, DPCD_TRIES, dpcd_rev[0], get_elapsed_ms());
         out_dpcd = Some(dpcd_rev[0]);
 
-        highest = 4;
+        highest = 5;
         rung_name = "edid";
         if let Err(e) = dp_aux_transfer(bar0, clock_divider, DP_AUX_I2C_WRITE | DP_AUX_I2C_MOT, 0x50, 1, &[0x00], &mut [], window_deadline) {
             pp_after = Some((mmio_read(bar0, regs::PCH_PP_CONTROL), mmio_read(bar0, regs::PCH_PP_STATUS)));
@@ -1410,7 +1556,7 @@ pub unsafe fn gmux_igd_switch() {
             return Err(("edid-checksum-bad", 0));
         }
 
-        highest = 5;
+        highest = 6;
         rung_name = "end";
         Ok(())
     };
@@ -1526,8 +1672,24 @@ pub unsafe fn gmux_igd_switch() {
         "UNTOUCHED"
     };
 
-    serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name={} ok={} pending={} gmux={} why={} elapsed_ms={} ::",
-        highest, rung_name, ok_flag, unwound_count, gmux_verdict, why_str, get_elapsed_ms());
+    // GMUXDPCD: the new tokens are APPENDED after `elapsed_ms=`, which was the line's last field.
+    // Every pre-existing field keeps its name, its value and its ORDER — flights 5 and 8-10 and
+    // the G8 row all key on this line, and a capture-to-capture diff has to stay a field-for-field
+    // diff. `pp_seen=` says which of the two PPS samples the LADDER's `pp=` pair actually holds
+    // (`both` on any path that reached an AUX transaction, `before` where the harness died between
+    // the switch and the first transaction, `none` where it never switched), so a 0x00000000 in
+    // `pp=` is never mistaken for a read that happened.
+    let (ppb_ctl, ppb_sts) = pp_before.unwrap_or((0, 0));
+    let (ppa_ctl, ppa_sts) = pp_after.unwrap_or((0, 0));
+    let pp_seen = match (pp_before.is_some(), pp_after.is_some()) {
+        (true, true) => "both",
+        (true, false) => "before",
+        _ => "none",
+    };
+    serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name={} ok={} pending={} gmux={} why={} elapsed_ms={} pp_seen={} pp=0x{:08X}/0x{:08X}->0x{:08X}/0x{:08X} pp_settle_ms={} aux_port=DPA(0x{:05X}) aux_div=0x{:03X} dpcd_tries={} ::",
+        highest, rung_name, ok_flag, unwound_count, gmux_verdict, why_str, get_elapsed_ms(),
+        pp_seen, ppb_ctl, ppb_sts, ppa_ctl, ppa_sts, pp_settle_ms,
+        regs::DPA_AUX_CH_CTL, aux_div, dpcd_tries);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -1728,3 +1890,47 @@ const _: () = {
     assert!(ext_restore_target(0x01).is_none()); // flight 5's 0x40 read, had it ever been offered
     assert!(ext_restore_target(0xFFFF_FFFF).is_none());
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// GMUXDPCD — THE TWO NUMBERS RUNG 3 AND RUNG 4 SPEND, AND WHERE EACH ONE COMES FROM
+//
+// Appended at the FOOT for the reason the GMUX-2 block above already gives: everything below the
+// gmux harness is nothing in a knob-OFF build, so an append here moves no knob-OFF line number and
+// `panic::Location` cannot shift under a `gmux_igd` change (QUEUE B94). Both items carry the same
+// `all(target_arch = "x86_64", feature = "gmux_igd")` cfg as the rest of the ladder.
+//
+// NEITHER OF THESE IS A SPEC CITATION, and each says so in its own name and on the wire. That is
+// deliberate: this rung's whole finding is that the tree cannot cite the PPS bit map, and a
+// budget dressed up as a cited T3 would be the same error one register along.
+
+/// The settle rung 3 spends between the gmux write and the first AUX transaction, in ms.
+///
+/// **A BUDGET, NOT A CITED T3.** The eDP panel-power-on delay for this panel is not in this tree:
+/// `PCH_PP_ON_DELAYS` reads `0x00000000` on this part (firmware never programmed T1..T8), the DPCD
+/// that would carry the panel's own figure is what rung 4 is trying to read, and the field layout
+/// that would decode `PP_ON_DELAYS` is marked TBV against PRM Vol 3 Part 4 "Panel Power
+/// Sequencing" in `docs/dev/OS/08_VIDEO/` — a document this tree does not hold. So 210 is chosen,
+/// not derived, on the one principle that design doc does give for panel timings: **bias long** —
+/// a panel given too much time works, one given too little does not. It is printed on the wire as
+/// `budget=not-a-cited-T3` so no later reader can promote it to a measurement, and it costs the
+/// boot a fifth of a second against a ladder that took 9 ms and learned nothing.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const PP_SETTLE_MS: u64 = 210;
+
+/// How many times rung 4 asks the sink for DPCD 0x00000 before it gives up.
+///
+/// **INHERITED FROM THIS FILE, NOT FROM THE DP SPEC.** `dp_aux_transfer` already gives up after
+/// seven AUX DEFERs (`retry_count >= 7`); seven is reused here so one number governs "how many
+/// times will this ladder ask" rather than two that can drift apart. The hardware timeout needs no
+/// such choice — it is already pinned at the maximum the field encodes
+/// (`DP_AUX_CH_CTL_TIME_OUT_1600US`, `3 << 26`, confirmed on the wire by flight 10's failing
+/// status `0x5D4000C8`, bits 27:26 = 0b11).
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const DPCD_TRIES: u32 = 7;
+
+/// The gap rung 4 leaves between two AUX attempts, in ms. Same standing as `PP_SETTLE_MS`: a
+/// budget. Seven attempts at this spacing put the last attempt roughly 120 ms past the first,
+/// inside the 2 s `window_deadline` the rung already carried, so the retry window can never
+/// outrun the bound that was already there.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const DPCD_RETRY_GAP_MS: u64 = 20;
