@@ -17907,3 +17907,72 @@ moved the image through the line shift, which is the trap `knoboff` exists to ca
 `-> shell deliver=0` and that is correct, not a regression: on flight 10 the bar carried ONE box,
 `app:pulse@34+57` (x 34..91), so of Peter's three presses only `(60,3)` was ever inside a title —
 `(117,5)` and `(279,11)` were on bare strip and had nothing to open.
+## BOOTFAILS — two metal-only fixture reds, one cause, and it is the MENU BAR and not the panel (x86 `wc`, 2026-09-17)
+
+rMBP flights 8, 9 and 10 each printed the same two `-> FAIL` lines, field for field, while the QEMU
+lane printed one of them as `PASS` and the other not at all. Both were read as panel-geometry defects
+of the 2880x1800 glass. Neither is. The variable is the MENU BAR: `desktop_uefi::activate` enables it
+and has exactly one caller — the Kepler takeover — so the bar is up on every metal boot and on no QEMU
+boot, and both fixtures were written against a top edge that is free only while the bar is off. Forcing
+`menubar::set_enabled(true)` around the two fixtures on the 1280x800 QEMU panel reproduces both reds
+with identical fields, which is the measurement that settles it. Provenance, counted over the whole
+capture rather than sampled: all three flights carry both lines unchanged, so neither red is new since
+`11ca67f1` and neither belongs to CURSOREMIT `33fb95db`, PTRREPAINT `bc607ffd`, RENDSTACK or
+PTRINSTALL2. Evidence: `docs/dev/evidence/rmbp-0917/bootfails/BOOTFAILS.txt`.
+
+**`[wc-x] move-vacate` — the probe was reading a box its window never occupied.** The fixture
+(`video/desktop_uefi.rs`, `move_vacate_probe`) opens an 8x8 scratch window pinned at `(EDGE_GAP,
+EDGE_GAP)` = (8,8), moves it one box to the right, and samples five points inside the box it vacated:
+content origin, two content diagonals, the title strip and the lower border. It asserts `painted &&
+clean == 5`, and `painted=false` is its own "this leg proves nothing" arm rather than a false PASS —
+which is exactly what it printed, three boots running. The cause is a CLAMP the fixture did not model:
+`wm::create_at` bounds a pinned CONTENT origin below by `work_top + TITLE_H + BORDER`, which with the
+bar up is `34 + 34 + 5 = 73`, and the capture's own `[wc-d] verify win=2 ... at (13,73) panel=2880x1800`
+is that clamp firing. The window therefore sat at y=73 while the read-back went to the requested y=47:
+`painted=false`, and the title-strip sample at `(ax+ow/2, ay+TITLE_H/2)` = (85,25) landed in the bar's
+own pixels — neither `DESKTOP_BG` nor `PROBE_COL` — which is the `desktop=4/5 stale=0/5`. Note what the
+scale field was NOT saying: `scale=18x` is `cluster_min_scale(8)` = `ceil(141/8)`, the WMMINW
+control-cluster floor, and it is 18 on the 1280x800 gate panel too — the `18x` in the metal line was
+never evidence of a large panel. The fix is one term: the probe's `ay` is now
+`EDGE_GAP.max(ui_status::top_chrome_h(pw, ph))`, the same accessor `wm::work_top` asks, so the origin
+is the WORK AREA's top edge and the clamp has nothing to move. A boot with no bar, or a bar that
+declines the panel, gets `0` back and the layout is byte-for-byte what it was. The SKIP guard moves
+with it (`ph < ay + oh + EDGE_GAP`), because a panel that could host the box at the top edge cannot
+necessarily host it below the furniture.
+
+**`[clickroute] route ... desktop=false` — a corner the window table calls unowned is not a bare
+desktop.** Leg 5 of `clickroute_selftest` (`arch/x86_64/syscall.rs`) asserts that a press over a point
+NO WINDOW OWNS is consumed and hands the keyboard back to the shell. It found that point by scanning
+the four PANEL corners for `wm::hit_test(x, y).is_none()`. `hit_test` answers for window rows only, and
+the menu bar and the dock are FURNITURE — `strip` tenants, invisible to the window table — so (2,2)
+answered "unowned" and the live router then sent the press to the menu band:
+`[clickroute] press at (2,2) band=menu -> open deliver=0`. Consumed, yes, but a menu opening does not
+hand the keyboard anywhere, so `user_input_active() == 0` was false and the leg read `desktop=false`.
+With the bar and the dock both up, ALL FOUR panel corners are furniture on this panel (`work=34+1604`,
+i.e. rows 0..33 bar and 1638..1799 dock), so there was no candidate left that could have passed.
+**And the damage did not stop at leg 5.** The menu that press opened stayed open, so leg 7's furniture
+press was eaten by the band as a `dismiss` (`[clickroute] press at (1354,491) band=menu -> dismiss`)
+and never reached the `is_kernel_owner` arm it exists to test: `deflect=true` on all three metal boots
+is luck, not a verdict, and the tell is that no `[clickroute] furniture deflect` line appears in any of
+them while the QEMU lane prints one. The fix is the same shape as the first: the candidates are now the
+corners of the WORK AREA, read from `ui_status::top_chrome_h` and `ui_status::chrome_h` — the two
+reservations `wm::work_top` and `wm::work_h` lay out from — so the leg probes where the desktop
+actually is. With no furniture those answer `0` and `ph`, and a bar-less boot picks exactly the point
+it picked before, which is why the default QEMU lane's wire is unchanged.
+
+**Go-red, and where it can and cannot be run.** The failing precondition is unreachable on the default
+x86 QEMU lane by construction (`desktop_uefi::activate`'s only caller is the Kepler takeover, and QEMU
+has no Kepler), and `UNAOS_FBW`/`UNAOS_FBH` cannot help: they are read by `arch/aarch64/mailbox.rs`
+alone, so there is no 2880x1800 x86 lane to run. What was run instead, and it is the stronger proof
+because it separates the two candidate causes: a scratch harness forcing the bar on at 1280x800
+reproduced BOTH reds with the metal's own field values (`painted=false desktop=4/5`, `desktop=false`),
+and the same harness on the fixed tree printed `painted=true desktop=5/5 -> PASS`, `press at (2,36)
+... -> consume`, a `furniture deflect` line, and `desktop=true -> PASS`. The harness is scratch and is
+not in this commit; the fixtures still cannot fire this leg on the gate lane, and closing THAT is owed
+(rmbp-ledger B122's residual: the QEMU lane needs a boot that brings the desktop scene up without a
+Kepler card, or these two legs stay metal-only).
+
+**Not fixed here, and it is a third red on the same boots:** `[dmgovlp] verdict ... adopt_stretch=0/4
+-> FAIL`, on flights 8, 9 and 10 alike (the flight-10 verdict word, cut in the seat's excerpt, is
+FAIL). The QEMU lane prints `adopt_stretch=4/4 -> PASS`, so the discriminator is the stretch-adopt
+count and nothing else in that line. It is a separate arc and is owed its own row.

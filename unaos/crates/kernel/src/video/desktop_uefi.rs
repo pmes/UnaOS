@@ -913,13 +913,13 @@ fn move_vacate_probe(pw: usize, ph: usize) {
         Some(g) => g,
         None => return,
     };
-    // Two disjoint boxes along the top edge, clear of the centred console and the corner demo.
+    // Two disjoint boxes along the top edge of the WORK AREA, clear of the centred console, the corner demo — and of the FURNITURE. BOOTFAILS: `create_at` clamps a pinned content origin to `work_top + TITLE_H + BORDER`, so `EDGE_GAP` alone lands the box under the menu bar, the clamp MOVES it, and every read-back below then samples coordinates the window never occupied — rMBP flights 8, 9 and 10 each printed `painted=false desktop=4/5 stale=0/5` (the 4th sample is the BAR's own pixels: neither `DESKTOP_BG` nor `PROBE_COL`), so the leg proved nothing on three metal boots. Reproduced at 1280x800 in QEMU with the bar forced on, fields identical: this was never panel geometry, it is the bar, which only `activate` enables and which the QEMU lane therefore never has up. Ask the furniture where it ends, through the SAME accessor `wm::work_top` asks — a bar that is off, or that declines the panel, answers `0` and the layout is byte-for-byte what it was.
     let step = ow + 2 * EDGE_GAP;
-    if pw < 2 * step + EDGE_GAP || ph < oh + EDGE_GAP {
+    let (ax, ay) = (EDGE_GAP, EDGE_GAP.max(crate::ui_status::top_chrome_h(pw, ph)));
+    if pw < 2 * step + EDGE_GAP || ph < ay + oh + EDGE_GAP {
         serial_println!("[wc-x] move-vacate SKIP (panel {}x{} too small)", pw, ph);
         return;
     }
-    let (ax, ay) = (EDGE_GAP, EDGE_GAP);
     let bx = EDGE_GAP + step;
 
     let surf = core::ptr::addr_of_mut!(PROBE_SURF) as usize;

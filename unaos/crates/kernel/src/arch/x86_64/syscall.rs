@@ -7892,13 +7892,13 @@ pub fn clickroute_selftest() {
 
     // The DESKTOP probe point, found rather than assumed: on x86 the console is itself a window and
     // now hittable, so most of the panel is owned. Report a skip rather than a false verdict if the
-    // live panel leaves nothing unowned.
-    let corners = [
-        (2i32, 2i32),
-        (pw as i32 - 3, 2),
-        (2, ph as i32 - 3),
-        (pw as i32 - 3, ph as i32 - 3),
-    ];
+    // live panel leaves nothing unowned. BOOTFAILS — and the candidates are the corners of the WORK
+    // AREA, not of the PANEL. `wm::hit_test` answers for WINDOW ROWS only; the menu bar and the dock
+    // are FURNITURE, invisible to the window table, so a panel corner reads "unowned" while `wc_click_route_at` routes it to a band.
+    // rMBP flights 8/9/10: `(2,2)` -> `band=menu -> open` — consumed, but the keyboard never handed to the shell, so `desktop=false`; and the menu that press left OPEN then ate leg 7's furniture press as a `dismiss`, so `deflect=true` was luck and not a verdict (no `furniture deflect` line on any of the three boots).
+    // Reproduced at 1280x800 in QEMU with the bar forced on, fields identical, so it is the FURNITURE and not the panel — the bar is up only where `desktop_uefi::activate` ran, i.e. only on metal. Read the two reservations from the same accessors `wm::work_top`/`work_h` lay out from; with no furniture they answer `0` and `ph`, so a bar-less boot picks exactly the point it picked before.
+    let (ytop, ybot) = (crate::ui_status::top_chrome_h(pw, ph) as i32, ph.saturating_sub(crate::ui_status::chrome_h(ph)) as i32);
+    let corners = [(2i32, ytop + 2), (pw as i32 - 3, ytop + 2), (2, ybot - 3), (pw as i32 - 3, ybot - 3)];
     let desktop_pt = corners.iter().copied().find(|&(x, y)| wm::hit_test(x, y).is_none());
 
     let saved_focus = user_input_active();
