@@ -24,9 +24,23 @@ can never be closed.
 Class 4 is an aarch64 `virt` one from `hw-jetson` (added orin 23, 2026-09-08 —
 the sentence that used to stand here said "everything here is x86", and adding an
 aarch64 class without correcting it would have left a doc that reads false to the
-next cold reader). None of these classes has been seen on metal, and none is
-metal-specific: they are all launcher/observer races or transport-margin effects
-that host load makes visible.
+next cold reader). **Classes 5-7 were added after that sentence and are named
+here for exactly the reason it was corrected**: Class 5 is `hw-pi4`
+(`kernel8-test`, raspi4b QEMU) with an x86 control of its own; Classes 6 and 7
+are x86 `hw-rmbp` again.
+
+**"None of these classes has been seen on metal" ALSO used to stand here, and it
+is no longer true — corrected 2026-09-22 (FLAKEFIX) rather than left to read
+false.** §1d has THREE metal sightings, on the rMBP's own flights 8 and 11
+(`chop-logs/flight8.log` twice, `f11.log` once; all three are metal captures —
+`uart16550=absent carrier=ftdi-mirror`, panel 2880x1800, SMC `OSK0` present).
+That is not a wrinkle, it is corroboration: §1d's mechanism is a race against a
+concurrent `compose`, and five real cores race it harder than TCG does. Class 7
+is the one class that is emulator-only BY CONSTRUCTION — it is QEMU's own event
+folding, and there is no such layer on metal. The rest remain unseen on metal and
+none is metal-specific: they are launcher/observer races and transport-margin
+effects, and load — host load under QEMU, real concurrency on metal — is what
+makes them visible.
 
 ---
 
@@ -293,7 +307,7 @@ not of this class.
   1a: a `SWEPT`-and-park handshake so the launcher's re-read happens inside a
   window where the state is provably live, instead of racing a 2000 ms deadline.
 
-### 1c. `[dmgovlp]` `adopt_stretch=0/4` — **suspect only, seen once**
+### 1c. `[dmgovlp]` `adopt_stretch=0/4` — **mechanism still suspect; rate now MEASURED at 6 in 47 boots (2026-09-22), the worst on the bench**
 
 **Signature on the wire** (the verdict's own format, `video/wm.rs:24379`):
 
@@ -355,15 +369,128 @@ drag leg to REFUSE (a distinct verdict word, not FAIL) when `drag_evt=0` —
 it did not measure what it claims to measure. Owner: the next x86 compositor
 arc.
 
+**Two more sightings, 2026-09-22 — this is no longer "seen once".** GMUX8's
+240 s battery at host load 23 (`gmux8-logs/test240.log:1944` —
+`drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=11/12 adopt=0 repaint=1 max_ms=2
+adopt_stretch=0/4 -> FAIL`) and FLAKEFIX's first `test-ptr` run at load 13
+(`flakefix-logs/repro1.log`, `serial.log:2022`, the same fields with
+`cur=10/12 adopt=0 repaint=0 max_ms=0`). Both `drag_evt=0`, i.e. both are the
+"the stimulus never ran" half — exactly the reading the REFUSE verdict asked for
+above would have made free. Rate: **2 reds in the 6 x86 battery runs read by hand that
+day, and 6 reds in 47 boots (about 13%) across every QEMU boot on the bench
+that day** — the worst rate of the three flakes measured, and one whole gate run
+each time. TRACKPAD's two `test-ptr` captures from the same
+box the same day both read
+`drag_evt=5 drag_px=38590 relay=3 adopt_stretch=4/4 -> PASS`, so the fixture is
+not broken — it is unmeasured under load.
+
 **Disposition — WATCH.** Do not clear a gate on this line without an
 idle-host re-run (both benches' standing rule: no single-run red convicts),
 and do not let a clean re-run bury the sighting — bank it here.
+
+### 1d. DOCKID `order=false set=false` — **measured 2026-09-22 (FLAKEFIX, rmbp-ledger B150): a Class-1 re-read race, NOT lost input**
+
+**Signature on the wire** (`video/dock.rs` `dockid_selftest`, the verdict's own
+format):
+
+```
+:: DOCKID: tiles=5 closed=win2 reopened=win2 recycle=true order=false set=false furniture=false count=true/5 pins=true/2 press=yes :: FAIL ::
+```
+
+The green line from the same binary, same box, an hour apart:
+
+```
+:: DOCKID: tiles=5 closed=win2 reopened=win2 recycle=true order=true set=true furniture=true count=true/5 pins=true/2 press=yes :: PASS ::
+```
+
+**Read WHICH legs failed — that is the whole diagnosis, and it is already
+printed.** The fixture has six legs and they split cleanly by what they read:
+
+| leg | reads | 2026-09-22 |
+| --- | --- | --- |
+| `recycle` | `wm::create`'s returned slot id | `true` in 5/5 sightings |
+| `order` | the SHARED tile registry (`TILE_ID`/`TILE_GEN`/rank) | **false** in 5/5 |
+| `set` | the SHARED registry, both directions | **false** in 5/5 |
+| `furniture` | `order_key` re-read over the already-sorted model | false in **1** of 5 |
+| `count` / `pins` | LOCAL scratch only (`probe`, the pin chain) | `true` in 5/5 |
+
+**The two legs that read only local scratch pass in every sighting; every leg
+that reads the shared registry fails.** That is not an input-loss shape — no
+injected event reaches this fixture at all — it is Class 1's shape exactly: a
+ground-truth re-read racing a concurrent mutator.
+
+**Root cause — the registry's one writer is `compose`, and the fixture does not
+exclude the render service's copy of it.** `strip_model` calls `wm::composite()`
+(which reconciles the registry) and then `dock_scan` + the pin chain + `settle`,
+and the fixture then re-reads `TILE_ID`/`TILE_GEN`/`order_key` for its three
+assertions. Nothing parks the render core in between. Under load its own
+`compose` lands inside that gap, and the two failure shapes follow from where it
+lands:
+
+- **between the reconcile and the reads** → the fixture's tiles are not the
+  registry's any more, every app tile falls back to `RANK_UNSEEN + id`, the strip
+  returns to WINDOW-ID order, and because the reopened window carries the closed
+  one's recycled id it sorts BEFORE its elder sibling → `order=false`, and the
+  registry/table cross-check → `set=false`. This is the majority shape
+  (`furniture=true`, 4 of 5, and all three metal sightings) and it is the one `dockid_selftest`'s own doc
+  comment already predicts in its "a dead fold empties the registry" paragraph —
+  the same end state reached by load instead of by a commented-out `settle`.
+- **between `settle`'s sort and the `furniture` walk** → `order_key` returns a
+  different key for a row than the one it was sorted by, monotonicity breaks and
+  `furniture=false` joins them (1 of 5, QEMU only so far).
+
+**Trigger conditions — and this one IS on metal, which is why it is the most
+convincing of the day's three.** On QEMU: **2 FAIL in 46 boots (about 4%)**
+across every boot on the bench on 2026-09-22, de-duplicated by each boot's own
+SERWIT-2 tap lines; FLAKEFIX's own five `test-ptr` runs at host load 9-41 were
+all `PASS`, and the reds are load-correlated the way the rest of this corpus is.
+On the rMBP's own metal, three further sightings, all
+`order=false set=false furniture=true`:
+
+| capture | when | verdict |
+| --- | --- | --- |
+| `f11.log` (flight 11) | `43391ms` | `tiles=7 closed=win5 reopened=win5 recycle=true order=false set=false furniture=true count=true/7 pins=true/2` |
+| `chop-logs/flight8.log` | `36903ms` | `tiles=6 … order=false set=false furniture=true count=true/6 pins=true/1` |
+| `chop-logs/flight8.log` | `38664ms` | the same line again, 1.8 s later in the same boot |
+
+Both are metal captures (`uart16550=absent carrier=ftdi-mirror`, panel
+2880x1800, SMC `OSK0` present), so this class is **not** a TCG artefact and the
+scope note at the top of this file was corrected for it. Five real cores race a
+`compose` harder than a loaded TCG host does, and the same two legs fail, with
+the same `count`/`pins` passing beside them.
+
+**It is NOT the typist class (7).** The lost-input mechanism below is loss
+*outside* the guest — QEMU folding motion events the guest never polled — and
+this fixture consumes no injected input: it mints its own six windows and reads
+kernel state. The two classes share only "host load made it visible". Proved by
+elimination as well as by mechanism: FLAKEFIX's `gored` run injected a
+deliberately lossy 36-report stream that the guest counted as **8**, and DOCKID
+in that same capture (`gored-serial.log:1740`) reads `order=true set=true
+furniture=true :: PASS ::`.
+
+**What to capture on recurrence.** The verdict line in full — the six legs ARE
+the diagnosis. Then: whether `count`/`pins` also went false (they read local
+scratch, so a false there is a DIFFERENT defect and not this class); whether
+`recycle` held; and the host load, or on metal what else was compositing. A sighting with `order=false` and
+`count=false` together is a regression, not this entry.
+
+**Disposition — WATCH, fix reported not made.** `video/dock.rs` is nominally in
+FLAKEFIX's file set but any edit there moves the default image and
+`./arroyo knoboff wc` scores that as a red by construction, so the change is
+written down instead of made. The cure is Class 1's, stated at the head of this
+class and proven in-tree by 1a: the fixture must take its three registry reads
+inside an interval where the registry is provably not moving — publish a
+"holding" flag and park the render service's reconcile (bounded) across the
+`strip_model` → assert span, the way DMG-REFUSE's prober publishes `SWEPT` and
+parks. **Not** a retry loop and **not** a widened assertion: the legs are correct
+about what they assert, they are merely asserting it about a snapshot that has
+already moved.
 
 ---
 
 ## Class 2 — the evidence taps lose lines to a margin-tight serial ring
 
-### 2a. SERWIT-2 `evidence_lost=17` — **suspect only**
+### 2a. SERWIT-2 `evidence_lost=N` — **ROOT CAUSE MEASURED 2026-09-22 (FLAKEFIX, rmbp-ledger B150); the original suspect REFUTED; fix owed in `drivers/xhci/ftdi.rs`**
 
 **Signature on the wire:**
 
@@ -409,19 +536,78 @@ Note also that `dropped` and `torn` are **different outcomes**: a tap charges
 `dropped` only on the exhaustion path — staging ring **full at depth**, *and* the
 free retry at the sink also failed. `evidence_lost` counts only the latter.
 
-**Trigger conditions.** Seen **1 run in 12**. Load-correlated in the same way as
-class 1: the drop path is reachable only while the sink lock is contended *and*
-the 64-slot staging ring is already full, which needs several cores printing at
-once.
+**Trigger conditions.** Seen **1 run in 12** when this entry was opened. Measured
+properly on 2026-09-22 across every QEMU boot on the bench that day, de-duplicated
+by each boot's own four tap lines: **2 FAIL in 65 boots, about 3%** — lower than
+the opening estimate, and low enough that a seat meets it about once a week and
+has no reason to remember it. Host load 9-41, up to nine concurrent `cargo`
+builds. Load-correlated in the same way
+as class 1: the drop path is reachable only while the sink lock is contended
+*and* the 64-slot staging ring is already full, which needs several cores
+printing at once.
 
-**Root cause — SUSPECT, explicitly not established.** No root-cause pass has been
-done; nobody has reproduced it under controlled load or identified which tap
-carried the 17.
+**Root cause — MEASURED 2026-09-22 (FLAKEFIX, rmbp-ledger B150). The tap is
+`ftdi`, the mechanism is DEPTH EXHAUSTION under lock contention, and the suspect
+below is REFUTED.** Four captures from one day, three of them other executors'
+and one reproduced by FLAKEFIX on its own tree, all on the same box:
 
-The suspect named when this corpus was opened is **per-line growth on the
-rollup lines** — concretely, the `stalls=` field, about **9 bytes per rollup** —
-against a serial ring whose margin is real and finite. The arithmetic that
-motivates the suspicion is in-tree and verified:
+| capture | ftdi tap at the verdict | tste tap | verdict |
+| --- | --- | --- | --- |
+| `crystalboot-logs/before-serial.log:588` | `staged=65 dropped=7 torn=0` | `dropped=0` | `FAIL — balanced=true evidence_lost=7` |
+| `flakefix-logs/gored-serial.log:597` | `staged=64 dropped=13 torn=0` | `dropped=0` | `FAIL — balanced=true evidence_lost=13` |
+| `crystalboot-logs/after-serial.log:587` | `staged=30 dropped=0 torn=0` | `dropped=0` | `PASS` |
+| `gmux8-logs/test240.log:1290` | `staged=10 dropped=0 torn=0` | `dropped=0` | `PASS` |
+
+Three things fall out of that table and each of them settles a question this
+entry used to have to ask a future investigator for.
+
+**(1) `torn=0` on every tap of every capture, FAIL and PASS alike.** That is
+this entry's own discriminator #3 below, and it fires against the suspect: the
+loss is the depth-exhaustion path, not the slot-width path, so **per-line growth
+is exonerated** and experiment #6 below does not need running. The `stalls=`
+suspect is retired.
+
+**(2) `staged` reaches the ring's depth exactly on the FAIL runs (64 and 65
+against `SLOTS = 64`) and sits at 10-30 on the PASS runs.** The ring is not
+marginally sized for the ordinary boot; it is exactly sized for the burst, and
+the burst that reaches it is SERWIT-1's own — `5 cores x 24 lines` plus 5
+wide-line probes, 125 lines, with the same run's SERWIT-1 line reading `110-116
+deferred to the staging ring` against `100-111` on the greens.
+
+**(3) The sink is NOT a host device and there is no QEMU backpressure in this
+path.** `drivers/xhci/ftdi.rs` `mirror()` loses a line only when, in order,
+`RING.try_lock()` fails, the 64×240 `STAGE` ring is full, *and* the one free
+retry `RING.try_lock()` fails again. `RING` is an in-kernel capture ring behind
+a spinlock — the FTDI *device* (`-device usb-serial`) is attached only under
+`UNAOS_USBSERIAL` (`builder/src/main.rs:1521`) and is absent from every default
+`./arroyo test`. The host reaches this only through how long a core holds `RING`:
+a vCPU descheduled by a loaded host mid-memcpy stretches the hold, the other four
+cores all miss the `try_lock`, and `STAGE` fills behind them. "sink contended or
+full" means **contended**, every time this has been measured.
+
+**THE FIX IS IN A FILE FLAKEFIX MAY NOT TOUCH, so it is reported and not made**
+(`drivers/xhci/ftdi.rs` is not in that brief's file set, and any edit there moves
+the default image, which `./arroyo knoboff wc` scores as a red by construction —
+see rmbp-ledger B144's note on knoboff having no power over unconditional code).
+The exact change, for whoever holds the file: **the one free retry is not
+enough.** `mirror()`'s third step is a single `try_lock`, so a line is declared
+lost after losing one race, while `serial_ring`'s own primary producer
+BACK-PRESSURES instead (`:: SERWIT-1B: … the contended producer BACK-PRESSURES,
+it does not drop … one capped drain freed 3 slot(s), the next turn DEFERRED the
+line intact, 0 dropped -> PASS ::`). Give the mirror the same policy the primary
+wire already has — a bounded spin on the retry, or a capped drain of `STAGE`
+into `RING` before declaring the loss — and quote a run with `staged >= 64` and
+`dropped=0` as the proof. **Do not widen `evidence_lost`'s threshold**: the 13
+lines are really gone, and on a 2012 rMBP with no 16550 the FTDI capture is not a
+mirror of the evidence, it IS the evidence (this function's own doc comment says
+so). A tolerance here would be the wrong-lenient half of LAWS §5 applied to the
+one tap that cannot afford it.
+
+The suspect that stood here before, kept because the arithmetic is still true and
+the next reader should not re-derive it: **per-line growth on the rollup lines**
+— concretely, the `stalls=` field, about **9 bytes per rollup** — against a
+serial ring whose margin is real and finite. The arithmetic is in-tree and
+verified:
 
 - the primary staging ring is `SLOTS = 64` × `SLOT_LEN = 1536` bytes; the
   measured worst-case line in the whole tree is 1291 chars + newline = **1292
@@ -434,8 +620,9 @@ tighter still. Two ways growth could bite, and they are distinguishable on the
 wire: extra bytes per line lengthen the sink-lock hold, which deepens staging and
 makes the depth-exhaustion `dropped` path reachable (→ `dropped` climbs); or
 extra bytes push a line past a slot width (→ `torn` climbs instead). **Only the
-first would produce `evidence_lost`.** That asymmetry is the cheapest available
-discriminator and it has not yet been checked against a real capture.
+first would produce `evidence_lost`.** That asymmetry was the cheapest available
+discriminator; it has now been checked against four real captures and it reads
+`torn=0` in all of them, which is why the width half is retired above.
 
 **What to capture on recurrence.** In priority order:
 
@@ -454,17 +641,63 @@ discriminator and it has not yet been checked against a real capture.
    `N back-pressured on a full ring (deepest X of Y turns)`; on the FAIL line
    they are the literal `stalls=N maxspin=M/…` fields.
 5. Host load and core count, and whether a re-run on an idle host is clean.
-6. If it is reproducible under load, the discriminating experiment: re-run with
-   the rollup lines shortened and see whether `evidence_lost` follows. That is
-   the check that would confirm or kill the suspect, and it has not been run.
+6. ~~If it is reproducible under load, the discriminating experiment: re-run with
+   the rollup lines shortened and see whether `evidence_lost` follows.~~ **Not
+   needed — `torn=0` in four captures answers it. Do not spend a run on it.**
 
-**Disposition — WATCH, suspect unconfirmed.** SERWIT-2 is not asserted by any
-`.spec` file (`x86-fat.spec`, `round6-rmbp.spec`, `x86-witness.spec`,
-`rmbp-boot.spec` carry no SERWIT token), so this failure does **not** turn a gate
-red on its own — it is caught by reading the log, and by
-`tools/serial-analyzer.py`, which does carry a `SERWIT-2` witness family. Treat a
-sighting as evidence to bank rather than as a gate failure to clear, and do not
-let a green spec run bury it.
+**Disposition — ROOT CAUSE KNOWN, FIX OWED, and CORRECT one sentence this entry
+used to carry: it DOES turn the gate red.** The old text said SERWIT-2 "does not
+turn a gate red on its own" because no `.spec` file carries a SERWIT token. That
+is true of the spec replay and false of the run: `FAIL ::` is in arroyo's
+`FAULT_PATTERNS`, so `scan_serial_faults` reds the leg on the verdict line and
+the spec replay never runs. Measured twice on 2026-09-22 —
+`✖ serial.log:591: :: SERWIT-2: FAIL — balanced=true evidence_lost=7 ::` ending
+CRYSTALBOOT's baseline run, and `✖ serial.log:600: … evidence_lost=13 ::` ending
+FLAKEFIX's. So a sighting is a **lost gate run**, not evidence to bank quietly,
+and that is what puts the fix above on the owed list rather than the watch list.
+
+**Companion sighting, same ring, same day, recorded so it is not diagnosed
+separately.** FLAKEFIX's `green2` run at host load 33 red on four `serial_ring`
+drain fixtures at once —
+`:: PWRDRAIN: FAIL — filled=64 lines=61 bytes=4148 want_bytes=4352 …`,
+`:: S5DRAIN: FAIL — filled=64 lines=25 bytes=1675 want_bytes=4288 …`,
+`:: SINKDRAIN: FAIL — staged=8 drained=0 on_cable=0 …`,
+`:: SERWIRE: FAIL — filled=8 capped_drains=1 capped_b=0 want_b=201 …` — every one
+of them `filled=64`, i.e. the same ring at the same depth under the same
+contention, and every one with `dropped=0` and `residue=0`. They are this class,
+not four defects, and a fix that gives the mirror the primary wire's
+back-pressure policy should be scored against them too.
+
+### 2b. `[mirror] tste: N line(s) dropped` is **NOT** what `evidence_lost` counts — **measured 2026-09-22, recorded so the wrong inference is not drawn twice**
+
+**The wrong reading, and it is the natural one.** A capture carries
+`[mirror] tste: 13 line(s) dropped, 0 truncated since boot (sink contended or
+full)` and a SERWIT-2 FAIL, and the two get joined. They are unrelated, and three
+captures from one day say so:
+
+| capture | `[mirror] tste` lines | tste tap AT the verdict | SERWIT-2 |
+| --- | --- | --- | --- |
+| `gmux8-logs/test240.log` | 12 of them, lines 2832-2939 | `:1291 dropped=0` | `:1293 PASS` |
+| `crystalboot-logs/before-serial.log` | 11 of them, lines 2146-2257 | `:589 dropped=0` | `:591 FAIL, evidence_lost=7` (carried by **ftdi**, `:588`) |
+| `flakefix-logs/gored-serial.log` | 11 of them, lines 2182+ | `:598 dropped=0` | `:600 FAIL, evidence_lost=13` (carried by **ftdi**, `:597`) |
+
+**The mechanism of the confusion is ORDERING.** SERWIT-2 is a one-shot verdict
+that prints at ~line 590-1290 of the boot; every `[mirror] tste:` line in all
+three captures lands ~1500 lines LATER, in a different phase. The tste tap reads
+`dropped=0` at the instant the verdict snapshots it, in every capture, green and
+red alike. GMUX8's run is the clean falsification: 13 tste drops in the capture
+and `SERWIT-2 … -> PASS` with `evidence_lost=0`.
+
+**What the tste drops are.** A separate, later, still-real loss on the
+boot-verdict replay ring, from the same contention mechanism as 2a but past the
+verdict's window — so no fixture scores them and nothing reds on them. They are
+worth a class entry of their own when someone holds `serial_ring.rs`; they are
+not worth attributing to a SERWIT-2 number they cannot have contributed to.
+
+**What to capture on recurrence.** The tap line at the verdict, with its serial
+line number, beside the `[mirror]` line's. If the two are more than a handful of
+lines apart, they are describing different moments and only the tap line is a
+reading of what the verdict scored.
 
 ---
 
@@ -531,6 +764,18 @@ it, it is this class rather than a regression in whatever arc is in flight.
 **Do not run gates concurrently in one worktree.** The runs share `target/` and
 the host's cores, and this class is the second-order cost — the same reason
 `target/` is never a flash-staging handoff source.
+
+**2026-09-22 reading, recorded so the field is not misread (FLAKEFIX, B150).**
+Every `[ptrdead] backlog` line carrying a non-zero `fpop12`/`fpop3` in that day's
+captures ends `-> PASS`, because the affected legs now read
+`whole=skip nodrop=skip order=skip` — the leg DECLINES when a foreign pop is
+seen instead of asserting through it, which is one of the two cures this entry
+said it did not choose between. The line's grammar has also moved on from the
+one quoted above: it ends `cpu=N svc=Some(N)` now, not `quiesced=`. So a
+non-zero `fpop3` on a current capture is **not** by itself a red, and
+rmbp-queue's `· B9` row (`[ptrdead] … fpop3=1 -> FAIL`, 2 reds in 5 WC runs,
+both at load ≥ 24) is about the older grammar. A `-> FAIL` with `fpop12=0` is
+still the regression this entry warns about.
 
 ---
 
@@ -910,6 +1155,122 @@ is absent from the knob-free default boot and a REQUIRE in `x86-default.spec` wo
 APPPIN trap) and `FORBID :: WINMENU: .* -> SKIP reason=menu-unpublished-after=[0-9]+ms ::` in
 both `x86-ahci.spec` and `x86-default.spec`, so a 250 ms miss on the fold gate's
 `UNAOS_WC=1 ./arroyo test` is a red, not a silent green.
+
+---
+
+## Class 7 — the INJECTED-EVENT typist paces on the wall clock, and the emulator FOLDS what the guest did not poll
+
+**The shape.** A fixture counts events a host-side typist injected over QMP, and
+pins the count. The typist sends on a fixed cadence and never learns whether
+QEMU's emulated device delivered anything. On an idle host the cadence is far
+wider than the endpoint's polling interval and every event becomes its own HID
+report; under load the guest's poll gap stretches past the cadence, QEMU folds
+the events it has not yet handed over, and the report COUNT the fixture pins
+comes back short — while nothing was dropped and no error was reported anywhere.
+The fixture is then measuring the host's scheduler.
+
+The trap is that the shortfall LOOKS like loss. It is not: the travel is
+conserved, QMP acked every command, and the only casualty is the count.
+
+### 7a. PTRLANE `:: PTRINSTALL: installs=27 reports=27` for 36 typed — **known, FIXED 2026-09-22 (FLAKEFIX, rmbp-ledger B150)**
+
+**Signature on the wire.** The spec replay's first shortfall, against
+`x86-ptr.spec:66/67`:
+
+```
+:: PTRINSTALL: installs=27 reports=27 folds=0 lag_max_ms=20 coalesced=0 drains=27 ::
+  ❌ REQUIRE    \[ptrinstall\] installs=36 reports=36 lag_max_ms=\d+ coalesced=\d+ drains=\d+ folds=\d+
+       FIRST-SHORTFALL x86-ptr.spec:66
+```
+
+**and the discriminator is one field away, on a line nobody was reading:**
+
+```
+:: MOUSE-1: 32 reports, last dx=0 dy=0 buttons=0x00 == witness ::
+```
+
+The green form of the same witness, same command, same box:
+
+```
+:: MOUSE-1: 32 reports, last dx=-24 dy=-24 buttons=0x00 == witness ::
+:: PTRINSTALL: installs=36 reports=36 folds=0 lag_max_ms=27 coalesced=0 drains=36 ::
+```
+
+**`last dx=0 dy=0` IS THE ROOT CAUSE AND IT IS A DELTA THE TYPIST CANNOT SEND.**
+`scripts/qmp_type.py --pointer-kind rel` alternates `+step` / `-step` on both
+axes, so every event on the wire is ±24 and a zero delta can only be a SUM.
+QEMU's `hid_pointer_event` (`hw/input/hid.c`) folds a new motion event into the
+TAIL queue entry while that entry has not been polled — "we combine events where
+possible to keep the queue small" — so two adjacent moves become ONE report of
+(+24) + (−24) = 0 as soon as the guest's poll gap exceeds the injection gap. The
+same capture's `drain_gap_max_ms=140` against a 50 ms cadence is that gap,
+measured. The guest then discards the folded report before counting it:
+`drivers/xhci/mod.rs` charges `mouse_report_count` (so MOUSE-1 keeps climbing)
+but emits `Event::Mouse` only when `dx != 0 || dy != 0`, so `[ptrinstall]
+reports=` never sees it. Hence `MOUSE-1` > `PTRINSTALL` > typed, all in one
+capture.
+
+**The three candidates, and how each was eliminated.**
+
+| candidate | eliminated by |
+| --- | --- |
+| the QMP socket | every `input-send-event` returned `{}`; an `error` reply is already fatal in `qmp_type.py` |
+| QEMU's 16-deep `QUEUE_LENGTH` drop path | needs >16 undelivered events; a 50 ms cadence against an 8 ms interval never builds that depth, and a drop loses travel — the travel is conserved |
+| **QEMU's motion coalescing** | `last dx=0 dy=0`, impossible from the stream, plus `MOUSE-1 count > PTRINSTALL count` in the same capture |
+
+**Trigger conditions.** Host CPU contention. TRACKPAD lost a `test-ptr` gate run
+to it at host load 23 on 2026-09-22 (`27` of 36; its control run scored worse
+still, 0 `[ptrinstall]` lines). It is **deterministically reproducible without
+any load at all** by putting the cadence under the endpoint's 8 ms polling
+interval — which is the same mechanism, driven rather than waited for:
+
+```
+UNAOS_PTRLANE_NOACK=1 UNAOS_PTRLANE_GAP=0.006 ./arroyo test-ptr 150
+  -> :: PTRINSTALL: installs=8 reports=8 …   (36 typed, host load 11)
+```
+
+**Fix — the typist ACKS delivery instead of pacing on the clock.**
+`scripts/qmp_type.py --pointer-ack N` (`PTRACK`; see that block in the script's
+header). After the wall-clock first pass it reads the guest's own
+`[ptrinstall] reports=` out of the serial log it already holds open for
+`--marker`, and re-sends **exactly the shortfall** `--ack-gap` apart, up to
+`--ack-rounds` (3 on this lane). Exactly the shortfall, so the loop can
+undershoot and retry but can never overshoot a fixture that pins an equality;
+`--ack-settle` (0.5 s) is the quiet the reading is taken after, so a rollup tick
+that fires between the last send and the guest's 8 ms poll cannot be mistaken for
+a shortfall. On cap exhaustion it prints
+`[qmp] pointer ack: GAVE UP after N retry round(s) — guest counted C of T …` and
+stops: **the shortfall stays real, the spec literal `installs=36 reports=36` is
+untouched, and no tolerance is widened anywhere.** `arroyo`'s PTRLANE block arms
+it; `UNAOS_PTRLANE_NOACK=1` and `UNAOS_PTRLANE_GAP=<secs>` are the two host-side
+go-reds.
+
+**Measured, at the cadence that fails deterministically (`UNAOS_PTRLANE_GAP=0.006`):**
+
+| run | host load | typist | verdict |
+| --- | --- | --- | --- |
+| go-red, `NOACK=1` | 11.2 | `36 rel moves … 6 ms apart` | `installs=8 reports=8`, rc=1 |
+| green0 | 10.3 | `round 1/3 — guest counted 10 of 36 … re-sending 26` → `36 of 36 after 1 round, 62 sent` | `installs=36 reports=36`, **rc=0** |
+| green1 | 9.2 | `counted 6 of 36` → `36 of 36 after 1 round, 66 sent` | `installs=36 reports=36`, **rc=0** |
+| green2 | 11.4 → 33.2 | `counted 4 of 36` → `36 of 36 after 1 round, 68 sent` | `installs=36 reports=36`; run rc=1 on an unrelated class-2 red |
+| green3 | 33.2 → 41.2 | `counted 4 of 36` → `36 of 36 after 1 round, 68 sent` | `installs=36 reports=36`, **rc=0** |
+
+Four consecutive runs, one retry round each, `installs=36 reports=36` every time
+including at host load 41 — and never 37.
+
+**What to capture on recurrence.** The typist transcript
+(`target/ptrlane-typist.log`) and the `MOUSE-1` line together. `pointer ack:
+GAVE UP` with a large shortfall and MOUSE-1 reading `dx=0 dy=0` is this class
+with the retry budget too small; `GAVE UP` with MOUSE-1 NOT climbing at all is a
+different failure (the device or the endpoint, not the fold) and does not belong
+here.
+
+**Do NOT apply the ack to the keyboard bursts.** `qmp_type.py --bursts` exists to
+LOSE events — it measures how many the endpoint drops with no TRB armed — so
+acking it would erase the thing it measures. `--pointer-ack` is pointer-only on
+purpose.
+
+---
 
 ## Adding an entry
 

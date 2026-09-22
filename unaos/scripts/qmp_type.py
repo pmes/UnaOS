@@ -61,9 +61,70 @@
 #
 #   python3 scripts/qmp_type.py --port 4464 --marker ':: MOUSE-1: HID pointer detected' \
 #       --marker-log target/serial.log --wait 1 --pointer 12 --pointer-kind abs --postwait 0
+#
+# PTRACK (rmbp 2026-09-22, FLAKEFIX, rmbp-ledger B150) — ACKED POINTER DELIVERY, `--pointer-ack N`.
+# Every mode above this line paces on WALL CLOCK and never learns whether QEMU's emulated device
+# delivered anything. That is not a tolerance question, it is a delivery question, and the measurement
+# says so:
+#
+#   MEASURED (TRACKPAD's go-red capture, 2026-09-22, host load ~23, `./arroyo test-ptr`):
+#     [qmp] pointer: 36 rel moves ...            <- this script sent 36, QMP returned {} to all 36
+#     :: MOUSE-1: 32 reports, last dx=0 dy=0 ... <- the guest's xHCI decode saw 32
+#     :: PTRINSTALL: installs=27 reports=27 ...  <- the producer counted 27 of the 36 typed
+#   and the SAME command on the same box one flake later (flakefix repro1, load 13):
+#     :: MOUSE-1: 32 reports, last dx=-24 dy=-24 ::  /  installs=36 reports=36
+#
+# `last dx=0 dy=0` IS THE MECHANISM, and it is a delta this script CANNOT SEND: `--pointer-kind rel`
+# alternates +step / -step every move, so every event on the wire is +-24 on both axes and a zero
+# delta can only be a SUM. QEMU's `hid_pointer_event` (hw/input/hid.c) folds a new motion event into
+# the TAIL queue entry whenever that entry has not been polled yet — "we combine events where possible
+# to keep the queue small" — so two adjacent moves 50 ms apart become ONE report of (+24) + (-24) = 0
+# the moment the guest's poll gap stretches past the injection gap (the same capture's
+# `drain_gap_max_ms=140` against a 50 ms cadence). The guest then DROPS that report before counting
+# it: the xHCI decode charges `mouse_report_count` (so MOUSE-1 still climbs) but only emits
+# `Event::Mouse` when `dx != 0 || dy != 0`, so `[ptrinstall] reports=` never sees it.
+#
+# NOTHING IS LOST BETWEEN QMP AND THE ENDPOINT. The QMP socket acked all 36 (an `error` reply is
+# already fatal below), the 16-deep `QUEUE_LENGTH` drop path needs >16 undelivered events and 50 ms
+# spacing never builds that, and the travel is CONSERVED — only the report COUNT is not. So a fixture
+# that counts injected events is, on a loaded host, counting the host's scheduler.
+#
+# WHAT `--pointer-ack N` DOES. After the wall-clock first pass it stops pacing on time and paces on
+# the GUEST'S OWN COUNT, read out of the serial log this typist already holds open for `--marker`:
+# settle `--ack-settle`, take the first count line printed AFTER that settle (`--ack-re`, one capture
+# group), and RE-SEND exactly the shortfall `--ack-gap` apart. Exactly the shortfall, so the loop can
+# undershoot and retry but can never overshoot a fixture that pins an equality.
+#
+#   THE CAP IS `--ack-rounds` (default 3) and it is a REAL cap: on exhaustion the typist prints
+#   `[qmp] pointer ack: GAVE UP after N retry round(s) — guest counted C of T ...` and STOPS. It does
+#   not widen anything and it does not exit non-zero: the shortfall is real delivery loss, the guest's
+#   own count line carries it, and the fixture reds on that. A typist must never be able to turn a
+#   delivery failure into a pass (LAWS §5 — wrong-strict is worse than wrong-lenient, and this is the
+#   third option: measure, then say what you measured).
+#
+#   THE BUDGET, because this lane has a deadline. `[ptrinstall]` rolls up on the depth line's 5 s tick
+#   and PTRLANE's moves land at ~32 s of guest uptime, while the one-shot `:: PTRINSTALL:` line that
+#   x86-ptr.spec:67 pins closes at `PTRI_LATE_MS` = 60 s. One round costs `--ack-settle` + at most one
+#   tick ~= 5.5 s, so 3 rounds ~= 17 s and the last retry is counted by ~50 s — inside the window.
+#   Raising `--ack-rounds` past 4 on THIS lane buys nothing: the late line has already printed.
+#
+#   THE SETTLE IS WHAT MAKES THE READING SOUND. A rollup tick that fires between the last QMP send and
+#   the guest's 8 ms poll would read low, the loop would re-send reports that were merely in flight,
+#   and the count would land ABOVE the target — the one way an acked typist could red a lane it was
+#   meant to green. `--ack-settle` (0.5 s default) is the quiet the reading is taken after, against a
+#   measured `lag_max_ms` of 20-27 ms and a `drain_gap_max_ms` of 70-140 ms.
+#
+#   NOT FOR THE KEYBOARD BURSTS. `--bursts` exists to LOSE events — it measures how many the endpoint
+#   drops with no TRB armed — so acking it would erase the thing it measures. This flag is pointer-only
+#   on purpose.
+#
+#   python3 scripts/qmp_type.py --port 4464 --marker ':: MOUSE-1: HID pointer detected' \
+#       --marker-log target/serial.log --pointer 36 --pointer-kind rel --pointer-ack 36
 
 import argparse
 import json
+import os
+import re
 import socket
 import sys
 import time
@@ -166,6 +227,30 @@ def wait_for_marker(path, text, timeout):
     return False
 
 
+def ack_count_after(path, rx, offset):
+    """PTRACK — THE GUEST'S OWN COUNT, read from `path` starting at byte `offset`.
+
+    Returns `(count, offset_now)`. `count` is the LAST match of `rx`'s first capture group among the
+    COMPLETE lines appended past `offset`, or `None` if no complete matching line is there yet;
+    `offset_now` advances past every complete line read, matching or not, so the next look can never
+    re-read a rollup printed before the injection it is supposed to be a reading of. Byte offsets, and
+    a bytes pattern, because these logs carry control bytes (the `awk`-not-`grep` rule) and a decode
+    would make the offset arithmetic a guess."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except OSError:
+        return None, offset
+    cut = data.rfind(b"\n")
+    if cut < 0:
+        return None, offset
+    last = None
+    for m in rx.finditer(data[: cut + 1]):
+        last = int(m.group(1))
+    return last, offset + cut + 1
+
+
 def main():
     ap = argparse.ArgumentParser(description="Type a string into headless QEMU and screendump.")
     ap.add_argument("--host", default="127.0.0.1")
@@ -212,6 +297,15 @@ def main():
     ap.add_argument("--pointer-settle", type=float, default=2.0, help="seconds of quiet after the burst, before the tail pairs")
     ap.add_argument("--pointer-tail", type=int, default=0, help="PTRPRESS: paced press+release pairs after the quiet")
     ap.add_argument("--pointer-tail-gap", type=float, default=0.2, help="seconds between the tail pairs' individual button events")
+    # PTRACK (FLAKEFIX, B150) — ACKED delivery. All default OFF: `--pointer-ack 0` is the wall-clock
+    # typist exactly, so no pre-existing caller changes behaviour. See the PTRACK block in the header.
+    ap.add_argument("--pointer-ack", type=int, default=0, help="PTRACK: reports the GUEST must count; re-send the shortfall until it does (0 = off, wall-clock only)")
+    ap.add_argument("--ack-log", default="", help="PTRACK: log to read the guest's count from (default: --marker-log)")
+    ap.add_argument("--ack-re", default=r"\[ptrinstall\] installs=\d+ reports=(\d+)", help="PTRACK: regex whose FIRST capture group is the guest's count")
+    ap.add_argument("--ack-rounds", type=int, default=3, help="PTRACK: max re-send rounds before giving up loudly")
+    ap.add_argument("--ack-settle", type=float, default=0.5, help="PTRACK: quiet seconds after the last report before a count line is authoritative")
+    ap.add_argument("--ack-timeout", type=float, default=8.0, help="PTRACK: seconds to wait for a fresh count line in one round")
+    ap.add_argument("--ack-gap", type=float, default=0.15, help="PTRACK: seconds between the re-sent reports")
     a = ap.parse_args()
 
     qmp = Qmp(connect(a.host, a.port, a.connect_timeout))
@@ -298,15 +392,21 @@ def main():
         # endpoint's polling interval instead of queueing behind the previous one — the same
         # pacing argument the burst block above makes for keys, and the reason the moves are not
         # one atomic `input-send-event`.
+        # PTRACK — the step generator, factored out of the loop below so a RE-SENT report is built by
+        # the same arithmetic as a first-pass one and simply continues the index: the rel alternation
+        # keeps alternating (no retry repeats its predecessor's delta) and an abs step lands on a
+        # position the previous one did not (an `abs` device re-reporting the same coordinates
+        # delivers nothing at all). `i` is unbounded; the abs fraction wraps.
+        def move_step(i):
+            if a.pointer_kind == "abs":
+                frac = ((i % max(a.pointer, 1)) + 1) / (a.pointer + 1)
+                return [move_event("abs", "x", ABS_MAX * frac), move_event("abs", "y", ABS_MAX * (1.0 - frac))]
+            step = a.pointer_rel_step if i % 2 == 0 else -a.pointer_rel_step
+            return [move_event("rel", "x", step), move_event("rel", "y", step)]
+
         moves = 0
         for i in range(a.pointer):
-            if a.pointer_kind == "abs":
-                frac = (i + 1) / (a.pointer + 1)
-                evs = [move_event("abs", "x", ABS_MAX * frac), move_event("abs", "y", ABS_MAX * (1.0 - frac))]
-            else:
-                step = a.pointer_rel_step if i % 2 == 0 else -a.pointer_rel_step
-                evs = [move_event("rel", "x", step), move_event("rel", "y", step)]
-            r = qmp.execute("input-send-event", {"events": evs})
+            r = qmp.execute("input-send-event", {"events": move_step(i)})
             if "error" in r:
                 raise SystemExit(f"[qmp] pointer move {i + 1}/{a.pointer} failed: {r['error']}")
             moves += 1
@@ -320,6 +420,59 @@ def main():
                 time.sleep(a.pointer_gap)
             clicks += 1
         print(f"[qmp] pointer: {moves} {a.pointer_kind} moves + {clicks} {a.pointer_button} click(s), {a.pointer_gap * 1000:.0f} ms apart", file=sys.stderr)
+        # PTRACK — and now stop pacing on the clock. See the PTRACK block in this file's header for
+        # the measurement that says why (QEMU folds adjacent motion events into an unpolled queue
+        # entry, so a wall-clock typist's report COUNT is a reading of the host's scheduler).
+        if a.pointer_ack > 0:
+            ack_log = a.ack_log or a.marker_log
+            if not ack_log:
+                raise SystemExit("[qmp] --pointer-ack needs a log to read the guest's count from (--ack-log or --marker-log)")
+            rx = re.compile(a.ack_re.encode())
+            sent = moves
+            step_i = a.pointer
+            rounds = 0
+            while True:
+                time.sleep(a.ack_settle)
+                try:
+                    off = os.path.getsize(ack_log)
+                except OSError:
+                    off = 0
+                counted = None
+                deadline = time.time() + a.ack_timeout
+                while time.time() < deadline:
+                    counted, off = ack_count_after(ack_log, rx, off)
+                    if counted is not None:
+                        break
+                    time.sleep(0.2)
+                if counted is None:
+                    # The guest is not publishing a count, so there is nothing to ack against. Say so
+                    # and stop: inventing more reports here would be guessing at the wire.
+                    print(f"[qmp] pointer ack: no line matching {a.ack_re!r} in {ack_log} within "
+                          f"{a.ack_timeout:.0f}s of the last report — the guest published no count to "
+                          f"pace on; {sent} move(s) sent, delivery UNACKED", file=sys.stderr)
+                    break
+                if counted >= a.pointer_ack:
+                    print(f"[qmp] pointer ack: guest counted {counted} of {a.pointer_ack} after "
+                          f"{rounds} retry round(s), {sent} move(s) sent", file=sys.stderr)
+                    break
+                if rounds >= a.ack_rounds:
+                    print(f"[qmp] pointer ack: GAVE UP after {rounds} retry round(s) (--ack-rounds) — "
+                          f"guest counted {counted} of {a.pointer_ack}, {sent} move(s) sent. The "
+                          f"shortfall is real delivery loss; the guest's own count line carries it and "
+                          f"the fixture reds on that. Nothing here widens a tolerance.", file=sys.stderr)
+                    break
+                short = a.pointer_ack - counted
+                rounds += 1
+                print(f"[qmp] pointer ack: round {rounds}/{a.ack_rounds} — guest counted {counted} of "
+                      f"{a.pointer_ack} after {sent} sent; re-sending {short} move(s) "
+                      f"{a.ack_gap * 1000:.0f} ms apart", file=sys.stderr)
+                for _ in range(short):
+                    r = qmp.execute("input-send-event", {"events": move_step(step_i)})
+                    if "error" in r:
+                        raise SystemExit(f"[qmp] pointer ack re-send {step_i} failed: {r['error']}")
+                    step_i += 1
+                    sent += 1
+                    time.sleep(a.ack_gap)
         # PTRPRESS — the burst, then the quiet, then the tail. One `input-send-event` per edge:
         # QEMU coalesces every event inside ONE call into a single HID report, so a press and a
         # release sent together would be a click the device never emits.
