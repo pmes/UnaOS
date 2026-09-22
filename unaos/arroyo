@@ -393,6 +393,24 @@ _feats=""
 # Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
 # disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
 [ -n "${UNAOS_SDW:-}" ] && _feats="${_feats}sdw,"
+# SDHCPOST (B155): UNAOS_SDW_RW=1 lifts the internal SD card's FAT mount from READ-ONLY to READ-WRITE.
+# This is the POSTURE half of milestone 4b — the half flight 11 needed when Peter pressed Print Screen
+# and got `:: PRTSCR: REFUSED READ-ONLY (source=sdhc … SDHC-4c)`. The posture has ONE definition,
+# `drivers::block::sdhc_write_veto`, and `fat::BlockSource::write_veto` and `block::handle_write_veto`
+# are both forwards to it, so the two views cannot drift (leg 8 of `sdwrite_posture_selftest`).
+# `sdhc=rw` needs all THREE: this knob, the write-protect PIN read AT MOUNT saying enabled, and a live
+# block-layer write path; a refusal names which one said no, on a truth table printed once at mount
+# (`:: SDHCPOST: posture sdw-rw=1 wp-pin=… write-path=… -> sdhc=… reason=… ::`). Implies `sdw` in
+# Cargo.toml — a writable volume over an image with no CMD24/CMD25 word would be `rw=yes` on a path
+# that cannot write a byte, the failure A60's one-posture rule exists to stop. It also RETIRES two of
+# SDHC-4c's claims while it is on (the closed writable set; "the card has no FAT mutator") — see
+# `fs/sdhc4c.rs` §SDHCPOST. DEFAULT OFF: the card IS the bench rMBP's hard drive, so a default-rw boot
+# volume is a power-cut decision on a journal-less FAT and it is PETER'S (rmbp-ledger B155), not a
+# build flag. Default OFF => the `not(sdw-rw)` twin compiles and both readers are byte-for-byte their
+# pre-SDHCPOST selves (`./arroyo knoboff sdw-rw`). x86_64 only; aarch64 media byte-identical (stripped
+# by arm_features below, like `sdw`). Kept in sync with builder/src/main.rs — a knob mapped HERE and
+# missing THERE ships the feature disabled while the banner claims it is on (s42/INSTGUI, WXN-M3b).
+[ -n "${UNAOS_SDW_RW:-}" ] && _feats="${_feats}sdw-rw,sdw,"
 # SDHC-4b (GR20): UNAOS_SDHCBLK=1 makes the INTERNAL SD card a real x86 BLOCK BACKEND, so `fs::fat` can
 # mount it. Boot AC identified the card and Boot AD wrote to it, but `drivers/block.rs` had two backends
 # and every SD arm in it is aarch64+baremetal (the Pi's EMMC2), so on x86 `read_block` has always meant
@@ -597,9 +615,13 @@ _feats=""
 # per-slot principal the loader stamps; the SAME SYS_OPEN owner/grants check enforces it), the shell
 # arms, and the M1 fixture `:: LOGIN: users+session … -> PASS ::` on the storage-ready passes. NOT
 # stripped by `arm_features`, for the reason `holocron` is not. Default OFF => module and every call
-# site vanish, both arches byte-identical (`./arroyo knoboff login`). NOTE: builder/src/main.rs
-# carries NO `UNAOS_LOGIN` mapping (outside the LOGIN executor's files) — until it does, `./arroyo
-# test` (x86, built by the builder) cannot compile the knob; `test-arm` builds from this map and can.
+# site vanish, both arches byte-identical (`./arroyo knoboff login`). NOTE, AMENDED BY SDHCPOST (B155):
+# this note used to say builder/src/main.rs carried NO `UNAOS_LOGIN` mapping, so the x86 `./arroyo
+# test` lane could not compile the knob. THAT IS NO LONGER TRUE — builder/src/main.rs maps both
+# `UNAOS_LOGIN` and `UNAOS_LOGINST` (the KNOB->BUILDER WIRING CHECK holds this line to it), so
+# `UNAOS_LOGIN=1 UNAOS_LOGINST=1 ./arroyo test` opens a session on x86. That matters to any capture
+# leg: PRTSCR's R54 no-session refusal is checked FIRST, ahead of the PRTSCR-VOL ladder, so without a
+# session no capture can land and rung 1 never even runs — see `video/prtscr.rs` and SDHCPOST.
 [ -n "${UNAOS_LOGIN:-}" ] && _feats="${_feats}login,"
 # LOGIN SELFTESTS: UNAOS_LOGINST=1 arms the LOGIN fixtures (M1 users+session — a BOOT-TIME WRITE: user
 # `una` with a known password lands in USERS.DAT; M2 home + a private file; M3 the screen driven by
@@ -2860,6 +2882,12 @@ arm_features() {
     # points, which is the property that lets the x86 track arm a card-write knob without touching the
     # Pi or Jetson media at all.
     f="${f//,sdw,/,}"
+    # SDHCPOST (B155) rides the same strip and for the same reason: `sdw-rw` gates only x86 arms —
+    # `drivers/block.rs` §SDHCPOST, `fs/fat.rs`'s `Sdhc` veto arm and `fs/sdhc4c.rs`, every one already
+    # inside `all(target_arch = "x86_64", feature = "sdhcblk")` — so it emits not one byte of aarch64
+    # CODE, but an enabled feature is hashed into cargo's `-Cmetadata` fingerprint and leaving it in
+    # would shift every aarch64 media hash for zero observable change.
+    f="${f//,sdw-rw,/,}"
     # WCD-VALVE rides the same strip, for the same reason: every valve item is x86_64-gated, so
     # `wcdvalve` emits not one byte of aarch64 CODE — but an enabled feature is hashed into cargo's
     # `-Cmetadata` fingerprint, and leaving it in would shift the aarch64 media hash between a
@@ -5389,7 +5417,7 @@ KERNEL_CFG_MATRIX=(
   # SIDE EFFECT: the table gains one knob and the universe gains one (brand-new, so "unclaimed =>
   # assume x86" either way and naming it here removes nothing); read the live board/mix counts on
   # `./arroyo check`'s own summary line, never from this prose.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc,sdw-rw"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the

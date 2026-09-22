@@ -1619,7 +1619,7 @@ pub fn read_block_512(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 /// The most 512-byte blocks one CMD18 transfer moves: 64 blocks = 32 KiB. Bounds one transfer's
 /// drain and one ADMA2 descriptor run, and matches the chunk the aarch64 Tegra driver already runs
 /// on metal (`arch::aarch64::sdmmc_tegra`'s `MULTIBLOCK_CHUNK_BLOCKS`).
-const MB_MAX_BLOCKS: u16 = 64;
+pub const MB_MAX_BLOCKS: u16 = 64;
 
 /// Translate an LBA into the Argument-register value this card expects.
 ///

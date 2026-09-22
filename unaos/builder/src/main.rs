@@ -226,6 +226,14 @@ fn main() {
     // wire) would have looked like a card that refused. The `armed=` field exists for exactly this,
     // and it is what caught the same omission in WXN-M3b. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_SDW").is_ok() { feats.push("sdw"); }
+    // SDHCPOST (B155): UNAOS_SDW_RW=1 lifts the internal SD card's FAT mount from READ-ONLY to
+    // READ-WRITE — the POSTURE half of milestone 4b, and the half flight 11's screenshot needed.
+    // Mapped HERE as well as in arroyo for the reason the `sdw` line above spells out, and this knob
+    // is the most consequential case of it in the tree so far: mapped in arroyo alone, a boot would
+    // print `sdhc=ro` and refuse the capture on a run the operator armed, which reads exactly like a
+    // card that said no. The truth-table line (`:: SDHCPOST: posture sdw-rw=1 … ::`) exists for the
+    // same reason `armed=` does — it is what catches this omission instead of the operator doing it.
+    if std::env::var("UNAOS_SDW_RW").is_ok() { feats.push("sdw-rw"); }
     // SDHC-4b (GR20): UNAOS_SDHCBLK=1 makes the INTERNAL SD card a real x86 block backend, published
     // under its OWN registry handle (`BlockHandle::Sdhc`) so `fs::fat` can mount it READ-ONLY without
     // the boot volume — the USB stick this machine boots from — moving at all. THIS list is what
