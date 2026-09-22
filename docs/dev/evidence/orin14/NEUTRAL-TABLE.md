@@ -318,3 +318,118 @@ further comments (`video/fbcon.rs`, `video/screen.rs`, `arch/aarch64/serial.rs`)
 `[orinrender] census`. No shared file composes a witness tag through a `{}` hole (only
 `arch/aarch64/ga10b_ignite.rs` does, for a different family), so an artifact grep on these tokens is
 sound — the LAWS §5 runtime-composition hazard does not apply here.
+
+## Addendum (NEUTRAL M2, 2026-09-22) — the colon families are RENAMED, and §2 was wrong in five places
+
+Base `acd102d7` (branch `exec-rmbp-neutral2`; the branch tip is the sha — the seat fills it at the
+fold). Census re-derived at that base before any edit, per §0 and LAWS §5 ("a measurement is scoped
+to its base exactly as a claim is scoped to its check"): script and raw output in
+`docs/dev/evidence/rmbp-0915/neutral/{census.py,census-at-acd102d7.txt,census-AFTER-m2.txt}`. The
+substitution table IS the script — `m2-rename.py`, one file with `--apply`, `--prove` and `--count`.
+
+### M2 — DONE (colon witness families in shared files)
+
+Counts are RAW occurrences in the file (what a `sed` moves), not the comment-stripped census figure;
+where they differ the census number is in parentheses.
+
+| old | new | sites moved | files |
+|---|---|---:|---|
+| `:: PIUSB:` | `:: USB:` | 79 (77) | `drivers/xhci/mod.rs` |
+| `:: PINSTALL:` | `:: INSTALL:` | 63 | `install/partition.rs` |
+| `:: PIINSTALL:` (`const PS`) | `:: INSTALL:` | 1 | `install/pi.rs` |
+| `:: TEGRA-SD:` | `:: SDMMC:` | 5 | `drivers/block.rs` |
+| `:: TEGRA-UNAFS:` | `:: UNAFS:` | 5 | `main.rs` |
+| `:: PI-RAST:` | `:: RAST:` | 4 (3) | `main.rs` |
+| `:: PI-DESK:` | `:: DESK:` | 2 (1) | `video/desktop_firmware.rs` 1, `main.rs` 1 |
+| `:: piusb27:` | `:: usb27:` | 6 | `fs/fat.rs` |
+| `:: piusb28:` | `:: usb28:` | 2 | `main.rs` |
+| `ORIN-DESKFURN` / `ORIN-RENDER` **inside witness message text only** | `DESKFURN` / `RENDER` | 2 | `main.rs:8420`, `main.rs:8682` |
+
+169 kernel sites + 100 sites in the pins outside it. **269 changed lines, insertions == deletions,
+and every line reproduced exactly by applying the table to the old line** (`m2-substitution-proof.txt`).
+
+### THE SECOND SPELLING IS NOT REGEX-ESCAPING HERE — IT IS THE DROPPED `:: ` PREFIX
+
+M1's defect was that specs write a bracket witness regex-escaped (`\[orinstkdepth\]`) and a plain sed
+left three rules behind. M2's families contain no regex metacharacter, so that spelling does not
+exist — and the lesson still applied, in a new form. **`jetson-sync1.spec` writes three LIVE rules
+with the `:: ` prefix dropped**, and two subsystem docs hand the operator the same short form:
+
+| file | rule | why a plain sed misses it silently |
+|---|---|---|
+| `jetson-sync1.spec:409` | `FORBID TEGRA-SD: REFUSED to publish` | a FORBID that can no longer match still reads green |
+| `jetson-sync1.spec:619` | `FORBID TEGRA-UNAFS: mount on TegraSd FAILED` | same |
+| `jetson-sync1.spec:593` | `PENDING TEGRA-UNAFS: native unafs volume MOUNTED…` | a PENDING was never required; it moves `pending N/M` only |
+| `partition-install.md:247,397` | `awk 'index($0,"PINSTALL:")'` | an operator command, not a gate — it just returns nothing |
+| `SITTING-1.md:99,239` | `awk 'index($0,"PINSTALL")'`, `grep -a -o -F 'PINSTALL: census part='` | the second is an ARTIFACT CERTIFICATION command |
+| `orin-specscore.py:292` | `` `TEGRA-SD: REFUSED to publish` `` | comment quoting the family |
+
+`m2-rename.py`'s `PASS_B` enumerates these per file **with an expected count, and a miscount is
+fatal** — the table refuses to write anything rather than move eight of ten spellings.
+
+### THE RULE THAT DECIDED WHAT DOES *NOT* MOVE
+
+The rename moves **wire tokens** — what a capture carries and what a gate greps. It does not move
+**arc names** or **knob names** (LAWS §4). So `PI-DESK` the 2026-08-12 arc (`engine.md:13262`'s
+section heading and eleven references to it), `PI-RAST` the arc, `# PI-DESK:`/`# PI-RAST:` as
+knob-doc headings in `arroyo:10332,10347`, `# ORIN-DESKFURN:` at `arroyo:1970,6291` and
+`Cargo.toml:3074`, and every `UNAOS_PIUSB` / `piinstall` / `sdmmc` / `pirast` stay. `ORIN-DESKFURN`
+and `ORIN-RENDER` moved at exactly the two places they sit INSIDE a `serial_println!` argument.
+
+### FOUR TARGETS WERE ALREADY OWNED — and all four are the SAME subsystem, so each is a merge
+
+Checked before renaming, at this base. None is a foreign emitter, so no target was re-chosen:
+
+| target | already emitted by | verdict |
+|---|---|---|
+| `:: INSTALL:` ×35 | `install/mod.rs` 32, `install/pi.rs` 2, `main.rs` 1 — the installer engine | MERGE. Count-safe: the engine spells its refusals `refusal — `, the renamed family spells them `refusal target=`, so `x86-install.spec:87 COUNT 5 :: INSTALL: refusal target=` cannot see the engine's. `:: INSTALL: census ` was 0 before the merge. |
+| `:: SDMMC:` ×2 | `arch/aarch64/sdmmc_tegra.rs:74` `const PS` — the Tegra SD controller | MERGE with the layer below it. `:: SDMMC: WRITE admitted`, the string `arroyo`'s `BANNER_ARTIFACT_MAP` greps, is still emitted from exactly ONE site (`drivers/block.rs:2522`). |
+| `:: RAST:` ×10 | `main.rs` 5, `rast_demo.rs` 4, `display_tegra.rs` 1 | MERGE — §2 already named this the target, not a conflict. |
+| `:: USB:`, `:: UNAFS:`, `:: DESK:`, `:: usb27:`, `:: usb28:` | 0 hits | clean. |
+
+### PARKED — and why, said out loud
+
+| family | count at this tip | why it did not move |
+|---|---:|---|
+| `:: tegra:` | 42 raw / 36 live, all `main.rs` (plus 393 in `arch/`) | §2's own seam decision, and the brief's exclusion: these lines ARE the Tegra bring-up narrative around `tegra_early_stop`, and the honest fix relocates the terminus into `arch/aarch64/`. **It is now the ONLY colon family left naming a board in a shared file.** |
+| `:: TEGRA-EL0:` | 2 `main.rs`, 2 `arch/aarch64/syscall.rs` | **§2's row is wrong twice over, and the rename would have made the tree worse.** (1) `:: EL0:` is NOT free — `arch/aarch64/syscall.rs` emits it 26 times for a DIFFERENT narrative (the EL0 threads/input self-tests), so by the collision rule this target is owned. (2) The board name here is DELIBERATE and documented: `arch/aarch64/mmu_tegra_el0.rs:115-117` routes six witnesses through `const EL0TAG = "TEGRA-EL0"` / `"VIRT-EL0"` precisely so a QEMU capture and an Orin capture are told apart by the same `awk` (`arch_arm64.md:10052-10069`). (3) `main.rs:7146`'s FAIL is the twin of `syscall.rs:23838`'s FAIL and `:23835`'s PASS; moving only the shared half splits one PASS/FAIL family across two spellings — the exact defect M1 recorded as OWED for `[piusb40]`. **STOP question for Peter / the seat: rename all four (arch included) to a free spelling such as `:: EL0HELLO:`, or leave the family board-tagged by design.** Note `jetson-sync1.spec:675` is RED against its own green capture at this base and was red at M1's base too — pre-existing, jetson's to answer, untouched here. |
+| `INSTALL-PI` | 13 kernel + 5 doc/script files | Not a `:: NAME:` family at all — an ARC name, and a doc SECTION ANCHOR (`install/pi.rs:35` reads "See `installer_engine.md` §INSTALL-PI"). Renaming it to `INSTALL` would collide with the generic installer-engine narrative it exists to distinguish, and its pins reach five files this brief does not name (`unaos/docs/dev/OS/10_INSTALL/{installer_engine,orin-unafs-root,vein-smart-installer}.md`, `unaos/scripts/make-pi-install-src.sh`, `review/unaos-install-pi-LANDING.md`). Reported, not half-renamed. |
+
+### OWED — sites a family lost to an excluded or unnamed home (NOT half-renamed)
+
+| token | where | why owed |
+|---|---|---|
+| `:: PIUSB:` ×3 | `arch/aarch64/piusb.rs:50` (`const P`), `:199`, `:2047` | exempt home — the `:: PIUSB:`/`:: USB:` family now SPLITS across two names, the shape M1 met with `[piusb40]`. The Pi's own PCIe/VL805 bring-up keeps the board name; the shared xHCI driver no longer does. |
+| `:: TEGRA-SD:` ×1 | `unaos/crates/kernel/Cargo.toml:1439` | a LIVE witness-family pin (`Witness families: :: TEGRA-SD: WRITE admitted`) that now disagrees with `arroyo`'s `BANNER_ARTIFACT_MAP` row. One-token change; Cargo.toml is not a file this brief names. |
+| `:: TEGRA-SD:` ×1, `TEGRA-SD:` ×1 | `docs/dev/OS/orin-queue.md:21,267` | another track's queue. |
+| `:: PIINSTALL:` ×2 | `docs/env-knobs.md:4874,4905` | not a file this brief names. |
+| `:: PIUSB:` ×30 | `unaos/scripts/pi-usb1-bench.md` | the PI-USB-1 bench procedure's expected wire; not a file this brief names. |
+| `PIUSB:`, `piusb27:`, `TEGRA-UNAFS:` | `docs/dev/OS/orin-ledger.md:141,221,223,224,227` | another track's ledger — and `:141` is row **B5**, the GATE-NEUTRAL census item this milestone answers. |
+
+### Five corrections to §2, each measured at `acd102d7`
+
+1. **`:: PINSTALL:` ×63 in `install/partition.rs` is absent from the table entirely** — the largest
+   colon family after `:: PIUSB:`, and the one with twelve live spec rules behind it
+   (`x86-install.spec`). **The cause is NOT M1's stripper bug, and that matters:** §0's COLON pattern
+   was an ALLOWLIST of family names that listed `PIINSTALL` and never `PINSTALL`, so the instrument
+   was never told to look. Measured at `acd102d7`: all 63 sites are live `serial_println!` code and
+   none is inside a comment, so the census's zero was a fact about the PATTERN, not the data
+   (LAWS §5). `census.py`'s COLON rule now matches the BOARD PREFIX and leaves the family name open,
+   the shape its BRACKET and IDENT rules already used; the space in `:: NAME:` is kept because
+   dropping it re-admits four Rust-module-path false positives (`::PixelFormat:` ×12, `::PinnedApp:`
+   ×7, `::piusb:` ×2, `::pi:` ×1). **An allowlist census cannot report what it was never told to
+   look for** — and three of M2's nine families (`:: PINSTALL:`, `:: piusb27:`, `:: piusb28:`) were
+   invisible to it for exactly that reason.
+2. `:: TEGRA-SD:` is **5** sites, not 3.
+3. `:: PI-RAST:` is **4** raw / 3 live, not 3; `:: PI-DESK:` is **2** (a second site at `main.rs:7401`), not 1.
+4. **Two colon families are missing from §2 altogether**: `:: piusb27:` ×6 (`fs/fat.rs`) and
+   `:: piusb28:` ×2 (`main.rs`) — the colon twins of M1's `[usb27]`/`[usb28]` bracket families.
+5. §2's total ("9 families / 131 sites") is wrong on both halves. Re-censused at `acd102d7` with
+   the corrected pattern: **11 families / 200 live sites** in shared files, going to **2 families /
+   38 sites** after M2 — and both remainders are the declared parked families (`:: tegra:` 36,
+   `:: TEGRA-EL0:` 2). Raw occurrences, which is what a `sed` moves, are 169 in the kernel.
+
+### M3 (identifiers) NOT started
+
+Unchanged by this milestone: `TegraSd` 51 sites, `tegra_shell_*` 39, `tegra_el0` 19, `tegra_sd_info`
+15 — the §3a population, plus the drift the M1 addendum recorded above.

@@ -1,0 +1,37 @@
+NEUTRAL M2 — proof that the RENAME diff is a PURE TOKEN SUBSTITUTION
+base acd102d7, branch exec-rmbp-neutral2
+
+Method: for every changed line pair (-,+), apply the M2 substitution table (PASS A's
+`:: NAME:` form, PASS B's PREFIX-LESS second spelling, PASS C's two message-text anchors)
+to the OLD line and require equality with the NEW line. One unexplained line means the
+batch moved something other than a token.
+
+POPULATION = the 23 files the rename edits. Files this arc AUTHORS new prose into are
+excluded BY NAME and are not substitutions: docs/dev/OS/rmbp-ledger.md docs/dev/OS/rmbp-queue.md docs/dev/evidence/orin14/NEUTRAL-TABLE.md docs/dev/evidence/rmbp-0915/neutral/
+
+    docs/dev/OS/01_BOOT_HAL/arch_arm64.md
+    docs/dev/OS/07_USB_STORAGE/usb_xhci.md
+    docs/dev/OS/08_VIDEO/PARITY.md
+    docs/dev/OS/08_VIDEO/engine.md
+    docs/dev/OS/08_VIDEO/rasterizer.md
+    docs/dev/OS/08_VIDEO/v3d.md
+    docs/dev/OS/10_INSTALL/SITTING-1.md
+    docs/dev/OS/10_INSTALL/partition-install.md
+    tools/serial-analyzer.py
+    unaos/arroyo
+    unaos/crates/kernel/src/drivers/block.rs
+    unaos/crates/kernel/src/drivers/xhci/mod.rs
+    unaos/crates/kernel/src/fs/fat.rs
+    unaos/crates/kernel/src/install/partition.rs
+    unaos/crates/kernel/src/install/pi.rs
+    unaos/crates/kernel/src/main.rs
+    unaos/crates/kernel/src/video/desktop_firmware.rs
+    unaos/scripts/banner-cert.sh
+    unaos/scripts/orin-specscore.py
+    unaos/scripts/specs/battery-control.capture
+    unaos/scripts/specs/jetson-sync1.spec
+    unaos/scripts/specs/x86-default.spec
+    unaos/scripts/specs/x86-install.spec
+
+  changed lines: -269 / +269  (insertions == deletions)
+  lines NOT explained by the substitution table: 0

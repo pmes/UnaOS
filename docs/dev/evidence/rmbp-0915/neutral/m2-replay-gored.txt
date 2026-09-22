@@ -1,0 +1,39 @@
+NEUTRAL M2 — x86 default-leg replay, GO-RED — ONE rule left on the OLD spelling (:43 REQUIRE :: PIUSB:), same capture. 6/6 -> 5/6.
+capture: ./arroyo test 240 on the renamed tree (rc=0), unaos/target/serial.log, 1605 lines
+scorer:  unaos/scripts/mbench.py --replay <capture> --spec <spec>
+
+════════════ MBENCH VERDICT — x86-default-GORED.spec vs /home/pmes/unaos-bench/scratch/rmbp-0915/neutral2-logs/gored/x86-default.capture ════════════
+  ✅ REQUIRE    :: PART: mbr census handle=global protective=0 accepted=[1-9][0-9]* rejected=[0-9]+ ::
+       1 hit(s), first @ line 1041
+  ✅ REQUIRE    :: PART: mbr handle=global slot=1 type=0x0c boot=0x[0-9a-f]+ start=[0-9]+ count=[0-9]+ end=[0-9]+ ACCEPT ::
+       1 hit(s), first @ line 1037
+  ❌ REQUIRE    :: PIUSB: \[usbw\] scratch geometry: USB last_lba=[0-9]+ \(num_blocks=[0-9]+\), keep-out ceiling=[0-9]+ \[mbr-partition-table\] ::
+       0 hits — MISSING (pinned at x86-default-GORED.spec:43)
+  ✅ REQUIRE    :: \[fatverb\] storage settle: waited=[0-9]+ms settled=found handles=global=(present|absent) sdhc=(present|absent|unbuilt) ::
+       1 hit(s), first @ line 1092
+  ✅ REQUIRE    :: USBREG: publish slot=[0-9]+ lun=[0-9]+ ix=[0-9]+ block_size=[0-9]+ num_blocks=[0-9]+ disks=[1-9][0-9]* ::
+       1 hit(s), first @ line 1020
+  ✅ REQUIRE    :: X86BIND: root=global:/KERNEL\.ELF serial=0x[0-9a-f]+ by=[a-z]+ bootinfo=0x[0-9a-f]+ agrees=(yes|no) mounts=[0-9]+ layout=true -> PASS ::
+       1 hit(s), first @ line 1086
+  ✅ FORBID*    -> FAIL
+       0 hits
+  ✅ FORBID*    FAIL ::
+       0 hits
+  ✅ FORBID*    PANIC
+       0 hits
+  ✅ FORBID*    -> FLICKER
+       0 hits
+  ✅ FORBID     :: USB: \[usbw\] scratch geometry: .* keep-out ceiling=0 \[raw
+       0 hits
+  ✅ FORBID     :: \[fatverb\] storage settle: .* settled=ceiling
+       0 hits
+  ✅ FORBID     :: STORSLOT: storage records FULL
+       0 hits
+  ✅ FORBID     :: X86BIND: root=-
+       0 hits
+  ✅ FORBID     :: WINMENU: .* -> SKIP reason=menu-unpublished-after=[0-9]+ms ::
+       0 hits
+  ─────
+  ❌ MBENCH FAIL — 5/6 required witnesses, 0 forbidden hit(s), 1605 lines scanned [mode unknown: no run sidecar]
+       FIRST-SHORTFALL x86-default-GORED.spec:43 REQUIRE :: PIUSB: \[usbw\] scratch geometry: USB last_lba=[0-9]+ \(num_blocks=[0-9]+\), keep-out ceiling=[0-9]+ \[mbr-partition-table\] ::
+  (* = default FORBID, always on)

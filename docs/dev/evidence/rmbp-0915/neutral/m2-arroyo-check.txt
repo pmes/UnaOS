@@ -1,0 +1,117 @@
+NEUTRAL M2 — ./arroyo check on the renamed tree (verdict extract; full log in the executor scratch)
+base acd102d7 + the M2 rename, branch exec-rmbp-neutral2
+wall: real 39m40s   EXIT: M2 check rc=1 — ONE finding, and it is a PEER'S BRANCH, not this tree.
+
+THE RED, read rather than summarised. GATE-BRANCH walks `refs/heads/exec-*`, NOT the working
+tree, so a rename of string literals cannot move it. At this seat's BASELINE run, before any
+edit, it read `refs=579 ... red=0` (ledger-check-BEFORE.txt). At the end of the check it read
+`refs=582 ... red=1`: three refs appeared on the bench while the check ran and one of them,
+`refs/heads/exec-rmbp-vugart c22ed375 user-vug: VUGART`, is on no track and in no registry
+line. It is not this executor's branch (mine is exec-rmbp-neutral2) and it touches none of
+this milestone's files. Reported, not touched.
+
+=== arch + bootloader legs ===
+[0;33m⚡ kernel features: ehcihid,kbdwit,sdhcblk,smolnet,sdwrite[0m
+[0;32m✅ x86_64 OK[0m
+[0;32m✅ aarch64 OK[0m
+[0;32m✅ bootloader OK[0m
+
+=== KERNEL_CFG_MATRIX: 80 legs, 80 with rc=0 ===
+[0;36m  · x86-all (slot 0) 66.2s rc=0[0m
+[0;36m  · arm-pi (slot 0) 65.3s rc=0[0m
+[0;36m  · arm-tegra (slot 0) 50.7s rc=0[0m
+[0;36m  · x86-vsyncpace (slot 0) 61.7s rc=0[0m
+[0;36m  · arm-tegra-el0 (slot 0) 56.4s rc=0[0m
+[0;36m  · arm-tegra-net6 (slot 0) 72.0s rc=0[0m
+[0;36m  · arm-tegra-el1ap (slot 0) 45.0s rc=0[0m
+[0;36m  · arm-tegra-apsrun (slot 0) 66.7s rc=0[0m
+[0;36m  · arm-tegra-simmer (slot 0) 29.8s rc=0[0m
+[0;36m  · arm-tegra-xusbfw (slot 0) 31.7s rc=0[0m
+[0;36m  · arm-tegra-smpmark (slot 0) 25.5s rc=0[0m
+[0;36m  · arm-tegra-orindesk (slot 0) 25.9s rc=0[0m
+[0;36m  · arm-tegra-jd1dc (slot 0) 28.2s rc=0[0m
+[0;36m  · arm-tegra-jd1dc-beam (slot 0) 17.6s rc=0[0m
+[0;36m  · arm-tegra-desk (slot 0) 18.1s rc=0[0m
+[0;36m  · arm-tegra-seam (slot 0) 18.1s rc=0[0m
+[0;36m  · arm-tegra-orinclick (slot 0) 14.3s rc=0[0m
+[0;36m  · arm-tegra-conwin (slot 0) 23.8s rc=0[0m
+[0;36m  · arm-tegra-render (slot 0) 22.4s rc=0[0m
+[0;36m  · arm-tegra-selfup (slot 0) 18.2s rc=0[0m
+[0;36m  · arm-tegra-orinwdt (slot 0) 23.5s rc=0[0m
+[0;36m  · arm-tegra-orinrx (slot 0) 19.9s rc=0[0m
+[0;36m  · arm-tegra-tcuprobe (slot 0) 17.1s rc=0[0m
+[0;36m  · arm-tegra-tcurx (slot 0) 17.0s rc=0[0m
+[0;36m  · arm-tegra-bsptick (slot 0) 17.6s rc=0[0m
+[0;36m  · arm-tegra-conwin-tenant (slot 0) 26.7s rc=0[0m
+[0;36m  · arm-tegra-tenant (slot 0) 18.3s rc=0[0m
+[0;36m  · arm-tegra-conwin-tenant-input (slot 0) 22.5s rc=0[0m
+[0;36m  · arm-tegra-bsprun (slot 0) 18.3s rc=0[0m
+[0;36m  · arm-tegra-bsprun-el0 (slot 0) 20.3s rc=0[0m
+[0;36m  · arm-tegra-supstate (slot 0) 23.0s rc=0[0m
+[0;36m  · arm-tegra-supstate-el0 (slot 0) 21.9s rc=0[0m
+[0;36m  · arm-tegra-supstate-el0-click (slot 0) 20.8s rc=0[0m
+[0;36m  · arm-tegra-supstate-el0-desk (slot 0) 16.6s rc=0[0m
+[0;36m  · arm-tegra-ga10bprobe1 (slot 0) 12.7s rc=0[0m
+[0;36m  · arm-tegra-ga10bprobe2 (slot 0) 15.0s rc=0[0m
+[0;36m  · arm-tegra-ga10bprobe3 (slot 0) 13.7s rc=0[0m
+[0;36m  · arm-tegra-ga10bprobe3b (slot 0) 23.2s rc=0[0m
+[0;36m  · arm-tegra-ga10bprobe4a (slot 0) 24.1s rc=0[0m
+[0;36m  · arm-tegra-ga10bprobe4b (slot 0) 26.0s rc=0[0m
+[0;36m  · arm-tegra-ga10bprobe4c (slot 0) 27.1s rc=0[0m
+[0;36m  · arm-tegra-ga10bprobe4d (slot 0) 28.7s rc=0[0m
+[0;36m  · arm-tegra-ga10bprobe4e (slot 0) 24.3s rc=0[0m
+[0;36m  · arm-tegra-ga10bprobe4f (slot 0) 21.7s rc=0[0m
+[0;36m  · arm-ga10bprobe5 (slot 0) 12.0s rc=0[0m
+[0;36m  · arm-tegra-ga10bprobe5a (slot 0) 25.5s rc=0[0m
+[0;36m  · arm-tegra-ga10bprobe5e (slot 0) 22.7s rc=0[0m
+[0;36m  · arm-tegra-ga10bprobe5b (slot 0) 20.4s rc=0[0m
+[0;36m  · arm-tegra-ga10bprobe5d (slot 0) 24.7s rc=0[0m
+[0;36m  · arm-tegra-ladder (slot 0) 15.4s rc=0[0m
+[0;36m  · arm-tegra-furn (slot 0) 17.1s rc=0[0m
+[0;36m  · arm-tegra-fbconpar (slot 0) 16.4s rc=0[0m
+[0;36m  · arm-tegra-fbconpar-cross (slot 0) 19.3s rc=0[0m
+[0;36m  · arm-desk-noel0 (slot 0) 17.7s rc=0[0m
+[0;36m  · arm-virt-el0 (slot 0) 12.3s rc=0[0m
+[0;36m  · arm-virt-net6 (slot 0) 12.4s rc=0[0m
+[0;36m  · arm-virt-sntp6 (slot 0) 17.1s rc=0[0m
+[0;36m  · arm-virt-tick (slot 0) 10.8s rc=0[0m
+[0;36m  · arm-tegra-furn-vpar-smpmark (slot 0) 21.7s rc=0[0m
+[0;36m  · arm-tegra-supstate-el0-smpmark (slot 0) 21.0s rc=0[0m
+[0;36m  · arm-tegra-el0-jd1dc (slot 0) 18.6s rc=0[0m
+[0;36m  · arm-tegra-sdmmcwrite (slot 0) 19.9s rc=0[0m
+[0;36m  · arm-tegra-sdwrite (slot 0) 12.1s rc=0[0m
+[0;36m  · arm-tegra-sdwritefx (slot 0) 9.8s rc=0[0m
+[0;36m  · arm-virt-sdwrite (slot 0) 14.3s rc=0[0m
+[0;36m  · arm-tegra-bsprun-nowitness (slot 0) 13.5s rc=0[0m
+[0;36m  · arm-tegra-bsprun-el0-nowitness (slot 0) 19.1s rc=0[0m
+[0;36m  · arm-pi-nowitness (slot 0) 23.1s rc=0[0m
+[0;36m  · arm-net5-virt (slot 0) 14.0s rc=0[0m
+[0;36m  · x86-nousblun (slot 0) 12.1s rc=0[0m
+[0;36m  · x86-all-nowitness (slot 0) 21.6s rc=0[0m
+[0;36m  · x86-mix-0 (slot 0) 24.7s rc=0[0m
+[0;36m  · x86-mix-1 (slot 0) 43.0s rc=0[0m
+[0;36m  · x86-mix-2 (slot 0) 36.2s rc=0[0m
+[0;36m  · x86-mix-3 (slot 0) 29.8s rc=0[0m
+[0;36m  · x86-mix-4 (slot 0) 26.0s rc=0[0m
+[0;36m  · x86-mix-5 (slot 0) 19.7s rc=0[0m
+[0;36m  · x86-mix-6 (slot 0) 26.2s rc=0[0m
+[0;36m  · x86-mix-7 (slot 0) 18.0s rc=0[0m
+[0;36m  · x86-mix-8 (slot 0) 22.0s rc=0[0m
+
+=== the named gates ===
+✅ knob-parity OK (every default-on arroyo feature is pushed by the x86 media builder)
+[0;32m✅ kernel cfg coverage OK (80 legs)[0m
+[0;32m  ✅ foreman agrees with mbench (verdict table and exit code)[0m
+[0;32m  ✅ mbench self-test (the scorer every verdict in this tree comes from)[0m
+GATE-FAMILY: OK — 6 platform-split families, none grown
+GATE-KNOB: OK — 208 features declared, 207 named by a cfg, 0 phantom, 0 dead, 0 trailing-comment cfg
+GATE-LEDGER: strict=off reason=HEAD acd102d7 on `exec-rmbp-neutral2` is NOT contained in main / origin/main — track content, cross-branch refs deferred (UNAOS_LEDGER_STRICT=1 to require them now)
+GATE-LEDGER: OK — 434 rows in 4 ledger file(s) + RULINGS + 4 queue file(s): ids unique, field counts match their header, absence claims name an enumeration (lexical sampler — see the header), status ∈ enum, owners known, cross-refs resolve, every deferral names an owner and an expiry, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>, no conflict markers, every queue citation resolves, one STATE line per claim, every ledger row ends at its final pipe, no row lost at a fold
+GATE-BRANCH: refs=582 reached=376 unreached=206 registered=237 (of them reached=32) owed=0 red=1 strict=off (UNAOS_BRANCH_STRICT=1 arms LOST) wall=1.0s
+GATE-BRANCH: RED — 1 finding(s):
+
+=== every ✖ in the log ===
+(none)
+
+=== the failure line ===
+[0;31m❌ check FAILED — a ledger row is unverifiable (see GATE-LEDGER above)[0m

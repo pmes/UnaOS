@@ -1,0 +1,50 @@
+NEUTRAL M2 — SPEC RULE <-> EMITTER RESOLUTION (source-side claim, not a wire claim)
+base tree /home/pmes/unaos-bench/scratch/rmbp-0915/neutral2-logs/base-tree/unaos/crates/kernel/src
+tip tree  unaos/crates/kernel/src
+
+== unaos/scripts/specs/x86-default.spec   ':: PIUSB:' -> ':: USB:'
+   rules still on the OLD prefix at tip : 0   (want 0)
+   rules on the NEW prefix at tip       : 2
+   shared emitters  BASE: old= 77 new=  0
+   shared emitters  TIP : old=  0 new= 77
+   VERDICT: OK — every rule and its emitter moved together
+      unaos/scripts/specs/x86-default.spec:43 REQUIRE :: USB: \[usbw\] scratch geometry: USB last_lba=[0-9]+ \(num_blocks=[0-9]+\), keep-out ceiling=[0-9]+ \[mbr-pa
+      unaos/scripts/specs/x86-default.spec:49 FORBID :: USB: \[usbw\] scratch geometry: .* keep-out ceiling=0 \[raw
+
+== unaos/scripts/specs/x86-install.spec   ':: PINSTALL:' -> ':: INSTALL:'
+   rules still on the OLD prefix at tip : 0   (want 0)
+   rules on the NEW prefix at tip       : 12
+   shared emitters  BASE: old= 63 new= 33
+   shared emitters  TIP : old=  0 new= 97
+   VERDICT: OK — every rule and its emitter moved together
+      unaos/scripts/specs/x86-install.spec:67 REQUIRE :: INSTALL: census disk=.* parts=5 foreign=[0-9]+ friend=[0-9]+ empty=[0-9]+ ::
+      unaos/scripts/specs/x86-install.spec:68 REQUIRE :: INSTALL: census part=1 type=7c3457ef lba=[0-9]+\.\.[0-9]+ sectors=[0-9]+ content=APFS ::
+      unaos/scripts/specs/x86-install.spec:69 REQUIRE :: INSTALL: census part=3 type=c12a7328 lba=[0-9]+\.\.[0-9]+ sectors=[0-9]+ content=ESP ::
+      unaos/scripts/specs/x86-install.spec:75 REQUIRE :: INSTALL: refusal target=global:disk reason=disk-has-foreign-volumes foreign=[0-9]+ friend=[0-9]+ -> guard O
+      unaos/scripts/specs/x86-install.spec:76 REQUIRE :: INSTALL: refusal target=global:part0 reason=partition-not-empty content=FAT -> guard OK ::
+      unaos/scripts/specs/x86-install.spec:77 REQUIRE :: INSTALL: refusal target=global:part1 reason=partition-not-empty content=APFS -> guard OK ::
+      unaos/scripts/specs/x86-install.spec:78 REQUIRE :: INSTALL: refusal target=global:part3 reason=partition-is-esp -> guard OK ::
+      unaos/scripts/specs/x86-install.spec:79 REQUIRE :: INSTALL: refusal target=global:part4 reason=partition-too-small have=[0-9]+B need=[0-9]+B -> guard OK ::
+      unaos/scripts/specs/x86-install.spec:87 COUNT 5 :: INSTALL: refusal target=
+      unaos/scripts/specs/x86-install.spec:104 REQUIRE :: INSTALL: refusal target=part1 reason=partition-not-empty content=APFS -> guard OK ::
+      unaos/scripts/specs/x86-install.spec:115 REQUIRE :: INSTALL: refusal target=part4 reason=partition-too-small have=[0-9]+B need=[0-9]+B -> guard OK ::
+      unaos/scripts/specs/x86-install.spec:148 FORBID :: INSTALL: refusal target=global:part2
+
+== unaos/scripts/specs/jetson-sync1.spec   'TEGRA-SD:' -> 'SDMMC:'
+   rules still on the OLD prefix at tip : 0   (want 0)
+   rules on the NEW prefix at tip       : 1
+   shared emitters  BASE: old=  5 new=  0
+   shared emitters  TIP : old=  0 new=  5
+   VERDICT: OK — every rule and its emitter moved together
+      unaos/scripts/specs/jetson-sync1.spec:409 FORBID SDMMC: REFUSED to publish
+
+== unaos/scripts/specs/jetson-sync1.spec   'TEGRA-UNAFS:' -> 'UNAFS:'
+   rules still on the OLD prefix at tip : 0   (want 0)
+   rules on the NEW prefix at tip       : 2
+   shared emitters  BASE: old=  5 new= 10
+   shared emitters  TIP : old=  0 new= 10
+   VERDICT: OK — every rule and its emitter moved together
+      unaos/scripts/specs/jetson-sync1.spec:593 PENDING UNAFS: native unafs volume MOUNTED read-only on TegraSd
+      unaos/scripts/specs/jetson-sync1.spec:619 FORBID UNAFS: mount on TegraSd FAILED
+
+ALL PAIRS RESOLVE
