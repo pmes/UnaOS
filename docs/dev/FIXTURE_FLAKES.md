@@ -1156,6 +1156,122 @@ APPPIN trap) and `FORBID :: WINMENU: .* -> SKIP reason=menu-unpublished-after=[0
 both `x86-ahci.spec` and `x86-default.spec`, so a 250 ms miss on the fold gate's
 `UNAOS_WC=1 ./arroyo test` is a red, not a silent green.
 
+---
+
+## Class 7 — the INJECTED-EVENT typist paces on the wall clock, and the emulator FOLDS what the guest did not poll
+
+**The shape.** A fixture counts events a host-side typist injected over QMP, and
+pins the count. The typist sends on a fixed cadence and never learns whether
+QEMU's emulated device delivered anything. On an idle host the cadence is far
+wider than the endpoint's polling interval and every event becomes its own HID
+report; under load the guest's poll gap stretches past the cadence, QEMU folds
+the events it has not yet handed over, and the report COUNT the fixture pins
+comes back short — while nothing was dropped and no error was reported anywhere.
+The fixture is then measuring the host's scheduler.
+
+The trap is that the shortfall LOOKS like loss. It is not: the travel is
+conserved, QMP acked every command, and the only casualty is the count.
+
+### 7a. PTRLANE `:: PTRINSTALL: installs=27 reports=27` for 36 typed — **known, FIXED 2026-09-22 (FLAKEFIX, rmbp-ledger B150)**
+
+**Signature on the wire.** The spec replay's first shortfall, against
+`x86-ptr.spec:66/67`:
+
+```
+:: PTRINSTALL: installs=27 reports=27 folds=0 lag_max_ms=20 coalesced=0 drains=27 ::
+  ❌ REQUIRE    \[ptrinstall\] installs=36 reports=36 lag_max_ms=\d+ coalesced=\d+ drains=\d+ folds=\d+
+       FIRST-SHORTFALL x86-ptr.spec:66
+```
+
+**and the discriminator is one field away, on a line nobody was reading:**
+
+```
+:: MOUSE-1: 32 reports, last dx=0 dy=0 buttons=0x00 == witness ::
+```
+
+The green form of the same witness, same command, same box:
+
+```
+:: MOUSE-1: 32 reports, last dx=-24 dy=-24 buttons=0x00 == witness ::
+:: PTRINSTALL: installs=36 reports=36 folds=0 lag_max_ms=27 coalesced=0 drains=36 ::
+```
+
+**`last dx=0 dy=0` IS THE ROOT CAUSE AND IT IS A DELTA THE TYPIST CANNOT SEND.**
+`scripts/qmp_type.py --pointer-kind rel` alternates `+step` / `-step` on both
+axes, so every event on the wire is ±24 and a zero delta can only be a SUM.
+QEMU's `hid_pointer_event` (`hw/input/hid.c`) folds a new motion event into the
+TAIL queue entry while that entry has not been polled — "we combine events where
+possible to keep the queue small" — so two adjacent moves become ONE report of
+(+24) + (−24) = 0 as soon as the guest's poll gap exceeds the injection gap. The
+same capture's `drain_gap_max_ms=140` against a 50 ms cadence is that gap,
+measured. The guest then discards the folded report before counting it:
+`drivers/xhci/mod.rs` charges `mouse_report_count` (so MOUSE-1 keeps climbing)
+but emits `Event::Mouse` only when `dx != 0 || dy != 0`, so `[ptrinstall]
+reports=` never sees it. Hence `MOUSE-1` > `PTRINSTALL` > typed, all in one
+capture.
+
+**The three candidates, and how each was eliminated.**
+
+| candidate | eliminated by |
+| --- | --- |
+| the QMP socket | every `input-send-event` returned `{}`; an `error` reply is already fatal in `qmp_type.py` |
+| QEMU's 16-deep `QUEUE_LENGTH` drop path | needs >16 undelivered events; a 50 ms cadence against an 8 ms interval never builds that depth, and a drop loses travel — the travel is conserved |
+| **QEMU's motion coalescing** | `last dx=0 dy=0`, impossible from the stream, plus `MOUSE-1 count > PTRINSTALL count` in the same capture |
+
+**Trigger conditions.** Host CPU contention. TRACKPAD lost a `test-ptr` gate run
+to it at host load 23 on 2026-09-22 (`27` of 36; its control run scored worse
+still, 0 `[ptrinstall]` lines). It is **deterministically reproducible without
+any load at all** by putting the cadence under the endpoint's 8 ms polling
+interval — which is the same mechanism, driven rather than waited for:
+
+```
+UNAOS_PTRLANE_NOACK=1 UNAOS_PTRLANE_GAP=0.006 ./arroyo test-ptr 150
+  -> :: PTRINSTALL: installs=8 reports=8 …   (36 typed, host load 11)
+```
+
+**Fix — the typist ACKS delivery instead of pacing on the clock.**
+`scripts/qmp_type.py --pointer-ack N` (`PTRACK`; see that block in the script's
+header). After the wall-clock first pass it reads the guest's own
+`[ptrinstall] reports=` out of the serial log it already holds open for
+`--marker`, and re-sends **exactly the shortfall** `--ack-gap` apart, up to
+`--ack-rounds` (3 on this lane). Exactly the shortfall, so the loop can
+undershoot and retry but can never overshoot a fixture that pins an equality;
+`--ack-settle` (0.5 s) is the quiet the reading is taken after, so a rollup tick
+that fires between the last send and the guest's 8 ms poll cannot be mistaken for
+a shortfall. On cap exhaustion it prints
+`[qmp] pointer ack: GAVE UP after N retry round(s) — guest counted C of T …` and
+stops: **the shortfall stays real, the spec literal `installs=36 reports=36` is
+untouched, and no tolerance is widened anywhere.** `arroyo`'s PTRLANE block arms
+it; `UNAOS_PTRLANE_NOACK=1` and `UNAOS_PTRLANE_GAP=<secs>` are the two host-side
+go-reds.
+
+**Measured, at the cadence that fails deterministically (`UNAOS_PTRLANE_GAP=0.006`):**
+
+| run | host load | typist | verdict |
+| --- | --- | --- | --- |
+| go-red, `NOACK=1` | 11.2 | `36 rel moves … 6 ms apart` | `installs=8 reports=8`, rc=1 |
+| green0 | 10.3 | `round 1/3 — guest counted 10 of 36 … re-sending 26` → `36 of 36 after 1 round, 62 sent` | `installs=36 reports=36`, **rc=0** |
+| green1 | 9.2 | `counted 6 of 36` → `36 of 36 after 1 round, 66 sent` | `installs=36 reports=36`, **rc=0** |
+| green2 | 11.4 → 33.2 | `counted 4 of 36` → `36 of 36 after 1 round, 68 sent` | `installs=36 reports=36`; run rc=1 on an unrelated class-2 red |
+| green3 | 33.2 → 41.2 | `counted 4 of 36` → `36 of 36 after 1 round, 68 sent` | `installs=36 reports=36`, **rc=0** |
+
+Four consecutive runs, one retry round each, `installs=36 reports=36` every time
+including at host load 41 — and never 37.
+
+**What to capture on recurrence.** The typist transcript
+(`target/ptrlane-typist.log`) and the `MOUSE-1` line together. `pointer ack:
+GAVE UP` with a large shortfall and MOUSE-1 reading `dx=0 dy=0` is this class
+with the retry budget too small; `GAVE UP` with MOUSE-1 NOT climbing at all is a
+different failure (the device or the endpoint, not the fold) and does not belong
+here.
+
+**Do NOT apply the ack to the keyboard bursts.** `qmp_type.py --bursts` exists to
+LOSE events — it measures how many the endpoint drops with no TRB armed — so
+acking it would erase the thing it measures. `--pointer-ack` is pointer-only on
+purpose.
+
+---
+
 ## Adding an entry
 
 An entry earns its place when a failure has been seen **more than once**, or once
