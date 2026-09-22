@@ -1,0 +1,130 @@
+DMGFLAKE — FIXTURE_FLAKES §1c re-classed and fixed (rmbp-ledger B158)
+branch exec-rmbp-dmgflake, parent 6fab6b0d, 2026-09-22
+
+================ 1. THE MECHANISM, FROM BENCH CAPTURES (read-only, other executors' logs)
+Every [dmgovlp] adopt_stretch=0/4 flake carries a [wcser] scope=fixture rollup with
+declined_pct=23..31. Greens carry declined_pct=0 or no fixture-scope declines at all.
+Captures live under ~/unaos-bench/scratch/rmbp-0915/<executor>-logs/ (build scratch, not git).
+
+=== DMGFLAKE evidence: the F1 flake family (all counters zero) vs GREEN ===
+
+-- FAIL captures (F1), with their [wcser] gate-serialisation rollup --
+#### gmux8-logs/test240.log
+[dmgovlp] stretch pass=8 pre=(true,0,0) dd=0 db=0 offers=0 taken=0
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=11/12 adopt=0 repaint=1 max_ms=2 adopt_stretch=0/4 -> FAIL
+  ✖ serial.log:1944: [dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=11/12 adopt=0 repaint=1 max_ms=2 adopt_stretch=0/4 -> FAIL
+[wcser] scope=live entered=105 declined=1 reruns=0 declined_pct=0 holder=-1 held_ms=0 exbusy=0 steals=0 revenants=0 span=5027ms -> SERIAL
+[wcser] scope=fixture entered=107 declined=48 reruns=3 declined_pct=30 holder=-1 held_ms=0 exbusy=0 steals=0 revenants=0 span=3548ms -> SERIAL
+#### flakefix-logs/repro1.log
+[dmgovlp] stretch pass=8 pre=(true,0,0) dd=0 db=0 offers=0 taken=0
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=10/12 adopt=0 repaint=0 max_ms=0 adopt_stretch=0/4 -> FAIL
+  ✖ serial.log:2022: [dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=10/12 adopt=0 repaint=0 max_ms=0 adopt_stretch=0/4 -> FAIL
+[wcser] scope=live entered=3 declined=0 reruns=0 declined_pct=0 holder=-1 held_ms=0 exbusy=0 steals=0 revenants=0 span=5021ms -> SOLO
+[wcser] scope=fixture entered=202 declined=61 reruns=4 declined_pct=23 holder=-1 held_ms=0 exbusy=0 steals=0 revenants=0 span=4153ms -> SERIAL
+[wcser] scope=live entered=42 declined=1 reruns=0 declined_pct=2 holder=-1 held_ms=0 exbusy=0 steals=0 revenants=0 span=19562ms -> SERIAL
+#### glassfix2-logs/serial-run1.log
+[dmgovlp] stretch pass=8 pre=(true,0,0) dd=0 db=0 offers=0 taken=0
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=9/12 adopt=0 repaint=0 max_ms=0 adopt_stretch=0/4 -> FAIL
+[wcser] scope=live entered=3 declined=0 reruns=0 declined_pct=0 holder=-1 held_ms=0 exbusy=0 steals=0 revenants=0 span=12861ms -> SOLO
+#### ptrinstall3-logs/serial-smp2-wc.log
+[dmgovlp] stretch pass=8 pre=(true,0,0) dd=0 db=0 offers=0 taken=0
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=12/12 adopt=0 repaint=0 max_ms=0 adopt_stretch=0/4 -> FAIL
+[wcser] scope=fixture entered=165 declined=75 reruns=4 declined_pct=31 holder=-1 held_ms=0 exbusy=0 steals=0 revenants=0 span=7859ms -> SERIAL
+#### specrows-logs/gate2-serial.log
+[dmgovlp] stretch pass=8 pre=(true,0,0) dd=0 db=0 offers=0 taken=0
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=8/12 adopt=1 repaint=0 max_ms=1 adopt_stretch=0/4 -> FAIL
+[wcser] scope=live entered=3 declined=0 reruns=0 declined_pct=0 holder=-1 held_ms=0 exbusy=0 steals=0 revenants=0 span=12162ms -> SOLO
+#### wifisweep-logs/after-serial.log
+[dmgovlp] stretch pass=8 pre=(true,0,0) dd=0 db=0 offers=0 taken=0
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=12/12 adopt=0 repaint=1 max_ms=1 adopt_stretch=0/4 -> FAIL
+[wcser] scope=live entered=196 declined=42 reruns=3 declined_pct=17 holder=-1 held_ms=0 exbusy=0 steals=0 revenants=0 span=5001ms -> SERIAL
+#### vfswit-logs/serial-x86-gored.log
+[dmgovlp] stretch pass=8 pre=(true,0,0) dd=0 db=0 offers=0 taken=0
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=12/12 adopt=3 repaint=1 max_ms=14 adopt_stretch=1/4 -> FAIL
+[wcser] scope=live entered=101 declined=6 reruns=0 declined_pct=5 holder=-1 held_ms=0 exbusy=0 steals=0 revenants=0 span=5356ms -> SERIAL
+[wcser] scope=fixture entered=121 declined=51 reruns=4 declined_pct=29 holder=-1 held_ms=0 exbusy=1 steals=0 revenants=0 span=4505ms -> SERIAL
+
+================ 2. THREE CONSECUTIVE GREENS UNDER LOAD (this fix, no probe)
+---- green1
+### green1
+LOAD_BEFORE:  16:51:34 up  9:31,  1 user,  load average: 25.02, 28.17, 31.31
+SIBLING_QEMU_BEFORE: 0
+TEST_RC=0
+LOAD_AFTER:  16:58:32 up  9:38,  1 user,  load average: 17.56, 22.67, 28.05
+SIBLING_QEMU_AFTER: 2
+[dmgovlp] stretch pass=8 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] stretch pass=9 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] stretch pass=10 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] stretch pass=11 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] serialisation folds=0 fold_ms=0 unran=0 budget_ms=250 — composite passes this battery had to wait out a COMP_GATE holder, the wall it cost, and passes that never ran within the budget (FIXTURE_FLAKES 1c: a declined pass composites nothing and clears nothing, so an unran pass scores every counter as a delta over work that did not happen; folds are REPORTED, never gated)
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=5 drag_px=38590 relay=3 narrow=3/12 cur=12/12 adopt=26 repaint=0 max_ms=11 adopt_stretch=4/4 -> PASS
+---- green2
+### green2
+LOAD_BEFORE:  16:59:25 up  9:39,  1 user,  load average: 16.98, 21.50, 27.33
+SIBLING_QEMU_BEFORE: 2
+TEST_RC=0
+LOAD_AFTER:  17:03:28 up  9:43,  1 user,  load average: 25.37, 23.82, 26.87
+SIBLING_QEMU_AFTER: 0
+[dmgovlp] stretch pass=8 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] stretch pass=9 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] stretch pass=10 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] stretch pass=11 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] serialisation folds=0 fold_ms=0 unran=0 budget_ms=250 — composite passes this battery had to wait out a COMP_GATE holder, the wall it cost, and passes that never ran within the budget (FIXTURE_FLAKES 1c: a declined pass composites nothing and clears nothing, so an unran pass scores every counter as a delta over work that did not happen; folds are REPORTED, never gated)
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=5 drag_px=38590 relay=3 narrow=3/12 cur=12/12 adopt=25 repaint=0 max_ms=6 adopt_stretch=4/4 -> PASS
+---- green3
+### green3
+LOAD_BEFORE:  17:03:28 up  9:43,  1 user,  load average: 25.37, 23.82, 26.87
+SIBLING_QEMU_BEFORE: 0
+TEST_RC=0
+LOAD_AFTER:  17:07:31 up  9:47,  1 user,  load average: 19.60, 21.36, 25.15
+SIBLING_QEMU_AFTER: 2
+[dmgovlp] stretch pass=8 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] stretch pass=9 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] stretch pass=10 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] stretch pass=11 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] serialisation folds=0 fold_ms=0 unran=0 budget_ms=250 — composite passes this battery had to wait out a COMP_GATE holder, the wall it cost, and passes that never ran within the budget (FIXTURE_FLAKES 1c: a declined pass composites nothing and clears nothing, so an unran pass scores every counter as a delta over work that did not happen; folds are REPORTED, never gated)
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=5 drag_px=38590 relay=3 narrow=3/12 cur=12/12 adopt=26 repaint=0 max_ms=10 adopt_stretch=4/4 -> PASS
+
+================ 3. FORCED FOLD — scratch probe holds COMP_GATE 80ms across the battery
+(the probe is NOT committed; it is the deterministic form of the bench mechanism)
+### forced-fixed
+LOAD_BEFORE:  17:08:50 up  9:49,  1 user,  load average: 28.06, 23.59, 25.61
+SIBLING_QEMU_BEFORE: 2
+TEST_RC=1
+LOAD_AFTER:  17:13:23 up  9:53,  1 user,  load average: 34.49, 31.75, 28.61
+SIBLING_QEMU_AFTER: 0
+[dmgflake-probe] SCRATCH: holding COMP_GATE from ms=14560 for 80ms
+[dmgflake-probe] SCRATCH: released COMP_GATE at ms=14670
+[dmgovlp] stretch pass=8 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] stretch pass=9 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] stretch pass=10 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] stretch pass=11 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1 why=adopted
+[dmgovlp] serialisation folds=2 fold_ms=110 unran=0 budget_ms=250 — composite passes this battery had to wait out a COMP_GATE holder, the wall it cost, and passes that never ran within the budget (FIXTURE_FLAKES 1c: a declined pass composites nothing and clears nothing, so an unran pass scores every counter as a delta over work that did not happen; folds are REPORTED, never gated)
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=3 drag_px=20910 relay=3 narrow=3/12 cur=12/12 adopt=26 repaint=0 max_ms=9 adopt_stretch=4/4 -> PASS
+NOTE: TEST_RC=1 on this run is COLLATERAL — the scratch probe clobbers COMP_GATE for the
+whole boot, which reds DOCK and DOCKID (FIXTURE_FLAKES §1d). [dmgovlp] itself PASSED.
+
+================ 4. DELIBERATE RE-INTRODUCTION — same probe, decline-blind drain restored
+### reintro
+LOAD_BEFORE:  17:14:24 up  9:54,  1 user,  load average: 43.96, 35.53, 30.16
+SIBLING_QEMU_BEFORE: 0
+TEST_RC=1
+LOAD_AFTER:  17:19:33 up  9:59,  1 user,  load average: 35.36, 38.49, 33.21
+SIBLING_QEMU_AFTER: 2
+[dmgflake-probe] SCRATCH: holding COMP_GATE from ms=9694 for 80ms
+[dmgovlp] stretch pass=8 pre=(true,0,0) dd=0 db=0 offers=0 taken=0 why=missed:pass-declined-by-COMP_GATE
+[dmgovlp] stretch pass=9 pre=(true,0,0) dd=0 db=0 offers=0 taken=0 why=missed:pass-declined-by-COMP_GATE
+[dmgovlp] stretch pass=10 pre=(true,0,0) dd=0 db=0 offers=0 taken=0 why=missed:pass-declined-by-COMP_GATE
+[dmgovlp] stretch pass=11 pre=(true,0,0) dd=0 db=0 offers=0 taken=0 why=missed:pass-declined-by-COMP_GATE
+[dmgovlp] serialisation folds=13 fold_ms=0 unran=0 budget_ms=250 — composite passes this battery had to wait out a COMP_GATE holder, the wall it cost, and passes that never ran within the budget (FIXTURE_FLAKES 1c: a declined pass composites nothing and clears nothing, so an unran pass scores every counter as a delta over work that did not happen; folds are REPORTED, never gated)
+[dmgovlp] stretch UNOFFERED offers=0/4 taken=0 — no staged window was offered the sprite (WC-D has published no first verdict for the stretch row, so `may_overlay` is withheld); the CURSTICK carry is NOT MEASURED on this boot and adopt_stretch does not gate the verdict
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=12/12 adopt=0 repaint=0 max_ms=3 adopt_stretch=0/4 -> FAIL
+
+================ 5. GATES
+CHECK_RC=0
+══ knoboff: wc ══
+   knoboff: warm=yes compiled_baseline=[unaos-kernel|unaos-kernel] compiled_tree=[unaos-kernel|unaos-kernel]   (x86|arm)
+   ✅ x86 knob-off image BYTE-IDENTICAL to baseline — 960c257292fd101eadd2a1af20323778ba838d20928be8a5df9a684e6f395363 1606680
+   ✅ arm knob-off image BYTE-IDENTICAL to baseline — 1a34fcf2362ab31b444efb37bb855b4ec492eff1a8f593de3ba3902731fddde8 1601385
+knoboff: PASS — 'wc' OFF is byte-identical to 6fab6b0d on both arches; control fired, cache warm.
+KNOBOFF_RC=0

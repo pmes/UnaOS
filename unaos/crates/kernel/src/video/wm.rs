@@ -25835,7 +25835,7 @@ pub fn dmgovlp_selftest() {
     /// First pass of the STRETCH (the last `M - STRETCH_AT` passes are the stretch), and the
     /// PASS floor on its carry count — see the doc block's stretch section.
     const STRETCH_AT: usize = 8;
-    const STRETCH_MIN: usize = 1;
+    const STRETCH_MIN: usize = 1; const FOLD_WAIT_MS: u64 = 250; const FOLD_SPIN_MAX: u32 = 200_000; // DMGFLAKE (B158) — ⚠ SAME-LINE, line-NEUTRAL fold, ahead of this line's first `//` (this file's standing rule: `wm.rs` compiles into the knob-off image and panic `Location`s below embed line numbers). The DECLINE budget. `composite()` on x86 is gated by [`COMP_GATE`]: a second entrant COMPOSITES NOTHING AND CLEARS NOTHING, stores `COMP_PENDING`, calls `owe_repaint` and returns — measured in microseconds. A fixture that scores a declined pass reads every counter as a delta over work that never happened, which is FIXTURE_FLAKES §1c's whole mechanism. 250 ms is 1.5x the worst honest TCG pass tail this file records (`[comp2] pass_us=4265` mean, 170 ms tail, VUGPROBE's note) and 4x under [`DMGOVLP_WEDGE_MS`], so the wait can never mask the boot-8 wedge it sits inside. `FOLD_SPIN_MAX` is the GIVEUP_FRAMES half of the bound, so the wait terminates even if `crate::arch::ms()` were to stop advancing.
     /// The six owners, kernel-band and pace-exempt. Const-asserted into the band.
     const OWNERS: [u64; 6] = [
         KERNEL_OWNER_BASE + 0x40,
@@ -25961,7 +25961,7 @@ pub fn dmgovlp_selftest() {
     };
     let (hx, hy) = (hid(ov_x, pw), hid(ov_y, ph));
     crate::pal::cursor::set_abs(hx, hy, pw as i32, ph as i32);
-    super::cursor::ensure_drawn();
+    super::cursor::ensure_drawn(); let (mut folds, mut fold_ms, mut unran) = (0u32, 0u64, 0usize); let composite_live = |budget_ms: u64| -> (bool, u64, u64, u32) { let w0 = crate::arch::ms(); let mut fold = 0u32; loop { let d0 = WCSER_DECLINED.load(Relaxed); let c0 = crate::arch::ms(); composite(); let work = crate::arch::ms().wrapping_sub(c0); if WCSER_DECLINED.load(Relaxed) == d0 { return (true, c0.wrapping_sub(w0), work, fold); } fold += 1; let waited = crate::arch::ms().wrapping_sub(w0); if waited >= budget_ms { return (false, waited, 0, fold); } let mut spins = 0u32; while COMP_GATE.load(Relaxed) && spins < FOLD_SPIN_MAX && crate::arch::ms().wrapping_sub(w0) < budget_ms { spins += 1; core::hint::spin_loop(); } } }; // DMGFLAKE (B158) — ⚠ SAME-LINE, line-NEUTRAL fold, ahead of this line's first `//` (this file's standing rule: `wm.rs` compiles into the knob-off image and panic `Location`s below embed line numbers). **COMPOSITE THAT ACTUALLY RAN, or say so.** This is the §1c fix, and it is the shape §1a proved for DMG-REFUSE one layer down: the assertion is made inside a window where the state is provably live, instead of wherever the wall clock happened to land. `composite()` returns identically whether it ran a pass or was DECLINED by [`COMP_GATE`], so the fixture asks the gate's own witness counter — a decline is the ONLY writer of [`WCSER_DECLINED`] — retries past it (the declined pass CLEARS NOTHING, so the damage it did not service is still on the table and the next real pass carries it), and reports what it cost. Three returns, all read at the call sites: `ran` (a real pass happened), `fold_wait_ms` (wall spent waiting — REPORTED on the `serialisation` line, never gated, LAWS §5), `work_ms` (the pass's OWN duration, the only term [`DMGOVLP_WEDGE_MS`] may see — folding the wait into it would turn a busy sibling into a false WEDGE, which is the wrong-strict trade §1c exists to refuse). A sibling's decline can also move the counter and cost one spurious retry; that is conservative by construction and costs a re-composite, never a verdict. Non-capturing, so it borrows nothing the loop below mutates.
 
     // ---- settle, then baseline (CTRLWIT's lesson: flush BEFORE the measured interval) --------
     // Drain whatever the creates, moves, raise and sprite arming left pending, so the deltas
@@ -25969,8 +25969,8 @@ pub fn dmgovlp_selftest() {
     // the defect the loop exists to catch, and the loop will catch it against its own baseline.
     for _ in 0..K + 1 {
         let before = C2_DMG_PX_TOT.load(Relaxed);
-        composite();
-        if C2_DMG_PX_TOT.load(Relaxed) == before {
+        let (sran, sfw, _sw, sfold) = composite_live(FOLD_WAIT_MS); folds += sfold; fold_ms = fold_ms.max(sfw); if !sran { unran += 1; } // DMGFLAKE (B158) — ⚠ SAME-LINE, line-NEUTRAL fold, ahead of this line's first `//` (this file's standing rule: `wm.rs` compiles into the knob-off image and panic `Location`s below embed line numbers). The settle is where the flake USED to be decided: a declined pass paints nothing, so `C2_DMG_PX_TOT` does not move, so the loop below read "settled" and the whole battery then ran against a gate it never held. `sran` is the term that tells the two apart.
+        if sran && C2_DMG_PX_TOT.load(Relaxed) == before {
             break;
         }
     }
@@ -26029,7 +26029,7 @@ pub fn dmgovlp_selftest() {
         } else {
             (false, 0, 0)
         };
-        let t0 = crate::arch::ms();
+        { let g0 = crate::arch::ms(); let mut spins = 0u32; while COMP_GATE.load(Relaxed) && spins < FOLD_SPIN_MAX && crate::arch::ms().wrapping_sub(g0) < FOLD_WAIT_MS { spins += 1; core::hint::spin_loop(); } } let t0 = crate::arch::ms(); // DMGFLAKE (B158) — ⚠ SAME-LINE, line-NEUTRAL fold, ahead of this line's first `//` (this file's standing rule: `wm.rs` compiles into the knob-off image and panic `Location`s below embed line numbers). `present_rows`/`present` composite INSIDE themselves, so the present is declinable exactly as the drain is. Waiting for the gate to read free first is not the proof (the holder can retake it between the load and the call, and `composite_live` in the drain below is what actually recovers the measurement) — it is the cheap half that keeps the common case out of the retry path, and it is bounded by the same two bounds.
         let ran = if m < STRETCH_AT {
             match m % 3 {
                 // (A) banded seed at the chain FOOT: w1 drags by the sliver, w2 only by relay.
@@ -26062,9 +26062,9 @@ pub fn dmgovlp_selftest() {
         let mut last_dpx = 0u64;
         for _ in 0..K {
             let before = C2_DMG_PX_TOT.load(Relaxed);
-            let c0 = crate::arch::ms();
-            composite();
-            let cdt = crate::arch::ms().wrapping_sub(c0);
+            let (dran, dfw, cdt, dfold) = composite_live(FOLD_WAIT_MS); // DMGFLAKE (B158) — ⚠ SAME-LINE, line-NEUTRAL fold, ahead of this line's first `//` (this file's standing rule: `wm.rs` compiles into the knob-off image and panic `Location`s below embed line numbers). **THE DEFECT, IN ONE TERM.** The old drain read `Δdmg == 0` and called it DRAINED — but a pass DECLINED by [`COMP_GATE`] also adds zero pixels, so `drained=12/12` was being scored by the compositor doing NOTHING. Every §1c capture on the bench reads `drained=12/12` beside `drag_evt=0 drag_px=0 relay=0 narrow=0/12 adopt=0`: twelve green drains over twelve passes that never happened.
+            folds += dfold; fold_ms = fold_ms.max(dfw); // DMGFLAKE (B158) — ⚠ SAME-LINE, line-NEUTRAL fold, ahead of this line's first `//` (this file's standing rule: `wm.rs` compiles into the knob-off image and panic `Location`s below embed line numbers). The cost of the wait, carried to the `serialisation` line. Never a verdict term.
+            if !dran { unran += 1; } // DMGFLAKE (B158) — ⚠ SAME-LINE, line-NEUTRAL fold, ahead of this line's first `//` (this file's standing rule: `wm.rs` compiles into the knob-off image and panic `Location`s below embed line numbers). The budget expired with every attempt declined — the fixture did NOT measure what it claims to measure, and `ok` says so below rather than printing zeros that read like a CURSTICK regression.
             max_ms = max_ms.max(cdt);
             if cdt > DMGOVLP_WEDGE_MS {
                 serial_println!("[dmgovlp] WEDGE pass={} ms={} -> FAIL", m, cdt);
@@ -26072,7 +26072,7 @@ pub fn dmgovlp_selftest() {
                 break;
             }
             last_dpx = C2_DMG_PX_TOT.load(Relaxed).wrapping_sub(before);
-            if last_dpx == 0 {
+            if dran && last_dpx == 0 {
                 drained = true;
                 break;
             }
@@ -26100,10 +26100,10 @@ pub fn dmgovlp_selftest() {
                 adopt_stretch += 1;
             }
             serial_println!(
-                "[dmgovlp] stretch pass={} pre=({},{},{}) dd={} db={} offers={} taken={}",
+                "[dmgovlp] stretch pass={} pre=({},{},{}) dd={} db={} offers={} taken={} why={}",
                 m, pre.0, pre.1, pre.2, dd, db,
                 CUR3_OFFERS.load(Relaxed).wrapping_sub(of0),
-                CUR3_TAKEN.load(Relaxed).wrapping_sub(tk0)
+                CUR3_TAKEN.load(Relaxed).wrapping_sub(tk0), if CUR3_TAKEN.load(Relaxed) != tk0 { "adopted" } else if db == 0 { "missed:pass-declined-by-COMP_GATE" } else if CUR3_OFFERS.load(Relaxed) == of0 { "missed:unoffered" } else { "missed:offered-but-no-carry" } // DMGFLAKE (B158) — ⚠ SAME-LINE, line-NEUTRAL fold, ahead of this line's first `//`. The per-pass MISS REASON, so a capture never again has to guess which of the three a `0/4` was. `missed:pass-declined-by-COMP_GATE` (`db == 0`: the pass painted no box pixels at all, so it did not run) is FIXTURE_FLAKES §1c's flake; `missed:unoffered` is DMGOVLP2's third state; `missed:offered-but-no-carry` is the ONLY one that convicts CURSTICK, and it is the shape the go-red prints. It rides the per-pass line and not the verdict because `scripts/specs/x86-wc.spec`'s REQUIRE pins the verdict grammar `adopt_stretch=\d+/4 -> PASS` contiguously; this line carries no `SKIP` and no `-> FAIL`, so it trips none of that file's FORBIDs — the same argument DMGOVLP2's `stretch UNOFFERED` line makes.
             );
         }
     }
@@ -26124,7 +26124,7 @@ pub fn dmgovlp_selftest() {
         && cur_n >= CUR_MIN
         // The stretch's conviction: at least one of its OFFERED passes CARRIED the sprite through
         // a staged band — impossible without the CURSTICK widening (RED reads 0/4 WITH offers).
-        && adopt_stretch >= STRETCH_MIN.min(stretch_offer); if stretch_offer == 0 { serial_println!("[dmgovlp] stretch UNOFFERED offers=0/4 taken=0 — no staged window was offered the sprite (WC-D has published no first verdict for the stretch row, so `may_overlay` is withheld); the CURSTICK carry is NOT MEASURED on this boot and adopt_stretch does not gate the verdict"); } // DMGOVLP2 — ⚠ SAME-LINE, line-NEUTRAL. The floor is `min(1, offered)`, so an UNOFFERED battery asserts nothing instead of convicting CURSTICK of a schedule it does not own; an OFFERED one is the pre-DMGOVLP2 threshold character for character. The reason goes on the wire on its own line rather than into the verdict, which is spec-regex-pinned (`adopt_stretch=\d+/4`) and must not move; the line carries no `SKIP` and no `-> FAIL`, so it trips none of x86-wc.spec's FORBIDs.
+        && adopt_stretch >= STRETCH_MIN.min(stretch_offer) && unran == 0; serial_println!("[dmgovlp] serialisation folds={} fold_ms={} unran={} budget_ms={} — composite passes this battery had to wait out a COMP_GATE holder, the wall it cost, and passes that never ran within the budget (FIXTURE_FLAKES 1c: a declined pass composites nothing and clears nothing, so an unran pass scores every counter as a delta over work that did not happen; folds are REPORTED, never gated)", folds, fold_ms, unran, FOLD_WAIT_MS); if stretch_offer == 0 { serial_println!("[dmgovlp] stretch UNOFFERED offers=0/4 taken=0 — no staged window was offered the sprite (WC-D has published no first verdict for the stretch row, so `may_overlay` is withheld); the CURSTICK carry is NOT MEASURED on this boot and adopt_stretch does not gate the verdict"); } // DMGOVLP2 — ⚠ SAME-LINE, line-NEUTRAL. The floor is `min(1, offered)`, so an UNOFFERED battery asserts nothing instead of convicting CURSTICK of a schedule it does not own; an OFFERED one is the pre-DMGOVLP2 threshold character for character. The reason goes on the wire on its own line rather than into the verdict, which is spec-regex-pinned (`adopt_stretch=\d+/4`) and must not move; the line carries no `SKIP` and no `-> FAIL`, so it trips none of x86-wc.spec's FORBIDs.
     serial_println!(
         "[dmgovlp] verdict passes={}/12 drained={}/12 drag_evt={} drag_px={} relay={} narrow={}/12 cur={}/12 adopt={} repaint={} max_ms={} adopt_stretch={}/4 -> {}",
         passes_n, drained_n, drag_evt, drag_px, relay, narrow_k, cur_n, adopt, repaint_n, max_ms,
