@@ -18358,3 +18358,291 @@ the ring). That last pair is the finding restated as a fact: with the blocking a
 contended panel read takes the ENTIRE input path down with it, which is what it means for the
 pointer to wait on the compositor. `main.rs` was then restored and verified byte-identical by
 sha256.
+## VUGPERF — the pace-shadow critical section was the pass, and that is the vug tearing (x86 `wc`, flight 11, 2026-09-22)
+
+**Brief.** Peter on flight 11 (2026-09-22): two storms, ZERO dead cores — W5SPIN holds, and the
+falsification written up in SPANFLUSH above is confirmed by the absence of every line it predicted
+would stop — but *"vug performance still way off, tearing"*. Branch `exec-rmbp-vugperf`, parent
+`b9edcfa1`; rmbp-ledger **B135**.
+
+### 1. The wire, and what pairs with what
+
+The flight-11 capture
+(`~/unaos-bench/scratch/rmbp-0915/vugperf-logs/f11.log`, 18290 lines) carries **3697**
+`:: [wcser] PRESENT-BANDED SPIN` lines. They are not noise and they are not random: they pair.
+
+    grep -o "PRESENT-BANDED SPIN site=[0-9]* waited_us=[0-9]* on=shadow[0-9]* -> [A-Z-]*" f11.log \
+      | sed 's/waited_us=[0-9]*/waited_us=N/' | sort | uniq -c | sort -rn
+
+    450 site=2 waited_us=N on=shadow9  -> GAVE-UP      449 site=1 waited_us=N on=shadow9  -> RELEASED
+    386 site=2 waited_us=N on=shadow6  -> GAVE-UP      385 site=1 waited_us=N on=shadow6  -> RELEASED
+    302 site=2 waited_us=N on=shadow8  -> GAVE-UP      301 site=1 waited_us=N on=shadow8  -> RELEASED
+    183 site=2 waited_us=N on=shadow7  -> GAVE-UP      182 site=1 waited_us=N on=shadow7  -> RELEASED
+    146 site=2 waited_us=N on=shadow10 -> GAVE-UP      145 site=1 waited_us=N on=shadow10 -> RELEASED
+    127 site=2 waited_us=N on=shadow11 -> GAVE-UP      127 site=1 waited_us=N on=shadow11 -> RELEASED
+    101 site=2 waited_us=N on=shadow12 -> GAVE-UP      100 site=1 waited_us=N on=shadow12 -> RELEASED
+
+The census reconciles exactly, and it is worth writing down because the line count and the `[wpace]`
+counters are NOT the same number — a reader who conflates them will mis-size the defect:
+
+    grep -c "PRESENT-BANDED SPIN"                          3697   every printed transition
+      site=2 (the band update)                             2008   = 1695 GAVE-UP + 313 RELEASED
+      site=1 (the create refill)                           1689   = 1689 RELEASED, 0 GAVE-UP
+    [wpace] spin=  summed over every per-window line       2002   one tick per printed RELEASED
+    [wpace] wedge= summed over every per-window line       2383   one tick per GIVE-UP, PRINTED OR NOT
+
+`wedge=2383` against 1695 printed give-ups is not a discrepancy, it is W5SPIN working: the counter
+ticks on every budget exhaustion while the LINE prints once per latch TRANSITION, so the 688
+difference is give-ups taken on an ALREADY-LATCHED slot, where `budget = 0` makes the cost one
+`cmpxchg` instead of 500 µs. That is precisely what the latch is for and it must not be read as
+extra damage. The number that sizes the defect is therefore **2383 give-ups**, of which **1695 were
+full-budget 500 µs stalls**; 1695 is also the honest floor on shadow evictions.
+
+Against what: the seven vug windows took **32 733** presents on this boot (`[wc-h] presspop=`
+5549 / 5728 / 5903 / 4996 / 5013 / 2200 / 3344 for win 6..12), so the full-budget give-ups are
+**5.2 %** of their presents and all give-ups **7.3 %**. The PASS-side `ShadowSrc::Defer` arm — the
+composite finding the shadow held by the OWNER — fired **34** times in the whole boot
+(`[wpace] defer=`). That asymmetry is the finding in one ratio: the presenter loses this race ~70×
+more often than the pass does, because the presenter is the only one of the two with a bound.
+
+Three readings are forced by that table and each one is load-bearing.
+
+**(a) Every GAVE-UP spent the WHOLE budget.** `grep -o "site=2 waited_us=[0-9]*.*GAVE-UP"` over the
+capture yields `waited_us=500` **1695 times and no other value**. Not one give-up was a near miss.
+
+**(b) Only the vugs.** The give-ups are on shadows 6..12 — the seven windows
+`[wc-a] create win=6..11 … surf=288x288 stride=1152 scale=2x` and `win=12 … surf=128x128` — and
+their counts sum to exactly the 1695 total. The console window (win=2) and the shell never gave up
+once, which is the same split `[wc-h]` shows on banding (below).
+
+**(c) The site=1 twin says the lock was FREE microseconds later.** `site=1` is
+`pace_shadow_refresh`'s CREATE arm, and its `waited_us=0 -> RELEASED` is
+`pace_shadow_acquire`'s latched-slot path: the first `try_lock` SUCCEEDED. So the cycle per window
+is one loop: the band update waits 500 µs and gives up → `PACE_SHADOW_OK` bit cleared → the window
+drops to the live-read path for that present → the next present arrives with `create = true`,
+takes the lock instantly, and re-copies the WHOLE `surf_len` extent. At least 1695 evictions and
+1695 full-extent refills — one per full-budget collision, and 2383 by the `wedge=` counter.
+
+### 2. The mechanism: who holds the shadow, across what
+
+`composite_inner`'s `_shadow_pin` (`video/wm.rs`, the `pace_shadow_source` match) is a
+`let` binding in the per-window loop body, so the guard lives to the END of the iteration. Between
+the pin and that end the pass runs, in order:
+
+    verify_reference (WC-D reference, a multi-MB read)
+    wcg::begin
+    draw_window -> stage_window, per band:
+        paint_window(&layer, r, …)      <-- THE ONLY READER OF THE SHADOW BYTES
+        cursor::compose_into
+        beam::hold(by+band, …)          <-- SPINS ON THE KEPLER BEAM
+        for y in 0..rows { blit_traced(fb, …) }   <-- the BAR1 blit, reads `stage`, not the shadow
+        fb.flush_rect / beam::settle
+    wcg::end          (read-back checksums)
+    wcg::stage_flush  (serial UART writes)
+    band_flush / chromeband_fixture
+    verify_window     (scan-out read-back)
+
+Only `paint_window` touches a shadow byte. Everything after it reads the STAGING buffer. And
+flight 11 says how long the rest is:
+
+    [comp2] rollup passes=35 pass_us=139751 max_us=211550 blit_us=139508 compose_us=60954
+            present_us=32066 bytes_pp=19843205 dmg_px_pp=4960801 box_px_pp=4960801 util_pct=97 rate=6.9/s
+
+* `pass_us=139751` mean, `max_us=250007` on the worst rollup, `util_pct=97` — the compositor is
+  busy 97 % of the wall.
+* `compose_us=60954` is `paint_window` (19.8 MB re-derived per pass at 326 MB/s) — the part that
+  needs the shadow.
+* `present_us=32066` is the BAR1 blit (19.8 MB at ~620 MB/s into the Kepler aperture) — does not.
+* The residual `blit_us - (compose_us + present_us)` = **46 488 µs per pass** is the BEAM WAIT,
+  which is charged to neither half by construction (`stage_window` subtracts `_hbw` out of
+  `compose_cyc` and starts `present_cyc` after the hold). `[wc-h] win=8 beamwaits=4336
+  beamwait_us=10766899` is a 2.48 ms MEAN hold; `win=2 beammaxwait_us=62007`.
+
+Ten windows share a 139.75 ms pass, so one window's pin is ≈ **14 ms** — and the presenter's whole
+budget is **500 µs**. The pin is 28× the bound. Worse, it is not even close: the beam wait ALONE,
+at 2.48 ms mean, exceeds the budget by 5× before a single BAR1 byte moves. `[wpace] rollup wins=10
+pres=880 rate=176.0/s -> FREE` is the other side of the same arithmetic — 176 presents a second
+arriving into a lock whose holder keeps it for 14 ms at a time.
+
+**So the collision is not a race the presenter can lose. It is a race the presenter cannot win.**
+W5SPIN's 500 µs bound was never too small; the critical section was too wide. That is the whole
+finding, and it is the sentence the `pace_shadow_acquire` header should be read against: its own
+text already said the pass pins the shadow "across `draw_window` + WC-G/WC-D + the staged
+span-flush into the Kepler BAR1, which is milliseconds at best" — it named the width and then
+bounded the wrong side of it.
+
+### 3. The fix: the pass gets its own copy
+
+`PACE_MIRROR`, a second per-slot buffer. `pace_shadow_source` now, under the shadow lock:
+`try_lock` the slot's mirror, grow it fallibly to `surf_len`, ONE `copy_nonoverlapping` of the
+shadow into it, **`drop(g)`**, point `rw.surf` at the mirror and return the MIRROR's guard.
+`ShadowSrc::Shadow`'s type is unchanged (both are
+`MutexGuard<'static, Vec<u8>, SpinRelax>`) and every caller is unchanged, so the pass still holds a
+guard for the whole iteration — but it is a guard on a buffer **no refresh can ever want**.
+
+The critical section stops being the pass and becomes the memcpy: 288×288×4 = **324 KiB**, which is
+tens of µs on this machine against a 500 µs bound. The mirror's own `try_lock` cannot honestly
+contend (`COMP_GATE` serialises passes; nothing else touches `PACE_MIRROR`), and a miss — or an
+allocation decline — falls back to `ShadowSrc::Shadow(g)`, i.e. the pre-VUGPERF wide pin: correct,
+slow, counted as `mirror_oom=`, never a torn glyph. Memory is SHELLWIN-OOM's rule doubled and no
+worse: 12 × 324 KiB = 3.9 MiB against the x86 256 MiB heap, fallible, never freed.
+
+It also STRENGTHENS the two read-back witnesses. WC-G's `blit`/`after` checksums and WC-D's
+reference/verify pair bracket the blit and must see the same bytes at both ends; until now that
+rested on holding the shadow lock across the blit — the very width this arc removes. On the mirror
+they read a buffer only the serialised pass can write, so the property is structural instead of
+lock-dependent.
+
+**Expected GAVE-UP count per storm: ZERO, and a non-zero count is now a real report.** A give-up
+after this fix means a presenter waited 500 µs for a 324 KiB memcpy, which cannot happen on a
+running core — so it would mean a pass PREEMPTED inside the copy, which is the one residue W5SPIN's
+latch is still there to survive. The wire to read on flight 12 is therefore
+`grep -c "PRESENT-BANDED SPIN"` = **0**, against flight 11's 3697.
+
+### 4. The fixture: ask the lock, do not time it
+
+QEMU cannot reproduce the contention — `[wpace] spin=0 wedge=0` is the healthy TCG reading, which
+is exactly why `x86-wc.spec`'s W5SPIN rule could only pin the census FIELDS and not a value. So the
+fixture does not measure the collision; it measures the PROPERTY that prevents it.
+
+`pace_pin_probe` runs at the tail of the per-window composite iteration — past `draw_window`, the
+beam wait, the BAR1 blit and both read-back witnesses — on every window that composited from a
+shadow, and try-locks that window's `PACE_SHADOW`. The answer is deterministic in both directions:
+
+* with the mirror, the pass released the shadow inside `pace_shadow_source`, so the try-lock
+  succeeds unless the owner is coincidentally mid-refresh;
+* re-widen the critical section and the pass is ITSELF the holder, so the try-lock **cannot**
+  succeed — `free=0`, every probe, on any host, at any speed.
+
+    :: VUGPERF: shadow-pin probes=<n> free=<n> held=<n> free_pct=<n> copy_us=<n> pass_us=<n>
+       copy_pct=<n> mirror_oom=<n> bound=free_pct>=90 :: PASS ::
+
+on `[wpace]`'s cadence, drained, and silent when the population is empty (a boot with no paced
+window must not print a green line about one — the silent-fixture hole `x86-wc.spec`'s PTRDEAD
+block exists to close). `free_pct >= 90` rather than `held == 0`: the presenter legitimately holds
+the shadow for the µs of its own memcpy, so an honest run may lose a probe to it, while the
+re-widened pass loses every one. Nothing can land between those two populations.
+`copy_us`/`pass_us` are REPORTED, never gated — pinning a duration would gate the emulator rather
+than the lock.
+
+**Go-red** is the one token: revert `pace_shadow_source`'s tail to `r.surf = g.as_ptr() as usize;
+ShadowSrc::Shadow(g)` and the pass holds the shadow across the pass again.
+
+### 4b. AND THE FIXTURE DID NOT SCORE ON ITS OWN GATE — measured, not assumed
+
+The verdict line **did not print** on this arc's QEMU capture, and the honest reading is that the
+fixture SHIPS but is UNSCORED here, not that it passed. It is in the artifact —
+`LC_ALL=C grep -a -o -F ":: VUGPERF: shadow-pin" target/x86_64_esp/kernel.elf` matches (control
+`:: VUGPERFX:` = 0) — and `pace_pin_probe` is reached, which `./arroyo check` proves by the ABSENCE
+of a `never used` warning for it across all 157 cfg legs. What is missing is the POPULATION, and
+the capture says exactly why:
+
+    awk 'index($0,"[wpace] win=")' target/serial.log | grep -v "shdw=0"
+    [wpace] win=1 asid=0xc live=yes mode=panel paced=2 coalesced=1 tail=1 shdw=1 defer=0 spin=0 wedge=0 …
+
+**One coalesced present in a 248-second boot** (`coalesced=` summed over every per-window line = 1),
+so exactly one shadow was ever created — and `[wc-a] close win=1` retires that window before any
+pass composited from it. `create_inner` clears the validity bit on slot re-issue, so no composite
+ever took `ShadowSrc::Shadow`, `probes` stayed 0, and the emitter's `if probes > 0` guard correctly
+said nothing. A shadow only exists for a window the pacer has COALESCED, i.e. one presenting faster
+than the panel; the QEMU ladder's windows present slowly and are torn down fast, so this gate
+structurally cannot hold one. That is the same reason `x86-wc.spec`'s W5SPIN rule could only pin
+the census FIELDS.
+
+**The go-red was therefore NOT RUN, and running it would have proved nothing.** The emitter's guard
+is identical on both trees, so a re-widened build prints the same nothing: the run would have been a
+vacuous red, and quoting it as a go-red would be the false green this file keeps warning about. The
+vacuity is a deduction from a measured fact (`probes = 0`), not a guess.
+
+**What would give it a population — the exact change, named and NOT taken** (it needs a file this
+brief does not name, EXECUTOR-BRIEF §3). A driven fixture on the DMGOVLP / MENUDROP pattern: the
+body in `video/wm.rs`, one ladder call in `arch/x86_64/syscall.rs`. Create one user window, present
+it TWICE inside a single 16.667 µs-scaled frame period so the second present is COALESCED — which
+creates the shadow at a real present boundary, honestly, rather than by poking `PACE_SHADOW`
+directly — then run one `composite()` and let `pace_pin_probe` fire at the loop tail. That makes
+`probes >= 1` on every boot and the go-red deterministic: with the mirror `free_pct=100`, re-widened
+`free_pct=0`, on the same capture. Poking the slot directly instead would repeat precisely the
+mistake `x86-wc.spec` records at B121 — `winmenu::selftest` passing on every x86 boot through a seam
+the live path never calls.
+
+**Until then it scores on METAL, where the population is enormous.** Flight 11's seven vugs took
+32 733 presents with 2383 give-ups; flight 12 will take the Shadow path on essentially every one of
+them, so `:: VUGPERF: shadow-pin …` will print on the wire with a four-figure `probes=` and the
+verdict is read there.
+
+### 5. `amp=4.44x` — the brief's premise is wrong, and the right number is next to it
+
+    [wc-w] rollup presents=4727 requested_px=34958085 presented_px=155244773 amp=4.44x
+           full_presents=27 bracketq_met=0 bracketq_busy=0 -> WIDENED
+
+This is **not** "the compositor pushing 4.4× the pixels the windows asked for". `[wc-w]` is
+DRAGWIDE's DESKTOP census (`video/screen.rs`, `desk_present_note` from
+`Screen::present_background`): `requested_px` is the `PRESENT_RECTS` queue that this present
+drained — the DRAG-PI M1 narrow asks, which only `move_to_inner` and `drain_deferred` ever write —
+and `presented_px` is the whole desktop damage set, which also carries console text and strip
+damage the queue never asked for. It says nothing about the window layer at all.
+
+And the ratio decomposes cleanly. 27 whole-panel escalations × 2880×1800 = **139 968 000 px**, i.e.
+**90.2 %** of the 155 244 773 numerator, from **0.57 %** of the presents. The remaining 4700
+presents published 15 276 773 px against 34 958 085 requested — they are not amplifying at all,
+they publish LESS than they were asked for (merged, clipped and empty rects). `-> WIDENED` is the
+discriminator saying precisely this, and `full_presents=27` is the whole story. **The pace-shadow
+give-up does not feed `amp=`, and the fix will not move it.** What moves it is
+`request_full_present`; that is a separate row and it is not this arc's.
+
+The WINDOW-layer amplification is real and is reported one line away:
+
+    [comp2] … dmg_px_pp=4960801 box_px_pp=4960801       (equal on 120 of 201 rollups)
+    [wc-h] win=8  whole=3911 banded=49        win=12 whole=1725 banded=7      win=3 whole=14266 banded=354
+    [wc-h] win=2  whole=3483 banded=3640      (the console — the ONLY window that bands)
+
+The vugs present whole-box 97.6–99.6 % of the time while the console bands half its presents. The
+give-up path is one named contributor: `pace_shadow_defer` re-raises `r.damage_all()` — the WHOLE
+box, deliberately conservative — and the create-refill copies the whole extent. 302 give-ups
+against win 8's 3911 whole-box presents is ~8 %, so this fix removes a slice and not the bulk; the
+rest is the vug declaring whole-box damage itself, which is a `pulse`/vug question, not a
+compositor one. Stated as a bound rather than a promise: flight 12 should read `banded=` up by
+roughly the give-up count per window and `whole=` down by the same, and nothing else.
+
+### 6. Tearing — and this answers A5's open question
+
+`torn=` is the BEAM witness's count of presents whose band crossed the Kepler beam position, and on
+flight 11 the bracket is armed and working (`beam=obs beamobs=5903 beamwaits=4336
+beamgiveup=35`). The blit is ALREADY inside `beam::hold`'s bracket — there is nothing to move it
+onto — and it stays inside it after this fix, which only changes which buffer `paint_window` read
+before the bracket opened.
+
+So the tear Peter sees in the vugs is a DIFFERENT CLASS from the one `torn=` counts, and that is
+the third of the three readings A5 left open ("the tear class the eye sees there is not the class
+`beamcross` counts"). **At least 1695 times this boot — 2383 by `[wpace] wedge=` — a vug window
+was composited from its LIVE surface**
+— that is what clearing `PACE_SHADOW_OK` does — while its owner was mid-draw of the next frame.
+That is a torn SOURCE, and no scan-out bracket can see it: the band was published cleanly, it was
+simply a picture of half a frame. It is exactly the GR27 flicker the shadow was built to kill,
+re-entering through the shadow's own degraded mode. Removing the collisions removes the live-path
+presents, which is why this arc expects the vug tearing to go with the give-ups.
+
+`torn=223` (win 8) and `torn=191` (win 12) are a separate, standing population — presents that did
+cross the beam — and this fix is not expected to move them.
+
+**`bracketq_met=0 bracketq_busy=0` is DEAD CODE on this board, not a quiet reading.**
+`Screen::bracket_needed` tests `if DESK_SPRITE_OCC { note_flush_bracket(false); return (false,
+true); }` BEFORE the `||`-chain whose last term is `present_rects_meet`, and
+`const DESK_SPRITE_OCC: bool = cfg!(all(target_arch = "x86_64", feature = "wc"))`. Flight 11 is
+x86 with `wc` armed, so PTRREPAINT's withheld-copy answer short-circuits above BRACKETQ's arm and
+`present_rects_meet` is NEVER CALLED. The pair can only be non-zero where `DESK_SPRITE_OCC` is
+false — aarch64, or a `wc`-off x86 witness boot — and `[wc-w]` is an x86 reader, so on every armed
+compositor boot there has ever been the pair reads 0 by construction. It is in `video/screen.rs`,
+outside this arc's named files: REPORTED, not taken.
+
+### 7. The rung for the GPU line, which this arc does not climb
+
+Everything above is a lock. The Kepler half is untouched and is still `PCIE-RP-RECOVERY.md` §11.3
+**rung W5** — why the GK107 drives the pass slow enough to open the window at all. The specific
+measurement this arc adds to that rung: `beam::hold` spins a MEAN of **2.48 ms** per band on x86
+(`[wc-h] win=8 beamwaits=4336 beamwait_us=10766899`, `win=2 beammaxwait_us=62007`,
+`win=3 beamwait_us=49113217` over 13971 waits), i.e. the compositor spends ~46.5 ms of every
+139.75 ms pass BUSY-WAITING on a raster position read back over PCIe config-space-adjacent MMIO.
+A real vsync interrupt or a fence from the display engine would return those cycles to the pass and
+is the next thing worth costing — `drivers/gpu/kepler_display.rs`, beside `beam_probe`, in the
+Kepler driver files this brief did not name.
