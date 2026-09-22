@@ -250,9 +250,12 @@ const D11_SHM_DATA_UNALIGNED: u64 = 0x0166;
 #[cfg(feature = "wifi3")]
 const SHM_ROUTE_UCODE: u32 = 0x0300;
 /// `[SPEC-V3 SHM]` (fact 1's table) routing 0x0001 = Shared Memory; offsets for THIS routing are
-/// BYTE addresses (`>> 2` to the dword index — fact 2). The same value `drivers/bcma.rs` proved on
-/// metal (S4a's select/readback leg), which is what makes the table that carries 0x0300
-/// discriminating corroboration (fact 1's cross-check).
+/// BYTE addresses (`>> 2` to the dword index — fact 2). The same value `drivers/bcma.rs` CARRIES —
+/// **not** "proved on metal", as this comment and §S4-W5 fact 1 both said until WIFISHM: that
+/// file's S4a probe has never executed on any boot (its `Result` block is still `<unflown>` and
+/// flight 11 printed no `wifi-s4a:` line at all), so 0x0001 is a SPEC pin corroborated by a second
+/// transcription, never a measurement. The `shm-probe` line in [`upload_ucode`] is the first time
+/// this tree reads shared memory on this silicon.
 #[cfg(feature = "wifi3")]
 const SHM_ROUTE_SHARED: u32 = 0x0001;
 /// `[SPEC-V3 ChipInit steps 3+5+6; SPEC-V4 802.11/Registers]` (fact 4) Generic IRQ Reason —
@@ -819,7 +822,7 @@ fn end_line(dl: &Deadline, ok: bool, stage: &str, d11: &str, w: &Writes, restore
         "audited — MACCTL, SHM_CONTROL, SHM_DATA and RADIO_CONTROL have no write site in this file";
     #[cfg(all(feature = "wifi3", not(feature = "wifi4")))]
     const CORE_REGS_NOTE: &str =
-        "audited — counted at the wifi3 upload sites; RADIO_CONTROL alone still has no write site in this file";
+        "audited — counted at the wifi3 upload rung's sites, the read-only shm-probe select included; RADIO_CONTROL alone still has no write site in this file";
     // Under `wifi4` the sentence above would be true and MISLEADING: no d11 register in this
     // counter's enumerated set gains a site, but the wifi4 rung DOES write a radio-side register —
     // the ADDRESS port at d11+0x3F6, which is NOT the 0x3E2 this file's b43-lineage naming calls
@@ -827,7 +830,7 @@ fn end_line(dl: &Deadline, ok: bool, stage: &str, d11: &str, w: &Writes, restore
     // this line says where to look rather than leaving a reader to infer "no radio register moved".
     #[cfg(feature = "wifi4")]
     const CORE_REGS_NOTE: &str =
-        "audited — counted at the wifi3 upload sites; RADIO_CONTROL (0x3E2) still has no write site in this file, and wifi4 writes the radio ADDRESS port (0x3F6) instead — counted on the wifi4 end line, not this one";
+        "audited — counted at the wifi3 upload rung's sites, the read-only shm-probe select included; RADIO_CONTROL (0x3E2) still has no write site in this file, and wifi4 writes the radio ADDRESS port (0x3F6) instead — counted on the wifi4 end line, not this one";
     let (ev, eu) = fmt_dur(dl.elapsed());
     serial_println!(
         ":: wifi2: end ok={} stage={} d11={} wrote-cfg80={}(selftest={} moves={} restore={}) wrote-cfg0xac={}(moves={} restore={}) wrote-wrapper={}(enable={} unwind={}) wrote-core-regs={}({}) uploaded-bytes={}(audited) restore={} elapsed={}{} ::",
@@ -1609,7 +1612,7 @@ fn upload_not_attempted(w: &Writes) {
         "SHM_CONTROL, SHM_DATA, MACCTL and RADIO_CONTROL share this counter and no site in this file increments it";
     #[cfg(feature = "wifi3")]
     const SITE_NOTE: &str =
-        "SHM_CONTROL, SHM_DATA, MACCTL and RADIO_CONTROL share this counter; its write sites live in the wifi3 upload rung, which did not run";
+        "SHM_CONTROL, SHM_DATA, MACCTL and RADIO_CONTROL share this counter; under wifi3 its sites are (i) the READ-ONLY shm-probe select — one SHM_CONTROL write, no data-port write — and (ii) the destructive upload sites, and the COUNT discriminates: 0 = the rung returned before the probe, 1 = the probe alone and no destructive write was made";
     serial_println!(
         ":: wifi2: upload NOT ATTEMPTED uploaded-bytes={}(audited) wrote-core-regs={}(audited — {}) — the resident microcode is untouched and still running ::",
         w.upload_bytes, w.core_regs, SITE_NOTE
@@ -1752,16 +1755,73 @@ fn upload_ucode(bar0: u64, macctl: u32, w: &mut Writes) {
         return;
     }
 
-    // ── Precondition (c): MACCTL window/decode sanity. The SHM-window mechanics below assume
-    // SHM_ENABLED set, and the be32-file-to-u32-port framing assumes the core is NOT in
-    // big-endian mode ([SPEC-V4 802.11/Registers] bit values, fact 2). ──────────────────────────
-    if (macctl & MACCTL_SHM_ENABLED) == 0 || (macctl & MACCTL_BE) != 0 {
+    // ── The SHM-window falsifier, READ-ONLY on the data side, taken BEFORE the gate below. ─────
+    // [SPEC-V3 SHM] (fact 2): control word = routing (high 16) | offset (low 16); the SHARED
+    // routing 0x0001 takes BYTE addresses (`>> 2` to the dword index), so shared byte offset 0 is
+    // the control word 0x0001_0000 and the aligned half comes out of SHM_DATA. This writes
+    // SHM_CONTROL — an ADDRESS-WINDOW selector on the READ path — and nothing else: no SHM_DATA
+    // write, so no shared-memory word and no PSM instruction is modified; no MACCTL write, so
+    // PSM_RUN and PSM_JMP0 stay exactly as the machine handed them over; no reset. The resident
+    // image keeps running unaltered, which is §S4a's safety argument applied to §S4a's own access.
+    //
+    // It exists because the gate below used to assert something no boot had ever tested. §S4a was
+    // built to test it and NEVER FLEW — its `Result` block still reads `<unflown>` and flight 11
+    // printed no `wifi-s4a:` line — so this is the first shared-memory read this tree has taken on
+    // this silicon. A non-degenerate word here while `shm-enabled=0` SHOWS the window answering
+    // with the bit clear, in the boot, on the wire; a degenerate one leaves the spec argument below
+    // standing alone. Either way the reading is printed and nothing downstream gates on it.
+    let shm_ctl = SHM_ROUTE_SHARED << 16;
+    unsafe { w32(bar0, D11_SHM_CONTROL, shm_ctl) };
+    w.core_regs += 1;
+    let shm_word = unsafe { r16(bar0, D11_SHM_DATA) };
+    let shm_ctl_rb = unsafe { r32(bar0, D11_SHM_CONTROL) };
+    serial_println!(
+        ":: wifi2: shm-probe routing=0x0001(Shared Memory, [SPEC-V3 SHM] fact 1's table) ctl-wrote={:#010x} ctl-readback={:#010x} shared[+0x00]={:#06x} macctl={:#010x} shm-enabled={} shm-upper={} big-endian={} window-answers={} — READ-ONLY: SHM_CONTROL (the read path's address-window selector) is the ONE register written; SHM_DATA is READ, never written; MACCTL, the wrapper RESET_CTL/IOCTL and RADIO_CONTROL are untouched and the resident PSM keeps running. The ctl readback is ADVISORY (no spec says this selector echoes). This is the in-boot falsifier for the precondition below: the tree had NO metal reading of SHM before this line — §S4a was written to take one and never flew ::",
+        shm_ctl, shm_ctl_rb, shm_word, macctl,
+        ((macctl & MACCTL_SHM_ENABLED) != 0) as u8, ((macctl & MACCTL_SHM_UPPER) != 0) as u8,
+        ((macctl & MACCTL_BE) != 0) as u8,
+        match shm_word {
+            0xFFFF => "NO(all-ones — a dead MMIO READ PATH, which is not a statement about the window)",
+            0 => "NO(all-zero — the window is off, OR nothing is published at shared+0x00; this leg does not separate them)",
+            _ => "YES(a non-degenerate word came back through routing 0x0001)",
+        }
+    );
+
+    // ── Precondition (c): MACCTL BYTE ORDER. ───────────────────────────────────────────────────
+    // REVISED by WIFISHM from flight 11 (2026-09-22). This gate also demanded MACCTL.SHM_ENABLED
+    // (0x100) set, and flight 11 refused on exactly that: macctl=0xc0020403, shm-enabled=0, with
+    // the resident PSM running. The demand was WRONG, and the refutation does not need metal —
+    // it is internal to the sequence THIS SAME FUNCTION performs sixty lines below:
+    //
+    //   [SPEC-V3 ChipInit] step 1  MACCTL <- 0x404     (fact 4.1, written ABSOLUTELY)
+    //   [SPEC-V3 ChipInit] step 2  the SHM word-stream (facts 1-3 — the upload itself)
+    //   [SPEC-V3 ChipInit] step 4  MACCTL <- 0x20402   (fact 4.4)
+    //
+    // Decoded against [SPEC-V4 802.11/Registers] (fact 2): 0x404 = IHR Region Enabled (0x400) |
+    // PSM Jump 0 (0x4), and 0x20402 = Infra (0x20000) | IHR Region Enabled | PSM Run (0x2). SHM
+    // Enabled (0x100) is CLEAR in BOTH words that bracket the upload, so the spec streams the
+    // microcode through the SHM window with the bit clear BY CONSTRUCTION. And
+    // [SPEC-V3 MicrocodeUpload] states no MACCTL precondition at all — only "control word
+    // 0x03000000, 32 bits at a time". A gate that refused because the bit was clear, inside a
+    // function whose very next MACCTL write CLEARS IT, was refusing its own spec: had flight 11
+    // arrived with shm-enabled=1 the upload would have proceeded and then cleared the bit anyway.
+    //
+    // SHM_ENABLED is therefore REPORTED, not gated — on the `shm-probe` line above and on the
+    // refusal below. [SPEC-V4 802.11/Registers] revision-qualifies only 0x100000/0x200000 (core
+    // revisions 11 and 12); 0x100 carries no revision caveat, so the NAME is right for rev 29 and
+    // it is the INFERENCE from the name that was wrong.
+    //
+    // BE stays gated, and alone: the be32-file-to-u32-port framing below is wrong by a swap if the
+    // core is in big-endian mode ([SPEC-V4 802.11/Registers] "Big Endian Mode", 0x10000, fact 2),
+    // and unlike the SHM bit nothing in the spec sequence sets or clears it for us.
+    if (macctl & MACCTL_BE) != 0 {
         serial_println!(
-            ":: wifi2: upload REFUSED reason=macctl-shape macctl={:#010x} shm-enabled={} want=1 big-endian={} want=0 — the SHM-window and byte-order arguments this upload rests on do not hold for this word. NOTHING has been written ::",
-            macctl, ((macctl & MACCTL_SHM_ENABLED) != 0) as u8, ((macctl & MACCTL_BE) != 0) as u8
+            ":: wifi2: upload REFUSED reason=macctl-big-endian macctl={:#010x} big-endian={} want=0 (GATED) shm-enabled={} want=<NOT GATED: [SPEC-V3 ChipInit] step 1 writes MACCTL 0x404 and step 4 writes 0x20402, and [SPEC-V4 802.11/Registers] decodes BOTH with SHM Enabled (0x100) CLEAR — the spec's own upload streams through the window with this bit clear, so its state cannot be this upload's precondition> shm-upper={} want=<NOT GATED: routing 0x0300 is the microcode bank, not a shared-memory index; SHM_UPPER bears on the fact-5 handshake reading, which has its own verdict ladder> — the byte-order argument this upload rests on does not hold for this word. NOTHING has been written beyond the read-only shm-probe select above ::",
+            macctl, ((macctl & MACCTL_BE) != 0) as u8,
+            ((macctl & MACCTL_SHM_ENABLED) != 0) as u8, ((macctl & MACCTL_SHM_UPPER) != 0) as u8
         );
         upload_not_attempted(w);
-        upload_verdict(s.words, s.fnv, psm_was, 0, "REFUSED", "macctl-shape");
+        upload_verdict(s.words, s.fnv, psm_was, 0, "REFUSED", "macctl-big-endian");
         return;
     }
 
