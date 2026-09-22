@@ -258,3 +258,4 @@ refs/heads/exec-rmbp-gmux8                 328a5967 IN-FLIGHT      rmbp         
 refs/heads/exec-rmbp-trackpad              4a283725 IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-sdhcwrite             4a283725 IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-ptrpaint              4a283725 IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-vugprobe              559786a8 IN-FLIGHT      rmbp                      2026-09-22
