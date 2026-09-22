@@ -273,3 +273,12 @@ pub fn scanout_beam() -> Option<(u32, u32)> {
         None
     }
 }
+
+/// IOAPIC — the I/O APIC redirection table (Intel 82093AA), and the end of "this function offers no
+/// usable MSI capability, and there is no IOAPIC in this kernel to route INTx to".
+///
+/// DECLARED AT THE FILE TAIL, and that is a byte-identity requirement rather than style: a
+/// `pub mod` inserted anywhere above shifts every `panic::Location` line below it, and
+/// `./arroyo knoboff ioapic` is this arc's stated invariant.
+#[cfg(feature = "ioapic")]
+pub mod ioapic;

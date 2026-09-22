@@ -283,6 +283,7 @@ nvidia-kepler-ctrladdr|:: kepler: ctrladdr |-|measured
 nvidia-kepler-ctrlbind|:: kepler: ctrlbind |-|measured
 hda|[hda] census|-|measured
 hda-tone|:: HDA-TONE:|-|measured
+ioapic|[ioapic] census ioapics=|-|measured(2)
 tegra|:: tegra: JB5 — XUSB domain not ON at handoff|-|measured(1)
 tegrasmp|:: AARCH64 SMP: ORIN-SMP-3 — DTB /cpus named no cores (dtb=@|-|measured(1)
 apsrun|:: [apsrun] cpu |-|measured(2)

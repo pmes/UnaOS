@@ -3507,6 +3507,33 @@ hda = []
 # Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs`.
 # See docs/dev/OS/11_AUDIO/hda.md.
 hda-tone = ["hda"]
+# IOAPIC (rmbp-ledger B147): `UNAOS_IOAPIC=1` arms `arch/x86_64/ioapic.rs` — the Intel 82093AA
+# I/O APIC redirection table, which this kernel has never had. Until this feature, `apic.rs` drove
+# the LOCAL APIC only and `drivers/pci.rs` could enable MSI/MSI-X, so a PCI function offering no
+# usable MSI capability had NOWHERE to deliver a legacy INTx assertion and could only be POLLED.
+# The measured case is the EHCI controllers (rmbp flight 11: `ISRARM REFUSED — … there is no IOAPIC
+# in this kernel to route INTx to`), and the cost is the trackpad's dark windows — up to 108 ms,
+# ledger B139 / EHCIDARK.
+#
+# THREE RUNGS BEHIND THE ONE KNOB, each landing green before the next. RUNG 1, which is what this
+# feature arms today: `acpi::parse_madt`'s catch-all arm — which has silently discarded every entry
+# type the topology walk does not consume since the file was written — feeds a collector that reads
+# every I/O APIC (ACPI §5.2.12.3), Interrupt Source Override (§5.2.12.5) and Local APIC NMI
+# (§5.2.12.7) entry; each controller's IOREGSEL/IOWIN window is mapped and IOAPICVER read for its
+# redirection-entry count. NOTHING IS WRITTEN. Witnesses: `[ioapic] census ioapics=… isos=… gsis=…`,
+# one `[ioapic] id=… addr=… gsi_base=… entries=… version=…` per controller, one `[ioapic] iso bus=…
+# irq=… -> gsi=…` per override, one `[ioapic] nmi …` per NMI entry. Rung 2 adds the redirection-entry
+# writer and rung 3 the PCI arm that ends the refusal above; both land on top of this file.
+#
+# Default OFF => the module is not lexed (its `pub mod` in `arch/x86_64/mod.rs` is both `#[cfg]`-gated
+# and at the FILE TAIL, so no `panic::Location` below it moves) and both `acpi.rs` sites are
+# `#[cfg]`-erased LINE-NEUTRAL appends with the code before the `//` — so the image is byte-identical
+# (`./arroyo knoboff ioapic`). x86_64 only in effect; stripped from aarch64 media by arroyo's
+# `arm_features` exactly as `hda` and `ahci` are.
+#
+# Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs`.
+# See docs/dev/OS/01_BOOT_HAL/ioapic.md.
+ioapic = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

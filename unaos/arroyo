@@ -2549,6 +2549,40 @@ fi
 # (stripped by arm_features below, exactly as `hda` itself is).
 # Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
 [ -n "${UNAOS_HDATONE:-}" ] && _feats="${_feats}hda-tone,"
+# IOAPIC (rmbp-ledger B147): UNAOS_IOAPIC=1 arms arch/x86_64/ioapic.rs — the Intel 82093AA I/O APIC
+# redirection table, WHICH THIS KERNEL HAS NEVER HAD. `arch/x86_64/apic.rs` drives the LOCAL APIC
+# only (xAPIC MMIO + x2APIC MSRs) and `drivers/pci.rs` can enable MSI and MSI-X, so a PCI function
+# offering no usable MSI capability had nowhere to deliver a legacy INTx assertion and could only be
+# POLLED. That is not a theory: rmbp flight 11 prints it, at 25626 ms, as a refusal —
+#   :: EHCI-HID: [1] ISRARM REFUSED — this function offers no usable MSI capability, and there is
+#   no IOAPIC in this kernel to route INTx to. The endpoint stays on the POLLED re-arm path …
+# — and the cost is the internal trackpad's lost reports (ledger B139; EHCIDARK dark windows to
+# 108 ms).
+#
+# THREE RUNGS BEHIND ONE KNOB, each landing green before the next. RUNG 1 IS WHAT THIS KNOB ARMS
+# TODAY: `acpi::parse_madt`'s catch-all arm — which has silently discarded every entry type the
+# topology walk does not consume since the file was written — feeds a collector that reads every
+# I/O APIC (ACPI §5.2.12.3), Interrupt Source Override (§5.2.12.5) and Local APIC NMI (§5.2.12.7)
+# entry, maps each controller's IOREGSEL/IOWIN window and reads IOAPICVER for its redirection-entry
+# count. NOTHING IS WRITTEN. Witnesses: `[ioapic] census ioapics=… isos=… gsis=…`, one
+# `[ioapic] id=… addr=… gsi_base=… entries=… version=…` per controller, one `[ioapic] iso bus=…
+# irq=… -> gsi=…` per override, one `[ioapic] nmi uid=… lint=…` per NMI entry. A machine whose MADT
+# declares no I/O APIC prints the `ioapics=0` line and says so in it — silence is never the answer.
+# Rung 2 adds `route_gsi`/`set_mask`/`unroute` (one 64-bit redirection entry per 82093AA §3.2.4,
+# programmed MASKED and read back) plus `route_pci_intx`; rung 3 calls it from
+# `ehci::isr_arm_controller` where MSI refused, which is what ends the refusal quoted above.
+#
+#   UNAOS_IOAPIC=1 ./arroyo test 150      (q35's usb-ehci + usb-kbd ride the default lane)
+#   UNAOS_IOAPIC=1 ./arroyo esp-x86
+# Default OFF => the module is not lexed (its `pub mod` is `#[cfg]`-gated AND at the file tail) and
+# the two acpi.rs sites are `#[cfg]`-erased LINE-NEUTRAL appends with the code before the `//`, so no
+# panic `Location` moves (`./arroyo knoboff ioapic`). x86_64 only; aarch64 media byte-identical
+# (stripped by arm_features below, exactly as `hda` and `ahci` are).
+# Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml — a knob mapped HERE and missing
+# THERE ships the feature disabled while the banner claims it is on (the rastmc/sdwrite lesson), and
+# for an interrupt route a silent no-op is indistinguishable on the wire from a machine whose
+# firmware routed the function nowhere.
+[ -n "${UNAOS_IOAPIC:-}" ] && _feats="${_feats}ioapic,"
 # ── BANNER-DEDUP (orin 3, 2026-08-22) — the banner must not misreport its own composition ─────────
 #
 # THE SYMPTOM. An armed jetson build printed `tegra` THREE times:
@@ -2876,6 +2910,16 @@ arm_features() {
     # Order-independent with the strip above by its own argument: `,hda-tone,` does not contain
     # `,hda,` as a substring, because the trailing comma is part of every pattern.
     f="${f//,hda-tone,/,}"
+    # IOAPIC (B147) rides the same strip, and its argument is the strongest of the three: the
+    # I/O APIC is an x86 interrupt controller and nothing else. The module is declared in
+    # `arch/x86_64/mod.rs` — a directory aarch64 never compiles — its two call sites are in
+    # `arch/x86_64/acpi.rs` and in the `x86_64`-gated half of `drivers/ehci/mod.rs`, and aarch64
+    # routes its interrupts through the GIC, which this feature does not touch and could not.
+    # So `ioapic` emits not one byte of aarch64 CODE. An enabled feature is still HASHED into the
+    # build fingerprint even when it compiles nothing, so leaving it in would shift every Pi and
+    # Jetson media hash for zero observable change. Stripped => the aarch64 media stay byte-identical
+    # and the banner stops claiming an interrupt controller that board does not have.
+    f="${f//,ioapic,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
@@ -5195,6 +5239,28 @@ KERNEL_CFG_MATRIX=(
   # that must be named explicitly now: the sleeping code has no other leg that compiles it with the
   # witness on. Between them both polarities of every `#[cfg]` in the family are compiled.
   "x86-vsyncpace ../../x86_64-unaos.json nvidia-kepler,nvidia-kepler-takeover,wc,witness,vsyncpace,ehcihid,smolnet"
+  # IOAPIC (rmbp-ledger B147) — x86, the I/O APIC redirection table ARMED. A leg of its own, for
+  # the `x86-vsyncpace` reason one row up, and it carries `ehcihid` deliberately: `ioapic`'s module
+  # and both of its `acpi.rs` sites compile under `ioapic` alone, but the driver call site this arc
+  # builds toward lives inside `drivers/ehci/mod.rs`, which is
+  # `#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]`. A leg with `ioapic` and no `ehcihid`
+  # would type-check the API and none of its only consumer — precisely the EXECGATE shape the
+  # JETSON-EL0 note below documents: a symbol under feature X referenced from code compiled under
+  # feature Y, catchable only by a leg carrying both.
+  #
+  # THE DISARMED POLARITY IS ALREADY HELD, which is why this is the armed twin and not a widening of
+  # an existing leg: `x86-all` carries `ehcihid` and deliberately does NOT carry `ioapic`, so it
+  # compiles the knob-off `parse_madt` catch-all and the knob-off driver path. Between the two legs
+  # every `#[cfg(feature = "ioapic")]` in the tree gets both polarities compiled.
+  #
+  # NAMED ON A LITERAL x86 LEG ON PURPOSE, and that is the load-bearing half rather than the
+  # coverage: it is what puts `UNAOS_IOAPIC` under the KNOB->BUILDER WIRING CHECK below. This knob is
+  # the worst case that check exists for — wired into arroyo alone it would light the banner while
+  # `builder/src/main.rs` built a kernel with no I/O APIC code in it at all, and the boot would print
+  # the very `ISRARM REFUSED … no IOAPIC` line the arc exists to end, with the banner claiming the
+  # fix was present. It is also what obliges `scripts/banner-cert.sh` to carry a row: without one the
+  # first armed `esp-x86` exits 2 by name rather than passing silently.
+  "x86-ioapic  ../../x86_64-unaos.json  ioapic,ehcihid"
   # JETSON-EL0 (M1b) — the ARMED Orin, appended GR26. Until this leg, `tegra_el0` appeared in NO leg of
   # this matrix, which means `./arroyo check` type-checked the configuration
   # `UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson` ships NOWHERE — and `UNAOS_TEGRA_EL0=1 ./arroyo check` did
