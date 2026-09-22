@@ -437,7 +437,85 @@ which reaps the row without ever calling `quarry::close()` and leaves `MODEL`, `
 stays draggable and parkable. On the wire the press now reads `-> quarry` where flight 10 read
 `-> consume`, and `press_route` prints one `[quarry] press at (sx,sy) row=N kind=… -> cd|select|launch|miss`
 line of its own — on both arches, because until this arc an in-window press printed nothing at all and
-a capture could not tell a press Quarry handled from a press Quarry never saw.
+a capture could not tell a press Quarry handled from a press Quarry never saw. (QUARRYOPEN replaced
+that line's `launch|miss` vocabulary one flight later — see §6.4.)
+
+### 6.4 QUARRYOPEN — a file row opens, and the wire says by what (2026-09-22)
+
+Peter, rMBP flight 11: *"quarry rows open fine, but could not open a file"*. The capture
+(`~/unaos-bench/scratch/rmbp-0915/quarryopen-logs/f11.log`, read with `awk index()`) answers it, and
+the answer is **three separate facts that the old wire could not tell apart**.
+
+**First: there was no double-press on that wire.** The two presses on the file row are
+
+```
+[ 844506ms] [quarry] press at (399,427) row=15 kind=file -> select
+[ 851023ms] [quarry] press at (389,425) row=15 kind=file -> select
+```
+
+— **6517 ms** apart, and between them sits `[ 846253ms] [quarry] press at (18,527) row=1 kind=dir ->
+select`, a press in the **tree** pane. `is_double` tests the pane as well as the row and the
+interval, so that tree press re-stamped `click_pane = Pane::Tree` and broke the pair on a second,
+independent ground. **No window width would have opened that file.** (The same read corrects a
+reasonable guess about the dir rows: every one of flight 11's tree presses landed at x = 18–26, which
+is inside the disclosure marker's box — `indent = ti.x + PAD + depth * mark_w`, `mark_w = 16` at
+`ts = 2`. They were expand/collapse toggles, which is why they say `select` and not `cd`. The tree
+moved; `cwd` never did.)
+
+**Second: the wire never said the row was openable.** `kind=file -> select` was the same line for
+`VUG.ELF`, for a screenshot and for `CONFIG.TXT`, so a capture could not tell an operator that a
+gesture existed at all, let alone that it was theirs to make. Worse, a double-press on an
+*unopenable* file printed `-> miss`: the second press of a pair changes no selection, no focus and no
+`cwd`, so the model diff read *"nothing happened"* for a gesture the window had heard and answered.
+The press line now carries the decision:
+
+```
+[quarry] press at (399,427) row=15 kind=file -> open kind=elf handler=launch
+[quarry] press at (512,308) row=7  kind=file -> open kind=png handler=facet
+[quarry] press at (410,455) row=9  kind=file -> select (no handler for .TXT)
+[quarry] enter row=15 kind=file -> open kind=elf handler=launch
+```
+
+`kind=` after the arrow is the **name's** kind (`png` · `elf` · `bin` · `text` · `unknown`) and is a
+label only — `open_handler` takes every routing decision, and `open_selftest`'s leg 1 drives every
+name through *both* and fails if the token and the `Act` ever disagree. `handler=` is this build's
+answer, `cfg` included: on an image without `UNAOS_FACET=1` a `.PNG` reads
+`-> select (no handler for .PNG)`, because promising an opener the image cannot reach would be worse
+than the silence it replaced. `[quarry] open UNHANDLED` was rewritten for the same reason — its old
+sentence, *"no opener exists in this tree"*, stopped being true the day FACET landed (`3c6e406a`).
+The `enter` line is new: `key_route` used to say only `key=0x0d focus=1 took=1`, that a byte was
+consumed and never what it decided, and Enter has opened the selected row since M2. Both gestures now
+print the same tail from the same `act_tail`, over the same `Act`, so a pointer and a keyboard cannot
+describe one decision two ways on one capture.
+
+**Third: the double-press window is measured on the DRAIN clock, and that clock has jitter.** The
+only `arch::ms()` the gesture ever reads is the one `content_press` takes when the click router
+finally runs — `press_route(x, y)` takes two coordinates and nothing else on both arches, so no
+report timestamp exists in this module to compare against. Flight 11 measured the gap, pairing each
+`:: PTR: [1] press … (down edge)` with the `[quarry] press` it produced: **264 / 200 / 300 ms**,
+against `[ptrinstall] installs=… lag_max_ms=678` (and `744` later in the same flight). So what
+`is_double` tests is `Δreport + (lag₂ − lag₁)`, and with a 400 ms window a real ~180 ms double-press
+was dropped whenever two drains differed by more than ~220 ms — a 100 ms spread across three
+consecutive presses is what that flight actually carried. **`DOUBLE_CLICK_MS` is now 500 ms**: the
+gesture's own ~180 ms plus the ~100 ms of measured drain spread, with the rest spent on the fact that
+the hand and the clock are separated by a queue. It is Windows' classic default, so it is not a
+number fingers have to learn, and it is still deliberately short of `lag_max_ms` — Quarry's single
+press is not inert, and a window wide enough to absorb 678 ms in full would turn a deliberate
+re-select into an accidental launch. The real repair is a **report stamp**, and it is not this
+module's to make; see §7.1.
+
+The fixture is `:: QUARRYOPEN: … ::`, and it exists partly because of *where* the old one lived: the
+double-press was driven only by leg 11 of `selftest_result`, which hangs off `quarry::selftest`,
+which the **x86 battery never calls** (x86 reaches `crystal::selftest` → `door_selftest`). On the arch
+Peter flies, the gesture behind *"could not open a file"* had no fixture at all. `open_selftest` is
+chained from **both** arms with its own `DONE` latch, drives `press_and_witness` — the function
+`press_route` itself calls, one lock deeper — and therefore puts **real** `[quarry] press at …` lines
+on the wire, readable from a battery capture with exactly the `awk index($0,"[quarry]")` a flight
+capture is read with. It is disk-free (the list is hand-built) and stops at the `Act`: the handler's
+own witness is `QUARRYLAUNCH`'s `[quarry] launch …` / `:: QUARRY-LAUNCH: …`, which runs in the same
+battery and is where a reader pairs the decision with its effect. **Go-red:** set `DOUBLE_CLICK_MS`
+to `0` — leg 2's 180 ms pin fails (`window=[180ms=no …]`) and leg 3's `elf=` reads `select` instead
+of `open kind=elf handler=launch`, two halves of the claim failing independently.
 
 ---
 
@@ -469,9 +547,12 @@ M2 adds two, both of which are about what a double-click on a NON-program should
    `cfg`-gated arm asking `facet::is_png_name`, which is the right shape for the first opener and the
    wrong shape for the second. An association table is what item 7 still means, and it is owed the
    moment a `.TXT` viewer or a second image format exists.
-   Every other extension is unchanged: a double-click on `CONFIG.TXT` still does nothing and still
-   says so on the wire (`[quarry] open UNHANDLED path=… — no opener exists in this tree`), which is
-   the honest posture — "broken" and "not built yet" must be tellable apart.
+   Every other extension is unchanged: a double-press on `CONFIG.TXT` still does nothing and still
+   says so on the wire, which is the honest posture — "broken" and "not built yet" must be tellable
+   apart. QUARRYOPEN (§6.4) fixed the *sentence*, which this item had made false: it used to read
+   `— no opener exists in this tree`, a claim that stopped being true the moment FACET became one.
+   It now names the name's kind and this build's handler set, and the press line above it agrees
+   word for word (`-> select (no handler for .TXT)`).
 8. **`SYS_EXEC` with an argv**, so an opener could be *handed* the path it is meant to open.
    `spawn_user_image_bg` takes an image and nothing else; a program launched from Quarry today is
    launched exactly as `bg` launches it, with no argument, which is why the launch path is limited to
@@ -486,6 +567,25 @@ A third item is a bookkeeping debt rather than a capability:
    is named rather than hidden: a Quarry-launched program does not appear in the shell's `jobs`, and
    `MAX_JOBS` (8) is the ceiling on how many it can have outstanding. The 9th launch reaps first and
    then declines out loud in the path bar.
+
+### 7.1 A press needs a REPORT timestamp — the seam QUARRYOPEN could not build
+
+`press_route(x, y)` takes two coordinates. That is its whole signature, on both arches, and it is why
+the double-press window is measured on the **drain** clock (§6.4's third fact): the only `arch::ms()`
+this module can reach is the one `content_press` takes when the click router finally runs the press,
+200–300 ms after the HID down edge on flight 11 and up to `lag_max_ms=678` in the worst case the
+channel reported. `DOUBLE_CLICK_MS = 500` absorbs that queue; it does not remove it, and a busier
+compositor pass can still stretch two drains further apart than two fingers ever were.
+
+What would remove it is one extra argument — the millisecond the **report** carried, stamped where
+`main.rs`'s `ptrinstall_report()` already stamps one — threaded through the routers' press arms into
+`press_route` and down to `is_double`. It is a three-file change and **none of the three are
+Quarry's**: `arch/x86_64/syscall.rs` (`wc_quarry_press`, `wc_click_route_at`) is another lane's, and
+`arch/aarch64/syscall.rs`'s click arm is compiled into the knob-off `kernel8.img`, whose
+byte-identity proof a single added line breaks (PARITY.md §5.3) — and its folded one-liners are
+already at their limit. The day that argument exists, `DOUBLE_CLICK_MS` can go back to the ~400 ms
+the gesture alone wants, `is_double`'s doc loses its jitter paragraph, and the press witness can name
+both clocks so a capture shows the queue instead of hiding inside it.
 
 ---
 

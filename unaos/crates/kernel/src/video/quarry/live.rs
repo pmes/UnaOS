@@ -225,7 +225,46 @@ const CENSUS_MAX: usize = 12;
 ///
 /// The predicate is [`is_double`], which is pure and witnessed, so this number is the only part of
 /// the gesture that is a judgement call.
-const DOUBLE_CLICK_MS: u64 = 400;
+///
+/// # QUARRYOPEN (rMBP flight 11, 2026-09-22) — WHICH CLOCK THIS NUMBER IS MEASURED ON
+///
+/// It is the DRAIN clock, and that is a measured fact rather than a design choice: the only
+/// `arch::ms()` this gesture ever reads is the one [`content_press`] takes when the CLICK ROUTER
+/// finally runs it, and the router runs one report's worth of work well after the HID down edge.
+/// The pointer never hands a press a report timestamp — `press_route(x, y)` takes two coordinates
+/// and nothing else, on both arches — so there is no report time available in this file to compare
+/// against, and a comment that claimed one would be a claim this module cannot make.
+///
+/// The lag is not small and it is not constant. Flight 11's capture
+/// (`~/unaos-bench/scratch/rmbp-0915/quarryopen-logs/f11.log`, read with `awk index()`) pairs each
+/// `:: PTR: [1] press … (down edge)` with the `[quarry] press at …` it produced:
+///
+/// ```text
+/// 844242 -> 844506   264 ms
+/// 846053 -> 846253   200 ms
+/// 850723 -> 851023   300 ms
+/// ```
+///
+/// …while `[ptrinstall] installs=… lag_max_ms=678` on the same flight (and `744` later in it) is the
+/// channel's own worst case. So what [`is_double`] actually tests is
+/// `Δreport + (lag₂ − lag₁)`, and the jitter term is bounded by nothing this window controls. With a
+/// 400 ms window a REAL double-click — two presses ~180 ms apart at the trackpad — is dropped the
+/// moment the two drains differ by more than ~220 ms, which flight 11 shows is an ordinary
+/// afternoon on this board (a 100 ms spread across three consecutive presses).
+///
+/// **500 ms**, therefore: the gesture's own ~180 ms plus the ~100 ms of drain spread this board was
+/// measured at, with the rest of the slack spent on the fact that the operator's hand and the
+/// kernel's clock are separated by a queue. It is exactly Windows' classic default, so it is also
+/// not a number an operator's fingers have to learn. It is still the SHORT side of the trade the
+/// third bullet above describes — Quarry's single press selects, and a window wide enough to absorb
+/// `lag_max_ms` in full (678 ms) would turn a deliberate re-select into an accidental launch.
+///
+/// THE REAL FIX IS A REPORT STAMP, and it is not this file's to make: it needs a press timestamp
+/// carried through `press_route`, which lives in `arch/x86_64/syscall.rs` and
+/// `arch/aarch64/syscall.rs` — the x86 click router is another lane's and the aarch64 one is the
+/// knob-off `kernel8.img`'s byte-identity file. `quarry.md` §7.1 states the seam that would retire
+/// this paragraph; until it exists, this number absorbs the queue.
+const DOUBLE_CLICK_MS: u64 = 500;
 
 // ── Geometry ────────────────────────────────────────────────────────────────────────────────────
 
@@ -649,6 +688,104 @@ fn is_executable(name: &str) -> bool {
     let n = name.as_bytes();
     let ends = |ext: &[u8]| n.len() > ext.len() && n[n.len() - ext.len()..].eq_ignore_ascii_case(ext);
     ends(b".elf") || ends(b".bin")
+}
+
+/// QUARRYOPEN — the extension, uppercased, with its dot. `""` when the name carries none.
+///
+/// A leading dot is NOT an extension (`.PROFILE` is a name, not a type), which is why the match
+/// demands a non-zero index as well as a non-empty tail.
+fn ext_of(name: &str) -> String {
+    match name.rfind('.') {
+        Some(i) if i > 0 && i + 1 < name.len() => {
+            let mut s = String::from(".");
+            s.push_str(&name[i + 1..].to_ascii_uppercase());
+            s
+        }
+        _ => String::new(),
+    }
+}
+
+/// QUARRYOPEN — **what kind of thing this name is**, as one wire token: `png` · `elf` · `bin` ·
+/// `text` · `unknown`.
+///
+/// This is a LABEL for the witness and nothing else — no routing decision is taken from it
+/// ([`open_handler`] takes those, and the two are proven to agree by [`open_selftest`]'s leg 1). It
+/// exists because flight 11's press line said `kind=file` for a program, for a screenshot and for a
+/// config file alike, so the wire could not tell an operator staring at `-> select` whether the row
+/// they pressed was openable at all.
+///
+/// `bin` is its own token rather than folded into `elf`: `is_executable` admits both and the loader
+/// treats them as genuinely different shapes (a validated ELF64 against a flat blob bounded to one
+/// code page), so a witness that called a `.BIN` an ELF would be wrong about the thing it names.
+fn open_kind(name: &str) -> &'static str {
+    let n = name.as_bytes();
+    let ends = |ext: &[u8]| n.len() > ext.len() && n[n.len() - ext.len()..].eq_ignore_ascii_case(ext);
+    if ends(b".elf") {
+        "elf"
+    } else if ends(b".bin") {
+        "bin"
+    } else if ends(b".png") {
+        "png"
+    } else if ends(b".txt") || ends(b".md") || ends(b".log") || ends(b".sha") || ends(b".cfg") || ends(b".ini") {
+        "text"
+    } else {
+        "unknown"
+    }
+}
+
+/// QUARRYOPEN — **who would open this name**, as one wire token: `launch` · `facet` · `none`.
+///
+/// THE SAME TESTS [`Model::activate_row`] TAKES, IN THE SAME ORDER, including the `facet` `cfg`: a
+/// build without the image viewer has no handler for a `.PNG` and this function must say so, or the
+/// wire would promise an opener the image cannot reach. That agreement is not left to a reader —
+/// [`open_selftest`]'s leg 1 drives every name through BOTH this function and `activate_row` and
+/// fails if the token and the `Act` ever disagree.
+fn open_handler(name: &str) -> &'static str {
+    if is_executable(name) {
+        return "launch";
+    }
+    #[cfg(feature = "facet")]
+    if crate::video::facet::is_png_name(name) {
+        return "facet";
+    }
+    "none"
+}
+
+/// QUARRYOPEN — the sentence a press on an UNOPENABLE row owes the wire.
+///
+/// `no handler for .TXT`, or the dotless form for a name that has no extension to blame.
+fn no_handler_reason(name: &str) -> String {
+    let e = ext_of(name);
+    if e.is_empty() {
+        alloc::format!("no handler for {} — it carries no extension", name)
+    } else {
+        alloc::format!("no handler for {}", e)
+    }
+}
+
+/// QUARRYOPEN — **the outcome tail for an ACTIVATION**, shared by the pointer's witness
+/// ([`press_witness`]) and the keyboard's ([`key_route`]'s Enter arm).
+///
+/// One function because the two gestures are one decision: `activate_row` is literally the body
+/// both reach, and a double-press and an Enter that described the same `Act` with different words
+/// would put the operator back where flight 11 left them — reading a wire that does not say what
+/// the glass did. `None` means "this act is not an activation"; the caller then uses its own
+/// model-diff words (`cd` / `select` / `miss`).
+fn act_tail(act: &Act) -> Option<String> {
+    match act {
+        Act::None => None,
+        Act::Launch(p) => {
+            Some(alloc::format!("open kind={} handler=launch", open_kind(&leaf(p))))
+        }
+        #[cfg(feature = "facet")]
+        Act::View(p) => Some(alloc::format!("open kind={} handler=facet", open_kind(&leaf(p)))),
+        // The press SELECTED, because that is all that happened on the glass — and then it says
+        // why nothing else did. Before QUARRYOPEN this case printed `miss`: the second press of a
+        // double-press on a `.TXT` changes no selection, no focus and no cwd, so the model diff
+        // read "nothing", which is exactly the word an operator must not be given for a gesture
+        // the window DID understand and DID refuse.
+        Act::NoOpener(p) => Some(alloc::format!("select ({})", no_handler_reason(&leaf(p)))),
+    }
 }
 
 /// Two presses are one double-click iff they hit the SAME row of the SAME pane inside
@@ -1467,13 +1604,20 @@ fn run_act(act: Act) {
             }
         }
         Act::NoOpener(p) => {
-            // The honest census the brief asks for. Nothing in this tree opens a document: there is
-            // no association registry, no viewer, and no `SYS_EXEC`-with-argv for a program to be
-            // handed a path with. Saying that out loud is the point — an operator who double-clicks
-            // `CONFIG.TXT` and sees nothing should be able to tell "broken" from "not built yet".
+            // The honest census. An operator who double-presses `CONFIG.TXT` and sees nothing must
+            // be able to tell "broken" from "not built yet".
+            //
+            // QUARRYOPEN — **"no opener exists in this tree" STOPPED BEING TRUE** the day FACET
+            // landed (`3c6e406a`), and a census sentence that is false about the tree it censuses is
+            // worse than no sentence. It now names THIS name's kind and THIS build's handler set,
+            // which is also what makes the line agree word-for-word with the `-> select (no handler
+            // for .TXT)` tail the press witness printed one line above it.
             serial_println!(
-                "[quarry] open UNHANDLED path={} — no opener exists in this tree (launchable = .ELF/.BIN via spawn_user_image_bg; a document needs the opener registry named in quarry.md 7)",
-                p
+                "[quarry] open UNHANDLED path={} kind={} handler=none — {} (this build opens: .ELF/.BIN -> launch via spawn_user_image_bg{}; anything else needs the opener registry named in quarry.md 7)",
+                p,
+                open_kind(&leaf(&p)),
+                no_handler_reason(&leaf(&p)),
+                if cfg!(feature = "facet") { ", .PNG -> facet" } else { ", and .PNG only when UNAOS_FACET=1 armed the viewer — this image has none" }
             );
             alloc::format!("no opener for {}", leaf(&p))
         }
@@ -2256,7 +2400,28 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
                 // console cannot reach, and this window is driven from both.
                 Pane::List => {
                     let i = m.list_sel;
+                    // Read BEFORE the activation: a directory row makes `activate_row` navigate,
+                    // which replaces `list` wholesale and resets `list_sel` — so the row this
+                    // witness names has to be sampled while it still exists.
+                    let was = match m.list.get(i) {
+                        Some(e) if matches!(e.kind, NodeKind::Dir) => "dir",
+                        Some(_) => "file",
+                        None => "none",
+                    };
                     act = m.activate_row(i);
+                    // QUARRYOPEN — THE KEYBOARD OWED THE SAME LINE THE POINTER OWES. `key_route`'s
+                    // own witness says only `key=0x0d focus=1 took=1` — that a byte was consumed,
+                    // never what it decided — so an Enter that opened a program and an Enter that
+                    // hit a document with no handler were the same line on the wire. Same tail
+                    // function as [`press_witness`], so the two gestures cannot drift: the `Some`
+                    // arm is an activation, and the `None` arm is a directory (Enter descended, and
+                    // the `cd` is already visible on the next `[quarry] open census`).
+                    serial_println!(
+                        "[quarry] enter row={} kind={} -> {}",
+                        i,
+                        was,
+                        act_tail(&act).unwrap_or_else(|| String::from("cd"))
+                    );
                 }
             },
             // Backspace — up one level, from wherever the focus is.
@@ -2385,10 +2550,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         //
         // QUARRYCLICK — the before/after pair [`press_witness`] reads, taken inside the one lock the
         // press already holds so the reading cannot race a repaint or a second press.
-        let before = (m.cwd.clone(), m.focus, m.tree_sel, m.list_sel);
-        let a = content_press(m, sx, sy);
-        press_witness(m, sx, sy, &before, &a);
-        a
+        press_and_witness(m, sx, sy).0
     };
     // Outside the lock, always: `run_act` may reach the ELF loader and the scheduler.
     run_act(act);
@@ -2408,9 +2570,17 @@ pub fn press_route(x: i32, y: i32) -> bool {
 /// at each would be nine chances to drift from what the model actually did. This reads the model on
 /// both sides of the one call instead, so the outcome word is a measurement:
 ///
-///  * `launch` — the press produced deferred work that leaves this window ([`Act::Launch`], and
-///    FACET's [`Act::View`]). The only outcome that is read from the act rather than from the model,
-///    because it is the only one that has not happened yet when this runs.
+///  * `open kind=<png|elf|bin|text|unknown> handler=<facet|launch>` — the press produced deferred
+///    work that leaves this window ([`Act::Launch`], and FACET's [`Act::View`]). The only outcome
+///    that is read from the act rather than from the model, because it is the only one that has not
+///    happened yet when this runs. QUARRYOPEN replaced the bare word `launch` here: flight 11's
+///    operator, told only `kind=file -> select`, had no way to learn from the wire that the row
+///    under the pointer was openable at all, let alone by what.
+///  * `select (no handler for .TXT)` — the press was a DOUBLE-press that the window understood and
+///    refused ([`Act::NoOpener`]). It says `select` because selecting is all the glass did, and the
+///    parenthesis is what makes the glass and the wire agree. Before QUARRYOPEN this printed
+///    `miss`, because the second press of a double-press changes no selection, no focus and no
+///    cwd — the model diff read "nothing happened" for a gesture that was heard and answered.
 ///  * `cd` — the working directory MOVED. A tree row navigated, or a list row was opened into.
 ///  * `select` — no navigation, but the pane focus or one of the two selections changed.
 ///  * `miss` — the press was inside the surface and changed nothing: the path bar, the header row,
@@ -2420,26 +2590,32 @@ pub fn press_route(x: i32, y: i32) -> bool {
 /// `row` is the selection of the pane the press left focused, which for every row press is the row
 /// pressed; `kind` is `dir` for a tree row (the tree carries directories only), the list entry's own
 /// [`NodeKind`] for a list row, and `none` where the press addressed no row.
-fn press_witness(m: &Model, sx: usize, sy: usize, before: &(String, Pane, usize, usize), act: &Act) {
+fn press_witness(
+    m: &Model,
+    sx: usize,
+    sy: usize,
+    before: &(String, Pane, usize, usize),
+    act: &Act,
+) -> String {
     let (bcwd, bfocus, btree, blist) = before;
     let row = match m.focus {
         Pane::Tree => m.tree_sel,
         Pane::List => m.list_sel,
     };
-    let mut out = if matches!(act, Act::Launch(_)) { "launch" } else { "" };
-    #[cfg(feature = "facet")]
-    if matches!(act, Act::View(_)) {
-        out = "launch";
-    }
-    if out.is_empty() {
-        out = if m.cwd != *bcwd {
+    // QUARRYOPEN — an ACTIVATION names itself, through the one tail both gestures share. This
+    // replaces the single word `launch`, which said nothing about WHAT was opened or by WHOM, and
+    // it is the only branch read from the act rather than from the model for the reason the doc
+    // above gives: it has not happened yet when this runs.
+    let out = match act_tail(act) {
+        Some(t) => t,
+        None => String::from(if m.cwd != *bcwd {
             "cd"
         } else if m.focus != *bfocus || m.tree_sel != *btree || m.list_sel != *blist {
             "select"
         } else {
             "miss"
-        };
-    }
+        }),
+    };
     let kind = if out == "miss" {
         "none"
     } else {
@@ -2453,6 +2629,26 @@ fn press_witness(m: &Model, sx: usize, sy: usize, before: &(String, Pane, usize,
         }
     };
     serial_println!("[quarry] press at ({},{}) row={} kind={} -> {}", sx, sy, row, kind, out);
+    out
+}
+
+/// QUARRYOPEN — **one press, witnessed**: the before/after pair, the press, and the line it owes,
+/// as one seam.
+///
+/// It was three statements inside [`press_route`]'s lock. It is a function now because
+/// [`open_selftest`] has to drive the EXACT path the click router drives — a fixture that called
+/// [`content_press`] alone (which is what leg 11 of [`selftest_result`] does) proves the model's
+/// decision and proves nothing at all about the words on the wire, and the words on the wire are
+/// what flight 11 was read from. The returned `String` is the outcome the line carried, so the
+/// fixture scores the sentence rather than a shape a reader hopes it has; [`press_route`] discards
+/// it, because by then the line is already out.
+///
+/// Called with `MODEL` held, exactly as before — the pair must not race a repaint or a second press.
+fn press_and_witness(m: &mut Model, sx: usize, sy: usize) -> (Act, String) {
+    let before = (m.cwd.clone(), m.focus, m.tree_sel, m.list_sel);
+    let a = content_press(m, sx, sy);
+    let out = press_witness(m, sx, sy, &before, &a);
+    (a, out)
 }
 
 /// Route a press already resolved to SOURCE coordinates. Split out from [`press_route`] so the
@@ -3343,6 +3539,12 @@ pub fn selftest() {
     // are: aarch64's desktop reaches THIS function and x86's reaches `door_selftest`, and x86 is the
     // arch the fixture exists for. Its own `DONE` latch makes the second chain a no-op.
     launch_selftest();
+    // QUARRYOPEN — the OPEN GESTURE, chained in the same shape and for a reason flight 11 made
+    // sharp: leg 11 of [`selftest_result`] is the only place the double-press was ever driven, and
+    // `selftest_result` is reached ONLY from this function — which the x86 battery never calls. So
+    // on the arch Peter flies, the gesture behind *"could not open a file"* had no fixture at all.
+    // Chained from both arms with its own `DONE` latch, so it runs exactly once on either.
+    open_selftest();
     match selftest_result() {
         Ok((a, b)) => serial_println!(
             ":: QUARRY: geometry+scroll+tree+hit+dedupe+exec+dblclick+cache+launch+wheel — 640x480 surf_px={} 1920x1200 surf_px={} dbl={}ms cache={} wheel={}rows :: PASS ::",
@@ -3439,6 +3641,12 @@ pub fn door_selftest() {
     // the only battery arm that reaches this file there. Ahead of the `DONE` swap below with the
     // three above, so a battery that already ran the door legs does not lose the launch witness.
     launch_selftest();
+    // QUARRYOPEN — and THIS is the chain that matters MOST for it: x86 is the arch flight 11 flew,
+    // and this tail is the only battery arm that reaches this file there. The open gesture's only
+    // previous fixture (leg 11 of `selftest_result`) hangs off `selftest`, which x86 never calls.
+    // Ahead of the `DONE` swap below with the four above, so a battery that already ran the door
+    // legs does not lose the open witness.
+    open_selftest();
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) {
         return;
@@ -3817,5 +4025,212 @@ pub fn launch_selftest() {
 pub fn launch_selftest() {
     serial_println!(
         ":: QUARRYLAUNCH: this build has no EL0 layer (none of `baremetal` / `tegra_el0` / `virt_el0`), so `arch::syscall::spawn_user_image_bg` is not compiled and the launch seam's only honest answer here is the `REFUSED reason=no-el0-layer` arm :: SKIP ::"
+    );
+}
+
+// ── QUARRYOPEN (rMBP flight 11) — a FILE ROW OPENS, and the wire says by what ────────────────────
+
+/// **QUARRYOPEN's fixture: the gesture, the words, and the window — through the seam the click
+/// router calls.**
+///
+/// # The flight this exists for
+///
+/// Peter, flight 11 (2026-09-22): *"quarry rows open fine, but could not open a file"*. The capture
+/// (`~/unaos-bench/scratch/rmbp-0915/quarryopen-logs/f11.log`, `awk index()`) says why, and it is
+/// three separate facts that the old wire could not tell apart:
+///
+///   1. **There was no double-press on that wire at all.** The two presses on the file row are
+///      `[ 844506ms] press at (399,427) row=15 kind=file -> select` and
+///      `[ 851023ms] press at (389,425) row=15 kind=file -> select` — 6517 ms apart, with
+///      `[ 846253ms] press at (18,527) row=1 kind=dir -> select` BETWEEN them. `is_double` tests the
+///      pane as well as the row, so that tree press re-stamped `click_pane = Pane::Tree` and broke
+///      the pair on a second, independent ground. No window width would have opened that file.
+///   2. **The wire never said the row was openable.** `kind=file -> select` is the same line for
+///      `VUG.ELF`, for a screenshot and for `CONFIG.TXT`, so an operator could not learn from the
+///      capture that the gesture existed, let alone that it was theirs to make. That is what
+///      [`press_witness`]'s new `-> open kind=… handler=…` tail repairs.
+///   3. **The clock the window is measured on is the DRAIN's**, and flight 11 measured its jitter:
+///      264 / 200 / 300 ms from each `:: PTR: … (down edge)` to the `[quarry] press` it produced,
+///      against `[ptrinstall] lag_max_ms=678`. [`DOUBLE_CLICK_MS`]'s doc carries the arithmetic; the
+///      window is 500 ms because of it.
+///
+/// # What it drives, and why through this seam
+///
+/// [`press_and_witness`] — the function [`press_route`] itself calls, one lock deeper. So the
+/// `[quarry] press at …` lines this fixture puts on the wire are REAL lines from the real path, and
+/// a capture of the battery run can be read with exactly the `awk index($0,"[quarry]")` a flight
+/// capture is read with. Everything above that seam is `wm::hit_test`, the panel→source arithmetic
+/// and the window table, which a fixture cannot build without perturbing the very rows the rest of
+/// this battery asserts pixels of — leg 11 of [`selftest_result`] draws the same line for the same
+/// reason.
+///
+/// Disk-free: the list is hand-built, so the leg is honest on a board with no volume mounted. It
+/// stops at the `Act` and never calls [`run_act`], so nothing is spawned and no window is minted;
+/// the HANDLER's own witness is `QUARRYLAUNCH`'s (`[quarry] launch …` / `:: QUARRY-LAUNCH: …`),
+/// which runs in this same battery and is where a reader pairs the decision with its effect.
+///
+/// # The legs
+///
+///   * **1 — agreement.** [`open_handler`]'s token and [`Model::activate_row`]'s `Act` must name the
+///     same opener for every name, including under `cfg(facet)`. A witness that promised an opener
+///     the image cannot reach would be worse than the silence it replaced.
+///   * **2 — the window.** A real double-press is ~180 ms of hand; flight 11 measured ~100 ms of
+///     drain spread on top. Both are pinned INSIDE the window, the boundary is pinned exactly, and
+///     one millisecond past it is pinned outside.
+///   * **3 — the gesture and its words**, end to end: a dir press selects, a file double-press opens
+///     and says by what, and an unopenable file's double-press says `select` and why.
+///   * **4 — pointer/keyboard parity.** Enter's tail and the press's tail are the same string,
+///     because they are the same [`act_tail`] over the same `Act`.
+///
+/// **Go-red:** set [`DOUBLE_CLICK_MS`] to `0`. Leg 2's 180 ms pin fails immediately
+/// (`window=[180ms=no …]`) and leg 3's `elf=` reads `select` instead of
+/// `open kind=elf handler=launch`, so this prints `:: QUARRYOPEN: … :: FAIL ::` — the two halves of
+/// the claim failing independently, which is what stops a green board from confusing a working
+/// gesture with an absent one.
+#[cfg(feature = "witness")]
+pub fn open_selftest() {
+    use core::sync::atomic::AtomicBool;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Some(small) = geometry(640, 480) else {
+        serial_println!(
+            ":: QUARRYOPEN: geometry(640x480) declined — no panel geometry to build a Model against :: SKIP ::"
+        );
+        return;
+    };
+
+    // ── leg 1: the token and the Act name the same opener ────────────────────────────────────────
+    // `activate_row` needs a model; it gets a throwaway one whose list is exactly the names under
+    // test. Directories are deliberately absent from this leg: their arm calls `navigate`, which
+    // reaches the VFS, and this fixture owes no board a volume.
+    let mut m = Model {
+        geom: small,
+        tree: Vec::new(),
+        tree_sel: 0,
+        tree_scroll: 0,
+        cwd: String::from("/apps"),
+        list: Vec::new(),
+        list_truncated: false,
+        list_sel: 0,
+        list_scroll: 0,
+        focus: Pane::List,
+        err: None,
+        mounts: Vec::new(),
+        cache: Vec::new(),
+        cache_gen: 0,
+        reads: 0,
+        hits: 0,
+        read_cycles: 0,
+        click_ms: 0,
+        click_row: 0,
+        click_pane: Pane::List,
+        status: None,
+    };
+    let png_tail = if cfg!(feature = "facet") {
+        "open kind=png handler=facet"
+    } else {
+        "select (no handler for .PNG)"
+    };
+    let png_handler = if cfg!(feature = "facet") { "facet" } else { "none" };
+    let cases: [(&str, &str, &str, &str); 5] = [
+        ("VUG.ELF", "elf", "launch", "open kind=elf handler=launch"),
+        ("S8W.BIN", "bin", "launch", "open kind=bin handler=launch"),
+        ("SCREEN6.PNG", "png", png_handler, png_tail),
+        ("CONFIG.TXT", "text", "none", "select (no handler for .TXT)"),
+        ("READ_ME", "unknown", "none", "select (no handler for READ_ME — it carries no extension)"),
+    ];
+    let mut leg_agree = true;
+    for (name, kind, handler, tail) in cases {
+        m.list = alloc::vec![DirEnt {
+            name: String::from(name),
+            kind: NodeKind::File,
+            size: 64,
+            mtime: None
+        }];
+        m.list_sel = 0;
+        let act = m.activate_row(0);
+        let got = act_tail(&act).unwrap_or_else(|| String::from("<not an activation>"));
+        if open_kind(name) != kind || open_handler(name) != handler || got != tail {
+            serial_println!(
+                "[quarry] QUARRYOPEN leg1 MISMATCH name={} kind={}(want {}) handler={}(want {}) tail=\"{}\"(want \"{}\")",
+                name, open_kind(name), kind, open_handler(name), handler, got, tail
+            );
+            leg_agree = false;
+        }
+    }
+
+    // ── leg 2: the window, against the two intervals flight 11 measured ──────────────────────────
+    // 180 ms is the gesture; +100 ms is the drain spread the flight's three press pairs carried
+    // (264/200/300 ms from down edge to drain); 420 ms is the pair the OLD 400 ms window dropped.
+    let w_gesture = is_double(1000, 1180, 3, 3, true);
+    let w_jitter = is_double(1000, 1280, 3, 3, true);
+    let w_slow = is_double(1000, 1420, 3, 3, true);
+    let w_edge = is_double(1000, 1000 + DOUBLE_CLICK_MS, 3, 3, true);
+    let w_past = is_double(1000, 1001 + DOUBLE_CLICK_MS, 3, 3, true);
+    let leg_window = w_gesture && w_jitter && w_slow && w_edge && !w_past && DOUBLE_CLICK_MS >= 280;
+
+    // ── leg 3: the gesture, through the seam the click router calls ──────────────────────────────
+    // Row 0 is a DIRECTORY, so the first press is the flight's own opening move (a dir row, one
+    // press, a selection) and the rows under test are never the first thing pressed.
+    m.cwd = String::from("/apps");
+    m.list = alloc::vec![
+        DirEnt { name: String::from("SUB"), kind: NodeKind::Dir, size: 0, mtime: None },
+        DirEnt { name: String::from("VUG.ELF"), kind: NodeKind::File, size: 12568, mtime: None },
+        DirEnt { name: String::from("SCREEN6.PNG"), kind: NodeKind::File, size: 40960, mtime: None },
+        DirEnt { name: String::from("CONFIG.TXT"), kind: NodeKind::File, size: 842, mtime: None },
+    ];
+    m.list_sel = 0;
+    m.list_scroll = 0;
+    m.click_ms = 0;
+    m.focus = Pane::Tree;
+    let lin = small.list_pane().inner();
+    let px_x = lin.x + PAD + 1;
+    let row_y = |r: usize| lin.y + small.row_h() * (r + 1) + 1;
+    // A board whose `CNTFRQ_EL0` reads 0 answers `ms() == 0` forever, and `is_double`'s guard must
+    // SUPPRESS the gesture there rather than fire it on the first press. Both worlds are scored.
+    let clock_live = crate::arch::ms() != 0;
+    let (a_dir, out_dir) = press_and_witness(&mut m, px_x, row_y(0));
+    let leg_dir = matches!(a_dir, Act::None) && out_dir == "select" && m.list_sel == 0;
+    let pair = |m: &mut Model, r: usize| {
+        m.click_ms = 0;
+        let _ = press_and_witness(m, px_x, row_y(r));
+        press_and_witness(m, px_x, row_y(r)).1
+    };
+    let out_elf = pair(&mut m, 1);
+    let out_png = pair(&mut m, 2);
+    let out_txt = pair(&mut m, 3);
+    let leg_gesture = if clock_live {
+        out_elf == "open kind=elf handler=launch"
+            && out_png == png_tail
+            && out_txt == "select (no handler for .TXT)"
+    } else {
+        // The zero-clock guard doing exactly its job: no activation, so no tail — the model-diff
+        // word for a re-press of an already-selected row.
+        out_elf == "miss" && out_png == "miss" && out_txt == "miss"
+    };
+
+    // ── leg 4: the keyboard says what the pointer says ───────────────────────────────────────────
+    // Same `Act`, same `act_tail`, therefore the same sentence — the property that keeps an Enter
+    // and a double-press from describing one decision two ways on one capture.
+    let enter_tail = act_tail(&Act::Launch(String::from("/apps/VUG.ELF")))
+        .unwrap_or_else(|| String::from("<none>"));
+    let leg_parity = enter_tail == "open kind=elf handler=launch";
+
+    let ok = leg_agree && leg_window && leg_dir && leg_gesture && leg_parity;
+    serial_println!(
+        ":: QUARRYOPEN: dbl={}ms clock={} stamp=drain(arch::ms in content_press) agree={} \
+window=[180ms={} 280ms={} 420ms={} {}ms={} {}ms={}] dir=\"{}\" elf=\"{}\" png=\"{}\" txt=\"{}\" \
+enter_matches_press={} :: {} ::",
+        DOUBLE_CLICK_MS,
+        if clock_live { "live" } else { "dead" },
+        leg_agree,
+        w_gesture, w_jitter, w_slow,
+        DOUBLE_CLICK_MS, w_edge,
+        DOUBLE_CLICK_MS + 1, w_past,
+        out_dir, out_elf, out_png, out_txt,
+        leg_parity,
+        if ok { "PASS" } else { "FAIL" }
     );
 }
