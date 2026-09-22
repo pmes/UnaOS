@@ -1225,11 +1225,18 @@ const BAND_ROWS: [u32; 3] = [
     (BAND_PAR - BAND_MID) as u32,
     (SH - BAND_PAR) as u32,
 ];
-/// VUGART: how often the running rollup is put on the wire. A WINX-8 CI vug lives a few hundred
-/// frames and is KILLED (no exit witness ever runs), so the verdict has to land periodically or the
-/// gate would have nothing to read; a bench vug can run for hundreds of thousands of frames, so it
-/// must not be per-frame. 64 puts ~5 lines in a CI vug's life, which is why the period is this and
-/// not 16.
+/// VUGART: the STEADY period of the rollup, on top of which every power-of-two frame also emits.
+///
+/// THE DOUBLING HEAD IS THE MEASUREMENT, not a flourish. A WINX-8 CI vug is KILLED — `winx8_launcher`
+/// breaks as soon as THREE GLOBAL presents have landed anywhere on the machine, which on a box under
+/// eight sibling executors is two or three of the vug's OWN frames — and it is killed, so the exit
+/// witness never runs. A period-only schedule put ZERO `:: VUGART:` lines on a full `UNAOS_WC=1
+/// UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_QEMU_FULL=1 ./arroyo test 240` capture at load
+/// average 38 (`vugart-logs/run1-repro.log`): the whole life of that vug was eighteen serial lines
+/// between the two WINX-8 witnesses, with two `[wc-h] win=1 … BUFFERED` presents in it. So frames 1,
+/// 2, 4, 8 … emit too, and the gate has a verdict from a vug that lived two frames.
+/// A bench vug runs for hundreds of thousands of frames, so the tail must NOT be per-frame: past 64
+/// the doubling is sparser than the period and 64 is what governs.
 #[cfg(target_arch = "x86_64")]
 const VUGART_PERIOD: u32 = 64;
 
@@ -1299,7 +1306,7 @@ fn art_score(g: u32) {
     } else {
         A_COHERENT.fetch_add(1, Ordering::Relaxed);
     }
-    if n % VUGART_PERIOD == 0 {
+    if n.is_power_of_two() || n % VUGART_PERIOD == 0 {
         art_emit();
     }
 }
