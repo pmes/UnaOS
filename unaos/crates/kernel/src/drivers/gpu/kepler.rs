@@ -1789,21 +1789,21 @@ pub fn init(gpu: &GpuInfo) {
                                             serial_println!(":: kepler: ctrladdr pbdma{} restored rb={:08X} ::", pbdma_idx, rb_restored);
                                         }
                                     }
-                                    // ══ KF9b `ctrlbind` — the seam's residue, unwound and READ BACK ═══════════════════════
-                                    // Reverse order of the seam's own writes: +0x04 first, then +0x00, so the word carrying
-                                    // VALID is the last one written here exactly as it is in the bringup. `init` rewrites both
-                                    // words far below, which is precisely why this restore matters: without it `init` would
-                                    // bind a channel a PROBE had already left armed, and every reading from there down would
-                                    // be taken against a state no unarmed boot ever reaches.
+                                    // ══ KF9b `ctrlbind` — the seam's residue, unwound and READ BACK (RELEASE FIRST, STATUS LAST) ══
+                                    // Flight 11 (2026-09-22) bought this order. It restored +0x04 then +0x00 — the bringup's "VALID
+                                    // written last" — and got `04=00000001(want 00000000) verdict=DIRTY`. NO WRITE OF THIS RUNG EVER
+                                    // CARRIED BIT 0: the seam writes +0x04=00000400, and its NEXT write, the VALID bind word into
+                                    // +0x00, is what leaves +0x04 reading 11000001 on all twelve encodings — bit 0 is CHIP-SET channel
+                                    // state, and the 0-write cleared 11000000 and not it because it landed while the channel was still
+                                    // BOUND. +0x00 is 00000000 at entry and carries no VALID, so "VALID last" is a BIND's rule and not
+                                    // its undoing's. `DIRTY-chanstate` = +0x04 off in bit 0 alone: the release did not drop it either.
                                     #[cfg(feature = "nvidia-kepler-ctrlbind")]
                                     {
-                                        mmio_write(bar0, 0x800004 + (1 * 8), ctrlbind_chan_pre.1);
-                                        mmio_write(bar0, 0x800000 + (1 * 8), ctrlbind_chan_pre.0);
-                                        let rb00 = mmio_read(bar0, 0x800000 + (1 * 8));
-                                        let rb04 = mmio_read(bar0, 0x800004 + (1 * 8));
-                                        serial_println!(":: kepler: ctrlbind chan-restored 00={:08X}(want {:08X}) 04={:08X}(want {:08X}) verdict={} ::",
+                                        mmio_write(bar0, 0x800000 + (1 * 8), ctrlbind_chan_pre.0); mmio_write(bar0, 0x800004 + (1 * 8), ctrlbind_chan_pre.1);
+                                        let (rb00, rb04) = (mmio_read(bar0, 0x800000 + (1 * 8)), mmio_read(bar0, 0x800004 + (1 * 8)));
+                                        serial_println!(":: kepler: ctrlbind chan-restored 00={:08X}(want {:08X}) 04={:08X}(want {:08X}) order=00-then-04 verdict={} ::",
                                             rb00, ctrlbind_chan_pre.0, rb04, ctrlbind_chan_pre.1,
-                                            if rb00 == ctrlbind_chan_pre.0 && rb04 == ctrlbind_chan_pre.1 { "clean" } else { "DIRTY" });
+                                            if rb00 == ctrlbind_chan_pre.0 && rb04 == ctrlbind_chan_pre.1 { "clean" } else if rb00 == ctrlbind_chan_pre.0 && (rb04 ^ ctrlbind_chan_pre.1) == 1 { "DIRTY-chanstate" } else { "DIRTY" });
                                     }
 
                                     // Milestone 1: Method-Mirror Backing-Store Beacon Test
