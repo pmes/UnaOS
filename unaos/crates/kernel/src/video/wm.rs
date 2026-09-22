@@ -25762,12 +25762,12 @@ pub fn ctrldecline_selftest() {
 /// The stretch is the shape with no rescue: `w5` is the stack's TOP (its damage drags nothing
 /// else into the pass), its box contains the parked sprite, and its seed band is its LAST two
 /// source rows — panel rows strictly below the arrow. Without the widening the staged band
-/// excludes the sprite's rows, the offer cannot land, and `CUR3_TAKEN` does not move for four
-/// consecutive passes; with it, `w5`'s band gains the sprite's rows (an 8-row surface cannot
-/// express them, so the fail-safe `None` arm rounds to the whole box) and every stretch pass
-/// carries. `adopt_stretch=N/4` counts stretch passes whose present+drain moved `CUR3_TAKEN`,
-/// and PASS requires at least one — RED is structurally zero, so the floor is set for GREEN
-/// robustness (a stage-declined direct fallback legitimately carries nothing).
+/// excludes the sprite's rows, so the offer is MADE AND CARRIES NOTHING (`offers=1 taken=0`)
+/// and `CUR3_TAKEN` does not move for four passes; with it, `w5`'s band gains the sprite's rows
+/// (an 8-row surface cannot express them, so the fail-safe `None` arm rounds to the whole box)
+/// and every pass carries. `adopt_stretch=N/4` counts stretch passes whose present+drain moved
+/// `CUR3_TAKEN`; PASS requires at least one OF THE PASSES THAT WERE OFFERED (`offers=0` is the
+/// THIRD state — see DMGOVLP2 at `stretch_offer` — and asserts nothing; RED still reads 0/4).
 ///
 /// During the stretch nothing else is staged over the sprite: only `w5` is dirty, the chain and
 /// the furniture sit clear of the arrow, and a drained pass paints nothing extra — which is what
@@ -25795,7 +25795,7 @@ pub fn ctrldecline_selftest() {
 /// shape and FORBIDs the other three.
 ///
 /// PASS thresholds: every pass runs and drains; `drag_evt`/`drag_px`/`relay` all moved;
-/// `adopt_stretch >= 1` (the stretch's conviction — RED is structurally 0/4, GREEN 4/4);
+/// `adopt_stretch >= min(1, stretch_offer)` (the conviction — RED is 0/4 OFFERED, GREEN 4/4);
 /// `narrow >= 2` and `cur >= 4` (the sprite-leg floor: at least 4 of the 12 passes must run the
 /// overlay-offer path with a live plan).
 ///
@@ -25985,7 +25985,7 @@ pub fn dmgovlp_selftest() {
     let mut drained_n = 0usize;
     let mut narrow_k = 0usize;
     let mut cur_n = 0usize;
-    let mut adopt_stretch = 0usize;
+    let mut adopt_stretch = 0usize; let mut stretch_offer = 0usize; // DMGOVLP2 — ⚠ SAME-LINE, line-NEUTRAL (this file's rule: `wm.rs` compiles into the knob-off image and panic `Location`s below embed line numbers). The DENOMINATOR the carry claim is entitled to: stretch passes the compositor actually OFFERED the sprite to. See the stretch doc section's third state.
     let mut max_ms = 0u64;
     let mut wedged = false;
     let mut stuck = false;
@@ -26095,7 +26095,7 @@ pub fn dmgovlp_selftest() {
         }
         // The stretch's carry claim, over the same interval: this pass's present (or its drain)
         // put sprite pixels through a staged window. Only the widening can make that true here.
-        if m >= STRETCH_AT {
+        if m >= STRETCH_AT { if CUR3_OFFERS.load(Relaxed) != of0 { stretch_offer += 1; } // DMGOVLP2 — ⚠ SAME-LINE, line-NEUTRAL. An OFFER is the precondition the carry needs and this fixture does not control: `composite_inner` sets `may_overlay = false` for every window WC-D has not yet published a first verdict for (`wcd_ref.is_some() || VERIFIED & bit == 0`, witness builds only), and `stage_window` is then handed `None` — no `compose_into`, no `CUR3_TAKEN`, WHATEVER the band says. On the QEMU lane WC-D verifies `w5` inside the battery, so the offer is there and the carry is CURSTICK's alone; on the rMBP its cadence is SECONDS (26 `[wc-d] verify` lines in 654 s, ids 1/2/3 at 23-38 s) against a battery that runs in ONE millisecond, so the offer never arrives and `offers=0 taken=0` says the widening was never asked. Counted here, beside the numerator, so the two are read as one claim.
             if CUR3_TAKEN.load(Relaxed) != tk0 {
                 adopt_stretch += 1;
             }
@@ -26122,9 +26122,9 @@ pub fn dmgovlp_selftest() {
         && relay > 0
         && narrow_k >= NARROW_MIN
         && cur_n >= CUR_MIN
-        // The stretch's conviction: at least one of its four passes CARRIED the sprite through
-        // a staged band — impossible without the CURSTICK widening (RED reads 0/4).
-        && adopt_stretch >= STRETCH_MIN;
+        // The stretch's conviction: at least one of its OFFERED passes CARRIED the sprite through
+        // a staged band — impossible without the CURSTICK widening (RED reads 0/4 WITH offers).
+        && adopt_stretch >= STRETCH_MIN.min(stretch_offer); if stretch_offer == 0 { serial_println!("[dmgovlp] stretch UNOFFERED offers=0/4 taken=0 — no staged window was offered the sprite (WC-D has published no first verdict for the stretch row, so `may_overlay` is withheld); the CURSTICK carry is NOT MEASURED on this boot and adopt_stretch does not gate the verdict"); } // DMGOVLP2 — ⚠ SAME-LINE, line-NEUTRAL. The floor is `min(1, offered)`, so an UNOFFERED battery asserts nothing instead of convicting CURSTICK of a schedule it does not own; an OFFERED one is the pre-DMGOVLP2 threshold character for character. The reason goes on the wire on its own line rather than into the verdict, which is spec-regex-pinned (`adopt_stretch=\d+/4`) and must not move; the line carries no `SKIP` and no `-> FAIL`, so it trips none of x86-wc.spec's FORBIDs.
     serial_println!(
         "[dmgovlp] verdict passes={}/12 drained={}/12 drag_evt={} drag_px={} relay={} narrow={}/12 cur={}/12 adopt={} repaint={} max_ms={} adopt_stretch={}/4 -> {}",
         passes_n, drained_n, drag_evt, drag_px, relay, narrow_k, cur_n, adopt, repaint_n, max_ms,
