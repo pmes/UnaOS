@@ -230,53 +230,53 @@ pub fn peek_recent(dst: &mut [u8]) -> Option<usize> {
 
 /// Append a formatted `_print` to the boot-capture ring.
 ///
-/// **try_lock only, never blocks** — the discipline of the SERIAL1 `_print` path, and non-negotiable:
-/// this runs OUTSIDE `SERIAL1` and OUTSIDE the interrupt mask, so every core reaches it at once, and a
-/// mirror that could block here would be able to stall the primary wire. That inversion would be worse
-/// than any drop.
+/// **try_lock only on the sink, never blocks** — the discipline of the SERIAL1 `_print` path, and
+/// non-negotiable: this runs OUTSIDE `SERIAL1` and OUTSIDE the interrupt mask, so every core reaches
+/// it at once, and a mirror that could block here would be able to stall the primary wire. That
+/// inversion would be worse than any drop. The bounded turn below holds NOTHING while it waits and
+/// re-tries the sink on every turn, so it is back-pressure and not a block.
 ///
 /// **SERWIT-2 — what changed.** The failure branch used to be nothing: on contention the whole
-/// formatted line evaporated, with no counter anywhere. That is the costliest instance of the defect in
-/// the tree, because THIS IS THE BENCH'S OWN CAPTURE PATH — the 2012 rMBP has no 16550, so on an
-/// attended metal sitting the FTDI cable is not a mirror of the evidence, it IS the evidence. It lost
-/// lines precisely when the machine was busiest, which is the only moment the wedge and cursor
-/// investigations care about, and it lost them invisibly.
+/// formatted line evaporated, with no counter anywhere. THIS IS THE BENCH'S OWN CAPTURE PATH — the
+/// 2012 rMBP has no 16550, so on an attended metal sitting the FTDI cable is not a mirror of the
+/// evidence, it IS the evidence — and it lost lines precisely when the machine was busiest.
 ///
-/// Now: take the ring if it is free (draining anyone else's staged lines first, so deferral never
-/// reorders the capture); otherwise defer the whole line into the lock-free [`STAGE`] ring; and if that
-/// is full too, try the ring once more before giving up — the retry is free (`try_lock`) and turns most
-/// of what would remain into a hit. Only after all three does a line count as lost, and a lost line is
-/// COUNTED and announced IN THE CAPTURE STREAM ITSELF (see [`drain_staged_into`]), which is the only
-/// channel a bench sitting has.
+/// **SERWIT-2 BACKPRESSURE (FIXTURE_FLAKES §2a, rmbp-ledger B159).** One free retry was not enough:
+/// `staged` hit this ring's own 64 slots exactly on the FAILs (`dropped=7`, `dropped=13`) against
+/// `staged=10..30 dropped=0` on the greens — DEPTH EXHAUSTION under contention. Now: take the sink if
+/// free (draining anyone else's staged lines first, so deferral never reorders the capture); else defer
+/// the whole line into [`STAGE`]; else GO ROUND under the primary wire's own contended-producer policy
+/// ([`crate::serial_ring::defer_policy`], rows compiler-checked). Only when the BOUND expires is a line
+/// lost, and a lost line is COUNTED and announced IN THE CAPTURE STREAM (see [`drain_staged_into`]).
 pub fn mirror(args: fmt::Arguments) {
     let tap = &crate::serial_ring::TAP_FTDI;
     tap.submit();
-    if let Some(mut ring) = RING.try_lock() {
-        drain_staged_into(&mut ring);
-        let _ = ring_write(&mut ring, args);
-        tap.absorb();
-        return;
-    }
-    match STAGE.stage(args) {
-        crate::serial_ring::Staged::Whole => {
-            tap.note_staged();
+    // SERWIT-2 BACKPRESSURE. The bound is the PRIMARY WIRE'S OWN, so this transport has one checkable magnitude and not a second one nobody can check (see `BACKPRESSURE_SPINS`). In panic mode it collapses to 1 — which IS the old single free retry, turn for turn — because a dying machine must not spend a bounded wait per line on a holder that may never release.
+    let bound = if crate::serial_ring::in_panic_mode() { 1 } else { crate::serial_ring::BACKPRESSURE_SPINS };
+    let mut spins: u32 = 0;
+    loop {
+        if let Some(mut ring) = RING.try_lock() {
+            drain_staged_into(&mut ring);
+            let _ = ring_write(&mut ring, args);
+            tap.absorb();
             return;
         }
-        crate::serial_ring::Staged::Truncated => {
-            // Sealed with a visible marker in the capture; counted and announced like a loss.
-            tap.note_staged();
-            tap.tear();
-            UNANNOUNCED.fetch_add(1, Ordering::Relaxed);
-            return;
+        match STAGE.stage(args) {
+            crate::serial_ring::Staged::Whole => { tap.note_staged(); return; }
+            crate::serial_ring::Staged::Truncated => {
+                // Sealed with a visible marker in the capture; counted and announced like a loss.
+                tap.note_staged();
+                tap.tear();
+                UNANNOUNCED.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            crate::serial_ring::Staged::Full => {}
         }
-        crate::serial_ring::Staged::Full => {}
-    }
-    // Staging ring full: one free retry at the sink before the line is declared lost.
-    if let Some(mut ring) = RING.try_lock() {
-        drain_staged_into(&mut ring);
-        let _ = ring_write(&mut ring, args);
-        tap.absorb();
-        return;
+        // Sink busy AND staging full — the one branch that was still lossy. Go round: each turn re-tries the SINK first (winning it drains STAGE and writes this line intact), so the wait bears progress, and room can also arrive from ANOTHER core's drain. Nothing is held across the turn.
+        match crate::serial_ring::defer_policy(false, spins, bound) {
+            crate::serial_ring::Defer::Retry => { spins += 1; core::hint::spin_loop(); }
+            _ => break,
+        }
     }
     tap.drop_line();
     UNANNOUNCED.fetch_add(1, Ordering::Relaxed);

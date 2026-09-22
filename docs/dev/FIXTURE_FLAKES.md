@@ -490,7 +490,7 @@ already moved.
 
 ## Class 2 — the evidence taps lose lines to a margin-tight serial ring
 
-### 2a. SERWIT-2 `evidence_lost=N` — **ROOT CAUSE MEASURED 2026-09-22 (FLAKEFIX, rmbp-ledger B150); the original suspect REFUTED; fix owed in `drivers/xhci/ftdi.rs`**
+### 2a. SERWIT-2 `evidence_lost=N` — **ROOT CAUSE MEASURED 2026-09-22 (FLAKEFIX, rmbp-ledger B150); the original suspect REFUTED; FIX MADE 2026-09-22 (FLAKEFIX2, rmbp-ledger B159) and UNSCORED — the bench would not reach the ring's depth**
 
 **Signature on the wire:**
 
@@ -585,23 +585,51 @@ a vCPU descheduled by a loaded host mid-memcpy stretches the hold, the other fou
 cores all miss the `try_lock`, and `STAGE` fills behind them. "sink contended or
 full" means **contended**, every time this has been measured.
 
-**THE FIX IS IN A FILE FLAKEFIX MAY NOT TOUCH, so it is reported and not made**
-(`drivers/xhci/ftdi.rs` is not in that brief's file set, and any edit there moves
-the default image, which `./arroyo knoboff wc` scores as a red by construction —
-see rmbp-ledger B144's note on knoboff having no power over unconditional code).
-The exact change, for whoever holds the file: **the one free retry is not
-enough.** `mirror()`'s third step is a single `try_lock`, so a line is declared
-lost after losing one race, while `serial_ring`'s own primary producer
-BACK-PRESSURES instead (`:: SERWIT-1B: … the contended producer BACK-PRESSURES,
-it does not drop … one capped drain freed 3 slot(s), the next turn DEFERRED the
-line intact, 0 dropped -> PASS ::`). Give the mirror the same policy the primary
-wire already has — a bounded spin on the retry, or a capped drain of `STAGE`
-into `RING` before declaring the loss — and quote a run with `staged >= 64` and
-`dropped=0` as the proof. **Do not widen `evidence_lost`'s threshold**: the 13
-lines are really gone, and on a 2012 rMBP with no 16550 the FTDI capture is not a
-mirror of the evidence, it IS the evidence (this function's own doc comment says
-so). A tolerance here would be the wrong-lenient half of LAWS §5 applied to the
-one tap that cannot afford it.
+**THE FIX IS NOW MADE — AND IT IS UNSCORED, WHICH IS SAID HERE FIRST BECAUSE IT
+IS THE HALF A READER MUST NOT SKIM PAST** (FLAKEFIX2, rmbp-ledger B159, branch
+`exec-rmbp-flakefix2`). `mirror()`'s third step was a single `try_lock`, so a
+line was declared lost after losing ONE race, while `serial_ring`'s own primary
+producer BACK-PRESSURES instead (`:: SERWIT-1B: … the contended producer
+BACK-PRESSURES, it does not drop … one capped drain freed 3 slot(s), the next
+turn DEFERRED the line intact, 0 dropped -> PASS ::`). The mirror now takes that
+same policy, through the same spelling: `crate::serial_ring::defer_policy`, whose
+six rows the compiler already checks on every `./arroyo check`, bounded by the
+primary wire's own `BACKPRESSURE_SPINS` so the transport has ONE checkable
+magnitude rather than a second one nobody can check. Each turn re-tries the SINK
+first (winning it drains `STAGE` and writes the line intact), so the wait bears
+progress and room can also arrive from another core's drain; nothing is held
+across a turn; in panic mode the bound collapses to 1, which is the old single
+free retry turn for turn, so a dying machine cannot spend a bounded wait per line.
+`evidence_lost`'s threshold is UNCHANGED at zero — the 13 lines were really gone,
+and on a 2012 rMBP with no 16550 the FTDI capture is not a mirror of the evidence,
+it IS the evidence, so a tolerance here would be the wrong-lenient half of LAWS §5
+applied to the one tap that cannot afford it.
+
+**WHY IT IS UNSCORED, WITH THE NUMBERS, because an unproven fix recorded as a
+proven one is the costlier error.** The proof this entry asks for is a run reading
+`staged >= 64` with `dropped=0`, i.e. a run that REACHES the ring's depth. FLAKEFIX2
+could not make the bench reach it. Four `./arroyo test` boots on 2026-09-22, all on
+the loaded box this entry's own rates were measured on, read the `ftdi` tap at
+**`staged=0`, `staged=1`, `staged=0`, `staged=0`** — below even the `staged=10..30`
+this entry records for its PASS captures, and two orders of magnitude below the
+`staged=64/65` the FAILs reached. Host load 29 → 57 across them (`uptime` quoted in
+rmbp-ledger B159), six sibling `cargo` builds, and a run with all five vCPUs pinned
+onto four already-spinning host CPUs — the deschedule-mid-memcpy shape this entry
+names as the mechanism — moved the reading from 0 to 1 and no further. **The branch
+that was changed was therefore never taken in any of the four runs**, so the four
+greens are a NO-REGRESSION measurement (rc=0, `SERWIT-2 … -> PASS`, the four tap
+lines' accounting identical, `balanced` intact) and nothing more. The go-red is
+unreachable for the same reason: re-introducing the single-attempt path cannot
+produce `dropped>0` on a boot that never fills the ring.
+
+**What a future seat needs, stated as the specific missing instrument rather than
+as more wall.** At the measured rate (2 FAIL in 65 boots) three CONSECUTIVE greens
+at depth is not a thing wall-clock buys. What is needed is a DELIBERATE WIDENER that
+drives `STAGE` to its 64 slots on demand — a SERWIT-1-shaped burst that holds `RING`
+across a stretched `ring_write`, or an `arroyo` knob that does. Every place such a
+widener can live is outside `drivers/xhci/ftdi.rs`: the SERWIT fixtures are in
+`crate::serial_ring`, and a knob is `unaos/arroyo` plus `builder/src/main.rs`. That
+is why it is not here, and it is the one thing to give whoever scores this.
 
 The suspect that stood here before, kept because the arithmetic is still true and
 the next reader should not re-derive it: **per-line growth on the rollup lines**
@@ -645,7 +673,8 @@ discriminator; it has now been checked against four real captures and it reads
    the rollup lines shortened and see whether `evidence_lost` follows.~~ **Not
    needed — `torn=0` in four captures answers it. Do not spend a run on it.**
 
-**Disposition — ROOT CAUSE KNOWN, FIX OWED, and CORRECT one sentence this entry
+**Disposition — ROOT CAUSE KNOWN, FIX MADE AND UNSCORED (see above; it stays on
+the owed list until a run at depth scores it), and CORRECT one sentence this entry
 used to carry: it DOES turn the gate red.** The old text said SERWIT-2 "does not
 turn a gate red on its own" because no `.spec` file carries a SERWIT token. That
 is true of the spec replay and false of the run: `FAIL ::` is in arroyo's
