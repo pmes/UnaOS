@@ -1,0 +1,69 @@
+NEUTRAL M1 — ARTIFACT CERTIFICATION (LC_ALL=C grep -a -o -F, never strings)
+commit 14549eaf on exec-rmbp-neutral, parent 4d8d047d. Generated 2026-09-22T21:56:07Z
+
+Rule (LAWS §5 / BANNER-ARTIFACT): an OLD token must be 0 in every image; a NEW token must be >=1
+in the images that ARM its family. A family the build does not arm is CORRECTLY absent — 'an unarmed
+family certifies nothing' — so each table carries a CONTROL that must be non-zero, to distinguish a
+fact about the data from a broken pattern.
+
+--- A. kernel8.img  (1458064 bytes; K8_FEATS=baremetal,skip_xhci) ---
+TOKEN              COUNT
+OLD [orinrender]     0
+OLD [orinfurn]       0
+OLD [orinstkdepth]   0
+OLD [orinface]       0
+OLD [orindefer]      0
+OLD [pidesk]         0
+OLD [tegra fs-mps]   0
+OLD [piusb24]        0
+OLD [piusb25]        0
+OLD [piusb26]        0
+OLD [piusb34]        0
+OLD [piusb35]        0
+OLD [piusb36]        0
+OLD [piusb37]        0
+OLD [piusb38]        0
+OLD [piusb39]        0
+OLD [piusb40]        0
+OLD [piusb41]        0
+NEW [usb24]          2
+NEW [usb25]          3
+NEW [usb26]          1
+NEW [usb34]          1
+NEW [usb35]          1
+NEW [usb36]          13
+NEW [usb37]          21
+NEW [usb38]          18
+NEW [usb39]          4
+NEW [usb40]          4
+NEW [usb41]          8
+CTL CAPSTONE         3
+CTL [vfs]            12
+  (unarmed here, correctly 0: [render] [deskfurn] [stkdepth] [conface] [condefer] [deskfw] [usb fs-mps])
+
+--- B. x86 wc kernel.elf  (2273832 bytes; banner=ehcihid,kbdwit,sdhcblk,smolnet,wc,sdwrite) ---
+OLD [orinrender]     0
+OLD [orinfurn]       0
+OLD [orinstkdepth]   0
+OLD [orinface]       0
+OLD [orindefer]      0
+OLD [pidesk]         0
+OLD [tegra fs-mps]   0
+OLD [piusb24]        0
+OLD [piusb25]        0
+OLD [piusb26]        0
+OLD [piusb34]        0
+OLD [piusb35]        0
+OLD [piusb36]        0
+OLD [piusb37]        0
+OLD [piusb38]        0
+OLD [piusb39]        0
+OLD [piusb40]        0
+OLD [piusb41]        0
+NEW [usb39]          4
+NEW [usb40]          4
+NEW [usb41]          8
+CTL [wc-x]           26
+CTL DECLINE reason=  22
+
+VERDICT: 18/18 OLD tokens are 0 in BOTH images; every family an image arms is >=1; every control fires.
