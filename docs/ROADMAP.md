@@ -299,6 +299,27 @@ byte-same `-EACCES`) are witnessed. No new security model, no fulfiller
 registration (BANDY-3's design pass). Witnesses `BANDY-CODEC2`/`BANDY-WR`/
 `BANDY-EQ2`/`BANDY-ACL`, `pi4-regression.spec` 41/41.
 
+Third arc — **🔬 LANDED (BUSX86, 2026-09-22, `exec-rmbp-busx86` off `878e1818`,
+QEMU-green on both arches; rMBP metal rides the next attended sitting): THE WIRE
+RUNS ON x86.** BANDY-1/-2 built the whole transport inside `arch/aarch64/` and the
+module said so in its own last line — "aarch64-only; zero x86 surface" — so
+`SYS_MSEND`/`SYS_MRECV` existed on exactly one board and the rMBP desktop's EL0
+programs (STAT, VUG, PULSE) had no bus to speak on. That is a board-split of the
+*program story*, which is the one thing this section's own principle forbids. **M1:**
+the v1 CODEC is lifted out of the board — `git mv` to `crate::bus`, declared once in
+`lib.rs`, compiled on both arches, with the frozen goldens (`BANDY-CODEC`,
+`BANDY-CODEC2`) now asserted on BOTH every boot rather than on the Pi alone. The
+frame did not move and cannot: the KATs are the spec of record. **M2:** the two
+syscalls on x86 — same semantics, same errnos, the same reserved KERNEL reply stamp,
+bounded per-row mailboxes, and in-kernel `ls`/`cat`/`cp` re-entering `sys_open`'s own
+gate sequence so the errnos are byte-same by construction. **What x86 does not have,
+said out loud:** no `PrincipalRecord` and no FAT-backed created-name root — its U6
+identity is `(row, SLOT_GEN[row])` and its namespace is the staged set plus the
+static `U10_NAMES` table, whose existence test is a LIVE DESCRIPTOR. The wire pays
+nothing for that, because the only principal that ever reaches a frame is the reply's
+reserved KERNEL constant. Witness `BUSX86-STAMP [w=0x3f/0x3f]` with a behavioural
+go-red; the ring-3 midden twin and its equivalence witness (M3) are OWED.
+
 ## 4. TALUS — the rover (deferred until the desktop chain matures)
 
 Architecture settled 2026-07-02. The OS is the **vehicle computer between the

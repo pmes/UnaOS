@@ -172,7 +172,7 @@ use una_abi::O_PUBLIC;
 // or revokes (rights == 0) access to another principal named OWNER-SCOPED by a `Child` handle the caller holds
 // (the SYS_XFER idiom — no raw pid/slot from ring 3). The grant is an ACL edge on the FILE (nothing delivered to
 // the grantee's table); the grantee opens the name and the SYS_OPEN ACL admits it. See `sys_fgrant`.
-use una_abi::SYS_FGRANT;
+use una_abi::SYS_FGRANT; use una_abi::SYS_MSEND; use una_abi::SYS_MRECV; // BUSX86 (ROADMAP §3b): the on-UnaOS SMessage bus verbs, at their SHARED cross-arch numbers. `una-abi` is UNCHANGED by this arc — 19 and 20 have been declared there since ABIFREEZE and the Pi has dispatched them since BANDY-1; x86 was the arch that never imported them, which is the board-split this arc closes (LAWS §3: ONE OS; R16). ⚠ SAME-LINE fold: this file's panic `Location` records embed line numbers, so a new line here renumbers 24 000 of them.
 // SOCK-2 (ROADMAP §1b): the UDP socket syscall family — the FIRST time ring 3 reaches the network.
 // A socket is a new object-table kind (`KIND_SOCKET`, already scaffolded as the U6bx/U9x kind
 // negative) whose value word is a persistent-`SocketSet` id; the handle is a capability exactly like a
@@ -2620,7 +2620,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_SEEK => sys_seek(a0, a1),
         SYS_UNLINK => sys_unlink(a0),
         SYS_CLOSE => sys_close(a0),
-        SYS_FGRANT => sys_fgrant(a0, a1, a2),
+        SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
         // so the dispatch match is byte-identical there and an unknown number falls to the default.
         #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
@@ -15080,7 +15080,7 @@ pub fn clear_handle_row(slot: usize) {
     // keeps the bounded table self-cleaning and enforces the owner-exit-reverts-to-public rule. Before
     // `clear_files_row` (the open-descriptor decrefs) — order-independent (a separate lock), placed here for
     // adjacency with the file teardown (the aarch64 `owned_clear_owner_asid` twin).
-    owned_clear_owner_slot(slot);
+    owned_clear_owner_slot(slot); busx_mbox_clear(slot); // BUSX86: drain this row's bus mailbox alongside its handles, owner rows and inbox. It lands AFTER the `SLOT_GEN` bump at the top of this function, which is what makes it sufficient rather than merely tidy: every queued reply carries the recipient's generation and `busx_mbox_pop` discards a stale-gen frame, so a reply enqueued in the window between the bump and this drain is already dead-on-arrival for the row's next tenant. The aarch64 twin drains at the same point in `clear_handle_row` for the same reason. ⚠ SAME-LINE fold.
     // U6bx: the slot's open-FILE row rides the same teardown (handles first, so no File handle can name a
     // descriptor this wipe has already freed) — covers both the exit and the fault-kill path, exactly like
     // the handles (the aarch64 `clear_handle_row` -> `clear_files_row` twin).
@@ -23551,7 +23551,7 @@ fn u11m2_launcher(demo_cpu: usize) {
     #[cfg(feature = "irqstorage")]
     s6_witness_launcher(demo_cpu);
     // U6x: chain the owner/grants ACL demo (program order, the u9x->..->u11m2 idiom; the LAST demo in the chain).
-    u6gx_launcher(demo_cpu);
+    u6gx_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); busx86_stamp_check(); // BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
 }
 
 /// Build a U6x fixture slot at a given entry symbol — the `u7x_build`/`u11m2_build` shape (allocate a private
@@ -24521,4 +24521,726 @@ pub fn session_epoch_fixture(user_id: u32, name: &[u8]) -> bool {
         if ok { "PASS" } else { "FAIL —" }
     );
     ok
+}
+
+// =====================================================================================================
+// BUSX86 (ROADMAP §3b): the on-UnaOS SMessage bus ON X86 — TRANSPORT + KERNEL FULFILLMENT.
+// =====================================================================================================
+//
+// "Port the bus, not the binary convention." BANDY-1 built this transport on aarch64 and left x86 with
+// NO SYS_MSEND and NO SYS_MRECV at all — a board-split of the program story itself (LAWS §3: ONE OS;
+// R16), which is why the rMBP desktop's EL0 programs (STAT, VUG, PULSE) had no bus to speak on. The
+// WIRE is shared code now (`crate::bus`, lifted out of `arch/aarch64/` by this same arc), and its KATs
+// run on BOTH arches every boot. THIS block is the x86 half of what BANDY-1's syscall.rs holds: the two
+// syscalls, the bounded mailboxes, and the in-kernel fulfiller for the v1 verbs.
+//
+// WHAT IS IDENTICAL TO THE aarch64 TRANSPORT, and must stay so:
+//   * the FRAME. Not one byte moves. The request principal field must arrive ALL-ZERO from ring 3 and a
+//     caller-supplied (nonzero) principal is refused -EINVAL, never overwritten (verdict C); the reply
+//     carries the RESERVED KERNEL record — kind 4, len 0, value zero — which is the exact 32 bytes the
+//     frozen goldens pin. The KATs are the spec of record and this file changes nothing they assert.
+//   * SYS_MSEND fulfils SYNCHRONOUSLY in the caller's own syscall context under the INVOKER's grants
+//     (verdict D — no impersonation primitive exists here either), then enqueues the reply into the
+//     SENDER's mailbox. A verb that FAILS still returns 0 with its errno in the reply's status.
+//   * mailbox capacity is checked BEFORE fulfillment, so a side-effectful verb can never run and lose
+//     its reply (-EAGAIN); depth 16, a deliberate bounded cap (the USER_SLOTS discipline).
+//   * SYS_MRECV requires a whole-frame buffer (>= BUS_FRAME_MAX, else -EMSGSIZE) and blocks on the
+//     scheduler's Semaphore while the mailbox is empty.
+//   * teardown drains the dying row's mailbox and every queued reply is generation-fenced.
+//
+// THE THREE PLACES aarch64's IMPLEMENTATION LEANS ON SOMETHING x86 DOES NOT HAVE. Named here rather
+// than discovered later, because each is a contract claim and not a coding detail:
+//
+//  1. THE PRINCIPAL. aarch64 stamps the sender's kernel-held `PrincipalRecord` — the K-line
+//     IMAGE_SHA256 mint. x86 HAS NO PrincipalRecord AND NEEDS NONE. Its U6 identity — the one its own
+//     SYS_OPEN owner ACL is keyed on, and therefore the only identity an equivalence witness could
+//     compare against — is the ADDRESS-SPACE ROW fenced by its incarnation: `(row, SLOT_GEN[row])`,
+//     where `row` is `caller_row()` and `SLOT_GEN` is bumped at the top of `clear_handle_row`. That
+//     pair is what every fulfiller below receives and what `owned_access_ok` is asked about, exactly as
+//     aarch64 passes `(asid, agen, ppid)` into `bus_cat`/`bus_cp`. This costs the WIRE nothing, and the
+//     reason is structural rather than lucky: on aarch64 the stamped sender principal is ALSO never
+//     read off a frame — `sys_msend_for` requires the field zero, hands `ppid` to the fulfiller
+//     directly, and never looks at `hdr.principal` again. The ONLY principal that reaches the wire in
+//     either direction is the reply's reserved KERNEL record, and that one is a constant. So x86 stamps
+//     the same constant, and "the same principal stamping" is true of the frame byte-for-byte while the
+//     identity BEHIND it is each arch's own — which is what it has to be, since the two arches key
+//     their ACLs on different things and always did.
+//
+//  2. THE MAILBOX ROW. aarch64 keys mailboxes by ASID (0 = the shared window). x86's twin of an ASID is
+//     the HANDLES row: a private slot, or `SHARED_ROW` for the multi-tenant kernel window. Same shape,
+//     same `USER_SLOTS + 1` width, same generation fence. `SHARED_ROW` never tears down, so its row is never
+//     drained — harmless, and stated because the aarch64 comment states the same about ASID 0.
+//
+//  3. THE NAMESPACE. This is the real divergence and it is NOT cosmetic. aarch64 fulfils through
+//     `fs::fat` — `mount`/`find_located`/`read_at`/`create_in_root` — against a real on-disk root whose
+//     ACL key is `(dir_lba, dir_off)`. x86's EL0 file namespace is not that volume: it is the STAGED
+//     set (HELLO.BIN / SCRATCH.BIN / GROW.BIN — read-only content the kernel published) plus the STATIC
+//     `U10_NAMES` created-file table, whose ACL key is the NAME-ID and whose "this file exists" test is
+//     `created_desc_any_row` — a LIVE DESCRIPTOR, not a directory entry. Every fulfiller below therefore
+//     re-enters THAT sequence, in `sys_open`'s own order, so the errnos are byte-same BY CONSTRUCTION
+//     rather than by a table of hand-copied numbers: root-leaf collapse -> staged set -> `SHARED_ROW`
+//     refusal -> `DYN_DELETED_G` -> `created_desc_any_row` -> `owned_access_ok`. The consequence for
+//     `cp` is spelled out at `bus_cp` and is the one honest-scope note of this arc.
+
+/// BUSX86: the errnos the bus needs that the x86 syscall file had no prior caller for. Values are the
+/// aarch64 twins' verbatim — a bus reply's status is compared byte-for-byte across arches by the
+/// equivalence witness, so a divergent number here would be a divergent WIRE.
+const EEXIST_X: i64 = -17; // bus cp refuses an existing destination (create-new-only in v1 — the BANDY-1 contract)
+const E2BIG_X: i64 = -7; // a source over the v1 copy ceiling
+const EMSGSIZE_X: i64 = -90; // SYS_MRECV buffer smaller than BUS_FRAME_MAX (the whole-frame contract)
+const ENOSYS_X: i64 = -38; // a v1 verb this arch does not fulfil yet (the BANDY-2 write side — see bus_verb_dispatch)
+
+/// Mailbox depth per row — a deliberate bounded cap (STOP-tripwired like `USER_SLOTS`), the aarch64
+/// `BUS_MBOX_DEPTH` verbatim.
+const BUSX_MBOX_DEPTH: usize = 16;
+
+/// One queued reply frame: the recipient-generation stamp + the heap-boxed frame bytes (exact length).
+struct BusxMsg {
+    rgen: u64,
+    frame: alloc::boxed::Box<[u8]>,
+}
+
+/// A bounded FIFO of queued replies. Guarded by its `SpinMutex` row; count <= DEPTH.
+struct BusxMbox {
+    head: usize,
+    count: usize,
+    slots: [Option<BusxMsg>; BUSX_MBOX_DEPTH],
+}
+
+impl BusxMbox {
+    const EMPTY: Self = BusxMbox { head: 0, count: 0, slots: [const { None }; BUSX_MBOX_DEPTH] };
+}
+
+/// Per-ROW reply mailboxes (row = the HANDLES row, like every other x86 per-tenant sidecar). Static
+/// table of Options — the frames are heap boxes, so the static footprint is pointers only.
+static BUSX_MBOX: [SpinMutex<BusxMbox>; crate::arch::memory::USER_SLOTS + 1] =
+    [const { SpinMutex::new(BusxMbox::EMPTY) }; crate::arch::memory::USER_SLOTS + 1];
+
+/// Per-row "replies pending" semaphores — the MRECV blocking primitive. `crate::arch::sched::Semaphore`
+/// on x86 carries the SAME contract aarch64's does (`init` reserves waiter capacity before any task can
+/// block; `wait` parks and returns false off a scheduled task; `post` wakes cross-core), which is why
+/// this is a port and not a re-design.
+static BUSX_SEM: [crate::arch::sched::Semaphore; crate::arch::memory::USER_SLOTS + 1] =
+    [const { crate::arch::sched::Semaphore::new(0) }; crate::arch::memory::USER_SLOTS + 1];
+static BUSX_SEM_INIT: AtomicU8 = AtomicU8::new(0); // 0 = untouched, 1 = initializing, 2 = ready
+
+/// One-shot waiter-capacity reservation for `BUSX_SEM`. Gate-and-spin so a second core entering
+/// mid-init waits it out (the aarch64 `bus_sem_init_once` verbatim).
+fn busx_sem_init_once() {
+    match BUSX_SEM_INIT.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {
+            for s in &BUSX_SEM {
+                s.init();
+            }
+            BUSX_SEM_INIT.store(2, Ordering::Release);
+        }
+        Err(_) => {
+            while BUSX_SEM_INIT.load(Ordering::Acquire) != 2 {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// Teardown drain — called from `clear_handle_row` AFTER its generation bump, so a reply enqueued in
+/// the window is already dead-on-arrival for the next tenant. Frees every queued box. Stray semaphore
+/// permits are harmless: `sys_mrecv` re-checks the queue after every wake.
+fn busx_mbox_clear(row: usize) {
+    if row >= BUSX_MBOX.len() {
+        return;
+    }
+    let _irq = IrqGuard::mask_save();
+    let mut mb = BUSX_MBOX[row].lock();
+    mb.head = 0;
+    mb.count = 0;
+    for s in mb.slots.iter_mut() {
+        *s = None; // drops the box
+    }
+}
+
+/// Enqueue a reply for `row` (generation-stamped). `false` = mailbox full — the caller already reserved space
+/// via `busx_mbox_has_room` BEFORE fulfilling, so this only fails under a racing enqueue.
+fn busx_mbox_push(row: usize, rgen: u64, frame: alloc::boxed::Box<[u8]>) -> bool {
+    let _irq = IrqGuard::mask_save();
+    let mut mb = BUSX_MBOX[row].lock();
+    if mb.count >= BUSX_MBOX_DEPTH {
+        return false;
+    }
+    let tail = (mb.head + mb.count) % BUSX_MBOX_DEPTH;
+    mb.slots[tail] = Some(BusxMsg { rgen, frame });
+    mb.count += 1;
+    true
+}
+
+/// Capacity pre-check — SYS_MSEND refuses BEFORE fulfilling when the reply could not be queued, so a
+/// verb with side effects can never run and then lose its reply.
+fn busx_mbox_has_room(row: usize) -> bool {
+    let _irq = IrqGuard::mask_save();
+    let mb = BUSX_MBOX[row].lock();
+    mb.count < BUSX_MBOX_DEPTH
+}
+
+/// Non-blocking dequeue: pop the oldest frame whose generation stamp matches the row's CURRENT `SLOT_GEN`;
+/// stale-generation frames (a predecessor tenant's) are discarded in the same pass.
+fn busx_mbox_pop(row: usize) -> Option<BusxMsg> {
+    let cur_gen = SLOT_GEN[row].load(Ordering::Acquire);
+    let _irq = IrqGuard::mask_save();
+    let mut mb = BUSX_MBOX[row].lock();
+    while mb.count > 0 {
+        let head = mb.head;
+        let msg = mb.slots[head].take();
+        mb.head = (head + 1) % BUSX_MBOX_DEPTH;
+        mb.count -= 1;
+        match msg {
+            Some(m) if m.rgen == cur_gen => return Some(m),
+            _ => continue, // stale-generation (or defensively empty) — discard, keep scanning
+        }
+    }
+    None
+}
+
+// -----------------------------------------------------------------------------------------------
+// KERNEL FULFILLMENT — ls / cat / cp through the EXISTING x86 SYS_OPEN gates, under the invoker's
+// `(row, cgen)`. Every errno mirrors the direct-syscall path because every check below IS the check
+// `sys_open` makes, in `sys_open`'s order.
+// -----------------------------------------------------------------------------------------------
+
+/// v1 content ceilings — the aarch64 twins' values verbatim (documented honest scope, not protocol
+/// constants): cat returns the FIRST 512 bytes sanitized; cp copies files up to 4096 bytes; ls
+/// truncates at ~3800 bytes. All keep a reply body under `BUS_BODY_MAX` by construction.
+const BUSX_CAT_MAX: usize = 512;
+const BUSX_CP_MAX: usize = 4096;
+const BUSX_LS_TEXT_MAX: usize = 3800;
+
+/// Sanitize file-content bytes for a text reply body — the aarch64 `bus_sanitize` verbatim, and for
+/// its reason: a client writes the body to the console, so a raw control byte could mangle the serial
+/// witness stream.
+fn busx_sanitize(b: u8) -> u8 {
+    match b {
+        0x20..=0x7e | b'\n' | b'\r' | b'\t' => b,
+        _ => b'.',
+    }
+}
+
+/// Append `name size\n` to an ls listing, honouring the text budget. Returns false when the budget is
+/// spent (the caller appends the honest `...\n` truncation marker and stops).
+fn busx_ls_line(text: &mut alloc::vec::Vec<u8>, name: &str, size: u32) -> bool {
+    if text.len() + name.len() + 13 > BUSX_LS_TEXT_MAX {
+        return false;
+    }
+    text.extend_from_slice(name.as_bytes());
+    text.push(b' ');
+    let mut numbuf = [0u8; 10];
+    let mut n = size;
+    let mut i = numbuf.len();
+    loop {
+        i -= 1;
+        numbuf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    text.extend_from_slice(&numbuf[i..]);
+    text.push(b'\n');
+    true
+}
+
+/// ls: list the x86 EL0 FILE NAMESPACE — the STAGED set plus every LIVE created `U10_NAMES` file — with
+/// each name's current size. This is the honest x86 twin of aarch64's FAT root listing, and the
+/// equality that makes it one is not the backing store but the RESOLVER: these are exactly the names
+/// `sys_open` can resolve on this arch, which is the same thing aarch64's `ls` enumerates there. No
+/// denial leg (names are not ACL-protected; CONTENT is, at cat — `owned_access_ok` sits in `bus_cat`,
+/// exactly as it sits in `sys_open`). Truncates honestly at `BUSX_LS_TEXT_MAX`.
+fn busx_ls(text: &mut alloc::vec::Vec<u8>) -> i64 {
+    for (k, n) in STAGED_NAMES.iter().enumerate() {
+        let Some(b) = staged_bytes(k as u32) else {
+            continue; // not published this boot — a name sys_open would miss, so ls must not claim it
+        };
+        if !busx_ls_line(text, n, b.len() as u32) {
+            text.extend_from_slice(b"...\n");
+            return 0;
+        }
+    }
+    let _ns = ns_lock(); // the created half is a namespace read — atomic against create/unlink
+    for (id, n) in U10_NAMES.iter().enumerate() {
+        if STAGED_NAMES.contains(n) {
+            continue; // GROW.BIN is both staged and a U10 name — list it once, from the staged pass
+        }
+        if DYN_DELETED_G[id].load(Ordering::Acquire) {
+            continue; // unlinked: gone for every row the moment the flag went up (sys_open says -ENOENT)
+        }
+        let Some((r, idx)) = created_desc_any_row(usize::MAX, id as u32) else {
+            continue; // no live descriptor anywhere == the file does not exist on this arch
+        };
+        if !busx_ls_line(text, n, FILE_SIZE[r][idx].load(Ordering::Acquire)) {
+            text.extend_from_slice(b"...\n");
+            return 0;
+        }
+    }
+    0
+}
+
+/// Resolve a bus verb's name argument exactly as `sys_open` resolves its copied-in name: bound, then
+/// the DIRNS root-leaf collapse. Returns the resolved name or the errno `sys_open` would have returned.
+/// Kept as ONE function so `cat` and `cp` cannot drift from each other or from the syscall.
+fn busx_resolve<'a>(name: &'a str) -> Result<&'a str, i64> {
+    if name.is_empty() || name.len() > MAX_NAME {
+        return Err(EINVAL);
+    }
+    Ok(crate::fs::vfs::el0_root_leaf(name).unwrap_or(name))
+}
+
+/// cat: read the first `BUSX_CAT_MAX` bytes of a name under the INVOKER's grants. The sequence below is
+/// `sys_open`'s existing-file gate VERBATIM — same checks, same order, same errnos, which is the
+/// equivalence witness's whole contract:
+///   bound/collapse (-EINVAL) -> STAGED set (public, `sys_open_staged`'s RO leg admits any caller)
+///   -> `SHARED_ROW` (-EACCES, the created-descriptor refusal) -> `DYN_DELETED_G` (-ENOENT)
+///   -> `created_desc_any_row` (-ENOENT) -> `owned_access_ok(CAP_READ)` (-EACCES).
+/// The bounded read (<= 512 B) stays under the namespace hold so a concurrent unlink cannot retire the
+/// descriptor mid-read; cat claims no descriptor of its own, exactly as the aarch64 twin claims none.
+fn busx_cat(row: usize, cgen: u64, name: &str, text: &mut alloc::vec::Vec<u8>) -> i64 {
+    let name = match busx_resolve(name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if let Some((sidx, _size)) = staged_lookup(name) {
+        // A staged file carries NO owner row — PUBLIC, byte-identical to `sys_open_staged`'s RO path,
+        // which asks the ACL nothing. HELLO.BIN is immutable ring-3 CODE and is readable there too.
+        let Some(b) = staged_bytes(sidx) else {
+            return ENOENT;
+        };
+        let n = core::cmp::min(b.len(), BUSX_CAT_MAX);
+        text.reserve(n);
+        for &x in b[..n].iter() {
+            text.push(busx_sanitize(x));
+        }
+        return 0;
+    }
+    if row == SHARED_ROW {
+        return EACCES; // `sys_open_dynamic`'s first refusal — the private-single-writer rule
+    }
+    let Some(nameid) = u10_name_id(name) else {
+        return ENOENT; // neither staged nor a U10 name: `sys_open_dynamic`'s tail verdict
+    };
+    let _ns = ns_lock();
+    if DYN_DELETED_G[nameid as usize].load(Ordering::Acquire) {
+        return ENOENT; // unlinked (the non-create arm of sys_open_dynamic's deleted check)
+    }
+    let Some((srcrow, idx)) = created_desc_any_row(row, nameid) else {
+        return ENOENT; // no live descriptor anywhere == the name does not resolve
+    };
+    if !owned_access_ok(nameid as usize, row, cgen, CAP_READ) {
+        return EACCES; // THE gate — the identical call `sys_open_dynamic` makes for an RO open
+    }
+    // Content: the descriptor's writable staging buffer is what a SYS_READ of this file serves, so it
+    // is what cat must read (siblings share one slot, so this is the same bytes every reader sees).
+    // Length is stable (writes are in-place or extend), which is why an unsynchronized read is safe
+    // here for exactly the reason `open_created_sibling` can share the slot at all.
+    let b: &[u8] = match (FILE_WSTAGE[srcrow][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
+        Some(widx) => wstage_bytes(widx),
+        None => &[], // a created descriptor always owns a wstage slot; fail closed to empty, never EIO-adjacent
+    };
+    let n = core::cmp::min(b.len(), BUSX_CAT_MAX);
+    text.reserve(n);
+    for &x in b[..n].iter() {
+        text.push(busx_sanitize(x));
+    }
+    0
+}
+
+/// cp: copy a name to a NEW created name under the INVOKER's grants. The SOURCE side is the `bus_cat`
+/// gate (same errnos); the DESTINATION is CREATE-NEW-ONLY in v1 (-EEXIST on a live name — BANDY-1's
+/// contract, inherited deliberately rather than re-derived: the direct `sys_open(O_CREAT)` would
+/// idempotently sibling-open, and v1's bus refuses instead so there is no overwrite semantics to get
+/// wrong). The created copy is PRIVATE to the invoker exactly as a direct `sys_open(O_CREAT)` is — the
+/// bus mints nothing the direct path would not.
+///
+/// ⚠ THE ONE HONEST-SCOPE DIVERGENCE OF THIS ARC, and it is a property of the x86 namespace rather than
+/// of the bus. On aarch64 a created file is a DIRECTORY ENTRY: `create_in_root` makes it, and it
+/// outlives every descriptor. On x86 a created file's identity IS a live descriptor
+/// (`created_desc_any_row` is the existence test — see `sys_open_dynamic`), so a fulfiller that created
+/// the copy and then closed its own handle would destroy the thing it had just acknowledged. This
+/// implementation therefore does what the DIRECT path does and keeps the descriptor: the destination is
+/// created through `open_create_new`, and the File handle it mints STAYS in the invoker's handle table,
+/// owned by the invoker, until the invoker closes it or tears down. That is the same end state a direct
+/// `SYS_OPEN(dst, O_CREAT|RW)` reaches, with the same fail-closed errnos (-EMFILE / -EAGAIN when the
+/// invoker's descriptor or handle table is full), and it is the only shape on this arch that makes the
+/// copy OBSERVABLE afterwards — a `bus ls` that cannot see what `bus cp` just made would be a lie.
+/// The cost is stated plainly: a bus `cp` consumes one handle slot of the invoker's eight. The
+/// descriptor-free create that would retire this note belongs to the x86 created-name-on-disk arc
+/// (STOR-1's line), not to the bus.
+fn busx_cp(row: usize, cgen: u64, src: &str, dst: &str) -> i64 {
+    // SOURCE — read it first (the cat gate), so a denied or missing source costs the destination nothing.
+    let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let src_status = busx_cat_raw(row, cgen, src, &mut data);
+    if src_status != 0 {
+        return src_status;
+    }
+    if data.len() > BUSX_CP_MAX {
+        return E2BIG_X; // v1's honest copy ceiling
+    }
+    let dst = match busx_resolve(dst) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if row == SHARED_ROW {
+        return EACCES; // `sys_open_dynamic` refuses a created (hence RW) descriptor here
+    }
+    if staged_lookup(dst).is_some() {
+        return EEXIST_X; // a staged name is always live — create-new-only refuses it
+    }
+    let Some(nameid) = u10_creatable_nameid(dst) else {
+        return ENOENT; // O_CREAT of a name outside the creatable set is -ENOENT on this arch
+    };
+    {
+        let _ns = ns_lock();
+        if DYN_DELETED_G[nameid as usize].load(Ordering::Acquire) {
+            return EBUSY; // `open_create_new`'s refusal: the deferred delete has not drained
+        }
+        if created_desc_any_row(row, nameid).is_some() {
+            return EEXIST_X; // create-new-only in v1 (see the doc note)
+        }
+    }
+    // CREATE — the direct path's own function, so ownership, the O_CREAT-private policy, the deleted
+    // re-check under the lock and every claim/unwind are the syscall's and not a second copy of it.
+    let h = open_create_new(row, nameid, false);
+    if h < 0 {
+        return h; // -EBUSY / -EMFILE / -EAGAIN / -EIO, verbatim from the direct create
+    }
+    // CONTENT — extend the fresh (0-length) staging buffer from KERNEL memory. `sys_write_grow` is the
+    // ring-3 twin of these four stores and cannot be called here: it validates and copies through
+    // `copy_from_user`, which refuses a kernel address by design. So the same four publications are made
+    // in the same order (bytes, then length, then size, then the grew mark), which is the order a
+    // reader's `sys_read` depends on.
+    let Some((crow, idx)) = created_desc_any_row(row, nameid) else {
+        return EIO; // the create above published a descriptor; its absence is a kernel bug — fail closed
+    };
+    debug_assert!(crow == row, "busx_cp: open_create_new landed off the invoker's row");
+    if !data.is_empty() {
+        let Some(widx) = (FILE_WSTAGE[crow][idx].load(Ordering::Acquire) as usize).checked_sub(1) else {
+            return EIO;
+        };
+        if data.len() > PAGE_SIZE as usize {
+            return ENOSPC; // the one-page staging buffer bounds a created file (the sys_write_grow clamp)
+        }
+        wstage_write_at(widx, 0, data.as_ptr() as u64, data.len());
+        wstage_set_len_at_least(widx, data.len() as u32);
+        FILE_SIZE[crow][idx].store(data.len() as u32, Ordering::Release);
+        mark_dirty(crow, idx, 0, data.len() as u32);
+        FILE_GREW[crow][idx].store(true, Ordering::Release);
+    }
+    0
+}
+
+/// `busx_cat` without the sanitize pass — the RAW source bytes `cp` must copy. `cat` sanitizes because
+/// its body is rendered to a console; `cp` must not, or a copy would silently corrupt binary content.
+/// Shares the gate by construction: it is the same function with the transform lifted out.
+fn busx_cat_raw(row: usize, cgen: u64, name: &str, out: &mut alloc::vec::Vec<u8>) -> i64 {
+    let name = match busx_resolve(name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if let Some((sidx, _size)) = staged_lookup(name) {
+        let Some(b) = staged_bytes(sidx) else {
+            return ENOENT;
+        };
+        out.extend_from_slice(&b[..core::cmp::min(b.len(), BUSX_CP_MAX)]);
+        return 0;
+    }
+    if row == SHARED_ROW {
+        return EACCES;
+    }
+    let Some(nameid) = u10_name_id(name) else {
+        return ENOENT;
+    };
+    let _ns = ns_lock();
+    if DYN_DELETED_G[nameid as usize].load(Ordering::Acquire) {
+        return ENOENT;
+    }
+    let Some((srcrow, idx)) = created_desc_any_row(row, nameid) else {
+        return ENOENT;
+    };
+    if !owned_access_ok(nameid as usize, row, cgen, CAP_READ) {
+        return EACCES;
+    }
+    let b: &[u8] = match (FILE_WSTAGE[srcrow][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
+        Some(widx) => wstage_bytes(widx),
+        None => &[],
+    };
+    out.extend_from_slice(&b[..core::cmp::min(b.len(), BUSX_CP_MAX)]);
+    0
+}
+
+/// Build + enqueue the reply frame for a fulfilled (or refused) verb: verb + corr echoed, status = the
+/// verb's errno (0 = ok), principal = the RESERVED KERNEL REPLY record, body = the verb-typed output
+/// (forced empty on error by `build_reply` — structural, not caller discipline). The kernel-reply
+/// principal is written as its 32 WIRE BYTES rather than through a `PrincipalRecord`, because x86 has no
+/// such type and the record the goldens pin is a constant: kind 4 (PRIN_KERNEL_REPLY), len 0, value
+/// zero. `crate::bus`'s own KAT asserts those exact bytes on this arch every boot.
+fn busx_reply_enqueue(row: usize, corr: u32, verb: u8, status: i64, text: &[u8]) -> i64 {
+    let mut prin_bytes = [0u8; 32];
+    prin_bytes[0] = BUSX_PRIN_KERNEL_REPLY;
+    let body: &[u8] = if status == 0 { text } else { &[] };
+    debug_assert!(body.len() <= crate::bus::BUS_BODY_MAX, "bus reply over the body ceiling (kernel bug)");
+    if body.len() > crate::bus::BUS_BODY_MAX {
+        return EIO; // fail closed (the ls/cat budgets make this unreachable)
+    }
+    let mut frame = alloc::vec![0u8; crate::bus::BUS_HDR_LEN + body.len()];
+    let n = crate::bus::build_reply(verb, corr, status as i32, prin_bytes, body, &mut frame);
+    debug_assert!(n == frame.len());
+    let rgen = SLOT_GEN[row].load(Ordering::Acquire);
+    if !busx_mbox_push(row, rgen, frame.into_boxed_slice()) {
+        return EAGAIN; // defensively unreachable (capacity pre-checked; single-threaded sender)
+    }
+    if BUSX_SEM_INIT.load(Ordering::Acquire) == 2 {
+        BUSX_SEM[row].post();
+    }
+    0
+}
+
+/// The RESERVED kernel-reply principal kind — the `PRIN_KERNEL_REPLY` of the aarch64 file, as the one
+/// byte of it that reaches the wire. Fail-closed as grantee/owner there; unreachable as either here,
+/// because x86's ACL is keyed on `(row, cgen)` and no row can ever hold this value.
+const BUSX_PRIN_KERNEL_REPLY: u8 = 4;
+
+/// The SYS_MSEND body, parameterized on the sender's identity — the syscall arm passes the caller's
+/// live `(row, SLOT_GEN[row])`; the kernel-side witness drives the SAME path with a scratch identity
+/// (the aarch64 `sys_msend_for` idiom, no duplicate logic). `frame` is already in kernel memory.
+fn busx_msend_for(row: usize, cgen: u64, frame: &[u8]) -> i64 {
+    let hdr = match crate::bus::frame_parse(frame) {
+        Ok(h) => h,
+        Err(_) => return EINVAL,
+    };
+    if hdr.kind != crate::bus::BUS_KIND_REQUEST || crate::bus::request_validate(&hdr).is_err() {
+        return EINVAL; // a REPLY frame, a nonzero status, or a CALLER-SUPPLIED PRINCIPAL — rejected
+    }
+    let body = &frame[crate::bus::BUS_HDR_LEN..];
+    if row >= BUSX_MBOX.len() || !busx_mbox_has_room(row) {
+        return EAGAIN; // capacity BEFORE fulfillment — a side effect must never lose its reply
+    }
+    let mut text: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let status = match hdr.verb {
+        crate::bus::BUS_VERB_LS => busx_ls(&mut text),
+        crate::bus::BUS_VERB_CAT => match crate::bus::cat_body_parse(body) {
+            Ok(nb) => match core::str::from_utf8(nb) {
+                Ok(name) => busx_cat(row, cgen, name, &mut text),
+                Err(_) => return EINVAL,
+            },
+            Err(_) => return EINVAL,
+        },
+        crate::bus::BUS_VERB_CP => match crate::bus::cp_body_parse(body) {
+            Ok((s, d)) => match (core::str::from_utf8(s), core::str::from_utf8(d)) {
+                (Ok(src), Ok(dst)) => busx_cp(row, cgen, src, dst),
+                _ => return EINVAL,
+            },
+            Err(_) => return EINVAL,
+        },
+        // BANDY-2's write side (write / rm / mv) is a DECODED, VALID frame on this arch — the codec is
+        // shared, so the goldens and the typed parsers run here exactly as they do on the Pi — but it is
+        // NOT FULFILLED yet, and it says so in the reply rather than pretending the verb is unknown.
+        // -ENOSYS, not -EINVAL: -EINVAL is what a MALFORMED frame gets, and a client that cannot tell
+        // "I spoke wrongly" from "this board cannot do that yet" has no way to degrade. The three
+        // destructive verbs need a descriptor-free create/unlink/rename in the x86 created-name
+        // namespace (see `busx_cp`'s note); that is the STOR-1 line's work, not the bus's.
+        crate::bus::BUS_VERB_WRITE | crate::bus::BUS_VERB_RM | crate::bus::BUS_VERB_MV => ENOSYS_X,
+        _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
+    };
+    busx_reply_enqueue(row, hdr.corr, hdr.verb, status, &text)
+}
+
+/// SYS_MSEND(frame_ptr, frame_len) — the ring-3 arm: the length ceiling BEFORE any copy, the whole
+/// range validated through the CFU-1 read seam, no partial decode; then the parameterized body under
+/// the caller's own identity. The staging buffer is HEAP-allocated at the exact request length (max
+/// forced staging 4148 B — never a big syscall-stack array).
+fn sys_msend(frame_ptr: u64, frame_len: u64) -> i64 {
+    busx_sem_init_once();
+    let len = frame_len as usize;
+    if len < crate::bus::BUS_HDR_LEN || len > crate::bus::BUS_FRAME_MAX {
+        return EINVAL; // the whole-frame ceiling gates the copy itself
+    }
+    let mut frame = alloc::vec![0u8; len];
+    if let Err(e) = copy_from_user(&mut frame, frame_ptr) {
+        return e;
+    }
+    let row = caller_row();
+    let cgen = SLOT_GEN[row].load(Ordering::Acquire);
+    busx_msend_for(row, cgen, &frame)
+}
+
+/// SYS_MRECV(buf_ptr, buf_len) — dequeue the oldest reply (blocking while empty). `buf_len` must cover
+/// a whole frame (>= BUS_FRAME_MAX, else -EMSGSIZE) so no partial-delivery state exists; the frame's
+/// exact length is the return value. The destination is validated ONCE up front over the whole-frame
+/// window, so a bad buffer is -EFAULT BEFORE any dequeue — a popped frame is never lost to a failed
+/// copy. Blocking rides the Semaphore; off a scheduled task it degrades to a poll returning -EAGAIN.
+fn sys_mrecv(buf_ptr: u64, buf_len: u64) -> i64 {
+    busx_sem_init_once();
+    if (buf_len as usize) < crate::bus::BUS_FRAME_MAX {
+        return EMSGSIZE_X;
+    }
+    let row = caller_row();
+    if row >= BUSX_MBOX.len() {
+        return EAGAIN;
+    }
+    if let Err(e) = user_range_ok(buf_ptr, crate::bus::BUS_FRAME_MAX as u64, UserAccess::Write) {
+        return e;
+    }
+    loop {
+        if let Some(msg) = busx_mbox_pop(row) {
+            if let Err(e) = copy_to_user(buf_ptr, &msg.frame) {
+                return e; // unreachable after the up-front check; fail closed
+            }
+            return msg.frame.len() as i64;
+        }
+        if !BUSX_SEM[row].wait() {
+            return EAGAIN; // off a scheduled task — the kernel-fixture poll path
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------------------------
+// BUSX86-STAMP: the x86 stamping + transport witness — the aarch64 `bandy_stamp_check` twin, driving
+// the PRODUCTION `busx_msend_for` path with a scratch identity (the kernel-side fixture idiom: no EL0
+// detour, no disk, no card). One uncounted `:: BUSX86-STAMP: … ::` line.
+//
+// WHAT IT DOES NOT CLAIM. The EQUIVALENCE witness proper — "denied via the bus == denied via the
+// syscall, byte-same errno" — cannot be made from in here, and BANDY-1 found the same thing on the Pi:
+// the direct leg is `SYS_OPEN`, which takes a RING-3 name pointer, so only a ring-3 program can drive
+// both legs and compare. That is the ring-3 fixture's job (`busx86-midden`). This witness proves the
+// things a kernel-side fixture CAN prove, which is everything about the stamp and the transport.
+// -----------------------------------------------------------------------------------------------
+#[inline(never)]
+fn busx86_stamp_check() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let mut w = 0u32;
+    let row: usize = 7; // a scratch row (the kernel-fixture discipline; the ring-3 ladder is done by now)
+    if row >= BUSX_MBOX.len() {
+        return;
+    }
+    let cgen = SLOT_GEN[row].load(Ordering::Acquire);
+    busx_mbox_clear(row);
+
+    // bit0: a CALLER-SUPPLIED principal is REJECTED -EINVAL (verdict C: reject, never overwrite) — and
+    // nothing was fulfilled or queued. This is the leg the go-red mutates.
+    let mut f = [0u8; 64];
+    let n = crate::bus::build_request(crate::bus::BUS_VERB_LS, 1, b"", &mut f);
+    f[16] = 2; // a nonzero principal kind byte, hand-planted where only the kernel may write
+    if busx_msend_for(row, cgen, &f[..n]) == EINVAL && busx_mbox_pop(row).is_none() {
+        w |= 1 << 0;
+    }
+
+    // bit1: a well-formed `ls` fulfils, and the reply that lands is a REPLY frame with the verb and
+    // corr ECHOED and the RESERVED KERNEL principal — the exact 32 bytes the frozen goldens pin.
+    let mut f2 = [0u8; 64];
+    let n2 = crate::bus::build_request(crate::bus::BUS_VERB_LS, 7, b"", &mut f2);
+    if busx_msend_for(row, cgen, &f2[..n2]) == 0 {
+        if let Some(msg) = busx_mbox_pop(row) {
+            if let Ok(h) = crate::bus::frame_parse(&msg.frame) {
+                let kernel_stamped = h.principal[0] == BUSX_PRIN_KERNEL_REPLY
+                    && h.principal[1] == 0
+                    && h.principal[2..].iter().all(|&b| b == 0);
+                if h.kind == crate::bus::BUS_KIND_REPLY
+                    && h.verb == crate::bus::BUS_VERB_LS
+                    && h.corr == 7
+                    && h.status == 0
+                    && kernel_stamped
+                {
+                    w |= 1 << 1;
+                }
+            }
+        }
+    }
+
+    // bit2: `cat HELLO.BIN` — the STAGED (public) read leg. Status 0 and a non-empty sanitized body,
+    // which also proves the fulfiller reached the same staged set `sys_open` resolves against. SKIPPED
+    // as a pass only if HELLO.BIN never staged this boot (no block device) — then the name genuinely
+    // does not resolve and -ENOENT is the correct, equal answer, so both outcomes are credited.
+    let mut f3 = [0u8; 128];
+    let n3 = crate::bus::build_request(crate::bus::BUS_VERB_CAT, 8, b"HELLO.BIN", &mut f3);
+    if busx_msend_for(row, cgen, &f3[..n3]) == 0 {
+        if let Some(msg) = busx_mbox_pop(row) {
+            if let Ok(h) = crate::bus::frame_parse(&msg.frame) {
+                let staged = staged_lookup("HELLO.BIN").is_some();
+                let ok = if staged {
+                    h.status == 0 && h.body_len > 0
+                } else {
+                    h.status == ENOENT as i32 && h.body_len == 0
+                };
+                if ok && h.verb == crate::bus::BUS_VERB_CAT && h.corr == 8 {
+                    w |= 1 << 2;
+                }
+            }
+        }
+    }
+
+    // bit3: a verb that FAILS still returns 0 from the SEND — the errno rides the REPLY's status with
+    // an EMPTY body (the native error-reply shape). `cat` of a name in neither the staged set nor
+    // `U10_NAMES` is -ENOENT, which is `sys_open`'s own verdict for it.
+    let mut f4 = [0u8; 128];
+    let n4 = crate::bus::build_request(crate::bus::BUS_VERB_CAT, 9, b"NOSUCH.BIN", &mut f4);
+    if busx_msend_for(row, cgen, &f4[..n4]) == 0 {
+        if let Some(msg) = busx_mbox_pop(row) {
+            if let Ok(h) = crate::bus::frame_parse(&msg.frame) {
+                if h.status == ENOENT as i32 && h.body_len == 0 && h.corr == 9 {
+                    w |= 1 << 3;
+                }
+            }
+        }
+    }
+
+    // bit4: the MAILBOX is bounded and per-row, fail-closed. 16 queued replies fill row 7 (the 17th
+    // send refuses -EAGAIN BEFORE fulfilling), while row 6's mailbox is unaffected — no cross-row
+    // starvation leverage. Drains both afterwards.
+    {
+        let mut filled = true;
+        for i in 0..BUSX_MBOX_DEPTH {
+            if busx_msend_for(row, cgen, &f2[..n2]) != 0 {
+                filled = false;
+                break;
+            }
+            let _ = i;
+        }
+        let refused = busx_msend_for(row, cgen, &f2[..n2]) == EAGAIN;
+        let other: usize = 6;
+        let other_ok = other < BUSX_MBOX.len() && {
+            let ogen = SLOT_GEN[other].load(Ordering::Acquire);
+            busx_mbox_clear(other);
+            let r = busx_msend_for(other, ogen, &f2[..n2]) == 0;
+            busx_mbox_clear(other);
+            r
+        };
+        if filled && refused && other_ok {
+            w |= 1 << 4;
+        }
+        busx_mbox_clear(row);
+    }
+
+    // bit5: the GENERATION FENCE — a reply queued for this row's CURRENT tenant is discarded once the
+    // row's generation moves on (a recycled row's next tenant can never read its predecessor's
+    // replies). Drives the real `SLOT_GEN` word, then puts it back: this row holds no live tenant at
+    // witness time (the ring-3 ladder has drained), so the bump is observable by nothing else.
+    {
+        busx_mbox_clear(row);
+        let sent = busx_msend_for(row, cgen, &f2[..n2]) == 0;
+        SLOT_GEN[row].fetch_add(1, Ordering::AcqRel);
+        let stale_dropped = busx_mbox_pop(row).is_none();
+        SLOT_GEN[row].fetch_sub(1, Ordering::AcqRel);
+        if sent && stale_dropped {
+            w |= 1 << 5;
+        }
+        busx_mbox_clear(row);
+    }
+
+    const ALL: u32 = (1 << 6) - 1;
+    serial_println!(
+        ":: BUSX86-STAMP: SYS_MSEND/SYS_MRECV on x86 — kernel-written principal (caller-supplied REJECTED -EINVAL), replies stamped RESERVED-KERNEL kind={}, errno-in-status-no-body, mailbox bounded per-row depth={} fail-closed, gen-fenced, identity=(row,SLOT_GEN) :: {} [w={:#04x}/{:#04x}] ::",
+        BUSX_PRIN_KERNEL_REPLY,
+        BUSX_MBOX_DEPTH,
+        if w == ALL { "PASS" } else { "FAIL" },
+        w,
+        ALL
+    );
 }
