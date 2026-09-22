@@ -1289,14 +1289,32 @@ fn art_end(b: usize, g: u32) {
 #[inline(always)]
 fn art_end(_b: usize, _g: u32) {}
 
-/// VUGART: rows of generation `g` that the surface does NOT currently hold — the whole of the
-/// coherence test, shared by the present-time scorer and the barrier-time one.
+/// VUGART: rows of generation `g` that the surface does NOT hold — the whole of the coherence test,
+/// shared by the present-time scorer and the barrier-time one, WITH THE ONE DIFFERENCE BETWEEN THEM.
+///
+/// `abandoned = false` (present time): a band is bad if it is stale OR still has a writer in it.
+/// After the barrier both are the same statement — nobody should be drawing and everybody should
+/// have drawn this generation — so the disjunction is the honest test.
+///
+/// `abandoned = true` (barrier-park time): a band is bad ONLY if it is stale AND HAS NO WRITER.
+/// MEASURED, not reasoned: the first cut used the disjunction here too, and the go-red capture
+/// (`vugart-logs/run5-gored.log`) came back `frames=1 coherent=0 torn_rows=216` — the FIRST frame,
+/// whose release was perfectly good, charged as mixed because under TCG the two workers had simply
+/// not finished inside `BARRIER_SPIN_YIELDS`. That is not the defect. A BUSY band is being drawn
+/// right now and the parent is about to wait for it; the surface being momentarily mid-raster is the
+/// ordinary condition of every unbuffered renderer and belongs to the compositor's own tearing
+/// question (rmbp-ledger A5, PTRPAINT/VUGPERF), not to this one. A band that is STALE WITH NOBODY IN
+/// IT is the discriminator: no writer is coming, so the surface has been LEFT this way, which is
+/// exactly a lost release and exactly what the eye sees as a crystal drawn from two rotations.
 #[cfg(target_arch = "x86_64")]
-fn art_bad_rows(g: u32) -> u32 {
+fn art_bad_rows(g: u32, abandoned: bool) -> u32 {
     let mut bad_rows = 0u32;
     let mut b = 0usize;
     while b < 3 {
-        if BAND_GEN[b].load(Ordering::Acquire) != g || BAND_BUSY[b].load(Ordering::Acquire) != 0 {
+        let stale = BAND_GEN[b].load(Ordering::Acquire) != g;
+        let busy = BAND_BUSY[b].load(Ordering::Acquire) != 0;
+        let bad = if abandoned { stale && !busy } else { stale || busy };
+        if bad {
             bad_rows += BAND_ROWS[b];
         }
         b += 1;
@@ -1327,7 +1345,7 @@ fn art_strand(g: u32, passes: u32) {
     if passes != BARRIER_SPIN_YIELDS + 1 {
         return;
     }
-    let bad = art_bad_rows(g);
+    let bad = art_bad_rows(g, true);
     if bad == 0 {
         return;
     }
@@ -1348,7 +1366,7 @@ fn art_score(g: u32) {
     if A_STRAND_GEN.load(Ordering::Relaxed) == g {
         return; // already charged to `mixed_frames` by `art_strand` — do not count the frame twice
     }
-    let bad_rows = art_bad_rows(g);
+    let bad_rows = art_bad_rows(g, false);
     let cl = A_CLASH.load(Ordering::Relaxed);
     let seen = A_CLASH_SEEN.swap(cl, Ordering::Relaxed);
     let n = A_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
