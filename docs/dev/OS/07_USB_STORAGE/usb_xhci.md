@@ -9469,6 +9469,98 @@ witnesses are `:: STORSLOT: claim slot=N ix=M devices=K ::` per device, two
 `:: USBREG: publish … ix=0 …` / `ix=1 …` lines with `disks=2`, and two `:: volid: mount` families with
 `/` still bound by content (`:: X86BIND: … by=content … -> PASS`).
 
+## 39. BTSCHED — the Bluetooth campaign is a post-GUI worker, not a step of the port walk (rmbp-ledger B137, 2026-09-22)
+
+### 39.1 The reading
+
+Flight 11 (2026-09-22, rMBP, image 3 at `56bbe53b`). The EHCI walk had the external keyboard and
+mouse armed early and then stopped dead for twenty-five seconds:
+
+```
+[   1743ms] :: EHCI-HID: [1] M2 armed keyboard addr=5 ep=IN1 mps=8 interval=10 (boot protocol) ::
+[   1769ms] :: EHCI-HID: [1] M2 armed boot-mouse addr=6 ep=IN1 mps=4 interval=10 (boot protocol) ::
+[   1812ms] :: bt-l2: [1] LE scan ENABLED …                     ← the campaign starts, INLINE
+[   3812ms] :: bt-l2: [1] LE repeat-scan summary — windows_run=4/4 … listened=1998ms(MEASURED) ::
+[   3815ms] :: bt-c1: [1] inquiry parameters — … inquiry_length=0x08(=10240ms) …
+[  14065ms] :: bt-c1: [1] BTRX-ROOM … responses=0 …
+[  14067ms] :: bt-c1: [1] page parameters — attempt=1/2 peer=88:c6:26:cc:2d:3c …
+[  19191ms] :: bt-c1: [1] PHASE-STEP — attempt=2/2 … delay_applied=1277ms …
+[  25593ms] :: bt-c1: [1] page summary — … page_timeout_each=5120ms … NOT REACHED …
+[  25593ms] :: bt-c1: [1] C1 tally — elapsed=21778ms … links_established=0 ::
+[  25622ms] :: EHCI-HID: [1] M1 hub-downstream device addr=8 …  ← the INTERNAL keyboard, at last
+[  25625ms] :: EHCI-HID: [1] M1 bcm5974 GET_REPORT(feature) addr=8 intf=1 …
+```
+
+`BPACE: ehci-hid-done t=25626ms d=25331ms` is the same span from the ledger's side. `xhci-settle`
+followed at 27043 ms and `[wc-x] menubar ENABLED` at 27616 ms. **The laptop's own keyboard and
+trackpad did not exist for twenty-five seconds, and the desktop for twenty-seven, because a radio
+was being asked about a bench speaker that was not in the room.**
+
+### 39.2 Why this is a PLACE defect and not a CONTENT defect
+
+Every number in that block is a bound the campaign is entitled to spend. `inquiry_length=0x08` is
+10240 ms by the Bluetooth Core spec's own unit; `page_timeout_each=5120ms` is the page timeout the
+controller was given; the four 500 ms LE windows are BT-L2's measured listen. Shortening any of
+them changes what the campaign can FIND, and that is BT-C1's subject, not this one's. What the
+campaign is *not* entitled to is spending those bounds before the machine has input and a desktop.
+
+So nothing about the chain's content moved. `bt_bringup_wire` runs the same commands, with the same
+bounds, printing every witness it has ever printed. Only its PLACE moved.
+
+### 39.3 The shape, and why no new mechanism was added
+
+`bt_retrigger` (§33-adjacent, the BT-RETRY hatch) already runs the identical chain from
+`service_ehci_hid` — the main-loop service hook — through a latch that a keyboard chord sets and the
+service pass drains under the `EHCI_HID` lock. That is a post-GUI worker in everything but name, and
+`bootpace.rs` states the ordering that makes it one:
+
+> on a GUI build the handoff happens BEFORE the service loop that runs enumeration/storage/FTDI
+> starts at all, so every main-loop tag necessarily lands after `gui`
+
+BTSCHED therefore adds a *second latch of the same kind*, drained in the same place, under the same
+lock, one statement earlier in the same block:
+
+| | before | after |
+|---|---|---|
+| `bt_probe`'s last act | `self.bt_bringup_wire(t, intf, &e)` — blocks the walk | `bt_defer_boot_campaign(self.idx, t.addr)` — latch and return |
+| who runs the chain | the boot core, inside the enumeration walk | `bt_drain_boot_campaign`, from `service_ehci_hid` |
+| how the event endpoint is obtained | the `BtEvtEp` the probe just armed | `bt_evt_ep_current` reconstructs it — the QH is spliced once and REUSED, never re-armed, exactly as the re-trigger does |
+| chain content | `bt_bringup_wire` | `bt_bringup_wire`, unchanged |
+
+### 39.4 The witnesses, and why the `gui` stamp is quoted rather than obeyed
+
+```
+:: bt-sched: campaign deferred past gui at <ms> ms ::
+:: bt-sched: campaign start at <ms> ms (gui at <ms>) ::
+```
+
+The drain does **not** gate on the `gui` stamp. On a GUI build the gate would be redundant — the
+service loop cannot run before the handoff — and on a `usbdebug` build, which reaches the same
+service loop and records `gui=none` by design, it would strand the campaign forever: a feature that
+silently stops running on one lane while every gate stays green. The stamp is printed instead, so a
+reader can subtract the two numbers and see the ordering. A line that only said "started" would read
+the same on the broken ordering this arc exists to end.
+
+### 39.5 What QEMU can and cannot gate
+
+QEMU models no Broadcom radio, so `bt_probe` claims nothing and the campaign declines there exactly
+as it did before — the run proves that the boot path still enumerates, that the new code compiles
+into the armed image (`LC_ALL=C grep -a -o -F ':: bt-sched:'` on the built kernel), and nothing
+more. **The falsifier is one metal sitting**, and it is three lines: `BPACE: ehci-hid-done d=` must
+fall from 25331 ms to the low hundreds; `EHCI-HID: [1] M2 armed keyboard addr=8` must land BEFORE
+`[wc-x] menubar ENABLED` instead of two seconds after it; and `:: bt-sched: campaign start …` must
+show a start after the `gui` stamp it quotes. Until that sitting, this section describes a fix that
+has been measured only by reading.
+
+### 39.6 Byte-identity
+
+Every item is `#[cfg(feature = "bt")]` and lives at the FOOT of `drivers/ehci/mod.rs`, after
+`service_ehci_hid`, so a knob-off build erases the token stream and — because appending at
+end-of-file cannot shift a line above it — no existing `panic::Location` moves. The two in-file
+edits (the deferral in `bt_probe`, the drain call in `service_ehci_hid`) are SAME-LINE folds for the
+same reason. `./arroyo knoboff bt` and `./arroyo knoboff btc` are the measurement.
+
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10), the EHCI-1/2 scout + shared wake (§9/§9a), and the ISRARM completion interrupt (§33).
