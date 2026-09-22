@@ -112,9 +112,10 @@ strings unaos/target/x86_64_esp/kernel.elf | grep -c 'BPACE'      # must be >= 1
 | `smp` | after `smp::start_aps` (x86) | AP bring-up + the post-bring-up smoke test |
 | `sched` | after the step-4d scheduler block (x86) | `sched::init` + `enable` + the CLOCK-X1 witness **sample** (the verdict is deferred to the first service pass — §8e) (+ the `witness` ring-3 fixtures, when built) |
 | `pci-enter` | first statement of `arch::pci::init` (x86) | step 4e — `apic::report_tick_rate`, a 50 ms PM-timer window |
-| `ehci-hid` | before `drivers::ehci::init` | the knob-gated VPERF / EHCI-scout / SMC probes (all absent by default ⇒ ~0) |
+| `ehci-hid` | before `drivers::ehci::init` | the knob-gated VPERF probes and the EHCI-1/EHCI-2 scouts (all absent by default ⇒ ~0). **NOT the SMC probe** — BOOTWAITS corrected that: BATMON-1 sits AFTER `ehci-hid-done`, so its cost lands in `pci-probes` (flight 11 put `:: SMC-SCOUT: begin ::` at 25626 ms and `end` at 25730 ms, both inside the `pci-scan` window, not this one) |
 | `ehci-hid-done` | after `drivers::ehci::init` | the whole EHCI-3 HID bring-up: 256-bus config walk, wake, port reset, EP0 enumeration — subdivided by the EPACE lines (below), not by more ring stamps |
-| `pci-scan` | after `PciScanner::scan()` | the xHCI bus scan (config-space reads only) |
+| `pci-probes` | before `PciScanner::scan()` (BOOTWAITS) | the knob-gated passenger blocks between `ehci-hid-done` and the walk — SMC-SCOUT, PCI-CENSUS, BCMA-RECON. `0ms` on every default build; flight 11 spent 104 ms here on `UNAOS_SMC=1` alone |
+| `pci-scan` | after `PciScanner::scan()` | the xHCI bus scan (config-space reads only). **Since BOOTWAITS this is the walk and nothing else.** It was not before: `d=` is the delta from the PREVIOUS stamp, so until `pci-probes` was added above, this tag carried every passenger hooked in below `ehci-hid-done` — flight 11 read `d=1315ms` of which ~1 ms was the walk (see §6b) |
 | `portsw` | after the PORTSW-1 flip | `probe_irq_caps` + `enable_bus_master` + the XUSB2PR/USB3_PSSEN routing writes |
 | `xhci-handoff` | after `bios_handoff` | the BIOS→OS USBLEGSUP handshake (budget-bounded; a no-op on QEMU) |
 | `xhci-halt` | after the `USBSTS.HCH=1` wait | stopping a controller the firmware left running |
@@ -280,6 +281,73 @@ port took 2.8 s to enumerate, which is far more than the debounce plus reset
 recovery accounts for. That is a per-port question (`xHCI:` lines around the
 `=== Enumerating Port 2 ===` marker), not a settle question, and M4 does not
 chase it.
+
+### 6b. Why `pci-scan d=1315ms` was never a PCI measurement (BOOTWAITS, flight 11)
+
+§6a's lesson is that a BPACE tag names the stamp, not the work. `pci-scan` is
+the same lesson on the other side of the boot, and it went further: §6a's tag
+over-reported a wait it *did* own, while this one reported work belonging to
+two other subsystems entirely.
+
+Flight 11 stamped `:: BPACE: pci-scan t=26941ms d=1315ms ::`. `d=` is the delta
+from the previous stamp — `ehci-hid-done` at 25626 ms — so the window is
+everything between the end of EHCI HID bring-up and the end of the xHCI bus
+scan. Read off the wire with `awk`, that window is:
+
+| span | ms | what | default? |
+|---|---|---|---|
+| 25626 → 25730 | **104** | `:: SMC-SCOUT: begin ::` → `end (present=Y probed=19 found=17)`, a 493-key index walk | no — `UNAOS_SMC=1` |
+| 25731 → 26941 | **1210** | `[hda] census bdf=...` → `[hda] audit stage=end`, dominated by `:: HDA-TONE: ... run_ms=1200 ... -> FAIL ::` | no — `UNAOS_HDA=1` |
+| 26941 → 26941 | **~1** | `PCI: Commencing motherboard scan...` → `[PCI] FOUND XHCI CONTROLLER ... (bus 0 dev 20 fn 0)` | **yes — this is the tag's own work** |
+
+**1314 of the 1315 ms belongs to two default-OFF bench knobs.** The walk the
+tag is named for is about one millisecond, because `enumerate_buses` returns on
+the first class match and the xHCI is at 0:20.0 — it never reaches bus 1. Even
+the *exhaustive* version is cheap: §10o's full census, every bus, every slot,
+MF-gated, reports `[PCI-CENSUS] done: devices=20 functions=27 printed=27
+truncated=0 net-class=0x02:2 (caps dumped 2) elapsed=6ms`. **Six milliseconds**
+for the whole config space of this machine. §5's own regression table already
+said so — boot 8 read `pci-scan` at 9 ms.
+
+So there is no PCI walk to optimise. The walks are already header-type-aware in
+all four copies (PCI 3.0 §6.2.5: the multi-function bit is read from function 0
+and functions 1–7 are probed only when it is set), and a bus-number limit from
+bridge subordinate registers (§7.5) could save at most the 6 ms the census
+measures. **The finding was the attribution, not the arithmetic.**
+
+**Two mechanisms put the time there, and both are fixed.**
+
+1. **HDA was hooked inside the walk.** B127 appended `hda::probe()` to the first
+   statement of `PciScanner::enumerate_buses`, and said so in its own comment:
+   "armed, this charges HDA bring-up to the `pci-scan` BPACE delta… The
+   placement a future fold should prefer is the AHCI-shaped append at
+   `arch/x86_64/pci.rs:1048`, which sits outside every pacing accumulator; that
+   file is not in this arc's brief and was therefore not touched." BOOTWAITS had
+   that file and made the move. HDA now rides beside AHCI, after the GPU
+   dispatch and the SDHC probe, outside every accumulator.
+
+2. **The window had no lower edge.** `pci-scan` is stamped after the walk, so
+   `d=` reached back past three more knob-gated passengers to `ehci-hid-done`.
+   A new **`pci-probes`** stamp, immediately before `PciScanner::scan()`, closes
+   it: SMC-SCOUT, PCI-CENSUS and BCMA-RECON are now `pci-probes`, and `pci-scan`
+   is the walk. The stamp is unconditional on purpose — a knob-gated stamp would
+   make the tag mean different things on different builds, which is the failure
+   being fixed. It costs one ring slot; flight 11 ran `n=28` of `CAP=64`.
+
+**The general rule this arc earns.** A tag whose `d=` opens at the *previous*
+stamp is a collection point for anything later folds hook in above it, and the
+hook is always a one-line append that reads as harmless at the call site. Two
+independent arcs (B127's audio knob, BATMON-1's SMC scout) landed in this one
+window without either noticing. **Where a passenger block sits between two
+stamps, give it its own stamp or its own `elapsed=`.** PCI-CENSUS and
+BCMA-RECON already self-report `elapsed=`, which is why they were legible here
+at all; SMC and HDA did not, and were not.
+
+**What flight 12 should show.** `pci-probes d=` carrying whatever knobs are
+armed (0 ms on a default build, ~104 ms with `UNAOS_SMC=1`), and `pci-scan d=`
+in the **single-digit milliseconds on every build**, armed or not. A `pci-scan`
+above about 20 ms after this would mean a new passenger has been hooked into the
+walk again, and that is now a one-line diagnosis instead of a three-hour one.
 
 ## 7. What BPACE is not
 
