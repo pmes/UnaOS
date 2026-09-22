@@ -162,6 +162,29 @@ FORBID :: MENUDROP: .* :: FAIL ::
 # not move with the item present or absent. Pinned by the seat at the fold in the MENUDROP shape; measured by the next gate.
 REQUIRE :: MENUBATT: .* decode_ok=true gone_red=true absent_ok=true layout_ok=true .* :: PASS ::
 FORBID :: MENUBATT: .* :: FAIL ::
+# --- MENUFIRST (rmbp-ledger B156) — the bar's FIRST PAINT, and the number the arc was sent to find.
+# The brief's 5051 ms gap does not exist: `[menubar] live` is a ~5 s ROLLUP and `compose` ticks it ABOVE
+# the damage test and the paint, so flight 11's `paints=0`@27616ms and `paints=1`@32667ms are one pass and
+# ONE paint (`paint=1130360cyc/419us` reads identically at 32667, 37866 and 43053 ms, where the ledger
+# accumulates). Metal measured `after_enable_ms=1`; this gate measures `after_enable_ms=1` on its own edge.
+# THREE fields BITE and none of them is `.*`. `bounded=true` is the claim — `after_enable_ms <= bound_ms`,
+# two composite frames. `gone_red=true` is its CONTROL: leg 4 pushes the edge back by the brief's OWN
+# 5051 ms (`RED_INJECT_MS`, self-calibrated into cycles through the same `strip::cycles_to_us` the reading
+# uses) and requires the bound to answer false — without it `bounded=true` would pass on a predicate that
+# ignored its argument, and with it a green run is also the standing statement that the recorder WOULD have
+# caught that gap had it been real. And `crystal=drawn` is Peter's own word from flight 11 ("shows a broken
+# crystal"), which the draw path answers is a COMPLETE gem on an EMPTY bar — `crystal_facet` reads only
+# `const` inks and `const` geometry, so the mark cannot be half-drawn by timing.
+# `unstamped`/`stamped`/`painted`/`recorded` are named for the standing reason this file gives at DMGOVLP:
+# a later edit that drops one reds this rule instead of silently narrowing what it asserts.
+REQUIRE :: MENUFIRST: after_enable_ms=\d+ bound_ms=\d+ model=[a-z:+]+ crystal=drawn .* unstamped=true stamped=true painted=true recorded=true bounded=true gone_red=true :: PASS ::
+FORBID :: MENUFIRST: .* :: FAIL ::
+# --- and the WITNESS itself, which is the line a metal capture is actually read for — emitted from the
+# paint site, once per boot. `model=` is pinned as a shape and not as a value on purpose: what it names is
+# the state of the MACHINE at the seam (`partial:caption+clock` on this gate, `partial:caption+batt` on
+# flight 11's metal), and a spec that demanded `complete` would be gating on the two rows B156's STOP hands
+# to `wm.rs` and `video/status.rs`. What is pinned is that the bar SAYS which, and that the gem was drawn.
+REQUIRE \[menubar\] first-paint at=\d+ after_enable_ms=\d+ model=[a-z:+]+ crystal=drawn rect=\d+x\d+\+\d+\+\d+
 # --- A SKIP is `wm::create` declining, or the bar never publishing the caption inside 250 ms. On
 # --- this gate (QEMU 1280x800, one 8x8 fixture row) neither is honest — same rule as DMGOVLP and
 # --- STRIPVAC above — so a SKIP means the fixture lost its panel or its window table.

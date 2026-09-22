@@ -741,6 +741,14 @@ pub fn set_enabled(on: bool) -> bool {
     );
     if was != on {
         TOGGLES.fetch_add(1, Ordering::Relaxed);
+        // MENUFIRST — stamp the FIRST off→on edge, so `after_enable_ms` is a measurement and not the
+        // seam's opinion of its own control flow. `compare_exchange` on the never-written state: only
+        // the first edge wins, so the fixture's four later toggles cannot rewrite the shell's. One
+        // counter read; see [`ENABLED_AT_CYC`] for why it is cycles and not ms.
+        if on {
+            let now = crate::arch::now_cycles();
+            let _ = ENABLED_AT_CYC.compare_exchange(CYC_NONE, now, Ordering::AcqRel, Ordering::Relaxed);
+        }
         // CRYSTAL — turning the bar OFF must tear down the SHARD menu, or its dropdown would outlive
         // the crystal it hangs from with nothing left on the bar to dismiss it. Turning the bar ON
         // does not open it; a menu is opened by a press, never by a toggle.
@@ -1152,6 +1160,11 @@ pub fn compose() -> bool {
     }
     LEDGER.paint(crate::arch::now_cycles().saturating_sub(t1), (r.2 * r.3) as u64);
     SLOT.store(sig, Some(r));
+    // MENUFIRST — the FIRST paint, once per boot, read off the paint that just landed. Sited AFTER
+    // `SLOT.store` so the line can never describe a paint `strip::paint` declined (the `return false`
+    // two statements up is the decline arm, and it is above this). One-shot inside the witness.
+    #[cfg(feature = "witness")]
+    firstpaint_witness(&model, r);
     true
 }
 
@@ -1291,6 +1304,264 @@ fn battery_witness() {
             serial_println!("[menubar] battery absent src={}", src.as_str());
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// MENUFIRST — the bar's FIRST PAINT, on the wire
+// ---------------------------------------------------------------------------
+
+/// MENUFIRST — the CYCLE stamp of the first off→on edge, or [`CYC_NONE`] while the bar has never
+/// been on.
+///
+/// Cycles and not milliseconds, and that is forced rather than preferred: [`crate::clock`]'s
+/// `logts_now` — the obvious source, since it is what stamps the `[ NNNNNms]` line prefix — is
+/// `#[cfg(feature = "logts")]`, and the x86 `wc` gate builds without `logts`. Reaching for it put an
+/// `E0425` in front of this arc's first gate run. `arch::now_cycles()` is what this file already
+/// times its ledger with, [`strip::cycles_to_us`] is `pub` and is the SAME conversion the strip's own
+/// `age_ms=` term uses, and neither takes a lock — which also makes this strictly better than
+/// `logts_now` on a path that runs masked at the composite tail, since that function's civil half
+/// does a `try_lock` this reading has no use for.
+///
+/// Latched by `compare_exchange` on the never-written state, so the FIXTURE's toggles (legs 3-4 and
+/// [`battery_selftest`] — five on flight 11's wire, `toggles=5`) cannot rewrite the shell's edge, and
+/// re-armable for the fixture alone through [`firstpaint_rearm`].
+static ENABLED_AT_CYC: AtomicU64 = AtomicU64::new(CYC_NONE);
+
+/// MENUFIRST — "the bar has never been enabled". `u64::MAX` rather than `0`, because a counter
+/// reading of `0` is reachable at the very first tick and a sentinel a real measurement can collide
+/// with is not a sentinel; `u64::MAX` cycles is not reachable on any machine this boots on.
+const CYC_NONE: u64 = u64::MAX;
+
+/// MENUFIRST — **the SPEAK one-shot: one line per boot (SO30), and NOTHING EVER RESETS IT.**
+///
+/// It is deliberately not part of what [`firstpaint_rearm`] takes and [`firstpaint_restore`] puts
+/// back. The fixture re-arms the RECORDER so it can measure an edge of its own; if it could re-arm
+/// this too, a later genuine composite would print a second `[menubar] first-paint` — and on the
+/// board where that matters (metal, where the shell's seam spoke twenty seconds earlier) the second
+/// line would carry the fixture's synthetic numbers under the boot's name. Keeping the speak latch
+/// out of the fixture's reach is what makes "once per boot" true by construction instead of by the
+/// fixture remembering to restore it.
+static FIRSTPAINT_SAID: AtomicBool = AtomicBool::new(false);
+
+/// MENUFIRST — the reading the witness published, for the fixture to read BACK rather than recompute:
+/// `after_enable_ms` in the low 32 bits, the completeness mask in bits 32-34, `crystal=drawn` in bit
+/// 35, and bit 63 set once anything has been recorded. Reading it back is what stops the fixture's
+/// bound leg re-deriving the very claim it exists to check.
+static FIRSTPAINT_READING: AtomicU64 = AtomicU64::new(0);
+
+/// MENUFIRST — bit 63 of [`FIRSTPAINT_READING`]: "a first paint has been recorded this boot".
+const FP_VALID: u64 = 1 << 63;
+
+/// MENUFIRST — **one composite pass, in ms**: the bound the fixture holds `after_enable_ms` to.
+///
+/// `16_667` is the frame the compositor paces against, and it is on the wire on every `[strip]
+/// rollup` line of flight 11 as `frame_us=16667`. The bound is TWO of them, not one: the pass the
+/// enable lands in and the pass that paints it — `desktop_uefi::activate` calls `wm::composite()` on
+/// the line after `set_enabled(true)`, so one frame of slack is structural and a third would be the
+/// bar being late. **33 ms**, by integer division — `2 * 16_667 / 1000` truncates 33.334 to 33, and
+/// the truncation is in the SAFE direction (a tighter bound cannot hide a late paint). Flight 11
+/// spent **1** of them (`[27616ms] menubar ENABLED` → `[27617ms] [strip] rollup tenant=menubar …
+/// paints=1`).
+///
+/// ⚠ The `16_667` is a THIRD copy of `wcg`'s original (`strip.rs` already carries the second, with
+/// the same note): both are private to their modules, so this is a restatement, not a re-derivation,
+/// and it is only ever compared against — it paces nothing.
+const ONE_COMPOSITE_MS: u64 = 2 * 16_667 / 1000;
+
+/// MENUFIRST — **the go-red's injected lateness, and it is the brief's own number.**
+///
+/// 5051 ms is the gap this arc was sent to close, read off two `[menubar] live` rollups — 27616 ms
+/// `paints=0` and 32667 ms `paints=1` — that are the SAME PAINT reported twice on the ledger's ~5 s
+/// cadence. It is named here rather than typed into [`firstpaint_selftest`] so the fixture's
+/// injection and this explanation cannot drift apart.
+#[cfg(feature = "witness")]
+const RED_INJECT_MS: u64 = 5051;
+
+/// MENUFIRST — a boot-time reading in ms, or `?` when the counter has no origin yet.
+///
+/// The `?` is [`crate::logts`]'s own discipline, imported deliberately: a boot with no trustworthy
+/// counter must not be made indistinguishable from an instantaneous one by a fabricated `0`.
+struct Ms(Option<u64>);
+
+impl core::fmt::Display for Ms {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(v) => write!(f, "{}", v),
+            None => write!(f, "?"),
+        }
+    }
+}
+
+/// MENUFIRST — **ms since the `entry` stamp**, or `None` before that stamp exists.
+///
+/// The origin is [`crate::bootpace::origin_cycles`], which is the SAME origin `logts` subtracts for
+/// the `[ NNNNNms]` line prefix — its doc comment states the rule this obeys: *an out-of-module
+/// timestamp must subtract the LEDGER's origin, not invent its own*, because the raw x86 TSC counts
+/// from processor RESET and an unsubtracted reading disagrees with every BPACE/GPACE `t=` by the
+/// firmware duration. So on any build that carries `logts` — which is every flown image — `at=` is
+/// directly comparable to the prefix on its own line, and on the `logts`-less gate it is still the
+/// same origin every other pace figure uses.
+///
+/// `origin == 0` is "no `entry` stamp yet", and it answers `None` rather than `0` for the reason
+/// [`Ms`] states. Lock-free: one counter read, one relaxed load, one multiply.
+#[inline]
+fn now_ms() -> Option<u64> {
+    let origin = crate::bootpace::origin_cycles();
+    if origin == 0 {
+        return None; // no `entry` stamp — "since entry" does not exist to measure
+    }
+    Some(strip::cycles_to_us(crate::arch::now_cycles().saturating_sub(origin)) / 1000)
+}
+
+/// MENUFIRST — **is the model COMPLETE, and if not, what is missing?**
+///
+/// Returns `(mask, what)`, one bit per element the bar draws from a source that can be UN-ASKED at
+/// the enable seam, named in draw order. `0` is `complete`.
+///
+/// ⛔ **The crystal is not in this mask, and that is the finding.** [`crystal_facet`] and
+/// [`crystal_half`] read nothing but `const` geometry and three `const` inks (`theme.rs:198,201,204`
+/// — `CONTROL_CLOSE`/`CONTROL_MID`/`CONTROL_ZOOM` are `pub const u32`), and `ceramic::shade` is a
+/// `spin::Once` table generated on first use. There is no theme, face or kit the mark waits on, so
+/// the mark cannot be half-drawn by TIMING: at the enable seam it is the same 16x22 gem it is at
+/// minute ten. What flight 11 put on the glass was a COMPLETE crystal on an EMPTY bar, and the three
+/// bits below are the emptiness.
+///
+/// * **caption** — `cap_owner == WIN_NONE`: no focused visible row, so no app name and no app menu.
+///   Flight 11 at the seam: `[27616ms] [menubar] menus cap_owner=0 cap= menu_owner=0 boxes=0
+///   items=none`. The row that would have filled it was `/STAT.ELF`, 15.5 s away behind `[43069ms]
+///   [wc-x] desktop-app HOLD-EXPIRED reason=dmg-refuse-unsettled … waited=15005ms`.
+/// * **clock** — [`clock_hhmm`] answered `None`: the civil clock has never been anchored, or was
+///   contended. Either way the bar draws no clock this pass.
+/// * **batt** — `status::source() == Unresolved`, which [`battery_witness`] states in words as
+///   *"nothing has asked yet"*. This is NOT "this board has no battery": flight 11 emitted no
+///   `[menubar] battery` line in 2.2 MB of wire, so on an rmbp WITH a pack the source never resolved
+///   all boot and the item was absent for a reason nothing on the glass could distinguish from
+///   "absent by design".
+fn model_terms(m: &Model) -> (u64, &'static str) {
+    let mut mask = 0u64;
+    if m.cap_owner == wm::WIN_NONE {
+        mask |= 1;
+    }
+    if m.clock.is_none() {
+        mask |= 2;
+    }
+    if super::status::source() == super::status::Source::Unresolved {
+        mask |= 4;
+    }
+    let what = match mask {
+        0 => "",
+        1 => "caption",
+        2 => "clock",
+        3 => "caption+clock",
+        4 => "batt",
+        5 => "caption+batt",
+        6 => "clock+batt",
+        _ => "caption+clock+batt",
+    };
+    (mask, what)
+}
+
+/// MENUFIRST — **the bar's first paint, once per boot, with what was in the model when it landed.**
+///
+/// Peter, flight 11: *"startup is still slow and shows a broken crystal"*. The capture answers half
+/// of that on its own, and the half it answers is the half that was read backwards — so this line
+/// exists to make the OTHER half readable without 2.2 MB of wire and a cycle count.
+///
+/// **There is no 5051 ms first-paint gap.** `[menubar] live` is a ROLLUP on a ~5 s cadence, and
+/// [`compose`] emits it through `LEDGER.tick` ABOVE the damage test and the paint below it — so the
+/// `paints=0` at 27616 ms and the `paints=1` at 32667 ms are the same single paint reported twice.
+/// The capture settles it arithmetically: that paint reads `paint=1130360cyc/419us px/paint=97920`
+/// at 32667 ms, at 37866 ms and again at 43053 ms — three reports, identical to the cycle, where a
+/// second paint would have added to the total. The bar's first paint landed at 27617 ms, **1 ms
+/// after the enable**, and the strip says the same on its own line: `[27617ms] [strip] rollup
+/// tenant=menubar … paints=1 paint_px=97920 … -> CLEAN` (97920 = 2880 x 34 — the whole band).
+///
+/// So `after_enable_ms` is the number that was missing, and it is not the one that was looked for.
+/// What was wrong on flight 11 is `model=`: the band that stood on the glass from 27617 ms to
+/// 43364 ms — 15746 ms, and the strip states that too (`emit=2 age_ms=15746`) — was the bar's face,
+/// its one keyline and the crystal, and NOTHING ELSE. No caption, no menu titles, no battery item.
+/// A 2880-px grey strip with a single 16x22 gem at `x=12`, held for a quarter of a minute because
+/// nothing in the model changed and so nothing owed a repaint.
+///
+/// Emitted from the PAINT SITE and not from the seam, because `[wc-x] menubar PAINTED` is the
+/// shell's claim about its own control flow, and this is the bar's reading of what it drew.
+#[cfg(feature = "witness")]
+fn firstpaint_witness(m: &Model, r: strip::Rect) {
+    // The RECORDER's one-shot is the reading's own valid bit, not the speak latch: one relaxed-ordered
+    // load on a path that runs a handful of times per boot (`paints=3` on flight 11's fixture line),
+    // and it keeps the measurement and the line independently one-shot. Everything below — the clock
+    // read, the model reduction, the store — is paid once.
+    if FIRSTPAINT_READING.load(Ordering::Acquire) & FP_VALID != 0 {
+        return;
+    }
+    let at = now_ms();
+    let enabled_at = ENABLED_AT_CYC.load(Ordering::Acquire);
+    // The INTERVAL is measured in the counter directly rather than as a difference of two `at=`
+    // readings: `at=` is truncated to whole ms, so subtracting two of them would quantise a
+    // sub-millisecond first paint to `0` or `1` depending on where the truncation fell. Flight 11's
+    // enable→paint was 1 ms of wall time and this is the arithmetic that can say so.
+    let after = if enabled_at == CYC_NONE {
+        None
+    } else {
+        Some(strip::cycles_to_us(crate::arch::now_cycles().saturating_sub(enabled_at)) / 1000)
+    };
+    let (mask, what) = model_terms(m);
+    // The mark is DRAWN iff its box fits the rect the painter was handed — the same two bounds
+    // `compose_row`'s crystal block is clipped by (`j < cy0 + CRYSTAL_H`, `i < w`), read off the rect
+    // rather than restated, so the witness cannot claim a gem the painter clipped away.
+    let crystal = r.3 >= CRYSTAL_H && crystal_offset(r.3).0 + CRYSTAL_W <= r.2;
+    FIRSTPAINT_READING.store(
+        FP_VALID
+            | (mask << 32)
+            | ((crystal as u64) << 35)
+            | after.unwrap_or(u32::MAX as u64).min(u32::MAX as u64),
+        Ordering::Release,
+    );
+    // SPEAK iff nothing has spoken this boot — see [`FIRSTPAINT_SAID`], which the fixture cannot
+    // re-arm. The reading above is stored FIRST and unconditionally, because the fixture's go-red
+    // exists to be read back; what it must never do is put a second line on the wire carrying a
+    // deliberately-wrong number, which would read exactly like the defect it is proving the fixture
+    // can see. On metal the shell's seam has already spoken and the fixture is silent; on QEMU
+    // `desktop_uefi::activate` never runs (no Kepler — `x86-wc.spec`'s own SCOPE note), so the
+    // fixture's driven pass IS that boot's first paint and it speaks. One rule, both boards.
+    if FIRSTPAINT_SAID.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    serial_println!(
+        "[menubar] first-paint at={} after_enable_ms={} model={}{} crystal={} rect={}x{}+{}+{}",
+        Ms(at),
+        Ms(after),
+        if mask == 0 { "complete" } else { "partial:" },
+        what,
+        if crystal { "drawn" } else { "absent" },
+        r.2, r.3, r.0, r.1
+    );
+}
+
+/// MENUFIRST — the fixture's re-arm. **Witness builds only, and [`firstpaint_selftest`] is its one
+/// caller.**
+///
+/// Legs 3-4 of [`selftest`] and [`battery_selftest`] toggle the bar, so a fixture that wants to
+/// MEASURE an enable→paint edge must be able to take one of its own without the shell's edge being
+/// the thing it measures. Returns the previous `(enabled_at, reading)` so the fixture can put the
+/// boot's real numbers back: a fixture that left its own synthetic edge latched would make every
+/// later reader of this witness read the fixture instead of the boot.
+///
+/// ⛔ **The SPEAK latch is NOT in here.** See [`FIRSTPAINT_SAID`] — re-arming it is the one thing
+/// that could put a second line on the wire, so the fixture is not given the ability.
+#[cfg(feature = "witness")]
+fn firstpaint_rearm() -> (u64, u64) {
+    (
+        ENABLED_AT_CYC.swap(CYC_NONE, Ordering::AcqRel),
+        FIRSTPAINT_READING.swap(0, Ordering::AcqRel),
+    )
+}
+
+/// MENUFIRST — put back what [`firstpaint_rearm`] took, so the fixture's edge does not outlive it.
+#[cfg(feature = "witness")]
+fn firstpaint_restore(prev: (u64, u64)) {
+    ENABLED_AT_CYC.store(prev.0, Ordering::Release);
+    FIRSTPAINT_READING.store(prev.1, Ordering::Release);
 }
 
 /// The crystal's box-relative top-left in the bar: **one [`strip::PAD`] from the left**, centred
@@ -1964,6 +2235,12 @@ pub fn selftest() {
     // `:: MENUBAR:` would have made a decode defect read as a geometry failure.
     battery_selftest(pw, ph);
 
+    // MENUFIRST — the enable→first-paint edge, AFTER the battery fixture and for the same two
+    // reasons it is after the census legs: it drives `compose` (so it must not perturb a leg that
+    // reads the model), and its claim — *the first paint lands inside one composite pass of the
+    // enable* — deserves its own verdict line rather than a term folded into `:: MENUBAR:`.
+    firstpaint_selftest(pw, ph);
+
     rollup("selftest");
 }
 
@@ -2108,6 +2385,134 @@ pub fn battery_selftest(pw: usize, ph: usize) {
         red_pct,
         decode_ok, gone_red, absent_ok, layout_ok, seat_ok,
         jitter_paint, change_paint, damage_ok,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// MENUFIRST fixture — **the bar's first paint lands inside ONE COMPOSITE PASS of the enable, it is
+/// RECORDED, and the recorder can say a late one is late.**
+///
+/// Four legs, and the fourth is what makes the first three worth reading.
+///
+/// 1. **the EDGE is stamped by the enable, not by the paint** — [`ENABLED_AT_CYC`] is `CYC_NONE` with
+///    the bar off and a real reading after `set_enabled(true)`. Without this the bound below would be
+///    measuring a number the paint site wrote about itself.
+/// 2. **a paint lands, and the recorder holds it** — `compose()` returns `true` (it is the composite
+///    that says whether it painted, so the claim is read off the pass rather than inferred) and
+///    [`FIRSTPAINT_READING`] carries [`FP_VALID`]. The retries the positive control is given are
+///    [`battery_selftest`]'s leg 6 rule: a pass can decline for a contended panel or a busy winmenu
+///    registry, which has nothing to do with damage.
+/// 3. **the BOUND** — `after_enable_ms <= `[`ONE_COMPOSITE_MS`]. This is the brief's number, and on
+///    flight 11 the boot itself already met it at 1 ms; the leg exists so a future seam that defers
+///    the enable-seam composite (the `[wc-x] menubar PAINTED` line is the shell's CLAIM, and the
+///    x86 seam does not read `owns_pixels()` back the way `desktop_firmware`'s twin does) is caught
+///    here instead of on a flight.
+/// 4. ⛔ **the GO-RED, through the same recorder and the same predicate** — the edge is pushed back
+///    by **5051 ms**, which is not an arbitrary number: it is the exact gap the brief read off two
+///    `[menubar] live` rollups (27616 ms `paints=0`, 32667 ms `paints=1`) that are the SAME PAINT
+///    reported twice on the ledger's ~5 s cadence. A bar whose first paint really had landed 5051 ms
+///    after its enable is the defect; this leg manufactures it and requires the bound to answer
+///    `false`. Without it leg 3 would pass on a test that ignored its argument — and, since the
+///    number it injects is the one the arc was sent to chase, a green leg 4 is also the standing
+///    statement that the recorder would have caught that gap if it had been real.
+///
+/// The injection RECORDS but does not SPEAK: [`FIRSTPAINT_SAID`] is the speak latch and the
+/// fixture is deliberately not given the ability to re-arm it, so the second and later paints this
+/// function drives are silent whatever order they run in. Everything the fixture DOES touch — the
+/// edge, the reading and the enable flag — is put back, so the boot's own `[menubar] first-paint`
+/// line is the one a capture reads and this fixture is invisible in it.
+#[cfg(feature = "witness")]
+pub fn firstpaint_selftest(pw: usize, ph: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let saved_en = enabled();
+    let rect = geometry(pw, ph);
+
+    // Leg 1 — the edge. Taken on the fixture's OWN off→on transition, with the recorder re-armed so
+    // the stamp under test is this one and not a shell seam that ran twenty seconds ago.
+    let prev = firstpaint_rearm();
+    set_enabled(false);
+    let _ = compose(); // discharge the vacate, so the slot is clear and the next enable owes a paint
+    let unstamped = ENABLED_AT_CYC.load(Ordering::Acquire) == CYC_NONE;
+    set_enabled(true);
+    let stamped = ENABLED_AT_CYC.load(Ordering::Acquire) != CYC_NONE;
+
+    // Leg 2 — the paint, read off the composite's own return value.
+    let mut painted = false;
+    for _ in 0..4 {
+        if compose() {
+            painted = true;
+            break;
+        }
+    }
+    let reading = FIRSTPAINT_READING.load(Ordering::Acquire);
+    let recorded = reading & FP_VALID != 0;
+    let after = reading & 0xFFFF_FFFF;
+    let mask = (reading >> 32) & 0x7;
+    let crystal = (reading >> 35) & 1 == 1;
+
+    // Leg 3 — the bound.
+    let bounded = recorded && after <= ONE_COMPOSITE_MS;
+
+    // Leg 4 — ⛔ the GO-RED. Same recorder, same predicate, the edge pushed back by the 5051 ms the
+    // rollup cadence looked like. The toggle is what makes the next `compose` owe a paint: turning
+    // the bar off clears the slot, so the pass after the re-enable has no stored signature to match.
+    let _ = firstpaint_rearm();
+    set_enabled(false);
+    let _ = compose();
+    set_enabled(true);
+    let real_edge = ENABLED_AT_CYC.load(Ordering::Acquire);
+    // 5051 ms expressed in CYCLES, self-calibrated through the SAME `strip::cycles_to_us` the reading
+    // is taken with — so the injection is stated in the units the bound is stated in rather than in a
+    // guessed TSC rate, and it stays 5051 ms on a machine of any clock. `probe_us.max(1)` is the
+    // uncalibrated-counter guard `cycles_to_us` itself carries; the product below is ~5.3e12 at a
+    // 1 GHz-scale rate and cannot overflow `u64`.
+    let probe_cyc: u64 = 1 << 20;
+    let probe_us = strip::cycles_to_us(probe_cyc).max(1);
+    let inject_cyc = (RED_INJECT_MS * 1000).saturating_mul(probe_cyc) / probe_us;
+    ENABLED_AT_CYC.store(real_edge.saturating_sub(inject_cyc), Ordering::Release);
+    let mut red_painted = false;
+    for _ in 0..4 {
+        if compose() {
+            red_painted = true;
+            break;
+        }
+    }
+    let red_reading = FIRSTPAINT_READING.load(Ordering::Acquire);
+    let red_after = red_reading & 0xFFFF_FFFF;
+    let gone_red = red_painted && red_reading & FP_VALID != 0 && !(red_after <= ONE_COMPOSITE_MS);
+
+    set_enabled(false);
+    let _ = compose(); // hand the band back before the boot's own state is restored
+    firstpaint_restore(prev);
+    set_enabled(saved_en);
+
+    let (rw, rh) = rect.map(|(_, _, w, h)| (w, h)).unwrap_or((0, 0));
+    let ok = unstamped && stamped && painted && recorded && bounded && gone_red && crystal;
+    serial_println!(
+        ":: MENUFIRST: after_enable_ms={} bound_ms={} model={}{} crystal={} bar={}x{} \
+         gem={}x{}+{}+{} red_after_enable_ms={} unstamped={} stamped={} painted={} recorded={} \
+         bounded={} gone_red={} :: {} ::",
+        after,
+        ONE_COMPOSITE_MS,
+        if mask == 0 { "complete" } else { "partial:" },
+        match mask {
+            0 => "",
+            1 => "caption",
+            2 => "clock",
+            3 => "caption+clock",
+            4 => "batt",
+            5 => "caption+batt",
+            6 => "clock+batt",
+            _ => "caption+clock+batt",
+        },
+        if crystal { "drawn" } else { "absent" },
+        rw, rh,
+        CRYSTAL_W, CRYSTAL_H, crystal_offset(rh.max(CRYSTAL_H)).0, crystal_offset(rh.max(CRYSTAL_H)).1,
+        red_after,
+        unstamped, stamped, painted, recorded, bounded, gone_red,
         if ok { "PASS" } else { "FAIL" }
     );
 }

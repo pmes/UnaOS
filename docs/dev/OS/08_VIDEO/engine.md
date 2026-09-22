@@ -19400,3 +19400,331 @@ already printed 443 lines earlier and `cash_owed_sprite` did no work at all betw
 (`owed_cashed` was 1 for the whole boot). It is a flake worth a queue row, not a finding this arc can
 close.
 
+
+## MENUFIRST — the bar's first paint was already at the seam; what was wrong is what was IN it (x86 `wc`, flight 11, 2026-09-22)
+
+Peter, flight 11: *"startup is still slow and shows a broken crystal"*. CRYSTALBOOT (B137) took
+23.8 s of Bluetooth off the boot walk and repaired the splash's wireframe frame — but the splash is
+compiled OUT of every flown image, so the crystal Peter saw is the MENU BAR's brand mark
+(`crystal=16x22`, `video/menubar.rs`), not the splash's. This arc went after the 5051 ms gap between
+the bar's enable and the bar's first model paint.
+
+**There is no such gap, and the capture says so in three places.**
+
+### 1. The premise, re-derived off `f11.log` rather than inherited
+
+The two lines the gap was read from:
+
+    [  27616ms] [menubar] live passes=1 paints=0 rate=0/1k scan=634284cyc/235us paint=0cyc/0us \
+        px/paint=0 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=4
+    [  32667ms] [menubar] live passes=44 paints=1 rate=22/1k scan=16945cyc/6us \
+        paint=1130360cyc/419us px/paint=97920 press=crystal crystal=16x22 clob=0 toggles=1 off_passes=4
+
+`[menubar] live` is a ROLLUP on the ledger's ~5 s cadence, not an event — the dock's own line sits
+beside it at `[32667ms] … emit=2 age_ms=5115`, the same interval. And `compose` emits it through
+`LEDGER.tick` **above** the damage test and the paint, so `paints=0` at 27616 ms is the count
+*before* that same pass painted. The two lines are one pass and one paint.
+
+The arithmetic settles it without reading a line of source. That paint reads
+`paint=1130360cyc/419us px/paint=97920` at 32667 ms — and again, **identical to the cycle**, at
+37866 ms and at 43053 ms. `LEDGER.paint` accumulates; a second paint would have moved the total.
+Three reports, one paint. The strip agrees on its own line, one millisecond after the enable:
+
+    [  27616ms] [wc-x] menubar ENABLED panel=2880x1800 rect=Some((0, 0, 2880, 34)) was=false
+    [  27617ms] [strip] rollup tenant=menubar scope=bar emit=1 age_ms=0 rect=2880x34+0+0 \
+        paints=1 paint_px=97920 torn=0 beam=obs … maxpaint_us=416 minpaint_us=416 … -> CLEAN
+    [  27617ms] [wc-x] menubar PAINTED (composite at the enable seam)
+
+`97920 = 2880 x 34` — the whole band, painted once, **`after_enable_ms=1`**. The enable seam already
+does the thing the brief asked to be made true.
+
+### 2. The mechanism: a COMPLETE crystal on an EMPTY bar
+
+The mark is not what is broken, and this is decidable from the draw path alone. `crystal_facet` and
+`crystal_half` (`video/menubar.rs`) read nothing but `const` geometry and three `const` inks —
+`theme.rs:198,201,204`, `CONTROL_CLOSE` / `CONTROL_MID` / `CONTROL_ZOOM`, all `pub const u32` — and
+the face under it is `ceramic::shade`, a `spin::Once` table generated on first use. **There is no
+theme, face or kit the mark waits on.** At the enable seam it is the same 16x22 gem it is at minute
+ten: crown widening 9→15 px over `CRYSTAL_CROWN_H=8` rows, girdle at 16 px, pavilion tapering to a
+1-px tip at `v=21`, `CONTROL_CLOSE` left of centre and `CONTROL_ZOOM` right of it. A mark drawn
+before its inputs were ready is not a state this file can reach.
+
+What the seam put on the band is on the wire on the line above the paint:
+
+    [  27616ms] [menubar] menus cap_owner=0 cap= menu_owner=0 boxes=0 items=none
+
+No caption, no menu titles. And in 2.2 MB of capture there is **no `[menubar] battery` line at all** —
+`battery_witness` returns early on exactly one state, `status::source() == Unresolved`, which its own
+comment states as *"nothing has asked yet"*. So on an rMBP **with a pack**, the status source never
+resolved for the whole boot and the item was absent for a reason nothing on the glass could tell
+apart from "absent by design".
+
+So the band that stood on the operator's screen was: the bar's face, its one bottom keyline, and the
+crystal. **Nothing else.** A 2880-px grey strip with a single gem at `x=12`.
+
+### 3. The gap that IS real — 15746 ms, and it is not the bar's
+
+The bar's second paint:
+
+    [  43364ms] [strip] rollup tenant=menubar scope=bar emit=2 age_ms=15746 rect=2880x34+0+0 \
+        paints=2 paint_px=195840 … -> CLEAN
+
+15746 ms of one unchanging band, and `compose` was right to decline every composite in it: the
+signature matched, the rect matched, and `clobbered` — which is `wm::dock_scan`'s answer about
+WINDOW rows — was 0. Nothing the bar reads had moved. What moved at 43364 ms is on the wire 295 ms
+earlier, and it belongs to the boot walk:
+
+    [  43069ms] [wc-x] desktop-app HOLD-EXPIRED reason=dmg-refuse-unsettled name=/STAT.ELF \
+        waited=15005ms threshold=15000ms — launching anyway
+    [  43077ms] [wc-x] desktop-app LAUNCH name=/STAT.ELF bytes=8472 entry=0x10000000000 pid=26
+    [  43363ms] [menubar] menus cap_owner=4 cap=Application menu_owner=0 boxes=1 items=app:Application@34+111
+
+The caption the bar was missing is `/STAT.ELF`'s, and it was held 15 s behind a damage-settle wait in
+`main.rs`. **That is BOOTWAITS' file and this arc does not touch it** — see the STOP below.
+
+### 4. The fix: the number that was missing, and a seam that reads instead of claims
+
+Two takes, both in this arc's files.
+
+**The witness.** `[menubar] first-paint at=<ms> after_enable_ms=<n> model=<complete|partial:<what>>
+crystal=<drawn|absent> rect=<WxH+X+Y>`, once per boot, emitted from the PAINT SITE (after
+`SLOT.store`, below `strip::paint`'s decline arm) and not from the seam — because `[wc-x] menubar
+PAINTED` is the shell's statement about its own control flow and this is the bar's reading of what it
+drew. `at=` is ms since `bootpace::origin_cycles()` — the SAME origin `logts` subtracts for the
+`[ NNNNNms]` line prefix, whose own doc states the rule this obeys (*an out-of-module timestamp must
+subtract the LEDGER's origin, not invent its own*, because the raw x86 TSC counts from processor
+RESET) — so on every flown image `at=` is directly comparable to the prefix on its own line, and `?`
+where that origin does not exist yet, which is `logts`'s discipline and not a fabricated `0`.
+
+**It is NOT `clock::logts_now()`, and the gate said so before this arc's first run finished.**
+Reaching for the obvious source put `error[E0425]: cannot find function logts_now in module
+crate::clock` in front of the x86 `wc` gate: that function is `#[cfg(feature = "logts")]` and this
+lane builds without `logts`. The replacement is `arch::now_cycles()` (what this file already times
+its ledger with) converted by `strip::cycles_to_us`, which is `pub` and is the same conversion the
+strip's own `age_ms=` term uses — and it is strictly better on this path than the function it
+replaces, because `logts_now`'s civil half takes a `try_lock` that a monotonic reading has no use
+for and `compose` runs masked at the composite tail. The INTERVAL is measured in the counter
+directly rather than as a difference of two `at=` readings, because `at=` is truncated to whole ms
+and subtracting two of them would quantise flight 11's 1 ms first paint to `0` or `1` depending on
+where the truncation fell. `after_enable_ms` is measured against an
+edge stamped in `set_enabled` by `compare_exchange` on the never-written state, so the fixture's four
+later toggles (`toggles=5` on flight 11) cannot rewrite the shell's.
+
+`model=` carries the three elements that can be UN-ASKED at the seam — `caption` (`cap_owner ==
+WIN_NONE`), `clock` (`clock_hhmm()` answered `None`), `batt` (`status::source() == Unresolved`) —
+named in draw order, `complete` when none are. **The crystal is deliberately not in that mask**, for
+§2's reason, and is reported separately as `crystal=drawn|absent` from the same two bounds
+`compose_row` clips the gem by, read off the rect rather than restated.
+
+On flight 11's wire this line would have read
+`after_enable_ms=1 model=partial:caption+batt crystal=drawn` — which is the whole finding in one
+line, and is what makes flight 12 answerable without a 2.2 MB capture and a cycle count.
+
+**The seam reads the fact — and the x86 half of a hole the Pi seat already closed.**
+`desktop_uefi.rs` printed `[wc-x] menubar PAINTED` unconditionally: a statement that
+`wm::composite()` had been CALLED, dressed as a statement that the bar was on the glass.
+`menubar::owns_pixels` exists for exactly that question (BRINGUP-PAINT, PA41 — its own doc comment
+names this seam), and the aarch64 twin has not only read it back since PA41 but **re-runs the
+composite when it answers `false`** (`desktop_firmware.rs:337-347`). Its comment states the reason:
+`strip::paint` declines the pass without touching a pixel on a contended `SCRATCH` (the dock is
+tenant #1 and takes the same scratch in the same pass) or a surface not yet `word4`;
+`menubar::compose` then returns `false` with its slot untouched; and the bar is left ENABLED — so
+`screen::present_background` is **already** subtracting its 34 rows from every desktop present — with
+nothing on the glass and no damage condition able to notice. On the quiet desktop this seam exists
+to serve, that is a bar invisible for the rest of the boot, and **PA41's metal reading of it is a bar
+that "came up INCOMPLETE" and filled in only under pointer activity.**
+
+The x86 twin never took that fix. It does now, in the same shape and with the same one re-run —
+`owns_pixels` is the same packed load `compose` acts on, so the retry fires iff the first pass did
+not land — and the line becomes `[wc-x] menubar <PAINTED / NOT-PAINTED> owns_pixels=<b>
+retried=<b> (composite at the enable seam, read back rather than assumed)`, the aarch64 wording.
+This is the general form MENUBAR-OCC-PAR already states in this file: *an instrument present on one
+chip only is the defect this instrument reports*. No spec pins the old literal
+(`grep -rn "menubar PAINTED" unaos/scripts/` is empty; only `[wc-x] menubar ENABLED` is referenced,
+in `x86-witness.spec`'s prose, and that line is untouched). **Flight 11's first pass DID land**, so
+on that capture the arm does not fire, the verdict word is still `PAINTED`, and `retried=false`.
+
+### 5. The fixture, and its go-red is the brief's own number
+
+`:: MENUFIRST:` (`menubar::firstpaint_selftest`, chained from `menubar::selftest` after
+`battery_selftest`). Four legs:
+
+1. the EDGE is stamped by the enable, not by the paint — `unstamped` with the bar off, `stamped`
+   after `set_enabled(true)`. Without it the bound would be measuring a number the paint site wrote
+   about itself.
+2. a paint LANDS and the recorder holds it — `compose()` returns `true` (the composite says whether
+   it painted; the claim is read off the pass, `battery_selftest` leg 6's rule) and the reading
+   carries its valid bit. The positive control gets retries, because a pass can decline for a
+   contended panel or a busy winmenu registry, neither of which is damage.
+3. the BOUND — `after_enable_ms <= 33 ms`, two frames of `16_667 us`: the pass the enable lands in
+   and the pass that paints it, since `activate` calls `wm::composite()` on the line after
+   `set_enabled(true)`. A third frame would be the bar being late.
+4. ⛔ the GO-RED, through the same recorder and the same predicate, with the edge pushed back by
+   **5051 ms** (`RED_INJECT_MS`) — not an arbitrary number, but the exact gap the brief read off the
+   two rollups §1 takes apart. The injection is expressed in CYCLES, self-calibrated through the
+   same `strip::cycles_to_us` the reading is taken with, so it stays 5051 ms on a machine of any
+   clock rather than depending on a guessed TSC rate. A bar whose first paint really had landed 5051 ms after its enable is the defect;
+   this leg manufactures it and requires the bound to answer `false`. A green leg 4 is therefore also
+   the standing statement that the recorder WOULD have caught that gap if it had been real.
+
+The injection RECORDS but does not SPEAK, and the mechanism is a structural one rather than a flag
+the fixture has to remember: **the RECORDER and the SPEAKER have separate one-shots, and only the
+recorder's is re-armable.** `FIRSTPAINT_READING`'s valid bit gates the measurement (so the fixture
+can take an edge of its own), `FIRSTPAINT_SAID` gates the line, and `firstpaint_rearm` is
+deliberately not given the second. A second `[menubar] first-paint` carrying a deliberately-wrong
+number would put a line on the wire that reads exactly like the defect it is proving the fixture can
+see; making that unreachable by construction is better than making it not happen by care. Everything
+the fixture DOES touch — the edge, the reading and the enable flag — is put back.
+
+One line per boot therefore holds on both boards, for different reasons and with no board-specific
+code: on metal the shell's enable seam speaks at `activate` and every later paint is silent; on QEMU
+`desktop_uefi::activate` never runs — there is no Kepler, as `x86-wc.spec`'s own SCOPE note says — so
+the first `compose()` that actually paints is a fixture-driven one, and that genuinely IS that boot's
+first paint.
+
+### ⚠ STOP — what this arc did NOT take, named exactly
+
+**The 15 s that made Peter call startup slow is `main.rs`'s, and the brief fences that file off
+(NEUTRAL, BOOTWAITS' pick).** `[wc-x] desktop-app HOLD-EXPIRED reason=dmg-refuse-unsettled …
+waited=15005ms threshold=15000ms` is the whole of §3's gap. Nothing in `video/` shortens it.
+
+**`model=complete` is not reachable at the seam, and no edit in this arc's file list makes it so.**
+The caption needs a focused visible row — `wm::focus_changed` / the console window's focus at
+`activate` time, in `wm.rs` outside the menubar band this brief opens. The battery item needs
+`status::poll` to have run once, in `video/status.rs` and the device-service task, neither of which
+is in scope. So the fixture asserts the BOUND and reports `model=`; it does not gate on
+`model=complete`, because a fixture that reds on state the bar does not control is a fixture that
+gets disabled. **Two queue rows follow from this and are the arc's real output**: resolve the status
+source before the enable seam, and give the console window focus at `activate` so the bar has a name
+to say. Both are one-line changes in files this executor was told not to open.
+
+**The 1-px crown asymmetry is recorded, not fixed.** `crystal_facet` splits at `u < cx` with
+`cx = CRYSTAL_W/2 = 8`, while the silhouette spans `[cx-half, cx+half]` — so the shadowed `CLOSE`
+face is `half` px wide and the lit `ZOOM` face is `half+1`. At the table row (`v=0`, `half=4`) that
+is 4 dark against 5 light out of 9. It is present at EVERY paint, not just the first, so it is not
+this arc's defect and moving the mark's pixels is R25 territory (`1046f81c` moved this mark once and
+Peter rejected it). Recorded here so the next reader does not re-derive it.
+
+### Gates (MENUFIRST, on `exec-rmbp-menufirst`, parent `b8930689`)
+
+**`./arroyo knoboff wc b8930689` — exit 0.** Both arches byte-identical to the baseline — x86
+`904c811e…` 1,606,680 bytes, arm `a1ac90e2…` 1,601,385 bytes — **control fired on BOTH arches**
+(`armed≠off: YES / YES`), `warm=yes`,
+`compiled_baseline=[unaos-kernel|unaos-kernel] compiled_tree=[unaos-kernel|unaos-kernel]`. It could
+not have come out otherwise and the control is what makes that statement worth anything: both files
+this arc touches are declared entirely inside the `wc` gate (`video/mod.rs:89-90` for
+`desktop_uefi`, `:120-121` for `menubar`), so a knob-off build compiles neither.
+
+**THE QEMU RUN — `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_QEMU_FULL=1
+./arroyo test 240`, rc 0**, full wall 253.7 s, the boot **reached its completion marker**
+(serial.log line 2489), `MBENCH PASS — 6/6 required witnesses, 0 forbidden hit(s), 2856 lines
+scanned` against `x86-default.spec`. The wire:
+
+    [menubar] first-paint at=13572 after_enable_ms=23 model=partial:caption+clock crystal=drawn \
+        rect=1280x34+0+0
+    :: MENUFIRST: after_enable_ms=1 bound_ms=33 model=partial:caption+clock crystal=drawn \
+        bar=1280x34 gem=16x22+12+6 red_after_enable_ms=5056 unstamped=true stamped=true \
+        painted=true recorded=true bounded=true gone_red=true :: PASS ::
+    :: MENUBATT: pct=82 charging=y mins=106 mv=12311 ma=1014 … decode_ok=true gone_red=true \
+        absent_ok=true layout_ok=true seat_ok=true jitter_paint=false change_paint=true \
+        damage_ok=true :: PASS ::
+
+Read term by term. **`after_enable_ms=1` on this gate is the same number flight 11 measured on
+metal**, arrived at independently — the fixture's own edge, its own board, its own clock. The
+witness line's `after_enable_ms=23` is a different and equally honest reading: that is the BOOT's
+first paint, whose enable is `battery_selftest`'s (QEMU never runs `desktop_uefi::activate` — no
+Kepler), and 23 ms is inside the 33 ms bound with a frame to spare. **`red_after_enable_ms=5056`**
+is the go-red: 5051 ms injected plus the 5 ms the fixture actually spent between the store and the
+paint, which is the injection behaving like a measurement rather than like a constant.
+`model=partial:caption+clock` is correct for this board and not a defect — nothing is focused and
+the civil clock is unanchored, while `batt` is NOT named because the MENUSTAT fixture has already
+resolved the source (`[menubar] battery absent src=none` earlier in the same capture, which is a
+determinate answer and not `Unresolved`). **`crystal=drawn`, `gem=16x22+12+6`** — the mark, whole,
+at its one-PAD inset. And **MENUBATT is undisturbed**, which is the thing this arc was most able to
+break: B148's fixture drives `compose` too, and it still reads `jitter_paint=false
+change_paint=true`.
+
+**Exactly ONE `[menubar] first-paint` line in the capture**, measured rather than intended —
+`awk 'index($0,"[menubar] first-paint")' target/serial.log | wc -l` = 1 — which is the
+separate-one-shots design doing its job across three fixture-driven paints (`paints=5` on the
+`[menubar] selftest` line, `toggles=10`).
+
+**THE SPEC — `./arroyo mbench --replay target/serial.log --spec scripts/specs/x86-wc.spec
+--platform x86`, rc 0, `MBENCH PASS — 16/16 required witnesses, 0 forbidden hit(s)`.** Both new
+pins hit once: the `:: MENUFIRST:` REQUIRE first at line 1546, the `[menubar] first-paint` REQUIRE
+first at line 1540.
+
+⚠ **`x86-wc.spec` IS NOT IN THE HARNESS'S AUTOMATIC REPLAY SET, and that is measured, not
+suspected.** `grep -n "x86-wc.spec" unaos/arroyo` is **empty**, and `grep -n -- '--spec'
+unaos/arroyo` reaches `x86-test.spec`, `x86-default.spec`, `x86-ptr.spec`, `x86-splash.spec`,
+`x86-install.spec`, `x86-ahci.spec`, `x86-fat.spec` and the two Pi specs — not this one. The
+`UNAOS_WC=1 … ./arroyo test 240` run above therefore auto-replayed `x86-default.spec`; `x86-wc.spec`
+is scored only by the hand command in its own header, which is what was run here. This is LAWS's
+"the scored set is what the harness invokes, not what a glob finds", and it means B121's MENUDROP,
+B148's MENUSTAT and this arc's MENUFIRST pins are all currently hand-scored. **A queue row, not a
+finding this arc can close** — wiring a replay selector is `arroyo`'s file and this brief does not
+open it.
+
+**THE PINS GO RED BY MUTATION — rc 1**, `14/16`, both of them, on the same capture and with nothing
+else changed (`gone_red=true` → `gone_red=false` in the fixture pin, `crystal=drawn` →
+`crystal=absent` in the witness pin):
+
+    ❌ REQUIRE :: MENUFIRST: … bounded=true gone_red=false :: PASS ::
+    ❌ REQUIRE \[menubar\] first-paint at=\d+ after_enable_ms=\d+ model=[a-z:+]+ crystal=absent …
+    ❌ MBENCH FAIL — 14/16 required witnesses
+       FIRST-SHORTFALL x86-wc.spec:180
+
+The spec was then restored and verified byte-identical by `sha256sum` against a copy taken before
+the mutation (`cd729099…`), and re-scored: **16/16, rc 0.**
+
+**THE ARMED ARTIFACT, and the reachability rule it exercises.**
+`UNAOS_WC=1 ./arroyo esp-x86` (features `ehcihid,kbdwit,sdhcblk,smolnet,wc,sdwrite`) carries **none**
+of this arc's tokens — and neither does it carry `[wc-x] menubar ENABLED panel=`, which is
+`b8930689`'s and not this arc's. That is the CLAUDE.md rule biting exactly where it says it will:
+without the Kepler knobs `desktop_uefi::activate` is reachable from nothing and the linker drops it
+whole, so *"a behavioural video gate needs the kepler knobs too and is verified reachable with
+`LC_ALL=C grep -a -o -F` on the artifact, not merely compiled."* Grepped on the artifact that
+actually carries the feature — `UNAOS_WC=1 UNAOS_WITNESS=1 UNAOS_KEPLER=1 UNAOS_KEPLER_TAKEOVER=1
+UNAOS_QUARRY=1 UNAOS_SMC=1 ./arroyo esp-x86`, `kernel.elf` sha256 `1ef7edb1…`, 3,052,520 bytes,
+features `witness,ehcihid,kbdwit,smc,sdhcblk,smolnet,nvidia-kepler,nvidia-kepler-takeover,wc,quarry,
+sdwrite` — with `LC_ALL=C grep -a -o -F`: `[menubar] first-paint at=` **1**, `:: MENUFIRST:` **1**,
+` after_enable_ms=` 2, ` bound_ms=` 1, ` red_after_enable_ms=` 1, ` crystal=` 4, ` owns_pixels=` 1,
+` retried=` 2, `(composite at the enable seam, read back rather than assumed)` **1**, `NOT-PAINTED`
+**1**, `PAINTED` 4, `[wc-x] menubar ` 2, `partial:` 1, `caption+clock` 2. Every new token is
+reachable in a shipped image, not merely compiled — **and the flown images are witness builds**, so
+flight 12 carries them.
+
+**`bash unaos/scripts/ledger-check.sh`** — run before and after. It is worth recording what the
+"before" caught, because it is the gate working: with B156's queue row written and its ledger row
+not yet, it returned **rc 1** on exactly one finding —
+`docs/dev/OS/rmbp-queue.md:25: cites ledger id B156, which exists in no ledger file in this tree and
+on no enumerated head — a citation to nothing (LEDGER SR12's shape)`. With the row added: **rc 0**,
+`GATE-LEDGER: OK — 432 rows in 4 ledger file(s) + RULINGS + 4 queue file(s)`, `GATE-BRANCH: OK`. The
+eleven `orin-queue` ids the brief warned about are **registered**, not findings, and no finding names
+a file this arc changes.
+
+**AND THE FIRST GATE RUN FAILED, recorded rather than swallowed.** `error[E0425]: cannot find
+function logts_now in module crate::clock` — `crates/kernel/src/video/menubar.rs:1384`, with rustc's
+own note: *"found an item that was configured out … gated behind the `logts` feature"*. The witness
+had reached for the function that stamps the line prefix, and the x86 `wc` lane builds without
+`logts`. The repair is §4's: `arch::now_cycles()` + `bootpace::origin_cycles()` + `strip::cycles_to_us`,
+all ungated, all lock-free, and the same origin `logts` itself subtracts. **A `cfg` that reads
+correctly is not reachability** — the same sentence LAWS already carries about the diverging board,
+met here on a feature instead of an arch.
+
+**`cd unaos && ./arroyo check`** — `x86_64 OK`, `aarch64 OK`, `bootloader OK`,
+`knob→leg coverage OK`, `kernel cfg coverage OK (80 legs)` with **all 80 legs `rc=0` and none
+failing** (`grep -cE 'rc=0'` = 80, `grep -cE 'rc=[1-9]'` = 0), userspace x86_64 OK (4 crates) and
+aarch64 OK, and **`GATE-LEDGER: OK — 432 rows in 4 ledger file(s) + RULINGS + 4 queue file(s)`**.
+
+**rc 1, and the single ❌ is NOT this arc's.** It is `GATE-BRANCH: RED — refs/heads/exec-rmbp-vugart
+c9c1805a "user-vug: VUGART — emit on every power-of-two frame as well as the 64-frame period" —
+UNREGISTERED`. **Proved environmental rather than argued**, and the proof is that the SAME tree
+answered differently an hour apart: `bash unaos/scripts/ledger-check.sh` returned **rc 0** with
+`GATE-BRANCH: OK` at `refs=580` and again at `refs=581` earlier in this session, and returns **rc 1**
+now at `refs=584` — peers were landing throughout, and the branch named is another seat's, touching
+`unaos/crates/user-vug/src/main.rs`, a file this arc never opens (`git show --stat c9c1805a` is that
+one file). `GATE-LEDGER` is `OK` in every one of those runs. The harness's closing line reads
+`check FAILED — a ledger row is unverifiable`, which is its generic wording; the gate that actually
+reddened is the branch registry above it. Same shape and same disposition as PTRPAINT's
+`exec-rmbp-kvblank` note earlier in this file.
