@@ -6121,7 +6121,7 @@ fn x86_usb_pump(cpu: usize) {
 fn x86_input_service(cpu: usize) {
     use core::sync::atomic::Ordering;
     use unaos_kernel::pal::Event;
-    serial_println!(":: SCHED-X86: input task dispatched on core {} ::", cpu);
+    serial_println!(":: SCHED-X86: input task dispatched on core {} ::", cpu); #[cfg(all(feature = "wc", feature = "witness"))] ptrlag_selftest(); // PTRLAG (B134) — the installer's geometry door driven across a HELD `WRITER`, ON THE BAND UNDER TEST: this task is the one that calls `x86_ptr_install`, and the fixture runs on its core before it has taken a single report, so the priming read is the first thing that door ever does. At the pre-PTRLAG code control never returns from it (`*WRITER.lock()` is non-reentrant and this core holds it) — that HANG is the go-red, scored by the wall. The fn is at this file's tail. ⚠ LINE-NEUTRAL fold, `wc`-erased.
     let mut pulse_ms = unaos_kernel::arch::ms();
     // INPUT-UNGATE producer state. `owed_motion` is summed relative travel the channel refused;
     // `owed_event` is the ONE must-survive event it refused. Both are owed to the channel in that
@@ -9949,7 +9949,8 @@ fn bootclock_report(stamps: (u64, u64, u64)) {
 // inflight` is untouched — none of these counters is netted out of `GUI_SENT_X86`/`GUI_RECV_X86`.
 //
 // TWO LINES, both `wc`-only:
-//   `[ptrinstall] installs=… reports=… lag_max_ms=… coalesced=… drains=… folds=…` — rides the
+//   `[ptrinstall] installs=… reports=… lag_max_ms=… coalesced=… drains=… folds=… fold_age_max_ms=…
+//       drain_gap_max_ms=… panel_busy=…` (the last three are PTRLAG's, B134 — see their statics) — rides the
 //       `[schedx86] depth` 5 s gate (folded onto that call's closing line) and prints only once a
 //       relative report or a drain has happened, so a pointerless QEMU boot carries none of them.
 //   `:: PTRINSTALL: installs=… reports=… folds=… lag_max_ms=… coalesced=… drains=… ::` — ONE late
@@ -9985,6 +9986,59 @@ static PTRI_LATE_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 const PTRI_LATE_MS: u64 = 60_000;
 
+/// PTRLAG (rmbp-ledger B134) — the high-water age, in ms, of the OLDEST report in a FOLDED run, read
+/// at the dispatch that finally delivered it.
+///
+/// `lag_max_ms` is this number over ALL drains and is therefore dominated by the quiet ones: flight 11
+/// read `lag_max_ms=678` with `folds=2917` on `installs=4775`, and nothing on that line said whether
+/// the 678 ms belonged to a report that was folded or to one that travelled alone. This term is
+/// restricted to the folded population — the one Peter feels, because a folded run is delivered as ONE
+/// dispatch carrying the SUM, so the focused app's drag sits still for the whole age below and then
+/// moves the whole distance at once. That is "jumping around" stated as a number, and `folds` alone
+/// could not state it: 61% of installs being folds is a RATE, and a rate says nothing about how long
+/// any of them waited.
+///
+/// The oldest member of a folded run IS what [`PTRI_OLDEST_MS`] holds. The consumer-side fold sums a
+/// run of `Event::Mouse` starting at the report the drain took first, and every report older than that
+/// one has already been drained (which is what cleared the clock), so the armed stamp belongs to the
+/// head of the run being folded. No per-report timestamp is needed and none is added — the channel
+/// still carries `Event::Mouse { x, y }` and nothing else.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PTRI_FOLD_AGE_MAX_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PTRLAG — `GUI_FOLD_X86` as the previous drain left it, so a drain can tell whether the dispatch it
+/// has just completed FOLDED anything.
+///
+/// A `swap` rather than a load-then-store: folds are charged only inside the fold loop that assembles
+/// the dispatch currently being drained, i.e. strictly between the previous drain stamp and this one,
+/// so "the counter moved" is exactly "this dispatch folded". The render service is the channel's only
+/// consumer (the split-brain rule `WCSER-REHOME` enforces), so there is no second drainer to race.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PTRI_FOLD_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PTRLAG — the longest the render core went between two relative dispatches WHILE A REPORT WAS
+/// WAITING, in ms. The compositor's stall, measured from the pointer's side.
+///
+/// THE POINT OF A SECOND NUMBER. `lag_max_ms` starts at the producer's stamp, so it mixes "the report
+/// arrived just before the drain" with "the drain never came"; this one starts at the previous
+/// DISPATCH, so it is the gap the render loop itself left. The two together separate the two readings
+/// flight 11 could not: a drain that is merely late (gap small, lag large — the report arrived early in
+/// a long window) from a render core that stopped dispatching altogether (gap large), which is what
+/// `PRESENT-BANDED SPIN … GAVE-UP` × 1138 and `amp=4.44x -> WIDENED` predict and what the drain and the
+/// present being ONE TASK ON ONE CORE makes structural: `x86_render_service` drains a burst, then
+/// presents, and nothing is dispatched until the present returns.
+///
+/// GATED ON A REPORT ACTUALLY WAITING (`PTRI_OLDEST_MS != 0`), and that gate is the whole honesty of
+/// the number. An idle pad produces a gap of whole seconds between the last drain and the next one, and
+/// counting it would make the high-water read "the operator went to lunch" on every capture. What is
+/// wanted is the gap a report SAT IN, so the gap is charged only where the drain found one pending.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PTRI_DRAIN_GAP_MAX_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PTRLAG — uptime of the last relative dispatch (`.max(1)`, so 0 stays "no drain yet").
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PTRI_LAST_DRAIN_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// PTRINSTALL — one relative report taken off the ring by the producer.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 #[inline]
@@ -10013,11 +10067,27 @@ fn ptrinstall_drained(raw: unaos_kernel::pal::Event) {
         return;
     }
     PTRI_DRAINS.fetch_add(1, Relaxed);
+    let now = unaos_kernel::arch::ms();
+    // PTRLAG — did the dispatch just completed FOLD anything? Read BEFORE the oldest-stamp is cashed,
+    // so the two answers describe the same dispatch. See `PTRI_FOLD_SEEN`.
+    let folds_now = GUI_FOLD_X86.load(Relaxed);
+    let folded_here = folds_now != PTRI_FOLD_SEEN.swap(folds_now, Relaxed);
     let oldest = PTRI_OLDEST_MS.swap(0, Relaxed);
     if oldest != 0 {
-        let lag = unaos_kernel::arch::ms().saturating_sub(oldest);
+        let lag = now.saturating_sub(oldest);
         PTRI_LAG_MAX_MS.fetch_max(lag, Relaxed);
+        // PTRLAG — the same age, restricted to the population Peter feels as a jump.
+        if folded_here {
+            PTRI_FOLD_AGE_MAX_MS.fetch_max(lag, Relaxed);
+        }
+        // PTRLAG — and the render core's own dispatch gap, charged only because a report was waiting
+        // in it (see `PTRI_DRAIN_GAP_MAX_MS`: an idle pad's gap is not a stall).
+        let prev = PTRI_LAST_DRAIN_MS.load(Relaxed);
+        if prev != 0 {
+            PTRI_DRAIN_GAP_MAX_MS.fetch_max(now.saturating_sub(prev), Relaxed);
+        }
     }
+    PTRI_LAST_DRAIN_MS.store(now.max(1), Relaxed);
 }
 
 /// PTRINSTALL — the periodic line (only once something relative has moved) and the one late line.
@@ -10030,10 +10100,18 @@ fn ptrinstall_rollup() {
     let coalesced = PTRI_COALESCED.load(Relaxed);
     let drains = PTRI_DRAINS.load(Relaxed);
     let folds = GUI_FOLD_X86.load(Relaxed);
+    // PTRLAG (B134) — the three fluidity terms, TAIL-APPENDED. x86-ptr.spec cites this line
+    // positionally and its own CONTRACT names tail-append as the safe form, so the pinned prefix
+    // `… drains=\d+ folds=\d+` still matches and no spec is re-pinned by this commit. The late
+    // `:: PTRINSTALL:` line below is NOT extended for the opposite reason: its pin ends at a literal
+    // ` ::`, so a term appended there would red the lane.
+    let fold_age = PTRI_FOLD_AGE_MAX_MS.load(Relaxed);
+    let drain_gap = PTRI_DRAIN_GAP_MAX_MS.load(Relaxed);
+    let panel_busy = PTRI_PANEL_BUSY.load(Relaxed);
     if reports != 0 || drains != 0 {
         serial_println!(
-            "[ptrinstall] installs={} reports={} lag_max_ms={} coalesced={} drains={} folds={}",
-            installs, reports, lag, coalesced, drains, folds
+            "[ptrinstall] installs={} reports={} lag_max_ms={} coalesced={} drains={} folds={} fold_age_max_ms={} drain_gap_max_ms={} panel_busy={}",
+            installs, reports, lag, coalesced, drains, folds, fold_age, drain_gap, panel_busy
         );
     }
     if unaos_kernel::arch::ms() >= PTRI_LATE_MS && !PTRI_LATE_DONE.swap(true, Relaxed) {
@@ -10061,9 +10139,30 @@ fn ptrinstall_rollup() {
 /// PTRINSTALL (engine.md §PTRINSTALL): `POS` is a masked constant-time spinlock, the sprite claim is
 /// `claim_bounded(2 ms)` → `owe_repaint`, `WRITER` is copied, `TABLE` may not block by rule. Charges
 /// `PTRI_INSTALLS` under `wc` so the wire reads `installs == reports`.
+///
+/// ### PTRLAG (rmbp-ledger B134) — "`WRITER` is copied" was true of the HOLD and false of the ACQUIRE
+/// The paragraph above accounts for every lock on this path except the one it opens with. `*WRITER.lock()`
+/// is a BLOCKING acquire of a raw `spin::Mutex` on the PREEMPTIBLE INPUT BAND — the boot-8 shape LOCKFIX
+/// removed from `click_pointer_pos` one function over (`arch/x86_64/syscall.rs`, the `WAS
+/// WRITER.lock().info()` note) while `video/mod.rs`'s door comment already named the input path as the
+/// place that must not make it. PTRINSTALL2 moved the install onto the input core and carried the
+/// acquire with it, so from B117 on EVERY relative report began its life waiting on whichever core held
+/// the panel — the render core, once per composite and once per flush. That is the pointer waiting on
+/// the compositor, at HID rate, in the first statement of the function written to stop it waiting.
+///
+/// So the read goes through [`ptrlag_panel_wh`]: `video::panel_info_nonblocking`, the counted
+/// `try_lock` door, with the last good geometry cached so a refusal DEGRADES rather than waits and the
+/// install still happens. Panel geometry changes only on a mode set, so the cached answer is the same
+/// answer; what the door removes is the wait, not the number.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn x86_ptr_install(dx: i32, dy: i32) {
+    // PTRLAG — ⚠ the `not(wc)` arm is the pre-PTRLAG statements VERBATIM, so the knob-off image cannot
+    // move (`./arroyo knoboff wc b9edcfa1`, exit 0, quoted in the B134 row). The contention this fix
+    // removes is contention with the COMPOSITOR, and without `wc` there is no compositor on x86.
+    #[cfg(feature = "wc")]
+    let Some((w, h)) = ptrlag_panel_wh() else { return };
+    #[cfg(not(feature = "wc"))]
     let (w, h) = {
         let fb = *unaos_kernel::video::WRITER.lock();
         if !fb.is_ready() {
@@ -10078,4 +10177,139 @@ fn x86_ptr_install(dx: i32, dy: i32) {
     unaos_kernel::pal::cursor::move_rel(dx, dy, w, h);
     #[cfg(feature = "wc")]
     PTRI_INSTALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// PTRLAG (rmbp-ledger B134) — the LAST GOOD panel geometry, packed `w << 32 | h`, 0 for "never read".
+///
+/// Panel geometry is set once by `init_panel` and changes only on a mode set, so a cached answer is
+/// not a stale answer — it is the same answer, taken earlier. That is what lets [`ptrlag_panel_wh`]
+/// answer a refused `try_lock` with a number instead of a wait, and it is why the refusal costs the
+/// pointer nothing at all rather than costing it one report.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PTRI_PANEL_WH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PTRLAG — panel reads the installer took as a REFUSAL and absorbed from [`PTRI_PANEL_WH`].
+///
+/// Reported as `panel_busy=` on the `[ptrinstall]` line, and it is this fix's own witness: every one
+/// of these is a report that, before B134, blocked the input band on the core holding the panel.
+/// `panel_busy=0` across a whole flight does not mean the fix is wrong — it means that flight never
+/// met the contention — so the number is read together with `drain_gap_max_ms`, which says whether
+/// the render core was busy enough for a contended read to have been possible at all.
+///
+/// Not the same population as `[inwedge]`'s `refused`: that census counts every input-path refusal
+/// (this one included, since B134 — the installer IS on the input band and `video::panel_census` is
+/// where input-path refusals are counted by rule), so `[inwedge] refused` now carries pointer installs
+/// beside the router's hints and `wheel_route`'s declines. Subtract `panel_busy` to recover the
+/// pre-B134 population.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PTRI_PANEL_BUSY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// PTRLAG — the installer's panel geometry, through the input path's counted non-blocking door.
+///
+/// `video::panel_info_nonblocking` is documented there as "the ONE panel acquisition the input path
+/// makes: masked, non-blocking, counted", and every other caller degrades rather than waits. So does
+/// this one, and it degrades to the strongest answer available: the last geometry this door returned.
+/// A cold cache (no successful read yet, i.e. before the panel is attached) is the `None` the
+/// pre-PTRLAG `is_ready()` guard returned, and the caller no-ops exactly as it did then.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[inline]
+fn ptrlag_panel_wh() -> Option<(i32, i32)> {
+    use core::sync::atomic::Ordering::Relaxed;
+    match unaos_kernel::video::panel_info_nonblocking() {
+        Some(i) => {
+            // The `is_ready()` half that survives the door: a degenerate panel is a no-op, and it is
+            // never cached, so one bad read cannot poison every later install.
+            if i.width == 0 || i.height == 0 {
+                return None;
+            }
+            PTRI_PANEL_WH.store(((i.width as u64) << 32) | i.height as u64, Relaxed);
+            Some((i.width as i32, i.height as i32))
+        }
+        None => {
+            PTRI_PANEL_BUSY.fetch_add(1, Relaxed);
+            let cached = PTRI_PANEL_WH.load(Relaxed);
+            if cached == 0 {
+                return None;
+            }
+            Some(((cached >> 32) as i32, (cached & 0xFFFF_FFFF) as i32))
+        }
+    }
+}
+
+/// PTRLAG — the installer's geometry door driven across a HELD `WRITER`, on the input task's own core.
+///
+/// `lockfix_b1_selftest`'s design verbatim (`arch/x86_64/syscall.rs`), one function over and for the
+/// defect it was built to catch, because B117 reintroduced that defect in `x86_ptr_install` two weeks
+/// after B1 removed it from `click_pointer_pos`. A fixture that only watched `click_pointer_pos` could
+/// not see it: the new blocking acquire was in `main.rs`, in the binary crate, where that ladder cannot
+/// reach.
+///
+/// WHY IT IS A GATE AND NOT A TAUTOLOGY. At the pre-PTRLAG code this leg does not FAIL, it HANGS:
+/// `*WRITER.lock()` is a non-reentrant `spin::Mutex` this very block is holding, on one core. That hang
+/// is the boot-8 wedge reproduced with no HID at all, the wall is the bound, and a truncated run is not
+/// a pass (QUEUE §5) — so re-introducing the dependency scores RED by construction rather than by a
+/// threshold somebody has to choose. This is the go-red the B134 row cites.
+///
+/// THREE ASSERTIONS. (1) DECLINED — the held read went through the counted door and came back a
+/// refusal (`panel_census` refusals moved, and `panel_busy` moved by exactly one, so the refusal was
+/// OURS and not a live AP's). (2) ABSORBED — and it still answered, with the primed geometry: a
+/// refusal that returned `None` would be a LOST install, which is the failure mode this cache exists
+/// to prevent, and it is the half `lockfix_b1_selftest` has no equivalent of. (3) RECOVERED — with
+/// nothing held the same call completes a read, the control without which a door hard-wired to refuse
+/// would pass (1) and (2) while measuring nothing. `RELEASED_TRIES` is B1's bound for B1's reason: a
+/// secondary core holding `WRITER` for its own present makes one non-blocking read refuse, which is a
+/// race against the live APs rather than a statement about this kernel.
+///
+/// Called once, from the input task's dispatch line — the band under test, before any report has been
+/// taken, so the priming read is the first thing the installer's door ever did.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+fn ptrlag_selftest() {
+    use core::sync::atomic::Ordering::Relaxed;
+    /// PTRLAG — released-half attempts; `lockfix_b1_selftest`'s `RELEASED_TRIES` and its reasoning.
+    const RELEASED_TRIES: u32 = 64;
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Relaxed) {
+        return;
+    }
+    // PRIME. Also the statement of what the held half must be able to answer with.
+    let Some((rw, rh)) = ptrlag_panel_wh() else {
+        serial_println!(
+            ":: PTRLAG: no panel at input dispatch — the installer's door has nothing to cache :: SKIP ::"
+        );
+        return;
+    };
+    let (read0, refused0) = unaos_kernel::video::panel_census();
+    let busy0 = PTRI_PANEL_BUSY.load(Relaxed);
+    // THE HELD HALF. At the pre-PTRLAG code control does not return from this block.
+    let held = {
+        let _held = unaos_kernel::video::WRITER.lock();
+        ptrlag_panel_wh()
+    };
+    let (_read1, refused1) = unaos_kernel::video::panel_census();
+    let busy1 = PTRI_PANEL_BUSY.load(Relaxed);
+    // THE RELEASED HALF — the control.
+    let mut read2 = read0;
+    let mut tries = 0u32;
+    while tries < RELEASED_TRIES {
+        tries += 1;
+        let _ = ptrlag_panel_wh();
+        read2 = unaos_kernel::video::panel_census().0;
+        if read2 > read0 {
+            break;
+        }
+    }
+    let declined = refused1 >= refused0 + 1 && busy1 == busy0 + 1;
+    let absorbed = held == Some((rw, rh));
+    let recovered = read2 > read0;
+    serial_println!(
+        ":: PTRLAG: x86_ptr_install geometry across a HELD WRITER — held: refused+{} busy+{} answered={:?} | primed={}x{} | released: read+{} tries={} :: {} ::",
+        refused1 - refused0,
+        busy1 - busy0,
+        held,
+        rw,
+        rh,
+        read2 - read0,
+        tries,
+        if declined && absorbed && recovered { "PASS" } else { "FAIL" }
+    );
 }

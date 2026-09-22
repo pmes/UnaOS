@@ -18092,3 +18092,269 @@ i.e. the same fields the three flights already printed, with the verdict word fl
 the fixture no longer asserting a claim the boot withheld. `adopt_stretch=4/4` on metal would mean
 WC-D's cadence reached the fixture's rows for the first time and is a green of a stronger kind; any
 `-> FAIL` on that line is then a REAL carry failure and reads `offers=1 taken=0` beside it.
+
+## PTRLAG — the pointer install waits on the compositor in its FIRST statement, and "sticky" is a folded run delivered as one jump (x86 `wc`, 2026-09-22)
+
+**Brief.** Peter on flight 11 (2026-09-22): "mouse not fluid, jumping around, sticky". The wire
+(`f11.log`, `awk 'index($0,"[ptrinstall]")'`) opens at `installs=1373 reports=1373 lag_max_ms=43
+folds=56 drains=1317` and ends at `installs=4775 reports=4775 lag_max_ms=678 coalesced=2 drains=1856
+folds=2917` — PTRINSTALL's identity holds on every sample (every report installs, exactly once,
+`installs == reports` throughout), and that is precisely why the line could not explain the
+complaint: **it measures identity, not fluidity.** Beside it, `[wpace] … rate=176.0/s -> FREE`,
+`[wc-w] … amp=4.44x -> WIDENED`, and `PRESENT-BANDED SPIN site=2 waited_us=500 -> GAVE-UP`
+(W5SPIN's bound; VUGPERF owns that line). **Counted off the capture rather than quoted: 3,697 spin
+lines in all, 2,008 of them `site=2`, and 1,695 GAVE-UP — every give-up is `site=2`.** The brief's
+1,138 is low; against `presents=4727` the give-up fires on about 36% of presents, not on nearly
+every other one. The direction of the finding is unchanged and the correction is recorded so the
+next reader does not re-derive it. Branch
+`exec-rmbp-ptrlag`, parent `b9edcfa1`; rmbp-ledger **B134**, B117 appended.
+
+### What a FOLD is, named from the code
+
+The queue is `GUI_CHANNEL_X86`, 64 slots, and it has exactly **one** producer and exactly **one**
+consumer — the split-brain rule `WCSER-REHOME` enforces with an epoch check at the top of the render
+loop. It is not a fixed-slot ring and nothing in it overwrites: a full channel is refused, never
+clobbered.
+
+* **Producer** — `x86_input_service` (`main.rs`), on the INPUT core. It takes reports off
+  `pal::EVENT_QUEUE` and OFFERS each to the channel (`gui_try_send_x86`). A refused relative report
+  becomes `owed_motion`, and every further report is summed into it: that is `coalesced`, the
+  PRODUCER-side fold (INPUT-UNGATE).
+* **Consumer** — `x86_render_service`, on the RENDER core, at `main.rs:6761`. When it takes an
+  `Event::Mouse` off the channel it keeps pulling and summing while the next event is also relative,
+  charging `GUI_FOLD_X86` once per absorbed report. That is `folds`, and it is the term on the wire.
+
+Both folds are sound as motion: deltas are additive and `wc_drag_motion` reads the resulting ABSOLUTE
+position, so a folded run steers the arrow and any live drag to the identical place. **What a fold
+destroys is not distance, it is TIME.** A run of 47 reports spanning 400 ms is delivered as ONE
+dispatch carrying their sum. The focused app sees nothing for 400 ms and then moves the whole way at
+once. That is Peter's "jumping around" and his "sticky", and they are the same event seen at its two
+ends.
+
+### Why the drain falls behind exactly when the compositor is busy — it is one task on one core
+
+The drain is not gated by the COMP gate and not by the shadow lock. It is simpler and worse: **the
+drain and the present are the same task, serialized in one loop.** `x86_render_service` blocks on
+`recv`, drains a burst (each dispatch running its arms and `wc_route_tail`), breaks when the channel
+is empty, and only THEN runs `pal.render()` — the panel present — plus the shell present and the
+witness block, before coming back round to `recv`. Nothing is dispatched while the present runs. So
+the drain cadence IS the present cadence, and every report that arrives during a present waits for
+the whole of it. With `amp=4.44x -> WIDENED` damage and 1,695 banded-present spins giving up at
+500 µs each, that is where `lag_max_ms` comes from: not a lock, a queue behind a pass.
+
+**Differenced across flight 11's 166 `[ptrinstall]` samples, the storm reads as a DISPATCH RATE and
+that is the whole finding.** Through the storm window (610 s to the end of the capture) the render
+core completed relative dispatches at **0.4 to 2.7 per second** while reports arrived at 10 to 50
+per second — e.g. `d_installs=255 d_drains=29 d_folds=257` over 5.1 s, and worse, `d_installs=85
+d_drains=9` and `d_installs=98 d_drains=3`. One sample dispatched NOTHING at all
+(`d_installs=15 d_drains=0 d_folds=0`). So in the storm the focused app was told where the pointer
+was **one to three times a second**, each time by one dispatch carrying a folded run. A mean drain
+gap of 350 ms to 2.5 s is "sticky" and "jumping around" in one number, and the pre-PTRLAG line could
+not print it: `folds` gave the rate, `lag_max_ms` gave one high-water over all drains, and neither
+gave the GAP. The capture's true final sample is `installs=4873 reports=4873 lag_max_ms=744
+coalesced=2 drains=1859 folds=2950` — the brief's `678` is the high-water as of 984915ms, and it
+kept climbing.
+
+The render loop's PERIOD is the same number from the compositor's side: `presents=4727` over ~998 s
+is one loop pass every ~211 ms mean, and a pass is exactly one drain burst plus one present. So
+`drain_gap_max_ms` is expected in the hundreds of ms on flight 12, with the high-water well above
+the mean — which is the term that was missing, because a mean anybody could have divided out and a
+high-water nobody could.
+
+And the channel SATURATES: the capture's last `[schedx86] depth` reads `sent=8714 recv=8650
+inflight=64 (render core 1) fold=2950` — `inflight=64` is the 64-slot channel completely full, i.e.
+the producer's offers are being refused outright and the ring behind them is next. That is the
+backpressure chain reaching its end, and it is the same one sentence from the other direction: the
+render core is the bottleneck, and everything upstream of it queues.
+
+### And the pointer's own install waits on the compositor in its FIRST statement
+
+PTRINSTALL2 (B117) moved the relative install to the producer so the arrow would track at HID rate
+through exactly this stall, and its doc block accounts for every lock on the path — `POS` is a masked
+constant-time spinlock, the sprite claim is `claim_bounded(2 ms)` → `owe_repaint`, `TABLE` may not
+block by rule, "`WRITER` is copied". That last clause is true of the HOLD and false of the ACQUIRE:
+
+    let fb = *unaos_kernel::video::WRITER.lock();   // main.rs, x86_ptr_install, at b9edcfa1
+
+`WRITER` is a raw `spin::Mutex`, and this is a BLOCKING acquire **on the preemptible input band** —
+the boot-8 shape LOCKFIX removed from `click_pointer_pos` one function over (`arch/x86_64/
+syscall.rs`: "WAS `WRITER.lock().info()`, a BLOCKING acquire on the preemptible input band"), while
+`video/mod.rs`'s own door comment already named the input path as the caller that must not make it.
+B117 moved the install onto the input core and carried the acquire with it. So from B117 on, every
+relative report began its life waiting on whichever core held the panel — the render core, once per
+composite and once per flush — in the first statement of the function written to stop it waiting.
+The cost is not only the wait: the input service is also the SOLE drain of `pal::EVENT_QUEUE`, so a
+blocked install stops the ring being drained, the ring backs up, the channel fills, and the consumer
+folds the backlog. **The fold storm and the install stall share one cause.**
+
+### What "sticky" is, in these terms, and what is NOT this arc's to fix
+
+Two distinct things wear the same word, and separating them is most of the value here:
+
+1. **The delivered position is stale** — a folded run holds the focused app (and a live title-bar
+   drag) at the OLD position until the next drain, then jumps. This is the 678 ms, and it is
+   structural in "drain and present are one task".
+2. **The arrow's PIXELS are stale** — `move_rel` → `repaint_on_move` → `cursor::repaint` →
+   `claim_bounded(2 ms)`. When the compositor holds the sprite loan the input core spins up to 2 ms
+   and then takes `owe_repaint()`, which hands a whole-sprite refresh to `wm::composite`'s
+   `take_present_dirty` — **subject to the `REPAIR_MIN_MS` floor, which RE-ARMS rather than grants.**
+   So the arrow's pixels are paid by a composite pass, on the compositor's cadence, exactly when the
+   compositor is the thing that is late.
+
+(2) lives in `video/cursor.rs` and `video/wm.rs`, which this arc may not touch (VUGPERF is in
+`wm.rs`). It is reported, not taken — see the STOP below.
+
+### The fix this arc takes: the installer's geometry read goes through the input path's own door
+
+`video::panel_info_nonblocking` is documented in `video/mod.rs` as "the ONE panel acquisition the
+input path makes: masked, non-blocking, counted", and every caller degrades rather than waits. The
+installer now uses it, with the last good geometry cached in `PTRI_PANEL_WH` so a refusal degrades to
+**the same number, taken earlier** rather than to a lost install: panel geometry changes only on a
+mode set. What the door removes is the wait, not the value. A cold cache (before the panel is
+attached) is the `None` the old `is_ready()` guard returned, and the caller no-ops as before.
+
+`x86_ptr_install` is in EVERY x86 image, `wc` on or off, so the `not(wc)` arm keeps the pre-PTRLAG
+statements verbatim and the knob-off image cannot move. That is a deliberate narrowing, stated: the
+contention being removed is contention with the COMPOSITOR, and without `wc` there is no compositor
+on x86 to contend with.
+
+### The instrument: fluidity, not identity
+
+Three terms TAIL-APPENDED to `[ptrinstall]` (x86-ptr.spec cites the line positionally and its own
+CONTRACT names tail-append as the safe form, so no spec is re-pinned; the late `:: PTRINSTALL:` line
+is NOT extended, because its pin ends at a literal ` ::`).
+
+* **`fold_age_max_ms`** — the high-water age of the OLDEST report in a FOLDED run, at the dispatch
+  that delivered it. `lag_max_ms` is that age over ALL drains and is dominated by the quiet ones;
+  this is the number restricted to the population that arrives as a jump. The oldest member of a
+  folded run is exactly what `PTRI_OLDEST_MS` already holds (everything older has been drained, which
+  is what cleared it), so no per-report timestamp is added and the channel still carries
+  `Event::Mouse { x, y }` and nothing else. "Was this dispatch a fold?" is answered by swapping
+  `GUI_FOLD_X86` against its value at the previous drain — folds are charged only while assembling
+  the dispatch being drained, and there is only one consumer to race.
+* **`drain_gap_max_ms`** — the longest gap between two relative dispatches **while a report was
+  waiting**. `lag_max_ms` starts at the producer's stamp and so mixes "arrived just before the drain"
+  with "the drain never came"; this starts at the previous DISPATCH, so it is the gap the render loop
+  itself left. The gate on a report actually pending is the honesty of the number: an idle pad leaves
+  gaps of whole seconds, and counting them would make the high-water read "the operator went to
+  lunch".
+* **`panel_busy`** — installer panel reads taken as a refusal and absorbed from the cache. This
+  fix's own witness: every one of these blocked the input band before B134. `panel_busy=0` means the
+  flight never met the contention, not that the fix is wrong — read it with `drain_gap_max_ms`, which
+  says whether the render core was busy enough for a contended read to be possible at all. Note that
+  `[inwedge] refused` now includes this population (correctly — the installer IS on the input band);
+  subtract `panel_busy` to recover the pre-B134 reading.
+
+### The go-red, and why it is a HANG rather than a threshold
+
+`ptrlag_selftest` (`main.rs` tail, `wc` + `witness`, called once from the input task's dispatch line)
+is `lockfix_b1_selftest`'s design verbatim, one function over and for the defect it was built to
+catch — because B117 reintroduced that defect in `x86_ptr_install` two weeks after B1 removed it from
+`click_pointer_pos`, and that ladder could not see it: the new blocking acquire was in `main.rs`, in
+the binary crate, where `arch/x86_64/syscall.rs`'s battery cannot reach.
+
+It primes the door, then calls it again **with this core holding `WRITER`**, then calls it once more
+with nothing held. Three assertions: DECLINED (the held read went through the counted door and came
+back a refusal — `panel_census` refusals moved AND `panel_busy` moved by exactly one, so the refusal
+was ours and not a live AP's), ABSORBED (**and it still answered**, with the primed geometry — a
+refusal that returned `None` would be a LOST install, the failure mode the cache exists to prevent,
+and the half B1 has no equivalent of), RECOVERED (the released call completes a read — the control,
+without which a door hard-wired to refuse would pass the first two while measuring nothing).
+
+**At the pre-PTRLAG code this leg does not FAIL, it HANGS**: `*WRITER.lock()` is a non-reentrant
+`spin::Mutex` that this very block is holding, on one core. The wall is the bound and a truncated run
+is not a pass (QUEUE §5), so re-introducing the drain dependency scores RED by construction rather
+than by a threshold somebody has to choose. That is the go-red quoted in the B134 row, and it needs
+no HID at all — which matters, because QEMU's TCG has nothing like the rMBP's contention and a
+threshold-based red here would have been unfalsifiable.
+
+### STOP — what this arc did NOT take, with the exact change named
+
+The brief's "the pointer never waits on the compositor" is satisfied for the GEOMETRY and for the
+POSITION. It is **not** satisfied for the arrow's PIXELS, and closing that needs files this arc may
+not touch:
+
+* `video/cursor.rs` — `repaint_deferred()` claims through `claim_bounded(CLAIM_RETRY_MS = 2 ms)`.
+  On the input band that is a 2 ms unmasked spin against the render core's sprite loan, per report,
+  i.e. up to 25% of a 125 Hz report period spent waiting on the compositor, and it is the same
+  "blocking acquire on the preemptible input band" one layer down. **The change:** a
+  `repaint_nowait()` entry point that claims through the bare `claim()` (immediate `Busy` →
+  `owe_repaint`) and is what `repaint_on_move` calls on x86, leaving `claim_bounded` to the
+  unmasked non-input callers it was derived for. Costs one more owed repaint under contention and
+  removes the wait entirely.
+
+  **Flight 11 already measured the case, and it is stronger than the argument needed.** The last
+  `[wedge9]` of the capture reads `refused=61127 masked=54070 retried=84 owed=1 serviced=7153 ->
+  DEFERRED`. Subtract the masked population (composite tails and WCSER declines, which never spin)
+  and ~7,057 refusals were UNMASKED — the `repaint()` population, i.e. the input band — against
+  `retried=84` that succeeded inside the budget. **The 2 ms budget helped 84 times in ~7,141
+  attempts, about 1.2%.** It is therefore not a retry window; it is ~14 s of input-core spin across
+  the flight that buys essentially nothing and ends in `owe_repaint` anyway. And `serviced=7153`
+  against `refused=61127` is the other half of "sticky" stated directly: the arrow's pixels were
+  handed to a composite pass, on the storm's own cadence, for the overwhelming majority of the
+  reports that could not take the loan.
+* `video/cursor.rs` / `video/wm.rs` — an owed repaint is cashed only by `wm::composite`'s
+  `take_present_dirty`, **and is re-armed under the `REPAIR_MIN_MS` floor**. So on a present-storming
+  compositor the arrow's pixels are paid on the storm's own cadence. The aarch64 model is the
+  alternative the brief names (`SPRITE_OWNS_PAINT = false`: the input path updates `POS` only and the
+  compositor reads the latest position), but adopting it on x86 would put the arrow's cadence BACK on
+  the present, which is the thing PTRINSTALL2 removed. The honest shape is neither: the sprite
+  install stays on the input path and stops waiting for the loan. VUGPERF owns `wm.rs`.
+
+### Gates
+
+`./arroyo knoboff wc b9edcfa1` — **exit 0**. Both arches byte-identical to the baseline
+(x86 `8e9e84a6… 1601032`, arm `8f311779… 1624592`), **control fired on BOTH arches**
+(`armed≠off: YES / YES`), `warm=yes`, `compiled_tree=[unaos-kernel|unaos-kernel]`. So the
+`not(wc)` arm of `x86_ptr_install` is the pre-PTRLAG statements in fact and not merely in intent.
+
+`cd unaos && ./arroyo check` — **157 ✅ legs**, `x86_64 OK`, `aarch64 OK`, `bootloader OK`, and the
+whole cfg matrix green (`x86-all`, `x86-vsyncpace`, `arm-pi`, and every `arm-tegra-*` slot).
+**rc 1, and the single ❌ is NOT this arc's:** `a ledger row is unverifiable` — five
+`stale queue-citation registration` findings, all in `docs/dev/OS/orin-queue.md` (A69, SO45, SO47,
+A83, A84, each "resolves on hw-rmbp now; delete the entry"), a file this arc does not touch.
+**Proved environmental rather than argued:** the four changed files were swapped for their `HEAD`
+contents, `git status` came back clean, and `ledger-check.sh` on that pristine b9edcfa1 tree
+reported **the identical five findings** and rc 1 (403 rows; this tree, 404). The files were then
+restored and re-verified by sha256. An earlier run of this gate failed differently — `cfg-gated
+kernel code did not compile` — while the bench overlay was at 100% (`No space left on device`);
+that is an ENOSPC artefact and did not reproduce once the filesystem recovered.
+
+`bash unaos/scripts/ledger-check.sh` — rc 0 before the edits (403 rows), rc 1 after **for the five
+orin-queue findings above only**, which the pristine baseline reproduces. No finding names a file
+this arc changed; row count 403 → 404 (B134) with zero new findings.
+
+**THE QEMU RUN — `UNAOS_QUARRY=1 ./arroyo test-ptr 150`, rc 0**, full wall 160.6 s, capture clean,
+`✔ spec replay: every pinned line in x86-ptr.spec is present`. The lane is `test-ptr` rather than
+`test 150` deliberately and the reason is in x86-ptr.spec's own header: every other x86 leg carries
+a `usb-tablet` ONLY (absolute → `set_abs`, never `x86_ptr_install`), so `test 150` reads the ZERO
+CONTROL and cannot exercise one line of this arc. `test_ptr` re-execs with `UNAOS_WC=1
+UNAOS_QEMU_FULL=1`, and `UNAOS_QUARRY=1` carries through the re-exec, so the built set is
+`witness,ehcihid,kbdwit,sdhcblk,smolnet,wc,quarry,sdwrite`. The wire:
+
+    [ptrinstall] installs=36 reports=36 lag_max_ms=17 coalesced=0 drains=36 folds=0 \
+        fold_age_max_ms=0 drain_gap_max_ms=69 panel_busy=1
+    :: PTRINSTALL: installs=36 reports=36 folds=0 lag_max_ms=17 coalesced=0 drains=36 ::
+    :: PTRLAG: x86_ptr_install geometry across a HELD WRITER — held: refused+1 busy+1 \
+        answered=Some((1280, 800)) | primed=1280x800 | released: read+1 tries=1 :: PASS ::
+
+Read honestly, term by term. B117's identity is intact (`installs == reports == 36`, `drains=36`).
+`folds=0` and therefore `fold_age_max_ms=0` — **correct and not a silent zero**: TCG under a 36-move
+typist has no storm, nothing is ever folded, so the term has no population. `drain_gap_max_ms=69`
+fires on a quiet lane, which is the point — the term is not structurally zero, and 69 ms on an idle
+QEMU against the rMBP's ~211 ms mean loop period is the right order. `panel_busy=1` is **exactly the
+fixture's own held read and nothing else**: on this lane the installer met contention once, when
+this arc's own fixture manufactured it. That is the honest reading and it is the one stated in
+advance — QEMU has nothing like the rMBP's `amp=4.44x` present storm, which is precisely why the
+go-red is a hang and not a threshold. The late `:: PTRINSTALL:` line is unchanged, so its
+` ::`-terminated pin still matches.
+
+**THE GO-RED — rc 1, and it is the mechanism rather than a mutated assertion.** `ptrlag_panel_wh`'s
+body was reverted to the pre-PTRLAG `*WRITER.lock()` (nothing else in the tree changed) and the same
+command re-run: `A run that stopped before its last fixture is NOT a pass`, **1,348 serial lines
+against the green run's 2,422**, **zero `:: PTRLAG:` lines** (the fixture never returned) and **zero
+`[ptrinstall]` lines** (the input task never reached its loop, so not one report was ever taken off
+the ring). That last pair is the finding restated as a fact: with the blocking acquire back, one
+contended panel read takes the ENTIRE input path down with it, which is what it means for the
+pointer to wait on the compositor. `main.rs` was then restored and verified byte-identical by
+sha256.
