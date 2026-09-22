@@ -17,13 +17,17 @@
 // kept its polled re-arm and the internal trackpad paid for it in dark windows (rmbp ledger B139;
 // EHCIDARK measured up to 108 ms with `missed<=11384`).
 //
-// THIS FILE IS RUNG 1: THE CENSUS. It reads what firmware declares and what the hardware answers,
-// and it writes NOTHING. The routing API (rung 2) and the PCI arm (rung 3) land on top of it.
+// RUNG 1 IS THE CENSUS (`madt_entry` / `census`): it reads what firmware declares and what the
+// hardware answers, and writes NOTHING. RUNG 2 IS THE ROUTE (`route_gsi` / `set_mask` / `unroute` /
+// `route_pci_intx`): the first redirection-entry writer this kernel has ever had. The PCI arm that
+// calls it from a driver is rung 3.
 //
 // CLEAN ROOM. Every register field below is cited to a public specification and to nothing else:
 // the Intel 82093AA I/O APIC datasheet (§3.1 the IOREGSEL/IOWIN window, §3.2.1 IOAPICID, §3.2.2
-// IOAPICVER), and ACPI 6.x §5.2.12 (MADT: §5.2.12.3 I/O APIC, §5.2.12.5 Interrupt Source Override
-// and the MPS INTI flags, §5.2.12.7 Local APIC NMI).
+// IOAPICVER, §3.2.4 the 64-bit redirection entry), ACPI 6.x §5.2.12 (MADT: §5.2.12.3 I/O APIC,
+// §5.2.12.5 Interrupt Source Override and the MPS INTI flags, §5.2.12.7 Local APIC NMI), and PCI
+// Local Bus 3.0 (§2.2.6 INTx is level-triggered and active low, §6.2.4 the Interrupt Line and
+// Interrupt Pin configuration registers).
 //
 // MECHANISM, THE OPEN QUESTION AND THE FLIGHT EXPECTATION: docs/dev/OS/01_BOOT_HAL/ioapic.md.
 
@@ -49,6 +53,27 @@ const REG_ID: u32 = 0x00;
 /// IOAPICVER (§3.2.2): version in bits 7:0, "maximum redirection entry" in bits 23:16 — that field
 /// is the LAST valid index, so the entry COUNT is it plus one.
 const REG_VER: u32 = 0x01;
+/// IOREDTBL[0] low dword (§3.2.4). Entry n occupies index 0x10 + 2n (low) and 0x11 + 2n (high).
+const REG_REDTBL: u32 = 0x10;
+
+// ── Intel 82093AA §3.2.4 — the 64-bit redirection entry, field by field ────────────────────────
+/// Bits 10:8 delivery mode. `000` = Fixed: deliver `vector` to the listed destination, with no
+/// arbitration and no redirection hint. The only mode this kernel programs.
+const DELIVERY_FIXED: u32 = 0b000 << 8;
+/// Bit 11 destination mode. 0 = physical (bits 63:56 are an APIC id), 1 = logical.
+const DEST_PHYSICAL: u32 = 0 << 11;
+/// Bit 13 interrupt input pin polarity: 0 = active high, 1 = active low.
+const POLARITY_LOW: u32 = 1 << 13;
+/// Bit 15 trigger mode: 0 = edge, 1 = level.
+const TRIGGER_LEVEL: u32 = 1 << 15;
+/// Bit 16 interrupt mask: 1 = this entry delivers nothing.
+const MASK: u32 = 1 << 16;
+/// Bits 12 (delivery status) and 14 (remote IRR) are READ-ONLY status the controller owns, so they
+/// are excluded from every read-back comparison. Everything else in the low dword is ours.
+const RO_STATUS: u32 = (1 << 12) | (1 << 14);
+/// A redirection entry with nothing in it but the mask — what `unroute` leaves behind, and the
+/// controller's own post-reset state (§3.2.4: the mask bit is set to 1 after a hardware reset).
+const ENTRY_MASKED_EMPTY: u32 = MASK;
 
 /// A machine is allowed more than one I/O APIC (each owns a contiguous GSI range starting at its
 /// own `gsi_base`). Four covers the 7-series PCH (one) and every part this kernel will meet; a
@@ -181,9 +206,13 @@ impl Census {
 /// contended and is never taken from an ISR.
 pub(crate) static CENSUS: spin::Mutex<Census> = spin::Mutex::new(Census::EMPTY);
 
-/// Census lines emitted. Read by nothing yet; it exists so a boot can say how much of the MADT this
-/// module actually understood without walking the table a second time.
+/// Census lines emitted. It exists so a boot can say how much of the MADT this module actually
+/// understood without walking the table a second time.
 static SEEN: AtomicU32 = AtomicU32::new(0);
+
+/// Redirection entries this module currently holds programmed. Reported on the arm line so a boot
+/// can say how many interrupts this kernel routed without walking the hardware again.
+static ROUTED: AtomicU32 = AtomicU32::new(0);
 
 /// Record one MADT entry. Called from `acpi::parse_madt`'s catch-all arm for EVERY entry type that
 /// walk does not itself consume, so the three types below are picked out here rather than by
@@ -253,6 +282,15 @@ pub unsafe fn madt_entry(etype: u8, base: usize, len: usize) {
 pub(crate) unsafe fn read_reg(addr: u32, reg: u32) -> u32 {
     core::ptr::write_volatile((addr as u64 + IOREGSEL) as *mut u32, reg);
     core::ptr::read_volatile((addr as u64 + IOWIN) as *const u32)
+}
+
+/// Select `reg` in IOREGSEL and write IOWIN (82093AA §3.1). Same non-atomicity note as `read_reg`;
+/// the same lock discipline answers it.
+///
+/// SAFETY: `addr` must be a mapped I/O APIC MMIO base.
+pub(crate) unsafe fn write_reg(addr: u32, reg: u32, val: u32) {
+    core::ptr::write_volatile((addr as u64 + IOREGSEL) as *mut u32, reg);
+    core::ptr::write_volatile((addr as u64 + IOWIN) as *mut u32, val);
 }
 
 /// Print what the MADT declared and what the hardware answers, and map each controller's MMIO
@@ -352,4 +390,213 @@ pub fn census() {
         c.dropped,
         SEEN.load(Ordering::Relaxed)
     );
+}
+
+// ── RUNG 2: THE ROUTE ──────────────────────────────────────────────────────────────────────────
+//
+// THE FIRST REDIRECTION-ENTRY WRITER IN THIS KERNEL'S HISTORY. Everything above this line reads;
+// everything below it can write exactly one thing — a 64-bit IOREDTBL entry — and reads it back
+// before it will say it did.
+
+/// Why a route could not be programmed. Every one of these is a REFUSAL that leaves the machine
+/// exactly as it was, which is the same posture `ehci::isr_arm_controller` takes about MSI: a
+/// half-armed interrupt controller is worse than an unarmed one, because the driver's fallback is
+/// correct and its own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RouteErr {
+    /// No controller's `[gsi_base, gsi_base + entries)` range contains this GSI.
+    NoController,
+    /// The controller owning this GSI failed its IOAPICVER read in `census`, so `entries` is 0 and
+    /// it is structurally unroutable. See the refusal `census` prints for it.
+    Unreadable,
+    /// The entry read back as something other than what was written.
+    Readback,
+}
+
+impl RouteErr {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteErr::NoController => "no-controller-owns-this-gsi",
+            RouteErr::Unreadable => "controller-unreadable",
+            RouteErr::Readback => "entry-readback-mismatch",
+        }
+    }
+}
+
+/// Find the controller index and redirection-entry index for a GSI. `None` when no controller owns
+/// it, or when the owning controller was refused by the census (`entries == 0`) — which is what
+/// makes an unreadable controller unroutable rather than merely undocumented.
+fn locate(c: &Census, gsi: u32) -> Option<(usize, u32)> {
+    for i in 0..c.n_ioapics {
+        let ia = c.ioapics[i];
+        if ia.entries == 0 || ia.addr == 0 {
+            continue;
+        }
+        if gsi >= ia.gsi_base && gsi < ia.gsi_base + ia.entries as u32 {
+            return Some((i, gsi - ia.gsi_base));
+        }
+    }
+    None
+}
+
+/// Program ONE redirection entry, MASKED, and return the 64-bit entry as read back.
+///
+/// The entry is built per 82093AA §3.2.4: `vector` in bits 7:0, delivery mode Fixed, physical
+/// destination mode, the caller's polarity and trigger, the destination APIC id in bits 63:56, and
+/// the MASK bit SET.
+///
+/// **MASKED IS NOT A DETAIL.** An entry that goes live the instant it is written can deliver to a
+/// vector whose handler the caller has not finished preparing — and the caller is the only code
+/// that knows when that is true. Unmasking is `set_mask`, a separate call, made by the caller when
+/// it is ready.
+///
+/// **THE WRITE ORDER IS LOAD-BEARING TOO:** high dword (destination) first, low dword second, so
+/// the dword carrying the vector and the mask is the last thing the controller latches.
+///
+/// Then it READS THE ENTRY BACK AND COMPARES — "programmed" is a measurement here, not a write we
+/// hope landed, which is the same rule `isr_arm_controller` applies to `USBINTR`. Bits 12 and 14
+/// are the controller's own read-only status and are excluded; every field this function chose is
+/// compared, and a mismatch is a refusal.
+pub fn route_gsi(
+    gsi: u32,
+    vector: u8,
+    polarity: Polarity,
+    trigger: Trigger,
+    dest_apic: u8,
+) -> Result<u64, RouteErr> {
+    let c = CENSUS.lock();
+    let (i, idx) = locate(&c, gsi).ok_or(RouteErr::NoController)?;
+    let addr = c.ioapics[i].addr;
+
+    let mut lo = vector as u32 | DELIVERY_FIXED | DEST_PHYSICAL | MASK;
+    if polarity == Polarity::ActiveLow {
+        lo |= POLARITY_LOW;
+    }
+    if trigger == Trigger::Level {
+        lo |= TRIGGER_LEVEL;
+    }
+    let hi = (dest_apic as u32) << 24;
+
+    let (rlo, rhi) = unsafe {
+        write_reg(addr, REG_REDTBL + 2 * idx + 1, hi);
+        write_reg(addr, REG_REDTBL + 2 * idx, lo);
+        (
+            read_reg(addr, REG_REDTBL + 2 * idx),
+            read_reg(addr, REG_REDTBL + 2 * idx + 1),
+        )
+    };
+    if (rlo & !RO_STATUS) != (lo & !RO_STATUS) || (rhi & 0xFF00_0000) != hi {
+        return Err(RouteErr::Readback);
+    }
+    ROUTED.fetch_add(1, Ordering::Relaxed);
+    Ok(((rhi as u64) << 32) | rlo as u64)
+}
+
+/// Set or clear the MASK bit (§3.2.4 bit 16) on an already-programmed entry, leaving every other
+/// field exactly as it was. Read-modify-write, then read back — an unmask that did not stick is
+/// precisely the state that makes an ISR silently absent, so it is measured rather than assumed.
+/// Returns the entry's low dword as read back.
+pub fn set_mask(gsi: u32, masked: bool) -> Result<u32, RouteErr> {
+    let c = CENSUS.lock();
+    let (i, idx) = locate(&c, gsi).ok_or(RouteErr::NoController)?;
+    let addr = c.ioapics[i].addr;
+    unsafe {
+        let lo = read_reg(addr, REG_REDTBL + 2 * idx);
+        let next = if masked { lo | MASK } else { lo & !MASK };
+        write_reg(addr, REG_REDTBL + 2 * idx, next);
+        let back = read_reg(addr, REG_REDTBL + 2 * idx);
+        if (back & MASK) != (next & MASK) {
+            return Err(RouteErr::Readback);
+        }
+        Ok(back)
+    }
+}
+
+/// Retire a route: put the entry back to the controller's post-reset shape (§3.2.4). The mask is
+/// written in the SAME dword as the cleared vector, so the entry can never be briefly live with a
+/// vector of zero.
+pub fn unroute(gsi: u32) -> Result<(), RouteErr> {
+    let c = CENSUS.lock();
+    let (i, idx) = locate(&c, gsi).ok_or(RouteErr::NoController)?;
+    let addr = c.ioapics[i].addr;
+    unsafe {
+        write_reg(addr, REG_REDTBL + 2 * idx, ENTRY_MASKED_EMPTY);
+        write_reg(addr, REG_REDTBL + 2 * idx + 1, 0);
+        if read_reg(addr, REG_REDTBL + 2 * idx) & MASK == 0 {
+            return Err(RouteErr::Readback);
+        }
+    }
+    ROUTED.fetch_sub(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// How many redirection entries this module currently holds programmed.
+pub fn routed() -> u32 {
+    ROUTED.load(Ordering::Relaxed)
+}
+
+/// Which GSI does this PCI function's INTx pin land on, and with what polarity and trigger?
+///
+/// THE ANSWER COMES FROM THE FUNCTION'S OWN CONFIG SPACE (PCI 3.0 §6.2.4): Interrupt Pin at 0x3D
+/// says which of INTA#..INTD# it asserts (0 = none), and Interrupt Line at 0x3C is the IRQ number
+/// FIRMWARE programmed for it.
+///
+/// ⚠ THE DSDT `_PRT` IS NOT CONSULTED, AND THAT IS THIS RUNG'S STATED LIMIT, not an oversight. The
+/// authoritative PCI interrupt routing table is `_PRT`, which is AML — an interpreter this kernel
+/// does not have and this arc does not write. So the mapping is: take firmware's own Interrupt
+/// Line and push it through the Interrupt Source Override table (identity when no override names
+/// it). On a machine whose firmware left Interrupt Line unprogrammed the honest answer is REFUSED
+/// — `reason=no-firmware-line`, printed — and the caller keeps polling exactly as it did before.
+/// See docs/dev/OS/01_BOOT_HAL/ioapic.md §4.
+///
+/// THE DEFAULT POLARITY AND TRIGGER ARE PCI'S, NOT ISA'S: INTx is LEVEL TRIGGERED and ACTIVE LOW
+/// (PCI 3.0 §2.2.6). An override naming this line wins over that default, because an override is
+/// firmware telling us about this specific line; an override whose flags say `bus-default` leaves
+/// the PCI default in place, which is what `BusDefault` being its own value buys.
+pub fn route_pci_intx(bus: u8, dev: u8, func: u8) -> Option<(u32, Polarity, Trigger)> {
+    let intr = unsafe { crate::arch::pci::read_config_32(bus, dev, func, 0x3C) };
+    let line = (intr & 0xFF) as u8;
+    let pin = ((intr >> 8) & 0xFF) as u8;
+    let pin_name = if pin >= 1 && pin <= 4 { (b'A' + pin - 1) as char } else { '?' };
+
+    if pin == 0 || pin > 4 {
+        serial_println!(
+            "[ioapic] route bdf={}:{}.{} pin=INT{} line={} -> REFUSED reason=no-intx-pin — this function declares no INTx pin, so there is no legacy assertion to route and nothing was written == witness ::",
+            bus, dev, func, pin_name, line
+        );
+        return None;
+    }
+    if line == 0 || line == 0xFF {
+        serial_println!(
+            "[ioapic] route bdf={}:{}.{} pin=INT{} line={} -> REFUSED reason=no-firmware-line — firmware programmed no IRQ for this function and this rung does not interpret the DSDT _PRT, so the GSI is UNKNOWN rather than guessed; nothing was written == witness ::",
+            bus, dev, func, pin_name, line
+        );
+        return None;
+    }
+
+    let (mut gsi, mut pol, mut trig) = (line as u32, Polarity::ActiveLow, Trigger::Level);
+    let mut via = "identity";
+    {
+        let c = CENSUS.lock();
+        for i in 0..c.n_isos {
+            let iso = c.isos[i];
+            if iso.bus == 0 && iso.irq == line {
+                gsi = iso.gsi;
+                if Polarity::from_flags(iso.flags) != Polarity::BusDefault {
+                    pol = Polarity::from_flags(iso.flags);
+                }
+                if Trigger::from_flags(iso.flags) != Trigger::BusDefault {
+                    trig = Trigger::from_flags(iso.flags);
+                }
+                via = "iso";
+                break;
+            }
+        }
+    }
+
+    serial_println!(
+        "[ioapic] route bdf={}:{}.{} pin=INT{} line={} -> gsi={} via={} polarity={} trigger={} == witness ::",
+        bus, dev, func, pin_name, line, gsi, via, pol.as_str(), trig.as_str()
+    );
+    Some((gsi, pol, trig))
 }
