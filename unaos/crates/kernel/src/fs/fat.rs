@@ -738,10 +738,10 @@ impl BlockSource {
             // what `write_block_usb` calls with index 0 — so a second card cannot have a different
             // write posture from the first by accident. One arm, both spellings.
             BlockSource::Usb | BlockSource::UsbN(_) => None,
-            // SDHC-4b/4c: the internal reader admits CMD24 only inside the reserved flight-recorder
-            // extent, which no file verb can name. See [`crate::fs::sdhc4c`].
+            // SDHCPOST (B155): a FORWARD to `drivers::block`'s §SDHCPOST — the ONE definition, which
+            // `handle_write_veto`'s `Sdhc` arm also forwards to, so leg 8 of `sdwrite_posture_selftest` agrees BY CONSTRUCTION. This arm keeps its OWN string (it is printed about a FAT MOUNT; the block layer's twin is printed about the native root), and that string is ALSO condition 1's answer: without `sdw-rw` the callee is the `not(sdw-rw)` twin and returns exactly this `Some(…)`, so `knoboff sdw-rw` measures byte-identity rather than being promised it. It was an UNCONDITIONAL `Some(…)` — which is what flight 11's screenshot ran into.
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-            BlockSource::Sdhc => Some(
+            BlockSource::Sdhc => crate::drivers::block::sdhc_write_veto(
                 "the internal SD reader is mounted READ-ONLY \u{2014} only the reserved \
                  flight-recorder extent admits a write (SDHC-4c), and no file verb can name it",
             ),

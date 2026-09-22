@@ -1470,6 +1470,32 @@ sdwritefx = ["sdwrite", "sdmmc"]
 # x86_64 only; aarch64 media are byte-identical. See docs/dev/OS/07_USB_STORAGE/sdhc.md §SDHC-4a.
 sdw = []
 
+# SDHCPOST (rmbp-ledger B155, x86): `UNAOS_SDW_RW=1` lifts the internal SD card's FAT mount from
+# READ-ONLY to READ-WRITE — the posture half of milestone 4b that SDHCWRITE correctly refused to
+# build from the files it was given. The answer has ONE definition, `drivers::block::sdhc_write_veto`
+# (§SDHCPOST at that file's tail), and BOTH readers forward to it: `fat::BlockSource::write_veto`'s
+# `Sdhc` arm and `block::handle_write_veto`'s, which is what makes leg 8 of
+# `fs::bootdisk::sdwrite_posture_selftest` agree by construction rather than by two arms being kept
+# in step. `rw` needs all THREE of: this feature built, the write-protect PIN read at MOUNT saying
+# enabled, and a live block-layer write path — and a refusal names which of the three said no
+# (`sdw-off` / `wp-protected` / `no-write-path`), on a truth-table line printed once at the mount.
+#
+# IMPLIES `sdw`, and that is not convenience: without 4a/4b's ladder the image carries no CMD24 and
+# no CMD25 word at all, so a "writable" volume would admit a mutation to a path that cannot write a
+# byte — `rw=yes` over a refusing stub, which is the exact failure A60 built its one-posture rule to
+# stop. It also RETIRES two of SDHC-4c's published claims for the duration of the boot (the closed
+# writable set, and "the card has no FAT mutator"): `fs/sdhc4c.rs` §SDHCPOST says so in those words,
+# because a file verb on a writable volume IS a FAT mutator and FAT has no journal.
+#
+# DEFAULT OFF, deliberately and not provisionally. The bench rMBP boots from this card, so making it
+# writable by default is a decision about power-cut exposure on a journal-less filesystem, not a
+# build flag — rmbp-ledger B155 states it with its costs and it is Peter's. Default OFF => the
+# `not(sdw-rw)` twin of `sdhc_write_veto` compiles, which returns its caller's own string and nothing
+# else, so both readers are byte-for-byte their pre-SDHCPOST selves (`./arroyo knoboff sdw-rw`).
+# x86_64 only; aarch64 media byte-identical (stripped by arroyo's `arm_features`, like `sdw`).
+# Kept in sync with arroyo and builder/src/main.rs.
+sdw-rw = ["sdw"]
+
 # SDHC-4b (GR20, x86): `UNAOS_SDHCBLK=1` makes the INTERNAL SD card a real block backend, so `fs::fat`
 # can mount it. Boot AC identified the card and Boot AD wrote to it, but nothing above `drivers/sdhc.rs`
 # could reach those primitives: `drivers/block.rs` has two backends and every SD arm in it is

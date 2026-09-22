@@ -2636,3 +2636,218 @@ Items 2 and 3 are the mechanism the flight-11 screenshot refusal needs, and both
 files this section's arc was scoped to. `rmbp-ledger.md` B140 carries the posture truth table they
 would implement, and the decision — default-rw boot volume, or ro with a reserved writable area —
 that is Peter's and not this arc's.
+
+> **ALL THREE ARE NOW CLOSED — §15 (SDHCPOST, B155) is what closed them, and it found a FOURTH the
+> list above did not name: the posture has TWO readers, not one.** `drivers/block.rs`'s
+> `handle_write_veto` stated it a second time, and `fs::bootdisk::sdwrite_posture_selftest` leg 8
+> compares the two for every source in `fat::ALL_SOURCES` — so lifting item 2 alone, exactly as
+> written above, would have turned that leg red (`sdhc=rw!DISAGREES`) and reddened every QEMU run
+> through arroyo's generic `-> FAIL` scan. The one line in one place was a one line in TWO places,
+> and §15.3 is why it is now genuinely one.
+
+## 15. SDHCPOST (rmbp-ledger B155) — the card becomes WRITABLE, and only under a knob
+
+§14 put CMD25 in the driver and the card was still `ro`, because the posture that decides whether a
+file verb may reach the medium was not in any file that arc could touch. This section is that
+posture. It is the half flight 11 asked for when Peter pressed Print Screen and the machine said
+
+```text
+:: PRTSCR: REFUSED READ-ONLY (source=sdhc … SDHC-4c)
+```
+
+### 15.1 The defect, in one sentence
+
+`fat::BlockSource::write_veto`'s `Sdhc` arm returned `Some(…)` **unconditionally**, and every other
+reader in the kernel — `FatFs::write_veto`, `FatBackend::read_only`, the `HOMESOIL: posture` census,
+`prtscr::mount_capture_target`'s rung 1 — is a forward to it. So three milestones of write
+machinery (4a's CMD24, 4b's CMD25, 4c's permitted extent) sat in the image with no path from a file
+verb to any of them. Nothing was broken; nothing was connected.
+
+### 15.2 The three conditions, and why a refusal names which one said no
+
+`sdhc=rw` requires all three. They fail for unrelated causes and send a reader to three different
+places, so the refusal carries a token rather than a mood:
+
+| # | condition | refusal token | where a reader goes next |
+| :-- | :-- | :-- | :-- |
+| 1 | the `sdw-rw` feature is BUILT | `sdw-off` | the knob, in all four places (§15.6) |
+| 2 | the write-protect PIN, read AT MOUNT, says enabled | `wp-protected` | the slider on the card |
+| 3 | the block layer has a LIVE write path (`sdhc_info()` published) | `no-write-path` | whether the card registered at all |
+
+**Condition 2 is deliberately not the read 4a and 4b do.** `write_block_512` and `write_blocks_512`
+re-read Present State bit 19 at the moment of *every* write and go on doing so (§14.4 gate 2). The
+posture's read answers a different question — *may this VOLUME be mounted writable* — and it is
+answered ONCE, at the mount, because that is what `write_veto` exists to do: say no **in advance**,
+before a multi-step file verb (`write`'s delete-then-recreate, `mv`) gets part-way. The two reads
+cannot disagree dangerously, because the posture is the looser of the pair and the per-write read
+still refuses underneath it. A latch also means a volume's posture cannot change under an open file
+verb because somebody brushed the slider mid-capture.
+
+The truth table is printed once, at the mount, **whatever the verdict** — including `ro`. An
+operator who armed both knobs and still got a read-only card needs the row that says which condition
+refused, not the absence of a line.
+
+### 15.3 THE POSTURE HAD TWO READERS, AND §14.7 SAID ONE
+
+This is the finding that changed the shape of the work, and it was not in the owed list.
+
+`drivers/block.rs`'s `handle_write_veto` — A60's per-HANDLE view — carried its own
+`BlockHandle::Sdhc => Some(NATIVE_SDHC_VETO)`, and `fs::bootdisk::sdwrite_posture_selftest` **leg 8**
+compares the FAT view against the block view for every source in `fat::ALL_SOURCES`:
+
+```rust
+let fat_admits = src.write_veto().is_none();
+let blk_admits = crate::drivers::block::handle_write_veto(fat::handle_of(*src)).is_none();
+if fat_admits != blk_admits { agree = false; }
+```
+
+`sdwrite` rides every x86 image, so that leg compiles and runs on `./arroyo test`. Lifting the FAT
+arm alone — the "one line in one place" §14.7 describes — would have printed `sdhc=rw!DISAGREES` and
+`FAIL ::`, which arroyo's generic `-> FAIL` scan turns into a red run. The fixture built to catch
+exactly this drift would have caught it, which is the fixture working.
+
+**The fix is not to keep two arms in step; it is to have one arm.** The single definition is
+`drivers::block::sdhc_write_veto`, in that file's tail §SDHCPOST, and BOTH readers forward to it —
+the A60 shape, one layer up. Leg 8 now agrees by construction rather than by two authors' care.
+
+The signature is the one unusual part and it is a byte-identity decision as much as an honesty one:
+the function takes the caller's own refusal STRING as a parameter. The two callers print about two
+different mounts (`NATIVE_SDHC_VETO` is about the native root; `fat.rs`'s is about a FAT volume) and
+a reader chasing a refusal must land on the layer that refused. Passing the string in means the
+`sdw-rw`-OFF twin is `#[inline(always)] fn(s) -> Some(s)`, so a knob-off image contains exactly the
+two strings and exactly the two `Some(…)` it contained before this arc — and `./arroyo knoboff
+sdw-rw` can therefore return 0 instead of a reasoned excuse.
+
+### 15.4 CMD25 through the block layer, decided by a number and not by "faster"
+
+§14.1 left `write_blocks_sdhc` looping CMD24 on purpose, because `fs::sdhc4c` published
+`cmd24 == bytes / 512` as a falsifiable prediction and re-pointing the path would have made a
+shipped witness name a command the card never saw. That was right. It also rested on a premise —
+"one sector per file-verb write is the common case" — which is **false for the workload that asked
+for the posture in the first place**:
+
+| | |
+| :-- | :-- |
+| `video/prtscr.rs` hands per `write_grow` | `SLICE_WRITE` = 32 KiB (`prtscr.rs:329`) |
+| `write_grow` step 3 pushes the whole-sector interior through | `write_span` → `fat::write_sectors` |
+| `write_sectors` chunks at | `MAX_BLOCKS_PER_OP` = `STORAGE_DATA_BYTES / 512` = **64** |
+| the driver's own multi-block bound is | `sdhc::MB_MAX_BLOCKS` = **64** |
+| so ONE capture slice is | **exactly one CMD25** |
+| and the rMBP's 15.5 MB screenshot is | ~484 slices (`prtscr.rs:331`) |
+| where the CMD24 loop issued | ~31,700 single-block writes |
+
+**~64× fewer card transactions for one screenshot**, each saved transaction a command, a response, a
+Buffer-Write-Ready re-arm and a DAT0 busy poll.
+
+**The route is gated on `sdw-rw`, not on `sdw`, and that is the honest gate rather than the
+convenient one.** `fs::sdhc4c`'s counter is printed, and a counter's NAME must name the command the
+card actually saw. On a `ro` build the write path really is the CMD24 loop — the only FAT-layer
+writes are 4c's reserved-extent ones, which every capture since 4c has been read against — so that
+build keeps `cmd24=` **verbatim**, down to the byte. Only an `sdw-rw` build takes CMD25, and only it
+prints `sectors=`, whose prediction `sectors == bytes / 512` is true of both commands and names
+neither. Neither polarity's witness lies, no existing capture is re-based, and — measured, not
+argued — `./arroyo knoboff sdw` stays byte-identical, which it could not have done had the rename
+landed on the shipped line. This is what §14.1 meant by "this file does not make a witness lie in
+order to be faster", answered rather than deferred.
+
+### 15.5 What SDHC-4c LOSES, stated as a retirement rather than an exception
+
+Two of 4c's load-bearing claims stop being true while `sdw-rw` is on, and `fs/sdhc4c.rs` now says so
+in its own module doc rather than leaving them standing:
+
+* *"There is no knob that widens the set."* There is now exactly one.
+* *"The card acquires a writer that is not a FAT mutator."* On a writable volume a file verb **is** a
+  FAT mutator — it allocates clusters, links the FAT in every copy and publishes a directory entry.
+
+**Why the bound had to go rather than widen**, because the smaller change is the obvious one and it
+cannot work: a capture does not write one extent. It CREATES a file (a directory-sector RMW), GROWS
+it (an `alloc_cluster` per 32 KiB, each a FAT write to every copy) and publishes its size LAST
+(another directory RMW). Those sectors live BELOW `data_start`, where §11's own proof shows the
+extent can never reach. A widened extent would admit the data and refuse the metadata — i.e. refuse
+the file. So the permit is no longer the gate; the gate is the mount posture, the block layer's
+bounds, and the driver's four per-write gates, which are all still there.
+
+The instrument follows the meaning. `note_fat_mutation`'s `!!` defect line keeps its exact sense for
+every `ro` build — which is every shipped build — and an `sdw-rw` boot accounts the same event as
+`:: SDHC4C: mutation expected …` against a separate counter. Folding the two would have retired an
+instrument in order to avoid renaming it.
+
+**What is honestly lost, and it is not mitigated here.** FAT has no journal. A power cut between the
+FAT write and the directory write leaves a cluster chain nothing points at; a cut between two FAT
+copies leaves them disagreeing. 4c's reserve-once shape had NO exposure to either, because it never
+touched a FAT or a directory sector at all. An `sdw-rw` boot has the exposure of any FAT writer.
+That is the trade. It is why the knob is opt-in, and it is the substance of the decision B155 puts
+to Peter.
+
+### 15.6 The knob, in four places and one type-check leg
+
+`UNAOS_SDW_RW=1` → feature `sdw-rw`, which **implies `sdw`**: without 4a/4b's ladder the image
+carries no CMD24 and no CMD25 word at all, so a "writable" volume would admit a mutation to a path
+that cannot write a byte — `rw=yes` over a refusing stub, the exact failure A60's one-posture rule
+exists to stop.
+
+| place | what it is |
+| :-- | :-- |
+| `crates/kernel/Cargo.toml` | `sdw-rw = ["sdw"]` |
+| `unaos/arroyo` knob map | `[ -n "${UNAOS_SDW_RW:-}" ] && _feats="${_feats}sdw-rw,sdw,"` |
+| `unaos/builder/src/main.rs` | `if std::env::var("UNAOS_SDW_RW").is_ok() { feats.push("sdw-rw"); }` |
+| `arm_features` | stripped, like `sdw` — x86-only arms, so aarch64 media stay byte-identical |
+
+The builder mapping is the one that matters most in this arc: mapped in arroyo alone, a boot would
+print `sdhc=ro` and refuse the capture **on a run the operator armed**, which reads exactly like a
+card that said no. The truth-table line exists for the same reason `armed=` does — so the gate
+catches that omission instead of the operator (s42/INSTGUI, WXN-M3b). `KERNEL_CFG_MATRIX`'s
+`x86-all` leg names `sdw-rw` literally (the ON polarity); `x86-all-nowitness` does not, which is the
+OFF polarity type-checked.
+
+### 15.7 A second knob this arc had to unblock: R54 and the session
+
+`PRTSCR` refuses a capture with **no user session** (`Refusal::NoSession`, R54, Peter 2026-09-13:
+*"do not hack screenshots to make it work right before multi-user is in"*), and that check is
+**first — ahead of the panel and ahead of the volume** (`prtscr.rs:143-146`): *"A capture that can
+never belong to anyone must not spin up the PRTSCR-VOL ladder."* So without a session
+`mount_capture_target` is never called at all, the PRTSCR-VOL witness never prints, and **no
+posture, writable or not, can produce a landed capture.**
+
+`arroyo`'s `UNAOS_LOGIN` note claimed `builder/src/main.rs` carried no mapping and that the x86
+`./arroyo test` lane therefore could not compile `login`. **That note was stale** — the builder maps
+both `UNAOS_LOGIN` and `UNAOS_LOGINST` — and it is corrected in place, because a false note in the
+knob map is how a lane stays believed-impossible. The capture leg of this arc's gate runs with both.
+
+### 15.8 THE DECISION IS NO LONGER OPEN — R59, and why this section is still written in the other polarity
+
+B140 parked one question for Peter: does the boot volume's DEFAULT posture become `rw`, or stay `ro`
+with a reserved writable area? **He answered it on 2026-09-22, while this arc was in flight. R59,
+verbatim: "read write."**
+
+R59 in full force: the boot volume mounts READ-WRITE **by default, on every board**; the only
+refusals left are the card's WP pin and a **named opt-out** for a cold-witness boot (LAWS §3 —
+default-on with a named opt-out, never opt-in); the SDHC-4c permit ladder and `UNAOS_SDW_RW`
+**retire**; the posture keeps its single definition and only its default flips.
+
+**Everything above is therefore the mechanism and not the shipped polarity, and that is deliberate.**
+The flip is a re-cut, not an edit to this arc, for five reasons worth naming so the next brief does
+not rediscover them:
+
+1. **The feature inverts in all five wiring places** — `sdw-rw` (opt-in) becomes an opt-out
+   `sdw-ro`: Cargo.toml, arroyo's map, `builder/src/main.rs`, `arm_features`, and the
+   `k8-reach.registry` row, plus the banner-cert row and the `KERNEL_CFG_MATRIX` leg.
+2. **The byte-identity argument inverts with it.** Today the claim `./arroyo knoboff sdw-rw` proves
+   is *"the knob-OFF image equals baseline"*. Under R59 the DEFAULT image **must** differ from
+   baseline — that is the point of the ruling — and the claim becomes *"the OPT-OUT image equals
+   baseline"*. Every knoboff verdict in §15.9 is re-derived, none carries over.
+3. **CMD25 and `sectors=` move into the default image.** §15.4's careful split — `cmd24=` kept
+   verbatim for the `ro` build, `sectors=` only under the knob — exists to protect a byte-identity
+   claim that R59 retires. Under rw-by-default the default path IS CMD25, so the default wire is
+   `sectors=` and the `cmd24=` twin is what moves behind the opt-out.
+4. **SDHC-4c's permit ladder RETIRES rather than being bypassed.** §15.5 documents the claims as
+   "true with `sdw-rw` off, retired with it on". Under R59 "off" is the exceptional case, so the
+   module's argument is rewritten around the opt-out rather than around the knob.
+5. **"On every board" reaches files this cut does not hold** — `TegraSd`'s posture is A60's
+   `sdwrite` on the Orin and the Pi's card is `emmc2`, three drivers and three postures.
+
+What survives the re-cut, unchanged, is everything this section actually built: the ONE definition
+with two forwards, the three conditions and their truth table, the WP pin read at mount, the CMD25
+route and the measurement that chose it, the `sdhc4c` expected-mutation vocabulary, and the two
+`builder/src/main.rs` login lines that made the capture leg reachable at all. The polarity is a
+parameter of that mechanism, not its shape.
