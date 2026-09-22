@@ -8,6 +8,81 @@ QEMU behavior. Newest sitting first.
 > in [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) (R19; rmbp-ledger B10). This file stays the
 > per-sitting narrative; the register is the verdict table.**
 
+## PRE-REGISTERED — KVBLANK (rmbp, the GPU line under R53), rungs `kvblank-measure` + `kvblank-wait`, cut 2026-09-22
+
+**NOT FLOWN.** Written here before the boot, unedited afterwards, because that is what makes the
+reading falsifiable. Branch `exec-rmbp-kvblank`, parent `f5d0fb1a`. Knob `UNAOS_KEPLER_VBLANK=1`.
+
+**THE DEFECT, and it is measured, not suspected.** B135 §7 (VUGPERF, fold `4a283725`) decomposed
+flight 11's 139.75 ms composite pass and found the residual charged to neither half of the clock —
+`blit_us - compose_us - present_us` = 46 488 us per pass — is `video::beam::hold` SPINNING on an
+MMIO read of `HEAD_STAT.VERT`. The census: `[wc-h] win=8 beamwaits=4336 beamwait_us=10766899`
+(2.48 ms mean per hold against a 16.667 ms frame), `win=3 beamwait_us=49113217` over 13971 waits,
+`win=2 beammaxwait_us=62007`. The beam wait alone exceeds the presenter's whole 500 us budget by 5x.
+
+**THE REGISTERS.** `gpu_spec.md` §2.3.1 and §2.3.2 carry the table with its citation classes. In
+one line: the EDGE is `HEAD_STAT.VERT[31:16]` (`vblank_count`, rnndb `display/g80_pdisplay.xml:647`,
+**[TREE]**, read out of the same word `scanout_beam` already reads for `vline[15:0]`); the PMC
+routing bit is `NV_PMC_INTR_0`/`NV_PMC_INTR_EN` bit 26 (**[EXT], UNVERIFIED on GK107**); and the
+PDISPLAY-side per-head vblank ENABLE/STATUS pair is **NOT-IN-TREE** and is neither read nor written.
+
+**`mode=poll`, AND THAT IS A FINDING ABOUT THIS TREE.** `arch/x86_64/interrupts.rs` has exactly
+three device vectors — `XHCI_MSI_VECTOR` 0x40, `NIC_MSI_VECTOR` 0x41, `EHCI_MSI_VECTOR` 0x43 — each
+a hard-coded constant with its own `extern "x86-interrupt"` handler and its own `idt[..]
+.set_handler_fn`. There is no `alloc_vector`, no `register_irq`, and no table a driver joins;
+`PciScanner::enable_msi`/`enable_msix` take a vector the caller must already own. A fourth would be
+a NEW interrupt mechanism, which this rung's brief forbids. So the edge is polled — at zero extra
+MMIO cost, because the compositor's own hold loop is the sampler.
+
+**WHAT FLIGHT 12 IS EXPECTED TO PRINT (rung 1).** Pre-registered so a missing line is a finding and
+not a shrug:
+
+```
+:: kepler: vblank pmc-arm bit=26 en_entry=00000000 en_armed=04000000 intr_entry=<w> intr_or=<w> pdisplay_seen=<n>/<n> window_ms=50 deliver=none reason=no-vector-helper restored=00000000 verdict=clean ::
+:: kepler: vblank arm head=0 vt=1852 mode=poll src=HEAD_STAT.VERT[31:16] ::
+:: kepler: vblank head=0 count=<n> period_us=~16667 jitter_us=<n> raster_at_irq=<v> vt=1852 mode=poll vbwaits=<n> vbwait_us=<n> vbgaveup=<n> vbrecheck=<n> ::
+```
+
+`head=0 vt=1852` are flight 8/9's own BEAMX86 readings, carried forward because this rung ARMS ON
+THE HEAD THE BEAM GATE CHOSE rather than choosing again. `period_us` near 16667 is the falsifier: a
+`vblank_count` that is not a frame counter will not produce it. `raster_at_irq` is the PHASE, and it
+is the number rung 2's arm is gated on — **the one reading this flight exists to take.**
+`pdisplay_seen=0/<n>` with a clean restore is a legitimate and informative outcome: it says the
+PDISPLAY source does not latch in PMC with only the PMC-side bit set, which is evidence FOR the
+`NOT-IN-TREE` pair being the real blocker and against any further PMC work.
+
+**RUNG 2 (`kvblank-wait`), and the three conditions its arm is gated on.** In `beam::hold`, beside
+the spin, which is untouched to the character: a source counting (two edges seen), a hazard zone
+covering at least **1/3 of a frame** (`VB_WIDE_DENOM = 3` — entering a zone of width `w` at a
+uniformly random phase costs the spin `w/2` lines, and B135 §7's 2.48 ms / 16.667 ms = 14.9% IS the
+`w/2` of a zone ~30% of a frame wide, so the threshold is the population VUGPERF measured), and
+rung 1's measured phase falling OUTSIDE that zone. The deadline handed to the wait is the SPIN's own
+`t0 + GIVEUP_FRAMES * FRAME_US`, so a present costs one give-up budget whichever arm it took. After
+the edge, ONE confirming raster read; a confirm that lands back inside the zone falls through to the
+spin and is counted `vbrecheck=`. **The wait can only make a present faster, never less safe.**
+
+**THE ORACLE IS METAL, AND QEMU CANNOT STAND IN FOR IT.** q35 answers `:: kepler: no-device ::`:
+`beam_probe` never arms, `scanout_beam()` is `None`, and every hardware path of both rungs is
+unreachable there. What QEMU DOES score is rung 2's property, through a fixture that drives
+`wait_next_edge` — the arm itself, not a copy — from a simulated counter the timer advances:
+
+```
+:: kepler: vblank selftest arm=wait sim=timer period_us=16667 from=<n> advanced=1 waited_us=<n> bound=waited_us<=16667 :: PASS ::
+:: kepler: vblank selftest arm=wait sim=stuck advanced=0 gaveup=1 waited_us=<n> budget_us=33334 bound=gaveup-on-GIVEUP_FRAMES :: GO-RED-OK ::
+```
+
+**THE FOUR-PLACE TRAP FIRED FIRST, AND IT IS RECORDED BECAUSE IT WAS MEASURED.** With the knob in
+`arroyo` alone, the first armed gate run printed `nvidia-kepler-vblank` in the `⚡ kernel features:`
+banner and `awk 'index($0,":: kepler: vblank")'` over `target/serial.log` returned ZERO lines:
+`builder/src/main.rs` compiles the kernel the QEMU gate BOOTS, not only the one media ship, and it
+never reads `$KERNEL_FEATURES`. That is BEAMX86's own documented failure mode — the rastmc/sdwrite
+class — caught on a gate instead of on a card. The builder line and the `x86-all` name landed in
+the same arc.
+
+**STILL OWED AT THE FOLD.** (a) `[wc-h]`'s `vbwaits=`/`vbwait_us=` fields: that line is emitted
+from `video/wm.rs`, which this rung's brief does not name, so the census ships on the
+`:: kepler: vblank` line instead. (b) No `scripts/specs/x86-wc.spec` pin for the fixture verdict.
+
 ## FLOWN — KDHEAD (shut-out register §1, rung KD14), flights 8 and 9, 2026-09-16: BOTH QUESTIONS ANSWERED, and KD3 re-opens
 
 **Capture:** `~/unaos-bench/capture/rmbp12-flight8/ttyUSB0.log`, both boots; scored in

@@ -44,9 +44,46 @@ NVIDIA uses a single large MMIO region (BAR0) for all registers, typically 16MB 
 - `0x001804` **NV_PBUS_PCI_NV_1**: Mirror of PCI config space `0x04` (Command/Status).
 
 ### 2.3 Display Engine (PDISPLAY) - Base `0x610000`
-*(To be detailed in Phase 2 for Modesetting)*
+*(Modesetting is still Phase 2. What is listed here is what this tree READS and CITES today.)*
 - Kepler uses a sophisticated display engine supporting multiple CRTCs (heads) and output resources (SORs).
 - Display heads control timings, while SORs control the physical encoders (eDP, HDMI).
+
+#### 2.3.1 `HEAD_STAT` — the raster position and the vblank counter (BEAMX86, KVBLANK)
+
+Source of record: **envytools rnndb `display/g80_pdisplay.xml:647`** (`HEAD_STAT`: offset `0x6000`,
+stride `0x800`, length 4 — GK104-). No nouveau code was read or transcribed for any row below.
+
+| offset | register | fields | read by | class |
+| --- | --- | --- | --- | --- |
+| PDISPLAY `+0x6000 + head*0x800` | **HEAD_STAT** | per-head status bank, 4 heads | `kepler_display.rs` read-only decode, `beam_probe` | **[TREE]** |
+| `HEAD_STAT + 0x340` | **VERT** | `vline[15:0]` — the raster line; `vblank_count[31:16]` — the FRAME counter | `beam_probe` (arms the x86 beam source), `scanout_beam` (one read per hold iteration), `kepler_vblank::note` (the vblank edge) | **[TREE]**, and BEHAVIOURALLY validated on every boot: `beam_probe` arms a head only if `vline` was seen to CLIMB and `vblank_count` to tick at least twice inside 45 ms |
+| `HEAD_STAT + 0x344` | **HORZ** | horizontal counterpart | read-only decode only | **[TREE]** |
+
+**There is no lines-per-frame register in this bank.** rnndb cites none, so `vtotal` is **SAMPLED**
+— `max(vline) + 1` across at least two whole frames — and cross-checked on the same witness line
+against the head's EVO `SIZE` readback (the ACTIVE raster, so `vtotal >= size_half` is the expected
+relation and never equality).
+
+#### 2.3.2 The vblank INTERRUPT path — what is cited, and what is owed (KVBLANK rung 1)
+
+| register | offset | bit | source | class |
+| --- | --- | --- | --- | --- |
+| `NV_PMC_INTR_0` | BAR0 `0x000100` | `[26]` = PDISPLAY | open-gpu-doc `dev_master`; the public NV50+ PMC interrupt-source table | offset **[TREE]** (§2.1); **bit 26 is [EXT] and UNVERIFIED on GK107** |
+| `NV_PMC_INTR_EN` | BAR0 `0x000140` | `[26]` = PDISPLAY | same | same |
+| PDISPLAY per-head vblank interrupt **ENABLE** | — | — | — | **NOT-IN-TREE** |
+| PDISPLAY per-head vblank interrupt **STATUS** | — | — | — | **NOT-IN-TREE** |
+
+The two `NOT-IN-TREE` rows are named rather than guessed, in the `igpu-dpy … NOT-IN-TREE` idiom
+(`igpu.rs:1731`): no offset for that pair exists in this tree or in the two documents above as this
+seat read them, so `kepler_vblank.rs` neither reads nor writes it. **They are the real blocker on a
+true vblank interrupt** — without them the engine never raises the event, whatever PMC says.
+
+`UNAOS_KEPLER_VBLANK=1` sets **exactly bit 26** in `NV_PMC_INTR_EN` (which `kepler::init` has
+written `0` since the driver's first day), watches `NV_PMC_INTR_0` for 50 ms, and RESTORES the
+captured value with a read-back. Delivery is impossible by construction — this tree has three
+hard-coded IDT vectors and no vector allocator a PCI function can join — so the rung asks whether
+the SOURCE latches, not whether an interrupt arrives, and the vblank EDGE it counts comes from
+`HEAD_STAT.VERT[31:16]` above (`mode=poll`). See `docs/dev/OS/rmbp-ledger.md` B145.
 
 ### 2.4 Host / PFIFO runlist submit - Base `0x002000`
 

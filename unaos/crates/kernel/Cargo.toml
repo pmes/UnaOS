@@ -267,13 +267,13 @@ nvidia-kepler-kfunwedge = ["nvidia-kepler", "nvidia-kepler-fifo"]
 # and media are byte-identical (`./arroyo knoboff nvidia-kepler-vblank`; `./arroyo knoboff beam`
 # measures that the rung-2 fold did not move the beam-off image either). Kept in sync with arroyo
 # and scripts/banner-cert.sh.
-# ⚠ NOT YET IN builder/src/main.rs, and therefore NOT on a literal `x86-*` cfg leg: that file is not
-# in this rung's named set, and the KNOB→BUILDER WIRING CHECK reds `check` for any feature a literal
-# x86 leg names without a builder entry. Consequence, stated rather than left to be discovered: x86
-# METAL MEDIA (`esp-x86`) DO NOT CARRY THIS RUNG YET. The armed polarity is compiled and the artifact
-# certified by `UNAOS_KEPLER_VBLANK=1 ./arroyo test` (which builds from `$KERNEL_FEATURES`), and the
-# owed one-liner is `if std::env::var("UNAOS_KEPLER_VBLANK").is_ok() { feats.push("nvidia-kepler-vblank"); }`
-# beside its siblings, plus the name on `x86-all`.
+# FOUR PLACES, and the fourth was MEASURED missing before it landed: with the knob in arroyo alone,
+# the first armed gate run printed `nvidia-kepler-vblank` in the `⚡ kernel features:` banner while
+# `awk 'index($0,":: kepler: vblank")'` over target/serial.log returned ZERO lines — the booted
+# kernel is built from `builder/src/main.rs`'s own env map, which never reads `$KERNEL_FEATURES`.
+# The rastmc/sdwrite class, caught on a gate rather than on a card. Kept in sync with arroyo,
+# builder/src/main.rs and scripts/banner-cert.sh; `x86-all` names the feature, which is what puts
+# the knob under `./arroyo check`'s KNOB→BUILDER WIRING CHECK.
 nvidia-kepler-vblank = ["nvidia-kepler", "beam"]
 # WC-X86: bring the window compositor (`video::wm`) up on the x86 panel path. Compiles
 # `video/desktop_uefi.rs` — the activation seam and the one kernel-drawn demo window — plus fbcon's
