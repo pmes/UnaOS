@@ -1268,6 +1268,83 @@ image is `build=kepler+takeover+fifo+ivb+wc+smc+` with a focused Quarry window, 
 takes no Kepler takeover and its Quarry is never focused. **Any future fixture for this defect must
 give Quarry focus first, or it is scoring a state the defect cannot occur in.**
 
+### SERIALDOOR — the wire is a CONSOLE, not a keyboard, and the door is told which it is
+
+Peter's ruling, 2026-09-17, on the §FTDICR reading above: *the serial console is a console, not a
+keyboard.* A byte typed at the cable reaches the **shell** whatever holds window focus; a byte typed
+on the keyboard keeps today's behaviour, so a focused Quarry still opens its selection with Enter.
+§FTDICR closes by saying the defect "is not in this file's subsystem" — it is in the key DOOR — but
+the mechanism that separates the two transports is, because the two producers share one queue and
+the tag is minted at the intake this document owns.
+
+**Why a tag at all.** `ftdirx::deliver` pushes `pal::Event::Key(b)` into the SAME `pal::EVENT_QUEUE`
+the HID decoders push into. By the time a key reaches `wc_route_event` there is nothing left in the
+event that says where it came from — which is why `[quarry] key_route key=0x0d focus=1 took=1` was
+the correct behaviour of a door that had no way to know better. Any fix must therefore either split
+the queue (two producers, two FIFOs, two drains, and every ordering guarantee re-derived) or carry
+the origin alongside it. The second is what shipped.
+
+**The origin FIFO** (`drivers/xhci/ftdi.rs`, the `ftdirx` module's tail):
+
+| | |
+| --- | --- |
+| `note_origin(b)` | producer side. Called from `deliver` **immediately before** `push_event`, never after — `push_event` takes the queue lock and the drain can be running on another core the instant it is released, so a tag written after the push is a tag the door may look for and not find. Tagging early is harmless (see the claim rule); tagging late loses one byte per boot, silently, which is the class of defect nobody reproduces. |
+| `claim_origin(b)` | consumer side, the door's question. Pops and answers `true` only when the ring is non-empty **and its head is this exact byte**. |
+| `ORIGIN_RING` / `ORIGIN_W` / `ORIGIN_R` | 128 bytes — four full FT232 data packets (`CHUNK` 64 less `STATUS_BYTES`, 62 each), i.e. sized to hold a burst the console can produce between two service passes, not a session. SPSC and lock-free by construction: `deliver`'s caller is the xHCI main-loop service pass and the consumer is the key drain, one of each, so the cursors need no CAS. |
+| `ORIGIN_CLAIMED` / `ORIGIN_OVERRUN` | the census. An overrun **is not a lost byte**: the byte still reaches the door, it is simply judged as a keystroke — exactly the pre-arc behaviour — and it is counted rather than swallowed so a capture can say whether the ring was ever the limit. |
+| `origin_census() -> (claimed, outstanding, overrun)` | read by the fixture and by the rollup, so a capture can be asked whether every tagged byte was claimed and not merely whether the door fired. |
+
+**A FIFO of BYTES and not a counter**, and the difference is the first interleave. A credit ("the
+next N keys are serial") is spent on whichever key comes out of the shared queue next, so one
+keyboard report arriving mid-burst hands a keystroke to the shell and a wire byte to the window —
+both wrong, in the same pass. The ring records *what* was pushed, in order. The one state it cannot
+separate is stated rather than hidden: the same byte value typed on the keyboard while a serial byte
+of that value is outstanding is claimed as serial, so that keystroke reaches the shell instead of the
+focused window. It needs two people typing the same character into two devices inside one drain
+pass, it costs one keystroke, and it fails **toward the shell** — the safe direction, because the
+operator can always get back out.
+
+**The branch at the top of `wc_route_event`** (`arch/x86_64/syscall.rs`), and its position is the
+whole fix. It sits FIRST, ahead of `strip::key_escape`, `quarry::key_route`, `wc_focus_key` and
+`user_input_route`, because every one of those is a question about WINDOW FOCUS and a serial byte is
+not addressed to a window. It answers `return raw` — **not** `user_input_route(raw)`: the ruling says
+the SHELL, so the byte skips the focused ring-3 input ring too. A program that wants the wire asks
+for it; it does not inherit it by being frontmost. The whole branch is `#[cfg(feature = "ftdirx")]`,
+matching the module that mints the tag, so a build without the FTDI console compiles nothing here.
+
+**The witness**, bounded to 256 lines because a console being typed into must not spend its own
+bandwidth narrating itself:
+
+```
+[serialdoor] key=0x0d win_focus=0xffffff03 ring=0x0 -> shell (the wire is a console)
+```
+
+`key=` is the byte the door just claimed. **There are TWO focus numbers and a reader of flight 10
+will otherwise pair the wrong one**: `win_focus=` is `wm::focus_asid()`, the WINDOW focus
+`quarry::key_route` gates on and the one `[quarry] key_route … focus=` reports, while `ring=` is
+`USER_INPUT_ACTIVE`, the EL0 input ring. A kernel-owned window holds the first and not the second, so
+`win_focus=0xffffff03 ring=0x0` is the NORMAL shape of this line and is not "nothing was focused".
+
+**The fixture builds the losing state rather than hoping for it**, which is the contract §FTDICR's
+last sentence set: `serialdoor_selftest` mints its own bar-published window, focuses it, and scores
+four legs — (1) CONTROL, an UNTAGGED `Esc` must be eaten by the live door and close the menu, without
+which a green "the wire got through" is indistinguishable from a dead door; (2) THE FIX, the SAME
+byte tagged through `tag_serial_byte` and driven through the SAME function, handed back as
+`Event::Key(0x1b)` with the menu still down; (3) QUARRY's `\r`, flight 10's exact shape, reported
+`skip-unopened`/`skip-knoboff` and NOT failed where the window cannot be opened; (4) end to end and
+INFORMATIONAL only — `help\r` through `inject_serial_byte`, the producer seam `deliver` itself uses,
+with the window still focused, so a capture can be asked for `[midden] cmd=` with a window focused.
+Leg 4 is outside the verdict on purpose: the shell drain is another task, this fixture does not own
+its scheduling, and a leg whose green depends on another task's luck is the WINMENUFLAKE lesson. The
+verdict line is `:: SERIALDOOR: win=… control=… wire=… quarry=…(…) claimed=… outstanding=…
+overrun=… e2e=pushed :: PASS ::`, and it is pinned in `unaos/scripts/specs/x86-wc.spec`.
+
+**Knob-off byte identity.** The `ftdirx` module is `#[cfg]`-erased knob-off and this block is
+appended at its tail, so no panic `Location` in `ftdi.rs` moves; the door's branch is folded onto
+`wc_route_event`'s own signature line, before that line's first `//`, so `syscall.rs` keeps its line
+count. `inject_serial_byte` and `tag_serial_byte` are additionally `witness`-gated: **no shipped
+image carries a way to synthesise wire bytes.**
+
 ## RBTDRAIN — the reboot ladder was flushed into a ring the reset then killed
 
 `docs/dev/OS/rmbp-ledger.md` A3. On the 2012 rMBP the `reboot` verb **worked** — it resets the

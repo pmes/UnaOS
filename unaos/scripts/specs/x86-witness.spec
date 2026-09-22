@@ -1409,6 +1409,93 @@ FORBID :: DOCK: .* :: FAIL ::
 REQUIRE :: CLICK-BAND: routed menu=true\(open\) outside=true\(dismiss\) dock=true\(.*\) band_lines=3 :: PASS ::
 FORBID :: CLICK-BAND: .* :: FAIL ::
 
+# --- SPECPINS (2026-09-22) — WHAT THE FLIGHT-10 FOLDS PUT ON, AND TOOK OFF, THIS BENCH'S WIRE ----
+# --- Five arcs folded on hw-rmbp after FLIGHT 10 (MENUDROP, SERIALDOOR, W5SPIN, BOOTFAILS,
+# --- GMUXDPCD) were each written FROM the flight-10 capture that provoked them, and each changes
+# --- what a healthy metal capture must and must not carry. Until this block the only reader of
+# --- that change was a prose clause in `docs/dev/OS/rmbp-queue.md`. Flight 11 is now scored by one
+# --- command instead of by a paragraph.
+# ---
+# --- YES, THE RUNNER CAN REPLAY A FILE, and that is how every directive below was measured:
+# --- `./arroyo mbench --replay docs/dev/evidence/rmbp-0917/flight10/FLIGHT10.md --spec <this file>
+# --- --platform x86` — `--replay` reads BYTES from any path and cares nothing for the extension, so
+# --- the evidence document scores line-for-line — 137 lines scanned. (The WHOLE-file replay of
+# --- THIS spec against that document reads `1/42 required witnesses` and that is not a finding: the
+# --- document is a curated excerpt of flight 10, not its capture, and quotes none of the
+# --- paygo/WXN/SDHC batteries. The measurement below is of the directives THIS BLOCK adds, replayed
+# --- alone against the same file, and their counts are stated because a count is checkable.)
+# ---
+# --- THE SPLIT IS MEASURED, NOT PREFERRED. On that replay:
+# ---   * the three FORBIDs HIT, THREE TIMES EACH (flight 10's three dead cores, 665828/668402/
+# ---     841827 ms). They are the DEFECT, quoted from the run that printed it — the strongest form
+# ---     in which a pin can be measured, and the reason a FORBID needs no generation floor.
+# ---   * the four PENDINGs MATCH NOTHING, 0/4. They are the FIXES. No capture in this tree carries
+# ---     them, because flight 10 IS the boot they were written from. A REQUIRE here would be a pin
+# ---     written from a run that never printed it — the one thing LAWS forbids a pin to be. The
+# ---     grammar has its own word for this and it is not a workaround: `PENDING` is "a witness that
+# ---     needs metal/code not yet flashed … lets a spec ship ahead of its bench" (mbench.py:24),
+# ---     it never fails a gate, and a PENDING THAT MATCHES IS FLAGGED FOR PROMOTION — which is
+# ---     precisely the report flight 11 owes. round6-rmbp.spec:87 is the in-tree precedent.
+# --- PROMOTION CONDITION, stated in advance so nobody has to decide it after the fact: flight 11's
+# --- capture matches it. Each PENDING below names the knob its line needs, because a PENDING that
+# --- stays dark on a capture built without its knob is the wrong spec for that boot, not a defect.
+#
+# --- W5SPIN — THE THREE LINES A HEALTHY BOOT DOES NOT HAVE. `pace_shadow_acquire` (video/wm.rs)
+# --- now bounds the refresh-side acquire at 500 us and gives up into the live-read path, so the
+# --- c1 -> c2 -> c3 cascade flight 10 measured cannot start. These three are the cascade's own
+# --- wire, verbatim from the capture; a single hit on any of them is a dead core.
+FORBID :: \[wcser\] GATE STOLEN from c\d+ by c\d+ after \d+ms
+FORBID :: \[wcser\] REHOMED the render role from DEAD c\d+ to c\d+
+# --- The dead-core census clause. On flight 10 it RIDES the GATE STOLEN line above rather than
+# --- standing alone, so this rule is redundant with that one TODAY — and it is written anyway,
+# --- because it is a SEPARATE CLAIM (a core was declared dead) that must keep reding if the steal
+# --- line is ever reworded, and because `main.rs`'s `[wcser] REHOME:` / `REHOME DECLINED:` twins
+# --- make the same claim in their own words on a boot where the dead core carried no role.
+FORBID c\d+ is DEAD and its singleton roles are owed a re-home
+# --- W5SPIN's POSITIVE line is deliberately NOT required: it prints ONE LINE PER TRANSITION and a
+# --- boot with no contention at all prints neither arm — `[wpace] … spin=0 wedge=0` is that boot's
+# --- reading, and it is pinned on the QEMU gate (x86-wc.spec) where a census line is guaranteed.
+# --- Requiring it here would red the healthiest possible capture. OPTIONAL, so a collision that DID
+# --- happen and was survived is still reported in the table rather than passing in silence.
+OPTIONAL :: \[wcser\] PRESENT-BANDED SPIN site=\d+ waited_us=\d+ on=shadow\d+ -> (RELEASED|GAVE-UP) ::
+#
+# --- MENUDROP — the MENUBAR band the x86 router never grew. Flight 10: `[clickroute] press at
+# --- (60,3) win=0 owner=0x0 was=0 -> shell deliver=0` with the bar reading `items=app:Pulse@34+57`,
+# --- i.e. a press on an app title fell past every furniture arm to `wm::hit_test`. The capture DOES
+# --- carry `band=menu` (the crystal's shard menu, at (2,2) and (1354,491)) — a different band, and
+# --- naming that here is the point: `band=menubar` has never been printed by this tree on metal.
+# --- Needs `wc` (the arm is `#[cfg(feature = "wc")]`). Outcome word is derived from `is_open()`
+# --- either side of the call, so all three spellings are admissible.
+PENDING \[clickroute\] press at \(\d+,\d+\) band=menubar -> (open|kept-open|closed)
+#
+# --- SERIALDOOR — the wire is a console. Flight 10 measured the defect instead: `[quarry] key_route
+# --- key=0x0d focus=1 took=1` at 252772 ms and 256841 ms, and the SAME byte submitting the line at
+# --- `focus=0` 123 s later. This witness prints only for a byte the ORIGIN FIFO claimed, so it is
+# --- also the proof the tag survived the shared `pal::EVENT_QUEUE`. Needs `ftdirx` AND an operator
+# --- (or the bridge) typing at the cable: a flight nobody types at prints nothing here and that is
+# --- not a defect. `win_focus=0xffffff03 ring=0x0` is the NORMAL shape — two different focus
+# --- numbers, see serial_transport.md §SERIALDOOR before reading either as "nothing was focused".
+PENDING \[serialdoor\] key=0x[0-9a-f]+ win_focus=0x[0-9a-f]+ ring=0x[0-9a-f]+ -> shell
+#
+# --- GMUXDPCD — the ladder RENUMBERED, and comparing on the rung NUMBER is what this pin refuses to
+# --- do. Flight 10 read `:: igpu-dpy: LADDER highest=03/10 name=dpcd ok=0 … why=aux-timeout-error`:
+# --- at that image rung 03 WAS dpcd. GMUXDPCD inserted the panel-power rung, so at this tip 03 is
+# --- `pp` and dpcd is 04. A pin on `highest=03` would therefore have read GREEN across the change
+# --- while meaning something else entirely — which is why this one names `name=pp` and the queue's
+# --- score card says "compare on name=". Needs the kepler/gmux knobs; QEMU has no iGPU and prints
+# --- no `igpu-dpy:` line at all, which is why this pin can live nowhere but here.
+PENDING :: igpu-dpy: rung=03 name=pp
+#
+# --- BOOTFAILS — the move-vacate probe. Flight 10: `[wc-x] move-vacate win=2 scale=18x from=(8,8)
+# --- to=(178,8) box=154x188 painted=false desktop=4/5 stale=0/5 -> FAIL`. `painted=false` says the
+# --- probe never owned its box, so `-> PASS` is the whole claim and `painted=true` is named inside
+# --- it so a future PASS that stopped painting cannot satisfy this rule. It belongs HERE and not on
+# --- the QEMU gate, measured: the probe is called from `desktop_uefi::activate_on`
+# --- (video/desktop_uefi.rs:599), the Kepler takeover never happens under QEMU, and
+# --- `serial-clean.log` — an unperturbed `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_QEMU_FULL=1` capture —
+# --- carries ZERO `[wc-x] move-vacate` lines. x86-wc.spec says so in its own words.
+PENDING \[wc-x\] move-vacate .* painted=true .* -> PASS
+
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
 # A PINNED LINE IN THIS FILE IS CHANGED TOGETHER WITH THE KERNEL LINE IT PINS, IN THE SAME COMMIT —
 # re-pinned to the new wording (naming the arc that changed it), or dropped with the reason stated.
