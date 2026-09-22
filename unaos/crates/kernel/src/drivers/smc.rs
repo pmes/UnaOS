@@ -1910,4 +1910,132 @@ pub mod battery {
         let age = if s.present && good != 0 { crate::arch::ms().wrapping_sub(good) } else { 0 };
         (s, age)
     }
+
+    // ═════════════════════════════════════════════════════════════════════════════════════════
+    // MENUSTAT — **the RAW battery key read the desktop status item is built from.**
+    //
+    // WHY A SECOND READER BESIDE `snapshot()`, AND WHY IT RETURNS BYTES.
+    //
+    // `snapshot()` is the POWER ACCOUNTANT: it sweeps at 1 Hz for the `:: PWR:` energy windows and
+    // the `:: SMC-BATT:` census, it reads `B0FC`/`B0RM`/`AC-W`/`B0Pr`, and it hands back a
+    // `BatterySnapshot` of already-DECODED `u16`s. The menu bar wants a different set (`BNum`,
+    // `B0St` and `B0TF` are not in that sweep at all), a different cadence (10 s, not 1 s — see
+    // `video::status`), and — this is the load-bearing half — it wants the decode to be testable
+    // against the WIRE BYTES a flight actually recorded.
+    //
+    // Flight 11's scout lines are nine byte strings (`BRSC=[00 52]`, `B0AC=[03 f6]`, …). A decoder
+    // that can only be fed `u16`s cannot be fed those; the conversion from bytes to `u16` would sit
+    // OUTSIDE the fixture, which is exactly where a byte-order defect lives. So this reader stops at
+    // the payload: `Raw` carries what the SMC put on the wire, and `video::status::decode` turns it
+    // into meaning. The fixture feeds `decode` the flight-11 bytes verbatim, and the go-red is a
+    // byte swap inside `decode` — a real injection into the code under test, not a re-typed literal.
+    //
+    // **Nothing in the port protocol is touched.** This is `read_key` with the SAME bounded
+    // discipline every other battery read has: `READ_ATTEMPTS` attempts, each one individually
+    // deadline-bounded by `SMC_WAIT_CYCLES`; a clean `Absent` stops immediately and is never
+    // retried; a short read is counted in `SHORT_READS`; a retry is counted in IVY-RETRY; and a key
+    // this SMC is known not to carry costs no transaction at all (`probe_once_skip`).
+    //
+    // COST, measured rather than asserted (flight 11, the scout block at 25626–25631 ms): the nine
+    // curated battery keys answered across 25627→25629 ms and the 493-name index walk ran
+    // 25631→25730 ms, i.e. **99 ms / 493 transactions ≈ 200 µs per SMC transaction** on the 2012
+    // rMBP, with the stall counters clean on the same boot (`st0=0 rfail=0 short=0 unc=0`; the
+    // `gap=1027 busy=21` terms are ordinary handshake waits, one or more per transaction, not
+    // faults). Six keys is therefore ~1.2 ms of port I/O per poll — which is why `video::status`
+    // polls at 10 s and the bar never calls this from a paint.
+    // ═════════════════════════════════════════════════════════════════════════════════════════
+
+    /// The battery keys' RAW payloads, exactly as the SMC returned them. `None` is honest absence
+    /// (the key does not exist here, or the bounded budget was spent without an answer) — never a
+    /// placeholder. `B0AV` is in the set although the brief's key list omits it: the status item
+    /// states a terminal voltage, and a field with no key behind it would be a fabricated number.
+    ///
+    /// `B0FC`/`B0RM` are deliberately NOT here. They feed no field of the status item, and a
+    /// transaction whose result nothing reads is ~200 µs of port I/O spent on nothing; `snapshot()`
+    /// already reads both at 1 Hz for the capacity census, so the facts are on the wire either way.
+    #[derive(Clone, Copy, Default)]
+    pub struct Raw {
+        /// `BNum` — battery count, 1 byte. Flight 11: `[01]`.
+        pub bnum: Option<u8>,
+        /// `BRSC` — relative state of charge, percent. Flight 11: `[00 52]`.
+        pub brsc: Option<[u8; 2]>,
+        /// `B0St` — battery 0 status bits. Flight 11: `[00 80]`. Carried to the wire as raw hex and
+        /// NOT used to decide charging; see `video::status::decode` for why one sample cannot.
+        pub b0st: Option<[u8; 2]>,
+        /// `B0AC` — instantaneous current, signed mA. Flight 11: `[03 f6]`.
+        pub b0ac: Option<[u8; 2]>,
+        /// `B0AV` — terminal voltage, mV. Flight 11: `[30 17]`.
+        pub b0av: Option<[u8; 2]>,
+        /// `B0TF` — time to full, minutes. Flight 11: `[00 6a]`. Absent (or meaningless) while
+        /// discharging, which is why the decoded field is itself an `Option`.
+        pub b0tf: Option<[u8; 2]>,
+    }
+
+    /// One 2-byte key's RAW payload, with the bounded retry budget. `read_u16k`'s discipline
+    /// verbatim — it is restated rather than called because that function folds the two bytes into
+    /// a `u16` and the bytes are the point here (see the MENUSTAT block above).
+    fn raw_b2(key: &[u8; 4]) -> Option<[u8; 2]> {
+        if probe_once_skip(key) {
+            return None;
+        }
+        for attempt in 0..READ_ATTEMPTS {
+            if attempt > 0 {
+                note_retry();
+            }
+            let mut b = [0u8; 2];
+            match read_key(key, &mut b) {
+                Ok(2) => return Some(b),
+                Err(SmcError::Absent) => return None, // clean absence — no retry
+                Ok(_) => {
+                    super::SHORT_READS.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {} // Stuck: bounded retry, each attempt itself deadline-bounded
+            }
+        }
+        None
+    }
+
+    /// `BNum`'s single byte, same discipline. A 1-byte key needs its own arm because `Ok(n)` with
+    /// `n != 1` is the short read here, and `read_u16k`'s test is for a 2-byte payload.
+    fn raw_b1(key: &[u8; 4]) -> Option<u8> {
+        if probe_once_skip(key) {
+            return None;
+        }
+        for attempt in 0..READ_ATTEMPTS {
+            if attempt > 0 {
+                note_retry();
+            }
+            let mut b = [0u8; 1];
+            match read_key(key, &mut b) {
+                Ok(1) => return Some(b[0]),
+                Err(SmcError::Absent) => return None,
+                Ok(_) => {
+                    super::SHORT_READS.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// MENUSTAT — read the status item's six keys and return their raw payloads.
+    ///
+    /// Six bounded transactions, ~200 µs each on the 2012 rMBP (the measurement is in the MENUSTAT
+    /// block above). Called from `video::status::poll` on the desktop service pass at a 10 s
+    /// cadence, and from NOWHERE on a paint path: `strip::compose_all` runs masked, and a sweep that
+    /// can spend six deadline-bounded handshakes is not something a composite may wait on.
+    ///
+    /// On QEMU's `isa-applesmc` every one of these answers `Absent` — the model carries `REV`/`OSK0`
+    /// and no battery keys — so the whole struct comes back `None` and the bar's item is the
+    /// MEASURED absence rather than a compiled-out feature.
+    pub fn raw() -> Raw {
+        Raw {
+            bnum: raw_b1(b"BNum"),
+            brsc: raw_b2(b"BRSC"),
+            b0st: raw_b2(b"B0St"),
+            b0ac: raw_b2(b"B0AC"),
+            b0av: raw_b2(b"B0AV"),
+            b0tf: raw_b2(b"B0TF"),
+        }
+    }
 }

@@ -156,6 +156,12 @@ FORBID :: STRIPVAC: .* :: SKIP ::
 # --- instead of silently narrowing what it asserts.
 REQUIRE :: MENUDROP: .* routed_open=true open=true routed_close=true closed=true band_lines=2 :: PASS ::
 FORBID :: MENUDROP: .* :: FAIL ::
+# --- MENUSTAT (rmbp-ledger B148, fold 2026-09-22) — the battery item in the bar's status area, decoded from the
+# flight-11 SMC bytes by the fixture (`src=fixture`, witness-gated, chained from menubar::selftest on this lane), with its
+# go-red inside the passing run (`red_pct=100`) and the layout assertion that the clock's rect and the caption floor do
+# not move with the item present or absent. Pinned by the seat at the fold in the MENUDROP shape; measured by the next gate.
+REQUIRE :: MENUBATT: .* decode_ok=true gone_red=true absent_ok=true layout_ok=true .* :: PASS ::
+FORBID :: MENUBATT: .* :: FAIL ::
 # --- A SKIP is `wm::create` declining, or the bar never publishing the caption inside 250 ms. On
 # --- this gate (QEMU 1280x800, one 8x8 fixture row) neither is honest — same rule as DMGOVLP and
 # --- STRIPVAC above — so a SKIP means the fixture lost its panel or its window table.

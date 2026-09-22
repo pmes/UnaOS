@@ -12634,6 +12634,210 @@ x86 + `witness` only: `occ_bar_probe` and the primitives it drives are `target_a
 `occclip_bar` itself is. The leg does not touch `composite_inner` or `occ_clip`'s push logic — it drives
 those primitives from the fixture, proving them, not changing them.
 
+### MENUSTAT — the STATUS AREA: the battery beside the clock, and the seam that keeps a board out of the bar
+
+Peter's direction for this surface is the Mac clone (LAWS §6, R25): the right end of the menu bar
+carries the **status items**. The bar has drawn the UTC clock there since it was written; MENUSTAT
+adds the first item beside it — the **battery**, to the clock's LEFT, which is where a Mac puts it.
+
+Three pieces, and the middle one is the point of the arc:
+
+| piece | file | what it is |
+|---|---|---|
+| the raw key read | `drivers/smc.rs`, `battery::raw()` | six bounded `read_key` transactions — `BNum` `BRSC` `B0St` `B0AC` `B0AV` `B0TF` — returning the payloads AS BYTES |
+| the status **model** | `video/status.rs` (new) | the decode, a lock-free cache with an age, and `Source` — the thing the bar reads |
+| the item | `video/menubar.rs` | geometry inside the existing floors, the cell glyph, the percent, and the wire |
+
+#### ⛔ The bar must not read a driver, and that is a compile fact before it is a taste one
+
+`video/menubar.rs` is compiled on **both** arches (`x86_64 + wc` **or** `aarch64 + desktop_firmware`),
+and `drivers::smc` is `all(target_arch = "x86_64", feature = "smc")`. A bar that named the SMC would
+not build on the Pi. The obvious repair — a `cfg` fork inside `compose_row` — would put a board fact
+in a painter both arches compile, which is exactly what LAWS §4 forbids in a shared file.
+
+So the item is **`battery`** and its source is **`status::Source`**, which is `Smc` today and `None`
+everywhere else. Nothing under `video/` names a machine. A second source (an ACPI battery, a Pi UPS
+HAT) is one variant and one arm in `status::board_raw`, and the bar does not change.
+
+#### ⛔ The source is resolved by MEASUREMENT, not by compilation
+
+`feature = "smc"` says *this kernel can talk to an Apple SMC*. It does **not** say *this machine has
+a pack*. QEMU's `isa-applesmc` — the model `arroyo` attaches under `UNAOS_SMC=1` — answers `REV` and
+`OSK0` and carries **no battery key at all**. A source resolved at compile time would have given
+every gate boot a battery meter with nothing behind it.
+
+`status::poll` therefore asks for the keys and resolves the source from the **answer**. On the gate
+that is a measured absence and it says so, once:
+
+```
+[menubar] battery absent src=none
+```
+
+#### The decode, and which key decides CHARGING
+
+Flight 11's scout printed the machine's own bytes at 25627–25629 ms. They are the fixture's input,
+verbatim:
+
+| key | flight 11 | decodes to |
+|---|---|---|
+| `BNum` | `[01]` | one battery present |
+| `BRSC` | `[00 52]` | 0x0052 = **82 %** |
+| `B0St` | `[00 80]` | status bits — read, reported raw, **not decisive** |
+| `B0AC` | `[03 f6]` | 0x03f6 = **+1014 mA** ⇒ charging |
+| `B0AV` | `[30 17]` | 0x3017 = **12311 mV** |
+| `B0TF` | `[00 6a]` | 0x006a = **106 min** to full |
+| `B0FC` / `B0RM` | `[26 ea]` / `[1f e0]` | 9962 / 8160 mAh — 8160/9962 = 81.9 %, the independent corroboration that `BRSC` is a plain percent and not a fixed-point fraction |
+
+**Charging comes from the `B0AC` SIGN.** The brief allowed either key and asked which; only one of
+them is falsifiable from what has been flown. `B0AC`'s sign is **metal-confirmed on this machine** —
+that is IVY-AC's claim, recorded at `drivers/smc.rs`'s `AcDerived`, and `derive_ac` has been shipping
+on it; flight 11 agrees across five witness lines an hour apart (`amp=1014mA … ac=derived:charging`
+at 25731 ms, still charging at 928074 ms with the percentage climbing 82 → 86). `B0St` is `[00 80]`
+in **one sample, in one state**, and one observation cannot distinguish "bit 7 means charging" from
+"bit 7 is always set on this controller"; every bit hypothesis fits a single point equally well. The
+scout that documented the key calls it *battery 0 status bits* and names no bit, because naming one
+would have been a guess wearing a measurement's clothes. So `B0St` is read, carried to the wire as
+raw hex, and used for nothing until a flight records it in both states.
+
+The ±32 mA deadband is IVY-AC's too: the reading dithers at rest, and a bare `> 0` test would flap
+the glyph's bolt on sensor noise.
+
+#### Cadence and cost — why the poll is on the device-service task
+
+One SMC transaction costs **~200 µs** on the 2012 rMBP, measured off flight 11 rather than asserted:
+the `#KEY` index walk ran 25631→25730 ms for 493 names (99 ms / 493 = 201 µs), and the nine curated
+battery keys answered inside 25627→25629 ms. The stall counters on that boot are clean
+(`st0=0 rfail=0 short=0 unc=0`; `gap=1027 busy=21` are ordinary handshake waits, not faults).
+
+Six keys is therefore ~1.2 ms of port I/O per poll. That may not run from `strip::compose_all`,
+which is **masked** (WEDGE-8), and it may not go on the render core (`main.rs`'s standing placement
+rule). It runs from `desktop_uefi::desktop_app_service` — the `wc`-gated body the ~1 kHz
+device-service task calls on every pass, beside `wm::pace_service` and `fat::probe_once`, and above
+the one-shot's ARMED gate so the item's liveness does not depend on whether a `STAT.ELF` was found
+on a stick. Self-throttled to **10 s**; the first pass finds the throttle at `0` and sweeps at once.
+
+What the bar reads is three relaxed atomic loads and a clock read (`status::bar_item`) — no lock, no
+port, no allocation. That is why the reading is packed into an `AtomicU64` rather than kept in a
+`Mutex<Battery>` like the driver's own 1 Hz cache, which takes two spin locks and therefore cannot be
+read from a composite at all.
+
+**Holding, bounded.** BATMON-HOLD's rule at this layer: a failed poll does not clobber a good
+reading, and `age_s` on the wire is what makes a held reading visible AS held. Past `STALE_MS`
+(60 s = six poll periods) the item goes absent rather than stating a number nothing has confirmed in
+a minute.
+
+#### Layout — inside the existing floors, and the clock does not move
+
+⛔ **`FLOOR_W` was NOT widened, and that is a constraint rather than an omission.** The floor reserves
+the crystal's slot, one title glyph and the clock. Adding the item to it would take the BAR off every
+panel between the old floor and the new one — on machines that may have no battery at all — and would
+move the `floor=` term on `:: MENUBAR:`, which is a menubar line a spec can pin. So `batt_slot`
+places the item inside the existing floors, from the same two terms the clock is placed by, and
+DECLINES on a panel that cannot seat it beside the clock with a title glyph left over. The bar then
+draws exactly what it drew before this arc.
+
+Measured on the 1280x800 gate panel (`CELL_W` = 9, `PAD` = 12):
+
+| number | value | derivation |
+|---|---|---|
+| cell body | 24x12 | `theme::CONTROL_BOX` x half of it — the crystal's size family, no new metric |
+| cap nub | 2x4 | past the body's right edge, so the outline reads as a battery and not a progress bar |
+| glyph | **26x12** | body + nub |
+| gap inside the item | **6** | `PAD / 2` — the item is ONE thing, so its inner space reads smaller than the PAD beside it |
+| percent slot | 4 glyphs = 36 px | `100%`, right-aligned (`  5%`, ` 82%`, `100%`) so the cell's x never moves when a digit appears |
+| **item width** | **68** | 26 + 6 + 36 |
+| item x | **1143** | one PAD left of the clock |
+| clock rect | **45x20+1223+7** | unchanged with the item present and with it absent |
+| caption x0 | **40** | `CRYSTAL_SLOT`, unchanged — SO3's inset |
+| floor | **118x110** | unchanged |
+
+The crystal's position is R25's and is unreachable from the new code by construction: every number in
+the MENUSTAT block is measured from the bar's RIGHT edge inward.
+
+`menus_right_limit` now stops the window-menu titles at the STATUS AREA's left edge rather than the
+clock's, derived from the same `batt_slot` the painter uses — the accessor's own rule ("a title can
+never be laid out under the time") applied to the second item out there.
+
+**The inks invent nothing.** The outline and the percent take `TITLE_TEXT_INACTIVE`, the ink the
+clock is already drawn in on the stated argument that the status area is glanced at rather than read;
+the FILL takes `TITLE_TEXT_ACTIVE`, the bar's primary, because the fill is the part that carries the
+measurement. The charging bolt is drawn as the **inverse of whatever is under it** —
+`BEVEL_LIGHT` over filled columns, the fill ink over empty ones — which is one rule covering both the
+97 % case (bolt on dark fill) and the 3 % case (bolt on the bar's face showing through), instead of a
+third colour. Build-time asserts keep the bolt strictly inside the outline, which is what makes
+"whatever is under it" mean fill-or-face and never the cell's own edge.
+
+#### Repainting only when the reading changes — measured, not argued
+
+The bar's damage signature folds `status::BarItem` — the percent and the charge state — and **not**
+`status::Battery`. That is the discipline in the type system rather than in care at the call site:
+the minutes, the current, the voltage and the age are not in the model, so a 10 s poll that moves
+them cannot reach the hash and cannot cost a repaint, while a percent tick or a bolt appearing must.
+
+`compose()` returns `true` iff it painted, so the claim is read directly off the composite:
+
+```
+:: MENUBATT: … jitter_paint=false change_paint=true damage_ok=true :: PASS ::
+```
+
+`jitter_paint` is a reading whose minutes, current and voltage all moved and whose percent and charge
+state did not — it painted nothing. `change_paint` is the positive control, and it is not optional:
+without it a bar that had stopped painting altogether would pass the first half.
+
+#### The fixture, and the go-red that makes its PASS mean something
+
+`menubar::battery_selftest`, six legs, from the one QEMU gate:
+
+```
+:: MENUBATT: pct=82 charging=y mins=106 mv=12311 ma=1014 b0st=0x0080 item_w=68 glyph=26x12 gap=6
+   pct_glyphs=4 batt_x=1143 clock=45x20+1223+7 caption_x0=40 floor=118x110 red_pct=100
+   decode_ok=true gone_red=true absent_ok=true layout_ok=true seat_ok=true
+   jitter_paint=false change_paint=true damage_ok=true :: PASS ::
+```
+
+⛔ **`gone_red=true red_pct=100` is the leg that stops `decode_ok` being a tautology.** The fixture
+re-runs the SAME call over the SAME bytes with a byte-order fault armed inside the decoder
+(`status::set_byte_swap`, the injection point in `be16`). `BRSC=[00 52]` then decodes as 0x5200 =
+20992, clamps to **100 %**, and the wrong percent is NAMED on the line. Without that injection the
+leg would pass on a decoder that ignored its arguments and returned the constants the comment beside
+it names.
+
+`layout_ok` is the brief's own falsifier — the clock's rect, the caption's inset and both floors are
+identical with the item injected present and injected absent. The crystal's position is R25's, the
+caption's is SO3's, and a status item that paid for its slot out of either would be taking a rule's
+pixels to draw a convenience.
+
+#### ⛔ A fixture's reading may not wear the driver's name
+
+The first measured run of this arc printed the fixture's synthetic 82 % over the UNGATED
+`[menubar] battery` line as `src=smc`. The line is ungated deliberately (the metal image is built
+without `witness`, and an instrument absent from the artifact Peter flies is not an instrument), so a
+witness-only injection reached a wire that a reader takes for measurement. "It is only a QEMU
+capture" is not a defence: the capture is read by people looking for facts.
+
+`Source::Fixture` is the fix, and it costs one variant: `status::inject` — the only writer, and
+itself `witness`-gated — stamps the reading `src=fixture`, so a synthetic number is unmistakable
+wherever it lands and a metal image contains no WRITER that can set it. (The string literal is still in
+the artifact — `LC_ALL=C grep -a -o -F fixture` finds it — because the match arm compiles; what a
+non-`witness` image has no code path to is the VARIANT, and that is the claim.)
+
+#### What flight 12 shows Peter
+
+The battery at the top right of the menu bar: an outlined cell filled to the pack's charge with a
+lightning mark while the adapter is in, its percentage beside it, one PAD left of the clock. On the
+wire, one line per five seconds:
+
+```
+[menubar] battery pct=82 charging=y mins=106 age_s=3 src=smc mv=12311 ma=1014 polls=4/4
+```
+
+and `[menubar] live … paints=` **flat** across the 10 s poll cadence while the percentage holds.
+
+**Owed:** the `:: MENUBATT:` pin. `arroyo test` replays `x86-default.spec`; `x86-wc.spec` is reached
+by the `mbench` verb, and no menubar line this arc touches is pinned in either, so nothing was
+changed there. The REQUIRE (plus FORBIDs on its FAIL and SKIP) is the seat's to place, in the shape
+SPECPINS gave `:: MENUDROP:`.
+
 ### MENUP — the menu PROTOCOL, designed, not implemented
 
 The full design ledger is at the foot of `video/menubar.rs`. Its shape, in brief:

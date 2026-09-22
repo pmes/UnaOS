@@ -643,6 +643,33 @@ pub fn desktop_app_service() {
     // already make from this lane. See `wm::pace_service`.
     super::wm::pace_service();
 
+    // MENUSTAT — the desktop STATUS MODEL's poll, here and for `pace_service`'s reason: this is the
+    // `wc`-gated body the ~1 kHz device-service task calls on EVERY pass, and it must run AHEAD of
+    // the one-shot below, which early-returns on every boot that never armed a desktop app.
+    //
+    // ### Why this task and not another
+    //
+    // The poll can spend six bounded SMC transactions (~200 µs each on the 2012 rMBP — the
+    // measurement is in `drivers/smc.rs`'s MENUSTAT block). Two placements are therefore excluded
+    // outright. It may not run from `strip::compose_all`, which is MASKED and is where the menu bar
+    // itself runs — the WEDGE-8 rule. And it may not go on the RENDER core, which is `main.rs`'s
+    // standing placement rule for anything that can wait on a device. The device-service task is
+    // where the port-I/O takers already live (`fat::probe_once`, `service_ehci_hid`, and the
+    // battery ACCOUNTANT `smc::battery::refresh_if_due` in `main.rs`'s own body for this task), so
+    // the status poll is a peer of the calls beside it rather than a new kind of thing.
+    //
+    // ### Why it is not inside the ARMED gate below
+    //
+    // The bar is a tenant of the desktop shell and the shell is what enables it — but the shell
+    // does that in `activate`, which has already run by the time anything arms the desktop APP.
+    // Gating the poll on `DESKTOP_APP_ARMED` would tie the status item's liveness to whether a
+    // `STAT.ELF` was found on a stick, which is an unrelated fact about storage.
+    //
+    // It self-throttles to `status::POLL_MS` (10 s) and costs one clock read and one relaxed load on
+    // the ~999 passes in between. The FIRST pass finds `LAST_POLL_MS == 0` and sweeps immediately,
+    // so the item is resolved before the bar reaches the glass rather than ten seconds after.
+    super::status::poll();
+
     // Not armed = the activation never completed. Cheapest test first, and it is the one that is
     // false on every boot without the Kepler takeover.
     if !DESKTOP_APP_ARMED.load(Ordering::Acquire) {

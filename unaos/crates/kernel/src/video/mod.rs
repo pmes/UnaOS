@@ -946,3 +946,24 @@ pub mod facet;
 // renumbers `panel_info_nonblocking` and its neighbours, which `core::panic::Location` embeds.
 // An append moves nothing.
 pub mod beam;
+
+// ── STATUS (MENUSTAT) — the desktop's STATUS MODEL, and the seam that keeps a board out of the bar ─
+//
+// `menubar` draws the status area at the right end of the bar; this is what that area states. One
+// item this arc — `battery` — and the whole point of the module is that the BAR never names a
+// driver: `drivers::smc` is `all(x86_64, smc)` and `menubar` is compiled on the Pi too, so a bar
+// that reached for the SMC would not build there, and a `cfg` fork inside `compose_row` would put a
+// board fact in a painter both arches compile (LAWS §4). The item is `battery`, its source is
+// `status::Source`, and the source is resolved by MEASUREMENT — QEMU's `isa-applesmc` carries no
+// battery keys, so that boot's item is the measured absence and not a compiled-out feature.
+//
+// Same furniture gate as `strip`/`menubar`/`crystal`/`winmenu`: the module is a client of `menubar`'s
+// family and has no consumer without it, so the gate is a DEPENDENCY fact exactly as `winmenu`'s is.
+//
+// DECLARED AT THE TAIL, below `beam`, for `winmenu`'s and `facet`'s stated reason — this file is
+// compiled into EVERY image including the knob-off Pi `kernel8.img`, and a `mod` line inserted
+// anywhere above renumbers `panel_info_nonblocking` and its neighbours, which `core::panic::Location`
+// embeds. An append moves nothing, and `./arroyo knoboff wc` is where that is measured rather than
+// reasoned about.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod status;
