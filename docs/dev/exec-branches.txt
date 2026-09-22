@@ -189,20 +189,20 @@ refs/remotes/origin/exec-orin21-c15knobs   aec2c604 SUPERSEDED     3efde934     
 refs/remotes/origin/exec-orin21-claimcheck aec2c604 SUPERSEDED     3efde934                  2026-09-07
 refs/heads/exec-orin21-c15knobs            8db9691c SUPERSEDED     3efde934                  2026-09-08
 refs/heads/exec-orin21-fold                6cf9f13b SUPERSEDED     3efde934                  2026-09-08
-refs/heads/exec-orin21-lawsnom             f86cf448 LOST           docs/dev/QUEUE.md         2026-09-08
-refs/heads/exec-orin21-ledger              fc1a2d52 LOST           docs/dev/QUEUE.md         2026-09-08
+refs/heads/exec-orin21-lawsnom             f86cf448 FOLDED-BY-HAND 56423204                  2026-09-22
+refs/heads/exec-orin21-ledger              fc1a2d52 FOLDED-BY-HAND 56423204                  2026-09-22
 refs/heads/exec-orin21-recon               6cf9f13b SUPERSEDED     3efde934                  2026-09-08
 refs/heads/exec-orin21-rekey               3894fdc9 SUPERSEDED     3efde934                  2026-09-08
 refs/heads/exec-orin21-tearfold            45870e80 FOLDED-BY-HAND 77806c49                  2026-09-08
-refs/heads/exec-orin22-lawsnom2            66523c05 LOST           docs/dev/QUEUE.md         2026-09-08
+refs/heads/exec-orin22-lawsnom2            66523c05 FOLDED-BY-HAND 56423204                  2026-09-22
 refs/heads/exec-orin22-matrixpar           5c1f13d0 LOST           docs/dev/QUEUE.md         2026-09-08
 refs/heads/exec-orin23-ga10b4              e7c8eb24 SUPERSEDED     f2794266                  2026-09-08
 refs/remotes/origin/exec-orin21-fold       6cf9f13b SUPERSEDED     3efde934                  2026-09-08
-refs/remotes/origin/exec-orin21-lawsnom    f86cf448 LOST           docs/dev/QUEUE.md         2026-09-08
-refs/remotes/origin/exec-orin21-ledger     fc1a2d52 LOST           docs/dev/QUEUE.md         2026-09-08
+refs/remotes/origin/exec-orin21-lawsnom    f86cf448 FOLDED-BY-HAND 56423204                  2026-09-22
+refs/remotes/origin/exec-orin21-ledger     fc1a2d52 FOLDED-BY-HAND 56423204                  2026-09-22
 refs/remotes/origin/exec-orin21-rekey      3894fdc9 SUPERSEDED     3efde934                  2026-09-08
 refs/remotes/origin/exec-orin21-tearfold   45870e80 FOLDED-BY-HAND 77806c49                  2026-09-08
-refs/remotes/origin/exec-orin22-lawsnom2   66523c05 LOST           docs/dev/QUEUE.md         2026-09-08
+refs/remotes/origin/exec-orin22-lawsnom2   66523c05 FOLDED-BY-HAND 56423204                  2026-09-22
 refs/remotes/origin/exec-orin22-matrixpar  ce0d992b LOST           docs/dev/QUEUE.md         2026-09-08
 refs/remotes/origin/exec-orin22-matrixpar2 5c1f13d0 LOST           docs/dev/QUEUE.md         2026-09-08
 refs/remotes/origin/exec-orin23-ga10b4     e7c8eb24 SUPERSEDED     f2794266                  2026-09-08
@@ -244,10 +244,8 @@ refs/remotes/origin/exec-rmbp-kfunwedge    6c38659d LOST           docs/dev/OS/r
 # today's tip: these branches move forward as their executors commit (and an executor that re-reads
 # its brief `git reset --hard`s back to exactly this sha), and the gate only asks that the tip still
 # descend from what is written here.
-refs/heads/exec-rmbp-branchgate            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-deskrescue            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-dmgovlp               2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
-refs/heads/exec-rmbp-docsrescue            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-specpins              2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-storgpu               2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-toolrescue            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
