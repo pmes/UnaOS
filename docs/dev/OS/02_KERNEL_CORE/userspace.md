@@ -3548,3 +3548,70 @@ Conventions shared across arches:
   one byte into the final page) is REFUSED with the witness; `RXEDGE.ELF` (`[0,0x3000)`,
   exactly at the boundary) loads, runs, and exits 0 — asserted by a second mbench spec
   after pi4-regression.spec passed 117/117 on the same capture.
+
+## BUSX86 — the on-UnaOS SMessage bus is now BOTH arches (2026-09-22)
+
+The v1 SMessage codec was `arch/aarch64/bus.rs` and closed with, in its own words,
+"aarch64-only (declared under arch/aarch64; zero x86 surface)". Nothing in those 678
+lines was aarch64 — frame layout, decode ceilings, typed verb bodies and the frozen
+UnaOS-NATIVE v1 goldens, naming no register, no board and no arch. The *declaration*
+named a board, and that made `SYS_MSEND`/`SYS_MRECV` a board-split of the **program
+story** rather than of a driver (LAWS §3; R16): the rMBP desktop's EL0 programs had
+no bus to speak on at all. The ABI numbers were never the split — 19 and 20 have been
+in `una-abi` since ABIFREEZE and are unchanged.
+
+**Where it lives now.** `crate::bus` (`git mv`, so history follows the file),
+declared once in `lib.rs` under `any(feature = "aarch64_el0", target_arch =
+"x86_64")` — the union of the two arches' existing EL0 conditions, not a new knob.
+`bus_codec_selftest` / `bus_codec2_selftest` run on **both** arches every boot; the
+x86 capture carries `:: BANDY-CODEC: … PASS [w=0x3f] ::` and `:: BANDY-CODEC2: …
+PASS [w=0x3f] ::`, the first assertion of either golden off the Pi. The frame did
+not move and cannot: the KATs are the spec of record (R17).
+
+**What the x86 transport shares, and the three places it cannot.** Shared: capacity
+checked before fulfillment, depth-16 per-row mailboxes, synchronous fulfilment under
+the invoker's grants, `-EMSGSIZE` on a sub-frame `SYS_MRECV` buffer, teardown drain
+after the generation bump, a reply stamped with the reserved KERNEL record.
+
+1. **The principal.** aarch64 stamps a `PrincipalRecord` from the K-line IMAGE_SHA256
+   mint. x86 has no such type and needs none: its U6 identity — the one its own
+   `SYS_OPEN` owner ACL is keyed on — is `(row, SLOT_GEN[row])`, and that pair is
+   what every fulfiller receives. The wire pays nothing, and structurally rather
+   than by luck: aarch64 never reads a *sender* principal off a frame either
+   (`sys_msend_for` requires the field zero and hands `ppid` to the fulfiller
+   directly), so the only principal that ever reaches the wire in either direction
+   is the reply's reserved KERNEL record — kind 4, len 0, value zero — which is a
+   constant. x86 writes that constant as its 32 wire bytes.
+2. **The mailbox row.** ASID → the HANDLES row (`caller_row()`), `SHARED_ROW`
+   included, `USER_SLOTS + 1` wide, fenced by `SLOT_GEN`.
+3. **The namespace, and this one is not cosmetic.** aarch64 fulfils through
+   `fs::fat` against a real on-disk root keyed `(dir_lba, dir_off)`. x86's EL0
+   namespace is the staged set plus the static `U10_NAMES` table, keyed by name-id,
+   whose "this file exists" test is `created_desc_any_row` — **a live descriptor,
+   not a directory entry.** So the fulfiller re-enters `sys_open`'s own sequence in
+   `sys_open`'s order (root-leaf collapse → staged → `SHARED_ROW` → `DYN_DELETED_G`
+   → `created_desc_any_row` → `owned_access_ok`), which is what makes the errnos
+   byte-same *by construction* rather than by a table of hand-copied numbers.
+
+**Honest scope.** Because a created file's identity on x86 *is* a live descriptor, a
+fulfiller that created a copy and closed its own handle would destroy what it had
+just acknowledged — so bus `cp` does what the direct path does and keeps the
+descriptor (`open_create_new`, private to the invoker, one of its eight handle
+slots). The BANDY-2 write side (`write`/`rm`/`mv`) decodes here — the codec is
+shared, the goldens run — but answers `-ENOSYS` in a well-formed reply rather than
+`-EINVAL`, so a client can tell "this board cannot do that yet" from "I spoke
+wrongly". Both want a descriptor-free create/unlink/rename in the x86 created-name
+namespace, which is STOR-1's work.
+
+**Witness.** `:: BUSX86-STAMP: … :: PASS [w=0x3f/0x3f] ::` — six bits: caller-supplied
+principal refused with nothing queued; the reply's echoed verb/corr and kernel stamp;
+the staged (public) `cat`; errno-in-status-with-empty-body on `-ENOENT`; a full
+mailbox refusing the 17th send while a second row is unaffected; the generation fence
+discarding a stale reply. Go-red (behavioural): delete the `request_validate` clause
+in `busx_msend_for` and the line reads `FAIL [w=0x20/0x3f]`.
+
+**OWED (M3).** The ring-3 midden twin on x86 and the **equivalence witness proper** —
+denied-via-bus == denied-via-syscall, byte-same errno. That one cannot be made
+kernel-side on either arch, and BANDY-1 found the same thing on the Pi: the direct
+leg is `SYS_OPEN`, which takes a ring-3 name pointer, so only a ring-3 program can
+drive both legs and compare. See `docs/dev/OS/rmbp-queue.md`.

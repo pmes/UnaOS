@@ -123,7 +123,7 @@ use una_abi::SYS_CLOSE;
 use una_abi::SYS_FGRANT;
 
 /// BANDY-1 M2: the on-UnaOS SMessage bus transport (ROADMAP §3b arc 1). SYS_MSEND(frame_ptr,
-/// frame_len) submits ONE v1 request frame (arch/aarch64/bus.rs wire layout); the kernel
+/// frame_len) submits ONE v1 request frame (crate::bus wire layout — SHARED since BUSX86); the kernel
 /// validates it fail-closed, STAMPS the sender's principal into the header (verdict C — a
 /// caller-supplied principal is -EINVAL, never overwritten), fulfills the verb through the
 /// EXISTING FAT/ACL machinery under the invoker's grants (verdict D — no impersonation, no new
@@ -16542,13 +16542,13 @@ pub fn u7_launcher(demo_cpu: usize) {
     // HOST serializer (tools/bandy-golden captures), native request header+payloads frozen,
     // decode fail-closed at the hard ceiling. Read-only, in-RAM (no disk, no card); its own
     // uncounted `:: BANDY-CODEC: … PASS ::` line. LAST in the chain.
-    super::bus::bus_codec_selftest();
+    crate::bus::bus_codec_selftest();
     u7stk!("after:bus_codec");
     // BANDY-2 M1: the write-side codec KATs — write/rm/mv request goldens frozen, the typed WRITE
     // [name_len][name][content] payload + empty/at-ceiling content, decode fail-closed. A SIBLING
     // of BANDY-CODEC (the BANDY-1 goldens/witness stay byte-identical). Read-only, in-RAM; its own
     // uncounted `:: BANDY-CODEC2: … PASS ::` line.
-    super::bus::bus_codec2_selftest();
+    crate::bus::bus_codec2_selftest();
     u7stk!("after:bus_codec2");
     // BANDY-1 M5 (verdict C): the stamping witness — caller-supplied principal rejected, replies
     // stamped with the reserved kernel kind (fail-closed everywhere a grantee/owner can appear),
@@ -22475,7 +22475,7 @@ fn nsspan_report() {
 // =====================================================================================================
 //
 // "Port the bus, not the binary convention." The wire layer (frame layout, decode ceilings, the
-// frozen native goldens) lives in arch/aarch64/bus.rs; THIS section is the syscall transport and
+// frozen native goldens) lives in `crate::bus` (SHARED with x86 since BUSX86); THIS section is the syscall transport and
 // the kernel-side fulfiller for the v1 verbs (ls / cat / cp).
 //
 // Shape (design verdicts Maestro-closed 2026-07-15/16 + Peter's native-format ruling, do not
@@ -23074,12 +23074,12 @@ fn bus_reply_enqueue(asid: u64, corr: u32, verb: u8, status: i64, text: &[u8]) -
     let mut prin_bytes = [0u8; 32];
     reply_prin.write(&mut prin_bytes);
     let body: &[u8] = if status == 0 { text } else { &[] };
-    debug_assert!(body.len() <= super::bus::BUS_BODY_MAX, "bus reply over the body ceiling (kernel bug)");
-    if body.len() > super::bus::BUS_BODY_MAX {
+    debug_assert!(body.len() <= crate::bus::BUS_BODY_MAX, "bus reply over the body ceiling (kernel bug)");
+    if body.len() > crate::bus::BUS_BODY_MAX {
         return EIO; // fail closed (ls/cat/cp budgets make this unreachable)
     }
-    let mut frame = alloc::vec![0u8; super::bus::BUS_HDR_LEN + body.len()];
-    let n = super::bus::build_reply(verb, corr, status as i32, prin_bytes, body, &mut frame);
+    let mut frame = alloc::vec![0u8; crate::bus::BUS_HDR_LEN + body.len()];
+    let n = crate::bus::build_reply(verb, corr, status as i32, prin_bytes, body, &mut frame);
     debug_assert!(n == frame.len());
     let agen = ASID_GEN[asid as usize].load(Ordering::Acquire);
     if !bus_mbox_push(asid, agen, frame.into_boxed_slice()) {
@@ -23097,14 +23097,14 @@ fn bus_reply_enqueue(asid: u64, corr: u32, verb: u8, status: i64, text: &[u8]) -
 fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i64 {
     // Parse + typed validation, all FAIL-CLOSED (bus.rs). Errno mapping: every refused frame —
     // ceiling, truncation, malformed, caller-supplied principal (verdict C) — is -EINVAL.
-    let hdr = match super::bus::frame_parse(frame) {
+    let hdr = match crate::bus::frame_parse(frame) {
         Ok(h) => h,
         Err(_) => return EINVAL,
     };
-    if hdr.kind != super::bus::BUS_KIND_REQUEST || super::bus::request_validate(&hdr).is_err() {
+    if hdr.kind != crate::bus::BUS_KIND_REQUEST || crate::bus::request_validate(&hdr).is_err() {
         return EINVAL; // a REPLY frame, nonzero status, or CALLER-SUPPLIED PRINCIPAL — rejected
     }
-    let body = &frame[super::bus::BUS_HDR_LEN..];
+    let body = &frame[crate::bus::BUS_HDR_LEN..];
     // Capacity BEFORE fulfillment — a verb with side effects must never run and lose its reply.
     if (asid as usize) >= BUS_MBOX.len() || !bus_mbox_has_room(asid) {
         return EAGAIN;
@@ -23115,8 +23115,8 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
     // Fulfill under the INVOKER's identity (verdict D) — synchronously, in this SVC context.
     let mut text: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let status = match hdr.verb {
-        super::bus::BUS_VERB_LS => bus_ls(&mut text),
-        super::bus::BUS_VERB_CAT => match super::bus::cat_body_parse(body) {
+        crate::bus::BUS_VERB_LS => bus_ls(&mut text),
+        crate::bus::BUS_VERB_CAT => match crate::bus::cat_body_parse(body) {
             // cat_body_parse admits printable ASCII only, so from_utf8 cannot fail — but stay
             // fail-closed rather than unwrap.
             Ok(nb) => match core::str::from_utf8(nb) {
@@ -23125,7 +23125,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
             },
             Err(_) => return EINVAL,
         },
-        super::bus::BUS_VERB_CP => match super::bus::cp_body_parse(body) {
+        crate::bus::BUS_VERB_CP => match crate::bus::cp_body_parse(body) {
             Ok((s, d)) => match (core::str::from_utf8(s), core::str::from_utf8(d)) {
                 (Ok(src), Ok(dst)) => bus_cp(asid, agen, ppid, src, dst),
                 _ => return EINVAL,
@@ -23134,21 +23134,21 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
         },
         // BANDY-2: the write-side verbs. The typed-body parsers admit printable-ASCII names only, so
         // from_utf8 cannot fail — but stay fail-closed rather than unwrap.
-        super::bus::BUS_VERB_WRITE => match super::bus::write_body_parse(body) {
+        crate::bus::BUS_VERB_WRITE => match crate::bus::write_body_parse(body) {
             Ok((nb, content)) => match core::str::from_utf8(nb) {
                 Ok(name) => bus_write(asid, agen, ppid, name, content),
                 Err(_) => return EINVAL,
             },
             Err(_) => return EINVAL,
         },
-        super::bus::BUS_VERB_RM => match super::bus::cat_body_parse(body) {
+        crate::bus::BUS_VERB_RM => match crate::bus::cat_body_parse(body) {
             Ok(nb) => match core::str::from_utf8(nb) {
                 Ok(name) => bus_rm(asid, agen, ppid, name),
                 Err(_) => return EINVAL,
             },
             Err(_) => return EINVAL,
         },
-        super::bus::BUS_VERB_MV => match super::bus::cp_body_parse(body) {
+        crate::bus::BUS_VERB_MV => match crate::bus::cp_body_parse(body) {
             Ok((s, d)) => match (core::str::from_utf8(s), core::str::from_utf8(d)) {
                 (Ok(src), Ok(dst)) => bus_mv(asid, agen, ppid, src, dst),
                 _ => return EINVAL,
@@ -23167,7 +23167,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
 fn sys_msend(frame_ptr: u64, frame_len: u64) -> i64 {
     bus_sem_init_once();
     let len = frame_len as usize;
-    if len < super::bus::BUS_HDR_LEN || len > super::bus::BUS_FRAME_MAX {
+    if len < crate::bus::BUS_HDR_LEN || len > crate::bus::BUS_FRAME_MAX {
         return EINVAL; // the whole-frame ceiling gates the copy itself
     }
     let mut frame = alloc::vec![0u8; len];
@@ -23187,7 +23187,7 @@ fn sys_msend(frame_ptr: u64, frame_len: u64) -> i64 {
 /// non-blocking poll returning -EAGAIN.
 fn sys_mrecv(buf_ptr: u64, buf_len: u64) -> i64 {
     bus_sem_init_once();
-    if (buf_len as usize) < super::bus::BUS_FRAME_MAX {
+    if (buf_len as usize) < crate::bus::BUS_FRAME_MAX {
         return EMSGSIZE;
     }
     let asid = current_asid();
@@ -23196,7 +23196,7 @@ fn sys_mrecv(buf_ptr: u64, buf_len: u64) -> i64 {
     }
     // Validate the destination ONCE up front (whole-frame window), so a bad buffer is -EFAULT
     // before any dequeue — a popped frame is never lost to a copy failure.
-    if !user_range_ok(buf_ptr, super::bus::BUS_FRAME_MAX, true) {
+    if !user_range_ok(buf_ptr, crate::bus::BUS_FRAME_MAX, true) {
         return EFAULT;
     }
     loop {
@@ -23237,7 +23237,7 @@ fn bandy_stamp_check() {
 
     // bit0: a caller-supplied principal is REJECTED -EINVAL — and nothing was fulfilled/queued.
     let mut f = [0u8; 64];
-    let n = super::bus::build_request(super::bus::BUS_VERB_LS, 1, b"", &mut f);
+    let n = crate::bus::build_request(crate::bus::BUS_VERB_LS, 1, b"", &mut f);
     let mut forged = f;
     forged[16] = PRIN_IMAGE_SHA256; // nonzero principal kind byte from "EL0"
     if sys_msend_for(asid, agen, ppid, &forged[..n]) == EINVAL && bus_mbox_pop(asid).is_none() {
@@ -23249,10 +23249,10 @@ fn bandy_stamp_check() {
     // carried zeros).
     if sys_msend_for(asid, agen, ppid, &f[..n]) == 0 {
         if let Some(msg) = bus_mbox_pop(asid) {
-            if let Ok(h) = super::bus::frame_parse(&msg.frame) {
+            if let Ok(h) = crate::bus::frame_parse(&msg.frame) {
                 let rp = PrincipalRecord::read(&h.principal);
-                if h.kind == super::bus::BUS_KIND_REPLY
-                    && h.verb == super::bus::BUS_VERB_LS
+                if h.kind == crate::bus::BUS_KIND_REPLY
+                    && h.verb == crate::bus::BUS_VERB_LS
                     && h.corr == 1
                     && h.status == 0
                 {
@@ -23348,7 +23348,7 @@ fn bandy_build_write(name: &str, content: &[u8], corr: u32, buf: &mut [u8]) -> u
     body[0] = name.len() as u8;
     body[1..1 + name.len()].copy_from_slice(name.as_bytes());
     body[1 + name.len()..1 + name.len() + content.len()].copy_from_slice(content);
-    super::bus::build_request(super::bus::BUS_VERB_WRITE, corr, &body[..1 + name.len() + content.len()], buf)
+    crate::bus::build_request(crate::bus::BUS_VERB_WRITE, corr, &body[..1 + name.len() + content.len()], buf)
 }
 
 #[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
@@ -23383,8 +23383,8 @@ fn bandy_grant_check() {
         let Some(msg) = bus_mbox_pop(asid) else {
             return (i64::MIN, alloc::vec::Vec::new());
         };
-        match super::bus::frame_parse(&msg.frame) {
-            Ok(h) => (h.status as i64, msg.frame[super::bus::BUS_HDR_LEN..].to_vec()),
+        match crate::bus::frame_parse(&msg.frame) {
+            Ok(h) => (h.status as i64, msg.frame[crate::bus::BUS_HDR_LEN..].to_vec()),
             Err(_) => (i64::MIN, alloc::vec::Vec::new()),
         }
     }
@@ -23407,7 +23407,7 @@ fn bandy_grant_check() {
         // cat is admitted with C1 (the pre-truncate baseline, bus leg).
         let granted = owned_grant(l1, o1 as u32, owner_asid, owner_gen, grantee_asid, grantee_gen, CAP_READ, owner, grantee) == 0;
         let mut cf = [0u8; 128];
-        let cn = super::bus::build_request(super::bus::BUS_VERB_CAT, 2, GRNT_NAME.as_bytes(), &mut cf);
+        let cn = crate::bus::build_request(crate::bus::BUS_VERB_CAT, 2, GRNT_NAME.as_bytes(), &mut cf);
         let (cst, cbody) = send(grantee_asid, grantee_gen, grantee, &cf[..cn]);
         if granted && cst == 0 && cbody.as_slice() == C1 {
             w |= 1 << 1;
@@ -23451,7 +23451,7 @@ fn bandy_grant_check() {
 
     // bit6: self-clean — owner bus-rm's the fixture; the name is gone (no card residue).
     let mut rf = [0u8; 128];
-    let rn = super::bus::build_request(super::bus::BUS_VERB_RM, 4, GRNT_NAME.as_bytes(), &mut rf);
+    let rn = crate::bus::build_request(crate::bus::BUS_VERB_RM, 4, GRNT_NAME.as_bytes(), &mut rf);
     let (rst, _) = send(owner_asid, owner_gen, owner, &rf[..rn]);
     let gone = crate::fs::fat::mount()
         .map(|fs| matches!(fs.find_in_root(GRNT_NAME), Err(crate::fs::fat::FatError::NotFound)))

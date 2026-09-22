@@ -45,11 +45,11 @@ pub mod sched;
 // compiles against whichever one the active feature selects.
 #[cfg(feature = "aarch64_el0")]
 pub mod syscall;
-// BANDY-1 (ROADMAP §3b arc 1): the on-UnaOS SMessage bus — v1 subset codec (wire layer of the
-// SYS_MSEND/SYS_MRECV transport in syscall.rs). Gated like syscall.rs — JETSON-EL0 (M1b) widened both
-// from `baremetal` to `any(baremetal, tegra_el0)` together, since the bus IS syscall.rs's wire layer.
-#[cfg(feature = "aarch64_el0")]
-pub mod bus;
+// BANDY-1's `pub mod bus;` STOOD HERE until BUSX86 (ROADMAP §3b, 2026-09-22). The v1 SMessage codec
+// was never aarch64 machinery — it names no register, no board, no arch — and declaring it under
+// `arch/aarch64/` is what made SYS_MSEND/SYS_MRECV a board-split of the program story (LAWS §3: ONE
+// OS). It now lives at `crate::bus` (`git mv`, so history follows the file), declared ONCE in lib.rs
+// and compiled on BOTH arches. ⚠ FIVE COMMENT LINES for the five removed: Locations below shift not.
 // JM3: Jetson Orin Nano (Tegra234) kernel-owned MMU. The tegra/UEFI build maps RAM Normal-WB + the
 // Tegra device windows Device-nGnRE before touching any peripheral MMIO (the R4 UARTC-fault fix).
 // (ORIN-NET-3 also compiles it for the `pcie3` virt witness — `ps_widen_witness` exercises the real
