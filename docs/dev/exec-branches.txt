@@ -245,7 +245,6 @@ refs/remotes/origin/exec-rmbp-kfunwedge    6c38659d LOST           docs/dev/OS/r
 # its brief `git reset --hard`s back to exactly this sha), and the gate only asks that the tip still
 # descend from what is written here.
 refs/heads/exec-rmbp-deskrescue            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
-refs/heads/exec-rmbp-specpins              2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-storgpu               2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-toolrescue            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-orin-rescue                fd440602 IN-FLIGHT      orin                      2026-09-22
