@@ -265,6 +265,7 @@ ehcihid|:: EHCI-HID: DMAR: no ACPI DMAR table|-|measured
 kbdwit|SILENCE-ENDED-HALTED|ehcihid|measured
 smc|:: SMC-BATT: sweep failed (present=false)|-|measured
 smcwalk|:: SMC-SCOUT: idx|smc|measured
+sdw|[sdhc-w] cmd24 lba=|-|measured
 sdhcblk|the staged file is FRAGMENTED; the permit describes exactly one LBA interval|-|measured
 sdwrite|:: SDWRITE-POSTURE: posture=|witness|measured
 irqstorage|:: bx-blockreq: no block device|-|measured(1)
