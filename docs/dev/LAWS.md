@@ -73,6 +73,15 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 ## 2. Batons and handoff
 
 - **The queues are the handoff; there are no batons and no numbered sessions** (Peter 2026-09-12: "there is no more orin 28 or rmbp 19 or pi 11"; "one session after the next with whatever focus I tell you"). What a session learns goes into the queue it belongs to THE TURN IT IS LEARNED: metal-specific facts and jobs into that platform's `docs/dev/OS/<track>-queue.md`, everything else into `docs/dev/QUEUE.md` on main — including the other platforms' queues when a finding touches them. R48's challenge ("maybe something is being missed") is written as open questions in those queue entries, not in a separate file. The focus is what Peter says at the start of a session and nothing else; it is not a place to store state. Enforcer: R48, R45; warning only.
+- **An executor branch is closed only by a line in `docs/dev/exec-branches.txt` naming its fold
+  sha; the gate is GATE-BRANCH in `ledger-check.sh`, RED on an unregistered or stale executor tip on
+  no track.** A ref whose tip is an ancestor of a track needs no line — git closed it. Enforcer:
+  `unaos/scripts/branch-census.sh` (GATE-BRANCH), called by `unaos/scripts/ledger-check.sh`, which
+  `./arroyo check` runs; it walks every `refs/heads/exec-*` and `refs/remotes/origin/exec-*` PER REF,
+  never by name (BRANCHCENSUS 935d099a: one name held two different tips and a name-keyed record
+  dropped one of them), and a close-out written anywhere but that file is a close-out trunk cannot
+  see — which is how 23 executor commits, 19 of them shared code, went missing, 14 in one day
+  (nominated rmbp 2026-09-22 — Peter's word pending).
 - **Every baton fact is a claim.** Verify each sha with `git log --oneline -1` and reachability with
   `ls-remote`; an inherited open question is checked in the peer's ledger at their head (`git show
   <peer-head>:<ledger>`) before re-asking; a wrong instruction in a baton is executed, not reviewed,
