@@ -1199,6 +1199,11 @@ pub unsafe fn gmux_igd_switch() {
     let mut aux_div = 0u32;
     let mut dpcd_tries = 0u32;
     let mut pp_settle_ms = 0u64;
+    // GMUX7: rung 07's verdict, hoisted out of the harness closure for the same reason GMUXDPCD
+    // hoisted the three above — the rollup must carry it on EVERY exit path. It is the token that
+    // says the ladder STOPPED SHORT OF PANEL POWER and why, so a capture that reaches
+    // `name=end ok=1` can never be misread as "the panel was powered and nothing happened".
+    let mut pps_verdict = "not-reached";
 
     // Will be captured dynamically based on live pre-image
     let mut pre_ddc: Option<u32> = None;
@@ -1556,7 +1561,176 @@ pub unsafe fn gmux_igd_switch() {
             return Err(("edid-checksum-bad", 0));
         }
 
+        // ═══════════════════════════════════════════════════════════════════════════════════
+        // RUNG 06 — `link`: WHAT THE SINK SAYS IT CAN DO, READ AND PRINTED DECODED.
+        //
+        // Flight 11 (2026-09-22) is why this rung exists and why it is FIRST of the three. It ran
+        // `rung=03 name=pp … SETTLE ms=210 … moved=0` → `rung=04 name=dpcd try=1/7 ok=1
+        // dpcd_rev=0x11 elapsed_ms=226` → `LADDER highest=06/10 name=end ok=1 pending=2
+        // gmux=MATCH why=none elapsed_ms=231`. GMUXDPCD's timing theory is CONFIRMED: after the
+        // settle the FIRST AUX try answered, the EDID read, and the ladder ended at its last built
+        // rung for the first time on this machine. The ladder was out of rungs, not out of sink.
+        //
+        // WHAT IT READS, AND WHERE EVERY ADDRESS COMES FROM. Two native AUX reads, no writes to
+        // anything but the AUX transaction registers rungs 04 and 05 already write:
+        //
+        //   * DPCD `0x00000..0x0000F` — the cap window this tree already names, verbatim, at
+        //     `docs/dev/GEMINI/video/iGUI/LADDER-igpu-bringup.md:318-319` ("Native AUX read of DPCD
+        //     `0x00000..0x0000F` → `DPCD_REV`, `MAX_LINK_RATE`, `MAX_LANE_COUNT`, `MAX_DOWNSPREAD`,
+        //     `eDP_CONFIGURATION_CAP`"). The brief asked for `0x000-0x00B`; the window is the
+        //     tree-cited 16 bytes because `eDP_CONFIGURATION_CAP` — which the brief names in the
+        //     same breath — is at `0x00D`, OUTSIDE `0x000-0x00B`. One transfer, not two, is also
+        //     one failure point rather than two.
+        //   * DPCD `0x00202..0x00207` — `LANE0_1_STATUS`, `LANE2_3_STATUS`,
+        //     `LANE_ALIGN_STATUS_UPDATED`, `SINK_STATUS`, `ADJUST_REQUEST_LANE0_1`,
+        //     `ADJUST_REQUEST_LANE2_3`, cited to the same document at :420-422, which marks the
+        //     whole set **NEEDS-VERIFICATION against the DP 1.1/1.2 spec**. So the BYTES are
+        //     printed and the BIT meanings are not claimed: `bits=uncited` is on the wire.
+        //
+        // ⚠ THE ONE DECODE THIS RUNG REFUSES TO MAKE, and it is a finding. The only MAX_LINK_RATE
+        // map in this tree (`LADDER-igpu-bringup.md:318-319`) reads `0x0A`=1.62, `0x14`=2.7 Gbps —
+        // and that same document marks its DP-side facts NEEDS-VERIFICATION at :420-422. It names
+        // no encoding at all for `0x06`. A link rate is the number that sets the PLL frequency
+        // (:177 of that doc), so converting the raw byte to MHz on an unverified table is exactly
+        // the "silent wrongness downstream" that document's own rung-3 section warns about. The
+        // rung therefore prints `rate_raw=` verbatim and `rate_decode=TBV-tree-table`, and the
+        // NEXT executor's first job is one PRM/DP-spec line, not one more boot.
+        //
+        // It cannot black the panel: it writes no display register, no PPS register, no gmux
+        // register, and adds no unwind entry. Its write envelope is exactly rung 04's.
         highest = 6;
+        rung_name = "link";
+
+        let mut dpcd_cap = [0u8; 16];
+        if let Err(e) = dp_aux_transfer(bar0, clock_divider, DP_AUX_NATIVE_READ, 0x00000, 16, &[], &mut dpcd_cap, window_deadline) {
+            pp_after = Some((mmio_read(bar0, regs::PCH_PP_CONTROL), mmio_read(bar0, regs::PCH_PP_STATUS)));
+            return Err(e);
+        }
+
+        let mut link_status = [0u8; 6];
+        if let Err(e) = dp_aux_transfer(bar0, clock_divider, DP_AUX_NATIVE_READ, 0x00202, 6, &[], &mut link_status, window_deadline) {
+            pp_after = Some((mmio_read(bar0, regs::PCH_PP_CONTROL), mmio_read(bar0, regs::PCH_PP_STATUS)));
+            return Err(e);
+        }
+        pp_after = Some((mmio_read(bar0, regs::PCH_PP_CONTROL), mmio_read(bar0, regs::PCH_PP_STATUS)));
+
+        let cap_rev = dpcd_cap[0x0];
+        let cap_rate = dpcd_cap[0x1];
+        let cap_lane_byte = dpcd_cap[0x2];
+        let cap_lanes = cap_lane_byte & 0x1F;
+        let cap_enhanced = (cap_lane_byte >> 7) & 0x1;
+        let cap_tps3 = (cap_lane_byte >> 6) & 0x1;
+        let cap_spread_byte = dpcd_cap[0x3];
+        let cap_downspread = cap_spread_byte & 0x1;
+        let cap_no_aux_tl = (cap_spread_byte >> 6) & 0x1;
+        let cap_edp_cfg = dpcd_cap[0xD];
+        // `MAX_LANE_COUNT & 0x1F ∈ {1,2,4}` is the structural-plausibility predicate the same
+        // design document states at :326-327. Scored, printed, and NOT made a refusal: this rung
+        // reports, and an implausible lane count is a fact rung 08 must carry, not a reason to
+        // throw away a capture that already cost a dark window.
+        let cap_lanes_plausible = if cap_lanes == 1 || cap_lanes == 2 || cap_lanes == 4 { 1 } else { 0 };
+
+        serial_println!(":: igpu-dpy: rung=06 name=link ok=1 window=DPCD(0x000-0x00F) dpcd_rev=0x{:02X} rate_raw=0x{:02X} rate_decode=TBV-tree-table lanes={} lanes_plausible={} enhanced_frame={} tps3={} downspread={} no_aux_tl={} edp_cfg_cap=0x{:02X} elapsed_ms={} ::",
+            cap_rev, cap_rate, cap_lanes, cap_lanes_plausible, cap_enhanced, cap_tps3, cap_downspread, cap_no_aux_tl, cap_edp_cfg, get_elapsed_ms());
+        serial_print!(":: igpu-dpy: rung=06 name=link CAP 000:");
+        for b in dpcd_cap.iter() { serial_print!(" {:02X}", b); }
+        serial_println!(" ::");
+        serial_println!(":: igpu-dpy: rung=06 name=link STATUS addr=DPCD(0x202-0x207) bits=uncited lane01=0x{:02X} lane23=0x{:02X} align=0x{:02X} sink=0x{:02X} adj01=0x{:02X} adj23=0x{:02X} ::",
+            link_status[0], link_status[1], link_status[2], link_status[3], link_status[4], link_status[5]);
+
+        // ═══════════════════════════════════════════════════════════════════════════════════
+        // RUNG 07 — `pps-on`: THE PANEL-POWER WRITE, DECLINED AGAIN, WITH THE DOCUMENT NAMED.
+        //
+        // The brief built this rung CONDITIONALLY: raise VDD **only if** this tree carries a cited
+        // bit map for `PCH_PP_CONTROL` (0xC7204) bits 0 and 3 and a cited T1..T5 field layout for
+        // `PCH_PP_ON_DELAYS` (0xC7208) / `PCH_PP_OFF_DELAYS` (0xC720C), from Intel PRM Vol 3
+        // Part 4 "Panel Power Sequencing"; else decline again and stop the ladder there.
+        //
+        // IT DOES NOT, AND THIS EXECUTOR COULD NOT SUPPLY IT. `gen7.md` names 0xC7204 once and
+        // only to say it is READ ONLY; `gpu_spec.md` does not name it at all; `gen7.rs`'s
+        // `PCH_PP_CONTROL_KEY` cites `0xABCD` as an entropy PATTERN, not a semantic; the one place
+        // in tree that names bit 0 / bit 2 / bit 3 — `LADDER-igpu-bringup.md` rung 2 — marks the
+        // whole map **TBV** and sources it to i915 `intel_pps.c` NAMING, which the clean-room rule
+        // forbids this rung from promoting to a citation. So the write is declined, again, with
+        // the same token flight 11 printed at rung 03, and NOTHING is written.
+        //
+        // AND THE T VALUES THE BRIEF WOULD HAVE DERIVED DO NOT EXIST EITHER, which is the new
+        // finding rather than a repeat. The brief said "program the delays from the DPCD/EDID-
+        // derived T values (never zero)". Rung 06 has just read the whole DPCD cap window this
+        // tree cites (0x000-0x00F) and rung 05 has just read the 128-byte EDID base block, and
+        // neither carries a panel-power T value: the cap window is link capability, the EDID base
+        // block is timing and identification. The panel's T1..T12 are therefore unavailable from
+        // EVERYTHING THIS LADDER HAS EVER READ, and `PCH_PP_ON_DELAYS`/`PP_OFF_DELAYS` read
+        // 0x00000000 on this part (flights 8/9/10/11). That is three independent legs under one
+        // decline, and the third one is the dangerous one: firing the PPS on zero delays is the
+        // documented panel-damage path.
+        //
+        // ⚠ THE DECLINE IS A TOKEN, NOT AN ABORT — deliberately, and the file already decided this
+        // one register along. Rung 03's own doc-comment states the rule (R19): "This rung writes
+        // nothing and so cannot fail: it reports." The brief's "stop the ladder here with the
+        // reason" is honoured as **the ladder stops WRITING here** — no PPS write, no panel power,
+        // no link write, ever, on this build — while rung 08, which writes nothing at all, still
+        // flies. Returning `Err` instead would have made rung 08 structurally unreachable on every
+        // boot, which is precisely the defect `docs/dev/QUEUE.md` §5 BRANCHCENSUS spent a whole
+        // commit convicting (206 executor branches that reached no track; 23 LOST). The reason is
+        // not hidden by that choice: it rides the rung line AND the rollup as `pps=`.
+        highest = 7;
+        rung_name = "pps-on";
+        pps_verdict = "DECLINED:pp-bits-uncited";
+
+        let pps_ctl = mmio_read(bar0, regs::PCH_PP_CONTROL);
+        let pps_sts = mmio_read(bar0, regs::PCH_PP_STATUS);
+        let pps_on = mmio_read(bar0, regs::PCH_PP_ON_DELAYS);
+        let pps_off = mmio_read(bar0, regs::PCH_PP_OFF_DELAYS);
+        let pps_div = mmio_read(bar0, regs::PCH_PP_DIVISOR);
+        serial_println!(":: igpu-dpy: rung=07 name=pps-on ok=1 pp_write=DECLINED why=pp-bits-uncited writes=0 pp_unwind=0 t_source=NONE t_dpcd=absent t_edid=absent pp_ctl=0x{:08X} pp_sts=0x{:08X} on_delays=0x{:08X} off_delays=0x{:08X} div=0x{:08X} elapsed_ms={} ::",
+            pps_ctl, pps_sts, pps_on, pps_off, pps_div, get_elapsed_ms());
+        serial_println!(":: igpu-dpy: rung=07 name=pps-on MISSING doc=PRM-Vol3-Part4-Panel-Power-Sequencing pp_control=0xC7204:bit0=power-state-target:UNCITED,bit3=vdd-override:UNCITED on_delays=0xC7208:T1-T5:UNCITED off_delays=0xC720C:T:UNCITED — no PPS write is attempted and this ladder raises no panel power on any boot of this build ::");
+
+        // ═══════════════════════════════════════════════════════════════════════════════════
+        // RUNG 08 — `link-train-dry`: THE TRANSCRIPTION, SO THE NEXT MODE-SET IS A COPY.
+        //
+        // A DRY RUN. It writes nothing — not one AUX byte, not one MMIO dword — and its whole
+        // product is five printed lines: the link parameters it WOULD set (from rung 06's DPCD,
+        // never invented), the DPCD addresses it WOULD write, the display registers it WOULD touch
+        // WITH THEIR CURRENT VALUES, and — the line that matters most — the registers a real
+        // mode-set needs that THIS TREE HAS NO OFFSET FOR. The last one turns the next executor's
+        // first hour from a hunt into a shopping list with a citation requirement attached.
+        //
+        // WHY THE "WOULD-TOUCH" SET IS EXACTLY THE `regs` BLOCK AND NOT ONE REGISTER WIDER. The
+        // clean-room rule for this seat is "every register cited". Each offset printed below is
+        // already a named constant in this file's own `regs` module (`igpu.rs:5-93`), which is the
+        // tree carrying it; an offset for HTOTAL/HBLANK/HSYNC, the transcoder block, `DP_TP_CTL`
+        // or the link M/N pairs is NOT in this file, and inventing one from memory is the exact
+        // move this ladder has refused at the PPS for four flights running. So they are named as
+        // ABSENT, by name, with no number beside them.
+        //
+        // It cannot black the panel, and the statement is structural rather than a promise:
+        // there is no `write_volatile` and no `dp_aux_transfer` call in the rung at all.
+        highest = 8;
+        rung_name = "link-train-dry";
+
+        serial_println!(":: igpu-dpy: rung=08 name=link-train-dry ok=1 DRY writes=0 aux_writes=0 pp_unwind=0 gated_on=pps={} elapsed_ms={} ::",
+            pps_verdict, get_elapsed_ms());
+        serial_println!(":: igpu-dpy: rung=08 name=link-train-dry WOULD-SET rate=0x{:02X}(DPCD 0x001 verbatim; no MHz conversion, decode TBV) lanes={} enhanced_frame={} tps3={} downspread={} seq=TPS1-CR/TPS2-EQ/pattern-off cite=LADDER-igpu-bringup.md-rung5-NEEDS-VERIFICATION ::",
+            cap_rate, cap_lanes, cap_enhanced, cap_tps3, cap_downspread);
+        serial_println!(":: igpu-dpy: rung=08 name=link-train-dry WOULD-WRITE-DPCD link_bw_set=0x100 lane_count_set=0x101 training_pattern_set=0x102 training_lane0_3_set=0x103-0x106 cite=LADDER-igpu-bringup.md-rung5-NEEDS-VERIFICATION ::");
+        serial_println!(":: igpu-dpy: rung=08 name=link-train-dry WOULD-TOUCH dp_a@0x{:05X}=0x{:08X} dplla@0x{:05X}=0x{:08X} fpa0@0x{:05X}=0x{:08X} fpa1@0x{:05X}=0x{:08X} pipeaconf@0x{:05X}=0x{:08X} pipeasrc@0x{:05X}=0x{:08X} ::",
+            regs::DP_A, mmio_read(bar0, regs::DP_A),
+            regs::DPLL_A_CTRL, mmio_read(bar0, regs::DPLL_A_CTRL),
+            regs::FPA0, mmio_read(bar0, regs::FPA0),
+            regs::FPA1, mmio_read(bar0, regs::FPA1),
+            regs::PIPEACONF, mmio_read(bar0, regs::PIPEACONF),
+            regs::PIPEASRC, mmio_read(bar0, regs::PIPEASRC));
+        serial_println!(":: igpu-dpy: rung=08 name=link-train-dry WOULD-TOUCH dspacntr@0x{:05X}=0x{:08X} dspastride@0x{:05X}=0x{:08X} dspalinoff@0x{:05X}=0x{:08X} dspatileoff@0x{:05X}=0x{:08X} dspasurf@0x{:05X}=0x{:08X} ::",
+            regs::DSPACNTR, mmio_read(bar0, regs::DSPACNTR),
+            regs::DSPASTRIDE, mmio_read(bar0, regs::DSPASTRIDE),
+            regs::DSPALINOFF, mmio_read(bar0, regs::DSPALINOFF),
+            regs::DSPATILEOFF, mmio_read(bar0, regs::DSPATILEOFF),
+            regs::DSPASURF, mmio_read(bar0, regs::DSPASURF));
+        serial_println!(":: igpu-dpy: rung=08 name=link-train-dry NOT-IN-TREE htotal hblank hsync vtotal vblank vsync transcoder dp_tp_ctl dp_tp_status link_m link_n — population=igpu.rs-regs-module(igpu.rs:5-93), hits=0; a mode-set is impossible until each lands WITH a PRM citation ::");
+
+        highest = 9;
         rung_name = "end";
         Ok(())
     };
@@ -1572,6 +1746,12 @@ pub unsafe fn gmux_igd_switch() {
         }
     }
 
+    // GMUX7: `pending=` has been a BARE COUNT since the rollup existed, and flight 11 printed
+    // `pending=2` with nothing on the wire saying WHICH two. The entries are snapshotted HERE —
+    // before `execute()` drains the stack to zero — so the rollup can name them. `entries` is
+    // `[UnwindEntry; 32]` and `UnwindEntry` is `Copy`, so this is a copy of the array, not a
+    // borrow that would outlive the drain.
+    let pending_entries = unwind.entries;
     let unwound_count = unwind.len;
     let revert_ok = unwind.execute();
 
@@ -1686,10 +1866,18 @@ pub unsafe fn gmux_igd_switch() {
         (true, false) => "before",
         _ => "none",
     };
-    serial_println!(":: igpu-dpy: LADDER highest={:02}/10 name={} ok={} pending={} gmux={} why={} elapsed_ms={} pp_seen={} pp=0x{:08X}/0x{:08X}->0x{:08X}/0x{:08X} pp_settle_ms={} aux_port=DPA(0x{:05X}) aux_div=0x{:03X} dpcd_tries={} ::",
+    // GMUX7 appends `pps=` and `pending_items=` after `dpcd_tries=`, which GMUXDPCD left as the
+    // line's last field — the same discipline GMUXDPCD itself followed: every pre-existing field
+    // keeps its NAME, its VALUE and its ORDER, so a flight-5/8/9/10/11-to-flight-12 diff stays a
+    // field-for-field diff and the register's G8 row keeps its key. The line is emitted in three
+    // calls because `pending_items=` is a variable-length list, but `serial_print!` appends no
+    // newline, so it is still ONE physical line and one `awk` match.
+    serial_print!(":: igpu-dpy: LADDER highest={:02}/10 name={} ok={} pending={} gmux={} why={} elapsed_ms={} pp_seen={} pp=0x{:08X}/0x{:08X}->0x{:08X}/0x{:08X} pp_settle_ms={} aux_port=DPA(0x{:05X}) aux_div=0x{:03X} dpcd_tries={} pps={} pending_items=",
         highest, rung_name, ok_flag, unwound_count, gmux_verdict, why_str, get_elapsed_ms(),
         pp_seen, ppb_ctl, ppb_sts, ppa_ctl, ppa_sts, pp_settle_ms,
-        regs::DPA_AUX_CH_CTL, aux_div, dpcd_tries);
+        regs::DPA_AUX_CH_CTL, aux_div, dpcd_tries, pps_verdict);
+    print_pending_items(&pending_entries, unwound_count);
+    serial_println!(" ::");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════
@@ -1934,3 +2122,79 @@ const DPCD_TRIES: u32 = 7;
 /// outrun the bound that was already there.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const DPCD_RETRY_GAP_MS: u64 = 20;
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// GMUX7 — NAMING THE UNWIND ENTRIES THE ROLLUP HAS ONLY EVER COUNTED
+//
+// Appended at the FOOT for the reason the two blocks above already give: everything below the
+// gmux harness is nothing in a knob-OFF build, so an append here moves no knob-OFF line number and
+// `panic::Location` cannot shift under a `gmux_igd` change (QUEUE B94). Every item carries the
+// same `all(target_arch = "x86_64", feature = "gmux_igd")` cfg as the rest of the ladder.
+//
+// WHAT `pending=2` MEANS ON THIS MACHINE, which is the question flight 11 left on the table. The
+// number is `DisplayUnwind::len` sampled immediately before the revert, and the stack at that
+// instant is the SECOND push set (the first is drained by the self-test's own `execute()` at the
+// `selftest` rung). That set is pushed EXTERNAL → DISPLAY → DDC and is LIFO, so:
+//
+//   * `GMUX_SWITCH_EXTERNAL` (0x40) is pushed ONLY when `ext_restore_target` mapped the 0x41
+//     STATUS read back to a named write encoding. On the 2012 rMBP it reads `0x21`
+//     (kepler-owned), for which this tree has no cited status→write map, so it is NOT pushed —
+//     `restore ext=SKIPPED` says so on its own line. THAT ABSENCE IS THE WHOLE REASON THE COUNT
+//     IS 2 AND NOT 3.
+//   * `GMUX_SWITCH_DISPLAY` (0x10) ← `GMUX_DISPLAY_DIS` (0x03).
+//   * `GMUX_SWITCH_DDC` (0x28) ← `GMUX_DDC_DIS` (0x02).
+//
+// So `pending=2` has always meant "the two gmux restores, DDC first then DISPLAY, and EXTERNAL
+// deliberately absent" — and from this commit the line SAYS that instead of leaving a reader to
+// re-derive it from three push sites and a `None`.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// The gmux index port, by the name this file's own constant block gives it.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const fn gmux_reg_name(reg: u8) -> &'static str {
+    match reg {
+        GMUX_SWITCH_DDC => "SWITCH_DDC",
+        GMUX_SWITCH_DISPLAY => "SWITCH_DISPLAY",
+        GMUX_SWITCH_EXTERNAL => "SWITCH_EXTERNAL",
+        _ => "UNNAMED",
+    }
+}
+
+/// The MMIO offsets the unwind can carry. Only the self-test ever pushes one (`DPA_AUX_CH_DATA1`),
+/// and it drains its own entry, so `UNNAMED` here is itself a finding rather than a formatting
+/// gap: it would mean an MMIO entry survived to the revert, which no path in this file writes.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const fn unwind_mmio_name(off: u32) -> &'static str {
+    if off as usize == regs::DPA_AUX_CH_DATA1 {
+        "DPA_AUX_CH_DATA1"
+    } else {
+        "UNNAMED"
+    }
+}
+
+/// Print the entries still on the unwind stack in the order `DisplayUnwind::execute` will replay
+/// them — LIFO, i.e. the order the forward writes went out — as a comma-separated list with no
+/// spaces, so the rollup stays one `awk`-able line. `none` when the stack is empty, which is what
+/// a `pending=0` flight (the pre-switch refusal of flight 5) prints.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+fn print_pending_items(entries: &[UnwindEntry; 32], len: usize) {
+    if len == 0 {
+        serial_print!("none");
+        return;
+    }
+    let mut i = len;
+    while i > 0 {
+        i -= 1;
+        if i + 1 != len {
+            serial_print!(",");
+        }
+        match entries[i] {
+            UnwindEntry::Gmux { reg, pre } => {
+                serial_print!("gmux:{}@0x{:02X}<-0x{:02X}", gmux_reg_name(reg), reg, pre);
+            }
+            UnwindEntry::Mmio { off, pre } => {
+                serial_print!("mmio:{}@0x{:05X}<-0x{:08X}", unwind_mmio_name(off), off, pre);
+            }
+        }
+    }
+}

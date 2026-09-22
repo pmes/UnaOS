@@ -246,3 +246,10 @@ refs/remotes/origin/exec-rmbp-kfunwedge    6c38659d FOLDED-BY-HAND 3bbeb754     
 # descend from what is written here.
 refs/heads/exec-rmbp-deskrescue            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-toolrescue            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-hdaamp                b9edcfa1 IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-wifishm               b9edcfa1 IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-gmux7                 b9edcfa1 IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-kf9close              b9edcfa1 IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-ptrlag                b9edcfa1 IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-vugperf               b9edcfa1 IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-quarryopen            b9edcfa1 IN-FLIGHT      rmbp                      2026-09-22
