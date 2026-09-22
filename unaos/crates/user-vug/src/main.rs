@@ -1217,6 +1217,10 @@ static A_COHERENT: AtomicU32 = AtomicU32::new(0);
 static A_TORN: AtomicU32 = AtomicU32::new(0);
 #[cfg(target_arch = "x86_64")]
 static A_MIXED: AtomicU32 = AtomicU32::new(0);
+/// VUGART: the generation `art_strand` last charged, so `art_score` cannot charge it again if the
+/// barrier eventually completes and the frame does reach a present after all.
+#[cfg(target_arch = "x86_64")]
+static A_STRAND_GEN: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// VUGART: rows in each band, so `torn_rows` is a row count and not a band count.
 #[cfg(target_arch = "x86_64")]
@@ -1285,10 +1289,10 @@ fn art_end(b: usize, g: u32) {
 #[inline(always)]
 fn art_end(_b: usize, _g: u32) {}
 
-/// VUGART: score the surface the parent is about to present. Call site: immediately before the
-/// present, after every writer this frame could legitimately have.
+/// VUGART: rows of generation `g` that the surface does NOT currently hold — the whole of the
+/// coherence test, shared by the present-time scorer and the barrier-time one.
 #[cfg(target_arch = "x86_64")]
-fn art_score(g: u32) {
+fn art_bad_rows(g: u32) -> u32 {
     let mut bad_rows = 0u32;
     let mut b = 0usize;
     while b < 3 {
@@ -1297,6 +1301,54 @@ fn art_score(g: u32) {
         }
         b += 1;
     }
+    bad_rows
+}
+
+/// VUGART — SCORE THE FRAME THE PARENT IS ABOUT TO ABANDON, and this is the hook that catches the
+/// defect Peter saw rather than a neighbour of it.
+///
+/// `art_score` below runs immediately before the present, so it can only ever judge frames that
+/// REACH a present. The failure this arc is about does not: when a release is lost the workers never
+/// run, `DONE` never reaches `live`, and the parent BLOCKS at the barrier — with the new projection
+/// already published and its own band `BAND_PAR..SH` already rasterised from it. Nothing is
+/// presented, and `art_score` never runs, but the SURFACE IS ALREADY MIXED and the compositor
+/// composites a live window from the surface on the PANEL's cadence, not on this program's presents.
+/// So the eye sees a two-rotation crystal that no present ever announced, and a present-only
+/// instrument would have reported `mixed_frames=0` through the whole of it.
+///
+/// This fires exactly ONCE per stranded frame, on the pass where the parent stops spinning and
+/// starts parking — the moment it stops being "a slow frame" and becomes "a surface left this way".
+/// It EMITS immediately, because the parent may never come back to emit at all.
+///
+/// `A_STRAND_GEN` is the no-double-count latch: a barrier that eventually completes will go on to
+/// present, and `art_score` must not charge that frame a second time.
+#[cfg(target_arch = "x86_64")]
+fn art_strand(g: u32, passes: u32) {
+    if passes != BARRIER_SPIN_YIELDS + 1 {
+        return;
+    }
+    let bad = art_bad_rows(g);
+    if bad == 0 {
+        return;
+    }
+    A_STRAND_GEN.store(g, Ordering::Relaxed);
+    A_FRAMES.fetch_add(1, Ordering::Relaxed);
+    A_MIXED.fetch_add(1, Ordering::Relaxed);
+    A_TORN.fetch_add(bad, Ordering::Relaxed);
+    art_emit();
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn art_strand(_g: u32, _passes: u32) {}
+
+/// VUGART: score the surface the parent is about to present. Call site: immediately before the
+/// present, after every writer this frame could legitimately have.
+#[cfg(target_arch = "x86_64")]
+fn art_score(g: u32) {
+    if A_STRAND_GEN.load(Ordering::Relaxed) == g {
+        return; // already charged to `mixed_frames` by `art_strand` — do not count the frame twice
+    }
+    let bad_rows = art_bad_rows(g);
     let cl = A_CLASH.load(Ordering::Relaxed);
     let seen = A_CLASH_SEEN.swap(cl, Ordering::Relaxed);
     let n = A_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3555,6 +3607,9 @@ pub extern "C" fn _start() -> ! {
                 join_b = false;
                 break;
             } else {
+                // VUGART: the pass where this stops being a slow frame and becomes a SURFACE LEFT
+                // MIXED. Fires once, emits immediately — the parent may never come back.
+                art_strand(gen, passes);
                 futex_wait(core::ptr::addr_of!(DONE), d);
             }
         }
