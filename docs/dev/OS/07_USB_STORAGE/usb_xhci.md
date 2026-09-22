@@ -8903,6 +8903,91 @@ Metal falsifiers, in order: (1) `ISRARM armed` on both functions rather than `IS
 altogether because `dark_missed` stops moving; (4) `ringfull=` — nonzero means a residual window
 remains and depth is worth revisiting, with §33b's parked QH-chain on the table.
 
+### 33h. THE PASS PERIOD *IS* THE DARK WINDOW — and on flight 11 it was already the tick (2026-09-22)
+
+§33a states it in one line and it is worth making the heading: `dark_gap_ms` is `now_ms - seen_ms`,
+**a service-pass gap**. Every number the EHCIDARK census prints — `windows=`, `dark=`, `max=`,
+`missed<=` — is therefore a statement about *how often the pass runs*, not about how deep the
+endpoint is. §33b says depth cannot be the answer on this silicon; this section says what the
+remaining term actually measured, on flight 11 (2026-09-22, `f11.log`, 41 rollups).
+
+**The pass is already at the scheduler tick.** `[deadman] pmp=` counts `service_ehci_hid()` entries
+per second. After the scheduler comes up at 28 s, across 928 seconds:
+
+| statistic | passes/s | mean pass period |
+|---|---|---|
+| p50 | 965 | 1.04 ms |
+| p90 | 1051 | 0.95 ms |
+| p10 | 518 | 1.93 ms |
+| min | 38 | 26 ms |
+
+That is `x86_usb_pump` doing exactly what its doc-comment claims: `sleep_ticks(1)` at the calibrated
+1 kHz local-APIC tick. It is **not** the console frame loop — the frame-paced call sites
+(`main.rs` usbdebug loop, inline BSP console loop) are taken only when fewer than two APs come
+online, and flight 11 ran `SCHED-X86 PLACE: aps=7 rsvc=c1 svc=c7`. **Nor does it contend with the
+compositor**: the pump is pinned to the service core c7 and the render task owns c1, a split
+`smp::publish_sched_split` asserts at the spawn site and prints. PTRLAG B134's rule — the input band
+must never wait on the compositor — is structurally satisfied on this path and was never the term.
+
+**What is left is a tail, and the tail is the serial console.** Partitioning those 928 seconds by
+the capture's own line rate:
+
+| serial line rate | seconds | mean pass period |
+|---|---|---|
+| quiet (< 50 lines/s) | 840 | **1.08 ms** |
+| burst (≥ 150 lines/s) | 17 | **6.46 ms** |
+
+A sixfold collapse, and `max=108ms` lives inside it. The mechanism is in `arch/x86_64/serial.rs`:
+`_print` runs under `interrupts::without_interrupts`, and on a full staging ring the winner of the
+`try_lock` **drains the whole ring** through a 16550 a byte at a time. A core inside that span
+cannot be preempted and runs no pass. It is machine-wide, not a slow pump body: the deadman's own
+1 Hz line stretches to 2041 ms in the same seconds **on a different core**, with `dec=ffffffff`.
+
+This is the defect EHCIDARK's own rollup constant was written to avoid feeding — "a census that
+printed per dark window would print hardest exactly when the console is already the problem". The
+census was right about the shape and did not yet say so in numbers. Now it does:
+
+```
+:: EHCI-HID: [1] EHCIDARK addr=8 ep=IN1 kind=vendor-mt reports=5706 cad=1ms windows=2262 dark=13646ms max=108ms missed<=11384 pass_period_us_max=… pass_period_us_mean=… == witness ::
+```
+
+| field | how to read it |
+|---|---|
+| `pass_period_us_mean` | at ~1000 µs the pass is running at the tick and the cadence is **not** the defect. Drifting well above it would be a genuinely slow pass — a different defect with a different owner. |
+| `pass_period_us_max` | two orders above the mean = a **tail**. That is the shape a console burst makes, and it is what costs the operator reports. |
+
+Both are **global**, because the pass period is a property of the scheduler and not of any one
+endpoint; two endpoints in one capture carry the same pair, which is the honest rendering of their
+having shared a pass. Measured with **rdtsc**, not `arch::ms()`: `ms()` is a count the timer ISR
+increments, so it under-counts precisely the masked span this exists to measure, while `now_cycles`
+is documented as advancing regardless of `EFLAGS.IF`.
+
+⚠ **A consequence worth stating: `dark=` and `max=` are themselves LOWER BOUNDS under console
+load.** They are computed from `ms()`, whose ticks are lost while interrupts are masked. `dark_gap_ms`
+is deliberately left on that clock — eleven flights have been read against it and silently re-basing
+it would break every comparison in the corpus — so the residual is named here instead of hidden.
+
+⚠ **`cad=1ms` is a self-calibrated floor, not the pad's report rate.** `dark_cad_ms` is the running
+minimum of gaps that ended in a completion, so at a ~1 ms pass period it collapses to 1 ms within
+seconds regardless of how often the device actually reports. `missed<=` divides every gap by that
+floor. On boot 10 of `rmbp2-boot8` the pad's routed cadence was 8 ms flat — against which
+`missed<=11384` would be roughly eightfold high. The field is documented as a bound and it is a
+loose one; `pass_period_us_mean` is what tells a reader how loose.
+
+**Fixture.** `pass_period_selftest` runs once at `init` beside `isr_selftest`, drives the real
+`pass_period_fold` with hand-built TSC stamps — 99 passes at a 1 ms tick plus one 40 ms stall, then
+a backwards delta — and asserts `max=40000 mean=1390 samples=100`. It exists because a healthy QEMU
+boot runs every pass at the tick, so the stall half would otherwise be unexecuted code on every gate
+this repo runs. It restores all four counters before returning, so a boot's census reports the
+machine's passes and not the fixture's.
+
+**What flight 12 should print.** `pass_period_us_mean` at ~1000 µs (confirming the cadence is not
+the defect) with `pass_period_us_max` in the tens of thousands, and the max tracking the capture's
+own burst seconds. If instead the *mean* is far off the tick, the pass is genuinely being starved
+and `x86_usb_pump`'s placement is back on the table. The next lever on `max=` is the console, not
+the schedule and not the endpoint: it is the third owner this arc has found, after depth (§33b,
+refused by silicon) and interrupt latency (§33c, refused by this function's missing MSI).
+
 ## 34. BT-DIR — the direction test: let the peer page **us** (`UNAOS_BTDIR=1`, 2026-08-25)
 
 §30.5 named the one surviving hypothesis and the one boot that settles it. This is that boot's
