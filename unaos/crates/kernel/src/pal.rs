@@ -612,7 +612,7 @@ pub mod cursor {
     #[inline]
     fn repaint_on_move() {
         if SPRITE_OWNS_PAINT {
-            let _ = crate::video::cursor::repaint_nowait(); // PTRPAINT (B141): the ONE token the arc could not place — pal.rs was outside its files; the seat placed it at the fold. Never the bounded spin on the input band.
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _ = crate::video::cursor::repaint_nowait(); #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] crate::video::cursor::repaint(); // PTRPAINT (B141): the wc arm is the no-wait door, every other build keeps the ungated repaint (aarch64 desktop_firmware included) — the seat's first placement at c1ee6955 named only the wc callee and did not compile on the non-wc x86 leg nor on aarch64 (NEUTRAL found it at its cut). the ONE token the arc could not place — pal.rs was outside its files; the seat placed it at the fold. Never the bounded spin on the input band.
         }
         rollup_tick();
     }
