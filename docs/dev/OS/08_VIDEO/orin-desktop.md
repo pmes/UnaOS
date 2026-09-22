@@ -192,7 +192,7 @@ Video scope under v5: PAIRED 328 · x86-only 229 · aarch64-only 67, plus 9 `cfg
 tree-wide excluded from the census.
 
 **Against v3, x86-only drift was under-reported by 172 gates — exactly half again as many as it
-reported.** Three of v5's 342 aarch64-only rows are this session's own `[orinstkdepth]` instrument
+reported.** Three of v5's 342 aarch64-only rows are this session's own `[stkdepth]` instrument
 (`main.rs:88`, `:8079`, `:8086`), attributed by diffing the report across the fold; the census
 tool and the code it measures moved in the same session, and saying so is cheaper than letting a
 later reader discover an unexplained +3.
@@ -2140,7 +2140,7 @@ But the SP itself is readable in three instructions with no scheduler, no `Task`
 linker symbol, and the exact pattern **already exists in this tree twice** —
 `arch/aarch64/mmu_tegra.rs:749-752` and `arch/aarch64/sched.rs:91-94`. Two reads on the
 same frame chain subtract to an exact **depth consumed**. `TERMINUS` D4 takes that
-measurement at the `[orinfurn] arm` line and publishes `[orinstkdepth] depth-consumed=`. The
+measurement at the `[deskfurn] arm` line and publishes `[stkdepth] depth-consumed=`. The
 instrument itself — wire format, both failure arms, and the full argument for why no headroom number
 is derivable — is documented in
 [`docs/dev/OS/01_BOOT_HAL/arch_arm64.md`](../01_BOOT_HAL/arch_arm64.md) §ORIN-STKDEPTH; §3.13 D4
@@ -2256,7 +2256,7 @@ rather than on a bench boot.
   Unproven on metal: that the bar paints at all; that it paints at 1920x1200 rather
   than declining on a contended `SCRATCH`; that the crystal press is consumed by the menu
   band rather than falling through to the desktop; that the composite fits the boot stack.
-  The falsifiers are `[orinfurn] ARMED … -> BAR-ON-GLASS` with a non-`None` `rect=`, and an
+  The falsifiers are `[deskfurn] ARMED … -> BAR-ON-GLASS` with a non-`None` `rect=`, and an
   `[orinclick] edge=press … at (x,y)` inside the printed corner rect that does **not** end
   `-> RAISED` or `MISS-SHELL`.
 
@@ -2284,7 +2284,7 @@ rather than deleted so the next reader can see both what was claimed and why it 
 ##### ~~"`orinfurn` faults trying to composite at the terminus"~~ — the seam was never entered
 
 `tegra_desk_furn`'s first statement is an unconditional `serial_println!` of
-`[orinfurn] arm click=… conwin=… desk=…` (`main.rs:7879-7886`). It precedes the one-shot
+`[deskfurn] arm click=… conwin=… desk=…` (`main.rs:7879-7886`). It precedes the one-shot
 `ORINFURN_ENTERED` latch (`:7889`) and every refusal path in the function, and its own comment
 gives the reason it exists: "a silent `false` must never be indistinguishable from 'the seam
 was never called'".
@@ -2388,7 +2388,7 @@ Two instruments in this subsystem were exercised on 2026-08-28, one in each dire
 is worth stating as a rule, because this ladder will keep adding seams shaped like both.
 
 **An entry line printed before any decision distinguishes "never ran" from "ran and refused."**
-`tegra_desk_furn` prints `[orinfurn] arm …` unconditionally as its first statement, ahead of the
+`tegra_desk_furn` prints `[deskfurn] arm …` unconditionally as its first statement, ahead of the
 one-shot latch and every `return false` (`main.rs:7879-7886`). That one line is what turned
 §3.12.1's question from unanswerable into arithmetic: a seam that prints nothing was not called,
 and no reasoning about the composite was required. The cost of not having such a line is on the
@@ -2460,7 +2460,7 @@ is distinguishable from "was not armed".
 | `FORBID \[orinconwin\] win=.* live=FROZEN` (`jetson-sync1.spec:1449`) | an `orinconwin` boot reaches the terminus with the route not installed at print time |
 | `FORBID console OWNS the panel \(Screen back buffer live\); first key` and `…; screen-on-boot` (`:1490-1491`) | a takeover line carries **no** `path=` token — a stale pre-fold image was flown, or the discriminator was reverted. These key on the PRE-FOLD byte sequence, in which `live);` is followed directly by ` first key` / ` screen-on-boot`; the post-fold line interposes `; path=jd2-…;` and no longer matches |
 | `OPTIONAL path=jd2-console-pump;` / `path=jd2-supstate-phase2;` (`:1512-1513`) | readouts, not rules — they say WHICH site printed. The conditional arm ("on a supstate image, forbid `path=jd2-console-pump`") is the grammar limit below |
-| `FORBID \[orinstkdepth\] DEPTH-UNAVAILABLE` (`:1572`) | an `orinfurn` boot reaches the furniture seam with no derivable depth |
+| `FORBID \[stkdepth\] DEPTH-UNAVAILABLE` (`:1572`) | an `orinfurn` boot reaches the furniture seam with no derivable depth |
 | `FORBID \[orinrast\] census .* -> RAST-PAINTED-OVERWRITTEN` (`:1601`) | a `rast` boot finds the cube painted at `post`, gone at `late`, latch not set. Not a new string — what changed is that a supstate boot can now reach the correct arm |
 
 **The takeover pair is the only rule in the set whose reachability is guaranteed by the spec
@@ -2595,9 +2595,9 @@ either way.**
 
 Two SP reads on one descending frame chain — the anchor appended to `kernel_main`'s
 `bootpace::record("entry")` statement (`main.rs:88`) and the seam read beside `tegra_desk_furn`'s
-unconditional `[orinfurn] arm` line (`main.rs:7896-7899`) — subtract to the exact bytes of boot-core
+unconditional `[deskfurn] arm` line (`main.rs:7896-7899`) — subtract to the exact bytes of boot-core
 stack that `kernel_main -> tegra_early_stop -> tegra_desk_furn` has consumed. It publishes
-`[orinstkdepth] depth-consumed=… -> DEPTH-CONSUMED`, and `[orinstkdepth] DEPTH-UNAVAILABLE` with a
+`[stkdepth] depth-consumed=… -> DEPTH-CONSUMED`, and `[stkdepth] DEPTH-UNAVAILABLE` with a
 named reason when the anchor is unset or the two reads are not on one descending chain
 (`main.rs:7900-7912`).
 
@@ -2962,7 +2962,7 @@ own unlanded arc also touches `video/wm.rs`.
 * **Artifacts:** every new instrument confirmed one-hit in the built `kernel.elf` with
   `LC_ALL=C grep -a -o`; every new token longer than 8 bytes so none can hide as an LLVM immediate.
 * **⚠ Runtime: NONE.** No Orin has booted any of the five instruments. `live=FROZEN` has never been
-  observed, no `[orinstkdepth]` number exists, no `[orinrast] census … console-owns=1` line has been
+  observed, no `[stkdepth]` number exists, no `[orinrast] census … console-owns=1` line has been
   captured from a supstate image, and no `[panel-owner]` line has been seen on Orin metal. Every
   claim in this section is a source or artifact reading.
 * **⚠ And no leg can score any of it** — see the finding at the head of this section. The gate
@@ -3425,7 +3425,7 @@ inference is not.** An unavailable measurement is an instrument gap; it is not e
 value the measurement would have returned. The stop-line stands on the Pi's two boots and on
 §5.1's inventory, and it needs the boot-stack high-water probe §3.12 names before any rung can
 claim to have cleared it. ⚠ **PARTIALLY ADDRESSED 2026-08-28:** ORIN-STKDEPTH
-(§3.13 D4, and `arch_arm64.md` §ORIN-STKDEPTH) now takes the DEPTH half at the `[orinfurn] arm`
+(§3.13 D4, and `arch_arm64.md` §ORIN-STKDEPTH) now takes the DEPTH half at the `[deskfurn] arm`
 line and prints `DEPTH-UNAVAILABLE` for HEADROOM. That instrument is **UNFLOWN** — no number
 exists — and a depth is not the high-water probe this paragraph asks for, so nothing here is
 cleared. What has changed is that the clearing condition can now be restated in terms something in
@@ -3445,7 +3445,7 @@ names the seat that owns the files under the parallel-arc rules in `CLAUDE.md`.
 | **2** | **The desktop seam** — ✅ **LANDED 2026-08-25, and it REFUSES** (§3.2.1) | `tegradesk` feature + `main.rs::tegra_desk_arm` on `tegra_early_stop`'s terminus line + `UNAOS_TEGRADESK` env map + the `arm-tegra-seam` leg (11 → 12 board legs). The seam evaluates its floors and declines at two named stop-lines | **the floors half is UNFLOWN**: `[deskseam] floors …` + `REFUSE reason=…` print on an armed Orin boot, and nobody has taken one. **The `activate()` half is WITHDRAWN, not owed**: `desktop_firmware::activate()` opens the console window and enables the bar, so running it crosses §6.1 *and* §5.2 — it belongs to rungs 3/5, and this row previously asked for something the same document forbids | jetson |
 | **3** | **Input routing** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN, ARMED, and ROUTING ON METAL** (§3.7, §3.8, §3.8.1) | `orinclick` (implies `tegra_el0`) wires `jd2_console_pump`'s `Event::Button` arm into `wc_click_route` (§3.4) and adds the `[orinclick]` instrument at the tail of `display_tegra.rs`. **⚠ HANDSHAKE WITH RUNG 2, DISCHARGED IN THIS ARC:** `main.rs`'s `TEGRADESK_CLICK_ROUTED` no longer reads `false` — it reads `cfg!(feature = "orinclick")`, **not** a literal `true`, because `tegradesk` does not imply `orinclick` and a hard `true` would assert a route back on an image that has none: the one-way trip re-entered through the constant meant to prevent it. `arm-tegra-seam` now carries `orinclick` so the assertion is type-checked. COMPILES: gate green 21/21 knob off and on; the new `arm-tegra-orinclick` leg proven to go red. No gate in this tree can boot it — QEMU models no Tegra234 | ✅ **DISCHARGED, boot7g 2026-08-25** (§3.8.1): `[clickroute] press hit asid=4294967042 win=1 (was 0) delivered` (capture line 13084) and `[orinclick] edge=press btn=0x01 at (1009,546) geom=yes hit=yes win=1 owner=0xffffff02 focus 0x0->0xffffff02 consumed=0 -> RAISED` (capture line 13085); release `-> RELEASE-DELIVERED` (13087); census `IDLE-NO-CLICKS -> ROUTING` (13089); a second press on the focused row `-> HIT-SAME` (13092), plus `CONSUMED` (13125), `MISS-SHELL` (13133) and `RELEASE-DROPPED` (13135). Six press/release pairs with `stuck=0 nogeom=0 dropped=0`. **The prior owed item — boot7f's armed-but-unclicked state (`-> ARMED`, capture line 11424, then 48 `IDLE-NO-CLICKS`) — is closed.** Still owed: nothing on the wire; stack cost on this path (§5) is still a Pi number | jetson |
 | **4** | **Console as a window** — ✅ **LANDED 2026-08-25 as a DEFAULT-OFF knob; FLOWN AND ROUTED the same day** (§3.9, §3.9.1) | `orinconwin` (implies `pidesk` + `tegra_el0`, and deliberately NOT `orindesk`/`orinclick`) calls the SHARED console-window machinery from `display_tegra::orin_conwin` on `tegra_early_stop`'s terminus line — `panel_console_face_arm` → `panel_console_window_open` → `console_is_routed` — and folds `jd2_console_pump`'s phase-2 `fbcon::detach()` to `if !tegra_conwin_live() { … }` so a routed console stays LIVE. **§6.1 IS NOW A BRANCH:** both ordering terms are read through `cfg!()` and an image missing either gets `[orinconwin] DECLINE reason=ordering-rule held=…` and NO window — measured on the artifact both ways. No `video/` edit; no `desktop_firmware::activate()`, so §5.2 is untouched. Gate green 23/23 knob off and on; `arm-tegra-conwin` proven to go red; knob-off loadable image byte-identical | ✅ **DISCHARGED, boot7h 2026-08-25** (§3.9.1): `[orinconwin] gate … dock=GRANTED … orindesk=1 orinclick=1` (capture line 14828), then `[orinconwin] win=2 panel=1920x1200 cell=7x16 stage=4194304 table=2 present=Composited route=true live=LIVE -> ROUTED` (14833) with the `[wc-x] console-window / console-route first-paint / panic-fallback armed` trio beside it (14830–14832). ⚠ **`live=LIVE` there was a COMPILE-TIME LITERAL, not a measurement** (§3.13 D1) — it would have printed `LIVE` whatever the route did. It became a read-back on 2026-08-28. This flight's image carried no `UNAOS_RAST`, so the unguarded second detach §3.13 D1 describes was the empty stub here and did not affect the capture; the 107-minute sitting, not the field, is what evidences the route staying live. The route stayed LIVE for a ~107-minute sitting — shell banner, keystroke echoes and verb output all landed through the window path; chrome clicks CONSUMED and the close control `REFUSED furniture` (14926–14927). **Still owed:** the dock round-trip (`presses=0` on every `[dock]` line — the minimise disc was never clicked) and a win=2 glyphs-on-glass read-back — ⚠ **both INSTRUMENTED 2026-08-25 under `orinladder`, both still UNFLOWN: see §3.11 for the two flight cards and every broken shape each one reads as** | jetson |
-| **5** | **The real desktop** — ⚠ **PARTIALLY LANDED 2026-08-26 as `orinfurn`: the MENU BAR half only** (§3.12) | the full row is unchanged: dock, strip, menubar, crystal armed; the full `pidesk` cascade; a tegra `render_service` (§3.6). What `orinfurn` takes is TWO of `activate`'s nine steps — `menubar::set_enabled(true)` + `wm::composite()` + the `owns_pixels` read-back — on the terminus line, DEFAULT OFF, with `desktop_firmware::activate()` NOT called and `TEGRADESK_CASCADE_OK` NOT touched. The cascade, the DESKTOP-CLEAR, `crystal::routed_selftest`, window population and the render service are all still owed | the Orin comes up to a desktop. **`orinfurn`'s own half is UNFLOWN**: `[orinfurn] ARMED … -> BAR-ON-GLASS` and a crystal press consumed by the menu band are both Orin-metal verdicts nobody has taken | jetson — the CASCADE is still **blocked by §5.2**; ⚠ and see §3.12 for why §5.2's `[u7stk]` evidence requirement is *structurally unsatisfiable at the terminus* (`stk_probe` returns early with no current task), which is a defect in the stop-line's clearing condition, not a reason to step over it |
+| **5** | **The real desktop** — ⚠ **PARTIALLY LANDED 2026-08-26 as `orinfurn`: the MENU BAR half only** (§3.12) | the full row is unchanged: dock, strip, menubar, crystal armed; the full `pidesk` cascade; a tegra `render_service` (§3.6). What `orinfurn` takes is TWO of `activate`'s nine steps — `menubar::set_enabled(true)` + `wm::composite()` + the `owns_pixels` read-back — on the terminus line, DEFAULT OFF, with `desktop_firmware::activate()` NOT called and `TEGRADESK_CASCADE_OK` NOT touched. The cascade, the DESKTOP-CLEAR, `crystal::routed_selftest`, window population and the render service are all still owed | the Orin comes up to a desktop. **`orinfurn`'s own half is UNFLOWN**: `[deskfurn] ARMED … -> BAR-ON-GLASS` and a crystal press consumed by the menu band are both Orin-metal verdicts nobody has taken | jetson — the CASCADE is still **blocked by §5.2**; ⚠ and see §3.12 for why §5.2's `[u7stk]` evidence requirement is *structurally unsatisfiable at the terminus* (`stk_probe` returns early with no current task), which is a defect in the stop-line's clearing condition, not a reason to step over it |
 | **6** | **EL0 tenants** — ✅ **LANDED 2026-08-25 as the CRYSTAL-HD parity fix + a DEFAULT-OFF instrument knob; UNFLOWN** (§3.10) | the `SYS_WIN_*` surface needed NO new verb — the gap was `mmu_tegra_el0.rs` carrying the pre-CRYSTAL-HD FB geometry (128x128 cap, 0x1_0000 slot stride), which refused the shipped vug's `SYS_WIN_CREATE(288,288)` with `-EINVAL` and mis-mapped the WC-B fixture's slot 1. Parity restored (4 slots x 0x51000, 288x288, unconditional under `tegra_el0`); `orintenant = ["tegra_el0"]` arms the terminus `reserve_stage` + the `[orintenant]` arm/create/close/reap/census instrument. Tenant close policy: CLOSE-CLEAN (tenants close; furniture refuses). Gate green 24/24; `arm-tegra-tenant` + the `arm-tegra-conwin-tenant` conjunction cross both go-red-proven; knob-off jetson AND Pi loadable images byte-identical | an EL0 program owns a window on the Orin panel: `run /fat/vug.elf` on the four-knob conjunction image -> `[orintenant] create … surf=288x288 wm-bound=1 -> TENANT-WINDOW`, census `IDLE-NO-TENANTS -> TENANT-LIVE`, and a clean exit reaps (§3.10 flight card) | jetson |
 
 ### §6.0 INHERITED FROM PI, NOT YET TAKEN — two shared-stack fixes waiting on the shelf
@@ -3717,7 +3717,7 @@ arrives — nothing is marked and nothing owes those rows a repaint.
   only consumer in this subsystem of *both* deferred queues and the only caller of
   `wm::service_damage`, so a request reaches the glass only through a pass that predicate lets run.
   This task's `dirty` was `passes == 1` plus `ui_status::tick`, and on the cascaded scene `tick` is
-  masked out forever (ui_status.rs:1285) — hence `[orinrender] census passes=13998251 presents=1`.
+  masked out forever (ui_status.rs:1285) — hence `[render] census passes=13998251 presents=1`.
   A peek, never a drain.
 
 ### The instrument

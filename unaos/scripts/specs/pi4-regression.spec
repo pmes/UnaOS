@@ -870,7 +870,7 @@ FORBID \[wc-f\] twin -> SKIP
 # ---    The witness is a ONE-SHOT, and on the armed desktop the first chrome-bearing composite is the
 # ---    console window's OWN `create_at`, inside `fbcon::panel_console_window_open`. The glyph route
 # ---    is not installed until that function RETURNS (`[wc-x] console-window ...` and
-# ---    `[pidesk] activate ... routed=true` both print AFTER the verdict in the capture), so at that
+# ---    `[deskfw] activate ... routed=true` both print AFTER the verdict in the capture), so at that
 # ---    instant fbcon is still painting the PANEL directly from every core that prints. Two
 # ---    consecutive armed runs of the SAME image on the SAME host:
 # ---        run 1: title_bot want=0xefeff1 got=0x000000  (fbcon BG_DEFAULT)

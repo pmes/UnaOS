@@ -231,3 +231,90 @@ in 7 shared files; 265 witness sites (134 bracket + 131 colon-prefix); 51 shared
 |---|---|---|---|---|---|---|---|
 | `orin_desk_scene_up` | fn | `main.rs` (orinrender region, DESKSCENE `8cbfaadf`) | 3 (:8121 def, :8149, :8281) | render/desk | `render_desk_scene_up` | yes (sed-safe, cfg unchanged) | rename with the S6 batch once GATE-NEUTRAL exists; not renamed alone (memory: no lone rename commit) |
 | `[orinrender]` | witness family | `main.rs` | +1 site (:8285 census, DESKSCENE) | render | `[render]` (with the family) | yes | already tabled; count updated |
+
+## Addendum (NEUTRAL M1, 2026-09-22) — the bracket families are RENAMED, and four corrections to this table
+
+Base `4d8d047d` (branch `exec-rmbp-neutral`; the branch tip is the sha — the seat fills it at the
+fold). Census re-derived at that base before any edit, per §0 and LAWS §5 ("a measurement is scoped
+to its base exactly as a claim is scoped to its check"): script and raw output in
+`docs/dev/evidence/rmbp-0915/neutral/{census.py,census-BEFORE-4d8d047d.txt,census-AFTER-m1.txt}`.
+
+### M1 — DONE (bracket witness families in shared files)
+
+| old | new | sites moved | files |
+|---|---|---:|---|
+| `[orinrender]` | `[render]` | 9 | `main.rs` |
+| `[orinfurn]` | `[deskfurn]` | 9 | `main.rs` |
+| `[orinstkdepth]` | `[stkdepth]` | 2 | `main.rs` |
+| `[orinface]` | `[conface]` | 4 | `video/fbcon.rs` |
+| `[orindefer]` | `[condefer]` | 1 | `video/fbcon.rs` |
+| `[pidesk]` | `[deskfw]` | 15 | `video/desktop_firmware.rs`, `main.rs` |
+| `[piusb24 25 26 34 35 36 37 38 39 40 41]` | `[usb NN]` | 78 | `drivers/xhci/mod.rs` 75, `main.rs` 3, `video/wm.rs` 1 |
+| `[tegra fs-mps]` | `[usb fs-mps]` | 7 | `drivers/xhci/mod.rs` |
+
+The rename is a pure token substitution and is MEASURED as one: 185 changed lines under
+`crates/kernel/src/` and 88 outside it, across the 22 files the rename edits — **273 total,
+insertions == deletions, and every single line is reproduced exactly by applying the substitution
+table (plain AND regex-escaped spellings) to the old line** (`m1-substitution-proof.txt` in this
+arc's evidence dir). No emission site, no cadence, no cfg and no line number moved — the LAWS §5
+rename contract ("a tag's TEXT changes, its emission site and cadence do not") asserted rather than
+argued.
+
+Feature NAMES are untouched (§4: a knob is not a symbol) — `orinrender`, `orinfurn`, `orinface`,
+`orindefer`, `desktop_firmware`, `piusb` all still spell themselves in `Cargo.toml` and `arroyo`, and
+`UNAOS_PIDESK` is still the env knob over the neutral `desktop_firmware` feature.
+
+### OWED — sites a family lost to an excluded or exempt home (NOT half-renamed)
+
+| token | where | why owed |
+|---|---|---|
+| `[piusb40]` ×8, `[piusb25]` ×1 | `arch/aarch64/piusb.rs` | exempt home (§5). **These two families now SPLIT across two names** — the same shape §1's NOTE predicted for `[orinreboot]`, and PWRNAME resolved by letting the wdt sibling keep `[orinwdt]`. Same call is owed here |
+| `[piusb26]` ×1 | `drivers/ehci/mod.rs` | EHCIDARK holds `drivers/ehci/*` |
+| `[orinrender]` ×2 (comments) | `arch/aarch64/sched.rs`, `arch/aarch64/serial.rs` | exempt home; both are prose naming the shared family and now name a token that no longer exists |
+| `pidesk={}` field key ×5 | `arch/aarch64/display_tegra.rs` | exempt home — LEDGER S28's adjudicated row, unchanged |
+| `[orinfurn] arm` ×1 (comment on `main.rs:88`), `[piusb26]` ×1 (comment on `main.rs:1432`) | `main.rs`, above `bootpace::record("gui")` | SPLASHGATE's region. Both are COMMENT-ONLY and provably cannot move the image (the code bytes and the line count on :88 are identical), but :88 is a `bootpace::record("entry")` line SPLASHGATE is likely to be editing, and the exclusion exists to prevent exactly that fold conflict. Reverted deliberately; two comments now name tokens that no longer exist |
+
+### Four corrections to this table, each measured at `4d8d047d`
+
+1. **§0's file set** — 122 shared `.rs` / 53 under `arch/` / 175 total, not 111 / 51 / 162.
+2. **§0's comment-stripping method is wrong and loses sites.** It removes `/* … */` FIRST, so a `/*`
+   inside a `//` line opens a bogus block comment and swallows the rest of the file. Re-run naively it
+   drops `[tegra fs-mps]` and four `[piusbNN]` families entirely. A single-pass lexer that handles
+   line comments, NESTED block comments and string/char/raw-string literals reproduces §1 exactly.
+3. **§2's `:: TEGRA-SD:` is 5 sites, not 3** (`drivers/block.rs`).
+4. **§5 says "17 families / 98 sites" but its own list enumerates 18.** Sites agree exactly (98);
+   the family count is an arithmetic slip. At this base the arch set is 18 families / 98 sites, with
+   `wdt_tegra.rs` carrying `[orinwdt]` ×2 rather than `[orinreboot]` ×2.
+
+### Already landed since this table was cut, so no longer owed by S6
+
+- **§1's `[orinreboot]` / `[orinshutoff]` rows (power.rs, 2 families / 10 sites) are DONE** —
+  `bc10a469 power: PWRNAME` renamed them `[pwrreboot]` / `[pwrshutoff]` and gave the
+  `arch/aarch64/wdt_tegra.rs` sibling `[orinwdt]`, exactly as §1's NOTE proposed. Zero
+  `orinreboot|orinshutoff` anywhere in kernel source.
+- **§3a's `rast_demo_maybe` twins are DONE** — ONEOS `3dab65ac` (recorded in LEDGER S6).
+- That reconciles §1's bracket total to this base: 20 families / 134 sites − 2 / 10 (PWRNAME)
+  + 1 site (`[orinrender]`, the PANEL4 addendum) = **18 families / 125 sites**, which is what the
+  re-run census returns.
+
+### Missing from this table entirely — drift since `6cc8de8c` (~60 sites, all M3 work)
+
+A whole `tegra_shell_*` family in `main.rs`: `tegra_shell_pick` 6, `_pal` 5, `_present` 5,
+`_window_open` 4, `_id` 3, `_mark` 3, `TegraShellWin` 13, `TEGRA_SHELL_PRESENTED` 2 (≈41 sites);
+plus `tegra_boot_focus` 3 / `TEGRA_BOOT_FOCUS_DONE` 2, `tegra_quarry_seat` 2, `orin_drag_steer` 2,
+`TEGRA_JD2_STACK_SIZE` 2, `tegra_opened` 4 (`video/login.rs`), and the SDHCWRITE-era
+`tegra_sd_write*` / `NATIVE_TEGRA_SD_VETO`. New holder files not in §3a: `fs/bootdisk.rs`,
+`install/partition.rs`, `video/login.rs`, `video/quarry/live.rs`.
+**Every one of the 39 `tegra_shell_*`/`TegraShellWin` sites is outside EHCIDARK's and SPLASHGATE's
+regions** (measured: all sit at `main.rs` 2899–10435; SPLASHGATE ends at the `bootpace::record("gui")`
+at :1638, the three `service_ehci_hid()` call sites are :1181/:1674/:5911, and `x86_usb_pump` spans
+:5880–6058), so the family is in scope for M3.
+
+### §1's `[render]` conflict column is stale, and the tree already agrees with the proposal
+
+`[render]` has ZERO live emission sites at this base. Its only occurrence was `main.rs:5404`, a
+comment that ALREADY calls the family `[render] census` — the neutral name this table proposes. Three
+further comments (`video/fbcon.rs`, `video/screen.rs`, `arch/aarch64/serial.rs`) spelled it
+`[orinrender] census`. No shared file composes a witness tag through a `{}` hole (only
+`arch/aarch64/ga10b_ignite.rs` does, for a different family), so an artifact grep on these tokens is
+sound — the LAWS §5 runtime-composition hazard does not apply here.

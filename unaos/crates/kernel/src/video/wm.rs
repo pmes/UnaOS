@@ -22606,7 +22606,7 @@ pub fn dragperf_selftest() {
     }
 
     // ---- Half 2: the pacer, at a bench-realistic report rate ------------------------------------
-    // 8 ms between reports is 125 Hz — the rate `[piusb24]` records on the bench. The span is fixed
+    // 8 ms between reports is 125 Hz — the rate `[usb24]` records on the bench. The span is fixed
     // rather than the count, so the expected admission is arithmetic: span / DRAG_MOTION_MS.
     //
     // The grab point is solved from the row's CURRENT box and not from the sweep's `oy`: half 1b has

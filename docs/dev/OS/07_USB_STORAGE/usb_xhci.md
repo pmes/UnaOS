@@ -680,7 +680,7 @@ Fix: `bot_transfer` now cleans the IN data buffer to DRAM *before* the doorbell
 (the OUT path already did), so no dirty line survives to lose; the post-transfer
 `inval` still drops the clean lines so the CPU parses fresh DRAM. This matches the
 convention at every interrupt-IN / control-IN / descriptor arming site. Witness:
-`[piusb34] LBA0 re-read post-invalidate: … <first-16 bytes>` (P44 zeros → P45 real
+`[usb34] LBA0 re-read post-invalidate: … <first-16 bytes>` (P44 zeros → P45 real
 boot sector).
 
 ### 5b. DMA-address audit — the inbound-window theory is REFUTED (PIUSB-35)
@@ -707,7 +707,7 @@ classic <3 GiB VL805 DMA quirk boundary. A working CSW-write to that pool cannot
 coexist with an unreachable data-write to the same pool, and READ CAPACITY reuses the
 identical buffer (killing the offset variant too). No address fix is warranted.
 
-Witness (P46, aarch64): `[piusb35] databuf phys=… in_trb=… cbw=… csw=… |
+Witness (P46, aarch64): `[usb35] databuf phys=… in_trb=… cbw=… csw=… |
 rc-inbound=[0x0,0x100000000) offset=0 | databuf in_window=… below_3G=… — … address
 theory REFUTED on-metal …`. When P46 confirms `in_window=true below_3G=true`, the
 address theory is dead on-metal and the discriminator returns to transfer
@@ -746,7 +746,7 @@ pump (no scheduler yield between doorbell and the invalidate+read), so a context
 cannot interpose between them — but the two phases differ in bus/interrupt activity, which
 is exactly what a posted-write visibility window would be sensitive to.
 
-Witness lines: `:: PIUSB: [piusb36] step<N>-<label> buf=… CSW=… residue=… verdict=… — <16 bytes> ::`
+Witness lines: `:: PIUSB: [usb36] step<N>-<label> buf=… CSW=… residue=… verdict=… — <16 bytes> ::`
 (step 6 prints both the immediate `A` and the `+1ms+inval` `B` snapshots). In QEMU virt
 (coherent) all six steps read real data and step 6 reports `no-race-hit`; the P46 metal
 run reads the verdicts as the decision tree — step 2 splits never-lands from lands-zeros,
@@ -764,7 +764,7 @@ key 0x06, is the bridge-returns-zeros-then-GOOD candidate); (4) a **TUR drain + 
 The P47 capture read the CBW as **byte-perfect** (`command is NOT the fault`) and LBA
 8192/16384 returned real non-zero data with `residue 0` — proving the transport/DMA/BOT are
 sound and the wedge is confined to the low-LBA region — while READ(12)/READ(16) STALLed
-(unsupported by the bridge, expected). Witness: `:: PIUSB: [piusb37] … ::`.
+(unsupported by the bridge, expected). Witness: `:: PIUSB: [usb37] … ::`.
 
 ### 5e. PIUSB-38 — BOT stall recovery + event-ring resilience + low-LBA bisect
 
@@ -807,7 +807,7 @@ TEST UNIT READY + REQUEST SENSE **complete** afterwards (`PIPE RECOVERED`), (2) 
 reports the zeros→data **boundary** and the first byte at which LBA0 and LBA8192 differ.
 Because only the LBA field changes, any zeros-vs-data split is **region-specific, not a
 command-shape fault** (null-hypothesis-our-code: a buffer/cache/aliasing effect on the low
-region). Witness: `:: PIUSB: [piusb38] … ::`. Inert on QEMU raspi4b (no VL805 → no storage
+region). Witness: `:: PIUSB: [usb38] … ::`. Inert on QEMU raspi4b (no VL805 → no storage
 slot); QEMU virt exercises the whole path (the full-reset TUR passes and the ladder reads real
 LBA0 data), byte-identical no-op on x86.
 
@@ -936,7 +936,7 @@ Every bring-up stage in `arch/aarch64/piusb.rs` is bracketed off `CNTVCT` (the f
 counter — always live, no init, no interrupt dependency) and emits exactly one line:
 
 ```
-:: PIUSB: [piusb40] stage=<name> took=<ms>ms (t=<ms>ms) ::
+:: PIUSB: [usb40] stage=<name> took=<ms>ms (t=<ms>ms) ::
 ```
 
 | Stage | What it covers | Budget on the wire |
@@ -962,9 +962,9 @@ counter — always live, no init, no interrupt dependency) and emits exactly one
 
 The instrument is always-on **within the `piusb` knob** and costs one counter read plus one serial
 line per stage. It performs **no MMIO of its own**, so it is safe at every point it is placed. Every
-`[piusb40]` line sits past a gate QEMU `raspi4b` never crosses (`bringup_inner` returns at the
+`[usb40]` line sits past a gate QEMU `raspi4b` never crosses (`bringup_inner` returns at the
 `pcie@` DTB census; `enumerate` returns at the `XHCI_READY` gate), so a QEMU boot — knob on or off —
-emits **zero** `[piusb40]` lines and a byte-identical log.
+emits **zero** `[usb40]` lines and a byte-identical log.
 
 #### What was trimmed: the cost-blind poison-retry ladders
 
@@ -993,7 +993,7 @@ one is load-bearing:
    ladder measures each read and, when one exceeds it, stops early and *names why*:
 
    ```
-   [piusb40] mmio-ladder @ 0x…: try N took …ms (>= 20ms) — consistent with the RC absorbing this read
+   [usb40] mmio-ladder @ 0x…: try N took …ms (>= 20ms) — consistent with the RC absorbing this read
    as a completion timeout rather than answering it; … Ladder STOPPED at …ms
    ```
 
@@ -1051,14 +1051,14 @@ What remains unproven is *which* of three silent candidates ate the boot: the MI
 reads, the SError drain window, or the caller's next stage (M1). None of them printed anything, which
 is why P59a's log could not separate them. The three brackets `dump-linkdown-rc-claim`,
 `dump-linkdown-serror-drain`, `entry-link-discriminator` and `m1-rc-bringup` now make the next boot
-name it: **whichever `[piusb40]` line is missing is the stage that wedged.** The bracket chain is
+name it: **whichever `[usb40]` line is missing is the stage that wedged.** The bracket chain is
 gap-free from the census through the end of M3, so a wedge cannot be misattributed to a neighbouring
 stage — the PIUSB-16 entry reads in particular used to sit in an unbracketed gap that would have
 pointed the finger at M1.
 
 #### Metal watch-list
 
-- Which `[piusb40]` stage carries the bulk of the pause — the expectation is
+- Which `[usb40]` stage carries the bulk of the pause — the expectation is
   `m2-mmio-verify` + `m3-cap-probe`, and a `mmio-ladder … STOPPED` line would confirm the
   completion-timeout mechanism outright.
 - `m3-xhci-handoff` and `enum-xhci-handoff`: if these show ~2.8 s multiples, the shared
@@ -1129,7 +1129,7 @@ the nested witness's three cost **32.41 / 3 ≈ 10.8 s each**.
 
 **What did not change.** No bring-up step, mandated settle, ordering, or protection is touched; the
 link-down gate is the same gate reading the same two registers; the fail-closed branches are
-unchanged. Every `[piusb40]` bracket still emits `stage=… took=…`, so the 5g wedge-localization
+unchanged. Every `[usb40]` bracket still emits `stage=… took=…`, so the 5g wedge-localization
 property survives intact — and on the skipped path a near-zero `dump-linkdown-rc-claim took=` is now
 itself the evidence that the stage was *skipped* rather than *wedged*.
 
@@ -1159,7 +1159,7 @@ it directly: the bracket stays, so `entry-link-discriminator took=` collapsing t
 ### 5i. PIUSB-43 — the enum-portsc witness (PA6: which connect branch died)
 
 **The gap.** PA5c metal (boot via GR12) ran the FULL 30 s `enum-pump` budget with **zero**
-port-status-change events off the ring, then thousands of idle `[piusb26]` pump passes and no slot, no HID, no BOT. The
+port-status-change events off the ring, then thousands of idle `[usb26]` pump passes and no slot, no HID, no BOT. The
 wire could not distinguish four different deaths: no device electrically present (CCS never set) ·
 CCS set but no Port Status Change Event generated · events written but never consumed off our ring ·
 PP/link state regressed after the M3 line.
@@ -1426,7 +1426,7 @@ ordinary `scsi_inquiry` + `scsi_read_capacity10` against each, prints the SAME `
 primary prints, and publishes it under its own `(slot, lun)`. A unit that fails there is named and
 skipped: one bad card in slot 3 is not a reason to fail a boot whose root is the card in slot 1.
 `bot_geom_reject` / `bot_fold_seen` are snapshotted and restored around the loop, because they are
-BRING-UP evidence that `[piusb41]`'s port-cycle trigger reads and an extra card's reply must neither
+BRING-UP evidence that `[usb41]`'s port-cycle trigger reads and an extra card's reply must neither
 manufacture that signature nor erase one.
 
 **The walk, and the dedupe that had to grow.** `fs::fat::live_sources()` is `ALL_SOURCES` with the USB
@@ -1670,7 +1670,7 @@ The keyboard guard carries the identical fix (`keyboard_prev_phys`); only its lo
 traffic kept the defect from being observed on metal.
 
 *Witness (knob-gated, `usbdebug`, rate-limited to one line per 250 ms).*
-`[piusb39] mouse rearm=<n> discarded=<n> errrearm=<n> (<tag>)` — the three counters are
+`[usb39] mouse rearm=<n> discarded=<n> errrearm=<n> (<tag>)` — the three counters are
 distinct populations and the tag names which one moved: `poll` (a normal armed read;
 printed on the first arm and every 256th), `guard` (the dup-Success guard discarded a
 completion and re-armed anyway), `halt` (a halted endpoint was un-halted and re-armed).
@@ -7447,15 +7447,15 @@ existing `bt_l3_await`, whose `armed` threading is what preserves the invariant 
 
 `~/unaos-bench/scratch/pi0-b1b2/boot3-inputdeath-tail.txt`, Pi 4 metal. A `Generic USB SD Reader`
 (058f:6362) behind hub slot 1 port 1 wedged at the transport level — CBW out, `IRQ_COUNT=0`, event
-ring provably empty per the [piusb40] necropsy. Read the tail as a **cycle**, not as a list of
+ring provably empty per the [usb40] necropsy. Read the tail as a **cycle**, not as a list of
 failures:
 
 ```
 :: BOT: SURRENDER slot=2 … retracted=yes          <- the per-slot floor DID fire, as designed
 xHCI: HUB slot 1 port 1 disconnect: slot 2 …      <- the ladder's OWN hub-port power-cycle rung (b')
-:: PIUSB: [piusb25] storage enumerated: slot 5 …  <- the same reader, re-enumerated, NEW slot id
+:: PIUSB: [usb25] storage enumerated: slot 5 …  <- the same reader, re-enumerated, NEW slot id
 :: BOT: SURRENDER slot=5 …                        <- a whole fresh ladder allowance, spent
-:: PIUSB: [piusb25] storage enumerated: slot 2 …  <- and back again. Forever.
+:: PIUSB: [usb25] storage enumerated: slot 2 …  <- and back again. Forever.
 ```
 
 Nothing in the ladder was wrong. Every rung did what §17's arcs built it to do. What was missing is
@@ -7499,7 +7499,7 @@ surrender is untouched underneath it. Four mechanisms, in the order they bite:
      and never touches `hw_wait_budget()`, and it applies only to an identity that already has an
      account (a healthy boot's *entire* BOT time is ~5 s, half this bound);
    * `BOT_PARK_DEAD_STREAK` (2) consecutive timeouts with a *provably idle* ring (no events, no
-     foreign events, no doorbells — the [piusb40] signature) cut this device's pump budget by
+     foreign events, no doorbells — the [usb40] signature) cut this device's pump budget by
      `BOT_PARK_DEAD_DIV` (8), so the steady state after a proven wedge is ~350 ms per attempt
      (the cut divides the *base* budget: 150 M / 8 = 18.75 M ticks ≈ 347 ms at 54 MHz) rather
      than 8.33 s. Applied with `min`: it can only shorten a wait, and a healthy device never earns
@@ -7620,7 +7620,7 @@ main loop's 2000th pass, and boot6 never got there.
 `UNAOS_BOTWEDGE=1` returns `Timeout` without pumping, so it accrued nothing: the ledger's wall-clock
 clause was unreachable in QEMU by construction, which is why the previous gate could only watch the
 back-off decline attempts. The injection now charges the wait it stands in for
-(`hw_wait_budget() * bot_budget_scale`, classified `dead` — the injected wedge IS the `[piusb40]`
+(`hw_wait_budget() * bot_budget_scale`, classified `dead` — the injected wedge IS the `[usb40]`
 signature), and credits the same fictional span against the back-off deadline, because the ledger
 must not accrue on one clock while the gate refuses on another. Both credits are `cfg`-gated to the
 feature; on metal a real first-attempt wait (8.33 s on the Pi 4, 14.4 s on the Orin — the "~7.2 s"
@@ -7660,9 +7660,9 @@ show up funny with a bunch of blank slots". Convicted from code, not yet fixed:
   OS has ever sent went to LUN 0.
 
 If the seated card is on any other LUN, every media-dependent command addresses an empty slot. The
-boot6 evidence lines up exactly: INQUIRY (no media dependence) always completes — `[piusb40]`'s
+boot6 evidence lines up exactly: INQUIRY (no media dependence) always completes — `[usb40]`'s
 post-wedge INQUIRY control returns `Ok`, so the bulk pipes are demonstrably alive *after* the wedge —
-while READ CAPACITY / READ(10) always wedge. And `[piusb41]` caught the desync in the act:
+while READ CAPACITY / READ(10) always wedge. And `[usb41]` caught the desync in the act:
 `READ CAPACITY reply REJECTED — block_size=83886080 last_lba=0x55534253`. `0x55534253` is `USBS`,
 the CSW signature: the device declined the data phase and answered with status, and the driver read
 that status into the capacity buffer — a device saying "nothing here" in the one way we do not parse.

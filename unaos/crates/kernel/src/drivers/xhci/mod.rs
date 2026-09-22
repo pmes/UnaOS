@@ -1192,7 +1192,7 @@ const BOT_BUDGET_SCALE_ESCALATION: u64 = 1;
 /// a HID) says the opposite and would move the investigation somewhere else entirely. The 2026-07-29
 /// capture had to argue this by eye, from the FTDI slot's unrelated log lines.
 pub static BOT_FOREIGN_EVENTS: AtomicU64 = AtomicU64::new(0);
-/// [piusb41] PA34: consecutive zero-data CSW folds this boot. The PA34 boot proved the replayed
+/// [usb41] PA34: consecutive zero-data CSW folds this boot. The PA34 boot proved the replayed
 /// CSW is not queued data (the drain found the IN pipe QUIET) — the device RE-MANUFACTURES its
 /// stale status as the answer to every new command: a stuck BOT state machine, with media seated.
 /// No host-side ring or reset act reaches that state; the rescue ladder's port power-cycle does.
@@ -1203,7 +1203,7 @@ pub static BOT_FOLD_STREAK: AtomicU64 = AtomicU64::new(0);
 /// clean boot, so any non-zero reading is itself the finding.
 pub static BOT_RESCUE_RESET_DEVICE: AtomicU64 = AtomicU64::new(0);
 pub static BOT_RESCUE_PORT_CYCLE: AtomicU64 = AtomicU64::new(0);
-/// [piusb41] Rung (b') attempts: the HUB-port power-cycle, the downstream twin of (b). Counted
+/// [usb41] Rung (b') attempts: the HUB-port power-cycle, the downstream twin of (b). Counted
 /// separately from the root rung because the two touch different hardware through different pipes —
 /// a root PORTSC write versus a hub-class request on another device's control endpoint — and a
 /// capture must be able to say which one a boot actually reached.
@@ -1217,9 +1217,9 @@ pub static BOT_RESCUE_SURRENDER: AtomicU64 = AtomicU64::new(0);
 //
 //   BOT: SURRENDER slot=2 …  retracted=yes      <- the per-slot floor DID fire, exactly as designed
 //   HUB slot 1 port 1 disconnect: slot 2 …      <- the ladder's OWN hub-port power-cycle rung (b')
-//   [piusb25] storage enumerated: slot 5 …      <- the same wedged reader, re-enumerated, NEW slot id
+//   [usb25] storage enumerated: slot 5 …      <- the same wedged reader, re-enumerated, NEW slot id
 //   BOT: SURRENDER slot=5 …                     <- a whole fresh ladder allowance, spent, surrendered
-//   [piusb25] storage enumerated: slot 2 …      <- and back again. Forever.
+//   [usb25] storage enumerated: slot 2 …      <- and back again. Forever.
 //
 // Nothing in the ladder is wrong there; every rung did what it was built to do. What is missing is a
 // verdict that OUTLIVES A SLOT ID. `bot_surrendered_slot` is one `u8`: it binds the floor to a
@@ -1253,7 +1253,7 @@ const BOT_PARK_SURRENDER_MAX: u32 = 2;
 const BOT_PARK_CYCLE_MAX_MS: u64 = 45_000;
 /// Consecutive pump timeouts on one identity with a PROVABLY IDLE ring — zero events drained, zero
 /// foreign events, zero doorbell rings observed during the whole wait — before this identity's pump
-/// budget is cut by `BOT_PARK_DEAD_DIV`. This is the [piusb40] necropsy signature, and it is the one
+/// budget is cut by `BOT_PARK_DEAD_DIV`. This is the [usb40] necropsy signature, and it is the one
 /// condition under which waiting longer is known to buy nothing: the event ring was empty, the
 /// interrupter delivered nothing for anyone, and IRQ_COUNT never moved. TWO, not one, so a single
 /// unlucky quiet wait on a slow-but-healthy stick cannot shorten its own budget.
@@ -1321,7 +1321,7 @@ const BOT_PARK_DEAD_MAX: u32 = 8;
 ///
 /// FINDING 5 — A NAKING DEVICE IS INDISTINGUISHABLE FROM A DEAD RING. A cold HDD spinning up, or a
 /// card just inserted, NAKs: it posts no event TRB at all, which is byte-identical on the ring to
-/// the [piusb40] necropsy signature. Two full-budget waits arm the cut, then six at ~0.3 s — the
+/// the [usb40] necropsy signature. Two full-budget waits arm the cut, then six at ~0.3 s — the
 /// device is parked in ~16 s and, before this, recoverable only by physical replug. That directly
 /// contradicts this module's own stated constraint (see `BOT_PARK_PASS_PUMP_MS`: "a slow-but-healthy
 /// stick must keep them"), and 16 s is well inside a 7200 rpm spin-up.
@@ -1362,7 +1362,7 @@ const BOT_PARK_PASS_LADDERS: u32 = 1;
 const BOT_PARK_SLOTS: usize = 4;
 /// Hard ceiling, in milliseconds, on the BOT time ONE main-loop pass may spend on an identity that
 /// already has an account. The ladder-count cap above is not sufficient on its own and the boot3
-/// measurement is why: the [piusb26] per-pass cost at the four c3=99% windows read 1,498,784,103 /
+/// measurement is why: the [usb26] per-pass cost at the four c3=99% windows read 1,498,784,103 /
 /// 1,972,189,353 / 1,060,628,143 / 1,348,032,519 cycles against a normal 119-134, i.e. 20-37 s in a
 /// SINGLE pass — because one ladder legitimately chains several waits (first attempt, the recovery
 /// retry, then a retry per rung), each with its own metal-earned budget.
@@ -3036,7 +3036,7 @@ pub struct DeviceSlot {
     pub route_string: u32,
     pub route_depth: u8,
 
-    /// [piusb41] The IMMEDIATE parent hub of a downstream device: its slot id, and the hub's
+    /// [usb41] The IMMEDIATE parent hub of a downstream device: its slot id, and the hub's
     /// downstream PORT NUMBER (1-based, as a hub-class `wIndex`) this device hangs off. Zero for a
     /// root device, and zero is unambiguous — slot 0 is never a device and hub ports are 1-based.
     ///
@@ -3428,19 +3428,19 @@ pub struct XhciController {
     /// at all times except inside an escalation retry, where it is briefly
     /// `BOT_BUDGET_SCALE_ESCALATION` and restored immediately after.
     bot_budget_scale: u64,
-    /// [piusb41] PA36: set by `scsi_read_capacity10` when the geometry clamp REJECTS a reply
+    /// [usb41] PA36: set by `scsi_read_capacity10` when the geometry clamp REJECTS a reply
     /// (phase-shifted/corrupt — a CSW tail where capacity bytes belong), consumed by
     /// `bring_up_storage`'s error arm. `TransferError(u8)` carries completion codes and cannot
     /// name this distinctly, and the port-cycle decision must wait for the post-wedge INQUIRY
     /// control (the photograph must precede any pipe reset), so the clamp site records the fact
     /// here instead of acting on it.
     bot_geom_reject: bool,
-    /// [piusb41] S1Z: the most recent `bot_transfer_once` attempt ended in a zero-data CSW FOLD.
+    /// [usb41] S1Z: the most recent `bot_transfer_once` attempt ended in a zero-data CSW FOLD.
     /// Read by `bot_rescue_clear` so a fold's own `Ok` return does not end the fold streak it
     /// just joined (unconditional clearing made the PA34 two-fold trigger unfireable). Reset at
     /// the top of every attempt and at bring-up start.
     bot_txn_folded: bool,
-    /// [piusb41] S1Z: at least one fold has happened on the CURRENT bring-up. The widened
+    /// [usb41] S1Z: at least one fold has happened on the CURRENT bring-up. The widened
     /// port-cycle trigger (fold + geometry-clamp reject = stuck reader) reads this latch instead
     /// of the live streak, because the garbage-carrying READ CAPACITY completes as a transaction
     /// — legitimately ending the streak — before its content ever reaches the clamp. Set at any
@@ -8338,7 +8338,7 @@ impl XhciController {
         true
     }
 
-    /// ZERO-DATA CSW FOLD ([piusb41]) — the device answered the CBW with its STATUS instead of the
+    /// ZERO-DATA CSW FOLD ([usb41]) — the device answered the CBW with its STATUS instead of the
     /// data phase, so the status wrapper landed in the DATA-stage buffer. Called once, immediately
     /// after an IN data stage's `run_bot_stage` returns (success, short, error OR timeout), before
     /// anything is decided from that outcome and before the CSW stage is built. Returns
@@ -8352,7 +8352,7 @@ impl XhciController {
     /// stick with NO data phase at all: it sends its 13-byte CSW straight back on the bulk-IN pipe.
     /// The host's outstanding IN TD at that moment is the 8-byte DATA stage, so the first 8 bytes
     /// of that CSW — `55 53 42 53 05 00 00 00`, i.e. `USBS` followed by the command's OWN
-    /// `dCBWTag` — are DMA-written into the data buffer. `[piusb40] readcap-wedge` photographs
+    /// `dCBWTag` — are DMA-written into the data buffer. `[usb40] readcap-wedge` photographs
     /// exactly that, with `landed=true` against the 0xA5 poison, so the bytes are a hard DRAM fact,
     /// not an inference.
     ///
@@ -8452,7 +8452,7 @@ impl XhciController {
         };
 
         serial_println!(
-            ":: BOT: [piusb41] zero-data CSW folded — cdb0={:#04x} tag={:#010x} status={} residue={} — the device declined the data phase; command completed from the data-stage CSW ::",
+            ":: BOT: [usb41] zero-data CSW folded — cdb0={:#04x} tag={:#010x} status={} residue={} — the device declined the data phase; command completed from the data-stage CSW ::",
             cdb0, tag, status_name, residue);
 
         // PHASE-RESYNC. Two things are left over and both must go before the next CBW is born.
@@ -8484,7 +8484,7 @@ impl XhciController {
         // next transaction's data stage guaranteed to start at its own first byte.
         let recovered = self.recover_bot_full(slot_id, BotError::TransferError(13), None);
         serial_println!(
-            ":: BOT: [piusb41] post-fold device phase reset — recover_bot_full={} — a fold means the device already re-entered its CBW wait out of step; host-only ring cleanup leaves its next CSW tail in our next data buffer (boot22's garbage-geometry lesson) ::",
+            ":: BOT: [usb41] post-fold device phase reset — recover_bot_full={} — a fold means the device already re-entered its CBW wait out of step; host-only ring cleanup leaves its next CSW tail in our next data buffer (boot22's garbage-geometry lesson) ::",
             recovered
         );
         // `run_bot_stage` parks the failed stage record here on a timeout for recovery's evidence
@@ -8503,7 +8503,7 @@ impl XhciController {
         // not drained, they are power-cycled; two consecutive folds is the stuck signature and the
         // rescue ladder's port-cycle rung is the one act that reaches device-internal state. The
         // re-enumeration it delegates gives the reader a cold BOT engine and bring-up a fresh run.
-        // [piusb41] S1Z: mark this attempt as a fold (so its own Ok return cannot end the streak
+        // [usb41] S1Z: mark this attempt as a fold (so its own Ok return cannot end the streak
         // it just joined) and latch fold-seen for the bring-up-scoped widened trigger (fold +
         // geometry-clamp reject on one bring-up — consumed in `bring_up_storage`'s error arm).
         self.bot_txn_folded = true;
@@ -8512,11 +8512,11 @@ impl XhciController {
         if streak >= 2 {
             BOT_FOLD_STREAK.store(0, Ordering::Relaxed);
             serial_println!(
-                ":: BOT: [piusb41] fold streak={} — drain-quiet + repeat fold = the device re-manufactures its stale CSW (stuck BOT state machine, media seated) — escalating to port power-cycle ::",
+                ":: BOT: [usb41] fold streak={} — drain-quiet + repeat fold = the device re-manufactures its stale CSW (stuck BOT state machine, media seated) — escalating to port power-cycle ::",
                 streak);
             let cycled = self.rescue_port_cycle(slot_id);
             serial_println!(
-                ":: BOT: [piusb41] port power-cycle result={} — {} ::",
+                ":: BOT: [usb41] port power-cycle result={} — {} ::",
                 cycled,
                 if cycled { "device re-enumerates cold; bring-up re-runs on the fresh slot" }
                 else { "cycle refused/failed — the surrender path owns what remains" });
@@ -8525,7 +8525,7 @@ impl XhciController {
         Some(BotResult { status, residue })
     }
 
-    /// [piusb41] boot24 — drain the IN pipe of replayed CSWs after a fold. Evidence chain, one
+    /// [usb41] boot24 — drain the IN pipe of replayed CSWs after a fold. Evidence chain, one
     /// boot per link: boot22 proved the CSW's tail leaks into the next data buffer; boot23 proved
     /// the recovery ladder can be made to succeed; boot24 proved that even a SUCCESSFUL Bulk-Only
     /// Mass Storage Reset leaves the unconsumed CSW queued — the device ('Generic USB SD Reader')
@@ -8569,7 +8569,7 @@ impl XhciController {
                     let stale_tag = (d[4] as u32) | ((d[5] as u32) << 8) | ((d[6] as u32) << 16) | ((d[7] as u32) << 24);
                     let is_csw = sig == 0x5342_5355;
                     serial_println!(
-                        ":: BOT: [piusb41] drained stale IN pass={} cc={} residue={} is_csw={} tag={:#010x} status_byte={:#04x} — {} ::",
+                        ":: BOT: [usb41] drained stale IN pass={} cc={} residue={} is_csw={} tag={:#010x} status_byte={:#04x} — {} ::",
                         pass, cc, residue, is_csw, stale_tag, d[12],
                         if is_csw { "a replayed CSW consumed off the pipe; the next data stage starts clean" }
                         else { "the pipe carried something that is NOT a CSW — recorded raw above, drain stops here rather than eat unknown data" });
@@ -8579,7 +8579,7 @@ impl XhciController {
                     self.bot_clean_rings(slot_id, BotError::Timeout);
                     self.bot_failed = None;
                     serial_println!(
-                        ":: BOT: [piusb41] drain pass={} — IN pipe quiet (timeout is the CLEAN outcome here); stranded drain TD cleaned ::",
+                        ":: BOT: [usb41] drain pass={} — IN pipe quiet (timeout is the CLEAN outcome here); stranded drain TD cleaned ::",
                         pass);
                     return;
                 }
@@ -8624,7 +8624,7 @@ impl XhciController {
                     // was unreachable in QEMU by construction, which is why the gate could only ever
                     // watch the back-off decline attempts. The charge is the budget the wait WOULD
                     // have paid, classified `dead` because the injected wedge is exactly the
-                    // [piusb40] necropsy signature: nothing queued, no doorbell, a provably idle
+                    // [usb40] necropsy signature: nothing queued, no doorbell, a provably idle
                     // ring. Real elapsed time is unchanged — this buys the fixture the ledger's
                     // arithmetic, not the metal's seconds.
                     let synthetic = crate::arch::hw_wait_budget()
@@ -8638,7 +8638,7 @@ impl XhciController {
         let in_dci = ((in_addr & 0x0F) * 2) + 1;
         let out_dci = (out_addr & 0x0F) * 2;
 
-        // [piusb41] S1Z: this attempt has not folded (yet). The marker is what lets
+        // [usb41] S1Z: this attempt has not folded (yet). The marker is what lets
         // `bot_rescue_clear` distinguish a REAL completion (ends the fold streak) from the fold's
         // own `Ok` return (IS the streak) — without it fold #1's completion-clear wiped the streak
         // before fold #2 could increment it, and the PA34 two-fold trigger was vacuous.
@@ -8815,7 +8815,7 @@ impl XhciController {
             if data_dci != out_dci { self.bot_doorbell(slot_id, data_dci, true); }
 
             let stage = self.run_bot_stage(slot_id, in_dci, out_dci, data_trb_phys);
-            // ZERO-DATA CSW FOLD ([piusb41]) — BEFORE the outcome above is judged and before the
+            // ZERO-DATA CSW FOLD ([usb41]) — BEFORE the outcome above is judged and before the
             // `?` can propagate a timeout. The device may have skipped the data phase and put its
             // 13-byte CSW where this data stage's buffer is; when it did, the transaction is
             // complete already and stage 3 must never be built. See `bot_fold_zero_data_csw` for
@@ -9137,7 +9137,7 @@ impl XhciController {
             _ => "DATA(real-bytes-landed)",
         };
         serial_println!(
-            ":: PIUSB: [piusb36] {} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+            ":: PIUSB: [usb36] {} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
             label, buf_phys, status, residue, verdict,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
             d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
@@ -9165,20 +9165,20 @@ impl XhciController {
     #[cfg(target_arch = "aarch64")]
     fn piusb36_matrix(&mut self) {
         let slot = self.storage_slot();
-        if slot == 0 { serial_println!(":: PIUSB: [piusb36] no storage slot — matrix skipped ::"); return; }
+        if slot == 0 { serial_println!(":: PIUSB: [usb36] no storage slot — matrix skipped ::"); return; }
         let databuf = match self.slots[slot as usize].scsi_data_buffer {
             Some(p) => p as u64,
-            None => { serial_println!(":: PIUSB: [piusb36] no scsi_data_buffer — matrix skipped ::"); return; }
+            None => { serial_println!(":: PIUSB: [usb36] no scsi_data_buffer — matrix skipped ::"); return; }
         };
         let read10_lba0 = [0x28u8, 0, 0, 0, 0, 0, 0, 0, 1, 0];
 
-        serial_println!(":: PIUSB: [piusb36] === experiment matrix (read-only, one boot) === ::");
+        serial_println!(":: PIUSB: [usb36] === experiment matrix (read-only, one boot) === ::");
 
         // --- Step 1: baseline READ(10) LBA0 into the CURRENT scsi_data_buffer (expect zeros on
         //     metal). Establishes the wedge is live this boot before the discriminating variants. ---
         match self.bot_transfer(slot, &read10_lba0, databuf, 512, Direction::In) {
             Ok(r) => Self::piusb36_report("step1-baseline-scsibuf", databuf, r.status, r.residue, None),
-            Err(e) => serial_println!(":: PIUSB: [piusb36] step1 baseline ERR {:?} ::", e),
+            Err(e) => serial_println!(":: PIUSB: [usb36] step1 baseline ERR {:?} ::", e),
         }
 
         // --- Step 2: FRESH alloc_zeroed buffer PRE-FILLED with 0xA5, then READ(10) LBA0 into it.
@@ -9189,12 +9189,12 @@ impl XhciController {
             let layout = core::alloc::Layout::from_size_align(512, 64).unwrap();
             let fresh = unsafe { alloc::alloc::alloc_zeroed(layout) };
             if fresh.is_null() {
-                serial_println!(":: PIUSB: [piusb36] step2 alloc failed ::");
+                serial_println!(":: PIUSB: [usb36] step2 alloc failed ::");
             } else {
                 unsafe { core::ptr::write_bytes(fresh, 0xA5, 512); }
                 match self.bot_transfer(slot, &read10_lba0, fresh as u64, 512, Direction::In) {
                     Ok(r) => Self::piusb36_report("step2-fresh-A5-heap", fresh as u64, r.status, r.residue, Some(0xA5)),
-                    Err(e) => serial_println!(":: PIUSB: [piusb36] step2 fresh-A5 ERR {:?} ::", e),
+                    Err(e) => serial_println!(":: PIUSB: [usb36] step2 fresh-A5 ERR {:?} ::", e),
                 }
                 unsafe { alloc::alloc::dealloc(fresh, layout); }
             }
@@ -9208,7 +9208,7 @@ impl XhciController {
             unsafe { core::ptr::write_bytes(sbuf, 0xA5, 512); }
             match self.bot_transfer(slot, &read10_lba0, sbuf as u64, 512, Direction::In) {
                 Ok(r) => Self::piusb36_report("step3-static-A5-low", sbuf as u64, r.status, r.residue, Some(0xA5)),
-                Err(e) => serial_println!(":: PIUSB: [piusb36] step3 static ERR {:?} ::", e),
+                Err(e) => serial_println!(":: PIUSB: [usb36] step3 static ERR {:?} ::", e),
             }
         }
 
@@ -9220,7 +9220,7 @@ impl XhciController {
             unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 36); }
             match self.bot_transfer(slot, &inquiry, databuf, 36, Direction::In) {
                 Ok(r) => Self::piusb36_report("step4-inquiry36-scsibuf", databuf, r.status, r.residue, Some(0xA5)),
-                Err(e) => serial_println!(":: PIUSB: [piusb36] step4 inquiry ERR {:?} ::", e),
+                Err(e) => serial_println!(":: PIUSB: [usb36] step4 inquiry ERR {:?} ::", e),
             }
         }
 
@@ -9228,7 +9228,7 @@ impl XhciController {
         //     TD-shape variant of the same 512 B transfer. Discriminates TD shape from length. ---
         match self.piusb36_read10_two_trb(slot, databuf) {
             Ok(r) => Self::piusb36_report("step5-two-trb-scsibuf", databuf, r.status, r.residue, None),
-            Err(e) => serial_println!(":: PIUSB: [piusb36] step5 two-TRB ERR {:?} ::", e),
+            Err(e) => serial_println!(":: PIUSB: [usb36] step5 two-TRB ERR {:?} ::", e),
         }
 
         // --- Step 6: POSTED-WRITE VISIBILITY. Re-read LBA0 (single TRB, 1 block): bot_transfer
@@ -9249,15 +9249,15 @@ impl XhciController {
                     else if a_zero && b_zero { "no-race(both-zero-after-1ms-delay)" }
                     else { "immediate-read-already-had-data(no-race-hit)" };
                 serial_println!(
-                    ":: PIUSB: [piusb36] step6-posted-write buf={:#x} CSW={:?} residue={} verdict={} | A(immediate)={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} | B(+1ms+inval)={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                    ":: PIUSB: [usb36] step6-posted-write buf={:#x} CSW={:?} residue={} verdict={} | A(immediate)={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} | B(+1ms+inval)={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
                     databuf, r.status, r.residue, verdict,
                     a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
                     b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
             }
-            Err(e) => serial_println!(":: PIUSB: [piusb36] step6 posted-write ERR {:?} ::", e),
+            Err(e) => serial_println!(":: PIUSB: [usb36] step6 posted-write ERR {:?} ::", e),
         }
 
-        serial_println!(":: PIUSB: [piusb36] === matrix complete === ::");
+        serial_println!(":: PIUSB: [usb36] === matrix complete === ::");
     }
 
     // ==================== PIUSB-37: chase the command itself ====================
@@ -9268,7 +9268,7 @@ impl XhciController {
         let d = unsafe { core::slice::from_raw_parts(phys as *const u8, 16) };
         let verdict = if d.iter().all(|&b| b == 0) { "ZEROS" } else { "DATA(real-bytes-landed)" };
         serial_println!(
-            ":: PIUSB: [piusb37] {} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+            ":: PIUSB: [usb37] {} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
             label, phys, status, residue, verdict,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
             d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
@@ -9285,17 +9285,17 @@ impl XhciController {
     #[cfg(target_arch = "aarch64")]
     fn piusb37_matrix(&mut self) {
         let slot = self.storage_slot();
-        if slot == 0 { serial_println!(":: PIUSB: [piusb37] no storage slot — matrix skipped ::"); return; }
+        if slot == 0 { serial_println!(":: PIUSB: [usb37] no storage slot — matrix skipped ::"); return; }
         let (databuf, cbw_phys) = {
             let s = &self.slots[slot as usize];
             match (s.scsi_data_buffer, s.cbw_buffer) {
                 (Some(d), Some(c)) => (d as u64, c as u64),
-                _ => { serial_println!(":: PIUSB: [piusb37] no data/cbw buffer — matrix skipped ::"); return; }
+                _ => { serial_println!(":: PIUSB: [usb37] no data/cbw buffer — matrix skipped ::"); return; }
             }
         };
         let read10_lba0 = [0x28u8, 0, 0, 0, 0, 0, 0, 0, 1, 0];
 
-        serial_println!(":: PIUSB: [piusb37] === chase-the-command matrix (read-only, one boot) === ::");
+        serial_println!(":: PIUSB: [usb37] === chase-the-command matrix (read-only, one boot) === ::");
 
         // --- Step 1: CBW AUDIT. Build the exact 31-byte CBW that bot_transfer hands to the
         //     controller (build_cbw writes the on-the-wire little-endian layout, so a post-build
@@ -9328,14 +9328,14 @@ impl XhciController {
             let lun_ok = lun <= max_lun;
             let cblen_ok = cblen as usize == cdb.len();
             serial_println!(
-                ":: PIUSB: [piusb37] cbw-dump {} sig={:#010x}({}) tag={:#x} dCBWDataTransferLength={}({}) bmFlags={:#04x}({}) bCBWLUN={}/{}({}) bCBWCBLength={}({}) ::",
+                ":: PIUSB: [usb37] cbw-dump {} sig={:#010x}({}) tag={:#x} dCBWDataTransferLength={}({}) bmFlags={:#04x}({}) bCBWLUN={}/{}({}) bCBWCBLength={}({}) ::",
                 label, sig, if sig_ok {"USBC-ok"} else {"BAD"}, tag,
                 dxlen, if len_ok {"ok"} else {"MISMATCH"},
                 flags, if flags_ok {"IN-ok"} else {"BAD"},
                 lun, max_lun, if lun_ok {"ok"} else {"OUT-OF-RANGE!"},
                 cblen, if cblen_ok {"ok"} else {"MISMATCH"});
             serial_println!(
-                ":: PIUSB: [piusb37] cbw-dump {} CDB= {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                ":: PIUSB: [usb37] cbw-dump {} CDB= {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
                 label,
                 c[15], c[16], c[17], c[18], c[19], c[20], c[21], c[22],
                 c[23], c[24], c[25], c[26], c[27], c[28], c[29], c[30]);
@@ -9345,7 +9345,7 @@ impl XhciController {
                 let lba = ((c[17] as u32) << 24) | ((c[18] as u32) << 16) | ((c[19] as u32) << 8) | (c[20] as u32);
                 let blocks = ((c[22] as u16) << 8) | (c[23] as u16);
                 serial_println!(
-                    ":: PIUSB: [piusb37] cbw-dump READ10 decode: opcode={:#04x}({}) LBA(BE)={} blocks(BE)={} — {} ::",
+                    ":: PIUSB: [usb37] cbw-dump READ10 decode: opcode={:#04x}({}) LBA(BE)={} blocks(BE)={} — {} ::",
                     opcode, if opcode == 0x28 {"ok"} else {"BAD"}, lba, blocks,
                     if opcode == 0x28 && lba == 0 && blocks == 1 { "CDB well-formed — command is NOT the fault" }
                     else { "CDB MALFORMED — this alone would return zeros+Passed" });
@@ -9366,12 +9366,12 @@ impl XhciController {
                     let d = unsafe { core::slice::from_raw_parts(databuf as *const u8, 16) };
                     let verdict = if d.iter().all(|&b| b == 0) { "ZEROS" } else { "DATA(real-bytes-landed)" };
                     serial_println!(
-                        ":: PIUSB: [piusb37] read10-lba{} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                        ":: PIUSB: [usb37] read10-lba{} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
                         lba, databuf, r.status, r.residue, verdict,
                         d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
                         d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
                 }
-                Err(e) => serial_println!(":: PIUSB: [piusb37] read10-lba{} ERR {:?} ::", lba, e),
+                Err(e) => serial_println!(":: PIUSB: [usb37] read10-lba{} ERR {:?} ::", lba, e),
             }
         }
         // READ(12) LBA0 (opcode 0xA8): LBA BE in bytes 2..6, transfer length BE (blocks) in 6..10.
@@ -9380,7 +9380,7 @@ impl XhciController {
             unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
             match self.bot_transfer(slot, &cdb, databuf, 512, Direction::In) {
                 Ok(r) => Self::piusb37_dump16("read12-lba0", databuf, r.status, r.residue),
-                Err(e) => serial_println!(":: PIUSB: [piusb37] read12-lba0 ERR {:?} ::", e),
+                Err(e) => serial_println!(":: PIUSB: [usb37] read12-lba0 ERR {:?} ::", e),
             }
         }
         // READ(16) LBA0 (opcode 0x88): LBA BE in bytes 2..10, transfer length BE (blocks) in 10..14.
@@ -9389,7 +9389,7 @@ impl XhciController {
             unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
             match self.bot_transfer(slot, &cdb, databuf, 512, Direction::In) {
                 Ok(r) => Self::piusb37_dump16("read16-lba0", databuf, r.status, r.residue),
-                Err(e) => serial_println!(":: PIUSB: [piusb37] read16-lba0 ERR {:?} ::", e),
+                Err(e) => serial_println!(":: PIUSB: [usb37] read16-lba0 ERR {:?} ::", e),
             }
         }
 
@@ -9403,7 +9403,7 @@ impl XhciController {
             let read_res = self.bot_transfer(slot, &read10_lba0, databuf, 512, Direction::In);
             match read_res {
                 Ok(r) => Self::piusb37_dump16("presense-read10-lba0", databuf, r.status, r.residue),
-                Err(e) => serial_println!(":: PIUSB: [piusb37] presense-read10 ERR {:?} ::", e),
+                Err(e) => serial_println!(":: PIUSB: [usb37] presense-read10 ERR {:?} ::", e),
             }
             let sense_cdb = [0x03u8, 0, 0, 0, 18, 0];
             unsafe { core::ptr::write_bytes(databuf as *mut u8, 0, 18); }
@@ -9419,17 +9419,17 @@ impl XhciController {
                         0x06 => "UNIT ATTENTION", 0x0b => "ABORTED COMMAND", _ => "other",
                     };
                     serial_println!(
-                        ":: PIUSB: [piusb37] REQUEST-SENSE CSW={:?} residue={} response={:#04x} key={:#x}({}) ASC={:#04x} ASCQ={:#04x} — {} ::",
+                        ":: PIUSB: [usb37] REQUEST-SENSE CSW={:?} residue={} response={:#04x} key={:#x}({}) ASC={:#04x} ASCQ={:#04x} — {} ::",
                         r.status, r.residue, resp, key, name, asc, ascq,
                         if key == 0x06 { "UNIT ATTENTION PENDING — strong candidate for zeros-then-good" }
                         else if key == 0x00 { "no pending sense — UA theory does NOT explain the zeros" }
                         else { "pending non-UA sense condition" });
                     serial_println!(
-                        ":: PIUSB: [piusb37] REQUEST-SENSE raw= {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                        ":: PIUSB: [usb37] REQUEST-SENSE raw= {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
                         s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8],
                         s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17]);
                 }
-                Err(e) => serial_println!(":: PIUSB: [piusb37] REQUEST-SENSE ERR {:?} ::", e),
+                Err(e) => serial_println!(":: PIUSB: [usb37] REQUEST-SENSE ERR {:?} ::", e),
             }
         }
 
@@ -9443,15 +9443,15 @@ impl XhciController {
             for attempt in 0..8 {
                 match self.scsi_test_unit_ready(slot) {
                     Ok(CswStatus::Passed) => {
-                        serial_println!(":: PIUSB: [piusb37] TUR attempt {} => Passed (ready) ::", attempt);
+                        serial_println!(":: PIUSB: [usb37] TUR attempt {} => Passed (ready) ::", attempt);
                         ready = true; break;
                     }
                     Ok(st) => {
-                        serial_println!(":: PIUSB: [piusb37] TUR attempt {} => {:?}; clearing sense ::", attempt, st);
+                        serial_println!(":: PIUSB: [usb37] TUR attempt {} => {:?}; clearing sense ::", attempt, st);
                         let sense_cdb = [0x03u8, 0, 0, 0, 18, 0];
                         let _ = self.bot_transfer(slot, &sense_cdb, databuf, 18, Direction::In);
                     }
-                    Err(e) => serial_println!(":: PIUSB: [piusb37] TUR attempt {} ERR {:?} ::", attempt, e),
+                    Err(e) => serial_println!(":: PIUSB: [usb37] TUR attempt {} ERR {:?} ::", attempt, e),
                 }
             }
             unsafe { core::ptr::write_bytes(databuf as *mut u8, 0, 512); }
@@ -9461,22 +9461,22 @@ impl XhciController {
                     let d = unsafe { core::slice::from_raw_parts(databuf as *const u8, 16) };
                     let still_zeros = d.iter().all(|&b| b == 0);
                     serial_println!(
-                        ":: PIUSB: [piusb37] post-TUR verdict: ready={} data={} — {} ::",
+                        ":: PIUSB: [usb37] post-TUR verdict: ready={} data={} — {} ::",
                         ready, if still_zeros {"ZEROS"} else {"REAL"},
                         if !still_zeros { "SENSE-CLEAR IS THE FIX: drain TUR/REQUEST-SENSE before first read" }
                         else { "still zeros after ready — UA/sense theory REFUTED; residual is READ-command response" });
                 }
-                Err(e) => serial_println!(":: PIUSB: [piusb37] postready-read10 ERR {:?} ::", e),
+                Err(e) => serial_println!(":: PIUSB: [usb37] postready-read10 ERR {:?} ::", e),
             }
         }
 
-        serial_println!(":: PIUSB: [piusb37] === chase-the-command matrix complete === ::");
+        serial_println!(":: PIUSB: [usb37] === chase-the-command matrix complete === ::");
     }
 
     // ==================== PIUSB-38: stall recovery + low-LBA-zeros bisect ====================
 
     /// PIUSB-38: prove BOT Reset Recovery on the storage pipe, then run the low-LBA-zeros bisect.
-    /// Three read-only phases in one boot (each witnessed `:: PIUSB: [piusb38] ... ::`):
+    /// Three read-only phases in one boot (each witnessed `:: PIUSB: [usb38] ... ::`):
     ///
     ///   * **Phase 1 — induced-stall recovery.** Issue an UNSUPPORTED command (READ(16), opcode
     ///     0x88) which the bench VL805 stick STALLs (completion code 4). `bot_transfer_once` clears
@@ -9501,13 +9501,13 @@ impl XhciController {
     #[cfg(target_arch = "aarch64")]
     fn piusb38_matrix(&mut self) {
         let slot = self.storage_slot();
-        if slot == 0 { serial_println!(":: PIUSB: [piusb38] no storage slot — matrix skipped ::"); return; }
+        if slot == 0 { serial_println!(":: PIUSB: [usb38] no storage slot — matrix skipped ::"); return; }
         let databuf = match self.slots[slot as usize].scsi_data_buffer {
             Some(p) => p as u64,
-            None => { serial_println!(":: PIUSB: [piusb38] no scsi_data_buffer — matrix skipped ::"); return; }
+            None => { serial_println!(":: PIUSB: [usb38] no scsi_data_buffer — matrix skipped ::"); return; }
         };
 
-        serial_println!(":: PIUSB: [piusb38] === stall-recovery + low-LBA bisect (read-only, one boot) === ::");
+        serial_println!(":: PIUSB: [usb38] === stall-recovery + low-LBA bisect (read-only, one boot) === ::");
 
         // --- Phase 1: induce a stall, then prove the pipe recovered. ---
         // READ(16), opcode 0x88, LBA0, 1 block — unsupported by many bulk bridges (STALL, code 4).
@@ -9515,11 +9515,11 @@ impl XhciController {
         unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
         match self.bot_transfer(slot, &read16_lba0, databuf, 512, Direction::In) {
             Ok(r) => serial_println!(
-                ":: PIUSB: [piusb38] induced-read16 CSW={:?} residue={} (no stall — device accepted READ16) ::",
+                ":: PIUSB: [usb38] induced-read16 CSW={:?} residue={} (no stall — device accepted READ16) ::",
                 r.status, r.residue),
             Err(BotError::Stall) => serial_println!(
-                ":: PIUSB: [piusb38] induced-read16 STALL — inline BOT reset-recovery ran ::"),
-            Err(e) => serial_println!(":: PIUSB: [piusb38] induced-read16 ERR {:?} (recovery ran) ::", e),
+                ":: PIUSB: [usb38] induced-read16 STALL — inline BOT reset-recovery ran ::"),
+            Err(e) => serial_println!(":: PIUSB: [usb38] induced-read16 ERR {:?} (recovery ran) ::", e),
         }
         // The pipe must be ALIVE now: TUR + REQUEST SENSE must COMPLETE (not Timeout).
         let tur1 = self.scsi_test_unit_ready(slot);
@@ -9529,7 +9529,7 @@ impl XhciController {
         let recovered = !matches!(tur1, Err(BotError::Timeout))
             && !matches!(sense1, Err(BotError::Timeout));
         serial_println!(
-            ":: PIUSB: [piusb38] post-stall TUR={:?} REQUEST-SENSE={:?} — {} ::",
+            ":: PIUSB: [usb38] post-stall TUR={:?} REQUEST-SENSE={:?} — {} ::",
             tur1, sense1.as_ref().map(|r| r.status),
             if recovered { "PIPE RECOVERED (TUR+SENSE completed — stall no longer wedges the pipe)" }
             else { "PIPE STILL WEDGED (a command timed out after the stall)" });
@@ -9539,11 +9539,11 @@ impl XhciController {
         // BOT-RESCUE M3 witness 6: no failed stage to hand over — this call is a deliberate
         // exercise of the recovery path, not the aftermath of one. `None` is the honest record.
         let full_ok = self.recover_bot_full(slot, BotError::Stall, None);
-        serial_println!(":: PIUSB: [piusb38] explicit recover_bot_full -> {} ::",
+        serial_println!(":: PIUSB: [usb38] explicit recover_bot_full -> {} ::",
             if full_ok { "ok" } else { "incomplete" });
         let tur2 = self.scsi_test_unit_ready(slot);
         serial_println!(
-            ":: PIUSB: [piusb38] post-full-reset TUR={:?} — {} ::",
+            ":: PIUSB: [usb38] post-full-reset TUR={:?} — {} ::",
             tur2,
             if matches!(tur2, Err(BotError::Timeout)) { "pipe dead after full reset" }
             else { "pipe alive after full Bulk-Only Reset Recovery" });
@@ -9571,37 +9571,37 @@ impl XhciController {
                     if !all_zero && !all_a5 && first_data_lba.is_none() { first_data_lba = Some(lba); }
                     if all_zero { last_zero_lba = Some(lba); }
                     serial_println!(
-                        ":: PIUSB: [piusb38] ladder-lba{} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                        ":: PIUSB: [usb38] ladder-lba{} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
                         lba, r.status, r.residue, verdict,
                         d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
                         d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
                 }
-                Err(e) => serial_println!(":: PIUSB: [piusb38] ladder-lba{} ERR {:?} ::", lba, e),
+                Err(e) => serial_println!(":: PIUSB: [usb38] ladder-lba{} ERR {:?} ::", lba, e),
             }
         }
         // Boundary verdict.
         match (last_zero_lba, first_data_lba) {
             (Some(z), Some(d)) => serial_println!(
-                ":: PIUSB: [piusb38] bisect boundary: last-zeros=LBA{} first-data=LBA{} — zeros→data split IS region-specific (same CDB shape) ::", z, d),
+                ":: PIUSB: [usb38] bisect boundary: last-zeros=LBA{} first-data=LBA{} — zeros→data split IS region-specific (same CDB shape) ::", z, d),
             (Some(z), None) => serial_println!(
-                ":: PIUSB: [piusb38] bisect boundary: ALL ladder LBAs zeros (last=LBA{}) — no data landed on any low LBA ::", z),
+                ":: PIUSB: [usb38] bisect boundary: ALL ladder LBAs zeros (last=LBA{}) — no data landed on any low LBA ::", z),
             (None, Some(d)) => serial_println!(
-                ":: PIUSB: [piusb38] bisect boundary: data from the first LBA (LBA{}) — no low-LBA zeros this boot ::", d),
+                ":: PIUSB: [usb38] bisect boundary: data from the first LBA (LBA{}) — no low-LBA zeros this boot ::", d),
             (None, None) => serial_println!(
-                ":: PIUSB: [piusb38] bisect boundary: no zeros and no data (pattern survived / errors) — see per-LBA lines ::"),
+                ":: PIUSB: [usb38] bisect boundary: no zeros and no data (pattern survived / errors) — see per-LBA lines ::"),
         }
         // Diff LBA0 vs LBA8192 (same READ(10) shape, only the LBA field differs).
         let first_diff = (0..16).find(|&i| lba0_first16[i] != lba8192_first16[i]);
         match first_diff {
             Some(i) => serial_println!(
-                ":: PIUSB: [piusb38] lba0-vs-lba8192 diff: first differ at byte {} (lba0={:#04x} lba8192={:#04x}) — identical command path, divergent data ⇒ region/buffer effect not command-shape ::",
+                ":: PIUSB: [usb38] lba0-vs-lba8192 diff: first differ at byte {} (lba0={:#04x} lba8192={:#04x}) — identical command path, divergent data ⇒ region/buffer effect not command-shape ::",
                 i, lba0_first16[i], lba8192_first16[i]),
             None => serial_println!(
-                ":: PIUSB: [piusb38] lba0-vs-lba8192 diff: first-16 IDENTICAL (both {}) ::",
+                ":: PIUSB: [usb38] lba0-vs-lba8192 diff: first-16 IDENTICAL (both {}) ::",
                 if lba0_first16.iter().all(|&b| b == 0) { "zeros" } else { "equal-nonzero" }),
         }
 
-        serial_println!(":: PIUSB: [piusb38] === stall-recovery + low-LBA bisect complete === ::");
+        serial_println!(":: PIUSB: [usb38] === stall-recovery + low-LBA bisect complete === ::");
     }
 
     /// USB-WRITE-2: recover a halted bulk endpoint after a STALL (completion code 4) or Babble
@@ -10121,7 +10121,7 @@ impl XhciController {
         }
         if downstream {
             // A hub-downstream device's power is the HUB's to switch, via a class request on the
-            // hub's slot — a different pipe, and PORTSC PP here would cut the whole hub. [piusb41]
+            // hub's slot — a different pipe, and PORTSC PP here would cut the whole hub. [usb41]
             // PA37 stopped at this line with `why=downstream-port-not-root`; the rung it named is
             // now written, so hand off to it rather than refusing. `port` (the ROOT port the chain
             // starts at) is deliberately NOT touched on this path.
@@ -10160,7 +10160,7 @@ impl XhciController {
         ccs != 0
     }
 
-    /// [piusb41] BOT-RESCUE escalation (b'): the HUB-downstream twin of `rescue_port_cycle`.
+    /// [usb41] BOT-RESCUE escalation (b'): the HUB-downstream twin of `rescue_port_cycle`.
     ///
     /// A device behind a hub has no PORTSC of its own — its VBUS is switched by the HUB, through
     /// class requests aimed at ONE named downstream port on the hub's control pipe
@@ -10253,7 +10253,7 @@ impl XhciController {
         // carries one device; a second live claimant means the bookkeeping is wrong, and cutting
         // power on a guess could darken a healthy sibling. Refuse instead.
         //
-        // [piusb41] PA38: "live" must mean what the REST of the driver means by it, not merely
+        // [usb41] PA38: "live" must mean what the REST of the driver means by it, not merely
         // `active`. `bot_clean` (see its `skipped=` line) treats a slot with a null output context
         // or a SURRENDERED slot as having no reachable ring and no possible further transfer — a
         // corpse the driver has already stopped addressing. Such a slot cannot be a healthy sibling
@@ -10511,7 +10511,7 @@ impl XhciController {
         self.port_link_witness("timeout");
     }
 
-    /// [piusb40] witness 3 — the event-ring necropsy. Photograph the ring at the instant of a BOT
+    /// [usb40] witness 3 — the event-ring necropsy. Photograph the ring at the instant of a BOT
     /// timeout, BEFORE any recovery touches it.
     ///
     /// The two surviving explanations for the READ CAPACITY wedge are indistinguishable in every
@@ -10538,7 +10538,7 @@ impl XhciController {
                 Some(r) => r,
                 None => {
                     serial_println!(
-                        ":: BOT: [piusb40] necropsy — event ring uninitialised — no photograph possible, this timeout predates the interrupter ::");
+                        ":: BOT: [usb40] necropsy — event ring uninitialised — no photograph possible, this timeout predates the interrupter ::");
                     return;
                 }
             };
@@ -10615,7 +10615,7 @@ impl XhciController {
         };
 
         serial_println!(
-            ":: BOT: [piusb40] necropsy — sw deq={} colour={} popped={} | hw ERDP={:#x} (slot {}) IMAN={:#x} | ring: {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} — {} ::",
+            ":: BOT: [usb40] necropsy — sw deq={} colour={} popped={} | hw ERDP={:#x} (slot {}) IMAN={:#x} | ring: {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} — {} ::",
             sw_deq, colour, popped, erdp, hw_slot, iman,
             slots[0].0, slots[0].1, slots[0].2,
             slots[1].0, slots[1].1, slots[1].2,
@@ -10882,7 +10882,7 @@ impl XhciController {
     }
 
     /// Charge one pump wait to a slot's identity. `dead` = the wait ended in a timeout with a
-    /// PROVABLY idle ring (the [piusb40] necropsy signature); it drives the budget cap, and any
+    /// PROVABLY idle ring (the [usb40] necropsy signature); it drives the budget cap, and any
     /// wait that is not dead clears the streak.
     ///
     /// Opens no account on the happy path: a device with no history is charged only once it has a
@@ -11286,7 +11286,7 @@ impl XhciController {
             None => self.bot_fail_streak_anon = 0,
         }
         self.bot_rescue_stage = 0;
-        // [piusb41] PA34 + S1Z: a completed transaction ends the fold streak ONLY when it was a
+        // [usb41] PA34 + S1Z: a completed transaction ends the fold streak ONLY when it was a
         // REAL completion — the fold's own `Ok` return is a member of the streak, not its end.
         // Unconditional, this line made the PA34 two-fold trigger unfireable: fold #1 returned
         // `Ok`, the caller's completion-clear ran this store, and fold #2's increment started
@@ -11511,7 +11511,7 @@ impl XhciController {
         // `BOT_BUDGET_SCALE_ESCALATION` and restores it immediately after. A healthy device never
         // reaches an escalation retry, so it never sees anything but the historical budget.
         let budget = crate::arch::hw_wait_budget().saturating_mul(self.bot_budget_scale);
-        // BOT-PARK: bounded work per pass. A device whose ring the [piusb40] necropsy has twice
+        // BOT-PARK: bounded work per pass. A device whose ring the [usb40] necropsy has twice
         // found PROVABLY idle across a whole wait — no events, no foreign events, no doorbells,
         // IRQ_COUNT flat — has demonstrated that the remaining seconds of this budget buy no
         // information; they only hold the core. `min`, never `max`: this can shorten a wait and can
@@ -11645,7 +11645,7 @@ impl XhciController {
                 // timeout printout below, because the question it answers is precisely whether a
                 // completion was consumable at the moment the budget died or only landed DURING
                 // the multi-line serial dump (tens of ms at metal baud — the window in which the
-                // [piusb40] necropsy can photograph "an event in OUR colour at the dequeue slot"
+                // [usb40] necropsy can photograph "an event in OUR colour at the dequeue slot"
                 // that did not exist when the pump last looked). Read-only: `has_event` invalidates
                 // and reads the dequeue TRB, consumes nothing, moves no pointer.
                 let bc_fresh_at_expiry = {
@@ -11776,7 +11776,7 @@ impl XhciController {
                     let db_out_d = BOT_DB_OUT.load(Ordering::Relaxed).wrapping_sub(db_out_at_entry);
                     self.bot_timeout_witness(&p, foreign, evts, db_in_d, db_out_d);
                 }
-                // [piusb40] witness 3. HERE, and not one line later: everything past this return
+                // [usb40] witness 3. HERE, and not one line later: everything past this return
                 // is recovery, and recovery mutates the ring it would be photographing. Unlike the
                 // witnesses above it is unconditional on `bot_pending` — a timeout with nothing
                 // pending still has an event ring worth reading, and that combination is itself
@@ -11811,7 +11811,7 @@ impl XhciController {
                 // BOT-PARK: charge the exhausted budget to the DEVICE, and classify the wait. A
                 // wait is "dead" only when NOTHING moved anywhere for its whole duration — no event
                 // drained here, no foreign event for any other slot, and no doorbell rung. That
-                // conjunction is the [piusb40] necropsy signature and nothing weaker: a boot with a
+                // conjunction is the [usb40] necropsy signature and nothing weaker: a boot with a
                 // live FTDI console produces foreign events continuously, so a device on a working
                 // controller cannot accidentally look dead.
                 {
@@ -11949,7 +11949,7 @@ impl XhciController {
 
     /// SCSI READ CAPACITY(10) (0x25), 8 bytes BE. Returns (block_size, last_lba).
     ///
-    /// [piusb40] witness 1 — the data-landed discriminator. boot20 wedges HERE, deterministically
+    /// [usb40] witness 1 — the data-landed discriminator. boot20 wedges HERE, deterministically
     /// and identically across two enumerations: TUR and INQUIRY complete (the pump reports n=1,2
     /// result=OK, and INQUIRY's 36-byte data-in provably landed — the shape line carries
     /// maxlen=36), then this 8-byte data-IN times out with no transfer event and a CSW that never
@@ -11975,7 +11975,7 @@ impl XhciController {
                 let d = unsafe { core::slice::from_raw_parts(data_phys as *const u8, 8) };
                 let landed = d.iter().any(|&b| b != 0xA5);
                 serial_println!(
-                    ":: PIUSB: [piusb40] readcap-wedge — err={:?} data=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] poison=0xA5 landed={} — {} ::",
+                    ":: PIUSB: [usb40] readcap-wedge — err={:?} data=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] poison=0xA5 landed={} — {} ::",
                     e, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], landed,
                     if landed {
                         "the 8 bytes ARE in DRAM: the transfer COMPLETED and only its completion event went missing — event-path defect, read the necropsy line"
@@ -11989,17 +11989,17 @@ impl XhciController {
             let d = core::slice::from_raw_parts(data_phys as *const u8, 8);
             let last_lba = ((d[0] as u32) << 24) | ((d[1] as u32) << 16) | ((d[2] as u32) << 8) | (d[3] as u32);
             let block_size = ((d[4] as u32) << 24) | ((d[5] as u32) << 16) | ((d[6] as u32) << 8) | (d[7] as u32);
-            // [piusb41] geometry sanity — boot22's lesson: a phase-shifted reply (CSW tail + real
+            // [usb41] geometry sanity — boot22's lesson: a phase-shifted reply (CSW tail + real
             // capacity fragment) parsed here as block_size=83886080 and MINTED A DISK. No real
             // USB stick reports anything but a small power-of-two sector; anything else is not a
             // strange disk, it is a corrupt reply, and the honest verdict is Failed-shaped refusal
             // upstream (the caller's sense/retry path), never a Disk line the block layer trusts.
             if !(block_size.is_power_of_two() && (512..=4096).contains(&block_size)) {
                 serial_println!(
-                    ":: PIUSB: [piusb41] READ CAPACITY reply REJECTED — block_size={} last_lba={:#010x} is not a sane sector geometry (want a power of two in 512..=4096) — phase-shifted or corrupt reply, no disk is minted from it ::",
+                    ":: PIUSB: [usb41] READ CAPACITY reply REJECTED — block_size={} last_lba={:#010x} is not a sane sector geometry (want a power of two in 512..=4096) — phase-shifted or corrupt reply, no disk is minted from it ::",
                     block_size, last_lba
                 );
-                // [piusb41] PA36: recorded, not acted on — `bring_up_storage` decides after the
+                // [usb41] PA36: recorded, not acted on — `bring_up_storage` decides after the
                 // post-wedge INQUIRY control has taken its photograph of the pipes.
                 self.bot_geom_reject = true;
                 return Err(BotError::TransferError(8));
@@ -12390,7 +12390,7 @@ impl XhciController {
     ///
     /// This deliberately does NOT call `scsi_inquiry`/`scsi_read_capacity10`: both ignore the CSW
     /// status (they were written for a path where a CHECK CONDITION cannot be told apart from data),
-    /// and `scsi_read_capacity10` additionally latches `bot_geom_reject` and prints the `[piusb40]`
+    /// and `scsi_read_capacity10` additionally latches `bot_geom_reject` and prints the `[usb40]`
     /// wedge witness — state and evidence belonging to the bring-up's own READ CAPACITY, which a
     /// census of empty card slots must not manufacture.
     fn usblun_probe(&mut self, slot_id: u8, lun: u8, max_lun: u8) -> bool {
@@ -12551,7 +12551,7 @@ impl XhciController {
         // BOT-RESCUE: a freshly enumerated disk inherits no escalation state, even if the
         // controller handed it a slot id a surrendered disk once held.
         self.bot_rescue_clear(slot);
-        // [piusb41] PA34 + S1Z: the fresh-enumeration clean slate, explicit and unconditional —
+        // [usb41] PA34 + S1Z: the fresh-enumeration clean slate, explicit and unconditional —
         // a post-cycle device gets its two-strike allowance back, and this bring-up's fold latch
         // starts unlit. (`bot_rescue_clear` can no longer be the home of these: its streak clear
         // is conditioned on the fold marker, and at this point the marker still describes the
@@ -12673,7 +12673,7 @@ impl XhciController {
         space_add(SP_INQ, t_inq);
         let (vendor, product) = inq?;
         self.storage_set_note(slot, "READ CAPACITY");
-        // [piusb40] witness 2 — the post-wedge pipe control. Witness 1 says whether the reply bytes
+        // [usb40] witness 2 — the post-wedge pipe control. Witness 1 says whether the reply bytes
         // reached DRAM; it says nothing about whether the bulk pipes are still alive afterwards,
         // and "0x25 specifically is cursed" and "the transport died" predict the same silence.
         // INQUIRY is the right probe precisely because it is the command that provably completed on
@@ -12701,14 +12701,14 @@ impl XhciController {
                     Err(_) => "Err(other)",
                 };
                 serial_println!(
-                    ":: PIUSB: [piusb40] post-wedge INQUIRY control — result={} — {} ::",
+                    ":: PIUSB: [usb40] post-wedge INQUIRY control — result={} — {} ::",
                     ctl_s,
                     if ctl.is_ok() {
                         "the bulk pipes still complete a full CBW/data/CSW round-trip AFTER the wedge: the failure is specific to the READ CAPACITY transaction, not a dead pipe"
                     } else {
                         "the pipes are dead from the wedge onward: whatever wedged 0x25 took the transport with it"
                     });
-                // [piusb41] PA36: the widened port-cycle trigger. PA36 arrived with the reader
+                // [usb41] PA36: the widened port-cycle trigger. PA36 arrived with the reader
                 // ALREADY stuck from power-on: bring-up saw ONE fold, then the next reply came
                 // phase-shifted and the geometry clamp rejected it — bring-up exited here and the
                 // two-fold streak trigger above never fired, leaving the stuck reader stuck for
@@ -12727,10 +12727,10 @@ impl XhciController {
                 if geom && core::mem::take(&mut self.bot_fold_seen) {
                     BOT_FOLD_STREAK.store(0, Ordering::Relaxed);
                     serial_println!(
-                        ":: BOT: [piusb41] fold + geometry-clamp reject on one bring-up — the widened stuck signature (PA36: a power-on-stuck reader folds once, then feeds the clamp garbage and exits before streak=2) — escalating to port power-cycle ::");
+                        ":: BOT: [usb41] fold + geometry-clamp reject on one bring-up — the widened stuck signature (PA36: a power-on-stuck reader folds once, then feeds the clamp garbage and exits before streak=2) — escalating to port power-cycle ::");
                     let cycled = self.rescue_port_cycle(slot);
                     serial_println!(
-                        ":: BOT: [piusb41] port power-cycle result={} — {} ::",
+                        ":: BOT: [usb41] port power-cycle result={} — {} ::",
                         cycled,
                         if cycled { "device re-enumerates cold; bring-up re-runs on the fresh slot" }
                         else { "cycle refused/failed — the surrender path owns what remains" });
@@ -12819,7 +12819,7 @@ impl XhciController {
     /// different readers of the same reply.
     ///
     /// `bot_geom_reject` / `bot_fold_seen` are snapshotted and restored around the loop. They are
-    /// BRING-UP evidence — `[piusb41]`'s widened port-cycle trigger reads them — and an extra unit's
+    /// BRING-UP evidence — `[usb41]`'s widened port-cycle trigger reads them — and an extra unit's
     /// reply must neither manufacture that signature nor erase one the primary's bring-up left.
     ///
     /// A unit that fails here is NAMED and SKIPPED: one bad card in slot 3 of a reader is not a
@@ -13142,7 +13142,7 @@ impl XhciController {
             let in_window = databuf >= RC_INBOUND_BASE && databuf < RC_INBOUND_BASE + RC_INBOUND_SIZE;
             let below_3g = databuf < VL805_DMA_CEILING;
             serial_println!(
-                ":: PIUSB: [piusb35] databuf phys={:#x} in_trb={:#x} cbw={:#x} csw={:#x} | rc-inbound=[{:#x},{:#x}) offset=0 (1:1) | databuf in_window={} below_3G={} — CBW(DMA-read)+CSW(DMA-write→Passed) share this pool; address theory {} ::",
+                ":: PIUSB: [usb35] databuf phys={:#x} in_trb={:#x} cbw={:#x} csw={:#x} | rc-inbound=[{:#x},{:#x}) offset=0 (1:1) | databuf in_window={} below_3G={} — CBW(DMA-read)+CSW(DMA-write→Passed) share this pool; address theory {} ::",
                 databuf, in_trb, cbw, csw,
                 RC_INBOUND_BASE, RC_INBOUND_BASE + RC_INBOUND_SIZE,
                 in_window, below_3g,
@@ -13197,13 +13197,13 @@ impl XhciController {
                                 None => (0, 0, 0),
                             };
                             serial_println!(
-                                ":: PIUSB: [piusb25] storage enumerated: slot {} bulk_in={:#04x} bulk_out={:#04x} block_size={} num_blocks={} ({} MiB) ::",
+                                ":: PIUSB: [usb25] storage enumerated: slot {} bulk_in={:#04x} bulk_out={:#04x} block_size={} num_blocks={} ({} MiB) ::",
                                 slot,
                                 self.slots[slot as usize].bulk_in_ep,
                                 self.slots[slot as usize].bulk_out_ep,
                                 bs, nb, mib);
                             serial_println!(
-                                ":: PIUSB: [piusb25] READ(10) LBA0 CSW={:?} residue={} — first 16 bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                                ":: PIUSB: [usb25] READ(10) LBA0 CSW={:?} residue={} — first 16 bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
                                 res.status, res.residue,
                                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                                 data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]);
@@ -13216,7 +13216,7 @@ impl XhciController {
                                      else if fat16 { "FAT12/16 BPB" }
                                      else { "unrecognized/raw" };
                             serial_println!(
-                                ":: PIUSB: [piusb25] boot-sector sanity: 0x55AA={} type={} ::",
+                                ":: PIUSB: [usb25] boot-sector sanity: 0x55AA={} type={} ::",
                                 boot_sig, fs);
                         }
                     }
@@ -13231,7 +13231,7 @@ impl XhciController {
                         unsafe {
                             let d = core::slice::from_raw_parts(p as *const u8, 16);
                             serial_println!(
-                                ":: PIUSB: [piusb34] LBA0 re-read post-invalidate: CSW={:?} residue={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                                ":: PIUSB: [usb34] LBA0 re-read post-invalidate: CSW={:?} residue={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
                                 re.status, re.residue,
                                 d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
                                 d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
@@ -14771,7 +14771,7 @@ impl XhciController {
                     "xHCI: HUB slot {} port {} connect ignored (hub at max USB tier depth {}).",
                     hub_slot, port, hub_depth);
             } else {
-                // [piusb41] PA38: a hub COALESCES change bits. If a downstream device drops and
+                // [usb41] PA38: a hub COALESCES change bits. If a downstream device drops and
                 // comes back between two status polls, the only thing left latched is
                 // C_PORT_CONNECTION with CCS=1 — this branch — and the disconnect half (M3 below)
                 // is never serviced. Enumerating straight through would leave the PREDECESSOR slot
@@ -14899,7 +14899,7 @@ impl XhciController {
             // must leave the block registry too, or the installer keeps listing it. Slot-id matched,
             // so only the slot that actually published geometry is retracted.
             crate::drivers::block::unpublish_usb_geometry(i as u8, crate::drivers::block::usb_publish_gen());
-            // [piusb41] PA38: mirror the root-port teardown — a slot that leaves takes its BOT
+            // [usb41] PA38: mirror the root-port teardown — a slot that leaves takes its BOT
             // escalation state with it. Without this, a surrendered hub-downstream disk's slot id
             // stayed marked after teardown, so the next device the controller handed that id would
             // have every transfer refused up front, and the id would go on reading as "surrendered"
@@ -15172,7 +15172,7 @@ impl XhciController {
             self.dispose_downstream_slot(slot_id as u8);
             return;
         }
-        // [piusb41] Record the IMMEDIATE parent (hub slot + hub downstream port) the moment the slot
+        // [usb41] Record the IMMEDIATE parent (hub slot + hub downstream port) the moment the slot
         // exists. This is the ONE place a downstream slot is born, and the pair is not recoverable
         // afterwards (route_string carries nibbles, not slot ids), so the rescue ladder's hub-port
         // power-cycle rung would otherwise have nothing exact to aim a class request at.
@@ -15547,7 +15547,7 @@ impl XhciController {
             // through, which also prevents a learn/retry loop.
             if JB10_FS_EVAL_CTX && speed == 1 && !self.fs_ep0_mps64[(port as usize) & 31] {
                 serial_println!(
-                    "xHCI: [tegra fs-mps] slot {} (FS port {}): learning MPS0 before full descriptor.",
+                    "xHCI: [usb fs-mps] slot {} (FS port {}): learning MPS0 before full descriptor.",
                     slot_id, port);
                 self.enum_cmd_phys = 0;
                 self.set_enum_stage("fs-mps-learn");
@@ -15568,20 +15568,20 @@ impl XhciController {
         // Phase 1: read the first 8 descriptor bytes at MPS0=8 — a single packet, no babble.
         if self.sync_control(slot_id, 0x80, 0x06, 0x0100, 0, 8, buf, true).is_err() {
             serial_println!(
-                "xHCI: [tegra fs-mps] slot {} 8-byte dev-desc failed; falling back to babble-recover.",
+                "xHCI: [usb fs-mps] slot {} 8-byte dev-desc failed; falling back to babble-recover.",
                 slot_id);
             self.fs_ep0_mps64[(port as usize) & 31] = true;
             self.recover_enumeration("fs-mps-8byte-failed", 0);
             return;
         }
         let mps0 = unsafe { *(buf as *const u8).add(7) }; // bMaxPacketSize0
-        serial_println!("xHCI: [tegra fs-mps] slot {} bMaxPacketSize0 = {}", slot_id, mps0);
+        serial_println!("xHCI: [usb fs-mps] slot {} bMaxPacketSize0 = {}", slot_id, mps0);
         // Phase 2: if it exceeds the guessed 8, patch EP0 MPS0 in place via Evaluate Context.
         // Only the legal FS values are accepted; anything else falls back rather than program junk.
         if mps0 > 8 {
             if mps0 != 16 && mps0 != 32 && mps0 != 64 {
                 serial_println!(
-                    "xHCI: [tegra fs-mps] slot {} illegal bMaxPacketSize0 {}; falling back.",
+                    "xHCI: [usb fs-mps] slot {} illegal bMaxPacketSize0 {}; falling back.",
                     slot_id, mps0);
                 self.fs_ep0_mps64[(port as usize) & 31] = true;
                 self.recover_enumeration("fs-mps-illegal", 0);
@@ -15638,11 +15638,11 @@ impl XhciController {
         };
         match self.run_command_sync(trb) {
             Ok((1, _)) => {
-                serial_println!("xHCI: [tegra fs-mps] slot {} EP0 MPS0 -> {} (Evaluate Context OK)", slot_id, mps0);
+                serial_println!("xHCI: [usb fs-mps] slot {} EP0 MPS0 -> {} (Evaluate Context OK)", slot_id, mps0);
                 true
             }
-            Ok((c, _)) => { serial_println!("xHCI: [tegra fs-mps] slot {} Evaluate Context code {}", slot_id, c); false }
-            Err(_) => { serial_println!("xHCI: [tegra fs-mps] slot {} Evaluate Context timed out", slot_id); false }
+            Ok((c, _)) => { serial_println!("xHCI: [usb fs-mps] slot {} Evaluate Context code {}", slot_id, c); false }
+            Err(_) => { serial_println!("xHCI: [usb fs-mps] slot {} Evaluate Context timed out", slot_id); false }
         }
     }
 
@@ -15939,7 +15939,7 @@ impl XhciController {
     }
 
     /// PIUSB-39 witness — one bounded line naming which population moved:
-    /// `[piusb39] mouse rearm=<n> discarded=<n> errrearm=<n> (<tag>)`. `tag` is `poll` (a normal
+    /// `[usb39] mouse rearm=<n> discarded=<n> errrearm=<n> (<tag>)`. `tag` is `poll` (a normal
     /// armed read), `guard` (the dup-Success guard discarded a completion and re-armed anyway) or
     /// `halt` (a halted endpoint was un-halted and re-armed). Split counters because the three are
     /// different populations: only `discarded` proves the guard's pipeline-preserving exit fired.
@@ -15956,7 +15956,7 @@ impl XhciController {
             if last != 0 && now.wrapping_sub(last) < 250 { return; }
             LAST_MS.store(now.max(1), Ordering::Relaxed);
             serial_println!(
-                "[piusb39] mouse rearm={} discarded={} errrearm={} ({})",
+                "[usb39] mouse rearm={} discarded={} errrearm={} ({})",
                 MOUSE_REARM_COUNT.load(Ordering::Relaxed),
                 MOUSE_DISCARD_REARM_COUNT.load(Ordering::Relaxed),
                 MOUSE_ERROR_REARM_COUNT.load(Ordering::Relaxed),
@@ -16014,7 +16014,7 @@ impl XhciController {
             }
             let dci: u32 = ((ep_addr as u32) & 0x0F) * 2 + if (ep_addr & 0x80) != 0 { 1 } else { 0 };
             serial_println!(
-                "xHCI: [piusb39] un-halting {} interrupt-IN slot {} ep {:#04x} (dci {})",
+                "xHCI: [usb39] un-halting {} interrupt-IN slot {} ep {:#04x} (dci {})",
                 if is_mouse { "pointer" } else { "keyboard" }, slot, ep_addr, dci);
 
             // 1) Reset Endpoint: Halted -> Stopped.
@@ -16022,7 +16022,7 @@ impl XhciController {
                 control: (14 << 10) | (dci << 16) | ((slot as u32) << 24) };
             match self.run_command_sync(reset_trb) {
                 Ok((1, _)) => {}
-                other => serial_println!("xHCI: [piusb39] Reset Endpoint unexpected {:?}", other),
+                other => serial_println!("xHCI: [usb39] Reset Endpoint unexpected {:?}", other),
             }
             // 2) Set TR Dequeue Pointer to the ring's current enqueue slot (past the faulted TRB).
             if let Some((phys, dcs)) = deq {
@@ -16030,13 +16030,13 @@ impl XhciController {
                     control: (16 << 10) | (dci << 16) | ((slot as u32) << 24) };
                 match self.run_command_sync(deq_trb) {
                     Ok((1, _)) => {}
-                    other => serial_println!("xHCI: [piusb39] Set TR Dequeue unexpected {:?}", other),
+                    other => serial_println!("xHCI: [usb39] Set TR Dequeue unexpected {:?}", other),
                 }
             }
             // 3) Device-side CLEAR_FEATURE(ENDPOINT_HALT); wIndex = full endpoint address.
             match self.sync_control(slot, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false) {
                 Ok(1) => {}
-                other => serial_println!("xHCI: [piusb39] CLEAR_FEATURE(HALT) unexpected {:?}", other),
+                other => serial_println!("xHCI: [usb39] CLEAR_FEATURE(HALT) unexpected {:?}", other),
             }
             // 4) The host ring dequeue moved; the old expectation is stale. Clear it so the first
             //    completion after recovery is accepted, then arm the read.

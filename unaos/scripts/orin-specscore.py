@@ -112,7 +112,7 @@ MAX_BRANCHES = 64      # alternation expansion bound
 # A cover must account for MOST of the run, not merely ANCHOR_MIN of it.  An
 # absolute floor lets a 33-character run be "covered" by 15 characters of generic
 # chunk and field credit borrowed from an unrelated emitter -- which is how
-# `[wedge4] preempt-in-section core=` found a home in `:: PIUSB: [piusb40]
+# `[wedge4] preempt-in-section core=` found a home in `:: PIUSB: [usb40]
 # readcap-wedge — err={:?} data=[...]`.  Half the run is the threshold.
 MIN_COVER_FRAC = 0.5
 

@@ -3108,7 +3108,7 @@ orinladder = ["orinconwin", "orinclick", "orindesk"]
 # file (file-tail block; the call site is appended to an existing line), and the jetson image is
 # byte-identical to baseline. The ARMED polarity is type-checked by the `arm-tegra-furn` leg of
 # KERNEL_CFG_MATRIX, never by the knob mapping. UNFLOWN — no Orin has booted it.
-# Witness on the wire: `[orinfurn] floors`, `[orinfurn] ARMED`, `[orinfurn] REFUSE`.
+# Witness on the wire: `[deskfurn] floors`, `[deskfurn] ARMED`, `[deskfurn] REFUSE`.
 # See docs/dev/OS/08_VIDEO/orin-desktop.md §3.12.
 orinfurn = ["desktop_firmware", "orinclick"]
 
@@ -3161,7 +3161,7 @@ orinrender = ["desktop_firmware", "tegra_el0"]
 # `tile=2/3`: the file manager was never compiled into the image, not declined by it. `activate=false`
 # in `[deskcascade] -> CASCADED` is the RETURN VALUE (`activate()` answers `routed` only under
 # `livecon`, `false` otherwise — `video/desktop_firmware.rs` tail), NOT "activate was skipped"; the
-# `[pidesk] desktop-clear / activate / menubar ENABLED / crystal LIVE / pulse-window ARMED` run in
+# `[deskfw] desktop-clear / activate / menubar ENABLED / crystal LIVE / pulse-window ARMED` run in
 # render6-boot2.log:421..485 is that same call reaching its last step.
 #
 # So: a knob whose own doc says it gives the Orin "the NORMAL desktop the Pi has" must carry the Pi's
@@ -3211,8 +3211,8 @@ deskcascade = ["desktop_firmware", "tegra_el0", "quarry", "facet"] # ORIN-FACET:
 # same-line append to `fbcon::init`'s existing `});`, so no line moves in a file compiled into the
 # knob-off `kernel8.img` whose byte-identity is the Pi track's standing proof.
 #
-# UNFLOWN — no Orin has booted it. Witness on the wire: `[orinface] ARMED`, `[orinface] DECLINE`,
-# `[orinface] MISMATCH`. Kept in sync with arroyo.
+# UNFLOWN — no Orin has booted it. Witness on the wire: `[conface] ARMED`, `[conface] DECLINE`,
+# `[conface] MISMATCH`. Kept in sync with arroyo.
 orinface = []
 # ORIN-DEFER (FBCONPAR item 2): UNAOS_ORINDEFER=1 — port x86's PANEL-DEFER split layout/paint path
 # to the aarch64 console.
@@ -3245,7 +3245,7 @@ orinface = []
 # been, the four counters and the census wrapper vanish, and the jetson AND pi images are
 # byte-identical to baseline. Every wire-in is a same-line fold, so no panic `Location` moves.
 #
-# UNFLOWN — no Orin has booted it. Witness on the wire: `[orindefer] census … -> DEFERRED` /
+# UNFLOWN — no Orin has booted it. Witness on the wire: `[condefer] census … -> DEFERRED` /
 # `-> CLASSIC-ONLY` / `-> LEDGER-MISMATCH`. Kept in sync with arroyo.
 orindefer = []
 # SERIALRX (ORINRX): UNAOS_ORINRX=1 — the Orin's serial console can RECEIVE. Today the Orin is

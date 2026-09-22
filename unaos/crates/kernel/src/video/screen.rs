@@ -2458,7 +2458,7 @@ pub fn present_surface(surf: *const u8, w: u32, h: u32, stride: u32) {
 // (`main.rs::orin_render_service`) presents at most once per pass and only when something set
 // `dirty`. On the cascaded scene its two sources of `dirty` both go permanently false — `passes == 1`
 // fires once and `ui_status::tick` is masked out by `desktop_scene_owns_backdrop()` — so the
-// render11 capture reads `[orinrender] census passes=13998251 presents=1`: ONE desktop present in a
+// render11 capture reads `[render] census passes=13998251 presents=1`: ONE desktop present in a
 // 466-second boot.
 //
 // [`Screen::flush`] is the only consumer of BOTH deferred queues in this subsystem: it drains

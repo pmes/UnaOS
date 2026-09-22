@@ -50,7 +50,7 @@
 ###
 ### 2026-09-07 (orin 20, EVQPRINT): a `[ptrpoll]` line is added at the foot, and it is the
 ### SECOND rewritten line in this file, for the same reason as the JD2/JD4 pair. The tail
-### block is a BOOT A shape and carries `[orinfurn] arm click=1`, so `orinclick` is armed
+### block is a BOOT A shape and carries `[deskfurn] arm click=1`, so `orinclick` is armed
 ### and a real capture of this shape WOULD carry `[ptrpoll]` — this file simply predated
 ### the row. The text is NOT harvested wire: it is the byte-for-byte output of
 ### `ptrpoll_witness`'s CURRENT format string (arch/aarch64/display_tegra.rs), obtained by
@@ -89,11 +89,11 @@
 [el0live] verdict=EXTINCT el0 runnable/parked/committed=0/0/0 last_disp=668ms last_wake=-- stall>=2000ms | reaped exit=1 kill_oncpu=0 kill_offcpu=0 corrupt=0 nopark=0 | totals el0_disp=1
 [spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=843 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
 [prio] svc=0 el0=1 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=1)
-[orinfurn] arm click=1 conwin=1 desk=1
+[deskfurn] arm click=1 conwin=1 desk=1
 [orinconwin] gate panel=1920x1200x32
 [orinconwin] win=1 panel=1920x1200 cell=8x16 stage=1 table=1 present=Composited route=true live=LIVE -> ROUTED
 :: tegra: JD4 — console OWNS the panel (Screen back buffer live); path=jd2-console-pump; screen-on-boot (no key, ~8 s) ::
 [orinrast] census seq=1 t=120 post=1 late=0 console-owns=1 conwin=1 pidesk=0 final=1 -> RAST-SUPERSEDED-BY-CONSOLE
-[orinstkdepth] depth-consumed=3184 bytes anchor-sp=0xffff000040200000 seam-sp=0xffff0000401ff390 at=orinfurn-arm chain=kernel_main->tegra_early_stop->tegra_desk_furn -> DEPTH-CONSUMED
+[stkdepth] depth-consumed=3184 bytes anchor-sp=0xffff000040200000 seam-sp=0xffff0000401ff390 at=orinfurn-arm chain=kernel_main->tegra_early_stop->tegra_desk_furn -> DEPTH-CONSUMED
 :: tegra: JD2 — OUT | JD2: interactive shell on the inherited scanout. Type 'help'. ::
 [ptrpoll] t=71 rearm=3 discard=0 errrearm=0 dup=0 nobuf=0 reports=3 base=3 decoded=0 folded=0 foldnew=0 -> BASELINE (the enumeration arms; every later line is measured against this one)

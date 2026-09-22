@@ -319,7 +319,7 @@ piusb|early/bringup_inner (P38 context, right before the first RC read)|-|measur
 genet|SKIP (no reply — pre-cable / no DHCP is the honest pre-metal state)|baremetal|measured(1)
 nettest|:: NET20-GATE: mdns host-name publish battery|baremetal|measured(1)
 pirast|:: PI-RAST: no mailbox framebuffer (headless boot) — cube demo skipped ::|-|measured(1)
-desktop_firmware|[pidesk] activate DECLINE reason=no-panel|-|measured(1)
+desktop_firmware|[deskfw] activate DECLINE reason=no-panel|-|measured(1)
 quarry|[quarry] DECLINE reason=dock-cannot-host-full-strip panel=|-|measured(1)
 wedge2|-|no gated string literal anywhere under cfg(feature="wedge2") — the knob only re-times an existing path; certify it from its serial witness, not from the artifact|unmeasured-here
 TABLE

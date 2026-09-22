@@ -1,0 +1,321 @@
+════════════ MBENCH VERDICT — jetson-sync1.spec vs /home/pmes/unaos-bench/scratch/rmbp-0915/neutral-logs/base-spec/jetson-sync1-green.capture ════════════
+  ✅ COMPLETE   JD2: interactive shell on the inherited scanout
+       end-of-run marker SEEN @ line 98 — the run got past this point
+  ✅ REQUIRE    JD1.*scanout:.*sane=true
+       1 hit(s), first @ line 72
+  ✅ REQUIRE    JD1.*panel LIVE
+       1 hit(s), first @ line 73
+  ✅ REQUIRE    JB1b.*MRQ_PING.*-> PASS
+       1 hit(s), first @ line 69
+  ✅ REQUIRE    JB0.*fan ON.*-> PASS
+       1 hit(s), first @ line 68
+  ✅ REQUIRE    JB1c.*XUSB ALIVE.*-> PASS
+       1 hit(s), first @ line 70
+  ✅ REQUIRE    JB2b.*keyboard ARMED.*-> PASS
+       1 hit(s), first @ line 71
+  ✅ REQUIRE    JD3.*mass storage ready
+       1 hit(s), first @ line 74
+  ✅ REQUIRE    JD2.*console pump live
+       1 hit(s), first @ line 87
+  ✅ REQUIRE    JD4.*console OWNS the panel
+       1 hit(s), first @ line 95
+  ✅ REQUIRE    (CAPSTONE COMPLETE|\[orinbsprun\] boot core [0-9]+ joins run\(\))
+       4 hit(s), first @ line 24
+  ✅ REQUIRE    TEGRA-EL0.*el0-hello round-trip -> PASS
+       1 hit(s), first @ line 82
+  ✅ REQUIRE    SCHED: task 'el0-hello' -> core [0-9]+ \(policy: (load-balanced|caller-pinned) EL0 residents=[0-9]+, no-migrate\)
+       1 hit(s), first @ line 80
+  ❌ REQUIRE    TEGRA-EL0: el0-hello spawned at EL0 \(placement=(auto|boot-core) core=-?[0-9]+ tid=[0-9]+\)
+       0 hits — MISSING (pinned at jetson-sync1.spec:675)
+  ✅ REQUIRE    \[el0core\] rollup: el0refuse=[0-9]+ el1cores=0x[0-9a-f]+
+       1 hit(s), first @ line 85
+  ✅ REQUIRE    \[el0core\] el1 core MEASURED: cpu=[0-9]+ mask=0x[0-9a-f]+
+       1 hit(s), first @ line 83
+  ✅ REQUIRE    SCHED: load c0=(--|[0-9]+%)/f=
+       1 hit(s), first @ line 86
+  ✅ REQUIRE    IRQEL-RT: first IRQ taken at EL1 on cpu [0-9]+
+       1 hit(s), first @ line 75
+  ✅ REQUIRE    IRQEL-RT: EL1 one-shot proof
+       2 hit(s), first @ line 76
+  ✅ REQUIRE    \[orinbsptick\] arming PERIODIC CNTP at EL[0-9]+ on cpu [0-9]+
+       1 hit(s), first @ line 78
+  ✅ REQUIRE    \[orinbsprun\] boot core [0-9]+ joins run\(\)
+       1 hit(s), first @ line 84
+  ✅ REQUIRE    dispatch is on_tick \+ post-EOI timer_preempt
+       1 hit(s), first @ line 78
+  ✅ REQUIRE    \[spread4\] live c0=[0-9]+/[0-9]+
+       1 hit(s), first @ line 90
+  ❌ REQUIRE    \[spread4\] live c0=[0-9]+/[0-9]+ .* c5=[0-9]+/[0-9]+
+       0 hits — MISSING (pinned at jetson-sync1.spec:1784)
+  ✅ REQUIRE    \[el0live\] verdict=[A-Z]+ el0 runnable/parked/committed=
+       1 hit(s), first @ line 89
+  ❌ REQUIRE    \[el0live\] verdict=[A-Z]+ .* el0cpus=0x([2-9a-f]|[0-9a-f]{2,})
+       0 hits — MISSING (pinned at jetson-sync1.spec:1814)
+  ✅ REQUIRE    \[prio\] svc=[0-9]+ el0=[0-9]+ defer=[0-9]+ agedin=[0-9]+ /win
+       1 hit(s), first @ line 91
+  ✅ COUNT>=2   \[orinbsptick\] tick [0-9]+ taken at EL[0-9]+ on cpu [0-9]+
+       2 hit(s), first @ line 79
+  ⏳ PENDING    TEGRA-SD.*block backend published
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \bwindow_len=4096\b
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \bmatches=1\b
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \bfiles=1\b
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[vfs\] volume mounted /volumes/
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[vfs\] unafs volume on .*not mounted
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[vfs\] root mount / = native unafs volume
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[vfs\] boot mount /boot = fat boot volume
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[vfs\] apps mount /apps = fat boot volume
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \bunafs=present\b
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    PART: mbr handle=tegra-sd slot=2 type=0x7f boot=0x[0-9a-f]{2} start=262144 count=1048576 end=1310720 ACCEPT
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    part=\[262144\.\.1310720\) span_base=262144 span_blocks=131072 fits=yes magic=ok
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[orinwm1\] win=[0-9]+ panel=[0-9]+x[0-9]+ surf=[0-9]+x[0-9]+
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[orinclick\] arm panel=[0-9]+x[0-9]+ rows=[0-9]+
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[orinclick\] census seq=[0-9]+ t=[0-9]+ up=[0-9]+s btn=[0-9]+
+       0 hits — awaiting metal/code (never fails)
+  ✅ PENDING    \[ptrpoll\] t=[0-9]+ rearm=[0-9]+
+       1 hit(s), first @ line 99 — MATCHED: consider promoting to REQUIRE
+  ✅ PENDING    \[ptrpoll\] .*decoded=[0-9]+ folded=[0-9]+ foldnew=[0-9]+ ->
+       1 hit(s), first @ line 99 — MATCHED: consider promoting to REQUIRE
+  ⏳ PENDING    JD1-DC VERDICT=
+       0 hits — awaiting metal/code (never fails)
+  ✅ PENDING    \[orinconwin\] gate panel=[0-9]+x[0-9]+x[0-9]+
+       1 hit(s), first @ line 93 — MATCHED: consider promoting to REQUIRE
+  ✅ PENDING    \[orinconwin\] win=[0-9]+ panel=[0-9]+x[0-9]+ cell=[0-9]+x[0-9]+
+       1 hit(s), first @ line 94 — MATCHED: consider promoting to REQUIRE
+  ⏳ PENDING    ORIN-NET-4 DONE
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[net4F\] RX ring pass verdict:
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[orinwdt\] wdt ARMED
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[orinwdt\] wdt DISARMED
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[orinselfup\] S0 scan
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[net4G\] latch-site status:
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[supstate\] lift gen=[0-9]+ screen\+console module-owned
+       0 hits — awaiting metal/code (never fails)
+  ⏳ PENDING    \[supstate\] roles input=jd2-console presenter=jd2-present dispatcher=jd2-dispatch core=0
+       0 hits — awaiting metal/code (never fails)
+  ✅ PENDING    \[orinfurn\] arm click=[0-9]+ conwin=[0-9]+ desk=[0-9]+
+       1 hit(s), first @ line 92 — MATCHED: consider promoting to REQUIRE
+  ✅ PENDING    \[orinstkdepth\] depth-consumed=[0-9]+ bytes
+       1 hit(s), first @ line 97 — MATCHED: consider promoting to REQUIRE
+  ✅ PENDING    \[orinrast\] census seq=[0-9]+ t=[0-9]+ post=
+       1 hit(s), first @ line 96 — MATCHED: consider promoting to REQUIRE
+  ◦ OPTIONAL   SCHED: EL0 placement REFUSED \([a-z]+\) '[^']*' req=-?[0-9]+
+       0 hits (informational)
+  ◦ OPTIONAL   \[el0core\] NOT stamped:
+       0 hits (informational)
+  ◦ OPTIONAL   \[pulse5\] live c0=[0-9]+ms
+       0 hits (informational)
+  ◦ OPTIONAL   !NOFOLD
+       0 hits (informational)
+  ◦ OPTIONAL   IRQEL-RT: one-shot proof IRQ taken at EL[0-9]+ on cpu [0-9]+ \(the ARMING core\)
+       0 hits (informational)
+  ◦ OPTIONAL   IRQEL-RT: EL1 one-shot NOT delivered in ~100 ms
+       0 hits (informational)
+  ◦ OPTIONAL   \[irqel2a\] \S+ cpu=[0-9]+ CurrentEL=[0-9]+
+       0 hits (informational)
+  ◦ OPTIONAL   \[irqel2b\] \S+ SKIPPED
+       0 hits (informational)
+  ◦ OPTIONAL   ^:P:
+       0 hits (informational)
+  ◦ OPTIONAL   :R[0-9]+:
+       0 hits (informational)
+  ◦ OPTIONAL   :A:
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinwm1\] win=.* -> COMPOSITED
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinwm1\] win=.* -> PRESENT-DECLINED
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinwm1\] DECLINE reason=
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinclick\] edge=(press|release|none) btn=0x[0-9a-f]+
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinclick\] census .* -> ROUTING
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinclick\] census .* -> IDLE-NO-CLICKS
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinclick\] .* -> DECLINE reason=
+       0 hits (informational)
+  ◦ OPTIONAL   JD1-DC VERDICT=REACHABLE
+       0 hits (informational)
+  ◦ OPTIONAL   JD1-DC VERDICT=DECODES-NOMATCH
+       0 hits (informational)
+  ◦ OPTIONAL   JD1-DC VERDICT=NOT-DECODING
+       0 hits (informational)
+  ◦ OPTIONAL   JD1-DC VERDICT=REFUSED reason=[a-z-]+
+       0 hits (informational)
+  ◦ OPTIONAL   FIRST TOUCH of a new MMIO class: about to read
+       0 hits (informational)
+  ◦ OPTIONAL   FIRST READ SURVIVED:
+       0 hits (informational)
+  ◦ OPTIONAL   JD1-DC-MODEL MODEL-VERDICT=NVDISPLAY-CLASS-[0-9A-F]{4}
+       0 hits (informational)
+  ◦ OPTIONAL   JD1-DC-MODEL MODEL-VERDICT=NVDISPLAY-CLASS-UNKNOWN-[0-9A-F]{4}
+       0 hits (informational)
+  ◦ OPTIONAL   JD1-DC-MODEL MODEL-VERDICT=DECODES-NOT-NVDISPLAY
+       0 hits (informational)
+  ◦ OPTIONAL   JD1-DC-MODEL MODEL-VERDICT=NOT-DECODING
+       0 hits (informational)
+  ◦ OPTIONAL   JD1-DC-MODEL MODEL-VERDICT=DISCRIMINATOR-TRIVIAL
+       0 hits (informational)
+  ◦ OPTIONAL   JD1-DC-MODEL MODEL-VERDICT=UNDETERMINED reason=discriminator-not-read
+       0 hits (informational)
+  ◦ OPTIONAL   JD1-DC-MODEL MODEL-VERDICT=REFUSED reason=no-reads
+       0 hits (informational)
+  ◦ OPTIONAL   JD1-DC-REG
+       0 hits (informational)
+  ◦ OPTIONAL   JD1-DC-IDS
+       0 hits (informational)
+  ◦ OPTIONAL   CAP CROSS-CHECK
+       0 hits (informational)
+  ◦ OPTIONAL   \[redzone\] cpu=[0-9]+ LOW-REDZONE (entered|TRAVERSED) task=
+       0 hits (informational)
+  ◦ OPTIONAL   \[redzone\] cpu=[0-9]+ HIGH-GUARD entered task=
+       0 hits (informational)
+  ✅ OPTIONAL   \[orinconwin\] win=.* -> ROUTED
+       1 hit(s), first @ line 94
+  ◦ OPTIONAL   \[orinconwin\] win=.* -> PRESENT-DECLINED
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinconwin\].* DECLINE reason=
+       0 hits (informational)
+  ◦ OPTIONAL   \[net4F\] VERDICT tag-proven single-address latch
+       0 hits (informational)
+  ◦ OPTIONAL   \[net4F\] MAC chip id:
+       0 hits (informational)
+  ◦ OPTIONAL   \[net4V no-lease verdict\]
+       0 hits (informational)
+  ◦ OPTIONAL   \[pwrreboot\] reboot verb invoked
+       0 hits (informational)
+  ◦ OPTIONAL   \[pwrreboot\] PSCI SYSTEM_RESET \(0x[0-9a-f]+\) via SMC
+       0 hits (informational)
+  ◦ OPTIONAL   \[pwrreboot\] PSCI SYSTEM_RESET RETURNED
+       0 hits (informational)
+  ◦ OPTIONAL   \[pwrshutoff\] shutdown verb invoked
+       0 hits (informational)
+  ◦ OPTIONAL   \[pwrshutoff\] PSCI SYSTEM_OFF \(0x[0-9a-f]+\) via SMC
+       0 hits (informational)
+  ◦ OPTIONAL   \[pwrshutoff\] PSCI SYSTEM_OFF RETURNED
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinselfup\] S1 verify
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinselfup\] S2 parse
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinselfup\] S3 write
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinselfup\] S4 flip
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinselfup\] S5 clean
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinselfup\] S6 reboot
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinselfup\] UPDATE APPLIED
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinselfup\] UPDATE REFUSED
+       0 hits (informational)
+  ◦ OPTIONAL   \[net4G\] DECOY ARMED: victim slot [0-9]+
+       0 hits (informational)
+  ◦ OPTIONAL   \[net4G\] VERDICT latch-site=[A-Z-]+
+       0 hits (informational)
+  ◦ OPTIONAL   \[net4G\] arm ABORTED:
+       0 hits (informational)
+  ◦ OPTIONAL   \[net4G\] interim pop slot=[0-9]+
+       0 hits (informational)
+  ◦ OPTIONAL   \[spin1\] cpu=[0-9]+ span=[0-9]+ms task=[0-9]+:
+       0 hits (informational)
+  ◦ OPTIONAL   \[wedge4\] RQ STALL core=[0-9]+
+       0 hits (informational)
+  ◦ OPTIONAL   \[supstate\] lift gen=([2-9]|[1-9][0-9]+) screen\+console
+       0 hits (informational)
+  ◦ OPTIONAL   KEY ('.'|0x[0-9a-f]{2}) ::
+       0 hits (informational)
+  ✅ OPTIONAL   path=jd2-console-pump;
+       2 hit(s), first @ line 41
+  ◦ OPTIONAL   path=jd2-supstate-phase2;
+       0 hits (informational)
+  ✅ OPTIONAL   \[orinrast\] census .* console-owns=1
+       1 hit(s), first @ line 96
+  ✅ OPTIONAL   \[orinrast\] census .* -> RAST-SUPERSEDED-BY-CONSOLE
+       1 hit(s), first @ line 96
+  ◦ OPTIONAL   \[orinrast\] census .* -> RAST-NEVER-PAINTED
+       0 hits (informational)
+  ◦ OPTIONAL   \[orinrast\] census .* -> (RAST-LATE-UNREADABLE|RAST-LATE-BUDGET)
+       0 hits (informational)
+  ✅ FORBID*    -> FAIL
+       0 hits
+  ✅ FORBID*    FAIL ::
+       0 hits
+  ✅ FORBID*    PANIC
+       0 hits
+  ✅ FORBID*    -> FLICKER
+       0 hits
+  ✅ FORBID     recon (SKIPPED|REFUSED|STOPPED at M3|done at M2)
+       0 hits
+  ✅ FORBID     TEGRA-SD: REFUSED to publish
+       0 hits
+  ✅ FORBID     span_blocks=2048 fits=
+       0 hits
+  ✅ FORBID     unafs span check .*fits=NO
+       0 hits
+  ✅ FORBID     unafs span check .*magic=MISSING
+       0 hits
+  ✅ FORBID     TEGRA-UNAFS: mount on TegraSd FAILED
+       0 hits
+  ✅ FORBID     SCHED: EL0 entry REFUSED
+       0 hits
+  ✅ FORBID     \[ptrpoll\] .*decoded=[0-9]+ ->
+       0 hits
+  ✅ FORBID     \[spin6\] cpu=[0-9]+ REFUSING corrupt switch-in: task=
+       0 hits
+  ✅ FORBID     running the full M4 CAPSTONE cooperatively
+       0 hits
+  ✅ FORBID     dispatch is on_tick ONLY \(no timer_preempt arm
+       0 hits
+  ✅ FORBID     \[wedge4\] preempt-in-section core=[0-9]+
+       0 hits
+  ✅ FORBID     \[orinconwin\] win=.* live=FROZEN
+       0 hits
+  ✅ FORBID     console OWNS the panel \(Screen back buffer live\); first key
+       0 hits
+  ✅ FORBID     console OWNS the panel \(Screen back buffer live\); screen-on-boot
+       0 hits
+  ✅ FORBID     \[orinstkdepth\] DEPTH-UNAVAILABLE
+       0 hits
+  ✅ FORBID     \[orinrast\] census .* -> RAST-PAINTED-OVERWRITTEN
+       0 hits
+  ✅ FORBID     PANIC
+       0 hits
+  ✅ FORBID     AARCH64 EXCEPTION: SERROR
+       0 hits
+  ✅ FORBID     entry [0-9]+ \(SError\) ESR=
+       0 hits
+  ✅ FORBID     X200 FLAG
+       0 hits
+  ✅ FORBID     Exception reason=1 syndrome=0x82000010
+       0 hits
+  ✅ FORBID     \[wm\] winid-register REFUSED
+       0 hits
+  ─────
+  ❌ MBENCH FAIL — 24/27 required witnesses, 0 forbidden hit(s), 99 lines scanned, pending 7/32 matched [mode unknown: no run sidecar]
+       FIRST-SHORTFALL jetson-sync1.spec:675 REQUIRE TEGRA-EL0: el0-hello spawned at EL0 \(placement=(auto|boot-core) core=-?[0-9]+ tid=[0-9]+\)
+       (2 further pinned line(s) also short — full table above)
+       (the end-of-run marker was seen — the run completed, so a missing witness here is a GENUINE regression)
+  (* = default FORBID, always on)

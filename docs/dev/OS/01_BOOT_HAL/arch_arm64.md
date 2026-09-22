@@ -2321,7 +2321,7 @@ for the next attended bench. Item 4 is pure hygiene and needs no bench.
 > exact on silicon) → a **Low-Speed keyboard (slot 8, route 0x42, tier 2) `keyboard ARMED (root port
 > 6) -> PASS`**, and typing came through end-to-end (`KEY 'h' 'e' 'l' 'l' 'o'` at EL1) — so the LS-child
 > TT (DW2) programming is correct on hardware too. **Item 2 (FS Evaluate-Context):** the JB9 port-7
-> blocker cracked — `[tegra fs-mps] slot 10 (FS port 7) … bMaxPacketSize0 = 64 … EP0 MPS0 -> 64
+> blocker cracked — `[usb fs-mps] slot 10 (FS port 7) … bMaxPacketSize0 = 64 … EP0 MPS0 -> 64
 > (Evaluate Context OK)`: the strict Tegra FW **accepted** the in-place Evaluate Context (the
 > review-caught EP0-offset fix was right), so the FS device learns MPS0 and reads its descriptor
 > instead of going silent after the old teardown churn. **Item 4:** JB9 diagnostic suite silent
@@ -8272,7 +8272,7 @@ attended Pi sitting — see the rung-2 runbook in `scripts/pi-usb1-bench.md`.
 **Metal P39 (hw-pi4@3329bcfd) regression:** on real BCM2711 silicon the async task **stalled right
 after the DTB census line** — it printed the async-start, `PI-USB-1 bring-up starting`, and `DTB census:
 … proceeding to RC bring-up` witnesses, then produced nothing more; the controller was never published,
-`usb_pump` idled forever (`[piusb26] pump pass … idle controller` repeating), and keyboard/mouse never
+`usb_pump` idled forever (`[usb26] pump pass … idle controller` repeating), and keyboard/mouse never
 armed. Boot was otherwise healthy. The prior synchronous boot (P38, `45c…`) had working USB. Root cause:
 the RC/VL805 attach + the **VideoCore mailbox singleton** it drives (M2's `NOTIFY_XHCI_RESET`) plus
 `boot::map_device_1gib` are all metal-proven **only in the boot core's single-threaded, pre-GUI context**
@@ -11577,7 +11577,7 @@ ORIN-STKDEPTH takes two SP reads on one descending frame chain and subtracts the
 
 * the **anchor**, `tegra_stk_anchor()`, appended to `kernel_main`'s `bootpace::record("entry")`
   statement — `main.rs:88`, the earliest stable point on the chain;
-* the **seam** read, inside `tegra_desk_furn` beside its unconditional `[orinfurn] arm` line —
+* the **seam** read, inside `tegra_desk_furn` beside its unconditional `[deskfurn] arm` line —
   `main.rs:7896-7899`.
 
 The difference is the number of bytes of boot-core stack the chain
@@ -11592,8 +11592,8 @@ the anchor would sit one leaf frame lower and the number would shrink — so the
 ### Wire format
 
 ```
-[orinstkdepth] depth-consumed=<n> bytes anchor-sp=<hex> seam-sp=<hex> at=orinfurn-arm chain=kernel_main->tegra_early_stop->tegra_desk_furn -> DEPTH-CONSUMED
-[orinstkdepth] DEPTH-UNAVAILABLE anchor-sp=<hex> seam-sp=<hex> at=orinfurn-arm reason=<anchor-never-ran | anchor-below-seam>
+[stkdepth] depth-consumed=<n> bytes anchor-sp=<hex> seam-sp=<hex> at=orinfurn-arm chain=kernel_main->tegra_early_stop->tegra_desk_furn -> DEPTH-CONSUMED
+[stkdepth] DEPTH-UNAVAILABLE anchor-sp=<hex> seam-sp=<hex> at=orinfurn-arm reason=<anchor-never-ran | anchor-below-seam>
 ```
 
 `main.rs:7900-7912`. **Fails closed:** the guard is `stk_anchor != 0 && stk_anchor >= stk_here`, so
@@ -11639,7 +11639,7 @@ untouched.
 Verified at `81f304d2` (fold `405b21f6`), build and artifact only:
 
 * `./arroyo check` green both arches;
-* `[orinstkdepth] depth-consumed=` and `[orinstkdepth] DEPTH-UNAVAILABLE` each one-hit in the
+* `[stkdepth] depth-consumed=` and `[stkdepth] DEPTH-UNAVAILABLE` each one-hit in the
   `arm-tegra-furn` `kernel.elf` (`LC_ALL=C grep -a -o`). The leg is `arroyo:3226`.
 
 ⚠ **UNFLOWN — no depth number exists.** No Orin has booted an `orinfurn` image that reached the
@@ -11651,8 +11651,8 @@ hardware, and the `DEPTH-UNAVAILABLE` arm has never been observed firing either.
 `arm-tegra-furn` going green means this instrument compiles, not that it prints anything. The
 mitigation is SPECGATE (fold `0ea79938`, 2026-08-28), which scores a metal CAPTURE instead:
 `unaos/scripts/specs/jetson-sync1.spec:1571-1572` carries
-`PENDING \[orinstkdepth\] depth-consumed=[0-9]+ bytes` beside
-`FORBID \[orinstkdepth\] DEPTH-UNAVAILABLE`, read as a pair with the `[orinfurn] arm` PENDING at
+`PENDING \[stkdepth\] depth-consumed=[0-9]+ bytes` beside
+`FORBID \[stkdepth\] DEPTH-UNAVAILABLE`, read as a pair with the `[deskfurn] arm` PENDING at
 `:1565` so "did not fire" is distinguishable from "was not armed". Two notes the spec makes and
 this section endorses:
 

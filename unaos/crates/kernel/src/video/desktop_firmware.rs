@@ -82,7 +82,7 @@ static ACTIVATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 /// never be reported as installed by a caller reading a stale local.
 pub fn activate() -> bool {
     if ACTIVATED.swap(true, core::sync::atomic::Ordering::AcqRel) {
-        serial_println!("[pidesk] activate SKIP reason=already-active");
+        serial_println!("[deskfw] activate SKIP reason=already-active");
         return fbcon::console_is_routed();
     }
 
@@ -93,7 +93,7 @@ pub fn activate() -> bool {
         (i.width, i.height)
     };
     if pw == 0 || ph == 0 {
-        serial_println!("[pidesk] activate DECLINE reason=no-panel");
+        serial_println!("[deskfw] activate DECLINE reason=no-panel");
         return false;
     }
 
@@ -166,7 +166,7 @@ pub fn activate() -> bool {
         fb.flush_all();
     }
     serial_println!(
-        "[pidesk] desktop-clear panel={}x{} bg={:08X} (pre-desktop residue off the glass; the window table is empty at this line; the panel mirror is held from this line — DESKHOLD)",
+        "[deskfw] desktop-clear panel={}x{} bg={:08X} (pre-desktop residue off the glass; the window table is empty at this line; the panel mirror is held from this line — DESKHOLD)",
         pw,
         ph,
         wm::DESKTOP_BG
@@ -213,7 +213,7 @@ pub fn activate() -> bool {
     //     it always was. The fit itself is stated on the wire by `[deskcascade] fit … overlap_rows=`.
     super::pulsewin::arm();
     if face_cell.is_none() {
-        serial_println!("[pidesk] console-face DECLINE reason=console-not-ready (the console keeps font8x8)");
+        serial_println!("[deskfw] console-face DECLINE reason=console-not-ready (the console keeps font8x8)");
     }
 
     // 2-3. CONSOLEWIN — the dock must be able to host the worst-case strip, or the console gets no
@@ -242,7 +242,7 @@ pub fn activate() -> bool {
     //    console window, hence no minimise disc, hence nothing to strand.
     let cwin = if super::dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_none() {
         serial_println!(
-            "[pidesk] console-window DECLINE reason=dock-cannot-host-full-strip panel={}x{} rows={} \
+            "[deskfw] console-window DECLINE reason=dock-cannot-host-full-strip panel={}x{} rows={} \
              (the console's minimise disc would have no way back) — the bar is unaffected and follows",
             pw,
             ph,
@@ -259,7 +259,7 @@ pub fn activate() -> bool {
     let routed = fbcon::console_is_routed();
     if cwin == wm::WIN_NONE {
         serial_println!(
-            "[pidesk] console-window ABSENT — continuing to the bar (DESKHOLD: the boot log is serial-only from the desktop-clear, exactly as on an x86 `wc` desktop, and the handoff will detach as before)"
+            "[deskfw] console-window ABSENT — continuing to the bar (DESKHOLD: the boot log is serial-only from the desktop-clear, exactly as on an x86 `wc` desktop, and the handoff will detach as before)"
         );
     } else {
         // `routed=true` states that the glyph ROUTE is installed — every console line from here lands
@@ -271,7 +271,7 @@ pub fn activate() -> bool {
         // regression specs anchor on it. With LIVECON armed the window does NOT freeze, and the
         // correction is stated in its own `[desktop_firmware] livecon ARMED` line at the tail rather than by
         // rewording a string a passing spec matches on.
-        serial_println!("[pidesk] activate panel={}x{} console_win={} routed={} (the window freezes at the handoff detach that follows — x86's desktop lane does the same)", pw, ph, cwin, routed);
+        serial_println!("[deskfw] activate panel={}x{} console_win={} routed={} (the window freezes at the handoff detach that follows — x86's desktop lane does the same)", pw, ph, cwin, routed);
     }
 
     // 3b. FONT-WITNESS — **which face each text surface on this desktop actually drew with.**
@@ -293,7 +293,7 @@ pub fn activate() -> bool {
         None => ("font8x8", (0, 0)),
     };
     serial_println!(
-        "[pidesk] faces=title:{},menu:{},crystal:{},dock:{},console:{} chrome={}x{} body={}x{} bar={} ::",
+        "[deskfw] faces=title:{},menu:{},crystal:{},dock:{},console:{} chrome={}x{} body={}x{} bar={} ::",
         super::font::Face::Chrome.name(),
         super::font::Face::Chrome.name(),
         super::font::Face::Chrome.name(),
@@ -311,7 +311,7 @@ pub fn activate() -> bool {
     //    x86; a bar nothing enables is a bar the operator cannot see, however correct its geometry.
     let bar_was = menubar::set_enabled(true);
     serial_println!(
-        "[pidesk] menubar ENABLED panel={}x{} rect={:?} was={} (the desktop scene owns the top of the glass)",
+        "[deskfw] menubar ENABLED panel={}x{} rect={:?} was={} (the desktop scene owns the top of the glass)",
         pw,
         ph,
         menubar::strip_rect(pw, ph),
@@ -341,7 +341,7 @@ pub fn activate() -> bool {
         false
     };
     serial_println!(
-        "[pidesk] menubar PAINTED owns_pixels={} retried={} (composite at the enable seam, read back rather than assumed)",
+        "[deskfw] menubar PAINTED owns_pixels={} retried={} (composite at the enable seam, read back rather than assumed)",
         menubar::owns_pixels(),
         repainted
     );
@@ -353,7 +353,7 @@ pub fn activate() -> bool {
     // `strip::press_route` ahead of every window arm. Stated on the wire because "the bar is painted"
     // and "the bar is live" are two claims and a capture should not have to infer the second.
     serial_println!(
-        "[pidesk] crystal LIVE — press the crystal for the SHARD menu (About real; Sleep the ONE honest stub, no S3 suspend path; Restart and Shut Down psci_wired={} — where a secure monitor answers the smc they ACT, crystal::fire -> power::crystal_restart / power::crystal_shutdown = PSCI SYSTEM_RESET / SYSTEM_OFF, and where none does they print their honest unimplemented lines)", !cfg!(feature = "pi")
+        "[deskfw] crystal LIVE — press the crystal for the SHARD menu (About real; Sleep the ONE honest stub, no S3 suspend path; Restart and Shut Down psci_wired={} — where a secure monitor answers the smc they ACT, crystal::fire -> power::crystal_restart / power::crystal_shutdown = PSCI SYSTEM_RESET / SYSTEM_OFF, and where none does they print their honest unimplemented lines)", !cfg!(feature = "pi")
     );
 
     // SHARD-PRESS (PA41) — and that claim is now WITNESSED rather than asserted. This is the Pi's
@@ -392,7 +392,7 @@ pub fn activate() -> bool {
     //    `[chrome-truth]` read its chrome off the glass between the create and the blit).
     super::pulsewin::arm();
     serial_println!(
-        "[pidesk] pulse-window ARMED view={} (the render pass opens it on its first live instrument sample; menu: click `View` in the window's own strip — first option is the Pi LED face, second is the x86 segment face; the desktop LED band is unchanged)",
+        "[deskfw] pulse-window ARMED view={} (the render pass opens it on its first live instrument sample; menu: click `View` in the window's own strip — first option is the Pi LED face, second is the x86 segment face; the desktop LED band is unchanged)",
         super::pulsewin::view().label()
     );
     // 6. QUARRY — the file manager, when `UNAOS_QUARRY=1` armed it. This is the Pi's answer to the
@@ -413,7 +413,7 @@ pub fn activate() -> bool {
     {
         super::quarry::open();
         serial_println!(
-            "[pidesk] quarry open={} — the file manager is a desktop tenant (arrows/Enter/Backspace move it ONLY WHILE IT HOLDS FOCUS — SO9; click it to focus, click the console to hand the keyboard back; Esc dismisses menus only and never closes a window — R24; the close disc and the dock's pinned tile are the way out and back)",
+            "[deskfw] quarry open={} — the file manager is a desktop tenant (arrows/Enter/Backspace move it ONLY WHILE IT HOLDS FOCUS — SO9; click it to focus, click the console to hand the keyboard back; Esc dismisses menus only and never closes a window — R24; the close disc and the dock's pinned tile are the way out and back)",
             super::quarry::is_open()
         );
     }
@@ -427,7 +427,7 @@ pub fn activate() -> bool {
     //    about a window that one has to be open to reach.
     #[cfg(feature = "facet")]
     serial_println!(
-        "[pidesk] facet ARMED — double-click (or press <Enter> on) a .PNG in the file manager and the image opens in its own window, titled with the FILE's name (R36); the close disc frees the surface"
+        "[deskfw] facet ARMED — double-click (or press <Enter> on) a .PNG in the file manager and the image opens in its own window, titled with the FILE's name (R36); the close disc frees the surface"
     );
 
     // ── THE LIVE-CONSOLE DECISION, and the measurement that settled it ──────────────────────────
@@ -516,7 +516,7 @@ pub fn activate() -> bool {
     if routed {
         fbcon::console_present_defer(true);
         serial_println!(
-            "[pidesk] livecon ARMED console_win={} (presents deferred off print context; the render service takes the ledger once per pass via `fbcon::console_service` — the handoff SKIPS the detach and the window stays LIVE)",
+            "[deskfw] livecon ARMED console_win={} (presents deferred off print context; the render service takes the ledger once per pass via `fbcon::console_service` — the handoff SKIPS the detach and the window stays LIVE)",
             cwin
         );
     }

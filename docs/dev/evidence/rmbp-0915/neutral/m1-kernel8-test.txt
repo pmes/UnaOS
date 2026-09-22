@@ -1,0 +1,11 @@
+NEUTRAL M1 — pi runtime replay on the renamed tree
+commit 14549eaf, image = the kernel8.img certified in m1-artifact-certification.txt
+
+  ✅ MBENCH PASS — 126/126 required witnesses, 0 forbidden hit(s), 4259 lines scanned [fast: completion +18.6s grace 20s wall 39.0s]
+real	1m11.765s
+kernel8-test rc=0
+
+Mode is FAST (completion +18.6s, grace 20s, wall 39.0s). LAWS §5: a fast capture is SOUND for
+pass/fail -- completion means every REQUIRE and COUNT has already landed -- and is a FLOOR only for
+monotonic accumulators and periodic soaks, of which this verdict reads none. 126/126 REQUIREs is a
+pass/fail claim, so the fast capture certifies it.

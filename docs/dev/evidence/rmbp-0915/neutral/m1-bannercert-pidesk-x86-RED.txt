@@ -1,0 +1,35 @@
+NEUTRAL M1 — `UNAOS_WC=1 UNAOS_PIDESK=1 ./arroyo esp-x86` is RED, and it is red at the BASE too.
+
+This is NOT the rename. banner-cert.sh:304 declares `desktop_firmware|[deskfw] activate DECLINE
+reason=no-panel|-|measured(1)` with cond=`-`, i.e. expected in EVERY build that arms the feature.
+But NO string of the desktop_firmware module reaches an x86 image: measured on this artifact,
+`[deskfw]` 0, `desktop-clear` 0, `menubar ENABLED` 0, `crystal LIVE` 0, `facet ARMED` 0 — while the
+rename-INVARIANT part of the very same line, `activate DECLINE reason=no-panel`, is also 0 and the
+control `DECLINE reason=` is 22. A substring nobody renamed cannot go missing because of a rename.
+
+So the row has never fired: nothing on this bench builds x86 with UNAOS_PIDESK=1. Arming it for the
+first time exposes a map row whose condition is wrong for the x86 arch. `UNAOS_WC=1 ./arroyo esp-x86`
+(without the knob) is rc=0, ok=5 missing/leak=0 — that is the leg this arc certifies against.
+
+Owed to whoever owns banner-cert.sh: give row 304 an arch/feature condition, or register the
+divergence. Left untouched here — it is a gate-map decision, not a rename.
+
+⚡ banner-cert: artifact=/home/pmes/unaos-bench/scratch/rmbp-0915/neutral/unaos/target/x86_64_esp/kernel.elf
+⚡ banner-cert: banner=ehcihid,kbdwit,sdhcblk,smolnet,wc,desktop_firmware,sdwrite
+⚡ banner-cert: arch=x86_64  (read from the artifact's OWN ELF header (e_machine at 0x12), never from an argument)
+feature=ehcihid witness=:: EHCI-HID: DMAR: no ACPI DMAR table hits=1 -> OK
+feature=kbdwit witness=SILENCE-ENDED-HALTED hits=1 -> OK
+feature=sdhcblk witness=the staged file is FRAGMENTED; the permit describes exactly one LBA interval hits=1 -> OK
+feature=smolnet witness=:: SOCK-1: smoltcp icmp echo hits=1 -> OK
+feature=wc witness=[wc-x] desktop-app DECLINE reason=no-storage name=/ hits=1 -> OK
+feature=desktop_firmware witness=[deskfw] activate DECLINE reason=no-panel hits=0 -> MISSING
+feature=sdwrite witness=:: SDWRITE-POSTURE: posture= hits=- -> UNVERIFIABLE (its literal also needs 'witness', which this build does not carry)
+control=instgui witness=[wc-x] instgui install-go with NO committed target hits=0 -> OK
+control=selfhost witness=:: SELFHOST: src payload holds no regular files -> FAIL :: hits=0 -> OK
+control=holocron witness=:: [hcron] framing fixture leg=roundtrip -> FAIL hits=0 -> OK
+control=videobench witness=:: vperf: fbmem no framebuffer registered :: hits=0 -> OK
+control=irqstorage witness=irqstorage::submit called off a scheduled task hits=0 -> OK
+⚡ banner-cert: ok=5 missing/leak=1 registered-divergences=0 unverifiable=1 nowitness=0 noverdict=0  (table: 63 measured, 0 unmeasured-here)
+❌ banner-cert: the banner and the artifact DISAGREE — this media is red.
+real	1m25.632s
+esp-x86 rc=1

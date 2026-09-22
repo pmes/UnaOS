@@ -1,0 +1,267 @@
+NEUTRAL M1 — ./arroyo check on the renamed tree (verdict extract; full log in the executor scratch)
+base 4d8d047d + the M1 rename, branch exec-rmbp-neutral
+wall: real	28m21.805s   EXIT: M1 check rc=0
+
+=== arch + bootloader legs ===
+[0;33m⚡ kernel features: ehcihid,kbdwit,sdhcblk,smolnet,sdwrite[0m
+[0;32m✅ x86_64 OK[0m
+[0;32m✅ aarch64 OK[0m
+[0;32m✅ bootloader OK[0m
+
+=== KERNEL_CFG_MATRIX: 80 legs, 80 with rc=0 ===
+  · x86-all (slot 0) 17.2s rc=0
+  · arm-pi (slot 0) 15.4s rc=0
+  · arm-tegra (slot 0) 12.2s rc=0
+  · x86-vsyncpace (slot 0) 12.9s rc=0
+  · arm-tegra-el0 (slot 0) 13.0s rc=0
+  · arm-tegra-net6 (slot 0) 20.7s rc=0
+  · arm-tegra-el1ap (slot 0) 19.7s rc=0
+  · arm-tegra-apsrun (slot 0) 19.3s rc=0
+  · arm-tegra-simmer (slot 0) 13.4s rc=0
+  · arm-tegra-xusbfw (slot 0) 18.5s rc=0
+  · arm-tegra-smpmark (slot 0) 19.3s rc=0
+  · arm-tegra-orindesk (slot 0) 20.2s rc=0
+  · arm-tegra-jd1dc (slot 0) 19.4s rc=0
+  · arm-tegra-jd1dc-beam (slot 0) 19.7s rc=0
+  · arm-tegra-desk (slot 0) 24.6s rc=0
+  · arm-tegra-seam (slot 0) 24.6s rc=0
+  · arm-tegra-orinclick (slot 0) 25.0s rc=0
+  · arm-tegra-conwin (slot 0) 19.2s rc=0
+  · arm-tegra-render (slot 0) 21.0s rc=0
+  · arm-tegra-selfup (slot 0) 19.8s rc=0
+  · arm-tegra-orinwdt (slot 0) 12.0s rc=0
+  · arm-tegra-orinrx (slot 0) 15.1s rc=0
+  · arm-tegra-tcuprobe (slot 0) 14.8s rc=0
+  · arm-tegra-tcurx (slot 0) 16.4s rc=0
+  · arm-tegra-bsptick (slot 0) 17.5s rc=0
+  · arm-tegra-conwin-tenant (slot 0) 18.0s rc=0
+  · arm-tegra-tenant (slot 0) 20.8s rc=0
+  · arm-tegra-conwin-tenant-input (slot 0) 24.1s rc=0
+  · arm-tegra-bsprun (slot 0) 14.4s rc=0
+  · arm-tegra-bsprun-el0 (slot 0) 18.3s rc=0
+  · arm-tegra-supstate (slot 0) 21.5s rc=0
+  · arm-tegra-supstate-el0 (slot 0) 18.2s rc=0
+  · arm-tegra-supstate-el0-click (slot 0) 29.0s rc=0
+  · arm-tegra-supstate-el0-desk (slot 0) 41.4s rc=0
+  · arm-tegra-ga10bprobe1 (slot 0) 13.9s rc=0
+  · arm-tegra-ga10bprobe2 (slot 0) 14.4s rc=0
+  · arm-tegra-ga10bprobe3 (slot 0) 16.8s rc=0
+  · arm-tegra-ga10bprobe3b (slot 0) 21.9s rc=0
+  · arm-tegra-ga10bprobe4a (slot 0) 24.1s rc=0
+  · arm-tegra-ga10bprobe4b (slot 0) 25.1s rc=0
+  · arm-tegra-ga10bprobe4c (slot 0) 31.8s rc=0
+  · arm-tegra-ga10bprobe4d (slot 0) 28.4s rc=0
+  · arm-tegra-ga10bprobe4e (slot 0) 19.9s rc=0
+  · arm-tegra-ga10bprobe4f (slot 0) 30.3s rc=0
+  · arm-ga10bprobe5 (slot 0) 12.6s rc=0
+  · arm-tegra-ga10bprobe5a (slot 0) 21.4s rc=0
+  · arm-tegra-ga10bprobe5e (slot 0) 17.7s rc=0
+  · arm-tegra-ga10bprobe5b (slot 0) 12.8s rc=0
+  · arm-tegra-ga10bprobe5d (slot 0) 13.6s rc=0
+  · arm-tegra-ladder (slot 0) 19.3s rc=0
+  · arm-tegra-furn (slot 0) 14.7s rc=0
+  · arm-tegra-fbconpar (slot 0) 18.6s rc=0
+  · arm-tegra-fbconpar-cross (slot 0) 16.0s rc=0
+  · arm-desk-noel0 (slot 0) 16.7s rc=0
+  · arm-virt-el0 (slot 0) 16.5s rc=0
+  · arm-virt-net6 (slot 0) 12.0s rc=0
+  · arm-virt-sntp6 (slot 0) 15.5s rc=0
+  · arm-virt-tick (slot 0) 14.5s rc=0
+  · arm-tegra-furn-vpar-smpmark (slot 0) 17.2s rc=0
+  · arm-tegra-supstate-el0-smpmark (slot 0) 11.5s rc=0
+  · arm-tegra-el0-jd1dc (slot 0) 15.9s rc=0
+  · arm-tegra-sdmmcwrite (slot 0) 13.6s rc=0
+  · arm-tegra-sdwrite (slot 0) 18.9s rc=0
+  · arm-tegra-sdwritefx (slot 0) 22.1s rc=0
+  · arm-virt-sdwrite (slot 0) 12.5s rc=0
+  · arm-tegra-bsprun-nowitness (slot 0) 29.7s rc=0
+  · arm-tegra-bsprun-el0-nowitness (slot 0) 33.0s rc=0
+  · arm-pi-nowitness (slot 0) 28.9s rc=0
+  · arm-net5-virt (slot 0) 16.8s rc=0
+  · x86-nousblun (slot 0) 24.8s rc=0
+  · x86-all-nowitness (slot 0) 17.4s rc=0
+  · x86-mix-0 (slot 0) 16.9s rc=0
+  · x86-mix-1 (slot 0) 12.5s rc=0
+  · x86-mix-2 (slot 0) 19.1s rc=0
+  · x86-mix-3 (slot 0) 17.5s rc=0
+  · x86-mix-4 (slot 0) 16.7s rc=0
+  · x86-mix-5 (slot 0) 17.4s rc=0
+  · x86-mix-6 (slot 0) 16.7s rc=0
+  · x86-mix-7 (slot 0) 12.4s rc=0
+  · x86-mix-8 (slot 0) 14.4s rc=0
+
+=== gate verdicts ===
+  ✅ shell syntax (bash -n over arroyo and 27 file(s), every verb and every script)
+  ✅ braces (every .rs balances outside strings and comments)
+✅ x86_64 OK
+✅ aarch64 OK
+✅ bootloader OK
+  ✅ x86-all
+  ✅ arm-pi
+  ✅ arm-tegra
+  ✅ x86-vsyncpace
+  ✅ arm-tegra-el0
+  ✅ arm-tegra-net6
+  ✅ arm-tegra-el1ap
+  ✅ arm-tegra-apsrun
+  ✅ arm-tegra-simmer
+  ✅ arm-tegra-xusbfw
+  ✅ arm-tegra-smpmark
+  ✅ arm-tegra-orindesk
+  ✅ arm-tegra-jd1dc
+  ✅ arm-tegra-jd1dc-beam
+  ✅ arm-tegra-desk
+  ✅ arm-tegra-seam
+  ✅ arm-tegra-orinclick
+  ✅ arm-tegra-conwin
+  ✅ arm-tegra-render
+  ✅ arm-tegra-selfup
+  ✅ arm-tegra-orinwdt
+  ✅ arm-tegra-orinrx
+  ✅ arm-tegra-tcuprobe
+  ✅ arm-tegra-tcurx
+  ✅ arm-tegra-bsptick
+  ✅ arm-tegra-conwin-tenant
+  ✅ arm-tegra-tenant
+  ✅ arm-tegra-conwin-tenant-input
+  ✅ arm-tegra-bsprun
+  ✅ arm-tegra-bsprun-el0
+  ✅ arm-tegra-supstate
+  ✅ arm-tegra-supstate-el0
+  ✅ arm-tegra-supstate-el0-click
+  ✅ arm-tegra-supstate-el0-desk
+  ✅ arm-tegra-ga10bprobe1
+  ✅ arm-tegra-ga10bprobe2
+  ✅ arm-tegra-ga10bprobe3
+  ✅ arm-tegra-ga10bprobe3b
+  ✅ arm-tegra-ga10bprobe4a
+  ✅ arm-tegra-ga10bprobe4b
+  ✅ arm-tegra-ga10bprobe4c
+  ✅ arm-tegra-ga10bprobe4d
+  ✅ arm-tegra-ga10bprobe4e
+  ✅ arm-tegra-ga10bprobe4f
+  ✅ arm-ga10bprobe5
+  ✅ arm-tegra-ga10bprobe5a
+  ✅ arm-tegra-ga10bprobe5e
+  ✅ arm-tegra-ga10bprobe5b
+  ✅ arm-tegra-ga10bprobe5d
+  ✅ arm-tegra-ladder
+  ✅ arm-tegra-furn
+  ✅ arm-tegra-fbconpar
+  ✅ arm-tegra-fbconpar-cross
+  ✅ arm-desk-noel0
+  ✅ arm-virt-el0
+  ✅ arm-virt-net6
+  ✅ arm-virt-sntp6
+  ✅ arm-virt-tick
+  ✅ arm-tegra-furn-vpar-smpmark
+  ✅ arm-tegra-supstate-el0-smpmark
+  ✅ arm-tegra-el0-jd1dc
+  ✅ arm-tegra-sdmmcwrite
+  ✅ arm-tegra-sdwrite
+  ✅ arm-tegra-sdwritefx
+  ✅ arm-virt-sdwrite
+  ✅ arm-tegra-bsprun-nowitness
+  ✅ arm-tegra-bsprun-el0-nowitness
+  ✅ arm-pi-nowitness
+  ✅ arm-net5-virt
+  ✅ x86-nousblun
+  ✅ x86-all-nowitness
+  ✅ x86-mix-0
+  ✅ x86-mix-1
+  ✅ x86-mix-2
+  ✅ x86-mix-3
+  ✅ x86-mix-4
+  ✅ x86-mix-5
+  ✅ x86-mix-6
+  ✅ x86-mix-7
+  ✅ x86-mix-8
+✅ knob→leg coverage OK (every aarch64-qualified feature is named by a leg; known holes allowlisted with owners)
+✅ knob→builder wiring OK (every x86-leg-named knob is read by the media builder)
+✅ knob-parity OK (every default-on arroyo feature is pushed by the x86 media builder)
+✅ kernel cfg coverage OK (80 legs)
+  ✅ user-blob-x86 (x86_64)
+  ✅ user-stat (x86_64)
+  ✅ user-vug (x86_64)
+  ✅ user-pulse (x86_64)
+✅ userspace x86_64 OK (4 crates)
+  ✅ user-blob (aarch64)
+  ✅ user-elf (aarch64)
+  ✅ user-stat (aarch64)
+  ✅ user-vug (aarch64)
+  ✅ user-pulse (aarch64)
+✅ userspace aarch64 OK (5 crates)
+✅ midden_core tests OK
+  ✅ foreman agrees with mbench (verdict table and exit code)
+  ✅ host suites, root workspace (20 crates)
+  ✅ host suites, kernel workspace (net, rast)
+  ✅ replay: control-byte log PASSes spec
+  ✅ replay: default FORBID '-> FAIL' fails the run
+  ✅ replay: default FORBID '-> FLICKER' fails the run
+  ✅ replay: '-> BRACKETED' is NOT forbidden (control)
+  ✅ replay: missing REQUIRE fails the run
+  ✅ follow: live writer witnesses all caught (PASS)
+  ✅ follow: ended on completion, not timeout
+  ✅ follow: absent REQUIRE fails at timeout
+  ✅ truncation: complete log with all witnesses PASSes (rc 0)
+  ✅ truncation: log cut before the end-of-run marker is TRUNCATED (rc 3)
+  ✅ truncation: a truncated log is NOT reported as a pass
+  ✅ truncation: complete log with a MISSING witness still FAILs (rc 1)
+  ✅ truncation: capture ending mid-line is TRUNCATED (rc 3)
+  ✅ truncation: a FORBID hit in a short log is FAIL, not TRUNCATED
+  ✅ truncation/follow: run reaching the marker PASSes
+  ✅ truncation/follow: did not stop before the marker landed
+  ✅ truncation/follow: marker never arrives -> TRUNCATED (rc 3)
+  ✅ truncation: a spec with NO COMPLETE line keeps plain FAIL (rc 1)
+  ✅ spec parses: jetson-jd5.spec
+  ✅ spec parses: jetson-sync1.spec
+  ✅ spec parses: pi4-barename.spec
+  ✅ spec parses: pi4-regression.spec
+  ✅ spec parses: rmbp-boot.spec
+  ✅ spec parses: round6-rmbp.spec
+  ✅ spec parses: x86-ahci.spec
+  ✅ spec parses: x86-default.spec
+  ✅ spec parses: x86-fat.spec
+  ✅ spec parses: x86-holocron.spec
+  ✅ spec parses: x86-install.spec
+  ✅ spec parses: x86-ptr.spec
+  ✅ spec parses: x86-test.spec
+  ✅ spec parses: x86-usb2.spec
+  ✅ spec parses: x86-wc.spec
+  ✅ spec parses: x86-wifival.spec
+  ✅ spec parses: x86-witness.spec
+  ✅ inject: platform 'rmbp' refused
+  ✅ inject: platform 'x86' refused
+  ✅ inject: platform None refused
+  ✅ inject: platform 'pi' allowed
+  ✅ inject: platform 'jetson' allowed
+  ✅ inject: script parses (CMD/SLEEP/WAIT)
+  ✅ inject: FIFO round-trip delivers 'ver\r'
+  ✅ SELF-TEST PASS — 42/42
+  ✅ mbench self-test (the scorer every verdict in this tree comes from)
+GATE-FAMILY: OK — 6 platform-split families, none grown
+  ✅ arch families (no per-platform copy added silently)
+GATE-APPEND: OK — 175 files, no statement hiding after a comment marker, none swallowed by one inserted ahead of it (4 controls fired)
+  ✅ append position (no statement hiding after a comment marker)
+  ✅ verb alias closure (no $1-keyed guard names a subset of a verb's spellings)
+  ✅ fixture reachability (no leg added to an entry point a headless boot never runs)
+GATE-KNOB: OK — 207 features declared, 206 named by a cfg, 0 phantom, 0 dead, 0 trailing-comment cfg
+  ✅ knob hygiene (no phantom cfg, no knob wired to nothing)
+  ✅ k8 reachability (160 knobs: 14 armed, 146 registered unarmed — 104 still TODO)
+  ✅ builder (host)
+GATE-ROOTS: OK — 9 binary targets, every one named by a leg of check_both
+  ✅ check roots (every binary target is named by a leg of this gate)
+GATE-SPECROOTS: OK — 17 replay specs, every one named by a verb or a declared command
+  ✅ spec roots (every replay spec is named by a verb or a declared command)
+  ✅ test roots (every test suite is run by a leg, a declared command, or registered)
+  ✅ fc2 (no module declared wider than every path that can reach it)
+  ✅ lba32 (no 64-bit LBA narrowed to 32 bits outside a registered refusal)
+GATE-LEDGER: strict=off reason=HEAD 4d8d047d on `exec-rmbp-neutral` is NOT contained in main / origin/main — track content, cross-branch refs deferred (UNAOS_LEDGER_STRICT=1 to require them now)
+GATE-LEDGER: CENSUS — queue files scanned 4/4; conflict-marker scan over 9 file(s); queue ledger-id citations 944 (240 distinct), deferred-keepable ids 12, grandfathered ids 11 (+0 registered id(s) not cited in this tree); cross-ref deferrals 0, grandfathered 0
+GATE-LEDGER: FOLD SHAPES — STATE-line uniqueness over 4 queue file(s): 0 finding(s); trailing text over 4 ledger file(s): 0 finding(s); row continuity not armed (HEAD is not a merge and no merge is in progress): 0 finding(s)
+GATE-LEDGER: FIELD COUNT — 1 registered exception(s); NOT findings, and each must reach zero:
+GATE-LEDGER: QUEUE CITATIONS — 11 registered id(s) over 30 citation(s); NOT findings, and each must reach zero:
+GATE-LEDGER: QUEUE CITATIONS — 12 deferred-keepable id(s); NOT findings, the row is written on another head and arrives at that landing:
+GATE-LEDGER: OK — 427 rows in 4 ledger file(s) + RULINGS + 4 queue file(s): ids unique, field counts match their header, absence claims name an enumeration (lexical sampler — see the header), status ∈ enum, owners known, cross-refs resolve, every deferral names an owner and an expiry, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>, no conflict markers, every queue citation resolves, one STATE line per claim, every ledger row ends at its final pipe, no row lost at a fold
+GATE-BRANCH: OK — every exec tip is on a track or named by a registry line; no stale line, no fold sha off the tracks, no executor in flight past 14 days
+  ✅ ledgers (ids, status enum, owners, cross-refs, shas, evidence in git)
