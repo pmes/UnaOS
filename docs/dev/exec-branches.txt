@@ -212,7 +212,7 @@ refs/heads/exec-orin-blitstall             4a4a55b1 FOLDED-BY-HAND fec8acdc     
 refs/heads/exec-orin-dragmetal             75c32d5e FOLDED-BY-HAND 83dbb1e1                  2026-09-22
 refs/heads/exec-orin-fonts2x               ad62cf09 FOLDED-BY-HAND 582278cd                  2026-09-13
 refs/heads/exec-orin-ga10b6                07c29a62 FOLDED-BY-HAND 0ae4fcf9                  2026-09-22
-refs/heads/exec-orin-gatehyg               78ca893a LOST           docs/dev/QUEUE.md         2026-09-13
+refs/heads/exec-orin-gatehyg               78ca893a FOLDED-BY-HAND 98c8a0c7                  2026-09-22
 refs/heads/exec-orin-loginboot             f14f6505 FOLDED-BY-HAND fec8acdc                  2026-09-22
 refs/heads/exec-orin-lun2                  bf45f7cb FOLDED-BY-HAND 3bbeb754                  2026-09-22
 refs/heads/exec-orin-netverb               23bddcf8 FOLDED-BY-HAND 83dbb1e1                  2026-09-22
@@ -226,7 +226,7 @@ refs/remotes/origin/exec-orin-blitstall    4a4a55b1 FOLDED-BY-HAND fec8acdc     
 refs/remotes/origin/exec-orin-dragmetal    75c32d5e FOLDED-BY-HAND 83dbb1e1                  2026-09-22
 refs/remotes/origin/exec-orin-fonts2x      ad62cf09 FOLDED-BY-HAND 582278cd                  2026-09-13
 refs/remotes/origin/exec-orin-ga10b6       07c29a62 FOLDED-BY-HAND 0ae4fcf9                  2026-09-22
-refs/remotes/origin/exec-orin-gatehyg      78ca893a LOST           docs/dev/QUEUE.md         2026-09-13
+refs/remotes/origin/exec-orin-gatehyg      78ca893a FOLDED-BY-HAND 98c8a0c7                  2026-09-22
 refs/remotes/origin/exec-orin-loginboot    f14f6505 FOLDED-BY-HAND fec8acdc                  2026-09-22
 refs/remotes/origin/exec-orin-lun2         bf45f7cb FOLDED-BY-HAND 3bbeb754                  2026-09-22
 refs/remotes/origin/exec-orin-netverb      23bddcf8 FOLDED-BY-HAND 83dbb1e1                  2026-09-22
