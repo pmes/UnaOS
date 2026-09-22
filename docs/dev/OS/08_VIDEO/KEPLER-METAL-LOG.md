@@ -67,9 +67,19 @@ unreachable there. What QEMU DOES score is rung 2's property, through a fixture 
 `wait_next_edge` — the arm itself, not a copy — from a simulated counter the timer advances:
 
 ```
-:: kepler: vblank selftest arm=wait sim=timer period_us=16667 from=<n> advanced=1 waited_us=<n> bound=waited_us<=16667 :: PASS ::
-:: kepler: vblank selftest arm=wait sim=stuck advanced=0 gaveup=1 waited_us=<n> budget_us=33334 bound=gaveup-on-GIVEUP_FRAMES :: GO-RED-OK ::
+:: kepler: vblank selftest arm=wait sim=timer period_us=16667 from=0 advanced=1 waited_us=16579 bound=waited_us<=16667 :: PASS ::
+:: kepler: vblank selftest arm=wait sim=stuck advanced=0 gaveup=1 waited_us=33287 budget_us=33334 bound=16667<=waited_us<=50001 (GIVEUP_FRAMES budget, +/- one frame) :: GO-RED-OK ::
 ```
+
+Those two are QUOTED FROM THIS ARC'S OWN CAPTURE, not predicted. **The go-red's bound is one frame
+wide, and it is one frame wide because its first armed run FAILED at `waited_us=33295
+budget_us=33334`** — 39 us on a 33 334 us budget, 0.12%, under TCG. The deadline is computed from a
+`now_cycles()` in the fixture and the elapsed time from a second one inside `wait_next_edge`, and
+`us_to_cycles`/`cycles_to_us` truncate in opposite directions. The claim under test is a count of
+FRAMES ("the wait gives up on the same GIVEUP_FRAMES budget as the spin"), so the bound's unit is
+the frame and it is BOTH-SIDED: at least `GIVEUP_FRAMES - 1` whole frames (it did not return early)
+and at most `GIVEUP_FRAMES + 1` (it did not overrun the spin's budget). A wait that returned in one
+frame instead of two still fails it, which is the regression the go-red exists to catch.
 
 **THE FOUR-PLACE TRAP FIRED FIRST, AND IT IS RECORDED BECAUSE IT WAS MEASURED.** With the knob in
 `arroyo` alone, the first armed gate run printed `nvidia-kepler-vblank` in the `⚡ kernel features:`

@@ -464,10 +464,23 @@ pub fn selftest_once() {
     let waited2_us = cycles_to_us(cyc2);
     let budget_us = GIVEUP_FRAMES.saturating_mul(crate::video::beam::FRAME_US);
     let gaveup = VB_WAIT_GAVEUP.load(Ordering::Relaxed) > g0;
-    let red_ok = !adv2 && gaveup && waited2_us >= budget_us;
+    // THE BOUND IS ONE FRAME WIDE, AND THAT IS THE CLAIM'S OWN RESOLUTION, not a slackened test.
+    // What is under test is "the wait gives up on the SAME GIVEUP_FRAMES budget as the spin" — a
+    // statement about a count of FRAMES. Asserting `waited_us >= budget_us` exactly measured the
+    // wrong thing and FAILED on its first armed gate run at `waited_us=33295 budget_us=33334`: the
+    // deadline is computed from a `now_cycles()` taken in this function and the elapsed time from a
+    // second one taken inside `wait_next_edge`, and `us_to_cycles`/`cycles_to_us` truncate in
+    // opposite directions — 39 us of clock plumbing on a 33 334 us budget, 0.12%, and on TCG at
+    // that. So the bound is BOTH-SIDED and its unit is the frame: the wait must have burned at
+    // least `GIVEUP_FRAMES - 1` whole frames (it did not return early) and at most
+    // `GIVEUP_FRAMES + 1` (it did not overrun the spin's budget). A wait that returns in one frame
+    // instead of two still FAILS this, which is the regression the go-red exists to catch.
+    let lo = budget_us.saturating_sub(crate::video::beam::FRAME_US);
+    let hi = budget_us.saturating_add(crate::video::beam::FRAME_US);
+    let red_ok = !adv2 && gaveup && waited2_us >= lo && waited2_us <= hi;
     serial_println!(
-        ":: kepler: vblank selftest arm=wait sim=stuck advanced={} gaveup={} waited_us={} budget_us={} bound=gaveup-on-GIVEUP_FRAMES :: {} ::",
-        adv2 as u32, gaveup as u32, waited2_us, budget_us,
+        ":: kepler: vblank selftest arm=wait sim=stuck advanced={} gaveup={} waited_us={} budget_us={} bound={}<=waited_us<={} (GIVEUP_FRAMES budget, +/- one frame) :: {} ::",
+        adv2 as u32, gaveup as u32, waited2_us, budget_us, lo, hi,
         if red_ok { "GO-RED-OK" } else { "GO-RED-FAILED" },
     );
 
