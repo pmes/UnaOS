@@ -211,32 +211,32 @@ refs/remotes/origin/exec-orin25-shotverb   edf8483a WIP-SURVIVOR   -            
 refs/heads/exec-orin-blitstall             4a4a55b1 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/heads/exec-orin-dragmetal             75c32d5e LOST           docs/dev/QUEUE.md         2026-09-13
 refs/heads/exec-orin-fonts2x               ad62cf09 FOLDED-BY-HAND 582278cd                  2026-09-13
-refs/heads/exec-orin-ga10b6                07c29a62 LOST           docs/dev/OS/orin-queue.md 2026-09-13
+refs/heads/exec-orin-ga10b6                07c29a62 FOLDED-BY-HAND 0ae4fcf9                  2026-09-22
 refs/heads/exec-orin-gatehyg               78ca893a LOST           docs/dev/QUEUE.md         2026-09-13
 refs/heads/exec-orin-loginboot             f14f6505 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/heads/exec-orin-lun2                  bf45f7cb FOLDED-BY-HAND 3bbeb754                  2026-09-22
 refs/heads/exec-orin-netverb               23bddcf8 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/heads/exec-orin-orintime              ad549988 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/heads/exec-orin-ptrlost               26646c22 LOST           docs/dev/QUEUE.md         2026-09-13
-refs/heads/exec-orin-rastwin               28bcd764 LOST           docs/dev/OS/orin-queue.md 2026-09-13
+refs/heads/exec-orin-rastwin               28bcd764 FOLDED-BY-HAND 0ae4fcf9                  2026-09-22
 refs/heads/exec-orin-scrshot               c8d66657 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/heads/exec-orin-sessgate              9f365744 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/heads/exec-orin-wirehyg               9c42a93c LOST           docs/dev/QUEUE.md         2026-09-13
 refs/remotes/origin/exec-orin-blitstall    4a4a55b1 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/remotes/origin/exec-orin-dragmetal    75c32d5e LOST           docs/dev/QUEUE.md         2026-09-13
 refs/remotes/origin/exec-orin-fonts2x      ad62cf09 FOLDED-BY-HAND 582278cd                  2026-09-13
-refs/remotes/origin/exec-orin-ga10b6       07c29a62 LOST           docs/dev/OS/orin-queue.md 2026-09-13
+refs/remotes/origin/exec-orin-ga10b6       07c29a62 FOLDED-BY-HAND 0ae4fcf9                  2026-09-22
 refs/remotes/origin/exec-orin-gatehyg      78ca893a LOST           docs/dev/QUEUE.md         2026-09-13
 refs/remotes/origin/exec-orin-loginboot    f14f6505 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/remotes/origin/exec-orin-lun2         bf45f7cb FOLDED-BY-HAND 3bbeb754                  2026-09-22
 refs/remotes/origin/exec-orin-netverb      23bddcf8 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/remotes/origin/exec-orin-orintime     ad549988 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/remotes/origin/exec-orin-ptrlost      26646c22 LOST           docs/dev/QUEUE.md         2026-09-13
-refs/remotes/origin/exec-orin-rastwin      28bcd764 LOST           docs/dev/OS/orin-queue.md 2026-09-13
+refs/remotes/origin/exec-orin-rastwin      28bcd764 FOLDED-BY-HAND 0ae4fcf9                  2026-09-22
 refs/remotes/origin/exec-orin-scrshot      c8d66657 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/remotes/origin/exec-orin-sessgate     9f365744 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/remotes/origin/exec-orin-wirehyg      9c42a93c LOST           docs/dev/QUEUE.md         2026-09-13
-refs/heads/exec-orin-ga10b7                0676ed4a LOST           docs/dev/OS/orin-queue.md 2026-09-15
+refs/heads/exec-orin-ga10b7                0676ed4a FOLDED-BY-HAND 0ae4fcf9                  2026-09-22
 refs/heads/exec-rmbp-kfunwedge             6c38659d FOLDED-BY-HAND 3bbeb754                  2026-09-22
 refs/remotes/origin/exec-rmbp-kfunwedge    6c38659d FOLDED-BY-HAND 3bbeb754                  2026-09-22
 
@@ -246,4 +246,3 @@ refs/remotes/origin/exec-rmbp-kfunwedge    6c38659d FOLDED-BY-HAND 3bbeb754     
 # descend from what is written here.
 refs/heads/exec-rmbp-deskrescue            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-toolrescue            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
-refs/heads/exec-orin-rescue                fd440602 IN-FLIGHT      orin                      2026-09-22
