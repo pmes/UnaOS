@@ -237,7 +237,7 @@ pub mod rtpi;
 // `arch/x86_64/sched.rs`, which is exactly why the Pi never got the repair; lifted here so both
 // schedulers call ONE definition instead of drifting copies. Declared unconditionally and carrying
 // no state — it is `const fn` arithmetic over its arguments, so nothing is linked that is not used.
-pub mod sched_spread;
+pub mod sched_spread; #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] pub mod bus; // BUSX86 (ROADMAP §3b, 2026-09-22): the on-UnaOS SMessage v1 CODEC — the SAME lift, one arc later, and for the same reason VUGSPREAD gives above. `bus.rs` sat under `arch/aarch64/` and said "aarch64-only; zero x86 surface" in its own header, which made SYS_MSEND/SYS_MRECV a board-split of the PROGRAM story (LAWS §3: ONE OS; R16) — the rMBP desktop's EL0 programs had no bus to speak on. The module names no register, no board and no arch: it is frame layout, decode ceilings and the frozen UnaOS-NATIVE v1 goldens, so `git mv` to the crate root is the whole port (history follows the file; `arch/aarch64/mod.rs` keeps five comment lines where its `pub mod bus;` stood, so no panic `Location` in THAT file shifts). The cfg is the UNION of the two arches' EL0 conditions, not a new knob: aarch64 keeps `aarch64_el0` (the gate syscall.rs is under — an aarch64 build with no EL0 has no transport to carry a frame), x86 compiles it unconditionally exactly as x86 compiles SYS_OPEN/SYS_READ (ring 3 is not optional there). ⚠ LINE-NEUTRAL fold onto sched_spread's line: a `pub mod` on its own line would shift every Location below it in this file. The KATs (`bus_codec_selftest` / `bus_codec2_selftest`) are the spec of record and are byte-unchanged by this move — both arches now run them every boot.
 
 pub fn init() {
     arch::init();

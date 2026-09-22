@@ -39,7 +39,7 @@
 // appear. This module treats the field as opaque bytes; policy lives at the transport.
 //
 // No heap use anywhere in this module beyond caller-provided buffers (one heap staging in the
-// selftest's at-ceiling KAT); no_std; aarch64-only (declared under arch/aarch64; zero x86 surface).
+// selftest's at-ceiling KAT); no_std; ARCH-NEUTRAL. ⚠ LINE-NEUTRAL FILE: every edit here keeps this file's LINE COUNT, because panic `Location`s embed line numbers and BUSX86's whole aarch64 claim is that the lift moved nothing but a path string. BANDY-1's header ended "aarch64-only (declared under arch/aarch64; zero x86 surface)" — that sentence WAS the board-split (LAWS §3: ONE OS; R16): the WIRE of the program story lived under one board's arch directory, so the rMBP desktop's EL0 programs had no bus to speak on. BUSX86 (2026-09-22) `git mv`'d this file to `crate::bus` — declared once in lib.rs, compiled on BOTH arches, KATs run every boot on each. The FRAME did not move: the goldens below are the spec of record exactly as BANDY-1 froze them, byte for byte.
 
 /// Frame magic: b"UBS1" — UnaOS Bus, wire v1.
 pub use una_abi::BUS_MAGIC;
