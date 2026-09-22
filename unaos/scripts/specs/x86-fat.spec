@@ -320,3 +320,28 @@ REQUIRE :: X86BIND: root=global:/KERNEL\.ELF serial=0x[0-9a-f]+ by=[a-z]+ bootin
 FORBID :: \[fatverb\] storage settle: .* settled=ceiling
 FORBID :: STORSLOT: storage records FULL
 FORBID :: X86BIND: root=- 
+
+# --- VFSWIT: THE PER-MOUNT `[vfs]` WITNESSES — one line per BOUND PREFIX ------------------------
+# WHY THIS BLOCK EXISTS, and it is the same defect the STORSLOT note above names: a defect whose
+# symptom is SILENCE. CARDROOT (2026-09-17, `docs/dev/OS/09_FILESYSTEM/layout.md` §1.6.7) measured
+# `[vfs] root mount` and `[vfs] volume mounted` at **0 lines** on two x86 captures whose `/`, `/boot`,
+# `/apps` and `/volumes/UNAOS SDHC4` had all bound correctly — dead since X86BIND, because `bind`'s
+# one-shot announce latch was spent by the FIRST mount table, which on x86 is built at serial ~line
+# 156, before any disk has enumerated. The wire that carried the fact instead was `:: volid: mount …`,
+# which rides a fixture. VFSWIT moves the latch to the first table that BOUND A ROOT, and these four
+# lines are what makes that falsifiable: put the latch back on the first table and every one of them
+# reads 0 and this spec FAILs (measured — see the commit body's go-red).
+# THE SHAPE, NOT THE NUMBERS, per this file's own rule three screens up. `source=` is the enumerated
+# backend (`global` on this leg, `sdhc` for the home-soil volume), `rw=` is a RUNTIME posture sampled
+# off the backend being mounted (§1.5 of the layout document: a `Default`-sourced mount's veto is
+# FRGUARD's `default_writable()`, so no value is fixed anywhere), and the home-soil volume's NAME is
+# the card's own label. What is FIXED is the sentence: this prefix bound, and it said so ONCE.
+REQUIRE \[vfs\] root mount / = fat boot volume source=[a-z-]+ rw=(yes|no) ::
+REQUIRE \[vfs\] boot mount /boot = fat boot volume source=[a-z-]+ rw=(yes|no) ::
+REQUIRE \[vfs\] apps mount /apps = fat boot volume source=[a-z-]+ rooted=[A-Z0-9]+ ::
+REQUIRE \[vfs\] volume mounted /volumes/.+ source=[a-z-]+ rw=(yes|no) ::
+# `/volumes/data` is CARDROOT's fifth mount and it is OPTIONAL here on purpose, not by oversight:
+# `make-fat-img.sh` builds the sf image WITHOUT a `DATA/` directory, so this leg's boot volume has no
+# data set to mount (layout §1.6.7's table: `mounts=4` on the image as built, `mounts=5` on the same
+# image with `DATA/` added by hand). A REQUIRE here would pin a fact about a DIFFERENT image.
+OPTIONAL \[vfs\] data mount /volumes/data = fat boot volume source=

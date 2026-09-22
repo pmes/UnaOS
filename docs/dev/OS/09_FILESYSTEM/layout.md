@@ -414,6 +414,61 @@ the control string `/volumes/dataX` reading 0 in both (`LC_ALL=C grep -a -o -F` 
 `target/x86_64_esp/kernel.elf`, `./arroyo esp-x86` both sides). Reverted; the source is byte-identical
 (`git diff --numstat` unchanged).
 
+### 1.6.8 VFSWIT — the latch moved to the first table that BOUND A ROOT (flight 11, 2026-09-22)
+
+The fix §1.6.7 named is made, and it is one clause: `bind` takes `announce` from
+`s.root.is_some() && !MOUNTS_ANNOUNCED.swap(true, …)` instead of the bare `swap`, so a mount table
+built before any disk enumerated no longer spends the latch on a table that prints nothing. The
+condition is the ROOT and deliberately not "this table has anything to say"
+(`|| !s.others.is_empty()`): `survey()` caches only a walk that FOUND a root and re-walks on every
+fingerprint change (SO38), so a table can carry home-soil disks while the root is still unresolved,
+and latching there would lose the root/boot/apps/data lines — the same defect one table later. The
+gate run's own wire shows that window: `[vfs] resurvey n=2 … bound_on_pass=3`, i.e. two walks found
+no root before the disk enumerated. What the choice gives up, stated rather than hidden: a board that
+enumerates disks and never binds a root announces no `[vfs] volume mounted` line at all; its witness
+is the `[vfs] root -> NONE` line the walk prints, and the mounts are still MADE either way.
+
+MEASURED, `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_QEMU_FULL=1 ./arroyo test-fat sf 200` (rc=0,
+`completion=complete`, `complete_line=2319`), each count taken with
+`awk -v p='<the line>' 'index($0,p)' target/serial.log | wc -l`:
+
+| witness | §1.6.7 (before) | this run |
+|---|---|---|
+| `[vfs] root mount` | 0 | **1** |
+| `[vfs] boot mount` | 0 | **1** |
+| `[vfs] apps mount` | 0 | **1** |
+| `[vfs] volume mounted` | 0 | **1** (`/volumes/UNAOS SDHC4 source=sdhc rw=no`) |
+| `[vfs] data mount` | 0 | 0 — this image carries no `DATA/`, per §1.6.7's first row |
+
+Four witness lines for the four prefixes the same boot's `:: X86BIND: … mounts=4 layout=true -> PASS ::`
+and its four `:: volid: mount …` lines report: **one line per bound prefix, exactly once**. The pins
+live in `unaos/scripts/specs/x86-fat.spec`, which `test-fat sf` replays as a STEP of the verb (its rc
+IS the verb's rc), so these witnesses are scored on every gate run rather than reasoned about —
+`40/40 required witnesses` on that run, where the same spec asked for 36 before. `/volumes/data` is
+pinned OPTIONAL there because the sf image has no data set to mount; a REQUIRE would pin a fact about
+a different image.
+
+THE AARCH64 LANE DOES NOT CHANGE, and the reason is worth keeping: on `./arroyo test-arm` (rc=0) the
+virt machine never reaches a filesystem verb, so its `[vfs]` wire is 2 lines before and after (the
+`planwalk` fixture's own INVARIANT-BROKEN pair) and `diff` over them is empty; with numeric fields
+normalised the WHOLE 658-line capture diffs to zero. The Pi and the Orin bind a root on the first
+table they build, where the old latch and the new one answer the same, so their counts are unchanged
+by construction. Image cost of the clause: aarch64 `kernel.elf` 2,142,776 → 2,142,808 B (+32); x86_64
+`kernel.elf` 3,027,608 → 3,025,136 B (−2472, the early-return path re-inlining — the clause is not a
+size argument in either direction and the numbers are quoted because they were asked for).
+
+GO-RED, behavioural and on this gate: put the latch back on the first table
+(`let announce = !MOUNTS_ANNOUNCED.swap(…)`, nothing else touched) and rebuild. All five witnesses
+read 0 lines again, and `mbench.py --replay` — the single verdict authority, the same step the verb
+runs — answers **`MBENCH FAIL — 36/40 required witnesses`, rc=1**, naming
+`FIRST-SHORTFALL x86-fat.spec:339 REQUIRE \[vfs\] root mount …`; the green build of the same spec on
+the same command reads `40/40`, rc=0. The go-red verb run also reds one line EARLIER than that, on
+an unrelated flake — `[dmgovlp] verdict … drag_evt=0 … adopt_stretch=1/4 -> FAIL`, the compositor's
+drag fixture receiving no drag events on that boot (`drag_evt=5 … adopt_stretch=4/4 -> PASS` on the
+green run) — and `scan_serial_faults` runs before the replay, so the spec verdict above was taken by
+running that authority over the very capture the red run produced. Reverted; the source is back to
+the one clause (`git diff` on `bootdisk.rs` shows only it and its comment).
+
 ## 2. The namespace this arc establishes
 
 ```
