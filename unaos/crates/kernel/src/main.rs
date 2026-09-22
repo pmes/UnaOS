@@ -5310,7 +5310,7 @@ fn click1_dispatch(
 }
 
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
-fn render_service(_: usize) {
+fn render_pass<W: RenderWait>(w: &mut W) {
     use unaos_kernel::pal::GneissPal; // for pal.render()
     // FrameBuffer is Copy: take a handle and build the back-buffered surface. All drawing goes to
     // cached RAM; render() flushes only the damaged span to the framebuffer, cleaning the cache so
@@ -5397,20 +5397,20 @@ fn render_service(_: usize) {
     // presents at most once, and only if something was actually drawn. Cursor latency is preserved:
     // a real pointer report still redraws the sprite and presents in the same pass.
     let mut last_abs: Option<(i32, i32)> = None;
-    // [sched6] witness accumulators (this task is the sole owner of the render core — plain locals,
-    // no atomics). Bracket each pass; report passes/s, presented composites/s, and the mean cycle
-    // cost of a presented pass, rate-limited to once every ~5 s.
-    let mut s6_passes: u64 = 0;
-    let mut s6_composites: u64 = 0;
-    let mut s6_cyc: u64 = 0;
-    let mut s6_last_ms = unaos_kernel::arch::ms();
+    // RENDCONV — the pass census USED to keep its four accumulators here, as plain locals of this
+    // body (`s6_passes` / `s6_composites` / `s6_cyc` / `s6_last_ms`). They are state of the WAITING
+    // DISCIPLINE, not of the pass: the three members count the same three quantities against three
+    // different clocks and print them on three different wire families (`[sched6]` on `arch::ms`,
+    // `[schedx86]` on the same millisecond clock but out of SHARED statics, `[render] census` on
+    // CNTPCT). So they moved into the `RenderWait` impl behind `w`, and the pass reports to it once
+    // per pass through `w.census(presented, cyc)` at the tail. See `ChannelWait`, this file's end.
 
     loop {
-        // Block until an event arrives (recv parks the task — an idle render core burns nothing).
-        let ev = GUI_CHANNEL.recv();
-        GUI_RECV.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // GUI-CLICK-2 depth accounting
+        // RENDCONV — **THE WAITING AXIS.** The pass no longer names a primitive: it asks the
+        let wake = w.wait();
+        // discipline what woke it — `ChannelWait` blocks in `GUI_CHANNEL.recv()` and charges the
         let t0 = unaos_kernel::arch::now_cycles(); #[cfg(feature = "livecon")] unaos_kernel::video::fbcon::console_live_service(); // LIVECON — THE PORT. The console window's presents come off print context (`fbcon::present_deferred`) and land HERE, on the one core that drives the compositor, at this pass's cadence — which is the arc `video/pidesk.rs`'s live-console ledger names. `console_live_service` is a readback bracket around the hook x86's `usbdebug` service loop has called since FBCON-PACE (`fbcon::console_service`) — the service call is unchanged and the bracket only counts presents that actually happened, which is what the one-line `[wc-x] livecon census` proof is read off. It is the PACED take, not a forced flush: `console_service` can only move a present earlier within the frame it was already going to happen in, it is free on a clean ledger (`pend_take` -> `Owed::Nothing`, nothing composited), and it is a no-op on every build where the console is not routed into a window. Top of the pass and not the tail, because a pass has many exits and a deferred band must not be able to miss one. ⚠ FOLDED onto an existing line — `main.rs` is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof and panic `Location` records embed line numbers (PARITY §5.3); knob-off the statement does not exist and no line moves.
-        s6_passes += 1; #[cfg(feature = "witness")] SHELLUP_RENDER_HB.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // SHELLUP — the render task's LIVENESS beat, read by the `[shellup]` census from the input core. It has to be a shared counter and not a local, because the question the census exists to answer is asked from a DIFFERENT task about a task that may already be dead — boot 10 dropped this one 17 log lines after it started (flight 2) and the census must still be able to say so. ⚠ FOLDED and `#[cfg]`-ON-THE-STATEMENT: `main.rs` is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof, so the beat must add no source line (PARITY §5.3) AND leave no MIR statement behind knob-off (quarry.md's inline-shim measurement — an empty call still moved the image).
+        #[cfg(feature = "witness")] SHELLUP_RENDER_HB.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // SHELLUP — the render task's LIVENESS beat, read by the `[shellup]` census from the input core. It has to be a shared counter and not a local, because the question the census exists to answer is asked from a DIFFERENT task about a task that may already be dead — boot 10 dropped this one 17 log lines after it started (flight 2) and the census must still be able to say so. ⚠ FOLDED and `#[cfg]`-ON-THE-STATEMENT: `main.rs` is compiled into the knob-off `kernel8.img` whose byte-identity is this track's standing proof, so the beat must add no source line (PARITY §5.3) AND leave no MIR statement behind knob-off (quarry.md's inline-shim measurement — an empty call still moved the image). // RENDCONV — `s6_passes += 1;` stood at the HEAD of this line and is now charged by `ChannelWait::wait`, because a pass IS a wake and the discipline is what knows one happened. The beat below is untouched and must stay a LIVE statement: it is read by the `[shellup]` census from the INPUT core about a task that may already be dead, so commenting it out would silently blind the one instrument that can report this task dying. ⚠ LINE-NEUTRAL: the statement is unchanged, the note is appended.
         // `dirty` — did this pass draw anything that must be presented? `strip_dirty` — must the
         // status strip be (re)composed on top this pass?
         let mut dirty = false;
@@ -5432,7 +5432,7 @@ fn render_service(_: usize) {
         let windowed = desktop && shell_id != unaos_kernel::video::wm::WIN_NONE;
         #[cfg(not(feature = "desktop_firmware"))]
         let windowed = false;
-        match ev {
+        match wake { Wake::Tick => strip_tick = true, Wake::Input(ev) => match ev {
             unaos_kernel::pal::Event::Key(c) => { #[cfg(feature = "login")] if unaos_kernel::fs::users::screen_key(c) { continue; } // LOGIN M3 — the screen takes the key before the shell window or the panel. ⚠ LINE-NEUTRAL append.
                 // SHELLWIN-PI — route the keystroke to its home. A key reaches this task only when
                 // `pump_usb_into_gui` found `user_input_active() == 0`, i.e. the keyboard belongs to
@@ -5501,13 +5501,13 @@ fn render_service(_: usize) {
                 // A click may activate/redraw a view under the strip band — keep the strip on top.
                 strip_dirty = true;
             }
-            // Timer (the 1 Hz status-tick pulse) is the strip's own refresh cadence: recompose it so
-            // the clock/lease advance even with no input. Other events carry nothing to draw.
-            unaos_kernel::pal::Event::Timer => {
-                strip_tick = true;
-            }
+            // RENDCONV — the `Event::Timer` arm that used to sit here (`strip_tick = true`) is what
+            // `Wake::Tick` means, and it is now the outer arm on the line that opens this match. The
+            // furniture cadence is a property of the discipline — the strip pulse on this member, the
+            // input service's own pulse on the folding one, a CNTPCT compare on a polled terminus — so
+            // the pass reads ONE answer and the impl decides what produced it. Other events: nothing.
             _ => {}
-        }
+        }}
         // SERIAL-FOCUS — **THE CONSUMER SIDE OF THE SOURCE SPLIT.** The shell's serial inbox is
         // drained here, on every pass, unconditionally, and the bytes are dispatched through the
         // SAME `handle_key` the USB keyboard reaches — into whichever surface `windowed` says the
@@ -5674,7 +5674,7 @@ fn render_service(_: usize) {
             // arch — the boot present above, `rast_demo`, the `video::witness` fixtures — now gets
             // the desktop bracket without having to remember it.
             pal.render();
-            s6_composites += 1;
+            // RENDCONV — `s6_composites += 1` was here; `w.census(dirty, …)` at the tail counts it.
         }
         // SHELLWIN-PI — flush the shell window's surface and composite it once per pass, AFTER the
         // backdrop present above so the window lands on top of the scene rather than under it. Same
@@ -5700,35 +5700,35 @@ fn render_service(_: usize) {
             );
             shell_dirty = false;
         }
-        s6_cyc += unaos_kernel::arch::now_cycles().wrapping_sub(t0);
-        // Rate-limited [sched6] witness: incoming pass rate vs presented-composite rate + mean pass
-        // cost over the window (proves the pacing — presents track real activity, not the event rate).
-        let now = unaos_kernel::arch::ms();
-        let span = now.wrapping_sub(s6_last_ms);
-        if span >= 5000 {
-            let passes_per_s = s6_passes.saturating_mul(1000) / span.max(1);
-            let comps_per_s = s6_composites.saturating_mul(1000) / span.max(1);
-            let mean_cyc = s6_cyc / s6_passes.max(1);
-            serial_println!(
-                // PULSE-4: the strip's cadence moved to 4 Hz; this witness's own 5 s span is
-                // deliberately UNCHANGED (wire volume). The label names the strip's rate, not this
-                // line's, so it tracks `PSTRIP_PERIOD_MS` rather than restating a stale literal.
-                "[sched6] passes={}/s composites={}/s mean={} cyc/pass (dirty-paced strip@{}ms)",
-                passes_per_s,
-                comps_per_s,
-                mean_cyc,
-                unaos_kernel::ui_status::PSTRIP_PERIOD_MS
-            );
-            // SCHED-PRIO: the dispatch-share line, emitted on `[sched6]`'s cadence and immediately
-            // after it, so a capture reads "composites=N/s" and "who won the dispatches that produced
-            // them" as one pair. This is the only site that fires while a fleet is actually live —
-            // the scheduler's own two emitters are metal-only and boot-once respectively.
-            unaos_kernel::arch::sched::prio_witness(); #[cfg(feature = "witness")] unaos_kernel::arch::sched::stk_probe("render:pass"); // SHELLUP — the render task's own kernel-stack HIGH-WATER, on `[sched6]`'s ~5 s cadence: the instrument half of the `RENDER_STACK_SIZE` fix at the spawn site. Boot 10 dropped this task with NOTHING on the wire saying how deep a render pass actually goes, so the size would have been a guess forever and the next arc that deepens a pass would have rediscovered SPIN-6 on metal instead of watching headroom shrink on a gate. One poison scan + one line per 5 s, `witness`-gated exactly like every other `[u7stk]` probe — so the plain `./arroyo kernel8` media build carries none of it while `kernel8-test` and the metal witness image carry it unconditionally. ⚠ FOLDED, `#[cfg]` on the statement — PARITY §5.3.
-            s6_passes = 0;
-            s6_composites = 0;
-            s6_cyc = 0;
-            s6_last_ms = now;
-        }
+        w.census(dirty, unaos_kernel::arch::now_cycles().wrapping_sub(t0));
+        // RENDCONV — the rate-limited `[sched6]` block that stood here (28 lines: the ~5 s span gate,
+        // the three rates, the `prio_witness()` dispatch-share line and the folded `[u7stk]` probe) is
+        // `ChannelWait::census` at this file's tail, verbatim and on the same clock. It is the THIRD
+        // thing the three members disagree about after the wait and input ownership, and the one that
+        // could not be lifted into a constant: `[sched6]` reads four task-local accumulators,
+        // `[schedx86]` reads SHARED statics (so a re-homed twin continues the dead instance's numbers),
+        // and a polled terminus rate-limits on CNTPCT because a PASS COUNT is not a rate limit on a
+        // busy-poll loop. One hook, called once per pass with the two facts the pass owns — whether it
+        // presented, and what it cost — and every member keeps its own wire family and its own clock.
+        // The call sits exactly where `s6_cyc +=` sat, i.e. after the shell window's present, so what
+        // it measures is still the WHOLE pass including both composites.
+        //
+        // What deliberately did NOT move: the `t0` read stays folded onto the `livecon` line at the head
+        // of the pass, because the cost this witness reports is the PASS's, and a discipline that took
+        // the reading inside `wait()` would be timing its own park.
+        //
+        // The format string, the field order, the 5 s span, the `span.max(1)` divisors and the
+        // `PSTRIP_PERIOD_MS` term are unchanged — this member's wire is byte-for-byte the wire it was,
+        // which is what `./arroyo kernel8-test` reads the no-behaviour-change claim off.
+        //
+        // NOTE for the members that follow: `census` takes `presented` rather than reading a `dirty` the
+        // impl cannot see, and `cyc` rather than a clock the impl would have to choose. Both are facts
+        // the PASS owns. Everything a member needs beyond them — a channel depth, a fold count, an
+        // epoch, a pass counter — is the impl's own state and never a parameter of this body, which is
+        // what keeps the parameter list from growing one entry per board (the shape the GATE-FAMILY
+        // ruling calls a parameterised call of one member rather than a convergence).
+        // `PSTRIP_PERIOD_MS`, `prio_witness` and `stk_probe` are all public — none is binary-crate-
+        // private, which is why the CENSUS could move out while the BODY could not (S7-CONVERGENCE §3.3).
     }
 }
 
@@ -10433,3 +10433,160 @@ fn tegra_boot_focus(win: &Option<TegraShellWin>) {
 #[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
 #[inline(always)]
 fn tegra_boot_focus(_win: &Option<TegraShellWin>) {}
+
+// ============================================================================================
+// RENDCONV — THE CONVERGED RENDER PASS (LEDGER S7, design `docs/dev/evidence/orin14/S7-CONVERGENCE.md`)
+// ============================================================================================
+//
+// The GATE-FAMILY ruling this answers: `render_service`, `x86_render_service` and
+// `orin_render_service` are ONE function written three times; the shared part is the pass loop; the
+// axes that differ are HOW THE PASS WAITS and WHO OWNS INPUT. `render_pass` above IS that loop — it
+// is the Pi member converted IN PLACE, which is why nothing in it moved a line (PARITY §5.3: the
+// knob-off `kernel8.img` is this track's standing byte-identity proof and panic `Location` records
+// embed source lines, so the conversion had to be line-for-line or it would have had to be
+// re-baselined for a reason that has nothing to do with the arc).
+//
+// EVERYTHING NEW LIVES HERE, AT THE FILE TAIL, FOR THE SAME REASON: an item appended below the last
+// existing line shifts no `Location` in the file, so the two images `./arroyo knoboff` measures (the
+// x86_64 and aarch64-virt kernels) cannot move on account of this block existing. Measured, not
+// argued — see the RENDCONV section of `docs/dev/OS/08_VIDEO/engine.md` for the verdicts.
+//
+// WHY THE BODY STAYS IN `main.rs` AND NOT IN `video/`. The pass calls items private to this binary
+// crate that the `unaos_kernel` library cannot see: `handle_key`, `open_shell_window`,
+// `click1_dispatch`, `serfocus_witness`, `shellwin_service_rearm`, `console_launch_drain`,
+// `desktop_owns_backdrop`, and the `GUI_CHANNEL` / `GUI_RECV` / `SERIAL_WAKE_PENDING` statics.
+// Moving it into `video/render.rs` would mean lifting the shell's whole key path into the library
+// first, which is a different and larger arc (S7-CONVERGENCE §3.3, unchanged by this landing).
+
+/// RENDCONV — **what a pass was woken for.** `Input` carries the event the pass is to dispatch;
+/// `Tick` is the furniture cadence (the status-strip pulse on this member) and carries nothing.
+///
+/// A fourth state the design proposed — `Retire`, the x86 revenant order — is deliberately NOT a
+/// variant here, and that is a CODE-WINS amendment to S7-CONVERGENCE §3.1 rather than an omission.
+/// A retiring instance must NOT unwind: `wm`'s rows hold raw pointers into the pass's own locals
+/// (the shell store's heap buffer, the panel `Screen`), and the whole reason those are flat locals
+/// in a never-returning task is to keep them alive for the rows' lifetime. A `Wake::Retire` the
+/// BODY handled would have to park without returning anyway, so the park belongs where the epoch is
+/// read — inside the discipline's own `wait`, which simply never hands a pass back. One fewer
+/// variant, one fewer arm in the body, and the invariant is enforced by the type rather than by a
+/// comment asking the next reader not to `return`.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+enum Wake {
+    Input(unaos_kernel::pal::Event),
+    Tick,
+}
+
+/// RENDCONV — **THE WAITING AXIS**, one impl per wait discipline, named for the discipline and
+/// never for a board (R16: this file compiles on both arches, so a board name in it is a defect).
+///
+/// `wait` blocks, folds or polls — whatever this member's primitive is — and answers what woke the
+/// pass. It may also never answer, which is how a superseded instance retires (see `Wake`).
+///
+/// `census` is the per-pass report: `presented` is whether the pass composited the panel, `cyc` is
+/// what the pass cost. Both are facts the PASS owns; everything else a member's witness needs is
+/// the impl's own state.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+trait RenderWait {
+    fn wait(&mut self) -> Wake;
+    fn census(&mut self, presented: bool, cyc: u64);
+}
+
+/// RENDCONV — the BLOCKING-CHANNEL discipline: `GUI_CHANNEL.recv()` parks the task (`STATE_BLOCKED`,
+/// `switch_context` to the scheduler), so an idle render core is off the run queue entirely and
+/// burns nothing. Woken by a `post` from `gui_send`: the input task's USB pump, the status strip's
+/// `Event::Timer` pulse, and the serial wake token.
+///
+/// It carries the `[sched6]` accumulators that used to be locals of the pass body. They are plain
+/// (non-atomic) fields on purpose and that is not an oversight: this task is the sole owner of the
+/// render core and the sole reader of these four numbers. The x86 member's twin counters CANNOT be
+/// locals for the opposite reason — a re-homed instance has to continue a dead instance's numbers —
+/// which is exactly why the census is a hook on the discipline and not a block in the body.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+struct ChannelWait {
+    passes: u64,
+    composites: u64,
+    cyc: u64,
+    last_ms: u64,
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+impl ChannelWait {
+    fn new() -> Self {
+        // `last_ms` is seeded from the same clock the census gate reads, at task start, exactly as
+        // the `s6_last_ms` local it replaces was.
+        Self { passes: 0, composites: 0, cyc: 0, last_ms: unaos_kernel::arch::ms() }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+impl RenderWait for ChannelWait {
+    fn wait(&mut self) -> Wake {
+        // The pass count is charged HERE rather than in the body: a pass is exactly a wake, and the
+        // discipline is what knows when one happened. `GUI_RECV` is the GUI-CLICK-2 depth ledger and
+        // is charged on the same event, on the same line it always was.
+        let ev = GUI_CHANNEL.recv();
+        GUI_RECV.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        self.passes += 1;
+        // The strip pulse posts an `Event::Timer`; that IS this member's furniture cadence, so it is
+        // mapped to `Wake::Tick` and the body's old `Event::Timer` arm is the outer `Wake::Tick` arm.
+        // Every other event is the pass's to dispatch, unchanged and in arrival order.
+        match ev {
+            unaos_kernel::pal::Event::Timer => Wake::Tick,
+            other => Wake::Input(other),
+        }
+    }
+
+    fn census(&mut self, presented: bool, cyc: u64) {
+        if presented {
+            self.composites += 1;
+        }
+        self.cyc += cyc;
+        // Rate-limited [sched6] witness: incoming pass rate vs presented-composite rate + mean pass
+        // cost over the window (proves the pacing — presents track real activity, not the event
+        // rate). VERBATIM from the body it moved out of: same clock, same 5 s span, same field
+        // order, same `span.max(1)` divisors, same trailing `PSTRIP_PERIOD_MS` term.
+        let now = unaos_kernel::arch::ms();
+        let span = now.wrapping_sub(self.last_ms);
+        if span >= 5000 {
+            let passes_per_s = self.passes.saturating_mul(1000) / span.max(1);
+            let comps_per_s = self.composites.saturating_mul(1000) / span.max(1);
+            let mean_cyc = self.cyc / self.passes.max(1);
+            serial_println!(
+                // PULSE-4: the strip's cadence moved to 4 Hz; this witness's own 5 s span is
+                // deliberately UNCHANGED (wire volume). The label names the strip's rate, not this
+                // line's, so it tracks `PSTRIP_PERIOD_MS` rather than restating a stale literal.
+                "[sched6] passes={}/s composites={}/s mean={} cyc/pass (dirty-paced strip@{}ms)",
+                passes_per_s,
+                comps_per_s,
+                mean_cyc,
+                unaos_kernel::ui_status::PSTRIP_PERIOD_MS
+            );
+            // SCHED-PRIO: the dispatch-share line, emitted on `[sched6]`'s cadence and immediately
+            // after it, so a capture reads "composites=N/s" and "who won the dispatches that
+            // produced them" as one pair.
+            unaos_kernel::arch::sched::prio_witness(); #[cfg(feature = "witness")] unaos_kernel::arch::sched::stk_probe("render:pass"); // SHELLUP — the render task's own kernel-stack HIGH-WATER on `[sched6]`'s ~5 s cadence, the instrument half of the `RENDER_STACK_SIZE` fix at the spawn site. `witness`-gated exactly as every other `[u7stk]` probe, so the plain `./arroyo kernel8` media build carries none of it. ⚠ FOLDED, `#[cfg]` on the statement — PARITY §5.3. The label is subsystem-named (`render:pass`), never board-named (R16 / LEDGER S6).
+            self.passes = 0;
+            self.composites = 0;
+            self.cyc = 0;
+            self.last_ms = now;
+        }
+    }
+}
+
+/// RENDCONV — the Pi member, now a SHIM: build the discipline, run the shared pass. The `cfg` and
+/// the spawn site (`spawn_prio("render", …, render_cpu, PRIO_SERVICE)`) are untouched, so nothing
+/// about how this task is created, named, prioritised or homed changed with the convergence.
+///
+/// The `[rendconv]` line is the arc's reachability witness and it is printed by the SHIM rather than
+/// by the shared body, for the byte-identity reason the block header gives: a line inside
+/// `render_pass` would have moved the pass body, and a line inside a body that x86 will also compile
+/// (M2) would move the `knoboff` images for a witness rather than for the arc. It names the
+/// discipline, which is the one thing a capture could not otherwise recover once the three members
+/// are one body — `wait=channel` is the member, `input=owned` is the other axis.
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn render_service(_: usize) {
+    serial_println!(
+        "[rendconv] service=render wait=channel input=owned family=3 -> RENDER-CONVERGED == witness ::"
+    );
+    render_pass(&mut ChannelWait::new());
+}
