@@ -8,6 +8,11 @@
 #   ./arroyo arm           Build & boot aarch64
 #   ./arroyo test [secs]   Headless x86_64 run; serial captured to target/serial.log
 #   ./arroyo test-arm [s]  Headless aarch64 run; serial -> target/serial-arm.log
+#   ./arroyo test-splash [s]
+#                          SPLASHGATE: headless x86_64 run of the SHIPPED polarity — witness,
+#                          usbdebug and bootlog all OFF, `wc` on — which is the only build that
+#                          paints the boot splash at all. Replays scripts/specs/x86-splash.spec and
+#                          certifies both splash witnesses on the booted ELF. See test_splash().
 #   ./arroyo state         One line: branch@HEAD, behind-trunk, ahead-of-trunk, owed-above-origin, dirty
 #                          (read-only; the four drifts a seat must never have to volunteer)
 #   ./arroyo check         Syntax check: kernel (both targets, default + cfg-gated feature legs,
@@ -56,6 +61,13 @@ WORKSPACE_DIR="$(cd "$(dirname "$0")" && pwd)"
 # this case and self-arms, the same way `battery`'s sub-invocations do.
 # PTRLANE (2026-09-16) adds `test-ptr` for the same reason and by the same route: `test_ptr` re-execs
 # through `"$0" test-ptr`, and x86-ptr.spec pins `:: MOUSE-1:` lines that are `witness`-gated.
+# SPLASHGATE (2026-09-22, rmbp-ledger B149) adds NOTHING to this list, and its ABSENCE from it is the
+# whole verb. `test-splash` (both spellings) is deliberately unnamed here: `main.rs:225-234` compiles
+# the `boot_splash` call out under `any(usbdebug, bootlog, witness)`, so arming `witness` for that leg
+# would compile away the only thing it exists to look at. CRYSTALBOOT's finding is that this one line
+# is why no battery run in this repo's history has ever had a splash on its panel — so the fix is a
+# verb this case does not reach, not an exception inside it. ⚠ A future `test-*` verb added to this
+# list must be checked against that cfg before it is: `witness` is not a free arming on x86.
 case "${1:-}" in
     test|test-x86|test_x86|test-fat|test_fat|test-arm|test-aarch64|kernel8-test|test-pi|test-install|test_install|test-ptr|test_ptr)
         export UNAOS_WITNESS="${UNAOS_WITNESS:-1}" ;;
@@ -4085,6 +4097,18 @@ SERIAL_LOG="${WORKSPACE_DIR}/target/serial.log"
 # one a pass may rest on — a stopping decision that went wrong (a killed waiter, a lost stamp)
 # cannot talk this verb into rc=0, because the verdict re-reads the capture from scratch.
 X86_TEST_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-test.spec"
+# SPLASHGATE (rmbp-ledger B149): THE ONE LEG WHOSE END-OF-RUN CANNOT BE x86-test.spec's, and that is
+# a fact about the BUILD rather than a preference. Every other x86 leg is `witness`-armed by the case
+# at the head of this file, and x86-test.spec's COMPLETE marker — the zeolite metrics line — is
+# printed by the demo chain that battery arms. `test-splash` exists precisely to boot the SHIPPED
+# polarity (witness/usbdebug/bootlog all OFF: the image a person boots, and the only one that has a
+# splash at all — main.rs:225-234 compiles `boot_splash` OUT under any of the three), so on this leg
+# that marker is absent BY CONSTRUCTION and `x86_test_completion` would call every green run
+# TRUNCATED. The lane therefore brings its own end-of-run, in its own spec, read through the same
+# `--settled` predicate — and the `UNAOS_TEST_SPEC` handed to the builder's waiter in `test_x86_64`
+# is this same variable, so the two readings cannot drift apart. `UNAOS_SPLASHLANE` is set only by
+# `test_splash`'s re-exec, so nothing else in this script can land here.
+[ -n "${UNAOS_SPLASHLANE:-}" ] && X86_TEST_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-splash.spec"
 
 # Ask the settled capture whether the run reached its end. Sets three globals for the caller:
 #   X86_TEST_VERDICT  complete | truncated | nosignal | unknown
@@ -4203,12 +4227,30 @@ X86_AHCI_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-ahci.spec"
 X86_DEFAULT_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-default.spec"
 X86_INSTALL_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-install.spec"
 X86_PTR_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-ptr.spec"
+X86_SPLASH_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-splash.spec"
 X86_REPLAY_SPEC=""   # path of the spec to replay, or "" when none describes this capture
 X86_REPLAY_WHY=""    # why there is none — printed verbatim in the skip line
 x86_pick_capture_spec() {
     X86_REPLAY_SPEC=""; X86_REPLAY_WHY=""
     if [ -n "${UNAOS_SELFHOST:-}" ]; then
         X86_REPLAY_WHY="UNAOS_SELFHOST is armed — test-selfhost packs SOURCE-ALONG onto the fixture, so this is not the capture x86-fat.spec was measured against. That lane's verdict is its own 'SELFHOST: src verified … -> PASS ::' witness."
+        return 0
+    fi
+    # SPLASHGATE: THE SHIPPED-POLARITY LEG, ASKED FIRST because its whole subject is the ABSENCE of
+    # the knobs every arm below assumes. `UNAOS_SPLASHLANE` is set only by `test_splash`'s re-exec,
+    # which also arms UNAOS_WC (the crystal's retirement seam and `fbcon::panel_console_live` are
+    # both `wc`-gated — b9e673d3) and leaves UNAOS_WITNESS unset (the head-of-file case does not name
+    # this verb, deliberately: `witness` compiles `boot_splash` out and there is no splash to gate).
+    # The guard therefore states the polarity POSITIVELY on both sides, because "the knob is absent"
+    # is exactly the condition a hand-exported marker would get wrong, and an unobservable splash
+    # would then be scored as a passing one.
+    if [ -n "${UNAOS_SPLASHLANE:-}" ]; then
+        if [ -n "${UNAOS_WC:-}" ] && [ -z "${UNAOS_WITNESS:-}" ] && [ -z "${UNAOS_USBDEBUG:-}" ] \
+           && [ -z "${UNAOS_BOOTLOG:-}" ]; then
+            X86_REPLAY_SPEC="$X86_SPLASH_SPEC"
+        else
+            X86_REPLAY_WHY="UNAOS_SPLASHLANE is armed on the wrong polarity (UNAOS_WC='${UNAOS_WC:-}' UNAOS_WITNESS='${UNAOS_WITNESS:-}' UNAOS_USBDEBUG='${UNAOS_USBDEBUG:-}' UNAOS_BOOTLOG='${UNAOS_BOOTLOG:-}') — main.rs:225-234 compiles \`boot_splash\` OUT under any of witness/usbdebug/bootlog, so every line x86-splash.spec pins is absent by construction on such a build and scoring it would be calling a splash-less image a splash pass. Use './arroyo test-splash' for the gated run."
+        fi
         return 0
     fi
     # PTRLANE: THE RELATIVE-POINTER LEG. `UNAOS_PTRLANE` is set only by `test_ptr`'s re-exec, which
@@ -8382,6 +8424,120 @@ test_ptr() {
     test_x86_64 "$secs"
 }
 
+# SPLASHGATE: `./arroyo test-splash [secs]` — THE SHIPPED POLARITY, BOOTED, so the boot splash stops
+# being a thing no gate in this repo has ever been able to see.
+#
+# WHAT CRYSTALBOOT FOUND (fold b9e673d3, rmbp-ledger B137). `./arroyo test` FORCE-ARMS the kernel's
+# `witness` feature — the `case` at the head of this file, `export UNAOS_WITNESS="${UNAOS_WITNESS:-1}"`,
+# which no caller can turn off from outside because `:-` substitutes on an EMPTY value too — and
+# `main.rs:225-234` compiles the `boot_splash` CALL out under `any(usbdebug, bootlog, witness)`. So no
+# battery run in this repo's history has had a splash on its panel; the flight-11 image carried
+# witness AND usbdebug for the fixtures and had none either; and CRYSTALBOOT's own mutation test —
+# re-introduce the paint after the desktop clear and watch a gate red — COULD NOT BE RUN. LAWS §5:
+# an instrument's presence is proven in the artifact, and a check that cannot fire is an absent one.
+#
+# WHY A VERB AND NOT A KNOB, the `test_ptr` answer with one term added. The leg needs three knobs set
+# together — `UNAOS_WC` (the `retire` function, its two call sites and `fbcon::panel_console_live` are
+# all `wc`-gated for byte-identity; without it the fold compiles to nothing and every pin is red),
+# `UNAOS_QEMU_FULL` (the three-valued run mode: `mode=full` on the sidecar is the only reading that
+# certifies the tail was not truncated — queue §5, "a truncated run must never be a pass"), and the
+# marker itself. And it needs one knob NOT set, which is the part a knob-on-`test` could never give:
+# `witness` must be OFF, and the only way to have that on this script is to be a verb the head-of-file
+# case does not name. That is the whole reason this is a fourth `test-*` verb rather than a flag.
+#
+# THE DEFAULT-OFF POLARITY IS THE ONE WORTH A LEG (LAWS §5, "a default-quiet knob has two polarities
+# and the gate must compile the one that SHIPS"). `witness` is the battery's polarity; it is not the
+# operator's. The image a person boots off a card has witness, usbdebug and bootlog all off, and it is
+# the ONLY image that paints a crystal at all — so the splash's entire behaviour lives in the polarity
+# every existing x86 QEMU leg compiles away. This verb boots that one. The serial console is KEPT
+# (`-serial file:` is the builder's, not a witness feature) and the splash's own `serial_println!`
+# lines are not witness-gated, which is what makes the shipped polarity OBSERVABLE rather than merely
+# built: `splash_artifact_cert` below proves that on the ELF before a single pin is scored.
+#
+# THE WALL: 120 s default. The lane's last pinned line is its COMPLETE marker at the GUI handoff, and
+# nothing in it waits on a fixture ladder (there is none — that is the point), so this leg is shorter
+# than `test-ptr`'s. `UNAOS_QEMU_FULL=1` is armed by the re-exec regardless, for the reason above.
+test_splash() {
+    local secs="${1:-120}"
+    if [ -z "${UNAOS_SPLASHLANE:-}" ]; then
+        exec env UNAOS_SPLASHLANE=1 UNAOS_WC=1 UNAOS_QEMU_FULL=1 "$0" test-splash "$secs"
+    fi
+    echo -e "${COLOR_CYAN}⚡ SPLASHGATE: booting the SHIPPED x86 wc polarity — witness, usbdebug and bootlog all OFF, so \`boot_splash\` is compiled IN and the crystal is on the panel (${secs}s, full wall)${COLOR_RESET}"
+    local _rc=0
+    test_x86_64 "$secs" || _rc=$?
+    # A RED MUST NAME THE PIN, and on this lane it would not without these four lines. MEASURED on
+    # this gate's own go-red (b9e673d3's splash.rs diff reverse-applied): `qemu_await.py --settled`
+    # folds "reached the end-of-run marker but a REQUIRE never printed" into `status=truncated`
+    # (`reason=short-witnesses:1`, and the reason line names the witness) — so `test_x86_64`'s
+    # TESTTRUNC step reds FIRST, prints `did not reach <marker>` for a capture that DID reach it,
+    # and returns before `x86_spec_replay` can print the verdict block. That wording is shared
+    # harness and is NOT this verb's to rewrite (it is a finding for the queue); what IS this verb's
+    # is that its own red be readable. So on any non-zero the lane replays the capture it just took
+    # and prints mbench's verdict, which says the true thing: `❌ MBENCH FAIL — 1/2 required
+    # witnesses … FIRST-SHORTFALL x86-splash.spec:88 REQUIRE :: SPLASH: retired at …` followed by
+    # `(the end-of-run marker was seen — the run completed, so a missing witness here is a GENUINE
+    # regression)`. DIAGNOSIS ONLY: `|| true` and no effect on `_rc` — the verdict is already made,
+    # this step only says what it was about, and it must never turn a red into anything else.
+    if [ "$_rc" -ne 0 ]; then
+        echo -e "${COLOR_PURPLE}──────── SPLASHGATE diagnosis: what this lane's own spec says about that capture ────────${COLOR_RESET}"
+        python3 "${WORKSPACE_DIR}/scripts/mbench.py" --replay "${WORKSPACE_DIR}/target/serial.log" \
+            --spec "$X86_SPLASH_SPEC" --platform x86 || true
+    fi
+    # THE ARTIFACT IS ASKED LAST AND ITS ANSWER IS NOT OPTIONAL. Last, because the builder REBUILDS
+    # the kernel from its own env-driven feature list (builder/src/main.rs) and the ELF that booted is
+    # the one it left behind — certifying the pre-builder `build_kernel_x86_64` output would be
+    # certifying a different binary, which is the s42/INSTGUI failure exactly. Not optional, because
+    # a spec replay over a capture from a splash-less image is the false green this whole verb exists
+    # to make impossible: the pins would simply be missing, and `x86_spec_replay` would say so — but
+    # only the ELF can say WHY, and "the witness is not in the image" and "the witness did not fire"
+    # are different defects with different fixes.
+    splash_artifact_cert "${WORKSPACE_DIR}/target/x86_64-unaos/release/unaos-kernel" || _rc=1
+    return $_rc
+}
+
+# SPLASHGATE — the two splash witnesses are IN THE BOOTED ELF, counted, with both controls.
+#
+# THE SHAPE IS `banner_artifact_check`'s and the controls are the same pair, for its reason: a `grep`
+# that matches nothing and a `grep` that matches everything both look like a clean gate from one
+# side only, so a present-control and an absent-control run FIRST and a broken instrument prints no
+# counts at all. What differs is the claim. `banner_artifact_check` asks "does the banner's feature
+# list describe this image"; this asks the narrower question B137's queue row was left owing: are the
+# two strings the lane's REQUIREs pin actually compiled into the binary that booted, exactly once
+# each — so that a missing line on the wire is a splash that did not FIRE, never a splash that was
+# never BUILT.
+#
+# ONE HIT EACH, not ">= 1", and that is a claim and not a tidy-up: both strings are single
+# `serial_println!` format literals with one call site apiece (splash.rs:436 and :690 at b9e673d3), so
+# a second hit means a second emitter has appeared and the wire's counts stop meaning what the spec
+# says they mean. `-F` and `LC_ALL=C` because these are fixed byte strings in a binary, never
+# patterns; `-a` because the file is not text. The trailing space in the `retired at ` token is
+# load-bearing — it is what distinguishes the format literal from this comment's prose in any future
+# grep of the tree, and it is the same token the spec pins.
+splash_artifact_cert() { # $1 = the booted kernel ELF
+    local elf="$1" rc=0 cpos cneg n_traced n_retired
+    if [ ! -f "$elf" ]; then
+        echo -e "${COLOR_RED}✖ SPLASHGATE artifact: ${elf} is not there to read — the lane cannot say whether the splash witnesses were compiled in. NO verdict, and NO pass. rc=1${COLOR_RESET}"
+        return 1
+    fi
+    cpos=$(LC_ALL=C grep -a -o -F -- 'UNAOS_BUILD_STAMP' "$elf" | wc -l)
+    cneg=$(LC_ALL=C grep -a -o -F -- 'NOTATOKEN-UNAOS' "$elf" | wc -l)
+    if [ "$cpos" -eq 0 ] || [ "$cneg" -ne 0 ]; then
+        echo -e "${COLOR_RED}✖ SPLASHGATE artifact: THE INSTRUMENT IS BROKEN, not the build — present-control UNAOS_BUILD_STAMP=${cpos} (want >0), absent-control NOTATOKEN-UNAOS=${cneg} (want 0). Every count below would be unreadable; NO verdict. rc=1${COLOR_RESET}"
+        return 1
+    fi
+    n_traced=$(LC_ALL=C grep -a -o -F -- ':: SPLASH: crystal cluster traced' "$elf" | wc -l)
+    n_retired=$(LC_ALL=C grep -a -o -F -- ':: SPLASH: retired at ' "$elf" | wc -l)
+    echo -e "${COLOR_YELLOW}⚡ SPLASHGATE artifact: certifying on the BOOTED ELF (${elf##*/}, $(wc -c < "$elf" | tr -d ' ') B); controls UNAOS_BUILD_STAMP=${cpos} NOTATOKEN-UNAOS=${cneg}.${COLOR_RESET}"
+    echo -e "    ':: SPLASH: crystal cluster traced' ${n_traced} hit(s) (want 1)   ':: SPLASH: retired at ' ${n_retired} hit(s) (want 1)"
+    if [ "$n_traced" -ne 1 ] || [ "$n_retired" -ne 1 ]; then
+        echo -e "${COLOR_RED}❌ SPLASHGATE artifact FAILED — the booted image does not carry exactly one of each splash witness. 0 hits means this build compiled the splash OUT (witness/usbdebug/bootlog armed, or the \`wc\` knob lost) and the capture below describes a splash-less kernel; >1 means a second emitter has appeared and the spec's counts no longer mean what they say. rc=1${COLOR_RESET}"
+        rc=1
+    else
+        echo -e "${COLOR_GREEN}✔ SPLASHGATE artifact: both splash witnesses are in the image that booted — a missing line on the wire is a splash that did not fire, not one that was never built.${COLOR_RESET}"
+    fi
+    return $rc
+}
+
 # aarch64 ESP for the Raspberry Pi 4 (UEFI / Path A). Copy onto a FAT32 SD card alongside the
 # Tianocore RPi4 EDK2 firmware (RPI_EFI.fd + the Pi firmware blobs).
 # ── BANNERCERT2 (2026-09-15): the aarch64 half of GATE-BANNERCERT ────────────────────────────────
@@ -12040,6 +12196,14 @@ case "${1:-}" in
         # Fold-gate command, not a leg of `check`.
         test_ptr "${2:-120}"
         ;;
+    test-splash|test_splash)
+        # SPLASHGATE: the SHIPPED-polarity leg — the only x86 QEMU verb this script does NOT arm
+        # `witness` for (the case at the head of the file deliberately omits both spellings), so
+        # `boot_splash` is compiled in and the crystal is on the panel. Re-execs itself with
+        # UNAOS_SPLASHLANE / UNAOS_WC / UNAOS_QEMU_FULL armed (see test_splash), so this arm is
+        # entered twice per invocation. Fold-gate command, not a leg of `check`.
+        test_splash "${2:-120}"
+        ;;
     kernel8|baremetal)
         kernel8
         ;;
@@ -12077,7 +12241,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|clean]"
+        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|clean]"
         exit 1
         ;;
 esac
