@@ -279,6 +279,10 @@ ftdirx|:: FTDIRX: first byte rx=|-|measured
 gen7r8|:: gen7: r8 begin rung=R8 wake=|-|measured
 nvidia-kepler-kfbind|:: KFBIND: pbdma[|-|measured
 nvidia-kepler-kdhead|:: KDHEAD: end rung=KD14|-|measured
+nvidia-kepler-ctrladdr|:: kepler: ctrladdr |-|measured
+nvidia-kepler-ctrlbind|:: kepler: ctrlbind |-|measured
+hda|[hda] census|-|measured
+hda-tone|:: HDA-TONE:|-|measured
 tegra|:: tegra: JB5 — XUSB domain not ON at handoff|-|measured(1)
 tegrasmp|:: AARCH64 SMP: ORIN-SMP-3 — DTB /cpus named no cores (dtb=@|-|measured(1)
 apsrun|:: [apsrun] cpu |-|measured(2)
