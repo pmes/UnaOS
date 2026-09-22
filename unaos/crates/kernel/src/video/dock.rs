@@ -685,13 +685,13 @@ static UNHIDES: AtomicU64 = AtomicU64::new(0);
 static PRESS_OUTCOME: AtomicU64 = AtomicU64::new(0);
 const DOCK_OUT_BACKGROUND: u64 = 1;
 const DOCK_OUT_LAUNCH_SHELL: u64 = 2;
-const DOCK_OUT_RAISE: u64 = 3; const DOCK_OUT_LAUNCH_CONSOLE: u64 = 4; // APPPIN — one outcome word per pinned app, so the router's `band=dock` witness tells a console launch from a shell launch.
+const DOCK_OUT_RAISE: u64 = 3; const DOCK_OUT_LAUNCH_CONSOLE: u64 = 4; #[cfg(feature = "quarry")] const DOCK_OUT_OPEN_REQUESTED: u64 = 5; // APPPIN — one outcome word per pinned app, so the router's `band=dock` witness tells a console launch from a shell launch. DOCKPRESS (rmbp-ledger B129, the finding QUARRYCLICK handed on rather than took) — **the QUARRY PIN needs a FIFTH word, and none of the four above can be borrowed.** Measured on `~/unaos-bench/scratch/rmbp-0915/quarryclick-logs/serial-caps.log`: line 2058 `[dock] press at (424,762) tile=0/5 quarry=pin -> open requested` and line 2059, ONE LINE UNDER IT, `[clickroute] press at (424,762) band=dock -> launch-console deliver=0`. The router's CLICK-BAND witness and the dock's own line disagree about the SAME press, because the `QUARRY_PIN_ID` arm in [`press_at`] returns consumed WITHOUT writing `PRESS_OUTCOME` — so [`last_press_outcome`] hands back whatever the previous consumed press left, and on that capture the previous one was the CONSOLE pin at (640,762) (line 1798, `-> launch-console`). A STALE word, not a wrong constant: the arm launches nothing (`post_launch` is never called), raises nothing, and is not the dock's background, so each of the four is a different lie about it, and `none` would read as "no arm consumed this press" when an arm did. `quarry`-gated, and the gate is the arm's own, so the DEFAULT image — the one `./arroyo knoboff` measures — gains no byte. ⚠ FOLDED onto this const line, onto the match arm below and onto the arm's existing `request_open()` call; CODE BEFORE COMMENT (LEDGER P7), line count unchanged.
 
 /// CLICK-BAND — the last consumed press's outcome, as the witness word.
 pub fn last_press_outcome() -> &'static str {
     match PRESS_OUTCOME.load(Ordering::Relaxed) {
         DOCK_OUT_BACKGROUND => "background",
-        DOCK_OUT_LAUNCH_SHELL => "launch-shell", DOCK_OUT_LAUNCH_CONSOLE => "launch-console",
+        DOCK_OUT_LAUNCH_SHELL => "launch-shell", DOCK_OUT_LAUNCH_CONSOLE => "launch-console", #[cfg(feature = "quarry")] DOCK_OUT_OPEN_REQUESTED => "open-requested", // DOCKPRESS — the word is the dock's OWN sentence, hyphenated to this witness's vocabulary: `[dock] … quarry=pin -> open requested` becomes `band=dock -> open-requested`, so the two adjacent lines now say the same thing about the same press and a reader needs neither to interpret the other.
         DOCK_OUT_RAISE => "raise",
         _ => "none",
     }
@@ -1064,7 +1064,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     // where a volume read belongs. Consumed either way, so the press never falls through to a window.
     #[cfg(feature = "quarry")]
     if r.id == QUARRY_PIN_ID {
-        crate::video::quarry::request_open();
+        PRESS_OUTCOME.store(DOCK_OUT_OPEN_REQUESTED, Ordering::Relaxed); crate::video::quarry::request_open(); // DOCKPRESS — **THE STORE THIS ARM NEVER MADE, and it goes BEFORE the latch, not after.** Every other consuming arm of this function writes `PRESS_OUTCOME` (background, the two app pins, the raise tail); this one did not, so the router's `band=dock` word was the PREVIOUS consumed press's for the whole of the Quarry gesture — `launch-console` on the capture this row was measured from. Written ahead of `request_open()` for the same reason SERIALDOOR's `note_origin` goes ahead of its `push_event` (`drivers/xhci/ftdi.rs:705`): the latch is drained by `quarry::service()` on the arch's input-drain task, which can be running on another core the instant this store's cache line is visible, and the router reads the word on ITS task straight after `press_at` returns — a store after the latch is a word that can be read stale by exactly the reader it exists for. Writing first can only ever be early, and early is harmless: the arm below returns `true` unconditionally, so a word written here is always a word this press earned. ⚠ FOLDED onto the existing call, CODE BEFORE COMMENT (LEDGER P7).
         serial_println!(
             "[dock] press at ({},{}) tile={}/{} quarry=pin -> open requested",
             x, y, t, n

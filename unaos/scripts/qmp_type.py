@@ -16,6 +16,10 @@
 #
 # Timing is driven from python (the shell `sleep` binary is unreliable under the sandbox).
 #
+# QMPCHECK (rmbp 2026-09-22) — the `qmp_capabilities` handshake's REPLY is read and a refusal is
+# fatal (see `main`): an unread refusal types into a closed monitor and the capture looks like a
+# kernel that ignored every key. QUARRYCLICK paid four runs for that silence.
+#
 # XHCIKBD (rmbp 2026-09-15) — the BURST mode, `--bursts N --burst P`, is the x86 keyboard-report-loss
 # fixture's typist (`UNAOS_XHCIKBD=1 ./arroyo test`). It is an EXTENSION of this script, not a
 # second QMP path: same `Qmp` class, same port plumbing, same `--wait`.
@@ -211,8 +215,22 @@ def main():
     a = ap.parse_args()
 
     qmp = Qmp(connect(a.host, a.port, a.connect_timeout))
-    qmp._read_obj()  # greeting
-    qmp.execute("qmp_capabilities")
+    # QMPCHECK — READ THE HANDSHAKE'S REPLY, and DIE on a refusal. A fresh QMP monitor is in
+    # CAPABILITIES-NEGOTIATION MODE and refuses every command until `qmp_capabilities` succeeds;
+    # `Qmp.execute` hands that refusal back as `{"error": ...}` and this line used to throw it away.
+    # The cost was measured, not imagined: the QUARRYCLICK fixture (2026-09-17) lost FOUR runs and
+    # ~40 injected presses that produced NOT ONE line on the guest's wire, because it inherited this
+    # silence. A typist that types into a closed monitor is indistinguishable, on the capture, from a
+    # kernel that ignored every key — and the second reading is the one a reader reaches for. Loud
+    # here is cheap: nothing has been typed yet, so a `SystemExit` costs the run and no evidence.
+    # `qmp_shoot.py:92` has always done both halves; this is that check, in the same shape.
+    greeting = qmp._read_obj()
+    if "QMP" not in greeting:
+        print(f"[qmp] warning: unexpected greeting: {greeting}", file=sys.stderr)
+    r = qmp.execute("qmp_capabilities")
+    if "error" in r:
+        raise SystemExit(f"[qmp] qmp_capabilities failed: {r['error']} — the monitor is still in "
+                         f"capabilities-negotiation mode and would refuse every key; nothing typed")
 
     t0 = time.time()
     for m in a.marker:

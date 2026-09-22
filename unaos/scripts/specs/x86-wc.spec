@@ -1,7 +1,7 @@
 # x86-wc.spec — the x86 window-compositor QEMU leg: DMGOVLP (overlap-forced banded damage, with
 # the sprite parked on the stack) plus the two ladder witnesses it depends on for ordering.
 #
-#   QEMU gate:  UNAOS_WC=1 ./arroyo test 150          -> unaos/target/serial.log
+#   QEMU gate:  UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1 ./arroyo test 240 -> target/serial.log
 #               ./arroyo mbench --replay target/serial.log \
 #                        --spec scripts/specs/x86-wc.spec --platform x86
 #
@@ -130,6 +130,80 @@ FORBID :: STRIPVAC: .* :: FAIL ::
 # neither skip arm is honest, so one appearing means the panel or the scratch was lost — a red.
 FORBID :: STRIPVAC: .* :: SKIP ::
 
+# --- SPECPINS (2026-09-22) — THE THREE 2026-09-17 FIXTURES THIS GATE COULD SCORE AND DID NOT -----
+# --- MENUDROP, SERIALDOOR and W5SPIN all landed on hw-rmbp on 2026-09-17, each with a green QEMU
+# --- run quoted in its own ledger row, and NOT ONE of them was pinned by a directive. A fixture
+# --- whose verdict no spec reads is a fixture that can stop running silently — the hole the PTRDEAD
+# --- block above exists to close, reopened three times in one day. B121's and A9's rows both end
+# --- with an OWED clause asking for exactly these lines. They are here now.
+# ---
+# --- THE RUN-BY LINE GREW TWO KNOBS FOR THIS BLOCK, and they are not decoration: `UNAOS_QUARRY=1`
+# --- because SERIALDOOR's leg 3 is Quarry's `\r` (without it the leg reports `skip-knoboff`, which
+# --- is honest but scores nothing), and `UNAOS_FTDIRX=1` because the tag producer is that module —
+# --- `serialdoor_selftest` is `#[cfg(all(witness, wc, ftdirx))]` and its knob-off stub prints
+# --- `:: SERIALDOOR: ftdirx knob off — no tag producer compiled :: SKIP ::`. The SKIP forbid below
+# --- is therefore ALSO the knob check: run this file without `UNAOS_FTDIRX=1` and it reds by name
+# --- rather than passing on a fixture that never ran.
+
+# --- MENUDROP (rmbp-ledger B121) — the MENUBAR band the x86 router never had. `band_lines=2` is the
+# --- field that BITES and it is pinned literally rather than as `\d+`: the fixture's own verdict
+# --- already ANDs `opened && closed`, so a PASS proves the two presses worked — but `band_lines` is
+# --- the count of `[clickroute] … band=menubar` lines the ROUTER owed, and it is the only field
+# --- that separates "the router's new arm ran" from "`winmenu::press_at` did the work directly",
+# --- which is precisely the confusion that let `winmenu::selftest` pass on every x86 boot while the
+# --- metal press was inert. `routed_open`/`open`/`routed_close`/`closed` are named for the standing
+# --- reason this file states at DMGOVLP: a later edit that drops one from the line reds this rule
+# --- instead of silently narrowing what it asserts.
+REQUIRE :: MENUDROP: .* routed_open=true open=true routed_close=true closed=true band_lines=2 :: PASS ::
+FORBID :: MENUDROP: .* :: FAIL ::
+# --- A SKIP is `wm::create` declining, or the bar never publishing the caption inside 250 ms. On
+# --- this gate (QEMU 1280x800, one 8x8 fixture row) neither is honest — same rule as DMGOVLP and
+# --- STRIPVAC above — so a SKIP means the fixture lost its panel or its window table.
+FORBID :: MENUDROP: .* :: SKIP ::
+
+# --- SERIALDOOR (rmbp-ledger A9) — the wire is a console. THREE legs are named because the verdict
+# --- is only worth pinning with its CONTROL in it: `control=true` is an UNTAGGED Esc being eaten by
+# --- the live key door, and without it a green `wire=true` is indistinguishable from a door that
+# --- died. `quarry=true(...)` keeps the parenthesised state out of the pin — `ran`, `ran-nodoor`,
+# --- `skip-unopened`, `skip-knoboff` — because a knob-off Quarry is not this door's defect and the
+# --- fixture already folds the skips to `true`; what is pinned is that the leg REPORTED. The three
+# --- census numbers are `\d+` and not literals: `claimed`/`outstanding` depend on how many bytes
+# --- leg 4 pushed before the drain ran, which is another task's scheduling (the WINMENUFLAKE rule),
+# --- and `overrun` is a ring-pressure fact. `e2e=pushed` is literal — it is a statement about what
+# --- the FIXTURE did, not about what the shell got back, and it must not quietly become a verdict.
+REQUIRE :: SERIALDOOR: .* control=true wire=true quarry=true\(.*\) claimed=\d+ outstanding=\d+ overrun=\d+ e2e=pushed :: PASS ::
+FORBID :: SERIALDOOR: .* :: FAIL ::
+# --- Both SKIP arms, and here they mean different things — no panel / table full is the DMGOVLP
+# --- rule again, but `ftdirx knob off` is the RUN-BY line being disobeyed. Either way a run that
+# --- prints one has scored nothing, which is the only thing a spec must never call a pass.
+FORBID :: SERIALDOOR: .* :: SKIP ::
+
+# --- W5SPIN — THE CENSUS, and it is pinned for PRESENCE and not for a value. `spin=`/`wedge=` are
+# --- the per-window shadow-acquire counters `pace_shadow_acquire` feeds (video/wm.rs:2049, census
+# --- at :2288), appended to the per-window `[wpace] … mode=panel` line. On a healthy QEMU boot they
+# --- read `spin=0 wedge=0` and NEITHER `:: [wcser] PRESENT-BANDED SPIN …` arm prints at all — one
+# --- line per TRANSITION, never per present — so the transition lines cannot be required anywhere
+# --- and the ONLY positive evidence that the bound exists in the shipped build is that the census
+# --- fields are on the wire. That is the whole claim here: the counters print. A NUMBER is
+# --- deliberately not pinned (`\d+`): contention under TCG is scheduler luck, and a gate that
+# --- demanded `spin=0` would red a run that contended once and recovered correctly, which is the
+# --- bound WORKING. `x86-witness.spec` carries the other half — the three lines a metal boot that
+# --- lost this race prints, as FORBIDs, measured on the flight-10 capture that printed them.
+# --- The `\d+` on `win=` and the `(yes|no)` on `live=` are there so this rule reds if the line is
+# --- ever re-shaped rather than matching a prefix that happens to survive.
+REQUIRE \[wpace\] win=\d+ asid=0x[0-9a-f]+ live=(yes|no) mode=panel .* spin=\d+ wedge=\d+ frame_us=\d+
+
+# --- BOOTFAILS — HALF OF IT BELONGS HERE AND HALF DOES NOT, and the half that does was already
+# --- pinned. `[clickroute] route … -> PASS` is line 43 of this file and has been since the ladder
+# --- witnesses were added, so BOOTFAILS's router leg is covered without a new directive. Its OTHER
+# --- leg, `[wc-x] move-vacate … -> PASS`, is NOT PINNED HERE AND MUST NOT BE — measured, not
+# --- assumed: `move_vacate_probe` is called from `desktop_uefi::activate_on`
+# --- (video/desktop_uefi.rs:599), this file's SCOPE paragraph says `desktop_uefi::activate` never
+# --- runs under QEMU because there is no Kepler, and an unperturbed `UNAOS_WC=1 UNAOS_QUARRY=1
+# --- UNAOS_QEMU_FULL=1` capture (`~/unaos-bench/scratch/rmbp-0915/quarryclick-logs/serial-clean.log`)
+# --- carries ZERO `[wc-x] move-vacate` lines. A REQUIRE for it here would red every run of this
+# --- gate forever. It is a PENDING in `x86-witness.spec`, where the boot that prints it lives.
+
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
 # A PINNED LINE IN THIS FILE IS CHANGED TOGETHER WITH THE KERNEL LINE IT PINS, IN THE SAME COMMIT —
 # re-pinned to the new wording (naming the arc that changed it), or dropped with the reason stated.
@@ -145,8 +219,16 @@ FORBID :: STRIPVAC: .* :: SKIP ::
 # repo's safe form for exactly that reason. The contract is ENFORCED, not merely written: see below.
 #
 # WHO RUNS THIS FILE, and the gate that makes the answer mandatory:
-# RUN-BY: knobleg — UNAOS_WC=1 ./arroyo test 150, then
+# RUN-BY: knobleg — UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1 ./arroyo test 240, then
 #          ./arroyo mbench --replay target/serial.log --spec scripts/specs/x86-wc.spec --platform x86
+#   THE KNOB SET GREW WITH THE SPECPINS BLOCK and each addition is load-bearing, not defensive:
+#   `UNAOS_QUARRY=1` gives SERIALDOOR's leg 3 a Quarry to focus (without it the leg reports
+#   `skip-knoboff`), `UNAOS_FTDIRX=1` compiles the tag producer the whole fixture is gated on (its
+#   absence prints the `ftdirx knob off` SKIP this file now FORBIDs by name), and `UNAOS_QEMU_FULL=1`
+#   is the three-valued run mode: `mode=full` on the sidecar is the only reading that certifies the
+#   tail was not truncated, and a spec verdict on a short capture is the false green this tree's
+#   queue §5 named on 2026-09-17 ("a truncated run must never be a pass"). The wall moved 150 -> 240
+#   for the same reason: the SERIALDOOR and MENUDROP fixtures sit late in the witness ladder.
 #   NOT on the default gate: `./arroyo test` replays x86-test.spec, and this file asserts a
 #   UNAOS_WC=1 build (on x86 the compositor's ignition is the Kepler takeover, so those knobs are
 #   load-bearing here). Measured 8/8 against this seat's fold-gate wc capture on 2026-09-15.
