@@ -268,3 +268,4 @@ refs/heads/exec-rmbp-menustat              c2b03aca IN-FLIGHT      rmbp         
 refs/heads/exec-rmbp-splashgate            b9e673d3 IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-flakefix              5b4c6d80 IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-neutral               c1ee6955 IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-gen7r6                e0ab16af IN-FLIGHT      rmbp                      2026-09-22
