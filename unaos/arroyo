@@ -4470,20 +4470,46 @@ test_x86_64() {
     # No new knob for the kernel and no `_feats` entry: `UNAOS_PTRLANE` is a HOST marker set by
     # the verb's re-exec, the standing of `UNAOS_INSTTYPIST` and `UNAOS_XHCIHUB_NOPTR`.
     # The typist's own transcript lands BESIDE the capture (target/ptrlane-typist.log), never in it.
+    # PTRACK (FLAKEFIX, rmbp-ledger B150, 2026-09-22) — AND THE 50 ms IS NOT A DELIVERY GUARANTEE.
+    # The paragraph above reasons "one HID report per QMP sync"; measured on a loaded box that is
+    # false. QEMU's `hid_pointer_event` folds a new motion event into the TAIL queue entry while that
+    # entry is unpolled, so when the guest's poll gap stretches past the injection gap two adjacent
+    # moves become ONE report — and because this lane alternates +24/-24, the fold is exactly
+    # (+24)+(-24) = 0, a delta the typist cannot send and the guest's decode does not count
+    # (`Event::Mouse` is emitted only when `dx != 0 || dy != 0`). TRACKPAD's 2026-09-22 go-red capture
+    # is that arithmetic on the wire: `:: MOUSE-1: 32 reports, last dx=0 dy=0` beside
+    # `:: PTRINSTALL: installs=27 reports=27` for 36 typed, against `last dx=-24 dy=-24` /
+    # `installs=36 reports=36` from the same command on the same box at lower load. Nothing was
+    # dropped — QMP acked all 36 and the travel is conserved; only the COUNT was, and the count is
+    # what x86-ptr.spec pins. So the typist now ACKS: `--pointer-ack` re-sends the shortfall the
+    # guest's own `[ptrinstall] reports=` reports, up to `--ack-rounds`, and says so either way.
+    # The equality above is therefore pinned HARDER, not looser — the spec literal is untouched.
+    #   THE TWO GO-REDS, host-side and named here rather than in the knob table because they set this
+    #   typist's arguments and nothing else: `UNAOS_PTRLANE_NOACK=1` disarms the ack (the wall-clock
+    #   typist exactly as it stood) and `UNAOS_PTRLANE_GAP=<secs>` forces the first-pass cadence, so
+    #   `UNAOS_PTRLANE_NOACK=1 UNAOS_PTRLANE_GAP=0.006 ./arroyo test-ptr 150` reproduces the fold on
+    #   an IDLE host — 0.006 is under the endpoint's own 8 ms polling interval (`interval=7` on the
+    #   MOUSE-1 enumeration line) and above the 16-deep queue's overflow regime, so it isolates the
+    #   fold from the drop — and it must red on the counts: measured `installs=8 reports=8` for 36
+    #   typed at host load 11.2. With the ack armed the SAME command must still green, and does:
+    #   four consecutive runs at `installs=36 reports=36`, one retry round each, at load 9.2 to 41.2.
     local PTRLANE_MOVES=36
     # ⚠ REMOVE THE SIDECAR FIRST — the PTRPRESS lesson, unconditional so a disarmed leg clears it.
     rm -f "${WORKSPACE_DIR}/target/ptrlane-typist.log"
     if [ -n "${UNAOS_PTRLANE:-}" ]; then
         export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -device usb-mouse,bus=xhci.0"
+        local ptrlane_gap="${UNAOS_PTRLANE_GAP:-0.05}"
+        local ptrlane_ack="$PTRLANE_MOVES"; [ -n "${UNAOS_PTRLANE_NOACK:-}" ] && ptrlane_ack=0
         python3 "${WORKSPACE_DIR}/scripts/qmp_type.py" --port "$qmp_port" --connect-timeout 600 \
             --marker ':: MOUSE-1: HID pointer detected vid:pid=0627:0001 proto=2 relative' \
             --marker '[crispy] theme=' --marker ':: zeolite: resolver bound :53' \
             --marker-log "$SERIAL_LOG" --marker-timeout "$(( secs > 40 ? secs - 20 : secs ))" \
-            --wait 5 --pointer "$PTRLANE_MOVES" --pointer-kind rel --pointer-gap 0.05 \
+            --wait 5 --pointer "$PTRLANE_MOVES" --pointer-kind rel --pointer-gap "$ptrlane_gap" \
+            --pointer-ack "$ptrlane_ack" --ack-rounds 3 \
             --pointer-clicks 0 --postwait 0 \
             2> "${WORKSPACE_DIR}/target/ptrlane-typist.log" &
         rel_pid=$!
-        echo -e "${COLOR_YELLOW}⚡ PTRLANE relative-pointer typist armed: port ${qmp_port}, usb-mouse on xhci.0 beside the tablet, ${PTRLANE_MOVES} rel moves 50 ms apart and NO button (PTRPRESS would arm), after the mouse's own MOUSE-1 line + theme + zeolite; transcript -> target/ptrlane-typist.log${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}⚡ PTRLANE relative-pointer typist armed: port ${qmp_port}, usb-mouse on xhci.0 beside the tablet, ${PTRLANE_MOVES} rel moves ${ptrlane_gap}s apart and NO button (PTRPRESS would arm), after the mouse's own MOUSE-1 line + theme + zeolite; ack target ${ptrlane_ack} (0 = PTRACK disarmed); transcript -> target/ptrlane-typist.log${COLOR_RESET}"
     fi
     # INSTALLTYPIST — the install sequence, typed. See `x86_install_typist` above for the chain and
     # why every hold is a marker rather than a sleep.
