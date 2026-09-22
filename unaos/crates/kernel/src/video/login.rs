@@ -102,7 +102,9 @@
 //!
 //! And the DENIAL says one thing. [`submit`] asks `users::verify` — *"one answer for 'no such user'
 //! and 'wrong password'"* — rather than reading a `UsersError`, so neither the glass nor the wire can
-//! grow a reason that tells someone at the keyboard which names exist on the machine.
+//! grow a reason that tells someone at the keyboard which names exist on the machine. The gate is
+//! [`control_leg`], which drives the LIVE arch router on a real row and never [`press_swallow`]
+//! directly (B121: a fixture that calls the predicate stays green on a tree whose router arm is gone).
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -755,7 +757,14 @@ fn submit() {
     // route on any path — see this module's header.
     if !users::verify(n, p) {
         serial_println!(
-            "[login] denied user={} (one answer: a name that does not exist and a wrong password are the SAME refusal here and on the glass — `users::verify`, never `UsersError`)",
+            // ⚠ THE SUFFIX MAY NOT SPELL OUT THE CASES IT REFUSES TO DISTINGUISH, and this line learned
+            // that from its own gate. The first wording named them — and `x86-login.spec` §7's FORBID,
+            // which exists so that a REASON can never reach this tag, matched the EXPLANATION and
+            // reddened an otherwise green run. The spec was right and the line was wrong: a rule that
+            // has to tell prose from payload is not a rule. Why the refusal gives nothing away is
+            // `submit`'s comment and the module doc's business; what belongs HERE is the refusal, the
+            // name that was typed, and the predicate that decided.
+            "[login] denied user={} (one answer for every refusal: `users::verify` decides and no error variant reaches the glass or the wire)",
             core::str::from_utf8(n).unwrap_or("?")
         );
         let mut f = FORM.lock();
@@ -968,13 +977,29 @@ fn close_leg() -> (&'static str, bool) {
     //
     // READ-ONLY and no verdict: `hit_test` is a pure read over the window table; nothing is pressed,
     // raised or focused by this line.
+    //
+    // ⚠ **`FALLS-THROUGH` IS THE EXPECTED READING AND IT IS NOT THE DEFECT ANY MORE — READ THIS BEFORE
+    // "FIXING" IT.** When LOGINBOOT printed this probe the reading WAS the defect, because nothing
+    // stopped the press. Two arcs have landed since and neither one changed this line, deliberately:
+    //  * SESSGATE made the screen MODAL AT THE ROUTER (`fs::users::screen_press`, asked first in
+    //    `video/strip.rs:780` and repeated at `arch/x86_64/syscall.rs:7452`), so the press never
+    //    reaches `hit_test` at all while the screen is up.
+    //  * LOGINFLOW made the press the SCREEN'S (`press_swallow` -> `ctl_at`), so it now lands on a
+    //    control instead of on nothing.
+    // The ROW still does not hit-test, and MUST NOT: `wm::hit_test` naming an `owner_asid == 0` row is
+    // the REJECTED alternative both SO36 and SO44 record, because it hands the screen a close box back
+    // (LOGINCLOSE's measured defect) and gates only the points INSIDE the rectangle. So `MODAL` here
+    // would mean the belt had been cut. What this line is for now is the standing proof of WHY the
+    // modality has to live at the router: it names, every witness boot, the row that WOULD have taken
+    // the press. The claim about what the press actually does is [`control_leg`]'s, which drives the
+    // live router and asks the screen what it heard.
     let (cxp, cyp) = (
         info.x.saturating_add(info.w.saturating_mul(info.scale) / 2) as i32,
         info.y.saturating_add(info.h.saturating_mul(info.scale) / 2) as i32,
     );
     let beneath = wm::hit_test(cxp, cyp);
     serial_println!(
-        "[login] press-probe win={} centre=({},{}) hit={} verdict={} (SO44: a press inside the screen's rectangle must belong to the screen; today it belongs to the row beneath it, which both routers then raise above the screen)",
+        "[login] press-probe win={} centre=({},{}) hit={} verdict={} (SO44: the ROW under the screen's own centre — FALLS-THROUGH/NOBODY is the EXPECTED reading and names the row a press WOULD have reached; the screen's modality is the ROUTER's, not the row's, so MODAL here would mean the hit_test band skip had been cut and the close box was back)",
         win,
         cxp,
         cyp,
@@ -1007,6 +1032,178 @@ fn close_leg() -> (&'static str, bool) {
     (route, reopened)
 }
 
+/// LOGINFLOW M1/M2/M3 — **THE CONTROL LEG: the three milestones driven through the LIVE ROUTER, with
+/// the pointer, on a real row.**
+///
+/// Everything else in this file is measured on the headless form, which is right for a state machine
+/// and cannot say anything at all about the thing Peter is about to do — put a finger on the glass.
+/// `login_press_fixture` (SESSGATE) proved the BARRIER at `strip::press_route`; this leg proves the
+/// CONSEQUENCE one frame higher, at the entry the board's own input path calls, and it proves the
+/// other half of SO44's rule: *a press inside the rectangle belongs to the screen*.
+///
+/// B121's lesson is the reason it is driven from the top and not from `press_swallow`:
+/// `winmenu::selftest` was green on every x86 boot for months while the metal press was inert, because
+/// the fixture called `press_at` directly and the ROUTER had no arm that reached it. A leg that calls
+/// `press_swallow` itself would pass on a tree whose router gate had been deleted. `press` here is
+/// `fs::users::screen_press_via_router` — `wc_click_route_at` on x86, `strip::press_route` on aarch64
+/// (see that function for why the two differ) — and `route` names which, on the verdict line.
+///
+/// The legs, in the order a person performs them:
+///  1. **ROUND TRIP.** `panel_of` (surface -> panel) is the inverse of [`local_of`] (panel -> surface),
+///     and a fixture that computed its press points with arithmetic of its own would be measuring that
+///     arithmetic. So every point is round-tripped through BOTH before it is used: the panel point for
+///     a control must map back to exactly that control. If this term is false the leg's own coordinates
+///     are wrong and nothing below it means anything.
+///  2. **OUTSIDE — the control, and it is what keeps `answered` from being a constant.** A press at
+///     `(0, 0)`, the FITTS corner the crystal claims, must be CONSUMED (SO36: no furniture answers
+///     before a session) and must answer NO control. A `ctl_at` that said yes to everything would pass
+///     every leg below and fail this one.
+///  3. **THE FIELDS.** A press on the password field focuses the password field; a press on the name
+///     field focuses the name field. This is the caret that did not move.
+///  4. **THE USER ROW.** A press on row 0 picks row 0's name OUT OF THE STORE and moves to the
+///     password — asserted against `users::name_at(0)`, not against a name the fixture chose, so the
+///     leg cannot pass by agreeing with itself. Skipped, reported `rows=0`, where the store is empty.
+///  5. **THE BUTTON IS THE WAY IN.** The credential is typed with the keys and submitted with the
+///     POINTER — `Ctl::Button`, never Enter, because Enter is `consume_key`'s path and is already
+///     proven by [`screen_fixture`]. A session must open under the typed name.
+///  6. **AND THE WAY OUT.** `logout` (the crystal's own Log Out row) must bring the screen back, and a
+///     press on the returned screen must be OWNED again — the round trip closed, which is the thing a
+///     second person sitting down at this machine depends on.
+///
+/// GO-RED, by re-opening SO44's seam: delete the `#[cfg(feature = "login")] if
+/// crate::fs::users::screen_press(x, y) { … return true; }` statement from either router and the press
+/// falls through to the window arm, which raises the row BENEATH the screen. The router still answers
+/// `true` (it consumed the press for that row), so `*_press` stays true — and `pw_focus`, `nm_focus`
+/// and `opened` all go false, because `press_swallow` was never called. The leg names it and reds.
+///
+/// Side-effect free by the same contract as [`close_leg`]: it mints the real screen, and it puts the
+/// panel back exactly as it found it — row closed, console resumed, form down, no session.
+#[cfg(feature = "loginst")]
+fn control_leg(
+    name: &[u8],
+    password: &[u8],
+    press: fn(i32, i32) -> bool,
+    route: &'static str,
+    logout: fn() -> bool,
+) -> bool {
+    // The REAL screen, on the panel that exists now — `close_leg`'s own preamble and for its reason.
+    HEADLESS.store(false, Ordering::Relaxed);
+    FORM.lock().state = State::Closed;
+    open();
+    let win = WIN.load(Ordering::Relaxed);
+    if wm::info(win).is_none() {
+        take_down();
+        FORM.lock().state = State::Closed;
+        serial_println!(
+            ":: LOGIN-CONTROL: route={} -> SKIP — `wm` named no surface in this harness (the aarch64 `virt` leg builds no desktop; the x86 WC ladder is where this claim is proven) ::",
+            route
+        );
+        return true;
+    }
+    /// SURFACE -> PANEL, the inverse of [`local_of`], used ONLY to aim the press.
+    fn panel_of(c: Ctl) -> Option<(i32, i32)> {
+        let info = wm::info(WIN.load(Ordering::Relaxed))?;
+        let (rx, ry, rw, rh) = ctl_rect(c);
+        let s = info.scale.max(1);
+        Some((
+            (info.x + (rx + rw / 2) * s) as i32,
+            (info.y + (ry + rh / 2) * s) as i32,
+        ))
+    }
+    // 1 — the leg's own arithmetic, checked before it is trusted.
+    let round_trip = [Ctl::NameField, Ctl::PwField, Ctl::Button].iter().all(|&c| {
+        matches!(panel_of(c), Some((x, y)) if local_of(x, y).and_then(|(lx, ly)| ctl_at(lx, ly)) == Some(c))
+    });
+    // 2 — OUTSIDE: consumed, and no control answered.
+    let a0 = PRESS_ANSWERED.load(Ordering::Relaxed);
+    let out_press = press(0, 0);
+    let out_quiet = PRESS_ANSWERED.load(Ordering::Relaxed) == a0;
+    // 3 — the two fields.
+    let (pw_press, pw_focus) = match panel_of(Ctl::PwField) {
+        Some((x, y)) => (press(x, y), FORM.lock().focus == Focus::Password),
+        None => (false, false),
+    };
+    let (nm_press, nm_focus) = match panel_of(Ctl::NameField) {
+        Some((x, y)) => (press(x, y), FORM.lock().focus == Focus::Name),
+        None => (false, false),
+    };
+    // 4 — the user row, against the STORE's own name.
+    let rows = user_rows();
+    let row_ok = if rows == 0 {
+        true
+    } else {
+        match panel_of(Ctl::User(0)) {
+            Some((x, y)) => {
+                let _ = press(x, y);
+                let mut nb = [0u8; users::NAME_MAX];
+                match users::name_at(0, &mut nb) {
+                    Some(n) => {
+                        let f = FORM.lock();
+                        f.name_len == n && f.name[..n] == nb[..n] && f.focus == Focus::Password
+                    }
+                    None => false,
+                }
+            }
+            None => false,
+        }
+    };
+    // 5 — the credential typed, and submitted WITH THE POINTER.
+    if let Some((x, y)) = panel_of(Ctl::NameField) {
+        let _ = press(x, y);
+    }
+    for _ in 0..FIELD_MAX {
+        let _ = consume_key(8); // clear whatever step 4 picked: this leg types its own name
+    }
+    for &b in name {
+        let _ = consume_key(b);
+    }
+    if let Some((x, y)) = panel_of(Ctl::PwField) {
+        let _ = press(x, y);
+    }
+    for &b in password {
+        let _ = consume_key(b);
+    }
+    let btn_press = match panel_of(Ctl::Button) {
+        Some((x, y)) => press(x, y),
+        None => false,
+    };
+    let mut nb = [0u8; users::NAME_MAX];
+    let opened = !is_open() && matches!(users::whoami(&mut nb), Some(n) if &nb[..n] == name);
+    // 6 — the way out, and the screen owning the pointer again on the other side of it.
+    let logout_ok = logout();
+    let back = is_open() && users::whoami(&mut nb).is_none();
+    let (back_press, back_focus) = match panel_of(Ctl::PwField) {
+        Some((x, y)) => (press(x, y), FORM.lock().focus == Focus::Password),
+        None => (false, false),
+    };
+    let ok = round_trip
+        && out_press
+        && out_quiet
+        && pw_press
+        && pw_focus
+        && nm_press
+        && nm_focus
+        && row_ok
+        && btn_press
+        && opened
+        && logout_ok
+        && back
+        && back_press
+        && back_focus;
+    serial_println!(
+        ":: LOGIN-CONTROL: route={} win={} round_trip={} outside_consumed={} outside_quiet={} pw_press={} pw_focus={} nm_press={} nm_focus={} rows={} row_picked={} button_press={} opened={} logout={} screen_back={} back_press={} back_focus={} answered={} swallowed={} -> {} ::",
+        route, win, round_trip, out_press, out_quiet, pw_press, pw_focus, nm_press, nm_focus, rows,
+        row_ok, btn_press, opened, logout_ok, back, back_press, back_focus,
+        PRESS_ANSWERED.load(Ordering::Relaxed), PRESS_SWALLOWED.load(Ordering::Relaxed),
+        if ok { "PASS" } else { "FAIL —" }
+    );
+    // The panel goes back exactly as it was found (`close_leg`'s contract).
+    users::logout();
+    take_down();
+    FORM.lock().state = State::Closed;
+    ok
+}
+
 /// M3 fixture: the screen is driven by keys exactly as a route offers them. Esc must leave the form up;
 /// a wrong password must leave it up with a message and the session closed; the right password must
 /// open the session and take the screen down; with the screen down a key must pass through; Log Out
@@ -1018,7 +1215,14 @@ fn close_leg() -> (&'static str, bool) {
 /// `logout` is the Log Out route under test — M4 hands in `crystal::logout_row_fire`, which finds the
 /// **Log Out row** in the SHARD tree, resolves it through the menu's own pure `item_at`, and fires it.
 #[cfg(feature = "loginst")]
-pub fn screen_fixture(name: &[u8], password: &[u8], wrong: &[u8], logout: fn() -> bool) -> bool {
+pub fn screen_fixture(
+    name: &[u8],
+    password: &[u8],
+    wrong: &[u8],
+    logout: fn() -> bool,
+    press: fn(i32, i32) -> bool,
+    route: &'static str,
+) -> bool {
     // SO43 — the IGNITION leg goes FIRST OF ALL: it is headless, it drives the ignition seam rather
     // than the form, and it saves and restores the once-latch, so it must run before anything else
     // has touched either. Its own `:: LOGIN-IGNITION:` line carries its verdict; it is folded into
@@ -1028,6 +1232,13 @@ pub fn screen_fixture(name: &[u8], password: &[u8], wrong: &[u8], logout: fn() -
     // fixture must run on the headless form the ladder expects. It leaves the screen down and the
     // console resumed, which is the state `open` below assumes.
     let (close_route, reopened) = close_leg();
+    // LOGINFLOW — the CONTROL leg goes SECOND, for close_leg's own two reasons and one of its own: it
+    // needs the REAL row (so it belongs beside the only other leg that mints one), it leaves the panel
+    // exactly as close_leg does (row closed, console resumed, form down, no session), and it must run
+    // BEFORE the headless battery below, which takes the form away from the glass for the rest of the
+    // fixture. It carries its own `:: LOGIN-CONTROL:` verdict; it is folded into `ok` as well, because
+    // a screen whose controls do not answer is a screen nobody can use whatever the state machine says.
+    let control_ok = control_leg(name, password, press, route, logout);
     HEADLESS.store(true, Ordering::Relaxed);
     open();
     let feed = |s: &[u8]| {
@@ -1075,10 +1286,10 @@ pub fn screen_fixture(name: &[u8], password: &[u8], wrong: &[u8], logout: fn() -
     // And the belt is required exactly where it could run: a harness that had a row must have seen the
     // stranded screen put back by the next key (`reopened`); one that had none has nothing to show.
     let heal_ok = close_route == "no-window" || reopened;
-    let ok = esc_kept && wrong_kept && opened && passes_through && logout_ok && back && second && close_box_refused && heal_ok && ignition_ok;
+    let ok = esc_kept && wrong_kept && opened && passes_through && logout_ok && back && second && close_box_refused && heal_ok && ignition_ok && control_ok;
     serial_println!(
-        ":: LOGIN-SCREEN: window=no esc_kept={} wrong_kept={} opened={} passes_through={} logout={} back_after_logout={} second_login={} logins={} close_box_refused={} close_route={} reopened={} heals={} ignition={} -> {} ::",
-        esc_kept, wrong_kept, opened, passes_through, logout_ok, back, second, LOGINS.load(Ordering::Relaxed), close_box_refused, close_route, reopened, HEALS.load(Ordering::Relaxed), ignition_ok, if ok { "PASS" } else { "FAIL —" }
+        ":: LOGIN-SCREEN: window=no esc_kept={} wrong_kept={} opened={} passes_through={} logout={} back_after_logout={} second_login={} logins={} close_box_refused={} close_route={} reopened={} heals={} ignition={} control={} -> {} ::",
+        esc_kept, wrong_kept, opened, passes_through, logout_ok, back, second, LOGINS.load(Ordering::Relaxed), close_box_refused, close_route, reopened, HEALS.load(Ordering::Relaxed), ignition_ok, control_ok, if ok { "PASS" } else { "FAIL —" }
     );
     ok
 }
