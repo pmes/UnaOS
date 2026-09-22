@@ -98,8 +98,24 @@ const FETCH_LINES: u32 = 64;
 const LEAD_MIN: u32 = 16;
 
 /// Frames the hold may spin before it gives up on a counter that is not moving.
+///
+/// KVBLANK rung 2 made this `pub`: the vblank wait arm gives up on the SAME budget as the spin, and
+/// `kepler_vblank.rs` asserts the two equal at COMPILE TIME (`const _: () = assert!(…)`) so they
+/// cannot drift. A `const` emits no code, so the visibility change moves no artifact.
 #[cfg(feature = "beam")]
-const GIVEUP_FRAMES: u64 = 2;
+pub const GIVEUP_FRAMES: u64 = 2;
+
+/// KVBLANK rung 2 — THE WIDE THRESHOLD, as a denominator: the wait arm is taken only for a rect
+/// whose hazard zone covers at least `1 / VB_WIDE_DENOM` of the frame.
+///
+/// DERIVED FROM THE MEASUREMENT, not chosen. Entering a zone of width `w` at a uniformly random
+/// phase costs the spin `w/2` lines of beam travel on average, i.e. `w / (2 * vt)` of a frame.
+/// B135 §7's census is a 2.48 ms mean hold against a 16.667 ms frame — 14.9%, which is the `w/2` of
+/// a zone about 30% of a frame wide. So `w >= vt/3` is exactly the population VUGPERF measured the
+/// cost on, and everything narrower keeps the spin, whose expected cost is under a millisecond and
+/// which needs no phase prediction to be correct.
+#[cfg(all(feature = "beam", target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
+const VB_WIDE_DENOM: u32 = 3;
 
 /// Per-core observation slots. Eight covers every part this kernel runs on; a higher core index
 /// folds onto the last slot, exactly as `wm::stage_pool_index` folds its stage buffers.
@@ -219,6 +235,17 @@ fn in_zone(v: u32, a: u32, b: u32) -> bool {
 /// will be recorded, and the caller's present runs exactly as it did before this module.
 #[cfg(feature = "beam")]
 pub fn hold(y0: usize, y1: usize, panel_h: usize, slow: bool, record: bool) -> Option<Hold> {
+    // KVBLANK rung 2's FIXTURE, one-shot, and it runs HERE because this is the only reachable
+    // ancestor of the wait arm that a machine with NO KEPLER still executes. q35 answers
+    // `:: kepler: no-device ::`, so `beam_probe` never arms, `scanout_beam()` below is `None` and
+    // every hardware path of this rung is unreachable in QEMU — while `hold` itself IS called, by
+    // `wm::stage_window` and `strip`, on every armed compositor boot. A simulated source is
+    // therefore the only way rung 2's property is verified anywhere but on the bench (LAWS §5: an
+    // ungated gate is not a gate), and it is `witness`-gated so no media build carries it.
+    // ⚠ The corpus's home for a fixture is `main.rs`, which this rung's brief does not name; this
+    // placement is the nearest site inside a named file and it is reported as such.
+    #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank", feature = "witness"))]
+    crate::drivers::gpu::kepler_vblank::selftest_once();
     let (v0, vt) = crate::arch::scanout_beam()?;
     if vt == 0 || panel_h == 0 {
         return None;
@@ -237,6 +264,52 @@ pub fn hold(y0: usize, y1: usize, panel_h: usize, slow: bool, record: bool) -> O
     let budget = us_to_cycles(GIVEUP_FRAMES * FRAME_US);
     let mut v = v0.min(vt - 1);
     let mut gaveup = false;
+    // ── KVBLANK rung 2 (`kvblank-wait`) — THE WAIT ARM, BESIDE THE SPIN ───────────────────────
+    //
+    // The spin arm below is UNTOUCHED, to the character. This arm sits in front of it and, when it
+    // fires, leaves `v` already clear of the zone so the `while` falls through on its first test.
+    //
+    // THREE CONDITIONS, and all three are measurements rather than hopes:
+    //   (1) A SOURCE IS COUNTING. `kepler_vblank::counter()` answers `None` until rung 1 has seen at
+    //       least two edges on the head `beam_probe` armed. Blind, stuck or un-armed => spin.
+    //   (2) THE ZONE IS WIDE — `zone_w * VB_WIDE_DENOM >= vt`, i.e. at least a third of the frame.
+    //       See `VB_WIDE_DENOM` for why that number is B135 §7's 2.48 ms mean and not a taste.
+    //   (3) RUNG 1'S MEASURED PHASE IS OUTSIDE THIS ZONE. `raster_at_irq` is the raster line read in
+    //       the SAME word as the counter tick, so it says where the beam actually is when the edge
+    //       lands. Waiting for an edge that lands INSIDE this rect's hazard zone would hand the
+    //       present a worse phase than it already has. This is the sense in which rung 2's threshold
+    //       is DERIVED from rung 1 rather than assumed from a datasheet's idea of where vblank is.
+    //
+    // THE DEADLINE IS `t0 + budget` — the SPIN's own deadline, from the SPIN's own `t0` — so a wait
+    // that runs out lands in a `while` whose first budget check fires immediately. One give-up
+    // budget per present whichever arm it took, never two.
+    //
+    // AND CORRECTNESS NEVER RESTS ON THE PREDICTION: after the edge the arm takes ONE raster read
+    // (the confirm), and if that read lands back inside the zone the spin runs exactly as before and
+    // the miss is counted `vbrecheck=`. The wait can only ever make the present FASTER, not safer.
+    #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
+    if in_zone(v, a, b) {
+        let zone_w = (b + vt - a) % vt;
+        if let (Some(c0), Some(phase)) = (
+            crate::drivers::gpu::kepler_vblank::counter(),
+            crate::drivers::gpu::kepler_vblank::edge_phase(),
+        ) {
+            if zone_w.saturating_mul(VB_WIDE_DENOM) >= vt && !in_zone(phase.min(vt - 1), a, b) {
+                let (advanced, _) = crate::drivers::gpu::kepler_vblank::wait_next_edge(
+                    c0,
+                    t0.saturating_add(budget),
+                );
+                if advanced {
+                    if let Some((nv, _)) = crate::arch::scanout_beam() {
+                        v = nv.min(vt - 1);
+                    }
+                    if in_zone(v, a, b) {
+                        crate::drivers::gpu::kepler_vblank::note_recheck();
+                    }
+                }
+            }
+        }
+    }
     while in_zone(v, a, b) {
         if crate::arch::now_cycles().saturating_sub(t0) > budget {
             gaveup = true;
