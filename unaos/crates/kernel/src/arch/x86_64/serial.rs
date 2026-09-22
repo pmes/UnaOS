@@ -83,111 +83,145 @@ pub fn _print(args: ::core::fmt::Arguments) {
         return;
     }
 
-    // Never-panic, and now never-SILENT: take the UART if it is free, otherwise DEFER the whole line
-    // into the lock-free staging ring for the next holder to emit intact. The `try_lock` (never
-    // `lock`) is still the rule — a print from an IRQ-masked or fault context must not be able to
-    // block on a console another core owns — but its failure branch is no longer a silent `drop`,
-    // which is what let arbitrary verdict lines evaporate under load. See `crate::serial_ring`.
+    // ── SERIALTX (rmbp-ledger B154) — THE MASKED REGION IS BYTE-FREE, AND THE EMISSION IS NOT IT ──
     //
-    // SERWIT-1B: the one branch that was STILL lossy is a full ring, and `./arroyo test` reached it on
-    // every headless x86 run once that leg started reading its own log — `dropped=19..36` of 125 lines,
-    // tracking host load, with the conservation law otherwise perfect. It is a rate problem, not a
-    // size problem: a producer formats a line into a slot with one memcpy while the consumer pushes it
-    // through the 16550 a byte at a time, so five contending cores overflow ANY depth. The loop below
-    // is the missing backpressure. On a full ring the producer goes round again instead of discarding,
-    // and each turn is an attempt to make progress ITSELF — re-try the UART, and winning it drains the
-    // whole ring and writes this line intact — so the wait cannot livelock at the tail of a burst the
-    // way a pure wait-for-room would. It is HARD-BOUNDED for the same reason every other wait in this
-    // file is: a print arriving from an exception handler that interrupted THIS core inside its own
-    // locked region would otherwise spin on a holder that can never release. Past the bound the line
-    // is dropped exactly as before — counted, announced by the next drain, and still a SERWIT-1 FAIL.
-    // When the ring is not full the first turn IS the old code path, unchanged, and `spins` stays 0.
-    interrupts::without_interrupts(|| {
-        let mut spins: u32 = 0;
-        loop {
-            if let Some(mut guard) = SERIAL1.try_lock() {
-                UART_STATE.store(if guard.is_some() { 1 } else { 2 }, Ordering::Relaxed);
-                if let Some(uart) = guard.as_mut() {
-                    // Emit anyone else's deferred lines BEFORE our own, so deferral never reorders the
-                    // wire (a line staged at t0 precedes a line written directly at t1 > t0), and so the
-                    // ring is kept shallow — a ring that is drained on every uncontended print is a ring
-                    // that essentially never reaches the full-and-must-drop state.
-                    {
-                        let mut sink = |s: &str| {
-                            #[cfg(feature = "logts")]
-                            {
-                                let _ = crate::logts::PrefixWriter { inner: uart }.write_str(s);
-                            }
-                            #[cfg(not(feature = "logts"))]
-                            {
-                                let _ = uart.write_str(s);
-                            }
-                        };
-                        // SO29/DRAINCAP: the CAPPED spelling. This drain runs IRQ-masked, UART-locked
-                        // and inline on whichever core printed next — on render13 that was the
-                        // compositing core, paying 64 x 68 B = 377.8 ms inside one composite pass.
-                        // `drain_capped` bounds it at `DRAIN_BYTE_BUDGET` bytes; the remainder rides
-                        // the next print, which every core makes on every line. The panic path above
-                        // keeps the UNCAPPED `drain` on purpose: a dying machine has no next print.
-                        crate::serial_ring::drain_capped(&mut sink);
+    // WHAT THIS REPLACED, and why it had to go. Until this arc the whole of the paragraph below ran
+    // inside ONE `interrupts::without_interrupts`: the winner of `SERIAL1.try_lock()` drained the
+    // staging ring (capped at `DRAIN_BYTE_BUDGET` = 192 B since SO31/DRAINCAP) and then wrote ITS OWN
+    // LINE synchronously, byte by byte, polling LSR bit 5 before each `out` to the THR. At 115200 8N1
+    // that is 86.8 us per byte — **~8.7 ms for a 100-byte line, with interrupts masked on that core**,
+    // on top of up to 22.6 ms of capped drain. A core inside that span cannot be preempted and runs no
+    // service pass, which is exactly what EHCIDARK measured from the other end on flight 11 (B146,
+    // `docs/dev/OS/07_USB_STORAGE/usb_xhci.md` §33h): the EHCI HID pass period collapses from 1.08 ms
+    // mean across 840 quiet seconds to 6.46 ms across the 17 burst seconds, `max=108ms` lives inside
+    // that, and the deadman's 1 Hz line on ANOTHER core stretches to 2041 ms in the same seconds.
+    //
+    // THE SHAPE NOW, in the order it runs:
+    //
+    //   (a) MASKED, BYTE-FREE. Resolve the 16550 tri-state if it is still unknown, and ENQUEUE this
+    //       line into the lock-free staging ring. No `out`, no LSR poll, no UART lock held across a
+    //       byte: the region is a compare-exchange and a memcpy. `SERIAL1` is taken here only to ASK
+    //       whether a 16550 exists, once per boot, and on the no-16550 machine to hold the drainer's
+    //       uniqueness across `discard_staged` — the SERWIT-1D accounting below is unchanged.
+    //
+    //   (b) THE DRAIN OWNER, WITH INTERRUPTS ENABLED. Whichever core printed next has always been the
+    //       drain owner; the change is that it now drains UNMASKED. The three candidates the brief
+    //       named were the 1 kHz timer tick, the 1 ms device-service pump, and this one; this one is
+    //       the one that needs no line in a file this arc may not touch, and it is not a fallback on
+    //       the merits — it is self-clocking (a console under load has, by definition, a next print
+    //       arriving), it needs no core to be reserved, and it keeps the drain on the core that is
+    //       already paying for the console instead of moving that cost onto the service core. The
+    //       ring's residual flush when printing STOPS is `serial_ring::mirror_service`, which the
+    //       main loop polls and whose contract is already IF=1 and lock-free.
+    //
+    //   (c) A print that arrives ALREADY MASKED — from an interrupt handler, an exception, or inside
+    //       another subsystem's `without_interrupts` — cannot unmask, because re-enabling interrupts
+    //       is not the console's to do. It still owes the ring forward progress, so it takes exactly
+    //       ONE 16550 transmit FIFO (`serial_ring::MASKED_BYTE_BUDGET` = 16 B = 1.39 ms worst case)
+    //       and leaves the rest. That is the ceiling this arc was asked for, and `sertx_selftest`
+    //       asserts the ordinary unmasked path spends ZERO of it.
+    //
+    // ORDERING IS UNCHANGED AND IS NOW STRUCTURAL. The old code drained other cores' staged lines
+    // before writing its own directly, so that a line staged at t0 preceded a line written at t1 > t0.
+    // Now every line goes through the ring, so wire order IS submission order by construction and
+    // there is no "direct" line left to reorder against.
+    //
+    // LOSS IS UNCHANGED. SERWIT-1's contract is untouched, branch for branch: `defer_contended` is
+    // still the single shared policy, a full ring still back-pressures for `BACKPRESSURE_SPINS`
+    // bounded turns, and a line that outlives the bound is still counted in `DROPPED` and announced on
+    // the wire by the next drain. What changed inside the retry turn is WHERE it makes progress: the
+    // old turn re-tried the UART *inside the mask* and, winning it, paid for a whole capped drain
+    // there; the new turn makes room by running the drain owner OUTSIDE it.
+    let mut spins: u32 = 0;
+    let mut masked_sum: u64 = 0;
+    let mut masked_max: u64 = 0;
+    let mut drain_cyc: u64 = 0;
+    let mut spin_cyc: u64 = 0;
+    let spin_t0 = crate::arch::now_cycles();
+    loop {
+        let m0 = crate::arch::now_cycles();
+        // `true` => this line's fate is settled (staged, declined, or lost past the bound).
+        let settled = interrupts::without_interrupts(|| {
+            match UART_STATE.load(Ordering::Relaxed) {
+                0 => {
+                    // The lazy probe has not run. Ask — and only ask; nothing is emitted here.
+                    if let Some(guard) = SERIAL1.try_lock() {
+                        let present = guard.is_some();
+                        UART_STATE.store(if present { 1 } else { 2 }, Ordering::Relaxed);
+                        crate::serial_ring::note_uart_resolved();
+                        if !present {
+                            // No 16550 on this machine. Nothing was written, nothing was lost that
+                            // fbcon and the FTDI mirror below do not already carry — and there is no
+                            // reason to keep a backlog nobody will ever drain. The guard is still held,
+                            // which is what makes this the unique drainer for `discard_staged`.
+                            //
+                            // SERWIT-1D: this outcome is DECLINED, and it is neither of the other two.
+                            // It is not `emitted` — no byte reached a 16550, because there is none —
+                            // and calling it emitted is the lie that `drain(|_| {})` used to tell,
+                            // since `drain` charges `EMITTED` for every line it consumes and this sink
+                            // is `|_| {}`. Nor is it `dropped`: the line is on the wire via the FTDI
+                            // mirror, whose own conservation law is asserted separately by SERWIT-2's
+                            // `ftdi` tap. So it gets its own terminal state and its own counter.
+                            crate::serial_ring::note_declined();
+                            crate::serial_ring::discard_staged();
+                            return true;
+                        }
                     }
-                    // CLOCK-2: with `logts`, prefix each serial LINE with a compact timestamp (monotonic
-                    // ms → UTC after a civil anchor exists). CLOCK-2b: the FTDI capture ring and the
-                    // flight recorder prefix their own streams too (see the taps below); fbcon and the
-                    // tste selftest ring still receive the raw `args`. OFF => identical.
-                    #[cfg(feature = "logts")]
-                    {
-                        let _ = crate::logts::PrefixWriter { inner: uart }.write_fmt(args);
-                    }
-                    #[cfg(not(feature = "logts"))]
-                    {
-                        let _ = uart.write_fmt(args);
-                    }
-                    crate::serial_ring::note_emitted();
-                } else {
-                    // No 16550 on this machine. Nothing was written, nothing was lost that fbcon and the
-                    // FTDI mirror below do not already carry — and there is no reason to keep a backlog
-                    // nobody will ever drain.
-                    //
-                    // SERWIT-1D: this outcome is DECLINED, and it is neither of the other two. It is not
-                    // `emitted` — no byte reached a 16550, because there is none — and calling it emitted
-                    // is the lie that `drain(|_| {})` used to tell, since `drain` charges `EMITTED` for
-                    // every line it consumes and this sink is `|_| {}`. Nor is it `dropped`: the line is
-                    // on the wire via the FTDI mirror, whose own conservation law is asserted separately
-                    // by SERWIT-2's `ftdi` tap. So it gets its own terminal state and its own counter.
-                    crate::serial_ring::note_declined();
-                    crate::serial_ring::discard_staged();
+                    // Contended while still unknown: fall through and stage, exactly as before. The
+                    // window is narrow and the lines staged in it are the ones `discard_staged`
+                    // charges to `DECLINED` the moment the answer turns out to be "absent".
                 }
-                break;
-            } else if UART_STATE.load(Ordering::Relaxed) == 2 {
-                // SERWIT-1D: contended AND there is no 16550 — the branch that had no counter at all.
-                // Staging here would fill a ring nobody drains, so the line correctly goes nowhere on this
-                // transport; what was missing is the accounting for it. Un-counted, it left `SUBMITTED`
-                // with no matching term, which is precisely the shape of hole this whole module exists to
-                // make impossible. Checked BEFORE the stage attempt so this machine never back-pressures
-                // against a ring that has no consumer.
-                crate::serial_ring::note_declined();
-                break;
-            } else if !matches!(
+                2 => {
+                    // SERWIT-1D: there is no 16550 — the branch that had no counter at all before that
+                    // arc. Staging here would fill a ring nobody drains, so the line correctly goes
+                    // nowhere on THIS transport; what was missing is the accounting for it. Checked
+                    // BEFORE the stage attempt so this machine never back-pressures against a ring
+                    // that has no consumer.
+                    crate::serial_ring::note_declined();
+                    return true;
+                }
+                _ => {}
+            }
+            // SERWIT-1B PARITY (SO31): `try_stage` succeeded / the bound expired / go round are ONE
+            // call, because aarch64 needs the identical decision and two copies of a policy is how two
+            // divergent policies happen. `serial_ring::defer_policy` is the single pure decision and
+            // its rows are asserted at compile time on both arches.
+            !matches!(
                 crate::serial_ring::defer_contended(args, &mut spins),
                 crate::serial_ring::Defer::Retry
-            ) {
-                // SERWIT-1B PARITY (SO31): the three branches that used to be spelled out here —
-                // `try_stage` succeeded / the bound expired / go round — are now ONE call, because
-                // aarch64 needed the identical decision and two copies of a policy is how two
-                // divergent policies happen (it is exactly how this arch ended up with backpressure
-                // while the other one dropped). `serial_ring::defer_policy` is the single pure
-                // decision and its rows are asserted at compile time on both arches. Behaviour here
-                // is unchanged, branch for branch: Staged is the wait-free common case, Lost is
-                // counted in `DROPPED` and announced by the next drain, and Retry is the bounded,
-                // progress-bearing turn whose next iteration re-tries the UART first.
-                break;
-            }
+            )
+        });
+        let m = crate::arch::now_cycles().wrapping_sub(m0);
+        masked_sum = masked_sum.wrapping_add(m);
+        if m > masked_max {
+            masked_max = m;
         }
-        if spins > 0 {
-            crate::serial_ring::note_stalled(spins);
+        if settled {
+            break;
         }
-    });
+        // The ring is full and the bound has not expired. Make room OUTSIDE the mask — this is the
+        // progress-bearing half of SERWIT-1B's turn, moved off the masked path.
+        drain_cyc = drain_cyc.wrapping_add(drain_owner());
+    }
+    if spins > 0 {
+        crate::serial_ring::note_stalled(spins);
+        // The cost of contention for this print, retry turns and their drains included. Zero on an
+        // uncontended print, which is every print on a machine that is not flooding its console.
+        spin_cyc = crate::arch::now_cycles().wrapping_sub(spin_t0);
+    }
+    // (b) — the emission, with interrupts ENABLED. `emit_cyc` is charged 0 and that is the point of
+    // the whole arc: this arch no longer writes its own line synchronously, so the term B146 named
+    // has no site left to be spent at. `arch/aarch64/serial.rs` still does, and its `[sertx] emit_us`
+    // is what says so.
+    drain_cyc = drain_cyc.wrapping_add(drain_owner());
+    crate::serial_ring::tx_charge(masked_sum, masked_max, drain_cyc, 0, spin_cyc);
+    // SERIALTX: the four POST-MASK taps are timed as one block and reported as `[sertx] taps_us`.
+    // They are NOT part of the masked census above and must not be folded into it — but they are not
+    // free either, and on the bench rMBP they are the ONLY term that can be large, because that
+    // machine has no 16550 at all (`uart16550=absent carrier=ftdi-mirror law=emitted==0` on flight
+    // 11) and every masked branch above is therefore the O(1) DECLINED one. A census that measured
+    // only the mask would have acquitted the console on the one board the arc was commissioned for.
+    let taps_t0 = crate::arch::now_cycles();
     // Mirror to the framebuffer console so diagnostics/panics are visible on hardware that has
     // no serial port. `Arguments` is Copy; fbcon self-guards (try_lock + interrupts off).
     crate::video::fbcon::_print(args);
@@ -204,6 +238,66 @@ pub fn _print(args: ::core::fmt::Arguments) {
     // later flush the whole boot log to UNAOS.LOG on the FAT volume. Same discipline as the taps
     // above — additive, alloc-free, `try_lock` only, drop-on-full; zero change to what is printed.
     crate::flight_recorder::capture(args);
+    crate::serial_ring::tx_charge_taps(crate::arch::now_cycles().wrapping_sub(taps_t0));
+}
+
+/// SERIALTX (rmbp-ledger B154) — **the drain owner**: emit from the staging ring at the 16550, and
+/// return what it cost in `arch::now_cycles()` units.
+///
+/// Two budgets, and the interrupt flag picks between them **as it actually stands**, never by which
+/// call site the author believed they were on:
+///
+///   * **interrupts ENABLED** — `DRAIN_BYTE_BUDGET` (192 B, one 60 Hz frame of UART; SO29/DRAINCAP).
+///     This is the ordinary path and it can be preempted at any byte, so its cost is charged to
+///     throughput and not to latency. Every byte it writes is charged to `[sertx] bytes` and to the
+///     UNMASKED half of that ledger.
+///   * **interrupts MASKED** — `MASKED_BYTE_BUDGET` (16 B, one 16550 transmit FIFO). Reached only by
+///     a print that ARRIVED masked; re-enabling is not the console's to do. The remainder stays in
+///     the ring, in order, for the next unmasked owner. Its bytes are charged to the MASKED half,
+///     which is the number `sertx_selftest` asserts is zero on the ordinary path and the number the
+///     go-red turns into the line cost.
+///
+/// `try_lock` (never `lock`) is still the rule and is what keeps the drainer unique: a print from any
+/// context that loses it simply leaves the ring to the next owner, and the panic path never comes
+/// here at all.
+///
+/// `pub` for ONE second caller: `serial_ring::residual_drain`, the main loop's flush. A staged line is
+/// not a lost one only for as long as there is a next print (the argument PWRDRAIN is built on), and
+/// with the emission moved off the print's own masked path the tail of a burst can outlive the print
+/// that queued it by one drain. The main-loop poll closes that window without a foreign file.
+pub fn drain_owner() -> u64 {
+    use core::fmt::Write;
+    use core::sync::atomic::Ordering;
+    use x86_64::instructions::interrupts;
+    if UART_STATE.load(Ordering::Relaxed) != 1 {
+        return 0;
+    }
+    let t0 = crate::arch::now_cycles();
+    if let Some(mut guard) = SERIAL1.try_lock() {
+        if let Some(uart) = guard.as_mut() {
+            let mut sink = |s: &str| {
+                crate::serial_ring::tx_note_bytes(s.len());
+                #[cfg(feature = "logts")]
+                {
+                    let _ = crate::logts::PrefixWriter { inner: uart }.write_str(s);
+                }
+                #[cfg(not(feature = "logts"))]
+                {
+                    let _ = uart.write_str(s);
+                }
+            };
+            // ⚠ THE GO-RED FOR `sertx_selftest` IS THIS `if`: wrap the `drain_capped` arm in
+            // `interrupts::without_interrupts(...)` and the same sink's bytes re-file themselves as
+            // masked, `:: SERIALTX:` reads `masked_b=201` and FAILs, and `[sertx] masked_us_max=`
+            // returns to the line cost in the same run.
+            if interrupts::are_enabled() {
+                crate::serial_ring::drain_capped(&mut sink);
+            } else {
+                crate::serial_ring::drain_fifo(&mut sink);
+            }
+        }
+    }
+    crate::arch::now_cycles().wrapping_sub(t0)
 }
 
 #[macro_export]

@@ -195,6 +195,26 @@ pub fn _print(args: fmt::Arguments) {
         return;
     }
 
+    // ── SERIALTX (rmbp-ledger B154) — THE TWIN, MEASURED, NOT CHANGED ────────────────────────────
+    //
+    // This arc fixed the x86 half: there `_print` stages its line and a drain owner emits it with
+    // interrupts ENABLED, so no byte of an ordinary print is written behind the mask (see
+    // `arch/x86_64/serial.rs` and `serial_ring::MASKED_BYTE_BUDGET`). THIS arch still does what both
+    // did before — drain the ring and then write its own line synchronously, byte by byte, inside the
+    // mask below — and the arc's brief scoped it to MEASUREMENT so that the fix here is decided by
+    // numbers rather than by symmetry. The census charged around the region is that evidence: on this
+    // arch `[sertx] emit_us` is NON-ZERO and `masked_b` tracks the line width, where on x86 both read
+    // zero. If the shape reads the same, porting the x86 shape here is the second milestone, and
+    // nothing in that port is novel — both arches already share one ring, one contended-producer
+    // policy (`serial_ring::defer_policy`) and one byte budget.
+    //
+    // NOTHING BELOW CHANGES BEHAVIOUR. Every statement this arc adds is a counter read or a relaxed
+    // atomic; the lock discipline, the drain, the write, the accounting and the branch structure are
+    // as they were, statement for statement.
+    crate::serial_ring::note_uart_resolved();
+    let mut drain_cyc: u64 = 0;
+    let mut emit_cyc: u64 = 0;
+    let masked_t0 = crate::arch::now_cycles();
     // Guard the serial lock with interrupts masked (matching x86) so an interrupt handler that
     // logs can't deadlock against an in-progress print holding the same lock.
     crate::arch::without_interrupts(|| {
@@ -222,6 +242,7 @@ pub fn _print(args: fmt::Arguments) {
         if let Some(mut guard) = SERIAL_PORT.try_lock() {
             {
                 let mut sink = |s: &str| {
+                    crate::serial_ring::tx_note_bytes(s.len()); // SERIALTX (B154) — measurement only: the bytes this drain puts at the UART, classified by the interrupt flag AS IT STANDS, which inside this masked region is `masked`. That is the honest reading and it is the point: on this arch the drain is still behind the mask.
                     #[cfg(feature = "logts")]
                     {
                         let _ = crate::logts::PrefixWriter { inner: &mut *guard }.write_str(s);
@@ -235,11 +256,14 @@ pub fn _print(args: fmt::Arguments) {
                 // budget. This is the drain SO29 measured at 377.8 ms inside a composite pass on the
                 // Orin; `drain_capped` bounds it by BYTES (the currency the UART charges), and the
                 // remainder rides the next print. The panic path above keeps the uncapped `drain`.
+                let drain_t0 = crate::arch::now_cycles(); // SERIALTX (B154) — measurement only.
                 crate::serial_ring::drain_capped(&mut sink);
+                drain_cyc = crate::arch::now_cycles().wrapping_sub(drain_t0); // SERIALTX (B154) — measurement only.
             }
             // CLOCK-2: with `logts`, prefix each serial LINE with a compact timestamp (monotonic ms →
             // UTC after a civil anchor exists). Only the UART byte-stream is touched; the fbcon +
             // capture-ring mirrors below still receive the raw `args`. Feature OFF => byte-identical.
+            let emit_t0 = crate::arch::now_cycles(); // SERIALTX (B154) — measurement only: THE TERM NOBODY HAD MEASURED. This is the own-line synchronous emission, byte by byte at 86.8 us each, inside the interrupt mask — ~8.7 ms for a 100-byte line. x86 no longer has this site at all; here it is timed so `[sertx] emit_us` can say what the port would buy.
             #[cfg(feature = "logts")]
             {
                 let _ = crate::logts::PrefixWriter { inner: &mut *guard }.write_fmt(args);
@@ -248,6 +272,7 @@ pub fn _print(args: fmt::Arguments) {
             {
                 let _ = guard.write_fmt(args);
             }
+            emit_cyc = crate::arch::now_cycles().wrapping_sub(emit_t0); // SERIALTX (B154) — measurement only.
             crate::serial_ring::note_emitted();
             break;
         } else if !matches!(
@@ -263,12 +288,19 @@ pub fn _print(args: fmt::Arguments) {
             crate::serial_ring::note_stalled(spins);
         }
     });
+    // SERIALTX (B154) — measurement only. One masked region per print on this arch (the whole loop is
+    // inside it), so `masked_sum` and `masked_max` are the same number here; on x86 they diverge on a
+    // back-pressured print, which re-enters the mask once per turn.
+    let masked_cyc = crate::arch::now_cycles().wrapping_sub(masked_t0);
+    crate::serial_ring::tx_charge(masked_cyc, masked_cyc, drain_cyc, emit_cyc, 0);
+    let taps_t0 = crate::arch::now_cycles(); // SERIALTX (B154) — measurement only.
     // Mirror to the framebuffer console (visible without a serial port). fbcon self-guards.
     crate::video::fbcon::_print(args);
     // TSTE-1 M2b: capture boot-fixture verdict lines (`-> PASS`/`-> FAIL`) into the selftest ring so
     // `tste` can replay them. Additive, alloc-free, `try_lock` only; safe from this IRQ-masked
     // context; zero change to what is printed above.
     crate::selftest::capture(args);
+    crate::serial_ring::tx_charge_taps(crate::arch::now_cycles().wrapping_sub(taps_t0)); // SERIALTX (B154) — measurement only.
 }
 
 // Expression-style (parentheses, no trailing semicolon) so the macros work in both
