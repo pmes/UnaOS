@@ -477,7 +477,7 @@ regression** and must not be re-run away; one with
 was exhausted, which is a new and reportable fact — read `unran=` and the
 `[wcser]` `declined_pct=` beside it.
 
-### 1d. DOCKID `order=false set=false` — **measured 2026-09-22 (FLAKEFIX, rmbp-ledger B150): a Class-1 re-read race, NOT lost input**
+### 1d. DOCKID `order=false set=false` — **measured 2026-09-22 (FLAKEFIX, rmbp-ledger B150): NOT lost input. MECHANISM CORRECTED 2026-09-22 (FLAKEFIX2, rmbp-ledger B159) FROM THE WIRE: the stale snapshot is the WRITER'S, not the reader's, and the metal half is CLASS 6**
 
 **Signature on the wire** (`video/dock.rs` `dockid_selftest`, the verdict's own
 format):
@@ -507,6 +507,81 @@ printed.** The fixture has six legs and they split cleanly by what they read:
 that reads the shared registry fails.** That is not an input-loss shape — no
 injected event reaches this fixture at all — it is Class 1's shape exactly: a
 ground-truth re-read racing a concurrent mutator.
+
+**MECHANISM CORRECTED 2026-09-22 (FLAKEFIX2) — READ THIS BEFORE THE PARAGRAPH
+BELOW IT, WHICH IS KEPT BECAUSE ITS END STATE IS RIGHT AND ITS WINDOW IS WRONG.**
+Everything this entry says about the LEGS and about the END STATE survives: the
+split by what each leg reads is exact, and `every app tile falls back to
+`RANK_UNSEEN + id`, the strip returns to WINDOW-ID order` is precisely what the
+captures show. What is wrong is WHOSE snapshot is stale. It is not the fixture
+re-reading a registry that moved under it; **it is `reconcile` itself ranking
+against a model it scanned BEFORE it mutated.** Four lines of one capture settle
+it, and they are `[dock]` lines this corpus already asked for on recurrence:
+
+```text
+x86bind-logs/gored-b3-serial.log
+1219: [wm]   alloc win=3 gen=4 owner=0xd1d3 title="idC"
+1224: [dock] tile add win=1 gen=8 owner=0xd1d1 seq=15 label=idA
+1225: [dock] tile add win=2 gen=5 owner=0xd1d2 seq=16 label=idB
+1227: [dock] census tiles=4 win:gen=1:8,2:5,console:pin,shell:pin      <-- idC is LIVE and has NO TILE
+1230: [wm]   alloc win=2 gen=6 owner=0xd1d4 title="idD"
+1236: [dock] tile add win=2 gen=6 owner=0xd1d4 seq=17 label=idD        <-- the YOUNGER window ranks 17
+1238: [dock] tile add win=3 gen=4 owner=0xd1d3 seq=18 label=idC        <-- the ELDER window ranks 18
+1242: [dock] census tiles=6 win:gen=1:8,2:6,3:4,4:1,console:pin,shell:pin
+1298: :: DOCKID: … order=false set=false furniture=true … :: FAIL ::
+```
+
+The same six windows on a GREEN boot, for the contrast that makes it conclusive:
+
+```text
+logs/foldgate/g2-test-x86-wc.log
+2019: [wm]   alloc win=3 gen=4 owner=0xd1d3 title="idC"
+2022: [dock] tile add win=3 gen=4 owner=0xd1d3 seq=17 label=idC        <-- elder ranks 17
+2029: [wm]   alloc win=2 gen=6 owner=0xd1d4 title="idD"
+2032: [dock] tile add win=2 gen=6 owner=0xd1d4 seq=18 label=idD        <-- younger ranks 18
+2103: :: DOCKID: … order=true set=true furniture=true … :: PASS ::
+```
+
+**`idC` was allocated ELEVEN LINES BEFORE `idD` and was given the LATER arrival
+rank.** `compose`'s `dock_scan` ran before `1219`, its `reconcile` ran after, so
+that pass never saw `idC` and did not admit it; the next pass admitted `idD` and
+`idC` together and walked the model in window-table order, where `idD`'s recycled
+id 2 precedes `idC`'s id 3. `order_ok` asserts `a < c && c < d`, and `c < d` is
+exactly what this reverses. **A tile's rank is therefore not its window's arrival
+— it is the arrival of the first reconcile pass that happened to see it**, which
+is the very thing `NEXT_SEQ`'s header says it exists to prevent.
+
+**This is why a reader-side snapshot cannot fix it, and that has to be said
+plainly because a generation/seqlock is the obvious cure and it is the wrong one
+here.** At `1242` the census is complete, internally consistent and stable: the
+registry is not TORN under the reader, it is stably and permanently WRONG. A
+consistent snapshot hands the reader an unimpeachable view of an answer that was
+already decided incorrectly one pass earlier. The tear is real and is worth
+closing on its own (it is what `furniture=false`, 1 of 5, looks like), but it is
+the smaller half and it is not what `order=false set=false` is.
+
+**THE METAL HALF IS A DIFFERENT CLASS AGAIN — CLASS 6, not Class 1.** On the three
+rMBP sightings the registry was not stale-by-one-pass, it was never written at all:
+
+```text
+gmux8-logs/f11.log   (identical in hdaamp-/gmux7-/camera1-/vugperf-logs/f11.log)
+3257: [wm] alloc win=4 gen=8 owner=0xd1d1 title="idA"    … through …
+3275: [wm] alloc win=8 gen=1 owner=0xd1d5 title="idF"
+      <-- NOT ONE `[dock] tile add` OR `[dock] census` LINE BETWEEN 3256 AND 3298
+3298: :: DOCKID: tiles=7 … order=false set=false furniture=true … :: FAIL ::
+```
+
+`dock::compose` reconciles UNCONDITIONALLY (it is the first statement of the
+settle at `video/dock.rs:789`, ahead of the panel snapshot's early-out), and it
+prints on every admit — so an absence of `tile add` over the whole fixture is not
+a quiet reconcile, it is NO reconcile. The fixture's own `wm::composite()`
+DECLINED to reach the dock (five real cores, another core holding the composite),
+and `strip_model` then scored a registry that no pass had ever written. That is
+Class 6's shape word for word — *the fixture drives a step that may DECLINE, then
+scores the value that step was to publish* — and its cure is 6a's, not Class 1's:
+give the fixture the declined step's own reading (a reconcile counter it can read
+across its `wm::composite()`) and let it REFUSE rather than score. Scored as a
+FAIL it convicts the kernel of a defect the capture does not show.
 
 **Root cause — the registry's one writer is `compose`, and the fixture does not
 exclude the render service's copy of it.** `strip_model` calls `wm::composite()`
@@ -563,23 +638,40 @@ scratch, so a false there is a DIFFERENT defect and not this class); whether
 `recycle` held; and the host load, or on metal what else was compositing. A sighting with `order=false` and
 `count=false` together is a regression, not this entry.
 
-**Disposition — WATCH, fix reported not made.** `video/dock.rs` is nominally in
-FLAKEFIX's file set but any edit there moves the default image and
-`./arroyo knoboff wc` scores that as a red by construction, so the change is
-written down instead of made. The cure is Class 1's, stated at the head of this
-class and proven in-tree by 1a: the fixture must take its three registry reads
-inside an interval where the registry is provably not moving — publish a
-"holding" flag and park the render service's reconcile (bounded) across the
-`strip_model` → assert span, the way DMG-REFUSE's prober publishes `SWEPT` and
-parks. **Not** a retry loop and **not** a widened assertion: the legs are correct
-about what they assert, they are merely asserting it about a snapshot that has
-already moved.
+**Disposition — WATCH, fix STILL NOT MADE, and the cure is no longer the one this
+entry used to name.** FLAKEFIX2 held the file and did not write the change, which
+is a decision and is recorded as one: the cure the brief carried (a reader-side
+generation/seqlock) is refuted above by the capture, and the cure the wire asks
+for is a WRITER-SHAPE change — `reconcile` must take its model at the moment it
+mutates rather than be handed one scanned before, so an arrival cannot be re-ranked
+behind a window created after it. That is a change to where a rank comes from, not
+to how a reader reads one, and it touches the single-writer rule this block is
+built on; it was not made unilaterally on a brief that specified the other fix.
+The metal half additionally reclassifies to **Class 6** and its cure is 6a's
+declined-step reading, above. Two separable pieces of work, then, and they should
+be priced separately:
+
+1. **The rank's provenance (Class 1, the operator-visible half).** `reconcile`
+   ranks against its caller's snapshot. Cure: the writer scans at mutation time.
+   Go-red must be DELIBERATE — at 2 FAIL in 46 boots the natural rate shows nothing
+   in three runs — which means a widener that mints a window inside the
+   scan→reconcile gap (a `witness`-gated hook in `settle`, driven by
+   `dockid_selftest`). Without it neither a green nor a red means anything.
+2. **The declined composite (Class 6, the metal half).** `strip_model` must read
+   whether the `wm::composite()` it drove actually reconciled, and SKIP when it did
+   not. Small, deterministic, and it removes all three metal sightings from the
+   FAIL column without widening one assertion.
+
+**Still not** a retry loop and **still not** a widened assertion: the legs are
+correct about what they assert. What changed is that they are not asserting it
+about a snapshot that moved — they are asserting it about a rank set that was
+written wrong, or never written at all.
 
 ---
 
 ## Class 2 — the evidence taps lose lines to a margin-tight serial ring
 
-### 2a. SERWIT-2 `evidence_lost=N` — **ROOT CAUSE MEASURED 2026-09-22 (FLAKEFIX, rmbp-ledger B150); the original suspect REFUTED; fix owed in `drivers/xhci/ftdi.rs`**
+### 2a. SERWIT-2 `evidence_lost=N` — **ROOT CAUSE MEASURED 2026-09-22 (FLAKEFIX, rmbp-ledger B150); the original suspect REFUTED; FIX MADE 2026-09-22 (FLAKEFIX2, rmbp-ledger B159) and UNSCORED — the bench would not reach the ring's depth**
 
 **Signature on the wire:**
 
@@ -674,23 +766,51 @@ a vCPU descheduled by a loaded host mid-memcpy stretches the hold, the other fou
 cores all miss the `try_lock`, and `STAGE` fills behind them. "sink contended or
 full" means **contended**, every time this has been measured.
 
-**THE FIX IS IN A FILE FLAKEFIX MAY NOT TOUCH, so it is reported and not made**
-(`drivers/xhci/ftdi.rs` is not in that brief's file set, and any edit there moves
-the default image, which `./arroyo knoboff wc` scores as a red by construction —
-see rmbp-ledger B144's note on knoboff having no power over unconditional code).
-The exact change, for whoever holds the file: **the one free retry is not
-enough.** `mirror()`'s third step is a single `try_lock`, so a line is declared
-lost after losing one race, while `serial_ring`'s own primary producer
-BACK-PRESSURES instead (`:: SERWIT-1B: … the contended producer BACK-PRESSURES,
-it does not drop … one capped drain freed 3 slot(s), the next turn DEFERRED the
-line intact, 0 dropped -> PASS ::`). Give the mirror the same policy the primary
-wire already has — a bounded spin on the retry, or a capped drain of `STAGE`
-into `RING` before declaring the loss — and quote a run with `staged >= 64` and
-`dropped=0` as the proof. **Do not widen `evidence_lost`'s threshold**: the 13
-lines are really gone, and on a 2012 rMBP with no 16550 the FTDI capture is not a
-mirror of the evidence, it IS the evidence (this function's own doc comment says
-so). A tolerance here would be the wrong-lenient half of LAWS §5 applied to the
-one tap that cannot afford it.
+**THE FIX IS NOW MADE — AND IT IS UNSCORED, WHICH IS SAID HERE FIRST BECAUSE IT
+IS THE HALF A READER MUST NOT SKIM PAST** (FLAKEFIX2, rmbp-ledger B159, branch
+`exec-rmbp-flakefix2`). `mirror()`'s third step was a single `try_lock`, so a
+line was declared lost after losing ONE race, while `serial_ring`'s own primary
+producer BACK-PRESSURES instead (`:: SERWIT-1B: … the contended producer
+BACK-PRESSURES, it does not drop … one capped drain freed 3 slot(s), the next
+turn DEFERRED the line intact, 0 dropped -> PASS ::`). The mirror now takes that
+same policy, through the same spelling: `crate::serial_ring::defer_policy`, whose
+six rows the compiler already checks on every `./arroyo check`, bounded by the
+primary wire's own `BACKPRESSURE_SPINS` so the transport has ONE checkable
+magnitude rather than a second one nobody can check. Each turn re-tries the SINK
+first (winning it drains `STAGE` and writes the line intact), so the wait bears
+progress and room can also arrive from another core's drain; nothing is held
+across a turn; in panic mode the bound collapses to 1, which is the old single
+free retry turn for turn, so a dying machine cannot spend a bounded wait per line.
+`evidence_lost`'s threshold is UNCHANGED at zero — the 13 lines were really gone,
+and on a 2012 rMBP with no 16550 the FTDI capture is not a mirror of the evidence,
+it IS the evidence, so a tolerance here would be the wrong-lenient half of LAWS §5
+applied to the one tap that cannot afford it.
+
+**WHY IT IS UNSCORED, WITH THE NUMBERS, because an unproven fix recorded as a
+proven one is the costlier error.** The proof this entry asks for is a run reading
+`staged >= 64` with `dropped=0`, i.e. a run that REACHES the ring's depth. FLAKEFIX2
+could not make the bench reach it. Four `./arroyo test` boots on 2026-09-22, all on
+the loaded box this entry's own rates were measured on, read the `ftdi` tap at
+**`staged=0`, `staged=1`, `staged=0`, `staged=0`** — below even the `staged=10..30`
+this entry records for its PASS captures, and two orders of magnitude below the
+`staged=64/65` the FAILs reached. Host load 29 → 57 across them (`uptime` quoted in
+rmbp-ledger B159), six sibling `cargo` builds, and a run with all five vCPUs pinned
+onto four already-spinning host CPUs — the deschedule-mid-memcpy shape this entry
+names as the mechanism — moved the reading from 0 to 1 and no further. **The branch
+that was changed was therefore never taken in any of the four runs**, so the four
+greens are a NO-REGRESSION measurement (rc=0, `SERWIT-2 … -> PASS`, the four tap
+lines' accounting identical, `balanced` intact) and nothing more. The go-red is
+unreachable for the same reason: re-introducing the single-attempt path cannot
+produce `dropped>0` on a boot that never fills the ring.
+
+**What a future seat needs, stated as the specific missing instrument rather than
+as more wall.** At the measured rate (2 FAIL in 65 boots) three CONSECUTIVE greens
+at depth is not a thing wall-clock buys. What is needed is a DELIBERATE WIDENER that
+drives `STAGE` to its 64 slots on demand — a SERWIT-1-shaped burst that holds `RING`
+across a stretched `ring_write`, or an `arroyo` knob that does. Every place such a
+widener can live is outside `drivers/xhci/ftdi.rs`: the SERWIT fixtures are in
+`crate::serial_ring`, and a knob is `unaos/arroyo` plus `builder/src/main.rs`. That
+is why it is not here, and it is the one thing to give whoever scores this.
 
 The suspect that stood here before, kept because the arithmetic is still true and
 the next reader should not re-derive it: **per-line growth on the rollup lines**
@@ -734,7 +854,8 @@ discriminator; it has now been checked against four real captures and it reads
    the rollup lines shortened and see whether `evidence_lost` follows.~~ **Not
    needed — `torn=0` in four captures answers it. Do not spend a run on it.**
 
-**Disposition — ROOT CAUSE KNOWN, FIX OWED, and CORRECT one sentence this entry
+**Disposition — ROOT CAUSE KNOWN, FIX MADE AND UNSCORED (see above; it stays on
+the owed list until a run at depth scores it), and CORRECT one sentence this entry
 used to carry: it DOES turn the gate red.** The old text said SERWIT-2 "does not
 turn a gate red on its own" because no `.spec` file carries a SERWIT token. That
 is true of the spec replay and false of the run: `FAIL ::` is in arroyo's
