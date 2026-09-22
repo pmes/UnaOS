@@ -307,7 +307,7 @@ not of this class.
   1a: a `SWEPT`-and-park handshake so the launcher's re-read happens inside a
   window where the state is provably live, instead of racing a 2000 ms deadline.
 
-### 1c. `[dmgovlp]` `adopt_stretch=0/4` — **mechanism still suspect; rate now MEASURED at 6 in 47 boots (2026-09-22), the worst on the bench**
+### 1c. `[dmgovlp]` `adopt_stretch=0/4` — **RE-CLASSED AND FIXED 2026-09-22 (DMGFLAKE, branch `exec-rmbp-dmgflake`, parent `6fab6b0d` — the tip sha at the fold; rmbp-ledger B158). NOT a wall-clock window, and NOT host starvation: the fixture was scoring composite passes that `COMP_GATE` DECLINED.** Rate before the fix: 6 in 47 boots (2026-09-22), the worst on the bench.
 
 **Signature on the wire** (the verdict's own format, `video/wm.rs:24379`):
 
@@ -329,10 +329,16 @@ and a patched re-run on the same host pass `adopt_stretch=4/4`. Artifacts:
 `~/unaos-bench/scratch/rmbp7/topport-regate.out` (the FAIL),
 `topport-baseline-r1.out`, `topport-patched-r3.out`.
 
-**Suspected mechanism:** the stretch passes assert inside a wall-clock window
-(the CURSTICK stretch, `wm.rs:24331` — present+drain must move `CUR3_TAKEN`
-within the pass); a QEMU starved by sibling load can miss all four windows
-without any kernel defect. Same shape as 1a's deadline race, one layer up.
+**Suspected mechanism (FALSIFIED 2026-09-22 — kept because it is what the
+next reader would guess too):** the stretch passes assert inside a wall-clock
+window (the CURSTICK stretch — present+drain must move `CUR3_TAKEN` within the
+pass), and a QEMU starved by sibling load misses all four windows without any
+kernel defect. Same shape as 1a's deadline race, one layer up.
+
+**Why it is false, and the tell was on every capture the whole time:
+`max_ms=0`.** Starvation makes a pass take LONGER. The failing captures read
+`max_ms=0..3` against greens at `max_ms=2..25` — the failing runs are the FAST
+ones, because nothing happened in them at all. See the real mechanism below.
 
 **What to record on the next sighting:** the full verdict line; host load and
 sibling QEMU count at the time; whether an idle-host re-run is clean; and
@@ -348,7 +354,13 @@ executors building. The failing verdict:
 [dmgovlp] verdict passes=12/12 drained=12/12 cur=12/12 drag_evt=0 drag_px=0 adopt=0 max_ms=0 adopt_stretch=0/4 -> FAIL
 ```
 
-**This sighting confirms the starvation reading on the terms §1c set.** The
+**This sighting was read as confirming starvation; it does the opposite, and
+the correction is DMGFLAKE's (2026-09-22) rather than a rewrite of the
+sighting.** `max_ms=0` beside greens at `max_ms=3` is not "an outlier" in the
+direction starvation predicts — a starved pass is SLOWER, not instant. The
+failing run is instant because its twelve passes were declined and never ran.
+`drag_evt=0` is the same fact stated once more. The banked observation stands;
+only its verdict is corrected. The original text follows. The
 two green re-runs on the same tree carry `drag_evt=5 drag_px=38590 adopt=25
 max_ms=3`; the failing run carries `drag_evt=0 drag_px=0 adopt=0 max_ms=0`.
 `max_ms` is the outlier §1c asked for — and `drag_evt=0` says more than
@@ -384,9 +396,86 @@ box the same day both read
 `drag_evt=5 drag_px=38590 relay=3 adopt_stretch=4/4 -> PASS`, so the fixture is
 not broken — it is unmeasured under load.
 
-**Disposition — WATCH.** Do not clear a gate on this line without an
-idle-host re-run (both benches' standing rule: no single-run red convicts),
-and do not let a clean re-run bury the sighting — bank it here.
+### 1c — THE REAL MECHANISM, measured (DMGFLAKE, 2026-09-22)
+
+**`composite()` on x86 is gated, and a declined pass is INDISTINGUISHABLE from
+a drained one.** `wm::composite`'s x86 arm compare-exchanges [`COMP_GATE`]; a
+second entrant takes the DECLINE arm, whose own comment states the property
+exactly: *"This pass composites nothing and — crucially — CLEARS NOTHING"*. It
+stores `COMP_PENDING`, ticks `WCSER_DECLINED`, calls `cursor::owe_repaint()`
+and returns — in microseconds, having painted nothing and left every `damaged`
+flag standing.
+
+`dmgovlp_selftest` scored that as success, twice over:
+
+* every counter it reads is a **delta over work that never happened**, so
+  `drag_evt`, `drag_px`, `relay`, `narrow`, `adopt` and `adopt_stretch` all
+  read zero; and
+* its **drain check** — "one extra composite must add NOTHING" — is satisfied
+  by the compositor doing nothing, so `drained=12/12` was scored BY the
+  decline. Twelve green drains over twelve passes that never ran.
+
+**The signature is bimodal, and that is the proof it is not a clock.** The
+fixture's whole battery completes in microseconds when it is being declined,
+so it fits inside ONE sibling composite pass (`[comp2] pass_us=4265` mean under
+TCG, 170 ms tail). Either the gate is free when the battery starts and all
+twelve passes run, or it is held and ALL of them fold. There is no middle: on
+the bench every green reads `drag_evt=5 drag_px=38590 … adopt_stretch=4/4` and
+every flake reads `drag_evt=0 drag_px=0 relay=0 narrow=0/12 … adopt_stretch=0/4`.
+A per-pass wall-clock lottery would produce 1/4, 2/4 and 3/4. None exists.
+
+**The discriminating field, free on every capture:** the `[wcser]` rollup.
+Every `adopt_stretch=0/4` flake on the bench carries a `scope=fixture` rollup
+with `declined_pct=23..31` (`gmux8-logs/test240.log` `entered=107 declined=48
+declined_pct=30`; `flakefix-logs/repro1.log` `entered=202 declined=61
+declined_pct=23`; `ptrinstall3-logs/serial-smp2-wc.log` `entered=165
+declined=75 declined_pct=31`). Greens carry `declined_pct=0` or no
+fixture-scope declines at all. `repaint=1` on the GMUX8 line is
+`owe_repaint()`'s own fingerprint — the decline path leaking into the verdict.
+
+**Fix — in the fixture's shape, not the compositor's.** The compositor is
+correct: declining is what the gate is FOR. What was wrong is a witness that
+could not tell "the pass ran and the assert failed" from "the pass never ran".
+`dmgovlp_selftest` now routes every `composite()` through a bounded
+`composite_live` helper which asks `WCSER_DECLINED` whether the call actually
+took the gate, waits the holder out (250 ms budget — 1.5x the worst honest TCG
+pass tail, 4x under `DMGOVLP_WEDGE_MS`, so it can never mask the boot-8 wedge)
+and retries; the declined pass CLEARS NOTHING, so the damage it did not service
+is still on the table and the next real pass carries it. Per LAWS §5 the wall
+clock is **REPORTED and never gated** — a new `[dmgovlp] serialisation
+folds=N fold_ms=N unran=N budget_ms=N` line — and the fold wait is kept out of
+`max_ms` so a busy sibling can never forge a WEDGE. A drain now counts only if
+its composite RAN, and the per-pass stretch line names the miss:
+`why=adopted | missed:pass-declined-by-COMP_GATE | missed:unoffered |
+missed:offered-but-no-carry`. Only the last convicts CURSTICK.
+
+**The spec pin is unchanged in meaning and in grammar.** `x86-wc.spec` still
+REQUIREs `adopt_stretch >= 1` via the same contiguous
+`adopt_stretch=\d+/4 -> PASS` regex; the new fields ride their own line (no
+`SKIP`, no `-> FAIL`, so they trip none of that file's FORBIDs), the same
+argument DMGOVLP2's `stretch UNOFFERED` line makes. Proven by replay: the
+three green gate runs below passed the spec unchanged.
+
+**Evidence (all at host load 17–44 on 20 cores, sibling QEMUs live).**
+
+| Run | Wire | Verdict |
+| --- | --- | --- |
+| three consecutive greens, loads 16.98 / 25.37 / 19.60 | `folds=0 fold_ms=0 unran=0` | `adopt_stretch=4/4 -> PASS`, `TEST_RC=0` x3 |
+| **forced fold** (scratch probe holds `COMP_GATE` 80 ms across the battery) | `folds=2 fold_ms=110 unran=0`, `why=adopted` x4 | `adopt_stretch=4/4 -> PASS` — the fixture waits the holder out |
+| **deliberate re-introduction** (same probe, the decline-blind drain restored) | `folds=13`, `pre=(true,0,0) dd=0 db=0`, `why=missed:pass-declined-by-COMP_GATE` x4 | `passes=12/12 drained=12/12 drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=12/12 adopt=0 repaint=0 max_ms=3 adopt_stretch=0/4 -> FAIL` |
+
+The re-introduction line is the bench's §1c signature **character for character
+apart from `max_ms`**, which is the confirmation that the forced probe and the
+bench flake are the same event.
+
+**Disposition — FIXED** (fixture-only, `video/wm.rs` `dmgovlp_selftest`; no
+compositor change, no spec change, knob-off byte-identical on both arches).
+The standing rule still holds for anything that reds here AFTER this sha: an
+`adopt_stretch=0/4` with `why=missed:offered-but-no-carry` is a **real CURSTICK
+regression** and must not be re-run away; one with
+`why=missed:pass-declined-by-COMP_GATE` after this fix means the 250 ms budget
+was exhausted, which is a new and reportable fact — read `unran=` and the
+`[wcser]` `declined_pct=` beside it.
 
 ### 1d. DOCKID `order=false set=false` — **measured 2026-09-22 (FLAKEFIX, rmbp-ledger B150): a Class-1 re-read race, NOT lost input**
 
