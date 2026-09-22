@@ -18646,3 +18646,280 @@ measurement this arc adds to that rung: `beam::hold` spins a MEAN of **2.48 ms**
 A real vsync interrupt or a fence from the display engine would return those cycles to the pass and
 is the next thing worth costing — `drivers/gpu/kepler_display.rs`, beside `beam_probe`, in the
 Kepler driver files this brief did not name.
+
+## PTRPAINT — the arrow's PIXELS waited on the compositor too, and 98.8% of that wait bought nothing (x86 `wc`, flight 11, 2026-09-22)
+
+**Brief.** PTRLAG (B134, fold `c7ce78c6`) took the blocking geometry read off the pointer install and
+closed its §STOP by naming the half it could not take: `video/cursor.rs`. This is that half. Branch
+`exec-rmbp-ptrpaint`, parent `a38ad49d`; rmbp-ledger **B141**. Appended at the tail of this file
+rather than under PTRLAG's section, on VUGPERF's precedent at `4a283725` — HEAD's section then
+EXEC's, both kept, a same-place append the seat unions rather than a conflict it has to judge.
+
+### The number, re-derived off `f11.log` rather than inherited
+
+`awk 'index($0,"[wedge9]")' f11.log | tail -1`, the capture's final sample (994010ms, `scope=desk`):
+
+    [wedge9] sprite-claim scope=desk refused=61127 masked=54070 retried=84 owed=1 serviced=7153 -> DEFERRED
+
+82 samples in the capture; the brief's figures are this line and they hold. `refused - masked` =
+**7,057 UNMASKED refusals** — the population that actually spins, because `claim_bounded` declines to
+wait while IRQs are masked (the WEDGE-8 rule) — against **`retried=84`**. So the 2 ms budget helped
+84 times in 7,141 attempts, **1.18%**, and the other 98.8% spent up to `CLAIM_RETRY_MS` on the INPUT
+core and then took `owe_repaint()` anyway. At 2 ms apiece that is on the order of **14 s of
+input-core spin across the flight**, on the band whose whole design goal since PTRINSTALL2 is to
+track the pad at HID rate. It is not a retry window. It is a wait, and PTRLAG's sentence about the
+install applies one layer down without a word changed.
+
+For scale on the other side of the same line: the first two samples of the capture already read
+`retried=0` (`47963ms`, `50017ms`) with `refused=5538`. `retried` has never been a large number on
+this machine.
+
+### And what an owed repaint then waited for — the floor is NOT the answer, and the capture says so
+
+The brief (and PTRLAG's §STOP) name `REPAIR_MIN_MS` as the thing that defers the cash. That is true
+of the mechanism and **small in the measurement**, which is worth stating plainly because the fix
+would otherwise have been aimed at the wrong half. The capture's last `[cursor8]`:
+
+    [cursor8] repair rate scope=live requests=7203 repairs=7151 suppressed_stale=12 \
+        suppressed_rate=40 unclocked=0 floor_ms=8 flush_kb=221296 -> LIMITED
+
+**The floor deferred 40 of 7,203 requests — 0.55%.** What the owed repaint actually waits for is the
+COMPOSITE PASS ITSELF. `repaired=7151` over ~994 s is one cash every ~139 ms, and `[comp2]` says the
+same number from the pass's own side: `passes=35 … rate=6.9/s span=5001ms`, with `pass_us=139751`
+and `max_us=211550` — **the mean composite pass on flight 11 was 139.7 ms and the worst was
+211.5 ms.** So the arrow's pixels were being paid out on a 140–210 ms cadence, by the very subsystem
+that was late, which is Peter's "sticky" for the sprite exactly as the fold storm is his "sticky" for
+the delivered position. `serviced=7153` against 7,057 unmasked refusals is the one-for-one
+restatement: nearly every refused claim did become a repaint — LATER, and on the storm's clock.
+
+### The fix, in two parts
+
+**1. `repaint_nowait()` — the bare claim.** One entry point in `video/cursor.rs` that claims through
+`claim()` instead of `claim_bounded(CLAIM_RETRY_MS)`: paints on success, `owe_repaint()` on refusal,
+and nothing in between. `claim_bounded` is left exactly where WEDGE-9 derived it — the UNMASKED
+NON-INPUT callers (`Screen::flush`'s bracket, `wm::move_to`/`close`, the composite tails), whose
+refusal costs a FRAME rather than a 125 Hz report and for which a spin against the worst single hold
+is the right trade. One entry point per regime, each saying what it is for, is the shape this module
+already uses for `claim` vs `claim_bounded` one layer down.
+
+It returns a `Nowait` (`Painted` / `Owed`) rather than `()`. No production caller reads it; the
+fixture does, and a fixture that cannot see the branch it scores is scoring nothing.
+
+**2. `cash_owed_sprite()` — the owed sprite's own cash, at `wm::cash_tail`.** One cfg-gated,
+line-neutral call at the tail of the composite's cashing half, past the four `CursorTail` arms. It
+is the RESIDUE consumer: in the common case one relaxed load, and it pays only a debt that
+`take_present_dirty` re-armed under the floor, or that a granted `repaint()` above then failed to
+claim, or that the tail itself armed. Bare claim, never waits (`cash_tail` is reached from the masked
+`SYS_WIN_PRESENT` chain on x86, where a wait is the F4 death outright), and the flag is cleared
+**only with the sprite in hand** — a `swap` ahead of the claim would drop the debt on a refusal,
+which is the one thing `owe_repaint`'s contract forbids.
+
+**What it does NOT do, and both matter.** It does not beat the pass — a present boundary is the
+boundary, and the claim in this section's title is that the debt is paid AT the boundary the
+compositor has already reached instead of rolling to the next one, i.e. `owed_cashed_us_max` bounded
+by **one present period**. And it is not `SPRITE_OWNS_PAINT = false`: PTRLAG rejected the aarch64
+model for x86 because it puts the arrow's cadence back on the present, which is what PTRINSTALL2
+removed. Here the INSTALL stays on the input path; only the CASH — a repaint nobody could take when
+it was owed — rides the present, which it already did.
+
+**Why it is not the P69 loop `REPAIR_MIN_MS` exists to break.** The floor bounds a self-feeding chain
+whose period is a composite pass: `repair` damages the windows under the pointer, their composite
+lands over the sprite, the next undraw owes again. This call runs AT a pass's tail and consumes the
+SAME flag, so it cannot produce a repaint the granted path would not have produced and it cannot run
+faster than the passes themselves. `REPAIR_MIN_MS` still governs `restore_note`'s desktop half, which
+is the leg with a 30 kHz render pump behind it and the one CURSORBG put the bound on.
+
+### The instrument
+
+One line, chained off `wedge9_rollup`'s own call site on the `[cursor8]` → `[cursor11]` → `[wedge9]`
+precedent — it is the same pass's contention story one DECISION further on, and a reader comparing
+`nowait_owed=` against `refused=`/`retried=` on the adjacent line is comparing like with like.
+
+    [ptrpaint] sprite-nowait scope=<s> nowait_ok=<n> nowait_owed=<n> owed_cashed=<n> \
+        owed_cashed_us_max=<n> bounded_entries=<n> owing=<0|1> -> QUIET|UNCONTENDED|CASHED|OWING
+
+* **`nowait_ok` / `nowait_owed`** — the split of the band's own claims. `nowait_owed` is the
+  population that used to spin.
+* **`owed_cashed`** — debts paid by `cash_owed_sprite` rather than by a granted tail.
+* **`owed_cashed_us_max`** — the high-water age of a debt at the moment it was paid, stamped
+  `compare_exchange(0, now)` so a burst reports its OLDEST member (`[ptrinstall] fold_age_max_ms`'s
+  choice, for the same reason). **This is the number flight 12 is for.**
+* **`bounded_entries`** — unmasked claims that entered `claim_bounded`'s wait, from ANY caller (the
+  go-red's counter; see below). Reported, never gated here: the non-input callers the bounded form
+  was derived for legitimately produce some, and that is exactly what this arc leaves them. Once the
+  `pal.rs` call site moves (see the STOP), this is the census that says the INPUT band no longer
+  produces any — read it beside `[wedge9] retried=`.
+
+**What flight 12 should read.** `[wedge9] retried=` **0** — `claim_bounded`'s successful spin is the
+counter's only producer and the input band no longer reaches it, so a non-zero `retried` on an armed
+flight-12 capture says the call site did not move. And `owed_cashed_us_max` bounded by one present
+period: read it against `[comp2] pass_us=` and `max_us=` on the same capture, which on flight 11 were
+139,751 and 211,550 µs. A reading in the hundreds of milliseconds with `owed_cashed` climbing says
+the cash is still riding the storm and this arc did not land. `QUIET` and `UNCONTENDED` are the
+honest absences — the band never ran, or ran and never met a loaned sprite — and neither is a pass.
+
+### The go-red, and the fixture that had to be rewritten to produce one
+
+`ptrpaint_selftest` is `ptrlag_selftest`'s design one file over, for the defect one layer down. It
+holds the sprite loan on THIS core — legal, and the reason WEDGE-9's loan is a loan and not a lock: a
+contender's `claim` observes `false` under `SPRITE_FREE` and returns `Busy` in a few dozen cycles, so
+holding it blocks nobody and cannot deadlock — then calls `repaint_nowait` under it.
+
+**The first version of this fixture TIMED the call, and the go-red scored GREEN.** The assertion was
+`cyc <= budget/4` on an argument that looks airtight: `claim_bounded` cannot return before
+`now - t0 >= budget`, because the loan it is waiting for is held by the block timing it. The mutated
+tree then read
+
+    :: PTRPAINT: … held: OWED cyc=317120 bound=997885 budget_cyc=3991798 nospin=yes … :: PASS ::
+
+i.e. 159 µs against a 2 ms budget — **the bounded form did not wait at all**, on a tree where it
+provably could not have taken the loan. The argument omits that `claim_bounded`'s deadline is an
+rdtsc compare made by a PREEMPTIBLE caller: one core migration or one host deschedule across that
+read and `now.wrapping_sub(t0)` clears the whole budget in a single iteration. It is not reliable in
+either direction — a later run of the identical mutation read `cyc=4705980`, spending the budget in
+full. **A fixture whose verdict depends on which way that coin lands is not a fixture.**
+
+VUGPERF's `pace_pin_probe` had already written the rule, and this is its second earning: **ASK THE
+LOCK, DO NOT TIME IT.** The assertion is now a COUNT. `PP_BOUNDED_ENTRIES` is charged on
+`claim_bounded`'s last line before its loop — after both fast exits (`first.is_ok()`,
+`irqs_masked()`) and after the unclocked `mono_now_hz` arm — so it counts exactly "an unmasked claim
+that entered the bounded wait", one per call, whatever the loop then does. The fixture takes its
+delta across the timed call:
+
+* **OWED** — the held call came back `Nowait::Owed`. The control for "did the fixture manufacture
+  contention at all"; without it the rest could pass on a sprite nobody was holding.
+* **`spun == 0`** — and it never entered the bounded wait. 0 for the bare claim, exactly 1 for the
+  bounded one, on any host at any speed, with no threshold in between.
+* **`masked == false`** — a PRECONDITION, in the verdict because `claim_bounded` refuses to wait
+  while masked (the WEDGE-8 rule): a masked run would read `spun=0` on the mutated tree too and
+  score the go-red green. The latch already declines a masked pass; this re-reads the flag at the
+  call and fails loudly rather than trusting it.
+* **PAINTED** — released, the next call takes the sprite. The second control: a `repaint_nowait`
+  hard-wired to owe would pass the rest while measuring nothing.
+
+`cyc` and `budget_cyc` stay on the wire, REPORTED and never gated: they are the honest reading of
+what the call cost and they are what exposed the first design, but they decide nothing.
+
+The residual, stated: `PP_BOUNDED_ENTRIES` is global, so a concurrent unmasked `repaint()` on
+another core entering the wait inside the fixture's window would also red the line. It is bounded by
+the population — the QEMU lane's whole boot reads `[wedge9] refused=4 masked=0` — and it fails in
+the LOUD direction, which is the side a fixture may be wrong on.
+
+### ⚠ STOP — the ONE line this arc could not take, named exactly
+
+`repaint_nowait` is written, gated, measured and scored, and **it is not yet on the input band**,
+because the call site is in a file this arc may not touch:
+
+    unaos/crates/kernel/src/pal.rs:615   crate::video::cursor::repaint();   // in `repaint_on_move`
+
+`pal::cursor::repaint_on_move` — CURSOR-X86's "THE ONE CHOKE POINT", the single function every x86
+motion path goes through — is the caller PTRLAG's §STOP names, and it lives in `pal.rs`, not in
+`cursor.rs`. The change is **one token**: `repaint()` → `repaint_nowait()`, inside the existing
+`if SPRITE_OWNS_PAINT { … }` arm, which is already x86-only in effect (`SPRITE_OWNS_PAINT` is
+`cfg!(target_arch = "x86_64")`, `wm.rs:28270`). Not taken, and deliberately: `exec-rmbp-trackpad` was
+registered IN-FLIGHT at this arc's own cut (`a38ad49d`) on the pointer path, and a second executor
+editing `pal.rs`'s pointer block is the two-sided fold the touch list exists to prevent.
+
+**What is live without it, and what is not.** Part 2 is live on every `wc` boot: `cash_owed_sprite`
+runs at every composite cash and pays owed sprite debts — however they were armed — at the boundary
+the compositor is already at, and `owed_cashed_us_max` measures it. Part 1 is compiled, exercised and
+scored by the fixture, and inert in production until that one token lands. `[ptrpaint] nowait_ok=`
+and `nowait_owed=` will therefore read the fixture's own two calls and nothing else, and
+`[wedge9] retried=` will NOT go to zero, until it does. **Flight 12 cannot score Part 1 before that
+line is taken**, and a reading of `retried > 0` on flight 12 means the line is still owed, not that
+the mechanism failed.
+
+### Gates
+
+`./arroyo knoboff wc a38ad49d` — **exit 0**, run on the FINAL tree (an earlier pass on an earlier
+revision of the same arc also read 0; only this one scores). Both arches byte-identical to the
+baseline — x86 `c250baac…` 1,601,160 bytes, arm `7f1d3434…` 1,624,592 bytes — **control fired on
+BOTH arches** (`armed≠off: YES / YES`), `warm=yes`,
+`compiled_tree=[unaos-kernel|unaos-kernel]`. Every statement this arc adds is
+`all(target_arch = "x86_64", feature = "wc")` or narrower, and the two edits above the tail block are
+SAME-LINE folds (`claim_bounded`'s `let budget = …`, `wedge9_rollup`'s closing `);`), so the knob-off
+image cannot move and no panic `Location` in either file changes number: `cursor.rs` 4,529 → 4,942
+lines with a pure tail append, `wm.rs` 28,616 → 28,616.
+
+`cd unaos && ./arroyo check` — **158 ✅ legs** on the final tree, `x86_64 OK`, `aarch64 OK`, `bootloader OK`,
+`kernel cfg coverage OK (80 legs)`, userspace x86_64 (4 crates) and aarch64 (5 crates) OK.
+**rc 1, and the single ❌ is NOT this arc's:** `a ledger row is unverifiable` — eleven
+`stale queue-citation registration` findings, every one in `docs/dev/OS/orin-queue.md` (SO43, SO44,
+SO46, A74, A75, A85, A86, A87, A89, A90, A91), a file this arc does not touch. **Proved
+environmental rather than argued:** `ledger-check.sh` was run on this worktree at a moment when
+`git status --porcelain` listed only the two `.rs` files as modified — i.e. with every doc byte-
+identical to `a38ad49d` — and it reported **those same eleven findings and rc 1**. The same script
+had returned **rc 0** twenty minutes earlier on the same tree, with the ids counted as
+`deferred-keepable`/`grandfathered` rather than stale; the classification depends on which peer
+branches exist in the shared repository at the moment of the run, and peers were landing throughout.
+A second ❌ under `GATE-BRANCH` names `refs/heads/exec-rmbp-kvblank` UNREGISTERED — another seat's
+branch, and likewise not this arc's.
+
+`bash unaos/scripts/ledger-check.sh` — run before and after. See the note above for why its verdict
+moved on an unchanged tree; the finding SET is identical before and after this arc's rows, no
+finding names a file this arc changes, and the row count moves by exactly the one row B141 adds.
+
+**THE QEMU RUN — `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 ./arroyo test-ptr 150`, rc 0**, full wall
+150.5 s, `MBENCH PASS — 7/7 required witnesses, 0 forbidden hit(s), 2820 lines scanned`, the boot
+reached its last fixture (serial.log line 2503), `✔ spec replay: every pinned line in x86-ptr.spec is
+present`. The lane is `test-ptr` for the reason x86-ptr.spec's own header gives — every other x86 leg
+carries a `usb-tablet` only, so `test 150` reads the ZERO CONTROL for the pointer band. Built set
+`witness,ehcihid,kbdwit,sdhcblk,smolnet,wc,quarry,sdwrite,ftdirx`. The wire:
+
+    :: PTRPAINT: repaint_nowait under a HELD sprite — held: OWED spun=0 masked=no \
+        cyc=379460 budget_cyc=3991840 | released: PAINTED :: PASS ::
+    [ptrpaint] sprite-nowait scope=desk nowait_ok=1 nowait_owed=1 owed_cashed=1 \
+        owed_cashed_us_max=964 bounded_entries=0 owing=0 -> CASHED
+    [wedge9] sprite-claim scope=desk refused=4 masked=0 retried=0 owed=0 serviced=4 -> DEFERRED
+    [ptrinstall] installs=36 reports=36 lag_max_ms=19 coalesced=0 drains=36 folds=0 \
+        fold_age_max_ms=0 drain_gap_max_ms=63 panel_busy=1
+
+Read honestly, term by term. `nowait_ok=1 nowait_owed=1` is **the fixture's own two calls and
+nothing else** — the production caller is the `pal.rs` line the STOP below names, and it has not
+moved, so there is no other producer on this or any lane yet. `owed_cashed=1` with
+`owed_cashed_us_max=964` is the cash path doing real work: the debt the fixture's OWED leg armed was
+paid **964 µs** later, at the next composite cash, which is the mechanism demonstrating itself
+end-to-end. (A second green run of the same tree read `owed_cashed=5 owed_cashed_us_max=1292` — the
+population varies with what the desktop happened to owe; both are ≪ one present period, and the
+flight-11 comparison is 139–211 ms.) `bounded_entries=0` says no context on this boot entered the
+bounded wait at all, which is a quiet-lane reading and not a result. `retried=0` on `[wedge9]` is
+likewise the QEMU control, not evidence: it was 0 on the baseline tree too, because TCG has no
+contention. **PTRINSTALL2's identity is intact** (`installs == reports == 36`, `drains=36`), so B117
+and B134 are undisturbed by this arc.
+
+**THE GO-RED — rc 1**, `repaint_nowait`'s claim routed back through `claim_bounded(CLAIM_RETRY_MS)`
+and nothing else in the tree changed:
+
+    ✖ serial.log:1442: :: PTRPAINT: repaint_nowait under a HELD sprite — held: OWED spun=1 \
+        masked=no cyc=4705980 budget_cyc=3991984 | released: PAINTED :: FAIL ::
+
+`spun=1` is the whole verdict; `masked=no` says the precondition held; and `cyc=4705980` against
+`budget_cyc=3991984` happens to show the full 2 ms wait on this particular run, which is the thing
+the FIRST version of the fixture could not rely on. `cursor.rs` was then restored and verified
+byte-identical by sha256.
+
+**THE ARMED ARTIFACT.** `UNAOS_WC=1 ./arroyo esp-x86` carries **no** new token, and that is correct
+rather than a miss: every string this arc adds is `witness`-gated, and so is `[wedge9]`'s own — that
+media build's features are `ehcihid,kbdwit,sdhcblk,smolnet,wc,sdwrite` and it contains neither
+`[wedge9] sprite-claim` nor `[cursor8] repair rate`. Grepped on the artifact that actually carries
+the feature — `UNAOS_WC=1 UNAOS_WITNESS=1 UNAOS_QUARRY=1 ./arroyo esp-x86`, kernel.elf sha256
+`84af7f28…`, features `witness,ehcihid,kbdwit,sdhcblk,smolnet,wc,quarry,sdwrite` — with
+`LC_ALL=C grep -a -o -F`: `nowait_ok=` 1, `nowait_owed=` 1, `owed_cashed=` 1, `owed_cashed_us_max=`
+1, `bounded_entries=` 1, `[ptrpaint] sprite-nowait scope=` 1,
+`:: PTRPAINT: repaint_nowait under a HELD sprite` 1, `spun=` 2, `budget_cyc=` 1, `owing=` 1, and the
+three verdict words `UNCONTENDED` / `CASHED` / `OWING` present. Every new token is reachable in a
+shipped image, not merely compiled.
+
+**ONE RED THAT DID NOT REPRODUCE, recorded rather than swallowed.** The first run of this lane on
+this tree failed on a fixture this arc has nothing to do with:
+`:: APPQUIT: app=quarry win=1 bar_named=false menu_down=false quit_routed=false row_gone=false
+owner_close=false model_freed=0 surf_released=0 seal=0 :: FAIL ::` — every term false, i.e.
+`focus_and_bar`'s single `wm::composite()` left the menu bar not naming the app and the whole
+sequence fell through. The same command was then run **on a pristine `a38ad49d` tree** (the two `.rs`
+files swapped for their HEAD contents, `git status` clean, then restored and verified by sha256):
+**rc 0, APPQUIT PASS**. Re-run on this arc's tree: **rc 0, APPQUIT PASS**, twice. So it is one
+sighting in four runs across two trees and does not attribute to this arc; the PTRPAINT fixture had
+already printed 443 lines earlier and `cash_owed_sprite` did no work at all between them
+(`owed_cashed` was 1 for the whole boot). It is a flake worth a queue row, not a finding this arc can
+close.
+

@@ -411,7 +411,7 @@ fn claim_bounded(budget_ms: u64) -> Result<SpriteLoan, SpriteClaimError> {
     let Some((t0, hz)) = mono_now_hz() else {
         return claim();
     };
-    let budget = hz.saturating_mul(budget_ms) / 1000;
+    let budget = hz.saturating_mul(budget_ms) / 1000; #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))] PP_BOUNDED_ENTRIES.fetch_add(1, Ordering::Relaxed); // PTRPAINT (B141) — THE SPIN-ENTRY COUNT, charged on the last line before the wait and AFTER both fast exits (`is_ok`/`irqs_masked` above, and the unclocked `mono_now_hz` arm), so it counts exactly "an unmasked claim that ENTERED the bounded wait" — one per call, whatever the loop then does. It is what `ptrpaint_selftest` gates on instead of a cycle threshold, on VUGPERF's rule (`pace_pin_probe`: ASK THE LOCK, DO NOT TIME IT): the first go-red attempt measured `cyc=317120` against its own `budget_cyc=3992146` and scored the mutation GREEN, because the loop's `now.wrapping_sub(t0) >= budget` test is an rdtsc read taken on whichever core this PREEMPTIBLE caller is running on, and one migration or host deschedule across that read makes the deadline arrive at once. This counter cannot be fooled that way: the bare `claim()` never reaches this line and the bounded form always does. ⚠ SAME-LINE fold, line-NEUTRAL and BEFORE the line's first `//` (LEDGER P7); cfg-gated on `wc`, so the knob-off image cannot move.
     loop {
         if let Ok(l) = claim() {
             #[cfg(feature = "witness")]
@@ -546,7 +546,7 @@ pub fn wedge9_rollup(scope: &str) {
     serial_println!(
         "[wedge9] sprite-claim scope={} refused={} masked={} retried={} owed={} serviced={} -> {}",
         scope, refused, masked, retried, u8::from(owed), serviced, verdict
-    );
+    ); #[cfg(all(target_arch = "x86_64", feature = "wc"))] ptrpaint_rollup(scope); // PTRPAINT (B141) — chained here rather than given its own call site, on the `[cursor8]` -> `[cursor11]` -> `[wedge9]` precedent this block already states: it is this pass's contention story one DECISION further on, and a reader comparing `nowait_owed=` against `refused=`/`retried=` on the line above is comparing like with like. ⚠ SAME-LINE fold, line-NEUTRAL: `cursor.rs` is compiled into the knob-off image on both arches and panic `Location` records embed line numbers, so the whole of B141 is a tail block plus this one token. The append is BEFORE the line's first `//` (LEDGER P7) and cfg-gated, so the knob-off image cannot move.
 }
 
 /// CURSOR-5 — [`Sprite::epoch`], mirrored where a lock-free reader can see it.
@@ -4525,5 +4525,418 @@ fn restore_note(x: usize, y: usize, w: usize, h: usize) {
         CB_DEFERRED.load(Ordering::Relaxed),
         CB_UNCLOCKED.load(Ordering::Relaxed),
         REPAIR_MIN_MS
+    );
+}
+
+// =================================================================================================
+// PTRPAINT — THE ARROW'S PIXELS STOP WAITING ON THE COMPOSITOR (x86 `wc`, rmbp-ledger B141)
+// =================================================================================================
+//
+// Appended at the TAIL of this file for the reason the PANELREFUSE and CURSORBG blocks above give:
+// `cursor.rs` is compiled into the knob-off image on BOTH arches and panic `Location` records embed
+// line numbers, so nothing in this file may move. The ONLY edit above this block is a single
+// SAME-LINE fold on `wedge9_rollup`'s closing `);`, and every item below is gated
+// `all(target_arch = "x86_64", feature = "wc")` — so the knob-off image cannot move either.
+//
+// # The defect, in flight 11's own numbers
+//
+// PTRLAG (B134) took the blocking GEOMETRY read off the pointer install and named the other half of
+// Peter's "sticky" in its STOP: the arrow's PIXELS. `repaint()` -> `repaint_deferred()` claims the
+// sprite through `claim_bounded(CLAIM_RETRY_MS = 2 ms)`, and on x86 the caller on the input band is
+// `pal::cursor::repaint_on_move`, i.e. EVERY pointer report. The last `[wedge9]` of `f11.log`
+// (`awk 'index($0,"[wedge9]")' f11.log | tail -1`, 994010ms, scope=desk) reads:
+//
+//     [wedge9] sprite-claim scope=desk refused=61127 masked=54070 retried=84 owed=1 serviced=7153 -> DEFERRED
+//
+// `refused - masked` = 7,057 UNMASKED refusals — the population that SPINS, because `claim_bounded`
+// declines to wait while masked (the WEDGE-8 rule) — against `retried=84` that succeeded inside the
+// budget. The 2 ms budget therefore helped 84 times in 7,141 attempts, **1.2%**, and the other 98.8%
+// spent up to 2 ms on the input core and ended in `owe_repaint()` regardless: about 14 s of
+// input-core spin across the flight, bought for nothing. That is not a retry window; it is a wait.
+//
+// # And the SECOND half: what an owed repaint then waited for
+//
+// The debt is cashed by `take_present_dirty`, which `wm::composite_pass_half` calls once per pass.
+// Two things stand between the arming and the pixels, and the flight says which one matters:
+//
+//   * the `REPAIR_MIN_MS` floor, which RE-ARMS rather than grants. Measured, and it is NOT the
+//     bottleneck: the last `[cursor8]` of the capture reads `requests=7203 repairs=7151
+//     suppressed_stale=12 suppressed_rate=40 unclocked=0 floor_ms=8 -> LIMITED`. The floor deferred
+//     **40 of 7,203** requests (0.55%). The brief's "cashed only under the floor" is true of the
+//     mechanism and small in the measurement, and this block says so rather than inheriting it.
+//   * the COMPOSITE PASS ITSELF, which is the real wait. `repaired=7151` over ~994 s is one cash
+//     every ~139 ms mean, and under the storm PTRLAG differenced (`d_drains=0` samples, a render
+//     loop period of ~211 ms) the arrow's pixels were paid on the compositor's cadence exactly when
+//     the compositor was the late thing. `serviced=7153` against 7,057 unmasked refusals is the
+//     one-for-one restatement: almost every refused claim became a repaint somebody else paid for,
+//     LATER.
+//
+// # The fix, in two parts, and what each one is NOT
+//
+// 1. [`repaint_nowait`] — the bare [`claim`], no spin, `owe_repaint()` on refusal. `claim_bounded`
+//    is left exactly where WEDGE-9 derived it: the UNMASKED NON-INPUT callers (`Screen::flush`'s
+//    bracket, `wm::move_to`/`close`, the composite tails), whose refusal costs a frame rather than a
+//    report and which are not on the 125 Hz band.
+// 2. [`cash_owed_sprite`] — the owed SPRITE repaint gets its own cash at `wm::cash_tail`, the
+//    present boundary the compositor is ALREADY at, with the bare claim and no floor. What it
+//    removes is not the pass (a pass is the boundary) but the three ways a debt could roll PAST a
+//    boundary it had already reached: `take_present_dirty`'s floor re-arm, the `tail == Untouched`
+//    upgrade that only fires when the flag was GRANTED, and the 2 ms spin inside the cash's own
+//    `repaint()`. `owed_cashed_us_max` is the number that says whether that worked, and its
+//    expectation on flight 12 is ONE PRESENT PERIOD.
+//
+//    It is NOT `SPRITE_OWNS_PAINT = false`. PTRLAG rejected the aarch64 model for x86 because it
+//    puts the arrow's cadence BACK on the present, which is what PTRINSTALL2 removed; the install
+//    stays on the input path and the CASH — a repaint nobody could take when it was owed — is the
+//    only thing that rides the present here.
+//
+//    Nor is it the P69 loop `REPAIR_MIN_MS` exists to break. The floor bounds a self-feeding chain
+//    whose period is a composite pass; this cash runs AT a composite pass's tail and consumes the
+//    SAME flag, so it cannot produce a repaint the granted path would not have produced, and it
+//    cannot run faster than the passes themselves. What it stops paying is the extra pass a re-arm
+//    or a missed upgrade used to cost.
+
+/// PTRPAINT — what [`repaint_nowait`] did with the report it was handed. Two outcomes, because the
+/// bare [`claim`] has two, and the caller can act on neither: the point of the split is that the
+/// FIXTURE can. See [`ptrpaint_selftest`].
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Nowait {
+    /// The sprite was free; the whole restore -> save -> draw ran under the loan.
+    Painted,
+    /// The sprite was loaned out. NOTHING waited: [`owe_repaint`] took the debt and
+    /// [`cash_owed_sprite`] pays it at the next present boundary.
+    Owed,
+}
+
+/// PTRPAINT — the monotonic tick at which the OLDEST un-cashed sprite debt was armed, or 0.
+///
+/// `compare_exchange(0, now)`, so the FIRST arming of a run wins and a burst of refusals reports the
+/// age of the oldest one rather than the youngest — the same choice `[ptrinstall] fold_age_max_ms`
+/// made for the same reason. Cleared by [`cash_owed_sprite`] when the debt is actually paid, so a
+/// `0` here means "nothing is owing", never "the clock was not read".
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static PP_OWED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// PTRPAINT — [`repaint_nowait`] calls that took the sprite and painted.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+static PP_NOWAIT_OK: AtomicU64 = AtomicU64::new(0);
+
+/// PTRPAINT — [`repaint_nowait`] calls that met a loaned sprite and owed instead. **This is the
+/// population that used to spin**: pre-B141 each of these was up to [`CLAIM_RETRY_MS`] on the input
+/// core, and flight 11 says 1.2% of them were worth it.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+static PP_NOWAIT_OWED: AtomicU64 = AtomicU64::new(0);
+
+/// PTRPAINT — owed sprite repaints paid by [`cash_owed_sprite`] at a present boundary.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+static PP_CASHED: AtomicU64 = AtomicU64::new(0);
+
+/// PTRPAINT — the high-water age, in microseconds, of a debt at the moment it was cashed. **The
+/// number flight 12 is for.** Bounded by one present period is the claim; anything in the hundreds
+/// of milliseconds says the cash is still riding the storm and the arc did not land.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+static PP_CASHED_US_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// PTRPAINT — unmasked claims that ENTERED [`claim_bounded`]'s wait, charged at that function's last
+/// line before the loop. **This is the arc's gated number, and why it is a COUNT and not a duration
+/// is written at the charge site**: the first go-red attempt timed the mutation and scored it GREEN
+/// at `cyc=317120` against its own `budget_cyc=3992146`, because `claim_bounded`'s deadline is an
+/// rdtsc compare taken by a PREEMPTIBLE caller and one core migration across it ends the wait at
+/// once. VUGPERF's `pace_pin_probe` states the rule this obeys: ASK THE LOCK, DO NOT TIME IT.
+///
+/// On metal it is also the census PTRPAINT exists to drive to zero ON THE INPUT BAND: every entry is
+/// an unmasked context that chose to wait on the compositor for the sprite. Reported as
+/// `bounded_entries=` on the `[ptrpaint]` line and never gated there — the NON-input callers
+/// `claim_bounded` was derived for legitimately produce some, and that is the whole of what this arc
+/// leaves them.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+static PP_BOUNDED_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+/// PTRPAINT — stamp the age clock iff nothing is already owing. See [`PP_OWED_AT`].
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn pp_owed_stamp() {
+    if let Some((now, _)) = mono_now_hz() {
+        // `max(1)`: 0 is the "nothing owing" sentinel and a monotonic counter can legitimately read
+        // 0 in the first instructions of a boot. One tick of error, once, against a lost stamp.
+        let _ = PP_OWED_AT.compare_exchange(0, now.max(1), Ordering::AcqRel, Ordering::Relaxed);
+    }
+}
+
+/// PTRPAINT — **put the sprite where the pointer is now, or owe it. Never wait.**
+///
+/// The entry point [`crate::pal::cursor::repaint_on_move`] is to call on x86 in place of
+/// [`repaint`]. Identical to [`repaint_deferred`] in every respect but one: the claim is the bare
+/// [`claim`] rather than [`claim_bounded`], so a loaned sprite costs one [`owe_repaint`] and zero
+/// microseconds of input-core spin instead of up to [`CLAIM_RETRY_MS`] of it.
+///
+/// **Why the bounded form is not simply retuned.** Its budget is derived (see [`CLAIM_RETRY_MS`])
+/// against the worst single hold and against the HID period, and it is correct for the callers
+/// WEDGE-9 wrote it for — `Screen::flush`'s bracket, `wm::move_to`/`close`, the composite tails.
+/// Those are unmasked, off the input band, and their refusal costs a FRAME. The input band's
+/// refusal costs a REPORT, at 125 Hz, and flight 11 measured the trade at 84 wins in 7,141 tries.
+/// One entry point per regime, each saying what it is for, is the shape this module already uses
+/// for `claim` vs `claim_bounded` one layer down.
+///
+/// **The debt is never lost and never silent.** The `Err` arm is `owe_repaint()` verbatim — the same
+/// whole-sprite refresh, the same [`TOUCHED_SINCE_DRAW`] arming, the same [`take_present_dirty`]
+/// consumer — plus a stamp, so [`cash_owed_sprite`] can say how long it stood.
+///
+/// Returns the outcome rather than `()`. No caller reads it; [`ptrpaint_selftest`] does, and a
+/// fixture that cannot see the branch it is scoring is a fixture that scores nothing.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn repaint_nowait() -> Nowait {
+    let mut armed_at: Option<(i32, i32)> = None;
+    let mut unsupported_now = false;
+    let restored = match claim() {
+        Ok(mut sp) => refresh_locked(&mut sp, &mut armed_at, &mut unsupported_now),
+        Err(_) => {
+            owe_repaint();
+            pp_owed_stamp();
+            #[cfg(feature = "witness")]
+            PP_NOWAIT_OWED.fetch_add(1, Ordering::Relaxed);
+            return Nowait::Owed;
+        }
+    };
+    // The loan drops at the end of the match above, exactly as in `repaint_deferred`: `finish` takes
+    // TABLE through `repair` and prints, and neither may run under the loan (`SPRITE` -> `TABLE`).
+    RepaintTail { restored, armed_at, unsupported_now }.finish();
+    // `refresh_locked` owes the refresh ITSELF on two paths — a refused undraw that left the arrow on
+    // the glass, and a refused `sprite_panel()` — and both are real debts this call created. Stamp
+    // them, or the cash below would report an age of zero for a wait that genuinely happened.
+    if REPAINT_OWED.load(Ordering::Acquire) {
+        pp_owed_stamp();
+    }
+    #[cfg(feature = "witness")]
+    PP_NOWAIT_OK.fetch_add(1, Ordering::Relaxed);
+    Nowait::Painted
+}
+
+/// PTRPAINT — **pay an owed sprite repaint at the present boundary the compositor is already at.**
+///
+/// One call, at the tail of `wm::cash_tail`, past every consumer of the pass's pixels and outside
+/// the `BlitGuard` window — the same footing `cash_tail`'s own `cursor::repaint()` has always had,
+/// which is what makes this one line and not an arc.
+///
+/// ### What it changes, stated against [`take_present_dirty`]
+/// Nothing about the FLAG: [`owe_repaint`] arms it, and `take_present_dirty` remains its judge for
+/// the tail-upgrade path. This is a SECOND consumer with a narrower duty — the sprite's own small
+/// rect, no full pass, no tail arm to upgrade, no floor — and it runs only on the residue: a debt
+/// that `take_present_dirty` re-armed under [`REPAIR_MIN_MS`], a debt a granted `repaint()` then
+/// failed to claim, or a debt armed by the tail itself. In the common case it is ONE relaxed load.
+///
+/// ### Why it is not the P69 loop the floor exists to break
+/// The floor bounds a self-feeding chain whose period is a composite pass — repair damages the
+/// windows under the pointer, their composite lands over the sprite, the next undraw owes again.
+/// This runs AT a pass's tail and consumes the SAME flag, so it cannot add a repaint the granted
+/// path would not have made and it cannot run faster than the passes themselves. `REPAIR_MIN_MS`
+/// still governs [`restore_note`]'s desktop half, which is the leg with the 30 kHz pump behind it.
+///
+/// ### Busy policy, and the ordering that makes the debt un-losable
+/// The bare [`claim`]. `cash_tail` runs inline on x86 and can be reached from a MASKED present
+/// chain, so a wait here is the F4 death outright. The flag is cleared **only once the sprite is in
+/// hand** — a `swap` ahead of the claim would drop the debt on a refusal, which is the one thing
+/// [`owe_repaint`]'s contract forbids — and a refusal simply leaves it standing for the next pass.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub(super) fn cash_owed_sprite() {
+    #[cfg(feature = "witness")]
+    ptrpaint_selftest_once();
+    if !REPAINT_OWED.load(Ordering::Acquire) {
+        return;
+    }
+    let mut armed_at: Option<(i32, i32)> = None;
+    let mut unsupported_now = false;
+    let restored = match claim() {
+        Ok(mut sp) => {
+            REPAINT_OWED.store(false, Ordering::Release);
+            refresh_locked(&mut sp, &mut armed_at, &mut unsupported_now)
+        }
+        Err(_) => return,
+    };
+    let stamp = PP_OWED_AT.swap(0, Ordering::AcqRel);
+    #[cfg(feature = "witness")]
+    {
+        // `[wedge9] serviced=` keeps its documented meaning — "owed repaints actually cashed at a
+        // composite tail" — and this IS one, so charging it here is what stops that line reading
+        // `LOST` once this consumer is doing the paying.
+        W9_OWED_SERVICED.fetch_add(1, Ordering::Relaxed);
+        PP_CASHED.fetch_add(1, Ordering::Relaxed);
+        if stamp != 0 {
+            if let Some((now, hz)) = mono_now_hz() {
+                let us = now.wrapping_sub(stamp).saturating_mul(1_000_000) / hz.max(1);
+                let mut seen = PP_CASHED_US_MAX.load(Ordering::Relaxed);
+                while us > seen {
+                    match PP_CASHED_US_MAX.compare_exchange_weak(
+                        seen,
+                        us,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(v) => seen = v,
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "witness"))]
+    let _ = stamp;
+    // `refresh_locked` can owe a NEW debt (refused undraw, refused panel). The stamp was just
+    // cleared for the one we paid, so re-arm the clock for the one we made.
+    if REPAINT_OWED.load(Ordering::Acquire) {
+        pp_owed_stamp();
+    }
+    RepaintTail { restored, armed_at, unsupported_now }.finish();
+}
+
+/// PTRPAINT — the instrument, on `[wedge9]`'s own cadence and chained off its call site for
+/// `[cursor8]` -> `[cursor11]` -> `[wedge9]`'s reason: it is the same pass's contention story one
+/// decision further on, and a reader comparing `nowait_owed=` with `refused=`/`retried=` on the
+/// adjacent line is comparing like with like.
+///
+/// * **`nowait_ok` / `nowait_owed`** — the split of the input band's own claims. Pre-B141 the
+///   `owed` population is `[wedge9] refused - masked` MINUS the WCSER declines, and every member of
+///   it spun; post-B141 none of them do. `retried=` on the line above must go to **0**: the only
+///   producer of that counter is `claim_bounded`'s successful spin, and the input band no longer
+///   reaches it.
+/// * **`owed_cashed`** — debts paid by [`cash_owed_sprite`] rather than by a granted tail.
+/// * **`owed_cashed_us_max`** — the high-water wait from arming to pixels. **Bounded by one present
+///   period is the claim.** Read it against `[comp2] pass_us=` and `[wpace] rate=` on the same
+///   capture: hundreds of milliseconds here means the debt is still riding the storm.
+/// * **`bounded_entries`** — unmasked claims that entered [`claim_bounded`]'s wait, from ANY caller
+///   (see [`PP_BOUNDED_ENTRIES`]). Reported, never gated: the non-input callers the bounded form was
+///   derived for legitimately produce some, and once the `pal.rs` call site moves this is the census
+///   that says the INPUT band no longer does — read it against `[wedge9] retried=`, which must be 0.
+///
+/// `QUIET` where the band never ran (QEMU without a relative pointer), `UNCONTENDED` where it ran
+/// and never met a loaned sprite — neither is a pass, and neither is a fault; they are the absence
+/// of a population, said out loud rather than shown as a green zero.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+pub(super) fn ptrpaint_rollup(scope: &str) {
+    let ok = PP_NOWAIT_OK.load(Ordering::Relaxed);
+    let owed = PP_NOWAIT_OWED.load(Ordering::Relaxed);
+    let cashed = PP_CASHED.load(Ordering::Relaxed);
+    let max_us = PP_CASHED_US_MAX.load(Ordering::Relaxed);
+    let entries = PP_BOUNDED_ENTRIES.load(Ordering::Relaxed);
+    let standing = REPAINT_OWED.load(Ordering::Relaxed);
+    let verdict = if ok == 0 && owed == 0 {
+        "QUIET"
+    } else if owed == 0 {
+        "UNCONTENDED"
+    } else if cashed > 0 || !standing {
+        "CASHED"
+    } else {
+        "OWING"
+    };
+    serial_println!(
+        "[ptrpaint] sprite-nowait scope={} nowait_ok={} nowait_owed={} owed_cashed={} owed_cashed_us_max={} bounded_entries={} owing={} -> {}",
+        scope, ok, owed, cashed, max_us, entries, u8::from(standing), verdict
+    );
+}
+
+/// PTRPAINT — the fixture's one-shot latch, and the two guards that make its verdict mean something.
+///
+/// **Unmasked only.** [`claim_bounded`] refuses to spin while IRQs are masked (the WEDGE-8 rule), so
+/// a masked run of the fixture would measure a bare claim on the mutated tree as well as on this one
+/// and score the go-red GREEN. `cash_tail` is reached both ways on x86 — masked from the
+/// `SYS_WIN_PRESENT` chain, unmasked from `pace_service` and `service_damage` — so the guard costs
+/// at most a few passes, never the fixture.
+///
+/// **The latch is taken only when the fixture actually RUNS.** The priming `claim` comes first and a
+/// refusal returns WITHOUT latching, so a boot in which another core happened to hold the sprite at
+/// the first unmasked pass retries at the next one instead of printing an unmeasured verdict.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+static PP_SELFTEST_DONE: AtomicBool = AtomicBool::new(false);
+
+/// PTRPAINT — see [`PP_SELFTEST_DONE`].
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+fn ptrpaint_selftest_once() {
+    if PP_SELFTEST_DONE.load(Ordering::Relaxed) || crate::arch::irqs_masked() {
+        return;
+    }
+    let Ok(held) = claim() else {
+        return; // not latched: the sprite was in use, try again at the next unmasked pass
+    };
+    if PP_SELFTEST_DONE.swap(true, Ordering::AcqRel) {
+        drop(held);
+        return;
+    }
+    ptrpaint_selftest(held);
+}
+
+/// PTRPAINT — **the go-red, and why it is a CYCLE COUNT rather than a threshold somebody chose.**
+///
+/// `ptrlag_selftest`'s design one file over, for the defect one layer down. It holds the sprite on
+/// THIS core — legal, and the whole reason WEDGE-9's loan is a loan and not a lock: a contender's
+/// [`claim`] observes `false` under `SPRITE_FREE` and returns `Busy` in a few dozen cycles, so
+/// holding it here blocks nobody and cannot deadlock — then calls [`repaint_nowait`] and times it.
+///
+/// Four assertions:
+///
+/// * **OWED** — the held call came back [`Nowait::Owed`], i.e. it went through a claim that refused
+///   and took the [`owe_repaint`] handoff. The control for "did the fixture manufacture contention
+///   at all"; without it the others could pass on a sprite nobody was holding.
+/// * **`spun == 0`** — and it never ENTERED the bounded wait. [`PP_BOUNDED_ENTRIES`] is charged on
+///   `claim_bounded`'s last line before its loop, so this delta is 0 for the bare claim and exactly
+///   1 for the bounded one, **deterministically, on any host at any speed, with no threshold in
+///   between**. This is the assertion the arc exists for.
+/// * **`masked == false`** — a PRECONDITION rather than a property of this tree, and in the verdict
+///   for that reason: `claim_bounded` refuses to wait while masked (the WEDGE-8 rule), so a masked
+///   run would read `spun=0` on the MUTATED tree too and score the go-red green. The latch in
+///   [`PP_SELFTEST_DONE`] already declines a masked pass; this re-reads the flag at the call and
+///   fails loudly rather than trusting it.
+/// * **PAINTED** — released, the next call takes the sprite and paints. The second control: a
+///   `repaint_nowait` hard-wired to owe would pass the rest while measuring nothing.
+///
+/// **`cyc` and `budget_cyc` are REPORTED, never gated, and that is a finding rather than a
+/// preference.** The first version of this fixture asserted `cyc <= budget/4` on exactly the
+/// argument that looks airtight — the bounded form cannot return before `now - t0 >= budget`,
+/// because the loan it waits for is held by the block timing it. The mutated tree then scored
+/// **`cyc=317120` against `budget_cyc=3992146`, i.e. PASS**. The argument omits that
+/// `claim_bounded`'s deadline is an rdtsc compare made by a PREEMPTIBLE caller: one core migration
+/// or host deschedule across that read and `now.wrapping_sub(t0)` clears the budget instantly. Both
+/// numbers stay on the wire because they are the honest reading of what the call cost, and neither
+/// decides anything. VUGPERF's `pace_pin_probe` is the precedent and states the rule outright: ASK
+/// THE LOCK, DO NOT TIME IT.
+///
+/// **The mutation that reds it** is the one token this arc turned: route [`repaint_nowait`]'s claim
+/// back through the bounded form (`claim_bounded(CLAIM_RETRY_MS)` in place of `claim()`), which is
+/// `repaint_on_move` back on `claim_bounded` by the only route this arc owns. OWED, `masked` and
+/// PAINTED all still hold; **`spun` becomes 1**, by construction, and the line reads `FAIL`.
+///
+/// The residual, stated: `PP_BOUNDED_ENTRIES` is global, so a concurrent unmasked `repaint()` on
+/// another core entering the bounded wait inside this window would also red the line. It is bounded
+/// by the population — the QEMU lane's whole boot reads `[wedge9] refused=27 masked=4`, i.e. ~23
+/// unmasked refusals in 150 s against a window of a few hundred microseconds — and it fails in the
+/// LOUD direction, which is the side a fixture may be wrong on.
+///
+/// Costs, stated: one `[wedge9] refused`, one `[ptrpaint] nowait_owed`, one `nowait_ok` and one
+/// whole-sprite repaint per boot. The debt the OWED leg arms is cashed by [`cash_owed_sprite`] on
+/// the same pass, which is the mechanism exercising itself.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))]
+fn ptrpaint_selftest(held: SpriteLoan) {
+    let masked = crate::arch::irqs_masked();
+    let budget = mono_now_hz().map_or(0, |(_, hz)| hz.saturating_mul(CLAIM_RETRY_MS) / 1000);
+    let e0 = PP_BOUNDED_ENTRIES.load(Ordering::Relaxed);
+    let t0 = crate::arch::now_cycles();
+    let first = repaint_nowait();
+    let cyc = crate::arch::now_cycles().wrapping_sub(t0);
+    let spun = PP_BOUNDED_ENTRIES.load(Ordering::Relaxed).saturating_sub(e0);
+    drop(held);
+    let second = repaint_nowait();
+    let owed = first == Nowait::Owed;
+    let painted = second == Nowait::Painted;
+    // UNMASKED is a PRECONDITION of the go-red, not an assertion about this tree, so it enters the
+    // verdict: masked, `claim_bounded` refuses to wait and the mutation would read `spun=0` too.
+    let ok = owed && spun == 0 && painted && !masked;
+    serial_println!(
+        ":: PTRPAINT: repaint_nowait under a HELD sprite — held: {} spun={} masked={} cyc={} budget_cyc={} | released: {} :: {} ::",
+        if owed { "OWED" } else { "PAINTED" },
+        spun,
+        if masked { "yes" } else { "no" },
+        cyc,
+        budget,
+        if painted { "PAINTED" } else { "OWED" },
+        if ok { "PASS" } else { "FAIL" }
     );
 }
