@@ -612,7 +612,7 @@ pub mod cursor {
     #[inline]
     fn repaint_on_move() {
         if SPRITE_OWNS_PAINT {
-            crate::video::cursor::repaint();
+            let _ = crate::video::cursor::repaint_nowait(); // PTRPAINT (B141): the ONE token the arc could not place — pal.rs was outside its files; the seat placed it at the fold. Never the bounded spin on the input band.
         }
         rollup_tick();
     }
