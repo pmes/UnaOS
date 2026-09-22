@@ -18646,3 +18646,171 @@ measurement this arc adds to that rung: `beam::hold` spins a MEAN of **2.48 ms**
 A real vsync interrupt or a fence from the display engine would return those cycles to the pass and
 is the next thing worth costing — `drivers/gpu/kepler_display.rs`, beside `beam_probe`, in the
 Kepler driver files this brief did not name.
+
+## RENDCONV — the render family's two axes were three, then seven; M1 lands the pass, and the premise for M2/M3 is re-measured (all boards, 2026-09-22)
+
+**Brief.** LEDGER **S7** carries a GATE-FAMILY size-3 entry with an expiry: `render_service` (Pi),
+`x86_render_service` and `orin_render_service` are one function written three times. The design that
+spends the entry is `docs/dev/evidence/orin14/S7-CONVERGENCE.md`, written on `hw-jetson` at
+`6cc8de8c`: it says the shared part is the pass loop, that the axes that differ are HOW THE PASS
+WAITS and WHO OWNS INPUT, and that a `render_pass<W: RenderWait>` with three impls collapses the
+family 3 → 1, starting from the Pi member and converting it IN PLACE so no `main.rs` line moves.
+Branch `exec-rmbp-rendconv`, parent `cab94b9e`; rmbp-ledger **B144**, shared **SR19**.
+
+### M1 — the Pi member behind the shared pass, and it is the same 421 lines
+
+`render_service` is now a shim. The body it used to be is `render_pass<W: RenderWait>` at the same
+`main.rs` lines, with four substitutions and no reordering:
+
+* `let ev = GUI_CHANNEL.recv();` became `let wake = w.wait();`. **The waiting axis is lifted.**
+* `match ev {` became `match wake { Wake::Tick => strip_tick = true, Wake::Input(ev) => match ev {`.
+  The Pi's `Event::Timer` arm — three lines that set `strip_tick` — IS `Wake::Tick`, so it is gone
+  from the body and `ChannelWait::wait` maps the strip pulse onto it.
+* the `[sched6]` block (28 lines) and its four accumulators (`s6_passes`, `s6_composites`, `s6_cyc`,
+  `s6_last_ms`) became `w.census(dirty, cyc)` and four fields on the impl.
+* nothing else. The serial-inbox drain, the mint arm, both cursor arms, the strip, the present
+  discipline and both presents are byte-for-byte the lines they were.
+
+`ChannelWait`, `Wake`, the `RenderWait` trait and the shim are appended at the FILE TAIL, below the
+last existing line, so no `panic::Location` in `main.rs` moves on account of them existing.
+
+**The `Wake::Retire` variant the design proposed is deliberately not in the enum, and that is a
+code-wins amendment rather than an omission.** A retiring x86 instance must not unwind: `wm`'s rows
+hold raw pointers into the pass's own locals (the shell store's heap buffer, the panel `Screen`) and
+the whole reason those are flat locals in a never-returning task is to keep them alive for the rows'
+lifetime. A `Wake::Retire` the BODY handled would have to park without returning anyway, so the park
+belongs where the epoch is read — inside the discipline's own `wait`, which simply never hands a
+pass back. One fewer variant, one fewer arm, and the invariant is carried by the type instead of by
+a comment asking the next reader not to `return`.
+
+### The premise, re-measured at `cab94b9e` — the axes are seven, not two
+
+S7-CONVERGENCE §1 tabled the three members at `6cc8de8c` and found the divergence reducible to two
+axes plus a set of consequences expressible as constants. That table is 16 days old and PTRLAG
+(B134), PTRINSTALL2 (B117), APPPIN (R49), VUGPERF and W5SPIN have all moved the x86 member since.
+Re-read at this sha, the members differ on SEVEN things that are not constants, and only three steps
+of the whole pass are still literally identical across Pi and x86 — the surface setup
+(`*WRITER.lock()` + `Screen::new`), the `console_launch_drain` call, and the shell-window present.
+
+1. **The wait.** `GUI_CHANNEL.recv()` / epoch-check + `wedgeinj_park_maybe` + `pending`-or-
+   `gui_recv_blocking_x86()` / `yield_now` + a CNTPCT compare. *Lifted in M1.*
+2. **Input ownership.** Pi and x86 dispatch; the Orin's contract forbids a second drainer because
+   `jd2_console_pump` owns `pal::EVENT_QUEUE`. *The design's second axis, still true.*
+3. **The census.** Three clocks, three wire families, and — the part a constant cannot reach — three
+   STORAGE classes: `[sched6]` reads four task-local accumulators, `[schedx86]` reads shared statics
+   precisely so a re-homed twin continues a dead instance's numbers, and `[orinrender]` rate-limits
+   on CNTPCT because a pass count is not a rate limit on a busy-poll loop. *Lifted in M1 as a hook.*
+4. **Where input is ROUTED.** x86 routes at the CONSUMER (`wc_route_event` at the head of the drain,
+   `wc_route_tail(raw)` after the arms); the Pi routes at the PRODUCER (`pump_usb_into_gui` consults
+   `user_input_active()` before it ever reaches `gui_send`). Not a constant: it is a different
+   pipeline stage, and the Pi has no counterpart call to gate off.
+5. **Where the pointer is INSTALLED.** PTRINSTALL2 (B117) moved the x86 relative install to the
+   producer, so the x86 `Mouse` arm is `cursor::draw_over(&mut pal)` and must NOT call `move_rel` —
+   a second install there doubles the motion. The Pi arm still installs (`move_rel` +
+   `video::cursor::repaint()`) because on that arch the cursor becomes current in this very arm,
+   which is also why `wm::drag_route_tail` is folded onto it. Postdates the design.
+6. **The burst discipline.** x86 drains a whole burst per pass through an inner loop with the PTRCH
+   motion fold and a `pending` slot that must outlive BOTH loops; the Pi takes one event per pass.
+   The design's `try_next` covers the shape — it does not cover `handle_key` answering `true`
+   stopping the drain, which only exists where there is a drain.
+7. **The shell instance lifecycle.** The Pi's APPPIN is `shellwin_service_rearm` folded into the
+   mint arm's own guard; x86's is a 45-line `dock::take_launch` quit/launch block with a generation
+   fence (`wm::winid_gen`) and `shell_key_sink_note`. LEDGER S7's own class note says step 2 must
+   collapse the two S4 drains into one — that is this axis, and it is a bug fix, not tidiness.
+
+And three of the Pi body's helpers do not exist on x86 at all: `click1_dispatch`, `serfocus_witness`
+and `shellwin_service_rearm` are each `#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]`,
+as are `shell_inbox` and `SERIAL_WAKE_PENDING`. A widened body needs a guard per helper, which is
+the cfg thicket the convergence exists to remove.
+
+**What this does NOT say.** It does not say the convergence is wrong; M1 is the proof that the axes
+lift cleanly when they are genuinely axes. It says the design's cost estimate (§6: "~15 changed in
+place, ~90 added") was priced against a two-axis family and the family is no longer that, so M2 and
+M3 are re-scoped against this table rather than against §1's.
+
+
+### Gates (M1, on `exec-rmbp-rendconv` at `b9240505`, parent `cab94b9e`)
+
+`cd unaos && ./arroyo check` — **80 cfg-matrix legs rc=0, 0 rustc errors**, both arches, the whole
+matrix including every leg that compiles the configuration this change turns on. The run's own exit
+is 1 and it is NOT this arc's: GATE-BRANCH REDs `refs/heads/exec-rmbp-kvblank 83aa8387` (a concurrent
+executor's branch) and `refs/heads/exec-rmbp-rendconv b9240505` (this one, red the moment it left the
+track), both clearing by a line in `docs/dev/exec-branches.txt` — the file the SEAT writes at the cut
+(`cab94b9e` is itself such a commit) and which is not in this arc's file set.
+`bash unaos/scripts/ledger-check.sh` — GATE-LEDGER **OK, 420 rows**, before and after.
+
+**Byte identity, measured on all three knobs the brief names, every one `exit 0 · warm=yes · control
+fired`, baseline `cab94b9e`:**
+
+| knob | x86 knob-off image | arm knob-off image | control |
+|---|---|---|---|
+| `wc` | `sha256:e065a28a…` 1,585,968 B | `sha256:88a9b8e9…` 1,610,932 B | x86 YES · arm YES |
+| `desktop_firmware` (`UNAOS_PIDESK`'s real feature) | `sha256:48d75374…` 1,585,968 B | `sha256:ef54ee4f…` 1,610,932 B | x86 YES · arm YES |
+| `deskcascade` | `sha256:38ccd05b…` 1,585,968 B | `sha256:e0f67607…` 1,610,932 B | x86 YES · arm no |
+
+The three x86 images are three different hashes of the same 1,585,968 bytes because each row is a
+different feature set; what each row asserts is that ITS knob-off image did not move against
+`cab94b9e`. **The x86 kernel did not change at all** — which is the strongest available answer to
+"does the waiting axis move the x86 drain/present relationship either way": it cannot, because M1
+emits no x86 instruction. **And the scope of that PASS is what makes M2 unscorable here**:
+`x86_render_service` is `#[cfg(target_arch = "x86_64")]`, i.e. it is IN the default image with `wc`
+off, so any rewrite of it moves the very image knoboff compares and the verb returns 1 by
+construction — not because the arc broke a knob, but because knoboff's question ("does ARMING this
+knob move the default image?") has no power over a refactor of UNCONDITIONAL code. M1 passes
+precisely because every line it changed is `baremetal`-gated and every line it added is below the
+file's last line.
+
+**Runtime.** `./arroyo kernel8-test 300` rc=0 — **MBENCH PASS 126/126 required witnesses, 0 forbidden
+hits, 4570 lines**, and it genuinely COMPLETED rather than running out of wall: the sidecar
+`target/serial-pi.log.run` reads `mode=fast completion_at=25.8 grace=20 wall=46.2 cap=300`.
+`UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1 ./arroyo test 240` rc=0, `wc` in the
+`⚡ kernel features:` banner, "the run REACHED its completion marker (serial.log line 2401)";
+`x86-default.spec` 6/6 and **`x86-wc.spec` 11/11**, 0 forbidden hits; `:: PTRLAG: x86_ptr_install
+geometry across a HELD WRITER — … :: PASS ::` on the same capture, and `[schedx86] depth sent=783
+recv=783 inflight=0 (render core 1) fold=0`.
+
+`./arroyo test-arm` rc=0, **and it does not report COMPLETE because the verb declares no completion
+signal at all** — arroyo says so itself ("test-arm: no completion signal declared for this verb — the
+full 20s wall stands") and the sidecar reads `mode=full completion_at=- wall=20.0 cap=20 spec=-`. So
+its rc=0 means "20 s elapsed and the fault scan found nothing", not "the boot finished", and it is
+quoted that way here rather than as a COMPLETE it cannot give (QUEUE §5, `bd17f887`: a truncated run
+must never be a pass — the sibling hazard is a verb whose pass has no completion behind it). Run
+under LAWS §3, an x86 landing's executor exercising shared aarch64 code with no aarch64 seat awake.
+M1 compiles into NEITHER aarch64 image this verb builds (`render_pass` is `baremetal`-gated and
+arm-virt is not `baremetal`), so what it proves is that the shared file still builds and boots there.
+
+**`drain_gap_max_ms` is not available from this leg, and that is the instrument's honest answer.**
+`ptrinstall_rollup` prints `[ptrinstall] …` only `if reports != 0 || drains != 0`, and a headless
+QEMU boot moves no pointer: the capture's own late line reads `:: PTRINSTALL: installs=0 reports=0
+folds=0 lag_max_ms=0 coalesced=0 drains=0 ::`. B134 measured its numbers on a metal FLIGHT capture
+for exactly this reason. Since the x86 image is byte-identical to baseline, the reading could not
+have moved either way.
+
+**Artifact reachability** (`LC_ALL=C grep -a -o -F` on the loadable images, never the `.elf`):
+
+| token | `kernel8.img` (2231744 B) | x86 loadable (2432336 B) |
+|---|---|---|
+| `[rendconv] service=render wait=channel input=owned family=3 -> RENDER-CONVERGED` | 1 | 0 |
+| `[sched6] passes=` | 1 | 0 |
+| `render:pass` (the `[u7stk]` label) | 1 | — |
+| `[schedx86] depth sent=` | — | 1 |
+| `[ptrinstall] installs=` | — | 1 |
+
+The zeroes are the point: M1's converged service is `baremetal`-gated, so the x86 image carries none
+of it, while PTRLAG's and SCHED-X86's own tokens are still there.
+
+**The Pi wire, on the `kernel8-test` capture** (`awk 'index($0,"[tag]")'`, never bare `grep`):
+`[sched6] passes=4/s composites=3/s mean=130055 cyc/pass (dirty-paced strip@250ms)` ×8 — the format
+string, field order and `PSTRIP_PERIOD_MS` term are the ones the body used to print;
+`[u7stk] at=render:pass task=71:render … hw=13048 headroom=19720` — the folded stack probe still
+fires from inside `ChannelWait::census`; `:: UI2: status strip armed …`; and
+`[shellup] census … render=live passes=+48 … gui=sent48/recv48 depth=0` — which is the instrument
+this arc's own first cut nearly deleted, reporting the render task live and the `GUI_RECV` ledger
+(now charged inside `ChannelWait::wait`) agreeing with `sent` exactly.
+
+**One honest blemish.** The `[rendconv]` line arrived on the Pi wire INTERLEAVED with another task's
+output on this run (`… wait=channel inpuABCDEF0123t=ow456789ABCDEF`) — the polled UART at a busy
+moment of the boot cascade, the same lossiness the Orin member's `[u7stk]` note prices at "two lines
+are what this wire can be asked to carry". The token is intact in the ARTIFACT, which is what the
+reachability grep above reads, so it is an artifact witness and must not be written into a spec as a
+`REQUIRE` without a quieter emission point.
