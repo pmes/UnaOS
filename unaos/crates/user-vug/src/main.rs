@@ -3412,7 +3412,44 @@ pub extern "C" fn _start() -> ! {
         art_publish(gen);
         if live > 0 {
             DONE.store(0, Ordering::Relaxed);
-            PHASE.store(frame + 1, Ordering::Release); // 1-based; never PHASE_EXIT (frame < cap)
+            // VUGART — THE RELEASE WORD IS THE GENERATION, NOT THE PRESENTED-FRAME COUNT. This line
+            // read `PHASE.store(frame + 1, …)` until this arc, and that was the defect.
+            //
+            // A worker leaves its wait on `p != last` — the release is an EDGE on this word, and an
+            // edge only exists if the value CHANGES. `frame` counts frames the panel TOOK: VUGSPIN
+            // moved `frame += 1` onto the present's success branch precisely so the fps readout would
+            // stop counting frames the eye never received. The cost of that, unnoticed until now, is
+            // that a FAILED present freezes `frame` — and the very next frame republishes the value
+            // the workers already have. No edge, no release. Both workers stay in their wait (the
+            // unconditional `wake_phase` wakes them, they re-read the same word and park again),
+            // `DONE` never reaches `live`, and the parent blocks at the barrier below.
+            //
+            // THAT IS NOT MERELY A SLOW FRAME, and this is the whole of "abstract art": by the time
+            // the parent blocks it has ALREADY published the new projection and ALREADY rasterised
+            // its OWN band, `BAND_PAR..SH`. So the surface it leaves behind holds rows 0..216 at the
+            // previous rotation and rows 216..288 at the next one — and the compositor composites a
+            // live window from that surface on the panel's cadence, not on this program's presents.
+            // A wireframe seen through that is edges that do not join: one crystal's lower quarter
+            // drawn against another's body.
+            //
+            // THE PRECONDITION IS ON THE WIRE, not argued: flight 11 (2026-09-22) carries six
+            // `[uvug9] stall frame=<n> phase=present rc=9` lines between 721199 ms and 725305 ms
+            // (frames 5465, 4323, 6706, 4500, 4565, 2479). `stall_witness`'s latch is a per-process
+            // static, so that is six DISTINCT vugs each taking a failing present; rc=9 is `EBADF`,
+            // which `sys_win_present` returns for a freed or out-of-range window row.
+            //
+            // `gen` is `attempts + 1`, and `attempts` is the right counter for exactly the reason
+            // REVIEW D5 gave when it moved the EXIT BUDGETS onto it: it advances on every RENDERED
+            // frame whatever the panel did. Holding `frame` still on failure is right for a METER and
+            // wrong for a DEADLINE — and wrong, it turns out, for a RELEASE. Skipped frames (the
+            // VUGPAUSE idle path) store nothing here at all, so they cannot repeat a value either.
+            // On any healthy run `attempts == frame` and this is the identical number the line
+            // published before, which is why no fixture's geometry or checksum can move.
+            //
+            // It is also now the SAME word the workers stamp their bands with, so "the band was drawn
+            // for the frame it was released for" is one comparison rather than two counters that
+            // could disagree.
+            PHASE.store(gen, Ordering::Release); // 1-based; PHASE_EXIT is u32::MAX, ~2 years away
             // VUGPAUSE-2: release any worker that outspun `WORKER_SPIN_YIELDS` and parked. UNCONDITIONAL,
             // and that is a decision rather than an oversight. Gating it on a "someone is parked" flag
             // would be a second lock-free protocol between three threads whose failure mode is a worker
