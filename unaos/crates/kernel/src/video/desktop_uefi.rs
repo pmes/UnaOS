@@ -580,7 +580,47 @@ pub fn activate_on(desc: SurfaceDesc) {
     // than a new one; it is also the pass that makes the residual's "bounded by the next composite"
     // true by construction instead of by hope. Costs one composite on a table holding one row.
     wm::composite();
-    serial_println!("[wc-x] menubar PAINTED (composite at the enable seam)");
+    // MENUFIRST — **READ the fact, do not print your own control flow.** This line said `PAINTED`
+    // unconditionally: it was a statement that `wm::composite()` had been CALLED, dressed as a
+    // statement that the bar was on the glass. `menubar::owns_pixels` exists for exactly this
+    // question (BRINGUP-PAINT, PA41 — its own doc names this seam), and the aarch64 twin
+    // `desktop_firmware::activate` has always read it back; the x86 seam never did, so a boot whose
+    // `strip::paint` declined (contended scratch, a surface not yet `word4`) would print `PAINTED`
+    // over 34 rows the desktop layer had already stopped owning and nothing had filled. Flight 11
+    // did paint — `[27617ms] [strip] rollup tenant=menubar … paints=1 paint_px=97920 … -> CLEAN`,
+    // 2880 x 34 — so this reading is `PAINTED` on that capture too and the wire shape is unchanged
+    // where the claim was true. The bar's own `[menubar] first-paint` line carries what was IN it.
+    //
+    // ⛔ **AND THE RETRY, WHICH IS THIS SEAM'S HALF OF A HOLE THE PI SEAT HAS ALREADY CLOSED.**
+    // `desktop_firmware::activate` (`:337-347`) reads the same accessor and re-runs the composite
+    // when it answers `false`, and its comment names the reason in PA41's own words: `strip::paint`
+    // declines the pass without touching a pixel on a contended `SCRATCH` (the dock is tenant #1 and
+    // takes the same scratch in the same pass) or a surface not yet `word4`; `menubar::compose` then
+    // returns `false` with its slot untouched; and the bar is left ENABLED — so
+    // `screen::present_background` is ALREADY subtracting its rows from every desktop present — with
+    // nothing on the glass and no damage condition able to notice. On the quiet desktop this seam
+    // exists to serve, that is a bar invisible for the rest of the boot. PA41's metal reading of it
+    // is a bar that *"came up INCOMPLETE"* and filled in only under pointer activity.
+    //
+    // That fix landed on aarch64 and the x86 twin never took it, which is precisely the parity
+    // defect MENUBAR-OCC-PAR states the general form of ("an instrument present on one chip only is
+    // the defect this instrument reports"). One re-run discharges it, `owns_pixels` is the same
+    // packed load `compose` acts on so the retry runs iff the first pass did not land, and
+    // `wm::composite()` on the line above is the proof that a second call here is safe in this
+    // context and on this lock discipline. Flight 11's first pass DID land, so on that capture this
+    // arm does not fire and `retried=false`.
+    let repainted = if super::menubar::enabled() && !super::menubar::owns_pixels() {
+        wm::composite();
+        true
+    } else {
+        false
+    };
+    serial_println!(
+        "[wc-x] menubar {} owns_pixels={} retried={} (composite at the enable seam, read back rather than assumed)",
+        if super::menubar::owns_pixels() { "PAINTED" } else { "NOT-PAINTED" },
+        super::menubar::owns_pixels(),
+        repainted
+    );
 
     // DESKTOP-APP — ARM the desktop's second window. It is a PROGRAM now, so it cannot be opened
     // from here; see the module docs for why this seam is structurally too early for a launch, and
