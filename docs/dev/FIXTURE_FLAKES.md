@@ -24,9 +24,23 @@ can never be closed.
 Class 4 is an aarch64 `virt` one from `hw-jetson` (added orin 23, 2026-09-08 —
 the sentence that used to stand here said "everything here is x86", and adding an
 aarch64 class without correcting it would have left a doc that reads false to the
-next cold reader). None of these classes has been seen on metal, and none is
-metal-specific: they are all launcher/observer races or transport-margin effects
-that host load makes visible.
+next cold reader). **Classes 5-7 were added after that sentence and are named
+here for exactly the reason it was corrected**: Class 5 is `hw-pi4`
+(`kernel8-test`, raspi4b QEMU) with an x86 control of its own; Classes 6 and 7
+are x86 `hw-rmbp` again.
+
+**"None of these classes has been seen on metal" ALSO used to stand here, and it
+is no longer true — corrected 2026-09-22 (FLAKEFIX) rather than left to read
+false.** §1d has THREE metal sightings, on the rMBP's own flights 8 and 11
+(`chop-logs/flight8.log` twice, `f11.log` once; all three are metal captures —
+`uart16550=absent carrier=ftdi-mirror`, panel 2880x1800, SMC `OSK0` present).
+That is not a wrinkle, it is corroboration: §1d's mechanism is a race against a
+concurrent `compose`, and five real cores race it harder than TCG does. Class 7
+is the one class that is emulator-only BY CONSTRUCTION — it is QEMU's own event
+folding, and there is no such layer on metal. The rest remain unseen on metal and
+none is metal-specific: they are launcher/observer races and transport-margin
+effects, and load — host load under QEMU, real concurrency on metal — is what
+makes them visible.
 
 ---
 
@@ -293,7 +307,7 @@ not of this class.
   1a: a `SWEPT`-and-park handshake so the launcher's re-read happens inside a
   window where the state is provably live, instead of racing a 2000 ms deadline.
 
-### 1c. `[dmgovlp]` `adopt_stretch=0/4` — **suspect only, seen once**
+### 1c. `[dmgovlp]` `adopt_stretch=0/4` — **mechanism still suspect; rate now MEASURED at 6 in 47 boots (2026-09-22), the worst on the bench**
 
 **Signature on the wire** (the verdict's own format, `video/wm.rs:24379`):
 
@@ -355,15 +369,128 @@ drag leg to REFUSE (a distinct verdict word, not FAIL) when `drag_evt=0` —
 it did not measure what it claims to measure. Owner: the next x86 compositor
 arc.
 
+**Two more sightings, 2026-09-22 — this is no longer "seen once".** GMUX8's
+240 s battery at host load 23 (`gmux8-logs/test240.log:1944` —
+`drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=11/12 adopt=0 repaint=1 max_ms=2
+adopt_stretch=0/4 -> FAIL`) and FLAKEFIX's first `test-ptr` run at load 13
+(`flakefix-logs/repro1.log`, `serial.log:2022`, the same fields with
+`cur=10/12 adopt=0 repaint=0 max_ms=0`). Both `drag_evt=0`, i.e. both are the
+"the stimulus never ran" half — exactly the reading the REFUSE verdict asked for
+above would have made free. Rate: **2 reds in the 6 x86 battery runs read by hand that
+day, and 6 reds in 47 boots (about 13%) across every QEMU boot on the bench
+that day** — the worst rate of the three flakes measured, and one whole gate run
+each time. TRACKPAD's two `test-ptr` captures from the same
+box the same day both read
+`drag_evt=5 drag_px=38590 relay=3 adopt_stretch=4/4 -> PASS`, so the fixture is
+not broken — it is unmeasured under load.
+
 **Disposition — WATCH.** Do not clear a gate on this line without an
 idle-host re-run (both benches' standing rule: no single-run red convicts),
 and do not let a clean re-run bury the sighting — bank it here.
+
+### 1d. DOCKID `order=false set=false` — **measured 2026-09-22 (FLAKEFIX, rmbp-ledger B150): a Class-1 re-read race, NOT lost input**
+
+**Signature on the wire** (`video/dock.rs` `dockid_selftest`, the verdict's own
+format):
+
+```
+:: DOCKID: tiles=5 closed=win2 reopened=win2 recycle=true order=false set=false furniture=false count=true/5 pins=true/2 press=yes :: FAIL ::
+```
+
+The green line from the same binary, same box, an hour apart:
+
+```
+:: DOCKID: tiles=5 closed=win2 reopened=win2 recycle=true order=true set=true furniture=true count=true/5 pins=true/2 press=yes :: PASS ::
+```
+
+**Read WHICH legs failed — that is the whole diagnosis, and it is already
+printed.** The fixture has six legs and they split cleanly by what they read:
+
+| leg | reads | 2026-09-22 |
+| --- | --- | --- |
+| `recycle` | `wm::create`'s returned slot id | `true` in 5/5 sightings |
+| `order` | the SHARED tile registry (`TILE_ID`/`TILE_GEN`/rank) | **false** in 5/5 |
+| `set` | the SHARED registry, both directions | **false** in 5/5 |
+| `furniture` | `order_key` re-read over the already-sorted model | false in **1** of 5 |
+| `count` / `pins` | LOCAL scratch only (`probe`, the pin chain) | `true` in 5/5 |
+
+**The two legs that read only local scratch pass in every sighting; every leg
+that reads the shared registry fails.** That is not an input-loss shape — no
+injected event reaches this fixture at all — it is Class 1's shape exactly: a
+ground-truth re-read racing a concurrent mutator.
+
+**Root cause — the registry's one writer is `compose`, and the fixture does not
+exclude the render service's copy of it.** `strip_model` calls `wm::composite()`
+(which reconciles the registry) and then `dock_scan` + the pin chain + `settle`,
+and the fixture then re-reads `TILE_ID`/`TILE_GEN`/`order_key` for its three
+assertions. Nothing parks the render core in between. Under load its own
+`compose` lands inside that gap, and the two failure shapes follow from where it
+lands:
+
+- **between the reconcile and the reads** → the fixture's tiles are not the
+  registry's any more, every app tile falls back to `RANK_UNSEEN + id`, the strip
+  returns to WINDOW-ID order, and because the reopened window carries the closed
+  one's recycled id it sorts BEFORE its elder sibling → `order=false`, and the
+  registry/table cross-check → `set=false`. This is the majority shape
+  (`furniture=true`, 4 of 5, and all three metal sightings) and it is the one `dockid_selftest`'s own doc
+  comment already predicts in its "a dead fold empties the registry" paragraph —
+  the same end state reached by load instead of by a commented-out `settle`.
+- **between `settle`'s sort and the `furniture` walk** → `order_key` returns a
+  different key for a row than the one it was sorted by, monotonicity breaks and
+  `furniture=false` joins them (1 of 5, QEMU only so far).
+
+**Trigger conditions — and this one IS on metal, which is why it is the most
+convincing of the day's three.** On QEMU: **2 FAIL in 46 boots (about 4%)**
+across every boot on the bench on 2026-09-22, de-duplicated by each boot's own
+SERWIT-2 tap lines; FLAKEFIX's own five `test-ptr` runs at host load 9-41 were
+all `PASS`, and the reds are load-correlated the way the rest of this corpus is.
+On the rMBP's own metal, three further sightings, all
+`order=false set=false furniture=true`:
+
+| capture | when | verdict |
+| --- | --- | --- |
+| `f11.log` (flight 11) | `43391ms` | `tiles=7 closed=win5 reopened=win5 recycle=true order=false set=false furniture=true count=true/7 pins=true/2` |
+| `chop-logs/flight8.log` | `36903ms` | `tiles=6 … order=false set=false furniture=true count=true/6 pins=true/1` |
+| `chop-logs/flight8.log` | `38664ms` | the same line again, 1.8 s later in the same boot |
+
+Both are metal captures (`uart16550=absent carrier=ftdi-mirror`, panel
+2880x1800, SMC `OSK0` present), so this class is **not** a TCG artefact and the
+scope note at the top of this file was corrected for it. Five real cores race a
+`compose` harder than a loaded TCG host does, and the same two legs fail, with
+the same `count`/`pins` passing beside them.
+
+**It is NOT the typist class (7).** The lost-input mechanism below is loss
+*outside* the guest — QEMU folding motion events the guest never polled — and
+this fixture consumes no injected input: it mints its own six windows and reads
+kernel state. The two classes share only "host load made it visible". Proved by
+elimination as well as by mechanism: FLAKEFIX's `gored` run injected a
+deliberately lossy 36-report stream that the guest counted as **8**, and DOCKID
+in that same capture (`gored-serial.log:1740`) reads `order=true set=true
+furniture=true :: PASS ::`.
+
+**What to capture on recurrence.** The verdict line in full — the six legs ARE
+the diagnosis. Then: whether `count`/`pins` also went false (they read local
+scratch, so a false there is a DIFFERENT defect and not this class); whether
+`recycle` held; and the host load, or on metal what else was compositing. A sighting with `order=false` and
+`count=false` together is a regression, not this entry.
+
+**Disposition — WATCH, fix reported not made.** `video/dock.rs` is nominally in
+FLAKEFIX's file set but any edit there moves the default image and
+`./arroyo knoboff wc` scores that as a red by construction, so the change is
+written down instead of made. The cure is Class 1's, stated at the head of this
+class and proven in-tree by 1a: the fixture must take its three registry reads
+inside an interval where the registry is provably not moving — publish a
+"holding" flag and park the render service's reconcile (bounded) across the
+`strip_model` → assert span, the way DMG-REFUSE's prober publishes `SWEPT` and
+parks. **Not** a retry loop and **not** a widened assertion: the legs are correct
+about what they assert, they are merely asserting it about a snapshot that has
+already moved.
 
 ---
 
 ## Class 2 — the evidence taps lose lines to a margin-tight serial ring
 
-### 2a. SERWIT-2 `evidence_lost=17` — **suspect only**
+### 2a. SERWIT-2 `evidence_lost=N` — **ROOT CAUSE MEASURED 2026-09-22 (FLAKEFIX, rmbp-ledger B150); the original suspect REFUTED; fix owed in `drivers/xhci/ftdi.rs`**
 
 **Signature on the wire:**
 
@@ -637,6 +764,18 @@ it, it is this class rather than a regression in whatever arc is in flight.
 **Do not run gates concurrently in one worktree.** The runs share `target/` and
 the host's cores, and this class is the second-order cost — the same reason
 `target/` is never a flash-staging handoff source.
+
+**2026-09-22 reading, recorded so the field is not misread (FLAKEFIX, B150).**
+Every `[ptrdead] backlog` line carrying a non-zero `fpop12`/`fpop3` in that day's
+captures ends `-> PASS`, because the affected legs now read
+`whole=skip nodrop=skip order=skip` — the leg DECLINES when a foreign pop is
+seen instead of asserting through it, which is one of the two cures this entry
+said it did not choose between. The line's grammar has also moved on from the
+one quoted above: it ends `cpu=N svc=Some(N)` now, not `quiesced=`. So a
+non-zero `fpop3` on a current capture is **not** by itself a red, and
+rmbp-queue's `· B9` row (`[ptrdead] … fpop3=1 -> FAIL`, 2 reds in 5 WC runs,
+both at load ≥ 24) is about the older grammar. A `-> FAIL` with `fpop12=0` is
+still the regression this entry warns about.
 
 ---
 
