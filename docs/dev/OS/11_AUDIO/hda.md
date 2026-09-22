@@ -12,7 +12,12 @@ walk in this kernel could reach**, the same blind spot GR20 found for the class-
 no capture in this project's history carries an `[hda]` line.
 
 This document is the ladder: **arc 1** census → reset → CORB/RIRB → widget walk; **arc 2** the output
-stream and its ear-free proof; **arc 3** owed.
+stream and its ear-free proof; **arc 3** owed; **arc 4** the second controller.
+
+**FLOWN 2026-09-22 (flight 11).** Arc 1 passed on its first metal boot and read
+`[hda] codec=0 vid=1013:4206` — a Cirrus Logic CS4206. Arc 2 ran a full second of samples at the
+exact link rate and **the room was silent**. §6 has the wire, the arithmetic and the three defects
+that reading named; rmbp-ledger **B127** (flown) and **B130**.
 
 ---
 
@@ -30,8 +35,9 @@ source follow the tree's convention:
 | `[QEMU]` | a fact about the emulated fixture |
 | `[METAL]` | a fact measured on the bench rMBP |
 
-There is no `[METAL]` tag in the file yet. **Arc 1 and arc 2 are built and unflown**; §7 is what the
-first metal boot has to show.
+**Arc 1 and arc 2 have now flown** (flight 11, 2026-09-22): §6 carries the measured wire and §7's
+expectation table is settled against it. A `[METAL]` tag in the source marks a fact that boot
+supplied.
 
 ---
 
@@ -44,9 +50,12 @@ first metal boot has to show.
 | 1c reset | `UNAOS_HDA=1` | `GCTL.CRST` cycles and `STATESTS` names the codecs | built |
 | 1d CORB/RIRB | `UNAOS_HDA=1` | the command ring round-trips — `GET_PARAMETER VENDOR_ID` answers | built |
 | 1e walk | `UNAOS_HDA=1` | every widget, its connections, and the derived output path | built |
-| 2 tone | `UNAOS_HDATONE=1` | a stream runs: LPIB advances and BCIS latches | built |
+| 2 tone | `UNAOS_HDATONE=1` | a stream runs: LPIB advances and the BDL is walked to its end (a WRAP or a BCIS latch) | **flown, silent** |
+| 2b amp | `UNAOS_HDATONE=1` | the codec's whole declared GPIO set driven, because this codec has no EAPD | built, **unflown** |
+| 2c pair | `UNAOS_HDATONE=1` | every pin of the speaker association driven, sequence-ordered, one stream tag | built, **unflown** |
 | 3a mixer seam | — | a volume/mute surface userspace can reach | **owed** |
 | 3b Pi twin | — | BCM2711 HDMI / PWM audio, the other half of ROADMAP §6's row | **owed** |
+| 4 second controller | — | the GK107's HDMI audio at `1:0.1`, enumerated on flight 11 and not claimed (§9) | **owed** |
 
 Every rung above names the rungs below it as open (LAWS §5, the probe-ladder rule). A rung that
 fails is "failed under `<conditions>`", never "ruled out"; its code and its knob stay.
@@ -265,7 +274,18 @@ carry, which is exactly the go-red mutation §6 names.
 
 ### 3.3 The codec side of the path
 
-For every node on the derived path, in path order: `SET_POWER_STATE D0` where the widget declares
+⚠ **"The path" is now every member of the derived pin's ASSOCIATION, not one pin.** An association
+is a group of pins wired as one device and its *sequence* field orders them, sequence 0 being the
+primary \[HDA-SPEC §7.3.3.31\]; the rMBP's internal speakers are two pins of association 1 with
+**different** converters, and flight 11 drove only one of them (§6, defect 3). Arc 2 collects every
+output-capable pin of that association carrying the same default device and owning a converter of
+its own (bounded at `PAIR_MAX = 2`), orders them by sequence, and applies everything below to each —
+binding all members to the **same stream tag**, with the starting channel \[HDA-SPEC §7.3.3.11\] 0
+for a stereo converter and the sequence index for a mono one. Every member prints its own
+`[hda] pair`, `[hda] bind`, `[hda] power` and `[hda] amp` lines, and one member that did not take
+its binding fails the whole run.
+
+For every node on each member's path, in path order: `SET_POWER_STATE D0` where the widget declares
 power control; `SET_CONNECTION_SELECT` on a **selector** with more than one input, pointed at the
 index the path actually took (a **mixer** is left alone — it sums — and gets its *input* amplifier
 unmuted instead); and `SET_AMPLIFIER_GAIN_MUTE` unmuted at a **moderate** gain.
@@ -276,25 +296,46 @@ tone on a laptop speaker; a full-scale sine out of a cold boot is how you fright
 
 The pin gets `SET_PIN_WIDGET_CONTROL` with OUT_ENABLE, plus the headphone amplifier bit when the pin
 declares headphone drive, and `SET_EAPD_BTL_ENABLE` with the EAPD bit where `PIN_CAPS` bit 16 says
-the pin has one — **that is the external amplifier the rMBP's internal speakers hang off**, and a
-tone programmed without it is a tone nobody hears.
+the pin has one.
+
+⚠ **EAPD IS NOT THE rMBP'S SPEAKER AMPLIFIER, AND THIS PARAGRAPH USED TO SAY IT WAS.** The claim
+"that is the external amplifier the rMBP's internal speakers hang off" was written before any metal
+boot and flight 11 falsified it: **both** internal speaker pins report `eapd=0` (`PIN_CAPS` bit 16
+clear), so the verb is correctly skipped and nothing wakes the amplifier. The codec-side output the
+specification *does* still offer is the function group's **GPIO** set, which arc 2 now drives as a
+whole and restores at stop — see §6, defect 2, for what the specification does and does not license
+here and why the ear is the instrument that narrows it.
 
 ### 3.4 The proof, without ears
 
 ```
 [hda] tone stream=0 lpib=<start> -> <end> (max <n>) bcis=<n> fifo_ready=<0|1> run_ms=<n> \
-      sts=<hex> fifoe=<0|1> dese=<0|1> cbl=<n> tag=<n> tag_bound=<hex> tag_ok=<0|1>
-:: HDA-TONE: lpib_advanced=<0|1> bcis=<n> tag_ok=<0|1> fifo_ready=<0|1> run_ms=<n> -> PASS|FAIL ::
+      sts=<hex> fifoe=<0|1> dese=<0|1> cbl=<n> tag=<n> tag_bound=<hex> tag_ok=<0|1> \
+      wraps=<n> consumed=<bytes> rate_bps=<n> expect_bps=192000 members=<n> ctl_running=<hex>
+:: HDA-TONE: lpib_advanced=<0|1> walked=<0|1> wraps=<n> bcis=<n> tag_ok=<0|1> fifo_ready=<0|1> \
+      run_ms=<n> members=<n> -> PASS|FAIL ::
 ```
 
 The claim is "the stream ran", and it has **three witnesses, of two different kinds**.
 
-**Controller side.** The link position advanced (the engine fetched and consumed sample data) and a
-buffer boundary latched `BCIS` (the BDL was walked to the end of at least one descriptor). Either
-alone is weaker than both: LPIB can be read mid-fetch on a stream that stalls immediately after, and
-a stale `BCIS` is impossible because the bit is cleared before `RUN`. `FIFOE` or `DESE` set at the
-end fails the verdict outright. `BCIS` latches because `IOCE` is set in `SDnCTL`; it reaches no CPU
-because `INTCTL` stays 0.
+**Controller side.** The link position advanced (the engine fetched and consumed sample data) **and
+the BDL was walked to its end** — proven by `wraps > 0` (a full pass of the whole cyclic buffer, so
+of *every* descriptor in the list) **or** by a `BCIS` latch (one descriptor boundary). Either
+witness alone is weaker than the pair: LPIB can be read mid-fetch on a stream that stalls
+immediately after. `FIFOE` or `DESE` set at the end fails the verdict outright.
+
+⚠ **`BCIS` used to be that second witness on its own, and metal took it away.** Flight 11 read
+`bcis=0` on the Intel 7-series PCH with IOC set in both BDL entries and `SDnCTL.IOCE` set, on a run
+whose LPIB walked the entire 192000-byte buffer and wrapped — so a working stream was scored `FAIL`
+by a status bit this controller does not latch. The term is now `wraps > 0 || bcis > 0`, which is
+**stronger**, not laxer; `bcis` stays on the wire, unscored alone, and *why* this silicon does not
+latch it is §6's open rung. Neither bit reaches a CPU either way: `INTCTL` stays 0.
+
+⚠ **LPIB IS A CYCLIC POSITION, NOT A TOTAL**, and reporting only its final value is how flight 11's
+full-rate run read as a stall. The loop counts wraps and the line carries `consumed=` and
+`rate_bps=` beside `expect_bps=192000`; the rate is printed and deliberately **not** a verdict term,
+because QEMU's `audiodev none` backend has no reason to consume at wall-clock rate and gating on a
+tolerance band there is how a gate becomes a flake.
 
 **Link side — and it exists because the controller-side pair was measured to be blind to it.** The
 first version of this arc scored only LPIB and BCIS, and the go-red the brief named (stream tag 0,
@@ -352,6 +393,14 @@ made checkable from the wire. `wrote-dplbase=0` says the DMA position buffer is 
 the position source, and a position buffer would be a second thing to keep coherent for no gain at
 enumeration time.
 
+Flight 11 measured `stage=tone wrote-cfg=1 wrote-ctrl=184 wrote-stream=22 verbs-get=69 verbs-set=13`
+on the CS4206. **`verbs-set` and `verbs-get` both rise** with the association pair, the GPIO set and
+the readback lines — a second member roughly doubles the codec-side programming, the GPIO set costs
+three `SET`s and six `GET`s plus three `SET`s at restore, and the `[hda] power` / `[hda] amp` /
+`[hda] bind` lines are `GET`s only. `wrote-cfg`, `wrote-intctl`, `wrote-wallclk` and `wrote-dplbase`
+are all unchanged, and that is the point of counting them separately: **the classes of write this
+driver refuses to make did not move.**
+
 ---
 
 ## 5. Where the driver is hooked, and where it should be
@@ -377,6 +426,137 @@ driver.
 
 ## 6. Gates and go-red
 
+### Flight 11 — the first metal boot, and the three defects it named (2026-09-22)
+
+The arc flew on the bench rMBP on 2026-09-22. Capture slice:
+`~/unaos-bench/scratch/rmbp-0915/hdaamp-logs/f11.log`, read with
+`awk 'index($0,"[hda]")'`. **Arc 1 passed on its first metal boot**, and the line nobody in this
+tree had ever read came back:
+
+```
+[hda] census bdf=0:27.0 id=8086:1e20 class=04 sub=03 progif=00 (hd-audio) bar0=0xc1c10000 irq=0
+[hda] census bdf=1:0.1 id=10de:0e1b class=04 sub=03 progif=00 (hd-audio) bar0=0xc1080000 irq=0
+[hda] gcap=0x4401 oss=4 iss=4 bss=0 nsdo=0 64ok=1 version=1.0
+[hda] reset crst=1 statests=0x0001 codecs=[0]
+[hda] codec=0 vid=1013:4206 rev=0x00100302
+[hda] walk codecs=1 nodes=20 dacs=5 pins=10 speaker_pin=0x0a hp_pin=0x09 path=found
+```
+
+Cirrus Logic **CS4206**, one codec, twenty widgets, five converters, ten pins — §7's expectation
+settled from the wire, not assumed. Arc 2 armed cleanly and **Peter heard nothing**:
+
+```
+[hda] node=0x0a type=pin conns=[3] pincap=0x00000054 out=1 hp=0 eapd=0 pincfg=0x90100112 (dev=speaker loc=internal … assoc=1 seq=2)
+[hda] node=0x0b type=pin conns=[4] pincap=0x00000050 out=1 hp=0 eapd=0 pincfg=0x90100110 (dev=speaker loc=internal … assoc=1 seq=0)
+[hda] path codec=0 dac=0x03 -> [10, 3] -> pin=0x0a dev=speaker hops=2
+[hda] tone arm sd=0 (iss=4 => descriptor 4) fmt=0x0011(readback 0x0011) cbl=192000(readback 192000) lvi=1 … tag=1 srst=1/1 ctl=0x00140004
+[hda] tone stream=0 lpib=0 -> 38396 (max 192000) bcis=0 fifo_ready=1 run_ms=1200 sts=0x20 fifoe=0 dese=0 cbl=192000 tag=1 tag_bound=0x10 tag_ok=1
+```
+
+#### ⚠ Defect 1 — THE DMA DID NOT STALL. THE VERDICT LINE CANNOT COUNT.
+
+The obvious reading of `lpib=0 -> 38396 (max 192000)` is "the engine stopped a fifth of the way
+through the buffer". **The same line falsifies it.** `SDnLPIB` is a position *inside* the cyclic
+buffer and returns to zero every `SDnCBL` bytes \[HDA-SPEC §3.3.37\], and this run reports
+`max 192000` — the engine reached the end of the whole 192000-byte buffer — with a *final* position
+of 38396, which is only possible after a wrap. So the bytes consumed are
+
+| term | value | source |
+| :--- | ---: | :--- |
+| one full pass of the cyclic buffer | 192000 | `max 192000` = `cbl=192000` |
+| position in the second pass | 38396 | `-> 38396` |
+| **consumed in 1200 ms** | **230396** | sum |
+| **measured rate** | **191997 B/s** | 230396 × 1000 / 1200 |
+| required rate, 48 kHz 16-bit stereo | 192000 B/s | `fmt=0x0011` \[HDA-SPEC §3.3.41\] |
+
+**−0.0017 %.** The stream engine ran at the exact link rate for the entire 1.2 s. Every
+controller-side suspect the flight went looking for is therefore excluded by the flight's own wire:
+the converter format matches `SDnFMT` (`fmt=0x0011(readback 0x0011)`), the cyclic buffer length took
+(`cbl=192000(readback 192000)`), the tag bound (`tag_bound=0x10 tag_ok=1`), `fifo_ready=1`,
+`fifoe=0`, `dese=0`. **The silence is entirely codec-side**, and that is what turns the flight from
+"why did the DMA stop" into defect 2.
+
+What *is* defective is the instrument. Two things:
+
+1. **The line reported a cyclic position as if it were a total.** Fixed: the run loop counts wraps
+   (`l < prev`) and the line now carries `wraps=`, `consumed=`, `rate_bps=` and `expect_bps=`. A
+   future reader does not have to redo the arithmetic above.
+2. **`bcis=0` with IOC set in both BDL entries and `SDnCTL.IOCE` set** (`ctl=0x00140004`, bit 2).
+   The completion latch did not fire on this controller although the engine walked past the end of
+   *both* descriptors. That made `ok` false on a stream that demonstrably ran — the verdict voted
+   down a working stream because a status bit did not latch. Fixed by replacing the second witness
+   with a **strictly stronger** one: `walked = wraps > 0 || bcis > 0`. A wrap is a full pass of
+   every descriptor in the list; a BCIS latch is one descriptor boundary. `bcis` stays on the wire,
+   unscored alone.
+   **The open question, for the next flight:** *why* this silicon does not latch BCIS. The leading
+   hypothesis has a precedent in this very file — `RIRBCTL.RINTCTL` gates the `RIRBSTS.RINTFL`
+   LATCH and not only the interrupt (§2.4, measured over two QEMU runs) — so the symmetric
+   candidate is that on the Intel 7-series PCH `INTCTL.SIE[n]` \[HDA-SPEC §3.3.14\] gates the
+   `SDnSTS.BCIS` latch the same way. It was **not** tried this flight: `INTCTL` is this driver's
+   audited never-written register (`wrote-intctl=0(audited)`), setting `SIE` with `GIE` clear
+   generates no message and is safe, and it is a one-knob experiment — but it is a change to a
+   stated invariant and belongs in a flight of its own, now that the verdict no longer needs it.
+
+   Two smaller observations from the same line, recorded so they are not re-derived: `sts=0x20` is
+   `FIFORDY` alone, and `ctl=0x00140004` carries **bit 18 (`TP`, traffic priority) set although the
+   driver never wrote it** — the byte-2 write is `0x10` and the readback is `0x14`, so that bit is
+   the controller's, not ours. The new arm line prints `lvi=…(readback …)` and `ioce=` beside it,
+   and every BDL entry is now read back and printed (`[hda] bdl entry=… addr=… len=… ioc=…`), which
+   is where a wrong length or a lost IOC flag would show.
+
+#### ⚠ Defect 2 — THE SPEAKER AMPLIFIER IS NOT AN EAPD PIN ON THIS CODEC
+
+Both internal speaker pins report **`eapd=0`** — `PIN_CAPS` bit 16 clear, `pincap=0x00000054` on
+0x0a and `0x00000050` on 0x0b \[HDA-SPEC §7.3.4.9\]. The external-amplifier bit arc 2 was written
+to drive **does not exist on this part**, so `VERB_SET_EAPD` was correctly skipped and *nothing at
+all* was done to wake the speaker amplifier. §7's expectation row said "EAPD-capable"; the wire says
+no, and the row is now settled the other way.
+
+The specification defines exactly one other codec-side output: the function group's **GPIO pins**
+\[HDA-SPEC §7.3.4.14 for `PARAM_GPIO_COUNT` (0x11); verbs 0xF15/0x715 data, 0xF16/0x716 enable,
+0xF17/0x717 direction\]. It does **not** define what any of them is wired to — that is the
+machine's wiring, not the standard's, and this tree has no legal source for it (clean room, §0). So
+the arc does the only spec-legal thing available: it reads the declared GPIO/GPO/GPI counts, drives
+**the whole declared set as one** (enable, then direction, then data — a pin driven before it is an
+enabled output is a write to a pin the codec is not driving), prints every word it read and wrote,
+and restores all three registers in mirror order at stream stop. Driving them one at a time would
+need a boot per GPIO and the specification gives no reason to prefer any order; **the ear answers
+whether the set matters, and the next flight narrows within it.** A codec that declares no GPIOs —
+QEMU's `hda-duplex` — prints `gpio … -> none` and is not written at all.
+
+Beside it, the four codec registers a silent-but-running stream must be diagnosed from, none of
+which flight 11 printed: `[hda] power` (the `F05` readback's *set* nibble **and** its *actual*
+nibble, on the pin and the converter, against the entry value), and `[hda] amp` (the `0xB00`
+gain/mute readback on converter and pin, the pin-control readback with `out_en`/`hp_en` decoded, and
+the converter's **own** format against `SDnFMT`).
+
+#### ⚠ Defect 3 — AN ASSOCIATION IS A SET OF PINS, AND THE ARC DROVE ONE OF THEM
+
+The path chose `pin=0x0a` (`assoc=1 seq=2`) over `pin=0x0b` (`assoc=1 seq=0`). **Why:** the rank in
+`walk_codec` is a function of (default device, gross location) only. Both pins are
+`dev=speaker loc=internal`, so both score rank 0; `best` is replaced only on a *strictly* smaller
+rank; the ascending-NID scan therefore hands the tie to 0x0a because `0x0a < 0x0b`. Association and
+sequence were decoded and printed by arc 1 and then never consulted. \[HDA-SPEC §7.3.3.31\] makes
+sequence the ordering *within* an association and **sequence 0 its primary member** — the
+specification supplies exactly the tie-break the rank was missing, and the rank now uses it.
+
+But a tie-break still drives one pin, and a two-member association **is** the stereo pair; the two
+pins have *different* converters (`0x0a conns=[3]`, `0x0b conns=[4]`). So arc 2 now collects every
+output-capable pin of the chosen pin's association carrying the same default device and owning a
+converter of its own, orders the members by sequence, and binds **all** of them to the same stream
+tag. The starting channel per member \[HDA-SPEC §7.3.3.11\] is 0 for a **stereo** converter
+(`PARAM_WIDGET_CAPS` bit 0 — both CS4206 converters report `caps=0x000d041d`, bit 0 set, so each
+consumes both channels of the two-channel stream; asking the second for channels 1–2 would ask for a
+channel the stream does not carry) and the sequence index for a mono one. Every member's binding is
+read back on its own `[hda] bind` line and **one member that did not take the binding fails the
+whole run**.
+
+#### The second controller, untouched
+
+`[hda] census bdf=1:0.1 id=10de:0e1b … bar0=0xc1080000` is the GK107 Kepler's HDMI audio function.
+The driver claims the first controller that resets and answers and stops — it claimed `0:27.0` and
+never touched `1:0.1`. That is deliberate and it is **arc 4** (§9).
+
 ### The QEMU fixture
 
 This is the rare driver in this neighbourhood with a **real emulator** — unlike the BCM4331 radio or
@@ -401,7 +581,13 @@ never disagree about whether a given run has a controller in it.
 ```
 UNAOS_HDA=1 ./arroyo test 60
 UNAOS_HDA=1 UNAOS_HDATONE=1 ./arroyo test 60
+UNAOS_WC=1 UNAOS_HDA=1 UNAOS_HDATONE=1 UNAOS_QEMU_FULL=1 ./arroyo test 120   # HDAAMP's gate
 ```
+
+The `hda-duplex` codec declares **no GPIOs**, so the HDAAMP arc's GPIO step prints
+`[hda] gpio … -> none` there, issues no verb, and the fixture's verdict is unchanged: the whole
+defect-2 mechanism is metal-only by construction and the fixture says so on its own line rather than
+being silent about it.
 
 ### Go-red by mutation — one per clause of the verdict, each measured
 
@@ -410,6 +596,7 @@ UNAOS_HDA=1 UNAOS_HDATONE=1 ./arroyo test 60
 | `SDnCBL` written 0 (the cyclic buffer is empty, so the engine has nothing to walk) | `lpib_advanced=0 bcis=0 tag_ok=1 → FAIL` | rc 1 |
 | `STREAM_TAG` = 0 (the "unused" tag; the link never carries it) | `lpib_advanced=1 bcis=2 tag_ok=0 → FAIL` | rc 1 |
 | *(the same tag mutation, against the FIRST version of the verdict)* | `lpib_advanced=1 bcis=2 → PASS` — **did not go red** | rc 0 |
+| **HDAAMP, 2026-09-22 — `SDnCBL` written 0, re-measured against the NEW verdict**, because the verdict's second clause changed (`walked = wraps > 0 \|\| bcis > 0`) and a go-red row measured against the old clause is not evidence about the new one | `lpib=0 -> 0 (max 0) bcis=0 wraps=0 consumed=0 rate_bps=0` -> `:: HDA-TONE: lpib_advanced=0 walked=0 wraps=0 bcis=0 tag_ok=1 fifo_ready=1 run_ms=1200 members=1 -> FAIL ::` — **both** new clauses fail, which is the point: the wrap witness cannot be satisfied by an engine with nothing to walk | rc 1 |
 
 Both live mutations red the leg through `arroyo`'s FAULT-SCAN list and `mbench`'s
 `DEFAULT_FORBIDS`; reverting each restores the pass. The third row is kept deliberately: it is the
@@ -424,7 +611,12 @@ Both knobs are `./arroyo knoboff hda` / `./arroyo knoboff hda-tone`, exit 0 (byt
 
 - `drivers/hda.rs` is **not lexed at all** knob-off — the `#[cfg]`-erased `pub mod` in
   `drivers/mod.rs` is the one case LAWS §5 names as byte-safe for a module — and the declaration is
-  the **last** line of that file, so no module above it moves.
+  the **last** line of that file, so no module above it moves. **This is what makes HDAAMP's arc-1
+  edit safe:** the sequence tie-break (§6, defect 3) is a change *above* the arc-2 banner, i.e. in
+  code the `hda` knob arms, and it would move the `hda`-ON image — but `knoboff` compares the
+  DEFAULT image, in which this file does not exist, so both knobs still measure exit 0. A reader
+  should not take that as licence: an arc-1 edit is only invisible here because the whole module is
+  erased, and the same edit in any file the default build lexes would have to be line-neutral.
 - `drivers/pci.rs::audio_inventory` is an **impl-tail** append and the probe call is a **line-neutral**
   append on an existing line, before that line's first `//` (LEDGER P7).
 - Every arc-2-only constant, the `cmd16` verb form, `elapsed_ms` and the whole `mod tone` block carry
@@ -491,24 +683,25 @@ What is worth reading off it, because it is what the metal boot will be compared
 ## 7. The metal expectation
 
 The bench machine is a 2012 15" Retina MacBook Pro, MacBookPro10,1, Intel 7-series (Panther Point)
-PCH. **Expected, not assumed** — the census prints what is there:
+PCH. **Expected, not assumed** — the census prints what is there. **Flight 11 (2026-09-22) settled
+every row of this table; the `measured` column is the wire, not a prediction** (§6):
 
-| fact | expectation | how it is settled |
+| fact | expectation | measured, flight 11 |
 | :--- | :--- | :--- |
-| controller bdf | `0:27.0` | the `[hda] census` line |
-| controller id | `8086:1e20` (7-series HD Audio) | the `[hda] census` line |
-| class triple | `class=04 sub=03 progif=00` | the `[hda] census` line |
-| codec | Cirrus Logic **CS4206** — vendor 0x1013 | **to be read**, from `[hda] codec=0 vid=…` |
-| codec count | 1 | `[hda] reset … codecs=[…]` |
-| internal speaker pin | `dev=speaker loc=internal`, EAPD-capable | `[hda] node=…` and `speaker_pin=` |
-| headphone pin | `dev=hp-out loc=external` | `hp_pin=` |
-| the tone | `lpib` advancing, `bcis` ≥ 2, `tag_ok=1`, and **Peter hears 440 Hz from the internal speakers** | `[hda] tone` plus the room |
+| controller bdf | `0:27.0` | ✅ `0:27.0`, and a **second** class-0x04 function at `1:0.1` |
+| controller id | `8086:1e20` (7-series HD Audio) | ✅ `8086:1e20`; the second is `10de:0e1b` (GK107 HDMI audio, §9) |
+| class triple | `class=04 sub=03 progif=00` | ✅ both functions |
+| codec | Cirrus Logic **CS4206** — vendor 0x1013 | ✅ `vid=1013:4206 rev=0x00100302` |
+| codec count | 1 | ✅ `statests=0x0001 codecs=[0]` |
+| internal speaker pin | `dev=speaker loc=internal`, EAPD-capable | ⚠ **TWO** of them — 0x0a (`assoc=1 seq=2`) and 0x0b (`assoc=1 seq=0`) — and **EAPD-capable is FALSE**: `eapd=0` on both, `PIN_CAPS` bit 16 clear (defect 2, §6) |
+| headphone pin | `dev=hp-out loc=external` | ✅ `hp_pin=0x09`, `pincfg=0x002b4020 (… assoc=2 seq=0)` |
+| the tone | `lpib` advancing, `bcis` ≥ 2, `tag_ok=1`, and **Peter hears 440 Hz from the internal speakers** | ⚠ `tag_ok=1`, LPIB walked the **whole** buffer and wrapped at 191997 B/s — and `bcis=0`, and **the room was silent** (§6) |
 
-The codec's vendor/device id is the one line of §7 nobody in this tree has ever read. A discrete
-GPU's HDMI audio function may also appear in the census on this machine — the GK107 has one — which
-is why the census prints every class-0x04 function and the driver claims the first that resets and
-answers. Driving two controllers at once is an arc 3 question and is deliberately not done quietly
-here.
+The codec's vendor/device id was the one line of §7 nobody in this tree had ever read; it now reads
+`1013:4206`. A discrete GPU's HDMI audio function may also appear in the census on this machine —
+the GK107 has one, and flight 11 printed it — which is why the census prints every class-0x04
+function and the driver claims the first that resets and answers. Driving two controllers at once is
+**arc 4** (§9) and is deliberately not done quietly here.
 
 **Flight line:**
 
@@ -535,4 +728,36 @@ UNAOS_HDA=1 UNAOS_HDATONE=1 ./arroyo esp-x86
    (one pass inside `pci::init`) does not have.
 4. **Multi-codec and multi-controller.** `STATESTS` is walked in full and every present codec is
    walked, but only the first with a derived path is a tone candidate, and only the first controller
-   that answers is claimed.
+   that answers is claimed. The *second controller* on the bench machine has a section of its own —
+   §9, arc 4 — now that flight 11 has measured it.
+
+---
+
+## 9. Arc 4 — the second controller, `1:0.1` `10de:0e1b`
+
+Flight 11's census printed **two** class-0x04 functions, and only the first was touched:
+
+```
+[hda] census bdf=0:27.0 id=8086:1e20 class=04 sub=03 progif=00 (hd-audio) bar0=0xc1c10000 irq=0
+[hda] census bdf=1:0.1 id=10de:0e1b class=04 sub=03 progif=00 (hd-audio) bar0=0xc1080000 irq=0
+```
+
+`10de:0e1b` is the **GK107 Kepler's HDMI audio function** — bus 1, device 0, function 1, beside the
+GPU itself at `1:0.0`. It is the same HD Audio controller architecture (CORB/RIRB, codec verbs,
+stream descriptors), with a codec whose pins are HDMI/DisplayPort sinks rather than speakers, so
+nothing in arcs 1–3 would have to be rewritten for it: the walk, the path derivation and the stream
+programming are the same code and the difference is which pin the path lands on.
+
+**It is untouched, and that is deliberate.** `probe` claims the FIRST controller that resets and
+answers and then returns — one controller per boot — so on this machine the PCH's analog controller
+wins and the Kepler's is enumerated, printed and left alone. Claiming both means two `Rings`, two
+widget tables and a decision about which one a tone should come out of, and it interacts with the
+GPU's own bring-up (the Kepler is the subject of an entire ladder of its own; `docs/dev/OS/08_VIDEO/`).
+That is an arc, not an adjacent improvement.
+
+What arc 4 owes, in order: claim the second function under a knob of its own; walk it and print its
+codec id and pin default configurations (an HDMI pin's `dev=` is `digital-other-out` or `spdif-out`,
+and its default configuration carries the connector rather than a speaker); decide the
+one-controller-per-boot rule properly rather than by "first that answers"; and only then consider a
+tone, which on an HDMI sink means a display that is awake and a link that is up — i.e. it depends on
+the Kepler ladder, not on this file.

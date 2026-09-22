@@ -16,10 +16,13 @@
 //! internal speaker sits on.
 //!
 //! **Arc 2 (`hda-tone`) does:** program output stream 0 with a 16-bit stereo 48 kHz sine (440 Hz,
-//! one second, low amplitude) through a two-entry BDL, bind the stream tag to the derived path's
-//! converter, power and enable the pin, unmute the amplifier on every node of the path, RUN the
-//! stream, and then PROVE it ran without ears — `LPIB` advancing plus at least one polled `BCIS` —
-//! before stopping and restoring every register it changed.
+//! one second, low amplitude) through a two-entry BDL, bind the stream tag to EVERY converter of
+//! the derived pin's ASSOCIATION (an internal speaker pair is two pins with two converters), power
+//! and enable each pin, unmute the amplifier on every node of every member's path, drive the codec
+//! function group's whole declared GPIO set (the CS4206 has no EAPD and its speaker amplifier is
+//! not reachable any other way the specification defines), RUN the stream, and then PROVE it ran
+//! without ears — `LPIB` advancing plus the BDL walked to its end, by a cyclic-buffer WRAP or a
+//! polled `BCIS` — before stopping and restoring every register it changed.
 //!
 //! **Does NOT — 1: no interrupts.** `INTCTL` is never written, so `GIE`/`CIE`/`SIE` stay 0 and the
 //! controller raises no message. `SDnCTL.IOCE` IS set, which is what makes `SDnSTS.BCIS` latch on a
@@ -75,9 +78,15 @@
 //! [hda] codec=0 vid=1af4:0022 rev=0x........
 //! [hda] node=0x02 type=audio-out conns=[] pincfg=-
 //! [hda] walk codecs=1 nodes=5 dacs=1 pins=2 speaker_pin=0x.. hp_pin=0x..
-//! [hda] tone stream=0 lpib=... -> ... bcis=... fifo_ready=... run_ms=... tag_ok=...
+//! [hda] pair member=1/2 pin=0x.. dac=0x.. dev=speaker assoc=. seq=. chan=. stereo=. primary=.
+//! [hda] bdl entry=0/1 addr=0x... len=... ioc=1 flags=0x00000001 (readback)
+//! [hda] gpio afg=0x.. caps=0x........ gpios=N ... mask=0x.. enable=..->.. dir=..->.. data=..->.. -> set|none
+//! [hda] bind member=. dac=0x.. want_tag=1 want_chan=. bound=0x.. tag=. chan=. ok=.
+//! [hda] power member=. dac=0x.. set=D. actual=D. ... pin=0x.. set=D. actual=D. ...
+//! [hda] amp member=. dac=0x.. gain=0x.... mute=. ... pinctl=0x.. out_en=. fmt_conv=0x.... fmt_match=.
+//! [hda] tone stream=0 lpib=... -> ... bcis=... fifo_ready=... run_ms=... tag_ok=... wraps=... consumed=... rate_bps=...
 //! :: HDA: codecs=<n> nodes=<n> path=<found|none> -> PASS|FAIL ::
-//! :: HDA-TONE: lpib_advanced=<0|1> bcis=<n> -> PASS|FAIL ::
+//! :: HDA-TONE: lpib_advanced=<0|1> walked=<0|1> wraps=<n> bcis=<n> -> PASS|FAIL ::
 //! ```
 //!
 //! Both verdict lines are printed ONLY on a machine that has an HDA controller and reached the
@@ -789,7 +798,15 @@ fn walk_codec(rings: &mut Rings, cad: u8, ws: &mut [Widget; MAX_NODES], a: &mut 
     };
     // Ranked candidates: internal speaker beats headphone beats line out, and an analog pin beats a
     // digital one at every rank. `None` until a pin of that rank is found WITH a path behind it.
-    let mut best: Option<(u8, Path, u8)> = None; // (rank, path, default-device)
+    // ⚠ HDAAMP — THE TIE-BREAK IS SEQUENCE, AND IT USED TO BE NID ORDER BY ACCIDENT. The tuple is
+    // (rank, SEQUENCE, path, default-device). Rank alone left two pins of the SAME association at
+    // the same score — the rMBP's two internal speaker pins, 0x0a (`assoc=1 seq=2`) and 0x0b
+    // (`assoc=1 seq=0`), measured on flight 11 — and a strictly-smaller-rank replacement then hands
+    // the tie to whichever pin the ascending-NID scan reached first. That is NID order dressed as a
+    // preference. [HDA-SPEC §7.3.3.31] makes sequence the ordering within an association and
+    // sequence 0 its PRIMARY member, so the specification supplies the tie-break the rank was
+    // missing. (Arc 2 then drives every member of the association, not only this one.)
+    let mut best: Option<(u8, u8, Path, u8)> = None; // (rank, sequence, path, default-device)
 
     for fgi in 0..fg_count {
         let fg = (fg_start + fgi) as u8;
@@ -921,13 +938,14 @@ fn walk_codec(rings: &mut Rings, cad: u8, ws: &mut [Widget; MAX_NODES], a: &mut 
             _ => continue,
         };
         let rank = rank + if w.caps & WCAP_DIGITAL != 0 { 8 } else { 0 };
+        let seq = (w.pincfg & 0x0F) as u8;
         if let Some(p) = find_path(ws, w.nid) {
             let better = match best {
                 None => true,
-                Some((r, _, _)) => rank < r,
+                Some((r, sq, _, _)) => rank < r || (rank == r && seq < sq),
             };
             if better {
-                best = Some((rank, p, dev));
+                best = Some((rank, seq, p, dev));
             }
         } else {
             serial_println!(
@@ -936,7 +954,7 @@ fn walk_codec(rings: &mut Rings, cad: u8, ws: &mut [Widget; MAX_NODES], a: &mut 
             );
         }
     }
-    if let Some((_, p, dev)) = best {
+    if let Some((_, _, p, dev)) = best {
         out.path = Some(p);
         out.path_dev = dev;
     }
@@ -1260,6 +1278,41 @@ mod tone {
     pub const PINCTL_HP_ENABLE: u8 = 1 << 7;
     pub const EAPD_ENABLE: u8 = 1 << 1; // [HDA-SPEC §7.3.3.16]
 
+    // ── HDAAMP: the GPIO group. [HDA-SPEC §7.3.3, verb identifiers 0xF15/0x715, 0xF16/0x716,
+    // 0xF17/0x717; §7.3.4.14 for the parameter] The VERB NUMBER is the citable constant and is
+    // written beside each name, because a reader checking this file against the specification's
+    // verb table looks the identifier up, not the prose.
+    //
+    // ⚠ WHY THIS EXISTS AT ALL. On the bench codec (Cirrus CS4206, `vid=1013:4206`) BOTH internal
+    // speaker pins report `eapd=0` — `PIN_CAPS` bit 16 CLEAR, measured on flight 11 — so the
+    // external-amplifier bit this driver already drives is ABSENT on this part and cannot be the
+    // thing that unmutes the speakers. The function group's GPIO pins are the only other codec-side
+    // output the specification defines, and the specification gives NO map from a GPIO to a board's
+    // amplifier: that wiring is the machine's, not the standard's, and this tree has no legal
+    // source for it. So the arc does the one spec-legal thing available: it reads how many GPIOs
+    // the codec DECLARES, drives the whole declared set as one, PRINTS every word it read and
+    // wrote, and restores all three registers at stream stop. The ear answers whether the set
+    // matters; the next flight narrows it. A codec that declares none (QEMU's `hda-duplex`) prints
+    // `gpio … -> none` and is not written at all.
+    pub const PARAM_GPIO_COUNT: u32 = 0x11; //                                  [HDA-SPEC §7.3.4.14]
+    pub const VERB_GET_GPIO_DATA: u32 = 0xF15; //                               [HDA-SPEC §7.3.3]
+    pub const VERB_SET_GPIO_DATA: u32 = 0x715;
+    pub const VERB_GET_GPIO_ENABLE: u32 = 0xF16; //                             [HDA-SPEC §7.3.3]
+    pub const VERB_SET_GPIO_ENABLE: u32 = 0x716;
+    pub const VERB_GET_GPIO_DIRECTION: u32 = 0xF17; // 1 = output               [HDA-SPEC §7.3.3]
+    pub const VERB_SET_GPIO_DIRECTION: u32 = 0x717;
+
+    /// `PARAM_WIDGET_CAPS` bit 0 — Stereo. A stereo converter consumes BOTH channels of a
+    /// two-channel stream, so its `SET_CONVERTER_STREAM_CHANNEL` starting channel is 0; a mono
+    /// converter takes one, and then the association's sequence order IS the channel order.
+    /// [HDA-SPEC §7.3.4.6, §7.3.3.11]
+    pub const WCAP_STEREO: u32 = 1 << 0;
+
+    /// How many pins of one association this arc drives at once. An internal stereo speaker pair is
+    /// two; the bound is what keeps a malformed default-configuration table from turning the tone
+    /// into a walk of every pin on the codec. [HDA-SPEC §7.3.3.31]
+    pub const PAIR_MAX: usize = 2;
+
     /// Elapsed milliseconds since `start` (a `now_cycles()` reading). Arc 2 only: arc 1's every wait
     /// is a predicate with a microsecond budget, and nothing in the walk reports a duration.
     pub fn elapsed_ms(start: u64) -> u64 {
@@ -1406,6 +1459,105 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
         }
     };
 
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+    // HDAAMP DEFECT 3 — AN ASSOCIATION IS A SET OF PINS, AND ARC 2 DROVE ONE OF THEM.
+    //
+    // Flight 11 measured two internal speaker pins on the CS4206, both `dev=speaker loc=internal`,
+    // both with a converter of their own:
+    //
+    //     node=0x0a … pincfg=0x90100112 (… assoc=1 seq=2)  conns=[3]
+    //     node=0x0b … pincfg=0x90100110 (… assoc=1 seq=0)  conns=[4]
+    //
+    // and the path line chose `dac=0x03 -> [10, 3] -> pin=0x0a`, i.e. the seq=2 member. WHY: the
+    // rank in [`walk_codec`] is a function of (default device, gross location) ONLY. Both pins
+    // score rank 0, the loop replaces `best` only on a STRICTLY smaller rank, so the first pin the
+    // ascending-NID scan reaches wins — 0x0a, because 0x0a < 0x0b. Association and sequence were
+    // decoded and PRINTED by arc 1 and then never consulted. [HDA-SPEC §7.3.3.31] makes sequence
+    // the ordering WITHIN an association and sequence 0 its primary member, so the tie-break is not
+    // a preference: it is the field the specification provides for exactly this question, and
+    // `walk_codec` now breaks rank ties on it.
+    //
+    // But the deeper defect is that a tie-break still drives ONE pin. A two-member association IS
+    // the stereo pair — that is what an association means — and a speaker pair is driven by binding
+    // BOTH converters to the SAME stream tag. So arc 2 collects every output-capable pin of the
+    // chosen pin's association that carries the same default device and has a converter of its
+    // own, orders the members by sequence, and programs all of them.
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+    let pin0 = ws[path.pin as usize];
+    let assoc = ((pin0.pincfg >> 4) & 0x0F) as u8;
+    let dev = ((pin0.pincfg >> 20) & 0x0F) as u8;
+    let mut paths = [Path::default(); PAIR_MAX];
+    let mut pseq = [0u8; PAIR_MAX];
+    let mut pchan = [0u8; PAIR_MAX];
+    paths[0] = path;
+    pseq[0] = (pin0.pincfg & 0x0F) as u8;
+    let mut np = 1usize;
+    // Association 0 is "no association" and 15 is "not grouped"; neither is a pair, so neither is
+    // walked for one. [HDA-SPEC §7.3.3.31]
+    if assoc != 0x00 && assoc != 0x0F {
+        for nid in 0..MAX_NODES {
+            if np >= PAIR_MAX {
+                break;
+            }
+            let w = ws[nid];
+            if !w.present || w.kind != WT_PIN || w.nid == path.pin {
+                continue;
+            }
+            if w.pincap & PINCAP_OUTPUT == 0 {
+                continue;
+            }
+            // Port connectivity 1 is "no physical connection" — the same exclusion arc 1's rank
+            // makes, restated here because this scan does not go through it.
+            if ((w.pincfg >> 30) & 0x03) as u8 == 0x1 {
+                continue;
+            }
+            if ((w.pincfg >> 4) & 0x0F) as u8 != assoc || ((w.pincfg >> 20) & 0x0F) as u8 != dev {
+                continue;
+            }
+            let p = match find_path(ws, w.nid) {
+                Some(p) => p,
+                None => continue,
+            };
+            // One converter per member. Two pins fed by ONE converter are not a stereo pair and
+            // binding that converter twice would be the same write issued twice.
+            let mut dup = false;
+            for i in 0..np {
+                if paths[i].dac == p.dac {
+                    dup = true;
+                }
+            }
+            if dup {
+                continue;
+            }
+            paths[np] = p;
+            pseq[np] = (w.pincfg & 0x0F) as u8;
+            np += 1;
+        }
+    }
+    // Sequence order. Insertion sort over at most `PAIR_MAX` members. [HDA-SPEC §7.3.3.31]
+    for i in 1..np {
+        let mut j = i;
+        while j > 0 && pseq[j] < pseq[j - 1] {
+            paths.swap(j, j - 1);
+            pseq.swap(j, j - 1);
+            j -= 1;
+        }
+    }
+    // The starting channel each converter takes out of the two-channel stream. A STEREO converter
+    // consumes both, so it starts at 0; asking a stereo converter for channels 1..2 of a
+    // two-channel stream asks for a channel the stream does not carry. A MONO converter takes one,
+    // and then sequence order is channel order. [HDA-SPEC §7.3.3.11, §7.3.4.6]
+    for i in 0..np {
+        pchan[i] = if ws[paths[i].dac as usize].caps & WCAP_STEREO != 0 { 0 } else { i as u8 };
+    }
+    for i in 0..np {
+        serial_println!(
+            "[hda] pair member={}/{} pin=0x{:02x} dac=0x{:02x} dev={} assoc={} seq={} chan={} stereo={} primary={}",
+            i + 1, np, paths[i].pin, paths[i].dac, pin_device_name(dev), assoc, pseq[i], pchan[i],
+            (ws[paths[i].dac as usize].caps & WCAP_STEREO != 0) as u8, (i == 0) as u8
+        );
+    }
+
     let sd = SD_BASE + (iss as u64) * SD_STRIDE;
     let pcm = dma_alloc(PCM_BYTES, 128);
     let bdl = dma_alloc(BDL_BYTES, BDL_ALIGN);
@@ -1431,6 +1583,102 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
         }
     }
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    // ⚠ HDAAMP — THE BDL IS READ BACK AND PRINTED, ENTRY BY ENTRY. Flight 11 scored `bcis=0` on a
+    // stream whose LPIB walked the whole cyclic buffer and wrapped, and the three candidate causes
+    // of a missing completion latch — a wrong entry length, a wrong entry address, an IOC flag that
+    // was never actually stored — are all facts about THESE SIXTEEN BYTES PER ENTRY and about
+    // nothing else. Printing the write does not settle it; printing what the memory holds after the
+    // fence does. `ioc=` is the bit whose absence would explain `bcis=0` outright. [HDA-SPEC §3.6.2]
+    for i in 0..BDL_ENTRIES {
+        let e = bdl + (i as u64) * 16;
+        let (lo, hi, len, flags) = unsafe {
+            (
+                core::ptr::read_volatile(e as *const u32),
+                core::ptr::read_volatile((e + 4) as *const u32),
+                core::ptr::read_volatile((e + 8) as *const u32),
+                core::ptr::read_volatile((e + 12) as *const u32),
+            )
+        };
+        serial_println!(
+            "[hda] bdl entry={}/{} addr={:#x} len={} ioc={} flags={:#010x} (readback)",
+            i, BDL_ENTRIES - 1, ((hi as u64) << 32) | (lo as u64), len, flags & 1, flags
+        );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+    // HDAAMP DEFECT 2 — THE SPEAKER AMPLIFIER IS NOT AN EAPD PIN ON THIS CODEC.
+    //
+    // The function group is found FROM THE WIRE here rather than carried down from the walk: node 0
+    // is asked for its subordinate node count and each function group for its type, which is three
+    // verbs and keeps every arc-2 statement below this file's arc-2 banner. See the `PARAM_GPIO_COUNT`
+    // block in `mod tone` for why a GPIO set is the only spec-legal move available.
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+    let mut afg: Option<u8> = None;
+    if let Some(sub) = rings.cmd(cad, 0, VERB_GET_PARAMETER, PARAM_SUBNODE_COUNT, a) {
+        a.verbs_get += 1;
+        let start = ((sub >> 16) & 0xFF) as u8;
+        let count = (sub & 0xFF) as u8;
+        for i in 0..count {
+            let fg = start.wrapping_add(i);
+            if let Some(t) = rings.cmd(cad, fg, VERB_GET_PARAMETER, PARAM_FUNCTION_TYPE, a) {
+                a.verbs_get += 1;
+                if t & 0x7F == FG_TYPE_AUDIO {
+                    afg = Some(fg);
+                    break;
+                }
+            }
+        }
+    }
+    // (function group, mask, data, direction, enable) as read BEFORE anything was driven.
+    let mut gpio_saved: Option<(u8, u8, u8, u8, u8)> = None;
+    match afg {
+        None => serial_println!("[hda] gpio afg=none caps=0 -> none (no audio function group answered)"),
+        Some(fg) => {
+            let caps = rings.cmd(cad, fg, VERB_GET_PARAMETER, PARAM_GPIO_COUNT, a).unwrap_or(0);
+            a.verbs_get += 1;
+            // [HDA-SPEC §7.3.4.14] bits 7:0 GPIO count, 15:8 GPO count, 23:16 GPI count,
+            // bit 30 GPI-unsolicited capable, bit 31 GPI-wake capable.
+            let ngpio = (caps & 0xFF) as u8;
+            let ngpo = ((caps >> 8) & 0xFF) as u8;
+            let ngpi = ((caps >> 16) & 0xFF) as u8;
+            if ngpio == 0 {
+                serial_println!(
+                    "[hda] gpio afg=0x{:02x} caps={:#010x} gpios=0 gpos={} gpis={} unsol={} wake={} -> none",
+                    fg, caps, ngpo, ngpi, (caps >> 30) & 1, (caps >> 31) & 1
+                );
+            } else {
+                let mask: u8 = if ngpio >= 8 { 0xFF } else { (1u8 << ngpio) - 1 };
+                let d0 = rings.cmd(cad, fg, VERB_GET_GPIO_DATA, 0, a).unwrap_or(0) as u8;
+                let dir0 = rings.cmd(cad, fg, VERB_GET_GPIO_DIRECTION, 0, a).unwrap_or(0) as u8;
+                let en0 = rings.cmd(cad, fg, VERB_GET_GPIO_ENABLE, 0, a).unwrap_or(0) as u8;
+                a.verbs_get += 3;
+                gpio_saved = Some((fg, mask, d0, dir0, en0));
+                // Enable, then direction, then data: a pin driven before it is an enabled output is
+                // a write to a pin the codec is not yet driving. Restore runs in the mirror order.
+                if rings.cmd(cad, fg, VERB_SET_GPIO_ENABLE, (en0 | mask) as u32, a).is_some() {
+                    a.verbs_set += 1;
+                }
+                if rings.cmd(cad, fg, VERB_SET_GPIO_DIRECTION, (dir0 | mask) as u32, a).is_some() {
+                    a.verbs_set += 1;
+                }
+                if rings.cmd(cad, fg, VERB_SET_GPIO_DATA, (d0 | mask) as u32, a).is_some() {
+                    a.verbs_set += 1;
+                }
+                let d1 = rings.cmd(cad, fg, VERB_GET_GPIO_DATA, 0, a).unwrap_or(0) as u8;
+                let dir1 = rings.cmd(cad, fg, VERB_GET_GPIO_DIRECTION, 0, a).unwrap_or(0) as u8;
+                let en1 = rings.cmd(cad, fg, VERB_GET_GPIO_ENABLE, 0, a).unwrap_or(0) as u8;
+                a.verbs_get += 3;
+                serial_println!(
+                    "[hda] gpio afg=0x{:02x} caps={:#010x} gpios={} gpos={} gpis={} unsol={} wake={} mask={:#04x} enable={:#04x}->{:#04x} dir={:#04x}->{:#04x} data={:#04x}->{:#04x} stuck={} -> set",
+                    fg, caps, ngpio, ngpo, ngpi, (caps >> 30) & 1, (caps >> 31) & 1, mask,
+                    en0, en1, dir0, dir1, d0, d1,
+                    // A pin that will not read back as driven is a pin the codec refused, and that
+                    // is a different answer from "driven and the speaker is still silent".
+                    (d1 & mask != mask || dir1 & mask != mask || en1 & mask != mask) as u8
+                );
+            }
+        }
+    }
 
     // ── Save every register this run changes. ───────────────────────────────────────────────────
     let saved_ctl = (r8(base, sd + SD_CTL) as u32) | ((r8(base, sd + SD_CTL + 1) as u32) << 8)
@@ -1441,120 +1689,177 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     let saved_cbl = r32(base, sd + SD_CBL);
     let saved_lvi = r16(base, sd + SD_LVI);
 
-    let mut s = Saved::default();
-    if let Some(v) = rings.cmd(cad, path.pin, VERB_GET_PIN_CONTROL, 0, a) {
-        a.verbs_get += 1;
-        s.pinctl = (v & 0xFF) as u8;
-        s.pinctl_ok = true;
-    }
-    if ws[path.pin as usize].pincap & PINCAP_EAPD != 0 {
-        if let Some(v) = rings.cmd(cad, path.pin, VERB_GET_EAPD, 0, a) {
+    let mut s = [Saved::default(); PAIR_MAX];
+    for m in 0..np {
+        let (mpin, mdac) = (paths[m].pin, paths[m].dac);
+        if let Some(v) = rings.cmd(cad, mpin, VERB_GET_PIN_CONTROL, 0, a) {
             a.verbs_get += 1;
-            s.eapd = (v & 0xFF) as u8;
-            s.eapd_ok = true;
+            s[m].pinctl = (v & 0xFF) as u8;
+            s[m].pinctl_ok = true;
         }
-    }
-    if let Some(v) = rings.cmd(cad, path.dac, VERB_GET_CONVERTER_FORMAT, 0, a) {
-        a.verbs_get += 1;
-        s.fmt = (v & 0xFFFF) as u16;
-        s.fmt_ok = true;
-    }
-    if let Some(v) = rings.cmd(cad, path.dac, VERB_GET_STREAM_CHANNEL, 0, a) {
-        a.verbs_get += 1;
-        s.strm = (v & 0xFF) as u8;
-        s.strm_ok = true;
-    }
-    for i in 0..path.len as usize {
-        let nid = path.nodes[i];
-        if ws[nid as usize].caps & WCAP_POWER_CTL != 0 {
-            if let Some(v) = rings.cmd(cad, nid, VERB_GET_POWER_STATE, 0, a) {
+        if ws[mpin as usize].pincap & PINCAP_EAPD != 0 {
+            if let Some(v) = rings.cmd(cad, mpin, VERB_GET_EAPD, 0, a) {
                 a.verbs_get += 1;
-                s.power[i] = (v & 0xFF) as u8;
-                s.power_ok[i] = true;
+                s[m].eapd = (v & 0xFF) as u8;
+                s[m].eapd_ok = true;
             }
         }
-        if ws[nid as usize].out_amp() {
-            // GET_AMP_GAIN_MUTE payload: bit15 output, bit13 left. Read the left channel; the two
-            // are written back together, which is what this driver set them to.
-            if let Some(v) = rings.cmd(cad, nid, VERB_GET_AMP_GAIN_MUTE, 0x80, a) {
-                a.verbs_get += 1;
-                s.out_amp[i] = (v & 0xFFFF) as u16;
-                s.out_amp_ok[i] = true;
+        if let Some(v) = rings.cmd(cad, mdac, VERB_GET_CONVERTER_FORMAT, 0, a) {
+            a.verbs_get += 1;
+            s[m].fmt = (v & 0xFFFF) as u16;
+            s[m].fmt_ok = true;
+        }
+        if let Some(v) = rings.cmd(cad, mdac, VERB_GET_STREAM_CHANNEL, 0, a) {
+            a.verbs_get += 1;
+            s[m].strm = (v & 0xFF) as u8;
+            s[m].strm_ok = true;
+        }
+        for i in 0..paths[m].len as usize {
+            let nid = paths[m].nodes[i];
+            if ws[nid as usize].caps & WCAP_POWER_CTL != 0 {
+                if let Some(v) = rings.cmd(cad, nid, VERB_GET_POWER_STATE, 0, a) {
+                    a.verbs_get += 1;
+                    s[m].power[i] = (v & 0xFF) as u8;
+                    s[m].power_ok[i] = true;
+                }
+            }
+            if ws[nid as usize].out_amp() {
+                // GET_AMP_GAIN_MUTE payload: bit15 output, bit13 left. Read the left channel; the
+                // two are written back together, which is what this driver set them to.
+                if let Some(v) = rings.cmd(cad, nid, VERB_GET_AMP_GAIN_MUTE, 0x80, a) {
+                    a.verbs_get += 1;
+                    s[m].out_amp[i] = (v & 0xFFFF) as u16;
+                    s[m].out_amp_ok[i] = true;
+                }
             }
         }
     }
 
-    // ── Program the codec side of the path. ─────────────────────────────────────────────────────
-    for i in 0..path.len as usize {
-        let nid = path.nodes[i];
-        let w = ws[nid as usize];
-        if w.caps & WCAP_POWER_CTL != 0 {
-            if rings.cmd(cad, nid, VERB_SET_POWER_STATE, 0, a).is_some() {
-                a.verbs_set += 1;
+    // ── Program the codec side of every member of the association. ──────────────────────────────
+    for m in 0..np {
+        let p = paths[m];
+        for i in 0..p.len as usize {
+            let nid = p.nodes[i];
+            let w = ws[nid as usize];
+            if w.caps & WCAP_POWER_CTL != 0 {
+                if rings.cmd(cad, nid, VERB_SET_POWER_STATE, 0, a).is_some() {
+                    a.verbs_set += 1;
+                }
+            }
+            // A selector on the path is pointed at the input the path actually took; a mixer is
+            // left alone (it sums) and gets its INPUT amp unmuted instead.
+            if w.kind == WT_SELECTOR && w.nconns > 1 {
+                if rings.cmd(cad, nid, VERB_SET_CONNECTION_SELECT, p.sel[i] as u32, a).is_some() {
+                    a.verbs_set += 1;
+                }
+            }
+            if w.out_amp() {
+                let caps = rings.cmd(cad, nid, VERB_GET_PARAMETER, PARAM_OUT_AMP_CAPS, a).unwrap_or(0);
+                a.verbs_get += 1;
+                let g = moderate_gain(caps);
+                if rings.cmd16(cad, nid, VERB_SET_AMP_GAIN_MUTE, amp_payload(true, 0, false, g), a).is_some() {
+                    a.verbs_set += 1;
+                }
+            }
+            if w.in_amp() && w.kind == WT_MIXER {
+                let caps = rings.cmd(cad, nid, VERB_GET_PARAMETER, PARAM_IN_AMP_CAPS, a).unwrap_or(0);
+                a.verbs_get += 1;
+                let g = moderate_gain(caps);
+                if rings.cmd16(cad, nid, VERB_SET_AMP_GAIN_MUTE, amp_payload(false, p.sel[i], false, g), a).is_some() {
+                    a.verbs_set += 1;
+                }
             }
         }
-        // A selector on the path is pointed at the input the path actually took; a mixer is left
-        // alone (it sums) and gets its INPUT amp unmuted instead.
-        if w.kind == WT_SELECTOR && w.nconns > 1 {
-            if rings.cmd(cad, nid, VERB_SET_CONNECTION_SELECT, path.sel[i] as u32, a).is_some() {
-                a.verbs_set += 1;
-            }
-        }
-        if w.out_amp() {
-            let caps = rings.cmd(cad, nid, VERB_GET_PARAMETER, PARAM_OUT_AMP_CAPS, a).unwrap_or(0);
-            a.verbs_get += 1;
-            let g = moderate_gain(caps);
-            if rings.cmd16(cad, nid, VERB_SET_AMP_GAIN_MUTE, amp_payload(true, 0, false, g), a).is_some() {
-                a.verbs_set += 1;
-            }
-        }
-        if w.in_amp() && w.kind == WT_MIXER {
-            let caps = rings.cmd(cad, nid, VERB_GET_PARAMETER, PARAM_IN_AMP_CAPS, a).unwrap_or(0);
-            a.verbs_get += 1;
-            let g = moderate_gain(caps);
-            if rings.cmd16(cad, nid, VERB_SET_AMP_GAIN_MUTE, amp_payload(false, path.sel[i], false, g), a).is_some() {
-                a.verbs_set += 1;
-            }
-        }
-    }
 
-    // The pin: output enable, plus the headphone amplifier when the pin declares one, plus EAPD —
-    // the external amplifier the rMBP's internal speakers hang off. [HDA-SPEC §7.3.3.13, §7.3.3.16]
-    let pincap = ws[path.pin as usize].pincap;
-    let mut pinctl = PINCTL_OUT_ENABLE;
-    if pincap & PINCAP_HP_DRIVE != 0 {
-        pinctl |= PINCTL_HP_ENABLE;
-    }
-    if rings.cmd(cad, path.pin, VERB_SET_PIN_CONTROL, pinctl as u32, a).is_some() {
-        a.verbs_set += 1;
-    }
-    if pincap & PINCAP_EAPD != 0 {
-        if rings.cmd(cad, path.pin, VERB_SET_EAPD, (s.eapd | EAPD_ENABLE) as u32, a).is_some() {
+        // The pin: output enable, plus the headphone amplifier when the pin declares one, plus EAPD
+        // WHEN THE PIN DECLARES IT — on the bench codec neither speaker pin does, which is defect 2.
+        // [HDA-SPEC §7.3.3.13, §7.3.3.16]
+        let pincap = ws[p.pin as usize].pincap;
+        let mut pinctl = PINCTL_OUT_ENABLE;
+        if pincap & PINCAP_HP_DRIVE != 0 {
+            pinctl |= PINCTL_HP_ENABLE;
+        }
+        if rings.cmd(cad, p.pin, VERB_SET_PIN_CONTROL, pinctl as u32, a).is_some() {
+            a.verbs_set += 1;
+        }
+        if pincap & PINCAP_EAPD != 0 {
+            if rings.cmd(cad, p.pin, VERB_SET_EAPD, (s[m].eapd | EAPD_ENABLE) as u32, a).is_some() {
+                a.verbs_set += 1;
+            }
+        }
+
+        // The converter: format first, then the stream tag and this member's starting channel.
+        // Order matters — a converter bound to a stream before its format is set can latch the old
+        // format for the first buffer. [HDA-SPEC §7.3.3.8, §7.3.3.11]
+        if rings.cmd16(cad, p.dac, VERB_SET_CONVERTER_FORMAT, FMT_48K_16_STEREO as u32, a).is_some() {
+            a.verbs_set += 1;
+        }
+        if rings.cmd(cad, p.dac, VERB_SET_STREAM_CHANNEL, (STREAM_TAG << 4) | pchan[m] as u32, a).is_some() {
             a.verbs_set += 1;
         }
     }
 
-    // The converter: format first, then the stream tag. Order matters — a converter bound to a
-    // stream before its format is set can latch the old format for the first buffer.
-    // [HDA-SPEC §7.3.3.8, §7.3.3.11]
-    if rings.cmd16(cad, path.dac, VERB_SET_CONVERTER_FORMAT, FMT_48K_16_STEREO as u32, a).is_some() {
-        a.verbs_set += 1;
-    }
-    if rings.cmd(cad, path.dac, VERB_SET_STREAM_CHANNEL, (STREAM_TAG << 4) | 0, a).is_some() {
-        a.verbs_set += 1;
-    }
     // ⚠ READ THE BINDING BACK, because LPIB AND BCIS CANNOT SEE IT. Both of those witnesses live on
     // the CONTROLLER side: they say the stream engine fetched sample data and walked the BDL. They
     // say nothing about whether the LINK carries those samples to a converter. MEASURED, on the
     // `intel-hda` fixture: with the stream tag deliberately set to 0 — the "unused" tag, which no
     // link ever carries [HDA-SPEC §3.3.35] — the run still read `lpib=0 -> 44160 (max 191960)
     // bcis=2 fifo_ready=1` and would have scored PASS. So the tag is checked where it is actually
-    // observable: the converter is asked what it was bound to, and the answer is folded into the
-    // verdict. This is a programming invariant read at the wire, not a restatement of the write.
-    // [HDA-SPEC §7.3.3.11]
-    let tag_bound = rings.cmd(cad, path.dac, VERB_GET_STREAM_CHANNEL, 0, a).unwrap_or(0xFFFF_FFFF);
-    a.verbs_get += 1;
-    let tag_ok = STREAM_TAG != 0 && tag_bound != 0xFFFF_FFFF && ((tag_bound >> 4) & 0x0F) == STREAM_TAG;
+    // observable: EVERY member's converter is asked what it was bound to, and one member that did
+    // not take the binding fails the whole run. [HDA-SPEC §7.3.3.11]
+    let mut tag_ok = STREAM_TAG != 0;
+    let mut tag_bound0 = 0xFFFF_FFFFu32;
+    for m in 0..np {
+        let tb = rings.cmd(cad, paths[m].dac, VERB_GET_STREAM_CHANNEL, 0, a).unwrap_or(0xFFFF_FFFF);
+        a.verbs_get += 1;
+        if m == 0 {
+            tag_bound0 = tb;
+        }
+        let this_ok = tb != 0xFFFF_FFFF && ((tb >> 4) & 0x0F) == STREAM_TAG && (tb & 0x0F) == pchan[m] as u32;
+        if !this_ok {
+            tag_ok = false;
+        }
+        serial_println!(
+            "[hda] bind member={} dac=0x{:02x} want_tag={} want_chan={} bound={:#04x} tag={} chan={} ok={}",
+            m, paths[m].dac, STREAM_TAG, pchan[m], tb & 0xFF, (tb >> 4) & 0x0F, tb & 0x0F, this_ok as u8
+        );
+    }
+
+    // ── HDAAMP — the codec-side readbacks a silent run cannot be diagnosed without. ─────────────
+    // Flight 11 proved the CONTROLLER side ran (see the wrap arithmetic at the verdict below) and
+    // Peter heard nothing, so every remaining suspect is a codec register: a node still in D3, a
+    // muted or zero-gain amplifier, a pin whose output enable did not stick, or a converter whose
+    // own format disagrees with `SDnFMT`. All four are readable and none of them were printed.
+    for m in 0..np {
+        let (mpin, mdac) = (paths[m].pin, paths[m].dac);
+        let pwr_dac = rings.cmd(cad, mdac, VERB_GET_POWER_STATE, 0, a).unwrap_or(0xFFFF_FFFF);
+        let pwr_pin = rings.cmd(cad, mpin, VERB_GET_POWER_STATE, 0, a).unwrap_or(0xFFFF_FFFF);
+        a.verbs_get += 2;
+        // [HDA-SPEC §7.3.3.10] response bits 3:0 = the state SET, bits 7:4 = the state ACTUALLY
+        // reached. They differ on a node that is still settling or that refused the request, and
+        // that difference is the whole reason both are printed.
+        serial_println!(
+            "[hda] power member={} dac=0x{:02x} set=D{} actual=D{} raw={:#04x} pin=0x{:02x} set=D{} actual=D{} raw={:#04x} entry_dac={:#04x} entry_pin={:#04x}",
+            m, mdac, pwr_dac & 0x0F, (pwr_dac >> 4) & 0x0F, pwr_dac & 0xFF,
+            mpin, pwr_pin & 0x0F, (pwr_pin >> 4) & 0x0F, pwr_pin & 0xFF,
+            s[m].power[(paths[m].len as usize).saturating_sub(1)], s[m].power[0]
+        );
+        let amp_dac = rings.cmd(cad, mdac, VERB_GET_AMP_GAIN_MUTE, 0x80, a).unwrap_or(0xFFFF_FFFF);
+        let amp_pin = rings.cmd(cad, mpin, VERB_GET_AMP_GAIN_MUTE, 0x80, a).unwrap_or(0xFFFF_FFFF);
+        let pinctl_back = rings.cmd(cad, mpin, VERB_GET_PIN_CONTROL, 0, a).unwrap_or(0xFFFF_FFFF);
+        let fmt_conv = rings.cmd(cad, mdac, VERB_GET_CONVERTER_FORMAT, 0, a).unwrap_or(0xFFFF_FFFF);
+        a.verbs_get += 4;
+        serial_println!(
+            "[hda] amp member={} dac=0x{:02x} raw={:#06x} mute={} gain={} pin=0x{:02x} raw={:#06x} mute={} out_amp={} pinctl={:#04x} out_en={} hp_en={} fmt_conv={:#06x} fmt_want={:#06x} fmt_match={}",
+            m, mdac, amp_dac & 0xFFFF, (amp_dac & 0x80 != 0) as u8, amp_dac & 0x7F,
+            mpin, amp_pin & 0xFFFF, (amp_pin & 0x80 != 0) as u8, ws[mpin as usize].out_amp() as u8,
+            pinctl_back & 0xFF,
+            (pinctl_back & PINCTL_OUT_ENABLE as u32 != 0) as u8,
+            (pinctl_back & PINCTL_HP_ENABLE as u32 != 0) as u8,
+            fmt_conv & 0xFFFF, FMT_48K_16_STEREO,
+            ((fmt_conv & 0xFFFF) == FMT_48K_16_STEREO as u32) as u8
+        );
+    }
 
     // ── Program the stream descriptor. [HDA-SPEC §3.3.35 ff.] ───────────────────────────────────
     // Stream reset, which the specification requires before a descriptor is reprogrammed.
@@ -1579,21 +1884,36 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
 
     let fmt_back = r16(base, sd + SD_FMT);
     let cbl_back = r32(base, sd + SD_CBL);
+    let lvi_back = r16(base, sd + SD_LVI);
     serial_println!(
-        "[hda] tone arm sd={} (iss={} => descriptor {}) fmt={:#06x}(readback {:#06x}) cbl={}(readback {}) lvi={} bdl={:#x} pcm={:#x} bytes={} tag={} srst={}/{} ctl={:#010x}",
-        0, iss, iss, FMT_48K_16_STEREO, fmt_back, PCM_BYTES, cbl_back, BDL_ENTRIES - 1, bdl, pcm, PCM_BYTES,
+        "[hda] tone arm sd={} (iss={} => descriptor {}) fmt={:#06x}(readback {:#06x}) cbl={}(readback {}) lvi={}(readback {}) bdl={:#x} pcm={:#x} bytes={} tag={} srst={}/{} ctl={:#010x} ioce={}",
+        0, iss, iss, FMT_48K_16_STEREO, fmt_back, PCM_BYTES, cbl_back, BDL_ENTRIES - 1, lvi_back, bdl, pcm, PCM_BYTES,
         STREAM_TAG, srst_set as u8, srst_clr as u8,
-        (r8(base, sd + SD_CTL) as u32) | ((r8(base, sd + SD_CTL + 1) as u32) << 8) | ((r8(base, sd + SD_CTL + 2) as u32) << 16)
+        (r8(base, sd + SD_CTL) as u32) | ((r8(base, sd + SD_CTL + 1) as u32) << 8) | ((r8(base, sd + SD_CTL + 2) as u32) << 16),
+        (r8(base, sd + SD_CTL) & SDCTL_IOCE as u8 != 0) as u8
     );
 
     // ── RUN. ────────────────────────────────────────────────────────────────────────────────────
     let lpib0 = r32(base, sd + SD_LPIB);
     w8(base, sd + SD_CTL, SDCTL_IOCE as u8 | SDCTL_RUN as u8);
     a.stream += 1;
+    let ctl_running = (r8(base, sd + SD_CTL) as u32)
+        | ((r8(base, sd + SD_CTL + 1) as u32) << 8)
+        | ((r8(base, sd + SD_CTL + 2) as u32) << 16);
     let t0 = crate::arch::now_cycles();
     let mut bcis = 0u32;
     let mut lpib_max = lpib0;
     let mut fifo_ready = 0u8;
+    // ⚠ HDAAMP — LPIB WRAPS, AND FLIGHT 11 IS THE PROOF THAT NOT COUNTING THE WRAPS MISREADS THE
+    // RUN AS A STALL. `SDnLPIB` is a position INSIDE the cyclic buffer, so it returns to 0 every
+    // `SDnCBL` bytes [HDA-SPEC §3.3.37]. Reporting only its final value turns a stream that
+    // consumed more than one buffer into a number smaller than the one it started from, which is
+    // exactly how flight 11's `lpib=0 -> 38396 (max 192000)` reads as "stopped at 38396 of 192000"
+    // when it means "walked the whole 192000-byte buffer, wrapped, and was 38396 bytes into the
+    // second pass". Counting the wraps here turns the position into BYTES CONSUMED, which is the
+    // quantity the run actually claims and the one a rate can be computed from.
+    let mut wraps = 0u32;
+    let mut prev = lpib0;
     loop {
         let sts = r8(base, sd + SD_STS);
         if sts & SDSTS_FIFORDY != 0 {
@@ -1605,6 +1925,10 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
             a.stream += 1;
         }
         let l = r32(base, sd + SD_LPIB);
+        if l < prev {
+            wraps += 1;
+        }
+        prev = l;
         if l > lpib_max {
             lpib_max = l;
         }
@@ -1639,51 +1963,91 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     w8(base, sd + SD_CTL, (saved_ctl & 0xFF) as u8 & !(SDCTL_RUN as u8));
     a.stream += 9;
 
-    if s.strm_ok && rings.cmd(cad, path.dac, VERB_SET_STREAM_CHANNEL, s.strm as u32, a).is_some() {
-        a.verbs_set += 1;
-    }
-    if s.fmt_ok && rings.cmd16(cad, path.dac, VERB_SET_CONVERTER_FORMAT, s.fmt as u32, a).is_some() {
-        a.verbs_set += 1;
-    }
-    if s.eapd_ok && rings.cmd(cad, path.pin, VERB_SET_EAPD, s.eapd as u32, a).is_some() {
-        a.verbs_set += 1;
-    }
-    if s.pinctl_ok && rings.cmd(cad, path.pin, VERB_SET_PIN_CONTROL, s.pinctl as u32, a).is_some() {
-        a.verbs_set += 1;
-    }
-    for i in 0..path.len as usize {
-        let nid = path.nodes[i];
-        if s.out_amp_ok[i] {
-            let mute = s.out_amp[i] & 0x80 != 0;
-            let gain = (s.out_amp[i] & 0x7F) as u8;
-            if rings.cmd16(cad, nid, VERB_SET_AMP_GAIN_MUTE, amp_payload(true, 0, mute, gain), a).is_some() {
-                a.verbs_set += 1;
+    for m in 0..np {
+        let p = paths[m];
+        if s[m].strm_ok && rings.cmd(cad, p.dac, VERB_SET_STREAM_CHANNEL, s[m].strm as u32, a).is_some() {
+            a.verbs_set += 1;
+        }
+        if s[m].fmt_ok && rings.cmd16(cad, p.dac, VERB_SET_CONVERTER_FORMAT, s[m].fmt as u32, a).is_some() {
+            a.verbs_set += 1;
+        }
+        if s[m].eapd_ok && rings.cmd(cad, p.pin, VERB_SET_EAPD, s[m].eapd as u32, a).is_some() {
+            a.verbs_set += 1;
+        }
+        if s[m].pinctl_ok && rings.cmd(cad, p.pin, VERB_SET_PIN_CONTROL, s[m].pinctl as u32, a).is_some() {
+            a.verbs_set += 1;
+        }
+        for i in 0..p.len as usize {
+            let nid = p.nodes[i];
+            if s[m].out_amp_ok[i] {
+                let mute = s[m].out_amp[i] & 0x80 != 0;
+                let gain = (s[m].out_amp[i] & 0x7F) as u8;
+                if rings.cmd16(cad, nid, VERB_SET_AMP_GAIN_MUTE, amp_payload(true, 0, mute, gain), a).is_some() {
+                    a.verbs_set += 1;
+                }
+            }
+            if s[m].power_ok[i] {
+                if rings.cmd(cad, nid, VERB_SET_POWER_STATE, s[m].power[i] as u32, a).is_some() {
+                    a.verbs_set += 1;
+                }
             }
         }
-        if s.power_ok[i] {
-            if rings.cmd(cad, nid, VERB_SET_POWER_STATE, s.power[i] as u32, a).is_some() {
-                a.verbs_set += 1;
-            }
+    }
+    // The GPIO set goes back in the mirror order of the drive: data, then direction, then enable.
+    if let Some((fg, mask, d0, dir0, en0)) = gpio_saved {
+        if rings.cmd(cad, fg, VERB_SET_GPIO_DATA, d0 as u32, a).is_some() {
+            a.verbs_set += 1;
         }
+        if rings.cmd(cad, fg, VERB_SET_GPIO_DIRECTION, dir0 as u32, a).is_some() {
+            a.verbs_set += 1;
+        }
+        if rings.cmd(cad, fg, VERB_SET_GPIO_ENABLE, en0 as u32, a).is_some() {
+            a.verbs_set += 1;
+        }
+        let d1 = rings.cmd(cad, fg, VERB_GET_GPIO_DATA, 0, a).unwrap_or(0) as u8;
+        a.verbs_get += 1;
+        serial_println!(
+            "[hda] gpio afg=0x{:02x} mask={:#04x} restored data={:#04x} dir={:#04x} enable={:#04x} readback={:#04x} match={}",
+            fg, mask, d0, dir0, en0, d1, (d1 == d0) as u8
+        );
     }
 
     // ── Score it. ───────────────────────────────────────────────────────────────────────────────
-    // The claim is "the stream ran", and it has two independent witnesses: the link position
-    // advanced (the controller fetched and consumed sample data), and a buffer boundary latched
-    // BCIS (the BDL was walked to the end of at least one descriptor). Either alone is weaker than
-    // both: LPIB can be read mid-fetch on a stream that stalls immediately after, and a BCIS from a
-    // previous run is cleared above before RUN so it cannot be stale.
-    let advanced = lpib_max > lpib0 || lpib_end != lpib0;
-    let ok = advanced && bcis > 0 && tag_ok && sts_end & SDSTS_FIFOE == 0 && sts_end & SDSTS_DESE == 0;
+    // ⚠ HDAAMP — THE VERDICT'S SECOND WITNESS IS NOW "THE BDL WAS WALKED TO ITS END", NOT "BCIS
+    // LATCHED", AND THAT IS A CORRECTION MEASURED ON METAL, NOT A WEAKENING. The claim has always
+    // been "the stream ran", with two independent witnesses because either alone is weak: LPIB can
+    // be read mid-fetch on a stream that stalls immediately after, so the second witness has to say
+    // that the engine reached the END of a descriptor. `BCIS` said that on QEMU. On the bench
+    // controller (Intel 7-series PCH, 8086:1e20) it did NOT: flight 11 read `bcis=0` with IOC set
+    // in both BDL entries and `SDnCTL.IOCE` set — and on the same run LPIB walked the entire
+    // 192000-byte cyclic buffer, wrapped, and reached 38396 of the next pass in 1200 ms. That is
+    // 230396 bytes, 191997 B/s, against the 192000 B/s a 48 kHz 16-bit stereo stream must consume:
+    // the engine was not merely past the end of a descriptor, it was past the end of the BUFFER, at
+    // exactly the link rate, for the whole run. A WRAP IS A STRICTLY STRONGER WITNESS THAN A BCIS
+    // LATCH — it is a full pass of every descriptor in the list — so the term is `wraps > 0 ||
+    // bcis > 0`, and a controller whose completion latch does not work no longer votes a running
+    // stream down. `bcis` stays on the wire, unscored on its own, because the next rung is why this
+    // silicon does not latch it (hda.md §6, the INTCTL.SIE hypothesis).
+    //
+    // The RATE is printed and deliberately NOT a verdict term: the QEMU fixture's `audiodev none`
+    // backend has no reason to consume at wall-clock rate and gating on a tolerance band there is
+    // how a gate becomes a flake. On metal the number is the whole diagnosis.
+    let consumed_i = (wraps as i64) * (PCM_BYTES as i64) + (lpib_end as i64) - (lpib0 as i64);
+    let consumed = if consumed_i < 0 { 0u64 } else { consumed_i as u64 };
+    let expect_bps = (SAMPLE_RATE * 4) as u64;
+    let rate_bps = if run_ms > 0 { consumed.saturating_mul(1000) / run_ms } else { 0 };
+    let advanced = wraps > 0 || lpib_max > lpib0 || lpib_end != lpib0;
+    let walked = wraps > 0 || bcis > 0;
+    let ok = advanced && walked && tag_ok && sts_end & SDSTS_FIFOE == 0 && sts_end & SDSTS_DESE == 0;
     serial_println!(
-        "[hda] tone stream=0 lpib={} -> {} (max {}) bcis={} fifo_ready={} run_ms={} sts={:#04x} fifoe={} dese={} cbl={} tag={} tag_bound={:#04x} tag_ok={}",
+        "[hda] tone stream=0 lpib={} -> {} (max {}) bcis={} fifo_ready={} run_ms={} sts={:#04x} fifoe={} dese={} cbl={} tag={} tag_bound={:#04x} tag_ok={} wraps={} consumed={} rate_bps={} expect_bps={} members={} ctl_running={:#010x}",
         lpib0, lpib_end, lpib_max, bcis, fifo_ready, run_ms, sts_end,
         (sts_end & SDSTS_FIFOE != 0) as u8, (sts_end & SDSTS_DESE != 0) as u8, PCM_BYTES, STREAM_TAG,
-        tag_bound & 0xFF, tag_ok as u8
+        tag_bound0 & 0xFF, tag_ok as u8, wraps, consumed, rate_bps, expect_bps, np, ctl_running
     );
     serial_println!(
-        ":: HDA-TONE: lpib_advanced={} bcis={} tag_ok={} fifo_ready={} run_ms={} -> {} ::",
-        advanced as u8, bcis, tag_ok as u8, fifo_ready, run_ms,
+        ":: HDA-TONE: lpib_advanced={} walked={} wraps={} bcis={} tag_ok={} fifo_ready={} run_ms={} members={} -> {} ::",
+        advanced as u8, walked as u8, wraps, bcis, tag_ok as u8, fifo_ready, run_ms, np,
         if ok { "PASS" } else { "FAIL" }
     );
     a.line("tone");
