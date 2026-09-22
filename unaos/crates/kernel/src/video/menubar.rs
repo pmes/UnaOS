@@ -47,6 +47,7 @@
 //! | top bevel | — | [`theme::BEVEL_LIGHT`], [`theme::BEVEL`] px |
 //! | CRYSTAL, leftmost | UnaOS's brand mark (Peter, *"instead of an apple do a small crystal"*) | the kit's blue gem ramp, [`theme::CONTROL_CLOSE`]/`_MID`/`_ZOOM` |
 //! | title, right of crystal | the FOCUSED window's caption, via `wm::dock_scan` | [`theme::TITLE_TEXT_ACTIVE`] |
+//! | battery, right of the menus and LEFT of the clock | MENUSTAT — [`super::status::bar_item`], the desktop STATUS MODEL. An outlined cell filled in proportion to the charge, a lightning mark while current flows in, and the percent right-aligned in a fixed slot. ABSENT entirely when the board has no battery source, which is QEMU, the Pi and the Orin — and absent because it was MEASURED absent, not because it was compiled out | outline + percent [`theme::TITLE_TEXT_INACTIVE`] (the clock's ink — the status area is glanced at); fill [`theme::TITLE_TEXT_ACTIVE`]; the bolt is the INVERSE of whatever is under it |
 //! | clock, right | [`crate::clock::try_unix_now`], UTC `HH:MM` | [`theme::TITLE_TEXT_INACTIVE`] |
 //!
 //! **The bar's one press target is the CRYSTAL.** This module still registers nothing with the click
@@ -199,6 +200,70 @@ const CLOCK_GLYPHS: usize = 5;
 const TITLE_GLYPHS: usize = wm::MAX_TITLE;
 
 // ---------------------------------------------------------------------------
+// MENUSTAT — the STATUS AREA, right end, beside the clock.
+//
+// Peter's direction for this surface is the Mac clone (LAWS §6, R25): the right end of the bar
+// carries the status items, and the bar has drawn the UTC clock there since it was written. The
+// first item beside it is the BATTERY, and it goes to the clock's LEFT, which is where a Mac puts
+// it.
+//
+// ⛔ **THE FLOORS DO NOT MOVE, AND THAT IS A CONSTRAINT AND NOT AN OMISSION.** [`FLOOR_W`] reserves
+// the crystal's slot, one title glyph and the clock. Adding the item's width to it would take the
+// BAR off every panel between the old floor and the new one — on machines that may have no battery
+// at all — and would move the `floor=` term on `:: MENUBAR:`, which is a menubar line a spec can
+// pin. So the item is laid out INSIDE the existing floors by [`batt_slot`], from the same two terms
+// the clock is placed by, and is simply not drawn on a panel that cannot seat it beside the clock
+// with a title glyph left over. Same terms, same PAD, no new floor.
+//
+// The crystal's position is R25's and is unreachable from here BY CONSTRUCTION: every number in
+// this block is measured from the bar's RIGHT edge inward, and `TITLE_X0`/`CRYSTAL_SLOT` appear in
+// [`batt_slot`] only as the floor the item must not cross.
+// ---------------------------------------------------------------------------
+
+/// The battery cell's body width, px — [`theme::CONTROL_BOX`], so the item reads as the same
+/// size-family as the crystal and the window controls. No new metric is invented; the kit's one
+/// control dimension is the source for all three.
+const BATT_BODY_W: usize = theme::CONTROL_BOX;
+/// The cell's body height, px — half the control box. A battery reads WIDER than tall, which is
+/// [`CRYSTAL_W`]'s proportion rule applied to a lying-down shape.
+const BATT_BODY_H: usize = theme::CONTROL_BOX / 2;
+/// The positive terminal's nub, px — the columns past the body's right edge that make the outline
+/// read as a battery rather than as a progress bar.
+const BATT_CAP_W: usize = 2;
+/// The nub's height, px — a third of the body, centred on it.
+const BATT_CAP_H: usize = BATT_BODY_H / 3;
+/// The whole drawn glyph's width, px: body plus nub.
+const BATT_GLYPH_W: usize = BATT_BODY_W + BATT_CAP_W;
+/// The percent text's slot, in glyphs — `100%` is the longest string it can hold, and the text is
+/// RIGHT-ALIGNED inside it (`  5%`, ` 82%`, `100%`). The fixed slot is why the glyph's x never moves
+/// when the charge crosses 10 % or 100 %: a status item that shifted its own parts every time a
+/// digit appeared would be MENUOWN's variable gap, one surface over.
+const BATT_PCT_GLYPHS: usize = 4;
+/// The gap between the glyph and its percent, px — half a [`strip::PAD`]. They are ONE item, so the
+/// space inside it must read as smaller than the PAD separating the item from the clock.
+const BATT_GAP: usize = strip::PAD / 2;
+/// The whole item's width, px. The number the layout is built from and the number the ledger records.
+const BATT_ITEM_W: usize = BATT_GLYPH_W + BATT_GAP + BATT_PCT_GLYPHS * CELL_W;
+
+/// The charging mark's box, px.
+const BOLT_W: usize = 5;
+/// See [`BOLT_W`].
+const BOLT_H: usize = 8;
+/// The charging mark — a lightning bolt, 5x8, MSB leftmost. Drawn as the INVERSE of whatever is
+/// under it (see [`draw_battery_glyph`]), which is the one rule that keeps it legible at 3 % and at
+/// 97 % without inventing a third ink for it.
+const BOLT: [u8; BOLT_H] = [
+    0b00011, //
+    0b00110, //
+    0b01100, //
+    0b11111, //
+    0b00110, //
+    0b01100, //
+    0b11000, //
+    0b10000, //
+];
+
+// ---------------------------------------------------------------------------
 // The brand CRYSTAL — the leftmost mark, where macOS puts its logo.
 //
 // Peter's ruling, 2026-08-11: *"instead of an apple do a small crystal"*. UnaOS's identity is
@@ -335,6 +400,27 @@ const _: () = {
     // own menu. The horizontal half is the load-bearing one; vertical containment is the bevel assert.
     // The cell starts at 0 and the glyph at PAD, so the glyph's RIGHT edge is what must fit.
     assert!(strip::PAD + CRYSTAL_W <= CRYSTAL_SLOT);
+
+    // MENUSTAT — the status item's silhouette must be drawable inside the bar it sits in, and the
+    // charging mark inside the cell it sits in. These are build-time because they are statements
+    // about CONSTANTS: a metric change that would draw the cell through the bar's keyline, or the
+    // bolt through the cell's outline, fails the build rather than painting it once on the glass.
+    assert!(BATT_BODY_H + 2 * theme::BEVEL <= BAR_H);
+    assert!(BATT_BODY_H >= 4); // an outline, a fill row and an outline
+    assert!(BATT_CAP_H > 0 && BATT_CAP_H < BATT_BODY_H);
+    // The bolt lives INSIDE the 1-px outline on all four sides, so it can never erase the cell's
+    // own edge — the falsifier for the "inverse of whatever is under it" rule, which is only safe
+    // while "under it" is fill or face and never outline.
+    assert!(BOLT_H + 2 <= BATT_BODY_H);
+    assert!(BOLT_W + 2 <= BATT_BODY_W);
+    // `100%` must fit the slot the percent is right-aligned in, or a full pack would be truncated.
+    assert!(BATT_PCT_GLYPHS >= 4);
+    // ⛔ THE FLOORS ARE NOT WIDENED: the item is NOT part of `FLOOR_W`. This asserts the consequence
+    // that matters — on the floor panel the bar still seats the crystal, a title glyph and the clock
+    // WITHOUT the item, which is the state `batt_slot` declines into rather than shrinking anything.
+    // If a future edit folds `BATT_ITEM_W` into `FLOOR_W`, this assert stops meaning what it says and
+    // the reader is sent to `batt_slot` to find out which rule changed.
+    assert!(FLOOR_W == 2 * strip::PAD + CRYSTAL_SLOT + (CLOCK_GLYPHS + 1) * CELL_W);
 };
 
 // ---------------------------------------------------------------------------
@@ -760,6 +846,17 @@ struct Model {
     /// WINMENU — the title boxes, laid out once per compose and handed to the row painter. Filled in
     /// by [`compose`] after the rect is settled, because the layout is a function of the bar rect.
     menus: super::winmenu::BarSnapshot,
+    /// MENUSTAT — **the battery status item**, or `None` when this board has no battery source
+    /// (QEMU, the Pi, the Orin) or the held reading has gone stale. Taken from [`super::status`],
+    /// which is the whole reason this field is not a driver call: `drivers::smc` is x86-only and
+    /// this file is compiled on the Pi.
+    ///
+    /// ⛔ **It is [`super::status::BarItem`] and not [`super::status::Battery`], and the difference
+    /// is the repaint discipline.** Only what is DRAWN — the percent and the charge state — is in
+    /// the model, so only what is drawn is in [`signature`](Self::signature). The minutes, the
+    /// current, the voltage and the age are on the wire and nowhere near the damage test, which is
+    /// what keeps the bar's `paints=` flat while the meter ticks at 10 s.
+    batt: Option<super::status::BarItem>,
 }
 
 impl Model {
@@ -771,6 +868,7 @@ impl Model {
             menu_owner: wm::WIN_NONE,
             cap_owner: wm::WIN_NONE,
             menus: super::winmenu::BarSnapshot::empty(),
+            batt: None,
         }
     }
 
@@ -824,6 +922,14 @@ impl Model {
         // out no tenant titles, which is exactly what a Mac shows for an app with no menus of its
         // own — and is what `render9` should have shown while `console` and `quarry` held focus.
         m.menu_owner = if super::winmenu::has_tree(m.cap_owner) { m.cap_owner } else { wm::WIN_NONE };
+        // MENUSTAT — the battery item, gathered with the rest of the model and from the same rule:
+        // everything the painter reads is read ONCE, here. It is three relaxed atomic loads and a
+        // clock read (`super::status::bar_item`) — no lock, no port, no allocation — which is the
+        // only shape allowed at this seam: `compose` runs masked inside `strip::compose_all`, and
+        // the SMC transaction that produced this number ran ten seconds ago on the device-service
+        // task (`super::status::poll`). A bar that read the SMC here would wait on six bounded
+        // handshakes with interrupts off.
+        m.batt = super::status::bar_item();
         m.clock = clock_hhmm(); #[cfg(feature = "sntp6")] if m.clock.is_none() { barclock_note(None); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the UNSYNCED half of the bar's clock witness, latched to one line per boot at the file tail. It is reported from the MODEL, not the painter, because the painter's clock branch never runs when there is nothing to draw — which is precisely the state this half exists to say aloud.
         (m, clobbered)
     }
@@ -857,6 +963,22 @@ impl Model {
         // as long as the caption and the clock happened not to move, which on a quiet desktop is
         // minutes. (The two lists are the same list on purpose — this function's own rule.)
         h = strip::fnv1a_u64(h, self.menus.signature());
+        // MENUSTAT — **the status item's DRAWN state, and nothing else.** This is the whole of the
+        // repaint discipline the brief asked to be measured, and it is enforced by what the model
+        // carries rather than by care here: `batt` is a `BarItem`, so the only things that CAN be
+        // folded are the percent and the charge state. The minutes, the current, the voltage and
+        // the age are not in this struct, so a 10 s poll that moves them cannot reach this hash and
+        // cannot cost a repaint — while a percent tick or a bolt appearing must, because the glass
+        // would otherwise be wrong. (The fixture's `jitter_paint`/`change_paint` legs measure both
+        // halves against `compose`'s own return value.)
+        match self.batt {
+            Some(b) => {
+                h = strip::fnv1a(h, 1);
+                h = strip::fnv1a(h, b.percent as u8);
+                h = strip::fnv1a(h, b.charging as u8);
+            }
+            None => h = strip::fnv1a(h, 0),
+        }
         strip::seal(h)
     }
 }
@@ -987,6 +1109,12 @@ pub fn compose() -> bool {
     LEDGER.tick("menubar", format_args!("press=crystal crystal={}x{} clob={} toggles={} off_passes={}",
         CRYSTAL_W, CRYSTAL_H, CLOBBERS.load(Ordering::Relaxed),
         TOGGLES.load(Ordering::Relaxed), OFF_PASSES.load(Ordering::Relaxed)));
+    // MENUSTAT — the status area's own line, beside the cost ledger's and on its cadence. A SIBLING
+    // line rather than terms appended to the one above, for the reason PTRINSTALL records at
+    // `main.rs`: the ledger's tail is the tenant's COST vocabulary and the status item is not a
+    // cost, and a reader grepping `[menubar] battery` should get one line per interval with only
+    // the battery on it.
+    battery_witness();
 
     // The damage conditions, in the order the dock states them: a signature that MATCHES and a pass
     // that did not touch the strip is the common case and returns here having read no pixel.
@@ -1065,6 +1193,104 @@ fn menurow_witness(m: &Model) {
         m.menus.n,
         m.menus.items()
     );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// MENUSTAT — THE STATUS AREA ON THE WIRE
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// The cycle stamp of the last `[menubar] battery` line, `0` = never.
+static BATT_WIRE_LAST: AtomicU64 = AtomicU64::new(0);
+/// Whether the ABSENT statement has been made. Once a boot: "this machine has no battery" is a
+/// fixed fact, and a fixed fact repeated every five seconds is the SO30 defect that ate 36 % of a
+/// boot's wire.
+static BATT_ABSENT_SAID: AtomicBool = AtomicBool::new(false);
+/// The status line's period. Five seconds, which is [`strip::Ledger`]'s `ROLLUP_PERIOD_US` and
+/// `wm`'s `WCN_ROLLUP_MS` — restated here because that constant is private to `strip` and `strip`
+/// is not this lane's file. It is the same number for the same reason: a capture should carry the
+/// bar's cost line and the bar's status line in one interval so they can be read side by side.
+const BATT_WIRE_US: u64 = 5_000_000;
+
+/// `mins=` — the minutes-to-full field, or `-` when the SMC offers no estimate (which it does not
+/// while discharging). A `Display` adapter rather than two near-identical `serial_println!` arms,
+/// so the line's format string exists exactly once and the two states cannot drift apart.
+struct Mins(Option<u16>);
+
+impl core::fmt::Display for Mins {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(m) => write!(f, "{}", m),
+            None => f.write_str("-"),
+        }
+    }
+}
+
+/// MENUSTAT — **the status area's reading, ON THE WIRE.**
+///
+/// UNGATED, for `menurow_witness`'s reason and it is the same reason: the metal image is built
+/// WITHOUT `witness`, Peter's captures come off metal, and an instrument absent from the artifact he
+/// flies is not an instrument. It is affordable because it is rate-limited to one line per
+/// [`BATT_WIRE_US`] — one relaxed load per composite in the steady state.
+///
+/// Two shapes, and the second is the one a gate boot prints:
+///
+///  * `[menubar] battery pct=82 charging=y mins=106 age_s=3 src=smc mv=12311 ma=1014 polls=4/4` —
+///    a live reading. `age_s` is how long ago the poll that produced it landed, which is the
+///    falsifier for the BATMON-HOLD rule at this layer: a held reading is visible AS held instead of
+///    looking fresh. `polls=answers/attempts` separates "the service never ran" from "it ran and the
+///    SMC said nothing".
+///  * `[menubar] battery absent src=none` — ONCE. This is what QEMU prints, and printing it is the
+///    point: `isa-applesmc` answers `REV`/`OSK0` and carries no battery key, so the absence is
+///    MEASURED and says so, rather than the item being compiled out and the boot being silent about
+///    a question it did answer.
+///
+/// An `Unresolved` source says NOTHING. The desktop service has not swept yet, and a line claiming
+/// absence before anything asked would be the same defect in the other direction.
+fn battery_witness() {
+    match super::status::reading() {
+        Some((b, age_ms)) => {
+            let now = crate::arch::now_cycles();
+            let last = BATT_WIRE_LAST.load(Ordering::Relaxed);
+            if last != 0 && strip::cycles_to_us(now.saturating_sub(last)) < BATT_WIRE_US {
+                return;
+            }
+            // The same `compare_exchange` `Ledger::tick` uses, for its reason: two cores must not
+            // print one interval twice, and a loser simply skips.
+            if BATT_WIRE_LAST
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                return;
+            }
+            let (polls, answers) = super::status::counts();
+            serial_println!(
+                "[menubar] battery pct={} charging={} mins={} age_s={} src={} mv={} ma={} polls={}/{}",
+                b.percent,
+                if b.charging { "y" } else { "n" },
+                Mins(b.minutes),
+                age_ms / 1000,
+                super::status::source().as_str(),
+                b.mv,
+                b.ma,
+                answers,
+                polls
+            );
+        }
+        None => {
+            let src = super::status::source();
+            if src == super::status::Source::Unresolved {
+                return; // nothing has asked yet — see the doc comment
+            }
+            if BATT_ABSENT_SAID.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            // `src=none` on a board with no battery source, which is every gate boot. It can also
+            // read `src=smc` — a source that answered and has since gone past `status::STALE_MS`,
+            // i.e. a pack removed or an SMC that stopped answering for a minute. Both are "the item
+            // is not on the glass", and the term says which.
+            serial_println!("[menubar] battery absent src={}", src.as_str());
+        }
+    }
 }
 
 /// The crystal's box-relative top-left in the bar: **one [`strip::PAD`] from the left**, centred
@@ -1162,7 +1388,74 @@ pub fn caption_x0() -> usize {
 pub fn menus_right_limit(bar: strip::Rect) -> usize {
     let (bx, _by, bw, _bh) = bar;
     let need = 2 * strip::PAD + CLOCK_GLYPHS * CELL_W;
+    // MENUSTAT — the limit is the STATUS AREA's left edge, not the clock's. This function's own
+    // rule is that "a title can never be laid out under the time"; the battery item is the same
+    // claim about the same rows, and the moment a second item exists the clock stops being the
+    // leftmost thing out here. Derived from [`batt_slot`] — the SAME function the painter places
+    // the item with — rather than from a restated arithmetic, so a title box and the cell it must
+    // not sit under have one definition between them.
+    //
+    // It is a function of RUNTIME state (is there an item), which is new for this accessor and is
+    // accounted for: `Model::signature` folds the item's presence, so an item appearing or going
+    // absent repaints the bar and re-lays the titles in the same pass.
+    if super::status::bar_item().is_some() {
+        if let Some(x0) = batt_slot(bw) {
+            return bx + x0.saturating_sub(strip::PAD);
+        }
+    }
     bx + bw.saturating_sub(need)
+}
+
+/// **The CLOCK's left inset inside a bar `w` px wide**, or `None` when the bar is too narrow to
+/// draw one — [`compose_row`]'s own test, lifted so it has ONE definition.
+///
+/// MENUSTAT lifted it because three sites now need the same number and two of them are new: the
+/// painter (which always had it inline), [`batt_slot`] (which places the status item one PAD to its
+/// left) and [`battery_selftest`]'s layout leg (which asserts the clock's rect does not move when
+/// the item appears). Three copies of `w - PAD - CLOCK_GLYPHS * CELL_W` is how the clock ends up in
+/// two places at once.
+#[inline]
+fn clock_slot(w: usize) -> Option<usize> {
+    let cw = CLOCK_GLYPHS * CELL_W;
+    if w > cw + strip::PAD { Some(w - strip::PAD - cw) } else { None }
+}
+
+/// The clock's rect on the PANEL — `(x, y, w, h)`, absolute — or `None` when no clock is drawn.
+///
+/// For the fixture: the falsifier for *"the status item did not move the clock"*. It is a function
+/// of the bar rect and [`clock_slot`] alone and mentions the battery nowhere, which is the reason
+/// the claim holds — but a claim that holds BY CONSTRUCTION still has to be readable off a capture,
+/// and this is what puts it there.
+#[cfg(feature = "witness")]
+fn clock_rect(r: strip::Rect) -> Option<(usize, usize, usize, usize)> {
+    let (rx, ry, w, h) = r;
+    let x0 = clock_slot(w)?;
+    Some((rx + x0, ry + (h - CELL_H) / 2, CLOCK_GLYPHS * CELL_W, CELL_H))
+}
+
+/// MENUSTAT — **the battery item's left inset inside a bar `w` px wide**, or `None` when the bar
+/// cannot seat it.
+///
+/// One [`strip::PAD`] left of the clock — the same gap the clock keeps from the bar's right edge,
+/// so the two items in the status area are spaced by the kit's one number and not by a second one
+/// invented for this row.
+///
+/// ⛔ **The decline is the floor rule, and it is why [`FLOOR_W`] did not have to move.** The item
+/// yields on a panel that cannot seat it: not enough width for the clock at all, not enough to put
+/// a PAD and the item to its left, or not enough left over for the caption's first glyph past
+/// [`TITLE_X0`]. On the floor panel the bar therefore still draws exactly what it drew before this
+/// arc — crystal, a title glyph, the clock — and the item is the thing that is absent, which is the
+/// same yielding discipline `FLOOR_H` already states between the bar and the dock.
+///
+/// It does NOT ask whether there IS a battery: this is geometry. [`compose_row`] and
+/// [`menus_right_limit`] pair it with [`super::status::bar_item`], so "no source" and "no room" stay
+/// two separate facts with two separate answers.
+fn batt_slot(w: usize) -> Option<usize> {
+    let x0 = clock_slot(w)?.checked_sub(strip::PAD + BATT_ITEM_W)?;
+    if x0 < TITLE_X0 + CELL_W {
+        return None;
+    }
+    Some(x0)
 }
 
 /// **THE ONE transient-dropdown accessor** — the rect of whichever menu is currently down, or `None`.
@@ -1225,6 +1518,88 @@ fn crystal_facet(u: usize, v: usize) -> Option<u32> {
     })
 }
 
+/// MENUSTAT — compose the battery GLYPH into row `j` of the bar: an outlined cell whose fill is
+/// proportional to the charge, with a lightning mark when current is flowing in.
+///
+/// Called from [`compose_row`] ABOVE the text-band early return, for the crystal's reason: the cell
+/// is centred in the whole bar and spans rows the glyph band never touches. The percent TEXT is
+/// drawn in the band, beside the clock, from the same [`batt_slot`].
+///
+/// # The inks, and why no palette is invented
+///
+/// The status area is SECONDARY chrome — the clock is already drawn in
+/// [`theme::TITLE_TEXT_INACTIVE`] on exactly that argument ("the title is what the operator is
+/// reading, the clock is what they glance at"), and the battery is the same kind of fact. So the
+/// outline and the percent take that ink, and the FILL takes [`theme::TITLE_TEXT_ACTIVE`] — the
+/// bar's primary — because the fill is the one part of the item that carries the measurement. Two
+/// roles the bar already draws with; nothing new.
+///
+/// # ⛔ The bolt is the INVERSE of what is under it
+///
+/// A charging mark in one fixed ink is legible over exactly one of the two backgrounds it can land
+/// on. At 97 % the bolt sits on FILL (dark); at 3 % it sits on the bar's FACE showing through the
+/// empty cell (light). So the bolt is drawn in [`theme::BEVEL_LIGHT`] over filled columns and in
+/// the fill ink over empty ones — one rule, both cases, no third colour. The build-time asserts on
+/// [`BOLT_W`]/[`BOLT_H`] keep it strictly inside the outline, which is what makes "whatever is under
+/// it" mean fill-or-face and never the cell's own edge.
+fn draw_battery_glyph(out: &mut [u32], w: usize, h: usize, j: usize, x0: usize, it: super::status::BarItem) {
+    let by0 = (h - BATT_BODY_H) / 2;
+    if j < by0 || j >= by0 + BATT_BODY_H {
+        return;
+    }
+    let v = j - by0;
+    let outline = theme::TITLE_TEXT_INACTIVE;
+    let ink = theme::TITLE_TEXT_ACTIVE;
+    // The fill, in columns of the cell's INTERIOR (the outline takes one column each side). Integer
+    // arithmetic, no float — the crystal's discipline. `percent` is already clamped at the decode
+    // (`status::decode`), so this can never exceed the interior.
+    let inner = BATT_BODY_W - 2;
+    let fill = inner * (it.percent.min(100) as usize) / 100;
+    let edge_row = v == 0 || v + 1 == BATT_BODY_H;
+    for u in 0..BATT_BODY_W {
+        let c = if edge_row || u == 0 || u + 1 == BATT_BODY_W {
+            outline
+        } else if u - 1 < fill {
+            ink
+        } else {
+            continue; // the empty part of the cell keeps the bar's own face
+        };
+        let i = x0 + u;
+        if i < w {
+            out[i] = c;
+        }
+    }
+    // The positive terminal's nub, centred on the body.
+    let ny = (BATT_BODY_H - BATT_CAP_H) / 2;
+    if v >= ny && v < ny + BATT_CAP_H {
+        for u in 0..BATT_CAP_W {
+            let i = x0 + BATT_BODY_W + u;
+            if i < w {
+                out[i] = outline;
+            }
+        }
+    }
+    if !it.charging {
+        return;
+    }
+    let bx = (BATT_BODY_W - BOLT_W) / 2;
+    let byy = (BATT_BODY_H - BOLT_H) / 2;
+    if v < byy || v >= byy + BOLT_H {
+        return;
+    }
+    let row = BOLT[v - byy];
+    for u in 0..BOLT_W {
+        if row & (1 << (BOLT_W - 1 - u)) == 0 {
+            continue;
+        }
+        let cell = bx + u;
+        let i = x0 + cell;
+        if i < w {
+            out[i] = if cell - 1 < fill { theme::BEVEL_LIGHT } else { ink };
+        }
+    }
+}
+
 /// Compose panel row `j` of the bar into `out[0..w]` as logical `0x00RRGGBB` colours.
 ///
 /// A field pass (face, bevel, keyline), then the brand CRYSTAL overlaid at its left inset, then the two
@@ -1265,6 +1640,16 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
         }
     }
 
+    // MENUSTAT — the battery CELL, at its slot left of the clock. Before the text-band return for
+    // the crystal's reason: the cell is centred in the bar, not in the glyph band. Two `Option`s and
+    // no item is drawn unless BOTH answer — `m.batt` is *does this board have a battery*
+    // ([`super::status`]'s measured answer, `None` on QEMU, the Pi and the Orin) and [`batt_slot`]
+    // is *can this panel seat it*. Keeping them apart is what makes "absent" one fact with two
+    // distinguishable causes instead of one silent blank.
+    if let (Some(it), Some(bx0)) = (m.batt, batt_slot(w)) {
+        draw_battery_glyph(out, w, h, j, bx0, it);
+    }
+
     // The two texts share a baseline: vertically centred in the bar.
     let ty0 = (h - CELL_H) / 2;
 
@@ -1302,14 +1687,38 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     let cap_ink = if m.menus.app_open() { theme::BEVEL_LIGHT } else { theme::TITLE_TEXT_ACTIVE };
     super::font::draw_row(out, w, &m.title[..cols], TITLE_X0, sy, cap_ink, BOLD, FACE);
 
+    // MENUSTAT — the battery's PERCENT, right-aligned in its fixed [`BATT_PCT_GLYPHS`] slot so the
+    // cell beside it never moves when a digit appears or goes. Secondary ink, the clock's: the
+    // whole status area is glanced at, not read. Drawn from the SAME [`batt_slot`] the cell was, so
+    // the two halves of one item cannot drift apart.
+    if let (Some(it), Some(bx0)) = (m.batt, batt_slot(w)) {
+        let mut pct = [b' '; BATT_PCT_GLYPHS];
+        let p = it.percent.min(100);
+        pct[BATT_PCT_GLYPHS - 1] = b'%';
+        if p >= 100 {
+            pct[BATT_PCT_GLYPHS - 4] = b'1';
+            pct[BATT_PCT_GLYPHS - 3] = b'0';
+            pct[BATT_PCT_GLYPHS - 2] = b'0';
+        } else if p >= 10 {
+            pct[BATT_PCT_GLYPHS - 3] = b'0' + (p / 10) as u8;
+            pct[BATT_PCT_GLYPHS - 2] = b'0' + (p % 10) as u8;
+        } else {
+            pct[BATT_PCT_GLYPHS - 2] = b'0' + p as u8;
+        }
+        let tx = bx0 + BATT_GLYPH_W + BATT_GAP;
+        super::font::draw_row(out, w, &pct, tx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
+    }
+
     // Clock, right, at one PAD from the far edge — the crystal holds the LEFT corner, so nothing of
     // the brand sits out here. Secondary ink: the title is what the operator is reading, the clock is
     // what they glance at.
-    if let Some(c) = m.clock {
-        let cw = CLOCK_GLYPHS * CELL_W;
-        if w > cw + strip::PAD {
-            super::font::draw_row(out, w, &c, w - strip::PAD - cw, sy, theme::TITLE_TEXT_INACTIVE, false, FACE); #[cfg(feature = "sntp6")] barclock_note(Some((w - strip::PAD - cw, ty0, cw, CELL_H))); // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the SET half, reported from the one place that knows the clock's DRAWN rect. `compose_row` runs once per row per pass, so this call is on the compositor cadence and the latch at the file tail — not this site — is what makes it one line per boot (SO30).
-        }
+    // MENUSTAT — the two-line test that stood here (`let cw = …; if w > cw + strip::PAD`) is now
+    // [`clock_slot`], because the status item has to be placed one PAD to the LEFT of exactly this
+    // x and a second copy of `w - PAD - CLOCK_GLYPHS * CELL_W` is how a clock ends up in two places
+    // at once. Same arithmetic, same guard, one definition — and it is the definition the fixture's
+    // `clock=` term and [`batt_slot`] both read.
+    if let (Some(c), Some(cx)) = (m.clock, clock_slot(w)) {
+        super::font::draw_row(out, w, &c, cx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE); #[cfg(feature = "sntp6")] barclock_note(Some((cx, ty0, CLOCK_GLYPHS * CELL_W, CELL_H))); // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the SET half, reported from the one place that knows the clock's DRAWN rect. `compose_row` runs once per row per pass, so this call is on the compositor cadence and the latch at the file tail — not this site — is what makes it one line per boot (SO30).
     }
 }
 
@@ -1549,7 +1958,158 @@ pub fn selftest() {
         }
     }
 
+    // MENUSTAT — the status area's own fixture, LAST and in its own function. Last because it
+    // drives `compose` with injected readings and must not perturb the census legs above; its own
+    // function because it is a separate claim with a separate verdict line, and a leg folded into
+    // `:: MENUBAR:` would have made a decode defect read as a geometry failure.
+    battery_selftest(pw, ph);
+
     rollup("selftest");
+}
+
+/// MENUSTAT fixture — **the battery item decodes flight 11's bytes, does not move the clock, and
+/// does not repaint the bar when nothing it draws has changed.**
+///
+/// Six legs, each able to fail on its own, and the first two are a pair: a PASS leg that can only be
+/// trusted because the RED leg beside it proves the decoder is what produced it.
+///
+/// 1. **the decode** — the nine byte strings `:: SMC-SCOUT:` printed at 25627–25629 ms on flight 11
+///    (`BNum=[01] BRSC=[00 52] B0St=[00 80] B0AC=[03 f6] B0AV=[30 17] B0TF=[00 6a]`, with
+///    `B0FC=[26 ea]`/`B0RM=[1f e0]` as the corroboration) fed to [`super::status::decode`] verbatim
+///    must yield **82 %, charging, 106 min, 12311 mV, +1014 mA**. Hardware facts, off the wire, used
+///    as such.
+/// 2. ⛔ **the GO-RED** — the same bytes through the same decoder with its byte order swapped
+///    ([`super::status::set_byte_swap`], the injection inside `be16`). It must NOT yield 82 %. This
+///    is what stops leg 1 being a tautology: without it the leg would pass on a decoder that ignored
+///    its arguments and returned the constants this comment names.
+/// 3. **absence decodes as absence** — no keys at all (QEMU's `isa-applesmc`) and `BNum=[00]` (a
+///    machine whose SMC reports zero packs) both answer `None`. The honest empty state is reachable,
+///    not merely intended.
+/// 4. ⛔ **the CLOCK DOES NOT MOVE** — [`clock_rect`] is identical with the item injected present
+///    and injected absent, and so are [`caption_x0`] and [`geometry`]. This is the leg the brief
+///    named: the crystal's position is R25's, the caption's inset is SO3's, and the clock's is this
+///    file's, and a status item that paid for its slot out of any of them would be taking a rule's
+///    pixels to draw a convenience.
+/// 5. **the item is seated where the layout says** — [`batt_slot`] is one PAD left of the clock and
+///    clear of the caption's first glyph. The numbers go on the line so a capture and the ledger row
+///    can be checked against each other.
+/// 6. ⛔ **the repaint discipline, MEASURED** — `compose()` returns `true` iff it painted, so the
+///    claim is read directly off the composite rather than inferred. A reading whose minutes,
+///    current and voltage move but whose percent and charge state do not must paint NOTHING
+///    (`jitter_paint=false`); a percent change must paint (`change_paint=true`). The positive half
+///    is a control: without it a bar that had stopped painting altogether would pass the first half.
+///
+/// The model's state is snapshotted and restored, so a boot whose SMC had already answered gets its
+/// reading back and the fixture cannot leave a synthetic battery on the operator's glass.
+#[cfg(feature = "witness")]
+pub fn battery_selftest(pw: usize, ph: usize) {
+    use super::status;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    // Flight 11, 2026-09-.. at 25627–25629 ms — the bytes, not a transcription of their meaning.
+    const F11_BNUM: Option<u8> = Some(0x01);
+    const F11_BRSC: Option<[u8; 2]> = Some([0x00, 0x52]);
+    const F11_B0ST: Option<[u8; 2]> = Some([0x00, 0x80]);
+    const F11_B0AC: Option<[u8; 2]> = Some([0x03, 0xf6]);
+    const F11_B0AV: Option<[u8; 2]> = Some([0x30, 0x17]);
+    const F11_B0TF: Option<[u8; 2]> = Some([0x00, 0x6a]);
+    let want = status::Battery { percent: 82, charging: true, minutes: Some(106), ma: 1014, mv: 12311 };
+
+    // Leg 1 — the decode.
+    let got = status::decode(F11_BNUM, F11_BRSC, F11_B0ST, F11_B0AC, F11_B0AV, F11_B0TF);
+    let decode_ok = got == Some(want);
+    let (gp, gc, gm, gv, ga) = match got {
+        Some(b) => (b.percent, b.charging, b.minutes.unwrap_or(0), b.mv, b.ma),
+        None => (0, false, 0, 0, 0),
+    };
+
+    // Leg 2 — the go-red, through the SAME call with the fault armed.
+    status::set_byte_swap(true);
+    let red = status::decode(F11_BNUM, F11_BRSC, F11_B0ST, F11_B0AC, F11_B0AV, F11_B0TF);
+    status::set_byte_swap(false);
+    let red_pct = red.map(|b| b.percent).unwrap_or(0);
+    let gone_red = red != Some(want) && red_pct != want.percent;
+
+    // Leg 3 — absence.
+    let absent_ok = status::decode(None, None, None, None, None, None).is_none()
+        && status::decode(Some(0), F11_BRSC, F11_B0ST, F11_B0AC, F11_B0AV, F11_B0TF).is_none()
+        // a partial sweep is not a reading: no percent, no item (the caller HOLDS instead)
+        && status::decode(F11_BNUM, None, F11_B0ST, F11_B0AC, F11_B0AV, F11_B0TF).is_none();
+
+    // Legs 4-6 need the bar present and the model drivable. Everything below restores what it found.
+    let saved_model = status::snapshot_state();
+    let saved_en = enabled();
+    set_enabled(true);
+    let r = strip_rect(pw, ph);
+
+    // Leg 4 — the clock, the caption and the floors, with the item absent and present.
+    status::inject(None);
+    let (clk_a, cap_a, geo_a) = (r.and_then(clock_rect), caption_x0(), geometry(pw, ph));
+    status::inject(Some(want));
+    let (clk_b, cap_b, geo_b) = (r.and_then(clock_rect), caption_x0(), geometry(pw, ph));
+    let layout_ok = clk_a == clk_b && cap_a == cap_b && geo_a == geo_b && clk_b.is_some();
+
+    // Leg 5 — where the item sits, from the same accessors the painter uses.
+    let bw = r.map(|(_, _, w, _)| w).unwrap_or(0);
+    let slot = batt_slot(bw);
+    let clock_x = clock_slot(bw).unwrap_or(0);
+    let seat_ok = match slot {
+        Some(x0) => x0 + BATT_ITEM_W + strip::PAD == clock_x && x0 >= TITLE_X0 + CELL_W,
+        None => false,
+    };
+
+    // Leg 6 — the repaint discipline. `compose` returns `true` iff it painted.
+    let _ = compose(); // settle: this pass owes the item it has just been given
+    let _ = compose(); // and the signature is now stored
+    status::inject(Some(status::Battery { percent: 82, charging: true, minutes: Some(99), ma: 1041, mv: 12290 }));
+    let jitter_paint = compose();
+    status::inject(Some(status::Battery { percent: 83, ..want }));
+    let mut change_paint = false;
+    for _ in 0..4 {
+        // A pass can decline for reasons that have nothing to do with damage (a contended panel, a
+        // busy winmenu registry — both return `false` and re-ask next composite), so the POSITIVE
+        // control is given the retries the negative one must not have.
+        if compose() {
+            change_paint = true;
+            break;
+        }
+    }
+    let damage_ok = !jitter_paint && change_paint;
+
+    status::restore_state(saved_model);
+    set_enabled(saved_en);
+
+    let (cx, cy, cw2, ch) = clk_b.unwrap_or((0, 0, 0, 0));
+    let ok = decode_ok && gone_red && absent_ok && layout_ok && seat_ok && damage_ok;
+    serial_println!(
+        ":: MENUBATT: pct={} charging={} mins={} mv={} ma={} b0st=0x{:02x}{:02x} \
+         item_w={} glyph={}x{} gap={} pct_glyphs={} batt_x={} clock={}x{}+{}+{} caption_x0={} \
+         floor={}x{} red_pct={} decode_ok={} gone_red={} absent_ok={} layout_ok={} seat_ok={} \
+         jitter_paint={} change_paint={} damage_ok={} :: {} ::",
+        gp,
+        if gc { "y" } else { "n" },
+        gm,
+        gv,
+        ga,
+        F11_B0ST.unwrap_or([0, 0])[0],
+        F11_B0ST.unwrap_or([0, 0])[1],
+        BATT_ITEM_W,
+        BATT_GLYPH_W,
+        BATT_BODY_H,
+        BATT_GAP,
+        BATT_PCT_GLYPHS,
+        match slot { Some(x) => x as i64, None => -1 },
+        cw2, ch, cx, cy,
+        cap_b,
+        FLOOR_W, FLOOR_H,
+        red_pct,
+        decode_ok, gone_red, absent_ok, layout_ok, seat_ok,
+        jitter_paint, change_paint, damage_ok,
+        if ok { "PASS" } else { "FAIL" }
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════════
