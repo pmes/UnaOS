@@ -193,6 +193,52 @@ FORBID :: SERIALDOOR: .* :: SKIP ::
 # --- ever re-shaped rather than matching a prefix that happens to survive.
 REQUIRE \[wpace\] win=\d+ asid=0x[0-9a-f]+ live=(yes|no) mode=panel .* spin=\d+ wedge=\d+ frame_us=\d+
 
+# --- VUGPROBE / VUGPERF (rmbp-ledger B142, and the OWED clause B135 ends with) — THE FIXTURE THAT
+# --- SHIPPED UNSCORED, NOW DRIVEN. VUGPERF landed `pace_pin_probe` and its own QEMU gate never
+# --- printed the verdict: `[wpace] coalesced=1` summed over a 248 s boot, the one shadowed window
+# --- was closed before any pass composited from it, `probes=0`, and the emitter's `if probes > 0`
+# --- guard correctly said nothing. The go-red was therefore NOT RUN — a re-widened build prints
+# --- the same silence, so the red would have been vacuous. That is exactly the silent-fixture hole
+# --- the PTRDEAD block above exists to close, and it is why BOTH rules below are here:
+# --- `:: VUGPROBE:` says the DRIVER ran, `:: VUGPERF:` says the probe it drove answered. Pinning
+# --- only the second would let the driver be deleted and this gate stay green through the very
+# --- `probes=0` silence the arc was written to end.
+# ---
+# --- `coalesced=1 shadow=true lost=false` are LITERAL, because they are the claim. The fixture
+# --- (`wm::vugprobe_selftest`, ladder tail in arch/x86_64/syscall.rs) mints ONE ring-3-band row —
+# --- non-zero owner outside `KERNEL_OWNER_BASE`, const-asserted, because a kernel-band row is
+# --- pace-EXEMPT at `pace_admit` and could never coalesce — and presents it through
+# --- `present_outcome` until one present comes back `Coalesced`. The second present lands inside
+# --- the first one's 16.667 ms frame, and COALESCING is what calls
+# --- `pace_shadow_refresh(.., create = true)`: the shadow is created at a REAL present boundary by
+# --- the real presenter, never by poking `PACE_SHADOW` or its validity bit — the B121 mistake
+# --- (`winmenu::selftest` green on every x86 boot through a seam the live path never called) is
+# --- what that costs if it is got wrong. `shadow=` is the validity bit READ BACK, so `shadow=false`
+# --- is the fixture asserting about a window `pace_shadow_source` would answer `Live` for, and
+# --- `coalesced=0` is the pacer never folding at all. `paced=` and `tries=` are reported, not
+# --- pinned: a recycled slot can carry a stamp that coalesces the FIRST present (`paced=0` is
+# --- honest), and the retry budget exists because the gap between the two presents IS the first
+# --- present's own composite pass (`[comp2] pass_us=4265` mean under TCG, with a 170 ms tail).
+REQUIRE :: VUGPROBE: shadow-drive win=\d+ tries=\d+ paced=\d+ coalesced=1 shadow=true lost=false .* :: PASS ::
+FORBID :: VUGPROBE: .* :: FAIL ::
+# --- A SKIP is no panel or a full window table. On this gate neither is honest — the DMGOVLP /
+# --- MENUDROP / STRIPVAC rule above, one row and the same panel — so a SKIP is a lost fixture.
+FORBID :: VUGPROBE: .* :: SKIP ::
+
+# --- And the verdict the driver exists to make scoreable. `probes=[1-9]\d*` is the whole arc: it is
+# --- the population B135 did not have, and it is pinned as "at least one" rather than as a number
+# --- because a second armed window on a future boot must not red this. `free_pct=` is `\d+` and the
+# --- threshold is NOT duplicated here — the fixture folds `bound=free_pct>=90` into its own
+# --- PASS/FAIL, and `bound=` is pinned verbatim so a later edit that loosens the bound reds this
+# --- rule instead of quietly passing under a new one. GO-RED, MEASURED on this gate and not
+# --- reasoned: revert `pace_shadow_source`'s tail to `r.surf = g.as_ptr() as usize;
+# --- ShadowSrc::Shadow(g)` — the pass holds the shadow across the whole per-window iteration again
+# --- — and the same capture reads `probes=1 free=0 held=1 free_pct=0 … :: FAIL ::`. That direction
+# --- is deterministic on any host at any speed: the probe's try-lock is then contending with the
+# --- pass that is itself the holder, so it CANNOT succeed.
+REQUIRE :: VUGPERF: shadow-pin probes=[1-9]\d* free=\d+ held=\d+ free_pct=\d+ .* bound=free_pct>=90 :: PASS ::
+FORBID :: VUGPERF: .* :: FAIL ::
+
 # --- BOOTFAILS — HALF OF IT BELONGS HERE AND HALF DOES NOT, and the half that does was already
 # --- pinned. `[clickroute] route … -> PASS` is line 43 of this file and has been since the ladder
 # --- witnesses were added, so BOOTFAILS's router leg is covered without a new directive. Its OTHER

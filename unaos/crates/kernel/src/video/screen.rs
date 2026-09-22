@@ -727,8 +727,8 @@ fn desk_amp_flush() {
     // reasons. It belongs to DRAGWIDE's arc (the queue this census already reports on is the queue
     // the peek reads), and `[flick2]` lives in `cursor`, which is read-only to this change.
     // Monotone totals, not drained: the question they answer is "did this arm ever fire on this
-    // boot", and a per-interval reading would make a rare event look like an absent one.
-    serial_println!(
+    // boot", and a per-interval reading would make a rare event look like an absent one. || BRACKETQ-RETIRED (B142) — **AND ON THIS BOARD THE PAIR CANNOT FIRE, so it is not printed here.** `Screen::bracket_needed` returns at `if DESK_SPRITE_OCC { note_flush_bracket(false); return (false, true); }` BEFORE the `||`-chain whose last term is `present_rects_meet`, and `DESK_SPRITE_OCC` is `cfg!(all(target_arch = "x86_64", feature = "wc"))` — so on every armed x86 compositor boot there has ever been, `BRACKETQ_MET`/`BRACKETQ_BUSY` read 0 BY CONSTRUCTION and flight 11's `bracketq_met=0 bracketq_busy=0` was a structural zero being read as a quiet one. LAWS §5: a check that cannot fire is an absent one, so the two FIELDS are absent from the armed line and `bracketq=retired(DESK_SPRITE_OCC)` says why in the place a reader looks. It is NOT reachability that was added and NOT a global retirement, and both halves are measured rather than argued: the arm has no question to answer when the sprite is an occluder (PTRREPAINT's `present_background` WITHHOLDS the sprite's box from the copy, so nothing in this present can overwrite the arrow, and the subtraction is decided there against that function's FINAL damage set — after the `PRESENT_RECTS` drain and after `mark_full` — which is strictly better informed than this peek; re-siting the peek below the early return would buy one `PRESENT_RECTS` try_lock per desktop present and would redefine `BRACKETQ_MET` from "brackets this arm rescued" to "rects that met the sprite", which is the counter lying about its own name); and the pair IS LIVE on aarch64, where `DESK_SPRITE_OCC` is false — `docs/dev/evidence/orin23/battery-postmetal-600887c2.log` reads `[wc-w] rollup presents=66 … bracketq_met=1 bracketq_busy=0 -> WIDENED`, an observed firing, which is why the fields stay exactly as they were on every board that can produce one.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] serial_println!("[wc-w] rollup presents={} requested_px={} presented_px={} amp={}.{:02}x full_presents={} bracketq=retired(DESK_SPRITE_OCC) -> {}", n, req, pres, a / 100, a % 100, full, if full > 0 { "WIDENED" } else { "HONOURED" }); #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] serial_println!(
         "[wc-w] rollup presents={} requested_px={} presented_px={} amp={}.{:02}x full_presents={} bracketq_met={} bracketq_busy={} -> {}",
         n,
         req,
@@ -1548,7 +1548,7 @@ impl Screen {
         }
         // PTRREPAINT — the withheld-copy answer. Counted through `note_flush_bracket(false)` like
         // any other skip, so `[flick2] flush_skip=` keeps meaning "presents that left the arrow on
-        // glass" and becomes the whole live-sprite population on this board.
+        // glass" and becomes the whole live-sprite population on this board. BRACKETQ-RETIRED (B142) — this return is ALSO why `[wc-w]` no longer prints `bracketq_met=`/`bracketq_busy=` on this board: it is above the `||`-chain, so `present_rects_meet` is never called here and the pair could only ever read 0. The return itself is unchanged and correct — see `desk_amp_flush`, which carries the decision and the aarch64 evidence that kept the fields alive there.
         if DESK_SPRITE_OCC {
             super::cursor::note_flush_bracket(false);
             return (false, true);
