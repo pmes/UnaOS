@@ -561,13 +561,13 @@ fn resolve_verts(sh: &Shard, w: i64, h: i64, s: i64) -> [(i64, i64); MAX_VERTS] 
 /// lays one short bright glint whose position crawls with `PHASE` and whose brightness is the
 /// specular alignment of that facet with the sweeping light — the beam-entry facet also throbs.
 #[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
-pub fn advance(tag: &str) {
+pub fn advance(tag: &str) { #[cfg(feature = "wc")] if ANIM.load(Ordering::Relaxed) && crate::video::fbcon::panel_console_live() { retire("video/fbcon.rs panel_console_resume (the Kepler takeover's full-panel clear; under wc that clear is the compositor's ignition)"); return; } // SPLASHRETIRE (B137) ⚠ SAME-LINE fold. THE BROKEN CRYSTAL, and this is the line that ends it. `ANIM` used to latch off ONLY at the `gui` stamp (below), which `main.rs` records ~500 lines and one whole boot phase AFTER the panel has already been taken: `pci::init` -> `kepler::takeover_display` -> `fbcon::panel_console_resume` clears the WHOLE panel and starts mirroring console glyphs onto it, and under `wc` `desktop_uefi::activate_on` then fills it with `DESKTOP_BG` and composites the console window and the menu bar. The very next `bootpace::record` after that seam is `pci-usb` — flight 11 measured it at t=28036 ms against `[wc-x] desktop-clear` at 27428 ms and `gui` at 28059 ms — and the frame it drove painted, through the pre-heap front-framebuffer handle captured at `SPLASH_FB`, NOTHING BUT FACET EDGES: `edge_run(… SPLASH_EDGE)` per edge plus a glint, with no background fill, no fans and no spectrum. A crystal's wireframe laid over a live desktop with none of the body that made it read as a crystal is exactly "a broken crystal", and it is the LAST thing painted before the desktop's first paint. Asking the seam here, before any pixel moves, is the whole fix; nothing about the crystal's LOOK is touched.
     if !ANIM.load(Ordering::Relaxed) {
         return;
     }
     if tag == "gui" {
         // The GUI is taking the panel (recorded before its first paint on both handoff paths).
-        ANIM.store(false, Ordering::Relaxed);
+        #[cfg(feature = "wc")] retire("bootpace gui stamp (main.rs, before the desktop's first paint)"); ANIM.store(false, Ordering::Relaxed); // SPLASHRETIRE (B137) ⚠ SAME-LINE fold. THE BACKSTOP, not the fix: on every boot that reaches the Kepler seam the fold at `advance`'s entry has already retired the splash and this arm never runs. It is kept, and now witnessed, for the boot that reaches `gui` WITHOUT that seam — so that `SPLASH_UP` is cleared on every path that exists rather than on the one this arc happened to measure, and so the retirement always names the site that did it. `retire` is idempotent: the second caller prints nothing.
         return;
     }
     let fb = match SPLASH_FB.try_lock() {
@@ -639,4 +639,53 @@ pub fn advance(tag: &str) {
             edge_run(&fb, a, b, g - gl / 2, g + gl / 2, dim(0x00FF_FFFF, inten as u32));
         }
     }
+}
+
+// =================================================================================================
+// SPLASHRETIRE (B137) — the splash is HANDED OVER, not merely stopped.
+//
+// Before this arc `SPLASH_UP` had exactly one writer in the whole tree — `store(true)` at the foot
+// of `boot_splash` — and no reader ever saw it go false. Two things followed, and both are defects
+// rather than curiosities:
+//
+//   1. `fbcon::milestone` consults `splash::active()` and returns early while it is true. Since it
+//      never became false, the QUIET-PANEL on-panel milestone leg was DEAD from the splash paint
+//      onward on every x86 GUI boot — including `gui:handoff`, the last milestone there is. The
+//      suppression was written as "while the crystal owns the panel"; it silently became "forever".
+//   2. Nothing marked the instant the crystal STOPPED owning the panel, so `advance` kept painting
+//      past it. That is the broken crystal (see the fold at `advance`'s entry).
+//
+// `retire` gives the flag its missing second writer and makes the handover an EVENT with a time and
+// an author, which is what `:: SPLASH: retired at <ms> ms by <site> ::` is. The `<site>` field is
+// load-bearing and is the whole reason this is a function rather than two stores: the mutation test
+// for this arc is to re-introduce a paint after the seam, and a witness that only said "retired"
+// would not name which site took the glass back.
+//
+// IDEMPOTENT, and it has to be. Two callers exist (the seam fold and the `gui` backstop) and on a
+// Kepler boot both are reached; the second must not print a second, later, wrong retirement time.
+// The `swap` is the latch — only the caller that observed `true` prints.
+//
+// BYTE-IDENTITY. `wc`-gated, so on a knob-off build (`default = []`) this function and both of its
+// call sites are erased and the image cannot move — `./arroyo knoboff bt` / `btc` would otherwise
+// convict a splash change of being a Bluetooth change. Appended at the FOOT of the file, after
+// `advance`, so no existing `panic::Location` in `splash.rs` shifts; both call sites are SAME-LINE
+// folds for the same reason (B94).
+//
+// WHAT IS NOT PROVEN HERE, said plainly rather than left for a reader to assume. `./arroyo test`
+// force-arms `UNAOS_WITNESS=1` (`arroyo`, the `case` at the head of the file), and `witness`
+// compiles the `boot_splash` CALL out of `main.rs` altogether — so no battery run has ever had a
+// splash on its panel, and QEMU has no Kepler, so `panel_console_resume` is never reached there
+// either. The gate for this line is the artifact grep plus a metal sitting. That gap is B137's
+// queue row, not something this file can close.
+
+/// SPLASHRETIRE — hand the panel over: latch the animation off, clear `SPLASH_UP`, and witness the
+/// instant and the site that took the glass. Idempotent; only the first caller prints.
+#[cfg(feature = "wc")]
+pub fn retire(site: &str) {
+    if !SPLASH_UP.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+    ANIM.store(false, Ordering::Relaxed);
+    serial_println!(":: SPLASH: retired at {} ms by {} ::", crate::arch::ms(), site);
 }

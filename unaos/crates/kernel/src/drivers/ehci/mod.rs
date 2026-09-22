@@ -5451,7 +5451,7 @@ impl Controller {
         // BTCLAIM (D-4): a claim retires any pended candidate — relevant only when this probe
         // was re-driven by `bt_retrigger` after a boot whose phase-0 re-read failed out.
         self.bt_pending = None;
-        self.bt_bringup_wire(t, intf, &e);
+        let _ = &e; bt_defer_boot_campaign(self.idx, t.addr); // BTSCHED (B137): `e` is bound but no longer CONSUMED here — the deferred chain reconstructs the event endpoint with `bt_evt_ep_current`, exactly as `bt_retrigger` does, because the QH is spliced into the periodic list once (`bt_arm_events`/`bt_evt_armed`) and is REUSED, never re-armed; the binding is kept (rather than renamed `_e`) so `bt_arm_events`'s STOP path above still reads as the guard it is. the campaign LEAVES the boot path HERE. This statement was `self.bt_bringup_wire(t, intf, &e);` — the whole LE scan + (under btc) inquiry + page train run SYNCHRONOUSLY inside the enumeration walk, which on flight 11 (2026-09-22) held the INTERNAL keyboard, the trackpad, xHCI and the GUI behind `C1 tally — elapsed=21778ms … links_established=0` for a bench speaker that was not in the room. Nothing about the chain's CONTENT moves: the same `bt_bringup_wire`, every witness, against the radio the line above just claimed into `self.bt_radio` — only its PLACE moves, to `service_ehci_hid`'s post-GUI drain, which is the shape `bt_retrigger` already uses (no new mechanism). ⚠ LINE-NEUTRAL: one statement replaces one statement, so no `panic::Location` below it in this file moves and the knob-off image stays byte-identical (B94).
         true
     }
 
@@ -18535,7 +18535,7 @@ pub fn service_ehci_hid() {
     // One chain per pass; the first controller that claimed a radio owns it.
     #[cfg(feature = "bt")]
     {
-        let src = BT_RETRIGGER_PENDING.swap(0, core::sync::atomic::Ordering::SeqCst);
+        bt_drain_boot_campaign(ctrls); let src = BT_RETRIGGER_PENDING.swap(0, core::sync::atomic::Ordering::SeqCst); // BTSCHED (B137) ⚠ SAME-LINE fold, for the reason every fold in this tree carries: a physical line here would shift every `panic::Location` below it in an 18k-line file and move the knob-off image. The boot campaign the enumeration walk deferred is drained FIRST and on its own latch, ahead of the chord-driven re-trigger, because it is the chain that would have run at boot; both run under this same `EHCI_HID` lock and neither can start while the other is in flight (`bt_chain_busy`).
         if src != 0 {
             let mut serviced = false;
             for c in ctrls.iter_mut() {
@@ -18556,4 +18556,176 @@ pub fn service_ehci_hid() {
             }
         }
     }
+}
+
+// =================================================================================================
+// BTSCHED (B137) — the Bluetooth campaign is a POST-GUI worker, not a step of the boot walk.
+//
+// THE READING IT COMES FROM. Flight 11 (2026-09-22, rMBP, image 3 at 56bbe53b): the APIC calibrated
+// at 116 ms and the EHCI walk had the external keyboard at addr=5 and the mouse at addr=6 by
+// 1769 ms. Then `bt_probe` claimed the Broadcom radio and called `bt_bringup_wire` INLINE, on the
+// boot core, with interrupts and the whole walk behind it:
+//
+//     bt-l2  LE scan, 4 x 500 ms                              1812 →  3815 ms
+//     bt-c1  HCI_Inquiry inquiry_length=0x08 (=10240 ms)      3821 → 14065 ms   (heard nothing)
+//     bt-c1  2 x HCI_Create_Connection @ 5120 ms page timeout
+//            + a 1277 ms phase delay                         14068 → 25593 ms
+//     `C1 tally — elapsed=21778ms … links_established=0`
+//
+// Only THEN did the walk continue to `hub 3 port 2` and enumerate the INTERNAL keyboard (addr=8)
+// and the bcm5974 trackpad, at 25609–25625 ms. `BPACE: ehci-hid-done t=25626ms d=25331ms` is the
+// same 25 s seen from the ledger. xHCI settled at 27043 ms; `[wc-x] menubar ENABLED` at 27616 ms.
+// So the machine's own keyboard and trackpad were dead for 25 s, and the desktop for 27, because a
+// radio was being asked about a bench speaker that was not present.
+//
+// WHY IT IS A PLACE BUG AND NOT A CONTENT BUG. Every number above is a BOUND the campaign is
+// entitled to spend: the inquiry length and the page timeout are the protocol's, not ours, and
+// shortening them would change what the campaign can find — which is BT-C1's subject, not this
+// arc's. What is not entitled is spending them BEFORE the machine has input and a desktop. So the
+// content is untouched here: the same `bt_bringup_wire` runs, with the same commands, the same
+// bounds and every witness line it has ever printed. Only the PLACE moves.
+//
+// THE SHAPE, AND WHY THIS ONE. `bt_retrigger` already runs the identical chain from
+// `service_ehci_hid` — the main-loop service hook — through a latch (`BT_RETRIGGER_PENDING`) that
+// a keyboard chord sets and the service pass drains under the `EHCI_HID` lock. That is a post-GUI
+// worker in everything but name, and `bootpace.rs`'s own prose states the ordering that makes it
+// one: "on a GUI build the handoff happens BEFORE the service loop that runs enumeration/storage/
+// FTDI starts at all, so every main-loop tag necessarily lands after `gui`". So this arc adds NO
+// mechanism. It adds a second latch of exactly the same kind, drained in the same place, under the
+// same lock, one pass earlier in the same block.
+//
+// WHY THE `gui` STAMP IS QUOTED AND NOT OBEYED. Because the ordering is structural, a second gate
+// on the stamp would buy nothing on a GUI build and would COST the `usbdebug` lane everything: that
+// build reaches the same service loop and records `gui=none` by design, so a drain that waited for
+// the stamp would strand the campaign there forever — a feature that silently stops running on one
+// lane while every gate stays green. What the stamp is for is FALSIFIABILITY: `:: bt-sched:
+// campaign start at <ms> ms (gui at <ms>) ::` prints both numbers, so a reader subtracts them and
+// sees that the campaign began after the desktop. A line that only said "started" would read the
+// same on the broken ordering this arc exists to end.
+//
+// BYTE-IDENTITY. Every item in this block is `#[cfg(feature = "bt")]` and lives at the FOOT of the
+// file, after `service_ehci_hid`, so on a knob-off build the token stream vanishes and not one
+// existing `panic::Location` moves — appending at end-of-file cannot shift a line above it. The two
+// in-file edits (`bt_probe`'s deferral, `service_ehci_hid`'s drain) are SAME-LINE folds for the same
+// reason. `./arroyo knoboff bt` and `./arroyo knoboff btc` are the measurement, not this paragraph.
+
+/// BTSCHED — the boot walk's deferred campaign, as `controller index + 1` (0 = nothing deferred).
+///
+/// `+ 1` so the latch has a zero that means "no request", exactly as `BT_RETRIGGER_PENDING`'s
+/// `0` does; controller 0 is a real controller and must not be spelled the same as "none".
+/// Decoupled from any one `Controller` for the reason the re-trigger latch gives: the drain runs
+/// over the whole `EHCI_HID` vector and must be able to name which member owns the request.
+#[cfg(feature = "bt")]
+static BT_BOOT_CAMPAIGN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// BTSCHED — `arch::ms()` at the instant the boot walk deferred, so the start line can report the
+/// wall clock the boot path did NOT spend. Written once, read once.
+#[cfg(feature = "bt")]
+static BT_BOOT_CAMPAIGN_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// BTSCHED — convert a `bootpace` counter stamp to milliseconds with the LEDGER's own origin and
+/// rate, never an arch-specific `tsc_hz()` of our own. `None` when the tag has not been recorded or
+/// the counter's rate is still unknown — both of which are readings, not failures, and the caller
+/// prints them as such rather than fabricating a millisecond (`bootpace.rs`'s standing rule).
+#[cfg(feature = "bt")]
+fn bt_bootpace_ms(tag: &str) -> Option<u64> {
+    let cy = crate::bootpace::cycles_of(tag)?;
+    let hz = crate::bootpace::origin_hz();
+    if hz == 0 {
+        return None;
+    }
+    Some(cy.saturating_sub(crate::bootpace::origin_cycles()).saturating_mul(1000) / hz)
+}
+
+/// BTSCHED — called from `bt_probe` at the exact point the inline `bt_bringup_wire` used to sit.
+/// Records the request and returns immediately, so the enumeration walk proceeds to the next port
+/// (on the rMBP that is `hub 3 port 2`: the internal keyboard and the bcm5974 trackpad) instead of
+/// waiting out the LE scan, the inquiry and the page trains.
+#[cfg(feature = "bt")]
+fn bt_defer_boot_campaign(idx: usize, addr: u8) {
+    let now = crate::arch::ms();
+    BT_BOOT_CAMPAIGN_AT.store(now, core::sync::atomic::Ordering::SeqCst);
+    BT_BOOT_CAMPAIGN.store(idx as u32 + 1, core::sync::atomic::Ordering::SeqCst);
+    serial_println!(":: bt-sched: campaign deferred past gui at {} ms ::", now);
+    serial_println!(
+        ":: bt-sched: [{}] radio addr={} claimed and armed; the bring-up chain is NOT run on the boot core — the port walk continues from here and the GUI ignites first; the chain runs from the post-GUI service pass with its content, its bounds and its witnesses unchanged == witness ::",
+        idx, addr
+    );
+}
+
+/// BTSCHED — the drain, called once per `service_ehci_hid` pass under the `EHCI_HID` lock.
+///
+/// Declines, each witnessed: nothing deferred (the common case, one relaxed load); the `gui` stamp
+/// not yet recorded (so nothing runs before the desktop on a build that has one); the named
+/// controller gone, holding no radio, or unable to reconstruct its event endpoint. The latch is
+/// taken with a `swap` BEFORE the chain runs, so a chain that STOPs early cannot re-arm itself into
+/// a loop: a second run is the chord's to ask for, through `bt_retrigger`, which is what that hatch
+/// is for.
+#[cfg(feature = "bt")]
+fn bt_drain_boot_campaign(ctrls: &mut [Controller]) {
+    if BT_BOOT_CAMPAIGN.load(core::sync::atomic::Ordering::SeqCst) == 0 {
+        return;
+    }
+    // The `gui` stamp is read for the WITNESS, and is deliberately NOT a gate. Reaching this drain
+    // already means the boot is past the handoff: it runs from `service_ehci_hid`, and the main
+    // service loop does not start until the GUI has been handed the panel (`bootpace.rs`: "on a GUI
+    // build the handoff happens BEFORE the service loop … so every main-loop tag necessarily lands
+    // after `gui`"). Gating on the stamp as well would add nothing on a GUI build and would strand
+    // the campaign FOREVER on a `usbdebug` build, which reaches the same service loop and records
+    // `gui=none` by design. So the stamp is quoted, not obeyed — and quoting it is what makes the
+    // start line falsifiable, because a reader can subtract the two numbers and see the ordering.
+    let gui = bt_bootpace_ms("gui");
+    let want = BT_BOOT_CAMPAIGN.swap(0, core::sync::atomic::Ordering::SeqCst);
+    if want == 0 {
+        return;
+    }
+    let idx = (want - 1) as usize;
+    let now = crate::arch::ms();
+    let deferred_at = BT_BOOT_CAMPAIGN_AT.load(core::sync::atomic::Ordering::SeqCst);
+    for c in ctrls.iter_mut() {
+        if c.idx != idx {
+            continue;
+        }
+        if c.bt_chain_busy {
+            serial_println!(
+                ":: bt-sched: [{}] DECLINED at {} ms — a bring-up chain is already in flight on this controller; not starting a second == witness ::",
+                idx, now
+            );
+            return;
+        }
+        let Some(radio) = c.bt_radio else {
+            serial_println!(
+                ":: bt-sched: [{}] ABORTED at {} ms — the deferral named this controller but it holds no claimed radio; nothing ran == witness ::",
+                idx, now
+            );
+            return;
+        };
+        let Some(e) = (unsafe { c.bt_evt_ep_current(radio.evt_mps) }) else {
+            serial_println!(
+                ":: bt-sched: [{}] ABORTED at {} ms — the event endpoint could not be reconstructed (no armed slot, or it failed the phys/alignment contract); no chain ran == witness ::",
+                idx, now
+            );
+            return;
+        };
+        match gui {
+            Some(g) => serial_println!(":: bt-sched: campaign start at {} ms (gui at {} ms) ::", now, g),
+            // No `gui` stamp and the panel already handed over, or a build with no GUI at all: the
+            // honest reading is that there is no gui millisecond to quote, not a fabricated one.
+            None => serial_println!(":: bt-sched: campaign start at {} ms (gui at none ms) ::", now),
+        }
+        serial_println!(
+            ":: bt-sched: [{}] FIRING — the chain the enumeration walk deferred at {} ms runs now, {} ms of boot path it did not hold; addr={}; its bt-l2 scan summary and (under btc) its bt-c1 page summary below are its outcome == witness ::",
+            idx, deferred_at, now.saturating_sub(deferred_at), radio.target.addr
+        );
+        unsafe { c.bt_bringup_wire(&radio.target, radio.intf, &e) };
+        serial_println!(
+            ":: bt-sched: [{}] COMPLETE at {} ms — the chain returned == witness ::",
+            idx, crate::arch::ms()
+        );
+        return;
+    }
+    serial_println!(
+        ":: bt-sched: the deferral named controller {} but no such member is in EHCI_HID; nothing ran == witness ::",
+        idx
+    );
 }

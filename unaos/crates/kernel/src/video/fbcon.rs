@@ -3433,3 +3433,25 @@ fn cells_remint(
     };
     Remint { repainted_rows, store, col, row, was: (ocols, orows), had }
 }
+
+/// SPLASHRETIRE (B137) — is the PANEL CONSOLE live? The one bit `splash.rs` needs in order to know
+/// that its glass is gone, exposed as a reader because the static itself is private and must stay
+/// that way (it has exactly one writer, `panel_console_resume`, and that is the property the seam's
+/// ordering law at `panel_console_resume`'s doc depends on).
+///
+/// WHAT IT MEANS, stated so it is not mistaken for "is there a GUI". True from the instant
+/// `panel_console_resume` finished step (3) — `c.full_fb().fill_screen(BG_DEFAULT)` over the WHOLE
+/// panel — and set the flag in step (4). So `true` is precisely "something other than the splash has
+/// cleared the panel and is drawing on it", which is the question `splash::advance` has to ask
+/// before it lays another frame. On the rMBP that clear is the Kepler takeover's, and under `wc` the
+/// Kepler takeover IS the compositor's ignition, so the same bit marks the compositor seam.
+///
+/// `wc`-gated, and that is a BYTE-IDENTITY constraint rather than a claim about where the defect
+/// lives: `default = []`, so a knob-off build must not contain this function at all or
+/// `./arroyo knoboff bt` would convict a change that has nothing to do with Bluetooth. The same
+/// reasoning gates its only caller. A non-`wc` x86 boot has the same overpaint and is B137's queue
+/// row, not its fix.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn panel_console_live() -> bool {
+    PANEL_CONSOLE.load(Ordering::Relaxed)
+}
