@@ -348,6 +348,12 @@ struct IntEp {
     /// is still a constant, and the pair reads as the sequence it was.
     #[cfg(feature = "kbdwit")]
     kbdwit_cut: bool,
+    /// TRACKPAD (B139) — the PER-REPORT-ID census of this endpoint's stream. See [`TpCensus`] for
+    /// why an id histogram is the datum the next flight needs and a bounded hex dump is not.
+    /// Carried on EVERY endpoint rather than only the vendor-multitouch one because `IntEp` has no
+    /// per-kind variant and a conditional field would need one; only the vendor-multitouch arm ever
+    /// writes or prints it, so a keyboard pays the (zeroed) bytes and not one instruction.
+    tp: TpCensus,
     /// MT-INVESTIGATION (IVY, `mtraw` only): bytes ONE armed transfer may accept — `mps` for every
     /// endpoint except the vendor-multitouch one, which is armed for the whole (grown) receive
     /// buffer so the controller accumulates a >MPS raw frame into it. See `arm_interrupt_ep`.
@@ -4745,49 +4751,143 @@ impl Controller {
     /// its capture window closes. The probe is selected at the CALL SITE (a `#[cfg]` pair there),
     /// deliberately — so that knob-off this function's name and body stay verbatim what they were
     /// and default media are byte-identical, symbol names included.
+    /// TRACKPAD (B139) — **the write this function sent on flight 11 was NOT well-formed, and the
+    /// defect is one field wide.**
+    ///
+    /// HID 1.11 §7.2.1 (Get_Report) and §7.2.2 (Set_Report) define the SAME three fields for both
+    /// requests: `wValue` = Report Type in the high byte and Report ID in the low byte, **`wIndex`
+    /// = Interface**, `wLength` = report length, and the DATA stage carries the whole report. This
+    /// driver sent `wIndex = 0` — [`BCM5974_MODE_REQ_INDEX`], whose own comment says "NOT the intf
+    /// number" — while the vendor-multitouch report descriptor that declares this Feature report
+    /// lives on INTERFACE 1 (flight 11: `M1 bcm5974 GET_REPORT(feature) addr=8 intf=1`). A class
+    /// request with an INTERFACE recipient is routed by `wIndex`, so the SET was delivered to
+    /// interface 0 — the boot keyboard — and the vendor interface was never addressed at all.
+    ///
+    /// The flight-11 GET is not evidence against this. It returned `got=8b byte0=0x08` from
+    /// `wIndex=0`, which proves only that interface 0 answered an 8-byte Feature report; it does
+    /// not make interface 0 the owner of the mode byte. What settles it is that the stream after
+    /// the SET stayed Report ID 0x02 — and THAT, per this arc's brief, is a MEASUREMENT and never
+    /// an error: a device that declines the switch is entitled to keep streaming HID-mode reports.
+    ///
+    /// The rest of the request was already right and is unchanged: `wValue = 0x0300` is Feature
+    /// (type 3) with Report ID 0, and the Report ID low byte is 0 precisely because byte 0 of the
+    /// returned report is the MODE byte (0x08 = the documented NORMAL selector), not a Report ID
+    /// prefix — a device that prefixed its Feature report with an ID would have answered `byte0`
+    /// with that id. The read-modify-write is likewise already conformant: §7.2.2's data stage
+    /// carries the WHOLE report, so the seven bytes we do not own are fetched and written back
+    /// verbatim, and only byte 0 changes.
+    ///
+    /// SHAPE OF THE FIX, and why it is two attempts and not one. The conformant `wIndex = intf` is
+    /// tried FIRST. If it neither stalls nor latches, the legacy `wIndex = 0` is tried ONCE more,
+    /// because a firmware that has always been driven at index 0 by other operating systems may
+    /// well only answer there — and refusing to find out would replace one untested assumption
+    /// with another. Bounded at two attempts, total; every stage is still NON-FATAL (the caller
+    /// arms the endpoint regardless), and each attempt prints its own `[tp] mode` line carrying
+    /// the FULL eight bytes written and the FULL eight read back, so flight 12 can read what the
+    /// device latched instead of what we asked for.
     unsafe fn bcm5974_mode_switch(&mut self, t: &Target, intf: u8) {
-        // Stage 1 — read the current feature report.
+        // Attempt 1 — HID 1.11 §7.2.2: wIndex is the INTERFACE this Feature report belongs to.
+        if self.bcm5974_mode_attempt(t, intf, intf as u16, "hid1.11-intf") {
+            return;
+        }
+        // Attempt 2 — the legacy index this driver has always sent. Reached only when the
+        // conformant request did not latch, and never a third time.
+        if intf as u16 != BCM5974_MODE_REQ_INDEX {
+            self.bcm5974_mode_attempt(t, intf, BCM5974_MODE_REQ_INDEX, "legacy-index0");
+        }
+    }
+
+    /// TRACKPAD (B139) — ONE read-modify-write-readback of the mode Feature report at a given
+    /// `wIndex`, fully witnessed. Returns whether the device LATCHED the vendor selector, which is
+    /// the only thing that can stop [`Self::bcm5974_mode_switch`] trying the other index.
+    ///
+    /// "Latched" is defined against the READBACK and nothing else: byte 0 of the report the device
+    /// hands back after the SET equals [`BCM5974_MODE_VENDOR`]. A SET that the device ACKs is not
+    /// evidence — flight 11's ACKed SET is exactly the line that made "multitouch stream requested"
+    /// read as an accomplished fact for two months. A failed readback is `latched=no`, never a
+    /// guess.
+    unsafe fn bcm5974_mode_attempt(
+        &mut self,
+        t: &Target,
+        intf: u8,
+        w_index: u16,
+        why: &str,
+    ) -> bool {
+        const N: usize = BCM5974_MODE_LEN as usize;
+        // Stage 1 — read the current feature report (HID 1.11 §7.2.1).
         let read = self.control(
-            t, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_VALUE, BCM5974_MODE_REQ_INDEX,
+            t, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_VALUE, w_index,
             BCM5974_MODE_LEN, true,
         );
         match read {
             Ok(got) => {
-                let n = (got as usize).min(BCM5974_MODE_LEN as usize);
+                let n = (got as usize).min(N);
                 let cur = if n > 0 { *self.data_buf } else { 0 };
                 serial_println!(
-                    ":: EHCI-HID: [{}] M1 bcm5974 GET_REPORT(feature) addr={} intf={} got={}b byte0={:#04x} == witness ::",
-                    self.idx, t.addr, intf, got, cur
+                    ":: EHCI-HID: [{}] M1 bcm5974 GET_REPORT(feature) addr={} intf={} widx={} got={}b byte0={:#04x} == witness ::",
+                    self.idx, t.addr, intf, w_index, got, cur
                 );
             }
             Err(e) => {
                 // A device may not answer the read yet still accept the write, so a failed GET is
                 // not a reason to skip the SET. Seed the buffer to a known state and press on.
                 serial_println!(
-                    ":: EHCI-HID: [{}] M1 bcm5974 GET_REPORT(feature) addr={} intf={} FAILED ({}) — writing anyway ::",
-                    self.idx, t.addr, intf, e
+                    ":: EHCI-HID: [{}] M1 bcm5974 GET_REPORT(feature) addr={} intf={} widx={} FAILED ({}) — writing anyway ::",
+                    self.idx, t.addr, intf, w_index, e
                 );
-                for k in 0..BCM5974_MODE_LEN as usize {
+                for k in 0..N {
                     self.data_buf.add(k).write(0);
                 }
             }
         }
-        // Stage 2 — flip byte 0 to the raw-multitouch selector.
+        // Stage 2 — flip byte 0 to the raw-multitouch selector, leaving the other seven bytes of
+        // the report exactly as the device returned them (§7.2.2: the data stage is the WHOLE
+        // report). Snapshot what we are about to put on the wire so the witness can print it.
         self.data_buf.write(BCM5974_MODE_VENDOR);
+        let mut wrote = [0u8; N];
+        for k in 0..N {
+            wrote[k] = self.data_buf.add(k).read();
+        }
         // Stage 3 — write the report back (SET_REPORT, class, interface recipient).
-        match self.control(
-            t, 0x21, BCM5974_MODE_WRITE_REQ, BCM5974_MODE_REQ_VALUE, BCM5974_MODE_REQ_INDEX,
+        let set_ok = match self.control(
+            t, 0x21, BCM5974_MODE_WRITE_REQ, BCM5974_MODE_REQ_VALUE, w_index,
             BCM5974_MODE_LEN, false,
         ) {
-            Ok(_) => serial_println!(
-                ":: EHCI-HID: [{}] M1 bcm5974 SET_REPORT(feature) addr={} intf={} mode={:#04x} — multitouch stream requested == witness ::",
-                self.idx, t.addr, intf, BCM5974_MODE_VENDOR
-            ),
-            Err(e) => serial_println!(
-                ":: EHCI-HID: [{}] M1 bcm5974 SET_REPORT(feature) addr={} intf={} FAILED ({}) — endpoint armed, stream may stay silent ::",
-                self.idx, t.addr, intf, e
-            ),
+            Ok(_) => true,
+            Err(e) => {
+                serial_println!(
+                    ":: EHCI-HID: [{}] M1 bcm5974 SET_REPORT(feature) addr={} intf={} widx={} FAILED ({}) — endpoint armed, stream may stay silent ::",
+                    self.idx, t.addr, intf, w_index, e
+                );
+                false
+            }
+        };
+        // Stage 4 — READ IT BACK. The device's own answer to "what mode are you in", which is the
+        // term flight 11 had no line for.
+        let mut back = [0u8; N];
+        let read_back = set_ok
+            && self
+                .control(
+                    t, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_VALUE, w_index,
+                    BCM5974_MODE_LEN, true,
+                )
+                .is_ok();
+        if read_back {
+            for k in 0..N {
+                back[k] = self.data_buf.add(k).read();
+            }
         }
+        let latched = read_back && back[0] == BCM5974_MODE_VENDOR;
+        let (mut wh, mut bh) = ([0u8; TP_HEX_MAX], [0u8; TP_HEX_MAX]);
+        serial_println!(
+            ":: EHCI-HID: [{}] [tp] mode wrote={} readback={} latched={} (addr={} intf={} widx={} try={} set={} readback_ok={}) == witness ::",
+            self.idx,
+            tp_hex(&mut wh, &wrote),
+            if read_back { tp_hex(&mut bh, &back) } else { "none" },
+            if latched { "yes" } else { "no" },
+            t.addr, intf, w_index, why, set_ok, read_back
+        );
+        latched
     }
 
     /// MT-INVESTIGATION (IVY) — write ONE value into byte 0 of the 8-byte mode feature report and
@@ -4799,12 +4899,18 @@ impl Controller {
     /// use a much shorter settle because our control path is synchronous and already-completed by
     /// the time it returns — the point of the pause is that the write must not race the read's
     /// completion, which our blocking `control` already guarantees, so this is belt-and-braces.
+    ///
+    /// TRACKPAD (B139): `w_index` is now a PARAMETER and its caller passes the INTERFACE, for the
+    /// reason spelled out on `bcm5974_mode_switch` — HID 1.11 §7.2.1/§7.2.2 route a class request
+    /// with an INTERFACE recipient by `wIndex`, and this function shipped the same hardcoded 0 the
+    /// default path did. Leaving one of the two malformed while fixing the other would put two
+    /// different answers to one protocol question in one file.
     #[cfg(feature = "mtraw")]
-    unsafe fn bcm5974_mode_write(&mut self, t: &Target, val: u8) -> Option<u8> {
+    unsafe fn bcm5974_mode_write(&mut self, t: &Target, val: u8, w_index: u16) -> Option<u8> {
         // Read-modify-write: fetch the live report so the seven bytes we do NOT own are preserved.
         let read_ok = self
             .control(
-                t, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_VALUE, BCM5974_MODE_REQ_INDEX,
+                t, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_VALUE, w_index,
                 BCM5974_MODE_LEN, true,
             )
             .is_ok();
@@ -4817,7 +4923,7 @@ impl Controller {
         self.data_buf.write(val);
         if self
             .control(
-                t, 0x21, BCM5974_MODE_WRITE_REQ, BCM5974_MODE_REQ_VALUE, BCM5974_MODE_REQ_INDEX,
+                t, 0x21, BCM5974_MODE_WRITE_REQ, BCM5974_MODE_REQ_VALUE, w_index,
                 BCM5974_MODE_LEN, false,
             )
             .is_err()
@@ -4827,7 +4933,7 @@ impl Controller {
         ehci_scout::settle_ms(5);
         // Read back so the witness records what the DEVICE thinks its mode is, not what we asked.
         match self.control(
-            t, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_VALUE, BCM5974_MODE_REQ_INDEX,
+            t, 0xA1, BCM5974_MODE_READ_REQ, BCM5974_MODE_REQ_VALUE, w_index,
             BCM5974_MODE_LEN, true,
         ) {
             Ok(got) if got > 0 => Some(*self.data_buf),
@@ -4850,14 +4956,14 @@ impl Controller {
     /// immediately, exactly as the default path tolerates a failed handshake.
     #[cfg(feature = "mtraw")]
     unsafe fn bcm5974_mt_raw_probe(&mut self, t: &Target, intf: u8) {
-        let off = self.bcm5974_mode_write(t, BCM5974_MODE_NORMAL);
+        let off = self.bcm5974_mode_write(t, BCM5974_MODE_NORMAL, intf as u16);
         serial_println!(
             ":: EHCI-MT: [{}] mode-try val={:#04x} readback={} addr={} intf={} (step 1/2: normal) == witness ::",
             self.idx, BCM5974_MODE_NORMAL,
             match off { Some(v) => v, None => 0xFF }, t.addr, intf
         );
         ehci_scout::settle_ms(50); // wsp takes a long pause between the OFF and ON writes
-        let on = self.bcm5974_mode_write(t, BCM5974_MODE_VENDOR);
+        let on = self.bcm5974_mode_write(t, BCM5974_MODE_VENDOR, intf as u16);
         serial_println!(
             ":: EHCI-MT: [{}] mode-try val={:#04x} readback={} addr={} intf={} (step 2/2: raw sensor) == witness ::",
             self.idx, BCM5974_MODE_VENDOR,
@@ -13466,6 +13572,11 @@ impl Controller {
             kbdwit_broke: false,
             #[cfg(feature = "kbdwit")]
             kbdwit_cut: false,
+            // TRACKPAD (B139): the id census starts empty. `min_len` starts at `u16::MAX` so the
+            // FIRST report sets it (a zero start would pin the minimum at 0 forever and the
+            // `sizes=` term would say nothing); the rollup prints `0/0` while no report has
+            // landed rather than `65535/0`, which is what `TpCensus::EMPTY` documents.
+            tp: TpCensus::EMPTY,
             #[cfg(feature = "mtraw")]
             rx_total,
             #[cfg(feature = "mtraw_inject")]
@@ -13913,6 +14024,17 @@ impl Controller {
                     e.reports = e.reports.wrapping_add(1);
                     if let Some(l) = e.layout {
                         if l.vendor_mt {
+                            // TRACKPAD (B139) — CHARGE THE CENSUS FIRST, before any decode, any
+                            // length gate and any id gate. That ordering is the whole point: the
+                            // instrument this replaces (`trackpad format witness`, one shot at
+                            // `e.reports == 1`) sat BEHIND `decode_trackpad_rel`'s gates, so
+                            // flight 11's two-byte `60 02` runt consumed it and 5,706 reports went
+                            // by with nothing on the wire naming their report id. A counter that a
+                            // report can fail to reach is a counter about the reports that passed.
+                            // The rollup rides `EHCIDARK`'s own cadence and stays silent unless the
+                            // census moved — see `tp_census_rollup`.
+                            e.tp.note(report);
+                            tp_census_rollup(e, idx, now_ms);
                             // M1 (RMBP-FIX, 2026-07-18): the raw-report dump exists ONLY to capture the
                             // opaque stream's byte layout, and that characterization is COMPLETE. Bound it
                             // hard — usbdebug builds only, first 4 reports total per device — so it can
@@ -13962,9 +14084,27 @@ impl Controller {
                             // into the RELATIVE pointer path (the same `pal::Event::Mouse` seam the
                             // boot-mouse path uses). Length-checked + ID-gated inside `decode_trackpad_rel`:
                             // a short or non-0x02 report yields None → no event, no state change.
-                            if let Some((buttons, dx, dy)) = decode_trackpad_rel(report) {
-                                // Bounded one-line format witness on the first decoded report.
-                                if e.reports == 1 {
+                            // TRACKPAD (B139): ONE dispatcher decides where a report goes, and it
+                            // decides on the REPORT'S OWN ID rather than on the descriptor's. That
+                            // is not a refactor of the `if let Some(..) = decode_trackpad_rel(..)`
+                            // it replaces — it is the thing that makes "the switch finally latched
+                            // and the stream turned into 0x44 frames" a routed case instead of a
+                            // silently dropped one. `TpRoute::Rel` keeps this arm's body verbatim;
+                            // `TpRoute::Mt` is the kept hypothesis decode, witnessed and NEVER
+                            // installed (the `VMT_FINGER_*` offsets are unconfirmed on silicon);
+                            // `TpRoute::None` is a runt, exactly as before — no event, no state
+                            // change. Proven on flight 11's own four captured reports by
+                            // `trackpad_dispatch_selftest`.
+                            match trackpad_dispatch(report) {
+                              TpRoute::Rel { buttons, dx, dy } => {
+                                // Bounded one-line format witness on the first report of THIS ID.
+                                // TRACKPAD (B139): the condition was `e.reports == 1` and that is
+                                // why flight 11 has no such line anywhere in 970 s — report #1 was
+                                // the `60 02` runt, which routes nowhere, so the one shot was spent
+                                // on a report that never reached here. `e.tp.n[0] == 1` fires on the
+                                // first id-0x02 report whatever its position in the stream, and the
+                                // census line carries the rest.
+                                if e.tp.n[0] == 1 {
                                     serial_println!(
                                         ":: EHCI-HID: [{}] trackpad format witness: 8-byte id=0x02 rel — buttons={:#04x} dx={} dy={} == witness ::",
                                         idx, buttons, dx, dy
@@ -14017,6 +14157,21 @@ impl Controller {
                                         idx, buttons
                                     );
                                 }
+                              }
+                              // TRACKPAD (B139): the id the DESCRIPTOR declares, finally on the
+                              // wire. One bounded witness on the first such frame — `first_bytes=`
+                              // on the census line carries the bytes, and until a metal sitting
+                              // confirms the `VMT_FINGER_*` offsets this decode installs NOTHING.
+                              TpRoute::Mt { present, x, y } => {
+                                if e.tp.n[1] == 1 {
+                                    serial_println!(
+                                        ":: EHCI-HID: [{}] trackpad vendor frame: id={:#04x} len={} first-finger present={} x={} y={} (HYPOTHESIS offsets X@{} Y@{} touch@{}; decode only, NOT installed) == witness ::",
+                                        idx, TRACKPAD_VENDOR_REPORT_ID, report.len(), present, x, y,
+                                        VMT_FINGER_ABS_X, VMT_FINGER_ABS_Y, VMT_FINGER_TOUCH
+                                    );
+                                }
+                              }
+                              TpRoute::None => {}
                             }
                         } else {
                             // M2 report-pointer path: decode X/Y/buttons from the parsed field map.
@@ -16906,6 +17061,301 @@ fn decode_trackpad_rel(report: &[u8]) -> Option<(u8, i32, i32)> {
     Some((buttons, dx, dy))
 }
 
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// TRACKPAD (B139) — **THE PER-REPORT-ID CENSUS, and what flight 11 actually measured.**
+//
+// THE QUESTION THIS ANSWERS. Flight 11's whole record of what the internal trackpad's endpoint
+// streamed was FOUR hex lines and then nothing:
+//     [ 28063ms] vendor-multitouch raw report #1 (2 B): 60 02
+//     [112433ms] vendor-multitouch raw report #2 (8 B): 02 00 f9 00 00 00 fb 00
+//     [112445ms] vendor-multitouch raw report #3 (8 B): 02 00 fa 00 00 00 fc 00
+//     [112451ms] vendor-multitouch raw report #4 (8 B): 02 00 f9 00 00 00 fb 00
+// Read alone, that looks like an endpoint that spoke four times and died — and reading it that
+// way is how this arc was briefed. It is wrong, and the SAME LOG refutes it: `dump_vendor_report`
+// is called under `if e.reports <= 4` (and only on a `usbdebug` build), so FOUR IS THE DUMP'S
+// CAP, not the stream's length. The endpoint's own rollup on that boot ends
+//     [993836ms] EHCIDARK addr=8 ep=IN1 kind=vendor-mt reports=5706 … missed<=11384
+// — 5,706 reports delivered across ~970 s of the sitting. The receive path was never capped and
+// never stopped.
+//
+// SO WHY ADD ANYTHING. Because NOTHING on a default build says WHICH REPORT ID those 5,706
+// reports carried. The one line that would have — `trackpad format witness`, printed at
+// `e.reports == 1` — is ABSENT from the whole of flight 11, and the reason is exact: report #1
+// was the two-byte runt `60 02`, which fails `decode_trackpad_rel`'s length and id gates, so the
+// one-shot witness fired on a report that decoded to nothing and never fired again. An
+// instrument whose single sample can be consumed by a runt is an instrument that reports on the
+// runt. The census below replaces it with a HISTOGRAM that no single report can exhaust:
+//
+//     [tp] ids=02:<n>,44:<n>,other:<n> sizes=<min>/<max> first_bytes=<the first report of each id>
+//
+// Three counters, the observed length range, and the first sixteen bytes of the first report of
+// EACH class — so "the mode switch latched and the stream turned into 0x44 frames" and "the
+// stream stayed 0x02" are told apart by reading one line, with no hypothesis in the path.
+//
+// BOUNDING. It rides [`EHCIDARK_ROLLUP_MS`], the cadence already in this loop, and additionally
+// stays off the wire unless the census has MOVED since the last line it printed — the same
+// two-part rule `EHCIDARK` uses, and for the same reason: an instrument built to explain a burst
+// must not become one. Everything it holds is fixed-size and stack- or struct-resident; there is
+// no allocation anywhere on this path, which is what lets it run on a DEFAULT build where
+// `dump_vendor_report` (a `String` per report) deliberately cannot.
+
+/// TRACKPAD (B139) — bytes of the first report of each id kept for `first_bytes=`. Sixteen covers
+/// the whole of an 8-byte HID-mode report with room to spare, and the leading 16 bytes of a raw
+/// frame — the header fields (`nfinger`@14, `ibt`@15) a first look at a latched stream wants —
+/// without putting a 511-byte line into a 64 KiB drop-oldest serial ring.
+const TP_FIRST_BYTES: usize = 16;
+/// TRACKPAD (B139) — the hex scratch a `TP_FIRST_BYTES` dump needs: `"xx "` per byte, less the
+/// trailing space. Sized as a CONST rather than a literal so the two can never drift apart.
+const TP_HEX_MAX: usize = TP_FIRST_BYTES * 3;
+/// TRACKPAD (B139) — the Apple vendor-multitouch report id the descriptor declares and the
+/// hypothesis decode is written for. Named here so the census and the dispatcher read the same
+/// symbol the descriptor parser does.
+const TRACKPAD_VENDOR_REPORT_ID: u8 = 0x44;
+
+/// TRACKPAD (B139) — hex-render up to `TP_FIRST_BYTES` bytes into a caller-owned buffer.
+///
+/// No allocation: this runs on the default build's enumeration and service paths, where
+/// `dump_vendor_report`'s `alloc::string::String` is compiled out on purpose. The slice is capped
+/// at `buf.len() / 3` so a longer input truncates instead of running off the scratch.
+fn tp_hex<'a>(buf: &'a mut [u8; TP_HEX_MAX], bytes: &[u8]) -> &'a str {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut n = 0usize;
+    for (k, b) in bytes.iter().enumerate() {
+        if n + 3 > buf.len() {
+            break;
+        }
+        if k > 0 {
+            buf[n] = b' ';
+            n += 1;
+        }
+        buf[n] = HEX[(b >> 4) as usize];
+        buf[n + 1] = HEX[(b & 0xF) as usize];
+        n += 2;
+    }
+    // Safe: every byte written above is ASCII hex or a space.
+    unsafe { core::str::from_utf8_unchecked(&buf[..n]) }
+}
+
+/// TRACKPAD (B139) — the per-report-id census carried on [`IntEp::tp`]. See the block comment
+/// above for why this exists and what its one line answers.
+#[derive(Clone, Copy)]
+struct TpCensus {
+    /// Reports seen per class, indexed by [`TpCensus::slot`]: 0 = id 0x02, 1 = id 0x44, 2 = other
+    /// (which includes the empty report and flight 11's two-byte `60 02` runt).
+    n: [u32; 3],
+    /// Shortest report seen, `u16::MAX` until the first one — see the init comment on `IntEp::tp`.
+    min_len: u16,
+    /// Longest report seen.
+    max_len: u16,
+    /// First `TP_FIRST_BYTES` of the FIRST report of each class, and how many of them are real.
+    first: [[u8; TP_FIRST_BYTES]; 3],
+    first_len: [u8; 3],
+    /// `arch::ms()` of the last line emitted, rate-limiting to one per [`EHCIDARK_ROLLUP_MS`].
+    log_ms: u64,
+    /// Total reports the last emitted line accounted for. A census that has not moved says nothing.
+    logged: u32,
+}
+
+impl TpCensus {
+    const EMPTY: TpCensus = TpCensus {
+        n: [0; 3],
+        min_len: u16::MAX,
+        max_len: 0,
+        first: [[0; TP_FIRST_BYTES]; 3],
+        first_len: [0; 3],
+        log_ms: 0,
+        logged: 0,
+    };
+
+    /// Which counter a report belongs to. Total: any byte sequence maps somewhere, and a report
+    /// too short to HAVE an id byte is `other`, which is the honest answer for `60 02` as well.
+    fn slot(report: &[u8]) -> usize {
+        match report.first() {
+            Some(&TRACKPAD_REPORT_ID) => 0,
+            Some(&TRACKPAD_VENDOR_REPORT_ID) => 1,
+            _ => 2,
+        }
+    }
+
+    /// Charge one report. Called before any decode, so no length gate or id gate can decide
+    /// whether a report is counted — the defect that let flight 11's stream go unnamed.
+    fn note(&mut self, report: &[u8]) {
+        let s = Self::slot(report);
+        self.n[s] = self.n[s].saturating_add(1);
+        let len = report.len().min(u16::MAX as usize) as u16;
+        self.min_len = self.min_len.min(len);
+        self.max_len = self.max_len.max(len);
+        if self.first_len[s] == 0 && !report.is_empty() {
+            let k = report.len().min(TP_FIRST_BYTES);
+            self.first[s][..k].copy_from_slice(&report[..k]);
+            self.first_len[s] = k as u8;
+        }
+    }
+
+    /// Reports charged so far, across every class.
+    fn total(&self) -> u32 {
+        self.n[0]
+            .saturating_add(self.n[1])
+            .saturating_add(self.n[2])
+    }
+}
+
+/// TRACKPAD (B139) — emit the census line, at most once per [`EHCIDARK_ROLLUP_MS`] and only when
+/// the census has moved since the line before it.
+fn tp_census_rollup(e: &mut IntEp, idx: usize, now_ms: u64) {
+    let total = e.tp.total();
+    if total == e.tp.logged || now_ms.wrapping_sub(e.tp.log_ms) < EHCIDARK_ROLLUP_MS {
+        return;
+    }
+    e.tp.log_ms = now_ms;
+    e.tp.logged = total;
+    let (mut h0, mut h1, mut h2) = ([0u8; TP_HEX_MAX], [0u8; TP_HEX_MAX], [0u8; TP_HEX_MAX]);
+    let f0 = e.tp.first_len[0] as usize;
+    let f1 = e.tp.first_len[1] as usize;
+    let f2 = e.tp.first_len[2] as usize;
+    serial_println!(
+        ":: EHCI-HID: [{}] [tp] ids=02:{},44:{},other:{} sizes={}/{} first_bytes=02[{}] 44[{}] other[{}] == witness ::",
+        idx,
+        e.tp.n[0], e.tp.n[1], e.tp.n[2],
+        if e.tp.min_len == u16::MAX { 0 } else { e.tp.min_len },
+        e.tp.max_len,
+        tp_hex(&mut h0, &e.tp.first[0][..f0]),
+        tp_hex(&mut h1, &e.tp.first[1][..f1]),
+        tp_hex(&mut h2, &e.tp.first[2][..f2]),
+    );
+}
+
+/// TRACKPAD (B139) — where ONE report off the vendor-multitouch endpoint goes.
+///
+/// The endpoint's descriptor declares Report ID 0x44 and nothing else, but the device on this
+/// bench streams Report ID 0x02 whatever the mode switch asks for (flight 11, 5,706 reports). So
+/// the routing decision is a property of the REPORT, never of the descriptor, and this is the one
+/// place that makes it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TpRoute {
+    /// Report ID 0x02 — an 8-byte relative (mouse-shaped) report from the trackpad's own
+    /// interface. Goes into the SAME relative pointer install the boot-mouse arm uses, with the
+    /// same fold/lag accounting, because by the time it reaches `pal::push_pointer_report` the two
+    /// are indistinguishable — one `Event::Mouse`, one ring, one consumer.
+    Rel { buttons: u8, dx: i32, dy: i32 },
+    /// Report ID 0x44 — the vendor-multitouch frame the descriptor promises and this device has
+    /// never sent. Decoded at the `VMT_FINGER_*` HYPOTHESIS offsets and WITNESSED, never
+    /// installed: the offsets are unconfirmed on silicon, and installing pointer motion from an
+    /// unverified byte map is exactly the move this arc is undoing elsewhere.
+    Mt { present: bool, x: i32, y: i32 },
+    /// Anything else — a runt, an empty completion, an id this endpoint has no decode for. Counted
+    /// by the census, routed nowhere. Flight 11's `60 02` is this.
+    None,
+}
+
+/// TRACKPAD (B139) — the id dispatcher. Total and bounds-safe on any input; both decoders it
+/// delegates to already gate on length and id, so a malformed report reaches `TpRoute::None`
+/// rather than a partial read.
+fn trackpad_dispatch(report: &[u8]) -> TpRoute {
+    match report.first() {
+        Some(&TRACKPAD_REPORT_ID) => match decode_trackpad_rel(report) {
+            Some((buttons, dx, dy)) => TpRoute::Rel { buttons, dx, dy },
+            None => TpRoute::None,
+        },
+        Some(&TRACKPAD_VENDOR_REPORT_ID) => {
+            match decode_vendor_first_finger(report, TRACKPAD_VENDOR_REPORT_ID) {
+                Some((present, x, y)) => TpRoute::Mt { present, x, y },
+                None => TpRoute::None,
+            }
+        }
+        _ => TpRoute::None,
+    }
+}
+
+/// TRACKPAD (B139) self-test — **the four reports flight 11 actually captured, replayed through
+/// the dispatcher.** QEMU has no Apple trackpad, so this is the only way the routing decision can
+/// be proven on a QEMU gate at all; the bytes are not synthetic, they are the verbatim capture
+/// (`trackpad-logs/f11.log`, the four `vendor-multitouch raw report #N` lines at 28063 ms and
+/// 112433/112445/112451 ms), so what is under test is the real wire and not a convenient one.
+///
+/// ASSERTED, and each assertion is a fact off that log:
+///   * `60 02` (report #1, 2 B) routes NOWHERE. It is the runt that consumed the old one-shot
+///     `trackpad format witness` at `e.reports == 1` and left the whole 970-second sitting with no
+///     line naming the stream's report id. The census counts it as `other`; the dispatcher gives
+///     it no route.
+///   * reports #2/#3/#4 route to ONE RELATIVE INSTALL EACH, `dx=-7 dy=0` / `dx=-6 dy=0` /
+///     `dx=-7 dy=0` — the int8 reading of bytes [2]/[3]. (A le16 reading of the same bytes gives
+///     +249, not -7: `f9 00` little-endian is 0x00f9. -7 as le16 would be `f9 ff`, which is not
+///     what the pad sent. The int8 map is the one the wire supports.)
+///   * a Report ID 0x44 frame built at the `VMT_FINGER_*` hypothesis offsets routes to the
+///     EXISTING first-finger decode, unchanged — the path kept for the flight on which the mode
+///     switch finally latches.
+///   * an empty completion routes nowhere (bounds safety: `report.first()` is `None`).
+///   * the census over exactly those five inputs reads `02:3,44:1,other:1` with `sizes=2/49` —
+///     the histogram's own arithmetic, on the population that produced it.
+///
+/// GO-RED: mutate `trackpad_dispatch` (swap the two id arms, or drop the 0x02 arm) and this line
+/// prints `:: FAIL ::`, which is one of mbench's three phase-unbound FORBID builtins — the run
+/// reds with no spec re-pinned and no threshold chosen.
+unsafe fn trackpad_dispatch_selftest() {
+    // Flight 11, verbatim off the wire.
+    let r1: [u8; 2] = [0x60, 0x02];
+    let r2: [u8; 8] = [0x02, 0x00, 0xf9, 0x00, 0x00, 0x00, 0xfb, 0x00];
+    let r3: [u8; 8] = [0x02, 0x00, 0xfa, 0x00, 0x00, 0x00, 0xfc, 0x00];
+    let r4: [u8; 8] = [0x02, 0x00, 0xf9, 0x00, 0x00, 0x00, 0xfb, 0x00];
+    // The 0x44 frame this device has never sent, at the hypothesis offsets the decode uses.
+    let mut mt = [0u8; 1 + VMT_FINGER_TOUCH + 2];
+    mt[0] = TRACKPAD_VENDOR_REPORT_ID;
+    mt[1 + VMT_FINGER_ABS_X..1 + VMT_FINGER_ABS_X + 2].copy_from_slice(&100i16.to_le_bytes());
+    mt[1 + VMT_FINGER_ABS_Y..1 + VMT_FINGER_ABS_Y + 2].copy_from_slice(&200i16.to_le_bytes());
+    mt[1 + VMT_FINGER_TOUCH..1 + VMT_FINGER_TOUCH + 2].copy_from_slice(&10u16.to_le_bytes());
+    let empty: [u8; 0] = [];
+
+    let d1 = trackpad_dispatch(&r1);
+    let d2 = trackpad_dispatch(&r2);
+    let d3 = trackpad_dispatch(&r3);
+    let d4 = trackpad_dispatch(&r4);
+    let dm = trackpad_dispatch(&mt);
+    let de = trackpad_dispatch(&empty);
+
+    let runt_ok = d1 == TpRoute::None;
+    let rel_ok = d2 == TpRoute::Rel { buttons: 0x00, dx: -7, dy: 0 }
+        && d3 == TpRoute::Rel { buttons: 0x00, dx: -6, dy: 0 }
+        && d4 == TpRoute::Rel { buttons: 0x00, dx: -7, dy: 0 };
+    let mt_ok = dm == TpRoute::Mt { present: true, x: 100, y: 200 };
+    let empty_ok = de == TpRoute::None;
+
+    // The census, over exactly those five inputs.
+    let mut c = TpCensus::EMPTY;
+    for r in [&r1[..], &r2[..], &r3[..], &r4[..], &mt[..]] {
+        c.note(r);
+    }
+    let census_ok = c.n == [3, 1, 1]
+        && c.min_len == 2
+        && c.max_len == mt.len() as u16
+        && c.first_len[0] == 8
+        && c.first[0][..2] == [0x02, 0x00]
+        && c.first_len[2] == 2
+        && c.first[2][..2] == [0x60, 0x02];
+
+    let ok = runt_ok && rel_ok && mt_ok && empty_ok && census_ok;
+    let (mut h, mut hm) = ([0u8; TP_HEX_MAX], [0u8; TP_HEX_MAX]);
+    let (rel_dx, rel_dy, rel_btn) = match d2 {
+        TpRoute::Rel { buttons, dx, dy } => (dx, dy, buttons),
+        _ => (0, 0, 0xFF),
+    };
+    let (mt_present, mt_x, mt_y) = match dm {
+        TpRoute::Mt { present, x, y } => (present, x, y),
+        _ => (false, 0, 0),
+    };
+    serial_println!(
+        ":: EHCI-HID: [tp] dispatch self-test capture={} -> rel buttons={:#04x} dx={} dy={} | 0x44 {} -> mt present={} x={} y={} | runt={} rel={} mt={} empty={} census=02:{},44:{},other:{} sizes={}/{} ok={} :: {} ::",
+        tp_hex(&mut h, &r2),
+        rel_btn, rel_dx, rel_dy,
+        tp_hex(&mut hm, &mt[..4]),
+        mt_present, mt_x, mt_y,
+        runt_ok, rel_ok, mt_ok, empty_ok,
+        c.n[0], c.n[1], c.n[2], c.min_len, c.max_len,
+        ok,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+
 /// MT-INVESTIGATION (IVY) — what `decode_wellspring_type2` extracts from one raw TYPE2 frame.
 /// Only the fields the arc actually needs: the frame-level count/button, and the FIRST finger's
 /// position + contact state (deeper multitouch is a later arc; the decoder validates the whole
@@ -17155,6 +17605,10 @@ unsafe fn parser_selftest() {
         hostile_bounded, MAX_REPORT_FIELDS, legit_ok
     );
     vendor_multitouch_selftest();
+    // TRACKPAD (B139): the id DISPATCHER, fed flight 11's own four captured reports. Runs on every
+    // build for the same reason `vendor_multitouch_selftest` does — the routing decision is the
+    // only part of the trackpad path QEMU can exercise at all, since QEMU has no Apple pad.
+    trackpad_dispatch_selftest();
     // MT-INVESTIGATION (IVY, `mtraw` only): the ONLY QEMU-provable witness for the raw TYPE2
     // decoder — QEMU has no Wellspring pad, so a synthetic frame stands in. Compiled out (and so
     // silent) on a default build.
