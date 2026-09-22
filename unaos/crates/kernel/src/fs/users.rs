@@ -1013,3 +1013,48 @@ pub fn login_fixture() {
         );
     }
 }
+
+// =========================================================================================
+// LOGINFLOW (M1) — THE TAIL APPEND, and the two reasons it is at the TAIL and knob-gated
+// =========================================================================================
+//
+// `fs/mod.rs:106` declares this module UNCONDITIONALLY (`pub mod users;`), so unlike `video/login.rs`
+// — which `video/crystal.rs`'s tail declares under `#[cfg(feature = "login")]` and which therefore
+// does not exist knob-off at all — every line of this file is in a DEFAULT image. Two consequences,
+// and both are rules rather than preferences (LAWS §5, rmbp-ledger PI5):
+//
+//  1. **TAIL, because a panic `Location` is a line number.** An insert anywhere above shifts the
+//     `Location` of every panic site below it in this file, and `./arroyo knoboff login <baseline>`
+//     compares the knob-OFF image BYTE FOR BYTE. Appending below the last item shifts nothing.
+//  2. **`#[cfg(feature = "login")]`, because "unreferenced, so the linker drops it" is a claim about
+//     an optimiser and not about the source.** Gated, the functions below are not COMPILED knob-off,
+//     which is a fact the build reproduces on every host at every opt level.
+
+/// LOGINFLOW M1 — **the store's own name-by-row accessor, so the login screen can SHOW who lives on
+/// this machine.** The screen draws one row per user and a press on a row picks that name
+/// (`video/login.rs`'s `Ctl::User`), which is the gesture that makes the name field optional for the
+/// person who owns the machine — the Mac model, and the only reason a first-time user is not required
+/// to remember a string they typed once.
+///
+/// Row order is the STORE's order (creation order, as `create_user` appends and `parse_image` reads
+/// back), so the index on a `[login] press … control=user-row` line reads against `/USERS.DAT`
+/// directly. Returns the length written into `out`, or `None` when `i` is past the end — never a
+/// partially written buffer, and never the empty name a corrupt row would carry (`UserRec::read`
+/// refuses those at parse time, so a row that is present is a row that is valid).
+///
+/// This is `home_of`'s shape with the lookup key inverted, and it takes the same one lock for the same
+/// length of time. It is deliberately NOT a slice-returning accessor: `TABLE` is behind a `spin::Mutex`
+/// and a borrow of a row could not outlive the guard.
+#[cfg(feature = "login")]
+pub fn name_at(i: usize, out: &mut [u8; NAME_MAX]) -> Option<usize> {
+    let t = TABLE.lock();
+    if i >= t.count as usize {
+        return None;
+    }
+    let n = t.rows[i].name();
+    if n.is_empty() {
+        return None;
+    }
+    out[..n.len()].copy_from_slice(n);
+    Some(n.len())
+}

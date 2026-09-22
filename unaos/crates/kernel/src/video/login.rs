@@ -77,6 +77,28 @@
 //! launches it (R49 retired exactly that machinery and this does not bring it back). Esc already does
 //! not close the screen (R24, proven by M3's `esc_kept` leg); the close box is the same kind of no,
 //! and now so is every other way the row could go.
+//!
+//! LOGINFLOW (SO44's second sentence) — **THE PRESS IS THE SCREEN'S, AND A SCREEN THAT ONLY SWALLOWS
+//! IS A WALL.** SO44's rule is two sentences: *a press outside the rectangle belongs to nobody* **and**
+//! *a press inside it belongs to IT*. SESSGATE landed the first — [`press_swallow`] answered `true`
+//! for every point, both routers stopped there, no tile launched and no row was raised — and that is
+//! the whole of the barrier and none of the screen. To the person in front of it the two are not
+//! distinguishable from a machine that has hung: press the password field and the caret does not move,
+//! press where a button should be and there is no button, and nothing anywhere says why.
+//!
+//! So the coordinates [`press_swallow`] has always taken and thrown away are USED. [`local_of`] maps
+//! the panel point through the row's own `wm` geometry, [`ctl_at`] asks which control is there, and the
+//! control acts: the two fields focus, the button submits (the SAME [`submit`] Enter calls — there is
+//! no second path to keep in step), a user's row picks that name out of the STORE and moves to the
+//! password. The return value is unchanged and MUST stay unchanged: `true` for EVERY press while the
+//! screen is up, hit or miss, because the modality is the ROUTER's contract and is not conditioned on
+//! there being a control under the point.
+//!
+//! The screen therefore SHOWS who lives on this machine (`users::name_at`, the Mac model) and carries
+//! a button, because Enter is not discoverable and a person who has just chosen a password has no
+//! reason to know it is the only way in. The painter and the press read ONE accessor, [`ctl_rect`] —
+//! `wm::control_disc`'s discipline, for LOGINCLOSE's reason one layer out: a control drawn from one
+//! rect and hit-tested from another is one edit from being drawn where it cannot be pressed.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -153,6 +175,121 @@ static LOGINS: AtomicU32 = AtomicU32::new(0);
 /// route that did it has to be named and shut. Zero is the expected reading everywhere except the
 /// fixture's own CLOSE leg, which drives `wm::close` at the row on purpose.
 static HEALS: AtomicU32 = AtomicU32::new(0);
+/// LOGINFLOW — presses the screen ANSWERED (a control was hit) and presses it merely SWALLOWED. The
+/// pair is the witness for SO44's second half: `swallowed` alone proves the BARRIER, and only
+/// `answered` proves the screen is a screen rather than a wall.
+static PRESS_ANSWERED: AtomicU32 = AtomicU32::new(0);
+static PRESS_SWALLOWED: AtomicU32 = AtomicU32::new(0);
+/// One `control=none` press line per open, not one per press: a trackpad resting on the glass emits
+/// presses a human never counts, and a witness that scrolls the boot log away is not a witness. A hit
+/// on a CONTROL always prints — those are countable by construction, because a person made each one.
+static MISS_SAID: AtomicBool = AtomicBool::new(false);
+
+// ---------------------------------------------------------------------------
+// LAYOUT — **ONE accessor, read by the painter AND by the press.**
+// ---------------------------------------------------------------------------
+//
+// LOGINFLOW M1 — `wm::control_disc`'s discipline applied to the screen's own face, and it is the same
+// argument LOGINCLOSE's doc makes about the window chrome one layer out: *a control DRAWN from one
+// rect and HIT-TESTED from another is one edit away from being drawn where it cannot be pressed*, and
+// nothing on the glass would say so — the button would simply be dead under the pointer, on the first
+// thing anyone sees. So [`repaint`] and [`ctl_at`] both go through [`ctl_rect`] and neither carries a
+// literal of its own.
+
+/// The screen's pressable controls, in the order [`ctl_at`] asks about them.
+#[derive(Clone, Copy, PartialEq)]
+enum Ctl {
+    /// The name field — a press focuses it.
+    NameField,
+    /// The password field — a press focuses it.
+    PwField,
+    /// Log In / Create — a press IS [`submit`], the same call Enter makes.
+    Button,
+    /// A user's row: the screen SHOWS who lives on this machine (the Mac model), and a press picks
+    /// that name into the field and moves to the password. The `usize` is the store's row index.
+    User(usize),
+}
+
+const LX: usize = 24;
+/// User rows drawn. Four fit the 392 px of content width at `USER_W` + `USER_GAP`; the store holds up
+/// to `users::MAX_USERS` (8). A machine with more users than fit still LOGS IN — the name field is the
+/// general answer and the rows are the shortcut — so this is a drawing bound and not a limit on
+/// anything the flow can do.
+const USER_MAX: usize = 4;
+const USER_W: usize = 92;
+const USER_GAP: usize = 8;
+const FIELD_X: usize = LX + 100;
+const FIELD_W: usize = W - 2 * LX - 100;
+const FIELD_H: usize = CELL + 8;
+const BTN_W: usize = 120;
+const BTN_H: usize = 28;
+
+/// How many user rows the screen draws. Zero on the create-first-user screen, by construction.
+fn user_rows() -> usize {
+    users::count().min(USER_MAX)
+}
+
+/// The rect of one control, in SURFACE pixels. The ONE place any of these numbers exists.
+fn ctl_rect(c: Ctl) -> (usize, usize, usize, usize) {
+    match c {
+        Ctl::User(i) => (LX + i * (USER_W + USER_GAP), 46, USER_W, FIELD_H),
+        Ctl::NameField => (FIELD_X, 76, FIELD_W, FIELD_H),
+        Ctl::PwField => (FIELD_X, 112, FIELD_W, FIELD_H),
+        Ctl::Button => (W - LX - BTN_W, 150, BTN_W, BTN_H),
+    }
+}
+
+/// Which control is at a SURFACE point, if any — the press's half of [`ctl_rect`], with no rect of its
+/// own. The fields and the button are asked first and the user rows last: the rows are the only
+/// controls whose COUNT varies, so asking them last keeps a store that grows from moving the answer
+/// anywhere the fixed controls already claim.
+fn ctl_at(lx: i32, ly: i32) -> Option<Ctl> {
+    let inside = |c: Ctl| {
+        let (rx, ry, rw, rh) = ctl_rect(c);
+        lx >= rx as i32 && lx < (rx + rw) as i32 && ly >= ry as i32 && ly < (ry + rh) as i32
+    };
+    for c in [Ctl::NameField, Ctl::PwField, Ctl::Button] {
+        if inside(c) {
+            return Some(c);
+        }
+    }
+    (0..user_rows()).map(Ctl::User).find(|&c| inside(c))
+}
+
+/// The control's name on the wire. NEVER the user's own name: a login screen's serial log must not be
+/// a roster, and the row index is enough to read the line back against the store.
+fn ctl_name(c: Option<Ctl>) -> &'static str {
+    match c {
+        Some(Ctl::NameField) => "name-field",
+        Some(Ctl::PwField) => "password-field",
+        Some(Ctl::Button) => "button",
+        Some(Ctl::User(_)) => "user-row",
+        None => "none",
+    }
+}
+
+/// PANEL pixels -> SURFACE pixels, through the row's own `wm` geometry (origin AND integer upscale), or
+/// `None` where there is no row (headless) or the point lies outside the surface. The subtraction
+/// happens FIRST and its sign is checked BEFORE the divide: Rust's integer division truncates toward
+/// zero, so `-1 / 2` reads as `0` and a press one pixel ABOVE the window would land inside its first
+/// row.
+fn local_of(x: i32, y: i32) -> Option<(i32, i32)> {
+    let id = WIN.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE {
+        return None;
+    }
+    let info = wm::info(id)?;
+    let (dx, dy) = (x - info.x as i32, y - info.y as i32);
+    if dx < 0 || dy < 0 {
+        return None;
+    }
+    let s = info.scale.max(1) as i32;
+    let (lx, ly) = (dx / s, dy / s);
+    if lx >= W as i32 || ly >= H as i32 {
+        return None;
+    }
+    Some((lx, ly))
+}
 
 // ---------------------------------------------------------------------------
 // drawing (the instgui primitives, on this surface)
@@ -208,6 +345,34 @@ fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: 
     }
 }
 
+/// LOGINFLOW M1 — the push button, drawn from [`ctl_rect`] like every other control. A bevel, a frame
+/// and a centred caption in the `theme`'s own button colours: the point is not the styling, it is that
+/// there IS a thing to press, because Enter is not discoverable and a person who has just created a
+/// password has no reason to know it is the only way in.
+fn button(px: &mut [u32], c: Ctl, label: &[u8], primary: bool) {
+    let (x, y, w, h) = ctl_rect(c);
+    fill(px, x, y, w, h, if primary { theme::ACCENT } else { theme::BUTTON_FACE });
+    rect(px, x, y, w, h, theme::FRAME_LINE);
+    let tw = label.len() * CELL;
+    let tx = x + w.saturating_sub(tw) / 2;
+    let ty = y + h.saturating_sub(CELL) / 2;
+    text(px, tx, ty, label, if primary { theme::BEVEL_LIGHT } else { theme::BUTTON_TEXT });
+}
+
+/// LOGINFLOW M1 — one user's row. The screen says WHO lives on this machine, which is the Mac model
+/// and is also the only affordance that makes the name field optional for the person who owns the
+/// machine. The name is drawn TRUNCATED to the cell rather than clipped mid-glyph, and it is the only
+/// place a user's name is put on the glass before a session exists — deliberate, and the reason the
+/// wire line for a press on one says `user-row` and an INDEX, never the name.
+fn user_row(px: &mut [u32], i: usize, name: &[u8], picked: bool) {
+    let (x, y, w, h) = ctl_rect(Ctl::User(i));
+    fill(px, x, y, w, h, if picked { theme::ACCENT } else { theme::CONTENT_FILL });
+    rect(px, x, y, w, h, if picked { theme::ACCENT } else { theme::FRAME_LINE });
+    let max = (w - 12) / CELL;
+    let n = name.len().min(max);
+    text(px, x + 6, y + 4, &name[..n], if picked { theme::BEVEL_LIGHT } else { theme::CONTENT_TEXT });
+}
+
 fn repaint() {
     let f = FORM.lock();
     if !f.windowed {
@@ -217,19 +382,30 @@ fn repaint() {
     let px: &mut [u32] = unsafe { &mut (*core::ptr::addr_of_mut!(SURF)).0 };
     fill(px, 0, 0, W, H, theme::CHROME_FACE);
     rect(px, 2, 2, W - 4, H - 4, theme::FRAME_LINE);
-    let lx = 24;
     let first = users::count() == 0;
     let title: &[u8] = if first { b"Create the first user" } else { b"Log in to UnaOS" };
-    text(px, lx, 20, title, theme::CONTENT_TEXT);
-    fill(px, lx, 42, W - 2 * lx, 2, theme::FRAME_LINE);
-    text(px, lx, 62, b"Name", theme::TITLE_TEXT_INACTIVE);
-    field(px, lx + 100, 56, W - 2 * lx - 100, &f.name[..f.name_len], f.focus == Focus::Name, false);
-    text(px, lx, 102, b"Password", theme::TITLE_TEXT_INACTIVE);
-    field(px, lx + 100, 96, W - 2 * lx - 100, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
-    let hint: &[u8] = if first { b"Enter creates the user and logs in" } else { b"Enter logs in   Tab switches field" };
-    text(px, lx, 150, hint, theme::TITLE_TEXT_INACTIVE);
+    text(px, LX, 14, title, theme::CONTENT_TEXT);
+    fill(px, LX, 36, W - 2 * LX, 2, theme::FRAME_LINE);
+    // The user rows, when there are users. `name_at` is the store's own accessor, so the row a press
+    // picks and the row the painter draws are the same row by construction — the `ctl_rect` argument
+    // one layer up, applied to the CONTENT as well as to the geometry.
+    let mut nb = [0u8; users::NAME_MAX];
+    for i in 0..user_rows() {
+        if let Some(n) = users::name_at(i, &mut nb) {
+            user_row(px, i, &nb[..n], f.name_len == n && f.name[..n] == nb[..n]);
+        }
+    }
+    let (nx, ny, nw, _) = ctl_rect(Ctl::NameField);
+    text(px, LX, ny + 4, b"Name", theme::TITLE_TEXT_INACTIVE);
+    field(px, nx, ny, nw, &f.name[..f.name_len], f.focus == Focus::Name, false);
+    let (pxf, py, pwf, _) = ctl_rect(Ctl::PwField);
+    text(px, LX, py + 4, b"Password", theme::TITLE_TEXT_INACTIVE);
+    field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
+    button(px, Ctl::Button, if first { b"Create" } else { b"Log In" }, true);
+    let hint: &[u8] = if first { b"Enter or Create makes the user" } else { b"Enter or Log In   Tab switches" };
+    text(px, LX, 186, hint, theme::TITLE_TEXT_INACTIVE);
     if !f.message.is_empty() {
-        text(px, lx, 190, f.message.as_bytes(), theme::ACCENT);
+        text(px, LX, 212, f.message.as_bytes(), theme::ACCENT);
     }
     drop(f);
     let id = WIN.load(Ordering::Relaxed);
@@ -263,6 +439,7 @@ fn open() {
         f.message = "";
         f.windowed = false;
     }
+    MISS_SAID.store(false, Ordering::Relaxed); // LOGINFLOW — the one miss line is per OPEN, not per boot
     if HEADLESS.load(Ordering::Relaxed) {
         serial_println!("[login] screen open window=no (fixture — headless form)");
         return;
@@ -356,12 +533,89 @@ pub fn is_open() -> bool {
 /// that a screen which one day grows a live region (a "switch user" affordance, say) narrows this in place
 /// rather than through a new seam. There is no press this function may decline while the screen is up.
 ///
-/// It does NOT swallow keys — [`consume_key`] is that seam, unchanged — and it does not ACT: nothing is
-/// raised, focused, launched or closed by a `true` here. The router consumes the press and drops its
-/// release, the grammar every furniture arm already follows.
+/// It does NOT swallow keys — [`consume_key`] is that seam, unchanged.
+///
+/// # LOGINFLOW M1 — **AND THEN THE PRESS IS THE SCREEN'S, WHICH IS THE HALF SO44 ASKED FOR.**
+///
+/// SESSGATE stopped the press at the router and stopped it there COMPLETELY: `true` for every point,
+/// nothing raised, nothing focused, nothing launched. That closed SO36's furniture half and the
+/// stranding half of SO44 — and it left the screen a WALL. SO44's rule is two sentences and only the
+/// second one had landed: *a press outside the rectangle belongs to nobody* **and** *a press inside it
+/// BELONGS TO IT*. A barrier that answers every press with silence is indistinguishable, to the person
+/// sitting in front of it, from a machine that has hung: Peter presses the password field and the
+/// caret does not move, presses where a button should be and there is no button. So the coordinates
+/// this function has always taken and thrown away are now USED — translated through the row's own `wm`
+/// geometry ([`local_of`]) and asked of [`ctl_at`], the press half of the painter's [`ctl_rect`].
+///
+/// **The return value does not change and MUST not.** It is still `true` for every press while the
+/// screen is up, including a press that hits no control — the modality is the ROUTER's contract and it
+/// is not conditioned on the screen having a control under the point. `answered` and `swallowed` are
+/// counted separately so the wire can tell a screen that is answering from a barrier that is merely
+/// holding; `PRESS_ANSWERED` staying 0 across a boot with presses on it is the reading that means the
+/// controls have come unstuck from the paint.
+///
+/// **Headless is NOT a special case and takes no branch of its own**: [`local_of`] answers `None`
+/// where there is no row, `ctl_at` is never asked, and the press is swallowed exactly as before — which
+/// is what the ladder's legs have always measured and must keep measuring.
+///
+/// The RELEASE is still the router's to drop (`CLICK_TARGET_DROP`), so a control fires on the press
+/// edge, once, the grammar the close disc and every furniture arm already follow.
 pub fn press_swallow(x: i32, y: i32) -> bool {
-    let _ = (x, y);
-    is_open()
+    if !is_open() {
+        return false;
+    }
+    // LOGINCLOSE — the same belt [`consume_key`] runs, for the same reason and one layer earlier: a
+    // press routed into a screen that is not on the glass is a press into nothing, and the row's
+    // geometry is exactly what [`local_of`] is about to read.
+    heal_if_row_gone();
+    let hit = local_of(x, y).and_then(|(lx, ly)| ctl_at(lx, ly));
+    match hit {
+        Some(Ctl::NameField) => FORM.lock().focus = Focus::Name,
+        Some(Ctl::PwField) => FORM.lock().focus = Focus::Password,
+        // A press on the button IS Enter. One call, so the two routes into a session cannot drift:
+        // there is no second submit path to keep in step with `consume_key`'s.
+        Some(Ctl::Button) => submit(),
+        Some(Ctl::User(i)) => pick_user(i),
+        None => {}
+    }
+    if hit.is_some() {
+        PRESS_ANSWERED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        PRESS_SWALLOWED.fetch_add(1, Ordering::Relaxed);
+    }
+    // A CONTROL always says so; a miss says so once per open (see `MISS_SAID`). Neither line carries a
+    // typed byte, a user's name or a field length — the whole point of this screen is that what is
+    // typed into it does not reach the wire.
+    if hit.is_some() || !MISS_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            "[login] press at=({},{}) control={} answered={} swallowed={} (SO44: while the screen is open every press is the screen's — the router stops it and THIS decides what it means)",
+            x, y, ctl_name(hit),
+            PRESS_ANSWERED.load(Ordering::Relaxed),
+            PRESS_SWALLOWED.load(Ordering::Relaxed)
+        );
+    }
+    repaint();
+    true
+}
+
+/// LOGINFLOW M1 — a press on a user's row picks that name. The password is cleared with it and the
+/// focus moves to the password field, which is the whole gesture a Mac login is: point at yourself,
+/// type the password, Enter. The name is copied from the STORE (`users::name_at`), never from the
+/// glass, so a row that cannot be read picks nothing rather than picking a truncated name.
+fn pick_user(i: usize) {
+    let mut nb = [0u8; users::NAME_MAX];
+    let Some(n) = users::name_at(i, &mut nb) else {
+        return;
+    };
+    let mut f = FORM.lock();
+    f.name[..n].copy_from_slice(&nb[..n]);
+    f.name_len = n;
+    for b in f.pw.iter_mut() {
+        *b = 0;
+    }
+    f.pw_len = 0;
+    f.focus = Focus::Password;
+    f.message = "";
 }
 
 /// LOGINCLOSE — **the three pieces of the screen's state move together, or the machine is dead.**
@@ -670,12 +924,8 @@ fn close_leg() -> (&'static str, bool) {
     // after `hit_test` names an id), which puts it above the screen — Peter, render14: *"the login
     // window appeared over the top of the gui and when i click it it went away."*
     //
-    // READ-ONLY and no verdict: this is the MEASUREMENT SO44's row cites, not its fix. `hit_test` is a
-    // pure read over the window table; nothing is pressed, raised or focused by this line. The fix is
-    // MODALITY at the shared furniture router (`video/strip.rs`'s `press_route`, the one seam both
-    // arch routers ask ahead of every window arm) and that file is outside this executor's list, so
-    // the exact change is reported and not made. `MODAL` is the reading once it lands; `FALLS-THROUGH`
-    // is today's, and it names the row that takes the press instead.
+    // READ-ONLY and no verdict: `hit_test` is a pure read over the window table; nothing is pressed,
+    // raised or focused by this line.
     let (cxp, cyp) = (
         info.x.saturating_add(info.w.saturating_mul(info.scale) / 2) as i32,
         info.y.saturating_add(info.h.saturating_mul(info.scale) / 2) as i32,
