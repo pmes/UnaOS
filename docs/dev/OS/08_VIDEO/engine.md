@@ -17976,3 +17976,119 @@ Kepler card, or these two legs stay metal-only).
 -> FAIL`, on flights 8, 9 and 10 alike (the flight-10 verdict word, cut in the seat's excerpt, is
 FAIL). The QEMU lane prints `adopt_stretch=4/4 -> PASS`, so the discriminator is the stretch-adopt
 count and nothing else in that line. It is a separate arc and is owed its own row.
+
+## DMGOVLP2 — the stretch was convicting CURSTICK of a schedule it does not own (x86 `wc`, 2026-09-22)
+
+**The red.** `[dmgovlp] verdict … adopt_stretch=0/4 -> FAIL` on rMBP flights 8, 9 and 10, `4/4 ->
+PASS` on QEMU — the third metal-only fixture red BOOTFAILS left standing and explicitly did not fix.
+BOOTFAILS's cause (the menu bar) is NOT this one, and the discriminator is not the adopt count
+either: it is one field of the fixture's own per-pass line, and the fixture already printed it.
+
+**What the wire says, counted before any claim** (capture `~/unaos-bench/capture/rmbp12-flight8/
+ttyUSB0.log`, read-only with `awk index()`; boots at 10 / 6654 / 11269 by `=== SQUAWK MARK`):
+
+    [dmgovlp] stretch pass=8..11 pre=(false,0,0) dd=8840 db=8840 offers=0 taken=0     (flights 8, 9)
+    [dmgovlp] stretch pass=8..11 pre=(true,0,0)  dd=0    db=0    offers=0 taken=0     (flight 10)
+    [dmgovlp] verdict … drag_evt=12 drag_px=383900 relay=4 narrow=8/12 cur=12/12 adopt=27 … 0/4 FAIL
+    [dmgovlp] verdict … drag_evt=8  drag_px=622620 relay=2 narrow=2/12 cur=12/12 adopt=13 … 0/4 FAIL
+    [dmgovlp] verdict … drag_evt=11 drag_px=371490 relay=2 narrow=5/12 cur=12/12 adopt=10 … 0/4 FAIL
+
+against the QEMU green (`docs/dev/evidence/orin23/battery-postmetal-600887c2.log:3414-3418`):
+
+    [dmgovlp] stretch pass=8..11 pre=(false,0,0) dd=8840 db=8840 offers=1 taken=1
+    [dmgovlp] verdict … narrow=3/12 cur=12/12 adopt=25 … adopt_stretch=4/4 -> PASS
+
+`cur=12/12` on every metal boot, so the sprite plan is LIVE at every pass; `dd == db == 8840` on
+flights 8 and 9 is the whole outer box (170x52), so the CURSTICK widening FIRED — `w5`'s two-row
+seed was promoted to the whole box exactly as on the green lane. **The only field that differs is
+`offers=`, and it is zero.** `CUR3_OFFERS` moves in `note_cursor_overlay`, one per `compose_into`
+call, so `offers=0` means no staged window was ever OFFERED the sprite. The pre-CURSTICK RED
+calibration reads `offers=1 taken=0` — offered and empty. The fixture could not tell the two apart
+and called both a carry failure.
+
+**The precondition, and it is a witness instrument's schedule.** `composite_inner` withholds the
+offer per window (`wm.rs:6318-6331`, `#[cfg(feature = "witness")]` only): for `!compat && presented
+&& id < 32`, `wcd_ref.is_some() || VERIFIED & bit == 0` sets `may_overlay = false`, and
+`draw_window` then hands `stage_window` `offer = None` — no `compose_into`, no `CUR3_TAKEN`,
+WHATEVER the band holds. WC-I's invariant owns that exclusion (no verified pixel may be read back
+with the sprite on the panel), and a window keeps it until WC-D publishes its FIRST VERDICT.
+So the stretch's carry claim silently depends on WC-D having verified `w5` before pass 8. Measured
+on both lanes, and the answer is a schedule:
+
+  * QEMU: `[wc-d] verify win=6 surf=160x8 … at (97,141) panel=1280x800` at log line 3406 — that IS
+    the fixture's `w5` (160x8 surface, staircase content origin) — eight lines before the stretch.
+    15 verify lines in that boot.
+  * rMBP: `awk 'index($0,"[wc-d] verify") && index($0,"surf=160x8")'` over the whole capture = **0
+    lines**. The six fixture rows were never verified on ANY of the three boots. WC-D's metal
+    cadence is seconds (26 verify lines in 654 s, ids 1/2/3 at 23–38 s) against a battery that runs
+    in ONE millisecond (`39390ms` → `39391ms`), so the verdict cannot land inside it.
+
+The exclusion is compiled out of a non-witness build, so nothing the product ships is defective
+here: on a witness boot the carry simply does not engage for an unverified row and the pass takes
+the documented `Repaint` tail, which is CURSOR-3's always-correct fallback (`drained=12/12` on all
+three metal boots says no storm followed). **The fixture is what was wrong.**
+
+**The fix (fixture only, line-neutral, grammar-stable).** `stretch_offer` counts the stretch passes
+whose `CUR3_OFFERS` moved — the denominator the carry claim is entitled to — and the threshold
+becomes `adopt_stretch >= STRETCH_MIN.min(stretch_offer)`. An OFFERED battery is the pre-DMGOVLP2
+predicate character for character (RED `offers=1 taken=0` still convicts); an UNOFFERED one asserts
+nothing and says so on its own line:
+
+    [dmgovlp] stretch UNOFFERED offers=0/4 taken=0 — no staged window was offered the sprite (WC-D
+    has published no first verdict for the stretch row, so `may_overlay` is withheld); the CURSTICK
+    carry is NOT MEASURED on this boot and adopt_stretch does not gate the verdict
+
+The verdict line is untouched — `x86-wc.spec:76`'s REQUIRE is regex-pinned on `adopt_stretch=\d+/4`
+and the new line carries neither `SKIP` nor `-> FAIL`, so no spec edit was needed and none was made.
+
+**Reproduction and go-red, at 1280x800.** The `wcdvalve` knob reaches the precondition but only
+INTERMITTENTLY, and that pair is itself the proof: `UNAOS_WC=1 UNAOS_WCDVALVE=1 UNAOS_QUARRY=1
+UNAOS_QEMU_FULL=1 ./arroyo test 120` on the unfixed tree gave rc 1 with `offers=0 taken=0 … 0/4 ->
+FAIL` and **3** verify lines, none of them `surf=160x8`; the next run of the same command gave
+`offers=1 taken=1 … 4/4` with **15** verify lines including `win=6 surf=160x8`. Same knob, same
+tree — the discriminator is whether `w5` got its verdict, nothing else. (This also names the
+mechanism behind §WCDVALVE-LOOP's standing red, which that section left as "partially known,
+indirect": the valve returns `None` from `verify_reference` before `wcd_admit`, so the first verdict
+is postponed, `may_overlay` stays false and the stretch is never offered. It is a flake of the same
+precondition, not a coupling of its own.)
+
+A SCRATCH HARNESS (one line, `~/unaos-bench/scratch/rmbp-0915/dmgovlp-logs/scratch-harness.patch`,
+NEVER COMMITTED) makes it deterministic by forcing the metal state for the six fixture rows only —
+`|| (r.owner_asid >= KERNEL_OWNER_BASE + 0x40 && r.owner_asid <= KERNEL_OWNER_BASE + 0x45)` in that
+same exclusion — and nothing else in the kernel. `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_QEMU_FULL=1
+./arroyo test 120`, no valve knob, plain 1280x800 lane:
+
+  * UNFIXED + harness: rc 1, `stretch pass=8..11 pre=(false,0,0) dd=8840 db=8840 offers=0 taken=0`,
+    `verdict … drag_evt=5 drag_px=38590 relay=3 narrow=3/12 cur=12/12 adopt=25 repaint=0 max_ms=4
+    adopt_stretch=0/4 -> FAIL` — the metal line field for field; `x86-wc.spec` replay 7/8 required,
+    2 forbidden.
+  * FIXED + harness: rc 0, the same four stretch lines and the same `adopt_stretch=0/4`, now
+    `-> PASS` with the UNOFFERED line beside it; `x86-wc.spec` replay 8/8 required, 0 forbidden.
+  * FIXED, plain (harness reverted, `git diff --numstat` back to 12/12): rc 0, `offers=1 taken=1`
+    ×4, `adopt_stretch=4/4 -> PASS`, no UNOFFERED line, `x86-wc.spec` replay 8/8 / 0 forbidden and
+    the run's own `x86-default.spec` 6/6. The gate lane's reading does not move.
+
+**Gates.** `./arroyo check` rc 0 (159 ✅, 19 pre-existing warnings, none naming the fixture);
+`./arroyo knoboff witness 2fc9c71c` **exit 0** — x86 AND arm knob-off images BYTE-IDENTICAL
+(`1600824` / `1618440`), control fired on both arches, `warm=yes`; `bash unaos/scripts/
+ledger-check.sh` rc 0 before and after. `wm.rs` is LINE-NEUTRAL (`git diff --numstat` 12/12, 28513
+lines both sides): the two new statements ride existing lines ahead of their first `//`, this
+file's standing rule for the Pi track's byte identity.
+
+**Not this arc, stated so the next reader does not re-cut it.** A `[dmgovlp] … drag_evt=0 …` red
+(VFSWIT's `test-fat sf 200` lane, `adopt_stretch=1/4`; also rmbp-ledger B120's `UNAOS_SMP=2` lane
+and WIFISWEEP's one-run flake) is a DIFFERENT class: it fails the `drag_evt > 0` clause because the
+fixture's drags never arrived, and its stretch count is incidental. The metal boots carry
+`drag_evt=12 / 8 / 11` and `drag_px=383900 / 622620 / 371490` — the drag leg RAN on all three — so
+the pointer path is not the metal precondition and the metal red is not that flake.
+
+**What flight 11 must show.** The fixture is expected to read, on the rMBP, with the stretch lines
+printing `offers=0 taken=0` and the UNOFFERED line beside them:
+
+    [dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=<n>0 drag_px=<n>0 relay=<n>0 narrow=<k>/12
+    cur=12/12 adopt=<n> repaint=<n> max_ms=<n> adopt_stretch=0/4 -> PASS
+
+i.e. the same fields the three flights already printed, with the verdict word flipped to PASS by
+the fixture no longer asserting a claim the boot withheld. `adopt_stretch=4/4` on metal would mean
+WC-D's cadence reached the fixture's rows for the first time and is a green of a stronger kind; any
+`-> FAIL` on that line is then a REAL carry failure and reads `offers=1 taken=0` beside it.
