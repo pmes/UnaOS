@@ -214,7 +214,7 @@ refs/heads/exec-orin-fonts2x               ad62cf09 FOLDED-BY-HAND 582278cd     
 refs/heads/exec-orin-ga10b6                07c29a62 LOST           docs/dev/OS/orin-queue.md 2026-09-13
 refs/heads/exec-orin-gatehyg               78ca893a LOST           docs/dev/QUEUE.md         2026-09-13
 refs/heads/exec-orin-loginboot             f14f6505 LOST           docs/dev/QUEUE.md         2026-09-13
-refs/heads/exec-orin-lun2                  bf45f7cb LOST           docs/dev/QUEUE.md         2026-09-13
+refs/heads/exec-orin-lun2                  bf45f7cb FOLDED-BY-HAND 3bbeb754                  2026-09-22
 refs/heads/exec-orin-netverb               23bddcf8 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/heads/exec-orin-orintime              ad549988 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/heads/exec-orin-ptrlost               26646c22 LOST           docs/dev/QUEUE.md         2026-09-13
@@ -228,7 +228,7 @@ refs/remotes/origin/exec-orin-fonts2x      ad62cf09 FOLDED-BY-HAND 582278cd     
 refs/remotes/origin/exec-orin-ga10b6       07c29a62 LOST           docs/dev/OS/orin-queue.md 2026-09-13
 refs/remotes/origin/exec-orin-gatehyg      78ca893a LOST           docs/dev/QUEUE.md         2026-09-13
 refs/remotes/origin/exec-orin-loginboot    f14f6505 LOST           docs/dev/QUEUE.md         2026-09-13
-refs/remotes/origin/exec-orin-lun2         bf45f7cb LOST           docs/dev/QUEUE.md         2026-09-13
+refs/remotes/origin/exec-orin-lun2         bf45f7cb FOLDED-BY-HAND 3bbeb754                  2026-09-22
 refs/remotes/origin/exec-orin-netverb      23bddcf8 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/remotes/origin/exec-orin-orintime     ad549988 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/remotes/origin/exec-orin-ptrlost      26646c22 LOST           docs/dev/QUEUE.md         2026-09-13
@@ -237,14 +237,13 @@ refs/remotes/origin/exec-orin-scrshot      c8d66657 LOST           docs/dev/QUEU
 refs/remotes/origin/exec-orin-sessgate     9f365744 LOST           docs/dev/QUEUE.md         2026-09-13
 refs/remotes/origin/exec-orin-wirehyg      9c42a93c LOST           docs/dev/QUEUE.md         2026-09-13
 refs/heads/exec-orin-ga10b7                0676ed4a LOST           docs/dev/OS/orin-queue.md 2026-09-15
-refs/heads/exec-rmbp-kfunwedge             6c38659d LOST           docs/dev/OS/rmbp-queue.md 2026-09-15
-refs/remotes/origin/exec-rmbp-kfunwedge    6c38659d LOST           docs/dev/OS/rmbp-queue.md 2026-09-15
+refs/heads/exec-rmbp-kfunwedge             6c38659d FOLDED-BY-HAND 3bbeb754                  2026-09-22
+refs/remotes/origin/exec-rmbp-kfunwedge    6c38659d FOLDED-BY-HAND 3bbeb754                  2026-09-22
 
 # IN FLIGHT — the 2026-09-22 rmbp rescue round and the orin rescue. Each line records the CUT, not
 # today's tip: these branches move forward as their executors commit (and an executor that re-reads
 # its brief `git reset --hard`s back to exactly this sha), and the gate only asks that the tip still
 # descend from what is written here.
 refs/heads/exec-rmbp-deskrescue            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
-refs/heads/exec-rmbp-storgpu               2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-toolrescue            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-orin-rescue                fd440602 IN-FLIGHT      orin                      2026-09-22
