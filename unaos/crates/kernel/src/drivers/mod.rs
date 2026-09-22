@@ -61,3 +61,17 @@ pub mod ahci;
 // numbering of every module above is untouched.
 #[cfg(all(target_arch = "x86_64", feature = "hda"))]
 pub mod hda;
+
+// UVC (rmbp-ledger B143): the USB Video Class census + `VS_PROBE_CONTROL` negotiation
+// (UNAOS_UVC=1) — the first time this kernel has read a descriptor out of the camera that has been
+// on the EHCI bus of every boot it has ever taken. CONTROL TRANSFERS ONLY: no isochronous pipe, no
+// VS_COMMIT_CONTROL, no SET_CUR on any VideoControl control (the file header says why each).
+// x86_64-gated because its ONE call site is inside `drivers/ehci/mod.rs`, which is itself
+// `target_arch = "x86_64"`-gated; the FILE is arch-neutral in name and shape — `parse` is a pure
+// function over a descriptor slice and the transfer seam is a closure, so the day another board
+// grows a USB host controller this driver is reached by one more call and no edit (LAWS §3, ONE
+// OS). Knob off => the module is never lexed (the `#[cfg]`-erased `pub mod` is the one case
+// LAWS §5 names as byte-safe) and media are byte-identical. DECLARED LAST, after `hda` and for the
+// reason `ahci` and `hda` were: the knob-off line numbering of every module above is untouched.
+#[cfg(all(target_arch = "x86_64", feature = "uvc"))]
+pub mod uvc;

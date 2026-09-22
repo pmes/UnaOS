@@ -2594,6 +2594,66 @@ fi
 # (stripped by arm_features below, exactly as `hda` itself is).
 # Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
 [ -n "${UNAOS_HDATONE:-}" ] && _feats="${_feats}hda-tone,"
+# UVC (rmbp-ledger B143): UNAOS_UVC=1 arms drivers/uvc.rs — the USB VIDEO CLASS census and the
+# VS_PROBE_CONTROL negotiation. THE DEVICE: the 2012 rMBP's built-in FaceTime HD camera, 05ac:8510,
+# bDeviceClass 0xEF (Miscellaneous, with an Interface Association Descriptor), high speed, on EHCI
+# controller [0] at addr 2, one hop below the root-mounted hub. It has been on the bus of EVERY boot
+# this kernel has ever taken and the only line it has ever produced is the HID walk's shrug —
+# flight 11, verbatim: `:: EHCI-HID: [0] M1 hub-downstream device addr=2 05ac:8510 class=0xef
+# speed=HS depth=1 (parent hub 1 port 1) tt=(hub 0 port 0) == witness ::` then `:: EHCI-HID: [0]
+# addr 2 has no HID interrupt-IN endpoint — nothing to arm ::`.
+#
+# WHAT IT DOES, in three parts, all on EP0 through the same `control()` helper the HID walk and the
+# Bluetooth census issue every transfer through: (1) CENSUS — re-read the configuration descriptor
+# in full, find the bFunctionClass = CC_VIDEO (0x0E) IAD, walk the VideoControl interface (header,
+# camera input terminal with its controls bitmap, processing unit, output terminal) and every
+# VideoStreaming interface (input header, each format with its frame descriptors' geometry and
+# interval table or range), plus every alternate setting's isochronous IN endpoint — `[uvc] vc …`,
+# `[uvc] vs fmt=…`, `[uvc] frame …`, `[uvc] alt=… mps=… mult=…`. (2) PROBE — GET_MIN/GET_MAX/GET_DEF
+# on VS_PROBE_CONTROL, then SET_CUR with the first uncompressed format at its default frame
+# interval, then GET_CUR, printed field by field with an explicit `agreed=` verdict. (3) REFUSALS —
+# a device with no video IAD costs one line and ZERO transfers (`[uvc] skip addr=<n>
+# reason=no-video-iad`); a stall names its stage and its request code and ENDS the sequence, never
+# retries it (a retry storm here would land on the controller the internal keyboard enumerates on).
+#
+# WHAT IT DELIBERATELY DOES NOT DO, and the boundary is the point of the rung: no isochronous pipe
+# is opened (that is the NEXT rung — this driver has no iTD/siTD path and PROBE-14 keeps every
+# transfer on the periodic-QH discipline), VS_COMMIT_CONTROL is NEVER sent (`[uvc] commit=withheld
+# reason=no-iso-pipe` — a committed format with nothing draining it leaves the camera armed for the
+# rest of the boot), and no SET_CUR reaches a VideoControl control (brightness/exposure/focus are
+# read as capability BITMAPS out of the descriptors and never written). The one state change is the
+# standard SET_CONFIGURATION that makes an interface-recipient class request legal at all (USB 2.0
+# §9.4.3), and it is reported on its own line.
+#
+# QEMU MODELS NO UVC DEVICE, so the armed QEMU leg scores the PARSER rather than the camera: a
+# hand-built descriptor set written from the spec's own tables (VC header, camera input terminal,
+# processing unit, output terminal; VS input header, one uncompressed format with a DISCRETE and a
+# CONTINUOUS frame, one MJPEG format with one frame, two isochronous IN alternates and one OUT
+# alternate that must NOT enter the census) is driven through
+# the SAME `parse()` the wire uses and asserted field by field:
+#   :: uvc: selftest fixture=289B formats=2 frames=3 alts=2 probe_roundtrip=ok probe_reply=ok -> PASS ::
+# and the failure arm names the field, what was read and what the fixture declares, ending in the
+# FAIL token FAULT_PATTERNS above makes an exit-1 for the whole run. The leg:
+#   UNAOS_UVC=1 UNAOS_WC=1 ./arroyo test 240
+# Implies `ehcihid` (the call site lives inside the x86-gated drivers/ehci/mod.rs), which is
+# default-ON, so this knob alone is the whole delta. Default OFF => `pub mod uvc` is `#[cfg]`-erased
+# and never lexed, the single call site is a LINE-NEUTRAL same-line fold in `configure_hid`, and
+# `./arroyo knoboff uvc` compares byte-identical. x86_64 only.
+#
+# WIRED IN builder/src/main.rs TOO, and that line is not bookkeeping: the builder re-derives the
+# x86 feature list from its OWN env for every MEDIA verb AND for `./arroyo test` (it owns that QEMU
+# and the wall), so a knob mapped HERE alone ships the feature disabled while this file's own
+# `⚡ kernel features:` banner claims it is on. That failure was MEASURED on this arc before the
+# builder line existed, and the gate built for it caught it exactly as designed: banner-cert on the
+# knob-off artifact with `uvc` on the banner printed `feature=uvc witness=[uvc] commit=withheld
+# hits=0 -> MISSING` and exited 1. `uvc` is therefore named by the `x86-all` and `x86-all-nowitness`
+# legs of KERNEL_CFG_MATRIX below — which is what type-checks the ARMED polarity of the
+# `configure_hid` fold, and what puts this knob under the KNOB->BUILDER WIRING CHECK in
+# `check_kernel_cfg` that would red the day the builder line is deleted. Its `scripts/banner-cert.sh`
+# row certifies the feature on the ARTIFACT, and `scripts/k8-reach.registry` records why an x86-only
+# USB-host driver has no Pi bare-metal arm.
+# See docs/dev/OS/07_USB_STORAGE/uvc.md.
+[ -n "${UNAOS_UVC:-}" ] && _feats="${_feats}uvc,"
 # ── BANNER-DEDUP (orin 3, 2026-08-22) — the banner must not misreport its own composition ─────────
 #
 # THE SYMPTOM. An armed jetson build printed `tegra` THREE times:
@@ -5201,7 +5261,7 @@ KERNEL_CFG_MATRIX=(
   # SIDE EFFECT: the table gains one knob and the universe gains one (brand-new, so "unclaimed =>
   # assume x86" either way and naming it here removes nothing); read the live board/mix counts on
   # `./arroyo check`'s own summary line, never from this prose.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -6709,7 +6769,7 @@ KERNEL_CFG_MATRIX=(
   # `x86_cfg_universe` gains it from the `[features]` table itself, not from this row. Board legs +1.
   # Read the live board/mix counts off `./arroyo check`, which prints them every run.
   "x86-nousblun ../../x86_64-unaos.json witness,logts,wedge2,sched_demo,skip_xhci,nousblun"
-  "x86-all-nowitness ../../x86_64-unaos.json nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst"
+  "x86-all-nowitness ../../x86_64-unaos.json nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,uvc"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────

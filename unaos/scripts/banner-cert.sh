@@ -237,6 +237,21 @@ fi
 # (drivers/xhci/mod.rs:25), so knob-off the file is never lexed and the string cannot exist.
 # Measured on the DIRNS artifact: `LC_ALL=C grep -a -c -F` = 1 knob-on, and 0 for a known-absent
 # control string on the same artifact.
+#
+# `uvc` (CAMERA1, rmbp-ledger B143, 2026-09-22) — the USB Video Class census. The row exists
+# BEFORE the knob's first media build, on purpose: DIRNS's finding one paragraph up is that a knob
+# with no row here exits 2 (NO VERDICT) on the first `esp-x86` that arms it, and stops the verb
+# before QEMU. Token: `[uvc] commit=withheld`, 21 bytes, the withheld-commit witness in
+# `drivers/uvc.rs::probe` — a function reached from `ehci::Controller::configure_hid` behind
+# `#[cfg(feature = "uvc")]` AND NOTHING ELSE, which is what rule 7(a) above demands (the leanest
+# arming build keeps it; there is no second knob in the call chain to drop the function). The
+# module itself is gated `#[cfg(all(target_arch = "x86_64", feature = "uvc"))] pub mod uvc;`
+# (drivers/mod.rs), so knob-off the file is never lexed and the string cannot exist. BOTH
+# POLARITIES MEASURED on two x86_64 artifacts built the same hour from this tree
+# (`cargo build --release --target x86_64-unaos.json --features …,wc,ehcihid,witness`, with and
+# without `uvc`): `LC_ALL=C grep -a -o -F '[uvc] commit=withheld' | wc -l` = 1 knob-on, 0 knob-off,
+# while the `ehcihid` row's own token measured 1 on BOTH as the positive control proving the
+# knob-off artifact was a real EHCI-carrying build and not an empty one.
 # ---------------------------------------------------------------------------------------------
 bc_table() {
 cat <<'TABLE'
@@ -284,6 +299,7 @@ nvidia-kepler-ctrlbind|:: kepler: ctrlbind |-|measured
 nvidia-kepler-vblank|:: kepler: vblank |-|measured
 hda|[hda] census|-|measured
 hda-tone|:: HDA-TONE:|-|measured
+uvc|[uvc] commit=withheld|-|measured(1)
 tegra|:: tegra: JB5 — XUSB domain not ON at handoff|-|measured(1)
 tegrasmp|:: AARCH64 SMP: ORIN-SMP-3 — DTB /cpus named no cores (dtb=@|-|measured(1)
 apsrun|:: [apsrun] cpu |-|measured(2)

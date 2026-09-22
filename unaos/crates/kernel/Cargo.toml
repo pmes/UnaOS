@@ -3546,6 +3546,37 @@ hda = []
 # Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs`.
 # See docs/dev/OS/11_AUDIO/hda.md.
 hda-tone = ["hda"]
+# UVC (rmbp-ledger B143): `UNAOS_UVC=1` arms the USB Video Class CENSUS and the `VS_PROBE_CONTROL`
+# negotiation on the 2012 rMBP's built-in FaceTime HD camera (`05ac:8510`, class 0xEF with a video
+# IAD, high speed, EHCI controller [0] addr 2 — the device flight 11 enumerated and dismissed with
+# `addr 2 has no HID interrupt-IN endpoint — nothing to arm`). CONTROL TRANSFERS ONLY, and it stops
+# one rung short of a picture on purpose: no isochronous pipe is opened (the EHCI driver has no
+# iTD/siTD path at all, and PROBE-14 keeps every transfer on the periodic-QH discipline),
+# `VS_COMMIT_CONTROL` is never sent (a committed format with nothing draining it leaves the camera
+# armed for the rest of the boot, on the controller the internal keyboard is on), and no `SET_CUR`
+# reaches a VideoControl control — brightness/exposure/focus are read as capability BITMAPS out of
+# the descriptors and never written.
+#
+# IMPLIES `ehcihid`, for the reason `bt` does: the driver's ONE call site is inside
+# `drivers/ehci/mod.rs`, whose own declaration is `#[cfg(all(target_arch = "x86_64", feature =
+# "ehcihid"))]`, so without it the knob would arm a module nothing calls. `ehcihid` is default-ON,
+# so pushing `uvc` alone is the whole delta.
+#
+# Default OFF => `drivers/mod.rs`'s `pub mod uvc` is `#[cfg]`-erased (never lexed — the one case
+# LAWS §5 names as byte-safe) and the single call site in `configure_hid` is a LINE-NEUTRAL
+# same-line fold, so no `panic::Location` in that 18k-line file moves and the knob-off image is
+# byte-identical (`./arroyo knoboff uvc`). x86_64 only.
+#
+# WIRED IN THREE PLACES, and none of them is optional: `unaos/arroyo`'s knob map, `unaos/builder/
+# src/main.rs` (which re-derives the x86 feature list from its OWN env for every media verb AND for
+# `./arroyo test`, whose QEMU the builder owns — a knob mapped in arroyo alone lights the banner on
+# an image carrying none of the code, the sdwrite/rastmc failure, MEASURED on this arc before the
+# builder line existed), and the `x86-all` / `x86-all-nowitness` legs of arroyo's
+# KERNEL_CFG_MATRIX, which type-check the ARMED polarity of the `configure_hid` fold. A fourth,
+# `scripts/banner-cert.sh`, certifies the feature ON THE ARTIFACT; a fifth, `scripts/
+# k8-reach.registry`, records why this knob has no Pi bare-metal arm.
+# See docs/dev/OS/07_USB_STORAGE/uvc.md.
+uvc = ["ehcihid"]
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
