@@ -600,3 +600,70 @@ pub fn route_pci_intx(bus: u8, dev: u8, func: u8) -> Option<(u32, Polarity, Trig
     );
     Some((gsi, pol, trig))
 }
+
+// ── RUNG 3: THE PCI ARM ────────────────────────────────────────────────────────────────────────
+
+/// Route this PCI function's INTx to `vector` and unmask it. `true` means an interrupt that was
+/// previously UNDELIVERABLE now has somewhere to go; `false` means nothing was changed and the
+/// caller must keep whatever fallback it had.
+///
+/// **THE ORDER IS THE ARGUMENT.** The redirection entry is programmed MASKED; the function's PCI
+/// Interrupt Disable bit (COMMAND bit 10, PCI 3.0 §6.2.2) is cleared so INTA# can assert at all;
+/// and only THEN is the entry unmasked. Unmasking first would open a window in which a pin
+/// firmware left asserted delivers to a vector before the function was ready — the same failure
+/// `ehci::isr_arm_controller` already avoids by publishing its operational base before it touches
+/// MSI, and for the same reason.
+///
+/// **THE INTERRUPT DISABLE BIT IS THE QUIETEST WAY THIS FAILS.** `enable_msi` sets it by
+/// implication (MSI masks INTx per spec) and firmware may have left it set; an entry routed
+/// correctly to a function that cannot assert is a perfect route and a dead interrupt. It is
+/// cleared and READ BACK, and the read-back value rides the arm line.
+///
+/// **NO EOI SPECIAL CASE, and it is worth saying why there is none** — a reader will look for one.
+/// A level-triggered entry's Remote IRR is cleared by the LOCAL APIC's EOI broadcast on every part
+/// this kernel runs on (Intel SDM Vol. 3 §10.8.5; 82093AA §3.2.4), and every handler in
+/// `interrupts.rs` already writes the local-APIC EOI register last. So the handler side needed no
+/// change and got none.
+pub fn route_pci_function(bus: u8, dev: u8, func: u8, vector: u8) -> bool {
+    let (gsi, pol, trig) = match route_pci_intx(bus, dev, func) {
+        Some(v) => v,
+        None => return false, // route_pci_intx has already printed the reason
+    };
+    let dest = crate::arch::apic::apic_id();
+
+    let entry = match route_gsi(gsi, vector, pol, trig, dest) {
+        Ok(e) => e,
+        Err(e) => {
+            serial_println!(
+                "[ioapic] route bdf={}:{}.{} gsi={} vector={:#04x} -> REFUSED reason={} — the redirection entry was not programmed and nothing on this function changed == witness ::",
+                bus, dev, func, gsi, vector, e.as_str()
+            );
+            return false;
+        }
+    };
+
+    let cmd = unsafe { crate::arch::pci::read_config_16(bus, dev, func, 0x04) };
+    if cmd & (1 << 10) != 0 {
+        unsafe { crate::arch::pci::write_config_16(bus, dev, func, 0x04, cmd & !(1u16 << 10)) };
+    }
+    let cmd_back = unsafe { crate::arch::pci::read_config_16(bus, dev, func, 0x04) };
+
+    let unmasked = match set_mask(gsi, false) {
+        Ok(lo) => lo,
+        Err(e) => {
+            serial_println!(
+                "[ioapic] route bdf={}:{}.{} gsi={} -> REFUSED reason=unmask-{} — the entry is programmed but still MASKED, so the vector could never fire == witness ::",
+                bus, dev, func, gsi, e.as_str()
+            );
+            return false;
+        }
+    };
+
+    serial_println!(
+        "[ioapic] armed bdf={}:{}.{} gsi={} vector={:#04x} dest_apic={} entry={:#018x} unmasked_lo={:#010x} intx_disable={} routed={} == witness ::",
+        bus, dev, func, gsi, vector, dest, entry, unmasked,
+        (cmd_back >> 10) & 1,
+        routed()
+    );
+    true
+}

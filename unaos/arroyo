@@ -2559,24 +2559,40 @@ fi
 # — and the cost is the internal trackpad's lost reports (ledger B139; EHCIDARK dark windows to
 # 108 ms).
 #
-# THREE RUNGS BEHIND ONE KNOB, each landing green before the next. RUNG 1 IS WHAT THIS KNOB ARMS
-# TODAY: `acpi::parse_madt`'s catch-all arm — which has silently discarded every entry type the
-# topology walk does not consume since the file was written — feeds a collector that reads every
-# I/O APIC (ACPI §5.2.12.3), Interrupt Source Override (§5.2.12.5) and Local APIC NMI (§5.2.12.7)
-# entry, maps each controller's IOREGSEL/IOWIN window and reads IOAPICVER for its redirection-entry
-# count. NOTHING IS WRITTEN. Witnesses: `[ioapic] census ioapics=… isos=… gsis=…`, one
-# `[ioapic] id=… addr=… gsi_base=… entries=… version=…` per controller, one `[ioapic] iso bus=…
-# irq=… -> gsi=…` per override, one `[ioapic] nmi uid=… lint=…` per NMI entry. A machine whose MADT
-# declares no I/O APIC prints the `ioapics=0` line and says so in it — silence is never the answer.
-# Rung 2 adds `route_gsi`/`set_mask`/`unroute` (one 64-bit redirection entry per 82093AA §3.2.4,
-# programmed MASKED and read back) plus `route_pci_intx`; rung 3 calls it from
-# `ehci::isr_arm_controller` where MSI refused, which is what ends the refusal quoted above.
+# THREE RUNGS BEHIND ONE KNOB, each landed green before the next. (1) CENSUS: `acpi::parse_madt`'s
+# catch-all arm — which had silently discarded every entry type the topology walk does not consume
+# since the file was written — feeds a collector that reads every I/O APIC (ACPI §5.2.12.3),
+# Interrupt Source Override (§5.2.12.5) and Local APIC NMI (§5.2.12.7) entry, maps each controller's
+# IOREGSEL/IOWIN window and reads IOAPICVER for its redirection-entry count. Nothing is written.
+# (2) ROUTE: `route_gsi` programs one 64-bit redirection entry MASKED (82093AA §3.2.4 — vector,
+# delivery Fixed, physical destination, polarity, trigger, mask) and READS IT BACK; `set_mask` and
+# `unroute` are its other verbs; `route_pci_intx` derives a function's GSI from its OWN Interrupt Pin
+# and Interrupt Line registers (PCI 3.0 §6.2.4) through the override table. (3) PCI ARM:
+# `route_pci_function` is what `ehci::isr_arm_controller` calls where MSI refused — route, clear PCI
+# COMMAND bit 10 (Interrupt Disable), unmask, in that order — and the completion vector ISRARM
+# already owned starts being DELIVERED instead of refused. Witnesses: `[ioapic] census ioapics=…
+# isos=… gsis=…`, one `[ioapic] id=… addr=… gsi_base=… entries=… version=…` per controller, one
+# `[ioapic] iso bus=… irq=… -> gsi=…` per override, `[ioapic] route bdf=… pin=INT<A-D> line=… ->
+# gsi=…|REFUSED reason=…`, and `[ioapic] armed bdf=… gsi=… vector=… entry=… unmasked_lo=…`.
+#
+# THE EHCI SIDE IS SCORED ON INSTRUMENTS THAT ALREADY EXISTED, so a new counter cannot let the old
+# one rot: the ISRARM rollup's `irq=` (ISR_ENTRIES) moving off zero is the pass, and the existing
+# `ISRARM IRQ DEAD` self-check is what names the failure. MEASURED on q35 with the default lane's
+# usb-kbd (it rides the usb-ehci harness controller unless UNAOS_XHCIKBD moves it to xHCI) and a QMP
+# typist: `ISRARM armed=1 refused=0 irq=122 isr_rearm=109 poll_rearm=13` — 109 of 122 endpoint
+# re-arms came from the ISR rather than the polled pass, which is the arc's whole product. GO-RED
+# (source mutation): leave the entry masked (`set_mask(gsi, true)`) and the same lane reads
+# `unmasked_lo=0x00018043` (bit 16 still set), ZERO `ISRARM armed=` rollups and two
+# `ISRARM IRQ DEAD … irq=0` lines — the route correct and the interrupt dead, which is exactly the
+# pair a gate scoring the route alone would have missed.
 #
 #   UNAOS_IOAPIC=1 ./arroyo test 150      (q35's usb-ehci + usb-kbd ride the default lane)
 #   UNAOS_IOAPIC=1 ./arroyo esp-x86
-# Default OFF => the module is not lexed (its `pub mod` is `#[cfg]`-gated AND at the file tail) and
-# the two acpi.rs sites are `#[cfg]`-erased LINE-NEUTRAL appends with the code before the `//`, so no
-# panic `Location` moves (`./arroyo knoboff ioapic`). x86_64 only; aarch64 media byte-identical
+# Default OFF => the module is not lexed (its `pub mod` is `#[cfg]`-gated AND at the file tail), the
+# two acpi.rs sites and the one drivers/ehci/mod.rs site are `#[cfg]`-erased LINE-NEUTRAL appends
+# with the code before the `//`, and the EHCI condition TERM (which cannot carry a `#[cfg]`) folds
+# away because `arch/x86_64/mod.rs::ioapic_route_intx` is a constant `false` — the `scanout_beam`
+# shape in that same file. No panic `Location` moves (`./arroyo knoboff ioapic`). x86_64 only; aarch64 media byte-identical
 # (stripped by arm_features below, exactly as `hda` and `ahci` are).
 # Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml — a knob mapped HERE and missing
 # THERE ships the feature disabled while the banner claims it is on (the rastmc/sdwrite lesson), and
