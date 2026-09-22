@@ -2059,3 +2059,159 @@ finding(s); trailing text over 4 ledger file(s): N finding(s); row continuity
 <armed — why, base <sha> | not armed>: N finding(s)`. SR13's lesson: a verdict
 silent about whether it armed is indistinguishable from one that ran and found
 nothing, and row continuity is deliberately not armed on most trees.
+
+---
+
+## GATE-SPLASH — the polarity that SHIPS is booted, so the splash can be seen at all
+
+**Where this one runs, because it is the third exception to the header above.**
+Not in `check_both`: like GATE-TESTTRUNC it asserts a property of a QEMU RUN,
+and unlike every other x86 leg it asserts a property of the BUILD that run was
+made from. It lives in `test_splash` / `splash_artifact_cert` in `unaos/arroyo`
+and fires only on `./arroyo test-splash [secs]`. `./arroyo check` cannot see it
+and is not asked to.
+
+**Invariant.** `./arroyo test-splash` exits 0 only if (1) the kernel ELF the
+builder left behind carries exactly one `:: SPLASH: crystal cluster traced` and
+exactly one `:: SPLASH: retired at ` string, and (2) the capture it produced
+satisfies `unaos/scripts/specs/x86-splash.spec` — the splash was painted, and it
+was handed over once, at a NAMED site, before the desktop's first paint.
+
+**Why a gate, and why a VERB rather than a knob.** CRYSTALBOOT (fold `b9e673d3`,
+rmbp-ledger B137) fixed the broken crystal — `splash::advance` laying facet edges
+onto the live desktop one frame after the panel had been cleared — and then could
+not test it, because no command in this repo could produce a boot with a splash
+on it. `./arroyo test` FORCE-ARMS the kernel's `witness` feature (the `case` at
+the head of `arroyo`: `export UNAOS_WITNESS="${UNAOS_WITNESS:-1}"`, and `:-`
+substitutes on an EMPTY value too, so no caller can disarm it from outside),
+while `main.rs:225-234` compiles the `boot_splash` CALL out under
+`any(usbdebug, bootlog, witness)`. So every battery run this repo has ever made
+had no splash on its panel; flight 11's own image, which carried `witness` AND
+`usbdebug` for its fixtures, had none either; and SPLASH-1, SPLASH-2,
+SPLASH-ALIVE, SPLASH-SEAMLESS and SPLASHRETIRE were five arcs of code no run had
+ever executed. LAWS §5 rules both halves of that: an instrument's presence is
+proven in the artifact, and a check that cannot fire is an absent one.
+
+A knob on `test` could not fix it. The lane needs `witness` **unset**, and the
+only way to have that is to be a verb the arming `case` does not name — which is
+why `test-splash` is a fourth `test-*` verb and why the `case`'s comment block
+now carries a warning that a future `test-*` verb must be checked against that
+cfg before it is added to the list. LAWS §5's default-quiet rule is the general
+form: *a default-quiet knob has two polarities and the gate must compile the one
+that SHIPS.* `witness` is the battery's polarity. The image a person boots off a
+card has witness, usbdebug and bootlog all off, and it is the only image that
+paints a crystal at all.
+
+**Which knobs the lane arms, and why each is load-bearing.** `UNAOS_WC=1` —
+`splash::retire`, both of its call sites and `fbcon::panel_console_live` are all
+`#[cfg(feature = "wc")]` (b9e673d3 gated them so that `./arroyo knoboff bt` could
+not convict a splash change of being a Bluetooth change), so without the knob the
+retirement witness does not exist. `UNAOS_QEMU_FULL=1` — the three-valued run
+mode; `mode=full` on the sidecar is the only reading that certifies the tail was
+not truncated (`docs/dev/QUEUE.md` §5, 2026-09-17). And `UNAOS_SPLASHLANE=1`, the
+re-exec marker that routes `x86_pick_capture_spec` to this spec and overrides
+`X86_TEST_SPEC` so the lane brings its own end-of-run.
+
+**Mechanism, two independent legs, and they answer different questions.**
+
+*The artifact leg* (`splash_artifact_cert`) counts both strings with
+`LC_ALL=C grep -a -o -F` on `target/x86_64-unaos/release/unaos-kernel` AFTER the
+run — the binary that actually booted, because the builder rebuilds the kernel
+from its own env-driven feature list and certifying the pre-builder output would
+be certifying a different binary (the s42/INSTGUI failure). It demands exactly
+one hit each: 0 means the splash was compiled OUT, >1 means a second emitter has
+appeared and the spec's counts no longer mean what they say.
+
+*The replay leg* is `x86-splash.spec`, through the ordinary `x86_spec_replay`
+path. Two REQUIREs (the paint, and the retirement with its SITE pinned verbatim),
+two FORBIDs (the metal-only `panel_console_resume` site, which on this gate is
+unreachable by construction and is what keeps the REQUIRE a claim about WHICH
+site retired the splash; and `retired at 0 ms`, the one shape in which this
+witness can be present and still be lying about its own time), and its own
+COMPLETE marker.
+
+The two are not redundant. The artifact separates *the witness did not FIRE* from
+*the witness was never BUILT* — which are different defects with different fixes,
+and on this subject the second one is the defect that hid for five arcs.
+
+**Why this lane cannot borrow x86-test.spec's end-of-run.** Every other x86 leg
+is witness-armed, and x86-test.spec's COMPLETE marker — the zeolite metrics line
+— is printed by the demo chain that `witness` arms. On the shipped polarity it is
+absent by construction, so `x86_test_completion` would call every green run
+TRUNCATED. The lane's own marker is `:: BPACE: total gui=\d+ms .* result=LEDGER ::`
+from `bootpace::service_dump`, which is *deliberately ungated* — no cargo
+feature, no env knob, in its own words because "a ledger that only exists in the
+builds nobody boots on hardware is not an instrument". `gui=\d+ms` is the
+load-bearing field: the ledger prints `gui=-` until the `gui` phase is recorded,
+and the `gui` stamp is the very call that retires the splash, so a capture that
+matches has necessarily got past both REQUIREs, and one that did not is
+TRUNCATED rather than FAIL — the honest verdict, since a splash cannot have been
+retired by a stamp that never landed.
+
+**Control.** `splash_artifact_cert` runs `banner_artifact_check`'s pair before it
+prints any count and refuses a verdict if either fails — present-control
+`UNAOS_BUILD_STAMP` (want >0) and absent-control `NOTATOKEN-UNAOS` (want 0). Both
+fired on every run quoted below (`1` and `0`). The replay leg's control is
+mbench's own self-test, a leg of `./arroyo check` (`43/43`, with
+`✅ spec parses: x86-splash.spec` among them).
+
+**The zero that is a FACT about the tree, measured, not reasoned — two builds one
+term apart.** Same feature list, `witness` added, `LC_ALL=C grep -a -o -F`:
+
+| build | `:: SPLASH: crystal cluster traced` | `:: SPLASH: retired at ` |
+|---|---|---|
+| `ehcihid,kbdwit,sdwrite,sdhcblk,wc,smolnet` (the lane; the booted ELF) | 1 | 1 |
+| the same list **+ `witness`** | 0 | 0 |
+
+`witness` does not merely silence the splash: the call site is cfg'd away, and
+with no caller the linker drops `boot_splash` and `retire` with them, so both
+witnesses leave the binary. A grep of a battery image for a splash line can only
+ever return zero, whatever the kernel does — which is exactly why the artifact
+leg is half of this gate and not a nicety.
+
+**Goes red when** the splash is not painted, or is not retired, or is retired by
+the wrong site, or at time zero, or the strings are not in the image.
+
+**GO-RED proof by mutation, and the mutation is CRYSTALBOOT's own — the one B137
+recorded as unrunnable.** `b9e673d3`'s `splash.rs` diff reverse-applied
+(`git apply -R`): the paint re-introduced, `retire` and both of its call sites
+gone. Same command, same wall:
+
+| tree | rc | replay | artifact leg |
+|---|---|---|---|
+| this tree | **0** | `✅ MBENCH PASS — 2/2 required witnesses, 0 forbidden hit(s), 730 lines scanned`, marker at `serial.log:356` | `crystal cluster traced` 1, `retired at ` 1 |
+| the mutation | **1** | `❌ MBENCH FAIL — 1/2 required witnesses, 0 forbidden hit(s), 728 lines scanned` · `FIRST-SHORTFALL x86-splash.spec:88 REQUIRE :: SPLASH: retired at \d+ ms by bootpace gui stamp …` · `(the end-of-run marker was seen — the run completed, so a missing witness here is a GENUINE regression)` | `retired at ` **0 hit(s) (want 1)** |
+
+Green wire, verbatim: `:: SPLASH: crystal cluster traced — 3 shards, 9 spectrum
+rays ::` at `serial.log:65` and `:: SPLASH: retired at 2975 ms by bootpace gui
+stamp (main.rs, before the desktop's first paint) ::` at `:295`. The tree was
+restored by forward-applying the same patch and re-verified: `git diff` on
+`splash.rs` empty, sha256 back to its pre-mutation value.
+
+**A shared-harness wart this go-red uncovered, recorded rather than fixed here.**
+`scripts/qemu_await.py --settled` folds "reached the end-of-run marker but a
+REQUIRE never printed" into `status=truncated` — its reason line does name the
+witness (`reason=short-witnesses:1`) — so `test_x86_64`'s TESTTRUNC step reds
+FIRST and prints `did not reach <marker>` about a capture that reached it at line
+355, then returns before `x86_spec_replay` can print the verdict block. That
+wording affects every x86 leg and is not this verb's to rewrite; it is a queue
+row. What `test_splash` does instead is make its OWN red readable: on any
+non-zero it replays the capture through mbench and prints the verdict, which is
+where both quotes in the table above come from. The step is diagnosis only —
+`|| true`, no effect on the return code — because a verdict that is already made
+must not be talked out of.
+
+**Legitimately updated** by re-pinning a line in `x86-splash.spec` together with
+the kernel line it pins, in the same commit (the SPECRUN contract at that file's
+tail), never by teaching the kernel a second spelling of the same witness.
+
+**What this gate does NOT prove, so a green is read for what it is.** The fold's
+SEAM arm — `advance` asking `fbcon::panel_console_live()` before any pixel moves
+— is METAL-ONLY and is dead here by construction: `PANEL_CONSOLE` has exactly one
+writer, `fbcon::panel_console_resume`, which is the Kepler takeover's, and QEMU
+has no Kepler (measured on this lane's capture: `panel_console_resume` 0 hits,
+`[wc-x]` 0 hits). Every retirement on this gate is therefore the `gui` BACKSTOP's,
+which is why the REQUIRE pins that site by name. The gate proves the splash is
+painted and handed over once at a named site on the build a person boots — which
+is precisely what makes the seam's own mutation test runnable on metal at all.
+The seam belongs to `x86-witness.spec` and a flight, and stays B137's row.
