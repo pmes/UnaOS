@@ -747,6 +747,20 @@ fn main() {
     // Needs UNAOS_USBSERIAL=1 to have a cable at all, and UNAOS_FTDIRX_INJECT=<path> (below) to have
     // anything to receive under QEMU. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_FTDIRX").is_ok() { feats.push("ftdirx"); }
+    // UVC (CAMERA1, rmbp-ledger B143): UNAOS_UVC=1 arms the USB Video Class census and the
+    // VS_PROBE_CONTROL negotiation on the rMBP's built-in FaceTime HD camera (05ac:8510, class
+    // 0xEF with a video IAD, EHCI controller [0] addr 2). MUST be listed here and not only in
+    // `arroyo`, for the reason the FTDIRX line above states and with the same sting: THIS list is
+    // what the x86 kernel that actually boots is built from — for `esp-x86`/`vm-image` AND for
+    // `./arroyo test`, whose QEMU this builder owns — so a knob mapped there alone would light the
+    // `⚡ kernel features:` banner on an image carrying not one `[uvc]` string. MEASURED before
+    // this line existed, and it is the sdwrite/rastmc shape caught by the gate built for it:
+    // banner-cert on the knob-off artifact with `uvc` on the banner reads
+    // `feature=uvc witness=[uvc] commit=withheld hits=0 -> MISSING`, exit 1. Implies `ehcihid` in
+    // Cargo.toml, which this list already pushes by default, so pushing `uvc` alone is the whole
+    // delta. Default OFF => the feature is absent and the image is byte-identical
+    // (`./arroyo knoboff uvc`). Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_UVC").is_ok() { feats.push("uvc"); }
     if !feats.is_empty() {
         let list = feats.join(",");
         kernel_cmd.arg("--features").arg(&list);
