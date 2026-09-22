@@ -2427,3 +2427,212 @@ on a `UNAOS_WIFI=1 ./arroyo esp-x86` kernel confirms both the retry witnesses (`
 populated handle`). Wifi-feature knob-off byte-identity: the default (wifi-off) `esp-x86`
 `kernel.elf` is bit-identical with the `firmware.rs`/`mod.rs` edits applied and reverted
 (`sha256 14ae8e95…`, snapshot + `git apply -R`, never `git stash`).
+
+---
+
+## 14. SDHC-4b (driver half) — CMD25 WRITE_MULTIPLE_BLOCK on PIO
+
+Milestone 4a gave this driver its first card write: `write_block_512`, a polled single-block CMD24,
+behind the `sdw` feature (`UNAOS_SDW=1`), with four gates and a seven-rung boot self-test
+(§8). Its own header closed with *"Multi-block CMD25, block-layer registration and any filesystem
+write are 4b/4c and are not here."* §10 and §11 have since built the second and third of those in
+`drivers/block.rs` and `fs/sdhc4c.rs`. **This section is the first of the three: the driver's own
+multi-block write.**
+
+Emitter: `unaos/crates/kernel/src/drivers/sdhc.rs`, §"Step 9" and §"Step 9b", both **appended at the
+file's end** and both entirely `#[cfg(feature = "sdw")]`. Nothing above them moved.
+
+### 14.1 What it is, and what it deliberately is not
+
+It is exactly two things:
+
+* **`write_blocks_512(lba, count, buf) -> Result<busy_ms, BlockError>`** — one polled CMD25
+  WRITE_MULTIPLE_BLOCK closed by the controller's Auto CMD12 STOP_TRANSMISSION, mirroring the shape
+  of the existing CMD18 read path (`read_blocks_pio_on`) rather than inventing a second one.
+* **`write_multiblock_selftest`** — a boot fixture that proves it against the read path, on a window
+  it has re-proved blank per block, with stash and verified restore.
+
+It is **not** a change to any existing caller. `drivers::block::write_blocks_sdhc` still LOOPS
+`write_block_512`, sector by sector, and that is deliberate rather than unfinished:
+`fs::sdhc4c` accounts the FAT layer's card traffic as `cmd24=N` and publishes `cmd24 == bytes / 512`
+as a falsifiable prediction of that arc (§11.2, `fs/sdhc4c.rs:207-208`). Re-pointing that path at
+CMD25 would make a published witness name a command the card never saw. Renaming the counter is
+`fs/sdhc4c.rs`'s change to make, in the arc that makes it; this file does not make a witness lie in
+order to be faster. §14.6 states the wiring that is therefore still owed.
+
+### 14.2 The command sequence, and what each citation buys
+
+Sources: the **SD Host Controller Simplified Specification 3.00** for the register side and the **SD
+Physical Layer Simplified Specification** for the card side — the same two this file has cited since
+milestone 1.
+
+| step | spec | what it fixes |
+| :-- | :-- | :-- |
+| CMD25 WRITE_MULTIPLE_BLOCK, R1, data present | Physical Layer §4.3.3 ("Data Write") | the card accepts blocks continuously until stopped, and signals busy on DAT0 whenever its write buffer is full |
+| Transfer Mode: Multi/Single Block Select = 1, Block Count Enable = 1, **`TM_DIR_READ` omitted** | Host Controller §2.2.5 | there is no positive "write" bit — the ABSENCE of the direction bit is what makes the transfer a write, which is why `write_block_512` calls it out and so does this |
+| CMD12 STOP_TRANSMISSION, R1b, issued as **Auto CMD12** | Host Controller §2.2.5 (Auto CMD12 Enable) | Block Count Enable is therefore not optional: the block counter is the only thing that tells the controller when the transfer ended and the STOP is due |
+| Auto CMD12 failure → error-half bit 8 (`INT_ERR_AUTO_CMD`), reason in Auto CMD Error Status | Host Controller §2.2.18 | a failed STOP leaves the CARD streaming; the raw word is printed, not decoded, because a later reader needs it to attribute the failure |
+| programming-busy wait on DAT0 (Command Inhibit (DAT), Present State bit 1) | Physical Layer §4.6.2.2 | the blocks are off the FIFO but not yet in flash |
+| CMD13 SEND_STATUS afterwards | Physical Layer §4.10.1 | programming-phase failures are reported by NO controller interrupt, and `prg` carries no error bit — a clean R1 whose CURRENT_STATE is not `tran` is a write that is not durable |
+
+**The timeout correction is the part that is engineering rather than transcription.** §4.6.2.2 states
+the WRITE timeout as a **per-block** figure of 250 ms. `PROG_BUSY_TIMEOUT_MS` (500 ms) is already
+that figure doubled for margin — 4a's constant, unchanged. `DATA_TIMEOUT_MS` (200 ms) is a **READ**
+bound, the 100 ms read-access ceiling doubled, and it is **below the spec's own write figure**. The
+CMD18 read path waits on `DATA_TIMEOUT_MS` per block and is right to. A CMD25 path that copied that
+shape would convict a perfectly legal card of a timeout mid-stream the first time it went busy on a
+full write buffer — a first CMD25 failing for a reason that is not CMD25, which is the diagnosis
+failure this whole file is organised against. So every wait in the write path that card programming
+can hold off — Buffer Write Ready between blocks, Transfer Complete at the end, and the closing
+DAT0 busy — uses `mb_write_budget_ms(count) = PROG_BUSY_TIMEOUT_MS * count`, saturating.
+
+### 14.3 Still PIO, and reason 4 has changed sides
+
+§"Step 8" gave four arguments for PIO over the ADMA2 engine that is already sitting there: (1) the
+DMA law at the top of the file protects HOST memory and says nothing in the write direction —
+reverse the direction and a straggling descriptor lands on the MEDIUM, which is the thing being
+protected; (2) an armed engine cannot be recalled, a PIO write can; (3) layering — CMD18 was proved
+on PIO before ADMA2 went under it; (4) nothing to win, a single-block write is programming-bound.
+
+**Reason 4 is the one CMD25 weakens.** A 64-block transfer is 8192 uncached word writes, which is
+real bus time. Reasons 1–3 are untouched and they are the ones that decide it. Proving CMD25 on PIO
+first is exactly the argument §"Milestones" 3a already made and won for CMD18, in the direction that
+can damage the medium.
+
+### 14.4 Every gate of 4a is kept, and gate 5/7 are re-made PER BLOCK
+
+Gates 1–3 belong to the primitive and are enforced on every call, the same as 4a:
+
+1. **the build gate** — `#[cfg(feature = "sdw")]`. Without the knob no CMD25 word, and no CMD12
+   word, is assembled anywhere in the image. 4a's stated property, extended to two more commands.
+2. **the physical switch** — Present State bit 19 (inverted sense: 1 = write ENABLED), **re-read at
+   the moment of this write**, never trusted from bring-up.
+3. **the card's own CSD** — `PERM_WRITE_PROTECT` / `TMP_WRITE_PROTECT`, decoded at identification.
+
+Gate 4 — the blank-sector proof — is not a property of a primitive; it belongs to the caller, and
+the fixture makes it **per block**:
+
+| rung | refusal `reason=` | why |
+| :-- | :-- | :-- |
+| — | `card-too-small` | the window needs `SDW_MB_BLOCKS + 2` blocks: the window, 4a's own scratch sector, and LBA 0 never in reach |
+| 5 | `inside-partition-N` | **tested for every block of the window, not for the window as a whole.** A window is only as safe as its least safe sector, and "the top sector is outside every partition" says nothing about the one below it |
+| 6 | `window-unreadable` | nothing to stash, so nothing to restore from — and it is the first CMD18 the window has seen, so an unreadable window is refused before anything can be written over it |
+| 7 | `nonblank` | **also per block.** The only content a power cut can strand on the card is this driver's own labelled pattern where zeros were |
+
+The window is the `SDW_MB_BLOCKS = 4` blocks **below** 4a's scratch sector (`num_blocks - 1`), never
+overlapping it: sharing the sector would mean the second fixture's evidence could be the first
+fixture's leftovers. Rungs 1–4 (wp-switch, csd-perm-wp, csd-tmp-wp, gpt) are not repeated because
+the fixture runs only after 4a's ladder passed all four seconds earlier — which is the ordering
+§14.5 exists for.
+
+**Four, not 64.** It is the smallest count that makes the transfer genuinely multi-block — more than
+one Buffer Write Ready re-arm, a real Auto CMD12, a per-block stride to get wrong — while costing
+2 KiB of `.bss` per buffer and a bounded ~2 s worst-case budget. A bigger window proves nothing this
+one does not and spends medium and boot time to do it.
+
+### 14.5 The ordering IS the instrument
+
+The fixture runs **only after** 4a's single-block ladder reported `restore=IDENTICAL -> PASS`, as a
+LINE-NEUTRAL append on that ladder's last statement. If the window then compares badly there is a
+boot's worth of evidence — every read witness (`verify_read`, `verify_multiblock`, `adma2_smoke`,
+`verify_adma_ab`), plus a CMD24 write that was written, read back and restored byte-for-byte on this
+same card, seconds earlier — that indicts **CMD25** rather than leaving "the card", "the read path"
+and "the write path" jointly suspect.
+
+The pattern is stamped **per block** (`sdw_make_pattern` puts the block's own LBA at bytes 32..40),
+because the new failure mode CMD25 introduces is precisely a transfer that lands its blocks in the
+wrong order or at the wrong stride. A differing block whose bytes 32..40 hold a *different* block's
+LBA names that failure directly.
+
+**What it still cannot catch**, unchanged from 4a and named so it is not mistaken for covered: a
+SYSTEMATIC wrong-LBA write. Pattern, verify, restore and restore-verify all go through the same
+`lba_arg`, so a computation that puts the window at the wrong address has every step agreeing with
+every other.
+
+### 14.6 The witnesses
+
+Two lines, printed exactly once per boot on which 4a's ladder reached `-> PASS`:
+
+```text
+[sdhc] write n=4 lba=32762 verify=ok busy_ms=0
+:: sdhc: w2 armed=1 lba=32762 n=4 verify=ok busy_ms=0 restore=IDENTICAL reason=none -> PASS ::
+```
+
+`verify=` is what a reader keys on; `busy_ms=` is only ever read beside it:
+
+| `verify=` | means |
+| :-- | :-- |
+| `ok` | the window was written by ONE CMD25 and read back by CMD18 byte-identical |
+| `MISMATCH` | written and read back, and the compare found a difference — the `[sdhc-w] verify … first-diff block=B off=O` line before it carries the offset |
+| `UNREADABLE` | the CMD18 verify read itself failed; the window's content is unknown |
+| `WRITE-FAILED` | the CMD25 returned `Err`; its reason is already on the wire |
+| `SKIPPED` | a gate refused before any write was attempted; `reason=` names which |
+
+`busy_ms=0` on every path that issued no CMD25 — and also, legitimately, on a QEMU card, which
+programs in far under a millisecond. That is why a measurement is never read without its `verify=`
+token beside it, and why the milliseconds come from the same calibrated TSC `cycles_ms` uses and
+read `0` rather than a fabricated figure when the TSC is uncalibrated.
+
+The line's **absence** means one thing and only one: 4a's ladder did not reach `-> PASS`, and its own
+`:: sdhc: w1 … ::` verdict says why.
+
+### 14.6a The go-red, and the thing it taught about the restore
+
+The witness was proved to have power by mutation, not by argument: one byte of block 2 flipped on
+its way into the FIFO (`word ^= 1` at `i == 0, blk == 2` in the push loop), `UNAOS_SDHCBLK=1
+UNAOS_SDW=1 ./arroyo test 200` — run rc **1**, and the wire named the fault exactly:
+
+```text
+:: sdhc: w1 ... verify=IDENTICAL restore=IDENTICAL reason=none -> PASS ::
+[sdhc-w] verify lba=32763 blocks=4 first-diff block=2 off=0 wrote=0x55 read=0x54
+[sdhc] write n=4 lba=32763 verify=MISMATCH busy_ms=0
+:: sdhc: w2 armed=1 lba=32763 n=4 verify=MISMATCH busy_ms=0 restore=REWRITTEN reason=readback-differs -> FAIL ::
+```
+
+Note the first line: 4a's single-block ladder still says `-> PASS` above the failure. That is §14.5's
+ordering claim, measured rather than asserted — the same card, the same read path, the same boot, and
+only the multi-block write is indicted.
+
+**AND THE NEXT BOOT REFUSED, WHICH IS THE GATE WORKING AND IS WORTH STATING.** On the reverted tree
+the very next run read `verify=SKIPPED ... reason=nonblank -> REFUSED`, and the card held `01` at
+block 2 offset 0 of the window. The reason is structural and is not a QEMU artifact: **the restore
+goes through the same primitive as the write**, so a primitive corrupt enough to fail the verify
+corrupts the restore too, and `restore=REWRITTEN` is exactly the token that says so — the stash write
+returned `Ok` and NOTHING was read back or compared. Gate 7 then refused the window on the following
+boot rather than writing over bytes nobody had accounted for. Three consequences, none of them a
+defect to fix:
+
+* `restore=REWRITTEN` is load-bearing and must never be printed as `IDENTICAL`. 4a's verdict table
+  already draws that distinction (§8); this is the first time it has been *earned* by a real failure.
+* A `nonblank` refusal on the boot after a `FAIL` is the EXPECTED reading, not a second fault. The
+  window stays refused until something zeroes it — which for a throwaway QEMU card is
+  `dd if=/dev/zero of=target/sdcard.img bs=512 seek=<lo> count=<n> conv=notrunc`, and for a real card
+  is a deliberate operator act. Neither the driver nor the fixture will do it.
+* It is also the reason `sdw_blank` accepts the driver's own marker as writable. A pattern write that
+  is interrupted leaves a self-identifying sector the next boot may reuse; a *restore* that wrote
+  corrupt bytes leaves one it may not. The two outcomes are different on purpose.
+
+### 14.7 What is still owed
+
+Named here rather than implied, because the brief this section answers asked for three things and
+this is one of them:
+
+1. **The block-layer wiring.** `write_blocks_sdhc` should route counted writes through
+   `write_blocks_512`. It cannot until `fs::sdhc4c`'s `cmd24=` counter is renamed to something that
+   is true of both commands — see §14.1. `fs/sdhc4c.rs` and `fs/fat.rs`.
+2. **The writable posture.** A `Sdhc` source reports `sdhc=ro` from one definition,
+   `fat::BlockSource::write_veto` (`fs/fat.rs:725`), which returns `Some(…)` for `Sdhc`
+   unconditionally. Nothing in `drivers/`, `fs/vfs.rs` or `video/prtscr.rs` can change that answer:
+   `FatFs::write_veto`, `FatBackend::read_only`, the `HOMESOIL: posture` census and
+   `prtscr::mount_capture_target`'s rung 1 are all forwards to it. Turning the card writable is one
+   line in that one place, and the `TegraSd` arm beside it is the exact precedent —
+   `if crate::drivers::block::tegra_sd_writes_admitted() { None } else { Some(TEGRA_SD_VETO) }`.
+3. **The arming knob.** A `UNAOS_SDW_RW=1` posture knob is a cargo feature, and a cargo feature in
+   this tree is a four-place wiring: `crates/kernel/Cargo.toml`, `arroyo`'s knob map,
+   `builder/src/main.rs` (a knob mapped in one and missing in the other ships the feature disabled
+   while the banner claims it is on — the s42/INSTGUI and WXN-M3b lesson), and `arm_features`.
+
+Items 2 and 3 are the mechanism the flight-11 screenshot refusal needs, and both fall outside the
+files this section's arc was scoped to. `rmbp-ledger.md` B140 carries the posture truth table they
+would implement, and the decision — default-rw boot volume, or ro with a reserved writable area —
+that is Peter's and not this arc's.

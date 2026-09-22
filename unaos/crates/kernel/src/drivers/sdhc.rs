@@ -32,8 +32,8 @@
 //!   [`write_block_512`], a polled single-block CMD24 mirroring `drivers::emmc2::write_block_512`
 //!   (emmc2.rs:706-786), the ladder the Pi has already proved on metal — plus a boot-time
 //!   self-test that exercises it against a scratch sector the driver has PROVEN is empty.
-//!   Multi-block CMD25, block-layer registration and any filesystem write are 4b/4c and are not
-//!   here. See §"The write gates" below for why nothing writes a card by default.
+//!   Block-layer registration and any filesystem write are 4b/4c, in `block.rs` / `fs/sdhc4c.rs`.
+//! * **Milestone 4b, driver half (this file)** — multi-block CMD25, §"Step 9" at the file's TAIL.
 //! * **SDHC-v1x (this file, independent of 4a)** — identification for **pre-v2.00 (v1.0/v1.01)
 //!   cards**. CMD8
 //!   SEND_IF_COND was introduced by SD Physical Layer spec 2.00, so a v1.x card is *defined* not to
@@ -3316,7 +3316,7 @@ fn write_selftest(num_blocks: u64) {
             if restore_ok { "IDENTICAL" } else { "MISMATCH" },
             if restore_ok { "none" } else { "restore-differs" },
             if restore_ok { "PASS" } else { "FAIL" },
-        );
+        ); if restore_ok { drop(readback); drop(pattern); write_multiblock_selftest(num_blocks, &s0); } // SDHC-4b LINE-NEUTRAL append (EXECUTOR-BRIEF §5; the whole Step 9 section is APPENDED at the file's end, so no existing line moves and `knoboff sdw` / `knoboff sdhcblk` stay byte-identical). The multi-block fixture runs ONLY after the single-block ladder reached `-> PASS` — see §"Step 9b" for why that ordering is the instrument. The two window locks are dropped first: they are held for this whole block, the fixture takes its own three, and an explicit hand-off is cheaper to read than a lock-order argument.
     }
 }
 
@@ -3467,4 +3467,582 @@ pub fn probe() {
         driven = true;
         bring_up(base, bus, slot, func);
     }
+}
+
+// ===================================================================================
+// Step 9 — the MULTI-BLOCK WRITE (CMD25), PIO (SDHC-4b)
+//
+// EVERYTHING BELOW THIS LINE IS `#[cfg(feature = "sdw")]` AND IS APPENDED AT THE FILE'S END.
+// Both facts are load-bearing and neither is style. The first keeps SDHC-4a's stated property —
+// "without the knob no CMD24 word is assembled anywhere in the image" — true of CMD25 too, and now
+// of CMD12 as well. The second is the byte-identity discipline `./arroyo knoboff` measures:
+// `panic::Location` embeds the source LINE, so inserting a line ABOVE existing code moves bytes in
+// an image that contains none of this feature's code. Appending moves nothing, and the one call
+// site this section needs is a LINE-NEUTRAL append onto `write_selftest`'s last statement.
+//
+// WHAT THIS MILESTONE IS, AND WHAT IT DELIBERATELY IS NOT. It is one new primitive,
+// [`write_blocks_512`], and one fixture that proves it against the read path. It is NOT a change to
+// any existing caller: `drivers::block::write_blocks_sdhc` still LOOPS `write_block_512`, and it is
+// left alone on purpose — `fs::sdhc4c` accounts the FAT layer's card traffic as `cmd24=N` and
+// predicts `cmd24 == bytes / 512`, so re-pointing that path at CMD25 makes a published witness
+// name a command the card never saw. Renaming that counter is `fs/sdhc4c.rs`'s change to make, in
+// the arc that makes it; this file does not make a witness lie in order to be faster.
+//
+// STILL PIO, AND THE FOURTH REASON HAS CHANGED SIDES. §"Step 8"'s four arguments for PIO over
+// ADMA2 were 1) the DMA law protects HOST memory and says nothing in the write direction, 2) an
+// armed engine cannot be recalled while a PIO write can, 3) layering, and 4) "there is nothing to
+// win — a single-block write is programming-bound". Reason 4 is the one CMD25 weakens: a 64-block
+// transfer is 8192 uncached word writes, which is real bus time. Reasons 1-3 are untouched and they
+// are the ones that decide it — the medium is what a straggling descriptor would damage, and this
+// is the FIRST multi-block write this driver has ever issued. Proving CMD25 on PIO first is exactly
+// the argument §"Milestones" 3a already made and won for CMD18.
+//
+// THE COMMAND SEQUENCE (SD Physical Layer Simplified Specification, and the Host Controller
+// Simplified Specification 3.00 for the register side):
+//
+//   * **CMD25 WRITE_MULTIPLE_BLOCK**, R1, data present, host -> card. Physical Layer §4.3.3 ("Data
+//     Write"): the card accepts blocks continuously until it is stopped, and signals busy on DAT0
+//     whenever its write buffer is full. Transfer Mode (Host Controller §2.2.5) carries Multi/Single
+//     Block Select = 1 and Block Count Enable = 1; `TM_DIR_READ` is OMITTED, and its ABSENCE is what
+//     makes the transfer a write — there is no positive "write" bit, which is why it is called out
+//     here exactly as [`write_block_512`] calls it out.
+//   * **CMD12 STOP_TRANSMISSION**, R1b, issued by the CONTROLLER as Auto CMD12 (Host Controller
+//     §2.2.5, Auto CMD12 Enable). Block Count Enable is therefore not optional: the block counter is
+//     the only thing that tells the controller when the transfer ended and the STOP is due. This
+//     mirrors [`counted_read_cmd`]'s CMD18 arm rather than inventing a second shape — and an Auto
+//     CMD12 failure sets error-half bit 8 ([`INT_ERR_AUTO_CMD`], inside [`INT_ERR_ANY`], named by
+//     [`int_error_name`]), with the reason readable in [`REG_AUTO_CMD_ERR`] (§2.2.18), which the
+//     failure lines below print because a STOP that failed leaves the CARD streaming.
+//   * **The programming-busy wait**, Physical Layer §4.6.2.2. That section caps a WRITE's busy
+//     window at 250 ms PER BLOCK, and [`PROG_BUSY_TIMEOUT_MS`] is already that figure doubled for
+//     margin. A multi-block write is bounded by the same per-block figure times the block count, so
+//     every wait in this path that can be held off by card programming scales with `count`
+//     ([`mb_write_budget_ms`]) instead of using [`DATA_TIMEOUT_MS`], which is a READ bound (the
+//     100 ms read-access ceiling, doubled) and is 200 ms — under the spec's own 250 ms write figure.
+//     Using the read bound here would convict a perfectly legal card of a timeout mid-stream, which
+//     is the single most likely way a first CMD25 goes wrong for a reason that is not CMD25.
+//   * **CMD13 SEND_STATUS** afterwards, for the same reason 4a gives: programming-phase failures are
+//     reported by NO controller interrupt, and `prg` carries no error bit, so a clean R1 whose
+//     CURRENT_STATE is not `tran` is a write that is not durable.
+//
+// GATES 2 AND 3 ARE RE-READ HERE, NOT INHERITED. The write-protect pin is sampled from Present
+// State (§2.2.9 bit 19, inverted sense) at the moment of THIS write, and the card's own CSD
+// PERM/TMP_WRITE_PROTECT is re-checked, exactly as [`write_block_512`] does. A primitive that can
+// write must carry its own refusals; a caller must not have to remember them.
+// ===================================================================================
+
+/// SDHC-4b: the (command word, transfer-mode bits, log name) for a counted WRITE of `count` blocks.
+///
+/// `count == 1` issues **CMD24 WRITE_BLOCK with Multi/Single Block Select clear**, not CMD25 with a
+/// block count of one — [`counted_read_cmd`]'s rule and its reasoning, in the write direction: the
+/// single-block form is the one every card and controller in the field is exercised on, and keeping
+/// the degenerate case on it means a `count == 1` call through this function issues the same command
+/// word [`write_block_512`] issues, so the two paths can be compared.
+///
+/// Auto CMD12 appears only on the multi-block leg, and only alongside Block Count Enable.
+#[cfg(feature = "sdw")]
+fn counted_write_cmd(count: u16) -> (u16, u16, &'static str) {
+    if count == 1 {
+        (
+            cmd_word(24, RSP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA_PRESENT),
+            TM_BLOCK_COUNT_EN,
+            "cmd24",
+        )
+    } else {
+        (
+            cmd_word(25, RSP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK | CMD_DATA_PRESENT),
+            TM_BLOCK_COUNT_EN | TM_MULTI_BLOCK | TM_AUTO_CMD12,
+            "cmd25",
+        )
+    }
+}
+
+/// SDHC-4b: the bound, in milliseconds, for any wait in a `count`-block write that card programming
+/// can hold off — Buffer Write Ready between blocks, Transfer Complete at the end, and the closing
+/// DAT0 busy.
+///
+/// SD Physical Layer Simplified Specification §4.6.2.2 states the WRITE timeout as a per-block
+/// figure (250 ms); [`PROG_BUSY_TIMEOUT_MS`] is that figure doubled for margin, and this scales it
+/// by the block count because a multi-block transfer is that many programming operations. Saturating
+/// so a bound can never wrap to a small number: a budget is only a budget if it cannot underflow.
+#[cfg(feature = "sdw")]
+fn mb_write_budget_ms(count: u16) -> u64 {
+    PROG_BUSY_TIMEOUT_MS.saturating_mul(count as u64)
+}
+
+/// SDHC-4b: wait out the card's programming busy on DAT0 and MEASURE it. `Some(ms)` when DAT0 was
+/// released inside `budget_ms`, `None` on timeout.
+///
+/// The measurement is the point. `busy_ms` on the witness line is what separates "the card is
+/// programming, as cards do" from "the card is wedged and the budget is merely generous": a figure
+/// in the single-digit milliseconds for a four-block write is a healthy card, and a figure that sits
+/// at the budget is a card that never released DAT0. A pass/fail bit says neither.
+///
+/// Milliseconds are derived from the SAME calibrated TSC [`cycles_ms`] uses, and read `0` rather
+/// than a fabricated figure when the TSC is uncalibrated — "not measured" must not be spelled as a
+/// number this file made up.
+#[cfg(feature = "sdw")]
+fn wait_prog_busy_ms(base: u64, budget_ms: u64) -> Option<u64> {
+    let start = crate::arch::now_cycles();
+    let released = wait_ms(budget_ms, || r32(base, REG_PRESENT_STATE) & PS_DAT_INHIBIT == 0);
+    let elapsed = crate::arch::now_cycles().wrapping_sub(start);
+    let hz = crate::arch::apic::tsc_hz();
+    let ms = if hz != 0 { elapsed.saturating_mul(1000) / hz } else { 0 };
+    if released { Some(ms) } else { None }
+}
+
+/// SDHC-4b — write `count` contiguous 512-byte blocks starting at `lba` from `buf` via ONE polled
+/// CMD25 WRITE_MULTIPLE_BLOCK, closed by the controller's Auto CMD12 STOP_TRANSMISSION.
+///
+/// Returns the measured programming-busy window in milliseconds, which the caller prints; the
+/// transfer either completed and the card returned to `tran`, or this is an `Err` and the reason is
+/// already on the wire with the raw Interrupt Status word that convicted it.
+///
+/// **Compiled only under `feature = "sdw"` (`UNAOS_SDW=1`)**, gate 1 of the module header's four.
+/// Gates 2 (the physical write-protect pin, re-read at this write) and 3 (the card's own CSD) are
+/// enforced here on every call, the same as [`write_block_512`]. Gate 4 — the blank-sector proof —
+/// is not a property of a primitive and belongs to the caller; [`write_multiblock_selftest`] is the
+/// one caller in this arc and it makes that proof per block before it calls.
+///
+/// Every failure path closes the CARD's side with [`abort_data_transfer`], not just the host's. An
+/// aborted CMD25 leaves the card in `rcv`, and the next command issued to a card in `rcv` is
+/// rejected for a reason that has nothing to do with that command — the cascade
+/// `abort_data_transfer`'s own doc comment exists to prevent, and the one delta from the `emmc2`
+/// twin that [`write_block_512`] already carries.
+#[cfg(feature = "sdw")]
+pub fn write_blocks_512(lba: u64, count: u16, buf: &[u8]) -> Result<u64, BlockError> {
+    let guard = CARD.lock();
+    let card = guard.as_ref().ok_or(BlockError::NotReady)?;
+
+    if count == 0 || count > MB_MAX_BLOCKS {
+        serial_println!(
+            "[sdhc-w] refusing count={} (bound is 1..={}) — a transfer this driver cannot bound is \
+             not issued",
+            count, MB_MAX_BLOCKS
+        );
+        return Err(BlockError::Io);
+    }
+    let n = count as usize * 512;
+    if buf.len() < n {
+        serial_println!(
+            "[sdhc-w] refusing lba={} blocks={}: caller buffer is {} bytes, {} needed — a short push \
+             leaves the controller waiting and desynchronises every later transfer",
+            lba, count, buf.len(), n
+        );
+        return Err(BlockError::Io);
+    }
+    if lba.checked_add(count as u64).is_none_or(|end| end > card.num_blocks) {
+        return Err(BlockError::BadLba);
+    }
+
+    let base = card.base;
+
+    // --- Gate 2: the physical switch, read NOW. Inverted sense: bit 19 set = write ENABLED.
+    let present = r32(base, REG_PRESENT_STATE);
+    if present & PS_WRITE_PROTECT == 0 {
+        serial_println!(
+            "[sdhc-w] REFUSED lba={} blocks={} present={:#010x} wp-switch=LOCKED — the slider on the \
+             card says read-only (Present State bit 19 clear); no CMD25 issued",
+            lba, count, present
+        );
+        return Err(BlockError::Io);
+    }
+    // --- Gate 3: the card's own CSD declaration, decoded at identification.
+    if card.csd_perm_wp || card.csd_tmp_wp {
+        serial_println!(
+            "[sdhc-w] REFUSED lba={} blocks={} csd perm-wp={} tmp-wp={} — the CARD declares itself \
+             read-only; no CMD25 issued",
+            lba, count, card.csd_perm_wp as u8, card.csd_tmp_wp as u8
+        );
+        return Err(BlockError::Io);
+    }
+
+    let arg = lba_arg(card, lba)?;
+    let (command, tm, name) = counted_write_cmd(count);
+    let budget = mb_write_budget_ms(count);
+
+    w32(base, REG_INT_STATUS, 0xFFFF_FFFF); // W1C stale status
+    w16(base, REG_BLOCK_SIZE, 512); // bits 11:0 = block length; SDMA boundary bits stay 0 (PIO)
+    w16(base, REG_BLOCK_COUNT, count);
+    // HOST -> CARD, block count enabled, Auto CMD12 on the multi-block leg, DMA DISABLED. Written
+    // BEFORE the Command register, which is what issues the transfer.
+    w16(base, REG_TRANSFER_MODE, tm);
+
+    if let Err(int) = send_command(base, command, arg, true) {
+        serial_println!(
+            "[sdhc-w] {} lba={} blocks={} FAILED int={:#010x} ({})",
+            name, lba, count, int, int_error_name(int)
+        );
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+    // The card answered on the wire; now its own verdict, BEFORE pushing a byte. A card that rejected
+    // CMD25 — WP_VIOLATION, OUT_OF_RANGE, CARD_IS_LOCKED — will never accept the FIFO words, and
+    // pushing them anyway desynchronises the controller for every later transfer.
+    if let Err(r1) = r1_check(base, "cmd25 multi-block write") {
+        serial_println!(
+            "[sdhc-w] {} lba={} blocks={} rejected by the CARD r1={:#010x}",
+            name, lba, count, r1
+        );
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+
+    for blk in 0..count as usize {
+        // Buffer Write Ready is re-armed by the controller once per block, and between blocks the
+        // card may be BUSY programming the previous one — which is why this waits on the write
+        // budget (§4.6.2.2, 250 ms per block) and not on `DATA_TIMEOUT_MS`, the 200 ms READ bound.
+        // The error half is tested in the same predicate, because a failing transfer sets an error
+        // bit INSTEAD of, not before, the ready bit.
+        if !wait_ms(budget, || {
+            r32(base, REG_INT_STATUS) & (INT_BUF_WRITE_READY | INT_ERR_ANY) != 0
+        }) {
+            let int = r32(base, REG_INT_STATUS);
+            serial_println!(
+                "[sdhc-w] {} lba={} blocks={} block {} buffer-write-ready TIMEOUT after {}ms \
+                 int={:#010x} ({}) present={:#010x}",
+                name, lba, count, blk, budget, int, int_error_name(int), r32(base, REG_PRESENT_STATE)
+            );
+            abort_data_transfer(base);
+            return Err(BlockError::Io);
+        }
+        let int = r32(base, REG_INT_STATUS);
+        if int & INT_ERR_ANY != 0 {
+            serial_println!(
+                "[sdhc-w] {} lba={} blocks={} block {} ERROR int={:#010x} ({}) autocmd={:#06x}",
+                name, lba, count, blk, int, int_error_name(int), r16(base, REG_AUTO_CMD_ERR)
+            );
+            w32(base, REG_INT_STATUS, int);
+            abort_data_transfer(base);
+            return Err(BlockError::Io);
+        }
+        w32(base, REG_INT_STATUS, INT_BUF_WRITE_READY); // W1C, re-arm for the next block
+
+        // Push exactly 128 little-endian words for this block. `buf` is already proven long enough
+        // above, so there is no short-push arm here: a partial block is never written.
+        let bo = blk * 512;
+        for i in 0..128usize {
+            let off = bo + i * 4;
+            let word = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            w32(base, REG_BUFFER_DATA, word);
+        }
+    }
+
+    // Transfer Complete: the controller's Auto CMD12 has closed the card's write. The card can be
+    // programming the last block here, so this is the write budget too.
+    if !wait_ms(budget, || {
+        r32(base, REG_INT_STATUS) & (INT_XFER_COMPLETE | INT_ERR_ANY) != 0
+    }) {
+        let int = r32(base, REG_INT_STATUS);
+        serial_println!(
+            "[sdhc-w] {} lba={} blocks={} transfer-complete TIMEOUT after {}ms int={:#010x} ({}) \
+             autocmd={:#06x}",
+            name, lba, count, budget, int, int_error_name(int), r16(base, REG_AUTO_CMD_ERR)
+        );
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+    let int = r32(base, REG_INT_STATUS);
+    w32(base, REG_INT_STATUS, int); // W1C everything we saw
+    if int & INT_ERR_ANY != 0 {
+        // `autocmd=` is the reason a STOP failed (§2.2.18) and it is printed HERE rather than
+        // decoded, because a failed Auto CMD12 leaves the CARD streaming and the raw word is what a
+        // later reader needs to attribute it.
+        serial_println!(
+            "[sdhc-w] {} lba={} blocks={} data ERROR int={:#010x} ({}) autocmd={:#06x}",
+            name, lba, count, int, int_error_name(int), r16(base, REG_AUTO_CMD_ERR)
+        );
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    }
+
+    // --- Programming busy (§4.6.2.2). The blocks are off the FIFO but not yet in flash: the card
+    // holds DAT0 low while it programs, and programming-PHASE failures are reported by NO controller
+    // interrupt — only by the CMD13 below. Without this wait a write the card ultimately discarded
+    // returns `Ok`.
+    let Some(busy_ms) = wait_prog_busy_ms(base, budget) else {
+        let ps = r32(base, REG_PRESENT_STATE);
+        serial_println!(
+            "[sdhc-w] {} lba={} blocks={} programming-busy TIMEOUT after {}ms present={:#010x} — the \
+             card never released DAT0; the fate of {} blocks is UNKNOWN",
+            name, lba, count, budget, ps, count
+        );
+        abort_data_transfer(base);
+        return Err(BlockError::Io);
+    };
+
+    // --- CMD13 SEND_STATUS: the card's post-programming verdict, and the only place it is available.
+    if let Err(int) = send_command(
+        base,
+        cmd_word(13, RSP_48 | CMD_CRC_CHECK | CMD_INDEX_CHECK),
+        card.rca_arg,
+        false,
+    ) {
+        serial_println!(
+            "[sdhc-w] cmd13 after {} lba={} blocks={} FAILED int={:#010x} ({}) — the write has NO \
+             verdict",
+            name, lba, count, int, int_error_name(int)
+        );
+        return Err(BlockError::Io);
+    }
+    let r1 = r32(base, REG_RESPONSE0);
+    if r1 & R1_ERROR_MASK != 0 {
+        serial_println!(
+            "[sdhc-w] cmd13 after {} lba={} blocks={} r1={:#010x} state={} — the card reports the \
+             WRITE failed",
+            name, lba, count, r1, r1_state_name(r1_state(r1))
+        );
+        return Err(BlockError::Io);
+    }
+    // `prg` carries no error bit. A card still programming answers with a clean R1, and treating that
+    // as success is how a write gets reported durable before it is.
+    if r1_state(r1) != R1_STATE_TRAN || r1 & R1_READY_FOR_DATA == 0 {
+        serial_println!(
+            "[sdhc-w] cmd13 after {} lba={} blocks={} r1={:#010x} state={} ready-for-data={} — the \
+             card has NOT returned to tran; the write is not durable",
+            name, lba, count, r1, r1_state_name(r1_state(r1)),
+            (r1 & R1_READY_FOR_DATA != 0) as u8
+        );
+        return Err(BlockError::Io);
+    }
+    Ok(busy_ms)
+}
+
+// ===================================================================================
+// Step 9b — the multi-block write fixture (SDHC-4b)
+//
+// The same ladder Step 8b runs for one sector, over a WINDOW, and it runs only after Step 8b's
+// single-block ladder reported PASS. That ordering is the whole instrument: if the window compares
+// badly there is a boot's worth of evidence — every read witness, plus a CMD24 write that was
+// written, read back and restored byte-for-byte on this same card, seconds earlier — that indicts
+// CMD25 rather than leaving "the card", "the read path" and "the write path" jointly suspect. It is
+// §"Milestones" 3a's argument for CMD18, repeated in the direction that can damage the medium.
+//
+// THE WINDOW IS BELOW THE SINGLE-BLOCK SCRATCH AND NEVER OVERLAPS IT. Step 8b owns `num_blocks - 1`;
+// this fixture takes the [`SDW_MB_BLOCKS`] blocks BELOW it. Sharing the sector would mean the second
+// fixture's evidence could be the first fixture's leftovers.
+//
+// EVERY GATE OF 4a IS KEPT, PER BLOCK. The partition-extent test and the blank test are re-made for
+// each block of the window, not for the window as a whole and not inherited from rung 5/7: a window
+// is only as safe as its least safe sector, and "the top sector was blank" says nothing about the
+// one below it. The stash read, the write, the verify read and the restore all go through the PUBLIC
+// paths (`read_blocks_512` / `write_blocks_512`), so what the fixture exercises is exactly what a
+// later caller gets.
+//
+// WHAT THIS FIXTURE CANNOT CATCH, named so it is not mistaken for covered, is 4a's limitation
+// unchanged: a SYSTEMATIC wrong-LBA write. Pattern, verify, restore and restore-verify all go
+// through the same [`lba_arg`], so a computation that puts the window at the wrong address has every
+// step agreeing with every other. The per-block embedded LBA (bytes 32..40 of
+// [`sdw_make_pattern`]) catches a per-block address slip — which IS the new failure mode CMD25
+// introduces, a transfer that lands its blocks in the wrong order or at the wrong stride — and that
+// is precisely why the pattern is stamped per block rather than once across the window.
+// ===================================================================================
+
+/// SDHC-4b: how many blocks the multi-block write fixture exercises.
+///
+/// Four, not [`MB_MAX_BLOCKS`]: it is the smallest count that makes the transfer genuinely
+/// multi-block (more than one Buffer Write Ready re-arm, a real Auto CMD12, a per-block stride to
+/// get wrong) while costing 2 KiB of `.bss` per buffer and a bounded ~2 s worst-case budget. A
+/// bigger window proves nothing this one does not and spends medium and boot time to do it.
+#[cfg(feature = "sdw")]
+const SDW_MB_BLOCKS: u16 = 4;
+
+/// SDHC-4b: the stashed original contents of the multi-block scratch window.
+#[cfg(feature = "sdw")]
+static SDW_MB_STASH: Mutex<[u8; SDW_MB_BLOCKS as usize * 512]> =
+    Mutex::new([0u8; SDW_MB_BLOCKS as usize * 512]);
+/// SDHC-4b: the stamped pattern written to the multi-block scratch window, one stamp PER BLOCK.
+#[cfg(feature = "sdw")]
+static SDW_MB_PATTERN: Mutex<[u8; SDW_MB_BLOCKS as usize * 512]> =
+    Mutex::new([0u8; SDW_MB_BLOCKS as usize * 512]);
+/// SDHC-4b: the read-back buffer, used for both the write verify and the restore verify.
+#[cfg(feature = "sdw")]
+static SDW_MB_READBACK: Mutex<[u8; SDW_MB_BLOCKS as usize * 512]> =
+    Mutex::new([0u8; SDW_MB_BLOCKS as usize * 512]);
+
+/// SDHC-4b — **the multi-block write witness, in one place.** Printed EXACTLY ONCE per boot on which
+/// Step 8b's single-block ladder reached `-> PASS`, whatever happens after — refusal, pass or
+/// failure — so that the line's ABSENCE means only one thing: the single-block ladder did not pass,
+/// and its own verdict says why.
+///
+/// `verify=` and `busy_ms=` are the two fields a reader acts on, and they are deliberately not
+/// collapsible into one another:
+///
+/// | `verify=` | means |
+/// | :-- | :-- |
+/// | `ok` | the window was written by ONE CMD25 and read back by CMD18 byte-identical |
+/// | `MISMATCH` | written and read back, and the compare found a difference (the offset is on the preceding line) |
+/// | `UNREADABLE` | the CMD18 verify read itself failed; the window's content is unknown |
+/// | `WRITE-FAILED` | the CMD25 returned `Err`; its reason is already on the wire |
+/// | `SKIPPED` | a gate refused before any write was attempted; `reason=` names which |
+///
+/// `busy_ms=0` on every path that issued no CMD25 — a measurement that was not taken must not be
+/// spelled as a small number that looks like a fast card, which is why the `verify=` token is what a
+/// reader keys on and `busy_ms` is only ever read beside it.
+#[cfg(feature = "sdw")]
+fn mb_verdict(lba: Option<u64>, count: u16, verify: &str, busy_ms: u64, restore: &str, reason: &str, verdict: &str) {
+    match lba {
+        Some(l) => {
+            serial_println!(
+                "[sdhc] write n={} lba={} verify={} busy_ms={}",
+                count, l, verify, busy_ms
+            );
+            serial_println!(
+                ":: sdhc: w2 armed=1 lba={} n={} verify={} busy_ms={} restore={} reason={} -> {} ::",
+                l, count, verify, busy_ms, restore, reason, verdict
+            );
+        }
+        None => {
+            serial_println!("[sdhc] write n={} lba=NONE verify={} busy_ms={}", count, verify, busy_ms);
+            serial_println!(
+                ":: sdhc: w2 armed=1 lba=NONE n={} verify={} busy_ms={} restore={} reason={} -> {} ::",
+                count, verify, busy_ms, restore, reason, verdict
+            );
+        }
+    }
+}
+
+/// SDHC-4b: is this 512-byte slice of a window blank by gate 4's rule? `false` for a slice that is
+/// not exactly 512 bytes, which cannot happen from the one caller and is refused rather than
+/// assumed.
+///
+/// A forward to [`sdw_blank`], never a second policy: gate 4 has one definition and a window-shaped
+/// caller does not get its own.
+#[cfg(feature = "sdw")]
+fn sdw_blank_at(window: &[u8], blk: usize) -> bool {
+    let lo = blk * 512;
+    match window.get(lo..lo + 512).and_then(|s| <&[u8; 512]>::try_from(s).ok()) {
+        Some(b) => sdw_blank(b),
+        None => false,
+    }
+}
+
+/// SDHC-4b — write [`SDW_MB_BLOCKS`] blocks with ONE CMD25, verify them with CMD18, restore the
+/// originals with a second CMD25 and verify that too.
+///
+/// Called from [`write_selftest`]'s armed tail, and only when its single-block ladder reported
+/// `restore=IDENTICAL -> PASS`. `s0` is the sector-0 survey that ladder already took — re-parsing it
+/// would be a second read of a sector whose content this boot has already established, and the
+/// partition extents are the same claim either way.
+#[cfg(feature = "sdw")]
+fn write_multiblock_selftest(num_blocks: u64, s0: &Sector0) {
+    let n = SDW_MB_BLOCKS;
+
+    // --- The window: the `n` blocks BELOW Step 8b's own scratch sector (`num_blocks - 1`), so the
+    // two fixtures never share a sector. `+ 1` for that sector, `+ 1` so LBA 0 is never in reach.
+    if num_blocks < n as u64 + 2 {
+        mb_verdict(None, n, "SKIPPED", 0, "SKIPPED", "card-too-small", "REFUSED");
+        return;
+    }
+    let lo = num_blocks - 1 - n as u64;
+
+    // --- Gate 5, per block. A window is only as safe as its least safe sector: "the top sector is
+    // outside every partition" says nothing about the one below it, and a card partitioned "use the
+    // rest of the disk" puts a live filesystem block exactly here.
+    for b in 0..n as u64 {
+        if let Some(i) = sdw_inside_partition(s0, lo + b) {
+            let why = match i {
+                0 => "inside-partition-0",
+                1 => "inside-partition-1",
+                2 => "inside-partition-2",
+                _ => "inside-partition-3",
+            };
+            mb_verdict(Some(lo), n, "SKIPPED", 0, "SKIPPED", why, "REFUSED");
+            return;
+        }
+    }
+
+    let mut stash = SDW_MB_STASH.lock();
+    let mut pattern = SDW_MB_PATTERN.lock();
+    let mut readback = SDW_MB_READBACK.lock();
+
+    // --- Gate 6: stash the window's current contents, through the PUBLIC counted read path — which
+    // is also the first CMD18 this window has seen, so a window that cannot be read is refused
+    // before anything can be written over it.
+    if read_blocks_512(lo, n as usize, &mut stash[..]).is_err() {
+        mb_verdict(Some(lo), n, "SKIPPED", 0, "SKIPPED", "window-unreadable", "REFUSED");
+        return;
+    }
+
+    // --- Gate 7: the blank proof, per block. This is what makes the stash/restore window harmless:
+    // the only content a power cut can strand on the card is this driver's own labelled pattern
+    // where zeros were.
+    for b in 0..n as usize {
+        if !sdw_blank_at(&stash[..], b) {
+            mb_verdict(Some(lo), n, "SKIPPED", 0, "SKIPPED", "nonblank", "REFUSED");
+            return;
+        }
+    }
+
+    // --- The pattern, stamped PER BLOCK with that block's own LBA. This is the check CMD25 needs
+    // and CMD24 did not: a transfer that lands its blocks in the wrong order, or at the wrong
+    // stride, differs from the pattern at byte 32 of some block and names the offset.
+    for b in 0..n as usize {
+        let off = b * 512;
+        if let Ok(dst) = <&mut [u8; 512]>::try_from(&mut pattern[off..off + 512]) {
+            sdw_make_pattern(dst, lo + b as u64);
+        }
+    }
+
+    // --- The write: ONE CMD25 for the whole window.
+    let busy_ms = match write_blocks_512(lo, n, &pattern[..]) {
+        Ok(ms) => ms,
+        Err(_) => {
+            // The window may have partially landed. Put the originals back and say whether that
+            // worked. `REWRITTEN`, not `IDENTICAL`: the restore returned Ok and NOTHING was read
+            // back or compared — 4a's distinction, kept, for the same reason.
+            let restored = write_blocks_512(lo, n, &stash[..]).is_ok();
+            mb_verdict(
+                Some(lo), n, "WRITE-FAILED", 0,
+                if restored { "REWRITTEN" } else { "REWRITE-FAILED" },
+                "cmd25-failed", "FAIL",
+            );
+            return;
+        }
+    };
+
+    // --- The write verify: read the window back with CMD18 and compare byte for byte.
+    if read_blocks_512(lo, n as usize, &mut readback[..]).is_err() {
+        let restored = write_blocks_512(lo, n, &stash[..]).is_ok();
+        mb_verdict(
+            Some(lo), n, "UNREADABLE", busy_ms,
+            if restored { "REWRITTEN" } else { "REWRITE-FAILED" },
+            "verify-read-failed", "FAIL",
+        );
+        return;
+    }
+    if let Some((blk, off)) = first_difference(&pattern[..], &readback[..]) {
+        // The EVIDENCE, not a summary: WHICH block and WHICH offset says whether the window landed
+        // short, landed at the wrong stride (a differing block whose bytes 32..40 hold a DIFFERENT
+        // block's LBA), or lost a word.
+        serial_println!(
+            "[sdhc-w] verify lba={} blocks={} first-diff block={} off={} wrote={:#04x} read={:#04x}",
+            lo, n, blk, off, pattern[blk * 512 + off], readback[blk * 512 + off]
+        );
+        let restored = write_blocks_512(lo, n, &stash[..]).is_ok();
+        mb_verdict(
+            Some(lo), n, "MISMATCH", busy_ms,
+            if restored { "REWRITTEN" } else { "REWRITE-FAILED" },
+            "readback-differs", "FAIL",
+        );
+        return;
+    }
+
+    // --- The restore, and its own verify. A SECOND CMD25 with DIFFERENT content: a path that wrote
+    // once could have got lucky, and one that writes twice and verifies both has shown it repeatable.
+    if write_blocks_512(lo, n, &stash[..]).is_err() {
+        mb_verdict(Some(lo), n, "ok", busy_ms, "FAILED", "restore-write-failed", "FAIL");
+        return;
+    }
+    if read_blocks_512(lo, n as usize, &mut readback[..]).is_err() {
+        mb_verdict(Some(lo), n, "ok", busy_ms, "UNREADABLE", "restore-read-failed", "FAIL");
+        return;
+    }
+    let restore_ok = first_difference(&stash[..], &readback[..]).is_none();
+    mb_verdict(
+        Some(lo), n, "ok", busy_ms,
+        if restore_ok { "IDENTICAL" } else { "MISMATCH" },
+        if restore_ok { "none" } else { "restore-differs" },
+        if restore_ok { "PASS" } else { "FAIL" },
+    );
 }
