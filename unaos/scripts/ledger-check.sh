@@ -643,8 +643,8 @@ QUEUECITE_REG = {
     f"docs/dev/OS/orin-queue.md:{_i}":
         "orin-queue cites a row that exists in no ledger on any head (measured over 9 heads, "
         "2026-09-15, rmbp 20) — orin's to write or to strike; must reach zero"
-    for _i in ("A70 A71 A74 A75 A76 A78 A79 A85 A86 A87 "
-               "A89 A90 A91 A92 A94 S33 S34 SO43 SO44 SO46 SO48 SO49").split()
+    for _i in ("A70 A71 A76 A78 A79 "
+               "A92 A94 S33 S34 SO48 SO49").split()
 }
 # COLLAPSED BY (file, id), NOT one line per occurrence: the first cut printed 202 identical-shaped
 # REGISTERED lines on every green run, which is LAWS §5's "22 names on every run trains the eye to

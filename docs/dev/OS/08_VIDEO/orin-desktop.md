@@ -3862,3 +3862,217 @@ image; the log carries no `[compgate]` line because the compositor never runs. T
 aarch64 image does composite are `kernel8-test` (QEMU raspi4b, `baremetal`) and the Orin metal
 `esp-jetson` flight. The fixture's go-red therefore has not been executed on a run; it is the one
 outstanding item on this arc.
+
+---
+
+## §12 PTRLOST / SO46 — the pointer's THIRD region, and why `nohit` could not say so
+
+Added 2026-09-13 (orin-0912b, PTRLOST, branch `exec-orin-ptrlost`). Closes the road SO46 names.
+It is **not** SO27's road: `shell-remint` is 0 across the whole render14 wire, so APPPIN's fix held.
+
+### §12.1 What Peter saw, and what the wire says about it
+
+> *"went to open quarry the machine froze for a minute and when it came back the mouse cursor was
+> gone"* — twice, both times ending in a reboot.
+
+The wire's reading of that state — **in git as
+[`docs/dev/evidence/orin28/render14-boot5-ptrlost-nohit-latched.log`](../../evidence/orin28/render14-boot5-ptrlost-nohit-latched.log)**,
+a whole contiguous boot cut from `~/unaos-bench/capture/line-acm0/orin.log` lines 342308-356403 and
+anchored on its own first line `KELF min=0x0 max=0x3fe708 pg=1023`, which matches the render14 flash
+MANIFEST's `ELF max_vaddr=0x3fe708`, so the image identity is verified rather than assumed — read with
+`LC_ALL=C awk 'index($0,"[cursor12]")'`, is four consecutive rollups:
+
+```
+[cursor12] offer scope=live adm=window passes=3158 nosprite=15  hidden=0   nohit=3143 … planned=0 -> nohit
+[cursor12] offer scope=live adm=window passes=8032 nosprite=567 hidden=551 nohit=7465 … planned=0 -> nohit
+[cursor12] offer scope=live adm=window passes=7717 nosprite=828 hidden=812 nohit=6889 … planned=0 -> nohit
+[cursor12] offer scope=live adm=window passes=1379 nosprite=473 hidden=464 nohit=906  … planned=0 -> nohit
+```
+
+and, in the same windows:
+
+```
+[cursor]  restore src=scene rect=9x9+765+1156 …        [strip] rollup tenant=dock … rect=768x52+576+1136
+[cursor]  restore src=scene rect=9x9+1036+1167 …       [dock] press at (742,1173) tile=1/7 … raised=true
+[cursor]  restore src=scene rect=9x9+1195+1154 …       [dock] press at (818,1165) tile=2/7 … raised=true
+[flick2]  down_max=1ms -> 374ms -> 634ms -> 1883ms
+```
+
+The sprite is inside the **dock strip** for the whole block, and the arrow's longest single absence
+from the glass climbs to 1.88 s.
+
+### §12.2 `nohit` at its definition site, and the reading that is only half true
+
+`video/wm.rs`, `CUR12_NOHIT`:
+
+> *"CURSOR-12 — the sprite was on the panel, but no live window above the shell met its box. The
+> pointer is over the desktop; nothing to compose through, and WC-I's whole point."*
+
+and `cursor12_rollup`'s reading of a dominant `nohit`:
+
+> *"`nohit` ≈ `passes` — the operator simply was not pointing at a window. Not a defect; check the
+> sitting, not the code."*
+
+That is **true over the backdrop and false over furniture**, and nothing on the line separates the
+two. The bump is `video/wm.rs:5719-5721`, gated on `!hit`; `hit` is built at `video/wm.rs:5572-5584`
+from the window TABLE alone:
+
+```rust
+for r in t.rows.iter() {
+    if r.used && above_shell(r, shell) && boxes_overlap(sbox, outer_box(r)) { … }
+}
+npaint > 0
+```
+
+### §12.3 The row set did NOT change — the pointer's ADDRESS did
+
+Every `[wc-fv] focus raise …` line of that boot reads `shell_z=0`, so `wm::above_shell` excluded
+nothing (`PARKED_Z` is 0 and every live row was `z=33..52`), and `[wcn] rollup … wins=7` throughout.
+What opening apps changes is **where the operator's hand has to be**: under R49 a pinned app is
+launched from its dock tile, so "open quarry" means putting the arrow inside
+`rect=768x52+576+1136` — and the dock is not a window table row.
+
+### §12.4 Two sprites, three regions, and the one region with no painter
+
+SO5 (`arch/aarch64/display_tegra.rs`, `sprite_size_witness`) measured the two-sprite fact live on this
+wire: `compositor=9x9 backbuffer=18x18 same=0`. Which one reaches the glass is decided by
+`video/screen.rs::present_background`'s occluder subtraction, and since SHELLDESK/MENUFIT that set is
+windows **plus furniture** — `screen.rs:1610` (`wm::occluders`), `screen.rs:1617` (the strips),
+`screen.rs:1632` (the open dropdown):
+
+| pointer stands on | desktop present subtracts its box? | `composite_inner` `hit`? | arrow on glass |
+| --- | :-: | :-: | --- |
+| backdrop  | no  | no (`nohit`) | the BACK-buffer 18×18 sprite |
+| a window  | yes | yes          | the COMPOSITOR 9×9 sprite |
+| **furniture** (dock, menu bar, open dropdown) | **yes** | **no (`nohit`)** | **neither** |
+
+The furniture arm that could have raised `hit` sets `reserved_hit` at `video/wm.rs:5692` (dropdown)
+and `:5700` (dock) — seventy lines **after** the only `hit |= reserved_hit` fold (`video/wm.rs:5626`),
+which is itself inside `#[cfg(all(target_arch = "aarch64", feature = "witness", feature = "baremetal"))]`
+and therefore absent from an Orin build altogether. No strip can ever make the pass plan.
+
+`pal.rs` had already written down the mechanism for the WINDOW case and shipped the fix for x86 only:
+
+> *"The sprite was BELOW the window layer. `Screen::present_background` subtracts the compositor's
+> occluder boxes from the desktop's damage (WC-I), so back-buffer pixels are deliberately never copied
+> where a window is. The arrow therefore vanished under every window it crossed — correct behaviour for
+> the desktop layer, wrong behaviour for a system cursor, which is by definition the last painter of
+> the panel."* — `pal.rs`, CURSOR-X86
+
+`SPRITE_OWNS_PAINT` was `cfg!(target_arch = "x86_64")`. SHELLDESK then widened the subtraction onto
+aarch64 `desktop_firmware` without widening the ownership with it, and the furniture row of that table
+is the gap it opened.
+
+### §12.5 The fix, and the invariant that keeps the two halves together
+
+One predicate, `pal.rs`:
+
+```rust
+pub(crate) const SPRITE_OWNS_PAINT: bool =
+    cfg!(target_arch = "x86_64") || cfg!(feature = "desktop_firmware");
+```
+
+The knob that compiles the furniture subtraction is the knob that hands the arrow to the compositor
+sprite. Consequences on a `desktop_firmware` build, all of them already-written paths:
+
+* `pal::cursor::repaint_on_move` now calls `video::cursor::repaint()` on **every pointer report**, so
+  the arrow's cadence is the trackpad's, not one desktop present in a hundred, and it is repainted
+  over furniture, windows and backdrop alike.
+* `draw`/`draw_over` → `video::cursor::ensure_drawn()`, `restore` → `undraw()`. The back-buffer arrow
+  is never painted, so there is nothing left for the subtraction to eat.
+* SO5's `same=` becomes trivially 1: one sprite, one block scale, so *"mouse cursor grows when over
+  desktop background"* (Peter, render7) is fixed by the same line.
+
+Carve-out preserved: an aarch64 build WITHOUT `desktop_firmware` — the `virt`/UEFI GUI console, which
+has no compositor-sprite driver of its own — keeps the back-buffer sprite exactly as before, which is
+what `pal.rs`'s own note asks for.
+
+The pairing is asserted, not documented. `video/screen.rs` tail:
+
+```rust
+pub(crate) const PTR_OWNER_INVARIANT: bool =
+    !FURNITURE_SUBTRACTED || crate::pal::cursor::SPRITE_OWNS_PAINT;
+const _: () = assert!(PTR_OWNER_INVARIANT, "PTRLOST/SO46: …");
+```
+
+`FURNITURE_SUBTRACTED` is the *same* cfg the `(nocc, nwin)` arms are written on, named once so the
+invariant cannot be gated on a paraphrase of it. Reverting the `pal.rs` predicate is a **compile
+error** on every `aarch64 + desktop_firmware` build — that is this arc's go-red, and it is reached by
+`./arroyo check`, not by a boot.
+
+### §12.6 The witness: `[ptrown]`, and what it distinguishes
+
+`video/screen.rs::ptrown_pass`, folded onto `present_background`'s `let occ = &occ[..nocc];` so the
+knob-off build keeps its `panic::Location` numbering. It rides the finished occluder set because that
+is the one place in the kernel where the window boxes and the furniture boxes are both in hand and
+already split (`occ[..nwin]` / `occ[nwin..]`) — the split the two sprites divide on.
+
+```
+[ptrown] at=(x,y) panel=WxH row=0|1 furniture=0|1 subtracted=0|1 paint=compositor|backbuffer composited=0|1 n=k/12 -> backdrop|window|furniture|LOST
+```
+
+`row=` and `composited=` (the lock-free `video::cursor::live_box_relaxed` mirror) are the two terms
+`[cursor12] -> nohit` merges and cannot separate:
+
+* `row=no` — **the sprite has no row.** Whether that is benign is decided by `furniture=`.
+* `row=yes composited=0` — **the sprite has a row and is not being composited.** A different defect,
+  and one no previous line could tell apart from the first.
+
+`-> LOST` names the closed state: a subtracted region whose arrow still belongs to the back-buffer
+sprite with no compositor sprite on the glass. `PTR_OWNER_INVARIANT` makes that terminal unreachable
+at compile time on every build that compiles the function, so a capture carrying it is a build whose
+invariant was defeated.
+
+**Bounded and latched, per SO30** (the per-pass line that ate 36% of a boot's wire): one line per
+state TRANSITION, at most 12 for the life of the boot, and on a pass with no transition the cost is a
+`visible()` check, one `pos()`, at most `DESK_OCC_MAX` box tests and one relaxed swap.
+
+The one-shot fixture runs from the first desktop present and scores the classifier and the invariant
+together:
+
+```
+:: PTRLOST: window=1:0 furniture=0:1 backdrop=0:0 furn_subtracted=1 sprite_owns_paint=1 lost_reachable=0 :: PASS ::
+```
+
+`window=`/`furniture=`/`backdrop=` are `(row, furniture)` for a probe inside a window box, inside a
+furniture box, and clear of both — so a wire that reads `furniture=0` is known to be able to read `1`.
+`lost_reachable=0` is the invariant evaluated on THIS build.
+
+### §12.7 What the next Orin boot must show
+
+With the pointer moved from the backdrop, across a window, onto a dock tile and back:
+
+* `:: PTRLOST: window=1:0 furniture=0:1 backdrop=0:0 furn_subtracted=1 sprite_owns_paint=1 lost_reachable=0 :: PASS ::`
+* `[ptrown] … paint=compositor composited=1 … -> backdrop`, `-> window` **and `-> furniture`**, at
+  most 12 lines, and **never** `-> LOST`.
+* `[sprite] … compositor=9x9 backbuffer=9x9 same=1` — SO5's size toggle gone, because there is one
+  sprite. (The `[sprite]` line survives: it reports the pair, and the pair now agrees.)
+* `[cursor12] … -> nohit` blocks are still expected and are no longer a verdict about the pointer —
+  they now mean only "no window was under the arrow", which is what the counter's name says.
+* `[flick2] down_max` back to single-digit ms with `down_slow` flat, since the arrow is re-established
+  at report rate rather than at composite rate.
+
+### §12.8 A correction to SO46's own headline number, and what is NOT in git
+
+The SO46 queue line headlines *"`[cursor12]` carries `nohit=186` at the end of boot2"*. That number is
+real and it is in boot 2 — the boot beginning at capture line 326454 — but **it is not the lost-pointer
+signature**, and this arc does not rest on it:
+
+```
+[cursor12] offer scope=live adm=window passes=2294 nosprite=29 hidden=0 nohit=186 reserved=0 nosession=0 planned=2079 … -> below-session
+```
+
+91% of that window's passes PLANNED an overlay; `nohit` is 8% of it, and the verdict token is
+`below-session`, not `nohit`. The signature this section is written from is the LATCHED block — `nohit`
+approaching `passes` with `planned=0`, sustained across four rollups — and that is in **boot 5**, which
+is the excerpt now in git.
+
+Boot ordinals were derived, not assumed: the four boots of the `0x3fe708` image in that capture start at
+lines 326454, 331681, 336654 and 342308, and the already-committed
+[`render14-boot3-shutdown-rung4e.log`](../../evidence/orin28/render14-boot3-shutdown-rung4e.log) pins the
+second of those as boot 3 (its `[cursor12] … cum=873` tail falls inside it) — which makes 326454 boot 2
+and 342308 boot 5.
+
+**Not in git:** boot 2's capture. The one line above is quoted here and in orin-ledger A74 so a reader can
+locate it in the same source; if the boot-2 window is ever needed as evidence for a claim, it has to be
+cut and committed the way boot 5 was.

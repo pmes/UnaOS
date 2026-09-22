@@ -5395,7 +5395,7 @@ fn cash_tail(owed: Owed) {
     // serial line here cannot inflate `pass_us`. Spends itself on the first pass that finds a staged
     // buffer (see `physwit_once`); every pass after that is one relaxed load.
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
-    physwit_once(); #[cfg(all(feature = "witness", feature = "wc", target_arch = "x86_64"))] wcd_oom_latch_selftest(); // WCDFLOOD (SO30) — ⚠ LINE-NEUTRAL append, before this line's first `//`. The WCDLATCH fixture rides an EXISTING call site rather than a new one in `arch/x86_64/syscall.rs`, which this brief does not name, and it rides THIS one for `physwit_once`'s own stated reason: the ledger is closed, every guard the pass took has dropped, and a serial line here cannot inflate `pass_us`. Self-one-shot, so every pass after the first is one relaxed load. IT DOES NOT RIDE THE x86 SELFTEST LADDER: folded onto the head of `dmgovlp_selftest` it cost that fixture its whole drag leg (`drag_evt=0 relay=0 narrow=0/12 adopt_stretch=0/4 -> FAIL` against a same-host baseline's `drag_evt=5 relay=3 narrow=3/12 adopt_stretch=4/4 -> PASS`), which is exactly the "no fixture between them can lose an event" rule that ladder's own comment states. Measured, then moved.
+    physwit_once(); #[cfg(all(feature = "witness", feature = "wc", target_arch = "x86_64"))] wcd_oom_latch_selftest(); #[cfg(all(feature = "witness", feature = "wc", target_arch = "x86_64"))] blitwire_selftest(); /* BLITWIRE (SO45) — ⚠ LINE-NEUTRAL fold, before this line's first `//`, and it rides THIS site for the reason the WCDFLOOD note below gives: the ledger is closed, every guard the pass took has dropped, and a serial line here cannot inflate `pass_us`. Self-one-shot, so every pass after the first is one relaxed load. It touches NO live counter — `blitwire_calc` and `blitwire_arm` are pure — so unlike WCDLATCH it has nothing to give back and cannot cost a neighbouring fixture an event, and it does NOT consume `BLITWIRE_SAID`: the latch on the wire stays armed for the real rollup. */ // WCDFLOOD (SO30) — ⚠ LINE-NEUTRAL append, before this line's first `//`. The WCDLATCH fixture rides an EXISTING call site rather than a new one in `arch/x86_64/syscall.rs`, which this brief does not name, and it rides THIS one for `physwit_once`'s own stated reason: the ledger is closed, every guard the pass took has dropped, and a serial line here cannot inflate `pass_us`. Self-one-shot, so every pass after the first is one relaxed load. IT DOES NOT RIDE THE x86 SELFTEST LADDER: folded onto the head of `dmgovlp_selftest` it cost that fixture its whole drag leg (`drag_evt=0 relay=0 narrow=0/12 adopt_stretch=0/4 -> FAIL` against a same-host baseline's `drag_evt=5 relay=3 narrow=3/12 adopt_stretch=4/4 -> PASS`), which is exactly the "no fixture between them can lose an event" rule that ladder's own comment states. Measured, then moved.
 }
 
 /// What [`composite_inner`] owes the sprite when it returns.
@@ -6358,7 +6358,7 @@ fn composite_inner() -> CursorTail {
             &clip,
         );
         // WCSER-H — breadcrumb: draw returned; the post-draw witnesses (wcg end / wc-d) run next.
-        comp_mark(rw.id, 4);
+        comp_mark(rw.id, 4); #[cfg(feature = "witness")] let c2_wit0 = crate::arch::now_cycles(); // BLITWIRE (SO45) — ⚠ LINE-NEUTRAL fold, before this line's first `//`. THE WITNESS BRACKET OPENS HERE, one statement after `draw_window` returned and one statement before the first witness-only site. Everything between this and the close on `wcn_note_drawn` moves NO pixel and exists only because this image was built with `witness`: `wcg::end` below and the two `[wc-g]` lines it prints, `stage_flush`'s `[wc-h]`, `band_flush`'s `[wc-b]`, `chromeband_fixture`, and `verify_window`'s read-back and `[wc-d]`. Every byte of it is already inside [`C2_LOOP_CYC`]'s bracket and therefore already inside the `blit_us` this file prints — unnamed, and on render14 boot 1 the majority of it. The region is straight-line: no `continue`, `break`, `return` or `?` between the two, so they cannot desynchronise. See [`C2_WIT_CYC`].
         #[cfg(feature = "witness")]
         if let Some(p) = wcg_probe {
             let r = &rw;
@@ -6403,7 +6403,7 @@ fn composite_inner() -> CursorTail {
         // WCN-CAUSE — `!seed[i]` is the cause: this row was not dirty at the table snapshot, so the
         // upward closure is the only thing that could have put it in this pass.
         #[cfg(feature = "witness")]
-        wcn_note_drawn(rows[i].id, !seed[i]);
+        wcn_note_drawn(rows[i].id, !seed[i]); #[cfg(feature = "witness")] { use core::sync::atomic::Ordering::Relaxed; C2_WIT_CYC.fetch_add(crate::arch::now_cycles().saturating_sub(c2_wit0), Relaxed); C2_WIT_N.fetch_add(1, Relaxed); } // BLITWIRE (SO45) — ⚠ LINE-NEUTRAL fold, before this line's first `//`. THE WITNESS BRACKET CLOSES HERE, and it is a SPAN TOTAL charged per WINDOW, not per pass: `wit_n` counts the windows the span bracketed, so a reader can see the mean cost of one and never mistake the total for a per-pass mean. It is charged UNCONDITIONALLY, on every drawn window whether a witness fired inside it or not, for the reason [`C2_WIT_CYC`] gives: a counter that is only charged when it is large cannot be read as a share.
         drawn += 1; /* WCC-FURN — a user row is one that is neither the compat row nor kernel furniture. */ #[cfg(feature = "witness")] if !rw.compat && !is_kernel_owner(rw.owner_asid) { drawn_user += 1; } /* VUGPERF — the pin probe, LAST in the iteration and therefore past every consumer of the pinned bytes. See `pace_pin_probe`. */ #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] if _shadow_pin.is_some() { pace_pin_probe(rw.id, _win_t0); }
     }
     // COMPOSITE-2 — loop closed. The witness one-shots inside it (WC-G/WC-D/WC-C) are charged here
@@ -13408,7 +13408,7 @@ fn comp2_emit(span: u64) {
     // COMP2-WCD — drained with the sweep; a verify only ever runs inside a pass, so the
     // `passes == 0` discard below can lose at most the sliver of a pass straddling the drain,
     // which is the standing property of every counter this early return already discards.
-    let wcd_cyc = C2_WCD_CYC.swap(0, Relaxed);
+    let wcd_cyc = C2_WCD_CYC.swap(0, Relaxed); let wit_cyc = C2_WIT_CYC.swap(0, Relaxed); let wit_n = C2_WIT_N.swap(0, Relaxed); // BLITWIRE (SO45) — ⚠ LINE-NEUTRAL fold, before this line's first `//`. Drained in THIS sweep and not at the emit below, and SWAPPED on every rollup whether the latch has spoken or not: that is what keeps the odometer a SPAN and stops it silently becoming a boot total, the same ordering rule COMP2-WCD states one line up. The `passes == 0` return two lines down discards what this took, which for a witness bracket is exactly right — a bracket only ever runs inside a pass.
     if passes == 0 {
         return;
     }
@@ -13491,7 +13491,7 @@ fn comp2_emit(span: u64) {
         passes.saturating_mul(10_000) / span.max(1) / 10,
         passes.saturating_mul(10_000) / span.max(1) % 10,
         span
-    ); serwire_emit(max_cyc, span, passes); // SERWIRE (SO45) — the transport's capped-drain odometer for THIS span, drained here and printed ONCE PER BOOT when `max_us` crosses the stall threshold, immediately under the `[comp2]` line it adjudicates. It is fed `max_cyc` (already swapped above, so this reads the identical number `[comp2]` just printed) rather than re-reading the counter, which by then is zero. `[comp2]` itself is NOT widened by one byte: a per-rollup field would be SO30 one layer up. ⚠ LINE-NEUTRAL append onto the emit's closing `);`, before the line's first `//`; the body is a FILE-TAIL append, so no `panic::Location` in this file moves.
+    ); serwire_emit(max_cyc, span, passes); blitwire_note(max_cyc, passes, loop_cyc.saturating_sub(cache_cyc), wit_cyc, wit_n, wcd_cyc, bytes); // SERWIRE (SO45) — the transport's capped-drain odometer for THIS span, drained here and printed ONCE PER BOOT when `max_us` crosses the stall threshold, immediately under the `[comp2]` line it adjudicates. It is fed `max_cyc` (already swapped above, so this reads the identical number `[comp2]` just printed) rather than re-reading the counter, which by then is zero. `[comp2]` itself is NOT widened by one byte: a per-rollup field would be SO30 one layer up. ⚠ LINE-NEUTRAL append onto the emit's closing `);`, before the line's first `//`; the body is a FILE-TAIL append, so no `panic::Location` in this file moves. — BLITWIRE (fold, both calls on one `);`): BLITWIRE (SO45) — ⚠ LINE-NEUTRAL fold, before this line's first `//`. AFTER the rollup and never before it, so the one-shot reads as an annotation on the `[comp2]` line directly above it and the two are read as a pair. `[comp2]` is not widened by one byte; this is a separate, LATCHED line that speaks at most once per boot (SO30 — a per-rollup field at ~140 rollups on a 700 s boot is this defect one layer up). Takes the SAME `loop_cyc - cache_cyc` the `blit_us` argument above takes, so the two can never disagree about what they are decomposing.
     // CHROMEBAND — pi's `[chromeband]` ledger was RETIRED at the 0ed6fee2 fold: trunk's own
     // band-clamp landed with the `[wc-b]` witness family (per-window, rollup and fixture lines
     // carrying chrome_rows/chrome_rows_used/amp), which measures the same quantity as the
@@ -28612,5 +28612,220 @@ fn serwire_emit(max_cyc: u64, span: u64, passes: u64) {
         // TOTAL drain time bounds any single pass in it. `NOT-DRAIN` therefore means SO29's mechanism
         // cannot be this `max_us`, and the next suspect is whatever `[comp2] blit_us` is measuring.
         if drain_us >= max_us { "DRAIN-BOUND" } else { "NOT-DRAIN" }
+    );
+}
+
+/// BLITWIRE (SO45) — **`blit_us` IS NOT A BLIT RATE, AND THIS IS THE ODOMETER THAT SAYS SO.**
+///
+/// `comp2_emit` prints `blit_us` as `loop_cyc - cache_cyc`, and [`C2_LOOP_CYC`] is charged with
+/// `now_cycles() - c2_loop0` at the close of the WHOLE per-window loop. Four witness-only sites run
+/// inside that bracket and move no pixel at all:
+///
+/// | file:line | site | what it does |
+/// | --- | --- | --- |
+/// | `video/wm.rs:6362` | `wcg::end` | reads the scan-out back and prints `[wc-g] win=` + `[wc-g] prof` |
+/// | `video/wm.rs:6378` | `wcg::stage_flush` | prints `[wc-h]` / `[wc-k]` |
+/// | `video/wm.rs:6382` | `band_flush` | prints `[wc-b]` |
+/// | `video/wm.rs:6398` | `verify_window` | reads the scan-out back and prints `[wc-d]`; the ONLY one with a field of its own ([`C2_WCD_CYC`]) |
+///
+/// So `bytes_pp / blit_us` is a copy rate ONLY on a span where none of them fired. The loop's own
+/// comment at the [`C2_LOOP_CYC`] charge says they "never [perturb] the rollup average this line is
+/// read for" because they are per-window-id one-shots — **and that is false on exactly the rollup
+/// SO45 is about, because that rollup is the boot's FIRST and every one-shot is still unfired.**
+///
+/// THE PARTITION, over render14 boot 1's 38 `[comp2]` rollups (`awk`, evidence orin28):
+///
+/// ```text
+///   rollups WITH a WC-G sample or wcd_us>0 :  r1 r2 r3 r4 r33 r38
+///   bytes_pp/blit_us on r1..r4             :  32.2  40.2  51.8  71.7   <- the four slowest of the boot
+///   bytes_pp/blit_us on the 32 witness-free:  68.7 .. 163.0, mean 109
+/// ```
+///
+/// The recovery is monotonic as the one-shots retire, and render14 boot 3 reproduces r1 to within
+/// 0.06 %: `passes=4 max_us=361880 blit_us=94910 bytes_pp=3053700 wcd_us=41937`, i.e. the same
+/// 32.2 B/us. A contention or mapping defect does not repeat to five figures across two boots; a
+/// boot-phase structure does.
+///
+/// THE ARITHMETIC ON THE STALL ROLLUP, from the boot's own instruments and nothing else. r1 is
+/// `passes=4 blit_us=94713`, so the bracket total for the span is `4 x 94 713` = **378 852 us**, and
+/// `max_us=361130` is **95.3 %** of it — one pass holds essentially the whole span's bracket.
+/// Charged INSIDE that bracket, measured, on the same wire:
+///
+/// ```text
+///   [wc-g] prof win=1 seq=0   cks_blit 7339 + civac 7682 + cks_after 7345 + readback 5274 = 27 640
+///   [wc-g] prof win=1 seq=1         7335 +       7470 +         7338 +        5253 = 27 396
+///                                                              WC-G in this span  =  55 036 us
+///   [comp2] wcd_us=                                            WC-D in this span  =  41 944 us
+///                                                                          total  =  96 980 us
+/// ```
+///
+/// (`wit_us=` on `[wc-g] rollup win=1` is 109 867 over all four of win=1's samples and is the same
+/// four-phase sum — `wcg.rs:387`/`:3901` — which is the independent check that 55 036 is the two
+/// samples this span took.) That is **25.6 %** of the bracket and **26.9 %** of `max_us`, and not one
+/// byte of it is a pixel on glass. It is a LOWER BOUND, because it excludes the loop's own UART: the
+/// span carries 1 686 B of `[wc-g]`/`[wc-h]`/`[wc-b]`/`[wc-d]`, which at 115200 8N1 (86.805 us/B, the
+/// rate DRAGMETAL's SERWIRE derivation pins) is up to 146 353 us more, also inside the bracket.
+///
+/// **WHAT IS NOT YET PROVEN, AND IS WHY THIS IS AN INSTRUMENT AND NOT A FIX.** With the measured
+/// terms alone the remainder is `378 852 - 96 980` = 281 872 us for 12 214 800 B = **43 B/us**, still
+/// 2.5x under the boot's own healthy 109. With the full bracket modelled (the UART term at its
+/// ceiling) it is `378 852 - 243 333` = 135 519 us = **90 B/us**, inside the healthy band. The wire
+/// cannot separate those two today, because nothing charges the print sites. THAT is the gap this
+/// counter closes, and the verdict is the discrimination the next boot owes:
+///
+/// ```text
+///   net_bus >= BLITWIRE_FLOOR_BUS  ->  WITNESS-BOUND — the bracket's excess is the INSTRUMENT.
+///                                      SO45 closes: there is no slow blit, only a wide bracket.
+///   net_bus <  BLITWIRE_FLOOR_BUS  ->  COPY-BOUND   — the copy really is slow with the witness
+///                                      subtracted, and the mapping-attribute / alignment / memory-
+///                                      port candidates survive into the next arc.
+/// ```
+///
+/// Cost to a flight boot: **one line, at most once per boot, bounded at 345 B** (112 B of literal and
+/// newline, 11 fields that cannot exceed 20 decimal digits, and a 13 B verdict word); 166 B on the
+/// render14 numbers it was shaped against. `[comp2]` is not widened by one byte and there is no
+/// per-pass and no per-rollup field — SO30 is this defect one layer up and the brief forbids it. The
+/// hot path pays two `now_cycles()` reads and two relaxed atomics per DRAWN WINDOW, in a `witness`
+/// build only, and zero bytes of UART.
+///
+/// Charged unconditionally on every drawn window — not only when a witness fires — because a counter
+/// charged only when it is large cannot be read as a SHARE of anything, and `wit_pct` is the field
+/// the verdict turns on.
+#[cfg(feature = "witness")]
+static C2_WIT_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// BLITWIRE — windows the span's witness bracket closed over, so `wit_us / wit_n` is the mean cost of
+/// one and the total can never be misread as a per-pass mean. Drained in the same sweep.
+#[cfg(feature = "witness")]
+static C2_WIT_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// BLITWIRE — the one-shot latch. At most one `[blitwire]` line per boot; see the byte budget above.
+#[cfg(feature = "witness")]
+static BLITWIRE_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// BLITWIRE — the threshold `max_us` must cross before the line speaks, argued from the boot it was
+/// shaped on rather than picked: render14 boot 1's 32 witness-FREE rollups read `max_us` 43 218
+/// ..85 871 and its four witness-carrying rollups read 91 082..361 130, so 100 000 us is above every
+/// witness-free `max_us` the boot recorded, is 6x the 16.667 ms frame, and is cleared by the stall
+/// band (348 593..367 166) by 3.5x. A lower threshold would latch on a rollup with no stall in it.
+pub const BLITWIRE_ARM_US: u64 = 100_000;
+/// BLITWIRE — the bytes per microsecond the WITNESS-SUBTRACTED loop must sustain to acquit the copy.
+/// render14 boot 1's witness-free rollups sustain 68.7..163.0 B/us and boot 3's 158.6..398.8; 64 is
+/// below every one of them and exactly twice the stall rollup's 32.2, so the verdict cannot read
+/// WITNESS-BOUND on a copy that is still running at the stall rate.
+pub const BLITWIRE_FLOOR_BUS: u64 = 64;
+// BLITWIRE — the truth table, and NOT `witness`-gated, for the reason SO40 states: a `const assert`
+// emits no code, and a compile-time go-red that only fires in the configuration nobody ships is the
+// polarity trap LAWS §5 names. Every row is render14 boot 1 rollup 1 arithmetic.
+const _: () = assert!(BLITWIRE_ARM_US == 100_000 && BLITWIRE_FLOOR_BUS == 64);
+const _: () = assert!(12_214_800 / 378_852 == 32); // raw: the bracket as `blit_us` reports it today
+const _: () = assert!(12_214_800 / (378_852 - 96_980) == 43); // measured WC-G + WC-D subtracted
+const _: () = assert!(12_214_800 / (378_852 - 243_333) == 90); // the full bracket, UART term at its ceiling
+const _: () = assert!(96_980 * 100 / 378_852 == 25 && 243_333 * 100 / 378_852 == 64);
+/// BLITWIRE — the arithmetic the line prints, factored out so the fixture drives the SAME code the
+/// wire does. Returns `(net_us, raw_bus, net_bus, witness_bound)`. `net_us` is reported exactly; only
+/// the divisor is clamped, so a bracket that is entirely witness reads `net_us=0` and still divides.
+#[cfg(feature = "witness")]
+fn blitwire_calc(loop_us: u64, wit_us: u64, bytes: u64) -> (u64, u64, u64, bool) {
+    let net_us = loop_us.saturating_sub(wit_us);
+    let raw_bus = bytes / loop_us.max(1);
+    let net_bus = bytes / net_us.max(1);
+    (net_us, raw_bus, net_bus, net_bus >= BLITWIRE_FLOOR_BUS)
+}
+/// BLITWIRE — the latch predicate, factored out for the same reason `blitwire_calc` is. NOT gated on
+/// `witness`: it is arithmetic, it emits no code unless called, and the fixture asserts both edges.
+pub const fn blitwire_arm(max_us: u64, said: bool) -> bool {
+    !said && max_us >= BLITWIRE_ARM_US
+}
+/// BLITWIRE — the latched one-shot. Called from `comp2_emit` AFTER the `[comp2]` rollup it annotates.
+#[cfg(feature = "witness")]
+fn blitwire_note(max_cyc: u64, passes: u64, loop_cyc: u64, wit_cyc: u64, wit_n: u64, wcd_cyc: u64, bytes: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let max_us = super::wcg::cycles_to_us(max_cyc);
+    if !blitwire_arm(max_us, BLITWIRE_SAID.load(Relaxed)) {
+        return;
+    }
+    // Re-tested as a swap: two cores inside `comp2_emit` at once is what COMP2-UTIL's `util_pct > 100`
+    // exists to detect, so it is not hypothetical on this compositor.
+    if BLITWIRE_SAID.swap(true, Relaxed) {
+        return;
+    }
+    let loop_us = super::wcg::cycles_to_us(loop_cyc);
+    let wit_us = super::wcg::cycles_to_us(wit_cyc);
+    let (net_us, raw_bus, net_bus, ok) = blitwire_calc(loop_us, wit_us, bytes);
+    serial_println!(
+        "[blitwire] arm max_us={} passes={} loop_us={} wit_us={} wit_n={} wcd_us={} wit_pct={} bytes={} raw_bus={} net_bus={} floor_bus={} -> {}",
+        max_us,
+        passes,
+        loop_us,
+        wit_us,
+        wit_n,
+        super::wcg::cycles_to_us(wcd_cyc),
+        wit_us.saturating_mul(100) / loop_us.max(1),
+        bytes,
+        raw_bus,
+        net_bus,
+        BLITWIRE_FLOOR_BUS,
+        if ok { "WITNESS-BOUND" } else { "COPY-BOUND" }
+    );
+    let _ = net_us;
+}
+/// BLITWIRE — the fixture. It drives `blitwire_calc` and `blitwire_arm`, the two objects the wire
+/// calls, with render14 boot 1 rollup 1's own numbers, so every row is arithmetic a reader can check
+/// against the evidence log rather than a magic constant.
+///
+/// THE REGRESSION IT REDS. The realistic mistake is charging the bracket and then not subtracting it
+/// — `net_us = loop_us` — which reads `net_bus = raw_bus = 32 -> COPY-BOUND` and would send the next
+/// arc after a mapping-attribute bug that is not there. Row A IS that mistake, asserted to produce
+/// exactly the un-subtracted numbers; rows B and C are the two readings the real boot can give.
+///
+/// Row C's `WIT_BRACKET` is a **MODEL, not a measurement**: 96 980 us of measured WC-G + WC-D plus
+/// the span's 1 686 B of in-loop UART at 86.805 us/B. It is here to pin the arithmetic of the
+/// acquitting branch, and the whole point of the instrument is that only metal can say which of B
+/// and C the bracket actually reads.
+#[cfg(feature = "witness")]
+pub fn blitwire_selftest() {
+    use core::sync::atomic::Ordering::Relaxed;
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Relaxed) {
+        return;
+    }
+    const LOOP_US: u64 = 378_852; // render14 boot 1 r1: passes=4 x blit_us=94713
+    const BYTES: u64 = 12_214_800; // the same rollup: passes=4 x bytes_pp=3053700
+    const WIT_MEASURED: u64 = 96_980; // [wc-g] prof seq=0 + seq=1 (55036) + [comp2] wcd_us (41944)
+    const WIT_BRACKET: u64 = 243_333; // + the span's 1686 B of in-loop UART at 86.805 us/B
+    let (n_a, r_a, b_a, ok_a) = blitwire_calc(LOOP_US, 0, BYTES);
+    let (n_b, _, b_b, ok_b) = blitwire_calc(LOOP_US, WIT_MEASURED, BYTES);
+    let (n_c, _, b_c, ok_c) = blitwire_calc(LOOP_US, WIT_BRACKET, BYTES);
+    let arm_lo = blitwire_arm(BLITWIRE_ARM_US - 1, false);
+    let arm_hi = blitwire_arm(BLITWIRE_ARM_US, false);
+    let arm_said = blitwire_arm(BLITWIRE_ARM_US, true);
+    let ok = n_a == LOOP_US
+        && r_a == 32
+        && b_a == 32
+        && !ok_a
+        && n_b == 281_872
+        && b_b == 43
+        && !ok_b
+        && n_c == 135_519
+        && b_c == 90
+        && ok_c
+        && !arm_lo
+        && arm_hi
+        && !arm_said;
+    serial_println!(
+        ":: BLITWIRE: loop_us={} bytes={} raw_bus={} net_us_meas={} net_bus_meas={} net_us_full={} net_bus_full={} floor={} bound={}{}{} arm={}{}{} -> {} ::",
+        LOOP_US,
+        BYTES,
+        r_a,
+        n_b,
+        b_b,
+        n_c,
+        b_c,
+        BLITWIRE_FLOOR_BUS,
+        ok_a as u8,
+        ok_b as u8,
+        ok_c as u8,
+        arm_lo as u8,
+        arm_hi as u8,
+        arm_said as u8,
+        if ok { "PASS" } else { "FAIL" }
     );
 }
