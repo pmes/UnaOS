@@ -1615,3 +1615,192 @@ rollups sustain). `-> DRAIN-BOUND` keeps SO29 alive and makes per-pass attributi
 
 No `[serwire]` line on a capture that HAS `[comp2]` rollups means no pass crossed 100 ms that boot —
 the "the stall did not happen" reading, not "the instrument did not run".
+
+## SERIALTX — a print does not emit its own line any more, and the census says what one costs
+
+*(rmbp-ledger B154, 2026-09-22; commissioned off EHCIDARK B146 and `LEDGER.md` SO29/SO45.)*
+
+### The four terms, and how many of them had ever been measured
+
+`_print` has always paid four things. Until this arc, instruments existed for exactly one:
+
+| # | term | measured before this arc? |
+|---|---|---|
+| 1 | the **ring drain** — other cores' staged lines | yes: SO29 capped it, SO45's `[serwire]` odometer measures it |
+| 2 | the **own-line emission** — this print's line, byte by byte at the UART | **no** |
+| 3 | the **contended-lock spin** — SERWIT-1B's bounded backpressure | no |
+| 4 | the **four post-mask taps** — fbcon, the FTDI mirror, `tste`, the flight recorder | no |
+
+Terms 1–3 ran inside one `interrupts::without_interrupts`; term 4 ran after it. SO45 answered the
+question it was asked — *is `[comp2] max_us` the ring drain?* — and its answer is unaffected here.
+What it could not answer is what the OTHER three cost, and term 2 is the large one: at 115200 8N1 a
+byte is **86.8 µs**, so a 100-byte line is **~8.7 ms with interrupts masked on that core**, on top of
+up to 22.6 ms of capped drain. A core inside that span cannot be preempted and runs no service pass.
+
+### What EHCIDARK saw, and the part of its sentence that does not hold on this board
+
+`usb_xhci.md` §33h (B146) partitioned flight 11's 928 post-scheduler seconds by the capture's own line
+rate and measured the EHCI HID pass period collapsing from **1.08 ms** across 840 quiet seconds to
+**6.46 ms** across the 17 burst seconds, with `max=108ms` inside that band and the deadman's 1 Hz line
+on a *different* core stretching to 2041 ms. That correlation is real, and re-derived independently
+here from the same capture by bucketing timestamps into whole seconds: **24 seconds at ≥ 150 lines/s
+against 957 below 50 lines/s**, over 999 seconds.
+
+Its *mechanism* sentence — "`_print` … drains the whole ring through a 16550 a byte at a time" —
+**cannot be what cost those milliseconds on the rMBP**, and the capture says so in three places:
+
+```text
+[    244ms] :: SERWIT-1: contended serial [uart16550=absent carrier=ftdi-mirror law=emitted==0] …
+             (submitted=151 emitted=0 declined=151 inflight=0) -> PASS ::
+[  28280ms] :: DRAINCAP: SKIP — no 16550 on this machine, nothing is ever staged (SERWIT-1D) …
+[ 993490ms] [comp2] rollup … wcd_us=0 wcd_skips=0 …
+```
+
+There is no 16550 on that laptop (SERWIT-1D), so every masked branch of `_print` there is the O(1)
+`DECLINED` one: nothing is staged, nothing is drained, and not one byte is written behind the mask.
+`wcd_us=0` on every rollup of the flight is the same fact from the compositor's end. **The console is
+still the right suspect; the UART is not the site.** On that board the only term that can be large is
+term 4, the post-mask taps — which is why the census below reports `taps_us` beside `masked_us` rather
+than folding the two together, and why a census that measured only the mask would have gone green on
+the one machine the arc exists for.
+
+### The fix — `_print` enqueues, an unmasked owner emits
+
+`arch/x86_64/serial.rs`:
+
+* **(a) masked, byte-free.** Resolve the 16550 tri-state if it is still unknown, and enqueue the line
+  into the staging ring. A compare-exchange and a memcpy: no `out`, no LSR poll, no UART lock held
+  across a byte. `SERIAL1` is taken here only to *ask* whether a 16550 exists (once per boot) and, on
+  the machine where the answer is no, to hold the drainer's uniqueness across `discard_staged` — the
+  SERWIT-1D accounting is unchanged, branch for branch.
+* **(b) the drain owner, with interrupts ENABLED.** `drain_owner()` takes `SERIAL1.try_lock()` and
+  drains up to `DRAIN_BYTE_BUDGET` (192 B). Whichever core printed next has always been the drain
+  owner; what changed is that it drains unmasked, so the cost is charged to throughput instead of to
+  latency and the core stays preemptible at every byte.
+* **(c) a print that arrived ALREADY masked** — from an interrupt handler, an exception, or inside
+  another subsystem's `without_interrupts` — cannot unmask, because re-enabling interrupts is not the
+  console's to do. It still owes the ring forward progress, so it takes exactly one 16550 transmit
+  FIFO, `serial_ring::MASKED_BYTE_BUDGET` = **16 B = 1.39 ms worst case**, and leaves the rest.
+
+The three candidate owners the brief named were the 1 kHz timer tick, the 1 ms device-service pump
+(`x86_usb_pump`), and the next printer. The next printer is the one that needs no line in a file this
+arc may not touch, and it is not a concession: it is self-clocking (a console under load has, by
+definition, a next print arriving), it reserves no core, and it leaves the drain on the core already
+paying for the console instead of moving that cost onto the service core c7 — which is the core
+EHCIDARK is trying to protect.
+
+**The residual flush when printing STOPS is `serial_ring::residual_drain`, called last of all from
+`mirror_service`.** That is not decoration. "A deferred line is not a lost one only for as long as
+there is a NEXT PRINT" is the sentence PWRDRAIN is built on, and this arc made it load-bearing one
+layer earlier: before it, a `_print` wrote its own line directly, so the last line of a burst always
+reached the wire on the print that produced it; now every line leaves on a capped drain and the tail
+of a burst can outlive its print by one. On a machine that then goes quiet — the end of a boot ladder,
+a capture's last rungs, a fixture's final `-> PASS` — a verdict sitting in a ring is
+indistinguishable from a fixture that never ran, which is precisely what *the wire may not lose lines*
+forbids. `mirror_service` already runs IF=1, lock-free, non-print, on the main loop of both arches, so
+the flush costs one `try_lock` and at most `DRAIN_BYTE_BUDGET` bytes per poll and needs no line in the
+timer ISR or in `main.rs`. It is a no-op on aarch64 by design: that arch still emits its own line
+synchronously, so a line that reached `_print` there has already reached the wire. `power_drain` and
+the panic path keep their uncapped synchronous drains exactly as before.
+
+**Ordering is unchanged and is now structural.** The old code drained other cores' staged lines before
+writing its own directly, so that a line staged at t0 preceded a line written at t1 > t0. Now every
+line goes through the ring, so wire order *is* submission order by construction and there is no
+"direct" line left to reorder against.
+
+**Loss is unchanged.** `defer_contended` is still the single shared policy, a full ring still
+back-pressures for `BACKPRESSURE_SPINS` bounded turns, and a line that outlives the bound is still
+counted in `DROPPED` and announced on the wire. What changed inside the retry turn is *where* it makes
+progress: the old turn re-tried the UART inside the mask and, winning it, paid for a whole capped
+drain there; the new turn makes room by running the drain owner outside it.
+
+### The census — `[sertx]`, and why it is UNCONDITIONAL
+
+```text
+[sertx] prints=N masked_us_max=A masked_us_mean=B drain_us=C emit_us=D spin_us=E bytes=F
+        masked_b=G fifo_b=16 taps_us=H taps_us_max=I sink=uart|ftdi|both|none hz=Z
+        masked_cy_max=J masked_cy_sum=K
+```
+
+| field | reading |
+|---|---|
+| `masked_us_max` | the longest single interrupt-masked `_print` region of the span. **This is the term B146's `pass_period_us_max=` is downstream of.** |
+| `masked_us_mean` | a mean near the max is a steady cost; a max orders above it is a tail, which is the shape a console burst makes. |
+| `drain_us` | of that, the ring drain — comparable with `[serwire] drain_us`, which measures the same drains from the other end. |
+| `emit_us` | of that, the own-line synchronous emission. **Zero is the fixed shape.** Non-zero says that arch still writes its own line under the mask. |
+| `spin_us` | of that, SERWIT-1B's backpressure turns; includes those turns' drains, and is 0 on an uncontended print. |
+| `bytes` / `masked_b` | bytes put at a 16550, and how many of them behind a mask — the currency of the dark window, at 86.8 µs each. |
+| `taps_us` / `taps_us_max` | the four post-mask mirrors. On a board with no 16550 this is the **only** term that can be large. |
+| `sink` | `ftdi` on the bench rMBP, `uart` under QEMU, `both` on a machine carrying both. |
+| `hz` | the rate the microseconds were derived at. **`hz=0` means UNKNOWN**, every `_us` field reads 0 for that reason alone, and only the `_cy` pair is evidence. |
+
+Every other instrument in this file is `witness`-gated, which is right for a fixture. This one is not,
+because the thing it measures only exists on the images that are **not** witness builds — `esp-x86`
+media, the card a flight boots (LAWS §5's default-quiet polarity rule: coverage of the ON state is
+coverage of a build nobody boots). A `witness`-gated `[sertx]` would be absent from every image that
+has ever produced a dark window. The price is two `now_cycles()` reads and a handful of relaxed
+atomics per print, against a print that already costs microseconds, plus one rollup line per
+`SERTX_PERIOD_MS` (10 s — `[pstrip]`'s cadence, and deliberately not per-window: EHCIDARK's own rollup
+constant exists because a census that printed per dark window would print hardest exactly when the
+console is already the problem, and a transmit-cost census has that failure mode twice over).
+
+**It therefore MOVES the default image, and `./arroyo knoboff` says so.** That is the honest outcome
+for a change to unconditional console code, not a defect to be gated away — see the arc's report for
+what the knob-offs can and cannot certify here.
+
+### The fixture — the proof is in BYTES, not in cycles
+
+`:: SERIALTX:` (x86_64, `witness`, last of all in `mirror_service`) stages 8 × 65 B, makes **one real
+`serial_println!` through the live `_print`**, and asserts on the census counters that the drain owner
+emitted `3 × 65 = 195 B` **unmasked** and `0 B` masked, with `emit_us` cycles at zero and nothing
+dropped. 195 B is the same arithmetic DRAINCAP and SERWIRE assert, read through a third set of
+counters, so all three convict each other if any drifts.
+
+Bytes rather than cycles because a cycle bound would be a flake (host TSC rate, TCG timing, whatever
+else the box is compiling) while bytes are exact and are the currency the UART charges.
+`tx_note_bytes` classifies each write by the interrupt flag **as it actually stands at the write**,
+never by the call site — which is what makes the instrument sound (a print arriving from an interrupt
+handler is masked without `_print` having masked anything, and a census keyed on the call site would
+file its bytes under "unmasked" and read clean while the pass period collapsed).
+
+**Go-red, and it is one edit:** wrap `drain_owner`'s `drain_capped` arm in
+`interrupts::without_interrupts(…)`. The same sink's bytes re-file themselves as masked,
+`:: SERIALTX:` reads `masked_b=195` and FAILs, and `[sertx] masked_us_max=` returns to the line cost
+in the same run. The second, weaker mutation is deleting the `tx_note_bytes` call: `unmasked_b=0`
+where the fill provably went out, and the verdict FAILs for the other clause — which is what stops a
+zero from acquitting on no evidence.
+
+### The aarch64 twin, measured
+
+**AND THE aarch64 CENSUS HAS ALREADY ANSWERED THE SECOND MILESTONE.** `./arroyo test-arm` on this same tree prints `[sertx] prints=342 masked_us_max=5029 masked_us_mean=165 drain_us=274 emit_us=55960 spin_us=0 bytes=0 masked_b=0 fifo_b=16 taps_us=2010 taps_us_max=109 sink=uart hz=62 500 000 (CNTFRQ_EL0)`. Read it: **`emit_us=55960` against `drain_us=274` — the own-line emission is 204x the ring drain**, and `masked_us_mean=165` is 55960/342 = 163.6, i.e. the masked region on that arch IS the own-line emission to within 1 %. The term SO29 capped was never the cost on that path; the term nobody had measured is all of it. The port is warranted and the number that warrants it is on the wire. (`bytes=0` there is correct and is a stated limitation, not a hole: aarch64 charges `tx_note_bytes` from the DRAIN sink only — its own-line write goes through `write_fmt` and is timed, not counted — and `drain_us=274` says there was nothing to drain.)
+
+**x86_64 only, and that is a statement not an omission.** `arch/aarch64/serial.rs` still drains and
+then writes its own line synchronously inside the mask; this arc MEASURES that arch rather than
+changing it, so the fix there is decided by numbers and not by symmetry. A fixture running there would
+be REQUIRING a limitation — the shape LAWS §5 calls upside down — and its green would certify that the
+second milestone has not been done. That arch's evidence is the `[sertx]` line itself, where `emit_us`
+is non-zero and `masked_b` tracks the line width.
+
+### Reading the next flight
+
+```text
+[sertx] prints=N masked_us_max=<small> masked_us_mean=<small> drain_us=0 emit_us=0 spin_us=0
+        bytes=0 masked_b=0 fifo_b=16 taps_us=<H> taps_us_max=<I> sink=ftdi hz=<tsc>
+:: EHCI-HID: [1] EHCIDARK … max=… pass_period_us_max=… pass_period_us_mean=… == witness ::
+```
+
+On the bench rMBP `sink=ftdi` and every UART term reads 0 — correctly, because there is no 16550 —
+so the flight's whole `[sertx]` verdict rests on `taps_us_max`. If that is in the tens of thousands of
+microseconds, the dark window is the POST-MASK TAPS and the next arc is theirs (`video/fbcon.rs`'s
+panel paint is the first suspect: on a metal boot the Kepler takeover arms `PANEL_CONSOLE`, and
+flight 11's SERWIT-2 tap read `fbcon: absorbed=813` of 3387 lines by 28 s, each one glyph work on a
+2880×1800 panel, with PANEL-DEFER's own comment stating that its layout half runs masked). If instead
+`taps_us_max` is small too, the console is acquitted outright on that board and EHCIDARK's remaining
+term is elsewhere. **Either way the answer is a number in the capture and not an inference**, which
+is the whole of what this arc buys on metal.
+
+Under QEMU, where a 16550 does exist, `sink=uart`, `emit_us=0` and `masked_b=0` are the fix itself
+reported from the inside, and `masked_us_max` against the pre-arc build is the before/after.
+EHCIDARK's prediction for `pass_period_us_max=` — that it falls toward the tick once the console stops
+masking — is testable on x86 QEMU and, on the rMBP, is testable only once `taps_us_max` has named
+which sink was actually holding the core.

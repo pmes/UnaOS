@@ -1688,14 +1688,14 @@ pub fn mirror_service() {
     // a print context, and it is reached on BOTH arches (x86 via `flight_recorder::service`'s first
     // statement, aarch64 via the BSP main loop and `pump_usb_into_gui` on baremetal). Placed AFTER the
     // verdict so the fixture's own traffic cannot move the tap tallies that verdict snapshots.
-    #[cfg(feature = "witness")] draincap_selftest();
+    tx_rollup(); #[cfg(feature = "witness")] draincap_selftest(); // SERIALTX (B154) — the `[sertx]` transmit-cost rollup, self-cadenced at `SERTX_PERIOD_MS` and UNCONDITIONAL, because the images that produce dark windows are built witness-FREE (LAWS §5's default-quiet polarity rule). Placed AFTER `mirror_verdict_once` so its own print cannot move the tap tallies that verdict snapshots, and BEFORE the witness fixtures so the first span it reports is the boot's and not a fixture's. ⚠ LINE-NEUTRAL append, before the line's first `//`; the body is a FILE-TAIL append.
     // SERWIT-1B PARITY — the shared contended-producer policy, exercised on whichever arch is
     // running. Same one-shot call site and same contract as the two fixtures above it.
     #[cfg(feature = "witness")] backpressure_selftest();
     // PWRDRAIN (SO31 part 3) — the power-verb full drain. Same one-shot call site and same contract;
     // it is last because it deliberately fills the ring to SLOTS and then empties it completely, and
     // a fixture that leaves the ring as it found it should not do so before one that reads it.
-    #[cfg(feature = "witness")] pwrdrain_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] s5drain_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] sinkdrain_selftest(); #[cfg(feature = "witness")] serwire_selftest(); // S5DRAIN (trunk queue §5, 2026-09-12) — PWRDRAIN's twin for the x86 route that does NOT go through `power.rs`: `video/crystal.rs`'s Shut Down and `video/instgui.rs` call `arch::acpi_power::poweroff()` directly. x86-only because the defect is: on aarch64 the desktop's Shut Down is `power::crystal_shutdown`, which has drained since SO31. Last, and after PWRDRAIN, for PWRDRAIN's own stated reason — it fills the ring to SLOTS and empties it again, so it must not run before a fixture that reads the ring. SINKDRAIN (2026-09-15) joins this same physical line for the same reason and runs LAST of all: it fills and empties the ring like the two above it AND then reads the FTDI mirror ring's tail, so anything after it would be measuring that fixture's own traffic. ⚠ LINE-NEUTRAL append; both bodies are FILE-TAIL appends, so no `panic::Location` in this file moves.  SERWIRE (SO45) appended AFTER sinkdrain and running LAST OF ALL. Both fixtures claim the last slot; the tie is settled by their own stated reasons, not by arrival order. SINKDRAIN must have nothing after it because it reads the FTDI mirror ring's TAIL, so a later fixture would measure sinkdrain's own traffic — but SERWIRE ZEROES ITS ODOMETER ON ENTRY, opening a fresh span that inherits none of that traffic. The reverse order is the one that breaks: sinkdrain after serwire would be measured against the span serwire opened, which serwire's own comment forbids. ⚠ LINE-NEUTRAL append, before the line's first `//`; the body is a FILE-TAIL append.
+    #[cfg(feature = "witness")] pwrdrain_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] s5drain_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] sinkdrain_selftest(); #[cfg(feature = "witness")] serwire_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] sertx_selftest(); residual_drain(); // S5DRAIN (trunk queue §5, 2026-09-12) — PWRDRAIN's twin for the x86 route that does NOT go through `power.rs`: `video/crystal.rs`'s Shut Down and `video/instgui.rs` call `arch::acpi_power::poweroff()` directly. x86-only because the defect is: on aarch64 the desktop's Shut Down is `power::crystal_shutdown`, which has drained since SO31. Last, and after PWRDRAIN, for PWRDRAIN's own stated reason — it fills the ring to SLOTS and empties it again, so it must not run before a fixture that reads the ring. SINKDRAIN (2026-09-15) joins this same physical line for the same reason and runs LAST of all: it fills and empties the ring like the two above it AND then reads the FTDI mirror ring's tail, so anything after it would be measuring that fixture's own traffic. ⚠ LINE-NEUTRAL append; both bodies are FILE-TAIL appends, so no `panic::Location` in this file moves.  SERWIRE (SO45) appended AFTER sinkdrain and running LAST OF ALL. Both fixtures claim the last slot; the tie is settled by their own stated reasons, not by arrival order. SINKDRAIN must have nothing after it because it reads the FTDI mirror ring's TAIL, so a later fixture would measure sinkdrain's own traffic — but SERWIRE ZEROES ITS ODOMETER ON ENTRY, opening a fresh span that inherits none of that traffic. The reverse order is the one that breaks: sinkdrain after serwire would be measured against the span serwire opened, which serwire's own comment forbids. ⚠ LINE-NEUTRAL append, before the line's first `//`; the body is a FILE-TAIL append.  SERIALTX (B154) appended after SERWIRE and running LAST OF ALL, by the same settlement: it fills and empties the ring like the three above it, it ZEROES ITS OWN CENSUS SPAN ON ENTRY so it inherits none of their traffic, and it reads no other ring's tail — so it is the only one of the four that nothing after it could be required to avoid, and it is the only one that nothing before it can perturb. x86_64 because the property it asserts (a `_print` emits ZERO bytes behind the mask) is implemented on that arch only; asserting it on aarch64 would REQUIRE A LIMITATION, which LAWS §5 calls upside down, and that arch's evidence is the `[sertx]` census line instead.  `residual_drain()` is LAST OF ALL and is NOT a fixture: it is the main loop's flush of the staging ring, and it goes after everything so that whatever this poll printed — the `[mirror]` markers, the SERWIT-2 verdict, the `[sertx]` rollup, every fixture verdict — is on the wire before the poll returns. ⚠ LINE-NEUTRAL append, before the line's first `//`; both bodies are FILE-TAIL appends.
 }
 
 /// One-shot: has the SERWIT-2 verdict been emitted yet?
@@ -2980,5 +2980,464 @@ fn serwire_selftest() {
             SERWIRE_FILL - 3,
             lost
         );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// SERIALTX (rmbp-ledger B154; off EHCIDARK B146 and LEDGER SO29/SO45) — WHAT ONE `_print` COSTS,
+// AND WHERE IT SPENDS IT
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// ### The question SO29, SO45 and B146 each answered half of
+//
+// SO29 measured the RING DRAIN and capped it ([`DRAIN_BYTE_BUDGET`]). SO45 built the odometer that
+// proves the cap is where the drain cost goes (`[serwire]`, the `WIRE_*` counters above). B146
+// measured, on flight 11, that `service_ehci_hid`'s pass period collapses 1.08 ms -> 6.46 ms in the
+// capture's burst seconds and named the serial console as the owner. **Nobody had yet measured the
+// cost of a print's OWN emission**, and the drain is only one of the four terms a `_print` pays:
+//
+//   1. the RING DRAIN            — SO45 measures this one, and only this one
+//   2. the OWN-LINE EMISSION     — this print's line, byte by byte at the UART
+//   3. the CONTENDED-LOCK SPIN   — SERWIT-1B's bounded backpressure turns
+//   4. the four POST-MASK TAPS   — fbcon, the FTDI mirror, `tste`, the flight recorder
+//
+// Terms 1-3 ran INSIDE `interrupts::without_interrupts` and term 4 outside it. The census below
+// splits all four and reports them on one line, `[sertx]`, so a flight capture says which term owns
+// the tail instead of leaving it to be inferred from a correlation.
+//
+// ### The census is UNCONDITIONAL, and that is a deliberate cost
+//
+// Every other instrument in this file is `witness`-gated, which is right for a fixture: it runs once
+// and its wire cost is a verdict line. This one is not, because the thing it measures only exists on
+// the images that are NOT witness builds — `esp-x86` media, the card a flight boots (LAWS §5, the
+// default-quiet-knob polarity rule: coverage of the ON state is coverage of a build nobody boots).
+// A `witness`-gated `[sertx]` would be absent from every image that has ever produced a dark window.
+// The price is two `now_cycles()` reads and a handful of relaxed atomics per print, against a print
+// that already costs microseconds, plus one rollup line per [`SERTX_PERIOD_MS`].
+//
+// ⚠ **It therefore MOVES the default image, and `./arroyo knoboff` will say so.** That is the honest
+// outcome for a change to unconditional console code and not a defect to be gated away; what knoboff
+// can still certify is quoted with the arc.
+
+/// SERIALTX — **the ceiling on what one `_print` may put on the wire with interrupts MASKED**: one
+/// 16550 transmit FIFO.
+///
+/// ### Why a FIFO and not a byte budget
+/// [`DRAIN_BYTE_BUDGET`] is a COST ceiling for an unmasked drain — one 60 Hz frame of UART, chosen
+/// against the compositor. This is a different question: what a core may spend while it cannot be
+/// preempted and runs no service pass. Sixteen bytes is the 16550's whole transmit FIFO, so a write
+/// of that size is one `out` burst into hardware that has already made room, and the poll of LSR
+/// bit 5 in front of it is the only thing that can stall — 16 x 86.8 us = **1.39 ms worst case**,
+/// against 260 B = 22.6 ms for a capped drain and 4 352 B = 377.8 ms for the whole ring.
+///
+/// ### It is a FALLBACK, not the path
+/// `arch::x86_64::serial::_print` emits NOTHING under the mask: it stages its line and drains with
+/// interrupts ENABLED. This budget governs the one case it cannot: a print that arrives already
+/// masked — from an interrupt handler, an exception, or inside another subsystem's
+/// `without_interrupts` — where re-enabling is not the console's to do. Such a print still owes the
+/// ring forward progress (a machine whose only prints come from ISRs must not stop draining), so it
+/// takes one FIFO and leaves the rest. [`sertx_selftest`] asserts the unmasked path spends zero of
+/// this budget, which is what makes the number a fallback rather than the design.
+pub const MASKED_BYTE_BUDGET: usize = 16;
+
+// ── THE MASKED-BUDGET TRUTH TABLE: checked by the compiler, both arches, every `./arroyo check` ──
+const _: () = assert!(
+    MASKED_BYTE_BUDGET < DRAIN_BYTE_BUDGET,
+    "the masked fallback must cost strictly less than an unmasked capped drain, or it is not a fallback"
+);
+const _: () = assert!(
+    drain_may_continue(0, MASKED_BYTE_BUDGET),
+    "a masked drain must still always take its first line, however wide: the ring may not wedge"
+);
+const _: () = assert!(
+    !drain_may_continue(MASKED_BYTE_BUDGET, MASKED_BYTE_BUDGET),
+    "one FIFO spent exactly is one FIFO spent: stop, and leave the rest to an unmasked owner"
+);
+const _: () = assert!(
+    !drain_may_continue(260, MASKED_BYTE_BUDGET),
+    "SO31's capped drain (192 + 68 B = 22.6 ms) is far past one FIFO: a masked print must not take it"
+);
+
+/// SERIALTX — [`drain`] bounded at ONE hardware FIFO ([`MASKED_BYTE_BUDGET`]), for the one context
+/// that cannot unmask: a print that arrived with interrupts already off.
+///
+/// Same contract, same order and same accounting as [`drain`] and [`drain_capped`]; only the budget
+/// differs. Deliberately NOT charged to the SERWIRE odometer: that instrument's stated claim is that
+/// it measures `drain_capped` and nothing else (SO45), and folding a second spelling into it would
+/// make `[serwire] drain_us` a number about two different budgets.
+pub fn drain_fifo<F: FnMut(&str)>(emit: F) {
+    drain_into(emit, &EMITTED, true, MASKED_BYTE_BUDGET);
+}
+
+/// SERIALTX — how many prints the span covered.
+static TX_N: AtomicU64 = AtomicU64::new(0);
+/// SERIALTX — total cycles spent inside `_print`'s `without_interrupts` region.
+static TX_MASKED_CYC: AtomicU64 = AtomicU64::new(0);
+/// SERIALTX — the single longest masked region of the span, in cycles. This is the number B146's
+/// `pass_period_us_max=` is a claim about: a core inside this span runs no service pass.
+static TX_MASKED_MAX: AtomicU64 = AtomicU64::new(0);
+/// SERIALTX — cycles spent in the ring drain ([`drain_capped`] / [`drain_fifo`]).
+static TX_DRAIN_CYC: AtomicU64 = AtomicU64::new(0);
+/// SERIALTX — cycles spent emitting this print's OWN line directly at the UART. **The term nobody
+/// had measured**, and the one the x86 fix drives to zero by routing every line through the ring.
+static TX_EMIT_CYC: AtomicU64 = AtomicU64::new(0);
+/// SERIALTX — cycles spent in SERWIT-1B's bounded contended-lock retry.
+static TX_SPIN_CYC: AtomicU64 = AtomicU64::new(0);
+/// SERIALTX — cycles spent in the four POST-MASK taps (fbcon, the FTDI mirror, `tste`, the flight
+/// recorder). On a machine with no 16550 this is the only term that can be non-trivial, so a census
+/// that omitted it would acquit the console on the one board the arc was commissioned for.
+static TX_TAPS_CYC: AtomicU64 = AtomicU64::new(0);
+/// SERIALTX — the single longest post-mask tap span of the span, in cycles.
+static TX_TAPS_MAX: AtomicU64 = AtomicU64::new(0);
+/// SERIALTX — bytes this transport put at a UART with interrupts ENABLED.
+static TX_B_UNMASKED: AtomicU64 = AtomicU64::new(0);
+/// SERIALTX — bytes this transport put at a UART with interrupts MASKED. **The quantity the whole
+/// arc is about.** Bounded by [`MASKED_BYTE_BUDGET`] per masked print on the fixed arch; a reading
+/// that tracks the line width instead convicts the emission path.
+static TX_B_MASKED: AtomicU64 = AtomicU64::new(0);
+
+/// SERIALTX — charge the BYTES of one sink write, classified by the interrupt flag **as it actually
+/// stands at the write**, never by which code path the author believed they were on.
+///
+/// That distinction is the whole soundness of the instrument. A print that arrives from an interrupt
+/// handler is masked without `_print` having masked anything, and its bytes cost the machine exactly
+/// what a self-masked print's do; a census keyed on the call site would file them under "unmasked"
+/// and read clean while the pass period collapsed. It is also what makes the go-red one edit: move
+/// the drain back inside `without_interrupts` and these same bytes re-file themselves as masked.
+#[inline]
+pub fn tx_note_bytes(n: usize) {
+    if crate::arch::irqs_masked() {
+        TX_B_MASKED.fetch_add(n as u64, Ordering::Relaxed);
+    } else {
+        TX_B_UNMASKED.fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
+/// SERIALTX — charge one `_print`. Relaxed throughout and for SERWIRE's reasons: this runs on the
+/// print path, may not block, allocate, print or take a lock, and the cells are a span total read by
+/// one consumer long afterwards.
+#[inline]
+/// `masked_sum` is every masked region this print entered and `masked_max` is its LONGEST SINGLE
+/// one; they differ only on a back-pressured print, which re-enters the mask once per turn. The two
+/// are charged separately because they answer different questions: the sum is what the print cost
+/// the machine, the max is how long one core went un-preemptible — and it is the max that B146's
+/// `pass_period_us_max=` is downstream of. Folding the sum into the high-water cell would report a
+/// contiguous dark window that never happened.
+pub fn tx_charge(masked_sum: u64, masked_max: u64, drain_cyc: u64, emit_cyc: u64, spin_cyc: u64) {
+    TX_N.fetch_add(1, Ordering::Relaxed);
+    TX_MASKED_CYC.fetch_add(masked_sum, Ordering::Relaxed);
+    TX_MASKED_MAX.fetch_max(masked_max, Ordering::Relaxed);
+    TX_DRAIN_CYC.fetch_add(drain_cyc, Ordering::Relaxed);
+    TX_EMIT_CYC.fetch_add(emit_cyc, Ordering::Relaxed);
+    TX_SPIN_CYC.fetch_add(spin_cyc, Ordering::Relaxed);
+}
+
+/// SERIALTX — charge the post-mask tap block of one `_print`.
+#[inline]
+pub fn tx_charge_taps(cyc: u64) {
+    TX_TAPS_CYC.fetch_add(cyc, Ordering::Relaxed);
+    TX_TAPS_MAX.fetch_max(cyc, Ordering::Relaxed);
+}
+
+/// SERIALTX — drain the census: every cell swapped to zero so the next reading is a SPAN and not a
+/// running total. Order matches the `[sertx]` line.
+fn tx_take() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) {
+    (
+        TX_N.swap(0, Ordering::Relaxed),
+        TX_MASKED_MAX.swap(0, Ordering::Relaxed),
+        TX_MASKED_CYC.swap(0, Ordering::Relaxed),
+        TX_DRAIN_CYC.swap(0, Ordering::Relaxed),
+        TX_EMIT_CYC.swap(0, Ordering::Relaxed),
+        TX_SPIN_CYC.swap(0, Ordering::Relaxed),
+        TX_B_UNMASKED.swap(0, Ordering::Relaxed),
+        TX_B_MASKED.swap(0, Ordering::Relaxed),
+        TX_TAPS_MAX.swap(0, Ordering::Relaxed),
+        TX_TAPS_CYC.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Cycles to whole microseconds against the ledger's own clock. `0` when the rate is not known:
+/// `bootpace::origin_hz` returns 0 before calibration, and fabricating a microsecond out of an
+/// unknown rate is what that function's own comment forbids. The `[sertx]` line therefore prints
+/// `hz=` and the raw cycle pair beside the microseconds, so a reader can always tell a real zero
+/// from an un-calibrated one.
+#[inline]
+fn cyc_to_us(cyc: u64) -> u64 {
+    let hz = crate::bootpace::origin_hz();
+    if hz >= 1_000_000 {
+        cyc / (hz / 1_000_000)
+    } else {
+        0
+    }
+}
+
+/// SERIALTX — the rollup cadence, in milliseconds of `arch::ms()`.
+///
+/// Ten seconds, which is `[pstrip]`'s cadence and the one this fleet's readers already have an eye
+/// for (LAWS §5). It is deliberately not per-print and not per-window: EHCIDARK's own rollup constant
+/// exists because "a census that printed per dark window would print hardest exactly when the console
+/// is already the problem", and a transmit-cost census has that failure mode twice over — every line
+/// it prints is a line it then charges itself for.
+const SERTX_PERIOD_MS: u64 = 10_000;
+
+/// `arch::ms()` at the last rollup. `u64::MAX` = never, which makes the FIRST poll print
+/// unconditionally: a capture that ends before ten seconds of main loop must still carry the token.
+static SERTX_LAST_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// SERIALTX — the `[sertx]` rollup, on the cadence above. Called from [`mirror_service`], whose
+/// contract (IF=1, no locks held, not a print context) is exactly what this needs.
+///
+/// Every field, and what a reader does with it:
+///
+/// | field | reading |
+/// |---|---|
+/// | `prints` | the span's denominator. `prints=0` means the console was silent, not that it was cheap. |
+/// | `masked_us_max` | the longest single interrupt-masked `_print` region. **This is the term B146's `pass_period_us_max=` is downstream of**; a core inside it runs no service pass. |
+/// | `masked_us_mean` | the same span averaged. A mean near the max is a steady cost; a max orders above the mean is a tail, which is the shape a console burst makes. |
+/// | `drain_us` | of that, the ring drain — SO29's object, capped at `DRAIN_BYTE_BUDGET`. Comparable with `[serwire] drain_us`, which measures the same drains from the other end. |
+/// | `emit_us` | of that, this print's OWN line written byte-by-byte at the UART. **Zero is the fixed shape**: the line goes through the ring and an unmasked owner emits it. Non-zero says the arch still emits synchronously. |
+/// | `spin_us` | of that, SERWIT-1B's bounded backpressure turns on a full ring. |
+/// | `bytes` | bytes this transport put at a 16550 during the span, masked and unmasked together. |
+/// | `masked_b` | of those, the bytes written with interrupts off — the currency of the dark window, at 86.8 us each. Bounded by `MASKED_BYTE_BUDGET` per masked print. |
+/// | `taps_us` / `taps_us_max` | the four POST-MASK mirrors. On a machine with no 16550 this is the only term that can be large, so it is reported beside the masked one rather than folded into it. |
+/// | `sink` | which transports were live at the rollup. `ftdi` on the bench rMBP (no 16550 — SERWIT-1D), `uart` under QEMU, `both` on a machine carrying both. |
+/// | `hz` | the rate the microseconds were derived at. `hz=0` means UNKNOWN, every `_us` field reads 0 for that reason alone, and only the `_cy` pair is evidence. |
+pub fn tx_rollup() {
+    let now = crate::arch::ms();
+    let last = SERTX_LAST_MS.load(Ordering::Relaxed);
+    if last != u64::MAX && now.wrapping_sub(last) < SERTX_PERIOD_MS {
+        return;
+    }
+    SERTX_LAST_MS.store(now, Ordering::Relaxed);
+    let (n, mmax, msum, drain, emit, spin, b_un, b_m, tmax, tsum) = tx_take();
+    let uart = !uart_absent() && UART_RESOLVED.load(Ordering::Relaxed);
+    let cable = crate::drivers::xhci::ftdi::is_live();
+    let sink = match (uart, cable) {
+        (true, true) => "both",
+        (true, false) => "uart",
+        (false, true) => "ftdi",
+        (false, false) => "none",
+    };
+    serial_println!(
+        "[sertx] prints={} masked_us_max={} masked_us_mean={} drain_us={} emit_us={} spin_us={} \
+         bytes={} masked_b={} fifo_b={} taps_us={} taps_us_max={} sink={} hz={} \
+         masked_cy_max={} masked_cy_sum={}",
+        n,
+        cyc_to_us(mmax),
+        cyc_to_us(if n == 0 { 0 } else { msum / n }),
+        cyc_to_us(drain),
+        cyc_to_us(emit),
+        cyc_to_us(spin),
+        b_un + b_m,
+        b_m,
+        MASKED_BYTE_BUDGET,
+        cyc_to_us(tsum),
+        cyc_to_us(tmax),
+        sink,
+        crate::bootpace::origin_hz(),
+        mmax,
+        msum
+    );
+}
+
+/// Has the lazy `SERIAL1`/`SERIAL_PORT` probe resolved yet? [`uart_absent`] is deliberately
+/// conservative — it answers `false` while the answer is unknown — so `!uart_absent()` alone would
+/// print `sink=uart` on a machine that has not yet looked. The `[sertx]` line needs the third value.
+pub static UART_RESOLVED: AtomicBool = AtomicBool::new(false);
+
+/// Record that the arch's UART probe has run. Called from `arch::serial::_print` at the one site that
+/// resolves the tri-state.
+#[inline]
+pub fn note_uart_resolved() {
+    UART_RESOLVED.store(true, Ordering::Relaxed);
+}
+
+// ── SERIALTX's fixture — the emission is OUTSIDE the mask, and the proof is in BYTES ─────────────
+//
+// ### What it asserts, and why bytes rather than cycles
+//
+// The property the fix buys is "a print emits nothing at the UART while interrupts are masked". A
+// cycle bound would express that too, and it would be a flake: the number depends on the host's TSC
+// rate, on TCG's instruction timing and on whatever else the box is compiling. Bytes are exact, they
+// are the currency the UART charges (86.8 us each), and [`tx_note_bytes`] classifies them by the
+// interrupt flag AS IT STANDS at the write — so the assertion is about the machine's actual state
+// and not about which function the author thought they were in.
+//
+// Both directions are asserted on the live ring and the live policy, in the order `_print` runs them:
+//
+//     stage SERTX_FILL lines of SERTX_LINE_B        ->  8 x 67 B staged
+//     one real `serial_println!` through `_print`   ->  unmasked_b = 201 (3 lines: 0,67,134 < 192)
+//                                                       masked_b   = 0
+//
+// 201 B is `DRAIN_BYTE_BUDGET - 1 + SERTX_LINE_B` rounded to whole lines — the SAME arithmetic
+// DRAINCAP and SERWIRE assert, read through a third set of counters, so all three convict each other
+// if any drifts. `unmasked_b == want` is what stops a zero from acquitting on no evidence: an
+// instrument that had simply come unwired would read 0 on BOTH terms and this fixture reds.
+//
+// ### The go-red, and it is ONE edit
+//   * THE REALISTIC ONE — restore the synchronous emission by moving `arch::x86_64::serial::_print`'s
+//     drain-owner block back inside `interrupts::without_interrupts`. The same sink then runs with
+//     IF=0, `tx_note_bytes` files its 201 bytes as MASKED, and the verdict is
+//     `:: SERIALTX: FAIL — … masked_b=201 …`. `[sertx] masked_us_max=` goes back to the line cost in
+//     the same run, which is the census half of the same proof.
+//   * THE UNWIRED ONE — delete the `tx_note_bytes` call from the drain sink. `unmasked_b=0` where the
+//     fill provably went out, and the verdict is FAIL for the OTHER clause.
+//
+// ### Why x86_64 only
+// Because the fix is x86_64 only. `arch::aarch64::serial::_print` still writes its own line under the
+// mask, and this arc measures that arch rather than changing it (B154). A fixture that ran there
+// would be REQUIRING a limitation — the shape LAWS §5 calls upside down — and its green would certify
+// that the second milestone has not been done. The aarch64 evidence is the `[sertx]` census line
+// itself, where `emit_us` is non-zero and `masked_b` tracks the line width.
+
+/// Width of one SERIALTX fill line, `"[sertx] fill NN " + DRAINCAP_PAD + "\n"`: 16 + 48 + 1 = 65.
+const SERTX_LINE_B: usize = 16 + 48 + 1;
+/// How many lines the fixture stages: more than one [`DRAIN_BYTE_BUDGET`], less than the ring.
+const SERTX_FILL: usize = 8;
+/// What one capped drain must emit from that fill: whole lines while `paid < DRAIN_BYTE_BUDGET`.
+/// 0, 65 and 130 are all under 192; 195 is not. Three lines.
+const SERTX_WANT_B: usize = 3 * SERTX_LINE_B;
+
+const _: () = assert!(
+    SERTX_LINE_B <= SLOT_LEN,
+    "a fixture fill line must not truncate, or the byte count it asserts on is not the one staged"
+);
+const _: () = assert!(
+    SERTX_FILL * SERTX_LINE_B > DRAIN_BYTE_BUDGET + SERTX_LINE_B,
+    "the fill must outlast one capped drain, or capped and uncapped are indistinguishable"
+);
+const _: () = assert!(
+    SERTX_FILL < SLOTS,
+    "the fill must fit the ring without back-pressure, or `filled` is not SERTX_FILL"
+);
+const _: () = assert!(
+    SERTX_WANT_B == 3 * SERTX_LINE_B
+        && 2 * SERTX_LINE_B < DRAIN_BYTE_BUDGET
+        && SERTX_WANT_B >= DRAIN_BYTE_BUDGET
+        && SERTX_WANT_B <= DRAIN_BYTE_BUDGET + SERTX_LINE_B,
+    "SERTX_WANT_B is THREE lines only while two fit the budget, three do not, and the third is the \
+     one line allowed to straddle it (DRAIN_BYTE_BUDGET's stated bound). Change either constant and \
+     this row re-derives the count for you instead of letting the fixture assert a stale number"
+);
+
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+static SERTX_DONE: AtomicBool = AtomicBool::new(false);
+
+/// SERIALTX, once per boot. Called from [`mirror_service`] LAST OF ALL: it fills the ring and empties
+/// it again (PWRDRAIN's reason), it zeroes its own census span on entry so it inherits no earlier
+/// traffic (SERWIRE's reason), and unlike SINKDRAIN it reads no other ring's tail, so nothing it does
+/// can be measured by a fixture that has already run.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+fn sertx_selftest() {
+    if SERTX_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if uart_absent() {
+        serial_println!(
+            ":: SERIALTX: SKIP — no 16550 on this machine, so no byte of this transport reaches a \
+             wire masked or unmasked (SERWIT-1D); the one-FIFO budget is asserted at compile time \
+             and the `[sertx]` census still reports the post-mask taps, which are that board's only \
+             carrier ::"
+        );
+        return;
+    }
+    let base_dropped = DROPPED.load(Ordering::Relaxed);
+    // Open a span of this fixture's own: everything the boot printed so far is not the question.
+    let _ = tx_take();
+    let mut filled = 0u64;
+    for i in 0..SERTX_FILL {
+        if try_stage(format_args!("[sertx] fill {:02} {}\n", i, DRAINCAP_PAD)) {
+            filled += 1;
+        }
+    }
+    // ONE real print through the live `_print`, from this IF=1 context. It stages its own line and
+    // drains the fill as the unmasked owner — which is the whole claim.
+    serial_println!("[sertx] probe");
+    let (n, _mmax, _msum, _drain, emit, _spin, b_un, b_m, _tmax, _tsum) = tx_take();
+    // Leave the ring as it was found, and do not charge the residue to the window just scored.
+    let mut residue = 0u64;
+    drain(|s| {
+        residue += 1;
+        draincap_wire(s);
+    });
+    let _ = tx_take();
+    let lost = DROPPED.load(Ordering::Relaxed).saturating_sub(base_dropped);
+    let pass = filled == SERTX_FILL as u64
+        && n >= 1
+        && b_m == 0
+        && b_un == SERTX_WANT_B as u64
+        && emit == 0
+        && lost == 0;
+    if pass {
+        serial_println!(
+            ":: SERIALTX: filled={} prints={} masked_b={} unmasked_b={} want_b={} fifo_b={} \
+             own_line_cyc={} residue={} dropped={} — `_print` staged its line and drained the ring \
+             with interrupts ENABLED (arch/x86_64/serial.rs), so not one byte of the {} it put on \
+             the wire was written behind a mask and no service pass was stopped by it -> PASS ::",
+            filled,
+            n,
+            b_m,
+            b_un,
+            SERTX_WANT_B,
+            MASKED_BYTE_BUDGET,
+            emit,
+            residue,
+            lost,
+            b_un
+        );
+    } else {
+        serial_println!(
+            ":: SERIALTX: FAIL — filled={} want_filled={} prints={} masked_b={} (want 0) \
+             unmasked_b={} want_b={} own_line_cyc={} (want 0) residue={} dropped={} ::",
+            filled,
+            SERTX_FILL,
+            n,
+            b_m,
+            b_un,
+            SERTX_WANT_B,
+            emit,
+            residue,
+            lost
+        );
+    }
+}
+
+/// SERIALTX (rmbp-ledger B154) — **the main loop's flush of the staging ring.**
+///
+/// ### Why it exists
+/// "A deferred line is not a lost one only for as long as there is a NEXT PRINT" is the sentence
+/// PWRDRAIN is built on, and B154 made it load-bearing one layer earlier. Before that arc a `_print`
+/// wrote its OWN line directly at the UART, so the last line of a burst always reached the wire on the
+/// print that produced it; now every line goes through the ring and leaves on a capped drain, so the
+/// tail of a burst can outlive the print that queued it by one drain. On a machine that then goes
+/// quiet — the end of a boot ladder, a capture's last rungs, a fixture's final `-> PASS` — "the next
+/// print" may be a long way off, and a verdict sitting in a ring is indistinguishable from a fixture
+/// that never ran. That is exactly the confusion `docs/dev/LAWS.md`'s "the wire may not lose lines"
+/// exists to forbid.
+///
+/// ### Why HERE and nowhere else
+/// [`mirror_service`]'s contract is already the one this needs and is already met on both arches:
+/// IF=1, no locks held, not a print context, reached from the main loop (x86 via
+/// `flight_recorder::service`'s first statement, aarch64 via the BSP loop and `pump_usb_into_gui`).
+/// Putting the flush here needs no line in the timer ISR and none in `main.rs` — the two owners the
+/// B154 brief named and STOP-reported — and it makes the main loop a second, clock-independent drain
+/// owner beside "whichever core prints next".
+///
+/// ### What it costs, and what it is not
+/// One `try_lock` and at most `DRAIN_BYTE_BUDGET` bytes per poll, with interrupts ENABLED, on a path
+/// that is already polling four tap ledgers. It is NOT the panic path (which keeps its uncapped
+/// synchronous [`drain`]) and NOT a power verb (which keeps [`power_drain`]); both of those own a
+/// machine that has no next anything, and this one is the ordinary case where there simply has not
+/// been a print for a while.
+///
+/// aarch64 is a deliberate no-op: that arch still writes its own line synchronously inside the mask
+/// (B154 measures it rather than changing it), so a line that reached `_print` there has already
+/// reached the wire and the only residue is the contended one, which rides the next print exactly as
+/// it did before this arc. When the aarch64 port lands, this is the function it also wires up.
+#[inline]
+pub fn residual_drain() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = crate::arch::serial::drain_owner();
     }
 }
