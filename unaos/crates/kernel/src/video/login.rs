@@ -99,6 +99,10 @@
 //! reason to know it is the only way in. The painter and the press read ONE accessor, [`ctl_rect`] —
 //! `wm::control_disc`'s discipline, for LOGINCLOSE's reason one layer out: a control drawn from one
 //! rect and hit-tested from another is one edit from being drawn where it cannot be pressed.
+//!
+//! And the DENIAL says one thing. [`submit`] asks `users::verify` — *"one answer for 'no such user'
+//! and 'wrong password'"* — rather than reading a `UsersError`, so neither the glass nor the wire can
+//! grow a reason that tells someone at the keyboard which names exist on the machine.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -720,7 +724,12 @@ fn submit() {
     let p = &pw[..plen];
     if users::count() == 0 {
         match users::create_user(n, p) {
-            Ok(_) => {}
+            // LOGINFLOW M2 — **the first boot on a fresh volume, and the reason this screen exists at
+            // all rather than a serial verb.** `users::count() == 0` is the whole predicate: there is
+            // nobody to log in as, so the same two fields CREATE the person and then log them in, with
+            // no console, no cable and nothing to know beforehand. The witness is the id, never the
+            // name's length or any part of what was typed.
+            Ok(id) => serial_println!("[login] first user created id={} — the fresh-volume path (no console was needed)", id),
             Err(e) => {
                 FORM.lock().message = match e {
                     users::UsersError::BadName => "Name: 1-8 of a-z 0-9 _ -, letter first",
@@ -730,6 +739,34 @@ fn submit() {
             }
         }
     }
+    // LOGINFLOW M2 — **THE DENIAL IS DECIDED BY ONE PREDICATE AND IT GIVES ONE ANSWER.**
+    //
+    // `users::verify` is documented as *"one answer for 'no such user' and 'wrong password'"*, and
+    // asking it HERE — ahead of `users::login`, which asks it again internally — is what keeps that
+    // property reachable from this screen. The alternative (deciding from `login`'s `UsersError`) puts
+    // a variant in the hand of the code that writes the message, and `users_reason` exists and is
+    // helpful and would eventually be used: `Refused` vs `Volume` vs `Exists` on the glass tells an
+    // attacker at the keyboard which names exist on the machine. There is no cost worth counting — a
+    // second salted SHA-256 on the ONE path a human takes a few times a day.
+    //
+    // So: ONE message, ONE wire line, and NEITHER carries a reason. The name IS on the wire (it is
+    // what was typed into a plain field, not a credential, and without it the line cannot be read
+    // against the store); nothing else about the attempt is, and the password never touches a serial
+    // route on any path — see this module's header.
+    if !users::verify(n, p) {
+        serial_println!(
+            "[login] denied user={} (one answer: a name that does not exist and a wrong password are the SAME refusal here and on the glass — `users::verify`, never `UsersError`)",
+            core::str::from_utf8(n).unwrap_or("?")
+        );
+        let mut f = FORM.lock();
+        f.message = "Login failed";
+        for b in f.pw.iter_mut() {
+            *b = 0;
+        }
+        f.pw_len = 0;
+        f.focus = Focus::Password;
+        return;
+    }
     match users::login(n, p) {
         Ok(()) => {
             LOGINS.fetch_add(1, Ordering::Relaxed);
@@ -737,8 +774,13 @@ fn submit() {
             close_into_session();
         }
         Err(_) => {
+            // The credential VERIFIED one line above and the session still did not open — a storage or
+            // slot-stamp refusal, which is not a denial and must not be reported as one. Said
+            // differently on the glass for the same reason the denial is said identically: a person
+            // who typed the right password must not be sent to look for a typo.
+            serial_println!("[login] verified but the session did not open — storage or slot refusal, NOT a credential refusal");
             let mut f = FORM.lock();
-            f.message = "Login failed";
+            f.message = "Could not open the session";
             for b in f.pw.iter_mut() {
                 *b = 0;
             }
