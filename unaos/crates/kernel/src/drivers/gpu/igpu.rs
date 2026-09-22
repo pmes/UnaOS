@@ -91,6 +91,93 @@ pub mod regs {
     pub const BLT_RING_START: usize = 0x22038;
     pub const BLT_RING_CTL: usize = 0x2203C;
     pub const BLT_RING_ACTHD: usize = 0x22074;
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════
+    // GMUX8 — PIPE TIMING AND PIPE M/N, EVERY ROW PINNED TO THE PUBLIC IVB PRM.
+    //
+    // Source, and it is the ONLY source: Intel® OpenSource HD Graphics PRM
+    // **Volume 3 Part 3: North Display Engine Registers (Ivy Bridge)**, Doc Ref
+    // `IHD-OS-V3 Pt 3 – 05 12`, May 2012 Rev 1.0, downloaded from intel.com
+    // (`cdrdv2-public.intel.com/690915/ivb-ihd-os-vol3-part3.pdf`). Section and PAGE are on
+    // every family below, and the same rows are tabulated in
+    // `docs/dev/OS/08_VIDEO/gpu_spec.md` §6. No i915 / i965 naming was opened for any of it.
+    //
+    // The three addresses per family are the PRM's own three printed rows (Pipe A / B / C),
+    // not a stride this file derived — see §4.1.1 p.66, which prints `60000h`, `61000h` and
+    // `62000h` as three separate `Address:` lines. `regs::PIPEASRC`/`PIPEACONF` above are the
+    // same registers the PRM calls `PIPE_SRCSZ_A` (§4.1.7 p.72) and `PIPE_CONF_A` (§5.1.3
+    // p.100), and this pass PINS those two offsets without moving them.
+    //
+    // ⚠ THREE REGISTERS A MODE-SET WANTS ARE NOT HERE AND CANNOT BE: `DP_TP_CTL`,
+    // `DP_TP_STATUS` and `TRANS_DDI_FUNC_CTL` occur **zero** times in either IVB display
+    // volume (Vol3 Pt3 North, Vol3 Pt4 South) — they are Haswell DDI-era registers. On this
+    // part eDP link training is `DP_CTL_A` bits 9:8 (§4.4.1 pp.85–86) and the eDP port is
+    // CPU-attached, so it is driven straight off the pipe timing block below with no PCH
+    // transcoder in the path. That is a FINDING, not a gap: see rung 08b's NOT-IN-IVB-PRM line.
+
+    // HTOTAL — §4.1.1 p.66. [28:16] Horizontal Total (pixels−1), [11:0] Horizontal Active (−1).
+    pub const PIPE_HTOTAL_A: usize = 0x60000;
+    pub const PIPE_HTOTAL_B: usize = 0x61000;
+    pub const PIPE_HTOTAL_C: usize = 0x62000;
+
+    // HBLANK — §4.1.2 p.67. [28:16] Horizontal Blank End, [12:0] Horizontal Blank Start.
+    pub const PIPE_HBLANK_A: usize = 0x60004;
+    pub const PIPE_HBLANK_B: usize = 0x61004;
+    pub const PIPE_HBLANK_C: usize = 0x62004;
+
+    // HSYNC — §4.1.3 p.68. [28:16] Horizontal Sync End, [12:0] Horizontal Sync Start.
+    pub const PIPE_HSYNC_A: usize = 0x60008;
+    pub const PIPE_HSYNC_B: usize = 0x61008;
+    pub const PIPE_HSYNC_C: usize = 0x62008;
+
+    // VTOTAL — §4.1.4 p.69. [28:16] Vertical Total (lines−1 progressive), [11:0] Vertical Active.
+    pub const PIPE_VTOTAL_A: usize = 0x6000C;
+    pub const PIPE_VTOTAL_B: usize = 0x6100C;
+    pub const PIPE_VTOTAL_C: usize = 0x6200C;
+
+    // VBLANK — §4.1.5 p.70. [28:16] Vertical Blank End, [12:0] Vertical Blank Start.
+    pub const PIPE_VBLANK_A: usize = 0x60010;
+    pub const PIPE_VBLANK_B: usize = 0x61010;
+    pub const PIPE_VBLANK_C: usize = 0x62010;
+
+    // VSYNC — §4.1.6 p.71. [28:16] Vertical Sync End, [12:0] Vertical Sync Start.
+    pub const PIPE_VSYNC_A: usize = 0x60014;
+    pub const PIPE_VSYNC_B: usize = 0x61014;
+    pub const PIPE_VSYNC_C: usize = 0x62014;
+
+    // DATAM — §4.2.1 pp.74–75. [30:25] TU Size (−1), [23:0] Data M. M1 = normal refresh,
+    // M2 = the low-power set PIPE_CONF bit 20 selects (§5.1.3 p.101).
+    pub const PIPE_DATAM1_A: usize = 0x60030;
+    pub const PIPE_DATAM1_B: usize = 0x61030;
+    pub const PIPE_DATAM1_C: usize = 0x62030;
+    pub const PIPE_DATAM2_A: usize = 0x60038;
+    pub const PIPE_DATAM2_B: usize = 0x61038;
+    pub const PIPE_DATAM2_C: usize = 0x62038;
+
+    // DATAN — §4.2.2 pp.75–76. [23:0] Data N.
+    pub const PIPE_DATAN1_A: usize = 0x60034;
+    pub const PIPE_DATAN1_B: usize = 0x61034;
+    pub const PIPE_DATAN1_C: usize = 0x62034;
+    pub const PIPE_DATAN2_A: usize = 0x6003C;
+    pub const PIPE_DATAN2_B: usize = 0x6103C;
+    pub const PIPE_DATAN2_C: usize = 0x6203C;
+
+    // LINKM — §4.2.3 p.76. [23:0] Link M, the m sent in the Main Stream Attributes.
+    pub const PIPE_LINKM1_A: usize = 0x60040;
+    pub const PIPE_LINKM1_B: usize = 0x61040;
+    pub const PIPE_LINKM1_C: usize = 0x62040;
+    pub const PIPE_LINKM2_A: usize = 0x60048;
+    pub const PIPE_LINKM2_B: usize = 0x61048;
+    pub const PIPE_LINKM2_C: usize = 0x62048;
+
+    // LINKN — §4.2.4 p.77. [23:0] Link N. "Writes to this register arm M/N registers for this
+    // pipe" — the double-buffer arm point for the whole M/N set, which the write rung will need.
+    pub const PIPE_LINKN1_A: usize = 0x60044;
+    pub const PIPE_LINKN1_B: usize = 0x61044;
+    pub const PIPE_LINKN1_C: usize = 0x62044;
+    pub const PIPE_LINKN2_A: usize = 0x6004C;
+    pub const PIPE_LINKN2_B: usize = 0x6104C;
+    pub const PIPE_LINKN2_C: usize = 0x6204C;
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1688,6 +1775,110 @@ pub unsafe fn gmux_igd_switch() {
         serial_println!(":: igpu-dpy: rung=07 name=pps-on MISSING doc=PRM-Vol3-Part4-Panel-Power-Sequencing pp_control=0xC7204:bit0=power-state-target:UNCITED,bit3=vdd-override:UNCITED on_delays=0xC7208:T1-T5:UNCITED off_delays=0xC720C:T:UNCITED — no PPS write is attempted and this ladder raises no panel power on any boot of this build ::");
 
         // ═══════════════════════════════════════════════════════════════════════════════════
+        // RUNG 07b — `pps-read`: THE CITATION RUNG 07 COULD NOT MAKE, MADE — AND THE PANEL'S
+        // ACTUAL POWER STATE DECODED FROM IT.
+        //
+        // ⚠ THIS RUNG DOES NOT UNDO RUNG 07'S DECLINE AND MUST NOT BE READ AS DOING SO. Rung 07
+        // still writes nothing, still prints `pp_write=DECLINED`, and this build still raises no
+        // panel power on any boot. What changed is only the FIRST of the three legs rung 07 stood
+        // on: "no citation exists for the bit". It exists now, and it is in this rung's `cite=`
+        // fields. The other two legs are untouched and are why the write is still declined —
+        // `PP_ON_DELAYS`/`PP_OFF_DELAYS` read `0x00000000` on this part, so the panel's T values
+        // are unprogrammed and firing the PPS on zero delays is the documented panel-damage path;
+        // and flight 8 says the write is not needed to reach the sink at all.
+        //
+        // WHERE THE BIT MAP CAME FROM, and the clean-room line held: Intel® OpenSource HD
+        // Graphics PRM **Volume 3 Part 4: South Display Engine Registers (Ivy Bridge)**, Doc Ref
+        // `IHD-OS-V3 Pt 4 – 05 12`, May 2012 Rev 1.0, fetched from intel.com
+        // (`cdrdv2-public.intel.com/690917/ivb-ihd-os-vol3-part4.pdf`) — §2.4 "Panel Power
+        // Sequencing", pp.38–43, one sub-section per register. `i915`/`intel_pps.c` was not
+        // opened; `docs/dev/GEMINI/video/iGUI/LADDER-igpu-bringup.md`'s TBV map, which was sourced
+        // to i915 NAMING and is why GMUX7 refused, is not this rung's source and is not consulted.
+        // Every row is re-stated with its section and page in `docs/dev/OS/08_VIDEO/gpu_spec.md` §6.
+        //
+        // ⚠ THE BRIEF ASKED FOR "T1/T2/T3/T4/T5" AND THE PRM DOES NOT NAME THOSE ON DISPLAYPORT —
+        // that lettering is the LVDS/SPWG column. On an eDP panel the same four fields are eDP
+        // **T3** (power up, `PP_ON_DELAYS` [28:16]), **T9** (backlight-off to video-off,
+        // `PP_OFF_DELAYS` [12:0]), **T10** (video-off to power-off, `PP_OFF_DELAYS` [28:16]) and
+        // **T12** (the power-cycle floor, `PP_DIVISOR` [4:0]). Both letterings are printed so a
+        // capture is not silently re-mapped, and the eDP names are the load-bearing ones.
+        //
+        // IT WRITES NOTHING. It re-uses rung 07's five reads rather than taking a second sample,
+        // deliberately: two samples a few microseconds apart would invite a reader to diff them
+        // as if the rung had measured motion, and it has not. `sample=rung07` says so on the wire.
+        highest = 8;
+        rung_name = "pps-read";
+
+        let pp_power_on = (pps_sts >> 31) & 1;
+        let pp_assets = (pps_sts >> 30) & 1;
+        let pp_seq = (pps_sts >> 28) & 0x3;
+        let pp_cycle_active = (pps_sts >> 27) & 1;
+        let pp_wp_key = (pps_ctl >> 16) & 0xFFFF;
+        let pp_vdd_force = (pps_ctl >> 3) & 1;
+        let pp_backlight = (pps_ctl >> 2) & 1;
+        let pp_pd_on_reset = (pps_ctl >> 1) & 1;
+        let pp_target = pps_ctl & 1;
+        let pp_port_sel = (pps_on >> 30) & 0x3;
+        let pp_t3_raw = (pps_on >> 16) & 0x1FFF;
+        let pp_bl_on_raw = pps_on & 0x1FFF;
+        let pp_t10_raw = (pps_off >> 16) & 0x1FFF;
+        let pp_t9_raw = pps_off & 0x1FFF;
+        let pp_refdiv = (pps_div >> 8) & 0xFFFFFF;
+        let pp_t12_raw = pps_div & 0x1F;
+        // §2.4.5 p.43 states the divider law in words — "the value should be (100 * Ref clock
+        // frequency in MHz / 2) - 1" — and gives one worked row, 125 MHz → 1869h. Inverted here,
+        // and printed beside the raw field so a reader can re-check the arithmetic on the wire.
+        let pp_refclk_mhz = if pp_refdiv == 0xFFFFFF { 0 } else { (2 * (pp_refdiv + 1)) / 100 };
+        // §2.4.5 p.43 gives TWO data points for the power-cycle field and no formula: default
+        // 4h = 300 ms, and "to achieve 400 ms, program a value of 5". Both fit (raw−1)·100 ms,
+        // and a written 0 is documented as "no delay". The derivation is named on the wire as
+        // `t12_law=prm-two-points` so it is never mistaken for a quoted formula.
+        let pp_t12_ms = if pp_t12_raw == 0 { 0 } else { (pp_t12_raw - 1) * 100 };
+        let pp_delays_programmed =
+            (pps_on != 0) as u32 + (pps_off != 0) as u32 + (pps_div != 0) as u32;
+
+        serial_println!(":: igpu-dpy: rung=07b name=pps-read ok=1 writes=0 sample=rung07 doc=IHD-OS-V3-Pt-4-05-12 cite=sec2.4-pp38-43 elapsed_ms={} ::",
+            get_elapsed_ms());
+        serial_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_status@0x{:05X}=0x{:08X} power_on={} assets={}(ignored-on-DPA-p38) seq={} cycle_delay_t4={} cite=sec2.4.1-pp38-39 ::",
+            regs::PCH_PP_STATUS, pps_sts,
+            if pp_power_on == 1 { "ON" } else { "OFF" },
+            if pp_assets == 1 { "ready" } else { "not-ready" },
+            pp_seq_name(pp_seq),
+            if pp_cycle_active == 1 { "active" } else { "not-active" });
+        serial_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_control@0x{:05X}=0x{:08X} wp_key=0x{:04X} write_protect={} vdd_override={} backlight={} pd_on_reset={} power_target={} cite=sec2.4.2-pp39-41 ::",
+            regs::PCH_PP_CONTROL, pps_ctl, pp_wp_key,
+            if pp_wp_key == 0xABCD { "DISABLED-key-ABCD" } else { "ENABLED" },
+            if pp_vdd_force == 1 { "FORCE" } else { "not-force" },
+            if pp_backlight == 1 { "enable" } else { "disable" },
+            if pp_pd_on_reset == 1 { "run" } else { "do-not-run" },
+            if pp_target == 1 { "ON" } else { "OFF" });
+        serial_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_on_delays@0x{:05X}=0x{:08X} port_sel={} t3_powerup_raw={} t3_us={} pwron_to_bl_raw={} pwron_to_bl_us={} unit=100us cite=sec2.4.3-pp41-42 ::",
+            regs::PCH_PP_ON_DELAYS, pps_on, pp_port_name(pp_port_sel),
+            pp_t3_raw, pp_t3_raw * 100, pp_bl_on_raw, pp_bl_on_raw * 100);
+        serial_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_off_delays@0x{:05X}=0x{:08X} t10_video_off_to_power_off_raw={} t10_us={} t9_bl_off_to_video_off_raw={} t9_us={} unit=100us cite=sec2.4.4-p42 ::",
+            regs::PCH_PP_OFF_DELAYS, pps_off, pp_t10_raw, pp_t10_raw * 100, pp_t9_raw, pp_t9_raw * 100);
+        serial_println!(":: igpu-dpy: rung=07b name=pps-read REG pp_divisor@0x{:05X}=0x{:08X} refdiv=0x{:06X} refclk_mhz={} t12_power_cycle_raw=0x{:02X} t12_ms={} t12_law=prm-two-points unit=100ms cite=sec2.4.5-p43 ::",
+            regs::PCH_PP_DIVISOR, pps_div, pp_refdiv, pp_refclk_mhz, pp_t12_raw, pp_t12_ms);
+        // THE ROLLUP LINE, and it is the one a write rung has to obey. `panel_powered_by_fw=` is
+        // the single fact the brief asked this rung to establish: what a later `pps-on` must
+        // PRESERVE rather than re-do. `vdd_forced_by_fw=` is the second, and on this machine it
+        // is the one that explains flight 11 — §2.4.2 p.40 says bit 3 exists precisely "to force
+        // on VDD for the embedded DisplayPort panel so AUX transactions can occur WITHOUT
+        // enabling the panel power sequence", which is exactly the state every AUX rung of this
+        // ladder has been reading the sink in. `port_sel_conflict=` is the third and it is a
+        // TRAP for the write rung: §2.4.3 p.41's own workaround note ties the `0xABCD` key to
+        // `PP_ON_DELAYS[31:30] = 01b DisplayPort A`, so a key of ABCD sitting above a port select
+        // of LVDS is a half-configured sequencer, and the write rung must program the port select
+        // (and real T values) before it touches the power-state target.
+        serial_println!(":: igpu-dpy: rung=07b name=pps-read ROLLUP panel_powered_by_fw={} vdd_forced_by_fw={} wp_window={} delays_programmed={}/3 t_source=PRM-fields-not-firmware-values port_sel_conflict={} preserve=pp_control=0x{:08X} ::",
+            if pp_power_on == 1 { "yes" } else { "no" },
+            if pp_vdd_force == 1 { "yes" } else { "no" },
+            if pp_wp_key == 0xABCD { "KEYED" } else { "PROTECTED" },
+            pp_delays_programmed,
+            if pp_wp_key == 0xABCD && pp_port_sel != 0b01 { "key-ABCD-but-port-sel-not-DPA" } else { "none" },
+            pps_ctl);
+
+        // ═══════════════════════════════════════════════════════════════════════════════════
         // RUNG 08 — `link-train-dry`: THE TRANSCRIPTION, SO THE NEXT MODE-SET IS A COPY.
         //
         // A DRY RUN. It writes nothing — not one AUX byte, not one MMIO dword — and its whole
@@ -1699,15 +1890,27 @@ pub unsafe fn gmux_igd_switch() {
         //
         // WHY THE "WOULD-TOUCH" SET IS EXACTLY THE `regs` BLOCK AND NOT ONE REGISTER WIDER. The
         // clean-room rule for this seat is "every register cited". Each offset printed below is
-        // already a named constant in this file's own `regs` module (`igpu.rs:5-93`), which is the
-        // tree carrying it; an offset for HTOTAL/HBLANK/HSYNC, the transcoder block, `DP_TP_CTL`
-        // or the link M/N pairs is NOT in this file, and inventing one from memory is the exact
-        // move this ladder has refused at the PPS for four flights running. So they are named as
-        // ABSENT, by name, with no number beside them.
+        // already a named constant in this file's own `regs` module, which is the tree carrying
+        // it, and inventing one from memory is the exact move this ladder has refused at the PPS
+        // for four flights running.
+        //
+        // ⚠ GMUX8 CHANGED THIS RUNG'S LAST LINE, and only that line, because leaving it would have
+        // put a FALSEHOOD on the wire. GMUX7 wrote `NOT-IN-TREE htotal hblank hsync vtotal vblank
+        // vsync transcoder dp_tp_ctl dp_tp_status link_m link_n — population=igpu.rs-regs-module
+        // (igpu.rs:5-93), hits=0`. Eight of those eleven names are now cited constants in that
+        // same module (GMUX8 added them from IVB PRM Vol3 Pt3), so `hits=0` is no longer true and
+        // the `igpu.rs:5-93` span no longer bounds the module. The three that remain are not
+        // "still missing" either — they are absent FROM THE SILICON'S OWN PUBLIC SPEC, which is a
+        // stronger statement and a different one, so the line now says which of the two it means.
+        // Every other token of rung 08 — its id, its name, `DRY`, `writes=0`, `WOULD-SET`,
+        // `WOULD-WRITE-DPCD`, `WOULD-TOUCH`, `NOT-IN-TREE` — is byte-identical to GMUX7's.
+        //
+        // `highest` moves 8 → 9 here because rung 07b took slot 8. The number is not a comparator
+        // and this file has said so since GMUXDPCD: captures compare on `name=`.
         //
         // It cannot black the panel, and the statement is structural rather than a promise:
         // there is no `write_volatile` and no `dp_aux_transfer` call in the rung at all.
-        highest = 8;
+        highest = 9;
         rung_name = "link-train-dry";
 
         serial_println!(":: igpu-dpy: rung=08 name=link-train-dry ok=1 DRY writes=0 aux_writes=0 pp_unwind=0 gated_on=pps={} elapsed_ms={} ::",
@@ -1728,9 +1931,161 @@ pub unsafe fn gmux_igd_switch() {
             regs::DSPALINOFF, mmio_read(bar0, regs::DSPALINOFF),
             regs::DSPATILEOFF, mmio_read(bar0, regs::DSPATILEOFF),
             regs::DSPASURF, mmio_read(bar0, regs::DSPASURF));
-        serial_println!(":: igpu-dpy: rung=08 name=link-train-dry NOT-IN-TREE htotal hblank hsync vtotal vblank vsync transcoder dp_tp_ctl dp_tp_status link_m link_n — population=igpu.rs-regs-module(igpu.rs:5-93), hits=0; a mode-set is impossible until each lands WITH a PRM citation ::");
+        serial_println!(":: igpu-dpy: rung=08 name=link-train-dry NOT-IN-TREE (none) LANDED-BY-GMUX8 htotal hblank hsync vtotal vblank vsync link_m link_n — population=igpu.rs-regs-module, read decoded at rung=08b; NOT-IN-IVB-PRM transcoder dp_tp_ctl dp_tp_status — population=IVB-PRM-V3Pt3+V3Pt4, hits=0, so they are absent from the SILICON's public spec and not merely from this tree ::");
 
-        highest = 9;
+        // ═══════════════════════════════════════════════════════════════════════════════════
+        // RUNG 08b — `modeset-read`: THE DRY MODE-SET, READ OFF THE RUNNING MACHINE.
+        //
+        // Rung 08 says what a mode-set WOULD write and had to name eleven registers it could not
+        // reach. This rung READS eight of those eleven — plus the port and pipe control words —
+        // and prints the mode THE FIRMWARE IS ALREADY DRIVING. That is the whole point: the write
+        // rung's job is to REPRODUCE these numbers, so they have to be on a wire first, decoded,
+        // with the section and page beside each one.
+        //
+        // IT WRITES NOTHING. There is no `write_volatile` and no `dp_aux_transfer` call in this
+        // rung; every access is `mmio_read`. It cannot black the panel.
+        //
+        // SOURCE, and again it is one document: Intel® OpenSource HD Graphics PRM **Volume 3
+        // Part 3: North Display Engine Registers (Ivy Bridge)**, Doc Ref `IHD-OS-V3 Pt 3 – 05 12`,
+        // May 2012 Rev 1.0, from intel.com (`cdrdv2-public.intel.com/690915/`). Offsets and bit
+        // fields are in `regs` with per-family section/page comments and in `gpu_spec.md` §6.
+        //
+        // WHICH PIPE — READ, NOT ASSUMED. `DP_CTL_A` bits [30:29] (§4.4.1 p.82) name the pipe the
+        // eDP port takes its data from, so the rung reads the port word FIRST and selects the
+        // timing block from it. Every earlier rung of this ladder that touched a pipe touched
+        // pipe A by construction; this one would print `pipe=B` if the firmware said B.
+        //
+        // ⚠ THE ONE NUMBER THIS RUNG DERIVES, and it is derived from two CITED fields rather than
+        // guessed. Refresh is not a register. §4.2 p.74 states the link law in the PRM's own
+        // words — "Link M/N = dot clock / ls_clk" — and §4.4.1 p.85 gives `ls_clk` a cited
+        // encoding on the SOURCE side: `DP_CTL_A` [17:16], `00b` = 270 MHz, `01b` = 162 MHz. So
+        // `dot_clock = ls_clk · LinkM / LinkN`, and refresh = dot clock / (htotal · vtotal) with
+        // the PRM's own minus-one convention undone. THIS IS THE FIRST CITED LINK RATE THIS
+        // LADDER HAS HAD: rung 06 still prints `rate_decode=TBV-tree-table` for the DPCD byte at
+        // `0x001`, because that is a SINK capability in a DP-spec encoding and this rung's number
+        // is a SOURCE PLL setting in an Intel encoding — they are two different facts and the
+        // rung prints both side by side rather than letting one stand in for the other.
+        //
+        // ⚠ AND WHICH M/N SET IS LIVE IS ALSO READ. `PIPE_CONF` bit 20 (§5.1.3 p.101) selects the
+        // normal (M/N 1) or low-power (M/N 2) set for software-controlled DRRS. Both sets are
+        // printed in full and `mn_set=` says which one the `MODE` line used, because a dry
+        // mode-set that silently read M1 while the panel was running on M2 would hand the write
+        // rung the wrong refresh with no way to notice.
+        //
+        // `end` LANDS AT 10 HERE — the ladder's full nominal height, so the rollup's `/10`
+        // denominator is exact for the first time. The `end` step below changes `rung_name` only:
+        // this rung already carried `highest` to the top, and a completed run is distinguished by
+        // `name=end ok=1`, never by the number.
+        highest = 10;
+        rung_name = "modeset-read";
+
+        let dp_a_val = mmio_read(bar0, regs::DP_A);
+        let dp_enable = (dp_a_val >> 31) & 1;
+        let dp_pipe_sel = (dp_a_val >> 29) & 0x3;
+        let dp_width = (dp_a_val >> 19) & 0x7;
+        let dp_enh_frame = (dp_a_val >> 18) & 1;
+        let dp_pll_freq = (dp_a_val >> 16) & 0x3;
+        let dp_reversed = (dp_a_val >> 15) & 1;
+        let dp_pll_en = (dp_a_val >> 14) & 1;
+        let dp_train_pat = (dp_a_val >> 8) & 0x3;
+        let dp_sync_pol = (dp_a_val >> 3) & 0x3;
+        let dp_detected = (dp_a_val >> 2) & 1;
+        let p = pipe_timing_regs(dp_pipe_sel);
+
+        serial_println!(":: igpu-dpy: rung=08b name=modeset-read ok=1 writes=0 doc=IHD-OS-V3-Pt-3-05-12 pipe={} pipe_sel_raw={} elapsed_ms={} ::",
+            p.name, dp_pipe_sel, get_elapsed_ms());
+        serial_println!(":: igpu-dpy: rung=08b name=modeset-read PORT dp_a@0x{:05X}=0x{:08X} enable={} pipe={} lanes={} enhanced_frame={} pll_freq={} pll_enable={} reversed={} train_pattern={} sync_pol=0x{:X} detected={} cite=sec4.4.1-pp82-86 ::",
+            regs::DP_A, dp_a_val,
+            if dp_enable == 1 { "ENABLED" } else { "disabled" },
+            p.name, dp_width_name(dp_width),
+            if dp_enh_frame == 1 { "enable" } else { "disable" },
+            dp_pll_freq_name(dp_pll_freq),
+            if dp_pll_en == 1 { "enable" } else { "disable" },
+            if dp_reversed == 1 { "reversed" } else { "not-reversed" },
+            dp_train_pat_name(dp_train_pat), dp_sync_pol,
+            if dp_detected == 1 { "detected" } else { "not-detected" });
+
+        let conf = mmio_read(bar0, p.conf);
+        let conf_enable = (conf >> 31) & 1;
+        let conf_state = (conf >> 30) & 1;
+        let conf_fsd = (conf >> 27) & 0x3;
+        let conf_interlace = (conf >> 21) & 0x7;
+        let conf_drrs = (conf >> 20) & 1;
+        let conf_bpc = (conf >> 5) & 0x7;
+        let mn_set = if conf_drrs == 1 { 2 } else { 1 };
+        serial_println!(":: igpu-dpy: rung=08b name=modeset-read PIPECONF conf@0x{:05X}=0x{:08X} pipe_enable={} pipe_state={} bpc={} interlace=0x{:X} drrs_power_mode={} mn_set={} frame_start_delay={} cite=sec5.1.3-pp100-103 ::",
+            p.conf, conf,
+            if conf_enable == 1 { "ENABLED" } else { "disabled" },
+            if conf_state == 1 { "ENABLED" } else { "disabled" },
+            pipe_bpc_name(conf_bpc), conf_interlace,
+            if conf_drrs == 1 { "low-power" } else { "normal" },
+            mn_set, conf_fsd);
+
+        // §4.1.1–§4.1.3 pp.66–68: the PRM programs Horizontal Total and Horizontal Active as
+        // "the number of pixels desired MINUS ONE", so every count below is the field plus one
+        // and every POSITION (blank/sync start and end) is printed as the field reads, since the
+        // PRM defines those relative to active-display start and not as a count.
+        let htot = mmio_read(bar0, p.htotal);
+        let hbl = mmio_read(bar0, p.hblank);
+        let hsy = mmio_read(bar0, p.hsync);
+        let h_active = (htot & 0xFFF) + 1;
+        let h_total = ((htot >> 16) & 0x1FFF) + 1;
+        serial_println!(":: igpu-dpy: rung=08b name=modeset-read TIMING-H htotal@0x{:05X}=0x{:08X} hblank@0x{:05X}=0x{:08X} hsync@0x{:05X}=0x{:08X} active={} total={} blank_start={} blank_end={} sync_start={} sync_end={} minus_one_undone=yes cite=sec4.1.1-4.1.3-pp66-68 ::",
+            p.htotal, htot, p.hblank, hbl, p.hsync, hsy,
+            h_active, h_total, hbl & 0x1FFF, (hbl >> 16) & 0x1FFF, hsy & 0x1FFF, (hsy >> 16) & 0x1FFF);
+
+        let vtot = mmio_read(bar0, p.vtotal);
+        let vbl = mmio_read(bar0, p.vblank);
+        let vsy = mmio_read(bar0, p.vsync);
+        let v_active = (vtot & 0xFFF) + 1;
+        let v_total = ((vtot >> 16) & 0x1FFF) + 1;
+        serial_println!(":: igpu-dpy: rung=08b name=modeset-read TIMING-V vtotal@0x{:05X}=0x{:08X} vblank@0x{:05X}=0x{:08X} vsync@0x{:05X}=0x{:08X} active={} total={} blank_start={} blank_end={} sync_start={} sync_end={} minus_one_undone=yes cite=sec4.1.4-4.1.6-pp69-71 ::",
+            p.vtotal, vtot, p.vblank, vbl, p.vsync, vsy,
+            v_active, v_total, vbl & 0x1FFF, (vbl >> 16) & 0x1FFF, vsy & 0x1FFF, (vsy >> 16) & 0x1FFF);
+
+        let srcsz = mmio_read(bar0, p.srcsz);
+        serial_println!(":: igpu-dpy: rung=08b name=modeset-read SRCSZ srcsz@0x{:05X}=0x{:08X} h={} v={} minus_one_undone=yes cite=sec4.1.7-p72 ::",
+            p.srcsz, srcsz, ((srcsz >> 16) & 0xFFF) + 1, (srcsz & 0xFFF) + 1);
+
+        let dm1 = mmio_read(bar0, p.datam1);
+        let dn1 = mmio_read(bar0, p.datan1);
+        let lm1 = mmio_read(bar0, p.linkm1);
+        let ln1 = mmio_read(bar0, p.linkn1);
+        let dm2 = mmio_read(bar0, p.datam2);
+        let dn2 = mmio_read(bar0, p.datan2);
+        let lm2 = mmio_read(bar0, p.linkm2);
+        let ln2 = mmio_read(bar0, p.linkn2);
+        serial_println!(":: igpu-dpy: rung=08b name=modeset-read MN1 datam1@0x{:05X}=0x{:08X} tu_size={} data_m={} datan1@0x{:05X}=0x{:08X} data_n={} linkm1@0x{:05X}=0x{:08X} link_m={} linkn1@0x{:05X}=0x{:08X} link_n={} cite=sec4.2.1-4.2.4-pp74-77 ::",
+            p.datam1, dm1, ((dm1 >> 25) & 0x3F) + 1, dm1 & 0xFFFFFF,
+            p.datan1, dn1, dn1 & 0xFFFFFF,
+            p.linkm1, lm1, lm1 & 0xFFFFFF,
+            p.linkn1, ln1, ln1 & 0xFFFFFF);
+        serial_println!(":: igpu-dpy: rung=08b name=modeset-read MN2 datam2@0x{:05X}=0x{:08X} tu_size={} data_m={} datan2@0x{:05X}=0x{:08X} data_n={} linkm2@0x{:05X}=0x{:08X} link_m={} linkn2@0x{:05X}=0x{:08X} link_n={} cite=sec4.2.1-4.2.4-pp74-77 ::",
+            p.datam2, dm2, ((dm2 >> 25) & 0x3F) + 1, dm2 & 0xFFFFFF,
+            p.datan2, dn2, dn2 & 0xFFFFFF,
+            p.linkm2, lm2, lm2 & 0xFFFFFF,
+            p.linkn2, ln2, ln2 & 0xFFFFFF);
+
+        let (live_lm, live_ln) = if mn_set == 2 { (lm2 & 0xFFFFFF, ln2 & 0xFFFFFF) } else { (lm1 & 0xFFFFFF, ln1 & 0xFFFFFF) };
+        let ls_clk_khz: u32 = match dp_pll_freq { 0 => 270_000, 1 => 162_000, _ => 0 };
+        let dot_khz: u32 = if live_ln != 0 && ls_clk_khz != 0 {
+            ((ls_clk_khz as u64 * live_lm as u64) / live_ln as u64) as u32
+        } else { 0 };
+        let px_per_frame = h_total as u64 * v_total as u64;
+        let refresh_mhz: u32 = if dot_khz != 0 && px_per_frame != 0 {
+            ((dot_khz as u64 * 1_000_000) / px_per_frame) as u32
+        } else { 0 };
+        // A zero here is a REFUSAL, not a reading, and it says which input was missing — an
+        // unpowered pipe reads M/N as zero and this ladder has never yet seen the pipe live.
+        let mode_why = if ls_clk_khz == 0 { "pll-freq-reserved" }
+            else if live_ln == 0 { "link_n=0" }
+            else if px_per_frame == 0 { "htotal-or-vtotal=0" }
+            else { "none" };
+        serial_println!(":: igpu-dpy: rung=08b name=modeset-read MODE active={}x{} total={}x{} mn_set={} ls_clk_khz={} dot_clock_khz={} refresh_mhz={} undefined_why={} law=LinkM/N=dotclock/ls_clk(sec4.2-p74)+DP_CTL[17:16](sec4.4.1-p85) dpcd_rate_raw=0x{:02X}(rate_decode=TBV-tree-table) dpcd_lanes={} ::",
+            h_active, v_active, h_total, v_total, mn_set, ls_clk_khz, dot_khz, refresh_mhz, mode_why, cap_rate, cap_lanes);
+        serial_println!(":: igpu-dpy: rung=08b name=modeset-read NOT-IN-IVB-PRM dp_tp_ctl dp_tp_status trans_ddi_func_ctl — population=IVB-PRM-V3Pt3(North)+V3Pt4(South), hits=0; those are Haswell DDI registers, and on Ivy Bridge eDP link training is DP_CTL_A[9:8] (sec4.4.1 pp.85-86) with the port CPU-attached, so no PCH transcoder is in the eDP path and the write rung must not look for one ::");
+
+        highest = 10;
         rung_name = "end";
         Ok(())
     };
@@ -2196,5 +2551,193 @@ fn print_pending_items(entries: &[UnwindEntry; 32], len: usize) {
                 serial_print!("mmio:{}@0x{:05X}<-0x{:08X}", unwind_mmio_name(off), off, pre);
             }
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// GMUX8 — THE FIELD DECODES FOR RUNGS 07b AND 08b, EACH ONE A PRM TABLE AND NOTHING ELSE
+//
+// Appended at the FOOT for the reason the GMUX-2 and GMUXDPCD blocks above already give:
+// everything below the gmux harness is nothing in a knob-OFF build, so an append here moves no
+// knob-OFF line number and `panic::Location` cannot shift under a `gmux_igd` change (QUEUE B94).
+// Every item carries the same `all(target_arch = "x86_64", feature = "gmux_igd")` cfg.
+//
+// ⚠ UNLIKE THE GMUXDPCD BLOCK BELOW WHICH IT SITS BESIDE, EVERY VALUE HERE *IS* A SPEC CITATION.
+// Each function below transcribes one `Value / Name / Description` table out of a public Intel
+// document, named in its doc-comment with section and page, and contains no judgement of its own:
+// an encoding the PRM marks Reserved returns the string `reserved`, never a guess at what the
+// silicon might do with it. Nothing here was taken from `i915`, `i965` or any driver source.
+//
+// The one thing these functions deliberately do NOT do is convert. `dp_pll_freq_name` returns
+// "270mhz" because that is the PRM's own spelling of the encoding at §4.4.1 p.85; the kHz number
+// the MODE line divides by is formed at the call site, where the law it is used under
+// (`Link M/N = dot clock / ls_clk`, §4.2 p.74) is written down next to it.
+
+/// `PP_STATUS` [29:28] Power Sequence Progress — IVB PRM Vol3 Pt4 (`IHD-OS-V3 Pt 4 – 05 12`)
+/// §2.4.1 p.39: `00b` None, `01b` Power Up, `10b` Power Down, `11b` Reserved.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+fn pp_seq_name(v: u32) -> &'static str {
+    match v {
+        0b00 => "none",
+        0b01 => "power-up",
+        0b10 => "power-down",
+        _ => "reserved",
+    }
+}
+
+/// `PP_ON_DELAYS` [31:30] Panel control port select — IVB PRM Vol3 Pt4 §2.4.3 p.41: `00b` LVDS,
+/// `01b` DisplayPort A, `10b` DisplayPort C, `11b` DisplayPort D. The same page carries the
+/// workaround that ties `01b` to a `PP_CONTROL` write-protect key of `0xABCD`, which is why rung
+/// 07b scores the two against each other.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+fn pp_port_name(v: u32) -> &'static str {
+    match v {
+        0b00 => "LVDS",
+        0b01 => "DP-A",
+        0b10 => "DP-C",
+        _ => "DP-D",
+    }
+}
+
+/// `DP_CTL` [21:19] Port Width Selection — IVB PRM Vol3 Pt3 (`IHD-OS-V3 Pt 3 – 05 12`) §4.4.1
+/// p.85: `000b` x1, `001b` x2, `011b` x4, others Reserved. Note the gap at `010b`: the PRM lists
+/// no x3 and this returns `reserved` rather than inventing one.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+fn dp_width_name(v: u32) -> &'static str {
+    match v {
+        0b000 => "x1",
+        0b001 => "x2",
+        0b011 => "x4",
+        _ => "reserved",
+    }
+}
+
+/// `DP_CTL` [17:16] DP PLL Frequency — IVB PRM Vol3 Pt3 §4.4.1 p.85: `00b` 270mhz, `01b` 162mhz,
+/// others Reserved. This is the SOURCE-side link symbol clock and is the only cited link rate
+/// this ladder has; the DPCD `MAX_LINK_RATE` byte rung 06 reads is a SINK capability in a DP-spec
+/// encoding and stays `rate_decode=TBV-tree-table` until that encoding is cited from the DP spec.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+fn dp_pll_freq_name(v: u32) -> &'static str {
+    match v {
+        0b00 => "270mhz",
+        0b01 => "162mhz",
+        _ => "reserved",
+    }
+}
+
+/// `DP_CTL` [9:8] Link training pattern enable — IVB PRM Vol3 Pt3 §4.4.1 pp.85–86: `00b`
+/// Pattern 1, `01b` Pattern 2, `10b` Idle, `11b` Normal (send normal pixels). This is Ivy
+/// Bridge's whole `DP_TP_CTL`: there is no such register on this part.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+fn dp_train_pat_name(v: u32) -> &'static str {
+    match v {
+        0b00 => "pattern1",
+        0b01 => "pattern2",
+        0b10 => "idle",
+        _ => "normal",
+    }
+}
+
+/// `PIPE_CONF` [7:5] Bits Per Color — IVB PRM Vol3 Pt3 §5.1.3 p.102: `000b` 8bpc, `001b` 10bpc,
+/// `010b` 6bpc, `011b` 12bpc, others Reserved. The ordering is the PRM's and is not monotonic.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+fn pipe_bpc_name(v: u32) -> &'static str {
+    match v {
+        0b000 => "8bpc",
+        0b001 => "10bpc",
+        0b010 => "6bpc",
+        0b011 => "12bpc",
+        _ => "reserved",
+    }
+}
+
+/// The per-pipe timing/M-N offsets rung 08b reads, chosen by `DP_CTL_A` [30:29] Pipe Select
+/// (IVB PRM Vol3 Pt3 §4.4.1 p.82: `00b` Pipe A, `01b` Pipe B, `10b` Pipe C, `11b` Reserved).
+///
+/// `11b` is Reserved and there is no fourth pipe to read, so it falls back to pipe A and the
+/// `name` field says `A(pipe-sel-reserved)` — the fallback is never silent, and rung 08b also
+/// prints `pipe_sel_raw=` so the encoding is on the wire whatever this returns.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+#[derive(Clone, Copy)]
+struct PipeTimingRegs {
+    name: &'static str,
+    conf: usize,
+    srcsz: usize,
+    htotal: usize,
+    hblank: usize,
+    hsync: usize,
+    vtotal: usize,
+    vblank: usize,
+    vsync: usize,
+    datam1: usize,
+    datan1: usize,
+    linkm1: usize,
+    linkn1: usize,
+    datam2: usize,
+    datan2: usize,
+    linkm2: usize,
+    linkn2: usize,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+const fn pipe_timing_regs(sel: u32) -> PipeTimingRegs {
+    match sel {
+        0b01 => PipeTimingRegs {
+            name: "B",
+            conf: regs::PIPEBCONF,
+            srcsz: regs::PIPEBSRC,
+            htotal: regs::PIPE_HTOTAL_B,
+            hblank: regs::PIPE_HBLANK_B,
+            hsync: regs::PIPE_HSYNC_B,
+            vtotal: regs::PIPE_VTOTAL_B,
+            vblank: regs::PIPE_VBLANK_B,
+            vsync: regs::PIPE_VSYNC_B,
+            datam1: regs::PIPE_DATAM1_B,
+            datan1: regs::PIPE_DATAN1_B,
+            linkm1: regs::PIPE_LINKM1_B,
+            linkn1: regs::PIPE_LINKN1_B,
+            datam2: regs::PIPE_DATAM2_B,
+            datan2: regs::PIPE_DATAN2_B,
+            linkm2: regs::PIPE_LINKM2_B,
+            linkn2: regs::PIPE_LINKN2_B,
+        },
+        0b10 => PipeTimingRegs {
+            name: "C",
+            conf: regs::PIPECCONF,
+            srcsz: regs::PIPECSRC,
+            htotal: regs::PIPE_HTOTAL_C,
+            hblank: regs::PIPE_HBLANK_C,
+            hsync: regs::PIPE_HSYNC_C,
+            vtotal: regs::PIPE_VTOTAL_C,
+            vblank: regs::PIPE_VBLANK_C,
+            vsync: regs::PIPE_VSYNC_C,
+            datam1: regs::PIPE_DATAM1_C,
+            datan1: regs::PIPE_DATAN1_C,
+            linkm1: regs::PIPE_LINKM1_C,
+            linkn1: regs::PIPE_LINKN1_C,
+            datam2: regs::PIPE_DATAM2_C,
+            datan2: regs::PIPE_DATAN2_C,
+            linkm2: regs::PIPE_LINKM2_C,
+            linkn2: regs::PIPE_LINKN2_C,
+        },
+        _ => PipeTimingRegs {
+            name: if sel == 0b00 { "A" } else { "A(pipe-sel-reserved)" },
+            conf: regs::PIPEACONF,
+            srcsz: regs::PIPEASRC,
+            htotal: regs::PIPE_HTOTAL_A,
+            hblank: regs::PIPE_HBLANK_A,
+            hsync: regs::PIPE_HSYNC_A,
+            vtotal: regs::PIPE_VTOTAL_A,
+            vblank: regs::PIPE_VBLANK_A,
+            vsync: regs::PIPE_VSYNC_A,
+            datam1: regs::PIPE_DATAM1_A,
+            datan1: regs::PIPE_DATAN1_A,
+            linkm1: regs::PIPE_LINKM1_A,
+            linkn1: regs::PIPE_LINKN1_A,
+            datam2: regs::PIPE_DATAM2_A,
+            datan2: regs::PIPE_DATAN2_A,
+            linkm2: regs::PIPE_LINKM2_A,
+            linkn2: regs::PIPE_LINKN2_A,
+        },
     }
 }
