@@ -1032,6 +1032,20 @@ _defnote = f", {len(deferred)} cross-branch ref(s) deferred" if deferred else ""
 say(f"OK — {rows_seen} rows in {len(files)} ledger file(s) + RULINGS + {len(QUEUES)} queue file(s): ids unique, field counts match their header, absence claims name an enumeration (lexical sampler — see the header), status ∈ enum, owners known, cross-refs resolve{_defnote}, every deferral names an owner and an expiry, shas exist, evidence in git and anchored, rulings live or superseded-by a real R<n>, no conflict markers, every queue citation resolves, one STATE line per claim, every ledger row ends at its final pipe, no row lost at a fold")
 _notation_note()
 PY
+rc=$?
+# GATE-BRANCH — THE SECOND POPULATION (BRANCHGATE, rmbp 2026-09-22; BRANCHCENSUS 935d099a §Findings).
+# GATE-LEDGER above judges the ROWS in this tree. It cannot see the other place work goes missing: an
+# executor REF whose tip is an ancestor of no track. Twenty-three judged rows of exactly that, 19 of
+# them shared code, 14 from the one day a seat ran out of credit between the reports and the fold —
+# and every one of them was invisible to every gate in this repo, because no tree contains a ref. The
+# census is a sibling (unaos/scripts/branch-census.sh: different corpus, 0.5 s, runnable alone), and
+# it is called HERE so that `arroyo check` still runs one gate and no seat has to remember a second.
+# Its verdict folds in whole: a 2 (no verdict) wins over any green, a 1 reds this script too.
+"$(dirname "${BASH_SOURCE[0]}")/branch-census.sh" "$ROOT"
+brc=$?
+[ "$brc" = 2 ] && exit 2
+[ "$brc" = 0 ] || rc=1
+exit "$rc"
 # GO-RED PROOF (tree mutation, run before shipping; each reverted after):
 #   duplicate id           -> RED naming the line       status "standing"      -> RED (outside the enum)
 #   `→ S999` in a row      -> RED (dangling), when LEDGER.md is present

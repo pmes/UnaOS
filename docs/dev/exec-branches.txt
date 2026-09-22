@@ -1,0 +1,255 @@
+# exec-branches.txt — THE EXECUTOR BRANCH REGISTRY. Read by GATE-BRANCH (unaos/scripts/branch-census.sh,
+# called by unaos/scripts/ledger-check.sh, which `arroyo check` runs).
+#
+# An executor branch is CLOSED by a line here naming its fold sha — not by a seat remembering. Every
+# `refs/heads/exec-*` and `refs/remotes/origin/exec-*` whose tip is an ancestor of NO track branch
+# (main · hw-rmbp · hw-jetson · hw-pi4, local and origin) must have a line here or the gate REDs. A
+# ref whose tip IS on a track needs no line: git has already closed it.
+#
+# ONE LINE PER REF, FIVE FIELDS:
+#
+#     <ref> <tip-sha> <state> <fold-sha-or-owner> <date>
+#
+#   <ref>       the FULL refname. PER REF, NEVER PER NAME — `exec-orin22-matrixpar` is `ce0d992b` on
+#               origin and `5c1f13d0` locally, two versions of one arroyo change, and a record keyed
+#               on the name silently drops one of them (VERDICTS.md §Findings 4).
+#   <tip-sha>   the sha this line judged. A CLOSED line must still match the ref's tip; an IN-FLIGHT
+#               line records where the executor was CUT and its branch may only move FORWARD from it.
+#   <state>     IN-FLIGHT · FOLDED-BY-HAND · SUPERSEDED · WIP-SURVIVOR · LOST. May be written with
+#               its argument appended (`FOLDED-BY-HAND:<sha>`); then field 4 is `-` or the same one.
+#   <field 4>   FOLDED-BY-HAND/SUPERSEDED: the fold sha — it must resolve here AND be an ancestor of
+#               a track, because a fold nobody can fetch is not a fold. LOST: the queue file that
+#               owes the rescue. IN-FLIGHT: the seat that cut it. WIP-SURVIVOR: `-`.
+#   <date>      the branch's date; for IN-FLIGHT, the day it was cut (more than 14 days old REDs).
+#
+# SEEDED 2026-09-22 from the 177 judged rows of `docs/dev/evidence/branch-census-0917/VERDICTS.md`
+# (935d099a on main) — 206 refs, which is every unreached exec ref in the repo on that date and this
+# one. Rows the census closed on an adjudication RECORD rather than one fold commit carry the commit
+# that CARRIES the record, because a sha is checkable from a tree that has not synced trunk and a
+# path is not: 935d099a = VERDICTS.md itself (the census's own patch-id and line probes), 3efde934 =
+# docs/dev/evidence/orin22/DISPOSITION.md (the orin 22 per-commit disposition).
+#
+# THE LOST LINES ARE A DEBT, AND THEY PRINT ON EVERY RUN. They are not skips: each names the queue
+# that owes the rescue, `UNAOS_BRANCH_STRICT=1` turns every one of them red, and a LOST line whose
+# ref later lands on a track goes RED by itself until somebody writes the fold sha. When a rescue
+# folds, edit its line — that is the close-out.
+refs/heads/exec-botfix                     7dab0534 FOLDED-BY-HAND bd1b7285                  2026-08-04
+refs/heads/exec-eret                       f319207f FOLDED-BY-HAND 7f8cec60                  2026-08-04
+refs/heads/exec-hubcm                      dcb7ce09 FOLDED-BY-HAND 225660f7                  2026-08-04
+refs/heads/exec-usb-wedge                  16ebb4f8 FOLDED-BY-HAND 2300e822                  2026-08-04
+refs/heads/exec-v3d93                      f96b5ecd FOLDED-BY-HAND 2c0f5ca9                  2026-08-04
+refs/heads/exec-btree                      3e688121 FOLDED-BY-HAND 0617fcff                  2026-08-12
+refs/heads/exec-cbwflags                   df807c1a FOLDED-BY-HAND 104f2ed9                  2026-08-12
+refs/heads/exec-cursorfix                  85c7387c FOLDED-BY-HAND 5de3eaa6                  2026-08-12
+refs/heads/exec-hubcycle                   6e65ea14 FOLDED-BY-HAND 37be8643                  2026-08-12
+refs/heads/exec-joinfix                    d84bd04f FOLDED-BY-HAND 86addc5a                  2026-08-12
+refs/heads/exec-midbin                     bae14ad4 FOLDED-BY-HAND 95d243c5                  2026-08-12
+refs/heads/exec-owedtail                   efaa9dfa FOLDED-BY-HAND 912de713                  2026-08-12
+refs/heads/exec-pidesk                     16cb31d4 FOLDED-BY-HAND fc352eb5                  2026-08-12
+refs/heads/exec-pirast                     d63a9fda FOLDED-BY-HAND 8cfe90d7                  2026-08-12
+refs/heads/exec-portshared                 63e6e9b3 FOLDED-BY-HAND 7b87e045                  2026-08-12
+refs/heads/exec-serwit2                    46dc59b4 FOLDED-BY-HAND 0eff8c89                  2026-08-12
+refs/heads/exec-specprose                  f92aafa4 FOLDED-BY-HAND 6969ed04                  2026-08-12
+refs/heads/exec-unafsf2                    5d6b4406 FOLDED-BY-HAND 4f980d7f                  2026-08-12
+refs/heads/exec-v3d85                      2072a65c FOLDED-BY-HAND c45fe00d                  2026-08-12
+refs/heads/exec-v3d85r1                    0da15b54 FOLDED-BY-HAND 935d099a                  2026-08-12
+refs/heads/exec-v3ddoc                     ff51f2b3 FOLDED-BY-HAND 5587cde4                  2026-08-12
+refs/heads/exec-vfsmin                     4cd87124 FOLDED-BY-HAND e33f1d05                  2026-08-12
+refs/heads/exec-wcdlive                    21eef30a FOLDED-BY-HAND f0036692                  2026-08-12
+refs/heads/exec-wedge12m2                  ea8bc89f FOLDED-BY-HAND fa53b1dd                  2026-08-12
+refs/heads/exec-chromewire                 f19a2e06 FOLDED-BY-HAND 935d099a                  2026-08-13
+refs/heads/exec-conswin                    e5a42af5 FOLDED-BY-HAND 14e54538                  2026-08-13
+refs/heads/exec-drainstall                 49b3a5fe FOLDED-BY-HAND e87ea2a4                  2026-08-13
+refs/heads/exec-owedarm                    fbe4b3bc FOLDED-BY-HAND da06e3ef                  2026-08-13
+refs/heads/exec-shellport                  9c809e32 FOLDED-BY-HAND b2e0fb4a                  2026-08-13
+refs/heads/exec-u11reap                    12e21725 FOLDED-BY-HAND f51e42be                  2026-08-13
+refs/heads/exec-crystalpi                  4c71e477 FOLDED-BY-HAND fc5f4298                  2026-08-17
+refs/heads/exec-deskclear2                 a252f102 FOLDED-BY-HAND 8f78399d                  2026-08-17
+refs/heads/exec-pulsewin                   8ea92c4e FOLDED-BY-HAND 935d099a                  2026-08-17
+refs/heads/exec-quarry                     2f6eaffb FOLDED-BY-HAND a165798a                  2026-08-17
+refs/heads/exec-realdesk                   5d8133ff FOLDED-BY-HAND 96cc0c0d                  2026-08-17
+refs/heads/exec-serialfocus                4a1a8d93 FOLDED-BY-HAND 2944ddfd                  2026-08-17
+refs/heads/exec-vugspread                  62c0e8a3 FOLDED-BY-HAND 935d099a                  2026-08-17
+refs/heads/exec-wchgate                    0a46b853 FOLDED-BY-HAND 763d72b3                  2026-08-17
+refs/heads/exec-deskreal                   b01feaa1 SUPERSEDED     9207e6fc                  2026-08-18
+refs/heads/exec-fatfix                     2078e6cc FOLDED-BY-HAND 631acb42                  2026-08-18
+refs/heads/exec-flakehunt                  fe6c93c5 FOLDED-BY-HAND 815d0cd6                  2026-08-19
+refs/heads/exec-wcgwin1                    724770fa FOLDED-BY-HAND 4a40d00b                  2026-08-19
+refs/heads/exec-wcgwin1b                   2f8dd9a2 FOLDED-BY-HAND b2471fec                  2026-08-21
+refs/heads/exec-adjudicate                 be63e95e FOLDED-BY-HAND c98164c8                  2026-08-25
+refs/heads/exec-bgspread-orin              71569a78 FOLDED-BY-HAND 1c44ea4b                  2026-08-25
+refs/heads/exec-chrome                     56d7f5b5 FOLDED-BY-HAND e98d798b                  2026-08-25
+refs/heads/exec-desktopdoc                 f6c7e91b SUPERSEDED     c98164c8                  2026-08-25
+refs/heads/exec-ga10bprobe1                3ffa56c3 FOLDED-BY-HAND cd568275                  2026-08-25
+refs/heads/exec-net4a                      5e559f9a FOLDED-BY-HAND 935d099a                  2026-08-25
+refs/heads/exec-netdhcp                    4190a736 FOLDED-BY-HAND 1c23485f                  2026-08-25
+refs/heads/exec-reboot                     88490840 FOLDED-BY-HAND 52df9111                  2026-08-25
+refs/heads/exec-rung4                      802adf1d FOLDED-BY-HAND 68c47585                  2026-08-25
+refs/heads/exec-rung6                      fb5a253b FOLDED-BY-HAND bc735850                  2026-08-25
+refs/heads/exec-smpb                       ca1d86ab FOLDED-BY-HAND 72d3d36e                  2026-08-25
+refs/heads/exec-smpb2                      894d9b46 FOLDED-BY-HAND a28879de                  2026-08-25
+refs/heads/exec-smpinstr                   2f1c146d FOLDED-BY-HAND a50358f0                  2026-08-25
+refs/heads/exec-spec                       a7b0a55d FOLDED-BY-HAND 1f2545cb                  2026-08-25
+refs/heads/exec-supstate                   db8331fd FOLDED-BY-HAND badc8732                  2026-08-25
+refs/heads/exec-wcg                        3728af13 FOLDED-BY-HAND 435addbd                  2026-08-25
+refs/heads/exec-pi5fold                    c8b895e1 FOLDED-BY-HAND 4e7da376                  2026-08-27
+refs/heads/exec-r7-bracketfix              680a7394 FOLDED-BY-HAND 80b9aab0                  2026-08-27
+refs/heads/exec-r7-btrx                    52a37efc FOLDED-BY-HAND 338a943c                  2026-08-27
+refs/heads/exec-r7-fbcon                   2424247d FOLDED-BY-HAND b41d1423                  2026-08-27
+refs/heads/exec-r7-lockfix                 24fd3f3e FOLDED-BY-HAND 94aeb0c9                  2026-08-27
+refs/heads/exec-r7-lockfix2                ae369d00 FOLDED-BY-HAND 27e27d6d                  2026-08-27
+refs/heads/exec-r7-menubar                 dece8e71 FOLDED-BY-HAND 103c0a5e                  2026-08-27
+refs/heads/exec-r7-noattdw                 df852d94 FOLDED-BY-HAND 04bf1c9a                  2026-08-27
+refs/heads/exec-r7-paldoc                  8283b033 FOLDED-BY-HAND 513e3bee                  2026-08-27
+refs/heads/exec-r7-phase31                 9eadadfc FOLDED-BY-HAND 214d71bf                  2026-08-27
+refs/heads/exec-r7-prtscr                  3e3d6556 FOLDED-BY-HAND 8dcf3f11                  2026-08-27
+refs/heads/exec-r7-quarry                  e325a236 FOLDED-BY-HAND 5a84327e                  2026-08-27
+refs/heads/exec-r7-quarry2                 42420fa2 SUPERSEDED     5a84327e                  2026-08-27
+refs/heads/exec-r7-rastport                2df7b3b6 FOLDED-BY-HAND f37f5a8f                  2026-08-27
+refs/heads/exec-r7-redsort                 0d9828be FOLDED-BY-HAND 790c5ea5                  2026-08-27
+refs/heads/exec-r7-selftest                7d2b334e FOLDED-BY-HAND 8be33559                  2026-08-27
+refs/heads/exec-r7-smalls                  c8e556be FOLDED-BY-HAND 935d099a                  2026-08-27
+refs/heads/exec-r7-smalls2                 75ee610c FOLDED-BY-HAND 935d099a                  2026-08-27
+refs/heads/exec-r7-smalls3                 da2a247f FOLDED-BY-HAND 03877f82                  2026-08-27
+refs/heads/exec-r7-wcg                     c8e97189 FOLDED-BY-HAND f3ea4769                  2026-08-27
+refs/heads/exec-r7-wmpaygo                 0dab1e3a FOLDED-BY-HAND 8b233f72                  2026-08-27
+refs/heads/exec-rmbp10-fadtreset           a5021ac4 FOLDED-BY-HAND b7901763                  2026-09-02
+refs/heads/exec-rmbp10-gateroots           c85b6af3 FOLDED-BY-HAND e1bff790                  2026-09-02
+refs/heads/exec-rmbp10-gatesdoc            ed15e673 FOLDED-BY-HAND 141724a1                  2026-09-02
+refs/heads/exec-rmbp10-prtscrchord         4bae1873 FOLDED-BY-HAND a0cf18a3                  2026-09-02
+refs/heads/exec-orin13-paintpulse          e7fff00c FOLDED-BY-HAND 7ffd2122                  2026-09-03
+refs/heads/exec-orin13-stackseed           317c6a95 FOLDED-BY-HAND 01739a93                  2026-09-03
+refs/heads/exec-orin15-clickdead           d54eb959 WIP-SURVIVOR   -                         2026-09-05
+refs/heads/exec-orin15-clickdead2          4a6bc46f FOLDED-BY-HAND 40a11ca9                  2026-09-05
+refs/heads/exec-orin15-clickdead3          f171099a FOLDED-BY-HAND c769e697                  2026-09-05
+refs/heads/exec-orin15-consolequiet        ec0bb52f WIP-SURVIVOR   -                         2026-09-05
+refs/heads/exec-orin15-consolequiet2       5ca8e49a SUPERSEDED     9e030696                  2026-09-05
+refs/heads/exec-orin15-dragdead            60b6ac42 FOLDED-BY-HAND 4dc88314                  2026-09-05
+refs/heads/exec-orin15-dragdead2           116ef7e3 SUPERSEDED     7580018e                  2026-09-05
+refs/heads/exec-orin15-menubar             a6e2e34e WIP-SURVIVOR   -                         2026-09-05
+refs/heads/exec-orin15-menubar2            0cd253b9 FOLDED-BY-HAND b768331a                  2026-09-05
+refs/heads/exec-orin15-quarry              d558f5bb WIP-SURVIVOR   -                         2026-09-05
+refs/heads/exec-orin15-quarry2             039958bf SUPERSEDED     f36cb82f                  2026-09-05
+refs/heads/exec-orin15-s7recut             ba3bdad8 FOLDED-BY-HAND 8a9a231c                  2026-09-05
+refs/heads/exec-orin15-tcurx2              f46a589d FOLDED-BY-HAND fb5d0d8a                  2026-09-05
+refs/heads/exec-orin17-a30fix              7ba2a8aa FOLDED-BY-HAND a84464fe                  2026-09-06
+refs/heads/exec-orin17-bootfocus           fdcba15d LOST           docs/dev/QUEUE.md         2026-09-06
+refs/heads/exec-orin17-cascadefit          b21df80f FOLDED-BY-HAND 9b1a0605                  2026-09-06
+refs/heads/exec-orin17-consoletext         a02f03b5 FOLDED-BY-HAND 935d099a                  2026-09-06
+refs/heads/exec-orin17-crystalfix          d3de2a64 FOLDED-BY-HAND 1046f81c                  2026-09-06
+refs/heads/exec-orin17-dupguard            28899d5c SUPERSEDED     d78241fa                  2026-09-06
+refs/heads/exec-orin17-jv1                 ccf93304 FOLDED-BY-HAND 8766cf12                  2026-09-06
+refs/heads/exec-orin17-landdoc             85824bc9 SUPERSEDED     580536af                  2026-09-06
+refs/heads/exec-orin17-net5idx             644992dc FOLDED-BY-HAND 2a7c59d2                  2026-09-06
+refs/heads/exec-orin17-pinconsole          62bdc702 FOLDED-BY-HAND 2809f657                  2026-09-06
+refs/heads/exec-orin17-pixels              4e0ad275 FOLDED-BY-HAND 36e6e3aa                  2026-09-06
+refs/heads/exec-orin17-prtsclost           4cd79076 FOLDED-BY-HAND 31a1d914                  2026-09-06
+refs/heads/exec-orin17-rxburst             10a13130 FOLDED-BY-HAND dabea629                  2026-09-06
+refs/heads/exec-orin17-shellbasics         f54aabbf FOLDED-BY-HAND 6627aaba                  2026-09-06
+refs/heads/exec-orin17-shellrelics         dc683c40 FOLDED-BY-HAND 18af05ab                  2026-09-06
+refs/heads/exec-orin17-so10fix             da4a36eb FOLDED-BY-HAND 0b6c7eb2                  2026-09-06
+refs/heads/exec-orin17-so11fix             53d621a3 SUPERSEDED     36e6e3aa                  2026-09-06
+refs/heads/exec-orin17-so9fix              9f810171 FOLDED-BY-HAND 63b109f6                  2026-09-06
+refs/heads/exec-orin17-supprtscr           a79cb2a3 FOLDED-BY-HAND 368c0dbf                  2026-09-06
+refs/heads/exec-orin17-vfsroute            1aae3459 FOLDED-BY-HAND 935d099a                  2026-09-06
+refs/heads/exec-orin17-virtpreempt         d47bb834 FOLDED-BY-HAND 74b7c764                  2026-09-06
+refs/heads/exec-orin17-wcg                 da8adcb2 FOLDED-BY-HAND 78cdc7f7                  2026-09-06
+refs/heads/exec-orin17-xhcintd             0019ec7a SUPERSEDED     d78241fa                  2026-09-06
+refs/heads/exec-orin18-aclsym              c8eb4038 FOLDED-BY-HAND a62188c9                  2026-09-06
+refs/heads/exec-orin18-fslayout            059ccf1d FOLDED-BY-HAND 935d099a                  2026-09-06
+refs/heads/exec-orin18-layoutland          a6a44eec FOLDED-BY-HAND 777c31b0                  2026-09-06
+refs/heads/exec-orin18-panicloc            b476cea5 SUPERSEDED     c4286ff7                  2026-09-06
+refs/heads/exec-orin18-sdmmcrt             cdce5129 SUPERSEDED     3efde934                  2026-09-06
+refs/remotes/origin/exec-orin17-dupguard   28899d5c SUPERSEDED     d78241fa                  2026-09-06
+refs/heads/exec-orin19-aclwit              f50538ae FOLDED-BY-HAND 9ca5103f                  2026-09-07
+refs/heads/exec-orin19-bootns              561c0436 SUPERSEDED     3efde934                  2026-09-07
+refs/heads/exec-orin19-tearscope           76bf3267 FOLDED-BY-HAND f4a17e17                  2026-09-07
+refs/heads/exec-orin19-tickdefault         29027ed6 FOLDED-BY-HAND 98213b7f                  2026-09-07
+refs/heads/exec-orin20-bootidland          a04cc7be SUPERSEDED     b1885dbc                  2026-09-07
+refs/heads/exec-orin20-bootidlive          aec2c604 SUPERSEDED     3efde934                  2026-09-07
+refs/heads/exec-orin20-commentfix          e928202a SUPERSEDED     3efde934                  2026-09-07
+refs/heads/exec-orin20-doctruth            92b27b9b SUPERSEDED     3efde934                  2026-09-07
+refs/heads/exec-orin20-evqprint            720d3f76 FOLDED-BY-HAND 74518f1e                  2026-09-07
+refs/heads/exec-orin20-fitsland            086ec38d FOLDED-BY-HAND 51f06bea                  2026-09-07
+refs/heads/exec-orin20-fold                611ad85a FOLDED-BY-HAND 1d87c94a                  2026-09-07
+refs/heads/exec-orin20-integrate           5c1c242a FOLDED-BY-HAND b519cba2                  2026-09-07
+refs/heads/exec-orin20-integrate2          0f06d60c SUPERSEDED     3efde934                  2026-09-07
+refs/heads/exec-orin20-panicloc            41e7fbf3 FOLDED-BY-HAND d1bc934c                  2026-09-07
+refs/heads/exec-orin20-panicregate         40dd57b1 FOLDED-BY-HAND d1bc934c                  2026-09-07
+refs/heads/exec-orin20-specarm             f99cd024 FOLDED-BY-HAND 0898fb92                  2026-09-07
+refs/heads/exec-orin20-unafsgrow           74b7f21b FOLDED-BY-HAND eb98ba90                  2026-09-07
+refs/heads/exec-orin20-unafsroot           c3abd946 SUPERSEDED     06759190                  2026-09-07
+refs/heads/exec-orin20-witnessgap          5cb571f9 FOLDED-BY-HAND df64ef5f                  2026-09-07
+refs/heads/exec-orin21-claimcheck          aec2c604 SUPERSEDED     3efde934                  2026-09-07
+refs/remotes/origin/exec-orin20-bootidlive aec2c604 SUPERSEDED     3efde934                  2026-09-07
+refs/remotes/origin/exec-orin20-fitsland   086ec38d FOLDED-BY-HAND 51f06bea                  2026-09-07
+refs/remotes/origin/exec-orin20-integrate2 0f06d60c SUPERSEDED     3efde934                  2026-09-07
+refs/remotes/origin/exec-orin20-unafsgrow  74b7f21b FOLDED-BY-HAND eb98ba90                  2026-09-07
+refs/remotes/origin/exec-orin21-c15knobs   aec2c604 SUPERSEDED     3efde934                  2026-09-07
+refs/remotes/origin/exec-orin21-claimcheck aec2c604 SUPERSEDED     3efde934                  2026-09-07
+refs/heads/exec-orin21-c15knobs            8db9691c SUPERSEDED     3efde934                  2026-09-08
+refs/heads/exec-orin21-fold                6cf9f13b SUPERSEDED     3efde934                  2026-09-08
+refs/heads/exec-orin21-lawsnom             f86cf448 LOST           docs/dev/QUEUE.md         2026-09-08
+refs/heads/exec-orin21-ledger              fc1a2d52 LOST           docs/dev/QUEUE.md         2026-09-08
+refs/heads/exec-orin21-recon               6cf9f13b SUPERSEDED     3efde934                  2026-09-08
+refs/heads/exec-orin21-rekey               3894fdc9 SUPERSEDED     3efde934                  2026-09-08
+refs/heads/exec-orin21-tearfold            45870e80 FOLDED-BY-HAND 77806c49                  2026-09-08
+refs/heads/exec-orin22-lawsnom2            66523c05 LOST           docs/dev/QUEUE.md         2026-09-08
+refs/heads/exec-orin22-matrixpar           5c1f13d0 LOST           docs/dev/QUEUE.md         2026-09-08
+refs/heads/exec-orin23-ga10b4              e7c8eb24 SUPERSEDED     f2794266                  2026-09-08
+refs/remotes/origin/exec-orin21-fold       6cf9f13b SUPERSEDED     3efde934                  2026-09-08
+refs/remotes/origin/exec-orin21-lawsnom    f86cf448 LOST           docs/dev/QUEUE.md         2026-09-08
+refs/remotes/origin/exec-orin21-ledger     fc1a2d52 LOST           docs/dev/QUEUE.md         2026-09-08
+refs/remotes/origin/exec-orin21-rekey      3894fdc9 SUPERSEDED     3efde934                  2026-09-08
+refs/remotes/origin/exec-orin21-tearfold   45870e80 FOLDED-BY-HAND 77806c49                  2026-09-08
+refs/remotes/origin/exec-orin22-lawsnom2   66523c05 LOST           docs/dev/QUEUE.md         2026-09-08
+refs/remotes/origin/exec-orin22-matrixpar  ce0d992b LOST           docs/dev/QUEUE.md         2026-09-08
+refs/remotes/origin/exec-orin22-matrixpar2 5c1f13d0 LOST           docs/dev/QUEUE.md         2026-09-08
+refs/remotes/origin/exec-orin23-ga10b4     e7c8eb24 SUPERSEDED     f2794266                  2026-09-08
+refs/heads/exec-orin25-shotverb            edf8483a WIP-SURVIVOR   -                         2026-09-10
+refs/remotes/origin/exec-orin25-shotverb   edf8483a WIP-SURVIVOR   -                         2026-09-10
+refs/heads/exec-orin-blitstall             4a4a55b1 LOST           docs/dev/QUEUE.md         2026-09-13
+refs/heads/exec-orin-dragmetal             75c32d5e LOST           docs/dev/QUEUE.md         2026-09-13
+refs/heads/exec-orin-fonts2x               ad62cf09 FOLDED-BY-HAND 582278cd                  2026-09-13
+refs/heads/exec-orin-ga10b6                07c29a62 LOST           docs/dev/OS/orin-queue.md 2026-09-13
+refs/heads/exec-orin-gatehyg               78ca893a LOST           docs/dev/QUEUE.md         2026-09-13
+refs/heads/exec-orin-loginboot             f14f6505 LOST           docs/dev/QUEUE.md         2026-09-13
+refs/heads/exec-orin-lun2                  bf45f7cb LOST           docs/dev/QUEUE.md         2026-09-13
+refs/heads/exec-orin-netverb               23bddcf8 LOST           docs/dev/QUEUE.md         2026-09-13
+refs/heads/exec-orin-orintime              ad549988 LOST           docs/dev/QUEUE.md         2026-09-13
+refs/heads/exec-orin-ptrlost               26646c22 LOST           docs/dev/QUEUE.md         2026-09-13
+refs/heads/exec-orin-rastwin               28bcd764 LOST           docs/dev/OS/orin-queue.md 2026-09-13
+refs/heads/exec-orin-scrshot               c8d66657 LOST           docs/dev/QUEUE.md         2026-09-13
+refs/heads/exec-orin-sessgate              9f365744 LOST           docs/dev/QUEUE.md         2026-09-13
+refs/heads/exec-orin-wirehyg               9c42a93c LOST           docs/dev/QUEUE.md         2026-09-13
+refs/remotes/origin/exec-orin-blitstall    4a4a55b1 LOST           docs/dev/QUEUE.md         2026-09-13
+refs/remotes/origin/exec-orin-dragmetal    75c32d5e LOST           docs/dev/QUEUE.md         2026-09-13
+refs/remotes/origin/exec-orin-fonts2x      ad62cf09 FOLDED-BY-HAND 582278cd                  2026-09-13
+refs/remotes/origin/exec-orin-ga10b6       07c29a62 LOST           docs/dev/OS/orin-queue.md 2026-09-13
+refs/remotes/origin/exec-orin-gatehyg      78ca893a LOST           docs/dev/QUEUE.md         2026-09-13
+refs/remotes/origin/exec-orin-loginboot    f14f6505 LOST           docs/dev/QUEUE.md         2026-09-13
+refs/remotes/origin/exec-orin-lun2         bf45f7cb LOST           docs/dev/QUEUE.md         2026-09-13
+refs/remotes/origin/exec-orin-netverb      23bddcf8 LOST           docs/dev/QUEUE.md         2026-09-13
+refs/remotes/origin/exec-orin-orintime     ad549988 LOST           docs/dev/QUEUE.md         2026-09-13
+refs/remotes/origin/exec-orin-ptrlost      26646c22 LOST           docs/dev/QUEUE.md         2026-09-13
+refs/remotes/origin/exec-orin-rastwin      28bcd764 LOST           docs/dev/OS/orin-queue.md 2026-09-13
+refs/remotes/origin/exec-orin-scrshot      c8d66657 LOST           docs/dev/QUEUE.md         2026-09-13
+refs/remotes/origin/exec-orin-sessgate     9f365744 LOST           docs/dev/QUEUE.md         2026-09-13
+refs/remotes/origin/exec-orin-wirehyg      9c42a93c LOST           docs/dev/QUEUE.md         2026-09-13
+refs/heads/exec-orin-ga10b7                0676ed4a LOST           docs/dev/OS/orin-queue.md 2026-09-15
+refs/heads/exec-rmbp-kfunwedge             6c38659d LOST           docs/dev/OS/rmbp-queue.md 2026-09-15
+refs/remotes/origin/exec-rmbp-kfunwedge    6c38659d LOST           docs/dev/OS/rmbp-queue.md 2026-09-15
+
+# IN FLIGHT — the 2026-09-22 rmbp rescue round and the orin rescue. Each line records the CUT, not
+# today's tip: these branches move forward as their executors commit (and an executor that re-reads
+# its brief `git reset --hard`s back to exactly this sha), and the gate only asks that the tip still
+# descend from what is written here.
+refs/heads/exec-rmbp-branchgate            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-deskrescue            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-dmgovlp               2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-docsrescue            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-specpins              2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-storgpu               2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-toolrescue            2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-vfswit                2fc9c71c IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-orin-rescue                fd440602 IN-FLIGHT      orin                      2026-09-22
