@@ -2885,7 +2885,7 @@ fn jd2_console_pump(_arg: usize) {
                 }
                 if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
                     last_sweep = cntpct();
-                    unaos_kernel::vugras::idle_sweep(sweep_tick); #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_census(sweep_tick); #[cfg(feature = "orinrx")] unaos_kernel::arch::serial::serialrx::census(sweep_tick); // SERIALRX (ORINRX) — the `[serialrx] rx=` census on this EXISTING sweep cadence (every 4th tick = ~1 s, the `[orinrender] census` rate); no new timer. ⚠ LINE-NEUTRAL append. // ORIN-RASTGLASS: the `late` read-back, and THIS is the site that makes it mean anything — phase 1 is the interval between RAST returning and the console taking the panel, i.e. the only window in which the cube is supposed to be visible, and it is bounded at 8 s / 32 sweeps. The phase-2 twin below keeps sampling afterwards, but a repaint observed THERE is the console doing its job (RAST-SUPERSEDED-BY-CONSOLE), not the defect. ⚠ LINE-NEUTRAL append.
+                    unaos_kernel::vugras::idle_sweep(sweep_tick); #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_census(sweep_tick); #[cfg(feature = "orinrx")] unaos_kernel::arch::serial::serialrx::census(sweep_tick); // SERIALRX (ORINRX) — the `[serialrx] rx=` census on this EXISTING sweep cadence (every 4th tick = ~1 s, the `[render] census` rate); no new timer. ⚠ LINE-NEUTRAL append. // ORIN-RASTGLASS: the `late` read-back, and THIS is the site that makes it mean anything — phase 1 is the interval between RAST returning and the console taking the panel, i.e. the only window in which the cube is supposed to be visible, and it is bounded at 8 s / 32 sweeps. The phase-2 twin below keeps sampling afterwards, but a repaint observed THERE is the console doing its job (RAST-SUPERSEDED-BY-CONSOLE), not the defect. ⚠ LINE-NEUTRAL append.
                     sweep_tick += 1;
                 }
                 unaos_kernel::arch::sched::yield_now();
@@ -3391,12 +3391,12 @@ fn gui_recv_blocking_x86() -> unaos_kernel::pal::Event {
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static RX_LOGGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// PIUSB-24: ms() timestamp of the last `[piusb24]` pointer witness line, to rate-limit it to ~4 Hz
+/// PIUSB-24: ms() timestamp of the last `[usb24]` pointer witness line, to rate-limit it to ~4 Hz
 /// (a moving mouse emits reports far faster than serial should mirror). 0 = never logged.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static PIUSB24_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// PIUSB-26: ms() timestamp of the last `[piusb26]` pump idle-cost witness, to rate-limit it to once
+/// PIUSB-26: ms() timestamp of the last `[usb26]` pump idle-cost witness, to rate-limit it to once
 /// every ~5 s (the pump runs ~250×/s — no point mirroring every pass). 0 = never logged.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 static PIUSB26_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -3770,9 +3770,9 @@ fn serial_to_shell(byte: u8) {
 //      file that is already safe. `docs/dev/OS/…/scheduler.md` §INWEDGE carries the same correction.
 //   5. The acquire never returns. The core is masked, so the holder it displaced can never be
 //      redispatched to release the lock, and `SCHED[3].current` still names the interrupted task —
-//      `99:input`. Every task pinned to that core dies with it: `usb-pump` emitted `[piusb26]`
+//      `99:input`. Every task pinned to that core dies with it: `usb-pump` emitted `[usb26]`
 //      exactly ONCE in the whole boot (it is rate-limited to 5 s), `rx-backstop` froze at
-//      `bs_phase=1 bs_loops=2`, and no `[wheel1]`, `[piusb24]`, `[el0in]` or `[cursor] armed` line
+//      `bs_phase=1 bs_loops=2`, and no `[wheel1]`, `[usb24]`, `[el0in]` or `[cursor] armed` line
 //      ever appeared. That is the whole input subsystem, ~15 s into the boot.
 //
 // THE RULE, stated once: **the input router may not hold a raw panel lock across a dispatch, and may
@@ -4708,7 +4708,7 @@ fn pump_usb_into_gui() {
     unaos_kernel::fs::fat::piusb27_service(); #[cfg(feature = "witness")] stackpool_stk_probe(); // STACKPOOL — the instrument half of `PUMP_PATH_STACK_SIZE`, placed HERE rather than at either spawn site because this function is the shared body BOTH sized tasks execute, and whichever of them is running gets named by the probe's own `task=id:name` field. It is the last statement of the pass, so `hw` already includes whatever the quarry-reopen and BOT chains above reached — a high-water is a lifetime reading, so a probe after the fact still reports a subtree that has long since returned. The early `return` at the `user_input_active()` branch skips it; that costs nothing for the same reason. Rate limit + rationale at the file tail. ⚠ FOLDED, `#[cfg]` on the statement — PARITY §5.3.
 }
 
-/// PIUSB-24: rate-limited (~4 Hz) `[piusb24]` serial witness of a pointer report reaching the GUI
+/// PIUSB-24: rate-limited (~4 Hz) `[usb24]` serial witness of a pointer report reaching the GUI
 /// bridge — dx/dy for motion (relative or absolute payload) or the button bitmask for a click edge.
 /// A moving mouse emits reports far faster than serial should mirror, so log at most every ~250 ms;
 /// button edges are rare and always logged (they bypass the throttle via the `buttons` arm).
@@ -4716,14 +4716,14 @@ fn pump_usb_into_gui() {
 fn piusb24_pointer_witness(dx: i32, dy: i32, buttons: Option<u8>) {
     use core::sync::atomic::Ordering;
     if let Some(mask) = buttons {
-        serial_println!("[piusb24] pointer buttons=0b{:08b}", mask);
+        serial_println!("[usb24] pointer buttons=0b{:08b}", mask);
         return;
     }
     let now = unaos_kernel::arch::ms();
     let last = PIUSB24_LAST_LOG_MS.load(Ordering::Relaxed);
     if now.wrapping_sub(last) >= 250 || last == 0 {
         PIUSB24_LAST_LOG_MS.store(now.max(1), Ordering::Relaxed);
-        serial_println!("[piusb24] pointer dx={} dy={}", dx, dy);
+        serial_println!("[usb24] pointer dx={} dy={}", dx, dy);
     }
 }
 
@@ -5770,7 +5770,7 @@ fn status_tick(_: usize) {
 /// intervals of 8-10 ms), so ~60+ pointer reports/s reach the render task while the UART/keyboard
 /// interrupt path stays untouched. No busy-spin — it naps between passes. Gated on `timer::is_live()`
 /// at spawn like `rx_backstop`/`status_tick`; in QEMU raspi4b the input task's poll-nap fallback still
-/// pumps each cooperative pass. A rate-limited `[piusb26]` witness proves the idle-controller cost of a
+/// pumps each cooperative pass. A rate-limited `[usb26]` witness proves the idle-controller cost of a
 /// pass is micro (a `poll_events` on an empty event ring is cheap MMIO). Never returns.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn usb_pump(_: usize) {
@@ -5785,7 +5785,7 @@ fn usb_pump(_: usize) {
         let last = PIUSB26_LAST_LOG_MS.load(Ordering::Relaxed);
         if now.wrapping_sub(last) >= 5000 || last == 0 {
             PIUSB26_LAST_LOG_MS.store(now.max(1), Ordering::Relaxed);
-            serial_println!("[piusb26] pump pass {} cyc (~4 ms cadence, idle controller)", dt);
+            serial_println!("[usb26] pump pass {} cyc (~4 ms cadence, idle controller)", dt);
         }
     }
 }
@@ -7392,7 +7392,7 @@ fn desktop_firmware_activate_maybe() -> bool {
 //        and `recv` is frozen at 1 from the drop onward in both flights;
 //   no `[shellwin-pi]` line in either flight — the shell window was never minted;
 //   no `[pulsewin] open` line in either flight — the pulse window was ARMED by the cascade
-//        (`[pidesk] pulse-window ARMED`, which is the cascade ANNOUNCING it, not opening it) and
+//        (`[deskfw] pulse-window ARMED`, which is the cascade ANNOUNCING it, not opening it) and
 //        then never opened, because the pass that opens it never ran again;
 //   `:: INPUT: PL011 RX interrupt live ::` fires on injected bytes and no shell answer ever comes
 //        back on the wire — the bytes reach `shell_inbox` and sit there unconsumed.
@@ -8417,7 +8417,7 @@ fn tegra_desk_furn() -> bool {
     // (Cargo.toml) so `click=1` here is a structural fact, printed to be falsifiable rather than
     // trusted.
     serial_println!(
-        "[orinfurn] arm click={} conwin={} desk={} tenant={} deskseam={} (ORIN-DESKFURN entered on the tegra terminus; §5.2 UNCROSSED — pidesk::activate is NOT called)",
+        "[deskfurn] arm click={} conwin={} desk={} tenant={} deskseam={} (ORIN-DESKFURN entered on the tegra terminus; §5.2 UNCROSSED — pidesk::activate is NOT called)",
         cfg!(feature = "orinclick") as u8,
         cfg!(feature = "orinconwin") as u8,
         cfg!(feature = "orindesk") as u8,
@@ -8440,19 +8440,19 @@ fn tegra_desk_furn() -> bool {
     let stk_anchor = ORINSTK_ANCHOR_SP.load(Ordering::Relaxed);
     if stk_anchor != 0 && stk_anchor >= stk_here {
         serial_println!(
-            "[orinstkdepth] depth-consumed={} bytes anchor-sp={:#x} seam-sp={:#x} at=orinfurn-arm chain=kernel_main->tegra_early_stop->tegra_desk_furn -> DEPTH-CONSUMED (this is stack CONSUMED between the two reads and is NOT headroom: the Orin boot stack is UEFI's and is never switched, this link defines no __stack_top, and the MemoryRegion slice that would bound it is consumed by memory::init — so no remaining-headroom number is derivable in-kernel today and none is claimed here)",
+            "[stkdepth] depth-consumed={} bytes anchor-sp={:#x} seam-sp={:#x} at=orinfurn-arm chain=kernel_main->tegra_early_stop->tegra_desk_furn -> DEPTH-CONSUMED (this is stack CONSUMED between the two reads and is NOT headroom: the Orin boot stack is UEFI's and is never switched, this link defines no __stack_top, and the MemoryRegion slice that would bound it is consumed by memory::init — so no remaining-headroom number is derivable in-kernel today and none is claimed here)",
             stk_anchor - stk_here, stk_anchor, stk_here
         );
     } else {
         serial_println!(
-            "[orinstkdepth] DEPTH-UNAVAILABLE anchor-sp={:#x} seam-sp={:#x} at=orinfurn-arm reason={} (no number is printed rather than a number derived from an unset or non-monotonic anchor — an instrument that cannot fire in the state it exists for must say so, not guess)",
+            "[stkdepth] DEPTH-UNAVAILABLE anchor-sp={:#x} seam-sp={:#x} at=orinfurn-arm reason={} (no number is printed rather than a number derived from an unset or non-monotonic anchor — an instrument that cannot fire in the state it exists for must say so, not guess)",
             stk_anchor, stk_here,
             if stk_anchor == 0 { "anchor-never-ran" } else { "anchor-below-seam (the two reads are not on one descending frame chain — the stack was switched between them)" }
         );
     }
 
     if ORINFURN_ENTERED.swap(true, Ordering::AcqRel) {
-        serial_println!("[orinfurn] REFUSE reason=already-armed (the seam is one-shot; a second pass would re-toggle ENABLED, bump menubar's TOGGLES counter and make its DEFAULT_LATCH witness read a history that did not happen)");
+        serial_println!("[deskfurn] REFUSE reason=already-armed (the seam is one-shot; a second pass would re-toggle ENABLED, bump menubar's TOGGLES counter and make its DEFAULT_LATCH witness read a history that did not happen)");
         return false;
     }
 
@@ -8464,7 +8464,7 @@ fn tegra_desk_furn() -> bool {
     let info = {
         let fb = *unaos_kernel::video::WRITER.lock();
         if !fb.is_ready() {
-            serial_println!("[orinfurn] REFUSE reason=no-panel (headless boot — JD1 seeded no scanout; the bar's geometry, its floors and the composite that paints it are all functions of panel geometry)");
+            serial_println!("[deskfurn] REFUSE reason=no-panel (headless boot — JD1 seeded no scanout; the bar's geometry, its floors and the composite that paints it are all functions of panel geometry)");
             return false;
         }
         fb.info()
@@ -8480,7 +8480,7 @@ fn tegra_desk_furn() -> bool {
     // cannot spare entry 0 at all.
     let staged = wm::reserve_stage(&info);
     if staged == 0 {
-        serial_println!("[orinfurn] REFUSE reason=stage-unreserved panel={}x{} stage=0 (wm::reserve_stage got nothing for entry 0 — the bar's composite would grow its buffer under SYS_WIN_PRESENT's IRQ mask, the F1-F5 shape)", pw, ph);
+        serial_println!("[deskfurn] REFUSE reason=stage-unreserved panel={}x{} stage=0 (wm::reserve_stage got nothing for entry 0 — the bar's composite would grow its buffer under SYS_WIN_PRESENT's IRQ mask, the F1-F5 shape)", pw, ph);
         return false;
     }
 
@@ -8497,12 +8497,12 @@ fn tegra_desk_furn() -> bool {
     // THE CENSUS. Unconditional, and ahead of the refusal below it, so a capture always carries every
     // measured floor and not merely the first one that said no.
     serial_println!(
-        "[orinfurn] floors panel={}x{}x{} stage={} rect={:?} table={} bar-was={} owned-was={} rows={}",
+        "[deskfurn] floors panel={}x{}x{} stage={} rect={:?} table={} bar-was={} owned-was={} rows={}",
         pw, ph, info.bytes_per_pixel, staged, rect, live, was_enabled, owned_before, wm::MAX_WINDOWS
     );
 
     if rect.is_none() {
-        serial_println!("[orinfurn] REFUSE reason=panel-below-bar-floor panel={}x{} (menubar::strip_rect declined this panel — shorter than FLOOR_H or narrower than FLOOR_W; enabling the bar anyway would subtract rows from every present that no composite could then fill)", pw, ph);
+        serial_println!("[deskfurn] REFUSE reason=panel-below-bar-floor panel={}x{} (menubar::strip_rect declined this panel — shorter than FLOOR_H or narrower than FLOOR_W; enabling the bar anyway would subtract rows from every present that no composite could then fill)", pw, ph);
         return false;
     }
 
@@ -8539,14 +8539,14 @@ fn tegra_desk_furn() -> bool {
         // behaviour difference between two seams, and only a bench boot can say which is right here.
         menubar::set_enabled(bar_was);
         serial_println!(
-            "[orinfurn] REFUSE reason=composite-declined panel={}x{} stage={} retried={} rolled-back-to={} passes={} (menubar::compose left its slot untouched — strip::paint declines on a contended SCRATCH or a surface not yet word4. ENABLED restored: an enabled bar with no pixels is a dead band Screen::present_background subtracts forever)",
+            "[deskfurn] REFUSE reason=composite-declined panel={}x{} stage={} retried={} rolled-back-to={} passes={} (menubar::compose left its slot untouched — strip::paint declines on a contended SCRATCH or a surface not yet word4. ENABLED restored: an enabled bar with no pixels is a dead band Screen::present_background subtracts forever)",
             pw, ph, staged, retried, bar_was, if retried { 2 } else { 1 }
         );
         return false;
     }
 
     serial_println!(
-        "[orinfurn] ARMED panel={}x{} stage={} rect={:?} bar-was={} retried={} owns_pixels={} table={} -> BAR-ON-GLASS",
+        "[deskfurn] ARMED panel={}x{} stage={} rect={:?} bar-was={} retried={} owns_pixels={} table={} -> BAR-ON-GLASS",
         pw, ph, staged, rect, bar_was, retried, painted, live
     );
     // The SHARD menu is reachable from this instant, and that is a SECOND claim, not a restatement:
@@ -8559,7 +8559,7 @@ fn tegra_desk_furn() -> bool {
     // `-> RAISED` or `MISS-SHELL` — the press reaching a window or the desktop means the menu band
     // did not consume it, which is the bar not being live however painted it looks.
     serial_println!(
-        "[orinfurn] crystal LIVE corner={:?} — press the crystal for the SHARD menu (About real; Sleep the ONE honest stub, no S3 suspend path; Restart and Shut Down psci_wired={} — where a secure monitor answers the smc they ACT, crystal::fire -> power::crystal_restart / power::crystal_shutdown = PSCI SYSTEM_RESET / SYSTEM_OFF, and where none does they print their honest unimplemented lines). UNFLOWN on Orin metal",
+        "[deskfurn] crystal LIVE corner={:?} — press the crystal for the SHARD menu (About real; Sleep the ONE honest stub, no S3 suspend path; Restart and Shut Down psci_wired={} — where a secure monitor answers the smc they ACT, crystal::fire -> power::crystal_restart / power::crystal_shutdown = PSCI SYSTEM_RESET / SYSTEM_OFF, and where none does they print their honest unimplemented lines). UNFLOWN on Orin metal",
         menubar::crystal_corner_abs(pw, ph), !cfg!(feature = "pi")
     );
     true
@@ -8579,7 +8579,7 @@ fn tegra_desk_furn() -> bool {
 // THE MEASUREMENT. Two reads of SP, taken in the same frame chain, subtracted:
 //   * the ANCHOR, `tegra_stk_anchor()`, on `kernel_main`'s `bootpace::record("entry")` line — the
 //     earliest stable point on the terminus path, before any subsystem exists;
-//   * the SEAM read, beside `tegra_desk_furn`'s unconditional `[orinfurn] arm` line, i.e. inside the
+//   * the SEAM read, beside `tegra_desk_furn`'s unconditional `[deskfurn] arm` line, i.e. inside the
 //     deepest frame the desktop-furniture rung reaches on the boot core's own stack.
 // The chain between them is `kernel_main -> tegra_early_stop -> tegra_desk_furn`, and the difference
 // is exactly the stack those frames plus their spilled locals have CONSUMED at that instant. It needs
@@ -8679,7 +8679,7 @@ fn tegra_render_arm() -> bool {
     // falsifiable rather than trusted. That distinction is not pedantry here: `orinconwin` shipped a
     // `live=LIVE` that was a compile-time literal and would have printed LIVE whatever the route did.
     serial_println!(
-        "[orinrender] arm conwin={} furn={} tenant={} click={} desk={} cascade={} scene={} (ORIN-RENDER entered on the tegra terminus; this seam does NOT call desktop_firmware::activate — §5.2 is crossed only by the deskcascade seam ahead of it, when cascade=1; scene=1 is the cascade's readback bar=1 + route=ROUTED, and on it the pass RETIRES the strip and SERVICES the pulse window — DESKSCENE)",
+        "[render] arm conwin={} furn={} tenant={} click={} desk={} cascade={} scene={} (ORIN-RENDER entered on the tegra terminus; this seam does NOT call desktop_firmware::activate — §5.2 is crossed only by the deskcascade seam ahead of it, when cascade=1; scene=1 is the cascade's readback bar=1 + route=ROUTED, and on it the pass RETIRES the strip and SERVICES the pulse window — DESKSCENE)",
         cfg!(feature = "orinconwin") as u8,
         cfg!(feature = "orinfurn") as u8,
         cfg!(feature = "orintenant") as u8,
@@ -8690,7 +8690,7 @@ fn tegra_render_arm() -> bool {
     );
 
     if ORINRENDER_ARMED.swap(true, Ordering::AcqRel) {
-        serial_println!("[orinrender] REFUSE reason=already-armed (the seam is one-shot; a second spawn would mint a second shell window and orphan the first row's heap store)");
+        serial_println!("[render] REFUSE reason=already-armed (the seam is one-shot; a second spawn would mint a second shell window and orphan the first row's heap store)");
         return false;
     }
 
@@ -8701,7 +8701,7 @@ fn tegra_render_arm() -> bool {
     let info = {
         let fb = *unaos_kernel::video::WRITER.lock();
         if !fb.is_ready() {
-            serial_println!("[orinrender] REFUSE reason=no-panel (headless boot — JD1 seeded no scanout; the shell window's geometry and the present that paints it are both functions of panel geometry)");
+            serial_println!("[render] REFUSE reason=no-panel (headless boot — JD1 seeded no scanout; the shell window's geometry and the present that paints it are both functions of panel geometry)");
             return false;
         }
         fb.info()
@@ -8718,7 +8718,7 @@ fn tegra_render_arm() -> bool {
     // seams make. FAILS when the 48 MiB aarch64 heap cannot spare entry 0 at all.
     let staged = unaos_kernel::video::wm::reserve_stage(&info);
     if staged == 0 {
-        serial_println!("[orinrender] REFUSE reason=stage-unreserved panel={}x{} stage=0 (wm::reserve_stage got nothing for entry 0 — every present this pass drives would grow its buffer under SYS_WIN_PRESENT's IRQ mask, the F1-F5 shape)", pw, ph);
+        serial_println!("[render] REFUSE reason=stage-unreserved panel={}x{} stage=0 (wm::reserve_stage got nothing for entry 0 — every present this pass drives would grow its buffer under SYS_WIN_PRESENT's IRQ mask, the F1-F5 shape)", pw, ph);
         return false;
     }
 
@@ -8764,7 +8764,7 @@ fn tegra_render_arm() -> bool {
         RENDER_STACK_SIZE,
     );
     serial_println!(
-        "[orinrender] spawned tid={} cpu=0 pinned=1 discipline=cooperative -> RENDER-ARMED (the terminus dispatches it; a spawn only pushes to the run queue)",
+        "[render] spawned tid={} cpu=0 pinned=1 discipline=cooperative -> RENDER-ARMED (the terminus dispatches it; a spawn only pushes to the run queue)",
         tid
     );
     true
@@ -8822,7 +8822,7 @@ fn orin_render_service(_: usize) {
     if scene {
         unaos_kernel::video::retire_desktop_chrome(pw, ph);
     } else {
-        serial_println!("[orinrender] strip=kept reason=no-scene cascade={} bar={} routed={} (the strip retires only on the cascaded scene — bar enabled AND console routed; here the shell still owns the backdrop, the Pi's rule)", cfg!(feature = "deskcascade") as u8, unaos_kernel::video::menubar::enabled() as u8, unaos_kernel::video::fbcon::console_is_routed() as u8);
+        serial_println!("[render] strip=kept reason=no-scene cascade={} bar={} routed={} (the strip retires only on the cascaded scene — bar enabled AND console routed; here the shell still owns the backdrop, the Pi's rule)", cfg!(feature = "deskcascade") as u8, unaos_kernel::video::menubar::enabled() as u8, unaos_kernel::video::fbcon::console_is_routed() as u8);
     }
 
     // PAINTPULSE — no shell window is minted on this board any more (both arms below decline), so
@@ -8866,7 +8866,7 @@ fn orin_render_service(_: usize) {
             // can carry the feature and still have the route decline at its ordering rule.
             if unaos_kernel::video::fbcon::console_is_routed() {
                 shell_declined = true;
-                serial_println!("[orinrender] DECLINE reason=console-already-windowed (fbcon::console_is_routed()=true — orinconwin owns the live console in its own wm row, so a shell window here is a second contentless row stacked above the real one; the render PASS below is what this rung contributes on a routed board)");
+                serial_println!("[render] DECLINE reason=console-already-windowed (fbcon::console_is_routed()=true — orinconwin owns the live console in its own wm row, so a shell window here is a second contentless row stacked above the real one; the render PASS below is what this rung contributes on a routed board)");
             } else {
                 // PAINTPULSE — the knob-solo arm used to mint here, and the window it minted was EMPTY
                 // BY CONSTRUCTION: `open_shell_window`'s surface came back as `_surf_fb` and was
@@ -8880,7 +8880,7 @@ fn orin_render_service(_: usize) {
                 // not a shell, and a worse lie than the empty box. So: no painter, no mint, said so.
                 shell_declined = true;
                 serial_println!(
-                    "[orinrender] DECLINE reason=no-painter panel={}x{} (fbcon::console_is_routed()=false — the shell on this image is jd2_console_pump's console on the panel; this task owns no drainer for a windowed shell, so it mints no window it cannot paint; the strip pass below is what this rung contributes)",
+                    "[render] DECLINE reason=no-painter panel={}x{} (fbcon::console_is_routed()=false — the shell on this image is jd2_console_pump's console on the panel; this task owns no drainer for a windowed shell, so it mints no window it cannot paint; the strip pass below is what this rung contributes)",
                     pw, ph
                 );
             }
@@ -8909,7 +8909,7 @@ fn orin_render_service(_: usize) {
         // it is now the pass that OPENED the window — the deepest chain this task has), and after it
         // `tick` is the only source of `dirty`, which on the cascaded scene is never. An un-cascaded
         // board is unchanged: `tick`'s arming pass returns dirty on pass 1 anyway.
-        dirty |= passes == 1 || unaos_kernel::video::screen::present_owed(); // CURSORBG — the THIRD source of `dirty`, and the one the two above cannot cover: a present another task OWES this layer. `Screen::flush` is the only consumer in this subsystem of both deferred queues (`present_background` drains `PRESENT_RECTS` and swaps `FULL_PRESENT`) and the only caller of `wm::service_damage`, so a request enqueued by `wm::drain_deferred`, `crystal`/`winmenu::repaint_vacated`, `cursor::repair` or `strip::restore_vacated` reaches the glass only through a pass this predicate lets run. Without it this task's `dirty` is `passes == 1` plus `ui_status::tick`, and on the cascaded scene `tick` is masked out forever (ui_status.rs:1285) — render11 measured the consequence, `[orinrender] census passes=13998251 presents=1`. A peek, never a drain (see `screen::present_owed`), so the pass that follows still finds the queue to publish; and it is a pure function of two already-live statics, so an image whose queues nobody fills presents exactly as often as it did before. ⚠ FOLDED onto this line, never added below it — panic `Location`s.
+        dirty |= passes == 1 || unaos_kernel::video::screen::present_owed(); // CURSORBG — the THIRD source of `dirty`, and the one the two above cannot cover: a present another task OWES this layer. `Screen::flush` is the only consumer in this subsystem of both deferred queues (`present_background` drains `PRESENT_RECTS` and swaps `FULL_PRESENT`) and the only caller of `wm::service_damage`, so a request enqueued by `wm::drain_deferred`, `crystal`/`winmenu::repaint_vacated`, `cursor::repair` or `strip::restore_vacated` reaches the glass only through a pass this predicate lets run. Without it this task's `dirty` is `passes == 1` plus `ui_status::tick`, and on the cascaded scene `tick` is masked out forever (ui_status.rs:1285) — render11 measured the consequence, `[render] census passes=13998251 presents=1`. A peek, never a drain (see `screen::present_owed`), so the pass that follows still finds the queue to publish; and it is a pure function of two already-live statics, so an image whose queues nobody fills presents exactly as often as it did before. ⚠ FOLDED onto this line, never added below it — panic `Location`s.
         if dirty {
             pal.render();
             presents += 1;
@@ -8942,7 +8942,7 @@ fn orin_render_service(_: usize) {
         if unaos_kernel::arch::timer::cntpct().wrapping_sub(last_census) >= census_ticks {
             last_census = unaos_kernel::arch::timer::cntpct();
             serial_println!(
-                "[orinrender] census passes={} presents={} win={} declined={} strip={} pulsewin={} -> RENDER-LIVE",
+                "[render] census passes={} presents={} win={} declined={} strip={} pulsewin={} -> RENDER-LIVE",
                 passes, presents, shell_id, shell_declined as u8,
                 if unaos_kernel::video::desktop_scene_owns_backdrop() { "retired" } else { "live" },
                 unaos_kernel::video::pulsewin::win()
@@ -9416,7 +9416,7 @@ fn tegra_shell_present(
 // (`[dock] press … tile=2/3`). The opener was never missing and the cascade never skipped it:
 // `video/desktop_firmware.rs:394` `super::quarry::open()` is step 6 of `activate()`, `tegra_desk_cascade`
 // calls `activate()` unconditionally, and render6-boot2.log:421..485 shows that call running every
-// other step it has (`[pidesk] desktop-clear`, `activate console_win=1 routed=true`, `faces=`,
+// other step it has (`[deskfw] desktop-clear`, `activate console_win=1 routed=true`, `faces=`,
 // `menubar ENABLED`, `menubar PAINTED`, `crystal LIVE`, `pulse-window ARMED`). What was missing is the
 // FEATURE: step 6 sits behind `#[cfg(feature = "quarry")]`, render6's banner reads
 // `…,orinrender,desktop_firmware,orinrx,tcuprobe,deskcascade` with no `quarry` term, and with the knob

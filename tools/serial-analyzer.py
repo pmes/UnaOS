@@ -281,7 +281,7 @@ WITNESS_FAMILIES = [
     _f('V3D',             'aarch64', r'^\s*::\s*(?:V3D:|\[v3d\d+)'),
     _f('PI-GENET',        'aarch64', r'^\s*::\s*PI-GENET:'),
     # not Pi-only: the rMBP capture also emits ':: PIUSB: [usbw] ... ::'
-    _f('PIUSB',           'any',     r'^\s*::\s*(?:PIUSB|piusb\d+):|\[piusb\d+\]'),
+    _f('PIUSB',           'any',     r'^\s*::\s*(?:PIUSB|piusb\d+):|\[usb\d+\]'),
     _f('SCHED',           'aarch64', r'^\s*::\s*SCHED(?:-LOAD)?:|\[sched\d+\]'
                                      r'|^\s*::\s*INPUT on core\b'),
     _f('AARCH64',         'aarch64', r'^\s*(?:::\s*)?AARCH64\b'),

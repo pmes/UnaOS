@@ -1991,8 +1991,8 @@ OPTIONAL KEY ('.'|0x[0-9a-f]{2}) ::
 #                                          is the trap and `FROZEN` is the fresh half
 #   `path=jd2-console-pump`       0 hits   NEW with the fold
 #   `path=jd2-supstate-phase2`    0 hits   NEW with the fold
-#   `[orinfurn] arm`              0 hits   never flown on this bench
-#   `[orinstkdepth]` (both arms)  0 hits   NEW with the fold, never flown
+#   `[deskfurn] arm`              0 hits   never flown on this bench
+#   `[stkdepth]` (both arms)  0 hits   NEW with the fold, never flown
 #   `RAST-PAINTED-OVERWRITTEN`    0 hits   NOT NEW — the verdict string predates the fold
 #                                          (display_tegra.rs); what the fold changed is
 #                                          that a supstate boot can now reach the CORRECT
@@ -2142,12 +2142,12 @@ OPTIONAL path=jd2-supstate-phase2;
 # --- INSTRUMENT 3: ORIN-STKDEPTH — the boot-core stack DEPTH at the furniture seam ------
 # ARMED BY `orinfurn` (UNAOS_ORINFURN=1, arroyo:1245, default OFF; implies
 # `desktop_firmware` + `orinclick` -> `tegra_el0` -> `tegra`). NEVER FLOWN ON THIS BENCH:
-# `[orinfurn]` and `[orinstkdepth]` both take ZERO hits across the whole capture tree, so
+# `[deskfurn]` and `[stkdepth]` both take ZERO hits across the whole capture tree, so
 # every row here is a prediction read out of the source, not a transcription off a wire.
 #
 # THE ROW THAT COULD FAIL, AND WHY ITS ARMING IS NOT AN ARGUMENT BUT A `#[cfg]` IDENTITY.
 # The two SP reads share ONE gate: the anchor `tegra_stk_anchor()` on `kernel_main`'s
-# `bootpace::record("entry")` line (main.rs:88) and the seam read beside `[orinfurn] arm`
+# `bootpace::record("entry")` line (main.rs:88) and the seam read beside `[deskfurn] arm`
 # (main.rs:7896) are both `#[cfg(all(target_arch = "aarch64", feature = "orinfurn"))]`.
 # So there is NO image in which the reader is compiled and the anchor is not — the
 # instrument cannot come up short on CONFIGURATION, which is the objection that keeps
@@ -2168,7 +2168,7 @@ OPTIONAL path=jd2-supstate-phase2;
 #                               instrument is telling the truth — and the right response
 #                               is to retire the row, because the DEPTH number it guards
 #                               would have become meaningless at the same moment.
-# CANNOT FALSE-RED AN UNARMED BOOT: the `[orinstkdepth]` tag is absent from every image
+# CANNOT FALSE-RED AN UNARMED BOOT: the `[stkdepth]` tag is absent from every image
 # without `orinfurn`. Read as a pair with the PENDINGs, same three-way as instrument 1:
 #   arm ⏳                        unarmed or the seam was never reached. NOT SCORED.
 #   arm ✅ + depth-consumed ✅    the depth was taken. The pass.
@@ -2183,20 +2183,20 @@ OPTIONAL path=jd2-supstate-phase2;
 # inventing one. NOTHING HERE CLEARS §5.2 — it clears the half that is takeable and names
 # the half that is not, which is the opposite of clearing a stop-line by argument.
 #
-# THE ARMING LINE, PENDING on the gate-line shape: `[orinfurn] arm` is printed before
+# THE ARMING LINE, PENDING on the gate-line shape: `[deskfurn] arm` is printed before
 # anything in the seam can decline, so on an armed image ANY reached seam prints it. This
 # row exists to tell "the instrument did not fire" from "the instrument was not armed" —
 # it is NOT a rule and can never fail, which is the whole grammar limit this block works
 # inside. Pattern stops before the `(ORIN-DESKFURN …)` prose: that tail carries a `§` and
 # an em dash, and this file never puts a multi-byte character inside a UARTC pattern.
-PENDING \[orinfurn\] arm click=[0-9]+ conwin=[0-9]+ desk=[0-9]+
+PENDING \[deskfurn\] arm click=[0-9]+ conwin=[0-9]+ desk=[0-9]+
 # THE HEALTHY ARM. Pattern STOPS AT `bytes` and deliberately never reaches `anchor-sp=` /
 # `seam-sp=`: `arch_arm64.md:6263` (§ORIN-RAS-ADDR) forbids keying any row on an ADDR
 # value, and while these two are stack pointers rather than RAS sinks the rule is written
 # as a rule and this file does not carve exceptions into it. The DEPTH is the measurement;
 # the addresses are context for a human reading the quoted line.
-PENDING \[orinstkdepth\] depth-consumed=[0-9]+ bytes
-FORBID \[orinstkdepth\] DEPTH-UNAVAILABLE
+PENDING \[stkdepth\] depth-consumed=[0-9]+ bytes
+FORBID \[stkdepth\] DEPTH-UNAVAILABLE
 
 # --- INSTRUMENT 4: ORIN-RASTGLASS — the latch that stopped indicting healthy boots ------
 # ARMED BY `rast` (UNAOS_RAST=1, arroyo:257; `rast` alone gates the census and does NOT

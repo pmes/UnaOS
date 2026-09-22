@@ -2867,11 +2867,11 @@ whose owner was being torn down. The boot-8 wire refuses it outright, and does s
 * `[wheel1]` — the wheel census, edge-triggered on `decoded + routed + nofocus` — **never printed**,
   in boot 8 or anywhere else in `pi4-pi1-b1/ttyACM0.log`. Not one wheel byte was decoded, routed, or
   dropped for want of focus.
-* `[piusb26]` — the xHCI pump's cost line, rate-limited to one print per 5 s — printed **exactly
+* `[usb26]` — the xHCI pump's cost line, rate-limited to one print per 5 s — printed **exactly
   once** in boot 8, at byte 6501 of the boot, and never again. `usb-pump` is spawned on `input_cpu`,
   the same core the wedge took: the pump made one pass and died with the core. After that instant no
   HID report of any kind — motion, button or wheel — was pumped at all.
-* No `[piusb24]`, no `[el0in]`, no `[cursor] armed`, no `[vugzoom]`. Every `[clickroute]`, `[wm-act]`
+* No `[usb24]`, no `[el0in]`, no `[cursor] armed`, no `[vugzoom]`. Every `[clickroute]`, `[wm-act]`
   and `[drag]` line in the freeze window carries `settle=noproc-selftest` or `dragperf`: synthetic
   fixture events, not hardware.
 

@@ -690,7 +690,7 @@ boot 10's four symptoms are four projections of one fault:
 |---|---|
 | `[click2] depth gui_chan=65 (sent=66 recv=1)`, `recv` frozen at 1 from the drop on | the only consumer is dead |
 | no `[shellwin-pi]` line at all | the only site that mints the shell window is dead |
-| no `[pulsewin] open` line at all | `[pidesk] pulse-window ARMED` is the cascade *announcing* the arm; the render pass is what *opens* it |
+| no `[pulsewin] open` line at all | `[deskfw] pulse-window ARMED` is the cascade *announcing* the arm; the render pass is what *opens* it |
 | RX interrupt live on injected bytes, no shell answer on the wire | bytes reach `shell_inbox` and sit there unconsumed |
 
 **THE FIX.** `sched::spawn_prio_stack` — the `spawn_stack` × `spawn_prio` cross, which did not exist
@@ -1445,7 +1445,7 @@ statements of intent (`ITEM_H == 24`) had to be rewritten as the invariants they
 
 ### 6.8d Witness, and one observation for the integrator
 
-`[pidesk] faces=title:…,menu:…,crystal:…,dock:…,console:… chrome=WxH body=WxH bar=H ::` — every term
+`[deskfw] faces=title:…,menu:…,crystal:…,dock:…,console:… chrome=WxH body=WxH bar=H ::` — every term
 read from the surface's own metric, so a boot that regressed a surface to the bitmap says so on the
 serial with nobody looking at the glass.
 
@@ -1528,7 +1528,7 @@ and now the only cause left rather than one of two.
 > one, but "pacing lane" is the wrong home for it. A 5×5 interleaved A/B showed `UNAOS_LIVECON=1` — the
 > arc that took the console's presents off print context, i.e. precisely the pacing fix — leaves the
 > `win=1` verdicts untouched (13 exceptional samples of 20 against 14 of 20). It could not have helped:
-> `wcg::SAMPLES` is 4 and all four are spent *before* `[pidesk] livecon ARMED`. The live interval is
+> `wcg::SAMPLES` is 4 and all four are spent *before* `[deskfw] livecon ARMED`. The live interval is
 > the boot seam `[console-route first-paint, detach)`, where `_print` writes the window's SOURCE
 > surface without the lock `draw_window` would need to hold. **Not closed by LIVECON.** See §6.14.
 
@@ -1871,7 +1871,7 @@ the same reason, is **one call site** from the same fix whenever that arc wants 
   ```
   [wc-x] console-window win=1 panel=1920x1200 surf=1295x736 box=1305x780 at (307,158) cell=7x16 cols=185 rows=46
   [wc-x] console-route first-paint win=1 (glyphs -> window surface, damage-limited)
-  [pidesk] livecon ARMED console_win=1 (presents deferred off print context; …the handoff SKIPS the detach and the window stays LIVE)
+  [deskfw] livecon ARMED console_win=1 (presents deferred off print context; …the handoff SKIPS the detach and the window stays LIVE)
   [wc-x] livecon census presents=8 ran=13 held=18 busy=26 idle=0 (the console window presented 8 times FROM THE RENDER SERVICE after the GUI handoff — a frozen snapshot presents none and prints no such line)
   ```
 
@@ -2135,7 +2135,7 @@ downstream consequence, not an independent fault.
 #### The A/B — five control runs and five armed, interleaved on one host
 
 `UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 150`, ± `UNAOS_LIVECON=1`, at
-`5d7ff0c8`. Every armed run carries `[pidesk] livecon ARMED` and a `[wc-x] livecon census` line, so the
+`5d7ff0c8`. Every armed run carries `[deskfw] livecon ARMED` and a `[wc-x] livecon census` line, so the
 knob is doing its job in all five.
 
 | Run | `win=1` samples | CLEAN | COHER | RACE-BLIT | RACE-PRESENT | BLIT | exceptional |
@@ -2160,7 +2160,7 @@ single exceptional `[wc-g]` sample in any of the ten runs.
 #### Why it could not have worked — the instrument is spent before the knob arms
 
 `wcg::SAMPLES` is **4**, and the console window's four presents are consumed inside a ~30-line stretch
-of the boot. In all five armed runs the LAST `win=1` sample precedes `[pidesk] livecon ARMED` by 4–11
+of the boot. In all five armed runs the LAST `win=1` sample precedes `[deskfw] livecon ARMED` by 4–11
 lines:
 
 | run | `console-route first-paint` | last `win=1` sample | `livecon ARMED` |

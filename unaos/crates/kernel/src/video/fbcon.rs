@@ -1459,7 +1459,7 @@ impl PanelSink {
                 //
                 // So the tail is legitimately lost, and — like every other loss in this arc — it is
                 // counted and announced rather than left to look like a short line.
-                crate::serial_ring::TAP_FBCON.tear(); defer_note_tear(); // ORIN-DEFER — charge the mid-line tear to this arc's OWN ledger as well as the tap's, so the `[orindefer] census` can report it beside the split/classic split it is drawn from. No-op (an `#[inline(always)]` empty fn) knob-off and on x86. ⚠ SAME-LINE fold.
+                crate::serial_ring::TAP_FBCON.tear(); defer_note_tear(); // ORIN-DEFER — charge the mid-line tear to this arc's OWN ledger as well as the tap's, so the `[condefer] census` can report it beside the split/classic split it is drawn from. No-op (an `#[inline(always)]` empty fn) knob-off and on x86. ⚠ SAME-LINE fold.
                 PANEL_UNANNOUNCED.fetch_add(1, Ordering::Relaxed);
             }
             return;
@@ -2646,12 +2646,12 @@ impl FbCon {
 /// console state is re-taken after the arm and the fields are read out of it — and the verdict
 /// crosses that readback against `video::font`'s own constants:
 ///
-///   * `[orinface] ARMED …` — read back `aa=1` and the cell equal to `font::CELL_W`x`CELL_H`.
-///   * `[orinface] MISMATCH …` — the arm returned a cell but the readback disagrees with it or with
+///   * `[conface] ARMED …` — read back `aa=1` and the cell equal to `font::CELL_W`x`CELL_H`.
+///   * `[conface] MISMATCH …` — the arm returned a cell but the readback disagrees with it or with
 ///     the face. This is the state that used to be indistinguishable from a pass.
-///   * `[orinface] DECLINE reason=console-not-ready …` — `panel_console_face_arm` answered `None`
+///   * `[conface] DECLINE reason=console-not-ready …` — `panel_console_face_arm` answered `None`
 ///     (`!c.ready`, or `FBCON` contended). The console keeps font8x8; the boot is otherwise unchanged.
-///   * `[orinface] DECLINE reason=readback-contended …` — the arm reported a cell but the lock could
+///   * `[conface] DECLINE reason=readback-contended …` — the arm reported a cell but the lock could
 ///     not be retaken to prove it. Reported as a decline, never as a pass.
 ///
 /// One line per call, on every polarity, so a silent decline can never look like "never ran".
@@ -2681,14 +2681,14 @@ pub fn orin_face_arm() {
     let want = (crate::video::font::CELL_W, crate::video::font::CELL_H);
     match (asked, seen) {
         (None, _) => serial_println!(
-            "[orinface] DECLINE reason=console-not-ready runs={} armed={} want={}x{} (panel_console_face_arm answered None — the console was not ready or FBCON was contended; the console keeps font8x8 at scale 1 and nothing else about this boot changes)",
+            "[conface] DECLINE reason=console-not-ready runs={} armed={} want={}x{} (panel_console_face_arm answered None — the console was not ready or FBCON was contended; the console keeps font8x8 at scale 1 and nothing else about this boot changes)",
             runs,
             ORINFACE_ARMED.load(Ordering::Relaxed),
             want.0,
             want.1
         ),
         (Some((aw, ah)), None) => serial_println!(
-            "[orinface] DECLINE reason=readback-contended runs={} armed={} asked={}x{} want={}x{} (the arm reported a cell but FBCON could not be retaken to prove it — reported as a decline, never as a pass)",
+            "[conface] DECLINE reason=readback-contended runs={} armed={} asked={}x{} want={}x{} (the arm reported a cell but FBCON could not be retaken to prove it — reported as a decline, never as a pass)",
             runs,
             ORINFACE_ARMED.load(Ordering::Relaxed),
             aw,
@@ -2700,12 +2700,12 @@ pub fn orin_face_arm() {
             if aa && cw == want.0 && ch == want.1 && (cw, ch) == (aw, ah) {
                 let armed = ORINFACE_ARMED.fetch_add(1, Ordering::Relaxed) + 1;
                 serial_println!(
-                    "[orinface] ARMED runs={} armed={} panel={}x{} cell={}x{} grid={}x{} aa=1 face=noto16-aa (READ BACK from the console after the arm, not asserted from the call: the aarch64 counterpart of x86's panel_console_resume now runs on an ordinary Orin boot, at fbcon::init, with no desktop and no compositor window involved) -> ARMED",
+                    "[conface] ARMED runs={} armed={} panel={}x{} cell={}x{} grid={}x{} aa=1 face=noto16-aa (READ BACK from the console after the arm, not asserted from the call: the aarch64 counterpart of x86's panel_console_resume now runs on an ordinary Orin boot, at fbcon::init, with no desktop and no compositor window involved) -> ARMED",
                     runs, armed, pw, ph, cw, ch, cols, rows
                 );
             } else {
                 serial_println!(
-                    "[orinface] MISMATCH runs={} armed={} panel={}x{} asked={}x{} readback={}x{} aa={} grid={}x{} want={}x{} (the arm returned but the console does not hold the face — this is the state that used to be indistinguishable from a pass) -> MISMATCH",
+                    "[conface] MISMATCH runs={} armed={} panel={}x{} asked={}x{} readback={}x{} aa={} grid={}x{} want={}x{} (the arm returned but the console does not hold the face — this is the state that used to be indistinguishable from a pass) -> MISMATCH",
                     runs,
                     ORINFACE_ARMED.load(Ordering::Relaxed),
                     pw, ph, aw, ah, cw, ch, aa as u8, cols, rows, want.0, want.1
@@ -2826,7 +2826,7 @@ fn defer_note_seen() {
         "CLASSIC-ONLY"
     };
     serial_println!(
-        "[orindefer] census seen={} split={} empty={} classic={} tear={} unaccounted={} chunk={} -> {} (DEFERRED means aarch64 console lines were laid out under the interrupt mask and PAINTED OUTSIDE it, which is x86's PANEL-DEFER shape reached on this arch; CLASSIC-ONLY means the route was armed and reached and never once taken — the compiled-but-unreachable polarity this arc exists to make speakable)",
+        "[condefer] census seen={} split={} empty={} classic={} tear={} unaccounted={} chunk={} -> {} (DEFERRED means aarch64 console lines were laid out under the interrupt mask and PAINTED OUTSIDE it, which is x86's PANEL-DEFER shape reached on this arch; CLASSIC-ONLY means the route was armed and reached and never once taken — the compiled-but-unreachable polarity this arc exists to make speakable)",
         n,
         split,
         empty,
@@ -2914,7 +2914,7 @@ fn defer_note_tear() {}
 ///
 /// The cascaded desktop's first and largest window — `console`, 1305x780 at (307,158),
 /// `[wc-x] console-window win=1 … cols=185 rows=46` — is a scrolling kernel log for the life of the
-/// boot: `[orinrender] census …`, `[serialrx] rx=…`, `[tcu] rx-mbox …`, `[pulse5] live …`,
+/// boot: `[render] census …`, `[serialrx] rx=…`, `[tcu] rx-mbox …`, `[pulse5] live …`,
 /// `[wc-h] rollup …`, one line per second per instrument. A user boots to a desktop and the biggest
 /// thing on it is a debug log.
 ///

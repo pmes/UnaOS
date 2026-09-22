@@ -183,7 +183,7 @@ Every path prints exactly one line; there is no silent failure.
 [facet] press close win=3 at (x,y)
 [facet] closed win=3 paints=1
 [quarry] open VIEW path=… -> facet (latched for the render pass)
-[pidesk] facet ARMED — …
+[deskfw] facet ARMED — …
 ```
 
 `reason=` tokens are stable, lower-case and hyphenated, so a spec or an `awk` can match on them.

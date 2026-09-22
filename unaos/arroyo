@@ -1695,7 +1695,7 @@ _p5_metal=""; case "${1:-}" in esp-jetson|esp_jetson|jetson|esp-jetson-img|esp_j
 # and a knob mapping cannot be un-set by an operator). The knob exists for the OTHER two boards and
 # for `UNAOS_FACET=1 ./arroyo check`, which type-checks the viewer alone.
 #
-# Arming proof is not the banner: `[pidesk] facet ARMED` is printed by `desktop_firmware::activate`
+# Arming proof is not the banner: `[deskfw] facet ARMED` is printed by `desktop_firmware::activate`
 # inside the built image, and `strings -a target/aarch64_esp/kernel.elf | grep -c '\[facet\]'` is the
 # artifact-side check the full-knob-gate law asks for.
 [ -n "${UNAOS_FACET:-}" ] && _feats="${_feats}facet,"
@@ -1996,8 +1996,8 @@ _p5_metal=""; case "${1:-}" in esp-jetson|esp_jetson|jetson|esp-jetson-img|esp_j
 # file (file-tail block; the call site is appended to an existing line), and the jetson image is
 # byte-identical to baseline. The ARMED polarity is type-checked by the `arm-tegra-furn` leg of
 # KERNEL_CFG_MATRIX, never by this mapping. UNFLOWN — no Orin has booted it.
-# Witness on the wire: `[orinfurn] arm`, `[orinfurn] floors`, `[orinfurn] ARMED`, `[orinfurn] REFUSE`,
-# `[orinfurn] crystal LIVE`. See docs/dev/OS/08_VIDEO/orin-desktop.md §3.12.
+# Witness on the wire: `[deskfurn] arm`, `[deskfurn] floors`, `[deskfurn] ARMED`, `[deskfurn] REFUSE`,
+# `[deskfurn] crystal LIVE`. See docs/dev/OS/08_VIDEO/orin-desktop.md §3.12.
 [ -n "${UNAOS_ORINFURN:-}" ] && _feats="${_feats}orinfurn,desktop_firmware,orinclick,tegra_el0,tegra,"
 # ORINRENDER: UNAOS_ORINRENDER=1 gives the Orin a RENDER PASS — `main.rs::tegra_render_arm` on the
 # tegra terminus line, which arms `desktop_firmware`'s latch (false for the whole Orin boot until
@@ -2108,8 +2108,8 @@ _p5_metal=""; case "${1:-}" in esp-jetson|esp_jetson|jetson|esp-jetson-img|esp_j
 # that HAS NEVER EXISTED — no row of the matrix carries that label. The coverage itself was real, on
 # the two rows now named; an auditor grepping for the label found nothing and would have recorded a
 # hole that is not there).
-# UNFLOWN — no Orin has booted it. Witness on the wire: `[orinface] ARMED`, `[orinface] DECLINE`,
-# `[orinface] MISMATCH`.
+# UNFLOWN — no Orin has booted it. Witness on the wire: `[conface] ARMED`, `[conface] DECLINE`,
+# `[conface] MISMATCH`.
 [ -n "${UNAOS_ORINFACE:-}" ] && _feats="${_feats}orinface,"
 # ORIN-DEFER (FBCONPAR item 2): UNAOS_ORINDEFER=1 arms `orindefer` — x86's PANEL-DEFER split
 # layout/paint route, ported to the aarch64 console.
@@ -2141,7 +2141,7 @@ _p5_metal=""; case "${1:-}" in esp-jetson|esp_jetson|jetson|esp-jetson-img|esp_j
 # type-checked by the `arm-tegra-fbconpar` and `arm-tegra-fbconpar-cross` legs of KERNEL_CFG_MATRIX,
 # never by this mapping (⚠ CORRECTED 2026-08-28, orin 10: this line named `arm-tegra-orindefer`, a
 # leg that HAS NEVER EXISTED — the `arm-tegra-orinface` error one block above, repeated).
-# UNFLOWN — no Orin has booted it. Witness on the wire: `[orindefer] census … -> DEFERRED` /
+# UNFLOWN — no Orin has booted it. Witness on the wire: `[condefer] census … -> DEFERRED` /
 # `-> CLASSIC-ONLY` / `-> LEDGER-MISMATCH`.
 [ -n "${UNAOS_ORINDEFER:-}" ] && _feats="${_feats}orindefer,"
 # JB11-ESCAPE: UNAOS_NOJB11=1 suppresses the Falcon firmware-header census

@@ -13621,7 +13621,7 @@ link did not exist. Evidence, static and behavioural:
   desktop-miss — and no chrome arm. `arch/aarch64/syscall.rs` contained the substring `drag` zero
   times.
 * The bench capture `pa38-freeze.log` (1920x1200, PIDESK, witness live — 478 `[comp2]` rollups) holds
-  **83** `[piusb24]` pointer lines and **zero** `[drag]` lines; the only `[wm-act]` verb in the whole
+  **83** `[usb24]` pointer lines and **zero** `[drag]` lines; the only `[wm-act]` verb in the whole
   capture is `park`.
 
 So a title-bar press raised and focused the window and delivered the press to the app. The window
@@ -13862,7 +13862,7 @@ Not sound here, and the gate surface proved it rather than the argument. The fir
 `UNAOS_PIDESK=1 ./arroyo kernel8-test` run of this arc printed
 
 ```
-[pidesk] activate DECLINE reason=dock-cannot-host-full-strip panel=640x480 rows=12
+[deskfw] activate DECLINE reason=dock-cannot-host-full-strip panel=640x480 rows=12
 ```
 
 and stopped — QEMU raspi4b's 640x480 cannot host a twelve-tile dock. The menu bar half of the arc
@@ -14009,8 +14009,8 @@ And the bar and the console on the bench panel path:
        cell=8x8 cols=162 rows=92
 [wc-x] console-route first-paint win=1 (glyphs -> window surface, damage-limited)
 [wc-x] console-window panic-fallback armed win=1 (panic paints the PANEL, not the window)
-[pidesk] menubar ENABLED panel=1920x1200 rect=Some((0, 0, 1920, 34)) was=false
-[pidesk] menubar PAINTED (composite at the enable seam)
+[deskfw] menubar ENABLED panel=1920x1200 rect=Some((0, 0, 1920, 34)) was=false
+[deskfw] menubar PAINTED (composite at the enable seam)
 [menubar] live passes=412 paints=22 rate=53/1k scan=389cyc/6us paint=40618cyc/649us
           px/paint=65280 press=inert crystal=16x22 toggles=1 off_passes=1
 ```
@@ -14185,7 +14185,7 @@ nine minutes), `[sched6] composites=0/s`, and `[cursor3] planned=571 offers=568 
 however many reports arrive — "the mouse does not respond" is downstream of the compositor here, not
 of the event queue.
 
-The pinned core is attributable too, and it is not this arc's spin. `[piusb26] pump pass` reads
+The pinned core is attributable too, and it is not this arc's spin. `[usb26] pump pass` reads
 **1498784103 / 1972189353 / 1060628143 / 1348032519 cycles** at the four points where
 `SCHED ... c3=99%` appears — against a normal pass of 119..134 cycles. That is the xHCI BOT storage
 pump (`pump=spin+hlt`) burning ~1 s per pass while a wedged card reader was retried
@@ -14259,14 +14259,14 @@ the load-bearing reason, stated at the call site.
 | `./arroyo check` | x86_64 OK, aarch64 OK, 12/12 cfg-coverage legs, userspace both arches |
 | `UNAOS_WC=1 ./arroyo check` | same, all green |
 | `UNAOS_PIDESK=1 ./arroyo kernel8-test 210` | MBENCH **PASS 108/108**, 0 forbidden |
-| knob-off `./arroyo kernel8-test 210` | MBENCH **PASS 108/108**, 0 forbidden; zero `[pidesk]` lines |
+| knob-off `./arroyo kernel8-test 210` | MBENCH **PASS 108/108**, 0 forbidden; zero `[deskfw]` lines |
 | `UNAOS_PIDESK=1 UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test 210` | the witness flip, below |
 
 **The flip, at bench geometry, same command before and after:**
 
 ```
 before: [chrome-truth] pt=desktop at=(1918,1198) want=0x2d2b55 got=0x1e1e1e -> NOCLEAR
-after:  [pidesk] desktop-clear panel=1920x1200 bg=002D2B55 (pre-desktop residue off the glass; …)
+after:  [deskfw] desktop-clear panel=1920x1200 bg=002D2B55 (pre-desktop residue off the glass; …)
         [chrome-truth] pt=desktop at=(1918,1198) want=0x2d2b55 got=0x2d2b55 -> HIT
 ```
 
@@ -18804,7 +18804,7 @@ of the whole pass are still literally identical across Pi and x86 — the surfac
    `jd2_console_pump` owns `pal::EVENT_QUEUE`. *The design's second axis, still true.*
 3. **The census.** Three clocks, three wire families, and — the part a constant cannot reach — three
    STORAGE classes: `[sched6]` reads four task-local accumulators, `[schedx86]` reads shared statics
-   precisely so a re-homed twin continues a dead instance's numbers, and `[orinrender]` rate-limits
+   precisely so a re-homed twin continues a dead instance's numbers, and `[render]` rate-limits
    on CNTPCT because a pass count is not a rate limit on a busy-poll loop. *Lifted in M1 as a hook.*
 4. **Where input is ROUTED.** x86 routes at the CONSUMER (`wc_route_event` at the head of the drain,
    `wc_route_tail(raw)` after the arms); the Pi routes at the PRODUCER (`pump_usb_into_gui` consults

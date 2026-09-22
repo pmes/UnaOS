@@ -651,7 +651,7 @@ a headless capture settles all four without a photograph:
 [quarry] press close win=<id> at (<x>,<y>)
 [quarry] closed win=<id> paints=<n>
 [dock]   press at (<x>,<y>) tile=<t>/<n> quarry=pin -> open requested
-[pidesk] quarry open=<bool> — the file manager is a desktop tenant
+[deskfw] quarry open=<bool> — the file manager is a desktop tenant
 ```
 
 ---
@@ -1127,7 +1127,7 @@ and the chain has no missing link:
 
 So the absence on late boot5 is one of exactly two honest refusals, and the wire distinguishes them:
 
-* **step 1 never happened** — the wire showed no enumeration lines at all (no `[piusb25]`, no
+* **step 1 never happened** — the wire showed no enumeration lines at all (no `[usb25]`, no
   `BOT: PARKED`), so no geometry was ever published and there was nothing to mount. This is the
   xHCI/BOT bring-up's business, an off-limits seam for this arc, and it is reported rather than
   touched.

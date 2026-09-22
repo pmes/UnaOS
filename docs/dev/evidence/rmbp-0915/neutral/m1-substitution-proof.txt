@@ -1,0 +1,12 @@
+NEUTRAL M1 — proof that the RENAME diff is a PURE TOKEN SUBSTITUTION
+base 4d8d047d, branch exec-rmbp-neutral, generated 2026-09-22T20:51:45Z
+
+Method: for every changed line pair (-,+), apply the M1 substitution table (plain AND
+regex-escaped spellings) to the OLD line and require equality with the NEW line. One
+unexplained line means the batch moved something other than a token.
+
+POPULATION = the 22 files the rename edits. The four files this arc AUTHORS new prose
+into are excluded BY NAME and are not substitutions: docs/dev/LEDGER.md docs/dev/OS/rmbp-ledger.md docs/dev/OS/rmbp-queue.md docs/dev/evidence/orin14/NEUTRAL-TABLE.md
+
+  changed lines: -273 / +273  (insertions == deletions)
+  lines NOT explained by the substitution table: 0
