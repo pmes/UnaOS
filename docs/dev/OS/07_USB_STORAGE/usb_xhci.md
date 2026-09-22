@@ -9469,6 +9469,165 @@ witnesses are `:: STORSLOT: claim slot=N ix=M devices=K ::` per device, two
 `:: USBREG: publish … ix=0 …` / `ix=1 …` lines with `disks=2`, and two `:: volid: mount` families with
 `/` still bound by content (`:: X86BIND: … by=content … -> PASS`).
 
+## 39. TRACKPAD — the stream was never capped, the mode SET was never delivered, and flight 11's "four reports then silence" was a dump limit (B139, 2026-09-22)
+
+**THE COMPLAINT.** Peter, flight 11 (2026-09-22): *"mouse not fluid, jumping around, sticky"*. PTRLAG
+(rmbp-ledger B134) took the install path and found two mechanisms there. This section takes the other
+end of the same wire: what the internal trackpad — 05ac:0262 at `addr=8`, interface 1, the vendor
+multitouch interface on `ep=IN1` — actually put on it.
+
+### 39.1 What flight 11 measured, and the three readings that were wrong
+
+The whole record of that endpoint's stream, as it appears if you grep for the word the arming line
+uses, is four lines and then nothing for the remaining ~880 s of a 995 s sitting:
+
+```
+[ 28063ms] vendor-multitouch raw report #1 (2 B): 60 02
+[112433ms] vendor-multitouch raw report #2 (8 B): 02 00 f9 00 00 00 fb 00
+[112445ms] vendor-multitouch raw report #3 (8 B): 02 00 fa 00 00 00 fc 00
+[112451ms] vendor-multitouch raw report #4 (8 B): 02 00 f9 00 00 00 fb 00
+```
+
+Read alone that is an endpoint which spoke four times and died. **It is not, and the same log says
+so three times over.**
+
+1. **FOUR IS THE DUMP'S CAP, NOT THE STREAM'S LENGTH.** `dump_vendor_report` is called under
+   `if e.reports <= 4`, inside a `#[cfg(feature = "usbdebug")]` block. The endpoint's own rollup,
+   which is not capped, ends the boot at
+   `[993836ms] EHCIDARK addr=8 ep=IN1 kind=vendor-mt reports=5706 cad=1ms windows=2262 dark=13646ms max=108ms missed<=11384`
+   — **5,706 reports delivered**, across 34 rollup lines. The receive path was continuous the whole
+   time. Nothing needed to be un-capped.
+2. **THE TRACKPAD WAS THE ONLY POINTER ON THAT BOOT.** The theory that "whatever moved Peter's
+   pointer was the boot-mouse at `addr=6`" is refused by that device's own witness:
+   `addr=6 … kind=boot-mouse … class=never-completed … reports=0 … dead=1`, retired at 28,063 ms with
+   `RETIRE-CONSEQUENCE addr=6 ep=IN1 role=pointer is out for the rest of this boot — pointer input
+   rides addr=8 ep=IN1 only`. It delivered zero reports, ever. `[ptrinstall] installs=4873
+   reports=4873` and the 87 `trackpad click`/`trackpad release` lines are the trackpad's, and only
+   the trackpad's.
+3. **SO "STICKY" IS ON THIS WIRE TOO.** `missed<=11384` against `reports=5706` is an upper bound on
+   reports dropped **on the wire** — the endpoint holds exactly one report and is dark from the
+   instant it retires until a service pass rewrites the overlay (see the `EHCIDARK` block comment in
+   `drivers/ehci/mod.rs`). Two thirds of the hand's motion never reached memory at all, with single
+   dark windows up to 108 ms. That is a second, independent producer of the same complaint PTRLAG
+   measured at the consumer.
+
+### 39.2 Why nothing named the report id — and the instrument that now does
+
+The stream in those captured bytes is **Report ID 0x02**, not the 0x44 the descriptor declares. The
+one line that would have said so on a default build — `trackpad format witness`, printed at
+`e.reports == 1` — is **absent from the whole of flight 11**, and the reason is exact: report #1 was
+the two-byte runt `60 02`, which fails `decode_trackpad_rel`'s length and id gates, so the one-shot
+fired on a report that decoded to nothing and never fired again. *An instrument whose single sample
+can be consumed by a runt is an instrument about the runt.*
+
+The replacement is a histogram that no single report can exhaust, charged **before** any decode,
+length gate or id gate, and printed on `EHCIDARK`'s existing rollup cadence (and only when it has
+moved):
+
+```
+[tp] ids=02:<n>,44:<n>,other:<n> sizes=<min>/<max> first_bytes=02[…] 44[…] other[…]
+```
+
+Three counters, the observed length range, and the first 16 bytes of the first report of each class.
+Fixed-size and allocation-free throughout, which is what lets it run on the default build where
+`dump_vendor_report`'s per-report `String` deliberately cannot. **Flight 12 tells "the switch latched
+and the stream became 0x44 frames" from "the stream stayed 0x02" by reading one line**, with no
+hypothesis in the path.
+
+### 39.3 The mode SET was not well-formed, and the defect is one field wide
+
+Flight 11's handshake:
+
+```
+[25625ms] M1 bcm5974 GET_REPORT(feature) addr=8 intf=1 got=8b byte0=0x08
+[25625ms] M1 bcm5974 SET_REPORT(feature) addr=8 intf=1 mode=0x01 — multitouch stream requested
+```
+
+**USB HID Class Definition 1.11 §7.2.1 (Get_Report) and §7.2.2 (Set_Report)** define the same three
+fields for both requests: `wValue` = Report Type in the high byte and Report ID in the low byte,
+**`wIndex` = Interface**, `wLength` = report length, and the DATA stage carries the whole report.
+This driver sent `wIndex = 0` — the constant `BCM5974_MODE_REQ_INDEX`, whose own comment said "NOT
+the intf number" — while the vendor-multitouch report descriptor that declares this Feature report is
+on **interface 1**. A class request with an INTERFACE recipient is routed by `wIndex`, so the SET was
+delivered to interface 0, the boot keyboard, and the vendor interface was never addressed at all.
+
+The flight-11 GET is not evidence against this. It returned eight bytes with `byte0=0x08` from
+`wIndex=0`, which proves that interface 0 answered an 8-byte Feature report — not that interface 0
+owns the mode byte.
+
+What the request already had RIGHT, and which is unchanged:
+
+* `wValue = 0x0300` is Report Type 3 (Feature) with Report ID 0, and the Report ID low byte is 0
+  **precisely because byte 0 of the returned report is the MODE byte** (0x08 = the documented NORMAL
+  selector), not a Report ID prefix. A device that prefixed this Feature report with an id would have
+  answered `byte0` with that id. So the answer to "does the report ID belong in `wValue` only, or
+  also as byte 0?" is: `wValue` only, on this device, and the wire says so.
+* The read-modify-write is what §7.2.2 asks for — the data stage carries the WHOLE report, so the
+  seven bytes we do not own are fetched and written back verbatim and only byte 0 changes.
+
+**THE FIX** is `wIndex = intf`, tried first, with ONE bounded fallback to the legacy `wIndex = 0`
+when the conformant request neither stalls nor latches — because a firmware driven at index 0 by
+every other operating system may only answer there, and refusing to find out would swap one untested
+assumption for another. Two attempts, total. Every stage stays non-fatal: the endpoint is armed
+regardless, exactly as before.
+
+**AND THE SWITCH NOW READS BACK.** Flight 11's SET was ACKed and the driver printed *"multitouch
+stream requested"* — a claim with no evidence behind it, which is how "the pad is in vendor mode and
+silent" stayed the working theory for two months. Each attempt now prints
+
+```
+[tp] mode wrote=<8 hex> readback=<8 hex> latched=<yes|no> (addr= intf= widx= try= set= readback_ok=)
+```
+
+`latched` is defined against the READBACK and nothing else — byte 0 of the report the device hands
+back after the SET equals `0x01`. A SET the device ACKs is not evidence; a failed readback is
+`latched=no`, never a guess.
+
+**AND THE STREAM STAYING 0x02 AFTER THE SWITCH IS A MEASUREMENT, NOT AN ERROR.** A device entitled to
+decline the switch keeps streaming HID-mode reports, and the pointer must keep working while it does.
+
+### 39.4 One dispatcher, on the report's own id
+
+Routing was decided by the descriptor (`layout.vendor_mt`) and then by a single decoder, so a 0x44
+frame arriving on that endpoint would have been dropped without a word. It is now decided by the
+REPORT:
+
+| first byte | route | what happens |
+|---|---|---|
+| `0x02` | `TpRoute::Rel` | `decode_trackpad_rel` → `pal::push_pointer_report(Event::Mouse{dx,dy}, button edge)` — **the same relative install seam the boot-mouse arm uses, with the same fold/lag accounting.** Byte map: `[0]` id, `[1]` buttons, `[2]` dx int8, `[3]` dy int8. |
+| `0x44` | `TpRoute::Mt` | `decode_vendor_first_finger` at the `VMT_FINGER_*` hypothesis offsets — **decoded and witnessed, never installed**, because those offsets are unconfirmed on silicon. Kept for the flight on which the switch latches. |
+| anything else | `TpRoute::None` | counted by the census, routed nowhere. Flight 11's `60 02` is this. |
+
+On the int8 reading: `02 00 f9 00 00 00 fb 00` is `dx = -7, dy = 0` (and a third int8 `-5` at `[6]`).
+A le16 reading of the same two bytes gives **+249**, because `f9 00` little-endian is `0x00f9`; `-7`
+as le16 would be `f9 ff`, which is not what the pad sent. The int8 map is the one the wire supports.
+
+### 39.5 The fixture
+
+`trackpad_dispatch_selftest`, at driver init on every build, feeds the dispatcher **flight 11's four
+verbatim captured reports** plus a synthetic 0x44 frame and an empty completion. QEMU has no Apple
+trackpad, so this is the only way the routing decision can be proven on a QEMU gate at all — and the
+bytes are the real wire, not a convenient one. It asserts the runt routes nowhere, the three 0x02
+reports route to one relative install each at `dx=-7/-6/-7 dy=0`, the 0x44 frame reaches the existing
+first-finger decode, the empty report is bounds-safe, and the census over exactly that population
+reads `02:3,44:1,other:1 sizes=2/49`. **GO-RED:** mutate `trackpad_dispatch` and the line ends
+`:: FAIL ::`, one of mbench's three phase-unbound FORBID builtins — the run reds with no spec
+re-pinned and no threshold chosen.
+
+### 39.6 What flight 12 must print
+
+1. `[tp] mode wrote=08 …` / `readback=…` / `latched=yes|no` for `widx=1` (`try=hid1.11-intf`), and a
+   second line for `widx=0` (`try=legacy-index0`) **only if the first did not latch**. Either verdict
+   is a result; `latched=no` on both is the measurement that the pad declines the switch at either
+   index, which would close this question for good.
+2. `[tp] ids=02:<n>,44:0,other:<n>` if the stream is unchanged, or a non-zero `44:` count with
+   `first_bytes=44[…]` if it latched — and then `trackpad vendor frame: id=0x44 len=…` once.
+3. `trackpad format witness: 8-byte id=0x02 rel` **present** (flight 11 has none; the one-shot now
+   fires on the first id-0x02 report rather than on report #1 whatever it is).
+4. `EHCIDARK … kind=vendor-mt … missed<=` — the fluidity number, to be read beside PTRLAG's
+   `[ptrinstall]` terms. Nothing in this arc addresses it; naming it is the point.
+
+
 ## See also
 - `unaos/crates/kernel/src/drivers/xhci/`, `drivers/block.rs` — the implementation.
 - `unaos/crates/kernel/src/drivers/ehci/`, `drivers/ehci_scout.rs` — the EHCI-3 HID driver (§10), the EHCI-1/2 scout + shared wake (§9/§9a), and the ISRARM completion interrupt (§33).
