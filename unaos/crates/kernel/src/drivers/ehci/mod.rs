@@ -13999,11 +13999,17 @@ impl Controller {
                         e.dark_log_ms = now_ms;
                         e.dark_missed_logged = e.dark_missed;
                         let chars = core::ptr::read_volatile(&(*e.qh).ep_chars);
+                        // PASSPERIOD — the CAUSE, printed beside the consequence it produces. Read
+                        // `pass_period_us_mean` against `cad=`: a mean at the scheduler tick with a
+                        // `max` two orders above it says the darkness is a TAIL (console burst,
+                        // §33h), not an endpoint that is polled too slowly. Global numbers, so two
+                        // endpoints in one capture carry the same pair — they shared the pass.
+                        let (pp_max_us, pp_mean_us) = pass_period_read();
                         serial_println!(
-                            ":: EHCI-HID: [{}] EHCIDARK addr={} ep=IN{} kind={} reports={} cad={}ms windows={} dark={}ms max={}ms missed<={} == witness ::",
+                            ":: EHCI-HID: [{}] EHCIDARK addr={} ep=IN{} kind={} reports={} cad={}ms windows={} dark={}ms max={}ms missed<={} pass_period_us_max={} pass_period_us_mean={} == witness ::",
                             idx, chars & 0x7F, (chars >> 8) & 0xF, int_ep_kind(e),
                             e.reports.wrapping_add(1), e.dark_cad_ms, e.dark_windows,
-                            e.dark_ms, e.dark_max_ms, e.dark_missed
+                            e.dark_ms, e.dark_max_ms, e.dark_missed, pp_max_us, pp_mean_us
                         );
                     }
                     // ══════════════════════════════════════════════════════════════════════════════
@@ -14497,6 +14503,182 @@ const HALT_CLEARS_MAX: u8 = 2;
 /// wearing the shape of its own diagnosis. Paired with the "only when the count MOVED" gate at the
 /// call site, a healthy boot emits this line ZERO times.
 const EHCIDARK_ROLLUP_MS: u64 = 5000;
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// PASSPERIOD (B146, 2026-09-22) — THE PASS GAP, NAMED ON THE WIRE BESIDE THE DARKNESS IT CAUSES.
+//
+// `dark_gap_ms` is `now_ms - seen_ms`: the interval between two SERVICE PASSES, not a property of
+// the endpoint's depth (see the ISRARM block below, and usb_xhci.md §33b for why depth cannot be
+// the answer on this silicon). The census has always printed the CONSEQUENCE — `windows=`,
+// `dark=`, `max=` — and never the CAUSE, so a reader holding one capture could not tell a late pass
+// from an under-armed endpoint without joining `[deadman] pmp=` against it by hand, one second at a
+// time. That join is what flight 11 needed, and it is the whole reason these two tokens exist.
+//
+// ## What flight 11 says the answer already is
+// `pmp=` is `service_ehci_hid()` entries per second. On f11.log, after the scheduler comes up at
+// 28 s: p50 = 965 passes/s, p90 = 1051 — i.e. the pass ALREADY runs at the 1 kHz scheduler tick,
+// because `x86_usb_pump` sleeps exactly one tick and is pinned to the service core, clear of the
+// compositor (`SCHED-X86 PLACE: rsvc=c1 svc=c7`). What is left is a TAIL: min = 38 passes in the
+// worst second, and it lands where the serial console bursts. Partitioning those 928 seconds by the
+// log's own line rate: 1.08 ms mean pass period across the 840 QUIET seconds (< 50 lines/s) against
+// 6.46 ms across the 17 BURST seconds (>= 150 lines/s) — a sixfold collapse, and `max=108ms` lives
+// in it. `serial::_print` masks interrupts and, on a full staging ring, drains it through a 16550 a
+// byte at a time; a core inside that span cannot be preempted and runs no pass. The deadman's own
+// 1 Hz line stretches to 2041 ms in the same seconds, on a DIFFERENT core, which is what makes this
+// a machine-wide stall rather than a slow pump body.
+//
+// So the pair below is not decoration on a fix — it IS the finding, made readable from one capture.
+//
+// ## Why rdtsc and not `arch::ms()`
+// `ms()` is `apic::ticks()`, a count the TIMER ISR increments. The stall this instrument exists to
+// measure runs inside `without_interrupts`, where that ISR cannot run and the local APIC coalesces
+// every missed period into a single interrupt. `ms()` therefore UNDER-COUNTS exactly the window
+// that matters, and an instrument built on it would be blind in the one state it was built for.
+// `now_cycles()` is rdtsc, which `arch::x86_64` documents as advancing "regardless of EFLAGS.IF or
+// whether the APIC-timer ISR runs" — the only clock in this tree that survives a masked span.
+//
+// `dark_gap_ms` itself is deliberately LEFT on `ms()`: it is the published number eleven flights
+// have been read against, and silently re-basing it would break every comparison in the corpus
+// while looking like an improvement. The consequence — that `dark=`/`max=` are themselves LOWER
+// BOUNDS under console load — is stated in §33h rather than quietly fixed.
+//
+// ## Units, and how to read the pair
+// Microseconds: the target is a 1 kHz tick, and a millisecond field would report the healthy case
+// as `0` or `1` with no resolution between them. `pass_period_us_mean` is a true running mean over
+// every pass since boot, not a windowed one — the tail is rare (17 seconds in 928) and a window
+// would average it away between bursts, which is the opposite of what the pair is for. Read them
+// TOGETHER: `mean` at the tick with `max` two orders above it is a TAIL, and a tail is what costs
+// the operator reports; `mean` itself drifting off the tick would be a slow pass, a different
+// defect with a different owner.
+//
+// An uncalibrated TSC (`tsc_hz() == 0`, before `apic::calibrate`) contributes NOTHING rather than a
+// fabricated conversion: the counters stay put and the line reads `0`, which is honest about having
+// no ruler and cannot be misread as a fast pass, since `pass_period_us_mean=0` is unreachable once
+// a single pass has been timed.
+static PASS_LAST_TSC: AtomicU64 = AtomicU64::new(0);
+static PASS_MAX_US: AtomicU32 = AtomicU32::new(0);
+static PASS_SUM_US: AtomicU64 = AtomicU64::new(0);
+static PASS_N: AtomicU64 = AtomicU64::new(0);
+
+/// PASSPERIOD — stamp one `service_ehci_hid()` entry and fold the gap since the previous one into
+/// the census. Called from the pass entry beside `deadman::note_hid_poll()`, which is its exact
+/// twin: both count the PASS rather than its findings, and both sit above the `EHCI_HID` lock so a
+/// pass that cannot take the lock still counts as a pass that happened.
+///
+/// Cost when nothing is wrong: one rdtsc, one swap, one divide, three relaxed RMWs.
+fn pass_period_note() {
+    let hz = crate::arch::x86_64::apic::tsc_hz();
+    if hz == 0 {
+        return;
+    }
+    let now = crate::arch::now_cycles();
+    pass_period_fold(PASS_LAST_TSC.swap(now, Ordering::Relaxed), now, hz);
+}
+
+/// PASSPERIOD — the arithmetic half of [`pass_period_note`], split out so the fixture can drive it
+/// with hand-built stamps instead of trying to manufacture a real 40 ms stall inside a boot.
+///
+/// A first pass (`prev == 0`) and a BACKWARDS delta are both discarded rather than saturated to
+/// zero: a fabricated 0 would drag the mean toward a speed the pass never ran at, and a backwards
+/// delta is reachable in principle if a task migrates across cores whose TSCs were never
+/// synchronised. Discarding costs one sample in ~10^6 and keeps the mean a measurement.
+fn pass_period_fold(prev: u64, now: u64, hz: u64) {
+    if prev == 0 || now <= prev {
+        return;
+    }
+    let us = ((now - prev).saturating_mul(1_000_000) / hz).min(u32::MAX as u64) as u32;
+    PASS_MAX_US.fetch_max(us, Ordering::Relaxed);
+    PASS_SUM_US.fetch_add(us as u64, Ordering::Relaxed);
+    PASS_N.fetch_add(1, Ordering::Relaxed);
+}
+
+/// PASSPERIOD — the pair the EHCIDARK line prints: `(max, mean)` in microseconds. Global rather
+/// than per-endpoint on purpose: the pass period is a property of the SCHEDULER, not of any one
+/// endpoint, so every endpoint's census line carries the same two numbers and a reader comparing
+/// two endpoints in one capture sees that they shared a pass rather than each having their own.
+fn pass_period_read() -> (u32, u64) {
+    let n = PASS_N.load(Ordering::Relaxed);
+    (
+        PASS_MAX_US.load(Ordering::Relaxed),
+        if n == 0 {
+            0
+        } else {
+            PASS_SUM_US.load(Ordering::Relaxed) / n
+        },
+    )
+}
+
+/// PASSPERIOD — the fixture, run once at `init` beside `isr_selftest` and for the same reason that
+/// one exists: without it the conversion, the max and the mean would be unexecuted code on every
+/// automated gate in this repo, and the first reader of `pass_period_us_max=` would be a seat on a
+/// bench with no way to tell a real 108 ms tail from a broken divide.
+///
+/// It drives the REAL [`pass_period_fold`] — not a copy of it — with hand-built TSC stamps spanning
+/// a known gap at a known rate, so the number under test is the one the wire will carry. Three
+/// legs, each a thing the instrument could get wrong and none of them observable on a healthy QEMU
+/// boot, where every pass is the tick:
+///
+///   1. **A 40 ms stall is reported as 40 ms.** The stall leg is the whole point — the field exists
+///      to name a tail, so a tail is what the fixture manufactures.
+///   2. **The mean stays near the tick while the max does not.** This is the pair's entire reading
+///      rule (see the block comment); a mean that tracked the max would make the tail invisible in
+///      exactly the way the raw `dark=`/`max=` pair already is.
+///   3. **A backwards delta contributes nothing** — neither a sample nor a saturated zero.
+///
+/// It runs BEFORE any endpoint is armed and restores all four counters before returning, so a
+/// boot's EHCIDARK line reports the machine's own passes and not the fixture's tally — the same
+/// discipline `isr_selftest` keeps with the ISRARM operational counters.
+fn pass_period_selftest() {
+    let (s_last, s_max, s_sum, s_n) = (
+        PASS_LAST_TSC.load(Ordering::Relaxed),
+        PASS_MAX_US.load(Ordering::Relaxed),
+        PASS_SUM_US.load(Ordering::Relaxed),
+        PASS_N.load(Ordering::Relaxed),
+    );
+    PASS_MAX_US.store(0, Ordering::Relaxed);
+    PASS_SUM_US.store(0, Ordering::Relaxed);
+    PASS_N.store(0, Ordering::Relaxed);
+
+    // A synthetic 2 GHz ruler, so the fixture's arithmetic does not depend on what this boot's
+    // `apic::calibrate` happened to measure (QEMU/TCG and the Ivy Bridge metal differ by a lot, and
+    // a fixture whose expected value moved with the host would prove nothing).
+    const HZ: u64 = 2_000_000_000;
+    const TICK_CYCLES: u64 = HZ / 1000; // 1 ms — the scheduler tick this pass is supposed to run at
+    const STALL_CYCLES: u64 = HZ / 25; // 40 ms — a console-burst tail, the case the field exists for
+
+    // Legs 1 + 2: 99 passes at the tick, then ONE 40 ms stall.
+    let mut t = TICK_CYCLES; // never 0 — `prev == 0` is the first-pass sentinel
+    for _ in 0..99 {
+        let prev = t;
+        t += TICK_CYCLES;
+        pass_period_fold(prev, t, HZ);
+    }
+    let prev = t;
+    t += STALL_CYCLES;
+    pass_period_fold(prev, t, HZ);
+    // Leg 3: a backwards delta, which must move neither the count nor the sum.
+    pass_period_fold(t, t - TICK_CYCLES, HZ);
+
+    let (max_us, mean_us) = pass_period_read();
+    let n = PASS_N.load(Ordering::Relaxed);
+    // 99 x 1000 us + 1 x 40000 us = 139000 us over 100 samples = 1390 us. The mean is 1.39x the
+    // tick while the max is 40x it: the tail is visible in `max` and all but invisible in `mean`,
+    // which is precisely the reading rule the block comment states.
+    let pass = max_us == 40_000 && mean_us == 1_390 && n == 100;
+    serial_println!(
+        ":: EHCI-HID: PASSPERIOD self-test: samples={} backwards-delta-refused={} tick=1000us stall=40000us -> pass_period_us_max={} pass_period_us_mean={} -> {} == witness ::",
+        n,
+        n == 100,
+        max_us,
+        mean_us,
+        if pass { "PASS" } else { "FAIL" }
+    );
+
+    PASS_LAST_TSC.store(s_last, Ordering::Relaxed);
+    PASS_MAX_US.store(s_max, Ordering::Relaxed);
+    PASS_SUM_US.store(s_sum, Ordering::Relaxed);
+    PASS_N.store(s_n, Ordering::Relaxed);
+}
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // ISRARM — THE COMPLETION INTERRUPT THIS CONTROLLER WAS ALREADY RAISING, FINALLY CONSUMED.
@@ -17907,6 +18089,10 @@ pub fn init() {
     // `isr_service_ep` against a hand-built completion so the ISR path is exercised on every boot,
     // QEMU included. See `isr_selftest`.
     unsafe { isr_selftest() };
+    // PASSPERIOD: the census's new pair, for the same reason and in the same place. A healthy QEMU
+    // boot runs every pass at the tick, so the STALL half of the instrument — the only half that
+    // matters — would never execute on any gate this repo runs. See `pass_period_selftest`.
+    pass_period_selftest();
     let selftest_cy = crate::arch::now_cycles().wrapping_sub(init_t0);
     let mut ctrls: Vec<Controller> = Vec::new();
     // BUY-1 (GR18): the port walk moved out of this loop into a second pass, so each woken
@@ -18520,6 +18706,10 @@ pub fn service_ehci_hid() {
     // as "the input hardware went dead" when what actually happened is that the `x86_usb_pump` task
     // stopped running — the difference between a bad bug and a much worse one.
     crate::deadman::note_hid_poll();
+    // PASSPERIOD — the same instant, on a clock that survives a masked span. `note_hid_poll` counts
+    // passes per second and this measures the gap BETWEEN them, which is the quantity `dark_gap_ms`
+    // is made of; stamped here, beside its twin and above the lock, for the identical reason.
+    pass_period_note();
     let mut g = EHCI_HID.lock();
     let Some(ctrls) = g.as_mut() else { return };
     for c in ctrls.iter_mut() {
