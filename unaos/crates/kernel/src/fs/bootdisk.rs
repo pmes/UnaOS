@@ -1328,8 +1328,31 @@ pub fn bind(mt: &mut crate::fs::vfs::MountTable) {
     let s = survey();
 
     // The mount table is rebuilt PER VERB, so the per-mount witnesses are latched exactly the way
-    // the root witness is (which rides the cached walk): announced once, on the first table built.
-    let announce = !MOUNTS_ANNOUNCED.swap(true, core::sync::atomic::Ordering::Relaxed);
+    // the root witness is (which rides the cached walk): announced once — on the first table that
+    // BOUND A ROOT.
+    //
+    // VFSWIT (CARDROOT, rmbp flight 11): the clause `s.root.is_some() &&` is the whole fix, and it
+    // is load-bearing rather than defensive. `bind` runs on EVERY verb, and on x86 the FIRST table
+    // is built before any disk has enumerated (serial ~line 156): [`survey`] returns no root and no
+    // others there, so the old unconditional `swap` spent the latch on a table that printed NOTHING
+    // and every per-mount witness — `[vfs] root mount`, `[vfs] volume mounted`, `[vfs] boot mount`,
+    // `[vfs] apps mount`, `[vfs] data mount` — read 0 lines for the whole boot on a board where all
+    // four prefixes bound. The fact rode `:: volid: mount …` inside a fixture instead, which is a
+    // witness certifying the wrong thing.
+    //
+    // The condition is the ROOT and not "this table has anything to say" (`|| !s.others.is_empty()`)
+    // because of the RESURVEY: [`survey`] caches only a walk that FOUND a root and re-walks on every
+    // fingerprint change (SO38), so a table can legitimately carry home-soil disks while the root is
+    // still unresolved, and latching there would lose the root/boot/apps/data lines — the same
+    // defect one table later. What that gives up, said out loud: a board that enumerates disks and
+    // NEVER binds a root announces no `[vfs] volume mounted` line at all; its witness is the
+    // `[vfs] root -> NONE` line [`walk_and_witness`] prints, and the mounts are still MADE either
+    // way. Trading a never-bound board's home-soil lines for every bound board's five is the right
+    // way round.
+    //
+    // Short-circuit, so a rootless table does not even LOOK at the latch, let alone spend it.
+    let announce =
+        s.root.is_some() && !MOUNTS_ANNOUNCED.swap(true, core::sync::atomic::Ordering::Relaxed);
 
     for h in s.others.iter() {
         // The backend's volume NAME is the point's unique leaf, so `same_volume` answers about the
