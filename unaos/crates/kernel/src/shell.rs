@@ -4992,7 +4992,7 @@ pub fn fatverb_storage_witness() {
     vfsroute_witness();
     // LAYOUT (orin 18): the namespace transcript rides the same site, for the same reason.
     #[cfg(feature = "witness")]
-    layout_witness();
+    layout_witness(); #[cfg(feature = "witness")] font_aa_witness(); // FONTAA (SO48) — `video.font.aa` rides THIS site, and it rides it as a SAME-LINE fold for this file's stated reason (see the `install` arm below): shell.rs is compiled into every image, so one added source line would move every `panic::Location` record beneath it (LEDGER P7). The body is a FILE-TAIL append, where nothing below it can move. WHY HERE: the fixture needs no medium and no panel — it renders `Ago` into its own 96x48 heap buffer through `video::font` — so it is safe at any boot point, and it takes the site its neighbours already took rather than opening a new one. It was a leg of the INTERACTIVE `tste` suite until 2026-09-22, which meant it shipped in every image and ran on no gate; GATEHYG's fixture-reachability gate is what named it.
     // X86BIND: the SETTLED call. This function is the one place on x86 that WAITS for storage
     // (`STORAGE_WAIT_MS`) and then speaks ANYWAY when the wait expires, so it is the only honest
     // place to say "enumeration is as finished as it is going to get". The mount-table builder
@@ -8385,4 +8385,24 @@ fn install_verb(console: &mut Console, args: &[&str]) {
         return;
     }
     install_into(console, name, id, slot, as_esp);
+}
+
+// FONTAA (SO48) — THE BOOT-WIRE HALF OF THE FONT FIXTURE.
+//
+// `selftest.rs`'s module note prescribed exactly this: "Putting it on the boot wire is one
+// `verdict("video.font.aa", …)` line in `shell.rs`'s boot-fixture block". This is that line, in the
+// uniform `:: TSTE: <name> -> PASS/FAIL ::` shape the boot-replay ring and `tste` both already read,
+// so the leg now has a VERDICT IN THE CAPTURE instead of a call nothing reaches. The compile-time
+// half of the same claim still lives in `video/font.rs`'s tail; this is the runtime half, and it is
+// the one that exercises the actual blit.
+//
+// The three arms are `report`'s three arms, spelled the same way, so a reader grepping either
+// source finds the same strings.
+#[cfg(feature = "witness")]
+fn font_aa_witness() {
+    match crate::selftest::test_font_aa() {
+        crate::selftest::Outcome::Pass => serial_println!(":: TSTE: {} -> PASS ::", "video.font.aa"),
+        crate::selftest::Outcome::Fail(why) => serial_println!(":: TSTE: {} -> FAIL ({}) ::", "video.font.aa", why),
+        crate::selftest::Outcome::Skip(why) => serial_println!(":: TSTE: {} -> SKIP ({}) ::", "video.font.aa", why),
+    }
 }
