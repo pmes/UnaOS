@@ -409,19 +409,78 @@ Note also that `dropped` and `torn` are **different outcomes**: a tap charges
 `dropped` only on the exhaustion path — staging ring **full at depth**, *and* the
 free retry at the sink also failed. `evidence_lost` counts only the latter.
 
-**Trigger conditions.** Seen **1 run in 12**. Load-correlated in the same way as
-class 1: the drop path is reachable only while the sink lock is contended *and*
-the 64-slot staging ring is already full, which needs several cores printing at
-once.
+**Trigger conditions.** Seen **1 run in 12** when this entry was opened. Measured
+properly on 2026-09-22 across every QEMU boot on the bench that day, de-duplicated
+by each boot's own four tap lines: **2 FAIL in 65 boots, about 3%** — lower than
+the opening estimate, and low enough that a seat meets it about once a week and
+has no reason to remember it. Host load 9-41, up to nine concurrent `cargo`
+builds. Load-correlated in the same way
+as class 1: the drop path is reachable only while the sink lock is contended
+*and* the 64-slot staging ring is already full, which needs several cores
+printing at once.
 
-**Root cause — SUSPECT, explicitly not established.** No root-cause pass has been
-done; nobody has reproduced it under controlled load or identified which tap
-carried the 17.
+**Root cause — MEASURED 2026-09-22 (FLAKEFIX, rmbp-ledger B150). The tap is
+`ftdi`, the mechanism is DEPTH EXHAUSTION under lock contention, and the suspect
+below is REFUTED.** Four captures from one day, three of them other executors'
+and one reproduced by FLAKEFIX on its own tree, all on the same box:
 
-The suspect named when this corpus was opened is **per-line growth on the
-rollup lines** — concretely, the `stalls=` field, about **9 bytes per rollup** —
-against a serial ring whose margin is real and finite. The arithmetic that
-motivates the suspicion is in-tree and verified:
+| capture | ftdi tap at the verdict | tste tap | verdict |
+| --- | --- | --- | --- |
+| `crystalboot-logs/before-serial.log:588` | `staged=65 dropped=7 torn=0` | `dropped=0` | `FAIL — balanced=true evidence_lost=7` |
+| `flakefix-logs/gored-serial.log:597` | `staged=64 dropped=13 torn=0` | `dropped=0` | `FAIL — balanced=true evidence_lost=13` |
+| `crystalboot-logs/after-serial.log:587` | `staged=30 dropped=0 torn=0` | `dropped=0` | `PASS` |
+| `gmux8-logs/test240.log:1290` | `staged=10 dropped=0 torn=0` | `dropped=0` | `PASS` |
+
+Three things fall out of that table and each of them settles a question this
+entry used to have to ask a future investigator for.
+
+**(1) `torn=0` on every tap of every capture, FAIL and PASS alike.** That is
+this entry's own discriminator #3 below, and it fires against the suspect: the
+loss is the depth-exhaustion path, not the slot-width path, so **per-line growth
+is exonerated** and experiment #6 below does not need running. The `stalls=`
+suspect is retired.
+
+**(2) `staged` reaches the ring's depth exactly on the FAIL runs (64 and 65
+against `SLOTS = 64`) and sits at 10-30 on the PASS runs.** The ring is not
+marginally sized for the ordinary boot; it is exactly sized for the burst, and
+the burst that reaches it is SERWIT-1's own — `5 cores x 24 lines` plus 5
+wide-line probes, 125 lines, with the same run's SERWIT-1 line reading `110-116
+deferred to the staging ring` against `100-111` on the greens.
+
+**(3) The sink is NOT a host device and there is no QEMU backpressure in this
+path.** `drivers/xhci/ftdi.rs` `mirror()` loses a line only when, in order,
+`RING.try_lock()` fails, the 64×240 `STAGE` ring is full, *and* the one free
+retry `RING.try_lock()` fails again. `RING` is an in-kernel capture ring behind
+a spinlock — the FTDI *device* (`-device usb-serial`) is attached only under
+`UNAOS_USBSERIAL` (`builder/src/main.rs:1521`) and is absent from every default
+`./arroyo test`. The host reaches this only through how long a core holds `RING`:
+a vCPU descheduled by a loaded host mid-memcpy stretches the hold, the other four
+cores all miss the `try_lock`, and `STAGE` fills behind them. "sink contended or
+full" means **contended**, every time this has been measured.
+
+**THE FIX IS IN A FILE FLAKEFIX MAY NOT TOUCH, so it is reported and not made**
+(`drivers/xhci/ftdi.rs` is not in that brief's file set, and any edit there moves
+the default image, which `./arroyo knoboff wc` scores as a red by construction —
+see rmbp-ledger B144's note on knoboff having no power over unconditional code).
+The exact change, for whoever holds the file: **the one free retry is not
+enough.** `mirror()`'s third step is a single `try_lock`, so a line is declared
+lost after losing one race, while `serial_ring`'s own primary producer
+BACK-PRESSURES instead (`:: SERWIT-1B: … the contended producer BACK-PRESSURES,
+it does not drop … one capped drain freed 3 slot(s), the next turn DEFERRED the
+line intact, 0 dropped -> PASS ::`). Give the mirror the same policy the primary
+wire already has — a bounded spin on the retry, or a capped drain of `STAGE`
+into `RING` before declaring the loss — and quote a run with `staged >= 64` and
+`dropped=0` as the proof. **Do not widen `evidence_lost`'s threshold**: the 13
+lines are really gone, and on a 2012 rMBP with no 16550 the FTDI capture is not a
+mirror of the evidence, it IS the evidence (this function's own doc comment says
+so). A tolerance here would be the wrong-lenient half of LAWS §5 applied to the
+one tap that cannot afford it.
+
+The suspect that stood here before, kept because the arithmetic is still true and
+the next reader should not re-derive it: **per-line growth on the rollup lines**
+— concretely, the `stalls=` field, about **9 bytes per rollup** — against a
+serial ring whose margin is real and finite. The arithmetic is in-tree and
+verified:
 
 - the primary staging ring is `SLOTS = 64` × `SLOT_LEN = 1536` bytes; the
   measured worst-case line in the whole tree is 1291 chars + newline = **1292
@@ -434,8 +493,9 @@ tighter still. Two ways growth could bite, and they are distinguishable on the
 wire: extra bytes per line lengthen the sink-lock hold, which deepens staging and
 makes the depth-exhaustion `dropped` path reachable (→ `dropped` climbs); or
 extra bytes push a line past a slot width (→ `torn` climbs instead). **Only the
-first would produce `evidence_lost`.** That asymmetry is the cheapest available
-discriminator and it has not yet been checked against a real capture.
+first would produce `evidence_lost`.** That asymmetry was the cheapest available
+discriminator; it has now been checked against four real captures and it reads
+`torn=0` in all of them, which is why the width half is retired above.
 
 **What to capture on recurrence.** In priority order:
 
@@ -454,17 +514,63 @@ discriminator and it has not yet been checked against a real capture.
    `N back-pressured on a full ring (deepest X of Y turns)`; on the FAIL line
    they are the literal `stalls=N maxspin=M/…` fields.
 5. Host load and core count, and whether a re-run on an idle host is clean.
-6. If it is reproducible under load, the discriminating experiment: re-run with
-   the rollup lines shortened and see whether `evidence_lost` follows. That is
-   the check that would confirm or kill the suspect, and it has not been run.
+6. ~~If it is reproducible under load, the discriminating experiment: re-run with
+   the rollup lines shortened and see whether `evidence_lost` follows.~~ **Not
+   needed — `torn=0` in four captures answers it. Do not spend a run on it.**
 
-**Disposition — WATCH, suspect unconfirmed.** SERWIT-2 is not asserted by any
-`.spec` file (`x86-fat.spec`, `round6-rmbp.spec`, `x86-witness.spec`,
-`rmbp-boot.spec` carry no SERWIT token), so this failure does **not** turn a gate
-red on its own — it is caught by reading the log, and by
-`tools/serial-analyzer.py`, which does carry a `SERWIT-2` witness family. Treat a
-sighting as evidence to bank rather than as a gate failure to clear, and do not
-let a green spec run bury it.
+**Disposition — ROOT CAUSE KNOWN, FIX OWED, and CORRECT one sentence this entry
+used to carry: it DOES turn the gate red.** The old text said SERWIT-2 "does not
+turn a gate red on its own" because no `.spec` file carries a SERWIT token. That
+is true of the spec replay and false of the run: `FAIL ::` is in arroyo's
+`FAULT_PATTERNS`, so `scan_serial_faults` reds the leg on the verdict line and
+the spec replay never runs. Measured twice on 2026-09-22 —
+`✖ serial.log:591: :: SERWIT-2: FAIL — balanced=true evidence_lost=7 ::` ending
+CRYSTALBOOT's baseline run, and `✖ serial.log:600: … evidence_lost=13 ::` ending
+FLAKEFIX's. So a sighting is a **lost gate run**, not evidence to bank quietly,
+and that is what puts the fix above on the owed list rather than the watch list.
+
+**Companion sighting, same ring, same day, recorded so it is not diagnosed
+separately.** FLAKEFIX's `green2` run at host load 33 red on four `serial_ring`
+drain fixtures at once —
+`:: PWRDRAIN: FAIL — filled=64 lines=61 bytes=4148 want_bytes=4352 …`,
+`:: S5DRAIN: FAIL — filled=64 lines=25 bytes=1675 want_bytes=4288 …`,
+`:: SINKDRAIN: FAIL — staged=8 drained=0 on_cable=0 …`,
+`:: SERWIRE: FAIL — filled=8 capped_drains=1 capped_b=0 want_b=201 …` — every one
+of them `filled=64`, i.e. the same ring at the same depth under the same
+contention, and every one with `dropped=0` and `residue=0`. They are this class,
+not four defects, and a fix that gives the mirror the primary wire's
+back-pressure policy should be scored against them too.
+
+### 2b. `[mirror] tste: N line(s) dropped` is **NOT** what `evidence_lost` counts — **measured 2026-09-22, recorded so the wrong inference is not drawn twice**
+
+**The wrong reading, and it is the natural one.** A capture carries
+`[mirror] tste: 13 line(s) dropped, 0 truncated since boot (sink contended or
+full)` and a SERWIT-2 FAIL, and the two get joined. They are unrelated, and three
+captures from one day say so:
+
+| capture | `[mirror] tste` lines | tste tap AT the verdict | SERWIT-2 |
+| --- | --- | --- | --- |
+| `gmux8-logs/test240.log` | 12 of them, lines 2832-2939 | `:1291 dropped=0` | `:1293 PASS` |
+| `crystalboot-logs/before-serial.log` | 11 of them, lines 2146-2257 | `:589 dropped=0` | `:591 FAIL, evidence_lost=7` (carried by **ftdi**, `:588`) |
+| `flakefix-logs/gored-serial.log` | 11 of them, lines 2182+ | `:598 dropped=0` | `:600 FAIL, evidence_lost=13` (carried by **ftdi**, `:597`) |
+
+**The mechanism of the confusion is ORDERING.** SERWIT-2 is a one-shot verdict
+that prints at ~line 590-1290 of the boot; every `[mirror] tste:` line in all
+three captures lands ~1500 lines LATER, in a different phase. The tste tap reads
+`dropped=0` at the instant the verdict snapshots it, in every capture, green and
+red alike. GMUX8's run is the clean falsification: 13 tste drops in the capture
+and `SERWIT-2 … -> PASS` with `evidence_lost=0`.
+
+**What the tste drops are.** A separate, later, still-real loss on the
+boot-verdict replay ring, from the same contention mechanism as 2a but past the
+verdict's window — so no fixture scores them and nothing reds on them. They are
+worth a class entry of their own when someone holds `serial_ring.rs`; they are
+not worth attributing to a SERWIT-2 number they cannot have contributed to.
+
+**What to capture on recurrence.** The tap line at the verdict, with its serial
+line number, beside the `[mirror]` line's. If the two are more than a handful of
+lines apart, they are describing different moments and only the tap line is a
+reading of what the verdict scored.
 
 ---
 
