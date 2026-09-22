@@ -950,7 +950,10 @@ pub mod net6 {
     struct Stack {
         iface: Interface,
         sockets: SocketSet<'static>,
-        dev: SmoltcpPhy<Net6Nic>,
+        /// Carries the `Learn` observer (SO47): every ARP frame the singleton polls — DHCP bring-up,
+        /// EL0 socket traffic, any `pump` — fills the NET6 neighbour table, so `arp` has a warm table
+        /// to read whether or not a verb ran first.
+        dev: SmoltcpPhy<Net6Nic, Learn>,
         /// socket-id → (smoltcp handle, owning address-space id, transport). `None` = free.
         reg: [Option<(SocketHandle, u64, Kind)>; NSOCK],
     }
@@ -974,7 +977,7 @@ pub mod net6 {
             return true;
         }
         let Some(mac) = Net6Nic::mac() else { return false };
-        let mut dev = SmoltcpPhy::<Net6Nic>::new();
+        let mut dev = SmoltcpPhy::<Net6Nic, Learn>::with_observer(Learn);
         let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
         config.random_seed = 0x4e45_5436; // ASCII "NET6"
         let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
@@ -1035,7 +1038,7 @@ pub mod net6 {
                 P6
             ),
         }
-        ok
+        #[cfg(feature = "sntp6")] crate::net_sntp_client::service_tick(); ok // SNTP-NET6 DRIVE SEAM — the statement ORINTIME (ad549988) recorded as OWED and could not land, because net_phy.rs was held by executor NETVERB that same session; this fold holds both. Folded ONTO the return line, never a new one: a new statement here shifts every `panic::Location` below it in this file (LEDGER P7 / LAWS §5). This is the surface's own service path, ABOVE every device adapter — the deliberate refusal of the x86 shape, where the client hangs off `drivers/e1000.rs`'s service tick so changing the NIC loses the clock. Idempotent and free before the network exists: the client is LATCHED (one attempt sequence per boot), an operator's existing anchor stands it down rather than being overwritten, and it returns with no line, no packet and no latch until `ipv4()` and `gateway()` both answer.
     }
 
     /// The address + prefix the persistent interface carries, or `None` before `init`.
@@ -1071,31 +1074,136 @@ pub mod net6 {
         }
     }
 
+    // ── The NET6 neighbour table: the thing `arp` answers from ────────────────────────────────────
+    //
+    // SO47, and DERIVED rather than assumed. smoltcp 0.13.1 holds its neighbour cache as a PRIVATE
+    // field of `InterfaceInner` (`neighbor_cache`, smoltcp-0.13.1/src/iface/interface/mod.rs:134) and
+    // publishes no reader for it — `NeighborCache::lookup` is `pub(crate)` (src/iface/neighbor.rs) —
+    // so a verb CANNOT ask smoltcp what it has already resolved. Every NET6 verb therefore built a
+    // THROWAWAY `Interface` with an EMPTY cache and re-derived the answer from the wire, and `arp`'s
+    // ONLY source of truth was one ARP reply captured inside its own 2 s budget.
+    //
+    // On a clean wire that works — measured, not argued: with the verb UNCHANGED, the QEMU `virt` leg
+    // prints `:: NET6: arp 10.0.2.2 -> is-at 52:55:0a:00:02:02 ::` right after a 4/4 ping. On the Orin
+    // it does not, because that NIC's inbound payload path drops frames outright (A64; render14 boot4
+    // scores six `[net5T] … verdict=NOWHERE — the payload never reached this DRAM at all` in twelve
+    // pops, several of them 60-byte, i.e. ARP-reply-sized). So render14 boot4/boot5 show
+    // `ping 10.42.0.1 4/4 replies … peer 9c:69:d3:28:6e:f4 -> REPLY` and then, on the same boot and
+    // the same address, `arp 10.42.0.1 -> NO REPLY` — the machine HAD the answer and the verb had
+    // thrown it away.
+    //
+    // The defect is therefore in the verb, not under it, and the fix is to stop discarding what the
+    // wire already taught us: every ARP frame ANY phy in this module receives is learned here, and
+    // `arp` reads this table first, probing only on a miss. Fixed BSS, no heap, one lock that nothing
+    // else nests inside.
+
+    /// Neighbours the table holds. A link a shell asks about has a handful of hosts; a fixed ring
+    /// means an ARP storm can evict but never grow it.
+    const NEIGH_CAP: usize = 8;
+    /// How long a learned entry may answer `arp` before the verb goes back to the wire. The age is on
+    /// the witness either way, so a cached answer is never passed off as a fresh round trip.
+    const NEIGH_TTL_MS: i64 = 120_000;
+
+    #[derive(Clone, Copy)]
+    struct Neigh {
+        ip: [u8; 4],
+        mac: [u8; 6],
+        /// `now_ms()` at the last frame that taught us this pairing.
+        at_ms: i64,
+    }
+
+    /// `(entries, next eviction slot)`. Lock order: nothing takes `STACK` while holding this, and the
+    /// learn path runs inside `RxObserver::observe`, which is already forbidden to re-enter the NIC.
+    static NEIGH: spin::Mutex<([Option<Neigh>; NEIGH_CAP], usize)> =
+        spin::Mutex::new(([None; NEIGH_CAP], 0));
+
+    /// Record `ip -> mac`, refreshing the age if we already knew it.
+    fn neigh_learn(ip: [u8; 4], mac: [u8; 6]) {
+        // 0.0.0.0 is an ARP PROBE's sender (RFC 5227 §2.1.1) and a group-bit MAC is a broadcast or
+        // multicast address, never a station's. Neither is a neighbour, and learning either would
+        // poison the table for the address that is.
+        if ip == [0, 0, 0, 0] || mac[0] & 1 == 1 {
+            return;
+        }
+        let now = now_ms();
+        let mut g = NEIGH.lock();
+        let (tbl, next) = &mut *g;
+        for slot in tbl.iter_mut() {
+            if let Some(n) = slot {
+                if n.ip == ip {
+                    n.mac = mac;
+                    n.at_ms = now;
+                    return;
+                }
+            }
+        }
+        for slot in tbl.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(Neigh { ip, mac, at_ms: now });
+                return;
+            }
+        }
+        // Full: evict round-robin, so one talkative peer cannot pin every slot.
+        tbl[*next] = Some(Neigh { ip, mac, at_ms: now });
+        *next = (*next + 1) % NEIGH_CAP;
+    }
+
+    /// The MAC learned for `ip` and its age in ms, or `None` if never learned or older than the TTL.
+    fn neigh_lookup(ip: [u8; 4]) -> Option<([u8; 6], i64)> {
+        let now = now_ms();
+        let g = NEIGH.lock();
+        for n in g.0.iter().flatten() {
+            if n.ip == ip {
+                let age = now.saturating_sub(n.at_ms);
+                return if age <= NEIGH_TTL_MS { Some((n.mac, age)) } else { None };
+            }
+        }
+        None
+    }
+
+    /// How many neighbours the table holds. A CONTROL for the `arp` failure line: `learned=0` says
+    /// the learn path never ran at all, which is a different defect from "this one address is
+    /// unknown", and the wire must be able to tell the two apart.
+    fn neigh_count() -> usize {
+        NEIGH.lock().0.iter().flatten().count()
+    }
+
     // ── The shell verbs: ping / arp / dns, each with a witness line the next boot scores ──────────
 
-    /// An inbound ARP reply for `target` carries the peer MAC that smoltcp hides behind its neighbour
-    /// cache. The blocking verbs snoop the wire for it so `arp` has something to print. Mirrors the
-    /// x86 `smolnet::snoop_arp` (a read-only reuse of `net::arp::learn`), spelled out here because
-    /// the crate-level `net` dependency is not in scope for this module.
+    /// Learn from one inbound frame if it is an IPv4-over-Ethernet ARP, and surface `target`'s MAC to
+    /// the caller's `out` when it is the address we were asked about. Mirrors the x86
+    /// `smolnet::snoop_arp` (a read-only reuse of `net::arp::learn`), spelled out here because the
+    /// crate-level `net` dependency is not in scope for this module.
+    ///
+    /// BOTH opcodes are learned, not just replies. An ARP REQUEST carries the sender's IP and MAC in
+    /// the same fields a reply does — a host that ARPs us is a host we have just learned, which is the
+    /// pairing every neighbour table takes. Scoring only opcode 2 is half of what made the verb depend
+    /// on one specific reply landing inside its own budget.
     fn snoop_arp(frame: &[u8], target: [u8; 4], out: &mut Option<[u8; 6]>) {
-        if out.is_some() || frame.len() < 42 {
+        if frame.len() < 42 {
             return;
         }
         if u16::from_be_bytes([frame[12], frame[13]]) != 0x0806 {
             return; // not ARP
         }
         let a = &frame[14..42];
-        // htype=1 ethernet, ptype=0x0800 IPv4, hlen=6, plen=4, oper=2 (reply)
-        if a[0] != 0 || a[1] != 1 || a[2] != 0x08 || a[3] != 0 || a[4] != 6 || a[5] != 4 || a[7] != 2
-        {
+        // htype=1 ethernet, ptype=0x0800 IPv4, hlen=6, plen=4
+        if a[0] != 0 || a[1] != 1 || a[2] != 0x08 || a[3] != 0 || a[4] != 6 || a[5] != 4 {
             return;
         }
-        if a[14..18] == target[..] {
-            *out = Some([a[8], a[9], a[10], a[11], a[12], a[13]]);
+        // oper: 1 = request, 2 = reply; anything else is not an address we may believe.
+        if a[6] != 0 || (a[7] != 1 && a[7] != 2) {
+            return;
+        }
+        let sip = [a[14], a[15], a[16], a[17]];
+        let smac = [a[8], a[9], a[10], a[11], a[12], a[13]];
+        neigh_learn(sip, smac);
+        if out.is_none() && sip == target {
+            *out = Some(smac);
         }
     }
 
-    /// The RX observer the blocking verbs bind: ARP-snoop for one target.
+    /// The RX observer the blocking verbs bind: learn every ARP sender, and capture one target.
     struct Snoop {
         target: [u8; 4],
         mac: Option<[u8; 6]>,
@@ -1103,6 +1211,20 @@ pub mod net6 {
     impl super::RxObserver for Snoop {
         fn observe(&mut self, frame: &[u8]) {
             snoop_arp(frame, self.target, &mut self.mac)
+        }
+    }
+
+    /// The PERSISTENT stack's observer: learn every ARP sender, capture nothing. The singleton polls
+    /// for DHCP, for every EL0 socket call and for every `pump`, so this is what keeps the table warm
+    /// between verbs — and it is why a cached `arp` answer does not depend on a verb having run first.
+    struct Learn;
+    impl super::RxObserver for Learn {
+        fn observe(&mut self, frame: &[u8]) {
+            // Target 0.0.0.0 matches nothing a sender may legally carry (`neigh_learn` refuses that
+            // sender outright), and the sink is dropped on return: this observer exists for its side
+            // effect on the table.
+            let mut sink = None;
+            snoop_arp(frame, [0, 0, 0, 0], &mut sink);
         }
     }
 
@@ -1245,9 +1367,33 @@ pub mod net6 {
         Some(PingOutcome { sent, received, mac: peer, first_rtt_ms: first_rtt })
     }
 
-    /// Blocking ARP resolve: one echo forces smoltcp to ARP the target; the observer returns the MAC
-    /// off the wire. Emits `:: NET6: arp <ip> -> is-at <mac> ::` / `-> NO REPLY ::`.
+    /// One witness line per `arp` invocation, whatever answered. BOUNDED: this is called on exactly
+    /// one path per call, never per packet. ` -> is-at ` is held byte-for-byte (A59's go-red shape and
+    /// the artifact certification both count that fragment); `via=` and `age_ms=` are appended after
+    /// the MAC so the operator can tell a table answer from a fresh round trip without reading code.
+    fn arp_hit(target: [u8; 4], m: [u8; 6], via: &str, age_ms: i64) -> [u8; 6] {
+        let b = fmt_mac(&m);
+        serial_println!(
+            "{} arp {}.{}.{}.{} -> is-at {} via={} age_ms={} ::",
+            P6, target[0], target[1], target[2], target[3],
+            core::str::from_utf8(&b).unwrap_or("<mac>"), via, age_ms
+        );
+        m
+    }
+
+    /// Resolve `target` to a MAC for the `arp` shell verb: the NEIGHBOUR TABLE first, the wire only on
+    /// a miss. Emits `:: NET6: arp <ip> -> is-at <mac> via=cache|wire age_ms=N ::`, or one
+    /// `-> NO REPLY (…) ::` naming why.
+    ///
+    /// Table-first is the standard meaning of `arp <ip>` (R26: standard verbs keep standard
+    /// semantics — this is the neighbour table, not a ping), and it is the SO47 fix: the answer the
+    /// machine already learned is no longer re-derived across a wire that may drop it. A miss still
+    /// probes, so the verb resolves an address nothing has talked to yet; a probe that answers refills
+    /// the table through the same observer every other frame goes through.
     pub fn arp(target: [u8; 4]) -> Option<[u8; 6]> {
+        if let Some((m, age)) = neigh_lookup(target) {
+            return Some(arp_hit(target, m, "cache", age));
+        }
         let mac = Net6Nic::mac()?;
         let (our_ip, plen) = ipv4()?;
         let gw = gateway()?;
@@ -1298,20 +1444,18 @@ pub mod net6 {
                 }
             }
         }
+        let spent = now_ms().saturating_sub(t0);
         match dev.obs.mac {
-            Some(m) => {
-                let b = fmt_mac(&m);
-                serial_println!(
-                    "{} arp {}.{}.{}.{} -> is-at {} ::",
-                    P6, target[0], target[1], target[2], target[3],
-                    core::str::from_utf8(&b).unwrap_or("<mac>")
-                );
-                Some(m)
-            }
+            // The observer already called `neigh_learn` for this pairing, so the next `arp` for the
+            // same address is a table read even if the wire never answers again.
+            Some(m) => Some(arp_hit(target, m, "wire", 0)),
             None => {
+                // `learned=` is the control: 0 says the learn path never ran at all (a dead observer,
+                // or a NIC delivering no ARP), which is a different defect from "this one address is
+                // unknown". A reader must be able to tell those apart from this line alone.
                 serial_println!(
-                    "{} arp {}.{}.{}.{} -> NO REPLY ::",
-                    P6, target[0], target[1], target[2], target[3]
+                    "{} arp {}.{}.{}.{} -> NO REPLY (cache miss, wire probe {} ms, learned={}) ::",
+                    P6, target[0], target[1], target[2], target[3], spent, neigh_count()
                 );
                 None
             }
@@ -1323,64 +1467,125 @@ pub mod net6 {
     /// the DHCP-offered nameserver where the lease carried one, else the gateway. Emits
     /// `:: NET6: dns <host> -> A a.b.c.d (server s.s.s.s) ::` or a typed failure line.
     pub fn dns(host: &str) -> Option<[u8; 4]> {
-        let Some(server) = resolver() else {
-            serial_println!("{} dns {} -> NO RESOLVER (no lease, no gateway) ::", P6, host);
-            return None;
-        };
+        let server = resolver();
+        let v = dns_lookup(host, server);
+        // ── THE ONE EMISSION POINT ────────────────────────────────────────────────────────────────
+        // SO47's second half: `dns google.com` returned a 44-byte `TerminalError` to the midden and
+        // printed NOTHING, so the wire could not say whether it had failed to parse, to find a
+        // resolver, to send or to wait. The verb now witnesses EVERY path from one place — there is
+        // exactly one `serial_println!` for this verb and every arm of `dns_lookup` reaches it — so
+        // "witnesses every path" is a property of the SHAPE and not of a reviewer noticing. The
+        // resolver is named on every arm that had one to use.
+        DNS_WITNESS.fetch_add(1, Ordering::Relaxed);
+        match (v, server) {
+            (DnsVerdict::NoResolver, _) => {
+                serial_println!("{} dns {} -> NO RESOLVER (no lease, no gateway) ::", P6, host)
+            }
+            (v, Some(s)) => serial_println!(
+                "{} dns {} -> {} (server {}.{}.{}.{}) ::",
+                P6, host, DnsSay(v), s[0], s[1], s[2], s[3]
+            ),
+            // Unreachable by construction (`dns_lookup` returns `NoResolver` and nothing else when
+            // `server` is `None`), and still WITNESSED rather than silent: a future arm that breaks
+            // that invariant prints this instead of vanishing.
+            (v, None) => serial_println!("{} dns {} -> {} (server none) ::", P6, host, DnsSay(v)),
+        }
+        match v {
+            DnsVerdict::Resolved(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// Every way a [`dns`] lookup can end. One arm per failure MODE, so the wire distinguishes "the
+    /// resolver said no" from "nothing came back" from "we never got off the box".
+    #[derive(Clone, Copy)]
+    enum DnsVerdict {
+        /// No lease and no gateway: there is no address to ask.
+        NoResolver,
+        /// `net_dns::build_query` refused the name (empty/over-long label, over-long encoded name).
+        BadName,
+        /// Every socket slot is in use.
+        NoSocket,
+        /// The socket would not take an ephemeral port.
+        BindFailed,
+        /// The stack refused the datagram.
+        SendFailed,
+        /// The query went out and nothing came back inside the receive budget.
+        NoAnswer,
+        /// A well-formed response carrying a non-zero RCODE.
+        ServerErr(u8),
+        /// RCODE=0 with no usable A record.
+        NoRecord,
+        /// Structurally invalid — rejected by the parser.
+        Malformed,
+        Resolved([u8; 4]),
+    }
+
+    /// Renders a [`DnsVerdict`] as the wire's verdict phrase. A `Display` adapter rather than a
+    /// `&'static str` because two arms carry a value, and the single emission point above must be
+    /// able to print every arm through one format slot.
+    struct DnsSay(DnsVerdict);
+    impl core::fmt::Display for DnsSay {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self.0 {
+                DnsVerdict::NoResolver => f.write_str("NO RESOLVER (no lease, no gateway)"),
+                DnsVerdict::BadName => f.write_str("BAD NAME (unencodable)"),
+                DnsVerdict::NoSocket => write!(f, "NO SOCKET (all {} slots in use)", NSOCK),
+                DnsVerdict::BindFailed => f.write_str("BIND FAILED (no ephemeral port)"),
+                DnsVerdict::SendFailed => f.write_str("SEND FAILED (sendto refused)"),
+                DnsVerdict::NoAnswer => f.write_str("NO ANSWER within budget"),
+                DnsVerdict::ServerErr(rc) => write!(f, "SERVER ERROR rcode={}", rc),
+                DnsVerdict::NoRecord => f.write_str("NO A RECORD"),
+                DnsVerdict::Malformed => f.write_str("MALFORMED REPLY"),
+                DnsVerdict::Resolved(a) => write!(f, "A {}.{}.{}.{}", a[0], a[1], a[2], a[3]),
+            }
+        }
+    }
+
+    /// Witness emissions from [`dns`] — one per invocation, bumped at the single emission point. The
+    /// `virt` fixture asserts it moves by EXACTLY one across a FAILING lookup, which is the mechanical
+    /// form of "the verb must witness every path": lose the emission and the counter stops, and the
+    /// leg reds. Bounded by construction: one per verb invocation, never one per packet.
+    static DNS_WITNESS: AtomicU32 = AtomicU32::new(0);
+
+    /// The lookup itself: all I/O, no printing. Returns the verdict the one emission point renders.
+    fn dns_lookup(host: &str, server: Option<[u8; 4]>) -> DnsVerdict {
+        let Some(server) = server else { return DnsVerdict::NoResolver };
         let mut qbuf = [0u8; 320];
         // The transaction id is the poll clock's low half: two lookups in one boot never collide, and
         // `parse_a` REJECTS a datagram whose id does not match, so a late reply to a previous query
         // can never be read as the answer to this one.
         let txid = (POLL_CLOCK.load(Ordering::Relaxed) as u16) ^ 0x4e36;
         let Some(qlen) = crate::net_dns::build_query(&mut qbuf, txid, host) else {
-            serial_println!("{} dns {} -> BAD NAME (unencodable) ::", P6, host);
-            return None;
+            return DnsVerdict::BadName;
         };
         // A kernel-side lookup borrows a ring-3 socket slot for the duration and gives it straight
         // back; `open`'s owner is the SHELL's address space, which no EL0 teardown will sweep.
-        let Some(sid) = open(u64::MAX, false) else {
-            serial_println!("{} dns {} -> NO SOCKET (all {} slots in use) ::", P6, host, NSOCK);
-            return None;
-        };
-        let mut answer = None;
-        if bind(sid, next_ephemeral()).is_ok()
-            && sendto(sid, server, crate::net_dns::DNS_PORT, &qbuf[..qlen]).is_ok()
-        {
-            let mut rbuf = [0u8; 512];
-            if let Some((_src, _sport, n)) = recvfrom(sid, &mut rbuf) {
-                match crate::net_dns::parse_a(&rbuf[..n], txid) {
-                    crate::net_dns::Dns::Resolved(a) => {
-                        serial_println!(
-                            "{} dns {} -> A {}.{}.{}.{} (server {}.{}.{}.{}) ::",
-                            P6, host, a[0], a[1], a[2], a[3],
-                            server[0], server[1], server[2], server[3]
-                        );
-                        answer = Some(a);
-                    }
-                    crate::net_dns::Dns::ServerErr(rc) => serial_println!(
-                        "{} dns {} -> SERVER ERROR rcode={} (server {}.{}.{}.{}) ::",
-                        P6, host, rc, server[0], server[1], server[2], server[3]
-                    ),
-                    crate::net_dns::Dns::NoAnswer => serial_println!(
-                        "{} dns {} -> NO A RECORD (server {}.{}.{}.{}) ::",
-                        P6, host, server[0], server[1], server[2], server[3]
-                    ),
-                    crate::net_dns::Dns::Malformed => serial_println!(
-                        "{} dns {} -> MALFORMED REPLY (server {}.{}.{}.{}) ::",
-                        P6, host, server[0], server[1], server[2], server[3]
-                    ),
-                }
-            } else {
-                serial_println!(
-                    "{} dns {} -> NO ANSWER within budget (server {}.{}.{}.{}) ::",
-                    P6, host, server[0], server[1], server[2], server[3]
-                );
-            }
+        let Some(sid) = open(u64::MAX, false) else { return DnsVerdict::NoSocket };
+        // SPLIT, deliberately: `bind` and `sendto` fail for different reasons (no free ephemeral port
+        // vs. the stack refusing the datagram) and the old single "SEND FAILED (socket unusable)"
+        // could not say which. A witness that cannot name the step it failed at costs a whole boot.
+        let bound = bind(sid, next_ephemeral()).is_ok();
+        let sent = bound && sendto(sid, server, crate::net_dns::DNS_PORT, &qbuf[..qlen]).is_ok();
+        let mut rbuf = [0u8; 512];
+        let v = if !bound {
+            DnsVerdict::BindFailed
+        } else if !sent {
+            DnsVerdict::SendFailed
         } else {
-            serial_println!("{} dns {} -> SEND FAILED (socket unusable) ::", P6, host);
-        }
+            match recvfrom(sid, &mut rbuf) {
+                Some((_src, _sport, n)) => match crate::net_dns::parse_a(&rbuf[..n], txid) {
+                    crate::net_dns::Dns::Resolved(a) => DnsVerdict::Resolved(a),
+                    crate::net_dns::Dns::ServerErr(rc) => DnsVerdict::ServerErr(rc),
+                    crate::net_dns::Dns::NoAnswer => DnsVerdict::NoRecord,
+                    crate::net_dns::Dns::Malformed => DnsVerdict::Malformed,
+                },
+                None => DnsVerdict::NoAnswer,
+            }
+        };
+        // The slot goes back on EVERY arm above, including the two that never used it.
         close(sid);
-        answer
+        v
     }
 
     // ── The socket registry: what the EL0 syscall family drives ───────────────────────────────────
@@ -1685,12 +1890,16 @@ pub mod net6 {
     /// jetson green certifies only that this COMPILES AND LINKS — the behaviour is proven here, on
     /// `virt`, over `virtio_net.rs`, through the IDENTICAL shared code an Orin boot runs.
     ///
-    /// Three legs, each its own witness line:
+    /// Five legs, each its own witness line:
     ///   1. `dns`   — a UDP round-trip through the persistent set (`open`/`bind`/`sendto`/`recvfrom`,
     ///                exactly the syscall bodies) to the leased resolver.
     ///   2. `tcp`   — an active open to the slirp gateway's DNS-over-TCP port, a write and a read
     ///                (`open`/`connect`/`send`/`recv`), i.e. the stream half of the family.
     ///   3. `ping`  — ICMP to the gateway, which also prints the per-sequence RTT lines.
+    ///   4. `arp`   — the VERB, in the operator's own order (ping, then arp, same address): the table
+    ///                must be warm before the call and the verb must answer from it. SO47's go-red.
+    ///   5. `dns` failure path — the VERB must witness a failure it returns no address for, naming
+    ///                the resolver. SO47's other half was a `dns` that printed nothing at all.
     ///
     /// Every leg is bounded; a silent backend makes them print a FAIL line, never hang.
     pub fn fixture() {
@@ -1724,6 +1933,62 @@ pub mod net6 {
         match ping(gw, 4) {
             Some(o) if o.received > 0 => pass += 1,
             _ => {}
+        }
+
+        // Leg 4 — the `arp` VERB, run immediately after the ping, which is exactly the order the
+        // operator typed on render14 boot4 (`ping 10.42.0.1` then `arp 10.42.0.1`). SO47's go-red: the
+        // table must already hold the gateway BEFORE `arp` is called — that is the learn path the
+        // defect was missing — and `arp` must then answer from it. If the learn path stops running,
+        // `cached_before` is false and this leg reds even though the verb still resolves off the wire.
+        legs += 1;
+        let cached_before = neigh_lookup(gw);
+        match (arp(gw), cached_before) {
+            (Some(m), Some((c, _))) if m == c => {
+                pass += 1;
+                serial_println!(
+                    "{} fixture arp: answered from the neighbour table the ping filled -> PASS ::",
+                    P6
+                );
+            }
+            (Some(_), Some(_)) => serial_println!(
+                "{} fixture arp -> FAIL — the verb and the table disagree on the gateway MAC ::",
+                P6
+            ),
+            (Some(_), None) => serial_println!(
+                "{} fixture arp -> FAIL — resolved, but the table was EMPTY after a 4/4 ping: the learn path did not run ::",
+                P6
+            ),
+            (None, _) => serial_println!(
+                "{} fixture arp -> FAIL — no answer from the table and none from the wire ::",
+                P6
+            ),
+        }
+
+        // Leg 5 — the `dns` VERB on a FAILURE path, because SO47's second half is that a failing `dns`
+        // printed NOTHING and the wire could not say whether it failed to parse, to find a resolver,
+        // to send or to wait. `a..b` carries an empty label, which `net_dns::build_query` refuses
+        // (net_dns.rs:86), so this takes the BAD NAME arm deterministically on every platform and
+        // proves the witness fires — WITH the resolver named — on a path that returns no address.
+        legs += 1;
+        let w0 = DNS_WITNESS.load(Ordering::Relaxed);
+        let answered = dns("a..b");
+        let emitted = DNS_WITNESS.load(Ordering::Relaxed).wrapping_sub(w0);
+        match (answered, emitted) {
+            (None, 1) => {
+                pass += 1;
+                serial_println!(
+                    "{} fixture dns-failpath: witnesses=1 on a path that returned no address, resolver named -> PASS ::",
+                    P6
+                );
+            }
+            (None, n) => serial_println!(
+                "{} fixture dns-failpath -> FAIL — the failing lookup emitted {} witnesses, not 1 ::",
+                P6, n
+            ),
+            (Some(_), _) => serial_println!(
+                "{} fixture dns-failpath -> FAIL — an unencodable name RESOLVED ::",
+                P6
+            ),
         }
 
         // The `dns` VERB itself, on the same wire — the shell verb an operator types, exercised here

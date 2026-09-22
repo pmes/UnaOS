@@ -1492,3 +1492,126 @@ otherwise have nothing left to take it out.
 
 So both x86 power ports now drain both buffers, and the table at the top of this section has no row
 left where a route reaches firmware with the cable's tail unsent.
+## SERWIRE — the cap is on the metal path, so 375 ms is not 192 bytes of UART
+
+SO29 concluded that `[comp2] max_us` measures this ring's drain, and SO31/DRAINCAP capped one drain at
+[`DRAIN_BYTE_BUDGET`] = 192 B and predicted the drag-stall band would fall from 377.8 ms to 22.6 ms.
+On render14 metal it did not move: `[comp2] max_us` reads 361 130 / 359 500 / 348 593 us across boots
+1/2/5 and 367 166 us on boot 3. SO45 is that disagreement, and this section is the derivation that
+settles which half of it is wrong.
+
+### The path, with a line at every hop
+
+The compositor's rollup reaches the UART on the Jetson through exactly this chain. No hop carries a
+`cfg` that a tegra flight build turns off, and the last one is the cap:
+
+| hop | file:line | what |
+| --- | --- | --- |
+| 1 | `video/wm.rs:14451` | `comp2_emit(span)` from the `[wcn]` rollup cadence — `#[cfg(feature = "witness")]`, and the flight line arms `UNAOS_WITNESS=1` |
+| 2 | `video/wm.rs:13462` | `serial_println!("[comp2] rollup …")` |
+| 3 | `arch/aarch64/serial.rs:284` | the macro expands to `arch::aarch64::serial::_print` |
+| 4 | `arch/aarch64/serial.rs:177` | `_print` — `note_submitted`, then the panic escape hatch (`:199`, uncapped, not the flight path) |
+| 5 | `arch/aarch64/serial.rs:203` | `arch::without_interrupts(|| { … })` — the whole body runs IRQ-masked |
+| 6 | `arch/aarch64/serial.rs:224` | `SERIAL_PORT.try_lock()` |
+| 7 | `arch/aarch64/serial.rs:238` | **`serial_ring::drain_capped(&mut sink)` — THE CAP, with no `cfg` on it** |
+| 8 | `serial_ring.rs:709/710` | `drain_capped` → `drain_into(.., DRAIN_BYTE_BUDGET)` |
+| 9 | `serial_ring.rs:251` | `pub const DRAIN_BYTE_BUDGET: usize = 192` — ungated, both arches, every image |
+| 10 | `serial_ring.rs:842` | `drain_may_continue(paid, budget)`, i.e. `paid < 192`, tested BEFORE each line |
+| 11 | `arch/aarch64/serial.rs:141` | the sink → `SerialPort::write_str` → `write_byte` |
+| 12 | `arch/aarch64/serial.rs:64` | `tegra::write_byte` — bounded THRE poll, one 32-bit store per byte |
+
+`DRAINCAP_PAD` (`serial_ring.rs:1839`) is a different object and is **not** on that path at all. It is
+`#[cfg(feature = "witness")]` fixture padding, read only by `draincap_selftest` (`:1892`),
+`backpressure_selftest` (`:2029`), `pwrdrain_selftest` (`:2172`) and `s5drain_selftest` (`:2316`) — all
+of which are reached only from `mirror_service`, which LEDGER SO41 proved is unreachable on the Jetson
+flight image. The pad has never executed on that board. The CAP CONSTANT is not gated on anything.
+
+### The arithmetic
+
+115200 8N1 is 10 bits per byte = 11 520 B/s = **86.805 us/byte**. Step 10 tests the budget before it
+takes a line and the test is strictly `<`, so one capped drain pays at most
+`DRAIN_BYTE_BUDGET - 1 + <widest line it took>`:
+
+```text
+  SO31's stated 68 B line       191 +   68 =   259 B  =  22.5 ms      <- SERDRAIN's prediction
+  render14 boot 1 mean 143.1 B  191 +  143 =   334 B  =  29.0 ms
+  render14 boot 1 max   1135 B  191 + 1135 = 1 326 B  = 115.1 ms      <- absolute worst single drain
+  the uncapped pre-SO31 ring    64 x   68 = 4 352 B  = 377.8 ms      <- SO29's mechanism
+```
+
+(line widths measured over the 5 926 lines of `docs/dev/evidence/orin28/render14-boot1-desktop-menubar.log`.)
+
+Against that, `max_us = 361 130 us` is `361130 / 86.805` = **4 161 bytes** of UART — 21.7 budgets, and
+1.05 whole staging rings of the 68 B shape. **One capped drain cannot produce it.** So either SO29's
+mechanism is wrong, or a single composite pass makes many prints. Two readings off the flight capture
+point at the first, and neither is conclusive alone:
+
+* render14 boot 1 has **zero** `[serial] dropped` lines, where the pre-SERDRAIN render13 boot 1 had
+  `dropped 5331 lines in 192 events`. The ring never reached `SLOTS` on the flight at all, and a ring
+  that never fills has no 64 lines to drain.
+* render14 boot 3's power verb printed `[pwrshutoff] ring drained lines=1 bytes=163` — the whole
+  staging ring held **one** line at shutdown — on the same boot that read `max_us=367166`.
+
+### The instrument: a SPAN TOTAL is an upper bound on any single pass
+
+`drain_capped` is the one spelling both arches' `_print` use (`arch/aarch64/serial.rs:238`,
+`arch/x86_64/serial.rs:132`) and is exactly the object SO31 capped. SERWIRE charges every call in
+cycles and bytes, and `comp2_emit` drains that odometer on the same rollup and against the same span
+as `max_cyc`. Because the span total bounds any single pass inside the span:
+
+```text
+  drain_us  <  max_us   =>  the pass that produced max_us did NOT spend it in the ring drain
+  drain_us >=  max_us   =>  the drain could still account for it; per-pass attribution is next
+```
+
+That is what makes the adjudication possible without a new bracket in the compositor — this arc is
+allowed to touch exactly one site in `video/wm.rs`, the `[comp2]` rollup emit, and that is enough.
+
+The uncapped spellings (`drain`, `power_drain`, `discard_staged`) are deliberately **not** charged:
+they run in panic and power contexts, never inside a composite pass, and counting them would put a
+shutdown flush into a drag-stall number. `serwire_selftest` asserts both directions.
+
+### The constants, each with its reason
+
+| constant | value | why |
+| --- | --- | --- |
+| `SERWIRE_ARM_US` (`video/wm.rs`) | `100_000` us | the threshold `max_us` must cross before the line speaks. render14 boot 1's healthy rollups read `pass_us` 8 227..17 679 and `max_us` 43 218..85 871, so 100 ms is above every healthy pass that boot recorded and is 6x the 16.667 ms frame; the stall band it exists for (348 593..367 166 us) clears it by 3.5x. A lower threshold would latch on the first rollup of every boot and report a span with no stall in it. |
+| `SERWIRE_LINE_B` | `18 + 48 + 1 = 67` | width of one fixture fill line, `"[serwire] fill NN " + DRAINCAP_PAD + "\n"`, so the byte assertions are arithmetic the compiler checks rather than magic numbers |
+| `SERWIRE_BOUND_B` | `DRAIN_BYTE_BUDGET + SERWIRE_LINE_B = 259` | the cap's own stated bound instantiated for that width |
+| `SERWIRE_FILL` | `8` | more than one budget and less than `SLOTS`, so one capped drain and one uncapped drain each have work to do and `filled` is not clipped by back-pressure |
+| `SERWIRE_WANT_B` | `3 * 67 = 201` | what one capped drain must emit: 0, 67 and 134 are under 192; 201 is not. Three lines. |
+
+The four rows are pinned by `const _: () = assert!(...)` in `serial_ring.rs` and, like every other truth
+table in that file, they are **not** `witness`-gated: they emit no code, and a compile-time go-red that
+only runs in the configuration nobody ships is the polarity trap LAWS §5 names.
+
+### What it costs a flight boot
+
+The line prints **at most once per boot** — `SERWIRE_SAID` is a one-shot latch — and is bounded at
+**324 B**: 113 B of format literal and newline, plus ten fields that cannot exceed 20 decimal digits
+each, plus the 11 B verdict word. Measured at 163 B on the render14 numbers it was shaped against. A per-rollup field was rejected outright: at ~140 rollups on a 700 s boot
+that is SO30 one layer up, and the brief forbids it. `[comp2]` itself is not widened by one byte.
+
+`wire_take()` is nevertheless called on **every** rollup, latched or not, so the odometer stays a SPAN
+and can never silently become a boot total. That ordering is load-bearing in one direction only: an
+inflated `drain_us` can produce a false `DRAIN-BOUND`, never a false `NOT-DRAIN`, so the verdict errs
+toward keeping SO29 alive rather than toward acquitting the drain.
+
+The hot path pays two `now_cycles()` reads (one `mrs cntvct_el0` / one `rdtsc`) and five relaxed
+atomics per print, in a witness build only, and zero bytes of UART.
+
+### Reading the next Orin boot
+
+```text
+[comp2] rollup passes=N pass_us=… max_us=361130 … blit_us=… span=…ms
+[serwire] arm max_us=361130 span_ms=34258 passes=4 drains=D drain_us=U drain_b=B maxdrain_us=X maxdrain_b=Y cap_b=192 share_pct=P -> NOT-DRAIN
+```
+
+`-> NOT-DRAIN` with a small `share_pct` closes SO29: the drag stall is not this ring, and the next
+suspect is whatever `[comp2] blit_us` is measuring (on the 361 130 rollup it is 94 713 us mean against a
+119 516 us mean pass, i.e. 79 % of the pass, at 32 B/us against the 109 B/us the same boot's healthy
+rollups sustain). `-> DRAIN-BOUND` keeps SO29 alive and makes per-pass attribution the next arc.
+`maxdrain_b` above `DRAIN_BYTE_BUDGET - 1 + SLOT_LEN` would convict the cap itself.
+
+No `[serwire]` line on a capture that HAS `[comp2]` rollups means no pass crossed 100 ms that boot —
+the "the stall did not happen" reading, not "the instrument did not run".

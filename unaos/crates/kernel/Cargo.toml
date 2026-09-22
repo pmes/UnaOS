@@ -1567,6 +1567,24 @@ vnet = ["dep:smoltcp"]
 # `arm-virt-net6` and `arm-tegra-net6` legs of KERNEL_CFG_MATRIX, never by the knob map in `arroyo`.
 net6 = ["dep:smoltcp"]
 
+# SNTP-NET6 (`sntp6` / UNAOS_SNTP6=1): the internet TIME CLIENT over the NET6 socket surface, plus the
+# menu bar's bounded clock-transition witness. `crates/kernel/src/net_sntp_client.rs` — the RFC 4330
+# wire format is NOT duplicated (it is `crate::net_sntp`, the one security surface) and the civil
+# renderer is NOT duplicated (it is `crate::clock::render_iso8601`); this feature is the CLIENT and the
+# proof that the bar's clock face lights up, and nothing else.
+#
+# STANDALONE, and deliberately not `sntp6 = ["net6"]`. A cargo implication would delete the
+# `sntp6`-on/`net6`-off polarity from every leg of KERNEL_CFG_MATRIX, which is the default-quiet-knob
+# hole LAWS §5 names (orin 20: "read the polarity, not the leg count"). The module carries the
+# conjunction in its own cfg (`all(sntp6, net6, aarch64)`, at lib.rs), so `sntp6` alone compiles the
+# menu-bar witness and no client — which is exactly what an x86 `wc` build wants. `arroyo`'s
+# `UNAOS_SNTP6=1` appends `net6` beside it the way the NIC knobs do, so an operator still types one knob.
+#
+# Default OFF => the client module is never lexed, the two menubar statements and the `tste` leg vanish,
+# and both arches are byte-identical to baseline (`./arroyo knoboff net6`). The ARMED polarity is
+# type-checked by the `arm-virt-sntp6` leg of KERNEL_CFG_MATRIX, never by the knob map in `arroyo`.
+sntp6 = []
+
 # CORE3-PROBE: instrument the aarch64 secondary-core entry stub (`_secondary_start`) to raw-dump,
 # MMU-off / no-stack, each core's MPIDR_EL1 low byte, CurrentEL, and its arrival x0 to the Pi 4 PL011
 # (0xFE201000) BEFORE any Rust runs. Disambiguates the CORE3-SMP >1 MiB core-3 regression (firmware

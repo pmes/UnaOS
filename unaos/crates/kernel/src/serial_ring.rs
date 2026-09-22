@@ -706,8 +706,8 @@ pub fn drain<F: FnMut(&str)>(emit: F) {
 /// Same contract, same order, same accounting as [`drain`]; the single difference is that the loop
 /// stops once it has emitted `DRAIN_BYTE_BUDGET` bytes, leaving the remainder in the ring for the next
 /// print. See [`DRAIN_BYTE_BUDGET`] for the arithmetic and for why the cap cannot lose a line.
-pub fn drain_capped<F: FnMut(&str)>(emit: F) {
-    drain_into(emit, &EMITTED, true, DRAIN_BYTE_BUDGET);
+pub fn drain_capped<F: FnMut(&str)>(emit: F) { #[cfg(feature = "witness")] wire_measured(emit); // SERWIRE (SO45) — the odometer goes HERE, on the one spelling both arches' `_print` uses, so what it reports is the cost of the drain SO31 capped and of nothing else. ⚠ LINE-NEUTRAL fold onto the SIGNATURE line, before any `//`: the body below keeps its own line and its own line NUMBER, or every `panic::Location` under it in this file moves in the knob-off image (LEDGER P7). Two exclusive `cfg`s rather than an early `return`, because a `return` would leave the line below type-checked against a moved `emit`.
+    #[cfg(not(feature = "witness"))] drain_into(emit, &EMITTED, true, DRAIN_BYTE_BUDGET); // ⚠ SAME-LINE fold: the call, its arguments and its line number are unchanged; only the `cfg` is new, and it is TRUE in every build that does not arm `witness` — which is every default and every media build (LAWS §5, orin 20).
 }
 
 /// The budget predicate, split out so it is `const`-evaluable and its go-red rows can be pinned in the
@@ -1695,7 +1695,7 @@ pub fn mirror_service() {
     // PWRDRAIN (SO31 part 3) — the power-verb full drain. Same one-shot call site and same contract;
     // it is last because it deliberately fills the ring to SLOTS and then empties it completely, and
     // a fixture that leaves the ring as it found it should not do so before one that reads it.
-    #[cfg(feature = "witness")] pwrdrain_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] s5drain_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] sinkdrain_selftest(); // S5DRAIN (trunk queue §5, 2026-09-12) — PWRDRAIN's twin for the x86 route that does NOT go through `power.rs`: `video/crystal.rs`'s Shut Down and `video/instgui.rs` call `arch::acpi_power::poweroff()` directly. x86-only because the defect is: on aarch64 the desktop's Shut Down is `power::crystal_shutdown`, which has drained since SO31. Last, and after PWRDRAIN, for PWRDRAIN's own stated reason — it fills the ring to SLOTS and empties it again, so it must not run before a fixture that reads the ring. SINKDRAIN (2026-09-15) joins this same physical line for the same reason and runs LAST of all: it fills and empties the ring like the two above it AND then reads the FTDI mirror ring's tail, so anything after it would be measuring that fixture's own traffic. ⚠ LINE-NEUTRAL append; both bodies are FILE-TAIL appends, so no `panic::Location` in this file moves.
+    #[cfg(feature = "witness")] pwrdrain_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] s5drain_selftest(); #[cfg(all(target_arch = "x86_64", feature = "witness"))] sinkdrain_selftest(); #[cfg(feature = "witness")] serwire_selftest(); // S5DRAIN (trunk queue §5, 2026-09-12) — PWRDRAIN's twin for the x86 route that does NOT go through `power.rs`: `video/crystal.rs`'s Shut Down and `video/instgui.rs` call `arch::acpi_power::poweroff()` directly. x86-only because the defect is: on aarch64 the desktop's Shut Down is `power::crystal_shutdown`, which has drained since SO31. Last, and after PWRDRAIN, for PWRDRAIN's own stated reason — it fills the ring to SLOTS and empties it again, so it must not run before a fixture that reads the ring. SINKDRAIN (2026-09-15) joins this same physical line for the same reason and runs LAST of all: it fills and empties the ring like the two above it AND then reads the FTDI mirror ring's tail, so anything after it would be measuring that fixture's own traffic. ⚠ LINE-NEUTRAL append; both bodies are FILE-TAIL appends, so no `panic::Location` in this file moves.  SERWIRE (SO45) appended AFTER sinkdrain and running LAST OF ALL. Both fixtures claim the last slot; the tie is settled by their own stated reasons, not by arrival order. SINKDRAIN must have nothing after it because it reads the FTDI mirror ring's TAIL, so a later fixture would measure sinkdrain's own traffic — but SERWIRE ZEROES ITS ODOMETER ON ENTRY, opening a fresh span that inherits none of that traffic. The reverse order is the one that breaks: sinkdrain after serwire would be measured against the span serwire opened, which serwire's own comment forbids. ⚠ LINE-NEUTRAL append, before the line's first `//`; the body is a FILE-TAIL append.
 }
 
 /// One-shot: has the SERWIT-2 verdict been emitted yet?
@@ -2695,6 +2695,290 @@ fn sinkdrain_selftest() {
             residue,
             lost,
             mirror_lost
+        );
+    }
+}
+// ── SERWIRE (SO45) — WHAT A CAPPED DRAIN ACTUALLY COSTS, MEASURED WHERE THE BOARD RUNS ──────────
+//
+// ### Why this exists: the cap is on the metal path, and the stall did not move
+//
+// SO29 concluded that `[comp2] max_us` is the serial staging-ring drain, and SO31/SERDRAIN capped
+// one drain's BYTES at [`DRAIN_BYTE_BUDGET`] = 192 to bound it. The cap IS on the path the aarch64
+// metal boot takes, with no `cfg` anywhere on it:
+//
+//     video/wm.rs:14451          comp2_emit(span)                      (`witness`)
+//     video/wm.rs:13462          serial_println!("[comp2] rollup …")
+//     arch/aarch64/serial.rs:284 serial_println! -> aarch64::serial::_print
+//     arch/aarch64/serial.rs:177 _print
+//     arch/aarch64/serial.rs:203   arch::without_interrupts(|| {
+//     arch/aarch64/serial.rs:224     SERIAL_PORT.try_lock()
+//     arch/aarch64/serial.rs:238     serial_ring::drain_capped(&mut sink)   <-- THE CAP, NO cfg
+//     serial_ring.rs:710             drain_into(.., DRAIN_BYTE_BUDGET)
+//     serial_ring.rs:842             drain_may_continue(paid, 192)
+//     arch/aarch64/serial.rs:141   SerialPort::write_str -> write_byte -> tegra::write_byte (:64)
+//
+// [`DRAINCAP_PAD`] is a different object and is NOT on that path: it is `witness`-gated fixture
+// padding (this file, above), read only by `draincap_selftest`, `backpressure_selftest`,
+// `pwrdrain_selftest` and `s5drain_selftest`, all of which are called only from [`mirror_service`] —
+// which LEDGER SO41 proved is unreachable on the Jetson flight image. The CAP CONSTANT
+// [`DRAIN_BYTE_BUDGET`] is ungated and is compiled into every image on both arches.
+//
+// ### The arithmetic, and why it refutes the mechanism rather than the fix
+//
+// 115200 8N1 = 10 bits/byte = 11 520 B/s = 86.805 us/byte. `drain_into` tests the budget BEFORE it
+// takes a line and the test is strictly `<`, so one capped drain pays at most
+// `DRAIN_BYTE_BUDGET - 1 + <widest line it took>`:
+//
+//     render14 boot 1 mean line 143.1 B  ->  191 + 143 =   334 B =  29.0 ms
+//     render14 boot 1 max  line 1135 B   ->  191 + 1135 = 1326 B = 115.1 ms
+//     SO31's stated 68 B shape            ->  191 +  68 =   259 B =  22.5 ms
+//
+// against a measured `[comp2] max_us` of 361 130 / 359 500 / 348 593 us (boots 1/2/5) and 367 166 us
+// on boot 3. 361 130 us / 86.805 us/B = **4 161 bytes** — 21.7 budgets, and 1.05 whole staging rings
+// of the 68 B shape (64 x 68 = 4 352 B). The capped drain cannot produce that number in ONE drain,
+// so either SO29's mechanism is wrong or a single composite pass contains many prints. Two readings
+// off the flight capture say the first:
+//
+//   * render14 boot 1 has ZERO `[serial] dropped` lines (`awk 'index($0,"[serial] dropped")'` = 0)
+//     where the pre-SERDRAIN render13 boot 1 had `dropped 5331 lines in 192 events`. The ring never
+//     reached SLOTS on the flight at all, and a ring that never fills has no 64 lines to drain.
+//   * render14 boot 3's power verb reports `[pwrshutoff] ring drained lines=1 bytes=163` — the WHOLE
+//     staging ring held ONE line at shutdown — on the same boot that read `max_us=367166`.
+//
+// Neither is conclusive on its own: both are snapshots, and a span-total of drain time is what the
+// question needs. That is what this instrument is.
+//
+// ### What it measures, and why a SPAN TOTAL settles it without per-pass brackets
+//
+// [`drain_capped`] is the one spelling both arches' `_print` uses, and it is exactly the object
+// SERDRAIN capped. Every call is charged here in CYCLES and in BYTES. [`wire_take`] hands the
+// accumulated span to `video/wm.rs`'s `comp2_emit`, which drains it on the SAME rollup cadence and
+// against the SAME span as `max_us` — so the two numbers are comparable without any new bracket in
+// the compositor. **A span total is an upper bound on any single pass inside that span**, so
+// `drain_us < max_us` is arithmetic proof that the pass that produced `max_us` did not spend it in
+// the ring drain. That is the whole adjudication, and it needs no per-pass attribution, which is
+// what makes it fit the one site in `wm.rs` this arc is allowed to touch.
+//
+// The uncapped spellings ([`drain`], [`power_drain`], [`discard_staged`]) are deliberately NOT
+// charged: they run in panic and power contexts, never inside a composite pass, and counting them
+// would put a shutdown flush into a drag-stall number. [`serwire_selftest`] asserts both directions.
+//
+// ### Cost
+// `witness`-gated, so it does not exist in the default image. In a witness build the hot path adds
+// two `now_cycles()` reads (one `rdtsc` / one `mrs cntvct_el0`) and five relaxed atomics per print,
+// and ZERO bytes of UART — the wire cost is the single latched `[serwire]` line `wm.rs` prints, at
+// most once per boot. See `docs/dev/OS/02_KERNEL_CORE/serial_transport.md` §SERWIRE.
+
+/// SERWIRE — cycles spent inside [`drain_capped`] since the last [`wire_take`]. Cycles, not
+/// microseconds: the conversion needs the arch's timer rate and that reader lives in `video::wcg`,
+/// so the transport stores the raw clock and the consumer converts it.
+#[cfg(feature = "witness")]
+static WIRE_CYC: AtomicU64 = AtomicU64::new(0);
+/// SERWIRE — bytes emitted by those drains. The currency the UART charges (86.805 us each).
+#[cfg(feature = "witness")]
+static WIRE_B: AtomicU64 = AtomicU64::new(0);
+/// SERWIRE — how many capped drains the span took. `WIRE_B / WIRE_N` is the mean drain, which the
+/// cap says must sit under `DRAIN_BYTE_BUDGET + <line>`.
+#[cfg(feature = "witness")]
+static WIRE_N: AtomicU64 = AtomicU64::new(0);
+/// SERWIRE — the single most expensive drain of the span, in cycles. This is the number SO31's
+/// 22.6 ms bound is a claim about, so it is reported rather than inferred from the mean.
+#[cfg(feature = "witness")]
+static WIRE_MAX_CYC: AtomicU64 = AtomicU64::new(0);
+/// SERWIRE — the widest single drain of the span, in bytes. Bounded by the cap at
+/// `DRAIN_BYTE_BUDGET - 1 + SLOT_LEN`; a reading above that convicts the cap itself.
+#[cfg(feature = "witness")]
+static WIRE_MAX_B: AtomicU64 = AtomicU64::new(0);
+
+/// SERWIRE — charge ONE capped drain. Relaxed throughout: this runs IRQ-masked with the UART Mutex
+/// held, so it may not block, allocate, print or take a second lock, and the numbers are a span
+/// total read by one consumer long afterwards — no ordering between them is load-bearing.
+#[cfg(feature = "witness")]
+#[inline]
+fn wire_charge(cyc: u64, bytes: u64) {
+    WIRE_CYC.fetch_add(cyc, Ordering::Relaxed);
+    WIRE_B.fetch_add(bytes, Ordering::Relaxed);
+    WIRE_N.fetch_add(1, Ordering::Relaxed);
+    WIRE_MAX_CYC.fetch_max(cyc, Ordering::Relaxed);
+    WIRE_MAX_B.fetch_max(bytes, Ordering::Relaxed);
+}
+
+/// SERWIRE — [`drain_capped`] with the odometer around it. Split out of `drain_capped` rather than
+/// written inline there because the knob-off build must keep `drain_capped`'s body on ITS OWN LINE,
+/// unchanged, or every `panic::Location` below it in this file moves (LEDGER P7).
+#[cfg(feature = "witness")]
+fn wire_measured<F: FnMut(&str)>(mut emit: F) {
+    let t0 = crate::arch::now_cycles();
+    let mut n = 0u64;
+    drain_into(
+        |s| {
+            n += s.len() as u64;
+            emit(s);
+        },
+        &EMITTED,
+        true,
+        DRAIN_BYTE_BUDGET,
+    );
+    wire_charge(crate::arch::now_cycles().saturating_sub(t0), n);
+}
+
+/// SERWIRE — drain the odometer: `(drains, bytes, cycles, max_cycles, max_bytes)`, every cell reset
+/// to zero so the next reading is a SPAN and not a running total.
+///
+/// Called once per `[comp2]` rollup by `video/wm.rs`, unconditionally — the swap happens on every
+/// rollup even after the latched line has been said, so the odometer never becomes a boot total that
+/// a later reader would mistake for a span.
+#[cfg(feature = "witness")]
+pub fn wire_take() -> (u64, u64, u64, u64, u64) {
+    (
+        WIRE_N.swap(0, Ordering::Relaxed),
+        WIRE_B.swap(0, Ordering::Relaxed),
+        WIRE_CYC.swap(0, Ordering::Relaxed),
+        WIRE_MAX_CYC.swap(0, Ordering::Relaxed),
+        WIRE_MAX_B.swap(0, Ordering::Relaxed),
+    )
+}
+
+// ── SERWIRE's fixture — the odometer is wired to the CAPPED drain and to nothing else ────────────
+//
+// The instrument's realistic failure is that it reads ZERO for the wrong reason: unwired, gated out,
+// or charged on a spelling `_print` does not use. A zero then prints `-> NOT-DRAIN` and acquits the
+// drain on no evidence, which is the exact shape of the acquittal SO29 had to undo (SO30's `wcd_us`
+// read 0 through the whole flood). So the fixture asserts the charge in BOTH directions on the live
+// ring and the live policy, in the order `_print` runs them.
+//
+//     stage SERWIRE_FILL lines of SERWIRE_LINE_B      ->  8 x 67 B staged
+//     drain_capped(...)                               ->  drains=1 bytes=201  (3 lines: 0,67,134 < 192)
+//     drain(...)            [the UNCAPPED spelling]   ->  drains=0 bytes=0, residue 5 lines
+//
+// 201 B is `DRAIN_BYTE_BUDGET - 1 + SERWIRE_LINE_B` rounded to whole lines, and it is the SAME
+// arithmetic DRAINCAP asserts, read through the new counters instead of through the fixture's own
+// tally — so the two fixtures convict each other if either drifts.
+//
+// ### The go-red, both at runtime (a compile-time form is not available: `wire_charge` has no type
+// ### that distinguishes it from not being called at all)
+//   * THE REALISTIC ONE — delete the `wire_charge(...)` call from [`wire_measured`]. The odometer
+//     reads `drains=0 bytes=0` where the fill provably went out, and the verdict is
+//     `:: SERWIRE: FAIL — capped_drains=0 capped_b=0 want_b=201 … ::`. This is the mutation that
+//     matters: it is the failure in which the metal line would print a confident, wrong acquittal.
+//   * THE CAP ONE — change [`drain_capped`] to `drain_into(.., usize::MAX)`. The single drain then
+//     takes all 8 lines, `capped_b=536` exceeds `SERWIRE_BOUND_B=259`, residue is 0, and the verdict
+//     is FAIL. That mutation also reds DRAINCAP, which is the point: one cap, two witnesses.
+//
+// ### What it costs
+// On the x86 witness ladder, 8 x 67 = 536 B of fill plus one verdict line. On the Jetson flight image
+// it costs NOTHING AT ALL, and that is not a claim about this fixture: [`mirror_service`] is
+// unreachable on that board (LEDGER SO41), so no fixture in this file has ever executed there. The
+// flight-boot wire cost of SERWIRE is the latched `[serwire]` line in `video/wm.rs` and nothing else.
+
+/// Width of one SERWIRE fill line, `"[serwire] fill NN " + DRAINCAP_PAD + "\n"`: 18 + 48 + 1. Named
+/// so the byte assertions are arithmetic the compiler checks rather than magic numbers.
+const SERWIRE_LINE_B: usize = 18 + 48 + 1;
+/// One capped drain's ceiling for THIS line width — [`DRAIN_BYTE_BUDGET`]'s "the bound this actually
+/// gives", instantiated: the budget plus the one line that may straddle it.
+const SERWIRE_BOUND_B: usize = DRAIN_BYTE_BUDGET + SERWIRE_LINE_B;
+/// How many lines the fixture stages. Chosen so the fill is MORE than one budget and LESS than the
+/// ring, which is what lets one capped drain and one uncapped drain each have work to do.
+const SERWIRE_FILL: usize = 8;
+/// What one capped drain must emit from that fill: whole lines while `paid < DRAIN_BYTE_BUDGET`.
+/// 0, 67 and 134 are all under 192; 201 is not. Three lines.
+const SERWIRE_WANT_B: usize = 3 * SERWIRE_LINE_B;
+
+const _: () = assert!(
+    SERWIRE_LINE_B <= SLOT_LEN,
+    "a fixture fill line must not truncate, or the byte count it asserts on is not the one staged"
+);
+const _: () = assert!(
+    SERWIRE_WANT_B <= SERWIRE_BOUND_B,
+    "the drain the fixture expects must sit inside the cap's own stated bound"
+);
+const _: () = assert!(
+    SERWIRE_FILL * SERWIRE_LINE_B > SERWIRE_BOUND_B,
+    "the fill must outlast one capped drain, or capped and uncapped are indistinguishable"
+);
+const _: () = assert!(
+    SERWIRE_FILL < SLOTS,
+    "the fill must fit the ring without back-pressure, or `filled` is not SERWIRE_FILL"
+);
+
+#[cfg(feature = "witness")]
+static SERWIRE_DONE: AtomicBool = AtomicBool::new(false);
+
+/// SERWIRE, once per boot. Called from [`mirror_service`], LAST — it fills the ring and empties it
+/// again, for the same reason PWRDRAIN states, and it must not run before a fixture that reads it.
+#[cfg(feature = "witness")]
+fn serwire_selftest() {
+    if SERWIRE_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if uart_absent() {
+        serial_println!(
+            ":: SERWIRE: SKIP — no 16550 on this machine, so no drain reaches a wire to be charged \
+             for (SERWIT-1D); the cap arithmetic is asserted at compile time ::"
+        );
+        return;
+    }
+    let base_dropped = DROPPED.load(Ordering::Relaxed);
+    // Zero the odometer so the span this fixture measures is its own and not the boot so far.
+    let _ = wire_take();
+    let mut filled = 0u64;
+    for i in 0..SERWIRE_FILL {
+        if try_stage(format_args!("[serwire] fill {:02} {}\n", i, DRAINCAP_PAD)) {
+            filled += 1;
+        }
+    }
+    // The CAPPED spelling — the one both arches' `_print` calls.
+    drain_capped(draincap_wire);
+    let (cap_n, cap_b, _cap_cyc, _cap_max_cyc, cap_max_b) = wire_take();
+    // The UNCAPPED spelling — the panic and power path. It must charge NOTHING, or a shutdown flush
+    // would land in a drag-stall number.
+    let mut residue = 0u64;
+    drain(|s| {
+        residue += 1;
+        draincap_wire(s);
+    });
+    let (unc_n, unc_b, _, _, _) = wire_take();
+    let lost = DROPPED.load(Ordering::Relaxed).saturating_sub(base_dropped);
+    let pass = filled == SERWIRE_FILL as u64
+        && cap_n == 1
+        && cap_b == SERWIRE_WANT_B as u64
+        && cap_max_b == SERWIRE_WANT_B as u64
+        && cap_b <= SERWIRE_BOUND_B as u64
+        && unc_n == 0
+        && unc_b == 0
+        && residue == (SERWIRE_FILL - 3) as u64
+        && lost == 0;
+    if pass {
+        serial_println!(
+            ":: SERWIRE: filled={} capped_drains={} capped_b={} want_b={} bound_b={} \
+             uncapped_drains={} uncapped_b={} residue={} dropped={} — the odometer is charged by \
+             `drain_capped` (the `_print` spelling, arch/aarch64/serial.rs:238 and \
+             arch/x86_64/serial.rs:132) and by NOTHING else, so `[serwire] drain_us` is the cost of \
+             the drain SO31 capped and not of any other wire traffic -> PASS ::",
+            filled,
+            cap_n,
+            cap_b,
+            SERWIRE_WANT_B,
+            SERWIRE_BOUND_B,
+            unc_n,
+            unc_b,
+            residue,
+            lost
+        );
+    } else {
+        serial_println!(
+            ":: SERWIRE: FAIL — filled={} capped_drains={} capped_b={} want_b={} bound_b={} \
+             uncapped_drains={} uncapped_b={} residue={} want_residue={} dropped={} ::",
+            filled,
+            cap_n,
+            cap_b,
+            SERWIRE_WANT_B,
+            SERWIRE_BOUND_B,
+            unc_n,
+            unc_b,
+            residue,
+            SERWIRE_FILL - 3,
+            lost
         );
     }
 }

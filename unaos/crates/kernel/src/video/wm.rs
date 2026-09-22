@@ -13491,7 +13491,7 @@ fn comp2_emit(span: u64) {
         passes.saturating_mul(10_000) / span.max(1) / 10,
         passes.saturating_mul(10_000) / span.max(1) % 10,
         span
-    );
+    ); serwire_emit(max_cyc, span, passes); // SERWIRE (SO45) — the transport's capped-drain odometer for THIS span, drained here and printed ONCE PER BOOT when `max_us` crosses the stall threshold, immediately under the `[comp2]` line it adjudicates. It is fed `max_cyc` (already swapped above, so this reads the identical number `[comp2]` just printed) rather than re-reading the counter, which by then is zero. `[comp2]` itself is NOT widened by one byte: a per-rollup field would be SO30 one layer up. ⚠ LINE-NEUTRAL append onto the emit's closing `);`, before the line's first `//`; the body is a FILE-TAIL append, so no `panic::Location` in this file moves.
     // CHROMEBAND — pi's `[chromeband]` ledger was RETIRED at the 0ed6fee2 fold: trunk's own
     // band-clamp landed with the `[wc-b]` witness family (per-window, rollup and fixture lines
     // carrying chrome_rows/chrome_rows_used/amp), which measures the same quantity as the
@@ -28509,5 +28509,108 @@ n={} control={} panel={}x{} | console=win{} pulse=win{} pulse_over_console={} ->
         pulse,
         pulse_over_console as u8,
         if pass { "PASS" } else { "FAIL" }
+    );
+}
+// ── SERWIRE (SO45) — IS `[comp2] max_us` THE SERIAL DRAIN, OR IS IT NOT? ────────────────────────
+//
+// SO29 said the drag stall is the serial staging-ring drain: `_print` runs IRQ-masked, the core that
+// wins the UART drains the ring inline, and on render13 boot 1 that core was this one. SO31/SERDRAIN
+// capped one drain at `serial_ring::DRAIN_BYTE_BUDGET` = 192 B and predicted the band would fall from
+// 377.8 ms to 22.6 ms. It did not: render14 metal reads `max_us` = 361 130 / 359 500 / 348 593 us on
+// boots 1/2/5 and 367 166 us on boot 3, the same band. The cap IS on the path the Jetson takes and has
+// no `cfg` on it (the hop list is in `serial_ring.rs`'s SERWIRE block), so the two live possibilities
+// are "a pass contains many prints" and "the drain is not the cost at all" — and nothing already on
+// the wire separates them.
+//
+// THE EXISTING WITNESS CANNOT ADJUDICATE IT ON THIS BOARD. DRAINCAP rides `serial_ring::
+// mirror_service`, which LEDGER SO41 proved is unreachable on the Jetson flight image, and re-arming
+// it is deferred by a recorded decision (it would re-arm three ring fixtures worth 1.228 s of UART on
+// the very boot whose serial we fly). So the number has to come from a site this board provably
+// executes — and `comp2_emit` is exactly that: it is where the 361 130 reading came from.
+//
+// ### The measurement
+//
+// `serial_ring::wire_take()` returns the capped-drain odometer for the span and zeroes it, drained on
+// the SAME rollup and against the SAME span as `max_cyc`, so the two are comparable with no new
+// bracket anywhere in the compositor. **A span total is an upper bound on any single pass inside that
+// span.** So:
+//
+//     drain_us  <  max_us   =>  the pass that produced `max_us` CANNOT have spent it in the drain,
+//                               whatever the per-pass split was. SO29's mechanism is refuted here.
+//     drain_us >=  max_us   =>  the drain could still account for it, and the next step is per-pass
+//                               attribution (which this arc is not allowed to add).
+//
+// That asymmetry is deliberate: the cheap half of the instrument answers the question we actually
+// have, and the expensive half is only paid for if the cheap half fails to.
+//
+// ### Why LATCHED, and why a threshold
+//
+// A per-rollup field would be SO30 one layer up: 140 rollups on a 700 s boot, and the `[comp2]` line
+// is already the widest in the tree. This prints ONCE PER BOOT, on the first rollup whose `max_us`
+// crosses [`SERWIRE_ARM_US`], and never again — so the flight-boot wire cost of the whole instrument
+// is one line, bounded at 324 B (113 B of literal and newline, plus ten fields that cannot
+// exceed 20 decimal digits each, plus the 11 B verdict) and 163 B in practice. `wire_take()` is still called on EVERY rollup, latched or not,
+// so the odometer stays a SPAN and never silently becomes a boot total.
+//
+// Silence is readable too, and only because the producing path announces itself: if no `[serwire]`
+// line appears on a capture that HAS `[comp2]` rollups, no pass in that boot crossed the threshold —
+// which is the "the stall did not happen this boot" reading, not "the instrument did not run".
+
+/// SERWIRE — the `max_us` a rollup must carry before the instrument speaks.
+///
+/// 100 000 us = 100 ms. Argued from the flight capture rather than picked: render14 boot 1's steady
+/// rollups read `pass_us` 8 227..17 679 and `max_us` 43 218..85 871, so 100 ms is above every healthy
+/// pass that boot recorded and is 6x the 16.667 ms frame the compositor is trying to hold. The stall
+/// band it exists for is 348 593..367 166 us, 3.5x clear of it. A threshold under the healthy `max_us`
+/// would latch on the first rollup of every boot and report a span with no stall in it.
+#[cfg(feature = "witness")]
+const SERWIRE_ARM_US: u64 = 100_000;
+
+/// SERWIRE — the one-shot latch. Set by the rollup that speaks; never cleared, because the line is a
+/// statement about the worst pass this boot has seen and a second copy adds no evidence.
+#[cfg(feature = "witness")]
+static SERWIRE_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// SERWIRE — drain the transport's capped-drain odometer for this span and, once per boot, put it on
+/// the wire beside the `max_us` it adjudicates.
+///
+/// Called from [`comp2_emit`] with the span's already-drained `max_cyc`, so it reads the same numbers
+/// `[comp2]` just printed and cannot disagree with them.
+#[cfg(feature = "witness")]
+fn serwire_emit(max_cyc: u64, span: u64, passes: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    // UNCONDITIONALLY FIRST: the odometer is a SPAN, so it is drained on every rollup whether or not
+    // this one speaks. Taking it inside the arm test would make the first line that DOES speak report
+    // every span since boot, which is the number that would make a `NOT-DRAIN` verdict unsound in the
+    // one direction that matters (an inflated `drain_us` can only produce a FALSE `DRAIN-BOUND`).
+    let (drains, bytes, cyc, max_drain_cyc, max_drain_b) = crate::serial_ring::wire_take();
+    let max_us = super::wcg::cycles_to_us(max_cyc);
+    if max_us < SERWIRE_ARM_US {
+        return;
+    }
+    if SERWIRE_SAID.swap(true, Relaxed) {
+        return;
+    }
+    let drain_us = super::wcg::cycles_to_us(cyc);
+    // The span's WHOLE capped-drain cost as a percentage of its single worst pass. Saturating and
+    // guarded: `max_us >= SERWIRE_ARM_US > 0` by the test above, so the divisor cannot be zero, and
+    // the guard is kept anyway because a future threshold of 0 must not fault the compositor.
+    let share_pct = drain_us.saturating_mul(100) / max_us.max(1);
+    serial_println!(
+        "[serwire] arm max_us={} span_ms={} passes={} drains={} drain_us={} drain_b={} maxdrain_us={} maxdrain_b={} cap_b={} share_pct={} -> {}",
+        max_us,
+        span,
+        passes,
+        drains,
+        drain_us,
+        bytes,
+        super::wcg::cycles_to_us(max_drain_cyc),
+        max_drain_b,
+        crate::serial_ring::DRAIN_BYTE_BUDGET,
+        share_pct,
+        // The verdict is the whole point of the line and it is arithmetic, not judgement: the span's
+        // TOTAL drain time bounds any single pass in it. `NOT-DRAIN` therefore means SO29's mechanism
+        // cannot be this `max_us`, and the next suspect is whatever `[comp2] blit_us` is measuring.
+        if drain_us >= max_us { "DRAIN-BOUND" } else { "NOT-DRAIN" }
     );
 }
