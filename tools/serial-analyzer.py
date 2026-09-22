@@ -280,7 +280,7 @@ WITNESS_FAMILIES = [
     # e.g. '::   [v3d60] MMU_ILLEGAL_ADDR ... ::'
     _f('V3D',             'aarch64', r'^\s*::\s*(?:V3D:|\[v3d\d+)'),
     _f('PI-GENET',        'aarch64', r'^\s*::\s*PI-GENET:'),
-    # not Pi-only: the rMBP capture also emits ':: PIUSB: [usbw] ... ::'
+    # not Pi-only: the rMBP capture also emits ':: USB: [usbw] ... ::'
     _f('PIUSB',           'any',     r'^\s*::\s*(?:PIUSB|piusb\d+):|\[usb\d+\]'),
     _f('SCHED',           'aarch64', r'^\s*::\s*SCHED(?:-LOAD)?:|\[sched\d+\]'
                                      r'|^\s*::\s*INPUT on core\b'),

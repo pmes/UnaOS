@@ -6299,7 +6299,7 @@ operator's and is cited as such. The verdict slice is banked at
 Two independent lines establish this as a **cold** boot, which matters for §49.20.2 V6:
 
 ```
-:: PIUSB: PIUSB-16: ENTRY link state — RGR1_SW_INIT_1=0x00000003 PCIE_STATUS=0x00000000
+:: USB: PIUSB-16: ENTRY link state — RGR1_SW_INIT_1=0x00000003 PCIE_STATUS=0x00000000
    (PHYLINKUP=false DL_ACTIVE=false) -> VC left RC in reset — COLD-BUILD pa…
 ```
 

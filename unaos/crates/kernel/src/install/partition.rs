@@ -302,7 +302,7 @@ pub fn census<T: InstallTarget>(t: &T) -> Result<Census, InstallError> {
 /// what a fixture that must assert about ONE partition's content actually needs.
 pub fn print_census(disk: &str, c: &Census) {
     serial_println!(
-        ":: PINSTALL: census disk={} parts={} foreign={} friend={} empty={} ::",
+        ":: INSTALL: census disk={} parts={} foreign={} friend={} empty={} ::",
         disk,
         c.rows.len(),
         c.foreign,
@@ -311,7 +311,7 @@ pub fn print_census(disk: &str, c: &Census) {
     );
     for r in &c.rows {
         serial_println!(
-            ":: PINSTALL: census part={} type={:08x} lba={}..{} sectors={} content={} ::",
+            ":: INSTALL: census part={} type={:08x} lba={}..{} sectors={} content={} ::",
             r.entry.index,
             r.entry.type_short(),
             r.entry.first_lba,
@@ -386,46 +386,46 @@ impl Refusal {
     pub fn say(self, who: &str) {
         match self {
             Refusal::DiskHasForeignVolumes { foreign, friend } => serial_println!(
-                ":: PINSTALL: refusal target={} reason={} foreign={} friend={} -> guard OK ::",
+                ":: INSTALL: refusal target={} reason={} foreign={} friend={} -> guard OK ::",
                 who,
                 self.reason(),
                 foreign,
                 friend
             ),
             Refusal::PartitionNotEmpty(c) => serial_println!(
-                ":: PINSTALL: refusal target={} reason={} content={} -> guard OK ::",
+                ":: INSTALL: refusal target={} reason={} content={} -> guard OK ::",
                 who,
                 self.reason(),
                 c.tag()
             ),
             Refusal::PartitionTooSmall { have_bytes, need_bytes } => serial_println!(
-                ":: PINSTALL: refusal target={} reason={} have={}B need={}B -> guard OK ::",
+                ":: INSTALL: refusal target={} reason={} have={}B need={}B -> guard OK ::",
                 who,
                 self.reason(),
                 have_bytes,
                 need_bytes
             ),
             Refusal::PartitionForeignType { kind } => serial_println!(
-                ":: PINSTALL: refusal target={} reason={} type={} -> guard OK ::",
+                ":: INSTALL: refusal target={} reason={} type={} -> guard OK ::",
                 who,
                 self.reason(),
                 kind
             ),
             Refusal::TransportReadOnly { transport } => serial_println!(
-                ":: PINSTALL: refusal target={} reason={} transport={} -> guard OK ::",
+                ":: INSTALL: refusal target={} reason={} transport={} -> guard OK ::",
                 who,
                 self.reason(),
                 transport
             ),
             Refusal::TransportWriteDisabled { transport, knob } => serial_println!(
-                ":: PINSTALL: refusal target={} reason={} transport={} knob={} -> guard OK ::",
+                ":: INSTALL: refusal target={} reason={} transport={} knob={} -> guard OK ::",
                 who,
                 self.reason(),
                 transport,
                 knob
             ),
             _ => serial_println!(
-                ":: PINSTALL: refusal target={} reason={} -> guard OK ::",
+                ":: INSTALL: refusal target={} reason={} -> guard OK ::",
                 who,
                 self.reason()
             ),
@@ -594,7 +594,7 @@ pub fn mint_grant(
     if let block::BlockHandle::Ahci { port } = id.handle {
         let row = census.row(index).ok_or(Refusal::NoSuchPartition)?;
         serial_println!(
-            ":: PINSTALL: grant minted transport=ahci port={} part={} lba={}..{} sectors={} — every other LBA on this disk is unreachable through it ::",
+            ":: INSTALL: grant minted transport=ahci port={} part={} lba={}..{} sectors={} — every other LBA on this disk is unreachable through it ::",
             port,
             index,
             row.entry.first_lba,
@@ -920,7 +920,7 @@ fn write_partition<T: InstallTarget>(
             bytes += r.size;
         } else {
             serial_println!(
-                ":: PINSTALL: verify part={} file={} => MISMATCH ::",
+                ":: INSTALL: verify part={} file={} => MISMATCH ::",
                 index,
                 r.path.as_str()
             );
@@ -963,7 +963,7 @@ pub fn install_into_partition(
     let w = write_partition(&mut disk, &entry, &tree, grant)?;
     if as_esp {
         gpt::set_entry_type_guid(&mut disk, index, &gpt::ESP_TYPE_GUID)?;
-        serial_println!(":: PINSTALL: part={} type GUID set to ESP (--as-esp) ::", index);
+        serial_println!(":: INSTALL: part={} type GUID set to ESP (--as-esp) ::", index);
     }
     Ok(w)
 }
@@ -1028,7 +1028,7 @@ pub fn run_fixture() -> bool {
     };
     let id = disk.id();
     let sel = disk.identity();
-    serial_println!(":: PINSTALL: fixture start — disk carries a valid GPT ::");
+    serial_println!(":: INSTALL: fixture start — disk carries a valid GPT ::");
     print_census(&id, &c);
 
     let tree = demo_tree();
@@ -1038,7 +1038,7 @@ pub fn run_fixture() -> bool {
         Err(r) => r.say("disk"),
         Ok(()) => {
             serial_println!(
-                ":: PINSTALL: whole-disk target ACCEPTED on a disk with no foreign volumes — the fixture expects a refusal here => FAIL ::"
+                ":: INSTALL: whole-disk target ACCEPTED on a disk with no foreign volumes — the fixture expects a refusal here => FAIL ::"
             );
             return true;
         }
@@ -1055,12 +1055,12 @@ pub fn run_fixture() -> bool {
                 if target.is_none() {
                     target = Some(row.entry);
                     serial_println!(
-                        ":: PINSTALL: part={} passes every guard — fixture names it the target ::",
+                        ":: INSTALL: part={} passes every guard — fixture names it the target ::",
                         row.entry.index
                     );
                 } else {
                     serial_println!(
-                        ":: PINSTALL: part={} also eligible (not selected) ::",
+                        ":: INSTALL: part={} also eligible (not selected) ::",
                         row.entry.index
                     );
                 }
@@ -1072,7 +1072,7 @@ pub fn run_fixture() -> bool {
     transport_leg();
 
     let Some(entry) = target else {
-        serial_println!(":: PINSTALL: no eligible partition on this disk => FAIL ::");
+        serial_println!(":: INSTALL: no eligible partition on this disk => FAIL ::");
         return true;
     };
 
@@ -1094,7 +1094,7 @@ pub fn run_fixture() -> bool {
     const FIXTURE_TARGET_INDEX: u32 = 2;
     if entry.index != FIXTURE_TARGET_INDEX {
         serial_println!(
-            ":: PINSTALL: selection part={} but the fixture built part{} as the only writable slot => FAIL ::",
+            ":: INSTALL: selection part={} but the fixture built part{} as the only writable slot => FAIL ::",
             entry.index, FIXTURE_TARGET_INDEX
         );
     }
@@ -1108,7 +1108,7 @@ pub fn run_fixture() -> bool {
         match head_sha(&disk, &row.entry) {
             Ok(s) => before.push((row.entry.index, s)),
             Err(e) => {
-                serial_println!(":: PINSTALL: neighbour part={} pre-read failed ({:?}) => FAIL ::", row.entry.index, e);
+                serial_println!(":: INSTALL: neighbour part={} pre-read failed ({:?}) => FAIL ::", row.entry.index, e);
                 return true;
             }
         }
@@ -1125,25 +1125,25 @@ pub fn run_fixture() -> bool {
             // against the forbid set rather than by a run: this path needs an I/O fault to fire, so
             // no fixture here exercises it and it is UNWITNESSED — which is exactly why it had to be
             // read. (`install/mod.rs`'s own `engine => FAIL ({:?})` has the same shape; not mine.)
-            serial_println!(":: PINSTALL: write part={} err={:?} -> FAIL ::", entry.index, e);
+            serial_println!(":: INSTALL: write part={} err={:?} -> FAIL ::", entry.index, e);
             return true;
         }
     };
     if w.verified != w.files || w.files == 0 {
         serial_println!(
-            ":: PINSTALL: wrote part={} fat32 tree={} bytes={} verified={}/{} -> FAIL ::",
+            ":: INSTALL: wrote part={} fat32 tree={} bytes={} verified={}/{} -> FAIL ::",
             w.index, w.files, w.bytes, w.verified, w.files
         );
         return true;
     }
     serial_println!(
-        ":: PINSTALL: wrote part={} fat32 tree={} bytes={} verified={}/{} -> PASS ::",
+        ":: INSTALL: wrote part={} fat32 tree={} bytes={} verified={}/{} -> PASS ::",
         w.index, w.files, w.bytes, w.verified, w.files
     );
 
     // --- RE-CENSUS: the table must still validate, and every neighbour must read as it did. ---
     let Ok(after_census) = census(&disk) else {
-        serial_println!(":: PINSTALL: post-write census — GPT no longer parses => FAIL ::");
+        serial_println!(":: INSTALL: post-write census — GPT no longer parses => FAIL ::");
         return true;
     };
     print_census(&id, &after_census);
@@ -1151,25 +1151,25 @@ pub fn run_fixture() -> bool {
     let mut untouched = 0usize;
     for (index, sha) in &before {
         let Some(row) = after_census.row(*index) else {
-            serial_println!(":: PINSTALL: neighbour part={} vanished from the table => FAIL ::", index);
+            serial_println!(":: INSTALL: neighbour part={} vanished from the table => FAIL ::", index);
             return true;
         };
         match head_sha(&disk, &row.entry) {
             Ok(now) if &now == sha => untouched += 1,
             Ok(_) => serial_println!(
-                ":: PINSTALL: neighbour part={} CHANGED across the install ::",
+                ":: INSTALL: neighbour part={} CHANGED across the install ::",
                 index
             ),
             Err(e) => serial_println!(
-                ":: PINSTALL: neighbour part={} post-read failed ({:?}) ::",
+                ":: INSTALL: neighbour part={} post-read failed ({:?}) ::",
                 index, e
             ),
         }
     }
     if untouched == before.len() {
-        serial_println!(":: PINSTALL: neighbours untouched={}/{} -> PASS ::", untouched, before.len());
+        serial_println!(":: INSTALL: neighbours untouched={}/{} -> PASS ::", untouched, before.len());
     } else {
-        serial_println!(":: PINSTALL: neighbours untouched={}/{} -> FAIL ::", untouched, before.len());
+        serial_println!(":: INSTALL: neighbours untouched={}/{} -> FAIL ::", untouched, before.len());
     }
     true
 }
@@ -1192,7 +1192,7 @@ fn transport_leg() {
         let h = block::BlockHandle::Ahci { port: 0 };
         if transport_writable(h) {
             serial_println!(
-                ":: PINSTALL: SATA transport reports WRITABLE without `ahci-write` — the knob is the only thing that may open it => FAIL ::"
+                ":: INSTALL: SATA transport reports WRITABLE without `ahci-write` — the knob is the only thing that may open it => FAIL ::"
             );
         } else {
             transport_refusal(h).say("disk=sata");
@@ -1203,17 +1203,17 @@ fn transport_leg() {
         let h = block::BlockHandle::Ahci { port: 0 };
         if transport_writable(h) {
             serial_println!(
-                ":: PINSTALL: SATA transport WRITABLE under `ahci-write` — no transport refusal, writes still need a grant ::"
+                ":: INSTALL: SATA transport WRITABLE under `ahci-write` — no transport refusal, writes still need a grant ::"
             );
         } else {
             serial_println!(
-                ":: PINSTALL: SATA transport refuses writes with `ahci-write` compiled — the knob did not reach the image => FAIL ::"
+                ":: INSTALL: SATA transport refuses writes with `ahci-write` compiled — the knob did not reach the image => FAIL ::"
             );
         }
     }
     #[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
     serial_println!(
-        ":: PINSTALL: SATA transport arm ABSENT in this build (no `ahci` feature) — refusal unmeasured here ::"
+        ":: INSTALL: SATA transport arm ABSENT in this build (no `ahci` feature) — refusal unmeasured here ::"
     );
 }
 
@@ -1302,7 +1302,7 @@ fn sata_fixture() -> bool {
         let Some(port) = block::ahci_port_at(ix) else { continue };
         let sectors = block::ahci_info_ix(ix).map(|i| i.num_blocks).unwrap_or(0);
         serial_println!(
-            ":: PINSTALL: sata disk ix={} port={} sectors={} install-self={} ::",
+            ":: INSTALL: sata disk ix={} port={} sectors={} install-self={} ::",
             ix,
             port,
             sectors,
@@ -1326,7 +1326,7 @@ fn sata_fixture() -> bool {
             continue;
         }
         let Ok(disk) = super::BlockTarget::bind_id(id) else {
-            serial_println!(":: PINSTALL: sata port={} bind refused — not in the live registry ::", port);
+            serial_println!(":: INSTALL: sata port={} bind refused — not in the live registry ::", port);
             continue;
         };
         match census(&disk) {
@@ -1334,11 +1334,11 @@ fn sata_fixture() -> bool {
                 if chosen.is_none() {
                     chosen = Some((port, disk, c));
                 } else {
-                    serial_println!(":: PINSTALL: sata port={} also carries a GPT (not selected) ::", port);
+                    serial_println!(":: INSTALL: sata port={} also carries a GPT (not selected) ::", port);
                 }
             }
             Err(_) => serial_println!(
-                ":: PINSTALL: sata port={} carries no parseable GPT — not a partition-install disk ::",
+                ":: INSTALL: sata port={} carries no parseable GPT — not a partition-install disk ::",
                 port
             ),
         }
@@ -1347,7 +1347,7 @@ fn sata_fixture() -> bool {
 
     let id_str = disk.id();
     let sel = disk.identity();
-    serial_println!(":: PINSTALL: fixture start — SATA port={} carries a valid GPT ::", port);
+    serial_println!(":: INSTALL: fixture start — SATA port={} carries a valid GPT ::", port);
     print_census(&id_str, &c);
 
     let tree = demo_tree();
@@ -1358,7 +1358,7 @@ fn sata_fixture() -> bool {
         Err(r) => r.say("disk"),
         Ok(()) => {
             serial_println!(
-                ":: PINSTALL: whole-disk target ACCEPTED on a disk with no foreign volumes — the fixture expects a refusal here => FAIL ::"
+                ":: INSTALL: whole-disk target ACCEPTED on a disk with no foreign volumes — the fixture expects a refusal here => FAIL ::"
             );
             return true;
         }
@@ -1373,11 +1373,11 @@ fn sata_fixture() -> bool {
                 if target.is_none() {
                     target = Some(row.entry);
                     serial_println!(
-                        ":: PINSTALL: part={} passes every guard — fixture names it the target ::",
+                        ":: INSTALL: part={} passes every guard — fixture names it the target ::",
                         row.entry.index
                     );
                 } else {
-                    serial_println!(":: PINSTALL: part={} also eligible (not selected) ::", row.entry.index);
+                    serial_println!(":: INSTALL: part={} also eligible (not selected) ::", row.entry.index);
                 }
             }
         }
@@ -1386,7 +1386,7 @@ fn sata_fixture() -> bool {
     transport_leg();
 
     let Some(entry) = target else {
-        serial_println!(":: PINSTALL: no eligible partition on this SATA disk => FAIL ::");
+        serial_println!(":: INSTALL: no eligible partition on this SATA disk => FAIL ::");
         return true;
     };
 
@@ -1394,7 +1394,7 @@ fn sata_fixture() -> bool {
     const FIXTURE_TARGET_INDEX: u32 = 2;
     if entry.index != FIXTURE_TARGET_INDEX {
         serial_println!(
-            ":: PINSTALL: selection part={} but the fixture built part{} as the only writable slot => FAIL ::",
+            ":: INSTALL: selection part={} but the fixture built part{} as the only writable slot => FAIL ::",
             entry.index, FIXTURE_TARGET_INDEX
         );
     }
@@ -1410,7 +1410,7 @@ fn sata_fixture() -> bool {
         match head_sha(&disk, &row.entry) {
             Ok(s) => before.push((row.entry.index, s)),
             Err(e) => {
-                serial_println!(":: PINSTALL: neighbour part={} pre-read failed ({:?}) => FAIL ::", row.entry.index, e);
+                serial_println!(":: INSTALL: neighbour part={} pre-read failed ({:?}) => FAIL ::", row.entry.index, e);
                 return true;
             }
         }
@@ -1423,13 +1423,13 @@ fn sata_fixture() -> bool {
         match sata_disk_sha(p) {
             Some(s) => {
                 serial_println!(
-                    ":: PINSTALL: other-disk port={} sha1MiB={:#018x} (pre) ::",
+                    ":: INSTALL: other-disk port={} sha1MiB={:#018x} (pre) ::",
                     p,
                     sha_head(&s)
                 );
                 disks_before.push((p, s));
             }
-            None => serial_println!(":: PINSTALL: other-disk port={} pre-fingerprint unavailable ::", p),
+            None => serial_println!(":: INSTALL: other-disk port={} pre-fingerprint unavailable ::", p),
         }
     }
 
@@ -1439,12 +1439,12 @@ fn sata_fixture() -> bool {
         Ok(g) => g,
         Err(r) => {
             r.say(&alloc::format!("part{}", entry.index));
-            serial_println!(":: PINSTALL: grant refused for the slot the ladder just cleared -> FAIL ::");
+            serial_println!(":: INSTALL: grant refused for the slot the ladder just cleared -> FAIL ::");
             return true;
         }
     };
     if grant.is_none() {
-        serial_println!(":: PINSTALL: no grant minted for a SATA target — the write path is unreachable -> FAIL ::");
+        serial_println!(":: INSTALL: no grant minted for a SATA target — the write path is unreachable -> FAIL ::");
         return true;
     }
 
@@ -1456,11 +1456,11 @@ fn sata_fixture() -> bool {
         let zero = [0u8; SECTOR];
         match disk.write_sectors(entry.first_lba, &zero) {
             Err(InstallError::NotReady) => serial_println!(
-                ":: PINSTALL: go-red(b) plain write_sectors on the SATA handle lba={} => NotReady, refused ::",
+                ":: INSTALL: go-red(b) plain write_sectors on the SATA handle lba={} => NotReady, refused ::",
                 entry.first_lba
             ),
             other => serial_println!(
-                ":: PINSTALL: go-red(b) plain write_sectors on the SATA handle returned {:?}, expected NotReady -> FAIL ::",
+                ":: INSTALL: go-red(b) plain write_sectors on the SATA handle returned {:?}, expected NotReady -> FAIL ::",
                 other
             ),
         }
@@ -1470,19 +1470,19 @@ fn sata_fixture() -> bool {
     let w = match write_partition(&mut disk, &entry, &tree, grant) {
         Ok(w) => w,
         Err(e) => {
-            serial_println!(":: PINSTALL: write part={} err={:?} -> FAIL ::", entry.index, e);
+            serial_println!(":: INSTALL: write part={} err={:?} -> FAIL ::", entry.index, e);
             return true;
         }
     };
     if w.verified != w.files || w.files == 0 {
         serial_println!(
-            ":: PINSTALL: wrote part={} fat32 tree={} bytes={} verified={}/{} -> FAIL ::",
+            ":: INSTALL: wrote part={} fat32 tree={} bytes={} verified={}/{} -> FAIL ::",
             w.index, w.files, w.bytes, w.verified, w.files
         );
         return true;
     }
     serial_println!(
-        ":: PINSTALL: wrote part={} fat32 tree={} bytes={} verified={}/{} -> PASS ::",
+        ":: INSTALL: wrote part={} fat32 tree={} bytes={} verified={}/{} -> PASS ::",
         w.index, w.files, w.bytes, w.verified, w.files
     );
 
@@ -1502,7 +1502,7 @@ fn sata_fixture() -> bool {
             _ => true, // no neighbour at that LBA on this fixture; the refusal is the whole claim
         };
         serial_println!(
-            ":: PINSTALL: go-red(a) write lba={} (grant {}..{}) refused={} neighbour-intact={} -> {} ::",
+            ":: INSTALL: go-red(a) write lba={} (grant {}..{}) refused={} neighbour-intact={} -> {} ::",
             past,
             g.first_lba(),
             g.last_lba(),
@@ -1514,7 +1514,7 @@ fn sata_fixture() -> bool {
 
     // --- RE-CENSUS and the neighbours.
     let Ok(after_census) = census(&disk) else {
-        serial_println!(":: PINSTALL: post-write census — GPT no longer parses => FAIL ::");
+        serial_println!(":: INSTALL: post-write census — GPT no longer parses => FAIL ::");
         return true;
     };
     print_census(&id_str, &after_census);
@@ -1522,19 +1522,19 @@ fn sata_fixture() -> bool {
     let mut untouched = 0usize;
     for (index, sha) in &before {
         let Some(row) = after_census.row(*index) else {
-            serial_println!(":: PINSTALL: neighbour part={} vanished from the table => FAIL ::", index);
+            serial_println!(":: INSTALL: neighbour part={} vanished from the table => FAIL ::", index);
             return true;
         };
         match head_sha(&disk, &row.entry) {
             Ok(now) if &now == sha => untouched += 1,
-            Ok(_) => serial_println!(":: PINSTALL: neighbour part={} CHANGED across the install ::", index),
-            Err(e) => serial_println!(":: PINSTALL: neighbour part={} post-read failed ({:?}) ::", index, e),
+            Ok(_) => serial_println!(":: INSTALL: neighbour part={} CHANGED across the install ::", index),
+            Err(e) => serial_println!(":: INSTALL: neighbour part={} post-read failed ({:?}) ::", index, e),
         }
     }
     if untouched == before.len() {
-        serial_println!(":: PINSTALL: neighbours untouched={}/{} -> PASS ::", untouched, before.len());
+        serial_println!(":: INSTALL: neighbours untouched={}/{} -> PASS ::", untouched, before.len());
     } else {
-        serial_println!(":: PINSTALL: neighbours untouched={}/{} -> FAIL ::", untouched, before.len());
+        serial_println!(":: INSTALL: neighbours untouched={}/{} -> FAIL ::", untouched, before.len());
     }
 
     // --- THE BOOT DISK. The ESP this kernel booted from is on the same controller, and the claim is
@@ -1545,22 +1545,22 @@ fn sata_fixture() -> bool {
             Some(s1) if &s1 == s0 => {
                 disks_same += 1;
                 serial_println!(
-                    ":: PINSTALL: other-disk port={} sha1MiB={:#018x} (post) UNCHANGED ::",
+                    ":: INSTALL: other-disk port={} sha1MiB={:#018x} (post) UNCHANGED ::",
                     p,
                     sha_head(&s1)
                 );
             }
             Some(s1) => serial_println!(
-                ":: PINSTALL: other-disk port={} sha1MiB {:#018x} -> {:#018x} CHANGED ::",
+                ":: INSTALL: other-disk port={} sha1MiB {:#018x} -> {:#018x} CHANGED ::",
                 p,
                 sha_head(s0),
                 sha_head(&s1)
             ),
-            None => serial_println!(":: PINSTALL: other-disk port={} post-fingerprint unavailable ::", p),
+            None => serial_println!(":: INSTALL: other-disk port={} post-fingerprint unavailable ::", p),
         }
     }
     serial_println!(
-        ":: PINSTALL: sata other-disks untouched={}/{} -> {} ::",
+        ":: INSTALL: sata other-disks untouched={}/{} -> {} ::",
         disks_same,
         disks_before.len(),
         if disks_same == disks_before.len() { "PASS" } else { "FAIL" }

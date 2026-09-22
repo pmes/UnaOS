@@ -40,7 +40,7 @@ use crate::drivers::emmc2;
 use super::{InstallError, InstallTarget};
 
 /// Stable serial prefix so the operator (and the bench runbook) can grep the whole install as one block.
-const PS: &str = ":: PIINSTALL:";
+const PS: &str = ":: INSTALL:";
 
 const SECTOR: usize = 512;
 

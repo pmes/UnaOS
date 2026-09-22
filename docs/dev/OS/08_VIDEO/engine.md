@@ -2752,7 +2752,7 @@ code that a later reader would mistake for a live hook.
 **Witness:** `[shellwin-pi] backdrop=crispy-scene shell=window win=<id> surf=<w>x<h> panel=<w>x<h> ==
 witness ::` at bring-up, or `[shellwin-pi] … shell=none (window declined) ::` beside
 `open_shell_window`'s own `[shellwin] DECLINE reason=…`; `[clickroute] press hit furniture … consume
--> shell focus` on a click that focuses it; and `:: PI-DESK: desktop armed — the witness cascade
+-> shell focus` on a click that focuses it; and `:: DESK: desktop armed — the witness cascade
 released the panel, furniture may land ::` at the hand-off.
 
 **The standing rule this arc adds, stated once.** *A desktop that appears before the boot witness

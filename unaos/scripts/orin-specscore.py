@@ -112,7 +112,7 @@ MAX_BRANCHES = 64      # alternation expansion bound
 # A cover must account for MOST of the run, not merely ANCHOR_MIN of it.  An
 # absolute floor lets a 33-character run be "covered" by 15 characters of generic
 # chunk and field credit borrowed from an unrelated emitter -- which is how
-# `[wedge4] preempt-in-section core=` found a home in `:: PIUSB: [usb40]
+# `[wedge4] preempt-in-section core=` found a home in `:: USB: [usb40]
 # readcap-wedge — err={:?} data=[...]`.  Half the run is the threshold.
 MIN_COVER_FRAC = 0.5
 
@@ -289,7 +289,7 @@ def coverable(run, chunks, blob, img):
         match specific, and without this credit that rule reads as unemittable.
 
         THE VALUE MUST BE IN THE IMAGE, not merely in the source.  Crediting a
-        source-only value is how `TEGRA-SD: REFUSED to publish` -- whose whole
+        source-only value is how `SDMMC: REFUSED to publish` -- whose whole
         emitter is `#[cfg]`-erased from both staged images -- talks its way into
         looking reachable: the words exist in the tree, just not in the build."""
         t = text.strip()

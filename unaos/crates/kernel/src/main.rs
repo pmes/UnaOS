@@ -2572,12 +2572,12 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             // expected line while the census SError is being fixed — the probe names the missing
             // precondition instead of a misleading NoStorage.
             None => serial_println!(
-                ":: TEGRA-UNAFS: probe SKIPPED — no TegraSd block backend published this boot (census did not reach its publish) ::"
+                ":: UNAFS: probe SKIPPED — no TegraSd block backend published this boot (census did not reach its publish) ::"
             ),
             Some(dev) => match unafs::mount_on(block::BlockHandle::TegraSd) {
                 Ok(fs) => {
                     serial_println!(
-                        ":: TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd — card {} sectors, {} committed root flip(s) on the volume ::",
+                        ":: UNAFS: native unafs volume MOUNTED read-only on TegraSd — card {} sectors, {} committed root flip(s) on the volume ::",
                         dev.num_blocks,
                         fs.commit_stats().commits
                     );
@@ -2587,18 +2587,18 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                 // The expected verdict until the installer has written a unafs partition: the card
                 // is readable end to end (the partition scan ran off it), it just carries no volume.
                 Err(unafs::MountError::NoVolume) => serial_println!(
-                    ":: TEGRA-UNAFS: card readable ({} sectors) but NO partition carries a unafs superblock — installer has not written the native volume yet ::",
+                    ":: UNAFS: card readable ({} sectors) but NO partition carries a unafs superblock — installer has not written the native volume yet ::",
                     dev.num_blocks
                 ),
                 // Partition table unparseable — a raw/blank card reads this way; also expected pre-install.
                 Err(unafs::MountError::Part(e)) => serial_println!(
-                    ":: TEGRA-UNAFS: partition scan on TegraSd FAILED — {:?} (card {} sectors; raw/blank card reads this way pre-install) ::",
+                    ":: UNAFS: partition scan on TegraSd FAILED — {:?} (card {} sectors; raw/blank card reads this way pre-install) ::",
                     e,
                     dev.num_blocks
                 ),
                 // Everything else (NoStorage race, BadSectorSize, Fs, Busy): a real defect worth a capture.
                 Err(e) => serial_println!(
-                    ":: TEGRA-UNAFS: mount on TegraSd FAILED — {:?} (card {} sectors; unexpected — capture this boot) ::",
+                    ":: UNAFS: mount on TegraSd FAILED — {:?} (card {} sectors; unexpected — capture this boot) ::",
                     e,
                     dev.num_blocks
                 ),
@@ -3429,7 +3429,7 @@ static EL0IN_LAST_LOG_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::At
 // The former drain-fed `typematic_observe` is gone — observing the queue drain was the hole.
 
 /// PIUSB-28: latched once the first Pi pump pass has armed the FAT mount trigger, so the
-/// `:: piusb28: mount-trigger armed (pi pump path) ::` witness prints exactly once per boot. This
+/// `:: usb28: mount-trigger armed (pi pump path) ::` witness prints exactly once per boot. This
 /// makes the wiring itself visible on serial — proving the mount edge is now polled from a path that
 /// actually runs on Pi baremetal+fb (`usb_pump`/`input_service` poll-fallback), unlike the dead
 /// main/GUI loop where PIUSB-27's original call sites live.
@@ -4703,7 +4703,7 @@ fn pump_usb_into_gui() {
     // per raise (`take_usb_ready`), so calling it every ~4 ms pass is a cheap no-op until a stick's
     // bring-up raises it, then it mounts + witnesses once (and again on every hot-plug re-enum).
     if !PIUSB28_ARMED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-        serial_println!(":: piusb28: mount-trigger armed (pi pump path) ::");
+        serial_println!(":: usb28: mount-trigger armed (pi pump path) ::");
     }
     unaos_kernel::fs::fat::piusb27_service(); #[cfg(feature = "witness")] stackpool_stk_probe(); // STACKPOOL — the instrument half of `PUMP_PATH_STACK_SIZE`, placed HERE rather than at either spawn site because this function is the shared body BOTH sized tasks execute, and whichever of them is running gets named by the probe's own `task=id:name` field. It is the last statement of the pass, so `hw` already includes whatever the quarry-reopen and BOT chains above reached — a high-water is a lifetime reading, so a probe after the fact still reports a subtree that has long since returned. The early `return` at the `user_input_active()` branch skips it; that costs nothing for the same reason. Rate limit + rationale at the file tail. ⚠ FOLDED, `#[cfg]` on the statement — PARITY §5.3.
 }
@@ -7217,7 +7217,7 @@ fn tegra_darkwin_witness(boot_info: &BootInfo) {
 //   * tegra — the headless test is width-only (JD1 either seeded a scanout or it did not), the
 //     ORIN-CONWIN rung-4 guarded `fbcon::detach()`, the `:: RAST: tegra` witnesses, the RAST-MC
 //     multi-core rung ahead of the paced pass, and the ORIN-RASTGLASS `post` glass read-back.
-//   * pi — the headless test also rejects a zero HEIGHT, the `:: PI-RAST:` witnesses (including the
+//   * pi — the headless test also rejects a zero HEIGHT, the `:: RAST:` witnesses (including the
 //     live firmware geometry), and the honest wall-clock fps line over the whole wire-in.
 //
 // WHERE EACH BOARD CALLS IT, unchanged by this merge. On tegra: the tail of `tegra_early_stop`
@@ -7255,7 +7255,7 @@ fn rast_demo_maybe() {
         #[cfg(feature = "tegra")]
         serial_println!(":: RAST: tegra headless (no JD1 scanout) — cube demo skipped ::");
         #[cfg(feature = "pi")]
-        serial_println!(":: PI-RAST: no mailbox framebuffer (headless boot) — cube demo skipped ::");
+        serial_println!(":: RAST: no mailbox framebuffer (headless boot) — cube demo skipped ::");
         return;
     }
     // Detach fbcon's serial mirror first so a CAPSTONE straggler line can't paint over the demo
@@ -7270,7 +7270,7 @@ fn rast_demo_maybe() {
     let mut screen = unaos_kernel::video::Screen::new(front_fb);
     #[cfg(feature = "pi")]
     serial_println!(
-        ":: PI-RAST: BCM2711 mailbox panel {}x{} (live firmware geometry, inherited scanout) — software rasterizer cube, the Pi's first 3D pixels ::",
+        ":: RAST: BCM2711 mailbox panel {}x{} (live firmware geometry, inherited scanout) — software rasterizer cube, the Pi's first 3D pixels ::",
         screen.width(),
         screen.height()
     );
@@ -7290,7 +7290,7 @@ fn rast_demo_maybe() {
         let elapsed = unaos_kernel::arch::ms().saturating_sub(t0).max(1);
         let fps_x1000 = (PI_RAST_FRAMES as u64 * 1000 * 1000) / elapsed;
         serial_println!(
-            ":: PI-RAST: {} frames in {} ms — {}.{:03} fps (software rasterizer, BCM2711 mailbox-fb present) ::",
+            ":: RAST: {} frames in {} ms — {}.{:03} fps (software rasterizer, BCM2711 mailbox-fb present) ::",
             PI_RAST_FRAMES,
             elapsed,
             fps_x1000 / 1000,
@@ -7398,7 +7398,7 @@ fn desktop_firmware_activate_maybe() -> bool {
 //        back on the wire — the bytes reach `shell_inbox` and sit there unconsumed.
 //
 // AND WHAT THIS FIX DOES NOT REACH — stated because a fix whose limits are not written down gets
-// re-litigated on the next capture. In flight 1 `:: PI-DESK: desktop armed ::` lands at log line
+// re-litigated on the next capture. In flight 1 `:: DESK: desktop armed ::` lands at log line
 // 1496, i.e. 381 lines AFTER the render task was already dead; in flight 2 it never lands at all.
 // So flight 2 carries a SECOND, independent defect — the witness cascade never released the panel
 // (its `[el0live] verdict=STARVED` run and the core-2 wedge are the visible end of it) — and a
@@ -8417,7 +8417,7 @@ fn tegra_desk_furn() -> bool {
     // (Cargo.toml) so `click=1` here is a structural fact, printed to be falsifiable rather than
     // trusted.
     serial_println!(
-        "[deskfurn] arm click={} conwin={} desk={} tenant={} deskseam={} (ORIN-DESKFURN entered on the tegra terminus; §5.2 UNCROSSED — pidesk::activate is NOT called)",
+        "[deskfurn] arm click={} conwin={} desk={} tenant={} deskseam={} (DESKFURN entered on the tegra terminus; §5.2 UNCROSSED — pidesk::activate is NOT called)",
         cfg!(feature = "orinclick") as u8,
         cfg!(feature = "orinconwin") as u8,
         cfg!(feature = "orindesk") as u8,
@@ -8679,7 +8679,7 @@ fn tegra_render_arm() -> bool {
     // falsifiable rather than trusted. That distinction is not pedantry here: `orinconwin` shipped a
     // `live=LIVE` that was a compile-time literal and would have printed LIVE whatever the route did.
     serial_println!(
-        "[render] arm conwin={} furn={} tenant={} click={} desk={} cascade={} scene={} (ORIN-RENDER entered on the tegra terminus; this seam does NOT call desktop_firmware::activate — §5.2 is crossed only by the deskcascade seam ahead of it, when cascade=1; scene=1 is the cascade's readback bar=1 + route=ROUTED, and on it the pass RETIRES the strip and SERVICES the pulse window — DESKSCENE)",
+        "[render] arm conwin={} furn={} tenant={} click={} desk={} cascade={} scene={} (RENDER entered on the tegra terminus; this seam does NOT call desktop_firmware::activate — §5.2 is crossed only by the deskcascade seam ahead of it, when cascade=1; scene=1 is the cascade's readback bar=1 + route=ROUTED, and on it the pass RETIRES the strip and SERVICES the pulse window — DESKSCENE)",
         cfg!(feature = "orinconwin") as u8,
         cfg!(feature = "orinfurn") as u8,
         cfg!(feature = "orintenant") as u8,

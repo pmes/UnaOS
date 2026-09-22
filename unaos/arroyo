@@ -3196,7 +3196,7 @@ gate_x86_rodata_no_code() {
 # greppable family: `wc`, `tegra`, `bsptick` and their kind gate CODE whose witnesses are named after
 # the SUBSYSTEM, not the feature, and `sdwrite` is a feature name that appears as a string in NO build
 # at all (the correction folded into 2e48d721 — it reads 0 on a known-good card, so grepping the
-# FEATURE NAME is a bad control; its family is `:: TEGRA-SD: WRITE admitted`). A map that guessed
+# FEATURE NAME is a bad control; its family is `:: SDMMC: WRITE admitted`). A map that guessed
 # would be worse than no map. So the rows below are the ones MEASURED both ways, and every other
 # feature on the banner is NAMED in one line as unmapped — reported, never silently skipped. Growing
 # this table is a per-feature, per-measurement job; `crates/kernel/Cargo.toml` already carries a
@@ -3217,7 +3217,7 @@ gate_x86_rodata_no_code() {
 #
 # A ROW IS SCOPED TO AN ARCH, and that column was paid for by the first real run of this check. The
 # x86 default feature list carries `sdwrite` (`witness,ehcihid,kbdwit,sdhcblk,smolnet,wc,sdwrite`)
-# while `:: TEGRA-SD: WRITE admitted` is printed from `arch/aarch64`, so an unscoped row reddened a
+# while `:: SDMMC: WRITE admitted` is printed from `arch/aarch64`, so an unscoped row reddened a
 # perfectly honest `./arroyo test` build on its first invocation. A FEATURE BEING ENABLED DOES NOT
 # MEAN ITS FAMILY IS COMPILED ON THIS TARGET; the arch is part of the declaration, and a row out of
 # scope is REPORTED as out of scope, never silently dropped. `any` means the family is arch-neutral.
@@ -3226,7 +3226,7 @@ gate_x86_rodata_no_code() {
 #
 # A ROW'S FEATURE FIELD IS A CONJUNCTION (`a+b+c`), and that was paid for too — by the third real
 # run, `UNAOS_QEMU_FULL=1 ./arroyo test-arm`. The aarch64 VIRT build arms `sdwrite`
-# (`witness,ehcihid,sdwrite`) but `:: TEGRA-SD: WRITE admitted` sits under
+# (`witness,ehcihid,sdwrite`) but `:: SDMMC: WRITE admitted` sits under
 # `#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc", feature = "sdwrite"))]`
 # (`drivers/block.rs:2518`), so a single-feature row reddened an honest `test-arm` (rc=6). ONE
 # FEATURE IS RARELY THE WHOLE GATE: the row must name every feature the `cfg` names, and the check
@@ -3239,7 +3239,7 @@ BANNER_ARTIFACT_MAP='
 ga10bprobe5a aarch64 [ga10bprobe5a]
 ga10bprobe5 aarch64 [ga10bfw]
 net6 aarch64 :: NET6:
-sdwrite+tegra+sdmmc aarch64 :: TEGRA-SD: WRITE admitted
+sdwrite+tegra+sdmmc aarch64 :: SDMMC: WRITE admitted
 '
 
 # Assert banner↔artifact agreement. 0 = agreed, 6 = disagreement or a broken control.

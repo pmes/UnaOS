@@ -1906,7 +1906,7 @@ static TEGRA_SD_PUBLISHED: core::sync::atomic::AtomicBool = core::sync::atomic::
 pub fn register_tegra_sd(num_blocks: u64, block_addressing: bool) -> bool {
     if num_blocks == 0 {
         serial_println!(
-            ":: TEGRA-SD: REFUSED to publish the microSD block backend — num_blocks=0 (nothing to address) ::"
+            ":: SDMMC: REFUSED to publish the microSD block backend — num_blocks=0 (nothing to address) ::"
         );
         return false;
     }
@@ -1919,8 +1919,8 @@ pub fn register_tegra_sd(num_blocks: u64, block_addressing: bool) -> bool {
     };
     *TEGRA_SD_BLOCK_DEVICE.lock() = Some(dev);
     if !TEGRA_SD_PUBLISHED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-        #[cfg(feature = "sdwrite")] serial_println!(":: TEGRA-SD: block backend published — {} sectors (read-write — the block layer admits ordinary writes; SDWRITE) ::", num_blocks); #[cfg(not(feature = "sdwrite"))] serial_println!(
-            ":: TEGRA-SD: block backend published — {} sectors (read-only) ::",
+        #[cfg(feature = "sdwrite")] serial_println!(":: SDMMC: block backend published — {} sectors (read-write — the block layer admits ordinary writes; SDWRITE) ::", num_blocks); #[cfg(not(feature = "sdwrite"))] serial_println!(
+            ":: SDMMC: block backend published — {} sectors (read-only) ::",
             num_blocks
         );
     }
@@ -1973,7 +1973,7 @@ static TEGRA_SD_WRITE_REFUSED: core::sync::atomic::AtomicBool = core::sync::atom
 pub fn write_block_tegra_sd(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> { #[cfg(feature = "sdwrite")] { return tegra_sd_write_through(_lba, _buf); } #[cfg(not(feature = "sdwrite"))] { // SDWRITE (A60): the knob-off arm below is the pre-A60 body, byte-for-byte; the route above is the only addition.
     if !TEGRA_SD_WRITE_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
         serial_println!(
-            ":: TEGRA-SD: WRITE refused at the block layer — the Orin card's only writer is the armed \
+            ":: SDMMC: WRITE refused at the block layer — the Orin card's only writer is the armed \
              sdmmc_arm ladder in sdmmc_tegra.rs (first, once) ::"
         );
     }
@@ -2519,7 +2519,7 @@ pub const fn tegra_sd_writes_admitted() -> bool {
 pub fn tegra_sd_write_through(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     if !TEGRA_SD_WRITE_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
         serial_println!(
-            ":: TEGRA-SD: WRITE admitted at the block layer — ordinary file mutation routes to the \
+            ":: SDMMC: WRITE admitted at the block layer — ordinary file mutation routes to the \
              unarmed CMD24 primitive (SDWRITE; first, once) ::"
         );
     }

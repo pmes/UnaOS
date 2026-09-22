@@ -64,19 +64,19 @@ REQUIRE :: INSTALLVERB: census disk=global transport=global ::
 # The fixture's own table, read back through the partition engine. `parts=5` IS pinned exactly —
 # it is a fact about `make-gpt-fixture.py`, not about the machine, and a fixture that silently grew
 # or lost a slot would make every refusal pin below assert a different disk.
-REQUIRE :: PINSTALL: census disk=.* parts=5 foreign=[0-9]+ friend=[0-9]+ empty=[0-9]+ ::
-REQUIRE :: PINSTALL: census part=1 type=7c3457ef lba=[0-9]+\.\.[0-9]+ sectors=[0-9]+ content=APFS ::
-REQUIRE :: PINSTALL: census part=3 type=c12a7328 lba=[0-9]+\.\.[0-9]+ sectors=[0-9]+ content=ESP ::
+REQUIRE :: INSTALL: census disk=.* parts=5 foreign=[0-9]+ friend=[0-9]+ empty=[0-9]+ ::
+REQUIRE :: INSTALL: census part=1 type=7c3457ef lba=[0-9]+\.\.[0-9]+ sectors=[0-9]+ content=APFS ::
+REQUIRE :: INSTALL: census part=3 type=c12a7328 lba=[0-9]+\.\.[0-9]+ sectors=[0-9]+ content=ESP ::
 #
 # ── 3. THE FOUR REFUSALS AND THE ONE OFFER (burst 1) ─────────────────────────────────────────────
 # Each refusal is pinned by its REASON token, because the reason is the guard that fired and the
 # target alone would not say which. `Refusal::say` (install/partition.rs:389-428) owns these
 # spellings; a pin here is changed together with that file, in the same commit.
-REQUIRE :: PINSTALL: refusal target=global:disk reason=disk-has-foreign-volumes foreign=[0-9]+ friend=[0-9]+ -> guard OK ::
-REQUIRE :: PINSTALL: refusal target=global:part0 reason=partition-not-empty content=FAT -> guard OK ::
-REQUIRE :: PINSTALL: refusal target=global:part1 reason=partition-not-empty content=APFS -> guard OK ::
-REQUIRE :: PINSTALL: refusal target=global:part3 reason=partition-is-esp -> guard OK ::
-REQUIRE :: PINSTALL: refusal target=global:part4 reason=partition-too-small have=[0-9]+B need=[0-9]+B -> guard OK ::
+REQUIRE :: INSTALL: refusal target=global:disk reason=disk-has-foreign-volumes foreign=[0-9]+ friend=[0-9]+ -> guard OK ::
+REQUIRE :: INSTALL: refusal target=global:part0 reason=partition-not-empty content=FAT -> guard OK ::
+REQUIRE :: INSTALL: refusal target=global:part1 reason=partition-not-empty content=APFS -> guard OK ::
+REQUIRE :: INSTALL: refusal target=global:part3 reason=partition-is-esp -> guard OK ::
+REQUIRE :: INSTALL: refusal target=global:part4 reason=partition-too-small have=[0-9]+B need=[0-9]+B -> guard OK ::
 # And the ONE slot the census may offer. `part2` is pinned exactly: the whole point of the fixture
 # is that exactly one slot is installable, and a preview naming any other slot is a FORBID below.
 REQUIRE :: INSTALLVERB: preview target=global:part2 content=empty sectors=[0-9]+ -> INSTALLABLE ::
@@ -84,7 +84,7 @@ REQUIRE :: INSTALLVERB: preview target=global:part2 content=empty sectors=[0-9]+
 # how many times the operator asks, which is the TYPIST's business and not the guard's. What is a
 # fact about the guard is that refusing is its ordinary answer on this disk. (LAWS §5: COUNT means
 # hits >= n, so a later arc that types one more command can never red this line.)
-COUNT 5 :: PINSTALL: refusal target=
+COUNT 5 :: INSTALL: refusal target=
 #
 # ── 4. THE ACT (burst 2: `install global 2`) ─────────────────────────────────────────────────────
 # The write, its verification, and the neighbours. `-> PASS` on the `wrote` line is the kernel's own
@@ -101,7 +101,7 @@ REQUIRE :: INSTALLVERB: neighbours untouched=[0-9]+/[0-9]+ -> PASS ::
 # verb's disposition and `refusal target=part1` is the engine's; both are pinned because either one
 # alone could be printed by a path that still wrote.
 REQUIRE :: INSTALLVERB: install target=global:part1 err=NotBlank — nothing written ::
-REQUIRE :: PINSTALL: refusal target=part1 reason=partition-not-empty content=APFS -> guard OK ::
+REQUIRE :: INSTALL: refusal target=part1 reason=partition-not-empty content=APFS -> guard OK ::
 #
 # ── 6. THE GRAPHICAL INSTALLER (burst 4: `install --gui`, then Enter, Enter) ─────────────────────
 # The same engine reached through the compositor instead of the parser, which is the half INSTALLVERB
@@ -112,7 +112,7 @@ REQUIRE :: PINSTALL: refusal target=part1 reason=partition-not-empty content=APF
 REQUIRE :: INSTALLVERB: --gui — installer window requested \(opens on the next main-loop pass\) ::
 REQUIRE \[wc-x\] instgui census step=1 gpt=1 parts=[0-9]+ installable=[0-9]+ whole_disk_offered=0 — READ-ONLY, nothing written
 REQUIRE \[wc-x\] instgui install-go step=2 part=[0-9]+ \(attended Enter on the census screen\)
-REQUIRE :: PINSTALL: refusal target=part4 reason=partition-too-small have=[0-9]+B need=[0-9]+B -> guard OK ::
+REQUIRE :: INSTALL: refusal target=part4 reason=partition-too-small have=[0-9]+B need=[0-9]+B -> guard OK ::
 REQUIRE \[wc-x\] instgui part-install part=[0-9]+ refused \(TooSmall\) — nothing was written
 #
 # ── 7. THE RED SPELLINGS ─────────────────────────────────────────────────────────────────────────
@@ -145,7 +145,7 @@ FORBID :: INSTALLVERB: preview target=global:part4
 # guard drifts toward: an installer that refuses everything passes every FORBID above and is
 # useless. Scoped to `global:` because the post-write GUI census legitimately refuses `instgui:part2`
 # — by then slot 2 carries the FAT volume burst 2 just wrote, which is the correct answer.
-FORBID :: PINSTALL: refusal target=global:part2
+FORBID :: INSTALL: refusal target=global:part2
 #
 # 7d. THE NEIGHBOURS. `untouched=[0-3]/4` is the shortfall spelling on THIS fixture (four
 # neighbours); the `-> FAIL` arm of the same line is the built-in's. The other three are the paths

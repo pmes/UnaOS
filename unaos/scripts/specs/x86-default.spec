@@ -40,13 +40,13 @@
 # `quarrydock-logs/serial-unarmed.log` (the newest default `test` capture in the seat): 3/3 on both.
 REQUIRE :: PART: mbr census handle=global protective=0 accepted=[1-9][0-9]* rejected=[0-9]+ ::
 REQUIRE :: PART: mbr handle=global slot=1 type=0x0c boot=0x[0-9a-f]+ start=[0-9]+ count=[0-9]+ end=[0-9]+ ACCEPT ::
-REQUIRE :: PIUSB: \[usbw\] scratch geometry: USB last_lba=[0-9]+ \(num_blocks=[0-9]+\), keep-out ceiling=[0-9]+ \[mbr-partition-table\] ::
+REQUIRE :: USB: \[usbw\] scratch geometry: USB last_lba=[0-9]+ \(num_blocks=[0-9]+\), keep-out ceiling=[0-9]+ \[mbr-partition-table\] ::
 # The FORBID partner, and it is a REAL red spelling rather than an invented negation: `keep-out
 # ceiling=0 [raw (no container in sector 0)]` is EXACTLY what this line printed BEFORE DEFAULTMEDIUM
 # — recorded at `x86bind-logs/final-serial.log` on this bench — i.e. the writer treating the whole
 # device as scratch. The REQUIRE above cannot catch that answer arriving under a different handle;
 # this convicts it by name.
-FORBID :: PIUSB: \[usbw\] scratch geometry: .* keep-out ceiling=0 \[raw
+FORBID :: USB: \[usbw\] scratch geometry: .* keep-out ceiling=0 \[raw
 #
 # AND THE STORAGE PAIR, the same two shapes x86-fat.spec and x86-ahci.spec pin — one kernel line
 # pinned by three legs, which is the one duplication this tree's spec contract permits (it is NOT a
