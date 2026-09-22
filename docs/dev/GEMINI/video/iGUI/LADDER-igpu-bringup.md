@@ -69,12 +69,22 @@ before code is written saves a bench sitting each.
   transport-control registers. On IVB, eDP link training is driven through **`DP_A` (`0x64000`)
   bit fields** (port enable, link-train pattern select, port width, pipe select) paired with
   **DPCD writes over the `DPA_AUX` channel**. Any lane code that reaches for `DP_TP_*` on this
-  machine is programming a register that isn't there. **NEEDS-VERIFICATION** against PRM Vol 3
-  Part 4 — but do not start from the HSW register names.
+  machine is programming a register that isn't there. ✅ **VERIFIED 2026-09-22 (GMUX8), and the
+  volume pointer above was wrong:** `DP_TP_CTL`, `DP_TP_STATUS` and `TRANS_DDI_FUNC_CTL` occur
+  **zero times** in *either* IVB display volume — Vol 3 Part 3 (North, `IHD-OS-V3 Pt 3 – 05 12`)
+  or Vol 3 Part 4 (South, `IHD-OS-V3 Pt 4 – 05 12`), searched as whole-document text. Link
+  training is `DP_CTL_A[9:8]` (Vol3 Pt3 §4.4.1 pp.85–86: `00b` Pattern 1, `01b` Pattern 2, `10b`
+  Idle, `11b` Normal), port width is `[21:19]`, pipe select `[30:29]` — exactly as this bullet
+  predicted. `gpu_spec.md` §6.5–§6.6.
 - **The eDP PLL is not `DPLL_A`.** On ILK/SNB/IVB, eDP on port A drives a dedicated eDP PLL
   configured from **bits inside `DP_A` itself** (enable + a 162/270 MHz frequency select), not from
   `DPLL_A_CTRL`/`FPA0`/`FPA1`. The metal reading `DPLL_A = FPA0 = FPA1 = 0` is therefore *not*
-  necessarily a gap for this path. **NEEDS-VERIFICATION** — and note that i915's own headers appear
+  necessarily a gap for this path. ✅ **VERIFIED 2026-09-22 (GMUX8): `DP_CTL_A[14]` is the
+  DisplayPort PLL enable and `[17:16]` is the frequency select — `00b` 270 MHz, `01b` 162 MHz**
+  (Vol3 Pt3 §4.4.1 p.85), with a stated restriction to wait out the PLL warm-up before setting the
+  port-enable bit 31. That encoding is what rung `08b name=modeset-read` divides by to derive the
+  firmware's dot clock, under §4.2 p.74's own law `Link M/N = dot clock / ls_clk`. Residual
+  **NEEDS-VERIFICATION** — and note that i915's own headers appear
   to overlap `DP_PORT_EN` (bit 31), `DP_PLL_ENABLE` (bit 30) and `DP_PIPE_SEL_MASK_IVB` (bits
   30:29); **the PRM must settle that overlap before a single `DP_A` write is issued.**
 - **Two rungs are missing from the straw man and both produce a black panel:**
@@ -267,8 +277,52 @@ non-zero, because then something else owns that GGTT range).
 **Registers read:** `PCH_PP_STATUS` (`0xC7200`), and `PCH_PP_CONTROL` read-back.
 
 Field layouts of `PP_ON_DELAYS` / `PP_OFF_DELAYS` / `PP_DIVISOR` (T1+T2, T3, T9, T10, T11+T12, and
-the unit — likely 100 µs ticks derived from the reference divider) are **all TBV, PRM Vol 3 Part 4
-"Panel Power Sequencing"**. So is the `PP_CONTROL` bit map (`31:16` unlock key `0xABCD` —
+the unit — likely 100 µs ticks derived from the reference divider) were **all TBV, PRM Vol 3 Part 4
+"Panel Power Sequencing"**.
+
+> ✅ **PINNED, 2026-09-22 by GMUX8 — and the paragraph above is left standing so the corrections
+> are visible rather than quietly absorbed.** The document was fetched and read: Intel® OpenSource
+> HD Graphics PRM **Volume 3 Part 4: South Display Engine Registers (Ivy Bridge)**, Doc Ref
+> `IHD-OS-V3 Pt 4 – 05 12`, May 2012 Rev 1.0, §2.4 pp.38–43. Every field is transcribed with its
+> section and page in `docs/dev/OS/08_VIDEO/gpu_spec.md` §6.2 and carried as cited constants in
+> `igpu.rs`'s `regs` module; rung `07b name=pps-read` reads and decodes all five on the wire.
+> **No `i915` source was opened for the pin** — which matters here specifically, because the
+> `PP_CONTROL` guess below is attributed to `intel_pps.c` naming and that attribution is why the
+> ladder refused to use it for four flights.
+>
+> **What the guesses got right:** the `PP_CONTROL` bit map is exactly as written — `[31:16]` key,
+> `[3]` force-VDD, `[2]` backlight enable, `[1]` power-down-on-reset, `[0]` power state target —
+> and the `0xABCD` key field is real (§2.4.2 p.40).
+>
+> **What the guesses got WRONG, and each one would have cost a boot:**
+> 1. **There is no T11 field and no "T11+T12" pair.** On DisplayPort the four programmable values
+>    are **T3** (`PP_ON_DELAYS[28:16]`), **T9** (`PP_OFF_DELAYS[12:0]`), **T10**
+>    (`PP_OFF_DELAYS[28:16]`) and **T12** (`PP_DIVISOR[4:0]`, alone). The `T1+T2` / `T5` / `Tx` /
+>    `T4` lettering the paragraph above uses is the **LVDS/SPWG** column of the same fields, not
+>    the eDP one, and the two must not be mixed.
+> 2. **The unit is not uniform.** `PP_ON_DELAYS` and `PP_OFF_DELAYS` are in **100 µs** ticks;
+>    `PP_DIVISOR[4:0]` Power Cycle Delay is in **100 ms** ticks (default `4h` = 300 ms; the page's
+>    own worked example is "to achieve 400 ms, program a value of 5"). A T12 programmed as if it
+>    were 100 µs is off by a factor of a thousand.
+> 3. **The reference divider has a stated law, so it is not "likely derived":** `[31:8]`, and
+>    "the value should be (100 * Ref clock frequency in MHz / 2) − 1" — `001869h` is 125 MHz,
+>    which is what this machine reads.
+> 4. **The key does not gate every write; write protect does, and only while the panel is on.**
+>    §2.4.2 p.39: protection engages when the panel is powered up or powering up, `ABCDh`
+>    *disables* it, and the protected set is named explicitly — it includes **HTOTAL, HBLANK,
+>    HSYNC, VTOTAL, VBLANK and VSYNC**, i.e. the whole mode-set timing block, so a timing write
+>    made against a powered panel completes normally and changes nothing.
+> 5. **The key is REQUIRED on this port, not merely permitted.** The workaround on pp.40–41 ties
+>    `ABCDh` to `PP_ON_DELAYS[31:30] = 01b DisplayPort A`. On this machine firmware has installed
+>    the key (`PP_CONTROL=0xABCD0008`) while `PP_ON_DELAYS` reads `0x00000000`, i.e. port select
+>    **LVDS** — a half-configured sequencer, and rung 07b prints
+>    `port_sel_conflict=key-ABCD-but-port-sel-not-DPA` for it.
+>
+> **And the circularity in "Do not invent the T-values" below is now broken from the other side.**
+> Bit 3 is documented as existing "to force on VDD for the embedded DisplayPort panel so AUX
+> transactions can occur **without enabling the panel power sequence**" (§2.4.2 p.40). Firmware has
+> it set. That is why flights 8 and 11 read DPCD and EDID with `PP_STATUS=0x00000000`, and it means
+> the EDID/DTD path (i) is available **without** this rung writing anything at all. So is the `PP_CONTROL` bit map (`31:16` unlock key `0xABCD` —
 *strongly* corroborated by the metal read `0xABCD0008`; bit 0 power-on, bit 1 power-reset, bit 2
 backlight enable, bit 3 force-VDD, per i915 `intel_pps.c` naming). **Every write to `PP_CONTROL`
 must carry the `0xABCD` key in the upper half or it is silently dropped** — TBV, but the metal
