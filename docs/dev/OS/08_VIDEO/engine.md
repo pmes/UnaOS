@@ -18570,6 +18570,112 @@ the live path never calls.
 them, so `:: VUGPERF: shadow-pin …` will print on the wire with a four-figure `probes=` and the
 verdict is read there.
 
+### 4c. VUGPROBE — the change §4b named is TAKEN, and the fixture now scores on QEMU (B142, 2026-09-22)
+
+§4b said what was missing (a POPULATION), named the exact change, and could not make it: the ladder
+call lives in `arch/x86_64/syscall.rs`, a file that brief did not name. It is made now, and the two
+lines §4b could not print are these, from `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1
+UNAOS_QEMU_FULL=1 ./arroyo test 240` (rc 0, full wall 251.2 s, 2843 lines):
+
+    :: VUGPROBE: shadow-drive win=1 tries=8 paced=1 coalesced=1 shadow=true lost=false
+        bound=coalesced>=1,shadow :: PASS ::
+    :: VUGPERF: shadow-pin probes=1 free=1 held=0 free_pct=100 copy_us=125 pass_us=1494
+        copy_pct=8 mirror_oom=0 bound=free_pct>=90 :: PASS ::
+
+**The population went 0 -> 1 and that is the whole delivery.** §4b's capture summed `coalesced=` to
+**1** over a 248 s boot and `probes` to **0**; this one reads `[wpace] win=1 … paced=2 coalesced=1
+tail=0 shdw=1 defer=0` for the fixture's own slot and `probes=1`. One probe, not a thousand, and
+that is the honest number under TCG — the gate has one paced window because the fixture mints
+exactly one.
+
+**The fixture drives the LIVE PATH and nothing else, which is the only part of its design that is
+load-bearing.** `wm::vugprobe_selftest` (`video/wm.rs`, beside `pace_pin_probe`; one ladder call in
+`arch/x86_64/syscall.rs` folded onto the `vugres`/`apppin` line) mints ONE row whose owner is
+non-zero and outside `KERNEL_OWNER_BASE` — const-asserted, and the reason is `pace_admit`'s first
+statement: a kernel-band row is pace-EXEMPT, so DMGOVLP's six `KERNEL_OWNER_BASE + 0x4N` rows could
+never have coalesced however hard they were presented. It then calls `present_outcome` until one
+present comes back `Coalesced`. The FIRST present claims the frame edge (`PACE_LAST_CYC`
+compare-exchange) and composites; the SECOND lands inside that same 16.667 ms frame and is
+coalesced — and coalescing is EXACTLY the call site of `pace_shadow_refresh(.., create = !pace_go)`.
+So the shadow is created at a real present boundary, by the real presenter, with the owner parked
+where `present_banded` parks it. Nothing writes `PACE_SHADOW` or `PACE_SHADOW_OK` from the fixture;
+`shadow=` on the verdict line is that bit READ BACK. Poking it instead would have repeated B121
+exactly — `winmenu::selftest` green on every x86 boot through a seam the live path never called —
+and the fixture would have proved that the poke worked.
+
+`tries=8` is a budget, not a loop that hides a failure: the gap between the two presents IS the
+first present's own composite pass, because `present_banded` stamps the frame BEFORE it calls
+`composite()`. QEMU's TCG passes are `[comp2] pass_us=4265` mean with a 170 ms tail, so one outlier
+costs a retry rather than the boot; the measured run needed none (`paced=1 coalesced=1`). A
+`composite()` ahead of the loop drains every other row's damage so that first pass carries this one
+160x8 row and nothing else.
+
+**THE GO-RED IS RUN THIS TIME, AND IT IS THE ONE §4b SAID WOULD HAVE BEEN VACUOUS.** Revert
+`pace_shadow_source`'s tail to the pre-VUGPERF wide pin (`r.surf = g.as_ptr() as usize;
+ShadowSrc::Shadow(g)` — the pass holds the shadow across the whole per-window iteration again),
+rebuild, same gate, same knobs:
+
+    :: VUGPROBE: shadow-drive win=1 tries=8 paced=1 coalesced=1 shadow=true lost=false
+        bound=coalesced>=1,shadow :: PASS ::
+    :: VUGPERF: shadow-pin probes=1 free=0 held=1 free_pct=0 copy_us=142 pass_us=1804
+        copy_pct=7 mirror_oom=0 bound=free_pct>=90 :: FAIL ::
+
+`./arroyo test 240` **rc 1**, and the replay reads `❌ MBENCH FAIL — 12/13 required witnesses, 2
+forbidden hit(s)` with `FIRST-SHORTFALL x86-wc.spec:239`. **Read the two lines together: the DRIVER
+still passes and the PROPERTY fails.** That separation is why both are pinned. A go-red that took
+the driver down with it would have proved only that the fixture is fragile; this one says the
+population was there, the probe ran, and the answer changed — `free_pct` 100 -> 0 on the same
+capture, deterministic in both directions and on any host, because with the pin re-widened the
+probe's try-lock is contending with the pass that is itself the holder.
+
+`copy_us=125 pass_us=1494 copy_pct=8` is the TCG reading of the ratio §3 is about, and it is
+REPORTED, never gated: the critical section is 8 % of the per-window iteration here, against the
+metal's ~14 ms pass where the beam wait alone is 5x the presenter's entire 500 us budget.
+
+**SPECPINS (b), which §4b said was worth nothing before (a).** `x86-wc.spec` now carries
+`REQUIRE :: VUGPROBE: … coalesced=1 shadow=true lost=false … :: PASS ::`,
+`REQUIRE :: VUGPERF: shadow-pin probes=[1-9]\d* … bound=free_pct>=90 :: PASS ::` and FORBIDs on
+their FAIL and SKIP arms. BOTH are pinned deliberately: the `:: VUGPERF:` line is emitted under
+`if probes > 0`, so pinning it alone would let the DRIVER be deleted and the gate stay green through
+the very silence this arc ended. The `probes=` pin is `[1-9]\d*` rather than a literal so a second
+paced window on a later boot cannot red it.
+
+### 4d. BRACKETQ — the dead pair §6 reported is retired ON THE BOARD WHERE IT IS DEAD, and only there
+
+§6 called `bracketq_met=0 bracketq_busy=0` dead code on this board and left it, correctly, as
+another arc's file. Taking it turned up the half §6 did not check, and it inverts the obvious
+remedy: **the pair is NOT dead everywhere — it is measured FIRING on aarch64.**
+`docs/dev/evidence/orin23/battery-postmetal-600887c2.log` reads
+
+    [wc-w] rollup presents=66 requested_px=1262008 presented_px=3139400 amp=2.48x
+           full_presents=2 bracketq_met=1 bracketq_busy=0 -> WIDENED
+
+`desk_amp_flush` is `#[cfg(feature = "witness")]` and nothing more, so `[wc-w]` is an every-board
+line despite DRAGWIDE's doc calling it "the x86 READER", and on aarch64 `DESK_SPRITE_OCC` is false,
+the `||`-chain runs, and `present_rects_meet` has a real question. **Retiring the fields outright
+would have deleted a witness with an observed firing.** So the retirement is scoped to the board
+where the arm is unreachable: on `all(target_arch = "x86_64", feature = "wc")` the `[wc-w]` line now
+reads `bracketq=retired(DESK_SPRITE_OCC)` in place of the two fields, and every other build prints
+them exactly as before, byte for byte (the two `serial_println!`s are `#[cfg]`-selected, not
+branched, so the knob-off image cannot move — `./arroyo knoboff wc 5369d61d` exit 0 confirms it).
+
+**And the pair was NOT made reachable, which was the other option §4b's owner offered. The reason is
+that `present_rects_meet` has no question to answer when the sprite is an occluder.** The bracket's
+one justification is "hand a pixel back before a painter in THIS operation overwrites it", and
+PTRREPAINT's `present_background` no longer overwrites it — the sprite's box joins the WC-I /
+SHELLDESK occluder set and the copy withholds those spans. That subtraction is decided inside
+`present_background` against its FINAL damage set, after the `PRESENT_RECTS` drain and after
+`mark_full`, which is strictly better informed than a peek taken before either. Re-siting the peek
+below the early return to give the counters a population would buy one `PRESENT_RECTS` try_lock per
+desktop present and would silently redefine `BRACKETQ_MET` from "brackets this arm rescued" to
+"rects that met the sprite" — a counter lying about its own name, which is worse than a zero.
+
+The armed artifact says the retirement is real rather than intended:
+`LC_ALL=C grep -a -o -F "bracketq_met=" target/x86_64_esp/kernel.elf` on the
+`witness,…,wc,quarry,…,ftdirx` build is **0 hits**, and `bracketq=retired(DESK_SPRITE_OCC)` is **1**.
+The wire agrees: `[wc-w] rollup presents=909 … full_presents=15 bracketq=retired(DESK_SPRITE_OCC)
+-> WIDENED`.
+
 ### 5. `amp=4.44x` — the brief's premise is wrong, and the right number is next to it
 
     [wc-w] rollup presents=4727 requested_px=34958085 presented_px=155244773 amp=4.44x
