@@ -236,6 +236,45 @@ nvidia-kepler-ctrlbind = ["nvidia-kepler", "nvidia-kepler-ctrladdr"]
 # shipped before this rung, which is why the rung is an inner gated module).
 # Kept in sync with arroyo AND builder/src/main.rs.
 nvidia-kepler-kfunwedge = ["nvidia-kepler", "nvidia-kepler-fifo"]
+# KVBLANK (rmbp, the GPU line under R53, rungs `kvblank-measure` + `kvblank-wait`):
+# `UNAOS_KEPLER_VBLANK=1` arms the Kepler head's VBLANK EDGE — counted, timed and phased — and the
+# wait `video/beam.rs` takes instead of spinning on the raster position
+# (`drivers/gpu/kepler_vblank.rs`, a module of its own).
+# THE DEFECT, measured: B135 §7 (VUGPERF, fold 4a283725) decomposed flight 11's 139.75 ms composite
+# pass and found the residual charged to neither half of the clock is `beam::hold` SPINNING on an
+# MMIO read — `[wc-h] win=8 beamwaits=4336 beamwait_us=10766899` (2.48 ms mean per hold against a
+# 16.667 ms frame), `win=3 beamwait_us=49113217` over 13971 waits, `win=2 beammaxwait_us=62007`. The
+# beam wait alone exceeds the presenter's whole 500 us budget by 5x, re-reading ONE register.
+# RUNG 1 `kvblank-measure` counts the edges and publishes the PHASE at which they land
+# (`:: kepler: vblank head= count= period_us= jitter_us= raster_at_irq= vt= mode=poll ::`), plus one
+# PMC line: exactly one bit (PDISPLAY) set in NV_PMC_INTR_EN, NV_PMC_INTR_0 watched for 50 ms, the
+# captured value RESTORED and READ BACK. `mode=poll` and not an interrupt because this tree has no
+# vector/MSI helper a PCI function can join (three hard-coded IDT vectors in
+# `arch/x86_64/interrupts.rs`, no allocator) and writing a fourth is a new interrupt mechanism; the
+# edge source is `HEAD_STAT.VERT[31:16]` (rnndb display/g80_pdisplay.xml:647), read out of the word
+# `scanout_beam` was reading anyway, so the rung costs ZERO extra MMIO.
+# RUNG 2 `kvblank-wait` adds a wait arm BESIDE the spin in `beam::hold` — taken only when a source
+# is counting, the hazard zone covers >= 1/3 of the frame, and rung 1's measured phase is OUTSIDE
+# that zone — with ONE confirming raster read and a fall-through to the untouched spin when the
+# prediction misses (`vbrecheck=`). Same give-up deadline as the spin, passed in from the spin's own
+# `t0`, so a present costs one budget whichever arm it took.
+# IMPLIES `nvidia-kepler` (the module reads `kepler::regs`/`mmio_read`) AND `beam` (rung 2's arm
+# lives inside `beam::hold` and rung 1's sampler is fed by `scanout_beam`, itself `beam`-gated), so
+# the gate at every call site is self-sufficient. x86_64-only in effect: the module's own `#[cfg]`
+# in `drivers/gpu/mod.rs` names the arch, because `arm_features` strips nothing from the kepler
+# family and the feature rides the full list onto aarch64 compiles.
+# DEFAULT OFF => the module, all four call sites and every `:: kepler: vblank ` string are unlinked
+# and media are byte-identical (`./arroyo knoboff nvidia-kepler-vblank`; `./arroyo knoboff beam`
+# measures that the rung-2 fold did not move the beam-off image either). Kept in sync with arroyo
+# and scripts/banner-cert.sh.
+# FOUR PLACES, and the fourth was MEASURED missing before it landed: with the knob in arroyo alone,
+# the first armed gate run printed `nvidia-kepler-vblank` in the `⚡ kernel features:` banner while
+# `awk 'index($0,":: kepler: vblank")'` over target/serial.log returned ZERO lines — the booted
+# kernel is built from `builder/src/main.rs`'s own env map, which never reads `$KERNEL_FEATURES`.
+# The rastmc/sdwrite class, caught on a gate rather than on a card. Kept in sync with arroyo,
+# builder/src/main.rs and scripts/banner-cert.sh; `x86-all` names the feature, which is what puts
+# the knob under `./arroyo check`'s KNOB→BUILDER WIRING CHECK.
+nvidia-kepler-vblank = ["nvidia-kepler", "beam"]
 # WC-X86: bring the window compositor (`video::wm`) up on the x86 panel path. Compiles
 # `video/desktop_uefi.rs` — the activation seam and the one kernel-drawn demo window — plus fbcon's
 # CONSOLE-WINDOW route (`panel_console_window_open`: the kernel console becomes an ordinary row in

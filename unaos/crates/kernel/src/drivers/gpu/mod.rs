@@ -64,3 +64,23 @@ pub mod igpu;
 #[cfg(feature = "gen7")]
 pub mod gen7;
 pub mod detect;
+/// KVBLANK (rmbp, GPU line under R53, rungs `kvblank-measure` + `kvblank-wait`) — the Kepler head's
+/// VBLANK EDGE, counted/timed/phased, and the wait `video/beam.rs` takes instead of spinning on the
+/// raster position. Answers B135 §7 (VUGPERF): `[wc-h] win=8 beamwaits=4336 beamwait_us=10766899`
+/// — 2.48 ms mean per hold, spent re-reading ONE MMIO register.
+///
+/// `target_arch = "x86_64"` IS PART OF THE GATE, not decoration: `nvidia-kepler-vblank` rides the
+/// full `$KERNEL_FEATURES` onto aarch64 compiles too (`arm_features` strips `smolnet`/`kbdwit`/
+/// `ehcihid`/`deadman` and nothing from the kepler family), and every item in this module reads a
+/// GK107 BAR0 or an x86 TSC. `nvidia-kepler-vblank` implies `nvidia-kepler` AND `beam` in
+/// Cargo.toml — the first because the module reads `kepler::regs`/`mmio_read`, the second because
+/// rung 2's arm lives inside `video::beam::hold` and rung 1's sampler is fed by `scanout_beam`,
+/// which is itself `beam`-gated — so this gate alone is sufficient at every call site.
+///
+/// DEFAULT OFF => the module, the four call sites (`kepler.rs`'s PMC statement, `beam_probe`'s arm,
+/// `scanout_beam`'s edge feed, `beam::hold`'s wait arm + fixture) and every `:: kepler: vblank `
+/// string vanish, and every artifact is byte-identical (`./arroyo knoboff nvidia-kepler-vblank`,
+/// and `./arroyo knoboff beam` measures that the rung-2 fold did not move the beam-off image
+/// either). Kept in sync with `arroyo` and `crates/kernel/Cargo.toml`.
+#[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
+pub mod kepler_vblank;

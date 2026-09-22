@@ -644,6 +644,23 @@ fn main() {
     // mod unwedge, the call site and kepler.rs's `fecs_poison_ledger` accessor unlinked =>
     // byte-identical media.
     if std::env::var("UNAOS_KEPLER_KFUNWEDGE").is_ok() { feats.push("nvidia-kepler-kfunwedge"); }
+    // KVBLANK (rmbp, the GPU line under R53, rungs kvblank-measure + kvblank-wait):
+    // UNAOS_KEPLER_VBLANK=1 arms the Kepler head's VBLANK EDGE — counted, timed and phased off
+    // `HEAD_STAT.VERT[31:16]` out of the word `scanout_beam` was already reading — and the wait
+    // `video/beam.rs::hold` takes instead of spinning on the raster position. B135 §7 (VUGPERF)
+    // measured the spin at `[wc-h] win=8 beamwaits=4336` with `beamwait_us` summing to 10 766 899,
+    // a 2.48 ms mean hold against a 16.667 ms frame.
+    // THIS list is what reaches the kernel binary for MEDIA builds AND for the QEMU gate, and this
+    // knob's entire product is witness lines — so a knob wired into arroyo alone puts
+    // `nvidia-kepler-vblank` in the banner and not one `:: kepler: vblank ` string in the image.
+    // ⚠ THAT IS NOT HYPOTHETICAL HERE: it was MEASURED on this rung's first armed gate run, before
+    // this line existed — banner named the feature, `awk 'index($0,":: kepler: vblank")'` over
+    // target/serial.log returned ZERO lines. BEAMX86's failure mode, and BAR1WEDGE's, KFBIND's,
+    // KFCTXBIND's, KDHEAD's and CTRLBIND's above, verbatim, caught by the gate rather than by a
+    // card. Kept in sync with arroyo AND crates/kernel/Cargo.toml; `./arroyo check`'s KNOB→BUILDER
+    // WIRING CHECK goes red if this line is dropped. DEFAULT OFF => the module, all four call sites
+    // and every `:: kepler: vblank ` string unlinked => byte-identical media.
+    if std::env::var("UNAOS_KEPLER_VBLANK").is_ok() { feats.push("nvidia-kepler-vblank"); }
     // R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
     // (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only; pure measurement,
     // no scheduling/locking/present change. x86_64-only in effect; DEFAULT OFF => empty inline shims,

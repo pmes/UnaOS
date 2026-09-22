@@ -1427,7 +1427,7 @@ pub fn init(gpu: &GpuInfo) {
 
         // 4. Disable Interrupts
         mmio_write(bar0, regs::NV_PMC_INTR_EN, 0);
-        serial_println!("[NVIDIA] Disabled interrupts via PMC_INTR_EN");
+        serial_println!("[NVIDIA] Disabled interrupts via PMC_INTR_EN"); #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))] crate::drivers::gpu::kepler_vblank::arm_pmc_pdisplay(bar0); // KVBLANK rung 1, PMC half — SAME-LINE APPEND, deliberately: this file's panic `Location` records embed line numbers and the knob-off byte-identity contract (`./arroyo knoboff nvidia-kepler-vblank`) is this track's standing proof, so the rung costs ZERO lines here. The statement above has written PMC_INTR_EN = 0 since the driver's first day; under the knob the rung then sets EXACTLY ONE bit (PDISPLAY, bit 26 — the two PMC offsets are [TREE], the BIT is [EXT] and UNVERIFIED on GK107), watches NV_PMC_INTR_0 for 50 ms to ask whether the display engine latches a source there AT ALL, and RESTORES the captured value with a READ-BACK (`restored=… verdict=clean|DIRTY`, the ctrlbind idiom). Delivery is impossible by construction — this tree has no vector/MSI helper a PCI function can join — which is the point: the rung asks whether the SOURCE is alive, not whether an interrupt arrives. See drivers/gpu/kepler_vblank.rs.
 
         // 5. VRAM Detection & Initialization
         let vram_size_mb = mmio_read(bar0, regs::NV_PFB_RAM_AMOUNT) as usize;
