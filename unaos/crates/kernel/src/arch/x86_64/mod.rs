@@ -273,3 +273,35 @@ pub fn scanout_beam() -> Option<(u32, u32)> {
         None
     }
 }
+
+/// IOAPIC — the I/O APIC redirection table (Intel 82093AA), and the end of "this function offers no
+/// usable MSI capability, and there is no IOAPIC in this kernel to route INTx to".
+///
+/// DECLARED AT THE FILE TAIL, and that is a byte-identity requirement rather than style: a
+/// `pub mod` inserted anywhere above shifts every `panic::Location` line below it, and
+/// `./arroyo knoboff ioapic` is this arc's stated invariant.
+#[cfg(feature = "ioapic")]
+pub mod ioapic;
+
+/// IOAPIC rung 3 — route one PCI function's INTx to `vector`, or answer `false`.
+///
+/// THE TWO-POLARITY WRAPPER, and it is `scanout_beam`'s shape above for `scanout_beam`'s reason.
+/// The one caller outside this directory is a term of an `if` CONDITION in
+/// `drivers/ehci/mod.rs::isr_arm_controller`, and a condition term cannot carry a `#[cfg]` of its
+/// own. So the OFF arm is a CONSTANT `false` — `&& !false` folds to the expression that was
+/// already there, which is what keeps `./arroyo knoboff ioapic` byte-identical — and the module
+/// declaration above stays `#[cfg]`-gated, so a knob-off build does not lex `ioapic.rs` at all.
+///
+/// Appended at the file tail for the reason the two functions above state.
+#[inline]
+pub fn ioapic_route_intx(bus: u8, dev: u8, func: u8, vector: u8) -> bool {
+    #[cfg(feature = "ioapic")]
+    {
+        ioapic::route_pci_function(bus, dev, func, vector)
+    }
+    #[cfg(not(feature = "ioapic"))]
+    {
+        let _ = (bus, dev, func, vector);
+        false
+    }
+}

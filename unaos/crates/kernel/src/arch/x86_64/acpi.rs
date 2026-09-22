@@ -166,7 +166,7 @@ pub fn init(rsdp_addr: u64) {
     // CPU or subsystem can observe it; read-only thereafter, so a relaxed atomic is sufficient
     // (there is no other datum whose visibility is ordered against it).
     RSDP_ADDR.store(rsdp_addr, core::sync::atomic::Ordering::Relaxed);
-    let topo = TOPOLOGY.call_once(|| parse(rsdp_addr));
+    let topo = TOPOLOGY.call_once(|| parse(rsdp_addr)); #[cfg(feature = "ioapic")] crate::arch::ioapic::census(); // IOAPIC (rmbp-ledger B147) — LINE-NEUTRAL append, and the position is the whole argument: `parse` is what walks the MADT, so the census table is full exactly here and not one statement earlier. READ-ONLY with respect to the redirection table — this prints what firmware declared and what IOAPICVER answers, and writes no entry. CODE BEFORE THE COMMENT (LEDGER P7).
     serial_println!(
         "ACPI: {} CPU(s) discovered, local APIC @ {:#x}, apic ids {:?}",
         topo.count,
@@ -297,7 +297,7 @@ unsafe fn parse_madt(madt_addr: u64) -> Topology {
                     topo.push(x2apic_id);
                 }
             }
-            _ => {}
+            _ => { #[cfg(feature = "ioapic")] crate::arch::ioapic::madt_entry(entry_type, base, entry_len); } // IOAPIC (rmbp-ledger B147) — LINE-NEUTRAL: this is the ONE arm that has silently discarded every entry type the topology walk does not consume, which is where the I/O APIC (type 1), the Interrupt Source Override (type 2) and the Local APIC NMI (type 4) entries have been going since this file was written. Routed to the census rather than matched here so the walk above stays EXACTLY the local-APIC list it was; the collector does its own type and length checks. CODE BEFORE THE COMMENT (LEDGER P7).
         }
         off += entry_len;
     }

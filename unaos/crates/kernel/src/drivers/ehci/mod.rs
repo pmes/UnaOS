@@ -15170,7 +15170,7 @@ unsafe fn isr_arm_controller(idx: usize, bus: u8, dev: u8, func: u8, op: u64) {
         func,
         msg_addr,
         crate::arch::interrupts::EHCI_MSI_VECTOR as u32,
-    ) {
+    ) && !crate::arch::x86_64::ioapic_route_intx(bus, dev, func, crate::arch::interrupts::EHCI_MSI_VECTOR) { // IOAPIC (rmbp-ledger B147) — LINE-NEUTRAL, and this ONE term is the whole of this arc inside this file. The refusal below is now reached only when BOTH delivery paths are unavailable: MSI (no usable capability) and INTx (no I/O APIC on the machine, no INTx pin on the function, or — the case this rung deliberately cannot answer — no Interrupt Line firmware ever programmed, `reason=no-firmware-line`). Routing SUCCEEDS => the function falls through to the USBINTR unmask below UNCHANGED, because the completion vector, its IDT entry and `ehci_msi_handler` are the ones ISRARM already had — only the delivery path is new, which is why this rung adds no handler and no vector. Knob-off, `ioapic_route_intx` is a CONSTANT `false` (arch/x86_64/mod.rs, the `scanout_beam` shape), so `&& !false` folds to the expression that was here before: `./arroyo knoboff ioapic`. CODE BEFORE THE COMMENT (LEDGER P7).
         ISR_REFUSED.fetch_add(1, Ordering::Relaxed);
         if idx < MAX_CONTROLLERS {
             ISR_OP[idx].store(0, Ordering::Relaxed);

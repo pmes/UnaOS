@@ -3577,6 +3577,41 @@ hda-tone = ["hda"]
 # k8-reach.registry`, records why this knob has no Pi bare-metal arm.
 # See docs/dev/OS/07_USB_STORAGE/uvc.md.
 uvc = ["ehcihid"]
+# IOAPIC (rmbp-ledger B147): `UNAOS_IOAPIC=1` arms `arch/x86_64/ioapic.rs` — the Intel 82093AA
+# I/O APIC redirection table, which this kernel has never had. Until this feature, `apic.rs` drove
+# the LOCAL APIC only and `drivers/pci.rs` could enable MSI/MSI-X, so a PCI function offering no
+# usable MSI capability had NOWHERE to deliver a legacy INTx assertion and could only be POLLED.
+# The measured case is the EHCI controllers (rmbp flight 11: `ISRARM REFUSED — … there is no IOAPIC
+# in this kernel to route INTx to`), and the cost is the trackpad's dark windows — up to 108 ms,
+# ledger B139 / EHCIDARK.
+#
+# THREE RUNGS BEHIND THE ONE KNOB, each landed green before the next. (1) CENSUS: `acpi::parse_madt`'s
+# catch-all arm feeds a collector that reads every I/O APIC (ACPI §5.2.12.3), Interrupt Source
+# Override (§5.2.12.5) and Local APIC NMI (§5.2.12.7) entry; each controller's IOREGSEL/IOWIN window
+# is mapped and IOAPICVER read for its redirection-entry count. Nothing is written. (2) ROUTE:
+# `route_gsi` programs one 64-bit redirection entry MASKED (82093AA §3.2.4) and reads it back;
+# `set_mask`/`unroute` are its other verbs; `route_pci_intx` derives a function's GSI from its own
+# Interrupt Pin / Interrupt Line registers through the override table. (3) PCI ARM:
+# `route_pci_function` is what `ehci::isr_arm_controller` calls where MSI refused — route, clear PCI
+# COMMAND bit 10, unmask, in that order. Witnesses: `[ioapic] census ioapics=…`, `[ioapic] id=…` per
+# controller, `[ioapic] iso …` per override, `[ioapic] route bdf=… -> gsi=…|REFUSED reason=…`, and
+# `[ioapic] armed bdf=… entry=…`. Measured on q35: `ISRARM … irq=122 isr_rearm=109 poll_rearm=13`.
+#
+# THE STATED LIMIT: the DSDT `_PRT` is AML and this kernel has no interpreter, so the GSI comes from
+# firmware's own Interrupt Line and an unprogrammed line is `REFUSED reason=no-firmware-line` rather
+# than guessed. See docs/dev/OS/01_BOOT_HAL/ioapic.md §4.
+#
+# Default OFF => the module is not lexed (its `pub mod` in `arch/x86_64/mod.rs` is both `#[cfg]`-gated
+# and at the FILE TAIL, so no `panic::Location` below it moves), the two `acpi.rs` sites and the one
+# `drivers/ehci/mod.rs` site are `#[cfg]`-erased LINE-NEUTRAL appends with the code before the `//`,
+# and the EHCI condition TERM folds away because `ioapic_route_intx` is a constant `false` in the OFF
+# polarity (the `scanout_beam` shape) — so the image is byte-identical
+# (`./arroyo knoboff ioapic`). x86_64 only in effect; stripped from aarch64 media by arroyo's
+# `arm_features` exactly as `hda` and `ahci` are.
+#
+# Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs`.
+# See docs/dev/OS/01_BOOT_HAL/ioapic.md.
+ioapic = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

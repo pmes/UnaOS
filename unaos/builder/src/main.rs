@@ -778,6 +778,17 @@ fn main() {
     // delta. Default OFF => the feature is absent and the image is byte-identical
     // (`./arroyo knoboff uvc`). Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_UVC").is_ok() { feats.push("uvc"); }
+    // IOAPIC (rmbp-ledger B147): UNAOS_IOAPIC=1 arms `arch/x86_64/ioapic.rs` — the Intel 82093AA
+    // redirection table, so a PCI function with no usable MSI capability can have its INTx routed
+    // to a vector instead of staying POLLED (rmbp flight 11: `ISRARM REFUSED … no IOAPIC`).
+    // MUST be listed here and not only in `arroyo`, and this knob is the worst case for that rule:
+    // THIS list is what compiles the kernel `./arroyo test` boots and the kernel the rMBP bench
+    // boots, so a mapping in arroyo alone would put `ioapic` on the banner while the image carried
+    // no redirection-table writer — and the boot would print the exact refusal this arc exists to
+    // end, with the banner claiming the fix was in. `scripts/banner-cert.sh` now reads the artifact
+    // for `[ioapic] census ioapics=` whenever the banner names the feature, which is the same
+    // question asked from the other side. Kept in sync with arroyo's mapping and Cargo.toml.
+    if std::env::var("UNAOS_IOAPIC").is_ok() { feats.push("ioapic"); }
     if !feats.is_empty() {
         let list = feats.join(",");
         kernel_cmd.arg("--features").arg(&list);
