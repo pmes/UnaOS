@@ -1500,8 +1500,8 @@ fn parse_bpb(
     let data_sec = tot_sec - first_data_sector;
     let count_of_clusters = data_sec / sec_per_clus;
 
-    // FAT type is defined SOLELY by the cluster count (Microsoft FAT spec). Not the FS-type string.
-    let kind = if count_of_clusters < 4085 {
+    // FAT32SHAPE (SO49, A73): a FAT32-shaped BPB is FAT32 at ANY cluster count — see the tail block. Otherwise the type is the cluster count's SOLELY (Microsoft FAT spec), never the FS-type string. LINE-NEUTRAL: the arm is folded onto the `let`, no line added.
+    let kind = if fat32_by_shape(fat_sz16, fat_sz32, root_ent_cnt) { FatKind::Fat32 } else if count_of_clusters < 4085 {
         return Err(FatError::Unsupported); // FAT12 — not implemented
     } else if count_of_clusters < 65525 {
         FatKind::Fat16
@@ -5348,3 +5348,73 @@ fn push_ahci_sources(out: &mut alloc::vec::Vec<BlockSource>) {
 #[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
 #[inline(always)]
 fn push_ahci_sources(_out: &mut alloc::vec::Vec<BlockSource>) {}
+
+// =========================================================================================
+// FAT32SHAPE (SO49, orin-ledger A73) — a FAT32 volume is FAT32 by the SHAPE of its BPB, and the
+// cluster count only separates FAT12 from FAT16 underneath that.
+//
+// Tail-appended for the reason every block above it is: `fat.rs` is compiled into the knob-off
+// `kernel8.img`, `panic::Location` embeds source line numbers, and anything inserted mid-file moves
+// every panic site below it. The ONE mid-file edit this closes with is line-neutral by construction
+// — a condition folded onto the existing `let kind = if …` line, nothing added, nothing removed.
+//
+// THE DEFECT THIS CLOSES, measured on the Orin bench (`capture/line-acm0/orin.log`, the boot whose
+// mount line is `[vfs] volume mounted /volumes/________ source=global rw=yes
+// label_raw=0002000000010006000000 ::`). MBR slot 1 of the boot card, partition type 0x0c (FAT32
+// LBA), was mounted as FAT16:
+//
+//   :: PART: fat mounted from MBR slot 1 — extent LBA 2048..262112 (260064 sectors), FAT16
+//      vol@LBA2048 volsec=260064 bps=512 spc=8 nfat=2 fatsz=256sec reserved=32 fat@LBA2080
+//      data@LBA2592 clusters=32440 rootdir@LBA2592 (0sec) ::
+//
+// Read that line against the FAT specification and it refutes its own verdict twice. `reserved=32`
+// is the FAT32 reserved-region size (FAT16 uses 1), and `rootdir@… (0sec)` means `BPB_RootEntCnt`
+// is ZERO — **a FAT16 volume always has a fixed root directory and therefore a non-zero entry
+// count**, and its `BPB_FATSz16` is always non-zero too. This volume has neither. It is a small
+// FAT32 volume: 32440 clusters, under the 65525 the Microsoft spec's cluster-count rule uses as the
+// FAT16/FAT32 boundary, so the rule — applied literally and alone — called it FAT16.
+//
+// EVERY FAT32-vs-FAT16 branch downstream then read the wrong field of the same sector:
+//   * `BS_VolLab` at 0x2B instead of 0x47. The 11 bytes at 0x2B of a FAT32 boot sector are the high
+//     byte of `BPB_FSVer`, then `BPB_RootClus` (2), `BPB_FSInfo` (1), `BPB_BkBootSec` (6), then two
+//     bytes of `BPB_Reserved` — little-endian, that is exactly
+//     `00 02 00 00 00 01 00 06 00 00 00`, which is the `label_raw=` on the wire, byte for byte.
+//     The garbled label was never a label; it was four other BPB fields.
+//   * `BS_VolID` at 0x27 instead of 0x43 — the UNAFS.ATR binding fingerprint.
+//   * `root_cluster` forced to 0 and the root directory placed at the FAT16 fixed region, which on
+//     this volume is zero sectors long, so the root directory could not be walked at all — which is
+//     why `label_raw_rootdir()` found no `ATTR_VOLUME_ID` entry and fell back to the BPB.
+//   * FAT entries read 2 bytes wide instead of 4, and the EOC/bad-cluster masks taken at 16 bits.
+//
+// THE RULE. `BPB_FATSz16 == 0` (so the FAT size had to come from `BPB_FATSz32`) together with
+// `BPB_RootEntCnt == 0` (so there is no fixed root directory) is the structural signature of a
+// FAT32 BPB, and no conforming FAT12 or FAT16 volume can present it. It is what Linux's `fs/fat`
+// keys on, and it is decidable from three fields that are already parsed above. The cluster count
+// keeps its whole job everywhere else: under a BPB that is NOT FAT32-shaped it still separates
+// FAT12 (refused) from FAT16, exactly as before.
+//
+// WHAT CANNOT REGRESS, and why it is a property rather than a hope: the new arm fires ONLY where
+// `fat_sz16 == 0 && root_ent_cnt == 0`. A FAT16 volume has both non-zero by definition, so it
+// cannot reach the arm; a FAT32 volume with >= 65525 clusters — every ordinary one, including every
+// x86 and Pi bench stick and every QEMU image — was already classified `Fat32` by the cluster count
+// and is classified `Fat32` by the shape, the same answer down a shorter road. The only volumes
+// whose classification MOVES are the ones that were provably being read through the wrong offsets.
+//
+// Asserted live, on this predicate, in `fs::bootdisk::homesoil_selftest` leg 8 — with the bench's
+// own BPB numbers as the case that must pass and a real FAT16 BPB as the control that must not.
+// =========================================================================================
+
+/// FAT32SHAPE (SO49): is this BPB structurally a FAT32 BPB?
+///
+/// `BPB_FATSz16 == 0` forces the FAT size to come from `BPB_FATSz32`, and `BPB_RootEntCnt == 0`
+/// says there is no fixed root directory. Both are true of every FAT32 volume and neither can be
+/// true of a conforming FAT12 or FAT16 one, whose FAT size and root-entry count are both non-zero
+/// by definition. `fat_sz32 != 0` is asked as well so a wholly zeroed BPB — which satisfies the
+/// other two vacuously — is not admitted here; `mount_at` refuses it a few lines later anyway, and
+/// a predicate that answers "FAT32" about a sector of zeros would be wrong even so.
+///
+/// The ONE site that decides FAT type calls this, and so does the fixture that proves it. There is
+/// no second copy of the rule to drift.
+pub fn fat32_by_shape(fat_sz16: u32, fat_sz32: u32, root_ent_cnt: u32) -> bool {
+    fat_sz16 == 0 && fat_sz32 != 0 && root_ent_cnt == 0
+}

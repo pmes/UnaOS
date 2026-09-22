@@ -643,12 +643,14 @@ QUEUECITE_REG = {
     f"docs/dev/OS/orin-queue.md:{_i}":
         "orin-queue cites a row that exists in no ledger on any head (measured over 9 heads, "
         "2026-09-15, rmbp 20) — orin's to write or to strike; must reach zero"
-    for _i in ("A66 A67 A68 A69 A70 A71 A72 A73 A74 A75 A76 A78 A79 A80 A82 A83 A84 A85 A86 A87 "
+    for _i in ("A66 A67 A68 A69 A70 A71 A74 A75 A76 A78 A79 A80 A82 A83 A84 A85 A86 A87 "
                "A89 A90 A91 A92 A94 A95 S33 S34 SO43 SO44 SO45 SO46 SO47 SO48 SO49").split()
 }
 # COLLAPSED BY (file, id), NOT one line per occurrence: the first cut printed 202 identical-shaped
 # REGISTERED lines on every green run, which is LAWS §5's "22 names on every run trains the eye to
-# skip the region" four times over. The population is 35 ids, so 35 is what the reader is shown.
+# skip the region" four times over. The population was 35 ids when registered; A72 and A73 now
+# resolve in this tree's `orin-ledger.md` (LUN2, bf45f7cb), so the gate reded them as stale and both
+# entries were struck. 33 is what the reader is shown, and the list is two ids nearer zero.
 qc_seen = set()
 queue_deferred = {}
 queue_registered = {}

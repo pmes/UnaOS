@@ -971,7 +971,7 @@ fi
 # site, the census publication inside beam_probe and every `:: KDHEAD:` string are unlinked and media
 # are byte-identical. Kept in sync with crates/kernel/Cargo.toml AND builder/src/main.rs (the
 # four-place trap); the map line is parser-conformant so the KNOB→BUILDER WIRING CHECK covers it, and
-# `x86-all` names the feature at the END of its list.
+# `x86-all` names the feature (KFUNWEDGE was appended after it, so it is no longer last).
 [ -n "${UNAOS_KEPLER_KDHEAD:-}" ] && _feats="${_feats}nvidia-kepler-kdhead,"
 # CTRLBIND (rmbp, shut-out register §2 rung KF9b, appended 2026-09-17 — LAST line of the kepler
 # block): UNAOS_KEPLER_CTRLBIND=1 arms the PER-TARGET CHANNEL BRINGUP RE-RUN inside the restored KF9
@@ -997,8 +997,66 @@ fi
 # Default OFF => every `:: kepler: ctrlbind ` string and every call site is unlinked and media are
 # byte-identical. Kept in sync with crates/kernel/Cargo.toml AND builder/src/main.rs (the four-place
 # trap); the map line is parser-conformant so the KNOB→BUILDER WIRING CHECK covers it, and `x86-all`
-# names the feature at the END of its list.
+# names the feature (KFUNWEDGE was appended after it at the STORGPU rescue, so it is no longer
+# last on the line — corrected here rather than left to rot, as this block's own rule requires).
 [ -n "${UNAOS_KEPLER_CTRLBIND:-}" ] && _feats="${_feats}nvidia-kepler-ctrlbind,"
+# KFUNWEDGE (rmbp, shut-out register §2 rung KF29, appended 2026-09-15 — LAST line of the kepler
+# block; if you append below this, CORRECT THIS CLAIM rather than leaving it to rot, as the four
+# entries above it were each corrected in turn): UNAOS_KEPLER_KFUNWEDGE=1 arms THE UN-WEDGE
+# EXPERIMENT in drivers/gpu/kepler_fifo.rs (`mod unwedge`, beside KF27 and KF28) — the only rung in
+# this tree that DELIBERATELY BREAKS THE HARDWARE IT IS MEASURING.
+# ⚠⚠ SACRIFICIAL BOOT. READ THIS BEFORE ARMING IT. The rung performs, on purpose, the one access
+# three sittings taught this campaign not to perform: a HOST READ of 0x409504 (WRCMD_CMD). §5.4 of
+# falcon_microcode_spec.md — the poison law — says what that does: the first access faults
+# immediately and wedges every subsequent read in the FECS unit for the rest of the boot (s31
+# discovered, s32 proved it with its own control frame, s34 convicted the offset by elimination).
+# The Kepler IS the panel on this machine, so the operator may LOSE THE DISPLAY UNTIL A POWER CYCLE
+# and the serial capture is the deliverable. FLY IT LAST IN A SITTING AND ALONE — never with
+# UNAOS_BEAMX86, the KDHEAD display rung, UNAOS_KEPLER_KFBIND (KF27) or UNAOS_KEPLER_KFCTXBIND
+# (KF28), because every verdict collected after this rung is void by §5.4. A POISON IS NOT
+# RESTORABLE: the rung reports `restored=IMPOSSIBLE`, not a success echo that cannot fail.
+# WHY IT IS OWED. §2's KF21 row has said the same thing for ten sittings: "the poison register is
+# writable without consequence to the boot. Reading it first is what poisons; writing it last is
+# harmless. The un-wedge experiment ('does a PRING clear recover the unit?') remains UNEXERCISED —
+# nothing has ever wedged on a boot that went looking." The instrument was designed and LANDED once
+# (pull 30, 0e26447e) and flew at s34, where all five probed offsets read clean, so the un-wedge
+# half never ran and the code was later removed. The missing ingredient was never the clear; it was
+# a wedge that fires on purpose at a point in the boot where losing the unit costs nothing.
+# FIVE STEPS. (1) BASELINE, read-only: the PRING fault words this tree has cited — PBUS_INTR
+# (0x1100, read 0000000C on this part at s33 and W1C'd there) and the PIBUS trio INTR_ADDR/
+# INTR_VALUE/INTR (0x120120/0x120124/0x120128, all read real 00000000 at s33), plus
+# PIBUS_MMIO_HUB_ENABLE1 as context — beside cpuctl, mailbox0 and the FECS access ledger, so the
+# capture proves nothing above had already poisoned the unit. (2) THE POKE: exactly ONE read of
+# 0x409504, through kepler::fecs_read so the ledger counts it, printed with its returned value and
+# `poisoned=<yes|no>` (the BAD0/BADF family is yes). (3) OBSERVE: the PRING words re-read with bits
+# 2 (MMIO_RING_ERR) and 3 (MMIO_FAULT) tagged [EXT], cpuctl and mailbox0 re-read, and NV_PMC_BOOT_0
+# — OUTSIDE the unit — as the control, which is what BOUNDS the damage: a real chip ID beside a
+# BADF1000 cpuctl says the FECS unit, a poisoned one says the whole BAR0 path. (4) CLEAR: a W1C of
+# EXACTLY the bits read as SET one line above — a clear in a W1C register and a no-op by
+# construction in a plain RW one, so it asserts no field layout at all — skipped with its reason
+# (`skipped write=pring_clear_<reg> reason=nothing-latched`) when the register holds nothing.
+# (5) RE-READ and score: `-> UNWEDGED` / `-> STILL-POISONED` / `-> POISON-CONFINED` (the offset
+# faulted for itself and the unit did not follow) / `-> NOT-POISONED` (the law did not fire this
+# boot — louder than an un-wedge, since s31/s32/s34 saw it fire three times) / `-> VOID-BRACKET` /
+# `-> VOID-CONTROL`, every arm naming its conditions (R19: never "ruled out").
+# GATED ON KF27 AT RUNTIME: the rung re-evaluates KF27's base ladder read-only over KF27's own PTOP
+# address, extraction, window and probe offsets, and prints `skipped reason=kf27-base-unresolved`
+# (poisoning NOTHING) unless it resolves DERIVED-WINS or BOTH-ANSWER. ⚠ DELIBERATELY DOES NOT IMPLY
+# nvidia-kepler-kfbind OR nvidia-kepler-kfctxbind, for the co-flight reason above.
+# Implies nvidia-kepler AND nvidia-kepler-fifo (Cargo-side) — the call site is in kepler::init's
+# fifo leg, immediately above the terminal poke, which is the §5.4 ordering rule taken literally.
+# ⚠ AND IT VOIDS THE TERMINAL POKE'S OWN DATUM on an armed boot: spec §10's evidence for that write
+# is that it is the boot's ONLY access to the offset, and here the read came first. The fecs-ledger
+# line prints 504_read_idx and 504_write_idx so the capture STATES the ordering.
+# Wire: `:: KFUNWEDGE: begin ...`, `:: KFUNWEDGE: base class=...`, `:: KFUNWEDGE: pring pre|post-poke
+# |post-clear ...`, `:: KFUNWEDGE: pre pring=0x... cpuctl=0x... ::`, `:: KFUNWEDGE: poke read=0x409504
+# value=0x... poisoned=... ::`, `:: KFUNWEDGE: observe ...`, `:: KFUNWEDGE: clear|skipped write=
+# pring_clear_... ::`, and the `verdict`/`end rung=KF29` rollup. Default OFF => mod unwedge, the call
+# site, kepler.rs's `fecs_poison_ledger` accessor and every `:: KFUNWEDGE:` string are unlinked and
+# media are byte-identical. Kept in sync with crates/kernel/Cargo.toml AND builder/src/main.rs (the
+# four-place trap); the map line is parser-conformant so the KNOB->BUILDER WIRING CHECK covers it,
+# and `x86-all` names the feature.
+[ -n "${UNAOS_KEPLER_KFUNWEDGE:-}" ] && _feats="${_feats}nvidia-kepler-kfunwedge,"
 # R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
 # (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only, never a mean; pure
 # measurement, changes no scheduling/locking/present behaviour. x86_64-only in effect (the real impl is
@@ -4725,7 +4783,8 @@ KERNEL_CFG_MATRIX=(
   # counts on `./arroyo check`'s own summary line, never from this prose.
   # APPEND to this line — never rewrite it. A rebase has already come close to dropping a knob by
   # replacing the list instead of extending it.
-  # KFCTXBIND (rmbp, shut-out register §2 rung KF28, appended 2026-09-15, LAST on the line):
+  # KFCTXBIND (rmbp, shut-out register §2 rung KF28, appended 2026-09-15 — was LAST on the line
+  # until KFUNWEDGE was appended after it the same day; corrected rather than left to rot):
   # `nvidia-kepler-kfctxbind` — the KF18/KF19 re-run at drivers/gpu/kepler_fifo.rs `mod ctxbind`. It
   # belongs on THIS leg for KFBIND's reason one paragraph up and for one KFBIND does not have: the
   # rung is an INNER module (`#[cfg(feature = "nvidia-kepler-kfctxbind")] pub mod ctxbind`) inside a
@@ -4778,7 +4837,25 @@ KERNEL_CFG_MATRIX=(
   # build defect (BEAMX86's, KFBIND's, KFCTXBIND's and KDHEAD's failure mode, verbatim). THIRD: the
   # seam it calls, `kepler::try_bind_and_witness`, is NOT gated — `init` calls it on every kepler
   # boot — so this leg is also what type-checks the two call sites' agreement on its signature.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,nvidia-kepler-ctrlbind"
+  # KFUNWEDGE (rmbp, shut-out register §2 rung KF29, appended 2026-09-15, LAST on the line):
+  # `nvidia-kepler-kfunwedge` — the un-wedge experiment at drivers/gpu/kepler_fifo.rs `mod unwedge`.
+  # It belongs on THIS leg for KFCTXBIND's reason one paragraph up, and for one neither of the other
+  # two has: the rung is an INNER module inside a file whose own declaration in drivers/gpu/mod.rs
+  # this feature WIDENED (`any(kfbind, kfctxbind, kfunwedge)`), and the feature deliberately implies
+  # NEITHER sibling — so the only configuration in which one byte of it compiles is one carrying
+  # `nvidia-kepler` AND `nvidia-kepler-fifo` AND this feature, a TRIPLE that GATE-CFG-MIX's covering
+  # array guarantees ordered PAIRS for and cannot be relied on to deliver. x86-all names all three,
+  # so the rung's ARMED body — including the `fecs_poison_ledger` accessor it calls in kepler.rs,
+  # which is itself feature-gated and would otherwise be type-checked by nothing — is compiled by
+  # construction rather than by an index-derived mask. It is also what puts UNAOS_KEPLER_KFUNWEDGE
+  # under the KNOB->BUILDER WIRING CHECK below, and this knob is the worst case that check exists
+  # for: a knob wired into arroyo alone would ship media whose banner claims the instrument and
+  # whose wire carries no `:: KFUNWEDGE:` string — and the operator would have spent a SACRIFICIAL
+  # boot, possibly the panel until a power cycle, on a build that never carried the rung. UNIVERSE
+  # SIDE EFFECT: the table gains one knob and the universe gains one (brand-new, so "unclaimed =>
+  # assume x86" either way and naming it here removes nothing); read the live board/mix counts on
+  # `./arroyo check`'s own summary line, never from this prose.
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
