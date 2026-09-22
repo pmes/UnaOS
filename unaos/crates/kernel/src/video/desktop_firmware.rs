@@ -581,7 +581,7 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 pub fn arm() {
     ARMED.store(true, Ordering::Release);
     serial_println!(
-        ":: PI-DESK: desktop armed — the witness cascade released the panel, furniture may land ::"
+        ":: DESK: desktop armed — the witness cascade released the panel, furniture may land ::"
     );
 }
 

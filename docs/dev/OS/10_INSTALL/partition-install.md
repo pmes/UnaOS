@@ -91,7 +91,7 @@ The "do not invent a verdict" arm stays, for identities the census truly does no
    > install global 1
    install refused (NotBlank) — nothing was written to global (see the console log for the reason)
    ```
-   `:: PINSTALL: refusal target=part1 reason=partition-not-empty content=APFS -> guard OK ::`
+   `:: INSTALL: refusal target=part1 reason=partition-not-empty content=APFS -> guard OK ::`
 
    `--as-esp` is accepted **only** as the explicit third word (`install global 2 --as-esp`), never
    inferred and never in place of the slot. `install --gui` reopens the graphical installer below.
@@ -244,7 +244,7 @@ The fixture disk carries one partition per refusal:
 | 3 | ESP-SLOT | ESP type GUID, all zero | `partition-is-esp` |
 | 4 | TINY | all zero, 1 MiB | `partition-too-small` |
 
-Witness lines to `awk` for (`awk 'index($0,"PINSTALL:")'` on `target/serial*.log`): the census rollup
+Witness lines to `awk` for (`awk 'index($0,"INSTALL:")'` on `target/serial*.log`): the census rollup
 and its five `census part=` rows, four `refusal … reason=` lines plus the SATA one,
 `wrote part=2 fat32 tree=4 bytes=61952 verified=4/4 -> PASS`, the post-write re-census, and
 `neighbours untouched=4/4 -> PASS` (all four non-target slots, not only the two foreign ones).
@@ -256,16 +256,16 @@ On the OPERATOR leg the same disk is written by the verb, so the verdicts are
 :: INSTALLVERB: census disks=3 ::
 :: INSTALLVERB: census disk=global transport=global ::
 :: INSTALLVERB: census disk=ahci5 transport=ahci UNREADABLE-HERE err=NotReady — install/mod.rs's BlockTarget reads only global/usb (B91); the disk is PRESENT and its content is UNKNOWN, not empty ::
-:: PINSTALL: census part=2 type=ebd0a0a2 lba=116736..215039 sectors=98304 content=empty ::
+:: INSTALL: census part=2 type=ebd0a0a2 lba=116736..215039 sectors=98304 content=empty ::
 :: INSTALLVERB: preview target=global:part2 content=empty sectors=98304 -> INSTALLABLE ::
-:: PINSTALL: refusal target=global:part4 reason=partition-too-small have=1048576B need=34662912B -> guard OK ::
+:: INSTALL: refusal target=global:part4 reason=partition-too-small have=1048576B need=34662912B -> guard OK ::
 :: INSTALLVERB: wrote part=2 files=4 bytes=61952 verified=4/4 -> PASS ::
 :: INSTALLVERB: neighbours untouched=4/4 -> PASS ::
-:: PINSTALL: refusal target=part1 reason=partition-not-empty content=APFS -> guard OK ::
+:: INSTALL: refusal target=part1 reason=partition-not-empty content=APFS -> guard OK ::
 :: INSTALLVERB: install target=global:part1 err=NotBlank — nothing written ::
 [wc-x] instgui census step=1 gpt=1 parts=5 installable=0 whole_disk_offered=0 — READ-ONLY, nothing written
 [wc-x] instgui install-go step=2 part=4 (attended Enter on the census screen)
-:: PINSTALL: refusal target=part4 reason=partition-too-small have=1048576B need=34659328B -> guard OK ::
+:: INSTALL: refusal target=part4 reason=partition-too-small have=1048576B need=34659328B -> guard OK ::
 ```
 
 **The two `need=` numbers differ by 3,584 B on purpose, and the difference is the one approximation
@@ -394,7 +394,7 @@ without `UNAOS_AHCI_DISK` is unchanged.
 ### Witness lines to `awk` for
 
 ```
-awk 'index($0,"PINSTALL:")'  target/serial*.log
+awk 'index($0,"INSTALL:")'  target/serial*.log
 awk 'index($0,"[ahci] write REFUSED")' target/serial*.log
 ```
 
@@ -402,21 +402,21 @@ Measured on the 2026-09-15 run (`target/serial.log`), verbatim:
 
 ```
 :: AHCI: write path ARMED — opcode WRITE-DMA-EXT-0x35 (ATA8-ACS, LBA48) compiled and reachable only through a WriteGrant (first, once) ::
-:: PINSTALL: sata disk ix=0 port=1 sectors=262144 install-self=eligible ::
-:: PINSTALL: sata disk ix=1 port=5 sectors=1032192 install-self=boot-device ::
-:: PINSTALL: refusal target=disk=sata-port5 reason=boot-device -> guard OK ::
-:: PINSTALL: fixture start — SATA port=1 carries a valid GPT ::
-:: PINSTALL: refusal target=disk reason=disk-has-foreign-volumes foreign=2 friend=0 -> guard OK ::
-:: PINSTALL: SATA transport WRITABLE under `ahci-write` — no transport refusal, writes still need a grant ::
-:: PINSTALL: other-disk port=5 sha1MiB=0xbbfe59f39e8ad2f6 (pre) ::
-:: PINSTALL: grant minted transport=ahci port=1 part=2 lba=116736..215039 sectors=98304 — every other LBA on this disk is unreachable through it ::
-:: PINSTALL: go-red(b) plain write_sectors on the SATA handle lba=116736 => NotReady, refused ::
-:: PINSTALL: wrote part=2 fat32 tree=4 bytes=61952 verified=4/4 -> PASS ::
+:: INSTALL: sata disk ix=0 port=1 sectors=262144 install-self=eligible ::
+:: INSTALL: sata disk ix=1 port=5 sectors=1032192 install-self=boot-device ::
+:: INSTALL: refusal target=disk=sata-port5 reason=boot-device -> guard OK ::
+:: INSTALL: fixture start — SATA port=1 carries a valid GPT ::
+:: INSTALL: refusal target=disk reason=disk-has-foreign-volumes foreign=2 friend=0 -> guard OK ::
+:: INSTALL: SATA transport WRITABLE under `ahci-write` — no transport refusal, writes still need a grant ::
+:: INSTALL: other-disk port=5 sha1MiB=0xbbfe59f39e8ad2f6 (pre) ::
+:: INSTALL: grant minted transport=ahci port=1 part=2 lba=116736..215039 sectors=98304 — every other LBA on this disk is unreachable through it ::
+:: INSTALL: go-red(b) plain write_sectors on the SATA handle lba=116736 => NotReady, refused ::
+:: INSTALL: wrote part=2 fat32 tree=4 bytes=61952 verified=4/4 -> PASS ::
 :: [ahci] write REFUSED lba=215040 outside grant port=1 116736..215039 — nothing written ::
-:: PINSTALL: go-red(a) write lba=215040 (grant 116736..215039) refused=1 neighbour-intact=1 -> PASS ::
-:: PINSTALL: neighbours untouched=4/4 -> PASS ::
-:: PINSTALL: other-disk port=5 sha1MiB=0xbbfe59f39e8ad2f6 (post) UNCHANGED ::
-:: PINSTALL: sata other-disks untouched=1/1 -> PASS ::
+:: INSTALL: go-red(a) write lba=215040 (grant 116736..215039) refused=1 neighbour-intact=1 -> PASS ::
+:: INSTALL: neighbours untouched=4/4 -> PASS ::
+:: INSTALL: other-disk port=5 sha1MiB=0xbbfe59f39e8ad2f6 (post) UNCHANGED ::
+:: INSTALL: sata other-disks untouched=1/1 -> PASS ::
 ```
 
 **Two things in that capture are worth reading twice.** First, **the boot ESP is AHCI port 5 and the

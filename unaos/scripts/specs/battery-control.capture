@@ -42,7 +42,7 @@ xHCI: >>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<
 xHCI: >>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<
 
 # ── usb-write witnesses, x86 and arm (assertions ON the two MISSION captures) ─────────
-:: PIUSB: [usbw] write lba=131071 ok — RMW+readback+restore, medium byte-identical ::
+:: USB: [usbw] write lba=131071 ok — RMW+readback+restore, medium byte-identical ::
 :: XHCI: [usbw] write lba=2048 ok — RMW+readback+restore, medium byte-identical ::
 
 # ── x86 test-fat leg (`x86 test-fat sf 300`) ──────────────────────────────────────────

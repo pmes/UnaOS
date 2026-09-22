@@ -64,7 +64,7 @@ Retiring this STOP is one change in one place — `install_into_partition` sourc
 `all(target_arch = "x86_64", feature = "ahci", not(feature = "ahci-write"))` the `Ahci` handle
 answers `Err(NotReady)`, and the READ opens **only** under `ahci-write`. With `UNAOS_AHCI=1` alone
 the `install` verb prints `ahci0: present, NOT censused …` (`shell.rs:8134`) and
-`:: PINSTALL: census part=…` never appears for the SSD at all. **Boot 1 needs `UNAOS_AHCI_WRITE=1`
+`:: INSTALL: census part=…` never appears for the SSD at all. **Boot 1 needs `UNAOS_AHCI_WRITE=1`
 for the READ** — and `UNAOS_INSTGUI=1` to stop that same knob writing (STOP 1). One image serves
 both boots; what separates them is what Peter types, not what is compiled.
 
@@ -72,7 +72,7 @@ Two smaller facts the row and the reader need:
 
 - **There is no `:: PART: gpt …` line in this tree.** `:: PART:` is emitted only by
   `drivers/block.rs:2292-2324` (MBR), `fs/unafs.rs` (the unafs span check) and `fs/fat.rs:1768`.
-  The GPT view of the SSD is `:: PINSTALL: census …` — the header at `partition.rs:305` and one row
+  The GPT view of the SSD is `:: INSTALL: census …` — the header at `partition.rs:305` and one row
   per slot at `partition.rs:314`.
 - **The flown images carry no `install` verb.** The shell arm is `#[cfg(feature = "installdemo")]`
   (`shell.rs:5553`), and `UNAOS_INSTALLDEMO` is absent from both flight-8 and flight-9 knob lines
@@ -96,7 +96,7 @@ Verbatim from `~/unaos-bench/capture/rmbp12-flight8/ttyUSB0.log`
 ```
 
 **The slot list is UNMEASURED.** On the same capture,
-`awk 'index($0,"PINSTALL")' ~/unaos-bench/capture/rmbp12-flight8/ttyUSB0.log` returns **0 lines** and
+`awk 'index($0,"INSTALL")' ~/unaos-bench/capture/rmbp12-flight8/ttyUSB0.log` returns **0 lines** and
 `awk 'index($0,"INSTALLVERB")'` returns **0 lines** — because neither `installdemo` nor `ahci-write`
 was on that flight line. We know the SSD is 1,467,339,812 sectors (716,474 MiB), carries a GPT, and
 that `bootdisk` found two volumes by content on it, one of them the `EFI` volume with serial
@@ -105,7 +105,7 @@ act of the sitting, and it is what boot 1 exists for.
 
 ### 1.2 The three things to check the census against Disk Utility
 
-Read `:: PINSTALL: census part=… type=… lba=…..… sectors=… content=… ::` (`partition.rs:314`) for
+Read `:: INSTALL: census part=… type=… lba=…..… sectors=… content=… ::` (`partition.rs:314`) for
 every slot of `ahci0`, against what macOS Disk Utility says about the same disk:
 
 1. **The partition COUNT matches** the `parts=` figure on the header line (`partition.rs:305`).
@@ -167,7 +167,7 @@ safe round-up of this number; for a real system Peter wants **≥ 64 GiB** as th
 
 `check_partition` (`partition.rs:508`), and **the order is the design** (`partition.rs:503`: *"Boot
 device first … then existence, then type, then content, then size"*). Each stops the ladder; each
-prints `:: PINSTALL: refusal target=… reason=<token> … -> guard OK ::` (`Refusal::say`,
+prints `:: INSTALL: refusal target=… reason=<token> … -> guard OK ::` (`Refusal::say`,
 `partition.rs:386`), and the `reason=` token is the API (`partition.rs:371`).
 
 | # | line | `reason=` | what it means on THIS disk |
@@ -236,7 +236,7 @@ It is already on the flight line.
 
 ```
 LC_ALL=C grep -a -o -F 'WRITE-DMA-EXT-0x35' kernel.elf   # must be ≥ 1 — go-red (c) inverted
-LC_ALL=C grep -a -o -F 'PINSTALL: census part=' kernel.elf
+LC_ALL=C grep -a -o -F 'INSTALL: census part=' kernel.elf
 LC_ALL=C grep -a -o -F 'INSTALLVERB: preview target=' kernel.elf
 ```
 
@@ -276,8 +276,8 @@ plus, new on this image (`drivers/ahci.rs`, first-once):
 :: AHCI: write path ARMED — opcode WRITE-DMA-EXT-0x35 (ATA8-ACS, LBA48) compiled and reachable only through a WriteGrant (first, once) ::
 ```
 
-**STOP if** any `:: PINSTALL:` line appears on its own. With `UNAOS_INSTGUI=1` the unattended probe
-is `cfg`-erased (`main.rs:1817`, `main.rs:6048`); a `PINSTALL` line before Peter types anything means
+**STOP if** any `:: INSTALL:` line appears on its own. With `UNAOS_INSTGUI=1` the unattended probe
+is `cfg`-erased (`main.rs:1817`, `main.rs:6048`); an `INSTALL` line before Peter types anything means
 the gate did not hold — **power-cycle immediately**, the disk is being written to.
 
 ### Step 2 — `install` — the read-only census
@@ -288,7 +288,7 @@ Type `install` (nothing else). It is read-only **by construction**: the bare for
 
 **Witness to read**, one per slot (`partition.rs:314`):
 ```
-:: PINSTALL: census part=<i> type=<8 hex> lba=<a>..<b> sectors=<n> content=<tag> ::
+:: INSTALL: census part=<i> type=<8 hex> lba=<a>..<b> sectors=<n> content=<tag> ::
 ```
 and on the console, per slot, `REFUSED <reason>` or `installable: install ahci0 <i>`.
 
@@ -316,7 +316,7 @@ and this sitting does not use it — see §4.)
 **Witnesses, in order** (`partition.rs` / `shell.rs`):
 ```
 :: INSTALLVERB: install target=ahci0:part<i> as_esp=0 neighbours=<n> ::
-:: PINSTALL: grant minted transport=ahci port=0 part=<i> lba=<a>..<b> sectors=<n> — every other LBA on this disk is unreachable through it ::
+:: INSTALL: grant minted transport=ahci port=0 part=<i> lba=<a>..<b> sectors=<n> — every other LBA on this disk is unreachable through it ::
 :: INSTALLVERB: wrote part=<i> files=4 bytes=61952 verified=4/4 -> PASS ::
 :: INSTALLVERB: neighbours untouched=<n>/<n> -> PASS ::
 ```
@@ -327,7 +327,7 @@ and this sitting does not use it — see §4.)
 into macOS, report.**
 
 **STOP also if:** `verified=` is less than `files=` ("the volume is NOT trustworthy") ·
-`:: PINSTALL: verify part=… file=… => MISMATCH ::` appears · any `[ahci] write REFUSED lba=… outside
+`:: INSTALL: verify part=… file=… => MISMATCH ::` appears · any `[ahci] write REFUSED lba=… outside
 grant …` appears (that is go-red (a)'s witness firing on a REAL write, i.e. the installer tried to
 leave its partition and bound 2 caught it) · the grant line names a `lba=…..…` range that is not the
 slot's own `lba=` from step 2's census.
@@ -391,16 +391,16 @@ call site and it is reported, not taken.
 
 ### 5.1 Expected on the wire, and not a surprise
 
-- `:: PINSTALL: refusal target=ahci0:disk reason=disk-has-foreign-volumes foreign=… friend=… -> guard OK ::`
+- `:: INSTALL: refusal target=ahci0:disk reason=disk-has-foreign-volumes foreign=… friend=… -> guard OK ::`
   — the whole-disk question is asked and answered on every census, and **no spelling of the verb can
   act on it** (`shell.rs`, the INSTALLVERB header block; R25).
-- `:: PINSTALL: refusal target=ahci0:part<i> reason=partition-not-empty content=APFS -> guard OK ::`
+- `:: INSTALL: refusal target=ahci0:part<i> reason=partition-not-empty content=APFS -> guard OK ::`
   on Catalina's slot, and `content=ESP` → `reason=partition-is-esp` on `disk0s1`. Both are the guards
   working.
 - `install-self=eligible` on port 0. **Expected and NOT reassuring** — see STOP 1. It means "the boot
   volume's FAT serial is not on this disk", which is true (we booted the stick) and says nothing
   about whether writing this disk is safe.
-- `:: PINSTALL: SATA transport WRITABLE under \`ahci-write\` — no transport refusal, writes still need a grant ::`
+- `:: INSTALL: SATA transport WRITABLE under \`ahci-write\` — no transport refusal, writes still need a grant ::`
   from `transport_leg` (`partition.rs:1181`) — but only on the fixture path, which `instgui` disarms.
 
 ### 5.2 If the write is interrupted — the bounds, and what is recoverable

@@ -4722,7 +4722,7 @@ pub fn piusb27_mount_witness() {
             };
             let size_mib = nb.saturating_mul(bs) / (1024 * 1024);
             serial_println!(
-                ":: piusb27: mounted FAT{} {} MiB cluster-size={}B as /fs/usb ::",
+                ":: usb27: mounted FAT{} {} MiB cluster-size={}B as /fs/usb ::",
                 kind, size_mib, fs.cluster_size()
             );
             match fs.read_root() {
@@ -4744,20 +4744,20 @@ pub fn piusb27_mount_witness() {
                         }
                     }
                     serial_println!(
-                        ":: piusb27: /fs/usb root: {} entries [{}] ::",
+                        ":: usb27: /fs/usb root: {} entries [{}] ::",
                         entries.len(), list
                     );
                     // PI-FS-3: descend the tree to prove arbitrary-depth subdirectory traversal (root →
                     // subdir → nested…). Bounded depth guards a malformed self-referential volume.
                     piusb27_walk_subtree(&fs, &entries, "/fs/usb", 0);
                 }
-                Err(e) => serial_println!(":: piusb27: root read error ({}) ::", fat_reason(e)),
+                Err(e) => serial_println!(":: usb27: root read error ({}) ::", fat_reason(e)),
             }
             // PI-FS-5: prove the SHELL's `ls /usb` collector sees the same mount (the `:: ls1: /usb... ::`
             // witness), so the shell and the `/fs/usb` HTTP route never disagree on the namespace.
             crate::shell::pi_usb_ls_witness();
         }
-        Err(e) => serial_println!(":: piusb27: no FAT volume ({}) ::", fat_reason(e)),
+        Err(e) => serial_println!(":: usb27: no FAT volume ({}) ::", fat_reason(e)),
     }
 }
 
@@ -4798,12 +4798,12 @@ fn piusb27_walk_subtree(fs: &FatFs, entries: &[DirEntry], prefix: &str, depth: u
                     }
                 }
                 serial_println!(
-                    ":: piusb27: {} ({} entries) [{}] ::",
+                    ":: usb27: {} ({} entries) [{}] ::",
                     path, sub.len(), list
                 );
                 piusb27_walk_subtree(fs, &sub, &path, depth + 1);
             }
-            Err(e) => serial_println!(":: piusb27: {} read error ({}) ::", path, fat_reason(e)),
+            Err(e) => serial_println!(":: usb27: {} read error ({}) ::", path, fat_reason(e)),
         }
     }
 }

@@ -126,7 +126,7 @@ verbatim by the Pi's post-heap `piusb::enumerate()` pump — the same code the x
 rMBP and the Jetson run. PIUSB-13 therefore adds **no enumeration control flow**; it
 adds an *observer* (`EnumWitness` in `arch/aarch64/piusb.rs`) that snapshots the
 driver's read-only state each pump tick (~2 ms cadence) and emits one
-`:: PIUSB: [enum] … ::` milestone line per stage transition, so a single metal boot
+`:: USB: [enum] … ::` milestone line per stage transition, so a single metal boot
 localizes exactly how far a keyboard got — and, on failure, the stage + completion
 code that stopped it. The state the observer reads (`enum_stage_now`,
 `enumerating_port_now`, `last_stall_now`, `stall_count_now`, `root_ports_now`, and
@@ -145,21 +145,21 @@ metal-only by construction.
 **Expected metal witness sequence** (keyboard in a VL805 root port, CNR cleared):
 
 ```
-:: PIUSB: [enum] observer armed … ::
-:: PIUSB: [enum] port P connect (device attached) ::
-:: PIUSB: [enum] port P trained speed High-Speed (xhci speed id 3) ::
-:: PIUSB: [enum] port P stage -> enable-slot ::
-:: PIUSB: [enum] port P stage -> address-device ::
-:: PIUSB: [enum] slot N addressed (root port P) ::
-:: PIUSB: [enum] port P stage -> dev-desc ::
-:: PIUSB: [enum] port P stage -> cfg-desc ::
-:: PIUSB: [enum] port P stage -> set-config ::
-:: PIUSB: [enum] slot N HID boot-keyboard armed (interrupt-IN ep 0x81 mps 8, root port P) ::
-:: PIUSB: [enum] slot N first keyboard report received — HID pipe live … ::
+:: USB: [enum] observer armed … ::
+:: USB: [enum] port P connect (device attached) ::
+:: USB: [enum] port P trained speed High-Speed (xhci speed id 3) ::
+:: USB: [enum] port P stage -> enable-slot ::
+:: USB: [enum] port P stage -> address-device ::
+:: USB: [enum] slot N addressed (root port P) ::
+:: USB: [enum] port P stage -> dev-desc ::
+:: USB: [enum] port P stage -> cfg-desc ::
+:: USB: [enum] port P stage -> set-config ::
+:: USB: [enum] slot N HID boot-keyboard armed (interrupt-IN ep 0x81 mps 8, root port P) ::
+:: USB: [enum] slot N first keyboard report received — HID pipe live … ::
 xHCI: KEY: 'a' (scancode 0x4)
 ```
 
-A `:: PIUSB: [enum] STALL port P @ stage <S> (<why>, completion code C) PORTSC=0x… ::`
+A `:: USB: [enum] STALL port P @ stage <S> (<why>, completion code C) PORTSC=0x… ::`
 line replaces the milestone that never came: the stage names *where* it stopped
 (`enable-slot`, `address-device`, `set-config`, …) and code `C` names *why* (xHCI
 completion code — e.g. 4 = USB Transaction Error, 5 = TRB Error, 17 = Parameter
@@ -746,7 +746,7 @@ pump (no scheduler yield between doorbell and the invalidate+read), so a context
 cannot interpose between them — but the two phases differ in bus/interrupt activity, which
 is exactly what a posted-write visibility window would be sensitive to.
 
-Witness lines: `:: PIUSB: [usb36] step<N>-<label> buf=… CSW=… residue=… verdict=… — <16 bytes> ::`
+Witness lines: `:: USB: [usb36] step<N>-<label> buf=… CSW=… residue=… verdict=… — <16 bytes> ::`
 (step 6 prints both the immediate `A` and the `+1ms+inval` `B` snapshots). In QEMU virt
 (coherent) all six steps read real data and step 6 reports `no-race-hit`; the P46 metal
 run reads the verdicts as the decision tree — step 2 splits never-lands from lands-zeros,
@@ -764,7 +764,7 @@ key 0x06, is the bridge-returns-zeros-then-GOOD candidate); (4) a **TUR drain + 
 The P47 capture read the CBW as **byte-perfect** (`command is NOT the fault`) and LBA
 8192/16384 returned real non-zero data with `residue 0` — proving the transport/DMA/BOT are
 sound and the wedge is confined to the low-LBA region — while READ(12)/READ(16) STALLed
-(unsupported by the bridge, expected). Witness: `:: PIUSB: [usb37] … ::`.
+(unsupported by the bridge, expected). Witness: `:: USB: [usb37] … ::`.
 
 ### 5e. PIUSB-38 — BOT stall recovery + event-ring resilience + low-LBA bisect
 
@@ -807,7 +807,7 @@ TEST UNIT READY + REQUEST SENSE **complete** afterwards (`PIPE RECOVERED`), (2) 
 reports the zeros→data **boundary** and the first byte at which LBA0 and LBA8192 differ.
 Because only the LBA field changes, any zeros-vs-data split is **region-specific, not a
 command-shape fault** (null-hypothesis-our-code: a buffer/cache/aliasing effect on the low
-region). Witness: `:: PIUSB: [usb38] … ::`. Inert on QEMU raspi4b (no VL805 → no storage
+region). Witness: `:: USB: [usb38] … ::`. Inert on QEMU raspi4b (no VL805 → no storage
 slot); QEMU virt exercises the whole path (the full-reset TUR passes and the ladder reads real
 LBA0 data), byte-identical no-op on x86.
 
@@ -816,7 +816,7 @@ LBA0 data), byte-identical no-op on x86.
 P57 ended the MISSION write proof with
 
 ```
-:: PIUSB: [usbw] write lba=500223999 -> FAIL (pre-read all candidates stalled) ::
+:: USB: [usbw] write lba=500223999 -> FAIL (pre-read all candidates stalled) ::
 ```
 
 Both halves of that line were wrong, and the cause was **ours**, not the reader's.
@@ -936,7 +936,7 @@ Every bring-up stage in `arch/aarch64/piusb.rs` is bracketed off `CNTVCT` (the f
 counter — always live, no init, no interrupt dependency) and emits exactly one line:
 
 ```
-:: PIUSB: [usb40] stage=<name> took=<ms>ms (t=<ms>ms) ::
+:: USB: [usb40] stage=<name> took=<ms>ms (t=<ms>ms) ::
 ```
 
 | Stage | What it covers | Budget on the wire |
@@ -1236,9 +1236,9 @@ pump (`XHCI_READY` gate), so its log stays byte-identical. Budget: ≤17 lines p
 **Witness grammar.**
 
 ```
-:: PIUSB: [piusb43] portsc <start|pump|end> t=<ms>ms p1=0x…(CCS=_ CSC=_ PED=_ PP=_ PLS=_ spd=_) … p5=…
+:: USB: [piusb43] portsc <start|pump|end> t=<ms>ms p1=0x…(CCS=_ CSC=_ PED=_ PP=_ PLS=_ spd=_) … p5=…
     | evt deq=<idx> cyc=<b> popped=<n> pend=<0|1> IMAN=0x…(IP=_ IE=_) ::
-:: PIUSB: [piusb43] verdict=<branch> — <evidence> ::
+:: USB: [piusb43] verdict=<branch> — <evidence> ::
 ```
 
 **Reading key — the verdict names only what the samples show, in this priority:**
@@ -7453,9 +7453,9 @@ failures:
 ```
 :: BOT: SURRENDER slot=2 … retracted=yes          <- the per-slot floor DID fire, as designed
 xHCI: HUB slot 1 port 1 disconnect: slot 2 …      <- the ladder's OWN hub-port power-cycle rung (b')
-:: PIUSB: [usb25] storage enumerated: slot 5 …  <- the same reader, re-enumerated, NEW slot id
+:: USB: [usb25] storage enumerated: slot 5 …  <- the same reader, re-enumerated, NEW slot id
 :: BOT: SURRENDER slot=5 …                        <- a whole fresh ladder allowance, spent
-:: PIUSB: [usb25] storage enumerated: slot 2 …  <- and back again. Forever.
+:: USB: [usb25] storage enumerated: slot 2 …  <- and back again. Forever.
 ```
 
 Nothing in the ladder was wrong. Every rung did what §17's arcs built it to do. What was missing is

@@ -1,0 +1,67 @@
+NEUTRAL M2 — ARTIFACT CERTIFICATION (LC_ALL=C grep -a -o -F, never strings)
+generated 2026-09-22T23:39:34Z
+
+--- A. kernel8.img  (K8_FEATS=baremetal,skip_xhci)  (2227776 bytes) ---
+TOKEN                    COUNT
+OLD :: PIUSB:            0
+OLD :: PINSTALL:         0
+OLD :: PIINSTALL:        0
+OLD :: TEGRA-SD:         0
+OLD :: TEGRA-UNAFS:      0
+OLD :: PI-RAST:          0
+OLD :: PI-DESK:          0
+OLD :: piusb27:          0
+OLD :: piusb28:          0
+OLD :: PIUSB: [usbw]     0
+NEW :: USB:              76
+NEW :: INSTALL:          0
+NEW :: SDMMC:            0
+NEW :: UNAFS:            0
+NEW :: RAST:             0
+NEW :: DESK:             0
+NEW :: usb27:            6
+NEW :: usb28:            1
+NEW :: USB: [usbw]       14
+CTL CAPSTONE             3   (present-control, MUST be >0)
+CTL [vfs]                13   (present-control, MUST be >0)
+CTL NOTATOKEN-UNAOS      0   (absent-control, MUST be 0)
+VERDICT: every OLD token reads 0
+
+--- B. x86 kernel.elf  (./arroyo test default leg)  (2465760 bytes) ---
+TOKEN                    COUNT
+OLD :: PIUSB:            0
+OLD :: PINSTALL:         0
+OLD :: PIINSTALL:        0
+OLD :: TEGRA-SD:         0
+OLD :: TEGRA-UNAFS:      0
+OLD :: PI-RAST:          0
+OLD :: PI-DESK:          0
+OLD :: piusb27:          0
+OLD :: piusb28:          0
+OLD :: PIUSB: [usbw]     0
+NEW :: USB:              19
+NEW :: INSTALL:          0
+NEW :: SDMMC:            0
+NEW :: UNAFS:            0
+NEW :: RAST:             0
+NEW :: DESK:             0
+NEW :: usb27:            0
+NEW :: usb28:            0
+NEW :: USB: [usbw]       14
+CTL UNAOS_BUILD_STAMP    1   (present-control, MUST be >0)
+CTL [vfs]                12   (present-control, MUST be >0)
+CTL NOTATOKEN-UNAOS      0   (absent-control, MUST be 0)
+VERDICT: every OLD token reads 0
+
+READING THE ZEROS. A NEW token at 0 is only meaningful once you know whether the image ARMS that
+family, and five of them are correctly absent from both images:
+  :: INSTALL:  neither image compiles the installer (`piinstall`/`install_target` off)
+  :: SDMMC:    tegra-only (`sdmmc`); no Tegra QEMU machine exists, so neither of these is a tegra image
+  :: UNAFS:    same gate — the mount census is the tegra card's
+  :: RAST:     needs `pirast`; kernel8() builds K8_FEATS=baremetal,skip_xhci
+  :: DESK:     needs `desktop_firmware`; the x86 default leg does not carry it
+An unarmed family certifies nothing, so those five are carried by the compile side of the gate
+(80/80 cfg legs in `./arroyo check`) and by the spec-rule resolution in m2-rule-resolution.txt, not
+by this table. WHAT THIS TABLE DOES CARRY: the `usb` family is ARMED in both images — `:: USB:` 76
+and 19, `:: USB: [usbw]` 14 in each — so its OLD spelling reading 0 is a fact about the RENAME and
+not about the arming, which is the whole point of pairing every OLD row with its NEW one.

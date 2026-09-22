@@ -384,8 +384,8 @@ so the same code serves three panels; the wire-in differs per platform:
   bracketing the shared `:: RAST:` pair:
 
   ```
-  :: PI-RAST: BCM2711 mailbox panel 1920x1200 (live firmware geometry, inherited scanout) — software rasterizer cube, the Pi's first 3D pixels ::
-  :: PI-RAST: 90 frames in <n> ms — <f> fps (software rasterizer, BCM2711 mailbox-fb present) ::
+  :: RAST: BCM2711 mailbox panel 1920x1200 (live firmware geometry, inherited scanout) — software rasterizer cube, the Pi's first 3D pixels ::
+  :: RAST: 90 frames in <n> ms — <f> fps (software rasterizer, BCM2711 mailbox-fb present) ::
   ```
 
   **Knob class.** `pirast` is a *thin* feature: it only implies `rast`, so the dep gate

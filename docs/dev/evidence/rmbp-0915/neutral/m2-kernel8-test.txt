@@ -1,0 +1,22 @@
+NEUTRAL M2 — pi runtime replay on the renamed tree
+image = the kernel8.img certified in m2-artifact-certification.txt (2227776 bytes)
+
+  ✅ MBENCH PASS — 126/126 required witnesses, 0 forbidden hit(s), 3754 lines scanned [fast: completion +24.3s grace 20s wall 44.7s]
+
+real	5m1.953s
+user	18m8.902s
+sys	0m53.006s
+KERNEL8TEST rc=0
+
+BEFORE == AFTER BY CONSTRUCTION, and it is measured rather than assumed: pi4-regression.spec
+carries 263 rules and ZERO of them name any family this milestone moved, in EITHER spelling —
+  grep -cE '(PIUSB|PINSTALL|PIINSTALL|TEGRA-SD|TEGRA-UNAFS|PI-RAST|PI-DESK|piusb2[78]|:: USB:|
+            :: INSTALL:|:: SDMMC:|:: UNAFS:|:: RAST:|:: DESK:|:: usb2[78]:)' = 0
+so the pin counts cannot move and the 126/126 is doing a different job: it is the REGRESSION
+proof that the 169 kernel sites this batch rewrote broke nothing ELSE on the Pi wire. The
+falsifiability of the rename itself is carried by the x86 go-red (m2-replay-gored.txt), where a
+spec rule DOES pin a moved family.
+
+Mode is FAST (completion +24.3s, grace 20s, wall 44.7s). LAWS §5: a fast capture is SOUND for
+pass/fail -- completion means every REQUIRE and COUNT has already landed -- and is a FLOOR only
+for monotonic accumulators and periodic soaks, of which this verdict reads none.

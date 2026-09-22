@@ -9137,7 +9137,7 @@ impl XhciController {
             _ => "DATA(real-bytes-landed)",
         };
         serial_println!(
-            ":: PIUSB: [usb36] {} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+            ":: USB: [usb36] {} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
             label, buf_phys, status, residue, verdict,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
             d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
@@ -9165,20 +9165,20 @@ impl XhciController {
     #[cfg(target_arch = "aarch64")]
     fn piusb36_matrix(&mut self) {
         let slot = self.storage_slot();
-        if slot == 0 { serial_println!(":: PIUSB: [usb36] no storage slot — matrix skipped ::"); return; }
+        if slot == 0 { serial_println!(":: USB: [usb36] no storage slot — matrix skipped ::"); return; }
         let databuf = match self.slots[slot as usize].scsi_data_buffer {
             Some(p) => p as u64,
-            None => { serial_println!(":: PIUSB: [usb36] no scsi_data_buffer — matrix skipped ::"); return; }
+            None => { serial_println!(":: USB: [usb36] no scsi_data_buffer — matrix skipped ::"); return; }
         };
         let read10_lba0 = [0x28u8, 0, 0, 0, 0, 0, 0, 0, 1, 0];
 
-        serial_println!(":: PIUSB: [usb36] === experiment matrix (read-only, one boot) === ::");
+        serial_println!(":: USB: [usb36] === experiment matrix (read-only, one boot) === ::");
 
         // --- Step 1: baseline READ(10) LBA0 into the CURRENT scsi_data_buffer (expect zeros on
         //     metal). Establishes the wedge is live this boot before the discriminating variants. ---
         match self.bot_transfer(slot, &read10_lba0, databuf, 512, Direction::In) {
             Ok(r) => Self::piusb36_report("step1-baseline-scsibuf", databuf, r.status, r.residue, None),
-            Err(e) => serial_println!(":: PIUSB: [usb36] step1 baseline ERR {:?} ::", e),
+            Err(e) => serial_println!(":: USB: [usb36] step1 baseline ERR {:?} ::", e),
         }
 
         // --- Step 2: FRESH alloc_zeroed buffer PRE-FILLED with 0xA5, then READ(10) LBA0 into it.
@@ -9189,12 +9189,12 @@ impl XhciController {
             let layout = core::alloc::Layout::from_size_align(512, 64).unwrap();
             let fresh = unsafe { alloc::alloc::alloc_zeroed(layout) };
             if fresh.is_null() {
-                serial_println!(":: PIUSB: [usb36] step2 alloc failed ::");
+                serial_println!(":: USB: [usb36] step2 alloc failed ::");
             } else {
                 unsafe { core::ptr::write_bytes(fresh, 0xA5, 512); }
                 match self.bot_transfer(slot, &read10_lba0, fresh as u64, 512, Direction::In) {
                     Ok(r) => Self::piusb36_report("step2-fresh-A5-heap", fresh as u64, r.status, r.residue, Some(0xA5)),
-                    Err(e) => serial_println!(":: PIUSB: [usb36] step2 fresh-A5 ERR {:?} ::", e),
+                    Err(e) => serial_println!(":: USB: [usb36] step2 fresh-A5 ERR {:?} ::", e),
                 }
                 unsafe { alloc::alloc::dealloc(fresh, layout); }
             }
@@ -9208,7 +9208,7 @@ impl XhciController {
             unsafe { core::ptr::write_bytes(sbuf, 0xA5, 512); }
             match self.bot_transfer(slot, &read10_lba0, sbuf as u64, 512, Direction::In) {
                 Ok(r) => Self::piusb36_report("step3-static-A5-low", sbuf as u64, r.status, r.residue, Some(0xA5)),
-                Err(e) => serial_println!(":: PIUSB: [usb36] step3 static ERR {:?} ::", e),
+                Err(e) => serial_println!(":: USB: [usb36] step3 static ERR {:?} ::", e),
             }
         }
 
@@ -9220,7 +9220,7 @@ impl XhciController {
             unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 36); }
             match self.bot_transfer(slot, &inquiry, databuf, 36, Direction::In) {
                 Ok(r) => Self::piusb36_report("step4-inquiry36-scsibuf", databuf, r.status, r.residue, Some(0xA5)),
-                Err(e) => serial_println!(":: PIUSB: [usb36] step4 inquiry ERR {:?} ::", e),
+                Err(e) => serial_println!(":: USB: [usb36] step4 inquiry ERR {:?} ::", e),
             }
         }
 
@@ -9228,7 +9228,7 @@ impl XhciController {
         //     TD-shape variant of the same 512 B transfer. Discriminates TD shape from length. ---
         match self.piusb36_read10_two_trb(slot, databuf) {
             Ok(r) => Self::piusb36_report("step5-two-trb-scsibuf", databuf, r.status, r.residue, None),
-            Err(e) => serial_println!(":: PIUSB: [usb36] step5 two-TRB ERR {:?} ::", e),
+            Err(e) => serial_println!(":: USB: [usb36] step5 two-TRB ERR {:?} ::", e),
         }
 
         // --- Step 6: POSTED-WRITE VISIBILITY. Re-read LBA0 (single TRB, 1 block): bot_transfer
@@ -9249,15 +9249,15 @@ impl XhciController {
                     else if a_zero && b_zero { "no-race(both-zero-after-1ms-delay)" }
                     else { "immediate-read-already-had-data(no-race-hit)" };
                 serial_println!(
-                    ":: PIUSB: [usb36] step6-posted-write buf={:#x} CSW={:?} residue={} verdict={} | A(immediate)={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} | B(+1ms+inval)={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                    ":: USB: [usb36] step6-posted-write buf={:#x} CSW={:?} residue={} verdict={} | A(immediate)={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} | B(+1ms+inval)={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
                     databuf, r.status, r.residue, verdict,
                     a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
                     b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
             }
-            Err(e) => serial_println!(":: PIUSB: [usb36] step6 posted-write ERR {:?} ::", e),
+            Err(e) => serial_println!(":: USB: [usb36] step6 posted-write ERR {:?} ::", e),
         }
 
-        serial_println!(":: PIUSB: [usb36] === matrix complete === ::");
+        serial_println!(":: USB: [usb36] === matrix complete === ::");
     }
 
     // ==================== PIUSB-37: chase the command itself ====================
@@ -9268,7 +9268,7 @@ impl XhciController {
         let d = unsafe { core::slice::from_raw_parts(phys as *const u8, 16) };
         let verdict = if d.iter().all(|&b| b == 0) { "ZEROS" } else { "DATA(real-bytes-landed)" };
         serial_println!(
-            ":: PIUSB: [usb37] {} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+            ":: USB: [usb37] {} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
             label, phys, status, residue, verdict,
             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
             d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
@@ -9285,17 +9285,17 @@ impl XhciController {
     #[cfg(target_arch = "aarch64")]
     fn piusb37_matrix(&mut self) {
         let slot = self.storage_slot();
-        if slot == 0 { serial_println!(":: PIUSB: [usb37] no storage slot — matrix skipped ::"); return; }
+        if slot == 0 { serial_println!(":: USB: [usb37] no storage slot — matrix skipped ::"); return; }
         let (databuf, cbw_phys) = {
             let s = &self.slots[slot as usize];
             match (s.scsi_data_buffer, s.cbw_buffer) {
                 (Some(d), Some(c)) => (d as u64, c as u64),
-                _ => { serial_println!(":: PIUSB: [usb37] no data/cbw buffer — matrix skipped ::"); return; }
+                _ => { serial_println!(":: USB: [usb37] no data/cbw buffer — matrix skipped ::"); return; }
             }
         };
         let read10_lba0 = [0x28u8, 0, 0, 0, 0, 0, 0, 0, 1, 0];
 
-        serial_println!(":: PIUSB: [usb37] === chase-the-command matrix (read-only, one boot) === ::");
+        serial_println!(":: USB: [usb37] === chase-the-command matrix (read-only, one boot) === ::");
 
         // --- Step 1: CBW AUDIT. Build the exact 31-byte CBW that bot_transfer hands to the
         //     controller (build_cbw writes the on-the-wire little-endian layout, so a post-build
@@ -9328,14 +9328,14 @@ impl XhciController {
             let lun_ok = lun <= max_lun;
             let cblen_ok = cblen as usize == cdb.len();
             serial_println!(
-                ":: PIUSB: [usb37] cbw-dump {} sig={:#010x}({}) tag={:#x} dCBWDataTransferLength={}({}) bmFlags={:#04x}({}) bCBWLUN={}/{}({}) bCBWCBLength={}({}) ::",
+                ":: USB: [usb37] cbw-dump {} sig={:#010x}({}) tag={:#x} dCBWDataTransferLength={}({}) bmFlags={:#04x}({}) bCBWLUN={}/{}({}) bCBWCBLength={}({}) ::",
                 label, sig, if sig_ok {"USBC-ok"} else {"BAD"}, tag,
                 dxlen, if len_ok {"ok"} else {"MISMATCH"},
                 flags, if flags_ok {"IN-ok"} else {"BAD"},
                 lun, max_lun, if lun_ok {"ok"} else {"OUT-OF-RANGE!"},
                 cblen, if cblen_ok {"ok"} else {"MISMATCH"});
             serial_println!(
-                ":: PIUSB: [usb37] cbw-dump {} CDB= {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                ":: USB: [usb37] cbw-dump {} CDB= {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
                 label,
                 c[15], c[16], c[17], c[18], c[19], c[20], c[21], c[22],
                 c[23], c[24], c[25], c[26], c[27], c[28], c[29], c[30]);
@@ -9345,7 +9345,7 @@ impl XhciController {
                 let lba = ((c[17] as u32) << 24) | ((c[18] as u32) << 16) | ((c[19] as u32) << 8) | (c[20] as u32);
                 let blocks = ((c[22] as u16) << 8) | (c[23] as u16);
                 serial_println!(
-                    ":: PIUSB: [usb37] cbw-dump READ10 decode: opcode={:#04x}({}) LBA(BE)={} blocks(BE)={} — {} ::",
+                    ":: USB: [usb37] cbw-dump READ10 decode: opcode={:#04x}({}) LBA(BE)={} blocks(BE)={} — {} ::",
                     opcode, if opcode == 0x28 {"ok"} else {"BAD"}, lba, blocks,
                     if opcode == 0x28 && lba == 0 && blocks == 1 { "CDB well-formed — command is NOT the fault" }
                     else { "CDB MALFORMED — this alone would return zeros+Passed" });
@@ -9366,12 +9366,12 @@ impl XhciController {
                     let d = unsafe { core::slice::from_raw_parts(databuf as *const u8, 16) };
                     let verdict = if d.iter().all(|&b| b == 0) { "ZEROS" } else { "DATA(real-bytes-landed)" };
                     serial_println!(
-                        ":: PIUSB: [usb37] read10-lba{} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                        ":: USB: [usb37] read10-lba{} buf={:#x} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
                         lba, databuf, r.status, r.residue, verdict,
                         d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
                         d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
                 }
-                Err(e) => serial_println!(":: PIUSB: [usb37] read10-lba{} ERR {:?} ::", lba, e),
+                Err(e) => serial_println!(":: USB: [usb37] read10-lba{} ERR {:?} ::", lba, e),
             }
         }
         // READ(12) LBA0 (opcode 0xA8): LBA BE in bytes 2..6, transfer length BE (blocks) in 6..10.
@@ -9380,7 +9380,7 @@ impl XhciController {
             unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
             match self.bot_transfer(slot, &cdb, databuf, 512, Direction::In) {
                 Ok(r) => Self::piusb37_dump16("read12-lba0", databuf, r.status, r.residue),
-                Err(e) => serial_println!(":: PIUSB: [usb37] read12-lba0 ERR {:?} ::", e),
+                Err(e) => serial_println!(":: USB: [usb37] read12-lba0 ERR {:?} ::", e),
             }
         }
         // READ(16) LBA0 (opcode 0x88): LBA BE in bytes 2..10, transfer length BE (blocks) in 10..14.
@@ -9389,7 +9389,7 @@ impl XhciController {
             unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
             match self.bot_transfer(slot, &cdb, databuf, 512, Direction::In) {
                 Ok(r) => Self::piusb37_dump16("read16-lba0", databuf, r.status, r.residue),
-                Err(e) => serial_println!(":: PIUSB: [usb37] read16-lba0 ERR {:?} ::", e),
+                Err(e) => serial_println!(":: USB: [usb37] read16-lba0 ERR {:?} ::", e),
             }
         }
 
@@ -9403,7 +9403,7 @@ impl XhciController {
             let read_res = self.bot_transfer(slot, &read10_lba0, databuf, 512, Direction::In);
             match read_res {
                 Ok(r) => Self::piusb37_dump16("presense-read10-lba0", databuf, r.status, r.residue),
-                Err(e) => serial_println!(":: PIUSB: [usb37] presense-read10 ERR {:?} ::", e),
+                Err(e) => serial_println!(":: USB: [usb37] presense-read10 ERR {:?} ::", e),
             }
             let sense_cdb = [0x03u8, 0, 0, 0, 18, 0];
             unsafe { core::ptr::write_bytes(databuf as *mut u8, 0, 18); }
@@ -9419,17 +9419,17 @@ impl XhciController {
                         0x06 => "UNIT ATTENTION", 0x0b => "ABORTED COMMAND", _ => "other",
                     };
                     serial_println!(
-                        ":: PIUSB: [usb37] REQUEST-SENSE CSW={:?} residue={} response={:#04x} key={:#x}({}) ASC={:#04x} ASCQ={:#04x} — {} ::",
+                        ":: USB: [usb37] REQUEST-SENSE CSW={:?} residue={} response={:#04x} key={:#x}({}) ASC={:#04x} ASCQ={:#04x} — {} ::",
                         r.status, r.residue, resp, key, name, asc, ascq,
                         if key == 0x06 { "UNIT ATTENTION PENDING — strong candidate for zeros-then-good" }
                         else if key == 0x00 { "no pending sense — UA theory does NOT explain the zeros" }
                         else { "pending non-UA sense condition" });
                     serial_println!(
-                        ":: PIUSB: [usb37] REQUEST-SENSE raw= {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                        ":: USB: [usb37] REQUEST-SENSE raw= {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
                         s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8],
                         s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17]);
                 }
-                Err(e) => serial_println!(":: PIUSB: [usb37] REQUEST-SENSE ERR {:?} ::", e),
+                Err(e) => serial_println!(":: USB: [usb37] REQUEST-SENSE ERR {:?} ::", e),
             }
         }
 
@@ -9443,15 +9443,15 @@ impl XhciController {
             for attempt in 0..8 {
                 match self.scsi_test_unit_ready(slot) {
                     Ok(CswStatus::Passed) => {
-                        serial_println!(":: PIUSB: [usb37] TUR attempt {} => Passed (ready) ::", attempt);
+                        serial_println!(":: USB: [usb37] TUR attempt {} => Passed (ready) ::", attempt);
                         ready = true; break;
                     }
                     Ok(st) => {
-                        serial_println!(":: PIUSB: [usb37] TUR attempt {} => {:?}; clearing sense ::", attempt, st);
+                        serial_println!(":: USB: [usb37] TUR attempt {} => {:?}; clearing sense ::", attempt, st);
                         let sense_cdb = [0x03u8, 0, 0, 0, 18, 0];
                         let _ = self.bot_transfer(slot, &sense_cdb, databuf, 18, Direction::In);
                     }
-                    Err(e) => serial_println!(":: PIUSB: [usb37] TUR attempt {} ERR {:?} ::", attempt, e),
+                    Err(e) => serial_println!(":: USB: [usb37] TUR attempt {} ERR {:?} ::", attempt, e),
                 }
             }
             unsafe { core::ptr::write_bytes(databuf as *mut u8, 0, 512); }
@@ -9461,22 +9461,22 @@ impl XhciController {
                     let d = unsafe { core::slice::from_raw_parts(databuf as *const u8, 16) };
                     let still_zeros = d.iter().all(|&b| b == 0);
                     serial_println!(
-                        ":: PIUSB: [usb37] post-TUR verdict: ready={} data={} — {} ::",
+                        ":: USB: [usb37] post-TUR verdict: ready={} data={} — {} ::",
                         ready, if still_zeros {"ZEROS"} else {"REAL"},
                         if !still_zeros { "SENSE-CLEAR IS THE FIX: drain TUR/REQUEST-SENSE before first read" }
                         else { "still zeros after ready — UA/sense theory REFUTED; residual is READ-command response" });
                 }
-                Err(e) => serial_println!(":: PIUSB: [usb37] postready-read10 ERR {:?} ::", e),
+                Err(e) => serial_println!(":: USB: [usb37] postready-read10 ERR {:?} ::", e),
             }
         }
 
-        serial_println!(":: PIUSB: [usb37] === chase-the-command matrix complete === ::");
+        serial_println!(":: USB: [usb37] === chase-the-command matrix complete === ::");
     }
 
     // ==================== PIUSB-38: stall recovery + low-LBA-zeros bisect ====================
 
     /// PIUSB-38: prove BOT Reset Recovery on the storage pipe, then run the low-LBA-zeros bisect.
-    /// Three read-only phases in one boot (each witnessed `:: PIUSB: [usb38] ... ::`):
+    /// Three read-only phases in one boot (each witnessed `:: USB: [usb38] ... ::`):
     ///
     ///   * **Phase 1 — induced-stall recovery.** Issue an UNSUPPORTED command (READ(16), opcode
     ///     0x88) which the bench VL805 stick STALLs (completion code 4). `bot_transfer_once` clears
@@ -9501,13 +9501,13 @@ impl XhciController {
     #[cfg(target_arch = "aarch64")]
     fn piusb38_matrix(&mut self) {
         let slot = self.storage_slot();
-        if slot == 0 { serial_println!(":: PIUSB: [usb38] no storage slot — matrix skipped ::"); return; }
+        if slot == 0 { serial_println!(":: USB: [usb38] no storage slot — matrix skipped ::"); return; }
         let databuf = match self.slots[slot as usize].scsi_data_buffer {
             Some(p) => p as u64,
-            None => { serial_println!(":: PIUSB: [usb38] no scsi_data_buffer — matrix skipped ::"); return; }
+            None => { serial_println!(":: USB: [usb38] no scsi_data_buffer — matrix skipped ::"); return; }
         };
 
-        serial_println!(":: PIUSB: [usb38] === stall-recovery + low-LBA bisect (read-only, one boot) === ::");
+        serial_println!(":: USB: [usb38] === stall-recovery + low-LBA bisect (read-only, one boot) === ::");
 
         // --- Phase 1: induce a stall, then prove the pipe recovered. ---
         // READ(16), opcode 0x88, LBA0, 1 block — unsupported by many bulk bridges (STALL, code 4).
@@ -9515,11 +9515,11 @@ impl XhciController {
         unsafe { core::ptr::write_bytes(databuf as *mut u8, 0xA5, 512); }
         match self.bot_transfer(slot, &read16_lba0, databuf, 512, Direction::In) {
             Ok(r) => serial_println!(
-                ":: PIUSB: [usb38] induced-read16 CSW={:?} residue={} (no stall — device accepted READ16) ::",
+                ":: USB: [usb38] induced-read16 CSW={:?} residue={} (no stall — device accepted READ16) ::",
                 r.status, r.residue),
             Err(BotError::Stall) => serial_println!(
-                ":: PIUSB: [usb38] induced-read16 STALL — inline BOT reset-recovery ran ::"),
-            Err(e) => serial_println!(":: PIUSB: [usb38] induced-read16 ERR {:?} (recovery ran) ::", e),
+                ":: USB: [usb38] induced-read16 STALL — inline BOT reset-recovery ran ::"),
+            Err(e) => serial_println!(":: USB: [usb38] induced-read16 ERR {:?} (recovery ran) ::", e),
         }
         // The pipe must be ALIVE now: TUR + REQUEST SENSE must COMPLETE (not Timeout).
         let tur1 = self.scsi_test_unit_ready(slot);
@@ -9529,7 +9529,7 @@ impl XhciController {
         let recovered = !matches!(tur1, Err(BotError::Timeout))
             && !matches!(sense1, Err(BotError::Timeout));
         serial_println!(
-            ":: PIUSB: [usb38] post-stall TUR={:?} REQUEST-SENSE={:?} — {} ::",
+            ":: USB: [usb38] post-stall TUR={:?} REQUEST-SENSE={:?} — {} ::",
             tur1, sense1.as_ref().map(|r| r.status),
             if recovered { "PIPE RECOVERED (TUR+SENSE completed — stall no longer wedges the pipe)" }
             else { "PIPE STILL WEDGED (a command timed out after the stall)" });
@@ -9539,11 +9539,11 @@ impl XhciController {
         // BOT-RESCUE M3 witness 6: no failed stage to hand over — this call is a deliberate
         // exercise of the recovery path, not the aftermath of one. `None` is the honest record.
         let full_ok = self.recover_bot_full(slot, BotError::Stall, None);
-        serial_println!(":: PIUSB: [usb38] explicit recover_bot_full -> {} ::",
+        serial_println!(":: USB: [usb38] explicit recover_bot_full -> {} ::",
             if full_ok { "ok" } else { "incomplete" });
         let tur2 = self.scsi_test_unit_ready(slot);
         serial_println!(
-            ":: PIUSB: [usb38] post-full-reset TUR={:?} — {} ::",
+            ":: USB: [usb38] post-full-reset TUR={:?} — {} ::",
             tur2,
             if matches!(tur2, Err(BotError::Timeout)) { "pipe dead after full reset" }
             else { "pipe alive after full Bulk-Only Reset Recovery" });
@@ -9571,37 +9571,37 @@ impl XhciController {
                     if !all_zero && !all_a5 && first_data_lba.is_none() { first_data_lba = Some(lba); }
                     if all_zero { last_zero_lba = Some(lba); }
                     serial_println!(
-                        ":: PIUSB: [usb38] ladder-lba{} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                        ":: USB: [usb38] ladder-lba{} CSW={:?} residue={} verdict={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
                         lba, r.status, r.residue, verdict,
                         d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
                         d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
                 }
-                Err(e) => serial_println!(":: PIUSB: [usb38] ladder-lba{} ERR {:?} ::", lba, e),
+                Err(e) => serial_println!(":: USB: [usb38] ladder-lba{} ERR {:?} ::", lba, e),
             }
         }
         // Boundary verdict.
         match (last_zero_lba, first_data_lba) {
             (Some(z), Some(d)) => serial_println!(
-                ":: PIUSB: [usb38] bisect boundary: last-zeros=LBA{} first-data=LBA{} — zeros→data split IS region-specific (same CDB shape) ::", z, d),
+                ":: USB: [usb38] bisect boundary: last-zeros=LBA{} first-data=LBA{} — zeros→data split IS region-specific (same CDB shape) ::", z, d),
             (Some(z), None) => serial_println!(
-                ":: PIUSB: [usb38] bisect boundary: ALL ladder LBAs zeros (last=LBA{}) — no data landed on any low LBA ::", z),
+                ":: USB: [usb38] bisect boundary: ALL ladder LBAs zeros (last=LBA{}) — no data landed on any low LBA ::", z),
             (None, Some(d)) => serial_println!(
-                ":: PIUSB: [usb38] bisect boundary: data from the first LBA (LBA{}) — no low-LBA zeros this boot ::", d),
+                ":: USB: [usb38] bisect boundary: data from the first LBA (LBA{}) — no low-LBA zeros this boot ::", d),
             (None, None) => serial_println!(
-                ":: PIUSB: [usb38] bisect boundary: no zeros and no data (pattern survived / errors) — see per-LBA lines ::"),
+                ":: USB: [usb38] bisect boundary: no zeros and no data (pattern survived / errors) — see per-LBA lines ::"),
         }
         // Diff LBA0 vs LBA8192 (same READ(10) shape, only the LBA field differs).
         let first_diff = (0..16).find(|&i| lba0_first16[i] != lba8192_first16[i]);
         match first_diff {
             Some(i) => serial_println!(
-                ":: PIUSB: [usb38] lba0-vs-lba8192 diff: first differ at byte {} (lba0={:#04x} lba8192={:#04x}) — identical command path, divergent data ⇒ region/buffer effect not command-shape ::",
+                ":: USB: [usb38] lba0-vs-lba8192 diff: first differ at byte {} (lba0={:#04x} lba8192={:#04x}) — identical command path, divergent data ⇒ region/buffer effect not command-shape ::",
                 i, lba0_first16[i], lba8192_first16[i]),
             None => serial_println!(
-                ":: PIUSB: [usb38] lba0-vs-lba8192 diff: first-16 IDENTICAL (both {}) ::",
+                ":: USB: [usb38] lba0-vs-lba8192 diff: first-16 IDENTICAL (both {}) ::",
                 if lba0_first16.iter().all(|&b| b == 0) { "zeros" } else { "equal-nonzero" }),
         }
 
-        serial_println!(":: PIUSB: [usb38] === stall-recovery + low-LBA bisect complete === ::");
+        serial_println!(":: USB: [usb38] === stall-recovery + low-LBA bisect complete === ::");
     }
 
     /// USB-WRITE-2: recover a halted bulk endpoint after a STALL (completion code 4) or Babble
@@ -11171,7 +11171,7 @@ impl XhciController {
         // off the wire without a source tree. Four clauses, any one of which closes an account —
         // stated with their bounds so a capture's numbers can be compared to them directly.
         serial_println!(
-            ":: PIUSB: [botpark] key — an identity is (root port + route string); it survives re-enumeration and slot-id reuse, which is what the per-slot surrender could not. Four PARK clauses, first to reach its bound closes the account: surrenders>={} (the ladder's verdict on two whole generations) | ladders>={} (retry entries across all generations) | ms>={} (pump wall-clock charged to the identity) | dead>={} (pump timeouts on a PROVABLY IDLE ring — no event, no foreign event, no doorbell for the whole wait; CUMULATIVE, so a live wait does not refund it). dead_streak>={} additionally CUTS the pump budget to 1/{} of base — read dead= not dead_streak= when asking why a device did or did not park. named=no used to mean hub-downstream (no VID:PID banner) and be normal; XHCIHUB (S2) stores the downstream identity, so named=no is now a real anomaly. BOTLATCH M2: the dead clause is the only one with a forgiveness rule, because it is the only one that can be wrong about a HEALTHY device (a NAKing spin-up posts no event, exactly like a dead ring) — a COMPLETED transfer zeroes dead=, and a dead-ring park unparks itself once after {} ms for a single probe at the cut budget (reprobe= says none/armed/spent; a second park on the same identity is permanent) ::",
+            ":: USB: [botpark] key — an identity is (root port + route string); it survives re-enumeration and slot-id reuse, which is what the per-slot surrender could not. Four PARK clauses, first to reach its bound closes the account: surrenders>={} (the ladder's verdict on two whole generations) | ladders>={} (retry entries across all generations) | ms>={} (pump wall-clock charged to the identity) | dead>={} (pump timeouts on a PROVABLY IDLE ring — no event, no foreign event, no doorbell for the whole wait; CUMULATIVE, so a live wait does not refund it). dead_streak>={} additionally CUTS the pump budget to 1/{} of base — read dead= not dead_streak= when asking why a device did or did not park. named=no used to mean hub-downstream (no VID:PID banner) and be normal; XHCIHUB (S2) stores the downstream identity, so named=no is now a real anomaly. BOTLATCH M2: the dead clause is the only one with a forgiveness rule, because it is the only one that can be wrong about a HEALTHY device (a NAKing spin-up posts no event, exactly like a dead ring) — a COMPLETED transfer zeroes dead=, and a dead-ring park unparks itself once after {} ms for a single probe at the cut budget (reprobe= says none/armed/spent; a second park on the same identity is permanent) ::",
             BOT_PARK_SURRENDER_MAX, BOT_PARK_LADDER_MAX, BOT_PARK_CYCLE_MAX_MS, BOT_PARK_DEAD_MAX,
             BOT_PARK_DEAD_STREAK, BOT_PARK_DEAD_DIV, BOT_PARK_REPROBE_MS);
         for e in self.bot_park.iter().filter(|e| e.used) {
@@ -11188,7 +11188,7 @@ impl XhciController {
             // that it has seen the device and is not yet done with it, which is exactly the fact
             // boot5's log could not distinguish from "the ledger is switched off".
             serial_println!(
-                ":: PIUSB: [botpark] account port={} route={:#x} vid={:04x} pid={:04x} named={} parked={} why={} surrenders={}/{} ladders={}/{} ms={}/{} dead={}/{} dead_streak={}/{} budget_cut={} gens={} reprobe={} ::",
+                ":: USB: [botpark] account port={} route={:#x} vid={:04x} pid={:04x} named={} parked={} why={} surrenders={}/{} ladders={}/{} ms={}/{} dead={}/{} dead_streak={}/{} budget_cut={} gens={} reprobe={} ::",
                 e.ident.port, e.ident.route, e.ident.vid, e.ident.pid,
                 if e.ident.anonymous() { "no" } else { "yes" },
                 if e.parked { "yes" } else { "no" },
@@ -11975,7 +11975,7 @@ impl XhciController {
                 let d = unsafe { core::slice::from_raw_parts(data_phys as *const u8, 8) };
                 let landed = d.iter().any(|&b| b != 0xA5);
                 serial_println!(
-                    ":: PIUSB: [usb40] readcap-wedge — err={:?} data=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] poison=0xA5 landed={} — {} ::",
+                    ":: USB: [usb40] readcap-wedge — err={:?} data=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] poison=0xA5 landed={} — {} ::",
                     e, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], landed,
                     if landed {
                         "the 8 bytes ARE in DRAM: the transfer COMPLETED and only its completion event went missing — event-path defect, read the necropsy line"
@@ -11996,7 +11996,7 @@ impl XhciController {
             // upstream (the caller's sense/retry path), never a Disk line the block layer trusts.
             if !(block_size.is_power_of_two() && (512..=4096).contains(&block_size)) {
                 serial_println!(
-                    ":: PIUSB: [usb41] READ CAPACITY reply REJECTED — block_size={} last_lba={:#010x} is not a sane sector geometry (want a power of two in 512..=4096) — phase-shifted or corrupt reply, no disk is minted from it ::",
+                    ":: USB: [usb41] READ CAPACITY reply REJECTED — block_size={} last_lba={:#010x} is not a sane sector geometry (want a power of two in 512..=4096) — phase-shifted or corrupt reply, no disk is minted from it ::",
                     block_size, last_lba
                 );
                 // [usb41] PA36: recorded, not acted on — `bring_up_storage` decides after the
@@ -12701,7 +12701,7 @@ impl XhciController {
                     Err(_) => "Err(other)",
                 };
                 serial_println!(
-                    ":: PIUSB: [usb40] post-wedge INQUIRY control — result={} — {} ::",
+                    ":: USB: [usb40] post-wedge INQUIRY control — result={} — {} ::",
                     ctl_s,
                     if ctl.is_ok() {
                         "the bulk pipes still complete a full CBW/data/CSW round-trip AFTER the wedge: the failure is specific to the READ CAPACITY transaction, not a dead pipe"
@@ -12929,7 +12929,7 @@ impl XhciController {
     /// diagnostic for "which USB devices enumerated, at what speed, and how far". Read-only.
     /// PIUSB-13: read-only enumeration observability for the Pi-side `enumerate()` pump. These
     /// expose the private root-enum FSM state (stage, in-flight port, last stall) and a structured
-    /// root-port snapshot so `piusb::enumerate` can emit the `:: PIUSB: [enum] ... ::` milestone
+    /// root-port snapshot so `piusb::enumerate` can emit the `:: USB: [enum] ... ::` milestone
     /// stream without duplicating the FSM. aarch64-gated: the block does not compile on x86, so x86
     /// codegen is byte-identical (nothing there reads this state). All methods are pure reads with
     /// no controller side effects.
@@ -13142,7 +13142,7 @@ impl XhciController {
             let in_window = databuf >= RC_INBOUND_BASE && databuf < RC_INBOUND_BASE + RC_INBOUND_SIZE;
             let below_3g = databuf < VL805_DMA_CEILING;
             serial_println!(
-                ":: PIUSB: [usb35] databuf phys={:#x} in_trb={:#x} cbw={:#x} csw={:#x} | rc-inbound=[{:#x},{:#x}) offset=0 (1:1) | databuf in_window={} below_3G={} — CBW(DMA-read)+CSW(DMA-write→Passed) share this pool; address theory {} ::",
+                ":: USB: [usb35] databuf phys={:#x} in_trb={:#x} cbw={:#x} csw={:#x} | rc-inbound=[{:#x},{:#x}) offset=0 (1:1) | databuf in_window={} below_3G={} — CBW(DMA-read)+CSW(DMA-write→Passed) share this pool; address theory {} ::",
                 databuf, in_trb, cbw, csw,
                 RC_INBOUND_BASE, RC_INBOUND_BASE + RC_INBOUND_SIZE,
                 in_window, below_3g,
@@ -13197,13 +13197,13 @@ impl XhciController {
                                 None => (0, 0, 0),
                             };
                             serial_println!(
-                                ":: PIUSB: [usb25] storage enumerated: slot {} bulk_in={:#04x} bulk_out={:#04x} block_size={} num_blocks={} ({} MiB) ::",
+                                ":: USB: [usb25] storage enumerated: slot {} bulk_in={:#04x} bulk_out={:#04x} block_size={} num_blocks={} ({} MiB) ::",
                                 slot,
                                 self.slots[slot as usize].bulk_in_ep,
                                 self.slots[slot as usize].bulk_out_ep,
                                 bs, nb, mib);
                             serial_println!(
-                                ":: PIUSB: [usb25] READ(10) LBA0 CSW={:?} residue={} — first 16 bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                                ":: USB: [usb25] READ(10) LBA0 CSW={:?} residue={} — first 16 bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
                                 res.status, res.residue,
                                 data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                                 data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]);
@@ -13216,7 +13216,7 @@ impl XhciController {
                                      else if fat16 { "FAT12/16 BPB" }
                                      else { "unrecognized/raw" };
                             serial_println!(
-                                ":: PIUSB: [usb25] boot-sector sanity: 0x55AA={} type={} ::",
+                                ":: USB: [usb25] boot-sector sanity: 0x55AA={} type={} ::",
                                 boot_sig, fs);
                         }
                     }
@@ -13231,7 +13231,7 @@ impl XhciController {
                         unsafe {
                             let d = core::slice::from_raw_parts(p as *const u8, 16);
                             serial_println!(
-                                ":: PIUSB: [usb34] LBA0 re-read post-invalidate: CSW={:?} residue={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
+                                ":: USB: [usb34] LBA0 re-read post-invalidate: CSW={:?} residue={} — {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} ::",
                                 re.status, re.residue,
                                 d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
                                 d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
@@ -13411,12 +13411,12 @@ impl XhciController {
                 // USBW-1: never skip silently — an unpublished USB handle used to make the whole
                 // write proof vanish without a trace, which is indistinguishable from "it ran".
                 serial_println!(
-                    ":: PIUSB: [usbw] scratch skipped: no USB block geometry published ::");
+                    ":: USB: [usbw] scratch skipped: no USB block geometry published ::");
                 return;
             }
         };
         if nb < 2 {
-            serial_println!(":: PIUSB: [usbw] scratch skipped: USB medium too small (num_blocks={}) ::", nb);
+            serial_println!(":: USB: [usbw] scratch skipped: USB medium too small (num_blocks={}) ::", nb);
             return;
         }
 
@@ -13436,11 +13436,11 @@ impl XhciController {
         // container spans the medium there is NO safe sector and the probe skips outright — it does
         // not fall back to writing inside a mounted volume.
         serial_println!(
-            ":: PIUSB: [usbw] scratch geometry: USB last_lba={} (num_blocks={}), keep-out ceiling={} [{}] ::",
+            ":: USB: [usbw] scratch geometry: USB last_lba={} (num_blocks={}), keep-out ceiling={} [{}] ::",
             nb - 1, nb, ceiling, prov);
         if ceiling >= nb {
             serial_println!(
-                ":: PIUSB: [usbw] scratch skipped: on-disk container spans the medium ({}), no sector outside it — refusing to RMW inside a live volume ::",
+                ":: USB: [usbw] scratch skipped: on-disk container spans the medium ({}), no sector outside it — refusing to RMW inside a live volume ::",
                 prov);
             return;
         }
@@ -13459,7 +13459,7 @@ impl XhciController {
             }
             if ncand == 0 {
                 serial_println!(
-                    ":: PIUSB: [usbw] scratch skipped: no candidate at/above the keep-out ceiling {} ::",
+                    ":: USB: [usbw] scratch skipped: no candidate at/above the keep-out ceiling {} ::",
                     ceiling);
                 return;
             }
@@ -13471,14 +13471,14 @@ impl XhciController {
                     Ok(r) if r.status == CswStatus::Passed => { chosen = Some(cand); break; }
                     other => {
                         serial_println!(
-                            ":: PIUSB: [usbw] pre-read lba={} -> {:?}, falling back ::", cand, other);
+                            ":: USB: [usbw] pre-read lba={} -> {:?}, falling back ::", cand, other);
                     }
                 }
             }
             match chosen {
                 Some(c) => {
                     if c != lba {
-                        serial_println!(":: PIUSB: [usbw] fallback lba={} ::", c);
+                        serial_println!(":: USB: [usbw] fallback lba={} ::", c);
                     }
                     lba = c;
                 }
@@ -13488,7 +13488,7 @@ impl XhciController {
                     // (residue 512), i.e. the device rejected the command; stall recovery had already
                     // run and cleared the halt, which is why the next candidate got a CSW at all.
                     serial_println!(
-                        ":: PIUSB: [usbw] write lba={} -> FAIL (no readable scratch candidate; see per-candidate CSW above) ::",
+                        ":: USB: [usbw] write lba={} -> FAIL (no readable scratch candidate; see per-candidate CSW above) ::",
                         lba);
                     return;
                 }
@@ -13507,7 +13507,7 @@ impl XhciController {
         match self.storage_write10(lba, 1) {
             Ok(r) if r.status == CswStatus::Passed => {}
             other => {
-                serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (write {:?}) ::", lba, other);
+                serial_println!(":: USB: [usbw] write lba={} -> FAIL (write {:?}) ::", lba, other);
                 self.restore_sector(lba, &orig); return;
             }
         }
@@ -13516,32 +13516,32 @@ impl XhciController {
         match self.storage_read10(lba, 1) {
             Ok(r) if r.status == CswStatus::Passed => {}
             other => {
-                serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (verify-read {:?}) ::", lba, other);
+                serial_println!(":: USB: [usbw] write lba={} -> FAIL (verify-read {:?}) ::", lba, other);
                 self.restore_sector(lba, &orig); return;
             }
         }
         let mut rb = [0u8; 512];
         unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, rb.as_mut_ptr(), 512); }
         if rb != pat {
-            serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (readback mismatch) ::", lba);
+            serial_println!(":: USB: [usbw] write lba={} -> FAIL (readback mismatch) ::", lba);
             self.restore_sector(lba, &orig); return;
         }
 
         // 4) RESTORE the original and confirm the medium is byte-identical again.
         if !self.restore_sector(lba, &orig) {
-            serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (restore write) ::", lba); return;
+            serial_println!(":: USB: [usbw] write lba={} -> FAIL (restore write) ::", lba); return;
         }
         match self.storage_read10(lba, 1) {
             Ok(r) if r.status == CswStatus::Passed => {}
-            other => { serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (restore-verify {:?}) ::", lba, other); return; }
+            other => { serial_println!(":: USB: [usbw] write lba={} -> FAIL (restore-verify {:?}) ::", lba, other); return; }
         }
         let mut chk = [0u8; 512];
         unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, chk.as_mut_ptr(), 512); }
         if chk != orig {
-            serial_println!(":: PIUSB: [usbw] write lba={} -> FAIL (not restored) ::", lba); return;
+            serial_println!(":: USB: [usbw] write lba={} -> FAIL (not restored) ::", lba); return;
         }
 
-        serial_println!(":: PIUSB: [usbw] write lba={} ok — RMW+readback+restore, medium byte-identical ::", lba);
+        serial_println!(":: USB: [usbw] write lba={} ok — RMW+readback+restore, medium byte-identical ::", lba);
     }
 
     /// USB-WRITE: stage `data` into the storage slot's DMA buffer and WRITE(10) it to `lba` (single

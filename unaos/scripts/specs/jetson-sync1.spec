@@ -331,7 +331,7 @@ REQUIRE (CAPSTONE COMPLETE|\[orinbsprun\] boot core [0-9]+ joins run\(\))
 REQUIRE TEGRA-EL0.*el0-hello round-trip -> PASS
 # M2 step 1: the microSD becomes block-layer-visible (read-only backend).
 # DEFECT 4, FIXED HERE (exec-spec, 2026-08-25). This was `REQUIRE`, promoted on capture at
-# orin 3 (2026-08-22) on `capture/orin2-boot5c-gui.log:1051` — `:: TEGRA-SD: block backend
+# orin 3 (2026-08-22) on `capture/orin2-boot5c-gui.log:1051` — `:: SDMMC: block backend
 # published — 62333952 sectors (read-only) ::` — and the promotion was right about the
 # EVIDENCE and wrong about the KIND. `sdmmc_tegra.rs` is `#[cfg(feature = "sdmmc")]` end to
 # end and the knob is `UNAOS_SDMMC=1` (arroyo:1015), default OFF. boot5c was flown
@@ -374,7 +374,7 @@ PENDING TEGRA-SD.*block backend published
 #   :2598  `M1: CAPABILITIES[…] = … — POISON … — recon REFUSED (no reset, no writes)`
 #   :2687  `ORIN-SDMMC-1 recon done at M2 (no identified card / honest stop)`
 #   :2694  `ORIN-SDMMC-1 recon STOPPED at M3 (sector-0 read failed)`
-#   block.rs:1684 `TEGRA-SD: REFUSED to publish the microSD block backend — num_blocks=0`
+#   block.rs:1684 `SDMMC: REFUSED to publish the microSD block backend — num_blocks=0`
 # The first row below covers the five SDMMC-side stops, the second the block layer's refusal.
 # THE SEVENTH ARM IS DELIBERATELY NOT FORBIDDEN: sdmmc_tegra.rs:85's `no Tegra234 SDMMC on
 # this build (QEMU virt) — recon is metal-only` is the honest not-on-metal answer and carries
@@ -406,7 +406,7 @@ PENDING TEGRA-SD.*block backend published
 # at the head of this file is unfireable on the same pair for the same reason, so its ⏳ can
 # never promote from these two flights either.
 FORBID recon (SKIPPED|REFUSED|STOPPED at M3|done at M2)
-FORBID TEGRA-SD: REFUSED to publish
+FORBID SDMMC: REFUSED to publish
 
 # --- BOOTROOT (orin 22): the root is the disk this kernel was FOUND on ------------------
 # There is nothing here to retire. The brief expected rows keyed on `[sdmmc] root` — the
@@ -590,7 +590,7 @@ PENDING part=\[262144\.\.1310720\) span_base=262144 span_blocks=131072 fits=yes 
 # DROPS it, leaving the shared `fs::unafs::MOUNT` on `BlockHandle::Global`. This row exists so
 # that if that posture ever changes it changes DELIBERATELY, with this line edited in the same
 # commit, instead of a boot quietly starting to say something else.
-PENDING TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd
+PENDING UNAFS: native unafs volume MOUNTED read-only on TegraSd
 # THE REGRESSION HALF. Each of these is a POSITIVE claim about the medium, and each fires only
 # when the witness line is present at all — so none of them can red an unarmed boot, exactly as
 # the two `recon`/`REFUSED to publish` rows above cannot.
@@ -616,7 +616,7 @@ PENDING TEGRA-UNAFS: native unafs volume MOUNTED read-only on TegraSd
 FORBID span_blocks=2048 fits=
 FORBID unafs span check .*fits=NO
 FORBID unafs span check .*magic=MISSING
-FORBID TEGRA-UNAFS: mount on TegraSd FAILED
+FORBID UNAFS: mount on TegraSd FAILED
 
 # --- EL0-EL1CORE: where an EL0 task was placed, and what happens when it cannot be -----
 # The arc that motivated this block (sched.rs `EL0-EL1CORE`) established that on the
@@ -782,7 +782,7 @@ OPTIONAL !NOFOLD
 #   MISS  `proof INCONCLUSIVE`                            nothing arrived; not a verdict
 #
 # THE KINDS: PASS is REQUIRE — promoted 2026-08-25 (exec-smallfix) at the two-trial bar
-# this file itself set for TEGRA-SD: two CONSECUTIVE metal flights carry the line verbatim
+# this file itself set for SDMMC: two CONSECUTIVE metal flights carry the line verbatim
 # (boot7g `capture/line-acm0/orin.log:12967`, boot7h `:14822`, cpu 0 both), both flown
 # AFTER IRQEL-RT2 removed the machine-global-flag artifact that produced the only FAIL
 # metal ever printed (boot5c). The old objection — a REQUIRE on the PASS line "would

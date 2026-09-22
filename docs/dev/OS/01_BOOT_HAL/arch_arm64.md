@@ -8592,13 +8592,13 @@ volume label + 0x55AA) — the installer's claim verified from outside the kerne
 Witness of record (2026-07-18, `raspi4b`, blank 128 MiB scratch):
 
 ```
-:: PIINSTALL: Gate 1 census — target = Pi emmc2 microSD (262144 x 512B sectors), capacity 262144 blocks (128 MiB), sector-0 = unknown (no recognised signature) ::
-:: PIINSTALL: Gate 2 scratch ladder — write/verify/restore/verify at LBA 262143 => PASS ::
-:: PIINSTALL: ABOUT TO DESTROY: microSD sector-0 = unknown … — the entire card is about to be repartitioned ::
-:: PIINSTALL:   GPT written + parse-back verified — ESP LBA 2048..133119, data LBA 133120..262110 of 262144 sectors ::
-:: PIINSTALL:   ESP formatted FAT32 — fat_sz=1016sec clusters=129008 data@vol+2064 ::
-:: PIINSTALL:   copied UNAOS.IMG (4096 bytes, 8 extents) ::
-:: PIINSTALL:   extent sha-verify (re-read every written extent off the card) => PASS ::
+:: INSTALL: Gate 1 census — target = Pi emmc2 microSD (262144 x 512B sectors), capacity 262144 blocks (128 MiB), sector-0 = unknown (no recognised signature) ::
+:: INSTALL: Gate 2 scratch ladder — write/verify/restore/verify at LBA 262143 => PASS ::
+:: INSTALL: ABOUT TO DESTROY: microSD sector-0 = unknown … — the entire card is about to be repartitioned ::
+:: INSTALL:   GPT written + parse-back verified — ESP LBA 2048..133119, data LBA 133120..262110 of 262144 sectors ::
+:: INSTALL:   ESP formatted FAT32 — fat_sz=1016sec clusters=129008 data@vol+2064 ::
+:: INSTALL:   copied UNAOS.IMG (4096 bytes, 8 extents) ::
+:: INSTALL:   extent sha-verify (re-read every written extent off the card) => PASS ::
 :: INSTALL: pi emmc2 gpt+fat32+copy verify => PASS ::
 ── host-side ──  PASS protective MBR / EFI PART @LBA1 / FAT32 fs-type / UNAOS label / 0x55AA  → HOST-VERIFY: PASS
 ```

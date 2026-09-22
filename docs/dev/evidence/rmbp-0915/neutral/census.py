@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """NEUTRAL census — NEUTRAL-TABLE.md §0 method with a real Rust lexer for comment stripping.
-Handles: line comments, NESTED block comments, string/char/raw-string literals."""
+Handles: line comments, NESTED block comments, string/char/raw-string literals.
+
+CORRECTION (NEUTRAL M2, 2026-09-22): the COLON pattern was an ALLOWLIST of family names
+(`tegra|TEGRA-[A-Z0-9]+|PIUSB|PI-[A-Z]+|PIINSTALL|INSTALL-PI`) and it never listed `PINSTALL`.
+So the largest colon family after `:: PIUSB:` — `:: PINSTALL:`, 63 LIVE `serial_println!` sites in
+`install/partition.rs`, with twelve spec rules behind it — censused as ZERO, and NEUTRAL-TABLE §2
+was written without it. Measured at `acd102d7`: all 63 sites are live code, none inside a comment,
+so that zero was a fact about the PATTERN and not about the data (LAWS §5: "is a zero a fact about
+the data or about the pattern?"). M1 blamed this class of miss on the `/*`-inside-`//` lexing bug;
+that bug was real and is fixed above, but it is NOT what hid this family. An allowlist census cannot
+report what it was never told to look for, so the COLON rule now matches the BOARD PREFIX and lets
+the family name be open — the same shape the BRACKET and IDENT patterns already used. Re-running
+this script at M1's base reproduces M1's numbers plus the families the allowlist could not see."""
 import os, re, sys
 from collections import defaultdict
 
@@ -57,7 +69,10 @@ shared.sort(); archf.sort()
 
 PATS = {
  'bracket': re.compile(r"\[(?:orin|tegra|jetson|pi|rmbp|mbp|x86)[a-z0-9 -]*?(?=[\]:0-9])"),
- 'colon'  : re.compile(r"::\s*(?:tegra|TEGRA-[A-Z0-9]+|PIUSB|PI-[A-Z]+|PIINSTALL|INSTALL-PI)\s*:"),
+ # the SPACE is load-bearing: `:: NAME:` is the witness form, `::piusb::`/`::PixelFormat::` are Rust
+ # module paths. Dropping it re-admits four path false positives (12 `::PixelFormat:`, 7 `::PinnedApp:`,
+ # 2 `::piusb:`, 1 `::pi:` at acd102d7) — measured, not assumed.
+ 'colon'  : re.compile(r":: +(?:(?i:orin|tegra|jetson|rmbp|mbp|pi))[A-Za-z0-9_-]* *:"),
  'ident'  : re.compile(r"\b(?:orin|tegra|jetson|pi|rmbp|mbp)_[a-z0-9_]+\b"),
  'glued'  : re.compile(r"\b(?:piusb|orinusb)[0-9]+_[a-z0-9_]+\b"),
  'upper'  : re.compile(r"\b[A-Z][A-Z_0-9]*(?:ORIN|TEGRA|JETSON|RMBP|MBP|PIUSB|PIINSTALL|PIRAST|PIDESK)[A-Z_0-9]*\b|\b(?:ORIN|TEGRA|JETSON|RMBP|MBP|PIUSB|PIINSTALL)[A-Z_0-9]*\b|\bPI_[A-Z0-9_]+\b"),
