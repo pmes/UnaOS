@@ -281,6 +281,7 @@ nvidia-kepler-kfbind|:: KFBIND: pbdma[|-|measured
 nvidia-kepler-kdhead|:: KDHEAD: end rung=KD14|-|measured
 nvidia-kepler-ctrladdr|:: kepler: ctrladdr |-|measured
 nvidia-kepler-ctrlbind|:: kepler: ctrlbind |-|measured
+nvidia-kepler-vblank|:: kepler: vblank |-|measured
 hda|[hda] census|-|measured
 hda-tone|:: HDA-TONE:|-|measured
 tegra|:: tegra: JB5 — XUSB domain not ON at handoff|-|measured(1)

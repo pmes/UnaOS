@@ -1019,7 +1019,7 @@ pub unsafe fn beam_probe(bar0: usize) {
     kdhead_publish_census(&c_adv, &c_vbd);
 
     if let Some((head, vtotal, samples, vbd, max, adv, evo_size)) = chosen {
-        BEAM_VTOTAL.store(vtotal, Ordering::Relaxed);
+        BEAM_VTOTAL.store(vtotal, Ordering::Relaxed); #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))] super::kepler_vblank::arm(head as u32, vtotal); // KVBLANK rung 1 — SAME-LINE APPEND (zero lines, so no panic `Location` in this file moves and `knoboff beam`/`knoboff nvidia-kepler-vblank` stay byte-identical). The vblank counter is ARMED on THE HEAD THIS PROBE CHOSE, borrowed exactly as KDHEAD borrows the census above: a second head choice would make a disagreement between the beam gate and the vblank counter unattributable.
         // Published LAST, with Release: it is the gate `scanout_beam` reads, and a reader that sees
         // a non-zero address must also see the vtotal above.
         BEAM_VERT_VA.store(bar0 + regs::NV_PDISPLAY_BASE + BEAM_OFF_HEAD_STAT + head * BEAM_HEAD_STRIDE + BEAM_OFF_VERT, Ordering::Release);
@@ -1057,7 +1057,7 @@ pub fn scanout_beam() -> Option<(u32, u32)> {
     // SAFETY: `va` was computed from the BAR0 base this module's reads already use and published by
     // `beam_probe` only after that very word was read repeatedly and behaved as a raster counter;
     // this is a read.
-    let v = (unsafe { core::ptr::read_volatile(va as *const u32) }) & 0xFFFF;
+    let w = unsafe { core::ptr::read_volatile(va as *const u32) }; #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))] super::kepler_vblank::note(w); let v = w & 0xFFFF; // KVBLANK rung 1 — SAME-LINE, and the whole reason the rung costs NO extra MMIO: `HEAD_STAT.VERT` carries `vblank_count[31:16]` in the SAME word as `vline[15:0]` (rnndb display/g80_pdisplay.xml:647), so the compositor's own hold loop is the vblank sampler. Off-knob this is `read_volatile(...) & 0xFFFF` exactly as it was — one binding, folded — which `./arroyo knoboff nvidia-kepler-vblank` measures rather than asserts. `note`'s fast path is one relaxed load and a 16-bit compare; `now_cycles()` and the witness print are reached only ON an edge, i.e. 60 times a second.
     Some((v.min(vt.saturating_sub(1)), vt))
 }
 

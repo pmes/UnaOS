@@ -1057,6 +1057,50 @@ fi
 # four-place trap); the map line is parser-conformant so the KNOB->BUILDER WIRING CHECK covers it,
 # and `x86-all` names the feature.
 [ -n "${UNAOS_KEPLER_KFUNWEDGE:-}" ] && _feats="${_feats}nvidia-kepler-kfunwedge,"
+# KVBLANK (rmbp, the GPU line under R53, appended 2026-09-22 — LAST line of the kepler block; if you
+# append below this, CORRECT THIS CLAIM rather than leaving it to rot, as the five entries above it
+# were each corrected in turn): UNAOS_KEPLER_VBLANK=1 arms THE VBLANK EDGE and the wait that replaces
+# the raster spin (`drivers/gpu/kepler_vblank.rs`, a module of its own, plus one arm in
+# `video/beam.rs`).
+# THE DEFECT IS MEASURED, not suspected. B135 §7 (VUGPERF, fold 4a283725) decomposed flight 11's
+# 139.75 ms composite pass and found the residual charged to neither half of the clock — 46 488 us
+# per pass — is `beam::hold` SPINNING on an MMIO read of the Kepler head's raster position:
+# `[wc-h] win=8 beamwaits=4336 beamwait_us=10766899` is a 2.48 ms mean hold against a 16.667 ms
+# frame, `win=3 beamwait_us=49113217` over 13971 waits, `win=2 beammaxwait_us=62007`. The beam wait
+# alone exceeds the presenter's entire 500 us budget by 5x. A display engine has a vblank for this.
+# RUNG 1 `kvblank-measure` (no compositor change): `:: kepler: vblank arm head= vt= mode=poll
+# src=HEAD_STAT.VERT[31:16] ::` at the beam gate's own head, then `:: kepler: vblank head= count=
+# period_us= jitter_us= raster_at_irq= vt= mode=poll vbwaits= vbwait_us= ::` at 1 Hz for the first
+# 10 s and 0.1 Hz after, plus ONE PMC line: exactly one bit (PDISPLAY) set in NV_PMC_INTR_EN,
+# NV_PMC_INTR_0 watched for 50 ms, the captured value RESTORED and READ BACK
+# (`:: kepler: vblank pmc-arm … restored=… verdict=clean|DIRTY ::`, the ctrlbind idiom; writes=2).
+# ⚠ mode=poll, AND THAT IS A FINDING ABOUT THIS TREE, not a shortcut: `arch/x86_64/interrupts.rs`
+# has three device vectors, each a hard-coded constant with its own handler and IDT entry, and no
+# `alloc_vector`/`register_irq` a PCI function can join. A fourth would be a new interrupt mechanism.
+# The edge source is `HEAD_STAT.VERT[31:16]` (rnndb display/g80_pdisplay.xml:647) read out of the
+# word `scanout_beam` was already reading, so rung 1 costs ZERO extra MMIO and its sampler is the
+# compositor's own hold loop. The PDISPLAY-side per-head vblank ENABLE/STATUS pair is NOT-IN-TREE and
+# is neither read nor written.
+# RUNG 2 `kvblank-wait`: a wait arm BESIDE the spin in `beam::hold`, taken only when a source is
+# counting, the hazard zone covers >= 1/3 of the frame (derived from the 2.48 ms mean above) and
+# rung 1's measured phase is OUTSIDE that zone; ONE confirming raster read, and a fall-through to the
+# UNTOUCHED spin when the prediction misses (`vbrecheck=`). The deadline is the spin's own, so a
+# present costs one give-up budget whichever arm it took. Fixture (witness builds only, one-shot from
+# `beam::hold` so it runs where there is no Kepler): `:: kepler: vblank selftest arm=wait sim=timer
+# … :: PASS ::` and its go-red twin `… sim=stuck … :: GO-RED-OK ::`.
+# IMPLIES nvidia-kepler AND beam (Cargo-side). Default OFF => the module, all four call sites and
+# every `:: kepler: vblank ` string are unlinked and media are byte-identical.
+# ⚠⚠ THE FOURTH PLACE IS OWED AND IS NOT A TYPO. `builder/src/main.rs` is NOT in this rung's named
+# file set, so this knob has no builder entry — and therefore this feature is deliberately NOT named
+# on `x86-all` or any other literal `x86-*` leg, because the KNOB→BUILDER WIRING CHECK below reds
+# `check` for exactly that pair. CONSEQUENCE, SAID HERE RATHER THAN DISCOVERED ON A CARD: x86 METAL
+# MEDIA DO NOT CARRY THIS RUNG. `esp-x86` rebuilds its feature list from the builder's own env map
+# and never reads $KERNEL_FEATURES, so a card cut today boots without one `:: kepler: vblank `
+# string — the rastmc/sdwrite failure mode, met head-on instead of shipped. The armed polarity IS
+# compiled and artifact-certified by `UNAOS_KEPLER_VBLANK=1 ./arroyo test`, which builds through
+# `build_kernel_x86_64` from $KERNEL_FEATURES and runs banner-cert on the ELF. The owed fold is one
+# line in the builder beside its siblings plus the name on `x86-all`.
+[ -n "${UNAOS_KEPLER_VBLANK:-}" ] && _feats="${_feats}nvidia-kepler-vblank,"
 # R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
 # (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only, never a mean; pure
 # measurement, changes no scheduling/locking/present behaviour. x86_64-only in effect (the real impl is
