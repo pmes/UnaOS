@@ -188,3 +188,18 @@ REQUIRE :: STOR1-NAME: .* :: PASS \[w=0x3f/0x3f\] ::
 # line on any short mask, and the go-red for this milestone produced it — `created_desc_any_row` put
 # back at `sys_open_dynamic`'s gate, which is the OLD identity model, restored and then reverted.
 FORBID :: STOR1-NAME: created-name entries FAIL
+
+# ── STOR-1 M2 (2026-09-23), TAIL-APPENDED past STOR-1 M1 ──────────────────────────────────────────
+# RENAME, pinned on the same unconditional lane for the same reason: `SYS_RENAME` is dispatched with
+# no feature gate at all, so its witness is present on the knob-free `./arroyo test`.
+#
+# `w=0x7f` carries the claim the same way M1's mask does — seven ring-3 legs, of which bit1..3 are
+# the move itself (rename returns 0, the OLD name is -ENOENT, the NEW name reads back byte-exact),
+# bit4 is "a refused rename mutates nothing" and bit5 is the x86-only `-EBUSY` on a live source
+# together with its own retirement (the same rename returns 0 the moment the handle closes). The
+# PASS spelling additionally requires the kernel-side OWNER-ONLY leg (`acl_ok`), which no mask bit
+# can carry because a single ring-3 program cannot be two principals.
+REQUIRE :: STOR1-MV: .* :: PASS \[w=0x7f/0x7f\] ::
+# The FORBID partner is the launcher's own FAIL spelling, produced by this milestone's go-red (the
+# `owned_unlink_permitted` refusal deleted from `rename_created`'s authorization, reverted).
+FORBID :: STOR1-MV: rename FAIL
