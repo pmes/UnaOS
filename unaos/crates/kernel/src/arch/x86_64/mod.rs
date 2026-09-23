@@ -282,19 +282,33 @@ pub fn scanout_beam() -> Option<(u32, u32)> {
 /// `./arroyo knoboff ioapic` is this arc's stated invariant.
 #[cfg(feature = "ioapic")]
 pub mod ioapic;
-
 /// IOAPIC rung 3 — route one PCI function's INTx to `vector`, or answer `false`.
 ///
 /// THE TWO-POLARITY WRAPPER, and it is `scanout_beam`'s shape above for `scanout_beam`'s reason.
-/// The one caller outside this directory is a term of an `if` CONDITION in
-/// `drivers/ehci/mod.rs::isr_arm_controller`, and a condition term cannot carry a `#[cfg]` of its
-/// own. So the OFF arm is a CONSTANT `false` — `&& !false` folds to the expression that was
-/// already there, which is what keeps `./arroyo knoboff ioapic` byte-identical — and the module
+/// Its caller is a term of an `if` CONDITION in `drivers/gpu/kepler_vblank.rs`, and a condition
+/// term cannot carry a `#[cfg]` of its own. So the OFF arm is a CONSTANT `false`, and the module
 /// declaration above stays `#[cfg]`-gated, so a knob-off build does not lex `ioapic.rs` at all.
+/// The EHCI caller moved to `ioapic_route_intx_why` below (IOAPIC2, rmbp-ledger B191), because a
+/// bare `false` could not tell its refusal line WHY — see that function.
 ///
 /// Appended at the file tail for the reason the two functions above state.
 #[inline]
 pub fn ioapic_route_intx(bus: u8, dev: u8, func: u8, vector: u8) -> bool {
+    ioapic_route_intx_why(bus, dev, func, vector).is_ok()
+}
+
+/// IOAPIC2 (rmbp-ledger B191) — the same route as `ioapic_route_intx`, answering `Ok(gsi)` or
+/// `Err(reason)` where `reason` is the token the `[ioapic]` refusal line printed (`no-intx-pin`,
+/// `no-firmware-line`, `pirq-disabled`, `rcba-disabled`, `dnir-unreadable`, the `route_gsi`
+/// refusals, `unmask-…`) — or, knob-off, `no-ioapic-in-kernel`, which is the ONE case in
+/// which the sentence flight 12 printed ("there is no IOAPIC in this kernel") is true. A caller
+/// composes its own refusal from this value and never from a fixed string: flight 12 printed that
+/// sentence in the same millisecond as `[ioapic] route … REFUSED reason=no-firmware-line`, on an
+/// image that HAD an I/O APIC (`f12-boot1.log`, 5833 ms).
+///
+/// Appended at the file tail, after `ioapic_route_intx`, so no line above it moves.
+#[inline]
+pub fn ioapic_route_intx_why(bus: u8, dev: u8, func: u8, vector: u8) -> Result<u32, &'static str> {
     #[cfg(feature = "ioapic")]
     {
         ioapic::route_pci_function(bus, dev, func, vector)
@@ -302,6 +316,6 @@ pub fn ioapic_route_intx(bus: u8, dev: u8, func: u8, vector: u8) -> bool {
     #[cfg(not(feature = "ioapic"))]
     {
         let _ = (bus, dev, func, vector);
-        false
+        Err("no-ioapic-in-kernel")
     }
 }

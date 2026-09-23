@@ -1,0 +1,12 @@
+mode=full
+completion_at=-
+grace=20
+wall=121.9
+cap=120
+spec=/home/pmes/unaos-bench/scratch/rmbp-0915/ioapic2/unaos/scripts/specs/x86-test.spec
+sha=94e90eae-dc87e32
+label=test
+completion=complete
+complete_line=2434
+log_bytes=241265
+log_sha256=f91358dcd3b986414719fad32b19f269aa8cb5c2caa33fcebce127c90fffc3e0

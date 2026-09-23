@@ -408,3 +408,42 @@ REQUIRE :: FAT-LFN-MV: renamed=Rename me - long to longer\.txt => Renamed - a lo
 # Both FAIL spellings end `FAIL ::` and are convicted by mbench's DEFAULT_FORBIDS and `arroyo`'s own
 # fault scan, so — FATLFN's reasoning above — they are not restated. A SKIP has no line of its own:
 # the witness runs only where FAT-LFN ran, whose SKIPPED is already FORBIDden above.
+
+# ── IOAPIC2 (2026-09-23, rmbp-ledger B191), TAIL-APPENDED past SPECPINS2 ──────────────────────────
+# THE ISRARM DECISION NAMES ITS REASON, AND THE STALE SENTENCE IS GONE. Flight 12 (`f12-boot1.log`,
+# 5833 ms) printed `[ioapic] route bdf=0:29.0 pin=INTA line=0 -> REFUSED reason=no-firmware-line`
+# and, the SAME millisecond, `ISRARM REFUSED — this function offers no usable MSI capability, and
+# there is no IOAPIC in this kernel to route INTx to` — on an image whose I/O APIC census had just
+# printed `ioapics=1 … gsis=24`. The EHCI refusal was a FIXED STRING written before the I/O APIC
+# existed. It is now composed from `arch::x86_64::ioapic_route_intx_why`'s `Err(reason)`, which is
+# the token the route's own `[ioapic]` line printed (knob-off: `no-ioapic-in-kernel`, the one case
+# where the old sentence was true), and the armed line names the LIVE path (`via=msi addr=…` or
+# `via=ioapic-intx gsi=<n>`) instead of reading "MSI vector" on both.
+#
+# KNOB-NEUTRAL BY CONSTRUCTION, because this file is replayed by every default-medium
+# `./arroyo test`, with or without `UNAOS_IOAPIC`: the REQUIRE accepts either arm of the decision
+# and requires only that the arm be STATED (a path, or a refusal with a reason token) — it certifies
+# the decision's wording, not a limitation (LAWS §5, "Require a PROPERTY"). Measured: knob-off lane
+# (the harness usb-ehci offers no MSI capability) prints `REFUSED reason=no-ioapic-in-kernel`; the
+# `UNAOS_IOAPIC=1` lane prints `armed via=ioapic-intx gsi=<n>`.
+REQUIRE :: EHCI-HID: \[\d+\] ISRARM (armed via=(msi addr=0x[0-9a-f]+|ioapic-intx gsi=\d+) vector 0x[0-9a-f]+,|REFUSED reason=[a-z0-9-]+ )
+# The sentence flight 12 printed beside a live I/O APIC. Neither polarity may print it again.
+FORBID there is no IOAPIC in this kernel to route INTx to
+#
+# IOAPIC2 M2 — THE CHIPSET PIRQ ROUTE. Under `UNAOS_IOAPIC=1` the builder places the harness usb-ehci
+# at 0:29.0 (the PCH's EHCI #1 slot) and `ioapic::pirq_gsi` derives its I/O APIC input from the
+# ICH9 LPC's own registers — `D29IR` behind RCBA picks the PIRQ for the function's pin, PIRQ A..H is
+# I/O APIC input 16..23 — which is the path the rMBP's 0:29.0 takes. Measured on that lane:
+#   [ioapic] pirq bdf=0:31.0 id=8086:2918 family=ich9 rcba=0xfed1c000 pirqa=0x0a … pirqd=0x0b …
+#            fn=0:29.0 pin=INTD d29ir=0x3210 -> pirq=D gsi=19 line=11 fw_line=11 fw_agree=yes
+#   [ioapic] armed bdf=0:29.0 gsi=19 vector=0x43 masked=false … unmasked_lo=0x0000a043 …
+# KNOB-NEUTRAL, so both rows are FORBIDs: a knob-off boot prints no `[ioapic]` line and neither can
+# fire there, which is correct — there is no route to judge. `fw_agree=` compares two INDEPENDENT
+# derivations of the same PIRQ: ours (the pin through `D29IR`, then `PIRQ[n]_ROUT` bits 3:0) and
+# firmware's (OVMF computed the Interrupt Line from its own table and wrote it to 0x3C). `no` means
+# one of them is wrong. GO-RED (source mutation, the wrong PIRQ index — `idx + 1`): `pirq=E gsi=20
+# line=10 fw_line=11 fw_agree=no`, and with the typist's 120 events on the wire the vector is never
+# delivered (`ISRARM IRQ DEAD … irq=0`). `masked=` is derived from the entry's read-back bit 16, so
+# an unmask that did not stick reds here and not only in the ISR counters.
+FORBID \[ioapic\] pirq .* fw_agree=no
+FORBID \[ioapic\] armed .* masked=true

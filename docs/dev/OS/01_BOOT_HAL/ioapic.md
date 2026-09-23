@@ -9,7 +9,8 @@ the 2012 rMBP alike. Nothing here is board-specific.
 `unaos/crates/kernel/src/drivers/ehci/mod.rs::isr_arm_controller`.
 
 **Knob:** `UNAOS_IOAPIC=1` → Cargo feature `ioapic`. Default OFF, byte-identical
-(`./arroyo knoboff ioapic`). **Ledger:** rmbp `B147`.
+(`./arroyo knoboff ioapic`). **Ledger:** rmbp `B147` (rungs 1–3), `B191` (the ISRARM reason and
+rung 4, §9).
 
 **Clean room.** Intel 82093AA I/O APIC datasheet (§3.1 the IOREGSEL/IOWIN window, §3.2.1 IOAPICID,
 §3.2.2 IOAPICVER, §3.2.4 the 64-bit redirection entry) · Intel SDM Vol. 3 §10 (local APIC, delivery
@@ -18,8 +19,8 @@ APIC, §5.2.12.5 Interrupt Source Override and the MPS INTI flags, §5.2.12.7 Lo
 Local Bus 3.0 (§2.2.6 INTx is level-triggered and active low, §6.2.2 COMMAND bit 10 Interrupt
 Disable, §6.2.4 Interrupt Line / Interrupt Pin). All public; no Linux source was read.
 
-**Rungs.** 1 `ioapic-census` (§2) · 2 `ioapic-route` (§3–§4) · 3 `ioapic-ehci` (§5–§6). Each landed
-green before the next.
+**Rungs.** 1 `ioapic-census` (§2) · 2 `ioapic-route` (§3–§4) · 3 `ioapic-ehci` (§5–§6) · 4
+`ioapic-pirq`, the chipset PIRQ router (§9). Each landed green before the next.
 
 ---
 
@@ -169,8 +170,11 @@ but leaves the Interrupt Line register unprogrammed — legal, since an ACPI OS 
 `_PRT` — this module will correctly decline to route.
 
 Closing it needs either an AML interpreter or a chipset-specific PIRQ-router decode (the ICH9 /
-7-series PCH `PIRQ[A-H]_ROUT` registers), and both are their own arcs. **Flight 12 is what decides
-whether it matters on the rMBP**: the `[ioapic] route … line=` values it prints are the measurement.
+7-series PCH `PIRQ[A-H]_ROUT` registers). **Flight 12 decided that it matters on the rMBP**:
+`[ioapic] route bdf=0:29.0 pin=INTA line=0 -> REFUSED reason=no-firmware-line`, and the rMBP's
+firmware programs no Interrupt Line on any function. **Rung 4 (§9) is the PIRQ-router decode**,
+and it closes the limit for every function the chipset builds in; a function behind a bridge
+still depends on firmware's line, because only `_PRT` describes it.
 
 ## 5. Rung 3 — the PCI arm
 
@@ -201,6 +205,10 @@ if !PciScanner::enable_msi(..) && !arch::x86_64::ioapic_route_intx(bus, dev, fun
     // ... the ISRARM REFUSED arm, unchanged
 }
 ```
+
+(That was rung 3's shape. Since `B191` the same lines read `let via = if enable_msi(..) { Ok(None) }
+else { ioapic_route_intx_why(..).map(Some) }; if let Err(why) = via { … }`, so the refusal prints
+the route's own reason token and the armed line names the live path — §9.2.)
 
 The refusal arm is now reached only when *both* delivery paths are unavailable. When the route
 succeeds the function falls through to the `USBINTR` unmask below it **unchanged** — the completion
@@ -310,3 +318,161 @@ census line is the measurement, not this paragraph.
 Also wanted from that boot, and recorded in `B147`: the EHCI functions' **Interrupt Line** values as
 the wire reports them (a `255` is itself a finding — firmware routed the function nowhere), and what
 happens to the `EHCIDARK` line when a completion interrupt can finally arm.
+
+**Flight 12 answered (§9.1):** the controller exactly as stated (`id=2 addr=0xfec00000 gsi_base=0
+entries=24 version=0x20`), and the EHCI at 0:29.0 with **Interrupt Line 0** — refused, polled.
+Flight 13's expectation is §9.5.
+
+## 9. Rung 4 — the chipset PIRQ router (IOAPIC2, rmbp `B191`)
+
+### 9.1 What flight 12 measured
+
+Flight 12 (image 4, `f12-boot1.log`) confirmed §8's expectation for the controller and refuted
+the route:
+
+```
+[ioapic] id=2 addr=0xfec00000 gsi_base=0 entries=24 version=0x20 hw_id=0 == witness ::
+[ioapic] census ioapics=1 isos=2 gsis=24 nmis=8 dropped=0 madt_entries=11 == witness ::
+[   5833ms] [ioapic] route bdf=0:29.0 pin=INTA line=0 -> REFUSED reason=no-firmware-line — …
+[   5833ms] :: EHCI-HID: [1] ISRARM REFUSED — this function offers no usable MSI capability, and
+            there is no IOAPIC in this kernel to route INTx to. …
+```
+
+The rMBP's firmware programs **no Interrupt Line on any function** — the same boot prints
+`[PCI-PROBE] … Interrupt Line (IRQ)=0 (0x0), Interrupt Pin=INTA` for the xHCI at 0:20.0 and
+`[hda] … irq=0` for 0:27.0 — so §4's limit is the one that bit. And the ISRARM line beside it was a
+**fixed string** written before this subsystem existed: it named "no IOAPIC in this kernel" on an
+image whose census had just printed one.
+
+### 9.2 The refusal names its reason (M1)
+
+`route_pci_intx` and `route_pci_function` now return `Result<…, &'static str>`, and every `Err` is
+the token the matching `[ioapic]` line printed. `arch/x86_64/mod.rs::ioapic_route_intx_why` hands
+that Result to the driver (knob-off: `Err("no-ioapic-in-kernel")`, the one case where the old
+sentence was true); `ioapic_route_intx` is `.is_ok()` of it for `kepler_vblank`'s condition term.
+The EHCI site is still line-neutral:
+
+```rust
+let via = if PciScanner::enable_msi(..) { Ok(None) } else { ioapic_route_intx_why(..).map(Some) };
+if let Err(why) = via { /* ISRARM REFUSED reason={why} — MSI: …; INTx: … */ }
+```
+
+and the armed line names the LIVE path — `via=msi addr=0xfee…` or `via=ioapic-intx gsi=<n>` —
+where it used to read "MSI vector" on both. `x86-default.spec` REQUIREs the decision stated with a
+path or a reason token (knob-neutral) and FORBIDs the flight-12 sentence.
+
+### 9.3 The route (M2)
+
+For a function the chipset builds in, the I/O APIC input is not a board decision. It is three
+chipset registers and one fixed mapping (clean room: the Intel 7 Series / C216 PCH datasheet, doc
+326776, and the ICH9 datasheet, doc 316972 — the same layout in both; document numbers and
+register names as recalled, **section and page numbers `unverified`**, which is why every value
+below is printed on the wire):
+
+| register | where | what this rung reads |
+|---|---|---|
+| `RCBA` | LPC config `0xF0` | bits 31:14 base, bit 0 enable |
+| `D<n>IR` | RCBA + `0x3140` (D31) `0x3144` (D29) `0x3146` (D28) `0x3148` (D27) `0x314C` (D26) `0x3150` (D25) | 3 bits per pin: INTA 2:0, INTB 6:4, INTC 10:8, INTD 14:12 → PIRQ A..H. Default `3210h`, **programmable**, so READ, never assumed |
+| `PIRQ[A-D]_ROUT` / `PIRQ[E-H]_ROUT` | LPC config `0x60–0x63` / `0x68–0x6B` | bit 7 IRQEN (1 = not routed to the 8259), bits 3:0 the ISA IRQ |
+| APIC interrupt mapping | datasheet table | PIRQA#–PIRQD# → I/O APIC inputs 16–19, PIRQE#–PIRQH# → 20–23, active-low |
+
+`ioapic::pirq_gsi(bus, dev, func, pin, fw_line)`:
+
+1. **Covered?** Bus 0 and a device number with a `D<n>IR` — otherwise `n/a reason=not-on-die`,
+   and rung 2's firmware-line path decides exactly as before.
+2. **Router discovered, not assumed** (R16): the ISA bridge (class 06/01) on bus 0 whose
+   vendor:device is in a family this rung reads — `ich9` 8086:2910–291F, `pch7` 8086:1E40–1E5F.
+   None → `n/a reason=no-pirq-router`.
+3. `RCBA` enabled, else `REFUSED reason=rcba-disabled`; the window is mapped with
+   `map_mmio_window` (the census's discipline), `D<n>IR` read as 16 bits, `0xFFFF` →
+   `REFUSED reason=dnir-unreadable`.
+4. The pin's 3-bit field is the PIRQ index; `PIRQ[n]_ROUT` with IRQEN set →
+   `REFUSED reason=pirq-disabled` (the datasheet's note: BIOS clears IRQEN on every PIRQ it uses
+   during POST, so a set bit at our boot is firmware saying "unused").
+5. Otherwise `gsi = 16 + index`, active-low, level. `line=` is `ROUT & 0x0F` and `fw_agree=`
+   compares it with the function's own Interrupt Line — two independent derivations of one PIRQ.
+
+`route_pci_intx` asks this FIRST for a covered function (the APIC-mode answer; the Interrupt Line
+register holds the 8259-mode one) and falls back to firmware's line for everything it does not
+cover. A covered function the router refuses AND whose line is 0 is refused with the router's
+token (`pirq-disabled`, …), which the ISRARM line then carries.
+
+**The QEMU fixture.** q35's `ICH9-LPC` (8086:2918) carries the same registers. Under
+`UNAOS_IOAPIC=1` the builder places the harness `usb-ehci` at `addr=1d.0` — the PCH's EHCI #1
+slot, 0:29.0 — so the lane exercises the path the rMBP's 0:29.0 takes (anywhere else the
+controller lands on QEMU's next free slot, 0:3.0, which no chipset register describes). OVMF
+programs an Interrupt Line on every function, so on QEMU `fw_agree=` is a live cross-check; on the
+rMBP it reads `n/a`. Measured, `UNAOS_WC=1 UNAOS_IOAPIC=1 UNAOS_QEMU_FULL=1 ./arroyo test 150` with
+a QMP typist (`qmp_type.py --port 4489 --marker ':: EHCI-HID: [0] M2 armed keyboard' --bursts 6
+--burst 9`), rc=0, `x86-default.spec` 19/19 `[full wall 152.0s]`:
+
+```
+[ioapic] pirq bdf=0:31.0 id=8086:2918 family=ich9 rcba=0xfed1c000 pirqa=0x0a pirqb=0x0a pirqc=0x0b
+         pirqd=0x0b pirqe=0x0a pirqf=0x0a pirqg=0x0b pirqh=0x0b fn=0:29.0 pin=INTD d29ir=0x3210
+         -> pirq=D gsi=19 line=11 fw_line=11 fw_agree=yes == witness ::
+[ioapic] route bdf=0:29.0 pin=INTD line=11 -> gsi=19 via=pirq polarity=active-low trigger=level
+[ioapic] armed bdf=0:29.0 gsi=19 vector=0x43 masked=false dest_apic=0 entry=0x000000000001a043
+         unmasked_lo=0x0000a043 intx_disable=0 routed=1 == witness ::
+:: EHCI-HID: [0] ISRARM armed via=ioapic-intx gsi=19 vector 0x43, USBINTR 0x00000000 -> 0x00000001 …
+:: EHCI-HID: ISRARM armed=1 refused=0 irq=122 isr_rearm=114 poll_rearm=8 depth_max=8 ringfull=8 …
+```
+
+114 of 122 re-arms from the ISR, on I/O APIC input 19, reached through `D29IR` and PIRQD.
+
+**GO-RED (source mutation, reverted):** the wrong PIRQ index (`idx + 1`) reads
+`-> pirq=E gsi=20 line=10 fw_line=11 fw_agree=no`, the entry is programmed and unmasked on input
+20 (`masked=false`), QEMU asserts input 19, and with the same 120 typed events the vector is never
+delivered: `ISRARM IRQ DEAD … (irq=0 isr_rearm=0 poll_rearm=0)` and **zero** `ISRARM armed=`
+rollups (4 on the pass). `x86-default.spec`'s `FORBID \[ioapic\] pirq .* fw_agree=no` reds the
+replay.
+
+⚠ **`ISRARM IRQ DEAD` IS NOT TRAFFIC-AWARE.** On the PASS run above it printed too — at 5011 ms,
+before the typist's first key — and then `irq=` climbed to 122. The dead verdict fires on uptime
+≥ 5 s with zero deliveries, and an idle interrupt-IN endpoint that NAKs completes no qTD, so a
+correct route on a quiet bus reads DEAD. Read it together with the rollup that follows, never alone.
+
+### 9.4 Boot time (M3)
+
+`BPACE: ehci-hid-done` is stamped when `ehci::init` returns (`arch/x86_64/pci.rs:851`), and
+`isr_arm_controller` runs at the very END of that init, after every endpoint is armed. The
+interrupt therefore cannot shorten `d=`: enumeration is synchronous and finished before the vector
+exists. Measured on `2eb57454`, six runs, fast mode, load 14–18, all rc=0 — polled
+(`UNAOS_WC=1 ./arroyo test 120`) `d=290/316/336 ms`, routed (`UNAOS_IOAPIC=1` + the typist)
+`d=338/321/346 ms`. No drop; the brief's "`ehci-hid-done` drops" did not hold and could not. What
+the route buys is the re-arm: 112–114 of 120–122 re-arms from the ISR on every routed run.
+Record: `docs/dev/evidence/rmbp-0915/ioapic2/IOAPIC2.md`.
+
+### 9.5 What only the glass can prove (flight 13)
+
+QEMU proves the derivation and the delivery on ICH9's model. It cannot prove any of these, and
+the flight reads them off the wire:
+
+- the rMBP LPC bridge's id is in `pch7`'s range (`[ioapic] pirq bdf=0:31.0 id=8086:1e??
+  family=pch7` — no capture carries the id yet);
+- Apple's `D29IR` and `PIRQ[n]_ROUT` values, and whether IRQEN is clear on the PIRQ the EHCI's
+  INTA lands on (`pirq-disabled` is the refusal if not);
+- that I/O APIC input 16+n actually delivers on the PCH (QEMU's model asserts it; the silicon is
+  the claim);
+- that the level-triggered line is not shared with a function that asserts and is never
+  acknowledged (a storm on vector 0x43 would be that);
+- the internal trackpad's dark window with the ISR live (`EHCIDARK`).
+
+**Flight-13 line list** (image built with `UNAOS_IOAPIC=1`):
+
+```
+[ioapic] census ioapics=1 isos=2 gsis=24 nmis=8 dropped=0 madt_entries=11          (as flight 12)
+[ioapic] pirq bdf=0:31.0 id=8086:1e?? family=pch7 rcba=0xfed1c000 pirqa=… pirqh=…
+         fn=0:29.0 pin=INTA d29ir=0x…  -> pirq=<X> gsi=<16..23> line=<n> fw_line=0 fw_agree=n/a
+    or   … -> pirq=<X> REFUSED reason=pirq-disabled
+[ioapic] route bdf=0:29.0 pin=INTA line=0 -> gsi=<16..23> via=pirq polarity=active-low trigger=level
+[ioapic] armed bdf=0:29.0 gsi=<n> vector=0x43 masked=false … intx_disable=0 routed=1
+:: EHCI-HID: [1] ISRARM armed via=ioapic-intx gsi=<n> vector 0x43, USBINTR … -> …
+:: EHCI-HID: ISRARM armed=<k> refused=… irq=<moving> isr_rearm=<moving> poll_rearm=…
+    or on refusal:
+:: EHCI-HID: [1] ISRARM REFUSED reason=pirq-disabled — MSI: …; INTx: …
+```
+
+The same list for 0:26.0 (`d26ir=`) if EHCI #2 reaches `isr_arm_controller` (flight 12 printed
+no ISRARM line for `[0]` at all). If the flight prints `pirq-disabled`, the next rung's question
+is whether input 16+n delivers regardless — the datasheet's APIC mapping does not pass through
+`PIRQ[n]_ROUT` — and that is a metal measurement.

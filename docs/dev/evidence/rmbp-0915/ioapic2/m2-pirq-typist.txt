@@ -1,0 +1,11 @@
+[qmp] waiting up to 300s for ':: EHCI-HID: [0] M2 armed keyboard' in target/serial.log
+[qmp] marker ':: EHCI-HID: [0] M2 armed keyboard' seen at +5.8s
+[qmp] boot 3.0s, then type '' (enter=False)
+[qmp] burst 1/6: 20 events (stall key 'f11' + 9 pairs over ['a', 'b']), one command each, 20 ms apart, 400 ms total
+[qmp] burst 2/6: 20 events (stall key 'f11' + 9 pairs over ['a', 'b']), one command each, 20 ms apart, 400 ms total
+[qmp] burst 3/6: 20 events (stall key 'f11' + 9 pairs over ['a', 'b']), one command each, 20 ms apart, 400 ms total
+[qmp] burst 4/6: 20 events (stall key 'f11' + 9 pairs over ['a', 'b']), one command each, 20 ms apart, 400 ms total
+[qmp] burst 5/6: 20 events (stall key 'f11' + 9 pairs over ['a', 'b']), one command each, 20 ms apart, 400 ms total
+[qmp] burst 6/6: 20 events (stall key 'f11' + 9 pairs over ['a', 'b']), one command each, 20 ms apart, 400 ms total
+[qmp] bursts done: 120 events total = expected reports if none were lost
+[qmp] sentinel 'f12' pressed after 1.0s quiet

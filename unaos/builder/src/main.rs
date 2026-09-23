@@ -1373,7 +1373,16 @@ fn main() {
     // controller unless a scout knob asks for one).
     let ehcihid = std::env::var("UNAOS_NOEHCIHID").is_err();
     if std::env::var("UNAOS_EHCISCOUT").is_ok() || std::env::var("UNAOS_EHCICONFIG").is_ok() || ehcihid {
-        cmd.arg("-device").arg("usb-ehci,id=ehci");
+        // IOAPIC2 (rmbp-ledger B191): under UNAOS_IOAPIC the controller sits where the 7-series PCH
+        // puts EHCI #1 — 0:29.0, device 0x1d — so the ICH9 LPC's D29IR and PIRQ[n]_ROUT registers
+        // describe it and `ioapic::pirq_gsi` routes it the way it routes the rMBP's 0:29.0. Anywhere
+        // else it lands on QEMU's next free slot (0:3.0), which no chipset register describes, and
+        // only firmware's Interrupt Line could route it. Unarmed runs are byte-for-byte unchanged.
+        let ioapic_lane = std::env::var("UNAOS_IOAPIC").is_ok();
+        cmd.arg("-device").arg(if ioapic_lane { "usb-ehci,id=ehci,addr=1d.0" } else { "usb-ehci,id=ehci" });
+        if ioapic_lane {
+            println!("   UNAOS_IOAPIC: usb-ehci placed at 0:29.0 (addr=1d.0), the PCH's EHCI #1 slot — the chipset PIRQ route's QEMU target");
+        }
         if ehcihid {
             println!("   EHCI-HID (default-on): usb-ehci controller attached — EHCI HID driver target (usb-kbd rides the ehci bus; UNAOS_NOEHCIHID=1 to opt out)");
         } else if std::env::var("UNAOS_EHCICONFIG").is_ok() {
