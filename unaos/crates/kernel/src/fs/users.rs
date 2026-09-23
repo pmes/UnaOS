@@ -1697,3 +1697,12 @@ pub fn login_rand_fixture() {
     let ok = distinct && nonzero && same_source && salts_differ && cleaned;
     serial_println!(":: LOGIN-RAND: source={} distinct={} nonzero={} same_source={} salts_differ={} draws={} epoch_bits=64 -> {} ::", sa.name(), distinct, nonzero, same_source, salts_differ, crate::rand::draws(), if ok { "PASS" } else { "FAIL —" });
 }
+
+/// ARMUSERS (rmbp-ledger B188) — has [`service`] latched for this boot (the store loaded and, under
+/// `loginst`, the fixture chain ran; or the bound of mount refusals was reached and said so)? The
+/// aarch64 virt GICv3 path polls its own bounded storage pass until this answers `true`, because that
+/// path diverges into the CAPSTONE terminus before any main loop exists to keep calling `service`
+/// (`main.rs::virt_users_pass`). One relaxed load; tail append, so no `Location` above moves.
+pub fn serviced() -> bool {
+    SERVICED.load(core::sync::atomic::Ordering::Relaxed)
+}
