@@ -847,56 +847,57 @@ fn next_free_name(fs: &FatFs, dir: u32) -> Result<String, Refusal> {
     Err(Refusal::AllTaken(vol_id(fs)))
 }
 
-// ─────────── SCRSHOT-DESKTOP (R60) — THE NAME, AND WHAT 8.3 COSTS US TO SAY IT ────────────
+// ─────────── FATLFN (R60) — THE NAME, AND WHAT IT COST TO BE ABLE TO SAY IT ───────────────
 //
 // **WHAT A MAC WRITES:** `Screenshot 2026-09-22 at 17.31.02.png`. Thirty-six characters, a space,
-// two of them, and three dots. **WHAT THIS FILESYSTEM CAN WRITE:** an 8.3 short name and nothing
-// else — `fs/fat.rs:118` says it outright, *"this driver's create path writes 8.3 names only (VFAT
-// LFN write is out of scope)"*, and `format_83` (`fs/fat.rs:325`) enforces base `1..=8`, extension
-// `0..=3`, one dot, legal short-name bytes. The Mac name is not merely long: every one of its
-// separators is illegal here. So there is no clever encoding that gets us Peter's name; there is a
-// MISSING FEATURE, and the honest thing is to name it rather than to pack a cryptogram.
+// two of them, and three dots. **AND WHAT THIS FILESYSTEM WRITES, SINCE 2026-09-22:** the same
+// thing. For the fourteen hours between SCRSHOT-DESKTOP and FATLFN this block said the opposite,
+// and it was true then: `format_83` (`fs/fat.rs`) enforces base `1..=8`, extension `0..=3`, one
+// dot, legal short-name bytes, and the Mac name is not merely long — every one of its separators
+// is illegal in an 8.3 field. That was a MISSING FEATURE, named here rather than packed around.
 //
-// **THE MISSING FEATURE IS LFN WRITE, AND THE READ HALF IS ALREADY BUILT.** `fs/fat.rs`'s `LfnBuf`
+// **THE FEATURE WAS LFN WRITE, AND THE READ HALF WAS ALREADY BUILT.** `fs/fat.rs`'s `LfnBuf`
 // decodes the 0x0F-attribute VFAT component slots that precede a short entry and checksum-validates
-// the run against that short name (PI-FS-3); `DirEntry::eq_name` (`fs/fat.rs:190`) then matches
-// either spelling. What the FATLFN arc must add is the inverse of exactly that, and only that:
-// EMIT the component slots (13 UTF-16 units each, in reverse order, `LAST_LONG_ENTRY` on the first
-// written), compute the SAME one-byte checksum over the 11-byte short field the read path already
-// verifies, allocate the contiguous run of slots plus the short entry in one directory extend, and
-// mint a non-colliding `NAME~1` style alias for the short field. Not started here — this arc is the
-// DESTINATION (R60), and a write path through the directory allocator is its own arc with its own
-// crash-order argument to make. `docs/dev/OS/08_VIDEO/screenshot.md` §13 carries the same list.
+// the run against that short name (PI-FS-3); `DirEntry::eq_name` then matches either spelling.
+// FATLFN added the inverse of exactly that, and only that: EMIT the component slots (13 UTF-16
+// units each, reverse order, `LAST_LONG_ENTRY` on the first written), the SAME one-byte checksum
+// over the 11-byte short field, a CONTIGUOUS run of slots plus the short entry from an allocator
+// that grows the directory, and a non-colliding `NAME~1` alias — `SCREEN~1.PNG` for the name above.
+// Nothing in THIS file had to change but [`clock_name`]: the capture writes through
+// `create_in_dir`, and that is the function FATLFN taught to route. See `fs/fat.rs` §FATLFN and
+// `docs/dev/OS/09_FILESYSTEM/vfs.md` §16; `screenshot.md` §13 was the specification and is closed.
 //
-// **WHAT WE DO IN THE MEANTIME, AND WHY IT IS NOT A CRYPTOGRAM.** Eight characters, all digits,
-// `MMDDHHMM.PNG` — month, day, hour, minute, each zero-padded to two. `09221731.PNG` is the capture
-// Peter's Mac would have called `Screenshot 2026-09-22 at 17.31.02.png`. Three properties, in the
-// order they were weighed:
+// **DOTS WHERE A MAC WRITES COLONS, AND THAT IS THE MAC'S OWN ANSWER TOO.** `HH.MM.SS`, not
+// `HH:MM:SS`: a colon is illegal in a VFAT LONG name as well (`fat::lfn_units` refuses it), and
+// macOS writes the dotted form on a FAT volume for the same reason. Two properties survive from
+// the `MMDDHHMM.PNG` that stood here, and the third is repaired rather than defended:
 //
 //  * **It sorts chronologically.** Most-significant field first, fixed width, so a directory listed
 //    in name order is listed in time order — the single property a screenshot folder is actually
 //    used through, and the one `SCREEN<n>` also has but only by accident of creation order.
-//  * **It is READ, not decoded.** Four digit pairs in the order a human says a date is four digit
-//    pairs; nobody needs this comment to know what `09221731` is. A packing like `S0922173` (base-36
-//    minutes, a leading letter to dodge a rule) buys a field and costs every future reader, which is
-//    the trade this tree refuses on principle.
-//  * **What it drops, it drops VISIBLY.** The YEAR and the SECONDS do not fit, full stop — twelve
-//    digits into eight. A name that silently dropped them while looking complete would be worse than
-//    one that is obviously a truncation of a date. Two captures inside the same minute therefore
-//    collide, and that is handled by FALLING BACK to the `SCREEN<n>` ladder with the reason on the
-//    wire ([`choose_name`]), never by overwriting and never by lying about the minute.
+//  * **It is READ, not decoded.** `2026-09-22 at 17.31.02` is a date in the order a human says one;
+//    nobody needs this comment to read it. A packing like `S0922173` (base-36 minutes, a leading
+//    letter to dodge a rule) buys a field and costs every future reader, which is the trade this
+//    tree refuses on principle — and with 255 characters available there is no field left to buy.
+//  * **Nothing is dropped any more.** The YEAR and the SECONDS that could not fit in eight
+//    characters are both in the name, so the collision window shrank from a MINUTE to a SECOND.
+//    Two captures inside one second still collide, and that is still handled by FALLING BACK to the
+//    `SCREEN<n>` ladder with the reason on the wire ([`choose_name`]), never by overwriting, and
+//    never by lying about the moment.
 //
-// **AND TODAY IT IS THE FALLBACK THAT RUNS, ON BOTH LANES — MEASURED, NOT ASSUMED.** `clock::now()`
-// (`clock.rs:201`) answers `None` until something seeds the anchor this boot, and nothing does:
+// **AND TODAY IT IS STILL THE FALLBACK THAT RUNS, ON BOTH LANES — MEASURED, NOT ASSUMED.**
+// `clock::now()` answers `None` until something seeds the anchor this boot, and nothing does:
 // QEMU's hermetic slirp gateway answers no NTP (`:: SMOLNET: [sntp] 10.0.2.2 no reply — clock
 // unsynced ::`) and the rMBP's flight-11 capture reads `clock=unsynced` on its own menu-bar
 // witness at 43 s. There is no RTC read on either arch's boot path. So every capture today is named
-// by the ladder and says `name_from=clock-unset` for it, and the clock-stamped arm lights up for
-// free the day `date -s`, SNTP on a real network, or an RTC seeds the anchor.
+// by the ladder and says `name_from=clock-unset` for it; the clock arm is proved instead by
+// `fat::fatlfn_run`, which drives [`mac_name`] on a FIXED synthetic moment and scores the string,
+// and it lights up for real the day `date -s`, SNTP on a real network, or an RTC seeds the anchor.
 
-/// SCRSHOT-DESKTOP (R60) — `MMDDHHMM.PNG` for the current wall-clock moment, or `None` when the
-/// clock has never been set this boot.
-///
+/// FATLFN (R60) — the MAC'S OWN SPELLING for the current wall-clock moment, or `None` when the
+/// clock has never been set this boot. Was `MMDDHHMM.PNG` (SCRSHOT-DESKTOP) for exactly as long as
+/// the create path could write nothing else; `fs/fat.rs` §FATLFN writes VFAT long names now, so the
+/// truncation that dropped the year and the seconds is retired and the name is the whole moment.
 /// `None` is not an error and is not rare: see the block above — it is what BOTH lanes read today.
 /// The caller turns it into the `SCREEN<n>` ladder and a reason token, so the wire always says
 /// which naming rule produced the file rather than leaving it to be inferred from the shape.
@@ -907,11 +908,10 @@ fn clock_name() -> Option<String> {
     if !t.is_valid() {
         return None;
     }
-    Some(alloc::format!(
-        "{:02}{:02}{:02}{:02}.PNG",
-        t.month, t.day, t.hour, t.min
-    ))
+    Some(mac_name(&t))
 }
+/// FATLFN — `Screenshot YYYY-MM-DD at HH.MM.SS.png`, as a PURE function of the moment, so the fixture can score the FORMATTER on a synthetic time on a lane that has no clock. The seconds are dotted, not colonned: a colon is illegal in a VFAT long name (`fat::lfn_units` refuses it) and a Mac writes it this way for the same reason on a FAT volume. 36 chars, two spaces, three dots — three component slots plus the short entry.
+pub fn mac_name(t: &crate::clock::WallTime) -> String { alloc::format!("Screenshot {:04}-{:02}-{:02} at {:02}.{:02}.{:02}.png", t.year, t.month, t.day, t.hour, t.min, t.sec) }
 
 /// SCRSHOT-DESKTOP (R60) — **the capture's file name, and the token that says which rule made it.**
 ///

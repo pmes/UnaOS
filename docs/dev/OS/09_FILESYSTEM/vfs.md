@@ -262,9 +262,13 @@ supports grow and no-op.
 
 **Documented bounds (this arc):**
 
-* **FAT LFN write is out of scope.** `create` accepts only representable 8.3 short names
-  (`format_83`); a non-representable name is `VfsError::Unsupported`. Reading VFAT long names is
-  unchanged (that is the backend's read posture, §3.2).
+* ~~**FAT LFN write is out of scope.** `create` accepts only representable 8.3 short names
+  (`format_83`); a non-representable name is `VfsError::Unsupported`.~~ **CLOSED by FATLFN
+  (2026-09-22) — see §16.** `create` now accepts any legal VFAT long name and writes the component
+  run; only a name `lfn_units` refuses (a control byte, one of `" * / : < > ? \ |`, a leading or
+  trailing space, a trailing dot, or past 255 UTF-16 units) is still `VfsError::Unsupported`. The
+  backend needed no change at all: `FatBackend::create` calls `create_in_dir` (`vfs.rs:1321`,
+  `:1372`), and that is the function FATLFN taught to route.
 * **No non-zero in-place shrink.** `0 < size < current` is `VfsError::Unsupported` on both
   backends — neither carries an in-place shrink primitive. For **native**, even shrink-to-zero is
   `Unsupported`: doing it by unlink+recreate would DROP the per-object ACL, the one thing the
@@ -1435,3 +1439,139 @@ epoch behind this file's arch gate. Wire proof: `:: QUARRYSTAMP: … -> PASS ::`
 each of the two refusal shapes. It runs over `vfs::nsgen_mock_table()`'s in-RAM volume rather than the
 boot disk deliberately: the claim is about the seam, not the medium, and a live-FAT fixture on x86
 would owe a new row in `fs/fat.rs`'s X86 FAT-MUTATOR ROSTER (see `NsMockBackend`'s header).
+
+## 16. FATLFN (2026-09-22, R60) — the FAT create path writes VFAT long names
+
+**The direction.** Peter, R60: a screenshot lands on the Desktop like a Mac's. SCRSHOT-DESKTOP moved
+the folder and stopped at the name, because `Screenshot 2026-09-22 at 17.31.02.png` is thirty-six
+characters with two spaces and three dots and **every one of those separators is illegal in an 8.3
+short name**. That was never a naming preference; it was a missing driver feature, and `fs/fat.rs`
+said so in its own source (*"this driver's create path writes 8.3 names only"*).
+`docs/dev/OS/08_VIDEO/screenshot.md` §13 wrote the specification. This section is what landed.
+
+### 16.1 The read half is the specification, and it was not touched
+
+PI-FS-3 built the reader: `LfnBuf` (`fs/fat.rs`) accumulates the `0x0F`-attribute component slots
+that physically PRECEDE a short entry, requires them **contiguous and descending N..1** with one
+shared checksum, validates that checksum against the short entry's 11 name bytes (`lfn_checksum`),
+and decodes UTF-16 → UTF-8; `DirEntry::eq_name` then matches EITHER spelling.
+
+The writer is the **pre-image of that reader**. It is not a second reading of the Microsoft spec —
+it is written so that `LfnBuf`, unchanged byte for byte, accepts what it produces. That is the whole
+correctness argument, and it is why the fixture's read-back goes through the ordinary lookup rather
+than through a private parser: a create that writes a run its own reader would reject fails **at the
+create**, not later, at whatever opens the file.
+
+### 16.2 The four pieces
+
+| # | piece | function | the thing that could go wrong, and what stops it |
+|---|---|---|---|
+| 1 | the units | `lfn_units` | it **refuses, it does not repair**. Windows silently strips trailing dots and edge spaces; doing that here would store a name other than the one the caller asked for, and every caller in this tree (`prtscr`'s no-overwrite ladder above all) asks `locate_in_dir` for the name it is about to create and reads `NotFound` as permission. `"a.txt "` is `Unsupported`, loudly, at the create |
+| 2 | the alias | `lfn_short_alias` | the `~n` is chosen **by lookup**, never by counting entries or trusting `~1`. The short field is what every component slot's checksum is computed over, so a collision does not merely duplicate a name — it makes one file's run validate against the other's short entry |
+| 3 | the run | `free_run_in_dir` + `free_run_or_grow` | `n + 1` **contiguous** free slots, crossing sector and cluster boundaries, because `walk_dir_sectors` enumerates the chain in directory order and a 255-character name needs 21 slots where a 512-byte sector holds 16. Any live slot resets the run. No run → append clusters and re-scan |
+| 4 | the order | `write_lfn_run` | component sectors first, the short entry's sector **last** |
+
+**`NAME~1`, worked.** `Screenshot 2026-09-22 at 17.31.02.png` → extension from the LAST dot → `PNG`;
+basis from what precedes it, with spaces and embedded dots DROPPED and any byte `to_upper_83` refuses
+mapped to `_`, capped at 8 → `SCREENSH` (the cap lands mid-word, which is ordinary); base truncated to
+`8 - len("~1")` = 6 → **`SCREEN~1.PNG`**. That is what an 8.3-only reader sees, and the fixture pins it
+literally for exactly that reason.
+
+### 16.3 The FAT16 fixed root refuses, and the refusal is the FORMAT's
+
+`free_run_or_grow` returns `NoSpace` immediately when the directory is the FAT16 fixed root, because
+that root is a fixed region sized at format time by `BPB_RootEntCnt`, living before the data area,
+with no FAT entry of its own and nowhere to grow into. A FAT32 root **is** a cluster chain
+(`BPB_RootClus`) and grows like any other directory; a subdirectory on either variant is a chain and
+grows. This is the same asymmetry FATGROW documented for the single-slot case, reached by the same
+code — `grow_dir_chain`, unchanged.
+
+### 16.4 The crash order, and why an orphan run is the safe residue
+
+The run is written **sector by sector in directory order**, so the sector holding the short entry —
+always the run's last slot — is written last. Three states are possible at any instant:
+
+* **nothing written** — the directory is exactly as it was;
+* **some component sectors written, the short entry's not** — an **ORPHAN RUN**. `LfnBuf` accumulates
+  it and discards it, because the next short entry's checksum cannot match; and when the create was
+  appending (the ordinary case) the run sits before the `0x00` terminator, so the walk ends before any
+  short entry is reached at all. A reader sees the directory it saw before. The cost is wasted slots;
+* **everything written** — the entry exists, complete, with its name.
+
+What **cannot** happen is a short entry with a half-written run — the state that would mislabel a
+file — because the short entry is written last and one sector write is atomic at the medium. When the
+run and the short entry share one sector (four slots in a sixteen-slot sector is the ordinary
+screenshot case) there is a single write and the intermediate state does not exist at all.
+
+### 16.5 The locator was long-name-blind, and that was a live defect
+
+`locate_in_dir_sectors` classified each slot with the bare `classify_dir_slot`, which never attaches
+a long name, so **`locate_in_dir(dir, "<a long name>")` answered `NotFound` for an entry `read_dir`
+listed under that exact spelling.** The two walkers disagreed about what a directory contains, and
+`screenshot.md` §5 asserted a property the locator did not have (*"the lookup goes through the
+filesystem because `locate_in_dir` matches on both the 8.3 short name and any long name"*). FATLFN
+factored the per-slot sequence out of `scan_dir_sector` into `classify_dir_slot_lfn` and gave both
+walkers the one rule. Without this the arc would have been worse than useless: `prtscr` would have
+created a duplicate Mac-named file on every capture.
+
+### 16.6 What is NOT here
+
+* **DELETE does not reclaim the component slots.** `delete_located` marks the SHORT entry `0xE5` and
+  leaves the run. Safe — an orphan run is discarded on the checksum, and a fresh run's
+  `LAST_LONG_ENTRY` slot calls `reset()` — but it wastes slots until the directory is rewritten. A
+  real VFAT driver tombstones the run too.
+* **RENAME does not rewrite the run.** `rename_entry` rewrites the 11-byte short field, changing the
+  checksum the preceding run was stamped with, so the long name falls away and the entry reads back
+  under its new short name.
+
+Both are changes to paths this arc does not own; both are ledgered as **rmbp-ledger B173**.
+
+### 16.7 The fixture
+
+`fat::fatlfn_witness_once`, `witness`-gated, one-shot from `fat::probe_once` — the only pass in
+`fs/fat.rs` with a live block device, a task stack and no driver lock held, and the pass the x86
+DEFAULT lane reaches. It works inside one scratch subdirectory of the volume root and removes it, so
+the root census `probe_once` prints two statements later is byte-for-byte what it was.
+
+Eight legs: the **formatter** (`prtscr::mac_name` on a fixed synthetic moment — the QEMU lane has no
+wall clock, so this is the only place the Mac spelling gets exercised at all); the **create** through
+the ordinary `create_in_dir`, so the dispatch is part of the claim; the **alias** read off the medium
+through `classify_dir_slot`; the **run on disk** (attribute, ordinals, `LAST_LONG_ENTRY`, checksum —
+each convicted by name rather than as "the name came back wrong"); **read-after-write on a FRESH
+mount**; **the alias resolving to the SAME slot**; the **torn write** (cut after 2 of 3 slots: the
+create returns `Io`, no entry appears, and the orphan slots ARE on the medium — the last clause is
+what stops a writer that wrote nothing from passing); and **teardown**.
+
+Wire, pinned in `unaos/scripts/specs/x86-default.spec`:
+
+```
+:: FAT-LFN: created=Screenshot 2026-09-22 at 17.31.02.png slots=3 alias=SCREEN~1.PNG readback=ok alias_readback=ok checksum=ok torn_k=2 orphans_ignored=ok -> PASS ::
+```
+
+`SKIPPED` is also FORBIDden on that lane: it is the correct answer on a read-only medium (the rMBP's
+own boot volume) and the wrong one here, and a default leg that starts skipping has lost its writable
+volume — which would otherwise read as green.
+
+### 16.8 The host-side read-back — a real VFAT driver reads our bytes
+
+Our reader agreeing with our writer is a closed loop. The decisive evidence is an INDEPENDENT VFAT
+implementation, so leg 9 re-creates one long-named file after the teardown and leaves it on the
+medium, announcing it on its own line (kept off the pinned verdict so the spec's regex is unchanged):
+
+```
+:: FAT-LFN: artifact left on the medium for the HOST-SIDE read-back: /LFNTEST/Screenshot 2026-09-22 at 17.31.02.png (8.3 alias SCREEN~1.PNG) — … ::
+```
+
+The default x86 medium is `unaos/builder/usb-boot.img`: MBR at LBA 0, FAT32 in slot 1 at LBA 2048 =
+byte offset 1048576. After the run:
+
+```
+MTOOLS_SKIP_CHECK=1 mdir -i unaos/builder/usb-boot.img@@1048576 ::/LFNTEST
+```
+
+mtools prints the 8.3 alias in its own column and the long name beside it, which is exactly the
+double reading this arc has to earn: `SCREEN~1 PNG   0  …  Screenshot 2026-09-22 at 17.31.02.png`.
+
+The residue cannot accumulate: the builder rebuilds `usb-boot.img` from scratch on every
+`./arroyo test`, and on a persistent card the fixture's step 0 pre-teardown removes it before
+anything is measured — FATGROW's pattern, for FATGROW's reason.
