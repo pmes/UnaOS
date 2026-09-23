@@ -288,3 +288,97 @@ volume=el0-fat(…)` once its block device answers, before or after the screen's
 screen's `submit` loads the store itself), and with `loginst` the same verdict lines as above. If no
 `[users] load` line appears on an Orin login boot, the console pump never saw a block device, and the
 row that owns the line is B188.
+
+## 8. Boot 13: root at boot, `adduser`, Log Out, the screen, the user (LOGIN13, rmbp-ledger B189, R63)
+
+Peter, flight 12 on the glass (RULINGS R63, verbatim there): *"for boot 13 lets boot into root like we
+have been i will add my user and log out then log into the user account"*. Flight 12 booted a `login`
+image and the screen opened at 8.4 s as a WINDOW over a live desktop (`[login] screen open window=2
+box=1330x764 at (775,345)`), offering create-first-user, and never had the keyboard: its keys went to
+`[wc-c] focus tab-cycle` and the desktop. §7's prediction (the create form at boot) is superseded by
+this section.
+
+### 8.1 The flow
+
+1. **Root at boot.** The two boot-time ignitions that opened the screen (`main.rs`, the x86
+   `x86_render_service` and the Pi `render_service`) call `users::boot_session(desktop)`, which opens
+   nothing and says so: `[login] boot session=root desktop=<b> screen=closed`. "Root" is the state the
+   code already had and did not name — no user session (`SESSION_LOCAL.1 == 0`; x86 `SESSION_USER ==
+   0`; aarch64 `PrincipalRecord::NONE`), programs stamped uid 0, which the ACL treats as anonymous.
+   LOGIN13 gives it a name (`users::root_session()`) and one bit of lifetime (`ROOT_LIVE`: true from
+   boot; cleared by its Log Out or by a user login from it; never set again this boot — there is no
+   root row and no root credential; root is reached by booting). Nothing about what uid 0 may open
+   changed. The SO43 seam (`screen_open_at_ignition`: the Tegra desk cascade, the virt pass) is
+   untouched; R63 is a ruling about boot 13.
+2. **`adduser <name>`, root only.** A host verb (`shell.rs`, `midden_core::HOST_VERBS`). The caller is
+   root when `root_session()` answers true, checked before the password is asked for and again at the
+   write. The NAME is on the line; the PASSWORD is asked for, twice, by `users::prompt_key`, which
+   `main.rs::handle_key` offers every key first — nothing is echoed, nothing reaches `history`, the
+   `[midden] cmd=` witness or the wire. `adduser <name> <pw>` is refused (`reason=password-on-line`):
+   `login`'s typed-line password is recorded in those three places before any verb runs. The row goes
+   through the same `create_user`, and `ensure_home` makes `/home/<name>` at once.
+3. **Log Out** — the crystal's row (`Verb::LogOut` -> `login::reopen_after_logout`) or the shell's
+   `logout` (`users::log_out_to_screen`, which calls the same function). Refused while the store has
+   nobody to log in as (`[users] logout REFUSED session=root reason=no-users`). Otherwise the root
+   session closes: x86 ends every running program stamped uid 0 in the root epoch (the SECLOGIN M3
+   walk, `session_logout_as(true)`) — the desktop's own `STAT.ELF` included — then the epoch bumps.
+4. **The screen**, on a real `wm` row, and the ONLY taker of input: x86's key router
+   (`wc_route_event`) hands every key to the screen before the Esc/Quarry doors, the Tab focus ring and
+   the focused ring (flight 12's defect), exactly as `wc_click_route_at` already did for presses
+   (SO44). The screen creates nobody (R63: *"more an installer thing"*). While the screen is up or the
+   `adduser` prompt is live, `USB-DEBUG: KEY` and the `[serialdoor] key=` witness withhold the byte.
+5. **The user logs in** through the screen and lands in `/home/<name>` (`[users] home=/home/<name>
+   exists`). A wrong password is `[login] denied user=<name>` and nothing else.
+
+What is NOT "over nothing": kernel windows (the console, the shell, Quarry) are not programs and stay
+on the desktop beneath the screen; the screen takes every key and press regardless. `STAT.ELF` is not
+relaunched when the user logs in (owed, B189). The aarch64 root arm is owed: aarch64 stamps no epoch on
+a non-user program (`session_restamp` is a no-op with no session), so root's programs cannot be
+selected there and its Log Out ends what it always ended.
+
+### 8.2 What proves it, and where
+
+| Claim | QEMU (the x86 login lane, `x86-login.spec` §10) | Waits for the glass |
+|---|---|---|
+| boot opens no screen | the boot's own line (`desktop=false`, printed by `main.rs` only) + `:: LOGIN-BOOTROOT:` driving the seam with `desktop=true`; go-red: the old open put back in the seam | `desktop=true screen=closed` on the rMBP after the Kepler takeover |
+| `adduser` | `:: LOGIN-ADDUSER:` (real verb, real prompt; `echo=none`, `verify=ok`, four refusals); FORBID of the typed passwords on the wire; go-red: the root check inverted | Peter typing at the EHCI keyboard into the shell window |
+| root's Log Out | `:: LOGIN-ROOTOUT:` (empty-store refusal; STAT.ELF launched in root and ended; screen on a real row; `adduser` then `not-root`) | the desktop's own STAT.ELF ending; the crystal row pressed with the trackpad (MOUSEHALT's) |
+| the screen takes the keyboard | `:: LOGIN-ROOTOUT:` `keys_routed=true name_typed=true tab=password` through the live `wc_route_event`; go-red: the fold deleted | `[login] key taken by the screen` and a session on the metal |
+
+### 8.3 FLIGHT-13 LINE LIST — the wire Peter's sitting must show, in order
+
+Image: `UNAOS_LOGIN=1`, no `loginst`. `<n>` is any number; `…` is the line's fixed explanatory tail.
+Lines 1 and 2 may come in either order (the render service starts before the SD card mounts on this
+bench); every other line is in this order.
+
+```text
+ 1  [login] boot session=root desktop=true screen=closed (R63: …)
+ 2  [rand] source=rdrand probe=cpuid.01h.ecx.30=1 bits=256     (immediately before the load; §4 row 6's prediction for Ivy Bridge)
+    [users] load volume=el0-fat(rw) src=<none|dat> users=<n> …
+    — Peter, in the shell window: adduser <name>
+ 3  :: [midden] cmd="adduser <name>" -> Host verb=adduser ::
+    — the prompt; while he types it and the retype, a `usbdebug` image prints `USB-DEBUG: KEY withheld (…)`
+      per key, and no byte of the password appears anywhere on the wire
+ 4  [users] kdf calibrated iters=<n> ms=<~250> …          (first KDF use of the boot)
+ 5  [users] home=/home/<name> created volume=<8 hex>
+ 6  [users] adduser user=<name> id=<uid> home=/home/<name> created=true (R63: …)
+    — Peter: Log Out (crystal row, or `logout` in the shell)
+ 7  :: SHARD: log out — the session closes and the login screen returns ::   (crystal route only)
+ 8  [users] session-end pid=<n> slot=<n> user=0 windows=<n> kill="…" ended=true   (one per root program; STAT.ELF at least)
+ 9  [users] root session closed ended=<n> windows=<n> (R63: …)
+10  [users] logout epoch=2 ended=<n> windows=<n> (SO37: …)
+11  [login] logged out — screen returns
+12  [login] screen open window=<n> box=<w>x<h> at (<x>,<y>)
+    — Peter types at the screen
+13  [login] key taken by the screen (…)
+    [login] press at=(<x>,<y>) control=<…> answered=<n> swallowed=<n> (…)   (only if he presses; the trackpad is MOUSEHALT's)
+    [login] denied user=<name> (…)                          (only on a wrong password — never with `reason=`)
+14  [users] home=/home/<name> exists volume=<the serial of line 5>
+15  [users] login ok user=<name> id=<uid of line 6> principal=user:<name>#<uid>
+16  [login] session open user=<name>
+```
+
+The sitting FAILS on any of: a `[login] screen open` line before line 11; `[login] boot … screen=open`;
+any byte of the password on the wire; `[login] denied … reason=`; `[users] adduser REFUSED … reason=not-root`
+before line 9; `[users] logout REFUSED session=root` after line 6 (it is correct — and expected — only if
+he logs out before adding a user). If line 2 reads `users=0`, a Log Out before line 6 is refused by design.
