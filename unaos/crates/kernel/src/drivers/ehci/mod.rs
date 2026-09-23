@@ -19,7 +19,7 @@
 //! ISRARM (2026-08-22) — **that poll is no longer the only thing that re-arms an endpoint, and this
 //! line used to say the opposite.** It read *"No interrupts: no USBINTR write, no IDT vector, no
 //! MSI"*, and all three are now false by design: `USBINTR.USBINT` is unmasked, IDT vector
-//! `EHCI_MSI_VECTOR` is registered, and each controller's MSI is routed to the local APIC. The
+//! `vectors::of("ehci")` is registered, and each controller's MSI goes to the local APIC. The
 //! driver still takes no OTHER interrupt — error, port-change and frame-rollover causes stay masked
 //! and are handled by the poll exactly as before. The polled pass remains the LOAD-BEARING path and
 //! the sole fallback: on a controller with no MSI capability, or a boot where the vector is never
@@ -15111,7 +15111,7 @@ unsafe fn isr_service_ep(slot: usize, now_ms: u64) {
     ep.claim.store(0, Ordering::Release);
 }
 
-/// The EHCI MSI handler's driver half (IDT vector `EHCI_MSI_VECTOR`). Acknowledge every armed
+/// The EHCI MSI handler's driver half (IDT vector `vectors::of("ehci")`). Acknowledge every armed
 /// controller's status register so it can raise again, then lift and re-arm every endpoint that
 /// completed. Lock-free, allocation-free, print-free, and bounded at `ISR_MAX_EPS` endpoints.
 ///
@@ -15163,14 +15163,14 @@ unsafe fn isr_arm_controller(idx: usize, bus: u8, dev: u8, func: u8, op: u64) {
     if idx < MAX_CONTROLLERS {
         ISR_OP[idx].store(op, Ordering::Relaxed);
     }
-    let msg_addr = 0xFEE0_0000u32 | ((crate::arch::x86_64::apic::apic_id() as u32) << 12);
+    let msg_addr = 0xFEE0_0000u32 | ((crate::arch::x86_64::apic::apic_id() as u32) << 12); let ehci_vec = match crate::arch::interrupts::vectors::of("ehci") { Some(v) => v, None => { ISR_REFUSED.fetch_add(1, Ordering::Relaxed); if idx < MAX_CONTROLLERS { ISR_OP[idx].store(0, Ordering::Relaxed); } serial_println!(":: EHCI-HID: [{}] ISRARM REFUSED — this kernel allocated no `ehci` interrupt vector, so there is no number to program into an MSI message or a redirection entry and no handler to deliver to. The endpoint stays on the POLLED re-arm path, which is unchanged == witness ::", idx); return; } }; // VECTORS (rmbp-ledger B168) — SAME-LINE FOLD (B94), so this file stays line-neutral and no `panic::Location` moves. The completion vector is now ASKED FOR rather than named: `EHCI_MSI_VECTOR` is gone and `vectors::of("ehci")` is the IDT's THIRD allocation, which is 0x43 — the same number, because `ipi` reserves 0x42 before the first `alloc` runs. Both controllers get the SAME answer, deliberately and exactly as before: a name owns one vector, MSI carries no cause, and the handler acknowledges every armed controller's USBSTS anyway. The `None` arm cannot be reached on a built kernel (the seed is unconditional and this whole file is `ehcihid`-gated, which is the same gate the seed carries); it exists so this driver can never program a number nobody registered a handler for.
     if !crate::drivers::pci::PciScanner::enable_msi(
         bus,
         dev,
         func,
         msg_addr,
-        crate::arch::interrupts::EHCI_MSI_VECTOR as u32,
-    ) && !crate::arch::x86_64::ioapic_route_intx(bus, dev, func, crate::arch::interrupts::EHCI_MSI_VECTOR) { // IOAPIC (rmbp-ledger B147) — LINE-NEUTRAL, and this ONE term is the whole of this arc inside this file. The refusal below is now reached only when BOTH delivery paths are unavailable: MSI (no usable capability) and INTx (no I/O APIC on the machine, no INTx pin on the function, or — the case this rung deliberately cannot answer — no Interrupt Line firmware ever programmed, `reason=no-firmware-line`). Routing SUCCEEDS => the function falls through to the USBINTR unmask below UNCHANGED, because the completion vector, its IDT entry and `ehci_msi_handler` are the ones ISRARM already had — only the delivery path is new, which is why this rung adds no handler and no vector. Knob-off, `ioapic_route_intx` is a CONSTANT `false` (arch/x86_64/mod.rs, the `scanout_beam` shape), so `&& !false` folds to the expression that was here before: `./arroyo knoboff ioapic`. CODE BEFORE THE COMMENT (LEDGER P7).
+        ehci_vec as u32,
+    ) && !crate::arch::x86_64::ioapic_route_intx(bus, dev, func, ehci_vec) { // IOAPIC (rmbp-ledger B147) — LINE-NEUTRAL, and this ONE term is the whole of this arc inside this file. The refusal below is now reached only when BOTH delivery paths are unavailable: MSI (no usable capability) and INTx (no I/O APIC on the machine, no INTx pin on the function, or — the case this rung deliberately cannot answer — no Interrupt Line firmware ever programmed, `reason=no-firmware-line`). Routing SUCCEEDS => the function falls through to the USBINTR unmask below UNCHANGED, because the completion vector, its IDT entry and `ehci_msi_handler` are the ones ISRARM already had — only the delivery path is new, which is why this rung adds no handler and no vector. Knob-off, `ioapic_route_intx` is a CONSTANT `false` (arch/x86_64/mod.rs, the `scanout_beam` shape), so `&& !false` folds to the expression that was here before: `./arroyo knoboff ioapic`. CODE BEFORE THE COMMENT (LEDGER P7).
         ISR_REFUSED.fetch_add(1, Ordering::Relaxed);
         if idx < MAX_CONTROLLERS {
             ISR_OP[idx].store(0, Ordering::Relaxed);
@@ -15200,7 +15200,7 @@ unsafe fn isr_arm_controller(idx: usize, bus: u8, dev: u8, func: u8, op: u64) {
     serial_println!(
         ":: EHCI-HID: [{}] ISRARM armed — MSI vector {:#04x} -> apic {:#x}, USBINTR {:#010x} -> {:#010x} (USBINT unmasked). The polled pass REMAINS the fallback: if this vector never fires, an `ISRARM IRQ DEAD` line follows and nothing else changes == witness ::",
         idx,
-        crate::arch::interrupts::EHCI_MSI_VECTOR,
+        ehci_vec, // VECTORS (rmbp-ledger B168) — the allocated vector, same-line substitution.
         msg_addr,
         prev,
         now

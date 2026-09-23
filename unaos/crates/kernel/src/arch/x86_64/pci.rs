@@ -770,14 +770,26 @@ fn init_network() {
             return;
         }
         crate::drivers::e1000::init(bus, slot, func);
-        // Route the NIC's RX interrupt to the BSP local APIC via MSI (IDT vector 0x41),
-        // the same local-APIC delivery the xHCI uses. The e1000e keeps its MSI-X table in
-        // BAR3 (not mappable by enable_msix), so plain MSI is used.
+        // Route the NIC's RX interrupt to the BSP local APIC via MSI, the same local-APIC delivery
+        // the xHCI uses. The e1000e keeps its MSI-X table in BAR3 (not mappable by enable_msix),
+        // so plain MSI is used. VECTORS (rmbp-ledger B168): the number is ASKED FOR, not named —
+        // `vectors::of("nic")` is the vector the IDT allocated to this driver and registered
+        // `nic_msi_handler` at, and it is 0x41, exactly as the deleted `NIC_MSI_VECTOR` const was.
+        // `None` cannot happen on a built kernel (the seed is unconditional); if it ever did, the
+        // arm is REFUSED rather than programming a number nobody registered a handler for, because
+        // that delivery lands on whatever handler happens to sit at it — the silent collision the
+        // allocator exists to prevent.
         let msg_addr = 0xFEE0_0000u32 | ((crate::arch::apic::apic_id() as u32) << 12);
-        crate::drivers::e1000::enable_interrupts(
-            bus, slot, func, msg_addr,
-            crate::arch::interrupts::NIC_MSI_VECTOR as u32,
-        );
+        match crate::arch::interrupts::vectors::of("nic") {
+            Some(vector) => {
+                let _ = crate::drivers::e1000::enable_interrupts(
+                    bus, slot, func, msg_addr, vector as u32,
+                );
+            }
+            None => serial_println!(
+                ":: x86_64 PCI: NIC MSI NOT ARMED — this kernel allocated no `nic` interrupt vector, so there is no number to program and no handler to deliver to. RX stays on the polled path, unchanged == witness ::"
+            ),
+        }
     } else {
         serial_println!(":: x86_64 PCI: No network controller (class 0x02) found ::");
     }
@@ -933,12 +945,22 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
             // Route the controller's interrupts via MSI-X straight to the local APIC (no
             // 8259, no I/O APIC). init_interrupter just published the IR0/OP MMIO bases the
             // handler needs; IMAN.IE is set there and USBCMD.INTE in start(). The MSI message
-            // targets the BSP local APIC (0xFEE00000 | dest_id<<12) at IDT vector 0x40.
+            // targets the BSP local APIC (0xFEE00000 | dest_id<<12). VECTORS (rmbp-ledger B168):
+            // the vector is ASKED FOR, not named — `vectors::of("xhci")` is the IDT's FIRST
+            // allocation, so it is 0x40, exactly as the deleted `XHCI_MSI_VECTOR` const was. A
+            // `None` cannot happen on a built kernel (the seed is unconditional); if it ever did,
+            // the MSI-X table is left alone rather than pointed at a number with no handler.
             let msg_addr = 0xFEE0_0000u32 | ((crate::arch::apic::apic_id() as u32) << 12);
-            crate::drivers::pci::PciScanner::enable_msix(
-                bus, dev, func, xhci_phys_addr, msg_addr,
-                crate::arch::interrupts::XHCI_MSI_VECTOR as u32,
-            );
+            match crate::arch::interrupts::vectors::of("xhci") {
+                Some(vector) => {
+                    let _ = crate::drivers::pci::PciScanner::enable_msix(
+                        bus, dev, func, xhci_phys_addr, msg_addr, vector as u32,
+                    );
+                }
+                None => serial_println!(
+                    ":: x86_64 PCI: xHCI MSI-X NOT ARMED — this kernel allocated no `xhci` interrupt vector, so there is no number to program and no handler to deliver to. The event ring stays on the polled drain, unchanged == witness ::"
+                ),
+            };
 
             xhci.init_pointers(command_ring_phys);
 

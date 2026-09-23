@@ -33,23 +33,295 @@ const VEC_AC: u8 = 17; // alignment check
 const VEC_MC: u8 = 18; // machine check
 
 /// IDT vectors. This is a pure local-APIC system — there is no 8259 PIC, hence no PIC vector
-/// offset. The APIC timer fires `TIMER_VECTOR`, the xHCI MSI-X interrupter (interrupter 0)
-/// fires `XHCI_MSI_VECTOR`, and `SPURIOUS_VECTOR` == the APIC SVR low byte.
+/// offset. THREE numbers are RESERVED BY NAME and cannot move: the APIC timer's `TIMER_VECTOR`,
+/// the reschedule IPI's `IPI_VECTOR` (read by `smp.rs` and `sched.rs` to build the ICR word), and
+/// `SPURIOUS_VECTOR`, which IS the local APIC's SVR low byte. **Every other device vector is
+/// ALLOCATED** — see `vectors` below. There is no `XHCI_MSI_VECTOR`, `NIC_MSI_VECTOR` or
+/// `EHCI_MSI_VECTOR` const any more; a driver that wants a number ASKS for one
+/// (`docs/dev/OS/01_BOOT_HAL/vectors.md`, rmbp-ledger B168).
 pub const TIMER_VECTOR: u8 = 0x20;
-pub const XHCI_MSI_VECTOR: u8 = 0x40;
-pub const NIC_MSI_VECTOR: u8 = 0x41;
-/// Inter-processor interrupt vector (reschedule/wake; scheduler foundation). 0x41 is reserved
-/// for the NIC, so IPIs use 0x42.
+/// Inter-processor interrupt vector (reschedule/wake; scheduler foundation). Reserved by name
+/// BEFORE the first allocation runs, which is why the allocator's third answer is 0x43 and not
+/// 0x42 — the EHCI's number, unchanged across this fold.
 pub const IPI_VECTOR: u8 = 0x42;
-/// EHCI HID completion interrupt (ISRARM). 0x40-0x42 are taken by the xHCI, the NIC and IPIs, so
-/// the EHCI functions share 0x43 — both of them, deliberately: MSI carries no cause, the handler
-/// acknowledges every armed controller's USBSTS anyway, and a second vector would buy nothing but
-/// another IDT entry. See `drivers::ehci`'s ISRARM block.
-pub const EHCI_MSI_VECTOR: u8 = 0x43;
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 
+/// VECTORS (rmbp-ledger B168) — the IDT vector allocator.
+///
+/// **THE DEFECT.** Until this module the x86 kernel numbered its interrupt vectors BY HAND: five
+/// `pub const`s at the top of this file, each registered by name in the IDT below, each named
+/// again by the driver that programmed its MSI (`pci.rs` for the NIC and the xHCI,
+/// `drivers/ehci/mod.rs` for the EHCI) or — since IOAPIC, B147 — its redirection entry. The next
+/// device that needed a vector (the HDA controller's completion, an AHCI port, a second EHCI or
+/// xHCI function, the UVC isochronous pipe when CAMERA2 opens it) copied the pattern and picked
+/// the next free number BY EYE. Two drivers that picked the same one would have collided IN
+/// SILENCE: `idt[v].set_handler_fn` is a plain overwrite, so the second registration wins, the
+/// first ISR stops running, and on the wire that is INDISTINGUISHABLE from a device that never
+/// interrupted. rmbp-queue's KVBLANK row states the same defect from the other side —
+/// *"`arch/x86_64/interrupts.rs` has three hard-coded IDT vectors and no allocator a PCI function
+/// can join"*.
+///
+/// **THE WIRE DOES NOT CHANGE, and that is a requirement rather than a courtesy.** The three
+/// device vectors this kernel already had are the allocator's FIRST THREE ANSWERS, in the order
+/// the IDT seeds them: `xhci` 0x40, `nic` 0x41, `ehci` 0x43 (0x42 is `ipi`, reserved before the
+/// first `alloc` runs, so the third answer skips it). Every capture recorded on this bench is
+/// therefore byte-comparable across the fold, which is what lets a regression in the interrupt
+/// path be seen at all. A later arc may renumber — it must say so and re-pin the captures.
+///
+/// **ALLOCATION ORDER IS PINNED AT IDT CONSTRUCTION, NOT AT PROBE TIME**, and that is
+/// load-bearing: the drivers actually probe in the order EHCI (`pci::init` → `ehci::init`), xHCI,
+/// NIC, so an allocator asked at each driver's own MSI site would have answered `ehci` 0x40 and
+/// moved every number on the wire. The drivers ASK — `vectors::of("xhci")` — and the seeding
+/// decides.
+///
+/// **THE RANGE.** The allocator's domain is `RANGE_LO..=RANGE_HI` (0x30–0xEF): above the 32 Intel
+/// exception vectors and above the 0x20–0x2F band this kernel gives the APIC timer, below the
+/// 0xF0–0xFF band where the SVR's spurious vector lives. `alloc` hands out from `FLOOR` (0x40)
+/// upward and leaves 0x30–0x3F alone, for two reasons: the wire reason above, and because a
+/// vector's PRIORITY on x86 is its number >> 4 (Intel SDM Vol. 3 §10.8.3) — the low band is where
+/// a deliberately LOW-priority device belongs, not where the next arrival lands by accident.
+pub mod vectors {
+    use super::{IPI_VECTOR, SPURIOUS_VECTOR, TIMER_VECTOR};
+    use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+    use spin::Mutex;
+    use x86_64::structures::idt::{HandlerFunc, InterruptDescriptorTable};
+
+    /// The allocator's domain, inclusive. Nothing outside it is ever chosen.
+    pub const RANGE_LO: u8 = 0x30;
+    pub const RANGE_HI: u8 = 0xEF;
+    /// The lowest number `alloc` will hand out. See the module block for why it is not `RANGE_LO`.
+    const FLOOR: u8 = 0x40;
+
+    #[derive(Clone, Copy)]
+    struct Slot {
+        name: &'static str,
+        /// `true` = RESERVED BY NAME (timer, IPI, spurious): a number this kernel cannot move. It
+        /// is never handed out by `alloc` and is not counted in the census's `allocated=`.
+        reserved: bool,
+    }
+
+    /// vector -> owner. One entry per IDT slot, not per allocatable slot, so the two reservations
+    /// that sit OUTSIDE the range (0x20 and 0xFF) are recorded in the same table the census prints
+    /// — one table a reader can check against the IDT, never two that must be added up.
+    static TABLE: Mutex<[Option<Slot>; 256]> = Mutex::new([None; 256]);
+    /// Successful `alloc` calls. `reserve` does not count: a reservation is a number this kernel
+    /// was already born with, and folding the two would make `allocated=` unreadable.
+    static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+    /// The LOADED IDT, published by `init_idt`. A runtime `alloc` writes its entry through this
+    /// pointer, so a driver that probes late can join. Null until `init_idt` runs, and an `alloc`
+    /// before that point is REFUSED on the wire rather than writing through it.
+    static LIVE: AtomicPtr<InterruptDescriptorTable> = AtomicPtr::new(core::ptr::null_mut());
+
+    /// Publish the loaded IDT. Called by `init_idt` on every CPU; the pointer is the same on all of
+    /// them (one table, `lidt`-ed per CPU), so the repeat stores are idempotent.
+    pub(super) fn publish(idt: *mut InterruptDescriptorTable) {
+        LIVE.store(idt, Ordering::Release);
+    }
+
+    /// `(vector, reserved)` for `name`. The second field is what lets a refusal say WHICH mistake
+    /// was made — asking twice for a device name, or asking for one of the three numbers this
+    /// kernel cannot move — instead of one undifferentiated "taken".
+    fn owner(t: &[Option<Slot>; 256], name: &str) -> Option<(u8, bool)> {
+        t.iter().enumerate().find_map(|(i, s)| match s {
+            Some(s) if s.name == name => Some((i as u8, s.reserved)),
+            _ => None,
+        })
+    }
+
+    fn holder(t: &[Option<Slot>; 256], name: &str) -> Option<u8> {
+        owner(t, name).map(|(v, _)| v)
+    }
+
+    fn free_count(t: &[Option<Slot>; 256]) -> usize {
+        (FLOOR..=RANGE_HI).filter(|&v| t[v as usize].is_none()).count()
+    }
+
+    /// Reserve `vector` for `name` — a number this kernel cannot move. The caller registers the
+    /// handler itself (the three reserved entries are set in the IDT initializer exactly as they
+    /// always were); this records the OWNERSHIP, so `alloc` can never hand the number to a device
+    /// and so the census prints one table instead of two.
+    pub(super) fn reserve(vector: u8, name: &'static str) {
+        let mut t = TABLE.lock();
+        let clash = t[vector as usize].map(|s| s.name).or_else(|| {
+            holder(&t, name).map(|_| name)
+        });
+        if let Some(by) = clash {
+            drop(t);
+            serial_println!(
+                "[vectors] reserve name={} vector={:#04x} -> REFUSED reason=already-owned by={} == witness ::",
+                name, vector, by
+            );
+            return;
+        }
+        t[vector as usize] = Some(Slot { name, reserved: true });
+    }
+
+    /// The vector `name` holds, or `None` if this kernel allocated it none. **This is how a driver
+    /// asks** — there is no const left to name. A `None` is not a diagnosis the caller may ignore:
+    /// programming a device with a number nobody registered delivers an interrupt to whatever
+    /// handler happens to sit at it, which is the collision this module exists to refuse.
+    pub fn of(name: &str) -> Option<u8> {
+        holder(&TABLE.lock(), name)
+    }
+
+    /// Allocate the lowest free vector at or above `FLOOR`, register `handler` at it in the LIVE
+    /// IDT, and record `(vector, name)`. Every `None` is accompanied by a witness on the wire.
+    ///
+    /// **REFUSES a name that is already allocated or reserved**, and that refusal IS the defect
+    /// this module closes: the hand-numbered kernel would have overwritten the IDT entry and one
+    /// ISR would have stopped running, silently, with no line anywhere to say so.
+    ///
+    /// The handler is registered BEFORE the number is returned, so the caller cannot program a
+    /// device with a vector whose entry is not yet live.
+    pub fn alloc(name: &'static str, handler: HandlerFunc) -> Option<u8> {
+        let idt = LIVE.load(Ordering::Acquire);
+        if idt.is_null() {
+            serial_println!(
+                "[vectors] alloc name={} -> REFUSED reason=idt-not-loaded — `init_idt` has not published a table yet, so there is nowhere to register a handler == witness ::",
+                name
+            );
+            return None;
+        }
+        // SAFETY: `LIVE` holds the one `'static` IDT, published by `init_idt` after `lidt`. Writing
+        // a descriptor of a LOADED IDT is defined — the CPU reads the entry at DELIVERY — and the
+        // entry written here is not deliverable until its caller programs a device with the number
+        // returned below. `TABLE`'s mutex serialises the choice of slot, and each slot is written
+        // exactly once, so there is one writer per descriptor.
+        let v = alloc_in(unsafe { &mut *idt }, name, handler)?;
+        serial_println!(
+            "[vectors] alloc name={} vector={:#04x} == witness ::",
+            name, v
+        );
+        census();
+        Some(v)
+    }
+
+    /// The allocator proper. `alloc` is this against the LIVE IDT; the IDT initializer is this
+    /// against the table it is still building, which is where the first three answers are decided.
+    pub(super) fn alloc_in(
+        idt: &mut InterruptDescriptorTable,
+        name: &'static str,
+        handler: HandlerFunc,
+    ) -> Option<u8> {
+        let mut t = TABLE.lock();
+        if let Some((held, reserved)) = owner(&t, name) {
+            drop(t);
+            serial_println!(
+                "[vectors] alloc name={} -> REFUSED reason=duplicate-name held={:#04x} kind={} — that name already owns a vector, and a second registration would OVERWRITE its IDT entry: one ISR would stop running and the wire would look exactly like a device that never interrupted == witness ::",
+                name,
+                held,
+                if reserved { "reserved" } else { "allocated" }
+            );
+            return None;
+        }
+        let mut chosen = None;
+        for v in FLOOR..=RANGE_HI {
+            if t[v as usize].is_none() {
+                t[v as usize] = Some(Slot { name, reserved: false });
+                chosen = Some(v);
+                break;
+            }
+        }
+        drop(t);
+        let Some(v) = chosen else {
+            serial_println!(
+                "[vectors] alloc name={} -> REFUSED reason=range-full range={:#04x}-{:#04x} floor={:#04x} — every vector this allocator may hand out is owned == witness ::",
+                name, RANGE_LO, RANGE_HI, FLOOR
+            );
+            return None;
+        };
+        idt[v].set_handler_fn(handler);
+        ALLOCATED.fetch_add(1, Ordering::Relaxed);
+        Some(v)
+    }
+
+    /// ONE line, the whole table, sorted by vector:
+    ///
+    /// ```text
+    /// [vectors] allocated=3 free=172 table=timer:0x20,xhci:0x40,nic:0x41,ipi:0x42,ehci:0x43,spurious:0xff == witness ::
+    /// ```
+    ///
+    /// `allocated=` counts `alloc` successes; the three RESERVED names appear in `table=` but not
+    /// in that count. `free=` is what `alloc` could STILL hand out — the unowned slots from `FLOOR`
+    /// to `RANGE_HI` — so it answers "how many more devices fit" rather than restating the range.
+    ///
+    /// **WHERE IT IS PRINTED, and why not later.** Every vector this kernel hands out is allocated
+    /// while the IDT is CONSTRUCTED (that is what pins the numbers), so the table is COMPLETE at
+    /// `init_idt` and the line is UNCONDITIONAL — it reaches the wire of the default image that
+    /// boots the metal whether or not a NIC, an xHCI or an EHCI was ever found, which a census
+    /// printed from a driver's own arm site could not promise. A runtime `alloc` re-prints it, so
+    /// the LAST `[vectors] allocated=` line of any capture is always the final table.
+    ///
+    /// Allocation-free (the heap does not exist yet at `init_idt`): the name list is formatted into
+    /// a fixed stack buffer, and a table too long for it ends in `,…` rather than being silently
+    /// short — `allocated=` and `free=` are exact either way.
+    pub fn census() {
+        struct Buf {
+            b: [u8; 1024],
+            n: usize,
+            cut: bool,
+        }
+        impl core::fmt::Write for Buf {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                for &c in s.as_bytes() {
+                    if self.n < self.b.len() {
+                        self.b[self.n] = c;
+                        self.n += 1;
+                    } else {
+                        self.cut = true;
+                    }
+                }
+                Ok(())
+            }
+        }
+        use core::fmt::Write;
+        let t = TABLE.lock();
+        let mut buf = Buf { b: [0; 1024], n: 0, cut: false };
+        let mut first = true;
+        for v in 0..=u8::MAX {
+            if let Some(s) = t[v as usize] {
+                let _ = write!(buf, "{}{}:{:#04x}", if first { "" } else { "," }, s.name, v);
+                first = false;
+            }
+        }
+        let free = free_count(&t);
+        let allocated = ALLOCATED.load(Ordering::Relaxed);
+        drop(t);
+        // Every byte came from a `&str`, so the slice is UTF-8 by construction; the fallback exists
+        // so a truncation that lands mid-codepoint prints a line instead of losing the census.
+        let table = core::str::from_utf8(&buf.b[..buf.n]).unwrap_or("<non-utf8>");
+        serial_println!(
+            "[vectors] allocated={} free={} table={}{} == witness ::",
+            allocated,
+            free,
+            table,
+            if buf.cut { ",…" } else { "" }
+        );
+    }
+
+    /// The three numbers this kernel cannot move, recorded before the first allocation. Split out
+    /// of the IDT initializer only so the reservation list and the seeding order read as one block.
+    pub(super) fn reserve_fixed() {
+        reserve(TIMER_VECTOR, "timer");
+        reserve(IPI_VECTOR, "ipi");
+        reserve(SPURIOUS_VECTOR, "spurious");
+    }
+}
+
+/// The IDT lives behind an `UnsafeCell` because `vectors::alloc` writes entries into it AFTER
+/// `lidt` — that is exactly what makes the allocator joinable by a driver that probes late (the
+/// HDA controller's completion, an AHCI port, the UVC isochronous pipe) rather than only by this
+/// file. Writing a descriptor of a loaded IDT is defined: the CPU reads the entry at DELIVERY, and
+/// the entry `alloc` writes is not deliverable until its caller programs the device with the
+/// number `alloc` returned. Single-writer by construction — the BSP builds the table, `TABLE`'s
+/// mutex serialises the choice of slot, and each slot is written exactly once.
+struct IdtCell(core::cell::UnsafeCell<InterruptDescriptorTable>);
+// SAFETY: see the block above. The cell is written only through `vectors`, never read except by
+// the CPU's own descriptor fetch and by `lidt`.
+unsafe impl Sync for IdtCell {}
+
 lazy_static! {
-    static ref IDT: InterruptDescriptorTable = {
+    static ref IDT: IdtCell = {
         let mut idt = InterruptDescriptorTable::new();
         idt.breakpoint.set_handler_fn(breakpoint_handler);
         // Minimal, lock-free NMI handler. LINT1 is wired as NMI (see `apic::init`), and NMIs
@@ -97,24 +369,47 @@ lazy_static! {
         idt.divide_error.set_handler_fn(divide_error_handler);
         idt.bound_range_exceeded.set_handler_fn(bound_range_exceeded_handler);
         idt.alignment_check.set_handler_fn(alignment_check_handler);
-        // All interrupts are delivered directly by the local APIC: the timer (heartbeat),
-        // the xHCI MSI-X interrupter, and the APIC spurious-interrupt vector.
+        // All interrupts are delivered directly by the local APIC: the timer (heartbeat), the
+        // allocated device vectors, the reschedule IPI, and the APIC spurious-interrupt vector.
+        //
+        // THE THREE RESERVED NUMBERS FIRST, and the order is load-bearing rather than tidy: with
+        // `ipi` recorded before the first `alloc`, 0x42 is already owned when the EHCI's turn
+        // comes, so the allocator's third answer is 0x43 — the number the deleted
+        // `EHCI_MSI_VECTOR` const carried, and the number every capture on this bench was recorded
+        // against. Their handlers are registered here, by name, exactly as they always were: a
+        // reservation records ownership, it does not install anything.
+        vectors::reserve_fixed();
         idt[TIMER_VECTOR].set_handler_fn(timer_interrupt_handler);
-        idt[XHCI_MSI_VECTOR].set_handler_fn(xhci_msi_handler);
-        idt[NIC_MSI_VECTOR].set_handler_fn(nic_msi_handler);
-        // ISRARM: the EHCI HID completion vector. Gated on the same feature as the driver that
-        // arms it, so a build without `ehcihid` carries neither the entry nor the handler — and
-        // therefore cannot be handed an interrupt it has no driver to service.
-        #[cfg(feature = "ehcihid")]
-        idt[EHCI_MSI_VECTOR].set_handler_fn(ehci_msi_handler);
         idt[IPI_VECTOR].set_handler_fn(ipi_handler);
         idt[SPURIOUS_VECTOR].set_handler_fn(spurious_handler);
-        idt
+        // THE ALLOCATOR'S FIRST THREE ANSWERS — 0x40, 0x41, 0x43, in this order, which is why the
+        // wire does not move. This is ALSO the only place the order can be pinned: the drivers
+        // probe EHCI → xHCI → NIC (`pci::init`), so an allocator asked at each driver's own MSI
+        // site would have answered `ehci` 0x40 and renumbered everything. Each driver now ASKS
+        // (`vectors::of("xhci")`) instead of naming a const.
+        let _ = vectors::alloc_in(&mut idt, "xhci", xhci_msi_handler);
+        let _ = vectors::alloc_in(&mut idt, "nic", nic_msi_handler);
+        // ISRARM: the EHCI HID completion vector. Gated on the same feature as the driver that
+        // arms it, so a build without `ehcihid` carries neither the entry nor the handler — and
+        // therefore cannot be handed an interrupt it has no driver to service. Knob-off the name
+        // is simply absent from the table, and the census says so.
+        #[cfg(feature = "ehcihid")]
+        let _ = vectors::alloc_in(&mut idt, "ehci", ehci_msi_handler);
+        // ONE census line per boot, here because here is where the table is COMPLETE and because
+        // here it is UNCONDITIONAL — see `vectors::census`.
+        vectors::census();
+        IdtCell(core::cell::UnsafeCell::new(idt))
     };
 }
 
 pub fn init_idt() {
-    IDT.load();
+    // SAFETY: `IDT` is `'static` and never moves, so the table `lidt` points at outlives every
+    // delivery. `load_unsafe` is the non-`'static` spelling of `load`; it is used because the
+    // table now lives inside an `UnsafeCell` (see `IdtCell`) and executes exactly one `lidt`.
+    unsafe { (*IDT.0.get()).load_unsafe() };
+    // Publish the loaded table so a driver that probes later can join the allocator. Idempotent:
+    // every AP calls `init_idt` and stores the same pointer.
+    vectors::publish(IDT.0.get());
 }
 
 /// Disable the legacy 8259 PIC by masking every IRQ line, so it can never assert. This is a
