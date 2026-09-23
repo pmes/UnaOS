@@ -1504,6 +1504,159 @@ PENDING :: igpu-dpy: rung=03 name=pp
 # --- carries ZERO `[wc-x] move-vacate` lines. x86-wc.spec says so in its own words.
 PENDING \[wc-x\] move-vacate .* painted=true .* -> PASS
 
+# --- METALPINS (2026-09-23, rmbp-ledger B195) — FLIGHT 12's SCORE CARD, AS DIRECTIVES ------------
+# --- SPECPINS2 (B184) pinned the QEMU lanes and named these METAL rows owed "once a flight-12 capture
+# --- exists". It exists, and until this block flight 12 was scored by a table in prose
+# --- (docs/dev/evidence/rmbp-0915/flight12/FLIGHT12.md). Every row of that table below is a directive
+# --- where a directive can honestly stand; the rows that cannot are named at the end of this block.
+# --- MEASURED ON TWO CAPTURES, both replayed with this whole file (the verdict tables are in
+# --- docs/dev/evidence/rmbp-0915/metalpins/):
+# ---   flight 12  image 4, hw-rmbp@6d8d3d2d, `f12-boot1.log` (6899 lines) — every REQUIRE/COUNT here
+# ---              GREEN; every FORBID here green.
+# ---   flight 11  image 3, hw-rmbp@56bbe53b, `f11.log` (5597 lines) — the go-red capture.
+# --- TWO KINDS OF GO-RED, and the row says which. BEHAVIOUR: both images print the family and flight 11
+# --- took the failing arm (pci-scan 1315 ms, HOLD-EXPIRED, DMG-REFUSE NOT RUN, HDA-TONE FAIL, FAT
+# --- READ-ONLY, DOCKID FAIL, dmgovlp FAIL). GENERATION: image 3 could not print the line at all
+# --- (`git grep -F` on 56bbe53b empty) — PASSPERIOD, [vectors], [ioapic], first-paint, HOLD-NONE,
+# --- [status] poll, KEYMAP, [sertx], [tp] mode, PRTSCR-DIR-FIX, the vblank selftests. That second kind
+# --- is SPECPINS2's measurement ("flight 11 has no PASSPERIOD line at all") and it is a fourth
+# --- MINIMUM-GENERATION FLOOR for this file, `6d8d3d2d`, beside the three in the header: a capture from
+# --- an image older than that reds these rows because the wire did not exist yet.
+# --- A KNOB SCOPE AXIS, beside the header's. Flight 12's MANIFEST knob line adds to flight 11's
+# --- `UNAOS_LOGIN=1 UNAOS_UVC=1 UNAOS_KEPLER_VBLANK=1 UNAOS_IOAPIC=1`; the [ioapic] rows need
+# --- UNAOS_IOAPIC, the vblank rows UNAOS_KEPLER_VBLANK, HDA-TONE UNAOS_HDA+UNAOS_HDATONE (armed on BOTH
+# --- flights, so its flight-11 red is behaviour), `src=smc` UNAOS_SMC. The MANIFEST is not in the
+# --- capture; a red here on a capture whose image lacked the knob is the wrong spec, as the header says.
+# --- NONE OF THESE REQUIRES A LINE THE LOGIN WINDOW SWALLOWED. Flight 12's login screen opened at
+# --- 8358 ms as a window over the live desktop and took every press (`[login] press … swallowed=1`),
+# --- which voided the press-driven desktop battery at 48-55 s (FLIGHT12.md §Fixtures names nine; the
+# --- capture carries five more FAIL lines: WINMENU, PULSEQUIT and `[wm-act] direct` are the same
+# --- press-driven shape and PASS on flight 11; MENUBATT (new in image 4) and GLASSFIX2 (FAIL on both
+# --- flights) are not press-driven; see B195). Those stay on the DEFAULT_FORBIDS
+# --- and on this file's existing rows (DOCK :1406, CLICK-BAND :1417, `[drag-occ]` :1335); nothing
+# --- below REQUIRES one of them. DOCKID and `[dmgovlp]` are press/drag-driven and PASSED under the
+# --- window on this capture, which is why they may stand as REQUIREs.
+#
+# --- ROW 1 — BOOTCLOCK / BPACE (B152). The BOOTCLOCK line is on both flights; its values are firmware
+# --- time and are not pinned. COUNT 1 = REQUIRE's threshold; the keyword marks, in the verdict table,
+# --- a row that does NOT separate flight 11 from flight 12 (go-red by mutation: the line deleted).
+COUNT 1 :: BOOTCLOCK: firmware->loader=\d+ms loader-read=\d+ms loader-jump=\d+ms kernel-entry=\d+ tsc_hz=\d+
+# --- `pci-scan d=` bounded under 100 ms. Flight 12: `:: BPACE: pci-scan t=5939ms d=0ms ::` (twice — the
+# --- ledger is dumped twice). Flight 11, same spelling: `:: BPACE: pci-scan t=26941ms d=1315ms ::` —
+# --- REQUIRE short and FORBID 2 hits. The REQUIRE catches the family disappearing, the FORBID the slow
+# --- arm on either dump (LAWS §5, REQUIRE a property). QEMU prints `d=0ms` too (SPECPINS2's table).
+REQUIRE :: BPACE: pci-scan t=\d+ms d=\d{1,2}ms ::
+FORBID :: BPACE: pci-scan t=\d+ms d=\d{3,}ms ::
+#
+# --- ROW 2 — VECTORS (B168). The FIRST table print (pre-Kepler); a later line on the same boot adds
+# --- `kepler-vblank:0x44` and is not what this pins. Flight 12 line 5; flight 11: generation.
+REQUIRE \[vectors\] allocated=\d+ free=\d+ table=timer:0x20,xhci:0x40,nic:0x41,ipi:0x42,ehci:0x43,spurious:0xff == witness ::
+#
+# --- ROW 3 — IOAPIC (B147, UNAOS_IOAPIC). `[ioapic] census ioapics=1 isos=2 gsis=24 nmis=8 dropped=0
+# --- madt_entries=11` and `[ioapic] id=2 addr=0xfec00000 gsi_base=0 entries=24 version=0x20 hw_id=0`.
+# --- `ioapics=0` (arch/x86_64/ioapic.rs:306) and `entries=0 … REFUSED reason=ioapicver-unreadable`
+# --- (:333) are the refusing arms and miss these patterns. Flight 11: generation.
+REQUIRE \[ioapic\] census ioapics=1 isos=\d+ gsis=24 nmis=\d+ dropped=0 madt_entries=\d+ == witness ::
+REQUIRE \[ioapic\] id=\d+ addr=0xfec00000 gsi_base=0 entries=24 version=0x[0-9a-f]+ hw_id=\d+ == witness ::
+#
+# --- ROW 5 — EHCI-HID self-tests, the metal twins of x86-default.spec:360/:361 (SPECPINS2), same
+# --- patterns. ISRARM is PASS on BOTH flights (image 3 already carried it), so it cannot separate them:
+# --- COUNT 1 plus the fixture's one decline as a FORBID (FAIL is caught by DEFAULT_FORBIDS). PASSPERIOD
+# --- is absent from flight 11 entirely — the go-red SPECPINS2 measured.
+COUNT 1 :: EHCI-HID: ISRARM self-test: modes=2 \(overlay-direct \+ qTD-chain\) depth=\d+ fifo=true payload=true rearm=true toggle=true ringfull-refuses=true -> PASS == witness ::
+FORBID :: EHCI-HID: ISRARM self-test SKIPPED
+REQUIRE :: EHCI-HID: PASSPERIOD self-test: samples=\d+ backwards-delta-refused=true tick=1000us stall=40000us -> pass_period_us_max=\d+ pass_period_us_mean=\d+ -> PASS == witness ::
+# --- The `[sertx]` census and the bcm5974 mode latch. Values (`taps_us_max=` reads 22186 on the first
+# --- census and 18-22 later) are not pinned; the presence and the latch are. `latched=no` on the
+# --- hid1.11 try followed by `latched=yes` on legacy-index0 is flight 12's healthy pair; only the
+# --- second is required. Flight 11: generation (both).
+REQUIRE \[sertx\] prints=\d+ .*taps_us_max=\d+ tap_max=
+REQUIRE :: EHCI-HID: \[\d+\] \[tp\] mode wrote=.* latched=yes
+#
+# --- ROW 4 — SDHC rw (R59, B166). The mount's own truth-table row and the FAT verdict. The FIRST
+# --- `:: SDHCPOST:` on the wire is `write-path=ABSENT -> sdhc=ro reason=no-write-path`, the pre-card
+# --- self-test (leg 8), and is deliberately not matched. Flight 11 (BEHAVIOUR for the FAT line): `FAT
+# --- mounted READ-ONLY on the internal SD card`; its SDHCPOST row is generation. These inherit the
+# --- header's CARD-PRESENCE axis: an empty reader reds them. `wp-pin=PROTECTED -> sdhc=ro reason=wp-pin`
+# --- (block.rs:3485) is a locked card, also red, and the line names why.
+REQUIRE :: SDHCPOST: posture sdw-ro=0 wp-pin=enabled write-path=live -> sdhc=rw reason=none
+REQUIRE :: SDHCBLK: FAT mounted READ-WRITE on the internal SD card
+# --- `reason=opt-out`, and HOW THIS FILE KNOWS THE KNOB: from the capture, not the MANIFEST. The
+# --- opt-out row is ONE literal compiled only into a `sdw-ro` build (`SDHC_RO_TWIN_ROW`,
+# --- drivers/block.rs:3402): `sdw-ro=1 wp-pin=unread write-path=unread -> sdhc=ro reason=opt-out`. The
+# --- knob's value is ON the line this FORBID matches, so no MANIFEST line is needed to read it. This
+# --- file's scope is the shipped polarity (R59: rw by default, the opt-out a named exception for a
+# --- cold-witness boot); a UNAOS_SDW_RO=1 capture is the wrong spec for this file, exactly like a
+# --- non-paygo capture, and this row says so by name instead of by a missing REQUIRE. 0 hits on both
+# --- flights (neither image was built with the knob); go-red by injecting the literal.
+FORBID :: SDHCPOST: posture .*reason=opt-out
+#
+# --- ROW 6 — menubar (B156, B167, B170). first-paint within a single-digit ms of enable with the
+# --- crystal drawn: `[menubar] first-paint at=6699 after_enable_ms=0 model=partial:caption+clock+batt
+# --- crystal=drawn rect=2880x34+0+0`. MENUFIRST's `crystal=absent … :: FAIL ::` at 48497 ms is one of
+# --- the nine login-voided fixtures and stays on DEFAULT_FORBIDS. Flight 11: generation.
+REQUIRE \[menubar\] first-paint at=\d+ after_enable_ms=\d model=\S+ crystal=drawn
+# --- HOLD-NONE (video/desktop_uefi.rs:786) and its predecessor forbidden. HOLD-EXPIRED has NO emitter
+# --- at 6d8d3d2d (only comments carry it), so on image 4 this FORBID is a revert guard, not a live
+# --- verdict — and it is not vacuous: flight 11 fires it (`HOLD-EXPIRED reason=dmg-refuse-unsettled
+# --- name=/STAT.ELF waited=15005ms`), BEHAVIOUR, and that line is the defect B167 removed.
+REQUIRE \[wc-x\] desktop-app HOLD-NONE name=/\S+ held_ms=0
+FORBID \[wc-x\] desktop-app HOLD-EXPIRED
+# --- The status poll answered (B170). Under QEMU it is `answered=0 src=none` (x86-wc.spec:538), so this
+# --- metal pin is the one that says the pack answers: `[status] poll n=1 answered=1 src=smc
+# --- took_us=1317`, and the bar's model carries it (`[menubar] battery pct=85 … src=smc`). Flight 11:
+# --- generation (both).
+REQUIRE \[status\] poll n=\d+ answered=[1-9]
+REQUIRE \[menubar\] battery pct=\d+ .*src=smc
+#
+# --- ROW 7 — DMG-REFUSE (B172). The metal shape: `19/19 probes from two ring-3 slots agree … — witness
+# --- OK ::` at 55191 ms. Flight 11, BEHAVIOUR: `:: DMG-REFUSE: the window table was not empty at entry
+# --- (occupied=0x01) — refusal witness NOT RUN ::` — the REQUIRE misses and the FORBID fires.
+REQUIRE :: DMG-REFUSE: SYS_WIN_PRESENT_ROWS\(33\) refused every malformed band .*19/19 probes from two ring-3 slots agree.* witness OK ::
+FORBID :: DMG-REFUSE: .*NOT RUN
+#
+# --- ROW 8 — KEYMAP (B163). Flight 11: generation.
+REQUIRE :: KEYMAP: table=crispy .* -> PASS ::
+#
+# --- ROW 9 — LOGIN, and why it is OPTIONAL. R63: boot 13 boots to the ROOT desktop with NO login screen,
+# --- and Log Out brings the screen back. A REQUIRE would red every boot from 13 on. A FORBID cannot
+# --- stand either: the boot's open (`screen_open_once`, main.rs:6380) and Log Out's open print the SAME
+# --- line (video/login.rs:501), and this grammar has no ordering, so a FORBID would red the Log Out R63
+# --- asks Peter to perform. OPTIONAL is the 0-tolerant form (COUNT 0 would enter the required tally
+# --- while being unable to fail — LAWS §5, a row that certifies nothing). Read it by hand: on a boot
+# --- nobody logged out of, a hit is the R63 defect. Flight 12: 1 hit at 8358 ms; flight 11: 0 (no
+# --- UNAOS_LOGIN).
+OPTIONAL \[login\] screen open window=\d+ box=
+#
+# --- §Fixtures — the PASS rows that stand. DOCKID (B165) and `[dmgovlp]` are BEHAVIOUR go-reds (flight
+# --- 11: `:: DOCKID: … order=false set=false … :: FAIL ::`, `[dmgovlp] verdict … -> FAIL`);
+# --- PRTSCR-DIR-FIX (R54) is generation. GLASSFIX2 is NOT here: FLIGHT12.md lists it as a PASS, but
+# --- both flights print `cascade overlaps=14|8 … -> FAIL ::` and DEFAULT_FORBIDS already reds it.
+REQUIRE :: DOCKID: .* reconciled=\d+/\d+ folds=\d+ :: PASS ::
+REQUIRE \[dmgovlp\] verdict passes=\d+/\d+ .* -> PASS
+REQUIRE :: PRTSCR-DIR-FIX: no session -> REFUSED reason=no-session .* -> PASS ::
+# --- HDA-TONE (UNAOS_HDA+UNAOS_HDATONE, armed on both flights). Flight 11, BEHAVIOUR: `:: HDA-TONE:
+# --- lpib_advanced=1 bcis=0 tag_ok=1 fifo_ready=1 run_ms=1200 -> FAIL ::`. The `-> REFUSED` arms
+# --- (drivers/hda.rs:1457, :1566) miss the REQUIRE. Audibility is not on the wire and is not claimed.
+REQUIRE :: HDA-TONE: .* -> PASS ::
+#
+# --- KVBLANK (B179, UNAOS_KEPLER_VBLANK). The two self-test verdicts only (drivers/gpu/kepler_vblank.rs:
+# --- 1009, :1038); `GO-RED-FAILED` misses the second REQUIRE. The period values (`period_us=127022`,
+# --- then 38241 on a 60 Hz panel) are NOT pinned: they are the open finding, not a property.
+REQUIRE :: kepler: vblank selftest arm=wait sim=timer .* :: PASS ::
+REQUIRE :: kepler: vblank selftest arm=wait sim=stuck .* :: GO-RED-OK ::
+#
+# --- NOT PINNED, stated rather than omitted (each is a FLIGHT12.md reading that no directive can hold
+# --- honestly): the vblank PERIOD (above); `pmc-arm … deliver=none reason=no-vector-helper` and
+# --- `[ioapic] route bdf=0:29.0 … -> REFUSED reason=no-firmware-line` — both are the current rung's
+# --- stated limit, and a FORBID would red every boot until the next rung lands; ISRARM's `[1] ISRARM
+# --- REFUSED … there is no IOAPIC in this kernel` — stale on image 4 and TRUE on image 3, and the
+# --- grammar cannot condition one line on another's presence; `[users]` absence and the login
+# --- screen's focus — R63's arc (LOGIN13) owns that wire. The `[wc-d]` full pass (:322, :335; flight
+# --- 11 also :329) is red on BOTH flights and is not this block's: the `UNAOS_WCDVALVE` valve reads
+# --- CLOSED from 6745 to 32164 ms and from 32323 ms to the end of flight 12 (flight 11: from 43220 ms,
+# --- after `[wc-d] paygo-taker STOP-NOTE win=1 — gave up after 16 attempts`) — recorded in B195.
+
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
 # A PINNED LINE IN THIS FILE IS CHANGED TOGETHER WITH THE KERNEL LINE IT PINS, IN THE SAME COMMIT —
 # re-pinned to the new wording (naming the arc that changed it), or dropped with the reason stated.
