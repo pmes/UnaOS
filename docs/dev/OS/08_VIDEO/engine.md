@@ -19910,6 +19910,14 @@ The verdict says which of the two it took, in the line, so no reader has to infe
 a yield. It is out of this arc's fence, it is in `rmbp-queue.md`, and until it lands the sentence
 above is the honest statement of what a yielded run proves.
 
+> **OWED CLOSED the same day, by PRESENTSLOT (2026-09-22, rmbp-ledger B178 — §PRESENTSLOT below).**
+> The per-slot counter landed at both sites; the split above is GONE and the equality is exact in
+> BOTH cases again. §§1–6 stay exactly as written — they are the record of what DMGYIELD measured,
+> and the captures in §4 and the replay table in §5 are its wire — but the kernel they describe no
+> longer exists: the verdict's two alternatives `(want 6, exactly: …)` / `(want 6, at least: …)`
+> were replaced by the single `presents=6 (slot, exactly) global=+N (want 6)`, so a yielded run now
+> proves exactly what an empty-table run proves, and §6's prediction was re-stated with it.
+
 ### 2. THE YIELD
 
 `dmg_refuse_witness` now takes its rows from the FREE SET at entry:
@@ -20269,3 +20277,208 @@ NOT CITED: `./arroyo knoboff`. The change is entirely inside `wc`-gated code (`v
 declared under the furniture gate at `video/mod.rs:969`), so a knob-off build is byte-identical by
 construction and the reading would carry no information. LAWS §5 (2026-09-22): the replay is the
 proof, and it is above.
+
+## PRESENTSLOT — the refusal witness counts its OWN presents, and grades a shared machine exactly (2026-09-22)
+
+DMGYIELD, one section up, ended by naming the one thing it could not do inside its fence, verbatim:
+*"a per-slot present counter beside `FB_PRESENT_COUNT.fetch_add` at `syscall.rs:3787`
+(`sys_win_present`) and `:4710` (`sys_win_present_rows`) would restore the exact equality under a
+yield, and would let the witness grade a metal boot's present count for the first time."* This is
+that counter. Base `435dc999`, branch `exec-rmbp-presentslot`, rmbp-ledger **B178**.
+
+### 1. What was actually lost, and it was not a nicety
+
+`presents == DMG_ACCEPTS` is the strongest control in the DMG-REFUSE block, because it is the only
+one the ring-3 fixture cannot forge: the counter is bumped KERNEL-SIDE, inside the `WINDOWS` hold,
+after all four checks have passed and before the compositor shim. It catches two classes no
+return-code check can see — an **accept that returned 0 without reaching the compositor**
+(under-count) and a **refusal arm that returned the right errno and repainted anyway** (over-count).
+
+DMGYIELD had to split it, because `FB_PRESENT_COUNT` is GLOBAL: under a yield the number includes
+`/STAT.ELF`'s ~20 fps, foreign presents can only ADD, so the under-count half survived as `>=` and
+the over-count half was **reported and not graded**. Stated plainly: **the over-count half of the
+strongest control in the block was dark on every boot that had a co-tenant — which, since STARTHOLD,
+is every metal boot there will ever be.** CI kept the full control only because `./arroyo test` has
+no Kepler and therefore no app.
+
+### 2. The counter, and why `Relaxed`
+
+One `AtomicU64` per address-space row, `USER_SLOTS` wide, bumped beside the global one at both sites
+inside the same `WINDOWS` critical section and after the same ownership proof, so the row it charges
+is provably the row that owns the window:
+
+    FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel); FB_PRESENT_COUNT_SLOT[slot].fetch_add(1, Ordering::Relaxed);
+
+`slot` is `win_caller_slot()`'s value, already checked against `t[id].owner` two lines above, so no
+slot can inflate another's count — the same argument `wpace_note_present` and `pace_advance` are
+placed by. The accessor is `fb_present_count_slot(row)`; an out-of-range row reads 0, which is not a
+silent pass (a delta of 0 grades FAIL against `DMG_ACCEPTS`), and the syscall side cannot reach it.
+
+**`Relaxed` is the correct strength, not a weakening.** The counter publishes nothing: no reader uses
+it to decide whether some OTHER memory is visible, so it has no release/acquire duty to discharge. It
+is a single location whose only value is its own. Its increments are already totally ordered with
+respect to one another by the spinlock they all sit inside, and its one reader brackets its two
+samples with a full scheduler handshake in each direction. `AcqRel` would buy a fence the lock has
+already paid for, on two of the hottest paths in the kernel. The global counter keeps its `AcqRel`
+untouched — not because it needs it either, but because changing it is not this arc's question.
+
+**UNCONDITIONAL, and LAWS §5 is why the knob was not reached for.** Both sites are unconditional code
+on a hot path. A counter compiled only under `witness` would measure a kernel nobody boots, and would
+put the fixture's proof and the shipped image on different sides of a `cfg`. So the cost is MEASURED
+instead of argued — §4.
+
+### 3. What the witness does with it
+
+`dmg_refuse_witness` takes the prober's baseline immediately after `dmg_build` returns and before
+`spawn_user_in_space` — the address space has no thread in it at that instant, so the row's total is
+read exactly where the prober's own count begins. That placement is not cosmetic: the counter is NOT
+reset on slot release, so a recycled row carries its predecessor's total, and only a delta taken
+across a window in which the slot is provably the one you built means anything.
+
+It CLOSES the delta at step 4, **inside the prober's post-SWEPT park**, and this is the tighter of
+the two available instants:
+
+* SWEPT means all 19 probes have fired, so every accept is already counted;
+* the prober is parked in `SYS_SLEEP_MS` and cannot present again;
+* the prober has NOT exited, so its slot cannot have been released and handed to something else that
+  presents. There is no instant inside this window that belongs to anybody but the fixture.
+
+The GLOBAL delta deliberately closes LATER, at the prober's exit, and is therefore a superset. That
+asymmetry is the point: the graded number is the tight one, and the loose one is printed beside it so
+a reader can see how busy the machine was.
+
+    && slot_presents == DMG_ACCEPTS          // exact, both cases; the `occ_entry` branch is gone
+
+    … yielded_to=0x00 presents=6 (slot, exactly) global=+6 (want 6) — witness OK ::
+    … yielded_to=0x01 presents=6 (slot, exactly) global=+8 (want 6) — witness OK ::
+
+### 4. Gates, and the cost measured rather than argued
+
+**`cd unaos && ./arroyo check` — rc 0**, text read. **`bash unaos/scripts/ledger-check.sh` rc 0
+before and after.**
+
+**LINE-NEUTRAL (B94).** `arch/x86_64/syscall.rs` is **26387 lines before and after**, 19 insertions
+and 19 deletions — every addition a same-line fold, so no `panic::Location` moves and no positional
+citation into this file shifts. SECLOGIN (`~:23850`), STOR1 (`~:12300`/`~:24800`) and APPCLIP
+(`~:5615`) were editing the same file in parallel.
+
+**The wc lane, `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_QEMU_FULL=1 ./arroyo test
+240`, four runs — and the first of them is a BASELINE taken on this worktree with the arc
+reverse-applied**, so the cost below is attributable to this change and not to a peer's fold:
+
+*Run 0, BASELINE at `435dc999` (the arc reverse-applied, `git apply -R`, then re-applied and the diff
+verified byte-identical by sha256):*
+
+    :: DMG-REFUSE: … yielded_to=0x00 presents=6 (want 6, exactly: no refusal reached the
+        compositor and no co-tenant shared the counter) — witness OK ::
+
+*Run 1, after, unperturbed — the equality is now the SLOT's, and the global is reported beside it:*
+
+    :: DMG-REFUSE: … the window still presented after all 13 refusals; yielded_to=0x00
+        presents=6 (slot, exactly) global=+6 (want 6) — witness OK ::
+
+**THE COST, on the `[wc-w] rollup presents=` cadence, which is the compositor's own frame accounting
+and the nearest thing this lane has to a clock.** The rollup fires every 4 presents; what a
+per-present cost would show up as is a rollup interval that stretches, or a shorter run in the same
+240 s wall. Neither moved — and the after run did MORE work:
+
+| | rollups | last `presents=` | step histogram |
+|---|---|---|---|
+| run 0, baseline | 214 | 806 | `+4` x163, `+3` x47, `+5` x2, `+2` x1 |
+| run 1, after | 232 | 927 | `+4` x230, `+6` x1 |
+
+The interval is the same 4, and the baseline is the JITTIER of the two (47 short steps against none).
+A relaxed `lock xadd` on a cache line the core already owns exclusively, inside a critical section
+that has just taken a spinlock, cannot make a machine faster; the honest reading is that the change
+is **below this lane's noise floor**, and the noise floor is host load. That is the measurement LAWS
+§5 asks for in place of a `knoboff` comparison, which would not have been available here anyway: two
+unconditional sites in hot paths have no knob to turn off.
+
+*Run 2, the OCCUPANCY PROBE — a scratch third fixture (`dmg-squat`) that stands a row up AND PRESENTS
+through the whole witness at 50/s, spawned and waited for before the entry read. This lane has no
+Kepler and therefore never has a real co-tenant, so the probe is how the metal shape is produced
+here. DMGYIELD's probe only HELD a row; this one had to PAINT, because a co-tenant that never
+presents cannot contaminate a present counter. **REVERTED**; the arc diff is byte-identical before
+and after the probe, verified by comparing the `git diff` sha256 against the patch saved before it:*
+
+    :: PROBE: squatter window in table = true slot=0 ::
+    :: DMG-REFUSE: … yielding to occupied=0x01 (11 of 12 rows free) ::
+    :: DMG-REFUSE: … yielded_to=0x01 presents=6 (slot, exactly) global=+8 (want 6) — witness OK ::
+
+**`global=+8` against `presents=6` is the whole arc in one line**: two foreign presents landed inside
+the witness's window, the old grade would have had to either red on them or stop looking, and this
+one neither notices nor forgives them — it simply is not counting them.
+
+*Run 3, GO-RED — the same probe, with the graded term changed back to the GLOBAL counter
+(`presents == DMG_ACCEPTS`) and nothing else touched. `./arroyo test` rc 1:*
+
+    :: DMG-REFUSE FAIL — probes=0x005b6d2924921249 want=0x005b6d2924921249 first_bad=P255 got=0
+        want_code=0 ids=(a=1 b0=2 b1=3 free=11) yielded_to=0x01 presents=6 (slot, exactly)
+        global=+8 (want 6) owner_witness=0x3 (want 0x3) done=2/2 killed=0 cleared=true
+        tables=(entry=0x03 recheck=0x0f) ::
+
+**`first_bad=P255` is the sentinel for "no probe disagreed", and printing it is the go-red's whole
+content.** Every one of the 19 probes returned exactly what it should have; the term that reds is the
+present count and nothing else. That is the precise statement that this arc's grade is load-bearing:
+remove the per-slot counter from the equality and a correct run fails, on the wire, by two presents
+that were never the fixture's.
+
+### 5. The spec pin, re-pinned under the SPECRUN contract, and the red taken on a capture
+
+`scripts/specs/x86-wc.spec` ARM A, re-pinned in the same commit as the kernel line it pins:
+
+    REQUIRE :: DMG-REFUSE: .*19/19 probes from two ring-3 slots agree.*yielded_to=0x[0-9a-f]+ \
+        presents=\d+ \(slot, exactly\) global=\+\d+ \(want \d+\) .*witness OK ::
+
+**Why the two new terms are IN the pattern and not left to `.*`, and this is the reason the rule had
+to be edited at all:** DMGYIELD's rule (`presents=\d+ .*witness OK ::`) still matches the NEW line
+verbatim. Leaving it would have gated NOTHING this arc adds — a build that reverted to grading the
+global counter would print `presents=6 … witness OK` on this empty-table lane and pass green.
+`\(slot, exactly\)` is the term that says WHICH counter was graded; `global=\+\d+` is the term that
+says the co-tenant's traffic was measured rather than ignored. Both stay `\d+`: this lane reads
+`global=+6` with nothing else painting, and metal reads the app's cadence.
+
+**B160 — a FORBID or a REQUIRE is worthless unless it is known to be able to go both ways —
+discharged on five real captures.** `./arroyo mbench --replay <log> --spec scripts/specs/x86-wc.spec
+--platform x86`:
+
+| capture | new `REQUIRE … (slot, exactly) global=+` | `FORBID … not empty at entry` | `FORBID DMG-REFUSE FAIL` | spec rc |
+|---|---|---|---|---|
+| flight 11 metal (`~/unaos-bench/scratch/rmbp-0915/bootwaits-logs/f11.log`, read-only) | 0 hits (pre-change capture) | **1 hit @ line 4042** | 0 | 1 |
+| **run 0, BASELINE at `435dc999`** | **0 hits — `FIRST-SHORTFALL x86-wc.spec:459`** | 0 | 0 | **1** |
+| run 1, after, unperturbed | **1 hit**, 22/22 | 0 | 0 | **0** |
+| run 2, occupancy probe | **1 hit**, 22/22 | 0 | 0 | **0** |
+| run 3, go-red | 0 hits — `FIRST-SHORTFALL x86-wc.spec:459` | 0 | **1 hit @ line 2398** | 1 |
+
+The BASELINE row is the one that matters for the re-pin: it is a green, complete, DMGYIELD-era
+capture on this exact lane, and the new rule reds on it. The rule is therefore known to distinguish
+the kernel before this arc from the kernel after it, which is the only property a re-pin can have
+that the old loose rule did not.
+
+`x86-fat.spec:90` (`REQUIRE DMG-REFUSE:.*19/19 probes.*witness OK`) and `:92`
+(`FORBID DMG-REFUSE:.*NOT RUN`) both survive this change verbatim — no file outside this arc's fence
+needed editing. The one shape still deliberately unforbidden here is `only N of 12 window rows are
+free at entry … NOT RUN`, for DMGYIELD's reason, unchanged.
+
+### 6. The prediction for flight 12, stated so it can be falsified
+
+DMGYIELD's §6 prediction stands in every respect except the `presents` term, which this arc
+re-states. On flight 12:
+
+* `:: DMG-REFUSE: … yielding to occupied=0x01 (11 of 12 rows free) ::` arms AFTER
+  `[wc-x] desktop-app LAUNCH … slot=0`, and the verdict reads
+  **`yielded_to=0x01 presents=6 (slot, exactly) global=+<N> — witness OK ::` with `N` > 6** — the
+  first metal boot whose present count is GRADED rather than reported.
+* `NOT RUN` appears nowhere in any `DMG-REFUSE` line.
+* **The falsifiable claim is `presents=6 (slot, exactly)` and `witness OK`, and NOT the size of
+  `N`.** `N` is `/STAT.ELF`'s paint rate multiplied by however long the sweep takes on metal, and
+  that duration has never been observed — flight 11 declined at the entry gate. This lane measured
+  `+8` against a 50/s co-tenant because the whole sweep is ~160 ms of headless wall; on metal, with
+  real spawns and a real serial wire between the same two reads, tens to hundreds is the expectation
+  and none of it is graded. A reader who finds `global=+7` has learned how fast the sweep is, not
+  that anything is wrong.
+* Falsified if `presents` is anything but 6 (the prober's own row counted a present that is not one
+  of its six accepts, or missed one — a real defect in the counter's placement or in the refusal
+  arms), or if the verdict reads `yielded_to=0x00` (the app did not take a row, so STARTHOLD's
+  mechanism is wrong), or if `first_bad=P<n>` names a probe (the yield handed the prober a row it
+  could not have).

@@ -3784,7 +3784,7 @@ fn sys_win_present(win: u64) -> i64 {
                 return EACCES;
             }
             wm_id = t[id].wm_id;
-            FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+            FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel); FB_PRESENT_COUNT_SLOT[slot].fetch_add(1, Ordering::Relaxed); // PRESENTSLOT: the per-slot arm DMGYIELD owed, beside the global one and under the same proof — `slot` is the CALLER's row, already proven to own `id` two lines up, so no slot can inflate another's count. Unconditional, like the global counter and for the same reason: the witness that reads it is a `witness` build, but a counter that only exists under a knob measures a kernel nobody boots (LAWS §5). The cost is one relaxed `lock xadd` on an already-owned cache line inside a critical section that just took a spinlock; the `[wc-w] rollup presents=` cadence is unmoved across the change.
             // VSYNC-PACE r3: the `[wpace]` present count, HERE and not inside `pace_advance` — it counts
             // an event that happens on every boot, while the pacer is compiled only under `vsyncpace`.
             // Same placement rule as the deadline: inside the ownership proof, so a slot cannot inflate
@@ -4707,7 +4707,7 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
             wm_id = t[id].wm_id;
             // The same counter the whole-box verb bumps: this IS a present that reached the compositor,
             // and the headless witness must not go blind on a window that switched to banded presents.
-            FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel);
+            FB_PRESENT_COUNT.fetch_add(1, Ordering::AcqRel); FB_PRESENT_COUNT_SLOT[slot].fetch_add(1, Ordering::Relaxed); // PRESENTSLOT: the same per-slot arm, for the same reason the global one is here — a banded present IS a present, and the DMG-REFUSE prober fires ALL of its accepts through THIS verb, so a per-slot counter that skipped the banded path would read 0 on the one fixture it exists to serve.
             // VSYNC-PACE r3: the `[wpace]` present count, for `sys_win_present`'s reason — a banded
             // present is a present, and the witness must not go blind on a client that switched to
             // damage bands.
@@ -4735,14 +4735,14 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
     present_backpressure(slot, outcome)
 }
 
-/// WINX-1: total `SYS_WIN_PRESENT` calls that reached the compositor — the headless witness's proof that
-/// a present actually happened, independent of whether a panel was attached.
-static FB_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
+/// WINX-1: total `SYS_WIN_PRESENT` calls that reached the compositor — the headless witness's proof that a present actually happened, independent of whether a panel was attached. PRESENTSLOT (2026-09-22, rmbp-ledger B178): and BESIDE it, the SAME event ATTRIBUTED — one `AtomicU64` per address-space row, bumped at the same two sites inside the same `WINDOWS` hold and after the same ownership proof, so a witness can count ITS OWN presents on a machine it shares. DMGYIELD (B172) is why: the global counter is shared with every co-tenant (`/STAT.ELF` presents every 50 ms), so `presents == DMG_ACCEPTS` could only be claimed EXACTLY on an empty table, and no metal boot has had one since STARTHOLD.
+/// a present actually happened, independent of whether a panel was attached. WHY `Relaxed` ON THE PER-SLOT ARM AND NOT A WEAKENING: this counter publishes nothing. It carries no data dependency — no reader uses it to decide whether some OTHER memory is visible — so it has no release/acquire duty to discharge; it is a single location whose only value is its own. The increments are already totally ordered with respect to one another by the `WINDOWS` spinlock they all sit inside (an AcqRel pair per present), and the one reader, `dmg_refuse_witness`, brackets its two samples with a full scheduler handshake in each direction (`spawn_user_in_space` before, the prober's SWEPT publication through its param page plus `DMG_DONE`'s Acquire load after). `AcqRel` here would buy a fence the lock already pays for, on two of the hottest paths in the kernel. The GLOBAL counter keeps its `AcqRel` untouched — not because it needs it either, but because changing it is not this arc's question.
+static FB_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0); static FB_PRESENT_COUNT_SLOT: [AtomicU64; crate::arch::memory::USER_SLOTS] = [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS];
 
-/// WINX-1: read the present counter (the fixture verdict reads it).
+/// WINX-1: read the present counter (the fixture verdict reads it). PRESENTSLOT: and `fb_present_count_slot(row)` reads ONE address-space row's own count. NOT RESET on slot release — a recycled row inherits its predecessor's total — so every caller takes a DELTA across a window in which it can prove the slot is the one it built. An out-of-range row reads 0, which is not a silent pass: a delta of 0 grades FAIL against `DMG_ACCEPTS`, loudly, and `win_caller_slot()` bounds every writer by construction so the arm cannot be reached from the syscall side at all.
 pub fn fb_present_count() -> u64 {
     FB_PRESENT_COUNT.load(Ordering::Acquire)
-}
+} pub fn fb_present_count_slot(row: usize) -> u64 { if row >= crate::arch::memory::USER_SLOTS { return 0; } FB_PRESENT_COUNT_SLOT[row].load(Ordering::Relaxed) }
 
 /// WINX-1: retire every window owned by address-space slot `s`. Called from
 /// `memory::free_user_space_by_cr3` before the FB leaves are dropped and the slot released, so a
@@ -18657,9 +18657,9 @@ fn winx7_launcher(demo_cpu: usize) {
 // the ownership gate runs BEFORE the range check — which is the contract's explicit claim, and which
 // also means the range check cannot be used to probe another process's surface height.
 //
-// THE STRONGEST CONTROL IS KERNEL-SIDE AND THE FIXTURE CANNOT FORGE IT: `FB_PRESENT_COUNT` is bumped
-// only after ALL FOUR checks pass, and before the compositor shim. The launcher samples it around the
-// whole run and requires the delta to be EXACTLY 6 — the number of accepting probes. `dmg-owner`
+// THE STRONGEST CONTROL IS KERNEL-SIDE AND THE FIXTURE CANNOT FORGE IT: the present counter is bumped
+// only after ALL FOUR checks pass, and before the compositor shim. PRESENTSLOT (B178): the GRADED one is `FB_PRESENT_COUNT_SLOT[probe.slot]`, the PROBER'S OWN row, sampled across its sweep — the global `FB_PRESENT_COUNT` is reported beside it (`global=+N`) and never graded, so a co-tenant painting through the run is visible and harmless.
+// The launcher samples it around the whole run and requires the delta to be EXACTLY 6 — the number of accepting probes. `dmg-owner`
 // deliberately presents zero times, so the delta is entirely the prober's. A refusal arm that returned
 // the right errno but still repainted would over-count; an accept that silently did nothing would
 // under-count. No return-code check can see either.
@@ -19047,8 +19047,8 @@ fn dmg_code(w: u64, i: usize) -> u32 {
 /// THE NEED, read off the steps above rather than off what was convenient (DMGYIELD, 2026-09-22): FOUR rows, and the identity of exactly TWO. `id_a` must be the owner's alone (step 2, re-read at step 4); `id_free` must be free at plant time and still free at step 4; the other two are the prober's, taken lowest-first and reported back by ring 3 for step 4 to confirm against the table.
 /// EVERY one of those tests is ALREADY slot-scoped or single-bit — `dmg_win_masks(s)` masks by OWNER,
 /// `table_ok` reads `occ_re` at the `id_free` bit ONLY, `rows_ok` compares the prober's own mask — so a foreign row never entered the GRADE. It entered only the ENTRY CONDITION, which demanded emptiness because emptiness came free of charge while the witness ladder ran alone, and since STARTHOLD it never does.
-/// ONE term of the grade did want it: `presents == DMG_ACCEPTS`, because `FB_PRESENT_COUNT` is GLOBAL
-/// and this block may not add a per-slot arm to `sys_win_present`/`sys_win_present_rows`. Split at the verdict — exact on an empty entry, `>=` under a yield (foreign presents can only ADD, so the under-count half is untouched) — and REPORTED in the line, never silent. `08_VIDEO/engine.md` §DMGYIELD.
+/// ONE term of the grade did want it: `presents == DMG_ACCEPTS`, because `FB_PRESENT_COUNT` is GLOBAL — and PRESENTSLOT (2026-09-22, rmbp-ledger B178) took the fence off and paid DMGYIELD's owed line, so that term is EXACT again in BOTH cases and the split is GONE.
+/// `FB_PRESENT_COUNT_SLOT[slot]` is bumped beside the global counter at `sys_win_present` and `sys_win_present_rows`, under the same ownership proof, so the grade reads the PROBER'S OWN presents and a co-tenant cannot reach the number at all. The global delta is still read and still printed as `global=+N`, so the co-tenant's traffic is VISIBLE on the wire without ever being graded: `presents=6 (slot, exactly) global=+312`. `08_VIDEO/engine.md` §PRESENTSLOT, and §DMGYIELD for the split this replaced.
 ///
 /// SETTLE FLAG: nothing GATES on it any more. STARTHOLD (2026-09-22, rmbp-ledger B167) deleted
 /// `desktop_app_service`'s 15 s hold — the cap was smaller than the bound of the signal it waited for, so flight 11 paid `waited=15005ms` AND still lost the witness — and `desktop_uefi.rs` now REPORTS the flag (`HOLD-NONE … dmg=<settled|unsettled>`) as the provenance of whichever row the app took.
@@ -19127,7 +19127,7 @@ fn dmg_refuse_witness(demo_cpu: usize) {
         );
         dmg_release_go(owner.slot);
         return;
-    };
+    }; let slot_before = fb_present_count_slot(probe.slot); // PRESENTSLOT: the per-slot baseline, taken HERE and not at the top beside `presents_before` — the slot did not exist at the top, and `fb_present_count_slot` is not reset on release, so a RECYCLED row carries its predecessor's total. Between `dmg_build` above and the `spawn_user_in_space` below, the address space has no thread in it and cannot present, so this reads the row's total at the exact instant the prober's own count starts.
     unsafe {
         let p = crate::arch::memory::slot_backing_ptr(probe.slot).add(DMG_PARAM_OFF) as *mut u64;
         core::ptr::write_volatile(p.add(1), id_a);
@@ -19180,7 +19180,7 @@ fn dmg_refuse_witness(demo_cpu: usize) {
     };
 
     // 4. GROUND TRUTH RE-READ, with the prober parked and every window — owner's and prober's — live.
-    let (occ_re, own_re) = dmg_win_masks(owner.slot);
+    let (occ_re, own_re) = dmg_win_masks(owner.slot); let slot_presents = fb_present_count_slot(probe.slot) - slot_before; // PRESENTSLOT: and the per-slot count is closed HERE, inside the park, rather than beside the global read after the exit. SWEPT means all 19 probes have fired, so every accept is already counted; the prober is parked in `SYS_SLEEP_MS` and cannot present again; and the slot is provably STILL THE PROBER'S — it has not exited, so it cannot have been released and handed to something else that presents. That makes the window this delta covers exactly the fixture's sweep, with no instant in it belonging to anyone else. The GLOBAL delta below deliberately closes LATER (at the exit) and is therefore a superset: it is reported, never graded.
     let (_, own_probe) = dmg_win_masks(probe.slot);
     // The two ids below are RING 3's report, so they are bound-checked BEFORE they reach a shift — a
     // fixture bug must not become a kernel shift-overflow panic in the launcher that grades it.
@@ -19258,15 +19258,15 @@ fn dmg_refuse_witness(demo_cpu: usize) {
     }
 
     if first_bad == usize::MAX
-        && (if occ_entry == 0 { presents == DMG_ACCEPTS } else { presents >= DMG_ACCEPTS }) // DMGYIELD: `FB_PRESENT_COUNT` is GLOBAL and has no per-slot arm this block may add, so the exact equality is a claim only an EMPTY entry can make. Under a yield a co-tenant shares the counter — the desktop app presents at ~20 fps (`user-stat`, `PAINT_INTERVAL_MS`) — and foreign presents can only ADD, so the UNDER-count half of the control (an accept that silently did nothing) survives EXACTLY as `>=`, while the OVER-count half (a refusal arm that repainted anyway) is not attributable and is REPORTED, not graded. Named, not swallowed: see `yielded_to=` on both verdicts and §THE NEED in 08_VIDEO/engine.md for the one-line fix a later arc may take in `sys_win_present`/`sys_win_present_rows`.
+        && slot_presents == DMG_ACCEPTS // PRESENTSLOT (B178) REPLACES DMGYIELD's SPLIT: the graded term is the PROBER'S OWN slot count, so the equality is EXACT in both cases — empty entry and yield alike — and the branch on `occ_entry` is gone. The two halves DMGYIELD had to separate are both back: an accept that returned 0 without reaching the compositor is an UNDER-count and reds, and a refusal arm that returned the right errno and repainted anyway is an OVER-count and reds, because a co-tenant's presents can no longer land in this number at all. The global delta is still READ and still PRINTED (`global=+N`) — the co-tenant's activity is visible on the wire, where a reader can see that the machine was busy — but it is NEVER graded, because nothing about it is attributable to this fixture. `FB_PRESENT_COUNT_SLOT` is bumped kernel-side at `sys_win_present`/`sys_win_present_rows` after the ownership proof, so the fixture cannot forge it, which is what made this the strongest control in the block before the yield weakened it.
         && owner_witness == DMG_OWNER_ALL
         && cleared
         && killed == 0
         && DMG_DONE.load(Ordering::Acquire) == 2
     {
         serial_println!(
-            ":: DMG-REFUSE: SYS_WIN_PRESENT_ROWS(33) refused every malformed band — {}/{} probes from two ring-3 slots agree: 6 legal bands returned 0, 7 bad ranges -EINVAL, 2 presents of another slot's LIVE window -EACCES, 4 free/out-of-range ids -EBADF; ownership is checked BEFORE the range (a malformed band on another slot's window is still -EACCES, on a free row still -EBADF), the height bound is the WINDOW's own (33 rows accepted on h=128, refused on h=32), the window still presented after all 13 refusals; yielded_to={:#04x} presents={} (want {}, {}) — witness OK ::",
-            DMG_PROBES, DMG_PROBES, occ_entry, presents, DMG_ACCEPTS, if occ_entry == 0 { "exactly: no refusal reached the compositor and no co-tenant shared the counter" } else { "at least: the counter is global and a co-tenant held a row, so only the under-count half is graded" }
+            ":: DMG-REFUSE: SYS_WIN_PRESENT_ROWS(33) refused every malformed band — {}/{} probes from two ring-3 slots agree: 6 legal bands returned 0, 7 bad ranges -EINVAL, 2 presents of another slot's LIVE window -EACCES, 4 free/out-of-range ids -EBADF; ownership is checked BEFORE the range (a malformed band on another slot's window is still -EACCES, on a free row still -EBADF), the height bound is the WINDOW's own (33 rows accepted on h=128, refused on h=32), the window still presented after all 13 refusals; yielded_to={:#04x} presents={} (slot, exactly) global=+{} (want {}) — witness OK ::",
+            DMG_PROBES, DMG_PROBES, occ_entry, slot_presents, presents, DMG_ACCEPTS
         );
     } else {
         let (got, want) = if first_bad == usize::MAX {
@@ -19275,7 +19275,7 @@ fn dmg_refuse_witness(demo_cpu: usize) {
             (dmg_code(witness, first_bad), DMG_CODES[first_bad] as u32)
         };
         serial_println!(
-            ":: DMG-REFUSE FAIL — probes={:#018x} want={:#018x} first_bad=P{} got={} want_code={} ids=(a={} b0={} b1={} free={}) yielded_to={:#04x} presents={} (want {}) owner_witness={:#x} (want {:#x}) done={}/2 killed={} cleared={} tables=(entry={:#04x} recheck={:#04x}) ::",
+            ":: DMG-REFUSE FAIL — probes={:#018x} want={:#018x} first_bad=P{} got={} want_code={} ids=(a={} b0={} b1={} free={}) yielded_to={:#04x} presents={} (slot, exactly) global=+{} (want {}) owner_witness={:#x} (want {:#x}) done={}/2 killed={} cleared={} tables=(entry={:#04x} recheck={:#04x}) ::",
             witness,
             DMG_EXPECT,
             if first_bad == usize::MAX { 255 } else { first_bad },
@@ -19285,7 +19285,7 @@ fn dmg_refuse_witness(demo_cpu: usize) {
             rep_b0,
             rep_b1,
             id_free,
-            occ_entry, presents,
+            occ_entry, slot_presents, presents,
             DMG_ACCEPTS,
             owner_witness,
             DMG_OWNER_ALL,

@@ -471,11 +471,24 @@ FORBID :: PRTSCR-DIR-FIX: .* -> FAIL ::
 # --- `presents=\d+` for the standing no-numerics reason. MEASURED on this seat's wc-lane capture,
 # --- `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_QEMU_FULL=1 ./arroyo test 240`:
 # ---   :: DMG-REFUSE: … the window still presented after all 13 refusals; yielded_to=0x00
-# ---       presents=6 (want 6, exactly: no refusal reached the compositor and no co-tenant shared
-# ---       the counter) — witness OK ::
-# --- and with a scratch third fixture standing in row 0 before the witness enters (REVERTED), the
-# --- same gate reads `yielded_to=0x01 presents=6 (want 6, at least: …) — witness OK ::`.
-REQUIRE :: DMG-REFUSE: .*19/19 probes from two ring-3 slots agree.*yielded_to=0x[0-9a-f]+ presents=\d+ .*witness OK ::
+# ---       presents=6 (slot, exactly) global=+6 (want 6) — witness OK ::
+# --- and with a scratch co-tenant standing in row 0 AND PRESENTING through the witness (REVERTED),
+# --- the same gate reads `yielded_to=0x01 presents=6 (slot, exactly) global=+8 (want 6) — witness OK ::`.
+# ---
+# --- RE-PINNED BY PRESENTSLOT (2026-09-22, rmbp-ledger B178), under the SPECRUN contract at the foot
+# --- of this file: the kernel line this rule pins changed in the same commit, so the rule changed
+# --- with it rather than being left to match loosely. DMGYIELD's `presents={} (want {}, exactly|at
+# --- least: …)` became `presents={} (slot, exactly) global=+{} (want {})` — the graded count is now
+# --- the PROBER'S OWN address-space row (`FB_PRESENT_COUNT_SLOT`), exact in BOTH cases, and the
+# --- global counter is reported beside it and never graded. WHY THE TWO NEW TERMS ARE IN THE PATTERN
+# --- AND NOT LEFT TO `.*`: the OLD rule still matches the NEW line verbatim (`presents=\d+ .*witness
+# --- OK ::` is satisfied by it), so leaving it alone would have gated NOTHING that this arc adds — a
+# --- build that reverted to grading the global counter would print `presents=6 … witness OK` on this
+# --- empty-table lane and pass. `\(slot, exactly\)` is the term that says WHICH counter was graded,
+# --- and `global=\+\d+` is the term that says the co-tenant's traffic was measured rather than
+# --- ignored. Both are `\d+`, never literals: this lane reads `global=+6` with nothing else painting
+# --- and metal reads the app's cadence.
+REQUIRE :: DMG-REFUSE: .*19/19 probes from two ring-3 slots agree.*yielded_to=0x[0-9a-f]+ presents=\d+ \(slot, exactly\) global=\+\d+ \(want \d+\) .*witness OK ::
 # --- ARM B — THE RETIRED DEMAND, AND THE RED WAS TAKEN ON A CAPTURE (B160: a FORBID that cannot
 # --- match reads identical to one that passed). Replaying THIS FILE against the flight-11 metal log
 # --- (read-only evidence, `~/unaos-bench/scratch/rmbp-0915/bootwaits-logs/f11.log`) scores this rule
