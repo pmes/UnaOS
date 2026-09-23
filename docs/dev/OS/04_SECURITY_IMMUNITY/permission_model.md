@@ -159,6 +159,32 @@ attributes the chain above built.** Nothing in §4 is redone; a user is one more
   `wm::hit_test` would hand the screen a control cluster and a close box back — LOGINCLOSE's measured
   defect — and would gate only the points inside the rectangle. Modality is a property of the ROUTER, not
   of the row.
+* **And the press is the SCREEN'S — SO44's second sentence (LOGINFLOW 2026-09-22).** SO44's rule is two
+  sentences: *a press outside the rectangle belongs to nobody* **and** *a press inside it belongs to IT*.
+  SESSGATE landed the first and left the screen a WALL — `press_swallow` answered `true` for every point
+  and did nothing with it, which to the person in front of the glass is not distinguishable from a
+  machine that has hung: press the password field, the caret does not move; press where a button should
+  be, there is no button. The coordinates the barrier has always taken and thrown away are now USED.
+  `login::local_of` maps the panel point through the row's own `wm` geometry (origin AND integer
+  upscale), `login::ctl_at` asks which control is there, and the control ACTS — the two fields focus, the
+  **button** submits (the same `submit` Enter calls; there is no second path to keep in step), a **user's
+  row** picks that name out of the store (`users::name_at`) and moves to the password. The screen
+  therefore SHOWS who lives on this machine, the Mac model, and carries a button, because Enter is not
+  discoverable and a person who has just chosen a password has no reason to know it is the only way in.
+  The RETURN VALUE is unchanged and must stay unchanged — `true` for every press while the screen is up,
+  hit or miss — because the modality is the ROUTER's contract and is not conditioned on there being a
+  control under the point. Painter and press read ONE accessor (`login::ctl_rect`): `wm::control_disc`'s
+  discipline, for LOGINCLOSE's reason one layer out — a control drawn from one rect and hit-tested from
+  another is one edit from being drawn where it cannot be pressed. And a **wrong password says one
+  thing**: `submit` asks `users::verify`, documented as *one answer for "no such user" and "wrong
+  password"*, rather than reading a `UsersError`, so neither the glass (`Login failed`) nor the wire
+  (`[login] denied user=<name>`) can grow a reason that tells someone at the keyboard which names exist.
+  A credential that verified but whose session did not open is said DIFFERENTLY (`Could not open the
+  session`) — that is a storage or slot refusal, not a denial, and a person who typed the right password
+  must not be sent to look for a typo. GATE: `login::control_leg` (`loginst`), which drives the **live
+  arch router** — `wc_click_route_at` on x86, `strip::press_route` on aarch64, named on its own verdict
+  line as `route=` — and never `press_swallow` directly, because a fixture that calls the predicate
+  stays green on a tree whose router arm has been deleted (rmbp-ledger B121, one band over).
 * **The IGNITION, and the one rule it follows (SO43, LOGINBOOT 2026-09-13):** the screen comes up
   because **the DESKTOP EXISTS**, never because a console route was installed. M3 wrote two of its four
   ignition sites as `if activate() { … }`, and `desktop_firmware::activate`'s return is

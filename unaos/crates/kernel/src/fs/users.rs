@@ -920,7 +920,7 @@ pub fn service() {
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-            crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire); // LOGIN M4 — the Log Out route under test is the CRYSTAL MENU'S ROW (`crystal::logout_row_fire`), not the screen's own reopen; M3's `logout_direct` retires with it.
+            crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire, screen_press_via_router, screen_press_route_name()); // LOGIN M4 — the Log Out route under test is the CRYSTAL MENU'S ROW (`crystal::logout_row_fire`), not the screen's own reopen; M3's `logout_direct` retires with it. LOGINFLOW M1 — and the PRESS route under test is the arch's LIVE ROUTER (`screen_press_via_router`, this file's tail), handed in for exactly the reason the logout route is: a fixture that called `press_swallow` itself would stay green on a tree whose router gate had been deleted — B121's lesson one band over. The seam's NAME travels with it, so the verdict line says which entry was driven rather than leaving the reader to infer it from the arch.
         }
         Err(e) => {
             let n = MOUNT_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1011,5 +1011,104 @@ pub fn login_fixture() {
             epoch,
             vol
         );
+    }
+}
+
+// =========================================================================================
+// LOGINFLOW (M1) — THE TAIL APPEND, and the two reasons it is at the TAIL and knob-gated
+// =========================================================================================
+//
+// `fs/mod.rs:106` declares this module UNCONDITIONALLY (`pub mod users;`), so unlike `video/login.rs`
+// — which `video/crystal.rs`'s tail declares under `#[cfg(feature = "login")]` and which therefore
+// does not exist knob-off at all — every line of this file is in a DEFAULT image. Two consequences,
+// and both are rules rather than preferences (LAWS §5, rmbp-ledger PI5):
+//
+//  1. **TAIL, because a panic `Location` is a line number.** An insert anywhere above shifts the
+//     `Location` of every panic site below it in this file, and `./arroyo knoboff login <baseline>`
+//     compares the knob-OFF image BYTE FOR BYTE. Appending below the last item shifts nothing.
+//  2. **`#[cfg(feature = "login")]`, because "unreferenced, so the linker drops it" is a claim about
+//     an optimiser and not about the source.** Gated, the functions below are not COMPILED knob-off,
+//     which is a fact the build reproduces on every host at every opt level.
+
+/// LOGINFLOW M1 — **the store's own name-by-row accessor, so the login screen can SHOW who lives on
+/// this machine.** The screen draws one row per user and a press on a row picks that name
+/// (`video/login.rs`'s `Ctl::User`), which is the gesture that makes the name field optional for the
+/// person who owns the machine — the Mac model, and the only reason a first-time user is not required
+/// to remember a string they typed once.
+///
+/// Row order is the STORE's order (creation order, as `create_user` appends and `parse_image` reads
+/// back), so the index on a `[login] press … control=user-row` line reads against `/USERS.DAT`
+/// directly. Returns the length written into `out`, or `None` when `i` is past the end — never a
+/// partially written buffer, and never the empty name a corrupt row would carry (`UserRec::read`
+/// refuses those at parse time, so a row that is present is a row that is valid).
+///
+/// This is `home_of`'s shape with the lookup key inverted, and it takes the same one lock for the same
+/// length of time. It is deliberately NOT a slice-returning accessor: `TABLE` is behind a `spin::Mutex`
+/// and a borrow of a row could not outlive the guard.
+#[cfg(feature = "login")]
+pub fn name_at(i: usize, out: &mut [u8; NAME_MAX]) -> Option<usize> {
+    let t = TABLE.lock();
+    if i >= t.count as usize {
+        return None;
+    }
+    let n = t.rows[i].name();
+    if n.is_empty() {
+        return None;
+    }
+    out[..n.len()].copy_from_slice(n);
+    Some(n.len())
+}
+
+/// LOGINFLOW M1 fixture seam (`loginst`) — **route a press through the REAL router this board boots
+/// with, so the fixture proves the PATH and not merely the predicate.**
+///
+/// `video/strip.rs::login_press_fixture` (SESSGATE) proves that `press_route` refuses to route a press
+/// while the screen is up. That is the BARRIER, and it is one frame below the thing a person actually
+/// touches: the arch router. B121's lesson is exactly this distance — `winmenu::selftest` was green on
+/// every x86 boot for months while the metal press was inert, because the fixture called `press_at`
+/// directly and the ROUTER had no arm to reach it. So the login flow's control legs are driven from
+/// the top:
+///
+///  * **x86** takes `wc_click_route_at(Button(1), x, y)`, the coordinate-taking entry `MENUDROP`'s own
+///    fixture drives, which is the LIVE router — the session gate at `arch/x86_64/syscall.rs:7452` is
+///    the first statement of its press edge and `press_swallow` is reached THROUGH it.
+///  * **aarch64** has no coordinate-taking router entry: `wc_click_route` reads the pointer from
+///    `click_pointer_pos()`, which a fixture cannot set without moving a real pointer. It is therefore
+///    driven at `strip::press_route` — the WHOLE of that router's furniture call
+///    (`arch/aarch64/syscall.rs:14326` is `if strip::press_route(x, y) { … return true; }`), one call
+///    below the top and above every window arm. The difference is REPORTED on the verdict line as
+///    `via=`, never smoothed over: a leg that drove a different seam than it claims is the defect this
+///    function exists to avoid.
+///
+/// Returns what the router returned: `true` = consumed, and no window arm ran.
+#[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn screen_press_via_router(x: i32, y: i32) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // PRESS then RELEASE, `menudrop_selftest`'s own shape: this router holds ONE outstanding press
+        // (`CLICK_PRESS_TARGET`) and a fixture that left one armed would hand the next real gesture a
+        // stale target. The verdict is the PRESS edge's — the release is consumed and discarded, which
+        // is what `CLICK_TARGET_DROP` (stored by the session gate itself) already asks for.
+        let hit = crate::arch::x86_64::syscall::wc_click_route_at(crate::pal::Event::Button(1), x, y);
+        let _ = crate::arch::x86_64::syscall::wc_click_route_at(crate::pal::Event::Button(0), x, y);
+        hit
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::video::strip::press_route(x, y)
+    }
+}
+
+/// The seam's own name on the wire — see [`screen_press_via_router`] for why the two arches differ and
+/// why the difference is printed rather than hidden.
+#[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn screen_press_route_name() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        "wc_click_route_at"
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        "strip::press_route"
     }
 }
