@@ -285,3 +285,4 @@ refs/heads/exec-rmbp-dockid2               9d190c4c IN-FLIGHT      rmbp         
 refs/heads/exec-rmbp-sdhcrw                2495f3a2 IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-starthold             2495f3a2 IN-FLIGHT      rmbp                      2026-09-22
 refs/heads/exec-rmbp-vectors               2495f3a2 IN-FLIGHT      rmbp                      2026-09-22
+refs/heads/exec-rmbp-seclogin              86f33c93 IN-FLIGHT      rmbp                      2026-09-22
