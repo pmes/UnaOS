@@ -70,13 +70,14 @@ relation and never equality).
 | --- | --- | --- | --- | --- |
 | `NV_PMC_INTR_0` | BAR0 `0x000100` | `[26]` = PDISPLAY | open-gpu-doc `dev_master`; the public NV50+ PMC interrupt-source table | offset **[TREE]** (§2.1); **bit 26 is [EXT] and UNVERIFIED on GK107** |
 | `NV_PMC_INTR_EN` | BAR0 `0x000140` | `[26]` = PDISPLAY | same | same |
-| PDISPLAY per-head vblank interrupt **ENABLE** | — | — | — | **NOT-IN-TREE** |
-| PDISPLAY per-head vblank interrupt **STATUS** | — | — | — | **NOT-IN-TREE** |
+| ~~PDISPLAY per-head vblank interrupt **ENABLE**~~ | — | — | — | ~~**NOT-IN-TREE**~~ — **RESOLVED, see §2.3.3** |
+| ~~PDISPLAY per-head vblank interrupt **STATUS**~~ | — | — | — | ~~**NOT-IN-TREE**~~ — **RESOLVED, see §2.3.3** |
 
-The two `NOT-IN-TREE` rows are named rather than guessed, in the `igpu-dpy … NOT-IN-TREE` idiom
-(`igpu.rs:1731`): no offset for that pair exists in this tree or in the two documents above as this
-seat read them, so `kepler_vblank.rs` neither reads nor writes it. **They are the real blocker on a
-true vblank interrupt** — without them the engine never raises the event, whatever PMC says.
+The two `NOT-IN-TREE` rows were named rather than guessed, in the `igpu-dpy … NOT-IN-TREE` idiom
+(`igpu.rs:1731`). **KVBLANK2 (rmbp-ledger B179) resolved them from the public documentation and
+§2.3.3 below replaces them.** The paragraph is left standing as the record of the first pass: the
+pair was the real blocker on a true vblank interrupt, and it was found in the file this section had
+already cited.
 
 `UNAOS_KEPLER_VBLANK=1` sets **exactly bit 26** in `NV_PMC_INTR_EN` (which `kepler::init` has
 written `0` since the driver's first day), watches `NV_PMC_INTR_0` for 50 ms, and RESTORES the
@@ -84,6 +85,65 @@ captured value with a read-back. Delivery is impossible by construction — this
 hard-coded IDT vectors and no vector allocator a PCI function can join — so the rung asks whether
 the SOURCE latches, not whether an interrupt arrives, and the vblank EDGE it counts comes from
 `HEAD_STAT.VERT[31:16]` above (`mode=poll`). See `docs/dev/OS/rmbp-ledger.md` B145.
+
+#### 2.3.3 The GF119-class per-head vblank interrupt block (KVBLANK2, B179)
+
+Source of record: **envytools rnndb `display/g80_pdisplay.xml`** — the *same file* §2.3.1 cites for
+`HEAD_STAT`. No nouveau and no Linux kernel source was read, quoted or transcribed for any row here.
+
+**Where KVBLANK's search stopped, stated plainly, because it is the finding.** That file carries two
+PDISPLAY generations inside one `<array name="PDISPLAY" offset="0x610000" stride="0x20000">`
+(line 153):
+
+| stripe | opens | closes | its interrupt registers |
+| --- | --- | --- | --- |
+| `<stripe variants="G80:GF119">` | line **182** | line **446** | `INTR_0` / `INTR_1` / `INTR_EN_0` / `INTR_EN_1` at `+0x0020`–`+0x002c` (lines 214-217) — NV50-shaped, **no per-head VBLANK bit** |
+| `<stripe variants="GF119-">` | line **448** | line **603** | the block below |
+
+KVBLANK read the first stripe, correctly found no per-head ENABLE/STATUS pair in it, and reported
+the absence. The GK107 is a GF119-class display and its registers begin **two lines past where that
+read ended**. The lesson generalises past this arc: in rnndb a *variant stripe* is a second register
+map in the same file, and an absence claim is only as wide as the stripe it was made in.
+
+**THE BLOCK.** Every offset is PDISPLAY-relative — `0x610000`, i.e. `regs::NV_PDISPLAY_BASE` — for
+the same reason `HEAD_STAT`'s `0x6000` is: the `GF119-` stripe carries no `offset=` attribute. Not
+one new base is introduced.
+
+| register | offset | bits | rnndb line | class | KVBLANK2 access |
+| --- | --- | --- | --- | --- | --- |
+| `INTR_SUMMARY` | PDISPLAY `+0x058` | `[24..27]` = `HEAD_0..HEAD_3` | `:516` (reg), `:455`-`:458` (bitset) | **[EXT]** | read-only |
+| `INTR_HEAD_STATUS` | PDISPLAY `+0x074 + head*0x800`, 4 heads | `[0]` = `VBLANK` | `:523` | **[EXT]** | read-only |
+| `INTR_HEAD_TRIGGER` | PDISPLAY `+0x078 + head*0x800`, 4 heads | same bitset | `:524` | **[EXT]** | **never touched** |
+| `INTR_HOST_SUMMARY` | PDISPLAY `+0x088` | `[24..27]` = `HEAD_0..HEAD_3` | `:528` | **[EXT]** | read-only |
+| `INTR_HOST_HEAD` | PDISPLAY `+0x0BC + head*0x800`, 4 heads | `[0]` = `VBLANK` | `:541` | **[EXT]** | read-only |
+| `INTR_HOST_HEAD_EN` | PDISPLAY `+0x0C0 + head*0x800`, 4 heads | `[0]` = `VBLANK` | `:542` | **[EXT]** | **THE ENABLE — the only register in this block KVBLANK2 writes** |
+| `INTR_HOST_HEAD_DISPATCH` | PDISPLAY `+0x0C8 + head*0x800`, 4 heads | same bitset | `:544` | **[EXT]** | read-only (reported, never steered) |
+
+The `_HEAD_` registers all carry `stride="0x800" length="4"` in rnndb itself (`:523`, `:524`,
+`:541`-`:544`) — the per-head stride is that file's statement, not an inference from `HEAD_STAT`'s.
+
+**THE GENERATION IS READ OFF THE BITSET, NOT ASSUMED.** Bitset `gf119_pdisplay_intr_head` (line
+489) declares two of its bitfields `variants="GK104-"`: `pos="2" name="UNK2"` (line 492) and
+`pos="27" name="UNK27"` (line 507). A bitset that names GK104-only bits is one rnndb asserts over
+GK104-generation parts, and the GK107 in this laptop is one. `VBLANK` at `pos="0"` (line 490) carries
+no `variants` qualifier, so it holds across the whole `GF119-` stripe.
+
+**⚠ WHAT IS STILL NOT CITED — the ACK.** rnndb names the registers and the bits. It does **not**
+state how a latched head status bit is cleared. `INTR_HEAD_STATUS` has an `INTR_HEAD_TRIGGER`
+partner, which is *suggestive* of a write-1-to-set / write-1-to-clear pair; suggestive is not a
+citation, and the whole point of the `NOT-IN-TREE` idiom is that a guessed write is not made.
+**So KVBLANK2's ISR never writes a status or a trigger register.** It acknowledges by DISARMING at
+the cited `INTR_HOST_HEAD_EN` — writing back the word captured before the arm — which touches only
+a cited register and makes an interrupt storm impossible by construction. The rung re-arms on the
+next vblank, so a window still measures many deliveries rather than one. **The ack protocol remains
+`NOT-IN-TREE` and is OWED**; the search that would close it is a document naming write semantics for
+`INTR_HEAD_STATUS`, which neither the rnndb XML nor open-gpu-doc `dev_master` provided.
+
+**⚠ NOT-IN-TREE, SEARCH RECORDED.** The rnndb `display/` directory holds `g80_pdisplay.xml`,
+`gf119_punk1c3.xml` (PUNK1C3, not a display interrupt block), `nv_evo.xml` (the EVO channel methods,
+no MMIO interrupt registers), and eleven pre-NV50 files. There is **no separate GF119 PDISPLAY
+file**; the GF119 map lives in the stripe above. A reader looking for `gf119_pdisplay.xml` will not
+find one, and that is the trap this section exists to disarm.
 
 ### 2.4 Host / PFIFO runlist submit - Base `0x002000`
 

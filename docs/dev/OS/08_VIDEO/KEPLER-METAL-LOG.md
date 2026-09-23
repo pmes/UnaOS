@@ -8,6 +8,108 @@ QEMU behavior. Newest sitting first.
 > in [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) (R19; rmbp-ledger B10). This file stays the
 > per-sitting narrative; the register is the verdict table.**
 
+## PRE-REGISTERED — KVBLANK2 (rmbp, the GPU line under R53), rungs R1 CITATION / R2 ENABLE WINDOW / R3 THE VECTOR, cut 2026-09-22
+
+**NOT FLOWN.** Written here before the boot, unedited afterwards, because that is what makes the
+reading falsifiable. Branch `exec-rmbp-kvblank2`, parent `1ad4ee3b`. Knob `UNAOS_KEPLER_VBLANK=1`
+(no new knob — the rungs ride KVBLANK's). Registers and their citation lines: `gpu_spec.md` §2.3.3.
+Ledger row **B179**.
+
+**WHAT CHANGED SINCE KVBLANK, IN ONE SENTENCE.** KVBLANK could not wire an interrupt because (a) the
+kernel had no vector allocator, (b) nothing called `enable_msi` for the GK107, and (c) the PDISPLAY
+per-head vblank ENABLE/STATUS pair was `NOT-IN-TREE`. VECTORS (**B168**) answered (a), IOAPIC
+(**B147**) answered the INTx half of (b), and **KVBLANK2 answered (c) by finding the pair in the
+file KVBLANK had already cited** — `g80_pdisplay.xml`'s `<stripe variants="GF119->` at lines
+448-603, two lines past where the first read stopped.
+
+### What flight 12 (or 13) must print, per rung, on success AND on the honest refusal
+
+Every rung's witness is designed so the flight falsifies it. `head=0 vt=1852` are flights 8/9's own
+BEAMX86 readings; the rungs arm on the head the beam gate chose and never choose again.
+
+**PRECONDITION FOR ALL THREE, and it is the first thing to check if the block is silent.** The
+ladder is driven by the VBLANK EDGE, i.e. by `note()`, i.e. by `scanout_beam()`, i.e. by a
+compositor that is presenting. A boot that reaches the desktop and then idles with no window motion
+takes no edges and the ladder stalls where it stands. **The flight must drive the compositor** — open
+a window, drag it, let the clock repaint — for at least ~20 s after the desktop is up. If only the
+`bdf-hunt` line appears, that is the diagnosis, not a Kepler refusal.
+
+**R0 — the bdf, at `kepler::init`, before any of it.**
+
+```
+:: kepler: vblank bdf-hunt bar0=<the BAR0 kepler::init mapped> bus_max=16 found=1 bdf=1:0.0 ::
+```
+*Honest refusal:* `found=0 bdf=255:255.255` — no NVIDIA function up to bus 16 has that BAR0. Then
+every later `vector` line reads `REFUSED reason=no-bdf` and nothing is armed. If `found=0` while the
+Kepler is plainly up, the bound is the suspect, not the match.
+
+**R1 — the census. WRITES NOTHING.** Eight lines, spaced 30 vblanks (~0.5 s), over ~4 s of scanout:
+
+```
+:: kepler: vblank-intr census sample=1/8 head=0 status=<w> en=<w> count_delta=<n> host_status=<w> host_dispatch=<w> summary=<w> host_summary=<w> vblank_bit=<0|1> host_vblank_bit=<0|1> summary_head_bit=<0|1> ::
+```
+*The reading:* `en=` is what the firmware left the per-head enable at — **the single most valuable
+number in this flight**, because it says whether the GOP/EFI driver was using the vblank interrupt
+before we took the panel. `status=`/`host_status=` frozen at one value across all eight samples
+while `count_delta=30` each time says the status does not latch without the enable; a `status=` that
+moves with the enable already clear says it latches regardless, and R2's window is then only
+confirming. Either is a result.
+*Honest refusal:* all six words read `FFFFFFFF` — the PDISPLAY aperture is not answering at these
+offsets, the `GF119-` stripe does not apply to this part, and **R2 and R3 must not be believed**.
+
+**R2 — the enable window. Two writes, both to `INTR_HOST_HEAD_EN`, restored and read back.**
+
+```
+:: kepler: vblank-intr window open head=0 bit=0 en_entry=<w> en_armed=<en_entry|1> took=1 window_vblanks=16 ::
+:: kepler: vblank-intr window close head=0 vblanks=16 samples=16 vblank_seen=<n>/16 status_or=<w> host_status_or=<w> restored=<en_entry> readback=<en_entry> verdict=clean ::
+```
+*Success:* `took=1` and `vblank_seen=16/16` — the enable latched and the status bit tracks the
+raster. *The other real outcome:* `took=1 vblank_seen=0/16 verdict=clean` — **a status that never
+toggles is a RESULT, not a failure.** It says the GF119- per-head VBLANK status does not assert on
+this head under the enable alone, and it is the evidence R3 needs before it is believed.
+*Honest refusal:* `took=0` — the enable bit did not stick, so this register is not writable here and
+R3's arm will be meaningless. *Red:* `verdict=DIRTY` — the restore did not read back, which is the
+one outcome that says this rung left the card changed. Nothing else in the block may be trusted.
+
+**R3 — the vector. Four writes, all restored and read back.**
+
+```
+:: kepler: vblank-intr vector armed bdf=1:0.0 vector=0x44 wire=<1|2> pmc_entry=00000000 pmc_bit=26 en_entry=<w> head=0 window_vblanks=60 storm_cap=4096 ::
+:: kepler: vblank-intr vector close head=0 irq=<n> vbl_delta=60 rearms=<n> wire=<1|2> vector=0x44 storm=0 pmc_restored=00000000 pmc_readback=00000000 en_restored=<w> en_readback=<w> verdict=clean mode=<irq|poll> ::
+```
+*Success — THE READING THIS WHOLE ARC EXISTS FOR:* `irq=` OFF ZERO with `vbl_delta=60`. The ratio is
+the delivery rate; `irq=60 vbl_delta=60` is one interrupt per frame and is the answer that ends the
+spin. `mode=irq` then appears on every subsequent `:: kepler: vblank head=` line, **and it appears
+because the wire delivered, not because a knob was set.**
+*Honest refusal, and it is a perfectly good flight:* `irq=0 vbl_delta=60 verdict=clean mode=poll`.
+The raster ran, the vector was allocated and registered, the function was programmed, PMC bit 26 was
+unmasked and the per-head VBLANK enable was set — and nothing arrived. That convicts the remaining
+uncited link (the ack protocol, or a `DISPATCH` steering this rung deliberately does not touch, or
+PMC bit 26 not being PDISPLAY on GK107) and it is worth more than a guess that happened to work.
+*The two refusals upstream of the wire:* `REFUSED reason=alloc` (the allocator said no — its own
+`[vectors]` witness is directly above) and `REFUSED reason=no-msi-no-intx` (the function offers no
+usable MSI capability and the IOAPIC would not take its INTx). In both, **nothing on the GK107 was
+armed**; the vector, if allocated, stays owned by name, which is the allocator's contract.
+*The safety valve:* `storm=1` means the ISR hit 4096 entries and cut PDISPLAY at PMC. The disarm at
+the enable did not deassert the line — a real fact about the part, printed, with the boot alive.
+
+**⚠ WHAT NO FLIGHT OF THIS ARC CAN SHOW, and it is structural.** Even `irq=60/60` does **not** make
+`beam::hold`'s wait cheap. `hold` runs IRQ-masked on the presenting core inside `COMP_GATE`
+(`wm.rs:8582`, `:6950`), so the ISR cannot advance a counter while a wait is spinning on it. The
+saving VUGPERF asked for needs `hold` to run unmasked — a `video/wm.rs` change fenced off this
+brief and **OWED**. What `irq>0` buys today is the PROOF that the source exists, which is the
+precondition for that arc and is exactly what has been missing since B145.
+
+**⚠ AND A DEFECT IN KVBLANK'S SHIPPED RUNG 2, FIXED HERE, which changes what flight 12 would have
+read.** `wait_next_edge` could never have advanced on hardware: it spins on `counter()`, whose
+polled term is advanced only by `note()`, fed only by `scanout_beam()` — and neither the wait nor
+`beam::hold`'s wait arm called it. Inside the wait the counter was FROZEN, so every armed present
+burned the full 33.3 ms give-up budget and fell through to the spin. Had flight 12 flown the KVBLANK
+image on a wide-zone desktop, `[wc-h] beamwait_us` would have gone UP, not down, and `vbgaveup=`
+would have equalled `vbwaits=`. QEMU could not see it: the fixture's `SIM_MODE=1` counter is
+computed from `now_cycles()` and advances with wall time, needing no sampler. **The flight's check
+on the fix: `vbgaveup=` must be a small fraction of `vbwaits=`, not equal to it.**
+
 ## PRE-REGISTERED — KVBLANK (rmbp, the GPU line under R53), rungs `kvblank-measure` + `kvblank-wait`, cut 2026-09-22
 
 **NOT FLOWN.** Written here before the boot, unedited afterwards, because that is what makes the
