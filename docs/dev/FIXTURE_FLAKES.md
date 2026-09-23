@@ -1195,6 +1195,93 @@ rmbp-queue's `· B9` row (`[ptrdead] … fpop3=1 -> FAIL`, 2 reds in 5 WC runs,
 both at load ≥ 24) is about the older grammar. A `-> FAIL` with `fpop12=0` is
 still the regression this entry warns about.
 
+### 3b. `[cursor11] … passes=0 … -> FLICKER` on the KNOB-OFF lane: PTRDEAD's stolen motion reaches the real arrow. **Measured 2026-09-23 (CURSORFLK, rmbp-ledger B186). The flicker is real, the trigger is this class, NOT FIXED.**
+
+The entry above is this class's first and has no letter. This one is its second consequence. There, a
+foreign drain took PTRDEAD's events away from the leg's own accounting. Here, the drain that took them
+is `x86_input_service`, and it **delivered** them to the real pointer.
+
+**Signature on the wire** (`video/cursor.rs:1484` `cursor11_rollup`, the verdict's own format), convicted
+by `mbench`'s builtin `-> FLICKER` FORBID (`scripts/mbench.py:153`) and by no spec directive:
+
+```
+[cursor11] compose-through scope=desk passes=0 bracketed=0 px_deferred=0 px_installed=0 px_redrawn=0 flicker_frames=5 px_absorbed=0 absorb_refused=0 -> FLICKER
+  ❌ FORBID*    -> FLICKER
+```
+
+**Read the banner FIRST: it is a knob-off (`wc`-less) x86 boot, and only there.** On a `wc` x86 build
+this line cannot say FLICKER: `video/screen.rs:866` `DESK_SPRITE_OCC` is `cfg!(all(x86_64, wc))`,
+`bracket_needed` returns `(false, true)` at `:1552`, and the count at `:1455-1457` needs `bracket`.
+`passes=0 bracketed=0 … px_absorbed=0` is the knob-off fingerprint: that build has no composite passes,
+and nothing withholds the arrow. **Then look directly above it for the discriminator, which is already
+printed:**
+
+```
+[ptrdead] -> SKIP (window raced: fpop12=1 fpop3=0) — a competing drain took this fixture's own queued events; cpu=3 svc=Some(5)
+[cursor] armed x=641 y=399
+[ptrdead] backlog whole=skip nodrop=skip order=true pushed=192 entries=1 travel=(191,-191) … fpop12=1 … -> PASS
+```
+
+**`[cursor] armed` right beside a `[ptrdead] -> SKIP` is the whole diagnosis.** The knob-off lane has no
+pointer. q35's tablet never arms it, and 64 of 64 knob-off boots with `fpop12=0` print no
+`[cursor] armed` at all. The arrow appears at the panel centre (640,400) plus exactly the travel the leg
+lost: 192 − 191 = (1,−1) gives (641,399), and on `ioapic-logs/test-r3.log` 192 − 28 = (164,−164) gives
+(804,236). The stolen synthetic motion is the arrow's position, to the pixel.
+
+**Mechanism: three steps, each measured.**
+
+1. **The leak (this class).** PTRDEAD's backlog leg pushes 192 synthetic `Mouse{1,-1}` into the live
+   `pal::EVENT_QUEUE` (`arch/x86_64/syscall.rs:7163-7165`). A timer preemption hands the fold
+   accumulator to `x86_input_service` on the service core (`main.rs:6121`; its `Event::Mouse` arm `:6165`
+   calls `x86_ptr_install`, `:10159`), which moves and draws the REAL arrow. The leg's SELFTEST-RACE SKIP
+   protects the leg's verdict. It cannot recall events the product has already consumed. The aarch64 tree
+   already states this rule (`main.rs:3827-3835`, `ROUTER_SELFTEST`: a fixture's synthetic pointer events
+   arm nothing, "no `[cursor] armed` on a panel with no pointer"). x86 has no counterpart.
+2. **The real flicker (the cursor code's, knob-off configuration).** For `HIDE_AFTER_MS` (1.5 s,
+   `pal.rs:327`) the arrow is live and visible. Every desktop present whose damage meets its box takes
+   the CURSOR-13 bracket. On x86 the front buffer IS the scan-out, so a pointerless panel is published.
+   The counter's own rustdoc says that on knob-off x86 it is "a live measurement rather than an invariant"
+   (`video/cursor.rs:1163-1164`).
+3. **The truthful instrument.** `cursor11_desk_tick` (`video/cursor.rs:1283`) prints only when the
+   counters moved. On knob-off every counter except `flicker_frames` is 0, so **on this lane the line
+   exists only when it says FLICKER**. An armed arrow that no present met prints nothing: 2 of the 4 leaks
+   in the population did that.
+
+**Not Class 6 and not Class 1**, and the control proves it. A scratch probe hands the backlog to the
+service on demand: a line-neutral spin until `evq_pops()` moves, appended after the push loop, and
+reverted. On the knob-off build it went red **2 of 2** (`armed x=832 y=208`, `flicker_frames=5` and `=4`,
+`MBENCH FAIL … 2 forbidden`), the natural red character for character. **The same probe on
+`UNAOS_WC=1`** puts the same arrow at the same pixel and reads `flicker_frames=0 px_absorbed=405 -> THROUGH`
+with `[flick2] … flush_undraw=0`, rc=0. The presents met the arrow in both builds. `wc` withholds it and
+knob-off brackets it, and `[cursor11]` counts exactly that difference.
+
+**Trigger conditions.** Load-correlated, like the rest of this class, because it needs a timer
+preemption inside PTRDEAD's push→pop window. Knob-off population, 2026-09-15..23: **2 FLICKER in 68
+boots** (about 3%): `stor1-logs/m2-default2.log` and `ioapic-logs/test-r3.log`. That comes from **4
+leaks in 68** (fpop12 ≥ 1), and all 4 armed the arrow. CURSORFLK's own 8 complete
+`UNAOS_QEMU_FULL=1 ./arroyo test 120` runs at load 3–18 were 8 of 8 `fpop12=0`, unarmed, green. Full
+table, per-boot population and probe: `docs/dev/evidence/rmbp-0915/cursorflk/`.
+
+**What to capture on recurrence.**
+
+1. The kernel-features banner. A `wc` build carrying `-> FLICKER` is NOT this entry: there the count is
+   structurally 0, so it is a PTRREPAINT regression.
+2. The `[ptrdead]` pair and whether `[cursor] armed` sits between or beside them. A knob-off FLICKER with
+   `fpop12=0` and no fixture-adjacent `[cursor] armed` means a pointer came from somewhere else, which is
+   new and reportable.
+3. The armed coordinates against (640 + stolen, 400 − stolen), where stolen = 192 − `travel`.
+
+**Disposition — WATCH, NOT FIXED, and not a re-run-away.** The instrument is right, and the flicker it
+counts is the knob-off cursor code's real behaviour. Under the brief's rule a real flicker is not fixed
+in the arc that finds it. Two cures, each for its owner:
+
+1. **Stop the leak.** Quiesce `x86_input_service`'s drain across PTRDEAD's window (the `ROUTER_SELFTEST`
+   shape). This is `main.rs` work and it is this class's open "quiesce or tolerate" question, now priced:
+   tolerating costs a knob-off gate run about 3% of the time.
+2. **Decide the knob-off flicker contract.** Either compile PTRREPAINT's subtraction on knob-off x86, or
+   exempt that build from the always-on `-> FLICKER` FORBID. Until then, **any knob-off x86 boot with a
+   real pointer can red that FORBID**, and the QEMU knob-off lane is green only because it has no pointer.
+
 ---
 
 ## Class 4 — `test-arm` captures NO serial bytes at all (aarch64 virt, loaded host)

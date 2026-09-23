@@ -1,0 +1,13 @@
+diff --git a/unaos/crates/kernel/src/arch/x86_64/syscall.rs b/unaos/crates/kernel/src/arch/x86_64/syscall.rs
+index 96612fe8..2eb07bb3 100644
+--- a/unaos/crates/kernel/src/arch/x86_64/syscall.rs
++++ b/unaos/crates/kernel/src/arch/x86_64/syscall.rs
+@@ -7162,7 +7162,7 @@ fn ptrdead_selftest_body() {
+     let pop0 = evq_pops();
+     for _ in 0..n {
+         crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: -1 }), None);
+-    }
++    } { let t0 = crate::arch::ms(); while evq_pops() == pop0 && crate::arch::ms().wrapping_sub(t0) < 200 { core::hint::spin_loop(); } serial_println!("[cursorflk-probe] backlog handed to a foreign drain after {}ms pops={}", crate::arch::ms().wrapping_sub(t0), evq_pops() - pop0); }
+     let (mut sx, mut sy, mut entries) = (0i32, 0i32, 0u32);
+     for _ in 0..crate::pal::QUEUE_SIZE_PUB {
+         match crate::pal::next_event() {
