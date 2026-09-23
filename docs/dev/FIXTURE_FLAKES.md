@@ -873,9 +873,140 @@ paragraph above says a go-red had to be DELIBERATE.
 
 ---
 
-### 1e. `:: DOCK: strip … vacate=false :: FAIL ::` — **measured 2026-09-23 (rmbp seat, gate10 at 29ca25d0): 1 in 8, timing-shaped, mechanism NOT yet read**
+### 1e. `:: DOCK: strip … vacate=false :: FAIL ::` — **measured 2026-09-23 (rmbp seat, gate10 at 29ca25d0): 1 in 8 on QEMU. MECHANISM READ AND RE-CLASSED 2026-09-23 (DOCKVAC, rmbp-ledger B187): NOT a Class 1 teardown race and NOT a missed vacate — CLASS 6, the fixture's three `wm::composite()` calls were DECLINED by `COMP_GATE` and it scored the rect those passes were to publish. The same leg has been red on EVERY metal capture on the bench (flights 7, 8, 9, 11; flight 5 by its postmortem). FIXED in the fixture (branch `exec-rmbp-dockvac`, parent `98fd8e66`; the branch tip is the sha — the seat fills it at the fold).**
 
-The fixture is `video/dock.rs` `selftest()` (:1193), the strip leg 6 at ~:1360–1377 ("THE STRIP OWES ITS VACATED PIXELS"): it samples `SLOT.packed()` before closing three windows and again after, and requires the packed rect to CHANGE (`vacate_ok = rect_before == 0 || rect_after != rect_before`). Every other term on the line read true. Population on the same code (29ca25d0 or its dock/strip-identical ancestors): gate9a wc lane at cd642fd8 (host load 28) PASS; DOCKSTAMP's three wc runs at c65e5618 PASS; gate10's ptr lane at 29ca25d0 PASS; two wc reruns on a detached tree at 29ca25d0 (`logs/foldgate/wcre-run{1,2}.log`, loads 7 and 10) PASS; gate10's wc lane at 29ca25d0 (load 10) FAIL. The `[strip] vacate tenant=dock box=444x52+418+736 uncovered_px=5616 erased=yes src=flat -> SCENE-RESTORE` line is present in the red run exactly as in the green ones, so the strip DID vacate on the wire; what differed is the rect the fixture read. Candidate mechanisms, none measured: the after-sample raced the strip's re-pack (Class 1 shape — the ground-truth re-read races the fixture's teardown), or the before-sample read a rect already vacated by an earlier close. Disposition: ON WATCH; the next red run's `[strip]`/`[dock]` lines around the verdict are the evidence to read first; a fix is a `video/dock.rs` fixture arc, not a seat edit.
+*The finding as the seat wrote it (kept verbatim; its two candidate mechanisms and its reading of the
+`[strip] vacate` line are answered below):*
+
+> The fixture is `video/dock.rs` `selftest()` (:1193), the strip leg 6 at ~:1360–1377 ("THE STRIP OWES ITS VACATED PIXELS"): it samples `SLOT.packed()` before closing three windows and again after, and requires the packed rect to CHANGE (`vacate_ok = rect_before == 0 || rect_after != rect_before`). Every other term on the line read true. Population on the same code (29ca25d0 or its dock/strip-identical ancestors): gate9a wc lane at cd642fd8 (host load 28) PASS; DOCKSTAMP's three wc runs at c65e5618 PASS; gate10's ptr lane at 29ca25d0 PASS; two wc reruns on a detached tree at 29ca25d0 (`logs/foldgate/wcre-run{1,2}.log`, loads 7 and 10) PASS; gate10's wc lane at 29ca25d0 (load 10) FAIL. The `[strip] vacate tenant=dock box=444x52+418+736 uncovered_px=5616 erased=yes src=flat -> SCENE-RESTORE` line is present in the red run exactly as in the green ones, so the strip DID vacate on the wire; what differed is the rect the fixture read. Candidate mechanisms, none measured: the after-sample raced the strip's re-pack (Class 1 shape — the ground-truth re-read races the fixture's teardown), or the before-sample read a rect already vacated by an earlier close. Disposition: ON WATCH; the next red run's `[strip]`/`[dock]` lines around the verdict are the evidence to read first; a fix is a `video/dock.rs` fixture arc, not a seat edit.
+
+**Signature on the wire** (gate10's red, `logs/foldgate/g10-test-x86-wc.log:2127..2147`, the capture's
+own `serial.log:1604`):
+
+```text
+[occ62] pardon win=2 cause=contended suppressed=wc-d/wc-g coverage=whole
+[wm] close win=1 gen=7 route=none holders-cleared=0 names=,,,
+[dock] tile remove win=1 gen=7 owner=0xd0c1 reason=close     <-- a SIBLING core's pass, before the fixture's own print
+[wc-a] close win=1
+[wm] close win=2 gen=4 route=none holders-cleared=0 names=,,,
+[wc-a] close win=2                                            <-- no tile remove for win 2
+[wm] close win=3 gen=3 route=none holders-cleared=0 names=,,,
+[wc-a] close win=3                                            <-- no tile remove for win 3
+:: DOCK: strip tiles=6 at x=310 w=660 glyphs=8, probe=(694,762) model=true geom=true restore=true specific=true miss=true vacate=false furniture park=parked/true :: FAIL ::
+[dock] census tiles=5 win:gen=quarry:pin,2:4,3:3,console:pin,shell:pin   <-- that sibling pass's census, AFTER the verdict
+```
+
+Every one of the seven greens (`g9-test-x86-wc.log:2119..2135`, `wcre-run1.log`, `wcre-run2.log`,
+`g10-test-ptr.log`, DOCKSTAMP's three) prints `[dock] tile remove win=N … reason=close` and a
+`[dock] census` after EACH of the three closes, before the verdict. The red prints one remove, from a
+pass that was not the fixture's, and no census until after the verdict — and the next reconcile retires
+win 2 and win 3 as `reason=reuse`, i.e. no pass reached the dock between the closes and DOCKID's
+re-mint of those slots.
+
+**The `[strip] vacate` line is NOT the fixture's vacate** — this corrects the paragraph above. `strip::vacate`
+prints `… -> SCENE-RESTORE` under a once-per-tenant latch (`SAID_RESTORE`, `video/strip.rs` `vacate`), so a
+boot prints it exactly once, for the dock's FIRST shrink: `g10-test-x86-wc.log:1916`, ~230 lines ahead of the
+fixture, and the same line at the same box in every green. It cannot say whether the fixture's closes vacated.
+
+**Root cause — known, and it is Class 6.** Leg 6 (`video/dock.rs` `selftest`, `rect_before`/`rect_after` at
+:1363/:1367 on the parent) reads `SLOT.packed()`. `SLOT` has ONE writer, `dock::compose` (`SLOT.store` /
+`SLOT.clear`), and `compose` runs only inside a composite pass. The fixture's only passes are the
+`composite()` at the tail of each `wm::close` (`video/wm.rs` `close`), and on x86 that call compare-exchanges
+`COMP_GATE` and, when a sibling core holds it, takes the DECLINE arm — stores `COMP_PENDING`, composites
+nothing, returns in microseconds, identically to a pass that ran (the DECLINE arm of `wm.rs` `composite`;
+WC-K2's note in `move_to` names the consequence: "the box then rides the holder's re-run or the next pass"). In the
+red a sibling core was mid-pass — it had reconciled win 1 and not yet printed its census — for the whole of
+closes 2 and 3 and the verdict, so all three of the fixture's passes were turned away and the after-sample
+WAS the before-sample. The two candidates the paragraph above named: the after-sample did race the strip's
+re-pack, but the race is a DECLINED drive, not a teardown (Class 1 is a launcher racing a ring-3 exit); and
+the before-sample cannot be an already-vacated rect, because nothing between the three creates and the
+three closes changes the tile count (`wm::minimise` keeps w[2] in the model as `visible=false`; the last
+census before the closes reads `tiles=6`, and the verdict's own `tiles=6` is that model).
+
+**It is the fixture's, not the strip's.** The strip's rule is "erase what you vacate on the next pass that
+composes", and the next pass does: `compose` computes `vacated` from `SLOT.packed()` against the model it
+just scanned, so a declined pass defers the vacate, it cannot lose it. A missed vacate would show a pass
+that REACHED `compose` on the post-close model and left the slot where it was; no capture shows that, and
+the fix below reds on exactly that case.
+
+**Go-red — the red reproduced on demand, THE SAME PROBE ON BOTH TREES** (`probe-apply.py`, scratch in
+`wm.rs` + `dock.rs`, reverted before any commit; `probe.diff` sha256
+`f777fc9a05e3a1f2781dff9c9ac46607625d08adccf59178fe696ecf07a28796`). From the moment leg 6 samples
+`rect_before`, every `composite()` on every core takes the DECLINE arm for 80 ms — a `COMP_GATE` held by a
+stalled holder, DMGFLAKE's forced-fold hold (§1c):
+
+```text
+PARENT 98fd8e66 + probe  (host load 5.72, UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1
+                          UNAOS_QEMU_FULL=1 ./arroyo test 240, rc=1, full wall 294.1s)
+  r1-parent-probe-serial.log
+  1603: :: DOCKVAC-PROBE: every composite declines for 80 ms from ms=4317 (COMP_GATE held, as under a stalled holder) ::
+  1604..1612: three `[wm] close` / `[wc-a] close` pairs, ZERO `[dock]` lines
+  1613: :: DOCK: strip tiles=6 at x=310 w=660 glyphs=8, probe=(694,762) model=true geom=true restore=true specific=true miss=true vacate=false furniture park=parked/true :: FAIL ::
+FIX + THE SAME PROBE  (host load 11.90, same command, rc=0, MBENCH PASS 16/16, full wall 240.5s)
+  r2-fix-probe-serial.log
+  1613..1615: [dock] tile remove win=1/2/3 … reason=close
+  1616: [dock] census tiles=3 win:gen=quarry:pin,console:pin,shell:pin
+  1617: [dock] vacate settle folds=56 wait_ms=81 reconciles=1 budget_ms=250 -> SETTLED
+  1619: :: DOCK: strip tiles=6 at x=310 w=660 glyphs=8, probe=(694,762) model=true geom=true restore=true specific=true miss=true vacate=true furniture park=parked/true :: PASS ::
+```
+
+The probe's red line is gate10's red line character for character, which is what makes the probe and the
+flake the same event. `wait_ms=81` against an 80 ms hold is the fixture waiting the holder out and not a
+millisecond longer.
+
+**Fix — in the fixture's shape, not the strip's or the compositor's.** Leg 6's after-sample is now
+`vacate_settle(pw, ph)` (tail-appended to `dock.rs`, `witness`-gated; the leg's line is a same-line fold,
+B94 line-neutral): it re-drives `wm::composite()`, bounded by DOCKID2's 250 ms budget and spin pacing
+(`DOCKID_FOLD_WAIT_MS`, `DOCKID_FOLD_SPIN_MAX` — reused, not re-derived; DOCKID2's counters are not
+touched), until `SLOT` holds the rect the CURRENT model demands (`strip_rect`, the tenant registry's reader
+of the pinned count), then samples. Of the three cures the brief offered this is the honest one:
+*sampling after the strip's vacate event* has no per-event witness to key on (the `[strip] vacate` line is
+latched once per boot, and the tenant's `vacates=` counter answers "an erase ran", not "the rect was
+re-published", which is what the leg asserts); *comparing against the `[strip] vacate` outcome* inherits the
+same latch; *waiting out the re-pack, bounded* asks the question the leg has. The settle predicate is the
+MODEL's rect and not "the rect changed", because a wait on the leg's own inequality would be the verdict
+wearing a loop. The verdict expression (`rect_before == 0 || rect_after != rect_before`) is unchanged, so a
+strip that shrinks without re-publishing its rect — the defect the leg was written for — never settles, the
+budget runs out, and the leg reds as it always did. The wait is REPORTED, never gated on:
+`[dock] vacate settle folds=<n> wait_ms=<ms> reconciles=<r> budget_ms=250 -> SETTLED | UNSETTLED why=no-pass |
+UNSETTLED why=pass-ran`, no `PASS`/`FAIL`/`SKIP` token, so it trips no DEFAULT_FORBID and satisfies no
+REQUIRE. The `:: DOCK: strip` line and its `x86-witness.spec` pin are unchanged; no knob added.
+
+**Rate.** QEMU: 1 red in the 8 captures above on dock/strip-identical code (the seat's count). Metal:
+**every** DOCK line in every metal capture on the bench reads `vacate=false` — flights 8, 9 and 11
+(`score89-logs/f8.log:2708`, `score89-logs/f9.log:2719`, `gmux7-logs/f11.log:3255`, each with three
+`[wm] close` lines and no `[dock]` reconcile between them and the verdict), flight 7
+(`score89-logs/flight7.log:3000`), and flight 5 (`evidence/rmbp9/FLIGHT5-POSTMORTEM.md` §5 item 6: "on metal
+where QEMU has it true"). Five real cores composing is the steady state the probe forces; this leg has been
+reading the decline, not the strip, on every flight since flight 5, and `ui_guidelines.md` recorded the same
+leg reddening when furniture lost its compose passes to a second print per create.
+
+**Evidence after the fix** (`docs/dev/evidence/rmbp-0923/dockvac/`, at `3b6eff48`, no probe):
+
+| Run | Host load | Wire | Verdict |
+| --- | --- | --- | --- |
+| `g1-wc-serial.log` | 9.26 | `[dock] vacate settle folds=0 wait_ms=0 reconciles=0 budget_ms=250 -> SETTLED` | `vacate=true … :: PASS ::`, rc=0, MBENCH 16/16 |
+| `g2-wc-serial.log` | 12.62 | same | same |
+| `g3-wc-serial.log` | 11.33 | same | same |
+| `g4-wc-serial.log` | 24.95 | same | same |
+| `g5-ptr-serial.log` (`test-ptr 150`) | 13.47 | same | `vacate=true … :: PASS ::`, rc=0, MBENCH 8/8 |
+
+Every other term of the DOCK line and the whole DOCKID line are unchanged across all seven runs
+(`model=true geom=true restore=true specific=true miss=true … park=parked/true`;
+`order=true set=true furniture=true … reconciled=3/3`).
+
+**What to capture if it recurs anyway.** The `[dock] vacate settle` line immediately above the verdict.
+`-> UNSETTLED why=no-pass` means `COMP_GATE` was held for the whole 250 ms budget — a new and reportable
+fact; read the `[wcser]` rollup and any `GATE STOLEN` line beside it. `-> UNSETTLED why=pass-ran` means
+passes REACHED `compose` on the post-close model and the slot did not follow — that is the STRIP's defect
+(a paint that keeps declining, or a repack that does not re-publish), it must never be re-run away, and it
+is a `video/dock.rs` / `video/strip.rs` arc, not this entry.
+
+**Disposition — FIXED in the fixture (`video/dock.rs` only; no strip, compositor or spec change).**
+What is OWED is the metal reading: flight 12's DOCK line must read `vacate=true … :: PASS ::` with
+`[dock] vacate settle folds=<n> … -> SETTLED` above it. `folds=` there is the first per-leg measurement of
+how long five real cores hold `COMP_GATE` against a boot-task fixture; an `UNSETTLED why=pass-ran` on metal
+would mean the metal half has a second mechanism this entry has not seen.
 
 ## Class 2 — the evidence taps lose lines to a margin-tight serial ring
 
