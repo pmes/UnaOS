@@ -160,6 +160,13 @@
 //! reads both back, samples `INTR_0` and `INTR_LINE_HOST` per vblank, and prints `deliver=`/`reason=`
 //! from [`classify`].
 //!
+//! **(2) THE POLL COUNTED SAMPLING EPISODES.** `HEAD_STAT.VERT[31:16]` is a vblank COUNT, and the
+//! edge detector used it as a flag, adding one per observed change. It is now accumulated by its
+//! difference, and the period is elapsed time over the difference between two TIGHT edges. See
+//! [`fold`]. Every "vblanks" budget in the KVBLANK2 ladder (census spacing, the R2 and R3 windows) is
+//! therefore in hardware vblanks from KVBLANK3 on. Through flight 12 those budgets were counted in
+//! sampling episodes: R3's "60" took 2016 ms.
+//!
 //! The section below describes KVBLANK's rung-1 PMC half as it shipped. Its register is the wrong one (see above).
 //!
 //! ## What `arm_pmc_pdisplay` does, and what it does not
@@ -304,17 +311,8 @@ const SLOW_MS: u64 = 10_000;
 static VB_HEAD1: AtomicU32 = AtomicU32::new(0);
 /// Lines per frame, as `beam_probe` measured them.
 static VB_VTOTAL: AtomicU32 = AtomicU32::new(0);
-/// `vblank_count[31:16]` as last seen, plus the 1-bit "seen at all" flag in bit 16.
-static VB_LAST: AtomicU32 = AtomicU32::new(0);
-/// Monotonic edge count. THE counter rung 2 compares against; it does not wrap at 16 bits the way
-/// the hardware field does.
-static VB_COUNT: AtomicU64 = AtomicU64::new(0);
-/// `now_cycles()` at the last edge.
-static VB_LAST_CYC: AtomicU64 = AtomicU64::new(0);
-/// Sum / min / max of the per-edge cycle deltas, for `period_us=` and `jitter_us=`.
-static VB_SUM_CYC: AtomicU64 = AtomicU64::new(0);
-static VB_MIN_CYC: AtomicU64 = AtomicU64::new(u64::MAX);
-static VB_MAX_CYC: AtomicU64 = AtomicU64::new(0);
+// KVBLANK3 — `VB_LAST`, `VB_COUNT`, `VB_LAST_CYC` and the `VB_SUM/MIN/MAX_CYC` accumulators that stood
+// here counted one per OBSERVED CHANGE and are replaced by [`VbAcc`] below ([`LIVE`]).
 /// `vline` read INSIDE the edge — THE PHASE, and the one number rung 2's threshold is derived from.
 /// Stored plus 1 so that zero means "no edge has been phased yet" and line 0 stays a legal reading.
 static VB_PHASE1: AtomicU32 = AtomicU32::new(0);
@@ -437,6 +435,160 @@ fn us_to_cycles(us: u64) -> u64 {
     us.saturating_mul(hz) / 1_000_000
 }
 
+// ── KVBLANK3 M3 (rmbp-ledger B192) — THE PERIOD, FROM THE COUNT ──────────────────────────────────
+//
+// `HEAD_STAT.VERT[31:16]` is a vblank COUNT (rnndb `display/g80_pdisplay.xml:647`,
+// `vblank_count[31:16]`). KVBLANK read it as an edge FLAG — `VB_COUNT += 1` on any change — and threw
+// the difference away, so every vblank that passed between two sampling episodes (two `beam::hold`s)
+// was lost. Flight 12: `count=10430 period_us=38241` over 398.9 s on a 60.2 Hz panel, the count's
+// rate following the compositor's pass rate (29.8/s at 23.4 passes/s, 25.5/s at 19.6 passes/s).
+//
+// NOW: the count accumulates the field's DIFFERENCE, mod 2^16, so a sample that arrives three
+// vblanks late adds three. period = elapsed / delta-count needs no sampling cadence at all, only two
+// timestamps that are close to their edges. An edge is TIGHT when the sample that saw it came within
+// [`TIGHT_US`] of the sample before it (the raster was being watched when the count stepped), so its
+// timestamp is known to TIGHT_US. period_us is measured between the FIRST and LAST tight edges;
+// jitter_us is max-min of the per-vblank period over consecutive tight pairs, each good to
+// 2*TIGHT_US / (vblanks between them). Before two tight edges exist, the loose first/last edges are
+// used and `period_src=loose` says so; with no edge at all it reads `none`, and the fixture calls
+// that GAVEUP.
+//
+// The limit, stated: a gap longer than 65536 vblanks (18.2 min at 60 Hz) between two samples loses
+// whole wraps. `seen=` beside `count=` makes it visible: the old count and the true count, on one line.
+//
+// COST: one `now_cycles()` (rdtsc) and one relaxed store per `note()` call, to timestamp the sample
+// for the tight bracket — against the uncached BAR0 read `scanout_beam` has just made (~1 us across
+// PCIe), i.e. about 1% of an iteration. The fast path takes no lock and does no division.
+
+/// A sample within this long of the previous sample makes the edge it sees TIGHT. 500 us is 3% of a
+/// 16.667 ms frame, and a `hold` spin samples every few microseconds, so any edge that lands inside a
+/// hold qualifies, and the first sample after an inter-present gap never does.
+const TIGHT_US: u64 = 500;
+
+/// The period accumulator. One live instance ([`LIVE`]); the fixture drives a second one
+/// ([`SIM_ACC`]) through the SAME [`fold`], so the fixture proves the arithmetic the metal runs.
+struct VbAcc {
+    /// `vblank_count[31:16]` as last seen, plus the "seen at all" flag in bit 16.
+    last: AtomicU32,
+    /// Hardware vblanks since the first reading: the sum of the field's differences.
+    count: AtomicU64,
+    /// Samples that saw the field change — exactly what `count=` counted before KVBLANK3.
+    seen: AtomicU64,
+    /// `now` at the previous sample, of any kind (the tight bracket's other end).
+    sample_cyc: AtomicU64,
+    /// First edge of any kind, and the last edge of any kind (the loose anchors).
+    loose_cyc: AtomicU64,
+    loose_n: AtomicU64,
+    last_cyc: AtomicU64,
+    /// First and latest TIGHT edge, and how many there were.
+    first_cyc: AtomicU64,
+    first_n: AtomicU64,
+    tight_cyc: AtomicU64,
+    tight_n: AtomicU64,
+    tight: AtomicU64,
+    /// Per-vblank period over consecutive tight pairs, cycles — `jitter_us=` is their spread.
+    pmin: AtomicU64,
+    pmax: AtomicU64,
+}
+
+impl VbAcc {
+    const fn new() -> Self {
+        Self {
+            last: AtomicU32::new(0),
+            count: AtomicU64::new(0),
+            seen: AtomicU64::new(0),
+            sample_cyc: AtomicU64::new(0),
+            loose_cyc: AtomicU64::new(0),
+            loose_n: AtomicU64::new(0),
+            last_cyc: AtomicU64::new(0),
+            first_cyc: AtomicU64::new(0),
+            first_n: AtomicU64::new(0),
+            tight_cyc: AtomicU64::new(0),
+            tight_n: AtomicU64::new(0),
+            tight: AtomicU64::new(0),
+            pmin: AtomicU64::new(u64::MAX),
+            pmax: AtomicU64::new(0),
+        }
+    }
+
+    /// `(period_cyc, jitter_cyc, src)` — see the block comment above for which anchors each `src` uses.
+    fn period(&self) -> (u64, u64, &'static str) {
+        let (mn, mx) = (self.pmin.load(Ordering::Relaxed), self.pmax.load(Ordering::Relaxed));
+        let jitter = if mn != u64::MAX && mx >= mn { mx - mn } else { 0 };
+        let (fc, fnn) = (self.first_cyc.load(Ordering::Relaxed), self.first_n.load(Ordering::Relaxed));
+        let (tc, tn) = (self.tight_cyc.load(Ordering::Relaxed), self.tight_n.load(Ordering::Relaxed));
+        if self.tight.load(Ordering::Relaxed) >= 2 && tn > fnn && tc > fc {
+            return ((tc - fc) / (tn - fnn), jitter, "tight");
+        }
+        let (lc, ln) = (self.loose_cyc.load(Ordering::Relaxed), self.loose_n.load(Ordering::Relaxed));
+        let (ec, en) = (self.last_cyc.load(Ordering::Relaxed), self.count.load(Ordering::Relaxed));
+        if self.seen.load(Ordering::Relaxed) >= 2 && en > ln && ec > lc {
+            return ((ec - lc) / (en - ln), jitter, "loose");
+        }
+        (0, jitter, "none")
+    }
+
+    /// What the pre-KVBLANK3 arithmetic would have printed for the same samples: the mean time
+    /// between OBSERVED edges. Printed by the fixture beside the true period, so the defect and the
+    /// fix are read off one line.
+    fn old_period(&self) -> u64 {
+        let seen = self.seen.load(Ordering::Relaxed);
+        let span = self.last_cyc.load(Ordering::Relaxed).saturating_sub(self.loose_cyc.load(Ordering::Relaxed));
+        if seen >= 2 { span / (seen - 1) } else { 0 }
+    }
+}
+
+/// The live accumulator, fed by [`note`].
+static LIVE: VbAcc = VbAcc::new();
+/// The fixture's accumulator. Never touched by the metal path.
+static SIM_ACC: VbAcc = VbAcc::new();
+
+/// Fold ONE sample of `HEAD_STAT.VERT` taken at `now` into `acc`. Returns the number of vblanks the
+/// count advanced by (`Some(d)`, `d >= 1`) when this sample saw it step, `None` otherwise.
+///
+/// The first reading of the field only sets the baseline: there is no earlier value to subtract.
+/// The claim of the new value is a compare-exchange, so two cores sampling the same step count it
+/// once.
+#[inline]
+fn fold(acc: &VbAcc, word: u32, now: u64) -> Option<u64> {
+    let vb = (word >> 16) & 0xFFFF;
+    let prev_sample = acc.sample_cyc.load(Ordering::Relaxed);
+    acc.sample_cyc.store(now, Ordering::Relaxed);
+    let prev = acc.last.load(Ordering::Relaxed);
+    if prev & 0x1_0000 != 0 && (prev & 0xFFFF) == vb {
+        return None;
+    }
+    if acc.last.compare_exchange(prev, vb | 0x1_0000, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return None;
+    }
+    if prev & 0x1_0000 == 0 {
+        return None;
+    }
+    // THE FIX: the difference, mod 2^16 — not 1.
+    let d = (vb.wrapping_sub(prev & 0xFFFF) & 0xFFFF) as u64;
+    let n = acc.count.fetch_add(d, Ordering::Relaxed) + d;
+    acc.seen.fetch_add(1, Ordering::Relaxed);
+    if acc.loose_cyc.load(Ordering::Relaxed) == 0 {
+        acc.loose_cyc.store(now, Ordering::Relaxed);
+        acc.loose_n.store(n, Ordering::Relaxed);
+    }
+    acc.last_cyc.store(now, Ordering::Relaxed);
+    if prev_sample != 0 && now.saturating_sub(prev_sample) <= us_to_cycles(TIGHT_US) {
+        acc.tight.fetch_add(1, Ordering::Relaxed);
+        let tc = acc.tight_cyc.swap(now, Ordering::Relaxed);
+        let tn = acc.tight_n.swap(n, Ordering::Relaxed);
+        if tc == 0 {
+            acc.first_cyc.store(now, Ordering::Relaxed);
+            acc.first_n.store(n, Ordering::Relaxed);
+        } else if n > tn && now > tc {
+            let p = (now - tc) / (n - tn);
+            acc.pmin.fetch_min(p, Ordering::Relaxed);
+            acc.pmax.fetch_max(p, Ordering::Relaxed);
+        }
+    }
+    Some(d)
+}
+
 // ── RUNG 1 — the PMC half, called from `kepler::init`'s interrupt-disable statement ────────────
 
 /// KVBLANK rung 1, PMC half. Set the PDISPLAY source bit in `NV_PMC_INTR_EN`, watch
@@ -530,34 +682,23 @@ pub fn arm(head: u32, vtotal: u32) {
 
 /// KVBLANK rung 1 — the edge detector, fed the RAW `HEAD_STAT.VERT` word `scanout_beam` just read.
 ///
-/// FAST PATH: one relaxed load and a 16-bit compare, then return. `now_cycles()` and the witness
-/// print are reached only ON an edge — at most 60 times a second on a 60 Hz panel — so this costs
-/// the hold loop a compare per iteration and nothing else.
+/// FAST PATH (KVBLANK3): one `now_cycles()`, a relaxed load and store, and a 16-bit compare — see
+/// [`fold`] for the cost and why the timestamp is taken on every sample. The witness print is
+/// reached only ON an edge.
 #[inline]
 pub fn note(word: u32) {
     if VB_HEAD1.load(Ordering::Acquire) == 0 {
         return;
     }
-    let vb = (word >> 16) & 0xFFFF;
-    let prev = VB_LAST.load(Ordering::Relaxed);
-    if prev & 0x1_0000 != 0 && (prev & 0xFFFF) == vb {
-        return;
+    if fold(&LIVE, word, crate::arch::now_cycles()).is_some() {
+        edge(word & 0xFFFF);
     }
-    VB_LAST.store(vb | 0x1_0000, Ordering::Relaxed);
-    if prev & 0x1_0000 == 0 {
-        // First reading of the field is not an edge — there is no previous timestamp to subtract.
-        VB_LAST_CYC.store(crate::arch::now_cycles(), Ordering::Relaxed);
-        return;
-    }
-    edge(word & 0xFFFF);
 }
 
-/// The edge itself: timestamp it, fold it into the period/jitter accumulators, record the PHASE and
-/// print on the cadence.
+/// The edge itself (the count and the period are already folded by [`fold`]): record the PHASE, step
+/// the KVBLANK2 ladder in HARDWARE vblanks, and print on the cadence.
 fn edge(vline: u32) {
-    let now = crate::arch::now_cycles();
-    let last = VB_LAST_CYC.swap(now, Ordering::Relaxed);
-    let n = VB_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let n = LIVE.count.load(Ordering::Relaxed);
     // THE PHASE. `vline` here is the raster position read in the SAME word as the counter tick, so
     // it is where in the frame the edge was observed — `raster_at_irq`, and the number rung 2's
     // threshold is derived from.
@@ -567,12 +708,6 @@ fn edge(vline: u32) {
     // because this is the one place per frame that is already off the fast path (`note`'s compare
     // returns before reaching `edge` on every non-edge iteration).
     ladder_tick(n);
-    if last != 0 {
-        let dt = now.saturating_sub(last);
-        VB_SUM_CYC.fetch_add(dt, Ordering::Relaxed);
-        VB_MIN_CYC.fetch_min(dt, Ordering::Relaxed);
-        VB_MAX_CYC.fetch_max(dt, Ordering::Relaxed);
-    }
     let prints = VB_PRINTS.load(Ordering::Relaxed);
     let due = if prints < FAST_PRINTS { FAST_MS } else { SLOW_MS };
     let ms = crate::arch::ms();
@@ -585,18 +720,19 @@ fn edge(vline: u32) {
 }
 
 /// The witness line. Split out so the fixture can print the same shape without an edge behind it.
+///
+/// KVBLANK3: `count=` is now HARDWARE vblanks (the sum of the field's differences), and every field
+/// before `vbrecheck=` keeps its name and position. Appended: `seen=` — what `count=` meant through
+/// flight 12, the samples that saw the field step — `tight=` and `period_src=` (see [`fold`]).
 fn report(n: u64, vline: u32) {
-    let sum = VB_SUM_CYC.load(Ordering::Relaxed);
-    let mn = VB_MIN_CYC.load(Ordering::Relaxed);
-    let mx = VB_MAX_CYC.load(Ordering::Relaxed);
-    let period_us = if n > 1 { cycles_to_us(sum / (n - 1)) } else { 0 };
-    let jitter_us = if mx >= mn && mn != u64::MAX { cycles_to_us(mx - mn) } else { 0 };
+    let (p_cyc, j_cyc, src) = LIVE.period();
     serial_println!(
-        ":: kepler: vblank head={} count={} period_us={} jitter_us={} raster_at_irq={} vt={} mode={} vbwaits={} vbwait_us={} vbgaveup={} vbrecheck={} ::",
+        ":: kepler: vblank head={} count={} period_us={} jitter_us={} raster_at_irq={} vt={} mode={} vbwaits={} vbwait_us={} vbgaveup={} vbrecheck={} seen={} tight={} period_src={} ::",
         VB_HEAD1.load(Ordering::Relaxed).saturating_sub(1),
-        n, period_us, jitter_us, vline, VB_VTOTAL.load(Ordering::Relaxed), mode_str(),
+        n, cycles_to_us(p_cyc), cycles_to_us(j_cyc), vline, VB_VTOTAL.load(Ordering::Relaxed), mode_str(),
         VB_WAITS.load(Ordering::Relaxed), VB_WAIT_US.load(Ordering::Relaxed),
         VB_WAIT_GAVEUP.load(Ordering::Relaxed), VB_WAIT_RECHECK.load(Ordering::Relaxed),
+        LIVE.seen.load(Ordering::Relaxed), LIVE.tight.load(Ordering::Relaxed), src,
     );
 }
 
@@ -1025,7 +1161,7 @@ extern "x86-interrupt" fn kepler_vblank_isr(_f: x86_64::structures::idt::Interru
 pub fn counter() -> Option<u64> {
     match SIM_MODE.load(Ordering::Relaxed) {
         0 => {
-            if VB_HEAD1.load(Ordering::Acquire) == 0 || VB_COUNT.load(Ordering::Relaxed) < 2 {
+            if VB_HEAD1.load(Ordering::Acquire) == 0 || LIVE.count.load(Ordering::Relaxed) < 2 {
                 None
             } else {
                 // KVBLANK2 — THE UNION OF THE TWO SOURCES, and it is a union rather than a switch
@@ -1036,7 +1172,7 @@ pub fn counter() -> Option<u64> {
                 // (`hold` runs IRQ-masked — see §R2b), and every wide-zone present would have
                 // regressed to the give-up budget. The sum can only ever shorten a wait.
                 Some(
-                    VB_COUNT.load(Ordering::Relaxed)
+                    LIVE.count.load(Ordering::Relaxed)
                         .wrapping_add(IRQ_COUNT.load(Ordering::Relaxed)),
                 )
             }
@@ -1206,6 +1342,7 @@ pub fn selftest_once() {
     VB_WAIT_RECHECK.store(0, Ordering::Relaxed);
 
     selftest_deliver();
+    selftest_period();
 }
 
 /// KVBLANK3 M2's fixture — **the vector, and the verdict, on a machine with no Kepler.**
@@ -1265,4 +1402,101 @@ fn selftest_deliver() {
         by_name.map(|v| v as u32).unwrap_or(0x100),
         if pass { "PASS" } else { "FAIL" },
     );
+}
+
+/// KVBLANK3 M3's fixture — **the period, from a simulated timer, sampled the way flight 12 sampled.**
+///
+/// A synthetic raster: vblank `k` at `t = k * FRAME_US` (16 667 us), the count field starting at
+/// 65 530 so it WRAPS its 16 bits within the first six frames. It is sampled in HOLD EPISODES — a
+/// 2 ms burst every 10 us, the shape of `beam::hold`'s spin — separated by gaps of 26-61 ms (the
+/// presents flight 12 made at 19.6-23.4/s) and ONE gap of 23.606 s (flight 12's
+/// `jitter_us=23605994`). The samples are handed to [`fold`] — the function [`note`] runs on the
+/// metal — against [`SIM_ACC`], with the timestamps in TSC cycles, so the tight-bracket threshold is
+/// the real one.
+///
+/// * **PASS** when `count=` equals the vblanks that actually elapsed, `period_us` is 16 667 +/- 2,
+///   `jitter_us < 2000`, at least two edges were tight, and `seen < count` (the schedule DID miss
+///   vblanks, so the case exercises the defect rather than stepping around it). `old_period_us=` is
+///   the pre-KVBLANK3 arithmetic over the SAME samples, printed for comparison and not scored.
+/// * **GO-RED** — a count that NEVER steps (the field frozen, `vline` still moving) must read
+///   `period_src=none` and `verdict=GAVEUP`, never a period.
+///
+/// Pure arithmetic with synthetic time: no MMIO, no waiting. It does not prove that the GK107's field
+/// is a live count. The flight-13 line (`count=` beside `seen=`) is what proves that.
+fn selftest_period() {
+    const H_US: u64 = 2_000;
+    const S_US: u64 = 10;
+    const EPISODES: u64 = 240;
+    const LONG_AT: u64 = 7;
+    const LONG_US: u64 = 23_606_000;
+    const GAPS_US: [u64; 6] = [38_241, 50_113, 43_007, 26_011, 61_009, 33_333];
+    const ORIGIN: u64 = 65_530;
+    let f = crate::video::beam::FRAME_US;
+    let base = 1_000u64; // cycles; nonzero so `sample_cyc == 0` still means "no sample yet"
+    let word = |t_us: u64, stuck: bool| -> u32 {
+        let frames = if stuck { 0x1234 } else { ORIGIN + t_us / f };
+        let vline = ((t_us % f) * 1852 / f) as u32;
+        (((frames & 0xFFFF) as u32) << 16) | vline
+    };
+    let run = |stuck: bool, episodes: u64| -> (u64, u64) {
+        let mut t = 5_000u64;
+        let (t_first, mut t_last) = (t, t);
+        for e in 0..episodes {
+            let end = t + H_US;
+            while t < end {
+                let _ = fold(&SIM_ACC, word(t, stuck), base + us_to_cycles(t));
+                t_last = t;
+                t += S_US;
+            }
+            t += if e == LONG_AT { LONG_US } else { GAPS_US[(e % 6) as usize] };
+        }
+        (t_first, t_last)
+    };
+
+    // ── PASS half — a stepping count ──
+    sim_acc_reset();
+    let (t0, t1) = run(false, EPISODES);
+    let expect = t1 / f - t0 / f;
+    let count = SIM_ACC.count.load(Ordering::Relaxed);
+    let seen = SIM_ACC.seen.load(Ordering::Relaxed);
+    let tight = SIM_ACC.tight.load(Ordering::Relaxed);
+    let (p_cyc, j_cyc, src) = SIM_ACC.period();
+    let (period_us, jitter_us) = (cycles_to_us(p_cyc), cycles_to_us(j_cyc));
+    let old_us = cycles_to_us(SIM_ACC.old_period());
+    let pass = count == expect
+        && period_us + 2 >= f
+        && period_us <= f + 2
+        && jitter_us < 2_000
+        && tight >= 2
+        && seen < count;
+    serial_println!(
+        ":: kepler: vblank selftest arm=period sim=timer period_us={} episodes={} hold_us={} gaps_us=26011..61009+{} count={} expect={} seen={} tight={} period_src={} got_period_us={} jitter_us={} old_period_us={} :: {} ::",
+        f, EPISODES, H_US, LONG_US, count, expect, seen, tight, src, period_us, jitter_us, old_us,
+        if pass { "PASS" } else { "FAIL" },
+    );
+
+    // ── GO-RED half — a count that never steps ──
+    sim_acc_reset();
+    let _ = run(true, 20);
+    let (_, _, src2) = SIM_ACC.period();
+    let count2 = SIM_ACC.count.load(Ordering::Relaxed);
+    let seen2 = SIM_ACC.seen.load(Ordering::Relaxed);
+    let gaveup = src2 == "none" && count2 == 0 && seen2 == 0;
+    serial_println!(
+        ":: kepler: vblank selftest arm=period sim=stuck count={} seen={} period_src={} verdict={} :: {} ::",
+        count2, seen2, src2, if gaveup { "GAVEUP" } else { "PERIOD" },
+        if gaveup { "GO-RED-OK" } else { "GO-RED-FAILED" },
+    );
+    sim_acc_reset();
+}
+
+/// Zero [`SIM_ACC`] between the fixture's two halves.
+fn sim_acc_reset() {
+    let a = &SIM_ACC;
+    for w in [&a.count, &a.seen, &a.sample_cyc, &a.loose_cyc, &a.loose_n, &a.last_cyc, &a.first_cyc,
+              &a.first_n, &a.tight_cyc, &a.tight_n, &a.tight, &a.pmax] {
+        w.store(0, Ordering::Relaxed);
+    }
+    a.pmin.store(u64::MAX, Ordering::Relaxed);
+    a.last.store(0, Ordering::Relaxed);
 }
