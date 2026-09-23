@@ -364,3 +364,29 @@ REQUIRE \[users\] adduser REFUSED user=boot13p reason=password-on-line
 # `boot13-pw` is the credential (typed twice), `one-pw`/`two-pw` the mismatched pair.
 FORBID boot13-pw
 FORBID (one|two)-pw
+#
+# M3 — LOG OUT CLOSES THE ROOT SESSION, AND THE SCREEN IS THE ONLY THING TAKING INPUT. The fixture runs third,
+# while root is still the session: the shell's `logout` from root with an EMPTY store is refused; a program
+# launched in the root session (`STAT.ELF`, uid 0 in the root epoch) is ENDED by the root session's Log Out
+# (the shell's `logout` -> `users::log_out_to_screen` -> `login::reopen_after_logout`, the crystal row's own
+# action); the screen comes up on a real row; `adduser` is then refused `not-root`; and every key is driven
+# through the LIVE x86 key router (`wc_route_event`) — the path flight 12's keys took to
+# `[wc-c] focus tab-cycle` — and must be consumed there and land in the form: the name, Tab to the password
+# field, a wrong password (the one-answer denial), the right one (a session as `boot13`, home
+# `/home/boot13`). GO-RED (LOGIN13 M3, run on this gate): the screen-first fold deleted from `wc_route_event`
+# (`arch/x86_64/syscall.rs:7312`) reads `keys_routed=false name_typed=false … -> FAIL —`. GREEN CERTIFIES:
+# root's Log Out is refused with nobody to log in as, ends root's programs when it is not, returns the
+# screen, and the screen — not the focus ring, not a focused app — receives the keyboard.
+REQUIRE :: LOGIN-ROOTOUT: root_before=true empty_refused=no-users pid=\d+ root_stamped=true others=\d+ root_after=false pid_gone=true window_gone=true screen=up screen_window=true not_root=not-root keys_routed=true name_typed=true tab=password wrong=denied login=boot13 cleaned=true -> PASS ::
+FORBID :: LOGIN-ROOTOUT: .* -> FAIL
+REQUIRE \[users\] logout REFUSED session=root reason=no-users
+REQUIRE \[users\] root session closed ended=\d+ windows=\d+
+REQUIRE \[users\] session-end pid=\d+ slot=\d+ user=0 windows=\d+ kill=
+REQUIRE \[users\] adduser REFUSED user=boot13x reason=not-root
+# The one-per-open key witness: what a flight-13 capture reads to know the keyboard reached the screen,
+# without a typed byte on the wire (the §7 denial FORBIDs still hold for this user's denial below).
+REQUIRE \[login\] key taken by the screen
+REQUIRE \[login\] denied user=boot13
+REQUIRE \[users\] login ok user=boot13 id=\d+ principal=user:boot13#\d+
+REQUIRE \[login\] session open user=boot13
+FORBID wrong-pw

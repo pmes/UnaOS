@@ -193,6 +193,9 @@ static PRESS_SWALLOWED: AtomicU32 = AtomicU32::new(0);
 /// presses a human never counts, and a witness that scrolls the boot log away is not a witness. A hit
 /// on a CONTROL always prints — those are countable by construction, because a person made each one.
 static MISS_SAID: AtomicBool = AtomicBool::new(false);
+/// LOGIN13 M3 — one `[login] key taken by the screen` line per open: the metal capture's evidence that
+/// the keyboard reached the screen (flight 12's never did) without ever printing what was typed.
+static KEY_SAID: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // LAYOUT — **ONE accessor, read by the painter AND by the press.**
@@ -465,6 +468,7 @@ fn open() {
         f.windowed = false;
     }
     MISS_SAID.store(false, Ordering::Relaxed); // LOGINFLOW — the one miss line is per OPEN, not per boot
+    KEY_SAID.store(false, Ordering::Relaxed); // LOGIN13 M3 — and so is the one key line
     if HEADLESS.load(Ordering::Relaxed) {
         serial_println!("[login] screen open window=no (fixture — headless form)");
         return;
@@ -525,8 +529,13 @@ fn close_into_session() {
     FORM.lock().state = State::Session;
 }
 
-/// M4: Log Out — close the session and put the screen back up.
+/// M4: Log Out — close the session and put the screen back up. LOGIN13 M3 (R63): the ROOT session's
+/// Log Out comes here too (the crystal's row and the shell's `logout`), and is refused while the store
+/// has nobody to log in as (`users::root_logout_refused`, which prints why).
 pub fn reopen_after_logout() {
+    if users::root_logout_refused() {
+        return;
+    }
     users::logout();
     FORM.lock().state = State::Closed;
     serial_println!("[login] logged out — screen returns");
@@ -693,6 +702,9 @@ pub fn consume_key(c: u8) -> bool {
     // is a key typed into nothing. See [`heal_if_row_gone`]; on every ordinary press this is one
     // mutex take and one relaxed load, and it answers `false`.
     heal_if_row_gone();
+    if !KEY_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!("[login] key taken by the screen (the first of this open — LOGIN13/R63: while the screen is up it is the only thing taking input; no typed byte is ever printed)");
+    }
     match c {
         b'\x1b' => {} // R24: Esc dismisses menus only; the screen stays
         b'\t' => {
@@ -1301,4 +1313,26 @@ pub fn screen_fixture(
         esc_kept, wrong_kept, opened, passes_through, logout_ok, back, second, LOGINS.load(Ordering::Relaxed), close_box_refused, close_route, reopened, HEALS.load(Ordering::Relaxed), ignition_ok, control_ok, if ok { "PASS" } else { "FAIL —" }
     );
     ok
+}
+
+/// LOGIN13 M3 fixture (`loginst`): did the screen get a REAL `wm` row this open (not the headless form)?
+#[cfg(feature = "loginst")]
+pub fn fixture_windowed() -> bool {
+    FORM.lock().windowed && WIN.load(Ordering::Relaxed) != wm::WIN_NONE
+}
+
+/// LOGIN13 M3 fixture (`loginst`): is the form open with exactly `name` in the name field and the focus
+/// on the password field (`password = true`) or the name field? What the router's keys must have done.
+#[cfg(feature = "loginst")]
+pub fn fixture_form_is(name: &[u8], password: bool) -> bool {
+    let f = FORM.lock();
+    f.state == State::Open && f.name_len == name.len() && f.name[..name.len()] == *name && (f.focus == Focus::Password) == password
+}
+
+/// LOGIN13 M3 fixture (`loginst`): put the screen back where the rest of the battery expects it — no
+/// row, console resumed, form `Closed` (a login leaves it `Session`, which no later leg starts from).
+#[cfg(feature = "loginst")]
+pub fn fixture_reset() {
+    take_down();
+    FORM.lock().state = State::Closed;
 }

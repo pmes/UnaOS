@@ -866,7 +866,7 @@ fn epoch_proof(name: &[u8]) -> &'static str {
 pub fn logout() -> (usize, usize) {
     // SECLOGIN M3: the session's programs are ENDED first (windows closed, then killed through the close
     // box's own path), THEN the stamps — a program cannot outlive the session that started it.
-    let (ended, windows) = arch_session_logout();
+    let root = root_session(); if root { ROOT_LIVE.store(false, core::sync::atomic::Ordering::Release); } let (ended, windows) = arch_session_logout(root); // LOGIN13 M3 (R63): the ROOT session's Log Out ends ROOT's programs (uid 0, the root epoch) by the same walk, and root does not come back this boot.
     {
         let mut s = SESSION_LOCAL.lock();
         s.1 = 0;
@@ -877,7 +877,7 @@ pub fn logout() -> (usize, usize) {
     // boot's session boundaries are countable on serial with no fixture armed. This is the ONE string SO37
     // adds to a shipping (`login`, no `loginst`) image; the enforcement itself is pure control flow and
     // deliberately prints nothing on the SYS_OPEN path, which is hot.
-    serial_println!("[users] logout epoch={} ended={} windows={} (SO37: stamps from the closed session are refused; M3: its programs are ended first)", arch_session_epoch(), ended, windows);
+    if root { serial_println!("[users] root session closed ended={} windows={} (R63: root's programs are ended; the next session is a user's, from the login screen)", ended, windows); } serial_println!("[users] logout epoch={} ended={} windows={} (SO37: stamps from the closed session are refused; M3: its programs are ended first)", arch_session_epoch(), ended, windows);
     (ended, windows)
 }
 
@@ -916,10 +916,10 @@ fn arch_session_login(id: u32, name: &[u8]) -> bool {
 
 /// SECLOGIN M3: `(ended, windows)` — the closing session's programs that were ended and the windows
 /// they held; `(0, 0)` on an image with no EL0 regime, where nothing can have been launched.
-fn arch_session_logout() -> (usize, usize) {
+fn arch_session_logout(root: bool) -> (usize, usize) { let _ = root; // LOGIN13 M3: `root` selects the ROOT session's programs (uid 0 in the root epoch) on x86; aarch64 stamps no epoch on a non-user program (`session_restamp` is a no-op with no session), so its root arm is OWED and it ends what it always ended.
     #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
     {
-        return crate::arch::syscall::session_logout();
+        #[cfg(target_arch = "x86_64")] return crate::arch::syscall::session_logout_as(root); #[cfg(not(target_arch = "x86_64"))] return crate::arch::syscall::session_logout();
     }
     #[cfg(not(any(target_arch = "x86_64", feature = "aarch64_el0")))]
     (0, 0)
@@ -966,13 +966,13 @@ pub fn shell_verb(verb: &str, args: &[&str], console: &mut crate::console::Conso
             }
         }
         "logout" => {
+            // LOGIN13 M3 (R63): the ROOT session logs out too, and wherever the screen is built the screen
+            // comes back — the SAME `reopen_after_logout` the crystal's Log Out row calls.
             let mut nb = [0u8; NAME_MAX];
-            match whoami(&mut nb) {
-                Some(n) => {
-                    let _ = logout();
-                    console.println(&alloc::format!("logged out {}", core::str::from_utf8(&nb[..n]).unwrap_or("?")));
-                }
-                None => console.println("logout: no session is open"),
+            match log_out_to_screen(&mut nb) {
+                Ok(n) => console.println(&alloc::format!("logged out {}", core::str::from_utf8(&nb[..n]).unwrap_or("?"))),
+                Err("refused") => console.println("logout: refused — add a user first (`adduser <name>`): the login screen would have nobody to log in as"),
+                Err(_) => console.println("logout: no session is open"),
             }
         }
         "adduser" => adduser_begin(args, console), // LOGIN13 M2 (R63) — root adds a user; see `adduser_begin`
@@ -1125,7 +1125,7 @@ pub fn service() {
         Ok(()) => {
             SERVICED.store(true, Ordering::Relaxed);
             #[cfg(feature = "loginst")]
-            { login_bootroot_fixture(); login_adduser_fixture(); login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
+            { login_bootroot_fixture(); login_adduser_fixture(); login_rootout_fixture(); login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -2097,5 +2097,161 @@ pub fn login_adduser_fixture() {
     #[cfg(not(target_arch = "x86_64"))]
     {
         serial_println!("[users] adduser fixture: x86 lane only (the verb and the prompt are arch-neutral and compiled here; the leg runs on the x86 login lane)");
+    }
+}
+
+// =========================================================================================
+// LOGIN13 M3 (rmbp-ledger B189, R63) — LOG OUT CLOSES THE ROOT SESSION AND THE SCREEN TAKES THE INPUT
+// =========================================================================================
+//
+// R63: *"i will add my user and log out then log into the user account"*. Two routes reach the same
+// action — the shell's `logout` ([`log_out_to_screen`]) and the crystal's Log Out row
+// (`video/crystal.rs` `Verb::LogOut` -> `login::reopen_after_logout`) — and both now:
+//   1. refuse the ROOT session's Log Out while the store has nobody to log in as ([`root_logout_refused`]);
+//   2. close the session through [`logout`], which for ROOT ends root's programs by the same walk
+//      SECLOGIN M3 built for a user's (x86: `session_logout_as(true)` selects the running rows stamped
+//      uid 0 in the root epoch — `arch/x86_64/syscall.rs`, `session_end_processes`), so the screen
+//      comes up over nothing a program drew;
+//   3. put the screen up, and the screen is the FIRST taker of every key on the x86 router
+//      (`wc_route_event`, ahead of the Esc/Quarry doors, the Tab focus ring and the focused ring —
+//      flight 12's keys went to `[wc-c] focus tab-cycle` and the desktop), as it already was of every
+//      press (`wc_click_route_at`, SO44).
+
+/// R63 — refuse the ROOT session's Log Out when it would strand the person at a screen with nobody to
+/// log in as. Prints the refusal and answers `true`; `false` (and silent) for every other session.
+pub fn root_logout_refused() -> bool {
+    if !root_session() {
+        return false;
+    }
+    let reason = if !load_once() {
+        "storage-not-up"
+    } else if count() == 0 {
+        "no-users"
+    } else {
+        return false;
+    };
+    serial_println!("[users] logout REFUSED session=root reason={} (R63: `adduser <name>` first — root's Log Out would leave a login screen with nobody to log in as)", reason);
+    true
+}
+
+/// LOGIN13 M3 — the shell's `logout`: close the open session (the root session included) and, where
+/// the screen is built, put it up — the SAME `reopen_after_logout` the crystal's Log Out row calls, so
+/// the two routes cannot drift. Where no screen is built (a headless image, the aarch64 `virt` lane) it
+/// is the plain [`logout`]. `Ok(name)` names the session that closed (`root` for the root session).
+pub fn log_out_to_screen(out: &mut [u8; NAME_MAX]) -> Result<usize, &'static str> {
+    let root = root_session();
+    let n = if root {
+        out[..4].copy_from_slice(b"root");
+        4
+    } else {
+        match whoami(out) {
+            Some(n) => n,
+            None => return Err("no-session"),
+        }
+    };
+    if root_logout_refused() {
+        return Err("refused");
+    }
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    crate::video::crystal::login::reopen_after_logout();
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    let _ = logout();
+    Ok(n)
+}
+
+/// LOGIN-ROOTOUT (`loginst`, LOGIN13 M3) — x86 `wc` lane: the root session's Log Out, end to end, driven
+/// through the entries a person uses. Runs after LOGIN-ADDUSER (which left `boot13` in the store) and
+/// before every other `loginst` leg:
+///  * `empty_refused` — with the store emptied of `boot13` for one call, the shell's `logout` from root is
+///    REFUSED `reason=no-users` and root stays live; `boot13` is then put back through `adduser_commit`;
+///  * `pid` / `root_stamped` — `STAT.ELF` launched IN THE ROOT SESSION (uid 0, the root epoch — the
+///    desktop's own launcher, `spawn_user_image_bg`); `others=` is every OTHER running root-session
+///    program the Log Out is about to end (0 on this lane: nothing else runs at the storage pass);
+///  * `root_after=false ended>=1 pid_gone window_gone` — the shell's `logout` closed root and ENDED its
+///    program; `screen=up screen_window=true` — the screen came up on a real `wm` row;
+///  * `not_root=not-root` — `adduser` from the screen's side of the Log Out is refused;
+///  * `keys_routed=true` — EVERY key below went through the LIVE x86 key router (`wc_route_event`) and was
+///    consumed there (`Event::Unknown`), never handed on; `name_typed` / `tab=password` — the bytes landed
+///    in the form's name field and Tab moved the FORM's focus (not `[wc-c] focus tab-cycle`);
+///    `wrong=denied` — a wrong password through the router is the one-answer denial and the screen stays;
+///    `login=boot13` — the right one opens the session as the new user (its `[users] home=/home/boot13`
+///    line is `login`'s); the screen goes down.
+/// It then logs `boot13` out (plainly — no screen), deletes it, and resets the form, leaving the store
+/// and the screen as the rest of the battery expects them.
+/// GO-RED (LOGIN13 M3, run on this gate): the screen-first fold deleted from `wc_route_event` →
+/// `keys_routed=false name_typed=false … -> FAIL —`.
+#[cfg(feature = "loginst")]
+pub fn login_rootout_fixture() {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        use crate::video::crystal::login as screen;
+        const N: &[u8] = b"boot13";
+        const PW: &[u8] = b"boot13-pw";
+        let mut con = crate::console::Console::new();
+        let mut nb = [0u8; NAME_MAX];
+        let root_before = root_session() && id_of(N).is_some();
+        // 1 — the refusal: root with nobody to log in as. Only when `boot13` is the store's ONE row (a
+        // fresh medium, which this lane's is), so the arm never deletes a user it did not create.
+        let empty_refused = if count() == 1 && delete_user(N).is_ok() {
+            shell_verb("logout", &[], &mut con);
+            let refused = root_session() && !screen_up();
+            let back = adduser_commit(N, PW).is_ok();
+            if refused && back { "no-users" } else { "NOT-REFUSED" }
+        } else {
+            "store-not-fresh"
+        };
+        // 2 — a program of the root session.
+        let (pid, slot, windowed, root_stamped) = match crate::arch::syscall::root_session_launch() {
+            Ok(v) => v,
+            Err(why) => {
+                serial_println!(":: LOGIN-ROOTOUT: launch -> FAIL — {} (the lane carries STAT.ELF; WINX-2 loads it every boot) ::", why);
+                return;
+            }
+        };
+        let others = crate::arch::syscall::root_session_others(slot);
+        // 3 — the shell's `logout`, from root.
+        shell_verb("logout", &[], &mut con);
+        let root_after = root_session();
+        let (pid_gone, window_gone) = crate::arch::syscall::root_session_probe(pid, slot);
+        let up = screen_up();
+        let screen_window = screen::fixture_windowed();
+        // 4 — root is gone, so `adduser` is refused.
+        shell_verb("adduser", &["boot13x"], &mut con);
+        let not_root = *ADDUSER_LAST.lock();
+        // 5 — the keyboard, through the LIVE x86 key router.
+        let route = |b: u8| matches!(crate::arch::syscall::wc_route_event(crate::pal::Event::Key(b)), crate::pal::Event::Unknown);
+        let mut routed = true;
+        for &b in N {
+            routed &= route(b);
+        }
+        let name_typed = screen::fixture_form_is(N, false);
+        routed &= route(b'\t');
+        let tab_pw = screen::fixture_form_is(N, true);
+        for &b in b"wrong-pw" {
+            routed &= route(b);
+        }
+        routed &= route(b'\n');
+        let wrong_kept = screen_up() && whoami(&mut nb).is_none();
+        for &b in PW {
+            routed &= route(b);
+        }
+        routed &= route(b'\n');
+        let logged_in = !screen_up() && matches!(whoami(&mut nb), Some(n) if &nb[..n] == N);
+        // 6 — put the battery's world back: session closed plainly, the scratch user gone, form reset.
+        let _ = logout();
+        screen::fixture_reset();
+        let cleaned = delete_user(N).is_ok() && !screen_up();
+        let ok = root_before && empty_refused == "no-users" && windowed && root_stamped && !root_after && pid_gone && window_gone && up && screen_window && not_root == "not-root" && routed && name_typed && tab_pw && wrong_kept && logged_in && cleaned;
+        serial_println!(
+            ":: LOGIN-ROOTOUT: root_before={} empty_refused={} pid={} root_stamped={} others={} root_after={} pid_gone={} window_gone={} screen={} screen_window={} not_root={} keys_routed={} name_typed={} tab={} wrong={} login={} cleaned={} -> {} ::",
+            root_before, empty_refused, pid, root_stamped, others, root_after, pid_gone, window_gone,
+            if up { "up" } else { "DOWN" }, screen_window, not_root, routed, name_typed,
+            if tab_pw { "password" } else { "NOT-MOVED" }, if wrong_kept { "denied" } else { "NOT-DENIED" },
+            if logged_in { "boot13" } else { "NONE" }, cleaned, if ok { "PASS" } else { "FAIL —" }
+        );
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    {
+        serial_println!("[users] root log-out fixture: x86 `wc` lane only (the screen and the x86 key router are what it drives)");
     }
 }

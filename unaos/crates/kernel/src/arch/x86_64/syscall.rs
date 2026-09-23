@@ -7309,7 +7309,7 @@ pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event { #[cfg(featu
     // rather than each naming one surface. It consumes ONLY a bare `Esc` while one of the two menus is open; every other event, and `Esc` with nothing down, falls straight through to the chain below.
     // ⚠ LINE-NEUTRAL fold (four comment lines in, four out): this file is x86-only so `kernel8.img`'s panic-`Location` proof is untouched either way, but the idiom is the tree's and is kept.
     // QUARRYDOOR (KEYDOORS F1) — `|| quarry::key_route(raw)`: on x86 the file manager had NO KEY DOOR AT ALL. `video/mod.rs:685` compiles `quarry` under `wc` on this arch too, but `wc_route_event` never asked it and neither does `user_input_enqueue` here (x86's ring door has no key interception — this wrapper IS x86's interception), so <Esc>, the arrows, <Enter>, Backspace, `r` and the wheel had ZERO reachable consumers on this board. Asked in the SAME position as the two aarch64 doors: after `strip::key_escape` (a menu composites above Quarry, so the modal surface wins) and ahead of `wc_focus_key` (an open file manager eats its own arrows before the focus ring). `key_route` gates on `focus_asid() == OWNER && on_glass()` since SO9FIX 63b109f6 (was `on_glass()` alone — SO9), so a closed Quarry consumes nothing and this is behaviour-alike on every boot without one. Folded into the existing condition — no line added, the idiom this block already states.
-    #[cfg(feature = "wc")]
+    #[cfg(feature = "login")] if crate::fs::users::screen_up() && matches!(raw, crate::pal::Event::Key(_) | crate::pal::Event::KeyUp(_)) { if let crate::pal::Event::Key(c) = raw { let _ = crate::fs::users::screen_key(c); } return crate::pal::Event::Unknown; } #[cfg(feature = "wc")] // LOGIN13 M3 (R63) — THE SCREEN IS THE FIRST TAKER OF EVERY KEY while it is up: ahead of the Esc/Quarry doors, the Tab focus ring (`wc_focus_key`) and the focused ring (`user_input_route`). Flight 12's keys went to `[wc-c] focus tab-cycle` and the desktop because every one of those was asked first and the screen was asked last, in the render loop's fallback (`main.rs`, after this router). A key-UP is swallowed too, so no app sees half a keystroke. The SERIALDOOR arm on the signature line stays first: a wire byte is the console's, and the loop's own `screen_key` still hands it to the screen. ⚠ LINE-NEUTRAL fold.
     if crate::video::strip::key_escape(raw) || crate::video::quarry::key_route(raw) {
         return crate::pal::Event::Unknown;
     }
@@ -23848,7 +23848,7 @@ pub fn session_login(id: u32, name: &[u8]) -> bool {
 /// SO37: the epoch is bumped FIRST, so no instant exists in which the session is already gone while the
 /// epoch still names it. See the SO37 block below for what the epoch is and why it is not in the record.
 #[cfg(feature = "login")]
-pub fn session_logout() -> (usize, usize) { let ended = session_end_processes(SESSION_EPOCH.load(Ordering::Acquire)); // SECLOGIN M3 — every program launched under the CLOSING epoch is ended (windows first, then the close box's own kill path) BEFORE the bump, so no instant exists in which a session's program outlives its session; `(ended, windows)` reaches the wire through `fs::users::logout`. Same-line fold (B94).
+pub fn session_logout() -> (usize, usize) { session_logout_as(false) } #[cfg(feature = "login")] pub fn session_logout_as(root: bool) -> (usize, usize) { let ended = session_end_processes(SESSION_EPOCH.load(Ordering::Acquire), root); // LOGIN13 M3 (R63) — `root` = the ROOT session is closing: its programs (uid 0, stamped in this epoch) are the ones ended. `session_logout` keeps its name and its meaning for every other caller. Same-line fold. SECLOGIN M3 — every program launched under the CLOSING epoch is ended (windows first, then the close box's own kill path) BEFORE the bump, so no instant exists in which a session's program outlives its session; `(ended, windows)` reaches the wire through `fs::users::logout`. Same-line fold (B94).
     SESSION_EPOCH.fetch_add(1, Ordering::AcqRel);
     SESSION_USER.store(0, Ordering::Release);
     crate::arch::without_interrupts(|| { SESSION_NAME.lock().1 = 0; }); ended
@@ -28657,12 +28657,12 @@ pub fn ident_fixture(uid_a: u32, uid_b: u32, uid_a2: u32) -> (bool, bool, bool) 
 /// box already takes (the reap tears the address space down and retires its compositor windows; the
 /// slot's user stamp goes with its generation in `clear_handle_row`). COUNTED as ended only when the
 /// row no longer names the pid after the kill returns — an armed-but-unconfirmed kill is not an end,
-/// so `ended=N` on the wire was measured, not requested. A program launched with NO session
-/// (`SLOT_USER == 0`: the whole fixture battery, the desktop's own `STAT.ELF`) is never touched —
-/// the boundary is the session, and an anonymous program has no session to outlive. Returns
+/// so `ended=N` on the wire was measured, not requested. A program launched with NO user session
+/// (`SLOT_USER == 0`) is touched ONLY by the ROOT session's Log Out (`root = true`, LOGIN13 M3 / R63:
+/// uid 0 IS the root session, and its programs end with it — the desktop's own `STAT.ELF` included) — a user's Log Out never touches it. Returns
 /// `(ended, windows_closed)`; called from [`session_logout`] BEFORE the epoch bump.
 #[cfg(feature = "login")]
-fn session_end_processes(closing: u64) -> (usize, usize) {
+fn session_end_processes(closing: u64, root: bool) -> (usize, usize) {
     let mut ended = 0usize;
     let mut windows = 0usize;
     for pi in 0..MAX_PROCS {
@@ -28671,7 +28671,7 @@ fn session_end_processes(closing: u64) -> (usize, usize) {
         }
         let owner = PROCS[pi].slot.load(Ordering::Acquire) as u64; // `slot + 1`-biased: the wm owner key
         let Some(s) = (owner as usize).checked_sub(1) else { continue };
-        if s > crate::arch::memory::USER_SLOTS || SLOT_USER[s].load(Ordering::Acquire) == 0 || SLOT_EPOCH[s].load(Ordering::Acquire) != closing {
+        if s > crate::arch::memory::USER_SLOTS || (SLOT_USER[s].load(Ordering::Acquire) == 0) != root || SLOT_EPOCH[s].load(Ordering::Acquire) != closing { // LOGIN13 M3: a USER session's Log Out ends its uid's rows (non-zero), the ROOT session's ends the uid-0 rows of the root epoch — never both, so a user's Log Out still leaves anonymous programs alone
             continue;
         }
         let pid = PROCS[pi].pid.load(Ordering::Acquire);
@@ -28730,4 +28730,62 @@ pub fn session_end_fixture() -> (u64, usize, usize, usize, bool, bool, &'static 
     let pid_gone = matches!(bg_poll(pid, false), BgPoll::Gone);
     let window_gone = !winx_slot_has_window(slot);
     (pid, windows_before, ended, windows, pid_gone && stamped, window_gone, if stamped { "stamped" } else { "UNSTAMPED" })
+}
+
+// =====================================================================================================
+// LOGIN13 M3 (rmbp-ledger B189, R63) — THE ROOT SESSION'S PROGRAMS, fixture half. File tail: nothing above moves.
+// =====================================================================================================
+
+/// LOGIN13 M3 fixture (`loginst`, x86): launch `STAT.ELF` IN THE ROOT SESSION through the desktop's own
+/// launcher (`spawn_user_image_bg`, exactly as [`session_end_fixture`] does for a user session) and wait
+/// for its window. `Ok((pid, slot, windowed, root_stamped))` where `root_stamped` reads the slot's stamp
+/// back — uid 0 in the LIVE epoch, i.e. the row [`session_end_processes`]'s root arm selects; `Err(why)`
+/// when there is nothing to launch on this medium.
+#[cfg(all(feature = "loginst", feature = "login"))]
+pub fn root_session_launch() -> Result<(u64, usize, bool, bool), &'static str> {
+    let Ok(fs) = crate::fs::fat::mount_program_source() else { return Err("no-fat-volume") };
+    let Ok(de) = fs.find_app("STAT.ELF") else { return Err("stat-elf-absent") };
+    let cap = user_window_size();
+    if de.size == 0 || de.size as usize > cap {
+        return Err("stat-elf-size");
+    }
+    let mut bytes = alloc::vec![0u8; de.size as usize];
+    if fs.read_file(&de, &mut bytes, cap).is_err() {
+        return Err("stat-elf-read");
+    }
+    let (pid, slot, _entry) = spawn_user_image_bg(&bytes).map_err(|_| "spawn-refused")?;
+    let slot = slot as usize;
+    let deadline = crate::arch::ticks() + 5_000;
+    let mut windowed = false;
+    while crate::arch::ticks() < deadline {
+        windowed |= winx_slot_has_window(slot);
+        if windowed {
+            break;
+        }
+        crate::arch::sched::yield_now();
+    }
+    let root_stamped = slot <= crate::arch::memory::USER_SLOTS
+        && SLOT_USER[slot].load(Ordering::Acquire) == 0
+        && SLOT_EPOCH[slot].load(Ordering::Acquire) == SESSION_EPOCH.load(Ordering::Acquire);
+    Ok((pid, slot, windowed, root_stamped))
+}
+
+/// LOGIN13 M3 fixture: every OTHER running program the root session's Log Out would end right now (uid 0
+/// in the live epoch, `except` excluded) — the fixture's `others=`, so a Log Out that took a program it
+/// did not launch is a number on its line rather than a mystery two fixtures later.
+#[cfg(all(feature = "loginst", feature = "login"))]
+pub fn root_session_others(except: usize) -> usize {
+    let live = SESSION_EPOCH.load(Ordering::Acquire);
+    (0..MAX_PROCS)
+        .filter(|&pi| PROCS[pi].state.load(Ordering::Acquire) == PRUNNING)
+        .filter_map(|pi| (PROCS[pi].slot.load(Ordering::Acquire) as usize).checked_sub(1))
+        .filter(|&s| s != except && s <= crate::arch::memory::USER_SLOTS && SLOT_USER[s].load(Ordering::Acquire) == 0 && SLOT_EPOCH[s].load(Ordering::Acquire) == live)
+        .count()
+}
+
+/// LOGIN13 M3 fixture: after the Log Out — is `pid` gone from the process table, and does `slot` hold no
+/// window? The same two reads [`session_end_fixture`] takes.
+#[cfg(all(feature = "loginst", feature = "login"))]
+pub fn root_session_probe(pid: u64, slot: usize) -> (bool, bool) {
+    (matches!(bg_poll(pid, false), BgPoll::Gone), !winx_slot_has_window(slot))
 }
