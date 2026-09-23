@@ -1666,3 +1666,12 @@ pub fn login_press_fixture(name: &[u8], password: &[u8]) -> bool {
     );
     ok
 }
+
+/// CRYSTAL2 (rmbp-ledger B194) — **one tenant's LEAF-LOCK decline count**, `decl_lock=` on its `scope=bar`
+/// rollup, read by a fixture that must say WHY a paint it drove did not land. Flight 12's menubar
+/// census moved `decl_lock` 0 -> 16 across `menubar::selftest` and nowhere else all boot, and that
+/// number was only readable 5 s later on the rollup cadence. Tail-appended (B94); witness-only.
+#[cfg(feature = "witness")]
+pub fn bar_decl_lock(name: &str) -> u64 {
+    BARS[bar_slot(name)].decl[DECL_LOCK].load(Ordering::Relaxed)
+}

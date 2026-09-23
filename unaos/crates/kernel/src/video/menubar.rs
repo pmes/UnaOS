@@ -117,8 +117,8 @@
 //! It is drawn from the kit's OWN blue accent ramp — three facets lit from the top-right, the
 //! high-contrast seam down the crown reading as a facet edge — reusing three lifted roles `theme.rs`
 //! records as having no consumer since the controls went semantic. No palette is invented. It appears
-//! only when the bar is enabled (the bar is a default-off tenant; the crystal is part of it), and its
-//! geometry is on the witness (`crystal=WxH+X+Y`) so a capture can confirm the mark is DRAWN.
+//! only when the bar is enabled (the bar is a default-off tenant; the crystal is part of it). Its GEOMETRY
+//! is `crystal=WxH+X+Y`; whether it is DRAWN is read off the PANEL (`gem_px=`/`sym=`, CRYSTAL2 B194).
 //!
 //! # Density, not decoration — why the bar earns its 34 rows
 //!
@@ -1105,7 +1105,7 @@ pub fn compose() -> bool {
         return false;
     }
     // MENUOWN — **WHOSE menus the bar is showing, and WHERE it put them.** See [`MENUROW_KEY`].
-    menurow_witness(&model);
+    menurow_witness(&model); #[cfg(feature = "witness")] persist_model(&mut model); // CRYSTAL2 (B194) — `crystal_persist_selftest`'s synthetic model, AFTER the menu row is announced and BEFORE the signature, so the bar's real damage test decides the repaint. Inert (one relaxed load) unless that fixture is running. ⚠ SAME-LINE fold, line-neutral (B94).
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
     }
@@ -1506,14 +1506,14 @@ fn firstpaint_witness(m: &Model, r: strip::Rect) {
         Some(strip::cycles_to_us(crate::arch::now_cycles().saturating_sub(enabled_at)) / 1000)
     };
     let (mask, what) = model_terms(m);
-    // The mark is DRAWN iff its box fits the rect the painter was handed — the same two bounds
-    // `compose_row`'s crystal block is clipped by (`j < cy0 + CRYSTAL_H`, `i < w`), read off the rect
-    // rather than restated, so the witness cannot claim a gem the painter clipped away.
-    let crystal = r.3 >= CRYSTAL_H && crystal_offset(r.3).0 + CRYSTAL_W <= r.2;
+    // CRYSTAL2 (B194) — the mark is DRAWN iff the PANEL holds it: every silhouette pixel in its ink, no
+    // gem ink outside it, mirror-symmetric. This was `r.3 >= CRYSTAL_H && …` — the rect's geometry, true
+    // on any 2880x34 bar whether or not a pixel of the gem reached the glass. See [`crystal_readback`].
+    let gem = crystal_readback(r); let crystal = matches!(gem, Some((m, w, 0, true)) if m == w && w > 0);
     FIRSTPAINT_READING.store(
         FP_VALID
             | (mask << 32)
-            | ((crystal as u64) << 35)
+            | ((crystal as u64) << 35) | (gem_class(gem) << 36) // CRYSTAL2 — bits 36-37: the readback's word
             | after.unwrap_or(u32::MAX as u64).min(u32::MAX as u64),
         Ordering::Release,
     );
@@ -1528,13 +1528,13 @@ fn firstpaint_witness(m: &Model, r: strip::Rect) {
         return;
     }
     serial_println!(
-        "[menubar] first-paint at={} after_enable_ms={} model={}{} crystal={} rect={}x{}+{}+{}",
+        "[menubar] first-paint at={} after_enable_ms={} model={}{} crystal={} rect={}x{}+{}+{} gem_px={}/{} stray={} sym={}",
         Ms(at),
         Ms(after),
         if mask == 0 { "complete" } else { "partial:" },
         what,
-        if crystal { "drawn" } else { "absent" },
-        r.2, r.3, r.0, r.1
+        gem_word(gem),
+        r.2, r.3, r.0, r.1, gem.map_or(0, |g| g.0), gem.map_or(0, |g| g.1), gem.map_or(0, |g| g.2), gem.map_or(false, |g| g.3)
     );
 }
 
@@ -1768,18 +1768,18 @@ fn crystal_half(v: usize) -> usize {
 /// Three facets from the kit's blue gem ramp, lit from the top-right: the crown's RIGHT face catches
 /// the light ([`theme::CONTROL_ZOOM`], lightest), its LEFT face is in shadow
 /// ([`theme::CONTROL_CLOSE`], darkest), and the pavilion below the girdle is the medium tone
-/// ([`theme::CONTROL_MID`]). The high-contrast CLOSE|ZOOM seam down the centre reads as the crown's
-/// facet edge; the colour change at the girdle reads as the girdle line. Two facet lines and a table,
-/// dense and minimal — a crystal at 16x22.
+/// ([`theme::CONTROL_MID`]). The CLOSE|ZOOM seam on the box's centre line reads as the crown's facet
+/// edge. CRYSTAL2 (B194): centred on the box's HALF-pixel line, so the gem is mirror-symmetric (it was
+/// centred on column 8 of 16: the girdle's right tip clipped by the box, the crown split 4 dark to 5 lit).
 #[inline]
 fn crystal_facet(u: usize, v: usize) -> Option<u32> {
     if v >= CRYSTAL_H || u >= CRYSTAL_W {
         return None;
     }
-    let cx = CRYSTAL_W / 2;
+    let cx = CRYSTAL_W / 2; // the facet seam: columns `< cx` are the shadowed face, `>= cx` the lit one
     let half = crystal_half(v);
-    let du = if u >= cx { u - cx } else { cx - u };
-    if du > half {
+    let d2 = (2 * u + 1).abs_diff(CRYSTAL_W); // CRYSTAL2 — distance from the box's centre line, in HALF px
+    if d2 > (2 * half).saturating_sub(1).max(1) {
         return None;
     }
     Some(if v < CRYSTAL_CROWN_H {
@@ -2239,7 +2239,7 @@ pub fn selftest() {
     // reasons it is after the census legs: it drives `compose` (so it must not perturb a leg that
     // reads the model), and its claim — *the first paint lands inside one composite pass of the
     // enable* — deserves its own verdict line rather than a term folded into `:: MENUBAR:`.
-    firstpaint_selftest(pw, ph);
+    firstpaint_selftest(pw, ph); crystal_persist_selftest(pw, ph); // CRYSTAL2 (B194) — the crystal on EVERY paint, read off the panel; after MENUFIRST for its reason (it drives `compose`). ⚠ SAME-LINE fold (B94).
 
     rollup("selftest");
 }
@@ -2439,14 +2439,14 @@ pub fn firstpaint_selftest(pw: usize, ph: usize) {
     set_enabled(true);
     let stamped = ENABLED_AT_CYC.load(Ordering::Acquire) != CYC_NONE;
 
-    // Leg 2 — the paint, read off the composite's own return value.
-    let mut painted = false;
-    for _ in 0..4 {
-        if compose() {
-            painted = true;
-            break;
-        }
-    }
+    // Leg 2 — the paint. CRYSTAL2 (B194): SETTLED ON THE RECORDER, not four back-to-back `compose()`
+    // tries. Flight 12 declined all four (and leg 4's four) on a refused leaf lock — `decl_lock` 0 -> 16
+    // across the fixture, zero `[menubar]` paints landed — and the verdict then printed the ZEROS of an
+    // empty reading as `model=complete crystal=absent`: FIXTURE_FLAKES Class 6. An unlanded paint is
+    // now a stated SKIP with its settle figures on the line, never a FAIL and never a fake reading.
+    let settle_a = paint_settle(|| FIRSTPAINT_READING.load(Ordering::Acquire) & FP_VALID != 0);
+    let painted = settle_a.0; // a paint LANDED and was recorded — a sibling core's pass counts too
+    // (`recorded` below stays its own field: it is the READING's valid bit, `painted` is the settle's.)
     let reading = FIRSTPAINT_READING.load(Ordering::Acquire);
     let recorded = reading & FP_VALID != 0;
     let after = reading & 0xFFFF_FFFF;
@@ -2473,13 +2473,13 @@ pub fn firstpaint_selftest(pw: usize, ph: usize) {
     let probe_us = strip::cycles_to_us(probe_cyc).max(1);
     let inject_cyc = (RED_INJECT_MS * 1000).saturating_mul(probe_cyc) / probe_us;
     ENABLED_AT_CYC.store(real_edge.saturating_sub(inject_cyc), Ordering::Release);
-    let mut red_painted = false;
-    for _ in 0..4 {
-        if compose() {
-            red_painted = true;
-            break;
-        }
-    }
+    // CRYSTAL2 — the same settle on the same recorder, for leg 2's reason. The injected edge above is
+    // what the recorder measures from, whichever core's pass lands the paint.
+    let settle_b = paint_settle(|| FIRSTPAINT_READING.load(Ordering::Acquire) & FP_VALID != 0);
+    let red_painted = settle_b.0;
+    // A leg-4 paint that never lands leaves `gone_red=false` for the same foreign reason leg 2's would,
+    // so the verdict is SKIP when EITHER settle ran out: the control is unproven, not refuted. A landed
+    // paint that reads wrong (late, unrecorded, gem not on the panel) is still a FAIL.
     let red_reading = FIRSTPAINT_READING.load(Ordering::Acquire);
     let red_after = red_reading & 0xFFFF_FFFF;
     let gone_red = red_painted && red_reading & FP_VALID != 0 && !(red_after <= ONE_COMPOSITE_MS);
@@ -2490,14 +2490,14 @@ pub fn firstpaint_selftest(pw: usize, ph: usize) {
     set_enabled(saved_en);
 
     let (rw, rh) = rect.map(|(_, _, w, h)| (w, h)).unwrap_or((0, 0));
-    let ok = unstamped && stamped && painted && recorded && bounded && gone_red && crystal;
+    let ok = unstamped && stamped && painted && recorded && bounded && gone_red && crystal; let gemc = (reading >> 36) & 3;
     serial_println!(
         ":: MENUFIRST: after_enable_ms={} bound_ms={} model={}{} crystal={} bar={}x{} \
-         gem={}x{}+{}+{} red_after_enable_ms={} unstamped={} stamped={} painted={} recorded={} \
+         gem={}x{}+{}+{} red_after_enable_ms={} settle_tries={}+{} settle_us={}+{} decl_lock={} unstamped={} stamped={} painted={} recorded={} \
          bounded={} gone_red={} :: {} ::",
         after,
         ONE_COMPOSITE_MS,
-        if mask == 0 { "complete" } else { "partial:" },
+        if !recorded { "unread" } else if mask == 0 { "complete" } else { "partial:" },
         match mask {
             0 => "",
             1 => "caption",
@@ -2508,12 +2508,12 @@ pub fn firstpaint_selftest(pw: usize, ph: usize) {
             6 => "clock+batt",
             _ => "caption+clock+batt",
         },
-        if crystal { "drawn" } else { "absent" },
+        if recorded { GEM_WORDS[gemc as usize] } else { "unread" },
         rw, rh,
         CRYSTAL_W, CRYSTAL_H, crystal_offset(rh.max(CRYSTAL_H)).0, crystal_offset(rh.max(CRYSTAL_H)).1,
-        red_after,
+        red_after, settle_a.1, settle_b.1, settle_a.2, settle_b.2, settle_a.3 + settle_b.3,
         unstamped, stamped, painted, recorded, bounded, gone_red,
-        if ok { "PASS" } else { "FAIL" }
+        if !painted || !red_painted { "SKIP" } else if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -2743,4 +2743,276 @@ fn barclock_note(rect: Option<(usize, usize, usize, usize)>) {
             TITLE_GLYPHS
         ),
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// CRYSTAL2 (rmbp-ledger B194) — THE CRYSTAL READ OFF THE PANEL, ON EVERY PAINT, AND A FIXTURE PAINT
+// THAT SETTLES INSTEAD OF GIVING UP AFTER FOUR TRIES. Tail-appended so no panic `Location` above
+// moves (B94); every item is `witness`-gated, the image Peter flies is a witness build.
+//
+// Flight 12 put two readings of the same mark on one wire. `[menubar] first-paint … crystal=drawn`
+// at 6699 ms was the RECT's geometry (`r.3 >= CRYSTAL_H && …`), true on any 2880x34 bar whether or
+// not a pixel of the gem reached the glass. `:: MENUFIRST: … crystal=absent … recorded=false` at
+// 48497 ms was bit 35 of a reading that was never written — the same zero that printed
+// `model=complete` and `after_enable_ms=0` — because all eight `compose()` tries declined on a
+// refused leaf lock (`[strip] rollup tenant=menubar … decl_lock=16`, 0 at 48481 ms, 16 at 53483 ms and
+// never again all boot) and zero `[menubar]` paints landed across the whole fixture (`paints=3`
+// before and after). Neither line said anything about the glass. Both now read the PANEL.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// CRYSTAL2 — the settle budget, ms. DOCKID2's `DOCKID_FOLD_WAIT_MS` (`video/dock.rs`), restated
+/// because that constant is private to its module: the same Class 6 cure, the same bound.
+#[cfg(feature = "witness")]
+const SETTLE_BUDGET_MS: u64 = 250;
+
+/// CRYSTAL2 — spins between two settle tries: DOCKID2's `DOCKID_FOLD_SPIN_MAX`, restated likewise.
+#[cfg(feature = "witness")]
+const SETTLE_SPIN: u32 = 4096;
+
+/// CRYSTAL2 — **drive [`compose`] until `done` answers `true`, or [`SETTLE_BUDGET_MS`] runs out.**
+///
+/// Returns `(landed, tries, waited_us, decl_lock)` — the last being how many LEAF-LOCK declines the
+/// menubar's strip census counted while this ran ([`strip::bar_decl_lock`]), so an unlanded settle
+/// names its cause on the line instead of leaving it to a rollup five seconds later.
+///
+/// `done` is a PREDICATE ON PUBLISHED STATE, never `compose()`'s return value: a sibling core's
+/// composite paints through this same `compose`, and a paint it lands is as much the bar's as one
+/// this fixture drove — FIXTURE_FLAKES Class 6's rule (score what the publisher published, and say
+/// so when it published nothing). Timed on the cycle counter through [`strip::cycles_to_us`], not on
+/// `arch::ms()`: the tick needs interrupts, and a settle that cannot see time pass cannot end.
+#[cfg(feature = "witness")]
+fn paint_settle(done: impl Fn() -> bool) -> (bool, u32, u64, u64) {
+    let t0 = crate::arch::now_cycles();
+    let d0 = strip::bar_decl_lock("menubar");
+    let waited = || strip::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0));
+    let mut tries = 0u32;
+    let landed = loop {
+        if done() {
+            break true;
+        }
+        if waited() >= SETTLE_BUDGET_MS * 1000 {
+            break false;
+        }
+        tries += 1;
+        let _ = compose();
+        if done() {
+            break true;
+        }
+        for _ in 0..SETTLE_SPIN {
+            core::hint::spin_loop();
+        }
+    };
+    (landed, tries, waited(), strip::bar_decl_lock("menubar").saturating_sub(d0))
+}
+
+/// CRYSTAL2 — the readback's words, indexed by [`gem_class`]: the panel lock was refused, every
+/// silhouette pixel in its ink with none outside and the mark mirror-symmetric, some but not all of
+/// that, none of it.
+#[cfg(feature = "witness")]
+const GEM_WORDS: [&str; 4] = ["unread", "drawn", "broken", "absent"];
+
+/// CRYSTAL2 — classify a [`crystal_readback`] into an index of [`GEM_WORDS`].
+#[cfg(feature = "witness")]
+fn gem_class(g: Option<(u32, u32, u32, bool)>) -> u64 {
+    match g {
+        None => 0,
+        Some((m, w, 0, true)) if m == w && w > 0 => 1,
+        Some((0, _, 0, _)) => 3,
+        Some(_) => 2,
+    }
+}
+
+/// CRYSTAL2 — [`gem_class`] as its word, for the `[menubar] first-paint` line.
+#[cfg(feature = "witness")]
+fn gem_word(g: Option<(u32, u32, u32, bool)>) -> &'static str {
+    GEM_WORDS[gem_class(g) as usize]
+}
+
+/// CRYSTAL2 — **the crystal's 16x22 box read back off the PANEL**: `(matched, want, stray, sym)`, or
+/// `None` when the panel lock was refused (masked and contended — [`super::panel_snapshot`]'s rule).
+///
+/// * `want` — silhouette pixels ([`crystal_facet`] answers `Some`); `matched` — those whose panel
+///   pixel IS that ink. `matched == want` is "every pixel of the gem reached the glass".
+/// * `stray` — pixels OUTSIDE the silhouette carrying one of the three gem inks: a mark drawn at the
+///   wrong offset, or smeared, reads `stray > 0` even when every silhouette pixel happens to match.
+/// * `sym` — the box is mirror-symmetric about its vertical centre line (shape, and the crown's
+///   shadowed face opposite its lit one). Read off the PANEL, so it holds [`crystal_facet`] itself to
+///   account, which `matched` cannot: `matched` compares the glass with the painter's own function.
+///
+/// 352 reads of the scan-out surface, ~1 µs each on the rMBP's write-combined aperture
+/// (`framebuffer.rs`'s cost note), paid once per boot by the first-paint witness and once per paint
+/// by [`crystal_persist_selftest`] — never on a steady-state composite.
+#[cfg(feature = "witness")]
+fn crystal_readback(r: strip::Rect) -> Option<(u32, u32, u32, bool)> {
+    let fb = super::panel_snapshot()?;
+    let (bx, by, _, _) = crystal_box(r);
+    let (mut matched, mut want, mut stray, mut sym) = (0u32, 0u32, 0u32, true);
+    for v in 0..CRYSTAL_H {
+        // 0 = not a gem ink, 1 = CLOSE (shadowed crown face), 2 = MID (pavilion), 3 = ZOOM (lit face).
+        let mut cls = [0u8; CRYSTAL_W];
+        for u in 0..CRYSTAL_W {
+            let px = fb.read_pixel(bx + u, by + v);
+            cls[u] = match px {
+                Some(theme::CONTROL_CLOSE) => 1,
+                Some(theme::CONTROL_MID) => 2,
+                Some(theme::CONTROL_ZOOM) => 3,
+                _ => 0,
+            };
+            match crystal_facet(u, v) {
+                Some(c) => {
+                    want += 1;
+                    if px == Some(c) {
+                        matched += 1;
+                    }
+                }
+                None => {
+                    if cls[u] != 0 {
+                        stray += 1;
+                    }
+                }
+            }
+        }
+        // The mirror of a shadowed face is the lit one; the pavilion and the bar's face mirror to
+        // themselves.
+        for u in 0..CRYSTAL_W / 2 {
+            if cls[CRYSTAL_W - 1 - u] != [0u8, 3, 2, 1][cls[u] as usize] {
+                sym = false;
+            }
+        }
+    }
+    Some((matched, want, stray, sym))
+}
+
+/// CRYSTAL2 — which synthetic model [`crystal_persist_selftest`] has [`compose`] paint: `0` none (the
+/// live model, always, outside the fixture), `1` the flight-12 first paint's model (no caption, no
+/// clock, no battery), `2` a COMPLETE one, `3` the complete one a clock minute later.
+#[cfg(feature = "witness")]
+static PERSIST_MODEL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// CRYSTAL2 — the synthetic model for [`PERSIST_MODEL`] kind `k`. Every field is set, so its
+/// [`Model::signature`] is a function of the kind and the rect alone and the fixture can compute the
+/// signature a landed paint must leave in [`SLOT`].
+#[cfg(feature = "witness")]
+fn persist_build(kind: u8) -> Model {
+    let mut m = Model::empty();
+    if kind >= 2 {
+        const CAP: &[u8] = b"Persist";
+        m.title[..CAP.len()].copy_from_slice(CAP);
+        m.title_len = CAP.len();
+        m.clock = Some(if kind == 2 { *b"12:34" } else { *b"12:35" });
+        m.batt = Some(super::status::BarItem { percent: 82, charging: true });
+    }
+    m
+}
+
+/// CRYSTAL2 — [`compose`]'s hook: replace the pass's model while the fixture holds a kind. One
+/// relaxed load when it does not.
+#[cfg(feature = "witness")]
+#[inline]
+fn persist_model(m: &mut Model) {
+    let k = PERSIST_MODEL.load(Ordering::Relaxed);
+    if k != 0 {
+        *m = persist_build(k);
+    }
+}
+
+/// CRYSTAL2 — what a model DRAWS, named in [`model_terms`]'s words but read off the model itself
+/// (that function's `batt` term is the status SOURCE, which a synthetic model does not move).
+#[cfg(feature = "witness")]
+fn drawn_terms(m: &Model) -> &'static str {
+    match (m.title_len > 0, m.clock.is_some(), m.batt.is_some()) {
+        (true, true, true) => "complete",
+        (false, false, false) => "partial:caption+clock+batt",
+        _ => "partial:other",
+    }
+}
+
+/// CRYSTAL2 fixture — **the crystal is on the glass after EVERY paint of the bar, whatever the bar's
+/// model: a partial bar, then a complete one, then that complete one a clock minute later.**
+///
+/// The question flight 12 left open: `[menubar] first-paint` spoke on a PARTIAL bar
+/// (`model=partial:caption+clock+batt`) and nothing spoke for the later, fuller ones — so a gem
+/// drawn on the first paint and omitted by a later one would be a broken crystal the wire never saw.
+/// The code answers it (`strip::paint` rewrites every row of the rect, and [`compose_row`] draws the
+/// gem before any model-dependent branch), and both flights' censuses agree (`paint_px` is exactly
+/// `paints x 97920` on all 17 `[strip] rollup tenant=menubar` lines of flights 11 and 12). This makes
+/// that a MEASUREMENT: each paint is driven through the real [`compose`] and the real damage test
+/// with the model swapped by [`persist_model`], settled on [`SLOT`] holding that model's signature
+/// (a sibling core's paint counts), and then the gem's box is read back off the panel.
+///
+/// `-> PASS` iff all three paints landed and every one read `drawn` ([`GEM_WORDS`]). `-> SKIP` when a
+/// paint did not land inside the budget or the panel lock was refused — Class 6: stated, never a
+/// FAIL. GO-RED (a source mutation, B194): skip the gem in [`compose_row`] when the model has a clock
+/// — i.e. on the second and third paints — and the line reads `present=1/3 … -> FAIL`.
+///
+/// Restores what it touched: the override is cleared, the band is handed back with the bar OFF, and
+/// the enable flag is put back — so on a metal boot the next composite repaints the LIVE model.
+#[cfg(feature = "witness")]
+pub fn crystal_persist_selftest(pw: usize, ph: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let saved_en = enabled();
+    // The synthetic clock is not the civil clock: keep `:: BARCLOCK:` from announcing it.
+    #[cfg(feature = "sntp6")]
+    let saved_clock_said = BARCLOCK_SEEN.fetch_or(0b11, Ordering::Relaxed);
+    // Clear the slot first, so paint 1 is a PAINT and not the live bar already matching kind 1.
+    set_enabled(false);
+    let _ = compose();
+    set_enabled(true);
+    let rect = strip_rect(pw, ph);
+    const KINDS: [u8; 3] = [1, 2, 3];
+    let mut words = ["-"; 3];
+    let mut tries = [0u32; 3];
+    let (mut landed, mut present, mut matched, mut want, mut stray) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    let (mut sym, mut unread, mut decl) = (true, 0u32, 0u64);
+    if let Some(r) = rect {
+        for (i, &k) in KINDS.iter().enumerate() {
+            let m = persist_build(k);
+            words[i] = drawn_terms(&m);
+            let want_sig = m.signature(r);
+            PERSIST_MODEL.store(k, Ordering::Release);
+            let s = paint_settle(|| SLOT.sig() == want_sig && SLOT.packed() == strip::pack_rect(Some(r)));
+            tries[i] = s.1;
+            decl += s.3;
+            if !s.0 {
+                continue;
+            }
+            landed += 1;
+            let g = crystal_readback(r);
+            match g {
+                Some((mt, w, st, y)) => {
+                    matched += mt;
+                    want += w;
+                    stray += st;
+                    sym &= y;
+                }
+                None => unread += 1,
+            }
+            if gem_class(g) == 1 {
+                present += 1;
+            }
+        }
+    }
+    PERSIST_MODEL.store(0, Ordering::Release);
+    set_enabled(false);
+    let _ = compose(); // hand the band back; the next enabled pass repaints the LIVE model
+    set_enabled(saved_en);
+    #[cfg(feature = "sntp6")]
+    BARCLOCK_SEEN.store(saved_clock_said, Ordering::Relaxed);
+    let n = KINDS.len() as u32;
+    let verdict = if rect.is_none() || landed < n || unread > 0 {
+        "SKIP"
+    } else if present == n {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    serial_println!(
+        "[menubar] crystal-persist paints={} present={}/{} models={},{},{} gem_px={}/{} stray={} sym={} \
+         tries={},{},{} decl_lock={} unread={} budget_ms={} -> {}",
+        landed, present, landed, words[0], words[1], words[2], matched, want, stray, sym,
+        tries[0], tries[1], tries[2], decl, unread, SETTLE_BUDGET_MS, verdict
+    );
 }

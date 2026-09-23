@@ -1,0 +1,13 @@
+diff --git a/unaos/crates/kernel/src/video/menubar.rs b/unaos/crates/kernel/src/video/menubar.rs
+index 5b793c40..2c43f016 100644
+--- a/unaos/crates/kernel/src/video/menubar.rs
++++ b/unaos/crates/kernel/src/video/menubar.rs
+@@ -2802,7 +2802,7 @@ fn paint_settle(done: impl Fn() -> bool) -> (bool, u32, u64, u64) {
+             core::hint::spin_loop();
+         }
+     };
+-    (landed, tries, waited(), strip::bar_decl_lock("menubar").saturating_sub(d0))
++    (landed && false, tries, waited(), strip::bar_decl_lock("menubar").saturating_sub(d0))
+ }
+ 
+ /// CRYSTAL2 — the readback's words, indexed by [`gem_class`]: the panel lock was refused, every

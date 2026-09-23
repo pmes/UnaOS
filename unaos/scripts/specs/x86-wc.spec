@@ -184,7 +184,7 @@ FORBID :: MENUFIRST: .* :: FAIL ::
 # the state of the MACHINE at the seam (`partial:caption+clock` on this gate, `partial:caption+batt` on
 # flight 11's metal), and a spec that demanded `complete` would be gating on the two rows B156's STOP hands
 # to `wm.rs` and `video/status.rs`. What is pinned is that the bar SAYS which, and that the gem was drawn.
-REQUIRE \[menubar\] first-paint at=\d+ after_enable_ms=\d+ model=[a-z:+]+ crystal=drawn rect=\d+x\d+\+\d+\+\d+
+REQUIRE \[menubar\] first-paint at=\d+ after_enable_ms=\d+ model=[a-z:+]+ crystal=drawn rect=\d+x\d+\+\d+\+\d+ gem_px=\d+/\d+ stray=0 sym=true
 # --- A SKIP is `wm::create` declining, or the bar never publishing the caption inside 250 ms. On
 # --- this gate (QEMU 1280x800, one 8x8 fixture row) neither is honest — same rule as DMGOVLP and
 # --- STRIPVAC above — so a SKIP means the fixture lost its panel or its window table.
@@ -677,3 +677,39 @@ FORBID \[clip\] refuse reason=
 # -> FAIL ::`.
 REQUIRE :: TERMSEL: resolved=13/13 delivered=13 left=ok copy_sel=ok home=ok esc=ok copy_line=ok cut=ok cut_empty=ok edit=ok pc=ok -> PASS ::
 FORBID :: TERMSEL: .* -> FAIL ::
+#
+# ── CRYSTAL2 (2026-09-23, rmbp-ledger B194), TAIL-APPENDED past TERMSEL ───────────────────────────
+# Peter, flight 11: "startup is still slow and shows a broken crystal". Flight 12 put two readings of
+# the bar's crystal on one wire and NEITHER read the glass: `[menubar] first-paint … crystal=drawn`
+# (6699 ms) was the rect's GEOMETRY, and `:: MENUFIRST: … crystal=absent … recorded=false` (48497 ms)
+# was bit 35 of a reading nobody wrote — all eight fixture `compose()` tries declined on a refused
+# leaf lock (`decl_lock` 0 -> 16 on the menubar strip census across the fixture, never again all
+# boot), so the verdict printed the zeros of an empty snapshot (`model=complete crystal=absent
+# after_enable_ms=0`): FIXTURE_FLAKES Class 6, not the login screen's press swallow (MENUFIRST
+# presses nothing). CRYSTAL2 makes the gem a PANEL READBACK and settles the fixture's paints.
+#
+# :187 IS RE-PINNED IN PLACE by this arc (SPECRUN contract): `crystal=drawn` on `[menubar] first-paint`
+# now means every one of the gem's silhouette pixels read back off the panel in its ink, and the
+# line carries `gem_px=<matched>/<want> stray=<n> sym=<b>`. `stray=0 sym=true` are pinned as
+# values: a gem ink outside the silhouette, or a mark that is not mirror-symmetric, is the broken
+# crystal stated. :180 (`:: MENUFIRST:`) keeps its text; its `crystal=` is now that readback too.
+#
+# THE PERSISTENCE ARM. `crystal_persist_selftest` (chained after MENUFIRST in `menubar::selftest`)
+# paints a PARTIAL bar, a COMPLETE one and the complete one a clock minute later through the real
+# `compose` and damage test, settles each on the slot's signature (a sibling core's paint counts),
+# and reads the gem back off the panel after each. Everything but `gem_px=`'s counts, `tries=` and
+# `decl_lock=` is pinned as a value: three paints, three present, the two model words, and
+# `unread=0`. GO-RED (measured, B194): skip the gem in `compose_row` whenever the model has a clock
+# -> `present=1/3 … gem_px=198/594 … -> FAIL`, this REQUIRE misses and the default `-> FAIL` FORBID
+# trips (mbench rc 1, 29/30). And the pre-CRYSTAL2 silhouette (`du > half` about column 8) reads
+# `crystal=broken gem_px=217/217 stray=0 sym=false` on :187's line — the flown gem, measured.
+REQUIRE \[menubar\] crystal-persist paints=3 present=3/3 models=partial:caption\+clock\+batt,complete,complete gem_px=\d+/\d+ stray=0 sym=true tries=\d+,\d+,\d+ decl_lock=\d+ unread=0 budget_ms=250 -> PASS
+# THE SKIP ARMS are Class 6's stated non-verdicts, for the metal wire. On this lane (q35, 1280x800)
+# this arc's gate capture landed every fixture paint on its first try (`tries=1,1,1`, `settle_tries=1+1`,
+# `decl_lock=0`), so a paint that cannot land in 250 ms here is a defect and both arms are FORBIDDEN —
+# the REQUIRE-or-skip + FORBID-the-skip shape of
+# pi4-regression.spec:2032/2052. GO-RED (measured, B194): make `paint_settle` report every settle
+# unlanded -> `:: MENUFIRST: … painted=false recorded=true … gone_red=false :: SKIP ::` and
+# `crystal-persist paints=0 present=0/0 … -> SKIP`, both FORBIDs hit, mbench rc 1 (28/30).
+FORBID \[menubar\] crystal-persist .* -> SKIP
+FORBID :: MENUFIRST: .* :: SKIP ::

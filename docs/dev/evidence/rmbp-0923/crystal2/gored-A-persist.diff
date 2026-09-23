@@ -1,0 +1,13 @@
+diff --git a/unaos/crates/kernel/src/video/menubar.rs b/unaos/crates/kernel/src/video/menubar.rs
+index 5b793c40..66632895 100644
+--- a/unaos/crates/kernel/src/video/menubar.rs
++++ b/unaos/crates/kernel/src/video/menubar.rs
+@@ -1899,7 +1899,7 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
+     // text early-return because the gem spans more rows than the glyph cell does — it is centred in
+     // the whole bar, not the band.
+     let (cx0, cy0) = crystal_offset(h);
+-    if j >= cy0 && j < cy0 + CRYSTAL_H {
++    if j >= cy0 && j < cy0 + CRYSTAL_H && m.clock.is_none() {
+         let v = j - cy0;
+         for u in 0..CRYSTAL_W {
+             if let Some(c) = crystal_facet(u, v) {
