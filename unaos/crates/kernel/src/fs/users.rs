@@ -755,7 +755,7 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
         let mut s = SESSION_LOCAL.lock();
         s.0[..name.len()].copy_from_slice(name);
         s.1 = name.len() as u8;
-        s.2 = id;
+        s.2 = id; ROOT_LIVE.store(false, core::sync::atomic::Ordering::Release); // R63 (LOGIN13): a user session SUPERSEDES the root session — root is never re-entered this boot (there is no root row in the store; root is reached by booting). See `root_session`.
     }
     let mut nb = [0u8; NAME_MAX];
     nb[..name.len()].copy_from_slice(name);
@@ -866,7 +866,7 @@ fn epoch_proof(name: &[u8]) -> &'static str {
 pub fn logout() -> (usize, usize) {
     // SECLOGIN M3: the session's programs are ENDED first (windows closed, then killed through the close
     // box's own path), THEN the stamps — a program cannot outlive the session that started it.
-    let (ended, windows) = arch_session_logout();
+    let root = root_session(); if root { ROOT_LIVE.store(false, core::sync::atomic::Ordering::Release); } let (ended, windows) = arch_session_logout(root); // LOGIN13 M3 (R63): the ROOT session's Log Out ends ROOT's programs (uid 0, the root epoch) by the same walk, and root does not come back this boot.
     {
         let mut s = SESSION_LOCAL.lock();
         s.1 = 0;
@@ -877,7 +877,7 @@ pub fn logout() -> (usize, usize) {
     // boot's session boundaries are countable on serial with no fixture armed. This is the ONE string SO37
     // adds to a shipping (`login`, no `loginst`) image; the enforcement itself is pure control flow and
     // deliberately prints nothing on the SYS_OPEN path, which is hot.
-    serial_println!("[users] logout epoch={} ended={} windows={} (SO37: stamps from the closed session are refused; M3: its programs are ended first)", arch_session_epoch(), ended, windows);
+    if root { serial_println!("[users] root session closed ended={} windows={} (R63: root's programs are ended; the next session is a user's, from the login screen)", ended, windows); } serial_println!("[users] logout epoch={} ended={} windows={} (SO37: stamps from the closed session are refused; M3: its programs are ended first)", arch_session_epoch(), ended, windows);
     (ended, windows)
 }
 
@@ -916,10 +916,10 @@ fn arch_session_login(id: u32, name: &[u8]) -> bool {
 
 /// SECLOGIN M3: `(ended, windows)` — the closing session's programs that were ended and the windows
 /// they held; `(0, 0)` on an image with no EL0 regime, where nothing can have been launched.
-fn arch_session_logout() -> (usize, usize) {
+fn arch_session_logout(root: bool) -> (usize, usize) { let _ = root; // LOGIN13 M3: `root` selects the ROOT session's programs (uid 0 in the root epoch) on x86; aarch64 stamps no epoch on a non-user program (`session_restamp` is a no-op with no session), so its root arm is OWED and it ends what it always ended.
     #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
     {
-        return crate::arch::syscall::session_logout();
+        #[cfg(target_arch = "x86_64")] return crate::arch::syscall::session_logout_as(root); #[cfg(not(target_arch = "x86_64"))] return crate::arch::syscall::session_logout();
     }
     #[cfg(not(any(target_arch = "x86_64", feature = "aarch64_el0")))]
     (0, 0)
@@ -958,27 +958,24 @@ pub fn shell_verb(verb: &str, args: &[&str], console: &mut crate::console::Conso
             if !load_once() {
                 return console.println("login: storage is not up (-ENODEV)");
             }
-            if count() == 0 {
-                match create_user(name.as_bytes(), pw.as_bytes()) {
-                    Ok(_) => console.println(&alloc::format!("login: created first user {}", name)),
-                    Err(e) => return console.println(&alloc::format!("login: cannot create {}: {}", name, users_reason(e))),
-                }
-            }
+            // LOGIN13 M2 (R63): `login` no longer creates the first user on an empty store — `adduser` (root
+            // only, password asked for) is the one way a user is made.
             match login(name.as_bytes(), pw.as_bytes()) {
                 Ok(()) => console.println(&alloc::format!("logged in as {} (user:{})", name, name)),
                 Err(_) => console.println("login: refused (-EACCES)"),
             }
         }
         "logout" => {
+            // LOGIN13 M3 (R63): the ROOT session logs out too, and wherever the screen is built the screen
+            // comes back — the SAME `reopen_after_logout` the crystal's Log Out row calls.
             let mut nb = [0u8; NAME_MAX];
-            match whoami(&mut nb) {
-                Some(n) => {
-                    let _ = logout();
-                    console.println(&alloc::format!("logged out {}", core::str::from_utf8(&nb[..n]).unwrap_or("?")));
-                }
-                None => console.println("logout: no session is open"),
+            match log_out_to_screen(&mut nb) {
+                Ok(n) => console.println(&alloc::format!("logged out {}", core::str::from_utf8(&nb[..n]).unwrap_or("?"))),
+                Err("refused") => console.println("logout: refused — add a user first (`adduser <name>`): the login screen would have nobody to log in as"),
+                Err(_) => console.println("logout: no session is open"),
             }
         }
+        "adduser" => adduser_begin(args, console), // LOGIN13 M2 (R63) — root adds a user; see `adduser_begin`
         _ => {}
     }
 }
@@ -1128,7 +1125,7 @@ pub fn service() {
         Ok(()) => {
             SERVICED.store(true, Ordering::Relaxed);
             #[cfg(feature = "loginst")]
-            { login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
+            { login_bootroot_fixture(); login_adduser_fixture(); login_rootout_fixture(); login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1636,8 +1633,9 @@ pub fn kernel_owned_leaf(leaf: &str) -> bool {
 /// near-miss refused), and then the REAL resolver is asked: on aarch64 through `open_locate` (the
 /// guarded seam every `sys_open` walks) and the answer is a verdict; on x86 through
 /// `fs::vfs::el0_locate` DIRECTLY, the shared resolver the storage task's `resolve_path` calls, whose
-/// guard line is outside this arc's grant (`multiuser.md` §6) — so the x86 line is a MEASUREMENT
-/// (`resolver=OPENED` today, `REFUSED` the day that line lands), never a PASS on a hole.
+/// guard VFSOWNED landed (B181, `multiuser.md` §6) and LOGIN13 M4 typed (`El0LocateError::KernelOwned`,
+/// `-EACCES` through the storage task) — so x86 now has a VERDICT too, `:: LOGIN-KOWN:`, which passes
+/// only when BOTH leaves come back as that variant (a refusal for any other reason is not this one).
 #[cfg(feature = "loginst")]
 pub fn login_kown_fixture() {
     let pred = kernel_owned_leaf("USERS.DAT") && kernel_owned_leaf("users.dat") && kernel_owned_leaf("USERS.NEW") && kernel_owned_leaf("Users.New") && !kernel_owned_leaf("USERS.TXT") && !kernel_owned_leaf("HELLO.BIN");
@@ -1650,20 +1648,22 @@ pub fn login_kown_fixture() {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        let resolver = match crate::fs::fat::mount() {
-            Ok(fs) => {
-                let mut c = false;
-                match crate::fs::vfs::el0_locate(&fs, "USERS.DAT", false, &mut c) {
-                    Ok(_) => "OPENED",
-                    Err(_) => "refused",
-                }
+        let probe = |fs: &crate::fs::fat::FatFs, path: &str| -> &'static str {
+            let mut c = false;
+            match crate::fs::vfs::el0_locate(fs, path, false, &mut c) {
+                Ok(_) => "OPENED",
+                Err(crate::fs::vfs::El0LocateError::KernelOwned) => "KernelOwned",
+                Err(_) => "OTHER",
             }
-            Err(_) => "no-volume",
         };
-        serial_println!("[users] kernel-owned pred={} resolver={} (x86: the guard line in fs::vfs::el0_locate is owed to the seat — multiuser.md §6; this line is a measurement, not a verdict)", if pred { "ok" } else { "FAIL" }, resolver);
-        if !pred {
-            serial_println!(":: LOGIN-KOWN: pred=FAIL -> FAIL — ::");
-        }
+        let (e1, e2) = match crate::fs::fat::mount() {
+            Ok(fs) => (probe(&fs, "USERS.DAT"), probe(&fs, "/USERS.NEW")),
+            Err(_) => ("no-volume", "no-volume"),
+        };
+        let resolver = if e1 == "OPENED" || e2 == "OPENED" { "OPENED" } else if e1 == "no-volume" { "no-volume" } else { "refused" };
+        serial_println!("[users] kernel-owned pred={} resolver={} (x86: `fs::vfs::el0_locate` refuses the credential file — VFSOWNED's guard, typed `El0LocateError::KernelOwned` since LOGIN13 M4, `-EACCES` through the storage task)", if pred { "ok" } else { "FAIL" }, resolver);
+        let typed = e1 == "KernelOwned" && e2 == "KernelOwned";
+        serial_println!(":: LOGIN-KOWN: pred={} resolver={} err={},{} reason=kernel-owned -> {} ::", if pred { "ok" } else { "FAIL" }, resolver, e1, e2, if pred && typed { "PASS" } else { "FAIL —" });
     }
     #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "aarch64_el0"))))]
     {
@@ -1705,4 +1705,556 @@ pub fn login_rand_fixture() {
 /// (`main.rs::virt_users_pass`). One relaxed load; tail append, so no `Location` above moves.
 pub fn serviced() -> bool {
     SERVICED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// =========================================================================================
+// LOGIN13 (rmbp-ledger B189, R63) — THE ROOT SESSION, AND A BOOT THAT OPENS NO SCREEN
+// =========================================================================================
+//
+// R63 (Peter, flight 12 on the glass): *"for boot 13 lets boot into root like we have been i will add
+// my user and log out then log into the user account"*. Flight 12 booted a `login` image and the screen
+// opened at 8.4 s as a WINDOW over the live desktop (`[login] screen open window=2 box=1330x764 at
+// (775,345)`) and never had the keyboard. R63's shape: the machine boots to the ROOT desktop as every
+// flight before it did, the person adds a user from that session (`adduser`), and Log Out closes the
+// root session and puts the screen up over nothing.
+//
+// WHAT "ROOT" IS IN THIS CODE, named rather than invented. Before this arc the boot's session had no
+// name: `SESSION_LOCAL.1 == 0` here, `SESSION_USER == 0` on x86 (`arch/x86_64/syscall.rs`, "0 = no
+// session"), `PrincipalRecord::NONE` on aarch64 — the "anonymous / pre-login world" the SO37 comments
+// describe. Every program launched in it is stamped uid 0, which the ACL treats as anonymous (no
+// by-user admission: `owned_user_ok`'s `u != 0` guard). R63's "root" IS that state; this arc gives it a
+// name and ONE bit of lifetime — [`ROOT_LIVE`] — and changes nothing about what uid 0 may open. It is
+// not a row in the store and has no credential: root is reached by BOOTING, and once it is closed (its
+// Log Out) or superseded (a user logged in from it) it does not come back until the next boot.
+
+/// R63 — is the root session still the machine's session? True from boot; cleared by the root
+/// session's Log Out ([`logout`]) and by a user login from it ([`login`]). Never set again this boot.
+static ROOT_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// R63 — the caller is the ROOT SESSION: no user session is open AND the root session has not been
+/// closed or superseded since boot. This is how `adduser` knows its caller is root: a shell verb is a
+/// kernel HOST verb with no per-caller principal of its own (`shell.rs` dispatches it on the render
+/// task), so "the caller" is whoever holds the machine's one session, and this is that session's name.
+pub fn root_session() -> bool {
+    ROOT_LIVE.load(core::sync::atomic::Ordering::Acquire) && SESSION_LOCAL.lock().1 == 0
+}
+
+/// Is the login screen up (the form is `Open`)? `false` where no screen is built (the crystal's gate:
+/// x86 `wc`, aarch64 `desktop_firmware`) — the same dispatch [`screen_key`] uses.
+pub fn screen_up() -> bool {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        return crate::video::crystal::login::is_open();
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    false
+}
+
+/// LOGIN13 M1 — **THE BOOT'S SCREEN DECISION, and under R63 the whole of it is "no".** This is the
+/// statement `main.rs`'s two boot-time ignitions used to be (`if desktop { screen_open_once(); }`, the
+/// x86 `x86_render_service` and the Pi `render_service`), moved here so a fixture can drive it with the
+/// `desktop = true` a QEMU boot never presents (no Kepler takeover, so `desktop_owns_backdrop()` is
+/// false on every `./arroyo test`). It opens nothing. GO-RED: put the old statement back in this body
+/// (`if desktop { screen_open_once(); }`) and `:: LOGIN-BOOTROOT:` reads `desk_screen=open -> FAIL —`.
+///
+/// The SO43 seam ([`screen_open_at_ignition`]) is NOT this seam and is untouched: it is the Tegra desk
+/// cascade's ignition (`main.rs`, `tegra_desk_cascade`) and the ARMUSERS virt pass's, and R63 is a
+/// ruling about boot 13 on this bench — widening it to the Orin is a suggestion for Peter, not a
+/// reading of his words.
+pub fn boot_ignition(desktop: bool) {
+    let _ = desktop;
+}
+
+/// LOGIN13 M1 — the boot's session, on the wire, from the two call sites that used to open the screen.
+/// `desktop=` is the caller's `desktop_owns_backdrop()` (true on the metal after the Kepler takeover,
+/// false on QEMU); `screen=` is READ BACK after [`boot_ignition`] ran, never assumed from it.
+pub fn boot_session(desktop: bool) {
+    boot_ignition(desktop);
+    serial_println!(
+        "[login] boot session=root desktop={} screen={} (R63: the machine boots to the root desktop; the login screen opens at the root session's Log Out, never at boot)",
+        desktop,
+        if screen_up() { "open" } else { "closed" }
+    );
+}
+
+/// LOGIN-BOOTROOT (`loginst`, LOGIN13 M1) — the boot opens no screen and the session is root. Runs FIRST
+/// in the `loginst` chain, before any login, because its first question is what the boot left behind:
+///  * `root_at_boot` — [`root_session`] at the head of the battery: no user session, root not closed.
+///  * `desk_screen` / `nodesk_screen` — [`boot_ignition`] driven with BOTH values of `desktop`; the screen
+///    must be down after each. `desktop=true` is the metal's arm (flight 12's), which QEMU cannot reach
+///    through the boot itself.
+///  * `still_root` — the ignition left the session alone.
+/// The boot's OWN line (`[login] boot session=root … screen=closed`) is printed by `main.rs`, never
+/// here, so a spec pin on it cannot be satisfied by this fixture (SPECPINS2's lesson, B184).
+#[cfg(feature = "loginst")]
+pub fn login_bootroot_fixture() {
+    let root_at_boot = root_session();
+    let before = screen_up();
+    boot_ignition(true);
+    let desk_open = screen_up();
+    boot_ignition(false);
+    let nodesk_open = screen_up();
+    let still_root = root_session();
+    let ok = root_at_boot && !before && !desk_open && !nodesk_open && still_root;
+    serial_println!(
+        ":: LOGIN-BOOTROOT: session=root(uid0) root_at_boot={} desk_screen={} nodesk_screen={} still_root={} screen_built={} -> {} ::",
+        root_at_boot,
+        if desk_open { "open" } else { "closed" },
+        if nodesk_open { "open" } else { "closed" },
+        still_root,
+        cfg!(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))),
+        if ok { "PASS" } else { "FAIL —" }
+    );
+}
+
+// =========================================================================================
+// LOGIN13 M2 (rmbp-ledger B189, R63) — `adduser <name>`: ROOT ADDS A USER, AND THE PASSWORD IS ASKED FOR
+// =========================================================================================
+//
+// R63: *"what about adduser since it's logging me in as root"*. The verb is `adduser` (R26: the standard
+// name), a HOST verb beside `login`/`logout` (`shell.rs`'s arm, `midden_core::HOST_VERBS`), root-only.
+//
+// HOW THE PASSWORD ARRIVES, and why it is not the way `login` takes it. `login <name> <password>` reads
+// the password off the TYPED LINE (this file's `shell_verb`), and that line is recorded in three places
+// before any verb runs: `shell::history_record` (the `history` verb reads it back), the
+// `:: [midden] cmd="…" -> Host verb=…` witness ON THE WIRE (`shell.rs`, every dispatched line), and the
+// console's own scrollback. A password typed there is on the serial capture a flight is scored from. So
+// `adduser` takes the NAME on the line and ASKS for the password: [`prompt_key`] is offered every key
+// ahead of the shell's line editor (`main.rs::handle_key`, a line-neutral fold), holds the bytes in
+// kernel RAM, echoes NOTHING (no glyph, no `current_input`, no history, no wire), asks twice, and hands
+// the result to the same [`create_user`] the store has always used — the hashing path is unchanged. A
+// password on the line (`adduser <name> <pw>`) is REFUSED rather than used, because by the time the
+// verb sees it the line has already been recorded; the refusal says so.
+//
+// WHILE THE PROMPT IS LIVE the two raw-key instruments that print typed bytes are told to withhold them
+// ([`secret_input`]): `USB-DEBUG: KEY` (`main.rs::usbdebug_event_print`, the `usbdebug` knob, which the
+// flight images carry) and the bounded `[serialdoor] key=` witness (`arch/x86_64/syscall.rs`, `ftdirx`).
+// The same predicate covers the login screen (LOGIN13 M3), which the module doc of `video/login.rs`
+// promised since LOGIN M3 ("NO TYPED BYTE REACHES THE WIRE") and which `usbdebug` quietly broke.
+
+/// The longest password the prompt holds. `login`'s screen caps a field at 32 (`video/login.rs`
+/// `FIELD_MAX`); the prompt allows more, and a longer password is refused rather than truncated so
+/// what verifies is exactly what was typed.
+const PW_MAX: usize = 64;
+
+/// The live `adduser` prompt: the name being added, which entry is being typed (1 = first, 2 = the
+/// retype), and the two entries. Zeroed on every exit path.
+struct Prompt {
+    live: bool,
+    stage: u8,
+    name: [u8; NAME_MAX],
+    nlen: usize,
+    a: [u8; PW_MAX],
+    alen: usize,
+    b: [u8; PW_MAX],
+    blen: usize,
+    over: bool,
+}
+
+/// The idle prompt — every exit path writes this back, which is what zeroes both entries.
+const PROMPT_IDLE: Prompt = Prompt { live: false, stage: 0, name: [0; NAME_MAX], nlen: 0, a: [0; PW_MAX], alen: 0, b: [0; PW_MAX], blen: 0, over: false };
+
+static PROMPT: Mutex<Prompt> = Mutex::new(PROMPT_IDLE);
+
+/// The last `adduser` outcome — `"created"` or the refusal's `reason=` word. The fixture reads it; the
+/// wire carries the same word, so a reader of either sees one vocabulary.
+static ADDUSER_LAST: Mutex<&'static str> = Mutex::new("");
+
+/// Is an `adduser` password prompt waiting for keys?
+pub fn prompt_live() -> bool {
+    PROMPT.lock().live
+}
+
+/// LOGIN13 — are the keys being typed right now SECRET? True while the `adduser` prompt is live or the
+/// login screen is up. The raw-key witnesses consult this and print a placeholder instead of the byte.
+pub fn secret_input() -> bool {
+    prompt_live() || screen_up()
+}
+
+/// The name as the wire prints it: the bytes when they are printable ASCII, `?` otherwise. A name that
+/// fails `name_ok` is still NAMED on its refusal line — root typed it — but never raw.
+fn wire_name(n: &[u8]) -> &str {
+    if !n.is_empty() && n.iter().all(|&b| (0x21..0x7f).contains(&b)) {
+        core::str::from_utf8(n).unwrap_or("?")
+    } else {
+        "?"
+    }
+}
+
+fn adduser_refuse(name: &[u8], reason: &'static str, console: &mut crate::console::Console) {
+    *ADDUSER_LAST.lock() = reason;
+    serial_println!("[users] adduser REFUSED user={} reason={}", wire_name(name), reason);
+    console.println(&alloc::format!("adduser: {} not added (reason={})", wire_name(name), reason));
+}
+
+/// The `UsersError` a create returned, in `adduser`'s refusal vocabulary.
+fn adduser_reason(e: UsersError) -> &'static str {
+    match e {
+        UsersError::Exists => "exists",
+        UsersError::BadName => "bad-name",
+        UsersError::Full => "full",
+        UsersError::WeakKdf => "weak-kdf",
+        UsersError::Volume => "volume",
+        other => users_reason(other),
+    }
+}
+
+/// `adduser <name>` — the checks that need no password, then the prompt. Every refusal here happens
+/// BEFORE a password is asked for, so nobody types a secret into a request that was never going to run.
+fn adduser_begin(args: &[&str], console: &mut crate::console::Console) {
+    let Some(name) = args.first() else {
+        return console.println("usage: adduser <name>   (root only; the password is asked for and never shown)");
+    };
+    let nb = name.as_bytes();
+    if args.len() > 1 {
+        // The line — password included — is already in `history` and on the wire (`[midden] cmd=`). Using
+        // it would make that the normal way to add a user; refusing it makes the prompt the only way.
+        return adduser_refuse(nb, "password-on-line", console);
+    }
+    if !root_session() {
+        return adduser_refuse(nb, "not-root", console);
+    }
+    if !load_once() {
+        return adduser_refuse(nb, "storage-not-up", console);
+    }
+    if !name_ok(nb) {
+        return adduser_refuse(nb, "bad-name", console);
+    }
+    if id_of(nb).is_some() {
+        return adduser_refuse(nb, "exists", console);
+    }
+    if count() >= MAX_USERS {
+        return adduser_refuse(nb, "full", console);
+    }
+    {
+        let mut p = PROMPT.lock();
+        p.live = true;
+        p.stage = 1;
+        p.name = [0; NAME_MAX];
+        p.name[..nb.len()].copy_from_slice(nb);
+        p.nlen = nb.len();
+        p.a = [0; PW_MAX];
+        p.alen = 0;
+        p.b = [0; PW_MAX];
+        p.blen = 0;
+        p.over = false;
+    }
+    console.println(&alloc::format!("adduser: password for {} (not shown; Enter ends it, Ctrl-C cancels):", name));
+}
+
+/// LOGIN13 M2 — offer a key to the `adduser` prompt. Called FIRST in `main.rs::handle_key`, ahead of the
+/// shell's line editor. `0` = no prompt is live (the key is the shell's); `1` = consumed, nothing to
+/// redraw (a password byte — nothing is echoed, so there is nothing to draw); `2` = consumed and the
+/// console printed a line (the caller redraws it).
+pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
+    let mut p = PROMPT.lock();
+    if !p.live {
+        return 0;
+    }
+    match c {
+        0x03 => {
+            let n = p.name;
+            let nl = p.nlen;
+            *p = PROMPT_IDLE;
+            drop(p);
+            adduser_refuse(&n[..nl], "cancelled", console);
+            2
+        }
+        8 | 0x7f => {
+            if p.stage == 1 {
+                p.alen = p.alen.saturating_sub(1);
+            } else {
+                p.blen = p.blen.saturating_sub(1);
+            }
+            1
+        }
+        b'\n' | b'\r' => {
+            if p.stage == 1 && p.alen > 0 && !p.over {
+                p.stage = 2;
+                drop(p);
+                console.println("adduser: retype it:");
+                return 2;
+            }
+            // Finished (or refused at the first Enter): copy out, ZERO the prompt, then decide with no
+            // lock held — `create_user` runs the calibrated KDF (~250 ms) and takes `TABLE`.
+            let (n, nl, a, al, b, bl, over, stage) = (p.name, p.nlen, p.a, p.alen, p.b, p.blen, p.over, p.stage);
+            *p = PROMPT_IDLE;
+            drop(p);
+            let name = &n[..nl];
+            let verdict = if over {
+                Err("password-too-long")
+            } else if al == 0 {
+                Err("empty-password")
+            } else if stage != 2 || a[..al] != b[..bl] {
+                Err("mismatch")
+            } else {
+                adduser_commit(name, &a[..al])
+            };
+            let mut a = a;
+            let mut b = b;
+            for x in a.iter_mut().chain(b.iter_mut()) {
+                *x = 0;
+            }
+            match verdict {
+                Ok((uid, created)) => console.println(&alloc::format!("adduser: added {} (uid {}, home /home/{}{})", wire_name(name), uid, wire_name(name), if created { ", created" } else { "" })),
+                Err(r) => adduser_refuse(name, r, console),
+            }
+            2
+        }
+        0x20..=0x7e => {
+            if p.stage == 1 {
+                if p.alen < PW_MAX { let i = p.alen; p.a[i] = c; p.alen += 1; } else { p.over = true; }
+            } else if p.blen < PW_MAX {
+                let i = p.blen;
+                p.b[i] = c;
+                p.blen += 1;
+            } else {
+                p.over = true;
+            }
+            1
+        }
+        _ => 1, // swallowed: nothing typed at a password prompt reaches the shell
+    }
+}
+
+/// LOGIN13 M2 — create the user root asked for and make its home. Root is RE-CHECKED here, at the
+/// moment of the write: the prompt may have been open across a Log Out. `Ok((uid, home_created))`;
+/// the wire line is `[users] adduser user=<n> id=<uid> home=/home/<n> created=<bool>`, where `created=`
+/// is the HOME's verdict (`ensure_home`, which also prints its own `[users] home=` line), `false` when
+/// the directory was already there or the volume refused it (then the `NOT created reason=` line says
+/// why — the user exists either way and `/home/<n>` is made again at its first login, `login`'s rule).
+pub fn adduser_commit(name: &[u8], password: &[u8]) -> Result<(u32, bool), &'static str> {
+    if !root_session() {
+        return Err("not-root");
+    }
+    if password.is_empty() {
+        return Err("empty-password");
+    }
+    let uid = create_user(name, password).map_err(adduser_reason)?;
+    let created = match ensure_home(name) {
+        Ok(v) => v == "created",
+        Err(e) => {
+            serial_println!("[users] home=/home/{} NOT created reason={} volume={}", wire_name(name), users_reason(e), crate::fs::fat::mount().map(|f| f.volume_fingerprint().0).unwrap_or(0));
+            false
+        }
+    };
+    *ADDUSER_LAST.lock() = "created";
+    serial_println!("[users] adduser user={} id={} home=/home/{} created={} (R63: root added it; the password was asked for, never on the line)", wire_name(name), uid, wire_name(name), created);
+    Ok((uid, created))
+}
+
+/// LOGIN-ADDUSER (`loginst`, LOGIN13 M2) — x86 lane. Drives the REAL verb (`shell_verb("adduser", …)`)
+/// and the REAL prompt (`prompt_key`, the function `handle_key` offers every key to) on a scratch console,
+/// in the root session the boot left (LOGIN-BOOTROOT ran first):
+///  * `prompted` — the verb opened the prompt instead of creating anything;
+///  * `echo=none` — after typing the password twice, the console's input line is EMPTY: no byte reached
+///    the line editor (and so neither history nor the `[midden] cmd=` witness);
+///  * `created` / `verify` — the user exists and the TYPED credential verifies (the prompt handed the
+///    bytes it was given to `create_user`, not a truncation or the retype's leftovers);
+///  * the four refusals, each by its wire word: `dup=exists`, `empty=empty-password`, `mismatch=mismatch`,
+///    `on_line=password-on-line` — and none of them created a row.
+/// Leaves `boot13` in the store: LOGIN-ROOTOUT (M3) logs in as it after the root session's Log Out.
+/// GO-RED (LOGIN13 M2, run on this gate): the root check in `adduser_begin` inverted → the verb refuses
+/// `reason=not-root` from root → `prompted=false created=false -> FAIL —`.
+#[cfg(feature = "loginst")]
+pub fn login_adduser_fixture() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        const N: &str = "boot13";
+        const PW: &[u8] = b"boot13-pw";
+        let mut con = crate::console::Console::new();
+        let feed = |con: &mut crate::console::Console, s: &[u8]| {
+            for &b in s {
+                let _ = prompt_key(b, con);
+            }
+        };
+        let root = root_session();
+        shell_verb("adduser", &[N], &mut con);
+        let prompted = prompt_live();
+        feed(&mut con, PW);
+        feed(&mut con, b"\n");
+        feed(&mut con, PW);
+        feed(&mut con, b"\n");
+        let echo_none = con.current_input.is_empty() && !prompt_live();
+        let created = *ADDUSER_LAST.lock() == "created" && id_of(N.as_bytes()).is_some();
+        let uid = id_of(N.as_bytes()).unwrap_or(0);
+        let verify_ok = verify(N.as_bytes(), PW);
+        shell_verb("adduser", &[N], &mut con);
+        let dup = if prompt_live() { "PROMPTED" } else { *ADDUSER_LAST.lock() };
+        shell_verb("adduser", &["boot13e"], &mut con);
+        feed(&mut con, b"\n");
+        let empty = if id_of(b"boot13e").is_some() { "CREATED" } else { *ADDUSER_LAST.lock() };
+        shell_verb("adduser", &["boot13m"], &mut con);
+        feed(&mut con, b"one-pw\n");
+        feed(&mut con, b"two-pw\n");
+        let mismatch = if id_of(b"boot13m").is_some() { "CREATED" } else { *ADDUSER_LAST.lock() };
+        shell_verb("adduser", &["boot13p", "on-the-line"], &mut con);
+        let on_line = if prompt_live() || id_of(b"boot13p").is_some() { "ACCEPTED" } else { *ADDUSER_LAST.lock() };
+        let ok = root && prompted && echo_none && created && verify_ok && dup == "exists" && empty == "empty-password" && mismatch == "mismatch" && on_line == "password-on-line";
+        serial_println!(
+            ":: LOGIN-ADDUSER: root={} prompted={} echo={} created={} uid={} verify={} dup={} empty={} mismatch={} on_line={} -> {} ::",
+            root, prompted, if echo_none { "none" } else { "LEAKED" }, created, uid, if verify_ok { "ok" } else { "FAIL" }, dup, empty, mismatch, on_line,
+            if ok { "PASS" } else { "FAIL —" }
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        serial_println!("[users] adduser fixture: x86 lane only (the verb and the prompt are arch-neutral and compiled here; the leg runs on the x86 login lane)");
+    }
+}
+
+// =========================================================================================
+// LOGIN13 M3 (rmbp-ledger B189, R63) — LOG OUT CLOSES THE ROOT SESSION AND THE SCREEN TAKES THE INPUT
+// =========================================================================================
+//
+// R63: *"i will add my user and log out then log into the user account"*. Two routes reach the same
+// action — the shell's `logout` ([`log_out_to_screen`]) and the crystal's Log Out row
+// (`video/crystal.rs` `Verb::LogOut` -> `login::reopen_after_logout`) — and both now:
+//   1. refuse the ROOT session's Log Out while the store has nobody to log in as ([`root_logout_refused`]);
+//   2. close the session through [`logout`], which for ROOT ends root's programs by the same walk
+//      SECLOGIN M3 built for a user's (x86: `session_logout_as(true)` selects the running rows stamped
+//      uid 0 in the root epoch — `arch/x86_64/syscall.rs`, `session_end_processes`), so the screen
+//      comes up over nothing a program drew;
+//   3. put the screen up, and the screen is the FIRST taker of every key on the x86 router
+//      (`wc_route_event`, ahead of the Esc/Quarry doors, the Tab focus ring and the focused ring —
+//      flight 12's keys went to `[wc-c] focus tab-cycle` and the desktop), as it already was of every
+//      press (`wc_click_route_at`, SO44).
+
+/// R63 — refuse the ROOT session's Log Out when it would strand the person at a screen with nobody to
+/// log in as. Prints the refusal and answers `true`; `false` (and silent) for every other session.
+pub fn root_logout_refused() -> bool {
+    if !root_session() {
+        return false;
+    }
+    let reason = if !load_once() {
+        "storage-not-up"
+    } else if count() == 0 {
+        "no-users"
+    } else {
+        return false;
+    };
+    serial_println!("[users] logout REFUSED session=root reason={} (R63: `adduser <name>` first — root's Log Out would leave a login screen with nobody to log in as)", reason);
+    true
+}
+
+/// LOGIN13 M3 — the shell's `logout`: close the open session (the root session included) and, where
+/// the screen is built, put it up — the SAME `reopen_after_logout` the crystal's Log Out row calls, so
+/// the two routes cannot drift. Where no screen is built (a headless image, the aarch64 `virt` lane) it
+/// is the plain [`logout`]. `Ok(name)` names the session that closed (`root` for the root session).
+pub fn log_out_to_screen(out: &mut [u8; NAME_MAX]) -> Result<usize, &'static str> {
+    let root = root_session();
+    let n = if root {
+        out[..4].copy_from_slice(b"root");
+        4
+    } else {
+        match whoami(out) {
+            Some(n) => n,
+            None => return Err("no-session"),
+        }
+    };
+    if root_logout_refused() {
+        return Err("refused");
+    }
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    crate::video::crystal::login::reopen_after_logout();
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    let _ = logout();
+    Ok(n)
+}
+
+/// LOGIN-ROOTOUT (`loginst`, LOGIN13 M3) — x86 `wc` lane: the root session's Log Out, end to end, driven
+/// through the entries a person uses. Runs after LOGIN-ADDUSER (which left `boot13` in the store) and
+/// before every other `loginst` leg:
+///  * `empty_refused` — with the store emptied of `boot13` for one call, the shell's `logout` from root is
+///    REFUSED `reason=no-users` and root stays live; `boot13` is then put back through `adduser_commit`;
+///  * `pid` / `root_stamped` — `STAT.ELF` launched IN THE ROOT SESSION (uid 0, the root epoch — the
+///    desktop's own launcher, `spawn_user_image_bg`); `others=` is every OTHER running root-session
+///    program the Log Out is about to end (0 on this lane: nothing else runs at the storage pass);
+///  * `root_after=false ended>=1 pid_gone window_gone` — the shell's `logout` closed root and ENDED its
+///    program; `screen=up screen_window=true` — the screen came up on a real `wm` row;
+///  * `not_root=not-root` — `adduser` from the screen's side of the Log Out is refused;
+///  * `keys_routed=true` — EVERY key below went through the LIVE x86 key router (`wc_route_event`) and was
+///    consumed there (`Event::Unknown`), never handed on; `name_typed` / `tab=password` — the bytes landed
+///    in the form's name field and Tab moved the FORM's focus (not `[wc-c] focus tab-cycle`);
+///    `wrong=denied` — a wrong password through the router is the one-answer denial and the screen stays;
+///    `login=boot13` — the right one opens the session as the new user (its `[users] home=/home/boot13`
+///    line is `login`'s); the screen goes down.
+/// It then logs `boot13` out (plainly — no screen), deletes it, and resets the form, leaving the store
+/// and the screen as the rest of the battery expects them.
+/// GO-RED (LOGIN13 M3, run on this gate): the screen-first fold deleted from `wc_route_event` →
+/// `keys_routed=false name_typed=false … -> FAIL —`.
+#[cfg(feature = "loginst")]
+pub fn login_rootout_fixture() {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        use crate::video::crystal::login as screen;
+        const N: &[u8] = b"boot13";
+        const PW: &[u8] = b"boot13-pw";
+        let mut con = crate::console::Console::new();
+        let mut nb = [0u8; NAME_MAX];
+        let root_before = root_session() && id_of(N).is_some();
+        // 1 — the refusal: root with nobody to log in as. Only when `boot13` is the store's ONE row (a
+        // fresh medium, which this lane's is), so the arm never deletes a user it did not create.
+        let empty_refused = if count() == 1 && delete_user(N).is_ok() {
+            shell_verb("logout", &[], &mut con);
+            let refused = root_session() && !screen_up();
+            let back = adduser_commit(N, PW).is_ok();
+            if refused && back { "no-users" } else { "NOT-REFUSED" }
+        } else {
+            "store-not-fresh"
+        };
+        // 2 — a program of the root session.
+        let (pid, slot, windowed, root_stamped) = match crate::arch::syscall::root_session_launch() {
+            Ok(v) => v,
+            Err(why) => {
+                serial_println!(":: LOGIN-ROOTOUT: launch -> FAIL — {} (the lane carries STAT.ELF; WINX-2 loads it every boot) ::", why);
+                return;
+            }
+        };
+        let others = crate::arch::syscall::root_session_others(slot);
+        // 3 — the shell's `logout`, from root.
+        shell_verb("logout", &[], &mut con);
+        let root_after = root_session();
+        let (pid_gone, window_gone) = crate::arch::syscall::root_session_probe(pid, slot);
+        let up = screen_up();
+        let screen_window = screen::fixture_windowed();
+        // 4 — root is gone, so `adduser` is refused.
+        shell_verb("adduser", &["boot13x"], &mut con);
+        let not_root = *ADDUSER_LAST.lock();
+        // 5 — the keyboard, through the LIVE x86 key router.
+        let route = |b: u8| matches!(crate::arch::syscall::wc_route_event(crate::pal::Event::Key(b)), crate::pal::Event::Unknown);
+        let mut routed = true;
+        for &b in N {
+            routed &= route(b);
+        }
+        let name_typed = screen::fixture_form_is(N, false);
+        routed &= route(b'\t');
+        let tab_pw = screen::fixture_form_is(N, true);
+        for &b in b"wrong-pw" {
+            routed &= route(b);
+        }
+        routed &= route(b'\n');
+        let wrong_kept = screen_up() && whoami(&mut nb).is_none();
+        for &b in PW {
+            routed &= route(b);
+        }
+        routed &= route(b'\n');
+        let logged_in = !screen_up() && matches!(whoami(&mut nb), Some(n) if &nb[..n] == N);
+        // 6 — put the battery's world back: session closed plainly, the scratch user gone, form reset.
+        let _ = logout();
+        screen::fixture_reset();
+        let cleaned = delete_user(N).is_ok() && !screen_up();
+        let ok = root_before && empty_refused == "no-users" && windowed && root_stamped && !root_after && pid_gone && window_gone && up && screen_window && not_root == "not-root" && routed && name_typed && tab_pw && wrong_kept && logged_in && cleaned;
+        serial_println!(
+            ":: LOGIN-ROOTOUT: root_before={} empty_refused={} pid={} root_stamped={} others={} root_after={} pid_gone={} window_gone={} screen={} screen_window={} not_root={} keys_routed={} name_typed={} tab={} wrong={} login={} cleaned={} -> {} ::",
+            root_before, empty_refused, pid, root_stamped, others, root_after, pid_gone, window_gone,
+            if up { "up" } else { "DOWN" }, screen_window, not_root, routed, name_typed,
+            if tab_pw { "password" } else { "NOT-MOVED" }, if wrong_kept { "denied" } else { "NOT-DENIED" },
+            if logged_in { "boot13" } else { "NONE" }, cleaned, if ok { "PASS" } else { "FAIL —" }
+        );
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    {
+        serial_println!("[users] root log-out fixture: x86 `wc` lane only (the screen and the x86 key router are what it drives)");
+    }
 }

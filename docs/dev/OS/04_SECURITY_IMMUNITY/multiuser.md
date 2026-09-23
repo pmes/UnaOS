@@ -150,7 +150,7 @@ one-answer denial LOGINFLOW built on the glass would leak the roster through the
 | # | Gap (B157, measured at 86f33c93) | Fix (milestone) | Wire witness | Fixture and go-red | Proves on |
 |---|---|---|---|---|---|
 | 1 | `users.rs:205 password_hash` is one SHA-256 per guess | **M1** PBKDF2-HMAC-SHA256 on `hash::sha256`; count calibrated at first use to ~250 ms and stored per row; migration at the next successful login | `[users] kdf calibrated iters=<n> ms=<n>` once; `[users] rehash user=<n> v1->v2 iters=<n> ms=<n>` per migrated row; `:: LOGIN-HARD: iters=<n> ms=<n> v2_rows=<n> migrated=<n> … -> PASS ::` | The fixture writes a v1 row for a scratch user, verifies it through the legacy path, logs in (migrates), verifies again as v2, refuses a wrong password, deletes the scratch user. Go-red: `calibrate` mutated to answer 1 → `create_user` refuses `reason=weak-kdf` and the wire quotes `iters=1 floor=10000` | x86 lane (`loginst`); `test-arm` compiles and runs the same store code |
-| 2 | `/USERS.DAT` readable with no session by construction; nothing encrypted at rest | **M4** the two leaves are kernel-owned: no EL0 open may resolve them, wherever in the tree they are named; the users service keeps reading through `locate_in_dir(0, leaf)`, which is not the EL0 resolver. Encryption at rest NOT built; §5 names what it needs | `[users] open REFUSED leaf=USERS.DAT reason=kernel-owned` from the fixture; the resolver's own errno is `-EACCES` | The fixture opens `/USERS.DAT` and `/USERS.NEW` through the real EL0 resolver as a session-stamped slot and expects the refusal; go-red: the predicate answers `false` → `resolver=OPENED -> FAIL` | aarch64 via `open_locate` (the same seam `home_acl_fixture` drives); x86 via `fs::vfs::el0_locate`, which is the one shared resolver and is OUTSIDE this arc's file grant — see §6 |
+| 2 | `/USERS.DAT` readable with no session by construction; nothing encrypted at rest | **M4** the two leaves are kernel-owned: no EL0 open may resolve them, wherever in the tree they are named; the users service keeps reading through `locate_in_dir(0, leaf)`, which is not the EL0 resolver. Encryption at rest NOT built; §5 names what it needs | What the fixture prints (LOGIN13 M4 made this cell agree with the wire — it named a `[users] open REFUSED leaf=… reason=kernel-owned` line no fixture ever printed): aarch64 `:: LOGIN-KOWN: pred=ok resolver=refused errno=-13,-13 reason=kernel-owned -> PASS ::`; x86 `[users] kernel-owned pred=ok resolver=refused (…)` and `:: LOGIN-KOWN: pred=ok resolver=refused err=KernelOwned,KernelOwned reason=kernel-owned -> PASS ::`; the resolver's errno is `-EACCES` on both arches (x86 through the storage task's `El0LocateError::KernelOwned` arms) | The fixture asks the real EL0 resolver for `USERS.DAT` and `/USERS.NEW` (aarch64 through `open_locate`; x86 through `fs::vfs::el0_locate` directly) and expects the refusal — on x86 the TYPED refusal, `El0LocateError::KernelOwned`; go-red: the predicate answers `false` → `resolver=OPENED -> FAIL`; on x86, the guard returning `Invalid` again (VFSOWNED's first cut) → `err=OTHER,OTHER -> FAIL` | aarch64 via `open_locate` (the same seam `home_acl_fixture` drives); x86 via `fs::vfs::el0_locate`, the one shared resolver — VFSOWNED landed its guard (§6) and LOGIN13 M4 typed it; both arches now print a `:: LOGIN-KOWN:` verdict |
 | 3 | x86 `owned_user_ok` compares a recyclable users-table id; aarch64 compares the name — two arches, two rules. ⚠ LATENT at 86f33c93: `grep -n 'fn delete_user' fs/users.rs` = 0, so no slot can be recycled until a delete exists | **M2** the `uid` rule of §2 on both arches, and `delete_user` lands in the same milestone so the hole never becomes reachable | `[users] delete user=<n> uid=<n> (slot <i> freed; uid never reissued)`; `:: LOGIN-IDENT: … same_slot_refused=true same_name_refused=true owner_ok=true -> PASS ::` | Create A (owns a row), delete A, create B (lands in A's slot, new uid) → B refused; recreate A (new uid again) → refused; the live owner admitted before the delete is the control. Go-red: the uid allocator mutated to `slot + 1` (v1's rule) → `same_slot_refused=false -> FAIL` on BOTH arches from one mutation | x86 lane AND `test-arm` (`UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 UNAOS_LOGIN=1 UNAOS_LOGINST=1 UNAOS_FATIMG=sf`) |
 | 4 | Log Out kills stamps, not processes | **M3** `session_logout` walks the process table for every running row whose slot carries a user stamp of the closing epoch, closes its windows (`wm::close_owner`) and kills it (`bg_kill`, the metal-proven path the close box already takes), THEN bumps the epoch and drops the stamps | `[users] logout epoch=<n> ended=<n> windows=<n>` | x86: the fixture opens a session, launches `STAT.ELF` through `spawn_user_image_bg` (the desktop's own launcher), logs out, proves the pid is gone from the table and the owner holds zero windows. Go-red: the kill skipped → `ended=0 pid_gone=false -> FAIL` | x86 lane; aarch64 twin compiled by `check` and run by `test-arm` as a regression (its own leg is the walk over scratch slots) |
 | 5 | The epoch is `AtomicU32` | **M5** `SESSION_EPOCH` and `SLOT_EPOCH` to `AtomicU64` on both arches, `session_epoch() -> u64` | `[users] logout epoch=<n>` unchanged in form | The type change is proven by `check` on both arches; the `LOGIN-EPOCH` legs read the new type | both arches |
@@ -197,8 +197,11 @@ lines in `el0_locate`, immediately after `let (parent, leaf) = el0_walk(fs, path
 if crate::fs::users::kernel_owned_leaf(leaf) { return Err(El0LocateError::Invalid); }
 ```
 
-`El0LocateError::Invalid` maps to `-EACCES`/`-EINVAL` through each arch's `el0_errno`; a dedicated
-`KernelOwned` variant is cleaner, touches every `match` on that enum, and is OWED, not taken.
+`El0LocateError::Invalid` mapped to `-EINVAL` through each arch's errno arm (aarch64 answered `-EACCES`
+first, from `open_locate`'s own guard). **LOGIN13 M4 (rmbp-ledger B189) took the owed variant:** the
+guard returns `El0LocateError::KernelOwned` (`login`-gated, like the guard), which maps to `-EACCES` in
+aarch64's `el0_errno` and in the x86 storage task's stat, create and delete arms, and the x86 fixture
+now prints a `:: LOGIN-KOWN:` verdict that passes only on that variant.
 `#[cfg(feature = "login")]` because `fs::users` is declared under `login` (`fs/mod.rs:105`) — the same
 pair aarch64 uses at `arch/aarch64/syscall.rs:25229/25233` — so a default image compiles unchanged on
 both arches and can hold no credential file at all. The guard covers the storage task's CREATE arm
@@ -285,3 +288,97 @@ volume=el0-fat(…)` once its block device answers, before or after the screen's
 screen's `submit` loads the store itself), and with `loginst` the same verdict lines as above. If no
 `[users] load` line appears on an Orin login boot, the console pump never saw a block device, and the
 row that owns the line is B188.
+
+## 8. Boot 13: root at boot, `adduser`, Log Out, the screen, the user (LOGIN13, rmbp-ledger B189, R63)
+
+Peter, flight 12 on the glass (RULINGS R63, verbatim there): *"for boot 13 lets boot into root like we
+have been i will add my user and log out then log into the user account"*. Flight 12 booted a `login`
+image and the screen opened at 8.4 s as a WINDOW over a live desktop (`[login] screen open window=2
+box=1330x764 at (775,345)`), offering create-first-user, and never had the keyboard: its keys went to
+`[wc-c] focus tab-cycle` and the desktop. §7's prediction (the create form at boot) is superseded by
+this section.
+
+### 8.1 The flow
+
+1. **Root at boot.** The two boot-time ignitions that opened the screen (`main.rs`, the x86
+   `x86_render_service` and the Pi `render_service`) call `users::boot_session(desktop)`, which opens
+   nothing and says so: `[login] boot session=root desktop=<b> screen=closed`. "Root" is the state the
+   code already had and did not name — no user session (`SESSION_LOCAL.1 == 0`; x86 `SESSION_USER ==
+   0`; aarch64 `PrincipalRecord::NONE`), programs stamped uid 0, which the ACL treats as anonymous.
+   LOGIN13 gives it a name (`users::root_session()`) and one bit of lifetime (`ROOT_LIVE`: true from
+   boot; cleared by its Log Out or by a user login from it; never set again this boot — there is no
+   root row and no root credential; root is reached by booting). Nothing about what uid 0 may open
+   changed. The SO43 seam (`screen_open_at_ignition`: the Tegra desk cascade, the virt pass) is
+   untouched; R63 is a ruling about boot 13.
+2. **`adduser <name>`, root only.** A host verb (`shell.rs`, `midden_core::HOST_VERBS`). The caller is
+   root when `root_session()` answers true, checked before the password is asked for and again at the
+   write. The NAME is on the line; the PASSWORD is asked for, twice, by `users::prompt_key`, which
+   `main.rs::handle_key` offers every key first — nothing is echoed, nothing reaches `history`, the
+   `[midden] cmd=` witness or the wire. `adduser <name> <pw>` is refused (`reason=password-on-line`):
+   `login`'s typed-line password is recorded in those three places before any verb runs. The row goes
+   through the same `create_user`, and `ensure_home` makes `/home/<name>` at once.
+3. **Log Out** — the crystal's row (`Verb::LogOut` -> `login::reopen_after_logout`) or the shell's
+   `logout` (`users::log_out_to_screen`, which calls the same function). Refused while the store has
+   nobody to log in as (`[users] logout REFUSED session=root reason=no-users`). Otherwise the root
+   session closes: x86 ends every running program stamped uid 0 in the root epoch (the SECLOGIN M3
+   walk, `session_logout_as(true)`) — the desktop's own `STAT.ELF` included — then the epoch bumps.
+4. **The screen**, on a real `wm` row, and the ONLY taker of input: x86's key router
+   (`wc_route_event`) hands every key to the screen before the Esc/Quarry doors, the Tab focus ring and
+   the focused ring (flight 12's defect), exactly as `wc_click_route_at` already did for presses
+   (SO44). The screen creates nobody (R63: *"more an installer thing"*). While the screen is up or the
+   `adduser` prompt is live, `USB-DEBUG: KEY` and the `[serialdoor] key=` witness withhold the byte.
+5. **The user logs in** through the screen and lands in `/home/<name>` (`[users] home=/home/<name>
+   exists`). A wrong password is `[login] denied user=<name>` and nothing else.
+
+What is NOT "over nothing": kernel windows (the console, the shell, Quarry) are not programs and stay
+on the desktop beneath the screen; the screen takes every key and press regardless. `STAT.ELF` is not
+relaunched when the user logs in (owed, B189). The aarch64 root arm is owed: aarch64 stamps no epoch on
+a non-user program (`session_restamp` is a no-op with no session), so root's programs cannot be
+selected there and its Log Out ends what it always ended.
+
+### 8.2 What proves it, and where
+
+| Claim | QEMU (the x86 login lane, `x86-login.spec` §10) | Waits for the glass |
+|---|---|---|
+| boot opens no screen | the boot's own line (`desktop=false`, printed by `main.rs` only) + `:: LOGIN-BOOTROOT:` driving the seam with `desktop=true`; go-red: the old open put back in the seam | `desktop=true screen=closed` on the rMBP after the Kepler takeover |
+| `adduser` | `:: LOGIN-ADDUSER:` (real verb, real prompt; `echo=none`, `verify=ok`, four refusals); FORBID of the typed passwords on the wire; go-red: the root check inverted | Peter typing at the EHCI keyboard into the shell window |
+| root's Log Out | `:: LOGIN-ROOTOUT:` (empty-store refusal; STAT.ELF launched in root and ended; screen on a real row; `adduser` then `not-root`) | the desktop's own STAT.ELF ending; the crystal row pressed with the trackpad (MOUSEHALT's) |
+| the screen takes the keyboard | `:: LOGIN-ROOTOUT:` `keys_routed=true name_typed=true tab=password` through the live `wc_route_event`; go-red: the fold deleted | `[login] key taken by the screen` and a session on the metal |
+
+### 8.3 FLIGHT-13 LINE LIST — the wire Peter's sitting must show, in order
+
+Image: `UNAOS_LOGIN=1`, no `loginst`. `<n>` is any number; `…` is the line's fixed explanatory tail.
+Lines 1 and 2 may come in either order (the render service starts before the SD card mounts on this
+bench); every other line is in this order.
+
+```text
+ 1  [login] boot session=root desktop=true screen=closed (R63: …)
+ 2  [rand] source=rdrand probe=cpuid.01h.ecx.30=1 bits=256     (immediately before the load; §4 row 6's prediction for Ivy Bridge)
+    [users] load volume=el0-fat(rw) src=<none|dat> users=<n> …
+    — Peter, in the shell window: adduser <name>
+ 3  :: [midden] cmd="adduser <name>" -> Host verb=adduser ::
+    — the prompt; while he types it and the retype, a `usbdebug` image prints `USB-DEBUG: KEY withheld (…)`
+      per key, and no byte of the password appears anywhere on the wire
+ 4  [users] kdf calibrated iters=<n> ms=<~250> …          (first KDF use of the boot)
+ 5  [users] home=/home/<name> created volume=<8 hex>
+ 6  [users] adduser user=<name> id=<uid> home=/home/<name> created=true (R63: …)
+    — Peter: Log Out (crystal row, or `logout` in the shell)
+ 7  :: SHARD: log out — the session closes and the login screen returns ::   (crystal route only)
+ 8  [users] session-end pid=<n> slot=<n> user=0 windows=<n> kill="…" ended=true   (one per root program; STAT.ELF at least)
+ 9  [users] root session closed ended=<n> windows=<n> (R63: …)
+10  [users] logout epoch=2 ended=<n> windows=<n> (SO37: …)
+11  [login] logged out — screen returns
+12  [login] screen open window=<n> box=<w>x<h> at (<x>,<y>)
+    — Peter types at the screen
+13  [login] key taken by the screen (…)
+    [login] press at=(<x>,<y>) control=<…> answered=<n> swallowed=<n> (…)   (only if he presses; the trackpad is MOUSEHALT's)
+    [login] denied user=<name> (…)                          (only on a wrong password — never with `reason=`)
+14  [users] home=/home/<name> exists volume=<the serial of line 5>
+15  [users] login ok user=<name> id=<uid of line 6> principal=user:<name>#<uid>
+16  [login] session open user=<name>
+```
+
+The sitting FAILS on any of: a `[login] screen open` line before line 11; `[login] boot … screen=open`;
+any byte of the password on the wire; `[login] denied … reason=`; `[users] adduser REFUSED … reason=not-root`
+before line 9; `[users] logout REFUSED session=root` after line 6 (it is correct — and expected — only if
+he logs out before adding a user). If line 2 reads `users=0`, a Log Out before line 6 is refused by design.

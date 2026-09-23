@@ -24719,7 +24719,7 @@ fn el0_errno(e: crate::fs::vfs::El0LocateError) -> i64 {
         E::Invalid => EINVAL, // no leaf, a name not representable as 8.3, or a refused `..`
         E::NoSpace => ENOSPC,
         E::Busy => EAGAIN, // WEDGE-8: retryable, nothing mutated
-        E::Io => EIO,
+        E::Io => EIO, #[cfg(feature = "login")] E::KernelOwned => EACCES, // LOGIN13 M4 — the credential file, typed; `open_locate`'s own guard answers the same errno first
     }
 }
 

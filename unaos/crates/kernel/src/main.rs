@@ -1335,7 +1335,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 match event {
                     unaos_kernel::pal::Event::Key(c) => {
                         let ch = c as char;
-                        serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' });
+                        #[cfg(feature = "login")] let hide = unaos_kernel::fs::users::secret_input(); #[cfg(not(feature = "login"))] let hide = false; if hide { serial_println!("USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)"); } else { serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' }); } // LOGIN13 M2/M3 — `usbdebug` (on every flight image) printed every typed byte, the login screen's password included, which broke `video/login.rs`'s "NO TYPED BYTE REACHES THE WIRE". ⚠ LINE-NEUTRAL fold.
                     }
                     unaos_kernel::pal::Event::Mouse { x, y } => {
                         serial_println!("USB-DEBUG: MOUSE relative dx={} dy={}", x, y);
@@ -2753,7 +2753,7 @@ fn handle_key(
     console: &mut unaos_kernel::console::Console,
     pal: &mut unaos_kernel::pal::TargetPal<'_>,
 ) -> bool {
-    if c == b'\n' || c == b'\r' { console.sel.on_edit(c, console.current_input.len()); // TERMSEL2 — the edit rule now splits: CR/LF drops any selection here (and parks the caret at the end of the empty line it leaves), and the two edit arms below go through `LineSel::type_byte`, which REPLACES a selection on the line instead of dropping it — the rule TERMSEL had to defer for want of a caret. // TERMSEL — THE EDIT RULE, ahead of every edit this function makes: a typed byte, BS/DEL and CR/LF drop a live selection first (`video::termsel::LineSel::on_edit`, which prints `[termsel] none … by=edit` only when one was live and ignores bytes that edit nothing, e.g. the arrow byte a `Shift+←` pushes just ahead of its `SelectLeft`). The editor has no caret, so a selection cannot be REPLACED by what is typed; keeping it across the edit would paint the band over cells that moved. A paste types through this same function, so it drops the selection the same way. Runs on every surface that calls `handle_key`; where no selection can be made (no `Event::Action` consumer) it is a no-op. ⚠ FOLDED onto the existing `if` — `main.rs` embeds `panic::Location` line numbers (PARITY §5.3); CODE FIRST (A10FIX).
+    #[cfg(feature = "login")] match unaos_kernel::fs::users::prompt_key(c, console) { 0 => {} 1 => return false, _ => { console.draw(pal); return false; } } if c == b'\n' || c == b'\r' { console.sel.on_edit(c, console.current_input.len()); // TERMSEL2 — the edit rule now splits: CR/LF drops any selection here (and parks the caret at the end of the empty line it leaves), and the two edit arms below go through `LineSel::type_byte`, which REPLACES a selection on the line instead of dropping it — the rule TERMSEL had to defer for want of a caret. // TERMSEL — THE EDIT RULE, ahead of every edit this function makes: a typed byte, BS/DEL and CR/LF drop a live selection first (`video::termsel::LineSel::on_edit`, which prints `[termsel] none … by=edit` only when one was live and ignores bytes that edit nothing, e.g. the arrow byte a `Shift+←` pushes just ahead of its `SelectLeft`). The editor has no caret, so a selection cannot be REPLACED by what is typed; keeping it across the edit would paint the band over cells that moved. A paste types through this same function, so it drops the selection the same way. Runs on every surface that calls `handle_key`; where no selection can be made (no `Event::Action` consumer) it is a no-op. ⚠ FOLDED onto the existing `if` — `main.rs` embeds `panic::Location` line numbers (PARITY §5.3); CODE FIRST (A10FIX).
         let cmd = console.current_input.clone();
         console.current_input.clear();
         // GUI-CLICK-2: mark the screen app-owned across the (possibly long-running, full-screen)
@@ -3580,7 +3580,7 @@ fn usbdebug_event_print(raw: unaos_kernel::pal::Event) {
         unaos_kernel::pal::Event::Key(c) => {
             usbdebug_ptr_rollup_flush();
             let ch = c as char;
-            serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' });
+            #[cfg(feature = "login")] let hide = unaos_kernel::fs::users::secret_input(); #[cfg(not(feature = "login"))] let hide = false; if hide { serial_println!("USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)"); } else { serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' }); } // LOGIN13 M2/M3 — `usbdebug` (on every flight image) printed every typed byte, the login screen's password included, which broke `video/login.rs`'s "NO TYPED BYTE REACHES THE WIRE". ⚠ LINE-NEUTRAL fold.
         }
         unaos_kernel::pal::Event::Mouse { x, y } => {
             // The bounded verbatim prologue: the old line, unchanged, for the first reports of the
@@ -5339,7 +5339,7 @@ fn render_pass<W: RenderWait>(w: &mut W) {
     #[cfg(not(feature = "desktop_firmware"))]
     let desktop = false;
 
-    let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen); #[cfg(feature = "login")] if desktop { unaos_kernel::fs::users::screen_open_once(); } // LOGIN M3 — the desktop boots to the login screen. ⚠ LINE-NEUTRAL append.
+    let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen); #[cfg(feature = "login")] unaos_kernel::fs::users::boot_session(desktop); // LOGIN13 M1 (R63, rmbp-ledger B189) — the x86 site's sibling: boot to the ROOT desktop, never to the login screen (see `fs::users::boot_session`). ⚠ LINE-NEUTRAL fold.
     let mut console = unaos_kernel::console::Console::new();
 
     // SHELLWIN-PI — the live shell's OWN compositor window. Flat locals for the service's life, for
@@ -6377,7 +6377,7 @@ fn x86_render_service(cpu: usize) {
     // the first present — and the live text shell is kept off the glass (it survives in serial and
     // `TERM_RING` for the Console app, per the facade law). Off the crispy desktop (a pre-takeover
     // boot, a `wc`-off x86 build) the shell is still the desktop and draws exactly as it always did.
-    let desktop = desktop_owns_backdrop(); #[cfg(feature = "login")] if desktop { unaos_kernel::fs::users::screen_open_once(); } // LOGIN M3 — the desktop boots to the login screen. ⚠ LINE-NEUTRAL append.
+    let desktop = desktop_owns_backdrop(); #[cfg(feature = "login")] unaos_kernel::fs::users::boot_session(desktop); // LOGIN13 M1 (R63, rmbp-ledger B189) — the machine boots to the ROOT desktop: this site used to OPEN the login screen (LOGIN M3), and flight 12 shows what that did (`[login] screen open window=2` over a live desktop, no keyboard). `boot_session` opens nothing and says so on the wire; the screen opens at the root session's Log Out. ⚠ LINE-NEUTRAL fold.
     if desktop {
         screen.paint_desktop_scene();
     }

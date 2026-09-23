@@ -258,8 +258,9 @@ REQUIRE \[users\] home=/home/una (created|exists) volume=[0-9a-f]{8}
 # The only emitter is `users::screen_open_at_ignition` (`fs/users.rs:1089`), and its only callers are
 # the Tegra desk cascade (`main.rs:9144`, inside `tegra_desk_cascade`, cfg aarch64 + `deskcascade`)
 # and the login fixture's IGNITION leg (`video/login.rs:852` for HELD, `:856` for OPEN, inside
-# `ignition_leg`, cfg `loginst`). The x86 boot opens the screen through `screen_open_once` at
-# `main.rs:6380` (`x86_render_service`), which prints no `[login] ignition` line. So on this lane both
+# `ignition_leg`, cfg `loginst`). The x86 boot opened the screen through `screen_open_once` at
+# `main.rs:6380` (`x86_render_service`), which prints no `[login] ignition` line — and SINCE LOGIN13 M1
+# (R63, B189) it opens nothing: that site calls `users::boot_session`, whose line §10 pins. So on this lane both
 # matching lines are the fixture's two arms — measured at lines 1260 (HELD) and 1261 (OPEN) of
 # `~/unaos-bench/scratch/rmbp-0915/specpins2-logs/run3-login-serial.log`, directly above
 # `:: LOGIN-IGNITION:` at 1263 — and a green here says the storage pass reached the battery, which is
@@ -296,7 +297,11 @@ REQUIRE \[login\] ignition desktop_up=(true|false) console_routed=(true|false) -
 # is the one line that says the screen got a REAL `wm` row, and no spec read it. §7 pins what a person
 # does at the screen; this pins that there was a screen to do it at.
 #
-# WHO PRINTS IT ON THIS LANE, measured, because it is NOT the boot. The x86 boot's own open is
+# RE-READ BY LOGIN13 M1 (R63, rmbp-ledger B189): THE BOOT'S OWN OPEN NO LONGER EXISTS ON ANY x86 IMAGE —
+# `main.rs:6380` now calls `users::boot_session(desktop)`, which opens nothing (§10). The paragraph below
+# is the pre-R63 measurement; its conclusion (every windowed line on this lane is the loginst battery's)
+# holds a fortiori, and on the METAL the first windowed line is now the root session's Log Out.
+# WHO PRINTS IT ON THIS LANE, measured, because it is NOT the boot. The x86 boot's own open WAS
 # `screen_open_once` at `main.rs:6380`, gated `if desktop` where `desktop = desktop_owns_backdrop()` =
 # `desktop_uefi::is_active()` — and `desktop_uefi::activate`'s only caller is the Kepler takeover
 # (`drivers/gpu/kepler_display.rs:511`). QEMU has no Kepler, so that call never runs here. Every
@@ -316,3 +321,81 @@ REQUIRE \[login\] screen open window=\d+ box=\d+x\d+ at \(\d+,\d+\)
 # can draw it. `window=no (fixture — headless form)` is NOT forbidden: the fixtures ask for it.
 FORBID \[login\] screen open window=no \(no surface yet
 FORBID \[login\] screen open window=no \(create refused
+
+# ── 10. R63 — THE BOOT IS ROOT, NOT A LOGIN SCREEN (LOGIN13, rmbp-ledger B189), TAIL-APPENDED ─────
+# Peter, flight 12 (RULINGS R63): *"for boot 13 lets boot into root like we have been i will add my user
+# and log out then log into the user account"*. Flight 12's screen opened at boot as a WINDOW over a live
+# desktop (`[login] screen open window=2 box=1330x764 at (775,345)`) and never had the keyboard.
+#
+# M1 — THE BOOT'S OWN LINE. Printed by `main.rs`'s x86 site (`x86_render_service`, the one that used to
+# open the screen) through `users::boot_session`, and by NOTHING ELSE — the fixture below drives the
+# decision (`users::boot_ignition`) without printing it, so this REQUIRE is the BOOT's, not the fixture's
+# (the trap SPECPINS2 measured in §8/§9). On QEMU it reads `desktop=false` (no Kepler takeover); on the
+# metal `desktop=true`. GREEN CERTIFIES: the boot reached the render service's ignition site and the
+# screen was DOWN when it left it. The FORBID is the defect's own reading.
+REQUIRE \[login\] boot session=root desktop=(true|false) screen=closed
+FORBID \[login\] boot session=\S+ desktop=\S+ screen=open
+# The fixture: `root_at_boot` (no user session, root not closed, at the head of the loginst battery),
+# the decision driven with `desktop=true` — the metal's arm, which no QEMU boot presents — and
+# `desktop=false`, the screen down after each. GO-RED (LOGIN13 M1, run on this gate): the pre-R63
+# statement put back inside `boot_ignition` (`if desktop { screen_open_once(); }`) reads
+# `desk_screen=open … -> FAIL —`. GREEN CERTIFIES: the seam that replaced the boot's open cannot open
+# the screen on a desktop boot, and `screen_built=true` says the screen was compiled so the claim bites.
+REQUIRE :: LOGIN-BOOTROOT: session=root\(uid0\) root_at_boot=true desk_screen=closed nodesk_screen=closed still_root=true screen_built=true -> PASS ::
+FORBID :: LOGIN-BOOTROOT: .* -> FAIL
+#
+# M2 — `adduser <name>`: ROOT ADDS A USER, AND THE PASSWORD IS ASKED FOR. The fixture drives the REAL verb
+# (`users::shell_verb("adduser", …)`) and the REAL prompt (`users::prompt_key`, the function
+# `main.rs::handle_key` offers every key to first) in the root session the boot left. GO-RED (LOGIN13 M2,
+# run on this gate): the root check in `adduser_begin` inverted (`if !root_session()` -> `if root_session()`)
+# reads `prompted=false … created=false … -> FAIL —`. GREEN CERTIFIES: root can add a user without the
+# password touching the line editor (`echo=none`), the typed credential is the stored one (`verify=ok`),
+# and the four refusals each speak their own word and create nothing.
+REQUIRE :: LOGIN-ADDUSER: root=true prompted=true echo=none created=true uid=\d+ verify=ok dup=exists empty=empty-password mismatch=mismatch on_line=password-on-line -> PASS ::
+FORBID :: LOGIN-ADDUSER: .* -> FAIL
+# The success line (the store's uid, the home's own verdict) and the refusal lines, by their wire words.
+REQUIRE \[users\] adduser user=boot13 id=\d+ home=/home/boot13 created=(true|false)
+REQUIRE \[users\] home=/home/boot13 (created|exists) volume=[0-9a-f]{8}
+REQUIRE \[users\] adduser REFUSED user=boot13 reason=exists
+REQUIRE \[users\] adduser REFUSED user=boot13e reason=empty-password
+REQUIRE \[users\] adduser REFUSED user=boot13m reason=mismatch
+REQUIRE \[users\] adduser REFUSED user=boot13p reason=password-on-line
+# THE PROPERTY THE PROMPT EXISTS FOR, as a rule: nothing the fixture typed at the prompt reaches the wire.
+# `boot13-pw` is the credential (typed twice), `one-pw`/`two-pw` the mismatched pair.
+FORBID boot13-pw
+FORBID (one|two)-pw
+#
+# M3 — LOG OUT CLOSES THE ROOT SESSION, AND THE SCREEN IS THE ONLY THING TAKING INPUT. The fixture runs third,
+# while root is still the session: the shell's `logout` from root with an EMPTY store is refused; a program
+# launched in the root session (`STAT.ELF`, uid 0 in the root epoch) is ENDED by the root session's Log Out
+# (the shell's `logout` -> `users::log_out_to_screen` -> `login::reopen_after_logout`, the crystal row's own
+# action); the screen comes up on a real row; `adduser` is then refused `not-root`; and every key is driven
+# through the LIVE x86 key router (`wc_route_event`) — the path flight 12's keys took to
+# `[wc-c] focus tab-cycle` — and must be consumed there and land in the form: the name, Tab to the password
+# field, a wrong password (the one-answer denial), the right one (a session as `boot13`, home
+# `/home/boot13`). GO-RED (LOGIN13 M3, run on this gate): the screen-first fold deleted from `wc_route_event`
+# (`arch/x86_64/syscall.rs:7312`) reads `keys_routed=false name_typed=false … -> FAIL —`. GREEN CERTIFIES:
+# root's Log Out is refused with nobody to log in as, ends root's programs when it is not, returns the
+# screen, and the screen — not the focus ring, not a focused app — receives the keyboard.
+REQUIRE :: LOGIN-ROOTOUT: root_before=true empty_refused=no-users pid=\d+ root_stamped=true others=\d+ root_after=false pid_gone=true window_gone=true screen=up screen_window=true not_root=not-root keys_routed=true name_typed=true tab=password wrong=denied login=boot13 cleaned=true -> PASS ::
+FORBID :: LOGIN-ROOTOUT: .* -> FAIL
+REQUIRE \[users\] logout REFUSED session=root reason=no-users
+REQUIRE \[users\] root session closed ended=\d+ windows=\d+
+REQUIRE \[users\] session-end pid=\d+ slot=\d+ user=0 windows=\d+ kill=
+REQUIRE \[users\] adduser REFUSED user=boot13x reason=not-root
+# The one-per-open key witness: what a flight-13 capture reads to know the keyboard reached the screen,
+# without a typed byte on the wire (the §7 denial FORBIDs still hold for this user's denial below).
+REQUIRE \[login\] key taken by the screen
+REQUIRE \[login\] denied user=boot13
+REQUIRE \[users\] login ok user=boot13 id=\d+ principal=user:boot13#\d+
+REQUIRE \[login\] session open user=boot13
+FORBID wrong-pw
+#
+# M4 — THE x86 CREDENTIAL-FILE REFUSAL IS TYPED AND HAS A VERDICT (VFSOWNED's owed items, B181 -> B189).
+# `El0LocateError::KernelOwned` is what `fs::vfs::el0_locate` returns for `USERS.DAT`/`USERS.NEW`; the x86
+# fixture asks the resolver for both and passes only on that variant — a refusal for any other reason is
+# not this one. §7d's `[users] kernel-owned pred=ok resolver=refused` token is unchanged (its parenthetical
+# no longer claims the guard "is owed to the seat": VFSOWNED landed it). GO-RED (LOGIN13 M4, run on this
+# gate): the guard returning `Invalid` again reads `err=OTHER,OTHER -> FAIL —`. GREEN CERTIFIES: x86 has a
+# verdict for SECLOGIN M4 (aarch64 has had one since ARMUSERS), and the refusal is the typed one.
+REQUIRE :: LOGIN-KOWN: pred=ok resolver=refused err=KernelOwned,KernelOwned reason=kernel-owned -> PASS ::

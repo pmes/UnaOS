@@ -14,7 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-//! LOGIN M3 — the login screen (`login` knob, RULINGS R51): the desktop boots to it, a successful
+//! LOGIN M3 — the login screen (`login` knob, RULINGS R51). SINCE LOGIN13 (R63) THE DESKTOP DOES NOT
+//! BOOT TO IT: the machine boots to the ROOT desktop (`fs::users::boot_session`), and the screen opens
+//! at the root session's Log Out ([`reopen_after_logout`]) and after every Log Out from then on. A successful
 //! login opens the session under `user:<name>` (`fs::users::login`, which also makes `/home/<name>`),
 //! and Log Out (M4: the crystal menu's own row, `crystal::Verb::LogOut`) returns to it, where a second
 //! login opens a NEW session under the same or another principal. Self-drawn, the Mac model: a name field, a
@@ -27,8 +29,9 @@
 //! aarch64 `desktop_firmware`); no board name, no `target_arch` of its own. The routes reach it through
 //! `fs::users::screen_key` / `screen_open_once`, which are `false`/no-op where no desktop is built.
 //!
-//! First boot with no users (`users::count() == 0`) is the CREATE-FIRST-USER screen: the same two
-//! fields, titled so; Enter creates the user and logs in. R24: Esc does nothing here — it dismisses
+//! The screen creates nobody (LOGIN13 M1, R63: *"this is more an installer thing anyway"*): root adds a
+//! user with the `adduser` shell verb, and an empty store has nobody for the form to verify — the root
+//! session's Log Out is refused until a user exists (M3). R24: Esc does nothing here — it dismisses
 //! menus only, and this is not a menu; it never closes an app window. Tab moves between the two fields
 //! of ONE form (a form control inside one window, not the retired window focus-cycle).
 //!
@@ -136,7 +139,7 @@ static mut SURF: Surf = Surf([0; W * H]);
 #[derive(Clone, Copy, PartialEq)]
 enum State {
     Closed,
-    /// The form is up (create-first-user or log-in, decided by `users::count()` at paint time).
+    /// The form is up (log in only since LOGIN13 M1; a user is created by root's `adduser`).
     Open,
     /// A session is open; the screen is down until Log Out.
     Session,
@@ -190,6 +193,9 @@ static PRESS_SWALLOWED: AtomicU32 = AtomicU32::new(0);
 /// presses a human never counts, and a witness that scrolls the boot log away is not a witness. A hit
 /// on a CONTROL always prints — those are countable by construction, because a person made each one.
 static MISS_SAID: AtomicBool = AtomicBool::new(false);
+/// LOGIN13 M3 — one `[login] key taken by the screen` line per open: the metal capture's evidence that
+/// the keyboard reached the screen (flight 12's never did) without ever printing what was typed.
+static KEY_SAID: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // LAYOUT — **ONE accessor, read by the painter AND by the press.**
@@ -244,7 +250,7 @@ pub fn roster_on_glass() -> bool {
     ROSTER_ON_GLASS
 }
 
-/// How many user rows the screen draws. Zero on the create-first-user screen, by construction, and
+/// How many user rows the screen draws. Zero on an empty store, by construction, and
 /// zero under the "type your name" policy (`roster_on_glass() == false`).
 fn user_rows() -> usize {
     if roster_on_glass() { users::count().min(USER_MAX) } else { 0 }
@@ -403,8 +409,9 @@ fn repaint() {
     let px: &mut [u32] = unsafe { &mut (*core::ptr::addr_of_mut!(SURF)).0 };
     fill(px, 0, 0, W, H, theme::CHROME_FACE);
     rect(px, 2, 2, W - 4, H - 4, theme::FRAME_LINE);
-    let first = users::count() == 0;
-    let title: &[u8] = if first { b"Create the first user" } else { b"Log in to UnaOS" };
+    // LOGIN13 M1 (R63) — ONE face: the screen only logs in (`adduser` creates; see `submit`), so the
+    // create-first-user title, button label and hint that keyed on `users::count() == 0` are gone.
+    let title: &[u8] = b"Log in to UnaOS";
     text(px, LX, 14, title, theme::CONTENT_TEXT);
     fill(px, LX, 36, W - 2 * LX, 2, theme::FRAME_LINE);
     // The user rows, when there are users. `name_at` is the store's own accessor, so the row a press
@@ -422,8 +429,8 @@ fn repaint() {
     let (pxf, py, pwf, _) = ctl_rect(Ctl::PwField);
     text(px, LX, py + 4, b"Password", theme::TITLE_TEXT_INACTIVE);
     field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
-    button(px, Ctl::Button, if first { b"Create" } else { b"Log In" }, true);
-    let hint: &[u8] = if first { b"Enter or Create makes the user" } else { b"Enter or Log In   Tab switches" };
+    button(px, Ctl::Button, b"Log In", true);
+    let hint: &[u8] = b"Enter or Log In   Tab switches";
     text(px, LX, 186, hint, theme::TITLE_TEXT_INACTIVE);
     if !f.message.is_empty() {
         text(px, LX, 212, f.message.as_bytes(), theme::ACCENT);
@@ -461,6 +468,7 @@ fn open() {
         f.windowed = false;
     }
     MISS_SAID.store(false, Ordering::Relaxed); // LOGINFLOW — the one miss line is per OPEN, not per boot
+    KEY_SAID.store(false, Ordering::Relaxed); // LOGIN13 M3 — and so is the one key line
     if HEADLESS.load(Ordering::Relaxed) {
         serial_println!("[login] screen open window=no (fixture — headless form)");
         return;
@@ -521,8 +529,13 @@ fn close_into_session() {
     FORM.lock().state = State::Session;
 }
 
-/// M4: Log Out — close the session and put the screen back up.
+/// M4: Log Out — close the session and put the screen back up. LOGIN13 M3 (R63): the ROOT session's
+/// Log Out comes here too (the crystal's row and the shell's `logout`), and is refused while the store
+/// has nobody to log in as (`users::root_logout_refused`, which prints why).
 pub fn reopen_after_logout() {
+    if users::root_logout_refused() {
+        return;
+    }
     users::logout();
     FORM.lock().state = State::Closed;
     serial_println!("[login] logged out — screen returns");
@@ -689,6 +702,9 @@ pub fn consume_key(c: u8) -> bool {
     // is a key typed into nothing. See [`heal_if_row_gone`]; on every ordinary press this is one
     // mutex take and one relaxed load, and it answers `false`.
     heal_if_row_gone();
+    if !KEY_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!("[login] key taken by the screen (the first of this open — LOGIN13/R63: while the screen is up it is the only thing taking input; no typed byte is ever printed)");
+    }
     match c {
         b'\x1b' => {} // R24: Esc dismisses menus only; the screen stays
         b'\t' => {
@@ -739,23 +755,13 @@ fn submit() {
     }
     let n = &name[..nlen];
     let p = &pw[..plen];
-    if users::count() == 0 {
-        match users::create_user(n, p) {
-            // LOGINFLOW M2 — **the first boot on a fresh volume, and the reason this screen exists at
-            // all rather than a serial verb.** `users::count() == 0` is the whole predicate: there is
-            // nobody to log in as, so the same two fields CREATE the person and then log them in, with
-            // no console, no cable and nothing to know beforehand. The witness is the id, never the
-            // name's length or any part of what was typed.
-            Ok(id) => serial_println!("[login] first user created id={} — the fresh-volume path (no console was needed)", id),
-            Err(e) => {
-                FORM.lock().message = match e {
-                    users::UsersError::BadName => "Name: 1-8 of a-z 0-9 _ -, letter first",
-                    _ => "Could not create the user",
-                };
-                return;
-            }
-        }
-    }
+    // LOGIN13 M1 (R63: *"this is more an installer thing anyway"*) — the screen CREATES NOBODY. Until this
+    // arc an empty store turned the two fields into create-first-user (`users::create_user`, then log in),
+    // which is how flight 12 put a create form over a live desktop. A user is made by root with `adduser`
+    // (`fs::users::shell_verb`); the screen only logs in, so an empty store simply has nobody to verify and
+    // the attempt is the same one-answer denial as any other. The root session's Log Out is refused while
+    // the store is empty (LOGIN13 M3, `fs::users::root_logout_refused`), so a person is never left at a screen with
+    // nobody to log in as.
     // LOGINFLOW M2 — **THE DENIAL IS DECIDED BY ONE PREDICATE AND IT GIVES ONE ANSWER.**
     //
     // `users::verify` is documented as *"one answer for 'no such user' and 'wrong password'"*, and
@@ -1307,4 +1313,26 @@ pub fn screen_fixture(
         esc_kept, wrong_kept, opened, passes_through, logout_ok, back, second, LOGINS.load(Ordering::Relaxed), close_box_refused, close_route, reopened, HEALS.load(Ordering::Relaxed), ignition_ok, control_ok, if ok { "PASS" } else { "FAIL —" }
     );
     ok
+}
+
+/// LOGIN13 M3 fixture (`loginst`): did the screen get a REAL `wm` row this open (not the headless form)?
+#[cfg(feature = "loginst")]
+pub fn fixture_windowed() -> bool {
+    FORM.lock().windowed && WIN.load(Ordering::Relaxed) != wm::WIN_NONE
+}
+
+/// LOGIN13 M3 fixture (`loginst`): is the form open with exactly `name` in the name field and the focus
+/// on the password field (`password = true`) or the name field? What the router's keys must have done.
+#[cfg(feature = "loginst")]
+pub fn fixture_form_is(name: &[u8], password: bool) -> bool {
+    let f = FORM.lock();
+    f.state == State::Open && f.name_len == name.len() && f.name[..name.len()] == *name && (f.focus == Focus::Password) == password
+}
+
+/// LOGIN13 M3 fixture (`loginst`): put the screen back where the rest of the battery expects it — no
+/// row, console resumed, form `Closed` (a login leaves it `Session`, which no later leg starts from).
+#[cfg(feature = "loginst")]
+pub fn fixture_reset() {
+    take_down();
+    FORM.lock().state = State::Closed;
 }
