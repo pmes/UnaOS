@@ -276,3 +276,60 @@ REQUIRE :: FAT-LFN: created=Screenshot [0-9]{4}-[0-9]{2}-[0-9]{2} at [0-9]{2}\.[
 # green, since the REQUIRE above going unmatched is reported as a short REQUIRE rather than as
 # positive evidence of what went wrong. This FORBID names it.
 FORBID :: FAT-LFN: SKIPPED
+
+# ── STOR-1 M1 (2026-09-23), TAIL-APPENDED past BUSX86 M3, the same shape it used ──────────────────
+# THE CREATED-NAME ENTRY, pinned on the lane it runs on. `stor1_name_launcher` is UNCONDITIONAL — no
+# `witness`, no `wc`, no storage knob — for BUSX86 M3's reason verbatim: `SYS_OPEN` is not optional
+# surface on this arch, so the PASS spelling is present on the knob-free `./arroyo test` and can be
+# REQUIRED rather than only FORBIDden in its negative. It skips with a named line when there is no
+# free address-space slot or the volume still carries a STOR1.BIN a previous boot left; neither is
+# true of this lane.
+#
+# WHY THE BITMASK IS IN THE REQUIRE AND NOT LEFT TO `PASS`. Same argument BUSX86-EQ's `diff=0` makes
+# one arc earlier: `PASS` here is a conjunction of six ring-3 legs plus five kernel-side conditions
+# (signalled, sealed, row cleared, queue drained, entry torn down), and an edit that stopped SCORING
+# a leg would keep printing `PASS` with a smaller mask. `w=0x3f` is the claim — six legs, of which
+# bits 2 and 3 are the milestone itself (a name re-opens after its last descriptor closed, and reads
+# back byte-exact) and bit 5 is the contract that must NOT have moved with it (unlink still removes
+# the name, and a plain re-open after it is -ENOENT).
+REQUIRE :: STOR1-NAME: .* :: PASS \[w=0x3f/0x3f\] ::
+# The FORBID partner is a REAL spelling, not an invented negation: the launcher prints exactly this
+# line on any short mask, and the go-red for this milestone produced it — `created_desc_any_row` put
+# back at `sys_open_dynamic`'s gate, which is the OLD identity model, restored and then reverted.
+FORBID :: STOR1-NAME: created-name entries FAIL
+
+# ── STOR-1 M2 (2026-09-23), TAIL-APPENDED past STOR-1 M1 ──────────────────────────────────────────
+# RENAME, pinned on the same unconditional lane for the same reason: `SYS_RENAME` is dispatched with
+# no feature gate at all, so its witness is present on the knob-free `./arroyo test`.
+#
+# `w=0x7f` carries the claim the same way M1's mask does — seven ring-3 legs, of which bit1..3 are
+# the move itself (rename returns 0, the OLD name is -ENOENT, the NEW name reads back byte-exact),
+# bit4 is "a refused rename mutates nothing" and bit5 is the x86-only `-EBUSY` on a live source
+# together with its own retirement (the same rename returns 0 the moment the handle closes). The
+# PASS spelling additionally requires the kernel-side OWNER-ONLY leg (`acl_ok`), which no mask bit
+# can carry because a single ring-3 program cannot be two principals.
+REQUIRE :: STOR1-MV: .* :: PASS \[w=0x7f/0x7f\] ::
+# The FORBID partner is the launcher's own FAIL spelling, produced by this milestone's go-red (the
+# `owned_unlink_permitted` refusal deleted from `rename_created`'s authorization, reverted).
+FORBID :: STOR1-MV: rename FAIL
+
+# ── STOR-1 M3 (2026-09-23), TAIL-APPENDED past STOR-1 M2 ──────────────────────────────────────────
+# THE WRITE SIDE ON THE WIRE. `BUSX86-WR` is a NEW witness rather than three more legs of BUSX86-EQ
+# for a mechanical reason: that fixture is a `global_asm!` block in the middle of a 26k-line file
+# whose panic `Location` records embed line numbers (B94), so this seat extends the CLAIM and appends
+# the witness. Eleven legs: the BANDY-WR round trip (write->cat byte-exact and the DIRECT syscall
+# sees the same file; mv->cat(new) byte-exact + cat(old) -ENOENT; rm->cat -ENOENT), the BANDY-EQ2
+# denials (write/rm/mv of a FOREIGN-owned file each -EACCES), the BANDY-ACL integrity check (the
+# denials left the foreign file there, still foreign, with no stolen name), and the CEILING leg — a
+# bus `cp` made while two created files are held open, read back directly byte-exact, which is the
+# shape rmbp-ledger B171 recorded as `cp-copy open_rc=-24` before a `cp` stopped costing a slot.
+REQUIRE :: BUSX86-WR: .* :: PASS \[w=0x7ff/0x7ff\] ::
+FORBID :: BUSX86-WR: write side FAIL
+#
+# AND BUSX86-EQ's WRITE-SIDE LEGS ARE RE-PINNED HERE, in the commit that changed the kernel line they
+# pin, which is this file's contract. They used to read `write/rm/mv=3/3 -ENOSYS` — an assertion that
+# the three verbs DID NOTHING. They do something now, so the pin becomes the exact triple that
+# fixture's own frames must produce, and it asserts strictly more than the old one: `-EBUSY` says the
+# ACL ran and the live-source refusal ran, `ok` says the owner was admitted, and `-ENOENT` says the
+# ordering between two destructive verbs on the same name is the one the wire asked for.
+REQUIRE :: BUSX86-EQ: .* write/rm/mv=-EBUSY/ok/-ENOENT .* -> PASS ::

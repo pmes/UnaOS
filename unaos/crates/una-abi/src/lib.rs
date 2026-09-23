@@ -315,6 +315,35 @@ pub const SYS_ACCEPT: u64 = 48;
 /// x86 dispatches it; aarch64 does not (D2) — reserved there, answers `-ENOSYS`.
 pub const SYS_CPUPULSE: u64 = 49;
 
+/// `SYS_RENAME(src_ptr, src_len, dst_ptr, dst_len) -> 0 / -errno` (STOR-1 M2) — re-bind a
+/// runtime-created file from one name to another.
+///
+/// NAME to NAME, not handle to name, and the argument shape is MATCHED FROM THE Pi rather than
+/// invented. aarch64 has no rename syscall at all, so its ONLY rename ABI is the v1 bus verb `mv`,
+/// whose frozen body is `[src_len][src][dst]` — two names in that order, owner-only, create-new-only
+/// on the destination. Taking the same two names in the same order with the same errno table is what
+/// lets a program be written ONCE: `mv A B` spoken over the bus and `SYS_RENAME(A, B)` spoken
+/// directly are then the SAME QUESTION, which is exactly the property the bus equivalence witness
+/// exists to assert. A handle-based rename could not have been that — and on x86 it could barely
+/// have worked, because after STOR-1 M1 a created file commonly has NO open descriptor and so no
+/// handle to name it by.
+///
+/// The fourth argument rides `r10` from ring 3 (`SYSCALL` itself destroys `rcx`), exactly as
+/// [`SYS_THREAD_SPAWN`]'s fourth does; the entry stub moves it to the 5th C register before its
+/// shuffle.
+///
+/// Errnos: `-EINVAL` (empty or oversized name) · `-ENOENT` (the source has no entry, or either name
+/// is outside the creatable set) · `-EACCES` (the shared window · an immutable staged name · not the
+/// owner — DELETE authority, because a content grantee able to re-point a name could steal it) ·
+/// `-EEXIST` (the destination is live) · `-EBUSY` (the destination's deferred delete has not
+/// drained, or the SOURCE still has an open descriptor — an x86-only refusal the kernel-side doc
+/// comment states in full) · `-EIO` (the on-disk twin could not be re-materialised; on that path the
+/// namespace is left exactly as it was).
+///
+/// x86 dispatches it; aarch64 does not — that arch answers `mv` on the bus, and minting the syscall
+/// there later is a dispatch arm over the existing `bus_mv` body. Reserved on both.
+pub const SYS_RENAME: u64 = 50;
+
 // =================================================================================================
 // Sub-ops and flags — the encodings ring 3 passes IN
 // =================================================================================================
@@ -613,8 +642,9 @@ pub const ENOSYS: i64 = -38;
 /// The shared block is contiguous and the socket family starts clear of it: a future verb minted at
 /// 34..=39 cannot silently land on a socket number, and a socket number cannot land on a shared one.
 const _: () = assert!(SYS_WIN_PRESENT_ROWS == 33 && SYS_SOCKET == 40);
-/// `SYS_CPUPULSE` is the high-water mark; the next verb minted takes 50.
-const _: () = assert!(SYS_CPUPULSE > SYS_ACCEPT);
+/// `SYS_RENAME` is the high-water mark; the next verb minted takes 51. (STOR-1 M2 took 50, which is
+/// the number this line said was next — the note is kept accurate rather than kept.)
+const _: () = assert!(SYS_RENAME > SYS_CPUPULSE && SYS_CPUPULSE > SYS_ACCEPT);
 /// The packed event must never collide with a negative return: type 5 shifted left 48 leaves bit 63
 /// clear with room to spare.
 const _: () = assert!(input_ev_pack(INPUT_EV_BUTTON, 0xFFFF_FFFF) < (1u64 << 63));
