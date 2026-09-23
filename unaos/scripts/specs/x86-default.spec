@@ -167,3 +167,80 @@ FORBID :: BUSX86-STAMP: .* :: FAIL
 # this is the line that convicts a future fixture that stops doing so. MEASURED as a real red on this
 # bench: the M3 build that skipped an unlink on -EMFILE printed it (`op=2 name=7 16 bytes`).
 FORBID :: U10: OP QUEUE FULL
+#
+# ── TSTETAP (2026-09-22), TAIL-APPENDED past VECTORS ──────────────────────────────────────────────
+# `absorbed=` ON THE `tste` TAP, because until this line NOTHING ON ANY LANE GATED IT — and it is the
+# count of boot verdicts the kernel actually recorded. `selftest::capture` is the ONLY record `tste`
+# can replay a boot fixture from (it cannot re-run them), so a scanner that stops recognising the
+# `-> PASS` marker does not make any fixture fail: it makes every fixture DISAPPEAR from `tste`'s
+# `[boot-time]` section, as if it had never executed. That is the exact defect SERWIT-2W was written
+# to end, and it had no gate.
+#
+# MEASURED, NOT REASONED — and the go-red is the whole reason this rule exists in this form. Change
+# `N_PASS` in `crates/kernel/src/selftest.rs` from `b"-> PASS"` to `b"-> PASSED"` — one mis-spelt
+# marker, nothing else — and the wc lane reads
+#     :: SERWIT-2 tap tste: submitted=579 absorbed=0 staged=0 dropped=0 suppressed=579 …
+# against the green tree's
+#     :: SERWIT-2 tap tste: submitted=579 absorbed=21 staged=0 dropped=0 suppressed=558 …
+# — every verdict lost. AND THE VERB STILL EXITED 0. `./arroyo test` was green, the spec replay was
+# green, the boot was green; 21 recorded verdicts had become 0 and no gate on this bench said a word.
+# That silence is what this line ends.
+#
+# WHAT IS PINNED AND WHY EACH ONE.
+#   * `absorbed=[1-9]\d*` — the assertion. Not a threshold: the boot fixture population moves with
+#     every knob, so any number above zero is the honest floor, and zero is the failure.
+#   * `dropped=0` — SERWIT-2's own claim, that this ring has NO loss path left but the ring genuinely
+#     filling (which is counted separately and reported by `run()`). A non-zero here is a regression
+#     to the `try_lock`-and-discard shape SERWIT-2 deleted.
+#   * `inflight=0` — every exit from `capture` charges exactly once, so nothing may be left in
+#     flight when the tally prints. `submitted=[1-9]\d*` keeps a tap that never ran from acquitting.
+#   * `staged=`, `suppressed=`, `torn=`, `in_progress=` are `\d+`: they move with the traffic.
+#
+# Measured green on NINE independent captures — this branch's `sertaps-logs/R1-serial.log` (the
+# fe385712 baseline) and `R2-serial.log` (after the arc), and all seven DOCKID2 captures under
+# `docs/dev/evidence/rmbp-0922/dockid2/` — and red on exactly one, `R3-serial.log`, the mutation
+# above. No FORBID partner, for B160's reason as cited by the VECTORS block.
+REQUIRE :: SERWIT-2 tap tste: submitted=[1-9]\d* absorbed=[1-9]\d* staged=\d+ dropped=0 suppressed=\d+ torn=\d+ inflight=0 in_progress=\d+ ::
+#
+# ── SERTXPIN (2026-09-22), TAIL-APPENDED past TSTETAP, as TSTETAP was past VECTORS ────────────────
+# `[sertx]` — SERIALTX's transmit-cost census (rmbp-ledger B154) with TAPSMAX's per-tap decomposition
+# folded into it (B161) — WAS PINNED IN NO SPEC AT ALL. B161 says so in as many words, and the gap is
+# the expensive kind: this is the ONE line on the wire that says what a print costs and which of the
+# four post-mask taps is paying. Every arc that has ever chased a dark window read it. Nothing on any
+# lane asserted it was still being printed, or still had its fields.
+#
+# WHY HERE AND NOT IN x86-test.spec: the head of this file. `[sertx]` is UNCONDITIONAL and x86-only
+# (serial_ring.rs:1780 — the images that produce dark windows are built witness-FREE, so gating the
+# census on `witness` would have deleted it from exactly the boots that need it), so it is present on
+# every x86 leg — but x86-test.spec answers "did ANY leg finish?" for all of them, and a pin put
+# there is a pin on the arm legs' completion check too. It goes in the per-leg files: here, and in
+# x86-wc.spec in the same commit.
+#
+# WHAT THE SHAPE ASSERTS, FIELD BY FIELD, and why almost all of them are open.
+#   * `tap_max=fbcon:…,ftdi:…,tste:…,rec:…` and the `tap_sum=` twin are pinned as a FOUR-NAME ORDERED
+#     TABLE, character for character in the names and the commas, for the reason the VECTORS rule
+#     above gives: a reader lines `tap_max=` up against the four `:: SERWIT-2 tap …:` lines WITHOUT A
+#     LOOKUP, and that only works while the order is `taps()`' order. A tap added, dropped or
+#     reordered silently turns every recorded `tap_max=` into a different measurement wearing the old
+#     shape. The NUMBERS are `\d+` — they are a cost on a shared bench and they move with the load.
+#   * `masked_b=0` is the one VALUE pinned, and it is the census stating SERIALTX's own claim: a span
+#     in which not one of `bytes=` went out behind the mask. It is asserted on a QUIET span, which is
+#     what presence semantics buy — measured 14 of 17 `[sertx]` lines on the capture below, and 4 of
+#     7 on the leanest of the seven DOCKID2 captures — and pre-SERIALTX no span with `prints>0` could
+#     have reached 0 at all, because every print wrote its own line synchronously under the mask.
+#   * everything else is `\d+`, deliberately. `prints=`, the three `_us` terms and the two `_cy`
+#     terms are wall costs; pinning any of them would red this lane on a busy bench, which is a
+#     finding about the bench and not about the kernel.
+#
+# NO FORBID PARTNER — B160's rule, cited by the VECTORS block above for the same reason: a FORBID
+# that can no longer match reads ✅ with 0 hits. The failure mode here is the line GOING SILENT or
+# LOSING A FIELD, which a REQUIRE on the whole shape convicts and no negation can state.
+#
+# GO-RED, MEASURED ON TWO REAL CAPTURES RATHER THAN REASONED, and they fail on DIFFERENT halves:
+#   * `logs/foldgate/g9-test-x86-default.log` (cd642fd8, pre-SERIALTX) carries ZERO `[sertx]` lines —
+#     the census did not exist. 0 hits, MISSING.
+#   * `docs/dev/evidence/rmbp-0922/dockid2/r3-wc-serial.log` (pre-TAPSMAX) carries 22 `[sertx]` lines,
+#     20 of them `masked_b=0`, and STILL 0 hits: its census stops at `taps_us_max=` and has no
+#     `tap_max=`/`tap_sum=` at all. That second red is the one that matters, because it is the shape
+#     regression this rule exists to catch rather than the absence any reader would have noticed.
+REQUIRE \[sertx\] prints=\d+ masked_us_max=\d+ masked_us_mean=\d+ drain_us=\d+ emit_us=\d+ spin_us=\d+ bytes=\d+ masked_b=0 fifo_b=\d+ taps_us=\d+ taps_us_max=\d+ tap_max=fbcon:\d+,ftdi:\d+,tste:\d+,rec:\d+ tap_sum=fbcon:\d+,ftdi:\d+,tste:\d+,rec:\d+ sink=(uart|ftdi|both|none) hz=\d+ masked_cy_max=\d+ masked_cy_sum=\d+

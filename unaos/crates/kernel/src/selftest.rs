@@ -202,12 +202,12 @@ impl VerdictScan {
 
 impl fmt::Write for VerdictScan {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for &b in s.as_bytes() {
-            if self.head_len < HEAD_MAX {
-                self.head[self.head_len] = b;
-                self.head_len += 1;
-            }
+        let chunk = s.as_bytes(); // TSTETAP (B174) — the head is copied in ONE `copy_from_slice` instead of a bounds-check-and-store per byte, and the needle loop below is entered only by the bytes that could possibly advance a needle. Same bytes, same `total`, same `hit` offsets; see `tste_precheck_declines` at the file tail for the measurement and for why the cheaper pre-check — a bounded scan of the format string's LITERAL PIECES — cannot be written at all on this toolchain. ⚠ LINE-NEUTRAL rewrite — 18 body lines before, 18 after.
+        if self.head_len < HEAD_MAX { let n = (HEAD_MAX - self.head_len).min(chunk.len()); // The head is [`HEAD_MAX`] bytes and the label is clipped to `NAME_MAX` regardless, so this is the same head the per-byte store built — it is built with one bulk copy instead of `chunk.len()` bounds-checked stores. ⚠ SAME-LINE fold.
+            self.head[self.head_len..self.head_len + n].copy_from_slice(&chunk[..n]); self.head_len += n; }
+        for &b in chunk {
             self.total += 1;
+            if b != N_PASS[0] && b != N_FAIL[0] && b != N_TSTE[0] && (self.m_pass | self.m_fail | self.m_tste) == 0 { continue; } // THE GATE, and it is an IDENTITY rather than an approximation: with every needle state at 0, [`needle_step`] handed a byte that is not that needle's FIRST character stores `usize::from(false)` — 0, the state it already held — and returns false. So skipping it changes nothing that any later byte can read. All three first characters are named here and none is assumed equal to another, so a marker re-spelt in the constants above cannot silently outrun this gate. ⚠ SAME-LINE fold.
             if needle_step(&mut self.m_tste, N_TSTE, b) {
                 self.saw_tste = true;
             }
@@ -230,7 +230,7 @@ impl fmt::Write for VerdictScan {
 pub fn capture(args: fmt::Arguments) {
     let tap = &crate::serial_ring::TAP_TSTE;
     tap.submit();
-    let mut sc = VerdictScan::new();
+    if let Some(s) = args.as_str() { if tste_precheck_declines(s) { tap.suppress(); return; } } let mut sc = VerdictScan::new(); // TSTETAP (B174) — THE PRE-CHECK, in the one shape `core::fmt::Arguments` admits. A literal-only line (no placeholder at all) is handed back as a `&'static str`, so it is decided with one pass over bytes that ALREADY EXIST: no `VerdictScan` frame, no `Formatter`, no template walk. It reads the SAME `N_PASS`/`N_FAIL` the scanner does — see [`tste_precheck_declines`] at the file tail — so the two cannot drift, and `tap.suppress()` keeps the ledger identity `submitted == absorbed + dropped + suppressed` exact on this exit as on the two below. ⚠ SAME-LINE fold.
     let _ = fmt::write(&mut sc, args);
 
     let Some((idx, pass)) = sc.hit else {
@@ -1145,4 +1145,75 @@ pub(crate) fn test_font_aa() -> Outcome {
     }
 
     Outcome::Pass
+}
+
+// ── TSTETAP (rmbp-ledger B174) — THE POST-MASK TAP THAT FORMATS EVERY LINE AND KEEPS 3.5 % OF THEM ──
+//
+// WHAT WAS MEASURED, AND BY WHOM. TAPSMAX (B161) gave `[sertx]` a per-tap census and it named this
+// tap the largest of the four on QEMU: `tap_max=fbcon:69,ftdi:214,tste:833,rec:159` (us) with
+// `tap_sum=fbcon:356,ftdi:2615,tste:6143,rec:2568`, on a tap whose own SERWIT-2 line reads
+// `absorbed=20 suppressed=556`. Read the four together and the shape is plain: `fbcon` is the FLOOR
+// (it declines at the door, so its 356 us over 576 submits is submit-and-charge overhead and nothing
+// else), `ftdi` and `rec` each walk the line ONCE and cost ~2.6 ms, and `tste` walks the same line
+// once and costs 6.1 ms — 2.4x its two peers for the same walk. The excess is not the walk. It is
+// what [`VerdictScan`] used to do to every BYTE of it: a bounds-checked store into the head buffer,
+// then three needle state machines, ~97 % of them on bytes that could not start any of the three.
+//
+// THE PRE-CHECK THAT CANNOT BE WRITTEN, stated here so nobody spends the day rediscovering it. The
+// obvious fix is to reject the 96 % WITHOUT formatting: the verdict markers are `-> PASS` and
+// `-> FAIL` (this file's own `N_PASS`/`N_FAIL`; the `:: PASS ::` and `== witness ::` spellings a
+// reader may have in mind belong to spec REQUIREs, not to this scanner), and by the tree's
+// convention they sit in a LITERAL piece at the very end of the format string — never in an
+// argument. So a bounded scan of the format string's literal pieces would decide every line for the
+// cost of a handful of byte compares and zero `Display` dispatch. IT IS NOT REACHABLE. On this
+// toolchain `core::fmt::Arguments` is `{ template: NonNull<u8>, args: NonNull<rt::Argument> }` with
+// BOTH fields private to `core`; the byte-coded template that `estimated_capacity()` walks is not
+// exposed by any accessor, stable or unstable. The whole public surface is `as_str()` (stable) and
+// `as_statically_known_str()` (unstable `fmt_internals`) — and BOTH return `Some` only for a line
+// with no placeholders at all, which is precisely the case that was already cheap. Reading the
+// pieces would mean transmuting a `#[repr(Rust)]` struct whose layout `core` does not promise, in a
+// kernel, on the print path. That is a ruling, not an executor's call, and it is not taken here.
+//
+// SO WHAT LANDED IS THE TWO THINGS THAT ARE REACHABLE:
+//   * this function — the literal-only fast path, which skips the `VerdictScan` frame and the
+//     template walk outright for the blank lines, the `|` rules and every other placeholder-free
+//     line. Small, free, and exactly as much as `as_str()` can honestly buy.
+//   * the gate in [`VerdictScan::write_str`] — a bulk head copy and a three-character test that
+//     lets ~97 % of bytes past for one increment and three compares.
+//
+// AND NEITHER OF THEM MOVED THE COST. THE MEASUREMENT IS WRITTEN DOWN HERE BECAUSE IT IS THE
+// FINDING, not because it is a disappointment. `tste`'s expense has to be read as a RATIO against
+// the two taps that walk the same line — the absolute microseconds are wall on a bench shared with
+// sibling executors and swing by a factor of four between runs of the SAME tree. Boot rollup,
+// `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_QEMU_FULL=1 ./arroyo test 240`:
+//
+//     tap_sum            ftdi    tste    rec     tste/ftdi   tste/rec
+//     TAPSMAX (B161)     2615    6143    2568       2.35       2.39      before, quiet box
+//     SERTAPS after      3126    7123    2964       2.28       2.40      this arc
+//
+// Every tap is ~18 % up together — that is the box, not the code — and `tste`'s ratio against both
+// of its peers is where it was. So the per-byte scan loop was NOT where `tste`'s 2.4x over `ftdi`
+// lives, and the next reader should stop looking for it there. What remains unexplained, and is the
+// next place to look, is what `capture` does that `ftdi::mirror` and `flight_recorder::capture` do
+// not: it builds a 200-byte zeroed `VerdictScan` frame per line, and it is the THIRD of the four
+// taps `_print` calls, so it is the one holding the line while the other three have had their turn.
+//
+// THE GO-RED IS `absorbed=`, NOT A TIMING. A pre-check that rejects a REAL verdict does not show up
+// as a slow tap; it shows up as a verdict that was never recorded, which is the defect SERWIT-2W
+// (above) was written to end. So the marker constants are read from ONE place by both the fast path
+// and the scanner, and the recorded red is a deliberate mis-spelling of that one place — see the
+// B174 row for the capture. `:: SERWIT-2 tap tste: … absorbed= …` is the sentinel: it must not move.
+/// TSTETAP — true when a LITERAL-ONLY line carries no verdict marker and the tap may decline it
+/// without building a scanner. Never called for a line with arguments: [`capture`] reaches it only
+/// through `Arguments::as_str()`, which is `None` the moment a placeholder exists.
+#[inline]
+fn tste_precheck_declines(s: &str) -> bool {
+    let b = s.as_bytes();
+    !(has_needle(b, N_PASS) || has_needle(b, N_FAIL))
+}
+
+/// Substring test over bytes, `core`-only and alloc-free. The line is already materialised, so this
+/// is one pass over it with no `Display` dispatch and no state machine to carry across chunks.
+fn has_needle(hay: &[u8], needle: &[u8]) -> bool {
+    hay.len() >= needle.len() && hay.windows(needle.len()).any(|w| w == needle)
 }

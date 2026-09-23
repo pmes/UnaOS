@@ -1877,3 +1877,149 @@ reported from the inside, and `masked_us_max` against the pre-arc build is the b
 EHCIDARK's prediction for `pass_period_us_max=` — that it falls toward the tick once the console stops
 masking — is testable on x86 QEMU and, on the rMBP, is testable only once `taps_us_max` has named
 which sink was actually holding the core.
+
+## SERTAPS — the post-mask taps, three answers: one impossible, one landed, one out of reach
+
+TAPSMAX left the census able to name a suspect and immediately named one: `tste`, at
+`tap_max=fbcon:69,ftdi:214,tste:833,rec:159` and `tap_sum=fbcon:356,ftdi:2615,tste:6143,rec:2568`
+on a wc-lane boot rollup, against its own tap line reading `absorbed=20 suppressed=556`.
+`selftest::capture` formats **every** line through `VerdictScan` to discover whether it is a
+verdict, and discards 96.5 % of them. This section is what came of going after that, and two of
+its three parts are negative results — which is why they are written down at all.
+
+### The pre-check that cannot be written
+
+Read the four taps together and the shape is plain. `fbcon` is the **floor**: on QEMU it declines
+at the door (the section above says why), so its 356 µs over 576 submits is submit-and-charge
+overhead and nothing else. `ftdi` and `flightrec` each walk the line once and cost ~2.6 ms. `tste`
+walks the same line once and costs 6.1 ms. The 2.4× is the question.
+
+The obvious answer is to reject the 96 % **without formatting**. The verdict markers are `-> PASS`
+and `-> FAIL` — `selftest.rs`'s own `N_PASS`/`N_FAIL`, and the only two; the `:: PASS ::` and
+`== witness ::` spellings a reader may have in mind are spec REQUIRE grammar, not this scanner's —
+and by the tree's convention they sit in a **literal piece at the very end of the format string**,
+never inside an argument. So a bounded scan of the format string's pieces would decide every line
+for a handful of byte compares with no `Display` dispatch at all.
+
+**It is not reachable.** On this toolchain `core::fmt::Arguments` is
+`{ template: NonNull<u8>, args: NonNull<rt::Argument> }` with both fields private to `core`. The
+byte-coded template that `estimated_capacity()` walks is exposed by no accessor, stable or
+unstable. The whole public surface is `as_str()` (stable) and `as_statically_known_str()`
+(unstable, `fmt_internals`) — and **both answer `Some` only for a line with no placeholders at
+all**, which is precisely the case that was already cheap. Reading the pieces would mean
+transmuting a `#[repr(Rust)]` struct whose layout `core` does not promise, in a kernel, on the
+print path. That is a ruling, not an executor's call, and it was not taken.
+
+### TSTETAP — what landed, and the measurement that says it did not pay
+
+Two things are reachable and both are in: the literal-only fast path through `as_str()`
+(`tste_precheck_declines`, `selftest.rs` file tail), which skips the `VerdictScan` frame and the
+template walk outright for the blank lines, the `|` rules and every other placeholder-free line;
+and a gate in `VerdictScan::write_str` — one bulk head copy instead of a bounds-checked store per
+byte, and a three-character test that lets ~97 % of bytes past for one increment and three
+compares. The gate is an **identity**, not an approximation: with every needle state at 0,
+`needle_step` handed a byte that is not that needle's first character re-stores the 0 it already
+held and returns false, so skipping it changes nothing any later byte can read. All three first
+characters are named in the test and none is assumed equal to another.
+
+Neither moved the cost, and the *way* to read that is the point. Absolute microseconds on this
+bench swing by a factor of four between runs of the **same tree** — the rMBP bench runs sibling
+executors, and the SERTAPS baseline run at fe385712 came back with
+`tap_max=…tste:3833… tap_sum=…tste:28196` under load average 19–26, against TAPSMAX's `tste:833 /
+tste:6143` for the same tree on a quiet box. So `tste` has to be read as a **ratio** against the
+two taps that walk the same line:
+
+| boot rollup | `ftdi` | `tste` | `rec` | tste/ftdi | tste/rec |
+|---|---|---|---|---|---|
+| TAPSMAX (B161), before | 2615 | 6143 | 2568 | 2.35 | 2.39 |
+| SERTAPS R2, after | 3126 | 7123 | 2964 | 2.28 | 2.40 |
+
+Every tap is ~18 % up together — that is the box — and `tste`'s ratio against both of its peers is
+where it was. **The per-byte scan loop is not where `tste`'s 2.4× over `ftdi` lives.** What is left,
+and is the next place to look, is what `capture` does that `ftdi::mirror` and
+`flight_recorder::capture` do not: it builds a 200-byte zeroed `VerdictScan` frame per line, and it
+is the **third** of the four taps `_print` calls, so it holds the line after the other three have
+had their turn at the same cache lines.
+
+### `absorbed=` was gated by nothing, and the go-red proved it
+
+A pre-check that rejects a real verdict does not show up as a slow tap. It shows up as a fixture
+that never ran: `BOOT_RING` is the only record `tste` can replay a boot fixture from, so a scanner
+that stops recognising the marker makes every boot fixture **disappear** from the `[boot-time]`
+section rather than fail. That is the defect SERWIT-2W was written to end.
+
+The recorded red mis-spells the marker in the one place both the fast path and the scanner read it
+from — `N_PASS = b"-> PASSED"`, nothing else — and the wc lane reads
+
+```
+:: SERWIT-2 tap tste: submitted=579 absorbed=0  staged=0 dropped=0 suppressed=579 …   (R3, go-red)
+:: SERWIT-2 tap tste: submitted=579 absorbed=21 staged=0 dropped=0 suppressed=558 …   (R2, green)
+```
+
+— every verdict lost. **And the verb exited 0.** `./arroyo test` green, spec replay green, boot
+green; 21 recorded verdicts had become 0 and nothing on this bench said a word. `absorbed=` on the
+`tste` tap was pinned in no spec. It is now, in `x86-default.spec` and `x86-wc.spec`:
+`absorbed=[1-9]\d*` beside `dropped=0` (SERWIT-2's no-loss-path claim) and `inflight=0` (one charge
+per exit). Green on nine independent captures, red on exactly R3, which it turns into rc=1.
+
+### SERTXPIN — `[sertx]` itself was pinned in no spec
+
+B161 recorded the gap; this closes it. The census is unconditional and x86-only, so it is present
+on every x86 leg — but a pin in `x86-test.spec` is a pin on the arm legs' completion check too
+(that file's own header says so), so it goes in the per-leg files. `tap_max=` and `tap_sum=` are
+pinned as a **four-name ordered table**, character for character in the names and the commas, for
+VECTORS' reason: a reader lines `tap_max=` up against the four `:: SERWIT-2 tap …:` lines with no
+lookup, and that only holds while the order is `taps()`' order. Every number is `\d+` — they are
+wall on a shared bench.
+
+`masked_b=0` is the one value pinned, and one clarification belongs here because the field invites
+the opposite reading: **`masked_b` on the rollup is non-zero on the busy spans by design** (R1 read
+4469 / 13495 / 10972 on its first three), because it is the capped drain, exactly as the doc table
+in `serial_ring.rs` states. The invariant "a `_print` emits zero bytes behind the mask" is asserted
+by the `:: SERIALTX: … masked_b=0 … -> PASS ::` fixture line. What the census pin buys is that
+*some* span reached zero — which pre-SERIALTX no span with `prints>0` could do at all, because
+every print wrote its own line synchronously under the mask.
+
+Two recorded go-reds, failing on different halves: `logs/foldgate/g9-test-x86-default.log`
+(cd642fd8, pre-SERIALTX) carries **zero** `[sertx]` lines; and
+`docs/dev/evidence/rmbp-0922/dockid2/r3-wc-serial.log` (pre-TAPSMAX) carries 22 of them, 20 with
+`masked_b=0`, and still misses — its census stops at `taps_us_max=` and has no `tap_max=`/`tap_sum=`
+at all. The second is the one that matters: it is the shape regression the rule exists to catch,
+not the absence any reader would have noticed.
+
+### TAGSNIFF — NOT DONE, and the reason is a file boundary, not a difficulty
+
+PANEL-QUIET's sniff is real and the defect is real, but both live in `video/fbcon.rs`, which the
+SERTAPS brief names as out of scope in the same breath as asking for the fix. Nothing was touched.
+What a seat needs in order to authorise it, measured:
+
+`TagSniff::muted()` opens with `if head.first() != Some(&b'[') { return false; }`. On flight 11 the
+compositor's spin telemetry is on the wire as `:: [wcser] PRESENT-BANDED SPIN site=2 waited_us=500
+on=shadow7 -> GAVE-UP ::` — **`:: ` first, the tag second** — so that one byte compare declines it
+before `PANEL_MUTE_TAGS` is ever consulted, and no entry on that list could ever mute it. The
+population: **3 697 of flight 11's 18 290 lines, 20.2 % of the whole capture**, in two bursts, at
+554–562 s (115 / 226 / 208 / 215 / 223 / 214 / 172 / 231 / 128 lines per second) and again at
+729–738 s (up to 192/s), spanning 554 494 ms to 843 989 ms. 3 856 lines of that capture begin
+`:: [` on the wire and the sniff can reach none of them.
+
+**The fix is two changes, not one**, and this is the part the brief's wording does not carry:
+skipping a leading `:: ` in the sniff is necessary but not sufficient, because `[wcser]` is not on
+`PANEL_MUTE_TAGS` either. Both edits are in `fbcon.rs`. The list's own doc comment gives the test a
+new entry has to pass — no on-glass reader, and re-entrancy through the console present — and
+`[wcser]` passes both on its face (it is per-spin telemetry emitted from inside the present it is
+reporting on, which is the `[wc-g]`/`[wc-h]`/`[wc-d]` family's exact shape), but that call is the
+video seat's to make and it is not made here.
+
+One hazard for whoever does it, found while measuring: the `:: [` shape is **not** always a tag.
+The same capture carries `:: [   26824 ms] portsw:flip ::` and three siblings, where the bracket
+holds a timestamp. A `:: ` skip is safe only because the test that follows is a positive match
+against a fixed list; a sniff that tried to *parse* a tag out of the brackets would mis-read those.
+
+Flight 12 should read, if the two edits land: the `:: [wcser] PRESENT-BANDED SPIN` lines still on
+the wire byte for byte (PANEL-QUIET governs the glass only — the FTDI ring, `UNAOS.LOG` and the
+`tste` tap all tap upstream in `arch::serial::_print`), and the `fbcon` tap's SERWIT-2 line moving
+by that population: `suppressed=` up by the `:: [wcser]` count in the span and `absorbed=` down by
+the same number, with `submitted=`, `dropped=` and `torn=` unmoved. Nothing else may move. On QEMU
+the whole thing is unobservable — `PANEL_CONSOLE` never arms there (see TAPSMAX above), so the
+sniff is never reached and every line takes the earlier `suppress()`; the fixture has to be a
+synthetic one driving `muted()` directly, and the flight is the only place the population is real.
