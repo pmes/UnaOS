@@ -1420,7 +1420,7 @@ install_target = ["sdmmc_arm"]
 # the knob mapping. Witness family: `[sdmmc] write` (subsystem-named). UNFLOWN — no Orin has booted it.
 sdmmcwrite = ["sdmmc"]
 
-# SDWRITE (A60, 2026-09-12): LIFT THE TegraSd WRITE VETO — the block layer admits an ORDINARY file
+# SDWRITE (A60, 2026-09-12): LIFT THE SdMmc WRITE VETO — the block layer admits an ORDINARY file
 # mutation to the Orin microSD, so a slot-booted Orin can have a writable `/` (R51 "home folder",
 # LOGIN M2). DEFAULT ON — `unaos/arroyo` composes it into every build and `UNAOS_NOSDWRITE=1` takes it
 # back out — because the shipped configuration is the one that has to be right, and a writable root
@@ -1428,7 +1428,7 @@ sdmmcwrite = ["sdmmc"]
 # `write_block_tegra_sd` / `write_blocks_tegra_sd` route to the driver's UNARMED CMD24 primitive
 # (`sdmmc_tegra::tegra_sd_write_block_512`, the twin of `read_block_ro`, appended at the end of
 # `mod metal`) instead of refusing; `register_tegra_sd`'s publish line says `read-write`;
-# `fs/fat.rs`'s `BlockSource::TegraSd` veto forwards `block::tegra_sd_writes_admitted()` instead of a
+# `fs/fat.rs`'s `BlockSource::SdMmc` veto forwards `block::tegra_sd_writes_admitted()` instead of a
 # flat refusal; `fs/vfs.rs`'s `NativeBackend::write_veto` FORWARDS `block::native_mount_write_veto()`
 # instead of asserting `None`; and `fs/bootdisk.rs`'s native root samples the BACKEND it mounts for
 # `rw=`. It does NOT touch the armed `sdmmc_arm` ladder, the `install_target` flow, the Pi's FRGUARD

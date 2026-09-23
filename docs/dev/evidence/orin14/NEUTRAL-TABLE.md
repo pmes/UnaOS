@@ -433,3 +433,87 @@ Checked before renaming, at this base. None is a foreign emitter, so no target w
 
 Unchanged by this milestone: `TegraSd` 51 sites, `tegra_shell_*` 39, `tegra_el0` 19, `tegra_sd_info`
 15 — the §3a population, plus the drift the M1 addendum recorded above.
+
+## Addendum (NEUTRAL M3, 2026-09-23) — the identifiers B160 counted are RENAMED, and one of the three was a knob
+
+Base `98fd8e66` (branch `exec-rmbp-neutral3`; the branch tip is the sha — the seat fills it at the
+fold). Census re-derived at that base before any edit (`census-at-98fd8e66.txt`): identical to
+`census-AFTER-m2.txt` in every token row — SDHCRW (B166) moved `TegraSd` lines inside `drivers/block.rs`
+but not its count, which is still **51** live shared sites (80 raw). The substitution table IS the script —
+`m3-rename.py`, one file with `--apply`, `--prove`, `--count`, `--preflight` and the go-red's `--half`.
+
+### M3 — DONE (the three counted rows of B160's status cell)
+
+The naming rule is this table's own (§3a): strip the board prefix; where the stripped name is already bound,
+qualify it by the subsystem the code already uses (§3a's `orin_render_service` -> `render_pass_service`).
+
+| old | new | kernel occurrences (raw / live) | files | why this name |
+|---|---|---:|---|---|
+| `TegraSd` (`BlockHandle::` + `BlockSource::` variants) | `SdMmc` | 80 / 51 | `drivers/block.rs` 17, `fs/fat.rs` 19, `fs/unafs.rs` 20, `main.rs` 7, `fs/bootdisk.rs` 6, `install/mod.rs` 3, `fs/vfs.rs` 2, `install/partition.rs` 2, `shell.rs` 2, `wifi/firmware.rs` 2 | §3a's proposal ("sibling of the existing x86 `Sdhc`"); what the handle IS — the card behind the SoC's SD/MMC host (`sdmmc` feature, and M2's `:: SDMMC:` family). 0 prior hits outside §3a |
+| `TegraShellWin` | `ShellWin` | 15 / 13 | `main.rs` | stripped name, free |
+| `tegra_shell_window_open` / `_mark` / `_id` / `_pal` / `_present` / `_pick` | `shellwin_window_open` / `_mark` / `_id` / `_pal` / `_present` / `_pick` | 37 / 26 (+2 comments in `video/dock.rs`) | `main.rs`, `video/dock.rs` | stripping gives `shell_*`, and `shell_id` (51 hits — `let shell_id = tegra_shell_id(&shellwin)` at the call site itself) and `shell_pal` (20, the x86/Pi pump's `TargetPal`) are TAKEN. The qualifier is the family's own: its unrenamed siblings are `shellwin_row`, `_absent`, `_launch_owed`, `_note_mint`, `_quit_note`, `_scene_live`, `_service_rearm`, `SHELLWIN_ROW` |
+| `TEGRA_SHELL_PRESENTED` | `SHELLWIN_PRESENTED` | 2 / 2 | `main.rs` | same family (the M1 addendum's "≈41"), sibling `SHELLWIN_ROW` |
+
+136 kernel occurrences + 27 in pins = **163 occurrences, 141 changed lines over 22 files, insertions ==
+deletions, every line reproduced exactly by applying the table to the old line** (`m3-substitution-proof.txt`).
+Census after (`census-AFTER-m3.txt`): IDENT 48/152 -> 42/126, UPPER 31/72 -> 30/70, CAMEL 6/83 -> 4/19 —
+92 live shared sites to 0, and nothing else moved. Pins moved with the identifiers: `unaos/arroyo` ×4
+(comments), `Cargo.toml` ×2 (comments), `k8-reach.registry` ×1 (evidence prose), `banner-cert.sh` ×1,
+`jetson-sync1.spec` ×3, and six subsystem docs (`arch_arm64.md` 4, `dock.md` 3, `sdhc.md` 2, `layout.md` 3,
+`partitions.md` 2, `vfs.md` 2). The substitution is WORD-BOUNDED (identifiers, not strings), and the
+retired `tegra_shell_note` / `_live_id` / `_remint` / `TEGRA_SHELL_BASE/…` in the APPPIN history notes
+(`main.rs:9567-9579`, `dock.md:225-226`) are NOT in the table: they name deleted functions, and history
+keeps the names it had.
+
+### THE SECOND SPELLING IS THE IDENTIFIER ON THE WIRE
+
+M1's was regex-escaping; M2's the dropped `:: ` prefix. M3's: `TegraSd` is spelled inside FOUR `:: UNAFS:`
+witness MESSAGES in `main.rs` (`probe SKIPPED — no TegraSd block backend`, `MOUNTED read-only on TegraSd`,
+`partition scan on TegraSd FAILED`, `mount on TegraSd FAILED`), and three live gates pin that text:
+`banner-cert.sh:312` (the `sdmmc` artifact row — left behind, a hard red on every sdmmc-armed media
+build), `jetson-sync1.spec:593` (PENDING) and `:619` (FORBID — left behind, a rule that can never match
+and reads green, M2's own finding). All three are in `m3-rename.py`'s EXPECT table with their counts and
+move in the same pass; the wire now reads `… MOUNTED read-only on SdMmc …`. Nothing in `pi4-regression.spec`,
+`x86-default.spec` or `test-arm`'s capture carries any of the nine tokens, because the variant exists only
+under `aarch64 + tegra + sdmmc` and the shell family only under `tegra`: no QEMU leg can witness the wire
+half, and the jetson spec is scored only on metal.
+
+### GO-RED (`m3-gored.txt`)
+
+`--half fs/bootdisk.rs TegraSd` (the table applied everywhere except `bootdisk.rs`): the `arm-tegra-render`
+leg is **rc=101, `error[E0599]: no variant, associated function, or constant named TegraSd found for enum
+BlockSource` at `fs/bootdisk.rs:672:31`**; the SAME half tree on the x86 default feature set is rc=0 — the
+x86 leg is blind to this rename, and only the tegra+sdmmc legs falsify it. Reverted, re-applied whole.
+**A FIRST go-red did not fire, and it is a finding:** `--half wifi/firmware.rs TegraSd` is rc=0 on the tegra
+leg, because `wifi/firmware.rs:772-773`'s `TegraSd` arm is `aarch64 + tegra + sdmmc`-gated inside a module
+`lib.rs:65` gates `wifi + x86_64`. No configuration compiles that arm — it is dead in every build, so a
+half-rename there passes every compile gate; only `--prove` covers it.
+
+### NOT MOVED — and why
+
+| token | count at `98fd8e66` | why |
+|---|---:|---|
+| `tegra_el0` (B160's "19") | 19 live shared | **Not an identifier.** All 19 are the FEATURE NAME — `#[cfg(feature = "tegra_el0")]` sites and prose naming that feature (`video/quarry/live.rs` 9, `main.rs` 4, `video/dock.rs` 4, `shell.rs` 2). A feature name is a knob (§4; M2: "a rename batch keeps knobs"; LAWS §4), and renaming it is a five-place knob change, not a token substitution. B160's cell counted it with the identifiers because the census's IDENT pattern cannot tell a cfg string from a symbol. |
+| `tegra_el0_start_maybe` 3, `"tegra-el0-verdict"` 1, `tegra_el0_verdict` 1 (arch-homed) | 5 | the emitters of `:: TEGRA-EL0:` — Peter's open question (rename-all-four vs machine-tag-by-design, B160 (2)); they move with his answer |
+| `:: tegra:` | 42 raw / 36 live, `main.rs` | excluded — Peter's seam question (B160 (1)); `tegra_early_stop` is its terminus |
+| `:: TEGRA-EL0:` | 2 `main.rs` + 2 `arch/aarch64/syscall.rs` | excluded — Peter's question (B160 (2)) |
+| `:: PIUSB:` | 3, `arch/aarch64/piusb.rs` | excluded — Peter's question; board-named file |
+| `TegraSd` ×1 | `arch/aarch64/sdmmc_tegra.rs:1866` (comment) | arch home AND a board-named file; the comment now names `handle_write(TegraSd)`, an arm spelled `SdMmc` — owed with the arch lane, the M1 `[orinrender]`-comment shape |
+| `TegraSd` ×3 | `unaos/docs/dev/OS/10_INSTALL/orin-unafs-root.md:122,135,147` | a file whose NAME carries the board (the brief's rule) |
+| records: `LAWS.md` `TegraSd` 3; `LEDGER.md` `tegra_shell_window_open` 2; `orin-ledger.md` `TegraSd` 16 + `tegra_shell_present` 1; `rmbp-ledger.md` `TegraSd` 10 + `TegraShellWin` 1 + `TEGRA_SHELL_PRESENTED` 1; `orin-queue.md` `TegraSd` 2; `rmbp-queue.md` `TegraSd` 4; `docs/dev/evidence/**` | 41 + evidence | records, not code: a ledger row and a rule quote the names the tree had when they were written (LAWS §3's orin 19-21 incident is spelled `locate_on(TegraSd)` because that is what shipped) |
+
+### OWED — the rest of §3a, NOT in B160's M3 cell (measured at `98fd8e66`, live shared sites)
+
+Same subsystems, different identifiers — left whole rather than half-renamed: the SD handle's siblings
+`tegra_sd_info` 15, `tegra_sd` (field) 7, `tegra_sd_writes_admitted` 4, `tegra_sd_write_through` 3,
+`tegra_sd_state` 2, `tegra_sd_write_blocks_through` 2, `TEGRA_SD_BLOCK_DEVICE` 3, `TEGRA_SD_WRITE_REFUSED` 3,
+`TEGRA_SD_PUBLISHED` 2, `TEGRA_SD_VETO` 2, `NATIVE_TEGRA_SD_VETO` 2, the `"tegra-sd"` handle-name string (a
+WIRE token, `handle=tegra-sd` / `source=tegra-sd`, with scorer pins in orin evidence) and `b"TEGRA-SD"`;
+the shell window's `tegra_boot_focus` 3 / `TEGRA_BOOT_FOCUS_DONE` 2; the §3a desk/render/stack/console rows
+(`tegra_desk_*`, `tegra_render_arm`, `orin_render_service`, `orin_desk_scene_up`, `tegra_conwin_live`,
+`tegra_cascade_stk_*`, `tegra_stk_anchor`, `ORINSTK_ANCHOR_SP`, `TEGRADESK_*`, `ORINFURN_ENTERED`,
+`ORINRENDER_ARMED`, `orin_face_arm`, `ORINFACE_*`, `tegra_darkwin_witness`, `tegra_quarry_seat`,
+`TEGRA_JD2_STACK_SIZE`, `TEGRA_DRAM_TOP`, `tegra_opened`); the pi/usb rows (`pi_ls_witness`,
+`pi_usb_ls_witness`, `PI_RAST_FRAMES`, `PIUSB24/26_LAST_LOG_MS`, `PIUSB28_ARMED`, `PIUSB36_STATIC_BUF`, the
+twelve glued `piusbNN_*` fns); and §3b's arch-homed `orin_*` symbols (renamed at their definition in
+`arch/aarch64/display_tegra.rs`, a board-named file). Full list with counts: `census-AFTER-m3.txt`.

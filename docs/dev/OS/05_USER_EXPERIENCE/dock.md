@@ -50,7 +50,7 @@ through the **same function its own boot bring-up used**:
 | console | every render body, via `console_launch_service` (arch-neutral, in `dock.rs`) | `fbcon::panel_console_window_open` | surface, row (id, gen), glyph route; the cell store (the app's document) is repainted |
 | shell (x86) | `x86_render_service`, inline at the tail of its event drain | `open_shell_window` + `Screen::direct` | store, `Screen`, `TargetPal`, `Console`, row |
 | shell (Pi) | `render_service`'s mint arm, opened by `shellwin_service_rearm` | `open_shell_window` | the same tuple, rebound by the arm |
-| shell (cascaded scene) | the console pump, on its drain line | `tegra_shell_window_open(pw, ph)` | `TegraShellWin` (store + `Screen`), its `TargetPal`, the pump's `Console` |
+| shell (cascaded scene) | the console pump, on its drain line | `shellwin_window_open(pw, ph)` | `ShellWin` (store + `Screen`), its `TargetPal`, the pump's `Console` |
 
 An instance that is already live when the post is drained (the scan-to-press race) is **raised**, never
 doubled — one live instance per pinned app. A console mint that declines for a transient reason (an
@@ -70,7 +70,7 @@ gone on its next pass and tears the instance down:
 - x86: frees the surface store, drops the `Console` (and everything typed into it), rebinds an empty
   `Screen`/`TargetPal`, publishes the slot-0 key sink as unbound. The generation recorded at the mint
   is the recycled-slot fence.
-- cascaded scene: drops the `TargetPal`, then the `TegraShellWin` (the store is freed then and there).
+- cascaded scene: drops the `TargetPal`, then the `ShellWin` (the store is freed then and there).
   A keystroke arriving while the scene is up and no shell instance is live is **dropped** — before this
   arc it painted the pump's console over the desktop (the render4 SCREEN0 defect).
 - Pi: clears the stale id and parks the mint arm shut; the old store is freed when the next launch

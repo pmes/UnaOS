@@ -309,7 +309,7 @@ tegrasmp|:: AARCH64 SMP: ORIN-SMP-3 — DTB /cpus named no cores (dtb=@|-|measur
 apsrun|:: [apsrun] cpu |-|measured(2)
 bsptick|:: [orinbsptick] arming PERIODIC CNTP at EL|tegra|measured(1)
 bsprun|:: [orinbsprun] boot core |tegra|measured(1)
-sdmmc|:: UNAFS: native unafs volume MOUNTED read-only on TegraSd|tegra|measured(1)
+sdmmc|:: UNAFS: native unafs volume MOUNTED read-only on SdMmc|tegra|measured(1)
 ga10bprobe5|[ga10bfw] window_need=|ga10bprobe5a+witness|measured(1)
 ga10bprobe5a|[ga10bprobe5a] -> REFUSED reason=|tegra|measured(13)
 baremetal|:: UnaOS bare-metal — Pi 4 microSD-slot boot, serial console (no framebuffer) ::|-|measured(1)

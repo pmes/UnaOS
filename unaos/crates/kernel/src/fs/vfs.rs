@@ -1145,7 +1145,7 @@ impl VfsBackend for FatBackend {
     ///   and every method reaches the medium through `fat::mount_source(self.source)`. Two
     ///   adapters with equal `source` therefore address the same bytes whatever their mounts
     ///   were NAMED — which is exactly the C1 aliasing: BOOTROOT binds the found boot disk at
-    ///   `/`, `/boot` and `/apps` over one source, and the retired ROOTFS bind typed one `TegraSd`
+    ///   `/`, `/boot` and `/apps` over one source, and the retired ROOTFS bind typed one `SdMmc`
     ///   `"card"` at `/` and `"fat"` at `/boot`. `BlockSource::name()` is the
     ///   spelling `SourceCensus` publishes, so no second vocabulary is invented here.
     /// * The **fingerprint** is the volume's own identity, and it is what makes this an
@@ -2496,7 +2496,7 @@ impl FatBackend {
     /// machine booted from the internal SD reader those are different devices, and FATVERB's whole
     /// argument is that a shell where `ls` and `run` disagree about which volume is the volume is
     /// not a shell. On aarch64 it binds the source `fs::bootdisk::locate` matched — the disk this
-    /// kernel's own image was found on — which is `Default` on the Pi's card and `TegraSd` or `Usb`
+    /// kernel's own image was found on — which is `Default` on the Pi's card and `SdMmc` or `Usb`
     /// on an Orin, decided by content and never by a board cfg. [`FatBackend::new`] hard-codes
     /// `Default`, so a caller that has already resolved the handle needs this constructor to say so.
     ///

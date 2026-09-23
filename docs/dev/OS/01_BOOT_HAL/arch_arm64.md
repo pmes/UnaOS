@@ -6636,7 +6636,7 @@ otherwise pass. Go-red proven by mutating the v1 shift (`c_size_mult + 2` → `+
 with `tegra-sd=present` on the `[vfs] root =` line. **The stranger card is HOMESOIL's business, not this
 driver's, and HOMESOIL does mount it** — read-only, at `/volumes/<its own label>`, with its posture sampled
 from the backend being mounted (`fs/bootdisk.rs::bind`). It is never a root candidate and never written:
-`BlockSource::TegraSd` is write-vetoed in every cfg. If the re-idle is not enough, the retry loop's verdict
+`BlockSource::SdMmc` is write-vetoed in every cfg. If the re-idle is not enough, the retry loop's verdict
 line now says how many of how many rounds went unanswered, which is the datum the next arc needs.
 
 #### ORIN-SDMMC-2 — the write path behind the paranoia ladder (`UNAOS_SDMMC_ARM`, a SEPARATE arm on top of `UNAOS_SDMMC`)
@@ -6941,7 +6941,7 @@ backend must not become a fourth door past them. That refusal was correct for wh
 did was make a writable `/` on a slot-booted Orin impossible — R51's "home folder" and LOGIN M2 both need one.
 
 **Where the veto actually lived, which is the finding ledger A60 was opened for.** `fs/fat.rs`'s
-`BlockSource::TegraSd` write-veto arm and `fs/bootdisk.rs`'s `rw=` witness both *reported* that refusal; neither
+`BlockSource::SdMmc` write-veto arm and `fs/bootdisk.rs`'s `rw=` witness both *reported* that refusal; neither
 was it. Lifting the `fat.rs` arm alone — the shape the first SDWRITE brief asked for — would have printed
 `[vfs] root mount / = native unafs volume source=tegra-sd rw=yes` over a path that could not write one byte,
 and broken `write_veto`'s own stated contract ("a `None` cannot admit a write the block layer would refuse").
@@ -6955,7 +6955,7 @@ it), and five sites, each the same answer forwarded rather than restated:
 | --- | --- | --- |
 | `block::write_block_tegra_sd` / `write_blocks_tegra_sd` | route to `tegra_sd_write_through` / `…_blocks_through` | the pre-A60 refusal, verbatim |
 | `block::register_tegra_sd` publish line | `… sectors (read-write — the block layer admits ordinary writes; SDWRITE)` | `… sectors (read-only)` |
-| `fat::BlockSource::TegraSd::write_veto` | forwards `block::tegra_sd_writes_admitted()` | `Some(TEGRA_SD_VETO)` |
+| `fat::BlockSource::SdMmc::write_veto` | forwards `block::tegra_sd_writes_admitted()` | `Some(TEGRA_SD_VETO)` |
 | `vfs::NativeBackend::write_veto` | forwards `block::native_mount_write_veto()` | `None` |
 | `bootdisk::bind_root` native arm | `native_root_mount` samples the BACKEND it mounts | samples `BlockSource::write_veto()` |
 
@@ -6978,7 +6978,7 @@ is not in `kernel8()`'s `K8_FEATS`.
 the CMD24 nor the card is reachable off metal — but the REPORT is, and the report is what A60 was about. Leg 8
 (`fs::bootdisk::sdwrite_posture_selftest`, `witness` + `sdwrite`) runs on `virt` and on x86 and asserts three
 things: the `rw=` mapping driven both ways, that the FAT-layer veto and the block-layer posture agree for
-**every** source in `fat::ALL_SOURCES`, and — on a build that has the card handle — that the `TegraSd` arm
+**every** source in `fat::ALL_SOURCES`, and — on a build that has the card handle — that the `SdMmc` arm
 matches `cfg!(feature = "sdwrite")` in both directions. Wire shape:
 
 ```

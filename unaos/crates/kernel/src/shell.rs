@@ -3886,13 +3886,13 @@ pub fn vfsroute_witness() {
         use crate::fs::fat::BlockSource;
         use crate::fs::vfs::{FatBackend, MountTable, KERNEL_PRINCIPAL};
         // EVERY source this build can name, the board-specific ones FIRST so an Orin boot measures
-        // the LITERAL C1 pair (`TegraSd` under two names) rather than a stand-in, and an x86 boot
+        // the LITERAL C1 pair (`SdMmc` under two names) rather than a stand-in, and an x86 boot
         // finds the staged card that `Default` does not name (the first cut of this leg listed only
         // `Default`/`Usb` and skipped itself on x86 with `handles=global=absent sdhc=present`).
         #[allow(unused_mut)]
         let mut cands = alloc::vec![BlockSource::Default, BlockSource::Usb];
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        cands.insert(0, BlockSource::TegraSd);
+        cands.insert(0, BlockSource::SdMmc);
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         cands.insert(0, BlockSource::Sdhc);
         let src = cands

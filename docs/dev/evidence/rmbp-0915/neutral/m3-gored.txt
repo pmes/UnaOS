@@ -1,0 +1,34 @@
+NEUTRAL M3 — GO-RED: a half-applied table must fail to compile (base 98fd8e66 + m3-rename.py --half)
+
+RED #1 THAT DID NOT FIRE (kept because it is a finding): --half unaos/crates/kernel/src/wifi/firmware.rs TegraSd
+  arm-tegra-render leg (cargo check, the leg's own feature list): rc=0 — the arm at wifi/firmware.rs:772-773 is
+  #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))] inside a module lib.rs:65 gates
+  #[cfg(all(feature = "wifi", target_arch = "x86_64"))]. No configuration compiles it, so no compile gate can see a
+  half-rename there; only m3-rename.py --prove (the substitution proof) covers that line.
+
+RED #2: --half unaos/crates/kernel/src/fs/bootdisk.rs TegraSd  (157 occurrences over 22 files — HALF-APPLIED, `TegraSd` LEFT OLD in unaos/crates/kernel/src/fs/bootdisk.rs)
+  arm-tegra-render leg, features: witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,orinconwin,orindesk,orinclick,orinrender,deskcascade,holocron,login,loginst
+  cargo +nightly check --release --target ../../aarch64-unaos.json $NIGHTLY_FLAGS --features <above>  -> rc=101
+    error[E0599]: no variant, associated function, or constant named `TegraSd` found for enum `BlockSource` in the current scope
+       --> crates/kernel/src/fs/bootdisk.rs:672:31
+        |
+    672 |         presence(BlockSource::TegraSd)
+        |                               ^^^^^^^ variant, associated function, or constant not found in `BlockSource`
+        |
+       ::: crates/kernel/src/fs/fat.rs:602:1
+        |
+    error: could not compile `unaos-kernel` (lib) due to 1 previous error; 24 warnings emitted
+
+  SAME HALF TREE, x86 default (--features ehcihid,kbdwit,sdhcblk,smolnet,sdwrite): rc=0
+        Finished `release` profile [optimized] target(s) in 12.33s
+  — the variant exists only under aarch64+tegra+sdmmc, so the x86 leg is BLIND to a half-applied TegraSd; the
+  go-red lives on the tegra+sdmmc cfg legs (the `arm-tegra*` rows of KERNEL_CFG_MATRIX in ./arroyo check).
+
+REVERTED: git diff saved, git apply -R, preflight OK, then the full --apply. The half trees were never committed.
+
+WHY THE GO-RED IS ON `TegraSd` AND NOT ON THE SHELL FAMILY: every live `tegra_shell_*` / `TegraShellWin` /
+`TEGRA_SHELL_PRESENTED` site is in ONE file (`main.rs`; `video/dock.rs`'s two are comments), so a per-file
+half-apply of that family is self-consistent and compiles by construction — it cannot be the falsifier.
+The family is carried by the full check's legs that compile BOTH polarities of its cfg pair:
+`deskcascade` ON (`arm-tegra-render`, the one KERNEL_CFG_MATRIX row that arms it) and `tegra` without `deskcascade`
+(the `enum TegraShellWin {}` / `#[inline(always)]` twins at main.rs:9376-9405, `arm-tegra`).

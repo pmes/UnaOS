@@ -2542,7 +2542,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     unaos_kernel::arch::sdmmc_tegra::sdmmc_install_from_usb(); #[cfg(all(feature = "tegra", feature = "selfup"))] unaos_kernel::arch::selfup_tegra::selfup_service(); #[cfg(feature = "ga10bprobe5a")] unaos_kernel::arch::ga10b_ignite::ga10bprobe5_run(dtb_addr, dtb_size, mmu.ram_gib_mask); // ORIN-SELFUP: self-update service — same preconditions as ORIN-INSTALL-2, AFTER it so an install and an update on one boot see the media final; appended to THIS line for knob-off byte-identity (no line moves). See docs/dev/OS/10_INSTALL/orin-selfupdate.md. GA10B-PROBE5A (orin-0912b): rung 5a, the VENDOR IGNITION, appended to THIS line before the comment (knob-off cfg-erased, no panic Location below moves) — HERE and not on the `sdmmc_census` line because the loader reads `/boot/GA10B/` through the VFS and `/boot` binds over the disk this kernel was found on, which is published by the SD census (slot card) OR the JB2b USB window above (reader card); after both, still EL2 (JM6 is below). Phase 0 runs now on every polarity; `=<n>d` arms the ignition for the shutdown path instead.
 
     // ORIN-UNAFS-ROOT rung 4 (arc M4): probe-mount the microSD's NATIVE unafs volume on its OWN
-    // block handle — `unafs::mount_on(BlockHandle::TegraSd)`, the consumer the SDSEAM arms in
+    // block handle — `unafs::mount_on(BlockHandle::SdMmc)`, the consumer the SDSEAM arms in
     // fs/unafs.rs were written for. Position is load-bearing, three ways:
     //   * AFTER `sdmmc_census` (~line 2188): the census's `publish_block_backend` is what fills
     //     `TEGRA_SD_BLOCK_DEVICE`; before it, `tegra_sd_info()` is None and every read answers
@@ -2561,7 +2561,7 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
     // hazard unafs.rs names; dropping ours before proceeding, plus the block layer's unconditional
     // `write_block_tegra_sd` refusal (the card has NO writer outside `sdmmc_arm`), keeps this
     // read-only and momentary by construction. `program_source` is likewise undisturbed — its
-    // `TegraSd` arm is `None` ("cannot be reached"), so the EL0 program volume stays the stick.
+    // `SdMmc` arm is `None` ("cannot be reached"), so the EL0 program volume stays the stick.
     // Compiled out without `sdmmc` => byte-identical to baseline. See docs/dev/OS/orin-unafs-root.md.
     #[cfg(feature = "sdmmc")]
     {
@@ -2572,12 +2572,12 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
             // expected line while the census SError is being fixed — the probe names the missing
             // precondition instead of a misleading NoStorage.
             None => serial_println!(
-                ":: UNAFS: probe SKIPPED — no TegraSd block backend published this boot (census did not reach its publish) ::"
+                ":: UNAFS: probe SKIPPED — no SdMmc block backend published this boot (census did not reach its publish) ::"
             ),
-            Some(dev) => match unafs::mount_on(block::BlockHandle::TegraSd) {
+            Some(dev) => match unafs::mount_on(block::BlockHandle::SdMmc) {
                 Ok(fs) => {
                     serial_println!(
-                        ":: UNAFS: native unafs volume MOUNTED read-only on TegraSd — card {} sectors, {} committed root flip(s) on the volume ::",
+                        ":: UNAFS: native unafs volume MOUNTED read-only on SdMmc — card {} sectors, {} committed root flip(s) on the volume ::",
                         dev.num_blocks,
                         fs.commit_stats().commits
                     );
@@ -2592,13 +2592,13 @@ fn tegra_early_stop(boot_info: &'static mut BootInfo) -> ! {
                 ),
                 // Partition table unparseable — a raw/blank card reads this way; also expected pre-install.
                 Err(unafs::MountError::Part(e)) => serial_println!(
-                    ":: UNAFS: partition scan on TegraSd FAILED — {:?} (card {} sectors; raw/blank card reads this way pre-install) ::",
+                    ":: UNAFS: partition scan on SdMmc FAILED — {:?} (card {} sectors; raw/blank card reads this way pre-install) ::",
                     e,
                     dev.num_blocks
                 ),
                 // Everything else (NoStorage race, BadSectorSize, Fs, Busy): a real defect worth a capture.
                 Err(e) => serial_println!(
-                    ":: UNAFS: mount on TegraSd FAILED — {:?} (card {} sectors; unexpected — capture this boot) ::",
+                    ":: UNAFS: mount on SdMmc FAILED — {:?} (card {} sectors; unexpected — capture this boot) ::",
                     e,
                     dev.num_blocks
                 ),
@@ -2896,19 +2896,19 @@ fn jd2_console_pump(_arg: usize) {
     // Phase 2: the console owns the panel. Detach the fbcon serial mirror FIRST so a CAPSTONE
     // straggler line can't paint over the console frame (serial output is unaffected).
     if !tegra_conwin_live() { unaos_kernel::video::fbcon::detach(); } #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_console_owns(); // ORIN-RASTGLASS: the phase-2 boundary latch — from here the console owns the glass, so a cube repainted away is the design, not a defect, and the census says RAST-SUPERSEDED-BY-CONSOLE instead of RAST-PAINTED-OVERWRITTEN. Placed on the FIRST statement of phase 2 and outside the conwin guard: the console takes the panel on both routes, only the detach differs. ⚠ LINE-NEUTRAL append. // ORIN-CONWIN rung 4 — the detach is GUARDED BY THE ROUTE, exactly as the Pi's GUI handoff guards it (`main.rs`'s CONSWIN-PI line). `tegra_conwin_live()` answers true only when `fbcon::console_is_routed()` does, and a routed console does not write the panel — `FbCon::draw_fb` hands back `win_fb`, kernel RAM no scan-out reads — so the ONE thing this detach exists to guarantee (exactly one writer on the panel while the JD2 Screen console owns it) is already true, and skipping it leaves the console window LIVE instead of freezing it with the boot log. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach();` it has always been. ⚠ FOLDED IN PLACE, never added lines: panic `Location` records embed line numbers and the knob-off jetson image's byte-identity is this track's standing proof.
-    let screen: &'static mut unaos_kernel::video::Screen = alloc::boxed::Box::leak(alloc::boxed::Box::new(unaos_kernel::video::Screen::new(front_fb))); let mut shellwin = tegra_shell_window_open(screen.width(), screen.height()); if shellwin.is_some() { screen.fill_screen(unaos_kernel::video::wm::DESKTOP_BG); } tegra_boot_focus(&shellwin); // APPPIN — the panel `Screen` is LEAKED (`Box::leak`): this pump never returns, so it lived for the boot already, and a `'static` panel pal is what lets the shell's pal be `'static` too — `TargetPal<'a>` is invariant behind `&mut`, so `tegra_shell_pick` unifies the two pals' lifetimes, and a shell pal that BORROWED `shellwin` would pin `shellwin` for the loop's life (E0506 on every quit/relaunch assignment). The mint takes `(pw, ph)` (a tile relaunch calls it with the panel `Screen` already borrowed by `pal`), and THE BAND CLEAR is this call site's: the scene's first paint, taken only when a window was minted (a decline leaves the panel to `console.draw`, which clears to the same colour). REALDESK-SHELLWIN (A19) — on the CASCADED scene (bar enabled AND console routed) the shell gets its own `wm` row here and the PANEL Screen is seeded `DESKTOP_BG`; `None` on every other boot (and knob-off, `#[inline(always)] None`), where the shell keeps the backdrop exactly as before. WHY: render4's SCREEN0.PNG carried this console's banner + prompt at the panel's top-left (y 46..89, x 12..495) — `console.draw` below clears the whole back buffer to `Console::BG` (== `wm::DESKTOP_BG`) and draws text, and `pal.render` flushed that through the occluder walk onto the desktop the cascade had just cleared (log order: `[deskcascade] -> CASCADED` THEN `JD2 — EL1 console pump live` THEN `JD4 — console OWNS the panel`). Not residue: a post-cascade repaint, every keystroke. ⚠ LINE-NEUTRAL fold. Helpers at file tail. BOOT-FOCUS (SO14) — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST (SO8). THE SHELL WINDOW IS THE LAST WINDOW THE BOOT MINTS, AND UNTIL THIS CALL NOTHING FOCUSED IT. `create_at` above already gives the row a fresh top-of-stack z, so the shell was FRONT from the instant it existed; what it never got was the KEYBOARD. The last focus call of the whole boot cascade is `quarry::open`'s own raise (`video/quarry/live.rs:1804`, reached from `desktop_firmware.rs:414`, step 6 of `activate()`), which lands ~8 s before this line — so after SO9FIX `63b109f6` gated `quarry::key_route` on `wm::focus_asid() == OWNER`, a boot-opened Quarry HELD Enter, Backspace and the arrows and the shell got none of them until the operator clicked the shell window (ledger SO14). Called UNCONDITIONALLY on the result, not from inside the `Some` arm, so a scene with no shell window says `-> NO-SHELL` on the wire instead of going quiet. `quarry::open()`'s own focus call is deliberately NOT touched: a Quarry the OPERATOR launches still comes to the front. Helper + knob-off twin at the file tail.
+    let screen: &'static mut unaos_kernel::video::Screen = alloc::boxed::Box::leak(alloc::boxed::Box::new(unaos_kernel::video::Screen::new(front_fb))); let mut shellwin = shellwin_window_open(screen.width(), screen.height()); if shellwin.is_some() { screen.fill_screen(unaos_kernel::video::wm::DESKTOP_BG); } tegra_boot_focus(&shellwin); // APPPIN — the panel `Screen` is LEAKED (`Box::leak`): this pump never returns, so it lived for the boot already, and a `'static` panel pal is what lets the shell's pal be `'static` too — `TargetPal<'a>` is invariant behind `&mut`, so `shellwin_pick` unifies the two pals' lifetimes, and a shell pal that BORROWED `shellwin` would pin `shellwin` for the loop's life (E0506 on every quit/relaunch assignment). The mint takes `(pw, ph)` (a tile relaunch calls it with the panel `Screen` already borrowed by `pal`), and THE BAND CLEAR is this call site's: the scene's first paint, taken only when a window was minted (a decline leaves the panel to `console.draw`, which clears to the same colour). REALDESK-SHELLWIN (A19) — on the CASCADED scene (bar enabled AND console routed) the shell gets its own `wm` row here and the PANEL Screen is seeded `DESKTOP_BG`; `None` on every other boot (and knob-off, `#[inline(always)] None`), where the shell keeps the backdrop exactly as before. WHY: render4's SCREEN0.PNG carried this console's banner + prompt at the panel's top-left (y 46..89, x 12..495) — `console.draw` below clears the whole back buffer to `Console::BG` (== `wm::DESKTOP_BG`) and draws text, and `pal.render` flushed that through the occluder walk onto the desktop the cascade had just cleared (log order: `[deskcascade] -> CASCADED` THEN `JD2 — EL1 console pump live` THEN `JD4 — console OWNS the panel`). Not residue: a post-cascade repaint, every keystroke. ⚠ LINE-NEUTRAL fold. Helpers at file tail. BOOT-FOCUS (SO14) — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST (SO8). THE SHELL WINDOW IS THE LAST WINDOW THE BOOT MINTS, AND UNTIL THIS CALL NOTHING FOCUSED IT. `create_at` above already gives the row a fresh top-of-stack z, so the shell was FRONT from the instant it existed; what it never got was the KEYBOARD. The last focus call of the whole boot cascade is `quarry::open`'s own raise (`video/quarry/live.rs:1804`, reached from `desktop_firmware.rs:414`, step 6 of `activate()`), which lands ~8 s before this line — so after SO9FIX `63b109f6` gated `quarry::key_route` on `wm::focus_asid() == OWNER`, a boot-opened Quarry HELD Enter, Backspace and the arrows and the shell got none of them until the operator clicked the shell window (ledger SO14). Called UNCONDITIONALLY on the result, not from inside the `Some` arm, so a scene with no shell window says `-> NO-SHELL` on the wire instead of going quiet. `quarry::open()`'s own focus call is deliberately NOT touched: a Quarry the OPERATOR launches still comes to the front. Helper + knob-off twin at the file tail.
     // VUGRAS: the Screen back buffer PA is only known now — add it to the candidate table.
     unaos_kernel::vugras::note_screen(&*screen);
     let mut pal = unaos_kernel::pal::TargetPal::new(screen);
-    let mut console = unaos_kernel::console::Console::new(); tegra_shell_mark(&mut console, &shellwin); let shell_id = tegra_shell_id(&shellwin); let mut spal = tegra_shell_pal(&mut shellwin); // REALDESK-SHELLWIN (A19) — the shell's pal: `Some` over the window's `Screen::direct` surface on the scene (the console drops its menu-bar reservation, `mark_in_window`), `None` otherwise; every `console.draw`/`handle_key` below goes through `tegra_shell_pick(&mut spal, &mut pal)`, which is `pal` itself when `spal` is `None`. `pal` (the panel Screen) stays the cursor's — unchanged. ⚠ LINE-NEUTRAL fold.
+    let mut console = unaos_kernel::console::Console::new(); shellwin_mark(&mut console, &shellwin); let shell_id = shellwin_id(&shellwin); let mut spal = shellwin_pal(&mut shellwin); // REALDESK-SHELLWIN (A19) — the shell's pal: `Some` over the window's `Screen::direct` surface on the scene (the console drops its menu-bar reservation, `mark_in_window`), `None` otherwise; every `console.draw`/`handle_key` below goes through `shellwin_pick(&mut spal, &mut pal)`, which is `pal` itself when `spal` is `None`. `pal` (the panel Screen) stays the cursor's — unchanged. ⚠ LINE-NEUTRAL fold.
     // JD11: mirror every command-output line to serial so an attended Orin bench captures a durable,
     // mbench-able transcript (the panel has no scrollback; before JD11 only keystrokes echoed to
     // serial). Installed before the banner so the shell-entry lines head the transcript too.
     console.set_output_sink(jd2_out_sink);
     console.println("UnaOS — Jetson Orin Nano (Tegra234)");
     console.println("JD2: interactive shell on the inherited scanout. Type 'help'.");
-    console.draw(tegra_shell_pick(&mut spal, &mut pal)); // REALDESK-SHELLWIN (A19) — the banner goes to the shell surface (window on the scene, panel otherwise). ⚠ LINE-NEUTRAL fold.
-    tegra_shell_present(&mut spal, shell_id, &mut pal, true); // REALDESK-SHELLWIN (A19) — `pal.render()` verbatim (knob-off identical) + on the scene the window flush and its owner-fenced `wm` present; this first panel flush is the seeded DESKTOP_BG through the occluder walk — the band clear. ⚠ LINE-NEUTRAL fold.
+    console.draw(shellwin_pick(&mut spal, &mut pal)); // REALDESK-SHELLWIN (A19) — the banner goes to the shell surface (window on the scene, panel otherwise). ⚠ LINE-NEUTRAL fold.
+    shellwin_present(&mut spal, shell_id, &mut pal, true); // REALDESK-SHELLWIN (A19) — `pal.render()` verbatim (knob-off identical) + on the scene the window flush and its owner-fenced `wm` present; this first panel flush is the seeded DESKTOP_BG through the occluder walk — the band clear. ⚠ LINE-NEUTRAL fold.
     match first_key {
         Some(c) => {
             serial_println!( // ORINPATH — `path=` names WHICH phase-2 printed this, and until this arc nothing did. `jd2_supstate_phase2` carries a verbatim copy of these two literals; on a `supstate` build both copies pass `#[cfg]`, so neither a serial capture nor a grep of the artifact could attribute the line to a site. See the twin's comment for the MEASURED shape of that ambiguity at 0ed6fee2. Token deliberately longer than 8 bytes — a shorter mark can be LLVM-immediate-encoded and never appear in `.rodata`, defeating the artifact grep. Placed AFTER "console OWNS the panel" so `scripts/specs/jetson-sync1.spec` / `jetson-jd5.spec`'s `REQUIRE JD4.*console OWNS the panel` still matches.
@@ -2916,8 +2916,8 @@ fn jd2_console_pump(_arg: usize) {
                 c
             );
             // The wake-up keystroke is a real keystroke: feed it through, don't swallow it.
-            #[cfg(not(feature = "login"))] handle_key(c, &mut console, tegra_shell_pick(&mut spal, &mut pal)); #[cfg(feature = "login")] if !unaos_kernel::fs::users::screen_key(c) { handle_key(c, &mut console, tegra_shell_pick(&mut spal, &mut pal)); } // LOGIN M3 — the wake key goes to the screen while it is up (knob-off the original statement, verbatim). ⚠ LINE-NEUTRAL fold. // REALDESK-SHELLWIN (A19). ⚠ LINE-NEUTRAL fold.
-            tegra_shell_present(&mut spal, shell_id, &mut pal, true); // REALDESK-SHELLWIN (A19). ⚠ LINE-NEUTRAL fold.
+            #[cfg(not(feature = "login"))] handle_key(c, &mut console, shellwin_pick(&mut spal, &mut pal)); #[cfg(feature = "login")] if !unaos_kernel::fs::users::screen_key(c) { handle_key(c, &mut console, shellwin_pick(&mut spal, &mut pal)); } // LOGIN M3 — the wake key goes to the screen while it is up (knob-off the original statement, verbatim). ⚠ LINE-NEUTRAL fold. // REALDESK-SHELLWIN (A19). ⚠ LINE-NEUTRAL fold.
+            shellwin_present(&mut spal, shell_id, &mut pal, true); // REALDESK-SHELLWIN (A19). ⚠ LINE-NEUTRAL fold.
         }
         None => serial_println!(
             ":: tegra: JD4 — console OWNS the panel (Screen back buffer live); path=jd2-console-pump; screen-on-boot (no key, ~8 s) ::"
@@ -2955,7 +2955,7 @@ fn jd2_console_pump(_arg: usize) {
         // (relative deltas accumulate; absolute takes the last position), so per-frame cursor work
         // is O(1) regardless of report rate and the drain always keeps pace with the keyboard. Keys
         // are handled inline and unconditionally, so they flow with zero pointer devices too.
-        let mut pending_rel: Option<(i32, i32)> = None; if spal.is_some() && shellwin_row() == unaos_kernel::video::wm::WIN_NONE { shellwin = None; spal = tegra_shell_pal(&mut shellwin); shellwin_quit_note(); } if spal.is_none() && shellwin_launch_owed() { shellwin = tegra_shell_window_open(pal.width() as usize, pal.height() as usize); spal = tegra_shell_pal(&mut shellwin); if spal.is_some() { console = unaos_kernel::console::Console::new(); console.set_output_sink(jd2_out_sink); console.mark_in_window(); console.draw(tegra_shell_pick(&mut spal, &mut pal)); needs_render = true; key_repainted = true; } } // APPPIN (R49) — the shell app's QUIT and LAUNCH on this body, which OWNS the instance (`shellwin` = store + `Screen` + id, `spal` = the `TargetPal` borrowing it, `console` = the typed state). QUIT: the row cell reads `WIN_NONE` (cleared by `wm::close` through the holder registry — the disc, Quit, `wc_close_furniture`) while a window pal is bound: drop the pal, drop the window (its store is freed here and now), report `[dock] quit`. LAUNCH: the dock's post with no instance live: re-mint all three through `tegra_shell_window_open` — the boot's own mint, so same geometry, fresh store, fresh row, fresh `Console` — and paint the prompt so the first present shows it. `spal` borrows NOTHING of `shellwin` (it holds the instance's leaked `'static` screen — see `TegraShellWin::screen`), which is what makes these assignments legal; it is rebuilt from the fresh instance right after each one. ⚠ FOLDED, CODE FIRST — see the APPPIN block at this file's tail.
+        let mut pending_rel: Option<(i32, i32)> = None; if spal.is_some() && shellwin_row() == unaos_kernel::video::wm::WIN_NONE { shellwin = None; spal = shellwin_pal(&mut shellwin); shellwin_quit_note(); } if spal.is_none() && shellwin_launch_owed() { shellwin = shellwin_window_open(pal.width() as usize, pal.height() as usize); spal = shellwin_pal(&mut shellwin); if spal.is_some() { console = unaos_kernel::console::Console::new(); console.set_output_sink(jd2_out_sink); console.mark_in_window(); console.draw(shellwin_pick(&mut spal, &mut pal)); needs_render = true; key_repainted = true; } } // APPPIN (R49) — the shell app's QUIT and LAUNCH on this body, which OWNS the instance (`shellwin` = store + `Screen` + id, `spal` = the `TargetPal` borrowing it, `console` = the typed state). QUIT: the row cell reads `WIN_NONE` (cleared by `wm::close` through the holder registry — the disc, Quit, `wc_close_furniture`) while a window pal is bound: drop the pal, drop the window (its store is freed here and now), report `[dock] quit`. LAUNCH: the dock's post with no instance live: re-mint all three through `shellwin_window_open` — the boot's own mint, so same geometry, fresh store, fresh row, fresh `Console` — and paint the prompt so the first present shows it. `spal` borrows NOTHING of `shellwin` (it holds the instance's leaked `'static` screen — see `ShellWin::screen`), which is what makes these assignments legal; it is rebuilt from the fresh instance right after each one. ⚠ FOLDED, CODE FIRST — see the APPPIN block at this file's tail.
         let mut pending_abs: Option<(i32, i32)> = None;
         while let Some(ev) = unaos_kernel::pal::next_event() {
             match ev {
@@ -2971,7 +2971,7 @@ fn jd2_console_pump(_arg: usize) {
                     }
                     needs_render = true;
                     key_repainted = true; #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::strip::key_escape(ev) { continue; } #[cfg(feature = "desktop_firmware")] if unaos_kernel::video::quarry::key_route(ev) { continue; } #[cfg(feature = "tegra_el0")] if unaos_kernel::arch::aarch64::syscall::wc_shell_focus_key(ev) { continue; } if shellwin_absent(&spal) { continue; } // APPPIN (R49) — a key with the shell app QUIT on the cascaded scene is DROPPED: there is nothing to type into and the panel is the desktop's (before this arc it painted the console over the desktop — the render4 SCREEN0 defect). Where the scene is not up this is `false` and the panel shell keeps every key. Ordered after the three doors above so <Esc>, Quarry's keys and <TAB> still work with no shell window; CODE FIRST. // QUARRYDOOR (KEYDOORS F1) — QUARRY'S WHOLE KEYBOARD HAD ONE CALLER AND IT WAS THE EL0 RING DOOR. `quarry::key_route` — <Esc> closes the file manager, `0x1C`..`0x1F` move the selection, <Enter> opens, Backspace goes up, `r` re-reads, and `Event::Wheel` scrolls — was asked ONLY at `arch/aarch64/syscall.rs:13211`, which fires while `USER_INPUT_ACTIVE != 0`. On the Orin that is never: this pump IS the board's key drain and its normal state is focus 0. And Quarry is ON THE GLASS AT BOOT on a `desktop_firmware`+`quarry` Orin image — `video/desktop_firmware.rs:394` runs `quarry::open()` as step 6 of `activate()`, and `main.rs`'s `tegra_quarry_seat` calls `request_open()` — so the file manager shipped with every arrow key falling past it into `handle_key`, and NO WAY TO CLOSE IT FROM THE KEYBOARD. Exactly TABKEY's defect and A10's defect, a third time, in this same statement: one body, two doors, only the ring door wired. Ordered AFTER `strip::key_escape` because a bar/SHARD menu composites ABOVE Quarry's window and the modal surface must win, and BEFORE `wc_shell_focus_key` because an open file manager eats its own arrows before the focus ring sees them; that is x86's order in `wc_route_event` and the aarch64 router's order in `user_input_enqueue`. NO focus guard is needed at the call site and adding one would be wrong: `key_route` gates on `focus_asid() == OWNER && on_glass()` since SO9FIX 63b109f6 (was `on_glass()` alone — SO9) (`video/quarry/live.rs:1651` — a live `WIN` id whose `z` is above `wm::shell_z()`), so with Quarry closed or buried it returns false and the shell keeps every arrow it has today. Gated `desktop_firmware` because `video/mod.rs:685` gates `pub mod quarry;` on it; the `UNAOS_QUARRY` knob is handled INSIDE the seam (`video/quarry.rs:47` is `#[inline(always)] false` knob-off) precisely so a folded call needs no second `cfg`. ⚠ FOLDED, and CODE-BEFORE-COMMENT per F0's rule on this line. // A10FIX (KEYDOORS F0) — THE A10 FOLD COMMENTED TABKEY OUT, AND ONLY A COLUMN-AWARE READ OF THIS LINE CAN SEE IT. `b768331a` folded `strip::key_escape` onto this statement and then wrote its prose at column 139 — AHEAD of the `wc_shell_focus_key` call TABKEY had folded on at column ~1600. A `//` runs to end of line, so from `b768331a` onward the Orin's TAB call was INSIDE the A10 comment: dead text, not a call. Nothing already in the tree could catch it — the line count is unchanged (so the `kernel8.img` byte-identity gate is silent), `./arroyo check` is green (the callee is a `pub fn` in a lib crate, so no dead-code warning exists to fire), and `git grep -n wc_shell_focus_key` STILL PRINTS THIS LINE, which is why the KEYDOORS audit scored the Orin's TAB door WIRED. Only reading the raw line by character offset finds it. This fix is ORDER ONLY — no call added, none removed: both calls now sit ahead of ALL prose and the two comment bodies are concatenated behind them. THE RULE THIS STATEMENT NOW CARRIES FOR EVERY FUTURE FOLD: **code first, all of it, then the comments** — a folded call written after a `//` is not a call. Line-neutral, one line in and one line out. // A10 (MENUBAR2) — <Esc> DISMISSES AN OPEN MENU, AND THE SHELL DOOR HAD NO CALLER. `strip::key_escape` was asked in exactly two places: x86's `wc_route_event` and aarch64's `user_input_enqueue` — and `user_input_enqueue` is the EL0 RING door, reached only while `USER_INPUT_ACTIVE != 0`. On the Orin that is never: this pump IS the board's key drain and its normal state is focus 0, so every <Esc> went straight past the modal surface into `handle_key`. MEASURED, render7 (`~/unaos-bench/scratch/orin16/render7-boot1.log`, awk): `[winmenu] open title=View` at :2414, `:: tegra: JD2 — KEY 0x1b ::` at :2437, `state=open` STILL at :2487 and :2526, and the menu finally closed `reason=outside` at :2569 — the exact shape TABKEY measured for <TAB> one arc earlier, in this same statement, for this same reason (one body, two doors, and only the ring door wired). Asked FIRST and ahead of `wc_shell_focus_key`, which is x86's order in `wc_route_event` and the aarch64 router's order in `user_input_enqueue`: a modal surface must get the key before the focus ring can TAB the desktop out from under an open menu. It consumes ONLY a bare <Esc> while a menu is down, so every other boot is behaviour-alike. Gated `desktop_firmware` because `video/mod.rs:112` gates `pub mod strip;` on it; a knob-off tegra or Pi image compiles this to nothing. ⚠ FOLDED onto the statement, never given a line of its own — panic `Location` records embed line numbers and the knob-off `kernel8.img` byte-identity proof is this track's standing gate. // TABKEY — THE MISSING SHELL HALF OF THE FOCUS RING. `wc_focus_key` has always been reachable on tegra through the IN-RING door (`user_input_enqueue` asks it at syscall.rs's router seam, and `orininput`'s `oi_pump` drives that seam), but the SHELL door — the one that fires while `USER_INPUT_ACTIVE == 0`, which is this board's normal state — had NO CALLER AT ALL, because `main.rs`'s two `wc_shell_focus_key` sites both live inside `pump_usb_into_gui`, `cfg(all(aarch64, baremetal))`, and `baremetal` implies `pi` while `pi` + `tegra` is a hard `compile_error!`. So on the Orin <TAB> fell straight through to `handle_key`, which has no byte-9 arm, and was silently dropped. MEASURED on metal (`~/unaos-bench/capture/line-acm0/`): `orin.log` carries 5x `:: tegra: JD2 — KEY 0x09 ::` at :13071-13080 and ZERO `[wc-c] focus tab-cycle`; the Pi control `pi.log`, same tool and directory, has 249. The serial echo above is deliberately left AHEAD of this call so the pairing stays scoreable from a capture — a fixed board reads `KEY 0x09` immediately followed by `[wc-c] focus tab-cycle`, a regressed one reads `KEY 0x09` alone, which is exactly what the Orin capture reads today. `wc_shell_focus_key` and not `wc_focus_key`, because this pump IS the Orin's shell drain: it returns false the moment an EL0 program holds focus, leaving the in-ring case to the router seam that already owns it — one body, two doors, one witness, which is the Pi's arrangement verbatim. `continue` where the Pi's bare-shell drain `break`s: that loop's destination is fixed at `gui_send`, so a moved focus invalidates the rest of its drain, whereas this loop's destination is `handle_key` on the backdrop console, which this pump feeds REGARDLESS of focus anyway (`xusb_tegra.rs`'s defect-2 note, out of this arc's scope) — so breaking would only re-deliver the same events to the same place one pass later. Gated `tegra_el0` because `arch/aarch64/mod.rs` gates `pub mod syscall;` on `aarch64_el0`, which a bare `tegra` image does not carry; the knob-off tegra media is therefore byte-identical, which is why this is FOLDED onto the statement above and given no line of its own — panic `Location` records embed line numbers and a line added anywhere in this file breaks that proof.
-                    if handle_key(c, &mut console, tegra_shell_pick(&mut spal, &mut pal)) { // REALDESK-SHELLWIN (A19) — the keystroke draws into the shell surface; the cursor bracket above/below stays on `pal`, the panel. ⚠ LINE-NEUTRAL fold.
+                    if handle_key(c, &mut console, shellwin_pick(&mut spal, &mut pal)) { // REALDESK-SHELLWIN (A19) — the keystroke draws into the shell surface; the cursor bracket above/below stays on `pal`, the panel. ⚠ LINE-NEUTRAL fold.
                         // A command took the whole screen (e.g. `gneiss`): stop draining this frame
                         // so a queued keystroke can't paint the console back over it (the shared
                         // drain-loop rule from the x86 GUI path).
@@ -3030,7 +3030,7 @@ fn jd2_console_pump(_arg: usize) {
             needs_render = true;
         }
         if needs_render {
-            tegra_shell_present(&mut spal, shell_id, &mut pal, key_repainted); if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() { x.poll_events(); } // PRTSCLOST (orin 17) — RE-ARM THE HID READS THE INSTANT THE PRESENT RELEASES THE CORE, instead of waiting for the top of the next iteration. Exactly ONE Normal TRB is outstanding on the keyboard interrupt-IN and it is re-armed only from the completion dispatch (drivers/xhci/mod.rs), and `set_hid_idle` sent SET_IDLE duration 0 = INDEFINITE, so the device reports ONLY on a state change and never resends: every key edge that happens while the endpoint has no TD queued is lost with no line anywhere. That is render8's PRTSCLOST — three fast Print Screen presses, one `armed` line. The present is the longest thing this loop does between two drains (render8's `[wc-h] maxpresent_us=92344`), and a 92 ms hole is wider than a human's whole press-and-release. This is a `poll_events()` on a ring that is usually empty — the same cheap MMIO the loop head already does, and `claim()` failing is a no-op, so a contended pass behaves exactly as it did. It does NOT close the window on its own (the slice below is the other half, and only multiple outstanding TDs would close it for good); it removes the largest term, and `[kbdpoll] armgap_us=` measures what is left. ⚠ LINE-NEUTRAL fold onto the existing present.
+            shellwin_present(&mut spal, shell_id, &mut pal, key_repainted); if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() { x.poll_events(); } // PRTSCLOST (orin 17) — RE-ARM THE HID READS THE INSTANT THE PRESENT RELEASES THE CORE, instead of waiting for the top of the next iteration. Exactly ONE Normal TRB is outstanding on the keyboard interrupt-IN and it is re-armed only from the completion dispatch (drivers/xhci/mod.rs), and `set_hid_idle` sent SET_IDLE duration 0 = INDEFINITE, so the device reports ONLY on a state change and never resends: every key edge that happens while the endpoint has no TD queued is lost with no line anywhere. That is render8's PRTSCLOST — three fast Print Screen presses, one `armed` line. The present is the longest thing this loop does between two drains (render8's `[wc-h] maxpresent_us=92344`), and a 92 ms hole is wider than a human's whole press-and-release. This is a `poll_events()` on a ring that is usually empty — the same cheap MMIO the loop head already does, and `claim()` failing is a no-op, so a contended pass behaves exactly as it did. It does NOT close the window on its own (the slice below is the other half, and only multiple outstanding TDs would close it for good); it removes the largest term, and `[kbdpoll] armgap_us=` measures what is left. ⚠ LINE-NEUTRAL fold onto the existing present.
         }
         // VUGRAS: the shell-idle writeback sweep on the ~250 ms cadence (boot-14's crash path — the
         // console pump was live at shell entry with no vug run). No-op with the knob off.
@@ -8312,7 +8312,7 @@ fn jd2_supstate_presenter(_arg: usize) {
             })
             .unwrap_or(false);
         }
-        #[cfg(feature = "orinclick")] unaos_kernel::arch::display_tegra::orin_drag_steer(0, 0); unaos_kernel::arch::display_tegra::sup_present_pass(work, flushed); if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() { x.poll_events(); } unaos_kernel::arch::sched::yield_now(); // DRAGDEAD (A27) — the `supstate` twin of the steer folded onto `jd2_console_pump`'s `cursor::draw_over` line, and it is OUTSIDE `sup_with_surface`'s closure on purpose rather than beside its cursor block. That closure runs with `SUP_SURFACE` HELD, and the supstate design states its seams as LEAF locks "never held across a yield"; `wm::move_to_inner` composites and can yield, so steering from inside it would break the rule the whole state-lift rests on. Here the closure has returned, the frame's travel is already in `pal::cursor` (applied inside it), and no supstate lock is held. `0, 0` asks the callee for its own geometry — there is no `Screen` in scope out here — which it takes from `video::panel_info_nonblocking()`, still no `WRITER` lock. Without this site the knob would be INERT on a `supstate` image (the ORIN-RASTGLASS omission shape this file records twice). ⚠ SAME-LINE fold, line-NEUTRAL. // ORIN-SUPSOUND — two relaxed atomic adds on the per-frame path, no lock and no print; the ~10 s census turns them into the liveness verdict. // SUPPRTSCR (orin 17) — the `supstate` home of PRTSCLOST's after-present re-arm. On the monolithic pump that fold sits on the `tegra_shell_present` line; under the split the present left the input source entirely and lives HERE, and both tasks are pinned to core 0 under a cooperative scheduler, so the render8-measured 92 ms present (`maxpresent_us=92344`) stalls the INPUT SOURCE too — mirroring the fold into `jd2_supstate_phase2`'s loop alone would have closed the sweep hole and left the larger one open. Placed AFTER `sup_present_pass` and OUTSIDE `sup_with_surface`'s closure, for the same reason `orin_drag_steer` is: that closure runs with `SUP_SURFACE` held, and nothing on this line takes the surface — `poll_events` pushes onto the PAL ring, which only the input source consumes. Before the `yield_now`, so the doorbell is rung with the core still ours. ⚠ LINE-NEUTRAL fold, and SO8: the code precedes the first `//`.
+        #[cfg(feature = "orinclick")] unaos_kernel::arch::display_tegra::orin_drag_steer(0, 0); unaos_kernel::arch::display_tegra::sup_present_pass(work, flushed); if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() { x.poll_events(); } unaos_kernel::arch::sched::yield_now(); // DRAGDEAD (A27) — the `supstate` twin of the steer folded onto `jd2_console_pump`'s `cursor::draw_over` line, and it is OUTSIDE `sup_with_surface`'s closure on purpose rather than beside its cursor block. That closure runs with `SUP_SURFACE` HELD, and the supstate design states its seams as LEAF locks "never held across a yield"; `wm::move_to_inner` composites and can yield, so steering from inside it would break the rule the whole state-lift rests on. Here the closure has returned, the frame's travel is already in `pal::cursor` (applied inside it), and no supstate lock is held. `0, 0` asks the callee for its own geometry — there is no `Screen` in scope out here — which it takes from `video::panel_info_nonblocking()`, still no `WRITER` lock. Without this site the knob would be INERT on a `supstate` image (the ORIN-RASTGLASS omission shape this file records twice). ⚠ SAME-LINE fold, line-NEUTRAL. // ORIN-SUPSOUND — two relaxed atomic adds on the per-frame path, no lock and no print; the ~10 s census turns them into the liveness verdict. // SUPPRTSCR (orin 17) — the `supstate` home of PRTSCLOST's after-present re-arm. On the monolithic pump that fold sits on the `shellwin_present` line; under the split the present left the input source entirely and lives HERE, and both tasks are pinned to core 0 under a cooperative scheduler, so the render8-measured 92 ms present (`maxpresent_us=92344`) stalls the INPUT SOURCE too — mirroring the fold into `jd2_supstate_phase2`'s loop alone would have closed the sweep hole and left the larger one open. Placed AFTER `sup_present_pass` and OUTSIDE `sup_with_surface`'s closure, for the same reason `orin_drag_steer` is: that closure runs with `SUP_SURFACE` held, and nothing on this line takes the surface — `poll_events` pushes onto the PAL ring, which only the input source consumes. Before the `yield_now`, so the doorbell is rung with the core still ours. ⚠ LINE-NEUTRAL fold, and SO8: the code precedes the first `//`.
     }
 }
 
@@ -9215,9 +9215,9 @@ const TEGRA_JD2_STACK_SIZE: usize = 32 * 1024;
 /// so it lives for the pump's life — the pump never returns), the single-buffer `Screen` over it, and
 /// the row id the presents are fenced on.
 #[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
-struct TegraShellWin {
+struct ShellWin {
     _store: alloc::vec::Vec<u8>,
-    screen: Option<&'static mut unaos_kernel::video::Screen>, // APPPIN — the window `Screen` HEADER is leaked at the mint (`Box::leak`; `direct` allocates no buffer, so this is two `FrameBuffer`s, an info and a damage set) and TAKEN by `tegra_shell_pal` into a `'static` pal that borrows nothing of this struct; on a quit the pal is dropped and the store below is freed with the struct, and the header stays leaked, unreachable. The price of a quit is that header; the alternative is a raw-pointer reclaim, which is worse.
+    screen: Option<&'static mut unaos_kernel::video::Screen>, // APPPIN — the window `Screen` HEADER is leaked at the mint (`Box::leak`; `direct` allocates no buffer, so this is two `FrameBuffer`s, an info and a damage set) and TAKEN by `shellwin_pal` into a `'static` pal that borrows nothing of this struct; on a quit the pal is dropped and the store below is freed with the struct, and the header stays leaked, unreachable. The price of a quit is that header; the alternative is a raw-pointer reclaim, which is worse.
     id: unaos_kernel::video::wm::WinId,
 }
 
@@ -9228,7 +9228,7 @@ struct TegraShellWin {
 /// decline is named on the wire; a decline AFTER the seed still leaves the band clear (the shell's
 /// `Console::draw` clears to the same colour anyway) and the shell on the panel as before.
 #[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
-fn tegra_shell_window_open(pw: usize, ph: usize) -> Option<TegraShellWin> {
+fn shellwin_window_open(pw: usize, ph: usize) -> Option<ShellWin> {
     use unaos_kernel::video::{fbcon, menubar, wm, FrameBuffer, Screen};
     // APPPIN — `(pw, ph)` come from the caller: the boot mint reads them off the panel `Screen`, a relaunch off the pump's `pal` (which holds that `Screen` borrowed for the pump's life).
     let bar = menubar::enabled();
@@ -9301,12 +9301,12 @@ fn tegra_shell_window_open(pw: usize, ph: usize) -> Option<TegraShellWin> {
         "[realdesk] band-cleared x=0 y={} w={} h={} bg={:06x} shell=win={} surf={}x{} box={}x{} at ({},{}) (A19: the band under the bar was jd2's own banner + prompt painted through the panel Screen AFTER the cascade, not residue; from here the shell draws into its own wm row and the panel Screen is seeded the desktop colour, so its full-damage flush walks the occluders and leaves the backdrop clean)",
         wtop, pw, ph.saturating_sub(wtop), wm::DESKTOP_BG, id, cw, ch, ow, oh, ox, oy
     );
-    shellwin_note_mint(id); Some(TegraShellWin { _store: store, screen: Some(alloc::boxed::Box::leak(alloc::boxed::Box::new(Screen::direct(fb)))), id }) // APPPIN — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST. RECORD THE ROW (`SHELLWIN_ROW`, registered so `wm::close` clears it) and REPORT THE LAUNCH through the dock's accounting — the boot mint and a tile relaunch both come through this function, so both print the same `[dock] launch app=shell by=console-pump … -> LAUNCHED` line. Nothing about the surface is recorded: there is no re-mint over these pixels any more (SO10's recipe cells are deleted); a relaunch allocates a fresh store, and a quit drops this one.
+    shellwin_note_mint(id); Some(ShellWin { _store: store, screen: Some(alloc::boxed::Box::leak(alloc::boxed::Box::new(Screen::direct(fb)))), id }) // APPPIN — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST. RECORD THE ROW (`SHELLWIN_ROW`, registered so `wm::close` clears it) and REPORT THE LAUNCH through the dock's accounting — the boot mint and a tile relaunch both come through this function, so both print the same `[dock] launch app=shell by=console-pump … -> LAUNCHED` line. Nothing about the surface is recorded: there is no re-mint over these pixels any more (SO10's recipe cells are deleted); a relaunch allocates a fresh store, and a quit drops this one.
 }
 
 /// REALDESK-SHELLWIN — a windowed shell reserves no menu-bar chrome (`Console::top_y`).
 #[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
-fn tegra_shell_mark(console: &mut unaos_kernel::console::Console, win: &Option<TegraShellWin>) {
+fn shellwin_mark(console: &mut unaos_kernel::console::Console, win: &Option<ShellWin>) {
     if win.is_some() {
         console.mark_in_window();
     }
@@ -9314,26 +9314,26 @@ fn tegra_shell_mark(console: &mut unaos_kernel::console::Console, win: &Option<T
 
 /// REALDESK-SHELLWIN — the row id, read BEFORE the pal borrows the window (`WIN_NONE` without one).
 #[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
-fn tegra_shell_id(win: &Option<TegraShellWin>) -> unaos_kernel::video::wm::WinId {
+fn shellwin_id(win: &Option<ShellWin>) -> unaos_kernel::video::wm::WinId {
     win.as_ref().map_or(unaos_kernel::video::wm::WIN_NONE, |w| w.id)
 }
 
 /// REALDESK-SHELLWIN — the shell's pal over the window surface; `None` leaves the shell on the panel.
 #[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
-fn tegra_shell_pal(win: &mut Option<TegraShellWin>) -> Option<unaos_kernel::pal::TargetPal<'static>> { // APPPIN — `'static`, and TAKES the leaked screen: the pal borrows nothing of `win`, so the pump can drop and re-mint `shellwin` while a pal variable is live. A second call on the same instance answers `None` (its screen is already in the pal).
+fn shellwin_pal(win: &mut Option<ShellWin>) -> Option<unaos_kernel::pal::TargetPal<'static>> { // APPPIN — `'static`, and TAKES the leaked screen: the pal borrows nothing of `win`, so the pump can drop and re-mint `shellwin` while a pal variable is live. A second call on the same instance answers `None` (its screen is already in the pal).
     win.as_mut().and_then(|w| w.screen.take()).map(unaos_kernel::pal::TargetPal::new)
 }
 
 /// REALDESK-SHELLWIN — one-shot: the first shell-window present prints its outcome and the stack gauge.
 #[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
-static TEGRA_SHELL_PRESENTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static SHELLWIN_PRESENTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// REALDESK-SHELLWIN — the pump's present: the panel flush VERBATIM (`pal.render()` — the cursor's
 /// damage, and on the first call the seeded full-panel band clear), then, only when the shell
 /// repainted, the window's flush and its owner-fenced `wm` present. `present_outcome_owned`, never
 /// bare `present`: the Pi's recycled-slot fence (a slot alias with no generation).
 #[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
-fn tegra_shell_present(
+fn shellwin_present(
     spal: &mut Option<unaos_kernel::pal::TargetPal<'_>>,
     _id: unaos_kernel::video::wm::WinId,
     pal: &mut unaos_kernel::pal::TargetPal<'_>,
@@ -9351,7 +9351,7 @@ fn tegra_shell_present(
     };
     sp.render();
     let id = shellwin_row(); if id == wm::WIN_NONE { return; } let outcome = wm::present_outcome_owned(id, wm::KERNEL_OWNER_DESKTOP); // APPPIN — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST. THE ID IS THE ROW CELL, never the pump's captured `shell_id`: `SHELLWIN_ROW` is written by the mint (boot and every tile relaunch) and cleared by `wm::close` through the holder registry, so `WIN_NONE` means the shell app is quit right now — paint the surface (`sp.render()` above) and present nothing; a relaunch writes the fresh row's id and the next present lands on it. Presenting a captured id would aim an owner-fenced blit at whatever `KERNEL_OWNER_DESKTOP` row the table has since re-issued that slot to.
-    if !TEGRA_SHELL_PRESENTED.swap(true, Ordering::AcqRel) {
+    if !SHELLWIN_PRESENTED.swap(true, Ordering::AcqRel) {
         serial_println!(
             "[realdesk] shell-present win={} outcome={:?} (first owner-fenced present of the shell window from the jd2 pump; every later key repaint presents the same way, pointer frames never do)",
             id, outcome
@@ -9364,7 +9364,7 @@ fn tegra_shell_present(
 /// REALDESK-SHELLWIN — the shell's drawing surface: the window pal when there is one, the panel
 /// pal otherwise. Shared by both knob states (knob-off `spal` is always `None`, so this is `pal`).
 #[cfg(all(target_arch = "aarch64", feature = "tegra"))]
-fn tegra_shell_pick<'r, 'a>(
+fn shellwin_pick<'r, 'a>(
     spal: &'r mut Option<unaos_kernel::pal::TargetPal<'a>>,
     pal: &'r mut unaos_kernel::pal::TargetPal<'a>,
 ) -> &'r mut unaos_kernel::pal::TargetPal<'a> {
@@ -9376,28 +9376,28 @@ fn tegra_shell_pick<'r, 'a>(
 
 // Knob-off twins: `tegra` without `deskcascade` — no-ops, so phase 2 folds to its pre-A19 shape.
 #[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
-enum TegraShellWin {}
+enum ShellWin {}
 #[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
 #[inline(always)]
-fn tegra_shell_window_open(_pw: usize, _ph: usize) -> Option<TegraShellWin> {
+fn shellwin_window_open(_pw: usize, _ph: usize) -> Option<ShellWin> {
     None
 } #[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))] #[inline(always)] fn shellwin_row() -> unaos_kernel::video::wm::WinId { unaos_kernel::video::wm::WIN_NONE } // APPPIN — knob-off twin: no scene, no shell row.
 #[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
 #[inline(always)]
-fn tegra_shell_mark(_console: &mut unaos_kernel::console::Console, _win: &Option<TegraShellWin>) {} #[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))] #[inline(always)] fn shellwin_launch_owed() -> bool { false } // APPPIN — knob-off twin: no dock, no post.
+fn shellwin_mark(_console: &mut unaos_kernel::console::Console, _win: &Option<ShellWin>) {} #[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))] #[inline(always)] fn shellwin_launch_owed() -> bool { false } // APPPIN — knob-off twin: no dock, no post.
 #[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
 #[inline(always)]
-fn tegra_shell_id(_win: &Option<TegraShellWin>) -> unaos_kernel::video::wm::WinId {
+fn shellwin_id(_win: &Option<ShellWin>) -> unaos_kernel::video::wm::WinId {
     unaos_kernel::video::wm::WIN_NONE
 } #[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))] #[inline(always)] fn shellwin_absent(_spal: &Option<unaos_kernel::pal::TargetPal<'_>>) -> bool { false } // APPPIN — knob-off twin: the shell is the panel, no key is ever dropped.
 #[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
 #[inline(always)]
-fn tegra_shell_pal(_win: &mut Option<TegraShellWin>) -> Option<unaos_kernel::pal::TargetPal<'static>> {
+fn shellwin_pal(_win: &mut Option<ShellWin>) -> Option<unaos_kernel::pal::TargetPal<'static>> {
     None
 } #[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))] #[inline(always)] fn shellwin_quit_note() {} // APPPIN — knob-off twin (no scene, nothing to quit).
 #[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
 #[inline(always)]
-fn tegra_shell_present(
+fn shellwin_present(
     _spal: &mut Option<unaos_kernel::pal::TargetPal<'_>>,
     _id: unaos_kernel::video::wm::WinId,
     pal: &mut unaos_kernel::pal::TargetPal<'_>,
@@ -9515,10 +9515,10 @@ fn tegra_quarry_seat() {
 //    (`shell_id == WIN_NONE && !shell_declined && armed()`). [`shellwin_service_rearm`] folds into
 //    that arm's guard: a quit parks the arm SHUT (`shell_id = WIN_NONE`, `shell_declined = true`),
 //    a launch opens it (`shell_declined = false`) and the arm mints on the same pass.
-//  * the cascaded scene's console pump — the instance is a `TegraShellWin` (store + `Screen` + id)
+//  * the cascaded scene's console pump — the instance is a `ShellWin` (store + `Screen` + id)
 //    plus the `TargetPal` borrowing it and the pump's own `Console`. The pump's fold (on the drain's
 //    `pending_rel` line) drops all three on a quit and re-mints all three on a launch through
-//    [`tegra_shell_window_open`], which now takes `(pw, ph)` so it can be called with the panel
+//    [`shellwin_window_open`], which now takes `(pw, ph)` so it can be called with the panel
 //    `Screen` already borrowed by `pal` (the boot mint's band clear moved to its call site — it is
 //    the scene's first paint, not the window's). The id lives in [`SHELLWIN_ROW`], REGISTERED so
 //    `wm::close` clears it on every close path (SO1(b)'s registry), and the present reads that cell.
@@ -9614,7 +9614,7 @@ fn shellwin_row() -> unaos_kernel::video::wm::WinId {
     SHELLWIN_ROW.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// APPPIN — record a freshly minted shell row (from [`tegra_shell_window_open`]'s tail, the one
+/// APPPIN — record a freshly minted shell row (from [`shellwin_window_open`]'s tail, the one
 /// place a shell row is minted on this scene, boot and relaunch alike) and report the launch through
 /// the dock's accounting, so the boot mint and a tile relaunch print the identical line.
 #[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
@@ -9648,7 +9648,7 @@ fn shellwin_launch_owed() -> bool {
     unaos_kernel::video::dock::take_launch(unaos_kernel::video::dock::PinnedApp::Shell)
 }
 
-/// APPPIN — is the cascaded scene up? The same readback [`tegra_shell_window_open`] mints under
+/// APPPIN — is the cascaded scene up? The same readback [`shellwin_window_open`] mints under
 /// (bar enabled AND console routed): where it is not, the shell is the panel and keys go to it.
 #[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
 fn shellwin_scene_live() -> bool {
@@ -10328,7 +10328,7 @@ fn ptrlag_selftest() {
 // focus: `quarry::open()` raises itself through `wm::focus_changed(OWNER)`
 // (`video/quarry/live.rs:1804`, and `:1675` on its already-open arm). So `tegra_desk_cascade` returns
 // with `FOCUS_ASID` naming Quarry, 0xffffff03. Roughly 8 s later the jd2 pump's phase 2 mints the
-// SHELL window (`tegra_shell_window_open`, `wm::create_at(KERNEL_OWNER_DESKTOP, …)`) and does not
+// SHELL window (`shellwin_window_open`, `wm::create_at(KERNEL_OWNER_DESKTOP, …)`) and does not
 // call `focus_changed` at all.
 //
 // Before SO9FIX that was invisible: `quarry::key_route` gated on `on_glass()` alone, so it took
@@ -10392,12 +10392,12 @@ static TEGRA_BOOT_FOCUS_DONE: core::sync::atomic::AtomicBool =
 /// take the console window, the pulse window and Quarry off the glass at boot. The Orin's shell is a
 /// WINDOW (`KERNEL_OWNER_DESKTOP`), and focusing a window is what this needs to say.
 ///
-/// `None` — the scene minted no shell window (`no-scene`, `alloc`, `geometry`: `tegra_shell_window_open`
+/// `None` — the scene minted no shell window (`no-scene`, `alloc`, `geometry`: `shellwin_window_open`
 /// has already named which on the line above) — is `-> NO-SHELL` and NO focus change. There is no row
 /// to focus, and the alternatives are both wrong: `focus_changed(0)` would park the scene, and leaving
 /// Quarry focused is at least the state the operator can fix with one click.
 #[cfg(all(target_arch = "aarch64", feature = "deskcascade"))]
-fn tegra_boot_focus(win: &Option<TegraShellWin>) {
+fn tegra_boot_focus(win: &Option<ShellWin>) {
     use core::sync::atomic::Ordering;
     use unaos_kernel::video::wm;
     if TEGRA_BOOT_FOCUS_DONE.swap(true, Ordering::AcqRel) {
@@ -10428,11 +10428,11 @@ fn tegra_boot_focus(win: &Option<TegraShellWin>) {
 }
 
 /// BOOT-FOCUS (SO14) — the knob-off twin. Without `deskcascade` there is no scene and no shell row
-/// (`tegra_shell_window_open` is the `#[inline(always)] None` twin), so the folded call at the mint
+/// (`shellwin_window_open` is the `#[inline(always)] None` twin), so the folded call at the mint
 /// site emits zero instructions and the image is byte-identical.
 #[cfg(all(target_arch = "aarch64", feature = "tegra", not(feature = "deskcascade")))]
 #[inline(always)]
-fn tegra_boot_focus(_win: &Option<TegraShellWin>) {}
+fn tegra_boot_focus(_win: &Option<ShellWin>) {}
 
 // ============================================================================================
 // RENDCONV — THE CONVERGED RENDER PASS (LEDGER S7, design `docs/dev/evidence/orin14/S7-CONVERGENCE.md`)

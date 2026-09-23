@@ -160,7 +160,7 @@
 //! row gone. Nothing is kept back for a "reopen": there is no reopen route, no re-mint over old
 //! pixels, no latch that remembers a dead id. A relaunch mints a NEW window with a NEW id and
 //! generation through the SAME function the boot used for the first one — `open_shell_window` /
-//! `tegra_shell_window_open` for the shell, `fbcon::panel_console_window_open` for the console —
+//! `shellwin_window_open` for the shell, `fbcon::panel_console_window_open` for the console —
 //! exactly as QUARRY-LAUNCH mints a program's window through the seam `bg` takes.
 //!
 //! What this module owns of that: the tiles ([`pin_console`], [`pin_shell`], [`pin_quarry`]); the
@@ -514,7 +514,7 @@ pub enum PinnedApp {
     /// The console — the kernel log in a window. Mint seam `fbcon::panel_console_window_open`.
     Console,
     /// The shell — a `wm::KERNEL_OWNER_DESKTOP` window over the render body's own `Console`.
-    /// Mint seam `open_shell_window` (x86, Pi) / `tegra_shell_window_open` (the cascaded scene).
+    /// Mint seam `open_shell_window` (x86, Pi) / `shellwin_window_open` (the cascaded scene).
     Shell,
 }
 

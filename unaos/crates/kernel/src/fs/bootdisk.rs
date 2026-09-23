@@ -229,7 +229,7 @@
 //! **The posture is the SOURCE's own**, sampled from the very `FatBackend` that gets mounted:
 //! `rw = !FatBackend::read_only()`, which forwards to `BlockSource::write_veto`. `Usb` is WRITABLE
 //! (the Pi's verified BOT WRITE(10) path — forcing a read-only mount here would be a behaviour
-//! change on the Pi), `TegraSd` is vetoed in every cfg so the Orin's slot card is read-only BY THE
+//! change on the Pi), `SdMmc` is vetoed in every cfg so the Orin's slot card is read-only BY THE
 //! VETO rather than by this mount, and `Default` is CONDITIONAL on FRGUARD's `default_writable()`,
 //! which is a RUNTIME state and not a property of the volume — so there is no fixed expectation for
 //! a `Default`-sourced mount anywhere, in code or in a spec row. One witness line per mount:
@@ -669,7 +669,7 @@ fn sdhc_state() -> &'static str {
 fn tegra_sd_state() -> &'static str {
     #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
     {
-        presence(BlockSource::TegraSd)
+        presence(BlockSource::SdMmc)
     }
     #[cfg(not(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc")))]
     {
@@ -2193,9 +2193,9 @@ fn native_root_mount(mt: &mut crate::fs::vfs::MountTable, src: BlockSource, anno
 ///  2. **One answer per source.** For EVERY source in `fat::ALL_SOURCES`, the FAT layer's
 ///     `BlockSource::write_veto()` and the block layer's `handle_write_veto(handle_of(src))` agree on
 ///     whether a write is admitted. A second policy in either layer reds this the moment it differs —
-///     which is exactly the drift the `TegraSd` arm was (a veto that only ECHOED one two layers down).
+///     which is exactly the drift the `SdMmc` arm was (a veto that only ECHOED one two layers down).
 ///  3. **The polarity that SHIPS.** `posture=` is `cfg!(feature = "sdwrite")`, printed so a capture
-///     says which build it came from; and on a build that HAS the card handle, `TegraSd`'s veto is
+///     says which build it came from; and on a build that HAS the card handle, `SdMmc`'s veto is
 ///     asserted to match it in both directions. On a build without `tegra`+`sdmmc` the field reads
 ///     `card=absent` — the leg says what it did not test instead of passing quietly.
 #[cfg(all(feature = "witness", feature = "sdwrite"))]
@@ -2243,8 +2243,8 @@ pub fn sdwrite_posture_selftest() {
     // (3) the polarity that ships, on a build that has the card handle.
     #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
     let (card_field, card_ok) = (
-        if crate::fs::fat::BlockSource::TegraSd.write_veto().is_none() { "admits" } else { "refuses" },
-        crate::fs::fat::BlockSource::TegraSd.write_veto().is_none() == posture
+        if crate::fs::fat::BlockSource::SdMmc.write_veto().is_none() { "admits" } else { "refuses" },
+        crate::fs::fat::BlockSource::SdMmc.write_veto().is_none() == posture
             && crate::drivers::block::tegra_sd_writes_admitted() == posture,
     );
     #[cfg(not(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc")))]

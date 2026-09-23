@@ -33,7 +33,7 @@ second probe of `exec_resolve`, i.e. the reason a bare `vug` worked from anywher
 ### 1.2 Jetson Orin Nano (`hw-jetson`, `tegra`) — HISTORY; see §1.4 for what the aarch64 boards do now
 > **SUPERSEDED (BOOTROOT, orin 22, branch `exec-orin22-bootroot`).** The per-board root knob this
 > section describes — `UNAOS_SDMMCROOT=1` / cargo `sdmmcroot`, its file-tail section in
-> `arch/aarch64/sdmmc_tegra.rs`, its hard-coded `BlockSource::TegraSd` constructor in `fs/vfs.rs`
+> `arch/aarch64/sdmmc_tegra.rs`, its hard-coded `BlockSource::SdMmc` constructor in `fs/vfs.rs`
 > and its statement in `shell::vfs_mount_table` — is DELETED. Nothing below is edited away: the rows
 > record what was true and why, and remain the history of how the fault was found. What replaces it
 > is `fs/bootdisk.rs`: the kernel is told nothing about where it came from, brings up every disk
@@ -47,7 +47,7 @@ second probe of `exec_resolve`, i.e. the reason a bare `vug` worked from anywher
 
 The shared builder above ran, and then `sdmmc_tegra::sdmmc_root_bind` (§ROOTFS,
 `arch/aarch64/sdmmc_tegra.rs`) **re-pointed both `/` and `/fat`** at the card's FAT through
-`BlockSource::TegraSd`, read-only. It had to: this machine has no UnaFS volume and no `Default`
+`BlockSource::SdMmc`, read-only. It had to: this machine has no UnaFS volume and no `Default`
 block device, so before ROOTFS (orin 16, A28) `ls /` answered `backend error: unafs-mount` and
 `/fat` answered `-ENODEV`. Two mounts, zero volumes.
 
@@ -85,7 +85,7 @@ loader: *"WTF does it matter what method I choose to boot? You are assuming too 
 
 1. Every disk driver the board has is in the image — none behind a knob. On the jetson image that
    meant making `sdmmc` default-on (`arroyo`'s `esp_jetson()`, opt out `UNAOS_NOSDMMC=1`), because
-   `BlockSource::TegraSd` exists only under that feature and a walk cannot enumerate a slot whose
+   `BlockSource::SdMmc` exists only under that feature and a walk cannot enumerate a slot whose
    type is not compiled.
 2. Every FAT volume on every compiled-in `BlockSource` is walked (depth ≤ 4, ≤ 4096 entries; a cap
    that is HIT is a named reason, never a silent stop).

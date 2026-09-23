@@ -149,7 +149,7 @@ arm that supplies the capacity and the arm that supplies the bytes are picked by
 
 SDSEAM made the *device* carry its handle; the process-wide `with_unafs` mount cache still assumed
 one. Its lazy bind called `mount()` — a `BlockHandle::Global` wrapper — so on a machine whose unafs
-volume arrives via any **other** handle (the orin's TegraSd card is the motivating case: the global
+volume arrives via any **other** handle (the orin's SdMmc card is the motivating case: the global
 handle there is the USB boot stick), the shell's `with_unafs` could never see its own volume: the
 cache was hardwired to the global block device. UNAFSBIND extends the SDSEAM philosophy one level
 up. The contract:
@@ -172,7 +172,7 @@ up. The contract:
   returned, so a volume-less machine reports today's exact verdict.
 * **The probe walk is E0004-guarded.** `bind_probe_admitted` is an exhaustive match — a handle added
   in the block layer is a compile error at the bind seam, forcing the decision "should this handle be
-  discoverable?" in the same commit that adds the handle (for `TegraSd` the answer is `true`, one
+  discoverable?" in the same commit that adds the handle (for `SdMmc` the answer is `true`, one
   line, and the shell needs no tegra-side wiring at all). `handle_kind_name` and
   `bind_probe_candidates` sit beside it under the same MERGE NOTE.
 * **The binding is witnessed.** A successful bind prints one line, so any machine's wire shows which

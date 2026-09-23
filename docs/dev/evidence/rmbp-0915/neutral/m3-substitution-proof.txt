@@ -1,0 +1,36 @@
+NEUTRAL M3 — proof that the RENAME diff is a PURE TOKEN SUBSTITUTION
+base 98fd8e66, branch exec-rmbp-neutral3
+
+Method: for every changed line pair (-,+), apply the M3 substitution table (nine
+identifiers, word-bounded) to the OLD line and require equality with the NEW line. One
+unexplained line means the batch moved something other than a token.
+
+POPULATION = the 22 files the rename edits. Files this arc AUTHORS new prose into are
+excluded BY NAME and are not substitutions: docs/dev/OS/rmbp-ledger.md docs/dev/OS/rmbp-queue.md docs/dev/evidence/orin14/NEUTRAL-TABLE.md docs/dev/evidence/rmbp-0915/neutral/
+
+    docs/dev/OS/01_BOOT_HAL/arch_arm64.md
+    docs/dev/OS/05_USER_EXPERIENCE/dock.md
+    docs/dev/OS/07_USB_STORAGE/sdhc.md
+    docs/dev/OS/09_FILESYSTEM/layout.md
+    docs/dev/OS/09_FILESYSTEM/partitions.md
+    docs/dev/OS/09_FILESYSTEM/vfs.md
+    unaos/arroyo
+    unaos/crates/kernel/Cargo.toml
+    unaos/crates/kernel/src/drivers/block.rs
+    unaos/crates/kernel/src/fs/bootdisk.rs
+    unaos/crates/kernel/src/fs/fat.rs
+    unaos/crates/kernel/src/fs/unafs.rs
+    unaos/crates/kernel/src/fs/vfs.rs
+    unaos/crates/kernel/src/install/mod.rs
+    unaos/crates/kernel/src/install/partition.rs
+    unaos/crates/kernel/src/main.rs
+    unaos/crates/kernel/src/shell.rs
+    unaos/crates/kernel/src/video/dock.rs
+    unaos/crates/kernel/src/wifi/firmware.rs
+    unaos/scripts/banner-cert.sh
+    unaos/scripts/k8-reach.registry
+    unaos/scripts/specs/jetson-sync1.spec
+
+  identifier occurrences moved: 163
+  changed lines: -141 / +141  (insertions == deletions)
+  lines NOT explained by the substitution table: 0
