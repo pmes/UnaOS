@@ -300,6 +300,36 @@ FORBID :: VUGPERF: .* :: FAIL ::
 # --- drops by one, verdict `-> FAIL`.
 REQUIRE :: KEYMAP: table=crispy resolved=\d+ .* ctrl_c_ascii=0x03 ctrl_c_action=none pc_table_alt_c=copy .* -> PASS ::
 
+# --- MENUBATT2 (rmbp-ledger B170) — THE STATUS POLL STATES THAT IT RAN. Extends the MENUBATT pair
+# --- at :163. APPENDED HERE and not beside it, because this file's own CONTRACT block below names
+# --- tail-append as the safe form and rows cite spec lines POSITIONALLY — an insert at :164 would
+# --- move MENUFIRST's :180/:187 and every citation of them.
+# --- WHY THIS PIN EXISTS. `[menubar] battery` is SILENT while the source is `Unresolved`, by its own
+# --- design, so "the sweep never ran", "it ran and nothing resolved" and "this code is not in the
+# --- image" all printed the same nothing. B156 read flight 11's 2.2 MB, found no `[menubar] battery`
+# --- line, and concluded the second. It was the THIRD: flight 11's image is 56bbe53b (2026-09-22
+# --- 08:12) and `video/status.rs` does not exist in that commit — MENUSTAT folded 7.5 h later.
+# --- `[status] poll` is emitted from inside `status::poll`'s throttled body, so the LINE's existence
+# --- is the proof the sweep ran, and its absence is now a statement instead of an ambiguity.
+# --- `src=none` IS PINNED AS A VALUE, deliberately rather than lazily: QEMU's `isa-applesmc` answers
+# --- REV/OSK0 and carries no battery key, so the MEASURED absence is this lane's truth, and with or
+# --- without `UNAOS_SMC=1` the sweep resolves `none` here (knob-off takes `board_raw`'s second arm to
+# --- the same place). A gate that read `src=smc` would mean QEMU grew a pack; one that read
+# --- `src=fixture` would mean MENUBATT's injection escaped its restore. Both are findings, and `.*`
+# --- would have hidden both.
+# --- `n=`/`answered=`/`took_us=` are shapes and not values — the counts depend on where in the 240 s
+# --- wall the capture is cut, and `took_us` is a measurement. They are NAMED for the standing reason
+# --- this file gives at DMGOVLP: a later edit that drops one reds this rule instead of silently
+# --- narrowing what it asserts.
+# --- THE FORBID BITES A REAL INVARIANT, not a spelling: every sweep resolves the source before this
+# --- line is emitted, so `src=unresolved` on a `[status] poll` line is unreachable unless the resolve
+# --- arms stopped covering `board_raw`'s match. It is not a restatement of the REQUIRE.
+# --- GO-RED, ONE EDIT (measured, B170): disarm `super::status::poll();` at desktop_uefi.rs:711 ->
+# --- the capture carries ZERO `[status] poll` lines, this REQUIRE misses, `mbench` rc 1 — and that
+# --- capture is flight 11's wire, reproduced.
+REQUIRE \[status\] poll n=\d+ answered=\d+ src=none took_us=\d+
+FORBID \[status\] poll .* src=unresolved
+
 
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
 # A PINNED LINE IN THIS FILE IS CHANGED TOGETHER WITH THE KERNEL LINE IT PINS, IN THE SAME COMMIT —
