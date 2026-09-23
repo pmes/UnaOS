@@ -38,6 +38,15 @@ NVIDIA uses a single large MMIO region (BAR0) for all registers, typically 16MB 
 - `0x000200` **NV_PMC_ENABLE**: Master engine enable mask. Indicates if the GPU is initialized/POST'd.
 - `0x000100` **NV_PMC_INTR_0**: Global interrupt status.
 - `0x000140` **NV_PMC_INTR_EN**: Global interrupt enable. Write `0` to disable all interrupts during init.
+- `0x000160` **INTR_LINE_HOST**: the output interrupt line, readable; on GF100+ `1` = active (envytools `docs/hw/bus/pmc.rst:360-364`). **[EXT]**, read-only in this tree (KVBLANK3).
+- `0x000640` **INTR_MASK_HOST** (`GT215:`): the PER-SOURCE mask. A source whose bit is `0` here reads always-0 in `NV_PMC_INTR_0` (envytools `pmc.rst:45`, `:374-377`). **[EXT]**. Written by KVBLANK3 only, for a bounded window, with the entry value restored and read back.
+
+**`NV_PMC_INTR_EN` (`0x140`) HAS TWO BITS, NOT A SOURCE MASK** (KVBLANK3, rmbp-ledger B192). envytools names it
+`INTR_ENABLE_HOST` (`pmc.rst:30`): `bit 0` enables the hardware interrupts and `bit 1` the software interrupt (`:345-349`),
+and the document says the register "only allows one to enable/disable all hardware or all software interrupts"
+(`:314-316`). The per-source bits (26 = PDISPLAY, `:494` in the GF100+ table that starts at `:471`) are in
+`0x640`. Flight 12 confirmed it on the GK107: writing bit 26 to `0x140` read back `00000000`
+(`:: kepler: vblank pmc-arm … en_entry=00000000 en_armed=00000000`). This file said otherwise until 2026-09-23 (§2.3.2).
 
 ### 2.2 Bus Control (PBUS) - Base `0x001000`
 - `0x001800` **NV_PBUS_PCI_NV_0**: Mirror of PCI config space `0x00` (Vendor/Device ID).
@@ -69,7 +78,8 @@ relation and never equality).
 | register | offset | bit | source | class |
 | --- | --- | --- | --- | --- |
 | `NV_PMC_INTR_0` | BAR0 `0x000100` | `[26]` = PDISPLAY | open-gpu-doc `dev_master`; the public NV50+ PMC interrupt-source table | offset **[TREE]** (§2.1); **bit 26 is [EXT] and UNVERIFIED on GK107** |
-| `NV_PMC_INTR_EN` | BAR0 `0x000140` | `[26]` = PDISPLAY | same | same |
+| ~~`NV_PMC_INTR_EN` | BAR0 `0x000140` | `[26]` = PDISPLAY~~ | same | **WRONG, corrected by KVBLANK3 (B192): `0x140` is `INTR_ENABLE_HOST`, bit 0 = all hardware sources (§2.1). The per-source bit 26 is in `INTR_MASK_HOST` `0x640`. Flight 12 read back `en_armed=00000000` after the bit-26 write** |
+| `INTR_MASK_HOST` | BAR0 `0x000640` | `[26]` = PDISPLAY | envytools `docs/hw/bus/pmc.rst:45`, `:374-377`, `:494` | **[EXT]** (GT215+) |
 | ~~PDISPLAY per-head vblank interrupt **ENABLE**~~ | — | — | — | ~~**NOT-IN-TREE**~~ — **RESOLVED, see §2.3.3** |
 | ~~PDISPLAY per-head vblank interrupt **STATUS**~~ | — | — | — | ~~**NOT-IN-TREE**~~ — **RESOLVED, see §2.3.3** |
 
@@ -79,7 +89,7 @@ The two `NOT-IN-TREE` rows were named rather than guessed, in the `igpu-dpy … 
 pair was the real blocker on a true vblank interrupt, and it was found in the file this section had
 already cited.
 
-`UNAOS_KEPLER_VBLANK=1` sets **exactly bit 26** in `NV_PMC_INTR_EN` (which `kepler::init` has
+**⚠ The paragraph below describes KVBLANK's rung as it shipped, and its register is wrong (see the struck row above).** `UNAOS_KEPLER_VBLANK=1` sets **exactly bit 26** in `NV_PMC_INTR_EN` (which `kepler::init` has
 written `0` since the driver's first day), watches `NV_PMC_INTR_0` for 50 ms, and RESTORES the
 captured value with a read-back. Delivery is impossible by construction — this tree has three
 hard-coded IDT vectors and no vector allocator a PCI function can join — so the rung asks whether

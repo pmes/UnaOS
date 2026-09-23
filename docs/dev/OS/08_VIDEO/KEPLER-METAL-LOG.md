@@ -8,6 +8,89 @@ QEMU behavior. Newest sitting first.
 > in [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) (R19; rmbp-ledger B10). This file stays the
 > per-sitting narrative; the register is the verdict table.**
 
+## FLIGHT 12 READING — KVBLANK2 (B179) scored, and KVBLANK3's READ (rmbp-ledger B192), 2026-09-23
+
+Capture: `f12-boot1.log` (bench scratch, 6899 lines; record `docs/dev/evidence/rmbp-0915/flight12/FLIGHT12.md`
+§KVBLANK2). Every line quoted below is from that capture, read with `awk 'index($0,…)'`.
+
+### Finding 1 — `reason=no-vector-helper` is a stale literal; the interrupt path DID arm, and delivered nothing
+
+`reason=no-vector-helper` is a string constant in `arm_pmc_pdisplay` (`kepler_vblank.rs:460` at
+`94e90eae`). That function is KVBLANK's rung 1 PMC half and runs at `kepler::init`. It printed the
+reason unconditionally at 6147 ms, 33 s before the KVBLANK2 ladder reached the vector rung. The
+vector rung ran, and the same wire shows it:
+
+```
+[  38983ms] [vectors] alloc name=kepler-vblank vector=0x44 == witness ::
+[  38983ms] [vectors] allocated=4 free=171 table=timer:0x20,xhci:0x40,nic:0x41,ipi:0x42,ehci:0x43,kepler-vblank:0x44,spurious:0xff == witness ::
+[  38984ms] [MSI] Enabled on 1:0.0: cap@0x68 addr=0xfee00000 data=0x44 (64-bit) MsgCtl=0x0081
+[  38984ms] :: kepler: vblank-intr vector armed bdf=1:0.0 vector=0x44 wire=1 pmc_entry=00000000 pmc_bit=26 en_entry=00000000 head=0 window_vblanks=60 storm_cap=4096 ::
+[  41000ms] :: kepler: vblank-intr vector close head=0 irq=0 vbl_delta=60 rearms=0 wire=1 vector=0x44 storm=0 pmc_restored=00000000 pmc_readback=00000000 en_restored=00000000 en_readback=00000000 verdict=clean mode=poll ::
+```
+
+So the B168 row is on the table, MSI was programmed on the GK107 (`MsgCtl=0x0081`: 64-bit, enable),
+and nothing was delivered: `irq=0`. The brief's premise ("the interrupt path never armed") is
+refuted by the capture. What this reading changes is WHY `irq=0`.
+
+**Why `irq=0`: bit 26 was written to a register that has no bit 26.** envytools `docs/hw/bus/pmc.rst`
+(fetched 2026-09-23, 543 lines, sha256 `1d3fa199dd3f5c18d69d82750c9725faa3add1a920b52ca4f0e1df3f9aaf02bc`)
+lists `0x140 INTR_ENABLE_HOST` (line 30). Lines 346-349 give it two bits: `bit 0: hardware interrupt
+enable` and `bit 1: software interrupt enable`. Lines 314-316 say this enable register "only allows one to enable/disable all
+hardware or all software interrupts". The per-source bit lives in `0x640 INTR_MASK_HOST`,
+`GT215:` (line 45), described at line 375: a source whose bit is 0 there is "masked off to always-0 in the
+INTR_* register". Bit 26 = PDISPLAY is in the GF100+ source table (line 494). This tree placed bit 26 in
+`0x140` (`gpu_spec.md` §2.3.2 as of `94e90eae`). The wire agrees with the document: the rung-1 line reads
+`en_entry=00000000 en_armed=00000000`, so the bit-26 write to `0x140` read back as 0. §R3 made the same
+write and never read it back. So `INTR_ENABLE_HOST` stayed 0 for the whole window. With the output line
+unable to assert, the GK107 could not send an MSI, and the PDISPLAY source was never examined at
+all. Neither the MSI path nor the ack protocol is convicted by this flight. (Bus master is not the
+cause: `kepler.rs:1310` calls `enable_bus_master` on the GK107 before any of this.)
+
+A census fact for the next rung: on every census sample and through R2's window, `status=02000003
+host_status=02000003 host_summary=01000000 vblank_bit=1`. The VBLANK status bit reads SET before
+anything was enabled and never reads clear (`vblank_seen=16/16`). It is latched and no one clears it. The
+ack protocol is still `NOT-IN-TREE` (B179).
+
+### Finding 2 — the poll counts sampling episodes, not vblanks; derived twice
+
+**Derivation A — from the code (`kepler_vblank.rs` at `94e90eae`).** `note(word)` compares
+`word[31:16]` with the last value it saw. On any difference it calls `edge()`, and `edge()` does
+`VB_COUNT += 1` (`:508`). **The hardware field is a COUNT (rnndb `g80_pdisplay.xml:647`,
+`vblank_count[31:16]`), and the code used it as a changed/unchanged flag and threw away the
+difference.** `note` is fed only by `scanout_beam()`, which is called only inside `beam::hold` (a
+present or a strip paint) and inside `wait_next_edge`. Between two holds the field advances by
+however many vblanks passed, and the next hold counts that as ONE edge. So `count=` is the number of
+sampling episodes that followed at least one vblank. `period_us = Σdt / (count − 1)` (`report()`,
+`:540`) is the mean time between those episodes, and `jitter_us = max(dt) − min(dt)`. max(dt) is the
+longest gap between two episodes: count went 15→22 between the 8319 ms and 32152 ms lines, a ~23.6 s
+stretch with no presents, and `jitter_us=23605994` is that gap.
+
+**Derivation B — from the wire alone, without the code.** (i) *The panel is 60 Hz:* BEAMX86 on the
+same boot, `vtotal=1852 … adv=5020 … sample_ms=45 … vblank_delta=2`. 5020 lines / 1852 = 2.711 frames
+in 45 ms, so 16.60 ms per frame (60.2 Hz), and 2 counter steps in 45 ms matches. (ii) *The count
+runs at the sampling rate:* 10430 counts from the `arm` line at 6414 ms to 405359 ms is 26.1/s.
+Σdt/(n−1) = 398.9 s / 10429 = 38.25 ms, against `period_us=38241`. (iii) *The count follows the
+compositor's workload, which a vblank cannot do:* from 51.5 s to 217.0 s the count ran at
+(5633 − 697) / 165.5 s = **29.8/s** while `[wcn] rollup … passes=118 … span=5044ms` = **23.4 passes/s**
+with `shown=3/3`. From 217.0 s to 405.4 s it ran at (10430 − 5633) / 188.4 s = **25.5/s** while
+`passes=99 … span=5049ms` = **19.6/s** with `shown=2/2`. The count's rate fell by 4.3/s when the
+pass rate fell by 3.8/s. The panel's rate did not change. The count is above the pass rate because
+the menu-bar and dock strip paints also enter `hold` and sample. `[wpace] … rate=19.6/s` and
+`frame_us=16667` are on the same wire: the pacer's target is 16.667 ms, and the count follows the
+presents it actually made.
+
+**The two derivations agree, and they are independent.** A never reads the capture, and B never
+reads `note()`. A predicts a count bounded by the sampling-episode rate, and B measures that rate and
+shows it moving with the pass rate. **The 33 ms KVBLANK2 fix (§R2b) was not what the panel showed. It
+made the WAIT sample, but it left the COUNT counting episodes.** The KVBLANK2 ladder's windows are also
+counted in episodes, not vblanks. R2's "16 vblanks" took 38451→38983 ms = 532 ms (≈32 frames), and
+R3's "60" took 38984→41000 ms = 2016 ms (≈121 frames).
+
+**Why the old path used the field as a flag.** It was written as an EDGE detector for the wait
+(`c != from`), and for that a flag is enough. The period and jitter were then computed from the flag's
+timestamps, which only give a true period when the sampler never misses a vblank. KVBLANK's doc
+assumed exactly that ("the compositor's own hold loop is the sampler, at ~400 kHz during a hold"),
+but the claim holds only DURING a hold, and holds cover a few ms of each 50 ms present.
 ## PRE-REGISTERED — KVBLANK2 (rmbp, the GPU line under R53), rungs R1 CITATION / R2 ENABLE WINDOW / R3 THE VECTOR, cut 2026-09-22
 
 **NOT FLOWN.** Written here before the boot, unedited afterwards, because that is what makes the
