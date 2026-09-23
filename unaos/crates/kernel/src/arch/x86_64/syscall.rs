@@ -2859,7 +2859,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
                     // the prober's sweep — which is the only honest way to reach the -EACCES arm.
                     DMG_OWNER_WITNESS.store(a0 as u32, Ordering::Release);
                     DMG_DONE.fetch_add(1, Ordering::AcqRel);
-                } Some("busx86-midden") | Some("busx86-other") | Some("stor1-name") | Some("stor1-mv") => {} // STOR-1 M1/M2: `stor1-name` joins the no-exit-witness arm for the identical reason — its witness is the sealed RESULT TABLE in its own window, and letting its exit fall to the `_` arm would silently move U1a's byte-for-byte `exited=` count. ⚠ SAME-LINE fold. · BUSX86 M3: the ring-3 midden pair carries NO exit witness — its witness is the RESULT TABLE it writes into its own window (thirteen legs' two answers each, sealed), which the launcher reads while the slot is still live. The arm exists anyway, and it is not decoration: the `_` fallback below counts an unrecognised name into `U1A_EXITED_OK`, so a fixture that skipped this list would silently move U1a's byte-for-byte `exited=` count. Named, does nothing, changes nothing. ⚠ SAME-LINE fold (see the `use` line's note).
+                } Some("busx86-midden") | Some("busx86-other") | Some("stor1-name") | Some("stor1-mv") | Some("stor1-wr") => {} // STOR-1 M1/M2/M3: `stor1-name` joins the no-exit-witness arm for the identical reason — its witness is the sealed RESULT TABLE in its own window, and letting its exit fall to the `_` arm would silently move U1a's byte-for-byte `exited=` count. ⚠ SAME-LINE fold. · BUSX86 M3: the ring-3 midden pair carries NO exit witness — its witness is the RESULT TABLE it writes into its own window (thirteen legs' two answers each, sealed), which the launcher reads while the slot is still live. The arm exists anyway, and it is not decoration: the `_` fallback below counts an unrecognised name into `U1A_EXITED_OK`, so a fixture that skipped this list would silently move U1a's byte-for-byte `exited=` count. Named, does nothing, changes nothing. ⚠ SAME-LINE fold (see the `use` line's note).
                 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
                 Some("sock2-udp") => {
                     // SOCK-2: the UDP round-trip fixture conveys its 5-bit witness bitmask as its exit STATUS
@@ -12313,7 +12313,7 @@ const U10OP_DELETE: u32 = 4;
 /// The U10 demo file names — the single source of truth an op's `U10_NAMEID` indexes, so the drain re-resolves
 /// the on-disk directory entry by the SAME name the fixture named (`find_located`). GROW.BIN is also a staged
 /// file (idx `GROW_STAGED_IDX`); FRESH.BIN/DELME.BIN/DEFER.BIN are runtime-created (never staged).
-const U10_NAMES: [&str; 11] = [U10_GROW_NAME, U10C_NAME, U10D_NAME, U11M2_NAME, U6GX_NAME, "MIDDEN.BIN", "OTHER.BIN", "COPY.BIN", S1N_NAME, S1N_NAME2, S1N_NAME3]; // STOR-1 M2: STOR2.BIN and STOR3.BIN — the rename witness needs somewhere to move a file TO, and two destinations rather than one because its -EEXIST leg must land on a name that is ALREADY live while its -EBUSY leg still needs a free one. · STOR-1 M1: STOR1.BIN — the created-name-entry witness's OWN name, registered here for the same reason every other one is (on this arch `u10_creatable_nameid` IS the creatable set) and NOT shared with any other fixture: a witness whose verdict depends on another fixture's ordering, or whose leftovers depend on another fixture's pre-flight, is two fixtures pretending to be one. ⚠ SAME-LINE fold. · BUSX86 M3: the ring-3 midden's three CREATABLE names — MIDDEN.BIN (the path the witness owns), OTHER.BIN (the path ANOTHER row owns, which is the only way an -EACCES leg can exist at all) and COPY.BIN (the bus `cp` destination). Registered HERE and nowhere else, because on this arch `u10_creatable_nameid` IS the creatable set. The witness's "does not exist" name (NOSUCH.BIN) is deliberately ABSENT from this table — that absence is exactly what makes its -ENOENT leg honest on BOTH legs at once. ⚠ SAME-LINE fold: this file's panic `Location` records embed line numbers (see the `use` line's note).
+const U10_NAMES: [&str; 12] = [U10_GROW_NAME, U10C_NAME, U10D_NAME, U11M2_NAME, U6GX_NAME, "MIDDEN.BIN", "OTHER.BIN", "COPY.BIN", S1N_NAME, S1N_NAME2, S1N_NAME3, S1WR_FOREIGN]; // STOR-1 M3: WRFOR.BIN — the write-side witness's FOREIGN-owned path, the only way an -EACCES leg can exist at all (BUSX86 M3's own words about OTHER.BIN); it is a separate name from the witness's own three because a file it is allowed to destroy and a file it must be refused are different fixtures. · STOR-1 M2: STOR2.BIN and STOR3.BIN — the rename witness needs somewhere to move a file TO, and two destinations rather than one because its -EEXIST leg must land on a name that is ALREADY live while its -EBUSY leg still needs a free one. · STOR-1 M1: STOR1.BIN — the created-name-entry witness's OWN name, registered here for the same reason every other one is (on this arch `u10_creatable_nameid` IS the creatable set) and NOT shared with any other fixture: a witness whose verdict depends on another fixture's ordering, or whose leftovers depend on another fixture's pre-flight, is two fixtures pretending to be one. ⚠ SAME-LINE fold. · BUSX86 M3: the ring-3 midden's three CREATABLE names — MIDDEN.BIN (the path the witness owns), OTHER.BIN (the path ANOTHER row owns, which is the only way an -EACCES leg can exist at all) and COPY.BIN (the bus `cp` destination). Registered HERE and nowhere else, because on this arch `u10_creatable_nameid` IS the creatable set. The witness's "does not exist" name (NOSUCH.BIN) is deliberately ABSENT from this table — that absence is exactly what makes its -ENOENT leg honest on BOTH legs at once. ⚠ SAME-LINE fold: this file's panic `Location` records embed line numbers (see the `use` line's note).
 /// The count of `U10_NAMES` — the width of the per-row `DYN_DELETED` overlay.
 const N_U10_NAMES: usize = U10_NAMES.len();
 static U10_USED: [AtomicBool; NU10] = [const { AtomicBool::new(false) }; NU10];
@@ -23551,7 +23551,7 @@ fn u11m2_launcher(demo_cpu: usize) {
     #[cfg(feature = "irqstorage")]
     s6_witness_launcher(demo_cpu);
     // U6x: chain the owner/grants ACL demo (program order, the u9x->..->u11m2 idiom; the LAST demo in the chain).
-    u6gx_launcher(demo_cpu); stor1_name_launcher(demo_cpu); stor1_mv_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); busx86_stamp_check(); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
+    u6gx_launcher(demo_cpu); stor1_name_launcher(demo_cpu); stor1_mv_launcher(demo_cpu); stor1_wr_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); busx86_stamp_check(); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
 }
 
 /// Build a U6x fixture slot at a given entry symbol — the `u7x_build`/`u11m2_build` shape (allocate a private
@@ -24588,7 +24588,7 @@ pub fn session_epoch_fixture(user_id: u32, name: &[u8]) -> bool {
 const EEXIST_X: i64 = -17; // bus cp refuses an existing destination (create-new-only in v1 — the BANDY-1 contract)
 const E2BIG_X: i64 = -7; // a source over the v1 copy ceiling
 const EMSGSIZE_X: i64 = -90; // SYS_MRECV buffer smaller than BUS_FRAME_MAX (the whole-frame contract)
-const ENOSYS_X: i64 = -38; // a v1 verb this arch does not fulfil yet (the BANDY-2 write side — see bus_verb_dispatch)
+const ENOSYS_X: i64 = -38; // STOR-1 M3: NO verb answers this any more (the BANDY-2 write side is fulfilled). Kept, and still referenced, as the value the `BUSX86-WR` witness FORBIDS on every leg — a re-stub would otherwise read as a plausible errno instead of as the regression it is. ⚠ SAME-LINE fold.
 
 /// Mailbox depth per row — a deliberate bounded cap (STOP-tripwired like `USER_SLOTS`), the aarch64
 /// `BUS_MBOX_DEPTH` verbatim.
@@ -24856,20 +24856,20 @@ fn busx_cat(row: usize, cgen: u64, name: &str, text: &mut alloc::vec::Vec<u8>) -
 /// wrong). The created copy is PRIVATE to the invoker exactly as a direct `sys_open(O_CREAT)` is — the
 /// bus mints nothing the direct path would not.
 ///
-/// ⚠ THE ONE HONEST-SCOPE DIVERGENCE OF THIS ARC, and it is a property of the x86 namespace rather than
-/// of the bus. On aarch64 a created file is a DIRECTORY ENTRY: `create_in_root` makes it, and it
-/// outlives every descriptor. On x86 a created file's identity IS a live descriptor
-/// (`created_desc_any_row` is the existence test — see `sys_open_dynamic`), so a fulfiller that created
-/// the copy and then closed its own handle would destroy the thing it had just acknowledged. This
-/// implementation therefore does what the DIRECT path does and keeps the descriptor: the destination is
-/// created through `open_create_new`, and the File handle it mints STAYS in the invoker's handle table,
-/// owned by the invoker, until the invoker closes it or tears down. That is the same end state a direct
-/// `SYS_OPEN(dst, O_CREAT|RW)` reaches, with the same fail-closed errnos (-EMFILE / -EAGAIN when the
-/// invoker's descriptor or handle table is full), and it is the only shape on this arch that makes the
-/// copy OBSERVABLE afterwards — a `bus ls` that cannot see what `bus cp` just made would be a lie.
-/// The cost is stated plainly: a bus `cp` consumes one handle slot of the invoker's eight. The
-/// descriptor-free create that would retire this note belongs to the x86 created-name-on-disk arc
-/// (STOR-1's line), not to the bus.
+/// ⚠ THE HONEST-SCOPE NOTE THIS FUNCTION CARRIED FOR TWO MILESTONES IS RETIRED HERE (STOR-1 M3), and
+/// it is restated in its retired form because the shape of the old constraint is the clearest account
+/// of what changed. IT SAID: on aarch64 a created file is a DIRECTORY ENTRY and outlives every
+/// descriptor, but on x86 a created file's identity WAS a live descriptor, so a fulfiller that created
+/// the copy and closed its own handle would destroy the thing it had just acknowledged — therefore bus
+/// `cp` did what the direct path does and KEPT the descriptor. The cost was stated plainly: one handle
+/// slot of the invoker's eight, one descriptor, and (rmbp-ledger B171's measurement, which the note did
+/// not yet know when it was written) one of only three writable-staging slots, which is what made
+/// VERIFYING a bus `cp` cost three at once. IT IS NO LONGER TRUE. STOR-1 M1 made a created name an
+/// ENTRY that survives every close, so the destination is minted by `created_entry_create` — no
+/// descriptor, no handle, no pool slot — and the copy is observable afterwards because it EXISTS rather
+/// than because someone is holding it. The end state is still the one a direct
+/// `SYS_OPEN(dst, O_CREAT|RW)` followed by a close reaches, and the bus still mints nothing the direct
+/// path would not. What the two arches do here is now one thing said twice: a name outliving its maker.
 fn busx_cp(row: usize, cgen: u64, src: &str, dst: &str) -> i64 {
     // SOURCE — read it first (the cat gate), so a denied or missing source costs the destination nothing.
     let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -24902,33 +24902,33 @@ fn busx_cp(row: usize, cgen: u64, src: &str, dst: &str) -> i64 {
             return EEXIST_X; // create-new-only in v1 (see the doc note)
         }
     }
-    // CREATE — the direct path's own function, so ownership, the O_CREAT-private policy, the deleted
-    // re-check under the lock and every claim/unwind are the syscall's and not a second copy of it.
-    let h = open_create_new(row, nameid, false);
-    if h < 0 {
-        return h; // -EBUSY / -EMFILE / -EAGAIN / -EIO, verbatim from the direct create
-    }
-    // CONTENT — extend the fresh (0-length) staging buffer from KERNEL memory. `sys_write_grow` is the
-    // ring-3 twin of these four stores and cannot be called here: it validates and copies through
-    // `copy_from_user`, which refuses a kernel address by design. So the same four publications are made
-    // in the same order (bytes, then length, then size, then the grew mark), which is the order a
-    // reader's `sys_read` depends on.
-    let Some((crow, idx)) = created_desc_any_row(row, nameid) else {
-        return EIO; // the create above published a descriptor; its absence is a kernel bug — fail closed
-    };
-    debug_assert!(crow == row, "busx_cp: open_create_new landed off the invoker's row");
-    if !data.is_empty() {
-        let Some(widx) = (FILE_WSTAGE[crow][idx].load(Ordering::Acquire) as usize).checked_sub(1) else {
-            return EIO;
-        };
-        if data.len() > PAGE_SIZE as usize {
-            return ENOSPC; // the one-page staging buffer bounds a created file (the sys_write_grow clamp)
-        }
-        wstage_write_at(widx, 0, data.as_ptr() as u64, data.len());
-        wstage_set_len_at_least(widx, data.len() as u32);
-        FILE_SIZE[crow][idx].store(data.len() as u32, Ordering::Release);
-        mark_dirty(crow, idx, 0, data.len() as u32);
-        FILE_GREW[crow][idx].store(true, Ordering::Release);
+    // CREATE + CONTENT, in ONE descriptor-free step — STOR-1 M3. What stood here was a two-part dance
+    // forced by the retired note above: `open_create_new` to mint a descriptor (which then had to be
+    // KEPT, or the copy died with it), followed by four hand-made publications into that descriptor's
+    // writable staging buffer, in the exact order a reader's `sys_read` depends on — necessary because
+    // `sys_write_grow` copies through `copy_from_user`, which refuses a kernel address by design.
+    // `created_entry_create` is that entire sequence with the descriptor taken out of it: the name, its
+    // bytes and its owner row, claimed under the namespace lock with the on-disk twin materialised
+    // before it, and the O_CREAT-private policy unchanged (the copy is the invoker's, not the world's).
+    //
+    // WHAT THE INVOKER PAYS NOW, against what B171 measured it paying: NOTHING. Not one of its eight
+    // handle slots, not a descriptor, and — the measurement that row made the whole point of — not one
+    // of the three writable-staging slots. `NWSTAGE` bounds concurrent live WRITERS again, which is
+    // what a staging pool is for, and a bus `cp` is not one of them. B171's companion finding follows
+    // it out: VERIFYING a cp cost three slots at once (source, the kept destination, the read-back
+    // sibling) and now costs two — the middle term no longer exists, and the read-back of a copy
+    // nobody holds open resolves through `open_created_entry` rather than through a peer's descriptor.
+    //
+    // ORDER IS UNCHANGED AND STILL LOAD-BEARING: the SOURCE was read first (the cat gate, above), so a
+    // denied or missing source still costs the destination nothing — no name is minted for a copy that
+    // was never permitted. Only after that verdict does anything at all get created.
+    //
+    // The errnos stay the direct path's because they stay the direct path's FUNCTIONS: -EBUSY from the
+    // deleted re-check, -EEXIST from create-new-only, -ENOSPC from the one-page bound, -EIO from the
+    // volume. -EMFILE and -EAGAIN are simply unreachable now — no descriptor, no handle to install.
+    let rc = created_entry_create(row, nameid as usize, false, &data);
+    if rc != 0 {
+        return rc;
     }
     0
 }
@@ -25036,14 +25036,14 @@ fn busx_msend_for(row: usize, cgen: u64, frame: &[u8]) -> i64 {
             },
             Err(_) => return EINVAL,
         },
-        // BANDY-2's write side (write / rm / mv) is a DECODED, VALID frame on this arch — the codec is
-        // shared, so the goldens and the typed parsers run here exactly as they do on the Pi — but it is
-        // NOT FULFILLED yet, and it says so in the reply rather than pretending the verb is unknown.
-        // -ENOSYS, not -EINVAL: -EINVAL is what a MALFORMED frame gets, and a client that cannot tell
-        // "I spoke wrongly" from "this board cannot do that yet" has no way to degrade. The three
-        // destructive verbs need a descriptor-free create/unlink/rename in the x86 created-name
-        // namespace (see `busx_cp`'s note); that is the STOR-1 line's work, not the bus's.
-        crate::bus::BUS_VERB_WRITE | crate::bus::BUS_VERB_RM | crate::bus::BUS_VERB_MV => ENOSYS_X,
+        // BANDY-2's write side, FULFILLED (STOR-1 M3). It used to answer `-ENOSYS` in a well-formed
+        // reply — honest, and it said why: the three destructive verbs needed a descriptor-free
+        // create/unlink/rename in the x86 created-name namespace. They have one now. `busx_rm` IS
+        // `created_entry_destroy` and `busx_mv` IS `rename_created` — the same functions the direct
+        // by-name delete and `SYS_RENAME` call — so these legs cannot drift from the syscall's, there
+        // being no second implementation to drift from. Body parsing and the fail-closed `-EINVAL` on
+        // a malformed one are the aarch64 dispatcher's, verb for verb. ⚠ LINE-NEUTRAL fold (B94).
+        crate::bus::BUS_VERB_WRITE => match crate::bus::write_body_parse(body) { Ok((nb, c)) => match core::str::from_utf8(nb) { Ok(n) => busx_write(row, cgen, n, c), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_RM => match crate::bus::cat_body_parse(body) { Ok(nb) => match core::str::from_utf8(nb) { Ok(n) => busx_rm(row, cgen, n), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_MV => match crate::bus::cp_body_parse(body) { Ok((a, b)) => match (core::str::from_utf8(a), core::str::from_utf8(b)) { (Ok(x), Ok(y)) => busx_mv(row, cgen, x, y), _ => return EINVAL }, Err(_) => return EINVAL },
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
     busx_reply_enqueue(row, hdr.corr, hdr.verb, status, &text)
@@ -26324,7 +26324,7 @@ fn busx86_midden_launcher(_demo_cpu: usize) {
             diff += 1;
         }
     }
-    let nosys = (9..12).filter(|&i| bus[i] == -38).count();
+    let fulfilled = bus[9] == EBUSY && bus[10] == 0 && bus[11] == ENOENT; // STOR-1 M3 RE-POINT (and it is a re-point, not a relaxation): these three legs used to assert `3/3 -ENOSYS`, which was only ever a statement that the verbs DID NOTHING. They do something now, so the assertion becomes the exact triple this fixture's own frames must produce — `write MIDDEN.BIN` -EBUSY (M owns it AND HOLDS IT OPEN, and an x86 truncate is a replace, refused under a live reader), `rm MIDDEN.BIN` 0 (M owns it; the U10 M3 deferral keeps M's own descriptor readable), `mv MIDDEN.BIN COPY.BIN` -ENOENT (the rm one line above took the source away). Pinning the triple asserts strictly MORE than `-ENOSYS` did: it says the ACL ran, the refusal ran, and the ordering between two destructive verbs is the one the wire asked for.
     let badframe = bus[12];
     // A cleanup step that returned an errno did NOT free its file, and a file not freed at a GO step
     // lands on the teardown's shoulders where a second enqueue meets a one-deep queue. So the unlinks'
@@ -26337,11 +26337,11 @@ fn busx86_midden_launcher(_demo_cpu: usize) {
         && cleared
         && drained
         && diff == 0
-        && flags == 7
-        && nosys == 3
+        && flags & 5 == 5 // STOR-1 M3 RE-POINT: bit0 (cat payload) and bit2 (the refused frame queued nothing) still hold; bit1 — the cp-own COPY's content — cannot, because this fixture's own `rm MIDDEN.BIN` leg (now fulfilled) removes the source its later cp-own leg needs, and the frames are `global_asm!` this seat may not re-order (B94). THE CLAIM IS NOT DROPPED, IT MOVED: `BUSX86-WR` bit10 makes a bus `cp` and reads the copy back DIRECTLY byte-exact, and does it with TWO created files held open — which this fixture could never do, because that is the very ceiling STOR-1 M3 retires.
+        && fulfilled
         && badframe == EINVAL;
     serial_println!(
-        ":: BUSX86-EQ: ring-3 midden (busx86-midden) — denied via the bus == denied via the DIRECT syscall, byte-same errno; permitted via one == permitted via the other: legs={} same={} diff={} [{}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{}] payload cat={} cp={} refused-frame-queued-nothing={} write/rm/mv={}/3 {} (BANDY-2 write side, well-formed reply, distinct from -EINVAL) badframe={} identity=(row,SLOT_GEN)=({},{}) seq={} sealed={} cleanup={} unlinked={} cleared={} drained={} ops_replayed={} -> {} ::",
+        ":: BUSX86-EQ: ring-3 midden (busx86-midden) — denied via the bus == denied via the DIRECT syscall, byte-same errno; permitted via one == permitted via the other: legs={} same={} diff={} [{}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{}] payload cat={} cp-own-content={} refused-frame-queued-nothing={} write/rm/mv={}/{}/{} (BANDY-2 write side FULFILLED by STOR-1 M3 — it answered -ENOSYS x3 here until that arc; this fixture's own rm is what takes its cp-own source away, and the cp payload claim now lives in BUSX86-WR bit10) badframe={} identity=(row,SLOT_GEN)=({},{}) seq={} sealed={} cleanup={} unlinked={} cleared={} drained={} ops_replayed={} -> {} ::",
         BXM_LEGS, same, diff,
         BXM_LEG_NAMES[0], busxm_errno_name(direct[0]), busxm_errno_name(bus[0]),
         BXM_LEG_NAMES[1], busxm_errno_name(direct[1]), busxm_errno_name(bus[1]),
@@ -26353,9 +26353,9 @@ fn busx86_midden_launcher(_demo_cpu: usize) {
         BXM_LEG_NAMES[7], busxm_errno_name(direct[7]), busxm_errno_name(bus[7]),
         BXM_LEG_NAMES[8], busxm_errno_name(direct[8]), busxm_errno_name(bus[8]),
         if flags & 1 != 0 { "same" } else { "DIFF" },
-        if flags & 2 != 0 { "same" } else { "DIFF" },
+        if flags & 2 != 0 { "same" } else { "n/a-source-removed-by-this-fixture's-own-rm" },
         flags & 4 != 0,
-        nosys, busxm_errno_name(bus[9]),
+        busxm_errno_name(bus[9]), busxm_errno_name(bus[10]), busxm_errno_name(bus[11]),
         busxm_errno_name(badframe),
         identity_row, identity_gen,
         seq_ok, sealed, clean_ok, unlinked, cleared, drained, replayed,
@@ -27702,6 +27702,914 @@ fn stor1_mv_launcher(demo_cpu: usize) {
             w, S1MV_WANT, signalled, handshook, sealed, cleared, drained, acl_ok, entries_gone, replayed,
             foreign, owner,
             rc[0], rc[1], rc[2], rc[3], rc[4], rc[5], rc[6], rc[7], rc[8], rc[9], rc[10], rc[11]
+        );
+    }
+}
+
+// =================================================================================================
+// STOR-1 M3 — THE BUS. The two things LEDGER SR20 and rmbp-ledger B153/B171 left open, closed:
+// `busx_cp` stops keeping a handle, and the BANDY-2 write side stops answering `-ENOSYS`.
+//
+// HOW THE WRITE SIDE IS FULFILLED, and it is the whole design in one sentence: `busx_mv` IS
+// `rename_created` and `busx_rm` IS `created_entry_destroy` — the very functions `SYS_RENAME` and
+// the by-name delete call, not copies of them. So the equivalence BUSX86-EQ asserts for the read
+// side by COMPARING two answers is, for the write side, TRUE BY CONSTRUCTION: there is no second
+// implementation that could drift, no hand-copied errno table, and the ACL is not "the same rule"
+// but the same call. That is a stronger claim than a comparison and a weaker witness — a comparison
+// of a function against itself proves nothing — which is exactly why the M3 witness below spends
+// its legs on what construction does NOT give for free: that the round trip works across the real
+// ring-3 wire, that a FOREIGN-owned file refuses all three destructive verbs, and that a refused
+// verb left the file and its owner row untouched. (The read side's nine legs are unchanged and
+// still compared, because `busx_cat`/`busx_cp` genuinely are second implementations of `sys_open`'s
+// gate and could drift.)
+//
+// WHAT `NWSTAGE` BOUNDS NOW — the ceiling B171 measured, re-measured. It was: "verifying a bus `cp`
+// costs three writable-staging slots at once — the source, the destination the fulfiller KEPT, and
+// the sibling that reads the copy back — so one other row holding a created file open makes the
+// read-back `-EMFILE`." The middle term is gone. A bus `cp` now creates an ENTRY and holds nothing:
+// no handle of the invoker's eight, no descriptor, and NO POOL SLOT. `NWSTAGE` is still 3 and still
+// untouched, and it now bounds exactly one thing — CONCURRENT LIVE WRITERS — which is what a
+// staging pool was always supposed to be for. Verifying a cp costs TWO (the source, if the invoker
+// holds it open, and the read-back), and the read-back of a copy nobody holds open goes through
+// `open_created_entry`, which seeds from the entry's own twin rather than from a peer descriptor.
+//
+// DOES M3's TWO-PHASE FIXTURE STILL NEED ITS PHASES? No — and the honest answer has two halves.
+// Arithmetically: phase 1 holds OTHER.BIN (1) and MIDDEN.BIN (1); doing the cp and its read-back
+// without releasing O would now need one more, for three — exactly `NWSTAGE`, where before it
+// needed four. So the choreography is no longer load-bearing. It is nonetheless RETAINED, because
+// removing it means restructuring a ring-3 `global_asm!` block in the middle of a 26k-line file
+// whose panic `Location` records embed line numbers (B94), and this seat's discipline is appends
+// and same-line folds. The retirement is therefore PROVED POSITIVELY instead, by a new leg in the
+// M3 witness below: a bus `cp` made while another row holds a created file open, read back
+// directly, byte-exact — the exact shape that printed `cp-copy open_rc=-24` before this milestone.
+//
+// AND THE COUNTERPARTY IS NOT A PROGRAM ANY MORE, which is M1's dividend showing up as a
+// simplification rather than a claim. BUSX86 M3 needed a whole second ring-3 process (`busx86-other`
+// on its own core and slot) for ONE purpose: to HOLD OTHER.BIN open, because letting go would have
+// destroyed it and every `-EACCES` leg would have decayed into an `-ENOENT` leg without saying so.
+// A foreign-owned file now survives its creator, so this witness's counterparty is a scratch row
+// that creates the file, closes it, and goes away — no core, no slot, no choreography.
+// =================================================================================================
+
+/// STOR-1 M3: CREATE A CREATED NAME WITH CONTENT AND NO DESCRIPTOR — the primitive the whole
+/// milestone turns on, and the one the two ledger rows named as missing ("a descriptor-free
+/// create/unlink/rename in the x86 created-name namespace"). The `open_create_new` twin with the
+/// descriptor, the handle and the writable-staging slot all removed: what is left is a namespace
+/// entry, its content, and its owner row.
+///
+/// ORDER, and it is `rename_created`'s for the same reason: the on-disk twin is materialised FIRST,
+/// off the lock (never a service-task block under a spinlock — the STOR-1 S5 deadlock class), and
+/// the namespace is claimed SECOND, under it. A storage failure is then a clean `-EIO` with nothing
+/// minted; the residue is an idempotently-re-creatable orphan the fixtures' pre-flight self-heals,
+/// which is the trade STOR-1 S4a already makes at every create.
+///
+/// The caller has taken the create-new-only decision; this re-takes it under the lock, because both
+/// callers released the lock to do the disk half.
+fn created_entry_create(row: usize, nameid: usize, public: bool, content: &[u8]) -> i64 {
+    if nameid >= N_U10_NAMES {
+        return ENOENT;
+    }
+    if row == SHARED_ROW {
+        return EACCES; // a created file is RW and never lives in the shared window
+    }
+    if content.len() > PAGE_SIZE as usize {
+        return ENOSPC; // the one-page bound a created file has always had (the sys_write_grow clamp)
+    }
+    #[cfg(feature = "irqstorage")]
+    if s4_sync_storage() {
+        let name = U10_NAMES[nameid];
+        if unsafe { crate::drivers::xhci::irqstorage::submit_create(name.as_bytes()) } < 0 {
+            return EIO;
+        }
+        if !content.is_empty() {
+            let mut kbuf = alloc::vec::Vec::from(content); // the service task reads via *mut u8
+            let n = kbuf.len();
+            if unsafe {
+                crate::drivers::xhci::irqstorage::submit_grow(name.as_bytes(), 0, kbuf.as_mut_ptr(), n)
+            } < 0
+            {
+                return EIO;
+            }
+        }
+    }
+    let _ns = ns_lock();
+    if DYN_DELETED_G[nameid].load(Ordering::Acquire) {
+        return EBUSY; // `open_create_new`'s refusal: the deferred delete has not drained
+    }
+    if created_entry_live(nameid) {
+        return EEXIST_X; // create-new-only — re-taken under the lock the disk phase released
+    }
+    created_entry_make(nameid);
+    if !content.is_empty() {
+        let n = content.len().min(PAGE_SIZE as usize);
+        unsafe {
+            let dst = (&raw mut CREATED_BUF).cast::<u8>().add(nameid * PAGE_SIZE as usize);
+            core::ptr::copy_nonoverlapping(content.as_ptr(), dst, n);
+        }
+        CREATED_LEN[nameid].store(n as u32, Ordering::Release);
+        CREATED_SIZE[nameid].store(n as u32, Ordering::Release);
+    }
+    // Owned-by-default exactly as `open_create_new` is: a private create records this row (gen-fenced)
+    // as the owner, `public` opts out. The bus mints nothing the direct path would not.
+    if !public {
+        owned_set_owner(nameid, row, SLOT_GEN[row].load(Ordering::Acquire));
+        #[cfg(feature = "login")]
+        owned_user_stamp(nameid, row);
+    }
+    0
+}
+
+/// STOR-1 M3 — bus `write`: CREATE-OR-TRUNCATE a created name under the invoker's grants, the
+/// `bus_write` twin. CREATE (name absent) mints the entry private to the invoker, exactly as a
+/// direct `SYS_OPEN(O_CREAT)` + one write would. TRUNCATE (name present) is OWNER-ONLY, and for
+/// `bus_write`'s stated reason inherited rather than re-derived: a delete-then-recreate BY A
+/// GRANTEE would let a content grantee steal ownership, so a truncate of an OWNED file takes the
+/// same authority a delete does.
+///
+/// ⚠ HONEST SCOPE, the x86 half of the one `bus_write` already flags. A truncate is implemented as
+/// destroy-then-create (there is no shrink primitive under this lane on either arch), so it is
+/// refused `-EBUSY` while ANY descriptor of the name is open — a reader holding a snapshot would
+/// otherwise keep serving bytes from a file that had been replaced underneath it. Same refusal, same
+/// reason and the same named retirement as `sys_rename`'s: an in-place rewrite needs a storage-task
+/// primitive that does not exist yet (`drivers/xhci/irqstorage.rs`, not this seat's file).
+fn busx_write(row: usize, cgen: u64, name: &str, content: &[u8]) -> i64 {
+    if content.len() > BUSX_CP_MAX {
+        return E2BIG_X; // v1's honest write ceiling, shared with cp
+    }
+    let name = match busx_resolve(name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if row == SHARED_ROW {
+        return EACCES;
+    }
+    if staged_lookup(name).is_some() {
+        return EACCES; // `sys_unlink`'s scaffold guard: an immutable staged file is not ring 3's to rewrite
+    }
+    let Some(nameid) = u10_creatable_nameid(name) else {
+        return if u10_name_id(name).is_some() { EACCES } else { ENOENT };
+    };
+    let nameid = nameid as usize;
+    let live = {
+        let _ns = ns_lock();
+        if DYN_DELETED_G[nameid].load(Ordering::Acquire) {
+            return EBUSY;
+        }
+        if created_entry_live(nameid) {
+            if !owned_unlink_permitted(nameid, row, cgen) {
+                return EACCES; // the truncate authority IS the delete authority
+            }
+            if OPENF_REFS[nameid].load(Ordering::Acquire) != 0 {
+                return EBUSY; // ⚠ see the honest-scope note: a replace under a live reader is refused
+            }
+            true
+        } else {
+            false
+        }
+    };
+    if live {
+        let rc = created_entry_destroy(row, nameid, true);
+        if rc != 0 {
+            return rc;
+        }
+    }
+    created_entry_create(row, nameid, false, content)
+}
+
+/// STOR-1 M3 — bus `rm`: UNLINK a created name under the invoker's grants. ONE CALL, and that is the
+/// point: `created_entry_destroy` is the by-name delete core, so the bus's delete and the direct
+/// by-name delete are not two implementations agreeing, they are one implementation. DELETE is
+/// OWNER-ONLY inside it (`owned_unlink_permitted`, `sys_unlink`'s own call), and descriptors already
+/// open elsewhere keep reading until their last close — the U10 M3 deferral, unchanged.
+///
+/// The invoker's `cgen` is the SLOT_GEN captured when the frame was sent and `created_entry_destroy`
+/// re-reads `SLOT_GEN[row]`; they are the same value for a synchronous fulfilment (the row cannot be
+/// recycled underneath its own running syscall), and the re-read is the more conservative of the two.
+fn busx_rm(row: usize, cgen: u64, name: &str) -> i64 {
+    let name = match busx_resolve(name) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if row == SHARED_ROW {
+        return EACCES;
+    }
+    if staged_lookup(name).is_some() {
+        return EACCES; // the scaffold guard: ring 3 may not 0xE5 an immutable staged file
+    }
+    let Some(nameid) = u10_creatable_nameid(name) else {
+        return if u10_name_id(name).is_some() { EACCES } else { ENOENT };
+    };
+    debug_assert_eq!(cgen, SLOT_GEN[row].load(Ordering::Acquire), "busx_rm: the invoker's row was recycled mid-fulfilment");
+    created_entry_destroy(row, nameid as usize, true)
+}
+
+/// STOR-1 M3 — bus `mv`: RENAME under the invoker's grants. ONE CALL to `rename_created`, the body
+/// `SYS_RENAME` itself calls after its copy-in. So "denied via the bus == denied via the direct
+/// syscall" is not a comparison that happens to come out equal here; it is the same function
+/// answering twice, and the errnos cannot drift because there is nothing to drift from. Owner-only,
+/// create-new-only on the destination, `-EBUSY` on a live source — all of it the syscall's, stated
+/// once, in one place.
+fn busx_mv(row: usize, cgen: u64, src: &str, dst: &str) -> i64 {
+    let src = match busx_resolve(src) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let dst = match busx_resolve(dst) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    debug_assert_eq!(cgen, SLOT_GEN[row].load(Ordering::Acquire), "busx_mv: the invoker's row was recycled mid-fulfilment");
+    rename_created(row, src, dst)
+}
+
+// =================================================================================================
+// STOR-1 M3 — THE WITNESS: `BUSX86-WR`, the write side on the wire. It is a NEW witness rather than
+// three more legs of BUSX86-EQ, and the reason is mechanical rather than stylistic: BUSX86-EQ's
+// fixture is a `global_asm!` block in the middle of this 26k-line file, and extending it means
+// inserting lines into a file whose panic `Location` records embed line numbers (B94). So M3 extends
+// the CLAIM and appends the witness, exactly as the brief's own alternative allows.
+//
+// WHAT IT ASSERTS, in the BANDY shapes the Pi already pins, on x86:
+//   BANDY-WR  bit0..bit5 — write -> cat byte-exact · mv -> cat(new) byte-exact AND cat(old) -ENOENT
+//                          · rm -> cat -ENOENT. Plus bit2, which the Pi's own witness does not have:
+//                          the bus's WRITE read back through the DIRECT syscall, so "the bus wrote a
+//                          file" means a file the rest of the system can see, not a bus-visible ghost.
+//   BANDY-EQ2 bit6..bit8 — write, rm and mv of a FOREIGN-owned file are each -EACCES. (On the Pi this
+//                          is stated as an equivalence against the direct syscall; here it is stronger
+//                          and cheaper at once, because `busx_rm` and `busx_mv` ARE the direct
+//                          functions — there is no second answer to compare, only one to check.)
+//   BANDY-ACL bit9       — and the three denials left the world intact: the foreign file is STILL
+//                          there and STILL foreign (cat -> -EACCES, not -ENOENT), and the name the
+//                          denied `mv` aimed at was NOT created (cat -> -ENOENT). A denial that
+//                          half-happened is the failure this bit exists to catch.
+//   THE CEILING bit10    — and this is B171's measurement, re-run. With the counterparty row holding
+//                          its created file OPEN (one staging slot) and the fixture holding its own
+//                          source OPEN (a second), a bus `cp` is made and the copy is READ BACK
+//                          DIRECTLY, byte-exact. Under the old model that cost FOUR slots — source,
+//                          counterparty, the destination the fulfiller had to KEEP, and the read-back
+//                          sibling — against a pool of three, and B171 recorded exactly what that
+//                          printed: `cp-copy open_rc=-24`. It now costs three, because the kept
+//                          destination is gone. The ceiling is not "retired" in the sense of being
+//                          raised; `NWSTAGE` is still 3. It is retired in the sense that a bus `cp`
+//                          no longer CONSUMES from it.
+//
+// AND THE COUNTERPARTY IS NOT A PROGRAM. BUSX86 M3 needed a whole second ring-3 process on its own
+// core and slot for one job — HOLDING OTHER.BIN open, because letting go would have destroyed it and
+// every -EACCES leg would have quietly become an -ENOENT leg. Here the counterparty is a scratch row
+// the launcher allocates, which creates WRFOR.BIN through `created_entry_create` and holds ONE handle
+// on it (for the ceiling leg's sake, not the ACL's — after M1 the file would outlive even that). No
+// core, no blob, no GO/SIG choreography. That simplification IS M1, showing up as subtraction.
+// =================================================================================================
+
+const S1WR_W_OFF: usize = 0x2800;
+const S1WR_RC_OFF: usize = 0x2808; // i64[16] — every leg's raw status
+const S1WR_SEAL_OFF: usize = 0x2900;
+const S1WR_SIG_OFF: usize = 0x3800;
+const S1WR_SEAL: u64 = 0x5331_5752_5345_414c; // "S1WRSEAL"
+const S1WR_WANT: u64 = 0x7ff; // eleven bits
+const S1WR_FOREIGN: &str = "WRFOR.BIN";
+
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_stor1wr_blob_start
+unaos_user_stor1wr_blob_start:
+    .balign 16
+
+    .globl unaos_user_stor1_wr
+unaos_user_stor1_wr:
+    lea r15, [rip + unaos_user_stor1wr_blob_start]
+    xor r12, r12
+
+    // ---- bit0: bus WRITE creates STOR1.BIN with 16 bytes ----
+    lea rdi, [rip + .Lwr_f_w1]
+    mov rsi, 78
+    mov rdx, 4
+    mov rcx, 1
+    call .Lwr_call
+    mov qword ptr [r15 + 0x2808], rax
+    test rax, rax
+    jnz .Lwr_acl
+    or r12, 1
+
+    // ---- bit1: bus CAT reads it back BYTE-EXACT (BANDY-WR's write->cat leg) ----
+    lea rdi, [rip + .Lwr_f_c1]
+    mov rsi, 61
+    mov rdx, 2
+    mov rcx, 2
+    call .Lwr_call
+    mov qword ptr [r15 + 0x2810], rax
+    test rax, rax
+    jnz .Lwr_direct
+    call .Lwr_body16
+    test rax, rax
+    jz .Lwr_direct
+    or r12, 2
+
+.Lwr_direct:
+    // ---- bit2: and the DIRECT syscall sees the same file — a bus write is a real file ----
+    mov rax, 11
+    lea rdi, [rip + .Lwr_n1]
+    mov rsi, 9
+    xor rdx, rdx
+    syscall
+    mov qword ptr [r15 + 0x2818], rax
+    mov rbx, rax
+    test rbx, rbx
+    js .Lwr_mv
+    mov rax, 12
+    mov rdi, rbx
+    lea rsi, [r15 + 0x3000]
+    mov rdx, 16
+    syscall
+    mov qword ptr [r15 + 0x2820], rax
+    push rax
+    mov rax, 17
+    mov rdi, rbx
+    syscall
+    pop rax
+    cmp rax, 16
+    jne .Lwr_mv
+    lea rcx, [rip + .Lwr_pat]
+    mov rax, qword ptr [r15 + 0x3000]
+    cmp rax, qword ptr [rcx]
+    jne .Lwr_mv
+    mov rax, qword ptr [r15 + 0x3000 + 8]
+    cmp rax, qword ptr [rcx + 8]
+    jne .Lwr_mv
+    or r12, 4
+
+.Lwr_mv:
+    // ---- bit3: bus MV moves it to STOR2.BIN ----
+    lea rdi, [rip + .Lwr_f_mv]
+    mov rsi, 71
+    mov rdx, 6
+    mov rcx, 3
+    call .Lwr_call
+    mov qword ptr [r15 + 0x2828], rax
+    test rax, rax
+    jnz .Lwr_rm
+    or r12, 8
+    // ---- bit4: cat(new) byte-exact AND cat(old) -ENOENT (BANDY-WR's mv leg, both halves) ----
+    lea rdi, [rip + .Lwr_f_c2]
+    mov rsi, 61
+    mov rdx, 2
+    mov rcx, 4
+    call .Lwr_call
+    mov qword ptr [r15 + 0x2830], rax
+    test rax, rax
+    jnz .Lwr_rm
+    call .Lwr_body16
+    test rax, rax
+    jz .Lwr_rm
+    lea rdi, [rip + .Lwr_f_c1b]
+    mov rsi, 61
+    mov rdx, 2
+    mov rcx, 5
+    call .Lwr_call
+    mov qword ptr [r15 + 0x2838], rax
+    cmp rax, -2
+    jne .Lwr_rm
+    or r12, 16
+
+.Lwr_rm:
+    // ---- bit5: bus RM takes STOR2.BIN away and cat says so (BANDY-WR's rm leg) ----
+    lea rdi, [rip + .Lwr_f_rm2]
+    mov rsi, 61
+    mov rdx, 5
+    mov rcx, 6
+    call .Lwr_call
+    mov qword ptr [r15 + 0x2840], rax
+    test rax, rax
+    jnz .Lwr_acl
+    lea rdi, [rip + .Lwr_f_c2b]
+    mov rsi, 61
+    mov rdx, 2
+    mov rcx, 7
+    call .Lwr_call
+    mov qword ptr [r15 + 0x2848], rax
+    cmp rax, -2
+    jne .Lwr_acl
+    or r12, 32
+
+.Lwr_acl:
+    // ---- bit6/7/8: every destructive verb on a FOREIGN-owned file is -EACCES (BANDY-EQ2) ----
+    lea rdi, [rip + .Lwr_f_wf]
+    mov rsi, 78
+    mov rdx, 4
+    mov rcx, 8
+    call .Lwr_call
+    mov qword ptr [r15 + 0x2850], rax
+    cmp rax, -13
+    jne .Lwr_acl_rm
+    or r12, 64
+.Lwr_acl_rm:
+    lea rdi, [rip + .Lwr_f_rmf]
+    mov rsi, 61
+    mov rdx, 5
+    mov rcx, 9
+    call .Lwr_call
+    mov qword ptr [r15 + 0x2858], rax
+    cmp rax, -13
+    jne .Lwr_acl_mv
+    or r12, 128
+.Lwr_acl_mv:
+    lea rdi, [rip + .Lwr_f_mvf]
+    mov rsi, 71
+    mov rdx, 6
+    mov rcx, 10
+    call .Lwr_call
+    mov qword ptr [r15 + 0x2860], rax
+    cmp rax, -13
+    jne .Lwr_intact
+    or r12, 256
+
+.Lwr_intact:
+    // ---- bit9: the three denials left the world intact (BANDY-ACL). The foreign file is still
+    //      there and still foreign (-EACCES, NOT -ENOENT — that difference is the whole bit), and
+    //      the name the denied `mv` aimed at was never created.
+    lea rdi, [rip + .Lwr_f_cf]
+    mov rsi, 61
+    mov rdx, 2
+    mov rcx, 11
+    call .Lwr_call
+    mov qword ptr [r15 + 0x2868], rax
+    cmp rax, -13
+    jne .Lwr_ceiling
+    lea rdi, [rip + .Lwr_f_c2c]
+    mov rsi, 61
+    mov rdx, 2
+    mov rcx, 12
+    call .Lwr_call
+    mov qword ptr [r15 + 0x2870], rax
+    cmp rax, -2
+    jne .Lwr_ceiling
+    or r12, 512
+
+.Lwr_ceiling:
+    // ---- bit10: THE CEILING, re-measured. Hold our own source OPEN (the counterparty row is
+    //      already holding its file open), then bus `cp` and read the copy back DIRECTLY. Under the
+    //      old model this is where `cp-copy open_rc=-24` came from.
+    mov rax, 11
+    lea rdi, [rip + .Lwr_n1]
+    mov rsi, 9
+    mov rdx, 3
+    syscall
+    mov rbx, rax
+    mov qword ptr [r15 + 0x2878], rax
+    test rbx, rbx
+    js .Lwr_done
+    mov rax, 1
+    mov rdi, rbx
+    lea rsi, [rip + .Lwr_pat]
+    mov rdx, 16
+    syscall
+    cmp rax, 16
+    jne .Lwr_clean
+    lea rdi, [rip + .Lwr_f_cp]
+    mov rsi, 71
+    mov rdx, 3
+    mov rcx, 13
+    call .Lwr_call
+    mov qword ptr [r15 + 0x2880], rax
+    test rax, rax
+    jnz .Lwr_clean
+    mov rax, 11                             // read the copy back through the DIRECT path
+    lea rdi, [rip + .Lwr_n3]
+    mov rsi, 9
+    xor rdx, rdx
+    syscall
+    mov qword ptr [r15 + 0x2888], rax
+    mov rbp, rax
+    test rbp, rbp
+    js .Lwr_clean
+    mov rax, 12
+    mov rdi, rbp
+    lea rsi, [r15 + 0x3100]
+    mov rdx, 16
+    syscall
+    mov qword ptr [r15 + 0x2890], rax
+    push rax
+    mov rax, 17
+    mov rdi, rbp
+    syscall
+    pop rax
+    cmp rax, 16
+    jne .Lwr_clean
+    lea rcx, [rip + .Lwr_pat]
+    mov rax, qword ptr [r15 + 0x3100]
+    cmp rax, qword ptr [rcx]
+    jne .Lwr_clean
+    mov rax, qword ptr [r15 + 0x3100 + 8]
+    cmp rax, qword ptr [rcx + 8]
+    jne .Lwr_clean
+    or r12, 1024
+
+.Lwr_clean:
+    // Cleanup over the BUS, because a write-side witness that cleaned up with the syscall would be
+    // leaving its own verbs untested at the one moment they are easiest to test. Both rcs recorded.
+    lea rdi, [rip + .Lwr_f_rm3]
+    mov rsi, 61
+    mov rdx, 5
+    mov rcx, 14
+    call .Lwr_call
+    mov qword ptr [r15 + 0x2898], rax
+    mov rax, 17                             // let our own source go before removing it
+    mov rdi, rbx
+    syscall
+    lea rdi, [rip + .Lwr_f_rm1]
+    mov rsi, 61
+    mov rdx, 5
+    mov rcx, 15
+    call .Lwr_call
+    mov qword ptr [r15 + 0x28a0], rax
+
+.Lwr_done:
+    mov qword ptr [r15 + 0x2800], r12
+    mov rax, 0x533157525345414c            // "S1WRSEAL" — written LAST
+    mov qword ptr [r15 + 0x2900], rax
+    mov qword ptr [r15 + 0x3800], 1
+    mov rax, 2
+    xor rdi, rdi
+    syscall
+.Lwr_spin:
+    jmp .Lwr_spin
+
+    // ---- the bus exchange, the `.Lbxm_bus_call` contract verbatim (magic/version/kind/verb/corr/
+    //      the reserved KERNEL principal/exact length), so this witness believes a status only after
+    //      the frame carrying it has been proved to be a well-formed REPLY TO THIS REQUEST.
+    //   in:  rdi = frame, rsi = length, rdx = expected verb, rcx = expected corr
+    //   out: rax = the reply's status, or -999 if the exchange was not what the v1 wire says
+    .balign 16
+.Lwr_call:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    mov rbp, rdx
+    mov r12, rcx
+    mov rax, 19
+    syscall
+    test rax, rax
+    jnz .Lwr_bad
+    mov rax, 20
+    lea rdi, [r15 + 0x1000]
+    mov rsi, 4148
+    syscall
+    cmp rax, 52
+    jl .Lwr_bad
+    mov r13, rax
+    lea r14, [r15 + 0x1000]
+    cmp dword ptr [r14], 0x31534255
+    jne .Lwr_bad
+    cmp byte ptr [r14 + 4], 1
+    jne .Lwr_bad
+    cmp byte ptr [r14 + 5], 2
+    jne .Lwr_bad
+    movzx eax, byte ptr [r14 + 6]
+    cmp rax, rbp
+    jne .Lwr_bad
+    cmp byte ptr [r14 + 7], 0
+    jne .Lwr_bad
+    mov eax, dword ptr [r14 + 8]
+    cmp rax, r12
+    jne .Lwr_bad
+    cmp byte ptr [r14 + 16], 4
+    jne .Lwr_bad
+    lea rsi, [r14 + 17]
+    mov rcx, 31
+.Lwr_prin:
+    cmp byte ptr [rsi], 0
+    jne .Lwr_bad
+    inc rsi
+    dec rcx
+    jnz .Lwr_prin
+    mov eax, dword ptr [r14 + 48]
+    add rax, 52
+    cmp rax, r13
+    jne .Lwr_bad
+    movsxd rax, dword ptr [r14 + 12]
+    jmp .Lwr_out
+.Lwr_bad:
+    mov rax, -999
+.Lwr_out:
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+    // The last reply's body is exactly the 16-byte pattern? rax = 1 / 0. Clobbers rax/rcx/rdx/rsi/rdi.
+    .balign 16
+.Lwr_body16:
+    mov eax, dword ptr [r15 + 0x1000 + 48]
+    cmp rax, 16
+    jne .Lwr_b16_no
+    lea rcx, [rip + .Lwr_pat]
+    mov rax, qword ptr [r15 + 0x1000 + 52]
+    cmp rax, qword ptr [rcx]
+    jne .Lwr_b16_no
+    mov rax, qword ptr [r15 + 0x1000 + 60]
+    cmp rax, qword ptr [rcx + 8]
+    jne .Lwr_b16_no
+    mov rax, 1
+    ret
+.Lwr_b16_no:
+    xor rax, rax
+    ret
+
+    // ================================= wire data =================================
+    // Hand-built byte for byte as `crate::bus`'s `hdr_write` lays them out, the BUSX86 M3 discipline:
+    // magic(4) ver(1) kind(1) verb(1) rsvd(1) corr(4) status(4) principal(32) body_len(4), payload.
+    // Verbs: 2 = CAT, 3 = CP, 4 = WRITE, 5 = RM, 6 = MV. Every name here is 9 bytes, so a write frame
+    // is 52 + 1 + 9 + 16 = 78, a bare-name frame 52 + 9 = 61, and a two-name frame 52 + 1 + 9 + 9 = 71.
+    .balign 8
+.Lwr_f_w1:
+    .ascii "UBS1"
+    .byte 1, 1, 4, 0
+    .long 1
+    .long 0
+    .space 32, 0
+    .long 26
+    .byte 9
+    .ascii "STOR1.BINstor1-wr-payload"
+.Lwr_f_c1:
+    .ascii "UBS1"
+    .byte 1, 1, 2, 0
+    .long 2
+    .long 0
+    .space 32, 0
+    .long 9
+    .ascii "STOR1.BIN"
+.Lwr_f_mv:
+    .ascii "UBS1"
+    .byte 1, 1, 6, 0
+    .long 3
+    .long 0
+    .space 32, 0
+    .long 19
+    .byte 9
+    .ascii "STOR1.BINSTOR2.BIN"
+.Lwr_f_c2:
+    .ascii "UBS1"
+    .byte 1, 1, 2, 0
+    .long 4
+    .long 0
+    .space 32, 0
+    .long 9
+    .ascii "STOR2.BIN"
+.Lwr_f_c1b:
+    .ascii "UBS1"
+    .byte 1, 1, 2, 0
+    .long 5
+    .long 0
+    .space 32, 0
+    .long 9
+    .ascii "STOR1.BIN"
+.Lwr_f_rm2:
+    .ascii "UBS1"
+    .byte 1, 1, 5, 0
+    .long 6
+    .long 0
+    .space 32, 0
+    .long 9
+    .ascii "STOR2.BIN"
+.Lwr_f_c2b:
+    .ascii "UBS1"
+    .byte 1, 1, 2, 0
+    .long 7
+    .long 0
+    .space 32, 0
+    .long 9
+    .ascii "STOR2.BIN"
+.Lwr_f_wf:
+    .ascii "UBS1"
+    .byte 1, 1, 4, 0
+    .long 8
+    .long 0
+    .space 32, 0
+    .long 26
+    .byte 9
+    .ascii "WRFOR.BINstor1-wr-payload"
+.Lwr_f_rmf:
+    .ascii "UBS1"
+    .byte 1, 1, 5, 0
+    .long 9
+    .long 0
+    .space 32, 0
+    .long 9
+    .ascii "WRFOR.BIN"
+.Lwr_f_mvf:
+    .ascii "UBS1"
+    .byte 1, 1, 6, 0
+    .long 10
+    .long 0
+    .space 32, 0
+    .long 19
+    .byte 9
+    .ascii "WRFOR.BINSTOR2.BIN"
+.Lwr_f_cf:
+    .ascii "UBS1"
+    .byte 1, 1, 2, 0
+    .long 11
+    .long 0
+    .space 32, 0
+    .long 9
+    .ascii "WRFOR.BIN"
+.Lwr_f_c2c:
+    .ascii "UBS1"
+    .byte 1, 1, 2, 0
+    .long 12
+    .long 0
+    .space 32, 0
+    .long 9
+    .ascii "STOR2.BIN"
+.Lwr_f_cp:
+    .ascii "UBS1"
+    .byte 1, 1, 3, 0
+    .long 13
+    .long 0
+    .space 32, 0
+    .long 19
+    .byte 9
+    .ascii "STOR1.BINSTOR3.BIN"
+.Lwr_f_rm3:
+    .ascii "UBS1"
+    .byte 1, 1, 5, 0
+    .long 14
+    .long 0
+    .space 32, 0
+    .long 9
+    .ascii "STOR3.BIN"
+.Lwr_f_rm1:
+    .ascii "UBS1"
+    .byte 1, 1, 5, 0
+    .long 15
+    .long 0
+    .space 32, 0
+    .long 9
+    .ascii "STOR1.BIN"
+    .balign 8
+.Lwr_n1:
+    .ascii "STOR1.BIN"
+    .balign 8
+.Lwr_n3:
+    .ascii "STOR3.BIN"
+    .balign 8
+.Lwr_pat:
+    .ascii "stor1-wr-payload"
+
+    .balign 16
+    .globl unaos_user_stor1wr_blob_end
+unaos_user_stor1wr_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_stor1wr_blob_start: u8;
+    static unaos_user_stor1wr_blob_end: u8;
+    static unaos_user_stor1_wr: u8;
+}
+
+fn s1wr_build() -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_stor1wr_blob_start as usize;
+    let bend = &raw const unaos_user_stor1wr_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "STOR-1 M3 blob does not fit in a code page");
+    let off = (&raw const unaos_user_stor1_wr as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// STOR-1 M3 launcher + verdict — the write side on the wire, with a counterparty that is a ROW
+/// rather than a PROGRAM (see the header: that subtraction is M1 showing up as a simplification).
+fn stor1_wr_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // the standing gate: keep the no-storage control path free of demo lines
+    }
+    let disk_present = HELLO_STAGED.load(Ordering::Acquire);
+    if disk_present
+        && !(u10_preflight_absent(S1N_NAME)
+            && u10_preflight_absent(S1N_NAME2)
+            && u10_preflight_absent(S1N_NAME3)
+            && u10_preflight_absent(S1WR_FOREIGN))
+    {
+        serial_println!(":: BUSX86-WR: a STOR[123]/WRFOR name is present on the volume and not self-healed — write-side witness skipped ::");
+        return;
+    }
+    let (Some(f1), Some(s2), Some(s3), Some(sf)) = (
+        u10_name_id(S1N_NAME),
+        u10_name_id(S1N_NAME2),
+        u10_name_id(S1N_NAME3),
+        u10_name_id(S1WR_FOREIGN),
+    ) else {
+        return;
+    };
+    // THE COUNTERPARTY: a scratch row that OWNS WRFOR.BIN. It creates the file through the same
+    // descriptor-free primitive the bus's own `write` uses, then opens ONE handle on it — not for the
+    // ACL legs (after M1 the file outlives every handle, which is the point) but for the CEILING leg,
+    // which needs a live writer occupying a staging slot to be measuring anything at all.
+    let Some(other) = crate::arch::memory::alloc_user_space() else {
+        serial_println!(":: BUSX86-WR: no free address-space slot (counterparty) — write-side witness skipped ::");
+        return;
+    };
+    let mk = created_entry_create(other, sf as usize, false, b"foreign-owned-16");
+    let hold = if mk == 0 { created_open_admitted(other, sf as usize, CAP_READ | CAP_WRITE) } else { -1 };
+    let Some(f) = s1wr_build() else {
+        let _ = created_entry_destroy(other, sf as usize, true);
+        clear_files_row(other);
+        crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(other));
+        serial_println!(":: BUSX86-WR: no free address-space slot — write-side witness skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: BUSX86-WR: the BANDY-2 write side on x86 — write/rm/mv FULFILLED through the created-name entries, the same ACL and the same functions the direct syscalls call (they answered -ENOSYS through BUSX86 M3) ::"
+    );
+    let cpu = crate::arch::smp::worker_cpu(0).unwrap_or(demo_cpu);
+    if s4_sync_storage() {
+        crate::arch::sched::spawn_user_preemptible(
+            "stor1-wr", f.entry, f.sp, cpu, f.cr3,
+            alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new()),
+        );
+    } else {
+        crate::arch::sched::spawn_user_in_space("stor1-wr", f.entry, f.sp, cpu, f.cr3);
+    }
+    let deadline = crate::arch::ticks() + 8000;
+    while s1n_read(f.slot, S1WR_SIG_OFF) == 0 && crate::arch::ticks() < deadline {
+        crate::arch::sched::yield_now();
+    }
+    let signalled = s1n_read(f.slot, S1WR_SIG_OFF) >= 1;
+    let sealed = s1n_read(f.slot, S1WR_SEAL_OFF) == S1WR_SEAL;
+    let w = s1n_read(f.slot, S1WR_W_OFF);
+    let mut rc = [0i64; 16];
+    for (i, cell) in rc.iter_mut().enumerate() {
+        *cell = s1n_read(f.slot, S1WR_RC_OFF + i * 8) as i64;
+    }
+    // NOT ONE LEG MAY ANSWER -ENOSYS. This is the retirement stated as an assertion rather than as
+    // prose: if a future edit re-stubs the write side, every ACL leg would still read -EACCES-shaped
+    // to a careless eye, but `-38` would appear here and the verdict says so by name.
+    let no_enosys = rc.iter().all(|&v| v != ENOSYS_X);
+    let td = crate::arch::ticks() + 3000;
+    while !(files_row_is_clear(f.slot) && handle_row_is_clear(f.slot)) && crate::arch::ticks() < td {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = files_row_is_clear(f.slot) && handle_row_is_clear(f.slot);
+    let mut replayed = 0u32;
+    if let Ok(fs) = crate::fs::fat::mount() {
+        while u10_flush_drain_one(&fs).is_some() {
+            replayed += 1;
+        }
+    }
+    let drained = u10_flush_all_free() && !U10_OVERFLOW.load(Ordering::Acquire);
+    crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(f.slot));
+    // THE COUNTERPARTY SURVIVED ITS OWN DENIALS: still live, still owned by `other`, content intact.
+    let foreign_live = created_entry_live(sf as usize);
+    let foreign_kept = foreign_live && created_entry_bytes(sf as usize) == b"foreign-owned-16";
+    // Tear the counterparty down through the product by-name delete, then prove the table is vacant.
+    let _ = created_entry_destroy(other, sf as usize, true);
+    clear_files_row(other);
+    crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(other));
+    if let Ok(fs) = crate::fs::fat::mount() {
+        while u10_flush_drain_one(&fs).is_some() {
+            replayed += 1;
+        }
+    }
+    let vacant = ![f1, s2, s3, sf].iter().any(|&id| created_entry_live(id as usize));
+    let pass = signalled
+        && sealed
+        && w == S1WR_WANT
+        && mk == 0
+        && hold >= 0
+        && no_enosys
+        && foreign_kept
+        && cleared
+        && drained
+        && vacant;
+    if pass {
+        serial_println!(
+            ":: BUSX86-WR: the BANDY-2 write side on x86 (stor1-wr) — write->cat byte-exact and the DIRECT syscall sees the same file; mv->cat(new) byte-exact + cat(old) -ENOENT; rm->cat -ENOENT; write/rm/mv of a FOREIGN-owned file all -EACCES and the denials left it there, still foreign, with no stolen name; and a bus `cp` made while two created files are held open reads back byte-exact — the B171 ceiling (`cp-copy open_rc=-24`) no longer bites because a `cp` holds no descriptor, no handle and no staging slot :: PASS [w={:#x}/{:#x}] ::",
+            w, S1WR_WANT
+        );
+    } else {
+        serial_println!(
+            ":: BUSX86-WR: write side FAIL [w={:#x}/{:#x}] — signalled={} sealed={} mk={} hold={} no_enosys={} foreign_live={} foreign_kept={} cleared={} drained={} vacant={} replayed={} rc=[write={} cat={} dopen={} dread={} mv={} cat_new={} cat_old={} rm={} cat_gone={} f_write={} f_rm={} f_mv={} f_cat={} f_dst={} cp_src_open={} cp={}] ::",
+            w, S1WR_WANT, signalled, sealed, mk, hold, no_enosys, foreign_live, foreign_kept, cleared, drained, vacant, replayed,
+            rc[0], rc[1], rc[2], rc[3], rc[4], rc[5], rc[6], rc[7], rc[8], rc[9], rc[10], rc[11], rc[12], rc[13], rc[14], rc[15]
         );
     }
 }

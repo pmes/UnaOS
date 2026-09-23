@@ -203,3 +203,24 @@ REQUIRE :: STOR1-MV: .* :: PASS \[w=0x7f/0x7f\] ::
 # The FORBID partner is the launcher's own FAIL spelling, produced by this milestone's go-red (the
 # `owned_unlink_permitted` refusal deleted from `rename_created`'s authorization, reverted).
 FORBID :: STOR1-MV: rename FAIL
+
+# ── STOR-1 M3 (2026-09-23), TAIL-APPENDED past STOR-1 M2 ──────────────────────────────────────────
+# THE WRITE SIDE ON THE WIRE. `BUSX86-WR` is a NEW witness rather than three more legs of BUSX86-EQ
+# for a mechanical reason: that fixture is a `global_asm!` block in the middle of a 26k-line file
+# whose panic `Location` records embed line numbers (B94), so this seat extends the CLAIM and appends
+# the witness. Eleven legs: the BANDY-WR round trip (write->cat byte-exact and the DIRECT syscall
+# sees the same file; mv->cat(new) byte-exact + cat(old) -ENOENT; rm->cat -ENOENT), the BANDY-EQ2
+# denials (write/rm/mv of a FOREIGN-owned file each -EACCES), the BANDY-ACL integrity check (the
+# denials left the foreign file there, still foreign, with no stolen name), and the CEILING leg — a
+# bus `cp` made while two created files are held open, read back directly byte-exact, which is the
+# shape rmbp-ledger B171 recorded as `cp-copy open_rc=-24` before a `cp` stopped costing a slot.
+REQUIRE :: BUSX86-WR: .* :: PASS \[w=0x7ff/0x7ff\] ::
+FORBID :: BUSX86-WR: write side FAIL
+#
+# AND BUSX86-EQ's WRITE-SIDE LEGS ARE RE-PINNED HERE, in the commit that changed the kernel line they
+# pin, which is this file's contract. They used to read `write/rm/mv=3/3 -ENOSYS` — an assertion that
+# the three verbs DID NOTHING. They do something now, so the pin becomes the exact triple that
+# fixture's own frames must produce, and it asserts strictly more than the old one: `-EBUSY` says the
+# ACL ran and the live-source refusal ran, `ok` says the owner was admitted, and `-ENOENT` says the
+# ordering between two destructive verbs on the same name is the one the wire asked for.
+REQUIRE :: BUSX86-EQ: .* write/rm/mv=-EBUSY/ok/-ENOENT .* -> PASS ::

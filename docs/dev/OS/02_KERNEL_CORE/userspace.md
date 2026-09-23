@@ -3696,3 +3696,176 @@ overflow is a *dropped acknowledged mutation*. The first build skipped an unlink
 per GO step with the launcher draining between, **and records every unlink's rc** — a
 cleanup step that silently did nothing must never be able to read as a clean one. That
 spelling is now a `FORBID` in `x86-default.spec`.
+
+## STOR-1 — a created file's identity stops being a live descriptor (x86, 2026-09-23)
+
+BUSX86 left two things written down and unfixed, and both of them were the same thing.
+`busx_cp`'s **Honest scope** said a bus `cp` had to KEEP the descriptor it created with,
+because closing it would destroy what the reply had just acknowledged. M3's **measured
+ceiling** priced that: `NWSTAGE == 3` machine-wide, `open_created_sibling` allocates its own
+slot, so *verifying* one bus `cp` cost three slots at once and one other row holding a created
+file open made the read-back `-EMFILE` (`cp-copy open_rc=-24`, the first green build). Both
+notes named the same missing thing — "a descriptor-free create/unlink/rename in the x86
+created-name namespace" — and both named this arc. Three milestones, one per verb it was
+missing.
+
+### M1 — the name entry
+
+**The sentence that changed.** A runtime-created file used to exist exactly while one of its
+descriptors was live anywhere: `created_desc_any_row` WAS the existence test. Now a created
+name's existence is a TABLE ENTRY, one per creatable name-id, that outlives every descriptor:
+`CREATED_LIVE` (set at the fresh create, cleared at `sys_unlink`, and by nothing else),
+`CREATED_SIZE` (the running MAXIMUM over releasing descriptors — exact rather than defensive,
+because this namespace grows and has no truncate verb), and `CREATED_BUF`/`CREATED_LEN`, the
+close-surviving content twin at one page each, which is the bound `FILE_SIZE == WSTAGE_LEN <=
+PAGE_SIZE` already put on a created file.
+
+**The owner did not move, and that is why the ACL legs did not.** `OWNED_FILES` was already
+keyed by name-id and already survived every close — it is cleared at `owned_clear`, i.e. at
+unlink. Only existence and content were tied to a descriptor. So `owned_access_ok` keys the
+entry unchanged, and every `-EACCES` leg of BUSX86-EQ is byte-identical across this change.
+
+**What the entry means on each knob, because it is not the same thing.** Knob-on
+(`s4_sync_storage()`), STOR-1 S4a/S4b/S5a already gave a created file a real on-disk twin, so
+the entry is pure NAMESPACE — and still load-bearing, because `sys_open_dynamic` deliberately
+EXCLUDES every `U10_NAMES` spelling from the dynamic on-disk arm (the case-variant exclusion
+that stops an owned name being re-resolved as a public one), so without an entry a U10 name on
+disk is unreachable by name. Knob-off there is no disk and `CREATED_BUF` IS the file; without
+it a close would have turned a created file into a 0-LENGTH one, which is worse than losing it.
+**Measured: the QEMU lanes run knob-OFF** — `ops_replayed=3` in BUSX86-EQ is only reachable
+when `!s4_sync_storage() && HELLO_STAGED`, so the deferred-op path is the one under test here
+and the on-disk half is compiled, type-checked both ways, and owed to metal with the rest.
+
+**Honest scope.** The table is per boot. It does not adopt files a previous boot left on the
+volume; reconciling the on-disk root into the created namespace at mount is U11 M2's
+disk-write-back line, not this arc's, and the fixtures' own `u10_preflight_absent` self-heal
+already deletes such leftovers.
+
+**Witness.** `:: STOR1-NAME: … :: PASS [w=0x3f/0x3f] ::` — six ring-3 legs: create+write,
+close the ONLY descriptor, ★ a plain RO re-open SUCCEEDS, ★ it reads back byte-exact, O_CREAT
+of the closed-but-live name is the IDEMPOTENT open rather than a fresh 0-length mint, and
+`SYS_UNLINK` still takes the name away (`-ENOENT` after). Ring 3 and not a kernel-side check,
+for BUSX86 M3's reason verbatim: the thing under test is `sys_open`'s resolution order, and
+`sys_open` takes a ring-3 name pointer. Go-red: put `created_desc_any_row` back at
+`sys_open_dynamic`'s gate — `FAIL [w=0x33/0x3f] … reopen=-2 …`. Bits 2 and 3 fall; bits 0, 1,
+4 and 5 SURVIVE, because bit4's re-open is O_CREAT and goes through `open_create_new`, whose
+own entry test the go-red does not touch — the file is still there for the create path while
+gone for the plain-open path, and a witness scoring only "does it come back" would have called
+that half-broken namespace green.
+
+**No existing fixture had to be re-pointed, and that is a measurement.** Every U10/U11/U6x/
+BUSX86 verdict is unchanged on both lanes. The old identity was never ASSERTED by a fixture;
+it was load-bearing only in `busx_cp`'s note and in M3's two-phase choreography.
+
+### M2 — rename, and the ABI is matched rather than invented
+
+`SYS_RENAME(src_ptr, src_len, dst_ptr, dst_len)` — number 50, taken at the high-water mark
+`una-abi`'s own assert named as next. **NAME to NAME, and the shape came from the Pi.**
+aarch64 has no rename syscall at all; its only rename ABI is the v1 bus verb `mv`, whose frozen
+golden body is `[src_len][src][dst]` — two names, source first, owner-only, create-new-only on
+the destination. The syscall takes the same two names in the same order with the same errno
+table, so `mv A B` over the bus and `SYS_RENAME(A, B)` direct are the SAME QUESTION. A
+handle-based rename would have matched nothing there, and after M1 a created file's normal
+state is CLOSED, so there is usually no handle to name it by.
+
+**⚠ The one divergence, and it is mechanical.** x86 refuses a rename while the SOURCE still has
+an open descriptor (`-EBUSY`). aarch64 does not need to: `bus_mv` calls `fat::rename_entry`, an
+in-place single dir-sector name rewrite that keeps the same directory slot, so a live writer
+notices nothing. The x86 syscall handler runs IF-masked and reaches the volume only through the
+storage service task, whose submit set is create/grow/delete/read/stat/mkdir/rmdir — **there is
+no `submit_rename`**. So the on-disk twin is RE-MATERIALISED, and doing that under a live
+writer would silently drop everything it wrote after the snapshot. **The retirement is one
+named thing**: a `submit_rename` in `drivers/xhci/irqstorage.rs` over the `fat::rename_entry`
+that already exists, after which the refusal drops and the two arches converge completely.
+
+**Atomicity against a concurrent open — neither of the two orders, but no order at all.** The
+flip runs wholly under the NAMESPACE lock, and every path that can observe a created name takes
+that same lock (`sys_open_dynamic`, `open_create_new`, `sys_unlink`, `busx_ls`, `busx_cat`,
+`busx_cat_raw`, `busx_cp`). An observer sees the before state or the after state, never
+between. The store order inside the flip is still chosen, because a future lock-free reader
+would see it: the DESTINATION is published before the SOURCE is cleared, so a torn pair shows
+the file under BOTH names for an instant rather than under NEITHER — losing a file is worse
+than briefly doubling a view of it.
+
+**The ACL rides the file, not the name.** Owner and grants move as one row, so a grantee of the
+old path is a grantee of the new one and nobody's authority changes because a name did. That is
+what makes this a MOVE rather than a create-plus-delete wearing a move's name, which would
+re-own the file to the renamer. The source is VACATED, not deleted — `DYN_DELETED_G` is
+untouched, so the old name is immediately re-creatable.
+
+**Witness.** `:: STOR1-MV: … :: PASS [w=0x7f/0x7f] ::` — seven ring-3 legs plus one
+kernel-side. Rename returns 0, the old name is `-ENOENT`, the new name reads back byte-exact;
+`-EEXIST` on a live target and the source survives the refusal untouched; `-EBUSY` while the
+source is open and 0 the instant it closes. The OWNER-ONLY leg is driven kernel-side through
+`rename_created` — the body `SYS_RENAME` itself calls, the `sys_msend_for` idiom — with two
+scratch rows, because one ring-3 program structurally cannot be two principals. **Go-red, and
+it took two attempts, which is the part worth keeping.** Removing the `owned_unlink_permitted`
+refusal from phase 1 changed nothing — the run came back green, because the check is enforced
+TWICE (phase 1 authorizes, phase 3 re-authorizes after the lock was released for the on-disk
+phase), and a go-red that removes one of two guards measures the second guard. With both
+removed: `FAIL [w=0x7f/0x7f] … acl_ok=false … foreign=0 owner=-2 …`. The non-owner's rename
+SUCCEEDED and the real owner was then told `-ENOENT` about its own file — the ownership theft
+`bus_rm`'s comment predicts in prose, reproduced. Note that every ring-3 bit stayed LIT: the
+fixture is the owner in all seven of its legs, so the mask alone could never have caught it.
+
+### M3 — the bus, and both ledgered notes retire
+
+**`busx_cp` holds nothing.** The destination is minted by `created_entry_create` — no
+descriptor, no handle, no pool slot — and the copy is observable afterwards because it EXISTS
+rather than because someone is holding it. `-EMFILE` and `-EAGAIN` are no longer reachable in
+that function, which is the retirement stated as an errno.
+
+**THE CEILING, re-measured rather than declared.** `NWSTAGE` is still **3** and untouched; what
+changed is what it bounds. It bounds CONCURRENT LIVE WRITERS again, which is what a staging
+pool is for, and a bus `cp` is not one of them. Verifying a cp cost three slots (source, the
+kept destination, the read-back sibling) and now costs two, because the middle term is gone and
+the read-back of a copy nobody holds open resolves through `open_created_entry`, seeding from
+the entry's own twin rather than a peer's descriptor. **Does M3's two-phase fixture still need
+its phases? No** — arithmetically, doing the cp and its read-back without releasing O would now
+need three where it used to need four. The choreography is nonetheless RETAINED, because
+removing it means restructuring a `global_asm!` block in the middle of a 26k-line file whose
+panic `Location` records embed line numbers (B94). The retirement is proved POSITIVELY instead,
+by `BUSX86-WR` bit10.
+
+**The write side is fulfilled, and the equivalence is by CONSTRUCTION.** `busx_mv` IS
+`rename_created` and `busx_rm` IS `created_entry_destroy` — the very functions `SYS_RENAME` and
+the direct by-name delete call. There is no second implementation that could drift, no
+hand-copied errno table, and the ACL is not "the same rule" but the same call. That is a
+stronger claim than a comparison and a WEAKER witness, since comparing a function to itself
+proves nothing — which is why the new witness spends its legs on what construction does not
+give: the round trip across the real ring-3 wire, the foreign-owner denials, and the integrity
+of the world after a denial. (`busx_write` is a create-or-truncate whose truncate half is
+destroy-then-create, so it too refuses `-EBUSY` under a live reader, with the same retirement.)
+
+**Witness.** `:: BUSX86-WR: … :: PASS [w=0x7ff/0x7ff] ::` — eleven legs in the BANDY shapes the
+Pi pins: BANDY-WR (write→cat byte-exact **and** the DIRECT syscall sees the same file;
+mv→cat(new) byte-exact + cat(old) `-ENOENT`; rm→cat `-ENOENT`), BANDY-EQ2 (write, rm and mv of
+a FOREIGN-owned file each `-EACCES`), BANDY-ACL (the denials left it there, still foreign — cat
+`-EACCES`, not `-ENOENT` — with no stolen name), and the ceiling leg: a bus `cp` made while two
+created files are held open, read back directly, byte-exact. **The counterparty is a ROW, not a
+PROGRAM.** BUSX86 M3 needed a whole second ring-3 process on its own core and slot for one job:
+holding OTHER.BIN open, because letting go would have destroyed it and every `-EACCES` leg
+would have decayed into an `-ENOENT` leg without saying so. A foreign-owned file now survives
+its creator, so the counterparty here is a scratch row that creates the file and stays out of
+the way. That subtraction IS M1.
+
+**And BUSX86-EQ's write-side legs are re-pointed, because fulfilling a verb gave that fixture's
+own frames an effect.** They read `write/rm/mv=3/3 -ENOSYS`, which was only ever an assertion
+that the three verbs DID NOTHING. They do something now: the midden's `write MIDDEN.BIN` is
+`-EBUSY` (it owns the file AND HOLDS IT OPEN), its `rm MIDDEN.BIN` succeeds, and its
+`mv MIDDEN.BIN COPY.BIN` is then `-ENOENT` — so its own `rm` removes the source its later
+`cp-own` leg needed, and the cp-own payload check can no longer be made there. The pin becomes
+the exact triple `write/rm/mv=-EBUSY/ok/-ENOENT`, which asserts strictly MORE than `-ENOSYS`
+did (the ACL ran, the live-source refusal ran, and the ordering between two destructive verbs
+on one name is the one the wire asked for), and the cp payload claim moves to `BUSX86-WR`
+bit10, where it is made under pool pressure the midden could never have applied. The frames are
+`global_asm!` and were not re-ordered; that is stated rather than worked around.
+
+**Go-red (M3).** Re-stub the dispatch to `BUS_VERB_WRITE | BUS_VERB_RM | BUS_VERB_MV =>
+ENOSYS_X` — one line. `:: BUSX86-WR: write side FAIL [w=0x600/0x7ff] … no_enosys=false …
+rc=[write=-38 … f_write=-38 f_rm=-38 f_mv=-38 …]` and `BUSX86-EQ … -> FAIL`: two witnesses, and
+the surviving bits (9 and 10) are exactly the two that do not go through the write side.
+
+**What is still owed.** x86 METAL for the whole STOR-1/BUSX86 arc — everything above is
+QEMU-proven on both lanes, knob-off, and the rMBP leg rides the next attended sitting. Disk
+write-back of created entries across a boot is U11 M2's line and is not touched here.
