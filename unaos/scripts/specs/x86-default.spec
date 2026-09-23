@@ -167,3 +167,24 @@ FORBID :: BUSX86-STAMP: .* :: FAIL
 # this is the line that convicts a future fixture that stops doing so. MEASURED as a real red on this
 # bench: the M3 build that skipped an unlink on -EMFILE printed it (`op=2 name=7 16 bytes`).
 FORBID :: U10: OP QUEUE FULL
+
+# ── STOR-1 M1 (2026-09-23), TAIL-APPENDED past BUSX86 M3, the same shape it used ──────────────────
+# THE CREATED-NAME ENTRY, pinned on the lane it runs on. `stor1_name_launcher` is UNCONDITIONAL — no
+# `witness`, no `wc`, no storage knob — for BUSX86 M3's reason verbatim: `SYS_OPEN` is not optional
+# surface on this arch, so the PASS spelling is present on the knob-free `./arroyo test` and can be
+# REQUIRED rather than only FORBIDden in its negative. It skips with a named line when there is no
+# free address-space slot or the volume still carries a STOR1.BIN a previous boot left; neither is
+# true of this lane.
+#
+# WHY THE BITMASK IS IN THE REQUIRE AND NOT LEFT TO `PASS`. Same argument BUSX86-EQ's `diff=0` makes
+# one arc earlier: `PASS` here is a conjunction of six ring-3 legs plus five kernel-side conditions
+# (signalled, sealed, row cleared, queue drained, entry torn down), and an edit that stopped SCORING
+# a leg would keep printing `PASS` with a smaller mask. `w=0x3f` is the claim — six legs, of which
+# bits 2 and 3 are the milestone itself (a name re-opens after its last descriptor closed, and reads
+# back byte-exact) and bit 5 is the contract that must NOT have moved with it (unlink still removes
+# the name, and a plain re-open after it is -ENOENT).
+REQUIRE :: STOR1-NAME: .* :: PASS \[w=0x3f/0x3f\] ::
+# The FORBID partner is a REAL spelling, not an invented negation: the launcher prints exactly this
+# line on any short mask, and the go-red for this milestone produced it — `created_desc_any_row` put
+# back at `sys_open_dynamic`'s gate, which is the OLD identity model, restored and then reverted.
+FORBID :: STOR1-NAME: created-name entries FAIL

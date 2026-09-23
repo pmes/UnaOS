@@ -2859,7 +2859,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
                     // the prober's sweep — which is the only honest way to reach the -EACCES arm.
                     DMG_OWNER_WITNESS.store(a0 as u32, Ordering::Release);
                     DMG_DONE.fetch_add(1, Ordering::AcqRel);
-                } Some("busx86-midden") | Some("busx86-other") => {} // BUSX86 M3: the ring-3 midden pair carries NO exit witness — its witness is the RESULT TABLE it writes into its own window (thirteen legs' two answers each, sealed), which the launcher reads while the slot is still live. The arm exists anyway, and it is not decoration: the `_` fallback below counts an unrecognised name into `U1A_EXITED_OK`, so a fixture that skipped this list would silently move U1a's byte-for-byte `exited=` count. Named, does nothing, changes nothing. ⚠ SAME-LINE fold (see the `use` line's note).
+                } Some("busx86-midden") | Some("busx86-other") | Some("stor1-name") => {} // STOR-1 M1: `stor1-name` joins the no-exit-witness arm for the identical reason — its witness is the sealed RESULT TABLE in its own window, and letting its exit fall to the `_` arm would silently move U1a's byte-for-byte `exited=` count. ⚠ SAME-LINE fold. · BUSX86 M3: the ring-3 midden pair carries NO exit witness — its witness is the RESULT TABLE it writes into its own window (thirteen legs' two answers each, sealed), which the launcher reads while the slot is still live. The arm exists anyway, and it is not decoration: the `_` fallback below counts an unrecognised name into `U1A_EXITED_OK`, so a fixture that skipped this list would silently move U1a's byte-for-byte `exited=` count. Named, does nothing, changes nothing. ⚠ SAME-LINE fold (see the `use` line's note).
                 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
                 Some("sock2-udp") => {
                     // SOCK-2: the UDP round-trip fixture conveys its 5-bit witness bitmask as its exit STATUS
@@ -10119,7 +10119,7 @@ fn sys_unlink(handle: u64) -> i64 {
     // twin), so a later O_CREAT re-create of the name (once its deferred delete drains and clears DYN_DELETED_G)
     // establishes a FRESH owner rather than inheriting the deleted file's ACL. Placed right after the unlink is
     // claimed, so the ACL row dies exactly when the name does.
-    owned_clear(nameid);
+    created_entry_clear(nameid); owned_clear(nameid); // STOR-1 M1: THE NAME ENTRY DIES WITH THE NAME, in the same breath as its ACL row and under the same NAMESPACE hold — unlink is now the ONLY thing that removes a created file, which is the contract the whole milestone exists to establish. The U10 M3 semantics below are untouched: descriptors already open keep reading (the deferral), the NAME is what is gone. ⚠ LINE-NEUTRAL fold.
     let mut heldslot = 0u32; // +1-biased queue slot of the held op (0 == none)
     // Knob-off / no-FAT: enqueue the deferred CreateGrowDelete op HELD (a self-contained COPY of the file's
     // bytes; released at the LAST close). STOR-1 S4c: knob-on, the file is ALREADY ON DISK (S4a create + S4b
@@ -12313,7 +12313,7 @@ const U10OP_DELETE: u32 = 4;
 /// The U10 demo file names — the single source of truth an op's `U10_NAMEID` indexes, so the drain re-resolves
 /// the on-disk directory entry by the SAME name the fixture named (`find_located`). GROW.BIN is also a staged
 /// file (idx `GROW_STAGED_IDX`); FRESH.BIN/DELME.BIN/DEFER.BIN are runtime-created (never staged).
-const U10_NAMES: [&str; 8] = [U10_GROW_NAME, U10C_NAME, U10D_NAME, U11M2_NAME, U6GX_NAME, "MIDDEN.BIN", "OTHER.BIN", "COPY.BIN"]; // BUSX86 M3: the ring-3 midden's three CREATABLE names — MIDDEN.BIN (the path the witness owns), OTHER.BIN (the path ANOTHER row owns, which is the only way an -EACCES leg can exist at all) and COPY.BIN (the bus `cp` destination). Registered HERE and nowhere else, because on this arch `u10_creatable_nameid` IS the creatable set. The witness's "does not exist" name (NOSUCH.BIN) is deliberately ABSENT from this table — that absence is exactly what makes its -ENOENT leg honest on BOTH legs at once. ⚠ SAME-LINE fold: this file's panic `Location` records embed line numbers (see the `use` line's note).
+const U10_NAMES: [&str; 9] = [U10_GROW_NAME, U10C_NAME, U10D_NAME, U11M2_NAME, U6GX_NAME, "MIDDEN.BIN", "OTHER.BIN", "COPY.BIN", S1N_NAME]; // STOR-1 M1: STOR1.BIN — the created-name-entry witness's OWN name, registered here for the same reason every other one is (on this arch `u10_creatable_nameid` IS the creatable set) and NOT shared with any other fixture: a witness whose verdict depends on another fixture's ordering, or whose leftovers depend on another fixture's pre-flight, is two fixtures pretending to be one. ⚠ SAME-LINE fold. · BUSX86 M3: the ring-3 midden's three CREATABLE names — MIDDEN.BIN (the path the witness owns), OTHER.BIN (the path ANOTHER row owns, which is the only way an -EACCES leg can exist at all) and COPY.BIN (the bus `cp` destination). Registered HERE and nowhere else, because on this arch `u10_creatable_nameid` IS the creatable set. The witness's "does not exist" name (NOSUCH.BIN) is deliberately ABSENT from this table — that absence is exactly what makes its -ENOENT leg honest on BOTH legs at once. ⚠ SAME-LINE fold: this file's panic `Location` records embed line numbers (see the `use` line's note).
 /// The count of `U10_NAMES` — the width of the per-row `DYN_DELETED` overlay.
 const N_U10_NAMES: usize = U10_NAMES.len();
 static U10_USED: [AtomicBool; NU10] = [const { AtomicBool::new(false) }; NU10];
@@ -12740,7 +12740,7 @@ fn files_free_clear(row: usize, idx: usize) -> Option<usize> {
     // enqueuing a flush, so a revoked File-write cap never persists stale bytes (the brief's revoke ordering:
     // revoke drops the dirty flag). Only a whole-task TEARDOWN (`clear_files_row`) enqueues dirty bytes.
     if let Some(widx) = (FILE_WSTAGE[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
-        wstage_free(widx);
+        if let Some(n) = openf_nameid { created_entry_snapshot(n, row, idx, widx); } wstage_free(widx); // STOR-1 M1: THE NAME ENTRY TAKES THE DESCRIPTOR'S SIZE + BYTES BEFORE THE POOL SLOT GOES BACK — this is what makes a close drop the descriptor and NOT the file. No-op when the entry is not live, so the unlink sweep (which clears the entry first) can never resurrect a name it just killed. ⚠ LINE-NEUTRAL fold.
     }
     FILE_WSTAGE[row][idx].store(0, Ordering::Release);
     FILE_CLUSTER[row][idx].store(0, Ordering::Release);
@@ -13015,15 +13015,15 @@ fn sys_open_dynamic(row: usize, name: &str, mode: u64) -> i64 {
         // owned file is admitted only for the owner or a sufficiently-granted principal (public files pass). The
         // requested rights follow the open mode (RW or O_CREAT -> R|W; else R); a denial is a clean -EACCES with
         // nothing claimed. The gen fence is the caller's CURRENT SLOT_GEN.
-        if let Some((srcrow, existing)) = created_desc_any_row(row, nameid) {
+        if created_entry_live(nameid as usize) { // STOR-1 M1: EXISTENCE IS THE NAME ENTRY, not a live descriptor — the line the whole arc turns on. ⚠ LINE-NEUTRAL fold.
             let requested = if mode & 1 != 0 || create { CAP_READ | CAP_WRITE } else { CAP_READ };
             let caller_gen = SLOT_GEN[row].load(Ordering::Acquire);
-            if !owned_access_ok(nameid as usize, row, caller_gen, requested) { #[cfg(feature = "login")] if owned_user_ok(nameid as usize, row) { return open_created_sibling(row, srcrow, existing, nameid as usize, requested); } // LOGIN M1 — by-USER admission on a live-incarnation deny (file tail). ⚠ LINE-NEUTRAL fold.
+            if !owned_access_ok(nameid as usize, row, caller_gen, requested) { #[cfg(feature = "login")] if owned_user_ok(nameid as usize, row) { return created_open_admitted(row, nameid as usize, requested); } // LOGIN M1 — by-USER admission on a live-incarnation deny (file tail). ⚠ LINE-NEUTRAL fold.
                 return EACCES;
             }
-            return open_created_sibling(row, srcrow, existing, nameid as usize, requested);
+            return created_open_admitted(row, nameid as usize, requested); // STOR-1 M1: a SIBLING if a descriptor is open anywhere, else the ENTRY itself. ⚠ LINE-NEUTRAL fold.
         }
-        drop(ns); // not a live sibling — release the lock before the create path re-acquires it
+        drop(ns); // the name has no entry — release the lock before the create path re-acquires it
     }
     // O_CREAT of a creatable name -> a fresh 0-length created file (the first write grows it). U6x: owned-by-
     // default unless O_PUBLIC (opt out into world-access).
@@ -13116,12 +13116,12 @@ fn open_create_new(row: usize, nameid: u32, public: bool) -> i64 {
     // descriptor + a second owner row (which would STEAL ownership from the winning creator). ACL-checked — the
     // winner may have created it private. The demo callers are single-threaded at setup, so this never fires for
     // them (byte-identical); it closes the create-races-create window on true SMP.
-    if let Some((srcrow, existing)) = created_desc_any_row(row, nameid) {
+    if created_entry_live(nameid as usize) { // STOR-1 M1: the name EXISTS iff it has an ENTRY — so an O_CREAT of a closed-but-live name is the idempotent open, not a second mint. ⚠ LINE-NEUTRAL fold.
         let caller_gen = SLOT_GEN[row].load(Ordering::Acquire);
-        if !owned_access_ok(nameid as usize, row, caller_gen, CAP_READ | CAP_WRITE) { #[cfg(feature = "login")] if owned_user_ok(nameid as usize, row) { return open_created_sibling(row, srcrow, existing, nameid as usize, CAP_READ | CAP_WRITE); } // LOGIN M1 — by-USER admission (file tail). ⚠ LINE-NEUTRAL fold.
+        if !owned_access_ok(nameid as usize, row, caller_gen, CAP_READ | CAP_WRITE) { #[cfg(feature = "login")] if owned_user_ok(nameid as usize, row) { return created_open_admitted(row, nameid as usize, CAP_READ | CAP_WRITE); } // LOGIN M1 — by-USER admission (file tail). ⚠ LINE-NEUTRAL fold.
             return EACCES;
         }
-        return open_created_sibling(row, srcrow, existing, nameid as usize, CAP_READ | CAP_WRITE);
+        return created_open_admitted(row, nameid as usize, CAP_READ | CAP_WRITE); // STOR-1 M1: sibling or entry. ⚠ LINE-NEUTRAL fold.
     }
     let Some(w) = wstage_alloc(&[]) else {
         return EMFILE; // the writable staging pool is full
@@ -13142,7 +13142,7 @@ fn open_create_new(row: usize, nameid: u32, public: bool) -> i64 {
     // U11x M2: incref AFTER the created identity is stamped and BEFORE `install_file_handle` — its EAGAIN unwind
     // routes through `files_free`, which decrefs by that identity, so every failure path pairs exactly once (an
     // incref after the install would leave the unwind decrementing an un-incremented count: underflow).
-    openf_incref(nameid as usize);
+    created_entry_make(nameid as usize); openf_incref(nameid as usize); // STOR-1 M1: THE NAME IS BORN HERE, under the same NAMESPACE hold as the claims above — and it now outlives every descriptor below it. Before the incref so the entry is never seen by a refcount that already exists; a failed `install_file_handle` unwinds the DESCRIPTOR and deliberately leaves the ENTRY, because the file was created (knob-on it is on the volume) and that is exactly the state a close now leaves. ⚠ LINE-NEUTRAL fold.
     install_file_handle(row, fid, CAP_READ | CAP_WRITE)
 }
 
@@ -23551,7 +23551,7 @@ fn u11m2_launcher(demo_cpu: usize) {
     #[cfg(feature = "irqstorage")]
     s6_witness_launcher(demo_cpu);
     // U6x: chain the owner/grants ACL demo (program order, the u9x->..->u11m2 idiom; the LAST demo in the chain).
-    u6gx_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); busx86_stamp_check(); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
+    u6gx_launcher(demo_cpu); stor1_name_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); busx86_stamp_check(); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
 }
 
 /// Build a U6x fixture slot at a given entry symbol — the `u7x_build`/`u11m2_build` shape (allocate a private
@@ -24770,10 +24770,10 @@ fn busx_ls(text: &mut alloc::vec::Vec<u8>) -> i64 {
         if DYN_DELETED_G[id].load(Ordering::Acquire) {
             continue; // unlinked: gone for every row the moment the flag went up (sys_open says -ENOENT)
         }
-        let Some((r, idx)) = created_desc_any_row(usize::MAX, id as u32) else {
-            continue; // no live descriptor anywhere == the file does not exist on this arch
-        };
-        if !busx_ls_line(text, n, FILE_SIZE[r][idx].load(Ordering::Acquire)) {
+        if !created_entry_live(id) { // STOR-1 M1: the NAME ENTRY is existence, so a listing no longer loses a file the moment its writer closed. ⚠ LINE-NEUTRAL fold.
+            continue; // no entry == the file does not exist — the SAME test `sys_open_dynamic` now makes
+        }
+        if !busx_ls_line(text, n, created_name_size(id)) { // STOR-1 M1: the live descriptor's size if one is open, else the entry's. ⚠ LINE-NEUTRAL fold.
             text.extend_from_slice(b"...\n");
             return 0;
         }
@@ -24827,19 +24827,19 @@ fn busx_cat(row: usize, cgen: u64, name: &str, text: &mut alloc::vec::Vec<u8>) -
     if DYN_DELETED_G[nameid as usize].load(Ordering::Acquire) {
         return ENOENT; // unlinked (the non-create arm of sys_open_dynamic's deleted check)
     }
-    let Some((srcrow, idx)) = created_desc_any_row(row, nameid) else {
-        return ENOENT; // no live descriptor anywhere == the name does not resolve
-    };
+    if !created_entry_live(nameid as usize) { // STOR-1 M1: existence is the NAME ENTRY — the identical test `sys_open_dynamic` now makes, which is what keeps the two legs byte-same. ⚠ LINE-NEUTRAL fold.
+        return ENOENT; // no entry == the name does not resolve (sys_open_dynamic's tail verdict)
+    }
     if !owned_access_ok(nameid as usize, row, cgen, CAP_READ) {
         return EACCES; // THE gate — the identical call `sys_open_dynamic` makes for an RO open
     }
-    // Content: the descriptor's writable staging buffer is what a SYS_READ of this file serves, so it
-    // is what cat must read (siblings share one slot, so this is the same bytes every reader sees).
-    // Length is stable (writes are in-place or extend), which is why an unsynchronized read is safe
-    // here for exactly the reason `open_created_sibling` can share the slot at all.
-    let b: &[u8] = match (FILE_WSTAGE[srcrow][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
-        Some(widx) => wstage_bytes(widx),
-        None => &[], // a created descriptor always owns a wstage slot; fail closed to empty, never EIO-adjacent
+    // Content: a live descriptor's writable staging buffer is what a SYS_READ of this file serves, so
+    // it is what cat must read (siblings share one slot, so this is the same bytes every reader sees).
+    // STOR-1 M1: with NO descriptor open the name still exists, and the entry's close-surviving twin is
+    // what a reader would get — so cat answers from it rather than calling a live file empty.
+    let b: &[u8] = match created_desc_any_row(row, nameid) { // ⚠ LINE-NEUTRAL fold.
+        Some((srcrow, idx)) => created_desc_bytes(srcrow, idx, nameid as usize),
+        None => created_entry_bytes(nameid as usize), // entry-only: nobody holds this file open
     };
     let n = core::cmp::min(b.len(), BUSX_CAT_MAX);
     text.reserve(n);
@@ -24898,7 +24898,7 @@ fn busx_cp(row: usize, cgen: u64, src: &str, dst: &str) -> i64 {
         if DYN_DELETED_G[nameid as usize].load(Ordering::Acquire) {
             return EBUSY; // `open_create_new`'s refusal: the deferred delete has not drained
         }
-        if created_desc_any_row(row, nameid).is_some() {
+        if created_entry_live(nameid as usize) { // STOR-1 M1: create-new-only now means "no ENTRY", not "no open descriptor" — without this fold a `cp` onto a closed-but-live name would sail past this gate, reach `open_create_new`'s idempotent arm and SILENTLY OVERWRITE the file, which v1's bus refuses to have semantics for. ⚠ LINE-NEUTRAL fold.
             return EEXIST_X; // create-new-only in v1 (see the doc note)
         }
     }
@@ -24958,15 +24958,15 @@ fn busx_cat_raw(row: usize, cgen: u64, name: &str, out: &mut alloc::vec::Vec<u8>
     if DYN_DELETED_G[nameid as usize].load(Ordering::Acquire) {
         return ENOENT;
     }
-    let Some((srcrow, idx)) = created_desc_any_row(row, nameid) else {
+    if !created_entry_live(nameid as usize) { // STOR-1 M1: the same entry test as `busx_cat`, kept in lockstep by hand because these two ARE one gate with the sanitize lifted out. ⚠ LINE-NEUTRAL fold.
         return ENOENT;
-    };
+    }
     if !owned_access_ok(nameid as usize, row, cgen, CAP_READ) {
         return EACCES;
     }
-    let b: &[u8] = match (FILE_WSTAGE[srcrow][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
-        Some(widx) => wstage_bytes(widx),
-        None => &[],
+    let b: &[u8] = match created_desc_any_row(row, nameid) { // STOR-1 M1: live descriptor, else the entry's close-surviving twin. ⚠ LINE-NEUTRAL fold.
+        Some((srcrow, idx)) => created_desc_bytes(srcrow, idx, nameid as usize),
+        None => created_entry_bytes(nameid as usize),
     };
     out.extend_from_slice(&b[..core::cmp::min(b.len(), BUSX_CP_MAX)]);
     0
@@ -26382,6 +26382,546 @@ fn busx86_midden_launcher(_demo_cpu: usize) {
         serial_println!(
             ":: BUSX86-EQ: DETAIL cleanup — copy_sibling_open={} copy_unlink={} midden_unlink={} ::",
             bus[13], bus[14], bus[15]
+        );
+    }
+}
+
+// =================================================================================================
+// STOR-1 M1 — THE CREATED-NAME ENTRY TABLE: A CREATED FILE'S IDENTITY STOPS BEING A LIVE DESCRIPTOR
+//
+// WHAT WAS WRONG, stated as the two rows that measured it (LEDGER SR20; rmbp-ledger B153, B171).
+// On this arch a runtime-created file "existed" exactly while one of its descriptors was live
+// anywhere: `created_desc_any_row` WAS the existence test, so the last `SYS_CLOSE` of a name
+// destroyed the file. Two consequences were ledgered rather than fixed. (1) BUSX86 M2's bus `cp`
+// could not close the handle it had just created with — closing it would destroy what the reply had
+// already acknowledged — so it KEEPS one of the invoker's eight handle slots (the "honest scope"
+// note on `busx_cp`). (2) BUSX86 M3 measured the price: `NWSTAGE == 3` machine-wide and
+// `open_created_sibling` allocates its OWN slot, so VERIFYING one bus `cp` costs three pool slots
+// at once and one other row holding a created file open makes the read-back `-EMFILE`.
+//
+// WHAT THE ENTRY IS. A created name's existence is now a TABLE ENTRY, one per creatable name-id,
+// that outlives every descriptor of that name:
+//   * `CREATED_LIVE[nameid]`  — the file EXISTS. Set by `open_create_new` at the fresh create,
+//                               cleared by `sys_unlink` and by nothing else. THE existence test.
+//   * `CREATED_SIZE[nameid]`  — the file's logical size, refreshed from every releasing descriptor
+//                               with `fetch_max`. MAX and not a plain store, and that is a claim
+//                               about this namespace rather than a hedge: a created file here only
+//                               ever GROWS (`sys_write_grow` extends past EOF; there is no truncate
+//                               verb on this arch and no shrink primitive under it), so a sibling
+//                               that opened small and closed last can never shrink the name.
+//   * `CREATED_BUF[nameid]`   — the close-surviving CONTENT twin, one page (the same one-page bound
+//                               `FILE_SIZE == WSTAGE_LEN <= PAGE_SIZE` already puts on a created
+//                               file, so it can never truncate one), with `CREATED_LEN` bytes live.
+//   * the OWNER is NOT here — `OWNED_FILES` is already keyed by name-id and already survives every
+//     close (it is cleared at `owned_clear`, i.e. at unlink). The ACL was always the entry's shape;
+//     only existence and content were tied to a descriptor. So `owned_access_ok` keys the entry
+//     unchanged, which is what lets the ACL legs of BUSX86-EQ stay byte-identical.
+//
+// AND THE POOL. `NWSTAGE` is untouched and still THREE, but it now bounds a strictly smaller thing:
+// LIVE DESCRIPTORS of created files, never the files themselves. A created name with no open
+// descriptor holds NO pool slot and NO handle — it holds one entry, and entries are a static array
+// indexed by name-id, so there are exactly `N_U10_NAMES` of them and they cannot be exhausted.
+//
+// KNOB-ON vs KNOB-OFF, because the entry means something different on each and the difference is
+// the point. Knob-on (`s4_sync_storage()`), STOR-1 S4a/S4b/S5a already gave a created file a REAL
+// on-disk twin: the directory entry is made synchronously in-syscall, writes go through to it, and
+// reads come back from it live (`created_read_live`). So knob-on the entry is pure NAMESPACE — the
+// existence bit and the size — and the disk is the content. It is still load-bearing, because
+// `sys_open_dynamic` deliberately EXCLUDES every `U10_NAMES` spelling from the dynamic on-disk arm
+// (the case-variant exclusion that keeps an owned name from being re-resolved as a public one), so
+// without an entry a U10 name on disk is unreachable by name. Knob-off (no FAT / pre-service / the
+// in-memory core) there is no disk, so `CREATED_BUF` IS the file — and without it a close would
+// have turned a created file into a 0-length one, which is worse than losing it outright.
+//
+// PER BOOT, STATED PLAINLY. The table starts empty at every boot; it does not adopt files a
+// previous boot left on the volume. Reconciling the on-disk root into the created namespace at
+// mount is U11 M2's disk-write-back line, not this arc's — and the U10 fixtures' own
+// `u10_preflight_absent` self-heal already deletes such leftovers before they can be read.
+// =================================================================================================
+
+/// STOR-1 M1: created name `nameid` EXISTS. The successor to `created_desc_any_row` as THE existence
+/// test — set once at the fresh create (published LAST, after size), cleared once at `sys_unlink`.
+static CREATED_LIVE: [AtomicBool; N_U10_NAMES] = [const { AtomicBool::new(false) }; N_U10_NAMES];
+/// STOR-1 M1: the entry's logical file size — the running MAXIMUM over every releasing descriptor
+/// (see the header: this namespace grows and never shrinks, so max is exact rather than defensive).
+static CREATED_SIZE: [AtomicU32; N_U10_NAMES] = [const { AtomicU32::new(0) }; N_U10_NAMES];
+/// STOR-1 M1: how many bytes of `CREATED_BUF[nameid]` are live. Knob-off this equals `CREATED_SIZE`;
+/// knob-on it may lag (the disk is the content) and is never read for a read — only as a `bus cat`
+/// fallback when no descriptor holds the file open.
+static CREATED_LEN: [AtomicU32; N_U10_NAMES] = [const { AtomicU32::new(0) }; N_U10_NAMES];
+/// STOR-1 M1: the close-surviving content twin, one page per creatable name — the same one-page
+/// bound a created descriptor's writable staging slot already carries, so a snapshot of a created
+/// file always fits and a close can never truncate one. Row-major, like `WSTAGE_BUF`.
+static mut CREATED_BUF: [[u8; PAGE_SIZE as usize]; N_U10_NAMES] =
+    [[0; PAGE_SIZE as usize]; N_U10_NAMES];
+
+/// STOR-1 M1: does created name `nameid` exist? Bounds-checked so every caller can hand it a raw
+/// name-id. This is the call that replaced `created_desc_any_row(..).is_some()` at every gate.
+fn created_entry_live(nameid: usize) -> bool {
+    nameid < N_U10_NAMES && CREATED_LIVE[nameid].load(Ordering::Acquire)
+}
+
+/// STOR-1 M1: MAKE the entry — the fresh create's namespace half. Size/len are zeroed FIRST and the
+/// live bit published LAST (Release), so a reader that sees the name exist never sees a stale size
+/// from the name's previous incarnation. Called under the NAMESPACE lock (`open_create_new`).
+fn created_entry_make(nameid: usize) {
+    if nameid >= N_U10_NAMES {
+        return;
+    }
+    CREATED_SIZE[nameid].store(0, Ordering::Release);
+    CREATED_LEN[nameid].store(0, Ordering::Release);
+    CREATED_LIVE[nameid].store(true, Ordering::Release);
+}
+
+/// STOR-1 M1: CLEAR the entry — the unlink's namespace half, the exact inverse. The live bit is
+/// cleared FIRST (Release) so the name stops existing before its size does: the opposite order from
+/// `created_entry_make`, which is what makes both transitions unobservable half-done. Called under
+/// the NAMESPACE lock (`sys_unlink`), next to `owned_clear` — name and ACL die in the same breath.
+fn created_entry_clear(nameid: usize) {
+    if nameid >= N_U10_NAMES {
+        return;
+    }
+    CREATED_LIVE[nameid].store(false, Ordering::Release);
+    CREATED_SIZE[nameid].store(0, Ordering::Release);
+    CREATED_LEN[nameid].store(0, Ordering::Release);
+}
+
+/// STOR-1 M1: the entry's live content bytes (`CREATED_LEN` of them, bounded by the page).
+fn created_entry_bytes(nameid: usize) -> &'static [u8] {
+    if nameid >= N_U10_NAMES {
+        return &[];
+    }
+    let len = (CREATED_LEN[nameid].load(Ordering::Acquire) as usize).min(PAGE_SIZE as usize);
+    unsafe {
+        let base = (&raw const CREATED_BUF).cast::<u8>().add(nameid * PAGE_SIZE as usize);
+        core::slice::from_raw_parts(base, len)
+    }
+}
+
+/// STOR-1 M1: THE SEAM THAT MAKES A CLOSE NOT A DELETE — take the releasing descriptor's size and
+/// bytes into the name entry, immediately BEFORE its writable-staging slot goes back to the pool
+/// (`files_free_clear`). Runs for every release of a created descriptor (close, revoke, open-unwind,
+/// the unlink sweep, teardown), and does nothing at all when the entry is not live — so the unlink
+/// sweep, which clears the entry first, can never resurrect content into a name that just died.
+///
+/// TWO GUARDS, each measured against a real descriptor shape rather than imagined:
+///   * SIZE takes `fetch_max`, per the header — a knob-on sibling carries the source's size and a
+///     writer may have grown past it since, and the larger is always the file.
+///   * CONTENT is only taken when the descriptor actually HOLDS the file's bytes
+///     (`wstage_len >= size`). Knob-on, `open_created_sibling` seeds a sibling EMPTY by design
+///     (reads go live to disk — the S5a torn-copy closure), so a sibling closing last would
+///     otherwise overwrite a good twin with nothing. Knob-off every descriptor's wstage is seeded to
+///     its size, so the guard always passes and the entry always takes the fresh bytes.
+fn created_entry_snapshot(nameid: usize, row: usize, idx: usize, widx: usize) {
+    if !created_entry_live(nameid) {
+        return;
+    }
+    let size = FILE_SIZE[row][idx].load(Ordering::Acquire);
+    CREATED_SIZE[nameid].fetch_max(size, Ordering::AcqRel);
+    let src = wstage_bytes(widx);
+    if src.len() < size as usize {
+        return; // this descriptor does not hold the file's bytes (a knob-on sibling) — keep the twin
+    }
+    let n = (size as usize).min(src.len()).min(PAGE_SIZE as usize);
+    unsafe {
+        let dst = (&raw mut CREATED_BUF).cast::<u8>().add(nameid * PAGE_SIZE as usize);
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dst, n);
+    }
+    CREATED_LEN[nameid].store(n as u32, Ordering::Release);
+}
+
+/// STOR-1 M1: the file's CURRENT size — the live descriptor's if one is open anywhere, else the
+/// entry's. `bus ls` needs exactly this: a listing must not shrink a file because its writer closed.
+fn created_name_size(nameid: usize) -> u32 {
+    match created_desc_any_row(usize::MAX, nameid as u32) {
+        Some((r, idx)) => FILE_SIZE[r][idx].load(Ordering::Acquire),
+        None => CREATED_SIZE[nameid].load(Ordering::Acquire),
+    }
+}
+
+/// STOR-1 M1: the bytes a reader of descriptor `[row][idx]` would see — its writable staging buffer
+/// when that buffer holds them, else the name entry's twin. The fallback is what a knob-on sibling
+/// needs (seeded empty by S5a; the real content is on disk, and a `bus cat` runs under the NAMESPACE
+/// hold where a service-task read would be the S5 deadlock class, so the twin answers instead).
+fn created_desc_bytes(row: usize, idx: usize, nameid: usize) -> &'static [u8] {
+    if let Some(widx) = (FILE_WSTAGE[row][idx].load(Ordering::Acquire) as usize).checked_sub(1) {
+        let b = wstage_bytes(widx);
+        if !b.is_empty() {
+            return b;
+        }
+    }
+    created_entry_bytes(nameid)
+}
+
+/// STOR-1 M1: open a descriptor over a created name that NO descriptor currently holds — the case
+/// that simply could not arise before this milestone, because the name would not have existed. The
+/// `open_created_sibling` twin with the source replaced by the entry: same claims in the same order
+/// (wstage, descriptor, created mark, caller-verified identity, incref, handle), same errnos
+/// (`-EMFILE` on either pool, `-EAGAIN` on a full handle table), same unwind pairing.
+///
+/// The seed mirrors `open_created_sibling` EXACTLY, and deliberately: knob-on the wstage is seeded
+/// EMPTY because reads go live to the on-disk twin (`created_read_live`), knob-off it is seeded from
+/// the entry's bytes because the entry IS the file. The caller has already taken the ACL verdict —
+/// this function admits nobody on its own.
+fn open_created_entry(row: usize, nameid: usize, rights: u32) -> i64 {
+    if !created_entry_live(nameid) {
+        return ENOENT; // defensive: the caller resolved under the lock, so this cannot fire
+    }
+    let size = CREATED_SIZE[nameid].load(Ordering::Acquire);
+    let seed: &[u8] = if s4_sync_storage() { &[] } else { created_entry_bytes(nameid) };
+    let Some(w) = wstage_alloc(seed) else {
+        return EMFILE;
+    };
+    let Some(fid) = files_alloc(row, CREATED_STAGED_SENTINEL, size, (w + 1) as u32, 0) else {
+        wstage_free(w);
+        return EMFILE;
+    };
+    FILE_CREATED[row][fid].store(true, Ordering::Release);
+    FILE_OPNAME[row][fid].store((nameid + 1) as u32, Ordering::Release); // caller-verified identity
+    openf_incref(nameid);
+    install_file_handle(row, fid, rights)
+}
+
+/// STOR-1 M1: open an ALREADY-ADMITTED created name — the single tail every gate now returns
+/// through (`sys_open_dynamic`'s sibling branch, its LOGIN by-user arm, and `open_create_new`'s
+/// create-races-create fallback). A live descriptor anywhere still seeds a SIBLING (unchanged, so
+/// the cross-process snapshot/live-read behaviour of U11x M2 and STOR-1 S5a is byte-identical);
+/// with no descriptor open, the entry itself is opened. The caller has taken the ACL verdict and
+/// holds the NAMESPACE lock, which is what makes the two-way choice atomic against create/unlink.
+fn created_open_admitted(row: usize, nameid: usize, rights: u32) -> i64 {
+    match created_desc_any_row(row, nameid as u32) {
+        Some((srcrow, existing)) => open_created_sibling(row, srcrow, existing, nameid, rights),
+        None => open_created_entry(row, nameid, rights),
+    }
+}
+
+// =================================================================================================
+// STOR-1 M1 — THE WITNESS: `stor1-name`, one ring-3 program that asks the one question the old model
+// could not be asked. Every leg is a REAL syscall from ring 3 under its own private identity, because
+// the claim is about what a PROGRAM sees: a file it created and then closed is still there.
+//
+// WHY RING 3 AND NOT A KERNEL-SIDE CHECK. The launcher could call `open_create_new` and
+// `sys_open_dynamic` directly and read the same booleans out, and that witness would be worth
+// nothing: the thing under test is `sys_open`'s resolution order, and `sys_open` takes a RING-3 NAME
+// POINTER. A kernel-side caller enters one function below the gate it is meant to be proving. This is
+// the wall BANDY-1 hit on the Pi and the reason BUSX86 M3 is a ring-3 program too.
+//
+// WHY ITS OWN NAME. `STOR1.BIN` is registered in `U10_NAMES` for this fixture alone. Sharing a name
+// with U10c/U10d/U11x-M2 would have made this witness's verdict depend on their ordering, and (worse)
+// made THEIR pre-flights depend on this one's cleanup. The fixture unlinks the name on its way out,
+// so the boot ends with the table exactly as it found it — and the last leg is that unlink, so a
+// cleanup that silently did nothing cannot read as a clean one.
+//
+// THE SIX BITS, and the two that are the milestone:
+//   bit0  create (O_CREAT|RW, PRIVATE) + a 16-byte write            — the setup, scored so a broken
+//                                                                     setup is never a silent skip
+//   bit1  SYS_CLOSE of the ONLY descriptor returns 0                — the file now has no descriptor
+//   bit2 ★ SYS_OPEN of that name READ-ONLY SUCCEEDS                 — pre-STOR-1 this was `-ENOENT`:
+//                                                                     `created_desc_any_row` found
+//                                                                     nothing and the file was gone
+//   bit3 ★ the re-opened file reads back BYTE-EXACT                 — existence without content would
+//                                                                     be a name pointing at nothing
+//   bit4  a second close, then O_CREAT of the same name gives the   — the idempotent-open contract,
+//         SAME file (its bytes, not a fresh 0-length mint)            which used to be reachable only
+//                                                                     while a descriptor was alive
+//   bit5  SYS_UNLINK through that handle -> 0, and a plain re-open  — U10 M3's contract KEPT: unlink,
+//         -> -ENOENT                                                  and ONLY unlink, removes a name
+//
+// GO-RED (behavioural, MEASURED rather than reasoned — the prediction was wrong and the measurement
+// is the better witness for it). Put `created_desc_any_row(row, nameid).is_some()` back in place of
+// `created_entry_live(nameid as usize)` at `sys_open_dynamic`'s sibling gate — the OLD identity model,
+// one line — and this fixture prints, on the default lane:
+//
+//   :: STOR1-NAME: created-name entries FAIL [w=0x33/0x3f] — signalled=true sealed=true cleared=true
+//   drained=true entry_gone=true replayed=1 rc=[create=0 write=16 close=0 reopen=-2 read=0
+//   recreate=0 reread=16 unlink=0] ::
+//
+// `reopen=-2` IS the old model, in one number: the plain re-open of a name whose last descriptor just
+// closed is `-ENOENT`. Bits 2 and 3 fall and bits 0,1,4,5 SURVIVE, which is worth stating because it
+// is not what a first reading predicts: bit4's re-open is O_CREAT, so it goes through
+// `open_create_new`, whose OWN entry test this go-red does not touch — the file is still there for
+// the create path while being gone for the plain-open path, and a witness that scored only "does it
+// come back" would have called that half-broken namespace green. Both pins in `x86-default.spec`
+// convict it: the REQUIRE on `w=0x3f/0x3f` goes unmatched AND the FORBID takes a hit.
+// =================================================================================================
+
+const S1N_W_OFF: usize = 0x2000; // u64 — the witness bitmask
+const S1N_RC_OFF: usize = 0x2008; // i64[8] — every leg's RAW rc, so a FAIL says which syscall said what
+const S1N_SEAL_OFF: usize = 0x2100; // written LAST (the BXM_SEAL discipline: a scrubbed window is all zeros and `0` is a legal rc, so without a seal a fixture that died before its first leg reads as a clean set of zeros)
+const S1N_SIG_OFF: usize = 0x2800; // fixture -> launcher
+const S1N_SEAL: u64 = 0x5331_4e41_4d45_5f31; // "S1NAME_1"
+const S1N_WANT: u64 = 0x3f; // six bits
+const S1N_NAME: &str = "STOR1.BIN";
+
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_stor1_blob_start
+unaos_user_stor1_blob_start:
+    .balign 16
+
+    .globl unaos_user_stor1_name
+unaos_user_stor1_name:
+    lea r15, [rip + unaos_user_stor1_blob_start]   // r15 = window base (== USER_BASE)
+    xor r12, r12                                   // r12 = the witness bitmask
+
+    // ---- bit0: create STOR1.BIN PRIVATE (O_CREAT|RW = 3, no O_PUBLIC) and write 16 bytes ----
+    mov rax, 11                             // SYS_OPEN
+    lea rdi, [rip + .Ls1_nm]
+    mov rsi, 9
+    mov rdx, 3
+    syscall
+    mov qword ptr [r15 + 0x2008], rax
+    mov rbx, rax
+    test rbx, rbx
+    js .Ls1_done
+    mov rax, 1                              // SYS_WRITE
+    mov rdi, rbx
+    lea rsi, [rip + .Ls1_pat]
+    mov rdx, 16
+    syscall
+    mov qword ptr [r15 + 0x2010], rax
+    cmp rax, 16
+    jne .Ls1_done
+    or r12, 1
+
+    // ---- bit1: CLOSE the only descriptor. After this the file has no handle and no descriptor
+    //      anywhere — which under the old model was the same sentence as "the file is gone".
+    mov rax, 17                             // SYS_CLOSE
+    mov rdi, rbx
+    syscall
+    mov qword ptr [r15 + 0x2018], rax
+    test rax, rax
+    jnz .Ls1_done
+    or r12, 2
+
+    // ---- bit2 ★ THE MILESTONE: open the name again, READ-ONLY (mode 0, not O_CREAT — a create
+    //      could always have minted a new file; only a plain open can prove the OLD one is there).
+    mov rax, 11
+    lea rdi, [rip + .Ls1_nm]
+    mov rsi, 9
+    xor rdx, rdx
+    syscall
+    mov qword ptr [r15 + 0x2020], rax
+    mov rbx, rax
+    test rbx, rbx
+    js .Ls1_recreate
+    or r12, 4
+
+    // ---- bit3 ★ and it is the SAME file: 16 bytes back, byte-for-byte the pattern written above.
+    mov rax, 12                             // SYS_READ
+    mov rdi, rbx
+    lea rsi, [r15 + 0x1000]
+    mov rdx, 16
+    syscall
+    mov qword ptr [r15 + 0x2028], rax
+    cmp rax, 16
+    jne .Ls1_close_ro
+    lea rcx, [rip + .Ls1_pat]
+    mov rax, qword ptr [r15 + 0x1000]
+    cmp rax, qword ptr [rcx]
+    jne .Ls1_close_ro
+    mov rax, qword ptr [r15 + 0x1000 + 8]
+    cmp rax, qword ptr [rcx + 8]
+    jne .Ls1_close_ro
+    or r12, 8
+.Ls1_close_ro:
+    mov rax, 17
+    mov rdi, rbx
+    syscall
+
+.Ls1_recreate:
+    // ---- bit4: with every descriptor closed again, O_CREAT|RW of the same name must be the
+    //      IDEMPOTENT open of the existing file — it must hand back a handle whose read serves the
+    //      original bytes, never a fresh 0-length mint that silently replaced them.
+    mov rax, 11
+    lea rdi, [rip + .Ls1_nm]
+    mov rsi, 9
+    mov rdx, 3
+    syscall
+    mov qword ptr [r15 + 0x2030], rax
+    mov rbx, rax
+    test rbx, rbx
+    js .Ls1_done
+    mov rax, 12
+    mov rdi, rbx
+    lea rsi, [r15 + 0x1040]
+    mov rdx, 16
+    syscall
+    mov qword ptr [r15 + 0x2038], rax
+    cmp rax, 16
+    jne .Ls1_unlink
+    lea rcx, [rip + .Ls1_pat]
+    mov rax, qword ptr [r15 + 0x1040]
+    cmp rax, qword ptr [rcx]
+    jne .Ls1_unlink
+    mov rax, qword ptr [r15 + 0x1040 + 8]
+    cmp rax, qword ptr [rcx + 8]
+    jne .Ls1_unlink
+    or r12, 16
+
+.Ls1_unlink:
+    // ---- bit5: UNLINK still removes the NAME. The entry made a close harmless; it must not have
+    //      made a delete harmless too. Scored as one bit over two syscalls, because "the unlink
+    //      returned 0" and "the name is gone" are different claims and only the pair is the contract.
+    mov rax, 16                             // SYS_UNLINK
+    mov rdi, rbx
+    syscall
+    mov qword ptr [r15 + 0x2040], rax
+    test rax, rax
+    jnz .Ls1_done
+    mov rax, 11
+    lea rdi, [rip + .Ls1_nm]
+    mov rsi, 9
+    xor rdx, rdx
+    syscall
+    cmp rax, -2                             // exactly -ENOENT
+    jne .Ls1_done
+    or r12, 32
+
+.Ls1_done:
+    mov qword ptr [r15 + 0x2000], r12
+    mov rax, 0x53314e414d455f31            // "S1NAME_1" — the table is complete; written LAST
+    mov qword ptr [r15 + 0x2100], rax
+    mov qword ptr [r15 + 0x2800], 1        // SIG 1: the launcher may read the table
+    mov rax, 2                              // SYS_EXIT — routed to the no-op arm by NAME (this
+    xor rdi, rdi                            // fixture carries no exit witness; the table is it)
+    syscall
+.Ls1_spin:
+    jmp .Ls1_spin
+
+    .balign 8
+.Ls1_nm:
+    .ascii "STOR1.BIN"
+    .balign 8
+.Ls1_pat:
+    .ascii "stor1-name-entry"
+
+    .balign 16
+    .globl unaos_user_stor1_blob_end
+unaos_user_stor1_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_stor1_blob_start: u8;
+    static unaos_user_stor1_blob_end: u8;
+    static unaos_user_stor1_name: u8;
+}
+
+/// Build the STOR-1 M1 fixture slot — the `busxm_build` shape verbatim (private address space, the
+/// WHOLE window scrubbed so the seal means something, the blob copied into the RX-RO code page).
+fn s1n_build() -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_stor1_blob_start as usize;
+    let bend = &raw const unaos_user_stor1_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "STOR-1 M1 blob does not fit in a code page");
+    let off = (&raw const unaos_user_stor1_name as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+fn s1n_read(slot: usize, off: usize) -> u64 {
+    let p = unsafe { crate::arch::memory::slot_backing_ptr(slot).add(off) as *const u64 };
+    unsafe { core::ptr::read_volatile(p) }
+}
+
+/// STOR-1 M1 launcher + verdict. Chained into the ring-3 ladder BEFORE the BUSX86 M3 midden, for the
+/// reason M3's own comment gives about its placement: a fixture that needs three address-space slots
+/// and three cores must find them free, so anything cheaper runs first and gives its slot back.
+///
+/// Knob-on it pre-flights the name off the volume first (`u10_preflight_absent`, the u10dx/u11m2
+/// discipline): `submit_create` is idempotent, so a STOR1.BIN a previous boot left behind would be
+/// ADOPTED as a 0-length descriptor over an N-byte on-disk file — the exact stale-entry class STOR-1
+/// S6's note 3 closed for the delete side, and the reason no fixture in this file creates a name it
+/// has not first proved absent.
+fn stor1_name_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let disk_present = HELLO_STAGED.load(Ordering::Acquire);
+    if disk_present && !u10_preflight_absent(S1N_NAME) {
+        serial_println!(
+            ":: STOR1-NAME: {} present on the volume and not self-healed — created-name witness skipped ::",
+            S1N_NAME
+        );
+        return;
+    }
+    let Some(f) = s1n_build() else {
+        serial_println!(":: STOR1-NAME: no free address-space slot — created-name witness skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: STOR1-NAME: created-name entries — a created file's identity is a NAME ENTRY, not a live descriptor: close every handle and the file is still there (the x86 twin of the pi4 dir-entry model) ::"
+    );
+    // The `u6gx`/M3 preemptibility gate, taken for its reason verbatim: knob-on a created file's
+    // reads route through the storage service task, and a non-preemptible ring-3 task co-located with
+    // that task would starve it. Knob-off keeps the byte-identical non-preemptible spawn. The core is
+    // a non-render worker when the pool has one (M3's placement rule) and `demo_cpu` otherwise —
+    // this fixture never spins on a GO word, so sharing the launcher's core is survivable for it.
+    let cpu = crate::arch::smp::worker_cpu(0).unwrap_or(demo_cpu);
+    if s4_sync_storage() {
+        crate::arch::sched::spawn_user_preemptible(
+            "stor1-name", f.entry, f.sp, cpu, f.cr3,
+            alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new()),
+        );
+    } else {
+        crate::arch::sched::spawn_user_in_space("stor1-name", f.entry, f.sp, cpu, f.cr3);
+    }
+    let deadline = crate::arch::ticks() + 5000;
+    while s1n_read(f.slot, S1N_SIG_OFF) == 0 && crate::arch::ticks() < deadline {
+        crate::arch::sched::yield_now();
+    }
+    let signalled = s1n_read(f.slot, S1N_SIG_OFF) >= 1;
+    let sealed = s1n_read(f.slot, S1N_SEAL_OFF) == S1N_SEAL;
+    let w = s1n_read(f.slot, S1N_W_OFF);
+    let mut rc = [0i64; 8];
+    for (i, slot) in rc.iter_mut().enumerate() {
+        *slot = s1n_read(f.slot, S1N_RC_OFF + i * 8) as i64;
+    }
+    // Teardown proof + the deferred-op drain, the M3 cleanup discipline: the fixture's unlink is the
+    // last thing it does, and knob-off that enqueues ONE held CreateGrowDelete released at its last
+    // close. `NU10 == 1`, so an undrained op here would meet the next fixture's enqueue and become the
+    // dropped acknowledged mutation `:: U10: OP QUEUE FULL` names.
+    let tdeadline = crate::arch::ticks() + 3000;
+    while !(files_row_is_clear(f.slot) && handle_row_is_clear(f.slot)) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = files_row_is_clear(f.slot) && handle_row_is_clear(f.slot);
+    let mut replayed = 0u32;
+    if let Ok(fs) = crate::fs::fat::mount() {
+        while u10_flush_drain_one(&fs).is_some() {
+            replayed += 1;
+        }
+    }
+    let drained = u10_flush_all_free() && !U10_OVERFLOW.load(Ordering::Acquire);
+    // The entry table is back where the boot found it: the name is gone and holds nothing. This is the
+    // kernel-side half of bit5 — the fixture proved `-ENOENT` from ring 3, and this proves the ENTRY
+    // behind that answer was actually torn down rather than merely hidden by `DYN_DELETED_G`.
+    let nameid = u10_name_id(S1N_NAME).unwrap_or(0) as usize;
+    let entry_gone = !created_entry_live(nameid);
+    crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(f.slot));
+    let pass = signalled && sealed && w == S1N_WANT && cleared && drained && entry_gone;
+    if pass {
+        serial_println!(
+            ":: STOR1-NAME: created-name entries (stor1-name) — create+write, CLOSE the only descriptor, and the name is STILL THERE: re-open OK, bytes byte-exact, O_CREAT idempotent (not a fresh mint), and SYS_UNLINK still takes it away (-ENOENT after) :: PASS [w={:#x}/{:#x}] ::",
+            w, S1N_WANT
+        );
+    } else {
+        serial_println!(
+            ":: STOR1-NAME: created-name entries FAIL [w={:#x}/{:#x}] — signalled={} sealed={} cleared={} drained={} entry_gone={} replayed={} rc=[create={} write={} close={} reopen={} read={} recreate={} reread={} unlink={}] ::",
+            w, S1N_WANT, signalled, sealed, cleared, drained, entry_gone, replayed,
+            rc[0], rc[1], rc[2], rc[3], rc[4], rc[5], rc[6], rc[7]
         );
     }
 }
