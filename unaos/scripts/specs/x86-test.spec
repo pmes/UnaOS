@@ -151,3 +151,77 @@ COMPLETE :: zeolite: metrics .*queries seen, .*blocked \(sinkholed\), .*forwarde
 # scripts/specs/ that is neither named in `arroyo`'s CODE nor carries a RUN-BY line above — and a
 # `RUN-BY: verb:` claim is cross-checked against `arroyo`, so this file cannot claim a runner it
 # does not have. "A replay spec no gate command runs is a silent landmine."
+
+# ── SDHCRW (appended 2026-09-22, rmbp-ledger B166, RULINGS R59) — THE BOOT VOLUME'S POSTURE ──────
+#
+# R59, Peter, verbatim: "read write." The card in the rMBP's internal slot is that machine's hard
+# drive, and until this arc a default image mounted it READ-ONLY and said so. This block is what
+# makes the flip a fact this lane re-reads on every `./arroyo test` instead of a claim in a ledger
+# row.
+#
+# WHY A PIN HERE AT ALL, AND WHY THIS FILE. `./arroyo test` is the only command that both BOOTS a
+# default x86 image and SCORES it, and the posture is a property of the DEFAULT image — there is no
+# knob to arm to see it. `x86-witness.spec`'s `:: sdhc: w1 armed=[01] …` cannot cover it: that
+# pattern matches both polarities on purpose (that file says so in as many words) and it scores the
+# DRIVER's self-test, not the MOUNT's posture. A driver that can write a sector and a volume a file
+# verb may mutate are two different questions, and flight 11 failed on the second while the first
+# had passed since Boot AD.
+#
+# ⚠ THE SHAPE OF THESE THREE REQUIREs IS NOT A HEDGE, AND IT COST A RUN TO LEARN. The first cut
+# pinned the rw rows FLAT (`-> sdhc=rw reason=none`). They passed the default lane — and turned
+# `UNAOS_SDW_RO=1 ./arroyo test` RED, because `scripts/qemu_await.py --settled` treats an unmatched
+# REQUIRE as NOT SETTLED: the opt-out capture reached its end-of-run marker at line 2454 and the
+# verb still called it `truncated  reason=short-witnesses:3`, then burned the whole 420 s wall
+# waiting for lines that cannot print in that polarity. A pin that reds a SHIPPED knob is a trap for
+# the next operator, not a gate. So each REQUIRE below names BOTH legal rows VERBATIM and nothing
+# else — drift in either polarity still reds — and the R59 assertion itself, which an alternation
+# cannot carry, is the FORBID underneath them.
+#
+# THE THREE REQUIREs, each a different layer saying the same word:
+#   1. `drivers::block::sdhc_write_veto`'s truth table — the ONE definition, at the mount. Either
+#      `sdw-ro=0 wp-pin=enabled write-path=live -> sdhc=rw reason=none` (the R59 default) or
+#      `sdw-ro=1 wp-pin=unread write-path=unread -> sdhc=ro reason=opt-out` (the named escape).
+#      No third row is admitted, which is what makes this a pin and not a shrug.
+#   2. `fs::fat`'s SDHCBLK mount witness — the word in it is ASKED of (1) since this arc, not
+#      asserted, so pinning it pins the two agreeing.
+#   3. `fs::sdhc4c`'s tally — `sectors=`+`posture=rw` is the CMD25 vocabulary the default image
+#      rides; `cmd24=` is the opt-out's, and 4c's line reverts to its pre-SDHCPOST shape there.
+#      `armed=1` in both is the `sdw` ladder being present by default, which is R59's other half.
+#
+# WHICH CONSUMER READS THESE PINS, measured rather than assumed. `x86_test_completion` runs
+# `qemu_await.py --settled` against THIS file on EVERY `./arroyo test`, whatever the knob set —
+# that is how the trap above fired — so these pins are load-bearing even on a run whose REPLAY
+# spec is a different file: under `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1`,
+# `x86_pick_capture_spec` resolves the replay to `x86-default.spec`. A plain `./arroyo test`
+# replays this file with both consumers, which is the case the CONTRACT's RUN-BY line describes.
+#
+# THE FORBID IS THE R59 ASSERTION. `sdw-ro=0 wp-pin=enabled write-path=live -> sdhc=ro` is a DEFAULT
+# image, with the slider saying ENABLED and the card registered, refusing anyway. There is no
+# configuration in which that row is correct: every legitimate refusal names `opt-out` (the knob),
+# `wp-pin` (the slider) or `no-write-path` (no card yet), and this one names none of them while
+# having no reason left to refuse. It is silent in BOTH lanes, so it costs the opt-out operator
+# nothing, and it is the exact row a regression in any of the five wiring places would print —
+# including the pre-card latch defect this arc found and fixed (`sdhc_rw_gate`'s PRE-CARD note: a
+# witness fixture asking before the card registered froze the posture at `ro` for the whole boot,
+# and the FIRST default replay of this arc read `wp-pin=PROTECTED write-path=ABSENT -> sdhc=ro`).
+#
+# GO-RED (LAWS §5 — an ungated gate is not a gate; MEASURED 2026-09-22 against this arc's own
+# captures, `python3 scripts/mbench.py --replay <capture> --spec scripts/specs/x86-test.spec
+# --platform x86`). Both directions were exercised, because a REQUIRE and a FORBID fail in opposite
+# ways and proving one says nothing about the other. The logs are in this arc's executor logs.
+#
+# Under the CONTRACT above, changing any of the three kernel lines changes these pins in the SAME
+# commit.
+#
+# Capture lines — DEFAULT (`UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1 ./arroyo test 240`):
+#   :: SDHCPOST: posture sdw-ro=0 wp-pin=enabled write-path=live -> sdhc=rw reason=none (the pin is read ONCE, at the mount; …) ::
+#   :: SDHCBLK: FAT mounted READ-WRITE on the internal SD card (16 MiB): FAT16 vol@LBA0 … ::
+#   :: SDHC4C: tally fat-mutations-on-sdhc=0 permits=1 refusals=0 sectors=1 armed=1 posture=rw permits-by-posture=2 expected-mutations=0 ::
+# Capture lines — OPT-OUT (the same, plus `UNAOS_SDW_RO=1`):
+#   :: SDHCPOST: posture sdw-ro=1 wp-pin=unread write-path=unread -> sdhc=ro reason=opt-out (condition 1 refused before the pin was read; …) ::
+#   :: SDHCBLK: FAT mounted READ-ONLY on the internal SD card (16 MiB): FAT16 vol@LBA0 … ::
+#   :: SDHC4C: tally fat-mutations-on-sdhc=0 permits=1 refusals=0 cmd24=1 armed=1 ::
+REQUIRE :: SDHCPOST: posture (sdw-ro=0 wp-pin=enabled write-path=live -> sdhc=rw reason=none|sdw-ro=1 wp-pin=unread write-path=unread -> sdhc=ro reason=opt-out)
+REQUIRE :: SDHCBLK: FAT mounted READ-(WRITE|ONLY) on the internal SD card
+REQUIRE :: SDHC4C: tally fat-mutations-on-sdhc=[0-9]+ permits=[0-9]+ refusals=[0-9]+ (sectors=[0-9]+ armed=1 posture=rw|cmd24=[0-9]+ armed=1 ::)
+FORBID :: SDHCPOST: posture sdw-ro=0 wp-pin=enabled write-path=live -> sdhc=ro
