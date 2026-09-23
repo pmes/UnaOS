@@ -113,21 +113,24 @@ the kernel compiles and decode the result with a real zlib.
 
 ## 5. Naming, and the no-overwrite rule
 
-A Mac writes `Screenshot 2026-09-22 at 17.31.02.png`. **We cannot** — `fs/fat.rs:118` writes 8.3
-short names only and every separator in that name is illegal here. §13 states what the FATLFN arc
-must add to earn it. Until then `prtscr::choose_name` picks, in order:
+A Mac writes `Screenshot 2026-09-22 at 17.31.02.png`. **And so do we, since FATLFN (2026-09-22).**
+For the fourteen hours between SCRSHOT-DESKTOP and that arc this paragraph read *"we cannot"*, and
+it was true: `fs/fat.rs` wrote 8.3 short names only and every separator in that name is illegal in
+one. §13 stated what had to be built; it is built, and §13 now records it as closed.
+`prtscr::choose_name` picks, in order:
 
 | rule | name | when | `name_from=` |
 |---|---|---|---|
-| clock stamp | `MMDDHHMM.PNG` — e.g. `09221731.PNG` | the wall clock is set **and** that name is free | `clock` |
-| ladder | `SCREEN0.PNG` .. `SCREEN99.PNG`, first free index | the clock name is already taken (two captures inside one minute) | `clock-taken` |
+| clock stamp | `Screenshot YYYY-MM-DD at HH.MM.SS.png` — e.g. `Screenshot 2026-09-22 at 17.31.02.png` | the wall clock is set **and** that name is free | `clock` |
+| ladder | `SCREEN0.PNG` .. `SCREEN99.PNG`, first free index | the clock name is already taken (two captures inside one second) | `clock-taken` |
 | ladder | the same | `clock::now()` is `None` — no wall clock this boot | `clock-unset` |
 
-**`MMDDHHMM` and not a packing.** Four zero-padded digit pairs, most-significant first, so a
-directory listed in name order is listed in **time order** — the one property a screenshot folder is
-actually used through. Nobody needs a comment to read `09221731`. The year and the seconds do not fit
-(twelve digits into eight) and are dropped **visibly**, rather than smuggled into a base-36
-cryptogram that buys one field and costs every future reader.
+**Dots where a Mac writes colons, and that is the Mac's own answer too.** `HH.MM.SS`, not `HH:MM:SS`:
+a colon is illegal in a VFAT long name (`fat::lfn_units` refuses it) and macOS writes the dotted form
+on a FAT volume for the same reason. Nothing else is dropped — the year and the seconds that
+`MMDDHHMM.PNG` had to truncate are both back, so two captures now collide only inside the same
+**second** rather than the same minute, and the `clock-taken` fallback that handles it is unchanged.
+The 8.3 alias an old reader sees is `SCREEN~1.PNG` (`fs/fat.rs` §FATLFN; `docs/dev/OS/09_FILESYSTEM/vfs.md` §16.2).
 
 **Today the ladder is what runs, on both lanes.** Measured, not assumed: `clock::now()`
 (`clock.rs:201`) answers `None` until something seeds the anchor, and nothing does — QEMU's hermetic
@@ -143,8 +146,10 @@ overwritten** in either arm: the search asks `locate_in_dir(dir, name)` per cand
 first `NotFound`; when all hundred ladder names are present the capture refuses and says so rather
 than wrapping around onto `SCREEN0.PNG`. The lookup goes through the filesystem rather than a
 directory listing because `locate_in_dir` matches on both the 8.3 short name and any long name, and
-`create_in_dir` does not de-duplicate. Every name this module mints is 8.3-clean, so none of them
-needs a long-name entry.
+`create_in_dir` does not de-duplicate. ⚠ **That sentence was a promise the locator did not keep** —
+`locate_in_dir_sectors` classified slots without a long-name accumulator and so matched SHORT names
+only, which nothing noticed while every name this module minted was 8.3-clean. FATLFN made it true
+(`vfs.md` §16.5); without that fix the clock arm would have created a duplicate on every capture.
 
 ## 6. Writing, and `Busy`
 
@@ -698,28 +703,51 @@ All three are cured by work already in flight rather than by anything here: LOGI
 session, R59 lands the boot volume read-write, and on flight 12 a ⌘⇧3 after logging in should print
 the RESOLVED line above and leave the file on Peter's own card.
 
-## 13. What the Mac name needs — the FATLFN arc, NOT started here
+## 13. The Mac name — CLOSED by FATLFN (2026-09-22)
 
 A Mac writes `Screenshot 2026-09-22 at 17.31.02.png`. Thirty-six characters, two spaces and three
-dots: not merely too long, but illegal in every separator. `fs/fat.rs:118` states the constraint
-outright — *"this driver's create path writes 8.3 names only (VFAT LFN write is out of scope)"* — so
-this is a **missing feature**, and §5's `MMDDHHMM.PNG` is what we do until it lands, not a substitute
-for it.
+dots: not merely too long, but illegal in every separator. This section was written on 2026-09-22 by
+SCRSHOT-DESKTOP as a **specification for an arc that had not started**, because `fs/fat.rs` stated
+the constraint outright — *"this driver's create path writes 8.3 names only (VFAT LFN write is out
+of scope)"* — and §5's `MMDDHHMM.PNG` was what we did until it landed. **FATLFN landed it the same
+day.** The four items are below, each with what now implements it; the mechanism, the crash
+argument, the FAT16-root refusal and the fixture are in `docs/dev/OS/09_FILESYSTEM/vfs.md` §16, which
+is the FAT driver's own doc and the place to read rather than this one.
 
-**The read half is already built and is the specification for the write half.** PI-FS-3's `LfnBuf`
-accumulates the 0x0F-attribute VFAT component slots preceding a short entry, checksum-validates the
-run against that short name, and decodes it; `DirEntry::eq_name` (`fs/fat.rs:190`) then matches
-either spelling. What FATLFN must add is the inverse of exactly that, and only that:
+**The read half was the specification, and it was not touched.** PI-FS-3's `LfnBuf` accumulates the
+0x0F-attribute VFAT component slots preceding a short entry, checksum-validates the run against that
+short name, and decodes it; `DirEntry::eq_name` (`fs/fat.rs`) matches either spelling. What FATLFN
+added is the inverse of exactly that, and only that:
 
-1. **Emit the component slots** — 13 UTF-16 code units each, written in reverse order, with
-   `LAST_LONG_ENTRY` (0x40) or'd into the sequence number of the first one written.
-2. **Compute the one-byte checksum** over the 11-byte short-name field, the same checksum the read
-   path already verifies, and stamp it into every slot of the run.
-3. **Allocate the run and the short entry contiguously** in one directory extend, with a crash order
-   as deliberate as `create_dir`'s and `write_grow`'s: a boot cut must leave either no entry or a
-   complete run, never a short entry whose long slots are half-written.
-4. **Mint a non-colliding short alias** for the short field — the `NAME~1` form a real VFAT driver
-   writes, with the `~n` bumped against what the directory already holds.
+1. ~~**Emit the component slots**~~ — **done**: `write_lfn_run` materializes 13 UTF-16 units per slot
+   and writes them in reverse order with `LAST_LONG_ENTRY` (0x40) or'd into the ordinal of the first
+   one written, a `0x0000` terminator where there is room for one and `0xFFFF` padding after it.
+2. ~~**Compute the one-byte checksum**~~ — **done**: the SAME `lfn_checksum` the read path verifies,
+   over the 11-byte short field, stamped into every slot of the run.
+3. ~~**Allocate the run and the short entry contiguously**~~ — **done**: `free_run_in_dir` finds
+   `n + 1` consecutive free slots across sector and cluster boundaries; `free_run_or_grow` appends
+   clusters through FATGROW's own `grow_dir_chain` when there is no such run, and refuses the FAT16
+   fixed root because that root cannot grow (the format's refusal, not the driver's). The crash order
+   is slots-before-the-short-entry, sector by sector, short entry's sector LAST — so a boot cut
+   leaves an ORPHAN RUN, which every VFAT reader discards on the checksum, and never a short entry
+   whose name slots are half-written. Proven by a fixture leg that cuts after 2 of 3 slots.
+4. ~~**Mint a non-colliding short alias**~~ — **done**: `lfn_short_alias` produces the `NAME~n` form
+   with the `~n` bumped **by lookup** against the directory, never by guess.
+   `Screenshot 2026-09-22 at 17.31.02.png` becomes `SCREEN~1.PNG`.
 
-It is its own arc because item 3 is its own argument. This arc (SCRSHOT-DESKTOP) is the
-**destination**; the name waits on that one.
+**And one thing the list did not name, which the arc had to fix to be worth anything.**
+`locate_in_dir` matched SHORT names only — see §5's warning and `vfs.md` §16.5. Without that repair
+the clock arm would have created a duplicate Mac-named file on every capture, because the
+no-overwrite rule asks `locate_in_dir` for the name and takes `NotFound` as permission.
+
+**The wire**, pinned on the x86 default lane (`unaos/scripts/specs/x86-default.spec`):
+
+```
+:: FAT-LFN: created=Screenshot 2026-09-22 at 17.31.02.png slots=3 alias=SCREEN~1.PNG readback=ok alias_readback=ok checksum=ok torn_k=2 orphans_ignored=ok -> PASS ::
+```
+
+The name there is built by `prtscr::mac_name` from a **fixed synthetic moment**, because the QEMU
+lane still has no wall clock (§5: `clock::now()` is `None` all boot, and every capture on that lane
+still says `name_from=clock-unset` and takes the `SCREEN<n>` ladder). The formatter is therefore
+proved on a lane that cannot otherwise reach it, and the clock arm lights up for free the day
+`date -s`, SNTP on a real network, or an RTC seeds the anchor.

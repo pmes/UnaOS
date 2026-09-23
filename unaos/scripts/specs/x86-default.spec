@@ -244,3 +244,35 @@ REQUIRE :: SERWIT-2 tap tste: submitted=[1-9]\d* absorbed=[1-9]\d* staged=\d+ dr
 #     `tap_max=`/`tap_sum=` at all. That second red is the one that matters, because it is the shape
 #     regression this rule exists to catch rather than the absence any reader would have noticed.
 REQUIRE \[sertx\] prints=\d+ masked_us_max=\d+ masked_us_mean=\d+ drain_us=\d+ emit_us=\d+ spin_us=\d+ bytes=\d+ masked_b=0 fifo_b=\d+ taps_us=\d+ taps_us_max=\d+ tap_max=fbcon:\d+,ftdi:\d+,tste:\d+,rec:\d+ tap_sum=fbcon:\d+,ftdi:\d+,tste:\d+,rec:\d+ sink=(uart|ftdi|both|none) hz=\d+ masked_cy_max=\d+ masked_cy_sum=\d+
+
+# ── FATLFN (2026-09-22, R60), TAIL-APPENDED past the contract block, as WINMENUSPEC was ──────────
+# THE NEW PIN, and why it belongs on THIS file rather than on x86-test.spec: it is a per-leg claim
+# about the DEFAULT medium, which is the only lane whose boot reaches `fat::probe_once` with a
+# WRITABLE FAT32 volume under it (`FS: FAT mounted: FAT32 vol@LBA2048 …` is on every default capture
+# on this bench; FRGUARD prints `writes ALLOWED (guard DISARMED)` on the same wire). Put in
+# x86-test.spec it would gate EVERY x86 leg, including the `sf` superfloppy and the AHCI fixture,
+# which is exactly the mistake this file's header records and exists to prevent.
+#
+# WHAT IS PINNED. `fs/fat.rs` §FATLFN gave the create path VFAT long names: the component-slot run,
+# the `~n` short alias, a contiguous-run allocator that grows the directory, and a slots-before-the-
+# short-entry write order. The fixture writes PETER'S OWN NAME — `Screenshot 2026-09-22 at
+# 17.31.02.png`, 36 characters, two spaces, three dots, the string `format_83` refuses — reads it
+# back on a FRESH mount by BOTH spellings, checks the run's ordinals and checksum on the medium, and
+# then cuts a write after 2 of 3 slots and proves the orphan run is ignored.
+#
+# THE SHAPE, NOT THE MOMENT. The date and time come from a FIXED synthetic `WallTime` (the QEMU lane
+# has no clock — `clock::now()` is `None` all boot, which is why `prtscr` still says
+# `name_from=clock-unset` here), so they could be pinned literally; they are pinned as a SHAPE
+# anyway, because what the leg is about is the formatter's spelling — four-digit year, dotted
+# seconds, `.png` — and a literal would have to be re-typed the day the fixture picks another
+# moment. `slots=3` and `alias=SCREEN~1\.PNG` ARE literal: they are the two facts another VFAT
+# implementation would see, and neither may drift silently.
+REQUIRE :: FAT-LFN: created=Screenshot [0-9]{4}-[0-9]{2}-[0-9]{2} at [0-9]{2}\.[0-9]{2}\.[0-9]{2}\.png slots=3 alias=SCREEN~1\.PNG readback=ok alias_readback=ok checksum=ok torn_k=[0-9]+ orphans_ignored=ok -> PASS ::
+# The FAIL spelling is already convicted by mbench's DEFAULT_FORBIDS (`FAIL ::`) and by `arroyo`'s
+# own fault scan, so it is NOT restated here. What neither of those catches is the witness going
+# QUIET-BUT-HONEST: `SKIPPED` is the correct answer on a read-only medium (the rMBP's own boot
+# volume) and on a lane with no FAT volume, and it is the WRONG answer on this one. A default leg
+# that starts skipping has lost its writable volume — a real finding — and would otherwise read as
+# green, since the REQUIRE above going unmatched is reported as a short REQUIRE rather than as
+# positive evidence of what went wrong. This FORBID names it.
+FORBID :: FAT-LFN: SKIPPED

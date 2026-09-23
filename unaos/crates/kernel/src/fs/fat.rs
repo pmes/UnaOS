@@ -23,7 +23,7 @@
 //! [`DirEntry::name`] returns the long name when present (else the 8.3 short name); `eq_name` matches
 //! EITHER spelling. **Subdirectory traversal** to arbitrary depth is served by [`FatFs::read_dir`] (the
 //! FAT16 fixed root, the FAT32 root cluster chain, and any subdirectory cluster chain all resolve through
-//! one API — a directory's `first_cluster()` is the chain head). All of this is strictly read-only.
+//! one API — a directory's `first_cluster()` is the chain head). PI-FS-3 was READ-only; **FATLFN** (2026-09-22) adds the inverse — see the §FATLFN block at the FILE TAIL.
 //!
 //! Handles both a **superfloppy** (the FAT BPB sits at LBA 0, no partition table) and an
 //! **MBR-partitioned** disk (an MBR at LBA 0 whose partition entry points at the BPB). All
@@ -115,9 +115,9 @@ const LNAME_MAX: usize = 768;
 
 /// LAYOUT (orin 18): the on-medium directory that holds the launchable programs — the ESP's
 /// `APPS/`, bound in the namespace at `/apps` (`shell::EXEC_ROOT`). An 8.3 SHORT name by
-/// construction: this driver's create path writes 8.3 names only (VFAT LFN write is out of scope,
-/// see `fat_create_err`), the staging scripts (`arroyo`, `builder`, `make-fat-img.sh`) spell it the
-/// same way, and every lookup is case-insensitive, so `apps`/`Apps`/`APPS` on the wire all reach it.
+/// construction — and it stays one by CHOICE now rather than by the driver's limit: FATLFN gave the
+/// create path VFAT long names (§FATLFN, file tail), but the staging scripts (`arroyo`, `builder`,
+/// `make-fat-img.sh`) spell it this way and every lookup is case-insensitive, so `apps`/`Apps`/`APPS` reach it.
 pub const APPS_DIR: &str = "APPS";
 
 /// A parsed directory entry. Carries the on-disk short (8.3) name (uppercase, e.g. `KERNEL.ELF`) and,
@@ -478,33 +478,19 @@ fn scan_dir_sector(
     out: &mut alloc::vec::Vec<DirEntry>,
     lfn: &mut LfnBuf,
 ) -> bool {
+    // FATLFN: the per-slot sequence that used to be written out here is now `classify_dir_slot_lfn`
+    // (§FATLFN, file tail), because the write-side LOCATOR has to run the IDENTICAL one and did not.
+    // `locate_in_dir_sectors` classified each slot with the bare `classify_dir_slot`, which never
+    // attaches a long name, so `locate_in_dir(dir, "<a long name>")` answered `NotFound` for an entry
+    // `read_dir` listed by that exact spelling — the two walkers disagreed about what a directory holds,
+    // and `prtscr`'s no-overwrite rule (screenshot.md §5, "the lookup goes through the filesystem
+    // because `locate_in_dir` matches on both the 8.3 short name and any long name") was asserting a
+    // property the locator did not have. One function, two callers, no second copy of the rule.
     for i in 0..(SECTOR_SIZE / 32) {
-        let e = &sec[i * 32..i * 32 + 32];
-        match e[0] {
-            0x00 => return true, // end of directory
-            0xE5 => {
-                lfn.reset(); // a deleted slot (incl. a deleted LFN component) interrupts any run
-                continue;
-            }
-            _ => {}
-        }
-        let attr = e[11];
-        if attr & 0x0F == 0x0F {
-            lfn.push(e); // long-name component
-            continue;
-        }
-        if attr & 0x08 != 0 {
-            lfn.reset(); // volume label — not a name, breaks a run
-            continue;
-        }
-        match classify_dir_slot(e) {
-            DirSlot::Entry(mut de) => {
-                let mut short11 = [0u8; 11];
-                short11.copy_from_slice(&e[0..11]);
-                lfn.attach(&short11, &mut de);
-                out.push(de);
-            }
-            _ => lfn.reset(),
+        match classify_dir_slot_lfn(&sec[i * 32..i * 32 + 32], lfn) {
+            DirSlot::End => return true, // end of directory
+            DirSlot::Skip => continue,
+            DirSlot::Entry(de) => out.push(de),
         }
     }
     false
@@ -3180,13 +3166,19 @@ impl FatFs {
         name: &str,
     ) -> Result<(DirEntry, u64, usize), FatError> {
         let mut found: Option<(DirEntry, u64, usize)> = None;
+        // FATLFN: the accumulator the read walker has always had, threaded across sectors here too. Before
+        // it, this loop called the bare `classify_dir_slot` and therefore matched SHORT names only.
+        let mut lfn = LfnBuf::new();
         self.walk_dir_sectors(start_cluster, |lba, sec| {
             for i in 0..(SECTOR_SIZE / 32) {
-                match classify_dir_slot(&sec[i * 32..i * 32 + 32]) {
+                match classify_dir_slot_lfn(&sec[i * 32..i * 32 + 32], &mut lfn) {
                     DirSlot::End => return true, // end of directory — stop, `found` stays None
                     DirSlot::Skip => continue,
                     DirSlot::Entry(de) => {
                         if de.eq_name(name) {
+                            // The (LBA, offset) is the SHORT entry's, as every caller of this fn assumes:
+                            // `write_dir_entry_fields`, `mark_dir_deleted` and `rename_entry` address the
+                            // 32-byte short slot, never the component run that precedes it.
                             found = Some((de, lba, i * 32));
                             return true;
                         }
@@ -3360,7 +3352,7 @@ impl FatFs {
     /// (all copies) before the slot write. Every such mutation rides the existing `FAT_MUTATION` primitives,
     /// and `grow_dir_chain` documents why each of its failure points is benign.
     pub fn create_in_root(&self, name: &str, attr: u8) -> Result<(DirEntry, u64, usize), FatError> {
-        let raw = format_83(name).ok_or(FatError::Unsupported)?;
+        let Some(raw) = format_83(name) else { return self.create_lfn_in_dir(0, name, attr, None); }; // FATLFN: an 8.3-clean name takes the body below BYTE-FOR-BYTE; anything else is a VFAT long name and routes to the run writer at the file tail. This line is the only change to this fn.
         let (lba, off) = self.find_free_root_slot()?;
         // F3-M2: the slot WRITE is a sector RMW under DIR_MUTATION (the free-slot SCAN above stays outside —
         // per the with_dir_lock span rule; the scan-then-claim slot race itself is the F3-M3 namespace lock's).
@@ -3440,7 +3432,7 @@ impl FatFs {
         if first_cluster == 0 {
             return self.create_in_root(name, attr);
         }
-        let raw = format_83(name).ok_or(FatError::Unsupported)?;
+        let Some(raw) = format_83(name) else { return self.create_lfn_in_dir(first_cluster, name, attr, None); }; // FATLFN: the 8.3 body below is unchanged; a long name routes to the run writer. ⚠ this line is the ONE place this twin differs from `create_in_root`'s, and it differs only in the directory it names.
         let (lba, off) = self.free_slot_in_dir_chain(first_cluster)?;
         // F3-M2: the slot WRITE is a sector RMW under DIR_MUTATION — the free-slot SCAN above stays
         // outside, exactly as in `create_in_root`.
@@ -3561,7 +3553,7 @@ impl FatFs {
         name: &str,
     ) -> Result<(DirEntry, u64, usize), FatError> {
         // Validate the name BEFORE any allocation, so a bad name leaks no cluster.
-        let _ = format_83(name).ok_or(FatError::Unsupported)?;
+        if format_83(name).is_none() && lfn_units(name).is_none() { return Err(FatError::Unsupported); } // FATLFN: a name is now creatable if it is 8.3-clean OR a legal VFAT long name; step 3's `create_in_dir` picks the path. Still BEFORE `alloc_cluster`, so the leak argument is unchanged.
         // 1. Allocate + zero-fill the child cluster (compare-and-claim under FAT_MUTATION; EOC-terminated,
         //    UNLINKED — unreachable by any reader until step 3/4 publish it).
         let child = self.alloc_cluster()?;
@@ -4079,7 +4071,7 @@ pub fn probe_once() {
     if crate::drivers::block::info().is_none() {
         return; // storage not brought up yet
     }
-    PROBED.store(true, Ordering::Relaxed);
+    PROBED.store(true, Ordering::Relaxed); #[cfg(feature = "witness")] fatlfn_witness_once(); // FATLFN: the long-name create fixture rides this one-shot — the only pass in this file that has what it needs (a live block device, a task stack, no driver lock held) and the one the x86 DEFAULT lane reaches. BEFORE the listing below, not after, so its scratch directory is created and torn down before `read_root` counts anything and the printed census is byte-for-byte what it was. ⚠ cfg FOLDED ONTO THE STATEMENT: `probe_once` is compiled into every build while the fixture is `witness`-gated.
 
     match mount() {
         Ok(fs) => {
@@ -5417,4 +5409,763 @@ fn push_ahci_sources(_out: &mut alloc::vec::Vec<BlockSource>) {}
 /// no second copy of the rule to drift.
 pub fn fat32_by_shape(fat_sz16: u32, fat_sz32: u32, root_ent_cnt: u32) -> bool {
     fat_sz16 == 0 && fat_sz32 != 0 && root_ent_cnt == 0
+}
+
+// =========================================================================================
+// §FATLFN (2026-09-22, R60) — THE VFAT LONG-NAME **WRITE** PATH: the exact inverse of PI-FS-3's
+// read half, and nothing else.
+//
+// WHY IT EXISTS. Peter, R60: a screenshot lands on the Desktop like a Mac's. SCRSHOT-DESKTOP moved
+// the folder and stopped at the NAME — `Screenshot 2026-09-22 at 17.31.02.png` is thirty-six
+// characters with two spaces and three dots, and every one of those separators is illegal in an 8.3
+// short name, so `format_83` refused it and the capture was called `MMDDHHMM.PNG`. That was not a
+// naming preference; it was a missing driver feature, stated as one at the old `APPS_DIR` comment
+// and in `docs/dev/OS/08_VIDEO/screenshot.md` §13. §13 is the specification this block implements.
+//
+// THE READ HALF IS THE SPEC, AND IT IS NOT TOUCHED. `LfnBuf` (:373) accumulates the 0x0F-attribute
+// component slots that physically PRECEDE a short entry, requires them contiguous and descending
+// N..1 with one shared checksum, and validates that checksum against the short entry's 11 name
+// bytes (`lfn_checksum`, :357). Everything below is written so that `LfnBuf` — unchanged, byte for
+// byte — accepts it. That is the whole correctness argument: the writer is not a second reading of
+// the Microsoft spec, it is the pre-image of the reader this tree already ships and already flies.
+//
+// THE FOUR PIECES §13 NAMES, in the order they run:
+//   1. **The units.** `lfn_units` encodes the name UTF-16LE and REFUSES rather than silently mutating
+//      (see its doc — a driver that strips a trailing dot creates a file the caller cannot find).
+//   2. **The alias.** `lfn_short_alias` mints the `NAME~n` short field, and the `~n` is chosen by
+//      LOOKUP against the directory — never by guess, never by counting entries.
+//   3. **The run.** `free_run_in_dir` finds n+1 CONTIGUOUS free slots across sector and cluster
+//      boundaries; `free_run_or_grow` appends clusters when no such run exists. The FAT16 fixed root
+//      cannot grow and says so — see `free_run_or_grow`'s doc, that `NoSpace` is the format's.
+//   4. **The order.** `write_lfn_run` writes the component slots BEFORE the short entry, grouped per
+//      sector, with the short entry's sector LAST. A cut mid-write therefore leaves ORPHAN COMPONENT
+//      SLOTS — which every VFAT reader, including this file's own, discards on the checksum — and
+//      never a short entry whose name slots are half-written. Proven, not asserted: `torn_after`
+//      stops the writer after k slots and the fixture re-reads the directory.
+//
+// WHAT IS NOT HERE, STATED SO IT IS NOT MISTAKEN FOR DONE:
+//   * **DELETE does not reclaim the component slots.** `delete_located` marks the SHORT entry `0xE5`
+//     and leaves the run in place. That is SAFE — an orphan run is discarded by `LfnBuf` the moment
+//     the next short entry's checksum disagrees, and a fresh run's `LAST_LONG_ENTRY` slot calls
+//     `reset()` — but it WASTES slots until the directory is rewritten. A real VFAT driver tombstones
+//     the run too. Ledgered (rmbp-ledger B173) rather than done: it is a change to the delete path,
+//     which is not this arc's.
+//   * **RENAME does not rewrite the run.** `rename_entry` rewrites the 11-byte short field, which
+//     changes the checksum the preceding run was stamped with, so the long name silently falls away
+//     and the entry reads back under its new short name. Same disposition, same row.
+// =========================================================================================
+
+/// FATLFN: the VFAT component-slot attribute (`ATTR_LONG_NAME` = READ_ONLY|HIDDEN|SYSTEM|VOLUME_ID).
+const LFN_ATTR: u8 = 0x0F;
+/// FATLFN: `LAST_LONG_ENTRY` — or'd into the ordinal of the component written FIRST (the highest one).
+const LFN_LAST: u8 = 0x40;
+/// FATLFN: UTF-16 code units per component slot — 5 at offset 1, 6 at offset 14, 2 at offset 28.
+const LFN_UNITS_PER_SLOT: usize = 13;
+/// FATLFN: the VFAT cap. 255 units is 20 slots (`LfnBuf::units` is sized `20 * 13` and `push`
+/// poisons the run on an ordinal above 20), so this driver cannot write a name its reader refuses.
+const LFN_MAX_SLOTS: usize = 20;
+
+/// FATLFN: the three disjoint spans a component slot stores its 13 UTF-16 units in. The SAME table
+/// `LfnBuf::push` reads them back through — one definition would be better still, but `push` is the
+/// read half and this arc does not touch it, so the table is duplicated with this note instead of
+/// the read path being edited. A divergence here is caught immediately: the fixture's readback
+/// decodes through `push`, so a wrong offset produces a wrong name, not a silent pass.
+const LFN_SLOT_OFFS: [usize; LFN_UNITS_PER_SLOT] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+
+/// FATLFN: encode `name` as the UTF-16 code units a VFAT component run carries, or `None` when it is
+/// not a legal long name.
+///
+/// **It refuses; it does not repair.** Windows strips leading/trailing spaces and trailing dots when
+/// it mints a long name. This driver will not: a create that silently stores a name other than the
+/// one it was handed produces a file the caller cannot find again, and every caller in this tree
+/// (`prtscr`'s no-overwrite ladder above all) asks `locate_in_dir` for the name it is about to
+/// create and takes `NotFound` as permission. So `"a.txt "` is `Unsupported`, loudly, at the create.
+///
+/// The refused set, and why each: the six characters a long name may not contain per the FAT spec
+/// (`" * / : < > ? \ |`) plus control bytes; a name that is empty, all dots, or longer than the
+/// 255-unit cap; a leading or trailing space; a trailing dot. `+ , ; = [ ]` are LEGAL in a long name
+/// (they are illegal only in the 8.3 SHORT field, which is why `to_upper_83` rejects them and the
+/// alias minter maps them to `_`), and that asymmetry is the whole reason the alias exists.
+fn lfn_units(name: &str) -> Option<alloc::vec::Vec<u16>> {
+    if name.is_empty() || name.starts_with(' ') || name.ends_with(' ') || name.ends_with('.') {
+        return None;
+    }
+    if name.chars().all(|c| c == '.') {
+        return None;
+    }
+    for c in name.chars() {
+        if (c as u32) < 0x20 || matches!(c, '"' | '*' | '/' | ':' | '<' | '>' | '?' | '\\' | '|') {
+            return None;
+        }
+    }
+    let units: alloc::vec::Vec<u16> = name.encode_utf16().collect();
+    if units.is_empty() || units.len() > LFN_MAX_SLOTS * LFN_UNITS_PER_SLOT {
+        return None;
+    }
+    Some(units)
+}
+
+/// FATLFN: how many component slots a run of `units` code units needs — `ceil(len / 13)`.
+///
+/// A name whose length is an exact multiple of 13 gets NO `0x0000` terminator, because there is no
+/// unit left to put one in, and that is correct rather than a corner: `LfnBuf::decode_into` stops at
+/// `max_ord * 13` when it finds no NUL, which is exactly the length. Anything shorter gets the NUL
+/// and then `0xFFFF` padding, which is what `decode_into`'s "trailing 0xFFFF sits beyond it" means.
+fn lfn_slot_count(units: &[u16]) -> usize {
+    (units.len() + LFN_UNITS_PER_SLOT - 1) / LFN_UNITS_PER_SLOT
+}
+
+/// FATLFN: classify ONE 32-byte directory slot **with the long-name accumulator threaded through it**
+/// — the single per-slot rule `scan_dir_sector` (the read walker) and `locate_in_dir_sectors` (the
+/// write-side locator) both run.
+///
+/// It is a pure MOVE of what `scan_dir_sector` already did, made callable so the locator stops being
+/// a second, long-name-blind implementation of the same walk. The sequence is PI-FS-3's and is
+/// unchanged: `0x00` ends the directory; `0xE5` (deleted — including a deleted component) resets any
+/// run; an `attr & 0x0F == 0x0F` slot is a component and feeds `push`; a volume label resets; and a
+/// real short entry CONSUMES the run via `attach`, which validates the checksum against these same
+/// 11 name bytes and otherwise leaves the entry on its 8.3 name.
+fn classify_dir_slot_lfn(e: &[u8], lfn: &mut LfnBuf) -> DirSlot {
+    match e[0] {
+        0x00 => return DirSlot::End,
+        0xE5 => {
+            lfn.reset();
+            return DirSlot::Skip;
+        }
+        _ => {}
+    }
+    let attr = e[11];
+    if attr & 0x0F == 0x0F {
+        lfn.push(e);
+        return DirSlot::Skip;
+    }
+    if attr & 0x08 != 0 {
+        lfn.reset(); // volume label — not a name, breaks a run
+        return DirSlot::Skip;
+    }
+    match classify_dir_slot(e) {
+        DirSlot::Entry(mut de) => {
+            let mut short11 = [0u8; 11];
+            short11.copy_from_slice(&e[0..11]);
+            lfn.attach(&short11, &mut de);
+            DirSlot::Entry(de)
+        }
+        other => {
+            lfn.reset();
+            other
+        }
+    }
+}
+
+impl FatFs {
+    /// FATLFN: how the directory named by `first_cluster` is enumerated — `None` is the FAT16 fixed
+    /// root (a flat sector run that cannot grow), `Some(c)` a cluster chain. The same mapping
+    /// `find_free_root_slot` and `find_located` make, in one place, so the run allocator and the
+    /// locator cannot disagree about which region a create is landing in.
+    fn dir_start(&self, first_cluster: u32) -> Option<u32> {
+        match (first_cluster, self.kind) {
+            (0, FatKind::Fat32) => Some(self.root_cluster),
+            (0, FatKind::Fat16) => None,
+            (c, _) => Some(c),
+        }
+    }
+
+    /// FATLFN piece 2 — **the short-name ALIAS**, and the `~n` is MEASURED, never guessed.
+    ///
+    /// The basis, per the Microsoft spec's lossy conversion: upper-case; spaces and embedded dots
+    /// dropped; any byte `to_upper_83` refuses (and any non-ASCII) replaced by `_`; the extension
+    /// taken from the LAST dot and truncated to 3; the base truncated to `8 - (1 + digits(n))` to
+    /// leave room for `~n`. An empty basis becomes `_`, so a name made entirely of illegal bytes
+    /// still gets a well-formed alias rather than an empty name field.
+    ///
+    /// **The tail is chosen by LOOKUP.** Each candidate is put to `locate_in_dir`, and only a
+    /// `NotFound` takes it. Counting entries, or trusting `~1` because the directory "looks empty",
+    /// is how two files end up sharing a short field — and a short field is what the checksum in
+    /// every component slot is computed over, so a collision does not merely duplicate a name, it
+    /// makes one file's long-name run validate against the other's short entry. Bounded at 999:
+    /// beyond that the numeric tail costs more base characters than the spec's hint-and-hash scheme
+    /// would, and a directory with a thousand same-basis names is a `NoSpace` this driver is content
+    /// to return rather than grow a second algorithm for.
+    ///
+    /// Returns the alias as TEXT (the spelling `locate_in_dir` and `eq_name` speak) and as the
+    /// 11-byte on-disk field, derived from the text by `format_83` so the two cannot drift.
+    fn lfn_short_alias(&self, first_cluster: u32, long: &str) -> Result<(String, [u8; 11]), FatError> {
+        // The extension: after the LAST dot, if that dot is not the first character.
+        let ext_src = match long.rfind('.') {
+            Some(i) if i > 0 => &long[i + 1..],
+            _ => "",
+        };
+        let base_src = match long.rfind('.') {
+            Some(i) if i > 0 => &long[..i],
+            _ => long,
+        };
+        let mut ext = String::new();
+        for b in ext_src.bytes() {
+            if ext.len() == 3 {
+                break;
+            }
+            if b == b' ' || b == b'.' {
+                continue;
+            }
+            ext.push(to_upper_83(b).unwrap_or(b'_') as char);
+        }
+        let mut basis = String::new();
+        for b in base_src.bytes() {
+            if basis.len() == 8 {
+                break;
+            }
+            if b == b' ' || b == b'.' {
+                continue; // spaces and embedded dots are DROPPED, not mapped — the spec's rule
+            }
+            basis.push(to_upper_83(b).unwrap_or(b'_') as char);
+        }
+        if basis.is_empty() {
+            basis.push('_');
+        }
+        for n in 1u32..=999 {
+            let tail = alloc::format!("~{}", n);
+            let keep = 8 - tail.len();
+            let head: String = basis.chars().take(keep).collect();
+            let cand = if ext.is_empty() {
+                alloc::format!("{}{}", head, tail)
+            } else {
+                alloc::format!("{}{}.{}", head, tail, ext)
+            };
+            // `format_83` is the ONE formatter; if it refuses our own candidate the basis logic above
+            // is wrong and we must not write a field the reader will read back as something else.
+            let raw = format_83(&cand).ok_or(FatError::Unsupported)?;
+            match self.locate_in_dir(first_cluster, &cand) {
+                Err(FatError::NotFound) => return Ok((cand, raw)),
+                Ok(_) => continue,
+                Err(e) => return Err(e), // a real I/O fault: never answered by picking another name
+            }
+        }
+        Err(FatError::NoSpace)
+    }
+
+    /// FATLFN piece 3 — the first CONTIGUOUS run of `need` free 32-byte slots in this directory.
+    ///
+    /// Free is what `free_slot_in_dir_sectors` already means by it: a slot whose first byte is `0x00`
+    /// (the end-of-directory terminator, and every slot after it) or `0xE5` (a tombstone). The run
+    /// may cross sector AND cluster boundaries, because `walk_dir_sectors` enumerates the chain IN
+    /// DIRECTORY ORDER — consecutive in that walk is exactly what "contiguous" means to a reader,
+    /// and a 255-character name needs 21 slots where a 512-byte sector holds 16, so a run that could
+    /// not cross a boundary would be unable to write the names this arc exists for.
+    ///
+    /// Any live slot RESETS the run: a component run with a live entry in the middle of it is not a
+    /// run, and writing one would make `LfnBuf` poison the sequence (non-descending ordinal) and the
+    /// name vanish. `NoSpace` when the directory holds no such run — `free_run_or_grow` is the half
+    /// that then appends clusters.
+    fn free_run_in_dir(
+        &self,
+        start: Option<u32>,
+        need: usize,
+    ) -> Result<alloc::vec::Vec<(u64, usize)>, FatError> {
+        let mut run: alloc::vec::Vec<(u64, usize)> = alloc::vec::Vec::new();
+        self.walk_dir_sectors(start, |lba, sec| {
+            for i in 0..(SECTOR_SIZE / 32) {
+                let b0 = sec[i * 32];
+                if b0 == 0x00 || b0 == 0xE5 {
+                    run.push((lba, i * 32));
+                    if run.len() == need {
+                        return true;
+                    }
+                } else {
+                    run.clear();
+                }
+            }
+            false
+        })?;
+        if run.len() == need {
+            Ok(run)
+        } else {
+            Err(FatError::NoSpace)
+        }
+    }
+
+    /// FATLFN piece 3, the growing half — `free_run_in_dir`, and when there is no such run, APPEND
+    /// clusters until there is.
+    ///
+    /// **The FAT16 fixed root refuses, and the refusal is the FORMAT's, not this driver's.** A FAT16
+    /// root is a fixed region sized at format time by `BPB_RootEntCnt`, sitting before the data area
+    /// with no FAT entry of its own and nowhere to grow into — exactly what `find_free_root_slot`'s
+    /// doc already says about the single-slot case. So `start == None` returns `NoSpace` immediately
+    /// rather than calling `grow_dir_chain` on a region that has no chain. A FAT32 root IS a cluster
+    /// chain (`BPB_RootClus`) and grows like any other directory; a subdirectory on EITHER variant is
+    /// a chain and grows. This is the same asymmetry FATGROW documented, reached by the same code.
+    ///
+    /// Growth is bounded and RE-SCANS rather than assuming: `grow_dir_chain` hands back a freshly
+    /// zeroed cluster whose slots are free by construction, but the run may legitimately start in the
+    /// trailing free slots of the OLD tail and continue into the new cluster, so the scan is the thing
+    /// that decides where the run is. One growth cannot always suffice — a 21-slot run needs two
+    /// clusters on a 512-byte-cluster volume — hence the `need / slots_per_clus + 2` bound, which is
+    /// the smallest number that can always succeed and never loops on a volume that is simply full
+    /// (`grow_dir_chain` returns `NoSpace`, and that propagates out of here untouched).
+    fn free_run_or_grow(
+        &self,
+        start: Option<u32>,
+        need: usize,
+    ) -> Result<alloc::vec::Vec<(u64, usize)>, FatError> {
+        match self.free_run_in_dir(start, need) {
+            Err(FatError::NoSpace) => {}
+            other => return other,
+        }
+        let Some(chain) = start else {
+            return Err(FatError::NoSpace); // FAT16 fixed root — see the doc above
+        };
+        let slots_per_clus = self.sec_per_clus as usize * SECTOR_SIZE / 32;
+        let grows = need / slots_per_clus.max(1) + 2;
+        for _ in 0..grows {
+            self.grow_dir_chain(chain)?;
+            match self.free_run_in_dir(start, need) {
+                Err(FatError::NoSpace) => continue,
+                other => return other,
+            }
+        }
+        Err(FatError::NoSpace)
+    }
+
+    /// FATLFN pieces 1 and 4 — materialize the run and write it **in the crash-safe order**.
+    ///
+    /// The payload first, all of it, in memory: `slots` component slots in the order they go on disk
+    /// (ordinal `n` FIRST, with `LAST_LONG_ENTRY` set, descending to ordinal 1), then the short entry.
+    /// Component slot `p` carries ordinal `n - p`, so its 13 units start at `(ord - 1) * 13` — the
+    /// same arithmetic `LfnBuf::push` uses to put them back.
+    ///
+    /// **THE ORDER, which is the whole crash argument.** The run is written SECTOR BY SECTOR in
+    /// directory order, so the sector holding the short entry — always the last slot of the run — is
+    /// written LAST. Three states are therefore possible at any instant:
+    ///   * nothing written — the directory is exactly as it was, the slots are still `0x00`/`0xE5`;
+    ///   * some component sectors written, the short entry's not — the directory holds an ORPHAN RUN.
+    ///     `LfnBuf` accumulates it and then discards it, because the next short entry's checksum
+    ///     cannot match (and if the run sits before the `0x00` terminator, as it does when the create
+    ///     was appending, the walk ends before any short entry is reached at all). A reader sees the
+    ///     directory it saw before; the cost is wasted slots, which `free_run_in_dir` reclaims the
+    ///     moment they are `0x00`, or a rewrite reclaims when they are not;
+    ///   * everything written — the entry exists, complete, with its name.
+    /// What CANNOT happen is a short entry with a half-written run, which is the state that would
+    /// mislabel a file: the short entry is the last thing written, and one sector write is atomic at
+    /// the medium. Note the component slots and the short entry may share ONE sector (four slots in a
+    /// 16-slot sector is the ordinary screenshot case) — then there is a single write and the
+    /// intermediate state does not exist at all, which is strictly stronger.
+    ///
+    /// `torn_after` is the FIXTURE's cut. `Some(k)` writes exactly the first `k` component slots and
+    /// stops, returning `Io` — the simulated boot cut, driven through THIS writer rather than a
+    /// second copy of it, so what the fixture proves is what production does. `None` in every real
+    /// caller; the parameter is named at all three create sites so nobody adds a fourth that forgets.
+    #[allow(clippy::too_many_arguments)]
+    fn write_lfn_run(
+        &self,
+        run: &[(u64, usize)],
+        units: &[u16],
+        slots: usize,
+        raw: &[u8; 11],
+        attr: u8,
+        cksum: u8,
+        torn_after: Option<usize>,
+    ) -> Result<(), FatError> {
+        let mut payload: alloc::vec::Vec<[u8; 32]> = alloc::vec::Vec::with_capacity(run.len());
+        for p in 0..slots {
+            let ord = slots - p; // on-disk order is REVERSE: the highest ordinal is written first
+            let mut e = [0u8; 32];
+            e[0] = ord as u8 | if p == 0 { LFN_LAST } else { 0 };
+            e[11] = LFN_ATTR;
+            e[12] = 0; // LDIR_Type — 0 means "a name component", the only value the spec defines
+            e[13] = cksum;
+            // LDIR_FstClusLO @26 stays 0: a component slot names no cluster, and a non-zero value
+            // here is how a legacy scandisk decides the directory is damaged.
+            let base = (ord - 1) * LFN_UNITS_PER_SLOT;
+            for (k, &o) in LFN_SLOT_OFFS.iter().enumerate() {
+                let u = match base + k {
+                    i if i < units.len() => units[i],
+                    i if i == units.len() => 0x0000, // the NUL terminator, when there is room for it
+                    _ => 0xFFFF,                     // pad — what `decode_into` steps over
+                };
+                e[o..o + 2].copy_from_slice(&u.to_le_bytes());
+            }
+            payload.push(e);
+        }
+        // The short entry, byte-for-byte what `create_in_root`'s own slot write produces: the 11-byte
+        // field, the attribute with the volume-label bit cleared, JD17's last-write stamp, zeros
+        // elsewhere (first cluster hi@20 lo@26 = 0, size@28 = 0).
+        let mut s = [0u8; 32];
+        s[0..11].copy_from_slice(raw);
+        s[11] = attr & !0x08;
+        let (mt, md) = crate::clock::fat_stamp();
+        s[22..24].copy_from_slice(&mt.to_le_bytes());
+        s[24..26].copy_from_slice(&md.to_le_bytes());
+        payload.push(s);
+
+        let upto = match torn_after {
+            Some(k) => core::cmp::min(k, slots),
+            None => run.len(),
+        };
+        let mut i = 0usize;
+        while i < upto {
+            let lba = run[i].0;
+            let mut j = i;
+            while j < upto && run[j].0 == lba {
+                j += 1;
+            }
+            // F3-M2: one sector RMW per sector under DIR_MUTATION, exactly as the 8.3 twins do — the
+            // free-run SCAN stayed outside the lock, per the `with_dir_lock` span rule.
+            with_dir_lock_src(self.source, "create_lfn_in_dir", || {
+                let mut buf = [0u8; SECTOR_SIZE];
+                self.rd_sector(lba, &mut buf)?;
+                for k in i..j {
+                    let off = run[k].1;
+                    buf[off..off + 32].copy_from_slice(&payload[k]);
+                }
+                self.wr_sector(lba, &buf)
+            })?;
+            i = j;
+        }
+        if upto < run.len() {
+            return Err(FatError::Io); // the fixture's simulated cut — orphan slots, no short entry
+        }
+        Ok(())
+    }
+
+    /// FATLFN — **create `name` in the directory at `first_cluster` (`0` = the volume root) as a VFAT
+    /// long name**: the component run, the `~n` alias, and the short entry, in that order.
+    ///
+    /// Reached from `create_in_root` and `create_in_dir` when `format_83` refuses the name, so an
+    /// 8.3-clean name never comes here and those two bodies are byte-for-byte what they were. The
+    /// caller must have confirmed the name is absent — this does not de-duplicate, exactly as its
+    /// twins do not (the alias minter's lookups are about the SHORT field, not about `name`).
+    ///
+    /// The returned `(DirEntry, LBA, offset)` is the SHORT entry's slot, so every existing consumer —
+    /// `create_dir`'s `write_dir_entry_fields` publish, `delete_located`, `write_grow` — addresses the
+    /// same 32 bytes it always did. It comes from `locate_in_dir`, not from re-parsing the buffer,
+    /// deliberately: that is a READ-AFTER-WRITE through the ordinary lookup path, so a create that
+    /// wrote a run the reader will not accept fails HERE, at the create, instead of succeeding and
+    /// producing a file nobody can open.
+    ///
+    /// Errors: `Unsupported` (not a legal long name — see `lfn_units`), `NoSpace` (no run and the
+    /// directory cannot grow: a full volume, the FAT spec's 65 536-slot cap, a FAT16 fixed root, or
+    /// 999 alias collisions), `Io`/`BadChain`/`NoDisk` from the primitives.
+    pub fn create_lfn_in_dir(
+        &self,
+        first_cluster: u32,
+        name: &str,
+        attr: u8,
+        torn_after: Option<usize>,
+    ) -> Result<(DirEntry, u64, usize), FatError> {
+        let units = lfn_units(name).ok_or(FatError::Unsupported)?;
+        let slots = lfn_slot_count(&units);
+        if slots == 0 || slots > LFN_MAX_SLOTS {
+            return Err(FatError::Unsupported);
+        }
+        let start = self.dir_start(first_cluster);
+        // The alias BEFORE the run: its lookups walk the directory, and a walk is cheaper and safer
+        // before any slot has been claimed than after.
+        let (_alias, raw) = self.lfn_short_alias(first_cluster, name)?;
+        let cksum = lfn_checksum(&raw);
+        let run = self.free_run_or_grow(start, slots + 1)?;
+        self.write_lfn_run(&run, &units, slots, &raw, attr, cksum, torn_after)?;
+        let (lba, off) = run[run.len() - 1];
+        match self.locate_in_dir(first_cluster, name) {
+            Ok((de, l, o)) if l == lba && o == off => Ok((de, l, o)),
+            // Found, but not where we put it: another create raced us into this directory. Report
+            // rather than paper over it — the caller's `(lba, off)` would address a stranger's entry.
+            Ok(_) => Err(FatError::Io),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// FATLFN: the alias a long-named entry was given, as an 8.3-only reader sees it — the 11 on-disk
+    /// name bytes at `(lba, off)`, rendered through `classify_dir_slot` so the text is exactly the
+    /// spelling that reader would print. Used by the fixture to score `alias=`; cheap enough that no
+    /// caller needs to remember what `create_lfn_in_dir` minted.
+    pub fn short_name_at(&self, lba: u64, off: usize) -> Result<String, FatError> {
+        if off + 32 > SECTOR_SIZE {
+            return Err(FatError::Io);
+        }
+        let mut buf = [0u8; SECTOR_SIZE];
+        self.rd_sector(lba, &mut buf)?;
+        match classify_dir_slot(&buf[off..off + 32]) {
+            DirSlot::Entry(de) => Ok(String::from(de.short_name())),
+            _ => Err(FatError::NotFound),
+        }
+    }
+}
+
+// ─────────── §FATLFN — THE FIXTURE, and what each of its legs can actually convict ───────────
+//
+// It runs from `probe_once`, which is the ONE pass in this file that has a live block device, a task
+// stack and no driver lock held, and is the pass the x86 DEFAULT lane reaches (`FS: FAT mounted` is
+// on every default capture). It creates ONE scratch subdirectory of the volume root, does all its
+// work inside it, and removes it — so the root census `probe_once` prints two statements later is
+// byte-for-byte what it was before this arc.
+//
+// THE NAME IT WRITES IS PETER'S, NOT A SYNTHETIC ONE. `Screenshot 2026-09-22 at 17.31.02.png` —
+// thirty-six characters, two spaces, three dots — is the exact string R60 asked for and the exact
+// string `format_83` refuses. It is produced by `prtscr::mac_name` on a FIXED synthetic moment
+// rather than typed here, because the QEMU lane has no wall clock (`clock::now()` is `None` for the
+// whole boot, so the capture path's own `name_from=` reads `clock-unset`) and a formatter nothing
+// exercises is a formatter nobody has checked. Scoring it here is how the clock arm gets proved on a
+// lane that cannot reach it.
+
+/// FATLFN fixture: the scratch subdirectory. An 8.3 name on purpose — the directory the long names
+/// live IN is not what is under test, and an 8.3 name keeps the teardown's `remove_dir` on the path
+/// FATDIRS already proves.
+#[cfg(feature = "witness")]
+const FATLFN_DIR: &str = "LFNTEST";
+/// FATLFN fixture: what `prtscr::mac_name` must produce for the synthetic moment below. Typed out
+/// so a formatter change has to come here and be read, not merely compile.
+#[cfg(feature = "witness")]
+const FATLFN_NAME: &str = "Screenshot 2026-09-22 at 17.31.02.png";
+/// FATLFN fixture: the alias that name must be given in an EMPTY directory — spaces and dots
+/// dropped, upper-cased, truncated to six, `~1`, extension from the last dot. Typed out for the same
+/// reason: the alias is what an 8.3-only reader sees, so it is a promise to other implementations.
+#[cfg(feature = "witness")]
+const FATLFN_ALIAS: &str = "SCREEN~1.PNG";
+/// FATLFN fixture: the torn-write case. 34 characters -> 3 component slots, cut after 2.
+#[cfg(feature = "witness")]
+const FATLFN_TORN: &str = "Torn write leaves orphan slots.txt";
+#[cfg(feature = "witness")]
+const FATLFN_TORN_K: usize = 2;
+
+/// FATLFN fixture: every 32-byte slot of a directory, with where it lives. The scratch directory is
+/// one or two clusters, so this is bounded by construction; it exists because the checksum and
+/// orphan legs are claims about the RAW SLOTS preceding a short entry, which no read API exposes.
+#[cfg(feature = "witness")]
+fn fatlfn_slots(fs: &FatFs, dir: u32) -> Result<alloc::vec::Vec<(u64, usize, [u8; 32])>, FatError> {
+    let mut out: alloc::vec::Vec<(u64, usize, [u8; 32])> = alloc::vec::Vec::new();
+    fs.walk_dir_sectors(Some(dir), |lba, sec| {
+        for i in 0..(SECTOR_SIZE / 32) {
+            let mut e = [0u8; 32];
+            e.copy_from_slice(&sec[i * 32..i * 32 + 32]);
+            out.push((lba, i * 32, e));
+        }
+        false
+    })?;
+    Ok(out)
+}
+
+/// FATLFN fixture: remove the scratch directory and everything in it, if it is there. Best-effort,
+/// and run BOTH before the test (a previous boot's crash residue on a persistent card) and after it
+/// (the real teardown, whose success is part of the verdict) — FATGROW's shape, for FATGROW's reason.
+#[cfg(feature = "witness")]
+fn fatlfn_teardown(fs: &FatFs) -> Result<(), FatError> {
+    let (de, _, _) = match fs.locate_in_dir(0, FATLFN_DIR) {
+        Ok(t) => t,
+        Err(_) => return Ok(()), // not there — nothing to undo
+    };
+    let dir = de.first_cluster();
+    if dir != 0 {
+        for e in fs.read_dir(dir)? {
+            let n = e.name();
+            if n == "." || n == ".." {
+                continue;
+            }
+            let name = String::from(n);
+            if let Ok((_, l, o)) = fs.locate_in_dir(dir, &name) {
+                let _ = fs.delete_located(l, o, e.first_cluster());
+            }
+        }
+    }
+    fs.remove_dir(0, FATLFN_DIR)?;
+    Ok(())
+}
+
+/// FATLFN fixture: create Peter's name, read it back, read its alias back, verify the run on the
+/// medium, then cut a write in half and prove the reader ignores what is left.
+///
+/// The legs, and what each one convicts that the others cannot:
+///  1. **the formatter** — `prtscr::mac_name` on a fixed moment must be `FATLFN_NAME`. Convicts a
+///     name-shape change (a colon for a dot, a missing zero-pad) on a lane with no clock;
+///  2. **the create** — the name `format_83` refuses is created, and `create_in_dir` routed it here
+///     without any caller knowing. Convicts the dispatch;
+///  3. **the alias** — the short field is `SCREEN~1.PNG`. Convicts a basis or `~n` change, and it is
+///     read back off the MEDIUM through `classify_dir_slot`, i.e. as an 8.3-only reader sees it;
+///  4. **the run on disk** — the 3 slots physically preceding the short entry are attribute `0x0F`,
+///     carry ordinals 3,2,1 in that order with `LAST_LONG_ENTRY` on the first, and every one of them
+///     carries `lfn_checksum` of the short field. Convicts a reversed order, a missing 0x40, a
+///     wrong checksum — each of which the decode leg alone could ALSO catch, but only as "the name
+///     came back wrong", which does not say which of the four it was;
+///  5. **read-after-write on a FRESH mount** — the long name resolves through the ordinary
+///     `locate_in_dir`, with nothing in memory left to answer for the disk. Convicts a create that
+///     wrote a run its own reader will not accept;
+///  6. **the alias resolves too, to the SAME slot** — both spellings reach one entry, which is what
+///     `eq_name` promises and what stops a second create from duplicating the file;
+///  7. **the torn write** — cut after 2 of 3 slots, the create returns `Io`, NO entry appears (the
+///     directory census is unchanged and the name is `NotFound`), and the orphan slots ARE on the
+///     medium with attribute `0x0F`. The last clause is what makes leg 7 a test: without it, a
+///     writer that wrote nothing at all would pass;
+///  8. **teardown** — the directory and its cluster come back, so a boot leaves the volume as it
+///     found it and nothing accumulates per boot;
+///  9. **the artifact** — ONE long-named file re-created and deliberately LEFT, because the decisive
+///     evidence for this arc is a REAL VFAT driver reading our bytes, not our reader agreeing with
+///     our writer, and leg 8 has just erased everything a host could look at. Self-clearing: the
+///     builder rebuilds the QEMU medium every run, and on a card step 0 removes it next boot.
+#[cfg(feature = "witness")]
+fn fatlfn_run(fs: &FatFs) -> Result<String, FatError> {
+    let _ = fatlfn_teardown(fs);
+
+    // (1) THE FORMATTER, on a fixed synthetic moment — the lane has no clock to supply a real one.
+    let t = crate::clock::WallTime { year: 2026, month: 9, day: 22, hour: 17, min: 31, sec: 2 };
+    let name = crate::video::prtscr::mac_name(&t);
+    if name != FATLFN_NAME {
+        return Err(FatError::Unsupported);
+    }
+    let units = lfn_units(&name).ok_or(FatError::Unsupported)?;
+    let slots = lfn_slot_count(&units);
+
+    let (dde, _, _) = fs.create_dir(0, FATLFN_DIR)?;
+    let dir = dde.first_cluster();
+    if dir == 0 {
+        return Err(FatError::BadChain);
+    }
+
+    // (2) THE CREATE, through the ordinary 8.3 entry point — the dispatch is part of the claim.
+    let (de, lba, off) = fs.create_in_dir(dir, &name, 0x20)?;
+    if de.name() != name {
+        return Err(FatError::BadChain);
+    }
+
+    // (3) THE ALIAS, off the medium, as an 8.3-only reader renders it.
+    let alias = fs.short_name_at(lba, off)?;
+    if alias != FATLFN_ALIAS {
+        return Err(FatError::BadChain);
+    }
+
+    // (4) THE RUN ON DISK: the `slots` slots physically preceding the short entry.
+    let all = fatlfn_slots(fs, dir)?;
+    let at = all
+        .iter()
+        .position(|&(l, o, _)| l == lba && o == off)
+        .ok_or(FatError::BadChain)?;
+    if at < slots {
+        return Err(FatError::BadChain); // the run cannot precede the directory's first slot
+    }
+    let raw = format_83(&alias).ok_or(FatError::BadChain)?;
+    let want = lfn_checksum(&raw);
+    for p in 0..slots {
+        let (_, _, e) = all[at - slots + p];
+        let ord = slots - p; // on-disk order: ordinal n first, descending to 1
+        // ⚠ the parentheses are load-bearing: in Rust `|` binds LOOSER than `!=`, so without them
+        // this reads `(e[0] != ord as u8) | <u8>` — a type error at best and a silent wrong test at
+        // worst in a language that allowed it.
+        if e[11] != LFN_ATTR || e[13] != want || e[0] != (ord as u8 | if p == 0 { LFN_LAST } else { 0 })
+        {
+            return Err(FatError::BadChain);
+        }
+    }
+
+    // (5)+(6) A FRESH MOUNT answers for the disk: both spellings, one entry, the same slot.
+    let fs2 = mount()?;
+    let (d2, l2, o2) = fs2.locate_in_dir(dir, &name)?;
+    if d2.name() != name || l2 != lba || o2 != off {
+        return Err(FatError::BadChain);
+    }
+    let (d3, l3, o3) = fs2.locate_in_dir(dir, &alias)?;
+    if l3 != lba || o3 != off || d3.name() != name {
+        return Err(FatError::BadChain);
+    }
+
+    // (7) THE TORN WRITE: cut after `FATLFN_TORN_K` of the torn name's slots.
+    let before = fs2.read_dir(dir)?.len();
+    match fs2.create_lfn_in_dir(dir, FATLFN_TORN, 0x20, Some(FATLFN_TORN_K)) {
+        Err(FatError::Io) => {}
+        _ => return Err(FatError::BadChain), // the cut must be reported, never silently completed
+    }
+    let fs3 = mount()?;
+    if fs3.read_dir(dir)?.len() != before {
+        return Err(FatError::BadChain); // an entry appeared from a half-written run
+    }
+    if !matches!(fs3.locate_in_dir(dir, FATLFN_TORN), Err(FatError::NotFound)) {
+        return Err(FatError::BadChain);
+    }
+    // …and the orphan slots really are on the medium, or leg 7 proves nothing: a writer that wrote
+    // NOTHING AT ALL would satisfy every clause above. Counted BY POSITION, not by checksum — the
+    // good entry's own run is `all[at - slots .. at]`, so every OTHER live component slot in this
+    // directory is residue of the cut. (A checksum inequality would have been a 1-in-256 flake.)
+    let orphans = fatlfn_slots(&fs3, dir)?
+        .iter()
+        .filter(|&&(l, o, e)| {
+            e[0] != 0x00
+                && e[0] != 0xE5
+                && e[11] == LFN_ATTR
+                && !all[at - slots..at].iter().any(|&(gl, go, _)| gl == l && go == o)
+        })
+        .count();
+    if orphans != FATLFN_TORN_K {
+        return Err(FatError::BadChain);
+    }
+
+    // (8) TEARDOWN — the directory, its entry, its cluster and the orphan run all go.
+    fatlfn_teardown(&fs3)?;
+    if fs3.locate_in_dir(0, FATLFN_DIR).is_ok() {
+        return Err(FatError::BadChain);
+    }
+
+    // (9) THE HOST-READABLE ARTIFACT, and it is deliberate residue rather than a leak.
+    //
+    // Leg 8 just proved the volume comes back exactly as it was found — which is the property this
+    // fixture must have, and which also means that after the run the IMAGE HOLDS NO LONG NAME for
+    // anyone to check independently. The decisive evidence for this arc is not our own reader
+    // agreeing with our own writer; it is a REAL VFAT DRIVER reading our bytes. So one long-named
+    // file is re-created and LEFT, and the wire says so by name: `mdir -i builder/usb-boot.img@@1048576
+    // ::/LFNTEST` on the host then lists `SCREEN~1 PNG … Screenshot 2026-09-22 at 17.31.02.png`.
+    //
+    // It cannot accumulate. On the QEMU lane the builder rebuilds `usb-boot.img` from scratch every
+    // run; on a persistent card the NEXT boot's pre-teardown (step 0, FATGROW's pattern) removes it
+    // before anything is measured. It is announced on its own line rather than folded into the
+    // verdict so the pinned witness keeps the exact shape the spec matches.
+    let fs4 = mount()?;
+    let (ade, _, _) = fs4.create_dir(0, FATLFN_DIR)?;
+    fs4.create_in_dir(ade.first_cluster(), &name, 0x20)?;
+    serial_println!(
+        ":: FAT-LFN: artifact left on the medium for the HOST-SIDE read-back: /{}/{} (8.3 alias {}) \
+         — a real VFAT driver must list both spellings; the next boot's pre-teardown removes it ::",
+        FATLFN_DIR, name, alias
+    );
+
+    Ok(alloc::format!(
+        "created={} slots={} alias={} readback=ok alias_readback=ok checksum=ok torn_k={} orphans_ignored=ok",
+        name, slots, alias, FATLFN_TORN_K
+    ))
+}
+
+/// FATLFN: the one-shot witness. Runs once per boot from `probe_once`, mutates only its own scratch
+/// directory, and leaves the volume as it found it.
+///
+/// Three distinguishable outcomes, on purpose — the reason `fatgrow_witness_once`'s doc gives, which
+/// is that a gate unable to tell "did not run" from "passed" is not a gate:
+///   * `… -> PASS ::` — all eight legs held;
+///   * `… SKIPPED — <reason> ::` — no FAT volume, or the volume is mounted read-only (the rMBP's own
+///     boot medium is, by FRGUARD/AHCI policy, so this is the ordinary metal answer, not a failure);
+///   * `… FAIL ::` — a regression, spelled to hit `mbench.py`'s DEFAULT_FORBIDS and `arroyo`'s fault
+///     scan directly.
+#[cfg(feature = "witness")]
+pub fn fatlfn_witness_once() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if crate::drivers::block::info().is_none() {
+        return; // storage not up yet — `probe_once` has not latched either, so this retries with it
+    }
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let fs = match mount() {
+        Ok(fs) => fs,
+        Err(_) => {
+            serial_println!(":: FAT-LFN: SKIPPED — no FAT volume on the boot block device ::");
+            return;
+        }
+    };
+    if let Some(why) = fs.write_veto() {
+        serial_println!(":: FAT-LFN: SKIPPED — the volume refuses file mutations ({}) ::", why);
+        return;
+    }
+    match fatlfn_run(&fs) {
+        Ok(detail) => serial_println!(":: FAT-LFN: {} -> PASS ::", detail),
+        // `Unsupported` out of `fatlfn_run` is leg 1 — the FORMATTER, not the filesystem — and it is
+        // worth saying so, because the two failures send a reader to different files.
+        Err(FatError::Unsupported) => serial_println!(
+            ":: FAT-LFN: the clock-stamped name is not `{}` — prtscr::mac_name changed shape FAIL ::",
+            FATLFN_NAME
+        ),
+        Err(e) => serial_println!(":: FAT-LFN: VFAT long-name create ({:?}) FAIL ::", e),
+    }
 }
