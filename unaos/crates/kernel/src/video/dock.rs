@@ -1920,7 +1920,7 @@ const MAX_TILES: usize = wm::MAX_WINDOWS;
 
 /// DOCKID — the arrival counter. Monotonic, never reused, so a tile's rank is unique for the boot and
 /// a window that closes can never hand its position to the window that recycles its slot.
-static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
+static NEXT_SEQ: AtomicU64 = AtomicU64::new(1); static RECONCILES: AtomicU64 = AtomicU64::new(0); // DOCKID2 — ⚠ SAME-LINE fold, line-NEUTRAL (B94). **THE RECONCILE THAT ACTUALLY RAN.** Incremented by [`reconcile`] at the END of every completed pass, and read by nothing on a shipped image: it exists so a fixture can tell "the registry says X" from "NO PASS EVER WROTE THE REGISTRY", which is the Class 6 distinction all three metal DOCKID sightings turn on (FIXTURE_FLAKES §1d). A GLOBAL total rather than a per-caller one, deliberately — the fixture does not care WHICH core reconciled, only THAT a pass wrote the registry while its windows were live. See the DOCKID2 block at this file's tail.
 
 /// DOCKID — registry column: the window id this slot's tile names, or `wm::WIN_NONE` for a free slot.
 static TILE_ID: [AtomicU32; MAX_TILES] = [const { AtomicU32::new(wm::WIN_NONE) }; MAX_TILES];
@@ -2090,8 +2090,8 @@ fn census(rows: &[wm::DockEntry], n: usize) {
 ///
 /// Furniture is skipped by both arms: its rank is a constant, it has no arrival order, and its tile
 /// is permanent by design (that is what a pin IS).
-fn reconcile(rows: &[wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> bool {
-    let mut changed = false;
+fn reconcile() -> bool {
+    let mut changed = false; let mut scan = [wm::DockEntry::empty(); wm::MAX_WINDOWS]; let (n, _) = wm::dock_scan(&mut scan, (0, 0, 0, 0)); let rows = &scan; // DOCKID2 — ⚠ SAME-LINE fold, line-NEUTRAL (B94). **THE WRITER TAKES ITS MODEL WHEN IT MUTATES.** This function USED to be handed `(rows, n)` by [`settle`] — the model its CALLER scanned, before the pin chain, before anything else the pass did — and that is the whole of the defect §1d measured on `x86bind-logs/gored-b3-serial.log:1219..1238`: `idC` was allocated at `1219`, the reconcile at `1224` had been handed a model scanned BEFORE that allocation and did not admit it, the census at `1227` published `tiles=4` with `idC` live and TILELESS, and the next pass admitted `idD` at `seq=17` and `idC` at `seq=18` — the ELDER window given the LATER rank, against a green boot of the same six windows where `idC` takes 17 and `idD` 18 (`logs/foldgate/g2-test-x86-wc.log:2022/2032`). A tile's rank was therefore not its window's ARRIVAL but the arrival of the first reconcile pass that happened to SEE it, which is precisely what [`NEXT_SEQ`]'s header says the counter exists to prevent. ⚠ A READER-SIDE SNAPSHOT CANNOT FIX THIS and one was deliberately not written (B159): at `1242` the census is complete, internally consistent and STABLE — the registry is not TORN under the reader, it is stably and permanently WRONG, and a generation/seqlock hands the reader an unimpeachable view of an answer decided incorrectly one pass earlier. THE SCAN IS THE FIX. The pins are dropped with the caller's model and that costs nothing: both arms below skip every row [`fixed_rank`] answers for, and a pin's sentinel id (`wm::WinId::MAX - 3 ..= MAX`) can never equal a live window id, so the pinned model and the bare scan were always the same INPUT to this function. SINGLE WRITER UNCHANGED — [`compose`]'s `settle(.., true)` is still the one caller on a shipped image, and the router still reaches [`settle`] with `reconciling=false`, so LOCKFIX's rule for `press_at` (allocates nothing, takes no panel lock) is untouched: this scan is on the COMPOSE path only. COST, stated rather than hidden: one EXTRA `wm::dock_scan` per composite pass, i.e. a second acquire of the window table on a path that already takes it once — the same lock, the same masked context, no new wait CLASS, and the `[dock]` ledger tail is the measurement.
     for s in 0..MAX_TILES {
         let id = TILE_ID[s].load(Ordering::Relaxed);
         if id == wm::WIN_NONE {
@@ -2146,7 +2146,7 @@ fn reconcile(rows: &[wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> bool {
         );
         changed = true;
     }
-    changed
+    RECONCILES.fetch_add(1, Ordering::Relaxed); changed // DOCKID2 — ⚠ SAME-LINE fold, line-NEUTRAL (B94). The pass is over and the registry is written; SAY SO. At the END rather than the top, and `Relaxed` rather than `Release`, because the one reader is a fixture on the boot task that drives its own composites and re-reads the registry through the same `Relaxed` columns the rest of this block uses — it is a LIVENESS witness ("a pass ran"), not a publication fence.
 }
 
 /// DOCKID — the model assembly every reader shares: reconcile (compose only), then ORDER.
@@ -2155,7 +2155,7 @@ fn reconcile(rows: &[wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> bool {
 /// two lines, and so `strip_rect` — which wants the tile COUNT and nothing else — is not made to pay
 /// for an ordering it cannot use.
 fn settle(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize, reconciling: bool) {
-    if reconciling && reconcile(rows, n) {
+    if reconciling && reconcile() { // DOCKID2 — [`reconcile`] takes NO model any more: it scans for itself, at the moment it mutates. `rows`/`n` still feed the two lines below, which ORDER and PRINT the model this pass will paint — that model is correctly the caller's scan (it is what the strip shows), and only the RANK's provenance moved. ⚠ SAME-LINE fold, line-NEUTRAL (B94).
         order_model(rows, n);
         census(rows, n);
         return;
@@ -2655,3 +2655,56 @@ fn pins_census_once(rows: &[wm::DockEntry; wm::MAX_WINDOWS], n: usize) {
         yn(cfg!(feature = "quarry"))
     );
 }
+
+// ------------------------------------------------------------------------------------------------
+// DOCKID2 — WHERE A RANK COMES FROM, and a fixture that knows whether the pass it drove ever RAN
+// (TAIL-APPENDED: nothing above this line moved, so knob-off panic `Location` line numbers are
+// untouched; PARITY.md §5.3, B94)
+// ------------------------------------------------------------------------------------------------
+//
+// Two defects, measured separately, priced separately, fixed separately. Both are DOCKID's, neither
+// is the one B150's brief specified, and the diagnosis that replaced it is FLAKEFIX2's (rmbp-ledger
+// B159, FIXTURE_FLAKES §1d) read off the wire rather than inferred.
+//
+// # 1. The writer ranked against a model it had already stopped holding
+//
+// [`reconcile`] was handed `(rows, n)` by [`settle`] — the model [`compose`] scanned at the TOP of
+// the pass. Anything allocated after that scan was invisible to the reconcile that followed it, and
+// was admitted by the NEXT pass instead, walked in window-table order beside whatever had arrived
+// since. `gored-b3-serial.log:1219..1238` is the whole defect in five lines: `idC` allocated at
+// `1219`, the reconcile at `1224` admitting `idA` and `idB` and not `idC`, the census at `1227`
+// publishing `tiles=4` with `idC` live and TILELESS, then `idD` at `seq=17` and `idC` at `seq=18` —
+// the ELDER window given the LATER rank. The same six windows on a green boot
+// (`g2-test-x86-wc.log:2022/2032`) give `idC` 17 and `idD` 18. `order_ok` asserts `a < c && c < d`
+// and `c < d` is exactly what the reversal breaks.
+//
+// **The fix is one word: the writer SCANS.** [`reconcile`] takes no model at all now; it calls
+// `wm::dock_scan` itself, immediately before it mutates, so the rows it ranks are the rows as they
+// stand AT ADMISSION. A window created between the caller's scan and this one is admitted by THIS
+// pass, in its own arrival order, and a window created after this scan is admitted by the next pass
+// — after every window this one admitted. Ranks are therefore monotone in the order the reconciles
+// SEE arrivals, and the interval in which an arrival can be missed collapses from a whole composite
+// pass (scan → pins → layout → settle) to the few instructions between `dock_scan` returning and the
+// admit loop reading it.
+//
+// **The residual, named rather than left for the next reader to find.** Two windows allocated
+// between one reconcile and the next are still admitted in ONE pass, and that pass walks them in
+// window-table (id) order, so a recycled low id can still take the lower rank of the two. Closing
+// THAT needs an allocation stamp the window table does not carry — `wm::DockEntry` has `id`,
+// `owner_asid`, `title`, `title_len`, `visible`, `focused` and nothing monotone — so it is a
+// `video/wm.rs` change and is not this branch's. What it is NOT is the measured defect: in the
+// capture the two windows were eleven lines and one whole reconcile apart.
+//
+// **What did NOT move.** The single-writer rule: [`compose`]'s `settle(.., true)` is still the only
+// caller that reconciles on a shipped image. LOCKFIX's rule for the router: [`press_at`] reaches
+// [`settle`] with `reconciling=false`, allocates nothing and takes no panel lock, and this scan is on
+// the compose path only. The cost that DID move is one extra `wm::dock_scan` per composite pass — a
+// second acquire of the window table on a path that already takes it once, the same lock in the same
+// masked context, no new wait CLASS — and the `[dock]` ledger tail is where it is measured.
+// # 2. The fixture that scores this registry is the NEXT commit's, and it is not optional
+//
+// `dockid_selftest` drives `wm::composite()` and then reads the registry this function writes — and
+// `composite()` returns IDENTICALLY whether it ran a pass or was DECLINED by `COMP_GATE`. Until that
+// is fixed the fixture can score a registry NO pass has written, which is what all three rMBP metal
+// sightings did (FIXTURE_FLAKES §1d, Class 6). [`RECONCILES`] above is the witness that closes it and
+// is landed HERE, with the writer it belongs to; the reader arrives in the commit after this one.
