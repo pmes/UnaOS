@@ -725,11 +725,12 @@ impl BlockSource {
             // write posture from the first by accident. One arm, both spellings.
             BlockSource::Usb | BlockSource::UsbN(_) => None,
             // SDHCPOST (B155): a FORWARD to `drivers::block`'s §SDHCPOST — the ONE definition, which
-            // `handle_write_veto`'s `Sdhc` arm also forwards to, so leg 8 of `sdwrite_posture_selftest` agrees BY CONSTRUCTION. This arm keeps its OWN string (it is printed about a FAT MOUNT; the block layer's twin is printed about the native root), and that string is ALSO condition 1's answer: without `sdw-rw` the callee is the `not(sdw-rw)` twin and returns exactly this `Some(…)`, so `knoboff sdw-rw` measures byte-identity rather than being promised it. It was an UNCONDITIONAL `Some(…)` — which is what flight 11's screenshot ran into.
+            // `handle_write_veto`'s `Sdhc` arm also forwards to, so leg 8 of `sdwrite_posture_selftest` agrees BY CONSTRUCTION. This arm keeps its OWN string (it is printed about a FAT MOUNT; the block layer's twin is printed about the native root), and that string is ALSO condition 1's answer. SDHCRW (B166, R59, 2026-09-22): the POLARITY inverted under it — the callee's DEFAULT twin now ADMITS, and this string is reached only on the `sdw-ro` opt-out (or an image with no `sdw` ladder), so on a plain `./arroyo test` this arm returns `None` and a file verb reaches the card. It was an UNCONDITIONAL `Some(…)` — which is what flight 11's screenshot ran into.
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockSource::Sdhc => crate::drivers::block::sdhc_write_veto(
-                "the internal SD reader is mounted READ-ONLY \u{2014} only the reserved \
-                 flight-recorder extent admits a write (SDHC-4c), and no file verb can name it",
+                "the internal SD reader is mounted READ-ONLY \u{2014} this build carries the \
+                 `sdw-ro` opt-out (UNAOS_SDW_RO=1), or no `sdw` write path at all; R59 makes rw \
+                 the default and this string is what the EXCEPTION says",
             ),
             // TEGRA-SDBLK: a flat NO, and unlike the `Sdhc` arm there is no reserved extent to carve
             // an exception for — the block layer's `write_block_tegra_sd` refuses in EVERY cfg. This
@@ -4155,8 +4156,15 @@ pub fn sdhc_probe_once() {
     let size_mib = dev.num_blocks.saturating_mul(dev.block_size as u64) / (1024 * 1024);
     match mount_source(BlockSource::Sdhc) {
         Ok(fs) => {
+            // SDHCRW (rmbp-ledger B166, R59, 2026-09-22): the verdict word is now ASKED, not
+            // asserted. "READ-ONLY" was a constant in this string because under SDHC-4b it was a
+            // property of the image; R59 makes it a property of the posture, and a mount line that
+            // says READ-ONLY over a volume a file verb can write is a lie on the wire of exactly the
+            // kind this subsystem's one-definition rule exists to stop. It asks the SAME function
+            // both readers forward to, so it cannot disagree with them.
             serial_println!(
-                ":: SDHCBLK: FAT mounted READ-ONLY on the internal SD card ({} MiB): {} ::",
+                ":: SDHCBLK: FAT mounted {} on the internal SD card ({} MiB): {} ::",
+                if fs.write_veto().is_some() { "READ-ONLY" } else { "READ-WRITE" },
                 size_mib, fs.describe()
             );
             match fs.read_root() {

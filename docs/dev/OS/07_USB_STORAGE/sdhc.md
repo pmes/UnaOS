@@ -2851,3 +2851,242 @@ with two forwards, the three conditions and their truth table, the WP pin read a
 route and the measurement that chose it, the `sdhc4c` expected-mutation vocabulary, and the two
 `builder/src/main.rs` login lines that made the capture leg reachable at all. The polarity is a
 parameter of that mechanism, not its shape.
+
+## 15.9 SDHCRW (rmbp-ledger B166) — the polarity inverts: READ-WRITE by default, on every board
+
+§15.8 listed five reasons the flip had to be a re-cut rather than an edit. This section is that
+re-cut, and it is organised as those five reasons answered in order, because that is the shortest
+honest way to say what moved and what did not.
+
+**R59, Peter, verbatim, 2026-09-22: "read write."** — in answer to *"boot-volume default posture
+(rw vs reserved area)"*. LAWS §3 turns that into a shape: default-on with a **named opt-out**, never
+opt-in, and every disk driver the board has in the default image. `sdw-rw` is gone; `sdw-ro`
+(`UNAOS_SDW_RO=1`) is the opt-out, and it is the same name on all three boards.
+
+### 15.9.1 Reason 1 — the feature inverts name and polarity in all five wiring places
+
+| place | before (B155) | after (B166) |
+| :-- | :-- | :-- |
+| `crates/kernel/Cargo.toml` | `sdw = []` (opt-in) · `sdw-rw = ["sdw"]` | `sdw = []` (**default-on**, x86) · `sdw-ro = []` |
+| `unaos/arroyo` knob map | `[ -n "${UNAOS_SDW:-}" ] && … sdw,` · `[ -n "${UNAOS_SDW_RW:-}" ] && … sdw-rw,sdw,` | `_feats="${_feats}sdw,"` (unguarded) · `[ -n "${UNAOS_SDW_RO:-}" ] && … sdw-ro,` |
+| `unaos/builder/src/main.rs` | `if …var("UNAOS_SDW").is_ok() { push("sdw") }` · same for `UNAOS_SDW_RW` | `feats.push("sdw");` · `if …var("UNAOS_SDW_RO").is_ok() { push("sdw-ro") }` |
+| `arm_features` | `sdw` stripped · `sdw-rw` stripped | `sdw` stripped · **`sdw-ro` NOT stripped** (§15.9.5) |
+| `scripts/banner-cert.sh` | `sdw-rw|:: SDHCPOST: posture sdw-rw=1 wp-pin=|sdw|measured` | `sdw-ro|:: SDHCPOST: posture sdw-ro=1 wp-pin=unread|-|measured` |
+| `scripts/k8-reach.registry` | `UNAOS_SDW_RW  NA  --evidence: … 0 Pi-live …` | row DELETED — the knob is **armed** in `K8_FEATS` now |
+| `KERNEL_CFG_MATRIX` | `x86-all` ended `…,uvc,sdw-rw` | `x86-all` ends `…,uvc` (it type-checks the **shipped rw** polarity); three new legs `x86-sdw-ro`, `arm-tegra-sdw-ro`, `arm-pi-sdw-ro` carry the opt-out |
+
+`UNAOS_SDW=1` is still accepted and now decides nothing (the `UNAOS_SDHCBLK` precedent). The
+`UNAOS_SDW` registry row went with `UNAOS_SDW_RW`: neither name is in the knob map any more, and a
+registry row for a knob the map does not carry is what `k8-reach.py` calls STALE.
+
+Two gate reds were earned and fixed inside this arc, and both are recorded because they are cheap
+lessons about this tree's own machinery:
+
+1. The first cut of `x86-sdw-ro` named `sdwrite` in its feature list, to get leg 8 type-checked
+   against the refusing twin. `./arroyo check` came back
+   `❌ knob→builder wiring: UNAOS_SDWRITE->sdwrite — mapped in arroyo, named by a literal x86 leg,
+   and UNREAD by builder/src/main.rs`. The `arm-*-sdwrite` block warns about exactly this in its
+   own "UNIVERSE SIDE EFFECT" paragraph. `sdwrite` came back off the leg.
+2. The first cut of the `K8_FEATS` arm explained itself by naming `UNAOS_NOSDWRITE` in a comment.
+   `scripts/k8-reach.py:86` reads `armed` as every `UNAOS_[A-Z0-9_]+` token between `kernel8()`'s
+   braces, so a **mention is an arm**: `❌ k8-reach CONTRADICTION: UNAOS_NOSDWRITE — armed in
+   kernel8() AND registered as unarmed`. The comment no longer spells another knob's name.
+
+### 15.9.2 Reason 2 — the byte-identity claim inverts, so it is NOT the proof
+
+§15.8 predicted this and it is worth stating as a rule rather than a note. `./arroyo knoboff sdw-ro`
+compares the **knob-OFF** image to the baseline. With the opt-out OFF the image is the new
+read-write default, which differs from baseline **by design** — that difference *is* the ruling. A
+knoboff verdict here would either be a red that means nothing or a green that means the arc did not
+land. **No knoboff is quoted for this arc, anywhere** (LAWS §5, 2026-09-22), and the arroyo knob
+block says so at the knob.
+
+The proof is the **replay**, in both polarities, on the same tree:
+
+```text
+DEFAULT  (UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1 ./arroyo test 240 → rc=0)
+  :: SDHCPOST: posture sdw-ro=0 wp-pin=enabled write-path=live -> sdhc=rw reason=none … ::
+  :: SDHCBLK: FAT mounted READ-WRITE on the internal SD card (16 MiB): FAT16 vol@LBA0 … ::
+  :: sdhc: w1 armed=1 lba=32767 wp_sw=1 … verify=IDENTICAL restore=IDENTICAL reason=none -> PASS ::
+  :: SDHC4C: tally … sectors=1 armed=1 posture=rw permits-by-posture=2 expected-mutations=0 ::
+
+OPT-OUT (… plus UNAOS_SDW_RO=1)
+  :: SDHCPOST: posture sdw-ro=1 wp-pin=unread write-path=unread -> sdhc=ro reason=opt-out … ::
+  :: SDHCBLK: FAT mounted READ-ONLY on the internal SD card (16 MiB): FAT16 vol@LBA0 … ::
+  :: SDHC4C: tally fat-mutations-on-sdhc=0 permits=1 refusals=0 cmd24=1 armed=1 ::
+```
+
+The write is witnessed, not inferred: `verify=IDENTICAL restore=IDENTICAL -> PASS` is the driver's
+w1 self-test writing a sector to the QEMU card and reading it back, and `armed=1` on a run with no
+knob set is R59 in one field.
+
+#### The defect the flip exposed on its FIRST replay, and it is the most useful thing in this section
+
+The very first default replay read:
+
+```text
+:: SDHCPOST: posture sdw-ro=0 wp-pin=PROTECTED write-path=ABSENT -> sdhc=ro reason=wp-pin ::
+:: SDWRITE-POSTURE: posture=on … sdhc=ro card=absent … :: PASS ::
+… 14 lines later ::  SDHCBLK: registered internal SD card as block handle Sdhc … ::
+… and later still :: sdhc: w1 armed=1 lba=32767 wp_sw=1 … -> PASS ::
+```
+
+B155's doc said the pin is read *"on the FIRST posture question of the boot, which IS the mount …
+Nothing asks earlier"*. **Something does, and it is a fixture.**
+`fs::bootdisk::sdwrite_posture_selftest` (leg 8) drives `write_veto` over every source in
+`fat::ALL_SOURCES` on purpose — that is its whole value — and on x86 it runs before `drivers::sdhc`
+registers the card. `card_write_protected()` answers `None` with no mapped controller, the gate
+fails closed and reads that as PROTECTED (correct in isolation), and `SDHC_WP_AT_MOUNT` then froze
+it for the boot. The same boot's slider says ENABLED (`wp_sw=1`). **Every default image would have
+mounted read-only for a reason the hardware never gave**, and B155 could not have seen it because
+with `sdw-rw` default OFF that function did not exist in a shipped build.
+
+The fix is an ordering fix and not a loosening: with no live write path the answer is
+`no-write-path` — always the honest name for "there is no card here yet" — and `sdhc_rw_gate` now
+takes **neither** latch on that path. Nothing is admitted that was not admitted before; the pre-card
+question still refuses, it just no longer answers for a mount that has not happened. It gets its own
+row and its own one-shot, so a boot whose card never registers still says so exactly once:
+
+```text
+:: SDHCPOST: posture sdw-ro=0 wp-pin=unread write-path=ABSENT -> sdhc=ro reason=no-write-path
+   (asked BEFORE the card registered — typically `sdwrite_posture_selftest` leg 8 …) ::
+```
+
+**The lesson, stated for the next polarity flip in this tree:** a default-OFF feature's code has
+never run in a shipped build, so its *interaction with boot ordering* is unmeasured no matter how
+carefully the feature itself was reviewed. B155's mechanism was right and its call-graph claim was
+wrong, and only flipping the default could tell them apart.
+
+### 15.9.3 Reason 3 — CMD25 and `sectors=` ride the default image
+
+`drivers::block::write_blocks_sdhc`'s CMD25 route is now gated
+`all(feature = "sdw", not(feature = "sdw-ro"))`, so a counted file-verb write on a plain
+`./arroyo test` IS one CMD25. `fs::sdhc4c`'s tally follows it: `sectors=` on the default wire,
+`cmd24=` behind the opt-out, and the capture pair above shows both. `cmd24=` is kept verbatim where
+the path really is CMD24 — §15.4's split survives, it has simply changed which side is the default.
+
+### 15.9.4 Reason 4 — SDHC-4c's permit ladder retires, and `PRTSCR: REFUSED READ-ONLY` with it
+
+On flight 11 Peter pressed Print Screen and the machine said:
+
+```text
+:: PRTSCR: REFUSED READ-ONLY (source=sdhc serial=0x00000000 label=UNAOS-X86 reason=the internal SD
+   reader is mounted READ-ONLY — only the reserved flight-recorder extent admits a write (SDHC-4c),
+   and no file verb can name it) — no writable USB volume attached either — capture skipped ::
+```
+
+**That ladder needed no code change in `video/prtscr.rs`, and this is worth being precise about
+because the brief was prepared for the opposite.** `prtscr.rs:579` prints `reason={}` — the string
+comes from `write_veto`, which is `fs/fat.rs`'s `BlockSource::Sdhc` arm forwarding to the one
+definition. On a default image that arm returns `None`, the refusal is never reached, and the line
+cannot print. The SDHC-4c wording lived in the string this arc replaced, not in the screenshot path.
+What `prtscr.rs` does still carry is three STALE PROSE references to SDHC-4c's read-only card
+(`:153`, `:1189`, `:1414`) — reported, not touched: that file is SCRSHOT-DESKTOP's and is in flight.
+
+`fs/sdhc4c.rs`'s module doc is rewritten around the opt-out rather than the knob: everything it
+claims is true **under `sdw-ro`**, and retired on a default image. The permit's first rung
+(`sdhcpost_admits`) is now in every default image and the extent rung is what became exceptional —
+untouched, line for line, and still the whole gate whenever the posture is `ro`.
+
+### 15.9.5 Reason 5 — "on every board": three drivers, three verdicts, three different proofs
+
+R59 says *read write*, full stop, so the opt-out has to be **one name on every board**. `sdw-ro` is
+therefore the first card-posture feature in this tree that `arm_features` does **not** strip, and
+the consequence is stated rather than hidden: **aarch64 media are no longer byte-identical across
+this knob.** They remain byte-identical across `sdw`, which is still x86-only code and still
+stripped.
+
+| board | driver | write path before R59 | what changed | its board leg, and what that leg proves |
+| :-- | :-- | :-- | :-- | :-- |
+| rMBP (x86) | `drivers/sdhc.rs` | `sdw`, **opt-in** | `sdw` default-on; posture default `rw`; opt-out `sdw-ro` | QEMU replay, both polarities (§15.9.2), plus `x86-all` (rw) and `x86-sdw-ro` (opt-out) compile legs |
+| Pi 4 | `drivers/emmc2.rs` | **behind no feature at all** — `write_block`'s `BACKEND_SD` arm has routed to `emmc2::write_block_512` since U9 | nothing on the write path; the **opt-out was what was missing** (LAWS §3's other half) — `default_writable` gains the `sdw-ro` term, `guard_default_write_backend` gains its own refusal line, and `register_sd` states the posture once | `./arroyo kernel8-test` under QEMU raspi4b: `:: SDHCPOST: posture sdw-ro=0 driver=emmc2 write-path=live -> sd=rw reason=none … ::`, plus the `arm-pi-sdw-ro` compile leg for the refusal side |
+| Orin (Tegra) | `arch/aarch64/sdmmc_tegra.rs` via `block::write_block_tegra_sd` | `sdwrite`, **already default-on** (A60) | `tegra_sd_writes_admitted()` becomes `cfg!(sdwrite) && !cfg!(sdw-ro)`, and the veto is applied at `write_block_tegra_sd` too so the posture and the entry point cannot be two policies | **compile only — R39.** No Orin QEMU exists and this seat does not proof another seat's board. `arm-tegra-sdw-ro` type-checks the only configuration in which `sdwrite` is built and the card is refused |
+
+The claim "R59's default-on half was already true on the Pi" is not a shrug: it is why the Pi needed
+no write-path work and why the honest deliverable there was the escape hatch and a line on the wire.
+orin 19–21's opt-in was the presumption R59 removes; A60 had already removed it on the Orin.
+
+### 15.9.6 Flight 12
+
+**Flight 12's knob line carries NOTHING for this — by design, and that is the deliverable.** Both
+`UNAOS_SDW` and `UNAOS_SDW_RW` are retired; the card mounts read-write because the image does, and
+the operator types nothing. For a **cold-witness boot** — a flight where the card must not be
+mutated at all — the operator adds exactly `UNAOS_SDW_RO=1`, on any of the three boards.
+
+What flight 12 should read where flight 11 read `:: PRTSCR: REFUSED READ-ONLY`:
+
+```text
+:: SDHCPOST: posture sdw-ro=0 wp-pin=enabled write-path=live -> sdhc=rw reason=none … ::
+:: SDHCBLK: FAT mounted READ-WRITE on the internal SD card (…) ::
+```
+
+and then a capture that lands, because `mount_capture_target` is no longer refused by the volume.
+**Two conditions outside this arc still gate the screenshot** and are named so a failed flight is
+diagnosed and not re-litigated: R54's `Refusal::NoSession` runs *first* (§15.7 — no session, no
+capture, whatever the posture), and the WP slider on the physical card is still condition 2. A
+flight-12 refusal reading `reason=wp-pin` is the slider, not this arc.
+
+### 15.9.7 The pins, and the gates
+
+`scripts/specs/x86-test.spec` gains three REQUIREs and one FORBID (tail-appended, per that file's
+CONTRACT). The three REQUIREs name **both** legal rows verbatim — the R59 default and the named
+escape — and nothing else. That shape cost a run to learn and the reason is written at the pins: a
+flat `-> sdhc=rw` REQUIRE passed the default lane and turned `UNAOS_SDW_RO=1 ./arroyo test` **red**,
+because `qemu_await.py --settled` treats an unmatched REQUIRE as *not settled* — the opt-out capture
+reached its end-of-run marker at line 2454 and the verb still called it
+`truncated reason=short-witnesses:3`, then burned the whole 420 s wall. **A pin that reds a shipped
+knob is a trap, not a gate.** The R59 assertion an alternation cannot carry is the FORBID:
+`sdw-ro=0 wp-pin=enabled write-path=live -> sdhc=ro` — a default image, slider enabled, card
+registered, refusing anyway, which no configuration makes correct. It is silent in both lanes.
+
+Which consumer reads them is measured, not assumed: `x86_test_completion` runs
+`qemu_await.py --settled` against `x86-test.spec` on **every** `./arroyo test`, whatever the knob
+set — that is how the trap fired — so these pins are load-bearing even on the two replays above,
+whose REPLAY spec `x86_pick_capture_spec` resolves to `x86-default.spec` under that knob set. Both
+final replays came back **rc=0**, with `MBENCH PASS 6/6` on the replay spec and a `complete`
+settled verdict that these pins are part of.
+
+Go-red was measured in **both** directions against this arc's own captures, because a REQUIRE and a
+FORBID fail in opposite ways: mutating the rw row's verdict token gives
+`❌ MBENCH FAIL — 2/3 … FIRST-SHORTFALL x86-test.spec:217`, and pointing the FORBID at the pre-card
+row the default capture really carries gives `❌ MBENCH FAIL — 3/3 required witnesses, 1 forbidden
+hit(s)`. Both restore to `✅ MBENCH PASS` on both captures.
+
+### 15.9.8 Artifact certification, and the third thing this arc learned from a gate
+
+`banner-cert` certifies a feature by finding its witness token **in the artifact** with
+`LC_ALL=C grep -a -o -F` — a fixed string, never a regex. That is the whole reason it can catch a
+banner naming a feature the media does not carry (it caught `sdwrite` that way on its first armed
+run, §15.6's neighbourhood). It also means **a witness that is not contiguous bytes cannot be
+certified**, and this arc walked straight into that:
+
+```text
+feature=sdw-ro witness=:: SDHCPOST: posture sdw-ro=1 wp-pin=unread hits=0 -> MISSING
+❌ banner-cert: the banner and the artifact DISAGREE — this media is red.
+```
+
+The refusing twin printed its two fields through `{}`. rustc splits a format string at every
+placeholder, so `sdw-ro=1` existed nowhere in the binary — the gate was right and the line was
+uncertifiable. The fix is the same trick §SDHCPOST already used for `sdhc=rw`/`sdhc=ro`: the row is
+**one contiguous literal per polarity**, selected by `#[cfg]` and never `cfg!`. `#[cfg]` matters as
+much as the literal does — `cfg!` compiles both arms, so the opt-out row's bytes would sit in every
+default image and banner-cert would report a **LEAK**, a control string for a feature the banner did
+not name. One literal per polarity means the artifact carries exactly the row it can print.
+
+Measured on the two media (`./arroyo esp-x86`, and the same with `UNAOS_SDW_RO=1`):
+
+| token | default | opt-out |
+| :-- | --: | --: |
+| `cmd25` | 3 | 3 |
+| `cmd25 multi-block write` | 1 | 1 |
+| `sdhc=rw` | **2** | **0** |
+| `reason=wp-pin` | 1 | 0 |
+| `sdw-ro=1 wp-pin=unread write-path=unread -> sdhc=ro reason=opt-out` | **0** | **1** |
+
+`cmd25` in BOTH is the point of the design and not an oversight: `sdw` rides every x86 image now, so
+an opt-out image carries the whole ladder and **refuses** — it is not an image that *cannot* write,
+and a refusal reporting `no-write-path` would have misnamed itself. `sdhc=rw` in the default only is
+"is this image capable of a writable card at all", answered off the artifact and never only off a
+boot that may not have run. The `0` in the opt-out row's default column is the LEAK check.
+
+`banner-cert` itself: default `ok=5 missing/leak=0`, opt-out `ok=6 missing/leak=0`.

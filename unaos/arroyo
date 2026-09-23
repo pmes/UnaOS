@@ -390,27 +390,46 @@ _feats=""
 # read-only half and prints `:: sdhc: w1 armed=0 ... -> DRYRUN ::` naming the LBA it would have
 # written — so the question "would arming this build write, and where" is answered by a boot that
 # writes nothing. x86_64 only; aarch64 media byte-identical. Default OFF.
+# SDHCRW (rmbp-ledger B166, R59, 2026-09-22) — **DEFAULT-ON NOW, and `UNAOS_SDW=1` decides nothing.**
+# Peter's ruling on the boot volume's default posture is *"read write."* and LAWS §3 reads default-on
+# with a named opt-out, never opt-in — so 4a/4b's ladder rides EVERY x86 image and a plain
+# `./arroyo test` boots a kernel that can write its card. "Default OFF" and "no CMD24 command word
+# exists anywhere in a default image" above are the PRE-R59 tree, kept because they are what changed.
+# UNAOS_SDW=1 is still accepted and still means "on" (the UNAOS_SDHCBLK precedent), so existing
+# playbooks keep working. The named opt-out is UNAOS_SDW_RO below and it changes the POSTURE, not
+# this ladder — an opt-out image still carries CMD24/CMD25 and refuses with `reason=opt-out`.
 # Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
-# disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson).
-[ -n "${UNAOS_SDW:-}" ] && _feats="${_feats}sdw,"
-# SDHCPOST (B155): UNAOS_SDW_RW=1 lifts the internal SD card's FAT mount from READ-ONLY to READ-WRITE.
-# This is the POSTURE half of milestone 4b — the half flight 11 needed when Peter pressed Print Screen
-# and got `:: PRTSCR: REFUSED READ-ONLY (source=sdhc … SDHC-4c)`. The posture has ONE definition,
-# `drivers::block::sdhc_write_veto`, and `fat::BlockSource::write_veto` and `block::handle_write_veto`
-# are both forwards to it, so the two views cannot drift (leg 8 of `sdwrite_posture_selftest`).
-# `sdhc=rw` needs all THREE: this knob, the write-protect PIN read AT MOUNT saying enabled, and a live
-# block-layer write path; a refusal names which one said no, on a truth table printed once at mount
-# (`:: SDHCPOST: posture sdw-rw=1 wp-pin=… write-path=… -> sdhc=… reason=… ::`). Implies `sdw` in
-# Cargo.toml — a writable volume over an image with no CMD24/CMD25 word would be `rw=yes` on a path
-# that cannot write a byte, the failure A60's one-posture rule exists to stop. It also RETIRES two of
-# SDHC-4c's claims while it is on (the closed writable set; "the card has no FAT mutator") — see
-# `fs/sdhc4c.rs` §SDHCPOST. DEFAULT OFF: the card IS the bench rMBP's hard drive, so a default-rw boot
-# volume is a power-cut decision on a journal-less FAT and it is PETER'S (rmbp-ledger B155), not a
-# build flag. Default OFF => the `not(sdw-rw)` twin compiles and both readers are byte-for-byte their
-# pre-SDHCPOST selves (`./arroyo knoboff sdw-rw`). x86_64 only; aarch64 media byte-identical (stripped
-# by arm_features below, like `sdw`). Kept in sync with builder/src/main.rs — a knob mapped HERE and
-# missing THERE ships the feature disabled while the banner claims it is on (s42/INSTGUI, WXN-M3b).
-[ -n "${UNAOS_SDW_RW:-}" ] && _feats="${_feats}sdw-rw,sdw,"
+# disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson). A DEFAULT-ON name
+# missing there is the `sdwrite` class instead, which `scripts/knob-parity.sh` reds on.
+_feats="${_feats}sdw,"
+# SDHCRW (rmbp-ledger B166, R59, 2026-09-22): UNAOS_SDW_RO=1 — **the NAMED OPT-OUT of the read-write
+# default, and the only knob that puts a card back to READ-ONLY. On every board.**
+# It inverts SDHCPOST's UNAOS_SDW_RW (B155, opt-in, default OFF). B155 built the mechanism and said
+# the polarity was Peter's; R59 is the answer, verbatim: "read write." So the posture is `rw` unless
+# the write-protect PIN read AT MOUNT says the card is locked, or THIS knob is armed — and the
+# refusal names which (`sdhc=ro reason=wp-pin` / `reason=opt-out`) on a truth-table line printed once
+# at the mount BY EITHER POLARITY (`:: SDHCPOST: posture sdw-ro=… wp-pin=… write-path=… -> sdhc=…
+# reason=… ::`). The posture still has ONE definition, `drivers::block::sdhc_write_veto`, and
+# `fat::BlockSource::write_veto` and `block::handle_write_veto` are both forwards to it, so the two
+# views cannot drift (leg 8 of `sdwrite_posture_selftest`).
+# NO `sdw` IMPLICATION — the opposite of `sdw-rw`, which armed a write path and had to imply one. This
+# one REFUSES, and a refusal needs no ladder.
+# **NOT stripped by `arm_features`**, unlike `sdw` and unlike B155's `sdw-rw`. R59 is "on every board"
+# and the escape must be ONE name on every board: this knob also vetoes the Orin's A60 `sdwrite`
+# posture (`block::tegra_sd_writes_admitted`, `write_block_tegra_sd`) and the Pi's emmc2 card
+# (`block::default_writable` / `guard_default_write_backend` — whose write path is behind no feature
+# at all and never was, so R59's default-on half was already true there and only the opt-out was
+# missing). aarch64 media are therefore NOT byte-identical across this knob, by design, and it is
+# carried into `kernel8()`'s curated K8_FEATS for the same reason.
+# ⚠ DO NOT quote `./arroyo knoboff sdw-ro` as the proof of this arc (LAWS §5, 2026-09-22): knoboff
+# compares the knob-OFF image to the baseline, and with this opt-out OFF the image is the NEW rw
+# default, which differs from baseline BY DESIGN — that difference is the ruling, not a defect. The
+# proof is the replay: default image prints `sdhc=rw` and writes; `UNAOS_SDW_RO=1` prints
+# `sdhc=ro reason=opt-out` and refuses.
+# Kept in sync with builder/src/main.rs — a knob mapped HERE and missing THERE ships the feature
+# disabled while the banner claims it is on (s42/INSTGUI, WXN-M3b). Here that would be WORSE than
+# usual: the operator would think the card was cold and it would not be.
+[ -n "${UNAOS_SDW_RO:-}" ] && _feats="${_feats}sdw-ro,"
 # SDHC-4b (GR20): UNAOS_SDHCBLK=1 makes the INTERNAL SD card a real x86 BLOCK BACKEND, so `fs::fat` can
 # mount it. Boot AC identified the card and Boot AD wrote to it, but `drivers/block.rs` had two backends
 # and every SD arm in it is aarch64+baremetal (the Pi's EMMC2), so on x86 `read_block` has always meant
@@ -2882,12 +2901,19 @@ arm_features() {
     # points, which is the property that lets the x86 track arm a card-write knob without touching the
     # Pi or Jetson media at all.
     f="${f//,sdw,/,}"
-    # SDHCPOST (B155) rides the same strip and for the same reason: `sdw-rw` gates only x86 arms —
-    # `drivers/block.rs` §SDHCPOST, `fs/fat.rs`'s `Sdhc` veto arm and `fs/sdhc4c.rs`, every one already
-    # inside `all(target_arch = "x86_64", feature = "sdhcblk")` — so it emits not one byte of aarch64
-    # CODE, but an enabled feature is hashed into cargo's `-Cmetadata` fingerprint and leaving it in
-    # would shift every aarch64 media hash for zero observable change.
-    f="${f//,sdw-rw,/,}"
+    # SDHCRW (rmbp-ledger B166, R59, 2026-09-22) — **`sdw-ro` IS DELIBERATELY NOT STRIPPED HERE, and
+    # that is the one line of this function the R59 cut changed.** B155's `sdw-rw` WAS stripped, on the
+    # argument quoted above: it gated only x86 arms (`drivers/block.rs` §SDHCPOST, `fs/fat.rs`'s `Sdhc`
+    # veto arm, `fs/sdhc4c.rs`), emitted not one byte of aarch64 CODE, and leaving it in would have
+    # shifted every aarch64 media hash for nothing. That argument is DEAD, because its premise is:
+    # R59 is "read write" ON EVERY BOARD, so the named opt-out reaches real aarch64 code —
+    # `block::tegra_sd_writes_admitted` and `write_block_tegra_sd` (the Orin's A60 `sdwrite` posture)
+    # and `block::default_writable` / `guard_default_write_backend` / `register_sd` (the Pi's emmc2).
+    # Stripping it would leave the aarch64 media with a write-by-default card and NO WAY TO SAY NO,
+    # which is precisely the LAWS §3 half orin 19-21's opt-in got wrong in the other direction.
+    # CONSEQUENCE, said out loud because a reader will look for it: aarch64 media are NO LONGER
+    # byte-identical across this knob. They are byte-identical across `sdw` (still stripped, still
+    # x86-only code), and that is the property this block still protects.
     # WCD-VALVE rides the same strip, for the same reason: every valve item is x86_64-gated, so
     # `wcdvalve` emits not one byte of aarch64 CODE — but an enabled feature is hashed into cargo's
     # `-Cmetadata` fingerprint, and leaving it in would shift the aarch64 media hash between a
@@ -5417,7 +5443,7 @@ KERNEL_CFG_MATRIX=(
   # SIDE EFFECT: the table gains one knob and the universe gains one (brand-new, so "unclaimed =>
   # assume x86" either way and naming it here removes nothing); read the live board/mix counts on
   # `./arroyo check`'s own summary line, never from this prose.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc,sdw-rw"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,mtraw_inject,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
@@ -6839,6 +6865,49 @@ KERNEL_CFG_MATRIX=(
   "arm-tegra-sdwrite ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdwrite"
   "arm-tegra-sdwritefx ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdwrite,sdwritefx"
   "arm-virt-sdwrite ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,sdwrite"
+  # ── SDHCRW (appended 2026-09-22, rmbp-ledger B166, R59) — THREE legs, one per board, and the
+  # reason there are three is the ruling: "read write" ON EVERY BOARD means the OPT-OUT compiles on
+  # every board, and an opt-out that only ever type-checks on one arch is the `tegra_el0`/EXECGATE
+  # vacuity this gate exists to catch ──────────────────────────────────────────────────────────────
+  #
+  # THE SHIPPED POLARITY NEEDS NO NEW LEG, and that is the first thing to check before adding one:
+  # `x86-all` already names `sdw` and `sdhcblk` and now does NOT name `sdw-ro`, so it type-checks the
+  # rw twin of `sdhc_write_veto` — the polarity that ships. `x86-all-nowitness` names `sdhcblk`
+  # without `sdw`, which type-checks the refusing twin's `not(sdw)` half for free. What was named by
+  # nothing is the `sdw-ro` half of that twin, and the aarch64 vetoes the knob newly reaches.
+  #
+  # `x86-sdw-ro` is the EXCEPTIONAL x86 polarity: `sdhcblk` + `sdw` + `sdw-ro`, i.e. the image that
+  # carries the whole CMD24/CMD25 ladder AND refuses to use it. That conjunction is the one the
+  # opt-out actually ships as, and no other leg produces it — `x86-all` has the ladder and admits,
+  # `x86-all-nowitness` refuses but has no ladder. It deliberately does NOT name `sdwrite`, although
+  # leg 8 of `fs::bootdisk::sdwrite_posture_selftest` would then type-check against the refusing twin
+  # as well: naming `sdwrite` on a LITERAL x86 leg puts UNAOS_SDWRITE under the KNOB→BUILDER WIRING
+  # CHECK and demands a builder entry for a knob whose every site is aarch64 — the side effect the
+  # `arm-*-sdwrite` block above warns about in those words, and this gate reds on it within one run
+  # (MEASURED here, 2026-09-22: the first cut of this leg carried `sdwrite` and the check said
+  # `UNAOS_SDWRITE->sdwrite … UNREAD by builder/src/main.rs`). Leg 8's x86 half stays where that
+  # block put it: compiled and EXECUTED by `./arroyo test`, which arms `witness` and carries
+  # `sdwrite` by default.
+  #
+  # `arm-tegra-sdw-ro` is `arm-tegra-sdwrite` plus the opt-out — the ONLY configuration in which
+  # `tegra_sd_writes_admitted()` is false while `sdwrite` is built, and therefore the only one that
+  # type-checks `write_block_tegra_sd`'s `any(not(sdwrite), sdw-ro)` arm with the board features
+  # present. R39: no Orin QEMU exists, so a compile is the whole of this board's proof and the ledger
+  # says so rather than implying a run.
+  #
+  # `arm-pi-sdw-ro` is `arm-pi` plus the opt-out. The Pi's write path is behind NO feature, so what
+  # this leg proves is the refusal side alone: `default_writable`'s `sdw-ro` term and
+  # `guard_default_write_backend`'s opt-out arm. Its BEHAVIOURAL twin is `./arroyo kernel8-test`,
+  # which runs the default (rw) polarity — the two halves are deliberately split that way round
+  # because the default is the one a board boots.
+  #
+  # UNIVERSE SIDE EFFECT: `sdw-ro` is now named by an x86-* leg, which puts it under the KNOB→BUILDER
+  # WIRING CHECK — deliberately, and unlike `sdwrite`: UNAOS_SDW_RO must be read by
+  # `builder/src/main.rs` or an operator arming a cold-witness boot on METAL gets a writable card and
+  # a banner that says otherwise. That is the one failure this knob must not have. Board legs +3.
+  "x86-sdw-ro ../../x86_64-unaos.json witness,logts,wedge2,sched_demo,skip_xhci,sdhcblk,sdw,sdw-ro"
+  "arm-tegra-sdw-ro ../../aarch64-unaos.json logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,sdwrite,sdw-ro"
+  "arm-pi-sdw-ro ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet,v3d_singleseg,login,loginst,sdw-ro"
   # ── WITNESSGAP (appended 2026-09-07, orin 20) — the WITNESS-FREE polarity, which is the polarity
   # every piece of BOOT MEDIA actually ships ──────────────────────────────────────────────────────
   #
@@ -10530,6 +10599,27 @@ kernel8() {
     # the session principal, the shell arms and the M1 fixture (see the knob's block near the top of
     # this file). OFF => fs/users.rs is not compiled, every call site is a `#[cfg]`-erased statement
     # folded onto an existing line, and kernel8.img is byte-identical to baseline.
+    # SDHCRW (rmbp-ledger B166, R59, 2026-09-22): UNAOS_SDW_RO=1 — the NAMED OPT-OUT of the
+    # read-write default, and the FIRST card-posture knob this curated list has ever carried.
+    # It is here and the Orin's own `sdwrite` opt-out knob is not (that one keeps its NA row in
+    # `scripts/k8-reach.registry`), and the difference is the ruling: R59 is "read write" ON EVERY
+    # BOARD, so the escape must exist on every board.
+    # ⚠ DO NOT spell another knob's UNAOS_ name in this function's body, in a comment or anywhere
+    # else: `scripts/k8-reach.py:86` reads `armed` as every `UNAOS_[A-Z0-9_]+` token between
+    # `kernel8()`'s braces, so a MENTION is an ARM to that gate. The first cut of this block named
+    # the Orin knob in prose and `check` came back `k8-reach CONTRADICTION` for it (measured
+    # 2026-09-22). Withholding it would leave kernel8 with a write-by-default card and no
+    # way for an operator to say no — exactly the LAWS §3 half orin 19-21 got wrong in the other
+    # direction. What it changes on the Pi: `block::default_writable`'s `sdw-ro` term and
+    # `guard_default_write_backend`'s opt-out arm, so `/`'s `rw=` and the shell's pre-mutation
+    # refusal follow it. The Pi's WRITE PATH is behind no feature and is not touched by this knob;
+    # `register_sd` prints the posture either way (`:: SDHCPOST: posture sdw-ro=… driver=emmc2 … ::`),
+    # which is what `./arroyo kernel8-test` quotes. kernel8.img is NOT byte-identical across this
+    # knob, by design.
+    if [ -n "${UNAOS_SDW_RO:-}" ]; then
+        K8_FEATS="${K8_FEATS},sdw-ro"
+        echo -e "${COLOR_YELLOW}  • UNAOS_SDW_RO: the card stays READ-ONLY — R59's named opt-out, for a cold-witness boot (default is read-write)${COLOR_RESET}"
+    fi
     if [ -n "${UNAOS_LOGIN:-}" ]; then
         K8_FEATS="${K8_FEATS},login"
         echo -e "${COLOR_YELLOW}  • UNAOS_LOGIN: human users — /USERS.DAT record store, login/logout session principal (user:<name>), /home/<user> at first login${COLOR_RESET}"

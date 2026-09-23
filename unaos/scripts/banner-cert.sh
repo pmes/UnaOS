@@ -266,7 +266,7 @@ kbdwit|SILENCE-ENDED-HALTED|ehcihid|measured
 smc|:: SMC-BATT: sweep failed (present=false)|-|measured
 smcwalk|:: SMC-SCOUT: idx|smc|measured
 sdw|[sdhc-w] cmd24 lba=|-|measured
-sdw-rw|:: SDHCPOST: posture sdw-rw=1 wp-pin=|sdw|measured
+sdw-ro|sdw-ro=1 wp-pin=unread write-path=unread -> sdhc=ro reason=opt-out|-|measured
 sdhcblk|the staged file is FRAGMENTED; the permit describes exactly one LBA interval|-|measured
 sdwrite|:: SDWRITE-POSTURE: posture=|witness|measured
 irqstorage|:: bx-blockreq: no block device|-|measured(1)

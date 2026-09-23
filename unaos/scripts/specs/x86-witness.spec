@@ -933,15 +933,23 @@ REQUIRE :: sdhc: card (v1\.x|v2\.00\+) (SDSC|SDHC|SDXC) (byte|block)-addressed b
 #   [sdhc] bdf 3:0.1 CARD IDENTIFIED — 60800 blocks, byte-addressed, csd v1
 REQUIRE \[sdhc\] bdf [0-9]+:[0-9]+\.[0-9]+ CARD IDENTIFIED — [0-9]+ blocks, (byte|block)-addressed, csd v[0-9]+
 # --- 3. THE WRITE SELF-TEST'S VERDICT LINE, AND WHY THE VERDICT IS NOT IN THE PATTERN.
-# SDHC-4a's `write_block_512` is `#[cfg(feature = "sdw")]` — OFF by default — but the four-gate
+# SDHC-4a's `write_block_512` is `#[cfg(feature = "sdw")]` — **ON by default since SDHCRW
+# (rmbp-ledger B166, R59, 2026-09-22); it was OFF by default when the paragraph below was written,
+# and the two capture lines quoted further down are still both real, just no longer one-per-knob** —
+# but the four-gate
 # ladder, the stash read and THIS LINE compile and run on every boot, armed or not (sdhc.rs:2943-2948
 # says so in as many words, and `let armed = cfg!(feature = "sdw")` at :3163 is the whole difference).
 # That is what makes a REQUIRE legitimate here where it is not legitimate for `pcicensus` or
 # `bcmarecon`: the wire is unconditional, only its VERDICT moves with the knob. So the verdict is
 # what the pattern refuses to name.
 # BOTH CONFIGURATIONS ARE IN THE BENCH ARCHIVE, which makes this a measurement rather than a claim:
-#   Boot AC (default build):   `armed=0 … verify=DRYRUN restore=SKIPPED reason=would-write -> DRYRUN`
-#   Boots AD/AE/AF (UNAOS_SDW=1): `armed=1 … verify=IDENTICAL restore=IDENTICAL reason=none -> PASS`
+#   Boot AC (pre-R59 default build):   `armed=0 … verify=DRYRUN restore=SKIPPED reason=would-write -> DRYRUN`
+#   Boots AD/AE/AF (then UNAOS_SDW=1, now the DEFAULT): `armed=1 … verify=IDENTICAL restore=IDENTICAL reason=none -> PASS`
+# SDHCRW: the `armed=0` arm has not gone away — it is what an image built WITHOUT `sdw` still prints
+# — but no verb in this tree composes one any more, so the pattern below is now load-bearing for the
+# armed arm alone and would not have caught a default-image regression either way round. That is
+# argued, not assumed: it is exactly why this arc added the POSTURE pin below instead of editing this
+# one.
 # One pattern matches all four. A REQUIRE naming `-> PASS` would red every default boot; one naming
 # `-> DRYRUN` would red every armed one. The refusal arms (`-> REFUSED`, `lba=NONE`, `class=?`,
 # `blank=?`) are matched too, and deliberately: a write-protect slider, a GPT card or a non-blank

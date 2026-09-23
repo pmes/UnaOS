@@ -64,20 +64,22 @@
 //! survive a lying BPB, and they are why the set stays bounded even then.
 //!
 //! **THERE IS NOW EXACTLY ONE KNOB THAT WIDENS THE SET, AND THIS PARAGRAPH USED TO SAY THERE WAS NONE.**
-//! Everything above is TRUE WITH `sdw-rw` OFF — the shipped polarity — and RETIRED WITH IT ON: SDHCPOST
+//! Everything above is TRUE ONLY UNDER THE `sdw-ro` OPT-OUT — the EXCEPTIONAL polarity since R59 —
+//! and is RETIRED on every default image (SDHCRW, rmbp-ledger B166). It read the other way round
+//! until 2026-09-22: SDHCPOST
 //! (B155) makes the volume's posture liftable, and a writable volume whose permit still admitted one
 //! extent would refuse every file verb per sector instead. See §SDHCPOST at this file's TAIL.
 //!
 //! ## WHAT IS *NOT* IN THE SET — the reserve-once idea
 //!
-//! WITH `sdw-rw` OFF (the shipped polarity, and the whole of what follows): nothing outside the
+//! UNDER `sdw-ro` (the exceptional polarity, and the whole of what follows): nothing outside the
 //! reserved file's own data clusters. In particular NO FAT entry, NO directory sector, NO allocation
 //! and NO free. The kernel never creates, grows, deletes or renames the reserved file: it ADOPTS a
 //! host-staged one or refuses. That is why there is no lock here and none is claimed — a path that
 //! mutates no shared FAT structure has nothing to serialize against, and the x86 FAT-mutator count
 //! (`fs/fat.rs` FAT-MUTATOR ROSTER) stays at one, on the *boot* volume, unchanged. [`FAT_MUTATIONS`]
 //! is the instrument that can falsify that claim: incremented at `with_fat_lock_src` /
-//! `with_dir_lock_src` whenever the source is `Sdhc`. **WITH `sdw-rw` ON the claim is RETIRED, not
+//! `with_dir_lock_src` whenever the source is `Sdhc`. **ON A DEFAULT IMAGE the claim is RETIRED, not
 //! merely strained** — a file verb on a writable volume IS a FAT mutator; §SDHCPOST below says so.
 //!
 //! ## FRGUARD composition
@@ -100,7 +102,7 @@
 //! :: SDHC4C: reserve NAME=UNALOG.BIN cluster=K size=S runs=1 lba=[A..B) permit=ARMED ::
 //! :: SDHC4C: reserve NAME=UNALOG.BIN ... permit=UNARMED (<reason>) — the card stays READ-ONLY ::
 //! :: SDHC4C: in-place write ok bytes=W lba=[A..B) readback=MATCH fnv=0x... ::
-//! :: SDHC4C: tally fat-mutations-on-sdhc=0 permits=N refusals=0 cmd24=N armed=1 ::   (`sectors=` under `sdw-rw`)
+//! :: SDHC4C: tally fat-mutations-on-sdhc=0 permits=N refusals=0 cmd24=N armed=1 ::   (the opt-out's line; a DEFAULT image prints `sectors=`)
 //! ```
 //!
 //! The must-not-appear line is `:: SDHC4C: permit REFUSED ...`. A refusal is not a device fault, so
@@ -151,7 +153,7 @@ static PERMITS: AtomicU32 = AtomicU32::new(0);
 /// How many it refused. Non-zero is a finding.
 static REFUSALS: AtomicU32 = AtomicU32::new(0);
 /// SECTORS admitted. The STATIC keeps 4c's name and the WIRE carries the truth: `cmd24=` on a `ro`
-/// build (the loop really is CMD24), `sectors=` under `sdw-rw` (the path is CMD25) — see `tally`. A
+/// build (the loop really is CMD24), `sectors=` on a DEFAULT image (the path is CMD25) — see `tally`. A
 static CMD24: AtomicU32 = AtomicU32::new(0); // rename here costs 8 bytes of .bss ORDER, for nothing.
 /// FAT-table or directory RMWs ATTEMPTED against the `Sdhc` source. Must be 0. Incremented at the
 /// two lock wrappers in `fs/fat.rs`, which every such RMW funnels through.
@@ -209,7 +211,7 @@ pub fn permit_write(site: &str, lba: u64, count: u64) -> Result<(), FatError> {
 /// instrument must count card traffic, not gate crossings. `REFUSALS` IS incremented here: a
 /// refusal is never double-counted, because the run check returning `Err` means the loop is never
 /// entered.
-pub fn permit_span(site: &str, lba: u64, count: u64) -> Result<(), FatError> { #[cfg(feature = "sdw-rw")] if sdhcpost_admits(site, lba, count) { return Ok(()); } // SDHCPOST (B155): the FIRST rung of the ladder, and it exists only in an `sdw-rw` build. With the volume's posture `rw` the reserved extent is no longer THE writable set, so a bound that still admitted one extent would refuse every file verb sector by sector — the half-finished mutation `BlockSource::write_veto` exists to prevent, arriving one layer lower. The extent rung below is UNTOUCHED and is still the whole gate whenever the posture is `ro`, which is every shipped build. See §SDHCPOST at this file's tail.
+pub fn permit_span(site: &str, lba: u64, count: u64) -> Result<(), FatError> { #[cfg(all(feature = "sdw", not(feature = "sdw-ro")))] if sdhcpost_admits(site, lba, count) { return Ok(()); } // SDHCPOST (B155): the FIRST rung of the ladder. SDHCRW (B166, R59): it is now in EVERY default image and the extent rung below is what became exceptional. With the volume's posture `rw` the reserved extent is no longer THE writable set, so a bound that still admitted one extent would refuse every file verb sector by sector — the half-finished mutation `BlockSource::write_veto` exists to prevent, arriving one layer lower. The extent rung below is UNTOUCHED, line for line, and is still the whole gate whenever the posture is `ro` — which under R59 means the `sdw-ro` opt-out and the WP pin, not the shipped default. See §SDHCPOST at this file's tail.
     if in_reserved_extent(lba, count) {
         return Ok(());
     }
@@ -353,7 +355,7 @@ pub fn extent() -> (u64, u64) {
 /// [`permit_write`] (a FAT or directory sector is below `data_start` and therefore outside the
 /// extent by construction), so the counter's job is to make the ATTEMPT visible, which a refusal
 /// count alone would not distinguish from an out-of-range data write.
-pub fn note_fat_mutation(site: &str) { #[cfg(feature = "sdw-rw")] if sdhcpost_note_expected_mutation(site) { return; } // SDHCPOST (B155): on a volume the posture made WRITABLE, a FAT-table or directory RMW is what a file verb IS — it is EXPECTED, and counting it as the defect below would make the instrument cry wolf on every screenshot. It is counted separately and said separately; the defect line keeps its exact meaning for every `ro` build, which is all of them by default.
+pub fn note_fat_mutation(site: &str) { #[cfg(all(feature = "sdw", not(feature = "sdw-ro")))] if sdhcpost_note_expected_mutation(site) { return; } // SDHCPOST (B155): on a volume the posture made WRITABLE, a FAT-table or directory RMW is what a file verb IS — it is EXPECTED, and counting it as the defect below would make the instrument cry wolf on every screenshot. It is counted separately and said separately; the defect line keeps its exact meaning for every `ro` build, which is all of them by default.
     FAT_MUTATIONS.fetch_add(1, Ordering::Relaxed);
     if !MUTATION_ONCE.swap(true, Ordering::Relaxed) {
         serial_println!(
@@ -430,7 +432,7 @@ pub fn fnv1a(data: &[u8]) -> u32 {
 
 /// The closing tally. Printed by the reserve pass whatever the outcome, so "nothing happened" and
 /// "the pass did not run" are distinguishable in a capture.
-pub fn tally() { #[cfg(feature = "sdw-rw")] if sdhcpost_tally() { return; } // SDHCPOST (B155): the counter's NAME must name the command the card saw, so the two polarities print two lines and neither lies. `ro` build: the CMD24 loop below is the write path, and the line below is byte-for-byte the one every capture since 4c has carried. `sdw-rw` build: the path is CMD25, so `cmd24=` would be false and `sdhcpost_tally` prints `sectors=` instead. That is also why `knoboff sdw` can be byte-identical while the rename still lands.
+pub fn tally() { #[cfg(all(feature = "sdw", not(feature = "sdw-ro")))] if sdhcpost_tally() { return; } // SDHCPOST (B155): the counter's NAME must name the command the card saw, so the two polarities print two lines and neither lies. `ro` build: the CMD24 loop below is the write path, and the line below is byte-for-byte the one every capture since 4c has carried. DEFAULT build (SDHCRW, R59): the path is CMD25, so `cmd24=` would be false and `sdhcpost_tally` prints `sectors=` instead — so `sectors=` is what a plain `./arroyo test` capture carries now, and `cmd24=` is the opt-out's line.
     serial_println!(
         ":: SDHC4C: tally fat-mutations-on-sdhc={} permits={} refusals={} cmd24={} armed={} ::",
         FAT_MUTATIONS.load(Ordering::Relaxed),
@@ -443,7 +445,7 @@ pub fn tally() { #[cfg(feature = "sdw-rw")] if sdhcpost_tally() { return; } // S
 
 // ═══════ SDHCPOST (rmbp-ledger B155) — what a WRITABLE volume does to this module's argument ══════
 //
-// READ THE MODULE DOC FIRST: everything it says is true with `sdw-rw` OFF, which is every shipped
+// READ THE MODULE DOC FIRST: everything it says is true under the `sdw-ro` opt-out, which since R59 is NOT the shipped
 // build. This section is what changes when it is ON, and it is stated as a RETIREMENT rather than as
 // an exception, because two of 4c's load-bearing claims simply stop being true:
 //
@@ -474,28 +476,28 @@ pub fn tally() { #[cfg(feature = "sdw-rw")] if sdhcpost_tally() { return; } // S
 // WHAT IS HONESTLY LOST, and B155 is where Peter decides whether to pay it. FAT has no journal. A
 // power cut between the FAT write and the directory write leaves a cluster chain nothing points at;
 // a cut between two FAT copies leaves them disagreeing. 4c's reserve-once shape had NO exposure to
-// either, because it never touched a FAT or a directory sector at all. An `sdw-rw` boot has the
+// either, because it never touched a FAT or a directory sector at all. A DEFAULT (rw) boot has the
 // exposure of any FAT writer. That is the trade, it is not mitigated here, and it is why the knob
 // is opt-in and the DEFAULT posture is unchanged.
 
 /// SDHCPOST: does the volume's own POSTURE admit this span, ahead of the reserved-extent bound?
 ///
 /// Returns `true` only when `drivers::block::sdhc_writes_admitted()` says the mount is writable —
-/// i.e. `sdw-rw` is built, the write-protect pin read at mount said enabled, and the block layer has
+/// i.e. `sdw-ro` is NOT built, `sdw` is, the write-protect pin read at mount said enabled, and the block layer has
 /// a live write path. It is deliberately NOT a second copy of that decision: it asks the one
 /// definition, exactly as the `Default` arm of `BlockSource::write_veto` asks `default_writable()`.
 ///
 /// LBA 0 is refused here even so. No file verb can name the MBR — the volume lives inside a
 /// partition and `cluster_lba` cannot address below it — so this can only fire on a caller bug or a
 /// dishonest BPB, and a posture is not a licence to write the partition table.
-#[cfg(feature = "sdw-rw")]
+#[cfg(all(feature = "sdw", not(feature = "sdw-ro")))]
 fn sdhcpost_admits(site: &str, lba: u64, count: u64) -> bool {
     if count == 0 || lba == 0 || !crate::drivers::block::sdhc_writes_admitted() {
         return false;
     }
     if !RW_SAID.swap(true, Ordering::Relaxed) {
         serial_println!(
-            ":: SDHC4C: permit BYPASSED at {} lba={} count={} \u{2014} `sdw-rw` is built and the \
+            ":: SDHC4C: permit BYPASSED at {} lba={} count={} \u{2014} the posture is rw and the \
              posture says sdhc=rw, so the reserved-extent bound is NOT the gate this boot; the gate \
              is the mount posture (SDHCPOST) plus the block layer's bounds and the driver's \
              per-write WP/CSD gates (first, once) ::",
@@ -513,7 +515,7 @@ fn sdhcpost_admits(site: &str, lba: u64, count: u64) -> bool {
 /// arc's invariant says cannot happen" and must stay readable as that on every `ro` capture;
 /// `RW_MUTATIONS` means "a file verb did what a writable volume is for". Folding them would retire
 /// an instrument in order to avoid renaming it.
-#[cfg(feature = "sdw-rw")]
+#[cfg(all(feature = "sdw", not(feature = "sdw-ro")))]
 fn sdhcpost_note_expected_mutation(site: &str) -> bool {
     if !crate::drivers::block::sdhc_writes_admitted() {
         return false;
@@ -522,7 +524,7 @@ fn sdhcpost_note_expected_mutation(site: &str) -> bool {
     if !RW_MUTATION_SAID.swap(true, Ordering::Relaxed) {
         serial_println!(
             ":: SDHC4C: mutation expected on the Sdhc source at {} \u{2014} the volume's posture is \
-             rw (`sdw-rw`), so a FAT-table or directory RMW is a file verb doing its job, not the \
+             rw (R59 default; no `sdw-ro`), so a FAT-table or directory RMW is a file verb doing its job, not the \
              invariant breach the `!!` line reports on a read-only build (first, once) ::",
             site
         );
@@ -532,7 +534,7 @@ fn sdhcpost_note_expected_mutation(site: &str) -> bool {
 
 /// SDHCPOST: the rw half of the closing tally, printed beside 4c's own so a capture shows both the
 /// reserve-once accounting and the posture accounting without either line changing shape.
-#[cfg(feature = "sdw-rw")]
+#[cfg(all(feature = "sdw", not(feature = "sdw-ro")))]
 fn sdhcpost_tally() -> bool {
     serial_println!(
         ":: SDHC4C: tally fat-mutations-on-sdhc={} permits={} refusals={} sectors={} armed={} \
@@ -550,14 +552,14 @@ fn sdhcpost_tally() -> bool {
 }
 
 /// SDHCPOST: spans admitted by the POSTURE rather than by the reserved extent.
-#[cfg(feature = "sdw-rw")]
+#[cfg(all(feature = "sdw", not(feature = "sdw-ro")))]
 static RW_PERMITS: AtomicU32 = AtomicU32::new(0);
 /// SDHCPOST: FAT/directory RMWs accounted as EXPECTED. See [`sdhcpost_note_expected_mutation`].
-#[cfg(feature = "sdw-rw")]
+#[cfg(all(feature = "sdw", not(feature = "sdw-ro")))]
 static RW_MUTATIONS: AtomicU32 = AtomicU32::new(0);
 /// SDHCPOST: one-shot latch for the bypass witness.
-#[cfg(feature = "sdw-rw")]
+#[cfg(all(feature = "sdw", not(feature = "sdw-ro")))]
 static RW_SAID: AtomicBool = AtomicBool::new(false);
 /// SDHCPOST: one-shot latch for the expected-mutation witness.
-#[cfg(feature = "sdw-rw")]
+#[cfg(all(feature = "sdw", not(feature = "sdw-ro")))]
 static RW_MUTATION_SAID: AtomicBool = AtomicBool::new(false);

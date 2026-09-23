@@ -1010,10 +1010,29 @@ pub fn unpublish_usb_geometry(slot_id: u8, captured_gen: u64) -> bool {
 /// selector so `read_block` (and, since U9, `write_block`) route to `drivers::emmc2`. Called once, from
 /// the bare-metal BSP probe after a successful card init (`emmc2::probe`). aarch64 bare-metal only; x86
 /// never calls it, so its read/write path is byte-identical to the pre-M6g xHCI-only code.
+///
+/// SDHCRW (rmbp-ledger B166, R59, 2026-09-22): this is where the Pi's card SAYS its posture, and the
+/// site is chosen because it is the one call in this file that runs EXACTLY ONCE on a Pi boot and
+/// runs before any consumer — the same "at the mount" property the x86 truth table has, obtained
+/// from the call graph rather than from a latch. **The emmc2 write path itself did not change and
+/// needed no change: it is behind NO feature at all** (`write_block`'s `BACKEND_SD` arm routes
+/// straight to `emmc2::write_block_512`, and `emmc2` has issued CMD24 since U9), so R59's
+/// default-on half was already true on this board — worth saying out loud, because the rule "if the
+/// write path is behind a feature, that feature becomes default-on" has no work to do here. What
+/// was missing was the OTHER half of LAWS §3: a NAMED OPT-OUT. `sdw-ro` is it, and this line is how
+/// a `kernel8-test` capture reads which posture the image carries.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 pub fn register_sd(dev: BlockDeviceInfo) {
     *BLOCK_DEVICE.lock() = Some(dev);
     BACKEND.store(BACKEND_SD, Ordering::Release);
+    serial_println!(
+        ":: SDHCPOST: posture sdw-ro={} driver=emmc2 write-path=live -> sd={} reason={} (the Pi \
+         card's write path is behind no feature and never was; R59's opt-out is the only thing \
+         that refuses it \u{2014} SDHCRW, at the registration, once) ::",
+        if cfg!(feature = "sdw-ro") { 1 } else { 0 },
+        if cfg!(feature = "sdw-ro") { "ro" } else { "rw" },
+        if cfg!(feature = "sdw-ro") { "opt-out" } else { "none" }
+    );
 }
 
 /// USBFALL F1: one-shot latch for the fail-closed refusal witness, so a write-heavy caller that keeps
@@ -1060,9 +1079,15 @@ static SUBST_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 ///
 /// Byte-inert on a healthy SD boot: `BACKEND_SD` is set before the first FAT write, so this returns `Ok`
 /// without touching the console.
+///
+/// SDHCRW (B166, R59): `sdw-ro` is a SECOND, independent reason this can be `false`, and the two are
+/// deliberately not merged into one message — [`guard_default_write_backend`] below tests the
+/// opt-out FIRST and says `reason=opt-out`, because printing USBFALL's "no SD backend registered"
+/// over a boot whose card registered perfectly well and was simply asked to stay read-only is
+/// exactly the kind of misattributed refusal this file's one-definition rule exists to stop.
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 pub fn default_writable() -> bool {
-    BACKEND.load(Ordering::Acquire) == BACKEND_SD
+    !cfg!(feature = "sdw-ro") && BACKEND.load(Ordering::Acquire) == BACKEND_SD
 }
 
 // ===================== FRGUARD (GR21) — is the Default slot the medium we BOOTED from? ==============
@@ -1337,10 +1362,22 @@ fn guard_default_write_backend() -> Result<(), BlockError> {
     if default_writable() {
         return Ok(());
     }
+    // SDHCRW (B166, R59): the opt-out is tested BEFORE the substitution message, and the two reasons
+    // never share a line. They are not the same event and they do not send a reader to the same
+    // place: `opt-out` is a build the operator asked for, `no-sd-backend` is a card that failed to
+    // identify. The latch is shared because the rule ("say it once") is the same for both.
     if !SUBST_REFUSED.swap(true, Ordering::Relaxed) {
-        serial_println!(
-            ":: USBFALL: no SD backend registered — refusing Default WRITE (would land on the USB stick) ::"
-        );
+        if cfg!(feature = "sdw-ro") {
+            serial_println!(
+                ":: SDHCPOST: posture sdw-ro=1 driver=emmc2 -> sd=ro reason=opt-out \u{2014} \
+                 refusing Default WRITE; the card registered and this build was asked to keep it \
+                 read-only (SDHCRW, first, once) ::"
+            );
+        } else {
+            serial_println!(
+                ":: USBFALL: no SD backend registered — refusing Default WRITE (would land on the USB stick) ::"
+            );
+        }
     }
     Err(BlockError::NotReady)
 }
@@ -1813,7 +1850,7 @@ pub fn write_block_sdhc(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> {
 pub fn write_blocks_sdhc(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     let dev = sdhc_info().ok_or(BlockError::NotReady)?;
     let count = span_blocks(&dev, lba, buf.len())?;
-    let bs = dev.block_size as usize; #[cfg(feature = "sdw-rw")] if count > 1 && bs == SECTOR_BYTES { return write_blocks_sdhc_mb(lba, count, &buf[..count * bs]); } // SDHCPOST (B155): a COUNTED write is ONE CMD25, not `count` CMD24s — §SDHCPOST at this file's TAIL carries the measurement that decided it (a 15.5 MB capture is ~31,700 single-block writes against ~484 multi-block ones, because `fat::write_sectors` chunks at MAX_BLOCKS_PER_OP=64 and `sdhc::MB_MAX_BLOCKS` is 64 too). The loop below remains the single-sector path AND the whole of the `sdw`-off shape, byte for byte.
+    let bs = dev.block_size as usize; #[cfg(all(feature = "sdw", not(feature = "sdw-ro")))] if count > 1 && bs == SECTOR_BYTES { return write_blocks_sdhc_mb(lba, count, &buf[..count * bs]); } // SDHCPOST (B155): a COUNTED write is ONE CMD25, not `count` CMD24s — §SDHCPOST at this file's TAIL carries the measurement that decided it (a 15.5 MB capture is ~31,700 single-block writes against ~484 multi-block ones, because `fat::write_sectors` chunks at MAX_BLOCKS_PER_OP=64 and `sdhc::MB_MAX_BLOCKS` is 64 too). SDHCRW (B166, R59): this route now rides the DEFAULT x86 image — `sdw` is default-on and `sdw-ro` is the opt-out — so the counted write a file verb issues IS one CMD25 on a plain `./arroyo test`. The loop below remains the single-sector path AND the whole of the opt-out shape.
     for i in 0..count {
         write_block_sdhc(lba + i as u64, &buf[i * bs..(i + 1) * bs])?;
     }
@@ -1970,11 +2007,14 @@ static TEGRA_SD_WRITE_REFUSED: core::sync::atomic::AtomicBool = core::sync::atom
 /// as a readable block device must not become a fourth way past that ladder, so this entry point exists
 /// so the seam is total and fails CLOSED, not so that anything writes through it.
 #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-pub fn write_block_tegra_sd(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> { #[cfg(feature = "sdwrite")] { return tegra_sd_write_through(_lba, _buf); } #[cfg(not(feature = "sdwrite"))] { // SDWRITE (A60): the knob-off arm below is the pre-A60 body, byte-for-byte; the route above is the only addition.
+pub fn write_block_tegra_sd(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> { #[cfg(all(feature = "sdwrite", not(feature = "sdw-ro")))] { return tegra_sd_write_through(_lba, _buf); } #[cfg(any(not(feature = "sdwrite"), feature = "sdw-ro"))] { // SDWRITE (A60): the knob-off arm below is the pre-A60 body, byte-for-byte; the route above is the only addition. SDHCRW (B166, R59): the OPT-OUT takes the same arm, and it has to be HERE and not only in `tegra_sd_writes_admitted` — a posture that reported `ro` at the mount while this entry point still wrote would be two policies again, the exact drift A60's one-definition rule exists to stop. The refusal line below names which of the two it is.
     if !TEGRA_SD_WRITE_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
         serial_println!(
-            ":: SDMMC: WRITE refused at the block layer — the Orin card's only writer is the armed \
-             sdmmc_arm ladder in sdmmc_tegra.rs (first, once) ::"
+            ":: SDMMC: posture sdw-ro={} -> sd=ro reason={} \u{2014} WRITE refused at the block \
+             layer; the Orin card's only writer is the armed sdmmc_arm ladder in sdmmc_tegra.rs \
+             (first, once) ::",
+            if cfg!(feature = "sdw-ro") { 1 } else { 0 },
+            if cfg!(feature = "sdw-ro") { "opt-out" } else { "no-sdwrite" }
         );
     }
     // `NotReady` is the refusal code SDHC-4b's disarmed write twin returns for the same situation —
@@ -2503,9 +2543,17 @@ impl PartitionRange {
 /// arm forwards to it instead of stating a second policy, so the report and the behaviour cannot
 /// drift — which is exactly how the pre-A60 tree came to have a veto in `fat.rs` that only ECHOED a
 /// refusal living two layers down.
+///
+/// SDHCRW (rmbp-ledger B166, R59, 2026-09-22): the board-wide OPT-OUT reaches here too. R59 is
+/// *"read write"* **on every board**, and the corollary is that the one named escape must be the
+/// same name on every board — an operator arming a cold-witness boot should not have to learn a
+/// third spelling for the Orin. `sdwrite` stays default-on (A60, unchanged) and `sdw-ro`
+/// (`UNAOS_SDW_RO=1`) now vetoes on top of it. Still a `const fn` and still only `cfg!`: this
+/// driver's posture has no pin to read, so nothing here became a runtime question. UNFLOWN on the
+/// armed side and it stays that way — R39, no Orin QEMU exists; the leg that proves it is a compile.
 #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
 pub const fn tegra_sd_writes_admitted() -> bool {
-    cfg!(feature = "sdwrite")
+    cfg!(feature = "sdwrite") && !cfg!(feature = "sdw-ro")
 }
 
 /// SDWRITE: one 512-byte sector to the card, through the driver's unarmed CMD24 primitive.
@@ -2631,7 +2679,8 @@ const NATIVE_SDHC_VETO: &str = "the native root rides the internal SD reader, wh
                                 only inside the reserved flight-recorder extent (SDHC-4c)";
 #[cfg(all(feature = "sdwrite", target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
 const NATIVE_TEGRA_SD_VETO: &str = "the native root rides the microSD and this build refuses every \
-                                    write to it (UNAOS_NOSDWRITE=1 / no `sdwrite` feature)";
+                                    write to it (UNAOS_SDW_RO=1 opt-out, or UNAOS_NOSDWRITE=1 / no \
+                                    `sdwrite` feature)";
 
 // ══════════ AHCI (rmbp-ledger B89, first rung) — the SATA disks as their own registry ════════════
 //
@@ -3250,22 +3299,33 @@ pub fn write_sectors_granted(grant: &WriteGrant, lba: u64, buf: &[u8]) -> Result
 // (4b) and the reserved-extent permit (4c) were all in the image and all unreachable from a file
 // verb. This is the lift, and it is opt-in.
 //
-// THE POLARITY, and why it is this way round. `sdw-rw` is DEFAULT OFF, the opposite of A60's
-// `sdwrite`. The shipped configuration is therefore the pre-SDHCPOST refusal kept verbatim, and the
-// knob-on configuration is the new one — which is LAWS §5's default-quiet rule read straight: the
-// card in the bench rMBP's internal slot IS that machine's hard drive, and a build that makes the
-// boot volume writable by default is a decision about a journal-less FAT filesystem under a machine
-// that loses power, not a build flag. That decision is Peter's and B155 states it with its costs.
-// This section builds the MECHANISM for either answer and takes neither.
+// THE POLARITY — INVERTED BY SDHCRW (rmbp-ledger B166, R59, 2026-09-22), and this paragraph is the
+// whole of the change. B155 shipped `sdw-rw` DEFAULT OFF and said in as many words that the decision
+// was Peter's and not a build flag. He took it: RULINGS R59, verbatim, *"read write."* So the
+// shipped configuration is now the one that WRITES — `sdw` (4a/4b's ladder) rides the default x86
+// image, the posture is `rw`, and the refusal moved behind a NAMED OPT-OUT, `sdw-ro`
+// (`UNAOS_SDW_RO=1`), which is LAWS §3 read straight: default-on with a named opt-out, never opt-in.
+// The cost B155 priced — a journal-less FAT under a machine that loses power — is unchanged and is
+// now a cost the ruling accepts; the opt-out is what an operator arms for a cold-witness boot, and
+// it is the ONLY thing that restores the pre-SDHCPOST refusal.
+//
+// A NOTE ON WHAT PROVES IT, because the old proof inverts too. B155's claim was `./arroyo knoboff
+// sdw-rw` = "the knob-OFF image equals baseline". Under R59 the knob-OFF image IS the new rw default
+// and MUST differ from baseline — that is the ruling — so a knoboff verdict is not the proof here
+// and must not be quoted as one (LAWS §5). The proof is the REPLAY: the default image prints
+// `sdhc=rw` and writes, the `UNAOS_SDW_RO=1` image prints `sdhc=ro reason=opt-out` and refuses.
 //
 // THE THREE CONDITIONS, and why each is separate. `sdhc=rw` requires all three, and the reason a
 // refusal carries names WHICH one failed, because they fail for unrelated causes and send a reader
 // to three different places:
 //
-//   1. `sdw-rw` BUILT       — a posture is a build-time decision an operator made deliberately.
-//                             Without it this file compiles the `not(sdw-rw)` twin below, which is
-//                             today's answer returned from today's string, and `./arroyo knoboff
-//                             sdw-rw` measures that as byte-identity rather than as a claim.
+//   1. NO OPT-OUT, PATH BUILT — `sdw-ro` NOT built and `sdw` built. Both halves are condition 1
+//                             because both are build-time and both mean the same thing to a caller:
+//                             this image will not write the card. Either one compiles the refusing
+//                             twin below, which returns the CALLER'S OWN string and names itself
+//                             `opt-out` (the knob) or `no-write-path` (no 4a/4b ladder) on the wire.
+//                             `sdw` is default-on for x86 now, so in practice condition 1 is the
+//                             opt-out and nothing else.
 //   2. WP PIN says ENABLED  — Present State bit 19, read ONCE, AT MOUNT. This is deliberately NOT
 //                             the same read 4a/4b do: `write_block_512` and `write_blocks_512`
 //                             re-read the pin at the moment of EVERY write and keep doing so
@@ -3290,34 +3350,73 @@ pub fn write_sectors_granted(grant: &WriteGrant, lba: u64, buf: &[u8]) -> Result
 //
 // THE APPEND IS AT THE FILE TAIL, for the reason the SDWRITE section above gives: no
 // `core::panic::Location` line in `block.rs` moves, and the two in-file sites this section needed
-// (`write_blocks_sdhc`'s CMD25 route and `handle_write_veto`'s `Sdhc` arm) are LINE-NEUTRAL, so
-// `./arroyo knoboff sdw` and `./arroyo knoboff sdw-rw` can both come out byte-identical.
+// (`write_blocks_sdhc`'s CMD25 route and `handle_write_veto`'s `Sdhc` arm) are LINE-NEUTRAL. SDHCRW
+// keeps the append at the tail for the same reason, and keeps both sites line-neutral too — but see
+// the polarity note above: byte-identity is no longer what this section is measured by.
 
-/// SDHCPOST: the `sdw-rw`-OFF twin — condition 1 of the three failed, so the answer is today's
-/// answer, returned from the CALLER'S OWN string.
+/// SDHCPOST/SDHCRW: the REFUSING twin — condition 1 failed, so the answer is the pre-SDHCPOST
+/// refusal, returned from the CALLER'S OWN string.
 ///
-/// The string is a parameter rather than a constant here for a byte-identity reason that is also an
-/// honesty reason: the two callers print about two DIFFERENT mounts (`NATIVE_SDHC_VETO` is about the
-/// native root, `fs/fat.rs`'s is about a FAT volume) and a reader chasing a refusal must land on the
-/// layer that refused. Passing the string in means the knob-off image contains exactly the two
-/// strings and exactly the two `Some(…)` it contained before this arc, which is what lets
-/// `./arroyo knoboff sdw-rw` return 0 instead of a reasoned excuse.
+/// SDHCRW (B166, R59): this is now the EXCEPTIONAL build, not the shipped one. It compiles when
+/// `sdw-ro` is armed (the named opt-out) or when `sdw` is absent (no 4a/4b ladder, so there is no
+/// write path to admit anything to). It prints the truth table exactly as the admitting twin does —
+/// the same line, the same fields — because an operator who armed the opt-out and an operator whose
+/// image simply has no ladder need to read WHICH of the two they are looking at, and silence is not
+/// a reading. That is a deliberate departure from B155, where this twin was byte-silent to protect a
+/// byte-identity claim R59 retires.
 ///
-/// `#[inline(always)]`, not `#[inline]`: byte-identity is the gate, and a hint is not a gate.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", not(feature = "sdw-rw")))]
-#[inline(always)]
+/// The string is a parameter rather than a constant here for an honesty reason: the two callers
+/// print about two DIFFERENT mounts (`NATIVE_SDHC_VETO` is about the native root, `fs/fat.rs`'s is
+/// about a FAT volume) and a reader chasing a refusal must land on the layer that refused. Passing
+/// the string in also keeps ONE signature for both polarities, so neither caller carries a `cfg`.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", any(feature = "sdw-ro", not(feature = "sdw"))))]
 pub fn sdhc_write_veto(ro_reason: &'static str) -> Option<&'static str> {
+    // SDHCRW (B166): the SAME truth-table line the admitting twin prints, once per boot, so the two
+    // polarities are read off one vocabulary and the opt-out is a fact on the wire rather than the
+    // absence of one. `wp-pin=` and `write-path=` are `unread` here and say so: this twin refuses
+    // BEFORE condition 2, so claiming a pin reading it never took would be the lie the line exists
+    // to prevent.
+    if !SDHC_POSTURE_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(":: SDHCPOST: posture {} ::", SDHC_RO_TWIN_ROW);
+    }
     Some(ro_reason)
 }
 
-/// SDHCPOST: the armed twin — conditions 2 and 3, asked at the mount. `None` = an ordinary file
+/// SDHCRW (B166): the refusing twin's row as ONE CONTIGUOUS LITERAL per polarity, and the shape is
+/// forced by a GATE rather than chosen for looks.
+///
+/// `scripts/banner-cert.sh` certifies a feature by finding its witness token IN THE ARTIFACT with
+/// `LC_ALL=C grep -a -o -F` — a fixed string, not a regex — which is the whole reason it can catch a
+/// banner that names a feature the media does not carry. A `serial_println!` with `{}` in it does
+/// not put its rendered line anywhere: rustc splits the format string at each placeholder, so
+/// `sdw-ro=1` never exists as bytes and the row is uncertifiable. MEASURED on this arc: the first
+/// cut printed the two fields through `cfg!` and `./arroyo esp-x86` with `UNAOS_SDW_RO=1` came back
+/// `feature=sdw-ro witness=:: SDHCPOST: posture sdw-ro=1 wp-pin=unread hits=0 -> MISSING` — the
+/// gate correctly refusing to certify a line that is not in the binary.
+///
+/// `#[cfg]` and not `cfg!`, for the other half of the same gate: `cfg!` is a runtime false and
+/// compiles BOTH arms, so the opt-out row's bytes would sit in every default image and banner-cert
+/// would report a LEAK — a control string for a feature the banner did not name. One literal per
+/// polarity means the artifact carries exactly the row it can print.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw-ro"))]
+const SDHC_RO_TWIN_ROW: &str = "sdw-ro=1 wp-pin=unread write-path=unread -> sdhc=ro \
+                                reason=opt-out (condition 1 refused before the pin was read; R59 \
+                                made rw the default and THIS is the exception — SDHCPOST/SDHCRW, \
+                                first, once)";
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", not(feature = "sdw"), not(feature = "sdw-ro")))]
+const SDHC_RO_TWIN_ROW: &str = "sdw-ro=0 wp-pin=unread write-path=unread -> sdhc=ro \
+                                reason=no-write-path (this image carries no `sdw` CMD24/CMD25 \
+                                ladder at all, so there is nothing to admit a mutation to — \
+                                SDHCPOST/SDHCRW, first, once)";
+
+/// SDHCPOST: the ADMITTING twin — conditions 2 and 3, asked at the mount. `None` = an ordinary file
 /// mutation may reach the card; `Some(reason)` names which condition said no.
 ///
-/// `_ro_reason` is unused on purpose and is not a mistake to clean up: it is condition 1's answer,
-/// and condition 1 cannot fail in a build that compiled THIS twin (`sdw-rw` implies `sdw` in
-/// `Cargo.toml`). Keeping the parameter keeps ONE signature for both polarities, so neither caller
-/// carries a `cfg`.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw-rw"))]
+/// SDHCRW (B166, R59): this is the SHIPPED twin now. `_ro_reason` is unused on purpose and is not a
+/// mistake to clean up: it is condition 1's answer, and condition 1 cannot fail in a build that
+/// compiled THIS twin (`sdw` built, `sdw-ro` not). Keeping the parameter keeps ONE signature for
+/// both polarities, so neither caller carries a `cfg`.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw", not(feature = "sdw-ro")))]
 pub fn sdhc_write_veto(_ro_reason: &'static str) -> Option<&'static str> {
     sdhc_rw_gate()
 }
@@ -3326,7 +3425,7 @@ pub fn sdhc_write_veto(_ro_reason: &'static str) -> Option<&'static str> {
 /// callers that want the posture without a reason. Kept beside `tegra_sd_writes_admitted` in
 /// PURPOSE if not in position (position is the file tail, for byte-identity); unlike that one it
 /// cannot be `const fn`, because condition 2 is a PIN on a live controller and not a `cfg!`.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw-rw"))]
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw", not(feature = "sdw-ro")))]
 #[inline(always)]
 pub fn sdhc_writes_admitted() -> bool {
     sdhc_write_veto("").is_none()
@@ -3338,22 +3437,30 @@ pub fn sdhc_writes_admitted() -> bool {
 /// A latch rather than a live read, and that is the whole point of condition 2: a volume's posture
 /// must not change under an open file verb because someone brushed the slider mid-write. The LIVE
 /// read still exists and still refuses, one layer down, at every single CMD24 and CMD25.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw-rw"))]
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw", not(feature = "sdw-ro")))]
 static SDHC_WP_AT_MOUNT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-/// SDHCPOST: one-shot latch for the truth-table witness below.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw-rw"))]
+/// SDHCPOST: one-shot latch for the truth-table witness. SDHCRW (B166): shared by BOTH twins now —
+/// the refusing one prints the same line — so its cfg is the module's, not the posture's.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
 static SDHC_POSTURE_SAID: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// SDHCRW (B166): a SECOND, independent one-shot for the pre-card question — see [`sdhc_rw_gate`]'s
+/// PRE-CARD note. It must not be the same latch as [`SDHC_POSTURE_SAID`]: if one question could
+/// consume the other's line, the boot that mattered would be the one with no row.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw", not(feature = "sdw-ro")))]
+static SDHC_NOPATH_SAID: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// SDHCPOST: condition 2's refusal.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw-rw"))]
-const SDHC_RW_WP_VETO: &str = "the internal SD reader is mounted READ-ONLY (reason=wp-protected) \
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw", not(feature = "sdw-ro")))]
+const SDHC_RW_WP_VETO: &str = "the internal SD reader is mounted READ-ONLY (reason=wp-pin) \
                                \u{2014} the write-protect pin read at MOUNT says the card is \
-                               locked (Present State bit 19 clear), and `sdw-rw` does not overrule \
-                               the slider";
+                               locked (Present State bit 19 clear), and R59's rw default does not \
+                               overrule the slider";
 /// SDHCPOST: condition 3's refusal.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw-rw"))]
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw", not(feature = "sdw-ro")))]
 const SDHC_RW_NOPATH_VETO: &str = "the internal SD reader is mounted READ-ONLY \
                                    (reason=no-write-path) \u{2014} no card geometry is published \
                                    on this handle, so there is nothing to bound an LBA against and \
@@ -3361,21 +3468,61 @@ const SDHC_RW_NOPATH_VETO: &str = "the internal SD reader is mounted READ-ONLY \
 
 /// SDHCPOST: THE DECISION, and the only place conditions 2 and 3 are stated.
 ///
-/// The pin is read on the FIRST posture question of the boot, which IS the mount: `FatBackend::new_source`
-/// asks `read_only()` while binding, and `fs::bootdisk`'s HOMESOIL census asks `write_veto()` for
-/// every source as the volume walk runs. Nothing asks earlier, so "read at mount" is a fact about
-/// the call graph rather than a call this function had to place by hand in a boot path.
+/// The pin is read on the first posture question of the boot THAT HAS A LIVE WRITE PATH, which IS
+/// the mount: `FatBackend::new_source` asks `read_only()` while binding, and `fs::bootdisk`'s
+/// HOMESOIL census asks `write_veto()` for every source as the volume walk runs.
+///
+/// ### PRE-CARD: the qualifier above is SDHCRW's, and a measured boot is why it is there
+///
+/// B155's doc said "the FIRST posture question of the boot, which IS the mount — nothing asks
+/// earlier". **Something does, and it is a FIXTURE.** `fs::bootdisk::sdwrite_posture_selftest` (leg
+/// 8, the `:: SDWRITE-POSTURE:` line) drives `write_veto` over EVERY source in `fat::ALL_SOURCES`
+/// deliberately — that is its whole value — and on x86 it runs before `drivers::sdhc` registers the
+/// card. B155 never saw it because with `sdw-rw` default OFF this function did not exist in a
+/// shipped build; R59's flip ran it for the first time, and the first default replay read:
+///
+/// ```text
+/// :: SDHCPOST: posture sdw-ro=0 wp-pin=PROTECTED write-path=ABSENT -> sdhc=ro reason=wp-pin ::
+/// :: SDWRITE-POSTURE: posture=on … sdhc=ro card=absent … :: PASS ::
+/// … (14 lines later) :: SDHCBLK: registered internal SD card as block handle Sdhc … ::
+/// ```
+///
+/// `card_write_protected()` answers `None` with no mapped controller, the gate fails CLOSED and
+/// reads that as PROTECTED — correct in isolation, and the latch then froze it for the boot. The
+/// card's pin in that same boot says ENABLED (`:: sdhc: w1 … wp_sw=1 … -> PASS ::`), so the volume
+/// would have stayed read-only on every default image for a reason the hardware never gave.
+///
+/// THE FIX IS AN ORDERING FIX, NOT A LOOSENING, and it is condition 3 doing its job: with no live
+/// write path the answer is `no-write-path` — which was always the honest name for "there is no
+/// card here yet" — and the function takes NEITHER latch on that path. Nothing is admitted that was
+/// not admitted before: the pre-card question still refuses. What changes is that it no longer
+/// ANSWERS FOR the mount that has not happened. The pin's fail-closed reading is untouched and
+/// still applies the moment a controller is mapped.
 ///
 /// The truth table is printed ONCE, whatever the verdict — including when the verdict is `ro`,
-/// because an operator who armed both knobs and still got a read-only card needs the row that says
-/// which condition refused, not the absence of a line.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw-rw"))]
+/// because an operator on a DEFAULT image who still got a read-only card needs the row that says
+/// which condition refused, not the absence of a line. SDHCRW (B166): the refusing twin above prints
+/// the same line for the same reason, so the vocabulary is one and `sdhc=rw` / `sdhc=ro` is a token
+/// an artifact grep finds in either polarity. The pre-card question gets its own row and its own
+/// one-shot, so a boot whose card never registers still says so exactly once.
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw", not(feature = "sdw-ro")))]
 fn sdhc_rw_gate() -> Option<&'static str> {
     use core::sync::atomic::Ordering;
-    // Condition 3 first only in the sense of being cheapest; the REPORTED reason follows the
-    // truth table's own order (sdw-off, wp-protected, no-write-path), which is why the verdict
-    // below tests the pin before the path.
-    let path_live = sdhc_info().is_some();
+    // SDHCRW (B166): condition 3 is tested FIRST and is now a hard early return — see the PRE-CARD
+    // note above. Before the card registers there is no pin to read and no mount to answer for, so
+    // this arm reads no pin, takes no latch, and cannot decide the boot.
+    if sdhc_info().is_none() {
+        if !SDHC_NOPATH_SAID.swap(true, Ordering::Relaxed) {
+            serial_println!(
+                ":: SDHCPOST: posture sdw-ro=0 wp-pin=unread write-path=ABSENT -> sdhc=ro \
+                 reason=no-write-path (asked BEFORE the card registered — typically \
+                 `sdwrite_posture_selftest` leg 8, which drives every source on purpose; NOTHING \
+                 is latched here and the mount answers for itself — SDHCRW, first, once) ::"
+            );
+        }
+        return Some(SDHC_RW_NOPATH_VETO);
+    }
+    let path_live = true;
     let mut wp = SDHC_WP_AT_MOUNT.load(Ordering::Acquire);
     if wp == 0 {
         // `None` (no mapped controller) is PROTECTED, not unknown: this gate fails closed, in the
@@ -3396,9 +3543,9 @@ fn sdhc_rw_gate() -> Option<&'static str> {
     };
     if !SDHC_POSTURE_SAID.swap(true, Ordering::Relaxed) {
         serial_println!(
-            ":: SDHCPOST: posture sdw-rw=1 wp-pin={} write-path={} -> {} reason={} (the pin is \
-             read ONCE, at the mount; 4a/4b re-read it at every write \u{2014} SDHCPOST, first, \
-             once) ::",
+            ":: SDHCPOST: posture sdw-ro=0 wp-pin={} write-path={} -> {} reason={} (the pin is \
+             read ONCE, at the mount; 4a/4b re-read it at every write \u{2014} SDHCPOST/SDHCRW, \
+             first, once) ::",
             match wp {
                 1 => "enabled",
                 _ => "PROTECTED",
@@ -3412,7 +3559,7 @@ fn sdhc_rw_gate() -> Option<&'static str> {
             match (wp, path_live) {
                 (1, true) => "none",
                 (1, false) => "no-write-path",
-                _ => "wp-protected",
+                _ => "wp-pin",
             }
         );
     }
@@ -3440,7 +3587,7 @@ fn sdhc_rw_gate() -> Option<&'static str> {
 /// Bounds are re-checked here against the published geometry even though the driver checks them
 /// again against the card's own capacity, for the reason [`tegra_sd_write_through`] gives: this
 /// function names an LBA to a medium and must not depend on a caller's care.
-#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw-rw"))]
+#[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw", not(feature = "sdw-ro")))]
 pub fn write_blocks_sdhc_mb(lba: u64, count: usize, buf: &[u8]) -> Result<(), BlockError> {
     let dev = sdhc_info().ok_or(BlockError::NotReady)?;
     if count == 0 || count > crate::drivers::sdhc::MB_MAX_BLOCKS as usize {

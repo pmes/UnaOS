@@ -1468,33 +1468,47 @@ sdwritefx = ["sdwrite", "sdmmc"]
 # the `armed=` field on the wire is what catches a knob wired into `arroyo` but not into
 # `builder/src/main.rs`, and a dry run answers "would arming this write, and where" without writing.
 # x86_64 only; aarch64 media are byte-identical. See docs/dev/OS/07_USB_STORAGE/sdhc.md §SDHC-4a.
+#
+# SDHCRW (rmbp-ledger B166, R59, 2026-09-22) — **THIS FEATURE IS NO LONGER OPT-IN.** Peter's ruling on
+# the boot volume's default posture is *"read write."*, and LAWS §3 reads default-on with a named
+# opt-out, never opt-in. So `arroyo` and `builder/src/main.rs` both append `sdw` to every x86 build
+# unconditionally: a plain `./arroyo test` boots a kernel that CAN write its card, and the paragraph
+# above ("no CMD24 command word exists anywhere in a default image") is now a statement about the
+# PRE-R59 tree, kept because it is the thing that changed. `UNAOS_SDW=1` is still accepted and still
+# means "on", so existing playbooks keep working — it just no longer decides anything. The named
+# opt-out is `sdw-ro` below, and it changes the POSTURE, not this ladder: an opt-out image still
+# carries CMD24/CMD25 and still refuses, with `reason=opt-out` on the wire, which is the honest
+# shape (a refusal an operator asked for, not a capability the image lacks).
 sdw = []
 
-# SDHCPOST (rmbp-ledger B155, x86): `UNAOS_SDW_RW=1` lifts the internal SD card's FAT mount from
-# READ-ONLY to READ-WRITE — the posture half of milestone 4b that SDHCWRITE correctly refused to
-# build from the files it was given. The answer has ONE definition, `drivers::block::sdhc_write_veto`
-# (§SDHCPOST at that file's tail), and BOTH readers forward to it: `fat::BlockSource::write_veto`'s
-# `Sdhc` arm and `block::handle_write_veto`'s, which is what makes leg 8 of
-# `fs::bootdisk::sdwrite_posture_selftest` agree by construction rather than by two arms being kept
-# in step. `rw` needs all THREE of: this feature built, the write-protect PIN read at MOUNT saying
-# enabled, and a live block-layer write path — and a refusal names which of the three said no
-# (`sdw-off` / `wp-protected` / `no-write-path`), on a truth-table line printed once at the mount.
+# SDHCRW (rmbp-ledger B166, R59, 2026-09-22): `UNAOS_SDW_RO=1` — **the NAMED OPT-OUT of R59's
+# read-write default, on every board.** It is the inversion of SDHCPOST's `sdw-rw` (B155), which was
+# opt-in and default OFF; B155 said in as many words that the polarity was Peter's decision and not a
+# build flag, and R59 is that decision: *"read write."*
 #
-# IMPLIES `sdw`, and that is not convenience: without 4a/4b's ladder the image carries no CMD24 and
-# no CMD25 word at all, so a "writable" volume would admit a mutation to a path that cannot write a
-# byte — `rw=yes` over a refusing stub, which is the exact failure A60 built its one-posture rule to
-# stop. It also RETIRES two of SDHC-4c's published claims for the duration of the boot (the closed
-# writable set, and "the card has no FAT mutator"): `fs/sdhc4c.rs` §SDHCPOST says so in those words,
-# because a file verb on a writable volume IS a FAT mutator and FAT has no journal.
+# The mechanism B155 built is untouched and only its default moved. The answer still has ONE
+# definition, `drivers::block::sdhc_write_veto` (§SDHCPOST at that file's tail), and BOTH readers
+# still forward to it: `fat::BlockSource::write_veto`'s `Sdhc` arm and `block::handle_write_veto`'s,
+# which is what makes leg 8 of `fs::bootdisk::sdwrite_posture_selftest` agree by construction rather
+# than by two arms being kept in step. `sdhc=rw` still needs all THREE of: NO opt-out and a built
+# `sdw` ladder, the write-protect PIN read at MOUNT saying enabled, and a live block-layer write
+# path — and a refusal still names which said no, now spelled `opt-out` / `no-write-path` /
+# `wp-pin`, on a truth-table line printed once at the mount BY EITHER POLARITY.
 #
-# DEFAULT OFF, deliberately and not provisionally. The bench rMBP boots from this card, so making it
-# writable by default is a decision about power-cut exposure on a journal-less filesystem, not a
-# build flag — rmbp-ledger B155 states it with its costs and it is Peter's. Default OFF => the
-# `not(sdw-rw)` twin of `sdhc_write_veto` compiles, which returns its caller's own string and nothing
-# else, so both readers are byte-for-byte their pre-SDHCPOST selves (`./arroyo knoboff sdw-rw`).
-# x86_64 only; aarch64 media byte-identical (stripped by arroyo's `arm_features`, like `sdw`).
-# Kept in sync with arroyo and builder/src/main.rs.
-sdw-rw = ["sdw"]
+# NO `["sdw"]` IMPLICATION, and that is the one structural difference from `sdw-rw`. B155's feature
+# ARMED a write path and so had to imply the ladder that could carry it. This one REFUSES, and a
+# refusal needs no ladder — implying `sdw` from it would drag the x86 CMD24/CMD25 code into the
+# aarch64 feature closure for a knob whose whole job there is to stop writes.
+#
+# NOT x86-only, and NOT stripped by arroyo's `arm_features` — the opposite of `sdw` and of B155's
+# `sdw-rw`. R59 is "on every board", so the escape has to be one name on every board: `sdw-ro` also
+# vetoes `block::tegra_sd_writes_admitted` (the Orin's A60 `sdwrite` posture) and the Pi's
+# `default_writable` / `guard_default_write_backend` (emmc2, whose write path is behind no feature
+# at all and never was). An operator arming a cold-witness boot types the same knob on all three.
+# aarch64 media are therefore NOT byte-identical across this knob, by design.
+#
+# Kept in sync with arroyo, builder/src/main.rs, scripts/banner-cert.sh and scripts/k8-reach.registry.
+sdw-ro = []
 
 # SDHC-4b (GR20, x86): `UNAOS_SDHCBLK=1` makes the INTERNAL SD card a real block backend, so `fs::fat`
 # can mount it. Boot AC identified the card and Boot AD wrote to it, but nothing above `drivers/sdhc.rs`

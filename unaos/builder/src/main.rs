@@ -225,15 +225,23 @@ fn main() {
     // print `armed=0 ... -> DRYRUN` on a run the operator armed, and (had the field not been on the
     // wire) would have looked like a card that refused. The `armed=` field exists for exactly this,
     // and it is what caught the same omission in WXN-M3b. Kept in sync with arroyo's mapping.
-    if std::env::var("UNAOS_SDW").is_ok() { feats.push("sdw"); }
-    // SDHCPOST (B155): UNAOS_SDW_RW=1 lifts the internal SD card's FAT mount from READ-ONLY to
-    // READ-WRITE — the POSTURE half of milestone 4b, and the half flight 11's screenshot needed.
-    // Mapped HERE as well as in arroyo for the reason the `sdw` line above spells out, and this knob
-    // is the most consequential case of it in the tree so far: mapped in arroyo alone, a boot would
-    // print `sdhc=ro` and refuse the capture on a run the operator armed, which reads exactly like a
-    // card that said no. The truth-table line (`:: SDHCPOST: posture sdw-rw=1 … ::`) exists for the
-    // same reason `armed=` does — it is what catches this omission instead of the operator doing it.
-    if std::env::var("UNAOS_SDW_RW").is_ok() { feats.push("sdw-rw"); }
+    // SDHCRW (rmbp-ledger B166, R59, 2026-09-22): DEFAULT-ON now — R59 is "read write" and LAWS §3 is
+    // default-on with a named opt-out, so the ladder rides every x86 MEDIA image, not only a knobbed
+    // one. Unconditional rather than `UNAOS_NOSDW`-guarded on purpose: the opt-out is a POSTURE knob
+    // (`sdw-ro` below), and an image that lost the ladder as well would refuse with
+    // `reason=no-write-path` — "this build cannot write" — when the truth is "this build was told
+    // not to". A default-on name missing HERE is the `sdwrite` class, which `scripts/knob-parity.sh`
+    // reds on; UNAOS_SDW=1 remains accepted upstream in arroyo and simply decides nothing now.
+    feats.push("sdw");
+    // SDHCRW (rmbp-ledger B166, R59): UNAOS_SDW_RO=1 — the NAMED OPT-OUT, the inversion of B155's
+    // UNAOS_SDW_RW. Mapped HERE as well as in arroyo for the reason the `sdw` line above spells out,
+    // and this knob is the most consequential case of it in the tree: mapped in arroyo alone, an
+    // operator arming a COLD-WITNESS boot on metal would get a banner saying `sdw-ro` and a card
+    // that writes — the exact inverse of B155's worry and a worse one, because the failure is a
+    // mutation that happened rather than a capture that did not. The truth-table line
+    // (`:: SDHCPOST: posture sdw-ro=… ::`) prints in BOTH polarities so this omission is caught on
+    // the wire instead of on the card.
+    if std::env::var("UNAOS_SDW_RO").is_ok() { feats.push("sdw-ro"); }
     // SDHC-4b (GR20): UNAOS_SDHCBLK=1 makes the INTERNAL SD card a real x86 block backend, published
     // under its OWN registry handle (`BlockHandle::Sdhc`) so `fs::fat` can mount it READ-ONLY without
     // the boot volume — the USB stick this machine boots from — moving at all. THIS list is what

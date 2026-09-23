@@ -95,9 +95,18 @@
 //! itself on serial when it refuses. They are layered so that the OUTERMOST is a compile-time
 //! decision and the innermost is evidence read off the card in this boot:
 //!
-//! 1. **The build gate.** [`write_block_512`] is `#[cfg(feature = "sdw")]` (`UNAOS_SDW=1`). Without
-//!    it the function does not exist, no CMD24 word is assembled anywhere in the image, and every
-//!    existing build — every media anyone has ever booted — is byte-identical on the card side.
+//! 1. **The build gate.** [`write_block_512`] is `#[cfg(feature = "sdw")]`. Without it the function
+//!    does not exist and no CMD24 word is assembled anywhere in the image.
+//!    **SDHCRW (rmbp-ledger B166, R59, 2026-09-22): `sdw` IS NOW DEFAULT-ON and this gate no longer
+//!    separates a shipped image from an armed one.** Peter's ruling on the boot volume's posture is
+//!    *"read write."*, so `arroyo` and `builder/src/main.rs` both append `sdw` to every x86 build;
+//!    `UNAOS_SDW=1` is still accepted and decides nothing. The sentence this bullet used to end
+//!    with — "every existing build, every media anyone has ever booted, is byte-identical on the
+//!    card side" — was true of the pre-R59 tree and is kept here as the thing that changed. Gates
+//!    2-4 below are UNCHANGED and are now the whole of what stands between a boot and a written
+//!    sector, which is why they are read more carefully than they were. The POSTURE (may a FILE
+//!    VERB reach the card at all) is a different question one layer up, answered once at the mount
+//!    by `drivers::block::sdhc_write_veto`, whose named opt-out is `sdw-ro` (`UNAOS_SDW_RO=1`).
 //! 2. **The physical switch.** Present State bit 19 ([`PS_WRITE_PROTECT`], *inverted* sense:
 //!    1 = write ENABLED), re-read at the moment of the write rather than trusted from bring-up.
 //! 3. **The card's own CSD.** `PERM_WRITE_PROTECT` (CSD[13]) and `TMP_WRITE_PROTECT` (CSD[12]),
