@@ -2278,3 +2278,56 @@ on the three captures above:
 **Legitimately updated** by re-pinning a line together with the kernel line it pins, in the same
 commit (each spec's CONTRACT block). A line that stops printing on a QEMU lane on purpose moves to
 the metal table here, with its reason.
+
+**The metal pins (METALPINS, rmbp-ledger B195, 2026-09-23).** The rows the tables above leave to "the metal
+capture" are now directives in `x86-witness.spec`'s METALPINS block (`:1507`-`:1680`, tail-inserted above its
+CONTRACT block), one per row of flight 12's score card (`docs/dev/evidence/rmbp-0915/flight12/FLIGHT12.md`)
+where a directive can honestly stand. Measured by replaying the WHOLE file on read-only copies of two captures —
+flight 12 (image 4, `6d8d3d2d`, `f12-boot1.log`, 6899 lines) and flight 11 (image 3, `56bbe53b`, `f11.log`, 5597
+lines) — with `./arroyo mbench --replay <copy> --spec scripts/specs/x86-witness.spec --platform x86`. Whole-file
+verdicts, before → after: flight 12 `37/42, 19 forbidden` → `60/65, 20 forbidden` (the five shortfalls and 19 hits
+that remain are M1's, classified in `docs/dev/evidence/rmbp-0915/metalpins/M1-BASELINE.md`; the one new hit is the
+boot-mouse row, red on purpose); flight 11 `36/42, 18` → `38/65, 23`. Neither capture passes the file, and neither
+should: both flights carried defects. Go-red kinds: **B** = behaviour (both images print the family, flight 11
+took the failing arm), **G** = generation (image 3 cannot print the line; `git grep -F` at `56bbe53b` empty — the
+fourth minimum-generation floor of that file, `6d8d3d2d`), **M** = the row does not separate the two flights and
+was taken red by mutation of a COPY of flight 12 (`m2-mutations.txt`).
+
+| pin | spec line | flight 12 | flight 11 | discriminates | green certifies |
+|---|---|---|---|---|---|
+| `:: BOOTCLOCK: firmware->loader=…` | `:1543` COUNT 1 | 1 hit | 1 hit | no (M: line deleted → `59/65`) | the loader-to-kernel clock line is on the wire (values not pinned) |
+| `:: BPACE: pci-scan … d=\d{1,2}ms ::` + FORBID `d=\d{3,}ms` | `:1548`, `:1549` | 2 hits `d=0ms`; FORBID 0 | 0; FORBID 2 (`d=1315ms`) | yes, B | B152: the PCI scan costs under 100 ms (d=99 green, d=100 red on a copy) |
+| `[vectors] allocated= … ehci:0x43,spurious:0xff == witness ::` | `:1553` | 1 (line 5) | 0 | yes, G | B168: the first vector table is exactly timer/xhci/nic/ipi/ehci/spurious |
+| `[ioapic] census ioapics=1 … gsis=24` | `:1559` | 1 | 0 | yes, G (`UNAOS_IOAPIC`) | B147: one I/O APIC, 24 GSIs, nothing dropped from the MADT |
+| `[ioapic] id= addr=0xfec00000 … entries=24` | `:1560` | 1 | 0 | yes, G | the I/O APIC answered its version read at the firmware address |
+| `:: EHCI-HID: ISRARM self-test … -> PASS` + FORBID `SKIPPED` | `:1566` COUNT 1, `:1567` | 1; 0 | 1; 0 | no (M: `-> FAIL` flip → `59/65` and 21 hits; SKIPPED injected → 1 hit) | B146/B154's completion-interrupt fixture ran and passed on metal |
+| `:: EHCI-HID: PASSPERIOD self-test … -> PASS` | `:1568` | 1 | 0 | yes, G (SPECPINS2's measurement) | B146's pass-period census fixture ran and passed |
+| `[sertx] prints= … taps_us_max= tap_max=` | `:1573` | 35 | 0 | yes, G | the serial-transport census is on the metal wire (values not pinned) |
+| `[tp] mode wrote= … latched=yes` | `:1574` | 1 | 0 | yes, G | the bcm5974 mode switch read back latched |
+| `:: SDHCPOST: posture sdw-ro=0 wp-pin=enabled write-path=live -> sdhc=rw reason=none` | `:1582` | 1 | 0 | yes, G | R59: the mount's truth table admits writes |
+| `:: SDHCBLK: FAT mounted READ-WRITE on the internal SD card` | `:1583` | 1 | 0 (`READ-ONLY`) | yes, B | R59/B166: the card's FAT mounted read-write |
+| FORBID `:: SDHCPOST: posture .*reason=opt-out` | `:1592` | 0 | 0 | no (M: `block.rs:3402`'s literal injected → 1 hit) | the capture is the shipped polarity; the knob's value (`sdw-ro=1`) is on the matched line itself, so no MANIFEST is needed |
+| `[menubar] first-paint … after_enable_ms=\d … crystal=drawn` | `:1598` | 1 (`after_enable_ms=0`) | 0 | yes, G | B156: the bar's first paint lands within 9 ms of enable with the crystal drawn (12 ms red on a copy) |
+| `[wc-x] desktop-app HOLD-NONE … held_ms=0` + FORBID `HOLD-EXPIRED` | `:1603`, `:1604` | 1; 0 | 0; 1 (`waited=15005ms`) | yes, G + B | B167: the desktop app launches unheld; HOLD-EXPIRED has no emitter at `6d8d3d2d`, so the FORBID is a revert guard |
+| `[status] poll n= answered=[1-9]` | `:1609` | 6 | 0 | yes, G | B170: the SMC answered the poll (QEMU reads `answered=0`) |
+| `[menubar] battery pct= … src=smc` | `:1610` | 76 | 0 | yes, G | the bar's battery model is fed by the pack |
+| `:: DMG-REFUSE: … 19/19 probes … witness OK ::` + FORBID `NOT RUN` | `:1615`, `:1616` | 1; 0 | 0; 1 | yes, B | B172: all 19 refusal probes agreed on metal |
+| `:: KEYMAP: table=crispy … -> PASS ::` | `:1619` | 1 | 0 | yes, G | B163: the chord table resolved on the flown image |
+| `[login] screen open window= box=` | `:1629` OPTIONAL | 1 (8358 ms) | 0 (no `UNAOS_LOGIN`) | never fails, by design | nothing — R63: a REQUIRE reds every boot from 13 on; a FORBID reds the Log Out R63 asks for (same emitter, `video/login.rs:501`) |
+| `:: DOCKID: … reconciled= folds= :: PASS ::` | `:1635` | 1 | 0 (`order=false set=false … FAIL`) | yes, B | B165: the dock's identity reconciled |
+| `[dmgovlp] verdict … -> PASS` | `:1636` | 1 | 0 (`-> FAIL`) | yes, B | the damage-overlap verdict passed |
+| `:: PRTSCR-DIR-FIX: no session -> REFUSED … -> PASS ::` | `:1637` | 1 | 0 | yes, G | R54: no session, no capture written |
+| `:: HDA-TONE: … -> PASS ::` | `:1641` | 1 | 0 (`-> FAIL`) | yes, B (knob on both) | the output stream ran (audibility not claimed) |
+| `:: kepler: vblank selftest … sim=timer … :: PASS ::` | `:1646` | 1 | 0 | yes, G (`UNAOS_KEPLER_VBLANK`) | B179: the vblank wait returns within a frame on an advancing counter |
+| `:: kepler: vblank selftest … sim=stuck … :: GO-RED-OK ::` | `:1647` | 1 | 0 | yes, G | the wait gives up on a stuck counter within its budget |
+| FORBID `[serial] dropped \d+ lines` | `:1658` | 0 | 0 | no (M: injected → 1 hit) | nothing on this machine today: no 16550, the staging ring is inert (`arch/x86_64/serial.rs:30-41`) |
+| FORBID `:: SERWIT-2 tap \w+: .* dropped=[1-9]` | `:1659` | 0 | 0 | no (M: `dropped=3` → 1 hit) | the FTDI tap lost no line — the metal-reachable form of the same law |
+| FORBID `STOP-NOTE interrupt endpoint halted .* kind=boot-mouse` | `:1669` | **1 — RED ON PURPOSE** | 1 | no: both flights had the dead pointer | MOUSEHALT's flight-13 gate: the boot-mouse endpoint survived the boot |
+
+Not pinned, with the reason in the block's last paragraph: the vblank period; `pmc-arm … reason=no-vector-helper`
+and `[ioapic] route … REFUSED reason=no-firmware-line` (the current rung's stated limit); ISRARM's stale `no IOAPIC
+in this kernel` sentence (true on image 3, false on image 4, and the grammar cannot condition one line on another);
+the login screen's focus and the absent `[users]` line (LOGIN13's). `GATE STOLEN` and `REHOMED the render role` were
+already FORBIDden (`:1455`, `:1456`, SPECPINS) and are not repeated. The four PENDINGs SPECPINS added (`:1477`-`:1505`)
+all MATCH flight 11 — the promotion condition it wrote — but `band=menubar` has 0 hits on flight 12 because the login
+window took the press, so promoting it to REQUIRE would red flight 12 for the voided reason; left to the seat.

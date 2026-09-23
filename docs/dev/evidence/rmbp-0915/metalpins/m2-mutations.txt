@@ -1,0 +1,144 @@
+# METALPINS go-red by mutation — each row a COPY of f12-boot1.log with ONE change, replayed with the amended x86-witness.spec
+# (from unaos/: ./arroyo mbench --replay <copy> --spec scripts/specs/x86-witness.spec --platform x86). Green reference: 60/65, 20 forbidden.
+# Each section: the capture diff (f12 < > copy), then the verdict diff (green < > mutated; line numbers and scan counts elided).
+
+== m1-bootclock-deleted
+68d67
+< [    116ms] :: BOOTCLOCK: firmware->loader=13311ms loader-read=741ms loader-jump=20ms kernel-entry=37913139191 tsc_hz=2693862425(measured) ::
+   <   ✅ COUNT>=1   :: BOOTCLOCK: firmware->loader=\d+ms loader-read=\d+ms loader-jump=\d+ms kernel-entry=\d+ tsc_hz=\d+
+   <        1 hit(s), first 
+   >   ❌ COUNT>=1   :: BOOTCLOCK: firmware->loader=\d+ms loader-read=\d+ms loader-jump=\d+ms kernel-entry=\d+ tsc_hz=\d+
+   >        0 hits — MISSING (pinned at x86-witness.spec:1543)
+   <   ❌ MBENCH FAIL — 60/65 required witnesses, 20 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   >   ❌ MBENCH FAIL — 59/65 required witnesses, 20 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   <        (4 further pinned line(s) also short — full table above)
+   >        (5 further pinned line(s) also short — full table above)
+   verdict: ════════════ MBENCH VERDICT — x86-witness.spec vs /home/pmes/unaos-bench/scratch/rmbp-0915/metalpins-logs/mut/m1-bootclock-deleted.log ════════════
+   verdict:   ❌ MBENCH FAIL — 59/65 required witnesses, 20 forbidden hit(s), 6898 lines scanned, pending 3/4 matched [mode unknown: no run sidecar]
+
+== m2-israrm-fail
+368c368
+< [    295ms] :: EHCI-HID: ISRARM self-test: modes=2 (overlay-direct + qTD-chain) depth=8 fifo=true payload=true rearm=true toggle=true ringfull-refuses=true -> PASS == witness ::
+---
+> [    295ms] :: EHCI-HID: ISRARM self-test: modes=2 (overlay-direct + qTD-chain) depth=8 fifo=true payload=true rearm=true toggle=true ringfull-refuses=true -> FAIL == witness ::
+   >   ❌ FORBID hit : [    295ms] :: EHCI-HID: ISRARM self-test: modes=2 (overlay-direct + qTD-chain) depth=8 fifo=true payload=true rearm=true toggle=true ringfull-refuses=true -> FAIL == witness ::
+   <   ❌ FORBID hit : [  48497ms] [clickroute] route hit=true deliver=false depth=0/0 kernel=false desktop=false nofab=true deflect=true -> FAIL
+   <   ✅ COUNT>=1   :: EHCI-HID: ISRARM self-test: modes=2 \(overlay-direct \+ qTD-chain\) depth=\d+ fifo=true payload=true rearm=true toggle=true ringfull-refuses=true -> PASS == witness ::
+   <        1 hit(s), first 
+   >   ❌ COUNT>=1   :: EHCI-HID: ISRARM self-test: modes=2 \(overlay-direct \+ qTD-chain\) depth=\d+ fifo=true payload=true rearm=true toggle=true ringfull-refuses=true -> PASS == witness ::
+   >        0 hits — MISSING (pinned at x86-witness.spec:1566)
+   <        3 hit(s), first : [  48497ms] [clickroute] route hit=true deliver=false depth=0/0 kernel=false desktop=false nofab=true deflect=true -> FAIL
+   >        4 hit(s), first : [    295ms] :: EHCI-HID: ISRARM self-test: modes=2 (overlay-direct + qTD-chain) depth=8 fifo=true payload=true rearm=true toggle=true ringfull-refuses=true -> FAIL == witness ::
+   <   ❌ MBENCH FAIL — 60/65 required witnesses, 20 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   >   ❌ MBENCH FAIL — 59/65 required witnesses, 21 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   <        (4 further pinned line(s) also short — full table above)
+   >        (5 further pinned line(s) also short — full table above)
+   verdict: ════════════ MBENCH VERDICT — x86-witness.spec vs /home/pmes/unaos-bench/scratch/rmbp-0915/metalpins-logs/mut/m2-israrm-fail.log ════════════
+   verdict:   ❌ MBENCH FAIL — 59/65 required witnesses, 21 forbidden hit(s), 6899 lines scanned, pending 3/4 matched [mode unknown: no run sidecar]
+
+== m3-israrm-skipped
+368a369
+> [    295ms] :: EHCI-HID: ISRARM self-test SKIPPED — the static pool failed the phys/alignment contract (MUTATION) ::
+   >   ❌ FORBID hit : [    295ms] :: EHCI-HID: ISRARM self-test SKIPPED — the static pool failed the phys/alignment contract (MUTATION) ::
+   <   ✅ FORBID     :: EHCI-HID: ISRARM self-test SKIPPED
+   <        0 hits
+   >   ❌ FORBID     :: EHCI-HID: ISRARM self-test SKIPPED
+   >        1 hit(s), first : [    295ms] :: EHCI-HID: ISRARM self-test SKIPPED — the static pool failed the phys/alignment contract (MUTATION) ::
+   <   ❌ MBENCH FAIL — 60/65 required witnesses, 20 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   >   ❌ MBENCH FAIL — 60/65 required witnesses, 21 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   verdict: ════════════ MBENCH VERDICT — x86-witness.spec vs /home/pmes/unaos-bench/scratch/rmbp-0915/metalpins-logs/mut/m3-israrm-skipped.log ════════════
+   verdict:   ❌ MBENCH FAIL — 60/65 required witnesses, 21 forbidden hit(s), 6900 lines scanned, pending 3/4 matched [mode unknown: no run sidecar]
+
+== m4-optout-injected
+2854a2855
+> [  32154ms] :: SDHCPOST: posture sdw-ro=1 wp-pin=unread write-path=unread -> sdhc=ro reason=opt-out (condition 1 refused before the pin was read; R59 made rw the default and THIS is the exception — SDHCPOST/SDHCRW, fir
+   >   ❌ FORBID hit : [  32154ms] :: SDHCPOST: posture sdw-ro=1 wp-pin=unread write-path=unread -> sdhc=ro reason=opt-out (condition 1 refused before the pin was read; R59 made rw the default and THIS is the exception — SDHCPOST/SDHC
+   <   ✅ FORBID     :: SDHCPOST: posture .*reason=opt-out
+   <        0 hits
+   >   ❌ FORBID     :: SDHCPOST: posture .*reason=opt-out
+   >        1 hit(s), first : [  32154ms] :: SDHCPOST: posture sdw-ro=1 wp-pin=unread write-path=unread -> sdhc=ro reason=opt-out (condition 1 refused before the pin was read; R59 made rw the default and THIS is the exception — SDHCP
+   <   ❌ MBENCH FAIL — 60/65 required witnesses, 20 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   >   ❌ MBENCH FAIL — 60/65 required witnesses, 21 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   verdict: ════════════ MBENCH VERDICT — x86-witness.spec vs /home/pmes/unaos-bench/scratch/rmbp-0915/metalpins-logs/mut/m4-optout-injected.log ════════════
+   verdict:   ❌ MBENCH FAIL — 60/65 required witnesses, 21 forbidden hit(s), 6900 lines scanned, pending 3/4 matched [mode unknown: no run sidecar]
+
+== m5-serial-dropped
+350a351
+> [serial] dropped 5 lines, truncated 0 (staging ring full, depth 64)
+   >   ❌ FORBID hit : [serial] dropped 5 lines, truncated 0 (staging ring full, depth 64)
+   <   ✅ FORBID     \[serial\] dropped \d+ lines
+   <        0 hits
+   >   ❌ FORBID     \[serial\] dropped \d+ lines
+   >        1 hit(s), first : [serial] dropped 5 lines, truncated 0 (staging ring full, depth 64)
+   <   ❌ MBENCH FAIL — 60/65 required witnesses, 20 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   >   ❌ MBENCH FAIL — 60/65 required witnesses, 21 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   verdict: ════════════ MBENCH VERDICT — x86-witness.spec vs /home/pmes/unaos-bench/scratch/rmbp-0915/metalpins-logs/mut/m5-serial-dropped.log ════════════
+   verdict:   ❌ MBENCH FAIL — 60/65 required witnesses, 21 forbidden hit(s), 6900 lines scanned, pending 3/4 matched [mode unknown: no run sidecar]
+
+== m6-serwit2-dropped
+2998c2998
+< [  32419ms] :: SERWIT-2 tap ftdi: submitted=3527 absorbed=3527 staged=116 dropped=0 suppressed=0 torn=5 inflight=0 in_progress=0 ::
+---
+> [  32419ms] :: SERWIT-2 tap ftdi: submitted=3527 absorbed=3527 staged=116 dropped=3 suppressed=0 torn=5 inflight=0 in_progress=0 ::
+   >   ❌ FORBID hit : [  32419ms] :: SERWIT-2 tap ftdi: submitted=3527 absorbed=3527 staged=116 dropped=3 suppressed=0 torn=5 inflight=0 in_progress=0 ::
+   <   ✅ FORBID     :: SERWIT-2 tap \w+: .* dropped=[1-9]
+   <        0 hits
+   >   ❌ FORBID     :: SERWIT-2 tap \w+: .* dropped=[1-9]
+   >        1 hit(s), first : [  32419ms] :: SERWIT-2 tap ftdi: submitted=3527 absorbed=3527 staged=116 dropped=3 suppressed=0 torn=5 inflight=0 in_progress=0 ::
+   <   ❌ MBENCH FAIL — 60/65 required witnesses, 20 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   >   ❌ MBENCH FAIL — 60/65 required witnesses, 21 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   verdict: ════════════ MBENCH VERDICT — x86-witness.spec vs /home/pmes/unaos-bench/scratch/rmbp-0915/metalpins-logs/mut/m6-serwit2-dropped.log ════════════
+   verdict:   ❌ MBENCH FAIL — 60/65 required witnesses, 21 forbidden hit(s), 6899 lines scanned, pending 3/4 matched [mode unknown: no run sidecar]
+
+== m7-firstpaint-12ms
+1923c1923
+< [   6699ms] [menubar] first-paint at=6699 after_enable_ms=0 model=partial:caption+clock+batt crystal=drawn rect=2880x34+0+0
+---
+> [   6699ms] [menubar] first-paint at=6699 after_enable_ms=12 model=partial:caption+clock+batt crystal=drawn rect=2880x34+0+0
+   <   ✅ REQUIRE    \[menubar\] first-paint at=\d+ after_enable_ms=\d model=\S+ crystal=drawn
+   <        1 hit(s), first 
+   >   ❌ REQUIRE    \[menubar\] first-paint at=\d+ after_enable_ms=\d model=\S+ crystal=drawn
+   >        0 hits — MISSING (pinned at x86-witness.spec:1598)
+   <   ❌ MBENCH FAIL — 60/65 required witnesses, 20 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   >   ❌ MBENCH FAIL — 59/65 required witnesses, 20 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   <        (4 further pinned line(s) also short — full table above)
+   >        (5 further pinned line(s) also short — full table above)
+   verdict: ════════════ MBENCH VERDICT — x86-witness.spec vs /home/pmes/unaos-bench/scratch/rmbp-0915/metalpins-logs/mut/m7-firstpaint-12ms.log ════════════
+   verdict:   ❌ MBENCH FAIL — 59/65 required witnesses, 20 forbidden hit(s), 6899 lines scanned, pending 3/4 matched [mode unknown: no run sidecar]
+
+== m8a-pciscan-99
+2981c2981
+< [  32419ms] :: BPACE: pci-scan t=5939ms d=0ms ::
+---
+> [  32419ms] :: BPACE: pci-scan t=5939ms d=99ms ::
+3194c3194
+< [  32959ms] :: BPACE: pci-scan t=5939ms d=0ms ::
+---
+> [  32959ms] :: BPACE: pci-scan t=5939ms d=99ms ::
+   verdict: ════════════ MBENCH VERDICT — x86-witness.spec vs /home/pmes/unaos-bench/scratch/rmbp-0915/metalpins-logs/mut/m8a-pciscan-99.log ════════════
+   verdict:   ❌ MBENCH FAIL — 60/65 required witnesses, 20 forbidden hit(s), 6899 lines scanned, pending 3/4 matched [mode unknown: no run sidecar]
+
+== m8b-pciscan-100
+2981c2981
+< [  32419ms] :: BPACE: pci-scan t=5939ms d=0ms ::
+---
+> [  32419ms] :: BPACE: pci-scan t=5939ms d=100ms ::
+3194c3194
+< [  32959ms] :: BPACE: pci-scan t=5939ms d=0ms ::
+---
+> [  32959ms] :: BPACE: pci-scan t=5939ms d=100ms ::
+   >   ❌ FORBID hit : [  32419ms] :: BPACE: pci-scan t=5939ms d=100ms ::
+   <   ✅ REQUIRE    :: BPACE: pci-scan t=\d+ms d=\d{1,2}ms ::
+   <        2 hit(s), first 
+   >   ❌ REQUIRE    :: BPACE: pci-scan t=\d+ms d=\d{1,2}ms ::
+   >        0 hits — MISSING (pinned at x86-witness.spec:1548)
+   <   ✅ FORBID     :: BPACE: pci-scan t=\d+ms d=\d{3,}ms ::
+   <        0 hits
+   >   ❌ FORBID     :: BPACE: pci-scan t=\d+ms d=\d{3,}ms ::
+   >        2 hit(s), first : [  32419ms] :: BPACE: pci-scan t=5939ms d=100ms ::
+   <   ❌ MBENCH FAIL — 60/65 required witnesses, 20 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   >   ❌ MBENCH FAIL — 59/65 required witnesses, 22 forbidden hit(s), , pending 3/4 matched [mode unknown: no run sidecar]
+   <        (4 further pinned line(s) also short — full table above)
+   >        (5 further pinned line(s) also short — full table above)
+   verdict: ════════════ MBENCH VERDICT — x86-witness.spec vs /home/pmes/unaos-bench/scratch/rmbp-0915/metalpins-logs/mut/m8b-pciscan-100.log ════════════
+   verdict:   ❌ MBENCH FAIL — 59/65 required witnesses, 22 forbidden hit(s), 6899 lines scanned, pending 3/4 matched [mode unknown: no run sidecar]

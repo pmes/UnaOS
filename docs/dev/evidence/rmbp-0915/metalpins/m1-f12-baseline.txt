@@ -1,0 +1,205 @@
+⚡ kernel features: ehcihid,kbdwit,sdw,sdhcblk,smolnet,sdwrite
+  ❌ FORBID hit @ line 487: [   3832ms] :: EHCI-HID: [1] EPACE-TRIM M8 SLOW-XFER addr=8 hub=3.2 spd=FS bmreq=0xa1 breq=0x01 wval=0x0300 widx=0x0001 wlen=8 stg=3 xfer=2000ms act=2000ms ass=0ms seq=1/8 == witness ::
+  ❌ FORBID hit @ line 3494: [  48497ms] [clickroute] route hit=true deliver=false depth=0/0 kernel=false desktop=false nofab=true deflect=true -> FAIL
+  ❌ FORBID hit @ line 3509: [  48497ms] :: MENUBATT: pct=82 charging=y mins=106 mv=12311 ma=1014 b0st=0x0080 item_w=68 glyph=26x12 gap=6 pct_glyphs=4 batt_x=2743 clock=45x20+2823+7 caption_x0=40 floor=118x110 red_pct=100 decode_ok=true gone_red=true absent_ok=true layout_ok=true seat_ok=true jitter_paint=false change_paint=false damage_ok=false :: FAIL ::
+  ❌ FORBID hit @ line 3545: [  48497ms] :: DOCK: strip tiles=7 at x=1056 w=768 glyphs=8, probe=(1548,1762) model=true geom=true restore=true specific=true miss=true vacate=false furniture park=parked/true :: FAIL ::
+  ❌ FORBID hit @ line 3882: [  50015ms] :: CLICK-BAND: routed menu=true(dismiss) outside=true(dismiss) dock=true(raise) band_lines=0 :: FAIL ::
+════════════ MBENCH VERDICT — x86-witness.spec vs /home/pmes/unaos-bench/scratch/rmbp-0915/metalpins-logs/f12-boot1.log ════════════
+  ✅ COMPLETE   :: PULSE-A: start pid=
+       end-of-run marker SEEN @ line 4330 — the run got past this point
+  ✂️ COMPLETE   :: PULSE-W: .*witness skipped ::
+       NOT SEEN — the capture never reached this point
+  ✅ REQUIRE    ^\[\s*[0-9]+ms\] \[wc-g\] paygo win=[0-9]+
+       14 hit(s), first @ line 1897
+  ✅ REQUIRE    \[wc-g\] prof win=[0-9]+ seq=[0-9]+ surf_bytes=[0-9]+ cks_blit_us=[0-9]+ civac_us=[0-9]+ cks_after_us=[0-9]+ probes=[0-9]+ readback_us=[0-9]+
+       39 hit(s), first @ line 1871
+  ✅ REQUIRE    \[wc-g\] win=1 seq=0 .*coverage=lattice16 .*-> CLEAN
+       1 hit(s), first @ line 1870
+  ✅ REQUIRE    \[wc-g\] win=1 .*coverage=full .*-> CLEAN
+       3 hit(s), first @ line 4505
+  ✅ REQUIRE    \[wc-g\] paygo win=[0-9]+ state=waiting emit=[0-9]+ lattice_n=16 deferred=[0-9]+ defer_ms=15000 since_entry_ms=[0-9]+ clock=entry taken=[0-9]+ budget=[0-9]+ -> DEFERRED
+       5 hit(s), first @ line 1897
+  ✅ REQUIRE    \[wc-g\] paygo win=[0-9]+ state=complete .*taken=[0-9]+ budget=[0-9]+ -> PAID
+       7 hit(s), first @ line 3228
+  ✅ REQUIRE    \[wc-g\] rollup win=[0-9]+ scope=window paygo=yes .*frame_us=[0-9]+ ->
+       7 hit(s), first @ line 3229
+  ✅ REQUIRE    \[wc-d\] verify win=[0-9]+ .*bad_cache=0 bad_ram=0 .*-> PASS
+       3 hit(s), first @ line 1898
+  ✅ REQUIRE    \[wc-d\] verify win=1 .*checked=[0-9]+ coverage=lattice16 bad_cache=0 bad_ram=0 .*-> PASS
+       1 hit(s), first @ line 1898
+  ❌ REQUIRE    \[wc-d\] verify win=1 .*checked=[0-9]+ coverage=full bad_cache=0 bad_ram=0 .*-> PASS
+       0 hits — MISSING (pinned at x86-witness.spec:322)
+  ✅ REQUIRE    \[wc-d\] paygo win=[0-9]+ state=waiting emit=[0-9]+ lattice_n=16 deferred=[0-9]+ defer_ms=15000 since_entry_ms=[0-9]+ clock=entry taken=[0-9]+ budget=2 -> DEFERRED
+       2 hit(s), first @ line 1912
+  ❌ REQUIRE    \[wc-d\] paygo win=[0-9]+ state=complete .*taken=[0-9]+ budget=2 -> PAID
+       0 hits — MISSING (pinned at x86-witness.spec:335)
+  ✅ REQUIRE    :: LOGWIT-1: tap prefix reached the FTDI capture .*-> PASS ::
+       1 hit(s), first @ line 162
+  ✅ REQUIRE    :: \[sntp-x86\] canned anchor cleared — clock unanchored again ::
+       1 hit(s), first @ line 168
+  ✅ REQUIRE    :: CLOCK-X1: TSC invariant, ~[0-9]+ MHz; uptime [0-9]+ s SAMPLED — second-advance DEFERRED to the first service pass
+       1 hit(s), first @ line 160
+  ✅ REQUIRE    \(JD17 x86-frozen clock now advances\) \[paygo: deferred [0-9]+ ms TSC / [0-9]+ ms APIC, uptime \+[0-9]+ s, core=[0-9]+ — (CONSISTENT|SKEW)\]
+       1 hit(s), first @ line 2960
+  ✅ REQUIRE    :: WXN-x86: ehdr=0x[0-9A-F]+ img=\[0x[0-9A-F]+,0x[0-9A-F]+\) .*pdpt_seen=[0-9]+ nx_set=[0-9]+ .*residue_leaves=[0-9]+ .*wp=[0-9]+ -> SWEPT ::
+       1 hit(s), first @ line 10
+  ✅ REQUIRE    :: WXN-M2: xseg=\[0x[0-9A-F]+,0x[0-9A-F]+\) xsegs=[0-9]+ xpages=[0-9]+ .*demote_1g=[0-9]+ split_2m=[0-9]+ pool_used=[0-9]+/[0-9]+ nx_pdpt=[0-9]+ nx_2m=[0-9]+ nx_pt=[0-9]+ nx_4k=[0-9]+ keep_x=[0-9]+ .*-> SPLIT ::
+       1 hit(s), first @ line 12
+  ✅ REQUIRE    :: WXAUDIT x86: leaves=[0-9]+ user=[0-9]+ user_WX=[0-9]+ kern_WX=[0-9]+ \([0-9]+ MiB\) tables=[0-9]+ nxe=[0-9]+ walk=[0-9]+kcyc l1=[0-9]+ l2=[0-9]+ l3=[0-9]+
+       1 hit(s), first @ line 16
+  ✅ REQUIRE    :: WXAUDIT-NXE: cores=[0-9]+ nxe=[0-9]+ nxe_mask=0x[0-9A-F]+ wp=[0-9]+ wp_mask=0x[0-9A-F]+ -> PASS ::
+       1 hit(s), first @ line 93
+  ✅ REQUIRE    :: WXAUDIT-CORES: n=[0-9]+ cr0=\[0x[0-9A-F]+(,0x[0-9A-F]+)*\] wp=0x[0-9A-F]+ nxe=0x[0-9A-F]+ ::
+       1 hit(s), first @ line 94
+  ✅ REQUIRE    :: WXN-FBWC: fb=0x[0-9A-F]+ lvl=[0-9]+ e=0x[0-9A-F]{16} pat=[0-9]+ pcd=[0-9]+ pwt=[0-9]+ w=[0-9]+ fx=[0-9]+ -> LEAF BIT-IDENTICAL ::
+       1 hit(s), first @ line 11
+  ✅ REQUIRE    :: video: edid present=[01] hdr=(-|OK|BAD) sum=(-|OK|BAD) native=(-|[0-9]+x[0-9]+) .*len=[0-9]+ ::
+       1 hit(s), first @ line 4
+  ✅ REQUIRE    :: igpu-blt: ring=
+       1 hit(s), first @ line 1662
+  ✅ REQUIRE    :: SMC-BATT: present=.*gap=[0-9]+ busy=[0-9]+ late=[0-9]+ == witness ::
+       5 hit(s), first @ line 1079
+  ✅ REQUIRE    :: SMC-SCOUT: index walk done \([0-9]+ of [0-9]+ names\) ::
+       1 hit(s), first @ line 1076
+  ✅ REQUIRE    :: sdhc: card (v1\.x|v2\.00\+) (SDSC|SDHC|SDXC) (byte|block)-addressed blocks=[0-9]+ size=[0-9]+ MiB rca=0x[0-9a-f]+ ::
+       1 hit(s), first @ line 2492
+  ✅ REQUIRE    \[sdhc\] bdf [0-9]+:[0-9]+\.[0-9]+ CARD IDENTIFIED — [0-9]+ blocks, (byte|block)-addressed, csd v[0-9]+
+       1 hit(s), first @ line 2497
+  ✅ REQUIRE    :: sdhc: w1 armed=[01] lba=(NONE|[0-9]+) wp_sw=[0-9]+ csd_perm=[0-9]+ csd_tmp=[0-9]+ class=\S+ blank=\S+ verify=\S+ restore=\S+ reason=\S+ -> [A-Z]+ ::
+       1 hit(s), first @ line 2514
+  ✅ REQUIRE    :: BPACE: total gui=[0-9]+ms ftdi=(none|[0-9]+ms) n=[0-9]+ dropped=0 hz=[0-9]+ result=LEDGER ::
+       2 hit(s), first @ line 2994
+  ✅ REQUIRE    :: BPACE: ehci-hid-done t=[0-9]+ms d=[0-9]+ms ::
+       2 hit(s), first @ line 2979
+  ✅ REQUIRE    :: BPACE: sched t=[0-9]+ms d=[0-9]+ms ::
+       2 hit(s), first @ line 2976
+  ✅ REQUIRE    :: GPACE: xtail=[0-9]+ms\(n=[0-9]+\) .*kepler=[0-9]+ms\(n=[0-9]+\) .*== witness ::
+       1 hit(s), first @ line 2598
+  ✅ REQUIRE    :: TSTE: midden.dispatch -> PASS ::
+       1 hit(s), first @ line 112
+  ✅ REQUIRE    :: TSTE: midden.route -> PASS ::
+       1 hit(s), first @ line 113
+  ✅ REQUIRE    :: TSTE: midden.resolve -> PASS ::
+       1 hit(s), first @ line 114
+  ✅ REQUIRE    :: TSTE: midden.precedence -> PASS ::
+       1 hit(s), first @ line 116
+  ✅ REQUIRE    :: MENUBAR-OCC: bar_enabled=true crossed=true occclip_bar=[1-9][0-9]* occclip_bar_px=[1-9][0-9]* forbid_bar=[1-9][0-9]* forbid_bar_px=0 forbid_trips_when_removed=true restored=true :: PASS ::
+       1 hit(s), first @ line 3508
+  ❌ REQUIRE    \[drag-occ\] .* bars=[0-9]/[0-9] bar=[0-9]+ fillclip_dock_px=
+       0 hits — MISSING (pinned at x86-witness.spec:1335)
+  ✅ REQUIRE    :: MENUBAR: .* press=crystal default_off=true clip_clean=true flush=true member=true floor=true/true dismissed=true crystal_ok=true :: PASS ::
+       1 hit(s), first @ line 3507
+  ❌ REQUIRE    :: DOCK: strip tiles=.* model=true geom=true restore=true specific=true miss=true vacate=true furniture park=parked/true :: PASS ::
+       0 hits — MISSING (pinned at x86-witness.spec:1406)
+  ❌ REQUIRE    :: CLICK-BAND: routed menu=true\(open\) outside=true\(dismiss\) dock=true\(.*\) band_lines=3 :: PASS ::
+       0 hits — MISSING (pinned at x86-witness.spec:1417)
+  ⏳ PENDING    \[clickroute\] press at \(\d+,\d+\) band=menubar -> (open|kept-open|closed)
+       0 hits — awaiting metal/code (never fails)
+  ✅ PENDING    \[serialdoor\] key=0x[0-9a-f]+ win_focus=0x[0-9a-f]+ ring=0x[0-9a-f]+ -> shell
+       2 hit(s), first @ line 3907 — MATCHED: consider promoting to REQUIRE
+  ✅ PENDING    :: igpu-dpy: rung=03 name=pp
+       2 hit(s), first @ line 2416 — MATCHED: consider promoting to REQUIRE
+  ✅ PENDING    \[wc-x\] move-vacate .* painted=true .* -> PASS
+       1 hit(s), first @ line 1951 — MATCHED: consider promoting to REQUIRE
+  ◦ OPTIONAL   \[wc-d\] verify .*aborts=[0-9]+/[0-9]+ retry=(yes|no) -> SKIP \(teardown\)
+       0 hits (informational)
+  ✅ OPTIONAL   :: EHCI-HID: \[0\] EPACE-TRIM M8 SLOW-XFER addr=[0-9]+ .*wlen=[0-9]+ stg=[0-9]+ xfer=[0-9]+.* == witness ::
+       1 hit(s), first @ line 422
+  ◦ OPTIONAL   \[PCI-CENSUS\] done: devices=[0-9]+ functions=[0-9]+ printed=[0-9]+ truncated=[0-9]+ net-class=0x[0-9a-f]+:[0-9]+
+       0 hits (informational)
+  ◦ OPTIONAL   :: bcma: begin — READ-ONLY recon of PCI class 0x02/sub 0x80
+       0 hits (informational)
+  ◦ OPTIONAL   :: bcma: end ok=[01] stage=\S+ elapsed=[0-9]+ms ::
+       0 hits (informational)
+  ◦ OPTIONAL   :: \[wcser\] PRESENT-BANDED SPIN site=\d+ waited_us=\d+ on=shadow\d+ -> (RELEASED|GAVE-UP) ::
+       0 hits (informational)
+  ❌ FORBID*    -> FAIL
+       3 hit(s), first @ line 3494: [  48497ms] [clickroute] route hit=true deliver=false depth=0/0 kernel=false desktop=false nofab=true deflect=true -> FAIL
+  ❌ FORBID*    FAIL ::
+       12 hit(s), first @ line 3509: [  48497ms] :: MENUBATT: pct=82 charging=y mins=106 mv=12311 ma=1014 b0st=0x0080 item_w=68 glyph=26x12 gap=6 pct_glyphs=4 batt_x=2743 clock=45x20+2823+7 caption_x0=40 floor=118x110 red_pct=100 decode_ok=true gone_red=true absent_ok=true layout_ok=true seat_ok=true jitter_paint=false change_paint=false damage_ok=false :: FAIL ::
+  ✅ FORBID*    PANIC
+       0 hits
+  ✅ FORBID*    -> FLICKER
+       0 hits
+  ✅ FORBID     \[wc-g\] .*-> COHER
+       0 hits
+  ✅ FORBID     \[wc-g\] .*-> RACE
+       0 hits
+  ✅ FORBID     \[wc-g\] .*-> BLIT
+       0 hits
+  ✅ FORBID     \[wc-d\] verify .*-> FAIL
+       0 hits
+  ✅ FORBID     \[wc-d\] verify .*retry=no -> SKIP \(teardown\)
+       0 hits
+  ✅ FORBID     \[wc-d\] paygo win=[0-9]+ state=sealed .*-> UNPAID
+       0 hits
+  ✅ FORBID     ^\[\s*[0-9]{5,}ms\] .*\[wc-[gd]\] paygo .*clock=unarmed
+       0 hits
+  ✅ FORBID     LOGWIT.*(FAIL|FORBID)
+       0 hits
+  ✅ FORBID     matcher vacuous
+       0 hits
+  ✅ FORBID     :: CLOCK-X1: FROZEN
+       0 hits
+  ✅ FORBID     :: CLOCK-X1: .*\[paygo: .*— SKEW\]
+       0 hits
+  ✅ FORBID     :: CLOCK-X1: NON-MONOTONE
+       0 hits
+  ✅ FORBID     :: WXN-x86: .*-> VACUOUS ::
+       0 hits
+  ✅ FORBID     :: WXN-x86: .*-> REFUSED
+       0 hits
+  ✅ FORBID     :: WXN-M2: .*-> REFUSED
+       0 hits
+  ✅ FORBID     :: WXN-M2: .*-> VACUOUS ::
+       0 hits
+  ✅ FORBID     :: WXAUDIT x86: .* TRUNCATED ::
+       0 hits
+  ✅ FORBID     :: WXAUDIT-CORES: .*cr0=\[[^]]*0x0[,\]]
+       0 hits
+  ✅ FORBID     :: WXN-FBWC: .*-> SKIPPED ::
+       0 hits
+  ❌ FORBID     :: EHCI-HID: \[1\] EPACE-TRIM M8 SLOW-XFER
+       2 hit(s), first @ line 487: [   3832ms] :: EHCI-HID: [1] EPACE-TRIM M8 SLOW-XFER addr=8 hub=3.2 spd=FS bmreq=0xa1 breq=0x01 wval=0x0300 widx=0x0001 wlen=8 stg=3 xfer=2000ms act=2000ms ass=0ms seq=1/8 == witness ::
+  ✅ FORBID     :: SMC-SCOUT: index enumeration STOP-NOTE at idx [0-9]+
+       0 hits
+  ✅ FORBID     :: BPACE: .*dropped=[1-9]
+       0 hits
+  ✅ FORBID     :: TSTE: midden\.\w+ -> FAIL
+       0 hits
+  ✅ FORBID     \[wc-k\] .*-> UNPUBLISHED
+       0 hits
+  ✅ FORBID     \[wc-k\] .*outside=[1-9]
+       0 hits
+  ✅ FORBID     \[wc-h\] rollup .*stalls=([2-9]|[1-9][0-9]+) .*presspread=[0-7] presspop=[0-9]+ pop=constant
+       0 hits
+  ✅ FORBID     \[drag-occ\] .*-> BLEED
+       0 hits
+  ✅ FORBID     \[wck4\] erase clip OVERFLOW
+       0 hits
+  ✅ FORBID     \[drag-occ\] .* occclip_dock=[1-9][0-9]* occclip_dock_px=0
+       0 hits
+  ✅ FORBID     \[drag-occ\] .* occclip_bar=[1-9][0-9]* occclip_bar_px=0
+       0 hits
+  ✅ FORBID     :: MENUBAR-OCC: .* :: FAIL ::
+       0 hits
+  ✅ FORBID     \[drag-occ\] .* bars=0/[0-9] bar=[1-9]
+       0 hits
+  ✅ FORBID     :: MENUBAR: .* :: FAIL ::
+       0 hits
+  ❌ FORBID     :: DOCK: .* :: FAIL ::
+       1 hit(s), first @ line 3545: [  48497ms] :: DOCK: strip tiles=7 at x=1056 w=768 glyphs=8, probe=(1548,1762) model=true geom=true restore=true specific=true miss=true vacate=false furniture park=parked/true :: FAIL ::
+  ❌ FORBID     :: CLICK-BAND: .* :: FAIL ::
+       1 hit(s), first @ line 3882: [  50015ms] :: CLICK-BAND: routed menu=true(dismiss) outside=true(dismiss) dock=true(raise) band_lines=0 :: FAIL ::
+  ✅ FORBID     :: \[wcser\] GATE STOLEN from c\d+ by c\d+ after \d+ms
+       0 hits
+  ✅ FORBID     :: \[wcser\] REHOMED the render role from DEAD c\d+ to c\d+
+       0 hits
+  ✅ FORBID     c\d+ is DEAD and its singleton roles are owed a re-home
+       0 hits
+  ─────
+  ❌ MBENCH FAIL — 37/42 required witnesses, 19 forbidden hit(s), 6899 lines scanned, pending 3/4 matched [mode unknown: no run sidecar]
+       FIRST-SHORTFALL x86-witness.spec:322 REQUIRE \[wc-d\] verify win=1 .*checked=[0-9]+ coverage=full bad_cache=0 bad_ram=0 .*-> PASS
+       (4 further pinned line(s) also short — full table above)
+       (the end-of-run marker was seen — the run completed, so a missing witness here is a GENUINE regression)
+  (* = default FORBID, always on)
