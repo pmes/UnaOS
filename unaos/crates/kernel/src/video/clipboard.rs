@@ -45,12 +45,12 @@
 //!    path a typed byte takes** — it pushes each byte back onto the ring as
 //!    [`crate::pal::Event::Key`], so the line edit, the echo and the wire are identical to the
 //!    operator having typed it and no second entry into the editor exists to keep in step. `Copy`
-//!    takes the whole current line, because **there is no selection model in this tree** — there is
-//!    nothing on any surface that records "these characters are selected", so a line is the largest
-//!    honest unit. `Cut` and `SelectAll` are therefore ACCEPTED AND WITNESSED as `unsupported`
-//!    (`[clip] unsupported action=…`), never silently dropped: a selection model is the next arc and
-//!    an operator pressing `⌘X` today must be able to see on the wire that the chord arrived and
-//!    the desktop declined it.
+//!    takes the SELECTION when one is live and the whole current line when none is — the selection
+//!    is TERMSEL's model (`video/termsel.rs`, `clipboard.md` §7), a run of cells in the editable
+//!    line. `Cut` removes the selection from the line after copying it, and with nothing selected
+//!    it is DECLINED ON THE WIRE (`[clip] cut refused reason=no-selection`), never silently: an
+//!    operator pressing `⌘X` must be able to see that the chord arrived. `SelectAll` and the
+//!    selection actions move the selection and nothing else.
 //!
 //! **No `Ctrl-C` special case exists anywhere in this file or in the path it completes** — that is
 //! R61's whole point. The table never claims `Ctrl-C` (`keymap.md` §4), `hid_key_ascii` still hands
@@ -81,9 +81,12 @@
 //! makes, and each owing an ownership question this kernel has not answered (may a background
 //! program overwrite the clipboard of a foreground one?). Named here rather than half-built.
 //!
-//! **A selection model**, and with it a real `Cut` and `SelectAll` — see part 3 above.
+//! **Pointer selection and scrollback selection** — TERMSEL's model reaches the editable line
+//! only, from the keyboard only (`clipboard.md` §7.7).
 
 use crate::video::keymap::Action;
+use crate::video::termsel::LineSel;
+use alloc::string::String;
 use spin::Mutex;
 
 /// The clipboard's capacity in bytes. A [`set`] longer than this is REFUSED with a witness rather
@@ -253,40 +256,70 @@ pub fn paste_into_ring() -> usize {
 }
 
 /// **THE TERMINAL'S CONSUMER.** What the shell's line editor does with one resolved [`Action`].
-/// `line` is the editor's CURRENT INPUT LINE (`console::Console::current_input` at the call site;
-/// the fixture passes its own buffer). Returns the field this action contributes to the witness —
-/// `ok`, `refused`, `unsupported` or `ignored` — so the caller never has to restate the outcome.
+/// `line` is the editor's CURRENT INPUT LINE and `sel` its selection (`console::Console`'s
+/// `current_input` and `sel` at the call site; the fixtures pass their own). Returns the field this
+/// action contributes to a witness — `ok`, `refused`, `empty` or `ignored` — and whether the input
+/// line must be REPAINTED (the line or the selection changed), so the caller never restates either.
 ///
 /// Every arm is terminal and none of them is silent, which is the rule this seam exists to keep: an
 /// action the desktop cannot honour must be visibly declined, or the operator learns that `⌘X` does
 /// nothing and stops reporting it.
-pub fn terminal_action(act: Action, line: &str) -> &'static str {
+pub fn terminal_action(act: Action, line: &mut String, sel: &mut LineSel) -> (&'static str, bool) {
     match act {
-        // There is NO SELECTION MODEL — nothing anywhere records which characters are selected — so
-        // the largest honest unit is the line the editor holds. Stated here and in the module header
-        // because a reader who assumes a selection will read this as a bug.
-        Action::Copy => {
-            if set(line.as_bytes()) {
-                serial_println!("[clip] copy unit=line len={}", line.len());
-                "ok"
-            } else {
-                "refused"
+        // TERMSEL: the selection when one is live; the whole line when none is — APPCLIP's
+        // behaviour, kept exactly (`unit=line`), because a line is still the largest honest unit
+        // when nothing is selected. The selection survives a copy, as it does on a Mac.
+        Action::Copy => match sel.range(line.len()) {
+            Some((lo, hi)) => {
+                if set(&line.as_bytes()[lo..hi]) {
+                    serial_println!("[clip] copy unit=selection len={}", hi - lo);
+                    ("ok", false)
+                } else {
+                    ("refused", false)
+                }
             }
-        }
+            None => {
+                if set(line.as_bytes()) {
+                    serial_println!("[clip] copy unit=line len={}", line.len());
+                    ("ok", false)
+                } else {
+                    ("refused", false)
+                }
+            }
+        },
         Action::Paste => {
             paste_into_ring();
-            "ok"
+            ("ok", false)
         }
-        Action::Cut | Action::SelectAll => {
-            serial_println!(
-                "[clip] unsupported action={} reason=no-selection-model",
-                act.name()
-            );
-            "unsupported"
-        }
+        // TERMSEL: copy the selection, and only if the clipboard TOOK it remove those cells from the
+        // editable line — a refused `set` must not lose the operator's text. The selection can only
+        // ever cover the editable line (`clipboard.md` §7.2), so there is no read-only case here.
+        Action::Cut => match sel.range(line.len()) {
+            Some((lo, hi)) => {
+                if set(&line.as_bytes()[lo..hi]) {
+                    sel.take(line.len());
+                    line.replace_range(lo..hi, "");
+                    serial_println!("[clip] cut unit=selection len={}", hi - lo);
+                    LineSel::witness_cleared(line.len(), "cut");
+                    ("ok", true)
+                } else {
+                    ("refused", false)
+                }
+            }
+            None => {
+                serial_println!("[clip] cut refused reason=no-selection");
+                ("empty", false)
+            }
+        },
+        Action::SelectAll
+        | Action::SelectLeft
+        | Action::SelectRight
+        | Action::SelectLineStart
+        | Action::SelectLineEnd
+        | Action::Deselect => ("ok", sel.apply(act, line.len())),
         // Not this consumer's business: the capture actions are delivered and acted on at the
         // decoder (`Action::is_capture`), and `LogOut` is KEYMAP's slot, bound by nobody.
-        Action::Screenshot | Action::ScreenshotRegion | Action::LogOut => "ignored",
+        Action::Screenshot | Action::ScreenshotRegion | Action::LogOut => ("ignored", false),
     }
 }
 
@@ -306,6 +339,11 @@ pub const fn action_code(a: Action) -> u64 {
         Action::Paste => 5,
         Action::SelectAll => 6,
         Action::LogOut => 7,
+        Action::SelectLeft => 8,
+        Action::SelectRight => 9,
+        Action::SelectLineStart => 10,
+        Action::SelectLineEnd => 11,
+        Action::Deselect => 12,
     }
 }
 
@@ -329,8 +367,10 @@ pub const fn action_code(a: Action) -> u64 {
 ///    ring cannot carry, or a push the classification refuses, lowers it.
 ///  * `copy=` / `paste=` — [`terminal_action`]'s own return for those two arms.
 ///  * `len=` — bytes the paste pushed, and `line_match=` — the rebuilt line against the source.
-///  * `cut=` / `selectall=` — `unsupported`, ASSERTED AS A VALUE: a future selection arc that makes
-///    them work must change this fixture, which is the point.
+///  * `cut=` / `selectall=` — ASSERTED AS VALUES. Until TERMSEL they were `unsupported`, and this
+///    fixture said the selection arc would have to come here and change them; it did. With nothing
+///    selected `Cut` is declined (`empty`) and `SelectAll` selects the line (`ok`). The selection's
+///    own behaviour is TERMSEL's fixture (`video::termsel::selftest`), not this one.
 ///  * `epoch_clear=` — the ownership gate, measured by AGEING the stamp (the buffer is set, its
 ///    stamp is walked back one epoch exactly as a log-out would leave it, and [`fresh_len`] must
 ///    then read 0 with `stale=yes`). It measures the same code on a build with no `login` feature,
@@ -361,6 +401,7 @@ pub fn selftest() {
     let mut cut = "no";
     let mut selectall = "no";
     let mut pasted = 0usize;
+    let mut sel = LineSel::new();
 
     // One action per round trip, dispatched exactly as the terminal's key consumer dispatches it.
     // The Paste round trip is the interesting one: `terminal_action` pushes the clipboard back onto
@@ -377,12 +418,12 @@ pub fn selftest() {
             match ev {
                 Event::Action(a) => {
                     delivered += 1;
-                    let line_now = if a == Action::Copy {
+                    let mut line_now = String::from(if a == Action::Copy {
                         SRC
                     } else {
                         core::str::from_utf8(&line[..ll]).unwrap_or("")
-                    };
-                    let verdict = terminal_action(a, line_now);
+                    });
+                    let verdict = terminal_action(a, &mut line_now, &mut sel).0;
                     match a {
                         Action::Copy => copy = verdict,
                         Action::Paste => paste = verdict,
@@ -419,8 +460,8 @@ pub fn selftest() {
         && copy == "ok"
         && paste == "ok"
         && line_match
-        && cut == "unsupported"
-        && selectall == "unsupported"
+        && cut == "empty"
+        && selectall == "ok"
         && epoch_clear;
     serial_println!(
         ":: APPCLIP: delivered={} copy={} paste={} len={} line_match={} cut={} selectall={} epoch_clear={} -> {} ::",

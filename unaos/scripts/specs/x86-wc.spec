@@ -356,9 +356,9 @@ REQUIRE :: KEYMAP: table=crispy resolved=\d+ .* ctrl_c_ascii=0x03 ctrl_c_action=
 # --- it were broken: `line_match=true` (the pasted bytes compared against the source AFTER the
 # --- round trip — a delivery that never happened, a clipboard that stored nothing and a paste
 # --- that pushed nothing each read `false` here, and it is the ONE field the go-red moves);
-# --- `cut=unsupported` and `selectall=unsupported` (asserted AS VALUES, not as silence — an
-# --- operator's `⌘X` must be visibly declined until a selection model exists, and the arc that
-# --- builds one has to come here and change this row, which is the point); `epoch_clear=ok` (the
+# --- `cut=empty` and `selectall=ok` (asserted AS VALUES; `unsupported` until TERMSEL, 2026-09-23,
+# --- which built the selection model and changed this row as the row said it must — with nothing
+# --- selected `⌘X` is declined on the wire and `⌘A` selects the line); `epoch_clear=ok` (the
 # --- session ownership gate — the buffer's stamp is aged by one epoch, exactly as a log-out
 # --- leaves it, and the next read must destroy the buffer instead of serving the previous user's
 # --- text). `delivered=4` is pinned as a literal because it is a CONSTANT of the fixture, not a
@@ -367,7 +367,7 @@ REQUIRE :: KEYMAP: table=crispy resolved=\d+ .* ctrl_c_ascii=0x03 ctrl_c_action=
 # --- GO-RED, ONE EDIT (measured, not reasoned): delete the `paste_into_ring()` call from
 # --- `terminal_action`'s `Action::Paste` arm -> no `Event::Key` reaches the ring, the line is
 # --- never built, and the same capture reads `paste=ok len=0 line_match=false … -> FAIL ::`.
-REQUIRE :: APPCLIP: delivered=4 copy=ok paste=ok len=\d+ line_match=true cut=unsupported selectall=unsupported epoch_clear=ok -> PASS ::
+REQUIRE :: APPCLIP: delivered=4 copy=ok paste=ok len=\d+ line_match=true cut=empty selectall=ok epoch_clear=ok -> PASS ::
 FORBID :: APPCLIP: .* -> FAIL ::
 
 # --- STARTHOLD: the desktop's ignition is never gated on a fixture's settle (2026-09-22) -------
@@ -633,3 +633,21 @@ REQUIRE :: SERWIT-2 tap tste: submitted=[1-9]\d* absorbed=[1-9]\d* staged=\d+ dr
 # gates it on the leg whose numbers anybody actually quotes. Measured 14 hits on the SERTAPS baseline
 # capture (`sertaps-logs/R1-serial.log`, the wc lane at this branch's parent fe385712).
 REQUIRE \[sertx\] prints=\d+ masked_us_max=\d+ masked_us_mean=\d+ drain_us=\d+ emit_us=\d+ spin_us=\d+ bytes=\d+ masked_b=0 fifo_b=\d+ taps_us=\d+ taps_us_max=\d+ tap_max=fbcon:\d+,ftdi:\d+,tste:\d+,rec:\d+ tap_sum=fbcon:\d+,ftdi:\d+,tste:\d+,rec:\d+ sink=(uart|ftdi|both|none) hz=\d+ masked_cy_max=\d+ masked_cy_sum=\d+
+
+# ── TERMSEL (2026-09-23), TAIL-APPENDED past SERTXPIN ─────────────────────────────────────────────
+# The terminal's SELECTION over the editable shell line (`video/termsel.rs`, `clipboard.md` §7): the
+# chords are rows in the theme's table and the fixture `video::termsel::selftest` — chained after
+# APPCLIP's in `drivers::ehci::parser_selftest`, which this lane runs every boot — resolves each one
+# from a synthetic report pair through the LIVE table, pushes the action through the REAL ring and
+# runs the shipped `clipboard::terminal_action` on it. QEMU cannot press a key; the ring is the proof.
+# PINNED VERBATIM, each because it would read well if the thing under it were broken: `copy_sel=ok`
+# (the clipboard, read back through the epoch gate, holds exactly the two selected cells and not the
+# line — THE field the go-red moves), `copy_line=ok` (with nothing selected ⌘C still copies the whole
+# line: APPCLIP's behaviour preserved), `cut=ok` (clipboard AND line AND selection all checked after
+# ⌘X) and `cut_empty=ok` (⌘X with nothing selected declined, line untouched). `resolved=` and
+# `delivered=` are pinned as the same literal because they are CONSTANTS of the fixture: thirteen
+# chords go in, and any other number means the table or the ring lost one.
+# GO-RED (measured, M2): make `terminal_action`'s `Copy` arm ignore the selection -> `copy_sel=no …
+# -> FAIL ::`.
+REQUIRE :: TERMSEL: resolved=13/13 delivered=13 left=ok copy_sel=ok home=ok esc=ok copy_line=ok cut=ok cut_empty=ok edit=ok pc=ok -> PASS ::
+FORBID :: TERMSEL: .* -> FAIL ::

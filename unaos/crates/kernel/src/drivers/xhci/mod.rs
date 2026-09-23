@@ -5254,7 +5254,7 @@ impl XhciController {
                                             } else if let Some((act, chord)) = hid_screenshot_chord_edge(&cur_keys, &prev_keys, modifiers) {
                                                 // KEYMAP: the chord is JUDGED by `video::keymap::resolve`, never tested here. `else if` so
                                                 // a report carrying both 0x46 and a chord arms once. An action that is NOT a capture
-                                                // (R61's ⌘C/⌘V/⌘X/⌘A, the ⌘⇧Q slot) resolves and stops here: no consumer exists yet.
+                                                // (R61's ⌘C/⌘V/⌘X/⌘A, TERMSEL's selection chords, the ⌘⇧Q slot) is delivered on the ring below.
                                                 if act.is_capture() { serial_println!(
                                                     ":: PRTSCR: [prtscr] chord={} (GUI+Shift+digit) down on xHCI -> capture armed action={} ::",
                                                     chord, act.name()

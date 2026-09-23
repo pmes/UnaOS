@@ -79,20 +79,23 @@ measures the same code on every build — including the gate lane, which has no 
 
 ## 3. The first consumer — the terminal
 
-`clipboard::terminal_action(act, line)` is what the shell's line editor does with an action.
+`clipboard::terminal_action(act, line, sel)` is what the shell's line editor does with an action.
+Since TERMSEL it takes the console's line and selection by `&mut` and returns the witness field plus
+whether the input line must be repainted (§7).
 
 | Action | What the terminal does |
 |---|---|
 | `Paste` | pushes each clipboard byte back onto the ring as `Event::Key`. **Not a call into the editor** — the editor's existing `Event::Key` arm types and echoes them, so the line edit, the echo, the `\n` dispatch and the key census are identical to the operator having typed the text, and there is no second entry into the editor to keep in step. |
-| `Copy` | copies the **whole current input line**. |
-| `Cut`, `SelectAll` | accepted and witnessed `[clip] unsupported action=<name> reason=no-selection-model`. |
+| `Copy` | copies the **selection** when one is live (`unit=selection`), and the **whole current input line** when none is (`unit=line`, APPCLIP's behaviour unchanged). |
+| `Cut` | copies the selection and removes it from the editable line; with none, declined on the wire: `[clip] cut refused reason=no-selection`. |
+| `SelectAll` and the five selection actions | move the selection (§7). |
 | `Screenshot`, `ScreenshotRegion`, `LogOut` | `ignored` — the captures are acted on at the decoder, and `LogOut` is KEYMAP's slot, bound by nobody. |
 
-**There is no selection model in this tree.** Nothing on any surface records "these characters are
-selected", so a line is the largest honest unit a copy can take and a cut has nothing to remove. The
-two unsupported actions are witnessed rather than dropped for one reason: an operator who presses
-`⌘X` and sees nothing learns that the chord does nothing and stops reporting it. A selection arc is
-the next rung, and it has to come here and change both the arm and the spec row that pins its value.
+**Until TERMSEL there was no selection model in this tree**, so `Copy` took the line and `Cut` and
+`SelectAll` were witnessed `unsupported`. TERMSEL (§7) came here and changed the arms and the spec
+row that pinned their values, as this paragraph said the selection arc would have to. The refusal
+that remains — `⌘X` with nothing selected — is witnessed for the reason the old ones were: an
+operator who presses `⌘X` and sees nothing learns that the chord does nothing and stops reporting it.
 
 **No `Ctrl-C` special case exists anywhere on this path** — no guard, no terminal branch, no focus
 test. That is R61 discharged: the table never claimed `Ctrl-C`, so nothing had to be carved out for it.
@@ -109,7 +112,7 @@ focus test is added there either.
 `scripts/specs/x86-wc.spec` and must read exactly what it read before this arc.
 
 ```
-:: APPCLIP: delivered=4 copy=ok paste=ok len=10 line_match=true cut=unsupported selectall=unsupported epoch_clear=ok -> PASS ::
+:: APPCLIP: delivered=4 copy=ok paste=ok len=10 line_match=true cut=empty selectall=ok epoch_clear=ok -> PASS ::
 ```
 
 Every field is a round trip, not a restatement. Four `Event::Action`s go in through
@@ -148,9 +151,8 @@ is a different event: a dropped motion is re-carried by the next report, and a l
 
 ## 6. What is next
 
-* **A selection model.** Without one, `Copy` is line-granular and `Cut`/`SelectAll` are witnessed
-  refusals. It is the largest thing this arc left, and it is what makes the clipboard feel like a
-  clipboard.
+* **A selection model** — built by TERMSEL, §7 (keyboard, editable line). Pointer and scrollback
+  selection are still owed (§7.7).
 * **A ring-3 clipboard API** — two syscalls, `SYS_CLIP_SET(ptr, len)` and
   `SYS_CLIP_GET(ptr, cap) -> len`, each owing the same text-only and capacity refusals `set` makes,
   and each owing an ownership question this kernel has not answered: may a background program

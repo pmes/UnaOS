@@ -43,6 +43,10 @@ pub struct Console {
     /// below the window's own top edge. `false` on every backdrop/headless surface (the desktop-layer
     /// shell, aarch64, wc-off), so those stay byte-for-byte unchanged.
     in_window: bool,
+    /// TERMSEL — the selection over [`Self::current_input`]. Changed only by
+    /// `video::clipboard::terminal_action` (the selection actions, `Cut`) and by
+    /// `main::handle_key`'s edit rule; read by [`Self::draw_prompt_line`], which paints it.
+    pub sel: crate::video::termsel::LineSel,
 }
 
 impl Console {
@@ -53,6 +57,7 @@ impl Console {
             history: alloc::vec::Vec::new(),
             out_sink: None,
             in_window: false,
+            sel: crate::video::termsel::LineSel::new(),
         }
     }
 
@@ -235,6 +240,17 @@ impl Console {
 
         let input_x = m.margin + m.text_w(prompt.len());
         pal.draw_text(input_x, prompt_y, &self.current_input, 0xFFFFFF);
+
+        // TERMSEL — the selection as an INVERSE-VIDEO band: the selected cells filled with the text
+        // colour, their characters redrawn in the background colour. Here and nowhere else, so the
+        // full repaint and the per-keystroke path (both call this) paint the same band. One cell
+        // tall, exactly as the cursor below is. No witness: a repaint is not a state change (the
+        // model prints those).
+        if let Some((lo, hi)) = self.sel.range(self.current_input.len()) {
+            let band_x = input_x + m.text_w(lo);
+            pal.draw_rect(band_x, prompt_y, m.text_w(hi - lo), m.cell_h, 0xFFFFFF);
+            pal.draw_text(band_x, prompt_y, self.current_input.get(lo..hi).unwrap_or(""), Self::BG);
+        }
 
         let cursor_x = input_x + m.text_w(self.current_input.len());
         pal.draw_rect(cursor_x, prompt_y, m.cell_w, m.cell_h, 0xFFFFFF); // exactly one cell
