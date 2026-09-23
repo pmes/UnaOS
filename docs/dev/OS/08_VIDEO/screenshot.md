@@ -1,9 +1,10 @@
 # Screen capture — PRTSCR
 
-Print Screen, and the `screenshot` verb, write the panel to `SCREEN<n>.PNG` **in the logged-in
-user's own `Pictures/Screenshots` folder** — and refuse, writing nothing, when nobody is logged in
-(§12, PRTSCR-HOME; it was the volume root until 2026-09-13). This document states what the mechanism
-is, where each piece runs, and what it refuses.
+Print Screen, and the `screenshot` verb, write the panel to a PNG **on the logged-in user's own
+Desktop** — `/home/<name>/Desktop` under the CRISPY theme — and refuse, writing nothing, when nobody
+is logged in (§12, SCRSHOT-DESKTOP/R60; the folder was `Pictures/Screenshots` from 2026-09-13 and the
+volume root before that). This document states what the mechanism is, where each piece runs, and what
+it refuses.
 
 Source: [`video/png.rs`](../../../../unaos/crates/kernel/src/video/png.rs) (the encoder),
 [`video/prtscr.rs`](../../../../unaos/crates/kernel/src/video/prtscr.rs) (capture, naming, write,
@@ -112,14 +113,38 @@ the kernel compiles and decode the result with a real zlib.
 
 ## 5. Naming, and the no-overwrite rule
 
-`SCREEN0.PNG` .. `SCREEN99.PNG` **in the capture directory** (§12 — the volume root until
-2026-09-13), first free index wins. The index therefore counts **per user**: two users each get their
-own `SCREEN0.PNG`, and neither can exhaust the other's hundred names. **An existing capture is
-never overwritten**: the search asks `locate_in_dir(dir, name)` per candidate and takes the first
-`NotFound`; when all hundred are present the capture refuses and says so rather than wrapping around
-onto `SCREEN0.PNG`. The lookup goes through the filesystem rather than a directory listing because
-`locate_in_dir` matches on both the 8.3 short name and any long name, and `create_in_dir` does not
-de-duplicate. The names are 8.3-clean, so they need no long-name entry.
+A Mac writes `Screenshot 2026-09-22 at 17.31.02.png`. **We cannot** — `fs/fat.rs:118` writes 8.3
+short names only and every separator in that name is illegal here. §13 states what the FATLFN arc
+must add to earn it. Until then `prtscr::choose_name` picks, in order:
+
+| rule | name | when | `name_from=` |
+|---|---|---|---|
+| clock stamp | `MMDDHHMM.PNG` — e.g. `09221731.PNG` | the wall clock is set **and** that name is free | `clock` |
+| ladder | `SCREEN0.PNG` .. `SCREEN99.PNG`, first free index | the clock name is already taken (two captures inside one minute) | `clock-taken` |
+| ladder | the same | `clock::now()` is `None` — no wall clock this boot | `clock-unset` |
+
+**`MMDDHHMM` and not a packing.** Four zero-padded digit pairs, most-significant first, so a
+directory listed in name order is listed in **time order** — the one property a screenshot folder is
+actually used through. Nobody needs a comment to read `09221731`. The year and the seconds do not fit
+(twelve digits into eight) and are dropped **visibly**, rather than smuggled into a base-36
+cryptogram that buys one field and costs every future reader.
+
+**Today the ladder is what runs, on both lanes.** Measured, not assumed: `clock::now()`
+(`clock.rs:201`) answers `None` until something seeds the anchor, and nothing does — QEMU's hermetic
+slirp gateway answers no NTP (`:: SMOLNET: [sntp] 10.0.2.2 no reply — clock unsynced ::`) and the
+rMBP's flight-11 capture reads `clock=unsynced` on its own menu-bar witness at 43 s. There is no RTC
+read on either arch's boot path. The clock arm lights up for free the day `date -s`, SNTP on a real
+network, or an RTC seeds it.
+
+Both rules land **in the capture directory** (§12 — `Pictures/Screenshots` until 2026-09-22, the
+volume root until 2026-09-13), so the ladder index counts **per user**: two users each get their own
+`SCREEN0.PNG`, and neither can exhaust the other's hundred names. **An existing capture is never
+overwritten** in either arm: the search asks `locate_in_dir(dir, name)` per candidate and takes the
+first `NotFound`; when all hundred ladder names are present the capture refuses and says so rather
+than wrapping around onto `SCREEN0.PNG`. The lookup goes through the filesystem rather than a
+directory listing because `locate_in_dir` matches on both the 8.3 short name and any long name, and
+`create_in_dir` does not de-duplicate. Every name this module mints is 8.3-clean, so none of them
+needs a long-name entry.
 
 ## 6. Writing, and `Busy`
 
@@ -469,21 +494,34 @@ The encode step is probed for the same reason: it spends seconds of passes befor
 volume-touching call, so an entry created on a disk that has left, or on a stranger's, is precisely
 the stale-handle write this refuses.
 
-## 12. PRTSCR-HOME — a capture belongs to a user, and lands in that user's own folder
+## 12. SCRSHOT-DESKTOP — a capture belongs to a user, and lands on that user's Desktop
 
-Peter, 2026-09-13: *"screenshots should be saved to a user's ~/Pictures/Screenshots"*, and on the
-no-session half, *"do not hack screenshots to make it work right before multi-user is in."* This is a
-consequence of R51 (multi-user as a line: a human logs in and gets a home folder). What it settles is
-**whose** folder — which makes the no-session case the load-bearing half, not an edge.
+**Two rulings, a week apart, answering two different questions. Both are live; neither replaces the
+other, and reading them as one is the mistake this section exists to prevent.**
+
+| ruling | the question it answers | what it says |
+|---|---|---|
+| PRTSCR-HOME, 2026-09-13 | **whose** folder | *"screenshots should be saved to a user's ~/Pictures/Screenshots"*, and on the no-session half, *"do not hack screenshots to make it work right before multi-user is in."* A consequence of R51 — multi-user as a line: a human logs in and gets a home folder. Settling that a capture has an **owner** is what makes the no-session case the load-bearing half, not an edge. |
+| **R60**, 2026-09-22 | **which** folder | *"is screenshot working? mac saves to desktop, correct? we should too, on this pioneer crispy theme anyway. we will be implementing a windows-esque them at some point so key-bindings shouldn't be hard coded."* The destination is `Desktop` — **and it is a property of the THEME**, on the same argument the ruling makes about key bindings in the same breath. |
 
 ### 12.1 The destination
 
 `fs::users::whoami` names the open session; `fs::users::home_of` turns that name into the user's home
 path (`/home/<name>` — the same path `ensure_home` creates at first login). The capture directory is
-that home plus `Pictures` plus `Screenshots`. `prtscr::ensure_capture_dir` walks it and creates what
-is absent, component by component, on the volume the PRTSCR-VOL ladder (§6) settled on. **This module
-reads `fs/users.rs` and writes nothing there**: `whoami` and `home_of` were already public and are
-the whole of the interface.
+that home plus **one** leaf, and the leaf is `video::theme::CAPTURE_DIR` — `Desktop` under CRISPY —
+so the resolved destination is `/home/<name>/Desktop`. `prtscr::ensure_capture_dir` walks it and
+creates what is absent, component by component, on the volume the PRTSCR-VOL ladder (§6) settled on.
+**This module reads `fs/users.rs` and writes nothing there**: `whoami` and `home_of` were already
+public and are the whole of the interface.
+
+**`video/prtscr.rs` does not know the word `Desktop` and must not learn it.** It asks the theme
+table, exactly as `video/wm.rs` asks that table what colour a title bar is. R60's second sentence is
+about key bindings, but its argument is about both: a Windows-shaped theme is coming, and the folder
+a screenshot lands in is as much a fact about the desktop the user is looking at as the chord that
+takes it. The second theme is one more `const` in `video/theme.rs` and **no edit at all** in
+`prtscr`; a string literal in `prtscr` would be exactly the hard-coding the ruling names. For the
+same reason every witness that reports the destination prints `theme=` beside it — the day two
+themes exist, `dir=/home/una/Desktop` alone does not say which table answered.
 
 Note which volume that is, because the two can differ and the difference is not a defect: the home
 `ensure_home` makes lives on the EL0 volume, while a capture goes to the ladder's answer — which on a
@@ -498,7 +536,7 @@ cluster into the parent entry **last** — the same shape as `write_grow`'s SAFE
 inside it leaves either no entry or a valid empty directory, never an entry pointing at an
 uninitialised cluster.
 
-### 12.2 The 8.3 question, answered from the code that decides it
+### 12.2 The 8.3 question, answered from the code that decides it — and R60 retired the alias
 
 **This FAT layer reads long file names and writes 8.3 only.** Both halves matter here:
 
@@ -507,29 +545,36 @@ uninitialised cluster.
 | **read** | VFAT long names ARE parsed (PI-FS-3): `LfnBuf` accumulates the 0x0F-attribute component slots preceding a short entry and checksum-validates the run; `DirEntry::eq_name` then matches **either** the long name or the 8.3 short name, ASCII-case-insensitively | `fs/fat.rs:190`, `fs/fat.rs:365`–`460` |
 | **write** | 8.3 ONLY — *"this driver's create path writes 8.3 names only (VFAT LFN write is out of scope)"*. `format_83` is the decider: base `1..=8`, extension `0..=3`, each a legal short-name byte, else `None`. `create_dir` validates through it before allocating anything, so a rejected name returns `FatError::Unsupported` and leaks no cluster | `fs/fat.rs:118`, `fs/fat.rs:325`, `fs/fat.rs:3562` |
 
-`"Screenshots"` is **eleven** characters. `format_83` returns `None` for it. **We cannot create a
-directory called `Screenshots` on this filesystem.** So the rule is *look up long, create short*:
+**`Desktop` is SEVEN characters, and that is the quiet gift in R60's destination.** PRTSCR-HOME
+needed a two-spelling alias table: `"Screenshots"` is **eleven** characters, `format_83` returns
+`None` for it, and we could not create a directory by that name on this filesystem at all — so the
+rule was *look up long, create short* (`Screenshots` → `SCRSHOTS`, visibly an abbreviation and never
+the truncation `SCREENSH`, which reads as a damaged word). A seven-character leaf clears the base
+bound with a character to spare:
 
 | the user asked for | looked up as | created as | why |
 |---|---|---|---|
-| `Pictures` | `Pictures` | `PICTURES` | 8 characters — a legal 8.3 base exactly as written, no compromise at all. Uppercase because short names are stored uppercase. |
-| `Screenshots` | `Screenshots` | `SCRSHOTS` | 11 characters — impossible as a short name. |
+| `Desktop` | `Desktop` | `DESKTOP` | 7 characters — a legal 8.3 base exactly as written. **No alias, no second spelling.** Uppercase because `format_83` upcases what it stores, not because anything in the kernel does. |
 
-Both lookups run before either create, so a volume that **already** carries a real
-`Pictures/Screenshots` — a stick formatted and filled on a host — is adopted verbatim and nothing new
-is made. Only a genuinely absent folder is created, and then in 8.3.
+**The alias table is gone rather than re-pointed.** `DIR_CAPTURE` in `video/prtscr.rs` keeps the
+`(look up, create)` pair type and puts `theme::CAPTURE_DIR` in **both** fields, so there is exactly
+one place the destination is written down and no second spelling that could drift from it.
+`path_for_home` renders the medium's upcase through the same fold it already applies to the home's
+own components, for the same reason.
 
-**`SCRSHOTS`, not `SCREENSH`.** A truncation to the first eight characters reads as a corrupted word,
-and it is not even the alias a real VFAT driver would write (that would be `SCREEN~1`, beside a long
-entry we have no way to author). `SCRSHOTS` is visibly an abbreviation, so an operator reading the
-stick on another machine sees a deliberate name rather than damage.
+The lookup runs before the create, so a volume that **already** carries a `Desktop` — a stick
+formatted and filled on a Mac — is adopted verbatim, with its own spelling, and nothing new is made.
+Only a genuinely absent folder is created, and then in 8.3. So: `/home/<name>/DESKTOP` on a volume we
+created it on, `/home/<name>/Desktop` on one where it already existed, and the mapping is on the wire
+for every capture rather than something a reader has to infer.
 
-**So what is really on disk, and what does the user see?** On a volume we created the folder on:
-`/home/<name>/Pictures/SCRSHOTS`, and the witness line prints exactly that. On a volume where the
-folder already existed with a long name: `/home/<name>/Pictures/Screenshots`, spelled as the user
-spelled it. The mapping is on the wire for every capture, so it is never something a reader has to
-infer. `DIR_SHOTS` in `video/prtscr.rs` is the single place that changes should the create path ever
-learn to write LFN component slots.
+**The 8.3 legality of a future theme's word is measured, not const-asserted.** A compile error is not
+a red run, and the go-red for this whole section is to point `theme::CAPTURE_DIR` at a name
+`format_83` refuses. `dir_fixture` therefore checks the **necessary** condition on the wire every
+boot (`legal83=` — one component, no dot, base `1..=8`), stated in `prtscr` because `format_83` is
+private to `fs/fat.rs` and this arc does not touch that file. The **sufficient** proof is the
+decider's own answer, which reaches the wire through `dir_refused`'s `-> REFUSED (unsupported name)`
+line on any lane that has a session and a writable volume to reach it.
 
 ### 12.3 No session means no capture — and that is the answer, not a gap
 
@@ -571,14 +616,22 @@ is a broken instrument. It runs on the first pass after a login.
 ### 12.4 The wire
 
 ```
-:: PRTSCR-DIR: user=una home=/home/una path=HOME/UNA/PICTURES/SCRSHOTS created=2 reason=session -> RESOLVED ::
-:: PRTSCR: SCREEN0.PNG 1920x1200 6912345 bytes -> OK :: source=usb serial=0x1A2B3C4D dir=HOME/UNA/PICTURES/SCRSHOTS ::
+:: PRTSCR-DIR: theme=crispy user=una home=/home/una dir=/home/una/Desktop path=HOME/UNA/DESKTOP created=1 reason=session -> RESOLVED ::
+:: PRTSCR: SCREEN0.PNG 1920x1200 name_from=clock-unset -> capturing (6912345 bytes reserved; …) ::
+:: PRTSCR: SCREEN0.PNG 1920x1200 6912345 bytes -> OK :: source=usb serial=0x1A2B3C4D dir=HOME/UNA/DESKTOP ::
 ```
+
+`theme=` and `dir=` are R60's two new fields on the RESOLVED line and no new line was added for them
+— a capture's witness is bounded evidence, not a feed. `dir=` is the destination as the **user**
+would say it (their own home, the theme's word); `path=` stays what the **medium** spells (upcased,
+or an adopted long name), and the two differing is the 8.3 mapping being visible rather than
+inferred. `created=` counts components this walk made, so `0` means every one of them was adopted.
+`name_from=` on the `-> capturing` line is §5's naming rule, named rather than inferred from shape.
 
 and, on every board today:
 
 ```
-:: PRTSCR: no user session (reason=no-login-built) — a capture belongs to a user's Pictures/Screenshots and there is none; NOTHING WRITTEN (no name chosen, no volume touched) — capture skipped ::
+:: PRTSCR: no user session (reason=no-login-built) — a capture belongs to a user's own Desktop folder (theme=crispy) and there is none; NOTHING WRITTEN (no name chosen, no volume touched) — capture skipped ::
 ```
 
 `dir=` is appended to the verdict line's **second** `::`-delimited segment, never folded into the
@@ -587,8 +640,13 @@ first: `scorers-render9.sh` keys on `bytes -> OK ::` being contiguous (A17 at :3
 cannot fire, produced by a witness change. The failure line names the component the walk stopped at:
 
 ```
-:: PRTSCR-DIR: user=una home=/home/una path=HOME/UNA at=Pictures -> REFUSED (-ENOSPC) — nothing written ::
+:: PRTSCR-DIR: theme=crispy user=una home=/home/una path=HOME/UNA at=Desktop -> REFUSED (-ENOSPC) — nothing written ::
 ```
+
+This is also where `format_83`'s **own verdict** on the theme's word reaches the wire: a
+`CAPTURE_DIR` the short-name decider refuses comes back from `create_dir` as `FatError::Unsupported`
+and prints here with nothing written and no cluster leaked (`create_dir` validates before it
+allocates, `fs/fat.rs:3562`).
 
 The resolved path is clipped at `DIR_PATH_MAX` (120 bytes) for printing only — an adopted long name
 can be up to `LNAME_MAX` (768) bytes, and two of those would put ~1.5 KB on one serial line against
@@ -604,8 +662,13 @@ service pass after the first.
 
 | arm | asserts | go red by |
 |---|---|---|
-| A — a resolved user home | `path_for_home("/home/una") == "HOME/UNA/PICTURES/SCRSHOTS"` — the 8.3 mapping stated as a mapping, volume-free so it runs on a board with no filesystem | changing `DIR_SHOTS`'s create spelling (to the truncation `SCREENSH`, say), or dropping the upcase in `path_for_home` |
+| A — the destination R60 named, and the 8.3 mapping it goes through | three claims, because they fail for three different reasons: `path_for_home("/home/una") == "HOME/UNA/DESKTOP"` (the want is a **literal** — a want derived from `theme::CAPTURE_DIR` would assert nothing, and R60 named this folder by name); the theme is on the wire (`theme=crispy dir=/home/una/Desktop`); and `legal83=true` for the theme's word. Volume-free, so it runs on a board with no filesystem — which is exactly the board `./arroyo test` gives us, and the reason this is the arm the wc lane can score | pointing `theme::CAPTURE_DIR` at a name `format_83` refuses. Restoring the pre-R60 `"Screenshots"` does both halves at once — the rendered path becomes `HOME/UNA/SCREENSHOTS`, which is not the want, and `legal83=false` names **why** that folder could never have been created. Dropping the upcase in `path_for_home` reds it the other way, on the path alone |
 | B — no session refuses, writing nothing | `plan_dir(None)` is `Err(NoSession)`, **and** the real `capture()` refuses with that variant while the `CAPTURES` census does not move | giving `plan_dir` a fallback destination for `None` — the shared-folder hack — which turns the `Err` false and the capture into an attempted write |
+
+Both arms are pinned in `scripts/specs/x86-wc.spec` (SCRSHOT-DESKTOP block). The live
+`:: PRTSCR-DIR: … -> RESOLVED ::` line is **not** pinned there and must not be: it needs a session
+and a writable volume, and no `./arroyo test` lane has either (§12.6). It is a PENDING in the same
+block, for the boot that can print it.
 
 Arm B drives the real `capture()` only when the machine genuinely has no session. If one is open, a
 boot-time fixture must not help itself to the operator's panel and write a file nobody asked for, so
@@ -615,7 +678,48 @@ contract.
 ### 12.6 What is exercisable today
 
 Honestly: **nothing on the happy path.** With `login` off by default and no boot login screen, every
-capture on every current build takes the refusal. Arm A proves the 8.3 mapping and arm B proves the
-refusal and its silence, and those are real gates that run on every boot — but the resolved-home
-write is proven by construction and by `UNAOS_LOGIN=1` compilation, not by a booted capture. It
-becomes exercisable the moment SO43's login screen lands, with nothing here to unwind.
+capture on every current build takes the refusal. Arm A proves the destination and the 8.3 mapping
+and arm B proves the refusal and its silence, and those are real gates that run on every boot — but
+the resolved-home write is proven by construction and by `UNAOS_LOGIN=1` compilation, not by a booted
+capture. Measured at R60's fold, so the next reader does not have to re-derive it:
+
+* **The wc lane has no session.** `UNAOS_LOGIN=1 … ./arroyo test` builds the store and nobody logs
+  in; the `loginst` fixtures open a session and **close it again** (`fs/users.rs:918`'s chain puts
+  the boot back where it found it — row closed, screen down, no session), so even the armed lane
+  reads `live=no-session` on arm B.
+* **The wc lane has no writable volume for a capture.** The plain `test` medium is read-only to the
+  PRTSCR-VOL ladder's rung 1 and attaches no USB FAT for rung 2, so `PRTSCR-ST` (§8) stays in its
+  announced wait. `UNAOS_PRTSCRST=1 ./arroyo test-fat sf` is the lane that has one.
+* **Metal says the same thing, out loud.** Flight 11 pressed ⌘⇧3 for real at 798 s and got
+  `:: PRTSCR-VOL: rung=none rung1=read-only rung2=absent -> NO TARGET ::` — the rMBP's internal SD
+  reader is read-only by policy (§8.1) and no stick was in.
+
+All three are cured by work already in flight rather than by anything here: LOGINFLOW lands the
+session, R59 lands the boot volume read-write, and on flight 12 a ⌘⇧3 after logging in should print
+the RESOLVED line above and leave the file on Peter's own card.
+
+## 13. What the Mac name needs — the FATLFN arc, NOT started here
+
+A Mac writes `Screenshot 2026-09-22 at 17.31.02.png`. Thirty-six characters, two spaces and three
+dots: not merely too long, but illegal in every separator. `fs/fat.rs:118` states the constraint
+outright — *"this driver's create path writes 8.3 names only (VFAT LFN write is out of scope)"* — so
+this is a **missing feature**, and §5's `MMDDHHMM.PNG` is what we do until it lands, not a substitute
+for it.
+
+**The read half is already built and is the specification for the write half.** PI-FS-3's `LfnBuf`
+accumulates the 0x0F-attribute VFAT component slots preceding a short entry, checksum-validates the
+run against that short name, and decodes it; `DirEntry::eq_name` (`fs/fat.rs:190`) then matches
+either spelling. What FATLFN must add is the inverse of exactly that, and only that:
+
+1. **Emit the component slots** — 13 UTF-16 code units each, written in reverse order, with
+   `LAST_LONG_ENTRY` (0x40) or'd into the sequence number of the first one written.
+2. **Compute the one-byte checksum** over the 11-byte short-name field, the same checksum the read
+   path already verifies, and stamp it into every slot of the run.
+3. **Allocate the run and the short entry contiguously** in one directory extend, with a crash order
+   as deliberate as `create_dir`'s and `write_grow`'s: a boot cut must leave either no entry or a
+   complete run, never a short entry whose long slots are half-written.
+4. **Mint a non-colliding short alias** for the short field — the `NAME~1` form a real VFAT driver
+   writes, with the `~n` bumped against what the directory already holds.
+
+It is its own arc because item 3 is its own argument. This arc (SCRSHOT-DESKTOP) is the
+**destination**; the name waits on that one.
