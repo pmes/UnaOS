@@ -1,0 +1,162 @@
+# Key bindings — KEYMAP
+
+Every chord the desktop understands is a **row in a table that belongs to the theme**, and one
+resolver reads it. Before this arc every chord was a literal in a USB driver: `drivers/xhci/mod.rs`
+tested `HID_MOD_GUI` and `HID_MOD_SHIFT` and usages `0x20`/`0x21` inline, the EHCI decoder called
+that same function, and Print Screen was a second literal (`0x46`) beside it. A Windows-shaped theme
+could not have been added without editing the USB drivers.
+
+Peter, 2026-09-22, [R60](../../RULINGS.md): *"we will be implementing a windows-esque them at some
+point so key-bindings shouldn't be hard coded."* And [R61](../../RULINGS.md): *"i prefer command-c
+and friends (alt-c on pc) then there's no special case for the command line to resolve that
+usability question."*
+
+Source: [`video/keymap.rs`](../../../../unaos/crates/kernel/src/video/keymap.rs) (the mechanism —
+`Action`, `Binding`, `Table`, the resolver and the fixture),
+[`video/theme.rs`](../../../../unaos/crates/kernel/src/video/theme.rs) tail (the rows — `CRISPY_ROWS`
+/ `CRISPY_BINDINGS` and `PC_ROWS` / `PC_BINDINGS`), and the two HID decoders that ask it:
+[`drivers/xhci/mod.rs`](../../../../unaos/crates/kernel/src/drivers/xhci/mod.rs) (the hand-off
+`hid_screenshot_chord_edge` / `hid_print_screen_action_edge`, and the call site in the keyboard
+branch of the event dispatch) and
+[`drivers/ehci/mod.rs`](../../../../unaos/crates/kernel/src/drivers/ehci/mod.rs) (the twin call site
+in `service_ehci_hid`, and the fixture's chain point in `parser_selftest`). The capture half is
+[screenshot.md](screenshot.md).
+
+## 1. The shape
+
+| Type | What it is |
+|---|---|
+| `Action` | what a chord MEANS — `Screenshot`, `ScreenshotRegion`, `Copy`, `Cut`, `Paste`, `SelectAll`, `LogOut`. Named for the desktop's intent, never for a key. |
+| `Binding` | a ROLE mask + a HID usage + the `Action` + a witness `token`. |
+| `Table` | a name, a row list in precedence order, and **`cmd_role`** — the physical HID modifier bits that play the abstract *Command* role on that table. |
+| `resolve(table, modifiers, usage_edge)` | **the only place a chord is judged.** |
+
+Role bits (`CMD`, `SHIFT`, `CTRL`, `ALT`) are *not* HID bits. `⌘C` is written once, as
+`CMD | usage 0x06`, and the table decides whether the operator's hand is on the GUI key or the Alt
+key. No row anywhere names a physical modifier — that is the whole seam, and it is one field wide.
+
+## 2. What is in the CRISPY table
+
+`CRISPY_ROWS`, in precedence order:
+
+| Chord | Usage | Action | Token |
+|---|---|---|---|
+| `Cmd+Shift+3` | 0x20 | `Screenshot` | `cmd-shift-3` |
+| `Cmd+Shift+4` | 0x21 | `ScreenshotRegion` | `cmd-shift-4` |
+| `Cmd+Shift+Q` | 0x14 | `LogOut` — **a SLOT** | `cmd-shift-q` |
+| `Cmd+C` | 0x06 | `Copy` | `cmd-c` |
+| `Cmd+V` | 0x19 | `Paste` | `cmd-v` |
+| `Cmd+X` | 0x1B | `Cut` | `cmd-x` |
+| `Cmd+A` | 0x04 | `SelectAll` | `cmd-a` |
+| Print Screen | 0x46 | `Screenshot` (no roles named) | `print-screen` |
+
+`cmd_role` is `HID_MOD_GUI` (0x88 — left **and** right, as every `HID_MOD_*` mask is).
+
+**`LogOut` is a slot.** `⌘⇧Q` resolves and nothing in this tree acts on it. LOGINFLOW may bind it;
+nothing else may.
+
+## 3. The second table, and why it is here
+
+`PC_BINDINGS` is a PC-shaped table: `cmd_role` is `HID_MOD_ALT`, the edit rows are the same rows in
+role space (so `Alt+C` is copy with no second `Copy` row written anywhere), and the capture chords
+are `PrtSc` / `Shift+PrtSc` instead of the Apple digits.
+
+**It is selected by nothing.** It is compiled, resolvable, and reached today only by the fixture's
+`pc_table_alt_c=` leg. A knob that selects it is NOT this arc; when one is written it changes
+`keymap::active()` and nothing else. It exists so that the seam is *proved* rather than asserted: if
+the role indirection were cosmetic, `pc_table_alt_c=` would read `none` while every other field
+stayed `ok`.
+
+## 4. R61 — why the command line needs no special case
+
+`Ctrl-C` keeps its interrupt meaning in the shell, on every window, because **the table never claims
+it**. There is no guard, no terminal branch, and no focus test anywhere: `CTRL` is a role the
+resolver understands and no shipped row uses it, so `resolve(CRISPY, HID_MOD_CTRL, 0x06)` is `None`
+and `hid_key_ascii(0x06, HID_MOD_CTRL, false)` still returns `0x03` exactly as it did before KEYMAP.
+The fixture measures both halves — `ctrl_c_action=none` and `ctrl_c_ascii=0x03` — rather than
+asserting them, and not one line of the ascii fold changed in this arc.
+
+**A chord types nothing, and that needed no new rule.** `hid_key_ascii` already returns 0 for any
+usage while a GUI **or** an Alt bit is held, so both `cmd_role` spellings suppress the character on
+their own.
+
+## 5. Rules the table keeps from the code it replaced
+
+* **Extra modifiers held do not disqualify.** `⌃⌘⇧3` is still a screenshot (macOS's rule, and the
+  old predicate's documented behaviour). A row requires the roles it names to be down and says
+  nothing about the ones it does not.
+* **Left and right of a modifier count alike.** The test is `!= 0` against a two-bit mask, never
+  `== mask`.
+* **The edge, not the level.** A boot report carries the set of keys HELD, so `resolve_edge` diffs
+  against the previous report. A chord held for half a second arms one capture.
+* **Precedence is the table's contract, and it is checked at compile time.** `keymap::no_shadow`
+  refuses a table in which a row shadows a later one — same usage, and everything the earlier row
+  requires also required by the later, so the later can never be reached. The hazard is real: a bare
+  `PrtSc -> Screenshot` row above `Shift+PrtSc -> ScreenshotRegion` disarms the region chord in
+  silence, with every gate green, because nothing on a wire says a row was never consulted. Both
+  shipped tables assert it at the foot of `theme.rs`.
+
+## 6. Delivery — what this arc did NOT build
+
+The screenshot actions are delivered: the decoders test `Action::is_capture()` and call
+`prtscr::request()` exactly as they did before, so the wire keeps its shape and gains one field:
+
+```
+:: PRTSCR: [prtscr] chord=cmd-shift-3 (GUI+Shift+digit) down on EHCI -> capture armed action=screenshot ::
+:: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed action=screenshot ::
+```
+
+**The edit actions have no consumer and no delivery path.** There is no clipboard in this tree
+(measured: `grep -r -i clipboard unaos/crates/kernel/src/video/` finds prose only), so `Copy`, `Cut`,
+`Paste` and `SelectAll` resolve and stop at the decoder.
+
+Delivering them to the focused window means one new `pal::Event` variant carrying the `Action`, which
+the terminal window would then receive like any other event and ignore. That change is **outside
+KEYMAP's file list** and is named here rather than half-built:
+
+| File | Change |
+|---|---|
+| `pal.rs` | one variant on `enum Event`, e.g. `Action(crate::video::keymap::Action)`, plus its arm in `push_locked`'s `is_key`/`is_ptr` classification (neither — it is a third kind). |
+| `arch/x86_64/syscall.rs` (~:5623) | an arm in the `Event -> (ty, payload)` match, which is **exhaustive**. |
+| `arch/aarch64/syscall.rs` (~:13219) | the same arm in the aarch64 twin, also exhaustive. |
+| `una_abi` | one `INPUT_EV_ACTION` code, if the action is to reach ring 3 at all. |
+| the two decoder call sites | `crate::pal::push_event(Event::Action(act))` on the non-capture arm. |
+
+Until then the resolver is the product, and it is the part R60 asked for.
+
+## 7. The fixture
+
+`keymap::selftest()`, chained from `drivers::ehci::parser_selftest` — the same chain that hosts
+`[tp] dispatch self-test`, for the same reason: the DECISION is the only part of an input path QEMU
+can exercise, because QEMU has neither an Apple pad nor an operator's hands. It resolves only; it
+arms no capture and requests nothing, so the lane behaves exactly as it did.
+
+```
+:: KEYMAP: table=crispy resolved=11 screenshot=ok region=ok copy=ok paste=ok cut=ok selectall=ok ctrl_c_ascii=0x03 ctrl_c_action=none pc_table_alt_c=copy prtsc=ok extramods=ok logout=ok rows=8/6 -> PASS ::
+```
+
+Every field is a comparison, not a restatement:
+
+* `resolved=` counts AGREEMENTS, not rows — deleting a row lowers it.
+* `screenshot=` / `region=` drive a REPORT PAIR, so the edge is under test and not just the mask.
+* `ctrl_c_ascii=` is measured through `hid_key_ascii`, the decoder the shell actually reads.
+* `pc_table_alt_c=` reads the same role row through the other table's `cmd_role`.
+* `extramods=` is `⌃⌘⇧3`, the rule that survives from the predicate this replaced.
+
+Gate: `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_QEMU_FULL=1 ./arroyo test 240`,
+scored by [`scripts/specs/x86-wc.spec`](../../../../unaos/scripts/specs/x86-wc.spec).
+Go-red: delete the `Cmd+C` row from `CRISPY_ROWS` — `copy=no`, `resolved=10`, `-> FAIL`.
+
+## 8. What a Windows theme will have to add
+
+Nothing in `keymap.rs`, and nothing in either driver. A second theme adds:
+
+1. its own `*_ROWS` and `*_BINDINGS` in its theme module, with `cmd_role` set to whichever physical
+   modifier that keyboard puts under the operator's thumb;
+2. the rows for chords CRISPY has no concept of (`Ctrl+Alt+Del`, `Win+L`, an `F13` capture key) —
+   each one is a row, and a new **meaning** is a new `Action` variant plus its `name()` arm;
+3. a way to pick it, which is `keymap::active()` and nothing else.
+
+What it will *not* be able to reuse is the `CTRL` role's emptiness: a Windows-shaped theme that binds
+`Ctrl+C` to copy re-opens exactly the command-line question R61 closed, and that is a ruling to ask
+for, not a row to write.
