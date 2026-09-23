@@ -873,6 +873,10 @@ paragraph above says a go-red had to be DELIBERATE.
 
 ---
 
+### 1e. `:: DOCK: strip … vacate=false :: FAIL ::` — **measured 2026-09-23 (rmbp seat, gate10 at 29ca25d0): 1 in 8, timing-shaped, mechanism NOT yet read**
+
+The fixture is `video/dock.rs` `selftest()` (:1193), the strip leg 6 at ~:1360–1377 ("THE STRIP OWES ITS VACATED PIXELS"): it samples `SLOT.packed()` before closing three windows and again after, and requires the packed rect to CHANGE (`vacate_ok = rect_before == 0 || rect_after != rect_before`). Every other term on the line read true. Population on the same code (29ca25d0 or its dock/strip-identical ancestors): gate9a wc lane at cd642fd8 (host load 28) PASS; DOCKSTAMP's three wc runs at c65e5618 PASS; gate10's ptr lane at 29ca25d0 PASS; two wc reruns on a detached tree at 29ca25d0 (`logs/foldgate/wcre-run{1,2}.log`, loads 7 and 10) PASS; gate10's wc lane at 29ca25d0 (load 10) FAIL. The `[strip] vacate tenant=dock box=444x52+418+736 uncovered_px=5616 erased=yes src=flat -> SCENE-RESTORE` line is present in the red run exactly as in the green ones, so the strip DID vacate on the wire; what differed is the rect the fixture read. Candidate mechanisms, none measured: the after-sample raced the strip's re-pack (Class 1 shape — the ground-truth re-read races the fixture's teardown), or the before-sample read a rect already vacated by an earlier close. Disposition: ON WATCH; the next red run's `[strip]`/`[dock]` lines around the verdict are the evidence to read first; a fix is a `video/dock.rs` fixture arc, not a seat edit.
+
 ## Class 2 — the evidence taps lose lines to a margin-tight serial ring
 
 ### 2a. SERWIT-2 `evidence_lost=N` — **ROOT CAUSE MEASURED 2026-09-22 (FLAKEFIX, rmbp-ledger B150); the original suspect REFUTED; FIX MADE 2026-09-22 (FLAKEFIX2, rmbp-ledger B159) and UNSCORED — the bench would not reach the ring's depth**
