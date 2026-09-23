@@ -76,8 +76,49 @@
 //! minute. Six poll periods: long enough that the drop-out rate flight 11 recorded
 //! (`retries=0/0` on every witness line, i.e. none at all on that boot) cannot reach it, short
 //! enough that a real removal is off the glass inside a minute.
+//!
+//! # MENUBATT2 — ⛔ THE POLL MUST STATE THAT IT RAN, BECAUSE SILENCE HERE HAS ALREADY BEEN READ AS A MEASUREMENT
+//!
+//! This is the rule this module was missing, and its absence produced a wrong finding in a ledger
+//! row rather than a wrong pixel on a screen.
+//!
+//! [`super::menubar`]'s `battery_witness` is the only thing that has ever spoken for this model, and
+//! it says NOTHING while [`Source::Unresolved`] — correctly, on its own terms: a line claiming
+//! absence before anything asked would be the opposite defect. But that makes THREE different facts
+//! print the same nothing:
+//!
+//!  1. the desktop service pass never ran, so [`poll`] was never called;
+//!  2. [`poll`] ran and the source has not resolved;
+//!  3. **this code is not in the image at all.**
+//!
+//! MENUFIRST (rmbp-ledger B156) read flight 11's 2.2 MB for a `[menubar] battery` line, found none,
+//! and concluded (2) — *"on an rMBP with a pack the status source never resolved for the whole
+//! boot"*. The answer is (3). Flight 11's image is **`56bbe53b`** (2026-09-22 08:12:41;
+//! `docs/dev/evidence/rmbp-0922/flight11/`, "image 3"), and `video/status.rs` **does not exist in
+//! that commit** — nor does `battery_witness`, nor the poll call in `desktop_uefi`. MENUSTAT folded
+//! at `0fb0f4fb`, 2026-09-22 15:42, seven and a half hours later. No poll could have run on that
+//! boot, and B148's own status cell already said so: *"the METAL half (a pack that actually answers)
+//! is flight 12's"*.
+//!
+//! So [`poll`] now speaks for ITSELF, from inside the sweep, over `[status] poll`: once on every
+//! change of the resolved source — which includes the first sweep of the boot, since [`WIRE_SRC`]
+//! starts on a value no source takes — and once per [`WIRE_MS`] thereafter. A capture with no
+//! `[status] poll` line is now a capture where the sweep did not run, which is a different sentence
+//! from the bar's silence and is falsifiable against `[wc-x] desktop-app` in the same function.
+//!
+//! ⚠ **What this instrument does NOT buy, stated so the next reader does not over-trust it.** No
+//! witness added here could have been in flight 11's image, because the FILE was not. The general
+//! cure for that class of error is not an instrument: it is reading a capture against the COMMIT its
+//! image was built from before inferring a code path's behaviour from a line's absence.
+//!
+//! The line is UNGATED inside the furniture gate — no `witness` term — for `battery_witness`'s
+//! reason: Peter's captures come off metal and the metal image is built without `witness`. It costs
+//! one relaxed load and one compare per SWEEP (~6 per minute), and nothing at all on the ~999
+//! service passes a second that return at the throttle without reaching the body.
 
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+use super::strip;
 
 // ---------------------------------------------------------------------------
 // The model
@@ -293,13 +334,32 @@ static LAST_POLL_MS: AtomicU64 = AtomicU64::new(0);
 /// Sweeps that actually ran, and how many of those the source answered. Both on the wire, so a
 /// capture separates "the service never ran" from "it ran and the SMC said nothing".
 static POLLS: AtomicU64 = AtomicU64::new(0);
+/// MENUBATT2 — SWEEPS that answered, which is why only [`poll`] increments it and [`store`] (the
+/// fixture's writer too) does not. See the note at that increment.
 static ANSWERS: AtomicU64 = AtomicU64::new(0);
+
+/// MENUBATT2 — how long `[status] poll` stays quiet while the resolved source is NOT changing. One
+/// minute: six sweeps, the same span [`STALE_MS`] gives a held reading, so a capture read at any
+/// point carries at least one statement of the poll's liveness from within the staleness window
+/// and a boot cannot go a minute without saying whether the sweep is still running. A CHANGE
+/// speaks immediately and does not wait for this.
+pub const WIRE_MS: u64 = 60_000;
+
+/// `crate::arch::ms()` of the last `[status] poll` line, `0` = never said.
+static WIRE_LAST_MS: AtomicU64 = AtomicU64::new(0);
+/// The source byte the last `[status] poll` line REPORTED, as distinct from [`SRC`], which is the
+/// source itself. Starts at [`SRC_UNSAID`] — a value no source takes — so the first sweep of the
+/// boot is a change and always speaks, whatever it resolved to.
+static WIRE_SRC: AtomicU8 = AtomicU8::new(SRC_UNSAID);
 
 const SRC_UNRESOLVED: u8 = 0;
 const SRC_NONE: u8 = 1;
 const SRC_SMC: u8 = 2;
 /// See [`Source::Fixture`]. Only [`inject`] writes it, and [`inject`] is `witness`-gated.
 const SRC_FIXTURE: u8 = 3;
+/// Not a source: the "no `[status] poll` line has been emitted yet" state of [`WIRE_SRC`]. It must
+/// stay outside the `SRC_*` range or the first sweep would be able to read as "unchanged".
+const SRC_UNSAID: u8 = 0xff;
 
 fn pack(b: Battery) -> u64 {
     (b.percent as u64 & 0xff)
@@ -361,8 +421,25 @@ pub fn poll() {
         return;
     }
     POLLS.fetch_add(1, Ordering::Relaxed);
+    // MENUBATT2 — the sweep's own COST, measured around exactly the six handshakes and nothing else.
+    // `now_cycles`/`strip::cycles_to_us` and not `arch::ms()`: the whole sweep is ~1.2 ms on the 2012
+    // rMBP, so a millisecond clock would report a two-valued number and a reader could not tell a
+    // clean sweep from one that spent its retry budget. This is the term that makes the poll's
+    // placement argument (WEDGE-8, the render-core rule) falsifiable on metal instead of asserted
+    // from a scout's arithmetic.
+    let t0 = crate::arch::now_cycles();
     match board_raw() {
         Some(b) => {
+            // MENUBATT2 — ⛔ [`ANSWERS`] IS COUNTED **HERE** AND NOT IN [`store`], AND THE FIRST
+            // MEASURED RUN OF THIS ARC IS WHY. It used to sit in `store`, which [`inject`] also
+            // calls, so the gate boot's own capture read `[status] poll n=7 answered=3 src=none`:
+            // three MENUBATT injections wearing the name of an SMC that had answered nothing. That
+            // is not a QEMU-only cosmetic — B156 records that **the flown images are witness
+            // builds**, so `inject` exists on metal and the fixture runs there, and flight 12's
+            // `answered=` would have carried the same three. A witness whose count can be inflated
+            // by a fixture is the `Source::Fixture` lesson one field over, and it is caught the
+            // same way: the term names SWEEPS THAT ANSWERED, so only a sweep may increment it.
+            ANSWERS.fetch_add(1, Ordering::Relaxed);
             store(b, now, SRC_SMC);
         }
         // A sweep that answered nothing. If the source has NEVER answered, that is the measured
@@ -378,27 +455,74 @@ pub fn poll() {
             );
         }
     }
+    let took_us = strip::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0));
+    poll_witness(now, took_us);
+}
+
+/// MENUBATT2 — **the poll's statement that it RAN**, and the module header's whole argument in one
+/// function. See that header for why silence here was not neutral.
+///
+/// `[status] poll n=4 answered=4 src=smc took_us=1180`
+///
+///  * `n=` / `answered=` are [`counts`] — sweeps that RAN, and how many the source answered. Two
+///    numbers rather than one because `n>0 answered=0` (the source is there and says nothing) and
+///    `n=0` (nothing swept) are the two halves MENUFIRST could not separate, and neither is the
+///    third case, NO LINE AT ALL, which is now what "the sweep did not run" looks like.
+///  * `src=` is the resolved source AT THIS SWEEP. It can never read `unresolved` on a line this
+///    function emits — every sweep resolves — which is why the spec FORBIDs that spelling: it would
+///    mean the resolve arms stopped covering the match.
+///  * `took_us=` is the six handshakes' measured cost, not the scout's ~1.2 ms estimate.
+///
+/// No lock and no allocation, and it is called from the throttled body, so the ~999 service passes
+/// a second between sweeps never reach it. Two cores cannot both be here for one window: the
+/// caller's `compare_exchange` on [`LAST_POLL_MS`] has already made the loser return.
+fn poll_witness(now: u64, took_us: u64) {
+    let src = SRC.load(Ordering::Relaxed);
+    let last = WIRE_LAST_MS.load(Ordering::Relaxed);
+    // The swap is the change test AND the record of it, in one operation, so a source that moves
+    // twice inside one [`WIRE_MS`] window cannot lose the second edge to a read-then-write race.
+    let changed = WIRE_SRC.swap(src, Ordering::Relaxed) != src;
+    if !changed && last != 0 && now.wrapping_sub(last) < WIRE_MS {
+        return;
+    }
+    WIRE_LAST_MS.store(now.max(1), Ordering::Relaxed);
+    let (polls, answers) = counts();
+    serial_println!(
+        "[status] poll n={} answered={} src={} took_us={}",
+        polls,
+        answers,
+        src_of(src).as_str(),
+        took_us
+    );
 }
 
 /// Publish a reading, stamped with the source that produced it. Split out so the fixture can drive
 /// the model without an SMC — and `src` is an ARGUMENT for exactly that reason: the fixture's
 /// readings must not leave this module wearing the driver's name (see [`Source::Fixture`]).
+/// MENUBATT2 — it does NOT touch [`ANSWERS`]. Publishing a reading and a SWEEP ANSWERING are two
+/// different events, and this function serves both writers; see the counter's note in [`poll`].
 fn store(b: Battery, now: u64, src: u8) {
     READING.store(pack(b), Ordering::Relaxed);
     VALID.store(1, Ordering::Relaxed);
     AT_MS.store(now, Ordering::Relaxed);
     SRC.store(src, Ordering::Relaxed);
-    ANSWERS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Where the item's facts come from, as resolved by the polls so far.
-pub fn source() -> Source {
-    match SRC.load(Ordering::Relaxed) {
+/// The stored byte as a [`Source`]. Split out of [`source`] so [`poll_witness`] can name the source
+/// of the sweep it just ran from the byte it already loaded, rather than re-reading [`SRC`] and
+/// risking a line whose `src=` term belongs to a different sweep than its `took_us=`.
+fn src_of(b: u8) -> Source {
+    match b {
         SRC_SMC => Source::Smc,
         SRC_FIXTURE => Source::Fixture,
         SRC_NONE => Source::None,
         _ => Source::Unresolved,
     }
+}
+
+/// Where the item's facts come from, as resolved by the polls so far.
+pub fn source() -> Source {
+    src_of(SRC.load(Ordering::Relaxed))
 }
 
 /// **The full reading plus its age in ms**, or `None` when there is no source or the held reading
@@ -425,7 +549,11 @@ pub fn bar_item() -> Option<BarItem> {
     Some(BarItem { percent: b.percent, charging: b.charging })
 }
 
-/// `(polls run, polls the source answered)` — for the bar's rollup line.
+/// `(polls run, polls the source ANSWERED)` — for the bar's rollup line and for `[status] poll`.
+///
+/// MENUBATT2: the second term counts sweeps, never fixture injections, so `n>0 answered=0` is the
+/// honest reading of a gate boot whose `isa-applesmc` carries no battery key even while MENUBATT's
+/// `inject` has driven a reading through the model three times.
 pub fn counts() -> (u64, u64) {
     (POLLS.load(Ordering::Relaxed), ANSWERS.load(Ordering::Relaxed))
 }
