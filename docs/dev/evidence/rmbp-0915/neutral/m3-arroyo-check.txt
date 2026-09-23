@@ -1,0 +1,84 @@
+NEUTRAL M3 — ./arroyo check on the renamed tree (verdict extract; full logs in the executor scratch)
+tree: exec-rmbp-neutral3 @ e72ef5ed (base 98fd8e66 + the M3 rename), dirty=0 at start
+
+=== env UNAOS_LEDGER_STRICT=1 UNAOS_K8REACH_STRICT=1 ./arroyo check
+EXIT: check-strict rc=1 2026-09-23T18:45:28Z
+⚡ kernel features: ehcihid,kbdwit,sdw,sdhcblk,smolnet,sdwrite
+  ✅ braces (every .rs balances outside strings and comments)
+✅ x86_64 OK
+✅ aarch64 OK
+✅ bootloader OK
+✅ knob-parity OK (every default-on arroyo feature is pushed by the x86 media builder)
+✅ kernel cfg coverage OK (84 legs)
+✅ userspace x86_64 OK (4 crates)
+✅ userspace aarch64 OK (5 crates)
+✅ midden_core tests OK
+  ✅ foreman agrees with mbench (verdict table and exit code)
+  ✅ SELF-TEST PASS — 44/44
+  ✅ mbench self-test (the scorer every verdict in this tree comes from)
+GATE-FAMILY: OK — 6 platform-split families, none grown
+  ✅ arch families (no per-platform copy added silently)
+GATE-APPEND: OK — 181 files, no statement hiding after a comment marker, none swallowed by one inserted ahead of it (4 controls fired)
+  ✅ verb alias closure (no $1-keyed guard names a subset of a verb's spellings)
+  ✅ fixture reachability (no leg added to an entry point a headless boot never runs)
+GATE-KNOB: OK — 210 features declared, 209 named by a cfg, 0 phantom, 0 dead, 0 trailing-comment cfg
+  ✅ k8 reachability (162 knobs: 15 armed, 147 registered unarmed — 103 still TODO)
+GATE-ROOTS: OK — 9 binary targets, every one named by a leg of check_both
+GATE-SPECROOTS: OK — 19 replay specs, every one named by a verb or a declared command
+  ✅ fc2 (no module declared wider than every path that can reach it)
+  ✅ lba32 (no 64-bit LBA narrowed to 32 bits outside a registered refusal)
+GATE-LEDGER: OK — 470 rows in 4 ledger file(s) + RULINGS + 4 queue file(s): ids unique, field counts match their header, absence claims name an enumeration (lexical sampler — see the header), status ∈
+GATE-BRANCH: RED — 5 finding(s):
+❌ check FAILED — a ledger row is unverifiable (see GATE-LEDGER above)
+cfg legs: 84 with rc=0, 0 with rc!=0; host 'test result: FAILED' lines: 0; '✖' lines: 0
+GATE-BRANCH findings (refs, not the tree — foreign/unregistered executor branches, report-not-touch):
+    refs/heads/exec-rmbp-dockvac f66c3558
+    refs/heads/exec-rmbp-lfn2 0a36be63
+    refs/heads/exec-rmbp-neutral3 e72ef5ed
+    refs/heads/exec-rmbp-stor2 fcef81d2
+    refs/heads/exec-rmbp-termsel 8686d7f6
+
+=== env UNAOS_TEGRA=1 UNAOS_LEDGER_STRICT=1 UNAOS_K8REACH_STRICT=1 ./arroyo check
+EXIT: check-tegra-strict rc=1 2026-09-23T18:49:00Z
+⚡ kernel features: ehcihid,kbdwit,sdw,sdhcblk,smolnet,tegra,bsptick,bsprun,tegrasmp,apsrun,sdwrite
+  ✅ braces (every .rs balances outside strings and comments)
+✅ x86_64 OK
+✅ aarch64 OK
+✅ bootloader OK
+✅ knob-parity OK (every default-on arroyo feature is pushed by the x86 media builder)
+✅ kernel cfg coverage OK (84 legs)
+✅ userspace x86_64 OK (4 crates)
+✅ userspace aarch64 OK (5 crates)
+✅ midden_core tests OK
+  ✅ foreman agrees with mbench (verdict table and exit code)
+  ✅ SELF-TEST PASS — 44/44
+  ✅ mbench self-test (the scorer every verdict in this tree comes from)
+GATE-FAMILY: OK — 6 platform-split families, none grown
+  ✅ arch families (no per-platform copy added silently)
+GATE-APPEND: OK — 181 files, no statement hiding after a comment marker, none swallowed by one inserted ahead of it (4 controls fired)
+  ✅ verb alias closure (no $1-keyed guard names a subset of a verb's spellings)
+  ✅ fixture reachability (no leg added to an entry point a headless boot never runs)
+GATE-KNOB: OK — 210 features declared, 209 named by a cfg, 0 phantom, 0 dead, 0 trailing-comment cfg
+  ✅ k8 reachability (162 knobs: 15 armed, 147 registered unarmed — 103 still TODO)
+GATE-ROOTS: OK — 9 binary targets, every one named by a leg of check_both
+GATE-SPECROOTS: OK — 19 replay specs, every one named by a verb or a declared command
+  ✅ fc2 (no module declared wider than every path that can reach it)
+  ✅ lba32 (no 64-bit LBA narrowed to 32 bits outside a registered refusal)
+GATE-LEDGER: OK — 470 rows in 4 ledger file(s) + RULINGS + 4 queue file(s): ids unique, field counts match their header, absence claims name an enumeration (lexical sampler — see the header), status ∈
+GATE-BRANCH: RED — 5 finding(s):
+❌ check FAILED — a ledger row is unverifiable (see GATE-LEDGER above)
+cfg legs: 84 with rc=0, 0 with rc!=0; host 'test result: FAILED' lines: 0; '✖' lines: 0
+GATE-BRANCH findings (refs, not the tree — foreign/unregistered executor branches, report-not-touch):
+    refs/heads/exec-rmbp-dockvac f66c3558
+    refs/heads/exec-rmbp-lfn2 0a36be63
+    refs/heads/exec-rmbp-neutral3 e72ef5ed
+    refs/heads/exec-rmbp-stor2 fcef81d2
+    refs/heads/exec-rmbp-termsel 8686d7f6
+
+READING: both runs are rc=1 and the ONLY red is GATE-BRANCH (ledger-check.sh's exit, reported under arroyo's
+'a ledger row is unverifiable' line; GATE-LEDGER itself reads OK under UNAOS_LEDGER_STRICT=1). Its five findings
+are executor branches with no line in docs/dev/exec-branches.txt — four peers' and this branch's own tip, which the
+seat registers at the fold; the brief forbids editing that file. Every compile leg, both arches, is green.
+GATE-FAMILY reads fn NAMES and M3 renamed six fns: still 6 families, none grown — the new `shellwin_*` names carry
+no platform affix and the old `tegra_shell_*` had no plain sibling, so neither side formed a family.
+GATE-NEUTRAL does not exist as a gate (0 hits in unaos/arroyo); its census is census.py (census-AFTER-m3.txt).

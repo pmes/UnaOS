@@ -1,0 +1,60 @@
+NEUTRAL M3 — the QEMU legs, BEFORE (base 98fd8e66, clean) and AFTER (e72ef5ed, the rename), same worktree, sequential
+verdict extract: m3-verdicts.awk — one family<TAB>verdict row per serial line carrying PASS/FAIL/SKIP/SKIPPED as a word
+(family = the leading `:: NAME:` or `[tag]`), counted with sort|uniq -c, then diff BEFORE vs AFTER.
+
+START base 2026-09-23T17:44:36Z HEAD=98fd8e66 dirty=0
+test-arm rc=0 2026-09-23T17:45:56Z
+kernel8-test rc=0 2026-09-23T18:00:41Z
+test-wc rc=0 2026-09-23T18:05:35Z
+DONE base 2026-09-23T18:05:35Z
+START after 2026-09-23T18:49:00Z HEAD=e72ef5ed dirty=0
+test-arm rc=0 2026-09-23T18:49:37Z
+kernel8-test rc=0 2026-09-23T19:00:05Z
+test-wc rc=0 2026-09-23T19:02:32Z
+DONE after 2026-09-23T19:02:32Z
+
+=== ./arroyo test-arm
+  base: ⚡ kernel features: witness,ehcihid,kbdwit,sdw,sdhcblk,smolnet,sdwrite
+  base: ⚡ ladder: no terminal marker is DECLARED for 'test-arm' — this run's COMPLETENESS was not checked (only its fault scan was). Not a pass for truncation; see LADDER-TAIL in this file.
+  base: ✅ aarch64 test complete. Log at unaos/target/serial-arm.log
+  after: ⚡ kernel features: witness,ehcihid,kbdwit,sdw,sdhcblk,smolnet,sdwrite
+  after: ⚡ ladder: no terminal marker is DECLARED for 'test-arm' — this run's COMPLETENESS was not checked (only its fault scan was). Not a pass for truncation; see LADDER-TAIL in this file.
+  after: ✅ aarch64 test complete. Log at unaos/target/serial-arm.log
+  serial-arm lines: 673 -> 674; verdict rows 15 -> 15; diff BEFORE AFTER:
+    (empty — every verdict family, verdict and count identical)
+
+=== env UNAOS_QEMU_FULL=1 ./arroyo kernel8-test 600
+  base: ⚡ kernel features: baremetal,skip_xhci,witness
+  base:   ✅ MBENCH PASS — 126/126 required witnesses, 0 forbidden hit(s), 60220 lines scanned [full wall 600.1s]
+  after: ⚡ kernel features: baremetal,skip_xhci,witness
+  after:   ✅ MBENCH PASS — 126/126 required witnesses, 0 forbidden hit(s), 33809 lines scanned [full wall 600.2s]
+  serial-pi lines: 60220 -> 33809; verdict rows 109 -> 109; diff BEFORE AFTER:
+    (empty — every verdict family, verdict and count identical)
+
+=== env UNAOS_WC=1 UNAOS_QEMU_FULL=1 ./arroyo test 120
+  base: ⚡ kernel features: witness,ehcihid,kbdwit,sdw,sdhcblk,smolnet,wc,sdwrite
+  base:    kernel features: witness,ehcihid,kbdwit,sdwrite,sdw,sdhcblk,wc,smolnet
+  base:   ✅ MBENCH PASS — 16/16 required witnesses, 0 forbidden hit(s), 2604 lines scanned [full wall 149.4s]
+  after: ⚡ kernel features: witness,ehcihid,kbdwit,sdw,sdhcblk,smolnet,wc,sdwrite
+  after:    kernel features: witness,ehcihid,kbdwit,sdwrite,sdw,sdhcblk,wc,smolnet
+  after:   ✅ MBENCH PASS — 16/16 required witnesses, 0 forbidden hit(s), 2604 lines scanned [full wall 120.4s]
+  serial lines: 2604 -> 2604; verdict rows 107 -> 107; diff BEFORE AFTER:
+    (empty — every verdict family, verdict and count identical)
+
+NOTES
+* test-arm declares no terminal marker (arroyo's own warning above, both runs): its completeness is NOT checked,
+  only its fault scan — so its before==after is a statement about the verdicts it printed, not a certified-complete run.
+* kernel8-test's 60220 -> 33809 lines is ONE periodic family, [click2] 57002 -> 30521 (every other family within
+  200 lines); a cadence under box load on a 600 s full wall, not a verdict — all 109 verdict rows are identical.
+* None of the nine renamed tokens, old or new, occurs in pi4-regression.spec, x86-default.spec or any of the six
+  captures (measured, LC_ALL=C grep -a -c -F: 0 each). The TegraSd variant is aarch64+tegra+sdmmc only and the
+  shell family tegra only; no QEMU machine models Tegra, so these legs are the REGRESSION proof that the rewritten
+  shared files (block.rs, fat.rs, unafs.rs, bootdisk.rs, vfs.rs, install/, main.rs, shell.rs, dock.rs) broke
+  nothing else on three wires. The rename's own falsifier is the compile go-red (m3-gored.txt).
+
+ARTIFACTS (LC_ALL=C grep -a -o -F | wc -l, never strings) — an unarmed family certifies nothing, and here all three are unarmed:
+  target/pi_baremetal/kernel8.img    'on TegraSd'=0 'on SdMmc'=0 ':: UNAFS:'=0 '[vfs]'=13 'NOTATOKEN-UNAOS'=0
+  target/aarch64_esp/kernel.elf      'on TegraSd'=0 'on SdMmc'=0 ':: UNAFS:'=0 '[vfs]'=13 'NOTATOKEN-UNAOS'=0
+  target/x86_64_esp/kernel.elf       'on TegraSd'=0 'on SdMmc'=0 ':: UNAFS:'=0 '[vfs]'=12 'NOTATOKEN-UNAOS'=0
+  `:: UNAFS:` itself is 0 in all three (tegra-only family), [vfs] is the present-control, NOTATOKEN-UNAOS the absent-control.
+  The one image that ARMS the wire half is esp-jetson with sdmmc — jetson's leg (LAWS §3, R39), not run here.
