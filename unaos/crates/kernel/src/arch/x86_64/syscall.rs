@@ -2859,7 +2859,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
                     // the prober's sweep — which is the only honest way to reach the -EACCES arm.
                     DMG_OWNER_WITNESS.store(a0 as u32, Ordering::Release);
                     DMG_DONE.fetch_add(1, Ordering::AcqRel);
-                } Some("busx86-midden") | Some("busx86-other") | Some("stor1-name") | Some("stor1-mv") | Some("stor1-wr") => {} // STOR-1 M1/M2/M3: `stor1-name` joins the no-exit-witness arm for the identical reason — its witness is the sealed RESULT TABLE in its own window, and letting its exit fall to the `_` arm would silently move U1a's byte-for-byte `exited=` count. ⚠ SAME-LINE fold. · BUSX86 M3: the ring-3 midden pair carries NO exit witness — its witness is the RESULT TABLE it writes into its own window (thirteen legs' two answers each, sealed), which the launcher reads while the slot is still live. The arm exists anyway, and it is not decoration: the `_` fallback below counts an unrecognised name into `U1A_EXITED_OK`, so a fixture that skipped this list would silently move U1a's byte-for-byte `exited=` count. Named, does nothing, changes nothing. ⚠ SAME-LINE fold (see the `use` line's note).
+                } Some("busx86-midden") | Some("busx86-other") | Some("stor1-name") | Some("stor1-mv") | Some("stor2-mv") | Some("stor1-wr") => {} // STOR-2 (B185): `stor2-mv` joins for the same reason. STOR-1 M1/M2/M3: `stor1-name` joins the no-exit-witness arm for the identical reason — its witness is the sealed RESULT TABLE in its own window, and letting its exit fall to the `_` arm would silently move U1a's byte-for-byte `exited=` count. ⚠ SAME-LINE fold. · BUSX86 M3: the ring-3 midden pair carries NO exit witness — its witness is the RESULT TABLE it writes into its own window (thirteen legs' two answers each, sealed), which the launcher reads while the slot is still live. The arm exists anyway, and it is not decoration: the `_` fallback below counts an unrecognised name into `U1A_EXITED_OK`, so a fixture that skipped this list would silently move U1a's byte-for-byte `exited=` count. Named, does nothing, changes nothing. ⚠ SAME-LINE fold (see the `use` line's note).
                 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
                 Some("sock2-udp") => {
                     // SOCK-2: the UDP round-trip fixture conveys its 5-bit witness bitmask as its exit STATUS
@@ -23551,7 +23551,7 @@ fn u11m2_launcher(demo_cpu: usize) {
     #[cfg(feature = "irqstorage")]
     s6_witness_launcher(demo_cpu);
     // U6x: chain the owner/grants ACL demo (program order, the u9x->..->u11m2 idiom; the LAST demo in the chain).
-    u6gx_launcher(demo_cpu); stor1_name_launcher(demo_cpu); stor1_mv_launcher(demo_cpu); stor1_wr_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); busx86_stamp_check(); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
+    u6gx_launcher(demo_cpu); stor1_name_launcher(demo_cpu); stor1_mv_launcher(demo_cpu); stor2_mv_launcher(demo_cpu); stor1_wr_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); busx86_stamp_check(); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
 }
 
 /// Build a U6x fixture slot at a given entry symbol — the `u7x_build`/`u11m2_build` shape (allocate a private
@@ -28889,5 +28889,416 @@ fn stor2_disk_undo(src: &str, dst: &str, source_unlinked: bool) {
         let _ = unsafe { submit_delete(dst.as_bytes()) };
     } else {
         let _ = unsafe { submit_rename(dst.as_bytes(), src.as_bytes()) };
+    }
+}
+
+// =================================================================================================
+// STOR-2 — THE WITNESS: `stor2-mv`, RENAME WITH THE SOURCE OPEN, from ring 3, plus one kernel-side
+// leg for the handshake no single program can time. A NEW witness rather than more legs of STOR1-MV
+// for STOR-1 M3's reason verbatim: STOR1-MV is a `global_asm!` block in the middle of this file, and
+// growing it would move every panic `Location` below it (B94). STOR1-MV's bit5 was re-pointed IN
+// PLACE instead (instruction-for-instruction), because its old assertion WAS the retired refusal.
+//
+// THE SEVEN RING-3 BITS, and which are the arc:
+//   bit0   create STOR1.BIN (O_CREAT|RW, PRIVATE), write 16 bytes A — and KEEP THE HANDLE OPEN
+//   bit1 ★ SYS_RENAME(STOR1.BIN, STOR2.BIN) == 0 with that handle still open (STOR-1: -EBUSY)
+//   bit2 ★ the old name is gone WHILE the descriptor lives: open(STOR1.BIN) == -ENOENT
+//   bit3 ★ the descriptor FOLLOWED the file: 16 more bytes B through the SAME handle == 16
+//   bit4 ★ the vacated name is a DIFFERENT file: O_CREAT STOR1.BIN with the old handle still open
+//          gives a fresh descriptor that reads 0 bytes (a 0-length new file, not the moved one)
+//   bit5 ★ close the old handle; open(STOR2.BIN) reads back exactly A||B — the post-rename write
+//          landed in the renamed file, and the close kept it (its snapshot went to the NEW name)
+//   bit6   cleanup: unlink STOR2.BIN, then (after a launcher drain — the U10 queue is one deep)
+//          the re-created STOR1.BIN; every rc recorded
+//
+// Knob-ON (`irqstorage`), every ★ is also a statement about the VOLUME: bit1 returns 0 only if
+// `submit_rename` moved the directory entry; bit3's grow is `submit_grow` BY THE NEW NAME, so it
+// fails -EIO unless the on-disk entry is already called STOR2.BIN; bit4's O_CREAT is `submit_create`
+// of STOR1.BIN, which would adopt the moved file if the disk still called it that; and bit5 reads
+// LIVE from disk (`created_read_live`). Knob-OFF the same legs exercise the namespace alone.
+//
+// THE KERNEL-SIDE LEG (`s2mv_race_leg`): a descriptor is held open in a scratch row, a release is
+// made to look IN FLIGHT (`STOR2_CLOSING[sid] += 1`, exactly what `stor2_close_enter` does), and the
+// rename must answer -EBUSY having changed NOTHING — source live, destination neither live nor still
+// reserved, the descriptor still naming the source, and knob-on the volume still calling the file by
+// its OLD name (the phase-2 undo ran). Then the fake release leaves and the same rename must return
+// 0 with the descriptor re-stamped and the refcount moved by exactly one.
+// =================================================================================================
+
+const S2MV_W_OFF: usize = 0x2000;
+const S2MV_RC_OFF: usize = 0x2008; // i64[10]
+const S2MV_SEAL_OFF: usize = 0x2100;
+const S2MV_SIG_OFF: usize = 0x2800;
+const S2MV_GO_OFF: usize = 0x2808;
+const S2MV_SEAL: u64 = 0x5332_4d56_5345_414c; // "S2MVSEAL"
+const S2MV_WANT: u64 = 0x7f; // seven bits
+
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_stor2mv_blob_start
+unaos_user_stor2mv_blob_start:
+    .balign 16
+
+    .globl unaos_user_stor2_mv
+unaos_user_stor2_mv:
+    lea r15, [rip + unaos_user_stor2mv_blob_start]
+    xor r12, r12
+
+    // ---- bit0: create STOR1.BIN PRIVATE RW, write 16 bytes A, KEEP IT OPEN (rbx) ----
+    mov rax, 11
+    lea rdi, [rip + .Ls2_n1]
+    mov rsi, 9
+    mov rdx, 3
+    syscall
+    mov qword ptr [r15 + 0x2008], rax
+    mov rbx, rax
+    test rbx, rbx
+    js .Ls2_done
+    mov rax, 1
+    mov rdi, rbx
+    lea rsi, [rip + .Ls2_pa]
+    mov rdx, 16
+    syscall
+    cmp rax, 16
+    jne .Ls2_close1
+    or r12, 1
+
+    // ---- bit1 ★ SYS_RENAME(STOR1.BIN -> STOR2.BIN) WITH THE HANDLE OPEN ----
+    mov rax, 50
+    lea rdi, [rip + .Ls2_n1]
+    mov rsi, 9
+    lea rdx, [rip + .Ls2_n2]
+    mov r10, 9
+    syscall
+    mov qword ptr [r15 + 0x2010], rax
+    test rax, rax
+    jnz .Ls2_close1
+    or r12, 2
+
+    // ---- bit2 ★ the old name is gone while the descriptor lives ----
+    mov rax, 11
+    lea rdi, [rip + .Ls2_n1]
+    mov rsi, 9
+    xor rdx, rdx
+    syscall
+    mov qword ptr [r15 + 0x2018], rax
+    cmp rax, -2
+    jne .Ls2_w2
+    or r12, 4
+
+.Ls2_w2:
+    // ---- bit3 ★ the descriptor FOLLOWED the file: 16 more bytes through the same handle ----
+    mov rax, 1
+    mov rdi, rbx
+    lea rsi, [rip + .Ls2_pb]
+    mov rdx, 16
+    syscall
+    mov qword ptr [r15 + 0x2020], rax
+    cmp rax, 16
+    jne .Ls2_recreate
+    or r12, 8
+
+.Ls2_recreate:
+    // ---- bit4 ★ the vacated name is a DIFFERENT file: O_CREAT it with the old handle open ----
+    mov rax, 11
+    lea rdi, [rip + .Ls2_n1]
+    mov rsi, 9
+    mov rdx, 3
+    syscall
+    mov qword ptr [r15 + 0x2028], rax
+    mov r13, rax
+    test r13, r13
+    js .Ls2_close1
+    mov rax, 12
+    mov rdi, r13
+    lea rsi, [r15 + 0x1000]
+    mov rdx, 32
+    syscall
+    mov qword ptr [r15 + 0x2030], rax
+    mov r14, rax
+    mov rax, 17
+    mov rdi, r13
+    syscall
+    test r14, r14
+    jnz .Ls2_close1
+    or r12, 16
+
+.Ls2_close1:
+    // ---- close the ORIGINAL handle: its snapshot + refcount must land on STOR2.BIN ----
+    mov rax, 17
+    mov rdi, rbx
+    syscall
+    mov qword ptr [r15 + 0x2038], rax
+
+    // ---- bit5 ★ STOR2.BIN reads back exactly A||B ----
+    mov rax, 11
+    lea rdi, [rip + .Ls2_n2]
+    mov rsi, 9
+    xor rdx, rdx
+    syscall
+    mov qword ptr [r15 + 0x2040], rax
+    mov rbx, rax
+    test rbx, rbx
+    js .Ls2_clean
+    mov rax, 12
+    mov rdi, rbx
+    lea rsi, [r15 + 0x1000]
+    mov rdx, 32
+    syscall
+    mov qword ptr [r15 + 0x2048], rax
+    cmp rax, 32
+    jne .Ls2_close2
+    lea rcx, [rip + .Ls2_pa]
+    mov rax, qword ptr [r15 + 0x1000]
+    cmp rax, qword ptr [rcx]
+    jne .Ls2_close2
+    mov rax, qword ptr [r15 + 0x1000 + 8]
+    cmp rax, qword ptr [rcx + 8]
+    jne .Ls2_close2
+    mov rax, qword ptr [r15 + 0x1000 + 16]
+    cmp rax, qword ptr [rcx + 16]
+    jne .Ls2_close2
+    mov rax, qword ptr [r15 + 0x1000 + 24]
+    cmp rax, qword ptr [rcx + 24]
+    jne .Ls2_close2
+    or r12, 32
+.Ls2_close2:
+    mov rax, 17
+    mov rdi, rbx
+    syscall
+
+.Ls2_clean:
+    // ---- bit6: cleanup. unlink STOR2.BIN, GO handshake (drain), unlink STOR1.BIN. rc recorded. ----
+    mov rax, 11
+    lea rdi, [rip + .Ls2_n2]
+    mov rsi, 9
+    mov rdx, 1
+    syscall
+    mov rbx, rax
+    test rbx, rbx
+    js .Ls2_done
+    mov rax, 16
+    mov rdi, rbx
+    syscall
+    mov qword ptr [r15 + 0x2050], rax
+    test rax, rax
+    jnz .Ls2_done
+    mov qword ptr [r15 + 0x2800], 1         // SIG 1 — drain between unlinks, please
+    mov rcx, 0x40000000
+.Ls2_p1:
+    cmp qword ptr [r15 + 0x2808], 1
+    jae .Ls2_go1
+    pause
+    dec rcx
+    jnz .Ls2_p1
+    jmp .Ls2_done
+.Ls2_go1:
+    mov rax, 11
+    lea rdi, [rip + .Ls2_n1]
+    mov rsi, 9
+    mov rdx, 1
+    syscall
+    mov rbx, rax
+    test rbx, rbx
+    js .Ls2_done
+    mov rax, 16
+    mov rdi, rbx
+    syscall
+    mov qword ptr [r15 + 0x2058], rax
+    test rax, rax
+    jnz .Ls2_done
+    or r12, 64
+
+.Ls2_done:
+    mov qword ptr [r15 + 0x2000], r12
+    mov rax, 0x53324d565345414c            // "S2MVSEAL" — written LAST
+    mov qword ptr [r15 + 0x2100], rax
+    mov qword ptr [r15 + 0x2800], 2
+    mov rax, 2
+    xor rdi, rdi
+    syscall
+.Ls2_spin:
+    jmp .Ls2_spin
+
+    .balign 8
+.Ls2_n1:
+    .ascii "STOR1.BIN"
+    .balign 8
+.Ls2_n2:
+    .ascii "STOR2.BIN"
+    .balign 8
+.Ls2_pa:
+    .ascii "stor2-mv-before!"
+.Ls2_pb:
+    .ascii "stor2-mv-after!!"
+
+    .balign 16
+    .globl unaos_user_stor2mv_blob_end
+unaos_user_stor2mv_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_stor2mv_blob_start: u8;
+    static unaos_user_stor2mv_blob_end: u8;
+    static unaos_user_stor2_mv: u8;
+}
+
+fn s2mv_build() -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_stor2mv_blob_start as usize;
+    let bend = &raw const unaos_user_stor2mv_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "STOR-2 blob does not fit in a code page");
+    let off = (&raw const unaos_user_stor2_mv as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+/// STOR-2: the HANDSHAKE leg, kernel-side because a release "in flight" cannot be timed from ring 3.
+/// Returns `(busy_rc, ok_rc, untouched, followed, disk_ok)`; see the witness header for each claim.
+fn s2mv_race_leg() -> (i64, i64, bool, bool, bool) {
+    const NONE: (i64, i64, bool, bool, bool) = (i64::MIN, i64::MIN, false, false, false);
+    let Some(ra) = crate::arch::memory::alloc_user_space() else {
+        return NONE;
+    };
+    let (Some(s1), Some(s2)) = (u10_name_id(S1N_NAME), u10_name_id(S1N_NAME2)) else {
+        crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(ra));
+        return NONE;
+    };
+    let (s1, s2) = (s1 as usize, s2 as usize);
+    let mut out = NONE;
+    let h = open_create_new(ra, s1 as u32, false); // PRIVATE to row A, and it stays OPEN
+    if h >= 0 {
+        if let Some((_, fid)) = created_desc_any_row(ra, s1 as u32) {
+            STOR2_CLOSING[s1].fetch_add(1, Ordering::SeqCst); // a release of STOR1.BIN "mid-way"
+            let busy = rename_created(ra, S1N_NAME, S1N_NAME2);
+            let untouched = created_entry_live(s1)
+                && !created_entry_live(s2)
+                && !DYN_DELETED_G[s2].load(Ordering::Acquire)
+                && FILE_OPNAME[ra][fid].load(Ordering::Acquire) as usize == s1 + 1;
+            #[allow(unused_mut)]
+            let mut disk_ok = true;
+            #[cfg(feature = "irqstorage")]
+            if s4_sync_storage() {
+                let (a, b) = unsafe {
+                    (
+                        crate::drivers::xhci::irqstorage::submit_stat(S1N_NAME.as_bytes()),
+                        crate::drivers::xhci::irqstorage::submit_stat(S1N_NAME2.as_bytes()),
+                    )
+                };
+                disk_ok = a >= 0 && b == ENOENT as i32; // the phase-2 undo put the old name back
+            }
+            STOR2_CLOSING[s1].fetch_sub(1, Ordering::SeqCst); // the release "finishes"
+            let ok = rename_created(ra, S1N_NAME, S1N_NAME2);
+            let followed = FILE_OPNAME[ra][fid].load(Ordering::Acquire) as usize == s2 + 1
+                && OPENF_REFS[s2].load(Ordering::Acquire) == 1
+                && OPENF_REFS[s1].load(Ordering::Acquire) == 0
+                && created_entry_live(s2)
+                && !created_entry_live(s1);
+            out = (busy, ok, untouched, followed, disk_ok);
+            files_free(ra, fid); // the SYS_CLOSE core — releases through the handshake, as STOR2.BIN
+            handle_clear(ra, h as usize);
+        }
+        let _ = created_entry_destroy(ra, s2, true);
+        let _ = created_entry_destroy(ra, s1, true);
+    }
+    clear_files_row(ra);
+    crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(ra));
+    out
+}
+
+/// STOR-2 launcher + verdict. Chained right after STOR1-MV's (it reuses STOR1.BIN/STOR2.BIN, which
+/// STOR1-MV leaves vacant) and before STOR1-WR.
+fn stor2_mv_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let disk_present = HELLO_STAGED.load(Ordering::Acquire);
+    if disk_present && !(u10_preflight_absent(S1N_NAME) && u10_preflight_absent(S1N_NAME2)) {
+        serial_println!(":: STOR2-MV: a STOR[12].BIN is present on the volume and not self-healed — rename-while-open witness skipped ::");
+        return;
+    }
+    let Some(f) = s2mv_build() else {
+        serial_println!(":: STOR2-MV: no free address-space slot — rename-while-open witness skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: STOR2-MV: rename with the source OPEN — the x86 -EBUSY divergence retired by irqstorage::submit_rename over fat::rename_entry; the descriptor follows the file ({}) ::",
+        if s4_sync_storage() { "knob-on: the volume entry moves in place" } else { "knob-off: namespace only" }
+    );
+    let cpu = crate::arch::smp::worker_cpu(0).unwrap_or(demo_cpu);
+    if s4_sync_storage() {
+        crate::arch::sched::spawn_user_preemptible(
+            "stor2-mv", f.entry, f.sp, cpu, f.cr3,
+            alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new()),
+        );
+    } else {
+        crate::arch::sched::spawn_user_in_space("stor2-mv", f.entry, f.sp, cpu, f.cr3);
+    }
+    let mut replayed = 0u32;
+    let d1 = crate::arch::ticks() + 5000;
+    while s1n_read(f.slot, S2MV_SIG_OFF) < 1 && crate::arch::ticks() < d1 {
+        crate::arch::sched::yield_now();
+    }
+    let handshook = s1n_read(f.slot, S2MV_SIG_OFF) >= 1;
+    if let Ok(fs) = crate::fs::fat::mount() {
+        while u10_flush_drain_one(&fs).is_some() {
+            replayed += 1;
+        }
+    }
+    s1mv_write(f.slot, S2MV_GO_OFF, 1);
+    let d2 = crate::arch::ticks() + 5000;
+    while s1n_read(f.slot, S2MV_SIG_OFF) < 2 && crate::arch::ticks() < d2 {
+        crate::arch::sched::yield_now();
+    }
+    let signalled = s1n_read(f.slot, S2MV_SIG_OFF) >= 2;
+    let sealed = s1n_read(f.slot, S2MV_SEAL_OFF) == S2MV_SEAL;
+    let w = s1n_read(f.slot, S2MV_W_OFF);
+    let mut rc = [0i64; 11];
+    for (i, cell) in rc.iter_mut().enumerate() {
+        *cell = s1n_read(f.slot, S2MV_RC_OFF + i * 8) as i64;
+    }
+    let td = crate::arch::ticks() + 3000;
+    while !(files_row_is_clear(f.slot) && handle_row_is_clear(f.slot)) && crate::arch::ticks() < td {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = files_row_is_clear(f.slot) && handle_row_is_clear(f.slot);
+    if let Ok(fs) = crate::fs::fat::mount() {
+        while u10_flush_drain_one(&fs).is_some() {
+            replayed += 1;
+        }
+    }
+    let drained = u10_flush_all_free() && !U10_OVERFLOW.load(Ordering::Acquire);
+    crate::arch::memory::free_user_space_by_cr3(crate::arch::memory::slot_cr3(f.slot));
+    let (busy, ok, untouched, followed, disk_ok) = s2mv_race_leg();
+    let race_ok = busy == EBUSY && ok == 0 && untouched && followed && disk_ok;
+    let entries_gone = [S1N_NAME, S1N_NAME2]
+        .iter()
+        .all(|n| u10_name_id(n).is_none_or(|id| !created_entry_live(id as usize)));
+    let pass = signalled && handshook && sealed && w == S2MV_WANT && cleared && drained && race_ok && entries_gone;
+    if pass {
+        serial_println!(
+            ":: STOR2-MV: rename-while-open (stor2-mv) — SYS_RENAME of an OPEN file returns 0, the old name is -ENOENT while the descriptor lives, writes through the old handle land in the renamed file, the vacated name re-creates as a different file, the renamed file reads back A||B after close; a release in flight answers -EBUSY and changes nothing ({}) :: PASS [w={:#x}/{:#x}] ::",
+            if s4_sync_storage() { "knob-on" } else { "knob-off" },
+            w, S2MV_WANT
+        );
+    } else {
+        serial_println!(
+            ":: STOR2-MV: rename-while-open FAIL [w={:#x}/{:#x}] — signalled={} handshook={} sealed={} cleared={} drained={} race=[busy={} ok={} untouched={} followed={} disk_ok={}] entries_gone={} replayed={} rc=[create={} mv_open={} old_open={} write_b={} recreate={} recreate_read={} close={} new_open={} new_read={} rm2={} rm1={} ] ::",
+            w, S2MV_WANT, signalled, handshook, sealed, cleared, drained, busy, ok, untouched, followed, disk_ok,
+            entries_gone, replayed,
+            rc[0], rc[1], rc[2], rc[3], rc[4], rc[5], rc[6], rc[7], rc[8], rc[9], rc[10]
+        );
     }
 }

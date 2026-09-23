@@ -6879,7 +6879,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             u11reap_report(a0);
             uowner_report(a0);
             k2_report(a0);
-            bandy_report(a0);
+            bandy_report(a0); stor2mv_report(a0); // STOR-2: the aarch64 SYS_RENAME fixture's tagged verdict word (body at the FILE TAIL). ⚠ SAME-LINE fold.
             elf1_report(a0);
             threads_report(a0);
             fb_report(a0);
@@ -7032,7 +7032,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
             // it) rather than the generic child-reap path.
             {
                 let nm = super::sched::current_name();
-                if nm == Some("el0-midden") {
+                if nm == Some("el0-midden") || stor2mv_exit(nm) { // STOR-2: `el0-stor2mv` exits by NAME through this arm too (status 0, never MIDDEN_EXIT_STATUS), so it never lands in the M6b counters. ⚠ SAME-LINE fold.
                     if a0 == MIDDEN_EXIT_STATUS {
                         EL0_MIDDEN_DONE.fetch_add(1, Ordering::AcqRel);
                     }
@@ -16569,7 +16569,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // byte-same errno) proven at EL0. Self-cleaning; its own uncounted `:: BANDY-RT: … ::`
     // + `:: BANDY-EQ: … ::` lines. LAST in the chain.
     bandy_rt_launcher(demo_cpu);
-    u7stk!("after:bandy_rt"); #[cfg(feature = "witness")] dirns_witness(); // DIRNS (LEDGER SO20): the EL0 path-open proof, appended to this statement so no source line moves below it (LEDGER P7). It rides DEAD LAST, after BANDY, and that placement was MEASURED not chosen: parked mid-chain beside RMDIR it cost the leg three witnesses across two runs (ERET-SCRUB first-entry, U6b, the u7fix park margin) and ~5 300 guest lines of the 300 s wall, while the base leg was 126/126 — its FAT directory I/O was contending for the EL0 volume's mount loan and for wall time with fixtures that were still running. Nothing in the chain waits on it here, so the only thing it can now delay is the end of the boot. Self-cleaning at both ends; takes its own `fat::mount()`. Knob-off the `#[cfg]` erases the statement before MIR.
+    u7stk!("after:bandy_rt"); #[cfg(feature = "witness")] dirns_witness(); stor2_mv_launcher(demo_cpu); // STOR-2 (B185): the aarch64 SYS_RENAME witness, AFTER DIRNS so DIRNS keeps its measured dead-last position relative to every fixture it could contend with, and nothing waits on either. DIRNS (LEDGER SO20): the EL0 path-open proof, appended to this statement so no source line moves below it (LEDGER P7). It rides DEAD LAST, after BANDY, and that placement was MEASURED not chosen: parked mid-chain beside RMDIR it cost the leg three witnesses across two runs (ERET-SCRUB first-entry, U6b, the u7fix park margin) and ~5 300 guest lines of the 300 s wall, while the base leg was 126/126 — its FAT directory I/O was contending for the EL0 volume's mount loan and for wall time with fixtures that were still running. Nothing in the chain waits on it here, so the only thing it can now delay is the end of the boot. Self-cleaning at both ends; takes its own `fat::mount()`. Knob-off the `#[cfg]` erases the statement before MIR.
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -25288,4 +25288,321 @@ fn sys_rename(src_ptr: u64, src_len: u64, dst_ptr: u64, dst_len: u64) -> i64 {
     let agen = ASID_GEN[asid as usize].load(Ordering::Acquire);
     let ppid = current_principal();
     bus_mv(asid, agen, ppid, src, dst)
+}
+
+// =================================================================================================
+// STOR-2 — THE aarch64 WITNESS: `el0-stor2mv`, `SYS_RENAME` spoken DIRECTLY from EL0 on the Pi lane.
+// An inline flat EL0 blob in the U10-create shape, spawned from the U7 launcher chain (which
+// `kernel8-test` runs: it arms `witness`), DEAD LAST after DIRNS so its FAT I/O cannot contend with
+// a fixture still running (DIRNS measured that cost mid-chain). Uncounted: its line is not a
+// `-> PASS` line, so the 23-fixture count is untouched.
+//
+// THE SIX BITS — the same claims x86's STOR2-MV makes, on the arch where they were always true:
+//   bit0   create S2MVA.BIN (O_CREAT|RW), write 16 bytes A, KEEP THE HANDLE OPEN
+//   bit1 ★ SYS_RENAME(S2MVA.BIN, S2MVB.BIN) == 0 with the handle open — the dispatch arm exists and
+//          is `bus_mv`'s body (pre-STOR-2 this syscall number answered -ENOSYS here)
+//   bit2 ★ open(S2MVA.BIN) == -ENOENT while the descriptor lives
+//   bit3 ★ the descriptor followed the file: 16 more bytes B through the same handle, seek 0, and a
+//          32-byte read through it is A||B
+//   bit4 ★ open(S2MVB.BIN) reads exactly A||B — the new name is the same file, post-rename bytes too
+//   bit5   ERRNO PARITY with x86, the numbers a portable program branches on: rename onto a live
+//          destination == -EEXIST (-17), rename of an absent source == -ENOENT (-2), a 0-length
+//          name == -EINVAL (-22)
+// Cleanup is by the program's own `SYS_UNLINK` through its handles; the launcher then proves on a
+// fresh mount that neither name is left on the card, and belt-and-braces deletes both either way.
+// =================================================================================================
+
+const S2MV_NAME_A: &str = "S2MVA.BIN";
+const S2MV_NAME_B: &str = "S2MVB.BIN";
+const S2MV_WANT: u64 = 0x3f;
+/// STOR-2: the fixture's reported witness mask, tagged `0x5332` ("S2") in bits 16..31 by the program
+/// itself so no other reporter's small integer can be mistaken for it (the NET6 discriminator).
+static STOR2MV_REPORT: AtomicU64 = AtomicU64::new(0);
+/// STOR-2: the fixture's SYS_EXIT was routed here by name (it never lands in the M6b counters).
+static STOR2MV_EXITED: AtomicBool = AtomicBool::new(false);
+
+core::arch::global_asm!(
+    r#"
+    .globl __stor2mv_blob_start
+__stor2mv_blob_start:
+    .balign 4
+    .globl __stor2mv_prog
+__stor2mv_prog:
+    mov  x23, xzr                          // witness bitmask
+    adr  x9, __stor2mv_blob_start          // window base
+    add  x12, x9, #0x2000                  // read buffer (writable data page)
+    adr  x13, .Ls2a_pat                    // A||B, 32 bytes, RO code page
+
+    // bit0: create S2MVA.BIN O_CREAT|RW, write A, KEEP x19 OPEN
+    mov  x8, #11
+    adr  x0, .Ls2a_na
+    mov  x1, #9
+    mov  x2, #3
+    svc  #0
+    mov  x19, x0
+    tbnz x19, #63, .Ls2a_parity
+    mov  x8, #1
+    mov  x0, x19
+    mov  x1, x13
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16
+    b.ne .Ls2a_parity
+    orr  x23, x23, #1
+
+    // bit1 ★ SYS_RENAME(S2MVA.BIN, S2MVB.BIN) with the handle OPEN
+    mov  x8, #50
+    adr  x0, .Ls2a_na
+    mov  x1, #9
+    adr  x2, .Ls2a_nb
+    mov  x3, #9
+    svc  #0
+    cbnz x0, .Ls2a_parity
+    orr  x23, x23, #2
+
+    // bit2 ★ the old name is gone while the descriptor lives
+    mov  x8, #11
+    adr  x0, .Ls2a_na
+    mov  x1, #9
+    mov  x2, #0
+    svc  #0
+    cmn  x0, #2
+    b.ne 1f
+    orr  x23, x23, #4
+1:
+    // bit3 ★ write B through the SAME handle, seek 0, read 32 through it == A||B
+    mov  x8, #1
+    mov  x0, x19
+    add  x1, x13, #16
+    mov  x2, #16
+    svc  #0
+    cmp  x0, #16
+    b.ne 2f
+    mov  x8, #15
+    mov  x0, x19
+    mov  x1, #0
+    svc  #0
+    cbnz x0, 2f
+    mov  x8, #12
+    mov  x0, x19
+    mov  x1, x12
+    mov  x2, #32
+    svc  #0
+    cmp  x0, #32
+    b.ne 2f
+    bl   .Ls2a_cmp32
+    cbnz x0, 2f
+    orr  x23, x23, #8
+2:
+    // bit4 ★ open S2MVB.BIN fresh and read 32 == A||B
+    mov  x8, #11
+    adr  x0, .Ls2a_nb
+    mov  x1, #9
+    mov  x2, #0
+    svc  #0
+    mov  x20, x0
+    tbnz x20, #63, .Ls2a_parity
+    mov  x8, #12
+    mov  x0, x20
+    mov  x1, x12
+    mov  x2, #32
+    svc  #0
+    mov  x22, x0
+    mov  x8, #17                           // SYS_CLOSE the fresh handle
+    mov  x0, x20
+    svc  #0
+    cmp  x22, #32
+    b.ne .Ls2a_parity
+    bl   .Ls2a_cmp32
+    cbnz x0, .Ls2a_parity
+    orr  x23, x23, #16
+
+.Ls2a_parity:
+    // bit5: errno parity — -EEXIST, -ENOENT, -EINVAL
+    mov  x8, #11                           // re-create S2MVA.BIN (the vacated name) -> x21
+    adr  x0, .Ls2a_na
+    mov  x1, #9
+    mov  x2, #3
+    svc  #0
+    mov  x21, x0
+    tbnz x21, #63, .Ls2a_clean
+    mov  x8, #50                           // onto the live S2MVB.BIN -> -EEXIST
+    adr  x0, .Ls2a_na
+    mov  x1, #9
+    adr  x2, .Ls2a_nb
+    mov  x3, #9
+    svc  #0
+    cmn  x0, #17
+    b.ne .Ls2a_clean
+    mov  x8, #50                           // an absent source -> -ENOENT
+    adr  x0, .Ls2a_nc
+    mov  x1, #9
+    adr  x2, .Ls2a_nd
+    mov  x3, #9
+    svc  #0
+    cmn  x0, #2
+    b.ne .Ls2a_clean
+    mov  x8, #50                           // a 0-length source name -> -EINVAL
+    adr  x0, .Ls2a_na
+    mov  x1, #0
+    adr  x2, .Ls2a_nd
+    mov  x3, #9
+    svc  #0
+    cmn  x0, #22
+    b.ne .Ls2a_clean
+    orr  x23, x23, #32
+
+.Ls2a_clean:
+    tbnz x21, #63, 3f                      // unlink the re-created S2MVA.BIN through its handle
+    mov  x8, #16
+    mov  x0, x21
+    svc  #0
+3:
+    tbnz x19, #63, 4f                      // unlink S2MVB.BIN through the ORIGINAL handle
+    mov  x8, #16
+    mov  x0, x19
+    svc  #0
+4:
+    movz x0, #0x5332, lsl #16              // SYS_REPORT("S2" << 16 | mask)
+    orr  x0, x0, x23
+    mov  x8, #3
+    svc  #0
+    mov  x8, #2                            // SYS_EXIT(0) — routed by NAME, never into M6b's counters
+    mov  x0, #0
+    svc  #0
+5:  b 5b
+
+    // x0 = 0 iff the 32 bytes at x12 equal the 32 at x13; clobbers x10, x11, x14
+.Ls2a_cmp32:
+    mov  x14, #0
+6:  ldr  x10, [x12, x14]
+    ldr  x11, [x13, x14]
+    cmp  x10, x11
+    b.ne 7f
+    add  x14, x14, #8
+    cmp  x14, #32
+    b.lt 6b
+    mov  x0, #0
+    ret
+7:  mov  x0, #1
+    ret
+
+    .balign 4
+.Ls2a_na:
+    .ascii "S2MVA.BIN"
+    .balign 4
+.Ls2a_nb:
+    .ascii "S2MVB.BIN"
+    .balign 4
+.Ls2a_nc:
+    .ascii "S2MVC.BIN"
+    .balign 4
+.Ls2a_nd:
+    .ascii "S2MVD.BIN"
+    .balign 8
+.Ls2a_pat:
+    .ascii "stor2-a64-before"
+    .ascii "stor2-a64-after!"
+    .balign 4
+    .globl __stor2mv_blob_end
+__stor2mv_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static __stor2mv_blob_start: u8;
+    static __stor2mv_blob_end: u8;
+    static __stor2mv_prog: u8;
+}
+
+/// STOR-2: the SYS_REPORT route for `el0-stor2mv` — by the `0x5332` tag the program stamps, like
+/// `net6_report`, and by name as well. Folded onto the reporter list.
+fn stor2mv_report(a0: u64) {
+    if (a0 >> 16) & 0xFFFF == 0x5332 && super::sched::current_name() == Some("el0-stor2mv") {
+        STOR2MV_REPORT.store(a0, Ordering::Release);
+    }
+}
+
+/// STOR-2: the SYS_EXIT route — `true` iff the exiting task is `el0-stor2mv`, recording its exit. Folded
+/// onto the midden by-name arm, which then marks no Proc entry (it has none) and exits the task.
+fn stor2mv_exit(nm: Option<&str>) -> bool {
+    let mine = nm == Some("el0-stor2mv");
+    if mine {
+        STOR2MV_EXITED.store(true, Ordering::Release);
+    }
+    mine
+}
+
+/// STOR-2: build the fixture slot — `u10c_build`'s shape for this blob.
+fn stor2mv_build() -> Option<U7Fix> {
+    let (base, size) = super::uslots::user_region();
+    let sp = (base + size as u64) & !0xF;
+    let bstart = &raw const __stor2mv_blob_start as usize;
+    let bend = &raw const __stor2mv_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen <= super::uslots::USER_CODE_SIZE, "STOR-2 blob does not fit in a code page");
+    let entry = {
+        let va = base + (&raw const __stor2mv_prog as usize - bstart) as u64;
+        assert!(va & 3 == 0, "STOR-2 fixture entry misaligned");
+        va
+    };
+    let slot = super::uslots::alloc_user_slot()?;
+    let backing = super::uslots::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, size);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    super::cache::icache_sync_range(backing as usize, blen);
+    unsafe { super::uslots::protect_user_slot_code(slot, super::uslots::USER_CODE_SIZE) };
+    let ttbr0 = super::uslots::slot_ttbr0(slot);
+    Some(U7Fix { entry, sp, ttbr0, asid: ttbr0 >> 48, slot })
+}
+
+/// STOR-2 launcher + verdict, DEAD LAST in the U7 chain. Skips silently with no SD (the u10c rule);
+/// cleans stale names up front (an interrupted metal run), runs the fixture, waits for its by-name
+/// exit and the slot's teardown, then proves on a fresh mount that it left nothing behind.
+#[inline(never)] // U7STK (PARITY §6.1b): keep this launcher's locals in ITS OWN frame — see u7_launcher
+fn stor2_mv_launcher(demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return;
+    }
+    for n in [S2MV_NAME_A, S2MV_NAME_B] {
+        bandy_cleanup_one(n);
+    }
+    let Some(fix) = stor2mv_build() else {
+        serial_println!(":: STOR2-MV: no free address-space slot — aarch64 SYS_RENAME witness skipped ::");
+        return;
+    };
+    serial_println!(
+        ":: STOR2-MV: aarch64 SYS_RENAME — the dispatch arm over bus_mv's body, spoken directly from EL0 with the source OPEN ::"
+    );
+    super::sched::spawn_user_slot("el0-stor2mv", fix.entry, fix.sp, fix.ttbr0, demo_cpu);
+    let _ = wait_while_secs(10, || !STOR2MV_EXITED.load(Ordering::Acquire));
+    let exited = STOR2MV_EXITED.load(Ordering::Acquire);
+    let word = STOR2MV_REPORT.load(Ordering::Acquire);
+    let w = if (word >> 16) & 0xFFFF == 0x5332 { word & 0xFFFF } else { 0 };
+    let _ = wait_while_secs(2, || !(files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid)));
+    let cleared = files_row_is_clear(fix.asid) && handle_row_is_clear(fix.asid);
+    let vacant = match crate::fs::fat::mount() {
+        Ok(fs) => fs.find_in_root(S2MV_NAME_A).is_err() && fs.find_in_root(S2MV_NAME_B).is_err(),
+        Err(_) => false,
+    };
+    for n in [S2MV_NAME_A, S2MV_NAME_B] {
+        bandy_cleanup_one(n); // belt and braces: a FAIL must not leave residue on a metal card either
+    }
+    if w == S2MV_WANT && exited && cleared && vacant {
+        serial_println!(
+            ":: STOR2-MV: aarch64 SYS_RENAME (el0-stor2mv) — rename of an OPEN file returns 0, the old name is -ENOENT while the descriptor lives, the descriptor follows the file, the new name reads back A||B, and -EEXIST/-ENOENT/-EINVAL match x86 byte for byte :: PASS [w={:#x}/{:#x}] ::",
+            w, S2MV_WANT
+        );
+    } else {
+        serial_println!(
+            ":: STOR2-MV: aarch64 SYS_RENAME FAIL [w={:#x}/{:#x}] — exited={} cleared={} vacant={} word={:#x} ::",
+            w, S2MV_WANT, exited, cleared, vacant, word
+        );
+    }
 }

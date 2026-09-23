@@ -2465,3 +2465,13 @@ FORBID :: QUARRY: .* :: FAIL ::
 # scripts/specs/ that is neither named in `arroyo`'s CODE nor carries a RUN-BY line above — and a
 # `RUN-BY: verb:` claim is cross-checked against `arroyo`, so this file cannot claim a runner it
 # does not have. "A replay spec no gate command runs is a silent landmine."
+
+# --- STOR-2 (rmbp-ledger B185, 2026-09-23): SYS_RENAME on aarch64, spoken DIRECTLY from EL0 by the
+# --- inline fixture `el0-stor2mv` (dead last in the U7 chain, uncounted — not a `-> PASS` line).
+# --- `w=0x3f`: create+write with the handle kept open; rename of the OPEN file == 0 (the dispatch
+# --- arm over bus_mv's body — pre-STOR-2 this number answered -ENOSYS here); old name -ENOENT while
+# --- the descriptor lives; the descriptor follows the file (write, seek, read A||B through it); the
+# --- new name reads A||B; and -EEXIST / -ENOENT / -EINVAL are x86's numbers. The PASS spelling also
+# --- requires the by-name exit, the slot's teardown, and a fresh mount showing neither name left.
+REQUIRE :: STOR2-MV: .* :: PASS \[w=0x3f/0x3f\] ::
+FORBID :: STOR2-MV: aarch64 SYS_RENAME FAIL
