@@ -300,6 +300,26 @@ FORBID :: VUGPERF: .* :: FAIL ::
 # --- drops by one, verdict `-> FAIL`.
 REQUIRE :: KEYMAP: table=crispy resolved=\d+ .* ctrl_c_ascii=0x03 ctrl_c_action=none pc_table_alt_c=copy .* -> PASS ::
 
+# --- STARTHOLD: the desktop's ignition is never gated on a fixture's settle (2026-09-22) -------
+# --- WHY A FORBID AND NOT A REQUIRE, written down so the next reader does not "fix" it into one:
+# --- this leg cannot produce a `[wc-x] desktop-app` line AT ALL. `desktop_uefi::activate` runs only
+# --- from the Kepler takeover, so `DESKTOP_APP_ARMED` is false on every `./arroyo test` boot and the
+# --- whole desktop-app seam — ARMED, the storage wait, the DMG-REFUSE hold, LAUNCH — has never once
+# --- executed in CI. That absence is itself part of the finding this rule records: the 15s hold it
+# --- retires lived its entire life with zero QEMU coverage and was only ever measured on metal.
+# --- THE RED WAS TAKEN ON A CAPTURE, not asserted — the property B160 showed a FORBID is worthless
+# --- without, because a FORBID that can no longer match reads identical to one that passed.
+# --- Replaying THIS FILE against the flight-11 metal log (read-only evidence,
+# --- `~/unaos-bench/scratch/rmbp-0915/bootwaits-logs/f11.log`) scores this rule 1 hit:
+# ---   [  43069ms] [wc-x] desktop-app HOLD-EXPIRED reason=dmg-refuse-unsettled name=/STAT.ELF \
+# ---       waited=15005ms threshold=15000ms — launching anyway
+# --- WHAT IT GATES: the return of a wall-clock gate on the ignition path. The refusal witness's
+# --- settle is a signal the desktop cannot make arrive — the DMG launcher is the TAIL of the witness
+# --- ladder, whose own bounded sub-waits sum past 15s — so the cap was smaller than the bound of the
+# --- thing it waited for and had to expire on exactly the boots that needed it. Flight 11 paid the
+# --- full `waited=15005ms` AND still lost the witness (`occupied=0x01 … NOT RUN`, five seconds after
+# --- the launch it was supposed to precede). `held_ms=` replaces it: reported, never gated.
+FORBID \[wc-x\] desktop-app HOLD-EXPIRED
 
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
 # A PINNED LINE IN THIS FILE IS CHANGED TOGETHER WITH THE KERNEL LINE IT PINS, IN THE SAME COMMIT —

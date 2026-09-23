@@ -9558,7 +9558,7 @@ creates in a fixed order: console, then probe.
 |----|------------|---------|-----------|-----------|
 | `win=1` | **the panel console** — fbcon routed into a window; the subject of this arc | 1312x736 | 1314x750 | `[wc-x] console-window win=1 panel=2880x1800 surf=1312x736 box=1314x750 at (783,444) …`, and `[wc-x] activate … console_win=1` |
 | `win=2` | the MOVE-VACATE probe — witness builds only, one-shot, opened and closed in a clear corner. It was `win=3` while the demo window still existed | 8x8 @ 8x | 66x78 | `[wc-x] move-vacate win=2 scale=8x from=(8,8) to=(90,8) box=66x78 painted=true … -> PASS` |
-| first free slot | **the desktop app** — `STAT.ELF`, launched by `desktop_uefi::desktop_app_service` from the device-service pass. A ring-3 window like any other: it takes whichever slot is free when its `SYS_WIN_CREATE` lands — and on a witness build that is now *after* the DMG-REFUSE hold releases, so its id follows the witness ladder's teardown state rather than racing it (Boot AL, pre-hold, saw it land in row 1 mid-ladder and void the refusal witness) | 128x128 | scale-dependent | `[wc-x] desktop-app LAUNCH name=/STAT.ELF bytes=8472 entry=0x… pid=P slot=S DETACHED, left RUNNING`, then `[wc-a] create win=<n> asid=<a> surf=128x128 …` |
+| first free slot | **the desktop app** — `STAT.ELF`, launched by `desktop_uefi::desktop_app_service` from the device-service pass. A ring-3 window like any other: it takes whichever slot is free when its `SYS_WIN_CREATE` lands. **The claim that used to stand here — that on a witness build this is *after* the DMG-REFUSE hold releases, so its id follows the ladder's teardown state rather than racing it — is FALSIFIED by flight 11, and the hold is gone (STARTHOLD, 2026-09-22; §STARTHOLD at the tail of this file).** On that boot the hold waited its full 15 s and expired at 43.069s, the launch took row 0 at 43.077s, and the witness entered at 48.074s, found `occupied=0x01` and printed NOT RUN — the exact outcome the hold was added to prevent (Boot AL, pre-hold, saw the same thing in row 1 mid-ladder). This row races the witness ladder on a witness build and always did; the ordering, if it is wanted back, is the FIXTURE's to take | 128x128 | scale-dependent | `[wc-x] desktop-app LAUNCH name=/STAT.ELF bytes=8472 entry=0x… pid=P slot=S DETACHED, left RUNNING`, then `[wc-a] create win=<n> asid=<a> surf=128x128 …` |
 
 The box arithmetic corroborates the wire independently, through `TITLE_H = 12` and `BORDER = 1`:
 8·8 + 2 = 66 and 8·8 + 12 + 2 = 78 for the probe. (The retired demo window's 96·8 + 2 = 770 and
@@ -19728,3 +19728,115 @@ one file). `GATE-LEDGER` is `OK` in every one of those runs. The harness's closi
 `check FAILED — a ledger row is unverifiable`, which is its generic wording; the gate that actually
 reddened is the branch registry above it. Same shape and same disposition as PTRPAINT's
 `exec-rmbp-kvblank` note earlier in this file.
+
+## STARTHOLD — the 15 s was the desktop's own, it bought nothing, and a clock was never able to buy it (2026-09-22)
+
+Peter on flight 11: *"startup is still slow and shows a broken crystal."* MENUFIRST (B156) settled the
+crystal half — a COMPLETE crystal on an EMPTY bar — and named the 15 s as not the bar's, but placed it
+in the wrong file. **It is not `main.rs`'s.** `main.rs:5999` only *calls* the pass; the hold's code,
+its constant and its line were `video/desktop_uefi.rs`'s, at `desktop_app_service`:
+
+    unaos/crates/kernel/src/video/desktop_uefi.rs:785   (HOLD-EXPIRED, at base 2495f3a2)
+    unaos/crates/kernel/src/video/desktop_uefi.rs:318   const DMG_HOLD_MS: u64 = 15_000;
+
+### 1. The mechanism, from the wire and the source
+
+`DMG_REFUSE_SETTLED` (`arch/x86_64/syscall.rs:19059`) is
+`AtomicBool::new(!cfg!(feature = "witness"))`, and `dmg_refuse_launcher` (`:19061`) stores `true`
+after `dmg_refuse_witness` returns — **on every exit, `NOT RUN` paths included**. So on the default
+`esp-x86` media (`wc` on, `witness` off) the flag is born `true` and the hold never engaged. Flight 11
+was a witness image (6884 `:: ` verdict lines in 2.2 MB), so the flag was born `false`, and the hold
+was a bounded wait on the *tail of the witness ladder*.
+
+**It was not waiting for a ghost.** The fixture armed and it arrived — five seconds too late:
+
+    [  27616ms] [wc-x] menubar ENABLED panel=2880x1800 rect=Some((0, 0, 2880, 34)) was=false
+    [  27617ms] [wc-x] desktop-app ARMED name=/STAT.ELF (deferred to the device-service pass …)
+    [  28064ms] :: PSRC: …                     ← storage up; the hold's clock starts here
+    [  43069ms] [wc-x] desktop-app HOLD-EXPIRED reason=dmg-refuse-unsettled name=/STAT.ELF \
+                    waited=15005ms threshold=15000ms — launching anyway
+    [  43077ms] [wc-x] desktop-app LAUNCH name=/STAT.ELF bytes=8472 … pid=26 slot=0
+    [  43363ms] [menubar] menus cap_owner=4 cap=Application menu_owner=0 boxes=1 \
+                    items=app:Application@34+111
+    [  48074ms] :: DMG-REFUSE: the window table was not empty at entry (occupied=0x01) — \
+                    refusal witness NOT RUN ::
+
+**So the boot paid the whole 15 005 ms AND still lost the witness.** `occupied=0x01` is row 0 — the
+row `LAUNCH … slot=0` had taken 5 s earlier. And the 15 s is exactly MENUFIRST's gap: the bar sat
+`cap_owner=0 cap= menu_owner=0 boxes=0 items=none` from 27 616 ms to 43 363 ms, and the caption it was
+missing was `/STAT.ELF`'s. The 15 746 ms MENUFIRST measured is the hold plus the 295 ms the app took
+to create its window and take focus.
+
+**Why 15 s, and why it could never work.** The constant's own doc named the measurement it was set
+from — Boot AL: launch 13.257s, DMG entry 13.859s, a 600 ms gap — and then named the risk in its own
+words: *"The chain's own bounded sub-waits (U6BX 10s + U8x 5+2s + WINX-7 10s) could stack past this
+bound."* They do. `dmg_refuse_launcher` is chained off `winx7_launcher`'s tail
+(`syscall.rs:18617`), which is the tail of a ladder whose bounded sub-waits sum past 27 s before
+DMG's own 5 s + 10 s are added. **The cap was strictly smaller than the bound of the signal it waited
+for**, so it was guaranteed to expire on exactly the boots where the ordering was needed and to be
+unnecessary on the boots where it was not. On flight 11 the ladder simply *ran*: U8x at 38 282 ms,
+WINX-7's verdict and DMG's entry together at 48 074 ms — 20 010 ms after the hold's clock started.
+
+**And no QEMU leg has ever run it.** `desktop_uefi::activate` runs only from the Kepler takeover, so
+`DESKTOP_APP_ARMED` is `false` on every `./arroyo test` boot: an unperturbed wc-lane capture
+(`UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_QEMU_FULL=1 ./arroyo test 240`) carries
+**zero `[wc-x]` lines of any kind**, and DMG-REFUSE reads `19/19 … witness OK` there with the hold
+playing no part. The 15 s hold lived its entire life with no CI coverage and was only ever measured on
+metal — by Peter, as "slow".
+
+### 2. The fix — REPORTED, never gated
+
+A clock cannot arbitrate which of two tenants takes row 0; only the tenants can. The hold, its
+constant and its stamp are deleted and the seam now states its cost as a fact:
+
+    [wc-x] desktop-app HOLD-NONE name=/STAT.ELF held_ms=0 dmg=<settled|unsettled> — the launch is
+    not gated on the DMG-REFUSE settle; a clock cannot arbitrate row 0, and flight 11 paid
+    waited=15005ms to lose the witness anyway
+
+`held_ms=0` is a property of the seam, not a threshold that happened not to be reached. `dmg=` is the
+settle state AT the launch, so a later `NOT RUN` naming an occupied table has this line as the row's
+provenance. On the default media `dmg=settled` and the desktop pays nothing for a fixture that is not
+in the image — which is now stated at the seam instead of inferred from a `cfg!` inside an atomic
+initialiser in another file. LINE-NEUTRAL: `desktop_uefi.rs` is 1043 lines before and after, 37
+insertions and 37 deletions (B94 — `panic::Location` embeds the source line).
+
+⚠ **STOP — the ordering is real and it is the FIXTURE's, in a file this brief fences off.**
+`dmg_refuse_witness` refuses to grade unless the window table is EMPTY at entry
+(`syscall.rs:19073`). Its actual need is narrower: that `id_a` stays the owner's and `id_free` stays
+free, which it already re-reads at step 4. A fixture that yielded to an already-launched app — or
+that published `DMG_REFUSE_SETTLED` on the three shapes where its chain declines to arm (no online
+AP, `u8x_build()` -> `None`, `winx7_build()` -> `None`) — would give back the coverage without
+charging the ignition path for it. That is `arch/x86_64/syscall.rs`, not `video/`, and it is not made
+here.
+
+### 3. The gate
+
+`FORBID \[wc-x\] desktop-app HOLD-EXPIRED` in `scripts/specs/x86-wc.spec`. A FORBID and not a REQUIRE
+because this leg cannot emit a `[wc-x]` line at all — and, per B160, a FORBID is worthless unless it
+is known to be able to match, so the red was taken on a capture: replaying the spec against the
+flight-11 metal log scores the rule **1 hit @ line 3049**, quoting `waited=15005ms threshold=15000ms`
+verbatim.
+
+### 4. The prediction for flight 12, stated so it can be falsified
+
+**The bar's items and the first app appear within 400 ms of `[wc-x] menubar ENABLED`.** The number is
+not a hope: flight 11's own wire measured every term of it with the hold subtracted out. Storage was
+up 447 ms after the enable (`menubar ENABLED` 27 616 ms -> `:: PSRC:` 28 064 ms, the first pass
+`program_source()` answered), and once the launch was allowed to run it took **295 ms** end to end —
+`LAUNCH` 43 077 ms -> `[menubar] menus cap_owner=4 cap=Application boxes=1
+items=app:Application@34+111` 43 363 ms. 447 + 295 = 742 ms from the enable on flight 11's own
+storage timing; the 400 ms is against `:: PSRC:`, which is the term this change controls. So:
+
+* `[wc-x] desktop-app HOLD-NONE … held_ms=0` appears, and `HOLD-EXPIRED` appears **nowhere**.
+* `[wc-x] desktop-app LAUNCH` lands within **400 ms** of the `:: PSRC:` line that precedes it.
+* `[menubar] menus … cap_owner=<nonzero> … boxes=1 items=app:…` follows `LAUNCH` within **400 ms**,
+  and the `[strip] rollup tenant=menubar … emit=2 age_ms=` that MENUFIRST read at **15746** reads
+  **under 1500**.
+* `:: DMG-REFUSE: …` still reports, and on a witness image it is expected to read **NOT RUN with
+  `occupied=` naming the app's row** — the same verdict flight 11 got, now for a stated reason and
+  without the 15 s. If it reads `witness OK`, the ladder beat the app on that boot; either is
+  consistent with this change, and a `NOT RUN` with `occupied=0x00` would falsify the mechanism
+  above.
+* Falsified if the caption is still empty 1 s after `LAUNCH`, or if the gap between `menubar
+  ENABLED` and the first non-empty `[menubar] menus` line is still measured in seconds — that would
+  mean a second wait exists that this seam does not own.
