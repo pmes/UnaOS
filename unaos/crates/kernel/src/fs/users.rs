@@ -958,12 +958,8 @@ pub fn shell_verb(verb: &str, args: &[&str], console: &mut crate::console::Conso
             if !load_once() {
                 return console.println("login: storage is not up (-ENODEV)");
             }
-            if count() == 0 {
-                match create_user(name.as_bytes(), pw.as_bytes()) {
-                    Ok(_) => console.println(&alloc::format!("login: created first user {}", name)),
-                    Err(e) => return console.println(&alloc::format!("login: cannot create {}: {}", name, users_reason(e))),
-                }
-            }
+            // LOGIN13 M2 (R63): `login` no longer creates the first user on an empty store — `adduser` (root
+            // only, password asked for) is the one way a user is made.
             match login(name.as_bytes(), pw.as_bytes()) {
                 Ok(()) => console.println(&alloc::format!("logged in as {} (user:{})", name, name)),
                 Err(_) => console.println("login: refused (-EACCES)"),
@@ -979,6 +975,7 @@ pub fn shell_verb(verb: &str, args: &[&str], console: &mut crate::console::Conso
                 None => console.println("logout: no session is open"),
             }
         }
+        "adduser" => adduser_begin(args, console), // LOGIN13 M2 (R63) — root adds a user; see `adduser_begin`
         _ => {}
     }
 }
@@ -1128,7 +1125,7 @@ pub fn service() {
         Ok(()) => {
             SERVICED.store(true, Ordering::Relaxed);
             #[cfg(feature = "loginst")]
-            { login_bootroot_fixture(); login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
+            { login_bootroot_fixture(); login_adduser_fixture(); login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1805,4 +1802,300 @@ pub fn login_bootroot_fixture() {
         cfg!(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))),
         if ok { "PASS" } else { "FAIL —" }
     );
+}
+
+// =========================================================================================
+// LOGIN13 M2 (rmbp-ledger B189, R63) — `adduser <name>`: ROOT ADDS A USER, AND THE PASSWORD IS ASKED FOR
+// =========================================================================================
+//
+// R63: *"what about adduser since it's logging me in as root"*. The verb is `adduser` (R26: the standard
+// name), a HOST verb beside `login`/`logout` (`shell.rs`'s arm, `midden_core::HOST_VERBS`), root-only.
+//
+// HOW THE PASSWORD ARRIVES, and why it is not the way `login` takes it. `login <name> <password>` reads
+// the password off the TYPED LINE (this file's `shell_verb`), and that line is recorded in three places
+// before any verb runs: `shell::history_record` (the `history` verb reads it back), the
+// `:: [midden] cmd="…" -> Host verb=…` witness ON THE WIRE (`shell.rs`, every dispatched line), and the
+// console's own scrollback. A password typed there is on the serial capture a flight is scored from. So
+// `adduser` takes the NAME on the line and ASKS for the password: [`prompt_key`] is offered every key
+// ahead of the shell's line editor (`main.rs::handle_key`, a line-neutral fold), holds the bytes in
+// kernel RAM, echoes NOTHING (no glyph, no `current_input`, no history, no wire), asks twice, and hands
+// the result to the same [`create_user`] the store has always used — the hashing path is unchanged. A
+// password on the line (`adduser <name> <pw>`) is REFUSED rather than used, because by the time the
+// verb sees it the line has already been recorded; the refusal says so.
+//
+// WHILE THE PROMPT IS LIVE the two raw-key instruments that print typed bytes are told to withhold them
+// ([`secret_input`]): `USB-DEBUG: KEY` (`main.rs::usbdebug_event_print`, the `usbdebug` knob, which the
+// flight images carry) and the bounded `[serialdoor] key=` witness (`arch/x86_64/syscall.rs`, `ftdirx`).
+// The same predicate covers the login screen (LOGIN13 M3), which the module doc of `video/login.rs`
+// promised since LOGIN M3 ("NO TYPED BYTE REACHES THE WIRE") and which `usbdebug` quietly broke.
+
+/// The longest password the prompt holds. `login`'s screen caps a field at 32 (`video/login.rs`
+/// `FIELD_MAX`); the prompt allows more, and a longer password is refused rather than truncated so
+/// what verifies is exactly what was typed.
+const PW_MAX: usize = 64;
+
+/// The live `adduser` prompt: the name being added, which entry is being typed (1 = first, 2 = the
+/// retype), and the two entries. Zeroed on every exit path.
+struct Prompt {
+    live: bool,
+    stage: u8,
+    name: [u8; NAME_MAX],
+    nlen: usize,
+    a: [u8; PW_MAX],
+    alen: usize,
+    b: [u8; PW_MAX],
+    blen: usize,
+    over: bool,
+}
+
+/// The idle prompt — every exit path writes this back, which is what zeroes both entries.
+const PROMPT_IDLE: Prompt = Prompt { live: false, stage: 0, name: [0; NAME_MAX], nlen: 0, a: [0; PW_MAX], alen: 0, b: [0; PW_MAX], blen: 0, over: false };
+
+static PROMPT: Mutex<Prompt> = Mutex::new(PROMPT_IDLE);
+
+/// The last `adduser` outcome — `"created"` or the refusal's `reason=` word. The fixture reads it; the
+/// wire carries the same word, so a reader of either sees one vocabulary.
+static ADDUSER_LAST: Mutex<&'static str> = Mutex::new("");
+
+/// Is an `adduser` password prompt waiting for keys?
+pub fn prompt_live() -> bool {
+    PROMPT.lock().live
+}
+
+/// LOGIN13 — are the keys being typed right now SECRET? True while the `adduser` prompt is live or the
+/// login screen is up. The raw-key witnesses consult this and print a placeholder instead of the byte.
+pub fn secret_input() -> bool {
+    prompt_live() || screen_up()
+}
+
+/// The name as the wire prints it: the bytes when they are printable ASCII, `?` otherwise. A name that
+/// fails `name_ok` is still NAMED on its refusal line — root typed it — but never raw.
+fn wire_name(n: &[u8]) -> &str {
+    if !n.is_empty() && n.iter().all(|&b| (0x21..0x7f).contains(&b)) {
+        core::str::from_utf8(n).unwrap_or("?")
+    } else {
+        "?"
+    }
+}
+
+fn adduser_refuse(name: &[u8], reason: &'static str, console: &mut crate::console::Console) {
+    *ADDUSER_LAST.lock() = reason;
+    serial_println!("[users] adduser REFUSED user={} reason={}", wire_name(name), reason);
+    console.println(&alloc::format!("adduser: {} not added (reason={})", wire_name(name), reason));
+}
+
+/// The `UsersError` a create returned, in `adduser`'s refusal vocabulary.
+fn adduser_reason(e: UsersError) -> &'static str {
+    match e {
+        UsersError::Exists => "exists",
+        UsersError::BadName => "bad-name",
+        UsersError::Full => "full",
+        UsersError::WeakKdf => "weak-kdf",
+        UsersError::Volume => "volume",
+        other => users_reason(other),
+    }
+}
+
+/// `adduser <name>` — the checks that need no password, then the prompt. Every refusal here happens
+/// BEFORE a password is asked for, so nobody types a secret into a request that was never going to run.
+fn adduser_begin(args: &[&str], console: &mut crate::console::Console) {
+    let Some(name) = args.first() else {
+        return console.println("usage: adduser <name>   (root only; the password is asked for and never shown)");
+    };
+    let nb = name.as_bytes();
+    if args.len() > 1 {
+        // The line — password included — is already in `history` and on the wire (`[midden] cmd=`). Using
+        // it would make that the normal way to add a user; refusing it makes the prompt the only way.
+        return adduser_refuse(nb, "password-on-line", console);
+    }
+    if !root_session() {
+        return adduser_refuse(nb, "not-root", console);
+    }
+    if !load_once() {
+        return adduser_refuse(nb, "storage-not-up", console);
+    }
+    if !name_ok(nb) {
+        return adduser_refuse(nb, "bad-name", console);
+    }
+    if id_of(nb).is_some() {
+        return adduser_refuse(nb, "exists", console);
+    }
+    if count() >= MAX_USERS {
+        return adduser_refuse(nb, "full", console);
+    }
+    {
+        let mut p = PROMPT.lock();
+        p.live = true;
+        p.stage = 1;
+        p.name = [0; NAME_MAX];
+        p.name[..nb.len()].copy_from_slice(nb);
+        p.nlen = nb.len();
+        p.a = [0; PW_MAX];
+        p.alen = 0;
+        p.b = [0; PW_MAX];
+        p.blen = 0;
+        p.over = false;
+    }
+    console.println(&alloc::format!("adduser: password for {} (not shown; Enter ends it, Ctrl-C cancels):", name));
+}
+
+/// LOGIN13 M2 — offer a key to the `adduser` prompt. Called FIRST in `main.rs::handle_key`, ahead of the
+/// shell's line editor. `0` = no prompt is live (the key is the shell's); `1` = consumed, nothing to
+/// redraw (a password byte — nothing is echoed, so there is nothing to draw); `2` = consumed and the
+/// console printed a line (the caller redraws it).
+pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
+    let mut p = PROMPT.lock();
+    if !p.live {
+        return 0;
+    }
+    match c {
+        0x03 => {
+            let n = p.name;
+            let nl = p.nlen;
+            *p = PROMPT_IDLE;
+            drop(p);
+            adduser_refuse(&n[..nl], "cancelled", console);
+            2
+        }
+        8 | 0x7f => {
+            if p.stage == 1 {
+                p.alen = p.alen.saturating_sub(1);
+            } else {
+                p.blen = p.blen.saturating_sub(1);
+            }
+            1
+        }
+        b'\n' | b'\r' => {
+            if p.stage == 1 && p.alen > 0 && !p.over {
+                p.stage = 2;
+                drop(p);
+                console.println("adduser: retype it:");
+                return 2;
+            }
+            // Finished (or refused at the first Enter): copy out, ZERO the prompt, then decide with no
+            // lock held — `create_user` runs the calibrated KDF (~250 ms) and takes `TABLE`.
+            let (n, nl, a, al, b, bl, over, stage) = (p.name, p.nlen, p.a, p.alen, p.b, p.blen, p.over, p.stage);
+            *p = PROMPT_IDLE;
+            drop(p);
+            let name = &n[..nl];
+            let verdict = if over {
+                Err("password-too-long")
+            } else if al == 0 {
+                Err("empty-password")
+            } else if stage != 2 || a[..al] != b[..bl] {
+                Err("mismatch")
+            } else {
+                adduser_commit(name, &a[..al])
+            };
+            let mut a = a;
+            let mut b = b;
+            for x in a.iter_mut().chain(b.iter_mut()) {
+                *x = 0;
+            }
+            match verdict {
+                Ok((uid, created)) => console.println(&alloc::format!("adduser: added {} (uid {}, home /home/{}{})", wire_name(name), uid, wire_name(name), if created { ", created" } else { "" })),
+                Err(r) => adduser_refuse(name, r, console),
+            }
+            2
+        }
+        0x20..=0x7e => {
+            if p.stage == 1 {
+                if p.alen < PW_MAX { let i = p.alen; p.a[i] = c; p.alen += 1; } else { p.over = true; }
+            } else if p.blen < PW_MAX {
+                let i = p.blen;
+                p.b[i] = c;
+                p.blen += 1;
+            } else {
+                p.over = true;
+            }
+            1
+        }
+        _ => 1, // swallowed: nothing typed at a password prompt reaches the shell
+    }
+}
+
+/// LOGIN13 M2 — create the user root asked for and make its home. Root is RE-CHECKED here, at the
+/// moment of the write: the prompt may have been open across a Log Out. `Ok((uid, home_created))`;
+/// the wire line is `[users] adduser user=<n> id=<uid> home=/home/<n> created=<bool>`, where `created=`
+/// is the HOME's verdict (`ensure_home`, which also prints its own `[users] home=` line), `false` when
+/// the directory was already there or the volume refused it (then the `NOT created reason=` line says
+/// why — the user exists either way and `/home/<n>` is made again at its first login, `login`'s rule).
+pub fn adduser_commit(name: &[u8], password: &[u8]) -> Result<(u32, bool), &'static str> {
+    if !root_session() {
+        return Err("not-root");
+    }
+    if password.is_empty() {
+        return Err("empty-password");
+    }
+    let uid = create_user(name, password).map_err(adduser_reason)?;
+    let created = match ensure_home(name) {
+        Ok(v) => v == "created",
+        Err(e) => {
+            serial_println!("[users] home=/home/{} NOT created reason={} volume={}", wire_name(name), users_reason(e), crate::fs::fat::mount().map(|f| f.volume_fingerprint().0).unwrap_or(0));
+            false
+        }
+    };
+    *ADDUSER_LAST.lock() = "created";
+    serial_println!("[users] adduser user={} id={} home=/home/{} created={} (R63: root added it; the password was asked for, never on the line)", wire_name(name), uid, wire_name(name), created);
+    Ok((uid, created))
+}
+
+/// LOGIN-ADDUSER (`loginst`, LOGIN13 M2) — x86 lane. Drives the REAL verb (`shell_verb("adduser", …)`)
+/// and the REAL prompt (`prompt_key`, the function `handle_key` offers every key to) on a scratch console,
+/// in the root session the boot left (LOGIN-BOOTROOT ran first):
+///  * `prompted` — the verb opened the prompt instead of creating anything;
+///  * `echo=none` — after typing the password twice, the console's input line is EMPTY: no byte reached
+///    the line editor (and so neither history nor the `[midden] cmd=` witness);
+///  * `created` / `verify` — the user exists and the TYPED credential verifies (the prompt handed the
+///    bytes it was given to `create_user`, not a truncation or the retype's leftovers);
+///  * the four refusals, each by its wire word: `dup=exists`, `empty=empty-password`, `mismatch=mismatch`,
+///    `on_line=password-on-line` — and none of them created a row.
+/// Leaves `boot13` in the store: LOGIN-ROOTOUT (M3) logs in as it after the root session's Log Out.
+/// GO-RED (LOGIN13 M2, run on this gate): the root check in `adduser_begin` inverted → the verb refuses
+/// `reason=not-root` from root → `prompted=false created=false -> FAIL —`.
+#[cfg(feature = "loginst")]
+pub fn login_adduser_fixture() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        const N: &str = "boot13";
+        const PW: &[u8] = b"boot13-pw";
+        let mut con = crate::console::Console::new();
+        let feed = |con: &mut crate::console::Console, s: &[u8]| {
+            for &b in s {
+                let _ = prompt_key(b, con);
+            }
+        };
+        let root = root_session();
+        shell_verb("adduser", &[N], &mut con);
+        let prompted = prompt_live();
+        feed(&mut con, PW);
+        feed(&mut con, b"\n");
+        feed(&mut con, PW);
+        feed(&mut con, b"\n");
+        let echo_none = con.current_input.is_empty() && !prompt_live();
+        let created = *ADDUSER_LAST.lock() == "created" && id_of(N.as_bytes()).is_some();
+        let uid = id_of(N.as_bytes()).unwrap_or(0);
+        let verify_ok = verify(N.as_bytes(), PW);
+        shell_verb("adduser", &[N], &mut con);
+        let dup = if prompt_live() { "PROMPTED" } else { *ADDUSER_LAST.lock() };
+        shell_verb("adduser", &["boot13e"], &mut con);
+        feed(&mut con, b"\n");
+        let empty = if id_of(b"boot13e").is_some() { "CREATED" } else { *ADDUSER_LAST.lock() };
+        shell_verb("adduser", &["boot13m"], &mut con);
+        feed(&mut con, b"one-pw\n");
+        feed(&mut con, b"two-pw\n");
+        let mismatch = if id_of(b"boot13m").is_some() { "CREATED" } else { *ADDUSER_LAST.lock() };
+        shell_verb("adduser", &["boot13p", "on-the-line"], &mut con);
+        let on_line = if prompt_live() || id_of(b"boot13p").is_some() { "ACCEPTED" } else { *ADDUSER_LAST.lock() };
+        let ok = root && prompted && echo_none && created && verify_ok && dup == "exists" && empty == "empty-password" && mismatch == "mismatch" && on_line == "password-on-line";
+        serial_println!(
+            ":: LOGIN-ADDUSER: root={} prompted={} echo={} created={} uid={} verify={} dup={} empty={} mismatch={} on_line={} -> {} ::",
+            root, prompted, if echo_none { "none" } else { "LEAKED" }, created, uid, if verify_ok { "ok" } else { "FAIL" }, dup, empty, mismatch, on_line,
+            if ok { "PASS" } else { "FAIL —" }
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        serial_println!("[users] adduser fixture: x86 lane only (the verb and the prompt are arch-neutral and compiled here; the leg runs on the x86 login lane)");
+    }
 }

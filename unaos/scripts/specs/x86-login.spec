@@ -343,3 +343,24 @@ FORBID \[login\] boot session=\S+ desktop=\S+ screen=open
 # the screen on a desktop boot, and `screen_built=true` says the screen was compiled so the claim bites.
 REQUIRE :: LOGIN-BOOTROOT: session=root\(uid0\) root_at_boot=true desk_screen=closed nodesk_screen=closed still_root=true screen_built=true -> PASS ::
 FORBID :: LOGIN-BOOTROOT: .* -> FAIL
+#
+# M2 — `adduser <name>`: ROOT ADDS A USER, AND THE PASSWORD IS ASKED FOR. The fixture drives the REAL verb
+# (`users::shell_verb("adduser", …)`) and the REAL prompt (`users::prompt_key`, the function
+# `main.rs::handle_key` offers every key to first) in the root session the boot left. GO-RED (LOGIN13 M2,
+# run on this gate): the root check in `adduser_begin` inverted (`if !root_session()` -> `if root_session()`)
+# reads `prompted=false … created=false … -> FAIL —`. GREEN CERTIFIES: root can add a user without the
+# password touching the line editor (`echo=none`), the typed credential is the stored one (`verify=ok`),
+# and the four refusals each speak their own word and create nothing.
+REQUIRE :: LOGIN-ADDUSER: root=true prompted=true echo=none created=true uid=\d+ verify=ok dup=exists empty=empty-password mismatch=mismatch on_line=password-on-line -> PASS ::
+FORBID :: LOGIN-ADDUSER: .* -> FAIL
+# The success line (the store's uid, the home's own verdict) and the refusal lines, by their wire words.
+REQUIRE \[users\] adduser user=boot13 id=\d+ home=/home/boot13 created=(true|false)
+REQUIRE \[users\] home=/home/boot13 (created|exists) volume=[0-9a-f]{8}
+REQUIRE \[users\] adduser REFUSED user=boot13 reason=exists
+REQUIRE \[users\] adduser REFUSED user=boot13e reason=empty-password
+REQUIRE \[users\] adduser REFUSED user=boot13m reason=mismatch
+REQUIRE \[users\] adduser REFUSED user=boot13p reason=password-on-line
+# THE PROPERTY THE PROMPT EXISTS FOR, as a rule: nothing the fixture typed at the prompt reaches the wire.
+# `boot13-pw` is the credential (typed twice), `one-pw`/`two-pw` the mismatched pair.
+FORBID boot13-pw
+FORBID (one|two)-pw

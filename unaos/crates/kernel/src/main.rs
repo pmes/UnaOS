@@ -1335,7 +1335,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 match event {
                     unaos_kernel::pal::Event::Key(c) => {
                         let ch = c as char;
-                        serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' });
+                        #[cfg(feature = "login")] let hide = unaos_kernel::fs::users::secret_input(); #[cfg(not(feature = "login"))] let hide = false; if hide { serial_println!("USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)"); } else { serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' }); } // LOGIN13 M2/M3 — `usbdebug` (on every flight image) printed every typed byte, the login screen's password included, which broke `video/login.rs`'s "NO TYPED BYTE REACHES THE WIRE". ⚠ LINE-NEUTRAL fold.
                     }
                     unaos_kernel::pal::Event::Mouse { x, y } => {
                         serial_println!("USB-DEBUG: MOUSE relative dx={} dy={}", x, y);
@@ -2753,7 +2753,7 @@ fn handle_key(
     console: &mut unaos_kernel::console::Console,
     pal: &mut unaos_kernel::pal::TargetPal<'_>,
 ) -> bool {
-    console.sel.on_edit(c, console.current_input.len()); if c == b'\n' || c == b'\r' { // TERMSEL — THE EDIT RULE, ahead of every edit this function makes: a typed byte, BS/DEL and CR/LF drop a live selection first (`video::termsel::LineSel::on_edit`, which prints `[termsel] none … by=edit` only when one was live and ignores bytes that edit nothing, e.g. the arrow byte a `Shift+←` pushes just ahead of its `SelectLeft`). The editor has no caret, so a selection cannot be REPLACED by what is typed; keeping it across the edit would paint the band over cells that moved. A paste types through this same function, so it drops the selection the same way. Runs on every surface that calls `handle_key`; where no selection can be made (no `Event::Action` consumer) it is a no-op. ⚠ FOLDED onto the existing `if` — `main.rs` embeds `panic::Location` line numbers (PARITY §5.3); CODE FIRST (A10FIX).
+    #[cfg(feature = "login")] match unaos_kernel::fs::users::prompt_key(c, console) { 0 => {} 1 => return false, _ => { console.draw(pal); return false; } } console.sel.on_edit(c, console.current_input.len()); if c == b'\n' || c == b'\r' { // TERMSEL — THE EDIT RULE, ahead of every edit this function makes: a typed byte, BS/DEL and CR/LF drop a live selection first (`video::termsel::LineSel::on_edit`, which prints `[termsel] none … by=edit` only when one was live and ignores bytes that edit nothing, e.g. the arrow byte a `Shift+←` pushes just ahead of its `SelectLeft`). The editor has no caret, so a selection cannot be REPLACED by what is typed; keeping it across the edit would paint the band over cells that moved. A paste types through this same function, so it drops the selection the same way. Runs on every surface that calls `handle_key`; where no selection can be made (no `Event::Action` consumer) it is a no-op. ⚠ FOLDED onto the existing `if` — `main.rs` embeds `panic::Location` line numbers (PARITY §5.3); CODE FIRST (A10FIX).
         let cmd = console.current_input.clone();
         console.current_input.clear();
         // GUI-CLICK-2: mark the screen app-owned across the (possibly long-running, full-screen)
@@ -3580,7 +3580,7 @@ fn usbdebug_event_print(raw: unaos_kernel::pal::Event) {
         unaos_kernel::pal::Event::Key(c) => {
             usbdebug_ptr_rollup_flush();
             let ch = c as char;
-            serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' });
+            #[cfg(feature = "login")] let hide = unaos_kernel::fs::users::secret_input(); #[cfg(not(feature = "login"))] let hide = false; if hide { serial_println!("USB-DEBUG: KEY withheld (LOGIN13: a password prompt or the login screen holds the keyboard; a typed secret is never printed)"); } else { serial_println!("USB-DEBUG: KEY {:#04x} '{}'", c, if c >= 32 && c < 127 { ch } else { '.' }); } // LOGIN13 M2/M3 — `usbdebug` (on every flight image) printed every typed byte, the login screen's password included, which broke `video/login.rs`'s "NO TYPED BYTE REACHES THE WIRE". ⚠ LINE-NEUTRAL fold.
         }
         unaos_kernel::pal::Event::Mouse { x, y } => {
             // The bounded verbatim prologue: the old line, unchanged, for the first reports of the
