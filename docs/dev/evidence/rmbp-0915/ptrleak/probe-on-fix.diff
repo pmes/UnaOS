@@ -1,0 +1,11 @@
+--- syscall.fix.rs	2026-09-23 14:46:59.386686095 -0600
++++ syscall.probe.rs	2026-09-23 14:46:59.413685253 -0600
+@@ -7162,7 +7162,7 @@
+     crate::pal::fixture_ring_hold(true); let pop0 = evq_pops(); // PTRLEAK (B193) — HOLD the ring before the first synthetic push: `x86_input_service` stands down until the matching release after this fixture's last drain, so none of the 192 synthetic motions (nor leg 3's `Button(1)`) reaches the real pointer. Nothing between the two returns early. ⚠ LINE-NEUTRAL fold.
+     for _ in 0..n {
+         crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: -1 }), None);
+-    }
++    } { let t0 = crate::arch::ms(); while evq_pops() == pop0 && crate::arch::ms().wrapping_sub(t0) < 200 { core::hint::spin_loop(); } serial_println!("[cursorflk-probe] backlog handed to a foreign drain after {}ms pops={}", crate::arch::ms().wrapping_sub(t0), evq_pops() - pop0); }
+     let (mut sx, mut sy, mut entries) = (0i32, 0i32, 0u32);
+     for _ in 0..crate::pal::QUEUE_SIZE_PUB {
+         match crate::pal::next_event() {

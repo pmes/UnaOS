@@ -1,0 +1,11 @@
+--- screen.fix.rs	2026-09-23 14:54:50.973973157 -0600
++++ screen.mut.rs	2026-09-23 14:54:50.990972627 -0600
+@@ -863,7 +863,7 @@
+ ///   ([`desk_window_occluders`]), so a knob-off x86 arrow is withheld, never bracketed (CURSORFLK B186).
+ ///
+ /// The two are checked against each other below rather than left to agree by reading.
+-const DESK_SPRITE_OCC: bool = cfg!(target_arch = "x86_64"); // PTRLEAK (B193) — was `all(x86_64, wc)`: the knob-off x86 desktop present bracketed a live front-buffer arrow and published pointerless frames (`[cursor11] … flicker_frames=5 … -> FLICKER`, CURSORFLK B186). The term that remains is the hardware one. ⚠ LINE-NEUTRAL.
++const DESK_SPRITE_OCC: bool = cfg!(all(target_arch = "x86_64", feature = "wc")); // PTRLEAK (B193) — was `all(x86_64, wc)`: the knob-off x86 desktop present bracketed a live front-buffer arrow and published pointerless frames (`[cursor11] … flicker_frames=5 … -> FLICKER`, CURSORFLK B186). The term that remains is the hardware one. ⚠ LINE-NEUTRAL.
+ 
+ /// PTRREPAINT — the subtraction may never be armed on a board whose arrow is NOT front-buffer-owned.
+ /// A compile-time proof rather than a sentence, because the failure mode is a pointer that vanishes

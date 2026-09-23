@@ -10915,6 +10915,19 @@ The fold caps the damage at the ring. The burst itself, and two seams that ampli
 where the hand is rather than crawling there — and `pal::pointer_motion_coalesced()` reading nonzero
 is the proof the drain fell behind and the fold caught it.
 
+**PTRLEAK (rmbp-ledger B193, 2026-09-23): the fixture's own window no longer leaks to the product.**
+PTRDEAD's selftest pushes 192 synthetic `Mouse{1,-1}` and a `Mouse/Button(1)/Mouse/Mouse` run into the
+live `pal::EVENT_QUEUE`. CURSORFLK (B186) measured `x86_input_service`, on another core, draining them
+under a timer preemption and installing the motion on the real pointer: `[cursor] armed` at centre plus
+the stolen travel, on a QEMU lane with no pointer, and on flight 12 as the boot's only `[cursor] armed`
+(trackpad halted, `[deadman] hid=0`). A forced run also showed the synthetic `Button(1)` delivered
+(`fpop3=2`). The fixture now holds the ring. `pal::fixture_ring_hold(true)` goes up before the first
+push and comes down after the last drain, and the service pops through `pal::next_event_unless_held`,
+which tests the hold and pops inside one `EVENT_QUEUE` critical section. This is the x86 form of
+aarch64's `ROUTER_SELFTEST`. The other drains are untouched, so the SELFTEST-RACE SKIP arm stays. With
+the hold, the leg judges (`whole=true nodrop=true order=true … fpop12=0 fpop3=0`) on every measured
+boot. Evidence: `docs/dev/evidence/rmbp-0915/ptrleak/PTRLEAK.md`.
+
 ## PTRWIT / PTBURST / EHCIDARK / PTRCH — the four amplifiers behind the dead zone (2026-08-21)
 
 PTRDEAD capped the damage at the ring. It did **not** remove the burst. This is the burst: the four
@@ -17465,14 +17478,20 @@ being a second name for `flush_undraw=`) and must be 0; `m` is its control, beca
 non-zero `n` now reads `-> FLICKER` ahead of every other rung, so the line cannot say `THROUGH`
 about a boot the operator watched the arrow blink through.
 
-**aarch64 does not move and must not.** `DESK_SPRITE_OCC` is `cfg!(all(target_arch = "x86_64",
-feature = "wc"))` — the `target_arch` term is `SPRITE_OWNS_PAINT`'s hardware reason (which buffer
-owns the arrow's pixels) and the `wc` term is the array-capacity one (only the SHELLDESK arm stages
-through its own `wins`, so only it has room for the extra slot). `DESK_SPRITE_MAX` is therefore 0 on
-aarch64 and on knob-off x86 and those occluder arrays are the ones they have always been, element
-for element; a `const _: () = assert!(!DESK_SPRITE_OCC || SPRITE_OWNS_PAINT)` makes the agreement a
-build failure rather than a sentence. Withholding the box on the Pi or the Orin would delete their
-pointer over the backdrop outright, so the guard is the fix's precondition and not its packaging.
+**aarch64 does not move and must not.** `DESK_SPRITE_OCC` is `cfg!(target_arch = "x86_64")`. The
+`target_arch` term is `SPRITE_OWNS_PAINT`'s hardware reason: which buffer owns the arrow's pixels.
+Until PTRLEAK (B193, 2026-09-23) it also carried a `wc` term. That term was the array-capacity one:
+only the SHELLDESK arm staged `wm::occluders` through its own `wins`, so only it had room for the
+extra slot. A knob-off x86 build therefore kept the FLICKER-3 bracket around a live front-buffer
+arrow, and CURSORFLK (B186) measured it publishing pointerless frames (`flicker_frames=5 … ->
+FLICKER`). The no-registry arm now fills through `desk_window_occluders`. On knob-off x86 it stages
+through `wins` and leaves the sprite's slot, so the knob-off desktop present withholds and absorbs the
+arrow exactly as `wc` does (forced arrow: `flicker_frames=0 px_absorbed=405`; with the term restored,
+`flicker_frames=4 -> FLICKER`). On aarch64 it is the WC-I call on the WC-I array, inlined.
+`DESK_SPRITE_MAX` is 0 there, and that occluder array is the one it has always had, element for
+element. A `const _: () = assert!(!DESK_SPRITE_OCC || SPRITE_OWNS_PAINT)` makes the agreement a build
+failure rather than a sentence. Withholding the box on the Pi or the Orin would delete their pointer
+over the backdrop outright, so the guard is the fix's precondition and not its packaging.
 
 **Residuals, both named rather than closed.** (1) Boot 2 of flight 8 is a DIFFERENT defect and this
 arc does not touch it: there `px_installed` is 0/1008 against `px_redrawn` 4320 → 17740 (up to
