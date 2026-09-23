@@ -333,3 +333,32 @@ FORBID :: BUSX86-WR: write side FAIL
 # ACL ran and the live-source refusal ran, `ok` says the owner was admitted, and `-ENOENT` says the
 # ordering between two destructive verbs on the same name is the one the wire asked for.
 REQUIRE :: BUSX86-EQ: .* write/rm/mv=-EBUSY/ok/-ENOENT .* -> PASS ::
+
+# ── LFN2 (2026-09-23, rmbp-ledger B182), TAIL-APPENDED past STOR-1 M3 ────────────────────────────────
+# B173's two owed halves. `fs/fat.rs` §LFN2: DELETE tombstones a long name's VFAT component run with
+# its short entry (short entry's sector first, then earlier sectors), and RENAME rewrites the run — a
+# new run for a long name (in place when that is one sector write, otherwise a fresh contiguous run
+# with the old entry retired after it), none for an 8.3 name, whose old run is retired. The fixture
+# (`lfn2_witness`, called from `fatlfn_witness_once`) works in the `/LFNTEST` directory FATLFN's leg 9
+# leaves, and its layout is CHOSEN so the deleted run straddles a sector boundary — on this image's
+# 512-byte clusters also a CLUSTER boundary — which is the only case that exercises the walk back
+# into an earlier sector and `fat_predecessor`. Two lines, pinned as the kernel prints them in the
+# commit that added them (the SPECRUN contract).
+#
+# DELETE. `sectors=2 clusters=2` ARE literal: they are the boundary crossing, and a layout change
+# that stopped crossing would otherwise pass while exercising nothing new. `pred=` names how the
+# previous cluster was found (`scan` on this image, where the moved file's data clusters sit between
+# the directory's two) and is an alternation, because which one fires is allocation, not correctness.
+# `tombstoned=6/6` is the claim; `orphans=0` is what a skipped tombstone shows up as, counted FORWARD
+# through the reader (every live component slot minus the slots of every attached long name), a method
+# that shares nothing with the walk-back under test.
+REQUIRE :: FAT-LFN-DEL: deleted=Deleted - this run crosses a sector boundary on purpose\.txt alias=DELETE~1\.TXT slots=5 sectors=2 clusters=2 pred=(adjacent|scan) tombstoned=6/6 readback=gone alias_gone=ok orphans=0 -> PASS ::
+# RENAME, four cases on one line: long -> longer (a DIFFERENT slot count: the entry MOVES into the
+# slots the delete just freed, its 700-byte chain comes with it, `old_tombstoned=4/4`); long -> long
+# at the same count in one sector (IN PLACE, `kept_slot=yes`); long -> 8.3 (no long name afterwards,
+# `run_tombstoned=2/2`); and a name `lfn_units` refuses (a trailing space: `refused=ok` means
+# `Unsupported` AND the directory's raw slots byte-identical after). Then `orphans=0`.
+REQUIRE :: FAT-LFN-MV: renamed=Rename me - long to longer\.txt => Renamed - a longer long name that needs more slots\.txt slots=3=>5 moved=yes readback=ok old_gone=yes chain=kept old_tombstoned=4/4 \| in_place=In place A\.txt => In place Bb\.txt kept_slot=yes \| to_83=In place Bb\.txt => SHORT\.TXT long_name=none:yes run_tombstoned=2/2 \| refused=ok orphans=0 -> PASS ::
+# Both FAIL spellings end `FAIL ::` and are convicted by mbench's DEFAULT_FORBIDS and `arroyo`'s own
+# fault scan, so — FATLFN's reasoning above — they are not restated. A SKIP has no line of its own:
+# the witness runs only where FAT-LFN ran, whose SKIPPED is already FORBIDden above.

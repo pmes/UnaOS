@@ -6176,6 +6176,7 @@ pub fn fatlfn_witness_once() {
         ),
         Err(e) => serial_println!(":: FAT-LFN: VFAT long-name create ({:?}) FAIL ::", e),
     }
+    lfn2_witness(); // LFN2 (B182): the delete and rename legs, on the directory leg 9 just left — see the §LFN2 fixture at the file tail
 }
 
 // =========================================================================================
@@ -6324,7 +6325,7 @@ impl FatFs {
         if rel % spc != 0 {
             return Ok(Some(lba - 1));
         }
-        let c = (rel / spc) as u32 + 2;
+        let c = u32::try_from(rel / spc).map_err(|_| FatError::OutOfVolume)? + 2; // never `as`: a truncated index could pass `valid_cluster` (lba32, SR15)
         if !self.valid_cluster(c) {
             return Err(FatError::BadChain);
         }
@@ -6559,4 +6560,239 @@ impl FatFs {
             Err(e) => Err(e),
         }
     }
+}
+
+// ─────────── §LFN2 — THE FIXTURE: delete and rename, on the medium FATLFN's leg 9 leaves ───────────
+//
+// It runs from `fatlfn_witness_once`, straight after the `:: FAT-LFN:` verdict, so it inherits that
+// witness's one-shot latch, its mount and its write-veto check (a read-only volume prints FAT-LFN's
+// SKIPPED and never reaches here). It works in `/LFNTEST`, the directory FATLFN's leg 9 re-creates and
+// LEAVES for the host read-back, and it too leaves its end state there for the same reason: the
+// decisive evidence is a real VFAT driver (GNU mtools) listing the NEW long name and not the old one,
+// and a count of orphan slots that does not use the walk-back under test. On a persistent card the
+// next boot's FATLFN step-0 teardown removes the whole directory.
+//
+// THE LAYOUT IS CHOSEN, because a run that never crosses a boundary would never exercise the walk
+// back into the previous sector. In the fresh directory `.` and `..` hold slots 0-1 and leg 9's
+// screenshot entry 2-5; this fixture then creates MV_FROM (4 slots, 6-9) and IP_FROM (3 slots,
+// 10-12), so the 6-slot DEL run lands at 13-18 and STRADDLES the sector boundary at 16 — on the
+// default image's 512-byte clusters that is also a CLUSTER boundary, reached by `fat_predecessor`.
+// Deleting it frees those six slots, and the relocating rename that follows is sized to take exactly
+// them back, so the wire also shows the reclaimed slots being reused.
+
+/// LFN2 fixture: 59 characters, 5 component slots — the DELETE leg's name, sized to straddle 16.
+#[cfg(feature = "witness")]
+const LFN2_DEL: &str = "Deleted - this run crosses a sector boundary on purpose.txt";
+/// LFN2 fixture: 30 characters (3 slots) renamed to 54 (5 slots) — a DIFFERENT slot count, so a fresh
+/// run: the entry MOVES, and its chain must come with it.
+#[cfg(feature = "witness")]
+const LFN2_MV_FROM: &str = "Rename me - long to longer.txt";
+#[cfg(feature = "witness")]
+const LFN2_MV_TO: &str = "Renamed - a longer long name that needs more slots.txt";
+/// LFN2 fixture: 14 characters to 15, 2 slots each, all in one sector — the IN-PLACE case.
+#[cfg(feature = "witness")]
+const LFN2_IP_FROM: &str = "In place A.txt";
+#[cfg(feature = "witness")]
+const LFN2_IP_TO: &str = "In place Bb.txt";
+/// LFN2 fixture: the long -> 8.3 case — no long form, so the old run is retired and none written.
+#[cfg(feature = "witness")]
+const LFN2_83: &str = "SHORT.TXT";
+/// LFN2 fixture: a name `lfn_units` refuses (a trailing space) — the rename must mutate NOTHING.
+#[cfg(feature = "witness")]
+const LFN2_BAD: &str = "Trailing space is refused ";
+/// LFN2 fixture: bytes written into MV_FROM before it moves — more than one 512-byte cluster, so
+/// "the chain came with it" is a multi-cluster claim, read back byte for byte.
+#[cfg(feature = "witness")]
+const LFN2_BYTES: usize = 700;
+
+/// LFN2 fixture: live component slots in `dir` that no entry's long name accounts for — every live
+/// `0x0F` slot, minus `lfn_slot_count` of every long name `read_dir` attaches. Independent of the
+/// walk-back under test: it counts forward, through the reader.
+#[cfg(feature = "witness")]
+fn lfn2_orphans(fs: &FatFs, dir: u32) -> Result<usize, FatError> {
+    let live = fatlfn_slots(fs, dir)?
+        .iter()
+        .filter(|&&(_, _, e)| e[0] != 0x00 && e[0] != 0xE5 && e[11] == LFN_ATTR)
+        .count();
+    let mut owned = 0usize;
+    for de in fs.read_dir(dir)? {
+        if de.lname_len > 0 {
+            owned += lfn_units(de.name()).map(|u| lfn_slot_count(&u)).ok_or(FatError::BadChain)?;
+        }
+    }
+    live.checked_sub(owned).ok_or(FatError::BadChain)
+}
+
+/// LFN2 fixture: the positions of the run AND short entry of the long-named entry at (`lba`, `off`) —
+/// the `slots` slots physically preceding it plus itself, read off the raw directory listing (the
+/// FATLFN leg-4 method), NOT through `lfn_run_before`, so a wrong walk cannot vouch for itself.
+#[cfg(feature = "witness")]
+fn lfn2_positions(fs: &FatFs, dir: u32, lba: u64, off: usize, slots: usize) -> Result<alloc::vec::Vec<(u64, usize)>, FatError> {
+    let all = fatlfn_slots(fs, dir)?;
+    let at = all.iter().position(|&(l, o, _)| l == lba && o == off).ok_or(FatError::BadChain)?;
+    if at < slots {
+        return Err(FatError::BadChain);
+    }
+    Ok(all[at - slots..=at].iter().map(|&(l, o, _)| (l, o)).collect())
+}
+
+/// LFN2 fixture: how many of `pos` read `0xE5` on the medium now.
+#[cfg(feature = "witness")]
+fn lfn2_tombstoned(fs: &FatFs, dir: u32, pos: &[(u64, usize)]) -> Result<usize, FatError> {
+    let all = fatlfn_slots(fs, dir)?;
+    Ok(pos.iter().filter(|&&(l, o)| all.iter().any(|&(al, ao, e)| al == l && ao == o && e[0] == 0xE5)).count())
+}
+
+#[cfg(feature = "witness")]
+fn lfn2_slots_of(name: &str) -> Result<usize, FatError> {
+    Ok(lfn_slot_count(&lfn_units(name).ok_or(FatError::Unsupported)?))
+}
+
+/// LFN2 fixture, the DELETE leg: create the 5-slot name so its run straddles a sector (and, on this
+/// image, a cluster) boundary, delete it through the ordinary `delete_located`, and on a FRESH mount
+/// prove (a) the long name AND its alias are gone, (b) all six slots — five components and the short
+/// entry — read `0xE5`, (c) the directory holds zero orphan component slots. (b) is the claim; (c) is
+/// what a skipped tombstone shows up as, counted by a method that does not share the code under test.
+#[cfg(feature = "witness")]
+fn lfn2_del(fs: &FatFs, dir: u32) -> Result<(bool, String), FatError> {
+    let slots = lfn2_slots_of(LFN2_DEL)?;
+    let (de, lba, off) = fs.create_in_dir(dir, LFN2_DEL, 0x20)?;
+    if de.name() != LFN2_DEL {
+        return Err(FatError::BadChain);
+    }
+    let alias = fs.short_name_at(lba, off)?;
+    let pos = lfn2_positions(fs, dir, lba, off, slots)?;
+    let mut sectors: alloc::vec::Vec<u64> = pos.iter().map(|&(l, _)| l).collect();
+    sectors.dedup();
+    let spc = fs.sec_per_clus as u64;
+    let mut clusters: alloc::vec::Vec<u64> = sectors.iter().map(|&l| (l - fs.data_start) / spc).collect();
+    clusters.dedup();
+    let pred = if clusters.len() > 1 {
+        let c = u32::try_from((lba - fs.data_start) / spc).map_err(|_| FatError::OutOfVolume)? + 2; // lba32 (SR15): a cluster index, refused rather than truncated
+        if fs.fat_entry_copy(c - 1, 0)? == c { "adjacent" } else { "scan" }
+    } else {
+        "none"
+    };
+    fs.delete_located(lba, off, de.first_cluster())?;
+    let fs2 = mount()?;
+    let gone = matches!(fs2.locate_in_dir(dir, LFN2_DEL), Err(FatError::NotFound));
+    let alias_gone = matches!(fs2.locate_in_dir(dir, &alias), Err(FatError::NotFound));
+    let tomb = lfn2_tombstoned(&fs2, dir, &pos)?;
+    let orphans = lfn2_orphans(&fs2, dir)?;
+    let ok = gone && alias_gone && tomb == slots + 1 && orphans == 0;
+    Ok((
+        ok,
+        alloc::format!(
+            "deleted={} alias={} slots={} sectors={} clusters={} pred={} tombstoned={}/{} readback={} alias_gone={} orphans={}",
+            LFN2_DEL, alias, slots, sectors.len(), clusters.len(), pred, tomb, slots + 1,
+            if gone { "gone" } else { "STILL-FOUND" }, if alias_gone { "ok" } else { "STILL-FOUND" }, orphans
+        ),
+    ))
+}
+
+/// LFN2 fixture, the RENAME leg. Four cases, each read back on a FRESH mount:
+///  A. long -> longer (3 -> 5 slots): a FRESH run. The entry MOVES (it lands in the slots the delete
+///     leg just freed), answers to the new name and not the old, keeps its chain and size (700 bytes
+///     read back byte for byte), and all 4 of the old run's slots read `0xE5`;
+///  B. long -> long, same slot count, one sector: IN PLACE — the entry keeps its (LBA, offset);
+///  C. long -> 8.3: in place, NO long name afterwards, and both old component slots read `0xE5`;
+///  D. a name `lfn_units` refuses: `Unsupported`, and not one byte of the directory changed.
+/// Then zero orphan slots in the directory.
+#[cfg(feature = "witness")]
+fn lfn2_mv(fs: &FatFs, dir: u32, want: &[u8]) -> Result<(bool, String), FatError> {
+    // A — long -> longer.
+    let (fde, flba, foff) = fs.locate_in_dir(dir, LFN2_MV_FROM)?;
+    let a_pos = lfn2_positions(fs, dir, flba, foff, lfn2_slots_of(LFN2_MV_FROM)?)?;
+    let (_, nlba, noff) = fs.rename_entry(dir, LFN2_MV_FROM, LFN2_MV_TO)?;
+    let fs2 = mount()?;
+    let moved = (nlba, noff) != (flba, foff);
+    let (tde, tl, to) = fs2.locate_in_dir(dir, LFN2_MV_TO)?;
+    let a_name = tde.name() == LFN2_MV_TO && (tl, to) == (nlba, noff);
+    let a_old_gone = matches!(fs2.locate_in_dir(dir, LFN2_MV_FROM), Err(FatError::NotFound));
+    let mut got = alloc::vec::Vec::new();
+    fs2.read_at(tde.first_cluster(), tde.size, 0, &mut got, LFN2_BYTES)?;
+    let chain = tde.first_cluster() == fde.first_cluster() && tde.size == fde.size && got == want;
+    let a_tomb = lfn2_tombstoned(&fs2, dir, &a_pos)?;
+    // B — in place.
+    let (_, blba, boff) = fs2.locate_in_dir(dir, LFN2_IP_FROM)?;
+    let (_, b2l, b2o) = fs2.rename_entry(dir, LFN2_IP_FROM, LFN2_IP_TO)?;
+    let fs3 = mount()?;
+    let (bde, bl, bo) = fs3.locate_in_dir(dir, LFN2_IP_TO)?;
+    let in_place = (b2l, b2o) == (blba, boff) && (bl, bo) == (blba, boff) && bde.name() == LFN2_IP_TO
+        && matches!(fs3.locate_in_dir(dir, LFN2_IP_FROM), Err(FatError::NotFound));
+    let c_pos = lfn2_positions(&fs3, dir, bl, bo, lfn2_slots_of(LFN2_IP_TO)?)?;
+    // C — long -> 8.3.
+    let (_, c2l, c2o) = fs3.rename_entry(dir, LFN2_IP_TO, LFN2_83)?;
+    let fs4 = mount()?;
+    let (cde, cl, co) = fs4.locate_in_dir(dir, LFN2_83)?;
+    let to_83 = (c2l, c2o) == (bl, bo) && (cl, co) == (bl, bo) && cde.lname_len == 0 && cde.name() == LFN2_83
+        && matches!(fs4.locate_in_dir(dir, LFN2_IP_TO), Err(FatError::NotFound));
+    let c_tomb = lfn2_tombstoned(&fs4, dir, &c_pos[..c_pos.len() - 1])?;
+    // D — refused, and nothing written.
+    let snap = fatlfn_slots(&fs4, dir)?;
+    let refused = matches!(fs4.rename_entry(dir, LFN2_83, LFN2_BAD), Err(FatError::Unsupported))
+        && fatlfn_slots(&mount()?, dir)? == snap;
+    let orphans = lfn2_orphans(&mount()?, dir)?;
+    let ok = moved && a_name && a_old_gone && chain && a_tomb == a_pos.len() && in_place && to_83
+        && c_tomb == c_pos.len() - 1 && refused && orphans == 0;
+    let yn = |b: bool| if b { "yes" } else { "NO" };
+    Ok((
+        ok,
+        alloc::format!(
+            "renamed={} => {} slots={}=>{} moved={} readback={} old_gone={} chain={} old_tombstoned={}/{} | \
+             in_place={} => {} kept_slot={} | to_83={} => {} long_name=none:{} run_tombstoned={}/{} | refused={} orphans={}",
+            LFN2_MV_FROM, LFN2_MV_TO, lfn2_slots_of(LFN2_MV_FROM)?, lfn2_slots_of(LFN2_MV_TO)?, yn(moved),
+            if a_name { "ok" } else { "WRONG" }, yn(a_old_gone), if chain { "kept" } else { "LOST" }, a_tomb, a_pos.len(),
+            LFN2_IP_FROM, LFN2_IP_TO, yn(in_place),
+            LFN2_IP_TO, LFN2_83, yn(to_83), c_tomb, c_pos.len() - 1,
+            if refused { "ok" } else { "NO" }, orphans
+        ),
+    ))
+}
+
+/// LFN2: the one-shot delete + rename witness, called once from `fatlfn_witness_once` (whose latch and
+/// write-veto check it therefore inherits). Two lines, each `-> PASS ::` or `… FAIL ::` (the spelling
+/// `mbench.py`'s DEFAULT_FORBIDS and `arroyo`'s fault scan convict), and one line naming what it leaves
+/// on the medium for the host.
+#[cfg(feature = "witness")]
+fn lfn2_witness() {
+    let setup = || -> Result<(FatFs, u32, alloc::vec::Vec<u8>), FatError> {
+        let fs = mount()?;
+        let dir = match fs.locate_in_dir(0, FATLFN_DIR) {
+            Ok((d, _, _)) => d.first_cluster(),
+            Err(FatError::NotFound) => fs.create_dir(0, FATLFN_DIR)?.0.first_cluster(),
+            Err(e) => return Err(e),
+        };
+        if dir == 0 {
+            return Err(FatError::BadChain);
+        }
+        // The two rename subjects exist BEFORE the delete leg runs, so the delete's run lands at 13-18.
+        let (_, ml, mo) = fs.create_in_dir(dir, LFN2_MV_FROM, 0x20)?;
+        let want: alloc::vec::Vec<u8> = (0..LFN2_BYTES).map(|i| (i * 7 + 3) as u8).collect();
+        fs.write_grow(0, 0, ml, mo, 0, &want)?;
+        fs.create_in_dir(dir, LFN2_IP_FROM, 0x20)?;
+        Ok((fs, dir, want))
+    };
+    let (fs, dir, want) = match setup() {
+        Ok(t) => t,
+        Err(e) => {
+            serial_println!(":: FAT-LFN-DEL: setup ({:?}) FAIL ::", e);
+            serial_println!(":: FAT-LFN-MV: setup ({:?}) FAIL ::", e);
+            return;
+        }
+    };
+    match lfn2_del(&fs, dir) {
+        Ok((true, d)) => serial_println!(":: FAT-LFN-DEL: {} -> PASS ::", d),
+        Ok((false, d)) => serial_println!(":: FAT-LFN-DEL: {} FAIL ::", d),
+        Err(e) => serial_println!(":: FAT-LFN-DEL: VFAT long-name delete ({:?}) FAIL ::", e),
+    }
+    match mount().and_then(|fs| lfn2_mv(&fs, dir, &want)) {
+        Ok((true, d)) => serial_println!(":: FAT-LFN-MV: {} -> PASS ::", d),
+        Ok((false, d)) => serial_println!(":: FAT-LFN-MV: {} FAIL ::", d),
+        Err(e) => serial_println!(":: FAT-LFN-MV: VFAT long-name rename ({:?}) FAIL ::", e),
+    }
+    serial_println!(
+        ":: FAT-LFN-MV: end state left in /{} for the HOST-SIDE read-back — a real VFAT driver must list `{}` and `{}`, must NOT list `{}`, `{}`, `{}` or `{}`, and must count zero orphan component slots ::",
+        FATLFN_DIR, LFN2_MV_TO, LFN2_83, LFN2_MV_FROM, LFN2_IP_FROM, LFN2_IP_TO, LFN2_DEL
+    );
 }
