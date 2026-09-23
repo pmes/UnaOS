@@ -18383,7 +18383,7 @@ fn winx7_launcher(demo_cpu: usize) {
     let (spawned_before, joined_before, exited_before) = thread_stats();
     let parks_before = futex_park_count();
     let Some(fix) = winx7_build() else {
-        serial_println!(":: WINX-7: no free address-space slot — threads/futex/input demo skipped ::");
+        serial_println!(":: WINX-7: no free address-space slot — threads/futex/input demo skipped ::"); DMG_REFUSE_SETTLED.store(true, Ordering::Release); serial_println!(":: DMG-REFUSE: SETTLED ON DECLINE shape=winx7-build-none — this early return skips the tail chain that calls `dmg_refuse_launcher`, so the refusal witness will not arm on this boot and nothing may wait on its settle ::"); // DMGYIELD
         return;
     };
     serial_println!(
@@ -19032,8 +19032,8 @@ fn dmg_code(w: u64, i: usize) -> u32 {
 ///
 /// Flow, and every step's failure prints a line carrying the literal `NOT RUN` rather than returning
 /// silently — a witness that can skip quietly is the defect this fixture exists to avoid:
-///   1. One-shot. Sample `FB_PRESENT_COUNT`. Require the window table to be EMPTY at entry (it is: the
-///      WINX-7 verdict waited on its own teardown, and the two later window witnesses run after us).
+///   1. One-shot. Sample `FB_PRESENT_COUNT`. Require FOUR FREE ROWS at entry — DMGYIELD, 2026-09-22.
+///      NOT an empty table: see THE NEED below, and `yielded_to=` on the verdict for what it worked around.
 ///   2. Build + spawn `dmg-owner`; wait (bounded) until its window is really in the table, then read
 ///      its row id KERNEL-SIDE. Pick `id_free` as the HIGHEST free row — `sys_win_create` allocates
 ///      strictly lowest-first, so a high row cannot be handed to the prober while low rows are free.
@@ -19044,18 +19044,18 @@ fn dmg_code(w: u64, i: usize) -> u32 {
 ///      tell its own race from a kernel bug is worse than no fixture.
 ///   5. Release the owner, wait for its exit and both slots' teardown, then grade.
 ///
-/// SETTLE FLAG: `video::desktop_uefi::desktop_app_service` holds the desktop-app launch (bounded, out loud)
-/// until this witness has had its empty-table entry — Boot AL's launch at 13.257s beat the witness to
-/// row 1 (DMG entry 13.859s) and it printed NOT RUN for the first time in the capture. The flag is
-/// published on EVERY exit (the wrapper stores it after the body returns, NOT RUN paths included).
+/// THE NEED, read off the steps above rather than off what was convenient (DMGYIELD, 2026-09-22): FOUR rows, and the identity of exactly TWO. `id_a` must be the owner's alone (step 2, re-read at step 4); `id_free` must be free at plant time and still free at step 4; the other two are the prober's, taken lowest-first and reported back by ring 3 for step 4 to confirm against the table.
+/// EVERY one of those tests is ALREADY slot-scoped or single-bit — `dmg_win_masks(s)` masks by OWNER,
+/// `table_ok` reads `occ_re` at the `id_free` bit ONLY, `rows_ok` compares the prober's own mask — so a foreign row never entered the GRADE. It entered only the ENTRY CONDITION, which demanded emptiness because emptiness came free of charge while the witness ladder ran alone, and since STARTHOLD it never does.
+/// ONE term of the grade did want it: `presents == DMG_ACCEPTS`, because `FB_PRESENT_COUNT` is GLOBAL
+/// and this block may not add a per-slot arm to `sys_win_present`/`sys_win_present_rows`. Split at the verdict — exact on an empty entry, `>=` under a yield (foreign presents can only ADD, so the under-count half is untouched) — and REPORTED in the line, never silent. `08_VIDEO/engine.md` §DMGYIELD.
 ///
-/// BORN SETTLED WITHOUT `witness`: the chain that reaches this launcher is witness-gated at its
-/// root — every `u6bx_probe_once` call site is `#[cfg(feature = "witness")]` — and there are three
-/// more shapes that never arrive even with `witness` on (no online AP; `u8x_build()` -> None;
-/// `winx7_build()` -> None, whose early return skips the tail chain). So the holder's termination
-/// argument is its BOUND, never this chain's reachability — and on a build that cannot run the
-/// witness at all (`./arroyo esp-x86` default: `wc` on, `witness` off) the flag starts `true` so the
-/// desktop app pays nothing for a fixture that cannot exist.
+/// SETTLE FLAG: nothing GATES on it any more. STARTHOLD (2026-09-22, rmbp-ledger B167) deleted
+/// `desktop_app_service`'s 15 s hold — the cap was smaller than the bound of the signal it waited for, so flight 11 paid `waited=15005ms` AND still lost the witness — and `desktop_uefi.rs` now REPORTS the flag (`HOLD-NONE … dmg=<settled|unsettled>`) as the provenance of whichever row the app took.
+/// It is published on EVERY exit of `dmg_refuse_launcher` (NOT RUN paths included) AND, since DMGYIELD,
+/// on the three shapes where the chain declines to reach that launcher at all, each with a `SETTLED ON DECLINE` witness naming the shape: no online AP (`u7x_probe_once`), `u8x_build()` -> None (`u8x_launcher`, which returns before its `winx7_launcher` call), `winx7_build()` -> None (`winx7_launcher`, whose early return skips this tail chain).
+/// So a reader of `dmg=unsettled` is no longer possibly looking at a ghost: either the witness is still coming, or a line on the wire already said why it never will.
+/// BORN SETTLED WITHOUT `witness`: on a build that cannot run the fixture at all (`./arroyo esp-x86` default: `wc` on, `witness` off) the flag starts `true`, so the desktop pays nothing for a fixture that is not in the image — the `cfg!` in the initialiser below.
 pub static DMG_REFUSE_SETTLED: AtomicBool = AtomicBool::new(!cfg!(feature = "witness"));
 
 fn dmg_refuse_launcher(demo_cpu: usize) {
@@ -19070,18 +19070,18 @@ fn dmg_refuse_witness(demo_cpu: usize) {
     }
 
     let presents_before = fb_present_count();
-    let (occ_entry, _) = dmg_win_masks(usize::MAX);
-    if occ_entry != 0 {
+    let (occ_entry, _) = dmg_win_masks(usize::MAX); const DMG_ROWS_NEEDED: u32 = 4; let free_entry = WIN_MAX as u32 - occ_entry.count_ones(); // DMGYIELD: the fixture's WHOLE claim on the table, read off its own steps — 1 row the owner takes, 2 the prober takes, 1 that must stay FREE as `id_free`. An EMPTY table was never the need; it was the sufficient condition that came free of charge while nothing else had launched, and since STARTHOLD every metal boot launches the desktop app first.
+    if free_entry < DMG_ROWS_NEEDED {
         serial_println!(
-            ":: DMG-REFUSE: the window table was not empty at entry (occupied={:#04x}) — refusal witness NOT RUN ::",
-            occ_entry
+            ":: DMG-REFUSE: only {} of {} window rows are free at entry, fewer than the {} this fixture needs (occupied={:#04x}) — refusal witness NOT RUN ::",
+            free_entry, WIN_MAX, DMG_ROWS_NEEDED, occ_entry
         );
         return;
     }
 
     serial_println!(
-        ":: DMG-REFUSE: SYS_WIN_PRESENT_ROWS(33) refusal arms — two ring-3 slots, {} probes across -EBADF/-EACCES/-EINVAL and their accepting twins ::",
-        DMG_PROBES
+        ":: DMG-REFUSE: SYS_WIN_PRESENT_ROWS(33) refusal arms — two ring-3 slots, {} probes across -EBADF/-EACCES/-EINVAL and their accepting twins, yielding to occupied={:#04x} ({} of {} rows free) ::",
+        DMG_PROBES, occ_entry, free_entry, WIN_MAX
     );
 
     // 2. The OWNER half. Its core: a sibling if the pool has one, else this demo's — neither half spins
@@ -19111,9 +19111,9 @@ fn dmg_refuse_witness(demo_cpu: usize) {
     let id_a = own_a.trailing_zeros() as u64;
     // The HIGHEST free row. `sys_win_create` scans lowest-first, so this row cannot be allocated to the
     // prober's two windows while lower rows remain free — it is free at plant time and provably stays so.
-    let Some(id_free) = (0..WIN_MAX).rev().find(|&i| occ_a & (1 << i) == 0).map(|i| i as u64) else {
+    let Some(id_free) = (0..WIN_MAX).rev().find(|&i| occ_a & (1 << i) == 0).map(|i| i as u64).filter(|_| WIN_MAX as u32 - occ_a.count_ones() >= 3) else { // DMGYIELD: and the lowest-first argument needs THREE free rows here, not one — the prober's two plus this one strictly above them. Re-derived on `occ_a` rather than inherited from the entry count, because a co-tenant may have created a window while the owner was coming up.
         serial_println!(
-            ":: DMG-REFUSE: no free window row to probe -EBADF with (occupied={:#04x}) — refusal witness NOT RUN ::",
+            ":: DMG-REFUSE: fewer than 3 free window rows once the owner has its own — the prober's two plus a free row to probe -EBADF with do not fit (occupied={:#04x}) — refusal witness NOT RUN ::",
             occ_a
         );
         dmg_release_go(owner.slot);
@@ -19258,15 +19258,15 @@ fn dmg_refuse_witness(demo_cpu: usize) {
     }
 
     if first_bad == usize::MAX
-        && presents == DMG_ACCEPTS
+        && (if occ_entry == 0 { presents == DMG_ACCEPTS } else { presents >= DMG_ACCEPTS }) // DMGYIELD: `FB_PRESENT_COUNT` is GLOBAL and has no per-slot arm this block may add, so the exact equality is a claim only an EMPTY entry can make. Under a yield a co-tenant shares the counter — the desktop app presents at ~20 fps (`user-stat`, `PAINT_INTERVAL_MS`) — and foreign presents can only ADD, so the UNDER-count half of the control (an accept that silently did nothing) survives EXACTLY as `>=`, while the OVER-count half (a refusal arm that repainted anyway) is not attributable and is REPORTED, not graded. Named, not swallowed: see `yielded_to=` on both verdicts and §THE NEED in 08_VIDEO/engine.md for the one-line fix a later arc may take in `sys_win_present`/`sys_win_present_rows`.
         && owner_witness == DMG_OWNER_ALL
         && cleared
         && killed == 0
         && DMG_DONE.load(Ordering::Acquire) == 2
     {
         serial_println!(
-            ":: DMG-REFUSE: SYS_WIN_PRESENT_ROWS(33) refused every malformed band — {}/{} probes from two ring-3 slots agree: 6 legal bands returned 0, 7 bad ranges -EINVAL, 2 presents of another slot's LIVE window -EACCES, 4 free/out-of-range ids -EBADF; ownership is checked BEFORE the range (a malformed band on another slot's window is still -EACCES, on a free row still -EBADF), the height bound is the WINDOW's own (33 rows accepted on h=128, refused on h=32), the window still presented after all 13 refusals, and the present counter advanced by exactly {} — no refusal reached the compositor == expected — witness OK ::",
-            DMG_PROBES, DMG_PROBES, presents
+            ":: DMG-REFUSE: SYS_WIN_PRESENT_ROWS(33) refused every malformed band — {}/{} probes from two ring-3 slots agree: 6 legal bands returned 0, 7 bad ranges -EINVAL, 2 presents of another slot's LIVE window -EACCES, 4 free/out-of-range ids -EBADF; ownership is checked BEFORE the range (a malformed band on another slot's window is still -EACCES, on a free row still -EBADF), the height bound is the WINDOW's own (33 rows accepted on h=128, refused on h=32), the window still presented after all 13 refusals; yielded_to={:#04x} presents={} (want {}, {}) — witness OK ::",
+            DMG_PROBES, DMG_PROBES, occ_entry, presents, DMG_ACCEPTS, if occ_entry == 0 { "exactly: no refusal reached the compositor and no co-tenant shared the counter" } else { "at least: the counter is global and a co-tenant held a row, so only the under-count half is graded" }
         );
     } else {
         let (got, want) = if first_bad == usize::MAX {
@@ -19275,7 +19275,7 @@ fn dmg_refuse_witness(demo_cpu: usize) {
             (dmg_code(witness, first_bad), DMG_CODES[first_bad] as u32)
         };
         serial_println!(
-            ":: DMG-REFUSE FAIL — probes={:#018x} want={:#018x} first_bad=P{} got={} want_code={} ids=(a={} b0={} b1={} free={}) presents={} (want {}) owner_witness={:#x} (want {:#x}) done={}/2 killed={} cleared={} tables=(entry={:#04x} recheck={:#04x}) ::",
+            ":: DMG-REFUSE FAIL — probes={:#018x} want={:#018x} first_bad=P{} got={} want_code={} ids=(a={} b0={} b1={} free={}) yielded_to={:#04x} presents={} (want {}) owner_witness={:#x} (want {:#x}) done={}/2 killed={} cleared={} tables=(entry={:#04x} recheck={:#04x}) ::",
             witness,
             DMG_EXPECT,
             if first_bad == usize::MAX { 255 } else { first_bad },
@@ -19285,7 +19285,7 @@ fn dmg_refuse_witness(demo_cpu: usize) {
             rep_b0,
             rep_b1,
             id_free,
-            presents,
+            occ_entry, presents,
             DMG_ACCEPTS,
             owner_witness,
             DMG_OWNER_ALL,
@@ -21441,7 +21441,7 @@ fn u8x_launcher(demo_cpu: usize) {
     // U8x runs REGARDLESS of a block device (its fixture is an inline console-cap blob — no disk), so the
     // revocation-tree rung is visible on the no-storage / metal path. (Scoped relaxation — U5x/U7x/U8x only.)
     let Some(fix) = u8x_build() else {
-        serial_println!(":: U8x: no free address-space slot — revocation-tree demo skipped ::");
+        serial_println!(":: U8x: no free address-space slot — revocation-tree demo skipped ::"); DMG_REFUSE_SETTLED.store(true, Ordering::Release); serial_println!(":: DMG-REFUSE: SETTLED ON DECLINE shape=u8x-build-none — this return is BEFORE the `winx7_launcher` call whose tail chains `dmg_refuse_launcher`, so the refusal witness will not arm on this boot and nothing may wait on its settle ::"); // DMGYIELD
         return;
     };
     install_cap(fix.slot, U8X_SRC_IDX, KIND_CONSOLE, HANDLE_CONSOLE, CAP_WRITE | CAP_GRANT | CAP_REVOKE);
@@ -23786,7 +23786,7 @@ pub fn u7x_probe_once() {
     // WITCORE: `smp::worker_cpu` — never the render core (see `u2_probe_once`).
     let Some(cpu) = crate::arch::smp::worker_cpu(0) else {
         DONE.store(true, Ordering::Relaxed);
-        serial_println!(":: U7x: no application processor online — transfer demo skipped ::");
+        serial_println!(":: U7x: no application processor online — transfer demo skipped ::"); DMG_REFUSE_SETTLED.store(true, Ordering::Release); serial_println!(":: DMG-REFUSE: SETTLED ON DECLINE shape=no-online-ap — the `u7x-launch` task is never spawned, so the whole chain u7x_launcher -> u8x_launcher -> winx7_launcher -> dmg_refuse_launcher never runs and nothing may wait on the settle ::"); // DMGYIELD
         return;
     };
     DONE.store(true, Ordering::Relaxed); // one-shot from here regardless of outcome

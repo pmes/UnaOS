@@ -19840,3 +19840,217 @@ storage timing; the 400 ms is against `:: PSRC:`, which is the term this change 
 * Falsified if the caption is still empty 1 s after `LAUNCH`, or if the gap between `menubar
   ENABLED` and the first non-empty `[menubar] menus` line is still measured in seconds — that would
   mean a second wait exists that this seam does not own.
+
+## DMGYIELD — the refusal witness yields to the row the desktop app took (2026-09-22)
+
+STARTHOLD, one section up, deleted the desktop's 15 s ignition hold and ended with a STOP it could
+not act on from `video/`: *"the ordering is real and it lives in a fenced file."* This is that file.
+Base `ec9c371b`, branch `exec-rmbp-dmgyield`, rmbp-ledger **B172**.
+
+**The consequence STARTHOLD left behind, stated plainly: from flight 12 onward the refusal witness
+would have been NOT RUN on every metal boot.** Flight 11's own wire is the proof, and the two lines
+are five seconds apart:
+
+    [  43077ms] [wc-x] desktop-app LAUNCH name=/STAT.ELF bytes=8472 entry=0x10000000000 pid=26 slot=0 …
+    [  48074ms] :: DMG-REFUSE: the window table was not empty at entry (occupied=0x01) — \
+                    refusal witness NOT RUN ::
+
+With the hold in place that was one boot's bad luck. With the hold deleted it is the ORDER: the app
+launches off the device-service pass, the witness ladder reaches DMG twenty seconds later, and
+`occupied=0x01` is row 0 — the app's. The whole `SYS_WIN_PRESENT_ROWS(33)` refusal contract
+(`-EBADF`, `-EACCES`, `-EINVAL`, and the accepting twins that stop each one passing vacuously) would
+have gone dark on metal while continuing to read `19/19 … witness OK` in CI, where `./arroyo test`
+has no Kepler, never runs `desktop_uefi::activate`, and therefore never launches an app at all.
+
+### 1. THE NEED, read off the fixture's own steps
+
+The entry gate demanded an EMPTY table. Nothing in the fixture needs that. Walking its five steps:
+
+| step | what it actually requires of the table |
+|---|---|
+| 2 | the owner creates **exactly one** window; its row is `id_a`. Read with `dmg_win_masks(owner.slot)`, which masks **by owner** — a foreign row is not in `own_a` and never was |
+| 2b | `id_free` = the **HIGHEST** free row. `sys_win_create` allocates strictly lowest-first, so it cannot be handed to the prober while lower rows are free. That argument is about the FREE SET, not about the set starting full |
+| 3 | the prober takes **two** rows, lowest-first, and reports them back through its param block |
+| 4 | the re-read: `own_re == (1 << id_a)` (slot-scoped) and `occ_re & (1 << id_free) == 0` (**one bit**), plus `own_probe == (1 << b0) | (1 << b1)` (slot-scoped) |
+| 5 | teardown: `winx_slot_has_window` for the two fixture slots only |
+
+So the fixture needs **FOUR ROWS** and cares about the identity of exactly **TWO**. Every test in the
+grade was already slot-scoped or single-bit; **a foreign row never entered the grade at all.** It
+entered only the ENTRY CONDITION — which asked for emptiness because emptiness came free of charge
+while the witness ladder ran alone, and step 4 already re-reads the two things that actually matter.
+
+**ONE term of the grade genuinely wanted the empty table, and it is named rather than quietly
+dropped.** `presents == DMG_ACCEPTS` — the strongest control in the fixture, because
+`FB_PRESENT_COUNT` is bumped kernel-side after all four checks pass and the fixture cannot forge it.
+That counter is **GLOBAL**. It has no per-slot arm, and adding one means editing `sys_win_present`
+(`syscall.rs:3787`) and `sys_win_present_rows` (`:4710`), which this arc's brief fences off. The
+co-tenant is not hypothetical: `/STAT.ELF` presents every 50 ms (`crates/user-stat/src/main.rs:471`,
+`PAINT_INTERVAL_MS`), so on metal the delta across DMG's run is hundreds, not six.
+
+**The split, and why it loses nothing that can be recovered any other way.** Foreign presents can
+only **ADD**. So:
+
+* **UNDER-count — an accept that returned 0 without reaching the compositor — is caught EXACTLY in
+  both cases**, because `presents >= DMG_ACCEPTS` cannot be forged downward by traffic that only
+  goes up.
+* **OVER-count — a refusal arm that returned the right errno and repainted anyway — is caught
+  exactly on an empty entry** (`yielded_to=0x00`, which is every `./arroyo test` boot, i.e. CI keeps
+  the full control forever) **and is not attributable under a yield**, where it is REPORTED in the
+  verdict instead of silently folded into a pass.
+
+The verdict says which of the two it took, in the line, so no reader has to infer it:
+
+    … yielded_to=0x00 presents=6 (want 6, exactly: no refusal reached the compositor and no
+        co-tenant shared the counter) — witness OK ::
+    … yielded_to=0x01 presents=6 (want 6, at least: the counter is global and a co-tenant held a
+        row, so only the under-count half is graded) — witness OK ::
+
+**OWED, and it is one line in each of two syscall bodies:** a per-slot present counter beside
+`FB_PRESENT_COUNT.fetch_add` at `syscall.rs:3787` and `:4710` would restore the exact equality under
+a yield. It is out of this arc's fence, it is in `rmbp-queue.md`, and until it lands the sentence
+above is the honest statement of what a yielded run proves.
+
+### 2. THE YIELD
+
+`dmg_refuse_witness` now takes its rows from the FREE SET at entry:
+
+    let (occ_entry, _) = dmg_win_masks(usize::MAX); const DMG_ROWS_NEEDED: u32 = 4;
+    let free_entry = WIN_MAX as u32 - occ_entry.count_ones();
+    if free_entry < DMG_ROWS_NEEDED { … "only {} of {} window rows are free at entry, fewer than
+        the {} this fixture needs (occupied={:#04x}) — refusal witness NOT RUN" … }
+
+and the `id_free` pick carries the second half of the lowest-first argument explicitly, re-derived on
+`occ_a` rather than inherited from the entry count — **because a co-tenant may create a window while
+the owner is coming up**, and the argument needs THREE free rows at that moment (the prober's two,
+plus one strictly above them), not one:
+
+    .filter(|_| WIN_MAX as u32 - occ_a.count_ones() >= 3)
+
+`occ_entry` is reported as `yielded_to=` on BOTH verdicts, OK and FAIL, so a graded run always says
+which rows it worked around. **A table with fewer than four free rows is the ONE remaining NOT RUN**,
+and it names the count and the mask — a reader can tell an honest shortage from a regression, which
+the retired line could not do.
+
+### 3. THE SETTLE ON DECLINE
+
+`DMG_REFUSE_SETTLED` had exactly one publisher: `dmg_refuse_launcher`, which stores `true` after the
+body returns. Three shapes never reach that launcher even with `witness` on, and on each of them the
+flag stayed `false` for the life of the boot:
+
+| shape | where it returns | what it skips |
+|---|---|---|
+| no online AP | `u7x_probe_once` (`syscall.rs:23787`) | the `u7x-launch` task is never spawned, so the whole chain `u7x_launcher` -> `u8x_launcher` -> `winx7_launcher` -> `dmg_refuse_launcher` never runs |
+| `u8x_build() -> None` | `u8x_launcher` (`:21443`) | the return is BEFORE that function's `winx7_launcher(demo_cpu)` call |
+| `winx7_build() -> None` | `winx7_launcher` (`:18385`) | the early return skips the tail chain that calls `dmg_refuse_launcher` |
+
+Each now publishes the flag and prints a one-line witness naming the shape:
+
+    :: DMG-REFUSE: SETTLED ON DECLINE shape=no-online-ap — the `u7x-launch` task is never spawned, …
+    :: DMG-REFUSE: SETTLED ON DECLINE shape=u8x-build-none — this return is BEFORE the `winx7_launcher` call …
+    :: DMG-REFUSE: SETTLED ON DECLINE shape=winx7-build-none — this early return skips the tail chain …
+
+**Nothing waits on the flag today** — STARTHOLD deleted the only consumer, and `desktop_uefi.rs:786`
+now merely REPORTS it (`HOLD-NONE … dmg=<settled|unsettled>`) as the provenance of whichever row the
+app took. That is exactly why this is worth doing now rather than when a consumer appears: a reader
+of `dmg=unsettled` can no longer be looking at a ghost. Either the witness is still coming, or a line
+on the same wire already said why it never will.
+
+### 4. Gates
+
+**`cd unaos && ./arroyo check` — rc 0.** `x86_64 OK`, `aarch64 OK`, `bootloader OK`, `knob→leg
+coverage OK`, `kernel cfg coverage OK (81 legs)` with every leg `rc=0`, userspace x86_64 OK (4
+crates) and aarch64 OK (5 crates), `GATE-SPECROOTS: OK — 19 replay specs`, `GATE-LEDGER: OK — 454
+rows`, `GATE-BRANCH: OK`. `bash unaos/scripts/ledger-check.sh` rc 0 before and after.
+
+**LINE-NEUTRAL (B94).** `arch/x86_64/syscall.rs` is **25246 lines before and after**, 30 insertions
+and 30 deletions — every addition is a same-line fold, so no `panic::Location` moves and no
+positional citation into this file shifts.
+
+**The wc lane, `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_QEMU_FULL=1 ./arroyo test
+240`, three runs.**
+
+*Before* (this line is on every wc-lane and plain-`test` capture in
+`~/unaos-bench/scratch/rmbp-0915/*-logs/` at base):
+
+    :: DMG-REFUSE: SYS_WIN_PRESENT_ROWS(33) refusal arms — two ring-3 slots, 19 probes across
+        -EBADF/-EACCES/-EINVAL and their accepting twins ::
+    :: DMG-REFUSE: … the window still presented after all 13 refusals, and the present counter
+        advanced by exactly 6 — no refusal reached the compositor == expected — witness OK ::
+
+*After, unperturbed* — the empty-entry arm, and the control is still the exact one:
+
+    :: DMG-REFUSE: SYS_WIN_PRESENT_ROWS(33) refusal arms — two ring-3 slots, 19 probes across
+        -EBADF/-EACCES/-EINVAL and their accepting twins, yielding to occupied=0x00 (12 of 12 rows free) ::
+    :: DMG-REFUSE: … the window still presented after all 13 refusals; yielded_to=0x00 presents=6
+        (want 6, exactly: no refusal reached the compositor and no co-tenant shared the counter)
+        — witness OK ::
+
+*After, with a row deliberately occupied before the witness enters.* The scratch probe stands a THIRD
+`dmg-owner` fixture up (`dmg-squat`) and waits for its window to be in the table before the entry
+read, so this lane — which has no Kepler and therefore never has a real co-tenant — produces the
+metal shape. **REVERTED**; the arc diff is byte-identical before and after the probe:
+
+    :: PROBE: squatter window in table = true ::
+    :: DMG-REFUSE: … and their accepting twins, yielding to occupied=0x01 (11 of 12 rows free) ::
+    :: DMG-REFUSE: … the window still presented after all 13 refusals; yielded_to=0x01 presents=6
+        (want 6, at least: the counter is global and a co-tenant held a row, so only the
+        under-count half is graded) — witness OK ::
+
+*GO-RED, on the same probe with the yield removed* — the pre-DMGYIELD entry gate restored and nothing
+else changed. This is the run that proves the coverage is real rather than assumed:
+
+    :: PROBE: squatter window in table = true ::
+    :: DMG-REFUSE: the window table was not empty at entry (occupied=0x01) — refusal witness NOT RUN ::
+
+### 5. The spec pins, and the red taken on a capture
+
+`scripts/specs/x86-wc.spec`, tail-appended before the CONTRACT block (no existing rule moves):
+
+    REQUIRE :: DMG-REFUSE: .*19/19 probes from two ring-3 slots agree.*yielded_to=0x[0-9a-f]+ presents=\d+ .*witness OK ::
+    FORBID :: DMG-REFUSE: the window table was not empty at entry
+    FORBID :: DMG-REFUSE FAIL
+
+`yielded_to=` is `0x[0-9a-f]+` and not a literal: this lane reads `0x00` and metal reads the app's
+mask, and pinning either would red the other. What the REQUIRE gates is that the FIELD EXISTS beside
+an OK verdict — a build that quietly dropped the yield would still print `19/19 … witness OK` here
+and nothing else in the file would see the missing term. `FORBID DMG-REFUSE FAIL` closes the hole
+`x86-fat.spec:91` already records: `:: DMG-REFUSE FAIL — probes=… ::` contains neither `-> FAIL` nor
+`FAIL ::`, so the three default FORBIDs score zero on it.
+
+**B160's rule — a FORBID is worthless unless it is known to be able to match — discharged in both
+directions on real wire.** `./arroyo mbench --replay <log> --spec scripts/specs/x86-wc.spec
+--platform x86`:
+
+| capture | `FORBID … not empty at entry` | `REQUIRE … yielded_to=` |
+|---|---|---|
+| flight 11 metal (`~/unaos-bench/scratch/rmbp-0915/bootwaits-logs/f11.log`, read-only) | **1 hit @ line 4042** — `[ 48074ms] :: DMG-REFUSE: the window table was not empty at entry (occupied=0x01) — refusal witness NOT RUN ::` | 0 hits (pre-change capture: the field did not exist) |
+| after, unperturbed | 0 hits | **1 hit** — whole spec rc 0 |
+| after, occupancy probe | 0 hits | **1 hit** — whole spec rc 0 |
+| go-red (yield removed) | **1 hit** | 0 hits — `FIRST-SHORTFALL x86-wc.spec:408`, spec rc 1 |
+
+The ONE shape deliberately NOT forbidden is the remaining honest decline — `only N of 12 window rows
+are free at entry, fewer than the 4 this fixture needs (occupied=0x…) — refusal witness NOT RUN`.
+`x86-fat.spec:92`'s `FORBID DMG-REFUSE:.*NOT RUN` already reds on it where the table is provably
+empty; forbidding it on this lane too would red a boot that behaved exactly as designed the day a
+co-tenant fixture lands ahead of DMG in the ladder.
+
+Neither `x86-fat.spec:90` (`REQUIRE DMG-REFUSE:.*19/19 probes.*witness OK`) nor `:92`
+(`FORBID DMG-REFUSE:.*NOT RUN`) needed re-pinning: both substrings survive this change verbatim, so
+the SPECRUN contract is met without editing a file outside this arc's fence.
+
+### 6. The prediction for flight 12, stated so it can be falsified
+
+STARTHOLD's own prediction for DMG-REFUSE was *"expected to read **NOT RUN** with `occupied=` naming
+the app's row."* **This arc replaces that prediction.** On flight 12:
+
+* `:: DMG-REFUSE: … yielding to occupied=0x01 (11 of 12 rows free) ::` arms AFTER
+  `[wc-x] desktop-app LAUNCH … slot=0`, and the verdict reads
+  `yielded_to=0x01 presents=<large> (want 6, at least: …) — witness OK ::`.
+* `NOT RUN` appears **nowhere** in any `DMG-REFUSE` line.
+* `presents` will be in the hundreds, not 6 — `/STAT.ELF` paints every 50 ms and shares the global
+  counter. That is the reported-not-graded term; a `presents` of exactly 6 on a boot with a live app
+  would mean the app stopped painting, which is a different finding.
+* Falsified if the verdict reads `yielded_to=0x00` (the app did not take a row, so STARTHOLD's
+  mechanism is wrong), or if it reads `19/19 … FAIL` with `first_bad=P<n>` (the yield handed the
+  prober a row it could not have — the lowest-first argument would then be the thing to re-derive,
+  not the entry gate).

@@ -419,6 +419,50 @@ FORBID :: PRTSCR-DIR-FIX: .* -> FAIL ::
 # --- LOGINFLOW holds a session open, and metal flight 12 under R59's read-write boot volume, where
 # --- flight 11 could only print `:: PRTSCR-VOL: rung=none rung1=read-only rung2=absent -> NO TARGET
 # --- ::` against a real ⌘⇧3 press at 798 s.
+# --- DMGYIELD (2026-09-22; rmbp-ledger B172) — THE REFUSAL WITNESS YIELDS TO AN OCCUPIED TABLE ---
+# --- THE HOLE THIS CLOSES IS THE ONE STARTHOLD OPENED, thirty lines up. `dmg_refuse_witness`
+# --- demanded an EMPTY window table at entry (`syscall.rs:19073` at base ec9c371b) and printed
+# --- `NOT RUN` otherwise. Its real need is FOUR FREE ROWS — one the owner takes, two the prober
+# --- takes, one that must stay free as `id_free` — and every term of the grade was ALREADY
+# --- slot-scoped or single-bit. With the 15 s ignition hold deleted, every metal boot launches
+# --- `/STAT.ELF` into row 0 BEFORE the ladder reaches DMG, so without the yield the refusal arms
+# --- are NOT RUN on every flight from 12 onward. The whole `SYS_WIN_PRESENT_ROWS(33)` refusal
+# --- contract would have gone dark on metal while reading green in CI — silently, which is the
+# --- failure mode this file's PTRDEAD note already names.
+# ---
+# --- ARM A — THE VERDICT, and `yielded_to=` is the field this arc adds. NOT pinned to a literal:
+# --- on THIS lane it reads `0x00` (QEMU has no Kepler, `desktop_uefi::activate` never runs, so no
+# --- app holds a row — the same absence the STARTHOLD FORBID is written around) and on metal it
+# --- reads the app's mask; pinning either would red the other. What the arm gates is that the
+# --- field EXISTS beside an OK verdict: a build that quietly dropped the yield would still print
+# --- `19/19 … witness OK` on this lane and NOTHING else here would see the missing term.
+# --- `presents=\d+` for the standing no-numerics reason. MEASURED on this seat's wc-lane capture,
+# --- `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_QEMU_FULL=1 ./arroyo test 240`:
+# ---   :: DMG-REFUSE: … the window still presented after all 13 refusals; yielded_to=0x00
+# ---       presents=6 (want 6, exactly: no refusal reached the compositor and no co-tenant shared
+# ---       the counter) — witness OK ::
+# --- and with a scratch third fixture standing in row 0 before the witness enters (REVERTED), the
+# --- same gate reads `yielded_to=0x01 presents=6 (want 6, at least: …) — witness OK ::`.
+REQUIRE :: DMG-REFUSE: .*19/19 probes from two ring-3 slots agree.*yielded_to=0x[0-9a-f]+ presents=\d+ .*witness OK ::
+# --- ARM B — THE RETIRED DEMAND, AND THE RED WAS TAKEN ON A CAPTURE (B160: a FORBID that cannot
+# --- match reads identical to one that passed). Replaying THIS FILE against the flight-11 metal log
+# --- (read-only evidence, `~/unaos-bench/scratch/rmbp-0915/bootwaits-logs/f11.log`) scores this rule
+# --- 1 hit:
+# ---   [  48074ms] :: DMG-REFUSE: the window table was not empty at entry (occupied=0x01) — \
+# ---       refusal witness NOT RUN ::
+# --- and 0 hits on this arc's own after-captures. Both directions, on real wire. It reds the day the
+# --- empty-table entry gate comes back, by its exact retired wording.
+FORBID :: DMG-REFUSE: the window table was not empty at entry
+# --- ARM C — the DMG FAIL line, which the harness default FORBIDs cannot see. `:: DMG-REFUSE FAIL —
+# --- probes=… ::` contains neither `-> FAIL` nor `FAIL ::`, the same hole `x86-fat.spec` records
+# --- for its S-witnesses and closes with the twin of this line (`x86-fat.spec:91`).
+FORBID :: DMG-REFUSE FAIL
+# --- AND THE ONE SHAPE DELIBERATELY NOT FORBIDDEN: `only N of 12 window rows are free at entry,
+# --- fewer than the 4 this fixture needs (occupied=0x…) — refusal witness NOT RUN`. That is the ONE
+# --- remaining honest decline, it names its count and its mask, and `x86-fat.spec:92`'s
+# --- `FORBID DMG-REFUSE:.*NOT RUN` already reds on it where the table is provably empty. Forbidding
+# --- it HERE would red a boot that behaved exactly as designed the day a co-tenant fixture lands
+# --- ahead of DMG in this ladder — wrong-strict, the rule the next seat deletes.
 
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
 # A PINNED LINE IN THIS FILE IS CHANGED TOGETHER WITH THE KERNEL LINE IT PINS, IN THE SAME COMMIT —
