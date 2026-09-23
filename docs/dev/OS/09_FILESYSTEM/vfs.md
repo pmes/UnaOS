@@ -676,7 +676,7 @@ gave for the native/FAT pair, now true for every pair of volumes the machine wil
 #### 13.2.1 What "the same volume" means (VOLID, orin 18 — rmbp 15 condition C1)
 > **SUPERSEDED (BOOTROOT, orin 22, branch `exec-orin22-bootroot`).** The per-board root knob this
 > section describes — `UNAOS_SDMMCROOT=1` / cargo `sdmmcroot`, its file-tail section in
-> `arch/aarch64/sdmmc_tegra.rs`, its hard-coded `BlockSource::TegraSd` constructor in `fs/vfs.rs`
+> `arch/aarch64/sdmmc_tegra.rs`, its hard-coded `BlockSource::SdMmc` constructor in `fs/vfs.rs`
 > and its statement in `shell::vfs_mount_table` — is DELETED. Nothing below is edited away: the rows
 > record what was true and why, and remain the history of how the fault was found. What replaces it
 > is `fs/bootdisk.rs`: the kernel is told nothing about where it came from, brings up every disk
@@ -1335,7 +1335,7 @@ The posture is **the source's own**, sampled from the very `FatBackend` that get
 
 * `Usb` is **writable** (the Pi's verified BOT WRITE(10) path). Forcing a read-only mount here would
   be a behaviour change on the Pi, so it is not done.
-* `TegraSd` is vetoed in every cfg, so the Orin's slot card is read-only **by the veto**, not by
+* `SdMmc` is vetoed in every cfg, so the Orin's slot card is read-only **by the veto**, not by
   this mount.
 * `Default` is **conditional** on FRGUARD's `default_writable()` — a RUNTIME state, not a property
   of the volume. So there is no fixed `rw=` expectation for a `Default`-sourced mount anywhere, in

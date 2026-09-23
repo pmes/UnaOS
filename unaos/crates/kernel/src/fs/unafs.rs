@@ -62,7 +62,7 @@
 //! **UNAFSBIND — the mount cache names its disk too.** SDSEAM made a *device*
 //! carry its handle; the process-wide [`MOUNT`] cache still assumed one: its
 //! lazy bind called [`mount`] — a `BlockHandle::Global` wrapper — so a machine
-//! whose unafs volume arrives on any OTHER handle (the orin's TegraSd card,
+//! whose unafs volume arrives on any OTHER handle (the orin's SdMmc card,
 //! bound via SDSEAM's handle routing, is the motivating case) had a shell whose
 //! [`with_unafs`] could never see its own volume. The cache entry is now a
 //! [`BoundMount`] that STORES the [`block::BlockHandle`] its volume was mounted
@@ -118,7 +118,7 @@ use ::unafs::UnaFS;
 /// during TEGRASD is that on a tegra build the ambient `read_block` reaches the USB stick, so sizing
 /// from `tegra_sd_info()` would have guarded STICK reads with the CARD's capacity — the inverse of
 /// PI-FS-2. With the handle carried, that premise is gone: a device opened on
-/// `BlockHandle::TegraSd` reads the card AND is sized from the card; one opened on
+/// `BlockHandle::SdMmc` reads the card AND is sized from the card; one opened on
 /// `BlockHandle::Global` reads the stick AND is sized from the stick. Neither can be built wrong.
 /// See [`handle_info`] / [`handle_read`] / [`handle_write`] for the arm each handle contributes.
 pub struct SdSectorDevice {
@@ -132,8 +132,8 @@ pub struct SdSectorDevice {
 /// Exhaustive on purpose (see [`SdSectorDevice`]): every handle the block layer defines contributes
 /// exactly one arm, and the arm names the same registry slot its read/write arms below route to.
 ///
-/// ### MERGE NOTE — the `TegraSd` arms, WRITTEN AT THE TRUNK LANDING
-/// `BlockHandle::TegraSd` and its entry points (`tegra_sd_info`, `read_block_tegra_sd`,
+/// ### MERGE NOTE — the `SdMmc` arms, WRITTEN AT THE TRUNK LANDING
+/// `BlockHandle::SdMmc` and its entry points (`tegra_sd_info`, `read_block_tegra_sd`,
 /// `write_block_tegra_sd`) live in `drivers/block.rs` and arrived with the orin track's TEGRASD
 /// commit; they did not exist on the pi branch, and `drivers/block.rs` was not that arc's lane, so
 /// the arms could not be written there. They were not guesswork either — the totality of these
@@ -142,12 +142,12 @@ pub struct SdSectorDevice {
 /// `#[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]`. All four are now
 /// applied verbatim, exactly as written here:
 ///
-/// * [`handle_info`] — `BlockHandle::TegraSd => block::tegra_sd_info(),`
-/// * [`handle_read`] — `BlockHandle::TegraSd => block::read_block_tegra_sd(lba, buf),`
-/// * [`handle_write`] — `BlockHandle::TegraSd => block::write_block_tegra_sd(lba, buf),`
+/// * [`handle_info`] — `BlockHandle::SdMmc => block::tegra_sd_info(),`
+/// * [`handle_read`] — `BlockHandle::SdMmc => block::read_block_tegra_sd(lba, buf),`
+/// * [`handle_write`] — `BlockHandle::SdMmc => block::write_block_tegra_sd(lba, buf),`
 ///   (which refuses in every cfg — the card is read-only outside `sdmmc_arm`, so a unafs write
 ///   attempt on it fails closed rather than reaching the medium)
-/// * [`SdSectorDevice::open_on`] — `BlockHandle::TegraSd => dev.num_blocks,` (a dedicated slot;
+/// * [`SdSectorDevice::open_on`] — `BlockHandle::SdMmc => dev.num_blocks,` (a dedicated slot;
 ///   no PI-FS-2 override, for the reason given there)
 ///
 /// With those four lines the tegra sizing arm skipped during TEGRASD is correct BY CONSTRUCTION:
@@ -161,7 +161,7 @@ fn handle_info(handle: block::BlockHandle) -> Option<block::BlockDeviceInfo> {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::TegraSd => block::tegra_sd_info(),
+        block::BlockHandle::SdMmc => block::tegra_sd_info(),
     }
 }
 
@@ -182,7 +182,7 @@ fn handle_read(
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::read_block_sdhc(lba, buf),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::TegraSd => block::read_block_tegra_sd(lba, buf),
+        block::BlockHandle::SdMmc => block::read_block_tegra_sd(lba, buf),
     }
 }
 
@@ -196,7 +196,7 @@ fn handle_write(handle: block::BlockHandle, lba: u64, buf: &[u8]) -> Result<(), 
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::write_block_sdhc(lba, buf),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::TegraSd => block::write_block_tegra_sd(lba, buf),
+        block::BlockHandle::SdMmc => block::write_block_tegra_sd(lba, buf),
     }
 }
 
@@ -253,7 +253,7 @@ impl SdSectorDevice {
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             block::BlockHandle::Sdhc => dev.num_blocks,
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            block::BlockHandle::TegraSd => dev.num_blocks,
+            block::BlockHandle::SdMmc => dev.num_blocks,
         };
         Ok(Self { handle, sectors })
     }
@@ -531,17 +531,17 @@ static MOUNT: Mutex<Option<BoundMount>> = Mutex::new(None);
 /// that adds the handle, instead of the handle silently staying invisible to [`with_unafs`] —
 /// which is exactly the defect this arc removes.
 ///
-/// ### MERGE NOTE — the TegraSd arm this seam is waiting for
-/// When `BlockHandle::TegraSd` lands (orin's TEGRASD, `drivers/block.rs`), the totality of this
+/// ### MERGE NOTE — the SdMmc arm this seam is waiting for
+/// When `BlockHandle::SdMmc` lands (orin's TEGRASD, `drivers/block.rs`), the totality of this
 /// match reports it as an E0004 alongside [`handle_info`]'s trio. Its arm here is one line under the
 /// TEGRASD cfg triple, and it is the whole point of this arc:
 ///
-/// * [`bind_probe_admitted`] — `BlockHandle::TegraSd => true,` (the orin's unafs volume rides the
+/// * [`bind_probe_admitted`] — `BlockHandle::SdMmc => true,` (the orin's unafs volume rides the
 ///   card's dedicated handle while `Global` is the USB stick; admitting the probe is what lets the
 ///   shell's `with_unafs` find the card's volume with no tegra-side shell wiring at all)
-/// * [`bind_probe_candidates`] — add `block::BlockHandle::TegraSd` to the array (and grow its
+/// * [`bind_probe_candidates`] — add `block::BlockHandle::SdMmc` to the array (and grow its
 ///   length), in enum order; the array mirrors the enum and [`handle_kind_name`] gains
-///   `BlockHandle::TegraSd => "tegra-sd",`.
+///   `BlockHandle::SdMmc => "tegra-sd",`.
 fn bind_probe_admitted(handle: block::BlockHandle) -> bool {
     match handle {
         // Not a probe: the default first attempt of every bind (see above).
@@ -554,7 +554,7 @@ fn bind_probe_admitted(handle: block::BlockHandle) -> bool {
         // TEGRASD merge arm — prescribed by the MERGE NOTE above: the orin's unafs volume rides
         // the card's dedicated handle while `Global` is the USB stick; admit the probe.
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::TegraSd => true,
+        block::BlockHandle::SdMmc => true,
     }
 }
 
@@ -569,7 +569,7 @@ fn bind_probe_candidates() -> impl Iterator<Item = block::BlockHandle> {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc,
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::TegraSd,
+        block::BlockHandle::SdMmc,
     ]
     .into_iter()
 }
@@ -584,7 +584,7 @@ fn handle_kind_name(handle: block::BlockHandle) -> &'static str {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => "sdhc",
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::TegraSd => "tegra-sd",
+        block::BlockHandle::SdMmc => "tegra-sd",
     }
 }
 

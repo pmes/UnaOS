@@ -770,6 +770,6 @@ fn source_of_handle(handle: crate::drivers::block::BlockHandle) -> fat::BlockSou
         // `program_source` nor `alternate_program_source` returns it, so no firmware search ever
         // reaches this arm; nothing else in this file changes.
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        crate::drivers::block::BlockHandle::TegraSd => fat::BlockSource::TegraSd, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] crate::drivers::block::BlockHandle::Ahci { port } => fat::BlockSource::Ahci(port), // AHCIBOOT: mapped only — neither `program_source` nor `alternate_program_source` returns a SATA handle, so no firmware search reaches this arm; nothing else in this file changes.
+        crate::drivers::block::BlockHandle::SdMmc => fat::BlockSource::SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] crate::drivers::block::BlockHandle::Ahci { port } => fat::BlockSource::Ahci(port), // AHCIBOOT: mapped only — neither `program_source` nor `alternate_program_source` returns a SATA handle, so no firmware search reaches this arm; nothing else in this file changes.
     }
 }

@@ -590,7 +590,7 @@ PENDING part=\[262144\.\.1310720\) span_base=262144 span_blocks=131072 fits=yes 
 # DROPS it, leaving the shared `fs::unafs::MOUNT` on `BlockHandle::Global`. This row exists so
 # that if that posture ever changes it changes DELIBERATELY, with this line edited in the same
 # commit, instead of a boot quietly starting to say something else.
-PENDING UNAFS: native unafs volume MOUNTED read-only on TegraSd
+PENDING UNAFS: native unafs volume MOUNTED read-only on SdMmc
 # THE REGRESSION HALF. Each of these is a POSITIVE claim about the medium, and each fires only
 # when the witness line is present at all — so none of them can red an unarmed boot, exactly as
 # the two `recon`/`REFUSED to publish` rows above cannot.
@@ -610,13 +610,13 @@ PENDING UNAFS: native unafs volume MOUNTED read-only on TegraSd
 #     this partition's extent, which is the overlapping-extent hazard `partition_witness` was
 #     written to catch. `magic=MISSING` means the bounded, partition-relative path does not reach
 #     the superblock the crate's own arithmetic just read. Neither is ever noise.
-#   * `mount on TegraSd FAILED` is main.rs's own catch-all arm, whose comment already calls it
+#   * `mount on SdMmc FAILED` is main.rs's own catch-all arm, whose comment already calls it
 #     "a real defect worth a capture". `NoVolume` is deliberately NOT forbidden beside it: that
 #     one is the honest pre-install answer and a seat may legitimately boot such a card.
 FORBID span_blocks=2048 fits=
 FORBID unafs span check .*fits=NO
 FORBID unafs span check .*magic=MISSING
-FORBID UNAFS: mount on TegraSd FAILED
+FORBID UNAFS: mount on SdMmc FAILED
 
 # --- EL0-EL1CORE: where an EL0 task was placed, and what happens when it cannot be -----
 # The arc that motivated this block (sched.rs `EL0-EL1CORE`) established that on the

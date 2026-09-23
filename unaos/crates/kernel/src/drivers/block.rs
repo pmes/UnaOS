@@ -516,12 +516,12 @@ pub fn alternate_program_source() -> Option<(BlockDeviceInfo, BlockHandle)> {
         BlockHandle::Usb => None,
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockHandle::Sdhc => info().map(|d| (d, BlockHandle::Global)),
-        // TEGRA-SDBLK: `program_source` never returns `TegraSd` either — the Orin's program volume is
+        // TEGRA-SDBLK: `program_source` never returns `SdMmc` either — the Orin's program volume is
         // the boot medium in the global slot, and the microSD is a SEPARATE disk that this arc gives a
         // read path, not a program-loading precedence (see the census note on `source_census`). Mapped
         // for totality, exactly as `Usb` is, and it means the same thing: this arm cannot be reached.
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::TegraSd => None, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => None, // AHCIBOOT: `program_source` never returns a SATA handle (this arc publishes no program-source rung for it), so this arm is mapped for totality and cannot be reached.
+        BlockHandle::SdMmc => None, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => None, // AHCIBOOT: `program_source` never returns a SATA handle (this arc publishes no program-source rung for it), so this arm is mapped for totality and cannot be reached.
     }
 }
 
@@ -624,7 +624,7 @@ pub enum BlockHandle {
     /// `sdmmc_arm` ladder in `sdmmc_tegra.rs`; [`write_block_tegra_sd`] exists so the dispatch below
     /// is total and fails CLOSED, not so that anything writes.
     #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-    TegraSd, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] /** AHCIBOOT: one published SATA disk, keyed on the HBA PORT — the enumerator's key (`drivers::ahci`'s `PI` mask), never anything read off the medium. Reads go through [`read_block_ahci_port`]; every write through it is REFUSED, because `drivers/ahci.rs` compiles no ATA write opcode at all. The installer refuses it by construction (`install/mod.rs`, rmbp-ledger B91). */ Ahci { port: u8 },
+    SdMmc, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] /** AHCIBOOT: one published SATA disk, keyed on the HBA PORT — the enumerator's key (`drivers::ahci`'s `PI` mask), never anything read off the medium. Reads go through [`read_block_ahci_port`]; every write through it is REFUSED, because `drivers/ahci.rs` compiles no ATA write opcode at all. The installer refuses it by construction (`install/mod.rs`, rmbp-ledger B91). */ Ahci { port: u8 },
 }
 
 /// INSTALL-SEL: a durable name for ONE block device, good across frames and across a registry change.
@@ -684,7 +684,7 @@ pub fn lookup(id: BlockDeviceId) -> Option<BlockDeviceInfo> {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockHandle::Sdhc => sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::TegraSd => tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => ahci_info_port(port), // AHCIBOOT: the registry row for that port, so an identity captured on a SATA disk re-resolves to the same disk.
+        BlockHandle::SdMmc => tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => ahci_info_port(port), // AHCIBOOT: the registry row for that port, so an identity captured on a SATA disk re-resolves to the same disk.
     };
     match cur {
         Some(d) if d.slot_id == id.slot_id && d.num_blocks == id.num_blocks => Some(d),
@@ -1876,7 +1876,7 @@ pub fn write_blocks_sdhc(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
 // by naming it, precisely as `Usb` (PIUSB-27) and `Sdhc` (SDHC-4b) are — and `read_block`,
 // `write_block`, `read_blocks`, `write_blocks` and `publish_usb_geometry` gain not one statement.
 //
-// ### The follow-up step: `BlockHandle::TegraSd` (LANDED — see the variant above)
+// ### The follow-up step: `BlockHandle::SdMmc` (LANDED — see the variant above)
 // SDHC-4b's precedent is a new HANDLE variant, and it is now here. It was held back one commit
 // because `BlockHandle` is total-by-construction, and MEASURED (variant added,
 // `UNAOS_TEGRA=1 ./arroyo check`, variant removed again) the arm-tegra leg reports E0004 at twelve
@@ -1895,7 +1895,7 @@ pub fn write_blocks_sdhc(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
 //
 // ### What the variant deliberately does NOT do: it is not a program-source rung
 // `program_source` still returns the global slot and nothing else on this board, and
-// `alternate_program_source` maps `TegraSd` to `None`. The Orin boots from a USB stick; making the
+// `alternate_program_source` maps `SdMmc` to `None`. The Orin boots from a USB stick; making the
 // card a program source would re-point `mount_program_source`, the shell's file verbs and the exec
 // path at a different disk — the PI-FS-2 hazard this whole section is written to avoid. The card is
 // censused (`SourceCensus::tegra_sd`) and readable by NAME; binding a filesystem to it is
@@ -2024,7 +2024,7 @@ pub fn write_block_tegra_sd(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> { 
 } }
 
 /// TEGRA-SDBLK: the counted twin of [`write_block_tegra_sd`], refusing for the same reason. Present so
-/// that a future `BlockHandle::TegraSd` dispatch has a total set of four entry points to name.
+/// that a future `BlockHandle::SdMmc` dispatch has a total set of four entry points to name.
 #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
 pub fn write_blocks_tegra_sd(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     #[cfg(feature = "sdwrite")] { return tegra_sd_write_blocks_through(lba, buf); } #[cfg(not(feature = "sdwrite"))] { write_block_tegra_sd(lba, buf) }
@@ -2312,7 +2312,7 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
         // is censused once on its own terms and can neither suppress nor be suppressed by the boot
         // stick's census. Disjoint from bit 4 by construction: no build carries both handles.
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::TegraSd => 8, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => 16, // AHCIBOOT: one latch bit for the whole SATA handle, so a two-disk rMBP censuses once rather than per port.
+        BlockHandle::SdMmc => 8, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => 16, // AHCIBOOT: one latch bit for the whole SATA handle, so a two-disk rMBP censuses once rather than per port.
     };
     let prev = MBR_CENSUS_LATCH.fetch_or(bit, core::sync::atomic::Ordering::Relaxed);
     if prev & bit != 0 || sec.len() < SECTOR_BYTES {
@@ -2324,7 +2324,7 @@ pub fn mbr_census(handle: BlockHandle, sec: &[u8], dev_blocks: u64) -> Option<Mb
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         BlockHandle::Sdhc => "sdhc",
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::TegraSd => "tegra-sd", #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => "ahci",
+        BlockHandle::SdMmc => "tegra-sd", #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { .. } => "ahci",
     };
 
     // --- RAW, before decoding anything: the signature word and the four 16-byte entries verbatim.
@@ -2445,7 +2445,7 @@ impl PartitionRange {
             // gate every other handle goes through — no second addressing path, no absolute LBA
             // computed by a caller.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::TegraSd => read_block_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => read_block_ahci_port(port, abs, buf),
+            BlockHandle::SdMmc => read_block_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => read_block_ahci_port(port, abs, buf),
         }
     }
 
@@ -2464,7 +2464,7 @@ impl PartitionRange {
             // one-shot witness + `NotReady`), so the variant cannot become a fourth door past the
             // armed `sdmmc_arm` ladder — a range that carries the card is readable and nothing more.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::TegraSd => write_block_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => write_block_ahci_port(port, abs, buf), // AHCIBOOT: REFUSES, in every cfg — `write_block_ahci` is the refusal and the image carries no ATA write opcode.
+            BlockHandle::SdMmc => write_block_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => write_block_ahci_port(port, abs, buf), // AHCIBOOT: REFUSES, in every cfg — `write_block_ahci` is the refusal and the image carries no ATA write opcode.
         }
     }
 
@@ -2478,7 +2478,7 @@ impl PartitionRange {
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockHandle::Sdhc => read_blocks_sdhc(abs, buf),
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::TegraSd => read_blocks_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => read_blocks_ahci_port(port, abs, buf),
+            BlockHandle::SdMmc => read_blocks_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => read_blocks_ahci_port(port, abs, buf),
         }
     }
 
@@ -2492,7 +2492,7 @@ impl PartitionRange {
             BlockHandle::Sdhc => write_blocks_sdhc(abs, buf),
             // TEGRA-SDBLK: refuses, as the single-sector twin above does and for the same reason.
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::TegraSd => write_blocks_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => write_blocks_ahci_port(port, abs, buf), // AHCIBOOT: refuses, as the single-sector twin does.
+            BlockHandle::SdMmc => write_blocks_tegra_sd(abs, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => write_blocks_ahci_port(port, abs, buf), // AHCIBOOT: refuses, as the single-sector twin does.
         }
     }
 
@@ -2507,7 +2507,7 @@ impl PartitionRange {
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             BlockHandle::Sdhc => sdhc_info(),
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            BlockHandle::TegraSd => tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => ahci_info_port(port),
+            BlockHandle::SdMmc => tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockHandle::Ahci { port } => ahci_info_port(port),
         }
         .ok_or(BlockError::NotReady)?;
         let bs = dev.block_size as usize;
@@ -2522,7 +2522,7 @@ impl PartitionRange {
 //
 // WHAT THIS SECTION IS FOR. Until A60 the Orin microSD had no writer outside the armed `sdmmc_arm`
 // ladder, and `write_block_tegra_sd` above said so by refusing in EVERY cfg. `fs/fat.rs`'s
-// `BlockSource::TegraSd` veto and `fs/bootdisk.rs`'s `rw=` witness only REPORTED that refusal; neither
+// `BlockSource::SdMmc` veto and `fs/bootdisk.rs`'s `rw=` witness only REPORTED that refusal; neither
 // was the refusal. LOGIN M2 needs a writable `/` on a slot-booted Orin, so the refusal has to be
 // liftable — and the one thing that must not happen while lifting it is the wire saying `rw=yes` over
 // a path that still cannot write a byte. Hence: ONE posture, decided here, forwarded everywhere.
@@ -2539,7 +2539,7 @@ impl PartitionRange {
 // this arc made ABOVE this line is line-for-line in place, for the same reason.
 
 /// SDWRITE: does the block layer admit an ORDINARY write (a file mutation, not the armed ladder) to
-/// the Orin microSD? The single definition of that answer. `fs/fat.rs`'s `BlockSource::TegraSd` veto
+/// the Orin microSD? The single definition of that answer. `fs/fat.rs`'s `BlockSource::SdMmc` veto
 /// arm forwards to it instead of stating a second policy, so the report and the behaviour cannot
 /// drift — which is exactly how the pre-A60 tree came to have a veto in `fat.rs` that only ECHOED a
 /// refusal living two layers down.
@@ -2658,7 +2658,7 @@ pub fn handle_write_veto(handle: BlockHandle) -> Option<&'static str> {
         BlockHandle::Sdhc => sdhc_write_veto(NATIVE_SDHC_VETO), // SDHCPOST (B155): a FORWARD to §SDHCPOST's one definition, never a second policy — `fs/fat.rs`'s `BlockSource::Sdhc` arm forwards to the SAME function, which is what makes leg 8 of `fs::bootdisk::sdwrite_posture_selftest` agree BY CONSTRUCTION instead of by two authors keeping two arms in step. It was `Some(NATIVE_SDHC_VETO)` — a second copy of the policy, and exactly the drift this arc's own fixture is built to catch.
         // A60: the posture this arc exists to make liftable, forwarded from its one definition.
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        BlockHandle::TegraSd => {
+        BlockHandle::SdMmc => {
             if tegra_sd_writes_admitted() {
                 None
             } else {

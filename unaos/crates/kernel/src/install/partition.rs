@@ -445,7 +445,7 @@ pub fn transport_writable(h: block::BlockHandle) -> bool {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => false,
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::TegraSd => false,
+        block::BlockHandle::SdMmc => false,
         // AHCIWRITE: SATA is the one transport whose answer is a BUILD fact rather than a standing
         // one. Without `ahci-write` the image compiles no ATA write opcode, so the answer is the
         // same flat NO the other two give. With it, the transport can write — but only through the
@@ -482,7 +482,7 @@ pub fn transport_name(h: block::BlockHandle) -> &'static str {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => "sdhc",
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::TegraSd => "tegra-sd",
+        block::BlockHandle::SdMmc => "tegra-sd",
         #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
         block::BlockHandle::Ahci { .. } => "ahci",
     }

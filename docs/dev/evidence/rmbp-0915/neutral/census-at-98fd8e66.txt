@@ -1,0 +1,114 @@
+== FILE COUNTS (shared = not under arch/, arch/mod.rs shared) ==
+shared .rs: 128   arch/ .rs: 53   total: 181
+
+== BRACKET: 1 distinct / 1 sites ==
+  [pin as usize                       1   drivers/hda.rs:1
+
+== COLON: 2 distinct / 38 sites ==
+  :: tegra:                          36   main.rs:36
+  :: TEGRA-EL0:                       2   main.rs:2
+
+== IDENT: 48 distinct / 152 sites ==
+  tegra_el0                          19   video/quarry/live.rs:9, main.rs:4, video/dock.rs:4, shell.rs:2
+  tegra_sd_info                      15   drivers/block.rs:8, fs/fat.rs:5, fs/unafs.rs:1, main.rs:1
+  tegra_sd                            7   drivers/block.rs:7
+  tegra_shell_pick                    6   main.rs:6
+  tegra_conwin_live                   5   main.rs:5
+  tegra_shell_pal                     5   main.rs:5
+  tegra_shell_present                 5   main.rs:5
+  tegra_opened                        4   video/login.rs:4
+  tegra_sd_writes_admitted            4   drivers/block.rs:2, fs/bootdisk.rs:1, fs/fat.rs:1
+  tegra_shell_window_open             4   main.rs:4
+  orin_desk_scene_up                  3   main.rs:3
+  orin_rast_census                    3   main.rs:3
+  orin_render_service                 3   main.rs:3
+  tegra_boot_focus                    3   main.rs:3
+  tegra_desk_furn                     3   main.rs:3
+  tegra_early_stop                    3   main.rs:3
+  tegra_el0_start_maybe               3   main.rs:3
+  tegra_render_arm                    3   main.rs:3
+  tegra_sd_write_through              3   drivers/block.rs:3
+  tegra_shell_id                      3   main.rs:3
+  tegra_shell_mark                    3   main.rs:3
+  orin_click                          2   main.rs:2
+  orin_click_census                   2   main.rs:2
+  orin_drag_steer                     2   main.rs:2
+  orin_face_arm                       2   video/fbcon.rs:2
+  orin_ladder_census                  2   main.rs:2
+  orin_rast_console_owns              2   main.rs:2
+  orin_tenant_census                  2   main.rs:2
+  pi_ls_witness                       2   main.rs:1, shell.rs:1
+  pi_usb_ls_witness                   2   fs/fat.rs:1, shell.rs:1
+  tegra_cascade_stk_post              2   main.rs:2
+  tegra_cascade_stk_pre               2   main.rs:2
+  tegra_darkwin_witness               2   main.rs:2
+  tegra_desk_arm                      2   main.rs:2
+  tegra_desk_cascade                  2   main.rs:2
+  tegra_quarry_seat                   2   main.rs:2
+  tegra_sd_state                      2   fs/bootdisk.rs:2
+  tegra_sd_write_blocks_through       2   drivers/block.rs:2
+  tegra_stk_anchor                    2   main.rs:2
+  orin_conwin                         1   main.rs:1
+  orin_ladder_arm                     1   main.rs:1
+  orin_rast_glass_post                1   main.rs:1
+  orin_tenant_arm                     1   main.rs:1
+  orin_wm1                            1   main.rs:1
+  tegra_el0_verdict                   1   main.rs:1
+  tegra_sd_read_block_512             1   drivers/block.rs:1
+  tegra_sd_read_blocks_512            1   drivers/block.rs:1
+  tegra_sd_write_block_512            1   drivers/block.rs:1
+
+== GLUED: 12 distinct / 38 sites ==
+  piusb36_report                      6   drivers/xhci/mod.rs:6
+  piusb37_dump16                      5   drivers/xhci/mod.rs:5
+  piusb24_pointer_witness             4   main.rs:4
+  piusb27_service                     4   main.rs:3, fs/fat.rs:1
+  piusb39_witness                     4   drivers/xhci/mod.rs:4
+  piusb27_walk_subtree                3   fs/fat.rs:3
+  piusb27_mount_witness               2   fs/fat.rs:2
+  piusb36_delay_ms                    2   drivers/xhci/mod.rs:2
+  piusb36_matrix                      2   drivers/xhci/mod.rs:2
+  piusb36_read10_two_trb              2   drivers/xhci/mod.rs:2
+  piusb37_matrix                      2   drivers/xhci/mod.rs:2
+  piusb38_matrix                      2   drivers/xhci/mod.rs:2
+
+== UPPER: 31 distinct / 72 sites ==
+  ORINFACE_ARMED                      5   video/fbcon.rs:5
+  TEGRA                               4   main.rs:2, drivers/block.rs:1, fs/fat.rs:1
+  TEGRADESK_CASCADE_OK                4   main.rs:4
+  TEGRADESK_CLICK_ROUTED              4   main.rs:4
+  ORINSTK_ANCHOR_SP                   3   main.rs:3
+  PIUSB24_LAST_LOG_MS                 3   main.rs:3
+  PIUSB26_LAST_LOG_MS                 3   main.rs:3
+  PI_RAST_FRAMES                      3   main.rs:3
+  TEGRA_SD_BLOCK_DEVICE               3   drivers/block.rs:3
+  TEGRA_SD_WRITE_REFUSED              3   drivers/block.rs:3
+  NATIVE_TEGRA_SD_VETO                2   drivers/block.rs:2
+  ORIN                                2   main.rs:2
+  ORINFACE_RUNS                       2   video/fbcon.rs:2
+  ORINFURN_ENTERED                    2   main.rs:2
+  ORINRENDER_ARMED                    2   main.rs:2
+  PIUSB28_ARMED                       2   main.rs:2
+  PIUSB36_STATIC_BUF                  2   drivers/xhci/mod.rs:2
+  TEGRADESK_ENTERED                   2   main.rs:2
+  TEGRA_BOOT_FOCUS_DONE               2   main.rs:2
+  TEGRA_DRAM_TOP                      2   vugras.rs:2
+  TEGRA_JD2_STACK_SIZE                2   main.rs:2
+  TEGRA_SD_PUBLISHED                  2   drivers/block.rs:2
+  TEGRA_SD_VETO                       2   fs/fat.rs:2
+  TEGRA_SHELL_PRESENTED               2   main.rs:2
+  UNAOS_ORINDESK                      2   main.rs:2
+  UNAOS_PIINSTALL_ARM                 2   install/pi.rs:2
+  ORINCONWIN                          1   main.rs:1
+  ORINTENANT                          1   main.rs:1
+  PIINSTALL                           1   install/pi.rs:1
+  UNAOS_PIINSTALL                     1   install/pi.rs:1
+  UNAOS_PIINSTALL_CONFIRM             1   install/pi.rs:1
+
+== CAMEL: 6 distinct / 83 sites ==
+  TegraSd                            51   fs/fat.rs:18, drivers/block.rs:11, fs/unafs.rs:7, main.rs:5, fs/bootdisk.rs:3, install/mod.rs:2, install/partition.rs:2, wifi/firmware.rs:2, shell.rs:1
+  TegraShellWin                      13   main.rs:13
+  Orin                               10   main.rs:7, drivers/block.rs:1, fs/fat.rs:1, video/fbcon.rs:1
+  Tegra234                            4   main.rs:4
+  Jetson                              3   main.rs:3
+  Tegra                               2   fs/bootdisk.rs:1, main.rs:1

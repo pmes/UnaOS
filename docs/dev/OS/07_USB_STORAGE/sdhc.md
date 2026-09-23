@@ -2625,7 +2625,7 @@ this is one of them:
    unconditionally. Nothing in `drivers/`, `fs/vfs.rs` or `video/prtscr.rs` can change that answer:
    `FatFs::write_veto`, `FatBackend::read_only`, the `HOMESOIL: posture` census and
    `prtscr::mount_capture_target`'s rung 1 are all forwards to it. Turning the card writable is one
-   line in that one place, and the `TegraSd` arm beside it is the exact precedent —
+   line in that one place, and the `SdMmc` arm beside it is the exact precedent —
    `if crate::drivers::block::tegra_sd_writes_admitted() { None } else { Some(TEGRA_SD_VETO) }`.
 3. **The arming knob.** A `UNAOS_SDW_RW=1` posture knob is a cargo feature, and a cargo feature in
    this tree is a four-place wiring: `crates/kernel/Cargo.toml`, `arroyo`'s knob map,
@@ -2843,7 +2843,7 @@ not rediscover them:
 4. **SDHC-4c's permit ladder RETIRES rather than being bypassed.** §15.5 documents the claims as
    "true with `sdw-rw` off, retired with it on". Under R59 "off" is the exceptional case, so the
    module's argument is rewritten around the opt-out rather than around the knob.
-5. **"On every board" reaches files this cut does not hold** — `TegraSd`'s posture is A60's
+5. **"On every board" reaches files this cut does not hold** — `SdMmc`'s posture is A60's
    `sdwrite` on the Orin and the Pi's card is `emmc2`, three drivers and three postures.
 
 What survives the re-cut, unchanged, is everything this section actually built: the ONE definition
