@@ -46,7 +46,9 @@
 //! | register | offset | bits | citation | class |
 //! |---|---|---|---|---|
 //! | `NV_PMC_INTR_0` | BAR0 `0x000100` | `[26]` = PDISPLAY | open-gpu-doc `dev_master`; envytools `docs/hw/bus/pmc.txt` NV50+ source table | offset **[TREE]** (`kepler.rs:9`, `gpu_spec.md` §2.1); **bit 26 is [EXT] and UNVERIFIED on GK107** |
-//! | `NV_PMC_INTR_EN` | BAR0 `0x000140` | `[26]` = PDISPLAY | same | same |
+//! | ~~`NV_PMC_INTR_EN`~~ | BAR0 `0x000140` | ~~`[26]`~~ | envytools `docs/hw/bus/pmc.rst:30`, `:345-349` | **WRONG UNTIL KVBLANK3 (B192)**: this is `INTR_ENABLE_HOST`, bit 0 = hardware enable, bit 1 = software; it has no bit 26 (flight 12: `en_armed=00000000`) |
+//! | `INTR_MASK_HOST` | BAR0 `0x000640` | `[26]` = PDISPLAY | envytools `pmc.rst:45` (`GT215:`), `:374-377`, `:494` | **[EXT]** — where the per-source bit lives |
+//! | `INTR_LINE_HOST` | BAR0 `0x000160` | output line, GF100+ `1` = active | envytools `pmc.rst:360-364` | **[EXT]**, read-only |
 //! | `HEAD_STAT` | PDISPLAY `0x6000`, stride `0x800`, 4 heads (GK104-) | — | rnndb `display/g80_pdisplay.xml:647` | **[TREE]** (`kepler_display.rs` BEAMX86) |
 //! | `HEAD_STAT.VERT` | `HEAD_STAT + 0x340` | `vline[15:0]`, **`vblank_count[31:16]`** | same | **[TREE]**, and BEHAVIOURALLY validated every boot by `beam_probe`'s `vbd >= 2` test |
 //! | ~~PDISPLAY per-head vblank interrupt ENABLE / STATUS~~ | — | — | — | **WAS `NOT-IN-TREE`. RESOLVED BY KVBLANK2 — see the block below and the six rows under it.** |
@@ -146,6 +148,27 @@
 //! is a `video/wm.rs` change this brief fences off and which is REPORTED, not taken. Under the
 //! fixture (`SIM_MODE != 0`) the sample is skipped, so both halves score exactly as B145 recorded.
 //!
+//! ## KVBLANK3 (rmbp-ledger B192) — what flight 12 showed, and the two fixes
+//!
+//! **(1) THE INTERRUPT PATH ARMED AND COULD NOT DELIVER.** Flight 12's §R3 allocated
+//! `kepler-vblank:0x44`, programmed MSI on `1:0.0`, and read `irq=0 vbl_delta=60`. The
+//! `reason=no-vector-helper` on the same wire was a literal on rung 1's PMC line, not a verdict. The
+//! cause: bit 26 was written to `0x140`, which is `INTR_ENABLE_HOST` and holds only a hardware and a
+//! software enable bit (envytools `pmc.rst:30`, `:345-349`), so the output line stayed off. The
+//! per-source bit is in `INTR_MASK_HOST` (`0x640`). Rung 1 now probes the source in `0x640` with the
+//! enable held at 0 (`reason=source-probe-only`). §R3 arms `0x640` = bit 26 alone plus `0x140` bit 0,
+//! reads both back, samples `INTR_0` and `INTR_LINE_HOST` per vblank, and prints `deliver=`/`reason=`
+//! from [`classify`].
+//!
+//! **(2) THE POLL COUNTED SAMPLING EPISODES.** `HEAD_STAT.VERT[31:16]` is a vblank COUNT, and the
+//! edge detector used it as a flag, adding one per observed change. It is now accumulated by its
+//! difference, and the period is elapsed time over the difference between two TIGHT edges. See
+//! [`fold`]. Every "vblanks" budget in the KVBLANK2 ladder (census spacing, the R2 and R3 windows) is
+//! therefore in hardware vblanks from KVBLANK3 on. Through flight 12 those budgets were counted in
+//! sampling episodes: R3's "60" took 2016 ms.
+//!
+//! The section below describes KVBLANK's rung-1 PMC half as it shipped. Its register is the wrong one (see above).
+//!
 //! ## What `arm_pmc_pdisplay` does, and what it does not
 //!
 //! `kepler::init` has written `NV_PMC_INTR_EN = 0` since the driver's first day ("Disable
@@ -171,6 +194,27 @@ use super::kepler::{mmio_read, mmio_write, regs};
 /// set, which is exactly what rung 1 is flying to find out — so the witness line prints the RAW
 /// words beside the decoded bit and a flight may re-derive the assignment from them.
 const PMC_INTR_BIT_PDISPLAY: u32 = 26;
+
+// ── KVBLANK3 (rmbp-ledger B192) — the PMC interrupt registers as envytools names them ───────────
+//
+// Source: envytools `docs/hw/bus/pmc.rst` (fetched 2026-09-23, 543 lines, sha256 `1d3fa199…02bc`).
+// KVBLANK and KVBLANK2 wrote bit 26 into `NV_PMC_INTR_EN` (`0x140`). That register is
+// `INTR_ENABLE_HOST` (`pmc.rst:30`) and has TWO bits — `bit 0: hardware interrupt enable`, `bit 1:
+// software interrupt enable` (`:345-349`); the document says it "only allows one to enable/disable
+// all hardware or all software interrupts" (`:314-316`). Flight 12 agrees: the bit-26 write read back
+// `en_armed=00000000`. The per-source bit is in `INTR_MASK_HOST` below; bit 26 = PDISPLAY in the
+// GF100+ source table (`:471`, `:494`), so `PMC_INTR_BIT_PDISPLAY` above is right — only its
+// REGISTER was wrong.
+
+/// `INTR_ENABLE_HOST` bit 0 — "hardware interrupt enable" (`pmc.rst:346-347`). The register itself
+/// is `regs::NV_PMC_INTR_EN` (`0x140`, [TREE]); this is its one hardware bit. **[EXT].**
+const PMC_ENABLE_HOST_HW: u32 = 1 << 0;
+/// `INTR_LINE_HOST` — `pmc.rst:360-364`: "a way to peek at the status of corresponding output
+/// interrupt line … On GF100+, 1 if active". READ-ONLY here. **[EXT].**
+const PMC_INTR_LINE_HOST: usize = 0x000160;
+/// `INTR_MASK_HOST` — `pmc.rst:45` (`GT215:`), `:374-377`: "If a bit is set to 0 here, it'll be
+/// masked off to always-0 in the INTR_* register". THE PER-SOURCE BIT 26 LIVES HERE. **[EXT].**
+const PMC_INTR_MASK_HOST: usize = 0x000640;
 
 // ── KVBLANK2 §R1 — the GF119- PDISPLAY interrupt block, every offset with its document line ────
 //
@@ -267,17 +311,8 @@ const SLOW_MS: u64 = 10_000;
 static VB_HEAD1: AtomicU32 = AtomicU32::new(0);
 /// Lines per frame, as `beam_probe` measured them.
 static VB_VTOTAL: AtomicU32 = AtomicU32::new(0);
-/// `vblank_count[31:16]` as last seen, plus the 1-bit "seen at all" flag in bit 16.
-static VB_LAST: AtomicU32 = AtomicU32::new(0);
-/// Monotonic edge count. THE counter rung 2 compares against; it does not wrap at 16 bits the way
-/// the hardware field does.
-static VB_COUNT: AtomicU64 = AtomicU64::new(0);
-/// `now_cycles()` at the last edge.
-static VB_LAST_CYC: AtomicU64 = AtomicU64::new(0);
-/// Sum / min / max of the per-edge cycle deltas, for `period_us=` and `jitter_us=`.
-static VB_SUM_CYC: AtomicU64 = AtomicU64::new(0);
-static VB_MIN_CYC: AtomicU64 = AtomicU64::new(u64::MAX);
-static VB_MAX_CYC: AtomicU64 = AtomicU64::new(0);
+// KVBLANK3 — `VB_LAST`, `VB_COUNT`, `VB_LAST_CYC` and the `VB_SUM/MIN/MAX_CYC` accumulators that stood
+// here counted one per OBSERVED CHANGE and are replaced by [`VbAcc`] below ([`LIVE`]).
 /// `vline` read INSIDE the edge — THE PHASE, and the one number rung 2's threshold is derived from.
 /// Stored plus 1 so that zero means "no edge has been phased yet" and line 0 stays a legal reading.
 static VB_PHASE1: AtomicU32 = AtomicU32::new(0);
@@ -343,6 +378,15 @@ static IRQ_HEAD: AtomicU32 = AtomicU32::new(0);
 static IRQ_PMC_ENTRY: AtomicU32 = AtomicU32::new(0);
 /// 0 = not wired, 1 = MSI, 2 = INTx through the IOAPIC.
 static IRQ_WIRE: AtomicU32 = AtomicU32::new(0);
+/// KVBLANK3 — the captured `INTR_MASK_HOST` word, the two PMC read-backs taken right after the arm,
+/// the GK107's PCI COMMAND word, and the OR of `INTR_0` / `INTR_LINE_HOST` over the window. These
+/// are the inputs of [`classify`], i.e. the evidence behind `deliver=`/`reason=`.
+static IRQ_MASK_ENTRY: AtomicU32 = AtomicU32::new(0);
+static IRQ_EN_ARMED: AtomicU32 = AtomicU32::new(0);
+static IRQ_MASK_ARMED: AtomicU32 = AtomicU32::new(0);
+static IRQ_CMD: AtomicU32 = AtomicU32::new(0);
+static WIN_PMC_OR: AtomicU32 = AtomicU32::new(0);
+static WIN_LINE_OR: AtomicU32 = AtomicU32::new(0);
 /// Set while the ISR may touch MMIO — cleared before the rung restores, so a late delivery after
 /// the window closes cannot write a register the rung has already put back.
 static IRQ_LIVE: AtomicBool = AtomicBool::new(false);
@@ -391,6 +435,160 @@ fn us_to_cycles(us: u64) -> u64 {
     us.saturating_mul(hz) / 1_000_000
 }
 
+// ── KVBLANK3 M3 (rmbp-ledger B192) — THE PERIOD, FROM THE COUNT ──────────────────────────────────
+//
+// `HEAD_STAT.VERT[31:16]` is a vblank COUNT (rnndb `display/g80_pdisplay.xml:647`,
+// `vblank_count[31:16]`). KVBLANK read it as an edge FLAG — `VB_COUNT += 1` on any change — and threw
+// the difference away, so every vblank that passed between two sampling episodes (two `beam::hold`s)
+// was lost. Flight 12: `count=10430 period_us=38241` over 398.9 s on a 60.2 Hz panel, the count's
+// rate following the compositor's pass rate (29.8/s at 23.4 passes/s, 25.5/s at 19.6 passes/s).
+//
+// NOW: the count accumulates the field's DIFFERENCE, mod 2^16, so a sample that arrives three
+// vblanks late adds three. period = elapsed / delta-count needs no sampling cadence at all, only two
+// timestamps that are close to their edges. An edge is TIGHT when the sample that saw it came within
+// [`TIGHT_US`] of the sample before it (the raster was being watched when the count stepped), so its
+// timestamp is known to TIGHT_US. period_us is measured between the FIRST and LAST tight edges;
+// jitter_us is max-min of the per-vblank period over consecutive tight pairs, each good to
+// 2*TIGHT_US / (vblanks between them). Before two tight edges exist, the loose first/last edges are
+// used and `period_src=loose` says so; with no edge at all it reads `none`, and the fixture calls
+// that GAVEUP.
+//
+// The limit, stated: a gap longer than 65536 vblanks (18.2 min at 60 Hz) between two samples loses
+// whole wraps. `seen=` beside `count=` makes it visible: the old count and the true count, on one line.
+//
+// COST: one `now_cycles()` (rdtsc) and one relaxed store per `note()` call, to timestamp the sample
+// for the tight bracket — against the uncached BAR0 read `scanout_beam` has just made (~1 us across
+// PCIe), i.e. about 1% of an iteration. The fast path takes no lock and does no division.
+
+/// A sample within this long of the previous sample makes the edge it sees TIGHT. 500 us is 3% of a
+/// 16.667 ms frame, and a `hold` spin samples every few microseconds, so any edge that lands inside a
+/// hold qualifies, and the first sample after an inter-present gap never does.
+const TIGHT_US: u64 = 500;
+
+/// The period accumulator. One live instance ([`LIVE`]); the fixture drives a second one
+/// ([`SIM_ACC`]) through the SAME [`fold`], so the fixture proves the arithmetic the metal runs.
+struct VbAcc {
+    /// `vblank_count[31:16]` as last seen, plus the "seen at all" flag in bit 16.
+    last: AtomicU32,
+    /// Hardware vblanks since the first reading: the sum of the field's differences.
+    count: AtomicU64,
+    /// Samples that saw the field change — exactly what `count=` counted before KVBLANK3.
+    seen: AtomicU64,
+    /// `now` at the previous sample, of any kind (the tight bracket's other end).
+    sample_cyc: AtomicU64,
+    /// First edge of any kind, and the last edge of any kind (the loose anchors).
+    loose_cyc: AtomicU64,
+    loose_n: AtomicU64,
+    last_cyc: AtomicU64,
+    /// First and latest TIGHT edge, and how many there were.
+    first_cyc: AtomicU64,
+    first_n: AtomicU64,
+    tight_cyc: AtomicU64,
+    tight_n: AtomicU64,
+    tight: AtomicU64,
+    /// Per-vblank period over consecutive tight pairs, cycles — `jitter_us=` is their spread.
+    pmin: AtomicU64,
+    pmax: AtomicU64,
+}
+
+impl VbAcc {
+    const fn new() -> Self {
+        Self {
+            last: AtomicU32::new(0),
+            count: AtomicU64::new(0),
+            seen: AtomicU64::new(0),
+            sample_cyc: AtomicU64::new(0),
+            loose_cyc: AtomicU64::new(0),
+            loose_n: AtomicU64::new(0),
+            last_cyc: AtomicU64::new(0),
+            first_cyc: AtomicU64::new(0),
+            first_n: AtomicU64::new(0),
+            tight_cyc: AtomicU64::new(0),
+            tight_n: AtomicU64::new(0),
+            tight: AtomicU64::new(0),
+            pmin: AtomicU64::new(u64::MAX),
+            pmax: AtomicU64::new(0),
+        }
+    }
+
+    /// `(period_cyc, jitter_cyc, src)` — see the block comment above for which anchors each `src` uses.
+    fn period(&self) -> (u64, u64, &'static str) {
+        let (mn, mx) = (self.pmin.load(Ordering::Relaxed), self.pmax.load(Ordering::Relaxed));
+        let jitter = if mn != u64::MAX && mx >= mn { mx - mn } else { 0 };
+        let (fc, fnn) = (self.first_cyc.load(Ordering::Relaxed), self.first_n.load(Ordering::Relaxed));
+        let (tc, tn) = (self.tight_cyc.load(Ordering::Relaxed), self.tight_n.load(Ordering::Relaxed));
+        if self.tight.load(Ordering::Relaxed) >= 2 && tn > fnn && tc > fc {
+            return ((tc - fc) / (tn - fnn), jitter, "tight");
+        }
+        let (lc, ln) = (self.loose_cyc.load(Ordering::Relaxed), self.loose_n.load(Ordering::Relaxed));
+        let (ec, en) = (self.last_cyc.load(Ordering::Relaxed), self.count.load(Ordering::Relaxed));
+        if self.seen.load(Ordering::Relaxed) >= 2 && en > ln && ec > lc {
+            return ((ec - lc) / (en - ln), jitter, "loose");
+        }
+        (0, jitter, "none")
+    }
+
+    /// What the pre-KVBLANK3 arithmetic would have printed for the same samples: the mean time
+    /// between OBSERVED edges. Printed by the fixture beside the true period, so the defect and the
+    /// fix are read off one line.
+    fn old_period(&self) -> u64 {
+        let seen = self.seen.load(Ordering::Relaxed);
+        let span = self.last_cyc.load(Ordering::Relaxed).saturating_sub(self.loose_cyc.load(Ordering::Relaxed));
+        if seen >= 2 { span / (seen - 1) } else { 0 }
+    }
+}
+
+/// The live accumulator, fed by [`note`].
+static LIVE: VbAcc = VbAcc::new();
+/// The fixture's accumulator. Never touched by the metal path.
+static SIM_ACC: VbAcc = VbAcc::new();
+
+/// Fold ONE sample of `HEAD_STAT.VERT` taken at `now` into `acc`. Returns the number of vblanks the
+/// count advanced by (`Some(d)`, `d >= 1`) when this sample saw it step, `None` otherwise.
+///
+/// The first reading of the field only sets the baseline: there is no earlier value to subtract.
+/// The claim of the new value is a compare-exchange, so two cores sampling the same step count it
+/// once.
+#[inline]
+fn fold(acc: &VbAcc, word: u32, now: u64) -> Option<u64> {
+    let vb = (word >> 16) & 0xFFFF;
+    let prev_sample = acc.sample_cyc.load(Ordering::Relaxed);
+    acc.sample_cyc.store(now, Ordering::Relaxed);
+    let prev = acc.last.load(Ordering::Relaxed);
+    if prev & 0x1_0000 != 0 && (prev & 0xFFFF) == vb {
+        return None;
+    }
+    if acc.last.compare_exchange(prev, vb | 0x1_0000, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return None;
+    }
+    if prev & 0x1_0000 == 0 {
+        return None;
+    }
+    // THE FIX: the difference, mod 2^16 — not 1.
+    let d = (vb.wrapping_sub(prev & 0xFFFF) & 0xFFFF) as u64;
+    let n = acc.count.fetch_add(d, Ordering::Relaxed) + d;
+    acc.seen.fetch_add(1, Ordering::Relaxed);
+    if acc.loose_cyc.load(Ordering::Relaxed) == 0 {
+        acc.loose_cyc.store(now, Ordering::Relaxed);
+        acc.loose_n.store(n, Ordering::Relaxed);
+    }
+    acc.last_cyc.store(now, Ordering::Relaxed);
+    if prev_sample != 0 && now.saturating_sub(prev_sample) <= us_to_cycles(TIGHT_US) {
+        acc.tight.fetch_add(1, Ordering::Relaxed);
+        let tc = acc.tight_cyc.swap(now, Ordering::Relaxed);
+        let tn = acc.tight_n.swap(n, Ordering::Relaxed);
+        if tc == 0 {
+            acc.first_cyc.store(now, Ordering::Relaxed);
+            acc.first_n.store(n, Ordering::Relaxed);
+        } else if n > tn && now > tc {
+            let p = (now - tc) / (n - tn);
+            acc.pmin.fetch_min(p, Ordering::Relaxed);
+            acc.pmax.fetch_max(p, Ordering::Relaxed);
+        }
+    }
+    Some(d)
+}
+
 // ── RUNG 1 — the PMC half, called from `kepler::init`'s interrupt-disable statement ────────────
 
 /// KVBLANK rung 1, PMC half. Set the PDISPLAY source bit in `NV_PMC_INTR_EN`, watch
@@ -424,16 +622,21 @@ pub unsafe fn arm_pmc_pdisplay(bar0: usize) {
         bdf.map(|v| v.0).unwrap_or(0xFF), bdf.map(|v| v.1).unwrap_or(0xFF), bdf.map(|v| v.2).unwrap_or(0xFF),
     );
 
+    // KVBLANK3 — the source bit goes to INTR_MASK_HOST (0x640), NOT to INTR_ENABLE_HOST (0x140),
+    // which has no bit 26 (see the constants above; flight 12 read `en_armed=00000000`).
+    // INTR_ENABLE_HOST is READ and never written here: `kepler::init` has just written it 0, and at
+    // 0 the output line cannot assert (`pmc.rst:346-347`), so NOTHING CAN BE DELIVERED by this rung —
+    // it asks whether PDISPLAY raises its PMC input, which `INTR_0` shows only for a source that is
+    // unmasked (`pmc.rst:331-332`). `line_or=` is the control: it must read 0 with the enable at 0.
     let bit = 1u32 << PMC_INTR_BIT_PDISPLAY;
-    let en_entry = mmio_read(bar0, regs::NV_PMC_INTR_EN);
+    let en_host = mmio_read(bar0, regs::NV_PMC_INTR_EN);
+    let mask_entry = mmio_read(bar0, PMC_INTR_MASK_HOST);
     let st_entry = mmio_read(bar0, regs::NV_PMC_INTR_0);
-    mmio_write(bar0, regs::NV_PMC_INTR_EN, en_entry | bit);
-    let en_armed = mmio_read(bar0, regs::NV_PMC_INTR_EN);
+    mmio_write(bar0, PMC_INTR_MASK_HOST, mask_entry | bit);
+    let mask_armed = mmio_read(bar0, PMC_INTR_MASK_HOST);
 
-    // Observe. Delivery is impossible (no vector is wired for this function — see the module doc),
-    // so what is under test is whether the SOURCE latches in the status word at all.
     let (mut seen, mut samples, mut spins) = (0u32, 0u32, 0u32);
-    let mut or_all = 0u32;
+    let (mut or_all, mut line_or) = (0u32, 0u32);
     let t0 = crate::arch::ms();
     loop {
         if crate::arch::ms().wrapping_sub(t0) > PMC_WINDOW_MS {
@@ -444,6 +647,7 @@ pub unsafe fn arm_pmc_pdisplay(bar0: usize) {
             break;
         }
         let st = mmio_read(bar0, regs::NV_PMC_INTR_0);
+        line_or |= mmio_read(bar0, PMC_INTR_LINE_HOST);
         samples = samples.saturating_add(1);
         or_all |= st;
         if st & bit != 0 {
@@ -452,14 +656,14 @@ pub unsafe fn arm_pmc_pdisplay(bar0: usize) {
         core::hint::spin_loop();
     }
 
-    mmio_write(bar0, regs::NV_PMC_INTR_EN, en_entry);
-    let en_back = mmio_read(bar0, regs::NV_PMC_INTR_EN);
-    let clean = en_back == en_entry;
+    mmio_write(bar0, PMC_INTR_MASK_HOST, mask_entry);
+    let mask_back = mmio_read(bar0, PMC_INTR_MASK_HOST);
+    let clean = mask_back == mask_entry;
 
     serial_println!(
-        ":: kepler: vblank pmc-arm bit={} en_entry={:08X} en_armed={:08X} intr_entry={:08X} intr_or={:08X} pdisplay_seen={}/{} window_ms={} deliver=none reason=no-vector-helper restored={:08X} verdict={} :: — NV_PMC_INTR_EN/INTR_0 offsets are [TREE] (kepler.rs:9-10, gpu_spec 2.1); BIT {} = PDISPLAY is [EXT] and UNVERIFIED on GK107 (public NV50+ PMC source table), so the RAW words are printed beside the decode and a flight may re-derive it. The PDISPLAY-side per-head vblank ENABLE/STATUS pair is NOT-IN-TREE and is neither read nor written here. writes=2 (set, restore), restored+read-back ::",
-        PMC_INTR_BIT_PDISPLAY, en_entry, en_armed, st_entry, or_all, seen, samples, PMC_WINDOW_MS,
-        en_back, if clean { "clean" } else { "DIRTY" }, PMC_INTR_BIT_PDISPLAY,
+        ":: kepler: vblank pmc-arm bit={} reg=INTR_MASK_HOST en_host={:08X} mask_entry={:08X} mask_armed={:08X} intr_entry={:08X} intr_or={:08X} line_or={:08X} pdisplay_seen={}/{} window_ms={} deliver=none reason=source-probe-only restored={:08X} verdict={} :: — KVBLANK3 (B192): bit {} = PDISPLAY is set in INTR_MASK_HOST 0x640 (envytools pmc.rst:45, :374-377, :494), NOT in 0x140, which is INTR_ENABLE_HOST with only bit 0 (hw) and bit 1 (sw) (pmc.rst:30, :345-349) — flight 12 read en_armed=00000000 after KVBLANK's bit-26 write there. en_host is READ, never written: at 0 the output line cannot assert, so nothing is delivered by construction and line_or must read 0. Delivery is KVBLANK2 R3's job (the vector-intr lines). writes=2 (mask set, mask restore), restored+read-back ::",
+        PMC_INTR_BIT_PDISPLAY, en_host, mask_entry, mask_armed, st_entry, or_all, line_or, seen, samples,
+        PMC_WINDOW_MS, mask_back, if clean { "clean" } else { "DIRTY" }, PMC_INTR_BIT_PDISPLAY,
     );
 }
 
@@ -478,34 +682,23 @@ pub fn arm(head: u32, vtotal: u32) {
 
 /// KVBLANK rung 1 — the edge detector, fed the RAW `HEAD_STAT.VERT` word `scanout_beam` just read.
 ///
-/// FAST PATH: one relaxed load and a 16-bit compare, then return. `now_cycles()` and the witness
-/// print are reached only ON an edge — at most 60 times a second on a 60 Hz panel — so this costs
-/// the hold loop a compare per iteration and nothing else.
+/// FAST PATH (KVBLANK3): one `now_cycles()`, a relaxed load and store, and a 16-bit compare — see
+/// [`fold`] for the cost and why the timestamp is taken on every sample. The witness print is
+/// reached only ON an edge.
 #[inline]
 pub fn note(word: u32) {
     if VB_HEAD1.load(Ordering::Acquire) == 0 {
         return;
     }
-    let vb = (word >> 16) & 0xFFFF;
-    let prev = VB_LAST.load(Ordering::Relaxed);
-    if prev & 0x1_0000 != 0 && (prev & 0xFFFF) == vb {
-        return;
+    if fold(&LIVE, word, crate::arch::now_cycles()).is_some() {
+        edge(word & 0xFFFF);
     }
-    VB_LAST.store(vb | 0x1_0000, Ordering::Relaxed);
-    if prev & 0x1_0000 == 0 {
-        // First reading of the field is not an edge — there is no previous timestamp to subtract.
-        VB_LAST_CYC.store(crate::arch::now_cycles(), Ordering::Relaxed);
-        return;
-    }
-    edge(word & 0xFFFF);
 }
 
-/// The edge itself: timestamp it, fold it into the period/jitter accumulators, record the PHASE and
-/// print on the cadence.
+/// The edge itself (the count and the period are already folded by [`fold`]): record the PHASE, step
+/// the KVBLANK2 ladder in HARDWARE vblanks, and print on the cadence.
 fn edge(vline: u32) {
-    let now = crate::arch::now_cycles();
-    let last = VB_LAST_CYC.swap(now, Ordering::Relaxed);
-    let n = VB_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let n = LIVE.count.load(Ordering::Relaxed);
     // THE PHASE. `vline` here is the raster position read in the SAME word as the counter tick, so
     // it is where in the frame the edge was observed — `raster_at_irq`, and the number rung 2's
     // threshold is derived from.
@@ -515,12 +708,6 @@ fn edge(vline: u32) {
     // because this is the one place per frame that is already off the fast path (`note`'s compare
     // returns before reaching `edge` on every non-edge iteration).
     ladder_tick(n);
-    if last != 0 {
-        let dt = now.saturating_sub(last);
-        VB_SUM_CYC.fetch_add(dt, Ordering::Relaxed);
-        VB_MIN_CYC.fetch_min(dt, Ordering::Relaxed);
-        VB_MAX_CYC.fetch_max(dt, Ordering::Relaxed);
-    }
     let prints = VB_PRINTS.load(Ordering::Relaxed);
     let due = if prints < FAST_PRINTS { FAST_MS } else { SLOW_MS };
     let ms = crate::arch::ms();
@@ -533,18 +720,19 @@ fn edge(vline: u32) {
 }
 
 /// The witness line. Split out so the fixture can print the same shape without an edge behind it.
+///
+/// KVBLANK3: `count=` is now HARDWARE vblanks (the sum of the field's differences), and every field
+/// before `vbrecheck=` keeps its name and position. Appended: `seen=` — what `count=` meant through
+/// flight 12, the samples that saw the field step — `tight=` and `period_src=` (see [`fold`]).
 fn report(n: u64, vline: u32) {
-    let sum = VB_SUM_CYC.load(Ordering::Relaxed);
-    let mn = VB_MIN_CYC.load(Ordering::Relaxed);
-    let mx = VB_MAX_CYC.load(Ordering::Relaxed);
-    let period_us = if n > 1 { cycles_to_us(sum / (n - 1)) } else { 0 };
-    let jitter_us = if mx >= mn && mn != u64::MAX { cycles_to_us(mx - mn) } else { 0 };
+    let (p_cyc, j_cyc, src) = LIVE.period();
     serial_println!(
-        ":: kepler: vblank head={} count={} period_us={} jitter_us={} raster_at_irq={} vt={} mode={} vbwaits={} vbwait_us={} vbgaveup={} vbrecheck={} ::",
+        ":: kepler: vblank head={} count={} period_us={} jitter_us={} raster_at_irq={} vt={} mode={} vbwaits={} vbwait_us={} vbgaveup={} vbrecheck={} seen={} tight={} period_src={} ::",
         VB_HEAD1.load(Ordering::Relaxed).saturating_sub(1),
-        n, period_us, jitter_us, vline, VB_VTOTAL.load(Ordering::Relaxed), mode_str(),
+        n, cycles_to_us(p_cyc), cycles_to_us(j_cyc), vline, VB_VTOTAL.load(Ordering::Relaxed), mode_str(),
         VB_WAITS.load(Ordering::Relaxed), VB_WAIT_US.load(Ordering::Relaxed),
         VB_WAIT_GAVEUP.load(Ordering::Relaxed), VB_WAIT_RECHECK.load(Ordering::Relaxed),
+        LIVE.seen.load(Ordering::Relaxed), LIVE.tight.load(Ordering::Relaxed), src,
     );
 }
 
@@ -723,7 +911,7 @@ fn rung3_arm(bar0: usize, head: usize, n: u64) {
     let bdf = bdf1 - 1;
     let (bus, slot, func) = ((bdf >> 16) as u8, (bdf >> 8) as u8, bdf as u8);
 
-    let vec = match crate::arch::interrupts::vectors::alloc("kepler-vblank", kepler_vblank_isr) {
+    let vec = match ensure_vector() {
         Some(v) => v,
         None => {
             serial_println!(
@@ -734,8 +922,6 @@ fn rung3_arm(bar0: usize, head: usize, n: u64) {
             return;
         }
     };
-    IRQ_VECTOR1.store(vec as u32 + 1, Ordering::Relaxed);
-
     let msg_addr = 0xFEE0_0000u32 | ((crate::arch::x86_64::apic::apic_id() as u32) << 12);
     let wire = if crate::drivers::pci::PciScanner::enable_msi(bus, slot, func, msg_addr, vec as u32)
     {
@@ -755,27 +941,116 @@ fn rung3_arm(bar0: usize, head: usize, n: u64) {
         return;
     }
 
-    // PMC bit 26 — unmask PDISPLAY for the window only. The captured word is what
-    // `arm_pmc_pdisplay` restored, i.e. the `0` `kepler::init` has written since day one.
+    // KVBLANK3 — THE PMC ARM, ON THE REGISTERS envytools NAMES (see the constants block). KVBLANK2
+    // wrote bit 26 into INTR_ENABLE_HOST (0x140), which has no bit 26, never read it back, and so
+    // flew a window with the output line held off (flight 12: `irq=0 vbl_delta=60`). Now:
+    //   INTR_MASK_HOST (0x640) = ONLY bit 26 — exactly one PMC source can raise the line, so an ISR
+    //     entry in this window is attributable to PDISPLAY and to nothing else;
+    //   INTR_ENABLE_HOST (0x140) |= bit 0 — the hardware-interrupt enable (`pmc.rst:346-347`).
+    // Both are captured first, READ BACK after (`pmc_en_armed=`, `pmc_mask_armed=`), and restored
+    // with a read-back at close. The PCI COMMAND word is read (never written) because MSI is a
+    // posted memory write and needs bus master (`kepler.rs:1310` sets it); it is printed and it is
+    // one of `classify`'s refusals.
+    let cmd = unsafe { crate::arch::pci::read_config_16(bus, slot, func, 0x04) };
+    IRQ_CMD.store(cmd as u32, Ordering::Relaxed);
     let pmc_bit = 1u32 << PMC_INTR_BIT_PDISPLAY;
     let pmc_entry = unsafe { mmio_read(bar0, regs::NV_PMC_INTR_EN) };
     IRQ_PMC_ENTRY.store(pmc_entry, Ordering::Relaxed);
+    let mask_entry = unsafe { mmio_read(bar0, PMC_INTR_MASK_HOST) };
+    IRQ_MASK_ENTRY.store(mask_entry, Ordering::Relaxed);
     // The per-head VBLANK enable — the same one bit §R2 proved restorable, in the same register.
     let en_entry = unsafe { mmio_read(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head)) };
     WIN_EN_ENTRY.store(en_entry, Ordering::Relaxed);
     WIN_SEEN.store(0, Ordering::Relaxed);
     WIN_SAMPLES.store(0, Ordering::Relaxed);
+    WIN_PMC_OR.store(0, Ordering::Relaxed);
+    WIN_LINE_OR.store(0, Ordering::Relaxed);
     IRQ_STORMED.store(false, Ordering::Relaxed);
     IRQ_LIVE.store(true, Ordering::Release);
-    unsafe {
+    // Order: the source first, then the one-source mask, then the line enable LAST, so the line
+    // can only come up once exactly one source can drive it.
+    let (en_armed, mask_armed) = unsafe {
         mmio_write(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head), en_entry | (1 << DISP_INTR_HEAD_BIT_VBLANK));
-        mmio_write(bar0, regs::NV_PMC_INTR_EN, pmc_entry | pmc_bit);
-    }
+        mmio_write(bar0, PMC_INTR_MASK_HOST, pmc_bit);
+        mmio_write(bar0, regs::NV_PMC_INTR_EN, pmc_entry | PMC_ENABLE_HOST_HW);
+        (mmio_read(bar0, regs::NV_PMC_INTR_EN), mmio_read(bar0, PMC_INTR_MASK_HOST))
+    };
+    IRQ_EN_ARMED.store(en_armed, Ordering::Relaxed);
+    IRQ_MASK_ARMED.store(mask_armed, Ordering::Relaxed);
     serial_println!(
-        ":: kepler: vblank-intr vector armed bdf={}:{}.{} vector={:#04x} wire={} pmc_entry={:08X} pmc_bit={} en_entry={:08X} head={} window_vblanks={} storm_cap={} :: — the vector came from interrupts::vectors::alloc (rmbp-ledger B168): no new const, no IDT edit, and the entry was registered BEFORE the number was returned. wire=1 MSI, wire=2 INTx via IOAPIC (B147). The ISR acknowledges by DISARMING at INTR_HOST_HEAD_EN (rnndb display/g80_pdisplay.xml:542) and NEVER by writing a status or trigger register, because rnndb names no ack protocol for them — an uncited write is not made. writes=2 (PMC unmask, head enable), both restored at window close ::",
+        ":: kepler: vblank-intr vector armed bdf={}:{}.{} vector={:#04x} wire={} pmc_entry={:08X} pmc_bit={} en_entry={:08X} head={} window_vblanks={} storm_cap={} cmd={:04X} pmc_en_armed={:08X} pmc_mask_entry={:08X} pmc_mask_armed={:08X} :: — the vector came from interrupts::vectors::alloc (rmbp-ledger B168). wire=1 MSI, wire=2 INTx via IOAPIC (B147). KVBLANK3 (B192): PMC is armed on INTR_MASK_HOST 0x640 = ONLY bit {} (PDISPLAY) and INTR_ENABLE_HOST 0x140 |= bit 0 (hw enable) — envytools pmc.rst:45/:374-377 and :30/:345-349 — both READ BACK here; KVBLANK2 wrote bit 26 into 0x140, which has no bit 26. The ISR acknowledges by DISARMING at INTR_HOST_HEAD_EN (rnndb display/g80_pdisplay.xml:542) and NEVER by writing a status or trigger register, because rnndb names no ack protocol for them. writes=3 (head enable, PMC mask, PMC enable), all restored at window close ::",
         bus, slot, func, vec, wire, pmc_entry, PMC_INTR_BIT_PDISPLAY, en_entry, head,
-        IRQ_WINDOW_VBLANKS, IRQ_STORM_CAP,
+        IRQ_WINDOW_VBLANKS, IRQ_STORM_CAP, cmd, en_armed, mask_entry, mask_armed, PMC_INTR_BIT_PDISPLAY,
     );
+}
+
+/// KVBLANK3 — the one vector this module owns, allocated ONCE per boot through B168's allocator and
+/// reused by every caller. The fixture calls it on every armed boot (so the `kepler-vblank:0x..` row
+/// reaches the `[vectors] … table=` census in QEMU, where §R3 never runs), and §R3 calls it on the
+/// metal; whichever runs first allocates and the other reuses, so the allocator never sees the name
+/// twice (it would REFUSE it — `reason=duplicate-name`).
+fn ensure_vector() -> Option<u8> {
+    let held = IRQ_VECTOR1.load(Ordering::Acquire);
+    if held != 0 {
+        return Some((held - 1) as u8);
+    }
+    let v = crate::arch::interrupts::vectors::alloc("kepler-vblank", kepler_vblank_isr)?;
+    IRQ_VECTOR1.store(v as u32 + 1, Ordering::Release);
+    Some(v)
+}
+
+/// KVBLANK3 — the inputs of the delivery verdict, all of them words the rung READ.
+#[derive(Clone, Copy)]
+struct DeliverIn {
+    irq: u64,
+    wire: u32,
+    cmd: u32,
+    en_armed: u32,
+    mask_armed: u32,
+    intr_or: u32,
+    line_or: u32,
+}
+
+/// KVBLANK3 — **`deliver=` and `reason=`, decided from what was read and in the order the signal
+/// travels**: the function's wiring, bus master, the PMC line enable, the PMC source mask, whether
+/// PDISPLAY raised its PMC input (`INTR_0` bit 26), whether the output line asserted
+/// (`INTR_LINE_HOST`), and only then the delivery itself. The FIRST broken link is the reason, so a
+/// refusal names where the signal stopped rather than the last thing that happened not to arrive.
+/// Pure, so the fixture drives this exact function over a table that includes flight 12's words.
+fn classify(d: DeliverIn) -> (&'static str, &'static str) {
+    let pd = 1u32 << PMC_INTR_BIT_PDISPLAY;
+    if d.irq > 0 {
+        return (
+            match d.wire {
+                1 => "msi",
+                2 => "intx",
+                _ => "vector",
+            },
+            "none",
+        );
+    }
+    if d.wire == 0 {
+        return ("none", "no-msi-no-intx");
+    }
+    if d.wire == 1 && d.cmd & (1 << 2) == 0 {
+        return ("none", "no-bus-master");
+    }
+    if d.wire == 2 && d.cmd & (1 << 10) != 0 {
+        return ("none", "intx-disabled-in-command");
+    }
+    if d.en_armed & PMC_ENABLE_HOST_HW == 0 {
+        return ("none", "pmc-enable-not-latched");
+    }
+    if d.mask_armed & pd == 0 {
+        return ("none", "pmc-mask-not-latched");
+    }
+    if d.intr_or & pd == 0 {
+        return ("none", "pdisplay-not-raised");
+    }
+    if d.line_or & 1 == 0 {
+        return ("none", "line-not-asserted");
+    }
+    ("none", "line-asserted-not-delivered")
 }
 
 /// **§R3 — RUN AND RESTORE.** Count ISR entries against the vblank count, re-arm the enable the ISR
@@ -783,6 +1058,9 @@ fn rung3_arm(bar0: usize, head: usize, n: u64) {
 fn rung3_run(bar0: usize, head: usize, n: u64) {
     let vb = 1u32 << DISP_INTR_HEAD_BIT_VBLANK;
     WIN_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    // KVBLANK3 — where the signal is, once per vblank: PDISPLAY's PMC input and the output line.
+    WIN_PMC_OR.fetch_or(unsafe { mmio_read(bar0, regs::NV_PMC_INTR_0) }, Ordering::Relaxed);
+    WIN_LINE_OR.fetch_or(unsafe { mmio_read(bar0, PMC_INTR_LINE_HOST) }, Ordering::Relaxed);
     let elapsed = n.saturating_sub(WIN_AT.load(Ordering::Relaxed));
     if elapsed < IRQ_WINDOW_VBLANKS && !IRQ_STORMED.load(Ordering::Relaxed) {
         // RE-ARM. The ISR disarms at the enable (the only ack this rung is licensed to make), so
@@ -799,26 +1077,40 @@ fn rung3_run(bar0: usize, head: usize, n: u64) {
     // ── CLOSE. Order matters: stop the ISR touching MMIO, then mask, then restore. ──
     IRQ_LIVE.store(false, Ordering::Release);
     let pmc_entry = IRQ_PMC_ENTRY.load(Ordering::Relaxed);
+    let mask_entry = IRQ_MASK_ENTRY.load(Ordering::Relaxed);
     let en_entry = WIN_EN_ENTRY.load(Ordering::Relaxed);
     unsafe {
-        mmio_write(bar0, regs::NV_PMC_INTR_EN, pmc_entry);
+        mmio_write(bar0, regs::NV_PMC_INTR_EN, pmc_entry); // the line first
+        mmio_write(bar0, PMC_INTR_MASK_HOST, mask_entry);
         mmio_write(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head), en_entry);
     }
     let pmc_back = unsafe { mmio_read(bar0, regs::NV_PMC_INTR_EN) };
+    let mask_back = unsafe { mmio_read(bar0, PMC_INTR_MASK_HOST) };
     let en_back = unsafe { mmio_read(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head)) };
     let irq = IRQ_COUNT.load(Ordering::Relaxed);
+    let (intr_or, line_or) = (WIN_PMC_OR.load(Ordering::Relaxed), WIN_LINE_OR.load(Ordering::Relaxed));
+    let (deliver, reason) = classify(DeliverIn {
+        irq,
+        wire: IRQ_WIRE.load(Ordering::Relaxed),
+        cmd: IRQ_CMD.load(Ordering::Relaxed),
+        en_armed: IRQ_EN_ARMED.load(Ordering::Relaxed),
+        mask_armed: IRQ_MASK_ARMED.load(Ordering::Relaxed),
+        intr_or,
+        line_or,
+    });
 
     // **THE MODE IS DECIDED HERE, BY THE WIRE.** Not by the knob, not by a `cfg`, not by whether
     // the registers were cited: by whether the GK107 delivered an interrupt to this kernel.
     IRQ_MODE.store(irq > 0, Ordering::Release);
 
-    let clean = pmc_back == pmc_entry && en_back == en_entry;
+    let clean = pmc_back == pmc_entry && mask_back == mask_entry && en_back == en_entry;
     serial_println!(
-        ":: kepler: vblank-intr vector close head={} irq={} vbl_delta={} rearms={} wire={} vector={:#04x} storm={} pmc_restored={:08X} pmc_readback={:08X} en_restored={:08X} en_readback={:08X} verdict={} mode={} :: — irq= is ISR ENTRIES and vbl_delta= is HEAD_STAT.VERT[31:16] edges over the same window, so irq/vbl_delta is the delivery ratio and irq=0 with vbl_delta>0 is the HONEST REFUSAL: the raster ran, the source was enabled and cited, and nothing was delivered. writes=4 total, all restored and read back. mode= is set by THIS number and by nothing else ::",
+        ":: kepler: vblank-intr vector close head={} irq={} vbl_delta={} rearms={} wire={} vector={:#04x} storm={} pmc_restored={:08X} pmc_readback={:08X} en_restored={:08X} en_readback={:08X} verdict={} mode={} deliver={} reason={} intr_or={:08X} line_or={:08X} mask_restored={:08X} mask_readback={:08X} :: — irq= is ISR ENTRIES and vbl_delta= is HEAD_STAT.VERT[31:16] vblanks over the same window, so irq/vbl_delta is the delivery ratio. deliver=/reason= (KVBLANK3, B192) name the FIRST broken link in the order the signal travels: wiring, bus master, PMC enable read-back, PMC mask read-back, INTR_0 bit 26 (PDISPLAY raised its input), INTR_LINE_HOST (the line asserted), delivery. writes=6 total (3 arm, 3 restore), all read back. mode= is set by irq= and by nothing else ::",
         head, irq, elapsed, WIN_SEEN.load(Ordering::Relaxed), IRQ_WIRE.load(Ordering::Relaxed),
         IRQ_VECTOR1.load(Ordering::Relaxed).saturating_sub(1), IRQ_STORMED.load(Ordering::Relaxed) as u32,
         pmc_entry, pmc_back, en_entry, en_back,
-        if clean { "clean" } else { "DIRTY" }, mode_str(),
+        if clean { "clean" } else { "DIRTY" }, mode_str(), deliver, reason, intr_or, line_or,
+        mask_entry, mask_back,
     );
     LADDER.store(LADDER_DONE, Ordering::Release);
 }
@@ -834,7 +1126,8 @@ fn rung3_run(bar0: usize, head: usize, n: u64) {
 /// [`rung3_run`] re-arms on the next vblank, so the window still measures many deliveries.
 ///
 /// [`IRQ_STORM_CAP`] is the second floor: if the disarm turns out NOT to deassert a level-triggered
-/// INTx, the handler cuts PDISPLAY at PMC bit 26 and the boot survives with a printed result.
+/// INTx, the handler writes `INTR_ENABLE_HOST` back to its captured entry (0 on this driver), which
+/// holds the output line off (`pmc.rst:346-347`), and the boot survives with a printed result.
 extern "x86-interrupt" fn kepler_vblank_isr(_f: x86_64::structures::idt::InterruptStackFrame) {
     let n = IRQ_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     let bar0 = VB_BAR0.load(Ordering::Acquire);
@@ -868,7 +1161,7 @@ extern "x86-interrupt" fn kepler_vblank_isr(_f: x86_64::structures::idt::Interru
 pub fn counter() -> Option<u64> {
     match SIM_MODE.load(Ordering::Relaxed) {
         0 => {
-            if VB_HEAD1.load(Ordering::Acquire) == 0 || VB_COUNT.load(Ordering::Relaxed) < 2 {
+            if VB_HEAD1.load(Ordering::Acquire) == 0 || LIVE.count.load(Ordering::Relaxed) < 2 {
                 None
             } else {
                 // KVBLANK2 — THE UNION OF THE TWO SOURCES, and it is a union rather than a switch
@@ -879,7 +1172,7 @@ pub fn counter() -> Option<u64> {
                 // (`hold` runs IRQ-masked — see §R2b), and every wide-zone present would have
                 // regressed to the give-up budget. The sum can only ever shorten a wait.
                 Some(
-                    VB_COUNT.load(Ordering::Relaxed)
+                    LIVE.count.load(Ordering::Relaxed)
                         .wrapping_add(IRQ_COUNT.load(Ordering::Relaxed)),
                 )
             }
@@ -1047,4 +1340,163 @@ pub fn selftest_once() {
     VB_WAIT_US.store(0, Ordering::Relaxed);
     VB_WAIT_GAVEUP.store(0, Ordering::Relaxed);
     VB_WAIT_RECHECK.store(0, Ordering::Relaxed);
+
+    selftest_deliver();
+    selftest_period();
+}
+
+/// KVBLANK3 M2's fixture — **the vector, and the verdict, on a machine with no Kepler.**
+///
+/// (1) THE VECTOR: [`ensure_vector`] allocates `kepler-vblank` through B168's allocator, which prints
+/// `[vectors] alloc name=kepler-vblank` and re-prints the census with the new row in `table=`; the
+/// fixture then asks the allocator back by NAME (`vectors::of`) and requires the same number. A
+/// second call must return the SAME vector without a second allocation (the reuse §R3 depends on).
+///
+/// (2) THE VERDICT: [`classify`] — the function §R3's close line calls — over one case per link in
+/// the chain plus **flight 12's own words** (`wire=1`, `pmc-arm … en_armed=00000000`, `intr_or=00000000`),
+/// which must read `pmc-enable-not-latched`: the reason flight 12 would have printed had the verdict
+/// existed. `cmd=0006` there is `kepler.rs:1310`'s bus-master grant; flight 12 did not print the word.
+///
+/// What this does NOT prove, and cannot here: that the GK107 raises the line or that an MSI arrives —
+/// q35 has no Kepler, §R3 never runs in QEMU, and those are the flight-13 lines.
+fn selftest_deliver() {
+    let pd = 1u32 << PMC_INTR_BIT_PDISPLAY;
+    let v1 = ensure_vector();
+    let v2 = ensure_vector();
+    let by_name = crate::arch::interrupts::vectors::of("kepler-vblank");
+    let vec_ok = v1.is_some() && v1 == v2 && v1 == by_name;
+    let base = DeliverIn { irq: 0, wire: 1, cmd: 0x0006, en_armed: 1, mask_armed: pd, intr_or: pd, line_or: 1 };
+    let cases: [(DeliverIn, &str, &str); 11] = [
+        (DeliverIn { irq: 60, ..base }, "msi", "none"),
+        (DeliverIn { irq: 7, wire: 2, ..base }, "intx", "none"),
+        (DeliverIn { wire: 0, ..base }, "none", "no-msi-no-intx"),
+        (DeliverIn { cmd: 0x0002, ..base }, "none", "no-bus-master"),
+        (DeliverIn { wire: 2, cmd: 0x0406, ..base }, "none", "intx-disabled-in-command"),
+        (DeliverIn { en_armed: 0, ..base }, "none", "pmc-enable-not-latched"),
+        (DeliverIn { mask_armed: 0, ..base }, "none", "pmc-mask-not-latched"),
+        (DeliverIn { intr_or: 0, ..base }, "none", "pdisplay-not-raised"),
+        (DeliverIn { line_or: 0, ..base }, "none", "line-not-asserted"),
+        (base, "none", "line-asserted-not-delivered"),
+        // FLIGHT 12, replayed from its own wire: MSI programmed, 0x140 read back 0 after the bit-26
+        // write, INTR_0 never moved, 0x640 never touched (so 0), the line never read.
+        (DeliverIn { irq: 0, wire: 1, cmd: 0x0006, en_armed: 0, mask_armed: 0, intr_or: 0, line_or: 0 }, "none", "pmc-enable-not-latched"),
+    ];
+    let mut ok = 0usize;
+    for (inp, want_d, want_r) in cases.iter() {
+        let (d, r) = classify(*inp);
+        if d == *want_d && r == *want_r {
+            ok += 1;
+        } else {
+            serial_println!(
+                ":: kepler: vblank selftest arm=deliver case-miss want={}/{} got={}/{} ::",
+                want_d, want_r, d, r,
+            );
+        }
+    }
+    let (_, f12) = classify(cases[10].0);
+    let pass = vec_ok && ok == cases.len();
+    serial_println!(
+        ":: kepler: vblank selftest arm=deliver cases={} ok={} flight12={} vector={:#04x} again={:#04x} of={:#04x} :: {} ::",
+        cases.len(), ok, f12,
+        v1.map(|v| v as u32).unwrap_or(0x100), v2.map(|v| v as u32).unwrap_or(0x100),
+        by_name.map(|v| v as u32).unwrap_or(0x100),
+        if pass { "PASS" } else { "FAIL" },
+    );
+}
+
+/// KVBLANK3 M3's fixture — **the period, from a simulated timer, sampled the way flight 12 sampled.**
+///
+/// A synthetic raster: vblank `k` at `t = k * FRAME_US` (16 667 us), the count field starting at
+/// 65 530 so it WRAPS its 16 bits within the first six frames. It is sampled in HOLD EPISODES — a
+/// 2 ms burst every 10 us, the shape of `beam::hold`'s spin — separated by gaps of 26-61 ms (the
+/// presents flight 12 made at 19.6-23.4/s) and ONE gap of 23.606 s (flight 12's
+/// `jitter_us=23605994`). The samples are handed to [`fold`] — the function [`note`] runs on the
+/// metal — against [`SIM_ACC`], with the timestamps in TSC cycles, so the tight-bracket threshold is
+/// the real one.
+///
+/// * **PASS** when `count=` equals the vblanks that actually elapsed, `period_us` is 16 667 +/- 2,
+///   `jitter_us < 2000`, at least two edges were tight, and `seen < count` (the schedule DID miss
+///   vblanks, so the case exercises the defect rather than stepping around it). `old_period_us=` is
+///   the pre-KVBLANK3 arithmetic over the SAME samples, printed for comparison and not scored.
+/// * **GO-RED** — a count that NEVER steps (the field frozen, `vline` still moving) must read
+///   `period_src=none` and `verdict=GAVEUP`, never a period.
+///
+/// Pure arithmetic with synthetic time: no MMIO, no waiting. It does not prove that the GK107's field
+/// is a live count. The flight-13 line (`count=` beside `seen=`) is what proves that.
+fn selftest_period() {
+    const H_US: u64 = 2_000;
+    const S_US: u64 = 10;
+    const EPISODES: u64 = 240;
+    const LONG_AT: u64 = 7;
+    const LONG_US: u64 = 23_606_000;
+    const GAPS_US: [u64; 6] = [38_241, 50_113, 43_007, 26_011, 61_009, 33_333];
+    const ORIGIN: u64 = 65_530;
+    let f = crate::video::beam::FRAME_US;
+    let base = 1_000u64; // cycles; nonzero so `sample_cyc == 0` still means "no sample yet"
+    let word = |t_us: u64, stuck: bool| -> u32 {
+        let frames = if stuck { 0x1234 } else { ORIGIN + t_us / f };
+        let vline = ((t_us % f) * 1852 / f) as u32;
+        (((frames & 0xFFFF) as u32) << 16) | vline
+    };
+    let run = |stuck: bool, episodes: u64| -> (u64, u64) {
+        let mut t = 5_000u64;
+        let (t_first, mut t_last) = (t, t);
+        for e in 0..episodes {
+            let end = t + H_US;
+            while t < end {
+                let _ = fold(&SIM_ACC, word(t, stuck), base + us_to_cycles(t));
+                t_last = t;
+                t += S_US;
+            }
+            t += if e == LONG_AT { LONG_US } else { GAPS_US[(e % 6) as usize] };
+        }
+        (t_first, t_last)
+    };
+
+    // ── PASS half — a stepping count ──
+    sim_acc_reset();
+    let (t0, t1) = run(false, EPISODES);
+    let expect = t1 / f - t0 / f;
+    let count = SIM_ACC.count.load(Ordering::Relaxed);
+    let seen = SIM_ACC.seen.load(Ordering::Relaxed);
+    let tight = SIM_ACC.tight.load(Ordering::Relaxed);
+    let (p_cyc, j_cyc, src) = SIM_ACC.period();
+    let (period_us, jitter_us) = (cycles_to_us(p_cyc), cycles_to_us(j_cyc));
+    let old_us = cycles_to_us(SIM_ACC.old_period());
+    let pass = count == expect
+        && period_us + 2 >= f
+        && period_us <= f + 2
+        && jitter_us < 2_000
+        && tight >= 2
+        && seen < count;
+    serial_println!(
+        ":: kepler: vblank selftest arm=period sim=timer period_us={} episodes={} hold_us={} gaps_us=26011..61009+{} count={} expect={} seen={} tight={} period_src={} got_period_us={} jitter_us={} old_period_us={} :: {} ::",
+        f, EPISODES, H_US, LONG_US, count, expect, seen, tight, src, period_us, jitter_us, old_us,
+        if pass { "PASS" } else { "FAIL" },
+    );
+
+    // ── GO-RED half — a count that never steps ──
+    sim_acc_reset();
+    let _ = run(true, 20);
+    let (_, _, src2) = SIM_ACC.period();
+    let count2 = SIM_ACC.count.load(Ordering::Relaxed);
+    let seen2 = SIM_ACC.seen.load(Ordering::Relaxed);
+    let gaveup = src2 == "none" && count2 == 0 && seen2 == 0;
+    serial_println!(
+        ":: kepler: vblank selftest arm=period sim=stuck count={} seen={} period_src={} verdict={} :: {} ::",
+        count2, seen2, src2, if gaveup { "GAVEUP" } else { "PERIOD" },
+        if gaveup { "GO-RED-OK" } else { "GO-RED-FAILED" },
+    );
+    sim_acc_reset();
+}
+
+/// Zero [`SIM_ACC`] between the fixture's two halves.
+fn sim_acc_reset() {
+    let a = &SIM_ACC;
+    for w in [&a.count, &a.seen, &a.sample_cyc, &a.loose_cyc, &a.loose_n, &a.last_cyc, &a.first_cyc,
+              &a.first_n, &a.tight_cyc, &a.tight_n, &a.tight, &a.pmax] {
+        w.store(0, Ordering::Relaxed);
+    }
+    a.pmin.store(u64::MAX, Ordering::Relaxed);
+    a.last.store(0, Ordering::Relaxed);
 }

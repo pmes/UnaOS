@@ -35,6 +35,8 @@ the first kernel line was not captured (the FTDI is kernel TX only).
 ## KVBLANK2 (B179) first metal reading
 `:: kepler: vblank bdf-hunt … found=1 bdf=1:0.0`; `pmc-arm … deliver=none reason=no-vector-helper`; `vblank arm head=0 vt=1852 mode=poll src=HEAD_STAT.VERT[31:16]`; selftests PASS and GO-RED-OK; then `vblank head=0 count=15 period_us=127022 jitter_us=1214654` at 8319 ms and `count=10430 period_us=38241 jitter_us=23605994 … mode=poll vbwaits=316 vbwait_us=3689731 vbgaveup=0` at 405 s. The interrupt path did not arm (no vector helper); the poll path ran; the period is 38 ms, not 16.7 — a 26 Hz vblank count on a 60 Hz panel.
 
+**Correction (KVBLANK3, rmbp-ledger B192, 2026-09-23; the paragraph above is left as written).** The same capture refutes "the interrupt path did not arm". `reason=no-vector-helper` is a literal on KVBLANK's rung-1 line, printed at 6147 ms before the KVBLANK2 ladder ran. At 38983 ms the ladder allocated `[vectors] alloc name=kepler-vblank vector=0x44` (the table row `kepler-vblank:0x44` is on the wire), programmed MSI (`[MSI] Enabled on 1:0.0: cap@0x68 … MsgCtl=0x0081`), and closed at 41000 ms with `irq=0 vbl_delta=60 … mode=poll`. It delivered nothing because bit 26 was written to `0x140 INTR_ENABLE_HOST`, which has no bit 26 (the rung-1 line's `en_armed=00000000`). The 26 Hz is the compositor's sampling-episode rate, not a vblank rate. Both findings are in `docs/dev/OS/08_VIDEO/KEPLER-METAL-LOG.md` §FLIGHT 12 READING.
+
 ## Decisions taken from this flight
 R63: boot 13 boots to the root desktop; `adduser` from the session; Log Out returns the login screen over nothing. Two executors named (LOGIN13, MOUSEHALT) — Peter's go pending at the time of this record.
 
