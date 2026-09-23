@@ -821,6 +821,31 @@ before it starts. Both still hold; the gate simply asks the right thing now.
   becomes an expression compared with itself — the exact defect FATVERB's own note records the first
   cut of that witness making.
 
+* **WRITEGATE2 (2026-09-22) made `fatverb.writegate` ask THE VOLUME IT WRITES, and R59 is what
+  exposed it — the readvol correction above, run again one leg down.** The leg sampled its veto from
+  `fat::mount_program_source()` and then fired the REAL write verb, `fs_rm`, which routes through
+  `vfs_write_open` and is therefore gated on THIS SECTION'S FIRST BULLET: the veto of the volume the
+  PATH resolves to, which on the fixture is ROOT, the disk `fs::bootdisk` finds BY CONTENT. Those
+  are two volumes exactly when the two producers above disagree, and on the AHCI-install lane they
+  do — root is the ESP on the SATA rung (`BlockSource::Ahci` -> `AHCI_VETO`) while the program
+  source answers with the global/SDHC handle. Before R59 (rmbp-ledger B166, SDHCRW) made the SD card
+  READ-WRITE by default the two happened to agree, both read-only, and the leg passed BY
+  COINCIDENCE; R59 turned the program source's answer into `None`, the coincidence broke, and the
+  gate10 capture read `:: TSTE: fatverb.writegate -> FAIL (got gate_ran=true gate=refused-ro
+  veto=none …) ::` on an image that was behaving correctly in every respect. **The rule is: THE
+  VOLUME WRITTEN IS THE VOLUME ASKED.** The leg now takes ONE sample of `fs::bootdisk::locate()` —
+  `Found::source`, so the handle it prints and the veto it compares cannot drift apart — and holds
+  the gate to `BlockSource::write_veto` on that source. It is NOT weakened to "any gate answer
+  passes": a READ-ONLY root must be `refused-ro`, a WRITABLE root `admitted` or `declined`, and
+  `gate_ran` is unchanged. Both vetos stay on the wire, the readvol way, on a line of their own:
+  `:: [fatverb] writegate census: root=<h> veto_same=<b> gate=<g> gate_ran=<b> veto_src=<…>
+  veto_root=<…> handles=… ::`, so `veto_same=false` on the AHCI fixture is a measured fact about the
+  machine rather than a red. Three lanes, each once under `UNAOS_QEMU_FULL=1`, all `mode=full
+  completion=complete`: AHCI-install `root=ahci veto_same=false gate=refused-ro -> PASS`, beside the
+  verb's own `:: [fatverb] rm -> REFUSED READ-ONLY (volume=boot path=/$FATVERB.$$$ …) ::`; default
+  `root=global veto_same=true gate=admitted -> PASS`, with no `rm` refusal line at all; `test-fat
+  sf`, whose root IS the writable medium, `root=global veto_same=true gate=admitted -> PASS`.
+
 #### 13.4a STORWAIT — the storage wait waits for THE BOOT MEDIUM, not for any disk (2026-09-15)
 
 `fatverb_storage_witness` owns the one bounded wait on x86, and `x86bind_witness(settled=true)` is
