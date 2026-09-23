@@ -69,8 +69,8 @@ fn main() {
     if std::env::var("UNAOS_USBDEBUG").is_ok() { feats.push("usbdebug"); }
     // Wellspring raw-multitouch capture/decode (drivers/ehci §10g): the arroyo knob must survive
     // the builder's own feature derivation or the QEMU self-test never compiles in.
-    if std::env::var("UNAOS_MTRAW_INJECT").is_ok() { feats.push("mtraw_inject"); }
-    else if std::env::var("UNAOS_MTRAW").is_ok() { feats.push("mtraw"); }
+    // TPFRAME (B197): `UNAOS_MTRAW_INJECT` is retired — its injection is the default route now.
+    if std::env::var("UNAOS_MTRAW").is_ok() { feats.push("mtraw"); }
     if std::env::var("UNAOS_SCHED_DEMO").is_ok() { feats.push("sched_demo"); }
     // UNAOS_IRQSTORAGE=1 routes x86 storage syscalls through the interrupt-driven storage service task
     // (STOR-1) instead of the staged-buffer path. x86_64 only; a no-op on the aarch64 media the arroyo
