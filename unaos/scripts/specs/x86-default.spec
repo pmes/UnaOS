@@ -367,3 +367,24 @@ REQUIRE :: EHCI-HID: PASSPERIOD self-test: samples=\d+ backwards-delta-refused=t
 FORBID :: EHCI-HID: ISRARM self-test: .* -> FAIL
 FORBID :: EHCI-HID: ISRARM self-test SKIPPED
 FORBID :: EHCI-HID: PASSPERIOD self-test: .* -> FAIL
+
+# ── IOAPIC2 (2026-09-23, rmbp-ledger B191), TAIL-APPENDED past SPECPINS2 ──────────────────────────
+# THE ISRARM DECISION NAMES ITS REASON, AND THE STALE SENTENCE IS GONE. Flight 12 (`f12-boot1.log`,
+# 5833 ms) printed `[ioapic] route bdf=0:29.0 pin=INTA line=0 -> REFUSED reason=no-firmware-line`
+# and, the SAME millisecond, `ISRARM REFUSED — this function offers no usable MSI capability, and
+# there is no IOAPIC in this kernel to route INTx to` — on an image whose I/O APIC census had just
+# printed `ioapics=1 … gsis=24`. The EHCI refusal was a FIXED STRING written before the I/O APIC
+# existed. It is now composed from `arch::x86_64::ioapic_route_intx_why`'s `Err(reason)`, which is
+# the token the route's own `[ioapic]` line printed (knob-off: `no-ioapic-in-kernel`, the one case
+# where the old sentence was true), and the armed line names the LIVE path (`via=msi addr=…` or
+# `via=ioapic-intx gsi=<n>`) instead of reading "MSI vector" on both.
+#
+# KNOB-NEUTRAL BY CONSTRUCTION, because this file is replayed by every default-medium
+# `./arroyo test`, with or without `UNAOS_IOAPIC`: the REQUIRE accepts either arm of the decision
+# and requires only that the arm be STATED (a path, or a refusal with a reason token) — it certifies
+# the decision's wording, not a limitation (LAWS §5, "Require a PROPERTY"). Measured: knob-off lane
+# (the harness usb-ehci offers no MSI capability) prints `REFUSED reason=no-ioapic-in-kernel`; the
+# `UNAOS_IOAPIC=1` lane prints `armed via=ioapic-intx gsi=<n>`.
+REQUIRE :: EHCI-HID: \[\d+\] ISRARM (armed via=(msi addr=0x[0-9a-f]+|ioapic-intx gsi=\d+) vector 0x[0-9a-f]+,|REFUSED reason=[a-z0-9-]+ )
+# The sentence flight 12 printed beside a live I/O APIC. Neither polarity may print it again.
+FORBID there is no IOAPIC in this kernel to route INTx to

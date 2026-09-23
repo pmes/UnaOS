@@ -547,13 +547,20 @@ pub fn routed() -> u32 {
 /// Line and push it through the Interrupt Source Override table (identity when no override names
 /// it). On a machine whose firmware left Interrupt Line unprogrammed the honest answer is REFUSED
 /// — `reason=no-firmware-line`, printed — and the caller keeps polling exactly as it did before.
-/// See docs/dev/OS/01_BOOT_HAL/ioapic.md §4.
+/// The refusal token is RETURNED as well as printed (IOAPIC2, rmbp-ledger B191), so the caller's
+/// own refusal line can name it instead of guessing: flight 12's ISRARM line said "there is no
+/// IOAPIC in this kernel" beside `[ioapic] route … REFUSED reason=no-firmware-line` in the same
+/// millisecond. See docs/dev/OS/01_BOOT_HAL/ioapic.md §4.
 ///
 /// THE DEFAULT POLARITY AND TRIGGER ARE PCI'S, NOT ISA'S: INTx is LEVEL TRIGGERED and ACTIVE LOW
 /// (PCI 3.0 §2.2.6). An override naming this line wins over that default, because an override is
 /// firmware telling us about this specific line; an override whose flags say `bus-default` leaves
 /// the PCI default in place, which is what `BusDefault` being its own value buys.
-pub fn route_pci_intx(bus: u8, dev: u8, func: u8) -> Option<(u32, Polarity, Trigger)> {
+pub fn route_pci_intx(
+    bus: u8,
+    dev: u8,
+    func: u8,
+) -> Result<(u32, Polarity, Trigger), &'static str> {
     let intr = unsafe { crate::arch::pci::read_config_32(bus, dev, func, 0x3C) };
     let line = (intr & 0xFF) as u8;
     let pin = ((intr >> 8) & 0xFF) as u8;
@@ -564,14 +571,15 @@ pub fn route_pci_intx(bus: u8, dev: u8, func: u8) -> Option<(u32, Polarity, Trig
             "[ioapic] route bdf={}:{}.{} pin=INT{} line={} -> REFUSED reason=no-intx-pin — this function declares no INTx pin, so there is no legacy assertion to route and nothing was written == witness ::",
             bus, dev, func, pin_name, line
         );
-        return None;
+        return Err("no-intx-pin");
     }
+
     if line == 0 || line == 0xFF {
         serial_println!(
             "[ioapic] route bdf={}:{}.{} pin=INT{} line={} -> REFUSED reason=no-firmware-line — firmware programmed no IRQ for this function and this rung does not interpret the DSDT _PRT, so the GSI is UNKNOWN rather than guessed; nothing was written == witness ::",
             bus, dev, func, pin_name, line
         );
-        return None;
+        return Err("no-firmware-line");
     }
 
     let (mut gsi, mut pol, mut trig) = (line as u32, Polarity::ActiveLow, Trigger::Level);
@@ -598,14 +606,16 @@ pub fn route_pci_intx(bus: u8, dev: u8, func: u8) -> Option<(u32, Polarity, Trig
         "[ioapic] route bdf={}:{}.{} pin=INT{} line={} -> gsi={} via={} polarity={} trigger={} == witness ::",
         bus, dev, func, pin_name, line, gsi, via, pol.as_str(), trig.as_str()
     );
-    Some((gsi, pol, trig))
+    Ok((gsi, pol, trig))
 }
 
 // ── RUNG 3: THE PCI ARM ────────────────────────────────────────────────────────────────────────
 
-/// Route this PCI function's INTx to `vector` and unmask it. `true` means an interrupt that was
-/// previously UNDELIVERABLE now has somewhere to go; `false` means nothing was changed and the
-/// caller must keep whatever fallback it had.
+/// Route this PCI function's INTx to `vector` and unmask it. `Ok(gsi)` means an interrupt that was
+/// previously UNDELIVERABLE now has somewhere to go, and names the I/O APIC input it went to;
+/// `Err(reason)` means nothing was changed, the caller must keep whatever fallback it had, and
+/// `reason` is the exact token the refusal line above it printed — so a caller's own refusal can
+/// say WHY (IOAPIC2, rmbp-ledger B191) instead of carrying a fixed sentence that goes stale.
 ///
 /// **THE ORDER IS THE ARGUMENT.** The redirection entry is programmed MASKED; the function's PCI
 /// Interrupt Disable bit (COMMAND bit 10, PCI 3.0 §6.2.2) is cleared so INTA# can assert at all;
@@ -624,11 +634,9 @@ pub fn route_pci_intx(bus: u8, dev: u8, func: u8) -> Option<(u32, Polarity, Trig
 /// this kernel runs on (Intel SDM Vol. 3 §10.8.5; 82093AA §3.2.4), and every handler in
 /// `interrupts.rs` already writes the local-APIC EOI register last. So the handler side needed no
 /// change and got none.
-pub fn route_pci_function(bus: u8, dev: u8, func: u8, vector: u8) -> bool {
-    let (gsi, pol, trig) = match route_pci_intx(bus, dev, func) {
-        Some(v) => v,
-        None => return false, // route_pci_intx has already printed the reason
-    };
+pub fn route_pci_function(bus: u8, dev: u8, func: u8, vector: u8) -> Result<u32, &'static str> {
+    // route_pci_intx has already printed the reason on its Err arm.
+    let (gsi, pol, trig) = route_pci_intx(bus, dev, func)?;
     let dest = crate::arch::apic::apic_id();
 
     let entry = match route_gsi(gsi, vector, pol, trig, dest) {
@@ -638,7 +646,7 @@ pub fn route_pci_function(bus: u8, dev: u8, func: u8, vector: u8) -> bool {
                 "[ioapic] route bdf={}:{}.{} gsi={} vector={:#04x} -> REFUSED reason={} — the redirection entry was not programmed and nothing on this function changed == witness ::",
                 bus, dev, func, gsi, vector, e.as_str()
             );
-            return false;
+            return Err(e.as_str());
         }
     };
 
@@ -655,15 +663,23 @@ pub fn route_pci_function(bus: u8, dev: u8, func: u8, vector: u8) -> bool {
                 "[ioapic] route bdf={}:{}.{} gsi={} -> REFUSED reason=unmask-{} — the entry is programmed but still MASKED, so the vector could never fire == witness ::",
                 bus, dev, func, gsi, e.as_str()
             );
-            return false;
+            return Err(match e {
+                RouteErr::NoController => "unmask-no-controller-owns-this-gsi",
+                RouteErr::Unreadable => "unmask-controller-unreadable",
+                RouteErr::Readback => "unmask-entry-readback-mismatch",
+            });
         }
     };
 
+    // `masked=` is DERIVED from the read-back (bit 16 of `unmasked_lo`), never restated from the
+    // call that asked for the unmask — the legible field and the sound one are the same field.
     serial_println!(
-        "[ioapic] armed bdf={}:{}.{} gsi={} vector={:#04x} dest_apic={} entry={:#018x} unmasked_lo={:#010x} intx_disable={} routed={} == witness ::",
-        bus, dev, func, gsi, vector, dest, entry, unmasked,
+        "[ioapic] armed bdf={}:{}.{} gsi={} vector={:#04x} masked={} dest_apic={} entry={:#018x} unmasked_lo={:#010x} intx_disable={} routed={} == witness ::",
+        bus, dev, func, gsi, vector,
+        unmasked & MASK != 0,
+        dest, entry, unmasked,
         (cmd_back >> 10) & 1,
         routed()
     );
-    true
+    Ok(gsi)
 }
