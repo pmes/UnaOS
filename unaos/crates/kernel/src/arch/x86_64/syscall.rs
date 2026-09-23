@@ -7310,7 +7310,7 @@ pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event { #[cfg(featu
     // ⚠ LINE-NEUTRAL fold (four comment lines in, four out): this file is x86-only so `kernel8.img`'s panic-`Location` proof is untouched either way, but the idiom is the tree's and is kept.
     // QUARRYDOOR (KEYDOORS F1) — `|| quarry::key_route(raw)`: on x86 the file manager had NO KEY DOOR AT ALL. `video/mod.rs:685` compiles `quarry` under `wc` on this arch too, but `wc_route_event` never asked it and neither does `user_input_enqueue` here (x86's ring door has no key interception — this wrapper IS x86's interception), so <Esc>, the arrows, <Enter>, Backspace, `r` and the wheel had ZERO reachable consumers on this board. Asked in the SAME position as the two aarch64 doors: after `strip::key_escape` (a menu composites above Quarry, so the modal surface wins) and ahead of `wc_focus_key` (an open file manager eats its own arrows before the focus ring). `key_route` gates on `focus_asid() == OWNER && on_glass()` since SO9FIX 63b109f6 (was `on_glass()` alone — SO9), so a closed Quarry consumes nothing and this is behaviour-alike on every boot without one. Folded into the existing condition — no line added, the idiom this block already states.
     #[cfg(feature = "wc")]
-    if crate::video::strip::key_escape(raw) || crate::video::quarry::key_route(raw) {
+    if crate::video::strip::key_escape(raw) || crate::video::quarry::key_route(raw) || wc_action_quarry_held(raw) {
         return crate::pal::Event::Unknown;
     }
     if wc_focus_key(raw) {
@@ -29300,5 +29300,33 @@ fn stor2_mv_launcher(demo_cpu: usize) {
             entries_gone, replayed,
             rc[0], rc[1], rc[2], rc[3], rc[4], rc[5], rc[6], rc[7], rc[8], rc[9], rc[10]
         );
+    }
+}
+
+/// TERMSEL2 M3 (tail-appended, so no `panic::Location` above it moves) — an ACTION pressed while Quarry holds the keyboard is not the shell's. Quarry takes
+/// its keys at `quarry::key_route` (arrows, Enter, Backspace), but it has no action consumer, so the
+/// `Event::Action` a decoder pushes beside a key fell through to the render service's `Event::Action`
+/// arm and acted on the SHELL — harmless while the only actions were chords, and not once the bare
+/// arrows became `CursorLeft`/`CursorRight`: every arrow that moves Quarry's selection would also
+/// move the shell's caret out of sight. Same focus test `key_route` makes (`wm::focus_asid() ==
+/// quarry::OWNER`, the window open); dropped on the wire, never silently.
+#[cfg(feature = "wc")]
+fn wc_action_quarry_held(raw: crate::pal::Event) -> bool {
+    let crate::pal::Event::Action(a) = raw else {
+        return false;
+    };
+    // Knob-off there is no Quarry (`quarry::OWNER` is compiled only with it) and nothing to hold.
+    #[cfg(not(feature = "quarry"))]
+    {
+        let _ = a;
+        false
+    }
+    #[cfg(feature = "quarry")]
+    {
+        if !(crate::video::quarry::is_open() && crate::video::wm::focus_asid() == crate::video::quarry::OWNER) {
+            return false;
+        }
+        serial_println!("[termsel] action={} -> dropped (Quarry holds the keyboard)", a.name());
+        true
     }
 }

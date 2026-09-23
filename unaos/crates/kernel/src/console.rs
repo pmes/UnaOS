@@ -256,8 +256,16 @@ impl Console {
             pal.draw_text(band_x, prompt_y, self.current_input.get(lo..hi).unwrap_or(""), Self::BG);
         }
 
-        let cursor_x = input_x + m.text_w(self.current_input.len());
-        pal.draw_rect(cursor_x, prompt_y, m.cell_w, m.cell_h, 0xFFFFFF); // exactly one cell
+        // TERMSEL2 M3 — the CARET: a Mac-style insertion BAR at the caret's cell boundary, one font
+        // stroke wide (`m.scale` px — the glyphs' own stroke at every scale) and one cell tall, in the
+        // theme's selection/focus accent. It replaces TERMSEL's block, which stood one cell PAST the
+        // text and so was a cell of the row model that held no character; the bar sits ON a
+        // boundary and occupies none, so the row's cells are exactly its characters. Hidden while
+        // this line shows a band, as a Mac text field hides its insertion point over a selection.
+        if self.sel.cols_on(crate::video::termsel::EDIT_ROW, len, len).is_none() {
+            let cursor_x = input_x + m.text_w(self.sel.caret_col(len));
+            pal.draw_rect(cursor_x, prompt_y, m.scale.max(1), m.cell_h, crate::video::theme::ACCENT);
+        }
     }
 
     pub fn draw(&self, pal: &mut TargetPal) {

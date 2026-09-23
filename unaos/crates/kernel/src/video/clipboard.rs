@@ -337,6 +337,7 @@ pub fn terminal_action_in(
                 if set(&line.as_bytes()[lo..hi]) {
                     sel.take(line.len());
                     line.replace_range(lo..hi, "");
+                    sel.set_caret(lo, line.len()); // TERMSEL2 M3: the caret closes the gap the cut left
                     serial_println!("[clip] cut unit=selection len={}", hi - lo);
                     LineSel::witness_cleared(line.len(), "cut");
                     ("ok", 1)
@@ -364,6 +365,10 @@ pub fn terminal_action_in(
         // Not this consumer's business: the capture actions are delivered and acted on at the
         // decoder (`Action::is_capture`), and `LogOut` is KEYMAP's slot, bound by nobody.
         Action::Screenshot | Action::ScreenshotRegion | Action::LogOut => ("ignored", 0),
+        // TERMSEL2 M3 — the caret (`LineSel::caret_action`).
+        Action::CursorLeft | Action::CursorRight | Action::CursorLineStart | Action::CursorLineEnd => {
+            ("ok", sel.caret_action(act, line.len()))
+        }
     }
 }
 
@@ -388,6 +393,10 @@ pub const fn action_code(a: Action) -> u64 {
         Action::SelectLineStart => 10,
         Action::SelectLineEnd => 11,
         Action::Deselect => 12,
+        Action::CursorLeft => 13,
+        Action::CursorRight => 14,
+        Action::CursorLineStart => 15,
+        Action::CursorLineEnd => 16,
     }
 }
 

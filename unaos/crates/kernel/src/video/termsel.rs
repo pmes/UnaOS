@@ -313,7 +313,7 @@ impl LineSel {
 
     /// Put the caret at boundary `pos` of a line of `len` cells; at or past the end it FOLLOWS the
     /// end ([`CARET_END`]), so typing at the end of the line keeps it there.
-    fn set_caret(&mut self, pos: usize, len: usize) {
+    pub fn set_caret(&mut self, pos: usize, len: usize) {
         self.caret = if pos >= len { CARET_END } else { pos };
     }
 
@@ -362,6 +362,9 @@ impl LineSel {
                             self.anchor = ws;
                             self.head = we;
                             self.live = true;
+                            if row == EDIT_ROW {
+                                self.set_caret(we, len);
+                            }
                         }
                         None => self.live = false,
                     }
@@ -374,11 +377,21 @@ impl LineSel {
                 self.head_row = row;
                 self.anchor = col;
                 self.head = col;
-                if self.note(before, len, "click") {
-                    2
-                } else {
-                    0
+                let mut code = if self.note(before, len, "click") { 2 } else { 0 };
+                // M3 — a click on the editable line puts the CARET under the pointer (a Mac text
+                // field's click); a click in the scrollback leaves it where it was.
+                if row == EDIT_ROW {
+                    let k = self.caret_col(len);
+                    let to = core::cmp::min(col, len);
+                    self.set_caret(to, len);
+                    if to != k {
+                        serial_println!("[termsel] cursor col={} by=click", to);
+                        if code == 0 {
+                            code = 1;
+                        }
+                    }
                 }
+                code
             }
             PressKind::Drag => {
                 if !self.ptr.held || self.ptr.word || cell == self.ptr.drag {
@@ -410,8 +423,112 @@ impl LineSel {
                 }
                 self.ptr.held = false;
                 serial_println!("[termsel] press cell=({},{}) kind=up", col, RowFmt(row));
+                // M3 — a drag that ended on the editable line leaves the caret at its HEAD, where a
+                // following `Shift+←/→` continues from (TERMSEL's `apply` rides the head too).
+                if !self.ptr.word && self.range(len).is_some() {
+                    self.set_caret(self.head, len);
+                }
                 0
             }
+        }
+    }
+
+    /// TERMSEL2 M3 — the CARET actions (`←`, `→`, `⌘←`/`Home`, `⌘→`/`End`, rows in the theme's
+    /// table). With a selection on the editable line, `←` goes to its start and `→` to its end, as a
+    /// Mac text field does; otherwise one cell, or the line end. ANY live selection is dropped —
+    /// witnessed by the model's one `[termsel]` line with `by=<action>` — and the caret, when it
+    /// moved, prints `[termsel] cursor col=<n> by=<action>`. Returns the repaint owed (2 when the
+    /// dropped selection had a band in the scrollback).
+    ///
+    /// Where they DIVERGE from TERMSEL's selection actions of the same keys: `SelectLineStart` and
+    /// `CursorLineStart` both go to cell 0 and `SelectLeft`/`CursorLeft` both move one cell — the same
+    /// motion — but a selection action moves the HEAD and keeps the anchor, and a caret action
+    /// collapses the selection first. `←` with a selection is not "one cell left of the head": it is
+    /// the selection's start, which is the Mac's rule and not a motion of the head at all.
+    pub fn caret_action(&mut self, act: Action, len: usize) -> u8 {
+        let before = self.span(len);
+        let scroll = self.touches_scrollback(len);
+        let edit_sel = self.range(len);
+        let k = self.caret_col(len);
+        let to = match (act, edit_sel) {
+            (Action::CursorLeft, Some((lo, _))) => lo,
+            (Action::CursorRight, Some((_, hi))) => hi,
+            (Action::CursorLeft, None) => k.saturating_sub(1),
+            (Action::CursorRight, None) => core::cmp::min(k + 1, len),
+            (Action::CursorLineStart, _) => 0,
+            (Action::CursorLineEnd, _) => len,
+            _ => return 0,
+        };
+        self.live = false;
+        let dropped = self.note(before, len, act.name());
+        self.set_caret(to, len);
+        let moved = to != k;
+        if moved {
+            serial_println!("[termsel] cursor col={} by={}", to, act.name());
+        }
+        if dropped && scroll {
+            2
+        } else if dropped || moved {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Is this one of the caret actions [`LineSel::caret_action`] acts on?
+    pub const fn is_caret_action(act: Action) -> bool {
+        matches!(
+            act,
+            Action::CursorLeft | Action::CursorRight | Action::CursorLineStart | Action::CursorLineEnd
+        )
+    }
+
+    /// TERMSEL2 M3 — THE LINE EDITOR'S EDITS, at the caret. `main::handle_key` calls this for a
+    /// printable byte and for BS/DEL (CR/LF still dispatch through [`LineSel::on_edit`]):
+    ///
+    ///  * with a selection ON THE EDITABLE LINE, a printable byte REPLACES it (the rule TERMSEL could
+    ///    not have without a caret) and BS/DEL deletes it — `[termsel] none … by=replace|delete`;
+    ///  * otherwise a live selection (one in the scrollback) is dropped by TERMSEL's edit rule
+    ///    (`by=edit`) and the byte edits at the caret: a printable byte is INSERTED there and BS/DEL
+    ///    deletes the byte BEFORE it.
+    ///
+    /// The caret moves with the edit and is not witnessed per keystroke (the edit is). Returns the
+    /// repaint owed: 1 the input line, 2 the whole terminal when a scrollback band was dropped, 0 for
+    /// a byte that edits nothing.
+    pub fn type_byte(&mut self, c: u8, line: &mut alloc::string::String) -> u8 {
+        let bs = c == 8 || c == 0x7F;
+        if !bs && !(c >= 32 && c <= 126) {
+            return 0;
+        }
+        let len = line.len();
+        let before = self.span(len);
+        if let Some((lo, hi)) = self.range(len) {
+            let mut b = [0u8; 4];
+            line.replace_range(lo..hi, if bs { "" } else { (c as char).encode_utf8(&mut b) });
+            self.live = false;
+            self.set_caret(if bs { lo } else { lo + 1 }, line.len());
+            self.note(before, line.len(), if bs { "delete" } else { "replace" });
+            return 1;
+        }
+        let full = before.is_some();
+        if full {
+            self.live = false;
+            self.note(before, len, "edit");
+        }
+        let k = self.caret_col(len);
+        if bs {
+            if k > 0 {
+                line.remove(k - 1);
+                self.set_caret(k - 1, line.len());
+            }
+        } else {
+            line.insert(k, c as char);
+            self.set_caret(k + 1, line.len());
+        }
+        if full {
+            2
+        } else {
+            1
         }
     }
 
@@ -855,7 +972,21 @@ const fn yn(v: bool) -> &'static str {
 ///    and `⌘C` copies exactly `select`.
 ///  * `into_edit` (0x400) — a press at (6,1) dragged to (4,e) selects from the scrollback INTO the
 ///    editable line; `⌘C` copies `delta\nunaos`.
-///  * `edit` (0x800) — a typed byte through the line editor's edit rule clears that selection.
+///  * `edit` (0x800) — a typed byte through the line editor (`LineSel::type_byte`, what
+///    `main::handle_key` calls) clears that selection, asks for a whole-terminal repaint, and is
+///    inserted at the caret (the line end, where the double-click's word left it).
+///
+/// M3 — THE CARET. Each chord is resolved through the LIVE table (`keymap::resolve_edge`) from a
+/// synthetic report pair and handed to the shipped consumer (`terminal_action_in`); the ring hop is
+/// NOT repeated here — this fixture runs after the input service is up, and an action pushed onto
+/// the ring now could be taken by the live render service — APPCLIP and TERMSEL prove that hop.
+///  * `click_caret` (0x1000) — a click on editable cell (3,e) puts the caret at 3.
+///  * `arrows` (0x2000) — `←` 2, `→` 3, `⌘←` 0, `⌘→` 12, `Home` 0, `End` 12.
+///  * `insert` (0x4000) — at caret 5, `X` makes `unaosX select`, caret 6.
+///  * `bs` (0x8000) — Backspace deletes before the caret: `unaos select`, caret 5.
+///  * `replace` (0x10000) — `⌘⇧→` selects `5..12`; `Z` REPLACES it: `unaosZ`, caret at the end.
+///  * `collapse` (0x20000) — `⌘A` then `←`: no selection, caret 0; `⌘A` then `→`: caret at the end.
+///  * `pc` (0x40000) — the PC table resolves `←`, `→`, `Home`, `End` to the same four actions.
 #[cfg(all(target_arch = "x86_64", feature = "witness"))]
 pub fn pointer_selftest() {
     use super::wm;
@@ -992,10 +1123,73 @@ pub fn pointer_selftest() {
         into_edit = con.sel.span(line_len) == Some(((1, 6), (EDIT_ROW, 5)))
             && con.act_for_fixture(Action::Copy) == ("ok", 0)
             && clip_is("delta\nunaos");
-        // edit — the line editor's edit rule drops it.
-        con.sel.on_edit(b'x', line_len);
-        edit = con.sel.span(line_len).is_none();
+        // edit — the line editor's edit drops it and types at the caret.
+        let r = con.sel.type_byte(b'x', &mut con.current_input);
+        edit = r == 2 && con.sel.span(con.current_input.len()).is_none() && con.current_input == "unaos selectx";
     }
+    // --- M3: the caret ---
+    let (mut click_caret, mut arrows, mut insert, mut bs, mut replace, mut collapse) =
+        (false, false, false, false, false, false);
+    if hit {
+        use crate::drivers::xhci::{HID_MOD_GUI, HID_MOD_SHIFT};
+        con.current_input = String::from("unaos select");
+        con.sel = LineSel::new();
+        let n = con.current_input.len();
+        // One chord: resolved through the LIVE table and handed to the shipped consumer.
+        let chord = |con: &mut crate::console::Console, usage: u8, mods: u8, want: Action| -> bool {
+            let none: [u8; 6] = [0; 6];
+            let cur: [u8; 6] = [usage, 0, 0, 0, 0, 0];
+            match super::keymap::resolve_edge(super::keymap::active(), &cur, &none, mods) {
+                Some((a, _)) if a == want => con.act_for_fixture(a).0 == "ok",
+                _ => false,
+            }
+        };
+        let p_c = at(2, 3);
+        wc_click_route_at(Event::Button(1), p_c.0, p_c.1);
+        wc_click_route_at(Event::Button(0), p_c.0, p_c.1);
+        let _ = take(&mut con);
+        click_caret = con.sel.caret_col(n) == 3;
+        let mut a_ok = true;
+        for (u, md, want, at_col) in [
+            (0x50u8, 0u8, Action::CursorLeft, 2usize),
+            (0x4F, 0, Action::CursorRight, 3),
+            (0x50, HID_MOD_GUI, Action::CursorLineStart, 0),
+            (0x4F, HID_MOD_GUI, Action::CursorLineEnd, n),
+            (0x4A, 0, Action::CursorLineStart, 0),
+            (0x4D, 0, Action::CursorLineEnd, n),
+        ] {
+            a_ok &= chord(&mut con, u, md, want) && con.sel.caret_col(n) == at_col;
+        }
+        arrows = a_ok;
+        chord(&mut con, 0x4A, 0, Action::CursorLineStart);
+        for _ in 0..5 {
+            chord(&mut con, 0x4F, 0, Action::CursorRight);
+        }
+        con.sel.type_byte(b'X', &mut con.current_input);
+        insert = con.current_input == "unaosX select" && con.sel.caret_col(con.current_input.len()) == 6;
+        con.sel.type_byte(8, &mut con.current_input);
+        bs = con.current_input == "unaos select" && con.sel.caret_col(con.current_input.len()) == 5;
+        let sel_ok = chord(&mut con, 0x4F, HID_MOD_GUI | HID_MOD_SHIFT, Action::SelectLineEnd)
+            && con.sel.range(n) == Some((5, 12));
+        let r = con.sel.type_byte(b'Z', &mut con.current_input);
+        let m2 = con.current_input.len();
+        replace = sel_ok && r == 1 && con.current_input == "unaosZ" && con.sel.range(m2).is_none() && con.sel.caret_col(m2) == m2;
+        con.current_input = String::from("unaos select");
+        let c1 = chord(&mut con, 0x04, HID_MOD_GUI, Action::SelectAll)
+            && chord(&mut con, 0x50, 0, Action::CursorLeft)
+            && con.sel.span(n).is_none()
+            && con.sel.caret_col(n) == 0;
+        let c2 = chord(&mut con, 0x04, HID_MOD_GUI, Action::SelectAll)
+            && chord(&mut con, 0x4F, 0, Action::CursorRight)
+            && con.sel.span(n).is_none()
+            && con.sel.caret_col(n) == n;
+        collapse = c1 && c2;
+    }
+    let pc_t = super::theme::PC_BINDINGS;
+    let pc = super::keymap::resolve(pc_t, 0, 0x50) == Some(Action::CursorLeft)
+        && super::keymap::resolve(pc_t, 0, 0x4F) == Some(Action::CursorRight)
+        && super::keymap::resolve(pc_t, 0, 0x4A) == Some(Action::CursorLineStart)
+        && super::keymap::resolve(pc_t, 0, 0x4D) == Some(Action::CursorLineEnd);
     for (bit, ok) in [
         (0x2u32, route),
         (0x4, drag),
@@ -1008,14 +1202,21 @@ pub fn pointer_selftest() {
         (0x200, word),
         (0x400, into_edit),
         (0x800, edit),
+        (0x1000, click_caret),
+        (0x2000, arrows),
+        (0x4000, insert),
+        (0x8000, bs),
+        (0x10000, replace),
+        (0x20000, collapse),
+        (0x40000, pc),
     ] {
         if ok {
             got |= bit;
         }
     }
-    const WANT: u32 = 0xfff;
+    const WANT: u32 = 0x7ffff;
     serial_println!(
-        ":: TERMSEL2: legs={:#x}/{:#x} hit={} route={} drag={} up={} dbl={} sel={} copy={} cut_ro={} esc={} word={} into_edit={} edit={} -> {} ::",
+        ":: TERMSEL2: legs={:#x}/{:#x} hit={} route={} drag={} up={} dbl={} sel={} copy={} cut_ro={} esc={} word={} into_edit={} edit={} click_caret={} arrows={} insert={} bs={} replace={} collapse={} pc={} -> {} ::",
         got,
         WANT,
         yn(hit),
@@ -1030,6 +1231,13 @@ pub fn pointer_selftest() {
         yn(word),
         yn(into_edit),
         yn(edit),
+        yn(click_caret),
+        yn(arrows),
+        yn(insert),
+        yn(bs),
+        yn(replace),
+        yn(collapse),
+        yn(pc),
         if got == WANT { "PASS" } else { "FAIL" }
     );
 

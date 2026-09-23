@@ -689,5 +689,8 @@ FORBID :: TERMSEL: .* -> FAIL ::
 # M2 (mouse selection) grew the verdict: `sel=` is the span a drag across two scrollback rows made —
 # THE field the go-red moves (a drag that ignores the row), `copy=`/`word=`/`into_edit=` read the
 # clipboard back through the epoch gate, `cut_ro=` is ⌘X REFUSED on the read-only scrollback.
-REQUIRE :: TERMSEL2: legs=0xfff/0xfff hit=ok route=ok drag=ok up=ok dbl=ok sel=ok copy=ok cut_ro=ok esc=ok word=ok into_edit=ok edit=ok -> PASS ::
+# M3 (the caret) grew it again: `arrows=` resolves `←`/`→`/`⌘←`/`⌘→`/`Home`/`End` through the LIVE
+# table and reads the caret after each, `insert=`/`bs=` edit AT the caret, `replace=` is typing over a
+# selection on the editable line (the rule TERMSEL deferred), `pc=` the PC table's four caret rows.
+REQUIRE :: TERMSEL2: legs=0x7ffff/0x7ffff hit=ok route=ok drag=ok up=ok dbl=ok sel=ok copy=ok cut_ro=ok esc=ok word=ok into_edit=ok edit=ok click_caret=ok arrows=ok insert=ok bs=ok replace=ok collapse=ok pc=ok -> PASS ::
 FORBID :: TERMSEL2: .* -> FAIL ::
