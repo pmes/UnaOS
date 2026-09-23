@@ -415,3 +415,38 @@ FORBID :: PRTSCR-DIR-FIX: .* -> FAIL ::
 # scripts/specs/ that is neither named in `arroyo`'s CODE nor carries a RUN-BY line above — and a
 # `RUN-BY: verb:` claim is cross-checked against `arroyo`, so this file cannot claim a runner it
 # does not have. "A replay spec no gate command runs is a silent landmine."
+
+# ── VUGART (rmbp-ledger B162) — THE VUG'S OWN FRAME IS ONE CRYSTAL ──────────────────────────────
+# Peter, flight 11 (2026-09-22): "vug opens struggling so it tries to display the basic line drawing
+# but it turns into abstract art." The crystal is ALWAYS a line drawing, so "abstract art" cannot
+# mean a different renderer ran — it means the lit pixels on ONE presented surface are not ONE
+# wireframe. `crates/user-vug` rasterises its 288x288 surface in THREE disjoint bands (worker A
+# 0..108, worker B 108..216, the parent 216..288) from ONE published projection; VUGART stamps each
+# band with the GENERATION its pixels came from and scores the three against the frame's own.
+#
+# APPENDED AT THE TAIL, per the CONTRACT block above: this file's pins are cited positionally from
+# ledger rows and kernel comments, and a header insert moves every one of them silently.
+#
+# THE MEASURED BOUND, stated so nobody reads this rule as stronger than it is. `winx8_launcher`
+# kills the CI vug as soon as THREE GLOBAL presents have landed anywhere on the machine, which on
+# this bench under eight sibling executors is TWO of the vug's own frames — and the kill means the
+# exit witness never runs. So the population this gate scores is `frames=2`, not a long run:
+# measured green three times (`vugart-logs/serial-run2.log`, `serial-run3.log`,
+# `serial-run7-fixed.log`, all `:: VUGART: frames=2 coherent=2 torn_rows=0 mixed_frames=0 -> PASS ::`).
+# Two frames cannot reproduce the defect, and this rule does not claim they can. What it claims, and
+# what it enforces, is that the INSTRUMENT IS IN THE SHIPPED IMAGE AND ANSWERING — which is the thing
+# a flight-12 metal capture needs in order to read a real population off the wire.
+#
+# `frames=[1-9]\d*` and not `\d+`: `frames=0` would be the fixture reporting that it scored nothing,
+# which is the silent-fixture hole the PTRDEAD and VUGPROBE blocks above exist to close.
+#
+# GO-RED, MEASURED ON THIS GATE AND NOT REASONED (`vugart-logs/serial-run8-gored.log`): change the
+# release in `crates/user-vug/src/main.rs` from `PHASE.store(gen, …)` back to a word that does not
+# advance — `PHASE.store(1, …)` is the limiting case of the defect this arc fixed — and the same
+# capture reads `:: VUGART: frames=2 coherent=1 torn_rows=216 mixed_frames=1 -> FAIL ::`. 216 rows is
+# exactly worker A's band plus worker B's: with no release edge neither worker runs, both bands hold
+# the previous rotation with no writer in them, and the parent's own 72-row band holds the next one.
+# WINX-8 goes red beside it (`presents=1`) because the parent then blocks at the barrier — that is
+# the freeze half of the same mechanism, and it is why a present-only instrument could not see this.
+REQUIRE :: VUGART: frames=[1-9]\d* coherent=\d+ torn_rows=\d+ mixed_frames=0 -> PASS ::
+FORBID :: VUGART: .* -> FAIL ::

@@ -1146,6 +1146,270 @@ static SURF: AtomicU64 = AtomicU64::new(0); // surface VA (parent sets before sp
 static mut PX: [i32; 14] = [0; 14]; // projected pixel X per vertex
 static mut PY: [i32; 14] = [0; 14]; // projected pixel Y per vertex
 
+// ---------------------------------------------------------------------------------------------
+// VUGART — THE COHERENCE INSTRUMENT. "vug opens struggling so it tries to display the basic line
+// drawing but it turns into abstract art" (Peter, flight 11, 2026-09-22).
+//
+// The crystal is ALWAYS a line drawing, so "abstract art" cannot mean a different renderer ran: it
+// means the lit pixels on one presented surface are NOT one wireframe. This program rasterises the
+// surface in THREE DISJOINT BANDS by up to three threads (worker A 0..BAND_MID, worker B
+// BAND_MID..BAND_PAR, the parent BAND_PAR..SH, plus the VUGGUARD inline path for any band a worker
+// does not own), all reading ONE parent-published projection (`PX`/`PY`). If any band's pixels were
+// drawn from a DIFFERENT projection than the others — a lost release, a worker still draining after
+// the barrier retired it, two writers in one band — the presented frame carries edges from two
+// rotations at once. Endpoints that belong to two crystals read, to an eye, as scattered segments.
+// That is the defect, and this is how it is counted WITHOUT EYES.
+//
+// THE INVARIANT, stated so it is scoreable: for the frame the parent is about to present, every one
+// of the three bands must have been rasterised EXACTLY ONCE, TO COMPLETION, from THIS frame's
+// generation of `PX`/`PY`. Three facts make that checkable with three words per band:
+//   * GEN — the parent's monotonic frame generation, published on the SAME release edge as the
+//     projection (a `Relaxed` store ordered by `PHASE`'s `Release`/`Acquire` pair, exactly as the
+//     plain `PX`/`PY` writes already are). A worker reads it ONCE, right after it accepts a release,
+//     and carries that value through its whole raster — so a worker that is still drawing frame g
+//     when the parent has moved to g+1 reports g, which is the thing being measured.
+//   * BAND_GEN[b] — the generation of the LAST writer to FINISH band b.
+//   * BAND_BUSY[b] — writers currently inside band b. Non-zero at present time means the panel is
+//     being handed a half-drawn band; a `fetch_add` that finds it already non-zero is a CLASH, two
+//     writers in one band, and is counted separately because the losing writer's pixels can survive
+//     under the winner's stamp.
+// A band is COHERENT iff `BAND_GEN[b] == gen && BAND_BUSY[b] == 0`; a frame is COHERENT iff all
+// three bands are and no clash was recorded since the previous frame. `torn_rows` accumulates the
+// ROW COUNT of every incoherent band, so the number is in the same unit the compositor's own
+// `[wc-h] … torn=` counter is about.
+//
+// WHY x86 ONLY, measured and not assumed: the aarch64 image links against a HARD `.text` ceiling of
+// 0x2000 (see the SIZE note above `futex_wait`) and at this writing its `.text` ends at **0x1f53 —
+// 173 bytes of headroom**, which does not hold an instrument and its witness line. The x86 image is
+// capped at 0x3000 and ends at 0x212f, with 3793 bytes free. The defect Peter saw is on the x86
+// compositor, the fixture that scores it is `scripts/specs/x86-wc.spec`, and the aarch64 300-frame
+// checksum `0xe68285b85121ac7c` that `pi4-regression.spec` pins is a fact about that image's
+// pixels — which this instrument never writes on either arch. On aarch64 every hook below is an
+// empty `#[inline(always)]` function and the image is byte-identical.
+// ---------------------------------------------------------------------------------------------
+/// VUGART: the parent's monotonic frame generation, published with the projection.
+#[cfg(target_arch = "x86_64")]
+static GEN: AtomicU32 = AtomicU32::new(0);
+/// VUGART: the generation of the last writer to FINISH each band. Initialised to `u32::MAX` so the
+/// very first frame cannot be scored coherent by an accident of zero-initialisation.
+#[cfg(target_arch = "x86_64")]
+static BAND_GEN: [AtomicU32; 3] = [
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+    AtomicU32::new(u32::MAX),
+];
+/// VUGART: writers currently inside each band.
+#[cfg(target_arch = "x86_64")]
+static BAND_BUSY: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+/// VUGART: total CLASHES (a writer entering a band another writer was already in) since boot.
+#[cfg(target_arch = "x86_64")]
+static A_CLASH: AtomicU32 = AtomicU32::new(0);
+/// VUGART: the clash total as of the PREVIOUS scored frame — the delta is this frame's clashes.
+#[cfg(target_arch = "x86_64")]
+static A_CLASH_SEEN: AtomicU32 = AtomicU32::new(0);
+/// VUGART: frames scored, frames whose three bands were all this generation's, rows in incoherent
+/// bands, and frames with at least one incoherent band. `frames == coherent + mixed_frames`.
+#[cfg(target_arch = "x86_64")]
+static A_FRAMES: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_arch = "x86_64")]
+static A_COHERENT: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_arch = "x86_64")]
+static A_TORN: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_arch = "x86_64")]
+static A_MIXED: AtomicU32 = AtomicU32::new(0);
+/// VUGART: the generation `art_strand` last charged, so `art_score` cannot charge it again if the
+/// barrier eventually completes and the frame does reach a present after all.
+#[cfg(target_arch = "x86_64")]
+static A_STRAND_GEN: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// VUGART: rows in each band, so `torn_rows` is a row count and not a band count.
+#[cfg(target_arch = "x86_64")]
+const BAND_ROWS: [u32; 3] = [
+    BAND_MID as u32,
+    (BAND_PAR - BAND_MID) as u32,
+    (SH - BAND_PAR) as u32,
+];
+/// VUGART: the STEADY period of the rollup, on top of which every power-of-two frame also emits.
+///
+/// THE DOUBLING HEAD IS THE MEASUREMENT, not a flourish. A WINX-8 CI vug is KILLED — `winx8_launcher`
+/// breaks as soon as THREE GLOBAL presents have landed anywhere on the machine, which on a box under
+/// eight sibling executors is two or three of the vug's OWN frames — and it is killed, so the exit
+/// witness never runs. A period-only schedule put ZERO `:: VUGART:` lines on a full `UNAOS_WC=1
+/// UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_QEMU_FULL=1 ./arroyo test 240` capture at load
+/// average 38 (`vugart-logs/run1-repro.log`): the whole life of that vug was eighteen serial lines
+/// between the two WINX-8 witnesses, with two `[wc-h] win=1 … BUFFERED` presents in it. So frames 1,
+/// 2, 4, 8 … emit too, and the gate has a verdict from a vug that lived two frames.
+/// A bench vug runs for hundreds of thousands of frames, so the tail must NOT be per-frame: past 64
+/// the doubling is sparser than the period and 64 is what governs.
+#[cfg(target_arch = "x86_64")]
+const VUGART_PERIOD: u32 = 64;
+
+/// VUGART: publish this frame's generation. Call site: immediately before the `PHASE` release.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn art_publish(g: u32) {
+    GEN.store(g, Ordering::Relaxed);
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn art_publish(_g: u32) {}
+
+/// VUGART: the generation a worker was released for. Call site: once, after the `PHASE` acquire.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn art_gen() -> u32 {
+    GEN.load(Ordering::Acquire)
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn art_gen() -> u32 {
+    0
+}
+
+/// VUGART: enter band `b`. A non-zero prior count is a CLASH — two writers in one band.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn art_begin(b: usize) {
+    if BAND_BUSY[b].fetch_add(1, Ordering::AcqRel) != 0 {
+        A_CLASH.fetch_add(1, Ordering::Relaxed);
+    }
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn art_begin(_b: usize) {}
+
+/// VUGART: leave band `b`, stamping the generation its pixels came from.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn art_end(b: usize, g: u32) {
+    BAND_GEN[b].store(g, Ordering::Release);
+    BAND_BUSY[b].fetch_sub(1, Ordering::Release);
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn art_end(_b: usize, _g: u32) {}
+
+/// VUGART: rows of generation `g` that the surface does NOT hold — the whole of the coherence test,
+/// shared by the present-time scorer and the barrier-time one, WITH THE ONE DIFFERENCE BETWEEN THEM.
+///
+/// `abandoned = false` (present time): a band is bad if it is stale OR still has a writer in it.
+/// After the barrier both are the same statement — nobody should be drawing and everybody should
+/// have drawn this generation — so the disjunction is the honest test.
+///
+/// `abandoned = true` (barrier-park time): a band is bad ONLY if it is stale AND HAS NO WRITER.
+/// MEASURED, not reasoned: the first cut used the disjunction here too, and the go-red capture
+/// (`vugart-logs/run5-gored.log`) came back `frames=1 coherent=0 torn_rows=216` — the FIRST frame,
+/// whose release was perfectly good, charged as mixed because under TCG the two workers had simply
+/// not finished inside `BARRIER_SPIN_YIELDS`. That is not the defect. A BUSY band is being drawn
+/// right now and the parent is about to wait for it; the surface being momentarily mid-raster is the
+/// ordinary condition of every unbuffered renderer and belongs to the compositor's own tearing
+/// question (rmbp-ledger A5, PTRPAINT/VUGPERF), not to this one. A band that is STALE WITH NOBODY IN
+/// IT is the discriminator: no writer is coming, so the surface has been LEFT this way, which is
+/// exactly a lost release and exactly what the eye sees as a crystal drawn from two rotations.
+#[cfg(target_arch = "x86_64")]
+fn art_bad_rows(g: u32, abandoned: bool) -> u32 {
+    let mut bad_rows = 0u32;
+    let mut b = 0usize;
+    while b < 3 {
+        let stale = BAND_GEN[b].load(Ordering::Acquire) != g;
+        let busy = BAND_BUSY[b].load(Ordering::Acquire) != 0;
+        let bad = if abandoned { stale && !busy } else { stale || busy };
+        if bad {
+            bad_rows += BAND_ROWS[b];
+        }
+        b += 1;
+    }
+    bad_rows
+}
+
+/// VUGART — SCORE THE FRAME THE PARENT IS ABOUT TO ABANDON, and this is the hook that catches the
+/// defect Peter saw rather than a neighbour of it.
+///
+/// `art_score` below runs immediately before the present, so it can only ever judge frames that
+/// REACH a present. The failure this arc is about does not: when a release is lost the workers never
+/// run, `DONE` never reaches `live`, and the parent BLOCKS at the barrier — with the new projection
+/// already published and its own band `BAND_PAR..SH` already rasterised from it. Nothing is
+/// presented, and `art_score` never runs, but the SURFACE IS ALREADY MIXED and the compositor
+/// composites a live window from the surface on the PANEL's cadence, not on this program's presents.
+/// So the eye sees a two-rotation crystal that no present ever announced, and a present-only
+/// instrument would have reported `mixed_frames=0` through the whole of it.
+///
+/// This fires exactly ONCE per stranded frame, on the pass where the parent stops spinning and
+/// starts parking — the moment it stops being "a slow frame" and becomes "a surface left this way".
+/// It EMITS immediately, because the parent may never come back to emit at all.
+///
+/// `A_STRAND_GEN` is the no-double-count latch: a barrier that eventually completes will go on to
+/// present, and `art_score` must not charge that frame a second time.
+#[cfg(target_arch = "x86_64")]
+fn art_strand(g: u32, passes: u32) {
+    if passes != BARRIER_SPIN_YIELDS + 1 {
+        return;
+    }
+    let bad = art_bad_rows(g, true);
+    if bad == 0 {
+        return;
+    }
+    A_STRAND_GEN.store(g, Ordering::Relaxed);
+    A_FRAMES.fetch_add(1, Ordering::Relaxed);
+    A_MIXED.fetch_add(1, Ordering::Relaxed);
+    A_TORN.fetch_add(bad, Ordering::Relaxed);
+    art_emit();
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn art_strand(_g: u32, _passes: u32) {}
+
+/// VUGART: score the surface the parent is about to present. Call site: immediately before the
+/// present, after every writer this frame could legitimately have.
+#[cfg(target_arch = "x86_64")]
+fn art_score(g: u32) {
+    if A_STRAND_GEN.load(Ordering::Relaxed) == g {
+        return; // already charged to `mixed_frames` by `art_strand` — do not count the frame twice
+    }
+    let bad_rows = art_bad_rows(g, false);
+    let cl = A_CLASH.load(Ordering::Relaxed);
+    let seen = A_CLASH_SEEN.swap(cl, Ordering::Relaxed);
+    let n = A_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    if bad_rows != 0 || cl != seen {
+        A_MIXED.fetch_add(1, Ordering::Relaxed);
+        A_TORN.fetch_add(bad_rows, Ordering::Relaxed);
+    } else {
+        A_COHERENT.fetch_add(1, Ordering::Relaxed);
+    }
+    if n.is_power_of_two() || n % VUGART_PERIOD == 0 {
+        art_emit();
+    }
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn art_score(_g: u32) {}
+
+/// VUGART: the verdict line. ONE `Buf` and ONE `write_bytes`, so the line cannot be split by another
+/// CPU's serial traffic — a spec REQUIRE matches a LINE, and a two-write witness would red the gate
+/// intermittently on exactly the loaded box the defect needs.
+#[cfg(target_arch = "x86_64")]
+fn art_emit() {
+    let mixed = A_MIXED.load(Ordering::Relaxed);
+    let mut buf = Buf::new();
+    buf.put(b":: VUGART: frames=");
+    buf.put_dec(A_FRAMES.load(Ordering::Relaxed));
+    buf.put(b" coherent=");
+    buf.put_dec(A_COHERENT.load(Ordering::Relaxed));
+    buf.put(b" torn_rows=");
+    buf.put_dec(A_TORN.load(Ordering::Relaxed));
+    buf.put(b" mixed_frames=");
+    buf.put_dec(mixed);
+    buf.put(if mixed == 0 {
+        b" -> PASS ::\n" as &[u8]
+    } else {
+        b" -> FAIL ::\n"
+    });
+    buf.flush();
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn art_emit() {}
+
 const PHASE_EXIT: u32 = u32::MAX;
 /// VUGPAUSE-2: `SYS_YIELD` passes a worker spends polling `PHASE` before it parks on it.
 ///
@@ -1779,7 +2043,14 @@ extern "C" fn uvug_worker(arg: usize) -> ! {
                 core::hint::spin_loop();
             }
         }
+        // VUGART: the generation THIS release carried, read ONCE and carried through the raster. A
+        // worker still inside `render_band` when the parent has published g+1 stamps g, which is
+        // precisely the "two rotations on one surface" the instrument exists to count. `arg` is the
+        // band index by construction (0 = 0..BAND_MID, 1 = BAND_MID..BAND_PAR).
+        let g = art_gen();
+        art_begin(arg);
         unsafe { render_band(surf, y_lo, y_hi) };
+        art_end(arg, g);
         // Arrive: atomically bump `done`, then FUTEX WAKE the parent.
         DONE.fetch_add(1, Ordering::Release);
         futex_wake(core::ptr::addr_of!(DONE), 1);
@@ -2620,13 +2891,28 @@ fn surface_checksum(surf: *const u8) -> u64 {
 // ---------------------------------------------------------------------------------------------
 // Tiny formatting into a byte buffer (no core::fmt — keep the text segment small).
 // ---------------------------------------------------------------------------------------------
+/// VUGART widened this from 64 to 112 bytes ON x86 ONLY. The verdict line (`:: VUGART: frames=…
+/// coherent=… torn_rows=… mixed_frames=… -> PASS ::`) is 65 fixed bytes plus four decimal fields,
+/// which a long-lived bench vug can push past 90 — and it must go out in ONE `write_bytes`, because
+/// a spec REQUIRE matches a line and a split witness would red the gate on a loaded box.
+///
+/// THE `cfg` IS NOT TIDINESS, IT IS THE `.text` CEILING, and it was MEASURED rather than assumed: a
+/// flat 112 grew the aarch64 `.text` from 0x1f53 to 0x1f7b — 40 bytes of the 173 that image has left
+/// under its hard 0x2000 cap, spent on a buffer no aarch64 caller fills. With the `cfg` the aarch64
+/// image is byte-identical to its parent commit, so the 300-frame checksum `0xe68285b85121ac7c` that
+/// `pi4-regression.spec` pins cannot have moved. Nothing else about `Buf` changed: every existing
+/// caller puts the same bytes and the bound is still `self.b.len()`.
+#[cfg(target_arch = "x86_64")]
+const BUF_CAP: usize = 112;
+#[cfg(not(target_arch = "x86_64"))]
+const BUF_CAP: usize = 64;
 struct Buf {
-    b: [u8; 64],
+    b: [u8; BUF_CAP],
     n: usize,
 }
 impl Buf {
     fn new() -> Self {
-        Buf { b: [0; 64], n: 0 }
+        Buf { b: [0; BUF_CAP], n: 0 }
     }
     fn put(&mut self, s: &[u8]) {
         let mut i = 0;
@@ -3188,9 +3474,52 @@ pub extern "C" fn _start() -> ! {
                 project(&vbase, ay, ax, dist);
             }
         }
+        // VUGART: this frame's generation, published BEFORE the release so the `PHASE` Release/Acquire
+        // pair carries it to the workers exactly as it already carries the plain `PX`/`PY` writes.
+        // `attempts` is used and not `frame` because it advances on every RENDERED frame whatever the
+        // panel did (REVIEW D5) — a generation that can repeat is not a generation.
+        let gen = attempts.wrapping_add(1);
+        art_publish(gen);
         if live > 0 {
             DONE.store(0, Ordering::Relaxed);
-            PHASE.store(frame + 1, Ordering::Release); // 1-based; never PHASE_EXIT (frame < cap)
+            // VUGART — THE RELEASE WORD IS THE GENERATION, NOT THE PRESENTED-FRAME COUNT. This line
+            // read `PHASE.store(frame + 1, …)` until this arc, and that was the defect.
+            //
+            // A worker leaves its wait on `p != last` — the release is an EDGE on this word, and an
+            // edge only exists if the value CHANGES. `frame` counts frames the panel TOOK: VUGSPIN
+            // moved `frame += 1` onto the present's success branch precisely so the fps readout would
+            // stop counting frames the eye never received. The cost of that, unnoticed until now, is
+            // that a FAILED present freezes `frame` — and the very next frame republishes the value
+            // the workers already have. No edge, no release. Both workers stay in their wait (the
+            // unconditional `wake_phase` wakes them, they re-read the same word and park again),
+            // `DONE` never reaches `live`, and the parent blocks at the barrier below.
+            //
+            // THAT IS NOT MERELY A SLOW FRAME, and this is the whole of "abstract art": by the time
+            // the parent blocks it has ALREADY published the new projection and ALREADY rasterised
+            // its OWN band, `BAND_PAR..SH`. So the surface it leaves behind holds rows 0..216 at the
+            // previous rotation and rows 216..288 at the next one — and the compositor composites a
+            // live window from that surface on the panel's cadence, not on this program's presents.
+            // A wireframe seen through that is edges that do not join: one crystal's lower quarter
+            // drawn against another's body.
+            //
+            // THE PRECONDITION IS ON THE WIRE, not argued: flight 11 (2026-09-22) carries six
+            // `[uvug9] stall frame=<n> phase=present rc=9` lines between 721199 ms and 725305 ms
+            // (frames 5465, 4323, 6706, 4500, 4565, 2479). `stall_witness`'s latch is a per-process
+            // static, so that is six DISTINCT vugs each taking a failing present; rc=9 is `EBADF`,
+            // which `sys_win_present` returns for a freed or out-of-range window row.
+            //
+            // `gen` is `attempts + 1`, and `attempts` is the right counter for exactly the reason
+            // REVIEW D5 gave when it moved the EXIT BUDGETS onto it: it advances on every RENDERED
+            // frame whatever the panel did. Holding `frame` still on failure is right for a METER and
+            // wrong for a DEADLINE — and wrong, it turns out, for a RELEASE. Skipped frames (the
+            // VUGPAUSE idle path) store nothing here at all, so they cannot repeat a value either.
+            // On any healthy run `attempts == frame` and this is the identical number the line
+            // published before, which is why no fixture's geometry or checksum can move.
+            //
+            // It is also now the SAME word the workers stamp their bands with, so "the band was drawn
+            // for the frame it was released for" is one comparison rather than two counters that
+            // could disagree.
+            PHASE.store(gen, Ordering::Release); // 1-based; PHASE_EXIT is u32::MAX, ~2 years away
             // VUGPAUSE-2: release any worker that outspun `WORKER_SPIN_YIELDS` and parked. UNCONDITIONAL,
             // and that is a decision rather than an oversight. Gating it on a "someone is parked" flag
             // would be a second lock-free protocol between three threads whose failure mode is a worker
@@ -3207,14 +3536,20 @@ pub extern "C" fn _start() -> ! {
         // disjoint by construction and `draw_line`/`put_px` clip to the band, so no two writers ever
         // touch a pixel.
         if inline_top {
+            art_begin(0);
             unsafe { render_band(surf, 0, BAND_MID) };
+            art_end(0, gen);
         }
         if inline_bot {
+            art_begin(1);
             unsafe { render_band(surf, BAND_MID, BAND_PAR) };
+            art_end(1, gen);
         }
         // CRYSTAL-HD: the parent's OWN band, every frame — see BAND_PAR. Placed with the inline
         // raster so it runs concurrently with the workers, exactly where the parent otherwise idles.
+        art_begin(2);
         unsafe { render_band(surf, BAND_PAR, SH) };
+        art_end(2, gen);
 
         // --- barrier: wait for the live workers to arrive (FUTEX) ---
         // UVUG-9: the wait itself is unchanged (re-check + compare-and-block is lost-wakeup-safe); a pass
@@ -3290,6 +3625,9 @@ pub extern "C" fn _start() -> ! {
                 join_b = false;
                 break;
             } else {
+                // VUGART: the pass where this stops being a slow frame and becomes a SURFACE LEFT
+                // MIXED. Fires once, emits immediately — the parent may never come back.
+                art_strand(gen, passes);
                 futex_wait(core::ptr::addr_of!(DONE), d);
             }
         }
@@ -3340,6 +3678,11 @@ pub extern "C" fn _start() -> ! {
         // it through the banded verb would buy the compositor no work back and would cost every aarch64
         // frame a syscall that can only fail. The banded verb belongs on the idle HUD path above, where the
         // damage is 11 rows; here the honest answer is the one this line already gives.
+        // VUGART: score the surface the line below is about to hand the compositor. This is the last
+        // point at which every writer this frame could legitimately have is finished, and the first at
+        // which the panel can see what they wrote — which makes it the only honest place to ask whether
+        // the three bands are one crystal.
+        art_score(gen);
         let rc = unsafe { sys1(SYS_WIN_PRESENT, win) };
         // REVIEW D5: present ATTEMPTS — the deadline clock for both exit budgets below. This is what
         // `frame` counted before the meter fix, and it advances whether or not the panel took the frame.
@@ -3470,6 +3813,9 @@ pub extern "C" fn _start() -> ! {
         buf.put(b" ::\n");
     }
     buf.flush();
+    // VUGART: the final verdict, for the runs that reach an exit at all. A WINX-8 CI vug is KILLED and
+    // never gets here — which is why `art_score` also emits on a period.
+    art_emit();
 
     exit(0);
 }
