@@ -299,7 +299,13 @@ fn password_hash(rec: &UserRec, password: &[u8]) -> [u8; HASH_LEN] {
 /// uniqueness, not secrecy (two users with one password do not share a hash; no precomputed table
 /// applies). M5 replaces the body with `rand::fill` and names its source on the wire.
 fn new_salt(name: &[u8], seq: u16) -> [u8; SALT_LEN] {
+    // SECLOGIN M5: 32 bytes from the entropy source (`rand::fill`, which says its source on the wire
+    // once per boot), folded with the cycle counter, the name and the store's seq — so even on the
+    // jitter path two rows can never share a salt, and on a hardware path the salt is unpredictable.
+    let mut r = [0u8; 32];
+    let _ = crate::rand::fill(&mut r);
     let mut sh = crate::hash::Sha256::new();
+    sh.update(&r);
     sh.update(&crate::arch::now_cycles().to_le_bytes());
     sh.update(name);
     sh.update(&seq.to_le_bytes());
@@ -307,6 +313,15 @@ fn new_salt(name: &[u8], seq: u16) -> [u8; SALT_LEN] {
     let mut s = [0u8; SALT_LEN];
     s.copy_from_slice(&d[..SALT_LEN]);
     s
+}
+
+/// SECLOGIN M5: the first uid a FRESH store issues — `FIRST_UID` plus a random 24-bit base, so a
+/// rebuilt credential file (a reformat, a refused image) is improbably rather than certainly reissuing
+/// a uid an old owner row on a unafs volume still names (`multiuser.md` §2).
+fn fresh_uid_base() -> u32 {
+    let mut r = [0u8; 32];
+    let _ = crate::rand::fill(&mut r);
+    FIRST_UID + (u32::from_le_bytes([r[0], r[1], r[2], 0]) & 0x00FF_FFFF)
 }
 
 /// Constant-time equality over the two digests (a fold, never an early return).
@@ -544,8 +559,8 @@ fn try_load() -> Result<(), FatError> {
     let mut t = TABLE.lock();
     match img {
         None => {
-            t.next_uid = FIRST_UID;
-            serial_println!("[users] load volume=el0-fat({}) src=none users=0 (fresh store)", veto);
+            t.next_uid = fresh_uid_base();
+            serial_println!("[users] load volume=el0-fat({}) src=none users=0 (fresh store) next_uid={}", veto, t.next_uid);
         }
         Some(b) => match parse_image(&b) {
             Ok(p) => {
@@ -560,7 +575,7 @@ fn try_load() -> Result<(), FatError> {
                 );
             }
             Err(e) => {
-                t.next_uid = FIRST_UID;
+                t.next_uid = fresh_uid_base();
                 serial_println!(
                     "[users] load volume=el0-fat({}) src={} REFUSED reason={} len={} (store starts empty)",
                     veto,
@@ -734,7 +749,7 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
     // that cannot take the write (read-only, vetoed) still opens the session: the home is owed, not the
     // login, and the witness line names the refusal.
     if let Err(e) = ensure_home(name) {
-        serial_println!("[users] home=/home/{} NOT created reason={} volume=el0-fat", core::str::from_utf8(name).unwrap_or("?"), users_reason(e));
+        serial_println!("[users] home=/home/{} NOT created reason={} volume={}", core::str::from_utf8(name).unwrap_or("?"), users_reason(e), crate::fs::fat::mount().map(|f| f.volume_fingerprint().0).unwrap_or(0)); // SECLOGIN M6: the serial, 0 when the volume itself could not be mounted
     }
     {
         let mut s = SESSION_LOCAL.lock();
@@ -784,7 +799,7 @@ pub fn ensure_home(name: &[u8]) -> Result<&'static str, UsersError> {
         }
         Err(e) => return Err(map_fat(e)),
     };
-    serial_println!("[users] home=/home/{} {} volume=el0-fat", leaf, verdict);
+    serial_println!("[users] home=/home/{} {} volume={:08x}", leaf, verdict, fs.volume_fingerprint().0); // SECLOGIN M6: the DEVICE (the FAT volume serial the formatter stamped), not the role — a flight capture tells the card from a stick without cross-reading the block registry
     Ok(verdict)
 }
 
@@ -912,7 +927,7 @@ fn arch_session_logout() -> (usize, usize) {
 
 /// SO37: the LIVE session epoch where the syscall layer exists (see [`arch_session_login`]); `0` on an
 /// image with no EL0 regime, where no program can be launched and so no stamp can be stranded.
-fn arch_session_epoch() -> u32 {
+fn arch_session_epoch() -> u64 {
     #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
     {
         return crate::arch::syscall::session_epoch();
@@ -1113,7 +1128,7 @@ pub fn service() {
         Ok(()) => {
             SERVICED.store(true, Ordering::Relaxed);
             #[cfg(feature = "loginst")]
-            { login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); } // SECLOGIN M1/M2/M3/M4 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
+            { login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1315,8 +1330,11 @@ pub fn screen_press_route_name() -> &'static str {
 // SECLOGIN M1 (PWHARD) — THE STRETCH: calibration, migration, delete, and the LOGIN-HARD fixture
 // =========================================================================================
 //
-// Unconditional code in the default image (LAWS §5, 2026-09-22: security is not a knob; the proof is
-// the replay and the fixture's go-red, never `knoboff`). Tail-appended so nothing above moves.
+// This module is declared under `#[cfg(feature = "login")]` (fs/mod.rs:105 — B157's "declared
+// UNCONDITIONALLY" was off by one line, measured by 31 red aarch64 legs when M4 first referenced it
+// from the unconditional resolver), so nothing here is in an image without the knob; within the LOGIN
+// line nothing is knob-gated further (LAWS §5, 2026-09-22: security is not a knob; the proof is the
+// replay and the fixture's go-red, never `knoboff`). Tail-appended so nothing above moves.
 
 /// The PBKDF2 count for THIS boot, measured once: `PBKDF2_CAL_PROBE` iterations are timed with
 /// `arch::ms()` and scaled to `PBKDF2_TARGET_MS`, then clamped to `[PBKDF2_ITERS_MIN, PBKDF2_ITERS_MAX]`.
@@ -1651,4 +1669,31 @@ pub fn login_kown_fixture() {
     {
         serial_println!("[users] kernel-owned pred={} resolver=unlinked", if pred { "ok" } else { "FAIL" });
     }
+}
+
+/// LOGIN-RAND (`loginst`) — SECLOGIN M5. Two draws differ and neither is all-zero; the source is
+/// named and matches what the probe said; two rows' salts differ (`una` and a scratch row). GO-RED:
+/// `rand::jitter_fill` mutated to a constant → `distinct=false -> FAIL` (the QEMU lane runs
+/// `-cpu qemu64,+x2apic`, no RDRAND, so the mutation bites there); the SOURCE FLIP is measured with
+/// the builder's existing `UNAOS_CPU=qemu64,+x2apic,+rdrand` override — `source=rdrand`, no new knob.
+#[cfg(feature = "loginst")]
+pub fn login_rand_fixture() {
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    let sa = crate::rand::fill(&mut a);
+    let sb = crate::rand::fill(&mut b);
+    let distinct = a != b;
+    let nonzero = a.iter().any(|&x| x != 0) && b.iter().any(|&x| x != 0);
+    let same_source = sa == sb && sa == crate::rand::source();
+    const SCRATCH: &[u8] = b"randx";
+    let _ = delete_user(SCRATCH);
+    let salts_differ = create_user(SCRATCH, b"salt-pw").is_ok() && {
+        let t = TABLE.lock();
+        let una = (0..t.count as usize).find(|&i| t.rows[i].name() == b"una").map(|i| t.rows[i].salt);
+        let sx = (0..t.count as usize).find(|&i| t.rows[i].name() == SCRATCH).map(|i| t.rows[i].salt);
+        matches!((una, sx), (Some(u), Some(x)) if u != x)
+    };
+    let cleaned = delete_user(SCRATCH).is_ok();
+    let ok = distinct && nonzero && same_source && salts_differ && cleaned;
+    serial_println!(":: LOGIN-RAND: source={} distinct={} nonzero={} same_source={} salts_differ={} draws={} epoch_bits=64 -> {} ::", sa.name(), distinct, nonzero, same_source, salts_differ, crate::rand::draws(), if ok { "PASS" } else { "FAIL —" });
 }

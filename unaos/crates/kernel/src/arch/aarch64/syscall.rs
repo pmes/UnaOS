@@ -24618,12 +24618,12 @@ fn session_restamp(asid: u64) {
 /// [`session_logout`]. `u32`: at one logout per second that is 136 years, and a wrap would have to land on
 /// the exact value a slot stranded that many sessions ago still carries.
 #[cfg(feature = "login")]
-static SESSION_EPOCH: AtomicU32 = AtomicU32::new(1);
+static SESSION_EPOCH: AtomicU64 = AtomicU64::new(1); // SECLOGIN M5: u64 — a u32 wraps at 4.3e9 logouts, named by B157 gap 5, now defended
 
 /// SO37: the epoch each slot's principal stamp was taken in (0 = never stamped, which never matches).
 #[cfg(feature = "login")]
-static SLOT_EPOCH: [AtomicU32; super::uslots::USER_SLOTS + 1] =
-    [const { AtomicU32::new(0) }; super::uslots::USER_SLOTS + 1];
+static SLOT_EPOCH: [AtomicU64; super::uslots::USER_SLOTS + 1] =
+    [const { AtomicU64::new(0) }; super::uslots::USER_SLOTS + 1]; // SECLOGIN M5: u64 with SESSION_EPOCH
 
 /// SO37: record the live epoch on `asid`, beside [`slot_ppid_stamp`]. Called ONLY from [`session_restamp`],
 /// the sole path that can put a `PRIN_USER` record into `SLOT_PPID`.
@@ -24662,7 +24662,7 @@ fn slot_epoch_clear(asid: u64) {
 /// SO37: the LIVE epoch as a NUMBER, for the wire — never a decision. Read by `fs::users::logout`, so
 /// every Log Out names the epoch it just opened and a boot's session boundaries are countable on serial.
 #[cfg(feature = "login")]
-pub fn session_epoch() -> u32 {
+pub fn session_epoch() -> u64 {
     SESSION_EPOCH.load(Ordering::Acquire)
 }
 
@@ -25181,7 +25181,7 @@ fn user_from_native_uid(rest: &[u8]) -> Option<PrincipalRecord> {
 /// program (no user stamp) is never touched. Returns `(ended, windows_closed)`; called from
 /// [`session_logout`] BEFORE the epoch bump.
 #[cfg(feature = "login")]
-fn session_end_processes(closing: u32) -> (usize, usize) {
+fn session_end_processes(closing: u64) -> (usize, usize) {
     let mut ended = 0usize;
     let mut windows = 0usize;
     for pi in 0..MAX_PROCS {

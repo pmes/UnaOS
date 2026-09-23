@@ -230,6 +230,21 @@ REQUIRE \[users\] logout epoch=\d+ ended=\d+ windows=\d+
 REQUIRE \[users\] kernel-owned pred=ok resolver=(OPENED|refused)
 FORBID :: LOGIN-KOWN: .* -> FAIL
 
+# ── 7e. THE SALT HAS A SOURCE, AND THE EPOCH IS 64 BITS (SECLOGIN M5, rmbp-ledger B169) ─────────
+# B157 gaps 5 and 6. `source=` is pinned as the three names the module can say; on THIS lane
+# (`-cpu qemu64,+x2apic`, no RDRAND) it reads `jitter` and the probe says `cpuid.01h.ecx.30=0`; under
+# the builder's `UNAOS_CPU=qemu64,+x2apic,+rdrand` it reads `rdrand` — the flip, with no new knob.
+# GO-RED: `rand::jitter_fill` mutated to a constant → `distinct=false -> FAIL`.
+REQUIRE \[rand\] source=(rdrand|rndr|jitter) probe=\S+ bits=256
+REQUIRE :: LOGIN-RAND: source=(rdrand|rndr|jitter) distinct=true nonzero=true same_source=true salts_differ=true draws=\d+ epoch_bits=64 -> PASS ::
+FORBID :: LOGIN-RAND: .* -> FAIL
+
+# ── 7f. THE HOME NAMES ITS VOLUME BY SERIAL (SECLOGIN M6, rmbp-ledger B169) ─────────────────────
+# B157 gap 8: `volume=el0-fat` named the ROLE. Now the FAT volume serial (BS_VolID, eight hex
+# digits), so a flight-12 capture tells the card from a stick. The roster policy (gap 7) is a
+# predicate in `video/login.rs` with the default unchanged, so `LOGIN-CONTROL`'s `rows=` is unchanged.
+REQUIRE \[users\] home=/home/una (created|exists) volume=[0-9a-f]{8}
+
 # ── 8. ABSENCE — the hole every block above exists to close ─────────────────────────────────────
 # A fixture that stops running prints nothing and passes silently. Every REQUIRE above gates PRESENCE
 # as well as health for its own leg, which covers it. What is NOT covered by any of them is the boot
