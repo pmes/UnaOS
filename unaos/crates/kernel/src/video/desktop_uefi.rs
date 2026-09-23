@@ -307,19 +307,19 @@ const STORAGE_WAIT_MS: u64 = 30_000;
 /// wait has not started". Written and read only by the single pinned service task, hence `Relaxed`.
 static WAIT_SINCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// DMG-REFUSE HOLD — how long the desktop-app launch defers to the refusal witness before giving up
-/// out loud. The witness settles ~1s after storage is ready on the boots in this capture (Boot AL:
-/// launch 13.257s, DMG entry 13.859s; DMG's own clean run measured 719ms on AI-2). The chain's own
-/// bounded sub-waits (U6BX 10s + U8x 5+2s + WINX-7 10s) could stack past this bound if fixtures time
-/// out — that case degrades to today's behaviour (HOLD-EXPIRED, launch, witness NOT RUN), out loud,
-/// which is the deliberate trade: 15s is the cap on what a healthy desktop will ever pay for a
-/// witness, not a promise the witness fits. Like `STORAGE_WAIT_MS` the job is to TERMINATE in a
-/// line rather than in silence.
-const DMG_HOLD_MS: u64 = 15_000;
-
-/// DMG-REFUSE HOLD — `ticks()` at the first held pass, or `0` for "the hold has not started".
-/// Same single-task access pattern as `WAIT_SINCE_MS`, hence `Relaxed`.
-static DMG_HOLD_SINCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// DMG-REFUSE HOLD — DELETED (STARTHOLD, 2026-09-22), with `DMG_HOLD_MS = 15_000` and
+// `DMG_HOLD_SINCE_MS`. It capped how long this launch deferred to the refusal witness, and flight 11
+// measured what the cap bought: the hold began at 28.064s, expired at 43.069s (`waited=15005ms
+// threshold=15000ms`), the launch took row 0 at 43.077s — and the witness did not enter until
+// 48.074s, FIVE SECONDS LATER, found `occupied=0x01` and printed `refusal witness NOT RUN`. The full
+// 15s was paid AND the witness was lost. It could not have gone otherwise: the DMG launcher is the
+// TAIL of the witness ladder, whose own bounded sub-waits (U6BX 10s + U8x 5+2s + WINX-7 10s, plus
+// DMG's own 5s + 10s) sum well past 15s, so the cap was smaller than the bound of the signal it
+// waited on and had to expire on exactly the boots that needed it. And no QEMU leg ever ran it:
+// `activate` needs the Kepler takeover, so `DESKTOP_APP_ARMED` is false on every `./arroyo test`
+// boot and this hold had zero CI coverage for its whole life. A clock cannot decide which of two
+// tenants takes row 0. The desktop is the product; the fixture is the guest; the ordering, if it is
+// wanted, is the FIXTURE's to take. See `desktop_app_service` — it REPORTS and gates on nothing.
 
 /// Gap in panel pixels between a pinned window's outer box and the panel edge. Matches `wm`'s own
 /// tiling gap in spirit. Witness-only since the demo window went to ring 3 — the MOVE-VACATE probe is
@@ -763,30 +763,30 @@ pub fn desktop_app_service() {
         );
         return;
     }
-    // DMG-REFUSE HOLD. The refusal witness requires the window table EMPTY at entry, and this launch
-    // is permanent — on Boot AL it took row 1 at 13.257s, the witness entered at 13.859s, and the
-    // capture got its first `NOT RUN` after three boots of `19/19 — witness OK`. On a `witness`
-    // build the flag settles when the launcher chain completes; on every other shape (witness off —
-    // the default esp-x86 media — or a chain leg that never arrives) the flag is BORN settled or the
-    // bound expires OUT LOUD — a desktop that never appears is worse than one lost witness, and the
-    // loss goes on the record either way.
-    if !crate::arch::syscall::DMG_REFUSE_SETTLED.load(Ordering::Acquire) {
-        let now = crate::arch::ticks();
-        let started = DMG_HOLD_SINCE_MS.load(Ordering::Relaxed);
-        if started == 0 {
-            DMG_HOLD_SINCE_MS.store(now.max(1), Ordering::Relaxed);
-            return;
-        }
-        let waited = now.saturating_sub(started);
-        if waited < DMG_HOLD_MS {
-            return;
-        }
-        serial_println!(
-            "[wc-x] desktop-app HOLD-EXPIRED reason=dmg-refuse-unsettled name=/{} waited={}ms threshold={}ms — launching anyway; the refusal witness will print NOT RUN if it arms after this",
-            DESKTOP_APP, waited, DMG_HOLD_MS
-        );
-        // fall through: the launch proceeds and the lost coverage is on the serial record.
-    }
+    // DMG-REFUSE ORDER — MEASURED AND REPORTED, NEVER GATED. The refusal witness requires the window
+    // table EMPTY at entry and this launch is permanent, so the two contend for row 0. Until STARTHOLD
+    // a 15s wall-clock cap arbitrated that contest, and flight 11 is the capture that shows a clock
+    // cannot: `[27617ms] … desktop-app ARMED`, the hold from 28.064s, `[43069ms] [wc-x] desktop-app
+    // HOLD-EXPIRED reason=dmg-refuse-unsettled name=/STAT.ELF waited=15005ms threshold=15000ms`,
+    // `[43077ms] … LAUNCH`, and the witness entering only at `[48074ms] :: DMG-REFUSE: the window
+    // table was not empty at entry (occupied=0x01) — refusal witness NOT RUN ::`. Fifteen seconds
+    // bought the witness nothing and cost the desktop everything the operator could see: the bar held
+    // `cap_owner=0 boxes=0 items=none` from `menubar ENABLED` at 27.616s to 43.363s — the whole of
+    // MENUFIRST's 15746 ms, which it measured and correctly named as not the bar's. So the launch is
+    // no longer deferred. `held_ms=0` is a FACT about this seam, not a threshold that happened not to
+    // be reached, and the settle state is published beside it so that a later `NOT RUN` naming an
+    // occupied table has this line as the row's provenance. On the default `esp-x86` media (`wc` on,
+    // `witness` off) the flag is born `true` and this reads `dmg=settled`: the fixture is not in the
+    // image and the desktop pays nothing for it, which is now STATED at the seam instead of inferred
+    // from a `cfg!` inside an atomic initialiser in another file. The ordering the hold reached for is
+    // real, but it is the FIXTURE's to take — `arch/x86_64/syscall.rs`'s `dmg_refuse_witness` is what
+    // knows when its own entry is, and it can yield to an already-launched app instead of demanding an
+    // empty table. That change is not this seam's and is not made here.
+    serial_println!(
+        "[wc-x] desktop-app HOLD-NONE name=/{} held_ms=0 dmg={} — the launch is not gated on the DMG-REFUSE settle; a clock cannot arbitrate row 0, and flight 11 paid waited=15005ms to lose the witness anyway",
+        DESKTOP_APP,
+        if crate::arch::syscall::DMG_REFUSE_SETTLED.load(Ordering::Acquire) { "settled" } else { "unsettled" }
+    );
     DONE.store(true, Ordering::Relaxed);
 
     // APPLOAD: the same handle ladder the storage gate above cleared — mounting `Default` here after
