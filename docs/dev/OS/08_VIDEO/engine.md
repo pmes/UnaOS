@@ -19728,3 +19728,219 @@ one file). `GATE-LEDGER` is `OK` in every one of those runs. The harness's closi
 `check FAILED — a ledger row is unverifiable`, which is its generic wording; the gate that actually
 reddened is the branch registry above it. Same shape and same disposition as PTRPAINT's
 `exec-rmbp-kvblank` note earlier in this file.
+
+## MENUBATT2 — the battery never polled on flight 11 because the poll was not in flight 11's image, and the silence that hid it is now a line (x86 `wc`, flight 11, 2026-09-22)
+
+MENUFIRST (B156) read flight 11's 2.2 MB for a `[menubar] battery` line, found none, and wrote the
+sentence this arc was sent to act on:
+
+> in 2.2 MB of capture there is **no `[menubar] battery` line at all**, which `battery_witness`
+> emits unless `status::source() == Unresolved` … So on an rMBP **with a pack** the status source
+> never resolved for the whole boot.
+
+That inference is sound about the CODE and wrong about the BOOT, and the difference is which artifact
+flew.
+
+### 1. The mechanism, from the image and not from the wire
+
+`docs/dev/evidence/rmbp-0922/flight11/` records flight 11 as **image 3 = `56bbe53b`**
+(2026-09-22 08:12:41 -0600). At that commit:
+
+    $ git cat-file -e 56bbe53b:unaos/crates/kernel/src/video/status.rs
+    fatal: path '…/video/status.rs' exists on disk, but not in '56bbe53b'
+    $ git grep -c battery_witness 56bbe53b -- unaos/crates/kernel/src/video/menubar.rs   # no match
+    $ git grep -n  status::poll  56bbe53b -- unaos/crates/kernel/src/video/desktop_uefi.rs # no match
+
+**The status model, the bar's battery witness and the poll call site did not exist in the artifact
+Peter flew.** MENUSTAT folded at `0fb0f4fb`, 2026-09-22 15:42:46 — seven and a half hours after
+flight 11's image was cut, and `56bbe53b` is an ancestor of it (`git merge-base --is-ancestor`, exit
+0). So on flight 11 there was nothing to print, nothing to return early from, and no source to leave
+`Unresolved`. B148's own status cell had already said as much: *"the METAL half (a pack that
+actually answers) is flight 12's."*
+
+Everything else B156's sentence depends on is TRUE on that boot, which is why it read so well:
+
+  * the `wc` and `smc` knobs were both in the image —
+    `[ 28036ms] :: GPACE: … build=kepler+takeover+fifo+ivb+wc+smc+ ==` ;
+  * the device-service pass ran, and `desktop_app_service` is the function that says so —
+    `[ 43069ms] [wc-x] desktop-app HOLD-EXPIRED reason=dmg-refuse-unsettled name=/STAT.ELF
+    waited=15005ms threshold=15000ms — launching anyway`, then `[ 43077ms] … LAUNCH … pid=26` ;
+  * and the SMC answered the battery keys on that very boot —
+    `[ 25627ms] :: SMC-SCOUT: key BNum present len=1 bytes=[01]`,
+    `[ 25628ms] … key BRSC present len=2 bytes=[00 52]` (82 %),
+    `[ 25628ms] … key B0AC present len=2 bytes=[03 f6]` (+1014 mA),
+    `[ 25731ms] :: SMC-BATT: present=true soc=82% volt=12311mV amp=1014mA … ac=derived:charging
+    retries=0/0 st0=0 rfail=0 rok=0 short=0 unc=0 == witness ::`.
+
+A pack that answers, on a lane that runs, in an image with both knobs — and no poll compiled into
+it. **The poll has never run on metal.** Its first metal reading is flight 12's, and always was.
+
+`drivers/smc.rs` was read and is NOT the defect: `battery::raw()` is six `raw_b1`/`raw_b2` calls,
+each `READ_ATTEMPTS = 3` deadline-bounded attempts with `Err(SmcError::Absent)` short-circuiting on a
+clean negative. Nothing in it was changed. Nor was the poll's placement, its call site, or
+`POLL_MS` — `LAST_POLL_MS` starts at `0`, so the first service pass after ignition already sweeps
+immediately and the throttle only governs the SECOND sweep. **`main.rs`'s `dmg-refuse-unsettled`
+hold is untouched and the poll did not move relative to it**: `status::poll()` is above
+`DESKTOP_APP_ARMED`'s gate and the hold is below it, as before.
+
+### 2. Why a correct code path could be misread, and what that costs
+
+`battery_witness` says NOTHING while the source is `Unresolved` — correctly, on its own terms; a line
+claiming absence before anything asked is the opposite defect. But it made three different facts
+print the same nothing:
+
+  1. the desktop service pass never ran, so `poll` was never called;
+  2. `poll` ran and the source has not resolved;
+  3. **this code is not in the image at all.**
+
+B156 picked (2). The answer was (3). The defect this arc fixes is therefore **instrumental, not
+behavioural**: an absence that three causes share is not evidence for any one of them.
+
+### 3. The fix — the poll states that it ran
+
+`video/status.rs` gains `poll_witness`, called from inside `poll`'s throttled body:
+
+    [status] poll n=<sweeps> answered=<answers> src=<none|smc|fixture> took_us=<cost>
+
+Once on every CHANGE of the resolved source — which includes the boot's first sweep, since
+`WIRE_SRC` starts at `SRC_UNSAID = 0xff`, a value no source takes — and once per `WIRE_MS` (60 s,
+six poll periods, the same span `STALE_MS` gives a held reading) while nothing changes. UNGATED
+inside the furniture gate, no `witness` term, for `battery_witness`'s reason: the metal image is
+built without `witness` and an instrument absent from the artifact Peter flies is not an instrument.
+
+`took_us` is measured in CYCLES around exactly the six handshakes (`arch::now_cycles` +
+`strip::cycles_to_us`) and not in `arch::ms()`: the whole sweep is ~1.2 ms by the scout's arithmetic,
+so a millisecond clock would report a two-valued number and no reader could tell a clean sweep from
+one that spent its retry budget. It is the term that makes the poll's placement argument (WEDGE-8,
+and `main.rs`'s render-core rule) falsifiable on metal instead of inherited from a scout.
+
+`source()` is now `src_of(SRC.load(..))`, split so the witness names the source of the sweep it just
+ran from the byte it already loaded — a line whose `src=` and `took_us=` described different sweeps
+would be the same class of error this arc exists to close.
+
+### 3a. ⛔ THE FIRST MEASURED RUN OF THE NEW WITNESS CAUGHT A FIXTURE INFLATING IT, AND THAT IS THE `Source::Fixture` LESSON ONE FIELD OVER
+
+The instrument's own first capture read:
+
+    [status] poll n=1 answered=0 src=none took_us=1965
+    [status] poll n=7 answered=3 src=none took_us=14
+
+`answered=3` **on a controller that had answered nothing.** `ANSWERS` was incremented inside
+`store()`, and `store()` is called by `inject()` as well as by the sweep, so MENUBATT's three fixture
+injections were counting themselves as SMC answers — the same defect `Source::Fixture` was minted
+for (B148: *"a fixture's reading may not wear the driver's name"*), one field to the left, and B148's
+own quoted wire shape `polls=1/1` carries it.
+
+It is NOT a QEMU-only cosmetic. B156 records that **the flown images are witness builds**, so
+`inject` exists on metal and `battery_selftest` runs there: flight 12's `answered=` would have
+carried the same inflation into the reading this arc was sent to produce.
+
+TAKEN: the increment moved out of `store()` and into `poll()`'s `Some` arm, so only a SWEEP may
+count as an answer. Re-measured on the same gate, `answered=0` on all four sweeps, and the bar's own
+rollup moved `polls=1/1` → `polls=0/1` — B148's quoted shape is superseded by this row, not
+contradicted by it.
+
+`took_us` earns its place in the same two lines: the FIRST sweep pays six real `read_key` handshakes
+and every later one costs ~15 µs, because PROBE-ONCE (`smc::battery::probe_once_skip`) has latched
+the six keys as absent and issues no transaction at all. That ratio is on the wire now and was not
+before.
+
+⚠ **WHAT THE INSTRUMENT DOES NOT BUY, and it is the honest half.** No witness added here could have
+been in flight 11's image, because the FILE was not. The general cure for this class of error is not
+an instrument: it is reading a capture against the COMMIT its image was built from before inferring
+a code path's behaviour from a line's absence. What `[status] poll` buys is flight 12 onward, where
+the poll IS in the image and its silence would otherwise still be three-valued.
+
+### 4. The prediction for flight 12, falsifiable
+
+The poll's first sweep is the first pass of the DEVICE-SERVICE task, and flight 11 stamps when that
+task begins: `[ 28062ms] :: SCHED-X86: usb-pump task dispatched on core 7 ::`, which is 446 ms after
+`[ 27616ms] [wc-x] menubar ENABLED panel=2880x1800 rect=Some((0, 0, 2880, 34))` and 2.3 s after the
+SMC answered its keys. Against those three stamps:
+
+  1. **the first `[status] poll` lands a few ms after `usb-pump task dispatched`** — i.e. ~450 ms
+     AFTER `menubar ENABLED`, not before it, because `activate` (which prints `menubar ENABLED` and
+     `desktop-app ARMED`) runs at the Kepler takeover seam and the task that calls the poll is
+     dispatched later. `n=1`, and `took_us` in the high hundreds to ~2000 (six transactions at the
+     scout's measured ~200 µs);
+  2. it reads **`src=smc answered=1`** on that FIRST sweep, not `src=none`: the SMC was already
+     answering at 25626 ms, 2.4 s before the task exists, so there is no window in which the poll
+     can run ahead of the controller. Should the order ever invert, the model self-heals — an early
+     `src=none` is overwritten by the next sweep's `store()` 10 s later — and the CHANGE policy puts
+     both readings on the wire rather than only the second;
+  3. **`[menubar] battery pct=82 charging=y mins=106 age_s=0 src=smc mv=12311 ma=1014 polls=1/1`**
+     appears within one `BATT_WIRE_US` interval (5 s) of that first poll — `pct` is whatever `BRSC`
+     reads on the day, `charging=y` iff `B0AC` is above the ±32 mA deadband;
+  4. and the item is on the glass **left of the clock**, MENUSTAT's order (glyph-then-percent) kept
+     as shipped. The percent-then-glyph flip is macOS's order and is Peter's call, parked at B148's
+     deviation (ii) and NOT taken here.
+
+Each of the four is a line in the capture or a pixel on the panel, and any of them missing is a
+finding rather than a shrug. If `[status] poll` is absent from flight 12 entirely, the cross-check is
+`[wc-x] desktop-app` in the SAME function: those lines present with no `[status] poll` means the poll
+call was dropped, and both absent means the service pass did not run.
+
+### 5. Gates
+
+`cd unaos && ./arroyo check` — `x86_64 OK`, `aarch64 OK`, `bootloader OK`, `kernel cfg coverage OK
+(81 legs)`, userspace both arches OK, `GATE-FC2` green, `GATE-KNOB: OK — 210 features declared, 209
+named by a cfg, 0 phantom, 0 dead, 0 trailing-comment cfg`, `GATE-LEDGER: OK`. **No warning names
+`status.rs`.** (The first of the two runs — taken before the `ANSWERS` move of §3a — was **rc 0**
+end to end at `GATE-BRANCH: OK, refs=595 … owed=0 red=0`; the closing run is the one whose figures
+are quoted, and its `GATE-BRANCH` red is the foreign one below.)
+
+`bash unaos/scripts/ledger-check.sh` — **rc 0 BEFORE** (452 rows, `GATE-BRANCH: OK`, refs=590).
+AFTER: `GATE-LEDGER: OK — 453 rows in 4 ledger file(s)`, and **rc 1 on findings that are not this
+arc's** — run in the gate's own form (`unaos/scripts/ledger-check.sh "$(pwd)"`, which is what
+`arroyo`'s GATE-LEDGER leg invokes at `unaos/arroyo:8181`): `GATE-BRANCH: RED — refs/heads/exec-rmbp-sertaps e6d8c2da "serial: SERTAPS — SERTXPIN:
+[sertx] was pinned in no spec" — UNREGISTERED`. **The sha is quoted HERE and not in B170**, and that is
+not fastidiousness: the first draft of B170 carried it and `GATE-LEDGER` reddened by name —
+`B170 is fixed-unflown but sha … is not an ancestor of any track head` — because a real commit on no
+track cited in a ledger row is itself a finding. B156 recorded the identical trap one row over, and
+this arc walked into it and was caught by the same gate. **Proved environmental rather than argued, and this arc's reading is
+stronger than B156's**: the SAME tree answered `GATE-BRANCH: OK` at `refs=590` at the start of this
+session, `RED` with ONE finding at `refs=595`, and `RED` with **TWO** minutes later, the second
+being `refs/heads/exec-rmbp-dmgyield d99b787d "x86/dmg-refuse: DMGYIELD …"`. **The count climbs
+while this tree stands still**, which is what an environmental red looks like from the inside;
+peers were landing throughout. Neither branch is this seat's and neither touches a file this arc
+opens (`serial`, `x86/dmg-refuse`); `GATE-LEDGER` is `OK` in every run. Report-not-touch.
+
+THE WC LANE, `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_QEMU_FULL=1 ./arroyo test
+240` — **rc 0, COMPLETE** (`the boot reached its last fixture (serial.log line 2498)`, full wall
+241.9 s, 2870 lines, `MBENCH PASS — 6/6` against `x86-default.spec`). Four `[status] poll` lines in
+the capture, which is the cadence the policy predicts on a 240 s wall with nothing changing — one
+at the first sweep and one per `WIRE_MS`:
+
+    [status] poll n=1  answered=0 src=none took_us=14335
+    [status] poll n=7  answered=0 src=none took_us=14
+    [status] poll n=13 answered=0 src=none took_us=24
+    [status] poll n=19 answered=0 src=none took_us=12
+
+`n` stepping by 6 between lines is `POLL_MS`=10 s inside `WIRE_MS`=60 s, stated twice over
+independently. MENUBATT and MENUFIRST undisturbed in the same run:
+`:: MENUBATT: … decode_ok=true gone_red=true absent_ok=true layout_ok=true seat_ok=true
+jitter_paint=false change_paint=true damage_ok=true :: PASS ::` and
+`:: MENUFIRST: after_enable_ms=1 … bounded=true gone_red=true :: PASS ::`.
+
+`./arroyo mbench --replay … --spec scripts/specs/x86-wc.spec --platform x86` — **rc 0, 18/18**,
+both new pins hitting.
+
+GO-RED, MEASURED AND NOT ARGUED: `super::status::poll();` disarmed at `desktop_uefi.rs:711`, same
+lane, **rc 0 COMPLETE** (line 2486) — and the capture carries **zero `[status] poll` lines**,
+`[menubar] battery absent src=none` is GONE (the source never resolves, so `battery_witness`'s
+Unresolved arm returns in silence), and the one line left reads
+`[menubar] battery pct=82 … src=fixture … polls=0/0`. **That capture is flight 11's wire,
+reproduced from a tree that HAS the poll** — which is the arc's whole claim, run as an experiment.
+The replay reds on exactly the new REQUIRE: `❌ REQUIRE \[status\] poll n=\d+ …`,
+`MBENCH FAIL — 17/18`. `desktop_uefi.rs` restored and verified byte-identical by `sha256sum`
+(`e18b9ee8…`), `git diff` empty for that file.
+
+The spec pin is `unaos/scripts/specs/x86-wc.spec`, a REQUIRE/FORBID pair extending the MENUBATT pair
+at `:163` but TAIL-APPENDED — that file's own CONTRACT block names tail-append as the safe form
+because rows cite its lines positionally, and an insert at `:164` would have moved MENUFIRST's
+`:180`/`:187`.
+
+NOT CITED: `./arroyo knoboff`. The change is entirely inside `wc`-gated code (`video/status.rs` is
+declared under the furniture gate at `video/mod.rs:969`), so a knob-off build is byte-identical by
+construction and the reading would carry no information. LAWS §5 (2026-09-22): the replay is the
+proof, and it is above.
