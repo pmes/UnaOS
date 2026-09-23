@@ -3982,10 +3982,10 @@ impl FatFs {
         with_dir_lock_src(self.source, "mark_dir_deleted", || {
             let mut buf = [0u8; SECTOR_SIZE];
             self.rd_sector(dir_lba, &mut buf)?;
-            buf[dir_off] = 0xE5;
+            let trail = lfn_retire_in_sector(&mut buf, dir_off, None); // LFN2 (B182): the short entry's `0xE5` AND every slot of its VFAT run in THIS sector, in ONE write — see §LFN2 at the file tail. A slot that is not a live short entry gets exactly the old single-byte `0xE5` and nothing else.
             self.wr_sector(dir_lba, &buf)?;
-            Ok(())
-        })
+            Ok(trail)
+        }).map(|trail| self.lfn_retire_prior(dir_lba, trail)) // LFN2: then the run's slots in EARLIER directory sectors, nearest first — AFTER the short entry is gone, so a cut leaves an orphan run and never a live entry with a half-tombstoned name. Best effort by design (§LFN2): the delete has happened, and failing here would make `delete_located` skip `free_chain` and leak the chain.
     }
 
     /// U11-M2: free every cluster in a file's chain (each FAT entry -> `0`, in ALL FAT copies), returning the
@@ -5452,12 +5452,12 @@ pub fn fat32_by_shape(fat_sz16: u32, fat_sz32: u32, root_ent_cnt: u32) -> bool {
 //      stops the writer after k slots and the fixture re-reads the directory.
 //
 // WHAT IS NOT HERE, STATED SO IT IS NOT MISTAKEN FOR DONE:
-//   * **DELETE does not reclaim the component slots.** `delete_located` marks the SHORT entry `0xE5`
-//     and leaves the run in place. That is SAFE — an orphan run is discarded by `LfnBuf` the moment
-//     the next short entry's checksum disagrees, and a fresh run's `LAST_LONG_ENTRY` slot calls
-//     `reset()` — but it WASTES slots until the directory is rewritten. A real VFAT driver tombstones
-//     the run too. Ledgered (rmbp-ledger B173) rather than done: it is a change to the delete path,
-//     which is not this arc's.
+//   * **DELETE did not reclaim the component slots** — CLOSED by §LFN2 (B182, file tail):
+//     `mark_dir_deleted` now tombstones the run with the short entry, the short entry's sector first.
+//     Before it the run stayed live: SAFE — an orphan run is discarded by `LfnBuf` the moment the next
+//     short entry's checksum disagrees, and a fresh run's `LAST_LONG_ENTRY` slot calls `reset()` —
+//     but it WASTED slots until the directory was rewritten. It was ledgered (rmbp-ledger B173) rather
+//     than done here because it is a change to the delete path, which was not FATLFN's.
 //   * **RENAME does not rewrite the run.** `rename_entry` rewrites the 11-byte short field, which
 //     changes the checksum the preceding run was stamped with, so the long name silently falls away
 //     and the entry reads back under its new short name. Same disposition, same row.
@@ -6175,5 +6175,224 @@ pub fn fatlfn_witness_once() {
             FATLFN_NAME
         ),
         Err(e) => serial_println!(":: FAT-LFN: VFAT long-name create ({:?}) FAIL ::", e),
+    }
+}
+
+// =========================================================================================
+// §LFN2 (2026-09-23, rmbp-ledger B182 — B173's two owed halves) — a long-named entry's component
+// run LEAVES WITH IT: DELETE tombstones the run.
+//
+// WHY. FATLFN (B173) gave the create path VFAT long names and left two paths that only knew the
+// 32-byte short slot. `mark_dir_deleted` wrote `0xE5` into byte 0 of the short entry and left the
+// component run standing — safe, because `LfnBuf` discards a run whose short entry is gone, but every
+// deleted long name kept `ceil(len / 13)` slots live until the directory was rewritten. And
+// `rename_entry` rewrote the 11-byte short field, which is exactly what every component slot's
+// checksum is computed over, so the long name fell away silently and the file read back under its
+// new 8.3 name; a long NEW name was refused outright (`format_83`).
+//
+// THE WALK IS THE READER'S RULE, RUN BACKWARDS. The run that belongs to a short entry is the one
+// `LfnBuf` would attach to it: the slots IMMEDIATELY preceding it, attribute `0x0F`, ONE checksum
+// equal to `lfn_checksum` of the short field, ordinals 1, 2, 3 … going back, ending at the slot that
+// carries `LAST_LONG_ENTRY`. `lfn_trail_in_sector` takes a slot only when `LfnBuf::push` would have
+// taken it as THIS run's component, so the walk cannot reach into a neighbour's run (a neighbour's
+// run is separated by the neighbour's own short entry, and carries the neighbour's checksum). The
+// checksum is read from the short field BEFORE that field is changed, which is the only moment it
+// still names the run.
+//
+// THE ORDER — the mirror of FATLFN's "slots first, short entry last" for create, and for the same
+// reason: the reader must never see a LIVE short entry with a half-written (here: half-tombstoned)
+// run, because that entry would be listed under its 8.3 alias — a name the user never gave it.
+//   * DELETE: the short entry's sector FIRST — the `0xE5` on the short entry and every run slot in
+//     that same sector, in ONE write — then the run's slots in EARLIER sectors, nearest first. After
+//     the first write the entry is gone; whatever of the run is still standing is followed by a
+//     `0xE5` (`LfnBuf::reset`) and is an orphan the reader discards: wasted slots, the pre-LFN2 state,
+//     never a mislabel. The reverse order would expose the alias on a cut.
+//     It lives in `mark_dir_deleted`, not in `delete_located`, because that is the one primitive
+//     every unlink path shares: `delete_located` (and `remove_dir` through it), the aarch64
+//     `sys_unlink`'s deferred free (mark now, free at the last close), and `move_entry`'s retirement
+//     of its source entry. No caller changed; each now takes the run with the entry.
+//
+// A run may cross sector AND cluster boundaries (FATLFN's allocator crosses both, and a 255-unit
+// name is 21 slots). Going BACKWARDS across a cluster boundary needs the cluster whose FAT entry
+// points at this one, which the FAT does not index; `fat_predecessor` tries `c - 1` first (one FAT
+// sector — the contiguously grown directory) and otherwise scans FAT copy 0. It is reached only when
+// a run straddles a cluster start, and it never decides WHAT is tombstoned — the checksum-and-ordinal
+// trail does — so a cross-linked FAT cannot redirect it into a stranger's slots.
+// =========================================================================================
+
+/// LFN2: the trail a walk-back follows — `ck`, the checksum the run was stamped with (the ORIGINAL
+/// short field's), and `next`, the ordinal the next slot back must carry.
+#[derive(Clone, Copy)]
+struct LfnTrail {
+    ck: u8,
+    next: u8,
+}
+
+/// LFN2: walk BACK from slot index `upto` (exclusive) of one directory sector, pushing onto `hits` the
+/// index of every slot that is the next component of the run `t` describes. Returns `Some(trail)` when
+/// the walk reached the TOP of the sector still inside the run (it continues in the previous directory
+/// sector), `None` when the run ended here: at its `LAST_LONG_ENTRY` slot, at the 20-slot cap, or at the
+/// first slot that is NOT this run's next component (free, deleted, a short entry, another checksum, an
+/// ordinal out of sequence). Read-only; the caller decides what to write.
+fn lfn_trail_in_sector(
+    sec: &[u8; SECTOR_SIZE],
+    upto: usize,
+    mut t: LfnTrail,
+    hits: &mut alloc::vec::Vec<usize>,
+) -> Option<LfnTrail> {
+    let mut i = upto;
+    while i > 0 {
+        i -= 1;
+        let e = &sec[i * 32..i * 32 + 32];
+        if e[0] == 0x00 || e[0] == 0xE5 || e[11] & 0x0F != 0x0F || e[13] != t.ck || (e[0] & 0x1F) != t.next {
+            return None;
+        }
+        hits.push(i);
+        if e[0] & LFN_LAST != 0 || t.next as usize >= LFN_MAX_SLOTS {
+            return None;
+        }
+        t.next += 1;
+    }
+    Some(t)
+}
+
+/// LFN2: retire the short entry at `off` in this sector buffer — `new_name` `None` writes `0xE5` (the
+/// delete), `Some(raw)` writes the new 11-byte field (the 8.3 rename) — AND tombstone every slot of its
+/// run that lies in the same sector, so that part is ONE write with the short entry. Returns the trail
+/// when the run continues into the previous directory sector.
+///
+/// Only a LIVE SHORT ENTRY has a run to follow. For any other slot (already `0xE5`, the `0x00`
+/// terminator, a component, a volume label) the field write is exactly what it was before LFN2 and
+/// nothing else is touched, so a caller that hands this a slot the old code handled is served
+/// byte-for-byte as before — and so is an 8.3 entry with no run in front of it, which is every entry
+/// this driver created before FATLFN.
+fn lfn_retire_in_sector(
+    buf: &mut [u8; SECTOR_SIZE],
+    off: usize,
+    new_name: Option<&[u8; 11]>,
+) -> Option<LfnTrail> {
+    let b0 = buf[off];
+    let attr = buf[off + 11];
+    let live_short = b0 != 0x00 && b0 != 0xE5 && attr & 0x0F != 0x0F && attr & 0x08 == 0;
+    let mut short11 = [0u8; 11];
+    short11.copy_from_slice(&buf[off..off + 11]); // BEFORE the field changes: the only moment it names the run
+    match new_name {
+        Some(raw) => buf[off..off + 11].copy_from_slice(raw),
+        None => buf[off] = 0xE5,
+    }
+    if !live_short {
+        return None;
+    }
+    let mut hits = alloc::vec::Vec::new();
+    let more = lfn_trail_in_sector(buf, off / 32, LfnTrail { ck: lfn_checksum(&short11), next: 1 }, &mut hits);
+    for i in hits {
+        buf[i * 32] = 0xE5;
+    }
+    more
+}
+
+impl FatFs {
+    /// LFN2: the directory sector that precedes `lba` in the directory's own order, or `None` when `lba`
+    /// is the directory's first sector. The FAT16 fixed root is one flat run; inside a cluster it is
+    /// `lba - 1`; at a cluster's first sector it is the LAST sector of the cluster whose FAT entry points
+    /// here (`fat_predecessor`), and a cluster nothing points at is the directory's first.
+    fn prev_dir_sector(&self, lba: u64) -> Result<Option<u64>, FatError> {
+        if self.kind == FatKind::Fat16
+            && lba >= self.root_dir_lba
+            && lba < self.root_dir_lba + self.root_dir_sectors as u64
+        {
+            return Ok(if lba > self.root_dir_lba { Some(lba - 1) } else { None });
+        }
+        if lba < self.data_start {
+            return Err(FatError::OutOfVolume);
+        }
+        let spc = self.sec_per_clus as u64;
+        let rel = lba - self.data_start;
+        if rel % spc != 0 {
+            return Ok(Some(lba - 1));
+        }
+        let c = (rel / spc) as u32 + 2;
+        if !self.valid_cluster(c) {
+            return Err(FatError::BadChain);
+        }
+        Ok(self.fat_predecessor(c)?.map(|p| self.cluster_lba(p) + spc - 1))
+    }
+
+    /// LFN2: the cluster whose FAT-copy-0 entry is `c`, or `None`. `c - 1` first — one FAT sector, and the
+    /// answer for any directory that grew into the next free cluster — then a bounded scan of copy 0 in
+    /// counted runs (`rd_sectors`). Only reached when a run straddles a cluster START, so its cost is
+    /// paid by that case alone; a 62 MiB FAT32 volume's copy is ~1000 sectors.
+    fn fat_predecessor(&self, c: u32) -> Result<Option<u32>, FatError> {
+        if self.valid_cluster(c - 1) && self.fat_entry_copy(c - 1, 0)? == c {
+            return Ok(Some(c - 1));
+        }
+        let entry_bytes: u64 = if self.kind == FatKind::Fat32 { 4 } else { 2 };
+        let per_sec = SECTOR_SIZE as u64 / entry_bytes;
+        let last = self.count_of_clusters as u64 + 1; // the highest valid cluster number
+        let secs = core::cmp::min(self.fat_sz as u64, (last + 1) * entry_bytes / SECTOR_SIZE as u64 + 1);
+        let chunk = core::cmp::min(crate::drivers::block::MAX_BLOCKS_PER_OP, 16) as u64;
+        let mut buf = alloc::vec![0u8; chunk as usize * SECTOR_SIZE];
+        let mut sec = 0u64;
+        while sec < secs {
+            let n = core::cmp::min(chunk, secs - sec);
+            self.rd_sectors(self.fat_start + sec, &mut buf[..n as usize * SECTOR_SIZE])?;
+            for k in 0..n * per_sec {
+                let cl = sec * per_sec + k;
+                if cl < 2 || cl > last {
+                    continue;
+                }
+                let at = (k * entry_bytes) as usize;
+                let v = match self.kind {
+                    FatKind::Fat16 => u16le(&buf, at) as u32,
+                    FatKind::Fat32 => u32le(&buf, at) & 0x0FFF_FFFF,
+                };
+                if v == c {
+                    return Ok(Some(cl as u32));
+                }
+            }
+            sec += n;
+        }
+        Ok(None)
+    }
+
+    /// LFN2: continue a retirement into the directory sectors BEFORE `lba`, nearest first — one sector RMW
+    /// under `DIR_MUTATION` per sector that holds any of the run, exactly the span `mark_dir_deleted`
+    /// uses — until the run's `LAST_LONG_ENTRY` slot. At most two further sectors (20 slots, 16 per
+    /// sector).
+    ///
+    /// **Best effort, on purpose.** It runs AFTER the short entry's sector is written, so the operation
+    /// the caller asked for has already happened: the entry is gone, and every run slot still standing
+    /// is followed by a `0xE5` — an orphan `LfnBuf` discards. A failure here therefore costs wasted
+    /// slots and nothing else, and reporting it as the operation's failure would be false — worse, it
+    /// would make `delete_located` skip `free_chain` and leak the whole chain.
+    fn lfn_retire_prior(&self, lba: u64, trail: Option<LfnTrail>) {
+        let Some(mut t) = trail else { return };
+        let mut cur = lba;
+        for _ in 0..LFN_MAX_SLOTS {
+            let prev = match self.prev_dir_sector(cur) {
+                Ok(Some(p)) => p,
+                _ => return, // the directory's first sector, or a FAT fault: the residue is an orphan
+            };
+            let step = with_dir_lock_src(self.source, "lfn_retire_prior", || {
+                let mut buf = [0u8; SECTOR_SIZE];
+                self.rd_sector(prev, &mut buf)?;
+                let mut hits = alloc::vec::Vec::new();
+                let more = lfn_trail_in_sector(&buf, SECTOR_SIZE / 32, t, &mut hits);
+                if !hits.is_empty() {
+                    for &i in &hits {
+                        buf[i * 32] = 0xE5;
+                    }
+                    self.wr_sector(prev, &buf)?;
+                }
+                Ok(more)
+            });
+            match step {
+                Ok(Some(nt)) => {
+                    t = nt;
+                    cur = prev;
+                }
+                _ => return,
+            }
+        }
     }
 }
