@@ -1364,7 +1364,7 @@ pub fn selftest() {
     for &i in w.iter() {
         wm::close(i);
     }
-    let rect_after = SLOT.packed();
+    let rect_after = vacate_settle(pw, ph); // DOCKVAC — ⚠ SAME-LINE fold, line-NEUTRAL (B94). WAS `SLOT.packed()` read straight after the three closes, and that read is FIXTURE_FLAKES §1e's red (rmbp-ledger B187): each `wm::close` ends in `wm::composite()`, which on x86 DECLINES when a sibling core holds `COMP_GATE` and returns identically whether a pass ran or not, so with all three declined [`compose`] never re-packed the strip and the after-sample WAS the before-sample. Class 6 — the fixture scored the value a declined step was to publish. [`vacate_settle`] waits the holder out, bounded, until [`SLOT`] holds the rect the post-close model demands; the verdict expression on the next line is unchanged, so a strip that repacks WITHOUT re-publishing its rect still reds.
     let vacate_ok = rect_before == 0 || rect_after != rect_before;
     focus_set(saved_focus);
     wm::focus_changed(saved_focus);
@@ -2780,4 +2780,77 @@ fn composite_reconciled() -> bool {
             core::hint::spin_loop();
         }
     }
+}
+
+// ------------------------------------------------------------------------------------------------
+// DOCKVAC — leg 6's after-sample waits for the strip's own re-pack (TAIL-APPENDED: nothing above this
+// block moved, so knob-off panic `Location` line numbers are untouched; B94, PARITY.md §5.3)
+// ------------------------------------------------------------------------------------------------
+//
+// FIXTURE_FLAKES §1e, rmbp-ledger B187. `selftest` leg 6 sampled [`SLOT`] before and after closing
+// its three rows and required the packed rect to CHANGE. [`SLOT`] has exactly one writer, [`compose`]
+// (its `SLOT.store` / `SLOT.clear`), and `compose` runs only inside a composite pass. The fixture's
+// passes were the three `wm::composite()` calls at the tail of each `wm::close`, and on x86 each of
+// those compare-exchanges `COMP_GATE` and takes the DECLINE arm when a sibling core holds it: stores
+// `COMP_PENDING`, composites nothing, returns — identically to a pass that ran. gate10's red
+// (`logs/foldgate/g10-test-x86-wc.log:2127..2147`) is that event on the wire: a sibling core's pass
+// printed `[dock] tile remove win=1 … reason=close` BETWEEN the row free and `[wc-a] close win=1`,
+// then did not print its `[dock] census` until AFTER the verdict, and no `tile remove` for win 2 or 3
+// appears before the verdict at all — the fixture's own three passes were all turned away while that
+// holder was stalled. Every green in the corpus shows `tile remove` + `census` after EACH close,
+// before the verdict. The red's `[strip] vacate tenant=dock … -> SCENE-RESTORE` line is NOT the
+// fixture's vacate: that line is latched once per boot (`SAID_RESTORE` in `strip::vacate`) and in
+// every capture it is the boot's FIRST dock shrink, ~230 lines ahead of the fixture.
+//
+// The cure is DMGFLAKE's (B158) and DOCKID2's (B165) shape, not their code: re-drive the pass,
+// bounded, until the thing the fixture reads has been written by a pass that saw the closes. The
+// settle predicate is "[`SLOT`] holds the rect the CURRENT model demands" — [`strip_rect`], the
+// tenant registry's own reader of the pinned count — and NOT "the rect changed", because a wait on
+// the leg's own inequality would stop the moment any pass moved the rect and would be the verdict
+// wearing a loop. The verdict (`rect_after != rect_before`) is untouched: under the defect the leg
+// was written for — a strip that shrinks without re-publishing its rect — the slot never reaches the
+// model's rect, the budget runs out, and the leg reds exactly as it did.
+//
+// The wait is REPORTED and never gated on (LAWS §5): one line, `[dock] vacate settle folds=<n>
+// wait_ms=<ms> reconciles=<r> budget_ms=250 -> SETTLED | UNSETTLED why=…`. `reconciles=` is the
+// [`RECONCILES`] delta across the wait — how many passes reached `compose` while the fixture waited,
+// on ANY core — so an exhausted budget names which of the two it was: `why=no-pass` (the gate was
+// held for the whole budget: a new and reportable fact, read `[wcser]` beside it) or `why=pass-ran`
+// (passes reached `compose` and the slot still did not follow: the STRIP's defect, never re-run
+// away). The line carries no `FAIL`, `SKIP` or `PASS` token, so it trips no DEFAULT_FORBID and
+// satisfies no REQUIRE; the `:: DOCK: strip` line and its `x86-witness.spec` pin are unchanged.
+
+/// DOCKVAC — **wait out the strip's re-pack after leg 6's closes; return the settled after-sample.**
+///
+/// Budget and pacing are DOCKID2's constants ([`DOCKID_FOLD_WAIT_MS`], [`DOCKID_FOLD_SPIN_MAX`]),
+/// reused and not re-derived: the same pass, the same TCG tail, the same wedge margin. DOCKID2's
+/// counters are NOT touched — `:: DOCKID:`'s `reconciled=`/`folds=` fields are scored by the spec and
+/// must keep counting that fixture's drives alone.
+#[cfg(feature = "witness")]
+fn vacate_settle(pw: usize, ph: usize) -> u64 {
+    let w0 = crate::arch::ms();
+    let r0 = RECONCILES.load(Ordering::Relaxed);
+    let settled = || SLOT.packed() == strip::pack_rect(strip_rect(pw, ph));
+    let mut folds = 0u64;
+    let mut ok = settled();
+    while !ok && crate::arch::ms().wrapping_sub(w0) < DOCKID_FOLD_WAIT_MS {
+        folds += 1;
+        wm::composite();
+        ok = settled();
+        let mut spins = 0u32;
+        while !ok && spins < DOCKID_FOLD_SPIN_MAX && crate::arch::ms().wrapping_sub(w0) < DOCKID_FOLD_WAIT_MS {
+            spins += 1;
+            core::hint::spin_loop();
+        }
+    }
+    let ran = RECONCILES.load(Ordering::Relaxed).wrapping_sub(r0);
+    serial_println!(
+        "[dock] vacate settle folds={} wait_ms={} reconciles={} budget_ms={} -> {}",
+        folds,
+        crate::arch::ms().wrapping_sub(w0),
+        ran,
+        DOCKID_FOLD_WAIT_MS,
+        if ok { "SETTLED" } else if ran == 0 { "UNSETTLED why=no-pass" } else { "UNSETTLED why=pass-ran" }
+    );
+    SLOT.packed()
 }
