@@ -1326,7 +1326,7 @@ rmbp-queue's `· B9` row (`[ptrdead] … fpop3=1 -> FAIL`, 2 reds in 5 WC runs,
 both at load ≥ 24) is about the older grammar. A `-> FAIL` with `fpop12=0` is
 still the regression this entry warns about.
 
-### 3b. `[cursor11] … passes=0 … -> FLICKER` on the KNOB-OFF lane: PTRDEAD's stolen motion reaches the real arrow. **Measured 2026-09-23 (CURSORFLK, rmbp-ledger B186). The flicker is real, the trigger is this class, NOT FIXED.**
+### 3b. `[cursor11] … passes=0 … -> FLICKER` on the KNOB-OFF lane: PTRDEAD's stolen motion reaches the real arrow. **Measured 2026-09-23 (CURSORFLK, rmbp-ledger B186). FIXED 2026-09-23 (PTRLEAK, rmbp-ledger B193): both cures made, see the disposition at the end of this entry.**
 
 The entry above is this class's first and has no letter. This one is its second consequence. There, a
 foreign drain took PTRDEAD's events away from the leg's own accounting. Here, the drain that took them
@@ -1402,16 +1402,51 @@ table, per-boot population and probe: `docs/dev/evidence/rmbp-0915/cursorflk/`.
    new and reportable.
 3. The armed coordinates against (640 + stolen, 400 − stolen), where stolen = 192 − `travel`.
 
-**Disposition — WATCH, NOT FIXED, and not a re-run-away.** The instrument is right, and the flicker it
-counts is the knob-off cursor code's real behaviour. Under the brief's rule a real flicker is not fixed
-in the arc that finds it. Two cures, each for its owner:
+**Disposition — FIXED (PTRLEAK, rmbp-ledger B193, branch `exec-rmbp-ptrleak`), both cures.** The
+text that stood here (WATCH, two cures for their owners) is in git history.
 
-1. **Stop the leak.** Quiesce `x86_input_service`'s drain across PTRDEAD's window (the `ROUTER_SELFTEST`
-   shape). This is `main.rs` work and it is this class's open "quiesce or tolerate" question, now priced:
-   tolerating costs a knob-off gate run about 3% of the time.
-2. **Decide the knob-off flicker contract.** Either compile PTRREPAINT's subtraction on knob-off x86, or
-   exempt that build from the always-on `-> FLICKER` FORBID. Until then, **any knob-off x86 boot with a
-   real pointer can red that FORBID**, and the QEMU knob-off lane is green only because it has no pointer.
+1. **The leak is stopped.** `x86_input_service` pops through `pal::next_event_unless_held`. PTRDEAD
+   raises `pal::fixture_ring_hold(true)` before its first synthetic push and lowers it after its last
+   drain. The hold test and the pop are one critical section under the `EVENT_QUEUE` lock, because
+   the service runs on another core. This is the aarch64 `ROUTER_SELFTEST` rule on x86. It is a drain
+   stand-down and not an event tag, so the fixture also keeps its own events and JUDGES
+   (`whole=true`) where it used to skip. The hold covers only the input service. Every other drain
+   is untouched, so the SELFTEST-RACE SKIP arm stays, and a `skip` on a current capture names a
+   different drain. That is new and reportable.
+2. **The knob-off flicker contract is decided: cure (a).** `video/screen.rs` `DESK_SPRITE_OCC` is now
+   `cfg!(target_arch = "x86_64")`, so the knob-off desktop present WITHHOLDS the arrow and absorbs
+   its box, exactly as `wc` does. It no longer brackets it. The `wc` term was only the occluder
+   array's capacity, and the no-registry arm now stages `wm::occluders` through its own `wins`
+   (`desk_window_occluders`). `-> FLICKER` remains unique to a real flicker
+   (`scorer-token-uniqueness.sh --verb compose-through`, OK, one emitter), and `mbench.py`'s FORBID
+   is unchanged. On knob-off x86 `flicker_frames` is now an invariant, as on `wc`.
+
+**The rate, before and after** (every run `UNAOS_QEMU_FULL=1 ./arroyo test 120`, complete; full table
+in `docs/dev/evidence/rmbp-0915/ptrleak/PTRLEAK.md` and `runs.tsv`):
+
+| population | leaks (fpop12 >= 1) | knob-off `[cursor] armed` | `-> FLICKER` |
+| --- | --- | --- | --- |
+| before: peer population (CURSORFLK) | 4 in 68 | 4 | 2 in 68 (about 3%) |
+| before: CURSORFLK's probe, hold absent or mutated off | 7 in 7 | 5 in 5 | 5 in 5 knob-off |
+| after: the same probe | 0 in 2 (`… after 200ms pops=0`, knob-off and wc) | 0 | 0 |
+| after: 8 natural knob-off runs at `a99e9ebc`, load 10 to 16 | 0 in 8 | 0 | 0 |
+| after: forced arrow on knob-off (hold mutated off, M2 in) | 1 | 1 (`x=641 y=399`) | 0 (`flicker_frames=0 px_absorbed=405`) |
+
+Every `[ptrdead]` line of the 8 natural runs, byte-identical, and there was no `[cursor]` line in any
+of them:
+
+```
+[ptrdead] backlog whole=true nodrop=true order=true pushed=192 entries=1 travel=(192,-192) folded=192 dropped=0 fpop12=0 fpop3=0 cpu=3 svc=Some(5) -> PASS
+```
+
+Eight natural runs cannot separate a 3% rate from zero (CURSORFLK's 8 before were also clean). The
+deterministic probe does separate it, 7 of 7 before against 0 of 2 after, and so do the two go-reds
+(hold mutated off gives `[cursor] armed x=832 y=208 … flicker_frames=5 -> FLICKER`, rc=1;
+`DESK_SPRITE_OCC` mutated back gives `flicker_frames=4 -> FLICKER`, rc=1).
+
+**On recurrence, read it this way now.** A knob-off `-> FLICKER` is no longer this entry. It means the
+withhold regressed, which is a PTRREPAINT/PTRLEAK defect, and a banner check comes first as before.
+A `[cursor] armed` beside a `[ptrdead]` pair means the hold did not cover a drain.
 
 ---
 

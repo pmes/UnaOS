@@ -2265,3 +2265,62 @@ impl<'a> GneissPal for TargetPal<'a> {
         self.surface.height() as u32
     }
 }
+
+/// PTRLEAK (rmbp-ledger B193) — **a boot fixture that drives `EVENT_QUEUE` with SYNTHETIC input
+/// owns the ring for its push→pop window, and the x86 input service's drain stands down while it
+/// does.** The x86 twin of `ROUTER_SELFTEST` (`main.rs`, aarch64): a fixture's synthetic pointer
+/// events arm nothing, because they never reach the product.
+///
+/// Measured (CURSORFLK, B186): PTRDEAD pushes 192 synthetic `Mouse{1,-1}` into the live ring, and a
+/// timer preemption inside its window handed the fold accumulator to `x86_input_service`, which
+/// installed it on the REAL pointer (`[cursor] armed x=641 y=399` = panel centre + the stolen
+/// travel). On a knob-off boot the desktop present then bracketed that arrow and `[cursor11]`
+/// read `-> FLICKER`; on flight 12 it was the ONLY `[cursor] armed` of the boot.
+///
+/// **Why a hold and not a tag on the event.** A tag would still let the service TAKE the events —
+/// the fixture would keep losing its own queued input and SKIP its verdict — and it would widen
+/// `Event`, which every consumer and `pack_input` match on. The hold keeps the events where the
+/// fixture pushed them, so the leak is gone AND the leg judges instead of skipping.
+///
+/// **Why the flag is written and read under the queue lock.** The service runs on a different
+/// core from the fixture ladder (`cpu=3` against `svc=Some(5)`, SELFTEST-RACE), so a load of the
+/// flag followed by a separate pop is a window a whole push can land in. Here the stand-down test
+/// and the pop are ONE critical section, and the raise is its own critical section taken before the
+/// fixture's first push: a service pop either precedes the raise (and took an event that was
+/// already in the ring, never the fixture's) or follows it (and sees the hold). No interleaving
+/// hands a synthetic event to the service.
+///
+/// Scope: ONE consumer stands down — [`next_event_unless_held`]'s caller, `x86_input_service`.
+/// Every other drain (`next_event`, `pump_and_poll`, a focus-change discard) is untouched, which is
+/// why PTRDEAD keeps its SELFTEST-RACE SKIP arm. A real HID report arriving inside the window stays
+/// in the ring and is judged by the fixture, exactly as it was when the fixture out-raced the
+/// service; the window is one ring's worth of pushes and pops.
+static FIXTURE_HOLDS_RING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// PTRLEAK — raise (`true`) before a fixture's first synthetic push, lower (`false`) after its last
+/// drain. Nothing between the two may return early. See [`FIXTURE_HOLDS_RING`].
+pub fn fixture_ring_hold(held: bool) {
+    crate::arch::without_interrupts(|| {
+        let _q = EVENT_QUEUE.lock();
+        FIXTURE_HOLDS_RING.store(held, core::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+/// PTRLEAK — [`next_event`] for the x86 INPUT SERVICE: `None` while a fixture holds the ring, so the
+/// service's drain loop breaks and comes back on its next 1 ms pass. The hold test and the pop are
+/// one critical section (see [`FIXTURE_HOLDS_RING`]); the accounting is `pop_event`'s, verbatim.
+pub fn next_event_unless_held() -> Option<Event> {
+    let ev = crate::arch::without_interrupts(|| {
+        let mut q = EVENT_QUEUE.lock();
+        let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
+        if FIXTURE_HOLDS_RING.load(core::sync::atomic::Ordering::Relaxed) {
+            None
+        } else {
+            q.pop()
+        }
+    });
+    if matches!(ev, Some(e) if !matches!(e, Event::Action(_))) {
+        EVQ_POP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    ev
+}

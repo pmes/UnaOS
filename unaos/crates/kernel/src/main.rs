@@ -6159,7 +6159,7 @@ fn x86_input_service(cpu: usize) {
             //     this task's other job and the one the pump's throughput depends on. It stops only
             //     when a must-survive event has nowhere to go, and then the ring holds the rest.
             while owed_event.is_none() {
-                let Some(ev) = unaos_kernel::pal::next_event() else { break };
+                let Some(ev) = unaos_kernel::pal::next_event_unless_held() else { break }; // PTRLEAK (B193) — the drain stands down while a boot fixture holds the ring for its synthetic push→pop window (`pal::fixture_ring_hold`; PTRDEAD is the holder), so a fixture's synthetic motion can never reach `x86_ptr_install` and arm the real arrow: the x86 twin of aarch64's `ROUTER_SELFTEST`. The hold test and the pop are one critical section in `pal`. ⚠ LINE-NEUTRAL fold.
                 match ev {
                     // Relative motion: fold into anything already owed, else offer it.
                     Event::Mouse { x, y } => { #[cfg(feature = "wc")] ptrinstall_report(); x86_ptr_install(x, y); match owed_motion.as_mut() { // PTRINSTALL (B117) — the REPORT stamp: every relative report the producer takes off the ring is counted here, before the fold/offer decides its fate, and the oldest-pending clock is armed if idle. PTRINSTALL2 — then THE INSTALL: `x86_ptr_install` moves the pointer by this report NOW, on this core, at HID rate, before the channel decides the report's fate; the delta still travels unchanged (a focused app drags by it) and no consumer installs it again. The arm became a block for exactly these statements; the matching `}` is on this arm's last line. ⚠ LINE-NEUTRAL fold, the report stamp `wc`-erased, the install in every x86 image; both fns are at this file's tail.

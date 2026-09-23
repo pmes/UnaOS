@@ -1160,8 +1160,8 @@ static C11_PIX_REDRAWN: AtomicU64 = AtomicU64::new(0);
 /// `false` and it counts again, which is the baseline's behaviour with this instrument added), not
 /// the zero on its own. The number that says the fix RAN is `px_absorbed`; the number that says the
 /// desktop present stopped bracketing is `[flick2] flush_undraw=` going to 0 with `flush_skip=`
-/// taking the whole live-sprite population. On knob-off x86 and on aarch64 the bracket is still
-/// taken and this counter is a live measurement rather than an invariant.
+/// taking the whole live-sprite population. On aarch64 the bracket is still taken and this counter
+/// is a live measurement there; on EVERY x86 build, knob-off included since PTRLEAK (B193), it is the invariant.
 ///
 /// **Counted only where a bracket IS a scan-out gap**, i.e. where `pal::cursor::SPRITE_OWNS_PAINT`
 /// says the arrow the operator sees is the FRONT-buffer one the bracket takes down. On aarch64 the

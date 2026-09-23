@@ -7093,7 +7093,7 @@ fn drag_settle_disarm() {
 /// detector said why in one field: **`cpu=3->3` while `svc=Some(5)`**. The fixture ladder does not
 /// run on the service core, so masking `IF` where the fixture is says nothing about where the
 /// competing drain is. The mask itself held perfectly (`dtick=0 masked=true` on every run) — it was
-/// simply pointed at the wrong core. Suspending the drain instead would be `main.rs`/`pal.rs` work.
+/// simply pointed at the wrong core. Suspending the drain instead would be `main.rs`/`pal.rs` work. PTRLEAK (B193) did that work for THIS fixture: `pal::fixture_ring_hold` stands `x86_input_service`'s drain down across PTRDEAD's window, because the service did not only steal the events, it installed them on the real pointer (CURSORFLK, B186). The SKIP arm stays for every other drain.
 ///
 /// So the legs below judge what they can and SKIP what the machine took from them, which is the
 /// idiom `wmdirect_selftest`'s own `settle`/`lead` legs already use.
@@ -7159,7 +7159,7 @@ fn ptrdead_selftest_body() {
     // SELFTEST-QUIESCE instrumentation: the ledger's own pop counter, sampled either side of the
     // window this leg believes it owns. Anything it counts beyond this leg's OWN successful pops
     // was taken by a different drain.
-    let pop0 = evq_pops();
+    crate::pal::fixture_ring_hold(true); let pop0 = evq_pops(); // PTRLEAK (B193) — HOLD the ring before the first synthetic push: `x86_input_service` stands down until the matching release after this fixture's last drain, so none of the 192 synthetic motions (nor leg 3's `Button(1)`) reaches the real pointer. Nothing between the two returns early. ⚠ LINE-NEUTRAL fold.
     for _ in 0..n {
         crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: -1 }), None);
     }
@@ -7247,7 +7247,7 @@ fn ptrdead_selftest_body() {
             break;
         }
         crate::pal::note_release_edge_drained();
-    }
+    } crate::pal::fixture_ring_hold(false); // PTRLEAK (B193) — RELEASE: every synthetic event this fixture pushed has been drained by it, and the release edge it manufactured is retired, so the input service may drain again. ⚠ LINE-NEUTRAL fold.
 
     // A skip-or-bool leg renders `true`/`false`/`skip`, the idiom `wmdirect_selftest` already uses,
     // and a skipped leg does not convict. The verdict stays `PASS`/`FAIL` — never a third token — so
