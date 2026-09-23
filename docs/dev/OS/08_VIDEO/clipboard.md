@@ -10,7 +10,8 @@ Peter, 2026-09-22, [R61](../../RULINGS.md): *"i prefer command-c and friends (al
 there's no special case for the command line to resolve that usability question."*
 
 Source: [`video/clipboard.rs`](../../../../unaos/crates/kernel/src/video/clipboard.rs) (the buffer,
-the consumer, the fixture), [`pal.rs`](../../../../unaos/crates/kernel/src/pal.rs) (the
+the consumer, the fixture), [`video/termsel.rs`](../../../../unaos/crates/kernel/src/video/termsel.rs)
+(TERMSEL's selection model and fixture, §7), `console.rs`'s `draw_prompt_line` (the band), [`pal.rs`](../../../../unaos/crates/kernel/src/pal.rs) (the
 `Event::Action` variant and its classification), the two `pack_input` functions in
 [`arch/x86_64/syscall.rs`](../../../../unaos/crates/kernel/src/arch/x86_64/syscall.rs) and
 [`arch/aarch64/syscall.rs`](../../../../unaos/crates/kernel/src/arch/aarch64/syscall.rs),
@@ -162,10 +163,10 @@ is a different event: a dropped motion is re-carried by the next report, and a l
   keyboard door; `⌘C` on a file is a different meaning of the same action, and the seam for it is
   `terminal_action`'s shape, not a second event.
 
-## 7. The terminal selection — TERMSEL (design, M0)
+## 7. The terminal selection — TERMSEL
 
-APPCLIP's `⌘C` copies the whole input line because nothing recorded which characters were selected
-(§3). This section is the model that records it. It is the smallest selection that is honest about
+Until TERMSEL, `⌘C` copied the whole input line because nothing recorded which characters were
+selected. This section is the model that records it. It is the smallest selection that is honest about
 what the terminal holds, and it names what it leaves for later.
 
 ### 7.1 What the terminal's text model is
@@ -268,3 +269,69 @@ No selected TEXT is printed — the `[clip]` lines print lengths only, for the s
 * **The fixture cannot press a key.** QEMU has no operator's hands (§4); the chords are resolved
   through the table from synthetic report pairs and pushed through the REAL ring, which is the
   proof available off metal. The decoder half and the painted band are flight 12's to see.
+
+### 7.8 The fixture, the gate, and the wire it printed
+
+`video::termsel::selftest()`, chained from `drivers::ehci::parser_selftest` after APPCLIP's fixture,
+on its own line. It drives thirteen CHORDS, not actions: each is a synthetic HID report pair resolved
+through the live table (`keymap::resolve_edge(keymap::active(), …)`), pushed through `pal::push_event`,
+taken back out of `pal::next_event` and handed to the shipped `terminal_action`, against a line
+(`unaos select`) and a `LineSel` standing where the console's stand. Measured on the wc lane at
+TERMSEL M1 (`UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_QEMU_FULL=1 ./arroyo test 240`,
+rc=0 COMPLETE, x86-wc.spec 27/27):
+
+```
+[termsel] sel=11..12 cells=1 line=12 by=select-left
+[termsel] sel=10..12 cells=2 line=12 by=select-left
+[termsel] sel=9..12 cells=3 line=12 by=select-left
+[termsel] sel=10..12 cells=2 line=12 by=select-right
+[clip] copy unit=selection len=2
+[termsel] sel=0..12 cells=12 line=12 by=select-line-start
+[termsel] none line=12 by=deselect
+[clip] copy unit=line len=12
+[termsel] sel=0..12 cells=12 line=12 by=select-all
+[termsel] sel=0..11 cells=11 line=12 by=select-left
+[clip] cut unit=selection len=11
+[termsel] none line=1 by=cut
+[clip] cut refused reason=no-selection
+[termsel] sel=0..1 cells=1 line=1 by=select-all
+[termsel] none line=1 by=edit
+:: TERMSEL: resolved=13/13 delivered=13 left=ok copy_sel=ok home=ok esc=ok copy_line=ok cut=ok cut_empty=ok edit=ok pc=ok -> PASS ::
+```
+
+(`[clip] set`/`get` lines between them omitted here.) `copy_sel=` reads the clipboard back through
+the epoch gate and requires exactly the two selected cells; `copy_line=` requires the whole line
+with nothing selected (§3's behaviour); `cut=` checks the clipboard, the line and the selection
+after `⌘X`; `pc=` resolves the PC column's five chords through `PC_BINDINGS`. Pinned in
+[`scripts/specs/x86-wc.spec`](../../../../unaos/scripts/specs/x86-wc.spec) (REQUIRE + FORBID,
+tail-appended). **Go-red, measured:** make `terminal_action`'s `Copy` arm ignore the selection
+(`match None::<(usize, usize)>`) — every copy reads `unit=line`, the verdict is
+`copy_sel=no … -> FAIL ::`, `./arroyo test` rc=1 and the x86-wc.spec replay 25/27 with the TERMSEL
+FORBID hit.
+
+The painted band is NOT proved by the fixture — it runs at `ehci::init`, before any console is
+drawn. It is proved by construction (the painter reads `LineSel::range`, the same reading the
+fixture asserts) and by flight 12.
+
+### 7.9 What flight 12 can show, stated so it can be wrong
+
+On the shell window, after typing `hello world` at the prompt, **on the internal keyboard (EHCI) or
+an external one (xHCI)**, in this order:
+
+* `Shift+←` three times paints an inverse band over `rld`, and the wire carries three
+  `[clip] chord=shift-left action=select-left via=<ehci|xhci> -> delivered` lines each followed by
+  a `[termsel] sel=… by=select-left` line ending at `sel=8..11 cells=3 line=11`.
+* `⌘C` copies `rld` (`[clip] copy unit=selection len=3`) and the band stays.
+* `⌘⇧←` then extends the band to the line start (`sel=0..11`); `Esc` removes it
+  (`none line=11 by=deselect`); `⌘C` with nothing selected copies the whole line
+  (`[clip] copy unit=line len=11`), as before this arc; `⌘V` types `hello world` onto the end.
+* `⌘A` then `⌘X` empties the line and the clipboard holds it; `⌘X` again prints
+  `[clip] cut refused reason=no-selection` and changes nothing.
+* Typing any character while a band is shown removes the band (`by=edit`) and appends the character.
+* On an external PC keyboard, `Shift+Home`/`Shift+End` behave as `⌘⇧←`/`⌘⇧→`
+  (`chord=shift-home`/`shift-end`). **Unverified:** whether the internal keyboard's `Fn+←` reaches
+  the decoder as Home (0x4A); in HID boot protocol the Apple Fn key is not reported, so the
+  expectation is that it arrives as a plain `←` and `Fn+Shift+←` selects one cell.
+
+A reading that contradicts any bullet is a TERMSEL defect, except the last clause, which is a
+question about the keyboard.

@@ -26,7 +26,7 @@ in `service_ehci_hid`, and the fixture's chain point in `parser_selftest`). The 
 
 | Type | What it is |
 |---|---|
-| `Action` | what a chord MEANS — `Screenshot`, `ScreenshotRegion`, `Copy`, `Cut`, `Paste`, `SelectAll`, `LogOut`. Named for the desktop's intent, never for a key. |
+| `Action` | what a chord MEANS — `Screenshot`, `ScreenshotRegion`, `Copy`, `Cut`, `Paste`, `SelectAll`, `LogOut`, and TERMSEL's `SelectLeft`, `SelectRight`, `SelectLineStart`, `SelectLineEnd`, `Deselect` ([clipboard.md](clipboard.md) §7). Named for the desktop's intent, never for a key. |
 | `Binding` | a ROLE mask + a HID usage + the `Action` + a witness `token`. |
 | `Table` | a name, a row list in precedence order, and **`cmd_role`** — the physical HID modifier bits that play the abstract *Command* role on that table. |
 | `resolve(table, modifiers, usage_edge)` | **the only place a chord is judged.** |
@@ -44,10 +44,17 @@ key. No row anywhere names a physical modifier — that is the whole seam, and i
 | `Cmd+Shift+3` | 0x20 | `Screenshot` | `cmd-shift-3` |
 | `Cmd+Shift+4` | 0x21 | `ScreenshotRegion` | `cmd-shift-4` |
 | `Cmd+Shift+Q` | 0x14 | `LogOut` — **a SLOT** | `cmd-shift-q` |
+| `Cmd+Shift+←` | 0x50 | `SelectLineStart` (TERMSEL) | `cmd-shift-left` |
+| `Cmd+Shift+→` | 0x4F | `SelectLineEnd` (TERMSEL) | `cmd-shift-right` |
 | `Cmd+C` | 0x06 | `Copy` | `cmd-c` |
 | `Cmd+V` | 0x19 | `Paste` | `cmd-v` |
 | `Cmd+X` | 0x1B | `Cut` | `cmd-x` |
 | `Cmd+A` | 0x04 | `SelectAll` | `cmd-a` |
+| `Shift+←` | 0x50 | `SelectLeft` (TERMSEL) | `shift-left` |
+| `Shift+→` | 0x4F | `SelectRight` (TERMSEL) | `shift-right` |
+| `Shift+Home` | 0x4A | `SelectLineStart` (TERMSEL) | `shift-home` |
+| `Shift+End` | 0x4D | `SelectLineEnd` (TERMSEL) | `shift-end` |
+| `Esc` | 0x29 | `Deselect` (TERMSEL; no roles named — the `0x1B` key is still typed) | `esc` |
 | Print Screen | 0x46 | `Screenshot` (no roles named) | `print-screen` |
 
 `cmd_role` is `HID_MOD_GUI` (0x88 — left **and** right, as every `HID_MOD_*` mask is).
@@ -59,7 +66,9 @@ nothing else may.
 
 `PC_BINDINGS` is a PC-shaped table: `cmd_role` is `HID_MOD_ALT`, the edit rows are the same rows in
 role space (so `Alt+C` is copy with no second `Copy` row written anywhere), and the capture chords
-are `PrtSc` / `Shift+PrtSc` instead of the Apple digits.
+are `PrtSc` / `Shift+PrtSc` instead of the Apple digits. TERMSEL added its selection rows here too
+(`Shift+←/→`, `Shift+Home/End`, `Esc`) and no `Alt+Shift+←/→`: on a PC the line ends are Home and
+End, which every PC keyboard has (11 rows; CRISPY has 15).
 
 **It is selected by nothing.** It is compiled, resolvable, and reached today only by the fixture's
 `pc_table_alt_c=` leg. A knob that selects it is NOT this arc; when one is written it changes
@@ -78,7 +87,9 @@ asserting them, and not one line of the ascii fold changed in this arc.
 
 **A chord types nothing, and that needed no new rule.** `hid_key_ascii` already returns 0 for any
 usage while a GUI **or** an Alt bit is held, so both `cmd_role` spellings suppress the character on
-their own.
+their own. TERMSEL's rows with no `CMD` role are the stated exception: `Shift+←/→` and `Esc` still
+type `0x1D`/`0x1C` and `0x1B`, pushed just ahead of the action, and the shell's line editor ignores
+those bytes.
 
 ## 5. Rules the table keeps from the code it replaced
 
