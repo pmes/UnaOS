@@ -152,8 +152,8 @@ is a different event: a dropped motion is re-carried by the next report, and a l
 
 ## 6. What is next
 
-* **A selection model** — built by TERMSEL, §7 (keyboard, editable line). Pointer and scrollback
-  selection are still owed (§7.7).
+* **A selection model** — built by TERMSEL, §7 (keyboard, editable line); pointer and scrollback
+  selection and a caret by TERMSEL2, §7.10–§7.15.
 * **A ring-3 clipboard API** — two syscalls, `SYS_CLIP_SET(ptr, len)` and
   `SYS_CLIP_GET(ptr, cap) -> len`, each owing the same text-only and capacity refusals `set` makes,
   and each owing an ownership question this kernel has not answered: may a background program
@@ -263,9 +263,10 @@ No selected TEXT is printed — the `[clip]` lines print lengths only, for the s
 
 * **Pointer selection** — drag to select, double-click a word, and with it scrollback selection. The
   x86 shell has no click model (`main.rs`'s `Event::Button` arm is empty by design); that is the
-  next arc, and it writes into the same ANCHOR/HEAD pair.
+  next arc, and it writes into the same ANCHOR/HEAD pair. *(Built by TERMSEL2, §7.10–§7.12: the
+  arm is still empty — the router notes the press instead — and it did write into the same pair.)*
 * **A caret.** Without one, a selection always starts at the line end and an edit cannot replace
-  it (§7.4).
+  it (§7.4). *(Built by TERMSEL2, §7.13.)*
 * **The fixture cannot press a key.** QEMU has no operator's hands (§4); the chords are resolved
   through the table from synthetic report pairs and pushed through the REAL ring, which is the
   proof available off metal. The decoder half and the painted band are flight 12's to see.
@@ -335,3 +336,236 @@ an external one (xHCI)**, in this order:
 
 A reading that contradicts any bullet is a TERMSEL defect, except the last clause, which is a
 question about the keyboard.
+
+### 7.10 TERMSEL2 — the pointer, the scrollback and the caret
+
+TERMSEL's §7.7 named two things it left undone by design: pointer selection (and with it the
+scrollback, which only a pointer can reach) and a caret (without which typing cannot replace a
+selection). TERMSEL2 (rmbp-ledger B196) builds both into the SAME model — `LineSel` grew, nothing
+was replaced, and a selection that lies wholly on the editable line is still TERMSEL's, with
+TERMSEL's `sel=` witness byte for byte.
+
+| Part | What it is now |
+|---|---|
+| a cell | `(col, row)`. `row` is an ABSOLUTE scrollback line number — `Console::hist_base` (lines dropped off the front of the 256-line scrollback) plus the index into `history` — or `EDIT_ROW` for the editable line, which sorts after every scrollback row. A line keeps its number while newer output pushes it up the screen. A scrollback cell is one `char` (the painter advances one cell per `char` and draws no glyph for a non-ASCII one); an editable-line cell is still one byte. |
+| the selection | TERMSEL's ANCHOR/HEAD pair, each offset now with a row: a start CELL and an end CELL. `span()` reads it in reading order; `range()` still answers only for a selection wholly on the editable line, so every TERMSEL path (the chords, `Cut`, the edit rule) reads exactly what it read before. `cols_on(row)` is the one per-row reading — both painters and the copy use it. |
+| the caret | a cell BOUNDARY on the editable line, resting at the line end (`CARET_END`, which follows the end as the line grows — TERMSEL's only insertion point). A keyboard selection that starts from nothing starts at the caret, and the caret rides the head of an editable-line selection. |
+
+### 7.11 How a press reaches the shell
+
+The shell window is `KERNEL_OWNER_DESKTOP` furniture, so `wc_click_route_at` CONSUMES a press on its
+content in the kernel-owner arm — after the menu bar, the crystal, the dock, Quarry, the controls and
+the chrome have all declined it — and the render service's `Event::Button` arm never sees it. That
+arm stays empty. Instead:
+
+| Seam | What it does |
+|---|---|
+| the router's kernel-owner arm | a press whose owner is `KERNEL_OWNER_DESKTOP` is NOTED for the window it hit: `termsel::pointer_press(win, x, y)`, which records the window as HELD. Routing is unchanged — still consumed, still raised, keyboard still to the shell. |
+| `wc_route_tail` | while a press is held, each pointer report is a `drag` note at the live cursor (`pointer_held()` + `pointer_motion`); one atomic load otherwise. |
+| the router's release arm | the release that ends a held press is its `up` note (`pointer_release`), for the window the press went to — never whatever the pointer has since crossed (the router's own release rule). |
+| `termsel`'s press queue | 16 notes in SURFACE pixels (panel pixels less the window's origin, divided by its upscale); a drag directly behind a drag of the same window replaces it; a full queue drops its OLDEST note and says so (`[termsel] press queue full dropped=<n> (oldest)`). `take_press(win)` takes only that window's notes. |
+| the render service (`main.rs`, folded) | after each routed event and its drag tail, `take_press(shell_id)` → `Console::pointer` → `Console::repaint`, marking the shell window dirty as a keystroke does. |
+| `Console::cell_at` | turns surface pixels into a cell with the painter's own derivation (`top_y`/`history_rows` delegate to `top_y_for`/`history_rows_for`): a point above the first shown row reads as that row, below the prompt as the prompt, left of a row's text as its first cell, past its end as one past its last character. |
+
+The router knows windows and not text; the console knows text and not windows; the queue is the
+whole seam between them. Wire, ONE line per press, from the model:
+
+```
+[termsel] press cell=(<col>,<row>) kind=down|drag|up|dbl
+```
+
+`<row>` is the absolute scrollback line, or `e` for the editable line. A drag prints only when it
+enters a NEW cell. `dbl` is a second DOWN on the SAME cell within `DBL_MS` = 500 ms (the macOS
+default); a double-click consumes the pair, so a third press is a fresh single click.
+
+### 7.12 What the pointer does to the selection
+
+| Press | Effect |
+|---|---|
+| DOWN | drops any selection (`[termsel] none … by=click`) and anchors a new one at its cell. Nothing is selected until the pointer leaves the cell. On the editable line it also puts the CARET there (`[termsel] cursor col=<n> by=click`). |
+| DRAG | selects every cell from the anchor cell to the drag cell, BOTH INCLUDED, across rows — scrollback rows, the editable line, or from one into the other. |
+| DBL | selects the WORD: the run of printable non-space ASCII containing the cell (`by=word`); nothing when the cell is a space or past the end. Drags are ignored until the release. |
+| UP | ends the press; a drag that ended on the editable line leaves the caret at its head. |
+
+A selection that reaches the scrollback is witnessed by its cells:
+`[termsel] span=(<c>,<r>)..(<c>,<r>) line=<len> by=<drag|word|click|deselect|edit|…>`. It is
+painted by `Console::draw_row_band` on each scrollback row it covers (the inverse video of §7.6),
+and on the editable line by `draw_prompt_line` through the same `cols_on`.
+
+| Chord / edit | With a selection that reaches the scrollback |
+|---|---|
+| `⌘C` | copies every selected cell, rows joined by `\n`: `[clip] copy unit=selection len=<n> rows=<n>`. A cell holding anything but printable ASCII is copied as a SPACE — what the glass shows there, and the clipboard's text-only rule (§2) would otherwise refuse the whole copy over one character. Rows that have left the 256-line scrollback are gone from the copy as they are from the glass. (The editable-line copy now carries `rows=1`.) |
+| `⌘X` | REFUSED: `[clip] cut refused reason=read-only`; the selection and the line are kept. The scrollback is output, not input — §7.5 said so before there was a way to reach it. |
+| `Esc` | clears it (`Deselect`), and the whole terminal is repainted: the band was in the scrollback. |
+| any edit | clears it (TERMSEL's rule, §7.4), repaints the whole terminal, then the edit happens at the caret. |
+
+### 7.13 The caret — typing can replace a selection now
+
+Four `keymap::Action`s, ring-3 codes 13..16, and their rows (keymap.md §2/§3):
+
+| Action | Token | CRISPY (Mac) | PC | What it does |
+|---|---|---|---|---|
+| `CursorLeft` | `cursor-left` | `←` | `←` | caret one cell left; with a selection on the editable line, to its START |
+| `CursorRight` | `cursor-right` | `→` | `→` | caret one cell right; with a selection on the editable line, to its END |
+| `CursorLineStart` | `cursor-line-start` | `⌘←`, `Home` | `Home` | caret to cell 0 |
+| `CursorLineEnd` | `cursor-line-end` | `⌘→`, `End` | `End` | caret to the line end |
+
+Every caret action DROPS any live selection (`[termsel] none … by=<action>`) and, when the caret
+moved, prints `[termsel] cursor col=<n> by=<action>`. The caret is not witnessed per keystroke:
+the edit is.
+
+**Where the caret actions reuse TERMSEL's and where they diverge.** `SelectLineStart` and
+`CursorLineStart` move to the same cell, and `SelectLeft`/`CursorLeft` make the same one-cell
+motion; the row tables pair them on the same keys with and without Shift, and `⌘⇧←/→` above `⌘←/→`
+is the precedence `no_shadow` enforces. They diverge in what moves: a selection action moves the
+HEAD and keeps the anchor; a caret action collapses the selection first — and `←` with a selection
+is not "one cell left of the head" but the selection's start, the Mac's rule, which is not a motion
+of the head at all.
+
+**The bytes are still typed.** The bare-arrow rows name no roles, so — like `Esc` — the decoder
+still pushes the arrow byte (`0x1D` ←, `0x1C` →) ahead of the action; Quarry and `user-vug`, which
+read those bytes, see exactly what they saw before. `Home`/`End` type nothing (their ascii is 0) and
+`⌘←/→` are suppressed by the `CMD` rule.
+
+**The edits, at the caret** (`LineSel::type_byte`, called by `main::handle_key`; CR/LF still
+dispatch through `on_edit` and park the caret at the end of the empty line they leave):
+
+| Byte | With a selection on the editable line | Otherwise |
+|---|---|---|
+| printable | REPLACES it: `[termsel] none … by=replace`, caret after the typed byte | inserted AT the caret |
+| BS / DEL | deletes it: `by=delete`, caret at its start | deletes the byte BEFORE the caret |
+
+A paste types through the same arm (§3), so `⌘V` over a selection replaces it with the clipboard.
+`⌘X` leaves the caret where the cut cells were.
+
+**Shown:** a Mac-style insertion BAR at the caret's cell boundary, one font stroke wide (`m.scale`
+px) and one cell tall, in the theme's selection/focus accent (`theme::ACCENT`, 0x4A73AA). It
+replaces TERMSEL's block, which stood one cell PAST the text — a cell of the row model that held no
+character; the bar sits on a boundary and occupies none, so the console's rows are exactly their
+characters. It is hidden while the editable line shows a band, as a Mac text field hides its
+insertion point over a selection.
+
+**An action pressed while Quarry holds the keyboard is not the shell's.** Quarry takes its keys at
+`quarry::key_route` and has no action consumer, so until now the `Event::Action` beside a key fell
+through to the shell. With the bare arrows bound that would move the shell's caret out of sight on
+every arrow that moves Quarry's selection, so `wc_route_event` now drops an action while
+`wm::focus_asid() == quarry::OWNER` with the window open (`wc_action_quarry_held`, tail of
+`arch/x86_64/syscall.rs`): `[termsel] action=<name> -> dropped (Quarry holds the keyboard)`. This
+also stops `⌘C`/`⌘A` in Quarry from acting on the shell — the pre-existing half of the same leak
+(§3's "no focused ring-3 window took it" was true and incomplete: Quarry is kernel furniture).
+
+### 7.14 The fixture, the gate, and the wire it printed
+
+`video::termsel::pointer_selftest()`, chained beside `clickroute_selftest` in
+`arch/x86_64/syscall.rs` (both `witness`; `./arroyo test` runs it every boot). It mints a
+`KERNEL_OWNER_DESKTOP` probe row (288x72, scale 1: 8-px cells, 12-px lines) and closes it before
+`dock::selftest`, which must find no such row; presses and releases go through the LIVE
+`wc_click_route_at`, motion through `pointer_motion`, the notes are taken with `take_press` and fed
+to a real `Console` holding two scrollback rows `alpha beta`, `gamma delta` and the line
+`unaos select`. Press points are cell centres computed from the metrics, not from `cell_at`, so the
+two derivations meet. The caret chords are resolved through the live table (`keymap::resolve_edge`)
+and handed to the shipped consumer; the ring hop is not repeated there, because this fixture runs
+after the input service is up and an action pushed onto the ring then could reach the live render
+service — APPCLIP and TERMSEL prove that hop.
+
+Measured on the wc lane at M3 (`UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1
+UNAOS_QEMU_FULL=1 ./arroyo test 240`, rc=0 COMPLETE, full wall 240.8 s; x86-wc.spec 30/30):
+
+```
+[termsel] press cell=(2,0) kind=down
+[termsel] press cell=(3,1) kind=drag
+[termsel] span=(2,0)..(4,1) line=12 by=drag
+[termsel] press cell=(3,1) kind=up
+[clip] copy unit=selection len=13 rows=2
+[clip] cut refused reason=read-only
+[termsel] none line=12 by=deselect
+[termsel] press cell=(8,e) kind=down
+[termsel] cursor col=8 by=click
+[termsel] press cell=(8,e) kind=up
+[termsel] press cell=(8,e) kind=dbl
+[termsel] sel=6..12 cells=6 line=12 by=word
+[termsel] press cell=(8,e) kind=up
+[clip] copy unit=selection len=6 rows=1
+[termsel] press cell=(6,1) kind=down
+[termsel] none line=12 by=click
+[termsel] press cell=(4,e) kind=drag
+[termsel] span=(6,1)..(5,e) line=12 by=drag
+[termsel] press cell=(4,e) kind=up
+[clip] copy unit=selection len=11 rows=2
+[termsel] none line=12 by=edit
+[termsel] press cell=(3,e) kind=down
+[termsel] cursor col=3 by=click
+[termsel] press cell=(3,e) kind=up
+[termsel] cursor col=2 by=cursor-left
+[termsel] cursor col=3 by=cursor-right
+[termsel] cursor col=0 by=cursor-line-start
+[termsel] cursor col=12 by=cursor-line-end
+[termsel] cursor col=0 by=cursor-line-start
+[termsel] cursor col=12 by=cursor-line-end
+[termsel] cursor col=0 by=cursor-line-start
+[termsel] cursor col=1 by=cursor-right
+[termsel] cursor col=2 by=cursor-right
+[termsel] cursor col=3 by=cursor-right
+[termsel] cursor col=4 by=cursor-right
+[termsel] cursor col=5 by=cursor-right
+[termsel] sel=5..12 cells=7 line=12 by=select-line-end
+[termsel] none line=6 by=replace
+[termsel] sel=0..12 cells=12 line=12 by=select-all
+[termsel] none line=12 by=cursor-left
+[termsel] cursor col=0 by=cursor-left
+[termsel] sel=0..12 cells=12 line=12 by=select-all
+[termsel] none line=12 by=cursor-right
+:: TERMSEL2: legs=0x7ffff/0x7ffff hit=ok route=ok drag=ok up=ok dbl=ok sel=ok copy=ok cut_ro=ok esc=ok word=ok into_edit=ok edit=ok click_caret=ok arrows=ok insert=ok bs=ok replace=ok collapse=ok pc=ok -> PASS ::
+```
+
+(`[clip] set`/`get` and the `[clickroute] press … -> consume` lines between them omitted.) Each
+`legs=` bit is one leg, documented at `pointer_selftest`. Pinned in
+[`scripts/specs/x86-wc.spec`](../../../../unaos/scripts/specs/x86-wc.spec) (REQUIRE + FORBID,
+tail-appended past TERMSEL's). TERMSEL's own verdict is unchanged on the same capture.
+
+**Go-red, measured, two:** (M2) a drag that ignores the row (`self.head_row = a.0`) —
+`legs=0xb1f/0xfff … sel=no copy=no cut_ro=no … into_edit=no … -> FAIL ::`, test rc=1, x86-wc.spec
+29/30 with the FORBID hit; (M3) an insert that ignores the caret (`let k = len;` in `type_byte`) —
+`legs=0x63fff/0x7ffff … insert=no bs=no replace=no … -> FAIL ::` (`replace` fails by cascade: its
+start state is the one `insert`/`bs` leave), test rc=1, 29/30. Both reverted to byte-identical files.
+
+**What the fixture proves and what only the glass can.** Proved: the router's disposition of a
+press on a `KERNEL_OWNER_DESKTOP` row, the queue, `cell_at` over the shipped layout, every selection
+and caret rule, the copy text, the read-only refusal, the live table's resolution of every caret
+chord on both tables. NOT proved, because no chord can be pressed and no pointer moved under QEMU:
+the HID decoders' pushing of the new actions beside their bytes (the same arm TERMSEL's chords
+take), the real trackpad's press/drag/release edges arriving at the router, the render service's
+`take_press(shell_id)` drain on a live shell window (the fixture takes its own probe row's notes),
+the painted bands and the bar. Those are flight 13's (§7.15).
+
+### 7.15 What flight 13 can show, stated so it can be wrong
+
+On the shell window, after running `help` so the scrollback has lines and typing `hello world` at
+the prompt, on the internal trackpad (EHCI) and keyboard:
+
+* **Drag-select in the shell.** Press on a scrollback line, drag down across two lines and onto the
+  prompt line, release: an inverse band covers every cell from the press cell to the release cell,
+  both included; the wire carries `[termsel] press cell=(c,r) kind=down`, `kind=drag` lines (one per
+  new cell), one `[termsel] span=(…)..(…,e) … by=drag` per cell change and `kind=up`.
+* **⌘C** then prints `[clip] copy unit=selection len=<n> rows=<3 or more>`; **⌘X** prints
+  `[clip] cut refused reason=read-only` and the band and the line stay; **Esc** removes the band
+  (`[termsel] none … by=deselect`).
+* **Paste.** With the band gone, **⌘V** types the copied text at the caret; its `\n`s DISPATCH lines
+  (the paste is typed, §3) — select within one line if that is not wanted.
+* **Word double-click.** Double-click `world` on the prompt line: the band covers exactly `world`
+  (`kind=dbl`, `sel=6..11 … by=word`); typing `X` replaces it: `hello X`, `none … by=replace`.
+  Double-clicking a word in the scrollback bands it; typing then drops the band (`by=edit`) and
+  appends.
+* **Cursor movement.** A bar (accent blue, one stroke wide) sits after the last character; `←` moves
+  it one cell left per press (`[termsel] cursor col=<n> by=cursor-left`, beside
+  `[clip] chord=left action=cursor-left via=ehci -> delivered`); typing inserts at the bar and
+  Backspace deletes the character before it; `⌘←` and `⌘→` jump to the line ends; a click on the
+  prompt line puts the bar under the pointer (`cursor col=<n> by=click`).
+* **Quarry keeps its arrows.** With Quarry focused, arrows move Quarry's selection and the wire
+  prints `[termsel] action=cursor-left -> dropped (Quarry holds the keyboard)`; the shell's bar does
+  not move.
+
+A reading that contradicts any bullet is a TERMSEL2 defect, except two questions about the machine:
+whether 500 ms is the right double-click window on this trackpad, and whether the EHCI trackpad's
+press edge arrives at the router within one cell of where the arrow shows (`[clickroute] press at
+(x,y)` against the band).

@@ -26,7 +26,7 @@ in `service_ehci_hid`, and the fixture's chain point in `parser_selftest`). The 
 
 | Type | What it is |
 |---|---|
-| `Action` | what a chord MEANS — `Screenshot`, `ScreenshotRegion`, `Copy`, `Cut`, `Paste`, `SelectAll`, `LogOut`, and TERMSEL's `SelectLeft`, `SelectRight`, `SelectLineStart`, `SelectLineEnd`, `Deselect` ([clipboard.md](clipboard.md) §7). Named for the desktop's intent, never for a key. |
+| `Action` | what a chord MEANS — `Screenshot`, `ScreenshotRegion`, `Copy`, `Cut`, `Paste`, `SelectAll`, `LogOut`, and TERMSEL's `SelectLeft`, `SelectRight`, `SelectLineStart`, `SelectLineEnd`, `Deselect` ([clipboard.md](clipboard.md) §7), and TERMSEL2's caret actions `CursorLeft`, `CursorRight`, `CursorLineStart`, `CursorLineEnd` (§7.13). Named for the desktop's intent, never for a key. |
 | `Binding` | a ROLE mask + a HID usage + the `Action` + a witness `token`. |
 | `Table` | a name, a row list in precedence order, and **`cmd_role`** — the physical HID modifier bits that play the abstract *Command* role on that table. |
 | `resolve(table, modifiers, usage_edge)` | **the only place a chord is judged.** |
@@ -46,6 +46,8 @@ key. No row anywhere names a physical modifier — that is the whole seam, and i
 | `Cmd+Shift+Q` | 0x14 | `LogOut` — **a SLOT** | `cmd-shift-q` |
 | `Cmd+Shift+←` | 0x50 | `SelectLineStart` (TERMSEL) | `cmd-shift-left` |
 | `Cmd+Shift+→` | 0x4F | `SelectLineEnd` (TERMSEL) | `cmd-shift-right` |
+| `Cmd+←` | 0x50 | `CursorLineStart` (TERMSEL2; below `Cmd+Shift+←`, which it would shadow) | `cmd-left` |
+| `Cmd+→` | 0x4F | `CursorLineEnd` (TERMSEL2) | `cmd-right` |
 | `Cmd+C` | 0x06 | `Copy` | `cmd-c` |
 | `Cmd+V` | 0x19 | `Paste` | `cmd-v` |
 | `Cmd+X` | 0x1B | `Cut` | `cmd-x` |
@@ -54,6 +56,10 @@ key. No row anywhere names a physical modifier — that is the whole seam, and i
 | `Shift+→` | 0x4F | `SelectRight` (TERMSEL) | `shift-right` |
 | `Shift+Home` | 0x4A | `SelectLineStart` (TERMSEL) | `shift-home` |
 | `Shift+End` | 0x4D | `SelectLineEnd` (TERMSEL) | `shift-end` |
+| `←` | 0x50 | `CursorLeft` (TERMSEL2; no roles named — below every 0x50 row; the `0x1D` byte is still typed) | `left` |
+| `→` | 0x4F | `CursorRight` (TERMSEL2; no roles named; the `0x1C` byte is still typed) | `right` |
+| `Home` | 0x4A | `CursorLineStart` (TERMSEL2; no roles named; types nothing) | `home` |
+| `End` | 0x4D | `CursorLineEnd` (TERMSEL2; no roles named; types nothing) | `end` |
 | `Esc` | 0x29 | `Deselect` (TERMSEL; no roles named — the `0x1B` key is still typed) | `esc` |
 | Print Screen | 0x46 | `Screenshot` (no roles named) | `print-screen` |
 
@@ -68,7 +74,9 @@ nothing else may.
 role space (so `Alt+C` is copy with no second `Copy` row written anywhere), and the capture chords
 are `PrtSc` / `Shift+PrtSc` instead of the Apple digits. TERMSEL added its selection rows here too
 (`Shift+←/→`, `Shift+Home/End`, `Esc`) and no `Alt+Shift+←/→`: on a PC the line ends are Home and
-End, which every PC keyboard has (11 rows; CRISPY has 15).
+End, which every PC keyboard has. TERMSEL2 added the caret rows `←`, `→`, `Home`, `End` (no roles,
+below the Shift rows on the same usages) and no `Alt+←/→`, for the same reason (15 rows; CRISPY
+has 21 — its `⌘←/→` are the Mac's line-end chords, the rMBP having no Home/End key).
 
 **It is selected by nothing.** It is compiled, resolvable, and reached today only by the fixture's
 `pc_table_alt_c=` leg. A knob that selects it is NOT this arc; when one is written it changes

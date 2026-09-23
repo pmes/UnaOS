@@ -19,14 +19,14 @@
 //!
 //! # The model, in one paragraph
 //!
-//! The terminal's text is a read-only scrollback plus ONE editable line
-//! (`console::Console::current_input`), and the editor has no caret: `main::handle_key` appends a
-//! printable byte, pops on Backspace and dispatches on Return, and nothing else changes the line.
-//! Every byte in it is printable ASCII, so a byte offset IS a cell column. A selection here is an
-//! ANCHOR and a HEAD over that one line — the anchor where the selection started, the head the end
-//! that moves. With no caret, a selection that starts from nothing starts at the LINE END, where
-//! the block cursor is painted. The scrollback is not selectable in this arc (see
-//! `docs/dev/OS/08_VIDEO/clipboard.md` §7.2 and §7.7).
+//! The terminal's text is a read-only scrollback plus ONE editable line (`Console::current_input`),
+//! every byte of it printable ASCII, so a byte offset IS a cell column. A selection is an ANCHOR and
+//! a HEAD — TERMSEL's pair — and since TERMSEL2 each carries a ROW (an absolute scrollback line or
+//! [`EDIT_ROW`]), so a pointer can select from the scrollback into the line. The editable line has a
+//! CARET (TERMSEL2 M3): a keyboard selection starts there, typing inserts there and replaces a
+//! selection on the line. A pointer press reaches the model through the press queue at the foot of
+//! this file (the click router notes it; the render service's `Console` turns it into a cell).
+//! `docs/dev/OS/08_VIDEO/clipboard.md` §7 (TERMSEL) and §7.10–§7.15 (TERMSEL2).
 //!
 //! # Where each part lives
 //!
@@ -35,12 +35,12 @@
 //!    terminal only ever sees an [`Action`] by name (R60, R61).
 //!  * **The model** — [`LineSel`], this file. It is the ONE place selection state changes, and the
 //!    only place the `[termsel]` witness is printed, once per STATE CHANGE and never per repaint.
-//!  * **The consumer** — `video::clipboard::terminal_action`, which routes the selection actions
-//!    here and reads [`LineSel::range`] for `Copy` and `Cut`.
-//!  * **The edit rule** — `main::handle_key` calls [`LineSel::on_edit`] before every edit, so a
-//!    typed byte, a Backspace, a Return and every byte of a paste drop the selection first.
-//!  * **The painter** — `console::Console::draw_prompt_line` paints [`LineSel::range`] as an
-//!    inverse-video band. It reads the model and never writes it.
+//!  * **The consumer** — `video::clipboard::terminal_action_in` (via `Console::act`): selection and
+//!    caret actions come here; `Copy`/`Cut` read [`LineSel::range`] and [`LineSel::span`].
+//!  * **The edits** — `main::handle_key`: CR/LF through [`LineSel::on_edit`], a printable byte and
+//!    BS/DEL through [`LineSel::type_byte`] (at the caret; a selection on the line is REPLACED).
+//!  * **The painters** — `Console::draw_prompt_line` and `Console::draw_row_band` paint
+//!    [`LineSel::cols_on`] as inverse-video bands, and the caret bar. They never write the model.
 
 use crate::video::keymap::Action;
 

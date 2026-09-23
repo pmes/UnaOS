@@ -81,8 +81,8 @@
 //! makes, and each owing an ownership question this kernel has not answered (may a background
 //! program overwrite the clipboard of a foreground one?). Named here rather than half-built.
 //!
-//! **Pointer selection and scrollback selection** — TERMSEL's model reaches the editable line
-//! only, from the keyboard only (`clipboard.md` §7.7).
+//! (Pointer and scrollback selection, once named here as missing, are TERMSEL2's: a copy that
+//! reaches the scrollback is [`terminal_action_in`]'s, `clipboard.md` §7.10–§7.14.)
 
 use crate::video::keymap::Action;
 use crate::video::termsel::LineSel;

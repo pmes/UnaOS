@@ -43,9 +43,9 @@ pub struct Console {
     /// below the window's own top edge. `false` on every backdrop/headless surface (the desktop-layer
     /// shell, aarch64, wc-off), so those stay byte-for-byte unchanged.
     in_window: bool,
-    /// TERMSEL — the selection over [`Self::current_input`]. Changed only by
-    /// `video::clipboard::terminal_action` (the selection actions, `Cut`) and by
-    /// `main::handle_key`'s edit rule; read by [`Self::draw_prompt_line`], which paints it.
+    /// TERMSEL/TERMSEL2 — the selection and the caret. Changed only by the action consumer
+    /// (`terminal_action_in`, via [`Self::act`]), `main::handle_key`'s edits and [`Self::pointer`];
+    /// read by the painters (`draw_prompt_line`, `draw_row_band`), which paint it.
     pub sel: crate::video::termsel::LineSel,
     /// TERMSEL2 — how many lines have been dropped off the front of [`Self::history`], so
     /// `hist_base + i` is line `i`'s ABSOLUTE number: the row a selection records, which does not
