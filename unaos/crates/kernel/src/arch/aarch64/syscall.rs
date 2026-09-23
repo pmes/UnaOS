@@ -6898,7 +6898,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_OPEN => sys_open(a0, a1, a2),
         SYS_READ => sys_read(a0, a1, a2),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_UNLINK => sys_unlink(a0),
+        SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), // STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
         SYS_CLOSE => sys_close(a0),
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(), #[cfg(feature = "net6")] una_abi::SYS_SOCKET => net6_sys_socket(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_BIND => net6_sys_bind(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_SENDTO => net6_sys_sendto(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_RECVFROM => net6_sys_recvfrom(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_CONNECT => net6_sys_connect(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SEND => net6_sys_send(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SOCK_RECV => net6_sys_sock_recv(a0, a1, a2), // NET6 (SOCKNUM 40..46) — the aarch64 arm of the socket family, over the SHARED `net_phy::net6` stack. Fully-qualified `una_abi::` paths (not `use` lines) and all seven folded onto this ONE existing arm: `syscall.rs` compiles into every aarch64 image and `panic::Location` embeds the source line, so a new line here would move the knob-off jetson/kernel8 images. ⚠ LINE-NEUTRAL append — bodies at the FILE TAIL.
@@ -25232,4 +25232,60 @@ fn kernel_owned_leaf_path(name: &str) -> bool {
 #[cfg(not(feature = "login"))]
 fn kernel_owned_leaf_path(_name: &str) -> bool {
     false
+}
+
+// =================================================================================================
+// STOR-2 (rmbp-ledger B185) — `SYS_RENAME` ON aarch64: THE SECOND RETIREMENT STOR-1 NAMED. File
+// tail: nothing above moves (B94); the dispatch arm is a same-line fold beside `SYS_UNLINK`.
+//
+// STOR-1 minted `SYS_RENAME` (una-abi 50) on x86 with its argument shape MATCHED from this arch's
+// only rename ABI, the v1 bus verb `mv` — two names, source first, owner-only, create-new-only — and
+// reserved the number here without dispatching it, so parity was forward-only: a program that spoke
+// the syscall ran on x86 and got `-ENOSYS` on the Pi. This is the one arm that closes that, and it
+// is a dispatch over `bus_mv`'s body rather than a second rename: `sys_rename` below copies the two
+// names in and calls `bus_mv` with the CALLER'S OWN identity, the same `(asid, gen, principal)`
+// triple `sys_msend` stamps a bus frame with. So `mv A B` over the bus and `SYS_RENAME(A, B)` direct
+// are one function answering twice on this arch — the property x86 gets from `busx_mv` being
+// `rename_created`. There is no second errno table to drift.
+//
+// THE COPY-IN IS x86's, STEP FOR STEP, so the two arches refuse the same malformed calls the same
+// way: both lengths bounded FIRST (`-EINVAL` for 0 or > `MAX_NAME`, before any byte is read), then
+// each name copied (`-EFAULT`), then UTF-8 (`-ENOENT` — a name no 8.3 entry can match), then the
+// DIRNS root-leaf collapse (`/X` is `X`). A name with a directory component is `-ENOENT` here, which
+// is what x86 answers for it (no created name has one) and what `bus_mv`'s root-only lookup would
+// find anyway — said explicitly rather than left to `find_located` to interpret a slash.
+//
+// ERRNOS, and which are shared: `-EINVAL` `-EFAULT` `-ENOENT` `-EACCES` (not the owner; the ACL
+// store) `-EEXIST` (destination exists) are the SAME numbers on both arches for the same cause.
+// `-EISDIR` (a directory), `-ENODEV`/`-EAGAIN`/`-EIO` (no card / driver loan busy / I/O) are this
+// arch's storage conditions, and `-EBUSY` (the destination's deferred delete, or a release in flight
+// — see x86 STOR-2) is x86's. Neither arch refuses an OPEN source any more: here `rename_entry`
+// rewrites the name of the same directory slot, and a descriptor keys that slot, so it follows.
+// =================================================================================================
+
+/// STOR-2: `SYS_RENAME(src_ptr, src_len, dst_ptr, dst_len) -> 0 / -errno` — the aarch64 arm. Copy-in
+/// exactly as x86's `sys_rename`, then `bus_mv` under the caller's own identity. See the block above.
+fn sys_rename(src_ptr: u64, src_len: u64, dst_ptr: u64, dst_len: u64) -> i64 {
+    let (sn, dn) = (src_len as usize, dst_len as usize);
+    if sn == 0 || sn > MAX_NAME || dn == 0 || dn > MAX_NAME {
+        return EINVAL;
+    }
+    let mut sbuf = [0u8; MAX_NAME];
+    let mut dbuf = [0u8; MAX_NAME];
+    if copy_from_user(&mut sbuf[..sn], src_ptr, sn).is_err() {
+        return EFAULT;
+    }
+    if copy_from_user(&mut dbuf[..dn], dst_ptr, dn).is_err() {
+        return EFAULT;
+    }
+    let (Ok(src), Ok(dst)) = (core::str::from_utf8(&sbuf[..sn]), core::str::from_utf8(&dbuf[..dn])) else {
+        return ENOENT; // a non-UTF-8 name matches no 8.3 entry (the `sys_open` verdict, both arches)
+    };
+    let (Some(src), Some(dst)) = (crate::fs::vfs::el0_root_leaf(src), crate::fs::vfs::el0_root_leaf(dst)) else {
+        return ENOENT; // a directory component: not the root namespace this verb renames in (x86's answer)
+    };
+    let asid = current_asid();
+    let agen = ASID_GEN[asid as usize].load(Ordering::Acquire);
+    let ppid = current_principal();
+    bus_mv(asid, agen, ppid, src, dst)
 }
