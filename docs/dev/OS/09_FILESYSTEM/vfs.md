@@ -1539,17 +1539,18 @@ factored the per-slot sequence out of `scan_dir_sector` into `classify_dir_slot_
 walkers the one rule. Without this the arc would have been worse than useless: `prtscr` would have
 created a duplicate Mac-named file on every capture.
 
-### 16.6 What is NOT here
+### 16.6 What was NOT here — both halves CLOSED by LFN2 (§16.9, §16.10)
 
-* **DELETE does not reclaim the component slots.** `delete_located` marks the SHORT entry `0xE5` and
-  leaves the run. Safe — an orphan run is discarded on the checksum, and a fresh run's
-  `LAST_LONG_ENTRY` slot calls `reset()` — but it wastes slots until the directory is rewritten. A
-  real VFAT driver tombstones the run too.
-* **RENAME does not rewrite the run.** `rename_entry` rewrites the 11-byte short field, changing the
-  checksum the preceding run was stamped with, so the long name falls away and the entry reads back
-  under its new short name.
+* **DELETE did not reclaim the component slots.** `delete_located` marked the SHORT entry `0xE5` and
+  left the run. Safe — an orphan run is discarded on the checksum, and a fresh run's
+  `LAST_LONG_ENTRY` slot calls `reset()` — but it wasted slots until the directory was rewritten. A
+  real VFAT driver tombstones the run too. **Closed: §16.9.**
+* **RENAME did not rewrite the run.** `rename_entry` rewrote the 11-byte short field, changing the
+  checksum the preceding run was stamped with, so the long name fell away and the entry read back
+  under its new short name; a long NEW name was refused. **Closed: §16.10.**
 
-Both are changes to paths this arc does not own; both are ledgered as **rmbp-ledger B173**.
+Both were changes to paths FATLFN did not own; both were ledgered as **rmbp-ledger B173**, and LFN2
+(**B182**) closed them.
 
 ### 16.7 The fixture
 
@@ -1600,3 +1601,111 @@ double reading this arc has to earn: `SCREEN~1 PNG   0  …  Screenshot 2026-09-
 The residue cannot accumulate: the builder rebuilds `usb-boot.img` from scratch on every
 `./arroyo test`, and on a persistent card the fixture's step 0 pre-teardown removes it before
 anything is measured — FATGROW's pattern, for FATGROW's reason.
+
+### 16.9 LFN2 (2026-09-23, B182) — DELETE takes the run with the entry
+
+**Which run belongs to an entry.** The one `LfnBuf` would attach to it: the slots IMMEDIATELY
+preceding the short entry, attribute `0x0F`, one checksum equal to `lfn_checksum` of the short field,
+ordinals 1, 2, 3 … going back, ending at the slot with `LAST_LONG_ENTRY`. `lfn_trail_in_sector` is
+that rule run backwards, and it takes a slot only when `LfnBuf::push` would have taken it as THIS
+run's component — so it cannot reach into a neighbour's run, which is separated by the neighbour's
+own short entry and carries the neighbour's checksum. The checksum is read from the short field
+BEFORE that field changes: the only moment it still names the run.
+
+**Where.** In `mark_dir_deleted`, not `delete_located`, because it is the one primitive every unlink
+path shares — `delete_located` and `remove_dir` through it, the aarch64 `sys_unlink` deferred free
+(the name now, the chain at the last close), and `move_entry`'s retirement of its source. No caller
+changed. Three line-neutral edits; the helpers are a tail append (`fs/fat.rs` §LFN2).
+
+**The order — the mirror of §16.4.** Create writes the run first and the short entry last; delete
+writes the short entry's sector FIRST (the `0xE5` and every run slot in that same sector, one write)
+and the earlier sectors after, nearest first. After the first write the entry is gone, and whatever
+of the run still stands is followed by a `0xE5` (`LfnBuf::reset`) — an orphan every reader discards:
+wasted slots, the pre-LFN2 state, never a mislabel. The reverse order would expose the file under
+its 8.3 alias on a cut — a LIVE short entry whose run is half tombstoned. The invariant both
+directions keep: a short entry is live only while its whole run is intact.
+
+**Across a cluster boundary** the sector before a cluster's first sector is the last sector of the
+cluster whose FAT entry points here, which the FAT does not index. `fat_predecessor` tries `c - 1`
+(one FAT sector: the directory that grew into the next free cluster) and otherwise scans FAT copy 0
+in counted runs. It decides where to LOOK, never what is tombstoned — the checksum-and-ordinal trail
+does — so a cross-linked FAT cannot redirect it into a stranger's slots. The earlier-sector step is
+**best effort**: the delete has already happened, the residue is an orphan, and failing the call
+would make `delete_located` skip `free_chain` and leak the whole chain.
+
+**The cost, stated rather than hidden.** The walk has to look at the slot before the short entry
+even when the entry turns out to have no run, because a run can sit entirely in the previous sector.
+So an entry at slot 0 of a CLUSTER whose predecessor is not `c - 1` pays a scan of FAT copy 0 on its
+delete or 8.3 rename, 8.3 entries included — on the default QEMU image that is 977 sectors (the FAT
+size `fsck.fat` reports), on a large card several MB. It is paid only at that one slot per cluster;
+its wall time on a real card is not measured yet (rmbp-ledger B182, owed).
+
+### 16.10 LFN2 — RENAME rewrites the run, or retires it
+
+* **To an 8.3 name** (`format_83` accepts it): `write_dir_entry_name` writes the new 11-byte field
+  where the delete writes `0xE5`, with the same in-sector tombstones and the same earlier-sector
+  step. No new run — an 8.3 name has no long form. After the first write the entry answers to its NEW
+  name. The same slot reached through a long name (a rename to the entry's own alias) is not a no-op
+  any more: it drops the long name. The read-back must resolve under the new name: an old run whose
+  checksum happened to equal the new field's would re-attach the OLD long name, and that is reported
+  (`Io`), never returned as success.
+* **To a long name** (`rename_lfn_in_dir`, dispatched by the same `let…else` FATLFN gave the create
+  twins): refused, never repaired, by `lfn_units` — the create path's rule; a new alias from
+  `lfn_short_alias` (by lookup, so a new checksum that collides with nothing); then
+  * **in place** only when that is ONE sector write — the new run fits in the old run's last slots
+    and those, with the short entry, share one sector. The entry keeps its (LBA, offset); unused
+    leading old slots are tombstoned after (an orphan prefix by then: the new run is headed by its own
+    `LAST_LONG_ENTRY`, which resets the reader);
+  * otherwise a **fresh contiguous n+1 run**, FATLFN's allocator (`free_run_or_grow`, growing through
+    `grow_dir_chain`) and FATLFN's writer, carrying the OLD short entry whole — attribute, first
+    cluster, size, every timestamp — under the new name; then the old entry is retired through
+    `mark_dir_deleted` (§16.9's order). A cut between the two leaves the file under BOTH full names
+    over one chain (FATMOVE's documented benign duplicate), never under an alias.
+
+  A multi-sector rewrite IN PLACE is not done even when the slot count is unchanged: whichever
+  sector went first, a cut would leave the short entry and its run stamped with different checksums,
+  and the file listed under its alias. That case takes a fresh run.
+* **A fresh run MOVES the entry.** The returned (LBA, offset) is not the one the caller located — the
+  `move_entry` shape, with `move_entry`'s caveats. The one caller that keys state by location, the
+  aarch64 bus `mv` (owner rows keyed by (LBA, offset), contract "the SAME slot"), refuses a non-8.3
+  destination up front through `fat::is_short_name` — the `-EINVAL` it answered before LFN2. The
+  shell `mv` (`FatBackend::rename`) resolves by path on every call and takes long names.
+
+### 16.11 The LFN2 fixture, and the host-side read-back
+
+`lfn2_witness`, called once from `fatlfn_witness_once` after its verdict (so it inherits that
+witness's latch, mount and write-veto check), works in the `/LFNTEST` directory FATLFN's leg 9 leaves.
+The layout is chosen so the deleted run STRADDLES a sector boundary — on the default image's 512-byte
+clusters also a cluster boundary — because a run that never crosses one never exercises the walk
+back: `.`/`..` at slots 0-1, leg 9's screenshot 2-5, the two rename subjects 6-9 and 10-12, so the
+6-slot delete subject lands at 13-18. The relocating rename is sized to take exactly those freed slots
+back. Wire, pinned in `unaos/scripts/specs/x86-default.spec`:
+
+```
+:: FAT-LFN-DEL: deleted=Deleted - this run crosses a sector boundary on purpose.txt alias=DELETE~1.TXT slots=5 sectors=2 clusters=2 pred=scan tombstoned=6/6 readback=gone alias_gone=ok orphans=0 -> PASS ::
+:: FAT-LFN-MV: renamed=Rename me - long to longer.txt => Renamed - a longer long name that needs more slots.txt slots=3=>5 moved=yes readback=ok old_gone=yes chain=kept old_tombstoned=4/4 | in_place=In place A.txt => In place Bb.txt kept_slot=yes | to_83=In place Bb.txt => SHORT.TXT long_name=none:yes run_tombstoned=2/2 | refused=ok orphans=0 -> PASS ::
+```
+
+`orphans=` is counted FORWARD through the reader — every live `0x0F` slot minus `lfn_slot_count` of
+every long name `read_dir` attaches — so it shares nothing with the walk-back under test, and it is
+what a skipped tombstone shows up as. `refused=ok` means `Unsupported` AND the directory's raw slots
+byte-identical afterwards. `pred=scan` says the cluster before the one holding the short entry was
+found by the FAT scan (the moved file's data clusters sit between the directory's two).
+
+The host reads the same image three independent ways (`MTOOLS_SKIP_CHECK=1 mdir -i
+unaos/builder/usb-boot.img@@1048576 ::/LFNTEST`; a stand-alone Python slot census that attaches runs
+by the spec's rule, kept beside the branch's evidence; and `fsck.fat -n` on the extracted partition,
+whose `Orphaned long file name part` line is dosfstools' own orphan detector). Green: mtools lists
+`SCREEN~1 PNG … Screenshot 2026-09-22 at 17.31.02.png`, `SHORT TXT`, and `RENAME~2 TXT 700 … Renamed -
+a longer long name that needs more slots.txt` (its bytes `mtype`-identical to what was written), and
+none of the four retired names; the census reads `live_lfn_slots=8 attached_lfn_slots=8
+ORPHAN_LFN_SLOTS=0 tombstones=6`; fsck prints no orphan line. (`RENAME~2`, not `~1`: when the alias
+was minted, the entry being renamed still held `RENAME~1` — the lookup chose around it, as §16.2
+says it must.)
+
+Go-red, both reverted with the mutation diff hashed: with the run tombstoning skipped in
+`mark_dir_deleted`, `tombstoned=1/6 … orphans=5 FAIL` (and the relocating rename, which retires its
+old entry through the same primitive, `old_tombstoned=1/4 … orphans=8 FAIL`), the host census reads
+`ORPHAN_LFN_SLOTS=8` and fsck names both orphaned long names; with the rename rewrite skipped (the
+pre-LFN2 short-field-only rename), `:: FAT-LFN-MV: VFAT long-name rename (NotFound) FAIL ::` and mdir
+lists `RENAME~2 TXT 700` with no long name.

@@ -23047,7 +23047,7 @@ fn bus_mv(asid: u64, agen: u64, ppid: PrincipalRecord, src: &str, dst: &str) -> 
         Err(crate::fs::fat::FatError::NotFound) => {}
         Err(_) => return EIO,
     }
-    let owner_ppid = owned_owner_ppid(s_lba, s_off as u32);
+    if !crate::fs::fat::is_short_name(dst) { return EINVAL; } let owner_ppid = owned_owner_ppid(s_lba, s_off as u32); // LFN2 (B182): `rename_entry` now takes VFAT long names, and a long-name rename may MOVE the entry to a fresh run — which would orphan this file's location-keyed owner row. This verb's contract is the SAME slot, so a long destination keeps the `-EINVAL` it answered before LFN2.
     // In-place rename (single dir-sector name RMW — SAME slot, so the in-RAM/native LOCATION keys
     // stay valid). dst-exists was pre-checked, so an Unsupported here is a bad 8.3 dst name.
     match fs.rename_entry(0, src, dst) {
