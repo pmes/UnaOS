@@ -179,6 +179,21 @@ REQUIRE \[login\] press at=\(\d+,\d+\) control=(name-field|password-field|button
 REQUIRE \[login\] press-probe win=\d+ centre=\(\d+,\d+\) hit=\d+ verdict=(FALLS-THROUGH|NOBODY)
 FORBID \[login\] press-probe .* verdict=MODAL
 
+# ── 7b. THE CREDENTIAL IS STRETCHED (SECLOGIN M1 / PWHARD, rmbp-ledger B169) ─────────────────────
+# One SHA-256 per guess was the whole cost of a lost card (B157 gap 1). Now PBKDF2-HMAC-SHA256 at a
+# count calibrated to ~250 ms on THIS CPU (`[users] kdf calibrated`, once per boot), stored per row,
+# floor 10000 refused at parse AND at create. The leg writes a scratch v1 row, verifies it through
+# the legacy path, logs in (which MIGRATES it — the `rehash` line), verifies again as v2, refuses a
+# wrong password and an UNKNOWN name (which now costs the same time), and deletes the scratch user.
+# `kat=ok` is the RFC 6070 known answers on SHA-256 — the implementation, not just the plumbing.
+# GO-RED: `calibrated_iters` mutated to answer 1 → `[users] kdf REFUSED iters=1 floor=10000` and
+# `:: LOGIN: users+session -> FAIL — create_user reason=weak-kdf`.
+REQUIRE \[users\] kdf calibrated iters=\d+ ms=\d+
+REQUIRE \[users\] rehash user=hard1 v1->v2 iters=\d+ ms=\d+
+REQUIRE :: LOGIN-HARD: kat=ok iters=\d+ ms=\d+ v2_rows=\d+ migrated=1 legacy_verify=ok migrated_verify=ok wrong=refused unknown=refused floor=10000 -> PASS ::
+FORBID :: LOGIN-HARD: .* -> FAIL
+FORBID \[users\] kdf REFUSED
+
 # ── 8. ABSENCE — the hole every block above exists to close ─────────────────────────────────────
 # A fixture that stops running prints nothing and passes silently. Every REQUIRE above gates PRESENCE
 # as well as health for its own leg, which covers it. What is NOT covered by any of them is the boot
