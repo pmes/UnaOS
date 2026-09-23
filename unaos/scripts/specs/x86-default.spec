@@ -112,3 +112,28 @@ FORBID :: X86BIND: root=-
 # `defaultmedium-logs/serial-default.log`); present (rc=1, FORBID hit) on the same capture with the
 # kernel's own SKIP spelling injected — the go-red recorded in the WINMENUSPEC commit.
 FORBID :: WINMENU: .* -> SKIP reason=menu-unpublished-after=[0-9]+ms ::
+#
+# ── VECTORS (2026-09-22), TAIL-APPENDED past WINMENUSPEC, as WINMENUSPEC was past the contract ──
+# The IDT vector table, pinned as ONE line, because the whole claim of rmbp-ledger B168 is that
+# replacing five hand-written `pub const`s with an allocator MOVED NO NUMBER. `interrupts::vectors`
+# hands out `xhci` 0x40, `nic` 0x41 and `ehci` 0x43 in that order (0x42 is `ipi`, reserved by name
+# before the first `alloc` runs), so every capture recorded on this bench stays byte-comparable
+# across the fold — and this rule is what says so on the next boot rather than on a reader's word.
+#
+# THE ORDER AND THE NUMBERS ARE THE ASSERTION, not the counts. `allocated=` and `free=` are left
+# open (`[0-9]+`) because a later device joining the allocator moves both LEGITIMATELY and must not
+# red this lane; `table=` is pinned character for character, because a number moving there is
+# exactly the regression this arc exists to make visible. A later arc that renumbers on purpose
+# re-pins this line in the same commit, which is the contract at the head of this file.
+#
+# NO FORBID PARTNER, and the reason is measured rather than stylistic: B160's go-red showed that a
+# FORBID which can no longer match reads ✅ with 0 hits — indistinguishable from one that passed.
+# The failure mode here is a vector SILENTLY CHANGING, which a REQUIRE on the exact table convicts
+# and no negation could state more sharply. The allocator's own refusals (`-> REFUSED
+# reason=duplicate-name`) are not forbidden either: they are the module's correct behaviour, and
+# the one that fires in a healthy boot is none.
+#
+# Measured: 0 hits on `vectors-logs/base-serial.log`, the default capture taken at this branch's
+# parent 2495f3a2 before a line of this arc was written (the go-red — the run that has no allocator
+# in it), and 1 hit on the capture the same verb produced after.
+REQUIRE \[vectors\] allocated=[0-9]+ free=[0-9]+ table=timer:0x20,xhci:0x40,nic:0x41,ipi:0x42,ehci:0x43,spurious:0xff == witness ::

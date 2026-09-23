@@ -197,16 +197,23 @@ writes the local-APIC EOI register last, so the handler side needed no change an
 In `drivers/ehci/mod.rs` the whole of this rung is **one term of one condition**:
 
 ```rust
-if !PciScanner::enable_msi(..) && !arch::x86_64::ioapic_route_intx(bus, dev, func, EHCI_MSI_VECTOR) {
+if !PciScanner::enable_msi(..) && !arch::x86_64::ioapic_route_intx(bus, dev, func, ehci_vec) {
     // ... the ISRARM REFUSED arm, unchanged
 }
 ```
 
 The refusal arm is now reached only when *both* delivery paths are unavailable. When the route
 succeeds the function falls through to the `USBINTR` unmask below it **unchanged** — the completion
-vector (`EHCI_MSI_VECTOR`, 0x43), its IDT entry and `ehci_msi_handler` are the ones ISRARM already
-had. **Only the delivery path is new**, which is why this rung adds no handler, no vector and no
-IDT entry.
+vector (0x43), its IDT entry and `ehci_msi_handler` are the ones ISRARM already had. **Only the
+delivery path is new**, which is why this rung adds no handler, no vector and no IDT entry.
+
+> **VECTORS (rmbp-ledger `B168`) renamed that term and changed nothing else about this rung.** It
+> read `EHCI_MSI_VECTOR` when rung 3 landed; that const no longer exists. `ehci_vec` is
+> `interrupts::vectors::of("ehci")` — the vector the IDT **allocated** to the EHCI, taken once at
+> the top of `isr_arm_controller` — and it is still **0x43**, because `ipi` reserves 0x42 by name
+> before the allocator's first answer and the EHCI is the third ask. So `route_pci_function` now
+> takes an allocated number instead of a hand-written const, and the `[ioapic] armed … vector=0x43`
+> line below is byte-identical across that fold. See `vectors.md`.
 
 `ioapic_route_intx` lives at the tail of `arch/x86_64/mod.rs` rather than being called directly,
 and that is a byte-identity requirement: a condition term cannot carry a `#[cfg]`, so the OFF arm
