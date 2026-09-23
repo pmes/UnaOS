@@ -230,9 +230,24 @@ const FIELD_H: usize = CELL + 8;
 const BTN_W: usize = 120;
 const BTN_H: usize = 28;
 
-/// How many user rows the screen draws. Zero on the create-first-user screen, by construction.
+/// SECLOGIN M6 — THE ROSTER POLICY. Names on the pre-session glass are a THEME/POLICY choice, not a
+/// mechanism: the Mac model shows who lives on the machine (the name field becomes optional for the
+/// person who owns it); the Windows-style "type your name" posture shows nobody. B157 gap 7 named the
+/// disclosure — anyone in front of the machine reads the roster — and this predicate is where the
+/// choice lives, so flipping it is one constant and not a redesign. The WIRE never carried names either
+/// way (`[login] press … control=user-row` prints an index). Default: as LOGINFLOW built it.
+pub const ROSTER_ON_GLASS: bool = true;
+
+/// The policy predicate `user_rows` consults. A function rather than a bare constant so a theme table
+/// (R60/R61) can own the answer later without touching the geometry below.
+pub fn roster_on_glass() -> bool {
+    ROSTER_ON_GLASS
+}
+
+/// How many user rows the screen draws. Zero on the create-first-user screen, by construction, and
+/// zero under the "type your name" policy (`roster_on_glass() == false`).
 fn user_rows() -> usize {
-    users::count().min(USER_MAX)
+    if roster_on_glass() { users::count().min(USER_MAX) } else { 0 }
 }
 
 /// The rect of one control, in SURFACE pixels. The ONE place any of these numbers exists.

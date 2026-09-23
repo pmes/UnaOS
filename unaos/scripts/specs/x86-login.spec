@@ -41,7 +41,7 @@
 # one is refused, the session opens under `user:una`, the home exists and the ACL admits its owner.
 # `linked=`/`home=`/`acl=`/`epoch=`/`users=`/`volume=` are reported by the fixture and folded into its
 # own verdict, so they are matched loosely and the VERDICT is what gates.
-REQUIRE :: LOGIN: users\+session create=.* verify=ok wrong=refused login=ok principal=user:una .* -> PASS ::
+REQUIRE :: LOGIN: users\+session create=.* verify=ok wrong=refused login=ok principal=user:una#\d+ .* -> PASS ::
 FORBID :: LOGIN: users\+session -> FAIL
 # A SKIPPED here is a harness with no FAT volume. On THIS gate the x86 default medium carries a FAT32
 # volume (DEFAULTMEDIUM), so a skip means the medium was lost — a red, not a shrug.
@@ -178,6 +178,72 @@ REQUIRE \[login\] press at=\(\d+,\d+\) control=(name-field|password-field|button
 # would mean the belt had been cut, so it is FORBIDden by name rather than merely not required.
 REQUIRE \[login\] press-probe win=\d+ centre=\(\d+,\d+\) hit=\d+ verdict=(FALLS-THROUGH|NOBODY)
 FORBID \[login\] press-probe .* verdict=MODAL
+
+# ── 7b. THE CREDENTIAL IS STRETCHED (SECLOGIN M1 / PWHARD, rmbp-ledger B169) ─────────────────────
+# One SHA-256 per guess was the whole cost of a lost card (B157 gap 1). Now PBKDF2-HMAC-SHA256 at a
+# count calibrated to ~250 ms on THIS CPU (`[users] kdf calibrated`, once per boot), stored per row,
+# floor 10000 refused at parse AND at create. The leg writes a scratch v1 row, verifies it through
+# the legacy path, logs in (which MIGRATES it — the `rehash` line), verifies again as v2, refuses a
+# wrong password and an UNKNOWN name (which now costs the same time), and deletes the scratch user.
+# `kat=ok` is the RFC 6070 known answers on SHA-256 — the implementation, not just the plumbing.
+# GO-RED: `calibrated_iters` mutated to answer 1 → `[users] kdf REFUSED iters=1 floor=10000` and
+# `:: LOGIN: users+session -> FAIL — create_user reason=weak-kdf`.
+REQUIRE \[users\] kdf calibrated iters=\d+ ms=\d+
+REQUIRE \[users\] rehash user=hard1 v1->v2 iters=\d+ ms=\d+
+REQUIRE :: LOGIN-HARD: kat=ok iters=\d+ ms=\d+ v2_rows=\d+ migrated=1 legacy_verify=ok migrated_verify=ok wrong=refused unknown=refused floor=10000 -> PASS ::
+FORBID :: LOGIN-HARD: .* -> FAIL
+FORBID \[users\] kdf REFUSED
+
+# ── 7c. THE IDENTITY IS NEVER REISSUED (SECLOGIN M2, rmbp-ledger B169) ──────────────────────────
+# B157 gap 3: x86 compared a RECYCLABLE users-table id, aarch64 compared the NAME — two arches, two
+# rules, and a recreated user could inherit. Now both compare the `uid` (x86 in its u32 tables,
+# aarch64 inside `user:<name>#<uid>`), allocated from a counter that never decreases. The leg creates
+# A, deletes A, creates B INTO A's FREED SLOT (`slot_reused=true` is measured, not assumed), recreates
+# A, and asks the real ACL about B and the second A against a row A's first uid owns: both refused
+# with `reason=recycled-id`, the owner admitted. GO-RED: the allocator mutated to v1's `slot + 1` →
+# `same_slot_refused=false -> FAIL` on both arches from one mutation.
+REQUIRE :: LOGIN-IDENT: a_uid=\d+ b_uid=\d+ a2_uid=\d+ slot_reused=true owner_ok=true same_slot_refused=true same_name_refused=true reason=recycled-id -> PASS ::
+FORBID :: LOGIN-IDENT: .* -> FAIL
+REQUIRE \[users\] delete user=identa uid=\d+ \(slot \d+ freed; uid never reissued
+# The principal string a session prints is the canonical one, uid included.
+REQUIRE \[users\] login ok user=una id=\d+ principal=user:una#\d+
+
+# ── 7d. LOG OUT ENDS THE SESSION (SECLOGIN M3, rmbp-ledger B169) ────────────────────────────────
+# B157 gap 4: Log Out killed STAMPS, not processes — the session's programs kept running and kept
+# their windows, so the next person's login screen came up over the last person's desktop. Now
+# `session_logout` walks the process table for every running row stamped in the closing epoch,
+# closes its windows and kills it through the close box's own path, THEN bumps the epoch. The leg
+# launches STAT.ELF under a session (the desktop's own launcher), logs out, and proves the pid gone
+# and the window gone. A SKIP is a medium with no STAT.ELF — not this lane's (WINX-2 loads it off
+# the same volume every boot), so it is FORBIDden here.
+REQUIRE :: LOGIN-END: pid=\d+ stamp=stamped windows_before=\d+ ended=1 windows=\d+ pid_gone=true window_gone=true -> PASS ::
+FORBID :: LOGIN-END: .* -> FAIL
+FORBID :: LOGIN-END: .* SKIPPED
+REQUIRE \[users\] logout epoch=\d+ ended=\d+ windows=\d+
+
+# ── 7d. THE CREDENTIAL FILE IS KERNEL-OWNED (SECLOGIN M4, rmbp-ledger B169) ─────────────────────
+# B157 gap 2. The predicate is pinned as a property; the x86 RESOLVER line is pinned as a MEASUREMENT
+# with BOTH readings allowed, because the guard line lives in `fs::vfs::el0_locate`, outside the
+# SECLOGIN grant (multiuser.md §6): `resolver=OPENED` is the hole measured, `resolver=refused` is
+# the day the seat's one line lands. A REQUIRE on `refused` alone would be red until then and a
+# REQUIRE on `OPENED` would certify the hole (LAWS §5: never require a limitation).
+REQUIRE \[users\] kernel-owned pred=ok resolver=(OPENED|refused)
+FORBID :: LOGIN-KOWN: .* -> FAIL
+
+# ── 7e. THE SALT HAS A SOURCE, AND THE EPOCH IS 64 BITS (SECLOGIN M5, rmbp-ledger B169) ─────────
+# B157 gaps 5 and 6. `source=` is pinned as the three names the module can say; on THIS lane
+# (`-cpu qemu64,+x2apic`, no RDRAND) it reads `jitter` and the probe says `cpuid.01h.ecx.30=0`; under
+# the builder's `UNAOS_CPU=qemu64,+x2apic,+rdrand` it reads `rdrand` — the flip, with no new knob.
+# GO-RED: `rand::jitter_fill` mutated to a constant → `distinct=false -> FAIL`.
+REQUIRE \[rand\] source=(rdrand|rndr|jitter) probe=\S+ bits=256
+REQUIRE :: LOGIN-RAND: source=(rdrand|rndr|jitter) distinct=true nonzero=true same_source=true salts_differ=true draws=\d+ epoch_bits=64 -> PASS ::
+FORBID :: LOGIN-RAND: .* -> FAIL
+
+# ── 7f. THE HOME NAMES ITS VOLUME BY SERIAL (SECLOGIN M6, rmbp-ledger B169) ─────────────────────
+# B157 gap 8: `volume=el0-fat` named the ROLE. Now the FAT volume serial (BS_VolID, eight hex
+# digits), so a flight-12 capture tells the card from a stick. The roster policy (gap 7) is a
+# predicate in `video/login.rs` with the default unchanged, so `LOGIN-CONTROL`'s `rows=` is unchanged.
+REQUIRE \[users\] home=/home/una (created|exists) volume=[0-9a-f]{8}
 
 # ── 8. ABSENCE — the hole every block above exists to close ─────────────────────────────────────
 # A fixture that stops running prints nothing and passes silently. Every REQUIRE above gates PRESENCE

@@ -211,6 +211,21 @@ attributes the chain above built.** Nothing in §4 is redone; a user is one more
   behaviour and is a separate arc. The row is proven ROW -> VERB -> ACTION through the
   menu's own pure resolver (`crystal::logout_row_fire`, fixture `loginst`), and its placement on the
   real panel by `crystal::selftest` leg 3, which walks every row of the tree.
+* **True secure multi-user login (SECLOGIN, R62 — 2026-09-22; the design is `multiuser.md`, the
+  ledger row rmbp B169).** B157's eight gaps, each taken in its own milestone. The credential is
+  PBKDF2-HMAC-SHA256 at a per-boot calibrated count stored per row (`USERS.DAT` v2, floor 10 000,
+  a v1 image adopted and re-hashed at the next successful login; `verify` constant-time for an
+  unknown name too). The identity is a `uid` that is never reissued — x86's u32 tables and
+  aarch64's `user:<name>#<uid>` string compare the same number, so a recreated user in a recycled
+  slot or under a reused name is refused, and `delete_user` exists at last. **Log Out ENDS the
+  session's programs** (windows closed, then killed through the close box's own path, then the
+  epoch bumps — `[users] logout epoch=<n> ended=<n> windows=<n>`), so the sentence above that a
+  program "keeps running" is history. The credential file is kernel-owned on the aarch64 path
+  resolver, and the x86 half is one owed line in `fs::vfs::el0_locate` (`multiuser.md` §6). The
+  salt draws from `rand.rs` (RDRAND / RNDR / a documented jitter fallback, the source said on the
+  wire once), and the epoch is 64 bits. The user rows on the pre-session glass are a stated policy
+  predicate (`login::roster_on_glass`), and `ensure_home` names the volume by serial. Encryption
+  at rest is NOT built and the design says what it needs.
 * **Status (M1, `exec-orin-login`):** record store, session principal on both arches, `login`/
   `logout` shell arms and the fixture landed; measured while landing: the typed verbs wait on one
   `HOST_VERBS` row in `libs/sys/midden_core`, the x86 QEMU build waits on one `UNAOS_LOGIN` map

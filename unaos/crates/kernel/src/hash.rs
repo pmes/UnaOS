@@ -88,7 +88,7 @@ const K: [u32; 64] = [
 
 /// A streaming SHA-256 digest — the copy-verify primitive feeds it extent-by-extent as it re-reads,
 /// so no full-payload buffer is ever held for hashing.
-pub struct Sha256 {
+#[derive(Clone)] pub struct Sha256 { // SECLOGIN M1: Clone so an HMAC can keep its two keyed prefix states and fork them per message (same-line fold: no Location below moves)
     h: [u32; 8],
     buf: [u8; 64],
     buf_len: usize,
@@ -217,4 +217,105 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(data);
     h.finalize()
+}
+
+// --- HMAC-SHA256 (RFC 2104) + PBKDF2-HMAC-SHA256 (RFC 8018 §5.2) — SECLOGIN M1 (PWHARD) ---
+//
+// The password stretch for `fs/users.rs`. Self-contained on the `Sha256` above, no crate, no alloc:
+// the salt is bounded (`fs::users::SALT_LEN` = 16) so the first block's input fits a stack buffer,
+// and a single 32-byte output block is all a credential row needs. Known answers (RFC 6070's vectors
+// carried over to SHA-256, the values every reference implementation prints) are asserted by the
+// `LOGIN-HARD` fixture at boot, not merely in this comment.
+
+/// A keyed HMAC-SHA256 with the two padded-key prefix states computed ONCE. `mac` forks them per
+/// message, which is what makes a PBKDF2 iteration exactly two compressions instead of four.
+pub struct HmacSha256 {
+    inner: Sha256,
+    outer: Sha256,
+}
+
+impl HmacSha256 {
+    pub fn new(key: &[u8]) -> Self {
+        let mut k = [0u8; 64];
+        if key.len() > 64 {
+            k[..32].copy_from_slice(&sha256(key));
+        } else {
+            k[..key.len()].copy_from_slice(key);
+        }
+        let mut ipad = [0u8; 64];
+        let mut opad = [0u8; 64];
+        for i in 0..64 {
+            ipad[i] = k[i] ^ 0x36;
+            opad[i] = k[i] ^ 0x5c;
+        }
+        let mut inner = Sha256::new();
+        inner.update(&ipad);
+        let mut outer = Sha256::new();
+        outer.update(&opad);
+        Self { inner, outer }
+    }
+
+    /// HMAC(key, msg).
+    pub fn mac(&self, msg: &[u8]) -> [u8; 32] {
+        let mut i = self.inner.clone();
+        i.update(msg);
+        let d = i.finalize();
+        let mut o = self.outer.clone();
+        o.update(&d);
+        o.finalize()
+    }
+}
+
+/// The longest salt `pbkdf2_hmac_sha256` accepts; a longer one is truncated (the caller's bound is
+/// 16, so this is a guard, not a limit anyone reaches).
+pub const PBKDF2_SALT_MAX: usize = 64;
+
+/// PBKDF2-HMAC-SHA256, first output block only (`dkLen` = 32): `T1 = U1 xor U2 xor … xor Uc`,
+/// `U1 = PRF(P, S || INT(1))`, `Uj = PRF(P, U(j-1))`. `iters` of 0 is treated as 1 (the standard
+/// forbids 0; the store refuses anything under its own floor before this is ever called).
+/// Cost: exactly `2 * iters` SHA-256 compressions after the two prefix states.
+pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iters: u32, out: &mut [u8; 32]) {
+    let prf = HmacSha256::new(password);
+    let n = core::cmp::min(salt.len(), PBKDF2_SALT_MAX);
+    let mut first = [0u8; PBKDF2_SALT_MAX + 4];
+    first[..n].copy_from_slice(&salt[..n]);
+    first[n..n + 4].copy_from_slice(&1u32.to_be_bytes());
+    let mut u = prf.mac(&first[..n + 4]);
+    let mut t = u;
+    let c = if iters == 0 { 1 } else { iters };
+    for _ in 1..c {
+        u = prf.mac(&u);
+        for i in 0..32 {
+            t[i] ^= u[i];
+        }
+    }
+    *out = t;
+}
+
+/// Known answers for the fixture: PBKDF2-HMAC-SHA256("password", "salt", c) for c = 1, 2, 4096 —
+/// the RFC 6070 inputs with SHA-256 as the PRF, as printed by every reference implementation.
+pub const PBKDF2_KAT: [(u32, [u8; 32]); 3] = [
+    (1, [
+        0x12, 0x0f, 0xb6, 0xcf, 0xfc, 0xf8, 0xb3, 0x2c, 0x43, 0xe7, 0x22, 0x52, 0x56, 0xc4, 0xf8, 0x37,
+        0xa8, 0x65, 0x48, 0xc9, 0x2c, 0xcc, 0x35, 0x48, 0x08, 0x05, 0x98, 0x7c, 0xb7, 0x0b, 0xe1, 0x7b,
+    ]),
+    (2, [
+        0xae, 0x4d, 0x0c, 0x95, 0xaf, 0x6b, 0x46, 0xd3, 0x2d, 0x0a, 0xdf, 0xf9, 0x28, 0xf0, 0x6d, 0xd0,
+        0x2a, 0x30, 0x3f, 0x8e, 0xf3, 0xc2, 0x51, 0xdf, 0xd6, 0xe2, 0xd8, 0x5a, 0x95, 0x47, 0x4c, 0x43,
+    ]),
+    (4096, [
+        0xc5, 0xe4, 0x78, 0xd5, 0x92, 0x88, 0xc8, 0x41, 0xaa, 0x53, 0x0d, 0xb6, 0x84, 0x5c, 0x4c, 0x8d,
+        0x96, 0x28, 0x93, 0xa0, 0x01, 0xce, 0x4e, 0x11, 0xa4, 0x96, 0x38, 0x73, 0xaa, 0x98, 0x13, 0x4a,
+    ]),
+];
+
+/// Run the three known answers; `true` when every one matches. Cheap (4099 iterations total).
+pub fn pbkdf2_kat_ok() -> bool {
+    let mut ok = true;
+    for (c, want) in PBKDF2_KAT.iter() {
+        let mut got = [0u8; 32];
+        pbkdf2_hmac_sha256(b"password", b"salt", *c, &mut got);
+        ok &= got == *want;
+    }
+    ok
 }

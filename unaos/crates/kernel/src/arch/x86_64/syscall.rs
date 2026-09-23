@@ -23801,20 +23801,20 @@ pub fn u7x_probe_once() {
 //
 // x86 keys its ACL by `(slot, gen)` and carries NO persistent principal (U6x, above) — there is no
 // `PrincipalRecord` on this arch to stamp `user:<name>` into. The twin therefore carries the user as its
-// users-table ID: `SESSION_USER` (0 = no session) is copied into `SLOT_USER[slot]` at the two loader
+// users-table ID — SINCE SECLOGIN M2 THE `uid`, never reissued (`multiuser.md` §2): `SESSION_USER` (0 = no session) is copied into `SLOT_USER[slot]` at the two loader
 // returns (`spawn_user_image_bg_inner`, `run_user_image` — the callers of `load_program_common`), cleared
 // with the slot's generation in `clear_handle_row`, recorded on the owner row at a private create
 // (`OWNED_USER[nameid]`), and consulted ONLY on a live-incarnation DENY in `sys_open`'s two ACL sites: a
 // caller whose slot carries the same non-zero user as the row's creator is admitted. Same seam, same
 // two call sites, one extra equality — the x86 analogue of the aarch64 by-name branch. A row wiped at
 // owner teardown reverts to PUBLIC exactly as before (the user stamp is then never consulted), and a
-// re-create re-stamps it, so no stale admission survives a name's reuse.
+// re-create re-stamps it, so no stale admission survives a name's reuse. And since SECLOGIN M2 the number compared is the uid, so a user recreated into a RECYCLED table slot (B157 gap 3) or under a REUSED name carries a different number and is refused by the same line.
 //
 // HONEST RESIDUAL (reported, not hidden): x86 EL0 opens a STATIC 5-name table at the volume root
 // (`U10_NAMES`, SO20), so the M2 home-directory proof cannot run on this arch until the path-taking
 // open lands; M1's x86 proof is the session stamp + admission, driven by the shared `fs::users` fixture.
 
-/// LOGIN M1: the open session's users-table id (0 = none).
+/// LOGIN M1: the open session's uid (0 = none) — SECLOGIN M2: `fs::users::id_of`, the non-recyclable identity.
 #[cfg(feature = "login")]
 static SESSION_USER: AtomicU32 = AtomicU32::new(0);
 /// LOGIN M1: per-slot user stamp, taken at load from `SESSION_USER` (0 = anonymous).
@@ -23848,10 +23848,10 @@ pub fn session_login(id: u32, name: &[u8]) -> bool {
 /// SO37: the epoch is bumped FIRST, so no instant exists in which the session is already gone while the
 /// epoch still names it. See the SO37 block below for what the epoch is and why it is not in the record.
 #[cfg(feature = "login")]
-pub fn session_logout() {
+pub fn session_logout() -> (usize, usize) { let ended = session_end_processes(SESSION_EPOCH.load(Ordering::Acquire)); // SECLOGIN M3 — every program launched under the CLOSING epoch is ended (windows first, then the close box's own kill path) BEFORE the bump, so no instant exists in which a session's program outlives its session; `(ended, windows)` reaches the wire through `fs::users::logout`. Same-line fold (B94).
     SESSION_EPOCH.fetch_add(1, Ordering::AcqRel);
     SESSION_USER.store(0, Ordering::Release);
-    crate::arch::without_interrupts(|| { SESSION_NAME.lock().1 = 0; });
+    crate::arch::without_interrupts(|| { SESSION_NAME.lock().1 = 0; }); ended
 }
 
 /// LOGIN M1: the open session's user name into `out` (its length), `None` with no session.
@@ -23901,7 +23901,7 @@ fn owned_user_stamp(nameid: usize, slot: usize) {
     }
 }
 
-/// LOGIN M1: by-user admission — the caller's slot carries the same NON-ZERO user as the row's creator.
+/// LOGIN M1: by-user admission — the caller's slot carries the same NON-ZERO uid as the row's creator (SECLOGIN M2: the uid is never reissued, so a recycled slot or a reused name never matches).
 /// SO37: the caller's user is read through [`slot_user_live`], so a stamp from a CLOSED session is 0 and
 /// the `u != 0` guard this function has always had refuses it. No new deny branch, no new cost on the
 /// admit path: this whole function is only reached on a live-incarnation DENY.
@@ -23942,17 +23942,17 @@ fn owned_user_ok(nameid: usize, slot: usize) -> bool {
 /// SO37: the LIVE session's epoch (starts at 1; 0 is the never-stamped slot value). Bumped by every
 /// [`session_logout`].
 #[cfg(feature = "login")]
-static SESSION_EPOCH: AtomicU32 = AtomicU32::new(1);
+static SESSION_EPOCH: AtomicU64 = AtomicU64::new(1); // SECLOGIN M5: u64 — a u32 wraps at 4.3e9 logouts, named by B157 gap 5, now defended
 
 /// SO37: the epoch each slot's user stamp was taken in (0 = never stamped, which never matches).
 #[cfg(feature = "login")]
-static SLOT_EPOCH: [AtomicU32; crate::arch::memory::USER_SLOTS + 1] =
-    [const { AtomicU32::new(0) }; crate::arch::memory::USER_SLOTS + 1];
+static SLOT_EPOCH: [AtomicU64; crate::arch::memory::USER_SLOTS + 1] =
+    [const { AtomicU64::new(0) }; crate::arch::memory::USER_SLOTS + 1]; // SECLOGIN M5: u64 with SESSION_EPOCH
 
 /// SO37: the LIVE epoch as a NUMBER, for the wire — never a decision. Read by `fs::users::logout`, so
 /// every Log Out names the epoch it just opened and a boot's session boundaries are countable on serial.
 #[cfg(feature = "login")]
-pub fn session_epoch() -> u32 {
+pub fn session_epoch() -> u64 {
     SESSION_EPOCH.load(Ordering::Acquire)
 }
 
@@ -28612,4 +28612,122 @@ fn stor1_wr_launcher(demo_cpu: usize) {
             rc[0], rc[1], rc[2], rc[3], rc[4], rc[5], rc[6], rc[7], rc[8], rc[9], rc[10], rc[11], rc[12], rc[13], rc[14], rc[15]
         );
     }
+}
+// SECLOGIN M2 — IDENTITY PARITY fixture, x86 half. File tail: nothing above moves.
+// =====================================================================================================
+
+/// SECLOGIN M2 (`loginst`): on the real x86 ACL tables (no disk I/O, SO20's static name table). Slot A
+/// carries user A's uid in the live epoch and creates the U6GX name PRIVATE (`owned_set_owner` +
+/// `owned_user_stamp`); slot B carries user B's uid — the row that reused A's STORAGE SLOT after A's
+/// delete; slot C carries A's NAME recreated, a newer uid again. A is admitted by user (the control);
+/// B and C are refused by `owned_user_ok`, because the number it compares is the uid and the uid was
+/// never reissued. `(owner_ok, same_slot_refused, same_name_refused)`. Cleaned up.
+#[cfg(feature = "loginst")]
+pub fn ident_fixture(uid_a: u32, uid_b: u32, uid_a2: u32) -> (bool, bool, bool) {
+    const A: usize = crate::arch::memory::USER_SLOTS - 2;
+    const B: usize = crate::arch::memory::USER_SLOTS - 1;
+    const C: usize = crate::arch::memory::USER_SLOTS;
+    let Some(nameid) = u10_name_id(U6GX_NAME) else { return (false, false, false) };
+    let nameid = nameid as usize;
+    let epoch = SESSION_EPOCH.load(Ordering::Acquire);
+    SLOT_USER[A].store(uid_a, Ordering::Release);
+    SLOT_USER[B].store(uid_b, Ordering::Release);
+    SLOT_USER[C].store(uid_a2, Ordering::Release);
+    for s in [A, B, C] { SLOT_EPOCH[s].store(epoch, Ordering::Release); }
+    let ga = SLOT_GEN[A].load(Ordering::Acquire);
+    owned_set_owner(nameid, A, ga);
+    owned_user_stamp(nameid, A);
+    let owner_ok = uid_a != 0 && owned_user_ok(nameid, A);
+    let same_slot_refused = !owned_user_ok(nameid, B);
+    let same_name_refused = !owned_user_ok(nameid, C);
+    owned_clear(nameid);
+    OWNED_USER[nameid].store(0, Ordering::Release);
+    for s in [A, B, C] { slot_user_clear(s); }
+    serial_println!("[users] ident name={} owner_uid={} same_slot_uid={} refused={} reason=recycled-id same_name_uid={} refused={} reason=recycled-id", U6GX_NAME, uid_a, uid_b, same_slot_refused, uid_a2, same_name_refused);
+    (owner_ok, same_slot_refused, same_name_refused)
+}
+
+// =====================================================================================================
+// SECLOGIN M3 — LOG OUT ENDS THE SESSION, x86 half. File tail: nothing above moves.
+// =====================================================================================================
+
+/// SECLOGIN M3: end every running program whose slot carries a user stamp taken in `closing`, the
+/// session that is closing. Per program: `wm::close_owner` (its windows leave the panel now — the
+/// same first move `wc_close_click` makes), then [`bg_kill`], the metal-proven x86 kill path the close
+/// box already takes (the reap tears the address space down and retires its compositor windows; the
+/// slot's user stamp goes with its generation in `clear_handle_row`). COUNTED as ended only when the
+/// row no longer names the pid after the kill returns — an armed-but-unconfirmed kill is not an end,
+/// so `ended=N` on the wire was measured, not requested. A program launched with NO session
+/// (`SLOT_USER == 0`: the whole fixture battery, the desktop's own `STAT.ELF`) is never touched —
+/// the boundary is the session, and an anonymous program has no session to outlive. Returns
+/// `(ended, windows_closed)`; called from [`session_logout`] BEFORE the epoch bump.
+#[cfg(feature = "login")]
+fn session_end_processes(closing: u64) -> (usize, usize) {
+    let mut ended = 0usize;
+    let mut windows = 0usize;
+    for pi in 0..MAX_PROCS {
+        if PROCS[pi].state.load(Ordering::Acquire) != PRUNNING {
+            continue;
+        }
+        let owner = PROCS[pi].slot.load(Ordering::Acquire) as u64; // `slot + 1`-biased: the wm owner key
+        let Some(s) = (owner as usize).checked_sub(1) else { continue };
+        if s > crate::arch::memory::USER_SLOTS || SLOT_USER[s].load(Ordering::Acquire) == 0 || SLOT_EPOCH[s].load(Ordering::Acquire) != closing {
+            continue;
+        }
+        let pid = PROCS[pi].pid.load(Ordering::Acquire);
+        if pid == 0 {
+            continue; // mid-publish; its stamp is dead the moment the epoch bumps
+        }
+        let user = SLOT_USER[s].load(Ordering::Acquire);
+        let w = crate::video::wm::close_owner(owner);
+        windows += w;
+        let settle = bg_kill(pid, owner);
+        let gone = PROCS[pi].state.load(Ordering::Acquire) != PRUNNING || PROCS[pi].pid.load(Ordering::Acquire) != pid;
+        if gone {
+            ended += 1;
+        }
+        serial_println!("[users] session-end pid={} slot={} user={} windows={} kill=\"{}\" ended={}", pid, s, user, w, settle, gone);
+    }
+    (ended, windows)
+}
+
+/// SECLOGIN M3 fixture (`loginst`, x86): with a session OPEN (the caller's), launch `STAT.ELF` through
+/// the desktop's own launcher (`spawn_user_image_bg` — the slot is stamped with the session's uid and
+/// epoch at load), wait for its window, then Log Out through `fs::users::logout` (the real entry the
+/// crystal's row calls) and measure: the pid is gone from the process table (`bg_poll` = `Gone`), the
+/// slot holds no window, and the logout's own `(ended, windows)` say so. Returns
+/// `(pid, windows_before, ended, windows, pid_gone, window_gone)`; `pid == 0` = could not launch
+/// (no FAT volume, no `STAT.ELF`, loader refused) — the caller prints a SKIP with the reason.
+#[cfg(all(feature = "loginst", feature = "login"))]
+pub fn session_end_fixture() -> (u64, usize, usize, usize, bool, bool, &'static str) {
+    let Ok(fs) = crate::fs::fat::mount_program_source() else { return (0, 0, 0, 0, false, false, "no-fat-volume") };
+    let Ok(de) = fs.find_app("STAT.ELF") else { return (0, 0, 0, 0, false, false, "stat-elf-absent") };
+    let cap = user_window_size();
+    if de.size == 0 || de.size as usize > cap {
+        return (0, 0, 0, 0, false, false, "stat-elf-size");
+    }
+    let mut bytes = alloc::vec![0u8; de.size as usize];
+    if fs.read_file(&de, &mut bytes, cap).is_err() {
+        return (0, 0, 0, 0, false, false, "stat-elf-read");
+    }
+    let (pid, slot, _entry) = match spawn_user_image_bg(&bytes) {
+        Ok(v) => v,
+        Err(_) => return (0, 0, 0, 0, false, false, "spawn-refused"),
+    };
+    let slot = slot as usize;
+    let deadline = crate::arch::ticks() + 5_000;
+    let mut windowed = false;
+    while crate::arch::ticks() < deadline {
+        windowed |= winx_slot_has_window(slot);
+        if windowed {
+            break;
+        }
+        crate::arch::sched::yield_now();
+    }
+    let windows_before = if windowed { 1 } else { 0 };
+    let stamped = SLOT_USER[slot].load(Ordering::Acquire) != 0 && SLOT_EPOCH[slot].load(Ordering::Acquire) == SESSION_EPOCH.load(Ordering::Acquire);
+    let (ended, windows) = crate::fs::users::logout();
+    let pid_gone = matches!(bg_poll(pid, false), BgPoll::Gone);
+    let window_gone = !winx_slot_has_window(slot);
+    (pid, windows_before, ended, windows, pid_gone && stamped, window_gone, if stamped { "stamped" } else { "UNSTAMPED" })
 }
