@@ -84,3 +84,35 @@ FORBID \[ptrdead\] backlog whole=skip nodrop=skip order=skip
 # re-pinned to the new wording (naming the arc that changed it), or dropped with the reason stated.
 # It is never worked around by teaching the kernel a SECOND spelling of the same witness.
 # Tail-append is this repo's safe form: pinned lines are cited positionally.
+
+# ── DOCKID (DOCKSTAMP, 2026-09-22; rmbp-ledger B175, FIXTURE_FLAKES §1d) — THE SAME PIN THE wc LANE
+# --- GOT, ON THE LANE DOCKID2 NAMED AS OWED. x86-wc.spec:226/240/246 carries this fixture's
+# --- REQUIRE-or-skip and its two FORBID-the-skip lines; DOCKID2 pinned it THERE ONLY and said so,
+# --- and this file is the other half. It is not a duplicate for tidiness: THIS lane is where the
+# --- fixture has actually gone red. `logs/foldgate/g9r-test-ptr.log` — a `./arroyo test-ptr` capture
+# --- from gate 9's re-run on this bench — carries
+# ---   serial.log:1702 :: DOCKID: tiles=6 … recycle=true order=true set=false furniture=true
+# ---                     count=true/6 pins=true/3 press=yes :: FAIL ::
+# --- and NO directive in this file saw it: it was convicted by `mbench`'s builtin DEFAULT_FORBIDS
+# --- reading the bare `:: FAIL ::`, exactly the hole x86-wc.spec's block was written to close. The
+# --- typist lane races the fixture harder than the plain wc lane does — `qmp_type.py` is injecting
+# --- 36 relative reports through the xHCI decoder while `dockid_selftest` mints and closes six
+# --- windows on the boot task — which is why the sighting is HERE and why the pin belongs here.
+# ---
+# --- THE SHAPE IS x86-wc.spec's, DELIBERATELY UNCHANGED, and pi4-regression.spec:2032/2052's before
+# --- that: a REQUIRE that accepts PASS or SKIP (so ABSENCE reds — DEFAULT_FORBIDS structurally
+# --- cannot see a missing line — while the fixture's two honest `fixture — table full` arms stay
+# --- legal), then FORBIDs that close the arms which must not pass quietly. The `reconciled=<ran>/
+# --- <drives> folds=<n>` fields are pinned for the reason x86-wc.spec gives: they are DOCKID2's
+# --- Class 6 leg, and a later fold that drops them must red HERE rather than silently narrow what
+# --- the verdict asserts.
+REQUIRE :: DOCKID: (.* reconciled=\d+/\d+ folds=\d+ :: (PASS|SKIP) ::|fixture — table full.* :: SKIP ::)
+FORBID :: DOCKID: .* :: FAIL ::
+# --- AND THE DECLINE ARM IS CLOSED ON THIS LANE TOO, for x86-wc.spec's argument applied to a lane
+# --- that is strictly busier: the fixture still runs on the boot task and still drives its own
+# --- composites, so a `reconciled=false` here is a contention report and not an honest outcome —
+# --- 250 ms is over fifty times the mean honest TCG pass. Both spellings, because one can go
+# --- missing and the other must still bite: the REASON line, then the VERDICT carrying the same
+# --- outcome with its `reconciled=` short. The `fixture — table full` skips match NEITHER.
+FORBID :: DOCKID: .* reconciled=false
+FORBID :: DOCKID: .* reconciled=\d+/\d+ folds=\d+ :: SKIP ::
