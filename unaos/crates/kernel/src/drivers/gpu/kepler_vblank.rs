@@ -471,7 +471,7 @@ pub fn arm(head: u32, vtotal: u32) {
     VB_LAST_PRINT_MS.store(crate::arch::ms(), Ordering::Relaxed);
     VB_HEAD1.store(head + 1, Ordering::Release);
     serial_println!(
-        ":: kepler: vblank arm head={} vt={} mode={} src=HEAD_STAT.VERT[31:16] :: — rnndb display/g80_pdisplay.xml:647 (HEAD_STAT 0x6000, stride 0x800, +0x340 VERT: vline[15:0], vblank_count[31:16]). POLL and not an interrupt because this tree has no vector/MSI helper a PCI function can join (three hard-coded IDT vectors, no allocator) — see kepler_vblank.rs for what the interrupt path would need. The sampler is the compositor's own scanout_beam read: zero extra MMIO. READ-ONLY: writes=0 ::",
+        ":: kepler: vblank arm head={} vt={} mode={} src=HEAD_STAT.VERT[31:16] :: — rnndb display/g80_pdisplay.xml:647 (HEAD_STAT 0x6000, stride 0x800, +0x340 VERT: vline[15:0], vblank_count[31:16]). mode= starts at poll and is set to irq ONLY by KVBLANK2 rung 3 observing the wire deliver (see the `vblank-intr vector close` line); KVBLANK's reason for poll — no vector allocator a PCI function could join — was closed by VECTORS (rmbp-ledger B168) and the NOT-IN-TREE enable/status pair by KVBLANK2's citation (B179). The polled sampler is the compositor's own scanout_beam read: zero extra MMIO. READ-ONLY: writes=0 ::",
         head, vtotal, mode_str(),
     );
 }
