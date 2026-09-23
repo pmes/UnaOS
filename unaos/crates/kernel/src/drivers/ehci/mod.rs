@@ -16957,31 +16957,61 @@ const MT_RAW_DUMP_BYTES: usize = 64;
 //     is raw ground truth) and apply the negation only in the opt-in injection path below.
 //
 // The raw frame carries NO leading HID Report ID byte — offsets here are from byte 0 of the frame.
+//
+// TPFRAME (rmbp-ledger B197) — THE FORMAT, DERIVED A SECOND TIME FROM THE WIRE, and the two compared.
+// Corpus: the three 58-byte frames flight 12 dumped after `[tp] mode … latched=yes` (image 4,
+// `hw-rmbp@6d8d3d2d`, `logs/foldgate/f12-boot1.log`, `vendor-multitouch raw report #2/#3/#4 (58 B)`
+// at 234250/234262/234267 ms). Derivation B read ONLY those bytes (every le16 offset scanned for
+// monotonic motion and for one field being a fixed multiple of another's frame-to-frame delta); A is
+// the wsp.c table above. B agrees with A at every offset B can reach, and the `VMT_FINGER_*` 0x44
+// hypothesis (report offsets 33/35/47, it strips a Report ID byte this frame does not carry) is off by
+// one at all three. `unverified` = the corpus cannot say, so the value rests on wsp alone.
+//   off  size  wsp name       corpus #2 / #3 / #4        reading
+//   0    u8    flag           74 / 74 / 74               constant; meaning unverified, NOT a route gate
+//   1    u8    sn0            57 / 58 / 59               +1 per frame: a frame sequence counter
+//   4    le32  dwSn1          0x3ae66 / 6e / 76          +8 per frame: a timestamp, unit unverified
+//   12   le16  wLength        28 / 28 / 28               = len - 30: bytes of finger records
+//   14   u8    nfinger        1 / 1 / 1                  = records the length holds
+//   15   u8    ibt            0 / 0 / 0                  button: unverified (no click in the corpus)
+//   30+2 le16  abs_x          2901 / 2871 / 2868         moves; = rel_x / 10 exactly (2/2 pairs)
+//   30+4 le16  abs_y          1720 / 1732 / 1737         moves; = rel_y / 10 exactly (2/2 pairs)
+//   30+6 le16  rel_x          -192 / -300 / -30          = 10 x delta(abs_x): the cross-check on +2
+//   30+8 le16  rel_y          56 / 120 / 50              = 10 x delta(abs_y): the cross-check on +4
+//   30+16 le16 touch_major    234 / 231 / 243            non-zero with a finger down; lift = 0 unverified
+//   30+24 le16 pressure       0 / 0 / 0                  unverified (0 with a finger down)
+// Bytes 2-3, 8-11, 16-29 and finger +0, +10..+14, +18..+23, +26 are unverified and unread. Which way
+// the sensor's Y grows on the glass is unverified too: the pointer path negates it as wsp does, and
+// only the glass can say. A header-only 30-byte frame (no records: all fingers up) is accepted by the
+// decoder as zero fingers — no such frame is in the corpus, so that shape is unverified as well.
+/// TPFRAME: finger-record offset of `rel_x` (int16 LE) — read only by the fixture's cross-check.
+const WSP2_F_REL_X: usize = 6;
+/// TPFRAME: finger-record offset of `rel_y` (int16 LE) — read only by the fixture's cross-check.
+const WSP2_F_REL_Y: usize = 8;
 /// Bytes of header before finger[0] (`FINGER_TYPE2`, corroborated by `struct tp_header`'s size).
-#[cfg(feature = "mtraw")]
+/// TPFRAME corpus: every 58-B frame is 30 + 1x28 (3/3), and `wLength`@12 reads 28 = len - 30 (3/3).
 const WSP2_HDR_LEN: usize = 30;
 /// Bytes per finger record (`FSIZE_TYPE2`, corroborated by `struct tp_finger`'s size).
-#[cfg(feature = "mtraw")]
+/// TPFRAME corpus: the only record size 58 - 30 admits with `nfinger`=1; one record per frame (3/3).
 const WSP2_FSIZE: usize = 28;
 /// Header offset of the finger count (`tp_header.nfinger`, = `BUTTON_TYPE2 - 1`).
-#[cfg(feature = "mtraw")]
+/// TPFRAME corpus: reads 1 on 3/3 frames, = (len - 30) / 28 on each. Count > 1 is `unverified`.
 const WSP2_NFINGER_OFF: usize = 14;
 /// Header offset of the integrated-button byte (`tp_header.ibt`, = `BUTTON_TYPE2`).
-#[cfg(feature = "mtraw")]
+/// TPFRAME corpus: reads 0 on 3/3 (no click in the corpus) — the button semantic is `unverified`.
 const WSP2_BUTTON_OFF: usize = 15;
 /// Finger-record offset of `abs_x` (int16 LE).
-#[cfg(feature = "mtraw")]
+/// TPFRAME corpus: 2901, 2871, 2868 — and `rel_x`@+6 = 10 x its delta on 2/2 frame pairs.
 const WSP2_F_ABS_X: usize = 2;
 /// Finger-record offset of `abs_y` (int16 LE).
-#[cfg(feature = "mtraw")]
+/// TPFRAME corpus: 1720, 1732, 1737 — and `rel_y`@+8 = 10 x its delta on 2/2 frame pairs.
 const WSP2_F_ABS_Y: usize = 4;
 /// Finger-record offset of `touch_major` (int16 LE); non-zero == the finger is in contact.
-#[cfg(feature = "mtraw")]
+/// TPFRAME corpus: 234, 231, 243 with a finger down (3/3); its lift value 0 is `unverified`.
 const WSP2_F_TOUCH_MAJOR: usize = 16;
 /// Hard clamp on decoded fingers (`MAX_FINGERS`). Hostile/garbled input can put anything in the
 /// count byte; the decoder additionally clamps to the records the frame's LENGTH can hold, so the
 /// two together make an out-of-bounds read unreachable.
-#[cfg(feature = "mtraw")]
+/// TPFRAME corpus: holds 1 record (3/3); the clamp is wsp's and untested on this pad.
 const WSP2_MAX_FINGERS: usize = 16;
 
 // EHCI-5 vendor-multitouch decode HYPOTHESIS (bcm5974 TYPE2 lead — CONFIRM AT METAL).
@@ -17542,7 +17572,7 @@ unsafe fn trackpad_dispatch_selftest() {
 /// Only the fields the arc actually needs: the frame-level count/button, and the FIRST finger's
 /// position + contact state (deeper multitouch is a later arc; the decoder validates the whole
 /// frame's shape either way, so it is a per-record loop away).
-#[cfg(feature = "mtraw")]
+/// TPFRAME: default-on since B197 (the live vendor route decodes through it); was `mtraw`-only.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Wsp2Frame {
     /// Fingers reported, clamped to `WSP2_MAX_FINGERS` AND to the records the frame can hold.
@@ -17576,11 +17606,12 @@ struct Wsp2Frame {
 ///
 /// Emits NO events and mutates NO state — decode + witness only (see `mt_inject_first_finger` for
 /// the opt-in pointer path).
-#[cfg(feature = "mtraw")]
+/// TPFRAME: default-on since B197; the length gate admits a header-only frame (see the table).
 fn decode_wellspring_type2(frame: &[u8]) -> Option<Wsp2Frame> {
-    // wsp_intr_callback's gate, verbatim in intent: one whole finger record minimum, and the
-    // post-header remainder must divide evenly into finger records.
-    if frame.len() < WSP2_HDR_LEN + WSP2_FSIZE {
+    // wsp_intr_callback's gate: the post-header remainder must divide evenly into finger records.
+    // TPFRAME: a header-only frame (zero records) is ADMITTED as zero fingers, so a lift sent in
+    // that shape resets the pointer baseline instead of being dropped (shape unverified, above).
+    if frame.len() < WSP2_HDR_LEN {
         return None;
     }
     if (frame.len() - WSP2_HDR_LEN) % WSP2_FSIZE != 0 {
