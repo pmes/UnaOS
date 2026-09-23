@@ -328,20 +328,20 @@ pub const SYS_CPUPULSE: u64 = 49;
 /// have worked, because after STOR-1 M1 a created file commonly has NO open descriptor and so no
 /// handle to name it by.
 ///
-/// The fourth argument rides `r10` from ring 3 (`SYSCALL` itself destroys `rcx`), exactly as
-/// [`SYS_THREAD_SPAWN`]'s fourth does; the entry stub moves it to the 5th C register before its
-/// shuffle.
+/// The fourth argument rides `r10` from ring 3 on x86 (`SYSCALL` destroys `rcx`), as [`SYS_THREAD_SPAWN`]'s
+/// fourth does, and the entry stub moves it to the 5th C register; on aarch64 it is `x3`, like every SVC's.
 ///
-/// Errnos: `-EINVAL` (empty or oversized name) · `-ENOENT` (the source has no entry, or either name
-/// is outside the creatable set) · `-EACCES` (the shared window · an immutable staged name · not the
-/// owner — DELETE authority, because a content grantee able to re-point a name could steal it) ·
-/// `-EEXIST` (the destination is live) · `-EBUSY` (the destination's deferred delete has not
-/// drained, or the SOURCE still has an open descriptor — an x86-only refusal the kernel-side doc
-/// comment states in full) · `-EIO` (the on-disk twin could not be re-materialised; on that path the
-/// namespace is left exactly as it was).
+/// Errnos SHARED by both arches for the same cause: `-EINVAL` (empty or oversized name, checked before any
+/// byte is read) · `-EFAULT` (a bad name pointer) · `-ENOENT` (no such source, a non-UTF-8 name, or a name
+/// with a directory component — both rename in the root) · `-EACCES` (not the owner: DELETE authority, since
+/// a content grantee able to re-point a name could steal it; x86 also the shared window and a staged name,
+/// aarch64 the ACL store) · `-EEXIST` (the destination exists). Arch storage conditions: x86 `-EBUSY` (the
+/// destination's deferred delete is pending, or a RELEASE of the source is mid-way on another core — a
+/// transient) and `-EIO`; aarch64 `-EISDIR` `-ENODEV` `-EAGAIN` `-EIO`. NEITHER arch refuses an OPEN source
+/// (STOR-2, rmbp-ledger B185): the descriptor follows the FILE, and the old name is `-ENOENT` while it lives.
 ///
-/// x86 dispatches it; aarch64 does not — that arch answers `mv` on the bus, and minting the syscall
-/// there later is a dispatch arm over the existing `bus_mv` body. Reserved on both.
+/// Dispatched on BOTH arches since STOR-2: aarch64's arm is `bus_mv`'s body under the caller's own identity,
+/// x86's is the body `busx_mv` calls, so `mv A B` and `SYS_RENAME(A, B)` are one function on each arch.
 pub const SYS_RENAME: u64 = 50;
 
 // =================================================================================================

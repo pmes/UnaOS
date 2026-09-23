@@ -304,8 +304,9 @@ FORBID :: STOR1-NAME: created-name entries FAIL
 #
 # `w=0x7f` carries the claim the same way M1's mask does — seven ring-3 legs, of which bit1..3 are
 # the move itself (rename returns 0, the OLD name is -ENOENT, the NEW name reads back byte-exact),
-# bit4 is "a refused rename mutates nothing" and bit5 is the x86-only `-EBUSY` on a live source
-# together with its own retirement (the same rename returns 0 the moment the handle closes). The
+# bit4 is "a refused rename mutates nothing" and bit5 — RE-POINTED IN PLACE by STOR-2 (B185), which
+# retired the x86-only `-EBUSY` on a live source — is now "an OPEN source is renamed (0), and its
+# vacated name is -ENOENT to the same rename and to a plain open after the handle closes". The
 # PASS spelling additionally requires the kernel-side OWNER-ONLY leg (`acl_ok`), which no mask bit
 # can carry because a single ring-3 program cannot be two principals.
 REQUIRE :: STOR1-MV: .* :: PASS \[w=0x7f/0x7f\] ::
@@ -367,3 +368,15 @@ REQUIRE :: EHCI-HID: PASSPERIOD self-test: samples=\d+ backwards-delta-refused=t
 FORBID :: EHCI-HID: ISRARM self-test: .* -> FAIL
 FORBID :: EHCI-HID: ISRARM self-test SKIPPED
 FORBID :: EHCI-HID: PASSPERIOD self-test: .* -> FAIL
+# ── STOR-2 (rmbp-ledger B185, 2026-09-23), TAIL-APPENDED ──────────────────────────────────────────
+# RENAME WITH THE SOURCE OPEN. `stor2_mv_launcher` is unconditional, chained right after STOR1-MV, so
+# the PASS spelling is on the knob-free `./arroyo test` and is REQUIRED. `w=0x7f` carries seven ring-3
+# legs: bit1 rename of an OPEN file returns 0 (STOR-1 answered -EBUSY), bit2 the old name is -ENOENT
+# while the descriptor lives, bit3 a write through the OLD handle succeeds (knob-on it is a grow BY THE
+# NEW NAME on the volume), bit4 the vacated name re-creates as a DIFFERENT, 0-length file, bit5 the
+# renamed file reads back A||B after the old handle closes. The PASS spelling additionally requires the
+# kernel-side handshake leg (a release in flight -> -EBUSY with nothing changed, then 0 with the
+# descriptor re-stamped and the refcount moved by one), which no mask bit can carry.
+REQUIRE :: STOR2-MV: .* :: PASS \[w=0x7f/0x7f\] ::
+# The FORBID partner is the launcher's own FAIL spelling (this milestone's go-red produced it).
+FORBID :: STOR2-MV: rename-while-open FAIL

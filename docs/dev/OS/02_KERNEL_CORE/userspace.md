@@ -3768,7 +3768,7 @@ table, so `mv A B` over the bus and `SYS_RENAME(A, B)` direct are the SAME QUEST
 handle-based rename would have matched nothing there, and after M1 a created file's normal
 state is CLOSED, so there is usually no handle to name it by.
 
-**⚠ The one divergence, and it is mechanical.** x86 refuses a rename while the SOURCE still has
+**⚠ The one divergence, and it is mechanical** (retired by STOR-2 below). x86 refuses a rename while the SOURCE still has
 an open descriptor (`-EBUSY`). aarch64 does not need to: `bus_mv` calls `fat::rename_entry`, an
 in-place single dir-sector name rewrite that keeps the same directory slot, so a live writer
 notices nothing. The x86 syscall handler runs IF-masked and reaches the volume only through the
@@ -3835,7 +3835,7 @@ stronger claim than a comparison and a WEAKER witness, since comparing a functio
 proves nothing — which is why the new witness spends its legs on what construction does not
 give: the round trip across the real ring-3 wire, the foreign-owner denials, and the integrity
 of the world after a denial. (`busx_write` is a create-or-truncate whose truncate half is
-destroy-then-create, so it too refuses `-EBUSY` under a live reader, with the same retirement.)
+destroy-then-create, so it too refuses `-EBUSY` under a live reader. STOR-2 corrects the rest of this sentence: that refusal is a truncate, not a rename, `submit_rename` does not retire it, and it stays.)
 
 **Witness.** `:: BUSX86-WR: … :: PASS [w=0x7ff/0x7ff] ::` — eleven legs in the BANDY shapes the
 Pi pins: BANDY-WR (write→cat byte-exact **and** the DIRECT syscall sees the same file;
@@ -3869,3 +3869,139 @@ the surviving bits (9 and 10) are exactly the two that do not go through the wri
 **What is still owed.** x86 METAL for the whole STOR-1/BUSX86 arc — everything above is
 QEMU-proven on both lanes, knob-off, and the rMBP leg rides the next attended sitting. Disk
 write-back of created entries across a boot is U11 M2's line and is not touched here.
+
+## STOR-2 — rename with the source open, and `SYS_RENAME` on both arches (2026-09-23)
+
+STOR-1 M2 named two retirements it could not take because they were outside its files
+(rmbp-ledger B177): x86 refused a rename while the source was open (`-EBUSY`) because the storage
+service task had no `submit_rename`, and aarch64 had no `SYS_RENAME` at all, so the parity the ABI
+promised was forward-only. STOR-2 (rmbp-ledger B185) takes both. Both premises were verified at the
+parent `98fd8e66` before any edit: `rename_created` refused on `OPENF_REFS[sid] != 0` in both of its
+locked phases and `irqstorage.rs`'s submit set stopped at `submit_rmdir`; aarch64's dispatch had
+`SYS_UNLINK => sys_unlink(a0)` at `syscall.rs:6901` and no rename arm, with `bus_mv` at `:23022`.
+
+### M1 — `submit_rename`, and the descriptor follows the file (x86)
+
+**The storage verb.** `drivers/xhci/irqstorage.rs` gains `BlockOp::Rename`, `submit_rename(src, dst)`
+and `service_rename`, in the shape of the other submit verbs: the request lives on the caller's
+stack, the second name rides the data buffer, the service task runs it at IF=1 and posts the
+result. The body is locate-first on both names and then `fat::rename_entry(0, src, dst)`, the same
+in-place 8.3 rewrite of one directory slot that `bus_mv` calls on aarch64. Nothing is copied and no
+cluster is allocated or freed, so a live writer's bytes cannot be dropped and a crash leaves the file
+under exactly one of its two names. Scope is the matched ABI's: root leaves only (`/X` collapses to
+`X`; a directory component is `-EINVAL`). `rename_entry` is called, not edited. It rewrites the 8.3
+field only, and every name this path moves is an 8.3 `U10_NAMES` entry, which `create_in_dir` writes
+without a long-name run (`fs/fat.rs:3436`), so no long-name run exists here to go stale.
+
+**The rename, in three phases.** Phase 1 authorizes (owner-only, unchanged) and **reserves the
+destination** under the namespace lock by setting `DYN_DELETED_G[did]`. Every create path already
+refuses that flag with `-EBUSY` and every plain open already reads it as absent, so while the disk
+phase runs off the lock nobody can mint, adopt or open the destination. Nothing else can clear the
+flag in that window: its other writers all retire a pending delete, and a destination with one is
+refused before the flag is taken. Phase 2 (knob-on only) is `submit_rename`. An on-disk entry
+already under the reserved name has no namespace owner, so it is reclaimed once and the rename
+retried; any failure is `-EIO` with the namespace untouched. Phase 3 (`stor2_flip`, under the lock)
+re-validates and re-authorizes, **re-stamps every live descriptor of the source** to the destination,
+moves the entry and moves the refcount by exactly the re-stamped count. It releases the reservation
+in the same hold, so the destination goes from reserved to live with nothing in between. A phase-3
+refusal undoes phase 2 first. A source that is still ours is renamed back. A source that was
+unlinked meanwhile is deleted under the destination name, because renaming it back would plant a
+deleted file as an orphan for the next create to adopt.
+
+**Rename atomicity, kept.** STOR-1's rule was that an observer sees the before state or the after
+state and never a state in between, with the destination published before the source is cleared.
+Both still hold, and they now cover descriptors too. The one new reader is the descriptor-release
+path (`files_free_clear`, `clear_files_row`), which takes no lock and cannot take `NAMESPACE`
+(`files_free` runs under it in the open-unwind and the unlink sweep, and teardown runs at IF=0). It
+meets the re-stamp on a SeqCst Dekker pair, `STOR2_CLOSING`/`STOR2_MOVING`. A release either finishes
+before the flip reads the descriptors, or starts after it and sees the new name. Only a release ever
+waits, and only on an IRQ-masked holder doing bounded in-memory work on another core. The rename
+never waits on a release, which might be a preemptible launcher task pinned to the renamer's own
+core. It answers `-EBUSY` instead. That transient, a close caught half-way, is the only `-EBUSY` a
+source has left.
+
+**What an open descriptor sees.** It follows the file, as it always did on aarch64, where a
+descriptor keys the directory slot (`FILE_DIR_LBA`/`FILE_DIR_OFF`) and not the name. After the rename
+returns 0, the descriptor's reads, writes, close snapshot and refcount all land on the new name. A
+plain open of the old name is `-ENOENT` while the descriptor lives, and re-creating the old name
+makes a different, empty file. **Residual, stated in the code:** knob-on, a read or write already
+inside a syscall on another core when phase 2 runs may have resolved the old on-disk name and fail
+`-EIO`. The failure is loud and leaves the descriptor unchanged. Knob-off there is no disk phase.
+
+**STOR1-MV is re-pointed in place.** Its bit5 asserted the retired refusal, so it was rewritten
+instruction for instruction in the middle of the file without moving a line (B94). It now asserts
+that an open source renames to 0 and that the same rename after close is `-ENOENT`. The spec pin
+(`w=0x7f`) is unchanged. **A STOR-1 claim is corrected:** §STOR-1 M3 said `busx_write`'s `-EBUSY`
+under a live reader had "the same retirement". It does not. That refusal is a truncate
+(destroy-then-create), and retiring it needs a shrink primitive, not a rename. The refusal stays and
+its code comment is corrected.
+
+### M2 — `SYS_RENAME` on aarch64
+
+One arm, a same-line fold beside `SYS_UNLINK`:
+`una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3)`. `sys_rename` (file tail) does x86's copy-in step
+for step: both lengths are bounded first (`-EINVAL`), each name is copied (`-EFAULT`), UTF-8 is
+checked (`-ENOENT`) and the root-leaf collapse is applied (a directory component is `-ENOENT`, x86's
+answer). It then calls **`bus_mv` under the caller's own `(asid, gen, principal)`**, the triple
+`sys_msend` stamps a bus frame with. So `mv A B` over the bus and `SYS_RENAME(A, B)` direct are one
+function answering twice on this arch, as they are on x86, where `busx_mv` is `rename_created`.
+**Shared errnos** (same number, same cause): `-EINVAL` `-EFAULT` `-ENOENT` `-EACCES` `-EEXIST`.
+Arch-specific storage conditions: x86 `-EBUSY` and `-EIO`; aarch64 `-EISDIR` `-ENODEV` `-EAGAIN`
+`-EIO`. `una-abi`'s doc comment on `SYS_RENAME` states the same table and names both dispatchers.
+
+### M3 — witnesses
+
+**`:: STOR2-MV: … :: PASS [w=0x7f/0x7f] ::` (x86, new, file tail, chained after STOR1-MV).** A new
+witness rather than more STOR1-MV legs, because STOR1-MV is a `global_asm!` block mid-file. It has
+seven ring-3 legs:
+
+1. Create `STOR1.BIN`, write A, and keep the handle open.
+2. ★ Rename it to `STOR2.BIN` while the handle is open; this returns 0.
+3. ★ Opening the old name returns `-ENOENT` while the descriptor lives.
+4. ★ A write of B through the old handle succeeds. Knob-on this is a grow by the new name on the
+   volume.
+5. ★ Re-creating `STOR1.BIN` while the old handle is open gives a 0-length, different file.
+6. ★ After the old handle closes, `STOR2.BIN` reads back exactly A‖B. Knob-on this read comes live
+   from disk.
+7. Cleanup, with every return code recorded.
+
+It also has one kernel-side leg for the handshake. A release is made to look in flight
+(`STOR2_CLOSING += 1`). The rename must then answer `-EBUSY` and change nothing: the source is live,
+the destination is neither live nor still reserved, the descriptor still names the source, and
+knob-on the volume still calls the file by its old name. Once the release is let go, the same rename
+must return 0, with the descriptor re-stamped and the refcount moved by exactly one.
+
+**`:: STOR2-MV: … :: PASS [w=0x3f/0x3f] ::` (aarch64, new, `el0-stor2mv`).** This is an inline EL0
+blob run last in the U7 chain, after DIRNS, so `kernel8-test` runs it. It has six legs:
+
+1. Create `S2MVA.BIN`, write A, and keep the handle open.
+2. ★ `SYS_RENAME` of the open file returns 0. Before STOR-2 this number answered `-ENOSYS` here.
+3. ★ Opening the old name returns `-ENOENT`.
+4. ★ The descriptor follows the file: write B, seek, and read A‖B through it.
+5. ★ The new name reads back A‖B.
+6. Errno parity with x86: `-EEXIST`, `-ENOENT` and `-EINVAL` are returned for a live destination, an
+   absent source and a 0-length name.
+
+The launcher also requires the by-name exit (routed through the midden arm, never into M6b's
+counters), the slot's teardown, and a fresh mount showing neither name left on the card.
+
+**Runs** (tree `f2fca4fa`; every x86 sidecar `mode=full completion=complete`):
+
+| Run | Result |
+|---|---|
+| `env UNAOS_WC=1 UNAOS_QEMU_FULL=1 ./arroyo test 120` | rc=0, MBENCH 17/17, 0 forbidden. The verdict census matches M1's capture except for the one new key. |
+| `env UNAOS_IRQSTORAGE=1 UNAOS_QEMU_FULL=1 ./arroyo test-fat sf 300` (knob-on) | rc=0, `x86-fat.spec` 40/40, STOR2-MV `(knob-on) :: PASS [w=0x7f/0x7f]`. STOR1-NAME, STOR1-MV and BUSX86-WR also pass knob-on. This is the only QEMU lane where `submit_rename` executes. |
+| `env UNAOS_QEMU_FULL=1 ./arroyo kernel8-test 600` | rc=0, `pi4-regression.spec` 127/127, STOR2-MV `PASS [w=0x3f/0x3f]`. |
+| `./arroyo test-arm` | rc=0 with no FAIL lines. Its image carries none of this code, and `arroyo` declares no completeness marker for it, so it is a regression run only. |
+
+**Go-red, one per half, each reverted with the tree diff re-hashed identical:**
+
+- **x86: re-stamp removed.** The result is `FAIL [w=0x5f/0x7f] … race=[busy=-16 ok=0 untouched=true
+  followed=false …] … new_read=0`. The rename, the old-name `-ENOENT`, the stale-handle write and the
+  re-create all still "work". The renamed file then reads back empty, because the stale handle's
+  close snapshot went into the re-created old name. That cross-file write is what the re-stamp
+  prevents, and it is why the witness scores content rather than return codes.
+- **aarch64: the arm restated as `-ENOSYS`.** The result is `FAIL [w=0x1/0x3f]`.
+
+**Still owed.** x86 metal for the whole STOR-1/STOR-2 arc; knob-on this now includes STOR2-MV.
+Persisting created files to disk across a boot remains U11 M2's work.

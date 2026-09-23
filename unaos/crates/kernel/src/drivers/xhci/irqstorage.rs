@@ -112,7 +112,7 @@ pub enum BlockOp {
     /// changes the volume it is measuring. IDEMPOTENT (already absent -> `0`); a leaf that is a FILE is
     /// `-ENOTDIR`; a NON-EMPTY directory is refused by `fat::remove_dir` and surfaces as `-EIO`. Same
     /// single-writer context as `MkDir` (roster row 3), so it adds no roster row either.
-    RmDir,
+    RmDir, Rename, // STOR-2 (B185): RENAME a root file IN PLACE — see `submit_rename` at the file tail. ⚠ SAME-LINE fold.
 }
 
 /// A storage transaction submitted to the service task. It lives on the SUBMITTER'S kernel stack:
@@ -418,7 +418,7 @@ fn service_one(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -
         BlockOp::Delete => service_delete_file(req, fs),
         BlockOp::Stat => service_stat_file(req, fs),
         BlockOp::MkDir => service_mkdir(req, fs),
-        BlockOp::RmDir => service_rmdir(req, fs),
+        BlockOp::RmDir => service_rmdir(req, fs), BlockOp::Rename => service_rename(req, fs), // STOR-2. ⚠ SAME-LINE fold.
     }
 }
 
@@ -732,5 +732,100 @@ fn selftest_task(_: usize) {
             ":: bx-blockreq: FAIL — polled_ok={} rc={} equal={} ::",
             polled_ok, rc, polled[..bs] == via[..bs]
         );
+    }
+}
+
+// =================================================================================================
+// STOR-2 (rmbp-ledger B185) — RENAME, the verb this service task was missing. Appended at the file
+// tail so no line above moves (B94); the `BlockOp::Rename` variant and its dispatch arm are same-line
+// folds above.
+//
+// WHY IT EXISTS. STOR-1 M2 gave x86 `SYS_RENAME`, but the x86 handler reaches the volume only through
+// this task, and the submit set was create/grow/delete/read/stat/mkdir/rmdir — so knob-on the syscall
+// layer RE-MATERIALISED a renamed file (create the destination, copy its bytes, delete the source),
+// and had to refuse `-EBUSY` while the source was open, because re-materialising under a live writer
+// drops whatever it wrote after the copy. aarch64 never had that problem: `bus_mv` calls
+// `fat::rename_entry`, which rewrites the 11-byte 8.3 name of the SAME directory slot and touches
+// nothing else. This op is that same call, run where x86 is allowed to block — so the file moves by
+// reference, the refusal retires, and the two arches answer the same question the same way.
+//
+// SCOPE, and it is the matched ABI's scope rather than a new limit: ROOT LEAVES ONLY. `bus_mv` renames
+// `rename_entry(0, src, dst)` — a file in the volume root — and x86's `SYS_RENAME` renames only the
+// created-name namespace, whose names are all root 8.3 leaves. A single-component path (`/X`) is
+// collapsed to its leaf by `el0_root_leaf` (the DIRNS security seam); anything with a directory
+// component is `-EINVAL`, never a silent root lookup of a different file. Directories are refused
+// (`-EISDIR`, `bus_mv`'s answer) — a created name is always a file.
+//
+// ⚠ `fat::rename_entry` IS CALLED, NOT EDITED. It rewrites only the 8.3 name field; a long-name run
+// in front of the slot is the concern of the LFN work that owns that function. Every name this op is
+// asked to move today is an 8.3 `U10_NAMES` entry created by `create_in_dir`, which writes a SHORT
+// name only for an 8.3 leaf, so no long-name run exists on this path to go stale.
+//
+// ERRNOS (the syscall layer maps them): `0` renamed (or a same-slot no-op, `rename_entry`'s own
+// rule) · `-ENOENT` no such source · `-EEXIST` the destination exists at a different slot (checked
+// FIRST, locate-first, so `rename_entry`'s defensive `Unsupported` backstop is never what reports
+// it) · `-EISDIR` the source is a directory · `-EINVAL` a malformed or non-root name, or a
+// destination not representable as 8.3 · `-EIO` no volume / an I/O error.
+// =================================================================================================
+
+/// STOR-2: "the destination already exists" — distinct from `EIO` so the syscall layer can tell an
+/// orphan under a reserved name (reclaimable) from a failed transfer. Matches the syscall layer's
+/// `EEXIST`.
+const EEXIST: i32 = -17;
+/// STOR-2: the source names a directory. Matches `bus_mv`'s `-EISDIR` on aarch64.
+const EISDIR: i32 = -21;
+
+/// STOR-2 helper the syscall layer calls: RENAME root file `src` to `dst` on the LIVE volume, IN
+/// PLACE (`fat::rename_entry` — one directory-sector rewrite, same slot, same chain, no data moved).
+/// Returns `0` or a negative errno (see the block above). Blocks the caller on the service task.
+///
+/// The request carries TWO names and has one name field, so `dst` rides the data buffer — the shape
+/// every file op already uses for its payload: a KERNEL copy on this caller's stack, pinned while it
+/// blocks, never the ring-3 buffer.
+///
+/// SAFETY: the caller must be a scheduled task (so it can block on the service task).
+pub unsafe fn submit_rename(src: &[u8], dst: &[u8]) -> i32 {
+    if dst.is_empty() || dst.len() > NAME_MAX || src.is_empty() || src.len() > NAME_MAX {
+        return EINVAL; // never truncate a name into a different one
+    }
+    let mut dbuf = [0u8; NAME_MAX];
+    dbuf[..dst.len()].copy_from_slice(dst);
+    let mut req = BlockRequest::new_file(BlockOp::Rename, src, 0, dbuf.as_mut_ptr(), dst.len());
+    req.done.init();
+    unsafe { submit(&mut req as *mut BlockRequest) }
+}
+
+/// STOR-2: the RENAME op on the service task. Locate-first on both names (the create discipline),
+/// then `fat::rename_entry(0, src, dst)`. Single-writer by construction: it runs on this task (the
+/// X86 FAT-MUTATOR ROSTER's row 3), so it adds no writer and no roster row.
+fn service_rename(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::FatFs>) -> i32 {
+    use crate::fs::fat::FatError;
+    let Some(fs) = mounted(fs) else { return EIO };
+    let Ok(src) = core::str::from_utf8(&req.name[..req.name_len]) else { return EINVAL };
+    if req.buf.is_null() || req.len == 0 || req.len > NAME_MAX {
+        return EINVAL;
+    }
+    let dbytes = unsafe { core::slice::from_raw_parts(req.buf, req.len) };
+    let Ok(dst) = core::str::from_utf8(dbytes) else { return EINVAL };
+    let (Some(src), Some(dst)) = (crate::fs::vfs::el0_root_leaf(src), crate::fs::vfs::el0_root_leaf(dst)) else {
+        return EINVAL; // a directory component (or `..`): not this verb's namespace — see the block above
+    };
+    let (slba, soff) = match fs.locate_in_dir(0, src) {
+        Ok((de, _, _)) if de.is_dir => return EISDIR,
+        Ok((_, l, o)) => (l, o),
+        Err(FatError::NotFound) => return ENOENT,
+        Err(_) => return EIO,
+    };
+    match fs.locate_in_dir(0, dst) {
+        Ok((_, l, o)) if l == slba && o == soff => return 0, // the same canonical name: a no-op
+        Ok(_) => return EEXIST, // create-new-only, `bus_mv`'s contract
+        Err(FatError::NotFound) => {}
+        Err(_) => return EIO,
+    }
+    match fs.rename_entry(0, src, dst) {
+        Ok(_) => 0,
+        Err(FatError::Unsupported) => EINVAL, // `dst` is not representable as 8.3 (existence was pre-checked)
+        Err(FatError::NotFound) => ENOENT,
+        Err(_) => EIO,
     }
 }
