@@ -137,3 +137,37 @@ FORBID :: WINMENU: .* -> SKIP reason=menu-unpublished-after=[0-9]+ms ::
 # parent 2495f3a2 before a line of this arc was written (the go-red — the run that has no allocator
 # in it), and 1 hit on the capture the same verb produced after.
 REQUIRE \[vectors\] allocated=[0-9]+ free=[0-9]+ table=timer:0x20,xhci:0x40,nic:0x41,ipi:0x42,ehci:0x43,spurious:0xff == witness ::
+#
+# ── TSTETAP (2026-09-22), TAIL-APPENDED past VECTORS ──────────────────────────────────────────────
+# `absorbed=` ON THE `tste` TAP, because until this line NOTHING ON ANY LANE GATED IT — and it is the
+# count of boot verdicts the kernel actually recorded. `selftest::capture` is the ONLY record `tste`
+# can replay a boot fixture from (it cannot re-run them), so a scanner that stops recognising the
+# `-> PASS` marker does not make any fixture fail: it makes every fixture DISAPPEAR from `tste`'s
+# `[boot-time]` section, as if it had never executed. That is the exact defect SERWIT-2W was written
+# to end, and it had no gate.
+#
+# MEASURED, NOT REASONED — and the go-red is the whole reason this rule exists in this form. Change
+# `N_PASS` in `crates/kernel/src/selftest.rs` from `b"-> PASS"` to `b"-> PASSED"` — one mis-spelt
+# marker, nothing else — and the wc lane reads
+#     :: SERWIT-2 tap tste: submitted=579 absorbed=0 staged=0 dropped=0 suppressed=579 …
+# against the green tree's
+#     :: SERWIT-2 tap tste: submitted=579 absorbed=21 staged=0 dropped=0 suppressed=558 …
+# — every verdict lost. AND THE VERB STILL EXITED 0. `./arroyo test` was green, the spec replay was
+# green, the boot was green; 21 recorded verdicts had become 0 and no gate on this bench said a word.
+# That silence is what this line ends.
+#
+# WHAT IS PINNED AND WHY EACH ONE.
+#   * `absorbed=[1-9]\d*` — the assertion. Not a threshold: the boot fixture population moves with
+#     every knob, so any number above zero is the honest floor, and zero is the failure.
+#   * `dropped=0` — SERWIT-2's own claim, that this ring has NO loss path left but the ring genuinely
+#     filling (which is counted separately and reported by `run()`). A non-zero here is a regression
+#     to the `try_lock`-and-discard shape SERWIT-2 deleted.
+#   * `inflight=0` — every exit from `capture` charges exactly once, so nothing may be left in
+#     flight when the tally prints. `submitted=[1-9]\d*` keeps a tap that never ran from acquitting.
+#   * `staged=`, `suppressed=`, `torn=`, `in_progress=` are `\d+`: they move with the traffic.
+#
+# Measured green on NINE independent captures — this branch's `sertaps-logs/R1-serial.log` (the
+# fe385712 baseline) and `R2-serial.log` (after the arc), and all seven DOCKID2 captures under
+# `docs/dev/evidence/rmbp-0922/dockid2/` — and red on exactly one, `R3-serial.log`, the mutation
+# above. No FORBID partner, for B160's reason as cited by the VECTORS block.
+REQUIRE :: SERWIT-2 tap tste: submitted=[1-9]\d* absorbed=[1-9]\d* staged=\d+ dropped=0 suppressed=\d+ torn=\d+ inflight=0 in_progress=\d+ ::

@@ -488,3 +488,15 @@ FORBID :: PRTSCR-DIR-FIX: .* -> FAIL ::
 # the freeze half of the same mechanism, and it is why a present-only instrument could not see this.
 REQUIRE :: VUGART: frames=[1-9]\d* coherent=\d+ torn_rows=\d+ mixed_frames=0 -> PASS ::
 FORBID :: VUGART: .* -> FAIL ::
+#
+# ── TSTETAP (2026-09-22), TAIL-APPENDED past VUGART ───────────────────────────────────────────────
+# `absorbed=` on the `tste` tap, pinned on this lane as well as on x86-default.spec, in the same
+# commit. The full argument — why a mis-spelt verdict marker makes every boot fixture VANISH from
+# `tste` rather than fail, why the recorded go-red still exited 0, and what each field buys — is
+# written once at the tail of `x86-default.spec` and is not repeated here.
+#
+# WHAT THE SECOND COPY BUYS: this is the lane the go-red was actually taken on
+# (`sertaps-logs/R3-serial.log`, `absorbed=0` where the green tree reads `absorbed=21`), and it is
+# the lane with the deepest fixture population, so it is the one where a silent scanner has the most
+# to lose. The default lane's copy guards the cheap leg.
+REQUIRE :: SERWIT-2 tap tste: submitted=[1-9]\d* absorbed=[1-9]\d* staged=\d+ dropped=0 suppressed=\d+ torn=\d+ inflight=0 in_progress=\d+ ::
