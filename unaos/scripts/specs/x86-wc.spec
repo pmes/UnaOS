@@ -500,3 +500,17 @@ FORBID :: VUGART: .* -> FAIL ::
 # the lane with the deepest fixture population, so it is the one where a silent scanner has the most
 # to lose. The default lane's copy guards the cheap leg.
 REQUIRE :: SERWIT-2 tap tste: submitted=[1-9]\d* absorbed=[1-9]\d* staged=\d+ dropped=0 suppressed=\d+ torn=\d+ inflight=0 in_progress=\d+ ::
+#
+# ── SERTXPIN (2026-09-22), TAIL-APPENDED past TSTETAP ─────────────────────────────────────────────
+# The `[sertx]` census, pinned on THIS lane as well as on x86-default.spec, in the same commit. The
+# full argument for the shape — why the four-name tap table is pinned character for character, why
+# every number is open, why `masked_b=0` is the one value asserted, and the two recorded go-reds —
+# is written once, at the tail of `x86-default.spec`, and is not repeated here.
+#
+# WHAT THE SECOND COPY BUYS, because a duplicated rule has to earn itself. This lane is where the
+# census is WORTH READING: the compositor is the load that produces the dark windows SERIALTX and
+# TAPSMAX were written for, and `tap_max=fbcon:…` on a wc boot is the only place the panel tap's cost
+# is visible at all. The default lane's copy gates the line's EXISTENCE on the cheap leg; this one
+# gates it on the leg whose numbers anybody actually quotes. Measured 14 hits on the SERTAPS baseline
+# capture (`sertaps-logs/R1-serial.log`, the wc lane at this branch's parent fe385712).
+REQUIRE \[sertx\] prints=\d+ masked_us_max=\d+ masked_us_mean=\d+ drain_us=\d+ emit_us=\d+ spin_us=\d+ bytes=\d+ masked_b=0 fifo_b=\d+ taps_us=\d+ taps_us_max=\d+ tap_max=fbcon:\d+,ftdi:\d+,tste:\d+,rec:\d+ tap_sum=fbcon:\d+,ftdi:\d+,tste:\d+,rec:\d+ sink=(uart|ftdi|both|none) hz=\d+ masked_cy_max=\d+ masked_cy_sum=\d+
