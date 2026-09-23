@@ -3140,6 +3140,77 @@ census and requires the same answer, which reds on any board the moment a pin is
 not the other. Go-red measured, not asserted: dropping the shell term from `pins_applied` gives
 `count=false/3 pins=false/1 :: FAIL ::` and `UNAOS_WC=1 ./arroyo test` exits 1.
 
+**§3.15.1 DOCKSTAMP — the arrival rank is now monotone in ALLOCATION, not in table position
+(rmbp, 2026-09-22; rmbp-ledger B175, FIXTURE_FLAKES §1d).**
+
+The bullet above says a tile's position *"is its ARRIVAL RANK, allocated once when the tile is
+created"*. That was true of the counter and false of the input it was fed, and two arcs were
+needed to make the sentence honest.
+
+* **DOCKID2 (B165)** fixed WHOSE model the rank is computed against. `reconcile` used to be handed
+  a model its caller had scanned at the TOP of the composite pass, so a window allocated after that
+  scan was invisible to the reconcile that followed and was admitted by the NEXT one — *a tile's
+  rank was the arrival of the first reconcile pass that happened to SEE it.* `reconcile` now takes
+  no model and calls `wm::dock_scan` itself, immediately before it mutates.
+* **DOCKSTAMP (B175)** fixes what the admit arm does when it sees TWO new rows at once — the
+  residual DOCKID2 named and could not reach. `wm::dock_scan` returns rows in `id` order by
+  construction, `create_inner` mints `id = slot + 1` from the LOWEST free slot, and the admit loop
+  consumed the scan in that order; so two windows allocated between one reconcile and the next were
+  admitted in ONE pass and ranked by SLOT NUMBER. A window that reused a freed low id took its
+  elder's place in the strip — mechanism (2) at the top of this section, returning by a narrower
+  door.
+
+**The window table had nothing monotone to sort by, and now it does.** `video/wm.rs` mints a
+globally monotone ordinal for every window at the CLAIM SITE — `create_inner`'s
+`t.rows[slot] = row` line, inside the table guard and beside `winid_slot_bump`'s generation — and
+`wm::DockEntry` carries it through `dock_scan` as `stamp`. Three properties are load-bearing and
+each is a choice:
+
+* **Inside the guard, not after it.** No painter and no `dock_scan` can observe the row until the
+  guard drops, so a row can never be scanned unstamped. Publish-then-stamp would open exactly the
+  window this arc closes.
+* **Global, not per-slot.** The question is "which of these two windows is older", and two windows
+  in different slots have no common ordering in `SLOT_GEN` — that counter is per-slot and answers
+  only how many tenants a slot has had.
+* **Not an identity.** A tile is still `(id, gen)`; `winid_gen` is unchanged and nothing about the
+  press path, the registry or the syscall ABI moves. The stamp answers ordering and nothing else.
+
+`dock::reconcile`'s admit arm then sorts an index permutation by `(stamp, id)` — insertion sort
+over at most `MAX_WINDOWS` = 12 rows, no allocation, no lock, stable — so `NEXT_SEQ` hands out
+ranks in arrival order BY CONSTRUCTION. The tie-break is `id`, so an all-unstamped scan degrades to
+exactly the pre-DOCKSTAMP behaviour rather than to an arbitrary one. The RETIRE arm is deliberately
+not reordered: it mints no rank and is idempotent in any order.
+
+**Cost, stated rather than hidden**, on DOCKID2's precedent: one relaxed RMW and one relaxed store
+per window create; one relaxed load per dock-addressable row per `dock_scan`, inside a lock that
+scan already holds; and a bounded ≤66-comparison sort on the admit path of a composite. No new
+lock, no new wait class, and nothing added to the `Window` row struct — the ordinal lives in a
+per-slot cell beside `SLOT_GEN`.
+
+**Go-red — DOCKID2's widening probe, extended from one hidden row to two, and the SAME PROBE ON
+BOTH TREES so the A/B is one variable.** It withholds from every reconcile's scan both of the rows
+`dockid_selftest` allocates in REVERSE TABLE ORDER (`idC` takes the HIGH slot 3 first, `idD` then
+recycles the freed LOW slot 2) and releases them together, so one pass admits both. Scratch in
+`dock.rs`, reverted before the commit.
+
+```text
+PARENT + probe (host load 12.89, TEST_RC=1)      FIXED + THE SAME PROBE (host load 28.62, TEST_RC=0)
+  seq=18 label=idD   <-- younger ranks first       seq=18 label=idC   <-- FIRST-allocated ranks first
+  seq=19 label=idC                                 seq=19 label=idD
+  … order=false … reconciled=3/3 :: FAIL ::        … order=true set=true … reconciled=3/3 :: PASS ::
+```
+
+`reconciled=3/3` on the red line is what makes it the ORDERING defect and provably not DOCKID2's
+Class 6 decline — the field exists precisely to tell those two apart on the wire. Captures:
+`docs/dev/evidence/rmbp-0922/dockstamp/`.
+
+**Gate.** `dockid_selftest` leg 2 is the gate and it did not have to be widened — the leg was
+always asserting the right thing and was passing for a reason the probe removes. The verdict is now
+pinned on BOTH x86 lanes: `x86-wc.spec` (DOCKID2) and `x86-ptr.spec` (this arc), each with the
+REQUIRE-or-skip + FORBID-the-skip shape. The ptr lane is where the fixture has actually gone red on
+this bench (`logs/foldgate/g9r-test-ptr.log`, `serial.log:1702`), and until now nothing there but
+`mbench`'s builtin default forbid could see it.
+
 ---
 
 ### §3.15 CLOSEMIN — closing one window minimised the others (render11, 2026-09-08)

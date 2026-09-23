@@ -1,0 +1,33 @@
+  ❌ FORBID hit @ line 2260: :: DOCKID: tiles=6 closed=win2 reopened=win2 recycle=true order=true set=false furniture=true count=true/6 pins=true/3 press=yes :: FAIL ::
+════════════ MBENCH VERDICT — x86-ptr.spec.parent vs /home/pmes/unaos-bench/scratch/rmbp-0915/logs/foldgate/g9r-test-ptr.log ════════════
+  ✅ REQUIRE    :: MOUSE-1: HID pointer detected vid:pid=0627:0001 proto=2 relative ep=0x8[0-9a-f] mps=\d+ interval=\d+ == witness ::
+       1 hit(s), first @ line 1658
+  ✅ REQUIRE    :: MOUSE-1: HID pointer detected vid:pid=0627:0001 proto=0 absolute ep=0x8[0-9a-f] mps=\d+ interval=\d+ == witness ::
+       1 hit(s), first @ line 1573
+  ✅ REQUIRE    :: MOUSE-1: 1 reports, last dx=-?\d+ dy=-?\d+ buttons=0x00 == witness ::
+       1 hit(s), first @ line 3116
+  ✅ REQUIRE    :: MOUSE-1: 32 reports, last dx=-?\d+ dy=-?\d+ buttons=0x00 == witness ::
+       1 hit(s), first @ line 3145
+  ✅ REQUIRE    \[ptrinstall\] installs=36 reports=36 lag_max_ms=\d+ coalesced=\d+ drains=\d+ folds=\d+
+       17 hit(s), first @ line 3150
+  ✅ REQUIRE    :: PTRINSTALL: installs=36 reports=36 folds=\d+ lag_max_ms=([0-9]|[1-4][0-9]) coalesced=\d+ drains=\d+ ::
+       1 hit(s), first @ line 3229
+  ✅ REQUIRE    \[ptrdead\] backlog whole=(true|skip) nodrop=(true|skip) order=(true|skip) .* fpop12=-?[0-9]+ fpop3=-?[0-9]+ .* -> PASS
+       1 hit(s), first @ line 2533
+  ✅ FORBID*    -> FAIL
+       0 hits
+  ❌ FORBID*    FAIL ::
+       2 hit(s), first @ line 2260: :: DOCKID: tiles=6 closed=win2 reopened=win2 recycle=true order=true set=false furniture=true count=true/6 pins=true/3 press=yes :: FAIL ::
+  ✅ FORBID*    PANIC
+       0 hits
+  ✅ FORBID*    -> FLICKER
+       0 hits
+  ✅ FORBID     :: PTRINSTALL: installs=0 reports=[1-9]
+       0 hits
+  ✅ FORBID     \[ptrinstall\] installs=0 reports=[1-9]
+       0 hits
+  ✅ FORBID     \[ptrdead\] backlog whole=skip nodrop=skip order=skip
+       0 hits
+  ─────
+  ❌ MBENCH FAIL — 7/7 required witnesses, 2 forbidden hit(s), 3345 lines scanned [mode unknown: no run sidecar]
+  (* = default FORBID, always on)

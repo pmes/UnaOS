@@ -477,7 +477,7 @@ regression** and must not be re-run away; one with
 was exhausted, which is a new and reportable fact — read `unran=` and the
 `[wcser]` `declined_pct=` beside it.
 
-### 1d. DOCKID `order=false set=false` — **measured 2026-09-22 (FLAKEFIX, rmbp-ledger B150): NOT lost input. MECHANISM CORRECTED 2026-09-22 (FLAKEFIX2, rmbp-ledger B159) FROM THE WIRE: the stale snapshot is the WRITER'S, not the reader's, and the metal half is CLASS 6. BOTH HALVES FIXED 2026-09-22 (DOCKID2, rmbp-ledger B165) — see the SUPERSEDED disposition at the end of this entry; the writer scans at mutation time and the fixture SKIPs a composite that never reconciled**
+### 1d. DOCKID `order=false set=false` — **measured 2026-09-22 (FLAKEFIX, rmbp-ledger B150): NOT lost input. MECHANISM CORRECTED 2026-09-22 (FLAKEFIX2, rmbp-ledger B159) FROM THE WIRE: the stale snapshot is the WRITER'S, not the reader's, and the metal half is CLASS 6. BOTH HALVES FIXED 2026-09-22 (DOCKID2, rmbp-ledger B165) — see the SUPERSEDED disposition at the end of this entry; the writer scans at mutation time and the fixture SKIPs a composite that never reconciled; and the RESIDUAL DOCKID2 named is CLOSED 2026-09-22 (DOCKSTAMP, rmbp-ledger B175) — the window table carries an allocation stamp and `reconcile` admits in allocation order, so the rank is monotone in arrival BY CONSTRUCTION. THE ENTRY IS CLOSED; what is owed is the flight-12 reading.**
 
 **Signature on the wire** (`video/dock.rs` `dockid_selftest`, the verdict's own
 format):
@@ -779,6 +779,97 @@ DOCKID line, and that field is the prediction — `reconciled=3/3` with a PASS, 
 metal half was never Class 6 and this entry is wrong about it. `folds=` on metal is
 the first measurement anyone will have of how hard five real cores hold `COMP_GATE`
 against a boot-task fixture.
+
+**RESIDUAL CLOSED 2026-09-22 (DOCKSTAMP, rmbp-ledger B175; branch `exec-rmbp-dockstamp` off
+`fe385712`, the branch tip is the sha — the seat fills it at the fold). THE ENTRY'S LAST OPEN
+CLAUSE IS THE ONE THE BLOCK ABOVE NAMED IN ITS OWN WORDS**, and it is quoted here rather than
+paraphrased because the fix is its answer word for word: *"two windows allocated between one
+reconcile and the next are still admitted in ONE pass, and that pass walks them in window-table
+(id) order, so a recycled low id can still take the lower of the two ranks. Closing that needs an
+allocation stamp the window table does not carry."*
+
+**THE STAMP.** `video/wm.rs` now mints a globally monotone ordinal for every window AT THE CLAIM
+SITE — `create_inner`'s `t.rows[slot] = row` line, inside the table guard and beside
+`winid_slot_bump`'s generation — and `wm::DockEntry` carries it through `dock_scan`. Under the
+guard rather than after it for the reason this whole entry is about: a stamp taken after the
+publish would order the DISCOVERY of rows, which is exactly the defect DOCKID2 fixed one layer up.
+It is GLOBAL and not per-slot, because the question is "which of these two windows is older" and
+two windows in different slots have no common ordering in `SLOT_GEN`; `0` means UNSTAMPED and is
+reachable only from `DockEntry::empty`'s scratch.
+
+**AND THE ADMIT ARM WALKS IT.** `dock::reconcile`'s admit loop sorts an index permutation by
+`(stamp, id)` instead of consuming the scan in its own (id) order, so `NEXT_SEQ` hands ranks out in
+ARRIVAL order by construction. The tie-break is `id`, so the degenerate all-unstamped input
+degrades to exactly the old behaviour rather than to an arbitrary one. **What this removes is the
+last dependence of tile order on TIMING**: DOCKID2 shrank the miss window from a whole composite
+pass to a few instructions; this makes it not matter how many windows a pass admits at once.
+
+*The probe is the one above, WIDENED FROM ONE HIDDEN ROW TO TWO, and it is again the SAME PROBE ON
+BOTH TREES.* It withholds from every reconcile's scan both of the rows the fixture allocates in
+REVERSE TABLE ORDER — `idC` takes the HIGH slot 3 FIRST, `idD` then recycles the freed LOW slot 2 —
+and releases them together, so ONE pass admits both. That is the residual's shape, and it is the
+only shape that can tell table order from allocation order. Scratch in `dock.rs`, reverted before
+the commit; the script that applies it is in the evidence directory.
+
+```text
+PARENT + probe  (host load 12.89, `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1
+                 UNAOS_QEMU_FULL=1 ./arroyo test 240`, TEST_RC=1)
+  r1-parent-probe-serial.log
+  1599: [wm] alloc win=3 gen=4 owner=0xd1d3 title="idC" from=declared     <-- allocated FIRST
+  1611: [wm] alloc win=2 gen=6 owner=0xd1d4 title="idD" from=declared     <-- allocated SECOND
+  1615: [dock] tile add win=2 gen=6 owner=0xd1d4 seq=18 label=idD         <-- the YOUNGER ranks 18
+  1616: [dock] tile add win=3 gen=4 owner=0xd1d3 seq=19 label=idC         <-- the ELDER ranks 19
+  :: DOCKID: tiles=6 … recycle=true order=false set=true furniture=true … reconciled=3/3 folds=0 :: FAIL ::
+
+FIXED + THE SAME PROBE  (host load 28.62, TEST_RC=0)
+  r2-fix-probe-serial.log
+  1601: [wm] alloc win=3 gen=4 owner=0xd1d3 title="idC" from=declared
+  1613: [wm] alloc win=2 gen=6 owner=0xd1d4 title="idD" from=declared
+  1617: [dock] tile add win=3 gen=4 owner=0xd1d3 seq=18 label=idC         <-- FIRST-allocated ranks 18
+  1618: [dock] tile add win=2 gen=6 owner=0xd1d4 seq=19 label=idD
+  :: DOCKID: tiles=6 … order=true set=true furniture=true … reconciled=3/3 folds=0 :: PASS ::
+```
+
+Both captures admit the two rows in ONE pass — the `[dock] tile add` lines are adjacent and there
+is no `census` between them — which is what makes this the residual and not the defect DOCKID2
+already fixed. **`reconciled=3/3` on the RED line does the same work it did for DOCKID2**: it says
+the reconcile RAN, so that capture is the ORDERING defect and provably not the Class 6 decline.
+
+**THE ptr LANE IS PINNED NOW TOO, which was DOCKID2's other open clause** ("`x86-wc.spec` now
+carries the pin" — and only that one did). `x86-ptr.spec` carries the same REQUIRE-or-skip and the
+same two FORBID-the-skip lines. It is not a duplicate for tidiness: **this is the lane where the
+fixture has actually gone red on this bench.** `logs/foldgate/g9r-test-ptr.log:2260`
+(`serial.log:1702` in the capture's own numbering) is a real FAIL from gate 9's re-run —
+
+```text
+:: DOCKID: tiles=6 closed=win2 reopened=win2 recycle=true order=true set=false furniture=true
+           count=true/6 pins=true/3 press=yes :: FAIL ::
+```
+
+— and the go-red is a REPLAY of the pin against that capture, not an argument about it. Parent
+spec: `7/7 required witnesses, 2 forbidden hit(s)`, and the only rule that caught it is
+`❌ FORBID* FAIL ::` — the `*` marks `mbench`'s BUILTIN default, i.e. **no directive in the file saw
+it**, which is this block's whole thesis measured on the very lane it was missing from. With the
+pin: `7/8 required witnesses, 4 forbidden hit(s)`,
+`FIRST-SHORTFALL x86-ptr.spec:109 REQUIRE :: DOCKID: …` and `❌ FORBID :: DOCKID: .* :: FAIL :: —
+2 hit(s), first @ line 2260`. Both replays are in the evidence directory.
+
+**Disposition — §1d IS CLOSED, all three pieces, with nothing named and unowned.** Three
+consecutive greens under load on the fixed tree with NO probe (host 14.80 / 13.27 / 7.87 on 20
+cores, sibling QEMUs live), all `order=true set=true furniture=true reconciled=3/3 folds=0`,
+`TEST_RC=0` ×3; and one green on the newly pinned typist lane
+(`UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1 ./arroyo test-ptr 150`, host load
+27.93, `MBENCH PASS — 8/8 required witnesses, 0 forbidden hit(s), 2871 lines scanned [full wall
+152.1s]`). What is STILL OWED is unchanged and is the METAL reading: flight 12's prediction is
+`order=true set=true … reconciled=3/3 folds=<n> :: PASS ::`. A flight-12 `order=false` carrying
+`reconciled=3/3` would now mean a THIRD mechanism — both the ones this entry knows are closed — and
+that is a sharper prediction than the paragraph above it could make.
+
+**The natural rate of the residual is UNMEASURED, deliberately and by construction.** It needs two
+allocations inside one reconcile window; the bench does not produce them on demand and no boot
+count is claimed for it here. That is the same reason the probe exists, and the same reason the
+paragraph above says a go-red had to be DELIBERATE.
+
 
 ---
 

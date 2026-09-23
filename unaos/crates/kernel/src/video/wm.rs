@@ -23602,7 +23602,7 @@ fn create_inner(
     // This is `wcn_forget`'s precedent — WC-N clears its per-slot cell under the table lock, at the
     // point where the id demonstrably names something new, for the same class of reason.
     controls_declined_rearm(id);
-    t.rows[slot] = row; let winid_generation = winid_slot_bump(slot); // WINID — ⚠ SAME-LINE fold, line-NEUTRAL. The slot's reuse generation is bumped WITH the row it publishes, under the same guard, so `gen=` names the tenant the row now holds. Evidence only — it is NOT in the id; see the WINID block at this file's tail for why packing it into `WinId` was refused (WC-B's syscall ABI, `dock`'s `WinId::MAX` sentinels, and F2's own prior ruling on this very question).
+    t.rows[slot] = row; let winid_generation = winid_slot_bump(slot); let _dockstamp = win_stamp_bump(slot); // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94). **THE CLAIM SITE IS WHERE THE STAMP IS MINTED, and it is minted INSIDE the guard, beside the generation.** This is the one line in the kernel at which a window row becomes a window, and the stamp has to be taken here or it is not an allocation order at all: taken later it would order the DISCOVERY of rows, which is precisely the defect DOCKID2 fixed one layer up (a rank that was the arrival of the first reconcile pass to SEE a window, not the window's own arrival). Under the guard rather than after it, on `controls_declined_rearm`'s argument at the top of this block: no painter and no `dock_scan` can observe `t.rows[slot]` until the guard drops, so a row can never be scanned with a stale or zero stamp — publish-then-stamp would open exactly that window, and a row read inside it would sort as UNSTAMPED and take table order, which is the bug. It is bound and dropped rather than used: the value the dock wants is read back from the row's slot by [`win_stamp_of`], so nothing in `create`'s ABI moves and no caller learns a new number. The bump is UNCONDITIONAL here and gated in the callee (the twin at this file's tail), which is `winid_slot_bump`'s own shape and keeps this line one call wide. // WINID — ⚠ SAME-LINE fold, line-NEUTRAL. The slot's reuse generation is bumped WITH the row it publishes, under the same guard, so `gen=` names the tenant the row now holds. Evidence only — it is NOT in the id; see the WINID block at this file's tail for why packing it into `WinId` was refused (WC-B's syscall ABI, `dock`'s `WinId::MAX` sentinels, and F2's own prior ruling on this very question).
     drop(t); winid_alloc_witness(id, winid_generation, owner_asid, &minted[..minted_len], title_src); // WINID + WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. AFTER the guard drops, never under it: a `serial_println!` on a routed console asks for a composite and a composite takes `TABLE`. ONE call and ONE line: the title rides the alloc witness rather than a second `serial_println!` beside it, because a second print here costs the furniture its compose passes for the rest of the boot — measured, see `winid_alloc_witness`.
     // WC-D: ids are recycled slot aliases, so a fresh window in a used slot is a DIFFERENT window and
     // deserves its own verdict — clear the one-shot latch here rather than at close, which is the point
@@ -25287,7 +25287,7 @@ pub struct DockEntry {
     /// back to. A dock built on a "visible windows" enumeration would omit it.
     pub visible: bool,
     /// Does this row's owner hold focus ([`FOCUS_ASID`])? Drives the caption ink only.
-    pub focused: bool,
+    pub focused: bool, pub stamp: u64, // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94). **THE ALLOCATION ORDINAL, and the only field on this snapshot that is monotone in ARRIVAL.** Every other field describes the row as it stands; this one says WHEN the row was claimed, globally, across slots and across recycles ([`win_stamp_bump`], minted under the table guard by `create_inner`). It exists because `dock::reconcile` admits in the order it walks the scan, the scan is in `id` order, and `id` is a recycled slot alias — so two rows admitted in ONE pass were ranked by TABLE POSITION, and a window that reused a low slot took the elder's place in the strip. That is the residual DOCKID2 measured and named and could not close without this field (rmbp-ledger B165, FIXTURE_FLAKES §1d). `0` means UNSTAMPED and is reachable only from [`DockEntry::empty`]'s scratch, never from a live row: the bump precedes the publish under one guard. Note what it is NOT — it is not an identity and it is not `winid_gen`: a tile is still `(id, gen)`, and the stamp answers only "which of these two is older", which is the one question the tile ORDER turns on.
 }
 
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
@@ -25300,7 +25300,7 @@ impl DockEntry {
             title: [0u8; MAX_TITLE],
             title_len: 0,
             visible: false,
-            focused: false,
+            focused: false, stamp: 0, // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94). `0` is UNSTAMPED, and it is the honest value for scratch: this entry names no row, so it has no allocation order. It is also the tie-break's degenerate input — [`dock::reconcile`] sorts by `(stamp, id)`, so an all-zero scan sorts by `id` and the admit arm behaves exactly as it did before this field existed. That is the property that keeps a PIN row (minted by `dock`'s own `pin_*` chain from this constructor, never by `create_inner`, so never stamped) from jumping the queue on any path that ever admitted one — and the admit arm skips every `fixed_rank` owner anyway, so the two guards agree.
         }
     }
 }
@@ -25355,7 +25355,7 @@ pub fn dock_scan(
             title: r.title,
             title_len: r.title_len.min(MAX_TITLE),
             visible: above_shell(r, shell),
-            focused: r.owner_asid == focus,
+            focused: r.owner_asid == focus, stamp: win_stamp_of(r.id), // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94). The stamp rides the SNAPSHOT, on this function's own rule: the table lock is released before the dock does anything with the model, so a consumer that had to go back for the ordinal would be reading it against a table that may have moved — and the ONE consumer, [`dock::reconcile`]'s admit arm, is the writer of the ranks. Read from `WIN_STAMP[id-1]` rather than from a field on `Window`, which is why this costs the row struct nothing and the scan one relaxed load per admitted row inside a lock it already holds. It is read UNDER the guard with the rest of the row, so the entry is internally consistent: the stamp and the `(id, gen)` it travels with name the same tenant, which a later read could not promise across a recycle.
         };
         n += 1;
     }
@@ -26466,7 +26466,7 @@ fn winid_slot_bump(slot: usize) -> u32 {
     SLOT_GEN[slot]
         .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
         .wrapping_add(1)
-}
+} #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] static WIN_STAMP: [core::sync::atomic::AtomicU64; MAX_WINDOWS] = [const { core::sync::atomic::AtomicU64::new(0) }; MAX_WINDOWS]; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] static NEXT_STAMP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] fn win_stamp_of(id: WinId) -> u64 { let slot = (id as usize).wrapping_sub(1); if id == WIN_NONE || slot >= MAX_WINDOWS { return 0; } WIN_STAMP[slot].load(core::sync::atomic::Ordering::Relaxed) } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] fn win_stamp_bump(slot: usize) -> u64 { let s = NEXT_STAMP.fetch_add(1, core::sync::atomic::Ordering::Relaxed); WIN_STAMP[slot].store(s, core::sync::atomic::Ordering::Relaxed); s } // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94), and filed HERE beside [`winid_slot_bump`] because it is the same fact about the same event: the slot's reuse GENERATION and the window's ALLOCATION ORDINAL are both minted as the row is claimed, under the same table guard, by the same line of `create_inner`. **THE WINDOW TABLE CARRIED NOTHING MONOTONE, AND THAT IS THE RESIDUAL DOCKID2 NAMED** (rmbp-ledger B165, FIXTURE_FLAKES §1d): `DockEntry` had `id`, `owner_asid`, `title`, `title_len`, `visible`, `focused` — and `id` is a RECYCLED SLOT ALIAS (`create_inner` takes the LOWEST free slot), so `dock::reconcile`'s admit arm, which walks its scan in table order, hands the LOWER rank to whichever of two rows admitted in ONE pass sits lower in the TABLE rather than to whichever ARRIVED first. `NEXT_STAMP` is the missing total order: one global counter, minted once per create and never re-minted, so a stamp compares across RECYCLES the way `id` cannot and across SLOTS the way `SLOT_GEN` cannot — that one is per-slot and answers only how many tenants a slot has had, which says nothing about two windows in different slots. `u64` and NOT wrapping: at one create per microsecond it runs for half a million years, so unlike [`SLOT_GEN`] (which wraps, and says why) there is no wrap arm to reason about and none is written; `0` is therefore free to mean UNSTAMPED, and that is the value [`dock::reconcile`]'s tie-break degrades to table order for. Relaxed at both ends for [`SLOT_GEN`]'s reason exactly: the store lands under the TABLE guard that publishes the row, so no reader can observe the row before its stamp — the guard is the ordering, and the atomic is for the aliasing.
 
 /// WINID — the erasing twin, so `create_inner`'s fold costs a knob-off image nothing.
 #[cfg(not(any(
@@ -26476,7 +26476,7 @@ fn winid_slot_bump(slot: usize) -> u32 {
 #[inline(always)]
 fn winid_slot_bump(_slot: usize) -> u32 {
     0
-}
+} #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] #[inline(always)] fn win_stamp_bump(_slot: usize) -> u64 { 0 } // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94). The erasing twin, on the line above's precedent: `create_inner` is UNCONDITIONAL code and calls the bump on every create, so the pair — real where the dock exists, zero where it does not — is what lets the claim site carry ONE call and no `#[cfg]` of its own. No twin is written for [`win_stamp_of`]: its only caller is [`dock_scan`], which carries the same gate, so on a build without the dock there is nobody to erase for.
 
 /// WINID — witness bound. Closes and creates are operator-scale events, but `close_owner` can reap a
 /// fleet in one call and this line is UNGATED BY `witness` (the metal image is built without
