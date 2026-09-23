@@ -99,7 +99,7 @@ struct Clip {
     buf: [u8; CLIP_CAP],
     len: usize,
     /// The session epoch this content was [`set`] under.
-    epoch: u32,
+    epoch: u64, // u64 since SECLOGIN M5 widened the session epoch (fold 9081402e); the seat widened this copy at the fold seam 2026-09-23 — the epoch is never narrowed
     /// Has anything ever been set? `false` means "empty by construction", not "cleared".
     stamped: bool,
 }
@@ -115,7 +115,7 @@ static CLIP: Mutex<Clip> = Mutex::new(Clip {
 /// function is private to a file this arc does not edit, so the shape is duplicated and not the
 /// value). `0` where there is no `login` feature or no EL0 regime to carry a session — see the
 /// module header on why that does not weaken the ownership check.
-fn session_epoch() -> u32 {
+fn session_epoch() -> u64 {
     #[cfg(all(feature = "login", any(target_arch = "x86_64", feature = "aarch64_el0")))]
     {
         return crate::arch::syscall::session_epoch();
