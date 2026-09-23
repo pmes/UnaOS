@@ -1718,8 +1718,9 @@ drain there; the new turn makes room by running the drain owner outside it.
 
 ```text
 [sertx] prints=N masked_us_max=A masked_us_mean=B drain_us=C emit_us=D spin_us=E bytes=F
-        masked_b=G fifo_b=16 taps_us=H taps_us_max=I sink=uart|ftdi|both|none hz=Z
-        masked_cy_max=J masked_cy_sum=K
+        masked_b=G fifo_b=16 taps_us=H taps_us_max=I
+        tap_max=fbcon:a,ftdi:b,tste:c,rec:d tap_sum=fbcon:e,ftdi:f,tste:g,rec:h
+        sink=uart|ftdi|both|none hz=Z masked_cy_max=J masked_cy_sum=K
 ```
 
 | field | reading |
@@ -1731,6 +1732,7 @@ drain there; the new turn makes room by running the drain owner outside it.
 | `spin_us` | of that, SERWIT-1B's backpressure turns; includes those turns' drains, and is 0 on an uncontended print. |
 | `bytes` / `masked_b` | bytes put at a 16550, and how many of them behind a mask — the currency of the dark window, at 86.8 µs each. |
 | `taps_us` / `taps_us_max` | the four post-mask mirrors. On a board with no 16550 this is the **only** term that can be large. |
+| `tap_max` / `tap_sum` | TAPSMAX — the same two quantities **by tap**, `fbcon:…,ftdi:…,tste:…,rec:…` in µs (`rec` is `flightrec`, `UNAOS.LOG`). `taps_us_max` is one number over four sinks, so it can say the taps are the cost but never *which* tap; this pair names one. Read `tap_max` first — a dark window is a **maximum** — and read `tap_sum` beside it exactly as `masked_us_mean` is read against `masked_us_max`. |
 | `sink` | `ftdi` on the bench rMBP, `uart` under QEMU, `both` on a machine carrying both. |
 | `hz` | the rate the microseconds were derived at. **`hz=0` means UNKNOWN**, every `_us` field reads 0 for that reason alone, and only the `_cy` pair is evidence. |
 
@@ -1747,6 +1749,48 @@ console is already the problem, and a transmit-cost census has that failure mode
 **It therefore MOVES the default image, and `./arroyo knoboff` says so.** That is the honest outcome
 for a change to unconditional console code, not a defect to be gated away — see the arc's report for
 what the knob-offs can and cannot certify here.
+
+### TAPSMAX — the census BY TAP, and why the seam is the tap ledger
+
+`taps_us_max=` is one number over four sinks. On the bench rMBP it is the **only** term that can be
+large (no 16550, so every masked branch is the O(1) `DECLINED` one), which makes it the whole verdict
+— and a whole verdict that cannot name a suspect is a number a seat cannot act on. `tap_max=` splits
+it four ways and `tap_sum=` gives the same split for the total.
+
+**The stopwatch is the tap ledger itself, and that is why this needed no foreign file.** Every tap
+opens with `TapCounters::submit()` and leaves through exactly one terminal outcome — `absorb`,
+`suppress`, `drop_line` or `note_staged` — because that is the SERWIT-2 conservation law
+(`submitted == absorbed + dropped + suppressed + in_flight`). `submit` stamps `now_cycles()` into the
+tap's own `span_t0`; each closer swaps it back to zero and charges the delta to that tap's
+`cost_max`/`cost_sum`. Two ledger methods are deliberately **not** closers. `absorb_n` accounts a
+batch drained in a *later* print's context, whose own span the `note_staged` that deferred it already
+closed — while the drain a tap performs on its *own* print path (`drain_staged_into`, called between
+`submit` and `absorb`) is inside the span and correctly charged to it. And `tear` is never a line's
+terminal outcome: on `ftdi`/`flightrec` it follows `note_staged`, and on `fbcon` it is charged from
+inside `PanelSink::flush` with the rest of the line still to paint, so closing there would end
+fbcon's span mid-line and hand its `absorb` an empty cell.
+
+**Every per-tap number is a LOWER bound, one-sidedly.** There is one `span_t0` cell per tap, not one
+per core, so two cores inside the same tap make the later `submit` overwrite the earlier stamp: the
+first closer then measures from the *later* stamp (short), and the second finds zero and charges
+nothing. Contention can only shrink this reading — it can hide a long tap on an unlucky sample and
+can never invent one, the same polarity DRAINCAP's clauses are built on. A per-core cell would buy
+a CPU-id read on the print path for a number that is a high-water mark over thousands of prints.
+
+`tap_sum` and `taps_us` are measured at different seams and will not add up: `taps_us` is the arch's
+single bracket around the whole tap block (call overhead included), `tap_sum` is the four taps' own
+submit-to-outcome spans. A large `taps_us - tap_sum` says *the block*, not *a tap*.
+
+**WHAT QEMU CAN AND CANNOT SAY HERE.** QEMU has no Kepler, so `fbcon::panel_console_resume` is never
+reached (`splash.rs`'s own note says so) and `PANEL_CONSOLE` stays clear for the whole boot. The
+`fbcon` tap therefore takes its O(1) `suppress()` branch on **every** line of a wc-lane run — the
+SERWIT-2 tap line reads `fbcon: … absorbed=0 … suppressed=N` and says it out loud. So a wc-lane
+`tap_max=fbcon:` is a measurement of a gate returning `false`, **not** of the panel paint, and the
+panel geometry cannot be forced either: `UNAOS_FBW`/`UNAOS_FBH` are read by `arch/aarch64/mailbox.rs`
+with `option_env!` and have no x86 reader at all. To exercise the fbcon paint half under QEMU the
+build must carry `bootlog` (`UNAOS_BOOTLOG=1`), which compiles the QUIET-PANEL gates out and sends
+every line through PANEL-DEFER. The three evidence taps (`ftdi` with `UNAOS_FTDIRX=1`, `tste`,
+`flightrec`) are live on the ordinary wc lane and their `tap_max=` is a real measurement of them.
 
 ### The fixture — the proof is in BYTES, not in cycles
 
@@ -1785,19 +1829,48 @@ is non-zero and `masked_b` tracks the line width.
 
 ```text
 [sertx] prints=N masked_us_max=<small> masked_us_mean=<small> drain_us=0 emit_us=0 spin_us=0
-        bytes=0 masked_b=0 fifo_b=16 taps_us=<H> taps_us_max=<I> sink=ftdi hz=<tsc>
+        bytes=0 masked_b=0 fifo_b=16 taps_us=<H> taps_us_max=<I>
+        tap_max=fbcon:<a>,ftdi:<b>,tste:<c>,rec:<d> … sink=ftdi hz=<tsc>
 :: EHCI-HID: [1] EHCIDARK … max=… pass_period_us_max=… pass_period_us_mean=… == witness ::
 ```
 
 On the bench rMBP `sink=ftdi` and every UART term reads 0 — correctly, because there is no 16550 —
-so the flight's whole `[sertx]` verdict rests on `taps_us_max`. If that is in the tens of thousands of
-microseconds, the dark window is the POST-MASK TAPS and the next arc is theirs (`video/fbcon.rs`'s
-panel paint is the first suspect: on a metal boot the Kepler takeover arms `PANEL_CONSOLE`, and
-flight 11's SERWIT-2 tap read `fbcon: absorbed=813` of 3387 lines by 28 s, each one glyph work on a
-2880×1800 panel, with PANEL-DEFER's own comment stating that its layout half runs masked). If instead
-`taps_us_max` is small too, the console is acquitted outright on that board and EHCIDARK's remaining
-term is elsewhere. **Either way the answer is a number in the capture and not an inference**, which
-is the whole of what this arc buys on metal.
+so the flight's whole `[sertx]` verdict rests on `taps_us_max`, and **`tap_max=` is what turns that
+verdict into a name.** If `taps_us_max` is in the tens of thousands of microseconds, the dark window
+is the POST-MASK TAPS and the largest term of `tap_max=` says which one owns it; `pass_period_us_max=`
+will then NOT fall to the tick, and that pair of readings is the measurement B146's prediction is now
+conditional on. If `taps_us_max` is small too, the console is acquitted outright on that board and
+EHCIDARK's remaining term is elsewhere. **Either way the answer is a number in the capture and not an
+inference**, which is the whole of what this arc buys on metal.
+
+**But `fbcon` is NOT the first suspect for the STEADY-STATE window, and flight 11's own wire is why.**
+The panel mirror is live for 881 ms of that 999-second capture and no longer: armed at
+`[27181ms] :: fbcon: glyphs-active …` by the Kepler takeover, and handed away at
+`[28062ms] [panel-owner] panel-ownership-handover from=owner-console-window to=owner-gui-screen
+site=fbcon::detach`. `detach()` stores `GUI_ACTIVE`, which is `fbcon::_print`'s FIRST test, so from
+28 062 ms the tap is an atomic load and a `suppress()` for the remaining 96.7 % of the boot — and the
+`max=108ms` EHCIDARK reports was not set during those 881 ms at all: its census does not begin until
+`[112445ms] … max=5ms`, reaches `max=106ms` at 557 953 ms and `max=108ms` at 582 559 ms. The 813
+painted lines the SERWIT-2 snapshot records are real and they are all inside the boot window.
+
+So on the rMBP the taps that are live when the dark window happens are `ftdi` and `flightrec` (both
+absorb every line) and `tste` (a prefix test), and **`fbcon` is the only one of the four that masks
+interrupts at all** — `drivers/xhci/ftdi.rs`, `flight_recorder.rs` and `selftest.rs` contain no
+`without_interrupts` call between them, while `video/fbcon.rs` has sixteen. A reader of flight 12
+should therefore expect a large `tap_max=fbcon:` in the one rollup covering ~27–28 s and ~0 in every
+later one; a large `fbcon:` in a LATE rollup would mean the detach did not hold, and that is itself
+the finding.
+
+The same capture also bounds the taps' MEAN, tightly and from the steady regime: 100 prefixed lines
+share the single stamp `[ 43375ms]` (and 110 share `[ 27066ms]`), so a whole `_print` — mask, drain,
+formatting and all four taps — averaged **under 10 µs of wall clock** there, and under 80 µs per
+print even on the worst assumption that all eight cores were printing in lockstep through that
+millisecond. A 108 ms window is 1 350 of those back to back on ONE core, against a densest observed
+*whole second* of 1 337 lines across every core. The mean is acquitted by three orders of magnitude;
+only a per-span TAIL can produce that window, and `tap_max=` is the only field in this census that
+can see one. (The bound counts prefixed lines, which is what `logts` stamps at print time; a line
+built from several `serial_print!` fragments carries one prefix, so the per-`_print` figure is
+smaller still, never larger.)
 
 Under QEMU, where a 16550 does exist, `sink=uart`, `emit_us=0` and `masked_b=0` are the fix itself
 reported from the inside, and `masked_us_max` against the pre-arc build is the before/after.

@@ -1567,6 +1567,15 @@ pub struct TapCounters {
     pub torn: AtomicU64,
     /// Loss not yet announced on the wire; swapped to 0 by the announcement.
     pending: AtomicU32,
+    /// TAPSMAX — `arch::now_cycles()` at this tap's [`submit`](TapCounters::submit); `0` = no span
+    /// open. See [`TapCounters::charge_span`] for why one cell is enough.
+    span_t0: AtomicU64,
+    /// TAPSMAX — cycles this tap spent, summed over the `[sertx]` census span.
+    cost_sum: AtomicU64,
+    /// TAPSMAX — this tap's LONGEST single span, in cycles. **The field the arc is about**: a dark
+    /// window is a maximum, and `[sertx] taps_us_max=` is one number over four taps, which cannot
+    /// name a suspect.
+    cost_max: AtomicU64,
 }
 
 impl TapCounters {
@@ -1579,15 +1588,67 @@ impl TapCounters {
             suppressed: AtomicU64::new(0),
             torn: AtomicU64::new(0),
             pending: AtomicU32::new(0),
+            span_t0: AtomicU64::new(0),
+            cost_sum: AtomicU64::new(0),
+            cost_max: AtomicU64::new(0),
         }
+    }
+    /// TAPSMAX — close the span [`submit`](TapCounters::submit) opened and charge it to THIS tap.
+    ///
+    /// The seam is the ledger the taps already keep, and that is what makes the census possible at
+    /// all without touching a foreign file: every tap opens with `submit()` and leaves through
+    /// exactly one terminal outcome (`absorb` / `suppress` / `drop_line` / `note_staged`), which is
+    /// the SERWIT-2 conservation law restated as a stopwatch. Two of the ledger's methods are
+    /// deliberately NOT closers: `absorb_n`, which accounts a batch drained in a LATER print's
+    /// context whose own span the `note_staged` that deferred it already closed; and `tear`, which
+    /// is never a line's terminal outcome — see its own note.
+    ///
+    /// **ONE CELL, AND INTERFERENCE IS ONE-SIDED.** Two cores can be inside the same tap at once, so
+    /// the later `submit()` overwrites the earlier core's `t0`. The `swap` then gives the FIRST
+    /// closer the LATER stamp — a shorter span than really elapsed — and the second closer finds `0`
+    /// and charges nothing. So contention can only make this reading SMALLER: it can hide a long tap
+    /// on an unlucky sample and can never invent one, which is the same one-sidedness DRAINCAP's
+    /// clauses are built on (a gate that cannot false-fail beats one that cannot false-pass). A
+    /// per-core cell would cost a CPU-id read on the print path for a number that is a high-water
+    /// mark over thousands of prints.
+    ///
+    /// The `>> 40` guard discards a torn sample rather than letting it become the maximum: 2^40
+    /// cycles is ~7 minutes at 2.4 GHz, so nothing it rejects could be a tap, and an unsynchronised
+    /// TSC across cores under TCG is exactly the way `now() - t0` goes backwards.
+    #[inline]
+    fn charge_span(&self) {
+        let t0 = self.span_t0.swap(0, Ordering::Relaxed);
+        if t0 == 0 {
+            return;
+        }
+        let d = crate::arch::now_cycles().wrapping_sub(t0);
+        if d >> 40 != 0 {
+            return;
+        }
+        self.cost_sum.fetch_add(d, Ordering::Relaxed);
+        self.cost_max.fetch_max(d, Ordering::Relaxed);
+    }
+    /// TAPSMAX — drain this tap's cost cells as a SPAN, matching `tx_take`'s discipline: `(max, sum)`
+    /// in cycles, both zeroed so the next `[sertx]` rollup reports its own ten seconds.
+    fn take_cost(&self) -> (u64, u64) {
+        (
+            self.cost_max.swap(0, Ordering::Relaxed),
+            self.cost_sum.swap(0, Ordering::Relaxed),
+        )
     }
     #[inline]
     pub fn submit(&self) {
         self.submitted.fetch_add(1, Ordering::Relaxed);
+        // TAPSMAX — open this tap's span. `| 1` keeps the stamp non-zero so `0` can mean "no span
+        // open" without a second atomic; it can only move `t0` one cycle LATER, i.e. shorten the
+        // reading, which is the polarity `charge_span` requires of every approximation here.
+        self.span_t0
+            .store(crate::arch::now_cycles() | 1, Ordering::Relaxed);
     }
     #[inline]
     pub fn absorb(&self) {
         self.absorbed.fetch_add(1, Ordering::Relaxed);
+        self.charge_span();
     }
     /// Account for a whole drained batch at once.
     #[inline]
@@ -1599,22 +1660,31 @@ impl TapCounters {
     #[inline]
     pub fn note_staged(&self) {
         self.staged.fetch_add(1, Ordering::Relaxed);
+        self.charge_span();
     }
     #[inline]
     pub fn suppress(&self) {
         self.suppressed.fetch_add(1, Ordering::Relaxed);
+        self.charge_span();
     }
     /// One line lost. Counted twice on purpose: cumulatively, and as un-announced.
     #[inline]
     pub fn drop_line(&self) {
         self.dropped.fetch_add(1, Ordering::Relaxed);
         self.pending.fetch_add(1, Ordering::Relaxed);
+        self.charge_span();
     }
     /// One line that reached the sink truncated. Announced like a drop, counted apart from one.
     #[inline]
     pub fn tear(&self) {
         self.torn.fetch_add(1, Ordering::Relaxed);
         self.pending.fetch_add(1, Ordering::Relaxed);
+        // TAPSMAX — deliberately NOT a span closer, at any of its three call sites. `tear` is never a
+        // line's terminal outcome: on ftdi and flightrec it FOLLOWS the `note_staged` that already
+        // closed the span, and on fbcon it PRECEDES the `absorb` that will — a mid-line tear is
+        // charged from inside `PanelSink::flush`, with the rest of the line still to paint. Closing
+        // here would end fbcon's span mid-line and hand its `absorb` an empty cell, under-measuring
+        // exactly the tap this census exists to size.
     }
     /// Losses not yet announced, taken.
     #[inline]
@@ -1659,6 +1729,25 @@ fn taps() -> [(&'static str, &'static TapCounters); 4] {
         ("tste", &TAP_TSTE),
         ("flightrec", &TAP_FLIGHTREC),
     ]
+}
+
+/// TAPSMAX — take all four taps' cost cells as ONE `[sertx]` span, in [`taps()`]' order:
+/// `[(max, sum); 4]` in cycles for fbcon, ftdi, tste, flightrec.
+///
+/// Drained here and nowhere else, so the per-tap pair and the `taps_us=`/`taps_us_max=` pair beside
+/// it on the same line always describe the same ten seconds. They are measured at DIFFERENT seams
+/// and will not add up exactly, and that is the honest shape rather than a defect: `taps_us` is the
+/// arch's single `now_cycles()` bracket around the whole tap block (it therefore also carries the
+/// call overhead and any tap that is not one of these four), while `tap_sum` is the four taps'
+/// own submit-to-outcome spans, each a lower bound under contention. `tap_sum > taps_us` cannot
+/// happen on a quiet console and means cores overlapped in the block; `taps_us - tap_sum` is the
+/// unattributed remainder and a reader should treat a LARGE one as "the block, not a tap".
+fn tap_cost_take() -> [(u64, u64); 4] {
+    let mut out = [(0u64, 0u64); 4];
+    for (i, (_, t)) in taps().into_iter().enumerate() {
+        out[i] = t.take_cost();
+    }
+    out
 }
 
 /// SERWIT-2 — announce any un-announced mirror loss on the WIRE, and emit the verdict once.
@@ -3200,6 +3289,7 @@ static SERTX_LAST_MS: AtomicU64 = AtomicU64::new(u64::MAX);
 /// | `bytes` | bytes this transport put at a 16550 during the span, masked and unmasked together. |
 /// | `masked_b` | of those, the bytes written with interrupts off — the currency of the dark window, at 86.8 us each. Bounded by `MASKED_BYTE_BUDGET` per masked print. |
 /// | `taps_us` / `taps_us_max` | the four POST-MASK mirrors. On a machine with no 16550 this is the only term that can be large, so it is reported beside the masked one rather than folded into it. |
+/// | `tap_max` / `tap_sum` | TAPSMAX — the SAME two quantities, BY TAP: `fbcon:<us>,ftdi:<us>,tste:<us>,rec:<us>`. `taps_us_max=` is one number over four sinks and so cannot name a suspect; this pair does. Read `tap_max` first — a dark window is a MAXIMUM — and read `tap_sum` beside it to tell a steady cost from a tail, exactly as `masked_us_mean` is read against `masked_us_max`. `rec` is the `flightrec` tap (`UNAOS.LOG`). Each is a LOWER BOUND under multi-core contention, by [`TapCounters::charge_span`]'s stated one-sidedness. |
 /// | `sink` | which transports were live at the rollup. `ftdi` on the bench rMBP (no 16550 — SERWIT-1D), `uart` under QEMU, `both` on a machine carrying both. |
 /// | `hz` | the rate the microseconds were derived at. `hz=0` means UNKNOWN, every `_us` field reads 0 for that reason alone, and only the `_cy` pair is evidence. |
 pub fn tx_rollup() {
@@ -3210,6 +3300,10 @@ pub fn tx_rollup() {
     }
     SERTX_LAST_MS.store(now, Ordering::Relaxed);
     let (n, mmax, msum, drain, emit, spin, b_un, b_m, tmax, tsum) = tx_take();
+    // TAPSMAX — the same span, decomposed by tap. Taken in `taps()`' order (fbcon, ftdi, tste,
+    // flightrec), which is also the order `_print` calls them in on both arches, so a reader can
+    // line `tap_max=` up against the `:: SERWIT-2 tap …` lines without a lookup.
+    let tc = tap_cost_take();
     let uart = !uart_absent() && UART_RESOLVED.load(Ordering::Relaxed);
     let cable = crate::drivers::xhci::ftdi::is_live();
     let sink = match (uart, cable) {
@@ -3220,8 +3314,9 @@ pub fn tx_rollup() {
     };
     serial_println!(
         "[sertx] prints={} masked_us_max={} masked_us_mean={} drain_us={} emit_us={} spin_us={} \
-         bytes={} masked_b={} fifo_b={} taps_us={} taps_us_max={} sink={} hz={} \
-         masked_cy_max={} masked_cy_sum={}",
+         bytes={} masked_b={} fifo_b={} taps_us={} taps_us_max={} \
+         tap_max=fbcon:{},ftdi:{},tste:{},rec:{} tap_sum=fbcon:{},ftdi:{},tste:{},rec:{} \
+         sink={} hz={} masked_cy_max={} masked_cy_sum={}",
         n,
         cyc_to_us(mmax),
         cyc_to_us(if n == 0 { 0 } else { msum / n }),
@@ -3233,6 +3328,14 @@ pub fn tx_rollup() {
         MASKED_BYTE_BUDGET,
         cyc_to_us(tsum),
         cyc_to_us(tmax),
+        cyc_to_us(tc[0].0),
+        cyc_to_us(tc[1].0),
+        cyc_to_us(tc[2].0),
+        cyc_to_us(tc[3].0),
+        cyc_to_us(tc[0].1),
+        cyc_to_us(tc[1].1),
+        cyc_to_us(tc[2].1),
+        cyc_to_us(tc[3].1),
         sink,
         crate::bootpace::origin_hz(),
         mmax,
