@@ -89,7 +89,7 @@ The two `NOT-IN-TREE` rows were named rather than guessed, in the `igpu-dpy … 
 pair was the real blocker on a true vblank interrupt, and it was found in the file this section had
 already cited.
 
-**⚠ The paragraph below describes KVBLANK's rung as it shipped, and its register is wrong (see the struck row above).** `UNAOS_KEPLER_VBLANK=1` sets **exactly bit 26** in `NV_PMC_INTR_EN` (which `kepler::init` has
+**⚠ The paragraph below describes KVBLANK's rung as it shipped, and its register is wrong (see the struck row above). Since KVBLANK3 (B192) the rung sets bit 26 in `INTR_MASK_HOST` (`0x640`). It only READS `INTR_ENABLE_HOST`, which `kepler::init` holds at 0, so the output line cannot assert and the line reads `deliver=none reason=source-probe-only`. KVBLANK2's R3 now arms `0x640` = bit 26 alone and `0x140` bit 0, reads both back, and names its verdict `deliver=`/`reason=` (§2.3.3 and `KEPLER-METAL-LOG.md`).** `UNAOS_KEPLER_VBLANK=1` sets **exactly bit 26** in `NV_PMC_INTR_EN` (which `kepler::init` has
 written `0` since the driver's first day), watches `NV_PMC_INTR_0` for 50 ms, and RESTORES the
 captured value with a read-back. Delivery is impossible by construction — this tree has three
 hard-coded IDT vectors and no vector allocator a PCI function can join — so the rung asks whether
