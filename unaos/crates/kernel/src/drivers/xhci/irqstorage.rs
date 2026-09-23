@@ -194,7 +194,7 @@ const ENOENT: i32 = -2;
 const ENOTDIR: i32 = -20;
 /// DIRNS: a malformed EL0 path — no leaf at all (`""`, `"/"`), a leaf not representable as 8.3, or a
 /// REFUSED `..` component. Matches the syscall layer's `EINVAL`.
-const EINVAL: i32 = -22;
+const EINVAL: i32 = -22; #[cfg(feature = "login")] const EACCES: i32 = -13; // LOGIN13 M4 — `El0LocateError::KernelOwned` (the credential file): permission, not a malformed path. Matches the syscall layer's `EACCES`. ⚠ LINE-NEUTRAL fold.
 
 /// The submission queue: raw `*mut BlockRequest` addresses (stored as `usize` so the static is
 /// `Sync` — the scheduler's `park_waiters` idiom). Pushed by submitters (IF already masked in the
@@ -491,7 +491,7 @@ fn service_create_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::F
     let mut created = false;
     match crate::fs::vfs::el0_locate(fs, name, true, &mut created) {
         Ok(_) => 0, // present or created
-        Err(crate::fs::vfs::El0LocateError::NotADirectory) => ENOTDIR,
+        Err(crate::fs::vfs::El0LocateError::NotADirectory) => ENOTDIR, #[cfg(feature = "login")] Err(crate::fs::vfs::El0LocateError::KernelOwned) => EACCES, // LOGIN13 M4
         Err(_) => EIO,
     }
 }
@@ -532,7 +532,7 @@ fn service_delete_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::F
         },
         Ok(_) => EIO, // a directory under this name — never delete it via the file path
         Err(crate::fs::vfs::El0LocateError::NotFound) => 0, // already gone — idempotent
-        Err(_) => EIO,
+        #[cfg(feature = "login")] Err(crate::fs::vfs::El0LocateError::KernelOwned) => EACCES, Err(_) => EIO, // LOGIN13 M4 — the credential file is refused as permission, never as an I/O error
     }
 }
 
@@ -561,7 +561,7 @@ fn service_stat_file(req: &mut BlockRequest, fs: &mut Option<crate::fs::fat::Fat
         Err(crate::fs::vfs::El0LocateError::NotFound) => ENOENT, // absent from the live volume
         Err(crate::fs::vfs::El0LocateError::NotADirectory) => ENOTDIR, // a component that is a file
         Err(crate::fs::vfs::El0LocateError::Invalid) => EINVAL, // no leaf, or a refused `..`
-        Err(_) => EIO, // a real mount / I/O error
+        #[cfg(feature = "login")] Err(crate::fs::vfs::El0LocateError::KernelOwned) => EACCES, Err(_) => EIO, // a real mount / I/O error; LOGIN13 M4 — the credential file is `-EACCES`, typed
     }
 }
 

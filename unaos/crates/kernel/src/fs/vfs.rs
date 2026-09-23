@@ -2875,7 +2875,7 @@ pub enum El0LocateError {
     /// WEDGE-8: the driver loan is busy — retryable, nothing mutated (`-EAGAIN`).
     Busy,
     /// Any other FAT error (`-EIO`).
-    Io,
+    Io, #[cfg(feature = "login")] #[doc = "LOGIN13 M4 (VFSOWNED's owed variant, B181/B189): the leaf is KERNEL-OWNED — the credential file (`fs::users::kernel_owned_leaf`: `USERS.DAT`, `USERS.NEW`) — and no EL0 open resolves it (`-EACCES` on both arches). Typed, so the refusal is not folded into `Invalid`'s malformed-path meaning. `login`-gated with the guard that returns it; ⚠ LINE-NEUTRAL fold."] KernelOwned,
 }
 
 /// DIRNS: how many EL0 opens have been refused for naming `..`. The escape guard's witness count —
@@ -3001,7 +3001,7 @@ pub fn el0_locate(
     // SECLOGIN M4 (VFSOWNED) — the kernel's credential file is unreachable through ANY EL0 open, on
     // BOTH arches, at the one resolver they share (B169; multiuser.md §6; `login`-gated as `fs::users` is).
     #[cfg(feature = "login")]
-    if crate::fs::users::kernel_owned_leaf(leaf) { return Err(El0LocateError::Invalid); }
+    if crate::fs::users::kernel_owned_leaf(leaf) { return Err(El0LocateError::KernelOwned); } // LOGIN13 M4: typed (was `Invalid`, VFSOWNED's first cut)
     match fs.locate_in_dir(parent, leaf) {
         Ok(t) => Ok(t),
         Err(FatError::NotFound) => {

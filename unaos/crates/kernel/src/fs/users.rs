@@ -1633,8 +1633,9 @@ pub fn kernel_owned_leaf(leaf: &str) -> bool {
 /// near-miss refused), and then the REAL resolver is asked: on aarch64 through `open_locate` (the
 /// guarded seam every `sys_open` walks) and the answer is a verdict; on x86 through
 /// `fs::vfs::el0_locate` DIRECTLY, the shared resolver the storage task's `resolve_path` calls, whose
-/// guard line is outside this arc's grant (`multiuser.md` §6) — so the x86 line is a MEASUREMENT
-/// (`resolver=OPENED` today, `REFUSED` the day that line lands), never a PASS on a hole.
+/// guard VFSOWNED landed (B181, `multiuser.md` §6) and LOGIN13 M4 typed (`El0LocateError::KernelOwned`,
+/// `-EACCES` through the storage task) — so x86 now has a VERDICT too, `:: LOGIN-KOWN:`, which passes
+/// only when BOTH leaves come back as that variant (a refusal for any other reason is not this one).
 #[cfg(feature = "loginst")]
 pub fn login_kown_fixture() {
     let pred = kernel_owned_leaf("USERS.DAT") && kernel_owned_leaf("users.dat") && kernel_owned_leaf("USERS.NEW") && kernel_owned_leaf("Users.New") && !kernel_owned_leaf("USERS.TXT") && !kernel_owned_leaf("HELLO.BIN");
@@ -1647,20 +1648,22 @@ pub fn login_kown_fixture() {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        let resolver = match crate::fs::fat::mount() {
-            Ok(fs) => {
-                let mut c = false;
-                match crate::fs::vfs::el0_locate(&fs, "USERS.DAT", false, &mut c) {
-                    Ok(_) => "OPENED",
-                    Err(_) => "refused",
-                }
+        let probe = |fs: &crate::fs::fat::FatFs, path: &str| -> &'static str {
+            let mut c = false;
+            match crate::fs::vfs::el0_locate(fs, path, false, &mut c) {
+                Ok(_) => "OPENED",
+                Err(crate::fs::vfs::El0LocateError::KernelOwned) => "KernelOwned",
+                Err(_) => "OTHER",
             }
-            Err(_) => "no-volume",
         };
-        serial_println!("[users] kernel-owned pred={} resolver={} (x86: the guard line in fs::vfs::el0_locate is owed to the seat — multiuser.md §6; this line is a measurement, not a verdict)", if pred { "ok" } else { "FAIL" }, resolver);
-        if !pred {
-            serial_println!(":: LOGIN-KOWN: pred=FAIL -> FAIL — ::");
-        }
+        let (e1, e2) = match crate::fs::fat::mount() {
+            Ok(fs) => (probe(&fs, "USERS.DAT"), probe(&fs, "/USERS.NEW")),
+            Err(_) => ("no-volume", "no-volume"),
+        };
+        let resolver = if e1 == "OPENED" || e2 == "OPENED" { "OPENED" } else if e1 == "no-volume" { "no-volume" } else { "refused" };
+        serial_println!("[users] kernel-owned pred={} resolver={} (x86: `fs::vfs::el0_locate` refuses the credential file — VFSOWNED's guard, typed `El0LocateError::KernelOwned` since LOGIN13 M4, `-EACCES` through the storage task)", if pred { "ok" } else { "FAIL" }, resolver);
+        let typed = e1 == "KernelOwned" && e2 == "KernelOwned";
+        serial_println!(":: LOGIN-KOWN: pred={} resolver={} err={},{} reason=kernel-owned -> {} ::", if pred { "ok" } else { "FAIL" }, resolver, e1, e2, if pred && typed { "PASS" } else { "FAIL —" });
     }
     #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "aarch64_el0"))))]
     {

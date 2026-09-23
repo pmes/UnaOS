@@ -390,3 +390,12 @@ REQUIRE \[login\] denied user=boot13
 REQUIRE \[users\] login ok user=boot13 id=\d+ principal=user:boot13#\d+
 REQUIRE \[login\] session open user=boot13
 FORBID wrong-pw
+#
+# M4 — THE x86 CREDENTIAL-FILE REFUSAL IS TYPED AND HAS A VERDICT (VFSOWNED's owed items, B181 -> B189).
+# `El0LocateError::KernelOwned` is what `fs::vfs::el0_locate` returns for `USERS.DAT`/`USERS.NEW`; the x86
+# fixture asks the resolver for both and passes only on that variant — a refusal for any other reason is
+# not this one. §7d's `[users] kernel-owned pred=ok resolver=refused` token is unchanged (its parenthetical
+# no longer claims the guard "is owed to the seat": VFSOWNED landed it). GO-RED (LOGIN13 M4, run on this
+# gate): the guard returning `Invalid` again reads `err=OTHER,OTHER -> FAIL —`. GREEN CERTIFIES: x86 has a
+# verdict for SECLOGIN M4 (aarch64 has had one since ARMUSERS), and the refusal is the typed one.
+REQUIRE :: LOGIN-KOWN: pred=ok resolver=refused err=KernelOwned,KernelOwned reason=kernel-owned -> PASS ::
