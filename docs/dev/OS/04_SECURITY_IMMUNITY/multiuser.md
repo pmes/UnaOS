@@ -176,21 +176,45 @@ one-answer denial LOGINFLOW built on the glass would leak the roster through the
   inside `x86_usb_pump`), so the login battery runs on x86 and on `test-arm` only. `main.rs` is not in
   this arc's grant; the one-line tegra-loop site A91 named remains owed there.
 
-## 6. The one file this arc may not touch, and the exact change it needs
+## 6. The one file this arc may not touch — CLOSED by VFSOWNED (rmbp-ledger B181)
 
 M4's refusal has one right home on BOTH arches: `crate::fs::vfs::el0_locate` (`fs/vfs.rs:2993`), the
 shared resolver every EL0 open walks — aarch64's `sys_open` through `open_locate`, x86's
 `sys_open_dynamic` through the storage service task's `resolve_path`
-(`drivers/xhci/irqstorage.rs:437`). `fs/vfs.rs` is outside this arc's file grant (EXECUTOR-BRIEF rule
-3), so the arc lands the predicate (`users::kernel_owned_leaf`), the aarch64 path-form guard beside
+(`drivers/xhci/irqstorage.rs:437`). `fs/vfs.rs` was outside SECLOGIN's file grant (EXECUTOR-BRIEF rule
+3), so that arc landed the predicate (`users::kernel_owned_leaf`), the aarch64 path-form guard beside
 the existing `UNAFS.ATR` guard in `open_locate` (the K1 M4 precedent: an up-front cheap check and a
-path-form check a spelling cannot slip past), the fixture, and the design — and STOPS on the x86 half
-with the exact patch for the seat, quoted in the arc's report. Until that line lands, an x86 program
-with `irqstorage` armed can open `/USERS.DAT` read-only through the dynamic on-disk arm; nothing in
-that arm can write it (`sys_write_file`'s dynamic branch is overwrite-only on a file the caller
-opened RW, and the users service replaces the file by rename, so an overwrite lands on a dead
-directory entry at worst) — but reading the roster and hashes from ring 3 is exactly what M4 refuses,
-and the report says so in those words.
+path-form check a spelling cannot slip past), the fixture, and the design — and STOPPED on the x86
+half with the exact patch for the seat.
+
+**LANDED 2026-09-22 by VFSOWNED, commit `c4fdd29d` (`exec-rmbp-vfsowned`, parent 9081402e).** Four
+lines in `el0_locate`, immediately after `let (parent, leaf) = el0_walk(fs, path)?;`:
+
+```rust
+// SECLOGIN M4 (VFSOWNED) — the kernel's credential file is unreachable through ANY EL0 open, on
+// BOTH arches, at the one resolver they share (B169; multiuser.md §6; `login`-gated as `fs::users` is).
+#[cfg(feature = "login")]
+if crate::fs::users::kernel_owned_leaf(leaf) { return Err(El0LocateError::Invalid); }
+```
+
+`El0LocateError::Invalid` maps to `-EACCES`/`-EINVAL` through each arch's `el0_errno`; a dedicated
+`KernelOwned` variant is cleaner, touches every `match` on that enum, and is OWED, not taken.
+`#[cfg(feature = "login")]` because `fs::users` is declared under `login` (`fs/mod.rs:105`) — the same
+pair aarch64 uses at `arch/aarch64/syscall.rs:25229/25233` — so a default image compiles unchanged on
+both arches and can hold no credential file at all. The guard covers the storage task's CREATE arm
+(`irqstorage.rs:492`) as well as its read arms, and the kernel's own credential path is untouched:
+`fs/users.rs` reads and writes the store through `locate_in_dir(0, leaf)` / `rename_entry`, never
+through this resolver.
+
+MEASURED on the x86 login lane (`UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_LOGIN=1
+UNAOS_LOGINST=1 UNAOS_QEMU_FULL=1 ./arroyo test 240`, rc=0 COMPLETE, full wall 240.4 s): the reading
+went `resolver=OPENED` → **`[users] kernel-owned pred=ok resolver=refused`**, every other `:: LOGIN-`
+verdict unchanged PASS. GO-RED: the line removed in scratch, the same lane, same wall — the line
+reads `resolver=OPENED` again. `x86-login.spec` §7d no longer admits both readings: it REQUIREs
+`resolver=refused` and FORBIDs `resolver=OPENED`, and that pin PASSES 24/24 on the green capture and
+FAILS 23/24 + 1 forbidden hit on the go-red capture. The paragraph this section used to end on —
+that an x86 program with `irqstorage` armed can READ the roster, salts and digests from ring 3 — is
+no longer true of any image that carries this line.
 
 ## 7. Prediction for flight 12, stated so it can be falsified
 
