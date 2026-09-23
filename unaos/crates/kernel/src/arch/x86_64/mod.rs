@@ -299,7 +299,7 @@ pub fn ioapic_route_intx(bus: u8, dev: u8, func: u8, vector: u8) -> bool {
 
 /// IOAPIC2 (rmbp-ledger B191) — the same route as `ioapic_route_intx`, answering `Ok(gsi)` or
 /// `Err(reason)` where `reason` is the token the `[ioapic]` refusal line printed (`no-intx-pin`,
-/// `no-firmware-line`, the `route_gsi`
+/// `no-firmware-line`, `pirq-disabled`, `rcba-disabled`, `dnir-unreadable`, the `route_gsi`
 /// refusals, `unmask-…`) — or, knob-off, `no-ioapic-in-kernel`, which is the ONE case in
 /// which the sentence flight 12 printed ("there is no IOAPIC in this kernel") is true. A caller
 /// composes its own refusal from this value and never from a fixed string: flight 12 printed that

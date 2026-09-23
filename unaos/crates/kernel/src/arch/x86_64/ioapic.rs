@@ -537,20 +537,25 @@ pub fn routed() -> u32 {
 
 /// Which GSI does this PCI function's INTx pin land on, and with what polarity and trigger?
 ///
-/// THE ANSWER COMES FROM THE FUNCTION'S OWN CONFIG SPACE (PCI 3.0 §6.2.4): Interrupt Pin at 0x3D
-/// says which of INTA#..INTD# it asserts (0 = none), and Interrupt Line at 0x3C is the IRQ number
-/// FIRMWARE programmed for it.
+/// THE ANSWER COMES FROM TWO PLACES, ASKED IN THIS ORDER (IOAPIC2, rmbp-ledger B191):
 ///
-/// ⚠ THE DSDT `_PRT` IS NOT CONSULTED, AND THAT IS THIS RUNG'S STATED LIMIT, not an oversight. The
-/// authoritative PCI interrupt routing table is `_PRT`, which is AML — an interpreter this kernel
-/// does not have and this arc does not write. So the mapping is: take firmware's own Interrupt
-/// Line and push it through the Interrupt Source Override table (identity when no override names
-/// it). On a machine whose firmware left Interrupt Line unprogrammed the honest answer is REFUSED
-/// — `reason=no-firmware-line`, printed — and the caller keeps polling exactly as it did before.
-/// The refusal token is RETURNED as well as printed (IOAPIC2, rmbp-ledger B191), so the caller's
-/// own refusal line can name it instead of guessing: flight 12's ISRARM line said "there is no
-/// IOAPIC in this kernel" beside `[ioapic] route … REFUSED reason=no-firmware-line` in the same
-/// millisecond. See docs/dev/OS/01_BOOT_HAL/ioapic.md §4.
+/// 1. **The chipset's own PIRQ router** (`pirq_gsi`, rung 4 below) — for a function the PCH builds
+///    in (bus 0, a device number with a Device Interrupt Route register), the I/O APIC input its
+///    INTx lands on is fixed by the chipset: pin -> PIRQ through `D<n>IR`, PIRQ A..H -> I/O APIC
+///    inputs 16..23. That answer is asked FIRST because it is the APIC-mode answer, and because
+///    the Interrupt Line register below is not: firmware writes there the 8259 IRQ the PIRQ was
+///    steered to (`PIRQ[n]_ROUT` bits 3:0), which is an ISA number, not an I/O APIC input.
+/// 2. **Firmware's Interrupt Line** (PCI 3.0 §6.2.4, config 0x3C) pushed through the Interrupt
+///    Source Override table (identity when no override names it) — for everything the router does
+///    not cover (a function behind a bridge, an unrecognised chipset). This is rung 2's path,
+///    unchanged.
+///
+/// ⚠ THE DSDT `_PRT` IS STILL NOT CONSULTED — it is AML and this kernel has no interpreter. A
+/// function neither path answers is REFUSED, printed, and the caller keeps polling. The refusal
+/// token is RETURNED as well as printed, so the caller's own refusal line can name it instead of
+/// guessing (flight 12's ISRARM line said "there is no IOAPIC in this kernel" beside an
+/// `[ioapic] route … REFUSED reason=no-firmware-line` in the same millisecond).
+/// See docs/dev/OS/01_BOOT_HAL/ioapic.md §4 and §9.
 ///
 /// THE DEFAULT POLARITY AND TRIGGER ARE PCI'S, NOT ISA'S: INTx is LEVEL TRIGGERED and ACTIVE LOW
 /// (PCI 3.0 §2.2.6). An override naming this line wins over that default, because an override is
@@ -574,7 +579,31 @@ pub fn route_pci_intx(
         return Err("no-intx-pin");
     }
 
+    // RUNG 4 FIRST: the chipset's APIC-mode answer for an on-die function.
+    let pirq_refused = match pirq_gsi(bus, dev, func, pin, line) {
+        Ok(gsi) => {
+            serial_println!(
+                "[ioapic] route bdf={}:{}.{} pin=INT{} line={} -> gsi={} via=pirq polarity={} trigger={} == witness ::",
+                bus, dev, func, pin_name, line, gsi,
+                Polarity::ActiveLow.as_str(),
+                Trigger::Level.as_str()
+            );
+            return Ok((gsi, Polarity::ActiveLow, Trigger::Level));
+        }
+        // The router covers this function and REFUSED it: that reason is the one the caller gets.
+        Err(Pirq::Refused(why)) => Some(why),
+        // The router does not cover this function at all: fall through to firmware's line.
+        Err(Pirq::NotApplicable(_)) => None,
+    };
+
     if line == 0 || line == 0xFF {
+        if let Some(why) = pirq_refused {
+            serial_println!(
+                "[ioapic] route bdf={}:{}.{} pin=INT{} line={} -> REFUSED reason={} — the chipset PIRQ router covers this function and refused it (see the `[ioapic] pirq` line above), and firmware programmed no Interrupt Line either, so the GSI is UNKNOWN rather than guessed; nothing was written == witness ::",
+                bus, dev, func, pin_name, line, why
+            );
+            return Err(why);
+        }
         serial_println!(
             "[ioapic] route bdf={}:{}.{} pin=INT{} line={} -> REFUSED reason=no-firmware-line — firmware programmed no IRQ for this function and this rung does not interpret the DSDT _PRT, so the GSI is UNKNOWN rather than guessed; nothing was written == witness ::",
             bus, dev, func, pin_name, line
@@ -680,6 +709,195 @@ pub fn route_pci_function(bus: u8, dev: u8, func: u8, vector: u8) -> Result<u32,
         dest, entry, unmasked,
         (cmd_back >> 10) & 1,
         routed()
+    );
+    Ok(gsi)
+}
+
+// ── RUNG 4: THE CHIPSET PIRQ ROUTER (IOAPIC2, rmbp-ledger B191) ──────────────────────────────
+//
+// THE DEFECT, on the wire (rmbp flight 12, f12-boot1.log at 5833 ms):
+//
+//   [ioapic] route bdf=0:29.0 pin=INTA line=0 -> REFUSED reason=no-firmware-line — …
+//
+// The rMBP's firmware programs no Interrupt Line on any function (`[PCI-PROBE] … Interrupt Line
+// (IRQ)=0` for the xHCI at 0:20.0 on the same boot; `[hda] … irq=0` for 0:27.0), so rung 2's only
+// source of a GSI was empty and the EHCI stayed polled. The authoritative table is the DSDT `_PRT`,
+// which is AML. But for a function the chipset BUILDS IN, the route is not a board decision at all:
+// it is three chipset registers and one fixed mapping, all public.
+//
+// CLEAN ROOM — every field below is cited to the chipset datasheets and nothing else. Document
+// numbers and chapter/register names are as recalled from the public documents; section and PAGE
+// numbers are NOT given because the PDFs were not open when this was written — `unverified` for
+// every one of them, and every value this code depends on is printed on the wire so the capture,
+// not this comment, settles it:
+//   · Intel 7 Series / C216 Chipset Family PCH Datasheet (doc 326776) and Intel I/O Controller
+//     Hub 9 (ICH9) Family Datasheet (doc 316972) — the same register layout in both:
+//     - LPC bridge (D31:F0) config 0x60-0x63 `PIRQ[A-D]_ROUT` and 0x68-0x6B `PIRQ[E-H]_ROUT`
+//       (LPC Interface Bridge Registers chapter, "PIRQ[n]_ROUT — PIRQ[n] Routing Control"): bit 7
+//       IRQEN (1 = the PIRQ is NOT routed to the 8259; default 80h), bits 3:0 the ISA IRQ.
+//     - LPC config 0xF0 `RCBA` (same chapter): bits 31:14 the Root Complex Base Address, bit 0 EN.
+//     - Chipset Configuration Registers chapter, `D<n>IR — Device <n> Interrupt Route`: 16-bit,
+//       RCBA+0x3140 (D31IR), +0x3144 (D29IR), +0x3146 (D28IR), +0x3148 (D27IR), +0x314C (D26IR),
+//       +0x3150 (D25IR). Bits 2:0 INTA's PIRQ, 6:4 INTB's, 10:8 INTC's, 14:12 INTD's
+//       (0 = PIRQA … 7 = PIRQH); default 3210h. PROGRAMMABLE — the swizzle is firmware's choice,
+//       which is why it is READ here and never assumed from the default.
+//     - Interrupt Logic / APIC chapter, "APIC Interrupt Mapping" table: I/O APIC inputs 16-19 are
+//       PIRQA#-PIRQD#, 20-23 are PIRQE#-PIRQH#, and inputs 16-23 receive ACTIVE-LOW internal
+//       sources. That mapping does not pass through `PIRQ[n]_ROUT`, which steers the 8259 only.
+//
+// ⚠ IRQEN = 1 IS REFUSED (`reason=pirq-disabled`), as the brief for this rung specifies. The
+// datasheet's note on that bit says BIOS must clear it for every PIRQ in use during POST and that
+// the OS may set it again when it moves to I/O APIC delivery — so a set bit at our boot is
+// firmware saying "unused", and routing it anyway would be a guess. If flight 13 prints
+// `pirq-disabled` for the EHCI, the next rung's question is whether the APIC-mode input 16+n
+// delivers regardless (the datasheet's mapping says it does); that is a metal measurement, not a
+// reading of this comment.
+//
+// NO BOARD IN THIS CODE (R16): the router is DISCOVERED — the ISA bridge (class 06/01) on bus 0
+// whose vendor:device falls in a family this rung knows — and a machine without one is
+// `reason=no-pirq-router`, falling back to rung 2 unchanged.
+
+/// A PIRQ-router family this rung reads. The two named ranges share the register layout above.
+struct RouterFamily {
+    name: &'static str,
+    dev_lo: u16,
+    dev_hi: u16,
+}
+
+/// ICH9 LPC: 8086:2910-291F (QEMU q35's `ICH9-LPC` is 8086:2918). 7-series PCH LPC ("Panther
+/// Point", the 2012 rMBP's family): 8086:1E40-1E5F — the rMBP's own id is NOT on any wire yet
+/// (`unverified`); the `[ioapic] pirq` line prints it.
+const ROUTER_FAMILIES: [RouterFamily; 2] = [
+    RouterFamily { name: "ich9", dev_lo: 0x2910, dev_hi: 0x291F },
+    RouterFamily { name: "pch7", dev_lo: 0x1E40, dev_hi: 0x1E5F },
+];
+
+/// `D<n>IR` offsets from RCBA, keyed by the on-die device number (see the chapter cited above).
+/// A device number not in this table is not a function this rung can route (`not-on-die`).
+const DNIR: [(u8, u16); 6] = [
+    (31, 0x3140),
+    (29, 0x3144),
+    (28, 0x3146),
+    (27, 0x3148),
+    (26, 0x314C),
+    (25, 0x3150),
+];
+
+/// The I/O APIC input PIRQA# lands on in APIC mode; PIRQ n lands on `PIRQ_GSI_BASE + n`.
+const PIRQ_GSI_BASE: u32 = 16;
+
+/// Why the router did not answer. `NotApplicable` = this function is not the router's business
+/// (rung 2's firmware-line path decides it). `Refused` = the router covers it and said no; that
+/// token is what the caller's refusal carries.
+#[derive(Clone, Copy)]
+pub enum Pirq {
+    NotApplicable(&'static str),
+    Refused(&'static str),
+}
+
+/// Find the PIRQ router on bus 0: the ISA bridge (class 0x0601) whose vendor:device is in a known
+/// family. Returns (device number, device id, family name).
+fn find_router() -> Option<(u8, u16, &'static str)> {
+    for d in 0u8..32 {
+        let id = unsafe { crate::arch::pci::read_config_32(0, d, 0, 0x00) };
+        if id & 0xFFFF != 0x8086 {
+            continue;
+        }
+        let class = unsafe { crate::arch::pci::read_config_32(0, d, 0, 0x08) } >> 16;
+        if class != 0x0601 {
+            continue;
+        }
+        let did = (id >> 16) as u16;
+        for f in ROUTER_FAMILIES.iter() {
+            if did >= f.dev_lo && did <= f.dev_hi {
+                return Some((d, did, f.name));
+            }
+        }
+    }
+    None
+}
+
+/// The chipset's answer for one function: which I/O APIC input its INTx pin lands on. Prints one
+/// `[ioapic] pirq` line in every outcome — silence is never the answer.
+///
+/// `pin` is the function's own Interrupt Pin (1..=4, already validated by the caller) and
+/// `fw_line` its Interrupt Line, carried only to report whether firmware's 8259 steering agrees
+/// with the PIRQ this derivation found (`fw_agree=`): on a machine whose firmware programs both,
+/// the two are written from the same PIRQ, so `no` means one side is wrong.
+pub fn pirq_gsi(bus: u8, dev: u8, func: u8, pin: u8, fw_line: u8) -> Result<u32, Pirq> {
+    let pin_name = (b'A' + pin - 1) as char;
+    let dnir_off = DNIR.iter().find(|(d, _)| *d == dev).map(|(_, o)| *o);
+    let dnir_off = match (bus, dnir_off) {
+        (0, Some(o)) => o,
+        _ => {
+            serial_println!(
+                "[ioapic] pirq fn={}:{}.{} pin=INT{} -> n/a reason=not-on-die — only a bus-0 function with a Device Interrupt Route register (D25/26/27/28/29/31) is routed by the chipset; everything else is the DSDT _PRT's, which this kernel does not interpret == witness ::",
+                bus, dev, func, pin_name
+            );
+            return Err(Pirq::NotApplicable("not-on-die"));
+        }
+    };
+    let (rdev, did, family) = match find_router() {
+        Some(r) => r,
+        None => {
+            serial_println!(
+                "[ioapic] pirq fn={}:{}.{} pin=INT{} -> n/a reason=no-pirq-router — no ISA bridge on bus 0 is a PIRQ router this rung reads (ich9 8086:2910-291f, pch7 8086:1e40-1e5f) == witness ::",
+                bus, dev, func, pin_name
+            );
+            return Err(Pirq::NotApplicable("no-pirq-router"));
+        }
+    };
+    let rout_ad = unsafe { crate::arch::pci::read_config_32(0, rdev, 0, 0x60) };
+    let rout_eh = unsafe { crate::arch::pci::read_config_32(0, rdev, 0, 0x68) };
+    let rout = |n: u32| -> u8 {
+        if n < 4 { (rout_ad >> (8 * n)) as u8 } else { (rout_eh >> (8 * (n - 4))) as u8 }
+    };
+    let rcba_reg = unsafe { crate::arch::pci::read_config_32(0, rdev, 0, 0xF0) };
+    let rcba = (rcba_reg & 0xFFFF_C000) as u64;
+    if rcba_reg & 1 == 0 || rcba == 0 {
+        serial_println!(
+            "[ioapic] pirq bdf=0:{}.0 id=8086:{:04x} family={} rcba_reg={:#010x} fn={}:{}.{} pin=INT{} -> REFUSED reason=rcba-disabled — the Device Interrupt Route registers live behind RCBA and it is not enabled, so the pin's PIRQ is unknown == witness ::",
+            rdev, did, family, rcba_reg, bus, dev, func, pin_name
+        );
+        return Err(Pirq::Refused("rcba-disabled"));
+    }
+    // Same discipline as the census: map the window rather than assume the boot map carries it.
+    crate::arch::memory::map_mmio_window(rcba + 0x3000, 0x1000);
+    let dnir = unsafe { core::ptr::read_volatile((rcba + dnir_off as u64) as *const u16) };
+    if dnir == 0xFFFF {
+        serial_println!(
+            "[ioapic] pirq bdf=0:{}.0 id=8086:{:04x} family={} rcba={:#x} fn={}:{}.{} pin=INT{} d{}ir={:#06x} -> REFUSED reason=dnir-unreadable — an unclaimed read, so the pin's PIRQ is unknown == witness ::",
+            rdev, did, family, rcba, bus, dev, func, pin_name, dev, dnir
+        );
+        return Err(Pirq::Refused("dnir-unreadable"));
+    }
+    // INTA's field is bits 2:0, INTB's 6:4, INTC's 10:8, INTD's 14:12.
+    let idx = ((dnir >> (4 * (pin as u16 - 1))) & 0x7) as u32;
+    let r = rout(idx);
+    let pirq_name = (b'A' + idx as u8) as char;
+    if r & 0x80 != 0 {
+        serial_println!(
+            "[ioapic] pirq bdf=0:{}.0 id=8086:{:04x} family={} rcba={:#x} pirqa={:#04x} pirqb={:#04x} pirqc={:#04x} pirqd={:#04x} pirqe={:#04x} pirqf={:#04x} pirqg={:#04x} pirqh={:#04x} fn={}:{}.{} pin=INT{} d{}ir={:#06x} -> pirq={} REFUSED reason=pirq-disabled — IRQEN is set on this PIRQ, which firmware leaves set only on a PIRQ it does not use, so the GSI is not guessed; nothing was written == witness ::",
+            rdev, did, family, rcba,
+            rout(0), rout(1), rout(2), rout(3), rout(4), rout(5), rout(6), rout(7),
+            bus, dev, func, pin_name, dev, dnir, pirq_name
+        );
+        return Err(Pirq::Refused("pirq-disabled"));
+    }
+    let gsi = PIRQ_GSI_BASE + idx;
+    let line = r & 0x0F;
+    let fw_agree = if fw_line == 0 || fw_line == 0xFF {
+        "n/a"
+    } else if fw_line == line {
+        "yes"
+    } else {
+        "no"
+    };
+    serial_println!(
+        "[ioapic] pirq bdf=0:{}.0 id=8086:{:04x} family={} rcba={:#x} pirqa={:#04x} pirqb={:#04x} pirqc={:#04x} pirqd={:#04x} pirqe={:#04x} pirqf={:#04x} pirqg={:#04x} pirqh={:#04x} fn={}:{}.{} pin=INT{} d{}ir={:#06x} -> pirq={} gsi={} line={} fw_line={} fw_agree={} == witness ::",
+        rdev, did, family, rcba,
+        rout(0), rout(1), rout(2), rout(3), rout(4), rout(5), rout(6), rout(7),
+        bus, dev, func, pin_name, dev, dnir, pirq_name, gsi, line, fw_line, fw_agree
     );
     Ok(gsi)
 }

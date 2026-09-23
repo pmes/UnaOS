@@ -388,3 +388,21 @@ FORBID :: EHCI-HID: PASSPERIOD self-test: .* -> FAIL
 REQUIRE :: EHCI-HID: \[\d+\] ISRARM (armed via=(msi addr=0x[0-9a-f]+|ioapic-intx gsi=\d+) vector 0x[0-9a-f]+,|REFUSED reason=[a-z0-9-]+ )
 # The sentence flight 12 printed beside a live I/O APIC. Neither polarity may print it again.
 FORBID there is no IOAPIC in this kernel to route INTx to
+#
+# IOAPIC2 M2 — THE CHIPSET PIRQ ROUTE. Under `UNAOS_IOAPIC=1` the builder places the harness usb-ehci
+# at 0:29.0 (the PCH's EHCI #1 slot) and `ioapic::pirq_gsi` derives its I/O APIC input from the
+# ICH9 LPC's own registers — `D29IR` behind RCBA picks the PIRQ for the function's pin, PIRQ A..H is
+# I/O APIC input 16..23 — which is the path the rMBP's 0:29.0 takes. Measured on that lane:
+#   [ioapic] pirq bdf=0:31.0 id=8086:2918 family=ich9 rcba=0xfed1c000 pirqa=0x0a … pirqd=0x0b …
+#            fn=0:29.0 pin=INTD d29ir=0x3210 -> pirq=D gsi=19 line=11 fw_line=11 fw_agree=yes
+#   [ioapic] armed bdf=0:29.0 gsi=19 vector=0x43 masked=false … unmasked_lo=0x0000a043 …
+# KNOB-NEUTRAL, so both rows are FORBIDs: a knob-off boot prints no `[ioapic]` line and neither can
+# fire there, which is correct — there is no route to judge. `fw_agree=` compares two INDEPENDENT
+# derivations of the same PIRQ: ours (the pin through `D29IR`, then `PIRQ[n]_ROUT` bits 3:0) and
+# firmware's (OVMF computed the Interrupt Line from its own table and wrote it to 0x3C). `no` means
+# one of them is wrong. GO-RED (source mutation, the wrong PIRQ index — `idx + 1`): `pirq=E gsi=20
+# line=10 fw_line=11 fw_agree=no`, and with the typist's 120 events on the wire the vector is never
+# delivered (`ISRARM IRQ DEAD … irq=0`). `masked=` is derived from the entry's read-back bit 16, so
+# an unmask that did not stick reds here and not only in the ISR counters.
+FORBID \[ioapic\] pirq .* fw_agree=no
+FORBID \[ioapic\] armed .* masked=true
