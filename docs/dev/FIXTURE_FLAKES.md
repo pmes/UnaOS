@@ -477,7 +477,7 @@ regression** and must not be re-run away; one with
 was exhausted, which is a new and reportable fact — read `unran=` and the
 `[wcser]` `declined_pct=` beside it.
 
-### 1d. DOCKID `order=false set=false` — **measured 2026-09-22 (FLAKEFIX, rmbp-ledger B150): NOT lost input. MECHANISM CORRECTED 2026-09-22 (FLAKEFIX2, rmbp-ledger B159) FROM THE WIRE: the stale snapshot is the WRITER'S, not the reader's, and the metal half is CLASS 6**
+### 1d. DOCKID `order=false set=false` — **measured 2026-09-22 (FLAKEFIX, rmbp-ledger B150): NOT lost input. MECHANISM CORRECTED 2026-09-22 (FLAKEFIX2, rmbp-ledger B159) FROM THE WIRE: the stale snapshot is the WRITER'S, not the reader's, and the metal half is CLASS 6. BOTH HALVES FIXED 2026-09-22 (DOCKID2, rmbp-ledger B165) — see the SUPERSEDED disposition at the end of this entry; the writer scans at mutation time and the fixture SKIPs a composite that never reconciled**
 
 **Signature on the wire** (`video/dock.rs` `dockid_selftest`, the verdict's own
 format):
@@ -639,7 +639,9 @@ scratch, so a false there is a DIFFERENT defect and not this class); whether
 `count=false` together is a regression, not this entry.
 
 **Disposition — WATCH, fix STILL NOT MADE, and the cure is no longer the one this
-entry used to name.** FLAKEFIX2 held the file and did not write the change, which
+entry used to name.** ⚠ **SUPERSEDED 2026-09-22 by DOCKID2 (B165) — BOTH PIECES ARE
+NOW MADE; read the DISPOSITION SUPERSEDED block below before acting on this
+paragraph, which is kept because it is the diagnosis that was executed.** FLAKEFIX2 held the file and did not write the change, which
 is a decision and is recorded as one: the cure the brief carried (a reader-side
 generation/seqlock) is refuted above by the capture, and the cure the wire asks
 for is a WRITER-SHAPE change — `reconcile` must take its model at the moment it
@@ -666,6 +668,117 @@ be priced separately:
 correct about what they assert. What changed is that they are not asserting it
 about a snapshot that moved — they are asserting it about a rank set that was
 written wrong, or never written at all.
+
+**DISPOSITION SUPERSEDED — BOTH PIECES MADE, 2026-09-22 (DOCKID2, rmbp-ledger
+B165; branch `exec-rmbp-dockid2` off `9d190c4c`, the branch tip is the sha — the
+seat fills it at the fold).** The two paragraphs above are kept because their
+diagnosis is what was executed, verbatim, and the go-red each one asked for was
+built and is quoted here.
+
+**(1) THE RANK'S PROVENANCE — FIXED.** `reconcile` takes no model at all now: it
+calls `wm::dock_scan` itself, immediately before it mutates, so the rows it ranks
+are the rows as they stand AT ADMISSION. The single-writer rule did not move
+(`compose`'s `settle(.., true)` is still the only reconciling caller) and neither
+did LOCKFIX's rule for the router (`press_at` reaches `settle` with
+`reconciling=false`). The cost that DID move is one extra `wm::dock_scan` per
+composite pass — a second acquire of the window table on a path that already takes
+it once, the same lock in the same masked context, no new wait CLASS.
+
+*The widener is not the one suggested above and is better than it.* Rather than
+mint a window inside the gap, the probe HIDES the newest non-furniture row from
+`compose`'s own scan while leaving it in the window table — which is the same real
+event (a window that exists but arrived after the model this pass is carrying was
+taken), is deterministic, and above all is the SAME PROBE ON BOTH TREES, so the A/B
+is one variable. Scratch, in `dock.rs`, reverted before the commit.
+
+```text
+UNFIXED + probe  (host load 9.52, `./arroyo test-ptr 150`, TEST_RC=1)
+  r1-gored-serial.log
+  1635: [wm]   alloc win=3 gen=4 owner=0xd1d3 title="idC"
+  1638: [dock] tile add win=2 gen=5 owner=0xd1d2 seq=9  label=idB   <-- idC NOT admitted
+  1639: [dock] census tiles=5 win:gen=quarry:pin,1:8,2:5,…          <-- idC live and TILELESS
+  1645: [wm]   alloc win=2 gen=6 owner=0xd1d4 title="idD"
+  1648: [dock] tile add win=2 gen=6 owner=0xd1d4 seq=10 label=idD   <-- the YOUNGER window ranks
+  :: DOCKID: tiles=6 … recycle=true order=false set=false furniture=true … reconciled=3/3 folds=0 :: FAIL ::
+
+FIXED + THE SAME PROBE  (host load 21.22, TEST_RC=0)
+  r2-fixed-probe1-serial.log
+  1714: [wm]   alloc win=3 gen=4 owner=0xd1d3 title="idC"
+  1717: [dock] tile add win=3 gen=4 owner=0xd1d3 seq=17 label=idC   <-- elder ranks 17
+  1724: [wm]   alloc win=2 gen=6 owner=0xd1d4 title="idD"
+  1727: [dock] tile add win=2 gen=6 owner=0xd1d4 seq=18 label=idD   <-- younger ranks 18
+  :: DOCKID: tiles=6 … order=true set=true furniture=true … reconciled=3/3 folds=0 :: PASS ::
+```
+
+`17`/`18` are `g2-test-x86-wc.log:2022/2032`'s green ranks character for character,
+reached with the widener still armed. **Note what `reconciled=3/3` does in the RED
+line**: it says the reconcile RAN, so that capture is defect (1) and provably not
+the Class 6 decline — the new field separates the two defects on the wire, which no
+capture in this entry's history could do.
+
+**THE RESIDUAL, NAMED.** Two windows allocated between one reconcile and the next
+are still admitted in ONE pass, and that pass walks them in window-table (id)
+order, so a recycled low id can still take the lower of the two ranks. Closing that
+needs an allocation stamp the window table does not carry — `wm::DockEntry` has
+`id`, `owner_asid`, `title`, `title_len`, `visible`, `focused` and nothing monotone
+— so it is a `video/wm.rs` change and was not made here. It is not the measured
+defect: in `gored-b3-serial.log` the two windows are eleven lines and one whole
+reconcile apart, and the fix collapses the miss window from a whole composite pass
+to the few instructions between `dock_scan` returning and the admit loop reading it.
+
+**(2) THE DECLINED COMPOSITE — FIXED, AND ALL THREE METAL SIGHTINGS ARE CLEARED.**
+`strip_model` drives `composite_reconciled()` instead of a bare `wm::composite()`:
+it asks the dock's own reconcile counter whether the pass reached `dock::compose`,
+waits the holder out bounded (250 ms) and re-drives, and the verdict gains
+`reconciled=<ran>/<drives> folds=<n>`. `ran < drives` is `:: SKIP ::` with its own
+`reconciled=false` witness line — never a PASS (nothing was measured), never a FAIL
+(a FAIL there convicts the kernel of a defect the capture does not show, which is
+exactly what flights 8 and 11 did). DMGFLAKE's `composite_live` (B158) is the same
+shape one layer up; it is a closure local to `wm::dmgovlp_selftest` and nothing
+exports it, so this is the pattern reused and not the code. The witness is
+deliberately the dock's reconcile counter and not `WCSER_DECLINED`: the latter
+answers "did `COMP_GATE` turn a pass away", the former answers the question the
+fixture actually has, and is also false when a pass is refused above the gate
+(PANELREFUSE Tier 1).
+
+```text
+DECLINE PROBE + the decline-AWARE fixture  (host load 11.19, TEST_RC=1)
+  r6-probe2-serial.log — ZERO `[dock] tile add`/`census` lines in the whole capture,
+  f11's metal shape reached deterministically instead of by five racing cores
+  :: DOCKID: declined drives=3 ran=0 folds=765 budget_ms=250 reconciled=false — … -> SKIP ::
+  :: DOCKID: tiles=6 … order=false set=false furniture=true … reconciled=0/3 folds=765 :: SKIP ::
+
+THE SAME PROBE + the decline-BLIND fixture restored  (host load 8.70, TEST_RC=1)
+  r7-reintro-serial.log
+  :: DOCKID: tiles=6 … recycle=true order=false set=false furniture=true … :: FAIL ::
+  f11.log:3298  :: DOCKID: tiles=7 … recycle=true order=false set=false furniture=true … :: FAIL ::
+```
+
+The six legs read identically across the re-introduction and the metal sighting,
+which is what makes the probe and the flake the same event.
+
+**THE SPEC HOLE THIS ARC ALSO FOUND, and it is the larger finding of the two.**
+`:: DOCKID:` was pinned by **no directive in any spec** — B159's and B150's reds,
+and all three metal sightings, were convicted by `mbench`'s builtin
+DEFAULT_FORBIDS seeing a bare `:: FAIL ::` and nothing else. So the fixture could
+have stopped running entirely and no gate would have said a word. `x86-wc.spec`
+now carries the pin, in pi4-regression.spec:2032/2052's REQUIRE-or-skip +
+FORBID-the-skip shape: a REQUIRE that accepts PASS or SKIP (so absence reds, and
+the honest `fixture — table full` arms stay legal) and two FORBIDs closing the
+declined-composite arm on the lane where a reconcile must run. Replays quoted in
+B165: green 15/15 required / 0 forbidden; the declined capture 15/15 required /
+**2 forbidden hit** — both spellings fire.
+
+**Disposition — CLOSED for both pieces, with the residual above named and owned by
+`video/wm.rs`.** THREE consecutive greens under load on the fixed tree, no probe
+(host 27.92 / 30.47 / 31.30 on 20 cores, sibling QEMUs live), all
+`order=true set=true furniture=true reconciled=3/3 folds=0`, `TEST_RC=0` ×3. What
+is still OWED is the METAL reading: flight 12 must print `reconciled=` on the
+DOCKID line, and that field is the prediction — `reconciled=3/3` with a PASS, or
+`reconciled=<r>/3` with a SKIP, but a FAIL carrying `reconciled=3/3` would mean the
+metal half was never Class 6 and this entry is wrong about it. `folds=` on metal is
+the first measurement anyone will have of how hard five real cores hold `COMP_GATE`
+against a boot-task fixture.
 
 ---
 

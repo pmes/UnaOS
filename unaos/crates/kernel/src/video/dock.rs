@@ -2249,7 +2249,7 @@ pub fn dockid_selftest() {
     /// reconcile left to `compose`, a dead fold empties the registry, every app tile falls back to
     /// `RANK_UNSEEN + id`, the strip returns to WINDOW-ID order, and legs 2 and 3 go red.
     fn strip_model(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS]) -> usize {
-        wm::composite();
+        composite_reconciled(); // DOCKID2 — WAS a bare `wm::composite();`, and that bare call is the whole of the Class 6 half of §1d. `composite()` returns IDENTICALLY whether it ran a pass or was DECLINED by `COMP_GATE`, so on the three rMBP metal sightings this fixture drove six composites, reached `dock::compose` NOT ONCE (`gmux8-logs/f11.log:3256..3298` — six `[wm] alloc` lines and ZERO `[dock] tile add`/`remove`/`census` between them and the verdict, where `compose` reconciles UNCONDITIONALLY ahead of the panel snapshot's early-out and PRINTS on every admit) and then scored a registry no pass had ever written. The helper drives the same `composite()`, asks [`RECONCILES`] whether it reached the dock, waits the holder out BOUNDED and retries, and counts drives/runs/folds for the verdict. DMGFLAKE's `composite_live` (B158, `video/wm.rs` `dmgovlp_selftest`) is the same shape one layer up; it is a non-capturing CLOSURE local to that fixture and cannot be called from here, so this is the pattern reused, not the code. ⚠ SAME-LINE fold, line-NEUTRAL (B94).
         let (n, _) = wm::dock_scan(rows, (0, 0, 0, 0));
         let n = pin_console(rows, n);
         let n = pin_shell(rows, n);
@@ -2405,9 +2405,9 @@ pub fn dockid_selftest() {
     wm::focus_changed(saved_focus);
 
     let ok =
-        recycle_ok && order_ok && set_ok && furniture_ok && count_ok && chain_ok && press_ok;
+        recycle_ok && order_ok && set_ok && furniture_ok && count_ok && chain_ok && press_ok; let (drives, ran, folds) = (DOCKID_DRIVES.load(Ordering::Relaxed), DOCKID_RAN.load(Ordering::Relaxed), DOCKID_FOLDS.load(Ordering::Relaxed)); if ran < drives { serial_println!(":: DOCKID: declined drives={} ran={} folds={} budget_ms={} reconciled=false — a composite this fixture DROVE never reached `dock::compose` within the budget, so the tile registry the six legs below read was never written by a pass and is NOT SCORED. A stated skip is a property (LAWS §5): scored as a FAIL this convicts the kernel of a defect the capture does not show, and scored as a PASS it certifies a registry nothing produced. FIXTURE_FLAKES §1d Class 6, the three rMBP metal sightings (flights 8 and 11) -> SKIP ::", drives, ran, folds, DOCKID_FOLD_WAIT_MS); } // DOCKID2 — ⚠ SAME-LINE fold, line-NEUTRAL (B94). The REASON goes on its own line and the verdict below keeps its grammar: `:: DOCKID: .* reconciled=false` is the FORBID that closes this arm on the lanes where a reconcile must run (x86-wc.spec), the REQUIRE-or-skip + FORBID-the-skip shape pi4-regression.spec:2032/2052 states.
     serial_println!(
-        ":: DOCKID: tiles={} closed=win{} reopened=win{} recycle={} order={} set={} furniture={} count={}/{} pins={}/{} press={} :: {} ::",
+        ":: DOCKID: tiles={} closed=win{} reopened=win{} recycle={} order={} set={} furniture={} count={}/{} pins={}/{} press={} reconciled={}/{} folds={} :: {} ::",
         n,
         w[1],
         w[3],
@@ -2420,7 +2420,7 @@ pub fn dockid_selftest() {
         chain_ok,
         chain,
         if press_ran { if press_ok { "yes" } else { "no" } } else { "skip" },
-        if ok { "PASS" } else { "FAIL" }
+        ran, drives, folds, if ran < drives { "SKIP" } else if ok { "PASS" } else { "FAIL" } // DOCKID2 — ⚠ SAME-LINE fold, line-NEUTRAL (B94). `reconciled=<ran>/<drives>` is the leg the three metal sightings were missing: it says how many of the composites this fixture DROVE actually reached `dock::compose`. `folds=` is the wall it spent waiting a `COMP_GATE` holder out — REPORTED, never gated (LAWS §5); it bounds a RETRY and no verdict term reads it. SKIP dominates PASS and FAIL because an unwritten registry leaves every leg beside it UNMEASURED, not failed.
     );
 }
 
@@ -2701,10 +2701,83 @@ fn pins_census_once(rows: &[wm::DockEntry; wm::MAX_WINDOWS], n: usize) {
 // the compose path only. The cost that DID move is one extra `wm::dock_scan` per composite pass — a
 // second acquire of the window table on a path that already takes it once, the same lock in the same
 // masked context, no new wait CLASS — and the `[dock]` ledger tail is where it is measured.
-// # 2. The fixture that scores this registry is the NEXT commit's, and it is not optional
 //
-// `dockid_selftest` drives `wm::composite()` and then reads the registry this function writes — and
-// `composite()` returns IDENTICALLY whether it ran a pass or was DECLINED by `COMP_GATE`. Until that
-// is fixed the fixture can score a registry NO pass has written, which is what all three rMBP metal
-// sightings did (FIXTURE_FLAKES §1d, Class 6). [`RECONCILES`] above is the witness that closes it and
-// is landed HERE, with the writer it belongs to; the reader arrives in the commit after this one.
+// # 2. The fixture scored a registry that no pass had written
+//
+// `dock::compose` reconciles UNCONDITIONALLY, ahead of the panel snapshot's early-out, and PRINTS on
+// every admit and every retire. So an ABSENCE of `[dock] tile add` over a whole fixture is not a
+// quiet reconcile — it is NO reconcile. `gmux8-logs/f11.log:3256..3298` has six `[wm] alloc` lines,
+// zero `[dock]` lines, and then `:: DOCKID: … order=false set=false … :: FAIL ::`. `wm::composite()`
+// had been DECLINED — `COMP_GATE` held by a sibling core, five real ones on the rMBP — and the
+// fixture scored the registry that call was supposed to publish. That is Class 6 word for word, and
+// it is the mechanism DMGFLAKE (B158) found and closed in `[dmgovlp]` one layer up.
+//
+// [`composite_reconciled`] is that cure here. It is DMGFLAKE's shape and not DMGFLAKE's code:
+// `composite_live` is a non-capturing closure local to `wm::dmgovlp_selftest` and nothing exports
+// it, so the pattern is reused from the outside. The witness is different too, and deliberately —
+// `WCSER_DECLINED` answers "did `COMP_GATE` turn a pass away", [`RECONCILES`] answers the question
+// the fixture actually has, "did the registry get written", which is also false when a pass is
+// refused for a reason `COMP_GATE` knows nothing about (PANELREFUSE Tier 1 declines the whole pass
+// above the gate, on both arches).
+//
+// The verdict gains `reconciled=<ran>/<drives> folds=<n>`, and `ran < drives` makes it `:: SKIP ::`
+// with its own witness line carrying `reconciled=false`. Never a PASS — nothing was measured. Never
+// a FAIL — a FAIL here convicts the kernel of a defect the capture does not show, which is what all
+// three metal sightings did. A stated skip is a property (LAWS §5), and the spec closes the arm
+// where it must not fire: `x86-wc.spec` FORBIDs `:: DOCKID: .* reconciled=false` beside a REQUIRE
+// that accepts PASS or SKIP — pi4-regression.spec:2032/2052's shape, where the REQUIRE catches the
+// ABSENCE that `mbench`'s DEFAULT_FORBIDS structurally cannot see and the FORBID catches the skip.
+
+/// DOCKID2 — the fixture's fold budget in milliseconds. DMGFLAKE's `FOLD_WAIT_MS` reasoning, applied
+/// to this fixture's own pass: comfortably over the worst honest TCG composite tail (`[comp2]
+/// pass_us` means ~4 ms, 170 ms observed tail) and far under any wedge threshold, so waiting a
+/// holder out can never mask a hang — a hang exhausts the budget and SKIPs, which is a report.
+#[cfg(feature = "witness")]
+const DOCKID_FOLD_WAIT_MS: u64 = 250;
+/// DOCKID2 — spins between wall re-reads while a holder is waited out. `wm`'s `COMP_GATE` is private
+/// to that module, so unlike `composite_live` this loop cannot watch the gate itself; it paces on the
+/// wall alone and simply re-drives. Conservative in the only direction that matters: it costs a
+/// re-composite, never a verdict.
+#[cfg(feature = "witness")]
+const DOCKID_FOLD_SPIN_MAX: u32 = 4096;
+/// DOCKID2 — composites [`dockid_selftest`] drove.
+#[cfg(feature = "witness")]
+static DOCKID_DRIVES: AtomicU64 = AtomicU64::new(0);
+/// DOCKID2 — of those, the ones that reached [`reconcile`]. `ran < drives` is the SKIP.
+#[cfg(feature = "witness")]
+static DOCKID_RAN: AtomicU64 = AtomicU64::new(0);
+/// DOCKID2 — re-drives spent waiting a holder out. REPORTED on the verdict, never gated on.
+#[cfg(feature = "witness")]
+static DOCKID_FOLDS: AtomicU64 = AtomicU64::new(0);
+
+/// DOCKID2 — **drive a composite and know whether it reconciled.** Returns `true` iff the registry
+/// was written by a pass during this call.
+///
+/// `wm::composite()` returns identically whether it ran or was declined, so the answer comes from
+/// [`RECONCILES`] instead: a delta means `dock::compose` ran its `settle(.., true)`. A SIBLING core's
+/// compose moves the same counter and is counted as success — correctly, because the fixture's
+/// question is whether the registry was written while its windows were live, not by whom. The
+/// declined pass CLEARS NOTHING, so the damage it did not service is still on the table and the
+/// re-drive carries it.
+#[cfg(feature = "witness")]
+fn composite_reconciled() -> bool {
+    DOCKID_DRIVES.fetch_add(1, Ordering::Relaxed);
+    let w0 = crate::arch::ms();
+    loop {
+        let r0 = RECONCILES.load(Ordering::Relaxed);
+        wm::composite();
+        if RECONCILES.load(Ordering::Relaxed) != r0 {
+            DOCKID_RAN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        DOCKID_FOLDS.fetch_add(1, Ordering::Relaxed);
+        if crate::arch::ms().wrapping_sub(w0) >= DOCKID_FOLD_WAIT_MS {
+            return false;
+        }
+        let mut spins = 0u32;
+        while spins < DOCKID_FOLD_SPIN_MAX && crate::arch::ms().wrapping_sub(w0) < DOCKID_FOLD_WAIT_MS {
+            spins += 1;
+            core::hint::spin_loop();
+        }
+    }
+}

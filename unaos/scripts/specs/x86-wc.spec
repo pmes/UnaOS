@@ -184,6 +184,44 @@ FORBID :: SERIALDOOR: .* :: FAIL ::
 # --- prints one has scored nothing, which is the only thing a spec must never call a pass.
 FORBID :: SERIALDOOR: .* :: SKIP ::
 
+# --- DOCKID (DOCKID2, 2026-09-22; rmbp-ledger B165, FIXTURE_FLAKES §1d) — A FOURTH FIXTURE THIS
+# --- GATE COULD SCORE AND DID NOT. `dockid_selftest` has printed `:: DOCKID: … :: FAIL ::` on this
+# --- bench twice in 46 QEMU boots and three times on the rMBP's own metal (flights 8 and 11), and
+# --- NO directive in ANY spec named it: every one of those reds was convicted by `mbench`'s builtin
+# --- DEFAULT_FORBIDS seeing the bare `:: FAIL ::` and nothing else. That is the hole this whole
+# --- block exists to close, and it means the fixture could have stopped running entirely without a
+# --- single gate noticing — which is not hypothetical here, because the SKIP arm below is new.
+# ---
+# --- THE REQUIRE IS SHAPED FOR THREE THINGS AT ONCE. (a) ABSENCE, which DEFAULT_FORBIDS
+# --- structurally cannot see — it reads a FAIL, never a missing line (pi4-regression.spec:2042
+# --- states the same argument). (b) THE NEW FIELDS: `reconciled=<ran>/<drives> folds=<n>` is
+# --- DOCKID2's Class 6 leg and a later fold that drops it must red HERE rather than silently
+# --- narrowing what the verdict asserts — the standing reason this file gives at DMGOVLP and
+# --- MENUDROP. (c) THE HONEST SKIPS, which are kept legal: the fixture's two `fixture — table full`
+# --- arms are real properties of a full window table and are matched by the second alternative, so
+# --- this rule reds on a LOST fixture and never on a declined one.
+REQUIRE :: DOCKID: (.* reconciled=\d+/\d+ folds=\d+ :: (PASS|SKIP) ::|fixture — table full.* :: SKIP ::)
+FORBID :: DOCKID: .* :: FAIL ::
+# --- AND THE SKIP ARM IS CLOSED ON THIS LANE, which is the half that carries the new risk. DOCKID2
+# --- gave the fixture the declined step's own reading: `wm::composite()` returns identically whether
+# --- it ran a pass or was DECLINED by `COMP_GATE`, so `composite_reconciled` asks the dock's own
+# --- reconcile counter, waits the holder out BOUNDED (250 ms) and retries, and prints
+# --- `:: DOCKID: reconciled=false … -> SKIP ::` when a composite it drove never reached
+# --- `dock::compose`. That is the right verdict on METAL, where five real cores hold the gate and
+# --- all three sightings are exactly this. It is NOT an honest outcome HERE: on this lane the
+# --- fixture runs on the boot task and drives its own composites, and 250 ms is over fifty times
+# --- the mean honest TCG pass (`[comp2] pass_us=4265`), so a run that still could not reconcile has
+# --- a contention problem this gate must report and not swallow. REQUIRE-or-skip above,
+# --- FORBID-the-skip here — pi4-regression.spec:2032/2052's shape, and the reason a widened
+# --- assertion was refused: the skip is a PROPERTY, and a property is pinned, not hidden.
+FORBID :: DOCKID: .* reconciled=false
+# --- BOTH SPELLINGS, because one of them can go missing and the other must still bite: the line
+# --- above is the fixture's REASON line, the one below is the VERDICT carrying the same outcome as
+# --- `:: SKIP ::` with its `reconciled=<ran>/<drives>` short. The honest `fixture — table full`
+# --- skips match NEITHER — they are properties of a full window table, not of a declined pass, and
+# --- the REQUIRE above keeps them legal.
+FORBID :: DOCKID: .* reconciled=\d+/\d+ folds=\d+ :: SKIP ::
+
 # --- W5SPIN — THE CENSUS, and it is pinned for PRESENCE and not for a value. `spin=`/`wedge=` are
 # --- the per-window shadow-acquire counters `pace_shadow_acquire` feeds (video/wm.rs:2049, census
 # --- at :2288), appended to the per-window `[wpace] … mode=panel` line. On a healthy QEMU boot they
