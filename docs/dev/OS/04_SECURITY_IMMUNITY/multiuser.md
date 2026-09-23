@@ -240,3 +240,48 @@ row on every later boot, the password field, the button, and after Log Out the s
 row on it and every window of the session gone. A second login is `home=/home/<name> exists` with the
 same serial. If any of these lines differ in ORDER, or `iters=` reads below 10000, or `source=` reads
 `jitter` on the rMBP, the prediction is false and the row that owns the line is B169.
+
+### 7.1 The aarch64 reading (ARMUSERS, rmbp-ledger B188, 2026-09-23)
+
+Until B188 the aarch64 halves of M1-M5 were type-checked and never run: `test-arm` under
+`login,loginst,virt_el0` booted to `:: CAPSTONE COMPLETE` with zero `[users]` lines. The GICv3 virt
+boot (`UNAOS_GICV3=1`, which `virt_el0` needs) drops EL2 -> EL1 inside `kernel_main`'s `is_v3()` branch
+and diverges into `run_capstone_boot_core`, before `arch::pci::init` and before the shared main loop
+whose storage pass carries `users::service()`. `main.rs::virt_users_pass` is that storage pass, run
+bounded at EL2 before the drop. The tegra console pump (`jd2_console_pump`) gets the per-pass call
+orin-ledger A91 named, compile-proven only (no QEMU models Tegra234).
+
+Measured on `env UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 UNAOS_LOGIN=1 UNAOS_LOGINST=1 UNAOS_FATIMG=sf
+./arroyo test-arm 120` (QEMU `virt`, cortex-a72), the first boot on a fresh stick — selected lines,
+in wire order (the full capture is quoted in B188's commit message):
+
+```text
+[rand] source=jitter probe=id_aa64isar0_el1.rndr=0 bits=256
+[users] load volume=el0-fat(rw) src=none users=0 (fresh store) next_uid=16415479
+[users] kdf calibrated iters=60606 ms=250 (probe=8000 took 33 ms; target 250 ms; floor 10000)
+[users] home=/home/una created volume=24b4bba3
+[users] login ok user=una id=16415479 principal=user:una#16415479
+[users] logout epoch=3 ended=0 windows=0 (SO37: …; M3: …)
+[armusers] virt storage pass serviced=true passes=185 ms=3643 block=up wall=60000 (…)
+[login] ignition desktop_up=false console_routed=false -> HELD (SO43: …)
+```
+
+The second boot on the same stick reads `src=dat users=1 seq=12 ver=2`, and the home line
+`exists` with the same serial. Every `loginst` verdict the lane can run is PASS (`LOGIN`,
+`LOGIN-EPOCH`, `LOGIN-HARD`, `LOGIN-IDENT`, `LOGIN-KOWN`, `LOGIN-RAND`); `unaos/scripts/specs/arm-login.spec`
+pins them. How this differs from the flight-12 prediction above, and why:
+
+- **No screen.** The virt lane compiles no desktop (`desktop_firmware` is not armed there), so the
+  SO43 seam HOLDS. The screen fixtures stay x86-only on QEMU; the Orin's render card is where the
+  aarch64 screen runs.
+- **`source=jitter`.** The QEMU CPU has no FEAT_RNG. An ARMv8.5 core with RNDR reads `rndr`.
+- **`ended=0`.** No program is launched under a session on this lane; `LOGIN-END`'s launch leg is
+  x86-only (`login_end_fixture`), and the aarch64 walk runs on every Log Out with nothing to end.
+- **`LOGIN-KOWN` is a verdict here** (`resolver=refused errno=-13,-13`): the aarch64 `open_locate`
+  guard refuses the credential file.
+
+**The Orin's half is owed to a flight.** A card with `UNAOS_LOGIN=1` should print `[users] load
+volume=el0-fat(…)` once its block device answers, before or after the screen's first open (the
+screen's `submit` loads the store itself), and with `loginst` the same verdict lines as above. If no
+`[users] load` line appears on an Orin login boot, the console pump never saw a block device, and the
+row that owns the line is B188.

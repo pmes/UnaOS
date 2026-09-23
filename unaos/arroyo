@@ -3863,11 +3863,8 @@ scan_serial_faults() { # $1 = log file, $2 = label used in the quoted lines
 #
 # NOT DECLARED IS NOT SKIPPED. A verb with no row here prints a loud UNDECLARED line and the run is
 # left at whatever verdict its other checks reached — it must never read as "completeness verified".
-# `test-arm` is that case today and is owed: the aarch64 virt boot's `:: CAPSTONE COMPLETE` is
-# printed by `capstone_body` (arch/aarch64/sched.rs:8333) and is the obvious candidate, but that
-# line is scoped by `pi4-regression.spec`/`jetson-sync1.spec` to captures those specs cover, and
-# declaring it for `test-arm` without measuring the virt boot's own tail would be asserting a marker
-# this verb does not own. Measured and declared in its own commit, not guessed at in this one.
+# `test-arm` WAS that case until ARMUSERS (rmbp-ledger B188, 2026-09-23); its two rows are below the
+# `test` rows, keyed by the GIC regime, because the one verb boots two different ladders.
 #
 # THE PRECONDITION IS STRUCTURAL, NOT ASSUMED: the ladder is `witness`-reached, and `test` cannot be
 # run without it — the case at :49 does `export UNAOS_WITNESS="${UNAOS_WITNESS:-1}"` for exactly the
@@ -3877,19 +3874,43 @@ scan_serial_faults() { # $1 = log file, $2 = label used in the quoted lines
 LADDER_TAIL_test=':: PULSE-W:|:: zeolite:'
 LADDER_CENSUS_test=':: U8x:|:: U9x:|:: WINX-1:|:: WINX-2:|:: WINX-3:|:: WINX-7:|:: DMG-REFUSE:|:: WINX-8:|:: PULSE-W:|:: zeolite:'
 
+# `test-arm` — ARMUSERS (rmbp-ledger B188). ONE VERB, TWO LADDERS, so two rows keyed by the regime
+# `test_aarch64` hands in (`UNAOS_GICV3` set or not; the kernel runtime-detects the same fact with
+# `gic::is_v3()` and the two boots share nothing after that branch). Each marker was MEASURED as the
+# last one-shot line of its own boot, never chosen from the source:
+#   gicv3  `kernel_main`'s `is_v3()` branch drops EL2 -> EL1 and diverges into `run_capstone_boot_core`,
+#          which never returns; `capstone_body` (arch/aarch64/sched.rs:8333) prints `:: CAPSTONE
+#          COMPLETE` once, as the last line of the capture — measured on this branch's
+#          `UNAOS_GICV3=1 UNAOS_VIRT_EL0=1 UNAOS_LOGIN=1 UNAOS_LOGINST=1 UNAOS_FATIMG=sf` capture
+#          (line 376 of 376) and on APPCLIP's plain GICv3 capture (the last of 122). It prints on no
+#          GICv2 boot and nothing else prints it.
+#   gicv2  the boot falls through to the shared main loop and never ends; its last ONE-SHOT line is
+#          `log_summary_once` (drivers/xhci/mod.rs:733) — the topology summary and its three census
+#          lines, printed on the loop's 2000th pass and closed by `:: BOT: tx single=… result=SIZES ::`
+#          (:806, its one emitter). Measured on VFSOWNED's plain capture (line 667 of 673, after
+#          `MISSION SUCCESS` at 529 and the usb-write witness at 642; only periodic rollups follow).
+#          ⚠ It is a PASS-COUNT point, not the end of every knob's work: a fixture a knob adds later
+#          in the loop can print after it, and this row does not certify such a fixture — a spec does
+#          (`arm-login.spec` names its own COMPLETE for exactly that reason).
+LADDER_TAIL_test_arm_gicv3=':: CAPSTONE COMPLETE'
+LADDER_CENSUS_test_arm_gicv3=':: JC3: SMP proof done|:: AARCH64 SCHED (virt):|:: CAPSTONE: verifying all 6|:: CAPSTONE COMPLETE'
+LADDER_TAIL_test_arm_gicv2=':: BOT: tx single='
+LADDER_CENSUS_test_arm_gicv2='MISSION SUCCESS|[usbw] write lba=|xHCI: === USB topology summary ===|:: BOT: tx single='
+
 # Assert a capture reached its verb's declared ladder tail. 0 = complete, 5 = truncated / no verdict,
 # 3 = nothing declared for this verb (reported, never silently green). awk with `index()`, never
 # `grep`: the tokens carry brackets and the serial logs carry control bytes (LAWS §5 Logs).
-ladder_tail_check() { # $1 = log file, $2 = verb label (the LADDER_TAIL_<label> suffix)
-    local logf="$1" lbl="${2:-test}" key term census
-    key="${lbl//-/_}"   # `test-arm` is not a shell identifier; the table is keyed on the underscored form
+ladder_tail_check() { # $1 = log file, $2 = verb label (the LADDER_TAIL_<label> suffix), $3 = optional regime (B188: `test-arm`'s gicv2|gicv3)
+    local logf="$1" lbl="${2:-test}" key term census verb="${2:-test}"
+    key="${lbl//-/_}${3:+_$3}"   # `test-arm` is not a shell identifier; the table is keyed on the underscored form (plus the regime, when the verb boots more than one ladder)
+    lbl="${lbl}${3:+/$3}"
     eval "term=\"\${LADDER_TAIL_${key}:-}\"; census=\"\${LADDER_CENSUS_${key}:-}\""
     if [ -z "$term" ]; then
         echo -e "${COLOR_YELLOW}⚡ ladder: no terminal marker is DECLARED for '${lbl}' — this run's COMPLETENESS was not checked (only its fault scan was). Not a pass for truncation; see LADDER-TAIL in this file.${COLOR_RESET}"
         return 3
     fi
     [ -f "$logf" ] || { echo -e "${COLOR_RED}✖ ladder: ${logf} is not there to read — no completeness verdict.${COLOR_RESET}"; return 5; }
-    awk -v term="$term" -v census="$census" -v lbl="$lbl" '
+    awk -v term="$term" -v census="$census" -v lbl="$lbl" -v verb="$verb" '
         BEGIN { nt = split(term, T, "|"); nc = split(census, C, "|"); far = 0; hit = 0; hitln = 0 }
         {
             for (i = 1; i <= nc; i++) if (index($0, C[i])) { if (!seen[i]) { seen[i] = 1; nseen++ } ; if (i > far) far = i }
@@ -3910,7 +3931,7 @@ ladder_tail_check() { # $1 = log file, $2 = verb label (the LADDER_TAIL_<label> 
             else         printf("    furthest rung : NONE — not one of the %d declared rungs appears in these %d line(s). Two readings, in order of how often each is true: the wall ended BEFORE the ladder started (the common case — `./arroyo test 12` on this box ended at 1091 lines with no rung on the wire, where a healthy `test 90` capture carries the first rung at line 1102), or the census names families this build no longer prints. Check the wall first, then the census.\n", nc, FNR)
             printf("    This run carries NO VERDICT: a clean fault scan over a capture that stops mid-ladder\n")
             printf("    proves only that the fixtures which DID run were clean. Exit 5.\n")
-            printf("    Give it more wall (./arroyo %s <secs>) or run it on a quieter box — this verdict is\n", lbl)
+            printf("    Give it more wall (./arroyo %s <secs>) or run it on a quieter box — this verdict is\n", verb)
             printf("    LOAD-DEPENDENT and that is exactly what it exists to stop being silent about.\n")
             exit 5
         }
@@ -4159,10 +4180,10 @@ test_aarch64() {
         echo -e "${COLOR_RED}❌ aarch64 test FAILED — the serial log carries fault text (lines above). Log at ${logf}${COLOR_RESET}"
         return 1
     fi
-    # LADDER-TAIL: wired here and NOT exempted, so the day a terminal marker is DECLARED for the
-    # aarch64 virt boot this leg gets the truncation verdict by adding one table row and nothing
-    # else. Until then it prints the UNDECLARED line (rc 3) — reported, never silently green.
-    local ltrc=0; ladder_tail_check "$logf" "test-arm" || ltrc=$?
+    # LADDER-TAIL (ARMUSERS, rmbp-ledger B188): the terminal marker is DECLARED per GIC regime — the
+    # two rows beside `test`'s in the LADDER-TAIL block — so a capture that ends before its boot's
+    # last one-shot line is exit 5, NO VERDICT, and never the green below.
+    local ltrc=0 regime=gicv2; if [ -n "${UNAOS_GICV3:-}" ]; then regime=gicv3; fi; ladder_tail_check "$logf" "test-arm" "$regime" || ltrc=$?
     if [ "$ltrc" -eq 5 ]; then
         echo -e "${COLOR_RED}❌ aarch64 test carries NO VERDICT — the capture is TRUNCATED (lines above): not a pass, not a regression. Log at ${logf}${COLOR_RESET}"
         return 5

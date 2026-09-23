@@ -400,7 +400,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // window (PL011/GIC), and the firmware framebuffer may live outside both (e.g. a high PCI BAR), so
         // a serial_println! that mirrored to it would fault at EL1. Serial itself (PL011, in the mapped
         // Device window) stays live, so the CAPSTONE log is captured regardless.
-        unaos_kernel::video::fbcon::detach();
+        unaos_kernel::video::fbcon::detach(); #[cfg(all(feature = "login", not(feature = "skip_xhci")))] virt_users_pass(dtb_addr, dtb_size); // ARMUSERS (rmbp-ledger B188) — the users service on the GICv3 virt path. This branch diverges into `run_capstone_boot_core` below, BEFORE `arch::pci::init` and the storage pass of the shared main loop that carries `users::service` (further down this fn), so until this fold `login`+`loginst` on `UNAOS_GICV3=1 ./arroyo test-arm` compiled every aarch64 fixture and ran none. Here, at EL2 with the heap up and the drop not yet taken — the VNET precedent above. See `virt_users_pass` at this file's tail. ⚠ LINE-NEUTRAL fold, CODE BEFORE COMMENT (P7).
         serial_println!(
             ":: JC3: SMP proof done; dropping the virt boot core EL2 -> EL1 for the scheduler + CAPSTONE ::"
         );
@@ -2937,7 +2937,7 @@ fn jd2_console_pump(_arg: usize) {
     loop {
         if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() {
             x.poll_events();
-        } #[cfg(feature = "orinrx")] unaos_kernel::arch::serial::serialrx::drain(); // SERIALRX (ORINRX) — phase-2 twin of the phase-1 drain above (see that line). ⚠ LINE-NEUTRAL append.
+        } #[cfg(feature = "orinrx")] unaos_kernel::arch::serial::serialrx::drain(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); // SERIALRX (ORINRX) — phase-2 twin of the phase-1 drain above (see that line). ⚠ LINE-NEUTRAL append. ARMUSERS (rmbp-ledger B188, orin-ledger A91's own fix) — the users service's per-pass call on the tegra console pump, the one aarch64 main loop that had none; it returns at once until a block device answers and latches after one load. Compile-proven only (R39: no QEMU models Tegra234); its wire is owed to an Orin flight.
         let cursor_was_visible = cursor::visible();
         let mut needs_render = false;
         // A key repaints the console into the back buffer; when that happens the cursor was erased
@@ -10589,4 +10589,64 @@ fn render_service(_: usize) {
         "[rendconv] service=render wait=channel input=owned family=3 -> RENDER-CONVERGED == witness ::"
     );
     render_pass(&mut ChannelWait::new());
+}
+
+// ── ARMUSERS (rmbp-ledger B188; orin-ledger A91; rmbp-ledger B169's aarch64 half) ──────────────────
+// THE SITE, measured at 98fd8e66. `fs::users::service()` is called from exactly three places in this
+// file, each a storage-ready pass: the `usbdebug` terminal loop, the SHARED main loop that ends
+// `kernel_main` (x86 reaches it only when the SCHED-X86 handoff to `run_bsp` is not taken; the aarch64
+// virt GICv2 boot lives in it), and `x86_usb_pump`. The login screen's four ignition sites are the Pi `render_pass`
+// (`baremetal`), `x86_render_service` (x86), `tegra_desk_arm` (`tegradesk`) and the tegra cascade
+// (`tegra`). The virt GICv3 boot (`UNAOS_GICV3=1`, which `UNAOS_VIRT_EL0=1` needs — the EL0 regime is
+// installed only on the JC3 drop) reaches none of the seven: inside `if gic::is_v3()` (cfg
+// `all(aarch64, not(pi), not(tegra))`) it drops EL2 -> EL1 and diverges into `run_capstone_boot_core`,
+// which never returns, BEFORE `arch::pci::init` has brought up the xHCI that carries the stick. So on
+// that lane no block device ever registers and nothing calls the service; the login line of the virt
+// lane was CAPSTONE-only.
+//
+// THE PASS. The same per-pass body the shared main loop runs for storage — the xHCI loan's seven
+// services, then `users::service` — run BOUNDED and SYNCHRONOUS at EL2 before the drop, the shape
+// `virtio_net::vnet_bringup` already takes on this branch. It stops the moment `users::serviced()`
+// latches (the store loaded and the `loginst` chain ran, or the service's own refusal bound spoke),
+// or at the wall. One pass per millisecond: `service`'s refusal bound counts PASSES (4096), and a
+// tight loop would spend it in microseconds where the main loop spends one GUI frame per pass.
+//
+// THE SCREEN. The ignition is the SO43 seam, never a console route: the screen opens iff a desktop
+// exists. This image compiles none — the menu bar the tegra site reads back (`menubar::enabled()`)
+// and the console route (`fbcon::console_is_routed()`) are both gated
+// `any(all(x86_64, wc), all(aarch64, desktop_firmware))` and `desktop_firmware` is not armable on
+// virt — so `desktop_up=false` is a compile-time fact, not a local inferred from control flow, and
+// the seam prints `-> HELD` on the wire instead of the lane saying nothing about its screen.
+#[cfg(all(target_arch = "aarch64", not(feature = "pi"), not(feature = "tegra"), feature = "login", not(feature = "skip_xhci")))]
+fn virt_users_pass(dtb_addr: u64, dtb_size: usize) {
+    const WALL_MS: u64 = 60_000;
+    unaos_kernel::arch::pci::init(dtb_addr, dtb_size);
+    let t0 = unaos_kernel::arch::ms();
+    let mut passes: u64 = 0;
+    while !unaos_kernel::fs::users::serviced() && unaos_kernel::arch::ms().saturating_sub(t0) < WALL_MS {
+        if let Ok(mut xhci) = unaos_kernel::drivers::xhci::claim() {
+            xhci.poll_events();
+            xhci.service_ftdi();
+            xhci.service_storage();
+            xhci.service_hubs();
+            xhci.service_hid_setproto();
+            xhci.service_slot_disposal();
+            xhci.service_enum();
+        }
+        unaos_kernel::fs::users::service();
+        passes += 1;
+        let t = unaos_kernel::arch::ms();
+        while unaos_kernel::arch::ms() == t {
+            core::hint::spin_loop();
+        }
+    }
+    serial_println!(
+        "[armusers] virt storage pass serviced={} passes={} ms={} block={} wall={} (EL2, before the JC3 drop; rmbp-ledger B188)",
+        unaos_kernel::fs::users::serviced(),
+        passes,
+        unaos_kernel::arch::ms().saturating_sub(t0),
+        if unaos_kernel::drivers::block::info().is_some() { "up" } else { "none" },
+        WALL_MS
+    );
+    unaos_kernel::fs::users::screen_open_at_ignition(false, false);
 }
