@@ -58,15 +58,23 @@
 //!    the lock keys and `0x46` do.
 //!  * **A chord types nothing.** `hid_key_ascii` returns 0 for any usage while a GUI **or** an Alt
 //!    bit is held, so both `cmd_role` spellings suppress the character on their own — the table
-//!    needs no suppression rule and did not gain one.
+//!    needs no suppression rule and did not gain one. **A row with no `CMD` role is the exception
+//!    and says so:** `Shift+←`/`Shift+→` and `Esc` (TERMSEL) still type their byte (`0x1D`/`0x1C`,
+//!    `0x1B`), pushed by the decoder just AHEAD of the action, because neither Shift nor no modifier
+//!    suppresses a key. That is deliberate: a menu that closes on `0x1B` still sees it, and the
+//!    shell's line editor ignores both bytes.
 //!
 //! # What is NOT here
 //!
-//! **No consumer of `Copy`/`Cut`/`Paste`/`SelectAll` exists.** There is no clipboard in this tree
-//! (measured: `grep -r -i clipboard video/` finds prose only), so those rows RESOLVE and go no
-//! further. The delivery seam is named in `docs/dev/OS/08_VIDEO/keymap.md` §Delivery and is one
-//! `pal::Event` variant away; `pal.rs` was not in KEYMAP's brief, so the arc stops at the resolver
-//! and says so rather than inventing a second event path beside `pal::push_event`.
+//! **The consumer of `Copy`/`Cut`/`Paste`/`SelectAll` is not here, and neither is the clipboard.**
+//! Both exist since APPCLIP (rmbp-ledger B176): the decoders push a resolved non-capture action
+//! onto the input ring as `pal::Event::Action`, `video/clipboard.rs` holds the one session-owned
+//! text buffer, and the terminal is its first consumer (`clipboard::terminal_action`) — `Paste`
+//! types the clipboard into the shell line; since TERMSEL (`video/termsel.rs`) `SelectAll` and the
+//! selection actions (`SelectLeft` .. `Deselect`) move a selection over the editable line, `Copy` copies that
+//! selection (or the whole line when none is live), and `Cut` removes it from the line (or is
+//! declined on the wire, `[clip] cut refused reason=no-selection`, when none is live). This file
+//! still only RESOLVES; what an action does is `clipboard.md`'s to say, not this file's.
 //!
 //! **`LogOut` is a SLOT.** `⌘⇧Q` resolves to [`Action::LogOut`] and nothing in this tree acts on
 //! it. LOGINFLOW may bind it; nothing else may.
@@ -82,16 +90,30 @@ pub enum Action {
     /// Region capture. Honoured as a whole-screen capture until a pointer selector exists — the
     /// same reservation `hid_screenshot_chord_edge` carried for `⌘⇧4`, moved to the table.
     ScreenshotRegion,
-    /// R61's first row. No consumer: there is no clipboard.
+    /// R61's first row. Consumed by the terminal (`clipboard::terminal_action`): the selection,
+    /// or the whole line when none is live.
     Copy,
-    /// R61. No consumer.
+    /// R61. Consumed by the terminal: cuts the SELECTION from the editable line (TERMSEL); with
+    /// no selection it is declined on the wire.
     Cut,
-    /// R61. No consumer.
+    /// R61. Consumed by the terminal: types the clipboard through the ring.
     Paste,
-    /// R61. No consumer.
+    /// R61. Consumed by the terminal: selects the whole editable line (TERMSEL).
     SelectAll,
     /// The SLOT. LOGINFLOW may bind it; nothing else may, and nothing acts on it today.
     LogOut,
+    /// TERMSEL: move the selection's HEAD one cell left (`Shift+←` on both tables).
+    SelectLeft,
+    /// TERMSEL: move the selection's HEAD one cell right (`Shift+→` on both tables).
+    SelectRight,
+    /// TERMSEL: move the selection's HEAD to the line start (`⌘⇧←` and `Shift+Home` on CRISPY,
+    /// `Shift+Home` on PC).
+    SelectLineStart,
+    /// TERMSEL: move the selection's HEAD to the line end (`⌘⇧→` and `Shift+End` on CRISPY,
+    /// `Shift+End` on PC).
+    SelectLineEnd,
+    /// TERMSEL: drop the selection (`Esc`, a row with no roles — the `0x1B` key is still typed).
+    Deselect,
 }
 
 impl Action {
@@ -105,6 +127,11 @@ impl Action {
             Action::Paste => "paste",
             Action::SelectAll => "select-all",
             Action::LogOut => "log-out",
+            Action::SelectLeft => "select-left",
+            Action::SelectRight => "select-right",
+            Action::SelectLineStart => "select-line-start",
+            Action::SelectLineEnd => "select-line-end",
+            Action::Deselect => "deselect",
         }
     }
 

@@ -10,7 +10,8 @@ Peter, 2026-09-22, [R61](../../RULINGS.md): *"i prefer command-c and friends (al
 there's no special case for the command line to resolve that usability question."*
 
 Source: [`video/clipboard.rs`](../../../../unaos/crates/kernel/src/video/clipboard.rs) (the buffer,
-the consumer, the fixture), [`pal.rs`](../../../../unaos/crates/kernel/src/pal.rs) (the
+the consumer, the fixture), [`video/termsel.rs`](../../../../unaos/crates/kernel/src/video/termsel.rs)
+(TERMSEL's selection model and fixture, §7), `console.rs`'s `draw_prompt_line` (the band), [`pal.rs`](../../../../unaos/crates/kernel/src/pal.rs) (the
 `Event::Action` variant and its classification), the two `pack_input` functions in
 [`arch/x86_64/syscall.rs`](../../../../unaos/crates/kernel/src/arch/x86_64/syscall.rs) and
 [`arch/aarch64/syscall.rs`](../../../../unaos/crates/kernel/src/arch/aarch64/syscall.rs),
@@ -79,20 +80,23 @@ measures the same code on every build — including the gate lane, which has no 
 
 ## 3. The first consumer — the terminal
 
-`clipboard::terminal_action(act, line)` is what the shell's line editor does with an action.
+`clipboard::terminal_action(act, line, sel)` is what the shell's line editor does with an action.
+Since TERMSEL it takes the console's line and selection by `&mut` and returns the witness field plus
+whether the input line must be repainted (§7).
 
 | Action | What the terminal does |
 |---|---|
 | `Paste` | pushes each clipboard byte back onto the ring as `Event::Key`. **Not a call into the editor** — the editor's existing `Event::Key` arm types and echoes them, so the line edit, the echo, the `\n` dispatch and the key census are identical to the operator having typed the text, and there is no second entry into the editor to keep in step. |
-| `Copy` | copies the **whole current input line**. |
-| `Cut`, `SelectAll` | accepted and witnessed `[clip] unsupported action=<name> reason=no-selection-model`. |
+| `Copy` | copies the **selection** when one is live (`unit=selection`), and the **whole current input line** when none is (`unit=line`, APPCLIP's behaviour unchanged). |
+| `Cut` | copies the selection and removes it from the editable line; with none, declined on the wire: `[clip] cut refused reason=no-selection`. |
+| `SelectAll` and the five selection actions | move the selection (§7). |
 | `Screenshot`, `ScreenshotRegion`, `LogOut` | `ignored` — the captures are acted on at the decoder, and `LogOut` is KEYMAP's slot, bound by nobody. |
 
-**There is no selection model in this tree.** Nothing on any surface records "these characters are
-selected", so a line is the largest honest unit a copy can take and a cut has nothing to remove. The
-two unsupported actions are witnessed rather than dropped for one reason: an operator who presses
-`⌘X` and sees nothing learns that the chord does nothing and stops reporting it. A selection arc is
-the next rung, and it has to come here and change both the arm and the spec row that pins its value.
+**Until TERMSEL there was no selection model in this tree**, so `Copy` took the line and `Cut` and
+`SelectAll` were witnessed `unsupported`. TERMSEL (§7) came here and changed the arms and the spec
+row that pinned their values, as this paragraph said the selection arc would have to. The refusal
+that remains — `⌘X` with nothing selected — is witnessed for the reason the old ones were: an
+operator who presses `⌘X` and sees nothing learns that the chord does nothing and stops reporting it.
 
 **No `Ctrl-C` special case exists anywhere on this path** — no guard, no terminal branch, no focus
 test. That is R61 discharged: the table never claimed `Ctrl-C`, so nothing had to be carved out for it.
@@ -109,7 +113,7 @@ focus test is added there either.
 `scripts/specs/x86-wc.spec` and must read exactly what it read before this arc.
 
 ```
-:: APPCLIP: delivered=4 copy=ok paste=ok len=10 line_match=true cut=unsupported selectall=unsupported epoch_clear=ok -> PASS ::
+:: APPCLIP: delivered=4 copy=ok paste=ok len=10 line_match=true cut=empty selectall=ok epoch_clear=ok -> PASS ::
 ```
 
 Every field is a round trip, not a restatement. Four `Event::Action`s go in through
@@ -148,9 +152,8 @@ is a different event: a dropped motion is re-carried by the next report, and a l
 
 ## 6. What is next
 
-* **A selection model.** Without one, `Copy` is line-granular and `Cut`/`SelectAll` are witnessed
-  refusals. It is the largest thing this arc left, and it is what makes the clipboard feel like a
-  clipboard.
+* **A selection model** — built by TERMSEL, §7 (keyboard, editable line). Pointer and scrollback
+  selection are still owed (§7.7).
 * **A ring-3 clipboard API** — two syscalls, `SYS_CLIP_SET(ptr, len)` and
   `SYS_CLIP_GET(ptr, cap) -> len`, each owing the same text-only and capacity refusals `set` makes,
   and each owing an ownership question this kernel has not answered: may a background program
@@ -159,3 +162,176 @@ is a different event: a dropped motion is re-carried by the next report, and a l
 * **Quarry's consumer.** The file manager is on the glass at boot on a `quarry` image and has its own
   keyboard door; `⌘C` on a file is a different meaning of the same action, and the seam for it is
   `terminal_action`'s shape, not a second event.
+
+## 7. The terminal selection — TERMSEL
+
+Until TERMSEL, `⌘C` copied the whole input line because nothing recorded which characters were
+selected. This section is the model that records it. It is the smallest selection that is honest about
+what the terminal holds, and it names what it leaves for later.
+
+### 7.1 What the terminal's text model is
+
+Measured at the branch's parent (`98fd8e66`), in `unaos/crates/kernel/src/console.rs` and
+`main.rs::handle_key`:
+
+| Part | What it is |
+|---|---|
+| `Console::history` | a `Vec<String>` scrollback, bounded at `HISTORY_MAX` = 256 lines, drop-oldest, painted read-only in grey. |
+| `Console::current_input` | ONE editable `String`: the shell line. |
+| the editor | `handle_key` is the only code that changes `current_input`, and it has exactly three edits: a printable byte (0x20..0x7E) is APPENDED, BS/DEL POPS the last byte, CR/LF dispatches the line and clears it. |
+| the caret | **there is none.** The block cursor is painted one cell past the last character (`draw_prompt_line`), and no key moves it: the arrow keys reach `handle_key` as `0x1C..0x1F` and fall through every arm. |
+| a cell | one byte. Every byte in `current_input` is printable ASCII (the only arm that inserts tests `32..=126`, and a paste arrives through that arm as `Event::Key`), so a byte offset and a cell column are the same number. |
+
+### 7.2 What can be selected
+
+**A contiguous run of cells in the editable line, and nothing else.** A selection is two offsets into
+`current_input`: an ANCHOR, where it started, and a HEAD, the end that moves. Because the editor
+has no caret, a selection that starts from nothing starts with both at the end of the line — the
+place the block cursor is painted — so the first `Shift+←` selects the last character, exactly as
+it does on a Mac text field whose caret sits at the end.
+
+The scrollback is NOT selectable in this arc. It is already in memory and could be, but reaching a
+line above the prompt from the keyboard needs a vertical motion (`Shift+↑`/`Shift+↓` walking into
+`history`) and a rule for what a cut does to a read-only line; neither is asked for here, and a
+selection that can reach only the editable line has no read-only case to get wrong. Scrollback
+selection arrives with the pointer (§7.7).
+
+### 7.3 How a selection is made — every chord is a row in the theme's table
+
+No chord is tested in terminal code. Each is a `Binding` in `video/theme.rs`, resolved by
+`keymap::resolve` at the HID decoder, and delivered as `pal::Event::Action` exactly as `⌘C` is
+(§1). Five new `keymap::Action` variants carry them:
+
+| Action | Token | What it does to the selection | CRISPY (Mac) | PC |
+|---|---|---|---|---|
+| `SelectLeft` | `select-left` | HEAD one cell left (stops at 0) | `Shift+←` | `Shift+←` |
+| `SelectRight` | `select-right` | HEAD one cell right (stops at the line end) | `Shift+→` | `Shift+→` |
+| `SelectLineStart` | `select-line-start` | HEAD to cell 0 | `Cmd+Shift+←`, `Shift+Home` | `Shift+Home` |
+| `SelectLineEnd` | `select-line-end` | HEAD to the line end | `Cmd+Shift+→`, `Shift+End` | `Shift+End` |
+| `SelectAll` (exists) | `select-all` | ANCHOR 0, HEAD the line end | `Cmd+A` | `Alt+A` |
+| `Deselect` | `deselect` | clears it | `Esc` | `Esc` |
+
+`Cmd+Shift+←/→` is on the Mac table because it is the Mac's own chord for "to the start/end of the
+line", and because **the rMBP's internal keyboard has no Home or End key**. `Shift+Home/End` is on
+both tables so an external PC keyboard works on either. A selection whose ANCHOR and HEAD meet is
+no selection (it collapses, and the witness says so).
+
+`Esc` is a row with no roles, like Print Screen. It does not stop being a key: the decoders push the
+`0x1B` `Event::Key` exactly as before and push the `Deselect` action beside it, so a menu that
+dismisses on `0x1B` still sees it. R24 (as heard by orin 17) is about Esc and app windows — *"esc
+should not close any app windows"* — and clearing a selection closes nothing.
+
+### 7.4 What an edit does to a selection
+
+**Any edit drops it.** A typed character, a Backspace, a Return, and every byte of a paste (which
+is typed through the same arm) clear the selection before they change the line. A Mac text field
+REPLACES a selection with what is typed; that needs a caret to put the replacement where the
+selection was, and this editor appends at the end and nowhere else. Replace-on-type is owed with a
+caret, and until then an edit that silently kept a selection over text that has moved would paint a
+band over the wrong cells.
+
+### 7.5 What the clipboard chords do
+
+| Chord | With a selection | With none |
+|---|---|---|
+| `Copy` | copies the SELECTED cells (`[clip] copy unit=selection len=N`); the selection stays | copies the whole line (`[clip] copy unit=line len=N`) — **APPCLIP's behaviour, unchanged** |
+| `Cut` | copies the selected cells and REMOVES them from the editable line; the selection clears | declined and witnessed (`[clip] cut refused reason=no-selection`) |
+| `Paste` | types the clipboard (§3); the first typed byte drops the selection (§7.4) | types the clipboard (§3) |
+
+Cut can only ever remove cells from the editable line, because that is the only line a selection
+can reach (§7.2). If scrollback selection lands, cut there must refuse — the scrollback is output,
+not input.
+
+### 7.6 How it is shown, and the wire
+
+**Shown:** an inverse-video band painted by the terminal's own painter, `Console::draw_prompt_line`
+— the shared routine the full repaint and the per-keystroke fast path both call — so the band can
+never disagree between the two. The band is the selected cells filled with the text colour and the
+selected characters redrawn in the console background colour; the block cursor stays where it is.
+
+**Wire:** ONE line per STATE CHANGE, from the model and never from the painter (a repaint is not a
+change):
+
+```
+[termsel] sel=<lo>..<hi> cells=<n> line=<len> by=<action-token|edit|cut>
+[termsel] none line=<len> by=<action-token|edit|cut>
+```
+
+No selected TEXT is printed — the `[clip]` lines print lengths only, for the same reason.
+
+### 7.7 What this arc does NOT do
+
+* **Pointer selection** — drag to select, double-click a word, and with it scrollback selection. The
+  x86 shell has no click model (`main.rs`'s `Event::Button` arm is empty by design); that is the
+  next arc, and it writes into the same ANCHOR/HEAD pair.
+* **A caret.** Without one, a selection always starts at the line end and an edit cannot replace
+  it (§7.4).
+* **The fixture cannot press a key.** QEMU has no operator's hands (§4); the chords are resolved
+  through the table from synthetic report pairs and pushed through the REAL ring, which is the
+  proof available off metal. The decoder half and the painted band are flight 12's to see.
+
+### 7.8 The fixture, the gate, and the wire it printed
+
+`video::termsel::selftest()`, chained from `drivers::ehci::parser_selftest` after APPCLIP's fixture,
+on its own line. It drives thirteen CHORDS, not actions: each is a synthetic HID report pair resolved
+through the live table (`keymap::resolve_edge(keymap::active(), …)`), pushed through `pal::push_event`,
+taken back out of `pal::next_event` and handed to the shipped `terminal_action`, against a line
+(`unaos select`) and a `LineSel` standing where the console's stand. Measured on the wc lane at
+TERMSEL M1 (`UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_QEMU_FULL=1 ./arroyo test 240`,
+rc=0 COMPLETE, x86-wc.spec 27/27):
+
+```
+[termsel] sel=11..12 cells=1 line=12 by=select-left
+[termsel] sel=10..12 cells=2 line=12 by=select-left
+[termsel] sel=9..12 cells=3 line=12 by=select-left
+[termsel] sel=10..12 cells=2 line=12 by=select-right
+[clip] copy unit=selection len=2
+[termsel] sel=0..12 cells=12 line=12 by=select-line-start
+[termsel] none line=12 by=deselect
+[clip] copy unit=line len=12
+[termsel] sel=0..12 cells=12 line=12 by=select-all
+[termsel] sel=0..11 cells=11 line=12 by=select-left
+[clip] cut unit=selection len=11
+[termsel] none line=1 by=cut
+[clip] cut refused reason=no-selection
+[termsel] sel=0..1 cells=1 line=1 by=select-all
+[termsel] none line=1 by=edit
+:: TERMSEL: resolved=13/13 delivered=13 left=ok copy_sel=ok home=ok esc=ok copy_line=ok cut=ok cut_empty=ok edit=ok pc=ok -> PASS ::
+```
+
+(`[clip] set`/`get` lines between them omitted here.) `copy_sel=` reads the clipboard back through
+the epoch gate and requires exactly the two selected cells; `copy_line=` requires the whole line
+with nothing selected (§3's behaviour); `cut=` checks the clipboard, the line and the selection
+after `⌘X`; `pc=` resolves the PC column's five chords through `PC_BINDINGS`. Pinned in
+[`scripts/specs/x86-wc.spec`](../../../../unaos/scripts/specs/x86-wc.spec) (REQUIRE + FORBID,
+tail-appended). **Go-red, measured:** make `terminal_action`'s `Copy` arm ignore the selection
+(`match None::<(usize, usize)>`) — every copy reads `unit=line`, the verdict is
+`copy_sel=no … -> FAIL ::`, `./arroyo test` rc=1 and the x86-wc.spec replay 25/27 with the TERMSEL
+FORBID hit.
+
+The painted band is NOT proved by the fixture — it runs at `ehci::init`, before any console is
+drawn. It is proved by construction (the painter reads `LineSel::range`, the same reading the
+fixture asserts) and by flight 12.
+
+### 7.9 What flight 12 can show, stated so it can be wrong
+
+On the shell window, after typing `hello world` at the prompt, **on the internal keyboard (EHCI) or
+an external one (xHCI)**, in this order:
+
+* `Shift+←` three times paints an inverse band over `rld`, and the wire carries three
+  `[clip] chord=shift-left action=select-left via=<ehci|xhci> -> delivered` lines each followed by
+  a `[termsel] sel=… by=select-left` line ending at `sel=8..11 cells=3 line=11`.
+* `⌘C` copies `rld` (`[clip] copy unit=selection len=3`) and the band stays.
+* `⌘⇧←` then extends the band to the line start (`sel=0..11`); `Esc` removes it
+  (`none line=11 by=deselect`); `⌘C` with nothing selected copies the whole line
+  (`[clip] copy unit=line len=11`), as before this arc; `⌘V` types `hello world` onto the end.
+* `⌘A` then `⌘X` empties the line and the clipboard holds it; `⌘X` again prints
+  `[clip] cut refused reason=no-selection` and changes nothing.
+* Typing any character while a band is shown removes the band (`by=edit`) and appends the character.
+* On an external PC keyboard, `Shift+Home`/`Shift+End` behave as `⌘⇧←`/`⌘⇧→`
+  (`chord=shift-home`/`shift-end`). **Unverified:** whether the internal keyboard's `Fn+←` reaches
+  the decoder as Home (0x4A); in HID boot protocol the Apple Fn key is not reported, so the
+  expectation is that it arrives as a plain `←` and `Fn+Shift+←` selects one cell.
+
+A reading that contradicts any bullet is a TERMSEL defect, except the last clause, which is a
+question about the keyboard.

@@ -549,19 +549,39 @@ use super::keymap::{Action, Binding, Table, CMD, SHIFT};
 ///
 /// HID usages are Keyboard/Keypad page ids (HUT 1.12 §10) and match
 /// `drivers::xhci::HID_SCANCODE_TO_ASCII`'s index: `a`=0x04, `c`=0x06, `q`=0x14, `v`=0x19,
-/// `x`=0x1B, `3`=0x20, `4`=0x21, Print Screen = 0x46.
-pub static CRISPY_ROWS: [Binding; 8] = [
+/// `x`=0x1B, `3`=0x20, `4`=0x21, Escape = 0x29, Print Screen = 0x46, Home = 0x4A, End = 0x4D,
+/// Right Arrow = 0x4F, Left Arrow = 0x50.
+///
+/// TERMSEL's rows (the terminal selection, `video/termsel.rs`, `clipboard.md` §7) are the Mac's
+/// own: `⌘⇧←`/`⌘⇧→` to the line start/end — written ABOVE the bare `Shift+←`/`Shift+→`, which
+/// would otherwise shadow them (the `no_shadow` check at the foot of this block refuses the other
+/// order at compile time) — and `Shift+Home`/`Shift+End` as well, because the rMBP's internal
+/// keyboard has no Home or End key but an external one on the same desktop does.
+pub static CRISPY_ROWS: [Binding; 15] = [
     // The two chords flight 11 proved on metal. Their tokens are the exact bytes the `[prtscr]`
     // witness has always carried, so a capture from before KEYMAP and one from after grep alike.
     Binding { roles: CMD | SHIFT, usage: 0x20, action: Action::Screenshot, token: "cmd-shift-3" },
     Binding { roles: CMD | SHIFT, usage: 0x21, action: Action::ScreenshotRegion, token: "cmd-shift-4" },
     // The SLOT (R60). LOGINFLOW may bind it; nothing else may, and nothing acts on it today.
     Binding { roles: CMD | SHIFT, usage: 0x14, action: Action::LogOut, token: "cmd-shift-q" },
-    // R61's four. No consumer — there is no clipboard in this tree.
+    // TERMSEL — to the line start / end, the Mac chords. ABOVE the bare Shift rows (precedence).
+    Binding { roles: CMD | SHIFT, usage: 0x50, action: Action::SelectLineStart, token: "cmd-shift-left" },
+    Binding { roles: CMD | SHIFT, usage: 0x4F, action: Action::SelectLineEnd, token: "cmd-shift-right" },
+    // R61's four. Consumed by the terminal (`clipboard::terminal_action`, `clipboard.md` §3/§7):
+    // Copy takes the selection or the whole line, Paste types, Cut removes the selection, Select
+    // All selects the line.
     Binding { roles: CMD, usage: 0x06, action: Action::Copy, token: "cmd-c" },
     Binding { roles: CMD, usage: 0x19, action: Action::Paste, token: "cmd-v" },
     Binding { roles: CMD, usage: 0x1B, action: Action::Cut, token: "cmd-x" },
     Binding { roles: CMD, usage: 0x04, action: Action::SelectAll, token: "cmd-a" },
+    // TERMSEL — one cell at a time, and the PC-keyboard line ends.
+    Binding { roles: SHIFT, usage: 0x50, action: Action::SelectLeft, token: "shift-left" },
+    Binding { roles: SHIFT, usage: 0x4F, action: Action::SelectRight, token: "shift-right" },
+    Binding { roles: SHIFT, usage: 0x4A, action: Action::SelectLineStart, token: "shift-home" },
+    Binding { roles: SHIFT, usage: 0x4D, action: Action::SelectLineEnd, token: "shift-end" },
+    // TERMSEL — Esc drops the selection. `roles: 0`, like Print Screen; the key is STILL TYPED
+    // (0x1B reaches every key consumer as before), so a menu that dismisses on it is unaffected.
+    Binding { roles: 0, usage: 0x29, action: Action::Deselect, token: "esc" },
     // Print Screen. `roles: 0` — the key means capture whatever else is held, which is precisely
     // what the `0x46` edge did before it was a row. A theme that drops this row disarms the key.
     Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: "print-screen" },
@@ -582,7 +602,7 @@ pub static CRISPY_BINDINGS: &Table = &Table {
 /// The rows are the SAME rows in role space. What differs is one field — `cmd_role` — plus the
 /// keyboard the operator is typing on: `Alt+C` is copy on a PC because R61 says the Command role
 /// moves to Alt there, not because a second Copy row was written.
-pub static PC_ROWS: [Binding; 6] = [
+pub static PC_ROWS: [Binding; 11] = [
     // PrtSc. The SHIFTED row is written ABOVE the bare one, and it has to be: the bare row names
     // no roles, so it matches with Shift held too and would shadow the region chord entirely. That
     // is this table's one ordering hazard; the `const` block at the foot of this file checks it.
@@ -592,6 +612,13 @@ pub static PC_ROWS: [Binding; 6] = [
     Binding { roles: CMD, usage: 0x19, action: Action::Paste, token: "alt-v" },
     Binding { roles: CMD, usage: 0x1B, action: Action::Cut, token: "alt-x" },
     Binding { roles: CMD, usage: 0x04, action: Action::SelectAll, token: "alt-a" },
+    // TERMSEL — a PC keyboard's selection chords. No `Alt+Shift+←` row: on a PC the line ends
+    // are Home and End, which every PC keyboard has.
+    Binding { roles: SHIFT, usage: 0x50, action: Action::SelectLeft, token: "shift-left" },
+    Binding { roles: SHIFT, usage: 0x4F, action: Action::SelectRight, token: "shift-right" },
+    Binding { roles: SHIFT, usage: 0x4A, action: Action::SelectLineStart, token: "shift-home" },
+    Binding { roles: SHIFT, usage: 0x4D, action: Action::SelectLineEnd, token: "shift-end" },
+    Binding { roles: 0, usage: 0x29, action: Action::Deselect, token: "esc" },
 ];
 
 /// The PC table. `cmd_role` is `HID_MOD_ALT` — R61's *"(alt-c on pc)"*, and the one field that

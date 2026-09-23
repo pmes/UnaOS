@@ -414,7 +414,9 @@ pub const INPUT_EV_WHEEL: u64 = 6;
 /// APPCLIP (R61): a RESOLVED DESKTOP ACTION — the `⌘C`/`⌘V`/`⌘X`/`⌘A` family, judged by the theme's
 /// binding table at the HID decoder and delivered to the focused program exactly the way a key is.
 /// Payload `[7:0]` = the action's DISCRIMINANT, which is never `0`:
-/// `1` screenshot, `2` screenshot-region, `3` copy, `4` cut, `5` paste, `6` select-all, `7` log-out.
+/// `1` screenshot, `2` screenshot-region, `3` copy, `4` cut, `5` paste, `6` select-all, `7` log-out,
+/// and TERMSEL's selection actions `8` select-left, `9` select-right, `10` select-line-start,
+/// `11` select-line-end, `12` deselect (appended, 2026-09-23).
 /// The kernel side of that mapping is `video::clipboard::action_code` — ONE definition, read by both
 /// arches' `pack_input`. Adding an action appends a value; changing one is an ABI break.
 ///
