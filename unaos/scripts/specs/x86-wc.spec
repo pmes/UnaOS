@@ -338,6 +338,38 @@ FORBID :: VUGPERF: .* :: FAIL ::
 # --- drops by one, verdict `-> FAIL`.
 REQUIRE :: KEYMAP: table=crispy resolved=\d+ .* ctrl_c_ascii=0x03 ctrl_c_action=none pc_table_alt_c=copy .* -> PASS ::
 
+# --- APPCLIP (R61, 2026-09-22) ----------------------------------------------------------------
+# --- The other half of R61: KEYMAP resolved the edit chords and stopped at the decoder, with no
+# --- delivery path, no clipboard and no consumer (keymap.md §6 named the seam). This row scores
+# --- the whole of what was built on top of it — `pal::Event::Action` through the REAL ring, the
+# --- session-owned clipboard, and the terminal's consumption of a paste — from one fixture
+# --- (`video/clipboard.rs`'s `selftest`), chained BESIDE `keymap::selftest` in
+# --- `drivers::ehci::parser_selftest`, which this lane runs on every boot.
+# --- WHY A FIXTURE AND NOT A CHORD: the same reason the KEYMAP row above gives. QEMU has no
+# --- operator's hands, `:: PRTSCR: [prtscr] chord=` has never appeared on this lane, and the new
+# --- `[clip] chord=… -> delivered` line it sits beside cannot appear here either. What CAN be
+# --- driven off metal is the ring, and the fixture drives it: four `Event::Action`s go in through
+# --- `pal::push_event` and come back out of `pal::next_event`, the shipped `terminal_action`
+# --- consumes them, and the paste arrives as `Event::Key`s on that same ring which the fixture
+# --- rebuilds the line from. So every field below is a ROUND TRIP, not a restatement.
+# --- THE FIELDS PINNED VERBATIM, each chosen because it would still read well if the thing under
+# --- it were broken: `line_match=true` (the pasted bytes compared against the source AFTER the
+# --- round trip — a delivery that never happened, a clipboard that stored nothing and a paste
+# --- that pushed nothing each read `false` here, and it is the ONE field the go-red moves);
+# --- `cut=unsupported` and `selectall=unsupported` (asserted AS VALUES, not as silence — an
+# --- operator's `⌘X` must be visibly declined until a selection model exists, and the arc that
+# --- builds one has to come here and change this row, which is the point); `epoch_clear=ok` (the
+# --- session ownership gate — the buffer's stamp is aged by one epoch, exactly as a log-out
+# --- leaves it, and the next read must destroy the buffer instead of serving the previous user's
+# --- text). `delivered=4` is pinned as a literal because it is a CONSTANT of the fixture, not a
+# --- population: four actions are pushed, and any number but four means the ring lost one.
+# --- NO OTHER NUMERIC IS PINNED: `len=` is \d+ so the fixture's sample text can change.
+# --- GO-RED, ONE EDIT (measured, not reasoned): delete the `paste_into_ring()` call from
+# --- `terminal_action`'s `Action::Paste` arm -> no `Event::Key` reaches the ring, the line is
+# --- never built, and the same capture reads `paste=ok len=0 line_match=false … -> FAIL ::`.
+REQUIRE :: APPCLIP: delivered=4 copy=ok paste=ok len=\d+ line_match=true cut=unsupported selectall=unsupported epoch_clear=ok -> PASS ::
+FORBID :: APPCLIP: .* -> FAIL ::
+
 # --- STARTHOLD: the desktop's ignition is never gated on a fixture's settle (2026-09-22) -------
 # --- WHY A FORBID AND NOT A REQUIRE, written down so the next reader does not "fix" it into one:
 # --- this leg cannot produce a `[wc-x] desktop-app` line AT ALL. `desktop_uefi::activate` runs only

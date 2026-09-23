@@ -96,33 +96,39 @@ their own.
   silence, with every gate green, because nothing on a wire says a row was never consulted. Both
   shipped tables assert it at the foot of `theme.rs`.
 
-## 6. Delivery — what this arc did NOT build
+## 6. Delivery — CLOSED by APPCLIP, 2026-09-22
 
-The screenshot actions are delivered: the decoders test `Action::is_capture()` and call
-`prtscr::request()` exactly as they did before, so the wire keeps its shape and gains one field:
+The screenshot actions were delivered from the first day: the decoders test `Action::is_capture()`
+and call `prtscr::request()` exactly as they did before, so the wire keeps its shape and gains one
+field:
 
 ```
 :: PRTSCR: [prtscr] chord=cmd-shift-3 (GUI+Shift+digit) down on EHCI -> capture armed action=screenshot ::
 :: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed action=screenshot ::
 ```
 
-**The edit actions have no consumer and no delivery path.** There is no clipboard in this tree
-(measured: `grep -r -i clipboard unaos/crates/kernel/src/video/` finds prose only), so `Copy`, `Cut`,
-`Paste` and `SelectAll` resolve and stop at the decoder.
+**The edit actions had no consumer and no delivery path, and this section named the seam rather than
+half-building it. APPCLIP built it — the section is closed and the table below is the record of what
+was owed, with what discharged each row.** The mechanism is [clipboard.md](clipboard.md); nothing in
+`keymap.rs` or `theme.rs` changed to get it, which is the seam behaving as designed.
 
-Delivering them to the focused window means one new `pal::Event` variant carrying the `Action`, which
-the terminal window would then receive like any other event and ignore. That change is **outside
-KEYMAP's file list** and is named here rather than half-built:
+| File | Change that was named here | Discharged by |
+|---|---|---|
+| `pal.rs` | one variant on `enum Event`, e.g. `Action(crate::video::keymap::Action)`, plus its arm in `push_locked`'s `is_key`/`is_ptr` classification (neither — it is a third kind). | `Event::Action(keymap::Action)`, classified `is_act` — and, symmetrically, excluded from `EVQ_POP`: an event counted on one side of the pipeline only would drift `[uvug10]`'s occupancy reading (clipboard.md §5). |
+| `arch/x86_64/syscall.rs` | an arm in the `Event -> (ty, payload)` match, which is **exhaustive**. | `(una_abi::INPUT_EV_ACTION, clipboard::action_code(a))`, folded onto the `Wheel` arm. |
+| `arch/aarch64/syscall.rs` | the same arm in the aarch64 twin, also exhaustive. | the same arm, from the same `action_code` — one definition, so the two wires cannot drift. |
+| `una_abi` | one `INPUT_EV_ACTION` code, if the action is to reach ring 3 at all. | `INPUT_EV_ACTION = 7`, payload = the action's discriminant. |
+| the two decoder call sites | `crate::pal::push_event(Event::Action(act))` on the non-capture arm. | exactly that, plus `[clip] chord=… action=… via=… -> delivered` on the wire. |
 
-| File | Change |
-|---|---|
-| `pal.rs` | one variant on `enum Event`, e.g. `Action(crate::video::keymap::Action)`, plus its arm in `push_locked`'s `is_key`/`is_ptr` classification (neither — it is a third kind). |
-| `arch/x86_64/syscall.rs` (~:5623) | an arm in the `Event -> (ty, payload)` match, which is **exhaustive**. |
-| `arch/aarch64/syscall.rs` (~:13219) | the same arm in the aarch64 twin, also exhaustive. |
-| `una_abi` | one `INPUT_EV_ACTION` code, if the action is to reach ring 3 at all. |
-| the two decoder call sites | `crate::pal::push_event(Event::Action(act))` on the non-capture arm. |
+Two things this section GUESSED and got wrong are worth keeping, because they are what a reader of a
+named seam should expect to have to re-derive:
 
-Until then the resolver is the product, and it is the part R60 asked for.
+* *"which the terminal window would then receive like any other event **and ignore**"*. It does not
+  ignore it. The terminal is the FIRST CONSUMER: `⌘V` types the clipboard into the current line
+  through the same path a typed byte takes, and `⌘C` copies the line. What it cannot do is select,
+  so `⌘X` and `⌘A` are witnessed refusals until a selection model exists.
+* *"There is no clipboard in this tree (measured: `grep -r -i clipboard unaos/crates/kernel/src/video/`
+  finds prose only)"*. True when written; `video/clipboard.rs` is the answer to it.
 
 ## 7. The fixture
 

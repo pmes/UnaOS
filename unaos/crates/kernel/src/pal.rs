@@ -56,6 +56,24 @@ pub enum Event {
     /// Consumers that do not scroll ignore it through their existing wildcard arm, exactly as they
     /// ignore `KeyUp`.
     Wheel(i8),
+    /// APPCLIP (R61): a RESOLVED DESKTOP ACTION — `⌘C`/`⌘V`/`⌘X`/`⌘A` and whatever chords a future
+    /// theme binds. **A THIRD KIND of event, neither a key nor a pointer report**, and that is a
+    /// property rather than an accident: an action has already been JUDGED
+    /// (`video::keymap::resolve` turned a modifier byte and a usage into a MEANING at the decoder),
+    /// so nothing downstream re-derives it from a keystroke and nothing treats it as motion.
+    ///
+    /// The two HID decoders push it on the NON-capture arm of the chord they already resolve; the
+    /// capture arm still calls `video::prtscr::request()` and is untouched. Consumers that do not
+    /// act on actions ignore it through the same wildcard arm they already use for `KeyUp` and
+    /// `Wheel`.
+    ///
+    /// `Ctrl-C` can never arrive here: the table never claims it (keymap.md §4), so
+    /// `hid_key_ascii` still hands the shell `0x03` and no terminal special case exists on this
+    /// path. The first consumer is `video::clipboard::terminal_action`.
+    ///
+    /// ⚠ **DELIBERATELY OUTSIDE THE UVUG-10 CENSUS, ON BOTH SIDES** — see [`push_locked`]'s
+    /// classification and [`pop_event`].
+    Action(crate::video::keymap::Action),
     None,
     Unknown,
 }
@@ -969,6 +987,21 @@ static EVQ_POP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::n
 /// the pad and the arrow was handed the whole backlog at once instead of walking it.
 static EVQ_COALESCE_PTR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// APPCLIP — `Event::Action`s OFFERED to the queue. Its own term, outside `push - drop - pop`
+/// entirely (the class is uncounted on the pop side too), so no existing reading of `[uvug10]`
+/// moves when the operator uses the clipboard. See [`push_locked`]'s classification.
+static EVQ_ACT_PUSH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// APPCLIP — `Event::Action`s the ring was too full to take. Nonzero is a LOST CHORD: unlike a
+/// dropped motion, nothing later re-carries the intent.
+static EVQ_ACT_DROP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// APPCLIP — `(pushed, dropped)` desktop actions. The clipboard's witness reads this; no other
+/// instrument does, which is why the class could be given its own term without moving any line.
+pub fn action_queue_stats() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (EVQ_ACT_PUSH.load(Relaxed), EVQ_ACT_DROP.load(Relaxed))
+}
+
 /// PTRDEAD — relative-motion reports folded into a queued motion instead of taking a ring slot
 /// (see [`EVQ_COALESCE_PTR`]). Monotonic; 0 on a boot where the drain never fell behind the pad.
 pub fn pointer_motion_coalesced() -> u64 {
@@ -1180,6 +1213,18 @@ fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint, coalesce: bool)
         Event::Mouse { .. } | Event::MouseAbsolute { .. } | Event::Button(_) | Event::Wheel(_)
     );
     let is_key = matches!(event, Event::Key(_) | Event::KeyUp(_));
+    // APPCLIP — **THE THIRD KIND.** `Event::Action` is neither `is_ptr` nor `is_key`, and it is
+    // counted in NEITHER of the UVUG-10 class counters — nor, symmetrically, in `EVQ_POP` when it is
+    // drained (see [`pop_event`]). That symmetry is the whole of the decision and it is the
+    // conservation law that forces it: `push - drop - pop` is read as the LIVE RING OCCUPANCY, so an
+    // event counted on exactly one side of the pipeline drifts that reading permanently — this one
+    // would drive it NEGATIVE, one per chord, which is the same hole `note_uncounted_discard` and
+    // `EVQ_COALESCE_PTR` were each written to keep out of the ledger. Counting it in `push_key`
+    // instead was the other candidate and is wrong for a different reason: `[uvug10] key=` is read
+    // against `[uvug9]`'s keystroke totals to name a second consumer of the KEYBOARD, and an action
+    // is not a keystroke — the two would stop agreeing exactly when the operator started using the
+    // clipboard. Actions get their own term, [`EVQ_ACT`], which no existing witness reads.
+    let is_act = matches!(event, Event::Action(_));
     // PTRDEAD — the fold, taken BEFORE the push accounting so a folded report is never counted as an
     // entry that exists (see [`EVQ_COALESCE_PTR`] for the conservation argument). The adjacency
     // record is still advanced: the newest ring entry is still a motion, and it is still the one an
@@ -1201,6 +1246,8 @@ fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint, coalesce: bool)
         EVQ_PUSH_PTR.fetch_add(1, Relaxed);
     } else if is_key {
         EVQ_PUSH_KEY.fetch_add(1, Relaxed);
+    } else if is_act {
+        EVQ_ACT_PUSH.fetch_add(1, Relaxed);
     }
     let stored = {
         let stored = q.push(event);
@@ -1265,6 +1312,11 @@ fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint, coalesce: bool)
             EVQ_DROP_PTR.fetch_add(1, Relaxed);
         } else if is_key {
             EVQ_DROP_KEY.fetch_add(1, Relaxed);
+        } else if is_act {
+            // APPCLIP — a chord the ring was too full to take. It is its OWN term and not a warning
+            // in passing: a dropped action is a `⌘V` the operator pressed and the machine lost, and
+            // unlike a dropped motion there is no later report that carries the same intent again.
+            EVQ_ACT_DROP.fetch_add(1, Relaxed);
         }
     }
     // R0 / rtwit — input→present proxy: stamp the arrival of this input at the enqueue funnel. Only
@@ -1928,7 +1980,11 @@ fn pop_event() -> Option<Event> {
         let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
         q.pop()
     });
-    if ev.is_some() {
+    // APPCLIP — `Event::Action` is excluded HERE for the same reason it is excluded from the push
+    // classification, and the two exclusions are one decision: the class is outside `push - drop -
+    // pop` on BOTH sides, so the occupancy reading is exactly what it was before actions existed.
+    // Counting the pop while the push is uncounted would drive it negative, one per chord.
+    if matches!(ev, Some(e) if !matches!(e, Event::Action(_))) {
         // UVUG-10: total consumption, across EVERY consumer — the router drain, the user focus-change
         // discard, `pump_and_poll`. `push - drop - pop` is the live ring occupancy; a `pop` count far
         // above the router drain's own `[uvug9]` totals names a second consumer as the thief.

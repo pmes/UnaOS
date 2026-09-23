@@ -382,6 +382,22 @@ pub const INPUT_EV_BUTTON: u64 = 5;
 /// consumer never sees a no-op detent; and only from a report that ACTUALLY carried a wheel byte — a
 /// 3-byte relative boot report (a mouse with no wheel) emits nothing rather than a fabricated zero.
 pub const INPUT_EV_WHEEL: u64 = 6;
+/// APPCLIP (R61): a RESOLVED DESKTOP ACTION — the `⌘C`/`⌘V`/`⌘X`/`⌘A` family, judged by the theme's
+/// binding table at the HID decoder and delivered to the focused program exactly the way a key is.
+/// Payload `[7:0]` = the action's DISCRIMINANT, which is never `0`:
+/// `1` screenshot, `2` screenshot-region, `3` copy, `4` cut, `5` paste, `6` select-all, `7` log-out.
+/// The kernel side of that mapping is `video::clipboard::action_code` — ONE definition, read by both
+/// arches' `pack_input`. Adding an action appends a value; changing one is an ABI break.
+///
+/// A program that does not implement the clipboard ignores this exactly as it ignores
+/// [`INPUT_EV_WHEEL`]: the type is unknown to it and its dispatch falls through. `Ctrl-C` never
+/// arrives as one of these — the table does not claim it, so it is still an ordinary
+/// [`INPUT_EV_KEY_DOWN`] carrying `0x03`, which is R61's point.
+///
+/// Numbered 7, the next free code, and NOT inserted beside [`INPUT_EV_KEY_UP`] where it belongs by
+/// kind: these values are on the wire, so the block reads in kind order only until the first
+/// addition, and what the ABI fixes is the number, not its position in this file.
+pub const INPUT_EV_ACTION: u64 = 7;
 
 /// Pack an event the way both kernels do. One definition, so the encode and the decode below cannot
 /// drift apart.
