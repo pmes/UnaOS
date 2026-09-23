@@ -633,3 +633,29 @@ REQUIRE :: SERWIT-2 tap tste: submitted=[1-9]\d* absorbed=[1-9]\d* staged=\d+ dr
 # gates it on the leg whose numbers anybody actually quotes. Measured 14 hits on the SERTAPS baseline
 # capture (`sertaps-logs/R1-serial.log`, the wc lane at this branch's parent fe385712).
 REQUIRE \[sertx\] prints=\d+ masked_us_max=\d+ masked_us_mean=\d+ drain_us=\d+ emit_us=\d+ spin_us=\d+ bytes=\d+ masked_b=0 fifo_b=\d+ taps_us=\d+ taps_us_max=\d+ tap_max=fbcon:\d+,ftdi:\d+,tste:\d+,rec:\d+ tap_sum=fbcon:\d+,ftdi:\d+,tste:\d+,rec:\d+ sink=(uart|ftdi|both|none) hz=\d+ masked_cy_max=\d+ masked_cy_sum=\d+
+#
+# ── SPECPINS2 (2026-09-23, rmbp-ledger B184), TAIL-APPENDED past SERTXPIN ─────────────────────────
+# THE CLIPBOARD'S OWN WIRE, beside the APPCLIP verdict this file already pins (rmbp-ledger B176).
+# `:: APPCLIP:` is the fixture's conclusion; `[clip] set len= epoch=` and `[clip] copy unit=line len=`
+# are the two lines `video/clipboard.rs` prints for EVERY copy, on this lane and on metal
+# (`clipboard.rs:166`, `:270`), and no spec read either. They are what a flight-12 capture of a real
+# ⌘C will be read with, so their wording is pinned here the way x86-login.spec §7 pins `[login]`.
+# Printed on this lane by `clipboard::selftest` (chained from `drivers::ehci::parser_selftest`,
+# unconditional under the default-ON `ehcihid`): `set len=10` for the copy, `set len=16` for the
+# epoch leg's stale buffer, one `copy unit=line len=10`.
+#   * `unit=line` is LITERAL: it is the claim that there is no selection model and the copy took the
+#     editor's whole line (B176 §3). The arc that builds a selection must come here and change it.
+#   * `len=` and `epoch=` are `\d+`: the fixture's sample text and the session epoch (u64 since
+#     SECLOGIN M5) move legitimately.
+REQUIRE \[clip\] set len=\d+ epoch=\d+
+REQUIRE \[clip\] copy unit=line len=\d+
+# The FAILURE spelling is a REAL one: `set` refuses out loud rather than truncating
+# (`[clip] refuse reason=too-large len= cap=` / `reason=non-text off= byte=`, `clipboard.rs:140`,
+# `:150`). The fixture copies a 10-byte printable string and never asks for a refusal, so on this
+# lane any `[clip] refuse` is a copy that failed; `terminal_action` would then report
+# `copy=refused` and APPCLIP would FAIL too, but this rule names the cause rather than the symptom.
+FORBID \[clip\] refuse reason=
+#
+# `[status] poll` (MENUBATT2, B170) is NOT re-pinned here: it has been pinned in this file since
+# 906e669c, at the MENUBATT2 block (`REQUIRE \[status\] poll n=\d+ answered=\d+ src=none took_us=\d+`
+# and its `src=unresolved` FORBID). SPECPINS2 replayed it on this arc's wc-lane capture instead.

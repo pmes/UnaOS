@@ -2215,3 +2215,66 @@ which is why the REQUIRE pins that site by name. The gate proves the splash is
 painted and handed over once at a named site on the build a person boots — which
 is precisely what makes the seam's own mutation test runnable on metal at all.
 The seam belongs to `x86-witness.spec` and a flight, and stays B137's row.
+
+## SPECPINS2 — a verdict line a QEMU lane prints is pinned by that lane's spec, or named metal-only
+
+**Where this one runs.** Not in `check_both`, for GATE-SPLASH's reason: it is a property of the x86
+QEMU captures and the per-lane specs that replay them. `x86-default.spec` is replayed by
+`x86_spec_replay` on every `./arroyo test` whose medium is the default stick (the wc and login lanes
+included, since neither sets `UNAOS_FATIMG`); `x86-wc.spec` and `x86-login.spec` are `knobleg`
+replays (`./arroyo mbench --replay target/serial.log --spec … --platform x86`, their RUN-BY lines).
+There is no separate mbench document in this tree; the conventions live in each spec's header and
+CONTRACT block, and GATE-SPECROOTS (above) is what keeps every spec named by a runner.
+
+**Invariant.** A verdict or witness line that a QEMU lane prints on every healthy boot is REQUIREd by
+the spec for that lane, with a FORBID on its failure spelling where the kernel has one; a line that
+prints only on metal is listed below as scored from the metal capture, so its absence from every
+QEMU spec is a decision and not an oversight. The shape it closes is DOCKID2's (rmbp-ledger B165):
+`:: DOCKID:` printed on every wc capture, no spec read it, and a regression rode green through the
+gate.
+
+**The census (rmbp-ledger B184, 2026-09-23), measured on this arc's three fresh captures** —
+default `UNAOS_WC=1 UNAOS_QEMU_FULL=1 ./arroyo test 120`, wc `UNAOS_WC=1 UNAOS_QUARRY=1
+UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_QEMU_FULL=1 ./arroyo test 240`, login `UNAOS_WC=1 UNAOS_QUARRY=1
+UNAOS_FTDIRX=1 UNAOS_LOGIN=1 UNAOS_LOGINST=1 UNAOS_QEMU_FULL=1 ./arroyo test 240`, all three rc 0,
+sidecars `mode=full completion=complete`. Go-red = the line(s) deleted from a COPY of the capture and
+the amended spec replayed.
+
+| line | printed on | pinned at | green replay | go-red (FIRST-SHORTFALL) |
+|---|---|---|---|---|
+| `:: EHCI-HID: ISRARM self-test: … -> PASS == witness ::` | all three | `x86-default.spec:360` + FORBIDs `:367` (FAIL), `:368` (SKIPPED) | 18/18 on all three | `x86-default.spec:360`, 17/18 |
+| `:: EHCI-HID: PASSPERIOD self-test: … -> PASS == witness ::` | all three | `x86-default.spec:361` + FORBID `:369` | 18/18 on all three | `x86-default.spec:361`, 17/18 |
+| `[status] poll n= answered= src=none took_us=` | all three (2 / 4 / 4 lines) | `x86-wc.spec:538` + FORBID `:539` — already pinned by MENUBATT2 (906e669c) | 28/28 | `x86-wc.spec:538`, 27/28 |
+| `[clip] set len= epoch=` | all three | `x86-wc.spec:650` | 28/28 | `x86-wc.spec:650`, 27/28 |
+| `[clip] copy unit=line len=` | all three | `x86-wc.spec:651` + FORBID `:657` (`[clip] refuse reason=`) | 28/28 | `x86-wc.spec:651`, 27/28 |
+| `[login] screen open window=<n> box= at ()` | login (5 lines, all fixture-driven) | `x86-login.spec:308` + FORBIDs `:313`, `:314` | 25/25 | `x86-login.spec:308`, 24/25 |
+| `[login] ignition desktop_up= console_routed= -> …` | login (2 lines, both the fixture's) | `x86-login.spec:264`, comment above it | 25/25 | `x86-login.spec:264`, 24/25 |
+
+Every new FORBID was also taken red on a copy of the green capture. Injected: the ISRARM SKIP line,
+`[clip] refuse reason=too-large len=5000 cap=4096` and both login declines, each `1 forbidden
+hit(s)`, rc 1. Flipped `-> PASS ==` to `-> FAIL ==` on the ISRARM and PASSPERIOD lines: each reads
+`2 forbidden hit(s)` (the file's FORBID and the default `-> FAIL`), rc 1.
+
+**What two of these pins do NOT prove, so a green is read for what it is.** Both `[login]` pins are
+satisfied by the loginst FIXTURES on x86, never by the boot. `users::screen_open_at_ignition`
+(`fs/users.rs:1089`) is called only by `tegra_desk_cascade` (`main.rs:9144`, aarch64) and by
+`ignition_leg`'s two arms (`video/login.rs:852`, `:856`). The x86 boot's own open,
+`screen_open_once` at `main.rs:6380`, is gated on `desktop_uefi::is_active()`, and
+`desktop_uefi::activate`'s only caller is the Kepler takeover (`drivers/gpu/kepler_display.rs:511`),
+so under QEMU it never runs and every windowed `[login] screen open` line is `login::open` reached
+from the PRESS, CLOSE and CONTROL legs. The pins hold the wording; the boot's own lines are metal-only.
+
+**Scored from the metal capture, and pinned by no QEMU spec, on purpose.** Counted with `awk index()`
+on the three captures above:
+
+| line | default | wc | login | why no QEMU pin |
+|---|---|---|---|---|
+| `[ioapic] census …` (`arch/x86_64/ioapic.rs:385`) | 0 | 0 | 0 | behind `UNAOS_IOAPIC` (B147), which none of these lanes arms; absent from flight 11's image (`git grep` at 56bbe53b empty), so its first reading is a flight's |
+| `:: EHCI-HID: [n] [tp] mode wrote= …` (`drivers/ehci/mod.rs:4883`) | 0 | 0 | 0 | `bcm5974_mode_switch`'s readback, reached only when an Apple bcm5974 trackpad enumerates; QEMU has none, and flight 11's image predates it |
+| `[wc-x] desktop-app HOLD-NONE …` (`video/desktop_uefi.rs:786`) | 0 | 0 | 0 | the desktop-app seam runs only after the Kepler takeover (the STARTHOLD note in `x86-wc.spec`) |
+| `:: BPACE: pci-scan t= d= ::` | 4 | 4 | 4 | the LINE prints on every lane (`d=0ms`); what it is read for, B152's `d=` against flight 11's 1315 ms, is a metal value |
+| `[login] screen open window=<n>` from `main.rs:6380`, `[login] ignition` from `main.rs:9144` | — | — | — | see the paragraph above |
+
+**Legitimately updated** by re-pinning a line together with the kernel line it pins, in the same
+commit (each spec's CONTRACT block). A line that stops printing on a QEMU lane on purpose moves to
+the metal table here, with its reason.

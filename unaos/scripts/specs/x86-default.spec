@@ -333,3 +333,37 @@ FORBID :: BUSX86-WR: write side FAIL
 # ACL ran and the live-source refusal ran, `ok` says the owner was admitted, and `-ENOENT` says the
 # ordering between two destructive verbs on the same name is the one the wire asked for.
 REQUIRE :: BUSX86-EQ: .* write/rm/mv=-EBUSY/ok/-ENOENT .* -> PASS ::
+
+# ── SPECPINS2 (2026-09-23, rmbp-ledger B184), TAIL-APPENDED past STOR-1 M3 ────────────────────────
+# THE TWO EHCI-HID SELF-TESTS, pinned for the first time. Both print on every x86 QEMU boot and until
+# this block NO SPEC READ EITHER: a fixture whose verdict no spec reads can stop running and the verb
+# stays green, which is the DOCKID2 shape (rmbp-ledger B165, `:: DOCKID:` pinned by no spec).
+# UNCONDITIONAL on this lane: `drivers::ehci::init` is compiled by `ehcihid`, which `arroyo` arms by
+# default (opt-out `UNAOS_NOEHCIHID=1`), and it calls `isr_selftest` and `pass_period_selftest`
+# (`drivers/ehci/mod.rs:18091`, `:18095`) with no knob of their own. Rows: ISRARM is B146/B154's
+# completion-interrupt fixture, PASSPERIOD is B146's pass-period census fixture (EHCIDARK, da8c8e83).
+#
+# WHY HERE AND NOT BESIDE `:: BPACE: ehci-hid-done` IN x86-witness.spec. That file is the METAL
+# witness battery (paygo + logts + witness armed) and is replayed against a bench capture, never
+# against this lane. Flight 11's capture (`~/unaos-bench/scratch/rmbp-0915/bootwaits-logs/f11.log`)
+# carries ISRARM at 295 ms and NO PASSPERIOD line, because flight 11's image (56bbe53b) predates it:
+# `git grep 'PASSPERIOD self-test' 56bbe53b` is empty. A REQUIRE there would red the one metal
+# capture the bench holds for a reason about the image, not the boot; the metal pin waits for a
+# flight-12 capture.
+#
+# THE SHAPE. ISRARM's booleans are literal because PASS is their conjunction (`order_ok && payload_ok
+# && rearm_ok && toggle_ok && full_ok && modes == 2`), so a literal costs nothing and a later edit
+# that drops a field reds here instead of narrowing silently. `depth=` is the ring size, left open.
+# PASSPERIOD's numbers are the fixture's own synthetic ruler (99 x 1000 us + one 40000 us stall), and
+# the verdict already folds them (`max_us == 40_000 && mean_us == 1_390 && n == 100`), so they are
+# `\d+` here and the verdict gates.
+REQUIRE :: EHCI-HID: ISRARM self-test: modes=2 \(overlay-direct \+ qTD-chain\) depth=\d+ fifo=true payload=true rearm=true toggle=true ringfull-refuses=true -> PASS == witness ::
+REQUIRE :: EHCI-HID: PASSPERIOD self-test: samples=\d+ backwards-delta-refused=true tick=1000us stall=40000us -> pass_period_us_max=\d+ pass_period_us_mean=\d+ -> PASS == witness ::
+# The FAIL spellings are the fixtures' own verdict token, stated here so this file gates alone (the
+# DEFAULT_FORBIDS `-> FAIL` catches them too). The ISRARM SKIP is the fixture's one decline: `phys_of`
+# refused the static `DMA_POOLS[0]` slot (`drivers/ehci/mod.rs:15236`), the same refusal
+# `arm_interrupt_ep` would make, so the ISR path went UNTESTED. The REQUIRE above already misses on
+# it; the FORBID names it, because a skipped ISR fixture is the silence this block exists to end.
+FORBID :: EHCI-HID: ISRARM self-test: .* -> FAIL
+FORBID :: EHCI-HID: ISRARM self-test SKIPPED
+FORBID :: EHCI-HID: PASSPERIOD self-test: .* -> FAIL

@@ -254,6 +254,17 @@ REQUIRE \[users\] home=/home/una (created|exists) volume=[0-9a-f]{8}
 # as well as health for its own leg, which covers it. What is NOT covered by any of them is the boot
 # reaching the storage pass at all: `users::service` is where the whole battery is chained from, and
 # until the root volume answers it prints nothing and returns. This line is that pass's own witness.
+# ⚠ SPECPINS2 (2026-09-23, rmbp-ledger B184): ON x86 THIS PIN IS FIXTURE-PROOF, NEVER THE BOOT'S LINE.
+# The only emitter is `users::screen_open_at_ignition` (`fs/users.rs:1089`), and its only callers are
+# the Tegra desk cascade (`main.rs:9144`, inside `tegra_desk_cascade`, cfg aarch64 + `deskcascade`)
+# and the login fixture's IGNITION leg (`video/login.rs:852` for HELD, `:856` for OPEN, inside
+# `ignition_leg`, cfg `loginst`). The x86 boot opens the screen through `screen_open_once` at
+# `main.rs:6380` (`x86_render_service`), which prints no `[login] ignition` line. So on this lane both
+# matching lines are the fixture's two arms — measured at lines 1260 (HELD) and 1261 (OPEN) of
+# `~/unaos-bench/scratch/rmbp-0915/specpins2-logs/run3-login-serial.log`, directly above
+# `:: LOGIN-IGNITION:` at 1263 — and a green here says the storage pass reached the battery, which is
+# what the paragraph above claims, and NOTHING about how the x86 boot's own screen came up. Kept, not
+# removed: it is the storage-pass witness. Do not read it as the ignition's.
 REQUIRE \[login\] ignition desktop_up=(true|false) console_routed=(true|false) -> (OPEN|HELD)
 
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
@@ -279,3 +290,29 @@ REQUIRE \[login\] ignition desktop_up=(true|false) console_routed=(true|false) -
 #
 # GATE-SPECROOTS (`scripts/spec-roots.sh`, a leg of `./arroyo check`) reds by name on any spec under
 # scripts/specs/ that is neither named in `arroyo`'s CODE nor carries a RUN-BY line above.
+
+# ── 9. SPECPINS2 (2026-09-23, rmbp-ledger B184), TAIL-APPENDED past the contract block ──────────
+# THE WINDOWED OPEN. `[login] screen open window=<n> box=<w>x<h> at (<x>,<y>)` (`video/login.rs:501`)
+# is the one line that says the screen got a REAL `wm` row, and no spec read it. §7 pins what a person
+# does at the screen; this pins that there was a screen to do it at.
+#
+# WHO PRINTS IT ON THIS LANE, measured, because it is NOT the boot. The x86 boot's own open is
+# `screen_open_once` at `main.rs:6380`, gated `if desktop` where `desktop = desktop_owns_backdrop()` =
+# `desktop_uefi::is_active()` — and `desktop_uefi::activate`'s only caller is the Kepler takeover
+# (`drivers/gpu/kepler_display.rs:511`). QEMU has no Kepler, so that call never runs here. Every
+# windowed line on this lane is `login::open` reached from the loginst battery: the first
+# (`window=2`, line 1213 of `~/unaos-bench/scratch/rmbp-0915/specpins2-logs/run3-login-serial.log`)
+# follows `[login] logged out — screen returns` at 1203, i.e. `reopen_after_logout`
+# (`video/login.rs:525`), inside the PRESS leg (its verdict at 1259); the rest are the CLOSE leg's
+# (1269, 1289) and the CONTROL leg's (1296, 1317; verdict at 1321). Same function and the same format
+# string as the boot's open, so the WORDING is pinned here; the boot's own line is metal-only and is
+# scored from the metal capture, the same limit §8's ignition pin carries.
+#
+# NO NUMERICS: the id and the geometry depend on the window table and the panel (this file's header).
+REQUIRE \[login\] screen open window=\d+ box=\d+x\d+ at \(\d+,\d+\)
+# The two declines that are HONEST elsewhere and not here: `no surface yet` (`wm::spawn_geometry`
+# answered nothing) and `create refused` (`wm::create_at` returned `WIN_NONE`). This lane has a panel
+# and a window table, so either one is the screen falling back to a headless form on a machine that
+# can draw it. `window=no (fixture — headless form)` is NOT forbidden: the fixtures ask for it.
+FORBID \[login\] screen open window=no \(no surface yet
+FORBID \[login\] screen open window=no \(create refused
