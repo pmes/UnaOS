@@ -62,11 +62,13 @@
 //!
 //! # What is NOT here
 //!
-//! **No consumer of `Copy`/`Cut`/`Paste`/`SelectAll` exists.** There is no clipboard in this tree
-//! (measured: `grep -r -i clipboard video/` finds prose only), so those rows RESOLVE and go no
-//! further. The delivery seam is named in `docs/dev/OS/08_VIDEO/keymap.md` §Delivery and is one
-//! `pal::Event` variant away; `pal.rs` was not in KEYMAP's brief, so the arc stops at the resolver
-//! and says so rather than inventing a second event path beside `pal::push_event`.
+//! **The consumer of `Copy`/`Cut`/`Paste`/`SelectAll` is not here, and neither is the clipboard.**
+//! Both exist since APPCLIP (rmbp-ledger B176): the decoders push a resolved non-capture action
+//! onto the input ring as `pal::Event::Action`, `video/clipboard.rs` holds the one session-owned
+//! text buffer, and the terminal is its first consumer (`clipboard::terminal_action`) — `Paste`
+//! types the clipboard into the shell line and `Copy` copies the whole line, while `Cut` and
+//! `SelectAll` arrive and are witnessed `[clip] unsupported … reason=no-selection-model`. This file
+//! still only RESOLVES; what an action does is `clipboard.md`'s to say, not this file's.
 //!
 //! **`LogOut` is a SLOT.** `⌘⇧Q` resolves to [`Action::LogOut`] and nothing in this tree acts on
 //! it. LOGINFLOW may bind it; nothing else may.
@@ -82,13 +84,13 @@ pub enum Action {
     /// Region capture. Honoured as a whole-screen capture until a pointer selector exists — the
     /// same reservation `hid_screenshot_chord_edge` carried for `⌘⇧4`, moved to the table.
     ScreenshotRegion,
-    /// R61's first row. No consumer: there is no clipboard.
+    /// R61's first row. Consumed by the terminal (`clipboard::terminal_action`).
     Copy,
-    /// R61. No consumer.
+    /// R61. Delivered; the terminal witnesses it `unsupported` (no selection model).
     Cut,
-    /// R61. No consumer.
+    /// R61. Consumed by the terminal: types the clipboard through the ring.
     Paste,
-    /// R61. No consumer.
+    /// R61. Delivered; the terminal witnesses it `unsupported` (no selection model).
     SelectAll,
     /// The SLOT. LOGINFLOW may bind it; nothing else may, and nothing acts on it today.
     LogOut,

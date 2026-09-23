@@ -159,3 +159,110 @@ is a different event: a dropped motion is re-carried by the next report, and a l
 * **Quarry's consumer.** The file manager is on the glass at boot on a `quarry` image and has its own
   keyboard door; `⌘C` on a file is a different meaning of the same action, and the seam for it is
   `terminal_action`'s shape, not a second event.
+
+## 7. The terminal selection — TERMSEL (design, M0)
+
+APPCLIP's `⌘C` copies the whole input line because nothing recorded which characters were selected
+(§3). This section is the model that records it. It is the smallest selection that is honest about
+what the terminal holds, and it names what it leaves for later.
+
+### 7.1 What the terminal's text model is
+
+Measured at the branch's parent (`98fd8e66`), in `unaos/crates/kernel/src/console.rs` and
+`main.rs::handle_key`:
+
+| Part | What it is |
+|---|---|
+| `Console::history` | a `Vec<String>` scrollback, bounded at `HISTORY_MAX` = 256 lines, drop-oldest, painted read-only in grey. |
+| `Console::current_input` | ONE editable `String`: the shell line. |
+| the editor | `handle_key` is the only code that changes `current_input`, and it has exactly three edits: a printable byte (0x20..0x7E) is APPENDED, BS/DEL POPS the last byte, CR/LF dispatches the line and clears it. |
+| the caret | **there is none.** The block cursor is painted one cell past the last character (`draw_prompt_line`), and no key moves it: the arrow keys reach `handle_key` as `0x1C..0x1F` and fall through every arm. |
+| a cell | one byte. Every byte in `current_input` is printable ASCII (the only arm that inserts tests `32..=126`, and a paste arrives through that arm as `Event::Key`), so a byte offset and a cell column are the same number. |
+
+### 7.2 What can be selected
+
+**A contiguous run of cells in the editable line, and nothing else.** A selection is two offsets into
+`current_input`: an ANCHOR, where it started, and a HEAD, the end that moves. Because the editor
+has no caret, a selection that starts from nothing starts with both at the end of the line — the
+place the block cursor is painted — so the first `Shift+←` selects the last character, exactly as
+it does on a Mac text field whose caret sits at the end.
+
+The scrollback is NOT selectable in this arc. It is already in memory and could be, but reaching a
+line above the prompt from the keyboard needs a vertical motion (`Shift+↑`/`Shift+↓` walking into
+`history`) and a rule for what a cut does to a read-only line; neither is asked for here, and a
+selection that can reach only the editable line has no read-only case to get wrong. Scrollback
+selection arrives with the pointer (§7.7).
+
+### 7.3 How a selection is made — every chord is a row in the theme's table
+
+No chord is tested in terminal code. Each is a `Binding` in `video/theme.rs`, resolved by
+`keymap::resolve` at the HID decoder, and delivered as `pal::Event::Action` exactly as `⌘C` is
+(§1). Five new `keymap::Action` variants carry them:
+
+| Action | Token | What it does to the selection | CRISPY (Mac) | PC |
+|---|---|---|---|---|
+| `SelectLeft` | `select-left` | HEAD one cell left (stops at 0) | `Shift+←` | `Shift+←` |
+| `SelectRight` | `select-right` | HEAD one cell right (stops at the line end) | `Shift+→` | `Shift+→` |
+| `SelectLineStart` | `select-line-start` | HEAD to cell 0 | `Cmd+Shift+←`, `Shift+Home` | `Shift+Home` |
+| `SelectLineEnd` | `select-line-end` | HEAD to the line end | `Cmd+Shift+→`, `Shift+End` | `Shift+End` |
+| `SelectAll` (exists) | `select-all` | ANCHOR 0, HEAD the line end | `Cmd+A` | `Alt+A` |
+| `Deselect` | `deselect` | clears it | `Esc` | `Esc` |
+
+`Cmd+Shift+←/→` is on the Mac table because it is the Mac's own chord for "to the start/end of the
+line", and because **the rMBP's internal keyboard has no Home or End key**. `Shift+Home/End` is on
+both tables so an external PC keyboard works on either. A selection whose ANCHOR and HEAD meet is
+no selection (it collapses, and the witness says so).
+
+`Esc` is a row with no roles, like Print Screen. It does not stop being a key: the decoders push the
+`0x1B` `Event::Key` exactly as before and push the `Deselect` action beside it, so a menu that
+dismisses on `0x1B` still sees it. R24 (as heard by orin 17) is about Esc and app windows — *"esc
+should not close any app windows"* — and clearing a selection closes nothing.
+
+### 7.4 What an edit does to a selection
+
+**Any edit drops it.** A typed character, a Backspace, a Return, and every byte of a paste (which
+is typed through the same arm) clear the selection before they change the line. A Mac text field
+REPLACES a selection with what is typed; that needs a caret to put the replacement where the
+selection was, and this editor appends at the end and nowhere else. Replace-on-type is owed with a
+caret, and until then an edit that silently kept a selection over text that has moved would paint a
+band over the wrong cells.
+
+### 7.5 What the clipboard chords do
+
+| Chord | With a selection | With none |
+|---|---|---|
+| `Copy` | copies the SELECTED cells (`[clip] copy unit=selection len=N`); the selection stays | copies the whole line (`[clip] copy unit=line len=N`) — **APPCLIP's behaviour, unchanged** |
+| `Cut` | copies the selected cells and REMOVES them from the editable line; the selection clears | declined and witnessed (`[clip] cut refused reason=no-selection`) |
+| `Paste` | types the clipboard (§3); the first typed byte drops the selection (§7.4) | types the clipboard (§3) |
+
+Cut can only ever remove cells from the editable line, because that is the only line a selection
+can reach (§7.2). If scrollback selection lands, cut there must refuse — the scrollback is output,
+not input.
+
+### 7.6 How it is shown, and the wire
+
+**Shown:** an inverse-video band painted by the terminal's own painter, `Console::draw_prompt_line`
+— the shared routine the full repaint and the per-keystroke fast path both call — so the band can
+never disagree between the two. The band is the selected cells filled with the text colour and the
+selected characters redrawn in the console background colour; the block cursor stays where it is.
+
+**Wire:** ONE line per STATE CHANGE, from the model and never from the painter (a repaint is not a
+change):
+
+```
+[termsel] sel=<lo>..<hi> cells=<n> line=<len> by=<action-token|edit|cut>
+[termsel] none line=<len> by=<action-token|edit|cut>
+```
+
+No selected TEXT is printed — the `[clip]` lines print lengths only, for the same reason.
+
+### 7.7 What this arc does NOT do
+
+* **Pointer selection** — drag to select, double-click a word, and with it scrollback selection. The
+  x86 shell has no click model (`main.rs`'s `Event::Button` arm is empty by design); that is the
+  next arc, and it writes into the same ANCHOR/HEAD pair.
+* **A caret.** Without one, a selection always starts at the line end and an edit cannot replace
+  it (§7.4).
+* **The fixture cannot press a key.** QEMU has no operator's hands (§4); the chords are resolved
+  through the table from synthetic report pairs and pushed through the REAL ring, which is the
+  proof available off metal. The decoder half and the painted band are flight 12's to see.
