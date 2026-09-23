@@ -256,6 +256,28 @@ FORBID :: VUGPERF: .* :: FAIL ::
 # --- carries ZERO `[wc-x] move-vacate` lines. A REQUIRE for it here would red every run of this
 # --- gate forever. It is a PENDING in `x86-witness.spec`, where the boot that prints it lives.
 
+# --- KEYMAP (R60/R61, 2026-09-22) -------------------------------------------------------------
+# --- The binding TABLE's resolver. `video/keymap.rs`'s fixture is chained from
+# --- `drivers::ehci::parser_selftest`, which this lane runs on every boot (`:: EHCI-HID:
+# --- report-parser self-test:` is on every capture of it), and it is the ONLY QEMU-provable
+# --- witness for the chord path: QEMU has no operator's hands, so no real chord is ever pressed
+# --- here and `:: PRTSCR: [prtscr] chord=` has never appeared on this lane at all (measured
+# --- 2026-09-22: 0 hits across every QEMU capture under ~/unaos-bench/scratch/rmbp-0915/*-logs/;
+# --- the only captures carrying it are the metal flight-11 logs). What the fixture proves is the
+# --- DECISION, which is the whole of what R60 moved out of the two USB drivers.
+# --- NO NUMERICS PINNED: `resolved=` is \d+ because it counts AGREEMENTS and a future row raises
+# --- it. The VERDICT token gates — `-> PASS`, and a `-> FAIL` reds through the harness default
+# --- rule — and beside it three fields are named VERBATIM, chosen because each would still read
+# --- `ok` if the thing it measures were broken: `ctrl_c_ascii=0x03` (R61 — the shell's byte,
+# --- measured through `hid_key_ascii`, not asserted), `ctrl_c_action=none` (R61 — the table never
+# --- claims Ctrl-C, which is why no terminal special case exists) and `pc_table_alt_c=copy` (R60 —
+# --- the SAME role row read through a table whose `cmd_role` is `HID_MOD_ALT`; if the role
+# --- indirection were cosmetic this one field would read `none` while every other stayed `ok`).
+# --- GO-RED, ONE EDIT: delete the `Cmd+C` row from `theme::CRISPY_ROWS` -> `copy=no`, `resolved=`
+# --- drops by one, verdict `-> FAIL`.
+REQUIRE :: KEYMAP: table=crispy resolved=\d+ .* ctrl_c_ascii=0x03 ctrl_c_action=none pc_table_alt_c=copy .* -> PASS ::
+
+
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
 # A PINNED LINE IN THIS FILE IS CHANGED TOGETHER WITH THE KERNEL LINE IT PINS, IN THE SAME COMMIT —
 # re-pinned to the new wording (naming the arc that changed it), or dropped with the reason stated.

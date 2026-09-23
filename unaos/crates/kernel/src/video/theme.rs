@@ -528,3 +528,89 @@ const _: () = {
     assert!(GLOSS_FALLOFF_Q16 <= Q16_ONE);
     assert!(GLOSS_FALLOFF_Q16 >= Q16_ONE / 100);
 };
+
+// --- KEYMAP (R60, R61) — THE THEME OWNS ITS KEY BINDINGS ---------------------------------------
+//
+// Peter, 2026-09-22 (R60): *"we will be implementing a windows-esque them at some point so
+// key-bindings shouldn't be hard coded."* A chord is a property of the THEME, exactly as the
+// screenshot destination is (R60's other half, `video/prtscr.rs`'s `SCRSHOT-DESKTOP`). So the
+// tables live HERE, beside the colours and the metrics, and `video/keymap.rs` holds only the
+// mechanism that reads them.
+//
+// TAIL-APPENDED, never folded into the body above: this module is lexed into every image and a
+// line inserted mid-file moves every `panic::Location` below it (LEDGER P7). Nothing follows this
+// block, so nothing moves.
+
+use super::keymap::{Action, Binding, Table, CMD, SHIFT};
+
+/// CRISPY's rows. PRECEDENCE ORDER — the resolver takes the first row whose usage edged and whose
+/// roles are held, so the two-modifier chords are written above the one-modifier ones. Every row
+/// is written in ROLE space (`CMD`), never in HID space; [`CRISPY_BINDINGS`] says what `CMD` is.
+///
+/// HID usages are Keyboard/Keypad page ids (HUT 1.12 §10) and match
+/// `drivers::xhci::HID_SCANCODE_TO_ASCII`'s index: `a`=0x04, `c`=0x06, `q`=0x14, `v`=0x19,
+/// `x`=0x1B, `3`=0x20, `4`=0x21, Print Screen = 0x46.
+pub static CRISPY_ROWS: [Binding; 8] = [
+    // The two chords flight 11 proved on metal. Their tokens are the exact bytes the `[prtscr]`
+    // witness has always carried, so a capture from before KEYMAP and one from after grep alike.
+    Binding { roles: CMD | SHIFT, usage: 0x20, action: Action::Screenshot, token: "cmd-shift-3" },
+    Binding { roles: CMD | SHIFT, usage: 0x21, action: Action::ScreenshotRegion, token: "cmd-shift-4" },
+    // The SLOT (R60). LOGINFLOW may bind it; nothing else may, and nothing acts on it today.
+    Binding { roles: CMD | SHIFT, usage: 0x14, action: Action::LogOut, token: "cmd-shift-q" },
+    // R61's four. No consumer — there is no clipboard in this tree.
+    Binding { roles: CMD, usage: 0x06, action: Action::Copy, token: "cmd-c" },
+    Binding { roles: CMD, usage: 0x19, action: Action::Paste, token: "cmd-v" },
+    Binding { roles: CMD, usage: 0x1B, action: Action::Cut, token: "cmd-x" },
+    Binding { roles: CMD, usage: 0x04, action: Action::SelectAll, token: "cmd-a" },
+    // Print Screen. `roles: 0` — the key means capture whatever else is held, which is precisely
+    // what the `0x46` edge did before it was a row. A theme that drops this row disarms the key.
+    Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: "print-screen" },
+];
+
+/// **The desktop's live table.** `cmd_role` is `HID_MOD_GUI`, so every `CMD` above is the Command
+/// key on the operator's Apple keyboard, left or right.
+pub static CRISPY_BINDINGS: &Table = &Table {
+    name: "crispy",
+    cmd_role: crate::drivers::xhci::HID_MOD_GUI,
+    rows: &CRISPY_ROWS,
+};
+
+/// A PC-shaped table. IT EXISTS TO PROVE THE SEAM AND IS SELECTED BY NOTHING — compiled,
+/// resolvable, and reached today only by `keymap::selftest`'s `pc_table_alt_c=` leg. A knob that
+/// selects it is NOT this arc; when one is written it changes `keymap::active()` and nothing else.
+///
+/// The rows are the SAME rows in role space. What differs is one field — `cmd_role` — plus the
+/// keyboard the operator is typing on: `Alt+C` is copy on a PC because R61 says the Command role
+/// moves to Alt there, not because a second Copy row was written.
+pub static PC_ROWS: [Binding; 6] = [
+    // PrtSc. The SHIFTED row is written ABOVE the bare one, and it has to be: the bare row names
+    // no roles, so it matches with Shift held too and would shadow the region chord entirely. That
+    // is this table's one ordering hazard; the `const` block at the foot of this file checks it.
+    Binding { roles: SHIFT, usage: 0x46, action: Action::ScreenshotRegion, token: "shift-prtsc" },
+    Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: "prtsc" },
+    Binding { roles: CMD, usage: 0x06, action: Action::Copy, token: "alt-c" },
+    Binding { roles: CMD, usage: 0x19, action: Action::Paste, token: "alt-v" },
+    Binding { roles: CMD, usage: 0x1B, action: Action::Cut, token: "alt-x" },
+    Binding { roles: CMD, usage: 0x04, action: Action::SelectAll, token: "alt-a" },
+];
+
+/// The PC table. `cmd_role` is `HID_MOD_ALT` — R61's *"(alt-c on pc)"*, and the one field that
+/// makes the whole difference.
+pub static PC_BINDINGS: &Table = &Table {
+    name: "pc",
+    cmd_role: crate::drivers::xhci::HID_MOD_ALT,
+    rows: &PC_ROWS,
+};
+
+/// The tables' two structural contracts, checked at compile time beside the kit's own colour
+/// assertions above.
+const _: () = {
+    // The two tables must DISAGREE about the physical Command key, or the role indirection is a
+    // no-op wearing a name and `pc_table_alt_c=` in the fixture proves nothing.
+    assert!(CRISPY_BINDINGS.cmd_role != PC_BINDINGS.cmd_role);
+    // No row may shadow a later one (see `keymap::no_shadow`). This is what stops a bare-modifier
+    // row being written above a chord that needs one — the failure that disarms a binding in
+    // silence.
+    assert!(super::keymap::no_shadow(&CRISPY_ROWS));
+    assert!(super::keymap::no_shadow(&PC_ROWS));
+};

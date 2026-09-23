@@ -16736,23 +16736,23 @@ unsafe fn decode_boot_keyboard(
     // capture runs on the device-service pass; a filesystem write from in here would contend the
     // xHCI storage loan from inside the EHCI pass and hold the keyboard and trackpad hostage for
     // seconds, which is the argument `holocron`'s deferred write already makes at its call site.
-    if super::xhci::hid_print_screen_edge(&cur_keys, prev_keys) {
-        serial_println!(":: PRTSCR: PrintScreen (HID 0x46) down on EHCI -> capture armed ::");
-        crate::video::prtscr::request();
-    } else if let Some(chord) =
+    if let Some(act) = super::xhci::hid_print_screen_action_edge(&cur_keys, prev_keys, modifiers) {
+        // KEYMAP (R60): the 0x46 EDGE is detected as it always was; what the usage MEANS comes from
+        // the theme's binding table now, so a theme that drops the row disarms the key here too.
+        serial_println!(":: PRTSCR: PrintScreen (HID 0x46) down on EHCI -> capture armed action={} ::", act.name());
+        if act.is_capture() { crate::video::prtscr::request(); }
+    } else if let Some((act, chord)) =
         super::xhci::hid_screenshot_chord_edge(&cur_keys, prev_keys, modifiers)
     {
-        // PRTSCRCHORD: ⌘⇧3 / ⌘⇧4 — the Apple chords, because the rMBP's internal keyboard has no
-        // Print Screen key and so never puts 0x46 on this wire. Same shared predicate shape, same
-        // request, same deferral; `modifiers` is this report's byte 0, already in scope. `else if`
-        // so a report carrying both 0x46 and a chord arms exactly once. The chord types nothing:
-        // `ascii_of` above folds any GUI-held usage to 0 (see `hid_screenshot_chord_edge`).
-        serial_println!(
-            ":: PRTSCR: [prtscr] chord={} (GUI+Shift+digit) down on EHCI -> capture armed ::",
-            chord
-        );
-        crate::video::prtscr::request();
-    }
+        // KEYMAP (R60) — the path that matters on the bench: the rMBP's internal keyboard has no Print
+        // Screen key and so never puts 0x46 on this wire. The chord is no longer TESTED here or in the
+        // shared predicate — `video::keymap::resolve` judges it against the theme's table and this
+        // decoder only asks. Same request, same deferral; `else if` so a report carrying both 0x46 and
+        // a chord arms exactly once. The chord types nothing: `ascii_of` above folds any GUI-held (and
+        // any Alt-held) usage to 0, which covers a PC-shaped table with no new rule.
+        if act.is_capture() { serial_println!(
+            ":: PRTSCR: [prtscr] chord={} (GUI+Shift+digit) down on EHCI -> capture armed action={} ::",
+            chord, act.name()); crate::video::prtscr::request(); } }
 
     *prev_keys = cur_keys;
     // ALLKEYS: remember this accepted report's modifier byte, so a later endpoint-death flush can
@@ -17790,7 +17790,7 @@ unsafe fn parser_selftest() {
     // TRACKPAD (B139): the id DISPATCHER, fed flight 11's own four captured reports. Runs on every
     // build for the same reason `vendor_multitouch_selftest` does — the routing decision is the
     // only part of the trackpad path QEMU can exercise at all, since QEMU has no Apple pad.
-    trackpad_dispatch_selftest();
+    trackpad_dispatch_selftest(); crate::video::keymap::selftest(); // KEYMAP (R60/R61) — the BINDING TABLE's resolver, chained here for the reason the line already carries: the DECISION is the only part of an input path QEMU can exercise at all, since QEMU has neither an Apple pad nor an operator's hands. This selftest chain is on the x86 `wc` lane's boot (`:: EHCI-HID: report-parser self-test:` is on every capture of it), so `:: KEYMAP: ... -> PASS ::` is scored by scripts/specs/x86-wc.spec. It resolves only — it arms no capture and requests nothing — so the lane behaves exactly as it did. ⚠ FOLDED onto the existing statement, never given a line of its own: this file is 18k lines and a line added anywhere in it moves every `panic::Location` below (B94, LEDGER P7); CODE FIRST, all of it, then the prose (A10FIX).
     // MT-INVESTIGATION (IVY, `mtraw` only): the ONLY QEMU-provable witness for the raw TYPE2
     // decoder — QEMU has no Wellspring pad, so a synthetic frame stands in. Compiled out (and so
     // silent) on a default build.

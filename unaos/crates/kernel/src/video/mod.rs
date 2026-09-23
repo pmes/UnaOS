@@ -132,7 +132,7 @@ pub mod crystal;
 // CRISPY-PI theme const table — carried verbatim from hw-pi4 (single-author law: edits flow
 // through the pi4 seat from the taste-gate). Declared for INSTGUI's use; full chrome wiring
 // (wm/fbcon reading these instead of their own constants) remains the later lockstep arc.
-pub mod theme;
+pub mod theme; pub mod keymap; // KEYMAP (R60) — the desktop's key BINDINGS, declared beside the theme that OWNS them, because that is the relationship: a chord is a property of the theme exactly as a colour is. `keymap.rs` holds the mechanism (the `Action` enum, `Binding`, `Table`, and the ONE resolver both HID decoders ask instead of testing chords as literals); `theme.rs` holds the rows. Unconditional, for the reason `theme` is: the decoders that call the resolver are unconditional code, so a knob-gated resolver would be a compile error on the default image. ⚠ FOLDED onto the `theme` line and given none of its own — this module root is lexed into every image and a line added here moves every `panic::Location` below it (LEDGER P7); LAWS' "a cfg'd-out `pub mod` declaration is the exception" does not apply, this declaration is not cfg'd.
 // PAPER — the Crispy kit's `content_surface.Paper` material, the multi-octave noise generator
 // `theme.rs` and engine.md §9 deliberately left unlifted, ported to integer Q16 (the kernel has no
 // float and no libm). A CONTENT surface only — Peter's white-board ruling is that the paper is NOT

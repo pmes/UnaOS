@@ -326,58 +326,58 @@ pub(crate) fn hid_print_screen_edge(cur_keys: &[u8; 6], prev_keys: &[u8; 6]) -> 
     cur_keys.contains(&HID_USAGE_PRINT_SCREEN) && !prev_keys.contains(&HID_USAGE_PRINT_SCREEN)
 }
 
-/// PRTSCRCHORD — HID usages `3` (0x20) and `4` (0x21), "Keyboard 3 and #" / "Keyboard 4 and $".
-pub(crate) const HID_USAGE_DIGIT_3: u8 = 0x20;
-pub(crate) const HID_USAGE_DIGIT_4: u8 = 0x21;
-
-/// PRTSCRCHORD — **did an Apple screenshot chord go DOWN in this report?** ⌘⇧3 (GUI+Shift+3) and
-/// ⌘⇧4 (GUI+Shift+4), judged at the same seam as [`hid_print_screen_edge`] and for the same reason:
-/// the rMBP's INTERNAL Apple keyboard never emits usage 0x46 — there is no Print Screen key on it —
-/// so the metal-proven capture (flight 5, `SCREEN2.PNG` 2880x1800) was bound to a key the bench
-/// machine cannot press. These two chords are what every Mac operator's hands already know.
+/// PRTSCRCHORD -> KEYMAP (R60). The two usages this file used to name — `3` (0x20) and `4` (0x21)
+/// — are ROWS in `video::theme::CRISPY_ROWS` now, and the `HID_USAGE_DIGIT_*` consts that stood
+/// here are deleted with them. A decoder that cannot name a chord's usage cannot hard-code a
+/// chord, which is exactly the property R60 asks for.
 ///
-/// WHY THIS LAYER. The chord is a MODIFIER BYTE plus a USAGE, and the boot report is the only place
+/// **did a bound chord go DOWN in this report?** Asked at the same seam as
+/// [`hid_print_screen_edge`] and for the same reason: the rMBP's INTERNAL Apple keyboard never
+/// emits usage 0x46 — there is no Print Screen key on it — so the metal-proven capture (flight 5,
+/// `SCREEN2.PNG` 2880x1800) was bound to a key the bench machine cannot press. ⌘⇧3 / ⌘⇧4 are what
+/// every Mac operator's hands already know; on a Windows-shaped theme they will be different
+/// chords, resolved by this same call, with no edit to this driver.
+///
+/// WHY THIS LAYER. A chord is a MODIFIER BYTE plus a USAGE, and the boot report is the only place
 /// both are in one hand: above the driver `pal::Event::Key` is a bare `u8` with no modifier field,
 /// and [`hid_key_ascii`] folds every GUI-held key to 0, so above the driver ⌘⇧3 does not exist.
 /// Both decoders already have `modifiers` (report byte 0), `cur_keys` and `prev_keys` in scope at
-/// the 0x46 site; this predicate sits beside it and is asked right after it.
+/// the 0x46 site; this hand-off sits beside it and is asked right after it.
 ///
-/// THE TEST. Both a GUI bit (bit 3 LGUI / bit 7 RGUI — `HID_MOD_GUI`) and a Shift bit (bit 1 / bit
-/// 5 — `HID_MOD_SHIFT`) held, and the digit present NOW and absent from the PREVIOUS report — an
-/// edge, diffed exactly as the lock keys and 0x46 are, so a chord held for half a second arms one
-/// capture and not one per restated report. Left and right of each modifier count alike. Extra
-/// modifiers (Ctrl, Alt) do not disqualify the chord: on macOS ⌃⌘⇧3 is still a screenshot.
+/// WHAT IS LEFT HERE IS THE HAND-OFF AND NOTHING ELSE. The edge diff, the modifier test, the
+/// precedence and the meaning are all [`crate::video::keymap`]'s, and every rule the old body
+/// carried is carried there: extra modifiers do not disqualify (⌃⌘⇧3 is still a screenshot), left
+/// and right of each modifier count alike, and a chord held across reports edges once.
 ///
 /// THE CHORD TYPES NOTHING, BY CONSTRUCTION. [`hid_key_ascii`] returns 0 for any usage while a GUI
-/// bit is held (the "GUI and Alt suppress the key entirely" rule), so the character loops above the
-/// call site emit no `Key('3')` / `Key('#')` for the chord — the same suppression 0x46 gets from its
-/// `(0, 0)` table entry, reached through the modifier instead of the table. The release path
-/// (`hid_key_release_ascii`) deliberately ignores GUI and will emit a lone `KeyUp('#')` when the
-/// digit lifts; that is the documented "spurious release, safe" case and is left alone.
+/// **or** an Alt bit is held, so the character loops above the call site emit no `Key('3')` /
+/// `Key('#')` for the chord — and the same suppression already covers a PC table's `Alt+C`, so the
+/// seam needed no new rule. The release path (`hid_key_release_ascii`) deliberately ignores GUI and
+/// will emit a lone `KeyUp('#')` when the digit lifts; that is the documented "spurious release,
+/// safe" case and is left alone.
 ///
-/// ⌘⇧4 is bound to the SAME whole-screen capture. On macOS it is region-select; region-select is
-/// reserved here (no pointer-driven selection exists yet) and the chord is honoured as a capture
-/// rather than ignored, so the witness names which chord fired.
-///
-/// Returns the chord's witness token, or `None`. The caller does exactly what the 0x46 caller does:
-/// one witness line and `prtscr::request()` — one atomic store, inside the controller's lock.
+/// Returns the resolved [`crate::video::keymap::Action`] and the row's witness token, or `None`.
 #[inline]
 pub(crate) fn hid_screenshot_chord_edge(
     cur_keys: &[u8; 6],
     prev_keys: &[u8; 6],
     modifiers: u8,
-) -> Option<&'static str> {
-    if modifiers & HID_MOD_GUI == 0 || modifiers & HID_MOD_SHIFT == 0 {
-        return None;
-    }
-    if cur_keys.contains(&HID_USAGE_DIGIT_3) && !prev_keys.contains(&HID_USAGE_DIGIT_3) {
-        return Some("cmd-shift-3");
-    }
-    if cur_keys.contains(&HID_USAGE_DIGIT_4) && !prev_keys.contains(&HID_USAGE_DIGIT_4) {
-        // Reserved: region-select for cmd-shift-4 — whole-screen capture until a selector exists.
-        return Some("cmd-shift-4");
-    }
-    None
+) -> Option<(crate::video::keymap::Action, &'static str)> {
+    crate::video::keymap::resolve_edge(crate::video::keymap::active(), cur_keys, prev_keys, modifiers)
+}
+
+/// KEYMAP — the 0x46 press edge's MEANING, resolved through the theme's table instead of assumed.
+/// [`hid_print_screen_edge`] stays what it always was, a level diff on one usage; what that usage
+/// MEANS is the table's to say, so a theme with no Print Screen row disarms the key and a theme
+/// that binds it elsewhere is one row away. This is the second of the two literals R60 named.
+///
+/// Asked with the report's modifier byte because a table may bind a MODIFIED Print Screen (the PC
+/// table binds `Shift+PrtSc` to the region capture); CRISPY's row names no roles, so on this theme
+/// the answer is `Screenshot` whatever else is held — which is today's behaviour exactly.
+#[inline]
+pub(crate) fn hid_print_screen_action_edge(cur_keys: &[u8; 6], prev_keys: &[u8; 6], modifiers: u8) -> Option<crate::video::keymap::Action> {
+    if !hid_print_screen_edge(cur_keys, prev_keys) { return None; }
+    crate::video::keymap::resolve(crate::video::keymap::active(), modifiers, HID_USAGE_PRINT_SCREEN)
 }
 
 
@@ -5243,22 +5243,22 @@ impl XhciController {
                                             // returns; the capture happens on the device-service pass,
                                             // because a filesystem write from inside this pass would
                                             // hold the keyboard hostage for its whole duration.
-                                            if hid_print_screen_edge(&cur_keys, &prev_keys) {
+                                            if let Some(act) = hid_print_screen_action_edge(&cur_keys, &prev_keys, modifiers) {
+                                                // KEYMAP (R60) — the 0x46 EDGE is still detected here (an edge is not a chord), but what
+                                                // it MEANS is the theme table's to say now: a theme with no Print Screen row disarms the
+                                                // key. The witness keeps its shape and gains `action=`.
                                                 serial_println!(
-                                                    ":: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed ::"
+                                                    ":: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed action={} ::", act.name()
                                                 );
-                                                crate::video::prtscr::request();
-                                            } else if let Some(chord) =
-                                                hid_screenshot_chord_edge(&cur_keys, &prev_keys, modifiers)
-                                            {
-                                                // PRTSCRCHORD: ⌘⇧3 / ⌘⇧4 — same request, same deferral;
-                                                // the witness names which chord fired. `else if` so a
-                                                // report carrying both 0x46 and a chord arms once.
-                                                serial_println!(
-                                                    ":: PRTSCR: [prtscr] chord={} (GUI+Shift+digit) down on xHCI -> capture armed ::",
-                                                    chord
-                                                );
-                                                crate::video::prtscr::request();
+                                                if act.is_capture() { crate::video::prtscr::request(); }
+                                            } else if let Some((act, chord)) = hid_screenshot_chord_edge(&cur_keys, &prev_keys, modifiers) {
+                                                // KEYMAP: the chord is JUDGED by `video::keymap::resolve`, never tested here. `else if` so
+                                                // a report carrying both 0x46 and a chord arms once. An action that is NOT a capture
+                                                // (R61's ⌘C/⌘V/⌘X/⌘A, the ⌘⇧Q slot) resolves and stops here: no consumer exists yet.
+                                                if act.is_capture() { serial_println!(
+                                                    ":: PRTSCR: [prtscr] chord={} (GUI+Shift+digit) down on xHCI -> capture armed action={} ::",
+                                                    chord, act.name()
+                                                ); crate::video::prtscr::request(); }
                                             }
 
                                             // HID-LED: lock-key press edges. A lock key present in this
