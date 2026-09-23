@@ -23801,20 +23801,20 @@ pub fn u7x_probe_once() {
 //
 // x86 keys its ACL by `(slot, gen)` and carries NO persistent principal (U6x, above) — there is no
 // `PrincipalRecord` on this arch to stamp `user:<name>` into. The twin therefore carries the user as its
-// users-table ID: `SESSION_USER` (0 = no session) is copied into `SLOT_USER[slot]` at the two loader
+// users-table ID — SINCE SECLOGIN M2 THE `uid`, never reissued (`multiuser.md` §2): `SESSION_USER` (0 = no session) is copied into `SLOT_USER[slot]` at the two loader
 // returns (`spawn_user_image_bg_inner`, `run_user_image` — the callers of `load_program_common`), cleared
 // with the slot's generation in `clear_handle_row`, recorded on the owner row at a private create
 // (`OWNED_USER[nameid]`), and consulted ONLY on a live-incarnation DENY in `sys_open`'s two ACL sites: a
 // caller whose slot carries the same non-zero user as the row's creator is admitted. Same seam, same
 // two call sites, one extra equality — the x86 analogue of the aarch64 by-name branch. A row wiped at
 // owner teardown reverts to PUBLIC exactly as before (the user stamp is then never consulted), and a
-// re-create re-stamps it, so no stale admission survives a name's reuse.
+// re-create re-stamps it, so no stale admission survives a name's reuse. And since SECLOGIN M2 the number compared is the uid, so a user recreated into a RECYCLED table slot (B157 gap 3) or under a REUSED name carries a different number and is refused by the same line.
 //
 // HONEST RESIDUAL (reported, not hidden): x86 EL0 opens a STATIC 5-name table at the volume root
 // (`U10_NAMES`, SO20), so the M2 home-directory proof cannot run on this arch until the path-taking
 // open lands; M1's x86 proof is the session stamp + admission, driven by the shared `fs::users` fixture.
 
-/// LOGIN M1: the open session's users-table id (0 = none).
+/// LOGIN M1: the open session's uid (0 = none) — SECLOGIN M2: `fs::users::id_of`, the non-recyclable identity.
 #[cfg(feature = "login")]
 static SESSION_USER: AtomicU32 = AtomicU32::new(0);
 /// LOGIN M1: per-slot user stamp, taken at load from `SESSION_USER` (0 = anonymous).
@@ -23901,7 +23901,7 @@ fn owned_user_stamp(nameid: usize, slot: usize) {
     }
 }
 
-/// LOGIN M1: by-user admission — the caller's slot carries the same NON-ZERO user as the row's creator.
+/// LOGIN M1: by-user admission — the caller's slot carries the same NON-ZERO uid as the row's creator (SECLOGIN M2: the uid is never reissued, so a recycled slot or a reused name never matches).
 /// SO37: the caller's user is read through [`slot_user_live`], so a stamp from a CLOSED session is 0 and
 /// the `u != 0` guard this function has always had refuses it. No new deny branch, no new cost on the
 /// admit path: this whole function is only reached on a live-incarnation DENY.
@@ -25243,4 +25243,39 @@ fn busx86_stamp_check() {
         w,
         ALL
     );
+}
+
+// =====================================================================================================
+// SECLOGIN M2 — IDENTITY PARITY fixture, x86 half. File tail: nothing above moves.
+// =====================================================================================================
+
+/// SECLOGIN M2 (`loginst`): on the real x86 ACL tables (no disk I/O, SO20's static name table). Slot A
+/// carries user A's uid in the live epoch and creates the U6GX name PRIVATE (`owned_set_owner` +
+/// `owned_user_stamp`); slot B carries user B's uid — the row that reused A's STORAGE SLOT after A's
+/// delete; slot C carries A's NAME recreated, a newer uid again. A is admitted by user (the control);
+/// B and C are refused by `owned_user_ok`, because the number it compares is the uid and the uid was
+/// never reissued. `(owner_ok, same_slot_refused, same_name_refused)`. Cleaned up.
+#[cfg(feature = "loginst")]
+pub fn ident_fixture(uid_a: u32, uid_b: u32, uid_a2: u32) -> (bool, bool, bool) {
+    const A: usize = crate::arch::memory::USER_SLOTS - 2;
+    const B: usize = crate::arch::memory::USER_SLOTS - 1;
+    const C: usize = crate::arch::memory::USER_SLOTS;
+    let Some(nameid) = u10_name_id(U6GX_NAME) else { return (false, false, false) };
+    let nameid = nameid as usize;
+    let epoch = SESSION_EPOCH.load(Ordering::Acquire);
+    SLOT_USER[A].store(uid_a, Ordering::Release);
+    SLOT_USER[B].store(uid_b, Ordering::Release);
+    SLOT_USER[C].store(uid_a2, Ordering::Release);
+    for s in [A, B, C] { SLOT_EPOCH[s].store(epoch, Ordering::Release); }
+    let ga = SLOT_GEN[A].load(Ordering::Acquire);
+    owned_set_owner(nameid, A, ga);
+    owned_user_stamp(nameid, A);
+    let owner_ok = uid_a != 0 && owned_user_ok(nameid, A);
+    let same_slot_refused = !owned_user_ok(nameid, B);
+    let same_name_refused = !owned_user_ok(nameid, C);
+    owned_clear(nameid);
+    OWNED_USER[nameid].store(0, Ordering::Release);
+    for s in [A, B, C] { slot_user_clear(s); }
+    serial_println!("[users] ident name={} owner_uid={} same_slot_uid={} refused={} reason=recycled-id same_name_uid={} refused={} reason=recycled-id", U6GX_NAME, uid_a, uid_b, same_slot_refused, uid_a2, same_name_refused);
+    (owner_ok, same_slot_refused, same_name_refused)
 }

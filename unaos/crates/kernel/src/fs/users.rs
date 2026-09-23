@@ -745,10 +745,11 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
     let mut nb = [0u8; NAME_MAX];
     nb[..name.len()].copy_from_slice(name);
     serial_println!(
-        "[users] login ok user={} id={} principal=user:{}",
+        "[users] login ok user={} id={} principal=user:{}#{}",
         core::str::from_utf8(name).unwrap_or("?"),
         id,
-        core::str::from_utf8(&nb[..name.len()]).unwrap_or("?")
+        core::str::from_utf8(&nb[..name.len()]).unwrap_or("?"),
+        id
     );
     Ok(())
 }
@@ -1104,7 +1105,7 @@ pub fn service() {
         Ok(()) => {
             SERVICED.store(true, Ordering::Relaxed);
             #[cfg(feature = "loginst")]
-            { login_fixture(); login_hard_fixture(); } // SECLOGIN M1 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
+            { login_fixture(); login_hard_fixture(); login_ident_fixture(); } // SECLOGIN M1/M2 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1174,8 +1175,9 @@ pub fn login_fixture() {
     let all = verify_ok && wrong_refused && wrong_login_refused && none_before && login_ok && principal_ok && none_after && home != "FAIL" && acl != "FAIL" && epoch != "FAIL";
     if all {
         serial_println!(
-            ":: LOGIN: users+session create={} verify=ok wrong=refused login=ok principal=user:una linked={} home={} acl={} epoch={} logout=ok users={} volume={} -> PASS ::",
+            ":: LOGIN: users+session create={} verify=ok wrong=refused login=ok principal=user:una#{} linked={} home={} acl={} epoch={} logout=ok users={} volume={} -> PASS ::",
             create,
+            id_of(NAME).unwrap_or(0),
             principal_linked(),
             home,
             acl,
@@ -1507,5 +1509,63 @@ pub fn login_hard_fixture() {
         serial_println!(":: LOGIN-HARD: kat=ok iters={} ms={} v2_rows={} migrated={} legacy_verify=ok migrated_verify=ok wrong=refused unknown=refused floor={} -> PASS ::", iters, ms, v2_rows, migrated, PBKDF2_ITERS_MIN);
     } else {
         serial_println!(":: LOGIN-HARD: -> FAIL — kat={} legacy_created={} legacy_was_v1={} legacy_verify={} wrong_refused={} login_ok={} migrated={} now_v2={} migrated_verify={} wrong_after={} unknown_refused={} deleted={} iters={} floor={} ::", kat, legacy_created, legacy_was_v1, legacy_verify, wrong_refused, login_ok, migrated, now_v2, migrated_verify, wrong_after, unknown_refused, deleted, iters, PBKDF2_ITERS_MIN);
+    }
+}
+
+/// The row's storage slot (its index in the table) for a fixture's `slot_reused=` term.
+#[cfg(feature = "loginst")]
+fn slot_of(name: &[u8]) -> Option<usize> {
+    let t = TABLE.lock();
+    (0..t.count as usize).find(|&i| t.rows[i].name() == name)
+}
+
+/// LOGIN-IDENT (`loginst`) — SECLOGIN M2, THE IDENTITY RULE ON A LIVE STORE, both arches through one
+/// call. Create A; delete A; create B (which lands in A's freed SLOT, measured, and gets a NEW uid);
+/// create A again (a newer uid still). Then the arch half puts A's first uid on an owned row and asks
+/// the ACL about B and about the second A: both refused, the owner admitted. GO-RED: `create_user`'s
+/// `r.uid = t.next_uid` mutated to `i as u32 + 1` (v1's rule) → B is issued A's number and
+/// `same_slot_refused=false -> FAIL` on BOTH arches from one mutation. Leaves the store as found.
+#[cfg(feature = "loginst")]
+pub fn login_ident_fixture() {
+    const A: &[u8] = b"identa";
+    const B: &[u8] = b"identb";
+    const PW: &[u8] = b"ident-pw";
+    let _ = delete_user(A);
+    let _ = delete_user(B);
+    let uid_a = create_user(A, PW).unwrap_or(0);
+    let slot_a = slot_of(A);
+    let deleted_a = delete_user(A).is_ok();
+    let uid_b = create_user(B, PW).unwrap_or(0);
+    let slot_b = slot_of(B);
+    let uid_a2 = create_user(A, PW).unwrap_or(0);
+    let slot_reused = slot_a.is_some() && slot_a == slot_b;
+    let uids_distinct = uid_a != 0 && uid_b != 0 && uid_a2 != 0 && uid_a != uid_b && uid_b != uid_a2 && uid_a != uid_a2;
+    let (owner_ok, same_slot_refused, same_name_refused) = ident_arch(uid_a, uid_b, uid_a2);
+    let cleaned = delete_user(A).is_ok() && delete_user(B).is_ok();
+    let ok = deleted_a && slot_reused && uids_distinct && owner_ok && same_slot_refused && same_name_refused && cleaned;
+    if ok {
+        serial_println!(":: LOGIN-IDENT: a_uid={} b_uid={} a2_uid={} slot_reused=true owner_ok=true same_slot_refused=true same_name_refused=true reason=recycled-id -> PASS ::", uid_a, uid_b, uid_a2);
+    } else {
+        serial_println!(":: LOGIN-IDENT: -> FAIL — a_uid={} b_uid={} a2_uid={} deleted_a={} slot_a={:?} slot_b={:?} slot_reused={} uids_distinct={} owner_ok={} same_slot_refused={} same_name_refused={} cleaned={} ::", uid_a, uid_b, uid_a2, deleted_a, slot_a, slot_b, slot_reused, uids_distinct, owner_ok, same_slot_refused, same_name_refused, cleaned);
+    }
+}
+
+/// The arch half of [`login_ident_fixture`] where an ACL exists; `(true, true, true)` with a printed
+/// `unlinked` where no EL0 regime is built (the same dispatch `home_acl_proof` uses).
+#[cfg(feature = "loginst")]
+fn ident_arch(uid_a: u32, uid_b: u32, uid_a2: u32) -> (bool, bool, bool) {
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_el0"))]
+    {
+        return crate::arch::syscall::ident_fixture("HOME/IDENT.TXT", b"identa", uid_a, b"identb", uid_b, uid_a2);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        return crate::arch::syscall::ident_fixture(uid_a, uid_b, uid_a2);
+    }
+    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "aarch64_el0"))))]
+    {
+        let _ = (uid_a, uid_b, uid_a2);
+        serial_println!("[users] ident: unlinked (no EL0 regime in this image)");
+        (true, true, true)
     }
 }

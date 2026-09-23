@@ -24504,24 +24504,24 @@ const PRIN_USER: u8 = 5;
 #[cfg(feature = "login")]
 static SESSION: SpinMutex<PrincipalRecord> = SpinMutex::new(PrincipalRecord::NONE);
 
-/// LOGIN M1: the `user:<name>` principal for a validated name (`fs::users::name_ok` bounds it to 24 bytes,
-/// so 5 + 24 = 29 <= the 30-byte value field; a longer name is refused, never truncated).
+/// LOGIN M1 / SECLOGIN M2: the `user:<name>#<uid>` principal for a validated name and its uid. The
+/// uid is the NON-RECYCLABLE identity (`multiuser.md` §2): `#` is outside the name alphabet
+/// (`fs::users::name_ok`), so the split is unambiguous, and `5 + 8 + 1 + 10 = 24 <= 30` fits the value
+/// field. A recreated user of the same name carries a new uid and is therefore a DIFFERENT principal to
+/// every by-value comparison in this file — which is the whole of the recycled-identity fix on this arch,
+/// with no change to `owned_access_ok`. A uid of 0 is "no user" and is refused. The body is at the file
+/// tail (`user_principal_uid`) so this site keeps v1's line count: every unconditional line below it
+/// (`open_locate`, the DIRNS fixture) keeps its panic `Location` (B94).
 #[cfg(feature = "login")]
-fn user_principal(name: &[u8]) -> Option<PrincipalRecord> {
-    if name.is_empty() || 5 + name.len() > PRIN_VALUE_LEN {
-        return None;
-    }
-    let mut value = [0u8; PRIN_VALUE_LEN];
-    value[..5].copy_from_slice(b"user:");
-    value[5..5 + name.len()].copy_from_slice(name);
-    Some(PrincipalRecord { kind: PRIN_USER, len: (5 + name.len()) as u8, value })
+fn user_principal(name: &[u8], uid: u32) -> Option<PrincipalRecord> {
+    user_principal_uid(name, uid)
 }
 
-/// LOGIN M1: open the session as `name`. `_id` is the users-table id the x86 twin carries; aarch64 carries
-/// the name itself. `false` = the name does not fit a principal (no session change).
+/// LOGIN M1 / SECLOGIN M2: open the session as `name` with uid `id` — the same uid the x86 twin stores in
+/// its tables, here inside the principal string. `false` = the pair does not fit a principal (no change).
 #[cfg(feature = "login")]
-pub fn session_login(_id: u32, name: &[u8]) -> bool {
-    let Some(p) = user_principal(name) else { return false };
+pub fn session_login(id: u32, name: &[u8]) -> bool {
+    let Some(p) = user_principal(name, id) else { return false };
     let _irq = IrqGuard::mask_save();
     *SESSION.lock() = p;
     true
@@ -24547,11 +24547,11 @@ pub fn session_name(out: &mut [u8]) -> Option<usize> {
     if p.kind != PRIN_USER || (p.len as usize) < 5 {
         return None;
     }
-    let n = p.len as usize - 5;
-    if n > out.len() {
+    let tail = &p.value[5..p.len as usize]; let n = tail.iter().position(|&c| c == b'#').unwrap_or(tail.len()); // SECLOGIN M2: the NAME is what precedes `#`; the uid after it is not a name (same-line fold, B94)
+    if n == 0 || n > out.len() {
         return None;
     }
-    out[..n].copy_from_slice(&p.value[5..5 + n]);
+    out[..n].copy_from_slice(&tail[..n]);
     Some(n)
 }
 
@@ -24677,11 +24677,11 @@ fn user_native_string(rec: &PrincipalRecord, out: &mut [u8]) -> Option<usize> {
     Some(n)
 }
 
-/// LOGIN M1: the K4 codec's reverse arm — `user:<name>` (bounded, verbatim) or `None`.
+/// LOGIN M1 / SECLOGIN M2: the K4 codec's reverse arm — `user:<name>#<uid>` (bounded, verbatim) or `None`; the parse is at the file tail (`user_from_native_uid`), this site keeps v1's line count (B94). A v1 string with no `#` names no uid and is `None`: owned by nobody, fail-closed; no card ever carried one (`multiuser.md` §2).
 #[cfg(feature = "login")]
 fn user_from_native(s: &[u8]) -> Option<PrincipalRecord> {
     let rest = s.strip_prefix(b"user:")?;
-    user_principal(rest)
+    user_from_native_uid(rest)
 }
 
 // =====================================================================================================
@@ -25071,4 +25071,101 @@ pub fn session_epoch_fixture(path: &str, id: u32, name: &[u8]) -> bool {
         if ok { "PASS" } else { "FAIL —" }
     );
     ok
+}
+
+// =====================================================================================================
+// SECLOGIN M2 — IDENTITY PARITY fixture, aarch64 half. File tail: nothing above moves.
+// =====================================================================================================
+
+/// SECLOGIN M2 (`loginst`): on the real ACL tables and the real path resolver — ASID 6 carries user A
+/// (`user:<a>#<uid_a>`) and creates `path` PRIVATE; ASID 7 carries user B, the row that reused A's
+/// STORAGE SLOT after A's delete, with a new uid; ASID 8 carries A's NAME recreated, with a newer uid
+/// again. The owner is admitted (the control), the other two are refused by the existing by-value
+/// compare, because the uid is inside the string. `(owner_ok, same_slot_refused, same_name_refused)`.
+#[cfg(feature = "loginst")]
+pub fn ident_fixture(path: &str, name_a: &[u8], uid_a: u32, name_b: &[u8], uid_b: u32, uid_a2: u32) -> (bool, bool, bool) {
+    const A_OWN: u64 = 6;
+    const A_B: u64 = 7;
+    const A_A2: u64 = 8;
+    let fs = match crate::fs::fat::mount() {
+        Ok(f) => f,
+        Err(e) => {
+            serial_println!("[users] ident: el0-fat mount refused ({:?})", e);
+            return (false, false, false);
+        }
+    };
+    let (Some(p_a), Some(p_b), Some(p_a2)) = (user_principal(name_a, uid_a), user_principal(name_b, uid_b), user_principal(name_a, uid_a2)) else {
+        return (false, false, false);
+    };
+    slot_ppid_stamp(A_OWN, p_a);
+    slot_epoch_stamp(A_OWN);
+    slot_ppid_stamp(A_B, p_b);
+    slot_epoch_stamp(A_B);
+    slot_ppid_stamp(A_A2, p_a2);
+    slot_epoch_stamp(A_A2);
+    let mut created = false;
+    let (de, lba, off) = match open_locate(&fs, path, O_CREAT, &mut created) {
+        Ok(t) => t,
+        Err(e) => {
+            serial_println!("[users] ident: open_locate({}) -> errno {}", path, e);
+            for a in [A_OWN, A_B, A_A2] { slot_ppid_clear(a); slot_epoch_clear(a); }
+            return (false, false, false);
+        }
+    };
+    let g = |a: u64| ASID_GEN[a as usize].load(Ordering::Acquire);
+    let owned = owned_set_owner(lba, off as u32, A_OWN, g(A_OWN), slot_ppid_of(A_OWN));
+    let owner_ok = owned && owned_access_ok(lba, off as u32, A_OWN, g(A_OWN), CAP_READ, slot_ppid_of(A_OWN));
+    let same_slot_refused = !owned_access_ok(lba, off as u32, A_B, g(A_B), CAP_READ, slot_ppid_of(A_B));
+    let same_name_refused = !owned_access_ok(lba, off as u32, A_A2, g(A_A2), CAP_READ, slot_ppid_of(A_A2));
+    owned_clear(lba, off as u32);
+    let _ = fs.delete_located(lba, off, de.first_cluster());
+    for a in [A_OWN, A_B, A_A2] { slot_ppid_clear(a); slot_epoch_clear(a); }
+    serial_println!("[users] ident path={} owner={}#{} same_slot={}#{} refused={} reason=recycled-id same_name={}#{} refused={} reason=recycled-id", path, core::str::from_utf8(name_a).unwrap_or("?"), uid_a, core::str::from_utf8(name_b).unwrap_or("?"), uid_b, same_slot_refused, core::str::from_utf8(name_a).unwrap_or("?"), uid_a2, same_name_refused);
+    (owner_ok, same_slot_refused, same_name_refused)
+}
+
+/// SECLOGIN M2: the body of [`user_principal`] — `user:<name>#<uid>`, bounded to the value field.
+#[cfg(feature = "login")]
+fn user_principal_uid(name: &[u8], uid: u32) -> Option<PrincipalRecord> {
+    if name.is_empty() || uid == 0 {
+        return None;
+    }
+    let mut digits = [0u8; 10];
+    let mut n = 0usize;
+    let mut v = uid;
+    while v > 0 {
+        digits[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
+    let total = 5 + name.len() + 1 + n;
+    if total > PRIN_VALUE_LEN {
+        return None;
+    }
+    let mut value = [0u8; PRIN_VALUE_LEN];
+    value[..5].copy_from_slice(b"user:");
+    value[5..5 + name.len()].copy_from_slice(name);
+    value[5 + name.len()] = b'#';
+    for i in 0..n {
+        value[5 + name.len() + 1 + i] = digits[n - 1 - i];
+    }
+    Some(PrincipalRecord { kind: PRIN_USER, len: total as u8, value })
+}
+
+/// SECLOGIN M2: the body of [`user_from_native`] — `<name>#<uid>` after the `user:` prefix.
+#[cfg(feature = "login")]
+fn user_from_native_uid(rest: &[u8]) -> Option<PrincipalRecord> {
+    let h = rest.iter().position(|&c| c == b'#')?;
+    let digits = &rest[h + 1..];
+    if digits.is_empty() || digits.len() > 10 {
+        return None;
+    }
+    let mut uid: u32 = 0;
+    for &c in digits {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        uid = uid.checked_mul(10)?.checked_add((c - b'0') as u32)?;
+    }
+    user_principal_uid(&rest[..h], uid)
 }

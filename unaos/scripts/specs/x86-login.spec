@@ -41,7 +41,7 @@
 # one is refused, the session opens under `user:una`, the home exists and the ACL admits its owner.
 # `linked=`/`home=`/`acl=`/`epoch=`/`users=`/`volume=` are reported by the fixture and folded into its
 # own verdict, so they are matched loosely and the VERDICT is what gates.
-REQUIRE :: LOGIN: users\+session create=.* verify=ok wrong=refused login=ok principal=user:una .* -> PASS ::
+REQUIRE :: LOGIN: users\+session create=.* verify=ok wrong=refused login=ok principal=user:una#\d+ .* -> PASS ::
 FORBID :: LOGIN: users\+session -> FAIL
 # A SKIPPED here is a harness with no FAT volume. On THIS gate the x86 default medium carries a FAT32
 # volume (DEFAULTMEDIUM), so a skip means the medium was lost — a red, not a shrug.
@@ -193,6 +193,20 @@ REQUIRE \[users\] rehash user=hard1 v1->v2 iters=\d+ ms=\d+
 REQUIRE :: LOGIN-HARD: kat=ok iters=\d+ ms=\d+ v2_rows=\d+ migrated=1 legacy_verify=ok migrated_verify=ok wrong=refused unknown=refused floor=10000 -> PASS ::
 FORBID :: LOGIN-HARD: .* -> FAIL
 FORBID \[users\] kdf REFUSED
+
+# ── 7c. THE IDENTITY IS NEVER REISSUED (SECLOGIN M2, rmbp-ledger B169) ──────────────────────────
+# B157 gap 3: x86 compared a RECYCLABLE users-table id, aarch64 compared the NAME — two arches, two
+# rules, and a recreated user could inherit. Now both compare the `uid` (x86 in its u32 tables,
+# aarch64 inside `user:<name>#<uid>`), allocated from a counter that never decreases. The leg creates
+# A, deletes A, creates B INTO A's FREED SLOT (`slot_reused=true` is measured, not assumed), recreates
+# A, and asks the real ACL about B and the second A against a row A's first uid owns: both refused
+# with `reason=recycled-id`, the owner admitted. GO-RED: the allocator mutated to v1's `slot + 1` →
+# `same_slot_refused=false -> FAIL` on both arches from one mutation.
+REQUIRE :: LOGIN-IDENT: a_uid=\d+ b_uid=\d+ a2_uid=\d+ slot_reused=true owner_ok=true same_slot_refused=true same_name_refused=true reason=recycled-id -> PASS ::
+FORBID :: LOGIN-IDENT: .* -> FAIL
+REQUIRE \[users\] delete user=identa uid=\d+ \(slot \d+ freed; uid never reissued
+# The principal string a session prints is the canonical one, uid included.
+REQUIRE \[users\] login ok user=una id=\d+ principal=user:una#\d+
 
 # ── 8. ABSENCE — the hole every block above exists to close ─────────────────────────────────────
 # A fixture that stops running prints nothing and passes silently. Every REQUIRE above gates PRESENCE
