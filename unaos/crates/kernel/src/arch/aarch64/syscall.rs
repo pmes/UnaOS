@@ -24738,7 +24738,7 @@ fn open_locate(
     mode: u64,
     created: &mut bool,
 ) -> Result<(crate::fs::fat::DirEntry, u64, usize), i64> {
-    if crate::fs::vfs::el0_path_leaf(name).eq_ignore_ascii_case(ATR_NAME) {
+    if crate::fs::vfs::el0_path_leaf(name).eq_ignore_ascii_case(ATR_NAME) || kernel_owned_leaf_path(name) { // SECLOGIN M4 — the credential file (USERS.DAT/USERS.NEW) is kernel-owned exactly as the ACL store is: no EL0 open resolves it, wherever in the tree it is named
         return Err(EACCES); // the kernel's own ACL store, wherever it is named (K1 M4's rule, path form)
     }
     crate::fs::vfs::el0_locate(fs, name, mode & O_CREAT != 0, created).map_err(el0_errno)
@@ -25207,4 +25207,29 @@ fn session_end_processes(closing: u32) -> (usize, usize) {
         serial_println!("[users] session-end pid={} asid={} windows={} kill=\"{}\" ended={}", pid, asid, w, settle, gone);
     }
     (ended, windows)
+}
+
+/// SECLOGIN M4 (`loginst`): what the EL0 path resolver answers for `path`, in `sys_open`'s errno
+/// vocabulary — `0` = it resolved (the hole), a negative errno = refused. Drives [`open_locate`], the
+/// seam every aarch64 `sys_open` walks, so the leg proves the PATH and not the predicate.
+#[cfg(feature = "loginst")]
+pub fn kernel_owned_probe(path: &str) -> i64 {
+    let Ok(fs) = crate::fs::fat::mount() else { return ENODEV };
+    let mut created = false;
+    match open_locate(&fs, path, 0, &mut created) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+/// SECLOGIN M4: the credential-file half of `open_locate`'s guard. `fs::users` is declared under
+/// `login` (fs/mod.rs:105), so the unconditional resolver reaches it through this pair: with the
+/// module present, the predicate; without it, `false` — no credential file can exist on such an image.
+#[cfg(feature = "login")]
+fn kernel_owned_leaf_path(name: &str) -> bool {
+    crate::fs::users::kernel_owned_leaf(crate::fs::vfs::el0_path_leaf(name))
+}
+#[cfg(not(feature = "login"))]
+fn kernel_owned_leaf_path(_name: &str) -> bool {
+    false
 }

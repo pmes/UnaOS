@@ -1113,7 +1113,7 @@ pub fn service() {
         Ok(()) => {
             SERVICED.store(true, Ordering::Relaxed);
             #[cfg(feature = "loginst")]
-            { login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); } // SECLOGIN M1/M2/M3 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
+            { login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); } // SECLOGIN M1/M2/M3/M4 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1603,5 +1603,52 @@ pub fn login_end_fixture() {
     #[cfg(not(target_arch = "x86_64"))]
     {
         serial_println!("[users] session-end fixture: x86 lane only (the aarch64 walk is compiled by the arm-virt-el0 leg and runs on every Log Out)");
+    }
+}
+
+/// SECLOGIN M4: is `leaf` one of the kernel-owned credential leaves (`USERS.DAT`, `USERS.NEW`)?
+/// Case-insensitive, because FAT's own lookup is (`DirEntry::eq_name`), so no spelling slips past.
+/// The users service never asks this — it reads through `locate_in_dir(0, leaf)`, not the EL0
+/// resolver — which is what "kernel-owned" means: reachable by the kernel's own path, by no program's.
+pub fn kernel_owned_leaf(leaf: &str) -> bool {
+    leaf.eq_ignore_ascii_case(USERS_FILE) || leaf.eq_ignore_ascii_case(USERS_TMP_FILE)
+}
+
+/// LOGIN-KOWN (`loginst`) — SECLOGIN M4. The predicate is asserted (both leaves, both cases, a
+/// near-miss refused), and then the REAL resolver is asked: on aarch64 through `open_locate` (the
+/// guarded seam every `sys_open` walks) and the answer is a verdict; on x86 through
+/// `fs::vfs::el0_locate` DIRECTLY, the shared resolver the storage task's `resolve_path` calls, whose
+/// guard line is outside this arc's grant (`multiuser.md` §6) — so the x86 line is a MEASUREMENT
+/// (`resolver=OPENED` today, `REFUSED` the day that line lands), never a PASS on a hole.
+#[cfg(feature = "loginst")]
+pub fn login_kown_fixture() {
+    let pred = kernel_owned_leaf("USERS.DAT") && kernel_owned_leaf("users.dat") && kernel_owned_leaf("USERS.NEW") && kernel_owned_leaf("Users.New") && !kernel_owned_leaf("USERS.TXT") && !kernel_owned_leaf("HELLO.BIN");
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_el0"))]
+    {
+        let e1 = crate::arch::syscall::kernel_owned_probe("USERS.DAT");
+        let e2 = crate::arch::syscall::kernel_owned_probe("/USERS.NEW");
+        let refused = e1 < 0 && e2 < 0;
+        serial_println!(":: LOGIN-KOWN: pred={} resolver={} errno={},{} reason=kernel-owned -> {} ::", if pred { "ok" } else { "FAIL" }, if refused { "refused" } else { "OPENED" }, e1, e2, if pred && refused { "PASS" } else { "FAIL —" });
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let resolver = match crate::fs::fat::mount() {
+            Ok(fs) => {
+                let mut c = false;
+                match crate::fs::vfs::el0_locate(&fs, "USERS.DAT", false, &mut c) {
+                    Ok(_) => "OPENED",
+                    Err(_) => "refused",
+                }
+            }
+            Err(_) => "no-volume",
+        };
+        serial_println!("[users] kernel-owned pred={} resolver={} (x86: the guard line in fs::vfs::el0_locate is owed to the seat — multiuser.md §6; this line is a measurement, not a verdict)", if pred { "ok" } else { "FAIL" }, resolver);
+        if !pred {
+            serial_println!(":: LOGIN-KOWN: pred=FAIL -> FAIL — ::");
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "aarch64_el0"))))]
+    {
+        serial_println!("[users] kernel-owned pred={} resolver=unlinked", if pred { "ok" } else { "FAIL" });
     }
 }

@@ -221,6 +221,15 @@ FORBID :: LOGIN-END: .* -> FAIL
 FORBID :: LOGIN-END: .* SKIPPED
 REQUIRE \[users\] logout epoch=\d+ ended=\d+ windows=\d+
 
+# ── 7d. THE CREDENTIAL FILE IS KERNEL-OWNED (SECLOGIN M4, rmbp-ledger B169) ─────────────────────
+# B157 gap 2. The predicate is pinned as a property; the x86 RESOLVER line is pinned as a MEASUREMENT
+# with BOTH readings allowed, because the guard line lives in `fs::vfs::el0_locate`, outside the
+# SECLOGIN grant (multiuser.md §6): `resolver=OPENED` is the hole measured, `resolver=refused` is
+# the day the seat's one line lands. A REQUIRE on `refused` alone would be red until then and a
+# REQUIRE on `OPENED` would certify the hole (LAWS §5: never require a limitation).
+REQUIRE \[users\] kernel-owned pred=ok resolver=(OPENED|refused)
+FORBID :: LOGIN-KOWN: .* -> FAIL
+
 # ── 8. ABSENCE — the hole every block above exists to close ─────────────────────────────────────
 # A fixture that stops running prints nothing and passes silently. Every REQUIRE above gates PRESENCE
 # as well as health for its own leg, which covers it. What is NOT covered by any of them is the boot
