@@ -857,13 +857,13 @@ const DESK_STRIP_MAX: usize = 0;
 ///   subtraction is exactly what CARRIES it to glass (`arch/aarch64/display_tegra.rs`'s SO5 note
 ///   traces the two sprites). Withholding the box there would delete the Pi/Orin pointer over the
 ///   backdrop outright, which is why the aarch64 answer is `false` and not an oversight.
-/// * `wc` — the feature knob, and the reason this is not simply the const above. The occluder array
-///   is sized at compile time and `wm::occluders` fills a `[_; MAX_WINDOWS]` by signature, so a
-///   slot for the sprite exists only where the SHELLDESK arm already stages through its own `wins`
-///   array. That arm is `wc`'s. A knob-off x86 build keeps the FLICKER-3 bracket it has today.
+/// * `wc` — RETIRED as a term by PTRLEAK (B193). It was the array-capacity one: the occluder array
+///   is sized at compile time and `wm::occluders` fills a `[_; MAX_WINDOWS]` by signature, so the
+///   sprite's slot needs a fill that stages through its own `wins`; the knob-off arm now does too
+///   ([`desk_window_occluders`]), so a knob-off x86 arrow is withheld, never bracketed (CURSORFLK B186).
 ///
 /// The two are checked against each other below rather than left to agree by reading.
-const DESK_SPRITE_OCC: bool = cfg!(all(target_arch = "x86_64", feature = "wc"));
+const DESK_SPRITE_OCC: bool = cfg!(target_arch = "x86_64"); // PTRLEAK (B193) — was `all(x86_64, wc)`: the knob-off x86 desktop present bracketed a live front-buffer arrow and published pointerless frames (`[cursor11] … flicker_frames=5 … -> FLICKER`, CURSORFLK B186). The term that remains is the hardware one. ⚠ LINE-NEUTRAL.
 
 /// PTRREPAINT — the subtraction may never be armed on a board whose arrow is NOT front-buffer-owned.
 /// A compile-time proof rather than a sentence, because the failure mode is a pointer that vanishes
@@ -1743,9 +1743,9 @@ impl Screen {
         };
         #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // PI-DESK/MENUBAR-PI: the Pi gets the furniture-strip subtraction and the top reservation on the same terms x86 has
         let (nocc, nwin) = {
-            // `DESK_OCC_MAX == wm::MAX_WINDOWS` here (no strip registry is compiled), so this is the
-            // WC-I call on the WC-I array, unchanged.
-            let n = super::wm::occluders(&mut occ);
+            // No strip registry is compiled here. On aarch64 `DESK_OCC_MAX == wm::MAX_WINDOWS` and this is the
+            // WC-I call on the WC-I array, unchanged; on knob-off x86 the array carries the sprite's slot (PTRLEAK).
+            let n = desk_window_occluders(&mut occ);
             (n, n)
         };
         // PTRREPAINT — THE SPRITE JOINS THE OCCLUDER SET, and it is the last entry on purpose.
@@ -2743,3 +2743,23 @@ fn ptrlost_selftest() {
 )))]
 #[inline(always)]
 fn ptrown_pass(_occ: &[(usize, usize, usize, usize)], _nwin: usize, _pw: usize, _ph: usize) {}
+
+/// PTRLEAK (B193) — the WC-I window fill for the desktop present's occluder array where no furniture
+/// registry is compiled. `wm::occluders` takes exactly `[_; MAX_WINDOWS]`; the array is
+/// `DESK_OCC_MAX` wide, which equals `MAX_WINDOWS` on aarch64 (so that arm IS the WC-I call, inlined,
+/// and its code is the one it has always had) and is `MAX_WINDOWS + 1` on knob-off x86, where
+/// [`DESK_SPRITE_OCC`] now reserves the POINTER's slot. There it stages through `wins` exactly as the
+/// SHELLDESK arm does, and the sprite's box is appended after the windows by the caller.
+#[cfg(all(target_arch = "aarch64", not(feature = "desktop_firmware")))]
+#[inline(always)]
+fn desk_window_occluders(occ: &mut [(usize, usize, usize, usize); DESK_OCC_MAX]) -> usize {
+    super::wm::occluders(occ)
+}
+#[cfg(all(target_arch = "x86_64", not(feature = "wc")))]
+#[inline(always)]
+fn desk_window_occluders(occ: &mut [(usize, usize, usize, usize); DESK_OCC_MAX]) -> usize {
+    let mut wins = [(0usize, 0usize, 0usize, 0usize); super::wm::MAX_WINDOWS];
+    let nw = super::wm::occluders(&mut wins);
+    occ[..nw].copy_from_slice(&wins[..nw]);
+    nw
+}
