@@ -557,7 +557,7 @@ use super::keymap::{Action, Binding, Table, CMD, SHIFT};
 /// would otherwise shadow them (the `no_shadow` check at the foot of this block refuses the other
 /// order at compile time) — and `Shift+Home`/`Shift+End` as well, because the rMBP's internal
 /// keyboard has no Home or End key but an external one on the same desktop does.
-pub static CRISPY_ROWS: [Binding; 15] = [
+pub static CRISPY_ROWS: [Binding; 21] = [
     // The two chords flight 11 proved on metal. Their tokens are the exact bytes the `[prtscr]`
     // witness has always carried, so a capture from before KEYMAP and one from after grep alike.
     Binding { roles: CMD | SHIFT, usage: 0x20, action: Action::Screenshot, token: "cmd-shift-3" },
@@ -567,6 +567,10 @@ pub static CRISPY_ROWS: [Binding; 15] = [
     // TERMSEL — to the line start / end, the Mac chords. ABOVE the bare Shift rows (precedence).
     Binding { roles: CMD | SHIFT, usage: 0x50, action: Action::SelectLineStart, token: "cmd-shift-left" },
     Binding { roles: CMD | SHIFT, usage: 0x4F, action: Action::SelectLineEnd, token: "cmd-shift-right" },
+    // TERMSEL2 — the CARET to the line start / end: `⌘←`/`⌘→`, the Mac's chords (the rMBP has no
+    // Home/End key). BELOW `⌘⇧←/→`, which they would otherwise shadow.
+    Binding { roles: CMD, usage: 0x50, action: Action::CursorLineStart, token: "cmd-left" },
+    Binding { roles: CMD, usage: 0x4F, action: Action::CursorLineEnd, token: "cmd-right" },
     // R61's four. Consumed by the terminal (`clipboard::terminal_action`, `clipboard.md` §3/§7):
     // Copy takes the selection or the whole line, Paste types, Cut removes the selection, Select
     // All selects the line.
@@ -579,6 +583,13 @@ pub static CRISPY_ROWS: [Binding; 15] = [
     Binding { roles: SHIFT, usage: 0x4F, action: Action::SelectRight, token: "shift-right" },
     Binding { roles: SHIFT, usage: 0x4A, action: Action::SelectLineStart, token: "shift-home" },
     Binding { roles: SHIFT, usage: 0x4D, action: Action::SelectLineEnd, token: "shift-end" },
+    // TERMSEL2 — the CARET, bare keys. `roles: 0` matches with any modifier held, so each is written
+    // BELOW every row on its usage (`no_shadow` refuses the other order). The arrow bytes are still
+    // typed; Home and End type nothing.
+    Binding { roles: 0, usage: 0x50, action: Action::CursorLeft, token: "left" },
+    Binding { roles: 0, usage: 0x4F, action: Action::CursorRight, token: "right" },
+    Binding { roles: 0, usage: 0x4A, action: Action::CursorLineStart, token: "home" },
+    Binding { roles: 0, usage: 0x4D, action: Action::CursorLineEnd, token: "end" },
     // TERMSEL — Esc drops the selection. `roles: 0`, like Print Screen; the key is STILL TYPED
     // (0x1B reaches every key consumer as before), so a menu that dismisses on it is unaffected.
     Binding { roles: 0, usage: 0x29, action: Action::Deselect, token: "esc" },
@@ -602,7 +613,7 @@ pub static CRISPY_BINDINGS: &Table = &Table {
 /// The rows are the SAME rows in role space. What differs is one field — `cmd_role` — plus the
 /// keyboard the operator is typing on: `Alt+C` is copy on a PC because R61 says the Command role
 /// moves to Alt there, not because a second Copy row was written.
-pub static PC_ROWS: [Binding; 11] = [
+pub static PC_ROWS: [Binding; 15] = [
     // PrtSc. The SHIFTED row is written ABOVE the bare one, and it has to be: the bare row names
     // no roles, so it matches with Shift held too and would shadow the region chord entirely. That
     // is this table's one ordering hazard; the `const` block at the foot of this file checks it.
@@ -619,6 +630,11 @@ pub static PC_ROWS: [Binding; 11] = [
     Binding { roles: SHIFT, usage: 0x4A, action: Action::SelectLineStart, token: "shift-home" },
     Binding { roles: SHIFT, usage: 0x4D, action: Action::SelectLineEnd, token: "shift-end" },
     Binding { roles: 0, usage: 0x29, action: Action::Deselect, token: "esc" },
+    // TERMSEL2 — the caret: arrows, Home, End. Below the Shift rows on the same usages.
+    Binding { roles: 0, usage: 0x50, action: Action::CursorLeft, token: "left" },
+    Binding { roles: 0, usage: 0x4F, action: Action::CursorRight, token: "right" },
+    Binding { roles: 0, usage: 0x4A, action: Action::CursorLineStart, token: "home" },
+    Binding { roles: 0, usage: 0x4D, action: Action::CursorLineEnd, token: "end" },
 ];
 
 /// The PC table. `cmd_role` is `HID_MOD_ALT` — R61's *"(alt-c on pc)"*, and the one field that

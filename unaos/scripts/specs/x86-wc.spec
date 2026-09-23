@@ -713,3 +713,19 @@ REQUIRE \[menubar\] crystal-persist paints=3 present=3/3 models=partial:caption\
 # `crystal-persist paints=0 present=0/0 … -> SKIP`, both FORBIDs hit, mbench rc 1 (28/30).
 FORBID \[menubar\] crystal-persist .* -> SKIP
 FORBID :: MENUFIRST: .* :: SKIP ::
+# ── TERMSEL2 (2026-09-23, rmbp-ledger B196), TAIL-APPENDED past TERMSEL ────────────────────────────
+# The POINTER on the shell's text (`video/termsel.rs`, `clipboard.md` §7.10+). A press on the shell
+# window is kernel furniture to the click router, which now NOTES it for that window
+# (`termsel::pointer_press`/`_motion`/`_release`); the render service hands the notes to its
+# `Console`, which turns them into cells. The fixture `termsel::pointer_selftest` — chained beside
+# `clickroute_selftest`, which this lane runs every boot — mints a `KERNEL_OWNER_DESKTOP` probe row
+# and drives presses through the LIVE `wc_click_route_at`. `legs=` is a bit per leg; the wanted mask
+# is a constant of the fixture, so it is pinned literally with every field.
+# M2 (mouse selection) grew the verdict: `sel=` is the span a drag across two scrollback rows made —
+# THE field the go-red moves (a drag that ignores the row), `copy=`/`word=`/`into_edit=` read the
+# clipboard back through the epoch gate, `cut_ro=` is ⌘X REFUSED on the read-only scrollback.
+# M3 (the caret) grew it again: `arrows=` resolves `←`/`→`/`⌘←`/`⌘→`/`Home`/`End` through the LIVE
+# table and reads the caret after each, `insert=`/`bs=` edit AT the caret, `replace=` is typing over a
+# selection on the editable line (the rule TERMSEL deferred), `pc=` the PC table's four caret rows.
+REQUIRE :: TERMSEL2: legs=0x7ffff/0x7ffff hit=ok route=ok drag=ok up=ok dbl=ok sel=ok copy=ok cut_ro=ok esc=ok word=ok into_edit=ok edit=ok click_caret=ok arrows=ok insert=ok bs=ok replace=ok collapse=ok pc=ok -> PASS ::
+FORBID :: TERMSEL2: .* -> FAIL ::
