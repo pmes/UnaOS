@@ -4698,7 +4698,8 @@ const STORAGE_WAIT_MS: u64 = 30_000;
 ///   asserted — a disagreement is a fact about the machine, not a failure.
 ///
 /// * `fatverb.writegate` runs `fs_rm` against a name that cannot exist, and requires that the write
-///   gate's counter advanced and that its recorded answer matches the mounted source's veto. The
+///   gate's counter advanced and that its recorded answer matches the veto of the ROOT volume —
+///   the volume that verb WRITES, which is not always the program source (`vfs.md` §13.4). The
 ///   probe name is deliberately unresolvable, so on a WRITABLE volume the verb gates through and
 ///   then stops at `NotFound` — the fixture drives the real refusal path without ever creating,
 ///   truncating or unlinking anything. On a READ-ONLY source the gate fires and the verb never
@@ -4933,9 +4934,33 @@ pub fn fatverb_storage_witness() {
     );
 
     // --- writegate -----------------------------------------------------------------------------
-    // The independent side of the comparison: what the SOURCE says, read straight off the block
-    // layer's own predicate, before the verb runs.
-    let veto = crate::fs::fat::mount_program_source().ok().and_then(|fs| fs.write_veto());
+    // THE RULE: **THE VOLUME WRITTEN IS THE VOLUME ASKED.** `fs_rm` below routes through
+    // `vfs_write_open`, whose predicate is `MountTable::write_veto(path)` — the veto of the volume
+    // the PATH resolves to (`vfs.md` §13.4). Here that is ROOT: the disk `fs::bootdisk` found BY
+    // CONTENT. So the veto this leg holds the gate to is sampled off ROOT's OWN source, and NOT off
+    // `mount_program_source()` — the global/SDHC program-source handle, which answers for a
+    // DIFFERENT volume whenever the two disagree. `readvol` above already grants them that right
+    // (`exec=sdhc read=ahci same=false` on the AHCI fixture, where the loader's ladder points at
+    // the SD reader and the kernel was found on the SATA ESP); this leg was nonetheless comparing a
+    // veto taken from ONE volume against a gate fired on ANOTHER.
+    //
+    // R59 / rmbp-ledger B166 (SDHCRW) is what EXPOSED it, and it was never a defect in SDHCRW:
+    // before R59 made the SD card READ-WRITE by default, `mount_program_source().write_veto()`
+    // answered `Some(…)` on the AHCI-install lane and the gate's `REFUSED_RO` (the SATA ESP, whose
+    // `BlockSource::Ahci` arm is `AHCI_VETO`) agreed WITH THE WRONG VOLUME, by coincidence. R59
+    // turned the program source's answer into `None`, the coincidence broke, and the leg read
+    // `veto=none gate=refused-ro -> FAIL` on an image whose behaviour was correct throughout.
+    //
+    // BOTH vetos stay on the wire (`veto_src=` / `veto_root=`), the readvol way: the disagreement
+    // is a FACT about the machine, not an error. Only `veto_root` is the verdict's term.
+    let veto_src = crate::fs::fat::mount_program_source().ok().and_then(|fs| fs.write_veto());
+    // ONE sample of the walk, so the handle this leg PRINTS and the veto it COMPARES cannot drift.
+    let (root_src, veto_root) = match crate::fs::bootdisk::locate() {
+        crate::fs::bootdisk::Verdict::Bound(f) => (bind::of_name(f.source.name()), f.source.write_veto()),
+        // No root: nothing is mounted at `/`, so `vfs_write_open` reaches no volume to veto and
+        // stamps DECLINED — which the `None` arm below already admits. An absent volume, not a veto.
+        crate::fs::bootdisk::Verdict::None_(_) => (bind::NONE, None),
+    };
     let gate_seq0 = WRITE_GATE_SEQ.load(BindOrd::Relaxed);
     {
         // The REAL write verb. `force = true` so a hypothetical prompt cannot stall the boot.
@@ -4944,7 +4969,9 @@ pub fn fatverb_storage_witness() {
     }
     let gate_ran = WRITE_GATE_SEQ.load(BindOrd::Relaxed) > gate_seq0;
     let gate = WRITE_GATE.load(BindOrd::Relaxed);
-    let gate_agrees = match veto {
+    // NOT weakened to "any gate answer passes": a READ-ONLY root must be REFUSED_RO and a WRITABLE
+    // root must be ADMITTED or DECLINED, each tied to THAT root's own veto.
+    let gate_agrees = match veto_root {
         Some(_) => gate == bind::REFUSED_RO,
         None => gate == bind::ADMITTED || gate == bind::DECLINED,
     };
@@ -4952,9 +4979,17 @@ pub fn fatverb_storage_witness() {
         "fatverb.writegate",
         gate_ran && gate_agrees,
         &alloc::format!(
-            "gate_ran={} gate={} veto={} handles={}",
-            gate_ran, bind::name(gate), veto.unwrap_or("none"), census
+            "gate_ran={} gate={} root={} veto_src={} veto_root={} handles={}",
+            gate_ran, bind::name(gate), bind::name(root_src),
+            veto_src.unwrap_or("none"), veto_root.unwrap_or("none"), census
         ),
+    );
+    // The census, on its own line and printed on every boot — a PASS must show the disagreement too
+    // (`veto_same=false` is exactly what the AHCI-install lane now reads while passing).
+    serial_println!(
+        ":: [fatverb] writegate census: root={} veto_same={} gate={} gate_ran={} veto_src={} veto_root={} handles={} ::",
+        bind::name(root_src), veto_src.is_some() == veto_root.is_some(),
+        bind::name(gate), gate_ran, veto_src.unwrap_or("none"), veto_root.unwrap_or("none"), census
     );
 
     // `waited` is the MEASUREMENT, not the threshold: a reader can tell "storage was there on the
