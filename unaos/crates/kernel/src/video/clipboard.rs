@@ -265,6 +265,27 @@ pub fn paste_into_ring() -> usize {
 /// action the desktop cannot honour must be visibly declined, or the operator learns that `⌘X` does
 /// nothing and stops reporting it.
 pub fn terminal_action(act: Action, line: &mut String, sel: &mut LineSel) -> (&'static str, bool) {
+    let (field, repaint) = terminal_action_in(act, line, sel, &[], 0);
+    (field, repaint != 0)
+}
+
+/// TERMSEL2 — [`terminal_action`] with the terminal's SCROLLBACK in hand (`hist`, whose first line is
+/// absolute row `base`; `console::Console::act` passes its own), because a pointer selection can
+/// reach it. The repaint is a code: 0 none, 1 the input line, 2 the whole terminal (a band in the
+/// scrollback moved or went away).
+///
+/// What the scrollback adds: `Copy` of a selection that reaches it copies every selected cell,
+/// rows joined by `\n` (`[clip] copy unit=selection len=<n> rows=<n>`); `Cut` of one is REFUSED
+/// (`[clip] cut refused reason=read-only`) and changes nothing — the scrollback is output, not
+/// input (TERMSEL's §7.5 said so before there was a way to reach it).
+pub fn terminal_action_in(
+    act: Action,
+    line: &mut String,
+    sel: &mut LineSel,
+    hist: &[String],
+    base: u64,
+) -> (&'static str, u8) {
+    let scroll = sel.touches_scrollback(line.len());
     match act {
         // TERMSEL: the selection when one is live; the whole line when none is — APPCLIP's
         // behaviour, kept exactly (`unit=line`), because a line is still the largest honest unit
@@ -272,24 +293,41 @@ pub fn terminal_action(act: Action, line: &mut String, sel: &mut LineSel) -> (&'
         Action::Copy => match sel.range(line.len()) {
             Some((lo, hi)) => {
                 if set(&line.as_bytes()[lo..hi]) {
-                    serial_println!("[clip] copy unit=selection len={}", hi - lo);
-                    ("ok", false)
+                    serial_println!("[clip] copy unit=selection len={} rows=1", hi - lo);
+                    ("ok", 0)
                 } else {
-                    ("refused", false)
+                    ("refused", 0)
+                }
+            }
+            None if scroll => {
+                let have = base..base + hist.len() as u64;
+                let text = sel.selected_text(line.len(), have, |r| {
+                    if r == crate::video::termsel::EDIT_ROW {
+                        Some(line.as_str())
+                    } else {
+                        r.checked_sub(base).and_then(|i| hist.get(i as usize)).map(|s| s.as_str())
+                    }
+                });
+                match text {
+                    Some((t, rows)) if set(t.as_bytes()) => {
+                        serial_println!("[clip] copy unit=selection len={} rows={}", t.len(), rows);
+                        ("ok", 0)
+                    }
+                    _ => ("refused", 0),
                 }
             }
             None => {
                 if set(line.as_bytes()) {
                     serial_println!("[clip] copy unit=line len={}", line.len());
-                    ("ok", false)
+                    ("ok", 0)
                 } else {
-                    ("refused", false)
+                    ("refused", 0)
                 }
             }
         },
         Action::Paste => {
             paste_into_ring();
-            ("ok", false)
+            ("ok", 0)
         }
         // TERMSEL: copy the selection, and only if the clipboard TOOK it remove those cells from the
         // editable line — a refused `set` must not lose the operator's text. The selection can only
@@ -301,14 +339,20 @@ pub fn terminal_action(act: Action, line: &mut String, sel: &mut LineSel) -> (&'
                     line.replace_range(lo..hi, "");
                     serial_println!("[clip] cut unit=selection len={}", hi - lo);
                     LineSel::witness_cleared(line.len(), "cut");
-                    ("ok", true)
+                    ("ok", 1)
                 } else {
-                    ("refused", false)
+                    ("refused", 0)
                 }
+            }
+            // TERMSEL2: a selection that reaches the scrollback cannot be cut — the scrollback is
+            // what the machine printed. Declined on the wire; the selection and the line are kept.
+            None if scroll => {
+                serial_println!("[clip] cut refused reason=read-only");
+                ("read-only", 0)
             }
             None => {
                 serial_println!("[clip] cut refused reason=no-selection");
-                ("empty", false)
+                ("empty", 0)
             }
         },
         Action::SelectAll
@@ -316,10 +360,10 @@ pub fn terminal_action(act: Action, line: &mut String, sel: &mut LineSel) -> (&'
         | Action::SelectRight
         | Action::SelectLineStart
         | Action::SelectLineEnd
-        | Action::Deselect => ("ok", sel.apply(act, line.len())),
+        | Action::Deselect => ("ok", if !sel.apply(act, line.len()) { 0 } else if scroll { 2 } else { 1 }),
         // Not this consumer's business: the capture actions are delivered and acted on at the
         // decoder (`Action::is_capture`), and `LogOut` is KEYMAP's slot, bound by nobody.
-        Action::Screenshot | Action::ScreenshotRegion | Action::LogOut => ("ignored", false),
+        Action::Screenshot | Action::ScreenshotRegion | Action::LogOut => ("ignored", 0),
     }
 }
 

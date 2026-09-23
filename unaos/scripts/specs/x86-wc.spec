@@ -686,5 +686,8 @@ FORBID :: TERMSEL: .* -> FAIL ::
 # `clickroute_selftest`, which this lane runs every boot — mints a `KERNEL_OWNER_DESKTOP` probe row
 # and drives presses through the LIVE `wc_click_route_at`. `legs=` is a bit per leg; the wanted mask
 # is a constant of the fixture, so it is pinned literally with every field.
-REQUIRE :: TERMSEL2: legs=0x1f/0x1f hit=ok route=ok drag=ok up=ok dbl=ok -> PASS ::
+# M2 (mouse selection) grew the verdict: `sel=` is the span a drag across two scrollback rows made —
+# THE field the go-red moves (a drag that ignores the row), `copy=`/`word=`/`into_edit=` read the
+# clipboard back through the epoch gate, `cut_ro=` is ⌘X REFUSED on the read-only scrollback.
+REQUIRE :: TERMSEL2: legs=0xfff/0xfff hit=ok route=ok drag=ok up=ok dbl=ok sel=ok copy=ok cut_ro=ok esc=ok word=ok into_edit=ok edit=ok -> PASS ::
 FORBID :: TERMSEL2: .* -> FAIL ::

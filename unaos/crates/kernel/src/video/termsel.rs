@@ -326,8 +326,14 @@ impl LineSel {
     /// a drag prints only when it enters a NEW cell. Every press is on the wire as
     /// `[termsel] press cell=(c,r) kind=down|drag|up|dbl`. Returns the repaint the console owes: 0
     /// none, 1 the input line, 2 the whole terminal.
+    ///
+    /// What each press does to the selection (M2): a DOWN drops any selection and anchors a new one
+    /// at its cell; a DRAG makes the selection every cell from the anchor cell to the drag cell,
+    /// both included, across rows; a DBL selects the WORD under the pointer — the run of printable
+    /// non-space characters containing that cell, nothing if the cell is a space or past the end —
+    /// and ignores drags until the release; an UP ends the press.
     pub fn pointer(&mut self, kind: PressKind, ms: u64, row: u64, col: usize, text: &str, len: usize) -> u8 {
-        let _ = (text, len);
+        let before = self.span(len);
         let cell = (row, col);
         match kind {
             PressKind::Down => {
@@ -348,7 +354,31 @@ impl LineSel {
                     RowFmt(row),
                     if dbl { "dbl" } else { "down" }
                 );
-                0
+                if dbl {
+                    match word_at(text, col) {
+                        Some((ws, we)) => {
+                            self.anchor_row = row;
+                            self.head_row = row;
+                            self.anchor = ws;
+                            self.head = we;
+                            self.live = true;
+                        }
+                        None => self.live = false,
+                    }
+                    self.note(before, len, "word");
+                    return 2;
+                }
+                // A plain DOWN: nothing is selected until the pointer leaves the cell.
+                self.live = false;
+                self.anchor_row = row;
+                self.head_row = row;
+                self.anchor = col;
+                self.head = col;
+                if self.note(before, len, "click") {
+                    2
+                } else {
+                    0
+                }
             }
             PressKind::Drag => {
                 if !self.ptr.held || self.ptr.word || cell == self.ptr.drag {
@@ -356,7 +386,23 @@ impl LineSel {
                 }
                 self.ptr.drag = cell;
                 serial_println!("[termsel] press cell=({},{}) kind=drag", col, RowFmt(row));
-                0
+                // Both end cells INCLUDED: the anchor cell's near boundary to the drag cell's far one.
+                let a = self.ptr.cell;
+                self.anchor_row = a.0;
+                self.head_row = row;
+                if cell >= a {
+                    self.anchor = a.1;
+                    self.head = col + 1;
+                } else {
+                    self.anchor = a.1 + 1;
+                    self.head = col;
+                }
+                self.live = true;
+                if self.span(len).is_none() {
+                    self.live = false;
+                }
+                self.note(before, len, "drag");
+                2
             }
             PressKind::Up => {
                 if !self.ptr.held {
@@ -368,6 +414,99 @@ impl LineSel {
             }
         }
     }
+
+    /// The selected columns `[lo, hi)` of row `row`, a row of `cells` cells, or `None` — the ONE
+    /// reading both painters use (the scrollback rows in `Console::draw`, the editable line in
+    /// `Console::draw_prompt_line`), so a band can never disagree with the text a copy takes. A row
+    /// strictly inside a multi-row selection is selected whole.
+    pub fn cols_on(&self, row: u64, cells: usize, len: usize) -> Option<(usize, usize)> {
+        let (s, e) = self.span(len)?;
+        if row < s.0 || row > e.0 {
+            return None;
+        }
+        let lo = core::cmp::min(if row == s.0 { s.1 } else { 0 }, cells);
+        let hi = core::cmp::min(if row == e.0 { e.1 } else { cells }, cells);
+        if lo < hi {
+            Some((lo, hi))
+        } else {
+            None
+        }
+    }
+
+    /// Does the live selection reach the SCROLLBACK? The scrollback is read-only, so `Cut` refuses
+    /// such a selection, and dropping one owes a repaint of the whole terminal, not the input line.
+    pub fn touches_scrollback(&self, len: usize) -> bool {
+        matches!(self.span(len), Some(((r, _), _)) if r != EDIT_ROW)
+    }
+
+    /// The selected TEXT and its row count, rows joined by `\n`, or `None`. `row_text` yields each
+    /// row by its number (`""` for a line that has left the scrollback — it is skipped). A cell
+    /// holding anything but printable ASCII is copied as a SPACE, which is what the painter shows
+    /// there (`draw_text` draws no glyph for it) and keeps the clipboard's text-only rule from
+    /// refusing a whole copy over one character.
+    ///
+    /// `have` is the range of scrollback rows that still exist (`hist_base .. hist_base + n`).
+    pub fn selected_text<'a>(
+        &self,
+        len: usize,
+        have: core::ops::Range<u64>,
+        row_text: impl Fn(u64) -> Option<&'a str>,
+    ) -> Option<(alloc::string::String, usize)> {
+        let (s, e) = self.span(len)?;
+        let mut out = alloc::string::String::new();
+        let mut rows = 0usize;
+        let mut take = |row: u64, out: &mut alloc::string::String| {
+            let Some(t) = row_text(row) else {
+                return;
+            };
+            let cells = t.chars().count();
+            if rows > 0 {
+                out.push('\n');
+            }
+            rows += 1;
+            if let Some((lo, hi)) = self.cols_on(row, cells, len) {
+                for ch in t.chars().skip(lo).take(hi - lo) {
+                    out.push(if ch.is_ascii() && (ch as u8) >= 0x20 && (ch as u8) <= 0x7E { ch } else { ' ' });
+                }
+            }
+        };
+        if s.0 != EDIT_ROW {
+            // Rows that have left the scrollback are gone from the copy, as they are from the glass.
+            let end = if e.0 == EDIT_ROW { have.end } else { core::cmp::min(e.0 + 1, have.end) };
+            let mut r = core::cmp::max(s.0, have.start);
+            while r < end {
+                take(r, &mut out);
+                r += 1;
+            }
+        }
+        if e.0 == EDIT_ROW {
+            take(EDIT_ROW, &mut out);
+        }
+        if rows == 0 {
+            None
+        } else {
+            Some((out, rows))
+        }
+    }
+}
+
+/// The WORD containing cell `col` of `text`: the maximal run of printable non-space ASCII around
+/// it, as `[start, end)` cells, or `None` when that cell is a space, not ASCII, or past the end.
+fn word_at(text: &str, col: usize) -> Option<(usize, usize)> {
+    let v: alloc::vec::Vec<char> = text.chars().collect();
+    let w = |c: char| c.is_ascii_graphic();
+    if col >= v.len() || !w(v[col]) {
+        return None;
+    }
+    let mut ws = col;
+    while ws > 0 && w(v[ws - 1]) {
+        ws -= 1;
+    }
+    let mut we = col + 1;
+    while we < v.len() && w(v[we]) {
+        we += 1;
+    }
+    Some((ws, we))
 }
 
 /// A row as the wire writes it: the absolute scrollback line number, or `e` for the editable line.
@@ -704,6 +843,19 @@ const fn yn(v: bool) -> &'static str {
 ///  * `drag` (0x4) — motion to cell (3,1) arrives as a `drag` note read as `(3,1)`.
 ///  * `up` (0x8) — the release is consumed, arrives as an `up` note at `(3,1)`, and nothing is held.
 ///  * `dbl` (0x10) — two presses on editable cell (8,e) inside [`DBL_MS`]: the second is `dbl`.
+///  * `sel` (0x20) — after the press at (2,0) and the drag to (3,1) the selection is the span
+///    `(2,0)..(4,1)`: both end cells included, ACROSS the row. THE go-red: a drag that ignores the
+///    row keeps the head on row 0 and this, `copy` and `into_edit` all read `no`.
+///  * `copy` (0x40) — `⌘C` (the shipped `terminal_action_in`, through `Console::act`'s arguments)
+///    puts `pha beta\ngamm` on the clipboard, read back through the epoch gate.
+///  * `cut_ro` (0x80) — `⌘X` on it is REFUSED `read-only`, and the selection and the line survive.
+///  * `esc` (0x100) — `Esc` (`Deselect`) clears it and asks for a WHOLE-terminal repaint (2): the
+///    band was in the scrollback.
+///  * `word` (0x200) — the double-click of `dbl` selected the word `select` (`6..12` on the line),
+///    and `⌘C` copies exactly `select`.
+///  * `into_edit` (0x400) — a press at (6,1) dragged to (4,e) selects from the scrollback INTO the
+///    editable line; `⌘C` copies `delta\nunaos`.
+///  * `edit` (0x800) — a typed byte through the line editor's edit rule clears that selection.
 #[cfg(all(target_arch = "x86_64", feature = "witness"))]
 pub fn pointer_selftest() {
     use super::wm;
@@ -770,7 +922,7 @@ pub fn pointer_selftest() {
     };
     // Take every note queued for the probe row and hand it to the console; return the last as
     // `(kind, row, col)` and how many there were.
-    let mut take = |con: &mut crate::console::Console| -> (Option<(PressKind, u64, usize)>, usize) {
+    let take = |con: &mut crate::console::Console| -> (Option<(PressKind, u64, usize)>, usize) {
         let mut last = None;
         let mut n = 0usize;
         while let Some(p) = take_press(win) {
@@ -790,6 +942,14 @@ pub fn pointer_selftest() {
         .all(|&(x, y)| wm::hit_test(x, y).map(|(w, _, _)| w) == Some(win));
     let mut got = 0u32;
     let (mut route, mut drag, mut up, mut dbl) = (false, false, false, false);
+    let (mut sel, mut copy, mut cut_ro, mut esc, mut word, mut into_edit, mut edit) =
+        (false, false, false, false, false, false, false);
+    let clip_is = |want: &str| -> bool {
+        let mut buf = [0u8; 64];
+        let n = crate::video::clipboard::get(&mut buf);
+        &buf[..n] == want.as_bytes()
+    };
+    let line_len = con.current_input.len();
     if hit {
         got |= 0x1;
         // route — a press on the scrollback is consumed and noted for THIS window.
@@ -801,6 +961,13 @@ pub fn pointer_selftest() {
         // up — the release is consumed and ends the hold.
         let c = wc_click_route_at(Event::Button(0), p_b.0, p_b.1);
         up = c && take(&mut con) == (Some((PressKind::Up, 1, 3)), 1) && !pointer_held();
+        // sel / copy / cut_ro / esc — the span the drag made, and what the clipboard chords do to it.
+        sel = con.sel.span(line_len) == Some(((0, 2), (1, 4)));
+        copy = con.act_for_fixture(Action::Copy) == ("ok", 0) && clip_is("pha beta\ngamm");
+        cut_ro = con.act_for_fixture(Action::Cut) == ("read-only", 0)
+            && con.current_input == "unaos select"
+            && con.sel.span(line_len) == Some(((0, 2), (1, 4)));
+        esc = con.act_for_fixture(Action::Deselect) == ("ok", 2) && con.sel.span(line_len).is_none();
         // dbl — two presses on one editable cell, well inside DBL_MS.
         let mut kinds = 0usize;
         for _ in 0..2 {
@@ -812,15 +979,43 @@ pub fn pointer_selftest() {
             let _ = take(&mut con);
         }
         dbl = kinds == 2 && con.sel.ptr.word == true && !con.sel.ptr.held;
+        word = con.sel.range(line_len) == Some((6, 12))
+            && con.act_for_fixture(Action::Copy) == ("ok", 0)
+            && clip_is("select");
+        // into_edit — from the scrollback into the editable line.
+        let p_d = at(1, 6);
+        let p_e = at(2, 4);
+        wc_click_route_at(Event::Button(1), p_d.0, p_d.1);
+        pointer_motion(p_e.0, p_e.1);
+        wc_click_route_at(Event::Button(0), p_e.0, p_e.1);
+        let _ = take(&mut con);
+        into_edit = con.sel.span(line_len) == Some(((1, 6), (EDIT_ROW, 5)))
+            && con.act_for_fixture(Action::Copy) == ("ok", 0)
+            && clip_is("delta\nunaos");
+        // edit — the line editor's edit rule drops it.
+        con.sel.on_edit(b'x', line_len);
+        edit = con.sel.span(line_len).is_none();
     }
-    for (bit, ok) in [(0x2u32, route), (0x4, drag), (0x8, up), (0x10, dbl)] {
+    for (bit, ok) in [
+        (0x2u32, route),
+        (0x4, drag),
+        (0x8, up),
+        (0x10, dbl),
+        (0x20, sel),
+        (0x40, copy),
+        (0x80, cut_ro),
+        (0x100, esc),
+        (0x200, word),
+        (0x400, into_edit),
+        (0x800, edit),
+    ] {
         if ok {
             got |= bit;
         }
     }
-    const WANT: u32 = 0x1f;
+    const WANT: u32 = 0xfff;
     serial_println!(
-        ":: TERMSEL2: legs={:#x}/{:#x} hit={} route={} drag={} up={} dbl={} -> {} ::",
+        ":: TERMSEL2: legs={:#x}/{:#x} hit={} route={} drag={} up={} dbl={} sel={} copy={} cut_ro={} esc={} word={} into_edit={} edit={} -> {} ::",
         got,
         WANT,
         yn(hit),
@@ -828,6 +1023,13 @@ pub fn pointer_selftest() {
         yn(drag),
         yn(up),
         yn(dbl),
+        yn(sel),
+        yn(copy),
+        yn(cut_ro),
+        yn(esc),
+        yn(word),
+        yn(into_edit),
+        yn(edit),
         if got == WANT { "PASS" } else { "FAIL" }
     );
 

@@ -247,7 +247,10 @@ impl Console {
         // full repaint and the per-keystroke path (both call this) paint the same band. One cell
         // tall, exactly as the cursor below is. No witness: a repaint is not a state change (the
         // model prints those).
-        if let Some((lo, hi)) = self.sel.range(self.current_input.len()) {
+        // TERMSEL2: `cols_on(EDIT_ROW, …)` — the editable line's part of ANY selection, one that
+        // started in the scrollback included; for a selection wholly on this line it is `range`.
+        let len = self.current_input.len();
+        if let Some((lo, hi)) = self.sel.cols_on(crate::video::termsel::EDIT_ROW, len, len) {
             let band_x = input_x + m.text_w(lo);
             pal.draw_rect(band_x, prompt_y, m.text_w(hi - lo), m.cell_h, 0xFFFFFF);
             pal.draw_text(band_x, prompt_y, self.current_input.get(lo..hi).unwrap_or(""), Self::BG);
@@ -265,8 +268,11 @@ impl Console {
         let rows = self.history_rows(pal);
         let skip = self.history.len().saturating_sub(rows);
         let mut y = self.top_y(pal);
-        for line in self.history.iter().skip(skip) {
+        for (i, line) in self.history.iter().enumerate().skip(skip) {
             pal.draw_text(m.margin, y, line, 0xAAAAAA);
+            // TERMSEL2 — a selection's band on a SCROLLBACK row, the same inverse video the editable
+            // line gets (`draw_prompt_line`), read from the same model (`LineSel::cols_on`).
+            self.draw_row_band(pal, y, self.hist_base + i as u64, line);
             y += m.line_h;
         }
 
@@ -387,6 +393,40 @@ impl Console {
                 true
             }
         }
+    }
+
+    /// The selection's band on scrollback row `row` (text `line`, drawn at `y`): the selected cells
+    /// filled with the text colour and their characters redrawn in the background colour.
+    fn draw_row_band(&self, pal: &mut TargetPal, y: usize, row: u64, line: &str) {
+        let m = pal.metrics();
+        let cells = line.chars().count();
+        if let Some((lo, hi)) = self.sel.cols_on(row, cells, self.current_input.len()) {
+            let x = m.margin + m.text_w(lo);
+            pal.draw_rect(x, y, m.text_w(hi - lo), m.cell_h, 0xFFFFFF);
+            let part: String = line.chars().skip(lo).take(hi - lo).collect();
+            pal.draw_text(x, y, &part, Self::BG);
+        }
+    }
+
+    /// TERMSEL2 — what the terminal does with a resolved desktop ACTION, with its whole text in hand
+    /// (`video::clipboard::terminal_action_in` gets the scrollback, which a pointer selection can
+    /// reach), and the repaint that action owes paid on `pal`. Returns whether anything was painted,
+    /// so the caller can mark its window dirty as it does for a keystroke.
+    pub fn act(&mut self, a: crate::video::keymap::Action, pal: &mut TargetPal) -> bool {
+        let (_, r) = crate::video::clipboard::terminal_action_in(
+            a,
+            &mut self.current_input,
+            &mut self.sel,
+            &self.history,
+            self.hist_base,
+        );
+        self.repaint(r, pal)
+    }
+
+    /// Fixture seam: [`Self::act`] without a surface — the action's field and repaint code.
+    #[cfg(feature = "witness")]
+    pub fn act_for_fixture(&mut self, a: crate::video::keymap::Action) -> (&'static str, u8) {
+        crate::video::clipboard::terminal_action_in(a, &mut self.current_input, &mut self.sel, &self.history, self.hist_base)
     }
 
     /// Fixture seam: place a scrollback line WITHOUT the transport. `println` drains the global
