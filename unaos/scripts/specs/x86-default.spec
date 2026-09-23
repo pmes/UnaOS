@@ -380,3 +380,23 @@ FORBID :: EHCI-HID: PASSPERIOD self-test: .* -> FAIL
 REQUIRE :: STOR2-MV: .* :: PASS \[w=0x7f/0x7f\] ::
 # The FORBID partner is the launcher's own FAIL spelling (this milestone's go-red produced it).
 FORBID :: STOR2-MV: rename-while-open FAIL
+
+# ── TPFRAME (2026-09-23, rmbp-ledger B197), TAIL-APPENDED ─────────────────────────────────────────
+# THE TRACKPAD'S VENDOR ROUTE, pinned the commit it lands. `tpframe_selftest` is chained beside
+# `trackpad_dispatch_selftest` in `parser_selftest` (drivers/ehci/mod.rs), which `drivers::ehci::init`
+# runs on every x86 boot under the default-on `ehcihid` — the same entry point SPECPINS2's block above
+# names for ISRARM/PASSPERIOD, with no knob of its own. It feeds flight 12's three captured 58-byte
+# vendor frames (f12-boot1.log, `raw report #2/#3/#4 (58 B)`) plus four labelled one-byte derivations
+# (click down, click up, header-only lift, re-touch) through `trackpad_dispatch` and `TpCensus::mt_step`,
+# the two functions the live arm runs. QEMU has no Apple pad, so this fixture is the ONLY place the
+# route runs off metal; the live lines (`[tp] mt route=`, `[tp] mt fingers=`, `[tp] mode-mismatch`) are
+# metal-only and are NOT forbidden here, because a FORBID no QEMU boot can reach protects nothing.
+#
+# THE SHAPE is ISRARM's: every field is literal because PASS is their conjunction (`vendor == 7 &&
+# fingers_max == 1 && deltas_ok && clicks_ok && wit_ok && rel_pairs == 2 && legacy_ok && mm_yes &&
+# mm_no`), so a later edit that drops or weakens a field reds here rather than narrowing silently.
+# `d=` is the two captured deltas (dx/dy, y negated): -30/-12 and -3/-5. `relx10=2/2` is the wire's
+# own cross-check — the pad's rel_x/rel_y equal 10 x our abs delta on both captured pairs. The two
+# `mismatch_*` fields are M3's rule, the wire beats the register: each direction named exactly once.
+REQUIRE :: TPFRAME: frames=7 fingers_max=1 deltas_ok=true click_edges=down@4,up@5 corpus=3 d=-30/-12,-3/-5 lift_reset=true relx10=2/2 wit_1in64=true legacy_ok=true mismatch_yes=true mismatch_no=true -> PASS ::
+FORBID :: TPFRAME: .* -> FAIL ::
