@@ -1,0 +1,36 @@
+frames 3 [58, 58, 58]
+constant bytes: [0, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25, 26, 27, 28, 30, 31, 33, 35, 39, 41, 43, 44, 45, 47, 49, 50, 51, 52, 53, 54, 55]
+varying bytes: [(1, [87, 88, 89]), (4, [102, 110, 118]), (20, [10, 12, 13]), (29, [3, 4, 4]), (32, [85, 55, 52]), (34, [184, 196, 201]), (36, [64, 212, 226]), (37, [255, 254, 255]), (38, [56, 120, 50]), (40, [39, 44, 41]), (42, [217, 223, 237]), (46, [234, 231, 243]), (48, [24, 28, 35]), (56, [189, 150, 137]), (57, [7, 8, 8])]
+le16@ 0 values=[22388, 22644, 22900] deltas=[256, 256] MONOTONIC
+le16@ 2 values=[796, 796, 796] deltas=[0, 0]
+le16@ 4 values=[-20890, -20882, -20874] deltas=[8, 8] MONOTONIC
+le16@ 6 values=[3, 3, 3] deltas=[0, 0]
+le16@ 8 values=[256, 256, 256] deltas=[0, 0]
+le16@10 values=[-26873, -26873, -26873] deltas=[0, 0]
+le16@12 values=[28, 28, 28] deltas=[0, 0]
+le16@14 values=[1, 1, 1] deltas=[0, 0]
+le16@16 values=[16, 16, 16] deltas=[0, 0]
+le16@18 values=[0, 0, 0] deltas=[0, 0]
+le16@20 values=[10, 12, 13] deltas=[2, 1] MONOTONIC
+le16@22 values=[0, 0, 0] deltas=[0, 0]
+le16@24 values=[0, 0, 0] deltas=[0, 0]
+le16@26 values=[0, 0, 0] deltas=[0, 0]
+le16@28 values=[769, 1025, 1025] deltas=[256, 0]
+le16@30 values=[258, 258, 258] deltas=[0, 0]
+le16@32 values=[2901, 2871, 2868] deltas=[-30, -3] MONOTONIC
+le16@34 values=[1720, 1732, 1737] deltas=[12, 5] MONOTONIC
+le16@36 values=[-192, -300, -30] deltas=[-108, 270]
+le16@38 values=[56, 120, 50] deltas=[64, -70]
+le16@40 values=[1063, 1068, 1065] deltas=[5, -3]
+le16@42 values=[985, 991, 1005] deltas=[6, 14] MONOTONIC
+le16@44 values=[16384, 16384, 16384] deltas=[0, 0]
+le16@46 values=[234, 231, 243] deltas=[-3, 12]
+le16@48 values=[280, 284, 291] deltas=[4, 7] MONOTONIC
+le16@50 values=[0, 0, 0] deltas=[0, 0]
+le16@52 values=[0, 0, 0] deltas=[0, 0]
+le16@54 values=[0, 0, 0] deltas=[0, 0]
+le16@56 values=[1981, 2198, 2185] deltas=[217, -13]
+le16@8 == 1 x delta(le16@0) on 2/2 consecutive pairs
+le16@16 == 2 x delta(le16@4) on 2/2 consecutive pairs
+le16@36 == 10 x delta(le16@32) on 2/2 consecutive pairs
+le16@38 == 10 x delta(le16@34) on 2/2 consecutive pairs

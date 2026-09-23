@@ -3114,6 +3114,8 @@ the device put on the wire, so every one of those rules is a clamp, not an assum
   there is no indexing a short frame could drive out of bounds.
 - the decoder emits **no events and mutates no state**. Decode + witness only.
 
+**RETIRED 2026-09-23 (TPFRAME, rmbp-ledger B197):** the sub-knob below no longer exists — its decode is
+the default-on `TpRoute::Vendor` route (§39.7). The paragraph is kept as the record of what it did.
 **Event injection is a second, separate knob.** `mtraw_inject` (`UNAOS_MTRAW_INJECT=1`, implies `mtraw`)
 differences the first finger's absolute position into `pal::Event::Mouse` deltas (applying wsp's Y
 negation, clearing the reference on finger-up so a lift never emits a jump, and clamping each delta to
@@ -9681,6 +9683,7 @@ REPORT:
 |---|---|---|
 | `0x02` | `TpRoute::Rel` | `decode_trackpad_rel` → `pal::push_pointer_report(Event::Mouse{dx,dy}, button edge)` — **the same relative install seam the boot-mouse arm uses, with the same fold/lag accounting.** Byte map: `[0]` id, `[1]` buttons, `[2]` dx int8, `[3]` dy int8. |
 | `0x44` | `TpRoute::Mt` | `decode_vendor_first_finger` at the `VMT_FINGER_*` hypothesis offsets — **decoded and witnessed, never installed**, because those offsets are unconfirmed on silicon. Kept for the flight on which the switch latches. |
+| anything else, TYPE2 shape (`len >= 30`, `(len − 30) % 28 == 0`) | `TpRoute::Vendor` | **TPFRAME (B197, §39.7):** the vendor-multitouch frame a latched mode switch produces — `TpCensus::mt_step` differences the primary finger into the 0x02 arm's own `(buttons, dx, dy)` and the 0x02 install carries it. |
 | anything else | `TpRoute::None` | counted by the census, routed nowhere. Flight 11's `60 02` is this. |
 
 On the int8 reading: `02 00 f9 00 00 00 fb 00` is `dx = -7, dy = 0` (and a third int8 `-5` at `[6]`).
@@ -9711,6 +9714,110 @@ re-pinned and no threshold chosen.
    fires on the first id-0x02 report rather than on report #1 whatever it is).
 4. `EHCIDARK … kind=vendor-mt … missed<=` — the fluidity number, to be read beside PTRLAG's
    `[ptrinstall]` terms. Nothing in this arc addresses it; naming it is the point.
+### 39.7 TPFRAME — the vendor frame, decoded and routed (rmbp-ledger B197, 2026-09-23)
+
+**Why.** Flight 12 is the first flight on which the mode switch latched (`[tp] mode wrote=01 05 00 …
+readback=01 05 00 … latched=yes (… widx=0 try=legacy-index0 …)` at 5832 ms). From then on the pad sent
+58-byte frames starting `74 57 1c 03` (`vendor-multitouch raw report #2 (58 B)` at 234250 ms,
+`[tp] ids=02:0,44:0,other:2 sizes=2/58`), and the dispatcher above routed every one of them to
+`TpRoute::None`, so the arrow was dead (R63; MOUSEHALT, B190). This section adds the fourth route.
+
+**The format, derived twice.** Derivation A is the wsp.c TYPE2 table the tree already carried
+(`WSP2_*`, §10g). Derivation B uses only the three captured frames: every le16 offset was scanned
+for motion, and for one field being a fixed multiple of another's frame-to-frame delta
+(`docs/dev/evidence/rmbp-0915/tpframe/derive.py`, output beside it). B agrees with A at every offset
+B can reach. The `VMT_FINGER_*` 0x44 hypothesis (report offsets 33/35/47) is off by one at all three,
+because it strips a Report ID byte that this frame does not carry.
+
+| off | size | wsp name | corpus #2 / #3 / #4 | reading, and its evidence |
+|---|---|---|---|---|
+| 0 | u8 | flag | `74` / `74` / `74` | constant. Meaning **unverified**. NOT used as a route gate. |
+| 1 | u8 | sn0 | `57` / `58` / `59` | +1 per frame: a sequence counter |
+| 4 | le32 | dwSn1 | `0x3ae66` / `…6e` / `…76` | +8 per frame: a timestamp, unit **unverified** |
+| 12 | le16 | wLength | 28 / 28 / 28 | = len − 30 on 3/3: bytes of finger records |
+| 14 | u8 | nfinger | 1 / 1 / 1 | = (len − 30) / 28 on 3/3. A count above 1 is **unverified** |
+| 15 | u8 | ibt (button) | 0 / 0 / 0 | **unverified**: the corpus has no click |
+| 30+2 | le16 | abs_x | 2901 / 2871 / 2868 | moves, and equals rel_x / 10 exactly on 2/2 pairs |
+| 30+4 | le16 | abs_y | 1720 / 1732 / 1737 | moves, and equals rel_y / 10 exactly on 2/2 pairs |
+| 30+6 | le16 | rel_x | −192 / −300 / −30 | = 10 × Δabs_x. This is the wire's own check on +2 |
+| 30+8 | le16 | rel_y | 56 / 120 / 50 | = 10 × Δabs_y. This is the wire's own check on +4 |
+| 30+16 | le16 | touch_major | 234 / 231 / 243 | non-zero with a finger down. The lift value 0 is **unverified** |
+| 30+24 | le16 | pressure | 0 / 0 / 0 | **unverified** (it reads 0 with a finger down) |
+
+Nothing reads the other bytes, and their meaning is **unverified**. The direction of the sensor's Y on
+the glass is also **unverified**. The pointer path negates Y as wsp does, and only the glass can
+confirm it. A header-only 30-byte frame (zero records, all fingers up) is accepted as zero fingers.
+No such frame is in the corpus.
+
+**The route.** `trackpad_dispatch` keeps its two id arms byte for byte. It adds one arm: any other
+first byte whose length fits the TYPE2 gate (`len >= 30`, `(len − 30) % 28 == 0`) becomes
+`TpRoute::Vendor(Wsp2Frame)`. The arm decides by shape, not by byte 0. `TpCensus::mt_step` turns the
+primary finger's absolute position into the `(buttons, dx, dy)` triple that the 0x02 arm decodes:
+
+- dx/dy are the delta since the previous touching frame, in sensor units at 1:1. That is the retired
+  `mtraw_inject` scale, and the gain is a glass question.
+- dy has Y negated.
+- Each delta is clamped to ±128 (`TP_MT_MAX_STEP`, carried over from `mtraw_inject`).
+- The baseline clears on a frame with no finger or with `touch_major == 0`, so a re-touch never jumps.
+- `ibt != 0` sets button bit 0.
+
+From there the install is the 0x02 arm's: `note_buttons`, one `push_pointer_report`, and the same
+`trackpad click (button-down edge …)` / `trackpad release (button-up edge …)` lines. `git diff` shows
+zero changed lines inside the `TpRoute::Rel` arm. The `mtraw_inject` sub-knob is retired into this
+default-on route (`unaos/arroyo`, `Cargo.toml`, `builder/src/main.rs` and `k8-reach.registry` each
+drop it; `banner-cert.sh` never had a row for it).
+
+**The mode switch's honesty (M3).** `bcm5974_mode_switch` now returns the readback, and the arm site
+stamps it on the endpoint (`TpCensus::latched`). It prints the implied route once:
+`[tp] mt route=vendor|legacy latched=yes|no`. The stream still decides the route. If vendor frames
+arrive while `latched=no`, or id-0x02 reports arrive while `latched=yes`, the driver prints
+`[tp] mode-mismatch readback=… stream=… -> route=<stream>`, once per direction per boot, and routes by
+the stream. The wire beats the register.
+
+**The fixture.** `tpframe_selftest`, chained beside `trackpad_dispatch_selftest` and run on every x86
+boot, feeds the three captured frames verbatim. It also feeds four derived frames, each labelled and
+each one byte or one truncation away from a captured frame: #4 with `ibt`=1, #4 again, #4's header
+with `nfinger`/`wLength` zeroed, and #2 again. Every frame goes through `trackpad_dispatch` and
+`mt_step`. The fixture asserts:
+
+- 7/7 frames route to Vendor.
+- The pointer triples are exactly (0,0,0), (0,−30,−12), (0,−3,−5), (1,0,0), (0,0,0), (0,0,0), (0,0,0).
+- The button edges are down at frame 4 and up at frame 5, by `note_buttons`' own rule.
+- The re-touch 33 units away moves nothing.
+- The pad's rel field equals 10 × our abs delta on both captured pairs.
+- The witness paces 1-in-64.
+- Flight 11's `02 00 f9 …` still routes Rel `dx=-7`, and its `60 02` runt still routes nowhere.
+- Each mismatch direction fires once.
+
+The verdict line is
+`:: TPFRAME: frames=7 fingers_max=1 deltas_ok=true click_edges=down@4,up@5 corpus=3 d=-30/-12,-3/-5 lift_reset=true relx10=2/2 wit_1in64=true legacy_ok=true mismatch_yes=true mismatch_no=true -> PASS ::`,
+and `x86-default.spec` pins it. **GO-RED:** reading abs_x/abs_y big-endian (the x/y byte order
+swapped) prints `deltas_ok=false … d=-128/-128,-128/-128 … relx10=0/2 … -> FAIL ::` and the run reds.
+
+### 39.8 What flight 13 must print (a live pad in vendor mode)
+
+1. `[tp] mode … latched=yes`, then `[tp] mt route=vendor latched=yes (addr=8 intf=1; …)` once. If the
+   switch misses: `latched=no` and `[tp] mt route=legacy latched=no`, and the 0x02 arm carries the pad
+   exactly as on flights 8, 9 and 11.
+2. On touch, `[tp] mt fingers=1 x=<n> y=<n> dx=0 dy=0 frame=1` (the first frame seeds the
+   baseline), then one more `[tp] mt …` per 64 frames with non-zero `dx`/`dy` while the finger moves.
+3. On a physical click, `trackpad click (button-down edge, buttons=0x01)` then
+   `trackpad release (button-up edge, buttons=0x00)`. These are the same lines as the 0x02 arm.
+   **This is the first capture that can verify `ibt`@15.**
+4. `[tp] ids=02:0,44:0,other:<n> sizes=<m>/58`. The vendor frames count as `other`, as before.
+5. A mismatch prints `[tp] mode-mismatch readback=vendor stream=legacy -> route=legacy` or
+   `[tp] mode-mismatch readback=legacy stream=vendor -> route=vendor`, at most once each. Either one
+   is a finding about the register and not a failure, because the pointer still moves.
+
+**What only the glass proves.**
+
+- The arrow follows the finger, fluidly, with no jump on re-touch.
+- Vertical motion is not inverted. The Y sign is wsp's and is **unverified** here.
+- The speed is usable. 1:1 sensor units is the retired sub-knob's scale, not a measurement.
+- A pad click is a click.
+- The EHCIDARK drop rate (§39.6 item 4) does not turn into stickiness now that each frame carries an
+  absolute position.
+
 ## 40. BTSCHED — the Bluetooth campaign is a post-GUI worker, not a step of the port walk (rmbp-ledger B137, 2026-09-22)
 
 ### 40.1 The reading
