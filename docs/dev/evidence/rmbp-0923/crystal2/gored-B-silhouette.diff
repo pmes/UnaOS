@@ -1,0 +1,15 @@
+diff --git a/unaos/crates/kernel/src/video/menubar.rs b/unaos/crates/kernel/src/video/menubar.rs
+index 5b793c40..96461b12 100644
+--- a/unaos/crates/kernel/src/video/menubar.rs
++++ b/unaos/crates/kernel/src/video/menubar.rs
+@@ -1778,8 +1778,8 @@ fn crystal_facet(u: usize, v: usize) -> Option<u32> {
+     }
+     let cx = CRYSTAL_W / 2; // the facet seam: columns `< cx` are the shadowed face, `>= cx` the lit one
+     let half = crystal_half(v);
+-    let d2 = (2 * u + 1).abs_diff(CRYSTAL_W); // CRYSTAL2 — distance from the box's centre line, in HALF px
+-    if d2 > (2 * half).saturating_sub(1).max(1) {
++    let du = if u >= cx { u - cx } else { cx - u };
++    if du > half {
+         return None;
+     }
+     Some(if v < CRYSTAL_CROWN_H {

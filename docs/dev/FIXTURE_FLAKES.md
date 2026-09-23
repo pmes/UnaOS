@@ -1792,6 +1792,40 @@ APPPIN trap) and `FORBID :: WINMENU: .* -> SKIP reason=menu-unpublished-after=[0
 both `x86-ahci.spec` and `x86-default.spec`, so a 250 ms miss on the fold gate's
 `UNAOS_WC=1 ./arroyo test` is a red, not a silent green.
 
+### 6b. `:: MENUFIRST: … crystal=absent … painted=false recorded=false … :: FAIL ::` — **measured 2026-09-23 on flight 12's wire (CRYSTAL2, rmbp-ledger B194): Class 6, and NOT the login screen's press swallow. FIXED in the fixture (branch `exec-rmbp-crystal2`, parent `94e90eae`; the branch tip is the sha — the seat fills it at the fold).**
+
+**Signature on the wire** (flight 12, `f12-boot1.log`, 48497 ms, verbatim):
+
+```
+:: MENUFIRST: after_enable_ms=0 bound_ms=33 model=complete crystal=absent bar=2880x34 gem=16x22+12+6 red_after_enable_ms=0 unstamped=true stamped=true painted=false recorded=false bounded=false gone_red=false :: FAIL ::
+```
+
+**Read `recorded=false` FIRST.** `model=`, `crystal=`, `after_enable_ms=` and `red_after_enable_ms=`
+are all decoded from `FIRSTPAINT_READING`, and a reading nobody wrote is `0`: mask `0` prints
+`complete`, bit 35 clear prints `absent`, the low word prints `0`. Four fields, one fact — the zeros of
+an empty snapshot, this class's tell. `crystal=absent` said nothing about the glass.
+
+**The press is a red herring.** The fixture presses nothing: it calls `compose()` directly. The one
+`[login] press … swallowed=1` in that second belongs to `clickroute_selftest` (the `[clickroute] route
+… deliver=false -> FAIL` two lines later). What declined was the PAINT: the menubar strip census moved
+`decl_lock` 0 -> 16 between `[48481ms]` and `[53483ms]` and never again all boot, the menubar ledger
+read `paints=3` before the fixture and `[menubar] selftest … paints=3` after it, and the same second
+carries `[strip] vacate tenant=menubar … erased=no … -> STALE-ENDS` and `:: STRIPVAC: erase declined`.
+16 is consistent with one try from `:: MENUBAR:` leg 6, seven from `:: MENUBATT:` leg 6 and eight from
+MENUFIRST's two four-try loops. **`:: MENUBATT: … change_paint=false damage_ok=false :: FAIL ::` is the
+same swallow**, and its `jitter_paint=false` half passed VACUOUSLY on that capture (the negative
+control's paint could not land either) — NOT fixed by this entry. Which leaf lock (the panel's
+masked `try_lock` or the strip `SCRATCH`) is not on the wire. MENUFIRST first ran on metal on flight
+12 (flight 11's image predates it); flight 11's `:: MENUBAR:` leg-6 paint DID land there (`decl_lock=0`,
+`paints` 2 -> 3). Rate on metal: one reading, one red.
+
+**Disposition.** Legs 2 and 4 settle on the RECORDER for up to 250 ms (`menubar::paint_settle`,
+cycle-timed; a sibling core's paint counts), the verdict carries `settle_tries=<a>+<b>
+settle_us=<x>+<y> decl_lock=<n>`, and an unlanded settle is `:: SKIP ::` with `model=unread
+crystal=unread` when nothing was recorded — never a FAIL printed from zeros. `x86-wc.spec` FORBIDs the
+SKIP on the QEMU lane. `crystal=` is now a readback of the gem off the panel (`gem_px=` on the
+`[menubar] first-paint` line), so a recorded paint says what reached the glass.
+
 ---
 
 ## Class 7 — the INJECTED-EVENT typist paces on the wall clock, and the emulator FOLDS what the guest did not poll

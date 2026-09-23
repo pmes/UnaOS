@@ -19598,12 +19598,12 @@ gets disabled. **Two queue rows follow from this and are the arc's real output**
 source before the enable seam, and give the console window focus at `activate` so the bar has a name
 to say. Both are one-line changes in files this executor was told not to open.
 
-**The 1-px crown asymmetry is recorded, not fixed.** `crystal_facet` splits at `u < cx` with
-`cx = CRYSTAL_W/2 = 8`, while the silhouette spans `[cx-half, cx+half]` — so the shadowed `CLOSE`
-face is `half` px wide and the lit `ZOOM` face is `half+1`. At the table row (`v=0`, `half=4`) that
-is 4 dark against 5 light out of 9. It is present at EVERY paint, not just the first, so it is not
-this arc's defect and moving the mark's pixels is R25 territory (`1046f81c` moved this mark once and
-Peter rejected it). Recorded here so the next reader does not re-derive it.
+**The 1-px crown asymmetry — FIXED by CRYSTAL2 (rmbp-ledger B194, §CRYSTAL2 at the end of this file).**
+`crystal_facet` split at `u < cx` with `cx = CRYSTAL_W/2 = 8` while the silhouette spanned
+`[cx-half, cx+half]`: the shadowed `CLOSE` face `half` px wide, the lit `ZOOM` face `half+1` (4 dark
+against 5 light at the table row), and — not seen here — the girdle row's right tip (`u = 16`) fell
+outside the 16-px box and was clipped. CRYSTAL2 centres the silhouette on the box's half-pixel line:
+same box, same place, same inks; the mark does not move (R25 is its position, this is its shape).
 
 ### Gates (MENUFIRST, on `exec-rmbp-menufirst`, parent `b8930689`)
 
@@ -20482,3 +20482,87 @@ re-states. On flight 12:
   arms), or if the verdict reads `yielded_to=0x00` (the app did not take a row, so STARTHOLD's
   mechanism is wrong), or if `first_bad=P<n>` names a probe (the yield handed the prober a row it
   could not have).
+
+## CRYSTAL2 — the bar's crystal read off the panel, on every paint (x86 `wc`, flight 12, 2026-09-23)
+
+rmbp-ledger **B194**, B156's follow-up. Branch `exec-rmbp-crystal2`, parent `94e90eae`. Peter,
+flight 11: *"startup is still slow and shows a broken crystal"*. The playbook asked him where the
+broken crystal was and got no answer, so this section is about making the wire say it.
+
+### 1. Flight 12's two readings, and what each measured
+
+| line (flight 12) | what the field was | what it said about the glass |
+|---|---|---|
+| `[6699ms] [menubar] first-paint … model=partial:caption+clock+batt crystal=drawn rect=2880x34+0+0` | `r.3 >= CRYSTAL_H && crystal_offset(r.3).0 + CRYSTAL_W <= r.2` — the rect's geometry | nothing beyond "a paint landed on a rect that can hold the gem" |
+| `[48497ms] :: MENUFIRST: after_enable_ms=0 … model=complete crystal=absent … painted=false recorded=false … :: FAIL ::` | bits of `FIRSTPAINT_READING`, which nobody wrote (`recorded=false`) | nothing: `complete`, `absent` and `0` are the zeros of an empty word |
+
+**The partial-then-complete question.** If a later, fuller bar paint had omitted the gem, the mark
+from the first paint would have been overdrawn and the wire would never have said so. From the code:
+`strip::paint` composes every row of its rect and `compose_row` draws the gem before the text-band
+return and before any model-dependent branch. From the wire, independently: `paint_px` is exactly
+`paints x 97920` (the whole 2880x34 band) on every `[strip] rollup tenant=menubar` line — 8 of 8 on
+flight 11, 9 of 9 on flight 12. Refuted from both ends, and now measured (§3).
+
+**MENUFIRST's red is FIXTURE_FLAKES §6b (Class 6).** The fixture presses nothing; the second's one
+`[login] press … swallowed=1` is `clickroute_selftest`'s. The paints declined: the menubar census moved
+`decl_lock` 0 -> 16 across the fixture (and never again), `paints=3` before and after, and the same
+second's vacate reads `erased=no … -> STALE-ENDS`. `:: MENUBATT: … change_paint=false :: FAIL ::` is
+the same swallow (owed: its leg 6 onto `paint_settle`). Which leaf lock is not on the wire.
+
+### 2. The gem itself was lopsided
+
+`crystal_facet` centred the silhouette on column 8 of the 16-px box. The girdle row's right tip
+(`u = 16`) fell outside the box and was clipped, and the crown split 4 dark to 5 lit. It is now centred
+on the box's half-pixel line — `abs(2u + 1 - 16) <= max(2*half - 1, 1)` — mirror-symmetric, 198 px,
+crown faces 4 and 4, the girdle the one full-width row. Same box `16x22+12+6`, same three inks: the
+mark's position (R25) is untouched, only its shape inside its own box changed.
+
+```
+....CCCCZZZZ....   rows 0-1   (C = CONTROL_CLOSE, Z = CONTROL_ZOOM, M = CONTROL_MID)
+...CCCCCZZZZZ...   rows 2-3
+..CCCCCCZZZZZZ..   rows 4-5
+.CCCCCCCZZZZZZZ.   rows 6-7
+MMMMMMMMMMMMMMMM   row 8, the girdle
+.MMMMMMMMMMMMMM.   row 9, tapering to a 2-px point at rows 19-21
+```
+
+### 3. The instruments
+
+* **`crystal_readback(rect)`** reads the gem's 16x22 box back off the scan-out surface:
+  `gem_px=<matched>/<want>` (silhouette pixels in their ink), `stray=<n>` (gem ink outside the
+  silhouette), `sym=<b>` (mirror symmetry, the shadowed face opposite the lit one). Words: `drawn`
+  (all matched, no stray, symmetric), `broken`, `absent`, `unread` (panel lock refused).
+  `[menubar] first-paint` now ends `crystal=<word> rect=… gem_px=… stray=… sym=…`; MENUFIRST's
+  `crystal=` is the same readback (reading bits 35-37).
+* **`[menubar] crystal-persist paints=3 present=3/3 models=partial:caption+clock+batt,complete,complete
+  gem_px=594/594 stray=0 sym=true tries=… decl_lock=… unread=0 budget_ms=250 -> PASS`** — three paints
+  through the real `compose` and damage test with the model swapped (`persist_model`), each settled on
+  `SLOT` holding that model's signature, the gem read back after each. SKIP (never FAIL) when a paint
+  cannot land or the readback is refused.
+* **`paint_settle`** — drive `compose()` until a predicate on published state holds, up to 250 ms on
+  the cycle counter. MENUFIRST legs 2 and 4 use it; its line gains `settle_tries=<a>+<b>
+  settle_us=<x>+<y> decl_lock=<n>` and says `:: SKIP ::` when either settle ran out.
+
+### 4. Gates (on the branch's code commit)
+
+`./arroyo check`: `x86_64 OK`, `aarch64 OK`, `GATE-LEDGER: OK`; rc 1 on GATE-BRANCH alone (foreign
+branches; this branch's own tip is the seat's registry line). `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1
+UNAOS_SMC=1 UNAOS_QEMU_FULL=1 ./arroyo test 240` rc 0, full wall, and `x86-wc.spec` replay 30/30:
+
+```
+[menubar] first-paint at=5758 after_enable_ms=6 model=partial:caption+clock crystal=drawn rect=1280x34+0+0 gem_px=198/198 stray=0 sym=true
+:: MENUFIRST: after_enable_ms=0 bound_ms=33 model=partial:caption+clock crystal=drawn bar=1280x34 gem=16x22+12+6 red_after_enable_ms=5055 settle_tries=1+1 settle_us=552+668 decl_lock=0 unstamped=true stamped=true painted=true recorded=true bounded=true gone_red=true :: PASS ::
+[menubar] crystal-persist paints=3 present=3/3 models=partial:caption+clock+batt,complete,complete gem_px=594/594 stray=0 sym=true tries=1,1,1 decl_lock=0 unread=0 budget_ms=250 -> PASS
+```
+
+Go-red by mutation, each reverted and `video/menubar.rs` re-hashed to the committed file
+(`docs/dev/evidence/rmbp-0923/crystal2/`): gem skipped on clocked paints -> `present=1/3 …
+gem_px=198/594 … -> FAIL` (29/30); the pre-CRYSTAL2 silhouette -> `crystal=broken gem_px=217/217
+stray=0 sym=false` on the first-paint line, MENUFIRST FAIL, persist `present=0/3` (27/30); every settle
+reported unlanded -> MENUFIRST `:: SKIP ::` and persist `-> SKIP`, both new FORBIDs hit (28/30).
+
+### 5. Flight 13
+
+The wire lines and the glass check are in `docs/dev/OS/rmbp-queue.md`'s CRYSTAL2 row. What only the
+glass proves: that the surface the readback reads is what the panel lights, how a 16x22 mark reads at
+the rMBP's density, and whether the mark Peter called broken was this one at all.

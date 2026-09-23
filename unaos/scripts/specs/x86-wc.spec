@@ -700,13 +700,16 @@ FORBID :: TERMSEL: .* -> FAIL ::
 # and reads the gem back off the panel after each. Everything but `gem_px=`'s counts, `tries=` and
 # `decl_lock=` is pinned as a value: three paints, three present, the two model words, and
 # `unread=0`. GO-RED (measured, B194): skip the gem in `compose_row` whenever the model has a clock
-# -> `present=1/3 … -> FAIL`, this REQUIRE misses and the default `-> FAIL` FORBID trips.
+# -> `present=1/3 … gem_px=198/594 … -> FAIL`, this REQUIRE misses and the default `-> FAIL` FORBID
+# trips (mbench rc 1, 29/30). And the pre-CRYSTAL2 silhouette (`du > half` about column 8) reads
+# `crystal=broken gem_px=217/217 stray=0 sym=false` on :187's line — the flown gem, measured.
 REQUIRE \[menubar\] crystal-persist paints=3 present=3/3 models=partial:caption\+clock\+batt,complete,complete gem_px=\d+/\d+ stray=0 sym=true tries=\d+,\d+,\d+ decl_lock=\d+ unread=0 budget_ms=250 -> PASS
 # THE SKIP ARMS are Class 6's stated non-verdicts, for the metal wire. On this lane (q35, 1280x800)
 # this arc's gate capture landed every fixture paint on its first try (`tries=1,1,1`, `settle_tries=1+1`,
 # `decl_lock=0`), so a paint that cannot land in 250 ms here is a defect and both arms are FORBIDDEN —
 # the REQUIRE-or-skip + FORBID-the-skip shape of
-# pi4-regression.spec:2032/2052. GO-RED (measured, B194): make `paint_settle` never call `compose`
-# -> `:: MENUFIRST: … model=unread crystal=unread … :: SKIP ::` and `crystal-persist … -> SKIP`.
+# pi4-regression.spec:2032/2052. GO-RED (measured, B194): make `paint_settle` report every settle
+# unlanded -> `:: MENUFIRST: … painted=false recorded=true … gone_red=false :: SKIP ::` and
+# `crystal-persist paints=0 present=0/0 … -> SKIP`, both FORBIDs hit, mbench rc 1 (28/30).
 FORBID \[menubar\] crystal-persist .* -> SKIP
 FORBID :: MENUFIRST: .* :: SKIP ::

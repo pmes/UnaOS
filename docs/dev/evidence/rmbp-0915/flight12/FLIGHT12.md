@@ -36,3 +36,6 @@ the first kernel line was not captured (the FTDI is kernel TX only).
 
 ## Decisions taken from this flight
 R63: boot 13 boots to the root desktop; `adduser` from the session; Log Out returns the login screen over nothing. Two executors named (LOGIN13, MOUSEHALT) — Peter's go pending at the time of this record.
+
+## Correction (CRYSTAL2, rmbp-ledger B194, 2026-09-23)
+§Fixtures files `:: MENUFIRST:` under "all press-driven". It is not: MENUFIRST presses nothing, and its `painted=false recorded=false` is eight declined paints (menubar `decl_lock` 0 -> 16 across the fixture, `paints=3` before and after) — FIXTURE_FLAKES §6b, Class 6. `:: MENUBATT: … change_paint=false :: FAIL ::` in the same second is the same swallow; `:: DOCK: … vacate=false` is B187's COMP_GATE decline. The one `[login] press … swallowed=1` is `clickroute_selftest`'s.
