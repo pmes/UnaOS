@@ -3610,8 +3610,89 @@ mailbox refusing the 17th send while a second row is unaffected; the generation 
 discarding a stale reply. Go-red (behavioural): delete the `request_validate` clause
 in `busx_msend_for` and the line reads `FAIL [w=0x20/0x3f]`.
 
-**OWED (M3).** The ring-3 midden twin on x86 and the **equivalence witness proper** —
-denied-via-bus == denied-via-syscall, byte-same errno. That one cannot be made
-kernel-side on either arch, and BANDY-1 found the same thing on the Pi: the direct
-leg is `SYS_OPEN`, which takes a ring-3 name pointer, so only a ring-3 program can
-drive both legs and compare. See `docs/dev/OS/rmbp-queue.md`.
+### M3 — the ring-3 midden twin and the equivalence witness proper
+
+The stamp witness above proves the stamp and the transport and **deliberately claims
+nothing about equivalence**, because equivalence cannot be claimed from in there. The
+claim is "a request denied via the bus is denied via the direct syscall with the
+byte-same errno, and a request permitted via one is permitted via the other", and it
+needs *both* legs driven by *one* principal. The direct leg is `SYS_OPEN`, which takes
+a **ring-3 name pointer** — so only a ring-3 program can drive both and compare.
+BANDY-1 hit exactly this wall on the Pi. M3 is the program.
+
+**Shape, and why not a crate.** Two `global_asm!` fixtures in the existing x86 EL0 set
+plus a `u6gx`-shaped launcher (`busx86_midden_launcher`, chained off `u6gx_launcher`).
+The ladder already spawns these blobs **by name into private address-space slots**, and
+a private slot *is* the identity the bus stamps — `identity=(row,SLOT_GEN)`, the stamp
+witness's own last clause. A `user-midden` ELF would have needed a builder entry, media
+and spec staging, and would have exercised not one extra byte of the bus. No kernel
+change beyond the fixtures, their launcher, three creatable names in `U10_NAMES` and a
+no-op `sys_exit` arm (without which the pair's exits would silently move U1a's
+byte-for-byte `exited=` count, which the `_` fallback owns).
+
+* `busx86-other` (O) creates OTHER.BIN private and **holds the descriptor** while the
+  witness runs. It has to: a created file's identity on this arch is a live descriptor,
+  so if O let go early "a path another row owns" would stop existing and every `-EACCES`
+  leg would decay into an `-ENOENT` leg without saying so.
+* `busx86-midden` (M) creates MIDDEN.BIN, then asks the same nine questions twice.
+
+**What "the same question" means per verb** — an equivalence witness that compares two
+different questions is worse than none, so each mapping is stated rather than assumed:
+
+| verb | direct leg | bus leg | compared |
+|---|---|---|---|
+| `cat` | `SYS_OPEN(name, RO)` — its errno *is* the access verdict | the reply's `status` | errno; and on the own-path leg the **content**, byte-for-byte |
+| `cp` | the direct open of the **source** — `busx_cp` fulfils through `busx_cat_raw`, so the source gate *is* the cat gate | the reply's `status` | errno; and on the own-path leg the copy is read back **directly** and compared to the original |
+| `ls` | does `SYS_OPEN` return anything other than `-ENOENT`? | is the name a line of the listing? | **existence**, not access |
+
+The `ls` row is the one that had to be thought about. `busx_ls` has no denial leg *by
+design* — names are not ACL-protected, content is, at `cat` — so ls lists another row's
+file. Mapping `-EACCES` to "resolves" is therefore correct and a witness that called
+that a divergence would be pinning a lie.
+
+**And the write side.** `write`/`rm`/`mv` decode here but are not fulfilled, and M
+asserts the `-ENOSYS` reply is distinguishable from `-EINVAL` along the sharpest axis
+available: a malformed frame (a caller-supplied principal) is refused by `SYS_MSEND`
+**itself** with `-EINVAL` and queues nothing, while an unfulfilled verb returns 0 from
+the send and carries `-ENOSYS` in a well-formed reply. A different *channel*, not just a
+different number — and M proves the refusal queued nothing by checking that the next
+reply it takes echoes the *next* request's `corr`.
+
+**Witness.**
+
+```
+:: BUSX86-EQ: … legs=9 same=9 diff=0 [ls-own:ok/ok ls-other:ok/ok ls-none:-ENOENT/-ENOENT
+cat-own:ok/ok cat-other:-EACCES/-EACCES cat-none:-ENOENT/-ENOENT cp-own:ok/ok
+cp-other:-EACCES/-EACCES cp-none:-ENOENT/-ENOENT] payload cat=same cp=same
+refused-frame-queued-nothing=true write/rm/mv=3/3 -ENOSYS badframe=-EINVAL
+identity=(row,SLOT_GEN)=(1,10) … -> PASS ::
+```
+
+Each pair is `direct/bus`. The results cross from ring 3 as a **table in the fixture's
+own window**, read by the launcher while the slot is still live and **sealed** with a
+magic word written last — the window is scrubbed to zero at build and `0` is a valid leg
+answer (`ok`), so without a seal a fixture that died before its first leg would present
+nine perfectly-agreeing zeros and read as a pass. Go-red: force one leg's recorded
+answer to `-EPERM` — `diff=1 [… cat-other:-EACCES/-EPERM …] -> FAIL`, which both the
+`REQUIRE` and the `FORBID` in `x86-default.spec` convict.
+
+**THE MEASURED CEILING, and it is the finding of this milestone.** `NWSTAGE` is **three**
+writable-staging slots for the whole machine, and `open_created_sibling` does **not**
+share a slot — every sibling open of a created file allocates and seeds its own. So
+*verifying* a bus `cp` costs three at once: the source, the destination the fulfiller
+kept (the honest-scope note above), and the sibling that reads the copy back. With any
+other row holding one created file open, there is no third slot and the read-back is
+`-EMFILE`. This is not a bus asymmetry — the direct copy path pays the same — but it is
+a real property of a bus `cp` on this arch: **it is verifiable only when the staging pool
+has room**, and M3 measured it rather than reasoned about it (the first green build
+printed `cp-copy open_rc=-24`). The fixture is therefore two-phase: every leg that needs
+another row's live file runs first, O releases, and only then is the copy made and
+checked. Retiring the ceiling belongs to the same descriptor-free-create work
+(STOR-1's line) that retires the honest-scope note itself.
+
+**A second thing the ceiling taught.** The U10 deferred-op queue is **one** deep and its
+overflow is a *dropped acknowledged mutation*. The first build skipped an unlink on that
+`-EMFILE` and the run printed `:: U10: OP QUEUE FULL`. So M3's cleanup unlinks one file
+per GO step with the launcher draining between, **and records every unlink's rc** — a
+cleanup step that silently did nothing must never be able to read as a clean one. That
+spelling is now a `FORBID` in `x86-default.spec`.

@@ -2859,7 +2859,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
                     // the prober's sweep — which is the only honest way to reach the -EACCES arm.
                     DMG_OWNER_WITNESS.store(a0 as u32, Ordering::Release);
                     DMG_DONE.fetch_add(1, Ordering::AcqRel);
-                }
+                } Some("busx86-midden") | Some("busx86-other") => {} // BUSX86 M3: the ring-3 midden pair carries NO exit witness — its witness is the RESULT TABLE it writes into its own window (thirteen legs' two answers each, sealed), which the launcher reads while the slot is still live. The arm exists anyway, and it is not decoration: the `_` fallback below counts an unrecognised name into `U1A_EXITED_OK`, so a fixture that skipped this list would silently move U1a's byte-for-byte `exited=` count. Named, does nothing, changes nothing. ⚠ SAME-LINE fold (see the `use` line's note).
                 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
                 Some("sock2-udp") => {
                     // SOCK-2: the UDP round-trip fixture conveys its 5-bit witness bitmask as its exit STATUS
@@ -12313,7 +12313,7 @@ const U10OP_DELETE: u32 = 4;
 /// The U10 demo file names — the single source of truth an op's `U10_NAMEID` indexes, so the drain re-resolves
 /// the on-disk directory entry by the SAME name the fixture named (`find_located`). GROW.BIN is also a staged
 /// file (idx `GROW_STAGED_IDX`); FRESH.BIN/DELME.BIN/DEFER.BIN are runtime-created (never staged).
-const U10_NAMES: [&str; 5] = [U10_GROW_NAME, U10C_NAME, U10D_NAME, U11M2_NAME, U6GX_NAME];
+const U10_NAMES: [&str; 8] = [U10_GROW_NAME, U10C_NAME, U10D_NAME, U11M2_NAME, U6GX_NAME, "MIDDEN.BIN", "OTHER.BIN", "COPY.BIN"]; // BUSX86 M3: the ring-3 midden's three CREATABLE names — MIDDEN.BIN (the path the witness owns), OTHER.BIN (the path ANOTHER row owns, which is the only way an -EACCES leg can exist at all) and COPY.BIN (the bus `cp` destination). Registered HERE and nowhere else, because on this arch `u10_creatable_nameid` IS the creatable set. The witness's "does not exist" name (NOSUCH.BIN) is deliberately ABSENT from this table — that absence is exactly what makes its -ENOENT leg honest on BOTH legs at once. ⚠ SAME-LINE fold: this file's panic `Location` records embed line numbers (see the `use` line's note).
 /// The count of `U10_NAMES` — the width of the per-row `DYN_DELETED` overlay.
 const N_U10_NAMES: usize = U10_NAMES.len();
 static U10_USED: [AtomicBool; NU10] = [const { AtomicBool::new(false) }; NU10];
@@ -23551,7 +23551,7 @@ fn u11m2_launcher(demo_cpu: usize) {
     #[cfg(feature = "irqstorage")]
     s6_witness_launcher(demo_cpu);
     // U6x: chain the owner/grants ACL demo (program order, the u9x->..->u11m2 idiom; the LAST demo in the chain).
-    u6gx_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); busx86_stamp_check(); // BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
+    u6gx_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); busx86_stamp_check(); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
 }
 
 /// Build a U6x fixture slot at a given entry symbol — the `u7x_build`/`u11m2_build` shape (allocate a private
@@ -25243,4 +25243,1145 @@ fn busx86_stamp_check() {
         w,
         ALL
     );
+}
+
+// =====================================================================================================
+// BUSX86 M3 (ROADMAP §3b): THE RING-3 MIDDEN TWIN AND THE EQUIVALENCE WITNESS PROPER.
+// =====================================================================================================
+//
+// WHY THIS CODE IS RING 3 AND COULD NOT HAVE BEEN ANYTHING ELSE. `busx86_stamp_check` above says so in
+// its own header and BANDY-1 hit the identical wall on the Pi: the EQUIVALENCE claim — "a request
+// DENIED via the bus is denied via the DIRECT syscall with the BYTE-SAME errno, and a request
+// PERMITTED via one is permitted via the other" — needs BOTH legs driven by ONE principal, and the
+// direct leg is `SYS_OPEN`, which takes a RING-3 name pointer (`copy_from_user`). A kernel-side
+// fixture can fake a `(row, cgen)` for the bus leg but has no way to make the direct leg at all, so
+// the only honest driver is a ring-3 program in a private slot — which is ALSO exactly the identity
+// the bus stamps (`identity=(row,SLOT_GEN)`, the stamp witness's last clause).
+//
+// WHY A `global_asm!` FIXTURE IN THE EXISTING EL0 SET RATHER THAN A `user-midden` CRATE. The x86
+// ladder already spawns these blobs BY NAME into private address-space slots (`u6gx`/`u7x`/`u11m2`),
+// and a private slot IS the identity under test. A new ELF would need a builder entry, media
+// staging and spec plumbing, and would exercise not one extra byte of the bus. So: one blob, two
+// programs, one launcher in the `u6gx` shape.
+//
+// THE TWO PROGRAMS.
+//   * `busx86-other` (O) — the MIDDEN's counterparty. It creates OTHER.BIN PRIVATE (O_CREAT|RW, no
+//     O_PUBLIC, so its OWN row owns it) and HOLDS the descriptor while M runs, because on this arch a
+//     created file's identity IS a live descriptor (`created_desc_any_row` — see `busx_cp`'s note): if
+//     O exited first, "a path another row owns" would simply stop existing and the -EACCES legs would
+//     decay into -ENOENT legs without saying so. It exists only to be the OTHER row.
+//   * `busx86-midden` (M) — the witness. From its own private slot it drives, for each of
+//     {ls, cat, cp} × {a path it owns, a path another row owns, a path that does not exist}, the
+//     DIRECT syscall and the BUS request, and records BOTH answers in its window for the launcher.
+//
+// WHAT "THE SAME QUESTION" MEANS PER VERB, stated here rather than left to the reader, because an
+// equivalence witness that compares two different questions is worse than none:
+//   * cat  — the direct leg is `SYS_OPEN(name, RO)`; its errno IS the access verdict. The bus leg is
+//     the reply's `status`. Compared byte-for-byte. On the OWN leg both also carry CONTENT, compared
+//     byte-for-byte too (the pattern is printable ASCII, so `busx_sanitize` is the IDENTITY on it —
+//     the compare is honest, not laundered through a transform).
+//   * cp   — `busx_cp`'s SOURCE gate IS `busx_cat`'s gate (it is literally `busx_cat_raw`), so the
+//     direct twin of a `cp` is the direct open of its SOURCE: that is the decision the bus re-enters.
+//     On the OWN leg the copy is then read back DIRECTLY and compared to the original's bytes — the
+//     "permitted via one is permitted via the other" half, with the effect observed and not assumed.
+//   * ls   — ls takes NO path and has NO denial leg by design (`busx_ls`: names are not ACL-protected,
+//     CONTENT is, at cat). So the compared quantity here is EXISTENCE, not access: the bus's answer is
+//     "is the name in the listing", the direct answer is "does `SYS_OPEN` return anything other than
+//     -ENOENT" (a handle OR -EACCES both mean the name RESOLVES). Mapping -EACCES to "resolves" is the
+//     whole reason this is stated: ls listing another row's file is the DESIGN, and a witness that
+//     called it a divergence would be pinning a lie.
+//
+// AND THE BANDY-2 WRITE SIDE (B153's stated scope): write/rm/mv DECODE here — the codec is shared and
+// its goldens run every boot — but are NOT FULFILLED, and answer -ENOSYS in a WELL-FORMED reply. M
+// asserts exactly that, and asserts it is DISTINGUISHABLE from -EINVAL along the sharpest axis
+// available: a malformed frame (a caller-supplied principal) is refused by `SYS_MSEND` ITSELF with
+// -EINVAL and queues NOTHING, while an unfulfilled verb returns 0 from the send and carries -ENOSYS in
+// the reply's status. Different CHANNEL, not merely a different number — which is what lets a client
+// tell "this board cannot do that yet" from "I spoke wrongly".
+
+/// M3 window map (offsets into the fixture's own 4-page window; page 0 is its RX-RO code page, so
+/// every writable datum below lives at 0x1000 or above). The launcher reads the result table straight
+/// out of the slot backing, the `u6gx` GO/SIG idiom widened from two words to a table.
+// The fixture's OWN scratch, named here for the map but referenced only from the blob (it hard-codes
+// the displacements, so nothing in Rust can read these and nothing should): 0x1000 the SYS_MRECV
+// landing buffer, a whole BUS_FRAME_MAX (4148 B) spanning 0x1000..0x2034 as SYS_MRECV's contract
+// demands; 0x2200 the direct SYS_READ of MIDDEN.BIN (the original bytes); 0x2400 the direct SYS_READ
+// of COPY.BIN (what the bus `cp` actually made). Below this line are the words the LAUNCHER reads.
+const BXM_DIRECT_OFF: usize = 0x2800; // i64[16] — the DIRECT syscall's answer per leg
+const BXM_BUS_OFF: usize = 0x2880; // i64[16] — the BUS reply's answer per leg
+const BXM_RAW_OFF: usize = 0x2900; // i64[16] — the direct syscall's RAW rc (a handle, or the errno)
+const BXM_FLAGS_OFF: usize = 0x2980; // bit0 cat payload same · bit1 cp copy content same · bit2 refused frame queued nothing
+const BXM_SEAL_OFF: usize = 0x2988; // written LAST — a zeroed window can never read as a green result table
+const BXM_GO_OFF: usize = 0x3800; // launcher -> fixture
+const BXM_SIG_OFF: usize = 0x3808; // fixture -> launcher
+/// The seal M stamps only after all thirteen legs are recorded. The window is scrubbed to zero at
+/// build, and zero is a VALID leg answer (`ok`), so without a seal a fixture that died before its
+/// first leg would present a table of nine perfectly-agreeing zeros and read as a PASS. It is the
+/// same reasoning `u6gx` applies to its witness bitmask, made explicit because here the table is memory.
+const BXM_SEAL: u64 = 0x4258_4d33_5345_414c; // "BXM3SEAL"
+/// The equivalence legs proper — {ls, cat, cp} × {own, other, none}, in that order. Legs 9..11 are the
+/// write/rm/mv -ENOSYS assertions and leg 12 the malformed-frame control; they are NOT equivalence
+/// legs (there is no direct twin of "a verb this board does not implement") and are reported apart.
+const BXM_LEGS: usize = 9;
+const BXM_LEG_NAMES: [&str; BXM_LEGS] =
+    ["ls-own", "ls-other", "ls-none", "cat-own", "cat-other", "cat-none", "cp-own", "cp-other", "cp-none"];
+/// `-999` is the fixture's own "the reply was not a well-formed REPLY frame for THIS request" sentinel
+/// (bad magic/version/kind, a verb or corr that did not echo, a principal that was not the RESERVED
+/// KERNEL record, or a frame whose length disagreed with its `body_len`). It can never collide with an
+/// errno, so a transport fault shows up as a LOUD diff instead of a quiet equality.
+const BXM_MALFORMED: i64 = -999;
+
+core::arch::global_asm!(
+    r#"
+    .globl unaos_user_busxm_blob_start
+unaos_user_busxm_blob_start:
+    .balign 16
+
+    // ======================= Process M: `busx86-midden` — THE WITNESS =======================
+    .globl unaos_user_busxm_midden
+unaos_user_busxm_midden:
+    lea r15, [rip + unaos_user_busxm_blob_start]   // r15 = window base (== USER_BASE)
+
+    // park: wait GO >= 1 — released once O OWNS OTHER.BIN, so "a path another row owns" exists before
+    // a single leg asks about it (otherwise the -EACCES legs would silently become -ENOENT legs).
+    mov rcx, 0x40000000
+.Lbxm_p1:
+    cmp qword ptr [r15 + 0x3800], 1
+    jae .Lbxm_go1
+    pause
+    dec rcx
+    jnz .Lbxm_p1
+    jmp .Lbxm_bail
+.Lbxm_go1:
+
+    // create MIDDEN.BIN PRIVATE (O_CREAT|RW = 3, NO O_PUBLIC -> THIS row owns it) -> rbx, then seed it
+    // with 16 PRINTABLE bytes: `busx_sanitize` maps printable ASCII to itself, so the payload compare
+    // below is a real byte compare and not one the transform could have rescued.
+    mov rax, 11
+    lea rdi, [rip + .Lbxm_nm_midden]
+    mov rsi, 10
+    mov rdx, 3
+    syscall
+    mov rbx, rax
+    test rbx, rbx
+    js .Lbxm_bail
+    mov rax, 1
+    mov rdi, rbx
+    lea rsi, [rip + .Lbxm_pat_midden]
+    mov rdx, 16
+    syscall
+    cmp rax, 16
+    jne .Lbxm_bail
+
+    // ---------------- legs 0..2: ls × own / other / none — the EXISTENCE comparison ----------------
+    // ONE bus `ls`, three searches of its listing; three direct opens normalised to an existence verdict.
+    lea rdi, [rip + .Lbxm_fr_ls]
+    mov rsi, [rip + .Lbxm_len_ls]
+    mov rdx, 1                              // expect verb LS echoed
+    mov rcx, 1                              // expect corr 1 echoed
+    call .Lbxm_bus_call
+    test rax, rax
+    jz .Lbxm_ls_ok
+    // an ls that did not even answer 0 makes all three bus cells the fixture's malformed sentinel
+    mov qword ptr [r15 + 0x2880], rax
+    mov qword ptr [r15 + 0x2888], rax
+    mov qword ptr [r15 + 0x2890], rax
+    jmp .Lbxm_ls_direct
+.Lbxm_ls_ok:
+    mov r13, r15
+    add r13, 0x1000
+    add r13, 52                             // r13 = the listing body
+    mov r14d, dword ptr [r15 + 0x1000 + 48] // r14 = body_len
+    // MIDDEN.BIN listed?
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [rip + .Lbxm_nm_midden]
+    mov rcx, 10
+    call .Lbxm_ls_find
+    call .Lbxm_found_to_errno
+    mov qword ptr [r15 + 0x2880], rax
+    // OTHER.BIN listed? (it MUST be — ls has no denial leg; that is the design, not a divergence)
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [rip + .Lbxm_nm_other]
+    mov rcx, 9
+    call .Lbxm_ls_find
+    call .Lbxm_found_to_errno
+    mov qword ptr [r15 + 0x2888], rax
+    // NOSUCH.BIN listed?
+    mov rdi, r13
+    mov rsi, r14
+    lea rdx, [rip + .Lbxm_nm_nosuch]
+    mov rcx, 10
+    call .Lbxm_ls_find
+    call .Lbxm_found_to_errno
+    mov qword ptr [r15 + 0x2890], rax
+.Lbxm_ls_direct:
+    lea rdi, [rip + .Lbxm_nm_midden]
+    mov rsi, 10
+    call .Lbxm_dopen
+    mov qword ptr [r15 + 0x2900], rax
+    call .Lbxm_norm_exist
+    mov qword ptr [r15 + 0x2800], rax
+    lea rdi, [rip + .Lbxm_nm_other]
+    mov rsi, 9
+    call .Lbxm_dopen
+    mov qword ptr [r15 + 0x2908], rax
+    call .Lbxm_norm_exist
+    mov qword ptr [r15 + 0x2808], rax
+    lea rdi, [rip + .Lbxm_nm_nosuch]
+    mov rsi, 10
+    call .Lbxm_dopen
+    mov qword ptr [r15 + 0x2910], rax
+    call .Lbxm_norm_exist
+    mov qword ptr [r15 + 0x2810], rax
+
+    // ---------------- leg 3: cat × a path it OWNS — errno AND payload ----------------
+    // direct: SYS_OPEN(RO) + SYS_READ + SYS_CLOSE. r12 = the direct byte count (-1 = the open refused).
+    mov rax, 11
+    lea rdi, [rip + .Lbxm_nm_midden]
+    mov rsi, 10
+    xor edx, edx                            // RO
+    syscall
+    mov qword ptr [r15 + 0x2918], rax
+    mov rbp, rax
+    mov r12, -1
+    test rbp, rbp
+    js .Lbxm_cat_own_rec
+    mov rax, 12
+    mov rdi, rbp
+    lea rsi, [r15 + 0x2200]
+    mov rdx, 512
+    syscall
+    mov r12, rax
+    mov rax, 17
+    mov rdi, rbp
+    syscall
+    xor ebp, ebp                            // the direct leg was PERMITTED -> errno 0
+.Lbxm_cat_own_rec:
+    mov qword ptr [r15 + 0x2818], rbp
+    lea rdi, [rip + .Lbxm_fr_catown]
+    mov rsi, [rip + .Lbxm_len_catown]
+    mov rdx, 2
+    mov rcx, 2
+    call .Lbxm_bus_call
+    mov qword ptr [r15 + 0x2898], rax
+    // payload: both legs permitted, both non-empty, same length, same bytes
+    test rax, rax
+    jnz .Lbxm_cat_own_end
+    test r12, r12
+    jle .Lbxm_cat_own_end
+    mov r13d, dword ptr [r15 + 0x1000 + 48]
+    cmp r13, r12
+    jne .Lbxm_cat_own_end
+    lea rdi, [r15 + 0x2200]
+    lea rsi, [r15 + 0x1000 + 52]
+    mov rcx, r12
+    repe cmpsb
+    jne .Lbxm_cat_own_end
+    or qword ptr [r15 + 0x2980], 1
+.Lbxm_cat_own_end:
+
+    // ---------------- leg 4: cat × a path ANOTHER ROW owns ----------------
+    lea rdi, [rip + .Lbxm_nm_other]
+    mov rsi, 9
+    call .Lbxm_dopen
+    mov qword ptr [r15 + 0x2920], rax
+    call .Lbxm_norm_acc
+    mov qword ptr [r15 + 0x2820], rax
+    lea rdi, [rip + .Lbxm_fr_catoth]
+    mov rsi, [rip + .Lbxm_len_catoth]
+    mov rdx, 2
+    mov rcx, 3
+    call .Lbxm_bus_call
+    mov qword ptr [r15 + 0x28a0], rax
+
+    // ---------------- leg 5: cat × a path that DOES NOT EXIST ----------------
+    lea rdi, [rip + .Lbxm_nm_nosuch]
+    mov rsi, 10
+    call .Lbxm_dopen
+    mov qword ptr [r15 + 0x2928], rax
+    call .Lbxm_norm_acc
+    mov qword ptr [r15 + 0x2828], rax
+    lea rdi, [rip + .Lbxm_fr_catnon]
+    mov rsi, [rip + .Lbxm_len_catnon]
+    mov rdx, 2
+    mov rcx, 4
+    call .Lbxm_bus_call
+    mov qword ptr [r15 + 0x28a8], rax
+
+    // ---------------- leg 7: cp × a source ANOTHER ROW owns ----------------
+    lea rdi, [rip + .Lbxm_nm_other]
+    mov rsi, 9
+    call .Lbxm_dopen
+    mov qword ptr [r15 + 0x2938], rax
+    call .Lbxm_norm_acc
+    mov qword ptr [r15 + 0x2838], rax
+    lea rdi, [rip + .Lbxm_fr_cpoth]
+    mov rsi, [rip + .Lbxm_len_cpoth]
+    mov rdx, 3
+    mov rcx, 6
+    call .Lbxm_bus_call
+    mov qword ptr [r15 + 0x28b8], rax
+
+    // ---------------- leg 8: cp × a source that DOES NOT EXIST ----------------
+    lea rdi, [rip + .Lbxm_nm_nosuch]
+    mov rsi, 10
+    call .Lbxm_dopen
+    mov qword ptr [r15 + 0x2940], rax
+    call .Lbxm_norm_acc
+    mov qword ptr [r15 + 0x2840], rax
+    lea rdi, [rip + .Lbxm_fr_cpnon]
+    mov rsi, [rip + .Lbxm_len_cpnon]
+    mov rdx, 3
+    mov rcx, 7
+    call .Lbxm_bus_call
+    mov qword ptr [r15 + 0x28c0], rax
+
+    // ---------------- legs 9..11: the BANDY-2 write side answers -ENOSYS in a WELL-FORMED reply ----
+    mov qword ptr [r15 + 0x2848], -38
+    lea rdi, [rip + .Lbxm_fr_write]
+    mov rsi, [rip + .Lbxm_len_write]
+    mov rdx, 4
+    mov rcx, 8
+    call .Lbxm_bus_call
+    mov qword ptr [r15 + 0x28c8], rax
+    mov qword ptr [r15 + 0x2850], -38
+    lea rdi, [rip + .Lbxm_fr_rm]
+    mov rsi, [rip + .Lbxm_len_rm]
+    mov rdx, 5
+    mov rcx, 9
+    call .Lbxm_bus_call
+    mov qword ptr [r15 + 0x28d0], rax
+    mov qword ptr [r15 + 0x2858], -38
+    lea rdi, [rip + .Lbxm_fr_mv]
+    mov rsi, [rip + .Lbxm_len_mv]
+    mov rdx, 6
+    mov rcx, 10
+    call .Lbxm_bus_call
+    mov qword ptr [r15 + 0x28d8], rax
+
+    // ---------------- leg 12: a MALFORMED frame is refused BY THE SEND, on a different channel ----
+    // A caller-supplied principal (verdict C). `SYS_MSEND` itself answers -EINVAL and queues NOTHING —
+    // which is the distinguishability claim: -ENOSYS above rode a reply, this does not ride one at all.
+    mov qword ptr [r15 + 0x2860], -22
+    mov rax, 19
+    lea rdi, [rip + .Lbxm_fr_bad]
+    mov rsi, [rip + .Lbxm_len_bad]
+    syscall
+    mov qword ptr [r15 + 0x28e0], rax
+    // PROVE nothing was queued: the very next reply must be the NEXT request's (corr 12), which
+    // `.Lbxm_bus_call` checks by echo. Had the refused frame queued anything, this would read it and
+    // return the malformed sentinel instead.
+    lea rdi, [rip + .Lbxm_fr_ls2]
+    mov rsi, [rip + .Lbxm_len_ls2]
+    mov rdx, 1
+    mov rcx, 12
+    call .Lbxm_bus_call
+    test rax, rax
+    jnz .Lbxm_phase1_done
+    or qword ptr [r15 + 0x2980], 4
+.Lbxm_phase1_done:
+    // SIG = 1 — phase 1 is over and, crucially, O may now LET GO of OTHER.BIN. THE WHOLE REASON THIS
+    // FIXTURE HAS TWO PHASES IS A MEASURED CEILING, not tidiness: `NWSTAGE` is THREE writable-staging
+    // slots for the whole machine, and `open_created_sibling` does NOT share a slot — every sibling
+    // open of a created file ALLOCATES AND SEEDS ITS OWN. Verifying the bus `cp` needs three at once
+    // (MIDDEN.BIN, the COPY.BIN the fulfiller KEPT, and the sibling that reads the copy back), so with
+    // O still holding OTHER.BIN the read-back open is -EMFILE and the copy cannot be checked at all.
+    // MEASURED, not reasoned: the first green build printed `cp-copy open_rc=-24`. So the legs that
+    // NEED another row's live file run first, O releases, and only then is the copy made and verified.
+    mov qword ptr [r15 + 0x3808], 1
+    mov rcx, 0x40000000
+.Lbxm_p2:
+    cmp qword ptr [r15 + 0x3800], 2
+    jae .Lbxm_go2
+    pause
+    dec rcx
+    jnz .Lbxm_p2
+    jmp .Lbxm_bail
+.Lbxm_go2:
+
+    // ---------------- leg 6: cp × a path it OWNS — errno AND the copy's content ----------------
+    // The direct twin of a `cp` is the direct open of its SOURCE: `busx_cp` fulfils through
+    // `busx_cat_raw`, so the source gate IS the cat gate and that is the decision being compared.
+    lea rdi, [rip + .Lbxm_nm_midden]
+    mov rsi, 10
+    call .Lbxm_dopen
+    mov qword ptr [r15 + 0x2930], rax
+    call .Lbxm_norm_acc
+    mov qword ptr [r15 + 0x2830], rax
+    lea rdi, [rip + .Lbxm_fr_cpown]
+    mov rsi, [rip + .Lbxm_len_cpown]
+    mov rdx, 3
+    mov rcx, 5
+    call .Lbxm_bus_call
+    mov qword ptr [r15 + 0x28b0], rax
+    test rax, rax
+    jnz .Lbxm_cp_own_end
+    // read the copy back through the DIRECT path — the permitted leg's EFFECT, observed. Every
+    // intermediate is recorded in the table's spare cells, because "the copy differs" is a finding and
+    // a finding has to say HOW it differs (open rc, both lengths, both leading qwords).
+    mov rax, 11
+    lea rdi, [rip + .Lbxm_nm_copy]
+    mov rsi, 8
+    xor edx, edx
+    syscall
+    mov qword ptr [r15 + 0x2968], rax       // RAW[13] = the copy's own direct open rc
+    mov rbp, rax
+    test rbp, rbp
+    js .Lbxm_cp_own_end
+    mov rax, 12
+    mov rdi, rbp
+    lea rsi, [r15 + 0x2400]
+    mov rdx, 512
+    syscall
+    mov r13, rax
+    mov qword ptr [r15 + 0x2970], r13       // RAW[14] = bytes the COPY served
+    mov qword ptr [r15 + 0x2978], r12       // RAW[15] = bytes the ORIGINAL served
+    mov rax, 17
+    mov rdi, rbp
+    syscall
+    mov rax, qword ptr [r15 + 0x2400]
+    mov qword ptr [r15 + 0x2868], rax       // DIRECT[13] = the copy's leading 8 bytes
+    mov rax, qword ptr [r15 + 0x2200]
+    mov qword ptr [r15 + 0x2870], rax       // DIRECT[14] = the original's leading 8 bytes
+    cmp r13, r12
+    jne .Lbxm_cp_own_end
+    test r13, r13
+    jle .Lbxm_cp_own_end
+    lea rdi, [r15 + 0x2200]
+    lea rsi, [r15 + 0x2400]
+    mov rcx, r13
+    repe cmpsb
+    jne .Lbxm_cp_own_end
+    or qword ptr [r15 + 0x2980], 2
+.Lbxm_cp_own_end:
+
+    mov rax, 0x42584d335345414c            // "BXM3SEAL" — the table is complete; written LAST
+    mov qword ptr [r15 + 0x2988], rax
+    mov qword ptr [r15 + 0x3808], 2        // SIG = 2: the launcher may read the results
+
+    // ---------------- cleanup, choreographed so the U10 op queue (NU10 == 1) never overflows --------
+    // Each unlink of a created, DIRTY file enqueues ONE deferred CreateGrowDelete op, released at its
+    // last close; the queue holds exactly one, and a second enqueue is a DROPPED MUTATION plus a sticky
+    // overflow — measured, not feared: the first build skipped an unlink on -EMFILE and the run printed
+    // `U10: OP QUEUE FULL`. So M unlinks ONE file per GO step, the launcher drains between steps, and
+    // every unlink's rc is RECORDED, because a cleanup step that silently did nothing must never be
+    // able to read as a clean one.
+    mov rcx, 0x40000000
+.Lbxm_p3:
+    cmp qword ptr [r15 + 0x3800], 3
+    jae .Lbxm_go3
+    pause
+    dec rcx
+    jnz .Lbxm_p3
+    jmp .Lbxm_bail
+.Lbxm_go3:
+    // COPY.BIN was created by the BUS fulfiller into THIS row's handle table (`busx_cp`'s honest-scope
+    // note), so M owns it but does not know its handle number — open a sibling by name and unlink
+    // through that; `sys_unlink` invalidates EVERY descriptor in the row naming the file, both of them.
+    mov rax, 11
+    lea rdi, [rip + .Lbxm_nm_copy]
+    mov rsi, 8
+    mov rdx, 1
+    syscall
+    mov qword ptr [r15 + 0x28e8], rax      // BUS[13] = the cleanup sibling open's rc
+    mov rbp, rax
+    mov rax, -24
+    test rbp, rbp
+    js .Lbxm_sig3
+    mov rax, 16
+    mov rdi, rbp
+    syscall
+.Lbxm_sig3:
+    mov qword ptr [r15 + 0x28f0], rax      // BUS[14] = the COPY.BIN unlink's rc
+    mov qword ptr [r15 + 0x3808], 3
+    mov rcx, 0x40000000
+.Lbxm_p4:
+    cmp qword ptr [r15 + 0x3800], 4
+    jae .Lbxm_go4
+    pause
+    dec rcx
+    jnz .Lbxm_p4
+    jmp .Lbxm_bail
+.Lbxm_go4:
+    mov rax, 16                             // unlink MIDDEN.BIN through its primary owner handle
+    mov rdi, rbx
+    syscall
+    mov qword ptr [r15 + 0x28f8], rax      // BUS[15] = the MIDDEN.BIN unlink's rc
+    mov qword ptr [r15 + 0x3808], 4
+    mov rcx, 0x40000000
+.Lbxm_p5:
+    cmp qword ptr [r15 + 0x3800], 5
+    jae .Lbxm_bail
+    pause
+    dec rcx
+    jnz .Lbxm_p5
+.Lbxm_bail:
+    // Exit carries NO witness — M's witness is the result table, and the seal is what says it is real.
+    mov rax, 2
+    xor edi, edi
+    syscall
+.Lbxm_m_park:
+    jmp .Lbxm_m_park
+
+    // ================= Process O: `busx86-other` — the counterparty row =================
+    .balign 16
+    .globl unaos_user_busxm_other
+unaos_user_busxm_other:
+    lea r15, [rip + unaos_user_busxm_blob_start]
+    mov rax, 11
+    lea rdi, [rip + .Lbxm_nm_other]
+    mov rsi, 9
+    mov rdx, 3                              // O_CREAT | RW, PRIVATE -> THIS row owns OTHER.BIN
+    syscall
+    mov rbx, rax
+    test rbx, rbx
+    js .Lbxm_o_exit
+    mov rax, 1
+    mov rdi, rbx
+    lea rsi, [rip + .Lbxm_pat_other]
+    mov rdx, 16
+    syscall
+    cmp rax, 16
+    jne .Lbxm_o_exit
+    mov qword ptr [r15 + 0x3808], 1         // SIG = 1: OTHER.BIN exists and this row owns it
+    // park GO >= 2 — O HOLDS the descriptor across every one of M's legs, because a created file's
+    // identity on this arch IS a live descriptor: letting go early would delete the very thing the
+    // -EACCES legs are asking about.
+    mov rcx, 0x40000000
+.Lbxm_o_p2:
+    cmp qword ptr [r15 + 0x3800], 2
+    jae .Lbxm_o_go2
+    pause
+    dec rcx
+    jnz .Lbxm_o_p2
+    jmp .Lbxm_o_exit
+.Lbxm_o_go2:
+    mov rax, 16                             // unlink (owner) -> this row exits with nothing dirty
+    mov rdi, rbx
+    syscall
+    mov qword ptr [r15 + 0x3808], 2
+    mov rcx, 0x40000000
+.Lbxm_o_p3:
+    cmp qword ptr [r15 + 0x3800], 3
+    jae .Lbxm_o_exit
+    pause
+    dec rcx
+    jnz .Lbxm_o_p3
+.Lbxm_o_exit:
+    mov rax, 2
+    xor edi, edi
+    syscall
+.Lbxm_o_park:
+    jmp .Lbxm_o_park
+
+    // ================================= helpers =================================
+    //
+    // `.Lbxm_bus_call` — send ONE request and take ONE reply, validating that the reply is a
+    // well-formed REPLY FRAME FOR THIS REQUEST before its status is believed.
+    //   in:  rdi = frame, rsi = frame length, rdx = expected verb, rcx = expected corr
+    //   out: rax = the reply's status (sign-extended i32), or -999 if ANYTHING about the exchange was
+    //        not what the v1 wire says it must be
+    // The checks are the client half of what `busx86_stamp_check` asserts kernel-side, driven here
+    // across the real ring-3 syscall boundary: magic/version, kind == REPLY, verb and corr ECHOED, the
+    // RESERVED KERNEL principal (kind 4, len 0, value zero — the 32 bytes the frozen goldens pin), and
+    // frame length == BUS_HDR_LEN + body_len exactly. rbx/rbp/r12/r13/r14 are the caller's and are
+    // saved: only those survive a syscall on this arch (the entry stub scrubs rdi/rsi/rdx/r8/r9/r10).
+    .balign 16
+.Lbxm_bus_call:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    mov rbp, rdx                            // expected verb  (survives the syscalls)
+    mov r12, rcx                            // expected corr  (survives the syscalls)
+    mov rax, 19                             // SYS_MSEND(rdi = frame, rsi = len)
+    syscall
+    test rax, rax
+    jnz .Lbxm_bc_bad                        // a well-formed request must be ACCEPTED (0)
+    mov rax, 20                             // SYS_MRECV(buf, BUS_FRAME_MAX)
+    lea rdi, [r15 + 0x1000]
+    mov rsi, 4148
+    syscall
+    cmp rax, 52
+    jl .Lbxm_bc_bad
+    mov r13, rax                            // the delivered frame's length
+    lea r14, [r15 + 0x1000]
+    cmp dword ptr [r14], 0x31534255         // "UBS1"
+    jne .Lbxm_bc_bad
+    cmp byte ptr [r14 + 4], 1               // wire v1
+    jne .Lbxm_bc_bad
+    cmp byte ptr [r14 + 5], 2               // kind == REPLY
+    jne .Lbxm_bc_bad
+    movzx eax, byte ptr [r14 + 6]
+    cmp rax, rbp                            // verb ECHOED
+    jne .Lbxm_bc_bad
+    cmp byte ptr [r14 + 7], 0               // reserved byte
+    jne .Lbxm_bc_bad
+    mov eax, dword ptr [r14 + 8]
+    cmp rax, r12                            // corr ECHOED — this reply answers THIS request
+    jne .Lbxm_bc_bad
+    cmp byte ptr [r14 + 16], 4              // RESERVED-KERNEL principal, kind 4
+    jne .Lbxm_bc_bad
+    lea rsi, [r14 + 17]
+    mov rcx, 31
+.Lbxm_bc_prin:
+    cmp byte ptr [rsi], 0                   // len 0, value zero — the rest of the record
+    jne .Lbxm_bc_bad
+    inc rsi
+    dec rcx
+    jnz .Lbxm_bc_prin
+    mov eax, dword ptr [r14 + 48]           // body_len
+    add rax, 52
+    cmp rax, r13                            // the frame is exactly header + body, no slack
+    jne .Lbxm_bc_bad
+    movsxd rax, dword ptr [r14 + 12]        // status, sign-extended from the wire's i32
+    jmp .Lbxm_bc_out
+.Lbxm_bc_bad:
+    mov rax, -999
+.Lbxm_bc_out:
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+    // `.Lbxm_dopen` — the DIRECT leg: SYS_OPEN(name, RO), and if it was admitted, close the handle
+    // again so a leg costs the row no descriptor (NFILE is 4 here).
+    //   in:  rdi = name, rsi = name length      out: rax = the raw rc (a handle, or the errno)
+    .balign 16
+.Lbxm_dopen:
+    push rbp
+    mov rax, 11
+    xor edx, edx                            // RO, no O_CREAT
+    syscall
+    mov rbp, rax
+    test rbp, rbp
+    js .Lbxm_dopen_out
+    mov rax, 17
+    mov rdi, rbp
+    syscall
+.Lbxm_dopen_out:
+    mov rax, rbp
+    pop rbp
+    ret
+
+    // `.Lbxm_norm_exist` — the ls legs' currency: does the name RESOLVE? A handle and -EACCES both
+    // mean YES (the name is there; access is a different question, and it is cat's). Anything else is
+    // returned unchanged, so -ENOENT stays -ENOENT.
+.Lbxm_norm_exist:
+    test rax, rax
+    jns .Lbxm_ne_zero
+    cmp rax, -13
+    jne .Lbxm_ne_out
+.Lbxm_ne_zero:
+    xor eax, eax
+.Lbxm_ne_out:
+    ret
+
+    // `.Lbxm_norm_acc` — the cat/cp legs' currency: the ACCESS verdict. A handle is `ok` (0); every
+    // refusal is its own errno, unchanged, which is what gets compared byte-for-byte.
+.Lbxm_norm_acc:
+    test rax, rax
+    jns .Lbxm_na_zero
+    ret
+.Lbxm_na_zero:
+    xor eax, eax
+    ret
+
+    // `.Lbxm_found_to_errno` — a listing hit is `ok` (0); a miss is -ENOENT, so the ls legs compare in
+    // the same currency as their direct twins.
+.Lbxm_found_to_errno:
+    test rax, rax
+    jnz .Lbxm_fte_zero
+    mov rax, -2
+    ret
+.Lbxm_fte_zero:
+    xor eax, eax
+    ret
+
+    // `.Lbxm_ls_find` — is `name` a LINE of the listing? `busx_ls` emits "NAME SIZE\n" per entry, so a
+    // hit is the name at a line start followed by a space. Anchored at line starts on purpose: an
+    // unanchored search would let "OTHER.BIN" match inside a longer name and call a miss a hit.
+    //   in:  rdi = body, rsi = body length, rdx = name, rcx = name length   out: rax = 1 hit, 0 miss
+    .balign 16
+.Lbxm_ls_find:
+    xor eax, eax
+    mov r8, rdi                             // r8 = the current line's start
+    add rsi, rdi                            // rsi = one past the body
+.Lbxm_lf_line:
+    cmp r8, rsi
+    jae .Lbxm_lf_out
+    mov r9, r8
+    add r9, rcx                             // r9 = where the separating space would be
+    cmp r9, rsi
+    jae .Lbxm_lf_next                       // no room for the name AND its space
+    mov r10, rcx
+    push rdi
+    push rsi
+    mov rdi, r8
+    mov rsi, rdx
+    repe cmpsb
+    pop rsi
+    pop rdi
+    mov rcx, r10
+    jne .Lbxm_lf_next
+    cmp byte ptr [r9], 0x20
+    jne .Lbxm_lf_next
+    mov eax, 1
+    jmp .Lbxm_lf_out
+.Lbxm_lf_next:
+    cmp r8, rsi
+    jae .Lbxm_lf_out
+    cmp byte ptr [r8], 0x0a
+    je .Lbxm_lf_eol
+    inc r8
+    jmp .Lbxm_lf_next
+.Lbxm_lf_eol:
+    inc r8
+    jmp .Lbxm_lf_line
+.Lbxm_lf_out:
+    ret
+
+    // ================================= wire data =================================
+    // The request frames are hand-built here, byte for byte, exactly as `crate::bus`'s `hdr_write`
+    // lays them out — which is the point BANDY-1's module doc makes when it says an EL0 client mirrors
+    // the builder: if this block and `build_request` ever disagree, the kernel refuses these frames and
+    // every leg reads the malformed sentinel. Layout: magic(4) ver(1) kind(1) verb(1) rsvd(1)
+    // corr(4) status(4) principal(32) body_len(4), then the verb's typed payload.
+    .balign 8
+.Lbxm_fr_ls:
+    .ascii "UBS1"
+    .byte 1, 1, 1, 0
+    .long 1
+    .long 0
+    .space 32, 0
+    .long 0
+.Lbxm_fr_ls_end:
+.Lbxm_fr_ls2:
+    .ascii "UBS1"
+    .byte 1, 1, 1, 0
+    .long 12
+    .long 0
+    .space 32, 0
+    .long 0
+.Lbxm_fr_ls2_end:
+.Lbxm_fr_catown:
+    .ascii "UBS1"
+    .byte 1, 1, 2, 0
+    .long 2
+    .long 0
+    .space 32, 0
+    .long 10
+    .ascii "MIDDEN.BIN"
+.Lbxm_fr_catown_end:
+.Lbxm_fr_catoth:
+    .ascii "UBS1"
+    .byte 1, 1, 2, 0
+    .long 3
+    .long 0
+    .space 32, 0
+    .long 9
+    .ascii "OTHER.BIN"
+.Lbxm_fr_catoth_end:
+.Lbxm_fr_catnon:
+    .ascii "UBS1"
+    .byte 1, 1, 2, 0
+    .long 4
+    .long 0
+    .space 32, 0
+    .long 10
+    .ascii "NOSUCH.BIN"
+.Lbxm_fr_catnon_end:
+.Lbxm_fr_cpown:
+    .ascii "UBS1"
+    .byte 1, 1, 3, 0
+    .long 5
+    .long 0
+    .space 32, 0
+    .long 19
+    .byte 10
+    .ascii "MIDDEN.BINCOPY.BIN"
+.Lbxm_fr_cpown_end:
+.Lbxm_fr_cpoth:
+    .ascii "UBS1"
+    .byte 1, 1, 3, 0
+    .long 6
+    .long 0
+    .space 32, 0
+    .long 18
+    .byte 9
+    .ascii "OTHER.BINCOPY.BIN"
+.Lbxm_fr_cpoth_end:
+.Lbxm_fr_cpnon:
+    .ascii "UBS1"
+    .byte 1, 1, 3, 0
+    .long 7
+    .long 0
+    .space 32, 0
+    .long 19
+    .byte 10
+    .ascii "NOSUCH.BINCOPY.BIN"
+.Lbxm_fr_cpnon_end:
+.Lbxm_fr_write:
+    .ascii "UBS1"
+    .byte 1, 1, 4, 0
+    .long 8
+    .long 0
+    .space 32, 0
+    .long 12
+    .byte 10
+    .ascii "MIDDEN.BINZ"
+.Lbxm_fr_write_end:
+.Lbxm_fr_rm:
+    .ascii "UBS1"
+    .byte 1, 1, 5, 0
+    .long 9
+    .long 0
+    .space 32, 0
+    .long 10
+    .ascii "MIDDEN.BIN"
+.Lbxm_fr_rm_end:
+.Lbxm_fr_mv:
+    .ascii "UBS1"
+    .byte 1, 1, 6, 0
+    .long 10
+    .long 0
+    .space 32, 0
+    .long 19
+    .byte 10
+    .ascii "MIDDEN.BINCOPY.BIN"
+.Lbxm_fr_mv_end:
+    // THE MALFORMED CONTROL: identical to a `cat` request except that byte 16 — the first byte of the
+    // principal field, which ONLY the kernel may write — is nonzero. `request_validate` refuses it
+    // BadPrincipal and `SYS_MSEND` answers -EINVAL with nothing fulfilled and nothing queued.
+.Lbxm_fr_bad:
+    .ascii "UBS1"
+    .byte 1, 1, 2, 0
+    .long 11
+    .long 0
+    .byte 2
+    .space 31, 0
+    .long 10
+    .ascii "MIDDEN.BIN"
+.Lbxm_fr_bad_end:
+
+    .balign 8
+.Lbxm_len_ls:     .quad .Lbxm_fr_ls_end - .Lbxm_fr_ls
+.Lbxm_len_ls2:    .quad .Lbxm_fr_ls2_end - .Lbxm_fr_ls2
+.Lbxm_len_catown: .quad .Lbxm_fr_catown_end - .Lbxm_fr_catown
+.Lbxm_len_catoth: .quad .Lbxm_fr_catoth_end - .Lbxm_fr_catoth
+.Lbxm_len_catnon: .quad .Lbxm_fr_catnon_end - .Lbxm_fr_catnon
+.Lbxm_len_cpown:  .quad .Lbxm_fr_cpown_end - .Lbxm_fr_cpown
+.Lbxm_len_cpoth:  .quad .Lbxm_fr_cpoth_end - .Lbxm_fr_cpoth
+.Lbxm_len_cpnon:  .quad .Lbxm_fr_cpnon_end - .Lbxm_fr_cpnon
+.Lbxm_len_write:  .quad .Lbxm_fr_write_end - .Lbxm_fr_write
+.Lbxm_len_rm:     .quad .Lbxm_fr_rm_end - .Lbxm_fr_rm
+.Lbxm_len_mv:     .quad .Lbxm_fr_mv_end - .Lbxm_fr_mv
+.Lbxm_len_bad:    .quad .Lbxm_fr_bad_end - .Lbxm_fr_bad
+
+.Lbxm_nm_midden:
+    .ascii "MIDDEN.BIN"
+.Lbxm_nm_other:
+    .ascii "OTHER.BIN"
+.Lbxm_nm_nosuch:
+    .ascii "NOSUCH.BIN"
+.Lbxm_nm_copy:
+    .ascii "COPY.BIN"
+    .balign 8
+.Lbxm_pat_midden:
+    .ascii "BUSX86-EQ-MIDDEN"
+.Lbxm_pat_other:
+    .ascii "BUSX86-EQ-OTHER!"
+    .globl unaos_user_busxm_blob_end
+unaos_user_busxm_blob_end:
+"#
+);
+
+unsafe extern "C" {
+    static unaos_user_busxm_blob_start: u8;
+    static unaos_user_busxm_blob_end: u8;
+    static unaos_user_busxm_midden: u8;
+    static unaos_user_busxm_other: u8;
+}
+
+/// Build one M3 fixture slot at an entry symbol — the `u6gx_build` shape verbatim (allocate a private
+/// address space, scrub the WHOLE window, copy the shared blob into the RX-RO code page through the
+/// identity alias, return the run params). The scrub is what makes `BXM_SEAL` meaningful: the result
+/// table starts as zeros and only the fixture can turn them into an answer.
+fn busxm_build(entry_sym: *const u8) -> Option<U7xFix> {
+    let slot = crate::arch::memory::alloc_user_space()?;
+    let bstart = &raw const unaos_user_busxm_blob_start as usize;
+    let bend = &raw const unaos_user_busxm_blob_end as usize;
+    let blen = bend - bstart;
+    assert!(blen as u64 <= PAGE_SIZE, "BUSX86 M3 blob does not fit in a code page");
+    let off = (entry_sym as usize - bstart) as u64;
+    let backing = crate::arch::memory::slot_backing_ptr(slot);
+    unsafe {
+        core::ptr::write_bytes(backing, 0, (USER_WINDOW_PAGES * PAGE_SIZE) as usize);
+        core::ptr::copy_nonoverlapping(bstart as *const u8, backing, blen);
+    }
+    Some(U7xFix {
+        entry: USER_BASE + off,
+        sp: USER_BASE + USER_WINDOW_PAGES * PAGE_SIZE - 16,
+        cr3: crate::arch::memory::slot_cr3(slot),
+        slot,
+    })
+}
+
+fn busxm_set_go(slot: usize, step: u64) {
+    let p = unsafe { crate::arch::memory::slot_backing_ptr(slot).add(BXM_GO_OFF) as *mut u64 };
+    unsafe { core::ptr::write_volatile(p, step) };
+}
+
+fn busxm_get_sig(slot: usize) -> u64 {
+    let p = unsafe { crate::arch::memory::slot_backing_ptr(slot).add(BXM_SIG_OFF) as *const u64 };
+    unsafe { core::ptr::read_volatile(p) }
+}
+
+/// Read one qword out of a fixture slot's window (the result table). Valid only while the slot is
+/// still allocated — the launcher reads the WHOLE table at SIG 1, before any cleanup step.
+fn busxm_read(slot: usize, off: usize) -> u64 {
+    let p = unsafe { crate::arch::memory::slot_backing_ptr(slot).add(off) as *const u64 };
+    unsafe { core::ptr::read_volatile(p) }
+}
+
+/// Wait (bounded, yielding) until fixture `slot`'s SIG reaches `step`. False on timeout — the verdict
+/// then FAILs honestly rather than the boot hanging (the `u6gx_wait_sig` contract).
+fn busxm_wait_sig(slot: usize, step: u64) -> bool {
+    let deadline = crate::arch::ticks() + 5000;
+    while busxm_get_sig(slot) < step && crate::arch::ticks() < deadline {
+        crate::arch::sched::yield_now();
+    }
+    busxm_get_sig(slot) >= step
+}
+
+/// Drain every deferred U10 op that is pending and RELEASED, returning how many replayed. Called
+/// between the fixtures' unlink steps: each unlink of a created dirty file enqueues one held
+/// CreateGrowDelete, released at its last close, and `NU10 == 1` — so a drain per step is not tidiness,
+/// it is the difference between three clean replays and two dropped mutations plus a sticky overflow.
+fn busxm_drain(fs: &crate::fs::fat::FatFs) -> u32 {
+    let mut n = 0;
+    while u10_flush_drain_one(fs).is_some() {
+        n += 1;
+    }
+    n
+}
+
+/// Render an errno the way the ledger rows spell it. Anything outside the set a leg can legitimately
+/// produce prints as `?`, and the raw number rides the FAIL line, so an unexpected value is loud.
+fn busxm_errno_name(v: i64) -> &'static str {
+    match v {
+        0 => "ok",
+        -1 => "-EPERM",
+        -2 => "-ENOENT",
+        -11 => "-EAGAIN",
+        -13 => "-EACCES",
+        -16 => "-EBUSY",
+        -17 => "-EEXIST",
+        -22 => "-EINVAL",
+        -38 => "-ENOSYS",
+        BXM_MALFORMED => "-MALFORMED",
+        _ => "?",
+    }
+}
+
+/// BUSX86 M3 launcher + verdict — the ring-3 midden twin and THE EQUIVALENCE WITNESS. Two ring-3
+/// programs on their own cores (a cooperative ring-3 fixture hogs its core, so — like `u6gx` — each
+/// needs a dedicated AP and the launcher a third), choreographed with the per-slot GO/SIG words.
+/// Chained off `u6gx_launcher`, BEFORE `busx86_stamp_check`: that witness drives scratch row 7 and
+/// bumps its `SLOT_GEN`, and its comment earns the right to by saying "the ring-3 ladder is done by
+/// now" — so the ladder has to actually be done, which means M3 runs before it and not after.
+/// Needs 3 online APs + storage; fewer skips cleanly. Every path releases both slots before returning.
+fn busx86_midden_launcher(_demo_cpu: usize) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if crate::drivers::block::info().is_none() {
+        return; // keep the no-storage control path free of demo lines (the standing gate)
+    }
+    // WITCORE: both from the non-render pool (see `u7x_run`) — strict, so a short pool skips cleanly.
+    let (Some(cpu_m), Some(cpu_o)) = (crate::arch::smp::worker_cpu(0), crate::arch::smp::worker_cpu(2)) else {
+        serial_println!(
+            ":: BUSX86-EQ: placement pool too small (aps={} pool={}, need 3) — ring-3 midden skipped ::",
+            crate::arch::smp::online_aps().len(),
+            crate::arch::smp::worker_pool_len()
+        );
+        return;
+    };
+    let Some(o) = busxm_build(&raw const unaos_user_busxm_other) else {
+        serial_println!(":: BUSX86-EQ: no free address-space slot (other) — ring-3 midden skipped ::");
+        return;
+    };
+    let Some(m) = busxm_build(&raw const unaos_user_busxm_midden) else {
+        serial_println!(":: BUSX86-EQ: no free address-space slot (midden) — ring-3 midden skipped ::");
+        return;
+    };
+    debug_assert!(m.slot != o.slot, "BUSX86 M3: midden and other landed on the same slot");
+    // The `u6gx` preemptibility gate, and for its reason verbatim: knob-on, a created file's READS route
+    // through the storage service task, and a NON-preemptible ring-3 spinner co-located with that task
+    // would starve it. M3 spins on GO words exactly as u6gx does, so it takes the same gate. Knob-off
+    // keeps the byte-identical non-preemptible spawn.
+    let preempt = s4_sync_storage();
+    serial_println!(
+        ":: BUSX86-EQ: ring-3 midden — the equivalence witness proper: the bus's answer against the DIRECT syscall's, same principal, same names (the kernel-side stamp witness deliberately claims none of this) ::"
+    );
+    if preempt {
+        crate::arch::sched::spawn_user_preemptible(
+            "busx86-other", o.entry, o.sp, cpu_o, o.cr3,
+            alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new()),
+        );
+        crate::arch::sched::spawn_user_preemptible(
+            "busx86-midden", m.entry, m.sp, cpu_m, m.cr3,
+            alloc::sync::Arc::new(crate::arch::sched::KillSwitch::new()),
+        );
+    } else {
+        crate::arch::sched::spawn_user_in_space("busx86-other", o.entry, o.sp, cpu_o, o.cr3);
+        crate::arch::sched::spawn_user_in_space("busx86-midden", m.entry, m.sp, cpu_m, m.cr3);
+    }
+
+    // THE ORDER, and it is forced by a measured ceiling rather than chosen (see the fixture's
+    // `.Lbxm_phase1_done` note): O owns OTHER.BIN and HOLDS it while M runs every leg that needs
+    // another row's live file; then O LETS GO, freeing the third and last writable-staging slot; only
+    // then does M make the copy and read it back, which needs three slots at once.
+    let fs = crate::fs::fat::mount().ok();
+    let mut replayed = 0u32;
+    let seq_ok = busxm_wait_sig(o.slot, 1) && {
+        busxm_set_go(m.slot, 1);
+        busxm_wait_sig(m.slot, 1) // phase 1: ls, cat, cp-other, cp-none, the write side, the bad frame
+    } && {
+        busxm_set_go(o.slot, 2); // O unlinks OTHER.BIN and releases its slot
+        let ok = busxm_wait_sig(o.slot, 2);
+        if let Some(f) = &fs {
+            replayed += busxm_drain(f);
+        }
+        ok
+    } && {
+        busxm_set_go(m.slot, 2);
+        busxm_wait_sig(m.slot, 2) // phase 2: cp-own, with room to verify what it made
+    };
+
+    // Read the WHOLE table now, while both slots are still live and before a single cleanup step.
+    let sealed = busxm_read(m.slot, BXM_SEAL_OFF) == BXM_SEAL;
+    let flags = busxm_read(m.slot, BXM_FLAGS_OFF);
+    let mut direct = [0i64; 16];
+    let mut bus = [0i64; 16];
+    let mut raw = [0i64; 16];
+    for i in 0..16 {
+        direct[i] = busxm_read(m.slot, BXM_DIRECT_OFF + i * 8) as i64;
+        bus[i] = busxm_read(m.slot, BXM_BUS_OFF + i * 8) as i64;
+        raw[i] = busxm_read(m.slot, BXM_RAW_OFF + i * 8) as i64;
+    }
+    let identity_row = m.slot;
+    let identity_gen = SLOT_GEN[m.slot].load(Ordering::Acquire);
+
+    // Cleanup, one unlink per GO step with a drain between (see `busxm_drain`). A mount failure is not
+    // fatal: the in-memory core enqueues nothing, so there is nothing to drain and `drained` stays true.
+    let step = |slot: usize, go: u64, sig: u64, fs: &Option<crate::fs::fat::FatFs>, replayed: &mut u32| {
+        busxm_set_go(slot, go);
+        let ok = busxm_wait_sig(slot, sig);
+        if let Some(f) = fs {
+            *replayed += busxm_drain(f);
+        }
+        ok
+    };
+    let clean_ok = step(m.slot, 3, 3, &fs, &mut replayed)      // M unlinks COPY.BIN
+        && step(m.slot, 4, 4, &fs, &mut replayed);             // M unlinks MIDDEN.BIN
+    busxm_set_go(m.slot, 5); // M exits
+    busxm_set_go(o.slot, 3); // O exits
+
+    // Teardown proof: both fixtures exited holding no live descriptors, so both rows cleared. Poll
+    // bounded, draining as we go — a teardown can release the last refcount on a held op.
+    let tdeadline = crate::arch::ticks() + 3000;
+    let both_clear = |a: usize, b: usize| {
+        files_row_is_clear(a) && handle_row_is_clear(a) && files_row_is_clear(b) && handle_row_is_clear(b)
+    };
+    while !both_clear(m.slot, o.slot) && crate::arch::ticks() < tdeadline {
+        crate::arch::sched::yield_now();
+    }
+    let cleared = both_clear(m.slot, o.slot);
+    if let Some(f) = &fs {
+        replayed += busxm_drain(f);
+    }
+    let queue_free = u10_flush_all_free();
+    let overflowed = U10_OVERFLOW.load(Ordering::Acquire);
+    let stranded_op = U10_OP[0].load(Ordering::Acquire);
+    let stranded_name = U10_NAMEID[0].load(Ordering::Acquire);
+    let stranded_held = U10_HELD[0].load(Ordering::Acquire);
+    let drained = queue_free && !overflowed;
+
+    // THE COMPARISON. Nine legs, each `direct[i]` against `bus[i]`, byte-for-byte on the errno.
+    let mut same = 0usize;
+    let mut diff = 0usize;
+    for i in 0..BXM_LEGS {
+        if direct[i] == bus[i] {
+            same += 1;
+        } else {
+            diff += 1;
+        }
+    }
+    let nosys = (9..12).filter(|&i| bus[i] == -38).count();
+    let badframe = bus[12];
+    // A cleanup step that returned an errno did NOT free its file, and a file not freed at a GO step
+    // lands on the teardown's shoulders where a second enqueue meets a one-deep queue. So the unlinks'
+    // own return codes are part of the verdict, not a thing to infer from `drained` afterwards.
+    let unlinked = bus[13] >= 0 && bus[14] == 0 && bus[15] == 0;
+    let pass = seq_ok
+        && sealed
+        && clean_ok
+        && unlinked
+        && cleared
+        && drained
+        && diff == 0
+        && flags == 7
+        && nosys == 3
+        && badframe == EINVAL;
+    serial_println!(
+        ":: BUSX86-EQ: ring-3 midden (busx86-midden) — denied via the bus == denied via the DIRECT syscall, byte-same errno; permitted via one == permitted via the other: legs={} same={} diff={} [{}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{} {}:{}/{}] payload cat={} cp={} refused-frame-queued-nothing={} write/rm/mv={}/3 {} (BANDY-2 write side, well-formed reply, distinct from -EINVAL) badframe={} identity=(row,SLOT_GEN)=({},{}) seq={} sealed={} cleanup={} unlinked={} cleared={} drained={} ops_replayed={} -> {} ::",
+        BXM_LEGS, same, diff,
+        BXM_LEG_NAMES[0], busxm_errno_name(direct[0]), busxm_errno_name(bus[0]),
+        BXM_LEG_NAMES[1], busxm_errno_name(direct[1]), busxm_errno_name(bus[1]),
+        BXM_LEG_NAMES[2], busxm_errno_name(direct[2]), busxm_errno_name(bus[2]),
+        BXM_LEG_NAMES[3], busxm_errno_name(direct[3]), busxm_errno_name(bus[3]),
+        BXM_LEG_NAMES[4], busxm_errno_name(direct[4]), busxm_errno_name(bus[4]),
+        BXM_LEG_NAMES[5], busxm_errno_name(direct[5]), busxm_errno_name(bus[5]),
+        BXM_LEG_NAMES[6], busxm_errno_name(direct[6]), busxm_errno_name(bus[6]),
+        BXM_LEG_NAMES[7], busxm_errno_name(direct[7]), busxm_errno_name(bus[7]),
+        BXM_LEG_NAMES[8], busxm_errno_name(direct[8]), busxm_errno_name(bus[8]),
+        if flags & 1 != 0 { "same" } else { "DIFF" },
+        if flags & 2 != 0 { "same" } else { "DIFF" },
+        flags & 4 != 0,
+        nosys, busxm_errno_name(bus[9]),
+        busxm_errno_name(badframe),
+        identity_row, identity_gen,
+        seq_ok, sealed, clean_ok, unlinked, cleared, drained, replayed,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    // Every DIFFERING pair named with its raw numbers, plus the direct leg's raw rc — a symbolic name
+    // is for reading, but a divergence has to be actionable, and `?` is not a bug report.
+    if !pass {
+        for i in 0..BXM_LEGS {
+            if direct[i] != bus[i] {
+                serial_println!(
+                    ":: BUSX86-EQ: DIFF {} — direct={} bus={} (direct syscall rc={}) ::",
+                    BXM_LEG_NAMES[i], direct[i], bus[i], raw[i]
+                );
+            }
+        }
+        // The two claims that are NOT errno pairs get their measured intermediates, so a FAIL here is a
+        // finding someone can act on and not a bit to re-derive by hand.
+        serial_println!(
+            ":: BUSX86-EQ: DETAIL cp-copy open_rc={} copy_len={} orig_len={} copy_head={:#018x} orig_head={:#018x} · U10 queue free={} overflow={} op={} nameid={} held={} replayed={} ::",
+            raw[13], raw[14], raw[15], direct[13] as u64, direct[14] as u64,
+            queue_free, overflowed, stranded_op, stranded_name, stranded_held, replayed
+        );
+        serial_println!(
+            ":: BUSX86-EQ: DETAIL cleanup — copy_sibling_open={} copy_unlink={} midden_unlink={} ::",
+            bus[13], bus[14], bus[15]
+        );
+    }
 }

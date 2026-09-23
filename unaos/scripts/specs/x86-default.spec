@@ -137,3 +137,33 @@ FORBID :: WINMENU: .* -> SKIP reason=menu-unpublished-after=[0-9]+ms ::
 # parent 2495f3a2 before a line of this arc was written (the go-red — the run that has no allocator
 # in it), and 1 hit on the capture the same verb produced after.
 REQUIRE \[vectors\] allocated=[0-9]+ free=[0-9]+ table=timer:0x20,xhci:0x40,nic:0x41,ipi:0x42,ehci:0x43,spurious:0xff == witness ::
+
+# ── BUSX86 M3 (2026-09-22), TAIL-APPENDED past the contract block, the WINMENUSPEC shape ────────────
+# THE EQUIVALENCE WITNESS, pinned on the lane it actually runs on. `busx86_midden_launcher` is
+# UNCONDITIONAL — no `witness`, no `wc`, no storage knob — because the bus is not optional surface on
+# this arch (the `SYS_MSEND`/`SYS_MRECV` dispatch reasoning verbatim), so unlike WINMENU's verdict the
+# PASS spelling is present on the knob-free `./arroyo test` and can be REQUIRED rather than only
+# FORBIDden in its negative. It skips cleanly with a named line when the box has no storage or fewer
+# than three placement cores; neither is true of this lane.
+#
+# WHY `diff=0` IS IN THE REQUIRE AND NOT LEFT TO `PASS`. `PASS` is a conjunction of nine things
+# (sequence, seal, cleanup, unlinks, teardown, drain, the payload pair, the write side, the bad
+# frame), and a future edit that loosened any ONE of them would keep printing `PASS` while the
+# equivalence claim itself quietly stopped being checked. `diff=0` is the claim: nine legs, each the
+# bus's errno against the DIRECT syscall's, compared byte-for-byte. Pinning both means the line has
+# to carry the claim AND the verdict, and neither can go green without the other.
+REQUIRE :: BUSX86-EQ: .* legs=9 same=9 diff=0 .* -> PASS ::
+# The FORBID partner is a REAL spelling, not an invented negation: the launcher prints exactly this
+# line with `-> FAIL` on any divergence, and the go-red for this arc (one leg's compare forced to
+# answer -EPERM, reverted) produced it — `diff=1 [... cat-other:-EACCES/-EPERM ...] -> FAIL`.
+FORBID :: BUSX86-EQ: .* -> FAIL ::
+# AND THE STAMP WITNESS, which BUSX86 M2 landed unpinned. It is the transport half M3 stands on: if
+# the stamping or the mailbox regressed, every M3 leg would still compare equal (both legs would be
+# wrong together) and `diff=0` would say nothing. One kernel line, two arcs, one lane.
+REQUIRE :: BUSX86-STAMP: .* :: PASS \[w=0x3f/0x3f\] ::
+FORBID :: BUSX86-STAMP: .* :: FAIL
+# The U10 deferred-op queue is ONE deep and its overflow is a DROPPED acknowledged mutation. M3's
+# cleanup is choreographed around that (one unlink per GO step, the launcher draining between), and
+# this is the line that convicts a future fixture that stops doing so. MEASURED as a real red on this
+# bench: the M3 build that skipped an unlink on -EMFILE printed it (`op=2 name=7 16 bytes`).
+FORBID :: U10: OP QUEUE FULL
