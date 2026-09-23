@@ -221,13 +221,17 @@ FORBID :: LOGIN-END: .* -> FAIL
 FORBID :: LOGIN-END: .* SKIPPED
 REQUIRE \[users\] logout epoch=\d+ ended=\d+ windows=\d+
 
-# ── 7d. THE CREDENTIAL FILE IS KERNEL-OWNED (SECLOGIN M4, rmbp-ledger B169) ─────────────────────
-# B157 gap 2. The predicate is pinned as a property; the x86 RESOLVER line is pinned as a MEASUREMENT
-# with BOTH readings allowed, because the guard line lives in `fs::vfs::el0_locate`, outside the
-# SECLOGIN grant (multiuser.md §6): `resolver=OPENED` is the hole measured, `resolver=refused` is
-# the day the seat's one line lands. A REQUIRE on `refused` alone would be red until then and a
-# REQUIRE on `OPENED` would certify the hole (LAWS §5: never require a limitation).
-REQUIRE \[users\] kernel-owned pred=ok resolver=(OPENED|refused)
+# ── 7d. THE CREDENTIAL FILE IS KERNEL-OWNED (SECLOGIN M4 + VFSOWNED, rmbp-ledger B169/B181) ─────
+# B157 gap 2. The predicate is pinned as a property. The x86 RESOLVER line USED to be pinned as a
+# MEASUREMENT with both readings allowed, because the guard line lived in `fs::vfs::el0_locate`,
+# outside the SECLOGIN grant (multiuser.md §6). VFSOWNED (B181) landed that line, so the pin is now
+# the PROPERTY and only the property: the resolver REFUSES. `resolver=refused` is the fixture's own
+# spelling (`fs/users.rs` login_kown_fixture, lower case) — not `REFUSED`; the wire is the authority.
+# The FORBID closes the other arm, which is the reading this pin exists to make unshippable: a REQUIRE
+# that still admitted `OPENED` would certify the hole (LAWS §5: never require a limitation), and a
+# REQUIRE alone cannot catch the family taking the wrong arm (pi4-regression.spec:2032/2052's shape).
+REQUIRE \[users\] kernel-owned pred=ok resolver=refused
+FORBID \[users\] kernel-owned .*resolver=OPENED
 FORBID :: LOGIN-KOWN: .* -> FAIL
 
 # ── 7e. THE SALT HAS A SOURCE, AND THE EPOCH IS 64 BITS (SECLOGIN M5, rmbp-ledger B169) ─────────

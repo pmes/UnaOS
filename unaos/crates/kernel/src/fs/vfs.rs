@@ -2998,6 +2998,10 @@ pub fn el0_locate(
 ) -> Result<(crate::fs::fat::DirEntry, u64, usize), El0LocateError> {
     use crate::fs::fat::FatError;
     let (parent, leaf) = el0_walk(fs, path)?;
+    // SECLOGIN M4 (VFSOWNED) — the kernel's credential file is unreachable through ANY EL0 open, on
+    // BOTH arches, at the one resolver they share (B169; multiuser.md §6; `login`-gated as `fs::users` is).
+    #[cfg(feature = "login")]
+    if crate::fs::users::kernel_owned_leaf(leaf) { return Err(El0LocateError::Invalid); }
     match fs.locate_in_dir(parent, leaf) {
         Ok(t) => Ok(t),
         Err(FatError::NotFound) => {
