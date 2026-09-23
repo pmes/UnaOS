@@ -359,11 +359,6 @@ struct IntEp {
     /// buffer so the controller accumulates a >MPS raw frame into it. See `arm_interrupt_ep`.
     #[cfg(feature = "mtraw")]
     rx_total: u32,
-    /// MT-INVESTIGATION (IVY, `mtraw_inject` sub-knob only): previous decoded first-finger absolute
-    /// position, for turning TYPE2 absolute coordinates into pointer DELTAS. `None` until the first
-    /// touching frame and again on finger-up, so a lift never emits a jump.
-    #[cfg(feature = "mtraw_inject")]
-    mt_prev: Option<(i32, i32)>,
 }
 
 // ======================================================================================
@@ -4696,17 +4691,24 @@ impl Controller {
         // swap lives here rather than inside `bcm5974_mode_switch` so that knob-off the switch
         // function keeps its exact name and body — default media stay byte-identical, symbols
         // included, which a build-hash comparison of both trees confirmed.
-        if layout.vendor_mt {
+        // TPFRAME (B197): the readback is kept, and stamped on the endpoint once it is armed.
+        let tp_latched = if layout.vendor_mt {
             #[cfg(not(feature = "mtraw"))]
-            self.bcm5974_mode_switch(t, intf);
+            { self.bcm5974_mode_switch(t, intf) }
             #[cfg(feature = "mtraw")]
-            self.bcm5974_mt_raw_probe(t, intf);
-        }
+            { self.bcm5974_mt_raw_probe(t, intf); false }
+        } else {
+            false
+        };
         // MTFIX: everything below — the bootlog milestone and both `== witness` lines — is the
         // report of an endpoint that IS armed. Boot AN printed all of it for an endpoint the
         // exhausted slot pool had just skipped.
         if !self.arm_interrupt_ep(t, ep, mps.min(64), false, false, Some(layout), intf) {
             return;
+        }
+        // TPFRAME: `arm_interrupt_ep` pushed this endpoint last; it carries the readback from here on.
+        if let Some(e) = self.int_eps.last_mut() {
+            e.tp.latched = tp_latched;
         }
         // GUI-WITNESS: the report-protocol pointer (the rMBP trackpad, incl. the Apple
         // vendor-multitouch interface) is armed — the trackpad-input milestone.
@@ -4785,16 +4787,20 @@ impl Controller {
     /// arms the endpoint regardless), and each attempt prints its own `[tp] mode` line carrying
     /// the FULL eight bytes written and the FULL eight read back, so flight 12 can read what the
     /// device latched instead of what we asked for.
-    unsafe fn bcm5974_mode_switch(&mut self, t: &Target, intf: u8) {
+    /// TPFRAME (B197): returns the readback (`latched`) and prints the route it implies, once.
+    unsafe fn bcm5974_mode_switch(&mut self, t: &Target, intf: u8) -> bool {
         // Attempt 1 — HID 1.11 §7.2.2: wIndex is the INTERFACE this Feature report belongs to.
-        if self.bcm5974_mode_attempt(t, intf, intf as u16, "hid1.11-intf") {
-            return;
-        }
         // Attempt 2 — the legacy index this driver has always sent. Reached only when the
         // conformant request did not latch, and never a third time.
-        if intf as u16 != BCM5974_MODE_REQ_INDEX {
-            self.bcm5974_mode_attempt(t, intf, BCM5974_MODE_REQ_INDEX, "legacy-index0");
-        }
+        let latched = self.bcm5974_mode_attempt(t, intf, intf as u16, "hid1.11-intf")
+            || (intf as u16 != BCM5974_MODE_REQ_INDEX
+                && self.bcm5974_mode_attempt(t, intf, BCM5974_MODE_REQ_INDEX, "legacy-index0"));
+        serial_println!(
+            ":: EHCI-HID: [{}] [tp] mt route={} latched={} (addr={} intf={}; the readback's route — a stream that disagrees is routed by the stream) == witness ::",
+            self.idx, if latched { "vendor" } else { "legacy" }, if latched { "yes" } else { "no" },
+            t.addr, intf
+        );
+        latched
     }
 
     /// TRACKPAD (B139) — ONE read-modify-write-readback of the mode Feature report at a given
@@ -4980,7 +4986,7 @@ impl Controller {
                     ":: EHCI-MT: [{}] raw mode-set FAILED — restoring pointer mode immediately ::",
                     self.idx
                 );
-                self.bcm5974_mode_switch(t, intf);
+                let _ = self.bcm5974_mode_switch(t, intf);
                 serial_println!(":: EHCI-MT: [{}] mode-restored == witness ::", self.idx);
             }
         }
@@ -5051,7 +5057,7 @@ impl Controller {
     #[cfg(feature = "mtraw")]
     unsafe fn bcm5974_mt_restore(&mut self) {
         if let Some((t, intf)) = self.mt_probe.take() {
-            self.bcm5974_mode_switch(&t, intf);
+            let _ = self.bcm5974_mode_switch(&t, intf);
             serial_println!(
                 ":: EHCI-MT: [{}] mode-restored addr={} intf={} after {} raw report(s) == witness ::",
                 self.idx, t.addr, intf, self.mt_dumped
@@ -13579,8 +13585,6 @@ impl Controller {
             tp: TpCensus::EMPTY,
             #[cfg(feature = "mtraw")]
             rx_total,
-            #[cfg(feature = "mtraw_inject")]
-            mt_prev: None,
         });
         // MTFIX: armed, linked, and registered with `service()` — the only path that returns true.
         true
@@ -14073,13 +14077,6 @@ impl Controller {
                                     dump_type2_frame(idx, e.mps, report);
                                 }
                             }
-                            // MT-INVESTIGATION (IVY, `mtraw_inject` sub-knob ONLY, default OFF): turn
-                            // the first finger's ABSOLUTE position into pointer deltas. Deliberately
-                            // gated behind a second knob: the pointer path stays 0x02-driven until
-                            // metal proves raw mode is stable, so the default `mtraw` build DECODES
-                            // and WITNESSES without ever touching the event queue.
-                            #[cfg(feature = "mtraw_inject")]
-                            mt_inject_first_finger(report, &mut e.mt_prev);
                             // M2 (RMBP-FIX silicon retarget): after the bcm5974 mode switch the internal
                             // trackpad does NOT stream the descriptor's opaque 0x44 / 511-byte multitouch
                             // frame — that hypothesis is REFUTED on this device path (the decode it drove,
@@ -14101,7 +14098,17 @@ impl Controller {
                             // `TpRoute::None` is a runt, exactly as before — no event, no state
                             // change. Proven on flight 11's own four captured reports by
                             // `trackpad_dispatch_selftest`.
-                            match trackpad_dispatch(report) {
+                            // TPFRAME (B197) M3 — the wire beats the register: a stream that
+                            // disagrees with the mode readback is NAMED (once per direction) and
+                            // routed by what it IS. Outside every arm, so the 0x02 arm is unchanged.
+                            let route = trackpad_dispatch(report);
+                            if let Some((rb, st)) = e.tp.stream_check(&route) {
+                                serial_println!(
+                                    ":: EHCI-HID: [{}] [tp] mode-mismatch readback={} stream={} -> route={} (the wire beats the register) == witness ::",
+                                    idx, rb, st, st
+                                );
+                            }
+                            match route {
                               TpRoute::Rel { buttons, dx, dy } => {
                                 // Bounded one-line format witness on the first report of THIS ID.
                                 // TRACKPAD (B139): the condition was `e.reports == 1` and that is
@@ -14174,6 +14181,44 @@ impl Controller {
                                         ":: EHCI-HID: [{}] trackpad vendor frame: id={:#04x} len={} first-finger present={} x={} y={} (HYPOTHESIS offsets X@{} Y@{} touch@{}; decode only, NOT installed) == witness ::",
                                         idx, TRACKPAD_VENDOR_REPORT_ID, report.len(), present, x, y,
                                         VMT_FINGER_ABS_X, VMT_FINGER_ABS_Y, VMT_FINGER_TOUCH
+                                    );
+                                }
+                              }
+                              // TPFRAME (B197): the vendor-multitouch frame the latched mode switch
+                              // produces (flight 12, `74 57 1c 03 …`, 58 B). `mt_step` turns the
+                              // primary finger's ABSOLUTE position into the same (buttons, dx, dy)
+                              // the 0x02 arm decodes, and from there the install is the 0x02 arm's:
+                              // `note_buttons`, one `push_pointer_report`, the same click lines.
+                              TpRoute::Vendor(f) => {
+                                let (buttons, dx, dy, wit) = e.tp.mt_step(f);
+                                if wit {
+                                    serial_println!(
+                                        ":: EHCI-HID: [{}] [tp] mt fingers={} x={} y={} dx={} dy={} frame={} == witness ::",
+                                        idx, f.fingers, f.x0, f.y0, dx, dy, e.tp.mt_frames
+                                    );
+                                }
+                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx);
+                                crate::pal::push_pointer_report(
+                                    if dx != 0 || dy != 0 {
+                                        Some(crate::pal::Event::Mouse { x: dx, y: dy })
+                                    } else {
+                                        None
+                                    },
+                                    if press || release {
+                                        Some(crate::pal::Event::Button(buttons))
+                                    } else {
+                                        None
+                                    },
+                                );
+                                if press {
+                                    serial_println!(
+                                        ":: EHCI-HID: [{}] trackpad click (button-down edge, buttons={:#04x}) == witness ::",
+                                        idx, buttons
+                                    );
+                                } else if release {
+                                    serial_println!(
+                                        ":: EHCI-HID: [{}] trackpad release (button-up edge, buttons={:#04x}) == witness ::",
+                                        idx, buttons
                                     );
                                 }
                               }
@@ -16954,7 +16999,7 @@ const MT_RAW_DUMP_BYTES: usize = 64;
 //   * finger presence: wsp treats `f->touch_major != 0` as the finger being in contact.
 //   * `sc->pos_y[i] = -f->abs_y` — wsp NEGATES Y for its pointer path (the sensor's Y grows the
 //     opposite way from screen Y). We report `abs_y` VERBATIM in the witness (so the metal capture
-//     is raw ground truth) and apply the negation only in the opt-in injection path below.
+//     is raw ground truth) and apply the negation only in `TpCensus::mt_step` (TPFRAME, B197).
 //
 // The raw frame carries NO leading HID Report ID byte — offsets here are from byte 0 of the frame.
 //
@@ -17366,6 +17411,17 @@ struct TpCensus {
     log_ms: u64,
     /// Total reports the last emitted line accounted for. A census that has not moved says nothing.
     logged: u32,
+    /// TPFRAME (B197) — the mode switch's READBACK: `true` only when `bcm5974_mode_switch` read the
+    /// vendor selector back (`[tp] mode … latched=yes`). Stamped once, right after arming.
+    latched: bool,
+    /// TPFRAME M3 — the `[tp] mode-mismatch` one-shots: bit 0 = vendor frames while `latched=no`,
+    /// bit 1 = id-0x02 reports while `latched=yes`. At most two lines per endpoint per boot.
+    mismatch: u8,
+    /// TPFRAME — vendor frames routed so far; paces the `[tp] mt` witness (`TP_MT_WITNESS_EVERY`).
+    mt_frames: u32,
+    /// TPFRAME — the primary finger's last position in POINTER orientation (sensor y negated).
+    /// `None` until a touching frame and again at every lift, so a re-touch never emits a jump.
+    mt_prev: Option<(i32, i32)>,
 }
 
 impl TpCensus {
@@ -17377,6 +17433,10 @@ impl TpCensus {
         first_len: [0; 3],
         log_ms: 0,
         logged: 0,
+        latched: false,
+        mismatch: 0,
+        mt_frames: 0,
+        mt_prev: None,
     };
 
     /// Which counter a report belongs to. Total: any byte sequence maps somewhere, and a report
@@ -17409,6 +17469,46 @@ impl TpCensus {
         self.n[0]
             .saturating_add(self.n[1])
             .saturating_add(self.n[2])
+    }
+
+    /// TPFRAME (B197) — one decoded vendor frame into the SAME `(buttons, dx, dy)` triple the id-0x02
+    /// arm decodes, plus whether this frame carries the bounded `[tp] mt` witness. The delta is the
+    /// primary finger's absolute motion since the previous touching frame, in sensor units 1:1 (the
+    /// retired `mtraw_inject` path's scale; the gain is a glass question), y negated as wsp does
+    /// (direction `unverified`), clamped to `TP_MT_MAX_STEP`. A frame with no finger, or with
+    /// `touch_major == 0`, clears the baseline: the NEXT touch starts from where it lands. The button
+    /// is `ibt`@15 (`unverified`), mapped to the 0x02 arm's bit 0 so `note_buttons` sees one shape.
+    fn mt_step(&mut self, f: Wsp2Frame) -> (u8, i32, i32, bool) {
+        self.mt_frames = self.mt_frames.wrapping_add(1);
+        let buttons = if f.button != 0 { 0x01 } else { 0x00 };
+        let (mut dx, mut dy) = (0, 0);
+        if f.fingers == 0 || f.touch0 == 0 {
+            self.mt_prev = None;
+        } else {
+            let (x, y) = (f.x0, -f.y0);
+            if let Some((px, py)) = self.mt_prev {
+                dx = (x - px).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP);
+                dy = (y - py).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP);
+            }
+            self.mt_prev = Some((x, y));
+        }
+        (buttons, dx, dy, self.mt_frames % TP_MT_WITNESS_EVERY == 1)
+    }
+
+    /// TPFRAME (B197) M3 — does the STREAM contradict the mode READBACK? Returns `(readback,
+    /// stream)` the first time each direction happens and `None` otherwise. The caller routes by the
+    /// stream either way: the readback is a register, the frame is what the pad is doing.
+    fn stream_check(&mut self, route: &TpRoute) -> Option<(&'static str, &'static str)> {
+        let (bit, readback, stream) = match (route, self.latched) {
+            (TpRoute::Vendor(_), false) => (1u8, "legacy", "vendor"),
+            (TpRoute::Rel { .. }, true) => (2u8, "vendor", "legacy"),
+            _ => return None,
+        };
+        if self.mismatch & bit != 0 {
+            return None;
+        }
+        self.mismatch |= bit;
+        Some((readback, stream))
     }
 }
 
@@ -17455,6 +17555,10 @@ enum TpRoute {
     /// installed: the offsets are unconfirmed on silicon, and installing pointer motion from an
     /// unverified byte map is exactly the move this arc is undoing elsewhere.
     Mt { present: bool, x: i32, y: i32 },
+    /// TPFRAME (B197) — a vendor-multitouch frame: the Wellspring TYPE2 shape (no Report ID, a
+    /// 30-byte header, 28-byte finger records), which the pad streams once its mode switch latched
+    /// (flight 12, `74 57 1c 03 …`). Routed by SHAPE, never by byte 0 (`flag`, unverified).
+    Vendor(Wsp2Frame),
     /// Anything else — a runt, an empty completion, an id this endpoint has no decode for. Counted
     /// by the census, routed nowhere. Flight 11's `60 02` is this.
     None,
@@ -17475,7 +17579,10 @@ fn trackpad_dispatch(report: &[u8]) -> TpRoute {
                 None => TpRoute::None,
             }
         }
-        _ => TpRoute::None,
+        _ => match decode_wellspring_type2(report) {
+            Some(f) => TpRoute::Vendor(f),
+            None => TpRoute::None,
+        },
     }
 }
 
@@ -17564,6 +17671,121 @@ unsafe fn trackpad_dispatch_selftest() {
         runt_ok, rel_ok, mt_ok, empty_ok,
         c.n[0], c.n[1], c.n[2], c.min_len, c.max_len,
         ok,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// TPFRAME (B197) self-test — **flight 12's three captured vendor frames, verbatim, through the
+/// live route**: `trackpad_dispatch` (by shape) then `TpCensus::mt_step`, the two functions the
+/// service arm runs, and nothing else. QEMU has no Apple pad, so this is the only gate that can see
+/// the route at all. Bytes: `vendor-multitouch raw report #2/#3/#4 (58 B)` at 234250/234262/234267
+/// ms in `f12-boot1.log` (image 4, `hw-rmbp@6d8d3d2d`), the frames that followed `latched=yes`.
+///
+/// The corpus holds no click and no lift, so four more frames are DERIVED from it and labelled as
+/// such, each one byte (or one truncation) away from a captured frame: `down` = #4 with `ibt`@15 = 1,
+/// `up` = #4 again, `lift` = #4's 30-byte header with `nfinger` and `wLength` zeroed (the header-only
+/// shape), `retouch` = #2 again. ASSERTED: every frame routes Vendor; the pointer triples are exactly
+/// (0,0,0) (0,-30,-12) (0,-3,-5) (1,0,0) (0,0,0) (0,0,0) (0,0,0) — #2 seeds the baseline, #3/#4 move
+/// by the abs delta with y negated, the lift clears the baseline so the re-touch 33 units away
+/// moves NOTHING; the button edges by `note_buttons`' own rule are one down at frame 4 and one up
+/// at frame 5; the device's own `rel_x`/`rel_y` equal 10 x our abs delta on both captured pairs (the
+/// wire's cross-check on the offsets); the witness paces 1-in-64; flight 11's id-0x02 report still
+/// routes Rel `dx=-7` and its `60 02` runt still routes nowhere; and `stream_check` names each
+/// mismatch direction exactly once. GO-RED: read abs_x/abs_y big-endian in the decoder -> `-> FAIL`.
+unsafe fn tpframe_selftest() {
+    const F2: [u8; 58] = [
+        0x74, 0x57, 0x1c, 0x03, 0x66, 0xae, 0x03, 0x00, 0x00, 0x01, 0x07, 0x97, 0x1c, 0x00, 0x01, 0x00,
+        0x10, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x03, 0x02, 0x01,
+        0x55, 0x0b, 0xb8, 0x06, 0x40, 0xff, 0x38, 0x00, 0x27, 0x04, 0xd9, 0x03, 0x00, 0x40, 0xea, 0x00,
+        0x18, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xbd, 0x07,
+    ];
+    const F3: [u8; 58] = [
+        0x74, 0x58, 0x1c, 0x03, 0x6e, 0xae, 0x03, 0x00, 0x00, 0x01, 0x07, 0x97, 0x1c, 0x00, 0x01, 0x00,
+        0x10, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x04, 0x02, 0x01,
+        0x37, 0x0b, 0xc4, 0x06, 0xd4, 0xfe, 0x78, 0x00, 0x2c, 0x04, 0xdf, 0x03, 0x00, 0x40, 0xe7, 0x00,
+        0x1c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x96, 0x08,
+    ];
+    const F4: [u8; 58] = [
+        0x74, 0x59, 0x1c, 0x03, 0x76, 0xae, 0x03, 0x00, 0x00, 0x01, 0x07, 0x97, 0x1c, 0x00, 0x01, 0x00,
+        0x10, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x04, 0x02, 0x01,
+        0x34, 0x0b, 0xc9, 0x06, 0xe2, 0xff, 0x32, 0x00, 0x29, 0x04, 0xed, 0x03, 0x00, 0x40, 0xf3, 0x00,
+        0x23, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x89, 0x08,
+    ];
+    let mut down = F4;
+    down[WSP2_BUTTON_OFF] = 0x01;
+    let mut lift = [0u8; WSP2_HDR_LEN];
+    lift.copy_from_slice(&F4[..WSP2_HDR_LEN]);
+    lift[WSP2_NFINGER_OFF] = 0;
+    lift[12] = 0; // wLength: no finger bytes follow
+    let seq: [&[u8]; 7] = [&F2, &F3, &F4, &down, &F4, &lift, &F2];
+    let want: [(u8, i32, i32); 7] =
+        [(0, 0, 0), (0, -30, -12), (0, -3, -5), (1, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)];
+
+    let mut c = TpCensus::EMPTY;
+    c.latched = true;
+    let (mut vendor, mut fingers_max, mut deltas_ok, mut wit_ok) = (0u32, 0u8, true, true);
+    let (mut prev_btn, mut down_at, mut up_at, mut edges) = (0u8, 0usize, 0usize, 0u32);
+    let mut got = [(0u8, 0i32, 0i32); 7];
+    for (k, fr) in seq.iter().enumerate() {
+        let r = trackpad_dispatch(fr);
+        let silent = c.stream_check(&r).is_none();
+        let TpRoute::Vendor(f) = r else {
+            deltas_ok = false;
+            continue;
+        };
+        vendor += 1;
+        fingers_max = fingers_max.max(f.fingers);
+        let (b, dx, dy, wit) = c.mt_step(f);
+        got[k] = (b, dx, dy);
+        deltas_ok &= got[k] == want[k] && silent;
+        wit_ok &= wit == (k == 0);
+        // `note_buttons`' own edge rule, on bit 0 — the fixture must not touch `pal::cursor`.
+        if b & 1 != 0 && prev_btn & 1 == 0 {
+            down_at = k + 1;
+            edges += 1;
+        } else if b & 1 == 0 && prev_btn & 1 != 0 {
+            up_at = k + 1;
+            edges += 1;
+        }
+        prev_btn = b;
+    }
+    // The witness cadence past the first window: frame 65 witnesses, 64 and 66 do not.
+    let mut p = TpCensus::EMPTY;
+    for n in 1..=66u32 {
+        if let TpRoute::Vendor(f) = trackpad_dispatch(&F2) {
+            let w = p.mt_step(f).3;
+            wit_ok &= w == (n == 1 || n == 65);
+        }
+    }
+    // The wire's own cross-check on the abs offsets: rel = 10 x delta(abs), both captured pairs.
+    let mut rel_pairs = 0u32;
+    for (a, b) in [(&F2, &F3), (&F3, &F4)] {
+        let rd = |fr: &[u8; 58], o: usize| read_le16(fr, WSP2_HDR_LEN + o).map(|v| v as i16 as i32).unwrap_or(0);
+        let (da, db) = (trackpad_dispatch(a), trackpad_dispatch(b));
+        if let (TpRoute::Vendor(fa), TpRoute::Vendor(fb)) = (da, db) {
+            if rd(b, WSP2_F_REL_X) == 10 * (fb.x0 - fa.x0) && rd(b, WSP2_F_REL_Y) == 10 * (fb.y0 - fa.y0) {
+                rel_pairs += 1;
+            }
+        }
+    }
+    // The legacy stream is untouched, and the mismatch one-shots fire once per direction.
+    let r11: [u8; 8] = [0x02, 0x00, 0xf9, 0x00, 0x00, 0x00, 0xfb, 0x00];
+    let legacy_ok = trackpad_dispatch(&r11) == TpRoute::Rel { buttons: 0x00, dx: -7, dy: 0 }
+        && trackpad_dispatch(&[0x60, 0x02]) == TpRoute::None;
+    let rel_route = trackpad_dispatch(&r11);
+    let mm_yes = c.stream_check(&rel_route) == Some(("vendor", "legacy"))
+        && c.stream_check(&rel_route).is_none();
+    let mut u = TpCensus::EMPTY;
+    let mm_no = u.stream_check(&rel_route).is_none()
+        && u.stream_check(&trackpad_dispatch(&F2)) == Some(("legacy", "vendor"))
+        && u.stream_check(&trackpad_dispatch(&F3)).is_none();
+    let clicks_ok = edges == 2 && down_at == 4 && up_at == 5;
+    let ok = vendor == 7 && fingers_max == 1 && deltas_ok && clicks_ok && wit_ok && rel_pairs == 2
+        && legacy_ok && mm_yes && mm_no;
+    serial_println!(
+        ":: TPFRAME: frames={} fingers_max={} deltas_ok={} click_edges=down@{},up@{} corpus=3 d={}/{},{}/{} lift_reset={} relx10={}/2 wit_1in64={} legacy_ok={} mismatch_yes={} mismatch_no={} -> {} ::",
+        vendor, fingers_max, deltas_ok, down_at, up_at, got[1].1, got[1].2, got[2].1, got[2].2,
+        got[6] == (0, 0, 0), rel_pairs, wit_ok, legacy_ok, mm_yes, mm_no,
         if ok { "PASS" } else { "FAIL" }
     );
 }
@@ -17659,42 +17881,14 @@ fn dump_type2_frame(idx: usize, mps: u16, frame: &[u8]) {
     }
 }
 
-/// MT-INVESTIGATION (IVY, `mtraw_inject` sub-knob ONLY — default OFF, and OFF is the shipping
-/// behaviour until metal proves raw mode is stable) — drive the pointer from the first finger.
-///
-/// TYPE2 coordinates are ABSOLUTE sensor units, while the landed EHCI pointer seam is
-/// `pal::Event::Mouse { x, y }` RELATIVE deltas, so we difference against the previous frame.
-/// `prev` is cleared whenever the finger is absent (`touch_major == 0`, wsp's own contact test) or
-/// the frame is not decodable, so a lift-and-replace never emits a jump. Deltas are clamped to a
-/// sane per-frame magnitude — a garbled coordinate must not fling the cursor.
-#[cfg(feature = "mtraw_inject")]
-fn mt_inject_first_finger(frame: &[u8], prev: &mut Option<(i32, i32)>) {
-    let Some(f) = decode_wellspring_type2(frame) else {
-        *prev = None;
-        return;
-    };
-    if f.fingers == 0 || f.touch0 == 0 {
-        *prev = None;
-        return;
-    }
-    // wsp uses `-abs_y` for its pointer path (sensor Y grows opposite to screen Y); apply that
-    // ONLY here, so the witness above keeps reporting the raw sensor value.
-    let (x, y) = (f.x0, -f.y0);
-    if let Some((px, py)) = *prev {
-        let dx = (x - px).clamp(-MT_INJECT_MAX_STEP, MT_INJECT_MAX_STEP);
-        let dy = (y - py).clamp(-MT_INJECT_MAX_STEP, MT_INJECT_MAX_STEP);
-        if dx != 0 || dy != 0 {
-            crate::pal::push_event(crate::pal::Event::Mouse { x: dx, y: dy });
-        }
-    }
-    *prev = Some((x, y));
-}
-
-/// MT-INVESTIGATION (`mtraw_inject`): per-frame delta clamp. The TYPE2 sensor spans a few thousand
-/// units edge to edge and streams at ~100 Hz, so a real swipe moves tens of units per frame; this
-/// bound is generous for real motion and hard against a garbled coordinate flinging the cursor.
-#[cfg(feature = "mtraw_inject")]
-const MT_INJECT_MAX_STEP: i32 = 128;
+/// TPFRAME (B197) — per-frame delta clamp, carried verbatim from the retired `mtraw_inject` path
+/// (its reasoning: the TYPE2 sensor spans a few thousand units edge to edge and streams at ~100 Hz,
+/// so a real swipe moves tens of units per frame — flight 12's corpus moves 30 and 3). Hard against
+/// a garbled coordinate, and against a re-touch no lift frame announced (`unverified` on metal).
+const TP_MT_MAX_STEP: i32 = 128;
+/// TPFRAME — one `[tp] mt` witness per this many vendor frames: the first, then every 64th (a
+/// resting hand streams ~100 frames/s; the FTDI ring is 64 KiB drop-oldest).
+const TP_MT_WITNESS_EVERY: u32 = 64;
 
 /// EHCI-5 (REFUTED-HYPOTHESIS HISTORY — kept per the never-trash rule, exercised by
 /// `vendor_multitouch_selftest`, NO LONGER the live decode path): decode the FIRST finger of an
@@ -17821,7 +18015,7 @@ unsafe fn parser_selftest() {
     // TRACKPAD (B139): the id DISPATCHER, fed flight 11's own four captured reports. Runs on every
     // build for the same reason `vendor_multitouch_selftest` does — the routing decision is the
     // only part of the trackpad path QEMU can exercise at all, since QEMU has no Apple pad.
-    trackpad_dispatch_selftest(); crate::video::keymap::selftest(); crate::video::clipboard::selftest(); crate::video::termsel::selftest(); // TERMSEL — the terminal selection's fixture, AFTER APPCLIP's and on a line of its own for the reason APPCLIP gives below (a verdict another arc pins is not widened). It resolves each selection chord through the live table from a synthetic report pair, pushes the action through the REAL ring, and runs the shipped `clipboard::terminal_action` on it: `:: TERMSEL: … -> PASS ::`, scored by scripts/specs/x86-wc.spec. ⚠ FOLDED onto the existing statement; CODE FIRST (A10FIX). // APPCLIP (R61) — chained BESIDE `keymap::selftest` and deliberately not INSIDE it: KEYMAP’s verdict line is pinned field-by-field by `scripts/specs/x86-wc.spec` and must read exactly what it read before this arc, so the clipboard’s fields go on a line of their own. Same chain, same reason the line already carries — this is the x86 `wc` lane’s boot, and QEMU has no operator’s hands, so a fixture driving the RING is the only proof of delivery available off metal. It pushes `Event::Action` through `pal::push_event`, takes it back out of `pal::next_event`, runs the shipped `clipboard::terminal_action` on it and rebuilds the pasted line from the `Event::Key`s that come back — so `line_match=` is a round trip, not a restatement. AFTER `keymap::selftest` because the clipboard consumes the `Action` that fixture proves resolvable. ⚠ FOLDED onto the existing statement; CODE FIRST, then the prose (A10FIX). // KEYMAP (R60/R61) — the BINDING TABLE's resolver, chained here for the reason the line already carries: the DECISION is the only part of an input path QEMU can exercise at all, since QEMU has neither an Apple pad nor an operator's hands. This selftest chain is on the x86 `wc` lane's boot (`:: EHCI-HID: report-parser self-test:` is on every capture of it), so `:: KEYMAP: ... -> PASS ::` is scored by scripts/specs/x86-wc.spec. It resolves only — it arms no capture and requests nothing — so the lane behaves exactly as it did. ⚠ FOLDED onto the existing statement, never given a line of its own: this file is 18k lines and a line added anywhere in it moves every `panic::Location` below (B94, LEDGER P7); CODE FIRST, all of it, then the prose (A10FIX).
+    trackpad_dispatch_selftest(); tpframe_selftest(); crate::video::keymap::selftest(); crate::video::clipboard::selftest(); crate::video::termsel::selftest(); // TERMSEL — the terminal selection's fixture, AFTER APPCLIP's and on a line of its own for the reason APPCLIP gives below (a verdict another arc pins is not widened). It resolves each selection chord through the live table from a synthetic report pair, pushes the action through the REAL ring, and runs the shipped `clipboard::terminal_action` on it: `:: TERMSEL: … -> PASS ::`, scored by scripts/specs/x86-wc.spec. ⚠ FOLDED onto the existing statement; CODE FIRST (A10FIX). // APPCLIP (R61) — chained BESIDE `keymap::selftest` and deliberately not INSIDE it: KEYMAP’s verdict line is pinned field-by-field by `scripts/specs/x86-wc.spec` and must read exactly what it read before this arc, so the clipboard’s fields go on a line of their own. Same chain, same reason the line already carries — this is the x86 `wc` lane’s boot, and QEMU has no operator’s hands, so a fixture driving the RING is the only proof of delivery available off metal. It pushes `Event::Action` through `pal::push_event`, takes it back out of `pal::next_event`, runs the shipped `clipboard::terminal_action` on it and rebuilds the pasted line from the `Event::Key`s that come back — so `line_match=` is a round trip, not a restatement. AFTER `keymap::selftest` because the clipboard consumes the `Action` that fixture proves resolvable. ⚠ FOLDED onto the existing statement; CODE FIRST, then the prose (A10FIX). // KEYMAP (R60/R61) — the BINDING TABLE's resolver, chained here for the reason the line already carries: the DECISION is the only part of an input path QEMU can exercise at all, since QEMU has neither an Apple pad nor an operator's hands. This selftest chain is on the x86 `wc` lane's boot (`:: EHCI-HID: report-parser self-test:` is on every capture of it), so `:: KEYMAP: ... -> PASS ::` is scored by scripts/specs/x86-wc.spec. It resolves only — it arms no capture and requests nothing — so the lane behaves exactly as it did. ⚠ FOLDED onto the existing statement, never given a line of its own: this file is 18k lines and a line added anywhere in it moves every `panic::Location` below (B94, LEDGER P7); CODE FIRST, all of it, then the prose (A10FIX).
     // MT-INVESTIGATION (IVY, `mtraw` only): the ONLY QEMU-provable witness for the raw TYPE2
     // decoder — QEMU has no Wellspring pad, so a synthetic frame stands in. Compiled out (and so
     // silent) on a default build.

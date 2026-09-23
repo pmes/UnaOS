@@ -50,7 +50,6 @@ UNAOS_KEPLER_CE            TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_KEPLER_FIFO          TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_KEPLER_TAKEOVER      TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_MTRAW                TODO  seeded 2026-09-06; no Pi-live cfg site
-UNAOS_MTRAW_INJECT         TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_NET4                 TODO  seeded 2026-09-06; 50 Pi-live cfg site(s)
 UNAOS_NOASPM               TODO  seeded 2026-09-06; no Pi-live cfg site
 UNAOS_NOEHCIHID            TODO  seeded 2026-09-06; 2 Pi-live cfg site(s)
