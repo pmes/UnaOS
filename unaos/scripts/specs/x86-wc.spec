@@ -256,6 +256,68 @@ FORBID :: VUGPERF: .* :: FAIL ::
 # --- carries ZERO `[wc-x] move-vacate` lines. A REQUIRE for it here would red every run of this
 # --- gate forever. It is a PENDING in `x86-witness.spec`, where the boot that prints it lives.
 
+# --- SCRSHOT-DESKTOP (R60, 2026-09-22; rmbp-ledger B164) — WHERE A SCREENSHOT LANDS ------------
+# --- THE HOLE THIS CLOSES IS THE ONE THE SPECPINS BLOCK ABOVE IS ABOUT. `prtscr::dir_fixture` has
+# --- run on EVERY x86 and arm boot since 2026-09-13 and NO SPEC HAS EVER READ IT: two PASS lines on
+# --- every capture in `~/unaos-bench/scratch/rmbp-0915/*-logs/`, scored by nobody. It is ungated —
+# --- deliberately, because the no-session refusal is what every board does today and a fixture
+# --- behind a knob would not have measured the ordinary case once — so it is also the fixture with
+# --- the most to lose from going silent, and silence is exactly what a FORBID cannot catch.
+# ---
+# --- KNOBS: NONE OF THEM. `dir_fixture` is compiled into every build and called from
+# --- `prtscr::service`, so these two rules hold on the plain `./arroyo test` lane as well as this
+# --- file's. They are HERE rather than in x86-default.spec because this is the file with a RUN-BY
+# --- line a gate command actually executes, and a pin nobody replays is the landmine the CONTRACT
+# --- block below names. MEASURED on this seat's SCRSHOT-DESKTOP fold capture:
+# --- `UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_SMC=1 UNAOS_LOGIN=1 UNAOS_QEMU_FULL=1
+# --- ./arroyo test 240` — a SUPERSET of the RUN-BY line below, and the two extra knobs cannot move
+# --- either rule: `UNAOS_SMC` is MENUBATT's and touches no PRTSCR line, and `UNAOS_LOGIN` moves
+# --- arm B's `live=` token between exactly the two values the alternation already admits.
+# ---
+# --- ARM A — THE DESTINATION, AND IT IS PINNED LITERALLY BECAUSE IT IS THE RULING. R60: *"mac saves
+# --- to desktop, correct? we should too, on this pioneer crispy theme anyway."* `dir=` is the
+# --- destination as the USER says it and `HOME/UNA/DESKTOP` is what the MEDIUM spells (`format_83`
+# --- upcases what it stores); both are literal here, and so is `theme=crispy`, because a `.*` in
+# --- any of the three would let the folder move without reddening the one rule that exists to stop
+# --- it. `legal83=true` is the necessary condition `format_83` (`fs/fat.rs:325`) imposes on the
+# --- theme's word — one component, no dot, base 1..=8 — restated in `prtscr` because that function
+# --- is private to `fs/fat.rs` and the SCRSHOT-DESKTOP arc does not touch that file. The
+# --- parenthetical between them is `.*`: it is prose about the 8.3 rule, it carries no claim, and
+# --- pinning prose is how a spec ends up edited for a comma.
+# --- GO-RED, MEASURED on this gate and not reasoned — point `video::theme::CAPTURE_DIR` at the
+# --- pre-R60 `"Screenshots"`, which is the name `format_83` refuses, and the same capture reads
+# --- `dir=/home/una/Screenshots … -> HOME/UNA/SCREENSHOTS (want HOME/UNA/DESKTOP; "Screenshots" is
+# --- 11 chars …) legal83=false -> FAIL ::`. BOTH halves move: the destination is wrong AND the name
+# --- could never have been created. That direction is deterministic on any host at any speed — the
+# --- arm is volume-free and its want is a literal, so nothing in it depends on a disk or a clock.
+REQUIRE :: PRTSCR-DIR-FIX: theme=crispy dir=/home/una/Desktop home=/home/una -> HOME/UNA/DESKTOP .* legal83=true -> PASS ::
+# --- ARM B — R54 SURVIVED THE MOVE, AND THAT IS THE HALF A DESTINATION CHANGE COULD HAVE BROKEN.
+# --- "No session, no capture" is Peter's 2026-09-13 ruling (*"do not hack screenshots to make it
+# --- work right before multi-user is in"*) and R60 changed WHICH folder, never WHETHER. Three
+# --- fields are the claim and are literal: `reason=no-session` (the token), `plan_none=true` (the
+# --- pure assertion) and `bytes=0`. `live=` is an alternation because the two tokens are two
+# --- different FACTS about the image and both are honest — `no-login-built` is a build with no user
+# --- store (`UNAOS_LOGIN` off, the default), `no-session` is one that has the store and nobody
+# --- logged in (this file's measured lane arms `UNAOS_LOGIN=1`). The census is `\d+->\d+` and not
+# --- `0->0`: what the arm asserts is that the two are EQUAL, which the fixture folds into its own
+# --- PASS/FAIL, and a future boot that legitimately captured before this pass must not red here.
+# --- `session-open-live-leg-skipped` is deliberately NOT admitted: it is the token for a board that
+# --- HAS a session, no lane prints it today, and the day one does this rule should be looked at
+# --- rather than pass silently through an alternation written before that boot existed.
+REQUIRE :: PRTSCR-DIR-FIX: no session -> REFUSED reason=no-session plan_none=true live=(no-session|no-login-built) captures \d+->\d+ bytes=0 .* -> PASS ::
+FORBID :: PRTSCR-DIR-FIX: .* -> FAIL ::
+# --- AND THE LINE THAT IS NOT PINNED HERE, WITH THE MEASUREMENT THAT SAYS WHY. The LIVE witness
+# --- `:: PRTSCR-DIR: theme=crispy user=… dir=/home/<name>/Desktop … -> RESOLVED ::` needs a SESSION
+# --- and a WRITABLE VOLUME, and this lane has neither: `UNAOS_LOGIN=1 ./arroyo test` builds the
+# --- store and nobody logs in (the `loginst` fixtures open a session and CLOSE it again —
+# --- `fs/users.rs:918` puts the boot back where it found it), and the default medium is read-only
+# --- to the PRTSCR-VOL ladder's rung 1 with no USB FAT attached for rung 2. A REQUIRE for it would
+# --- red every run of this gate forever — the BOOTFAILS rule this file states thirty lines up.
+# --- PENDING, for the boot that can print it: `UNAOS_PRTSCRST=1 ./arroyo test-fat sf` once
+# --- LOGINFLOW holds a session open, and metal flight 12 under R59's read-write boot volume, where
+# --- flight 11 could only print `:: PRTSCR-VOL: rung=none rung1=read-only rung2=absent -> NO TARGET
+# --- ::` against a real ⌘⇧3 press at 798 s.
+
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
 # A PINNED LINE IN THIS FILE IS CHANGED TOGETHER WITH THE KERNEL LINE IT PINS, IN THE SAME COMMIT —
 # re-pinned to the new wording (naming the arc that changed it), or dropped with the reason stated.
