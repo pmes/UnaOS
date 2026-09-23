@@ -8,6 +8,73 @@ QEMU behavior. Newest sitting first.
 > in [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) (R19; rmbp-ledger B10). This file stays the
 > per-sitting narrative; the register is the verdict table.**
 
+## PRE-REGISTERED — KVBLANK3 (rmbp, the GPU line under R53), cut 2026-09-23
+
+**NOT FLOWN.** Written before the boot and not edited afterwards. Branch `exec-rmbp-kvblank3`, parent
+`94e90eae`. Knob `UNAOS_KEPLER_VBLANK=1` (no new knob). Ledger row **B192**; the reading it answers is
+§FLIGHT 12 READING below. **The precondition from KVBLANK2 stands:** the ladder and the period are
+driven by `scanout_beam()`, i.e. by a compositor that is presenting, so drive the desktop for at
+least ~20 s after it is up.
+
+### What flight 13 must print — the interrupt path
+
+**Rung 1, at `kepler::init` (writes the mask only; the enable is held at 0, so nothing can be delivered):**
+
+```
+:: kepler: vblank pmc-arm bit=26 reg=INTR_MASK_HOST en_host=00000000 mask_entry=<w> mask_armed=<w with 04000000> intr_entry=<w> intr_or=<w> line_or=00000000 pdisplay_seen=<n>/<m> window_ms=50 deliver=none reason=source-probe-only restored=<mask_entry> verdict=clean ::
+```
+*Read:* `mask_armed` carries `04000000`, so the per-source mask exists and latched on the GK107
+(flight 12's `0x140` write read back 0). `pdisplay_seen>0` means PDISPLAY already raises its PMC
+input with the per-head enable clear, which flight 12's census predicts (`host_summary=01000000`).
+`pdisplay_seen=0/…` is also a result: the head enable, not the PMC mask, is what gates it.
+*Control:* `line_or=00000000`. A non-zero value means the line asserted with `INTR_ENABLE_HOST` at 0,
+and then this doc's reading of `0x140` is wrong. *Red:* `verdict=DIRTY`.
+
+**R3, the vector (after the census and R2; now ~4.5 s of scanout, counted in hardware vblanks):**
+
+```
+:: kepler: vblank-intr vector armed bdf=1:0.0 vector=0x44 wire=1 pmc_entry=00000000 pmc_bit=26 en_entry=00000000 head=0 window_vblanks=60 storm_cap=4096 cmd=<bit 2 set, e.g. 0006/0406> pmc_en_armed=00000001 pmc_mask_entry=<w> pmc_mask_armed=04000000 ::
+:: kepler: vblank-intr vector close head=0 irq=<n> vbl_delta=<60..63> rearms=<n> wire=1 vector=0x44 storm=0 pmc_restored=00000000 pmc_readback=00000000 en_restored=00000000 en_readback=00000000 verdict=clean mode=<irq|poll> deliver=<msi|none> reason=<none|…> intr_or=<w> line_or=<w> mask_restored=<w> mask_readback=<w> ::
+```
+**A WORKING INTERRUPT PATH PRINTS `irq>0 … deliver=msi reason=none`**, with `intr_or` carrying
+`04000000`, `line_or=00000001` and `mode=irq`. The ratio `irq/vbl_delta` is the delivery rate. A
+reading of `irq=1` (or a few) against `vbl_delta≈60` says the function sent a message and did not
+send again. The per-message MSI re-arm is `NOT-IN-TREE`, so that reading is a result and not a
+failure. `vbl_delta` is now hardware vblanks, so the window is ~1 s. Flight 12's "60" took 2016 ms.
+**The refusals, each naming where the signal stopped** (the classifier takes the first broken link):
+`no-bus-master` (cmd bit 2 clear, which `kepler.rs:1310` should make impossible) ·
+`pmc-enable-not-latched` (`pmc_en_armed` bit 0 did not read back) · `pmc-mask-not-latched` (bit 26
+did not read back in `0x640`) · `pdisplay-not-raised` (the enable and the mask are good, but
+PDISPLAY never set `INTR_0` bit 26 with the per-head VBLANK enable held; the suspects are the head
+enable, and `DISPATCH`, which flight 12 read as `FB333FC7` and this arc does not steer) ·
+`line-not-asserted` (PMC saw the source but the output line stayed low; `pmc.rst:319-324` and `:393-394` put the
+PDAEMON redirection circuitry between them) · `line-asserted-not-delivered` (the line rose and no
+ISR ran: the MSI message itself). `storm=1` still means a level line the disarm did not drop.
+
+### What flight 13 must print — the period
+
+```
+:: kepler: vblank head=0 count=<n> period_us=<16600..16700> jitter_us=<under 2000> raster_at_irq=<l> vt=1852 mode=<poll|irq> vbwaits=<n> vbwait_us=<n> vbgaveup=<n> vbrecheck=<n> seen=<n'> tight=<t> period_src=tight ::
+```
+**A WORKING PERIOD READS `period_us≈16667 jitter_us<2000 period_src=tight`.** BEAMX86's own
+figure on flight 12 was 16.60 ms (60.2 Hz), so 16600-16700 is the window. `count=` advances about
+60 per second of wall time. `seen=` is flight 12's old count and should run near 26/s on the same
+desktop, so `seen/count` is about 0.4, and that ratio is the miss rate the old line hid.
+**Falsifiers:** `count` equal to `seen`, with `period_us` still near 38 000, means the field steps
+by one per sample. Then `HEAD_STAT.VERT[31:16]` is NOT a vblank count on this part, and rnndb's
+`:647` reading is refuted on the metal. `period_src=loose` with `tight=0` means no step landed
+inside a hold. The period is then good only to about (a present gap)/count; after ~400 s that is
+under 0.1 us, so the number stands but the jitter is not measured. `jitter_us` in the thousands with
+`period_src=tight` means the edges are bracketed but the TSC differs between cores (the samples come
+from whichever core presents), or the raster really is unsteady.
+
+### What only the glass proves
+
+That the GK107 raises PDISPLAY into PMC, that its MSI reaches vector `0x44`, and that the count
+field steps 60 times a second. QEMU q35 has no Kepler (`:: kepler: no-device ::`). The q35 wire proves
+the vector allocation, the verdict function over flight 12's words, and the count/period arithmetic
+over a simulated timer sampled the way flight 12 sampled, and nothing more.
+
 ## FLIGHT 12 READING — KVBLANK2 (B179) scored, and KVBLANK3's READ (rmbp-ledger B192), 2026-09-23
 
 Capture: `f12-boot1.log` (bench scratch, 6899 lines; record `docs/dev/evidence/rmbp-0915/flight12/FLIGHT12.md`
