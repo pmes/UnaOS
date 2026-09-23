@@ -258,8 +258,9 @@ REQUIRE \[users\] home=/home/una (created|exists) volume=[0-9a-f]{8}
 # The only emitter is `users::screen_open_at_ignition` (`fs/users.rs:1089`), and its only callers are
 # the Tegra desk cascade (`main.rs:9144`, inside `tegra_desk_cascade`, cfg aarch64 + `deskcascade`)
 # and the login fixture's IGNITION leg (`video/login.rs:852` for HELD, `:856` for OPEN, inside
-# `ignition_leg`, cfg `loginst`). The x86 boot opens the screen through `screen_open_once` at
-# `main.rs:6380` (`x86_render_service`), which prints no `[login] ignition` line. So on this lane both
+# `ignition_leg`, cfg `loginst`). The x86 boot opened the screen through `screen_open_once` at
+# `main.rs:6380` (`x86_render_service`), which prints no `[login] ignition` line — and SINCE LOGIN13 M1
+# (R63, B189) it opens nothing: that site calls `users::boot_session`, whose line §10 pins. So on this lane both
 # matching lines are the fixture's two arms — measured at lines 1260 (HELD) and 1261 (OPEN) of
 # `~/unaos-bench/scratch/rmbp-0915/specpins2-logs/run3-login-serial.log`, directly above
 # `:: LOGIN-IGNITION:` at 1263 — and a green here says the storage pass reached the battery, which is
@@ -296,7 +297,11 @@ REQUIRE \[login\] ignition desktop_up=(true|false) console_routed=(true|false) -
 # is the one line that says the screen got a REAL `wm` row, and no spec read it. §7 pins what a person
 # does at the screen; this pins that there was a screen to do it at.
 #
-# WHO PRINTS IT ON THIS LANE, measured, because it is NOT the boot. The x86 boot's own open is
+# RE-READ BY LOGIN13 M1 (R63, rmbp-ledger B189): THE BOOT'S OWN OPEN NO LONGER EXISTS ON ANY x86 IMAGE —
+# `main.rs:6380` now calls `users::boot_session(desktop)`, which opens nothing (§10). The paragraph below
+# is the pre-R63 measurement; its conclusion (every windowed line on this lane is the loginst battery's)
+# holds a fortiori, and on the METAL the first windowed line is now the root session's Log Out.
+# WHO PRINTS IT ON THIS LANE, measured, because it is NOT the boot. The x86 boot's own open WAS
 # `screen_open_once` at `main.rs:6380`, gated `if desktop` where `desktop = desktop_owns_backdrop()` =
 # `desktop_uefi::is_active()` — and `desktop_uefi::activate`'s only caller is the Kepler takeover
 # (`drivers/gpu/kepler_display.rs:511`). QEMU has no Kepler, so that call never runs here. Every
@@ -316,3 +321,25 @@ REQUIRE \[login\] screen open window=\d+ box=\d+x\d+ at \(\d+,\d+\)
 # can draw it. `window=no (fixture — headless form)` is NOT forbidden: the fixtures ask for it.
 FORBID \[login\] screen open window=no \(no surface yet
 FORBID \[login\] screen open window=no \(create refused
+
+# ── 10. R63 — THE BOOT IS ROOT, NOT A LOGIN SCREEN (LOGIN13, rmbp-ledger B189), TAIL-APPENDED ─────
+# Peter, flight 12 (RULINGS R63): *"for boot 13 lets boot into root like we have been i will add my user
+# and log out then log into the user account"*. Flight 12's screen opened at boot as a WINDOW over a live
+# desktop (`[login] screen open window=2 box=1330x764 at (775,345)`) and never had the keyboard.
+#
+# M1 — THE BOOT'S OWN LINE. Printed by `main.rs`'s x86 site (`x86_render_service`, the one that used to
+# open the screen) through `users::boot_session`, and by NOTHING ELSE — the fixture below drives the
+# decision (`users::boot_ignition`) without printing it, so this REQUIRE is the BOOT's, not the fixture's
+# (the trap SPECPINS2 measured in §8/§9). On QEMU it reads `desktop=false` (no Kepler takeover); on the
+# metal `desktop=true`. GREEN CERTIFIES: the boot reached the render service's ignition site and the
+# screen was DOWN when it left it. The FORBID is the defect's own reading.
+REQUIRE \[login\] boot session=root desktop=(true|false) screen=closed
+FORBID \[login\] boot session=\S+ desktop=\S+ screen=open
+# The fixture: `root_at_boot` (no user session, root not closed, at the head of the loginst battery),
+# the decision driven with `desktop=true` — the metal's arm, which no QEMU boot presents — and
+# `desktop=false`, the screen down after each. GO-RED (LOGIN13 M1, run on this gate): the pre-R63
+# statement put back inside `boot_ignition` (`if desktop { screen_open_once(); }`) reads
+# `desk_screen=open … -> FAIL —`. GREEN CERTIFIES: the seam that replaced the boot's open cannot open
+# the screen on a desktop boot, and `screen_built=true` says the screen was compiled so the claim bites.
+REQUIRE :: LOGIN-BOOTROOT: session=root\(uid0\) root_at_boot=true desk_screen=closed nodesk_screen=closed still_root=true screen_built=true -> PASS ::
+FORBID :: LOGIN-BOOTROOT: .* -> FAIL

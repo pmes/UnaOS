@@ -5339,7 +5339,7 @@ fn render_pass<W: RenderWait>(w: &mut W) {
     #[cfg(not(feature = "desktop_firmware"))]
     let desktop = false;
 
-    let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen); #[cfg(feature = "login")] if desktop { unaos_kernel::fs::users::screen_open_once(); } // LOGIN M3 — the desktop boots to the login screen. ⚠ LINE-NEUTRAL append.
+    let mut pal = unaos_kernel::pal::TargetPal::new(&mut screen); #[cfg(feature = "login")] unaos_kernel::fs::users::boot_session(desktop); // LOGIN13 M1 (R63, rmbp-ledger B189) — the x86 site's sibling: boot to the ROOT desktop, never to the login screen (see `fs::users::boot_session`). ⚠ LINE-NEUTRAL fold.
     let mut console = unaos_kernel::console::Console::new();
 
     // SHELLWIN-PI — the live shell's OWN compositor window. Flat locals for the service's life, for
@@ -6377,7 +6377,7 @@ fn x86_render_service(cpu: usize) {
     // the first present — and the live text shell is kept off the glass (it survives in serial and
     // `TERM_RING` for the Console app, per the facade law). Off the crispy desktop (a pre-takeover
     // boot, a `wc`-off x86 build) the shell is still the desktop and draws exactly as it always did.
-    let desktop = desktop_owns_backdrop(); #[cfg(feature = "login")] if desktop { unaos_kernel::fs::users::screen_open_once(); } // LOGIN M3 — the desktop boots to the login screen. ⚠ LINE-NEUTRAL append.
+    let desktop = desktop_owns_backdrop(); #[cfg(feature = "login")] unaos_kernel::fs::users::boot_session(desktop); // LOGIN13 M1 (R63, rmbp-ledger B189) — the machine boots to the ROOT desktop: this site used to OPEN the login screen (LOGIN M3), and flight 12 shows what that did (`[login] screen open window=2` over a live desktop, no keyboard). `boot_session` opens nothing and says so on the wire; the screen opens at the root session's Log Out. ⚠ LINE-NEUTRAL fold.
     if desktop {
         screen.paint_desktop_scene();
     }

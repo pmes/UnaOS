@@ -755,7 +755,7 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
         let mut s = SESSION_LOCAL.lock();
         s.0[..name.len()].copy_from_slice(name);
         s.1 = name.len() as u8;
-        s.2 = id;
+        s.2 = id; ROOT_LIVE.store(false, core::sync::atomic::Ordering::Release); // R63 (LOGIN13): a user session SUPERSEDES the root session — root is never re-entered this boot (there is no root row in the store; root is reached by booting). See `root_session`.
     }
     let mut nb = [0u8; NAME_MAX];
     nb[..name.len()].copy_from_slice(name);
@@ -1128,7 +1128,7 @@ pub fn service() {
         Ok(()) => {
             SERVICED.store(true, Ordering::Relaxed);
             #[cfg(feature = "loginst")]
-            { login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
+            { login_bootroot_fixture(); login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1705,4 +1705,104 @@ pub fn login_rand_fixture() {
 /// (`main.rs::virt_users_pass`). One relaxed load; tail append, so no `Location` above moves.
 pub fn serviced() -> bool {
     SERVICED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// =========================================================================================
+// LOGIN13 (rmbp-ledger B189, R63) — THE ROOT SESSION, AND A BOOT THAT OPENS NO SCREEN
+// =========================================================================================
+//
+// R63 (Peter, flight 12 on the glass): *"for boot 13 lets boot into root like we have been i will add
+// my user and log out then log into the user account"*. Flight 12 booted a `login` image and the screen
+// opened at 8.4 s as a WINDOW over the live desktop (`[login] screen open window=2 box=1330x764 at
+// (775,345)`) and never had the keyboard. R63's shape: the machine boots to the ROOT desktop as every
+// flight before it did, the person adds a user from that session (`adduser`), and Log Out closes the
+// root session and puts the screen up over nothing.
+//
+// WHAT "ROOT" IS IN THIS CODE, named rather than invented. Before this arc the boot's session had no
+// name: `SESSION_LOCAL.1 == 0` here, `SESSION_USER == 0` on x86 (`arch/x86_64/syscall.rs`, "0 = no
+// session"), `PrincipalRecord::NONE` on aarch64 — the "anonymous / pre-login world" the SO37 comments
+// describe. Every program launched in it is stamped uid 0, which the ACL treats as anonymous (no
+// by-user admission: `owned_user_ok`'s `u != 0` guard). R63's "root" IS that state; this arc gives it a
+// name and ONE bit of lifetime — [`ROOT_LIVE`] — and changes nothing about what uid 0 may open. It is
+// not a row in the store and has no credential: root is reached by BOOTING, and once it is closed (its
+// Log Out) or superseded (a user logged in from it) it does not come back until the next boot.
+
+/// R63 — is the root session still the machine's session? True from boot; cleared by the root
+/// session's Log Out ([`logout`]) and by a user login from it ([`login`]). Never set again this boot.
+static ROOT_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// R63 — the caller is the ROOT SESSION: no user session is open AND the root session has not been
+/// closed or superseded since boot. This is how `adduser` knows its caller is root: a shell verb is a
+/// kernel HOST verb with no per-caller principal of its own (`shell.rs` dispatches it on the render
+/// task), so "the caller" is whoever holds the machine's one session, and this is that session's name.
+pub fn root_session() -> bool {
+    ROOT_LIVE.load(core::sync::atomic::Ordering::Acquire) && SESSION_LOCAL.lock().1 == 0
+}
+
+/// Is the login screen up (the form is `Open`)? `false` where no screen is built (the crystal's gate:
+/// x86 `wc`, aarch64 `desktop_firmware`) — the same dispatch [`screen_key`] uses.
+pub fn screen_up() -> bool {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        return crate::video::crystal::login::is_open();
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    false
+}
+
+/// LOGIN13 M1 — **THE BOOT'S SCREEN DECISION, and under R63 the whole of it is "no".** This is the
+/// statement `main.rs`'s two boot-time ignitions used to be (`if desktop { screen_open_once(); }`, the
+/// x86 `x86_render_service` and the Pi `render_service`), moved here so a fixture can drive it with the
+/// `desktop = true` a QEMU boot never presents (no Kepler takeover, so `desktop_owns_backdrop()` is
+/// false on every `./arroyo test`). It opens nothing. GO-RED: put the old statement back in this body
+/// (`if desktop { screen_open_once(); }`) and `:: LOGIN-BOOTROOT:` reads `desk_screen=open -> FAIL —`.
+///
+/// The SO43 seam ([`screen_open_at_ignition`]) is NOT this seam and is untouched: it is the Tegra desk
+/// cascade's ignition (`main.rs`, `tegra_desk_cascade`) and the ARMUSERS virt pass's, and R63 is a
+/// ruling about boot 13 on this bench — widening it to the Orin is a suggestion for Peter, not a
+/// reading of his words.
+pub fn boot_ignition(desktop: bool) {
+    let _ = desktop;
+}
+
+/// LOGIN13 M1 — the boot's session, on the wire, from the two call sites that used to open the screen.
+/// `desktop=` is the caller's `desktop_owns_backdrop()` (true on the metal after the Kepler takeover,
+/// false on QEMU); `screen=` is READ BACK after [`boot_ignition`] ran, never assumed from it.
+pub fn boot_session(desktop: bool) {
+    boot_ignition(desktop);
+    serial_println!(
+        "[login] boot session=root desktop={} screen={} (R63: the machine boots to the root desktop; the login screen opens at the root session's Log Out, never at boot)",
+        desktop,
+        if screen_up() { "open" } else { "closed" }
+    );
+}
+
+/// LOGIN-BOOTROOT (`loginst`, LOGIN13 M1) — the boot opens no screen and the session is root. Runs FIRST
+/// in the `loginst` chain, before any login, because its first question is what the boot left behind:
+///  * `root_at_boot` — [`root_session`] at the head of the battery: no user session, root not closed.
+///  * `desk_screen` / `nodesk_screen` — [`boot_ignition`] driven with BOTH values of `desktop`; the screen
+///    must be down after each. `desktop=true` is the metal's arm (flight 12's), which QEMU cannot reach
+///    through the boot itself.
+///  * `still_root` — the ignition left the session alone.
+/// The boot's OWN line (`[login] boot session=root … screen=closed`) is printed by `main.rs`, never
+/// here, so a spec pin on it cannot be satisfied by this fixture (SPECPINS2's lesson, B184).
+#[cfg(feature = "loginst")]
+pub fn login_bootroot_fixture() {
+    let root_at_boot = root_session();
+    let before = screen_up();
+    boot_ignition(true);
+    let desk_open = screen_up();
+    boot_ignition(false);
+    let nodesk_open = screen_up();
+    let still_root = root_session();
+    let ok = root_at_boot && !before && !desk_open && !nodesk_open && still_root;
+    serial_println!(
+        ":: LOGIN-BOOTROOT: session=root(uid0) root_at_boot={} desk_screen={} nodesk_screen={} still_root={} screen_built={} -> {} ::",
+        root_at_boot,
+        if desk_open { "open" } else { "closed" },
+        if nodesk_open { "open" } else { "closed" },
+        still_root,
+        cfg!(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))),
+        if ok { "PASS" } else { "FAIL —" }
+    );
 }
