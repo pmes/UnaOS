@@ -528,3 +528,57 @@ const _: () = {
     assert!(GLOSS_FALLOFF_Q16 <= Q16_ONE);
     assert!(GLOSS_FALLOFF_Q16 >= Q16_ONE / 100);
 };
+
+// ══════════════ SCRSHOT-DESKTOP — WHERE A SCREEN CAPTURE LANDS (R60, 2026-09-22) ══════════════
+//
+// Appended at the file's TAIL, and that is not tidiness: KEYMAP is adding its bindings table to
+// this same file in the same fold window, so a one-sided append is the only shape whose fold has
+// no hand-merge in it. (The colour table above is a lifted `const` set; an insertion into its
+// middle would also move every line the ledger rows cite positionally.)
+//
+// **WHY THE DESTINATION IS A PROPERTY OF THE THEME AND NOT OF `video/prtscr.rs`.**
+// Peter, R60: *"is screenshot working? mac saves to desktop, correct? we should too, on this
+// pioneer crispy theme anyway. we will be implementing a windows-esque them at some point so
+// key-bindings shouldn't be hard coded."* The ruling makes one argument about two things — the
+// CHORD and the DESTINATION are both facts about the desktop the user is looking at, not about the
+// capture mechanism. A Mac saves to `~/Desktop`; a Windows-shaped theme saves to
+// `%USERPROFILE%\Pictures\Screenshots`; the code that reads pixels and writes a PNG is the same on
+// both and must not know which. So `prtscr` asks THIS table where the file goes, exactly as
+// `wm.rs` asks it what colour a title bar is, and the second theme is one more `const` here.
+
+/// SCRSHOT-DESKTOP (R60) — **the folder, inside the logged-in user's home, that a screen capture
+/// lands in under the CRISPY theme.** The resolved destination is `/home/<name>/<CAPTURE_DIR>`.
+///
+/// `Desktop`, because that is where a Mac puts a screenshot and CRISPY is the Mac-shaped theme.
+/// This supersedes the 2026-09-13 `Pictures/Screenshots` destination (PRTSCR-HOME), which was a
+/// correct answer to a different question — *whose* folder — and never had a ruling on *which*.
+///
+/// ## Two constraints this value must satisfy, and they are not the same constraint
+///
+///  * **It must be a legal 8.3 SHORT NAME**, because `fs/fat.rs:118` writes 8.3 only and
+///    `format_83` (`fs/fat.rs:325`) is the decider: base `1..=8` characters, no dot, every byte a
+///    legal short-name byte. `Desktop` is SEVEN characters and clears that with a character to
+///    spare — which is the whole reason this move needs no alias table entry where
+///    `Screenshots` (eleven characters) needed `SCRSHOTS`. It is NOT const-asserted here on
+///    purpose: the go-red for the capture-directory fixture is to point this constant at a name
+///    `format_83` refuses, and a compile error is not a red RUN. `prtscr::dir_fixture` measures
+///    it instead, on the wire, every boot.
+///  * **It must be ONE component.** `prtscr::ensure_capture_dir` walks the home's components and
+///    then appends this as a single leaf; a value with a `/` in it would be created as one
+///    directory whose name contains a slash, which `format_83` also refuses — loudly, on the same
+///    fixture line, rather than quietly.
+///
+/// What the operator sees on the medium is `DESKTOP`, uppercase, because `format_83` upcases every
+/// byte it stores. That is not a presentation choice made anywhere in the kernel; it is what FAT
+/// short names are. The lookup is case-insensitive AND matches a VFAT long name (`DirEntry::eq_name`,
+/// `fs/fat.rs:190`), so a stick that already carries a `Desktop` folder made on a Mac is ADOPTED
+/// with its own spelling and nothing new is written.
+pub const CAPTURE_DIR: &str = "Desktop";
+
+/// SCRSHOT-DESKTOP (R60) — the theme's own name, for the witness lines that report a themed
+/// decision. One word, lower case, so `theme=crispy` reads the same in a log and in a spec pin.
+///
+/// It exists because a destination with no theme beside it on the wire is unreadable the day the
+/// second theme lands: `dir=/home/una/Desktop` alone cannot be told from a Windows-shaped theme
+/// that happens to agree. Every line that prints [`CAPTURE_DIR`]'s consequence prints this first.
+pub const NAME: &str = "crispy";
