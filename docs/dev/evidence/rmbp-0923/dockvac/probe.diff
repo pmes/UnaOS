@@ -1,0 +1,37 @@
+diff --git a/unaos/crates/kernel/src/video/dock.rs b/unaos/crates/kernel/src/video/dock.rs
+index 9402b7f6..55badc25 100644
+--- a/unaos/crates/kernel/src/video/dock.rs
++++ b/unaos/crates/kernel/src/video/dock.rs
+@@ -1361,6 +1361,7 @@ pub fn selftest() {
+     // erasing what it vacated would still be claiming — and still be showing — the wide rect. This is
+     // the defect the leg was written for, found by review rather than by the panel.
+     let rect_before = SLOT.packed();
++    wm::DOCKVAC_PROBE_UNTIL.store(crate::arch::ms() + 80, Ordering::Relaxed); serial_println!(":: DOCKVAC-PROBE: every composite declines for 80 ms from ms={} (COMP_GATE held, as under a stalled holder) ::", crate::arch::ms());
+     for &i in w.iter() {
+         wm::close(i);
+     }
+diff --git a/unaos/crates/kernel/src/video/wm.rs b/unaos/crates/kernel/src/video/wm.rs
+index 1ef83336..4fdc69dd 100644
+--- a/unaos/crates/kernel/src/video/wm.rs
++++ b/unaos/crates/kernel/src/video/wm.rs
+@@ -4922,9 +4922,9 @@ pub fn composite() { if let Some(term) = super::panel_refuse_term() { super::not
+             }
+         }
+         if !stole
+-            && COMP_GATE
++            && (crate::arch::ms() < DOCKVAC_PROBE_UNTIL.load(Relaxed) || COMP_GATE
+                 .compare_exchange(false, true, AcqRel, Relaxed)
+-                .is_err()
++                .is_err())
+         {
+             // DECLINED. This pass composites nothing and — crucially — CLEARS NOTHING: it never
+             // reached the table snapshot, so every `damaged` flag it would have consumed is still
+@@ -10238,7 +10238,7 @@ fn comp_phase_name(phase: u32) -> &'static str {
+ /// WCSER — a pass was declined and its damage is still on the table. Cleared by the holder's re-run
+ /// loop; see `composite` for the lost-wakeup close.
+ #[cfg(target_arch = "x86_64")]
+-static COMP_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
++static COMP_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false); pub static DOCKVAC_PROBE_UNTIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); // DOCKVAC-PROBE (scratch)
+ 
+ /// WCSER — how many extra rounds one UNMASKED gate holder will run for decliners before returning.
+ ///
