@@ -1512,7 +1512,7 @@ PENDING \[wc-x\] move-vacate .* painted=true .* -> PASS
 # --- MEASURED ON TWO CAPTURES, both replayed with this whole file (the verdict tables are in
 # --- docs/dev/evidence/rmbp-0915/metalpins/):
 # ---   flight 12  image 4, hw-rmbp@6d8d3d2d, `f12-boot1.log` (6899 lines) — every REQUIRE/COUNT here
-# ---              GREEN; every FORBID here green.
+# ---              GREEN; the FORBIDs here green except the one boot-mouse row, which is red ON PURPOSE.
 # ---   flight 11  image 3, hw-rmbp@56bbe53b, `f11.log` (5597 lines) — the go-red capture.
 # --- TWO KINDS OF GO-RED, and the row says which. BEHAVIOUR: both images print the family and flight 11
 # --- took the failing arm (pci-scan 1315 ms, HOLD-EXPIRED, DMG-REFUSE NOT RUN, HDA-TONE FAIL, FAT
@@ -1645,6 +1645,28 @@ REQUIRE :: HDA-TONE: .* -> PASS ::
 # --- then 38241 on a 60 Hz panel) are NOT pinned: they are the open finding, not a property.
 REQUIRE :: kepler: vblank selftest arm=wait sim=timer .* :: PASS ::
 REQUIRE :: kepler: vblank selftest arm=wait sim=stuck .* :: GO-RED-OK ::
+#
+# --- THE NEGATIVE PINS THE FLIGHTS TAUGHT. `GATE STOLEN` and `REHOMED the render role` are already
+# --- FORBIDden above (SPECPINS, :1455/:1456), 0 hits on both flights; not repeated, a second copy
+# --- would double-count one fault. HOLD-EXPIRED and `reason=opt-out` are with their rows above.
+# --- `[serial] dropped` — the conservation law's announcement (serial_ring.rs:896). ON THIS MACHINE IT
+# --- CANNOT FIRE TODAY: the rMBP has no 16550 (`SERWIT-1: … [uart16550=absent carrier=ftdi-mirror …]`
+# --- on both captures) and the staging ring stays inert when the UART is absent
+# --- (arch/x86_64/serial.rs:30-41). It is kept as asked, and the metal-reachable form of the same law
+# --- is pinned beside it: the FTDI tap's own drop count, `:: SERWIT-2 tap ftdi: … dropped=0 …`, which
+# --- prints on both flights. Both 0 hits on both flights; go-red by injection/mutation.
+FORBID \[serial\] dropped \d+ lines
+FORBID :: SERWIT-2 tap \w+: .* dropped=[1-9]
+# --- THE TRACKPAD, AND THIS ROW IS RED ON FLIGHT 12 ON PURPOSE. `:: EHCI-HID: [1] STOP-NOTE interrupt
+# --- endpoint halted addr=6 ep=IN1 kind=boot-mouse mps=4 class=xact-err-burn tok=0x00048141 … reports=0
+# --- … -> retire` at 32422 ms (drivers/ehci/mod.rs:13863) — Peter: "mouse cursor and keyboard input
+# --- are dead" (R63); the cursor never moved except PTRDEAD's synthetic backlog. Flight 11 carries the
+# --- same line at 28063 ms, so the row does NOT separate the two flights: both had the defect. It reds
+# --- flight 12 honestly and is the FLIGHT-13 GATE for MOUSEHALT (in flight in parallel): green here is
+# --- the claim that the pointing device's interrupt endpoint survived the boot. The `kind=kbd` twin
+# --- (addr=5, same timestamp, both flights) is NOT pinned: on flight 12 keys reached the desktop
+# --- (KBDWIT SILENCE-BROKE, the Tab/`storm` keys), so a FORBID on it would red a working keyboard.
+FORBID :: EHCI-HID: \[\d+\] STOP-NOTE interrupt endpoint halted .* kind=boot-mouse
 #
 # --- NOT PINNED, stated rather than omitted (each is a FLIGHT12.md reading that no directive can hold
 # --- honestly): the vblank PERIOD (above); `pmc-arm … deliver=none reason=no-vector-helper` and
