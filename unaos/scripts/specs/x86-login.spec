@@ -208,6 +208,19 @@ REQUIRE \[users\] delete user=identa uid=\d+ \(slot \d+ freed; uid never reissue
 # The principal string a session prints is the canonical one, uid included.
 REQUIRE \[users\] login ok user=una id=\d+ principal=user:una#\d+
 
+# ── 7d. LOG OUT ENDS THE SESSION (SECLOGIN M3, rmbp-ledger B169) ────────────────────────────────
+# B157 gap 4: Log Out killed STAMPS, not processes — the session's programs kept running and kept
+# their windows, so the next person's login screen came up over the last person's desktop. Now
+# `session_logout` walks the process table for every running row stamped in the closing epoch,
+# closes its windows and kills it through the close box's own path, THEN bumps the epoch. The leg
+# launches STAT.ELF under a session (the desktop's own launcher), logs out, and proves the pid gone
+# and the window gone. A SKIP is a medium with no STAT.ELF — not this lane's (WINX-2 loads it off
+# the same volume every boot), so it is FORBIDden here.
+REQUIRE :: LOGIN-END: pid=\d+ stamp=stamped windows_before=\d+ ended=1 windows=\d+ pid_gone=true window_gone=true -> PASS ::
+FORBID :: LOGIN-END: .* -> FAIL
+FORBID :: LOGIN-END: .* SKIPPED
+REQUIRE \[users\] logout epoch=\d+ ended=\d+ windows=\d+
+
 # ── 8. ABSENCE — the hole every block above exists to close ─────────────────────────────────────
 # A fixture that stops running prints nothing and passes silently. Every REQUIRE above gates PRESENCE
 # as well as health for its own leg, which covers it. What is NOT covered by any of them is the boot

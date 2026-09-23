@@ -845,12 +845,13 @@ fn epoch_proof(name: &[u8]) -> &'static str {
     }
 }
 
-/// Log out: close the session (SO37: and BURN THE EPOCH — see `arch::syscall::session_logout`). The
-/// programs the session launched keep the principal they were stamped with at load, and that stamp now
-/// reads ANONYMOUS from `slot_ppid_of` down, so it opens nothing the user owns and creates nothing in the
-/// user's name. What it keeps is what its own live `(asid, gen)` incarnation owns — the pre-login world.
-pub fn logout() {
-    arch_session_logout();
+/// Log out: END the session's programs (SECLOGIN M3), close the session, and BURN THE EPOCH (SO37 — see
+/// `arch::syscall::session_logout`), so any stamp from the closed session that somehow survived reads
+/// ANONYMOUS from `slot_ppid_of` down. Returns `(ended, windows)`; the wire carries both.
+pub fn logout() -> (usize, usize) {
+    // SECLOGIN M3: the session's programs are ENDED first (windows closed, then killed through the close
+    // box's own path), THEN the stamps — a program cannot outlive the session that started it.
+    let (ended, windows) = arch_session_logout();
     {
         let mut s = SESSION_LOCAL.lock();
         s.1 = 0;
@@ -861,7 +862,8 @@ pub fn logout() {
     // boot's session boundaries are countable on serial with no fixture armed. This is the ONE string SO37
     // adds to a shipping (`login`, no `loginst`) image; the enforcement itself is pure control flow and
     // deliberately prints nothing on the SYS_OPEN path, which is hot.
-    serial_println!("[users] logout epoch={} (SO37: stamps from the closed session are refused)", arch_session_epoch());
+    serial_println!("[users] logout epoch={} ended={} windows={} (SO37: stamps from the closed session are refused; M3: its programs are ended first)", arch_session_epoch(), ended, windows);
+    (ended, windows)
 }
 
 /// The logged-in user's name, copied into `out`; `None` when no session is open.
@@ -897,9 +899,15 @@ fn arch_session_login(id: u32, name: &[u8]) -> bool {
     }
 }
 
-fn arch_session_logout() {
+/// SECLOGIN M3: `(ended, windows)` — the closing session's programs that were ended and the windows
+/// they held; `(0, 0)` on an image with no EL0 regime, where nothing can have been launched.
+fn arch_session_logout() -> (usize, usize) {
     #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
-    crate::arch::syscall::session_logout();
+    {
+        return crate::arch::syscall::session_logout();
+    }
+    #[cfg(not(any(target_arch = "x86_64", feature = "aarch64_el0")))]
+    (0, 0)
 }
 
 /// SO37: the LIVE session epoch where the syscall layer exists (see [`arch_session_login`]); `0` on an
@@ -950,7 +958,7 @@ pub fn shell_verb(verb: &str, args: &[&str], console: &mut crate::console::Conso
             let mut nb = [0u8; NAME_MAX];
             match whoami(&mut nb) {
                 Some(n) => {
-                    logout();
+                    let _ = logout();
                     console.println(&alloc::format!("logged out {}", core::str::from_utf8(&nb[..n]).unwrap_or("?")));
                 }
                 None => console.println("logout: no session is open"),
@@ -1105,7 +1113,7 @@ pub fn service() {
         Ok(()) => {
             SERVICED.store(true, Ordering::Relaxed);
             #[cfg(feature = "loginst")]
-            { login_fixture(); login_hard_fixture(); login_ident_fixture(); } // SECLOGIN M1/M2 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
+            { login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); } // SECLOGIN M1/M2/M3 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1170,7 +1178,7 @@ pub fn login_fixture() {
     // stamp taken before it. It leaves a NEW session open under the same name; the `logout()` below
     // closes it, so `none_after` reads exactly as it did before this leg existed.
     let epoch = epoch_proof(NAME);
-    logout();
+    let _ = logout();
     let none_after = whoami(&mut nb).is_none();
     let all = verify_ok && wrong_refused && wrong_login_refused && none_before && login_ok && principal_ok && none_after && home != "FAIL" && acl != "FAIL" && epoch != "FAIL";
     if all {
@@ -1491,7 +1499,7 @@ pub fn login_hard_fixture() {
     let wrong_refused = !verify(NAME, b"wrong-horse");
     let before = REHASHED.load(core::sync::atomic::Ordering::Relaxed);
     let login_ok = login(NAME, PW).is_ok();
-    logout();
+    let _ = logout();
     let migrated = REHASHED.load(core::sync::atomic::Ordering::Relaxed) - before;
     let v2_facts = row_facts(NAME);
     let t0 = crate::arch::ms();
@@ -1567,5 +1575,33 @@ fn ident_arch(uid_a: u32, uid_b: u32, uid_a2: u32) -> (bool, bool, bool) {
         let _ = (uid_a, uid_b, uid_a2);
         serial_println!("[users] ident: unlinked (no EL0 regime in this image)");
         (true, true, true)
+    }
+}
+
+/// LOGIN-END (`loginst`) — SECLOGIN M3, on the x86 lane: open a session, launch `STAT.ELF` under it
+/// through the desktop's own launcher, Log Out through the real `logout`, and prove the pid is gone
+/// from the process table and the slot holds no window — `ended=1 windows>=1 pid_gone=true
+/// window_gone=true`. A launch that could not happen is a SKIP with its reason, never a PASS.
+/// GO-RED: `session_end_processes` mutated to skip the kill → `ended=0 pid_gone=false -> FAIL`.
+#[cfg(feature = "loginst")]
+pub fn login_end_fixture() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if login(b"una", b"correct-horse").is_err() {
+            serial_println!(":: LOGIN-END: -> FAIL — session did not open ::");
+            return;
+        }
+        let (pid, wb, ended, windows, pid_gone, window_gone, why) = crate::arch::syscall::session_end_fixture();
+        if pid == 0 {
+            let _ = logout();
+            serial_println!(":: LOGIN-END: launch -> SKIPPED reason={} (no program to end on this medium) ::", why);
+            return;
+        }
+        let ok = ended == 1 && windows >= 1 && wb >= 1 && pid_gone && window_gone;
+        serial_println!(":: LOGIN-END: pid={} stamp={} windows_before={} ended={} windows={} pid_gone={} window_gone={} -> {} ::", pid, why, wb, ended, windows, pid_gone, window_gone, if ok { "PASS" } else { "FAIL —" });
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        serial_println!("[users] session-end fixture: x86 lane only (the aarch64 walk is compiled by the arm-virt-el0 leg and runs on every Log Out)");
     }
 }

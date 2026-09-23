@@ -24534,10 +24534,10 @@ pub fn session_login(id: u32, name: &[u8]) -> bool {
 /// a second `logout()` closes nothing and refuses nothing new — but it is NOT a no-op: each call burns an
 /// epoch, which costs nothing and keeps the counter monotone.
 #[cfg(feature = "login")]
-pub fn session_logout() {
+pub fn session_logout() -> (usize, usize) { let ended = session_end_processes(SESSION_EPOCH.load(Ordering::Acquire)); // SECLOGIN M3 — the session's programs are ended BEFORE the bump (windows first, then the kill), so nothing launched under this epoch outlives it; `(ended, windows)` reaches the wire through `fs::users::logout`. Same-line fold (B94).
     SESSION_EPOCH.fetch_add(1, Ordering::AcqRel);
     let _irq = IrqGuard::mask_save();
-    *SESSION.lock() = PrincipalRecord::NONE;
+    *SESSION.lock() = PrincipalRecord::NONE; ended
 }
 
 /// LOGIN M1: the open session's user name into `out` (its length), `None` with no session.
@@ -25168,4 +25168,43 @@ fn user_from_native_uid(rest: &[u8]) -> Option<PrincipalRecord> {
         uid = uid.checked_mul(10)?.checked_add((c - b'0') as u32)?;
     }
     user_principal_uid(&rest[..h], uid)
+}
+
+// =====================================================================================================
+// SECLOGIN M3 — LOG OUT ENDS THE SESSION, aarch64 half. File tail: nothing above moves.
+// =====================================================================================================
+
+/// SECLOGIN M3: end every running program whose ASID carries a `PRIN_USER` stamp taken in `closing`.
+/// `wm::close_owner` first (the row's windows leave the panel now), then [`bg_kill`] — the SKILL-1
+/// primitive the close box and the shell's `kill` already use, ASID-scoped so ELF-2 siblings die too.
+/// Counted as ended only when the row no longer names the pid after the kill returns. An anonymous
+/// program (no user stamp) is never touched. Returns `(ended, windows_closed)`; called from
+/// [`session_logout`] BEFORE the epoch bump.
+#[cfg(feature = "login")]
+fn session_end_processes(closing: u32) -> (usize, usize) {
+    let mut ended = 0usize;
+    let mut windows = 0usize;
+    for pi in 0..MAX_PROCS {
+        if PROCS[pi].state.load(Ordering::Acquire) != PRUNNING {
+            continue;
+        }
+        let asid = PROCS[pi].asid.load(Ordering::Acquire);
+        let i = asid as usize;
+        if asid == 0 || i >= SLOT_EPOCH.len() || SLOT_EPOCH[i].load(Ordering::Acquire) != closing || slot_ppid_of(asid).kind != PRIN_USER {
+            continue;
+        }
+        let pid = PROCS[pi].pid.load(Ordering::Acquire);
+        if pid == 0 {
+            continue;
+        }
+        let w = crate::video::wm::close_owner(asid);
+        windows += w;
+        let settle = bg_kill(pid, asid);
+        let gone = PROCS[pi].state.load(Ordering::Acquire) != PRUNNING || PROCS[pi].pid.load(Ordering::Acquire) != pid;
+        if gone {
+            ended += 1;
+        }
+        serial_println!("[users] session-end pid={} asid={} windows={} kill=\"{}\" ended={}", pid, asid, w, settle, gone);
+    }
+    (ended, windows)
 }
