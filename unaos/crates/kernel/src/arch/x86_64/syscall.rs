@@ -7340,7 +7340,7 @@ pub fn wc_route_tail(raw: crate::pal::Event) {
         raw,
         crate::pal::Event::Mouse { .. } | crate::pal::Event::MouseAbsolute { .. }
     ) {
-        wc_drag_motion();
+        wc_drag_motion(); if crate::video::termsel::pointer_held() { let (x, y) = click_pointer_pos(); crate::video::termsel::pointer_motion(x, y); } // TERMSEL2 — a drag on the shell's text: while a press is held there, each pointer report is a `drag` note at the live cursor (the same position `wc_drag_motion` steers a title-bar drag by). One atomic load otherwise. ⚠ FOLDED, line-neutral.
     }
 }
 
@@ -7638,7 +7638,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
             Some((win, owner, _z)) if crate::video::wm::is_kernel_owner(owner) => {
                 clickroute_witness(x, y, win, owner, cur, "consume", 0);
                 furniture_keyboard_to_shell(owner, cur);
-                crate::video::wm::focus_changed(owner);
+                crate::video::wm::focus_changed(owner); if owner == crate::video::wm::KERNEL_OWNER_DESKTOP { crate::video::termsel::pointer_press(win, x, y); } // TERMSEL2 — A PRESS ON THE SHELL WINDOW'S TEXT GOES TO THE SHELL. The shell window is `KERNEL_OWNER_DESKTOP` furniture (one live row at most, `open_shell_window`), so its content press lands in THIS arm — chrome, controls, the bands and Quarry were all judged above — and was consumed with no one told where it fell: the render service's `Event::Button` arm never sees a consumed press. Noted for the window it hit, in panel pixels (`termsel::pointer_press` turns them into surface pixels); the render service takes the note after this event and its `Console` turns it into a cell. Still consumed, still raised, keyboard still to the shell: only the note is new. ⚠ FOLDED, line-neutral, code first.
                 CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
                 true
             }
@@ -7738,7 +7738,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         // off the NEXT gesture waiting for an edge that has already been and gone. Ahead of the
         // witness too, so `pend=` reads "another release is queued behind this one" rather than
         // always counting the edge that is being served.
-        crate::pal::note_release_edge_drained();
+        crate::pal::note_release_edge_drained(); crate::video::termsel::pointer_release(x, y); // TERMSEL2 — the release that ends a press HELD on the shell's text (`termsel::pointer_press` above) becomes that press's `up` note, for the window the press went to; any other release is one atomic swap and nothing. ⚠ FOLDED, line-neutral.
         if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE {
             let (sx, sy) = drag_settle_point();
             drag_settle_apply(sx, sy);
@@ -17516,7 +17516,7 @@ fn winx_launcher(demo_cpu: usize) {
     #[cfg(feature = "witness")]
     crate::video::wm::hittest_selftest();
     #[cfg(feature = "witness")]
-    clickroute_selftest();
+    { clickroute_selftest(); crate::video::termsel::pointer_selftest(); } // TERMSEL2 — the pointer on the shell's text, driven through `wc_click_route_at` exactly as `clickroute_selftest` drives it, right after it and for its reason: it mints (and closes) a row of its own, so it belongs after every one-shot per-window latch and before `dock::selftest`, which must find NO `KERNEL_OWNER_DESKTOP` row. ⚠ FOLDED, line-neutral.
     // DOCK — fourth of the click family. It mints three rows of its own and drives `focus_changed(0)`,
     // so it belongs here for the reason the two above do: after every one-shot per-window latch. It
     // runs after `clickroute_selftest` rather than before because it leaves a raised window behind

@@ -47,6 +47,10 @@ pub struct Console {
     /// `video::clipboard::terminal_action` (the selection actions, `Cut`) and by
     /// `main::handle_key`'s edit rule; read by [`Self::draw_prompt_line`], which paints it.
     pub sel: crate::video::termsel::LineSel,
+    /// TERMSEL2 — how many lines have been dropped off the front of [`Self::history`], so
+    /// `hist_base + i` is line `i`'s ABSOLUTE number: the row a selection records, which does not
+    /// change as newer output pushes the line up the screen.
+    hist_base: u64,
 }
 
 impl Console {
@@ -58,6 +62,7 @@ impl Console {
             out_sink: None,
             in_window: false,
             sel: crate::video::termsel::LineSel::new(),
+            hist_base: 0,
         }
     }
 
@@ -95,6 +100,7 @@ impl Console {
         self.history.push(String::from(text));
         if self.history.len() > Self::HISTORY_MAX {
             self.history.remove(0);
+            self.hist_base += 1;
         }
     }
 
@@ -112,11 +118,13 @@ impl Console {
     /// check before adding one, not a refactor to discover afterwards.
     pub fn drain_output(&mut self) -> u64 {
         let history = &mut self.history;
+        let base = &mut self.hist_base;
         let max = Self::HISTORY_MAX;
         crate::termring::drain(|line| {
             history.push(String::from(line));
             if history.len() > max {
                 history.remove(0);
+                *base += 1;
             }
         })
     }
@@ -196,16 +204,11 @@ impl Console {
     /// reason the module header already gives: the full repaint and the per-keystroke fast path share
     /// one derivation, or the prompt lands in two different places depending on which drew it.
     fn top_y(&self, pal: &TargetPal) -> usize {
-        let m = pal.metrics();
         // SHELLWIN — a windowed shell reserves NO menu-bar chrome (the bar is desktop furniture that
         // composites above every window). A backdrop shell keeps the reservation, so this is the old
-        // expression unchanged on every surface where [`in_window`] is `false`.
-        let chrome = if self.in_window {
-            0
-        } else {
-            crate::ui_status::top_chrome_h(pal.width() as usize, pal.height() as usize)
-        };
-        chrome.saturating_add(m.margin)
+        // expression unchanged on every surface where [`in_window`] is `false`. TERMSEL2: the body
+        // is [`Self::top_y_for`], so the pointer's cell lookup and the painter share it.
+        self.top_y_for(pal.metrics(), pal.width() as usize, pal.height() as usize)
     }
 
     /// Rows of history shown above the prompt: everything that fits from `TOP` down, reserving the
@@ -213,9 +216,7 @@ impl Console {
     /// (no chrome) and a backdrop shell (chrome reserved) each get the budget for their own surface;
     /// for a backdrop shell this is identical to [`Self::page_rows`] by construction.
     fn history_rows(&self, pal: &TargetPal) -> usize {
-        let m = pal.metrics();
-        let usable = (pal.height() as usize).saturating_sub(self.top_y(pal)) / m.line_h;
-        usable.saturating_sub(1).max(6)
+        self.history_rows_for(pal.metrics(), pal.width() as usize, pal.height() as usize)
     }
 
     /// The y of the prompt/input line: directly below the last shown history line (so on a fresh
@@ -284,5 +285,115 @@ impl Console {
         // Clear the input-line strip (one full line pitch) back to the background.
         pal.draw_rect(0, prompt_y, pal.width() as usize, m.line_h, Self::BG);
         self.draw_prompt_line(pal, prompt_y);
+    }
+}
+
+// --- TERMSEL2 — the pointer on the terminal's text ------------------------------------------------
+//
+// Tail-appended in its own `impl` so the layout code above keeps its lines. The console is the one
+// party that knows where a cell is — the prompt's width, the page's top, how many history rows are
+// shown — so it is the one that turns a pointer note (surface pixels, `video::termsel::Press`) into a
+// cell, and it does it with the SAME derivation the painter draws with: [`Console::top_y_for`] and
+// [`Console::history_rows_for`] are what `top_y`/`history_rows` compute, from the metrics and the
+// surface size rather than from a `TargetPal`, so a fixture with no panel can ask exactly the
+// question the render service asks.
+impl Console {
+    /// The prompt's width in cells (`draw_prompt_line` prints `{user}@unaos:~$ `).
+    pub fn prompt_cells(&self) -> usize {
+        self.session.username.len() + "@unaos:~$ ".len()
+    }
+
+    /// [`Self::top_y`] for a surface `w`x`h` with metrics `m`.
+    fn top_y_for(&self, m: crate::ui::Metrics, w: usize, h: usize) -> usize {
+        let chrome = if self.in_window { 0 } else { crate::ui_status::top_chrome_h(w, h) };
+        chrome.saturating_add(m.margin)
+    }
+
+    /// [`Self::history_rows`] for a surface `w`x`h` with metrics `m`.
+    fn history_rows_for(&self, m: crate::ui::Metrics, w: usize, h: usize) -> usize {
+        let usable = h.saturating_sub(self.top_y_for(m, w, h)) / m.line_h;
+        usable.saturating_sub(1).max(6)
+    }
+
+    /// The CELL under surface pixel `(lx, ly)`: `(row, col, cells)` — the row an absolute scrollback
+    /// line or `termsel::EDIT_ROW`, the column the character cell under the pointer clamped to one
+    /// past the row's last character, and the row's cell count. A point above the first shown row
+    /// reads as that row, a point below the prompt as the prompt, a point left of a row's text as its
+    /// first cell — a drag that leaves the text keeps a cell to report.
+    pub fn cell_at(&self, m: crate::ui::Metrics, w: usize, h: usize, lx: i32, ly: i32) -> (u64, usize, usize) {
+        let top = self.top_y_for(m, w, h);
+        let shown = self.history.len().min(self.history_rows_for(m, w, h));
+        let skip = self.history.len() - shown;
+        let (lx, ly) = (lx.max(0) as usize, ly.max(0) as usize);
+        let vrow = ly.saturating_sub(top) / m.line_h;
+        let (row, x0, cells) = if vrow < shown {
+            let i = skip + vrow;
+            (self.hist_base + i as u64, m.margin, self.history[i].chars().count())
+        } else {
+            (
+                crate::video::termsel::EDIT_ROW,
+                m.margin + m.text_w(self.prompt_cells()),
+                self.current_input.len(),
+            )
+        };
+        let col = core::cmp::min(lx.saturating_sub(x0) / m.cell_w, cells);
+        (row, col, cells)
+    }
+
+    /// The text of row `row` (an absolute scrollback line or `termsel::EDIT_ROW`), or `""` for a line
+    /// that has left the scrollback.
+    pub fn row_text(&self, row: u64) -> &str {
+        if row == crate::video::termsel::EDIT_ROW {
+            return &self.current_input;
+        }
+        match row.checked_sub(self.hist_base) {
+            Some(i) if (i as usize) < self.history.len() => &self.history[i as usize],
+            _ => "",
+        }
+    }
+
+    /// One pointer note, against the console's own layout on a surface `w`x`h` with metrics `m`.
+    /// Returns the repaint owed (see [`Self::repaint`]).
+    pub fn pointer_at(&mut self, p: &crate::video::termsel::Press, m: crate::ui::Metrics, w: usize, h: usize) -> u8 {
+        let (row, col, _) = self.cell_at(m, w, h, p.lx, p.ly);
+        let len = self.current_input.len();
+        let text = if row == crate::video::termsel::EDIT_ROW {
+            self.current_input.as_str()
+        } else {
+            match row.checked_sub(self.hist_base) {
+                Some(i) if (i as usize) < self.history.len() => self.history[i as usize].as_str(),
+                _ => "",
+            }
+        };
+        self.sel.pointer(p.kind, p.ms, row, col, text, len)
+    }
+
+    /// [`Self::pointer_at`] on the surface `pal` draws.
+    pub fn pointer(&mut self, p: &crate::video::termsel::Press, pal: &TargetPal) -> u8 {
+        self.pointer_at(p, pal.metrics(), pal.width() as usize, pal.height() as usize)
+    }
+
+    /// Pay a repaint the selection model asked for: 1 the input line, 2 the whole terminal (a band
+    /// in the scrollback moved). Returns whether anything was painted.
+    pub fn repaint(&self, code: u8, pal: &mut TargetPal) -> bool {
+        match code {
+            0 => false,
+            1 => {
+                self.draw_input_line(pal);
+                true
+            }
+            _ => {
+                self.draw(pal);
+                true
+            }
+        }
+    }
+
+    /// Fixture seam: place a scrollback line WITHOUT the transport. `println` drains the global
+    /// `TERM_RING`, and a fixture's console draining it would steal the records the real console is
+    /// owed (the fan-out precondition on [`Self::drain_output`]).
+    #[cfg(feature = "witness")]
+    pub fn place_for_fixture(&mut self, text: &str) {
+        self.place(text);
     }
 }

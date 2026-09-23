@@ -677,3 +677,14 @@ FORBID \[clip\] refuse reason=
 # -> FAIL ::`.
 REQUIRE :: TERMSEL: resolved=13/13 delivered=13 left=ok copy_sel=ok home=ok esc=ok copy_line=ok cut=ok cut_empty=ok edit=ok pc=ok -> PASS ::
 FORBID :: TERMSEL: .* -> FAIL ::
+#
+# ── TERMSEL2 (2026-09-23, rmbp-ledger B196), TAIL-APPENDED past TERMSEL ────────────────────────────
+# The POINTER on the shell's text (`video/termsel.rs`, `clipboard.md` §7.10+). A press on the shell
+# window is kernel furniture to the click router, which now NOTES it for that window
+# (`termsel::pointer_press`/`_motion`/`_release`); the render service hands the notes to its
+# `Console`, which turns them into cells. The fixture `termsel::pointer_selftest` — chained beside
+# `clickroute_selftest`, which this lane runs every boot — mints a `KERNEL_OWNER_DESKTOP` probe row
+# and drives presses through the LIVE `wc_click_route_at`. `legs=` is a bit per leg; the wanted mask
+# is a constant of the fixture, so it is pinned literally with every field.
+REQUIRE :: TERMSEL2: legs=0x1f/0x1f hit=ok route=ok drag=ok up=ok dbl=ok -> PASS ::
+FORBID :: TERMSEL2: .* -> FAIL ::
