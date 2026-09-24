@@ -121,13 +121,18 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use super::super::{fbcon, theme, wm};
+use super::super::{fbcon, font, theme, wm};
 use crate::fs::users;
 
 const W: usize = 440;
 const H: usize = 240;
-const TS: usize = 2;
-const CELL: usize = 8 * TS;
+/// LOGINFONT (R64: *"the font in the login window was super huge and blocky"*) — the screen's text is the
+/// shared anti-aliased face (`video/font.rs`, the one Quarry took in QUARRYFONT), not font8x8 at 2x. The
+/// vertical rhythm stays 16 px (`Face::Body.cell_h()` is `CELL_H` = 16, what the 2x cell was); the
+/// horizontal arithmetic moves to the face's own advance, as `font::draw_text`'s doc says a conversion must.
+const FACE: font::Face = font::Face::Body;
+const CELL: usize = font::Face::Body.cell_h();
+const CW: usize = font::Face::Body.cell_w();
 const FIELD_MAX: usize = 32;
 
 /// LOGINCLOSE — **the owner band the screen's row is minted in, and the whole of why the screen has no
@@ -378,21 +383,8 @@ fn rect(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
 }
 
 fn text(px: &mut [u32], x: usize, y: usize, s: &[u8], fg: u32) {
-    let mut cx = x;
-    for &ch in s {
-        if cx + CELL > W {
-            break;
-        }
-        let bitmap = font8x8::legacy::BASIC_LEGACY[ch.min(127) as usize];
-        for (ry, rowbits) in bitmap.iter().enumerate() {
-            for rx in 0..8 {
-                if rowbits & (1 << rx) != 0 {
-                    fill(px, cx + rx * TS, y + ry * TS, TS, TS, fg);
-                }
-            }
-        }
-        cx += CELL;
-    }
+    // LOGINFONT: the shared face, clipped to the surface; all-or-nothing per glyph (its contract).
+    let _ = font::draw_text(px, W, W, H, x, y, s, fg, false, FACE);
 }
 
 fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: bool, secret: bool) {
@@ -406,7 +398,7 @@ fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: 
         text(px, x + 6, y + 4, content, theme::CONTENT_TEXT);
     }
     if focused {
-        let cx = x + 6 + n * CELL;
+        let cx = x + 6 + n * CW; // LOGINFONT: the caret sits at the face's advance, not the old square cell
         fill(px, cx, y + 4, 2, CELL, theme::CONTENT_TEXT);
     }
 }
@@ -419,7 +411,7 @@ fn button(px: &mut [u32], c: Ctl, label: &[u8], primary: bool, setpw: bool) {
     let (x, y, w, h) = ctl_rect(c, setpw);
     fill(px, x, y, w, h, if primary { theme::ACCENT } else { theme::BUTTON_FACE });
     rect(px, x, y, w, h, theme::FRAME_LINE);
-    let tw = label.len() * CELL;
+    let tw = label.len() * CW; // LOGINFONT
     let tx = x + w.saturating_sub(tw) / 2;
     let ty = y + h.saturating_sub(CELL) / 2;
     text(px, tx, ty, label, if primary { theme::BEVEL_LIGHT } else { theme::BUTTON_TEXT });
@@ -434,7 +426,7 @@ fn user_row(px: &mut [u32], i: usize, name: &[u8], picked: bool) {
     let (x, y, w, h) = ctl_rect(Ctl::User(i), false);
     fill(px, x, y, w, h, if picked { theme::ACCENT } else { theme::CONTENT_FILL });
     rect(px, x, y, w, h, if picked { theme::ACCENT } else { theme::FRAME_LINE });
-    let max = (w - 12) / CELL;
+    let max = (w - 12) / CW; // LOGINFONT
     let n = name.len().min(max);
     text(px, x + 6, y + 4, &name[..n], if picked { theme::BEVEL_LIGHT } else { theme::CONTENT_TEXT });
 }
