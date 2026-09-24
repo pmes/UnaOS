@@ -2951,7 +2951,7 @@ pub fn root_pass_fixture() {
         _ => "pending",
     };
     serial_println!(
-        "[vfs] root-pass fixture n={} held_ms={} at={}ms verdict={} :: BOOTSLOW: a synthetic probe that does not serve the root; verdict=bound is the ordering, verdict=pending is a probe that ran ahead of the root ::",
+        "[vfs] root-pass fixture n={} held_ms={} at={}ms verdict={} :: BOOTSLOW: a synthetic probe that does not serve the root; bound is the ordering; a pending verdict is a probe that ran ahead of the root ::",
         n,
         crate::arch::ms().saturating_sub(start),
         start,
