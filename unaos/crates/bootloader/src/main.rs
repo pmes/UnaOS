@@ -1506,3 +1506,26 @@ unsafe fn read_gmux_trace() -> [u32; 7] {
         [0; 7]
     }
 }
+
+// =================================================================================================
+// WCSLEN — a libc symbol the UEFI target has no libc for. Nightlies from 2026-08-31 on (LLVM's
+// loop-idiom pass) turn the `uefi` crate's UTF-16 length loops (`uefi::system::firmware_vendor`,
+// `DevicePath::to_string16`) into calls to `wcslen`, and `rust-lld` then fails the x86_64-unknown-uefi
+// link with `undefined symbol: wcslen` (measured 2026-09-24, cloud session; nightly 2026-07-14 does not
+// emit the call). This definition is that symbol. The read is volatile so the same pass cannot fold
+// THIS loop into a call to itself. On a nightly that emits no call it is one unreferenced function.
+// =================================================================================================
+
+/// `wcslen`: the length in `u16` units of a NUL-terminated UTF-16 string. C ABI, for the linker.
+#[no_mangle]
+pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
+    let mut n = 0usize;
+    loop {
+        // SAFETY: the caller promises a NUL-terminated buffer, as C does; volatile keeps the loop a loop.
+        if core::ptr::read_volatile(s.add(n)) == 0 {
+            return n;
+        }
+        n += 1;
+    }
+}
+
