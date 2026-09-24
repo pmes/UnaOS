@@ -7588,3 +7588,105 @@ fn emit_stack_witness() {
         task.stack.len() - STACK_GUARD
     );
 }
+
+// ── SMPLOAD (rmbp-ledger B227; flight 15 §2: "smp is still weird though. seems like it should spread the
+// load better") ────────────────────────────────────────────────────────────────────────────────────
+// The per-core numbers have been on the wire for weeks (`[schedx86] load`, every ~5 s) and nothing
+// judged them: no spec pinned the line and the line carries no verdict, so Peter's glass and the wire
+// could not be compared. This line is the VERDICT over the same counters, once per ~10 s: the busy
+// percent per tracked core, the run-queue depth per core, the migrations since the previous sample,
+// and FAIL when the skew Peter named — one core above 80% while another sits below 20% — holds for two
+// consecutive samples (one sample is a burst; two is the scheduler declining to spread it). It rides the
+// depth line's gate in `main.rs` beside `emit_load_witness` and adds no snapshot of its own beyond the
+// one `core_load` already takes. Prep: docs/dev/evidence/rmbp-0924/prep/SMPLOAD.md.
+static SMPLOAD_LAST_MS: AtomicU64 = AtomicU64::new(0);
+static SMPLOAD_LAST_MOVES: AtomicU64 = AtomicU64::new(0);
+static SMPLOAD_SKEW_STREAK: AtomicU32 = AtomicU32::new(0);
+const SMPLOAD_PERIOD_MS: u64 = 10_000;
+const SMPLOAD_HI: u32 = 80;
+const SMPLOAD_LO: u32 = 20;
+
+/// The pure verdict, unit-tested by `smpload_selftest`: `(skewed_now, streak_after)` for one sample.
+/// SKEW is not "one core busy while another idles" — a single render task legitimately pegs one core
+/// (the first QEMU run: `busy=[0,1,100,100,0,99]` with every run queue empty, the compositor, nothing
+/// to spread). Skew is WORK WAITING behind a pegged core while another core idles with nothing queued:
+/// a core above `SMPLOAD_HI` with a STEALABLE waiter (`waitq >= 1`; a pinned waiter is a pin contract, not
+/// a spreading failure) and a core below `SMPLOAD_LO` with an empty queue.
+pub fn smpload_judge(busy: &[Option<u32>], waitq: &[usize], streak_before: u32) -> (bool, u32) {
+    let mut hot_waiting = false;
+    let mut idle_empty = false;
+    for (c, p) in busy.iter().enumerate() {
+        let Some(p) = p else { continue };
+        let q = waitq.get(c).copied().unwrap_or(0);
+        if *p > SMPLOAD_HI && q >= 1 { hot_waiting = true; }
+        if *p < SMPLOAD_LO && q == 0 { idle_empty = true; }
+    }
+    let skewed = hot_waiting && idle_empty;
+    (skewed, if skewed { streak_before + 1 } else { 0 })
+}
+
+/// `:: SMPLOAD: t=<s> cpus=N busy=[p0,p1,…] runq=[…] stealable=[…] migr=<n> streak=<k> skewed=<0|1> -> PASS|FAIL ::`
+pub fn emit_smpload_witness() {
+    use core::fmt::Write;
+    let now = crate::arch::ms();
+    if now.saturating_sub(SMPLOAD_LAST_MS.load(Ordering::Relaxed)) < SMPLOAD_PERIOD_MS { return; }
+    SMPLOAD_LAST_MS.store(now, Ordering::Relaxed);
+    let n = meter_cpu_count();
+    let mut busy: [Option<u32>; MAX_CPUS] = [None; MAX_CPUS];
+    let mut runq = [0usize; MAX_CPUS];
+    let mut waitq = [0usize; MAX_CPUS];
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for c in 0..n {
+            let ld = core_load(c);
+            busy[c] = if ld.tracked { Some(ld.busy_pct_recent) } else { None };
+            runq[c] = run_queue_len(c);
+            waitq[c] = run_queue_stealable(c);
+        }
+    });
+    let (moves, _) = steal_counters();
+    let migr = moves.saturating_sub(SMPLOAD_LAST_MOVES.swap(moves, Ordering::Relaxed));
+    let (skewed, streak) = smpload_judge(&busy[..n], &waitq[..n], SMPLOAD_SKEW_STREAK.load(Ordering::Relaxed));
+    SMPLOAD_SKEW_STREAK.store(streak, Ordering::Relaxed);
+    let mut w = LineBuf::new();
+    let _ = write!(w, ":: SMPLOAD: t={} cpus={} busy=[", now / 1000, n);
+    for c in 0..n {
+        let _ = write!(w, "{}", if c == 0 { "" } else { "," });
+        match busy[c] { Some(p) => { let _ = write!(w, "{}", p); } None => { let _ = write!(w, "--"); } }
+    }
+    let _ = write!(w, "] runq=[");
+    for c in 0..n { let _ = write!(w, "{}{}", if c == 0 { "" } else { "," }, runq[c]); }
+    let _ = write!(w, "] stealable=[");
+    for c in 0..n { let _ = write!(w, "{}{}", if c == 0 { "" } else { "," }, waitq[c]); }
+    let _ = write!(w, "] migr={} streak={} skewed={} -> {} ::", migr, streak, skewed as u8, if streak >= 2 { "FAIL" } else { "PASS" });
+    serial_println!("{}", w.as_str());
+}
+
+/// SMPLOAD fixture (witness): the pure verdict on five shapes — flat, one pegged core with empty queues
+/// (PASS: a single task cannot be spread), work waiting behind a hot core once (streak 1) and twice (FAIL),
+/// an untracked core ignored. Go-red: `smpload_judge` returning `streak_before`
+/// unchanged on a skewed sample never reaches 2.
+#[cfg(feature = "witness")]
+pub fn smpload_selftest() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) { return; }
+    let flat = smpload_judge(&[Some(40), Some(35), Some(50), Some(45)], &[0, 0, 0, 0], 0);          // spread: PASS
+    let pegged = smpload_judge(&[Some(95), Some(10), Some(30), Some(30)], &[0, 0, 0, 0], 0);        // one task, nothing queued: PASS (the compositor's shape)
+    let burst = smpload_judge(&[Some(95), Some(10), Some(30), Some(30)], &[1, 0, 0, 0], 0);         // work waiting behind the hot core, one sample: streak 1
+    let twice = smpload_judge(&[Some(95), Some(10), Some(30), Some(30)], &[2, 0, 0, 0], 1);         // second sample: FAIL at 2
+    let untracked = smpload_judge(&[Some(95), None, Some(30), Some(30)], &[1, 0, 0, 0], 0);         // the idle core is untracked: not judged
+    let ok = flat == (false, 0) && pegged == (false, 0) && burst == (true, 1) && twice == (true, 2) && untracked == (false, 0);
+    serial_println!(
+        ":: SMPLOAD-JUDGE: flat={}/{} pegged={}/{} burst={}/{} twice={}/{} untracked={}/{} fail_at=2 -> {} ::",
+        flat.0 as u8, flat.1, pegged.0 as u8, pegged.1, burst.0 as u8, burst.1, twice.0 as u8, twice.1, untracked.0 as u8, untracked.1, if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// SMPLOAD: READY tasks on `cpu`'s queue that an idle core is ALLOWED to take (`steal_ok`) — `census`'s
+/// `ready - pinned`. A pinned waiter behind a pegged core is a pin contract, not a spreading failure,
+/// and the first QEMU runs read exactly that during the fixture battery (`runq=1` behind a 100% core
+/// while two cores idled: the pinned self-test spinner). Witness-rate only, like `census`.
+pub fn run_queue_stealable(cpu: usize) -> usize {
+    if cpu >= MAX_CPUS { return 0; }
+    let (ready, pinned) = RUN_QUEUES[cpu].lock().census();
+    ready.saturating_sub(pinned)
+}

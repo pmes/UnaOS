@@ -310,6 +310,14 @@ REQUIRE :: VUGPROBE: shadow-drive win=\d+ tries=\d+ paced=\d+ coalesced=1 shadow
 # --- raise passes it (the control). Go-red: `reassert_modal_top` not writing `z` reads after_create=0 after_raise=0.
 REQUIRE :: LOGINZ: modal_z=\d+ rival_z=\d+ create_verdict=5 after_create=1 raised_modal_z=\d+ raised_rival_z=\d+ after_raise=1 unpinned_rival_above=1 -> PASS ::
 FORBID :: LOGINZ: .* -> FAIL
+# --- SMPLOAD (rmbp-ledger B227; flight 15 "smp is still weird") — the per-core verdict every ~10 s over the
+# --- `[schedx86] load` counters, FAIL only when STEALABLE work waits behind a core >80% while a core <20% has an
+# --- empty queue, two samples running (a pegged render task, or a pinned self-test spinner, is PASS);
+# --- and the pure judge on four shapes. Go-red: the judge not advancing the streak never reaches fail_at=2.
+REQUIRE :: SMPLOAD: t=\d+ cpus=\d+ busy=\[.*\] runq=\[.*\] stealable=\[.*\] migr=\d+ streak=\d+ skewed=\d -> PASS ::
+FORBID :: SMPLOAD: .* -> FAIL
+REQUIRE :: SMPLOAD-JUDGE: flat=0/0 pegged=0/0 burst=1/1 twice=1/2 untracked=0/0 fail_at=2 -> PASS ::
+FORBID :: SMPLOAD-JUDGE: .* -> FAIL
 FORBID :: VUGPROBE: .* :: FAIL ::
 # --- A SKIP is no panel or a full window table. On this gate neither is honest — the DMGOVLP /
 # --- MENUDROP / STRIPVAC rule above, one row and the same panel — so a SKIP is a lost fixture.

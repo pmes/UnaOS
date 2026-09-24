@@ -1138,7 +1138,7 @@ extern "x86-interrupt" fn kepler_vblank_isr(_f: x86_64::structures::idt::Interru
                 mmio_write(
                     bar0,
                     disp_head(DISP_INTR_HOST_HEAD_EN, head),
-                    WIN_EN_ENTRY.load(Ordering::Relaxed),
+                    isr_head_en(WIN_EN_ENTRY.load(Ordering::Relaxed)), // KVBLANK4 (B192→R71): the ack write RE-ARMS the vblank bit on the same write — see `isr_head_en`
                 );
                 if n >= IRQ_STORM_CAP {
                     mmio_write(bar0, regs::NV_PMC_INTR_EN, IRQ_PMC_ENTRY.load(Ordering::Relaxed));
@@ -1342,7 +1342,7 @@ pub fn selftest_once() {
     VB_WAIT_RECHECK.store(0, Ordering::Relaxed);
 
     selftest_deliver();
-    selftest_period();
+    selftest_period(); selftest_rearm(); // KVBLANK4 — the re-arm arithmetic against the real `isr_head_en`
 }
 
 /// KVBLANK3 M2's fixture — **the vector, and the verdict, on a machine with no Kepler.**
@@ -1499,4 +1499,46 @@ fn sim_acc_reset() {
     }
     a.pmin.store(u64::MAX, Ordering::Relaxed);
     a.last.store(0, Ordering::Relaxed);
+}
+
+// ── KVBLANK4 (rmbp-ledger B192's falsifier; R71 "whichever is the best edge or level") ──────────────
+// Flights 13–15 read `irq=1 vbl_delta=62 mode=irq deliver=msi`: ONE message per ~60-vblank window. The
+// ISR above acked by writing `INTR_HOST_HEAD_EN` back to its pre-arm value — a DISARM — and the only
+// re-arm lived in `rung3_run`, which runs off the compositor's poll cadence, not the ISR's. Two clocks,
+// uncoupled: the head enable sat off until a poll happened to land inside the window. The fix is one
+// value on the same write: the entry value with the vblank bit kept set. Edge vs level (R71): the
+// line is re-armed, not held — if the source is level-behaved and the enable alone does not deassert
+// it, `IRQ_STORM_CAP` still drops `INTR_ENABLE_HOST` to its entry value and prints; the metal run says
+// which. `rung3_run`'s re-arm branch stays as the second belt. Prep: docs/dev/evidence/rmbp-0924/prep/KVBLANK4.md.
+
+/// The value the ISR's ack writes to `INTR_HOST_HEAD_EN`: the entry value WITH the vblank bit — so the
+/// next vblank can raise the line again. Pure, so `selftest_rearm` drives the real thing.
+fn isr_head_en(entry: u32) -> u32 {
+    entry | (1u32 << DISP_INTR_HEAD_BIT_VBLANK)
+}
+
+/// KVBLANK4 fixture — the delivery count over a 62-vblank window on a machine with no Kepler: the
+/// "hardware" delivers a message iff the head enable's vblank bit is set at that vblank, and each message
+/// runs the ISR's write, i.e. the REAL `isr_head_en`. `broken` is the old ack (the entry value alone) —
+/// the flight shape, exactly one message. Go-red: `isr_head_en` returning `entry` reads `irq=1`.
+fn selftest_rearm() {
+    const N: u32 = 62;
+    let vb = 1u32 << DISP_INTR_HEAD_BIT_VBLANK;
+    let entry = 0u32; // this driver's captured pre-arm value (rung3_arm reads back 0)
+    let run = |ack: &dyn Fn(u32) -> u32| -> u32 {
+        let mut en = entry | vb; // armed by rung3_arm
+        let mut irq = 0u32;
+        for _ in 0..N {
+            if en & vb != 0 { irq += 1; en = ack(entry); }
+        }
+        irq
+    };
+    let fixed = run(&|e| isr_head_en(e));
+    let broken = run(&|e| e);
+    let ratio_pct = fixed * 100 / N;
+    let ok = ratio_pct >= 95 && broken == 1;
+    serial_println!(
+        ":: KVBLANK4: irq={} vbl={} ratio_pct={} fixed_isr=rearm broken={} -> {} ::",
+        fixed, N, ratio_pct, broken, if ok { "PASS" } else { "FAIL" }
+    );
 }

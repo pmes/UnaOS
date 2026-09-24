@@ -1,5 +1,7 @@
 # SMPLOAD — prep
 
+> BUILT the same day by the seat: `docs/dev/evidence/rmbp-0924/smpload/SMPLOAD.md` (B227 fixed-unflown). The judge was refined twice against the instrument's own readings — see that doc.
+
 ## The finding
 
 Flight 15 §2 SMP (rmbp-ledger B227). Peter, running a vug storm: "smp is still weird though. seems

@@ -1645,6 +1645,10 @@ REQUIRE :: HDA-TONE: .* -> PASS ::
 # --- then 38241 on a 60 Hz panel) are NOT pinned: they are the open finding, not a property.
 REQUIRE :: kepler: vblank selftest arm=wait sim=timer .* :: PASS ::
 REQUIRE :: kepler: vblank selftest arm=wait sim=stuck .* :: GO-RED-OK ::
+# --- KVBLANK4 (B192's falsifier answered; R71): the ISR's ack re-arms the vblank bit on the same write, so a
+# --- 62-vblank window delivers ~62 messages, not 1; `broken=1` is the flight-13..15 shape under the old ack.
+REQUIRE :: KVBLANK4: irq=\d+ vbl=62 ratio_pct=\d+ fixed_isr=rearm broken=1 -> PASS ::
+FORBID :: KVBLANK4: .* -> FAIL
 #
 # --- THE NEGATIVE PINS THE FLIGHTS TAUGHT. `GATE STOLEN` and `REHOMED the render role` are already
 # --- FORBIDden above (SPECPINS, :1455/:1456), 0 hits on both flights; not repeated, a second copy

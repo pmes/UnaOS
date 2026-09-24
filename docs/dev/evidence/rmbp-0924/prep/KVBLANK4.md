@@ -1,5 +1,7 @@
 # KVBLANK4 — prep
 
+> BUILT the same day by the seat: `docs/dev/evidence/rmbp-0924/kvblank4/KVBLANK4.md` (B192 fixed-unflown; R71). The fixture drives the real `isr_head_en`, not a mirror.
+
 ## The finding
 
 `docs/dev/OS/rmbp-queue.md:17`: *"KVBLANK4 (rmbp; from FLIGHT13.md §5, B192's falsifier fired):
