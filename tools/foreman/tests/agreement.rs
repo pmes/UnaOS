@@ -135,9 +135,16 @@ FORBID :: U[0-9]+: .* -> FAIL \\(sector\n\
 FORBID :: RENAMED-WITNESS: .* ::\n\
 FORBID :: U5: capabilities\n\
 FORBID U[45]:\n\
-FORBID kind=ax88179\n";
+FORBID kind=ax88179\n\
+FORBID \\[ptrdead\\] backlog whole=skip nodrop=skip\n\
+FORBID :: VUGART: .* -> FAIL ::\n";
+// The "kernel": label text contiguous, values in holes (`whole={} nodrop={}`), so the
+// ptrdead FORBID's quoted values are NOT one string here — reachable through its `whole=`
+// prefix candidate. `:: VUGART:` is not in the kernel at all: it is the ring-3 VUG's line,
+// found only when the artifact is the boot-media DIRECTORY (kernel + APPS/).
 const REACH_ART: &[u8] = b"\x7fELF\x02\x01\x01 :: U4: process model -> FAIL (sector mismatch) :: \
-:: U5: capabilities -> PASS :: kind=ecm \x00 CAPSTONE COMPLETE \x00";
+:: U5: capabilities -> PASS :: kind=ecm \x00 CAPSTONE COMPLETE \x00[ptrdead] backlog whole={} nodrop={} order={}";
+const REACH_APP: &[u8] = b"\x7fELF :: VUGART: frames={} coherent={} -> PASS :: \x00";
 const TRUNC_TAIL: &[u8] = b":: LAST-WITNESS PASS ::\r\n:: RUN-END marker ::\r\n";
 
 fn cat(parts: &[&[u8]]) -> Vec<u8> {
@@ -264,18 +271,23 @@ fn agrees_with_mbench_on_forbid_reachability() {
     let tmp = std::env::temp_dir().join(format!("foreman-reach-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("temp dir");
     let spec = write(&tmp, "reach.spec", REACH_SPEC);
-    let art = write(&tmp, "reach-kernel.elf", REACH_ART);
+    // Boot media: <esp>/kernel.elf + <esp>/APPS/VUG.ELF; `--artifact` names the directory.
+    let esp = tmp.join("esp");
+    std::fs::create_dir_all(esp.join("APPS")).expect("esp dir");
+    write(&esp, "kernel.elf", REACH_ART);
+    write(&esp.join("APPS"), "VUG.ELF", REACH_APP);
+    let kernel_only = esp.join("kernel.elf");
     let good = write(&tmp, "good.log", &cat(&[CANNED, CANNED_TAIL]));
     let bad = write(&tmp, "bad.log", &cat(&[CANNED, CANNED_TAIL, CANNED_BAD]));
 
     let mut mismatches: Vec<String> = Vec::new();
     let mut unreach_seen = false;
-    for log in [&good, &bad] {
-        let Some((mrc, mtable)) = run_mbench_art(&root, log, &spec, Some(&art)) else {
+    for (log, art, want_unreach) in [(&good, &esp, 2usize), (&bad, &esp, 2), (&good, &kernel_only, 3)] {
+        let Some((mrc, mtable)) = run_mbench_art(&root, log, &spec, Some(art)) else {
             eprintln!("SKIP: mbench did not run");
             return;
         };
-        let (frc, ftable) = run_foreman_art(log, &spec, Some(&art));
+        let (frc, ftable) = run_foreman_art(log, &spec, Some(art));
         if mrc != frc || mtable.trim_end() != ftable.trim_end() {
             mismatches.push(format!("{}:\n--- mbench\n{mtable}\n--- foreman\n{ftable}", log.display()));
         }
@@ -288,15 +300,25 @@ fn agrees_with_mbench_on_forbid_reachability() {
             "a literal present in the artifact was called unreachable:\n{ftable}"
         );
         assert!(
-            ftable.contains(", 2 unreachable FORBID(s)"),
-            "summary must count the two unreachable FORBIDs (RENAMED-WITNESS, kind=ax88179):\n{ftable}"
+            !ftable.contains("UNREACHABLE: its literal \"[ptrdead]"),
+            "a value-quoting literal whose label is in the artifact was called unreachable:\n{ftable}"
         );
+        let want = format!(", {want_unreach} unreachable FORBID(s)");
+        assert!(ftable.contains(&want), "summary must read `{want}` for {}:\n{ftable}", art.display());
+        // Kernel alone: the VUG's line is unreachable in it, named with the file; the directory
+        // artifact finds it in APPS/VUG.ELF and is named with a trailing slash.
+        if art == &kernel_only {
+            assert!(ftable.contains("UNREACHABLE: its literal \":: VUGART: \" has 0 hits in kernel.elf"), "{ftable}");
+        } else {
+            assert!(!ftable.contains("VUGART: \" has 0 hits"), "{ftable}");
+            assert!(ftable.contains("has 0 hits in esp/ "), "{ftable}");
+        }
     }
     // Advisory: the verdict is the verdict without the artifact.
     let (rc_no, _) = run_foreman(&good, &spec);
-    let (rc_art, _) = run_foreman_art(&good, &spec, Some(&art));
+    let (rc_art, _) = run_foreman_art(&good, &spec, Some(&esp));
     assert_eq!(rc_no, rc_art, "reachability changed a verdict");
-    let (rc_bad, table_bad) = run_foreman_art(&bad, &spec, Some(&art));
+    let (rc_bad, table_bad) = run_foreman_art(&bad, &spec, Some(&esp));
     assert_ne!(rc_bad, 0, "the FORBID hit must still fail:\n{table_bad}");
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -306,5 +328,5 @@ fn agrees_with_mbench_on_forbid_reachability() {
         "foreman disagrees with mbench with --artifact:\n{}",
         mismatches.join("\n")
     );
-    eprintln!("reach agreement: 2 pairs — tables identical, UNREACHABLE row and summary present");
+    eprintln!("reach agreement: 3 pairs — tables identical, UNREACHABLE rows and summaries as expected");
 }

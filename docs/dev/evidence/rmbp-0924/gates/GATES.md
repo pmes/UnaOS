@@ -192,6 +192,26 @@ $ LC_ALL=C grep -a -o -F ':: USBNET' unaos/target/x86_64-unaos/release/unaos-ker
 $ cargo test -p foreman   → 38 + 2 (agreement: shared corpus, forbid reachability) + 2 passed, 0 failed
 $ python3 unaos/scripts/mbench.py --self-test   → SELF-TEST PASS — 46/46
 ```
-Sidecar leg: `UNAOS_QEMU_MACHINE=pc-q35-8.2 UNAOS_WC=1 ./arroyo test` in this container writes `artifact=…/unaos-kernel`
-into `target/serial.log.run`, and a bare `mbench --replay target/serial.log --spec x86-wc.spec` (no `--artifact`) then
-counts against it — recorded below when the run lands.
+### Sidecar leg, and what the first live run taught the rule
+`UNAOS_QEMU_MACHINE=pc-q35-8.2 UNAOS_WC=1 ./arroyo test` (rc=1 on SOCK-3, environmental) wrote `artifact=` into
+`target/serial.log.run` (line 13, after `complete_line=`), and a BARE `mbench --replay target/serial.log --spec x86-wc.spec`
+read it. First cut (artifact = the kernel ELF, whole-run literal) reported 5 unreachable FORBIDs; three were false:
+```
+  ◦ FORBID  \[ptrdead\] backlog whole=skip nodrop=skip order=skip     ← kernel prints "whole={} nodrop={}": values are holes
+  ◦ FORBID  \[status\] poll .* src=unresolved                          ← same shape: `src={}`, "unresolved" is a separate string
+  ◦ FORBID  :: VUGART: .* -> FAIL ::                                    ← the VUG's line: in APPS/VUG.ELF, not in the kernel ELF
+  ◦ FORBID  \[wc-x\] desktop-app HOLD-EXPIRED                          ← TRUE: retired wording, the spec's declared tripwire
+  ◦ FORBID  :: DMG-REFUSE: the window table was not empty at entry       ← TRUE: retired wording, the spec's declared tripwire
+```
+Second cut (`reach_candidates`: whole run, `=`-prefixes, value tokens; artifact = the boot-media directory) on the same capture,
+both tools, tables byte-identical:
+```
+$ mbench --replay unaos/target/serial.log --spec x86-wc.spec --quiet --artifact unaos/target/x86_64_esp
+  ◦ FORBID     \[wc-x\] desktop-app HOLD-EXPIRED
+       0 hits — UNREACHABLE: its literal "[wc-x] desktop-app HOLD-EXPIRED" has 0 hits in x86_64_esp/ (a check that cannot fire is an absent one, LAWS §5)
+  ◦ FORBID     :: DMG-REFUSE: the window table was not empty at entry
+       0 hits — UNREACHABLE: its literal ":: DMG-REFUSE: the window table was not empty at entry" has 0 hits in x86_64_esp/ (…)
+  ❌ MBENCH FAIL — 39/41 required witnesses, 1 forbidden hit(s), 2491 lines scanned, 2 unreachable FORBID(s) [full wall 21.0s]
+```
+(39/41 and the SERIALDOOR hit are the lane's: this run carried no `UNAOS_QUARRY`/`UNAOS_FTDIRX`, the knobs the spec's RUN-BY
+line names; not this gate's.) `cargo test -p foreman`: 38 + 2 + 2 passed, the reach test now 3 pairs against a synthetic esp/.

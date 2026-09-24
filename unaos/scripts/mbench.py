@@ -228,6 +228,44 @@ def count_bytes(blob, needle):
     Rust twin has one definition to match."""
     return blob.count(needle)
 
+def reach_candidates(run, min_len=REACH_MIN):
+    """The strings whose presence in the artifact makes `run` reachable. A kernel format string keeps
+    its LABEL text contiguous and puts each value in a hole (`"whole={} nodrop={}"`), so a spec literal
+    that quotes values (`whole=skip nodrop=skip`) is not one contiguous string in the image even when
+    the line is live. Candidates, each >= min_len: the whole run; every prefix ending at an `=`; every
+    `key=value` value token. The run is UNREACHABLE only when none of them is in the artifact."""
+    cands = [run]
+    for i, ch in enumerate(run):
+        if ch == "=":
+            cands.append(run[: i + 1])
+    for tok in run.split():
+        if "=" in tok:
+            cands.append(tok.split("=", 1)[1])
+    return [c for c in cands if len(c) >= min_len]
+
+def reach_count(blob, run):
+    """The whole run's count when it is present; else the best any candidate does (0 = unreachable)."""
+    whole = count_bytes(blob, run.encode("utf-8"))
+    if whole:
+        return whole
+    return max((count_bytes(blob, c.encode("utf-8")) for c in reach_candidates(run)), default=0)
+
+def read_artifact(path):
+    """The artifact's bytes: a file, or every regular file under a directory (sorted walk — the boot
+    media, kernel and ring-3 programs alike, since a witness the VUG prints is not in the kernel ELF)."""
+    if os.path.isdir(path):
+        parts = []
+        for root, dirs, files in os.walk(path):
+            dirs.sort()
+            for f in sorted(files):
+                fp = os.path.join(root, f)
+                if os.path.isfile(fp) and not os.path.islink(fp):
+                    with open(fp, "rb") as fh:
+                        parts.append(fh.read())
+        return b"".join(parts)
+    with open(path, "rb") as f:
+        return f.read()
+
 class Directive:
     def __init__(self, kind, pattern, need=1, builtin=False, spec_line=0, spec_name=""):
         self.kind = kind          # REQUIRE | COUNT | OPTIONAL | FORBID | PENDING | COMPLETE
@@ -260,7 +298,7 @@ class Directive:
             return
         self.reach_run = run
         self.reach_art = art_name
-        self.reach = count_bytes(blob, run.encode("utf-8"))
+        self.reach = reach_count(blob, run)
 
     def unreachable(self):
         return self.kind == "FORBID" and self.hits == 0 and self.reach == 0
@@ -687,12 +725,11 @@ def apply_reach(matcher, log_path, artifact=None):
     if not art:
         return
     try:
-        with open(art, "rb") as f:
-            blob = f.read()
+        blob = read_artifact(art)
     except OSError as e:
         print(f"mbench: --artifact {art}: {e} — FORBID reachability not checked", file=sys.stderr)
         return
-    name = os.path.basename(art)
+    name = os.path.basename(art.rstrip("/")) + ("/" if os.path.isdir(art) else "")
     for d in matcher.directives:
         d.reach_check(blob, name)
 

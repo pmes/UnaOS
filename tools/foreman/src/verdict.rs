@@ -225,6 +225,67 @@ pub fn longest_literal(pat: &str, min_len: usize) -> Option<String> {
     best
 }
 
+/// The strings whose presence in the artifact makes `run` reachable: a kernel
+/// format string keeps its LABEL text contiguous and puts each value in a hole,
+/// so a spec literal quoting values (`whole=skip nodrop=skip`) is not contiguous
+/// in a live image. Candidates (each >= min_len): the whole run, every prefix
+/// ending at `=`, every `key=value` value token. mbench's `reach_candidates`.
+pub fn reach_candidates(run: &str, min_len: usize) -> Vec<String> {
+    let mut cands = vec![run.to_string()];
+    for (i, ch) in run.char_indices() {
+        if ch == '=' {
+            cands.push(run[..i + 1].to_string());
+        }
+    }
+    for tok in run.split_whitespace() {
+        if let Some((_, v)) = tok.split_once('=') {
+            cands.push(v.to_string());
+        }
+    }
+    cands.into_iter().filter(|c| c.chars().count() >= min_len).collect()
+}
+
+/// The whole run's count when present; else the best any candidate does.
+pub fn reach_count(blob: &[u8], run: &str) -> usize {
+    let whole = count_bytes(blob, run.as_bytes());
+    if whole > 0 {
+        return whole;
+    }
+    reach_candidates(run, REACH_MIN)
+        .iter()
+        .map(|c| count_bytes(blob, c.as_bytes()))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The artifact's bytes: a file, or every regular file under a directory in a
+/// sorted walk (the boot media: kernel and ring-3 programs alike).
+pub fn read_artifact(path: &Path) -> std::io::Result<Vec<u8>> {
+    if !path.is_dir() {
+        return std::fs::read(path);
+    }
+    fn walk(dir: &Path, out: &mut Vec<u8>) -> std::io::Result<()> {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        entries.sort();
+        let mut dirs = Vec::new();
+        for p in entries {
+            let meta = std::fs::symlink_metadata(&p)?;
+            if meta.is_dir() {
+                dirs.push(p);
+            } else if meta.is_file() {
+                out.extend(std::fs::read(&p)?);
+            }
+        }
+        for d in dirs {
+            walk(&d, out)?;
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(path, &mut out)?;
+    Ok(out)
+}
+
 /// Non-overlapping occurrences of `needle` in `blob` — Python's `bytes.count`.
 pub fn count_bytes(blob: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() || needle.len() > blob.len() {
@@ -278,7 +339,7 @@ impl Directive {
             return;
         }
         let Some(run) = longest_literal(&self.pattern, REACH_MIN) else { return };
-        self.reach = Some(count_bytes(blob, run.as_bytes()));
+        self.reach = Some(reach_count(blob, &run));
         self.reach_run = Some(run);
         self.reach_art = art_name.to_string();
     }
@@ -791,7 +852,7 @@ pub fn apply_reach(ev: &mut Evaluation, artifact: Option<&Path>) {
             None => return,
         },
     };
-    let blob = match std::fs::read(&art) {
+    let blob = match read_artifact(&art) {
         Ok(b) => b,
         Err(e) => {
             eprintln!(
@@ -801,7 +862,10 @@ pub fn apply_reach(ev: &mut Evaluation, artifact: Option<&Path>) {
             return;
         }
     };
-    let name = basename(&art);
+    let mut name = basename(&art);
+    if art.is_dir() {
+        name.push('/');
+    }
     for d in ev.directives.iter_mut() {
         d.reach_check(&blob, &name);
     }

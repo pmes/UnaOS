@@ -2445,17 +2445,37 @@ FORBIDs on ANOTHER knob's failure lines (`x86-usbnet.spec`'s `FORBID kind=ax8817
 LAWS §5 also forbids. The row is the finding; a reader who sees ◦ on a FORBID whose token they expected
 in the image has found the rename. The REQUIRE beside it is the present-control, as B160 said.
 
-**Where the artifact comes from.** `--artifact <file>` on `mbench.py --replay` and on `foreman`; or the
-run sidecar's new `artifact=` key, read only when the sidecar is FRESH (mode `fast`/`full`, identity
-checked — the same rule `mode=` obeys). `arroyo` writes it from `QEMU_RUN_ARTIFACT`, set beside each
-QEMU launch: `test` (`target/x86_64-unaos/release/unaos-kernel`), `test-arm`
-(`target/aarch64-unaos/release/unaos-kernel`), `kernel8-test` and `install-pi` (`kernel8.img`). A
-capture replayed without a sidecar and without `--artifact` behaves exactly as before.
+**Where the artifact comes from.** `--artifact <file-or-dir>` on `mbench.py --replay` and on `foreman`;
+or the run sidecar's new `artifact=` key, read only when the sidecar is FRESH (mode `fast`/`full`,
+identity checked — the same rule `mode=` obeys). `arroyo` writes it from `QEMU_RUN_ARTIFACT`, set beside
+each QEMU launch, and names the BOOT MEDIA, not the kernel alone: `test` → `target/x86_64_esp/`,
+`test-arm` → `target/aarch64_esp/`, `kernel8-test` and `install-pi` → `target/pi_baremetal/`. A
+directory artifact is every regular file under it in a sorted walk, and the row names it with a
+trailing slash (`has 0 hits in x86_64_esp/`). The first live run said why: `:: VUGART:` is the VUG's own
+line, in `APPS/VUG.ELF` and nowhere in the kernel ELF, and against the kernel alone it read UNREACHABLE.
+A capture replayed without a sidecar and without `--artifact` behaves exactly as before.
+
+**What counts as present.** A kernel format string keeps its LABEL text contiguous and puts each value
+in a hole — `"[ptrdead] backlog whole={} nodrop={}"` — so a spec literal that quotes the values
+(`whole=skip nodrop=skip`) is not one string in a live image. The candidates are therefore the whole
+run, every prefix of it ending at an `=`, and every `key=value` value token (each >= 6 chars), and the
+row is UNREACHABLE only when NONE of them is in the artifact (`reach_candidates` / `reach_count`). The
+same live run proved it: `[ptrdead] backlog whole=skip …` and `[status] poll .* src=unresolved` read
+UNREACHABLE against the whole-run rule and reachable (`whole=`, `unresolved`) under this one.
+
+**A ◦ that is meant.** `x86-wc.spec` keeps two FORBIDs on RETIRED wording on purpose — `[wc-x]
+desktop-app HOLD-EXPIRED` and `:: DMG-REFUSE: the window table was not empty at entry` — each with a
+comment block that cites B160, says the red was taken on the flight-11 capture, and says it reds "the
+day the retired wording comes back". Against the current media both read ◦ UNREACHABLE, which is the
+truth the author declared; the note beside a tripwire is the spec's comment, and the gate stays
+advisory precisely so that such a declared tripwire is a visible fact and not a red.
 
 **Twinned.** `mbench.py` (`literal_runs`, `longest_literal`, `count_bytes`, `Directive.reach_check`,
 `apply_reach`, `sidecar_artifact`) and `tools/foreman/src/verdict.rs` (the same names) render the same
 row and summary; GATE-FOREMAN's agreement test gained `agrees_with_mbench_on_forbid_reachability`
-(`tests/agreement.rs`): five FORBIDs against one synthetic artifact — a reachable 0-hit row, two
-unreachable rows (one the real `kind=ax88179`), a hit that still ❌s with the artifact present, and a
-sub-6-char literal that is not checked — plus the assertion that the artifact never changes an exit
-code. Measured on a real pair in `docs/dev/evidence/rmbp-0924/gates/GATES.md` §B210.
+(`tests/agreement.rs`): seven FORBIDs against a synthetic boot-media directory (`esp/kernel.elf` +
+`esp/APPS/VUG.ELF`) and against the kernel file alone — a reachable 0-hit row, two unreachable rows
+(one the real `kind=ax88179`), a hit that still ❌s with the artifact present, a sub-6-char literal
+that is not checked, a value-quoting literal reachable through its `whole=` label, and the VUG's line
+unreachable in the kernel alone (named `kernel.elf`) yet reachable in the directory (named `esp/`) —
+plus the assertion that the artifact never changes an exit code. Measured on a real pair in `docs/dev/evidence/rmbp-0924/gates/GATES.md` §B210.

@@ -4206,7 +4206,7 @@ test_aarch64() {
     # target/serial-arm.log, so the completion source is EMPTY and this verb keeps the full wall.
     # It is wired here anyway, and NOT exempted, so the day an aarch64-virt spec declares a
     # COMPLETE marker this leg gets the fast exit by naming that spec and nothing else.
-    QEMU_RUN_ARTIFACT="${WORKSPACE_DIR}/target/aarch64-unaos/release/unaos-kernel" \
+    QEMU_RUN_ARTIFACT="$ESP_DIR_ARM" \
     qemu_wait_or_complete "$qpid" "$logf" "$secs" "" "test-arm"
 
     echo ""
@@ -4920,7 +4920,8 @@ test_x86_64() {
     # returned — which is precisely the precondition `--settled` needs and the same ordering rule
     # `qemu_run_sidecar` documents: nothing further can land in the log.
     x86_test_completion "$SERIAL_LOG"
-    local QEMU_RUN_ARTIFACT="${WORKSPACE_DIR}/target/x86_64-unaos/release/unaos-kernel"
+    # The boot MEDIA, not the kernel alone: a witness the VUG prints (`:: VUGART:`) lives in APPS/VUG.ELF.
+    local QEMU_RUN_ARTIFACT="${WORKSPACE_DIR}/target/x86_64_esp"
     # `wall=` is the VERB's wall and has always included the cargo build; `qemu_wall=` is the
     # waiter's own measurement of the QEMU span, which is the number a reader comparing against
     # `cap=` actually wants, so both are recorded rather than one being passed off as the other.
@@ -11126,7 +11127,7 @@ test_kernel8() {
     # no COMPLETE line today).
     local k8_spec_main="${WORKSPACE_DIR}/scripts/specs/pi4-regression.spec"
     if [ -n "$k8_script" ]; then k8_spec_main=""; fi
-    QEMU_RUN_ARTIFACT="$KERNEL8_DIR/kernel8.img" \
+    QEMU_RUN_ARTIFACT="$KERNEL8_DIR" \
     qemu_wait_or_complete "$qpid" "$logf" "$secs" "$k8_spec_main" "kernel8-test" \
         python3 "${WORKSPACE_DIR}/scripts/qmp_shoot.py" --port "$qmp_port" --wait 0 --out "$png"
     if [ -n "$tpid" ]; then kill "$tpid" 2>/dev/null || true; wait "$tpid" 2>/dev/null || true; tpid=""; fi
@@ -11242,7 +11243,7 @@ install_pi() {
     # full-wall path `test-arm` takes (sleep the wall, kill, write the sidecar) and its behaviour is
     # unchanged. Nothing is written into `$logf`, so this function's `/PIINSTALL|:: INSTALL:/` scan
     # and its PASS regex see exactly the bytes they saw before.
-    QEMU_RUN_ARTIFACT="$KERNEL8_DIR/kernel8.img" \
+    QEMU_RUN_ARTIFACT="$KERNEL8_DIR" \
     qemu_wait_or_complete "$qpid" "$logf" "$secs" "" "install-pi"
 
     # ── In-kernel verdict ──
