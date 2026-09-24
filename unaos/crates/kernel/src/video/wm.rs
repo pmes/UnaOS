@@ -27057,7 +27057,7 @@ fn close_scope_witness(win: WinId, owner: u64, next_focus: u64) {
 /// The keyboard half (`user_input_set_active`) stays with the syscall layer on both arches, exactly
 /// as [`focus_release`]'s contract says; this verb is the wm half only. `win` is the id the operator
 /// pressed, carried for the witness alone — pass [`WIN_NONE`] from an owner-scoped caller that no
-/// longer knows it.
+/// longer knows it (CLOSESCOPE, B212: none does today — both close-box routers carry the hit's id).
 ///
 /// ### The `held` read, and why a plain load is enough
 /// `held` is read before the release rather than returned by the CAS inside it. Both are on the

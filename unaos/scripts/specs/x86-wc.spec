@@ -785,3 +785,14 @@ FORBID \[vfs\] root-pass NONE
 # `printed=16 rolled=0 … -> FAIL` on both ids; both REQUIREs miss and the default `-> FAIL` FORBID trips.
 REQUIRE \[wc-d\] latch-check forced=16 printed=1 rolled=16 win=30 reroll=0 -> PASS
 REQUIRE \[wc-d\] latch-check forced=16 printed=1 rolled=16 win=31 reroll=0 -> PASS
+# ── CLOSESCOPE (rmbp-ledger B212, 2026-09-24) — THE CLOSE-BOX PATH NAMES THE WINDOW IT CLOSED ──────
+# `[wm] close-scope` (CLOSEMIN) read `win=0` on every close-box press on both arches: `wc_close_click`
+# was owner-scoped and passed `WIN_NONE`, although the click router that calls it had the hit's
+# window id in hand (it passes it to `wc_close_furniture` on the kernel-furniture arm one branch
+# over). Both routers now hand the id through, so a reader can tie the `[wc-a] close_owner … ids=[N]`
+# line, the dock's `tile remove win=N` and the scope line by the same number. The lane closes two
+# windows on every boot (the closemin fixture's own, and the desktop battery's close-box press on a
+# user window); both must read a real id. GO-RED (measured on the before-capture, closescope-before):
+# COUNT 2 reads 1 hit and the FORBID trips on `[wm] close-scope win=0 owner=0x3`.
+COUNT 2 \[wm\] close-scope win=[1-9][0-9]* owner=0x[0-9a-f]+ next_focus=
+FORBID \[wm\] close-scope win=0 

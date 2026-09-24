@@ -6421,7 +6421,7 @@ pub const CLOSE_SETTLE_KILLED_X86: u32 = 2;
 /// resolves to no live process (kernel furniture, a witness fixture, or an app that already exited),
 /// in which case closing the windows was the whole of the effect.
 #[cfg(feature = "wc")]
-fn wc_close_click(owner: u64) -> &'static str {
+fn wc_close_click(win: crate::video::wm::WinId, owner: u64) -> &'static str { // CLOSESCOPE (rmbp-ledger B212): the router's hit carries the PRESSED window's id; `[wm] close-scope` names it instead of `win=0`.
     let closed = crate::video::wm::close_owner(owner);
     if USER_INPUT_ACTIVE.load(Ordering::Acquire) == owner {
         user_input_set_active(0);
@@ -6434,7 +6434,7 @@ fn wc_close_click(owner: u64) -> &'static str {
     // exact — the arm fires only when `focus_asid() == owner`, which a close-box press never
     // establishes by itself). A close must never park a sibling. The owner-held-focus guard lives
     // inside the verb (a CAS in `focus_release`), so it is called unconditionally.
-    crate::video::wm::focus_after_close(crate::video::wm::WIN_NONE, owner, "route=close-box shell-raise=skipped siblings=untouched"); // CLOSEMIN — `focus_after_close` is `focus_release` PLUS two things this arm did not do: it promotes the top-most surviving window (a close that left focus at the shell left the operator with a lit desktop and no focused window) and it prints the `[wm] close-scope` line. The CLOSE-TEARDOWN property this line already had — no shell raise, no sibling parked — is unchanged and is now stated by a fixture (`wm::closemin_selftest`) that runs in THIS arch's battery.
+    crate::video::wm::focus_after_close(win, owner, "route=close-box shell-raise=skipped siblings=untouched"); // CLOSEMIN — `focus_after_close` is `focus_release` PLUS two things this arm did not do: it promotes the top-most surviving window (a close that left focus at the shell left the operator with a lit desktop and no focused window) and it prints the `[wm] close-scope` line. The CLOSE-TEARDOWN property this line already had — no shell raise, no sibling parked — is unchanged and is now stated by a fixture (`wm::closemin_selftest`) that runs in THIS arch's battery.
     // `wm` owners for user rows are `slot + 1`-biased and `Proc::slot` is stored with the SAME bias
     // (see that field), so the owner IS the key — no arithmetic, and therefore no bias to get wrong.
     // Kernel furniture (`is_kernel_owner`) and owner 0 can never match a live row and fall out here.
@@ -6533,7 +6533,7 @@ pub fn wc_close_last_settle() -> u32 {
 }
 
 #[cfg(not(feature = "wc"))]
-fn wc_close_click(_owner: u64) -> &'static str {
+fn wc_close_click(_win: crate::video::wm::WinId, _owner: u64) -> &'static str {
     "nowc"
 }
 
@@ -7549,7 +7549,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
                     let settle = if crate::video::wm::is_kernel_owner(owner) {
                         wc_close_furniture(win, owner)
                     } else {
-                        wc_close_click(owner)
+                        wc_close_click(win, owner)
                     };
                     if CLOSE_LOG_COUNT_X86.fetch_add(1, Ordering::Relaxed) < CLOSE_LOG_MAX_X86 {
                         serial_println!(
