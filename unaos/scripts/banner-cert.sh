@@ -180,6 +180,14 @@
 #                    argument) or a FEATURE (matched against the banner). `+` is AND here, not OR:
 #                    the spec is one configuration, copied from the source's `not(all(...))`.
 #                    (CERTCOND, 2026-09-15, and the row that needed it is `witness`.)
+#             `@arch:<x86_64|aarch64>`
+#                    ARCH-SCOPED — the literal exists only in an artifact of that arch, because the
+#                    module that holds it is compiled under `arch/<that arch>` alone. Answered by the
+#                    artifact's own ELF header (a FLAT image takes the caller's arch argument). On the
+#                    other arch the row prints UNVERIFIABLE naming the arch — the row for a feature the
+#                    banner names but the arch cannot carry (`desktop_firmware` on x86: `UNAOS_WC=1
+#                    UNAOS_PIDESK=1 ./arroyo esp-x86` exited 2 NO VERDICT for the rename-invariant
+#                    control being 0 too, QUEUE.md §5 NEUTRAL M1 2026-09-22). (PIDESKCOND, 2026-09-24.)
 #           When a term is unsatisfied the row prints UNVERIFIABLE naming it — loud, never silent,
 #           never a pass. `-` for none. A cond this grammar cannot parse is exit 2 before any verdict
 #           is printed, the same way a short token is: a gate that cannot read its own table is not a
@@ -322,7 +330,7 @@ piusb|early/bringup_inner (P38 context, right before the first RC read)|-|measur
 genet|SKIP (no reply — pre-cable / no DHCP is the honest pre-metal state)|baremetal|measured(1)
 nettest|:: NET20-GATE: mdns host-name publish battery|baremetal|measured(1)
 pirast|:: RAST: no mailbox framebuffer (headless boot) — cube demo skipped ::|-|measured(1)
-desktop_firmware|[deskfw] activate DECLINE reason=no-panel|-|measured(1)
+desktop_firmware|[deskfw] activate DECLINE reason=no-panel|@arch:aarch64|measured(1)
 quarry|[quarry] DECLINE reason=dock-cannot-host-full-strip panel=|-|measured(1)
 wedge2|-|no gated string literal anywhere under cfg(feature="wedge2") — the knob only re-times an existing path; certify it from its serial witness, not from the artifact|unmeasured-here
 TABLE
@@ -435,7 +443,8 @@ bc_cond_bad() {  # bc_cond_bad <cond>
                 esac
                 [ -n "$body" ] || { echo "term '${c}': '!' with no feature name"; return 0; }
                 bc_name_ok "$body" || { echo "term '${c}': '${body}' is not a feature name"; return 0; } ;;
-            *@*) echo "term '${c}': '@except:' qualifies a NEGATED term only — write '!<feature>@except:<spec>'"; return 0 ;;
+            @arch:x86_64|@arch:aarch64) ;;   # ARCH-SCOPED (PIDESKCOND, 2026-09-24): the literal exists only in an artifact of this arch
+            *@*) echo "term '${c}': the only positive '@' term is '@arch:<x86_64|aarch64>'; '@except:' qualifies a NEGATED term only — write '!<feature>@except:<spec>'"; return 0 ;;
             *+*)
                 case "$c" in *++*|+*|*+) echo "term '${c}': empty alternative in an OR-group"; return 0 ;; esac
                 for t in ${c//+/ }; do
@@ -489,7 +498,7 @@ while IFS='|' read -r f tok cond state; do
     if why="$(bc_cond_bad "${cond:-}")"; then
         echo "❌ banner-cert: NO VERDICT — the cond for '${f}' is not in the grammar: ${why}"
         echo "   cond='${cond:-}'. The forms are: a bare feature; 'a+b' (OR-group); '!a' (negated);"
-        echo "   '!a@except:<arch-or-feature>[+…]' (negated with an exception). Commas are AND."
+        echo "   '!a@except:<arch-or-feature>[+…]' (negated with an exception), '@arch:<x86_64|aarch64>' (arch-scoped). Commas are AND."
         exit 2
     fi
     probe="${tok#!}"; probe="${probe#@boot }"
@@ -543,6 +552,10 @@ for f in ${BANNER//,/ }; do
                     done
                     [ -n "$_bc_miss" ] && { skip="EXC ${_bc_neg}|${_bc_exc}|${_bc_miss}"; break; }
                     ;;
+                @arch:*)  # ARCH-SCOPED: the module that holds the literal is compiled on ONE arch (`desktop_firmware`
+                          # lives under arch/aarch64); on the other arch the row is UNVERIFIABLE by name, never MISSING
+                          # and never a NO VERDICT — the artifact's own ELF header answers, not an argument.
+                    [ "$BC_ARCH" = "${c#@arch:}" ] || { skip="ARCH ${c#@arch:}"; break; } ;;
                 *+*)   # an OR-group: ANY one of the alternatives makes the literal exist
                     _bc_sat=""
                     for alt in ${c//+/ }; do bc_in_list "$alt" "$BANNER" && { _bc_sat=1; break; }; done
@@ -556,6 +569,7 @@ for f in ${BANNER//,/ }; do
             EXC\ *) _bc_s="${skip#EXC }"
                     _bc_n="${_bc_s%%|*}"; _bc_r="${_bc_s#*|}"; _bc_e="${_bc_r%%|*}"; _bc_w="${_bc_r#*|}"
                     echo "feature=${f} witness=${tok} hits=- -> UNVERIFIABLE (its literal needs 'NOT ${_bc_n}' EXCEPT on '${_bc_e}'; this build carries '${_bc_n}' and the exception does NOT hold here — ${_bc_w} — so that configuration makes the code the literal lives in UNREACHABLE, and its absence proves nothing about the feature)" ;;
+            ARCH\ *) echo "feature=${f} witness=${tok} hits=- -> UNVERIFIABLE (its literal exists only in a ${skip#ARCH } artifact; this one is ${BC_ARCH} — the module is compiled on that arch alone, so the row cannot fire here and says so)" ;;
             NOT\ *) echo "feature=${f} witness=${tok} hits=- -> UNVERIFIABLE (its literal needs '${skip}', and this build carries '${skip#NOT }' — that configuration makes the code the literal lives in UNREACHABLE, so its absence proves nothing about the feature)" ;;
             *)      echo "feature=${f} witness=${tok} hits=- -> UNVERIFIABLE (its literal also needs '${skip}', which this build does not carry)" ;;
         esac

@@ -2030,6 +2030,25 @@ host that never scheduled the pass. Tracked as orin-ledger A68, which also recor
 separate and more dangerous finding that `./arroyo test`'s default 20 s wall decides
 whether this fixture is reached at all.
 
+## A serial print between two ladder fixtures costs the next fixture an event (DRAGSTALL, 2026-09-12)
+
+**Witness.** `[dmgovlp] verdict … drag_evt=0 … -> FAIL` (the entry above) with the healthy
+`drag_evt=5 -> PASS` on the SAME host and load — the difference being a fixture that PRINTS between
+`dmgovlp_selftest`'s driver and its verdict.
+
+**Mechanism (measured, DRAGSTALL executor).** The x86 witness ladder's rule "no fixture between two
+ladder fixtures may lose an event" extends to SERIAL PRINTS: a line-neutral fixture appended at the HEAD
+of `dmgovlp_selftest` — printing, not consuming events — cost that fixture its drag leg (`drag_evt=0`),
+because the ladder's injected pointer events arrive on the wall clock while the guest is inside the
+serial write, and the drag leg's window closed before they were polled. Moved to `physwit_once`'s site
+(outside the ladder's event window) the same fixture is green. So: **a print is a stall, and a stall
+inside another fixture's event window is a lost event.** Place a new fixture at a ladder-neutral site,
+never at the head or tail of a fixture that consumes injected events.
+
+**Certainty.** Root cause known (measured both placements, same tree). Not a flake of the fixture — a
+placement rule for its neighbours. Related: `./arroyo test`'s 20 s default wall does not reach the x86
+witness ladder on a loaded host; a brief that gates on a ladder fixture needs `./arroyo test 90`.
+
 ## Adding an entry
 
 An entry earns its place when a failure has been seen **more than once**, or once

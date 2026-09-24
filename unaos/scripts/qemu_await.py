@@ -173,6 +173,9 @@ def main(argv=None):
     ap.add_argument("--spec", required=True, help="the spec whose COMPLETE markers end the run")
     ap.add_argument("--cap", type=float, default=None, help="hard cap in seconds (the verb's own wall)")
     ap.add_argument("--grace", type=float, default=20.0, help="seconds to keep reading after completion")
+    ap.add_argument("--quiet", type=float, default=1.0,
+                    help="QUIETKILL: after the grace, do not report completion (so the caller does not kill) until the "
+                         "capture has grown by no byte for this many seconds AND its tail ends in a newline; bounded by --cap")
     ap.add_argument("--label", default="qemu-run", help="verb name, for the human line on stderr")
     ap.add_argument("--settled", action="store_true",
                     help="the capture is FINISHED: read it once and report whether the run "
@@ -215,6 +218,8 @@ def main(argv=None):
     forbid_hits_after = 0
     buf = b""
     pos = 0
+    last_growth = time.time()   # QUIETKILL: when the capture last grew
+    quiet_waited = 0.0
 
     while True:
         now = time.time()
@@ -235,6 +240,7 @@ def main(argv=None):
             return 2
 
         if chunk:
+            last_growth = time.time()
             buf += chunk
             # Only COMPLETE lines are fed. A trailing partial line is held back until
             # its newline arrives, so a marker split across two reads is never missed
@@ -252,7 +258,18 @@ def main(argv=None):
                   f"{a.grace:.0f}s grace with every FORBID live.", file=sys.stderr)
 
         if grace_end is not None and time.time() >= grace_end:
-            break
+            # QUIETKILL (QUEUE.md §5, rmbp gate9a 2026-09-22): the grace is a SOAK for FORBIDs, not a
+            # promise that the guest has stopped writing. On a box at load 34 the kill fired after the
+            # marker and the 20 s grace while the guest was mid-line (`[click2] depth gui_chan=0 (se`),
+            # and the truncation rule then refused a boot that had printed every witness — a false red.
+            # So the stopping decision also asks: has the capture gone QUIET (no byte for --quiet
+            # seconds) AND does its tail end in a newline (`buf` holds the unterminated remainder)?
+            # Both, or keep reading — bounded by --cap, which the deadline test above still enforces.
+            # mbench's mid-line check downstream stays; it now fires only for a writer that really
+            # died mid-write, not for one the harness killed there.
+            if not buf and (time.time() - last_growth) >= a.quiet:
+                break
+            quiet_waited = time.time() - grace_end
 
         # 0.2 s: fast enough that the grace window is measured rather than rounded, slow
         # enough that a 300 s cap costs ~1500 short reads instead of a spin.
@@ -262,8 +279,12 @@ def main(argv=None):
     if complete_at is None:
         print(f"AWAIT status=cap complete_at=- forbid_hits=0 wall={wall:.1f}")
         return 3
+    if quiet_waited > 0.0:
+        print(f"⚡ {a.label}: QUIETKILL held the kill {quiet_waited:.1f}s past the grace until the capture went quiet "
+              f"({a.quiet:.1f}s without a byte) on a newline-terminated tail"
+              + (" — cap reached while still writing" if time.time() >= deadline else ""), file=sys.stderr)
     print(f"AWAIT status=complete complete_at={complete_at:.1f} "
-          f"forbid_hits={forbid_hits_after} wall={wall:.1f}")
+          f"forbid_hits={forbid_hits_after} wall={wall:.1f} quiet_held={quiet_waited:.1f}")
     return 0
 
 

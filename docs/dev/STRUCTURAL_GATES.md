@@ -1079,6 +1079,15 @@ control and should be argued for.
 
 ---
 
+**`@arch:<x86_64|aarch64>` (PIDESKCOND, B208, 2026-09-24).** A fourth `cond` term: the literal exists only in an
+artifact of that arch, because the module that holds it is compiled under `arch/<arch>` alone. Answered by
+the artifact's own ELF header (a FLAT image takes the caller's arch argument). On the other arch the row
+prints `UNVERIFIABLE (its literal exists only in a aarch64 artifact; this one is x86_64 …)` — loud, named,
+counted in `unverifiable=`, never MISSING and never NO VERDICT. The row that needed it is `desktop_firmware`:
+NEUTRAL M1 measured `UNAOS_WC=1 UNAOS_PIDESK=1 ./arroyo esp-x86` exiting 2 at two tips because the row's
+`cond=-` claimed every arch and both its witness and its rename-invariant control were 0 on x86. Proven on the
+Pi `kernel8.img` (OK, hits=1) and the x86 kernel ELF (UNVERIFIABLE by arch, `noverdict=0`).
+
 ## GATE-FC2 — a module may not be declared wider than every path that can reach it
 
 **Invariant.** For every non-inline `mod` / `pub mod` declaration reachable from

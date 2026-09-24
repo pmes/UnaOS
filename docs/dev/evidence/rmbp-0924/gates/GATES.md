@@ -142,3 +142,30 @@ $ k8-reach.py --evidence UNAOS_DMAWIN
 UNAOS_DMAWIN: 0 site(s), 0 Pi-live, 0 negated
 ```
 Registered ENV: UNAOS_DMAWIN, UNAOS_NET4_RINGDUMP, UNAOS_NET4_BUF1, UNAOS_NET4_DHCP_MS (each with its option_env! site). Named by arroyo (6): UNAOS_FBH, UNAOS_FBW, UNAOS_GIT_SHA, UNAOS_NOJB11, UNAOS_V3D81_SETTLE_MS, UNAOS_V3D_FIRSTKICK. Dual-keyed with a _feats line (2): UNAOS_NET4, UNAOS_SMPPROBE. (Lists computed with the tool's own parsers.)
+
+## PIDESKCOND (B208) — the `desktop_firmware` row scoped to its arch
+```
+$ banner-cert.sh target/pi_baremetal/kernel8.img baremetal,skip_xhci,witness,desktop_firmware,login,loginst aarch64
+feature=desktop_firmware witness=[deskfw] activate DECLINE reason=no-panel hits=1 -> OK
+⚡ banner-cert: ok=5 missing/leak=0 registered-divergences=0 unverifiable=1 nowitness=0 noverdict=0
+$ banner-cert.sh target/x86_64-unaos/release/unaos-kernel wc,witness,desktop_firmware
+feature=desktop_firmware witness=[deskfw] activate DECLINE reason=no-panel hits=- -> UNVERIFIABLE (its literal exists only in a aarch64 artifact; this one is x86_64 — the module is compiled on that arch alone, so the row cannot fire here and says so)
+⚡ banner-cert: ok=2 missing/leak=0 registered-divergences=0 unverifiable=1 nowitness=0 noverdict=0
+✅ banner-cert: every feature the banner named is in the artifact.   exit 0
+```
+Before: the same x86 shape exited 2 NO VERDICT (NEUTRAL M1, `docs/dev/evidence/rmbp-0915/neutral/m1-bannercert-pidesk-x86-RED.txt`).
+
+## QUIETKILL (B209) — the completion kill waits for a quiet, newline-terminated tail
+Synthetic writer: the COMPLETE marker at t=0, then `[click2] depth gui_chan=0 (se` with a byte every 0.3 s for ~2.7 s, then ` tail)\n`.
+```
+$ qemu_await.py --log qk.log --spec qk.spec --cap 20 --grace 1 --quiet 0.6 --label qk
+⚡ qk: run complete at +0.0s — holding 1s grace with every FORBID live.
+⚡ qk: QUIETKILL held the kill 2.4s past the grace until the capture went quiet (0.6s without a byte) on a newline-terminated tail
+AWAIT status=complete complete_at=0.0 forbid_hits=0 wall=3.6 quiet_held=2.4        (tail byte at AWAIT: \n)
+$ … --quiet 0          (the newline half alone; before this change the AWAIT line came at the grace, +1.5 s, mid-line)
+AWAIT status=complete complete_at=0.0 forbid_hits=0 wall=3.0 quiet_held=1.8
+$ … --cap 3 --grace 0.5 --quiet 0.6   against a writer that never stops or ends its line
+⚡ qk-cap: QUIETKILL held the kill 2.3s past the grace until the capture went quiet (0.6s without a byte) on a newline-terminated tail — cap reached while still writing
+AWAIT status=complete complete_at=0.0 forbid_hits=0 wall=3.0 quiet_held=2.3
+```
+Live measurement is the next bench `kernel8-test` (the leg that produced the false red); this container's QEMU has no raspi4b.
