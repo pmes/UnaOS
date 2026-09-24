@@ -3921,8 +3921,8 @@ LADDER_CENSUS_test=':: U8x:|:: U9x:|:: WINX-1:|:: WINX-2:|:: WINX-3:|:: WINX-7:|
 #          ⚠ It is a PASS-COUNT point, not the end of every knob's work: a fixture a knob adds later
 #          in the loop can print after it, and this row does not certify such a fixture — a spec does
 #          (`arm-login.spec` names its own COMPLETE for exactly that reason).
-LADDER_TAIL_test_arm_gicv3=':: CAPSTONE COMPLETE'
-LADDER_CENSUS_test_arm_gicv3=':: JC3: SMP proof done|:: AARCH64 SCHED (virt):|:: CAPSTONE: verifying all 6|:: CAPSTONE COMPLETE'
+LADDER_TAIL_test_arm_gicv3=':: CAPSTONE COMPLETE|:: CAPSTONE INCOMPLETE'   # B103: a failed capstone still ENDS the ladder (its own line), so the run is scored red rather than called truncated
+LADDER_CENSUS_test_arm_gicv3=':: JC3: SMP proof done|:: AARCH64 SCHED (virt):|:: CAPSTONE: verifying all 6|6 sync primitives'   # B103: the last rung is the closing line's phrase (`all 6 sync primitives` / `n/6 sync primitives`), present on a COMPLETE and an INCOMPLETE boot alike; the TAIL check, not this census, is what says the ladder ended
 LADDER_TAIL_test_arm_gicv2=':: BOT: tx single='
 LADDER_CENSUS_test_arm_gicv2='MISSION SUCCESS|[usbw] write lba=|xHCI: === USB topology summary ===|:: BOT: tx single='
 
@@ -4401,7 +4401,8 @@ X86_DEFAULT_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-default.spec"
 X86_INSTALL_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-install.spec"
 X86_PTR_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-ptr.spec"
 X86_SPLASH_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-splash.spec"
-X86_USBNET_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-usbnet.spec"   # USBNET (SO56): the dongle-only leg, UNAOS_USBNET=1 UNAOS_NOE1000=1
+X86_USBNET_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-usbnet.spec"
+X86_WC_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-wc.spec"         # WCLANE (B156): the compositor leg, UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1   # USBNET (SO56): the dongle-only leg, UNAOS_USBNET=1 UNAOS_NOE1000=1
 X86_REPLAY_SPEC=""   # path of the spec to replay, or "" when none describes this capture
 X86_REPLAY_WHY=""    # why there is none — printed verbatim in the skip line
 x86_pick_capture_spec() {
@@ -4481,6 +4482,17 @@ x86_pick_capture_spec() {
     # about the fixture rather than about the kernel. Refused out loud, with the knob named.
     if [ -n "${UNAOS_INSTALLDEMO:-}" ] || [ -n "${UNAOS_PART_DISK:-}" ] || [ -n "${UNAOS_NOSTORAGE:-}" ]; then
         X86_REPLAY_WHY="a medium knob replaced the usb-storage backing (UNAOS_INSTALLDEMO='${UNAOS_INSTALLDEMO:-}' UNAOS_PART_DISK='${UNAOS_PART_DISK:-}' UNAOS_NOSTORAGE='${UNAOS_NOSTORAGE:-}') — the x86 specs' storage pins describe the DEFAULT stick, and asserting them against a disk QEMU did not attach would be a red about the fixture, not about the kernel."
+        return 0
+    fi
+    # WCLANE (QUEUE.md §5 MENUFIRST finding, rmbp-ledger B156, 2026-09-22: "x86-wc.spec IS NOT IN THE HARNESS'S
+    # AUTOMATIC REPLAY SET"): the compositor leg that x86-wc.spec names as its gate — UNAOS_WC=1 UNAOS_QUARRY=1
+    # UNAOS_FTDIRX=1 with no medium or lane knob — now replays it here, so MENUDROP, MENUSTAT, STRIPVAC, DMGOVLP,
+    # PRTSCR-REFUSE, STRIPVAC-DEBT and the SO22 labels are scored by the verb and not by a hand-run mbench
+    # (2026-09-24: six hand replays in one session was the measurement). Ordered AFTER the lane knobs above
+    # (splash/ptr/typist/ahci each own their own spec) and BEFORE the medium case below.
+    if [ -n "${UNAOS_WC:-}" ] && [ -n "${UNAOS_QUARRY:-}" ] && [ -n "${UNAOS_FTDIRX:-}" ] && [ -z "${UNAOS_FATIMG:-}" ] \
+       && [ -z "${UNAOS_USBNET:-}" ] && [ -z "${UNAOS_HDA:-}" ] && [ -z "${UNAOS_HDATONE:-}" ] && [ -z "${UNAOS_LOGIN:-}" ]; then
+        X86_REPLAY_SPEC="$X86_WC_SPEC"
         return 0
     fi
     if [ -n "${UNAOS_USBNET:-}" ]; then

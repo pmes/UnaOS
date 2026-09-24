@@ -8269,8 +8269,8 @@ fn cap_rw_reader(_: usize) {
     }
 }
 
-fn cap_report(name: &str, pass: bool) {
-    serial_println!(":: CAPSTONE {}: {} ::", name, if pass { "PASS" } else { "FAIL" });
+static CAP_FAILS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0); fn cap_report(name: &str, pass: bool) { // B103: the verdicts are COUNTED here so the closing line below can tell COMPLETE from INCOMPLETE; same-line so no `Location` below moves
+    if !pass { CAP_FAILS.fetch_add(1, Ordering::Relaxed); } serial_println!(":: CAPSTONE {}: {} ::", name, if pass { "PASS" } else { "FAIL" });
 }
 
 /// The capstone coordinator: run each primitive's cross-core self-test in sequence and report. Runs
@@ -8330,7 +8330,7 @@ fn capstone_body(_: usize) {
     // 6. join() — exercised in EVERY step above (each spawn_joinable + join blocked the coordinator
     //    until the worker's completion post, at least one cross-core).
     cap_report("join", true);
-    serial_println!(":: CAPSTONE COMPLETE — all 6 sync primitives verified in one boot ::");
+    let cap_fails = CAP_FAILS.load(Ordering::Relaxed); if cap_fails == 0 { serial_println!(":: CAPSTONE COMPLETE — all 6 sync primitives verified in one boot ::"); } else { serial_println!(":: CAPSTONE INCOMPLETE — {}/6 sync primitives FAILED in this boot -> FAIL ::", cap_fails); } // B103: this line printed COMPLETE UNCONDITIONALLY, three lines after six `cap_report(name, bool)` calls that could each say FAIL — a lying tail. Now it is the six verdicts' sum; INCOMPLETE is declared as a second ladder tail (arroyo LADDER_TAIL_test_arm_gicv3, arm-login.spec COMPLETE) so a failed capstone is a RED, not a "truncated" no-verdict. Same-line, `Location`-neutral.
     // PI-SCHED-1 — one-shot per-core load snapshot at a steady state (after the capstone has driven
     // real cross-core dispatch on every AP). `pi`-gated (fires on the target + `kernel8-test`, byte-
     // identical for jetson/virt); `core_load_report()` itself is callable on demand for future paths.

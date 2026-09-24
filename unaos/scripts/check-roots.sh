@@ -26,10 +26,22 @@
 # must be enumerated as a binary AND resolved as a root of check_both itself, and the matrix
 # expansion must yield at least one crate. Otherwise exit 2 with NO verdict.
 #
-# usage: check-roots.sh          (exit 0 all binaries named; 1 a binary is unnamed; 2 control failed)
+# usage: check-roots.sh [<unaos dir>]   (exit 0 all binaries named; 1 a binary is unnamed; 2 control failed)
+#   The optional argument is the `unaos/` directory of the tree to scan. B96 (QUEUE.md §5): the script
+#   used to derive its root from BASH_SOURCE alone and silently ignored any path handed to it, so a
+#   cross-tree run (a worktree's copy of this script pointed at another checkout, or vice versa)
+#   scanned its own tree and reported on the wrong one. Now: an argument names the tree, it must hold
+#   an `arroyo`, and the verdict header says which tree was scanned.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-UNAOS="$(cd "$HERE/.." && pwd)"
+if [ $# -gt 1 ]; then echo "GATE-ROOTS: usage: check-roots.sh [<unaos dir>] — got $# arguments. No verdict." >&2; exit 2; fi
+if [ $# -eq 1 ]; then
+  [ -d "$1" ] || { echo "GATE-ROOTS: control FAILED — $1 is not a directory. No verdict." >&2; exit 2; }
+  UNAOS="$(cd "$1" && pwd)"
+else
+  UNAOS="$(cd "$HERE/.." && pwd)"
+fi
+echo "GATE-ROOTS: tree=$UNAOS"
 ARROYO="$UNAOS/arroyo"
 ENTRY="check_both"
 

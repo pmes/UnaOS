@@ -94,7 +94,7 @@ FORBID \[login\] ignition desktop_up=false console_routed=(true|false) -> OPEN
 # ── 7. THE END OF THE RUN ────────────────────────────────────────────────────────────────────────
 # The virt GICv3 boot's last line (B188 M3 declares the same marker as `test-arm`'s LADDER-TAIL row). A capture
 # without it is TRUNCATED on replay, never scored.
-COMPLETE :: CAPSTONE COMPLETE .* sync primitives verified in one boot ::
+COMPLETE :: CAPSTONE (COMPLETE — all 6 sync primitives verified|INCOMPLETE — \d+/6 sync primitives FAILED) in (one|this) boot
 
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
 # A PINNED LINE IN THIS FILE IS CHANGED TOGETHER WITH THE KERNEL LINE IT PINS, IN THE SAME COMMIT —
