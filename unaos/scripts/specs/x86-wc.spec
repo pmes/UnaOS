@@ -318,6 +318,11 @@ REQUIRE :: SMPLOAD: t=\d+ cpus=\d+ busy=\[.*\] runq=\[.*\] stealable=\[.*\] migr
 FORBID :: SMPLOAD: .* -> FAIL
 REQUIRE :: SMPLOAD-JUDGE: flat=0/0 pegged=0/0 burst=1/1 twice=1/2 untracked=0/0 fail_at=2 -> PASS ::
 FORBID :: SMPLOAD-JUDGE: .* -> FAIL
+# --- APPTITLE / WINTITLE (SO28; QUEUE §1's "titled Application" line, prep 2026-09-24): the late-arm leg is
+# --- the race that titled render13's windows "Application"; it was green and UNPINNED. Go-red: drop the
+# --- `app_name_adopt` call — `late-arm=0`, the FORBID hits.
+REQUIRE :: WINTITLE: program_name=1 document=1 label=1 .* declared=1 row=1 forget=1 late-arm=1 PASS ::
+FORBID :: WINTITLE: .* late-arm=0
 FORBID :: VUGPROBE: .* :: FAIL ::
 # --- A SKIP is no panel or a full window table. On this gate neither is honest — the DMGOVLP /
 # --- MENUDROP / STRIPVAC rule above, one row and the same panel — so a SKIP is a lost fixture.
