@@ -555,8 +555,8 @@ fn try_load() -> Result<(), FatError> {
     if TABLE.lock().loaded {
         return Ok(());
     }
-    let fs = crate::fs::fat::mount()?;
-    let veto = if fs.write_veto().is_some() { "ro" } else { "rw" };
+    let fs = store_mount()?;
+    let veto = if fs.write_veto().is_some() { "ro" } else { "rw" }; let via = store_via().name(); // LOGIN16 (B217): the load line names the ladder rung the volume mounted through
     let (src, img) = match read_root_file(&fs, USERS_FILE) {
         Some(b) => ("dat", Some(b)),
         None => match read_root_file(&fs, USERS_TMP_FILE) {
@@ -568,7 +568,7 @@ fn try_load() -> Result<(), FatError> {
     match img {
         None => {
             t.next_uid = fresh_uid_base();
-            serial_println!("[users] load volume=el0-fat({}) src=none users=0 (fresh store) next_uid={}", veto, t.next_uid);
+            serial_println!("[users] load volume=el0-fat({}) via={} src=none users=0 (fresh store) next_uid={}", veto, via, t.next_uid);
         }
         Some(b) => match parse_image(&b) {
             Ok(p) => {
@@ -577,16 +577,16 @@ fn try_load() -> Result<(), FatError> {
                 t.rows = p.rows;
                 t.next_uid = p.next_uid;
                 serial_println!(
-                    "[users] load volume=el0-fat({}) src={} users={} seq={} ver={} next_uid={} legacy_rows={}",
-                    veto, src, p.count, p.seq, p.ver, p.next_uid,
+                    "[users] load volume=el0-fat({}) via={} src={} users={} seq={} ver={} next_uid={} legacy_rows={}",
+                    veto, via, src, p.count, p.seq, p.ver, p.next_uid,
                     (0..p.count as usize).filter(|&i| p.rows[i].kdf == KDF_LEGACY).count()
                 );
             }
             Err(e) => {
                 t.next_uid = fresh_uid_base();
                 serial_println!(
-                    "[users] load volume=el0-fat({}) src={} REFUSED reason={} len={} (store starts empty)",
-                    veto,
+                    "[users] load volume=el0-fat({}) via={} src={} REFUSED reason={} len={} (store starts empty)",
+                    veto, via,
                     src,
                     users_reason(e),
                     b.len()
@@ -602,7 +602,7 @@ fn try_load() -> Result<(), FatError> {
 /// leaf. A failure anywhere leaves the previous live leaf in place and the RAM table as written.
 /// Always writes v2 (`USERS_VER`): a v1 image adopted at load goes to disk as v2 at its first flush.
 fn flush(t: &mut Table) -> Result<(), UsersError> {
-    let fs = crate::fs::fat::mount().map_err(|_| UsersError::Volume)?;
+    let fs = store_mount().map_err(|_| UsersError::Volume)?;
     let mut img = [0u8; USERS_IMAGE_MAX];
     t.seq = t.seq.wrapping_add(1);
     let n = serialize_into(t.seq, t.next_uid, &t.rows[..t.count as usize], &mut img);
@@ -839,7 +839,7 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
     // that cannot take the write (read-only, vetoed) still opens the session: the home is owed, not the
     // login, and the witness line names the refusal.
     if let Err(e) = ensure_home(name) {
-        serial_println!("[users] home=/home/{} NOT created reason={} volume={}", core::str::from_utf8(name).unwrap_or("?"), users_reason(e), crate::fs::fat::mount().map(|f| f.volume_fingerprint().0).unwrap_or(0)); // SECLOGIN M6: the serial, 0 when the volume itself could not be mounted
+        serial_println!("[users] home=/home/{} NOT created reason={} volume={}", core::str::from_utf8(name).unwrap_or("?"), users_reason(e), store_mount().map(|f| f.volume_fingerprint().0).unwrap_or(0)); // SECLOGIN M6: the serial, 0 when the volume itself could not be mounted
     }
     {
         let mut s = SESSION_LOCAL.lock();
@@ -864,7 +864,7 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
 /// ACL row (LEDGER SO35); the FILES a program creates inside it are owned through the SYS_OPEN
 /// owner/grants rows exactly as any private create, and that is what the home ACL proof exercises.
 pub fn ensure_home(name: &[u8]) -> Result<&'static str, UsersError> {
-    let fs = crate::fs::fat::mount().map_err(|_| UsersError::Volume)?;
+    let fs = store_mount().map_err(|_| UsersError::Volume)?;
     let home_fc = match fs.locate_in_dir(0, "HOME") {
         Ok((de, _, _)) if de.is_dir => de.first_cluster(),
         Ok(_) => return Err(UsersError::Volume),
@@ -1769,7 +1769,7 @@ pub fn login_kown_fixture() {
                 Err(_) => "OTHER",
             }
         };
-        let (e1, e2) = match crate::fs::fat::mount() {
+        let (e1, e2) = match store_mount() {
             Ok(fs) => (probe(&fs, "USERS.DAT"), probe(&fs, "/USERS.NEW")),
             Err(_) => ("no-volume", "no-volume"),
         };
@@ -2374,7 +2374,7 @@ pub fn adduser_commit(name: &[u8]) -> Result<(u32, bool), &'static str> {
     let created = match ensure_home(name) {
         Ok(v) => v == "created",
         Err(e) => {
-            serial_println!("[users] home=/home/{} NOT created reason={} volume={}", wire_name(name), users_reason(e), crate::fs::fat::mount().map(|f| f.volume_fingerprint().0).unwrap_or(0));
+            serial_println!("[users] home=/home/{} NOT created reason={} volume={}", wire_name(name), users_reason(e), store_mount().map(|f| f.volume_fingerprint().0).unwrap_or(0));
             false
         }
     };
@@ -2615,7 +2615,7 @@ pub fn login_rootout_fixture() {
 // … (global BLOCK_DEVICE untouched)`, `AHCI: registered port=0 … (global BLOCK_DEVICE untouched)`). Under
 // QEMU the test disk sets the global, so the guard opened and the login lane was green — the guard
 // measured the QEMU disk's shape, not "a store can be mounted". `fat::mount()` (what `try_load` uses)
-// already falls back to the internal card on `x86_64 + sdhcblk`; the load would have succeeded if asked.
+// was ASSUMED to fall back to the internal card — flight 14 §1 read that it did not (LOGIN16, below).
 // So: ready when ANY registered disk can carry the store — the global slot, the SDHC handle, or an AHCI
 // registry entry — and the mount's own retry bound stays the verdict on whether it actually mounts.
 
@@ -2663,5 +2663,61 @@ fn usersready_fixture() {
         ":: USERSREADY: rmbp-shape(global=0 sdhc=1 ahci=1)={} qemu-shape(global=1 sdhc=1 ahci=0)={} none={} old-guard-on-rmbp={} this-boot ready-by=global={} sdhc={} ahci={} -> {} ::",
         rmbp as u8, qemu as u8, none as u8, old_guard_rmbp as u8, g as u8, s as u8, a, if ok { "PASS" } else { "FAIL" }
     );
+    // LOGIN16 (B217): the ladder on the same three shapes; the OLD mount (`BlockSource::Default`, the
+    // global slot only) on the rMBP shape is the go-red — it names nothing, which is flight 14 §1.
+    let (m_rmbp, m_qemu, m_none) = (store_via_from(false, true, 1), store_via_from(true, true, 0), store_via_from(false, false, 0));
+    let old_mount = |global: bool| if global { StoreVia::Global } else { StoreVia::None }; // `BlockSource::Default` asks `block::info()` and nothing else
+    let old_mount_rmbp = old_mount(false); // global=0 on the rMBP shape
+    let mok = m_rmbp == StoreVia::Sdhc && m_qemu == StoreVia::Global && m_none == StoreVia::None && old_mount_rmbp == StoreVia::None;
+    serial_println!(
+        ":: USERSMOUNT: rmbp-shape={} qemu-shape={} none={} old-mount-on-rmbp={} this-boot via={} -> {} ::",
+        m_rmbp.name(), m_qemu.name(), m_none.name(), old_mount_rmbp.name(), store_via().name(), if mok { "PASS" } else { "FAIL" }
+    );
 }
 
+// ── LOGIN16 (rmbp-ledger B217; flight 14 §1) ─────────────────────────────────────────────────────────
+// LOGIN15 opened the guard on the rMBP (`USERSREADY … ready-by=global=0 sdhc=1 ahci=1 -> PASS`) and the
+// very next call, `fat::mount()` = `mount_source(BlockSource::Default)`, asked the GLOBAL slot again:
+// `NoDisk` on every pass, `did not mount after 4096 passes`, no `[users] load`, no root row, no alert,
+// Log Out refused for the wrong reason. The mount doc promised "the global, else the internal card" and
+// the code did only the first clause. So the store's mount now walks the SAME ladder the guard reads —
+// the global slot, else the SDHC card, else the first AHCI registry entry — through one resolver, and
+// the fixture below proves the pure ladder on the three shapes with the old global-only mount as the
+// go-red (it resolves to NOTHING on the rMBP shape, which is the void this arc closes). Every users
+// mount (`try_load`, `flush`, `ensure_home`, the home witness) goes through `store_mount`, so the leaf a
+// boot reads and the leaf it writes are on the same volume by construction.
+
+/// The ladder rung the users store mounts from. `None` is "nowhere to ask" — `store_ready` false.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StoreVia { Global, Sdhc, Ahci, None }
+
+impl StoreVia {
+    pub fn name(self) -> &'static str {
+        match self { StoreVia::Global => "global", StoreVia::Sdhc => "sdhc", StoreVia::Ahci => "ahci", StoreVia::None => "none" }
+    }
+}
+
+/// The PURE ladder (unit-tested by [`usersready_fixture`]): the global slot wins when it exists, then
+/// the card, then AHCI — the same precedence `block::program_source` gives programs, so a boot that
+/// already worked mounts the store where it always did.
+pub fn store_via_from(global: bool, sdhc: bool, ahci: usize) -> StoreVia {
+    if global { StoreVia::Global } else if sdhc { StoreVia::Sdhc } else if ahci > 0 { StoreVia::Ahci } else { StoreVia::None }
+}
+
+fn store_via() -> StoreVia {
+    store_via_from(crate::drivers::block::info().is_some(), sdhc_registered(), ahci_registered())
+}
+
+/// Mount the store's volume on the rung [`store_via`] names. A rung whose driver this image does not
+/// compile cannot be named by the registry (its `*_registered` reads 0), so the `_` arm is `None` only.
+fn store_mount() -> Result<FatFs, FatError> {
+    let source = match store_via() {
+        StoreVia::Global => crate::fs::fat::BlockSource::Default,
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+        StoreVia::Sdhc => crate::fs::fat::BlockSource::Sdhc,
+        #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+        StoreVia::Ahci => crate::fs::fat::BlockSource::Ahci(crate::drivers::block::ahci_port_at(0).ok_or(FatError::NoDisk)?),
+        _ => return Err(FatError::NoDisk),
+    };
+    crate::fs::fat::mount_source(source)
+}

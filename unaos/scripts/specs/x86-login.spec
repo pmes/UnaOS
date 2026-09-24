@@ -438,3 +438,6 @@ REQUIRE :: LOGIN-KOWN: pred=ok resolver=refused err=KernelOwned,KernelOwned reas
 # predicate on the rMBP shape, the QEMU shape and none, with the old guard's rMBP answer as the go-red.
 REQUIRE :: USERSREADY: rmbp-shape\(global=0 sdhc=1 ahci=1\)=1 .* none=0 old-guard-on-rmbp=0 .* -> PASS ::
 FORBID :: USERSREADY: .* -> FAIL
+REQUIRE :: USERSMOUNT: rmbp-shape=sdhc qemu-shape=global none=none old-mount-on-rmbp=none this-boot via=(global|sdhc) -> PASS ::
+FORBID :: USERSMOUNT: .* -> FAIL
+REQUIRE \[users\] load volume=el0-fat\(rw\) via=(global|sdhc) 
