@@ -431,3 +431,10 @@ FORBID wrong-pw
 # gate): the guard returning `Invalid` again reads `err=OTHER,OTHER -> FAIL —`. GREEN CERTIFIES: x86 has a
 # verdict for SECLOGIN M4 (aarch64 has had one since ARMUSERS), and the refusal is the typed one.
 REQUIRE :: LOGIN-KOWN: pred=ok resolver=refused err=KernelOwned,KernelOwned reason=kernel-owned -> PASS ::
+# ── LOGIN15 (rmbp-ledger B213, flight 13 §1) — THE GUARD THAT HELD THIS WHOLE FILE'S CHAIN SHUT ON THE METAL.
+# `users::service()` returned at `block::info().is_none()` on every rMBP pass (nothing sets the global slot
+# there), so none of the fixtures above ever ran on flights 12 and 13 while this lane read 53/53: the guard
+# measured the QEMU disk's shape. Readiness is now "any registry holds a disk"; the fixture below is the
+# predicate on the rMBP shape, the QEMU shape and none, with the old guard's rMBP answer as the go-red.
+REQUIRE :: USERSREADY: rmbp-shape\(global=0 sdhc=1 ahci=1\)=1 .* none=0 old-guard-on-rmbp=0 .* -> PASS ::
+FORBID :: USERSREADY: .* -> FAIL

@@ -14193,8 +14193,8 @@ impl Controller {
                                 let (buttons, dx, dy, wit) = e.tp.mt_step(f);
                                 if wit {
                                     serial_println!(
-                                        ":: EHCI-HID: [{}] [tp] mt fingers={} x={} y={} dx={} dy={} frame={} == witness ::",
-                                        idx, f.fingers, f.x0, f.y0, dx, dy, e.tp.mt_frames
+                                        ":: EHCI-HID: [{}] [tp] mt fingers={} x={} y={} dx={} dy={} div={} frame={} == witness ::", // TPSCALE (B214): dx/dy are the SCALED pixels the router takes; div= names the divisor so a glass reading can re-derive raw units
+                                        idx, f.fingers, f.x0, f.y0, dx, dy, TP_MT_DIV, e.tp.mt_frames
                                     );
                                 }
                                 let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx);
@@ -17487,8 +17487,8 @@ impl TpCensus {
         } else {
             let (x, y) = (f.x0, -f.y0);
             if let Some((px, py)) = self.mt_prev {
-                dx = (x - px).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP);
-                dy = (y - py).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP);
+                dx = tp_scale((x - px).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP)); // TPSCALE (B214): sensor units -> pointer pixels, see `tp_scale`
+                dy = tp_scale((y - py).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP));
             }
             self.mt_prev = Some((x, y));
         }
@@ -17718,8 +17718,9 @@ unsafe fn tpframe_selftest() {
     lift[WSP2_NFINGER_OFF] = 0;
     lift[12] = 0; // wLength: no finger bytes follow
     let seq: [&[u8]; 7] = [&F2, &F3, &F4, &down, &F4, &lift, &F2];
-    let want: [(u8, i32, i32); 7] =
+    let want_raw: [(u8, i32, i32); 7] = // the corpus's RAW sensor deltas (flight 12's frames), the fixture's truth
         [(0, 0, 0), (0, -30, -12), (0, -3, -5), (1, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)];
+    let want: [(u8, i32, i32); 7] = core::array::from_fn(|k| (want_raw[k].0, tp_scale(want_raw[k].1), tp_scale(want_raw[k].2))); // TPSCALE (B214): `mt_step` now returns PIXELS — raw/8 toward zero (-30/-12 -> -3/-1, -3/-5 -> 0/0); the witness `d=` prints what the router takes
 
     let mut c = TpCensus::EMPTY;
     c.latched = true;
@@ -17886,6 +17887,16 @@ fn dump_type2_frame(idx: usize, mps: u16, frame: &[u8]) {
 /// so a real swipe moves tens of units per frame — flight 12's corpus moves 30 and 3). Hard against
 /// a garbled coordinate, and against a re-touch no lift frame announced (`unverified` on metal).
 const TP_MT_MAX_STEP: i32 = 128;
+/// TPSCALE (rmbp-ledger B214, flight 13 §2) — the vendor route's deltas are RAW Wellspring sensor units
+/// (flight 13: x0 from -3503 to 2051, y0 from 414 to 4923 across one finger's travel — roughly ten
+/// thousand units over a 1440-logical-pixel pad), and TPFRAME handed them to the router as pixels: a
+/// one-centimetre stroke was ~1000 px, "hypersensitive to the point of unusable" (Peter). The divisor is
+/// a CONSTANT with a witness (`[tp] mt … raw=` beside `dx=`), not a knob: 8 is the first glass guess
+/// (~125 units per pixel); a clamped 128-unit frame step becomes 16 px at ~128 frames/s.
+/// Toward-zero division, so a sub-divisor jitter frame moves nothing.
+const TP_MT_DIV: i32 = 8;
+/// TPSCALE: one raw (clamped) sensor delta to pointer pixels.
+fn tp_scale(raw: i32) -> i32 { raw / TP_MT_DIV }
 /// TPFRAME — one `[tp] mt` witness per this many vendor frames: the first, then every 64th (a
 /// resting hand streams ~100 frames/s; the FTDI ring is 64 KiB drop-oldest).
 const TP_MT_WITNESS_EVERY: u32 = 64;
@@ -18157,7 +18168,7 @@ unsafe fn vendor_multitouch_selftest() {
     serial_println!(
         ":: EHCI-HID: vendor-multitouch self-test: recognized={} (id={:#04x}, min-bits={}), real-array-descriptor recognized={}, first-finger decode dx={} dy={} ok={} == witness ::",
         vendor_ok, id, VMT_MIN_VENDOR_BITS, real_ok, dx, dy, decode_ok
-    );
+    ); tpscale_selftest(); // TPSCALE (B214): the divisor against flight 13's own numbers, beside the decoder's self-test it scales
 }
 
 /// Probe-3/4 evidence: dump VT-d (DMAR) state, READ-ONLY. Probe 3 showed both EHCI functions'
@@ -19160,3 +19171,19 @@ impl core::fmt::Display for IsrVia {
         }
     }
 }
+
+/// TPSCALE (rmbp-ledger B214) self-test — the scaler on flight 13's measured shapes: the clamp ceiling
+/// (128 → 16 px), the largest witnessed frame step (|dx|=88 → 11, |dy|=60 → 7), a jitter frame under the
+/// divisor (7 → 0, -7 → 0: toward zero, both signs), and the sign is preserved. GO-RED: `TP_MT_DIV = 1`
+/// (the 1:1 scale flight 13 flew) reads `128,88,-60,7,-7 -> 128,88,-60,7,-7 … -> FAIL`.
+fn tpscale_selftest() {
+    let raw = [TP_MT_MAX_STEP, 88, -60, 7, -7];
+    let got = [tp_scale(raw[0]), tp_scale(raw[1]), tp_scale(raw[2]), tp_scale(raw[3]), tp_scale(raw[4])];
+    let ok = got[0] == 16 && got[1] == 11 && got[2] == -7 && got[3] == 0 && got[4] == 0 && TP_MT_DIV > 1;
+    serial_println!(
+        ":: EHCI-HID: TPSCALE self-test: div={} raw={},{},{},{},{} -> px={},{},{},{},{} (clamp-step={}px/frame, toward-zero) -> {} ::",
+        TP_MT_DIV, raw[0], raw[1], raw[2], raw[3], raw[4], got[0], got[1], got[2], got[3], got[4], tp_scale(TP_MT_MAX_STEP),
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+

@@ -368,6 +368,12 @@ REQUIRE :: EHCI-HID: PASSPERIOD self-test: samples=\d+ backwards-delta-refused=t
 FORBID :: EHCI-HID: ISRARM self-test: .* -> FAIL
 FORBID :: EHCI-HID: ISRARM self-test SKIPPED
 FORBID :: EHCI-HID: PASSPERIOD self-test: .* -> FAIL
+# --- TPSCALE (rmbp-ledger B214, flight 13 §2): the vendor trackpad route's raw Wellspring deltas were
+# --- handed to the router 1:1 as pixels (a 1 cm stroke ≈ 1000 px, "unusable"). The divisor is a constant
+# --- with a self-test beside the decoder's: clamp ceiling 128 -> 16 px, the flight's largest step 88 -> 11,
+# --- a sub-divisor jitter frame -> 0 both signs. GO-RED: `TP_MT_DIV = 1` reads `-> px=128,88,-60,7,-7 … -> FAIL`.
+REQUIRE :: EHCI-HID: TPSCALE self-test: div=[2-9][0-9]* raw=128,88,-60,7,-7 -> px=16,11,-7,0,0 .* -> PASS ::
+FORBID :: EHCI-HID: TPSCALE self-test: .* -> FAIL
 # ── STOR-2 (rmbp-ledger B185, 2026-09-23), TAIL-APPENDED ──────────────────────────────────────────
 # RENAME WITH THE SOURCE OPEN. `stor2_mv_launcher` is unconditional, chained right after STOR1-MV, so
 # the PASS spelling is on the knob-free `./arroyo test` and is REQUIRED. `w=0x7f` carries seven ring-3
@@ -465,7 +471,8 @@ FORBID \[ioapic\] armed .* masked=true
 # `d=` is the two captured deltas (dx/dy, y negated): -30/-12 and -3/-5. `relx10=2/2` is the wire's
 # own cross-check — the pad's rel_x/rel_y equal 10 x our abs delta on both captured pairs. The two
 # `mismatch_*` fields are M3's rule, the wire beats the register: each direction named exactly once.
-REQUIRE :: TPFRAME: frames=7 fingers_max=1 deltas_ok=true click_edges=down@4,up@5 corpus=3 d=-30/-12,-3/-5 lift_reset=true relx10=2/2 wit_1in64=true legacy_ok=true mismatch_yes=true mismatch_no=true -> PASS ::
+# --- TPSCALE (B214): `d=` is now the SCALED delta the router takes (raw -30/-12 -> -3/-1, -3/-5 -> 0/0 at div=8).
+REQUIRE :: TPFRAME: frames=7 fingers_max=1 deltas_ok=true click_edges=down@4,up@5 corpus=3 d=-3/-1,0/0 lift_reset=true relx10=2/2 wit_1in64=true legacy_ok=true mismatch_yes=true mismatch_no=true -> PASS ::
 FORBID :: TPFRAME: .* -> FAIL ::
 # ── LFNMV (2026-09-23, rmbp-ledger B202), TAIL-APPENDED past IOAPIC2 ──────────────────────────────────
 # A RENAME TO A LONG NAME, MEASURED. `lfnmv_launcher` runs right after STOR2-MV (whose ring-3 program

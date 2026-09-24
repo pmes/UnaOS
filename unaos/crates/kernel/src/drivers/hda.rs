@@ -1337,7 +1337,19 @@ mod tone {
     /// which Peter could not hear over a loud room on 2026-09-24 ("raise the volume on your test
     /// tone ... try not to scare people"): +9.5 dB, still 8.5 dB under full scale. A full-scale
     /// sine out of a cold boot is how you frighten an operator; this is not that.
-    pub const AMPLITUDE: i32 = 12288;
+    pub const AMPLITUDE: i32 = parse_amp(option_env!("UNAOS_HDA_AMP")); // HDATONE2 (rmbp-ledger B215): a BUILD-TIME knob, default 4096 — flight 13 heard 12288 as "sandpaper" (§3), so the flown level is the default and a flight sweeps 4096/8192/12288 with `UNAOS_HDA_AMP=<n>`, no rebuild of anything else; the amplitude used is on the wire (`[hda] tone … amp=`) and checked in the buffer (`:: HDA-PCM:`).
+    /// HDATONE2: the flown default (flights 8-12), -18 dBFS.
+    pub const AMPLITUDE_DEFAULT: i32 = 4096;
+    /// HDATONE2: parse `UNAOS_HDA_AMP` at compile time — decimal, 1..=32767; anything else is the default,
+    /// never a louder-than-asked or a silent tone (a `const fn`: no float, no alloc, no panic on bad input).
+    const fn parse_amp(s: Option<&str>) -> i32 {
+        let Some(s) = s else { return AMPLITUDE_DEFAULT };
+        let b = s.as_bytes();
+        if b.is_empty() || b.len() > 5 { return AMPLITUDE_DEFAULT; }
+        let mut v: i32 = 0; let mut i = 0;
+        while i < b.len() { let c = b[i]; if c < b'0' || c > b'9' { return AMPLITUDE_DEFAULT; } v = v * 10 + (c - b'0') as i32; i += 1; }
+        if v < 1 || v > 32767 { AMPLITUDE_DEFAULT } else { v }
+    }
     /// Two BDL entries, which is the minimum the specification allows, each half the buffer and
     /// each with IOC set. [HDA-SPEC §3.6.2]
     pub const BDL_ENTRIES: usize = 2;
@@ -1386,6 +1398,38 @@ mod tone {
                 core::ptr::write_volatile((buf + (f as u64) * 4 + 2) as *mut i16, s);
             }
         }
+        check(buf); // HDATONE2 (B215): the buffer is read back against its own reference before the DMA ever sees it
+    }
+
+    /// HDATONE2 (rmbp-ledger B215) — READ THE BUFFER BACK against the reference: flight 13's "sandpaper"
+    /// (§3) has three candidate mechanisms and the witness could not separate them; this line rules the
+    /// sample-layout one in or out on every boot. Checks, over the first period (~109 frames at 440 Hz)
+    /// and the whole buffer: (1) L == R on every frame (the interleave); (2) the peak equals AMPLITUDE
+    /// within the Q15 polynomial's error (±2), never above it (no clipping of the SAMPLE); (3) frame 0 is
+    /// 0 and the quarter-period frame (27) is within 3 % of the peak — the sine is a sine; (4) the
+    /// byte order is little-endian (the low byte of frame 27's left sample is the value's low byte).
+    /// `-> FAIL` is the harness's default FORBID. GO-RED: writing `s` only to the left channel reads
+    /// `interleave=0`; `>> 14` reads `peak=` twice the amplitude.
+    fn check(buf: u64) {
+        let rd = |f: usize, ch: u64| -> i32 { unsafe { core::ptr::read_volatile((buf + (f as u64) * 4 + ch * 2) as *const i16) as i32 } };
+        let (mut interleave, mut peak, mut min) = (true, 0i32, 0i32);
+        for f in 0..FRAMES {
+            let (l, r) = (rd(f, 0), rd(f, 1));
+            if l != r { interleave = false; }
+            if l > peak { peak = l; }
+            if l < min { min = l; }
+        }
+        let q = rd(27, 0); // quarter period: 48000/440/4 ≈ 27.3 frames
+        let lo = unsafe { core::ptr::read_volatile((buf + 27 * 4) as *const u8) } as i32;
+        let peak_ok = (peak - AMPLITUDE).abs() <= 2 && (min + AMPLITUDE).abs() <= 2;
+        let sine_ok = rd(0, 0) == 0 && (q - AMPLITUDE).abs() <= AMPLITUDE * 3 / 100 + 2;
+        let le_ok = lo == (q & 0xff);
+        let ok = interleave && peak_ok && sine_ok && le_ok;
+        serial_println!(
+            ":: HDA-PCM: amp={} default={} peak={} min={} q27={} interleave={} peak_ok={} sine_ok={} le_ok={} frames={} -> {} ::",
+            AMPLITUDE, AMPLITUDE_DEFAULT, peak, min, q, interleave as u8, peak_ok as u8, sine_ok as u8, le_ok as u8, FRAMES,
+            if ok { "PASS" } else { "FAIL" }
+        );
     }
 
     /// Every codec register this run changes, read before it is written and written back after.
@@ -2048,9 +2092,9 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
         tag_bound0 & 0xFF, tag_ok as u8, wraps, consumed, rate_bps, expect_bps, np, ctl_running
     );
     serial_println!(
-        ":: HDA-TONE: lpib_advanced={} walked={} wraps={} bcis={} tag_ok={} fifo_ready={} run_ms={} members={} -> {} ::",
+        ":: HDA-TONE: lpib_advanced={} walked={} wraps={} bcis={} tag_ok={} fifo_ready={} run_ms={} members={} -> {} :: amp={} ::", // HDATONE2 (B215): the amplitude flown, as a SECOND `::` segment so `members=N -> PASS ::` stays contiguous for every scorer
         advanced as u8, walked as u8, wraps, bcis, tag_ok as u8, fifo_ready, run_ms, np,
-        if ok { "PASS" } else { "FAIL" }
+        if ok { "PASS" } else { "FAIL" }, tone::AMPLITUDE
     );
     a.line("tone");
 }

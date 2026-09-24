@@ -1224,9 +1224,8 @@ pub fn service() {
     // one load and prints nothing. (The VFS mount table is deliberately NOT consulted here at all —
     // LEDGER SO33: `bootdisk::bind` caches its first survey for the boot, and an early call would latch
     // an EMPTY root for every later caller, the shell's own verbs included.)
-    if crate::drivers::block::info().is_none() {
-        return;
-    }
+    if !store_ready() { return; } // LOGIN15 (rmbp-ledger B213, flight 13 §1): readiness is "a store volume can mount", NOT the global slot — on the rMBP nothing sets BLOCK_DEVICE (SDHC and AHCI register beside it) and this guard held the whole LOGIN chain shut for two flights; `store_ready` is at this file's tail with its fixture.
+    #[cfg(feature = "witness")] usersready_fixture(); // LOGIN15: the pure predicate against the three shapes (rMBP, QEMU, none) and the OLD guard as the go-red — once, on the first ready pass.
     // The block registry answers before the volume is quietly mountable: the moment a stick registers,
     // the driver loan is still held by the enumeration pump and `fat::mount()` answers `Busy` (measured on
     // QEMU virt, gate-4 capture: the first pass after `MISSION SUCCESS` refused). So the mount is RETRIED
@@ -2607,3 +2606,62 @@ pub fn login_rootout_fixture() {
         serial_println!("[users] root log-out fixture: x86 `wc` lane only (the screen and the x86 key router are what it drives)");
     }
 }
+
+// ===================== LOGIN15 (rmbp-ledger B213) — THE STORE'S READINESS IS THE STORE'S =====================
+//
+// Flight 13 (`docs/dev/evidence/rmbp-0915/flight13/FLIGHT13.md` §1): 205 s on the glass, ONE `[login]`
+// line, ZERO `[users]`, ZERO `[rand]`. `service()` returned at `block::info().is_none()` on every pass,
+// because on the rMBP nothing sets the GLOBAL `BLOCK_DEVICE`: the wire says so twice (`SDHCBLK: registered
+// … (global BLOCK_DEVICE untouched)`, `AHCI: registered port=0 … (global BLOCK_DEVICE untouched)`). Under
+// QEMU the test disk sets the global, so the guard opened and the login lane was green — the guard
+// measured the QEMU disk's shape, not "a store can be mounted". `fat::mount()` (what `try_load` uses)
+// already falls back to the internal card on `x86_64 + sdhcblk`; the load would have succeeded if asked.
+// So: ready when ANY registered disk can carry the store — the global slot, the SDHC handle, or an AHCI
+// registry entry — and the mount's own retry bound stays the verdict on whether it actually mounts.
+
+/// The readiness inputs as this boot has them.
+pub fn store_ready() -> bool {
+    store_ready_from(crate::drivers::block::info().is_some(), sdhc_registered(), ahci_registered())
+}
+
+/// The PURE predicate (unit-testable, and tested by [`usersready_fixture`]): a store can be asked for
+/// when any of the three registries holds a disk.
+pub fn store_ready_from(global: bool, sdhc: bool, ahci: usize) -> bool {
+    global || sdhc || ahci > 0
+}
+
+fn sdhc_registered() -> bool {
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    { return crate::drivers::block::sdhc_info().is_some(); }
+    #[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
+    false
+}
+
+fn ahci_registered() -> usize {
+    #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+    { return crate::drivers::block::ahci_disk_count(); }
+    #[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
+    0
+}
+
+/// LOGIN15 fixture — the predicate against the three shapes the two benches and the harness produce,
+/// and the OLD guard (`global` alone) as the go-red: it reads `false` on the rMBP shape, which is the
+/// two-flight void this arc closes. Also says, once, which registries THIS boot is ready by, so a metal
+/// capture names the input the guard opened on (`ready-by=`), and a boot with none says so.
+#[cfg(feature = "witness")]
+static USERSREADY_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "witness")]
+fn usersready_fixture() {
+    if USERSREADY_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) { return; } // once: the guard opens on every pass until the mount lands (the first QEMU run printed it 24 times)
+    let (g, s, a) = (crate::drivers::block::info().is_some(), sdhc_registered(), ahci_registered());
+    let rmbp = store_ready_from(false, true, 1);      // flight 13: SDHC + AHCI registered, global untouched
+    let qemu = store_ready_from(true, true, 0);       // the x86 test lane: the test disk sets the global
+    let none = store_ready_from(false, false, 0);
+    let old_guard_rmbp = false;                       // `block::info().is_none()` on the rMBP shape: shut
+    let ok = rmbp && qemu && !none && !old_guard_rmbp;
+    serial_println!(
+        ":: USERSREADY: rmbp-shape(global=0 sdhc=1 ahci=1)={} qemu-shape(global=1 sdhc=1 ahci=0)={} none={} old-guard-on-rmbp={} this-boot ready-by=global={} sdhc={} ahci={} -> {} ::",
+        rmbp as u8, qemu as u8, none as u8, old_guard_rmbp as u8, g as u8, s as u8, a, if ok { "PASS" } else { "FAIL" }
+    );
+}
+

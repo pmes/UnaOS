@@ -2664,6 +2664,11 @@ fi
 # (stripped by arm_features below, exactly as `hda` itself is).
 # Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
 [ -n "${UNAOS_HDATONE:-}" ] && _feats="${_feats}hda-tone,"
+# HDATONE2 (rmbp-ledger B215): UNAOS_HDA_AMP=<1..32767> is the tone's amplitude, read by rustc at BUILD time
+# (`option_env!` in drivers/hda.rs; default 4096, the level flights 8-12 flew — 12288 was flight 13's
+# "sandpaper"). Not a cargo feature: the ELF changes, the banner does not; `[hda] tone … amp=` and
+# `:: HDA-PCM: amp=` on the wire name the level an image carries. A sweep is three builds:
+#   UNAOS_HDA=1 UNAOS_HDATONE=1 UNAOS_HDA_AMP=8192 ./arroyo esp-x86
 # HDASIE (rmbp-ledger B207): UNAOS_HDASIE=1 arms the INTCTL.SIE experiment on the tone's descriptor —
 # the one-knob flight B130 left open (does SIE gate the SDnSTS.BCIS latch on the 7-series PCH?). Implies
 # `hda-tone` (Cargo.toml `hda-sie = ["hda-tone"]`). Witnesses `[hda] intctl sie …`, `[hda] intctl
