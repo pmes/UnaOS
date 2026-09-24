@@ -124,6 +124,13 @@ const USERS_ROW_CRC_SPAN_V1: usize = 106;
 /// v1 row can be verified ONCE more, at the login that migrates it.
 pub const KDF_LEGACY: u8 = 1;
 pub const KDF_PBKDF2: u8 = 2;
+/// LOGIN14 (R65): NO credential yet — the row exists (`adduser` made it, or the boot made root's) and the
+/// password is chosen at the FIRST USE: root's on the set-password screen the boot-to-root opens, a user's on
+/// the same screen at the first login. `verify` never answers `true` for such a row.
+pub const KDF_UNSET: u8 = 0;
+/// The root credential's row name (LOGIN14). Root is still reached by BOOTING (R63); the row holds the
+/// password the set-password screen asked for, so a later arc can log root in through the screen (R64).
+pub const ROOT_NAME: &[u8] = b"root";
 /// SECLOGIN M1: the PBKDF2 count floor, ceiling and target. A row under the floor is refused at parse
 /// and at create; the count is calibrated once per boot to `PBKDF2_TARGET_MS` on this CPU.
 pub const PBKDF2_ITERS_MIN: u32 = 10_000;
@@ -259,6 +266,7 @@ impl UserRec {
         r.kdf = b[114];
         match r.kdf {
             KDF_LEGACY => {}
+            KDF_UNSET => {} // LOGIN14: a row whose password is not chosen yet
             KDF_PBKDF2 if r.iters >= PBKDF2_ITERS_MIN => {}
             _ => return None,
         }
@@ -624,6 +632,70 @@ pub fn count() -> usize {
     TABLE.lock().count as usize
 }
 
+/// LOGIN14: how many rows are NOT root's. Root's Log Out is refused while this is 0 — a screen with only
+/// `root` on it has nobody to log in as, because root is reached by booting (R63) until the screen can
+/// log root in (R64, owed).
+pub fn user_count() -> usize {
+    let t = TABLE.lock();
+    (0..t.count as usize).filter(|&i| t.rows[i].name() != ROOT_NAME).count()
+}
+
+/// LOGIN14: `Some(true)` for a row whose password is not chosen yet (`KDF_UNSET`), `Some(false)` for a
+/// row with a credential, `None` for no such row. The screen asks this BEFORE `verify` so a first login
+/// goes to the set-password form instead of a denial.
+pub fn password_unset(name: &[u8]) -> Option<bool> {
+    let t = TABLE.lock();
+    (0..t.count as usize).find(|&i| t.rows[i].name() == name).map(|i| t.rows[i].kdf == KDF_UNSET)
+}
+
+/// LOGIN14: write `password` as `name`'s credential (PBKDF2 at the calibrated count, a fresh salt) and
+/// publish. The store does not decide WHO may: the set-password screen calls it only for an unset row
+/// (`set_first_password`), the `passwd` verb for the session's own row or, from root, any row.
+pub fn set_password(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
+    if password.is_empty() {
+        return Err(UsersError::Refused);
+    }
+    let mut t = TABLE.lock();
+    if !t.loaded {
+        return Err(UsersError::Volume);
+    }
+    let Some(i) = (0..t.count as usize).find(|&i| t.rows[i].name() == name) else {
+        return Err(UsersError::Refused);
+    };
+    let iters = calibrated_iters(&mut t);
+    if iters < PBKDF2_ITERS_MIN {
+        serial_println!("[users] kdf REFUSED iters={} floor={} (a credential is never written below the floor)", iters, PBKDF2_ITERS_MIN);
+        return Err(UsersError::WeakKdf);
+    }
+    let first = t.rows[i].kdf == KDF_UNSET;
+    let saved = t.rows[i];
+    let mut r = saved;
+    r.salt = new_salt(name, t.seq);
+    r.kdf = KDF_PBKDF2;
+    r.iters = iters;
+    r.hash = password_hash(&r, password);
+    t.rows[i] = r;
+    match flush(&mut t) {
+        Ok(()) => {
+            serial_println!("[users] password set user={} first={} (LOGIN14/R65: chosen at the keyboard, never on the line or the wire)", wire_name(name), first);
+            Ok(())
+        }
+        Err(e) => {
+            t.rows[i] = saved;
+            Err(e)
+        }
+    }
+}
+
+/// LOGIN14: the set-password SCREEN's entry — refused unless the row's password is unset, so the screen
+/// (which anyone at the glass can reach) can only ever CHOOSE a first password, never change one.
+pub fn set_first_password(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
+    if password_unset(name) != Some(true) {
+        return Err(UsersError::Refused);
+    }
+    set_password(name, password)
+}
+
 /// The `uid` of `name`, or `None`. SECLOGIN M2: this is the NON-RECYCLABLE identity both arches
 /// compare (x86 in its u32 tables, aarch64 inside the `user:<name>#<uid>` principal string) — never
 /// the row's index, which is storage and is reused after a delete. Until M2 it was `row + 1`.
@@ -649,6 +721,16 @@ pub fn home_of(name: &[u8], out: &mut [u8; HOME_MAX]) -> Option<usize> {
 /// (refused below the floor — a count that only applied here could be edited off the card, so the
 /// parser refuses it too), and its `uid` comes from `next_uid`, which only ever increases.
 pub fn create_user(name: &[u8], password: &[u8]) -> Result<u32, UsersError> {
+    create_row(name, Some(password))
+}
+
+/// LOGIN14 (R65): a row with NO credential — `kdf = KDF_UNSET`, the password chosen at the first use
+/// (`set_first_password`). `adduser <name>` and the boot's root row are the two callers.
+pub fn create_user_unset(name: &[u8]) -> Result<u32, UsersError> {
+    create_row(name, None)
+}
+
+fn create_row(name: &[u8], password: Option<&[u8]>) -> Result<u32, UsersError> {
     if !name_ok(name) {
         return Err(UsersError::BadName);
     }
@@ -662,8 +744,8 @@ pub fn create_user(name: &[u8], password: &[u8]) -> Result<u32, UsersError> {
     if t.count as usize >= MAX_USERS || t.next_uid == u32::MAX {
         return Err(UsersError::Full);
     }
-    let iters = calibrated_iters(&mut t);
-    if iters < PBKDF2_ITERS_MIN {
+    let iters = if password.is_some() { calibrated_iters(&mut t) } else { 1 };
+    if password.is_some() && iters < PBKDF2_ITERS_MIN {
         serial_println!("[users] kdf REFUSED iters={} floor={} (a credential is never written below the floor)", iters, PBKDF2_ITERS_MIN);
         return Err(UsersError::WeakKdf);
     }
@@ -679,9 +761,17 @@ pub fn create_user(name: &[u8], password: &[u8]) -> Result<u32, UsersError> {
     r.home = home;
     r.salt = new_salt(name, t.seq);
     r.uid = t.next_uid;
-    r.kdf = KDF_PBKDF2;
-    r.iters = iters;
-    r.hash = password_hash(&r, password);
+    match password {
+        Some(pw) => {
+            r.kdf = KDF_PBKDF2;
+            r.iters = iters;
+            r.hash = password_hash(&r, pw);
+        }
+        None => {
+            r.kdf = KDF_UNSET;
+            r.iters = 1;
+        }
+    }
     let i = t.count as usize;
     t.rows[i] = r;
     t.count += 1;
@@ -713,8 +803,8 @@ pub fn verify(name: &[u8], password: &[u8]) -> bool {
         let mut t = TABLE.lock();
         let iters = calibrated_iters(&mut t);
         match (0..t.count as usize).find(|&i| t.rows[i].name() == name) {
-            Some(i) => (true, t.rows[i], iters),
-            None => (false, UserRec::EMPTY, iters),
+            Some(i) if t.rows[i].kdf != KDF_UNSET => (true, t.rows[i], iters),
+            _ => (false, UserRec::EMPTY, iters), // absent, or LOGIN14 unset: the same clock, the same answer
         }
     };
     let h = if found {
@@ -976,6 +1066,7 @@ pub fn shell_verb(verb: &str, args: &[&str], console: &mut crate::console::Conso
             }
         }
         "adduser" => adduser_begin(args, console), // LOGIN13 M2 (R63) — root adds a user; see `adduser_begin`
+        "passwd" => passwd_begin(args, console),   // LOGIN14 (R65) — the prompt: a password, twice, never echoed
         _ => {}
     }
 }
@@ -1124,8 +1215,9 @@ pub fn service() {
     match try_load() {
         Ok(()) => {
             SERVICED.store(true, Ordering::Relaxed);
+            root_credential_ignition(); // LOGIN14 (R65): root's row, and the set-password screen if its password is not chosen yet
             #[cfg(feature = "loginst")]
-            { login_bootroot_fixture(); login_adduser_fixture(); login_rootout_fixture(); login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
+            { login_rootpw_fixture(); login_bootroot_fixture(); login_adduser_fixture(); login_rootout_fixture(); login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1775,6 +1867,155 @@ pub fn boot_session(desktop: bool) {
         desktop,
         if screen_up() { "open" } else { "closed" }
     );
+    DESKTOP_IGNITED.store(true, core::sync::atomic::Ordering::Release);
+    if ROOT_PW_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        serial_println!("[login] root password unset (store loaded before the desktop) -> set-password screen now (LOGIN14/R65)");
+        screen_set_password(ROOT_NAME);
+    }
+}
+
+// =========================================================================================
+// LOGIN14 (R65) — ROOT'S PASSWORD IS CHOSEN AT THE FIRST BOOT-TO-ROOT, ON THE GLASS
+// =========================================================================================
+//
+// Peter, 2026-09-24 (RULINGS R65): boot to root, get an alert to set root's password, add a personal
+// account, log out, log in to it — and get the same alert for it. So the root credential is a ROW named
+// `root` in the same store (`ROOT_NAME`), made at the first store load of a boot-to-root with NO
+// credential (`KDF_UNSET`), and the set-password screen (`video/login.rs`, `open_set_password`) asks for
+// the password twice and writes it through `set_first_password`. Root is still reached by BOOTING (R63):
+// the row holds the credential a later arc will let the screen check (R64); the screen refuses a `root`
+// login until then. Two orders are possible on the rMBP (the render service and the SD card race, §8.3
+// line 1 vs 2): store first → the screen is deferred to `boot_session` through `ROOT_PW_PENDING`, so it
+// is never opened headless under a desktop that is not up yet (a headless screen swallows every key and
+// press with nothing on the glass); desktop first → it opens at the load.
+
+/// The desktop ignition (`boot_session`) has run: `wm` can name a surface for the screen.
+static DESKTOP_IGNITED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Root's password is unset and the desktop was not up when the store loaded: `boot_session` opens it.
+static ROOT_PW_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// At the store's load: make root's row if it is absent; open (or defer) the set-password screen if its
+/// password is not chosen yet. Nothing happens in a user session (the store loaded after a login).
+pub fn root_credential_ignition() {
+    if !root_session() {
+        return;
+    }
+    let row = if password_unset(ROOT_NAME).is_none() {
+        match create_user_unset(ROOT_NAME) {
+            Ok(_) => "created",
+            Err(e) => {
+                serial_println!("[login] root row NOT created reason={} (LOGIN14: no set-password screen; root has no credential this boot)", users_reason(e));
+                return;
+            }
+        }
+    } else {
+        "present"
+    };
+    if password_unset(ROOT_NAME) != Some(true) {
+        serial_println!("[login] root password set row={} (LOGIN14: nothing to ask)", row);
+        return;
+    }
+    if DESKTOP_IGNITED.load(core::sync::atomic::Ordering::Acquire) {
+        serial_println!("[login] root password unset row={} -> set-password screen (LOGIN14/R65: chosen at the keyboard, twice; never on the wire)", row);
+        screen_set_password(ROOT_NAME);
+    } else {
+        ROOT_PW_PENDING.store(true, core::sync::atomic::Ordering::Release);
+        serial_println!("[login] root password unset row={} -> set-password screen deferred to the desktop ignition (LOGIN14)", row);
+    }
+}
+
+fn screen_set_password(name: &[u8]) {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    crate::video::crystal::login::open_set_password(name, false);
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        let _ = name;
+        serial_println!("[login] set-password screen not built in this image (LOGIN14: the credential stays unset)");
+    }
+}
+
+/// LOGIN14 fixture support: put `name`'s row back to UNSET (a previous run of this image set it).
+#[cfg(feature = "loginst")]
+pub fn fixture_unset_password(name: &[u8]) -> bool {
+    let mut t = TABLE.lock();
+    if !t.loaded {
+        return false;
+    }
+    let Some(i) = (0..t.count as usize).find(|&i| t.rows[i].name() == name) else {
+        return true; // absent: the ignition creates it unset
+    };
+    let saved = t.rows[i];
+    t.rows[i].kdf = KDF_UNSET;
+    t.rows[i].iters = 1;
+    t.rows[i].hash = [0; HASH_LEN];
+    match flush(&mut t) {
+        Ok(()) => true,
+        Err(_) => {
+            t.rows[i] = saved;
+            false
+        }
+    }
+}
+
+/// LOGIN14 fixture: the set-password screen for root, driven through the LIVE key router where there is
+/// one (x86 `wc`: `wc_route_event`, the path the keyboard takes), else through `screen_key`. A mismatched
+/// retype keeps the screen and the row unset; a matching pair sets it, `verify` agrees, the screen is
+/// down, and the session is still root's. Runs FIRST in the loginst chain: every later login fixture
+/// assumes the screen is down.
+#[cfg(feature = "loginst")]
+pub fn login_rootpw_fixture() {
+    const PW: &[u8] = b"root13-pw";
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        serial_println!(":: LOGIN-ROOTPW: -> SKIP — no screen built in this image (the x86 `wc` lane is where this claim is proven) ::");
+        return;
+    }
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        use crate::video::crystal::login as screen;
+        fn key(b: u8) -> bool {
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+            {
+                return matches!(crate::arch::syscall::wc_route_event(crate::pal::Event::Key(b)), crate::pal::Event::Unknown);
+            }
+            #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+            screen_key(b)
+        }
+        let feed = |s: &[u8]| {
+            let mut ok = true;
+            for &b in s {
+                ok &= key(b);
+            }
+            ok
+        };
+        let reset = fixture_unset_password(ROOT_NAME);
+        root_credential_ignition();
+        let deferred = ROOT_PW_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel);
+        if deferred {
+            screen::open_set_password(ROOT_NAME, false); // the desktop ignition has not run in this lane yet: open it here (headless where `wm` has no surface)
+        }
+        let opened = screen_up() && screen::fixture_setpw_for(ROOT_NAME);
+        let mut routed = feed(PW);
+        routed &= key(b'\t');
+        routed &= feed(b"other-pw");
+        routed &= key(b'\n');
+        let mismatch_kept = screen_up() && password_unset(ROOT_NAME) == Some(true) && screen::fixture_setpw_for(ROOT_NAME);
+        routed &= feed(PW);
+        routed &= key(b'\t');
+        routed &= feed(PW);
+        routed &= key(b'\n');
+        let set = password_unset(ROOT_NAME) == Some(false);
+        let verify_ok = verify(ROOT_NAME, PW);
+        let wrong_refused = !verify(ROOT_NAME, b"other-pw");
+        let closed = !screen_up();
+        let root_after = root_session();
+        let ok = reset && opened && routed && mismatch_kept && set && verify_ok && wrong_refused && closed && root_after;
+        serial_println!(
+            ":: LOGIN-ROOTPW: reset={} deferred={} opened={} keys_routed={} mismatch_kept={} set={} verify={} wrong={} screen={} root_after={} -> {} ::",
+            reset, deferred, opened, routed, mismatch_kept, set, if verify_ok { "ok" } else { "FAIL" }, if wrong_refused { "refused" } else { "ACCEPTED" },
+            if closed { "closed" } else { "OPEN" }, root_after, if ok { "PASS" } else { "FAIL —" }
+        );
+    }
 }
 
 /// LOGIN-BOOTROOT (`loginst`, LOGIN13 M1) — the boot opens no screen and the session is root. Runs FIRST
@@ -1926,20 +2167,66 @@ fn adduser_begin(args: &[&str], console: &mut crate::console::Console) {
     if count() >= MAX_USERS {
         return adduser_refuse(nb, "full", console);
     }
+    // LOGIN14 (R65): the row is made with NO password; the person chooses it at their first login, on
+    // the set-password screen. `passwd <name>` (root) sets one from the shell if that is wanted first.
+    match adduser_commit(nb) {
+        Ok((uid, created)) => console.println(&alloc::format!("adduser: added {} (uid {}, home /home/{}{}); the password is chosen at the first login", wire_name(nb), uid, wire_name(nb), if created { ", created" } else { "" })),
+        Err(r) => adduser_refuse(nb, r, console),
+    }
+}
+
+fn passwd_refuse(name: &[u8], reason: &'static str, console: &mut crate::console::Console) {
+    *ADDUSER_LAST.lock() = reason;
+    serial_println!("[users] passwd REFUSED user={} reason={}", wire_name(name), reason);
+    console.println(&alloc::format!("passwd: {} not changed (reason={})", wire_name(name), reason));
+}
+
+/// LOGIN14: `passwd` (the session's own password; root's in the root session) or `passwd <name>` (root
+/// only). The password is asked for twice by the prompt `main.rs::handle_key` offers every key to first
+/// — nothing echoed, nothing in `history`, nothing on the wire. `passwd <name> <pw>` is refused.
+fn passwd_begin(args: &[&str], console: &mut crate::console::Console) {
+    let mut own = [0u8; NAME_MAX];
+    let target: &[u8] = match args.first() {
+        Some(n) => n.as_bytes(),
+        None => {
+            if root_session() {
+                ROOT_NAME
+            } else {
+                match whoami(&mut own) {
+                    Some(n) => &own[..n],
+                    None => return console.println("passwd: no session is open"),
+                }
+            }
+        }
+    };
+    if args.len() > 1 {
+        return passwd_refuse(target, "password-on-line", console);
+    }
+    let mut mine = [0u8; NAME_MAX];
+    let is_own = matches!(whoami(&mut mine), Some(n) if &mine[..n] == target) || (root_session() && target == ROOT_NAME);
+    if !is_own && !root_session() {
+        return passwd_refuse(target, "not-root", console);
+    }
+    if !load_once() {
+        return passwd_refuse(target, "storage-not-up", console);
+    }
+    if password_unset(target).is_none() {
+        return passwd_refuse(target, "no-such-user", console);
+    }
     {
         let mut p = PROMPT.lock();
         p.live = true;
         p.stage = 1;
         p.name = [0; NAME_MAX];
-        p.name[..nb.len()].copy_from_slice(nb);
-        p.nlen = nb.len();
+        p.name[..target.len()].copy_from_slice(target);
+        p.nlen = target.len();
         p.a = [0; PW_MAX];
         p.alen = 0;
         p.b = [0; PW_MAX];
         p.blen = 0;
         p.over = false;
     }
-    console.println(&alloc::format!("adduser: password for {} (not shown; Enter ends it, Ctrl-C cancels):", name));
+    console.println(&alloc::format!("passwd: new password for {} (not shown; Enter ends it, Ctrl-C cancels):", wire_name(target)));
 }
 
 /// LOGIN13 M2 — offer a key to the `adduser` prompt. Called FIRST in `main.rs::handle_key`, ahead of the
@@ -1957,7 +2244,7 @@ pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
             let nl = p.nlen;
             *p = PROMPT_IDLE;
             drop(p);
-            adduser_refuse(&n[..nl], "cancelled", console);
+            passwd_refuse(&n[..nl], "cancelled", console);
             2
         }
         8 | 0x7f => {
@@ -1972,7 +2259,7 @@ pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
             if p.stage == 1 && p.alen > 0 && !p.over {
                 p.stage = 2;
                 drop(p);
-                console.println("adduser: retype it:");
+                console.println("passwd: retype it:");
                 return 2;
             }
             // Finished (or refused at the first Enter): copy out, ZERO the prompt, then decide with no
@@ -1988,7 +2275,7 @@ pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
             } else if stage != 2 || a[..al] != b[..bl] {
                 Err("mismatch")
             } else {
-                adduser_commit(name, &a[..al])
+                passwd_commit(name, &a[..al])
             };
             let mut a = a;
             let mut b = b;
@@ -1996,8 +2283,8 @@ pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
                 *x = 0;
             }
             match verdict {
-                Ok((uid, created)) => console.println(&alloc::format!("adduser: added {} (uid {}, home /home/{}{})", wire_name(name), uid, wire_name(name), if created { ", created" } else { "" })),
-                Err(r) => adduser_refuse(name, r, console),
+                Ok(()) => console.println(&alloc::format!("passwd: password set for {}", wire_name(name))),
+                Err(r) => passwd_refuse(name, r, console),
             }
             2
         }
@@ -2023,14 +2310,28 @@ pub fn prompt_key(c: u8, console: &mut crate::console::Console) -> u8 {
 /// is the HOME's verdict (`ensure_home`, which also prints its own `[users] home=` line), `false` when
 /// the directory was already there or the volume refused it (then the `NOT created reason=` line says
 /// why — the user exists either way and `/home/<n>` is made again at its first login, `login`'s rule).
-pub fn adduser_commit(name: &[u8], password: &[u8]) -> Result<(u32, bool), &'static str> {
-    if !root_session() {
+/// LOGIN14: the prompt's commit — the caller was checked at `passwd_begin`; checked again here at the
+/// write (root, or the session's own row).
+fn passwd_commit(name: &[u8], password: &[u8]) -> Result<(), &'static str> {
+    let mut mine = [0u8; NAME_MAX];
+    let is_own = matches!(whoami(&mut mine), Some(n) if &mine[..n] == name) || (root_session() && name == ROOT_NAME);
+    if !is_own && !root_session() {
         return Err("not-root");
     }
     if password.is_empty() {
         return Err("empty-password");
     }
-    let uid = create_user(name, password).map_err(adduser_reason)?;
+    set_password(name, password).map_err(adduser_reason)?;
+    *ADDUSER_LAST.lock() = "set";
+    Ok(())
+}
+
+/// LOGIN14: root adds a user with NO credential; `/home/<name>` is made at once.
+pub fn adduser_commit(name: &[u8]) -> Result<(u32, bool), &'static str> {
+    if !root_session() {
+        return Err("not-root");
+    }
+    let uid = create_user_unset(name).map_err(adduser_reason)?;
     let created = match ensure_home(name) {
         Ok(v) => v == "created",
         Err(e) => {
@@ -2039,7 +2340,7 @@ pub fn adduser_commit(name: &[u8], password: &[u8]) -> Result<(u32, bool), &'sta
         }
     };
     *ADDUSER_LAST.lock() = "created";
-    serial_println!("[users] adduser user={} id={} home=/home/{} created={} (R63: root added it; the password was asked for, never on the line)", wire_name(name), uid, wire_name(name), created);
+    serial_println!("[users] adduser user={} id={} home=/home/{} created={} password=unset (R63/R65: root added it; the password is chosen at the first login, never on the line)", wire_name(name), uid, wire_name(name), created);
     Ok((uid, created))
 }
 
@@ -2069,31 +2370,39 @@ pub fn login_adduser_fixture() {
             }
         };
         let root = root_session();
+        // LOGIN14: `adduser` makes the row with NO password and asks for nothing
         shell_verb("adduser", &[N], &mut con);
+        let prompted_at_adduser = prompt_live();
+        let created = *ADDUSER_LAST.lock() == "created" && password_unset(N.as_bytes()) == Some(true);
+        let uid = id_of(N.as_bytes()).unwrap_or(0);
+        let unset_refused = !verify(N.as_bytes(), PW) && !verify(N.as_bytes(), b"");
+        // `passwd <name>` from root: the prompt, twice, nothing echoed
+        shell_verb("passwd", &[N], &mut con);
         let prompted = prompt_live();
         feed(&mut con, PW);
         feed(&mut con, b"\n");
         feed(&mut con, PW);
         feed(&mut con, b"\n");
         let echo_none = con.current_input.is_empty() && !prompt_live();
-        let created = *ADDUSER_LAST.lock() == "created" && id_of(N.as_bytes()).is_some();
-        let uid = id_of(N.as_bytes()).unwrap_or(0);
+        let set = *ADDUSER_LAST.lock() == "set" && password_unset(N.as_bytes()) == Some(false);
         let verify_ok = verify(N.as_bytes(), PW);
         shell_verb("adduser", &[N], &mut con);
         let dup = if prompt_live() { "PROMPTED" } else { *ADDUSER_LAST.lock() };
-        shell_verb("adduser", &["boot13e"], &mut con);
+        shell_verb("passwd", &[N], &mut con);
         feed(&mut con, b"\n");
-        let empty = if id_of(b"boot13e").is_some() { "CREATED" } else { *ADDUSER_LAST.lock() };
-        shell_verb("adduser", &["boot13m"], &mut con);
+        let empty = if !verify(N.as_bytes(), PW) { "CHANGED" } else { *ADDUSER_LAST.lock() };
+        shell_verb("passwd", &[N], &mut con);
         feed(&mut con, b"one-pw\n");
         feed(&mut con, b"two-pw\n");
-        let mismatch = if id_of(b"boot13m").is_some() { "CREATED" } else { *ADDUSER_LAST.lock() };
+        let mismatch = if !verify(N.as_bytes(), PW) { "CHANGED" } else { *ADDUSER_LAST.lock() };
         shell_verb("adduser", &["boot13p", "on-the-line"], &mut con);
         let on_line = if prompt_live() || id_of(b"boot13p").is_some() { "ACCEPTED" } else { *ADDUSER_LAST.lock() };
-        let ok = root && prompted && echo_none && created && verify_ok && dup == "exists" && empty == "empty-password" && mismatch == "mismatch" && on_line == "password-on-line";
+        shell_verb("passwd", &[N, "on-the-line"], &mut con);
+        let pw_on_line = if prompt_live() || !verify(N.as_bytes(), PW) { "ACCEPTED" } else { *ADDUSER_LAST.lock() };
+        let ok = root && !prompted_at_adduser && created && unset_refused && prompted && echo_none && set && verify_ok && dup == "exists" && empty == "empty-password" && mismatch == "mismatch" && on_line == "password-on-line" && pw_on_line == "password-on-line";
         serial_println!(
-            ":: LOGIN-ADDUSER: root={} prompted={} echo={} created={} uid={} verify={} dup={} empty={} mismatch={} on_line={} -> {} ::",
-            root, prompted, if echo_none { "none" } else { "LEAKED" }, created, uid, if verify_ok { "ok" } else { "FAIL" }, dup, empty, mismatch, on_line,
+            ":: LOGIN-ADDUSER: root={} created=unset:{} prompted_at_adduser={} unset_verify={} passwd_prompted={} echo={} uid={} set={} verify={} dup={} empty={} mismatch={} on_line={} passwd_on_line={} -> {} ::",
+            root, created, prompted_at_adduser, if unset_refused { "refused" } else { "ACCEPTED" }, prompted, if echo_none { "none" } else { "LEAKED" }, uid, set, if verify_ok { "ok" } else { "FAIL" }, dup, empty, mismatch, on_line, pw_on_line,
             if ok { "PASS" } else { "FAIL —" }
         );
     }
@@ -2128,7 +2437,7 @@ pub fn root_logout_refused() -> bool {
     }
     let reason = if !load_once() {
         "storage-not-up"
-    } else if count() == 0 {
+    } else if user_count() == 0 {
         "no-users"
     } else {
         return false;
@@ -2166,7 +2475,7 @@ pub fn log_out_to_screen(out: &mut [u8; NAME_MAX]) -> Result<usize, &'static str
 /// through the entries a person uses. Runs after LOGIN-ADDUSER (which left `boot13` in the store) and
 /// before every other `loginst` leg:
 ///  * `empty_refused` — with the store emptied of `boot13` for one call, the shell's `logout` from root is
-///    REFUSED `reason=no-users` and root stays live; `boot13` is then put back through `adduser_commit`;
+///    REFUSED `reason=no-users` and root stays live; `boot13` is then put back through `create_user` (LOGIN14: with its password);
 ///  * `pid` / `root_stamped` — `STAT.ELF` launched IN THE ROOT SESSION (uid 0, the root epoch — the
 ///    desktop's own launcher, `spawn_user_image_bg`); `others=` is every OTHER running root-session
 ///    program the Log Out is about to end (0 on this lane: nothing else runs at the storage pass);
@@ -2195,10 +2504,10 @@ pub fn login_rootout_fixture() {
         let root_before = root_session() && id_of(N).is_some();
         // 1 — the refusal: root with nobody to log in as. Only when `boot13` is the store's ONE row (a
         // fresh medium, which this lane's is), so the arm never deletes a user it did not create.
-        let empty_refused = if count() == 1 && delete_user(N).is_ok() {
+        let empty_refused = if user_count() == 1 && delete_user(N).is_ok() {
             shell_verb("logout", &[], &mut con);
             let refused = root_session() && !screen_up();
-            let back = adduser_commit(N, PW).is_ok();
+            let back = create_user(N, PW).is_ok(); // LOGIN14: made WITH its password here — the screen leg below logs in with it
             if refused && back { "no-users" } else { "NOT-REFUSED" }
         } else {
             "store-not-fresh"

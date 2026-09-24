@@ -344,22 +344,50 @@ FORBID \[login\] boot session=\S+ desktop=\S+ screen=open
 REQUIRE :: LOGIN-BOOTROOT: session=root\(uid0\) root_at_boot=true desk_screen=closed nodesk_screen=closed still_root=true screen_built=true -> PASS ::
 FORBID :: LOGIN-BOOTROOT: .* -> FAIL
 #
-# M2 — `adduser <name>`: ROOT ADDS A USER, AND THE PASSWORD IS ASKED FOR. The fixture drives the REAL verb
-# (`users::shell_verb("adduser", …)`) and the REAL prompt (`users::prompt_key`, the function
-# `main.rs::handle_key` offers every key to first) in the root session the boot left. GO-RED (LOGIN13 M2,
-# run on this gate): the root check in `adduser_begin` inverted (`if !root_session()` -> `if root_session()`)
-# reads `prompted=false … created=false … -> FAIL —`. GREEN CERTIFIES: root can add a user without the
-# password touching the line editor (`echo=none`), the typed credential is the stored one (`verify=ok`),
-# and the four refusals each speak their own word and create nothing.
-REQUIRE :: LOGIN-ADDUSER: root=true prompted=true echo=none created=true uid=\d+ verify=ok dup=exists empty=empty-password mismatch=mismatch on_line=password-on-line -> PASS ::
+# LOGIN14 (R65, rmbp-ledger B198) — ROOT'S PASSWORD IS CHOSEN ON THE GLASS AT THE FIRST BOOT-TO-ROOT. At the
+# store's load `users::root_credential_ignition` makes root's row with NO credential (`KDF_UNSET`) and opens
+# the set-password form of the login screen (or defers it to the desktop ignition when the store loads
+# first — `deferred=` says which this run saw). The fixture runs FIRST in the loginst chain (every later
+# login fixture assumes the screen is down): it puts root's row back to unset (a previous run of this image
+# set it), drives the REAL ignition, types the password, Tab, a DIFFERENT retype, Enter through the LIVE
+# x86 key router (`wc_route_event`) — the form must stay and the row stay unset — then the matching pair,
+# after which the row verifies, the wrong word does not, the screen is down and the session is still root's.
+# GO-RED (run on this gate): `set_first_password` mutated to skip the write reads `set=false verify=FAIL`.
+# GREEN CERTIFIES: the boot-13 alert exists, takes the keyboard, refuses a mismatch, writes exactly what was
+# typed twice, and gives the root desktop back.
+REQUIRE :: LOGIN-ROOTPW: reset=true deferred=(true|false) opened=true keys_routed=true mismatch_kept=true set=true verify=ok wrong=refused screen=closed root_after=true -> PASS ::
+FORBID :: LOGIN-ROOTPW: .* -> FAIL
+REQUIRE \[login\] set-password screen open user=root login_after=false in_place=false
+REQUIRE \[login\] set-password user=root retype mismatch
+REQUIRE \[users\] password set user=root first=true
+REQUIRE \[login\] set-password screen closed user=root
+# A root row exists from this gate on; the screen must not log root in yet (root is reached by booting, R63).
+FORBID \[login\] session open user=root
+# The property the form exists for: nothing typed at it reaches the wire. `root13-pw` is root's credential
+# (typed twice), `other-pw` the mismatched retype.
+FORBID root13-pw
+FORBID other-pw
+#
+# M2 (LOGIN13) as amended by LOGIN14 (R65) — `adduser <name>`: ROOT ADDS A USER WITH NO PASSWORD; THE PERSON
+# CHOOSES IT AT THEIR FIRST LOGIN, on the same set-password form. The shell's prompt (`users::prompt_key`,
+# the function `main.rs::handle_key` offers every key to first) is now `passwd [<name>]`'s: the fixture
+# drives the REAL `adduser` (no prompt; the row is unset and verifies NOTHING), then the REAL `passwd boot13`
+# from root, the password twice, nothing echoed, and the four refusals. GO-RED (LOGIN13 M2, still valid):
+# the root check in `adduser_begin` inverted reads `created=unset:false … -> FAIL —`. GREEN CERTIFIES: root
+# can add a user with no credential touching the line, an unset row is not a passwordless login, root can
+# set a password from the shell without it touching the line editor (`echo=none`), the typed credential is
+# the stored one (`verify=ok`), and the refusals each speak their own word and change nothing.
+REQUIRE :: LOGIN-ADDUSER: root=true created=unset:true prompted_at_adduser=false unset_verify=refused passwd_prompted=true echo=none uid=\d+ set=true verify=ok dup=exists empty=empty-password mismatch=mismatch on_line=password-on-line passwd_on_line=password-on-line -> PASS ::
 FORBID :: LOGIN-ADDUSER: .* -> FAIL
-# The success line (the store's uid, the home's own verdict) and the refusal lines, by their wire words.
-REQUIRE \[users\] adduser user=boot13 id=\d+ home=/home/boot13 created=(true|false)
+# The success lines (the store's uid, the home's own verdict, the password's own line) and the refusals.
+REQUIRE \[users\] adduser user=boot13 id=\d+ home=/home/boot13 created=(true|false) password=unset
 REQUIRE \[users\] home=/home/boot13 (created|exists) volume=[0-9a-f]{8}
+REQUIRE \[users\] password set user=boot13 first=true
 REQUIRE \[users\] adduser REFUSED user=boot13 reason=exists
-REQUIRE \[users\] adduser REFUSED user=boot13e reason=empty-password
-REQUIRE \[users\] adduser REFUSED user=boot13m reason=mismatch
+REQUIRE \[users\] passwd REFUSED user=boot13 reason=empty-password
+REQUIRE \[users\] passwd REFUSED user=boot13 reason=mismatch
 REQUIRE \[users\] adduser REFUSED user=boot13p reason=password-on-line
+REQUIRE \[users\] passwd REFUSED user=boot13 reason=password-on-line
 # THE PROPERTY THE PROMPT EXISTS FOR, as a rule: nothing the fixture typed at the prompt reaches the wire.
 # `boot13-pw` is the credential (typed twice), `one-pw`/`two-pw` the mismatched pair.
 FORBID boot13-pw

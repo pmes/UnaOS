@@ -382,3 +382,82 @@ The sitting FAILS on any of: a `[login] screen open` line before line 11; `[logi
 any byte of the password on the wire; `[login] denied … reason=`; `[users] adduser REFUSED … reason=not-root`
 before line 9; `[users] logout REFUSED session=root` after line 6 (it is correct — and expected — only if
 he logs out before adding a user). If line 2 reads `users=0`, a Log Out before line 6 is refused by design.
+
+## 9. Boot 13, amended: root's password is chosen on the glass, and so is a new account's (LOGIN14, rmbp-ledger B198, R65)
+
+Peter, 2026-09-24 (RULINGS R65, verbatim there): *"the clean boot 13 where it auto boots to root, i get an
+alert prompt to set root password, add a personal acct for myself, log out of root, then log into my newly
+created account"* and *"when i log into the newly created acct i should get another set password alert for
+it"*. §8 stands where it is not amended here: root at boot (§8.1 step 1), `adduser` root-only (step 2), Log
+Out (step 3), the screen the only taker of input (step 4). What changes is WHO CHOOSES A PASSWORD AND WHERE.
+
+### 9.1 The mechanism — one state, two askers
+
+- **A row with no credential** is a state of the store: `kdf = KDF_UNSET` (`fs/users.rs`). The parser
+  accepts it; `verify` never answers `true` for it and runs the unknown-name KDF so the clock says nothing;
+  `password_unset(name)` is the one question the screen asks before `verify`. `set_first_password` writes
+  a credential ONLY into an unset row, so the form anyone at the glass can reach can only ever choose a
+  first password. `set_password` (any row) is the shell's `passwd`.
+- **Root's row.** `ROOT_NAME = "root"`. At the store's load of a boot-to-root (`users::service()` ->
+  `root_credential_ignition`): absent -> made unset (`[login] root password unset row=created -> set-password
+  screen`); present and unset -> the screen; present and set -> `[login] root password set row=present
+  (LOGIN14: nothing to ask)`. Root is still reached by BOOTING (R63): the row holds the credential for the
+  day the screen checks it (R64, owed), and until then `root` typed at the login form is `[login] denied
+  user=root`. Root's Log Out is refused while `user_count()` (rows other than root) is 0.
+- **The two orders.** The rMBP's render service and SD card race (§8.3 lines 1/2). Desktop first: the form
+  opens at the load. Store first: `ROOT_PW_PENDING` is set and `boot_session` (the desktop ignition) opens
+  it after printing its own `screen=closed` line — a screen opened headless under a desktop that is not up
+  would swallow every key and press with nothing on the glass.
+- **The form** is the login screen's window in a second state (`video/login.rs` `State::SetPw`): title
+  "Set a password for <name>", Password, Retype, Set; Tab between the two fields; Enter = Set. Empty and
+  mismatched pairs write nothing and keep the form (`[login] set-password user=<n> retype mismatch`). Root's
+  closes back onto the root desktop (`[login] set-password screen closed user=root`); a user's logs the user
+  in (`[login] session open user=<n> (first login: …)`).
+- **`adduser <name>`** makes the row unset and asks nothing: `[users] adduser user=<n> id=<uid>
+  home=/home/<n> created=<b> password=unset`. At the screen, a name whose row is unset switches the form in
+  place (`[login] first login user=<n> -> set password`). The prompt LOGIN13 built for `adduser` is
+  `passwd [<name>]` now — the session's own row, or any row from root; twice, never echoed, never on the line.
+
+### 9.2 FLIGHT-13 LINE LIST, amended — the wire Peter's sitting must show, in order
+
+Image: `UNAOS_LOGIN=1`, no `loginst`. Replaces §8.3 from line 2 on; §8.3's FAIL list still applies.
+
+```text
+ 1  [login] boot session=root desktop=true screen=closed (R63: …)
+ 2  [users] load volume=el0-fat(rw) src=<none|dat> users=<n> …
+    then ONE of (the order of 1 and 2 is the bench's):
+    [login] root password unset row=created -> set-password screen (LOGIN14/R65: …)            (desktop first)
+    [login] root password unset row=created -> set-password screen deferred to the desktop ignition (LOGIN14)
+    [login] root password unset (store loaded before the desktop) -> set-password screen now (LOGIN14/R65)   (store first)
+ 3  [login] set-password screen open user=root login_after=false in_place=false (LOGIN14/R65: …)
+    — Peter types root's password, Tab, the retype, Enter (or presses Set); no byte of it appears anywhere
+ 4  [users] kdf calibrated iters=<n> ms=<~250> …          (first KDF use of the boot)
+ 5  [users] password set user=root first=true (LOGIN14/R65: …)
+ 6  [login] set-password screen closed user=root (the root desktop continues)
+    — Peter, in the shell window: adduser <name>
+ 7  :: [midden] cmd="adduser <name>" -> Host verb=adduser ::
+ 8  [users] home=/home/<name> created volume=<8 hex>
+ 9  [users] adduser user=<name> id=<uid> home=/home/<name> created=true password=unset (R63/R65: …)
+    — Peter: Log Out (crystal row, or `logout` in the shell)
+10  [users] session-end pid=<n> slot=<n> user=0 windows=<n> kill="…" ended=true   (one per root program)
+11  [users] root session closed ended=<n> windows=<n> (R63: …)
+12  [users] logout epoch=2 ended=<n> windows=<n> (SO37: …)
+13  [login] logged out — screen returns
+14  [login] screen open window=<n> box=<w>x<h> at (<x>,<y>)
+    — Peter presses his row (or types the name) and Enter
+15  [login] key taken by the screen (…)   /   [login] press at=(<x>,<y>) control=user-row …
+16  [login] first login user=<name> -> set password (LOGIN14/R65: the row has no credential yet)
+17  [login] set-password screen open user=<name> login_after=true in_place=true (LOGIN14/R65: …)
+    — Peter types the account's password, Tab, the retype, Enter
+18  [users] password set user=<name> first=true (LOGIN14/R65: …)
+19  [users] home=/home/<name> exists volume=<the serial of line 8>
+20  [users] login ok user=<name> id=<uid of line 9> principal=user:<name>#<uid>
+21  [login] session open user=<name> (first login: the password was chosen here)
+```
+
+The sitting FAILS additionally on: `[login] root password set row=present` on the FIRST boot of a fresh card
+(the row came from somewhere); `[login] set-password screen open user=root` with no `[login] set-password
+screen closed user=root` before line 7 (the alert did not take the keyboard — quote the `[login] key taken`
+and `USB-DEBUG: KEY withheld` lines beside it); `[login] denied user=<name>` at line 16 (the row was not unset:
+`adduser` prompted or `passwd` ran); any `-pw`-shaped token or typed word on the wire; `[login] session open
+user=root`. `[login] set-password user=<n> retype mismatch` is a typo, not a failure: the form stays.

@@ -35,6 +35,16 @@
 //! menus only, and this is not a menu; it never closes an app window. Tab moves between the two fields
 //! of ONE form (a form control inside one window, not the retired window focus-cycle).
 //!
+//! LOGIN14 (R65, 2026-09-24) — THE SAME WINDOW IS THE SET-PASSWORD SCREEN. A row whose password is not
+//! chosen yet (`users::KDF_UNSET`: root's row at the first boot-to-root, a row `adduser` made) is asked for
+//! it HERE, twice, and the pair is written through `users::set_first_password` — which refuses a row that
+//! already has one, so this face can only ever choose a first password. Two entries: [`open_set_password`]
+//! from the boot (root's; the screen closes back onto the root desktop) and from [`submit`] when the name
+//! typed at the login form is an unset user's (the screen switches form in place and, once the password is
+//! written, logs that user in). `root` typed at the login form is denied: root is reached by booting (R63)
+//! until the screen can check root's row (R64, owed). The form is one `State` and one `Focus` more, the
+//! layout stays behind the ONE accessor ([`ctl_rect`], now told which form it is drawing).
+//!
 //! HEADLESS: where `wm` can name no surface (`spawn_geometry` = None), or under the fixture, the screen
 //! runs its state machine without a window — the fixture drives it through the same [`consume_key`]
 //! the routes call and the witness says `window=no`. The fixture NEVER opens a window: on the shared
@@ -143,12 +153,16 @@ enum State {
     Open,
     /// A session is open; the screen is down until Log Out.
     Session,
+    /// LOGIN14: the set-password form is up for `Form::name` (root's at boot, a user's at first login).
+    SetPw,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Focus {
     Name,
     Password,
+    /// LOGIN14: the retype field of the set-password form.
+    Retype,
 }
 
 struct Form {
@@ -158,6 +172,12 @@ struct Form {
     name_len: usize,
     pw: [u8; FIELD_MAX],
     pw_len: usize,
+    /// LOGIN14: the retype of the set-password form.
+    pw2: [u8; FIELD_MAX],
+    pw2_len: usize,
+    /// LOGIN14: after the password is written, log `name` in (a user's first login) rather than close
+    /// back onto the root desktop (root's boot prompt).
+    setpw_login: bool,
     message: &'static str,
     /// The screen was drawn with a real `wm` window (else headless).
     windowed: bool,
@@ -170,6 +190,9 @@ static FORM: spin::Mutex<Form> = spin::Mutex::new(Form {
     name_len: 0,
     pw: [0; FIELD_MAX],
     pw_len: 0,
+    pw2: [0; FIELD_MAX],
+    pw2_len: 0,
+    setpw_login: false,
     message: "",
     windowed: false,
 });
@@ -215,8 +238,10 @@ enum Ctl {
     NameField,
     /// The password field — a press focuses it.
     PwField,
-    /// Log In / Create — a press IS [`submit`], the same call Enter makes.
+    /// Log In / Set — a press IS [`submit`], the same call Enter makes.
     Button,
+    /// LOGIN14: the retype field of the set-password form (that form only).
+    Pw2Field,
     /// A user's row: the screen SHOWS who lives on this machine (the Mac model), and a press picks
     /// that name into the field and moves to the password. The `usize` is the store's row index.
     User(usize),
@@ -257,24 +282,37 @@ fn user_rows() -> usize {
 }
 
 /// The rect of one control, in SURFACE pixels. The ONE place any of these numbers exists.
-fn ctl_rect(c: Ctl) -> (usize, usize, usize, usize) {
-    match c {
-        Ctl::User(i) => (LX + i * (USER_W + USER_GAP), 46, USER_W, FIELD_H),
-        Ctl::NameField => (FIELD_X, 76, FIELD_W, FIELD_H),
-        Ctl::PwField => (FIELD_X, 112, FIELD_W, FIELD_H),
-        Ctl::Button => (W - LX - BTN_W, 150, BTN_W, BTN_H),
+/// `setpw` selects the form (LOGIN14): the set-password form has the password field where the login form
+/// has the name, the retype where the login form has the password, no roster and no name field. A control
+/// the current form does not carry has an EMPTY rect, so `ctl_at` cannot hit it and the painter draws nothing.
+fn ctl_rect(c: Ctl, setpw: bool) -> (usize, usize, usize, usize) {
+    match (c, setpw) {
+        (Ctl::User(i), false) => (LX + i * (USER_W + USER_GAP), 46, USER_W, FIELD_H),
+        (Ctl::NameField, false) => (FIELD_X, 76, FIELD_W, FIELD_H),
+        (Ctl::PwField, false) => (FIELD_X, 112, FIELD_W, FIELD_H),
+        (Ctl::PwField, true) => (FIELD_X, 76, FIELD_W, FIELD_H),
+        (Ctl::Pw2Field, true) => (FIELD_X, 112, FIELD_W, FIELD_H),
+        (Ctl::Button, _) => (W - LX - BTN_W, 150, BTN_W, BTN_H),
+        _ => (0, 0, 0, 0),
     }
+}
+
+fn setpw_form() -> bool {
+    FORM.lock().state == State::SetPw
 }
 
 /// Which control is at a SURFACE point, if any — the press's half of [`ctl_rect`], with no rect of its
 /// own. The fields and the button are asked first and the user rows last: the rows are the only
 /// controls whose COUNT varies, so asking them last keeps a store that grows from moving the answer
 /// anywhere the fixed controls already claim.
-fn ctl_at(lx: i32, ly: i32) -> Option<Ctl> {
+fn ctl_at(lx: i32, ly: i32, setpw: bool) -> Option<Ctl> {
     let inside = |c: Ctl| {
-        let (rx, ry, rw, rh) = ctl_rect(c);
-        lx >= rx as i32 && lx < (rx + rw) as i32 && ly >= ry as i32 && ly < (ry + rh) as i32
+        let (rx, ry, rw, rh) = ctl_rect(c, setpw);
+        rw > 0 && lx >= rx as i32 && lx < (rx + rw) as i32 && ly >= ry as i32 && ly < (ry + rh) as i32
     };
+    if setpw {
+        return [Ctl::PwField, Ctl::Pw2Field, Ctl::Button].into_iter().find(|&c| inside(c));
+    }
     for c in [Ctl::NameField, Ctl::PwField, Ctl::Button] {
         if inside(c) {
             return Some(c);
@@ -290,6 +328,7 @@ fn ctl_name(c: Option<Ctl>) -> &'static str {
         Some(Ctl::NameField) => "name-field",
         Some(Ctl::PwField) => "password-field",
         Some(Ctl::Button) => "button",
+        Some(Ctl::Pw2Field) => "retype-field",
         Some(Ctl::User(_)) => "user-row",
         None => "none",
     }
@@ -376,8 +415,8 @@ fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: 
 /// and a centred caption in the `theme`'s own button colours: the point is not the styling, it is that
 /// there IS a thing to press, because Enter is not discoverable and a person who has just created a
 /// password has no reason to know it is the only way in.
-fn button(px: &mut [u32], c: Ctl, label: &[u8], primary: bool) {
-    let (x, y, w, h) = ctl_rect(c);
+fn button(px: &mut [u32], c: Ctl, label: &[u8], primary: bool, setpw: bool) {
+    let (x, y, w, h) = ctl_rect(c, setpw);
     fill(px, x, y, w, h, if primary { theme::ACCENT } else { theme::BUTTON_FACE });
     rect(px, x, y, w, h, theme::FRAME_LINE);
     let tw = label.len() * CELL;
@@ -392,7 +431,7 @@ fn button(px: &mut [u32], c: Ctl, label: &[u8], primary: bool) {
 /// place a user's name is put on the glass before a session exists — deliberate, and the reason the
 /// wire line for a press on one says `user-row` and an INDEX, never the name.
 fn user_row(px: &mut [u32], i: usize, name: &[u8], picked: bool) {
-    let (x, y, w, h) = ctl_rect(Ctl::User(i));
+    let (x, y, w, h) = ctl_rect(Ctl::User(i), false);
     fill(px, x, y, w, h, if picked { theme::ACCENT } else { theme::CONTENT_FILL });
     rect(px, x, y, w, h, if picked { theme::ACCENT } else { theme::FRAME_LINE });
     let max = (w - 12) / CELL;
@@ -409,6 +448,33 @@ fn repaint() {
     let px: &mut [u32] = unsafe { &mut (*core::ptr::addr_of_mut!(SURF)).0 };
     fill(px, 0, 0, W, H, theme::CHROME_FACE);
     rect(px, 2, 2, W - 4, H - 4, theme::FRAME_LINE);
+    if f.state == State::SetPw {
+        // LOGIN14: the set-password form — "Set a password for <name>", the password, its retype, Set.
+        let mut title = [0u8; 19 + users::NAME_MAX];
+        title[..19].copy_from_slice(b"Set a password for ");
+        let n = f.name_len.min(users::NAME_MAX);
+        title[19..19 + n].copy_from_slice(&f.name[..n]);
+        text(px, LX, 14, &title[..19 + n], theme::CONTENT_TEXT);
+        fill(px, LX, 36, W - 2 * LX, 2, theme::FRAME_LINE);
+        let (pxf, py, pwf, _) = ctl_rect(Ctl::PwField, true);
+        text(px, LX, py + 4, b"Password", theme::TITLE_TEXT_INACTIVE);
+        field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
+        let (p2x, p2y, p2w, _) = ctl_rect(Ctl::Pw2Field, true);
+        text(px, LX, p2y + 4, b"Retype", theme::TITLE_TEXT_INACTIVE);
+        field(px, p2x, p2y, p2w, &f.pw2[..f.pw2_len], f.focus == Focus::Retype, true);
+        button(px, Ctl::Button, b"Set", true, true);
+        let hint: &[u8] = b"Enter or Set   Tab switches";
+        text(px, LX, 186, hint, theme::TITLE_TEXT_INACTIVE);
+        if !f.message.is_empty() {
+            text(px, LX, 212, f.message.as_bytes(), theme::ACCENT);
+        }
+        drop(f);
+        let id = WIN.load(Ordering::Relaxed);
+        if id != wm::WIN_NONE {
+            let _ = wm::present(id);
+        }
+        return;
+    }
     // LOGIN13 M1 (R63) — ONE face: the screen only logs in (`adduser` creates; see `submit`), so the
     // create-first-user title, button label and hint that keyed on `users::count() == 0` are gone.
     let title: &[u8] = b"Log in to UnaOS";
@@ -423,13 +489,13 @@ fn repaint() {
             user_row(px, i, &nb[..n], f.name_len == n && f.name[..n] == nb[..n]);
         }
     }
-    let (nx, ny, nw, _) = ctl_rect(Ctl::NameField);
+    let (nx, ny, nw, _) = ctl_rect(Ctl::NameField, false);
     text(px, LX, ny + 4, b"Name", theme::TITLE_TEXT_INACTIVE);
     field(px, nx, ny, nw, &f.name[..f.name_len], f.focus == Focus::Name, false);
-    let (pxf, py, pwf, _) = ctl_rect(Ctl::PwField);
+    let (pxf, py, pwf, _) = ctl_rect(Ctl::PwField, false);
     text(px, LX, py + 4, b"Password", theme::TITLE_TEXT_INACTIVE);
     field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
-    button(px, Ctl::Button, b"Log In", true);
+    button(px, Ctl::Button, b"Log In", true, false);
     let hint: &[u8] = b"Enter or Log In   Tab switches";
     text(px, LX, 186, hint, theme::TITLE_TEXT_INACTIVE);
     if !f.message.is_empty() {
@@ -455,15 +521,59 @@ pub fn open_once() {
 }
 
 fn open() {
+    open_as(State::Open);
+}
+
+/// LOGIN14: open the set-password form for `name`. From the login form (a first login) the window is
+/// already up and the form switches IN PLACE; from the boot (root's) a window is made. `login_after`
+/// says what happens once the password is written: log `name` in, or close back onto the root desktop.
+pub fn open_set_password(name: &[u8], login_after: bool) {
+    let n = name.len().min(FIELD_MAX);
+    let switched = {
+        let mut f = FORM.lock();
+        f.name = [0; FIELD_MAX];
+        f.name[..n].copy_from_slice(&name[..n]);
+        f.name_len = n;
+        f.setpw_login = login_after;
+        if f.state == State::Open {
+            f.state = State::SetPw;
+            f.focus = Focus::Password;
+            for b in f.pw.iter_mut().chain(f.pw2.iter_mut()) {
+                *b = 0;
+            }
+            f.pw_len = 0;
+            f.pw2_len = 0;
+            f.message = "Choose a password and retype it";
+            true
+        } else {
+            false
+        }
+    };
+    if !switched {
+        open_as(State::SetPw);
+    }
+    serial_println!(
+        "[login] set-password screen open user={} login_after={} in_place={} (LOGIN14/R65: the password is typed twice here and never printed)",
+        core::str::from_utf8(&name[..n]).unwrap_or("?"),
+        login_after,
+        switched
+    );
+    repaint();
+}
+
+fn open_as(state: State) {
     {
         let mut f = FORM.lock();
-        if f.state == State::Open {
+        if f.state == State::Open || f.state == State::SetPw {
             return;
         }
-        f.state = State::Open;
-        f.focus = Focus::Name;
-        f.name_len = 0;
+        f.state = state;
+        f.focus = if state == State::SetPw { Focus::Password } else { Focus::Name };
+        if state != State::SetPw {
+            f.name_len = 0; // the set-password form is opened WITH its name (`open_set_password`)
+        }
         f.pw_len = 0;
+        f.pw2_len = 0;
         f.message = "";
         f.windowed = false;
     }
@@ -495,7 +605,8 @@ fn open() {
     // argument gives the login screen a close box and gives a one-click route to a machine with no
     // screen, no console and a swallowed keyboard. The fixture's CLOSE leg measures it every witness
     // boot, against a control row that differs only here.
-    let id = wm::create_at(OWNER, surf, W * H * 4, W as u32, H as u32, (W * 4) as u32, b"Log in", ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
+    let title: &[u8] = if state == State::SetPw { b"Set password" } else { b"Log in" };
+    let id = wm::create_at(OWNER, surf, W * H * 4, W as u32, H as u32, (W * 4) as u32, title, ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
     if id == wm::WIN_NONE {
         FORM.lock().windowed = false;
         serial_println!("[login] screen open window=no (create refused — headless form)");
@@ -518,10 +629,11 @@ fn take_down() {
     }
     let mut f = FORM.lock();
     f.windowed = false;
-    for b in f.pw.iter_mut() {
+    for b in f.pw.iter_mut().chain(f.pw2.iter_mut()) {
         *b = 0;
     }
     f.pw_len = 0;
+    f.pw2_len = 0;
 }
 
 fn close_into_session() {
@@ -543,7 +655,7 @@ pub fn reopen_after_logout() {
 }
 
 pub fn is_open() -> bool {
-    FORM.lock().state == State::Open
+    matches!(FORM.lock().state, State::Open | State::SetPw)
 }
 
 /// SO36 + SO44 — **the screen's answer to a PRESS, and it is the same answer everywhere.**
@@ -602,10 +714,11 @@ pub fn press_swallow(x: i32, y: i32) -> bool {
     // press routed into a screen that is not on the glass is a press into nothing, and the row's
     // geometry is exactly what [`local_of`] is about to read.
     heal_if_row_gone();
-    let hit = local_of(x, y).and_then(|(lx, ly)| ctl_at(lx, ly));
+    let hit = local_of(x, y).and_then(|(lx, ly)| ctl_at(lx, ly, setpw_form()));
     match hit {
         Some(Ctl::NameField) => FORM.lock().focus = Focus::Name,
         Some(Ctl::PwField) => FORM.lock().focus = Focus::Password,
+        Some(Ctl::Pw2Field) => FORM.lock().focus = Focus::Retype,
         // A press on the button IS Enter. One call, so the two routes into a session cannot drift:
         // there is no second submit path to keep in step with `consume_key`'s.
         Some(Ctl::Button) => submit(),
@@ -674,12 +787,13 @@ fn pick_user(i: usize) {
 ///
 /// Returns `true` when it repaired something, which is only ever a finding outside the fixture.
 fn heal_if_row_gone() -> bool {
-    {
+    let state = {
         let f = FORM.lock();
-        if f.state != State::Open || !f.windowed {
+        if !matches!(f.state, State::Open | State::SetPw) || !f.windowed {
             return false;
         }
-    }
+        f.state
+    };
     if WIN.load(Ordering::Relaxed) != wm::WIN_NONE {
         return false;
     }
@@ -689,7 +803,7 @@ fn heal_if_row_gone() -> bool {
     // walked back one step first. Every field is cleared by `open` anyway, which is what a person
     // whose login screen just vanished and came back should get: an empty form, focus on Name.
     FORM.lock().state = State::Closed;
-    open();
+    open_as(state);
     true
 }
 
@@ -709,13 +823,19 @@ pub fn consume_key(c: u8) -> bool {
         b'\x1b' => {} // R24: Esc dismisses menus only; the screen stays
         b'\t' => {
             let mut f = FORM.lock();
-            f.focus = if f.focus == Focus::Name { Focus::Password } else { Focus::Name };
+            f.focus = match (f.state, f.focus) {
+                (State::SetPw, Focus::Password) => Focus::Retype,
+                (State::SetPw, _) => Focus::Password,
+                (_, Focus::Name) => Focus::Password,
+                _ => Focus::Name,
+            };
         }
         8 | 0x7f => {
             let mut f = FORM.lock();
             match f.focus {
                 Focus::Name => f.name_len = f.name_len.saturating_sub(1),
                 Focus::Password => f.pw_len = f.pw_len.saturating_sub(1),
+                Focus::Retype => f.pw2_len = f.pw2_len.saturating_sub(1),
             }
         }
         b'\n' | b'\r' => submit(),
@@ -736,6 +856,13 @@ pub fn consume_key(c: u8) -> bool {
                         f.pw_len += 1;
                     }
                 }
+                Focus::Retype => {
+                    if f.pw2_len < FIELD_MAX {
+                        let i = f.pw2_len;
+                        f.pw2[i] = c;
+                        f.pw2_len += 1;
+                    }
+                }
             }
         }
         _ => {}
@@ -744,7 +871,69 @@ pub fn consume_key(c: u8) -> bool {
     true
 }
 
+fn clear_passwords(f: &mut Form) {
+    for b in f.pw.iter_mut().chain(f.pw2.iter_mut()) {
+        *b = 0;
+    }
+    f.pw_len = 0;
+    f.pw2_len = 0;
+    f.focus = Focus::Password;
+}
+
+/// LOGIN14: the set-password form's Enter/Set. Empty and mismatched pairs write nothing and keep the
+/// form; a matching pair goes through `users::set_first_password` (refused unless the row is unset), then
+/// either logs the user in (a first login) or closes back onto the root desktop (root's boot prompt).
+fn submit_setpw() {
+    let (name, nlen, pw, plen, pw2, p2len, login_after) = {
+        let f = FORM.lock();
+        (f.name, f.name_len, f.pw, f.pw_len, f.pw2, f.pw2_len, f.setpw_login)
+    };
+    let n = &name[..nlen];
+    let who = core::str::from_utf8(n).unwrap_or("?");
+    if plen == 0 {
+        FORM.lock().message = "Type a password";
+        return;
+    }
+    if pw[..plen] != pw2[..p2len] {
+        serial_println!("[login] set-password user={} retype mismatch (nothing written; the form stays)", who);
+        let mut f = FORM.lock();
+        f.message = "Passwords do not match";
+        clear_passwords(&mut f);
+        return;
+    }
+    if let Err(e) = users::set_first_password(n, &pw[..plen]) {
+        serial_println!("[login] set-password user={} NOT written reason={} (the form stays)", who, users::users_reason(e));
+        let mut f = FORM.lock();
+        f.message = "Could not save the password";
+        clear_passwords(&mut f);
+        return;
+    }
+    if !login_after {
+        take_down();
+        FORM.lock().state = State::Closed;
+        serial_println!("[login] set-password screen closed user={} (the root desktop continues)", who);
+        return;
+    }
+    match users::login(n, &pw[..plen]) {
+        Ok(()) => {
+            LOGINS.fetch_add(1, Ordering::Relaxed);
+            serial_println!("[login] session open user={} (first login: the password was chosen here)", who);
+            close_into_session();
+        }
+        Err(_) => {
+            serial_println!("[login] password written but the session did not open — storage or slot refusal, NOT a credential refusal");
+            let mut f = FORM.lock();
+            f.state = State::Open;
+            f.message = "Could not open the session";
+            clear_passwords(&mut f);
+        }
+    }
+}
+
 fn submit() {
+    if setpw_form() {
+        return submit_setpw();
+    }
     let (name, nlen, pw, plen) = {
         let f = FORM.lock();
         (f.name, f.name_len, f.pw, f.pw_len)
@@ -755,6 +944,19 @@ fn submit() {
     }
     let n = &name[..nlen];
     let p = &pw[..plen];
+    if n == users::ROOT_NAME {
+        // LOGIN14: root is reached by booting (R63); the screen logs root in when R64's arc lands.
+        serial_println!("[login] denied user=root (root is the boot session; the screen does not open it yet)");
+        let mut f = FORM.lock();
+        f.message = "Root logs in by booting";
+        clear_passwords(&mut f);
+        return;
+    }
+    if users::password_unset(n) == Some(true) {
+        serial_println!("[login] first login user={} -> set password (LOGIN14/R65: the row has no credential yet)", core::str::from_utf8(n).unwrap_or("?"));
+        open_set_password(n, true);
+        return;
+    }
     // LOGIN13 M1 (R63: *"this is more an installer thing anyway"*) — the screen CREATES NOBODY. Until this
     // arc an empty store turned the two fields into create-first-user (`users::create_user`, then log in),
     // which is how flight 12 put a create form over a live desktop. A user is made by root with `adduser`
@@ -1124,7 +1326,7 @@ fn control_leg(
     /// SURFACE -> PANEL, the inverse of [`local_of`], used ONLY to aim the press.
     fn panel_of(c: Ctl) -> Option<(i32, i32)> {
         let info = wm::info(WIN.load(Ordering::Relaxed))?;
-        let (rx, ry, rw, rh) = ctl_rect(c);
+        let (rx, ry, rw, rh) = ctl_rect(c, false);
         let s = info.scale.max(1);
         Some((
             (info.x + (rx + rw / 2) * s) as i32,
@@ -1133,7 +1335,7 @@ fn control_leg(
     }
     // 1 — the leg's own arithmetic, checked before it is trusted.
     let round_trip = [Ctl::NameField, Ctl::PwField, Ctl::Button].iter().all(|&c| {
-        matches!(panel_of(c), Some((x, y)) if local_of(x, y).and_then(|(lx, ly)| ctl_at(lx, ly)) == Some(c))
+        matches!(panel_of(c), Some((x, y)) if local_of(x, y).and_then(|(lx, ly)| ctl_at(lx, ly, false)) == Some(c))
     });
     // 2 — OUTSIDE: consumed, and no control answered.
     let a0 = PRESS_ANSWERED.load(Ordering::Relaxed);
@@ -1331,6 +1533,13 @@ pub fn fixture_form_is(name: &[u8], password: bool) -> bool {
 
 /// LOGIN13 M3 fixture (`loginst`): put the screen back where the rest of the battery expects it — no
 /// row, console resumed, form `Closed` (a login leaves it `Session`, which no later leg starts from).
+/// LOGIN14 fixture: the set-password form is up for `name`.
+#[cfg(feature = "loginst")]
+pub fn fixture_setpw_for(name: &[u8]) -> bool {
+    let f = FORM.lock();
+    f.state == State::SetPw && f.name_len == name.len() && f.name[..name.len()] == *name
+}
+
 #[cfg(feature = "loginst")]
 pub fn fixture_reset() {
     take_down();
