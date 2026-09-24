@@ -875,7 +875,7 @@ pub fn pirq_gsi(bus: u8, dev: u8, func: u8, pin: u8, fw_line: u8) -> Result<u32,
     let idx = ((dnir >> (4 * (pin as u16 - 1))) & 0x7) as u32;
     let r = rout(idx);
     let pirq_name = (b'A' + idx as u8) as char;
-    if r & 0x80 != 0 {
+    if r & 0x80 != 0 && !IOAPIC3_APIC_INPUT { // IOAPIC3 (rmbp-ledger B216, R68): the refusal arm is KEPT for the record and is no longer taken — see `IOAPIC3_APIC_INPUT` at this file's tail
         serial_println!(
             "[ioapic] pirq bdf=0:{}.0 id=8086:{:04x} family={} rcba={:#x} pirqa={:#04x} pirqb={:#04x} pirqc={:#04x} pirqd={:#04x} pirqe={:#04x} pirqf={:#04x} pirqg={:#04x} pirqh={:#04x} fn={}:{}.{} pin=INT{} d{}ir={:#06x} -> pirq={} REFUSED reason=pirq-disabled — IRQEN is set on this PIRQ, which firmware leaves set only on a PIRQ it does not use, so the GSI is not guessed; nothing was written == witness ::",
             rdev, did, family, rcba,
@@ -885,7 +885,7 @@ pub fn pirq_gsi(bus: u8, dev: u8, func: u8, pin: u8, fw_line: u8) -> Result<u32,
         return Err(Pirq::Refused("pirq-disabled"));
     }
     let gsi = PIRQ_GSI_BASE + idx;
-    let line = r & 0x0F;
+    let line = r & 0x0F; if r & 0x80 != 0 { serial_println!("[ioapic] pirq bdf=0:{}.0 id=8086:{:04x} family={} rcba={:#x} pirq{}_rout={:#04x} irqen=1 fn={}:{}.{} pin=INT{} d{}ir={:#06x} -> gsi={} via=apic-input (IOAPIC3, R68: the 8259 path is off by firmware's choice and stays off; I/O APIC input 16+{} receives PIRQ{}# regardless — datasheet APIC Interrupt Mapping — so the redirection entry is programmed active-low level and no chipset register is written) == witness ::", rdev, did, family, rcba, pirq_name.to_ascii_lowercase(), r, bus, dev, func, pin_name, dev, dnir, gsi, idx, pirq_name); return Ok(gsi); } // IOAPIC3 (B216): the IRQEN=1 arm ROUTES — flight 13's `pirq=G REFUSED reason=pirq-disabled` becomes `gsi=22 via=apic-input`; the ISA line bits are meaningless with IRQEN set, so `line=` is not printed for it.
     let fw_agree = if fw_line == 0 || fw_line == 0xFF {
         "n/a"
     } else if fw_line == line {
@@ -901,3 +901,28 @@ pub fn pirq_gsi(bus: u8, dev: u8, func: u8, pin: u8, fw_line: u8) -> Result<u32,
     );
     Ok(gsi)
 }
+
+// ===================== IOAPIC3 (rmbp-ledger B216; R68) — IRQEN=1 IS NOT "UNUSED" IN APIC MODE =====================
+//
+// Flight 13 (FLIGHT13.md §6) read the router on the rMBP: every `PIRQ[n]_ROUT` at 0x80 (IRQEN set), D29IR
+// steering the EHCI's INTA to PIRQG, and rung 4 REFUSED (`reason=pirq-disabled`), as its brief said it
+// should until the metal answered. Peter's go (R68: "write whatever is needed to the chipset to enable
+// functionality") was for a chipset write; the datasheet says the write is not the enabling step:
+//   - `PIRQ[n]_ROUT` bit 7 IRQEN steers the 8259 path ONLY (1 = not routed to the 8259). Its note says BIOS
+//     clears it for PIRQs in use during POST and the OS SETS it again when it moves to I/O APIC delivery —
+//     Apple's firmware boots in APIC mode from the start, so 0x80 everywhere is the APIC-mode shape, not
+//     "unused".
+//   - The APIC Interrupt Mapping table routes PIRQA#-PIRQH# to I/O APIC inputs 16-23 unconditionally,
+//     active-low. That mapping does not pass through `PIRQ[n]_ROUT`.
+// So the enabling move is to route input 16+n and program its redirection entry (active-low, level —
+// rung 2's `route_gsi`), which this file already does for an IRQEN=0 PIRQ. Clearing IRQEN would ADD the
+// legacy 8259 delivery beside the APIC one — a second path the kernel does not service — so the chipset
+// register is left as firmware set it, and the wire says so (`irqen=1 … via=apic-input`).
+//
+// The refusal arm above is kept behind this constant so the record of what flight 13 read stays
+// executable: `false` restores `reason=pirq-disabled` exactly (the go-red for boot 14's reading).
+// METAL-ONLY: QEMU's ich9 router has IRQEN clear (`pirqa=0x0a …`, x86-default.spec), so this arm is
+// never taken there; boot 14 reads `ISRARM armed via=ioapic-intx gsi=22` and the EHCI's completion
+// interrupt counts moving where flight 13 read `ISRARM REFUSED reason=pirq-disabled`.
+const IOAPIC3_APIC_INPUT: bool = true;
+
