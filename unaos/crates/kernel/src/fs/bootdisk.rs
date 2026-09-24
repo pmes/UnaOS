@@ -599,7 +599,7 @@ pub fn survey() -> Survey {
     let v = walk_and_witness();
     if v.root.is_some() {
         *PENDING.lock() = None;
-        *CACHE.lock() = Some(v.clone());
+        *CACHE.lock() = Some(v.clone()); crate::bootpace::record_once(&ROOT_BIND_STAMP, "root-bind"); // BOOTSLOW (rmbp-ledger B201): the BPACE `root-bind` rung — the instant the boot first HAS a root, stamped where the answer is cached and nowhere else, so every caller (the root pass, a verb, a fixture) reports the same moment. `record_once` because two walks can race to this line. ⚠ LINE-NEUTRAL fold, statement BEFORE the comment; the latch and the root pass are at this file's tail.
     } else {
         RESURVEYS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         *PENDING.lock() = Some((fp, v.clone()));
@@ -2746,5 +2746,215 @@ pub fn so49_selftest() {
         bench_bpb, fat16_bpb, big_bpb, zeros_bpb,
         garbled.0, garbled.1, underscores.0, partial.0,
         if leg9 { "PASS" } else { "FAIL" }
+    );
+}
+
+// ===================== BOOTSLOW (rmbp-ledger B201) — THE ROOT PASS, AT THE FILE TAIL =====================
+//
+// WHAT FLIGHT 12 MEASURED. The internal SD card registered as a block source at 7083 ms
+// (`:: SDHCBLK: registered internal SD card as block handle Sdhc`), the desktop painted its bar at
+// 6699 ms, and the root bound at 32220 ms (`:: X86BIND: root=sdhc:/kernel.elf … -> PASS`). Nothing
+// in between was storage. The device-service pass's first iteration (8345 ms) entered
+// `service_ehci_hid`, which drained the deferred Bluetooth campaign (`bt-sched: [1] FIRING`) and
+// held that pass until `bt-sched: [1] COMPLETE at 32010 ms`: a 10.24 s inquiry and two 5.12 s page
+// timeouts against a speaker that was not there. Every storage call in the pass sits BELOW that
+// hook, so the root, the desktop app, the BPACE ledger and the FTDI console all waited on a radio.
+//
+// THE RULE. The root pass is ordered by DEPENDENCY, not by device name: it needs a block source and
+// nothing else, so it runs on the first pass that has one. A probe that does not serve the root
+// (the Bluetooth campaign, the audio tone) asks [`root_pass_open`] and waits for the pass's VERDICT —
+// bound, or settled with none — so it runs after the root, never ahead of it. No board, bus or
+// device appears here; the dependency is "a block source is present", which is true or false on
+// any machine.
+//
+// BOUNDED. A machine that never shows the kernel its disk must not hold the probes forever, so the
+// pass settles OUT LOUD after [`ROOT_PASS_SETTLE_MS`] measured from its first call — the same 30 s
+// the desktop app's storage wait (`video/desktop_uefi.rs` `STORAGE_WAIT_MS`) grants a slow stick,
+// because it is the same question. A settle is a verdict, not a bind: `locate()` stays live and a
+// disk that arrives later still roots the OS through the ordinary survey (SO38).
+
+/// BOOTSLOW — the latch behind `survey()`'s `root-bind` rung (see the fold on the `CACHE` store).
+static ROOT_BIND_STAMP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// BOOTSLOW — the root pass's verdict: 0 = unresolved, 1 = bound, 2 = settled with no root.
+static ROOT_PASS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// BOOTSLOW — `arch::ms()` at the root pass's first call (`.max(1)`, so 0 keeps meaning "not
+/// started"). The settle is measured from here, not from boot, so a late service loop does not eat
+/// the budget.
+static ROOT_PASS_SINCE_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// BOOTSLOW — `arch::ms()` at the first root-pass call that found ANY block source present. The
+/// `wait_ms=` on the verdict line is measured from here: it is the time the root pass spent with a
+/// disk in hand and no answer, which is the quantity flight 12 lost 25 s to.
+static ROOT_PASS_SEEN_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// BOOTSLOW — root-pass calls made, reported as `pass=` so a reader can tell "bound on the first
+/// pass that ran" from "bound after N passes of waiting for the disk".
+static ROOT_PASS_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// BOOTSLOW — the probes that asked [`root_pass_open`] while the verdict was pending, in first-ask
+/// order. Each is announced once (`root-pass HOLD`) and all are named on the verdict line.
+static ROOT_PASS_HELD: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+/// BOOTSLOW — how long the root pass waits for a root before it releases the probes held behind it.
+pub const ROOT_PASS_SETTLE_MS: u64 = 30_000;
+
+/// BOOTSLOW — the root pass. Called once per device-service pass on every x86 service loop, right
+/// after the storage probes; one relaxed load per pass once it has a verdict.
+///
+/// Binds by calling [`locate`], i.e. the SAME content survey every other caller uses — this adds no
+/// second finder, it only makes the survey run on the first pass that has a disk instead of whenever
+/// a later caller happens to ask. `survey()` re-walks only when the set of present sources changes,
+/// so calling it every pass costs one fingerprint string until something new enumerates.
+pub fn root_pass_service() {
+    use core::sync::atomic::Ordering;
+    if ROOT_PASS.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let now = crate::arch::ms();
+    let calls = ROOT_PASS_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    let mut since = ROOT_PASS_SINCE_MS.load(Ordering::Relaxed);
+    if since == 0 {
+        since = now.max(1);
+        ROOT_PASS_SINCE_MS.store(since, Ordering::Relaxed);
+    }
+    let any = fat::live_sources().into_iter().any(fat::source_present);
+    if any {
+        let mut seen = ROOT_PASS_SEEN_MS.load(Ordering::Relaxed);
+        if seen == 0 {
+            seen = now.max(1);
+            ROOT_PASS_SEEN_MS.store(seen, Ordering::Relaxed);
+        }
+        if let Verdict::Bound(f) = locate() {
+            ROOT_PASS.store(1, Ordering::Release);
+            let at = crate::arch::ms();
+            serial_println!(
+                "[vfs] root-pass BOUND source={} match={} at={}ms source_seen_at={}ms wait_ms={}ms pass={} held={} :: BOOTSLOW: the root is bound on its own pass; the probes named in held= run after it ::",
+                f.source.name(),
+                f.path,
+                at,
+                seen,
+                at.saturating_sub(seen),
+                calls,
+                held_names()
+            );
+            return;
+        }
+    }
+    let waited = now.saturating_sub(since);
+    if waited >= ROOT_PASS_SETTLE_MS {
+        ROOT_PASS.store(2, Ordering::Release);
+        let reason = match locate() {
+            Verdict::None_(r) => r.as_str(),
+            Verdict::Bound(_) => "bound-late",
+        };
+        serial_println!(
+            "[vfs] root-pass NONE reason={} waited={}ms threshold={}ms pass={} held={} disks={} :: BOOTSLOW: settled without a root; the held probes are released and a disk that arrives later still roots the OS through the ordinary survey ::",
+            reason,
+            waited,
+            ROOT_PASS_SETTLE_MS,
+            calls,
+            held_names(),
+            disk_census()
+        );
+    }
+}
+
+/// BOOTSLOW — may a probe that does NOT serve the root run yet? `true` once the root pass has a
+/// verdict (bound or settled), `false` before. The first `false` for a given `probe` prints one
+/// `root-pass HOLD` line naming it, so a held probe is visible on the wire and its later start line
+/// can be read against the verdict.
+pub fn root_pass_open(probe: &'static str) -> bool {
+    if ROOT_PASS.load(core::sync::atomic::Ordering::Acquire) != 0 {
+        return true;
+    }
+    let mut held = ROOT_PASS_HELD.lock();
+    if !held.iter().any(|p| *p == probe) {
+        held.push(probe);
+        drop(held);
+        serial_println!(
+            "[vfs] root-pass HOLD probe={} at={}ms :: BOOTSLOW: this probe does not serve the root and waits for the root pass's verdict ::",
+            probe,
+            crate::arch::ms()
+        );
+    }
+    false
+}
+
+/// BOOTSLOW — `bt-campaign,hda`, or `-` when nothing was held.
+fn held_names() -> String {
+    let held = ROOT_PASS_HELD.lock();
+    if held.is_empty() {
+        return String::from("-");
+    }
+    let mut out = String::new();
+    for (i, p) in held.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(p);
+    }
+    out
+}
+
+/// BOOTSLOW — the fixture's hold: longer than the `root-bind d=` bound `x86-wc.spec` pins (`d=\d{1,3}ms`,
+/// under one second), so a fixture that runs AHEAD of the root pass cannot fit under it.
+#[cfg(feature = "witness")]
+const ROOT_PASS_FIXTURE_HOLD_MS: u64 = 1_200;
+
+/// BOOTSLOW — the root-pass FIXTURE (witness only): a synthetic probe that does not serve the root,
+/// asking the same gate the Bluetooth campaign and the audio tone ask.
+///
+/// WHY IT EXISTS. The wait flight 12 paid is a probe only the metal has — q35 carries no Broadcom
+/// radio — so on QEMU the old ordering and the new one bind the root at the same instant and no
+/// timing row could tell them apart. This fixture gives QEMU the metal's shape: it ARMS each time the
+/// set of present block sources changes while the root is unresolved (the radio became due the same
+/// way: the enumeration walk found it), and when its gate opens it holds the device-service pass for
+/// [`ROOT_PASS_FIXTURE_HOLD_MS`], exactly as `bt_bringup_wire` holds it. It is called on the same
+/// line as [`root_pass_service`] and AHEAD of it, so a gate that does not hold (the old ordering) runs
+/// the hold between the disk appearing and the root binding, and `:: BPACE: root-bind … d=` carries it.
+///
+/// Its own line names the verdict it saw when it ran: `verdict=bound` is the correct ordering;
+/// `verdict=pending` is a held probe that ran before the root and is FORBIDDEN in `x86-wc.spec`.
+/// Fires at most twice per boot, so a gate that never holds cannot turn it into a stall loop.
+#[cfg(feature = "witness")]
+pub fn root_pass_fixture() {
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static FIRED: AtomicU32 = AtomicU32::new(0);
+    static LAST_FP: Mutex<Option<String>> = Mutex::new(None);
+    if FIRED.load(Ordering::Relaxed) >= 2 {
+        return;
+    }
+    let verdict = ROOT_PASS.load(Ordering::Acquire);
+    if verdict == 0 {
+        let fp = present_fingerprint();
+        let mut last = LAST_FP.lock();
+        if fp != "-" && last.as_deref() != Some(fp.as_str()) {
+            *last = Some(fp);
+            ARMED.store(true, Ordering::Relaxed);
+        }
+    }
+    if !ARMED.load(Ordering::Relaxed) || !root_pass_open("witness-fixture") {
+        return;
+    }
+    ARMED.store(false, Ordering::Relaxed);
+    let n = FIRED.fetch_add(1, Ordering::Relaxed) + 1;
+    let start = crate::arch::ms();
+    while crate::arch::ms().saturating_sub(start) < ROOT_PASS_FIXTURE_HOLD_MS {
+        core::hint::spin_loop();
+    }
+    let seen = match ROOT_PASS.load(Ordering::Acquire) {
+        1 => "bound",
+        2 => "none",
+        _ => "pending",
+    };
+    serial_println!(
+        "[vfs] root-pass fixture n={} held_ms={} at={}ms verdict={} :: BOOTSLOW: a synthetic probe that does not serve the root; verdict=bound is the ordering, verdict=pending is a probe that ran ahead of the root ::",
+        n,
+        crate::arch::ms().saturating_sub(start),
+        start,
+        seen
     );
 }

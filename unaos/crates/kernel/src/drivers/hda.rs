@@ -2052,3 +2052,33 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     );
     a.line("tone");
 }
+
+// ===================== BOOTSLOW (rmbp-ledger B201) — THE PROBE, AFTER THE ROOT =====================
+//
+// `probe()` used to run inside `arch::x86_64::pci::init`, on the boot core, after the internal SD
+// card had registered and before the SCHED-X86 handoff started the service loop that binds the root.
+// Flight 12 measured what that ordering cost: `[hda] tone arm` at 7116 ms, `:: HDA-TONE: … run_ms=1200
+// … -> PASS ::` at 8325 ms, `BPACE: gui t=8344ms` — 1.2 s of audio fixture between a disk being
+// present and anything being allowed to root the OS on it. The tone serves nothing the root needs.
+//
+// So the call moved to the device-service pass (`main.rs`, all three x86 loops) and runs ONCE, after
+// the root pass has a verdict (`fs::bootdisk::root_pass_open`). Nothing in `probe` needed the boot
+// core: it takes its own PCI inventory, maps its own BAR, allocates its own DMA, and every wait in
+// this file is a bounded TSC spin (module docs), which runs the same in a scheduled kernel task as it
+// did with interrupts masked. The content of `probe` — every register, every witness — is unchanged.
+
+/// BOOTSLOW — `probe()` once, from a device-service pass, after the root pass's verdict.
+pub fn probe_after_root() {
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.load(core::sync::atomic::Ordering::Relaxed) || !crate::fs::bootdisk::root_pass_open("hda") {
+        return;
+    }
+    if DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    serial_println!(
+        "[hda] probe deferred-start at={}ms :: BOOTSLOW: the HDA bring-up runs after the root pass, not on the boot core ::",
+        crate::arch::ms()
+    );
+    probe();
+}

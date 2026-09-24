@@ -729,3 +729,32 @@ FORBID :: MENUFIRST: .* :: SKIP ::
 # selection on the editable line (the rule TERMSEL deferred), `pc=` the PC table's four caret rows.
 REQUIRE :: TERMSEL2: legs=0x7ffff/0x7ffff hit=ok route=ok drag=ok up=ok dbl=ok sel=ok copy=ok cut_ro=ok esc=ok word=ok into_edit=ok edit=ok click_caret=ok arrows=ok insert=ok bs=ok replace=ok collapse=ok pc=ok -> PASS ::
 FORBID :: TERMSEL2: .* -> FAIL ::
+#
+# --- BOOTSLOW (rmbp-ledger B201) — THE ROOT PASS RUNS BEFORE THE PROBES THAT DO NOT SERVE IT -----
+# Flight 12 (metal, `f12-boot1.log`): `:: SDHCBLK: registered internal SD card as block handle Sdhc`
+# at 7083 ms, `:: X86BIND: root=sdhc:/kernel.elf … -> PASS ::` at 32220 ms. The device-service pass's
+# first iteration drained the deferred Bluetooth campaign (`bt-sched: [1] FIRING` 8345 ms ->
+# `COMPLETE at 32010 ms`) from inside `service_ehci_hid`, ahead of every storage call in the pass.
+# The root pass (`fs::bootdisk::root_pass_service`) now binds on the first pass that has a block
+# source, and the campaign, the HDA tone and this lane's fixture ask `root_pass_open` first.
+#
+# q35 has no radio, so the old ordering and the new bind at the same instant here. The witness-only
+# `root_pass_fixture` gives the lane the metal's shape: it arms when the set of present block
+# sources changes while the root is unresolved and holds the service pass 1200 ms when its gate
+# opens — AHEAD of the root pass on the same line. Three rows:
+#   * `root-bind d=` — the BPACE rung, stamped where `survey()` caches the root. Its `d=` is the
+#     gap from the previous ledger stamp (the storage bring-up's `fat-mount`/`stor-ready` here,
+#     `gui` on the metal), pinned under one second (`\d{1,3}ms`); the fixture's 1200 ms hold cannot
+#     fit under it when it runs ahead of the root.
+#   * the fixture's own line must say it ran after the root (`verdict=bound`); `verdict=pending` is
+#     a held probe that ran ahead of it and is FORBIDDEN.
+#   * the root pass's verdict line is REQUIRED (the pass exists and bound), `NONE` FORBIDDEN on this
+#     lane (the boot stick carries the kernel).
+# GO-RED (measured, B201): `root_pass_open` returning `true` unconditionally — the old ordering, every
+# probe runs the moment it is due — see docs/dev/evidence/rmbp-0924/bootslow/BOOTSLOW.md for the
+# capture, the mutation's sha256 and the restored hash.
+REQUIRE :: BPACE: root-bind t=\d+ms d=\d{1,3}ms ::
+REQUIRE \[vfs\] root-pass BOUND source=\S+ match=\S+ at=\d+ms source_seen_at=\d+ms wait_ms=\d+ms pass=\d+ held=\S+ ::
+REQUIRE \[vfs\] root-pass fixture n=1 held_ms=\d+ at=\d+ms verdict=bound
+FORBID \[vfs\] root-pass fixture .* verdict=pending
+FORBID \[vfs\] root-pass NONE
