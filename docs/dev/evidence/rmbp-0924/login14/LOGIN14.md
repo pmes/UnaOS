@@ -53,3 +53,14 @@ The desktop ignition ran BEFORE the store loaded on this QEMU boot (`deferred=fa
 other order (store first, `deferred=true`, the screen opened by `boot_session`) is built and compiled
 but has no runtime reading yet: the rMBP's SD card versus render-service race decides which the metal
 shows, and §9.2's line 2 names both.
+
+## LOGINFONT (B204) and LOGINORDER (B206), same lane, 2026-09-24
+
+| gate | result |
+|---|---|
+| the login line above on cb883e2e (LOGINFONT + the five folds) | mbench 51/51 required, **4 forbidden hits**: `[clickroute] route … deflect=true -> FAIL`, `:: TERMSEL2: legs=0x7c001/0x7ffff … -> FAIL ::` and the two default FORBIDs they trip; `[login] press at=(624,241) control=none answered=7 swallowed=4` sits between them — the screen fixture's headless legs were live while the click family pressed (B189 finding 1; BOOTSLOW's 1.2 s hold moved the service pass onto it) |
+| the same line on 8c8f8369 (+ LOGINORDER) | mbench PASS 51/51, 0 forbidden, 3288 lines; `[clickroute] battery held 111ms for the loginst chain settled=true (LOGINORDER, B206 — B189 finding 1: the login fixtu`; `:: TERMSEL2: legs=0x7ffff/0x7ffff …`; `:: LOGIN-ROOTPW: … -> PASS ::`. The verb's rc=1 is SOCK-3 (the container's, FOLD.md control) |
+
+LOGINFONT itself has no wire of its own: the form's behaviour is the 51 witnesses above, and the glyphs are
+the glass's to judge on flight 13.
+
