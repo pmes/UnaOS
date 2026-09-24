@@ -1295,7 +1295,9 @@ fn main() {
     // Pro) than the legacy i440FX default. Note: on Q35 the qemu-xhci PCIe INTx routes to
     // an APIC GSI the 8259 PIC cannot service, so interrupt-driven xHCI uses MSI-X (local
     // APIC) rather than legacy INTx.
-    cmd.arg("-machine").arg("pc-q35-10.0");
+    // UNAOS_QEMU_MACHINE overrides the pinned machine type for a box whose QEMU predates 10.0
+    // (a cloud container with QEMU 8.2 has `pc-q35-8.2`); unset, the pin stands.
+    cmd.arg("-machine").arg(std::env::var("UNAOS_QEMU_MACHINE").unwrap_or_else(|_| "pc-q35-10.0".to_string()));
 
     // CPU model: advertise x2APIC (the default qemu64 model does not), so the kernel exercises
     // the MSR-based local-APIC path that the target hardware (2012 MacBook, Zenbook S16) uses.
