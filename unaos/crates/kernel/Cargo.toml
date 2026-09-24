@@ -3605,6 +3605,14 @@ hda = []
 # Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs`.
 # See docs/dev/OS/11_AUDIO/hda.md.
 hda-tone = ["hda"]
+# HDASIE (rmbp-ledger B207): `UNAOS_HDASIE=1` — the one-knob flight B130 left open. Sets `INTCTL.SIE[n]`
+# for the tone's ONE descriptor right before RUN and restores it after STOP (GIE/CIE untouched, so no
+# interrupt reaches the CPU) to ask whether SIE gates the `SDnSTS.BCIS` LATCH on the 7-series PCH the
+# way `RIRBCTL.RINTCTL` gates `RINTFL`. Implies `hda-tone`. Default OFF => both functions and the
+# `wrote-intctl=N(sie)` audit variant are file-tail and cfg-gated, call sites same-line: byte-identical
+# (`./arroyo knoboff hda-sie`). x86_64 only; stripped from aarch64 by arroyo's `arm_features` via `hda`.
+# Kept in sync with `unaos/arroyo` AND `unaos/builder/src/main.rs`. See docs/dev/OS/11_AUDIO/hda.md §6.
+hda-sie = ["hda-tone"]
 # UVC (rmbp-ledger B143): `UNAOS_UVC=1` arms the USB Video Class CENSUS and the `VS_PROBE_CONTROL`
 # negotiation on the 2012 rMBP's built-in FaceTime HD camera (`05ac:8510`, class 0xEF with a video
 # IAD, high speed, EHCI controller [0] addr 2 — the device flight 11 enumerated and dismissed with

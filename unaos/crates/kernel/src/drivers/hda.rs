@@ -320,11 +320,11 @@ struct Audit {
     ctrl: u32,      // controller MMIO register writes (GCTL, CORB*, RIRB*)
     stream: u32,    // stream-descriptor MMIO writes (SDnCTL/FMT/BDPL/BDPU/CBL/LVI/STS)
     verbs_get: u32, // codec verbs that only read
-    verbs_set: u32, // codec verbs that change codec state
+    verbs_set: u32, #[cfg(feature = "hda-sie")] intctl: u32, // codec verbs that change codec state; HDASIE (B207): the INTCTL write count, a field only when the knob is on so the knob-off struct is the struct it always was
 }
 
 impl Audit {
-    fn line(&self, stage: &str) {
+    #[cfg(not(feature = "hda-sie"))] fn line(&self, stage: &str) { // HDASIE (B207): with the knob ON this body is replaced by the file-tail `impl Audit` whose `wrote-intctl=` is a COUNT, because an audited zero must never be printed over a register this driver has written
         serial_println!(
             "[hda] audit stage={} wrote-cfg={} wrote-ctrl={} wrote-stream={} verbs-get={} verbs-set={} wrote-intctl=0(audited) wrote-wallclk=0(audited) wrote-dplbase=0(audited)",
             stage, self.cfg, self.ctrl, self.stream, self.verbs_get, self.verbs_set
@@ -1894,7 +1894,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     );
 
     // ── RUN. ────────────────────────────────────────────────────────────────────────────────────
-    let lpib0 = r32(base, sd + SD_LPIB);
+    let lpib0 = r32(base, sd + SD_LPIB); #[cfg(feature = "hda-sie")] let sie_saved = sie_arm(base, iss, a); // HDASIE (B207): INTCTL.SIE[desc] set — and ONLY that bit; GIE/CIE stay as read — immediately before RUN, so the question B130 left (does SIE gate the SDnSTS.BCIS LATCH on the 7-series PCH the way RIRBCTL.RINTCTL gates RINTFL?) is answered by the `bcis=` this very run prints. Same-line, cfg-gated: knob-off bytes unchanged.
     w8(base, sd + SD_CTL, SDCTL_IOCE as u8 | SDCTL_RUN as u8);
     a.stream += 1;
     let ctl_running = (r8(base, sd + SD_CTL) as u32)
@@ -1961,7 +1961,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     w8(base, sd + SD_CTL + 2, ((saved_ctl >> 16) & 0xFF) as u8);
     w8(base, sd + SD_CTL + 1, ((saved_ctl >> 8) & 0xFF) as u8);
     w8(base, sd + SD_CTL, (saved_ctl & 0xFF) as u8 & !(SDCTL_RUN as u8));
-    a.stream += 9;
+    a.stream += 9; #[cfg(feature = "hda-sie")] sie_restore(base, iss, sie_saved, bcis, a); // HDASIE (B207): INTCTL back to the value read before the arm, with a readback, after the stream is stopped and reset — the mirror-order restore every other register on these lines gets.
 
     for m in 0..np {
         let p = paths[m];
@@ -2081,4 +2081,63 @@ pub fn probe_after_root() {
         crate::arch::ms()
     );
     probe();
+}
+
+// ===================== HDASIE (rmbp-ledger B207) — THE ONE-KNOB FLIGHT B130 LEFT OPEN =====================
+//
+// Flight 11 read `bcis=0` on a stream that ran at the link rate with IOC set in both BDL entries and
+// `SDnCTL.IOCE` set: the 7-series PCH (8086:1e20) did not latch `SDnSTS.BCIS`. QEMU's controller does.
+// This driver has one precedent for a latch gated by an interrupt-CONTROL bit: `RIRBCTL.RINTCTL`
+// gates the `RIRBSTS.RINTFL` latch, not only the interrupt (hda.md §2.4, measured). The symmetric
+// candidate is `INTCTL.SIE[n]` [HDA-SPEC §3.3.14] gating the `SDnSTS.BCIS` latch. `INTCTL` was this
+// driver's audited never-written register, so the experiment is its own knob (`UNAOS_HDASIE=1`,
+// feature `hda-sie`, implies `hda-tone`), default OFF, and it changes exactly one thing: the SIE bit
+// of the ONE descriptor the tone runs on is set right before RUN and restored right after STOP.
+// `GIE` (bit 31) and `CIE` (bit 30) are never touched, so no interrupt can reach the CPU either way —
+// this is a latch experiment, not an interrupt arc. THE MEASUREMENT is the `bcis=` on the tone line
+// of the same run; the verdict below is deliberately NOT about it (a latch that still does not fire
+// is the finding, not a defect of this code): `:: HDA-SIE:` PASSes when the register was restored
+// to the value read before the arm. `sie_set=` says whether the write stuck (a read-only bit on some
+// part would read 0 and is then its own finding). Both functions are file-tail and cfg-gated, both
+// call sites are same-line, so the knob-off image is byte-identical (`./arroyo knoboff hda-sie`).
+#[cfg(feature = "hda-sie")]
+fn sie_arm(base: u64, iss: u8, a: &mut Audit) -> u32 {
+    let before = r32(base, REG_INTCTL);
+    let bit = 1u32 << (iss as u32 & 31);
+    w32(base, REG_INTCTL, before | bit);
+    a.intctl += 1;
+    let after = r32(base, REG_INTCTL);
+    serial_println!(
+        "[hda] intctl sie desc={} bit={:#010x} before={:#010x} want={:#010x} after={:#010x} set={} gie={} cie={}",
+        iss, bit, before, before | bit, after, (after & bit != 0) as u8, (after >> 31) & 1, (after >> 30) & 1
+    );
+    before
+}
+
+#[cfg(feature = "hda-sie")]
+fn sie_restore(base: u64, iss: u8, saved: u32, bcis: u32, a: &mut Audit) {
+    let bit = 1u32 << (iss as u32 & 31);
+    let armed = r32(base, REG_INTCTL);
+    w32(base, REG_INTCTL, saved);
+    a.intctl += 1;
+    let after = r32(base, REG_INTCTL);
+    let restored = after == saved;
+    serial_println!(
+        "[hda] intctl restore desc={} armed={:#010x} saved={:#010x} after={:#010x} restored={} bcis_with_sie={}",
+        iss, armed, saved, after, restored as u8, bcis
+    );
+    serial_println!(
+        ":: HDA-SIE: desc={} sie_set={} restored={} bcis={} -> {} ::",
+        iss, (armed & bit != 0) as u8, restored as u8, bcis, if restored { "PASS" } else { "FAIL" }
+    );
+}
+
+#[cfg(feature = "hda-sie")]
+impl Audit {
+    fn line(&self, stage: &str) {
+        serial_println!(
+            "[hda] audit stage={} wrote-cfg={} wrote-ctrl={} wrote-stream={} verbs-get={} verbs-set={} wrote-intctl={}(sie) wrote-wallclk=0(audited) wrote-dplbase=0(audited)",
+            stage, self.cfg, self.ctrl, self.stream, self.verbs_get, self.verbs_set, self.intctl
+        );
+    }
 }

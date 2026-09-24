@@ -2653,6 +2653,15 @@ fi
 # (stripped by arm_features below, exactly as `hda` itself is).
 # Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
 [ -n "${UNAOS_HDATONE:-}" ] && _feats="${_feats}hda-tone,"
+# HDASIE (rmbp-ledger B207): UNAOS_HDASIE=1 arms the INTCTL.SIE experiment on the tone's descriptor —
+# the one-knob flight B130 left open (does SIE gate the SDnSTS.BCIS latch on the 7-series PCH?). Implies
+# `hda-tone` (Cargo.toml `hda-sie = ["hda-tone"]`). Witnesses `[hda] intctl sie …`, `[hda] intctl
+# restore …`, `:: HDA-SIE: desc=N sie_set=. restored=1 bcis=N -> PASS ::`; the audit line reads
+# `wrote-intctl=2(sie)`. GIE/CIE are never written: no interrupt reaches the CPU. Default OFF =>
+# file-tail cfg-gated, byte-identical (`./arroyo knoboff hda-sie`). x86_64 only (stripped with `hda`).
+#   UNAOS_HDA=1 UNAOS_HDATONE=1 UNAOS_HDASIE=1 ./arroyo test 60
+# Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
+[ -n "${UNAOS_HDASIE:-}" ] && _feats="${_feats}hda-sie,"
 # UVC (rmbp-ledger B143): UNAOS_UVC=1 arms drivers/uvc.rs — the USB VIDEO CLASS census and the
 # VS_PROBE_CONTROL negotiation. THE DEVICE: the 2012 rMBP's built-in FaceTime HD camera, 05ac:8510,
 # bDeviceClass 0xEF (Miscellaneous, with an Interface Association Descriptor), high speed, on EHCI
@@ -3103,6 +3112,9 @@ arm_features() {
     # Order-independent with the strip above by its own argument: `,hda-tone,` does not contain
     # `,hda,` as a substring, because the trailing comma is part of every pattern.
     f="${f//,hda-tone,/,}"
+    # HDASIE (B207) rides the same strip: `hda-sie` implies `hda-tone`, and its two functions are a
+    # cfg-gated tail of the same x86-gated file — not one byte of aarch64 CODE, same hash argument.
+    f="${f//,hda-sie,/,}"
     # IOAPIC (B147) rides the same strip, and its argument is the strongest of the three: the
     # I/O APIC is an x86 interrupt controller and nothing else. The module is declared in
     # `arch/x86_64/mod.rs` — a directory aarch64 never compiles — its two call sites are in

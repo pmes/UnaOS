@@ -680,6 +680,55 @@ What is worth reading off it, because it is what the metal boot will be compared
 
 ---
 
+## 6b. HDASIE — the INTCTL.SIE latch experiment (rmbp-ledger B207, 2026-09-24)
+
+Flight 11 (§6) read `bcis=0` on a stream that walked the whole cyclic buffer at the link rate with
+IOC set in both BDL entries and `SDnCTL.IOCE` set. B130 changed the verdict so that a wrap is the
+second witness and left one question open: **why does the 7-series PCH (`8086:1e20`) not latch
+`SDnSTS.BCIS`?** The one precedent in this file is §2.4: `RIRBCTL.RINTCTL` gates the `RIRBSTS.RINTFL`
+*latch*, not only the interrupt. The symmetric candidate is `INTCTL.SIE[n]` [HDA-SPEC §3.3.14] gating
+the `SDnSTS.BCIS` latch. `INTCTL` was this driver's audited never-written register, so the experiment
+is its own knob and changes exactly one thing.
+
+**Knob.** `UNAOS_HDASIE=1` → feature `hda-sie` (implies `hda-tone`). Wired in `arroyo` (mapping and
+`arm_features` strip), `builder/src/main.rs` (the media list) and `Cargo.toml`.
+
+**What it does, and what it does not.** `sie_arm` runs on the `let lpib0` line, immediately before
+RUN: reads `INTCTL`, sets bit `n` for the ONE descriptor the tone runs on (`iss`, the first output
+descriptor), reads back. `sie_restore` runs on the `a.stream += 9` line after STOP, reset and the
+register restores: writes the value read before the arm, reads back. **`GIE` (bit 31) and `CIE` (bit
+30) are never written**, so no interrupt can reach the CPU either way — this is a latch experiment,
+not an interrupt arc, and `[hda] rings … intctl=…(untouched)` stays true where it prints (before the
+tone). The audit line's `wrote-intctl=0(audited)` is REPLACED with the knob on by a file-tail
+`impl Audit` that prints the count: `wrote-intctl=2(sie)`. An audited zero is never printed over a
+register this driver has written.
+
+**Wire.**
+```
+[hda] intctl sie desc=N bit=0x… before=0x… want=0x… after=0x… set=1 gie=0 cie=0
+[hda] tone stream=0 … bcis=N …                      ← THE MEASUREMENT
+[hda] intctl restore desc=N armed=0x… saved=0x… after=0x… restored=1 bcis_with_sie=N
+:: HDA-SIE: desc=N sie_set=1 restored=1 bcis=N -> PASS ::
+[hda] audit stage=tone … wrote-intctl=2(sie) …
+```
+**The verdict is about the restore, on purpose.** `-> PASS` says the register was put back to the
+value read before the arm. `bcis=` is the finding and is not scored here: on the bench, `bcis>0`
+with SIE set and `bcis=0` without it (flight 11) *is* the answer "SIE gates the latch"; `bcis=0` with
+`sie_set=1` says the hypothesis is wrong and the next candidate is the descriptor's own `IOCE`
+polarity or a controller quirk; `sie_set=0` says the bit would not take and is its own finding. None
+of those is a defect of this code, so none of them reds the run under DEFAULT_FORBIDS.
+
+**QEMU.** `hda-duplex` latches BCIS with or without SIE, so the fixture proves the knob's mechanics
+(set, readback, restore, audit count, tone verdict unchanged) and cannot answer the question. The
+gate line and the go-red are in `docs/dev/evidence/rmbp-0924/hdasie/HDASIE.md`.
+
+**Byte identity.** Both call sites are same-line and cfg-gated, both functions and the audit variant
+are file-tail; knob-off the module is not lexed at all (the "Byte identity" note above), so
+`./arroyo knoboff hda-sie` holds by the same argument as `hda-tone`.
+
+**Flight line** (the metal answer; one boot, the ear optional): flight 12's knobs plus
+`UNAOS_HDA=1 UNAOS_HDATONE=1 UNAOS_HDASIE=1`. Score `bcis=` on the tone line against flight 11's `bcis=0`.
+
 ## 7. The metal expectation
 
 The bench machine is a 2012 15" Retina MacBook Pro, MacBookPro10,1, Intel 7-series (Panther Point)

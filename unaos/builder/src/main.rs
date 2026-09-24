@@ -331,6 +331,11 @@ fn main() {
     // Default OFF => the tone block, the sine generator and every stream write unlinked, media
     // byte-identical. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
     if std::env::var("UNAOS_HDATONE").is_ok() { feats.push("hda-tone"); }
+    // HDASIE (rmbp-ledger B207): UNAOS_HDASIE=1 sets INTCTL.SIE for the tone's one descriptor before RUN
+    // and restores it after STOP — the BCIS-latch experiment B130 left open. Implies `hda-tone` in
+    // Cargo.toml. Same reason as HDATONE for living in THIS list: a media build must carry the bit or
+    // the wire reads `wrote-intctl=0(audited)` and the flight answers nothing. Default OFF, byte-identical.
+    if std::env::var("UNAOS_HDASIE").is_ok() { feats.push("hda-sie"); }
     // BCMA-RECON (GR20): UNAOS_BCMARECON=1 arms drivers/bcma.rs — STRICTLY READ-ONLY recon of the
     // Broadcom WiFi radio (class 0x02 / subclass 0x80), the first arc of the native-BCM4331 path.
     // THIS list is what reaches the kernel binary for MEDIA builds: the builder re-derives the x86
