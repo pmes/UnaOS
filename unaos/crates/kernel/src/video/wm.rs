@@ -23509,7 +23509,7 @@ fn create_inner(
         let min_y = work_top(info.width, info.height) + TITLE_H + BORDER;
         let max_x = info.width.saturating_sub(cw + BORDER).max(BORDER);
         let max_y = info.height.saturating_sub(ch + BORDER).max(min_y);
-        Some((x.clamp(BORDER, max_x), y.clamp(min_y, max_y), scale))
+        Some((x.clamp(BORDER, max_x), y.clamp(min_y, max_y), scale, info.width, info.height))
     });
     let mut t = table();
     let slot = match t.rows.iter().position(|r| !r.used) {
@@ -23578,7 +23578,7 @@ fn create_inner(
     row.title[..minted_len].copy_from_slice(&minted[..minted_len]); title_source_store(id, title_src); // WINTITLE-LATE — ⚠ SAME-LINE fold, line-NEUTRAL. The provenance is published WITH the caption and under the same guard, so `title_source_of` can never name a clause the row's bytes did not come from. It is stored for EVERY create, including a recycled slot, which is what keeps a dead tenant's `from=` from surviving under a live id.
     // SPAWN-PLACE — the row is born at its final geometry and PINNED, so the `place` below skips it
     // and the `composite` below paints it exactly once, where it stays.
-    if let Some((x, y, scale)) = placed {
+    if let Some((x, y, scale, pw, ph)) = placed { let (x, y) = glassfix3_cascade(&t, x, y, w.saturating_mul(scale), h.saturating_mul(scale), pw, ph); // GLASSFIX3 — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST. The Mac cascade: a request whose box would cover a live row's title band is offset down-right by one band from that row until it covers none. See the GLASSFIX3 block at this file's tail.
         row.x = x;
         row.y = y;
         row.scale = scale;
@@ -23937,11 +23937,11 @@ fn flow_fits(t: &Table, pw: usize, ph: usize, wtop: usize, usable_h: usize, cap:
             cy = cy.saturating_add(row_h).saturating_add(GAP);
             row_h = 0;
         }
-        if cy > wtop.saturating_add(usable_h.saturating_sub(bh)) {
+        let py = glassfix3_clear(t, r.z, r.id, cx, cy, bw, bh); if py > wtop.saturating_add(usable_h.saturating_sub(bh)) { // GLASSFIX3 — ⚠ SAME-LINE fold, line-NEUTRAL: `py` is `place`'s pushed origin, so this answers for the layout `place` will publish.
             return false;
         }
         cx = cx.saturating_add(bw).saturating_add(GAP);
-        row_h = row_h.max(bh);
+        row_h = row_h.max(bh + py.saturating_sub(cy));
     }
     true
 }
@@ -24126,7 +24126,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
                 }
             }
         }
-        let r = &mut t.rows[i];
+        ry = glassfix3_clear(&t, t.rows[i].z, t.rows[i].id, cx, ry, bw, bh).min(ceiling.max(ry)); let r = &mut t.rows[i]; // GLASSFIX3 — ⚠ SAME-LINE fold, line-NEUTRAL, CODE FIRST. A tiled row never lands across a pinned row's title band (nor with its own band under a pinned row above it): pushed DOWN past it, never below the work area (`ceiling`).
         // WC-J — the box this row occupied BEFORE the tiler moved it. A tiled window's position is a
         // function of how many windows exist, so every create and every close re-tiles the survivors;
         // the pixels they leave behind belong to nobody afterwards, and nothing else in this module
@@ -24160,7 +24160,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         pids[np] = (r.id, r.owner_asid);
         np += 1;
         cx = cx.saturating_add(bw).saturating_add(GAP);
-        row_h = row_h.max(bh);
+        row_h = row_h.max(bh + ry.saturating_sub(cy));
     }
 
     drop(t);
@@ -28326,6 +28326,14 @@ pub fn glassfix2_selftest() {
         KERNEL_OWNER_BASE + 0x4A,
         KERNEL_OWNER_BASE + 0x4B,
     ];
+    /// GLASSFIX3 — three more, for the PINNED rows (`create_at`), disjoint from the four above and
+    /// from every other kernel-band owner in the tree (0x4C..0x4E: no other user).
+    const PIN_OWNERS: [u64; 3] = [
+        KERNEL_OWNER_BASE + 0x4C,
+        KERNEL_OWNER_BASE + 0x4D,
+        KERNEL_OWNER_BASE + 0x4E,
+    ];
+    const _: () = assert!(is_kernel_owner(PIN_OWNERS[0]) && is_kernel_owner(PIN_OWNERS[2]));
     const _: () = assert!(is_kernel_owner(OWNERS[0]) && is_kernel_owner(OWNERS[3]));
     const _: () =
         assert!(OWNERS[0] != KERNEL_OWNER_CONSOLE && OWNERS[0] != KERNEL_OWNER_DESKTOP);
@@ -28369,29 +28377,39 @@ pub fn glassfix2_selftest() {
         |b: (usize, usize, usize, usize)| (b.0, b.1, b.2, (TITLE_H + BORDER).min(b.3));
     // Every live, non-compat row's outer box, snapshotted with the lock RELEASED before any serial
     // write (`tile-fit`'s discipline).
+    // GLASSFIX3 — and each row's STACKING KEY, `(z, id)`: the compositor's own paint order
+    // (`order.sort_unstable_by_key(|&i| (rows[i].z, rows[i].id))`), so "above" here is what the glass
+    // shows. A parked (minimised) row is not on the glass and is not counted.
     let census = |bx: &mut [(usize, usize, usize, usize); MAX_WINDOWS],
-                  bid: &mut [WinId; MAX_WINDOWS]|
+                  bid: &mut [WinId; MAX_WINDOWS],
+                  bz: &mut [(u32, WinId); MAX_WINDOWS]|
      -> usize {
         let t = table();
         let mut n = 0usize;
         for r in t.rows.iter() {
-            if !r.used || r.compat {
+            if !r.used || r.compat || r.z == PARKED_Z {
                 continue;
             }
             bx[n] = outer_box(r);
             bid[n] = r.id;
+            bz[n] = (r.z, r.id);
             n += 1;
         }
         n
     };
+    // GLASSFIX3 — the Mac rule is about VISIBILITY, so a pair counts only when `i` is ABOVE `j`:
+    // a window's box over the title band of a window stacked on top of it hides nothing. The z-blind
+    // count this replaces could not be satisfied by any cascade — in a Mac cascade every older
+    // window's body lies across the newer window's title band, underneath it.
     let scan = |bx: &[(usize, usize, usize, usize); MAX_WINDOWS],
                 bid: &[WinId; MAX_WINDOWS],
+                bz: &[(u32, WinId); MAX_WINDOWS],
                 n: usize|
      -> (usize, WinId, WinId, usize) {
         let (mut count, mut wa, mut wb, mut wr) = (0usize, WIN_NONE, WIN_NONE, 0usize);
         for i in 0..n {
             for j in 0..n {
-                if i == j {
+                if i == j || bz[i] < bz[j] {
                     continue;
                 }
                 let rows = rows_over(bx[i], title_band(bx[j]));
@@ -28416,6 +28434,34 @@ pub fn glassfix2_selftest() {
     let surf = &raw const HT_SURF as usize;
     let len = core::mem::size_of_val(&HT_SURF);
     let titles: [&[u8]; 4] = [b"gf2a", b"gf2b", b"gf2c", b"gf2d"];
+    // GLASSFIX3 — FIRST, three PINNED rows through the real `create_at`, every one asking for the SAME
+    // origin: the work area's centre, which is Quarry's and Facet's request and the console's, and
+    // the shape of flight 12's pile (console, login and shell all centred on x, their boxes tall
+    // enough to reach each other's bars). The request is this fixture's; where each row LANDS is
+    // `create_at`'s answer, which is the thing scored. Pinned rows first and tiled rows after is the
+    // boot desktop's own order (the console, login and shell at ~7 s, STAT tiled at 32 s), so the
+    // tiled rows below meet pinned rows already on the glass — the STAT-over-shell case.
+    let pin_titles: [&[u8]; 3] = [b"gf3p0", b"gf3p1", b"gf3p2"];
+    let mut pins = [WIN_NONE; 3];
+    if let Some((_s, ow, oh)) = spawn_geometry(FIX_W, FIX_H) {
+        let wtop = work_top(pw, ph);
+        let px = pw.saturating_sub(ow) / 2 + BORDER;
+        let py = wtop + work_h(pw, ph).saturating_sub(oh) / 2 + TITLE_H + BORDER;
+        for i in 0..3 {
+            pins[i] = create_at(
+                PIN_OWNERS[i],
+                surf,
+                len,
+                FIX_W as u32,
+                FIX_H as u32,
+                FIX_STRIDE as u32,
+                pin_titles[i],
+                px,
+                py,
+            );
+        }
+    }
+    let pinned = pins.iter().filter(|&&id| id != WIN_NONE).count();
     let mut w = [WIN_NONE; 4];
     for i in 0..4 {
         w[i] = create(
@@ -28432,8 +28478,9 @@ pub fn glassfix2_selftest() {
 
     let mut bx = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     let mut bid = [WIN_NONE; MAX_WINDOWS];
-    let n = census(&mut bx, &mut bid);
-    let (overlaps, wa, wb, wr) = scan(&bx, &bid, n);
+    let mut bz = [(0u32, WIN_NONE); MAX_WINDOWS];
+    let n = census(&mut bx, &mut bid, &mut bz);
+    let (overlaps, wa, wb, wr) = scan(&bx, &bid, &bz, n);
 
     // THE ARMED CONTROL. A detector that only ever prints zero proves nothing, so before the rows
     // are taken down one of them is deliberately walked ONTO another's title band through the real
@@ -28450,11 +28497,12 @@ pub fn glassfix2_selftest() {
         if move_to(w[3], victim.0 + BORDER, victim.1 + TITLE_H + BORDER + 1) {
             let mut cbx = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
             let mut cbid = [WIN_NONE; MAX_WINDOWS];
-            let cn = census(&mut cbx, &mut cbid);
-            control = scan(&cbx, &cbid, cn).0 > 0;
+            let mut cbz = [(0u32, WIN_NONE); MAX_WINDOWS];
+            let cn = census(&mut cbx, &mut cbid, &mut cbz);
+            control = scan(&cbx, &cbid, &cbz, cn).0 > 0;
         }
     }
-    for &id in w.iter() {
+    for &id in w.iter().chain(pins.iter()) {
         if id != WIN_NONE {
             close(id);
         }
@@ -28480,11 +28528,12 @@ pub fn glassfix2_selftest() {
         _ => false,
     };
 
-    let pass = sprite_same && overlaps == 0 && !pulse_over_console && minted == 4 && control;
+    let pass = sprite_same && overlaps == 0 && !pulse_over_console && minted == 4 && pinned == 3 && control;
     serial_println!(
         ":: GLASSFIX2: sprite same={} backdrop={}x{} window={}x{} scale={} owns_paint={} \
 compositor={}x{} backbuffer={}x{} | cascade overlaps={} worst=win{}-over-win{}:{}rows minted={}/4 \
-n={} control={} panel={}x{} | console=win{} pulse=win{} pulse_over_console={} -> {} ::",
+pinned={}/3 n={} control={} expect_overlaps=0 tb={} step={} panel={}x{} scale={} | console=win{} pulse=win{} \
+pulse_over_console={} -> {} ::",
         sprite_same as u8,
         over_backdrop,
         over_backdrop,
@@ -28501,10 +28550,14 @@ n={} control={} panel={}x{} | console=win{} pulse=win{} pulse_over_console={} ->
         wb,
         wr,
         minted,
+        pinned,
         n,
         control as u8,
+        TITLE_H,
+        cascade_step(),
         pw,
         ph,
+        s,
         console,
         pulse,
         pulse_over_console as u8,
@@ -29001,4 +29054,134 @@ pub fn wcd_skip_latch_check() {
     }
     let counted = C2_WCD_SKIPS.load(Relaxed).saturating_sub(before);
     C2_WCD_SKIPS.fetch_sub(counted, Relaxed);
+}
+// =================================================================================================
+// GLASSFIX3 — THE MAC CASCADE: a new window never lands over another window's title bar.
+// (TAIL-APPENDED: nothing above this line moves; the three call sites are folded onto existing
+// statements, code first, so `wm.rs` stays N->N above its own tail — PARITY.md §5.3, B94.)
+// =================================================================================================
+//
+// Flight 12 read `:: GLASSFIX2: … cascade overlaps=14 worst=win1-over-win3:39rows … n=8 … -> FAIL ::`
+// at 2880x1800 and QEMU reads 0 at 1280x800. The panel size is not the cause and neither is the
+// title-bar height: `TITLE_H` is `theme::TITLE_HEIGHT` = 34 on every panel (the kit does not scale
+// the strip with `ui::Metrics::scale`), and the 39 rows are exactly one title band, `TITLE_H +
+// BORDER`. The cause is that x86 had NO cascade at all. Every `create_at` caller seats its window by
+// its own centring rule (the console centred, the login screen centred in the upper third, the shell
+// centred at three quarters, Quarry and Facet centred in the work area) and `create_inner` honoured
+// the request as given, so windows opened at boot piled onto one another's title bars; and [`place`]
+// skips pinned rows, so a tiled window (STAT) could land across a pinned window's title bar too.
+// Under QEMU none of the boot desktop's pinned windows exist — the desktop scene is the Kepler
+// takeover, which is metal only — so the fixture's table held only its own four tiled rows, and a
+// flow tiler cannot overlap itself: `n=4 overlaps=0` at any panel size.
+//
+// The rule (the Mac's): a window's title bar stays visible under every window ABOVE it. Two seams
+// enforce it, both at placement time, both keyed on the live table:
+//
+//   * [`glassfix3_cascade`] — a `create_at` whose requested box would cover a live row's title band
+//     is offset down-right from THAT row by one title band ([`cascade_step`]), and again from the
+//     next row it would cover, until its box covers none; a candidate that would leave the work area
+//     wraps to its top/left edge (the Mac's own wrap). The new row is on top, so it is the only row
+//     whose placement can hide a bar; the rows under it keep their bars above its top edge.
+//   * [`glassfix3_clear`] — a TILED row whose box would cover the title band of a pinned row below
+//     it, or whose own title band would sit under a pinned row above it, is pushed down past the
+//     obstruction. Pushing only ever moves DOWN, and [`place`] re-clamps at the work area's bottom,
+//     so PULSE-2's reservation is untouched; a push that cannot fit leaves the row where the clamp
+//     puts it and GLASSFIX2's scan names the pair.
+//
+// The step is derived, never a literal: `TITLE_H + BORDER`, the band GLASSFIX2 measures — so a kit
+// change to the strip moves the cascade and the fixture's expectation together, and the fixture
+// prints the step it was scored against (`tb=` / `step=`).
+
+/// GLASSFIX3 — the cascade offset: one title band, `TITLE_H + BORDER` (39 px at the shipping theme,
+/// on every panel — the strip is not scaled with `ui::Metrics::scale`).
+pub(super) const fn cascade_step() -> usize {
+    TITLE_H + BORDER
+}
+
+/// GLASSFIX3 — rows of `b` under `a`, half-open, x first (GLASSFIX2's `rows_over`, restated so the
+/// placement and the fixture that scores it are not one expression agreeing with itself).
+fn glassfix3_rows(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize)) -> usize {
+    if a.0.max(b.0) >= (a.0 + a.2).min(b.0 + b.2) {
+        return 0;
+    }
+    (a.1 + a.3).min(b.1 + b.3).saturating_sub(a.1.max(b.1))
+}
+
+/// GLASSFIX3 — an outer box's title band: its top `TITLE_H + BORDER` rows.
+fn glassfix3_band(b: (usize, usize, usize, usize)) -> (usize, usize, usize, usize) {
+    (b.0, b.1, b.2, (TITLE_H + BORDER).min(b.3))
+}
+
+/// GLASSFIX3 — the content origin a `create_at` row of `cw` x `ch` content pixels is actually given,
+/// starting from the caller's (already clamped) request `(x, y)`. See the block comment above.
+fn glassfix3_cascade(
+    t: &Table,
+    x: usize,
+    y: usize,
+    cw: usize,
+    ch: usize,
+    pw: usize,
+    ph: usize,
+) -> (usize, usize) {
+    let step = cascade_step();
+    let min_y = work_top(pw, ph) + TITLE_H + BORDER;
+    let bottom = work_top(pw, ph) + work_h(pw, ph);
+    let max_x = pw.saturating_sub(cw + BORDER).max(BORDER);
+    let max_y = bottom.saturating_sub(ch + BORDER).max(min_y);
+    let (mut cx, mut cy) = (x, y);
+    for _ in 0..2 * MAX_WINDOWS {
+        let bx = (
+            cx.saturating_sub(BORDER),
+            cy.saturating_sub(TITLE_H + BORDER),
+            cw.saturating_add(2 * BORDER),
+            ch.saturating_add(TITLE_H + 2 * BORDER),
+        );
+        let hit = t.rows.iter().find(|r| {
+            r.used && !r.compat && r.z != PARKED_Z && glassfix3_rows(bx, glassfix3_band(outer_box(r))) > 0
+        });
+        let Some(r) = hit else {
+            return (cx, cy);
+        };
+        let nx = r.x.saturating_add(step);
+        let ny = r.y.saturating_add(step);
+        cx = if nx > max_x { BORDER } else { nx };
+        cy = if ny > max_y { min_y } else { ny };
+    }
+    (cx, cy)
+}
+
+/// GLASSFIX3 — the content `y` a TILED row (`z`, `id`, outer left `ox`, outer `bw` x `bh`, flow
+/// content origin `y`) is pushed down to so that it neither covers a lower pinned row's title band
+/// nor sits with its own band under a higher pinned row. Identity when nothing obstructs it, which is
+/// every layout with no pinned row in it.
+fn glassfix3_clear(t: &Table, z: u32, id: WinId, ox: usize, y: usize, bw: usize, bh: usize) -> usize {
+    let mut top = y.saturating_sub(TITLE_H + BORDER);
+    for _ in 0..2 * MAX_WINDOWS {
+        let me = (ox, top, bw, bh);
+        let mut moved = false;
+        for p in t.rows.iter() {
+            if !p.used || p.compat || !p.pinned || p.z == PARKED_Z || p.id == id {
+                continue;
+            }
+            let pb = outer_box(p);
+            let to = if (z, id) > (p.z, p.id) {
+                // This row is above `p`: its box must clear `p`'s title band.
+                (glassfix3_rows(me, glassfix3_band(pb)) > 0).then(|| pb.1 + glassfix3_band(pb).3)
+            } else {
+                // `p` is above this row: this row's title band must clear `p`'s box.
+                (glassfix3_rows(pb, glassfix3_band(me)) > 0).then(|| pb.1 + pb.3)
+            };
+            if let Some(to) = to {
+                if to > top {
+                    top = to;
+                    moved = true;
+                    break;
+                }
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    top + TITLE_H + BORDER
 }
