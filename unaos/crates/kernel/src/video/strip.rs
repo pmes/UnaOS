@@ -1307,6 +1307,33 @@ pub fn vacate(name: &str, old: Rect, new: Option<Rect>, owed: bool) -> bool {
     erased
 }
 
+/// B74 — pay the debt a declined `vacate` left. A tenant calls this on EVERY paint pass, before its
+/// own vacate: if a previous pass's erase declined (panel or scratch lock busy, `-> UNERASED` /
+/// `-> STALE-ENDS` on the wire), the old box is retried against the tenant's current rect with
+/// `owed = true`; success clears the debt and says so once (`-> DEBT-PAID`), a second decline leaves
+/// it for the next pass. Before this the return of `vacate` was discarded at both furniture call
+/// sites and the uncovered pixels stayed stale (TEARSCOPE's finding, rmbp-ledger B74 → A5).
+pub fn settle(name: &str, new: Option<Rect>) -> bool {
+    let c = &BARS[bar_slot(name)];
+    let v = c.owed_rect.load(Ordering::Relaxed);
+    if v == 0 {
+        return false;
+    }
+    let old = unpack_rect(v);
+    if !vacate(name, old, new, true) {
+        return false;
+    }
+    c.owed_rect.store(0, Ordering::Relaxed);
+    c.settled.fetch_add(1, Ordering::Relaxed);
+    if c.said.fetch_or(SAID_SETTLED, Ordering::Relaxed) & SAID_SETTLED == 0 {
+        serial_println!(
+            "[strip] settle tenant={} box={}x{}+{}+{} erased=yes -> DEBT-PAID",
+            name, old.2, old.3, old.0, old.1
+        );
+    }
+    true
+}
+
 /// TEARSCOPE — emit every tenant's `scope=bar` rollup that owes one.
 ///
 /// ### Reachability, and how it is guaranteed rather than assumed
@@ -1499,33 +1526,6 @@ const _: () = {
 /// One-shot, `witness`-gated, driven from [`super::dock::selftest`] (the lane compromise that
 /// function already documents for `menubar::selftest`, on the same terms and for the same reason).
 #[cfg(feature = "witness")]
-/// B74 — pay the debt a declined `vacate` left. A tenant calls this on EVERY paint pass, before its
-/// own vacate: if a previous pass's erase declined (panel or scratch lock busy, `-> UNERASED` /
-/// `-> STALE-ENDS` on the wire), the old box is retried against the tenant's current rect with
-/// `owed = true`; success clears the debt and says so once (`-> DEBT-PAID`), a second decline leaves
-/// it for the next pass. Before this the return of `vacate` was discarded at both furniture call
-/// sites and the uncovered pixels stayed stale (TEARSCOPE's finding, rmbp-ledger B74 → A5).
-pub fn settle(name: &str, new: Option<Rect>) -> bool {
-    let c = &BARS[bar_slot(name)];
-    let v = c.owed_rect.load(Ordering::Relaxed);
-    if v == 0 {
-        return false;
-    }
-    let old = unpack_rect(v);
-    if !vacate(name, old, new, true) {
-        return false;
-    }
-    c.owed_rect.store(0, Ordering::Relaxed);
-    c.settled.fetch_add(1, Ordering::Relaxed);
-    if c.said.fetch_or(SAID_SETTLED, Ordering::Relaxed) & SAID_SETTLED == 0 {
-        serial_println!(
-            "[strip] settle tenant={} box={}x{}+{}+{} erased=yes -> DEBT-PAID",
-            name, old.2, old.3, old.0, old.1
-        );
-    }
-    true
-}
-
 pub fn vacate_selftest() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) {
