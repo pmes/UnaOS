@@ -5032,7 +5032,7 @@ fn retire_killed(idx: usize, task: Box<Task>) {
     // barrier at all. Idempotent with the `exit()` arm by the registry's own compare-exchange claim.
     crate::video::wm::drain_release_dead(tid);
     task.state.store(STATE_FINISHED, Ordering::Release);
-    drop(task); // frees the kernel stack
+    #[cfg(feature = "witness")] if task.user_entry == 0 { serial_println!("[taskexit] tid={} name='{}' core={} reason=killed", tid, task.name, task.cpu); } drop(task); // frees the kernel stack — TASKEXIT (B211): the off-CPU reap names the task's recorded placement first; kernel threads only, same-line fold.
     // Drop this task out of its slot's live count, then settle — which withholds the confirmation while
     // sibling threads of the same address space are still alive (they are caught by this same request).
     let remaining = asid_thread_leave(ttbr0);
@@ -5129,7 +5129,7 @@ pub fn exit() -> ! {
         // `wm::close_owner`, which raises and lowers a barrier of its own under this same id, so a
         // release ordered before it would reconcile a task that is about to raise again. Costs one
         // eight-entry scan of relaxed loads on every death, and finds nothing on almost all of them.
-        crate::video::wm::drain_release_dead((*raw).id);
+        crate::video::wm::drain_release_dead((*raw).id); #[cfg(feature = "witness")] if (*raw).user_entry == 0 { serial_println!("[taskexit] tid={} name='{}' core={} reason=exit", (*raw).id, (*raw).name, cpu); } // TASKEXIT (rmbp-ledger B211, SMPBALK8's open half): the on-CPU death names its core; kernel threads only — an EL0 death is the `[el0live]` reap ledger's. Same-line fold: no `Location` below moves.
         (*raw).state.store(STATE_FINISHED, Ordering::Release);
         // `old_sp` is a throwaway on the dying stack — the scheduler never reads it back and never
         // switches into a finished task.

@@ -310,6 +310,13 @@ REQUIRE :: ERET-SCRUB: first-entry GPR/FP/TPIDR residue = 0 .*-> PASS ::
 REQUIRE :: ERET-SCRUB: syscall-return preserved .*-> PASS ::
 FORBID :: ERET-SCRUB: first-entry residue or=
 FORBID :: ERET-SCRUB: syscall-return residue bitmap=
+# --- TASKEXIT (SMPBALK8's open half; LEDGER SR16, rmbp-ledger B211): the per-task retirement line
+# --- `[taskexit] tid=N name='X' core=C reason=exit|killed` (witness-gated, kernel threads only) that
+# --- the queue asked for before anyone re-places CPU_AUTO verdicts. The pi seat's first kernel8-test
+# --- after this fold reads it: `awk 'index($0,"[taskexit]")' target/serial-pi.log` — the stolen
+# --- verdict's own row names the core it died on. PENDING (never fails) until that capture exists;
+# --- REQUIRED on the virt lane (`arm-login.spec`), where it was measured.
+PENDING \[taskexit\] tid=\d+ name='[^']+' core=\d+ reason=(exit|killed)
 FORBID :: ERET-SCRUB: witness entries not latched
 REQUIRE U4: process model.*-> PASS
 REQUIRE U5: capabilities.*-> PASS

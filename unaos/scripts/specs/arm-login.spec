@@ -95,6 +95,18 @@ FORBID \[login\] ignition desktop_up=false console_routed=(true|false) -> OPEN
 # The virt GICv3 boot's last line (B188 M3 declares the same marker as `test-arm`'s LADDER-TAIL row). A capture
 # without it is TRUNCATED on replay, never scored.
 COMPLETE :: CAPSTONE (COMPLETE — all 6 sync primitives verified|INCOMPLETE — \d+/6 sync primitives FAILED) in (one|this) boot
+# ── TASKEXIT (SMPBALK8's open half, LEDGER SR16 / rmbp-ledger B211; 2026-09-24) — EVERY KERNEL TASK SAYS
+# WHERE AND WHY IT DIED. SMPBALK8 found a `CPU_AUTO` kernel task stolen `c2->c0` that printed nothing
+# and left no trace in any per-core witness, and `u4-launch` going silent once in three runs though
+# both its EL0 fixtures exited; the queue named the instrument this needs before anyone re-places
+# CPU_AUTO verdicts: a per-task line at the two retirement paths. `arch/aarch64/sched.rs` now prints
+# `[taskexit] tid=N name='X' core=C reason=exit|killed` (witness-gated; KERNEL threads only — an EL0
+# task's death is already the `[el0live]` reap ledger's) at `exit()` (on-CPU, `reason=exit`) and
+# `retire_killed` (off-CPU reap, `reason=killed`). This lane carries `witness` (test-arm exports
+# UNAOS_WITNESS=1) and every fixture task is a kernel thread that returns, so the line is REQUIRED
+# here; on the Pi (`pi4-regression.spec`) it is PENDING until the first kernel8-test after this fold.
+# Go-red: the previous login capture (no emitter) reds this row alone, 18/19.
+REQUIRE \[taskexit\] tid=\d+ name='[^']+' core=\d+ reason=(exit|killed)
 
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
 # A PINNED LINE IN THIS FILE IS CHANGED TOGETHER WITH THE KERNEL LINE IT PINS, IN THE SAME COMMIT —
