@@ -29398,6 +29398,7 @@ pub fn root_session_others(except: usize) -> usize {
 #[cfg(all(feature = "loginst", feature = "login"))]
 pub fn root_session_probe(pid: u64, slot: usize) -> (bool, bool) {
     (matches!(bg_poll(pid, false), BgPoll::Gone), !winx_slot_has_window(slot))
+}
 // =================================================================================================
 // LFNMV (rmbp-ledger B202) — THE x86 HALF OF THE LONG-NAME VERDICT. File tail (B94).
 //
