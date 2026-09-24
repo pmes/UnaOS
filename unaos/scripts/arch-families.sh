@@ -2,7 +2,7 @@
 # arch-families.sh — GATE-FAMILY: a ratchet on platform-split symbol families.
 #
 # WHY THIS EXISTS (2026-08-31). UnaOS grows per-platform twins of shared jobs: `render_service` /
-# `x86_render_service`, `input_service` / `x86_input_service`, `usb_pump` / `x86_usb_pump`. Each one
+# `x86_render_service` (and, until ONEOS5 2026-09-24, `input_service` / `x86_input_service`, `usb_pump` / `x86_usb_pump`). Each one
 # was individually defensible when written. The result is that one job has N implementations and the
 # shared 40-60% is maintained N ways.
 #

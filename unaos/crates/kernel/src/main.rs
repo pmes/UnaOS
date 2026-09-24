@@ -1125,7 +1125,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // the debug capabilities riding INSIDE it behind the knob:
     //
     //   * the per-pass services this loop uniquely ran now have a home on the normal path (see the
-    //     service-mapping notes at `x86_usb_pump`; every one of them was already there except the
+    //     service-mapping notes at `usb_pump`; every one of them was already there except the
     //     boot-milestone re-dump, whose gate this arc widened to `witness OR usbdebug`);
     //   * the `USB-DEBUG:` event lines ride the real drains — `usbdebug_event_print` is called from
     //     `x86_render_service` and from the inline BSP GUI loop, keyed on the RAW report and printed
@@ -1560,14 +1560,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // the one we intended.
             unaos_kernel::arch::sched::spawn(
                 "usb-pump",
-                x86_usb_pump,
+                usb_pump,
                 svc_cpu,
                 svc_cpu,
                 unaos_kernel::arch::sched::PRIO_NORMAL,
             );
             unaos_kernel::arch::sched::spawn(
                 "input",
-                x86_input_service,
+                input_service,
                 svc_cpu,
                 svc_cpu,
                 unaos_kernel::arch::sched::PRIO_NORMAL,
@@ -1889,7 +1889,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 // identically. Compiled out without the knob.
                 #[cfg(all(feature = "usbdebug", feature = "wc"))]
                 usbdebug_event_print(raw);
-                (raw, { if let unaos_kernel::pal::Event::Mouse { x, y } = raw { x86_ptr_install(x, y); } unaos_kernel::arch::x86_64::syscall::wc_route_event(raw) }) // PTRINSTALL3 (B117) — THE INSTALL ON THIS LOOP: a relative report is installed here, once, by the same `x86_ptr_install` the split's producer calls (`x86_input_service`, :6165), BEFORE either router sees it — so a report a focused ring-3 app CONSUMES (the router answers `Unknown`, the `Mouse` arm below never runs, and `track_routed` is absolute-only since PTRINSTALL2) still moves the arrow, and a DECLINED one is not installed a second time because the `Mouse` arm's `move_rel` is cfg'd off this arch (:1944). One install per relative report on both branches; absolute reports untouched on both. ⚠ LINE-NEUTRAL fold, in every x86 image; the fn is at this file's tail.
+                (raw, { if let unaos_kernel::pal::Event::Mouse { x, y } = raw { x86_ptr_install(x, y); } unaos_kernel::arch::x86_64::syscall::wc_route_event(raw) }) // PTRINSTALL3 (B117) — THE INSTALL ON THIS LOOP: a relative report is installed here, once, by the same `x86_ptr_install` the split's producer calls (`input_service`, :6165), BEFORE either router sees it — so a report a focused ring-3 app CONSUMES (the router answers `Unknown`, the `Mouse` arm below never runs, and `track_routed` is absolute-only since PTRINSTALL2) still moves the arrow, and a DECLINED one is not installed a second time because the `Mouse` arm's `move_rel` is cfg'd off this arch (:1944). One install per relative report on both branches; absolute reports untouched on both. ⚠ LINE-NEUTRAL fold, in every x86 image; the fn is at this file's tail.
             };
             #[cfg(not(target_arch = "x86_64"))]
             let ev = pal.poll_event();
@@ -3036,7 +3036,7 @@ fn jd2_console_pump(_arg: usize) {
         // console pump was live at shell entry with no vug run). No-op with the knob off.
         if cntpct().wrapping_sub(last_sweep) >= sweep_ticks {
             last_sweep = cntpct();
-            unaos_kernel::vugras::idle_sweep(sweep_tick); #[cfg(feature = "orinclick")] unaos_kernel::arch::display_tegra::orin_click_census(sweep_tick); #[cfg(feature = "orintenant")] unaos_kernel::arch::display_tegra::orin_tenant_census(sweep_tick); #[cfg(feature = "orinladder")] unaos_kernel::arch::display_tegra::orin_ladder_census(sweep_tick); #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_census(sweep_tick); #[cfg(feature = "holocron")] unaos_kernel::video::prtscr::service(); #[cfg(feature = "orinrx")] unaos_kernel::arch::serial::serialrx::census(sweep_tick); // ORIN-RASTGLASS: the `late` half of the cube read-back — combined with the latched `post` it separates painted-and-survived from painted-and-overwritten from never-painted, which the RAST path could not say at all. `rast` alone is the gate (it does NOT imply tegra), and this fn is already `cfg(all(tegra, aarch64))`, so the conjunction is exact. ⚠ LINE-NEUTRAL append — see the Button arm above. // ORIN-CLICK rung 3 — the ARM line, then the ~10 s click census. Emitted FROM THIS LOOP on purpose: it is the routing task's own liveness, so `[orinclick] census` stopping is a dead pump and `btn=0` is "nobody clicked", not "routing failed". ⚠ LINE-NEUTRAL append — see the Button arm above. // PRTSCR-ORIN — the Print Screen key's SERVICE half on the Orin. The xHCI decoder this loop drives (`claim` -> `poll_events` -> `handle_event_trb`, drivers/xhci) arms `prtscr::request()` on the HID 0x46 press edge on every arch, but the three `prtscr::service()` sites in this file are x86/virt-only (the `usbdebug` loop, the `kernel_main` tail below `tegra_early_stop`'s divergence, `x86_usb_pump`), so on tegra the flag was armed and never serviced. THIS task is the only pump every jetson image with a keyboard runs (the `orinrender` pass is knob-gated and drains no events), and the sweep is a point where no xHCI claim is held — `capture()` takes the xHCI loan for the FAT write to the boot stick in the global slot. `prtscr` has NO code dependency on `holocron` (`video/mod.rs` declares it unconditionally; `capture` drives `fs::fat` alone): the gate is the repo's arming knob for "this boot may WRITE its boot medium" (`UNAOS_HOLOCRON=1`, deliberately not stripped by `arm_features`), so the knob-off jetson image stays byte-identical. Idle cost: one relaxed load per ~250 ms sweep. ⚠ LINE-NEUTRAL append — see the Button arm above. // SERIALRX (ORINRX) — the `[serialrx] rx=` census, phase-2 twin of the phase-1 sweep site. ⚠ LINE-NEUTRAL append. // ORIN-RASTGLASS: the `late` half of the cube read-back — combined with the latched `post` it separates painted-and-survived from painted-and-overwritten from never-painted, which the RAST path could not say at all. `rast` alone is the gate (it does NOT imply tegra), and this fn is already `cfg(all(tegra, aarch64))`, so the conjunction is exact. ⚠ LINE-NEUTRAL append — see the Button arm above. // ORIN-CLICK rung 3 — the ARM line, then the ~10 s click census. Emitted FROM THIS LOOP on purpose: it is the routing task's own liveness, so `[orinclick] census` stopping is a dead pump and `btn=0` is "nobody clicked", not "routing failed". ⚠ LINE-NEUTRAL append — see the Button arm above.
+            unaos_kernel::vugras::idle_sweep(sweep_tick); #[cfg(feature = "orinclick")] unaos_kernel::arch::display_tegra::orin_click_census(sweep_tick); #[cfg(feature = "orintenant")] unaos_kernel::arch::display_tegra::orin_tenant_census(sweep_tick); #[cfg(feature = "orinladder")] unaos_kernel::arch::display_tegra::orin_ladder_census(sweep_tick); #[cfg(feature = "rast")] unaos_kernel::arch::display_tegra::orin_rast_census(sweep_tick); #[cfg(feature = "holocron")] unaos_kernel::video::prtscr::service(); #[cfg(feature = "orinrx")] unaos_kernel::arch::serial::serialrx::census(sweep_tick); // ORIN-RASTGLASS: the `late` half of the cube read-back — combined with the latched `post` it separates painted-and-survived from painted-and-overwritten from never-painted, which the RAST path could not say at all. `rast` alone is the gate (it does NOT imply tegra), and this fn is already `cfg(all(tegra, aarch64))`, so the conjunction is exact. ⚠ LINE-NEUTRAL append — see the Button arm above. // ORIN-CLICK rung 3 — the ARM line, then the ~10 s click census. Emitted FROM THIS LOOP on purpose: it is the routing task's own liveness, so `[orinclick] census` stopping is a dead pump and `btn=0` is "nobody clicked", not "routing failed". ⚠ LINE-NEUTRAL append — see the Button arm above. // PRTSCR-ORIN — the Print Screen key's SERVICE half on the Orin. The xHCI decoder this loop drives (`claim` -> `poll_events` -> `handle_event_trb`, drivers/xhci) arms `prtscr::request()` on the HID 0x46 press edge on every arch, but the three `prtscr::service()` sites in this file are x86/virt-only (the `usbdebug` loop, the `kernel_main` tail below `tegra_early_stop`'s divergence, `usb_pump`), so on tegra the flag was armed and never serviced. THIS task is the only pump every jetson image with a keyboard runs (the `orinrender` pass is knob-gated and drains no events), and the sweep is a point where no xHCI claim is held — `capture()` takes the xHCI loan for the FAT write to the boot stick in the global slot. `prtscr` has NO code dependency on `holocron` (`video/mod.rs` declares it unconditionally; `capture` drives `fs::fat` alone): the gate is the repo's arming knob for "this boot may WRITE its boot medium" (`UNAOS_HOLOCRON=1`, deliberately not stripped by `arm_features`), so the knob-off jetson image stays byte-identical. Idle cost: one relaxed load per ~250 ms sweep. ⚠ LINE-NEUTRAL append — see the Button arm above. // SERIALRX (ORINRX) — the `[serialrx] rx=` census, phase-2 twin of the phase-1 sweep site. ⚠ LINE-NEUTRAL append. // ORIN-RASTGLASS: the `late` half of the cube read-back — combined with the latched `post` it separates painted-and-survived from painted-and-overwritten from never-painted, which the RAST path could not say at all. `rast` alone is the gate (it does NOT imply tegra), and this fn is already `cfg(all(tegra, aarch64))`, so the conjunction is exact. ⚠ LINE-NEUTRAL append — see the Button arm above. // ORIN-CLICK rung 3 — the ARM line, then the ~10 s click census. Emitted FROM THIS LOOP on purpose: it is the routing task's own liveness, so `[orinclick] census` stopping is a dead pump and `btn=0` is "nobody clicked", not "routing failed". ⚠ LINE-NEUTRAL append — see the Button arm above.
             sweep_tick += 1; if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() { x.poll_events(); } // PRTSCLOST (orin 17) — the SECOND half of the same repair, and the one that matters while a capture is open. This sweep block runs `prtscr::service()`, which advances a sliced capture by up to `slice_budget()` — ~75 ms on the Orin (its 4.8 s `hw_wait_budget` / 64), and the budget is checked AFTER a unit of work, so a 32 KiB `write_grow` can carry one slice past 110 ms. Without this drain the keyboard interrupt-IN sits with no TD queued for that whole span, every 250 ms, across the ~8 s a 1920x1200 capture takes; and under SET_IDLE 0 (INDEFINITE) a press+release inside it is lost with no line at all, so the `refused — capture in flight` deferral PRTSCR-ASYNC exists to print cannot fire for a press the decoder never receives. The BOT pump inside `write_grow` drains the ring on its own, which is why render8's SCREEN0..SCREEN2 burst DID record its presses and its one refusal; `Phase::Encode` has no such drain, and neither does the census work on either side of the service call. Same shape as the fold on the present above: `poll_events` on a usually-empty ring, and a failing `claim()` is a no-op, so a contended pass behaves exactly as it did. ⚠ LINE-NEUTRAL fold onto the existing `sweep_tick += 1`.
         }
         unaos_kernel::arch::sched::yield_now();
@@ -3102,12 +3102,12 @@ const X86_GUI_PULSE_MS: u64 = 250;
 /// backpressure against a consumer that is merely SLOW and catastrophic against one that is DEAD,
 /// and boot 16 produced the dead one: the render task's core parked inside a non-returning MMIO
 /// store, so the channel's only consumer stopped existing, the 64 slots filled, and
-/// `x86_input_service` parked in `send` for the remaining 497 seconds. Because that task is also the
+/// `input_service` parked in `send` for the remaining 497 seconds. Because that task is also the
 /// only drain of `pal::EVENT_QUEUE`, the whole input path died behind the compositor.
 ///
 /// The refusal is handed back rather than swallowed (`Err(ev)`), because WHAT TO DO ABOUT IT IS A
 /// QUESTION ABOUT THE EVENT, not about the channel, and only the caller can answer it — see the
-/// three-class policy in [`x86_input_service`]. `GUI_SENT_X86` is charged only on the accepted path,
+/// three-class policy in [`input_service`]. `GUI_SENT_X86` is charged only on the accepted path,
 /// so `sent - recv` keeps reading as live occupancy exactly as before.
 #[cfg(target_arch = "x86_64")]
 fn gui_try_send_x86(ev: unaos_kernel::pal::Event) -> Result<(), unaos_kernel::pal::Event> {
@@ -3131,7 +3131,7 @@ fn gui_try_send_x86(ev: unaos_kernel::pal::Event) -> Result<(), unaos_kernel::pa
 // core is not recovered, its window is not recovered."* Boot 16 showed the trade was mispriced,
 // because the list of what dies with the core was longer than the window. The render task lives on
 // that core, and the render task is the ONLY consumer of `GUI_CHANNEL_X86`. When it died the channel
-// acquired no consumer for the remaining 497 seconds, `x86_input_service` filled all 64 slots and
+// acquired no consumer for the remaining 497 seconds, `input_service` filled all 64 slots and
 // parked in `Channel::send`, and — because that task is also the sole drain of `pal::EVENT_QUEUE` —
 // the machine's entire input path went with it. `[deadman] hq=25`, pinned, unmoving, for seven
 // minutes, while the desktop repainted at 66 composite passes a second on a stolen gate.
@@ -3149,7 +3149,7 @@ fn gui_try_send_x86(ev: unaos_kernel::pal::Event) -> Result<(), unaos_kernel::pa
 //              parked. Peter has accepted both; they are one core and one window, and nothing in
 //              software un-parks a core stopped on an instruction. Named here rather than left to be
 //              rediscovered.
-//   NOT AT RISK — `x86_usb_pump` and `x86_input_service` share the SERVICE core, not the render
+//   NOT AT RISK — `usb_pump` and `input_service` share the SERVICE core, not the render
 //              core, so the steal has never cost them anything. If a future steal names the service
 //              core the same census must be run for them, and this comment is the place it is owed.
 //
@@ -3245,7 +3245,7 @@ static RENDER_RESCUE_X86: core::sync::atomic::AtomicBool =
 
 /// WCSER-REHOME — re-home the singleton roles of any core the steal has just declared dead.
 ///
-/// Called from `x86_usb_pump`'s service pass, and that placement is the same one `DESKTOP-APP` uses
+/// Called from `usb_pump`'s service pass, and that placement is the same one `DESKTOP-APP` uses
 /// for the same three reasons: `spawn` allocates a task and a kernel stack and takes a run-queue
 /// lock, so it must run from a scheduled task and never from inside the composite pass where the
 /// steal happens; the pump is on the SERVICE core, which the steal has never killed; and only a
@@ -3287,7 +3287,7 @@ fn render_rehome_service() {
 
     // A rescue core must be neither the dead core nor the SERVICE core. `xhci_worker_cpu` already
     // enforces exactly that exclusion, and for the reason that matters here: the render service is a
-    // preemptible taker of `XHCI_CONTROLLER` and so is `x86_usb_pump`, and two preemptible takers of
+    // preemptible taker of `XHCI_CONTROLLER` and so is `usb_pump`, and two preemptible takers of
     // a raw spinlock on one core deadlock it. Re-homing the render role onto the service core would
     // trade a dead channel for a dead machine. So we ask the placement authority rather than
     // re-deriving it.
@@ -5803,7 +5803,7 @@ fn usb_pump(_: usize) {
 // scheduler via `sched::run_bsp(0)`. Two placement rules are LOAD-BEARING and are asserted at the
 // spawn site rather than left to comments:
 //
-//  1. `x86_usb_pump` and `x86_render_service` MUST be on DIFFERENT cores. `XHCI_CONTROLLER` is a raw
+//  1. `usb_pump` and `x86_render_service` MUST be on DIFFERENT cores. `XHCI_CONTROLLER` is a raw
 //     `spin::Mutex`, not the scheduler's sleeping `Mutex`, and both tasks take it (the pump directly;
 //     the render side transitively, through `fat` block reads, `pal::pump_and_poll` inside a
 //     full-screen app, and the `lsusb` verb). Kernel tasks ARE preempted (`timer_preempt` acts on
@@ -5820,7 +5820,7 @@ fn usb_pump(_: usize) {
 //     `smp::publish_sched_split` below, and the resulting map is printed once as
 //     `:: SCHED-X86 PLACE: ... ::`. Ask that module for a core; do not re-derive one from
 //     `online_aps()`.
-//  2. `x86_input_service` PAINTS NOTHING. On x86 `pal::cursor::SPRITE_OWNS_PAINT` is true, so the
+//  2. `input_service` PAINTS NOTHING. On x86 `pal::cursor::SPRITE_OWNS_PAINT` is true, so the
 //     cursor verbs drive the compositor sprite straight into the FRONT buffer; running them on the
 //     input core would put two cores on the panel. The routers (`wc_click_route`, `user_input_route`)
 //     move with the pixels for the same reason — `wc_click_route` mutates window-manager focus and
@@ -5833,13 +5833,13 @@ fn usb_pump(_: usize) {
 /// WHY IT IS A FUNCTION AND NOT AN INLINE CALL. x86 has THREE mutually-exclusive per-pass service
 /// loops that poll `ehci::service_ehci_hid` — the `usbdebug` terminal loop, the inline BSP console
 /// loop (taken when fewer than two APs came online, so the render/service split cannot be made), and
-/// `x86_usb_pump` (the SCHED-X86 device-service task, the normal desktop path). A repeat that only
+/// `usb_pump` (the SCHED-X86 device-service task, the normal desktop path). A repeat that only
 /// fired on one of them would be a boot-configuration-dependent keyboard, which is precisely the
 /// class of divergence GR21 spent two arcs removing from this driver. One body, three call sites.
 ///
 /// PLACEMENT WITHIN A PASS mirrors aarch64 exactly: AFTER the HID service call that pushes this
 /// pass's genuine edges, so the tracker has already seen this pass's reports, and BEFORE any drain,
-/// so the injected `Event::Key` rides the identical routing a real press takes — `x86_input_service`
+/// so the injected `Event::Key` rides the identical routing a real press takes — `input_service`
 /// forwards it over `GUI_CHANNEL_X86` to the render task, `wc_click_route`/`user_input_route` apply
 /// the same asid focus rules, and a focused ring-3 app receives it in its own per-process ring. No
 /// per-path code, no second routing policy, and `typematic_tick`'s own backpressure guard refuses to
@@ -5877,7 +5877,7 @@ fn x86_typematic_pump() {
 /// SAME floor the old loop had — it ended each pass in `hlt()`, which the periodic timer broke once
 /// per tick — so this is a faithful translation of the service rate and not a boot-pace regression.
 #[cfg(target_arch = "x86_64")]
-fn x86_usb_pump(cpu: usize) {
+fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, two cfg-EXCLUSIVE definitions — this x86 body and the Pi body above; `usb_pump` is gone.
     serial_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu);
     loop {
         // Nap first: `spawn` puts us on the run queue immediately, and the framebuffer handoff on the
@@ -5920,7 +5920,7 @@ fn x86_usb_pump(cpu: usize) {
         // never killed, and because `spawn` must not be called from inside the composite pass where
         // the death is detected. Two relaxed loads per pass when nothing is owed.
         render_rehome_service();
-        // KEYREPEAT-X86: synthesise a held key's repeat into EVENT_QUEUE, which `x86_input_service`
+        // KEYREPEAT-X86: synthesise a held key's repeat into EVENT_QUEUE, which `input_service`
         // drains and forwards over GUI_CHANNEL_X86 exactly as it does a real press.
         x86_typematic_pump();
         // BATMON-1 — the SMC accumulator, restored to a path a normal GUI boot actually reaches.
@@ -6058,7 +6058,7 @@ fn x86_usb_pump(cpu: usize) {
 }
 
 /// SCHED-X86: the INPUT service — drain `pal::EVENT_QUEUE` (filled by the HID decode inside
-/// `x86_usb_pump`'s `poll_events`) and forward every event over `GUI_CHANNEL_X86` to the render task.
+/// `usb_pump`'s `poll_events`) and forward every event over `GUI_CHANNEL_X86` to the render task.
 /// Paints nothing and routes nothing; never returns.
 ///
 /// Two behaviours it carries that are not "forward an event":
@@ -6118,7 +6118,7 @@ fn x86_usb_pump(cpu: usize) {
 /// will never return just coalesces and holds forever; what actually restores input is the channel
 /// getting a live consumer again, which is WCSER-REHOME's job (see `render_rehome_service_once`).
 #[cfg(target_arch = "x86_64")]
-fn x86_input_service(cpu: usize) {
+fn input_service(cpu: usize) { // ONEOS5 (R16, SR21): ONE name, two cfg-EXCLUSIVE definitions — this x86 body and the Pi PL011 body above; `input_service` is gone.
     use core::sync::atomic::Ordering;
     use unaos_kernel::pal::Event;
     serial_println!(":: SCHED-X86: input task dispatched on core {} ::", cpu); #[cfg(all(feature = "wc", feature = "witness"))] ptrlag_selftest(); // PTRLAG (B134) — the installer's geometry door driven across a HELD `WRITER`, ON THE BAND UNDER TEST: this task is the one that calls `x86_ptr_install`, and the fixture runs on its core before it has taken a single report, so the priming read is the first thing that door ever does. At the pre-PTRLAG code control never returns from it (`*WRITER.lock()` is non-reentrant and this core holds it) — that HANG is the go-red, scored by the wall. The fn is at this file's tail. ⚠ LINE-NEUTRAL fold, `wc`-erased.
@@ -6713,7 +6713,7 @@ fn x86_render_service(cpu: usize) {
             //
             // PTRDEAD folds a relative-motion backlog in `pal::EVENT_QUEUE`. That is the right place
             // for the producer's backlog — but on the SCHED-X86 split the backlog does not sit there.
-            // `x86_input_service` runs on its own core and drains `pal::next_event()` to exhaustion
+            // `input_service` runs on its own core and drains `pal::next_event()` to exhaustion
             // every ~1 ms, so the ring is essentially always empty and there is nothing there to fold
             // INTO; what the input service does with each event is offer it into this 64-slot
             // channel, one slot per report. So a render core stalled inside a witness burst
@@ -6838,7 +6838,7 @@ fn x86_render_service(cpu: usize) {
                     }
                 }
                 unaos_kernel::pal::Event::Mouse { .. } => {
-                    // PTRINSTALL2 (B117): the POSITION was installed by the PRODUCER (`x86_input_service`
+                    // PTRINSTALL2 (B117): the POSITION was installed by the PRODUCER (`input_service`
                     // -> `x86_ptr_install`, this file's tail) the instant it took this report off the
                     // ring, at HID rate, whatever this core was doing — so this arm no longer calls
                     // `move_rel` (a second install here would double the motion). `draw_over` stays: the
@@ -9913,11 +9913,11 @@ fn bootclock_report(stamps: (u64, u64, u64)) {
 // span-flush blit wait, nothing installs. That reading is an inference from two counters that were
 // never meant to measure the pointer. These are the counters that are:
 //
-//   * `reports`    relative `Event::Mouse` reports the PRODUCER (`x86_input_service`) took off
+//   * `reports`    relative `Event::Mouse` reports the PRODUCER (`input_service`) took off
 //                  `pal::EVENT_QUEUE` — the HID side's delivery, counted at the ring, before the
 //                  offer/fold decides what happens to each one.
 //   * `installs`   installs made ON THE PRODUCER SIDE, i.e. `pal::cursor::move_rel` called from
-//                  `x86_input_service` at HID rate (`x86_ptr_install`, below). PTRINSTALL left this
+//                  `input_service` at HID rate (`x86_ptr_install`, below). PTRINSTALL left this
 //                  structurally 0 — the second install site, the router's consumed branch
 //                  (`arch/x86_64/syscall.rs::user_input_route` → `pal::cursor::track_routed`), would
 //                  have doubled every report while a ring-3 app held focus. PTRINSTALL2 narrowed
@@ -10124,7 +10124,7 @@ fn ptrinstall_rollup() {
 
 /// PTRINSTALL2 (rmbp-ledger B117) — the PRODUCER-side install of one relative report, x86 only.
 ///
-/// Called by `x86_input_service` for every `Event::Mouse` it takes off `pal::EVENT_QUEUE`, BEFORE the
+/// Called by `input_service` for every `Event::Mouse` it takes off `pal::EVENT_QUEUE`, BEFORE the
 /// offer/fold decides the report's fate on the channel, so the pointer's POSITION advances at HID rate
 /// whatever the render core is doing — the span-flush stall CHOP measured (flight 8, 5.3 : 1) left it
 /// frozen for seconds and then folded the backlog into one jump. The delta still travels the channel
@@ -10595,7 +10595,7 @@ fn render_service(_: usize) {
 // THE SITE, measured at 98fd8e66. `fs::users::service()` is called from exactly three places in this
 // file, each a storage-ready pass: the `usbdebug` terminal loop, the SHARED main loop that ends
 // `kernel_main` (x86 reaches it only when the SCHED-X86 handoff to `run_bsp` is not taken; the aarch64
-// virt GICv2 boot lives in it), and `x86_usb_pump`. The login screen's four ignition sites are the Pi `render_pass`
+// virt GICv2 boot lives in it), and `usb_pump`. The login screen's four ignition sites are the Pi `render_pass`
 // (`baremetal`), `x86_render_service` (x86), `tegra_desk_arm` (`tegradesk`) and the tegra cascade
 // (`tegra`). The virt GICv3 boot (`UNAOS_GICV3=1`, which `UNAOS_VIRT_EL0=1` needs — the EL0 regime is
 // installed only on the JC3 drop) reaches none of the seven: inside `if gic::is_v3()` (cfg

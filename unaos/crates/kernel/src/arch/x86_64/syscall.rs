@@ -5692,7 +5692,7 @@ pub fn user_input_enqueue(ev: crate::pal::Event) -> bool {
 /// the next composite tail over its box — Peter's "vug blocks mouse cursor". See [`crate::pal::cursor::track_routed`].
 ///
 /// ### PTRINSTALL2 (rmbp-ledger B117) — the arrow follows a RELATIVE report where it is PRODUCED
-/// `x86_input_service` installs every relative report (`main.rs::x86_ptr_install`) the instant it
+/// `input_service` installs every relative report (`main.rs::x86_ptr_install`) the instant it
 /// takes it off the ring, before the channel and this router see it, whoever holds focus — the position
 /// tracks the pad at HID rate through a render-core stall — so the consumed branch here must NOT
 /// install it again (the doubling PTRINSTALL measured and stopped on). `track_routed` is therefore
@@ -7081,7 +7081,7 @@ fn drag_settle_disarm() {
 /// The falsification this arc runs asks whether `[ptrdead] order` and `[wm-act] settle`/`lead` fail
 /// because the CODE UNDER TEST is wrong or because the ASSERTIONS are racy. The mechanism under
 /// suspicion is named and local: on the SCHED-X86 split, the fixture ladder runs inside
-/// `x86_usb_pump` (main.rs) and `x86_input_service` runs as a preemptible peer AT THE SAME PRIORITY
+/// `x86_usb_pump` (main.rs) and `input_service` runs as a preemptible peer AT THE SAME PRIORITY
 /// ON THE SAME CORE (`svc_cpu` — both `spawn`ed there in main.rs), and that peer's job is to drain
 /// `pal::EVENT_QUEUE` **to exhaustion** every pass. A timer preemption anywhere inside a fixture's
 /// push→pop window therefore hands the fixture's own queued events to the input service, which
@@ -7093,7 +7093,7 @@ fn drag_settle_disarm() {
 /// detector said why in one field: **`cpu=3->3` while `svc=Some(5)`**. The fixture ladder does not
 /// run on the service core, so masking `IF` where the fixture is says nothing about where the
 /// competing drain is. The mask itself held perfectly (`dtick=0 masked=true` on every run) — it was
-/// simply pointed at the wrong core. Suspending the drain instead would be `main.rs`/`pal.rs` work. PTRLEAK (B193) did that work for THIS fixture: `pal::fixture_ring_hold` stands `x86_input_service`'s drain down across PTRDEAD's window, because the service did not only steal the events, it installed them on the real pointer (CURSORFLK, B186). The SKIP arm stays for every other drain.
+/// simply pointed at the wrong core. Suspending the drain instead would be `main.rs`/`pal.rs` work. PTRLEAK (B193) did that work for THIS fixture: `pal::fixture_ring_hold` stands `input_service`'s drain down across PTRDEAD's window, because the service did not only steal the events, it installed them on the real pointer (CURSORFLK, B186). The SKIP arm stays for every other drain.
 ///
 /// So the legs below judge what they can and SKIP what the machine took from them, which is the
 /// idiom `wmdirect_selftest`'s own `settle`/`lead` legs already use.
@@ -7117,7 +7117,7 @@ fn evq_pushes() -> u64 {
 
 /// SELFTEST-RACE — the core this fixture is actually running on.
 ///
-/// Printed beside `svc=` (the core `x86_input_service` was published on) because the two are NOT
+/// Printed beside `svc=` (the core `input_service` was published on) because the two are NOT
 /// the same, and every reading of these fixtures that assumed they were has been wrong. Measured
 /// `cpu=3` against `svc=Some(5)` on 8/8 boots.
 #[cfg(feature = "witness")]
@@ -7159,7 +7159,7 @@ fn ptrdead_selftest_body() {
     // SELFTEST-QUIESCE instrumentation: the ledger's own pop counter, sampled either side of the
     // window this leg believes it owns. Anything it counts beyond this leg's OWN successful pops
     // was taken by a different drain.
-    crate::pal::fixture_ring_hold(true); let pop0 = evq_pops(); // PTRLEAK (B193) — HOLD the ring before the first synthetic push: `x86_input_service` stands down until the matching release after this fixture's last drain, so none of the 192 synthetic motions (nor leg 3's `Button(1)`) reaches the real pointer. Nothing between the two returns early. ⚠ LINE-NEUTRAL fold.
+    crate::pal::fixture_ring_hold(true); let pop0 = evq_pops(); // PTRLEAK (B193) — HOLD the ring before the first synthetic push: `input_service` stands down until the matching release after this fixture's last drain, so none of the 192 synthetic motions (nor leg 3's `Button(1)`) reaches the real pointer. Nothing between the two returns early. ⚠ LINE-NEUTRAL fold.
     for _ in 0..n {
         crate::pal::push_pointer_report(Some(Event::Mouse { x: 1, y: -1 }), None);
     }
@@ -8490,7 +8490,7 @@ pub fn wmdirect_selftest() {
             // unexpected lead count evidence of the router interleave rather than of the fix.
             // SELFTEST-RACE, NARROWED ON REVIEW — `fpop` is EVIDENCE on this leg, never a gate.
             // This leg's claims are all OUTCOME-shaped (grabbed/swap/ended/rest), and the thief is
-            // not a shredder: `x86_input_service` routes what it takes through the same
+            // not a shredder: `input_service` routes what it takes through the same
             // `wc_route_event` chain this leg drains through, so a stolen event still steers the
             // same window table and the gesture still comes to rest at +24. Measured when the first
             // cut of this arm gated on `fpop != 0`: 3 skips in 5 boots, the leg green and the row
