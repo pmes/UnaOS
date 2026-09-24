@@ -2423,6 +2423,21 @@ claims byte identity means `./arroyo knoboff <knob>` is owed on that fold, not a
 and every one has already been judged), and an advisory line nobody reads is not a gate. GATE-SELFSYNTAX
 covers the script; a bad or missing ref is exit 2 with no verdict.
 
+## GATE-K8REACH, STALE-ENUM — a capability's impliers are derived, never listed (B55, 2026-09-24)
+
+**The rule it checks.** `arch/aarch64/mod.rs` gates `pub mod syscall;` on the CAPABILITY `aarch64_el0`;
+seven arroyo comments restated that gate as `any(baremetal, tegra_el0)`, which was the complete list of
+impliers the day they were written and false the day `virt_el0 = ["aarch64_el0"]` landed. The comments
+now name the capability, and the list is DERIVED: `scripts/k8-reach.py --impliers <feature>` inverts the
+Cargo `[features]` closure (`cargo_impliers`) and prints every feature whose closure contains it (35 for
+`aarch64_el0` today). The grep that found the seven is now a red in every `k8-reach` run: any `any(a, b…)`
+spelled in arroyo whose terms are all impliers of one capability, and that the KERNEL does not itself spell
+as a cfg (`code_any_sets` collects every real `any(feature = …)` term set, so `any(orinel1ap, apsrun)` —
+a gate that exists — is not a finding), is a hand enumeration that the next implier falsifies silently.
+First catch on its own first run: `any(sdmmc_arm, sdmmcwrite)` at arroyo:6913 quoted a cfg that has read
+`any(sdmmc_arm, sdmmcwrite, sdwrite)` since SDWRITE. Go-red in GATES.md §B55: the old phrase appended to
+a tree copy's arroyo reds `STALE-ENUM: 1 arroyo line(s) … is aarch64_el0`, rc=1.
+
 ## FORBID-UNREACHABLE — a FORBID whose token is not in the artifact says so (B210, 2026-09-24)
 
 **The rule it checks.** A `FORBID` with 0 hits read ✅, whether the wire never carried the line or the

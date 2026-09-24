@@ -1572,7 +1572,7 @@ _p5_metal=""; case "${1:-}" in esp-jetson|esp_jetson|jetson|esp-jetson-img|esp_j
 # strip, no menubar, no crystal, no render_service.
 #
 # NOT STANDALONE, unlike smpmark/orindesk/jd1dc: `wc_click_route` lives in `arch/aarch64/syscall.rs`,
-# which `arch/aarch64/mod.rs:46` gates on `any(baremetal, tegra_el0)` — and `baremetal` implies `pi`,
+# which `arch/aarch64/mod.rs:46` gates on the capability `aarch64_el0` (impliers: `k8-reach.py --impliers aarch64_el0`) — `baremetal` implies `pi`,
 # which `pi`+`tegra`'s `compile_error!` forbids here. `tegra_el0` is the ONLY satisfiable term, so the
 # Cargo feature declares it (`orinclick = ["tegra_el0"]`) rather than leaving a knob that arms nothing
 # unless the operator also guesses UNAOS_TEGRA_EL0=1. `tegra_el0` implies `tegra`, so this knob is
@@ -1769,7 +1769,7 @@ _p5_metal=""; case "${1:-}" in esp-jetson|esp_jetson|jetson|esp-jetson-img|esp_j
 # `tegradesk = ["desktop_firmware", "tegra_el0"]` and `tegra_el0` implies `tegra`, so `UNAOS_TEGRADESK=1`
 # alone builds the armed configuration. That is deliberate and it is the rung's own lesson: the seam
 # calls `video::desktop_firmware::activate` (gated `all(aarch64, desktop_firmware)`), and `desktop_firmware` on aarch64 needs
-# `arch::aarch64::syscall` via `dock::focus_set`, gated `any(baremetal, tegra_el0)`. A standalone
+# `arch::aarch64::syscall` via `dock::focus_set`, gated on the capability `aarch64_el0` (B55: derive its impliers, never list them). A standalone
 # spelling would let `UNAOS_TEGRADESK=1 UNAOS_TEGRA=1` compile the seam's ABSENCE and still report
 # green — the exact "gate its own knob cannot satisfy" defect this rung removes. The terms are
 # appended here as well as implied by Cargo so the banner shows the configuration it actually built.
@@ -1801,7 +1801,7 @@ _p5_metal=""; case "${1:-}" in esp-jetson|esp_jetson|jetson|esp-jetson-img|esp_j
 # SELF-SUFFICIENT, like `tegradesk` and unlike `orindesk`/`jd1dc`/`smpmark`:
 # `orinconwin = ["desktop_firmware", "tegra_el0"]` and `tegra_el0` implies `tegra`, because every one of the
 # callees above is gated `any(all(x86_64, wc), all(aarch64, desktop_firmware))` and `desktop_firmware` on aarch64 reaches
-# `arch::aarch64::syscall` through `dock::focus_set` (`any(baremetal, tegra_el0)`; `baremetal` implies
+# `arch::aarch64::syscall` through `dock::focus_set` (the capability `aarch64_el0`; of its impliers `baremetal` implies
 # `pi` and `pi`+`tegra` is a `compile_error!`). A standalone spelling would let
 # `UNAOS_ORINCONWIN=1 UNAOS_TEGRA=1` compile the rung's ABSENCE and report green. The terms are
 # appended here as well as implied by Cargo so the banner shows the configuration it actually built.
@@ -1898,7 +1898,7 @@ _p5_metal=""; case "${1:-}" in esp-jetson|esp_jetson|jetson|esp-jetson-img|esp_j
 # `orinel1ap = ["tegrasmp", "tegra_el0"]` (both imply `tegra`), so the knob is self-sufficient:
 # `tegrasmp` because the AP must exist to be dropped (`start_secondaries` is itself
 # `#[cfg(feature = "tegrasmp")]`), `tegra_el0` because an EL1 AP exists to host an EL0 tenant and the
-# spawn surface is gated `any(baremetal, tegra_el0)` — `baremetal` implies `pi`, and `pi` + `tegra` is
+# spawn surface is gated on the capability `aarch64_el0` — of its impliers, `baremetal` implies `pi`, and `pi` + `tegra` is
 # a hard `compile_error!`, so `tegra_el0` is the only satisfiable term on this board. DEFAULT OFF =>
 # the block, the publishing statement, the call site and the accessor all vanish. The ARMED polarity
 # is type-checked by the `arm-tegra-el1ap` leg of KERNEL_CFG_MATRIX, never by this mapping.
@@ -5615,7 +5615,7 @@ KERNEL_CFG_MATRIX=(
   # has to stay that way: it is the only leg anywhere that compiles the SHIPPED default jetson image
   # (`tegra` ON, `tegra_el0` OFF), and that polarity has real code behind it — `main.rs`'s
   # `#[cfg(all(feature = "tegra", not(feature = "tegra_el0"), target_arch = "aarch64"))]`
-  # `tegra_el0_start_maybe` stub, plus the `not(any(baremetal, tegra_el0))` arms in `sched.rs` and
+  # `tegra_el0_start_maybe` stub, plus the negated `not(any(baremetal, tegra_el0, virt_el0))` arms (longhand ON PURPOSE, EL0-NAMING) in `sched.rs` and
   # `exceptions.rs`. Arming the one tegra leg would have traded the new hole for that one. The default
   # aarch64 leg does not cover it either: all-off is `tegra` OFF too, so it never compiles the
   # tegra-ON/el0-OFF combination. Exactly the `x86-vsyncpace` shape above — the armed twin is a leg of
@@ -5797,7 +5797,7 @@ KERNEL_CFG_MATRIX=(
   #
   # WHY THIS LEG CARRIES `tegra_el0`, and why that is a finding and not a convenience. `video/dock.rs`'s
   # `focus_set`/`focus_get` name `crate::arch::aarch64::syscall::user_input_{set_active,active}`, and
-  # `arch/aarch64/mod.rs` gates `pub mod syscall;` on `any(baremetal, tegra_el0)`. `desktop_firmware` on aarch64
+  # `arch/aarch64/mod.rs` gates `pub mod syscall;` on the capability `aarch64_el0` (impliers derived by `k8-reach.py --impliers`). `desktop_firmware` on aarch64
   # therefore REQUIRES one of those two; `baremetal` implies `pi` and `pi` + `tegra` is a hard
   # `compile_error!` (arch/aarch64/serial.rs), so on the Orin the only satisfiable term is `tegra_el0`.
   # The leg is `arm-tegra-el0`'s list verbatim + `desktop_firmware,livecon` for exactly that reason — it is the
@@ -5888,7 +5888,7 @@ KERNEL_CFG_MATRIX=(
   # WHY IT IS HOSTED ON `arm-tegra-el0`'s LIST AND NOT `arm-tegra`'s — the one place this leg differs
   # from its six predecessors, and it is forced. `orinclick` DECLARES `tegra_el0` as a Cargo feature
   # dependency, because `wc_click_route` lives in `arch/aarch64/syscall.rs` and `arch/aarch64/mod.rs:46`
-  # gates that module on `any(baremetal, tegra_el0)`; `baremetal` implies `pi` and `pi` + `tegra` is a
+  # gates that module on the capability `aarch64_el0`; of its impliers `baremetal` implies `pi` and `pi` + `tegra` is a
   # `compile_error!`, so `tegra_el0` is the only satisfiable term on this board. Hosting on `arm-tegra`
   # would have named a feature set cargo would silently widen back to this one anyway; naming it
   # explicitly makes the leg's line the configuration it actually compiles.
@@ -6910,7 +6910,7 @@ KERNEL_CFG_MATRIX=(
   # SDMMCWRITE armed (appended 2026-09-05, orin 14) — `sdmmcwrite` gates the gap-#3 write probe at the
   # tail of `arch/aarch64/sdmmc_tegra.rs` (`sdmmc_write_probe` + its scratch-sector chooser + the CMD24
   # twin), the same-line `pub use` on that file's TEGRA-SDBLK export line, the in-place widening of the
-  # `INT_WRITE_RDY` constant's cfg (`any(sdmmc_arm, sdmmcwrite)`), and the statement appended to the
+  # `INT_WRITE_RDY` constant's cfg (`any(sdmmc_arm, sdmmcwrite, sdwrite)` — three terms since SDWRITE; the two-term spelling here was STALE-ENUM's first catch, B55), and the statement appended to the
   # `sdmmc_census` call line in `main.rs`. Every site is inside `feature = "tegra"` items (the whole
   # `mod metal` is `tegra`-gated), so ONLY a leg carrying `tegra` compiles them at all — and no leg
   # carries `tegra` plus this knob but this one. Without it the ARMED polarity would be compiled by

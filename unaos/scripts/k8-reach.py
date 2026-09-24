@@ -268,6 +268,66 @@ def cargo_implications(cargo):
     return closure
 
 
+def cargo_impliers(cargo):
+    """feature -> the features whose closure contains it (the DERIVED answer to "who arms this
+    capability?"). rmbp-ledger B55: `arch/aarch64/mod.rs` gates `pub mod syscall;` on the CAPABILITY
+    `aarch64_el0`, and seven arroyo comments restated that gate as the hand enumeration
+    `any(baremetal, tegra_el0)` — stale the day `virt_el0` became a third implier. A capability's
+    impliers are Cargo's to state; a comment names the capability and points here."""
+    closure = cargo_implications(cargo)
+    feats = []
+    inf = False
+    for line in open(cargo, encoding="utf8", errors="replace"):
+        if line.startswith("[features]"):
+            inf = True; continue
+        if line.startswith("["):
+            inf = False; continue
+        m = re.match(r'^([A-Za-z0-9_-]+)[ \t]*=', line) if inf else None
+        if m:
+            feats.append(m.group(1))
+    return {f: sorted(g for g in feats if g != f and f in closure(g)) for f in feats}
+
+
+def code_any_sets(src):
+    """Every `any(feature = "a", feature = "b", …)` the kernel actually spells, as term sets. An arroyo
+    comment quoting one of these is quoting a gate that exists (`any(orinel1ap, apsrun)` is real);
+    only an enumeration the code does NOT spell is a restatement that can go stale."""
+    sets = set()
+    pat = re.compile(r'any\(([^()]*)\)')
+    for dp, _, fs in os.walk(src):
+        for f in fs:
+            if not f.endswith(".rs"):
+                continue
+            text = open(os.path.join(dp, f), encoding="utf8", errors="replace").read()
+            for m in pat.finditer(text):
+                terms = frozenset(re.findall(r'feature = "([A-Za-z0-9_-]+)"', m.group(1)))
+                if len(terms) >= 2:
+                    sets.add(terms)
+    return sets
+
+
+def stale_enumerations(arroyo, impliers, src):
+    """B55's grep, derived: for every capability with two or more impliers, an `any(a, b)` /
+    `any(a, b, c)` spelled out of its impliers anywhere in arroyo — that the kernel itself does
+    NOT spell as a cfg — is a hand enumeration of the capability that a new implier silently
+    falsifies. Returns [(lineno, capability, text)]."""
+    caps = {f: set(i) for f, i in impliers.items() if len(i) >= 2}
+    if not caps:
+        return []
+    real = code_any_sets(src)
+    found = []
+    pat = re.compile(r'any\(([A-Za-z0-9_, -]+)\)')
+    for lno, line in enumerate(open(arroyo, encoding="utf8", errors="replace"), 1):
+        for m in pat.finditer(line):
+            terms = {t.strip() for t in m.group(1).split(",") if t.strip()}
+            if len(terms) < 2 or frozenset(terms) in real:
+                continue
+            for cap, imps in caps.items():
+                if terms <= imps:
+                    found.append((lno, cap, m.group(0)))
+    return found
+
+
 def evidence(name, knob_feats, src):
     env_sites = parse_env_knobs(src).get(name)
     if env_sites:
@@ -315,6 +375,12 @@ def main():
         print("%s⚠ k8-reach: the kernel8() arm parse found %d knobs (expected >= 20); every knob "
               "would read as unarmed — NO VERDICT%s" % (YELLOW, len(armed), OFF))
         return 2
+
+    if argv and argv[0] == "--impliers":
+        imp = cargo_impliers(os.path.join(root, "crates", "kernel", "Cargo.toml"))
+        for f in argv[1:] or sorted(k for k, v in imp.items() if len(v) >= 2):
+            print("%s <= %s" % (f, ", ".join(imp.get(f, [])) or "(nothing implies it)"))
+        return 0
 
     if argv and argv[0] == "--evidence":
         why = site_scan_control(src)
@@ -405,7 +471,13 @@ def main():
     if env_misfiled:
         print("%s❌ k8-reach ENV-MISFILED: %s — `ENV` row(s) for knob(s) arroyo does name (or that also have a _feats line); "
               "the row says 'unnamed' about a knob that is not. Delete or reclassify.%s" % (RED, " ".join(env_misfiled), OFF))
-    if unregistered or stale or contradiction or env_unregistered or env_stale or env_misfiled:
+    stale_enum = stale_enumerations(arroyo, cargo_impliers(os.path.join(root, "crates", "kernel", "Cargo.toml")), src)
+    if stale_enum:
+        print("%s❌ k8-reach STALE-ENUM: %d arroyo line(s) spell a capability's impliers by hand — %s. A new implier "
+              "falsifies the list silently (rmbp-ledger B55: `virt_el0` did). Name the capability and derive the "
+              "list: `k8-reach.py --impliers <capability>`.%s"
+              % (RED, len(stale_enum), "; ".join("%d: %s is `%s`" % (l, t, c) for l, c, t in stale_enum), OFF))
+    if unregistered or stale or contradiction or env_unregistered or env_stale or env_misfiled or stale_enum:
         return 1
 
     if deferred:

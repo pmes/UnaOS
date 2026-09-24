@@ -215,3 +215,19 @@ $ mbench --replay unaos/target/serial.log --spec x86-wc.spec --quiet --artifact 
 ```
 (39/41 and the SERIALDOOR hit are the lane's: this run carried no `UNAOS_QUARRY`/`UNAOS_FTDIRX`, the knobs the spec's RUN-BY
 line names; not this gate's.) `cargo test -p foreman`: 38 + 2 + 2 passed, the reach test now 3 pairs against a synthetic esp/.
+
+## B55 — STALE-ENUM: a capability's impliers derived, and the hand enumerations swept
+```
+$ grep -c 'any(baremetal, tegra_el0)' unaos/arroyo          → 7 before, 0 after (seven comments now name the capability `aarch64_el0`)
+$ python3 scripts/k8-reach.py --impliers aarch64_el0
+aarch64_el0 <= baremetal, deskcascade, orinclick, orinconwin, orinel1ap, orinfurn, orininput, orinladder, orinrender, orintenant, piinstall, piinstall_arm,
+               piinstall_confirm, piusb, tegra_el0, tegradesk, v3d, … (21 v3d knobs), virt_el0, virt_tick          (35; `virt_el0` is the one B55 named)
+$ UNAOS_K8REACH_STRICT=1 python3 scripts/k8-reach.py        (first run, before the sweep of its own catch)
+❌ k8-reach STALE-ENUM: 1 arroyo line(s) spell a capability's impliers by hand — 6913: any(sdmmc_arm, sdmmcwrite) is `sdmmc`.
+   → sdmmc_tegra.rs:468 reads `any(feature = "sdmmc_arm", feature = "sdmmcwrite", feature = "sdwrite")`: the comment was two terms short. Rewritten.
+$ UNAOS_K8REACH_STRICT=1 python3 scripts/k8-reach.py        (after)
+  ✅ k8 reachability (…)                                       rc=0
+go-red — a tree copy (arroyo copied, scripts/ and crates/ symlinked) with `# stale: gated on any(baremetal, tegra_el0) here` appended:
+❌ k8-reach STALE-ENUM: 1 arroyo line(s) spell a capability's impliers by hand — 12608: any(baremetal, tegra_el0) is `aarch64_el0`.   rc=1
+control — `any(orinel1ap, apsrun)` (arroyo:5660), `any(ga10bprobe3, ga10bprobe4c)` (:6439): gates the kernel really spells; NOT findings (the first cut flagged them; `code_any_sets` is the fix).
+```
