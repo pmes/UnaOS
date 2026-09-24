@@ -243,7 +243,7 @@ and for the same reason.
 
 ### 3.1 The signal
 
-16-bit stereo, 48 kHz, 440 Hz, one second, amplitude 4096 of 32767 (about −18 dBFS). The sine is
+16-bit stereo, 48 kHz, 440 Hz, one second, amplitude 12288 of 32767 (about −8.5 dBFS; 4096 / −18 dBFS through flight 12 — raised 2026-09-24 for a loud room, Peter's ask, still 8.5 dB under full scale). The sine is
 computed in fixed point — the kernel has no float runtime — as an odd polynomial on the first
 quadrant mirrored into the other three, accurate to better than the quantisation of a 16-bit sample.
 

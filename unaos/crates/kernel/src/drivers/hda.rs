@@ -1333,9 +1333,11 @@ mod tone {
     /// is a multiple of 128 bytes, as the specification requires. [HDA-SPEC §3.3.38]
     pub const FRAMES: usize = SAMPLE_RATE;
     pub const PCM_BYTES: usize = FRAMES * 4;
-    /// Low amplitude: about -18 dBFS. This is a diagnostic tone on a laptop speaker, not a test
-    /// signal — a full-scale sine out of a cold boot is how you frighten an operator.
-    pub const AMPLITUDE: i32 = 4096;
+    /// Moderate amplitude: about -8.5 dBFS (12288 of 32767). Flights 8-12 used 4096 (-18 dBFS),
+    /// which Peter could not hear over a loud room on 2026-09-24 ("raise the volume on your test
+    /// tone ... try not to scare people"): +9.5 dB, still 8.5 dB under full scale. A full-scale
+    /// sine out of a cold boot is how you frighten an operator; this is not that.
+    pub const AMPLITUDE: i32 = 12288;
     /// Two BDL entries, which is the minimum the specification allows, each half the buffer and
     /// each with IOC set. [HDA-SPEC §3.6.2]
     pub const BDL_ENTRIES: usize = 2;
