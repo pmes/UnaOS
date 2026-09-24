@@ -3706,7 +3706,7 @@ smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-e
 unaos-xusb-fw = { path = "../xusb-fw", optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-x86_64 = "0.15.4"
+x86_64 = "0.15.5"
 uart_16550 = "0.6.0"
 # SOCK-1: mature TCP/IP stack (0BSD, #![no_std], heap-optional). x86-only + optional so aarch64 and
 # knob-off x86 builds never compile it. default-features off; only the three features SOCK-1 uses:
