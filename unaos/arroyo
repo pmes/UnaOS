@@ -8173,6 +8173,20 @@ BRACEPY
         [ "$_srrc" -eq 2 ] && echo -e "${COLOR_RED}❌ spec-roots gate gave NO VERDICT — its control did not fire, which is not a clean tree${COLOR_RESET}"
     fi
 
+    # GATE-VERBS (B47, 2026-09-24): the shell's two verb tables — midden_core's `HOST_VERBS` and
+    #   `dispatch_command`'s match arms — are ONE set, both set differences empty. `scripts/verb-roots.sh`
+    #   extracts both structurally (arms anywhere on a line, comments stripped) and runs three control
+    #   probes first (a synthetic arm, a synthetic table word, `date` in both); a control that does not
+    #   fire is exit 2 and NO verdict. A word in one table and not the other is exit 1, by name.
+    local _vrrc=0
+    "$WORKSPACE_DIR/scripts/verb-roots.sh" "$WORKSPACE_DIR" || _vrrc=$?
+    if [ "$_vrrc" -eq 0 ]; then
+        echo -e "${COLOR_GREEN}  ✅ verb roots (HOST_VERBS and the dispatch arms are one set)${COLOR_RESET}"
+    else
+        [ "$_vrrc" -eq 2 ] && echo -e "${COLOR_RED}❌ verb-roots gate gave NO VERDICT — its controls did not fire, which is not a clean tree${COLOR_RESET}"
+        [ "$_vrrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a shell verb is in one table and not the other (see GATE-VERBS above)${COLOR_RESET}"; return 1; }
+    fi
+
     # GATE-TESTROOTS (TESTROOTS, rmbp, 2026-09-16): GATE-ROOTS' shape applied to the THIRD kind of
     # root, and the CLASS that GATE-FOREMAN one leg above closed for exactly one file. A `#[test]`
     # is nobody's dependency either — `cargo build` never compiles it and no kernel leg links it —

@@ -2331,3 +2331,35 @@ the login screen's focus and the absent `[users]` line (LOGIN13's). `GATE STOLEN
 already FORBIDden (`:1455`, `:1456`, SPECPINS) and are not repeated. The four PENDINGs SPECPINS added (`:1477`-`:1505`)
 all MATCH flight 11 — the promotion condition it wrote — but `band=menubar` has 0 hits on flight 12 because the login
 window took the press, so promoting it to REQUIRE would red flight 12 for the voided reason; left to the seat.
+
+## GATE-VERBS — the shell's two verb tables are one set (B47, 2026-09-24)
+
+**The property.** A shell verb is spelled in two files: `libs/sys/midden_core/src/lib.rs` `HOST_VERBS`
+(membership: `midden_core::plan` asks it first, and a word it does not carry is "Unknown command" before
+any arm runs) and `crates/kernel/src/shell.rs` `dispatch_command` (behaviour: the `match` arm). B47 found
+`umv` and `urmattr` with full arms and no table entry, unreachable for their whole life, under a comment
+claiming the invariant had been checked. The mirror defect, a table word with no arm, answers with the
+`_ =>` fallthrough. LOGIN14 crossed the seam by hand again on 2026-09-24 (`passwd`), which is when this
+gate was written: the runtime `tste` leg in `shell.rs` checks a hand-picked subset; this checks the set.
+
+**The check.** `unaos/scripts/verb-roots.sh <workspace>`, run by `./arroyo check` beside the spec-roots and
+test-roots gates. TABLE = every `("<word>", Avail::…)` tuple in the midden file (cfg-gated ones included).
+ARMS = every `"<word>" =>` or `"a" | "b" =>` inside `dispatch_command`'s body, from the `pub fn` line to the
+next top-level `fn`, with trailing `//` comments stripped and arms matched anywhere on a line — the file
+folds arms onto shared lines for `panic::Location` neutrality, and a line-anchored first cut missed
+`uptime`, `dns` and `fdisk` and read a cfg attribute's `installdemo` as an arm. Both `comm` differences must
+be empty. Measured at the gate's birth: 76 and 76, both differences empty.
+
+**Controls, every run.** A synthetic arm (`"zz-control-arm" =>`) inserted into a copy of `shell.rs` must
+be extracted; a synthetic tuple (`("zz-control-word", Avail::Always)`) inserted into a copy of the midden
+file must be extracted; `date` must be in both real sets. Any control not firing: exit 2, no verdict,
+`check` says so and does not call the tree clean.
+
+**Go-red, recorded.** `("gored", Avail::Always)` added beside `uptime` in `HOST_VERBS`: `GATE-VERBS:
+HOST_VERBS=77 dispatch arms=76 controls=3/3` then `RED — in HOST_VERBS with NO dispatch arm … gored`, exit 1;
+restored, green at 76/76.
+
+**Legitimate update path.** Add the word to both files in one commit (the LOGIN14 `passwd` commit is the
+shape: one line in each). A verb that one arch does not carry is still a spelling in both tables — the
+cfg lives on the tuple and on the arm, never on the gate.
+
