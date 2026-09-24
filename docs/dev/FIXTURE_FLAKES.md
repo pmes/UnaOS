@@ -2049,6 +2049,42 @@ never at the head or tail of a fixture that consumes injected events.
 placement rule for its neighbours. Related: `./arroyo test`'s 20 s default wall does not reach the x86
 witness ladder on a loaded host; a brief that gates on a ladder fixture needs `./arroyo test 90`.
 
+## SOCK-2 / SOCK-3 `-> 0 bytes back — witness INCOMPLETE` and the ring-3 round-trip `FAIL — witness=0x7` / `witness=0x0` — the QEMU DNS leg is the HOST's resolver, and a bad network fails a kernel lane (2026-09-24, rmbp seat, cafe)
+
+**Signature on the wire.** `:: SOCK-2: smoltcp udp dns query 10.0.2.3:53 -> 0 bytes back — witness INCOMPLETE ::` and/or
+`:: SOCK-3: smoltcp tcp connect 10.0.2.3:53 established, 0 bytes back — witness INCOMPLETE ::`, then
+`:: SOCK-2: ring-3 udp round-trip FAIL — witness=0x7 cleared=true killed=0 done=1 (want 0x1f/true/0/1) ::` and/or
+`:: SOCK-3: ring-3 tcp round-trip FAIL — witness=0x0 cleared=true killed=0 done=1 (want 0x1f/true/0/1) ::`. SOCK-1 (icmp
+to 10.0.2.2) and SOCK-5 (dhcp) read OK in the same boot; SOCK-4 passes. The lane reds on the two ring-3 FAIL lines.
+
+**Trigger conditions.** Every x86 QEMU lane (wc, login, ptr, ahci-install) sends the DNS query to slirp's 10.0.2.3:53,
+which slirp forwards to the HOST's first resolver; the bytes back are whatever that resolver answers within the fixture's
+window. Sightings, all on one host and one tree (92f7778e, gate13, 2026-09-24, a cafe's Wi-Fi): wc lane 0/0 bytes (ring-3
+PASS — the round-trip made its window), login lane 24/26 bytes (all OK), ptr lane 0/0 (both ring-3 FAIL), ahci-install
+lane 24/0 (SOCK-2 ring-3 FAIL, SOCK-3 PASS) — four lanes within fourteen minutes, four different answers. The same four
+lanes on the previous tip (0974907c, gate12, 2026-09-23, at home) read 64/64 bytes and PASS in every lane. A host-side
+probe minutes later (`getaddrinfo`, and a raw UDP query to 127.0.0.53 and to 1.1.1.1) answered 61 bytes in under 0.1 s —
+the resolver works, intermittently, and the fixture's window is shorter than the cafe's worst case.
+
+**Root cause — known (environment).** The fixture measures the host's upstream DNS, not the kernel: the kernel's UDP and
+TCP paths carried the query out and the reply in whenever a reply existed (the 24/26- and 64-byte runs), and `witness=0x7`
+is "socket/bind/sendto OK, nothing to recvfrom". No kernel change between 0974907c and 92f7778e touches the socket path's
+delivery (the cloud session's container saw the same shape with NO network and attributed SOCK-3 to the container by
+control: the untouched tip failed identically there).
+
+**Fix — none in the kernel; the fixture is owed a control.** A SOCK-2/3 that also queries a slirp-local answerer (10.0.2.2
+answers ICMP; a fixed-answer UDP/TCP echo under the `UNAOS_NET=socket` injector already serves SOCK-6/7) would separate
+"the stack round-trips" from "the world answered". Until then: a SOCK-2/3 red beside SOCK-1 OK + SOCK-5 OK is read as this
+entry, and the lane is RERUN once; two identical reds with a host probe that answers are still this entry; a red with a
+host probe that FAILS is the network, full stop.
+
+**What to capture if it recurs.** The four `:: SOCK-[23]:` lines of the lane; the same lines from the neighbouring lanes
+of the same gate; a host probe at the time (`python3 -c 'import socket;print(socket.getaddrinfo("example.com",53))'` and a
+raw 12-byte-header UDP query to the host's `nameserver`); the venue.
+
+**Disposition — OPEN, read as environment; a lane rerun is the procedure.** First registered by the rmbp seat 2026-09-24
+from gate13 (ptr and ahci-install red) with gate13b's reruns on 63009d35 as the first application.
+
 ## Adding an entry
 
 An entry earns its place when a failure has been seen **more than once**, or once
