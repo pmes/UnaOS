@@ -182,7 +182,7 @@ Every row cites `docs/dev/OS/08_VIDEO/SHUTOUT-REGISTER.md` by section; read the 
 · ✓ JUDGED 2026-09-24 (landed by GATE-CFG-MIX; the check's census says `kernel cfg coverage OK (84 legs)`) — B3  five x86 features uncovered by any board leg (`nvidia-kepler-kdisp-hold rtpi rtwit selfhost vugras`)
 · B4  two `unsafe` warnings in the bootloader under `unaos_ivb`
 · B45  the x86 gate does not exercise the xHCI keyboard path at all (decides where the N-TD fix is proven)
-· B85  six FORBIDs keyed across a token junction in the x86 specs
+· ✓ DONE 2026-09-24 (the two unverified FORBIDs verified against their emitters and today's wire; all six sound) — B85  six FORBIDs keyed across a token junction in the x86 specs
 · B95  x86 spec files run by no `arroyo` verb (trunk-queue row 5; the x86 verb wiring is here)
 · B9  `[ptrdead] … fpop3=1 -> FAIL` in `UNAOS_WC=1 ./arroyo test-fat sf 200` — the foreign-drain flake in `arch/x86_64/syscall.rs`, 2 reds in 5 WC runs, both at load >= 24 (load-correlated, not random); `0d509431` / `badc8732` did not close it. Costs a re-run per proof on an unrelated leg
 · B83  the CITATION half: rmbp-ledger B58 and B60 cite `dc683c40` / `1aae3459`, which resolve on local `exec-*` branches only, while their CONTENT is on `main` as `18af05ab` / `c8153b4e`. A re-cite against the landed shas, not a rescue. (The metal-flight half closed when Peter pushed `exec-orin17-dupguard`.) Lane rule adopted: every cross-lane cherry-pick uses `-x`, so a dangling citation resolves by `git log --grep=<old sha>`
