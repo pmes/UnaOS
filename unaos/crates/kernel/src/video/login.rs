@@ -538,9 +538,8 @@ pub fn open_set_password(name: &[u8], login_after: bool) {
         if f.state == State::Open {
             f.state = State::SetPw;
             f.focus = Focus::Password;
-            for b in f.pw.iter_mut().chain(f.pw2.iter_mut()) {
-                *b = 0;
-            }
+            f.pw = [0; FIELD_MAX];
+            f.pw2 = [0; FIELD_MAX];
             f.pw_len = 0;
             f.pw2_len = 0;
             f.message = "Choose a password and retype it";
@@ -629,9 +628,8 @@ fn take_down() {
     }
     let mut f = FORM.lock();
     f.windowed = false;
-    for b in f.pw.iter_mut().chain(f.pw2.iter_mut()) {
-        *b = 0;
-    }
+    f.pw = [0; FIELD_MAX];
+    f.pw2 = [0; FIELD_MAX];
     f.pw_len = 0;
     f.pw2_len = 0;
 }
@@ -872,9 +870,8 @@ pub fn consume_key(c: u8) -> bool {
 }
 
 fn clear_passwords(f: &mut Form) {
-    for b in f.pw.iter_mut().chain(f.pw2.iter_mut()) {
-        *b = 0;
-    }
+    f.pw = [0; FIELD_MAX];
+    f.pw2 = [0; FIELD_MAX];
     f.pw_len = 0;
     f.pw2_len = 0;
     f.focus = Focus::Password;
