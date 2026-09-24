@@ -61,7 +61,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 CANARIES = ("UNAOS_PRTSCRST", "UNAOS_BOOTLOG")
 TRUNK = os.environ.get("UNAOS_K8REACH_TRUNK", "main")
-STATUSES = ("NA", "TODO")
+STATUSES = ("NA", "TODO", "ENV")  # ENV (B64): an `option_env!` knob no command names — registered, counted, visible
 
 RED, GREEN, YELLOW, OFF = "\033[91m", "\033[92m", "\033[93m", "\033[0m"
 
@@ -86,6 +86,32 @@ def parse_arroyo(path):
     armed = {k for l in lines[k8s:ends[0]] for k in re.findall(r'UNAOS_[A-Z0-9_]+', l)}
     return knob_feats, armed
 
+
+ENV_CANARY = "UNAOS_FBW"  # CLAUDE.md names it as an env knob; the option_env! parse must find it or it found nothing
+
+def parse_env_knobs(src):
+    """B64 — THE DOMAIN GAP. A knob delivered by `option_env!("UNAOS_X")` is read by rustc from the
+    BUILD environment: it needs no `_feats` line and no `K8_FEATS` arm to reach an image (`cargo`
+    inherits the caller's env and rustc records the env dependency), so the `_feats`-derived universe
+    above never sees it — the specimen was `UNAOS_DMAWIN`, armed by no command in the repo and
+    invisible to this gate. Returns knob -> sorted [relpath:line] of its option_env! sites."""
+    out = subprocess.run(["grep", "-rnoE", r'option_env!\("UNAOS_[A-Z0-9_]+"\)', src],
+                         capture_output=True, text=True).stdout
+    knobs = {}
+    for ln in out.split("\n"):
+        if not ln.strip():
+            continue
+        path, lno, text = ln.split(":", 2)
+        m = re.search(r'UNAOS_[A-Z0-9_]+', text)
+        if m:
+            knobs.setdefault(m.group(0), []).append("%s:%s" % (os.path.relpath(path, src), lno))
+    return {k: sorted(v) for k, v in knobs.items()}
+
+def arroyo_mentions(path):
+    """Every UNAOS_* token arroyo names ANYWHERE — code or comment. For an env knob the bar is
+    'does any verb or its documentation name it', so a comment counts: `UNAOS_FBW=1920 ./arroyo
+    kernel8-test` in a usage note is exactly how such a knob is reached."""
+    return set(re.findall(r'UNAOS_[A-Z0-9_]+', open(path, encoding="utf8", errors="replace").read()))
 
 def parse_registry(path):
     """knob -> (status, reason). Blank lines and `#` comments are skipped."""
@@ -243,6 +269,11 @@ def cargo_implications(cargo):
 
 
 def evidence(name, knob_feats, src):
+    env_sites = parse_env_knobs(src).get(name)
+    if env_sites:
+        print("  option_env! sites (B64 — build-time env knob, no _feats/K8_FEATS arm needed to reach an image):")
+        for site in env_sites:
+            print("    ENV            %s" % site)
     ctx = load_ctx(src)
     closure = cargo_implications(os.path.join(os.path.dirname(src), "Cargo.toml"))
     feats = sorted(knob_feats.get(name, {name}))
@@ -319,8 +350,8 @@ def main():
         return 2
 
     unregistered = [k for k in unarmed if k not in rows]
-    stale = [k for k in rows if k not in knob_feats]
-    contradiction = [k for k in rows if k in armed]
+    stale = [k for k, (st, _) in rows.items() if st != "ENV" and k not in knob_feats]  # ENV rows live in the option_env! half below
+    contradiction = [k for k, (st, _) in rows.items() if st != "ENV" and k in armed]
 
     branch = subprocess.run(["git", "-C", root, "rev-parse", "--abbrev-ref", "HEAD"],
                             capture_output=True, text=True).stdout.strip()
@@ -336,6 +367,19 @@ def main():
     deferred = []
     if not strict and stale:
         deferred, stale = stale, []
+    # B64 — the option_env! half of the universe.
+    env_knobs = parse_env_knobs(src)
+    if ENV_CANARY not in env_knobs:
+        print("%s⚠ k8-reach: control failed — the option_env! parse did not find %s (CLAUDE.md's own env knob); "
+              "the env half of this gate is reporting about nothing — NO VERDICT%s" % (YELLOW, ENV_CANARY, OFF))
+        return 2
+    mentions = arroyo_mentions(arroyo)
+    env_dual = sorted(k for k in env_knobs if k in knob_feats)
+    env_named = sorted(k for k in env_knobs if k not in knob_feats and k in mentions)
+    env_unnamed = sorted(k for k in env_knobs if k not in knob_feats and k not in mentions)
+    env_unregistered = [k for k in env_unnamed if rows.get(k, ("",))[0] != "ENV"]
+    env_stale = [k for k, (st, _) in rows.items() if st == "ENV" and k not in env_knobs]
+    env_misfiled = [k for k, (st, _) in rows.items() if st == "ENV" and (k in mentions or k in knob_feats)]
 
     if unregistered:
         print("%s❌ k8-reach UNREGISTERED: %s — knob(s) with no K8_FEATS arm and no registry row. "
@@ -349,7 +393,19 @@ def main():
     if contradiction:
         print("%s❌ k8-reach CONTRADICTION: %s — armed in kernel8() AND registered as unarmed. "
               "The row is wrong; delete it.%s" % (RED, " ".join(contradiction), OFF))
-    if unregistered or stale or contradiction:
+    if env_unregistered:
+        print("%s❌ k8-reach ENV-UNNAMED: %s — option_env! knob(s) that NO command in arroyo names (code or comment) and "
+              "no registry row carries as `ENV`. They reach every image the build's environment carries them into, and "
+              "nothing in the repo says how (LEDGER B64). Name the knob in the verb that uses it, or add "
+              "`<KNOB>  ENV  <site; who sets it>` to scripts/k8-reach.registry (`--evidence <KNOB>` prints the sites).%s"
+              % (RED, " ".join(env_unregistered), OFF))
+    if env_stale:
+        print("%s❌ k8-reach ENV-STALE: %s — `ENV` registry row(s) for knob(s) with no option_env! site left. Delete them.%s"
+              % (RED, " ".join(env_stale), OFF))
+    if env_misfiled:
+        print("%s❌ k8-reach ENV-MISFILED: %s — `ENV` row(s) for knob(s) arroyo does name (or that also have a _feats line); "
+              "the row says 'unnamed' about a knob that is not. Delete or reclassify.%s" % (RED, " ".join(env_misfiled), OFF))
+    if unregistered or stale or contradiction or env_unregistered or env_stale or env_misfiled:
         return 1
 
     if deferred:
@@ -357,8 +413,11 @@ def main():
               "Strict is %s; these become reds automatically on the trunk: %s"
               % (len(deferred), why, " ".join(sorted(deferred))))
     todo = sum(1 for k, (s, _) in rows.items() if s == "TODO")
-    print("%s  ✅ k8 reachability (%d knobs: %d armed, %d registered unarmed — %d still TODO)%s"
-          % (GREEN, len(knob_feats), len(armed & set(knob_feats)), len(rows), todo, OFF))
+    env_reg = sum(1 for k, (st, _) in rows.items() if st == "ENV")
+    print("%s  ✅ k8 reachability (%d knobs: %d armed, %d registered unarmed — %d still TODO; env knobs: %d option_env!, "
+          "%d named by arroyo, %d dual-keyed with a _feats line, %d unnamed and registered ENV)%s"
+          % (GREEN, len(knob_feats), len(armed & set(knob_feats)), len(rows) - env_reg, todo, len(env_knobs),
+             len(env_named), len(env_dual), env_reg, OFF))
     return 0
 
 

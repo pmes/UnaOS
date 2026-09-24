@@ -232,6 +232,24 @@ spots exactly — the arch-neutral file and the x86-gated callee are what a read
 mis-sorts — so an `NA` without its command is a second classifier with no proof (pi 7,
 2026-09-06). Deleting a row without adding the arm reintroduces the silence.
 
+**The `option_env!` half (B64, 2026-09-24).** The universe above is derived from arroyo's `_feats`
+lines, and a knob delivered by `option_env!("UNAOS_X")` is not in it: rustc reads such a knob from the
+BUILD environment (cargo inherits the caller's env and records the dependency), so it reaches every image
+with no `_feats` line and no `K8_FEATS` arm — and this gate could neither count it nor say whether any
+command names it. The specimen was `UNAOS_DMAWIN`, armed by no command in the repo. Now `k8-reach.py`
+also greps the kernel source for `option_env!` knobs (control: it must find `UNAOS_FBW`, CLAUDE.md's own
+env knob, or the env half is NO VERDICT) and sorts them three ways: **named** — arroyo mentions the knob
+anywhere, code or comment (`UNAOS_FBW=1920 ./arroyo kernel8-test` in a usage note is exactly how such a
+knob is reached); **dual-keyed** — the knob also has a `_feats` line (`UNAOS_NET4`, `UNAOS_SMPPROBE`: a feature AND a
+build-time value, counted, not a finding; `UNAOS_NOJB11` and `UNAOS_V3D_FIRSTKICK` reach kernel8 through
+an arm, not a `_feats` line, so they count as named);
+**unnamed** — no mention at all, RED as `ENV-UNNAMED` unless the registry carries the knob as
+`ENV <site; who sets it>`, the third status. `ENV-STALE` (a row whose knob has no `option_env!` site left)
+and `ENV-MISFILED` (an `ENV` row for a knob arroyo does name) keep the rows honest, and `--evidence`
+prints the `option_env!` sites beside the cfg sites. First run: four unnamed — DMAWIN and three NET4
+debugging knobs of the descriptor-17 hunt — all registered with their sites; the summary line now ends
+`env knobs: 12 option_env!, 6 named by arroyo, 2 dual-keyed with a _feats line, 4 unnamed and registered ENV`.
+
 ---
 
 ## GATE-LEDGER — the issue ledgers are a tracker, and every row is checkable

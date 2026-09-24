@@ -1242,7 +1242,7 @@ pub fn tick<P: GneissPal>(pal: &mut P) -> bool {
             // ever left waiting for a paint in this window.
             let srate_x10 = st.samples.saturating_mul(10_000) / span.max(1);
             serial_println!(
-                "[pstrip] rollup samples={} redraws={} skipped={} srcdelta={} rate={}.{}/s srate={}.{}/s gapmax={}ms lat_max_ms={} period={}ms decay={}ms", // pinned by scripts/specs/pi4-regression.spec (B101: `samples=` `skipped=` `srcdelta=` as whole tokens, order-free — add fields anywhere, never rename these three)
+                "[pstrip] rollup samples={} redraws={} skipped={} srcdelta={} rate={}.{}/s srate={}.{}/s gapmax={}ms lat_max_ms={} period={}ms decay={}ms", // pinned by scripts/specs/pi4-regression.spec (B101: `samples=` then `skipped=` then `srcdelta=` as whole tokens IN THIS ORDER, gaps allowed — add fields anywhere, never rename or reorder these three)
                 st.samples,
                 st.redraws,
                 st.samples.saturating_sub(st.redraws),

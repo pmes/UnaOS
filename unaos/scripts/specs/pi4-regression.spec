@@ -1549,10 +1549,12 @@ REQUIRE \[pstrip\] rollup samples=[0-9]+ redraws=[0-9]+ skipped=[1-9]
 # ---    B101 (rmbp-ledger; pi 9's finding, proven by execution): the old form `samples=… redraws=… skipped=0
 # ---    srcdelta=0` depended on FOUR FIELDS STAYING ADJACENT and went SILENT the moment a field was
 # ---    inserted between them — and the emitter (`ui_status.rs`, the `[pstrip] rollup` line) has fields
-# ---    owed (`paced=`). Now three lookaheads, one per field this rule actually reads, each a whole
-# ---    ` key=value ` token: field ORDER and any field in between are irrelevant, and the emitter's
-# ---    comment names this spec so the contract is visible from both ends.
-FORBID \[pstrip\] rollup (?=.*\bsamples=[1-9][0-9]*\b)(?=.*\bskipped=0\b)(?=.*\bsrcdelta=0\b)
+# ---    owed (`paced=`). Now the three tokens this rule actually reads, each whole (`\b…\b`), in the
+# ---    emitter's ORDER with `.*` gaps: a field inserted anywhere between them is irrelevant; the ORDER
+# ---    samples → skipped → srcdelta is the emitter's contract and its comment names this spec. (Not
+# ---    lookaheads: `foreman`, the Rust twin of mbench that GATE-FOREMAN keeps in agreement, has no
+# ---    look-around — measured, it failed to compile the first cut of this line.)
+FORBID \[pstrip\] rollup .*\bsamples=[1-9][0-9]*\b.*\bskipped=0\b.*\bsrcdelta=0\b
 # --- PULSE-3: THE SOURCE, not the pacing.
 # ---
 # ---    P64, attended, capture pi4-r23s1o. Three vugs held the cores at a sustained 99% and the

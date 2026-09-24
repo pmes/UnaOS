@@ -78,24 +78,29 @@ UNAOS_USBNET — knob(s) with no K8_FEATS arm and no registry row`. USBNET got a
   ✅ k8 reachability (163 knobs: 16 armed, 147 registered unarmed — 102 still TODO)
 ```
 
-## B101 — the pstrip FORBID, order-free
-Old: `\[pstrip\] rollup samples=[1-9][0-9]* redraws=[0-9]+ skipped=0 srcdelta=0`.
-New: `\[pstrip\] rollup (?=.*\bsamples=[1-9][0-9]*\b)(?=.*\bskipped=0\b)(?=.*\bsrcdelta=0\b)`.
-Eight lines through Python `re.search` (mbench's matcher), old versus new:
+## B101 — the pstrip FORBID, gap-tolerant in the emitter's order
+Old: `\[pstrip\] rollup samples=[1-9][0-9]* redraws=[0-9]+ skipped=0 srcdelta=0` (four adjacent fields).
+First cut: three lookaheads, order-free — **refused by GATE-FOREMAN**: `foreman` (the Rust twin of mbench,
+`regex` crate) has no look-around; `every_checked_in_spec_parses` and `agrees_with_mbench_on_the_shared_corpus`
+both failed on the strict check with `error: look-around, including look-ahead and look-behind, is not
+supported`. Specs may not use look-around; the pi4-regression.spec comment now says so.
+New: `\[pstrip\] rollup .*\bsamples=[1-9][0-9]*\b.*\bskipped=0\b.*\bsrcdelta=0\b` — whole tokens, the
+emitter's order, `.*` gaps. Nine lines through Python `re.search` (mbench's matcher), old versus new:
 ```
-case                                           old    new   (want: first four FIRE, rest SILENT)
-collapse line (real emitter)                   FIRE   FIRE
-paced= appended at the tail                    FIRE   FIRE
-paced= INSERTED between redraws and skipped    silent FIRE
-fields reordered                               silent FIRE
-honest line (skipped=90)                       silent silent
-honest line (srcdelta=7)                       silent silent
-degenerate zero-sample rollup                  silent silent
-skipped=05 (not zero)                          silent silent
+case                                                               old    new
+collapse line (real emitter)                                       FIRE   FIRE
+paced= appended at the tail                                        FIRE   FIRE
+paced= INSERTED between redraws and skipped                        silent FIRE
+a field inserted between skipped and srcdelta                      silent FIRE
+honest line (skipped=90)                                           silent silent
+honest line (srcdelta=7)                                           silent silent
+degenerate zero-sample rollup                                      silent silent
+skipped=05 (not zero)                                              silent silent
+fields REORDERED (breaks the emitter's contract — silent by design) silent silent
 NEW REGEX VERDICT: PASS
 ```
-`mbench.py --self-test` 46/46 after the edit. The emitter line in `ui_status.rs` now carries a same-line
-comment naming the spec and the three tokens it may never rename.
+`mbench.py --self-test` 46/46; `cargo test -p foreman` 38 + 1 + 2 tests green. The emitter line in
+`ui_status.rs` carries a same-line comment naming the spec and the three tokens it may never rename or reorder.
 
 ## B94 — GATE-LINENEUTRAL on this session's own commits
 ```
@@ -122,3 +127,18 @@ exit=2
 Reading: same-line hooks are neutral; a tail append moves nothing that matters; a mid-file helper (SO22's
 `app_name_armed`) moved 26 sites — harmless here since no knob-off identity claim rides on wm.rs, and now
 visible rather than assumed; a relocated block is a +0 MOVE that still shifts what lies between its homes.
+
+## B64 — the option_env! half of GATE-K8REACH
+```
+$ k8-reach.py   (before the registry rows)
+❌ k8-reach ENV-UNNAMED: UNAOS_DMAWIN UNAOS_NET4_BUF1 UNAOS_NET4_DHCP_MS UNAOS_NET4_RINGDUMP — option_env! knob(s) that NO command in arroyo names (code or comment) and no registry row carries as `ENV`. They reach every image the build's environment carries them into, and nothing in the repo says
+
+$ k8-reach.py   (after)
+  ✅ k8 reachability (163 knobs: 16 armed, 147 registered unarmed — 102 still TODO; env knobs: 12 option_env!, 6 named by arroyo, 2 dual-keyed with a _feats line, 4 unnamed and registered ENV)
+
+$ k8-reach.py --evidence UNAOS_DMAWIN
+  option_env! sites (B64 — build-time env knob, no _feats/K8_FEATS arm needed to reach an image):
+    ENV            arch/aarch64/rtl8168_tegra.rs:5286
+UNAOS_DMAWIN: 0 site(s), 0 Pi-live, 0 negated
+```
+Registered ENV: UNAOS_DMAWIN, UNAOS_NET4_RINGDUMP, UNAOS_NET4_BUF1, UNAOS_NET4_DHCP_MS (each with its option_env! site). Named by arroyo (6): UNAOS_FBH, UNAOS_FBW, UNAOS_GIT_SHA, UNAOS_NOJB11, UNAOS_V3D81_SETTLE_MS, UNAOS_V3D_FIRSTKICK. Dual-keyed with a _feats line (2): UNAOS_NET4, UNAOS_SMPPROBE. (Lists computed with the tool's own parsers.)
