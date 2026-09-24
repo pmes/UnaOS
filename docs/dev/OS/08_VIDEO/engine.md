@@ -1418,6 +1418,19 @@ are not black), so a blank surface faithfully blitted onto a blank rect is disti
 crystal instead of reading as an equally green PASS. `first=none` is printed on a clean verdict, so a real
 black-on-black mismatch at the origin cannot hide behind an all-zero placeholder. A window refused by a
 guard emits `-> SKIP` with its reason rather than silently consuming its one-shot latch.
+The geometry SKIPs (`degenerate row/geometry`, `no visible content rect`) seal the window and print once.
+`-> SKIP (no memory for WxH source snapshot)` hands the window back, because a failed allocation belongs to
+one instant and not to the row. Before WCDFLOOD (SO30, `0fc32a4c`) that meant one line per compositor pass:
+render13 boot 1 carried 46,161 of them, 68 B each, about 36% of that boot's UART budget. The line is now
+LATCHED per window id (`wcd_oom_say`). The first skip prints, and every skip, the printed one included,
+counts into two rollups: `[comp2] wcd_skips=` (a span total over all windows) and, since WCDMEM (QUEUE §1 (e),
+rmbp-ledger B199), `[wc-d] skip-rollup win=<id> reason=no-memory passes=<n> since_ms=<t>` (per window).
+The per-window rollup prints right after its `[comp2]` line, and only for a window whose count moved
+since its last rollup. `passes=` is cumulative since the witness and `since_ms=` is the time since the
+witness printed, so each span's `passes=` increments sum to that span's `wcd_skips=`. The x86 `wc` ladder's
+fixture prints `[wc-d] latch-check forced=16 printed=1 rolled=16 win=<30|31> reroll=0 -> PASS` right after
+`:: WCDLATCH:`. Its go-red is the pre-latch per-pass print, which reads `printed=16 rolled=0 … -> FAIL`.
+No aarch64 QEMU verb composites, so the Orin wire is the only runtime reading of the aarch64 half.
 
 **`bad_ram` uses a bare `DC IVAC`, and that is load-bearing.** The first cut of this witness used
 `DC CIVAC`. It was wrong in exactly the way that mattered: `CIVAC` writes dirty lines back before
