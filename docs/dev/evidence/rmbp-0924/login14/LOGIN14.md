@@ -15,7 +15,7 @@ builder searches. The toolchain window this forced is in the rmbp-queue STATE of
 
 | gate | result |
 |---|---|
-| `UNAOS_QEMU_MACHINE=pc-q35-8.2 UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_LOGIN=1 UNAOS_LOGINST=1 UNAOS_QEMU_FULL=1 ./arroyo test 240` | rc=0; completion marker reached (serial line 2824), full wall 242.2 s; `awk 'index($0,"-> FAIL")'` = 0 lines |
+| `UNAOS_QEMU_MACHINE=pc-q35-8.2 UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_LOGIN=1 UNAOS_LOGINST=1 UNAOS_QEMU_FULL=1 ./arroyo test 240` | **rc=1** (corrected 2026-09-24: the first draft of this row said rc=0 without having read the rc line — SR12's class); the verb exits 1 on `:: SOCK-3: ring-3 tcp round-trip FAIL — witness=0x1 …`, the ring-3 TCP fixture this arc does not touch (its control run is in `../fold/FOLD.md`); completion marker reached (serial line 2824), full wall 242.2 s; `awk 'index($0,"-> FAIL")'` = 0 lines; the login lane's own verdict is the mbench row below |
 | `./arroyo mbench --replay target/serial.log --spec scripts/specs/x86-login.spec --platform x86` | rc=0; MBENCH PASS 51/51 required, 0 forbidden, 3258 lines |
 | GO-RED: `set_first_password` mutated to skip the write, same test line | rc=1; the line below reads `set=false verify=FAIL -> FAIL —`; file restored, `git status` clean |
 | `./arroyo check` (final tree) | see the rmbp-queue LOGIN14 row (appended when it reported) |
