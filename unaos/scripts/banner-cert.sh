@@ -303,6 +303,7 @@ hda|[hda] census|-|measured
 hda-tone|:: HDA-TONE:|-|measured
 uvc|[uvc] commit=withheld|-|measured(1)
 login|[login] screen open window=|-|measured
+loginst|:: LOGIN: users+session|-|measured
 ioapic|[ioapic] census ioapics=|-|measured(2)
 tegra|:: tegra: JB5 — XUSB domain not ON at handoff|-|measured(1)
 tegrasmp|:: AARCH64 SMP: ORIN-SMP-3 — DTB /cpus named no cores (dtb=@|-|measured(1)
