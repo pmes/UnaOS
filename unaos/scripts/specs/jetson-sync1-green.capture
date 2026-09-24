@@ -65,6 +65,13 @@
 ### reads 60 lines scanned, not 21), so a pattern written out here is a line the scorer can
 ### match. The escaped form happened to be safe by one backslash; that is luck, not design.
 ### Name rows here, never quote them.
+### ORIN-CORE0 SYNC (2026-09-24, cloud session; QUEUE §5 NEUTRAL M1 finding, orin-ledger A106): this
+### capture predated orin 26 and was RED against its own spec (24/27: `:675 TEGRA-EL0`, `:1784 spread4 c5=`,
+### `:1814 el0live el0cpus=`). Three lines are now spelled the way the ORIN-CORE0 kernel prints them
+### (`main.rs` TEGRA-EL0 `placement={} core={} tid={}`, `sched.rs` `[el0live] … | where hosts= el0cpus= lastcpu= |`,
+### `[spread4] … el0refuse= c4= c5= c6= c7=`), with the SCHED placement row read as `load-balanced` on core 3 to
+### match. SYNTHETIC values, chosen to satisfy the rows the spec admits (`el0cpus=0x8`: an AP, more than bit 0).
+### 27/27; go-red proven by reverting each of the three lines in turn (26/27 each).
 :: tegra: JB0 — fan ON (~40% duty): CSR<-0x80660000 (readback 0x80660000) -> PASS ::
 :: tegra: JB1b — MRQ_PING err=0 reply=0xab5466 (want 0xab5466) -> PASS ::
 :: tegra: JB1c — XUSB ALIVE: xHCI v1.20 CAPLENGTH=0x20 HCSPARAMS1=0x08000524 HCCPARAMS1=0x0180ff05 USBCMD=0x00000000 USBSTS=0x00000011 -> PASS ::
@@ -77,8 +84,8 @@
 :: IRQEL-RT: EL1 one-shot proof IRQ taken at EL1 on cpu 0 (the ARMING core) ::
 :: [orinbsptick] arming PERIODIC CNTP at EL1 on cpu 0 (250 Hz, PPI30) — IRQs stay UNMASKED across the terminus; dispatch is on_tick + post-EOI timer_preempt (ORIN-BSPRUN: SCHED_ACTIVE is set at the terminus — the run() loop is PREEMPTIVE) ::
 :: [orinbsptick] tick 1 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
-:: SCHED: task 'el0-hello' -> core 0 (policy: caller-pinned EL0 residents=1, no-migrate) ::
-:: TEGRA-EL0: el0-hello spawned at EL0 (boot core), verdict armed — entry 0x40000000 sp 0x40010000 ::
+:: SCHED: task 'el0-hello' -> core 3 (policy: load-balanced EL0 residents=1, no-migrate) ::
+:: TEGRA-EL0: el0-hello spawned at EL0 (placement=auto core=3 tid=7), verdict armed — entry 0x40000000 sp 0x40010000 ::
 :: TEGRA-EL0: el0-hello round-trip -> PASS ::
 :: SCHED: [el0core] el1 core MEASURED: cpu=0 mask=0x1 (EL0-EL1CORE) ::
 :: [orinbsprun] boot core 0 joins run() — SCHED_ACTIVE=true, mark_online(0), preemptive terminus (clock: ORIN-BSPTICK); sleeper drain + steal + idle fold + the SCHED load/[pulse5]/[spin1] train are live on tegra for the first time ::
@@ -86,8 +93,8 @@
 :: SCHED: load c0=--/f=never-folded c1=0%/f=3ms c2=0%/f=1ms c3=0%/f=2ms c4=0%/f=2ms c5=0%/f=3ms c6=--/f=never-folded c7=--/f=never-folded (ctx +0/win nofold=0x0) ::
 :: tegra: JD2 — EL1 console pump live (boot log holds the panel; first key or ~8 s enters the shell) ::
 :: [orinbsptick] tick 250 taken at EL1 on cpu 0 — periodic CNTP live across the terminus ::
-[el0live] verdict=EXTINCT el0 runnable/parked/committed=0/0/0 last_disp=668ms last_wake=-- stall>=2000ms | reaped exit=1 kill_oncpu=0 kill_offcpu=0 corrupt=0 nopark=0 | totals el0_disp=1
-[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=843 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0
+[el0live] verdict=EXTINCT el0 runnable/parked/committed=0/0/0 last_disp=668ms last_wake=-- stall>=2000ms | where hosts=0x3e el0cpus=0x8 lastcpu=3 | reaped exit=1 kill_oncpu=0 kill_offcpu=0 corrupt=0 nopark=0 | totals el0_disp=1
+[spread4] live c0=0/0 c1=0/0 c2=0/0 c3=0/0 rewake=0 stay=0 short=0 refresh=0 margin=2 minpark=100ms steal=0 d1=0 remig=0 cool=0 pack=843 rwstamp=0 residn=0 residmin=0ms residavg=0ms el0refuse=0 c4=0/0 c5=0/0 c6=0/0 c7=0/0
 [prio] svc=0 el0=1 defer=0 agedin=0 /win (band>=2, totals svc=0 el0=1)
 [deskfurn] arm click=1 conwin=1 desk=1
 [orinconwin] gate panel=1920x1200x32
