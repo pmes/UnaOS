@@ -15712,7 +15712,7 @@ impl XhciController {
         }
         // XHCI-COHERENCE: evict stale lines of the reused descriptor buffer before the controller
         // DMA-writes the config descriptor (parse invalidates before reading). No-op x86.
-        dma_coherency::clean(desc_phys as usize, 64);
+        dma_coherency::clean(desc_phys as usize, 256); // SO55: the whole descriptor buffer — the read below asks for 256, not 64
 
         // 1. Setup Stage
         // bmRequestType = 0x80 (Device to Host, Standard, Device)
@@ -15722,7 +15722,7 @@ impl XhciController {
         // wLength = 0x0040 (64 bytes)
         // Little Endian u64: 0x0040000002000680
         let setup_trb = Trb {
-            parameter: 0x0040000002000680,
+            parameter: 0x0100000002000680, // SO55: wLength 0x0100 (256) — was 0x0040 (64), which truncated every configuration longer than 64 bytes (a CDC Ethernet device is ~90) to its first 64 while the walk below trusted wTotalLength
             status: 8, // Transfer Length
             control: (2 << 10) | (1 << 6) | (3 << 16), // Type 2 | IDT | TRT (IN)
         };
@@ -15731,7 +15731,7 @@ impl XhciController {
         // 2. Data Stage
         let data_trb = Trb {
             parameter: desc_phys,
-            status: 64, // Length 64 bytes
+            status: 256, // SO55: Length 256 bytes — the slot descriptor buffer is 256 (DeviceSlot::new), the walk bounds at 256
             control: (3 << 10) | (1 << 16), // Type 3 | DIR (IN)
         };
         self.push_ep0(slot_id, data_trb);
