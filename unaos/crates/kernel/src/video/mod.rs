@@ -176,7 +176,7 @@ use unaos_boot_info::FrameBufferInfo;
 
 /// The primary display surface. The GUI renderer (`pal::TargetPal` → `console`) draws here.
 /// Initialised once in `kernel_main` from `BootInfo` (UEFI GOP, or the Pi mailbox framebuffer).
-pub static WRITER: Mutex<FrameBuffer> = Mutex::new(FrameBuffer::new());
+pub static WRITER: HeldMutex<FrameBuffer> = HeldMutex::new(FrameBuffer::new()); // MENULOCK (rmbp-ledger B200) — WAS a bare `Mutex<FrameBuffer>`; now the same spin lock carrying WHO holds it (the `#[track_caller]` site, the core, since when, masked or open), so a refused paint can NAME its holder. Same `lock`/`try_lock` surface, same guard semantics; see [`HeldMutex`] at the file tail. ⚠ SAME-LINE fold, line-neutral (B94).
 
 // ── PANELOWN — who owns the panel, as a word rather than as a sentence ───────────────────────────
 //
@@ -443,7 +443,7 @@ pub fn panel_info_nonblocking() -> Option<FrameBufferInfo> {
 /// also refuse `prtscr::capture` — making the one screen an operator most wants a PNG of, the panic,
 /// the one screen that cannot be captured. The refusal sits at [`panel_refuse_term`]'s two callers.
 /// THIS FUNCTION consults [`PanelOwner`] nowhere; its body is byte-for-byte the pre-PANELOWN body.
-pub(crate) fn panel_snapshot() -> Option<FrameBuffer> {
+#[track_caller] pub(crate) fn panel_snapshot() -> Option<FrameBuffer> { // MENULOCK (B200) — `#[track_caller]` so a paint that takes the panel through this door is recorded as ITS OWN site, not this line. ⚠ SAME-LINE fold.
     if crate::arch::irqs_masked() {
         WRITER.try_lock().map(|fb| *fb)
     } else {
@@ -967,3 +967,175 @@ pub mod beam;
 // reasoned about.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod status;
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+// MENULOCK (rmbp-ledger B200) — A SPIN LOCK THAT KNOWS WHO HOLDS IT.
+//
+// Flight 12's menubar census moved `decl_lock` 0 -> 16 across the menubar fixture and the wire could
+// not say WHICH lock refused (the panel, `WRITER`; or the strip scratch, `strip::SCRATCH`) nor WHO
+// held it. Both are plain `spin::Mutex`es: nothing about a refused `try_lock` names the holder. This
+// type is that `spin::Mutex` plus a holder record written on every successful acquire and cleared on
+// release: the acquiring SITE (`#[track_caller]`, so every existing `WRITER.lock()` call site names
+// itself with no edit there), a caller-supplied TAG (the strip scratch sets its tenant), the CORE,
+// the acquire time in `arch::now_cycles()` units, and whether interrupts were MASKED at acquire — an
+// open (preemptible) holder can be descheduled with the lock held, a masked one cannot.
+//
+// The record is advisory and racy by construction (five relaxed words, written after the lock is
+// taken and cleared before it is released): a reader can see `site == 0` for a lock that is held —
+// printed `holder=released` — but can never see a site that did not hold the lock since the last
+// clear. The lock itself is untouched: `lock`, `try_lock` and the guard's release are `spin`'s.
+//
+// The core is recorded only once [`held_core_arm`] has run (the first strip paint): `WRITER` is taken
+// in `kernel_main` before the per-core block exists (`percpu::init_cpu`), and the core read is a
+// per-core self-lookup that is only valid after it. Before the arm, `core` reads `-`.
+// Tail-appended (B94): nothing above moves.
+// ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+/// MENULOCK — the core is recorded from this point on. See the block above.
+static HELD_CORE_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// MENULOCK — arm the core read. Called from `strip::paint` (the compositor era: every core that can
+/// take a panel lock by then has its per-core block).
+#[inline]
+pub(crate) fn held_core_arm() {
+    if !HELD_CORE_LIVE.load(Ordering::Relaxed) {
+        HELD_CORE_LIVE.store(true, Ordering::Relaxed);
+    }
+}
+
+/// MENULOCK — a `spin::Mutex` with a holder record. See the block above.
+pub struct HeldMutex<T> {
+    inner: Mutex<T>,
+    /// `&'static Location` of the acquiring call, as an address; `0` = free (or not yet recorded).
+    site: core::sync::atomic::AtomicUsize,
+    /// Caller-supplied tag, `0` = none. `strip` stores its tenant here.
+    tag: core::sync::atomic::AtomicUsize,
+    /// Holder core + 1; `0` = unrecorded.
+    core: core::sync::atomic::AtomicUsize,
+    /// `arch::now_cycles()` at acquire.
+    since: core::sync::atomic::AtomicU64,
+    /// Interrupts were masked when the holder acquired.
+    masked: AtomicBool,
+    /// Acquisitions made with interrupts ENABLED — the holds a timer tick can deschedule.
+    open_holds: core::sync::atomic::AtomicU64,
+}
+
+/// MENULOCK — one reading of a [`HeldMutex`]'s holder record.
+#[derive(Clone, Copy)]
+pub struct Holder {
+    pub site: Option<&'static core::panic::Location<'static>>,
+    pub tag: usize,
+    pub core: Option<usize>,
+    pub since_cyc: u64,
+    pub masked: bool,
+}
+
+/// MENULOCK — the guard: `spin`'s guard plus the record's release.
+pub struct HeldGuard<'a, T> {
+    lock: &'a HeldMutex<T>,
+    g: spin::MutexGuard<'a, T, spin::Spin>,
+}
+
+impl<T> HeldMutex<T> {
+    pub const fn new(v: T) -> HeldMutex<T> {
+        HeldMutex {
+            inner: Mutex::new(v),
+            site: core::sync::atomic::AtomicUsize::new(0),
+            tag: core::sync::atomic::AtomicUsize::new(0),
+            core: core::sync::atomic::AtomicUsize::new(0),
+            since: core::sync::atomic::AtomicU64::new(0),
+            masked: AtomicBool::new(false),
+            open_holds: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    fn note(&self, at: &'static core::panic::Location<'static>) {
+        let masked = crate::arch::irqs_masked();
+        if !masked {
+            self.open_holds.fetch_add(1, Ordering::Relaxed);
+        }
+        let core = if HELD_CORE_LIVE.load(Ordering::Relaxed) {
+            crate::arch::sched::meter_current_cpu() + 1
+        } else {
+            0
+        };
+        self.since.store(crate::arch::now_cycles(), Ordering::Relaxed);
+        self.core.store(core, Ordering::Relaxed);
+        self.masked.store(masked, Ordering::Relaxed);
+        self.tag.store(0, Ordering::Relaxed);
+        self.site.store(at as *const _ as usize, Ordering::Release);
+    }
+
+    /// `spin::Mutex::lock`, recording the caller as the holder.
+    #[track_caller]
+    #[inline]
+    pub fn lock(&self) -> HeldGuard<'_, T> {
+        let at = core::panic::Location::caller();
+        let g = self.inner.lock();
+        self.note(at);
+        HeldGuard { lock: self, g }
+    }
+
+    /// `spin::Mutex::try_lock`, recording the caller as the holder on success.
+    #[track_caller]
+    #[inline]
+    pub fn try_lock(&self) -> Option<HeldGuard<'_, T>> {
+        let at = core::panic::Location::caller();
+        let g = self.inner.try_lock()?;
+        self.note(at);
+        Some(HeldGuard { lock: self, g })
+    }
+
+    /// The holder record as it stands (advisory — see the block above).
+    pub fn holder(&self) -> Holder {
+        let site = self.site.load(Ordering::Acquire);
+        let core = self.core.load(Ordering::Relaxed);
+        Holder {
+            // SAFETY: a non-zero `site` is only ever stored from a `&'static Location` in `note`.
+            site: if site == 0 { None } else { Some(unsafe { &*(site as *const core::panic::Location<'static>) }) },
+            tag: self.tag.load(Ordering::Relaxed),
+            core: if core == 0 { None } else { Some(core - 1) },
+            since_cyc: self.since.load(Ordering::Relaxed),
+            masked: self.masked.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Acquisitions made with interrupts enabled, lifetime.
+    pub fn open_holds(&self) -> u64 {
+        self.open_holds.load(Ordering::Relaxed)
+    }
+}
+
+impl<'a, T> HeldGuard<'a, T> {
+    /// Tag this hold (e.g. the strip tenant that took the scratch). `0` is "none".
+    #[inline]
+    pub fn tag(&self, t: usize) {
+        self.lock.tag.store(t, Ordering::Relaxed);
+    }
+}
+
+impl<T> core::ops::Deref for HeldGuard<'_, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.g
+    }
+}
+
+impl<T> core::ops::DerefMut for HeldGuard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.g
+    }
+}
+
+impl<T> Drop for HeldGuard<'_, T> {
+    /// Clear the record BEFORE `spin` releases (`g` drops after this body), so the next holder's
+    /// record can never be overwritten by this one's clear.
+    #[inline]
+    fn drop(&mut self) {
+        self.lock.site.store(0, Ordering::Release);
+        self.lock.tag.store(0, Ordering::Relaxed);
+    }
+}

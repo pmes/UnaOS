@@ -1055,8 +1055,8 @@ pub fn compose() -> bool {
     let t0 = crate::arch::now_cycles();
     let (pw, ph) = {
         // LOCKFIX B1 — WAS `let fb = *super::WRITER.lock();` plus a separate `is_ready` arm; the `dock::compose` twin verbatim, and the same reason: this is the menubar's PRESENT TAIL, it runs MASKED inside `wcg`'s composite chain, and the WEDGE-8 rule forbids waiting on a lock from a context that cannot be preempted. `panel_snapshot` is LOCKFIX's PAINT-path door — still BLOCKING when interrupts are enabled, so the uncontended path is unchanged — and `.filter(is_ready)` folds the old readiness arm into the same `else`, so a held panel declines exactly the way an unready surface always has (ledger the pass, return `false`; the bar's signature stays unmatched and the next composite repaints it). No counter, no new print: LAWS §1(e). ⚠ LINE-NEUTRAL: 5 lines out, 5 in.
-        let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) else {
-            LEDGER.pass(crate::arch::now_cycles().saturating_sub(t0));
+        let snap = super::panel_snapshot(); let Some(fb) = snap.filter(|f| f.is_ready()) else { // MENULOCK (B200) — `snap` kept so a REFUSAL is told from a not-ready surface. ⚠ SAME-LINE fold.
+            LEDGER.pass(crate::arch::now_cycles().saturating_sub(t0)); if snap.is_none() { strip::panel_declined("menubar"); } // MENULOCK — this refusal returned UNCOUNTED before (no census, no line); now counted under `decl_lock` and named like `strip::paint`'s. ⚠ SAME-LINE fold.
             return false;
         };
         (fb.width(), fb.height())

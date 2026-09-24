@@ -346,7 +346,7 @@ struct Scratch {
     raw: [u32; MAX_STRIP_W],
 }
 
-static SCRATCH: spin::Mutex<Scratch> = spin::Mutex::new(Scratch {
+static SCRATCH: super::HeldMutex<Scratch> = super::HeldMutex::new(Scratch { // MENULOCK (B200) — WAS `spin::Mutex`; the same lock plus a holder record, so a refused paint names who holds it (`super::HeldMutex`). ⚠ SAME-LINE fold.
     log: [0; MAX_STRIP_W],
     raw: [0; MAX_STRIP_W],
 });
@@ -374,7 +374,7 @@ pub fn paint(name: &str, r: Rect, mut compose_row: impl FnMut(&mut [u32], usize)
     if w == 0 || h == 0 || w > MAX_STRIP_W {
         return bar_decline(name, DECL_GEOM); // TEARSCOPE — counted, still `false`
     }
-    let Some(fb) = super::panel_snapshot() else { return bar_decline(name, DECL_LOCK); }; // LOCKFIX B1 — WAS `*super::WRITER.lock()`, a BLOCKING acquire, and this primitive runs in the PRESENT TAIL with interrupts MASKED (`wcg`'s composite chain), which is the one context the WEDGE-8 rule forbids waiting in: a masked waiter can neither be preempted nor take a timer tick, so it is the F4 death outright. `panel_snapshot` is LOCKFIX's PAINT-path door (`video/mod.rs`) and keeps the uncontended path byte-for-byte what it was — it BLOCKS when interrupts are enabled, exactly as this line always did, and only `try_lock`s when masked. A refusal is a contended LEAF lock, which is precisely what `DECL_LOCK` already counts and what `decl_lock=` in this file's own `scope=bar` rollup already prints, so no counter, no array widening and no new per-pass print is added (LAWS §1(e)). The decline is the one this primitive already owes on contention: `false`, signature still unmatched, the next composite pass repaints. ⚠ LINE-NEUTRAL: 1 line out, 1 line in.
+    super::held_core_arm(); let Some(fb) = super::panel_snapshot() else { return lock_decline(name, LOCK_PANEL); }; // MENULOCK (B200): the panel refusal is counted AS BEFORE and now NAMED (`lock_decline`, file tail); ⚠ SAME-LINE fold. LOCKFIX B1 — WAS `*super::WRITER.lock()`, a BLOCKING acquire, and this primitive runs in the PRESENT TAIL with interrupts MASKED (`wcg`'s composite chain), which is the one context the WEDGE-8 rule forbids waiting in: a masked waiter can neither be preempted nor take a timer tick, so it is the F4 death outright. `panel_snapshot` is LOCKFIX's PAINT-path door (`video/mod.rs`) and keeps the uncontended path byte-for-byte what it was — it BLOCKS when interrupts are enabled, exactly as this line always did, and only `try_lock`s when masked. A refusal is a contended LEAF lock, which is precisely what `DECL_LOCK` already counts and what `decl_lock=` in this file's own `scope=bar` rollup already prints, so no counter, no array widening and no new per-pass print is added (LAWS §1(e)). The decline is the one this primitive already owes on contention: `false`, signature still unmatched, the next composite pass repaints. ⚠ LINE-NEUTRAL: 1 line out, 1 line in.
     if !fb.is_ready() {
         return bar_decline(name, DECL_READY); // TEARSCOPE
     }
@@ -397,8 +397,8 @@ pub fn paint(name: &str, r: Rect, mut compose_row: impl FnMut(&mut [u32], usize)
     }
     let Some(mut s) = SCRATCH.try_lock() else {
         // contended: the next pass repaints (the signature is still unmatched).
-        return bar_decline(name, DECL_LOCK); // TEARSCOPE
-    };
+        return lock_decline(name, LOCK_SCRATCH); // TEARSCOPE — MENULOCK (B200): counted as before, and named
+    }; s.tag(bar_slot(name) + 1); // MENULOCK — the scratch's holder record names this TENANT, not just this line. ⚠ SAME-LINE fold.
 
     // CURSOR — take the arrow off the panel before the first byte lands. `wm::erase`'s bracket, and
     // for its reason: without it these rows would overwrite the sprite and the save-under would later
@@ -460,7 +460,7 @@ pub fn erase_rect(r: Rect) -> bool {
     if w == 0 || h == 0 || w > MAX_STRIP_W {
         return false;
     }
-    let Some(fb) = super::panel_snapshot() else { return false; }; // LOCKFIX B1 — the `erase_rect` twin of the acquire in `paint` above, same door and same reason: this runs from the composite tail (`crystal::compose`'s vacate arm calls it MASKED) and a blocking wait there is the F4 death. UNCOUNTED on purpose, unlike `paint`'s: `erase_rect` has no `name` and no census row — it is the raw primitive under `vacate`, and `vacate` IS the counted wrapper (`strip::vacate` = this plus the census, as `menubar::compose` states at its own call). Adding a census here would double-count every vacate the wrapper already records. The refusal returns the `false` every other decline in this function returns, which callers already read as "still owed, still in the slot — the next pass retries" (`crystal::compose`'s erase arm says exactly that). ⚠ LINE-NEUTRAL: 1 line out, 1 line in.
+    let Some(fb) = super::panel_snapshot() else { return erase_declined(LOCK_PANEL); }; // MENULOCK (B200) — still `false`, now named once per holder. LOCKFIX B1 — the `erase_rect` twin of the acquire in `paint` above, same door and same reason: this runs from the composite tail (`crystal::compose`'s vacate arm calls it MASKED) and a blocking wait there is the F4 death. UNCOUNTED on purpose, unlike `paint`'s: `erase_rect` has no `name` and no census row — it is the raw primitive under `vacate`, and `vacate` IS the counted wrapper (`strip::vacate` = this plus the census, as `menubar::compose` states at its own call). Adding a census here would double-count every vacate the wrapper already records. The refusal returns the `false` every other decline in this function returns, which callers already read as "still owed, still in the slot — the next pass retries" (`crystal::compose`'s erase arm says exactly that). ⚠ LINE-NEUTRAL: 1 line out, 1 line in.
     if !fb.is_ready() || !fb.word4() {
         return false;
     }
@@ -470,8 +470,8 @@ pub fn erase_rect(r: Rect) -> bool {
     }
     let (w, h) = (w.min(info.width - x), h.min(info.height - y));
     let Some(mut s) = SCRATCH.try_lock() else {
-        return false;
-    };
+        return erase_declined(LOCK_SCRATCH); // MENULOCK (B200) — still `false`, now named once per holder
+    }; s.tag(TAG_ERASE); // MENULOCK — ⚠ SAME-LINE fold
     super::cursor::undraw();
     let raw = fb.encode4(wm::DESKTOP_BG).unwrap_or(0);
     for i in 0..w {
@@ -1438,7 +1438,7 @@ fn bar_rollup_one(k: usize) {
         c.restored_px.load(Ordering::Relaxed),
         FRAME_US,
         verdict
-    );
+    ); lock_rollup(k); // MENULOCK (B200) — the lock-decline rollup rides this tenant's own cadence, one sibling line, only when its lock declines moved (`lock_rollup`, file tail). ⚠ SAME-LINE fold.
 }
 
 const _: () = {
@@ -1674,4 +1674,243 @@ pub fn login_press_fixture(name: &[u8], password: &[u8]) -> bool {
 #[cfg(feature = "witness")]
 pub fn bar_decl_lock(name: &str) -> u64 {
     BARS[bar_slot(name)].decl[DECL_LOCK].load(Ordering::Relaxed)
+}
+
+// =================================================================================================
+// MENULOCK (rmbp-ledger B200) — EVERY LEAF-LOCK DECLINE NAMES ITS LOCK AND ITS HOLDER
+// =================================================================================================
+//
+// Flight 12 (`hw-rmbp@6d8d3d2d`): `[strip] rollup tenant=menubar … decl_lock=16`, 0 at 48481 ms and
+// 16 at 53483 ms and never again all boot, and the wire could not say WHICH lock refused nor WHO
+// held it. [`paint`] declines on exactly two leaf locks and both now go through [`lock_decline`]:
+//
+//  * `lock=panel` — `video::WRITER`, refused by `panel_snapshot` ONLY when the caller runs MASKED
+//    (an open caller blocks on it instead, so a fixture driving `compose` from a task can never be
+//    refused here); a `spin::Mutex` taken with `lock`/`try_lock` at ~120 sites, nearly all of them
+//    copy-out (`*WRITER.lock()`, the guard dropped in the same statement).
+//  * `lock=strip-scratch` — [`SCRATCH`], a `spin::Mutex` taken ONLY by `try_lock` in [`paint`] and
+//    [`erase_rect`] and held for one strip's compose + blit + flush, INCLUDING the beam hold
+//    (`beam::hold`, which spins with the scratch held on a board that can see its raster).
+//
+// Both are now `video::HeldMutex`, which records the acquiring site, a tag (the scratch's is the
+// TENANT), the core, the acquire time and whether the holder was masked. A decline reads that record
+// and prints ONE line per (decliner, lock, holder) pair — the `[wc-d]` latch shape, never a line per
+// pass — and the COUNT rides a sibling line on the tenant's own rollup cadence ([`lock_rollup`]).
+//
+//   [menubar] paint-declined lock=strip-scratch holder=strip:dock site=<file>:<line> core=7 irq=masked since_us=312 n=1 -> NAMED
+//   [menubar] paint-declined rollup panel=0 strip-scratch=16 released=0 pairs=1 unlatched=0 scratch_open_holds=<n> erase_panel=0 erase_scratch=1 -> HELD
+//
+// `holder=released` (`-> UNHELD`) is the honest race: the holder let go between the refused
+// `try_lock` and the record read. `scratch_open_holds` counts scratch holds taken with interrupts
+// ENABLED — a hold a timer tick can deschedule, so the one kind that can outlast a single paint.
+// Tail-appended (B94): nothing above moves.
+
+/// MENULOCK — which leaf lock refused. Indexes [`LOCK_NAMES`].
+const LOCK_PANEL: usize = 0;
+/// MENULOCK — see [`LOCK_PANEL`].
+const LOCK_SCRATCH: usize = 1;
+/// MENULOCK — how many leaf locks [`paint`] can be refused on.
+const LOCK_KINDS: usize = 2;
+/// MENULOCK — the wire words, in lock order.
+const LOCK_NAMES: [&str; LOCK_KINDS] = ["panel", "strip-scratch"];
+
+/// MENULOCK — the scratch tag [`erase_rect`] holds under (tenants are `slot + 1`, so 1..=BAR_SLOTS).
+const TAG_ERASE: usize = 0x40;
+/// MENULOCK — the scratch tag the lock-check fixture holds under.
+const TAG_LOCKCHECK: usize = 0x41;
+
+/// MENULOCK — per-tenant, per-lock decline totals (monotone; a rollup is a snapshot).
+static LOCKDECL: [[AtomicU64; LOCK_KINDS]; BAR_SLOTS] =
+    [const { [const { AtomicU64::new(0) }; LOCK_KINDS] }; BAR_SLOTS];
+/// MENULOCK — declines whose holder record read empty (the holder released inside the race window).
+static LOCK_RELEASED: [AtomicU64; BAR_SLOTS] = [const { AtomicU64::new(0) }; BAR_SLOTS];
+/// MENULOCK — this tenant's lock-decline total at its last rollup line (the delta gate).
+static LOCK_SAID: [AtomicU64; BAR_SLOTS] = [const { AtomicU64::new(0) }; BAR_SLOTS];
+/// MENULOCK — the tag / site of the LAST holder a decline of this tenant read (the fixture's probe).
+static LAST_HOLDER_TAG: [core::sync::atomic::AtomicUsize; BAR_SLOTS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; BAR_SLOTS];
+/// MENULOCK — see [`LAST_HOLDER_TAG`].
+static LAST_HOLDER_SITE: [core::sync::atomic::AtomicUsize; BAR_SLOTS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; BAR_SLOTS];
+/// MENULOCK — [`erase_rect`]'s leaf-lock refusals, per lock (it has no tenant; `vacate` is its census).
+static ERASE_DECL: [AtomicU64; LOCK_KINDS] = [const { AtomicU64::new(0) }; LOCK_KINDS];
+
+/// MENULOCK — the latch: one line per distinct (decliner, lock, holder). 32 pairs is far above any
+/// capture read so far; a pair past the table is COUNTED (`unlatched=`), never printed.
+const LATCH_N: usize = 32;
+static LATCH: [AtomicU64; LATCH_N] = [const { AtomicU64::new(0) }; LATCH_N];
+static LATCH_OVER: AtomicU64 = AtomicU64::new(0);
+
+/// MENULOCK — `true` iff `key` was not latched before (and now is).
+fn latch(key: u64) -> bool {
+    let key = key | 1;
+    let mut i = 0;
+    while i < LATCH_N {
+        let v = LATCH[i].load(Ordering::Relaxed);
+        if v == key {
+            return false;
+        }
+        if v == 0 {
+            match LATCH[i].compare_exchange(0, key, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(cur) if cur == key => return false,
+                Err(_) => {}
+            }
+        }
+        i += 1;
+    }
+    LATCH_OVER.fetch_add(1, Ordering::Relaxed);
+    false
+}
+
+/// MENULOCK — pairs latched so far.
+fn latched() -> usize {
+    LATCH.iter().filter(|v| v.load(Ordering::Relaxed) != 0).count()
+}
+
+/// MENULOCK — the pair key: FNV-1a over (scope, lock, holder site, holder tag). The CORE is left out
+/// on purpose: the same holder on another core is the same finding, and keying it would multiply the
+/// lines by the core count.
+fn holder_key(scope: u64, lock: usize, h: &super::Holder) -> u64 {
+    let site = h.site.map(|l| l as *const _ as u64).unwrap_or(0);
+    let mut x: u64 = 0xcbf2_9ce4_8422_2325;
+    for w in [scope, lock as u64, site, h.tag as u64] {
+        x ^= w;
+        x = x.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    x
+}
+
+/// MENULOCK — the holder record of leaf lock `lock`.
+fn holder_of(lock: usize) -> super::Holder {
+    if lock == LOCK_PANEL { super::WRITER.holder() } else { SCRATCH.holder() }
+}
+
+/// MENULOCK — the word a scratch tag names, or `None` for an untagged hold.
+fn tag_word(tag: usize) -> Option<&'static str> {
+    match tag {
+        t if t >= 1 && t <= BAR_SLOTS => Some(BAR_NAMES[t - 1]),
+        TAG_ERASE => Some("erase"),
+        TAG_LOCKCHECK => Some("lock-check"),
+        _ => None,
+    }
+}
+
+/// MENULOCK — `holder=`: `released`, `strip:<tag>` for a tagged hold, else the acquiring site.
+struct Who(super::Holder);
+impl core::fmt::Display for Who {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match (self.0.site, tag_word(self.0.tag)) {
+            (None, _) => f.write_str("released"),
+            (Some(_), Some(w)) => write!(f, "strip:{}", w),
+            (Some(l), None) => write!(f, "{}:{}", l.file(), l.line()),
+        }
+    }
+}
+
+/// MENULOCK — `site=` / `core=` fields: the value, or `-`.
+struct Site(Option<&'static core::panic::Location<'static>>);
+impl core::fmt::Display for Site {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(l) => write!(f, "{}:{}", l.file(), l.line()),
+            None => f.write_str("-"),
+        }
+    }
+}
+struct Core(Option<usize>);
+impl core::fmt::Display for Core {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(c) => write!(f, "{}", c),
+            None => f.write_str("-"),
+        }
+    }
+}
+
+/// MENULOCK — how long the holder had held at this instant, µs; `0` for a released record.
+fn held_us(h: &super::Holder) -> u64 {
+    if h.site.is_none() {
+        return 0;
+    }
+    cycles_to_us(crate::arch::now_cycles().saturating_sub(h.since_cyc))
+}
+
+/// MENULOCK — a [`paint`] refused on leaf lock `lock`: counted exactly as before (`DECL_LOCK`, via
+/// [`bar_decline`]) AND named — the holder read, the pair latched, the first sighting printed.
+/// Returns the `false` [`paint`] was already returning.
+fn lock_decline(name: &str, lock: usize) -> bool {
+    let k = bar_slot(name);
+    let h = holder_of(lock);
+    let n = LOCKDECL[k][lock].fetch_add(1, Ordering::Relaxed) + 1;
+    if h.site.is_none() {
+        LOCK_RELEASED[k].fetch_add(1, Ordering::Relaxed);
+    }
+    LAST_HOLDER_TAG[k].store(h.tag, Ordering::Relaxed);
+    LAST_HOLDER_SITE[k].store(h.site.map(|l| l as *const _ as usize).unwrap_or(0), Ordering::Relaxed);
+    if latch(holder_key(k as u64 + 1, lock, &h)) {
+        serial_println!(
+            "[{}] paint-declined lock={} holder={} site={} core={} irq={} since_us={} n={} -> {}",
+            name,
+            LOCK_NAMES[lock],
+            Who(h),
+            Site(h.site),
+            Core(h.core),
+            if h.site.is_none() { "-" } else if h.masked { "masked" } else { "open" },
+            held_us(&h),
+            n,
+            if h.site.is_none() { "UNHELD" } else { "NAMED" }
+        );
+    }
+    bar_decline(name, DECL_LOCK)
+}
+
+/// MENULOCK — the same, for [`erase_rect`] (no tenant: `vacate` is its census). Always `false`.
+fn erase_declined(lock: usize) -> bool {
+    let h = holder_of(lock);
+    let n = ERASE_DECL[lock].fetch_add(1, Ordering::Relaxed) + 1;
+    if latch(holder_key(0, lock, &h)) {
+        serial_println!(
+            "[strip] erase-declined lock={} holder={} site={} core={} irq={} since_us={} n={} -> {}",
+            LOCK_NAMES[lock],
+            Who(h),
+            Site(h.site),
+            Core(h.core),
+            if h.site.is_none() { "-" } else if h.masked { "masked" } else { "open" },
+            held_us(&h),
+            n,
+            if h.site.is_none() { "UNHELD" } else { "NAMED" }
+        );
+    }
+    false
+}
+
+/// MENULOCK — a leaf-lock refusal taken OUTSIDE [`paint`]: `menubar::compose`'s own panel read, which
+/// returned `false` UNCOUNTED before this arc (its pass declined with no census line at all). Counted
+/// under `DECL_LOCK` and named exactly as [`paint`]'s. Returns `false`.
+pub fn panel_declined(name: &str) -> bool {
+    lock_decline(name, LOCK_PANEL)
+}
+
+/// MENULOCK — this tenant's lock-decline rollup, a sibling of its `scope=bar` line and on the same
+/// cadence (called from [`bar_rollup_one`] after that line), printed only when its count moved.
+fn lock_rollup(k: usize) {
+    let p = LOCKDECL[k][LOCK_PANEL].load(Ordering::Relaxed);
+    let s = LOCKDECL[k][LOCK_SCRATCH].load(Ordering::Relaxed);
+    let tot = p + s;
+    if tot == 0 || LOCK_SAID[k].swap(tot, Ordering::Relaxed) == tot {
+        return;
+    }
+    serial_println!(
+        "[{}] paint-declined rollup panel={} strip-scratch={} released={} pairs={} unlatched={} scratch_open_holds={} erase_panel={} erase_scratch={} -> HELD",
+        BAR_NAMES[k],
+        p,
+        s,
+        LOCK_RELEASED[k].load(Ordering::Relaxed),
+        latched(),
+        LATCH_OVER.load(Ordering::Relaxed),
+        SCRATCH.open_holds(),
+        ERASE_DECL[LOCK_PANEL].load(Ordering::Relaxed),
+        ERASE_DECL[LOCK_SCRATCH].load(Ordering::Relaxed)
+    );
 }
