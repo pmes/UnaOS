@@ -95,6 +95,28 @@ const ST_CONFIGURED: u8 = 2; // Configure-Endpoint completed; class bring-up pen
 const ST_UP: u8 = 3; // bring-up done; frames move
 const ST_FAILED: u8 = 4; // bring-up refused; stays down, logged once
 
+/// Which front-end the candidate is. ECM is the class driver; AX88179 is the vendor front-end for
+/// Peter's dongles (`0b95:1790` AX88179B, `0b95:178a` AX88179/178A): a vendor-specific interface
+/// (class 0xFF) with the same bulk pair, register access over vendor control requests
+/// (bRequest 0x01 = MAC/register space, 0x02 = PHY; bmRequestType 0x40 write / 0xC0 read; wValue =
+/// register, wIndex = byte count), a packet TRAILER on every bulk-IN transfer and an 8-byte header on
+/// every bulk-OUT frame. The register map and the framing are the part's, as ASIX documents them and
+/// as the Linux `ax88179_178a` driver (GPL, this tree's own licence) uses them — see `ax::*`. BUILT
+/// FROM THAT MAP, NOT YET FLOWN: QEMU has no model of the part, so every constant below is confirmed
+/// on the bench with the dongle (the owed rung of SO56), and the wire says `kind=ax88179` so a
+/// reading is never mistaken for ECM's.
+pub const KIND_ECM: u8 = 1;
+pub const KIND_AX88179: u8 = 2;
+static KIND: AtomicU8 = AtomicU8::new(0);
+static VID: AtomicU16 = AtomicU16::new(0);
+static PID: AtomicU16 = AtomicU16::new(0);
+pub fn kind() -> u8 { KIND.load(Ordering::Relaxed) }
+pub fn kind_name() -> &'static str {
+    match KIND.load(Ordering::Relaxed) { KIND_ECM => "ecm", KIND_AX88179 => "ax88179", _ => "none" }
+}
+fn is_ax_part(vid: u16, pid: u16) -> bool {
+    vid == 0x0b95 && (pid == 0x1790 || pid == 0x178a)
+}
 static STATE: AtomicU8 = AtomicU8::new(ST_ABSENT);
 static SLOT: AtomicU8 = AtomicU8::new(0);
 static NUM_CONFIGS: AtomicU8 = AtomicU8::new(0);
@@ -175,12 +197,15 @@ static TXQ: Mutex<FrameRing> = Mutex::new(FrameRing::new());
 /// The device descriptor arrived for `slot`. Remembers `bNumConfigurations` (byte 17) so a walk that
 /// finds no ECM in configuration 0 knows whether there is a configuration 1 to ask for. Only a device
 /// that is not already the link is considered (one dongle per boot in this rung, like the FTDI).
-pub fn note_device(slot: u8, dev_class: u8, num_configs: u8) {
+pub fn note_device(slot: u8, dev_class: u8, num_configs: u8, vid: u16, pid: u16) {
     if STATE.load(Ordering::Relaxed) >= ST_CONFIGURED {
         return;
     }
     let _ = dev_class;
     SLOT.store(slot, Ordering::Relaxed);
+    VID.store(vid, Ordering::Relaxed);
+    PID.store(pid, Ordering::Relaxed);
+    KIND.store(0, Ordering::Relaxed);
     NUM_CONFIGS.store(num_configs, Ordering::Relaxed);
     CFG_INDEX.store(0, Ordering::Relaxed);
     CTRL_SEEN.store(false, Ordering::Relaxed);
@@ -193,7 +218,7 @@ pub fn note_device(slot: u8, dev_class: u8, num_configs: u8) {
 /// enumerator only walks class 0x00 (composite). Called on the same line as that test.
 #[inline]
 pub fn device_class_wants_walk(dev_class: u8) -> bool {
-    dev_class == 0x02
+    dev_class == 0x02 || (dev_class == 0xFF && is_ax_part(VID.load(Ordering::Relaxed), PID.load(Ordering::Relaxed)))
 }
 
 /// The configuration descriptor header arrived: `bConfigurationValue` is byte 5. Resets the
@@ -219,12 +244,22 @@ pub fn note_interface(slot: u8, iface: u8, alt: u8, class: u8, sub: u8, proto: u
         CTRL_IFACE.store(iface, Ordering::Relaxed);
         return false;
     }
+    if class == 0xFF && is_ax_part(VID.load(Ordering::Relaxed), PID.load(Ordering::Relaxed)) {
+        // The AX88179's one interface: vendor-specific, bulk IN + bulk OUT + interrupt IN, alt 0.
+        KIND.store(KIND_AX88179, Ordering::Relaxed);
+        CTRL_IFACE.store(iface, Ordering::Relaxed);
+        DATA_IFACE.store(iface, Ordering::Relaxed);
+        DATA_ALT.store(alt, Ordering::Relaxed);
+        STATE.store(ST_CANDIDATE, Ordering::Relaxed);
+        return true;
+    }
     // RNDIS control interface: 0x02/0x02/0xFF (CDC ACM-shaped) or 0xE0/0x01/0x03 (Wireless, RNDIS).
     if (class == 0x02 && sub == 0x02 && proto == 0xFF) || (class == 0xE0 && sub == 0x01 && proto == 0x03) {
         RNDIS_SEEN.store(true, Ordering::Relaxed);
         return false;
     }
     if class == 0x0A && CTRL_SEEN.load(Ordering::Relaxed) {
+        KIND.store(KIND_ECM, Ordering::Relaxed);
         DATA_IFACE.store(iface, Ordering::Relaxed);
         DATA_ALT.store(alt, Ordering::Relaxed);
         STATE.store(ST_CANDIDATE, Ordering::Relaxed);
@@ -274,8 +309,8 @@ pub fn taken(slot: u8, in_mps: u16, out_mps: u16) {
     IN_MPS.store(in_mps, Ordering::Relaxed);
     OUT_MPS.store(out_mps, Ordering::Relaxed);
     serial_println!(
-        ":: USBNET: ecm candidate slot={} cfg={} ctrl={} data={} alt={} imac={} mss={} in_mps={} out_mps={} ::",
-        slot, CFG_VALUE.load(Ordering::Relaxed), CTRL_IFACE.load(Ordering::Relaxed),
+        ":: USBNET: candidate kind={} slot={} vidpid={:04x}:{:04x} cfg={} ctrl={} data={} alt={} imac={} mss={} in_mps={} out_mps={} ::",
+        kind_name(), slot, VID.load(Ordering::Relaxed), PID.load(Ordering::Relaxed), CFG_VALUE.load(Ordering::Relaxed), CTRL_IFACE.load(Ordering::Relaxed),
         DATA_IFACE.load(Ordering::Relaxed), DATA_ALT.load(Ordering::Relaxed), IMAC_IDX.load(Ordering::Relaxed),
         MSS.load(Ordering::Relaxed), in_mps, out_mps
     );
@@ -334,8 +369,8 @@ pub fn set_up(slot: u8, filter_ok: bool, failed_at: Option<&'static str>) {
         None => {
             STATE.store(ST_UP, Ordering::Relaxed);
             serial_println!(
-                ":: USBNET: up slot={} cfg={} ctrl={} data={} alt={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} filter={} -> PASS ::",
-                slot, CFG_VALUE.load(Ordering::Relaxed), CTRL_IFACE.load(Ordering::Relaxed),
+                ":: USBNET: up kind={} slot={} cfg={} ctrl={} data={} alt={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} filter={} -> PASS ::",
+                kind_name(), slot, CFG_VALUE.load(Ordering::Relaxed), CTRL_IFACE.load(Ordering::Relaxed),
                 DATA_IFACE.load(Ordering::Relaxed), DATA_ALT.load(Ordering::Relaxed),
                 m[0], m[1], m[2], m[3], m[4], m[5], if filter_ok { "ok" } else { "refused" }
             );
@@ -344,7 +379,7 @@ pub fn set_up(slot: u8, filter_ok: bool, failed_at: Option<&'static str>) {
         }
         Some(why) => {
             STATE.store(ST_FAILED, Ordering::Relaxed);
-            serial_println!(":: USBNET: bring-up slot={} refused at {} -> FAIL ::", slot, why);
+            serial_println!(":: USBNET: bring-up kind={} slot={} refused at {} -> FAIL ::", kind_name(), slot, why);
         }
     }
 }
@@ -514,6 +549,94 @@ pub const STATIC_IP: [u8; 4] = [10, 0, 2, 15];
 /// The e1000-shaped triple: (MAC, static IP, link up). `None` until the link is up.
 pub fn hw_addr() -> Option<([u8; 6], [u8; 4], bool)> {
     if is_up() { Some((mac(), STATIC_IP, true)) } else { None }
+}
+
+/// AX88179: the station address straight from the NODE_ID register read (6 bytes).
+pub fn set_mac_bytes(m: &[u8]) -> bool {
+    if m.len() < 6 || m.iter().take(6).all(|&b| b == 0) {
+        return false;
+    }
+    for i in 0..6 {
+        MAC[i].store(m[i], Ordering::Relaxed);
+    }
+    true
+}
+
+/// The AX88179's register map and framing, as the part documents them (see the `KIND` note).
+pub mod ax {
+    pub const REQ_MAC: u8 = 0x01; // register space: wValue = reg, wIndex = byte count
+    pub const REQ_PHY: u8 = 0x02; // PHY: wValue = phy id, wIndex = mii reg, 2 bytes
+    pub const PHY_ID: u16 = 0x03;
+    pub const REG_PHYSICAL_LINK_STATUS: u16 = 0x02; // 8-bit: 0x04 SS, 0x02 HS, 0x01 FS
+    pub const REG_RX_CTL: u16 = 0x0b; // 16-bit
+    pub const REG_NODE_ID: u16 = 0x10; // 6 bytes
+    pub const REG_MEDIUM_STATUS_MODE: u16 = 0x22; // 16-bit
+    pub const REG_MONITOR_MODE: u16 = 0x24; // 8-bit
+    pub const REG_PHYPWR_RSTCTL: u16 = 0x26; // 16-bit
+    pub const REG_RX_BULKIN_QCTRL: u16 = 0x2e; // 5 bytes
+    pub const REG_CLK_SELECT: u16 = 0x33; // 8-bit
+    pub const REG_RXCOE_CTL: u16 = 0x34; // 8-bit
+    pub const REG_TXCOE_CTL: u16 = 0x35; // 8-bit
+    pub const REG_PAUSE_WATERLVL_HIGH: u16 = 0x54; // 8-bit
+    pub const REG_PAUSE_WATERLVL_LOW: u16 = 0x55; // 8-bit
+    pub const PHYPWR_IPRL: u16 = 0x0020;
+    pub const CLK_ACS_BCS: u8 = 0x03;
+    /// DROPCRCERR 0x0100 | IPE 0x0200 (2-byte IP alignment pad on RX) | START 0x0080 | AP 0x0020 |
+    /// AB 0x0008 | AMALL 0x0002.
+    pub const RX_CTL_RUN: u16 = 0x03aa;
+    pub const RX_CTL_STOP: u16 = 0x0000;
+    /// RECEIVE_EN 0x0100 | TXFLOW 0x0020 | RXFLOW 0x0010 | EN_125MHZ 0x0008 | ALWAYS_ONE 0x0004 |
+    /// FULL_DUPLEX 0x0002 | GIGAMODE 0x0001.
+    pub const MEDIUM_RUN: u16 = 0x013f;
+    pub const BMCR_ANEG_RESTART: u16 = 0x1200;
+    /// Bulk-IN queue control by USB speed (the part's aggregation timer/size tuple).
+    pub const BULKIN_QCTRL_SS: [u8; 5] = [0x07, 0x4f, 0x00, 0x12, 0xff];
+    pub const BULKIN_QCTRL_HS: [u8; 5] = [0x07, 0x20, 0x03, 0x16, 0xff];
+    /// TX header: two little-endian u32 — [0] = frame length, [1] = flags; bit 31|15 (0x80008000)
+    /// asks the part to pad when the transfer would otherwise end exactly on a max packet.
+    pub const TX_HDR_LEN: usize = 8;
+    pub const TX_PAD_FLAG: u32 = 0x8000_8000;
+    /// Per-packet header bits inside the RX trailer.
+    pub const RXHDR_CRC_ERR: u32 = 1 << 29;
+    pub const RXHDR_DROP_ERR: u32 = 1 << 31;
+    pub const RX_PAD: usize = 2; // the IPE alignment pad ahead of every frame
+}
+
+/// AX88179 receive: one bulk-IN transfer carries N frames and a trailer. The last 4 bytes are the
+/// transfer header (`pkt_cnt` low 16, `hdr_off` high 16); at `hdr_off` sit `pkt_cnt` little-endian
+/// u32 packet headers, each with the packet length in bits 16..29 (2 pad bytes + the frame); packets
+/// start at 0 and each occupies `(len + 7) & !7` bytes. Bad geometry is counted and the transfer
+/// dropped whole; a per-packet CRC/DROP flag drops that packet only.
+pub fn deliver_ax(buf: &[u8]) {
+    let n = buf.len();
+    if n < 4 {
+        return; // ZLP / nothing
+    }
+    let rx_hdr = u32::from_le_bytes([buf[n - 4], buf[n - 3], buf[n - 2], buf[n - 1]]);
+    let pkt_cnt = (rx_hdr & 0xffff) as usize;
+    let hdr_off = (rx_hdr >> 16) as usize;
+    if pkt_cnt == 0 || hdr_off + pkt_cnt * 4 > n - 4 {
+        ERRORS.fetch_add(1, Ordering::Relaxed);
+        RX_DROP.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let mut off = 0usize;
+    for i in 0..pkt_cnt {
+        let h = hdr_off + i * 4;
+        let pkt_hdr = u32::from_le_bytes([buf[h], buf[h + 1], buf[h + 2], buf[h + 3]]);
+        let pkt_len = ((pkt_hdr >> 16) & 0x1fff) as usize;
+        if pkt_len < ax::RX_PAD + 14 || off + pkt_len > hdr_off {
+            ERRORS.fetch_add(1, Ordering::Relaxed);
+            RX_DROP.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if pkt_hdr & (ax::RXHDR_CRC_ERR | ax::RXHDR_DROP_ERR) == 0 {
+            deliver(&buf[off + ax::RX_PAD..off + pkt_len]);
+        } else {
+            RX_DROP.fetch_add(1, Ordering::Relaxed);
+        }
+        off += (pkt_len + 7) & !7;
+    }
 }
 
 fn rollup() {

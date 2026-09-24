@@ -942,11 +942,26 @@ lease **10.0.2.30** (the link's own netdev range — the proof the lease did not
 SOCK-1 4/4, SOCK-2 UDP DNS, ring-3 SOCK-2 and SOCK-4 PASS; FORBID any `[e1000] up:`. Go-red by
 mutation of the MAC string parse. Evidence `docs/dev/evidence/rmbp-0924/usbnet/USBNET.md`.
 
-**Owed.** (a) The **AX88179 front-end** — vendor-specific interface, register reads/writes behind
-vendor control requests, a per-transfer RX header to strip; same rings, claim and `NicOps`, so it is
-a bring-up list and a header, not a second driver; QEMU has no model of it, so it flies on a bench
-with the dongle. (b) The aarch64 registration flown (Pi or Orin + dongle). (c) Ring-3 SOCK-3 over the
-link (in the container `done=0` within the wall, where the connect is refused anyway).
+**The AX88179 front-end (built, unflown).** Peter's dongles are ASIX AX88179B (`0b95:1790`; the
+`0b95:178a` AX88179/178A is taken too): one vendor-specific interface (class 0xFF) with the same
+bulk pair, so the walk takes it as the data interface (`kind=ax88179`). Register access is vendor
+request 0x01 (register space: wValue = register, wIndex = byte count; 0x40 write / 0xC0 read) and
+0x02 (PHY: wValue = PHY id 3, wIndex = MII register). Bring-up in the part's order
+(`usbnet_bringup_ax`): PHYPWR_RSTCTL 0 → IPRL, CLK_SELECT ACS|BCS, NODE_ID → MAC, RX_BULKIN_QCTRL
+by bus speed, pause water levels 0x34/0x52, RXCOE/TXCOE 0, MONITOR 0, RX_CTL 0x03aa, MEDIUM 0x013f,
+BMCR 0x1200. RX: every bulk-IN transfer ends in a trailer (`pkt_cnt` low 16, `hdr_off` high 16 of
+the last u32; per-packet u32 headers with the length in bits 16..29 and CRC/DROP flags; a 2-byte
+alignment pad ahead of each frame; packets 8-byte aligned) — `deliver_ax`. TX: an 8-byte header
+`[len][flags]` with the pad flag when the transfer would end on a max packet, in place of ECM's
+chained ZLP. The map is the part's as ASIX documents it and as the Linux `ax88179_178a` driver (GPL,
+this tree's licence) uses it; **QEMU has no model of the part, so nothing here is measured yet** — the
+wire carries `kind=ax88179`, the MEDIUM readback and the link-status byte so the first bench boot
+reads as data. One open question for that boot: whether the frame in the RX trailer format still
+carries its 4-byte FCS (if it does, `deliver_ax` strips one more constant).
+
+**Owed.** (a) The dongle boot: flight 13 on the rMBP with `UNAOS_USBNET=1` and a dongle (a Pi or
+Orin with one flies the aarch64 registration at the same time). (b) Ring-3 SOCK-3 over the link (in
+the container `done=0` within the wall, where the connect is refused anyway).
 
 ## See also
 - [`docs/dev/OS/`](../) — other kernel subsystem documentation.

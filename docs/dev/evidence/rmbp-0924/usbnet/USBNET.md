@@ -107,3 +107,33 @@ Source restored afterwards (`grep -c GO-RED usbnet.rs` = 0 before the commit).
       1 xHCI: HID Endpoints Configured (Slot 2). Proceeding to Set Configuration...
 ```
 On the dongle-only leg the same read produced `Total Length: 67` and `80` and walked both whole — with 64 the ECM data interface's alt-1 endpoints (bytes 64..80) were never seen.
+
+## Run D — the two-front-end tree (AX88179 built beside ECM), ECM leg re-measured
+Same command, after the AX88179 front-end landed on the same link (its lines never print here: QEMU
+has no model of the part; `FORBID kind=ax88179` in the spec holds at 0 hits). rc=1 from the
+container's SOCK-3 only.
+```
+:: USBNET: configuration 0 holds no ECM pair (rndis_seen=1) — requesting configuration index 1 of 2 ::
+:: USBNET: candidate kind=ecm slot=3 vidpid=0525:a4a2 cfg=1 ctrl=0 data=1 alt=1 imac=3 mss=0 in_mps=64 out_mps=64 ::
+:: USBNET: up kind=ecm slot=3 cfg=1 ctrl=0 data=1 alt=1 mac=40:54:00:12:34:57 filter=ok -> PASS ::
+:: USBNET: rx=181 tx=331 rx_drop=0 tx_drop=136 errors=0 ::
+:: SOCK-1: smoltcp icmp echo 10.0.2.2 4/4 replies — witness OK ::
+:: SOCK-2: smoltcp udp dns query 10.0.2.3:53 -> 64 bytes back — witness OK ::
+:: SOCK-5: smoltcp dhcpv4 lease 10.0.2.30/24 gw 10.0.2.2 — witness OK ::
+:: SOCK-2: ring-3 udp sockets — sys_socket(40)/bind(41)/sendto(42)/recvfrom(43), a datagram round-trip over the persistent smoltcp stack ::
+:: SOCK-2: ring-3 udp round-trip — socket/bind/sendto OK, recvfrom returned a datagram FROM 10.0.2.3:53, socket teardown clean -> PASS ::
+:: SOCK-4: transferable sockets — SYS_XFER moves a KIND_SOCKET cap cross-row (owner migrates), the grantee round-trips it, the grantor's stale handle is rejected ::
+:: SOCK-4: transferable sockets — grantee received + round-tripped the moved socket, grantor's migrated-away handle -EACCES, gen-rebind rejected, teardown clean -> PASS ::
+════════════ MBENCH VERDICT — x86-usbnet.spec vs /tmp/claude-0/-home-user-UnaOS/823e4b66-c41d-5863-8c5e-22382d4804ac/scratchpad/usbnet
+  ✅ MBENCH PASS — 9/9 required witnesses, 0 forbidden hit(s), 2779 lines scanned [mode unknown: no run sidecar]
+```
+`tx_drop=136`: frames smoltcp emitted while the controller loan was Busy (the main loop's pass held
+it) and the 8-deep TX ring was full — counted, retransmitted by the stack, and the DHCP/ICMP/DNS
+witnesses above are what came through. `vidpid=0525:a4a2` is QEMU's usb-net.
+
+## The AX88179 front-end — NOT measured here
+Built on this link (`usbnet::ax`, `usbnet_bringup_ax`, `deliver_ax`; network_stack.md §10). QEMU
+8.2 has no model of the part, so nothing of it ran. Its first bench boot is scored on
+`:: USBNET: candidate kind=ax88179 slot=… vidpid=0b95:1790 …`, `[usbnet] ax88179 link_status=…
+medium(readback)=… qctrl=… phy_aneg=…`, then `:: USBNET: up kind=ax88179 … mac=<the dongle's> -> PASS ::`
+or the named step that refused, and then smolnet's `:: SOCK-5: … lease` from the room's DHCP.

@@ -11,9 +11,10 @@
 # 40:54:00:12:34:57: the `mac=` the builder passes with the first octet's locally-administered bit set
 # by the device, which is the address the guest is meant to use on its end of the link.
 REQUIRE :: USBNET: configuration 0 holds no ECM pair \(rndis_seen=1\) — requesting configuration index 1 of 2 ::
-REQUIRE :: USBNET: ecm candidate slot=\d+ cfg=1 ctrl=0 data=1 alt=1 imac=\d+ mss=\d+ in_mps=\d+ out_mps=\d+ ::
+REQUIRE :: USBNET: candidate kind=ecm slot=\d+ vidpid=[0-9a-f]{4}:[0-9a-f]{4} cfg=1 ctrl=0 data=1 alt=1 imac=\d+ mss=\d+ in_mps=\d+ out_mps=\d+ ::
 REQUIRE xHCI: USBNET Endpoints Configured \(Slot \d+\)\. Link bring-up pending\.
-REQUIRE :: USBNET: up slot=\d+ cfg=1 ctrl=0 data=1 alt=1 mac=40:54:00:12:34:57 filter=ok -> PASS ::
+REQUIRE :: USBNET: up kind=ecm slot=\d+ cfg=1 ctrl=0 data=1 alt=1 mac=40:54:00:12:34:57 filter=ok -> PASS ::
+FORBID kind=ax88179
 FORBID :: USBNET: .* -> FAIL ::
 FORBID :: USBNET: link down
 #

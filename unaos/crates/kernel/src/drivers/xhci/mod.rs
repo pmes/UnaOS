@@ -4683,7 +4683,7 @@ impl XhciController {
                                     // meaningless on a config event, guarded for the same reason.
                                     let class_code = desc_data[4];
                                     let subclass = desc_data[5];
-                                    let protocol = desc_data[6]; #[cfg(feature = "usbnet")] { if desc_data[1] == 0x01 { usbnet::note_device(slot_id as u8, class_code, desc_data[17]); } } // USBNET: bNumConfigurations (byte 17) — a walk of configuration 0 that finds no ECM asks for configuration 1 only if the device declares one
+                                    let protocol = desc_data[6]; #[cfg(feature = "usbnet")] { if desc_data[1] == 0x01 { usbnet::note_device(slot_id as u8, class_code, desc_data[17], vid, pid); } } // USBNET: bNumConfigurations (byte 17) — a walk of configuration 0 that finds no ECM asks for configuration 1 only if the device declares one
 
                                     if desc_data[1] == 0x01 {
                                         serial_println!("xHCI: Device Found. Class={:#x} Sub={:#x} Proto={:#x}",
@@ -17247,7 +17247,7 @@ impl XhciController {
                 let n = usbnet::RX_CHUNK.saturating_sub(residue as usize);
                 dma_coherency::inval(rx_phys as usize, usbnet::RX_CHUNK);
                 let frame = unsafe { core::slice::from_raw_parts(rx_phys as *const u8, n.min(usbnet::RX_CHUNK)) };
-                usbnet::deliver(frame);
+                if usbnet::kind() == usbnet::KIND_AX88179 { usbnet::deliver_ax(frame); } else { usbnet::deliver(frame); }
             } else {
                 usbnet::note_error(code);
             }
@@ -17269,11 +17269,27 @@ impl XhciController {
         // ── TX: drain the frame ring, one synchronous TD per frame, at most one ring's worth per pass. ──
         let mut sent = 0;
         while sent < 8 && usbnet::tx_pending() {
+            let ax = usbnet::kind() == usbnet::KIND_AX88179;
             let n = {
-                let buf = unsafe { core::slice::from_raw_parts_mut(tx_phys as *mut u8, usbnet::FRAME_CAP) };
-                match usbnet::next_tx(buf) { Some(n) => n, None => break }
+                let buf = unsafe { core::slice::from_raw_parts_mut(tx_phys as *mut u8, usbnet::FRAME_CAP + usbnet::ax::TX_HDR_LEN) };
+                if ax {
+                    // 8-byte header ahead of the frame: [len][flags], the pad flag when the transfer
+                    // would end exactly on a max packet (the part then pads instead of a ZLP).
+                    match usbnet::next_tx(&mut buf[usbnet::ax::TX_HDR_LEN..]) {
+                        Some(n) => {
+                            let mps = usbnet::out_mps() as usize;
+                            let flags = if mps != 0 && (n + usbnet::ax::TX_HDR_LEN) % mps == 0 { usbnet::ax::TX_PAD_FLAG } else { 0 };
+                            buf[0..4].copy_from_slice(&(n as u32).to_le_bytes());
+                            buf[4..8].copy_from_slice(&flags.to_le_bytes());
+                            n + usbnet::ax::TX_HDR_LEN
+                        }
+                        None => break,
+                    }
+                } else {
+                    match usbnet::next_tx(buf) { Some(n) => n, None => break }
+                }
             };
-            match self.usbnet_tx_stage(slot, out_dci, tx_phys, n as u32) {
+            match self.usbnet_tx_stage(slot, out_dci, tx_phys, n as u32, !ax) {
                 Ok(1) | Ok(13) => usbnet::note_tx_done(),
                 Ok(code) => { usbnet::note_error(code); break; }
                 Err(()) => { usbnet::note_error(0); break; }
@@ -17285,6 +17301,10 @@ impl XhciController {
     /// CDC-ECM class bring-up, once: SET_CONFIGURATION(the ECM configuration), SET_INTERFACE(data,
     /// alt 1), the station address from the iMACAddress STRING descriptor, SetEthernetPacketFilter.
     fn usbnet_bringup(&mut self, slot: u8) {
+        if usbnet::kind() == usbnet::KIND_AX88179 {
+            self.usbnet_bringup_ax(slot);
+            return;
+        }
         let cfg = usbnet::cfg_value();
         if let Err(_) | Ok(0) | Ok(2..=u8::MAX) = self.sync_control(slot, 0x00, 0x09, cfg as u16, 0, 0, 0, false) {
             usbnet::set_up(slot, false, Some("SET_CONFIGURATION"));
@@ -17318,13 +17338,90 @@ impl XhciController {
         usbnet::set_up(slot, filter_ok, None);
     }
 
+    /// AX88179 register write: vendor request 0x01, bmRequestType 0x40, wValue = reg, wIndex = len.
+    fn ax_write(&mut self, slot: u8, reg: u16, data: &[u8]) -> bool {
+        let buf = self.slots[slot as usize].descriptor_buffer as u64;
+        if buf == 0 || data.len() > 64 {
+            return false;
+        }
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf as *mut u8, data.len()) };
+        matches!(self.sync_control(slot, 0x40, usbnet::ax::REQ_MAC, reg, data.len() as u16, data.len() as u16, buf, false), Ok(1) | Ok(13))
+    }
+    /// AX88179 register read: vendor request 0x01, bmRequestType 0xC0.
+    fn ax_read(&mut self, slot: u8, reg: u16, out: &mut [u8]) -> bool {
+        let buf = self.slots[slot as usize].descriptor_buffer as u64;
+        if buf == 0 || out.len() > 64 {
+            return false;
+        }
+        dma_coherency::clean(buf as usize, 64);
+        if !matches!(self.sync_control(slot, 0xC0, usbnet::ax::REQ_MAC, reg, out.len() as u16, out.len() as u16, buf, true), Ok(1) | Ok(13)) {
+            return false;
+        }
+        dma_coherency::inval(buf as usize, 64);
+        unsafe { core::ptr::copy_nonoverlapping(buf as *const u8, out.as_mut_ptr(), out.len()) };
+        true
+    }
+    /// AX88179 PHY (MII) register write: vendor request 0x02, wValue = phy id, wIndex = mii reg.
+    fn ax_phy_write(&mut self, slot: u8, reg: u16, v: u16) -> bool {
+        let buf = self.slots[slot as usize].descriptor_buffer as u64;
+        if buf == 0 {
+            return false;
+        }
+        unsafe { core::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), buf as *mut u8, 2) };
+        matches!(self.sync_control(slot, 0x40, usbnet::ax::REQ_PHY, usbnet::ax::PHY_ID, reg, 2, buf, false), Ok(1) | Ok(13))
+    }
+    fn ax_wait_ms(ms: u64) {
+        let t0 = crate::arch::ms();
+        while crate::arch::ms().saturating_sub(t0) < ms {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// AX88179 bring-up, in the part's documented order: power/reset, clock select, the station
+    /// address from NODE_ID, bulk-in aggregation for the bus speed, pause water levels, no checksum
+    /// offload, RX control, medium mode, PHY autonegotiation restart. Every step names itself on
+    /// refusal. UNFLOWN — see the `KIND` note in usbnet.rs.
+    fn usbnet_bringup_ax(&mut self, slot: u8) {
+        use usbnet::ax::*;
+        let cfg = usbnet::cfg_value().max(1);
+        if !matches!(self.sync_control(slot, 0x00, 0x09, cfg as u16, 0, 0, 0, false), Ok(1)) {
+            usbnet::set_up(slot, false, Some("SET_CONFIGURATION"));
+            return;
+        }
+        if !self.ax_write(slot, REG_PHYPWR_RSTCTL, &0u16.to_le_bytes()) { usbnet::set_up(slot, false, Some("PHYPWR_RSTCTL=0")); return; }
+        Self::ax_wait_ms(10);
+        if !self.ax_write(slot, REG_PHYPWR_RSTCTL, &PHYPWR_IPRL.to_le_bytes()) { usbnet::set_up(slot, false, Some("PHYPWR_RSTCTL=IPRL")); return; }
+        Self::ax_wait_ms(200);
+        if !self.ax_write(slot, REG_CLK_SELECT, &[CLK_ACS_BCS]) { usbnet::set_up(slot, false, Some("CLK_SELECT")); return; }
+        Self::ax_wait_ms(100);
+        let mut mac = [0u8; 6];
+        if !self.ax_read(slot, REG_NODE_ID, &mut mac) || !usbnet::set_mac_bytes(&mac) { usbnet::set_up(slot, false, Some("NODE_ID")); return; }
+        let mut link = [0u8; 1];
+        let _ = self.ax_read(slot, REG_PHYSICAL_LINK_STATUS, &mut link);
+        let qctrl = if usbnet::out_mps() >= 1024 || link[0] & 0x04 != 0 { BULKIN_QCTRL_SS } else { BULKIN_QCTRL_HS };
+        if !self.ax_write(slot, REG_RX_BULKIN_QCTRL, &qctrl) { usbnet::set_up(slot, false, Some("RX_BULKIN_QCTRL")); return; }
+        if !self.ax_write(slot, REG_PAUSE_WATERLVL_LOW, &[0x34]) || !self.ax_write(slot, REG_PAUSE_WATERLVL_HIGH, &[0x52]) { usbnet::set_up(slot, false, Some("PAUSE_WATERLVL")); return; }
+        if !self.ax_write(slot, REG_RXCOE_CTL, &[0]) || !self.ax_write(slot, REG_TXCOE_CTL, &[0]) { usbnet::set_up(slot, false, Some("COE_CTL")); return; }
+        if !self.ax_write(slot, REG_MONITOR_MODE, &[0]) { usbnet::set_up(slot, false, Some("MONITOR_MODE")); return; }
+        if !self.ax_write(slot, REG_RX_CTL, &RX_CTL_RUN.to_le_bytes()) { usbnet::set_up(slot, false, Some("RX_CTL")); return; }
+        if !self.ax_write(slot, REG_MEDIUM_STATUS_MODE, &MEDIUM_RUN.to_le_bytes()) { usbnet::set_up(slot, false, Some("MEDIUM_STATUS_MODE")); return; }
+        let phy_ok = self.ax_phy_write(slot, 0, BMCR_ANEG_RESTART);
+        let mut medium = [0u8; 2];
+        let _ = self.ax_read(slot, REG_MEDIUM_STATUS_MODE, &mut medium);
+        serial_println!(
+            "[usbnet] ax88179 link_status={:#04x} medium(readback)={:#06x} qctrl={} phy_aneg={} — UNFLOWN register map, confirm on the bench",
+            link[0], u16::from_le_bytes(medium), if qctrl == BULKIN_QCTRL_SS { "ss" } else { "hs" }, phy_ok as u8
+        );
+        usbnet::set_up(slot, phy_ok, None);
+    }
+
     /// One frame as one TD on the bulk-OUT ring, awaited. A frame whose length is a multiple of the
     /// OUT max packet size gets a chained zero-length TRB so the device sees the short packet that
     /// ends an ECM frame. Uses the `ftdi_pending` one-outstanding-OUT mechanism (see the block comment).
-    fn usbnet_tx_stage(&mut self, slot_id: u8, out_dci: u8, data_phys: u64, len: u32) -> Result<u8, ()> {
+    fn usbnet_tx_stage(&mut self, slot_id: u8, out_dci: u8, data_phys: u64, len: u32, zlp_ok: bool) -> Result<u8, ()> {
         dma_coherency::clean(data_phys as usize, len as usize);
         let mps = usbnet::out_mps() as u32;
-        let zlp = mps != 0 && len % mps == 0;
+        let zlp = zlp_ok && mps != 0 && len % mps == 0; // ECM: a chained ZLP; AX88179: its header's pad flag instead
         let wait_trb_phys = {
             let ring = self.slots[slot_id as usize].bulk_out_ring.as_mut().ok_or(())?;
             let base = ring.get_ptr();
