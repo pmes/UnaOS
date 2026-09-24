@@ -64,3 +64,12 @@ shows, and §9.2's line 2 names both.
 LOGINFONT itself has no wire of its own: the form's behaviour is the 51 witnesses above, and the glyphs are
 the glass's to judge on flight 13.
 
+## The deferred order, driven (b12764f7)
+
+| gate | result |
+|---|---|
+| the login line above on b12764f7 | mbench PASS **53/53** (two new pins: the `deferred to the desktop ignition` line and the `store loaded before the desktop … now` line), 0 forbidden; `:: LOGIN-ROOTPW: reset=true deferred_leg=armed-then-opened opened=true … -> PASS ::`. The verb's rc=1 is SOCK-3 (container). |
+
+Both orders of §9.2 line 2 now have a runtime reading every loginst boot: with the desktop marked not-up the
+ignition arms and opens nothing; the desktop step opens it. What the rMBP shows is still which line it prints.
+
