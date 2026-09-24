@@ -31,3 +31,14 @@ Run on the fold tip, recorded here as they report (see the rmbp-queue STATE for 
 :: GLASSFIX2: sprite same=1 backdrop=9x9 window=9x9 scale=1 owns_paint=1 compositor=9x9 backbuffer=18x18 | cascade overlaps=0 worst=win0-over-win0:0rows minted=4/4 pinned=3/3 n=7 control=1 expect_overlaps=0 tb=34 step=39 panel=1280x800 scale=1 | console=win0 pulse=win0 pulse_over_console=0 -> PASS ::
 ```
 
+## Control: SOCK-3 on the untouched tip
+
+| gate | result |
+|---|---|
+| the same WC line on hw-rmbp f54acf6c untouched except the two container fixes applied by hand (`x86_64` 0.15.5; the builder's machine string `pc-q35-8.2`) | rc=1 on the same line: `:: SOCK-3: ring-3 tcp round-trip FAIL — witness=0x1 cleared=true killed=0 done=1 (want 0x1f/true/0/1) ::`; completion reached, full wall 268.2 s; `:: SMEP unsupported (TCG?)` |
+
+Same failure, same first-step witness, on a tree with none of this branch's code: SOCK-3 is this container's (TCG, QEMU
+8.2's user-mode network, or both), not LOGIN14's and not the fold's. It is the reason every `./arroyo test` here exits 1
+while its specs pass; the mbench rows are the lane's verdicts. Peter's box (QEMU 10, KVM) is where SOCK-3 has its
+green; if it reds there on this branch, that is a finding against the branch and this row is the reason to look twice.
+
