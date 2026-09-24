@@ -17514,7 +17514,7 @@ fn winx_launcher(demo_cpu: usize) {
     // — and `hittest_selftest` goes first because its `focus_changed(0)` leg is the more disruptive of
     // the two and it restores `SHELL_Z`/`FOCUS_ASID` before returning.
     #[cfg(feature = "witness")]
-    crate::video::wm::hittest_selftest();
+    { #[cfg(feature = "login")] { let t0 = crate::arch::ms(); while !crate::fs::users::loginst_settled() && crate::arch::ms().saturating_sub(t0) < 20_000 { core::hint::spin_loop(); } serial_println!("[clickroute] battery held {}ms for the loginst chain settled={} (LOGINORDER, B206 — B189 finding 1: the login fixtures open the screen and the screen swallows every press, so the click family waits for them; the bound is 20 s)", crate::arch::ms().saturating_sub(t0), crate::fs::users::loginst_settled()); } crate::video::wm::hittest_selftest(); } // LOGINORDER (B206) — ⚠ SAME-LINE fold, line-NEUTRAL: the wait rides the hittest statement's own line.
     #[cfg(feature = "witness")]
     { clickroute_selftest(); crate::video::termsel::pointer_selftest(); } // TERMSEL2 — the pointer on the shell's text, driven through `wc_click_route_at` exactly as `clickroute_selftest` drives it, right after it and for its reason: it mints (and closes) a row of its own, so it belongs after every one-shot per-window latch and before `dock::selftest`, which must find NO `KERNEL_OWNER_DESKTOP` row. ⚠ FOLDED, line-neutral.
     // DOCK — fourth of the click family. It mints three rows of its own and drives `focus_changed(0)`,

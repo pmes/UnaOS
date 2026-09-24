@@ -1192,6 +1192,26 @@ pub fn screen_open_at_ignition(desktop_up: bool, console_routed: bool) {
 
 static SERVICED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// LOGINORDER (rmbp-ledger B206; B189 finding 1) — the loginst chain is RUNNING: it opens the screen
+/// (windowed and headless) and every press on the panel is the screen's while it does
+/// (`press_swallow`), so a desktop press battery that overlaps it is swallowed and reads FAIL. Set for
+/// the whole `Ok(())` arm of [`service`], cleared at its end.
+#[cfg(feature = "loginst")]
+static LOGINST_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// LOGINORDER — `true` once the loginst chain has run to its end (or was never compiled). The x86
+/// desktop press battery (`winx_launcher`'s click family) waits on this, bounded, before its first press.
+/// Without `loginst` there is no chain and nothing to wait for. A store that never mounts leaves the
+/// chain unrun and this `false` for the boot: the battery's bound, not this predicate, ends that wait.
+pub fn loginst_settled() -> bool {
+    #[cfg(feature = "loginst")]
+    {
+        return SERVICED.load(core::sync::atomic::Ordering::Acquire) && !LOGINST_LIVE.load(core::sync::atomic::Ordering::Acquire);
+    }
+    #[cfg(not(feature = "loginst"))]
+    true
+}
+
 /// Called from the storage-ready passes in `main.rs` (beside `holocron::service`, for the same
 /// reason: which pass a build reaches depends on its knobs). Loads the store once the root volume
 /// answers, then runs the M1 fixture exactly once. Costs one relaxed load per pass thereafter.
@@ -1214,6 +1234,8 @@ pub fn service() {
     // last error is named so the line says which refusal it was.
     match try_load() {
         Ok(()) => {
+            #[cfg(feature = "loginst")]
+            LOGINST_LIVE.store(true, Ordering::Release); // LOGINORDER (B206): the chain is live from here to the end of this arm — the desktop press battery waits for it
             SERVICED.store(true, Ordering::Relaxed);
             root_credential_ignition(); // LOGIN14 (R65): root's row, and the set-password screen if its password is not chosen yet
             #[cfg(feature = "loginst")]
@@ -1221,7 +1243,7 @@ pub fn service() {
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-            crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire, screen_press_via_router, screen_press_route_name()); // LOGIN M4 — the Log Out route under test is the CRYSTAL MENU'S ROW (`crystal::logout_row_fire`), not the screen's own reopen; M3's `logout_direct` retires with it. LOGINFLOW M1 — and the PRESS route under test is the arch's LIVE ROUTER (`screen_press_via_router`, this file's tail), handed in for exactly the reason the logout route is: a fixture that called `press_swallow` itself would stay green on a tree whose router gate had been deleted — B121's lesson one band over. The seam's NAME travels with it, so the verdict line says which entry was driven rather than leaving the reader to infer it from the arch.
+            crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire, screen_press_via_router, screen_press_route_name()); #[cfg(feature = "loginst")] LOGINST_LIVE.store(false, Ordering::Release); // LOGINORDER (B206): the chain is over; the press battery may run. ⚠ SAME-LINE fold. // LOGIN M4 — the Log Out route under test is the CRYSTAL MENU'S ROW (`crystal::logout_row_fire`), not the screen's own reopen; M3's `logout_direct` retires with it. LOGINFLOW M1 — and the PRESS route under test is the arch's LIVE ROUTER (`screen_press_via_router`, this file's tail), handed in for exactly the reason the logout route is: a fixture that called `press_swallow` itself would stay green on a tree whose router gate had been deleted — B121's lesson one band over. The seam's NAME travels with it, so the verdict line says which entry was driven rather than leaving the reader to infer it from the arch.
         }
         Err(e) => {
             let n = MOUNT_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
