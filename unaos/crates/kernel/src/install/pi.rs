@@ -163,11 +163,11 @@ pub fn run() {
 
     // ── Gate 2: the armed scratch write/verify/restore ladder (non-destructive) ──
     #[cfg(feature = "piinstall_arm")]
-    scratch_ladder(&t, &sec0);
+    let armed = scratch_ladder(&t, &sec0); #[cfg(all(feature = "piinstall_arm", not(feature = "piinstall_confirm")))] serial_println!("{} Gate 2 verdict={} — Gate 3 not built (UNAOS_PIINSTALL_CONFIRM) ::", PS, armed); // B102: Gate 2 RETURNS its verdict — a printed ladder is not a gate until something reads it; the arm-only build says the verdict out loud.
 
-    // ── Gate 3: the destructive install ──
+    // ── Gate 3: the destructive install — ONLY behind a Gate 2 that PASSED (B102; `piinstall_confirm` implies `piinstall_arm`, so `armed` always exists here) ──
     #[cfg(feature = "piinstall_confirm")]
-    install_to_pi(t, &sec0);
+    if armed { install_to_pi(t, &sec0); } else { serial_println!("{} Gate 3 REFUSED — Gate 2 did not pass (ladder REFUSED or FAILED above); the destructive install does not run. No write. ::", PS); }
 
     #[cfg(not(feature = "piinstall_arm"))]
     serial_println!(
@@ -194,7 +194,7 @@ fn make_pattern(buf: &mut [u8; SECTOR], lba: u64) {
 }
 
 #[cfg(feature = "piinstall_arm")]
-fn scratch_ladder(t: &EmmcInstallTarget, sec0: &[u8; SECTOR]) {
+fn scratch_ladder(t: &EmmcInstallTarget, sec0: &[u8; SECTOR]) -> bool { // B102: true only when write/verify/restore/verify all held; every REFUSED/FAIL arm returns false and Gate 3 reads it.
     serial_println!(
         "{} Gate 2 ARMED (UNAOS_PIINSTALL_ARM) — non-destructive scratch write/verify/restore ladder on the LAST block ::",
         PS
@@ -207,7 +207,7 @@ fn scratch_ladder(t: &EmmcInstallTarget, sec0: &[u8; SECTOR]) {
             "{}   ladder REFUSED — sector 0 is {}; a GPT backup header lives in the last LBA (our scratch region). No write. ::",
             PS, class
         );
-        return;
+        return false;
     }
     let scratch_lba = t.capacity_sectors() - 1;
 
@@ -215,7 +215,7 @@ fn scratch_ladder(t: &EmmcInstallTarget, sec0: &[u8; SECTOR]) {
     let mut stash = [0u8; SECTOR];
     if emmc2::read_block_512(scratch_lba, &mut stash).is_err() {
         serial_println!("{}   ladder FAIL (stash read) at LBA {} — REFUSING to write (nothing to restore) ::", PS, scratch_lba);
-        return;
+        return false;
     }
 
     // Write a stamped pattern.
@@ -224,7 +224,7 @@ fn scratch_ladder(t: &EmmcInstallTarget, sec0: &[u8; SECTOR]) {
     if emmc2::write_block_512(scratch_lba, &pattern).is_err() {
         serial_println!("{}   ladder FAIL (write) at LBA {} ::", PS, scratch_lba);
         restore_or_warn(scratch_lba, &stash);
-        return;
+        return false;
     }
 
     // Read back + verify against the pattern.
@@ -232,17 +232,17 @@ fn scratch_ladder(t: &EmmcInstallTarget, sec0: &[u8; SECTOR]) {
     if emmc2::read_block_512(scratch_lba, &mut back).is_err() || back != pattern {
         serial_println!("{}   ladder FAIL (verify) — read-back != written pattern at LBA {} ::", PS, scratch_lba);
         restore_or_warn(scratch_lba, &stash);
-        return;
+        return false;
     }
 
     // Restore the stash + verify.
     if !restore_or_warn(scratch_lba, &stash) {
-        return;
+        return false;
     }
     serial_println!(
         "{} Gate 2 scratch ladder — write/verify/restore/verify at LBA {} => PASS ::",
         PS, scratch_lba
-    );
+    ); true
 }
 
 /// Re-write the stash and verify it. Returns whether the original was provably put back; warns loudly if
@@ -287,7 +287,7 @@ fn install_to_pi(mut t: EmmcInstallTarget, sec0: &[u8; SECTOR]) {
         PS
     );
     serial_println!(
-        "{}   gates: [1] emmc2 census OK · [2] write path armed · [3] destructive-confirm — all satisfied ::",
+        "{}   gates: [1] emmc2 census OK · [2] write path armed AND PASSED (B102: Gate 3 is reached only on Gate 2's true) · [3] destructive-confirm — all satisfied ::",
         PS
     );
 
