@@ -11568,6 +11568,27 @@ battery_control_probe() { # $1 = scratch dir for the probe's captures. 0 = judge
 battery() {
     local t0=$SECONDS rc=0 results=""
     local blog_dir="${WORKSPACE_DIR}/target/battery"; mkdir -p "$blog_dir"
+    # R39 — THE SELECTOR (QUEUE §5 "battery selector: the selector is not written"; LEDGER SR22, 2026-09-24).
+    # "No seat proofs, gates or debugs another seat's board." This battery was cross-platform by
+    # construction — six of its thirteen legs were never the x86 seat's — and R39's own text says why
+    # that kept recurring: a leg with no named owner defaults to whoever is running. So every leg now
+    # NAMES its board (`_board` before the step), and the battery runs ONLY the legs of the board it is
+    # run for: `UNAOS_BATTERY_BOARD=rmbp|pi|orin|all`, else derived from the track branch (`hw-rmbp` →
+    # rmbp, `hw-pi4` → pi, `hw-jetson` → orin, anything else → all: trunk `main` and a cloud/feature
+    # branch still run the whole battery, because there the landing IS every board's). A skipped leg is
+    # SAID, one line each, never silently green; `shared` legs (the both-arch compile) run for every
+    # board. `UNAOS_BATTERY_DRY=1` prints the plan — which legs would run and which are skipped and
+    # whose — and executes nothing (the control probe included), so a seat can read its battery before
+    # paying for it, and this selector is proven without a QEMU wall.
+    local board="${UNAOS_BATTERY_BOARD:-}"
+    if [ -z "$board" ]; then
+        case "$(git -C "$WORKSPACE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null)" in
+            hw-rmbp) board=rmbp;; hw-pi4) board=pi;; hw-jetson) board=orin;; *) board=all;;
+        esac
+    fi
+    case "$board" in rmbp|pi|orin|all) ;; *) echo "battery: UNAOS_BATTERY_BOARD='$board' is not one of rmbp|pi|orin|all"; return 2;; esac
+    local leg_board=shared skipped=0 skipped_names=""
+    _board() { leg_board="$1"; }
 
     _step() { # [--build] name, expected-pattern (empty = rc only), logfile[:verdictfile], cmd...
         # kernel8-test doesn't echo its serial log to stdout, so a step may name a separate
@@ -11582,6 +11603,16 @@ battery() {
         local faultscan=1
         if [ "$1" = "--build" ]; then faultscan=0; shift; fi   # BANNERCERT alias sweep (QUEUE §5 item (a), measured 2026-09-15 at 9a7b09a4): `grep -n -E '"\$\{1:-\}" = |"\$1" = ' unaos/arroyo` returns exactly TWO lines — :1147, which is the ⚠ PROSE quoting the defect that was already fixed there (the live gate beside it is a `case` over all six jetson spellings), and THIS line, a function-local argument test on `battery`'s own `$1`, not a verb gate at all. So no single-spelling VERB gate survives in this file; the remaining exposure is not "another `= "verb"` somewhere" but a feature armed with no witness in the artifact, which is what scripts/banner-cert.sh now answers.
         local name="$1" pattern="$2" logf="${3%%:*}" vf="${3#*:}"; shift 3
+        # R39: another board's leg is not run here — and the skip is a LINE in the summary, not a silence.
+        if [ "$board" != "all" ] && [ "$leg_board" != "shared" ] && [ "$leg_board" != "$board" ]; then
+            results="${results}  ⏭  ${name} — SKIPPED (R39: ${leg_board}'s leg; this battery is ${board}'s)\n"
+            skipped=$((skipped + 1)); skipped_names="${skipped_names} ${leg_board}:'${name}'"
+            return 0
+        fi
+        if [ -n "${UNAOS_BATTERY_DRY:-}" ]; then
+            results="${results}  ▷  ${name} — would run (${leg_board}'s leg)\n"
+            return 0
+        fi
         # ── SR10: THE JUDGED FILE IS THE KEPT FILE ────────────────────────────────────────────────
         # A step may name a SEPARATE verdict file (`logfile:verdictfile`), because `kernel8-test` does
         # not echo its serial capture to stdout. That verdict file is a FIXED, SHARED path
@@ -11703,18 +11734,24 @@ battery() {
     # and every other path returns above it, so the summary cannot print a control state it did not
     # measure.
     local control="unproven"
-    battery_control_probe "$blog_dir/control" || return 1
-    control="ok"
+    if [ -z "${UNAOS_BATTERY_DRY:-}" ]; then battery_control_probe "$blog_dir/control" || return 1; control="ok"; else control="dry-run"; fi
+    echo -e "${COLOR_CYAN}⚡ battery: board=${board} (R39: only this board's legs run; UNAOS_BATTERY_BOARD overrides the branch-derived default)${COLOR_RESET}"
 
+    _board shared
     _step --build "check (both arches)"  ""                  "$blog_dir/check.log"        "$0" check
+    _board orin
     _step --build "check (tegra)"        ""                  "$blog_dir/check-tegra.log"  env UNAOS_TEGRA=1 "$0" check
+    _board rmbp
     _step "x86 test 25 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-x86.log"     "$0" test 25
     _step "x86 test-fat sf 300"        "U11m2.*-> PASS"      "$blog_dir/test-fat.log"     test_fat_drop_retry "$blog_dir/test-fat.log"
+    _board pi
     _step "arm virt v2 (MISSION)"      "MISSION SUCCESS"     "$blog_dir/test-arm-v2.log"  "$0" test-arm 22
     # USB-WRITE: assert the BOT WRITE(10) RMW+readback+restore witness in the MISSION logs just run
     # (cheap re-grep of the existing serial capture — no QEMU re-run). A `-> FAIL` usbw line is
     # already caught by the generic FAIL scan; these steps require the positive `ok` witness present.
+    _board rmbp
     _step "x86 usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-x86.log"    cat "$blog_dir/test-x86.log"
+    _board pi
     _step "arm usb-write witness"      "usbw. write lba=.* ok" "$blog_dir/usbw-arm.log"    cat "$blog_dir/test-arm-v2.log"
     # FATIMG-CI: the SHIPPED EL0 app-launch path — `bg /apps/STAT.ELF` / `bg /apps/VUG.ELF` read off a
     # REAL attached FAT volume, through the ELF loader, into a compositor window. Same cheap re-grep
@@ -11728,6 +11765,7 @@ battery() {
     # unwitnessed: a `find_in_root` result that was exactly DOUBLE the true file size sat on this path
     # undetected until an operator hit it by hand. Asserting the positive verdict — rather than
     # trusting the absence of a negative — is what makes that impossible to repeat.
+    _board rmbp
     _step "x86 STAT.ELF off FAT (WINX-2)" "WINX-2: STAT.ELF end-to-end .* -> PASS" "$blog_dir/winx2-fat.log" cat "$blog_dir/test-fat.log"
     _step "x86 VUG.ELF off FAT (WINX-8)"  "WINX-8: VUG.ELF end-to-end .* -> PASS"  "$blog_dir/winx8-fat.log" cat "$blog_dir/test-fat.log"
     # PULSE-1: the third shipped EL0 app on that same path. Same cheap re-grep of the `test-fat` capture, and
@@ -11735,6 +11773,7 @@ battery() {
     # honest line when no block device is attached, so on a plain `./arroyo test` its absence is silence, not
     # red. It is also the only leg that proves SYS_CPUPULSE(49) works across the privilege boundary.
     _step "x86 PULSE.ELF off FAT (PULSE-W)" "PULSE-W: PULSE.ELF end-to-end .* -> PASS" "$blog_dir/pulsew-fat.log" cat "$blog_dir/test-fat.log"
+    _board pi
     _step "arm virt v3 (CAPSTONE 6/6)" "CAPSTONE COMPLETE"   "$blog_dir/test-arm-v3.log"  env UNAOS_GICV3=1 "$0" test-arm 40
     # MBENCH-HONEST: this step's verdict is now the MBENCH REPLAY's exit status, which `kernel8-test`
     # propagates (see test_kernel8). It used to be a single `awk` for CAPSTONE COMPLETE against the
@@ -11753,6 +11792,7 @@ battery() {
     if awk 'BEGIN{f=1} /MBENCH TRUNCATED/{f=0} END{exit f}' "$blog_dir/kernel8.log" 2>/dev/null; then
         results="${results}       ↳ TRUNCATED (INCONCLUSIVE): the pi boot was CUT SHORT, not regressed — re-run before bisecting (${blog_dir}/kernel8.log)\n"
     fi
+    _board orin
     _step --build "esp-jetson (links)"   ""                  "$blog_dir/esp-jetson.log"   env UNAOS_TEGRA=1 "$0" esp-jetson
 
     # SR10: tally over the KEPT pi capture, not the shared path — a concurrent or later
@@ -11766,10 +11806,14 @@ battery() {
     echo -e "$results"
     echo "  PASS lines (fat+pi): $passes   step logs: $blog_dir/"
     echo -e "  ${COLOR_CYAN}⚠ this run clobbered any x86 esp media — rebuild UNAOS_USBDEBUG=1 esp-x86 LAST before flashing${COLOR_RESET}"
-    if [ "$rc" -eq 0 ]; then
+    if [ -n "${UNAOS_BATTERY_DRY:-}" ]; then
+        echo -e "${COLOR_YELLOW}▷ BATTERY DRY RUN — board=${board}, ${skipped} leg(s) skipped as other boards' (R39):${skipped_names:- none}. Nothing executed.${COLOR_RESET}"
+    elif [ "$rc" -eq 0 ] && [ "$board" = "all" ]; then
         echo -e "${COLOR_GREEN}✅ FULL BATTERY GREEN${COLOR_RESET}"
+    elif [ "$rc" -eq 0 ]; then
+        echo -e "${COLOR_GREEN}✅ BATTERY GREEN — ${board}'s legs (R39); ${skipped} leg(s) skipped as other boards':${skipped_names:- none}. Those boards' seats run theirs.${COLOR_RESET}"
     else
-        echo -e "${COLOR_RED}❌ BATTERY FAILED — see step logs${COLOR_RESET}"
+        echo -e "${COLOR_RED}❌ BATTERY FAILED — see step logs (board=${board}, ${skipped} leg(s) skipped as other boards' — R39)${COLOR_RESET}"
     fi
     return $rc
 }
@@ -12577,7 +12621,7 @@ case "${1:-}" in
         install_pi "${2:-12}"
         ;;
     battery)
-        battery
+        battery || exit $?   # R39 selector: a bad UNAOS_BATTERY_BOARD is exit 2, a red battery exit 1 — never a silent 0
         ;;
     mbench)
         # Metal-bench harness passthrough: assert a serial capture (bridge log or

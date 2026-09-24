@@ -231,3 +231,76 @@ go-red — a tree copy (arroyo copied, scripts/ and crates/ symlinked) with `# s
 ❌ k8-reach STALE-ENUM: 1 arroyo line(s) spell a capability's impliers by hand — 12608: any(baremetal, tegra_el0) is `aarch64_el0`.   rc=1
 control — `any(orinel1ap, apsrun)` (arroyo:5660), `any(ga10bprobe3, ga10bprobe4c)` (:6439): gates the kernel really spells; NOT findings (the first cut flagged them; `code_any_sets` is the fix).
 ```
+
+## R39 — the battery selector, dry-run for every board (SR22)
+```
+ === UNAOS_BATTERY_BOARD=rmbp
+ ⚡ battery: board=rmbp (R39: only this board's legs run; UNAOS_BATTERY_BOARD overrides the branch-derived default)
+ ════════════ BATTERY SUMMARY (0s) control=dry-run ════════════
+   ▷  check (both arches) — would run (shared's leg)
+   ⏭  check (tegra) — SKIPPED (R39: orin's leg; this battery is rmbp's)
+   ▷  x86 test 25 (MISSION) — would run (rmbp's leg)
+   ▷  x86 test-fat sf 300 — would run (rmbp's leg)
+   ⏭  arm virt v2 (MISSION) — SKIPPED (R39: pi's leg; this battery is rmbp's)
+   ▷  x86 usb-write witness — would run (rmbp's leg)
+   ⏭  arm usb-write witness — SKIPPED (R39: pi's leg; this battery is rmbp's)
+   ▷  x86 STAT.ELF off FAT (WINX-2) — would run (rmbp's leg)
+   ▷  x86 VUG.ELF off FAT (WINX-8) — would run (rmbp's leg)
+   ▷  x86 PULSE.ELF off FAT (PULSE-W) — would run (rmbp's leg)
+   ⏭  arm virt v3 (CAPSTONE 6/6) — SKIPPED (R39: pi's leg; this battery is rmbp's)
+   ⏭  pi4 kernel8-test 60 (mbench 63/63) — SKIPPED (R39: pi's leg; this battery is rmbp's)
+   ⏭  esp-jetson (links) — SKIPPED (R39: orin's leg; this battery is rmbp's)
+ ▷ BATTERY DRY RUN — board=rmbp, 6 leg(s) skipped as other boards' (R39): orin:'check (tegra)' pi:'arm virt v2 (MISSION)' pi:'arm usb-write witness' pi:'arm
+ === UNAOS_BATTERY_BOARD=pi
+ ⚡ battery: board=pi (R39: only this board's legs run; UNAOS_BATTERY_BOARD overrides the branch-derived default)
+ ════════════ BATTERY SUMMARY (0s) control=dry-run ════════════
+   ▷  check (both arches) — would run (shared's leg)
+   ⏭  check (tegra) — SKIPPED (R39: orin's leg; this battery is pi's)
+   ⏭  x86 test 25 (MISSION) — SKIPPED (R39: rmbp's leg; this battery is pi's)
+   ⏭  x86 test-fat sf 300 — SKIPPED (R39: rmbp's leg; this battery is pi's)
+   ▷  arm virt v2 (MISSION) — would run (pi's leg)
+   ⏭  x86 usb-write witness — SKIPPED (R39: rmbp's leg; this battery is pi's)
+   ▷  arm usb-write witness — would run (pi's leg)
+   ⏭  x86 STAT.ELF off FAT (WINX-2) — SKIPPED (R39: rmbp's leg; this battery is pi's)
+   ⏭  x86 VUG.ELF off FAT (WINX-8) — SKIPPED (R39: rmbp's leg; this battery is pi's)
+   ⏭  x86 PULSE.ELF off FAT (PULSE-W) — SKIPPED (R39: rmbp's leg; this battery is pi's)
+   ▷  arm virt v3 (CAPSTONE 6/6) — would run (pi's leg)
+   ▷  pi4 kernel8-test 60 (mbench 63/63) — would run (pi's leg)
+   ⏭  esp-jetson (links) — SKIPPED (R39: orin's leg; this battery is pi's)
+ ▷ BATTERY DRY RUN — board=pi, 8 leg(s) skipped as other boards' (R39): orin:'check (tegra)' rmbp:'x86 test 25 (MISSION)' rmbp:'x86 test-fat sf 300' rmbp:'x
+ === UNAOS_BATTERY_BOARD=orin
+ ⚡ battery: board=orin (R39: only this board's legs run; UNAOS_BATTERY_BOARD overrides the branch-derived default)
+ ════════════ BATTERY SUMMARY (0s) control=dry-run ════════════
+   ▷  check (both arches) — would run (shared's leg)
+   ▷  check (tegra) — would run (orin's leg)
+   ⏭  x86 test 25 (MISSION) — SKIPPED (R39: rmbp's leg; this battery is orin's)
+   ⏭  x86 test-fat sf 300 — SKIPPED (R39: rmbp's leg; this battery is orin's)
+   ⏭  arm virt v2 (MISSION) — SKIPPED (R39: pi's leg; this battery is orin's)
+   ⏭  x86 usb-write witness — SKIPPED (R39: rmbp's leg; this battery is orin's)
+   ⏭  arm usb-write witness — SKIPPED (R39: pi's leg; this battery is orin's)
+   ⏭  x86 STAT.ELF off FAT (WINX-2) — SKIPPED (R39: rmbp's leg; this battery is orin's)
+   ⏭  x86 VUG.ELF off FAT (WINX-8) — SKIPPED (R39: rmbp's leg; this battery is orin's)
+   ⏭  x86 PULSE.ELF off FAT (PULSE-W) — SKIPPED (R39: rmbp's leg; this battery is orin's)
+   ⏭  arm virt v3 (CAPSTONE 6/6) — SKIPPED (R39: pi's leg; this battery is orin's)
+   ⏭  pi4 kernel8-test 60 (mbench 63/63) — SKIPPED (R39: pi's leg; this battery is orin's)
+   ▷  esp-jetson (links) — would run (orin's leg)
+ ▷ BATTERY DRY RUN — board=orin, 10 leg(s) skipped as other boards' (R39): rmbp:'x86 test 25 (MISSION)' rmbp:'x86 test-fat sf 300' pi:'arm virt v2 (MISSION)
+ === UNAOS_BATTERY_BOARD=all
+ ⚡ battery: board=all (R39: only this board's legs run; UNAOS_BATTERY_BOARD overrides the branch-derived default)
+ ════════════ BATTERY SUMMARY (0s) control=dry-run ════════════
+   ▷  check (both arches) — would run (shared's leg)
+   ▷  check (tegra) — would run (orin's leg)
+   ▷  x86 test 25 (MISSION) — would run (rmbp's leg)
+   ▷  x86 test-fat sf 300 — would run (rmbp's leg)
+   ▷  arm virt v2 (MISSION) — would run (pi's leg)
+   ▷  x86 usb-write witness — would run (rmbp's leg)
+   ▷  arm usb-write witness — would run (pi's leg)
+   ▷  x86 STAT.ELF off FAT (WINX-2) — would run (rmbp's leg)
+   ▷  x86 VUG.ELF off FAT (WINX-8) — would run (rmbp's leg)
+   ▷  x86 PULSE.ELF off FAT (PULSE-W) — would run (rmbp's leg)
+   ▷  arm virt v3 (CAPSTONE 6/6) — would run (pi's leg)
+   ▷  pi4 kernel8-test 60 (mbench 63/63) — would run (pi's leg)
+   ▷  esp-jetson (links) — would run (orin's leg)
+ ▷ BATTERY DRY RUN — board=all, 0 leg(s) skipped as other boards' (R39): none. Nothing executed.
+ === default on branch claude/optimistic-ramanujan-r3qyu5 → board=all;  UNAOS_BATTERY_BOARD=mac → "is not one of rmbp|pi|orin|all", exit 2
+```
