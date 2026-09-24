@@ -3477,6 +3477,16 @@ nousblun = []
 # Witnesses on the wire: `:: FTDIRX: first byte rx=… ::` (one-shot) and `:: FTDIRX: rx=… result=OK ::`
 # (log-scale rollup). Kept in sync with arroyo.
 ftdirx = []
+# USBNET (LEDGER SO56): `UNAOS_USBNET=1` arms `drivers/xhci/usbnet.rs` — a USB Ethernet LINK on the xHCI bus
+# (frame rings, one-outstanding bulk-IN arm/claim, synchronous bulk-OUT) with the CDC-ECM class front-end
+# (0x02/0x06 control + 0x0A data, SET_INTERFACE alt 1, iMACAddress string, SetEthernetPacketFilter). x86:
+# `e1000::raw_rx/raw_tx/hw_addr` fall back to it when no e1000 is present, so the whole smolnet surface
+# runs over the dongle; aarch64: `NicOps` registered into `net_phy::net6` at link-up. Arch-neutral, one
+# device per boot. The AX88179 (vendor) front-end is the owed rung. QEMU target: `-device usb-net` (RNDIS
+# configuration first, ECM second — the walk asks for configuration index 1). DEFAULT OFF => the module is
+# `#[cfg]`-erased and every site in xhci/mod.rs and e1000.rs is a same-line cfg-gated append or an
+# `#[inline(always)] false` helper: byte-identical. Kept in sync with arroyo and builder/src/main.rs.
+usbnet = []
 
 # AHCI (rmbp-ledger B89, first rung): `UNAOS_AHCI=1` arms `drivers/ahci.rs` — the SATA host
 # controller driver, READ-ONLY. It finds the controller by PCI class (0x01/0x06 progif 0x01, never

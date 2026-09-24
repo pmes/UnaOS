@@ -331,6 +331,9 @@ fn main() {
     // Default OFF => the tone block, the sine generator and every stream write unlinked, media
     // byte-identical. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
     if std::env::var("UNAOS_HDATONE").is_ok() { feats.push("hda-tone"); }
+    // USBNET (LEDGER SO56): UNAOS_USBNET=1 arms the USB Ethernet link (CDC-ECM) on the xHCI. THIS list is
+    // what reaches the kernel for MEDIA builds; the QEMU device of the same knob is attached below.
+    if std::env::var("UNAOS_USBNET").is_ok() { feats.push("usbnet"); }
     // HDASIE (rmbp-ledger B207): UNAOS_HDASIE=1 sets INTCTL.SIE for the tone's one descriptor before RUN
     // and restores it after STOP — the BCIS-latch experiment B130 left open. Implies `hda-tone` in
     // Cargo.toml. Same reason as HDATONE for living in THIS list: a media build must carry the bit or
@@ -1646,7 +1649,19 @@ fn main() {
         // distinct from the guest's static fallback (10.0.2.15) — makes DHCP easy to confirm.
         cmd.arg("-netdev").arg("user,id=n0,dhcpstart=10.0.2.20");
     }
-    cmd.arg("-device").arg("e1000e,netdev=n0,mac=52:54:00:12:34:56");
+    // USBNET (SO56): UNAOS_NOE1000=1 omits the e1000e (the smoltcp stack then has only the USB link, or no
+    // NIC at all — the control), and UNAOS_USBNET=1 attaches QEMU's `usb-net` on the xHCI with its own user
+    // netdev (RNDIS configuration first, CDC-ECM second; the driver asks for configuration index 1).
+    if std::env::var("UNAOS_NOE1000").is_ok() {
+        println!("   UNAOS_NOE1000: e1000e omitted — no PCI NIC; the stack sees only a USB link if one is attached");
+    } else {
+        cmd.arg("-device").arg("e1000e,netdev=n0,mac=52:54:00:12:34:56");
+    }
+    if std::env::var("UNAOS_USBNET").is_ok() {
+        cmd.arg("-netdev").arg("user,id=n1,dhcpstart=10.0.2.30")
+           .arg("-device").arg("usb-net,bus=xhci.0,netdev=n1,mac=52:54:00:12:34:57");
+        println!("   UNAOS_USBNET: usb-net (CDC-ECM/RNDIS) on the xHCI bus, user netdev n1 — the USB Ethernet link's QEMU target");
+    }
 
     // SDHC-1 (DEFAULT-ON, opt out with UNAOS_NOSDHCI=1): attach QEMU's generic PCI SD host
     // controller (`sdhci-pci`, which reports the SAME class triple as the rMBP's reader — class

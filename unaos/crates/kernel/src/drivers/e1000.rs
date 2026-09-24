@@ -1036,7 +1036,7 @@ impl E1000 {
 /// smolnet poll must not hold the lock across a transmit, so each ring op locks independently).
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 pub fn raw_rx(out: &mut [u8]) -> Option<usize> {
-    NET_DEVICE.lock().as_mut().and_then(|n| n.rx_frame_raw(out))
+    let r = NET_DEVICE.lock().as_mut().and_then(|n| n.rx_frame_raw(out)); #[cfg(feature = "usbnet")] let r = r.or_else(|| crate::drivers::xhci::usbnet::raw_rx(out)); r // USBNET (SO56): with no e1000 the smoltcp Device reads the USB Ethernet link through this same accessor — the guard is dropped at the `;` before the fallback runs
 }
 
 /// SOCK-1: transmit one raw L2 frame from the smoltcp Device. Short-locks `NET_DEVICE`.
@@ -1044,13 +1044,13 @@ pub fn raw_rx(out: &mut [u8]) -> Option<usize> {
 pub fn raw_tx(frame: &[u8]) {
     if let Some(n) = NET_DEVICE.lock().as_mut() {
         n.tx_frame_raw(frame);
-    }
+    } else { #[cfg(feature = "usbnet")] crate::drivers::xhci::usbnet::raw_tx(frame); } // USBNET (SO56): no e1000 -> the frame is queued for the xHCI device-service pass; knob-off the else is empty and folds
 }
 
 /// SOCK-1: `(MAC, current IP, link-up)` for the smolnet interface config / `ifconfig`. `None` if no NIC.
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 pub fn hw_addr() -> Option<([u8; 6], [u8; 4], bool)> {
-    NET_DEVICE.lock().as_ref().map(|n| (n.mac, n.our_ip_raw(), n.link_up()))
+    let r = NET_DEVICE.lock().as_ref().map(|n| (n.mac, n.our_ip_raw(), n.link_up())); #[cfg(feature = "usbnet")] let r = r.or_else(crate::drivers::xhci::usbnet::hw_addr); r // USBNET (SO56): every smolnet verb and fixture keys on this triple, so the link answering here is what puts DHCP, ping, arp, dns and the ring-3 sockets on the dongle with no stack edit
 }
 
 /// Read-only snapshot of the NIC state for the shell.

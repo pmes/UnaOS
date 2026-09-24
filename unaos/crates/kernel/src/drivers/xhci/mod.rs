@@ -19,7 +19,7 @@ pub mod ring;
 pub mod event;
 pub mod context;
 pub mod dma_coherency;
-pub mod ftdi;
+pub mod ftdi; #[cfg(feature = "usbnet")] pub mod usbnet; // USBNET (LEDGER SO56) — a USB Ethernet link on this bus (CDC-ECM first, the AX88179 front-end owed); a `#[cfg]`-erased module, and every site of it in this file is a same-line cfg-gated append or an `#[inline(always)] false` helper, so the knob-off image is unchanged
 // STOR-1: the interrupt-driven storage service task + BlockRequest submit/complete. x86_64 + the
 // `irqstorage` knob only — the default build never links it, so the staged storage path is untouched.
 #[cfg(all(target_arch = "x86_64", feature = "irqstorage"))]
@@ -3380,7 +3380,7 @@ pub struct XhciController {
     ftdi_slot: u8,
     /// Set once the FTDI bulk endpoints are configured; the main loop runs the (synchronous)
     /// SET_CONFIGURATION + FTDI vendor setup in a safe, non-event context (mirrors storage).
-    ftdi_pending_bringup: bool,
+    ftdi_pending_bringup: bool, #[cfg(feature = "usbnet")] usbnet_configuring_slot: u8, // USBNET: the slot whose Configure-Endpoint completion routes to the link bring-up (the FTDI's twin field)
     /// In-flight FTDI console bulk-OUT transfer (the drain pump waits on it).
     ftdi_pending: Option<FtdiPending>,
     /// Running total of console bytes drained out the FTDI cable (for the TX-mirror PASS line).
@@ -3640,7 +3640,7 @@ impl XhciController {
             storage_postpublish_io: false,
             ftdi_configuring_slot: 0,
             ftdi_slot: 0,
-            ftdi_pending_bringup: false,
+            ftdi_pending_bringup: false, #[cfg(feature = "usbnet")] usbnet_configuring_slot: 0,
             ftdi_pending: None,
             ftdi_tx_total: 0,
             ftdi_pass_logged: false,
@@ -4138,7 +4138,7 @@ impl XhciController {
                                 // (a safe, non-event context, like storage). Kept in its OWN field
                                 // so this is not misclaimed by the storage branch above or the
                                 // address-device (`ours`) branch below.
-                                else if self.ftdi_configuring_slot == slot_id as u8 {
+                                else if self.usbnet_cfg_done(slot_id as u8) { self.start_next_port(); } else if self.ftdi_configuring_slot == slot_id as u8 { // USBNET: the link's Configure-Endpoint completion, ahead of the FTDI's; knob-off the helper is `#[inline(always)] false`
                                     serial_println!("xHCI: FTDI Endpoints Configured (Slot {}). Console bring-up pending.", slot_id);
                                     self.ftdi_configuring_slot = 0;
                                     self.ftdi_slot = slot_id as u8;
@@ -4458,7 +4458,7 @@ impl XhciController {
                                     }
                                 }
                             }
-                        } #[cfg(feature = "ftdirx")] { if ftdi::ftdirx::claim(slot_id as u8, endpoint_id as u8, param, completion_code as u8, transfer_len) { return; } } // FTDIRX (rmbp A9) — THE BULK-IN COMPLETION, claimed BESIDE its bulk-OUT twin above and for the same reason: the FTDI slot is distinct from the storage slot, so slot_id + the IN dci disambiguate this event from any BOT transfer, and the armed TRB address (or any error on our endpoint) claims exactly our own Normal TRB before the async enumeration FSM below can drop it as stale. `claim` stores four relaxed words and returns — LOCKFIX: `push_event` takes the event-queue lock and MUST NOT be reached from inside the event-ring dispatch, so the bytes are delivered by `service_ftdi_rx` on the next main-loop pass instead. ⚠ LINE-NEUTRAL append: this file is compiled into the Pi kernel8.img and a line added anywhere in it moves every panic `Location` below it; the knob-off byte-identity of BOTH arches is what `./arroyo knoboff ftdirx` measures.
+                        } #[cfg(feature = "ftdirx")] { if ftdi::ftdirx::claim(slot_id as u8, endpoint_id as u8, param, completion_code as u8, transfer_len) { return; } } #[cfg(feature = "usbnet")] { if usbnet::claim(slot_id as u8, endpoint_id as u8, param, completion_code as u8, transfer_len) { return; } } // USBNET: the link's bulk-IN completion, claimed beside the FTDI's for the same reason. // FTDIRX (rmbp A9) — THE BULK-IN COMPLETION, claimed BESIDE its bulk-OUT twin above and for the same reason: the FTDI slot is distinct from the storage slot, so slot_id + the IN dci disambiguate this event from any BOT transfer, and the armed TRB address (or any error on our endpoint) claims exactly our own Normal TRB before the async enumeration FSM below can drop it as stale. `claim` stores four relaxed words and returns — LOCKFIX: `push_event` takes the event-queue lock and MUST NOT be reached from inside the event-ring dispatch, so the bytes are delivered by `service_ftdi_rx` on the next main-loop pass instead. ⚠ LINE-NEUTRAL append: this file is compiled into the Pi kernel8.img and a line added anywhere in it moves every panic `Location` below it; the knob-off byte-identity of BOTH arches is what `./arroyo knoboff ftdirx` measures.
 
                         // An EP0 transfer for the port being ENUMERATED failed (STALL on a
                         // descriptor fetch / SET_CONFIGURATION, babble, transaction error...).
@@ -4683,7 +4683,7 @@ impl XhciController {
                                     // meaningless on a config event, guarded for the same reason.
                                     let class_code = desc_data[4];
                                     let subclass = desc_data[5];
-                                    let protocol = desc_data[6];
+                                    let protocol = desc_data[6]; #[cfg(feature = "usbnet")] { if desc_data[1] == 0x01 { usbnet::note_device(slot_id as u8, class_code, desc_data[17]); } } // USBNET: bNumConfigurations (byte 17) — a walk of configuration 0 that finds no ECM asks for configuration 1 only if the device declares one
 
                                     if desc_data[1] == 0x01 {
                                         serial_println!("xHCI: Device Found. Class={:#x} Sub={:#x} Proto={:#x}",
@@ -4702,7 +4702,7 @@ impl XhciController {
                                         serial_println!("xHCI: >>> HUB DETECTED (slot {}) <<<", slot_id);
                                         self.hubs_pending.push(slot_id as u8);
                                         self.start_next_port();
-                                    } else if class_code == 0x00 {
+                                    } else if class_code == 0x00 || usbnet_dev_class(desc_data[1], class_code) { // USBNET: a Communications device (0x02) reports its class at the DEVICE level; the helper answers only for a DEVICE descriptor (byte 1 == 0x01) because this same chain runs on the CONFIGURATION descriptor's completion, where byte 4 is bNumInterfaces (measured: 2 here looped the request); knob-off the helper is `#[inline(always)] false`
                                         // Class 0 means "Look at Interface Descriptor" (Common for Flash Drives too)
                                         serial_println!("xHCI: Composite Device. Requesting Configuration Descriptor...");
                                         self.request_configuration_descriptor(slot_id as u8);
@@ -4727,7 +4727,7 @@ impl XhciController {
                                         // U2.5: FTDI FT232 tracking — its vendor-specific interface
                                         // (class 0xFF) carries the same bulk IN/OUT pair as MSC, so it
                                         // reuses the bulk-collection arm below.
-                                        let mut is_ftdi = false;
+                                        let mut is_ftdi = false; #[cfg(feature = "usbnet")] let mut is_usbnet = false; #[cfg(not(feature = "usbnet"))] let is_usbnet = false; #[cfg(feature = "usbnet")] usbnet::note_config_header(slot_id as u8, desc_data[5]); // USBNET: bConfigurationValue (byte 5) of the configuration this walk describes; knob-off `is_usbnet` is a constant false the compiler folds
                                         let mut bulk_in: Option<(u8, u16)> = None;
                                         let mut bulk_out: Option<(u8, u16)> = None;
 
@@ -4741,7 +4741,7 @@ impl XhciController {
                                                 if offset + 7 >= 256 { break; }
                                                 current_intf_class = desc_data[offset + 5];
                                                 let intf_subclass = desc_data[offset + 6];
-                                                current_intf_protocol = desc_data[offset + 7];
+                                                current_intf_protocol = desc_data[offset + 7]; #[cfg(feature = "usbnet")] { if usbnet::note_interface(slot_id as u8, desc_data[offset + 2], desc_data[offset + 3], current_intf_class, intf_subclass, current_intf_protocol) { is_usbnet = true; } } // USBNET: the ECM DATA interface (0x0A, after a 0x02/0x06 control interface) — its bulk pair is collected below exactly as storage's and the FTDI's
                                                 serial_println!("xHCI: Interface: Class={:#x} Sub={:#x} Proto={:#x}",
                                                     current_intf_class, intf_subclass, current_intf_protocol);
 
@@ -4771,7 +4771,7 @@ impl XhciController {
                                                         is_ftdi = true;
                                                     }
                                                 }
-                                            } else if desc_type == 0x05 && (is_mass_storage || is_ftdi) { // Bulk Endpoint (MSC or FTDI)
+                                            } else if desc_type == 0x05 && (is_mass_storage || is_ftdi || is_usbnet) { // Bulk Endpoint (MSC, FTDI or USBNET)
                                                 if offset + 6 >= 256 { break; }
                                                 let ep_addr = desc_data[offset + 2];
                                                 let ep_attr = desc_data[offset + 3];
@@ -4787,7 +4787,7 @@ impl XhciController {
                                                     }
                                                 }
                                             }
-                                            offset += length;
+                                            #[cfg(feature = "usbnet")] { if desc_type == 0x24 && offset + length <= 256 { usbnet::note_cs(slot_id as u8, &desc_data[offset..offset + length]); } } offset += length; // USBNET: CS_INTERFACE (0x24) — the Ethernet Networking Functional Descriptor names iMACAddress and wMaxSegmentSize
                                         }
 
                                         // Arm EVERY HID interrupt-IN interface (keyboard and/or pointer)
@@ -4828,7 +4828,7 @@ impl XhciController {
                                                     self.start_next_port();
                                                 }
                                             }
-                                        }
+                                        } #[cfg(feature = "usbnet")] { if !is_mass_storage && !is_ftdi { self.usbnet_after_walk(slot_id as u8, is_usbnet, bulk_in, bulk_out); } } // USBNET: the third bulk-pair arm — take the ECM candidate, or ask for the device's other configuration (RNDIS-first devices), or leave the slot exactly as the stock path would
                                     } else if desc_data[1] == 0x01 {
                                         // ORIN-P7: a DEVICE descriptor whose class we have no driver
                                         // for (e.g. 0xE0 Wireless Controller — the AzureWave 13d3:3549
@@ -6359,7 +6359,7 @@ impl XhciController {
             // the unpark rule applied) against state the clear has not yet flattened.
             self.bot_park_note_disconnect(i as u8);
             self.bot_rescue_clear(i as u8);
-            if self.ftdi_configuring_slot == i as u8 {
+            #[cfg(feature = "usbnet")] { if self.usbnet_configuring_slot == i as u8 { self.usbnet_configuring_slot = 0; } usbnet::disconnect(i as u8); } if self.ftdi_configuring_slot == i as u8 { // USBNET: the link forgets a slot the same instant the FTDI does
                 self.ftdi_configuring_slot = 0;
             }
             if self.ftdi_slot == i as u8 {
@@ -6565,7 +6565,7 @@ impl XhciController {
             // `ftdi_configuring_slot == slot_id` BEFORE the HID branch, so a reused slot would be
             // misrouted into the FTDI console path and its real HID/MSC setup skipped. Guarded on the
             // disposed slot `i`, so a healthy console on another slot is never disturbed.
-            if self.ftdi_configuring_slot == i as u8 {
+            #[cfg(feature = "usbnet")] { if self.usbnet_configuring_slot == i as u8 { self.usbnet_configuring_slot = 0; } usbnet::disconnect(i as u8); } if self.ftdi_configuring_slot == i as u8 { // USBNET: the link forgets a slot the same instant the FTDI does
                 self.ftdi_configuring_slot = 0;
             }
             if self.ftdi_slot == i as u8 {
@@ -13608,7 +13608,7 @@ impl XhciController {
             crate::bootpace::record("ftdi-up");
             ftdi::set_live(true);
         }
-        self.drain_ftdi(); #[cfg(feature = "ftdirx")] self.service_ftdi_rx(); // FTDIRX (rmbp A9) — THE RX HALF OF THE CONSOLE, the one statement this path never had. TX-first on purpose: the drain above is the console's own output and stays ahead of the input that provokes it, so an echoed prompt reaches the wire before the next typed byte is taken off it. Arms one Normal TRB on bulk-IN once the sink is live (the `set_live(true)` directly above), consumes each completion, strips the FT232's TWO modem-status bytes and pushes the rest as `Event::Key` — the same queue the xHCI HID decoder feeds, so `x86_input_service`'s `next_event` drain sees a cable byte exactly as it sees a keystroke. Same shape as `serialrx::drain` on the Orin (arch/aarch64/serial.rs), one pass per device-service pass. DEFAULT OFF. ⚠ LINE-NEUTRAL append: panic `Location` records embed line numbers and this file is compiled into the Pi kernel8.img.
+        self.drain_ftdi(); #[cfg(feature = "ftdirx")] self.service_ftdi_rx(); #[cfg(feature = "usbnet")] self.service_usbnet(); // USBNET: the link's pass rides the same ladder slot — one call, all four x86 ladders. // FTDIRX (rmbp A9) — THE RX HALF OF THE CONSOLE, the one statement this path never had. TX-first on purpose: the drain above is the console's own output and stays ahead of the input that provokes it, so an echoed prompt reaches the wire before the next typed byte is taken off it. Arms one Normal TRB on bulk-IN once the sink is live (the `set_live(true)` directly above), consumes each completion, strips the FT232's TWO modem-status bytes and pushes the rest as `Event::Key` — the same queue the xHCI HID decoder feeds, so `x86_input_service`'s `next_event` drain sees a cable byte exactly as it sees a keystroke. Same shape as `serialrx::drain` on the Orin (arch/aarch64/serial.rs), one pass per device-service pass. DEFAULT OFF. ⚠ LINE-NEUTRAL append: panic `Location` records embed line numbers and this file is compiled into the Pi kernel8.img.
     }
 
     /// PTBURST — bytes staged into ONE bulk-OUT transfer. **64, the FT232's full-speed bulk max packet
@@ -14913,7 +14913,7 @@ impl XhciController {
             self.bot_park_note_disconnect(i as u8);
             self.bot_rescue_clear(i as u8);
             if self.configuring_slot == i as u8 { self.configuring_slot = 0; }
-            if self.ftdi_configuring_slot == i as u8 { self.ftdi_configuring_slot = 0; }
+            #[cfg(feature = "usbnet")] { if self.usbnet_configuring_slot == i as u8 { self.usbnet_configuring_slot = 0; } usbnet::disconnect(i as u8); } if self.ftdi_configuring_slot == i as u8 { self.ftdi_configuring_slot = 0; } // USBNET: same forgetting on this reset path
             if self.ftdi_slot == i as u8 {
                 self.ftdi_slot = 0;
                 self.ftdi_pending_bringup = false;
@@ -17148,3 +17148,214 @@ pub fn bot_residue_disagrees(data_len: u32, data_moved: u32, residue: u32) -> bo
     let device_moved = data_len.saturating_sub(residue.min(data_len));
     residue > data_len || device_moved != data_moved
 }
+
+// ===================== USBNET (LEDGER SO56) — THE CONTROLLER'S HALF OF THE USB ETHERNET LINK =====================
+//
+// Everything the link needs from the controller, at the file tail and `#[cfg]`-gated: the post-walk
+// arm (take the candidate / ask for the other configuration), a full-length configuration request by
+// INDEX, the Configure-Endpoint completion test, and the per-pass service — class bring-up once, then
+// bulk-IN arm/claim/deliver and bulk-OUT staging of queued frames. The synchronous OUT stage reuses
+// `ftdi_pending` + `pump_until_ftdi_done`: that pair is "one outstanding bulk-OUT TD on (slot, dci),
+// completed by the event ring" and nothing FTDI-specific, and the link runs on the same pass right
+// after `drain_ftdi` has consumed its own. See `xhci/usbnet.rs` for the device half and the wire.
+#[cfg(feature = "usbnet")]
+impl XhciController {
+    /// After the descriptor walk of a non-storage, non-FTDI device: configure the ECM bulk pair, or
+    /// request the device's other configuration, or leave the slot to the stock path.
+    fn usbnet_after_walk(&mut self, slot_id: u8, is_usbnet: bool, bulk_in: Option<(u8, u16)>, bulk_out: Option<(u8, u16)>) {
+        if is_usbnet && usbnet::walk_is_candidate(slot_id) {
+            match (bulk_in, bulk_out) {
+                (Some((ia, im)), Some((oa, om))) => {
+                    usbnet::taken(slot_id, im, om);
+                    self.usbnet_configuring_slot = slot_id;
+                    self.configure_endpoints(slot_id, ia, im, oa, om);
+                }
+                _ => {
+                    serial_println!(":: USBNET: ecm candidate slot={} has no bulk pair (in={:?}, out={:?}) — skipping device ::", slot_id, bulk_in, bulk_out);
+                    usbnet::disconnect(slot_id);
+                    self.start_next_port();
+                }
+            }
+        } else if let Some(idx) = usbnet::other_config(slot_id) {
+            self.usbnet_request_config(slot_id, idx);
+        }
+    }
+
+    /// `request_configuration_descriptor` by configuration INDEX (wValue 0x02xx), full length. The
+    /// completion lands in the same `desc_data[1] == 0x02` branch, so the second walk runs the same code.
+    fn usbnet_request_config(&mut self, slot_id: u8, idx: u8) {
+        self.enum_cmd_phys = 0;
+        self.set_enum_stage("cfg-desc");
+        let desc_phys = self.slots[slot_id as usize].descriptor_buffer as u64;
+        if desc_phys == 0 {
+            return;
+        }
+        dma_coherency::clean(desc_phys as usize, 256);
+        let setup_trb = Trb {
+            parameter: 0x0100000002000680 | ((idx as u64) << 16),
+            status: 8,
+            control: (2 << 10) | (1 << 6) | (3 << 16),
+        };
+        self.push_ep0(slot_id, setup_trb);
+        let data_trb = Trb { parameter: desc_phys, status: 256, control: (3 << 10) | (1 << 16) };
+        self.push_ep0(slot_id, data_trb);
+        let status_trb = Trb { parameter: 0, status: 0, control: (4 << 10) | (1 << 5) | (0 << 16) };
+        let status_phys = self.push_ep0(slot_id, status_trb);
+        self.slots[slot_id as usize].ep0_expect_phys = status_phys;
+        self.ring_doorbell(slot_id, 1);
+    }
+
+    /// Configure-Endpoint completed for the link's slot? Consumes the pending mark.
+    fn usbnet_cfg_done(&mut self, slot_id: u8) -> bool {
+        if self.usbnet_configuring_slot != 0 && self.usbnet_configuring_slot == slot_id {
+            self.usbnet_configuring_slot = 0;
+            usbnet::configured(slot_id);
+            serial_println!("xHCI: USBNET Endpoints Configured (Slot {}). Link bring-up pending.", slot_id);
+            return true;
+        }
+        false
+    }
+
+    /// The per-pass service: bring-up once, then frames both ways. Idempotent no-op with no link.
+    pub fn service_usbnet(&mut self) {
+        if let Some(slot) = usbnet::bringup_pending() {
+            self.usbnet_bringup(slot);
+        }
+        if !usbnet::is_up() {
+            return;
+        }
+        let slot = usbnet::slot();
+        if slot == 0 {
+            return;
+        }
+        let (in_ep, out_ep, data_phys) = {
+            let s = &self.slots[slot as usize];
+            let dp = match s.scsi_data_buffer { Some(p) => p as u64, None => return };
+            (s.bulk_in_ep, s.bulk_out_ep, dp)
+        };
+        if in_ep == 0 || out_ep == 0 {
+            return;
+        }
+        let in_dci = ((in_ep & 0x0F) * 2) + 1;
+        let out_dci = (out_ep & 0x0F) * 2;
+        let rx_phys = data_phys + usbnet::RX_BUF_OFFSET as u64;
+        let tx_phys = data_phys + usbnet::TX_BUF_OFFSET as u64;
+
+        // ── RX: one outstanding IN TRB; a completion is one frame (short packet) or a ZLP (0 bytes). ──
+        if let Some((code, residue)) = usbnet::take_done() {
+            if code == 1 || code == 13 {
+                let n = usbnet::RX_CHUNK.saturating_sub(residue as usize);
+                dma_coherency::inval(rx_phys as usize, usbnet::RX_CHUNK);
+                let frame = unsafe { core::slice::from_raw_parts(rx_phys as *const u8, n.min(usbnet::RX_CHUNK)) };
+                usbnet::deliver(frame);
+            } else {
+                usbnet::note_error(code);
+            }
+        }
+        if !usbnet::armed() {
+            dma_coherency::clean(rx_phys as usize, usbnet::RX_CHUNK);
+            let wait_trb_phys = {
+                let ring = match self.slots[slot as usize].bulk_in_ring.as_mut() { Some(r) => r, None => return };
+                let base = ring.get_ptr();
+                match ring.push(Trb { parameter: rx_phys, status: usbnet::RX_CHUNK as u32, control: (1 << 10) | (1 << 5) }) {
+                    Ok(idx) => base + (idx as u64) * core::mem::size_of::<Trb>() as u64,
+                    Err(_) => return,
+                }
+            };
+            usbnet::arm(in_dci, wait_trb_phys);
+            self.ring_doorbell(slot, in_dci as u32);
+        }
+
+        // ── TX: drain the frame ring, one synchronous TD per frame, at most one ring's worth per pass. ──
+        let mut sent = 0;
+        while sent < 8 && usbnet::tx_pending() {
+            let n = {
+                let buf = unsafe { core::slice::from_raw_parts_mut(tx_phys as *mut u8, usbnet::FRAME_CAP) };
+                match usbnet::next_tx(buf) { Some(n) => n, None => break }
+            };
+            match self.usbnet_tx_stage(slot, out_dci, tx_phys, n as u32) {
+                Ok(1) | Ok(13) => usbnet::note_tx_done(),
+                Ok(code) => { usbnet::note_error(code); break; }
+                Err(()) => { usbnet::note_error(0); break; }
+            }
+            sent += 1;
+        }
+    }
+
+    /// CDC-ECM class bring-up, once: SET_CONFIGURATION(the ECM configuration), SET_INTERFACE(data,
+    /// alt 1), the station address from the iMACAddress STRING descriptor, SetEthernetPacketFilter.
+    fn usbnet_bringup(&mut self, slot: u8) {
+        let cfg = usbnet::cfg_value();
+        if let Err(_) | Ok(0) | Ok(2..=u8::MAX) = self.sync_control(slot, 0x00, 0x09, cfg as u16, 0, 0, 0, false) {
+            usbnet::set_up(slot, false, Some("SET_CONFIGURATION"));
+            return;
+        }
+        let data_iface = usbnet::data_iface() as u16;
+        let alt = usbnet::data_alt() as u16;
+        if alt != 0 {
+            if let Err(_) | Ok(0) | Ok(2..=u8::MAX) = self.sync_control(slot, 0x01, 0x0B, alt, data_iface, 0, 0, false) {
+                usbnet::set_up(slot, false, Some("SET_INTERFACE"));
+                return;
+            }
+        }
+        let buf = self.slots[slot as usize].descriptor_buffer as u64;
+        let imac = usbnet::imac_index();
+        let mut mac_ok = false;
+        if imac != 0 && buf != 0 {
+            dma_coherency::clean(buf as usize, 64);
+            if let Ok(1) | Ok(13) = self.sync_control(slot, 0x80, 0x06, 0x0300 | imac as u16, 0x0409, 64, buf, true) {
+                dma_coherency::inval(buf as usize, 64);
+                let d = unsafe { core::slice::from_raw_parts(buf as *const u8, 64) };
+                mac_ok = usbnet::set_mac_from_string_descriptor(d);
+            }
+        }
+        if !mac_ok {
+            usbnet::set_up(slot, false, Some("GET_DESCRIPTOR(string iMACAddress)"));
+            return;
+        }
+        // 0x0E = DIRECTED | BROADCAST | ALL_MULTICAST. Optional: a STALL here leaves directed+broadcast.
+        let filter_ok = matches!(self.sync_control(slot, 0x21, 0x43, 0x000E, usbnet::ctrl_iface() as u16, 0, 0, false), Ok(1));
+        usbnet::set_up(slot, filter_ok, None);
+    }
+
+    /// One frame as one TD on the bulk-OUT ring, awaited. A frame whose length is a multiple of the
+    /// OUT max packet size gets a chained zero-length TRB so the device sees the short packet that
+    /// ends an ECM frame. Uses the `ftdi_pending` one-outstanding-OUT mechanism (see the block comment).
+    fn usbnet_tx_stage(&mut self, slot_id: u8, out_dci: u8, data_phys: u64, len: u32) -> Result<u8, ()> {
+        dma_coherency::clean(data_phys as usize, len as usize);
+        let mps = usbnet::out_mps() as u32;
+        let zlp = mps != 0 && len % mps == 0;
+        let wait_trb_phys = {
+            let ring = self.slots[slot_id as usize].bulk_out_ring.as_mut().ok_or(())?;
+            let base = ring.get_ptr();
+            if zlp {
+                // Normal | CH — the TD continues into the zero-length TRB, which carries the IOC.
+                ring.push(Trb { parameter: data_phys, status: len, control: (1 << 10) | (1 << 4) }).map_err(|_| ())?;
+                let idx = ring.push(Trb { parameter: 0, status: 0, control: (1 << 10) | (1 << 5) }).map_err(|_| ())?;
+                base + (idx as u64) * 16
+            } else {
+                let idx = ring.push(Trb { parameter: data_phys, status: len, control: (1 << 10) | (1 << 5) }).map_err(|_| ())?;
+                base + (idx as u64) * 16
+            }
+        };
+        self.ftdi_pending = Some(FtdiPending { slot_id, out_dci, wait_trb_phys, done: false, completion_code: 0 });
+        self.ring_doorbell(slot_id, out_dci as u32);
+        let pump = self.pump_until_ftdi_done();
+        let pending = self.ftdi_pending.take();
+        pump?;
+        Ok(pending.ok_or(())?.completion_code)
+    }
+}
+
+/// Knob-off twins of the two helpers the enumeration lines call: constant `false`, folded away.
+#[cfg(not(feature = "usbnet"))]
+impl XhciController {
+    #[inline(always)]
+    fn usbnet_cfg_done(&mut self, _slot_id: u8) -> bool { false }
+}
+#[cfg(feature = "usbnet")]
+#[inline]
+fn usbnet_dev_class(desc_type: u8, c: u8) -> bool { desc_type == 0x01 && usbnet::device_class_wants_walk(c) }
+#[cfg(not(feature = "usbnet"))]
+#[inline(always)]
+fn usbnet_dev_class(_desc_type: u8, _c: u8) -> bool { false }

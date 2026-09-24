@@ -884,6 +884,70 @@ net6 surface and retiring the other two clients.
 
 ---
 
+## 10. USBNET — a USB Ethernet link on the shared xHCI path (LEDGER SO56, 2026-09-24)
+
+**Why.** rmbp-ledger B8 asked for a wired NIC on the rMBP and named the wrong part: the board's only
+class-0x02 PCI device is the Broadcom Wi-Fi (`bcma.rs`), and it has no wired port. What every board
+can carry is a USB Ethernet dongle (Peter's two are ASIX AX88179B), so the job is ONE link driver on
+the shared bus: `unaos/crates/kernel/src/drivers/xhci/usbnet.rs`, feature `usbnet`, knob
+`UNAOS_USBNET=1`, cfg-erased when off.
+
+**Shape** (the `ftdi.rs` pattern). The controller owns the endpoints and rings; the module owns the
+device's identity, its bring-up state, an RX ring and a TX ring (8 × 1536), and the one-outstanding
+bulk-IN arm/claim protocol (`ftdirx`'s exact shape — the same event-ring dispatch claims both). The
+controller's half is a file-tail `impl XhciController` in `xhci/mod.rs`: `usbnet_after_walk` (take
+the ECM candidate, or ask for the device's other configuration), `usbnet_request_config` (GET
+CONFIGURATION by index, full length), `service_usbnet` (class bring-up once, then RX arm/deliver and
+TX staging on every device-service pass, riding `service_ftdi`'s slot in all four x86 ladders). Nine
+same-line cfg-gated hooks sit in the enumeration walk, the Configure-Endpoint completion routing, the
+three disconnect paths and the event-ring claim; the two helpers the stock lines call are
+`#[inline(always)] false` knob-off.
+
+**CDC-ECM, the parts used** (USB CDC 1.2, ECM subclass; class codes and requests are the
+specification's). Communications interface 0x02/0x06 with the Ethernet Networking Functional
+Descriptor (CS_INTERFACE 0x24 subtype 0x0F: `iMACAddress` string index, `wMaxSegmentSize`); Data
+interface 0x0A, alt 0 without endpoints and alt 1 with the bulk pair, so bring-up is
+SET_CONFIGURATION(the ECM configuration) → SET_INTERFACE(data, alt 1) → GET_DESCRIPTOR(string
+iMACAddress, 12 UTF-16LE hex digits) → SetEthernetPacketFilter (0x43, DIRECTED|BROADCAST|
+ALL_MULTICAST; optional). One frame per bulk transfer; a frame whose length is a multiple of the OUT
+MPS gets a chained zero-length TRB so the TD ends with the short packet ECM needs. **RNDIS-first
+devices**: QEMU's `usb-net` declares two configurations, RNDIS at index 0 (0x02/0x02/0xFF + 0x0A) and
+ECM at index 1 — a walk of index 0 with no ECM pair and `bNumConfigurations > 1` re-requests index 1.
+
+**How it reaches the stack.** x86: `e1000::raw_rx` / `raw_tx` / `hw_addr` (§5) each fall back to the
+link when `NET_DEVICE` is empty, same-line and cfg-gated, so `smolnet`'s `E1000Nic`, every verb and
+every fixture run over the dongle with no stack edit. aarch64: a `NicOps` is registered into
+`net_phy::net6` at link-up (§8's registry, beside virtio-net and the RTL8168) — compiles, unflown.
+
+**The synchronous drive, and why it exists** (measured). The first dongle-only run brought the link up
+and moved frames, and every smolnet witness still read INCOMPLETE with `tx_drop=45322`: `dhcp_acquire`,
+the ping `pump` and the ring-3 fixtures spin on `raw_rx` for hundreds of thousands of polls with the
+STACK lock held, on the e1000's assumption that the RX ring is readable from the caller's context. A
+USB link's frames only move on the xHCI pass, which could not run meanwhile. So when the RX ring is
+empty (and after every TX push) the accessors try-claim the controller LOAN and run one
+`poll_events` + `service_usbnet` themselves (`usbnet::drive`); `Busy` means the main loop holds it and
+the pass is about to run anyway. The loan is the controller's one mutual exclusion, and no lock of this
+module is held across it.
+
+**Two defects found on the way.** SO55: the enumerator read only 64 bytes of every configuration
+descriptor and walked `wTotalLength` — configurations longer than 64 bytes (RNDIS 67, ECM 80) were cut
+silently; now 256, the buffer's size. And the dispatch chain that routes on `desc_data[4]` runs on the
+configuration descriptor's completion too, where byte 4 is `bNumInterfaces` (2 here looped the
+request until USBNET's arm was gated on the descriptor type; the stock arms still are not — noted).
+
+**Gate.** `UNAOS_WC=1 UNAOS_QEMU_FULL=1 UNAOS_USBNET=1 UNAOS_NOE1000=1 ./arroyo test 120`, scored by
+`x86-usbnet.spec` (arroyo `X86_USBNET_SPEC`; refused on any other knob shape). Pins: the index-1
+request, the candidate line, `:: USBNET: up … mac=40:54:00:12:34:57 filter=ok -> PASS ::`, the DHCP
+lease **10.0.2.30** (the link's own netdev range — the proof the lease did not come over PCI),
+SOCK-1 4/4, SOCK-2 UDP DNS, ring-3 SOCK-2 and SOCK-4 PASS; FORBID any `[e1000] up:`. Go-red by
+mutation of the MAC string parse. Evidence `docs/dev/evidence/rmbp-0924/usbnet/USBNET.md`.
+
+**Owed.** (a) The **AX88179 front-end** — vendor-specific interface, register reads/writes behind
+vendor control requests, a per-transfer RX header to strip; same rings, claim and `NicOps`, so it is
+a bring-up list and a header, not a second driver; QEMU has no model of it, so it flies on a bench
+with the dongle. (b) The aarch64 registration flown (Pi or Orin + dongle). (c) Ring-3 SOCK-3 over the
+link (in the container `done=0` within the wall, where the connect is refused anyway).
+
 ## See also
 - [`docs/dev/OS/`](../) — other kernel subsystem documentation.
 - `unaos/crates/net/` — the implementation.

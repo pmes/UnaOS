@@ -2550,6 +2550,17 @@ fi
 # `:: FTDIRX: rx=… packets=… idle=… errors=… result=OK ::` (a rollup on `note_ftdi_pump`'s log-scale
 # doubling throttle, so it is the last MILESTONE and not a final total). Kept in sync with Cargo.toml.
 [ -n "${UNAOS_FTDIRX:-}" ] && _feats="${_feats}ftdirx,"
+# USBNET (LEDGER SO56): UNAOS_USBNET=1 arms drivers/xhci/usbnet.rs — the USB Ethernet link (CDC-ECM front-end)
+# on the shared xHCI path. x86: smolnet runs over it whenever no e1000 is present (`e1000::hw_addr` falls
+# back to the link); aarch64: registered into net6 at link-up. Arch-neutral, NOT stripped by arm_features
+# (a Pi or an Orin with the dongle is the point). QEMU: the BUILDER knob of the same name attaches
+# `usb-net` on the xHCI with its own user netdev, and UNAOS_NOE1000=1 (builder) omits the e1000e so the
+# stack has ONLY the dongle — that pair is the gated leg (x86-usbnet.spec):
+#   UNAOS_WC=1 UNAOS_QEMU_FULL=1 UNAOS_USBNET=1 UNAOS_NOE1000=1 ./arroyo test 120
+# Witnesses: `:: USBNET: ecm candidate slot=…`, `:: USBNET: up slot=… mac=… -> PASS ::`, then smolnet's
+# own `:: SOCK-5: smoltcp dhcpv4 lease …` and `:: SOCK-1: smoltcp icmp echo … 4/4 replies` over the link.
+# Default OFF => cfg-erased module, same-line sites: byte-identical. Kept in sync with Cargo.toml + builder.
+[ -n "${UNAOS_USBNET:-}" ] && _feats="${_feats}usbnet,"
 # AHCI (rmbp-ledger B89, first rung): UNAOS_AHCI=1 arms drivers/ahci.rs — the SATA host controller
 # driver, READ-ONLY. The rMBP has told us at every boot that it has both of the disks Peter wants
 # (`bdf 0:31.2 8086:1e03 class=01 sub=06 progif=01 (sata)` on every PCI census we have ever taken)
@@ -4390,6 +4401,7 @@ X86_DEFAULT_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-default.spec"
 X86_INSTALL_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-install.spec"
 X86_PTR_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-ptr.spec"
 X86_SPLASH_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-splash.spec"
+X86_USBNET_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-usbnet.spec"   # USBNET (SO56): the dongle-only leg, UNAOS_USBNET=1 UNAOS_NOE1000=1
 X86_REPLAY_SPEC=""   # path of the spec to replay, or "" when none describes this capture
 X86_REPLAY_WHY=""    # why there is none — printed verbatim in the skip line
 x86_pick_capture_spec() {
@@ -4469,6 +4481,14 @@ x86_pick_capture_spec() {
     # about the fixture rather than about the kernel. Refused out loud, with the knob named.
     if [ -n "${UNAOS_INSTALLDEMO:-}" ] || [ -n "${UNAOS_PART_DISK:-}" ] || [ -n "${UNAOS_NOSTORAGE:-}" ]; then
         X86_REPLAY_WHY="a medium knob replaced the usb-storage backing (UNAOS_INSTALLDEMO='${UNAOS_INSTALLDEMO:-}' UNAOS_PART_DISK='${UNAOS_PART_DISK:-}' UNAOS_NOSTORAGE='${UNAOS_NOSTORAGE:-}') — the x86 specs' storage pins describe the DEFAULT stick, and asserting them against a disk QEMU did not attach would be a red about the fixture, not about the kernel."
+        return 0
+    fi
+    if [ -n "${UNAOS_USBNET:-}" ]; then
+        if [ -n "${UNAOS_NOE1000:-}" ] && [ -z "${UNAOS_FATIMG:-}" ]; then
+            X86_REPLAY_SPEC="$X86_USBNET_SPEC"
+        else
+            X86_REPLAY_WHY="UNAOS_USBNET is armed but this is not the leg x86-usbnet.spec was measured on (it wants UNAOS_NOE1000=1 so the stack has ONLY the dongle, and no UNAOS_FATIMG). With the e1000e present the smolnet pins below would pass over the wrong NIC."
+        fi
         return 0
     fi
     case "${UNAOS_FATIMG:-}" in
