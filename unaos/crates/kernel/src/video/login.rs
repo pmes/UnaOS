@@ -603,19 +603,19 @@ fn open_as(state: State) {
         serial_println!("[login] screen open window=no (create refused — headless form)");
         return;
     }
-    WIN.store(id, Ordering::Relaxed);
+    WIN.store(id, Ordering::Relaxed); wm::set_modal_top(id); // LOGINZ (B223): the screen and the alert are the ceiling — a later create or focus-raise cannot pass them (flight 15 §2: "the pw dialog got covered up")
     wm::winid_register_holder(&WIN, "login");
     // Modal over the glass: the console keeps taking glyphs, serial keeps every line, but it stops
     // presenting until the session opens (instgui's rule and reason).
     fbcon::console_present_suspend(true);
-    serial_println!("[login] screen open window={} box={}x{} at ({},{})", id, ow, oh, ox, oy);
+    serial_println!("[login] screen open window={} box={}x{} at ({},{}) modal=true", id, ow, oh, ox, oy);
     repaint();
 }
 
 fn take_down() {
     let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
     if id != wm::WIN_NONE {
-        wm::close(id);
+        wm::clear_modal_top(id); wm::close(id); // LOGINZ (B223): the ceiling goes with the row
         fbcon::console_present_suspend(false);
     }
     let mut f = FORM.lock();

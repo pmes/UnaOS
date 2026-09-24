@@ -15502,7 +15502,7 @@ fn wcb_launcher(_demo_cpu: usize) {
     // must already have been claimed by the fixture above — otherwise this selftest's windows would
     // burn them and the arc's real per-window checksums would never print.
     #[cfg(feature = "witness")]
-    crate::video::wm::focusvis_selftest();
+    crate::video::wm::focusvis_selftest(); #[cfg(feature = "witness")] crate::video::wm::loginz_selftest(); // LOGINZ (B223): same placement reason as focus-vis — mints and closes its own rows after the one-shot latches are spent
     // WC-I: the close->reopen read-back, for the same reason and in the same place — it mints and
     // recycles its own rows, so it must run after every one-shot per-window latch above is spent.
     // Ordered AFTER `focusvis_selftest` because that one leaves the shell z restored and the live set

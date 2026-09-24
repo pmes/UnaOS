@@ -1,5 +1,7 @@
 # LOGINZ — prep
 
+> BUILT the same day by the seat: `docs/dev/evidence/rmbp-0924/loginz/LOGINZ.md` (B223 fixed-unflown). This doc is the plan it followed; M5's call site is the x86 fixture block before `wci_rollup`.
+
 ## The finding
 
 Flight 15 §2 (`docs/dev/evidence/rmbp-0915/flight15/FLIGHT15.md`):

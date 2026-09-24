@@ -3352,7 +3352,7 @@ pub fn focus_changed(asid: u64) {
                 newz = z;
                 raised += 1;
             }
-        }
+        } reassert_modal_top(&mut t, WIN_NONE); // LOGINZ (B223) — ⚠ SAME-LINE fold, line-NEUTRAL: the `[wc-fv] focus raise` that outran the modal on flight 15 (23703–23726 ms) now re-stamps the modal above whatever it just raised; the shell arm (asid=0) passes through it too and is a no-op when no modal is open.
         // VUGMIN-B/C — the z-order is now final for this focus change, so this is the one moment the
         // hidden state has a settled answer. Snapshot only; the publication is outside the guard.
         if asid == 0 {
@@ -23608,7 +23608,7 @@ fn create_inner(
     // This is `wcn_forget`'s precedent — WC-N clears its per-slot cell under the table lock, at the
     // point where the id demonstrably names something new, for the same class of reason.
     controls_declined_rearm(id);
-    t.rows[slot] = row; let winid_generation = winid_slot_bump(slot); let _dockstamp = win_stamp_bump(slot); // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94). **THE CLAIM SITE IS WHERE THE STAMP IS MINTED, and it is minted INSIDE the guard, beside the generation.** This is the one line in the kernel at which a window row becomes a window, and the stamp has to be taken here or it is not an allocation order at all: taken later it would order the DISCOVERY of rows, which is precisely the defect DOCKID2 fixed one layer up (a rank that was the arrival of the first reconcile pass to SEE a window, not the window's own arrival). Under the guard rather than after it, on `controls_declined_rearm`'s argument at the top of this block: no painter and no `dock_scan` can observe `t.rows[slot]` until the guard drops, so a row can never be scanned with a stale or zero stamp — publish-then-stamp would open exactly that window, and a row read inside it would sort as UNSTAMPED and take table order, which is the bug. It is bound and dropped rather than used: the value the dock wants is read back from the row's slot by [`win_stamp_of`], so nothing in `create`'s ABI moves and no caller learns a new number. The bump is UNCONDITIONAL here and gated in the callee (the twin at this file's tail), which is `winid_slot_bump`'s own shape and keeps this line one call wide. // WINID — ⚠ SAME-LINE fold, line-NEUTRAL. The slot's reuse generation is bumped WITH the row it publishes, under the same guard, so `gen=` names the tenant the row now holds. Evidence only — it is NOT in the id; see the WINID block at this file's tail for why packing it into `WinId` was refused (WC-B's syscall ABI, `dock`'s `WinId::MAX` sentinels, and F2's own prior ruling on this very question).
+    t.rows[slot] = row; let winid_generation = winid_slot_bump(slot); let _dockstamp = win_stamp_bump(slot); reassert_modal_top(&mut t, id); // LOGINZ (B223) — ⚠ SAME-LINE fold, line-NEUTRAL, BEFORE the comment: a row born after the login screen or the set-password alert opened is pushed back under it (flight 15: `win=5/6 z=6..10` covered the input-taker); under the guard, beside the publish, so no pass sees the newcomer on top even once. // DOCKSTAMP — ⚠ SAME-LINE fold, line-NEUTRAL (B94). **THE CLAIM SITE IS WHERE THE STAMP IS MINTED, and it is minted INSIDE the guard, beside the generation.** This is the one line in the kernel at which a window row becomes a window, and the stamp has to be taken here or it is not an allocation order at all: taken later it would order the DISCOVERY of rows, which is precisely the defect DOCKID2 fixed one layer up (a rank that was the arrival of the first reconcile pass to SEE a window, not the window's own arrival). Under the guard rather than after it, on `controls_declined_rearm`'s argument at the top of this block: no painter and no `dock_scan` can observe `t.rows[slot]` until the guard drops, so a row can never be scanned with a stale or zero stamp — publish-then-stamp would open exactly that window, and a row read inside it would sort as UNSTAMPED and take table order, which is the bug. It is bound and dropped rather than used: the value the dock wants is read back from the row's slot by [`win_stamp_of`], so nothing in `create`'s ABI moves and no caller learns a new number. The bump is UNCONDITIONAL here and gated in the callee (the twin at this file's tail), which is `winid_slot_bump`'s own shape and keeps this line one call wide. // WINID — ⚠ SAME-LINE fold, line-NEUTRAL. The slot's reuse generation is bumped WITH the row it publishes, under the same guard, so `gen=` names the tenant the row now holds. Evidence only — it is NOT in the id; see the WINID block at this file's tail for why packing it into `WinId` was refused (WC-B's syscall ABI, `dock`'s `WinId::MAX` sentinels, and F2's own prior ruling on this very question).
     drop(t); winid_alloc_witness(id, winid_generation, owner_asid, &minted[..minted_len], title_src); // WINID + WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. AFTER the guard drops, never under it: a `serial_println!` on a routed console asks for a composite and a composite takes `TABLE`. ONE call and ONE line: the title rides the alloc witness rather than a second `serial_println!` beside it, because a second print here costs the furniture its compose passes for the rest of the boot — measured, see `winid_alloc_witness`.
     // WC-D: ids are recycled slot aliases, so a fresh window in a used slot is a DIFFERENT window and
     // deserves its own verdict — clear the one-shot latch here rather than at close, which is the point
@@ -27245,7 +27245,7 @@ pub fn raise_one(id: WinId) -> bool {
     };
     if ok {
         t.next_z = t.next_z.wrapping_add(1).max(1);
-    }
+    } if ok { reassert_modal_top(&mut t, WIN_NONE); } // LOGINZ (B223) — ⚠ SAME-LINE fold, line-NEUTRAL: the dock's tile press is the third z writer; a raised tile cannot pass the login screen or the alert either.
     drop(t);
     if ok {
         composite();
@@ -29190,4 +29190,85 @@ fn glassfix3_clear(t: &Table, z: u32, id: WinId, ox: usize, y: usize, bw: usize,
         }
     }
     top + TITLE_H + BORDER
+}
+
+// ── LOGINZ (rmbp-ledger B223; flight 15 §2, the boot-1 blocker) ────────────────────────────────────
+// The login screen and the set-password alert take every key by design (SO44) but were ORDINARY rows
+// in z: `create_inner` hands out z from the one monotonic `next_z`, and `focus_changed`'s raise arm
+// re-stamps a focused owner's rows above everything — so the launcher and fixture windows born after
+// the alert opened landed on top of it ("the pw dialog got covered up … i cannot select a window").
+// `SHELL_Z` is this file's FLOOR idiom; this is the same idiom pointed UP: one modal row, named by
+// `login::open_as`, re-claimed off `next_z` at the two moments something could pass it (a create, a
+// raise). Nothing else changes: hit-test and composite already order by z, the keyboard router is
+// untouched, and with no modal open every call below is a compare-and-return.
+static MODAL_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(WIN_NONE);
+/// The last verdict `reassert_modal_top` reached (0 never ran with a modal, 2 except, 3 dead, 4 already-top, 5 moved) — read by the fixture, never printed under the guard.
+static MODAL_LAST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Name the row that must stay topmost until [`clear_modal_top`] (the login screen or the alert).
+pub fn set_modal_top(id: WinId) {
+    MODAL_WIN.store(id, core::sync::atomic::Ordering::Release);
+}
+
+/// Release the ceiling — CAS-guarded so a stale close cannot drop a newer modal's pin.
+pub fn clear_modal_top(id: WinId) {
+    let _ = MODAL_WIN.compare_exchange(id, WIN_NONE, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Acquire);
+}
+
+/// Under the table lock: if a modal is pinned, live, and not `except_id`, give it a fresh top z.
+/// Returns the z it moved to, or 0 when nothing moved (no modal, modal is `except_id`, or already top).
+fn reassert_modal_top(t: &mut Table, except_id: WinId) -> u32 {
+    let m = MODAL_WIN.load(core::sync::atomic::Ordering::Acquire);
+    if m == WIN_NONE { return 0; }
+    if m == except_id { MODAL_LAST.store(2, core::sync::atomic::Ordering::Relaxed); return 0; }
+    let slot = (m as usize).wrapping_sub(1);
+    if slot >= MAX_WINDOWS || !t.rows[slot].used || t.rows[slot].id != m { MODAL_LAST.store(3, core::sync::atomic::Ordering::Relaxed); return 0; }
+    let top = t.rows.iter().filter(|r| r.used && !r.compat && r.id != m).map(|r| r.z).max().unwrap_or(0);
+    if t.rows[slot].z > top { MODAL_LAST.store(4, core::sync::atomic::Ordering::Relaxed); return 0; }
+    MODAL_LAST.store(5, core::sync::atomic::Ordering::Relaxed);
+    let z = t.next_z;
+    t.next_z = t.next_z.wrapping_add(1).max(1);
+    t.rows[slot].z = z;
+    t.rows[slot].damage_all();
+    z
+}
+
+/// LOGINZ fixture: a pinned row, a rival created after it, the rival focus-raised — the pinned row
+/// must be topmost after both. The go-red is `reassert_modal_top` not writing `z` (the modal keeps
+/// its birth z while `next_z` advances under it): `after_create` and `after_raise` both read false.
+#[cfg(feature = "witness")]
+pub fn loginz_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) { return; }
+    const ASID_M: u64 = 0xF1A;
+    const ASID_R: u64 = 0xF1B;
+    let sm = &raw const FV_SURF_A as usize;
+    let sr = &raw const FV_SURF_B as usize;
+    let len = core::mem::size_of_val(&FV_SURF_A);
+    let wm_ = create(ASID_M, sm, len, 8, 8, 32, b"lz-modal");
+    if wm_ == WIN_NONE { serial_println!(":: LOGINZ: -> SKIP (window table full) ::"); return; }
+    set_modal_top(wm_);
+    let z_of = |id: WinId| -> u32 { let t = table(); t.rows.iter().find(|r| r.used && r.id == id).map(|r| r.z).unwrap_or(0) };
+    let wr = create(ASID_R, sr, len, 8, 8, 32, b"lz-rival");
+    if wr == WIN_NONE { clear_modal_top(wm_); close(wm_); serial_println!(":: LOGINZ: -> SKIP (window table full) ::"); return; }
+    let (m1, r1, v1) = (z_of(wm_), z_of(wr), MODAL_LAST.load(Ordering::Relaxed));
+    focus_changed(ASID_R);
+    let (m2, r2) = (z_of(wm_), z_of(wr));
+    // Control: with the pin cleared, a raise of the rival passes the ex-modal — proves the ceiling was
+    // the pin and not table order.
+    clear_modal_top(wm_);
+    focus_changed(ASID_R);
+    let (m3, r3) = (z_of(wm_), z_of(wr));
+    let after_create = m1 > r1;
+    let after_raise = m2 > r2;
+    let control = r3 > m3;
+    let ok = after_create && after_raise && control;
+    serial_println!(
+        ":: LOGINZ: modal_z={} rival_z={} create_verdict={} after_create={} raised_modal_z={} raised_rival_z={} after_raise={} unpinned_rival_above={} -> {} ::",
+        m1, r1, v1, after_create as u8, m2, r2, after_raise as u8, control as u8, if ok { "PASS" } else { "FAIL" }
+    );
+    focus_changed(0);
+    close(wr);
+    close(wm_);
 }

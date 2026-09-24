@@ -314,7 +314,7 @@ REQUIRE \[login\] ignition desktop_up=(true|false) console_routed=(true|false) -
 # scored from the metal capture, the same limit §8's ignition pin carries.
 #
 # NO NUMERICS: the id and the geometry depend on the window table and the panel (this file's header).
-REQUIRE \[login\] screen open window=\d+ box=\d+x\d+ at \(\d+,\d+\)
+REQUIRE \[login\] screen open window=\d+ box=\d+x\d+ at \(\d+,\d+\) modal=true
 # The two declines that are HONEST elsewhere and not here: `no surface yet` (`wm::spawn_geometry`
 # answered nothing) and `create refused` (`wm::create_at` returned `WIN_NONE`). This lane has a panel
 # and a window table, so either one is the screen falling back to a headless form on a machine that

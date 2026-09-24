@@ -305,6 +305,11 @@ REQUIRE \[wpace\] win=\d+ asid=0x[0-9a-f]+ live=(yes|no) mode=panel .* spin=\d+ 
 # --- honest), and the retry budget exists because the gap between the two presents IS the first
 # --- present's own composite pass (`[comp2] pass_us=4265` mean under TCG, with a 170 ms tail).
 REQUIRE :: VUGPROBE: shadow-drive win=\d+ tries=\d+ paced=\d+ coalesced=1 shadow=true lost=false .* :: PASS ::
+# --- LOGINZ (rmbp-ledger B223; flight 15 §2, the boot-1 blocker) — a row pinned as the modal ceiling stays
+# --- above a rival created after it AND above that rival after a focus-raise; with the pin cleared the same
+# --- raise passes it (the control). Go-red: `reassert_modal_top` not writing `z` reads after_create=0 after_raise=0.
+REQUIRE :: LOGINZ: modal_z=\d+ rival_z=\d+ create_verdict=5 after_create=1 raised_modal_z=\d+ raised_rival_z=\d+ after_raise=1 unpinned_rival_above=1 -> PASS ::
+FORBID :: LOGINZ: .* -> FAIL
 FORBID :: VUGPROBE: .* :: FAIL ::
 # --- A SKIP is no panel or a full window table. On this gate neither is honest — the DMGOVLP /
 # --- MENUDROP / STRIPVAC rule above, one row and the same panel — so a SKIP is a lost fixture.
