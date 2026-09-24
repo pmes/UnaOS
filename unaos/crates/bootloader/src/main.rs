@@ -1517,7 +1517,7 @@ unsafe fn read_gmux_trace() -> [u32; 7] {
 // =================================================================================================
 
 /// `wcslen`: the length in `u16` units of a NUL-terminated UTF-16 string. C ABI, for the linker.
-#[no_mangle]
+#[unsafe(no_mangle)] // edition 2024 spells the attribute unsafe
 pub unsafe extern "C" fn wcslen(s: *const u16) -> usize {
     let mut n = 0usize;
     loop {
