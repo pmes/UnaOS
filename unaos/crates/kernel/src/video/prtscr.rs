@@ -453,7 +453,7 @@ pub fn service() {
         // collapse. This is the line that was structurally unreachable before slicing: the input
         // pump could not decode the press at all while the write owned the pass.
         if PENDING.load(Ordering::Relaxed) && !DEFERRED_SAID.swap(true, Ordering::Relaxed) {
-            Refusal::InFlight.report();
+            refuse(Refusal::InFlight); // B70: counted AND named — the census's `refused` used to read 0 on a boot that printed this refusal
         }
         let open = { JOB.lock().take() };
         let mut job = match open {
@@ -485,7 +485,7 @@ pub fn service() {
         // opens. Said once per episode so a 7 s verb capture does not print 28 copies of the line.
         PENDING.store(true, Ordering::Relaxed);
         if !DEFERRED_SAID.swap(true, Ordering::Relaxed) {
-            Refusal::InFlight.report();
+            refuse(Refusal::InFlight); // B70: counted AND named — the census's `refused` used to read 0 on a boot that printed this refusal
         }
         return;
     }
@@ -505,6 +505,14 @@ pub fn service() {
 ///
 /// The single exit for the sliced path, so `SLICING` and `IN_FLIGHT` cannot be left set by a branch
 /// that forgot them — the PRTSCR2 "released on every exit path" rule, now that there are more exits.
+/// B70 — a refusal the KEYSTROKE path raises: counted, then reported, in that order and in one place.
+/// `finish`'s `Err` arm counts too; the selftest arms below call `.report()` directly on purpose
+/// (they are not requests, and counting them would skew the `census()` triple asymmetrically).
+fn refuse(why: Refusal) {
+    REFUSALS.fetch_add(1, Ordering::Relaxed);
+    why.report();
+}
+
 fn finish(verdict: Result<Shot, Refusal>) {
     SLICING.store(false, Ordering::Relaxed);
     IN_FLIGHT.store(false, Ordering::Release);
@@ -2039,6 +2047,40 @@ pub fn dir_fixture() {
     if DONE.load(Ordering::Relaxed) || DONE.swap(true, Ordering::Relaxed) {
         return;
     }
+    // B70 — the in-flight door, counted (HERE, not in `selftest_once`: that one is behind the `prtscrst`
+    // feature and this fixture runs on every leg that services the door): hold the door shut, present a pending request to `service`,
+    // and read the census before and after. Needs no session and no volume, so it runs on every leg
+    // that services the door; every latch it touches is put back. The nested `service()` re-enters
+    // `dir_fixture` and returns at once (DONE is already set). Go-red by mutation: the door's
+    // `refuse(..)` reverted to a bare `.report()` reads `counted=0`.
+    static INFLIGHT_DONE: AtomicBool = AtomicBool::new(false);
+    if !INFLIGHT_DONE.swap(true, Ordering::AcqRel) {
+        let (_, _, r0) = census();
+        let was_in_flight = IN_FLIGHT.swap(true, Ordering::AcqRel);
+        let was_pending = PENDING.swap(true, Ordering::AcqRel);
+        let was_said = DEFERRED_SAID.swap(false, Ordering::AcqRel);
+        let was_slicing = SLICING.load(Ordering::Relaxed);
+        if !was_slicing {
+            service();
+        }
+        let (_, _, r1) = census();
+        IN_FLIGHT.store(was_in_flight, Ordering::Release);
+        PENDING.store(was_pending, Ordering::Release);
+        DEFERRED_SAID.store(was_said, Ordering::Release);
+        serial_println!(
+            ":: PRTSCR-REFUSE: inflight door -> named=1 counted={} slicing={} -> {} ::",
+            r1.wrapping_sub(r0), was_slicing as u8,
+            if !was_slicing && r1.wrapping_sub(r0) == 1 { "PASS" } else if was_slicing { "SKIP" } else { "FAIL" }
+        );
+    }
+    // PRTSCR-HOME: a capture belongs to a user, so this selftest cannot run before one exists. That
+    // is a WAIT of exactly the shape the two below already are — announced once, never latched, and
+    // it ends the moment a session opens (SO43's login screen at boot, or the `login` verb). It is
+    // deliberately NOT a FAIL: on every board today there is no session at boot, and a permanent red
+    // that means "the feature is correct and nothing has exercised it" is a broken instrument.
+    //
+    // It is also FIRST, ahead of the mount, so a no-session boot leaves one line and never churns
+    // the PRTSCR-VOL ladder's decline witness on every storage-ready pass.
 
     // --- Arm A: the destination R60 named, and the 8.3 mapping it goes through -----------------
     const FIX_HOME: &str = "/home/una";

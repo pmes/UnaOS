@@ -129,6 +129,15 @@ FORBID :: STRIPVAC: .* :: FAIL ::
 # A SKIP here is a fixture that did not run: on this spec's own gate (QEMU 1280x800, word4 surface)
 # neither skip arm is honest, so one appearing means the panel or the scratch was lost — a red.
 FORBID :: STRIPVAC: .* :: SKIP ::
+# --- STRIPVAC-DEBT (B74): a declined vacate is a DEBT the tenant pays on its next paint pass. The
+# --- fixture plants one for its own tenant and settles it; `settle` is what dock.rs and menubar.rs
+# --- now call ahead of every paint. Reds by a `settle` that forgets to clear the debt.
+REQUIRE :: STRIPVAC-DEBT: planted=1 paid=1 settled=1 owed_after=0x0 -> PASS ::
+FORBID :: STRIPVAC-DEBT: .* -> FAIL ::
+# --- PRTSCR-REFUSE (B70): the in-flight door's refusal is COUNTED, not only named. Reds by the door's
+# --- `refuse(..)` reverted to a bare `.report()` (counted=0). SKIP is honest only mid-slice.
+REQUIRE :: PRTSCR-REFUSE: inflight door -> named=1 counted=1 slicing=0 -> PASS ::
+FORBID :: PRTSCR-REFUSE: .* -> FAIL ::
 
 # --- SPECPINS (2026-09-22) — THE THREE 2026-09-17 FIXTURES THIS GATE COULD SCORE AND DID NOT -----
 # --- MENUDROP, SERIALDOOR and W5SPIN all landed on hw-rmbp on 2026-09-17, each with a green QEMU

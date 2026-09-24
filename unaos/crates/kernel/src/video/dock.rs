@@ -837,12 +837,12 @@ pub fn compose() -> bool {
             // TEARSCOPE — `strip::vacate` IS `strip::erase_rect` plus the census; it returns exactly
             // what the erase returned and this arm behaves as it did. `owed=false`: the slot was
             // cleared above, so a declined erase is a span nothing comes back for.
-            Some(v) => strip::vacate("dock", v, None, false),
+            Some(v) => { strip::settle("dock", None); strip::vacate("dock", v, None, false) } // B74: pay any owed vacate first
             None => false,
         };
     };
 
-    let t1 = crate::arch::now_cycles();
+    let t1 = crate::arch::now_cycles(); strip::settle("dock", Some(l.rect())); // B74: a vacate that declined on an earlier pass is retried here, before this pass's own
     if let Some(v) = vacated {
         // Erase FIRST, then paint: the new strip lands on top of the cleaned area, so the two never
         // race to own an overlapping pixel and the panel never shows a half-erased strip.

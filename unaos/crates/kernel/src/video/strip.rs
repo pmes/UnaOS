@@ -943,6 +943,9 @@ const SAID_TORN: u64 = 4;
 /// The positive twin of [`SAID_STALE`], and it is on the wire for the same reason: the rollup is
 /// rate-limited, so the moment the mechanism first runs gets its own line.
 const SAID_RESTORE: u64 = 8;
+/// B74 — one-shot latch for the first debt a tenant paid: a vacate that declined was retried on a
+/// later pass and erased. The wire shows the mechanism ran, once, beside the UNERASED/STALE lines.
+const SAID_SETTLED: u64 = 16;
 
 /// Per-tenant bar census.
 ///
@@ -970,7 +973,7 @@ struct BarCensus {
     /// request) rather than left standing as flat desktop colour. `restored + flat == uncovered`
     /// over every span whose erase succeeded.
     restored: AtomicU64,
-    restored_px: AtomicU64,
+    restored_px: AtomicU64, owed_rect: AtomicU64, settled: AtomicU64, // B74: the one vacate this tenant still OWES (packed rect, 0 = none) and how many debts were paid
     /// BEAM (orin 26) — paints with a beam observation, microseconds the hold spun for them, and
     /// the exposure census `wcg` keeps for windows (see `H_BEAMCROSS`), here for the bars.
     beamobs: AtomicU64,
@@ -1011,7 +1014,7 @@ impl BarCensus {
             flat: AtomicU64::new(0),
             flat_px: AtomicU64::new(0),
             restored: AtomicU64::new(0),
-            restored_px: AtomicU64::new(0),
+            restored_px: AtomicU64::new(0), owed_rect: AtomicU64::new(0), settled: AtomicU64::new(0),
             beamobs: AtomicU64::new(0),
             beamwait_us: AtomicU64::new(0),
             beamcross_ppk: AtomicU64::new(0),
@@ -1255,7 +1258,7 @@ pub fn vacate(name: &str, old: Rect, new: Option<Rect>, owed: bool) -> bool {
     c.uncovered_px.fetch_add(px, Ordering::Relaxed);
     let (ox, oy, ow, oh) = old;
     if !erased {
-        c.unerased.fetch_add(1, Ordering::Relaxed);
+        c.unerased.fetch_add(1, Ordering::Relaxed); c.owed_rect.store(pack_rect(Some(old)), Ordering::Relaxed); // B74: the debt is REMEMBERED here, whatever `owed` says — `settle` retries it on the tenant's next paint pass
         c.unerased_px.fetch_add(px, Ordering::Relaxed);
         if !owed {
             let n = c.forgotten.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1496,6 +1499,33 @@ const _: () = {
 /// One-shot, `witness`-gated, driven from [`super::dock::selftest`] (the lane compromise that
 /// function already documents for `menubar::selftest`, on the same terms and for the same reason).
 #[cfg(feature = "witness")]
+/// B74 — pay the debt a declined `vacate` left. A tenant calls this on EVERY paint pass, before its
+/// own vacate: if a previous pass's erase declined (panel or scratch lock busy, `-> UNERASED` /
+/// `-> STALE-ENDS` on the wire), the old box is retried against the tenant's current rect with
+/// `owed = true`; success clears the debt and says so once (`-> DEBT-PAID`), a second decline leaves
+/// it for the next pass. Before this the return of `vacate` was discarded at both furniture call
+/// sites and the uncovered pixels stayed stale (TEARSCOPE's finding, rmbp-ledger B74 → A5).
+pub fn settle(name: &str, new: Option<Rect>) -> bool {
+    let c = &BARS[bar_slot(name)];
+    let v = c.owed_rect.load(Ordering::Relaxed);
+    if v == 0 {
+        return false;
+    }
+    let old = unpack_rect(v);
+    if !vacate(name, old, new, true) {
+        return false;
+    }
+    c.owed_rect.store(0, Ordering::Relaxed);
+    c.settled.fetch_add(1, Ordering::Relaxed);
+    if c.said.fetch_or(SAID_SETTLED, Ordering::Relaxed) & SAID_SETTLED == 0 {
+        serial_println!(
+            "[strip] settle tenant={} box={}x{}+{}+{} erased=yes -> DEBT-PAID",
+            name, old.2, old.3, old.0, old.1
+        );
+    }
+    true
+}
+
 pub fn vacate_selftest() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) {
@@ -1558,6 +1588,19 @@ pub fn vacate_selftest() {
         bar_uncovered(old, Some(new)),
         if super::desktop_scene_owns_backdrop() { "yes" } else { "no" },
         if pass { "PASS" } else { "FAIL" }
+    );
+    // B74 — the debt path, deterministic: plant a debt for the fixture tenant and settle it. Go-red
+    // by mutation: a `settle` that does not clear `owed_rect` reads `owed_after=<nonzero>`.
+    let s0 = c.settled.load(Ordering::Relaxed);
+    c.owed_rect.store(pack_rect(Some(old)), Ordering::Relaxed);
+    let paid = settle("stripvac", Some(new));
+    let owed_after = c.owed_rect.load(Ordering::Relaxed);
+    let ds = c.settled.load(Ordering::Relaxed) - s0;
+    super::cursor::repaint();
+    serial_println!(
+        ":: STRIPVAC-DEBT: planted=1 paid={} settled={} owed_after={:#x} -> {} ::",
+        paid as u8, ds, owed_after,
+        if paid && ds == 1 && owed_after == 0 { "PASS" } else { "FAIL" }
     );
 }
 

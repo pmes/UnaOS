@@ -1140,12 +1140,12 @@ pub fn compose() -> bool {
         SLOT.clear();
         return match vacated {
             // TEARSCOPE — accounted, not changed. `owed=false`: the slot is cleared above.
-            Some(v) => strip::vacate("menubar", v, None, false),
+            Some(v) => { strip::settle("menubar", None); strip::vacate("menubar", v, None, false) } // B74: pay any owed vacate first
             None => false,
         };
     };
 
-    let t1 = crate::arch::now_cycles();
+    let t1 = crate::arch::now_cycles(); strip::settle("menubar", Some(r)); // B74: a vacate that declined on an earlier pass is retried here, before this pass's own
     if let Some(v) = vacated {
         // Erase FIRST, then paint, so the two never race to own an overlapping pixel.
         //
