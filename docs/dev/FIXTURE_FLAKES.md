@@ -1976,6 +1976,59 @@ acking it would erase the thing it measures. `--pointer-ack` is pointer-only on
 purpose.
 
 ---
+## `[dmgovlp] verdict … drag_evt=0 … -> FAIL` — load-sensitive on a busy box
+
+**Witness.** The fixture is `wm::dmgovlp_selftest` (`unaos/crates/kernel/src/video/wm.rs`),
+driven from the x86 selftest ladder in `arch/x86_64/syscall.rs`. Its verdict line is
+
+```
+[dmgovlp] verdict passes=12/12 drained=12/12 drag_evt=0 drag_px=0 relay=0 narrow=0/12 cur=12/12 adopt=0 repaint=0 max_ms=0 adopt_stretch=0/4 -> FAIL
+```
+
+and the healthy shape on the same host is `drag_evt=5 drag_px=38590 relay=3 narrow=3/12
+adopt=26 -> PASS`. `-> FAIL` matches `arroyo`'s `FAULT_PATTERNS`, so the whole
+`./arroyo test` leg goes red on it.
+
+**Mechanism — suspected, not established.** `drag_evt` counts occlusion-closure
+*promotions* (`OVLP_DRAG_EVT`, charged at the top of `wcn_note_dragout`), not input
+events. A failing run reports zeros across `drag_evt`, `adopt`, `repaint` and `max_ms`
+together, i.e. the compositor did essentially no promotion work during the twelve passes,
+while `passes=12/12 drained=12/12` says the passes themselves ran. That is consistent with
+the fixture's timing windows closing before the compositor got scheduled on a loaded host,
+but the causal chain has **not** been traced and the root cause is **unknown**.
+
+**The evidence that makes it a flake rather than a regression** (orin-0912b, 2026-09-13,
+20-core box with five concurrent executors). Six x86 QEMU `UNAOS_WC=1` runs:
+
+| # | tree | `rast` | wall | lines | `drag_evt` | verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `b8f5ded9` | ON | 40 s | 1947 | 5 | PASS |
+| 2 | +RASTWIN (pre-merge) | **OFF** | 40 s | 1996 | 0 | **FAIL** |
+| 3 | +RASTWIN (merged) | **OFF** | 20 s | 1966 | 5 | PASS |
+| 4 | +RASTWIN, row closed | ON | 20 s | 1821 | 0 | **FAIL** |
+| 5 | +RASTWIN, row left open | ON | 20 s | 1855 | 5 | PASS |
+| 6 | +RASTWIN, row parked | ON | 45 s | 1989 | 0 | **FAIL** |
+
+**Rows 2 and 3 are the entry.** With `rast` OFF the `rast_demo` module is not linked at
+all (`lib.rs`'s `#[cfg(feature = "rast")] pub mod rast_demo;`) and the image is
+byte-identical to baseline — proven by `./arroyo knoboff rast` — yet the same build gave
+FAIL and then PASS. Nothing in that arc can cause an outcome that varies with the feature
+switched off, so **this fixture cannot convict or acquit a change on a loaded host.** Rows
+4/5/6 were initially read as "closing the row breaks the compositor"; rows 2/3 refute that
+reading, and it was withdrawn.
+
+**What to capture on recurrence.** Host load (`uptime`, count of concurrent
+`arroyo`/`cargo`/`qemu-system-*`), the capture's line count, and whether the ladder's
+neighbours (`APPPIN`, `DOCKID`, `WINMENU`, `PULSEQUIT`, `DOCK`) failed in the same run.
+Re-run the leg **alone on an idle box** before reading it. If it fails on an idle host with
+no other `qemu-system-*` running, it stops being a load artifact and becomes a real defect
+in the fixture's thresholds or in the promotion path.
+
+**Disposition.** On watch, and the thresholds are the thing to question first: `drag_evt >
+0` is asserted unconditionally (`wm.rs`, the verdict's `&&` chain) with no allowance for a
+host that never scheduled the pass. Tracked as orin-ledger A68, which also records the
+separate and more dangerous finding that `./arroyo test`'s default 20 s wall decides
+whether this fixture is reached at all.
 
 ## Adding an entry
 

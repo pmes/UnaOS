@@ -470,7 +470,9 @@ we already have (§2.5) rather than doing anything to the board.
    nothing in this ladder inspects, decrypts or transforms them** — see §5.5 and licence clauses 2.2
    and 2.6 (§4.2).
 3. **There is a second door of the same shape.** `safety-scheduler.{text,data,manifest}` is a second
-   FMC-shaped triple. R19 form: named, not tried, not ruled out — §6 Q7.
+   FMC-shaped triple. R19 form: named, not tried, not ruled out — §6 Q7. **⚠ NOW BUILT AND MEASURED-AS-A-SET:
+   §8.4 confirms it IS three files with the roles mapping unchanged, names their sizes and sha256s, and
+   §8.2/§8.3 make it `UNAOS_GA10B_PROBE5=3` — the next boot, after render15-5a returned F19.**
 
 #### 4.1.3 Where it can be got, and the one line Peter would run
 
@@ -922,7 +924,11 @@ point at the same questions; two are now closed and say so, and three new ones f
    UNKNOWN, and **(c)** does a seat then get the `ls -l` and `sha256sum` output of the three files to
    put in the ledger row, or do you place them on the card yourself and hand the row over?
 
-7. **NEW, LIVE — the second triple.** `safety-scheduler.{text,data,manifest}` (§4.1.2) has the same
+7. **ANSWERED BY R53, AND NOW BUILT — the second triple** (§8). `acr-gsp` returned F19 on render15-5a;
+   R53 ("do not stop to ask, build the next rung and the one after; halt only for a download or a metal
+   boot") makes this a build, not a question, and the only thing left that is Peter's is the power cycle.
+   The arm is `UNAOS_GA10B_PROBE5=3`, gated and staged; the original question is kept verbatim below.
+   **ORIGINAL — the second triple.** `safety-scheduler.{text,data,manifest}` (§4.1.2) has the same
    three-part shape as `acr-gsp` and is a second candidate payload for the very same registers. If
    `acr-gsp` returns F19 — a real image the ROM still refuses — is the second triple worth the next
    power cycle, or does the ladder stop and report? Asked now, before a failure makes it tempting to
@@ -987,11 +993,326 @@ nothing.
 - `NV_PRISCV_RISCV_BR_RETCODE` was **not found** in the three published MIT headers searched for it
   by name (GA102, GH100, GB100). That is "not found in that scope", not "does not exist".
 - **The GA10B firmware file SIZES are still not known** (§4.1), and neither is any file's sha256. No
-  JetPack rootfs was read and no package was opened; the names come from a package listing.
+  JetPack rootfs was read and no package was opened; the names come from a package listing. **CLOSED for
+  the two triples: A61 for `acr-gsp` and §8.4 for `safety-scheduler`, both measured from the staged set.**
 - **The mapping of the three `acr-gsp` files onto `fmccode`/`fmcdata`/`pkcparam` is an INFERENCE**
   (§4.1.2), from file names plus §1.3's roles. It is the load-bearing inference of §5 and it is not
-  measured on this die or in any source read here.
+  measured on this die or in any source read here. **STILL TRUE after render15-5a, and §8.2 turns it
+  into an experiment: `UNAOS_GA10B_PROBE5=4` flies its only alternative, one boot of its own (§8.3).**
 - **Whether 2 MiB is enough for the three sections is UNKNOWN** and is why §5.1 P8 exists.
 - Whether GA10B's boot ROM shares Hopper's address encoding was **not measured** and is §6 Q4.
 - No source in this document has been pointer-verified by a Group A pass, and none of it may gate
   code until one does. **This brief gates nothing: it proposes no code.**
+
+---
+
+## 8. After render15-5a — the two ONE-DELTA arms, and why they are two boots
+
+*(orin-0912b, 2026-09-13, GA10B6. Ledger A80 (the second triple), A81 (the mapping), A82 (the
+announce/result counter). Written AFTER rung 5a flew, so §5's predictions are now measurements.)*
+
+### 8.1 What the flight refuted
+
+`docs/dev/evidence/orin28/render15-5a-vendor-ignition.log`. The loader is an unqualified pass —
+`[ga10bfw] -> LOADED total=40192 window=0x80200000..0x80209d00 sections=3 digests_ok=3`, all three
+vendor files read through the VFS with zero MMIO, each `sha=match` against the A61 digests. The
+ignition returned `br_retcode=0x00000002 br_result=0x2`, `post_lockdown=1 v1_readable=0 halted=1`,
+`DMABUF-UNTOUCHED sections_intact=3/3`.
+
+That is **fail shape F19 with every precondition met**, and it kills the hypothesis the whole ladder
+was built around. Four boots have now varied three different things — the payload (ours vs NVIDIA's
+genuine signed triple), the address encoding (raw vs `pa >> 8`, rung 4e) and the fetch configuration
+(BRFETCH true vs false, rung 4f) — and **the ROM answered `0x00000002` to all four**. §2.5 said an
+unsigned image and a correctly laid-out signed one are indistinguishable by `br_retcode`; the flight
+says something stronger: *the payload is not what this door is rejecting*. "The ROM refuses us because
+our image is not genuine" is REFUTED BY MEASUREMENT.
+
+### 8.2 What is left, and what is dead
+
+F19's own line on the wire named three candidates. One is already dead: **the other address form is
+not a candidate**, because rung 4e measured raw and `pa >> 8` IDENTICAL on this die — spending a power
+cycle on `UNAOS_GA10B_PROBE5=5` would buy a result we already have. The two that remain are the two
+things render15-5a held fixed and never tested:
+
+| arm | knob | what changes | what a FAIL would then mean |
+|---|---|---|---|
+| **the SECOND TRIPLE** (A80) | `UNAOS_GA10B_PROBE5=3`, `ga10bprobe5s` | the PAYLOAD — `safety-scheduler.{text,data,manifest}` in place of `acr-gsp`; same window, same placements arithmetic, same seven writes, same mapping | both vendor triples in the directory are refused through this door, so no image NVIDIA ships for this part opens it and the ladder stops iterating images |
+| **the MAPPING** (A81) | `UNAOS_GA10B_PROBE5=4`, `ga10bprobe5m` | which FILE each BCR register pair points at — `fmccode <- …data…`, `fmcdata <- …text…`, manifest unmoved (`MAP = [1,0,2]`) | §4.1.2's inference is not the error either, and the remaining explanations are all *outside the payload*: fuse/lockdown state, a step of the SEQ we omit, or a door that does not open from EL2 at all |
+
+### 8.3 THE DECISION: two boots, not one — and it is not a preference
+
+**They cannot share a power cycle, and the reason is mechanical rather than methodological.** The
+ignition's second write is `bcr_dmacfg = target_noncoherent_system | lock_locked`, and the rung's own
+line says what that costs: *"THIS SPENDS THE POWER CYCLE: the BCR cannot be reprogrammed again until a
+cold boot"*. The rung's first precondition reads the same register back and REFUSES
+`reason=bcr-locked` when the lock is already set. So **a boot is ONE ignition by construction**: there
+is no second set of BCR values to write after the first ignition, whatever we would like to vary.
+
+A combined arm is therefore not "one boot testing two things" — it is one boot testing ONE thing that
+happens to differ from the flown configuration in two places, and its FAIL would be the least
+informative result the ladder has produced yet: it could not say whether the triple, the mapping or
+neither was responsible, and the next session would have to fly both arms anyway to find out. That is
+the *expensive* ambiguity: a wasted cycle plus the two it was supposed to save.
+
+**The order is A80 first**, on R53 Q7's own terms — "if acr-gsp is refused the safety-scheduler triple
+is the next boot", and it was refused. A81 follows on the boot after. Each arm is built, knobbed and
+gated now, so the second flight costs a card and no session.
+
+**What WOULD honestly ride one boot, and does not need a new rung:** anything READ-ONLY, because
+read-only oracles do not touch the BCR. Rung 5b (`=2`/`=7`) is exactly that shape and is already
+built — it samples the PMU handshake after an `ACR-ACCEPTED` and prints `PMU-NOT-ATTEMPTED
+reason=not-accepted` otherwise. It composes with either arm at no risk; it is simply not informative
+until something is accepted.
+
+### 8.4 The second triple, named and digested
+
+Measured on the bench 2026-09-13 from the SAME staged set as A61
+(`~/unaos-bench/flash/orin/ga10b-fw-36.4.3/`, MANIFEST re-verified with `sha256sum`; R52 — bench media
+only, never in the repository):
+
+| role (§4.1.2 mapping) | file | bytes | sha256 |
+|---|---|---|---|
+| `fmccode` | `safety-scheduler.text.encrypt.bin.prod` | 15,104 | `fbfa3772379ceab967823f8bd1c416fb954f5c6ab1c09f346058a397093400cf` |
+| `fmcdata` | `safety-scheduler.data.encrypt.bin.prod` | 3,072 | `8f317c7c15f77254d1a9ae7263d5b2861fce90b43d72571ffa89b245213fc723` |
+| `pkcparam` | `safety-scheduler.manifest.encrypt.bin.out.bin.prod` | 2,048 | `5847ba43abfe615b3f7fa76701f9b1a087315b17f61119c1c6a5e25124be5fcb` |
+
+**It IS three files and the roles DO map** — the check §4.1.2's fact 3 left open, now made: three
+files, one stem, the same `…text…` / `…data…` / `…manifest…` suffixes as `acr-gsp`, the same
+`…encrypt…` opacity, and nothing else in the directory shares the stem. Total 20,224 B; every section
+is already a multiple of 256, so the aligned total equals the raw total and `window_need = 0x4f00` —
+the 2 MiB rung-4 window holds it a hundred times over (P8 is arithmetic, not a hope). Placements are
+`+0x0` / `+0x3b00` / `+0x4700`, each 256-byte aligned.
+
+One fact worth keeping: **the manifest is 2,048 B in BOTH triples.** That is the size of a PKC
+signature blob and of nothing else in the directory, which is why A81 does NOT permute the manifest
+leg — `pkcparam <- …manifest…` is the one leg of §4.1.2 that is not a guess, and permuting it would
+spend a cycle on an arm no reading supports.
+
+### 8.5 Staging — unchanged, and that is the point
+
+`GA10B/` at the FAT root, exactly as §5.7 and A63's flight: the two triples live in the SAME directory
+on the card, the loader reads the three files its build names and **a file it does not name it does not
+read**. So the A80 card is the A63 card with three more files copied in from the staged set (they are
+already there if the whole directory was staged), `LICENCE.txt` beside them, every file a MANIFEST row.
+No tool change, no new path, no second directory.
+
+### 8.6 The wire the next boot must show
+
+```
+[ga10bprobe5a] rung 5a ARMED (UNAOS_GA10B_PROBE5=3) triple=safety-scheduler map=canonical …
+[ga10bfw] expect role=fmccode  file=/boot/GA10B/safety-scheduler.text.encrypt.bin.prod bytes=15104 sha256=fbfa3772…
+[ga10bfw] expect role=fmcdata  file=/boot/GA10B/safety-scheduler.data.encrypt.bin.prod bytes=3072  sha256=8f317c7c…
+[ga10bfw] expect role=pkcparam file=/boot/GA10B/safety-scheduler.manifest.encrypt.bin.out.bin.prod bytes=2048 sha256=5847ba43…
+[ga10bfw] window_need=0x4f00 window_have=0x200000
+[ga10bfw] -> LOADED total=20224 window=0x80200000..0x80204f00 sections=3 digests_ok=3 fmccode_off=0x0 fmcdata_off=0x3b00 pkcparam_off=0x4700
+[ga10bprobe5a] section=fmccode  file=safety-scheduler.text…     triple=safety-scheduler map=canonical pa=0x80200000 …
+[ga10bprobe5a] section=fmcdata  file=safety-scheduler.data…     triple=safety-scheduler map=canonical pa=0x80203b00 …
+[ga10bprobe5a] section=pkcparam file=safety-scheduler.manifest… triple=safety-scheduler map=canonical pa=0x80204700 …
+[ga10bprobe5a] bcrheld=7/7 … form=raw … -> BCR-ALLHELD
+[ga10bprobe5a] verdict br_retcode=0x… triple=safety-scheduler map=canonical … -> <ACR-ACCEPTED | BROM-VERDICT-FAIL code=…>
+[pwrshutoff] … PSCI SYSTEM_OFF (0x84000008) via SMC
+```
+
+The A81 boot is the same wire with `UNAOS_GA10B_PROBE5=4`, `triple=acr-gsp map=swapped`, and the
+`section=` lines showing `fmccode <- …data…` and `fmcdata <- …text…` at `pa=0x80207000` and
+`pa=0x80200000` respectively.
+
+**PASS is still `ACR-ACCEPTED`** on either arm — the lockdown dropping or the v1 mirror opening, a
+GPU-side observable no unsigned payload has ever produced. A `BROM-VERDICT-FAIL` is a recorded result
+under R19, never a stop; what it is NOT is a reason to fly a third payload in the same session.
+
+### 8.7 The announce-before-write counter was lying (A82)
+
+Found while scoring the 5a capture and worth stating in this brief, because the discipline it guards is
+the only forensic instrument this ladder has for a boot that dies inside a write. `scorer-ga10b4.sh`
+reported 37 announces against 38 results on render15-5a. **Both sides were wrong, and they had been
+cancelling.**
+
+1. The scorer's counters matched the WHOLE capture rather than the GA10B witness families, and every
+   full Orin boot carries one XUSB bring-up line — `:: tegra: JB6 — CSB page-sel 0x9c: pre=0x00000000
+   wrote=0x1234 rb=0x00001234 STICKS=true ::` — which contains ` wrote=0x` and is nobody's GA10B write.
+   It inflated `write_results` by exactly 1 in **all four** flown captures.
+2. Rung 4b's **ignition write** — `priscv_cpuctl` startcpu, the most important write in the ladder —
+   printed an announce and NO result line. Rung 5a had always printed one; rung 4b never did.
+
+So `render13-boot2`, `render14-boot3` and `render15-4f` each read a false 23/23 while genuinely
+carrying an unanswered announce, and only the 37-write 5a capture was unbalanced enough to show it.
+Both sides are fixed: the counters are bound to the families, `ga10b_probe.rs` prints the 4b result
+line (the readback rung 5a flew as `read=0x00000080`), and the bare total is now backed by a PAIRING
+WALK that NAMES the unpaired announce instead of printing a difference of two integers. The three
+pre-fix captures are re-scored honestly — `unpaired_announces=1 first=priscv_cpuctl` — and cannot be
+retro-fixed; that reading IS the finding.
+
+## 9. THE WRITTEN FINDING — the BCR/BROM door is closed by measurement (GA10B7, 2026-09-15)
+
+Six configurations flew through the boot ROM's BCR door and every one returned
+`br_retcode=0x00000002`: our blob-free image raw (render13); `pa>>8` (rung 4e, render14 boot 3);
+`BRFETCH=FALSE` (rung 4f, render15-4f); NVIDIA's `acr-gsp` triple canonical (rung 5a, render15-5a);
+NVIDIA's `safety-scheduler` triple canonical (twice, byte-identical, render15-5s boots 1 and 2); and
+NVIDIA's `acr-gsp` triple with code/data swapped (render15-5m). Every variable rung 4 and rung 5a can
+reach — address form, fetch configuration, payload authenticity, which vendor triple, the code/data
+mapping — has been varied and the answer did not move (ledger A61 2026-09-15 addendum, A62, A63).
+This section is the finding the ladder owes: it decodes the retcode, names the two doors, closes the
+mailbox and lockdown questions, and states the recommendation. **No code is proposed and none is
+touched (deliverable 5 resolves to shape (b), NO boot).**
+
+Every source below was read read-only on 2026-09-15 by executor GA10B7; no byte of any of them enters
+the repository (R52). Each carries its path and its licence.
+
+### 9.1 Deliverable 1 — what `br_retcode=0x00000002` decodes to, and the phase field that does not exist publicly
+
+**The decode.** `br_retcode` is at priscv-base-relative `0x65c` (BAR0-absolute `0x1711165c`;
+rung-1 read it as `0x0` before any ignition — [`GA10B-LADDER.md`](../../evidence/orin14/GA10B-LADDER.md)
+lines 59, 327). Its `RESULT` field is bits `[1:0]`: `0x2 = FAIL`, `0x3 = PASS`, `0x0`/`0x1` = still
+running. So `0x00000002` decodes as **`RESULT = FAIL`, and bits `[31:2]` all zero.**
+
+**The phase field is not public.** The value of this finding is what the upper 30 bits are NOT. The
+register `NV_PRISCV_RISCV_BR_RETCODE` — and therefore any `RESULT`/`PHASE`/`SYNDROME`/`INFO`
+decomposition of it — is **absent from every public source this seat could reach**:
+
+| source | path | licence | result |
+|---|---|---|---|
+| open-gpu-kernel-modules | `src/common/inc/swref/published/ampere/ga102/dev_riscv_pri.h` | MIT (SPDX in file) | defines `BCR_CTRL`, `CPUCTL`, `IRQ*`, `ICD*`, `TRACE*`, `PRIV_ERR*`, `HUB_ERR_STAT`; **no `BR_RETCODE`, nothing at `0x65c`** |
+| open-gpu-kernel-modules | `src/common/inc/swref/published/hopper/gh100/dev_riscv_pri.h` | MIT (SPDX in file) | defines `BCR_DMACFG` (`0x66c`), `BCR_DMAADDR_{FMCCODE,FMCDATA,PKCPARAM}_{LO,HI}` (`0x670`–`0x684`); **no `BR_RETCODE`, nothing at `0x65c`** |
+| Linux / nouveau | `drivers/gpu/drm/nouveau/include/nvhw/ref/gh100/dev_riscv_pri.h` | MIT (file header) | defines only `CPUCTL` (`0x388`, `HALTED`); **no `BR_RETCODE`** |
+| open-gpu-kernel-modules | `src/nvidia/src/kernel/gpu/gsp/arch/hopper/kernel_gsp_gh100.c` | MIT (SPDX in file) | the GSP-FMC bootstrap; **does not read or decode `br_retcode`** — it waits on priv-lockdown release and reads `MAILBOX0` (§9.4) |
+| Linux / nova-core | `drivers/gpu/nova-core/` GSP-boot patch (lkml.iu.edu/2509.3/01412.html) | GPL-2.0 | polls `is_riscv_active()`; **does not decode `br_retcode`** |
+| NVIDIA/nvgpu (github.com/NVIDIA/nvgpu) | repo root | MIT/GPL dual (README) | archived 2021, `gk20a`-era; **no GA10B, no RISC-V `br_retcode`** |
+
+The repo's own ACKED rung-1 facts already marked this open: "the ROM's reason code, if any, lives in
+`br_retcode`'s upper bits" ([`GA10B-LADDER.md`](../../evidence/orin14/GA10B-LADDER.md) line 271) — an
+UNKNOWN, never a decode. This seat's search confirms it against primary sources: **public sources
+decode the `RESULT` field only. There is no public `PHASE` or `SYNDROME` field for this register.**
+
+**What this settles for all six flights at once.** `0x00000002` is `FAIL` with a zero upper word.
+It does not name a phase, because no phase is encoded in anything public — and on our own wire the
+upper bits were measured zero directly (`reason_bits_or=0x00000000`, 20 samples, rung 4c). So the
+retcode is a **one-bit oracle** by the limit of what is public: it says the ROM rejected, and it
+cannot say whether the rejection was before fetch, at descriptor, at signature, or at launch. Six
+identical `0x00000002` values are six "FAIL, no syndrome," not six statements about a stage. **This
+is why varying the payload never moved the answer, and it is why no further boot through this
+register can localise a failure** (§9.5).
+
+### 9.2 Deliverable 2 — the two doors, and which one the ladder has knocked on
+
+**Door 1 — the BRFETCH-DMA door — is exactly what every rung flew, and it is the canonical Hopper GSP
+boot-ROM door.** `_kgspBootstrapGspFmc_GH100()` in `kernel_gsp_gh100.c` (MIT) programs, in order:
+the three BCR DMA addresses **`>> 8`** (`RISCV_BR_ADDR_ALIGNMENT = 8`) into
+`BCR_DMAADDR_{FMCCODE,FMCDATA,PKCPARAM}_{LO,HI}`; `BCR_DMACFG = TARGET | DMACFG_LOCK_LOCKED`;
+`kflcnRiscvProgramBcr(NV_TRUE)` (BRFETCH enabled); then `CPUCTL = STARTCPU_TRUE`. That is,
+line for line, rung 4b's write set — `bcr_dmacfg=0x80000002` (`LOCK|NONCOHERENT`), `bcr_ctrl=0x111`
+(BRFETCH TRUE, RISCV, VALID; decoded against the ga102 MIT header, §2.2), the DMA addresses, then
+`cpuctl=0x1` — and rung 4e's `>>8` form is the same door with the source's own shift applied. **The
+ladder has been on the correct, canonical door the entire time.** The door was not the error.
+
+**Door 2 — the GSP-ACR / IMEM-DMEM-port-load door — is a genuinely different load mechanism, and its
+GA10B write list does not exist in any source this seat could read.** GA10B5A's fact-finding recorded
+from nvgpu (orin-queue, 2026-09-12) that nvgpu's second route is "MAILBOX0/1 descriptor + `bcr_ctrl
+0x11` + IMEM/DMEM PORT LOADS." `bcr_ctrl = 0x11` is `BRFETCH = FALSE` (§2.2): "configure the BCR but
+do **not** have the boot ROM fetch through it." Mechanically that means the image must already be
+**resident in the falcon's IMEM/DMEM**, placed there by CPU port copies
+(`FALCON_IMEMC`/`IMEMD`/`DMEMC`/`DMEMD`) before `STARTCPU` — a write class the ladder has never used.
+Rung 4f flew `bcr_ctrl=0x11` (BRFETCH FALSE) **without** those port loads, so the ROM had no resident
+image to verify and returned `0x2` — the expected result, and confirmation that door 2 is not
+"flip one bit" but a different loader. **This seat could not obtain the GA10B write list for door 2**:
+NVIDIA/nvgpu on GitHub is archived `gk20a`-era; the L4T `linux-nvgpu` tree (nv-tegra gitweb) returned
+empty to WebFetch; no MIT header carries the GA10B IMEM/DMEM ACR sequence. Per this brief's own rule
+— *a door is not a candidate until its write list exists* — **the GSP-ACR door is not a candidate.**
+
+**Is `0x2` the retcode for a door mismatch?** Cannot be answered from public sources, because there
+is no phase field (§9.1). Mechanically, BRFETCH-FALSE with no IMEM/DMEM image yields a FAIL that is
+byte-identical (`0x2`) to a signature FAIL. So "wrong door" and "wrong signature" are indistinguishable
+at this register — which is itself the point: the retcode cannot separate them, so a door-2 boot could
+not be attributed on failure either (§9.5).
+
+### 9.3 Deliverable 3 — the mailbox channel is downstream of the verdict; the question closes
+
+`kernel_gsp_gh100.c` (MIT) writes the **GSP-FMC arguments buffer** physical address to the falcon
+mailbox — `MAILBOX0 = NvU64_LO32(physAddr)`, `MAILBOX1 = NvU64_HI32(physAddr)`, **unshifted**, before
+`STARTCPU`. The same `MAILBOX0` is where, per `_kgspLockdownReleasedOrFmcError()`, "the GSP-FMC
+(namely ACR) logs error codes during boot." So the mailbox is the **FMC's** channel — arguments in,
+error codes out — **consumed by the FMC, not by the boot ROM.** The boot ROM verifies and launches
+the FMC image via the BCR DMA descriptor (§9.2); it does not read the mailbox to decide its verdict.
+
+**Answer:** the GA10B boot ROM does **not** read a boot-parameter descriptor from `MAILBOX0/1` before
+evaluating the BCR. Our null mailbox (`mbox-arg-written=none`, `mbox-post-read=0x00000000`,
+render15-5s/5m) is the expected reading for a boot-ROM-stage rejection: the FMC never ran, so it
+neither consumed an argument nor logged an error. **Writing the mailbox and re-flying would change
+nothing about the `0x2`,** because the failing stage is upstream of the mailbox's only consumer. The
+question is closed. (Register offsets are Hopper-confirmed and GA10B-inferred from the shared
+architecture; the conclusion does not depend on the inference, since whatever GA10B's mailbox does,
+it cannot be read before the FMC the ROM refused to launch runs.)
+
+### 9.4 Deliverable 4 — priv-lockdown is the ROM's own pre-verdict state, unreachable from EL2
+
+`_kgspLockdownReleasedOrFmcError()` in `kernel_gsp_gh100.c` (MIT) reads `FALCON_HWCFG2` and tests
+`FLD_TEST_DRF(_PFALCON, _FALCON_HWCFG2, _RISCV_BR_PRIV_LOCKDOWN, _UNLOCK, hwcfg2)`. Priv-lockdown is
+a `HWCFG2` field (our `hwcfg2 raw=0x0001a733`, lockdown bit set on every flight). The driver waits
+for that field to transition to `_UNLOCK` as its **success** signal, and reads `MAILBOX0` only if it
+has not. So:
+
+- **What engages it:** the boot ROM holds priv-lockdown at reset on a production-secure part
+  (`opt_priv_sec_en=1`, rung 1). It is the locked default the ROM maintains until it has verified an
+  image.
+- **What releases it:** the boot ROM's own successful verification-and-launch of a signed FMC. It is
+  the ROM's **output**, not a precondition anyone supplies.
+- **Is the released state reachable from EL2 without a forbidden write class?** **No.** There is no
+  "unlock" MMIO write available to EL2 that is not itself gated by the lockdown; release is a state
+  the ROM enters only when it accepts an image signed against fuses we do not hold.
+
+**Therefore the ladder's never-asked question — "will the ROM accept any image while lockdown=1?" —
+has this answer: `lockdown=1` is not a separate wall in front of the ROM. It is the ROM's pre-verdict
+state, and it drops precisely when (and only when) the ROM accepts a signed image.** Its persistence
+across all six flights is a restatement of the six FAILs, not an independent obstacle we failed to
+clear. There is nothing to turn off before the ROM will look; the ROM looks, and lockdown drops iff
+it accepts. Crucially, **priv-lockdown release and the legacy-v1 mirror becoming readable are already
+instrumented (§2.6) and read the negative side on all six flights** — so a PASS on any future door
+would still be legible without the retcode.
+
+### 9.5 Deliverable 5 — the recommendation: (b) NO boot; the route is closed at this altitude
+
+Of the three shapes the brief names, the honest answer is **(b): no boot is worth a power cycle on
+this route.** The BCR/BROM BRFETCH-DMA door is closed by six-fold measurement, and each of the three
+things the wire pointed at resolves against a further boot:
+
+1. **The mailbox channel** is downstream of the verdict (§9.3): not a cause, not worth a boot.
+2. **The GSP-ACR / IMEM-DMEM door** is a real, different mechanism, but its GA10B write list does not
+   exist in any source this seat could read (§9.2): by the brief's own rule it is **not a candidate**.
+3. **Priv-lockdown** is the ROM's own pre-verdict gate, released only by a trusted signature and
+   unreachable from EL2 (§9.4): not a wall we can clear.
+
+**The deciding asymmetry.** A future door boot could teach something only on **success** — the
+lockdown drop and v1-mirror open are already instrumented (§9.4). On **failure** it returns the same
+inattributable `0x00000002` and held lockdown we already have six times (§9.1). Success requires
+either a signature the die's fuses trust (we do not hold it) or NVIDIA's earlier-stage signed boot
+chain running above EL2 (we do not run it). So the expected value of any further boot is ~zero and its
+failure is uninformative — the exact "ambiguity is the expensive outcome" trap the ladder was built to
+avoid (GA10B6's reasoning; F19).
+
+**A read-only probe (shape (c)) is not actionable now either.** Rung 5b (A65) is read-only but gated
+behind rung 5a's `ACR-ACCEPTED`, which never occurs, so as built it is unreachable. The one read-only
+probe that *would* discriminate the surviving hypotheses — a zero-MMIO read of the lockdown's actual
+reach at the host/PFIFO/CE PRI apertures (A61 falsifier #1) — **cannot be written**, because the
+ACKED facts file has no offsets for those apertures. Obtaining them needs the same unread source as
+(b) below.
+
+**What a different altitude would need (named, so a future seat resumes rather than re-derives):**
+
+1. **A source not yet read — nvgpu's GA10B RISC-V/ACR boot sequence** in NVIDIA's L4T `public_sources`
+   (`linux-nvgpu`, nv-tegra gitweb), to (a) obtain the host/PFIFO/CE/PMU PRI apertures so the
+   lockdown-reach read (A61 falsifier #1) can be written at zero MMIO, and (b) produce the GSP-ACR
+   door's complete, safe write list so it could become a candidate. This seat's WebFetch could not
+   reach it; a fetch of that tree is the unblocking step.
+2. **A public phase decomposition of `NV_PRISCV_RISCV_BR_RETCODE`** — absent from every source
+   searched (§9.1). Without it, every reachable door's FAIL is an inattributable `0x2`.
+3. **Acknowledgement of the altitude itself:** on a production-fused GA10B the GPU is brought up by
+   NVIDIA's signed multi-stage boot chain (MB1/MB2/TZ) with priv-lockdown owned by the boot ROM and
+   released only on its own trusted-signature launch (§9.4). That is a signed loader at a privilege
+   above EL2 which we do not hold — an altitude no EL2 BCR poke reaches, regardless of payload. This
+   is a licence/loader boundary (a signed image + the fuse trust to launch it), not a coding gap.
+
+**R19 form:** this is *failed under these conditions* — a production-fused GA10B, priv-lockdown
+engaged, the BRFETCH-DMA door, and the public sources as they stood on 2026-09-15 — not "ruled out."
+The `ga10bprobe4*`/`ga10bprobe5*` code and knobs are KEPT. The falsifiers are the three items above.
+Peter flies nothing on the GPU line until a source above names a boot whose failure would teach what
+six failures have not (R53). This finding names none, and says so.

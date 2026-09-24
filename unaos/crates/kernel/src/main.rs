@@ -7280,7 +7280,7 @@ fn rast_demo_maybe() {
     unaos_kernel::rast_demo::run_mc(&mut screen); // RAST-MC: the multi-core rung runs FIRST (1-core baseline + frame-pipelined pass, both unpaced) so the paced visible spin stays the last panel content of the boot; same-line per the zero-added-lines convention above. ORIN-RASTGLASS: the `post` glass read-back, fired the instant `run` returns — nothing is dispatched on this core in between, so it is the ONE sample that can establish whether the blit reached the scan-out at all (`late`, from the pump sweep, then says whether it survived). `drop(screen)` first so the double buffer's own `flush` has certainly landed before the panel is read back; also releases the back buffer to the heap ahead of ~2048 volatile VRAM reads. Same-line per the convention above.
     unaos_kernel::rast_demo::run(&mut screen);
     #[cfg(feature = "tegra")]
-    { drop(screen); unaos_kernel::arch::display_tegra::orin_rast_glass_post(); }
+    { drop(screen); } // A67 (RASTWIN, folded from hw-jetson 2026-09-24): the `orin_rast_glass_post()` call that stood here MOVED into `rast_demo::run`, onto the last composited frame — once the demo renders into a `wm` row, `run` closes that row before returning, so a sample taken here reads the repainted desktop and reports NO-RAST-INK on every healthy boot. Line-neutral; `drop(screen)` stays so the double buffer's flush has landed before the run's own read-back.
     #[cfg(feature = "pi")]
     {
         // Honest fps for the WHOLE pi wire-in: measured wall clock across `Screen` construction, the

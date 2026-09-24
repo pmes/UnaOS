@@ -307,18 +307,108 @@ constant.
 ## 4. The demo (`UNAOS_RAST=1`, and `UNAOS_PIRAST=1` on the Pi)
 
 A knob-gated demo (`rast` Cargo feature → `unaos/crates/kernel/src/rast_demo.rs`)
-renders a spinning, flat-shaded, z-buffered cube through the panel `Screen`. It is
+renders a spinning, flat-shaded, z-buffered cube **into a compositor window**. It is
 **call-never-edit** with respect to the shared video path: it renders into its own
-heap-owned RGBA8 back buffer (the double buffer), then presents each frame through
-the public `Screen::put_pixel` / `Screen::flush` API — it touches no shared surface
-code. The demo renders at a fixed 320×240 and blits centered on the panel (a full-
-panel per-pixel present is far too slow to witness), runs a bounded 90 frames, then
-hands the panel back to the shell, emitting one honest fps line:
+heap-owned RGBA8 back buffer, converts that into a `wm` row's own ARGB8888 surface,
+and presents through the public `wm::create_at` / `wm::present_rows` / `wm::close`
+API — it touches no shared surface code. The demo renders at a fixed 320×240, runs a
+bounded 90 frames, closes its window and returns, emitting one honest fps line:
 
 ```
-:: RAST: software rasterizer demo — 320x240 spinning cube centered on 1280x800 panel, 90 frames ::
-:: RAST: 90 frames in 4115 ms — 21.871 fps (software rasterizer, panel present) ::
+[rastwin] spin open win=1 owner=0xffffff61 surf=320x240 box=330x284 scale=1 at (475,258) panel=1280x800 title=3D (…)
+[rastwin] damage frames=89 presents=89 still=0 rows_presented=11308 rows_if_whole_box=21360 widest_band=146 of 240 panel_px_written_outside_row=0
+:: RAST: 90 frames in 3553 ms — 25.330 fps (software rasterizer, compositor window) ::
+:: RASTWIN: 3D-in-a-window win=1 geom=OK hit=OK dmg=OK rows=11308/21360 probe=(640,275) -> PASS ::
+[rastwin] spin close win=1 -> CLOSED (surface freed; desktop untouched)
 ```
+
+### 4.1 RASTWIN — why the demo stopped owning the panel (orin-0912b, 2026-09-13)
+
+The demo predates the desktop, so it owned the **panel**: `run` filled the whole
+screen with `0x0010_1018`, blitted a centred 320×240 through `Screen::put_pixel` for
+90 frames, and handed the panel back. On a machine with a compositor, a menu bar, a
+dock and windows that is the wrong shape — and the tegra call site had to
+`fbcon::detach()` around it to stop a second writer, which is the shape of a design
+that cannot share the glass.
+
+What changed, each item measured on `UNAOS_QEMU_FULL=1 UNAOS_WC=1 UNAOS_RAST=1
+./arroyo test`:
+
+- **Nothing outside the row is touched.** There is no `fill_screen`, no
+  `Screen::put_pixel` and no `Screen::flush` left on this path; the only writer of
+  panel pixels is `wm::composite`, through the row's own clip. The `Screen` the three
+  call sites still hand in is unused (`_screen`), which is why their signatures — two
+  of them on folded, line-neutral statements — did not have to change.
+- **Damage is the cube's rect, never the panel.** The RGBA→ARGB blit compares each
+  word before it writes and tracks the row band that actually moved, so a frame
+  presents `present_rows(id, dy0, dy1)` over the rows the cube crossed and nothing
+  else. Measured: **11 308 of a possible 21 360 rows (52.9 %)**, widest single band
+  146 of 240. Before, the demo wrote 76 800 panel pixels per frame plus a
+  1 280×800 `fill_screen`, none of it through the compositor's damage model at all.
+- **It is a real window.** The row is minted under its own kernel-band owner
+  (`KERNEL_OWNER_BASE + 0x61`), so `wm::hit_test` names it: the `hit=OK` leg
+  hit-tests the centre of the row's own title bar — the strip `wm::drag_begin`
+  accepts a press on — and gets `(id, owner)` back. An owner of `0` (the shape
+  `login.rs` uses deliberately) is skipped by `hit_test` outright and would have been
+  furniture the pointer cannot name.
+- **Faster, as a side effect.** 25.330 fps against the panel-poking path's 16.219 fps
+  on the same host: a window present writes cached RAM and lets the compositor move
+  only the damaged band, where the old path pushed every pixel through `put_pixel`.
+
+**What is bounded is the SPIN, not the window.** `FRAMES` is what makes QEMU boot straight
+through to the interactive path and it is unchanged. When it runs out the row is PARKED: it
+stays on the desktop with its last frame, draggable and raisable, and closable by the
+ordinary route — `RW_WIN` is registered with `wm::winid_register_holder`, so a close disc, a
+Quit or `wc_close_furniture` clears the cell through `wm::close` exactly as for any other
+furniture row. A window that erases itself three seconds after it opens is a demo; one that
+stays is an app. The cost is ~300 KiB retained for the boot, held by a module-owned cell
+(`pulsewin`'s `STORE` shape), and the surface deliberately outlives the row on an operator
+close — the safe direction, since the unsafe one is freeing a surface a live row still points
+at. On tegra the two passes SHARE the row: `run_mc` opens and parks it and `run` takes it back
+out, so a boot has one 3D window rather than two in sequence.
+
+**ORIN-RASTGLASS was repaired in the follow-up commit (A67).** The probe used to locate
+RAST's ink by restating this module's constants — a centred 320×240 box — and to require the
+backdrop constant *outside* it. A windowed renderer falsified both regions, and for one commit
+the probe was blind. It now works the other way round:
+
+- **It asks where the row is.** `rast_demo::rastwin_seat()` publishes what `wm::info` actually
+  seated — content rect and outer box, already multiplied by the compositor's integer `scale`.
+  That multiply is what no restatement could have got right: on a 1920×1200 panel a 320×240
+  surface composites at 640×480 while `info.w`/`info.h` still read 320×240. The restated
+  `RG_DEMO_W`/`RG_DEMO_H` constants are deleted.
+- **Three populations, the outer one inverted.** MARGIN (inside the content rect, owned by the
+  clear) must be the backdrop; MIDDLE must carry at least one non-backdrop pixel, so "the cube
+  drew" stays a separate claim from "the clear landed"; OUTSIDE (full-width strips above and
+  below the outer box, each one contiguous rectangle so no rect subtraction can be got wrong)
+  must carry **zero** backdrop pixels. That last is the old surround test with its sense
+  reversed, and it is the stronger claim: *the renderer touched nothing outside its row*
+  becomes a property measured from the glass rather than read off the code.
+- **Blind before falsely green, made explicit.** `RAST-NO-WINDOW` is reported when no seat was
+  ever published, and `RAST-LEAKED-OUTSIDE` when backdrop ink is found outside the row —
+  ordered above the row's own arms, because ink on glass the renderer does not own is a defect
+  however good the row looks. Neither is in the passing set.
+- **The `post` sample moved to where the question has an answer** — inside `run`, on the last
+  composited frame, latched one-shot — because fired from the terminus line (after `run`
+  returns) it would read the desktop and report `NO-RAST-INK` on every healthy boot.
+- **A bounded spin ending is not a repaint.** `rastwin_live()` separates "a row is composited
+  now" from "a row was seated and here is where", and the census gained `RAST-WINDOW-CLOSED`
+  so an operator close is not scored as an overwrite. The rung stays bounded and latched:
+  `RG_DONE`, `RG_CENSUS_PERIOD` and `RG_LATE_MAX` are unchanged.
+
+**The `fbcon::detach()` at `main.rs:7138` stays, and the reason is precise.** The
+windowed renderer removes *rast's own* second-writer problem — it no longer owns the
+panel, so a routed console and the cube are different rects. What the detach still
+guards is not rast-specific: an **unrouted** `fbcon` is a direct panel writer that
+will paint over *any* compositor content, the console window included. The guard
+already in place (`if !tegra_conwin_live()`) skips the detach exactly when the
+console *is* routed — i.e. exactly when there is no second writer — so on a desktop
+boot it is already not taken. The residual detach fires only on a boot with no routed
+console, which is precisely the boot where it is still needed. Removing it would hand
+a generic hazard to the compositor on the one target that has no QEMU model and
+therefore no runtime gate (LAWS §3: jetson cannot self-prove at runtime), so it would
+be an unverifiable behavioural change. The `main.rs:1612` detach on the x86/virt call
+site is the same shape and is outside this arc's file grant.
 
 **Frame pacing (RAST-PACE).** Each frame is held to a target wall-clock interval
 (`FRAME_MS = 33`, ≈ 30 fps) so the spin is *visible and platform-consistent* rather than
@@ -456,6 +546,32 @@ witness lines, is in
 > not run on the Jetson as of 2026-08-18, and QEMU cannot stand in for the
 > `tegra` path. That pending status is a property of the wire-in, not of this
 > crate. It is **no longer pending as a mechanism**, though: see §5.2a.
+
+> **⚠ RAST-MC IS ALREADY WIRED ON aarch64, AND HAS BEEN SINCE IT WAS WRITTEN**
+> (orin-0912b, 2026-09-13 — recorded because the opposite is an easy misreading of
+> `unaos/arroyo:311`). That comment says `UNAOS_RASTMC=1` "adds the x86 MULTI-CORE
+> rung … the frame-pipelined pass RAST-MC **built for the Orin**, now reaching x86's
+> APs"; it describes RASTPORT **adding** x86, not RAST-MC arriving on aarch64. Every
+> `#[cfg]` in the rung reads
+> `any(all(feature = "tegra", target_arch = "aarch64"), all(feature = "rastmc", target_arch = "x86_64"))`
+> — the aarch64 arm is first and is the original — and `run_mc` is **called** on the
+> Orin at `unaos/crates/kernel/src/main.rs:7141`, inside `tegra_rast_demo_maybe`,
+> ahead of `run` on the terminus line. `mc_spawn`'s aarch64 half
+> (`rast_demo.rs`, `#[cfg(all(feature = "tegra", target_arch = "aarch64"))]`) is
+> documented in place as "byte-for-byte the call RAST-MC always made".
+>
+> So nothing needs wiring. What is missing is the **measurement**, and it is missing
+> for a reason no code change can remove: `unaos/arroyo` launches `q35`, `raspi4b`
+> and generic `virt`, and **zero tegra machines**, so a jetson green certifies that
+> the rung compiles and links and never that it ran (LAWS §3). The ratio the x86 rung
+> reports (2.090x) was measured on x86's APs; the Orin's four A78s have a working
+> bring-up (`tegrasmp`, `apsrun`) and the rung will enlist them, but the number is a
+> **metal boot on Peter's bench** and nothing else. The one thing this arc did change
+> for it: `mc_present` now presents into the same `wm` row `run` uses instead of
+> poking panel coordinates (§4.1), which removes the occlusion trap the RAST-MC
+> header describes — both arms still pay the identical present cost, so the ratio is
+> unaffected, while the absolute fps moves and is therefore re-measured in the same
+> boot rather than compared against any published number.
 
 ### 5.2a RASTPORT — the same rung on x86 (`UNAOS_RASTMC=1`)
 
