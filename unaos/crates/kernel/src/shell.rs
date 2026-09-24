@@ -8441,3 +8441,158 @@ fn font_aa_witness() {
         crate::selftest::Outcome::Skip(why) => serial_println!(":: TSTE: {} -> SKIP ({}) ::", "video.font.aa", why),
     }
 }
+
+// =================================================================================================
+// LFNMV (rmbp-ledger B202, 2026-09-23) — A RENAME TO A LONG NAME, MEASURED ON BOTH ARCHES AT ONCE.
+// File tail: nothing above moves (B94).
+//
+// LFN2 (B182) taught `fat::rename_entry` VFAT long names, and STORFOLD left two things read from the
+// code and never run: the aarch64 `bus_mv` guard (`is_short_name(dst)` -> `-EINVAL`, the SAME-SLOT
+// promise its owner rows depend on) and what the shell's own `mv` answers for a long destination.
+// This is the one verdict both lanes print, so the two arches are compared on the wire and not in
+// prose. It takes the SYS_RENAME leg's answer from the arch that measured it (each arch's ring-3
+// STOR2-MV program asks for `LFNMV_SYS_LONG` and hands the rc back) and runs the SHELL leg here,
+// through `fs_mv`, the operator's verb, in `/boot` — the FAT volume BOOTROOT binds on both lanes.
+//
+// THE PATHS, as measured by this fixture and not assumed:
+//   * `SYS_RENAME` / bus `mv`: aarch64 `sys_rename` -> `bus_mv` (root leaves, owner-only, and the
+//     long-name guard); x86 `sys_rename` -> `rename_created`, whose names are `U10_NAMES` ids.
+//   * the shell `mv`: `fs_mv` -> `MountTable::rename` -> `FatBackend::rename` ->
+//     `FatFs::rename_entry` — NEITHER `bus_mv` NOR `rename_created`. It consults no owner row (the
+//     shell is ASID 0, the trusted console — see this file's PRINCIPAL note) and no `is_short_name`,
+//     so a long destination reaches LFN2's `rename_lfn_in_dir`, which may MOVE the entry to a fresh
+//     run.
+//
+// WHAT PASS CERTIFIES (the brief's four fields first, each read off the medium):
+//   sys_rename_long  the arch's SYS_RENAME answer for an 8.3 source and a long destination; the
+//                    decision is `-EINVAL` on both arches, refused before anything is written
+//   shell_mv_long    what the shell's `mv` answered (`ok` = it printed `moved …`)
+//   alias_leak       false iff the ONLY name the shell mv added to the directory is the long name,
+//                    spelled exactly — a rename that silently produced an 8.3 alias (`LONGNA~1.TXT`)
+//                    lists the alias instead, and is FORBIDDEN (this fixture's go-red)
+//   readback         `ok` iff the long name reads back the staged bytes (the chain followed the name)
+// plus `sys_untouched` (no `LONGNA…` name on the medium after the SYS_RENAME leg — the refusal wrote
+// nothing, under the long name or an alias) and the source's absence after the shell mv.
+//
+// It self-cleans at both ends — every name it or the SYS_RENAME leg could have made is unlinked
+// before it measures and after — so a red run leaves nothing for the next boot to trip on.
+// =================================================================================================
+
+/// LFNMV: the long destination both arches' ring-3 SYS_RENAME legs ask for. The blobs spell it in
+/// `.ascii` (a `global_asm!` string cannot name a Rust const), so this is the copy the verdict checks
+/// the medium for; the two must agree byte for byte (24 bytes — under both arches' `MAX_NAME` of 40,
+/// so the length check is NOT what answers).
+#[cfg(feature = "witness")]
+pub(crate) const LFNMV_SYS_LONG: &str = "LongNameViaSysRename.txt";
+/// LFNMV: the shell leg's 8.3 source, its long destination, the directory and the staged bytes.
+#[cfg(feature = "witness")]
+const LFNMV_SRC: &str = "LFNMV.TMP";
+#[cfg(feature = "witness")]
+const LFNMV_LONG: &str = "LongNameViaShellMv.txt";
+#[cfg(feature = "witness")]
+const LFNMV_DIR: &str = "/boot";
+#[cfg(feature = "witness")]
+const LFNMV_BYTES: &[u8] = b"lfnmv: the bytes follow the long name";
+/// LFNMV: the value an arch passes when its SYS_RENAME leg never reported (the blob's sentinel, `1`,
+/// which no rename returns). Printed `notrun`, and never a PASS.
+#[cfg(feature = "witness")]
+pub(crate) const LFNMV_NOTRUN: i64 = 1;
+
+/// LFNMV: an errno as the wire spells it — the names a portable program branches on.
+#[cfg(feature = "witness")]
+fn lfnmv_errno(rc: i64) -> String {
+    match rc {
+        0 => String::from("ok"),
+        LFNMV_NOTRUN => String::from("notrun"),
+        -2 => String::from("-ENOENT"),
+        -13 => String::from("-EACCES"),
+        -17 => String::from("-EEXIST"),
+        -22 => String::from("-EINVAL"),
+        -38 => String::from("-ENOSYS"),
+        other => alloc::format!("{}", other),
+    }
+}
+
+/// LFNMV: the shell's answer as a token — `ok` for its success line, else the `(-E…)` it printed.
+#[cfg(feature = "witness")]
+fn lfnmv_said(said: &str) -> String {
+    if said.contains("moved ") {
+        return String::from("ok");
+    }
+    match (said.rfind("(-"), said.rfind(')')) {
+        (Some(a), Some(b)) if b > a => String::from(&said[a + 1..b]),
+        _ => String::from("unparsed"),
+    }
+}
+
+/// LFNMV: the verdict. `arch` names the lane; `sys_rc` is what that arch's SYS_RENAME leg answered
+/// (`LFNMV_NOTRUN` if it never reported) and `sys_want` the decision it is held to. One line,
+/// `-> PASS ::` or `-> FAIL ::` (the spellings `mbench.py`'s DEFAULT_FORBIDS convict), or a stated
+/// `SKIPPED` when there is no writable `/boot` (the spec FORBIDs that on both lanes).
+#[cfg(feature = "witness")]
+pub(crate) fn lfnmv_witness(arch: &str, sys_rc: i64, sys_want: i64) {
+    use crate::fs::vfs::NodeKind;
+    let mt = vfs_mount_table();
+    if !mt.prefixes().iter().any(|p| *p == LFNMV_DIR) {
+        return serial_println!(":: LFNMV: SKIPPED — no {} mount on this boot ({}) ::", LFNMV_DIR, arch);
+    }
+    if let Ok(Some(veto)) = mt.write_veto(LFNMV_DIR) {
+        return serial_println!(":: LFNMV: SKIPPED — {} refuses writes ({}) ({}) ::", LFNMV_DIR, veto, arch);
+    }
+    let names = |mt: &crate::fs::vfs::MountTable| -> Vec<String> {
+        mt.read_dir(LFNMV_DIR).map(|rs| rs.into_iter().map(|r| r.name).collect()).unwrap_or_default()
+    };
+    // Both long names and every alias FAT would mint for them start `LONGNA` (6 characters, `~n`).
+    let longish = |n: &str| n.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("LONGNA"));
+    // (1) THE SYS_RENAME LEG'S RESIDUE, read BEFORE the scrub below could hide it.
+    let before = names(&mt);
+    let sys_untouched = !before.iter().any(|n| longish(n));
+    let scrub = |mt: &crate::fs::vfs::MountTable, extra: &[String]| {
+        for leaf in [LFNMV_SRC, LFNMV_LONG, LFNMV_SYS_LONG] {
+            let _ = mt.unlink(&vfs_join(LFNMV_DIR, leaf), SHELL_PRINCIPAL);
+        }
+        for leaf in extra {
+            let _ = mt.unlink(&vfs_join(LFNMV_DIR, leaf), SHELL_PRINCIPAL);
+        }
+    };
+    let leftovers: Vec<String> = before.iter().filter(|n| longish(n)).cloned().collect();
+    scrub(&mt, &leftovers);
+    // (2) THE SHELL LEG: stage an 8.3 file with known bytes, then the operator's `mv` to a long name.
+    let src = vfs_join(LFNMV_DIR, LFNMV_SRC);
+    let dst = vfs_join(LFNMV_DIR, LFNMV_LONG);
+    let staged = mt.create(&src, NodeKind::File, SHELL_PRINCIPAL).is_ok()
+        && matches!(mt.write(&src, 0, LFNMV_BYTES, SHELL_PRINCIPAL), Ok(n) if n == LFNMV_BYTES.len());
+    let snap1 = names(&mt);
+    let said = if staged {
+        witness_capture(|c| fs_mv(c, &src, &dst, false)).join(" | ")
+    } else {
+        String::from("(not staged)")
+    };
+    let snap2 = names(&mt);
+    let added: Vec<String> =
+        snap2.iter().filter(|n| !snap1.iter().any(|m| m.eq_ignore_ascii_case(n))).cloned().collect();
+    let listed = added.iter().any(|n| n == LFNMV_LONG);
+    let alias_leak = added.iter().any(|n| n != LFNMV_LONG);
+    let src_gone = !snap2.iter().any(|n| n.eq_ignore_ascii_case(LFNMV_SRC));
+    let readback_ok = matches!(mt.read(&dst, 0, 64), Ok(b) if b == LFNMV_BYTES);
+    let shell = lfnmv_said(&said);
+    scrub(&mt, &added);
+    let pass = sys_rc == sys_want && sys_untouched && staged && shell == "ok" && listed && !alias_leak
+        && src_gone && readback_ok;
+    let head = alloc::format!(
+        "sys_rename_long={} shell_mv_long={} alias_leak={} readback={}",
+        lfnmv_errno(sys_rc), shell, alias_leak, if readback_ok { "ok" } else { "gone" }
+    );
+    if pass {
+        serial_println!(
+            ":: LFNMV: {} ({}: SYS_RENAME {} -> {} refused before any write; shell mv {} -> {} listed under the long name only, source gone) -> PASS ::",
+            head, arch, LFNMV_SRC, LFNMV_SYS_LONG, src, dst
+        );
+    } else {
+        serial_println!(
+            ":: LFNMV: {} ({}) [sys_want={} sys_untouched={} staged={} listed={} src_gone={} added={:?} said=[{}]] -> FAIL ::",
+            head, arch, lfnmv_errno(sys_want), sys_untouched, staged, listed, src_gone, added,
+            said.char_indices().nth(120).map_or(said.as_str(), |(i, _)| &said[..i])
+        );
+    }
+}

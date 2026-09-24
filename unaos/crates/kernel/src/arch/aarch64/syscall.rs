@@ -16569,7 +16569,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // byte-same errno) proven at EL0. Self-cleaning; its own uncounted `:: BANDY-RT: … ::`
     // + `:: BANDY-EQ: … ::` lines. LAST in the chain.
     bandy_rt_launcher(demo_cpu);
-    u7stk!("after:bandy_rt"); #[cfg(feature = "witness")] dirns_witness(); stor2_mv_launcher(demo_cpu); // STOR-2 (B185): the aarch64 SYS_RENAME witness, AFTER DIRNS so DIRNS keeps its measured dead-last position relative to every fixture it could contend with, and nothing waits on either. DIRNS (LEDGER SO20): the EL0 path-open proof, appended to this statement so no source line moves below it (LEDGER P7). It rides DEAD LAST, after BANDY, and that placement was MEASURED not chosen: parked mid-chain beside RMDIR it cost the leg three witnesses across two runs (ERET-SCRUB first-entry, U6b, the u7fix park margin) and ~5 300 guest lines of the 300 s wall, while the base leg was 126/126 — its FAT directory I/O was contending for the EL0 volume's mount loan and for wall time with fixtures that were still running. Nothing in the chain waits on it here, so the only thing it can now delay is the end of the boot. Self-cleaning at both ends; takes its own `fat::mount()`. Knob-off the `#[cfg]` erases the statement before MIR.
+    u7stk!("after:bandy_rt"); #[cfg(feature = "witness")] dirns_witness(); stor2_mv_launcher(demo_cpu); #[cfg(feature = "witness")] lfnmv_launcher(); // LFNMV (B202): the long-name verdict, straight after the program that measured SYS_RENAME's half of it. STOR-2 (B185): the aarch64 SYS_RENAME witness, AFTER DIRNS so DIRNS keeps its measured dead-last position relative to every fixture it could contend with, and nothing waits on either. DIRNS (LEDGER SO20): the EL0 path-open proof, appended to this statement so no source line moves below it (LEDGER P7). It rides DEAD LAST, after BANDY, and that placement was MEASURED not chosen: parked mid-chain beside RMDIR it cost the leg three witnesses across two runs (ERET-SCRUB first-entry, U6b, the u7fix park margin) and ~5 300 guest lines of the 300 s wall, while the base leg was 126/126 — its FAT directory I/O was contending for the EL0 volume's mount loan and for wall time with fixtures that were still running. Nothing in the chain waits on it here, so the only thing it can now delay is the end of the boot. Self-cleaning at both ends; takes its own `fat::mount()`. Knob-off the `#[cfg]` erases the statement before MIR.
 }
 
 /// F2 M3 witness worker — the `demo_cpu` half of the cross-core FAT_MUTATION stress. `fn(usize)` for
@@ -25329,6 +25329,7 @@ __stor2mv_blob_start:
     .globl __stor2mv_prog
 __stor2mv_prog:
     mov  x23, xzr                          // witness bitmask
+    mov  x24, #1                           // LFNMV: the long-name leg's rc; 1 = never ran (no rename returns 1)
     adr  x9, __stor2mv_blob_start          // window base
     add  x12, x9, #0x2000                  // read buffer (writable data page)
     adr  x13, .Ls2a_pat                    // A||B, 32 bytes, RO code page
@@ -25453,6 +25454,17 @@ __stor2mv_prog:
     orr  x23, x23, #32
 
 .Ls2a_clean:
+    // LFNMV (B202): SYS_RENAME(S2MVA.BIN -> a LONG name) — `bus_mv`'s long-name guard, measured. No
+    // mask bit: the rc goes to the kernel in its own tagged report, and `lfnmv_launcher` judges it.
+    tbnz x21, #63, 8f
+    mov  x8, #50
+    adr  x0, .Ls2a_na
+    mov  x1, #9
+    adr  x2, .Ls2a_nl
+    mov  x3, #24
+    svc  #0
+    mov  x24, x0
+8:
     tbnz x21, #63, 3f                      // unlink the re-created S2MVA.BIN through its handle
     mov  x8, #16
     mov  x0, x21
@@ -25463,6 +25475,11 @@ __stor2mv_prog:
     mov  x0, x19
     svc  #0
 4:
+    movz x0, #0x4c46, lsl #16              // LFNMV: SYS_REPORT("LF" << 16 | the rc's low 16 bits)
+    and  x1, x24, #0xffff
+    orr  x0, x0, x1
+    mov  x8, #3
+    svc  #0
     movz x0, #0x5332, lsl #16              // SYS_REPORT("S2" << 16 | mask)
     orr  x0, x0, x23
     mov  x8, #3
@@ -25499,6 +25516,9 @@ __stor2mv_prog:
     .balign 4
 .Ls2a_nd:
     .ascii "S2MVD.BIN"
+    .balign 4
+.Ls2a_nl:
+    .ascii "LongNameViaSysRename.txt"          // LFNMV: == shell::LFNMV_SYS_LONG, 24 bytes
     .balign 8
 .Ls2a_pat:
     .ascii "stor2-a64-before"
@@ -25520,6 +25540,8 @@ unsafe extern "C" {
 fn stor2mv_report(a0: u64) {
     if (a0 >> 16) & 0xFFFF == 0x5332 && super::sched::current_name() == Some("el0-stor2mv") {
         STOR2MV_REPORT.store(a0, Ordering::Release);
+    } else if (a0 >> 16) & 0xFFFF == 0x4c46 && super::sched::current_name() == Some("el0-stor2mv") {
+        LFNMV_SYSRC.store((a0 & 0xFFFF) as u16 as i16 as i64, Ordering::Release); // LFNMV: the long-name leg's rc, sign-extended
     }
 }
 
@@ -25605,4 +25627,28 @@ fn stor2_mv_launcher(demo_cpu: usize) {
             w, S2MV_WANT, exited, cleared, vacant, word
         );
     }
+}
+
+// =================================================================================================
+// LFNMV (rmbp-ledger B202) — THE aarch64 HALF OF THE LONG-NAME VERDICT. File tail (B94).
+//
+// `el0-stor2mv` (above) asks `SYS_RENAME(S2MVA.BIN, "LongNameViaSysRename.txt")` from EL0 at the head
+// of its cleanup and reports the rc under the `0x4c46` ("LF") tag. The source exists and is the
+// caller's own, the destination is absent and 24 bytes long, so every earlier refusal in
+// `sys_rename`/`bus_mv` is passed and the one that answers is `bus_mv`'s long-name guard. The shared
+// verdict (`shell::lfnmv_witness`) then runs the shell `mv` leg and prints the one `:: LFNMV:` line.
+// =================================================================================================
+
+/// LFNMV: the long-name leg's rc as `el0-stor2mv` reported it; `shell::LFNMV_NOTRUN` until it does.
+static LFNMV_SYSRC: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(1);
+
+/// LFNMV: the verdict, right after `stor2_mv_launcher` (whose program measured the SYS_RENAME half).
+/// Held to `-EINVAL`: the guard's own answer, and the arch where it was always the only answer.
+#[cfg(feature = "witness")]
+fn lfnmv_launcher() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) || crate::drivers::block::info().is_none() {
+        return;
+    }
+    crate::shell::lfnmv_witness("aarch64", LFNMV_SYSRC.load(Ordering::Acquire), EINVAL);
 }

@@ -2475,3 +2475,16 @@ FORBID :: QUARRY: .* :: FAIL ::
 # --- requires the by-name exit, the slot's teardown, and a fresh mount showing neither name left.
 REQUIRE :: STOR2-MV: .* :: PASS \[w=0x3f/0x3f\] ::
 FORBID :: STOR2-MV: aarch64 SYS_RENAME FAIL
+
+# --- LFNMV (rmbp-ledger B202, 2026-09-23): A RENAME TO A LONG NAME, MEASURED. `el0-stor2mv` asks
+# --- `SYS_RENAME(S2MVA.BIN, "LongNameViaSysRename.txt")` from EL0 at the head of its cleanup (its own
+# --- file, absent 24-byte destination — every earlier refusal passed), and reports the rc under the
+# --- `0x4c46` tag; `lfnmv_launcher` then prints the shared verdict (`shell::lfnmv_witness`), whose
+# --- second half is the shell `mv` of an 8.3 file in `/boot` to `LongNameViaShellMv.txt` through
+# --- `fs_mv` -> `FatBackend::rename` -> `fat::rename_entry` (NOT `bus_mv`: no guard on that path).
+# --- `-EINVAL` is `bus_mv`'s long-name guard (LFN2, B182), which no lane had run before this row;
+# --- `shell_mv_long=ok alias_leak=false readback=ok` is the long name listed exactly, no 8.3 alias
+# --- added, the source gone, and the bytes read back under the long name.
+REQUIRE :: LFNMV: sys_rename_long=-EINVAL shell_mv_long=ok alias_leak=false readback=ok \(aarch64: .* -> PASS ::
+FORBID :: LFNMV: SKIPPED
+FORBID :: LFNMV: .* -> FAIL ::

@@ -467,3 +467,16 @@ FORBID \[ioapic\] armed .* masked=true
 # `mismatch_*` fields are M3's rule, the wire beats the register: each direction named exactly once.
 REQUIRE :: TPFRAME: frames=7 fingers_max=1 deltas_ok=true click_edges=down@4,up@5 corpus=3 d=-30/-12,-3/-5 lift_reset=true relx10=2/2 wit_1in64=true legacy_ok=true mismatch_yes=true mismatch_no=true -> PASS ::
 FORBID :: TPFRAME: .* -> FAIL ::
+# ── LFNMV (2026-09-23, rmbp-ledger B202), TAIL-APPENDED past IOAPIC2 ──────────────────────────────────
+# A RENAME TO A LONG NAME, MEASURED. `lfnmv_launcher` runs right after STOR2-MV (whose ring-3 program
+# asks `SYS_RENAME(STOR2.BIN, "LongNameViaSysRename.txt")` at the head of its cleanup) and prints the
+# shared verdict (`shell::lfnmv_witness`): the SYS_RENAME answer, then the shell `mv` of an 8.3 file in
+# `/boot` to `LongNameViaShellMv.txt` through `fs_mv` -> `FatBackend::rename` -> `fat::rename_entry`.
+# M1 PINS WHAT x86 ANSWERS TODAY: `-ENOENT` — `rename_created` resolves the destination through
+# `u10_creatable_nameid` (8.3 `U10_NAMES` leaves only), so a long name "does not exist", decided from
+# the name table before phase 1 and before `submit_rename`. The shell `mv` WORKS: the long name is
+# listed, spelled exactly, no 8.3 alias was added, the source is gone and the bytes read back.
+REQUIRE :: LFNMV: sys_rename_long=-ENOENT shell_mv_long=ok alias_leak=false readback=ok \(x86_64: .* -> PASS ::
+# The fixture's two non-PASS spellings: no writable `/boot` (it measured nothing) and its FAIL line.
+FORBID :: LFNMV: SKIPPED
+FORBID :: LFNMV: .* -> FAIL ::
