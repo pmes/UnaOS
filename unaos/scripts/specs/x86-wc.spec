@@ -713,3 +713,12 @@ REQUIRE \[menubar\] crystal-persist paints=3 present=3/3 models=partial:caption\
 # `crystal-persist paints=0 present=0/0 … -> SKIP`, both FORBIDs hit, mbench rc 1 (28/30).
 FORBID \[menubar\] crystal-persist .* -> SKIP
 FORBID :: MENUFIRST: .* :: SKIP ::
+# WCDMEM (rmbp-ledger B199, trunk QUEUE §1 (e)) — the no-memory `[wc-d] … -> SKIP` is LATCHED per
+# window id (WCDFLOOD, SO30) and every skip rolls up per window as `[wc-d] skip-rollup win=<id>
+# reason=no-memory passes=<n> since_ms=<t>`. The fixture arm drives the SHIPPING latch and rollup 16
+# times on each of two synthetic ids: one witness, one rollup carrying all 16, and no second rollup
+# with nothing new. Values pinned: they are the fixture's own constants and the property itself.
+# GO-RED (measured, B199): the latch granting every call (the pre-WCDFLOOD per-pass print) reads
+# `printed=16 rolled=0 … -> FAIL` on both ids; both REQUIREs miss and the default `-> FAIL` FORBID trips.
+REQUIRE \[wc-d\] latch-check forced=16 printed=1 rolled=16 win=30 reroll=0 -> PASS
+REQUIRE \[wc-d\] latch-check forced=16 printed=1 rolled=16 win=31 reroll=0 -> PASS

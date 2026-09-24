@@ -5395,7 +5395,7 @@ fn cash_tail(owed: Owed) {
     // serial line here cannot inflate `pass_us`. Spends itself on the first pass that finds a staged
     // buffer (see `physwit_once`); every pass after that is one relaxed load.
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
-    physwit_once(); #[cfg(all(feature = "witness", feature = "wc", target_arch = "x86_64"))] wcd_oom_latch_selftest(); #[cfg(all(feature = "witness", feature = "wc", target_arch = "x86_64"))] blitwire_selftest(); /* BLITWIRE (SO45) — ⚠ LINE-NEUTRAL fold, before this line's first `//`, and it rides THIS site for the reason the WCDFLOOD note below gives: the ledger is closed, every guard the pass took has dropped, and a serial line here cannot inflate `pass_us`. Self-one-shot, so every pass after the first is one relaxed load. It touches NO live counter — `blitwire_calc` and `blitwire_arm` are pure — so unlike WCDLATCH it has nothing to give back and cannot cost a neighbouring fixture an event, and it does NOT consume `BLITWIRE_SAID`: the latch on the wire stays armed for the real rollup. */ // WCDFLOOD (SO30) — ⚠ LINE-NEUTRAL append, before this line's first `//`. The WCDLATCH fixture rides an EXISTING call site rather than a new one in `arch/x86_64/syscall.rs`, which this brief does not name, and it rides THIS one for `physwit_once`'s own stated reason: the ledger is closed, every guard the pass took has dropped, and a serial line here cannot inflate `pass_us`. Self-one-shot, so every pass after the first is one relaxed load. IT DOES NOT RIDE THE x86 SELFTEST LADDER: folded onto the head of `dmgovlp_selftest` it cost that fixture its whole drag leg (`drag_evt=0 relay=0 narrow=0/12 adopt_stretch=0/4 -> FAIL` against a same-host baseline's `drag_evt=5 relay=3 narrow=3/12 adopt_stretch=4/4 -> PASS`), which is exactly the "no fixture between them can lose an event" rule that ladder's own comment states. Measured, then moved.
+    physwit_once(); #[cfg(all(feature = "witness", feature = "wc", target_arch = "x86_64"))] wcd_oom_latch_selftest(); #[cfg(all(feature = "witness", feature = "wc", target_arch = "x86_64"))] wcd_skip_latch_check(); #[cfg(all(feature = "witness", feature = "wc", target_arch = "x86_64"))] blitwire_selftest(); /* BLITWIRE (SO45) — ⚠ LINE-NEUTRAL fold, before this line's first `//`, and it rides THIS site for the reason the WCDFLOOD note below gives: the ledger is closed, every guard the pass took has dropped, and a serial line here cannot inflate `pass_us`. Self-one-shot, so every pass after the first is one relaxed load. It touches NO live counter — `blitwire_calc` and `blitwire_arm` are pure — so unlike WCDLATCH it has nothing to give back and cannot cost a neighbouring fixture an event, and it does NOT consume `BLITWIRE_SAID`: the latch on the wire stays armed for the real rollup. */ // WCDFLOOD (SO30) — ⚠ LINE-NEUTRAL append, before this line's first `//`. The WCDLATCH fixture rides an EXISTING call site rather than a new one in `arch/x86_64/syscall.rs`, which this brief does not name, and it rides THIS one for `physwit_once`'s own stated reason: the ledger is closed, every guard the pass took has dropped, and a serial line here cannot inflate `pass_us`. Self-one-shot, so every pass after the first is one relaxed load. IT DOES NOT RIDE THE x86 SELFTEST LADDER: folded onto the head of `dmgovlp_selftest` it cost that fixture its whole drag leg (`drag_evt=0 relay=0 narrow=0/12 adopt_stretch=0/4 -> FAIL` against a same-host baseline's `drag_evt=5 relay=3 narrow=3/12 adopt_stretch=4/4 -> PASS`), which is exactly the "no fixture between them can lose an event" rule that ladder's own comment states. Measured, then moved.
 }
 
 /// What [`composite_inner`] owes the sprite when it returns.
@@ -13491,7 +13491,7 @@ fn comp2_emit(span: u64) {
         passes.saturating_mul(10_000) / span.max(1) / 10,
         passes.saturating_mul(10_000) / span.max(1) % 10,
         span
-    ); serwire_emit(max_cyc, span, passes); blitwire_note(max_cyc, passes, loop_cyc.saturating_sub(cache_cyc), wit_cyc, wit_n, wcd_cyc, bytes); // SERWIRE (SO45) — the transport's capped-drain odometer for THIS span, drained here and printed ONCE PER BOOT when `max_us` crosses the stall threshold, immediately under the `[comp2]` line it adjudicates. It is fed `max_cyc` (already swapped above, so this reads the identical number `[comp2]` just printed) rather than re-reading the counter, which by then is zero. `[comp2]` itself is NOT widened by one byte: a per-rollup field would be SO30 one layer up. ⚠ LINE-NEUTRAL append onto the emit's closing `);`, before the line's first `//`; the body is a FILE-TAIL append, so no `panic::Location` in this file moves. — BLITWIRE (fold, both calls on one `);`): BLITWIRE (SO45) — ⚠ LINE-NEUTRAL fold, before this line's first `//`. AFTER the rollup and never before it, so the one-shot reads as an annotation on the `[comp2]` line directly above it and the two are read as a pair. `[comp2]` is not widened by one byte; this is a separate, LATCHED line that speaks at most once per boot (SO30 — a per-rollup field at ~140 rollups on a 700 s boot is this defect one layer up). Takes the SAME `loop_cyc - cache_cyc` the `blit_us` argument above takes, so the two can never disagree about what they are decomposing.
+    ); wcd_skip_rollup(); serwire_emit(max_cyc, span, passes); blitwire_note(max_cyc, passes, loop_cyc.saturating_sub(cache_cyc), wit_cyc, wit_n, wcd_cyc, bytes); // SERWIRE (SO45) — the transport's capped-drain odometer for THIS span, drained here and printed ONCE PER BOOT when `max_us` crosses the stall threshold, immediately under the `[comp2]` line it adjudicates. It is fed `max_cyc` (already swapped above, so this reads the identical number `[comp2]` just printed) rather than re-reading the counter, which by then is zero. `[comp2]` itself is NOT widened by one byte: a per-rollup field would be SO30 one layer up. ⚠ LINE-NEUTRAL append onto the emit's closing `);`, before the line's first `//`; the body is a FILE-TAIL append, so no `panic::Location` in this file moves. — BLITWIRE (fold, both calls on one `);`): BLITWIRE (SO45) — ⚠ LINE-NEUTRAL fold, before this line's first `//`. AFTER the rollup and never before it, so the one-shot reads as an annotation on the `[comp2]` line directly above it and the two are read as a pair. `[comp2]` is not widened by one byte; this is a separate, LATCHED line that speaks at most once per boot (SO30 — a per-rollup field at ~140 rollups on a 700 s boot is this defect one layer up). Takes the SAME `loop_cyc - cache_cyc` the `blit_us` argument above takes, so the two can never disagree about what they are decomposing.
     // CHROMEBAND — pi's `[chromeband]` ledger was RETIRED at the 0ed6fee2 fold: trunk's own
     // band-clamp landed with the `[wc-b]` witness family (per-window, rollup and fixture lines
     // carrying chrome_rows/chrome_rows_used/amp), which measures the same quantity as the
@@ -28153,9 +28153,9 @@ fn wcd_oom_say(i: usize) -> bool {
     if i >= WCD_IDS {
         return false;
     }
-    WCD_OOM_SAID[i]
+    wcd_skip_note(i, WCD_OOM_SAID[i] // WCDMEM (B199) — ⚠ LINE-NEUTRAL, 3 lines in and 3 out: the latch's answer now passes through [`wcd_skip_note`], which counts this window's skip into its own rollup cell and hands the answer back unchanged.
         .compare_exchange(0, 1, core::sync::atomic::Ordering::AcqRel, Relaxed)
-        .is_ok()
+        .is_ok())
 }
 
 /// WCDLATCH (SO30) — the fixture, and it proves the property on the WIRE as well as in the counters.
@@ -28828,4 +28828,177 @@ pub fn blitwire_selftest() {
         arm_said as u8,
         if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ---- WCDMEM (trunk QUEUE §1 (e), rmbp-ledger B199) — the latched no-memory SKIP gets its per-window rollup --
+//
+// WCDFLOOD (SO30, 0fc32a4c) already latched the LINE: `wcd_oom_say` lets a window's FIRST
+// `[wc-d] verify win=N -> SKIP (no memory for WxH source snapshot)` speak and counts every later one
+// into `[comp2] wcd_skips=`. That field is a span total over ALL windows, so a capture could say that
+// skips happened in a span but not which window kept taking them, nor for how long after its one line.
+// This block adds the per-window half of the row's verdict ("print once, then count into a rollup"):
+//
+// ```text
+//   [wc-d] skip-rollup win=<id> reason=no-memory passes=<n> since_ms=<t>
+// ```
+//
+//   * `passes=` is CUMULATIVE since the window's latched witness and INCLUDES the skip that spoke, so
+//     the one line plus its latest rollup is the whole count (the odometer rule `wcd_oom_say` states).
+//   * `since_ms=` is `arch::ms()` now minus the moment the witness spoke: how long the window has been
+//     unable to take a snapshot.
+//   * CADENCE: the `[comp2]` span (5 s, `WCN_ROLLUP_MS`), from `comp2_emit`, printed immediately after
+//     the `[comp2] rollup` line whose `wcd_skips=` it itemises, and only for a window whose count MOVED
+//     since its previous rollup. Nothing prints from `verify_reference`, so the blit loop's only print
+//     on this path stays the one latched witness. Bounded by construction: at most one line per
+//     skipping window (ids < `WCD_IDS` = 32) per span. The per-span increments of every window's
+//     `passes=` sum to that span's `wcd_skips=`.
+//   * `reason=`: `no-memory` is the only `[wc-d] … -> SKIP` reason that repeats. The two geometry
+//     SKIPs in `verify_reference` call `wcd_seal` and are terminal (one line per window per tenancy),
+//     and the teardown SKIP is a closing verdict, so none of them needs a latch or a rollup.
+//   * A tail skip that no later `[comp2]` span with `passes > 0` follows is never rolled. `wcd_skips=`
+//     has the same property: both are drained by a pass-driven rollup, and a compositor that stops
+//     compositing takes no further skips either.
+//
+// No verdict changes meaning: the SKIP literal, its latch and `wcd_skips=` are untouched, and no spec
+// REQUIREs or FORBIDs the SKIP line (`grep -rn 'no memory' unaos/scripts/specs/` is empty at 1ba7f63b).
+
+/// WCDMEM — per-id: skips this window has taken since its latched witness spoke, that one included.
+#[cfg(feature = "witness")]
+static WCD_OOM_PASSES: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+
+/// WCDMEM — per-id: the `passes=` value the last rollup for this window printed (the witness itself
+/// counts as having printed 1). A rollup prints only while `PASSES > ROLLED`.
+#[cfg(feature = "witness")]
+static WCD_OOM_ROLLED: [core::sync::atomic::AtomicU32; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; WCD_IDS];
+
+/// WCDMEM — per-id: `arch::ms()` at the moment the latched witness spoke.
+#[cfg(feature = "witness")]
+static WCD_OOM_T0_MS: [core::sync::atomic::AtomicU64; WCD_IDS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; WCD_IDS];
+
+/// WCDMEM — count one no-memory skip into window `i`'s rollup cell and return `first` unchanged.
+/// Called only from [`wcd_oom_say`], after its `i < WCD_IDS` test.
+///
+/// On the skip that speaks (`first`) the cells restart for this tenancy, in an order under which a
+/// concurrent [`wcd_skip_roll_one`] can never see `PASSES > ROLLED`: PASSES to 0, ROLLED to 1, the
+/// timestamp, then PASSES to 1. A rollup printed before that sequence belongs to the previous tenant
+/// of the id and says so with the previous tenant's count. Within one tenancy `wcd_admit`'s CAS makes
+/// one core the holder of the window's reference, so the `fetch_add` has one writer at a time.
+#[cfg(feature = "witness")]
+fn wcd_skip_note(i: usize, first: bool) -> bool {
+    use core::sync::atomic::Ordering::{Relaxed, Release};
+    if i >= WCD_IDS {
+        return first;
+    }
+    if first {
+        WCD_OOM_PASSES[i].store(0, Release);
+        WCD_OOM_ROLLED[i].store(1, Release);
+        WCD_OOM_T0_MS[i].store(crate::arch::ms(), Relaxed);
+        WCD_OOM_PASSES[i].store(1, Release);
+    } else {
+        WCD_OOM_PASSES[i].fetch_add(1, Release);
+    }
+    first
+}
+
+/// WCDMEM — print window `i`'s rollup if its count moved since the last one; return the `passes=` it
+/// printed. The `compare_exchange` on ROLLED is the claim, so two cores rolling at once print a given
+/// count once.
+#[cfg(feature = "witness")]
+fn wcd_skip_roll_one(i: usize) -> Option<u32> {
+    use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+    if i >= WCD_IDS {
+        return None;
+    }
+    let p = WCD_OOM_PASSES[i].load(Acquire);
+    let r = WCD_OOM_ROLLED[i].load(Acquire);
+    if p <= r {
+        return None;
+    }
+    if WCD_OOM_ROLLED[i].compare_exchange(r, p, AcqRel, Relaxed).is_err() {
+        return None;
+    }
+    serial_println!(
+        "[wc-d] skip-rollup win={} reason=no-memory passes={} since_ms={}",
+        i,
+        p,
+        crate::arch::ms().saturating_sub(WCD_OOM_T0_MS[i].load(Relaxed))
+    );
+    Some(p)
+}
+
+/// WCDMEM — the periodic rollup: every window whose count moved. Called once per `[comp2]` span,
+/// after that span's `[comp2] rollup` line (see the block header for the cadence).
+#[cfg(feature = "witness")]
+fn wcd_skip_rollup() {
+    for i in 0..WCD_IDS {
+        let _ = wcd_skip_roll_one(i);
+    }
+}
+
+/// WCDMEM — the latch-check arm of the WCDLATCH fixture, run right after it on the same site.
+///
+/// Two synthetic ids (the WCDLATCH pair, 30 and 31, which the test boot's live rows never reach) are
+/// driven through the SHIPPING [`wcd_oom_say`] `FORCED` times each, printing the real SKIP literal
+/// every time the latch grants, then rolled through the SHIPPING [`wcd_skip_roll_one`], then rolled
+/// again with nothing new. One verdict line per id:
+///
+/// ```text
+///   [wc-d] latch-check forced=16 printed=1 rolled=16 win=30 reroll=0 -> PASS
+/// ```
+///
+///   * `printed=1` — the witness spoke once for `FORCED` skips (the latch);
+///   * `rolled=FORCED` — the rollup line printed and carried every skip, the spoken one included;
+///   * `reroll=0` — a second rollup with no new skip printed nothing (the bound).
+///
+/// The fixture's skips are subtracted from `C2_WCD_SKIPS` afterwards, as WCDLATCH does, and its ids
+/// are rolled to completion here, so neither reaches a live `[comp2] wcd_skips=` or skip-rollup.
+///
+/// go-red: make [`wcd_oom_say`]'s latch grant every call (`.is_ok() || true`, the pre-WCDFLOOD
+/// per-pass print) and this reads `printed=16 rolled=0 … -> FAIL` on both ids, with 16 SKIP lines per
+/// id on the wire.
+#[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wc"))]
+pub fn wcd_skip_latch_check() {
+    use core::sync::atomic::Ordering::Relaxed;
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Relaxed) {
+        return;
+    }
+    const IDS: [usize; 2] = [30, 31];
+    const FORCED: u32 = 16;
+    let before = C2_WCD_SKIPS.load(Relaxed);
+    for &i in IDS.iter() {
+        WCD_OOM_SAID[i].store(0, Relaxed);
+        WCD_OOM_PASSES[i].store(0, Relaxed);
+        WCD_OOM_ROLLED[i].store(0, Relaxed);
+        let mut printed = 0u32;
+        for n in 0..FORCED {
+            if wcd_oom_say(i) {
+                printed += 1;
+                // The shipping literal, character for character (`verify_reference`), as WCDLATCH does.
+                serial_println!(
+                    "[wc-d] verify win={} -> SKIP (no memory for {}x{} source snapshot)",
+                    i,
+                    8 * (n + 1),
+                    8
+                );
+            }
+        }
+        let rolled = wcd_skip_roll_one(i).unwrap_or(0);
+        let reroll = wcd_skip_roll_one(i).unwrap_or(0);
+        let ok = printed == 1 && rolled == FORCED && reroll == 0;
+        serial_println!(
+            "[wc-d] latch-check forced={} printed={} rolled={} win={} reroll={} -> {}",
+            FORCED,
+            printed,
+            rolled,
+            i,
+            reroll,
+            if ok { "PASS" } else { "FAIL" }
+        );
+    }
+    let counted = C2_WCD_SKIPS.load(Relaxed).saturating_sub(before);
+    C2_WCD_SKIPS.fetch_sub(counted, Relaxed);
 }
