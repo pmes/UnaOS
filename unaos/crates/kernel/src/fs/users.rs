@@ -1890,10 +1890,19 @@ pub fn boot_session(desktop: bool) {
         if screen_up() { "open" } else { "closed" }
     );
     DESKTOP_IGNITED.store(true, core::sync::atomic::Ordering::Release);
+    let _ = open_pending_root_prompt();
+}
+
+/// LOGIN14: the desktop is up — open the set-password screen the store's load deferred, if it did.
+/// `true` when a deferred prompt was opened here. Called by `boot_session` and by the ROOTPW fixture's
+/// deferred leg, so the store-first order has a runtime reading on every loginst boot.
+fn open_pending_root_prompt() -> bool {
     if ROOT_PW_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
         serial_println!("[login] root password unset (store loaded before the desktop) -> set-password screen now (LOGIN14/R65)");
         screen_set_password(ROOT_NAME);
+        return true;
     }
+    false
 }
 
 // =========================================================================================
@@ -2011,11 +2020,20 @@ pub fn login_rootpw_fixture() {
             ok
         };
         let reset = fixture_unset_password(ROOT_NAME);
-        root_credential_ignition();
-        let deferred = ROOT_PW_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel);
-        if deferred {
-            screen::open_set_password(ROOT_NAME, false); // the desktop ignition has not run in this lane yet: open it here (headless where `wm` has no surface)
+        // THE DEFERRED LEG (R48's open question on the rMBP's order): with the desktop "not up", the
+        // ignition must ARM and open nothing; the desktop ignition's own step must then open it.
+        let was_ignited = DESKTOP_IGNITED.swap(false, core::sync::atomic::Ordering::AcqRel);
+        if screen_up() {
+            screen::fixture_reset(); // the real ignition already opened root's prompt in this lane: close it, the leg re-drives both orders
         }
+        root_credential_ignition();
+        let armed = ROOT_PW_PENDING.load(core::sync::atomic::Ordering::Acquire) && !screen_up();
+        DESKTOP_IGNITED.store(true, core::sync::atomic::Ordering::Release);
+        let opened_by_desktop = open_pending_root_prompt();
+        if !was_ignited {
+            DESKTOP_IGNITED.store(false, core::sync::atomic::Ordering::Release); // the real desktop ignition has not run yet in this lane: let it print its own line later
+        }
+        let deferred = armed && opened_by_desktop;
         let opened = screen_up() && screen::fixture_setpw_for(ROOT_NAME);
         let mut routed = feed(PW);
         routed &= key(b'\t');
@@ -2031,10 +2049,10 @@ pub fn login_rootpw_fixture() {
         let wrong_refused = !verify(ROOT_NAME, b"other-pw");
         let closed = !screen_up();
         let root_after = root_session();
-        let ok = reset && opened && routed && mismatch_kept && set && verify_ok && wrong_refused && closed && root_after;
+        let ok = reset && deferred && opened && routed && mismatch_kept && set && verify_ok && wrong_refused && closed && root_after;
         serial_println!(
-            ":: LOGIN-ROOTPW: reset={} deferred={} opened={} keys_routed={} mismatch_kept={} set={} verify={} wrong={} screen={} root_after={} -> {} ::",
-            reset, deferred, opened, routed, mismatch_kept, set, if verify_ok { "ok" } else { "FAIL" }, if wrong_refused { "refused" } else { "ACCEPTED" },
+            ":: LOGIN-ROOTPW: reset={} deferred_leg={} opened={} keys_routed={} mismatch_kept={} set={} verify={} wrong={} screen={} root_after={} -> {} ::",
+            reset, if deferred { "armed-then-opened" } else { "FAILED" }, opened, routed, mismatch_kept, set, if verify_ok { "ok" } else { "FAIL" }, if wrong_refused { "refused" } else { "ACCEPTED" },
             if closed { "closed" } else { "OPEN" }, root_after, if ok { "PASS" } else { "FAIL —" }
         );
     }

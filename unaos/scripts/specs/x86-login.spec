@@ -347,7 +347,9 @@ FORBID :: LOGIN-BOOTROOT: .* -> FAIL
 # LOGIN14 (R65, rmbp-ledger B198) — ROOT'S PASSWORD IS CHOSEN ON THE GLASS AT THE FIRST BOOT-TO-ROOT. At the
 # store's load `users::root_credential_ignition` makes root's row with NO credential (`KDF_UNSET`) and opens
 # the set-password form of the login screen (or defers it to the desktop ignition when the store loads
-# first — `deferred=` says which this run saw). The fixture runs FIRST in the loginst chain (every later
+# first). The fixture drives BOTH orders every run: with the desktop marked not-up the ignition must ARM
+# and open nothing, and the desktop step must then open it (`deferred_leg=armed-then-opened` — R48's
+# question about the rMBP's order answered at runtime, not by which order QEMU happened to take). It runs FIRST in the loginst chain (every later
 # login fixture assumes the screen is down): it puts root's row back to unset (a previous run of this image
 # set it), drives the REAL ignition, types the password, Tab, a DIFFERENT retype, Enter through the LIVE
 # x86 key router (`wc_route_event`) — the form must stay and the row stay unset — then the matching pair,
@@ -355,9 +357,11 @@ FORBID :: LOGIN-BOOTROOT: .* -> FAIL
 # GO-RED (run on this gate): `set_first_password` mutated to skip the write reads `set=false verify=FAIL`.
 # GREEN CERTIFIES: the boot-13 alert exists, takes the keyboard, refuses a mismatch, writes exactly what was
 # typed twice, and gives the root desktop back.
-REQUIRE :: LOGIN-ROOTPW: reset=true deferred=(true|false) opened=true keys_routed=true mismatch_kept=true set=true verify=ok wrong=refused screen=closed root_after=true -> PASS ::
+REQUIRE :: LOGIN-ROOTPW: reset=true deferred_leg=armed-then-opened opened=true keys_routed=true mismatch_kept=true set=true verify=ok wrong=refused screen=closed root_after=true -> PASS ::
 FORBID :: LOGIN-ROOTPW: .* -> FAIL
 REQUIRE \[login\] set-password screen open user=root login_after=false in_place=false
+REQUIRE \[login\] root password unset row=present -> set-password screen deferred to the desktop ignition
+REQUIRE \[login\] root password unset \(store loaded before the desktop\) -> set-password screen now
 REQUIRE \[login\] set-password user=root retype mismatch
 REQUIRE \[users\] password set user=root first=true
 REQUIRE \[login\] set-password screen closed user=root
