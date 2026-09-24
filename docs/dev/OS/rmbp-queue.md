@@ -179,7 +179,7 @@ Every row cites `docs/dev/OS/08_VIDEO/SHUTOUT-REGISTER.md` by section; read the 
 
 ## X86-ONLY FILES — QEMU q35 gates them
 · B1  LOCKFIX gap at `arch/x86_64/syscall.rs` `click_pointer_pos` (`WRITER.lock()` in an input band)
-· B3  five x86 features uncovered by any board leg (`nvidia-kepler-kdisp-hold rtpi rtwit selfhost vugras`)
+· ✓ JUDGED 2026-09-24 (landed by GATE-CFG-MIX; the check's census says `kernel cfg coverage OK (84 legs)`) — B3  five x86 features uncovered by any board leg (`nvidia-kepler-kdisp-hold rtpi rtwit selfhost vugras`)
 · B4  two `unsafe` warnings in the bootloader under `unaos_ivb`
 · B45  the x86 gate does not exercise the xHCI keyboard path at all (decides where the N-TD fix is proven)
 · B85  six FORBIDs keyed across a token junction in the x86 specs
