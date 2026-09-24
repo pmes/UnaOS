@@ -10950,6 +10950,18 @@ run_kernel8() {
 # deliberately NOT touched by this arc (lane discipline) and can inherit the retry helper later.
 test_kernel8() {
     local secs="${1:-60}"
+    # RASPI4B-PRESENT (QUEUE.md §5, 2026-09-24, measured on QEMU 8.2.2): an ABSENT machine type is not a
+    # flake. Without this probe the launch loop below retried `-machine raspi4b` on three ports, each
+    # attempt dying on `qemu-system-aarch64: unsupported machine type`, and then said "HARNESS FLAKE —
+    # QEMU never came up", which is a claim that a retry could have changed the outcome. It could not:
+    # `raspi4b` exists from QEMU 9.0. So the machine list is asked FIRST, before the build, and the
+    # answer is the same NO VERDICT exit 4 with its real reason. `-machine help` prints one machine per
+    # line, name first; awk keys on the whole first field so `raspi4b` never matches `raspi4b-foo`.
+    if ! qemu-system-aarch64 -machine help 2>/dev/null | awk '$1 == "raspi4b" { f = 1 } END { exit !f }'; then
+        echo -e "${COLOR_RED}✖ kernel8-test: this QEMU ($(qemu-system-aarch64 --version 2>/dev/null | head -1)) has NO 'raspi4b' machine type (QEMU 9.0 added it)."
+        echo -e "  Nothing was built or run, so this carries NO verdict: not a pass, not a regression, and NOT a flake — a retry cannot change it. Exit 4.${COLOR_RESET}"
+        return 4
+    fi
     kernel8 # always rebuild from current source (incremental; ~seconds) so we never test a stale image
     local logf="${WORKSPACE_DIR}/target/serial-pi.log"
     local png="${WORKSPACE_DIR}/target/pi-screen.png"
