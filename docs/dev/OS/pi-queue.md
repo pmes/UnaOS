@@ -8,6 +8,17 @@ the Pi's metal or the Pi's own files live here (`drivers/emmc2.rs`, `arch/aarch6
 Created 2026-09-12T00:35Z (2026-09-11 local; dates here are UTC) by orin 27 (all lanes, R46) from pi-ledger PI1-PI8, the SP rows and pi 11's archived
 focus queue (`docs/dev/evidence/pi11/FOCUS-QUEUE.md`, 2830 lines — a SUMMARY ARTIFACT, re-source every number).
 
+**TRACKSYNC 2026-09-24 (cloud session; Peter: "sync up the 3 branches so pi and orin don't get too far behind and it is then all ready to merge to main when the time is right. make it so each platform can do its own version boot 13").** The three tracks are ONE tree at the tip of `claude/optimistic-ramanujan-r3qyu5`: hw-rmbp f54acf6c was the base, hw-pi4 e6e71c9f was already contained (0 unique commits), hw-jetson 0ae4fcf9 carried 7 (RASTWIN A66/A67, GA10B6 A80-A82, GA10B7 A95, ORINRESCUE) and is merged at **2dda36e8** (4 conflicts, union; the one code conflict is main.rs, where ONEOS had converged the two rast wire-ins, so A67's move of `orin_rast_glass_post()` into `rast_demo::run` is ported into the converged fn, line-neutral). main 131d8958 is an ancestor of the tip, so PLAYBOOK §7 needs no trunk fold first — only the review panel and the `--no-ff` land, when Peter says. Level the tracks (Peter pushes, PLAYBOOK §8):
+```
+git fetch origin claude/optimistic-ramanujan-r3qyu5
+git -C ../UnaOS-rmbp   merge --ff-only origin/claude/optimistic-ramanujan-r3qyu5   # hw-rmbp  f54acf6c is an ancestor
+git -C ../UnaOS-hw-pi4 merge --ff-only origin/claude/optimistic-ramanujan-r3qyu5   # hw-pi4   e6e71c9f is an ancestor
+git -C ../UnaOS-orin   merge --ff-only origin/claude/optimistic-ramanujan-r3qyu5   # hw-jetson 0ae4fcf9 is an ancestor (merged 2dda36e8)
+git push origin hw-rmbp hw-pi4 hw-jetson
+```
+Gates on 2dda36e8: `bash unaos/scripts/ledger-check.sh` 245 findings (+0, the baseline); `UNAOS_LEDGER_STRICT=1 UNAOS_K8REACH_STRICT=1 ./arroyo check` — result in the CLOSE STATE below this block when it lands (the cloud box has no KVM and no bench; `:: SOCK-3:` is its known red).
+**BOOT 13 ON THE Pi 4 = its FIRST render-class metal boot, and it can now carry the login alert.** Build at the levelled hw-pi4 tip: `UNAOS_PIDESK=1 UNAOS_QUARRY=1 UNAOS_WC=1 UNAOS_LOGIN=1 ./arroyo kernel8` (`kernel8` accepts `UNAOS_LOGIN`, arroyo:10684; never `UNAOS_LOGINST=1` on a card), then `flash-pi4.sh` — and SP17 still holds: the script verifies the image, never the card's identity, so read the target device by hand first. New on THIS board: the root alert at boot and the first-login alert for a new account (LOGIN14, B198; `users::service()` is called from the Pi main loop's pass), the login window in Quarry's face (B204), plus the 46 owed render-class commits that have never executed on Pi metal (the row above). Score by `multiuser.md` §9.2 and `pi4-regression.spec`. QEMU rehearsal first, on raspi4b: `UNAOS_LOGIN=1 UNAOS_LOGINST=1 UNAOS_K8_SPEC=scripts/specs/arm-login.spec ./arroyo kernel8-test` (result in the CLOSE STATE when it lands; kernel8-test is flaky under host load — SO7/B26 — so a red here is re-run once on a quiet box before it is a finding).
+
 ## STATE — 2026-09-12T01:4xZ
 ✓ origin/hw-pi4 153c78dd; local hw-pi4 = this commit, clean. `git rev-list --left-right --count main...hw-pi4` with main at 4a03404f: main +6 (rmbp landing, R45-R48, QUEUE.md) / pi +48 (docs + the DRAG/STORM/V3D video and sched work + this file). Landing now (review panel ACK 2026-09-12).
 · Pi bench legs (R39): `kernel8-test`, `arm virt v2`, `arm virt v3 (CAPSTONE)`, the arm usb-write witness — pi's, unconditionally.
