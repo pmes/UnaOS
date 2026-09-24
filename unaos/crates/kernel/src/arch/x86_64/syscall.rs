@@ -19399,7 +19399,7 @@ fn winx8_launcher(_demo_cpu: usize) {
             return;
         }
     };
-    let slot = slot as usize;
+    let slot = slot as usize; crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot as u64), "VUG.ELF"); // SO22 (WINTITLE's two out-of-lane launchers): the window this program is about to mint is named here, through the one seam every launcher uses — same-line, like shell.rs and quarry/live.rs
 
     let deadline = crate::arch::ticks() + 5_000;
     let mut windowed = false;
@@ -19436,22 +19436,22 @@ fn winx8_launcher(_demo_cpu: usize) {
     while winx_slot_has_window(slot) && crate::arch::ticks() < tdeadline {
         crate::arch::sched::yield_now();
     }
-    let cleared = !winx_slot_has_window(slot);
+    let cleared = !winx_slot_has_window(slot); let mut name_gone = false; let ndl = crate::arch::ticks() + 2_000; while !name_gone && crate::arch::ticks() < ndl { name_gone = !crate::video::wm::app_name_armed(crate::video::wm::owner_of_launch(slot as u64)); if !name_gone { crate::arch::sched::yield_now(); } } // SO22: the name armed at spawn dies with the SLOT, and the slot is released by refcount (`USER_SPACE_REFS` -> `free_user_space_by_cr3`) a little after the window row and the proc row are gone (`row_freed` above is the PROC table), so this waits for it the way `cleared` waited for the window — bounded, 2 s; a recycled slot wearing "VUG" was the defect
 
     for _ in 0..64 {
         crate::arch::sched::yield_now();
     }
 
-    if windowed && presents >= WINX8_MIN_PRESENTS && killed && reaped && row_freed && cleared {
+    if windowed && presents >= WINX8_MIN_PRESENTS && killed && reaped && row_freed && cleared && name_gone {
         serial_println!(
             ":: WINX-8: VUG.ELF end-to-end — loaded (entry {:#x}) + windowed + {} presents with {} ring-3 thread(s), killed + row reaped by the kill (free {}->{}/{}, exited {}->{}), teardown clean -> PASS ::",
             entry, presents, threads, free_before, free_after, proc_table_rows(), exited_before, exited_after
         );
     } else {
         serial_println!(
-            ":: WINX-8: VUG.ELF end-to-end FAIL — windowed={} presents={} threads={} killed={} (verdict={:?}) row_gone={} row_freed={} (free {}->{}/{} exited {}->{}) cleared={} (want true/>={}/-/true/true/true/true) ::",
+            ":: WINX-8: VUG.ELF end-to-end FAIL — windowed={} presents={} threads={} killed={} (verdict={:?}) row_gone={} row_freed={} (free {}->{}/{} exited {}->{}) cleared={} name_gone={} (want true/>={}/-/true/true/true/true/true) ::",
             windowed, presents, threads, killed, verdict, reaped, row_freed,
-            free_before, free_after, proc_table_rows(), exited_before, exited_after, cleared, WINX8_MIN_PRESENTS
+            free_before, free_after, proc_table_rows(), exited_before, exited_after, cleared, name_gone, WINX8_MIN_PRESENTS
         );
     }
 }
@@ -19535,7 +19535,7 @@ fn pulsew_launcher(_demo_cpu: usize) {
             return;
         }
     };
-    let slot = slot as usize;
+    let slot = slot as usize; crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot as u64), "PULSE.ELF"); // SO22 (WINTITLE's two out-of-lane launchers): the window this program is about to mint is named here, through the one seam every launcher uses — same-line, like shell.rs and quarry/live.rs
 
     let deadline = crate::arch::ticks() + 8_000;
     let mut windowed = false;

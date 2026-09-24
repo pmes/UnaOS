@@ -961,6 +961,12 @@ pub fn app_name_forget(owner: u64) {
     }
 }
 
+/// SO22 — is a name armed for `owner` right now? The witness half of `app_name_forget`: a launcher
+/// that killed its program asks this after the slot is freed, and a `true` is the recycled-name defect.
+pub fn app_name_armed(owner: u64) -> bool {
+    owner != 0 && APP_NAMES.lock().iter().any(|e| e.owner == owner)
+}
+
 /// WINTITLE — clause 3's minter: the title of the `seq`-th nameless document. `Untitled`,
 /// `Untitled 1`, `Untitled 2`, … Returns the length written into `out`.
 ///

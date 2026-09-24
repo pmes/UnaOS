@@ -138,6 +138,15 @@ FORBID :: STRIPVAC-DEBT: .* -> FAIL ::
 # --- `refuse(..)` reverted to a bare `.report()` (counted=0). SKIP is honest only mid-slice.
 REQUIRE :: PRTSCR-REFUSE: inflight door -> named=1 counted=1 slicing=0 -> PASS ::
 FORBID :: PRTSCR-REFUSE: .* -> FAIL ::
+# --- SO22 (WINTITLE leftovers): the two launchers that minted UNNAMED windows now name them through
+# --- `wm::app_name_arm(owner_of_launch(slot), path)` at spawn (dock label = program name), and the
+# --- name dies with the slot (`free_user_space_by_cr3` on x86, `teardown_user_slot` on aarch64) — before,
+# --- every later slot-0 window wore "VUG" (measured: dock labels gen 27..32 all VUG on the previous run).
+# --- WINX-8's verdict now carries `name_gone`, so a name that outlives its slot reds its PASS line.
+REQUIRE \[dock\] tile add win=\d+ gen=\d+ owner=0x1 seq=\d+ label=PULSE
+REQUIRE \[dock\] tile add win=\d+ gen=\d+ owner=0x1 seq=\d+ label=VUG
+REQUIRE :: WINX-8: VUG\.ELF end-to-end — loaded \(entry 0x[0-9a-fA-F]+\) \+ windowed \+ [0-9]+ presents with 2 ring-3 thread\(s\), killed \+ row reaped by the kill .* teardown clean
+FORBID :: WINX-8: .* FAIL
 
 # --- SPECPINS (2026-09-22) — THE THREE 2026-09-17 FIXTURES THIS GATE COULD SCORE AND DID NOT -----
 # --- MENUDROP, SERIALDOOR and W5SPIN all landed on hw-rmbp on 2026-09-17, each with a green QEMU

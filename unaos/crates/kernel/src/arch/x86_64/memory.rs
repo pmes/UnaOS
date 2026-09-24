@@ -1046,7 +1046,7 @@ pub fn free_user_space_by_cr3(cr3: u64) {
                 "route=self-exit shell-raise=skipped siblings=untouched",
             );
             unsafe { clear_slot_fb(s) };
-            SLOT_USED[s].store(false, Ordering::Release);
+            SLOT_USED[s].store(false, Ordering::Release); crate::video::wm::app_name_forget(crate::video::wm::owner_of_launch(s as u64)); // SO22: a recycled slot must not wear its predecessor's name — forgotten the instant the slot is free
             // SMPBAL-X86: the RECYCLE point. `clear_slot_fb` above already bumped, but state that
             // dependency here rather than inheriting it — this store is what makes the slot claimable
             // again, and it is the instant after which another core's cached leaves for this CR3
