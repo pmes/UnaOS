@@ -36,25 +36,36 @@ fn mbench_py(root: &Path) -> PathBuf {
 
 /// Run mbench in replay mode; returns (rc, stdout).
 fn run_mbench(root: &Path, log: &Path, spec: &Path) -> Option<(i32, String)> {
-    let out = Command::new("python3")
-        .arg(mbench_py(root))
+    run_mbench_art(root, log, spec, None)
+}
+
+/// mbench replay with `--artifact` (FORBID-UNREACHABLE, B210) when one is given.
+fn run_mbench_art(root: &Path, log: &Path, spec: &Path, art: Option<&Path>) -> Option<(i32, String)> {
+    let mut cmd = Command::new("python3");
+    cmd.arg(mbench_py(root))
         .arg("--replay")
         .arg(log)
         .arg("--spec")
         .arg(spec)
-        .arg("--quiet")
-        .current_dir(root)
-        .output()
-        .ok()?;
+        .arg("--quiet");
+    if let Some(a) = art {
+        cmd.arg("--artifact").arg(a);
+    }
+    let out = cmd.current_dir(root).output().ok()?;
     let rc = out.status.code()?;
     Some((rc, String::from_utf8_lossy(&out.stdout).into_owned()))
 }
 
 /// Run foreman's `verdict` module over the same pair.
 fn run_foreman(log: &Path, spec: &Path) -> (i32, String) {
+    run_foreman_art(log, spec, None)
+}
+
+fn run_foreman_art(log: &Path, spec: &Path, art: Option<&Path>) -> (i32, String) {
     let cap = capture::read(log).expect("log readable");
     let ds = verdict::parse_spec(spec).expect("spec parses");
-    let ev = verdict::evaluate(ds, &cap, spec);
+    let mut ev = verdict::evaluate(ds, &cap, spec);
+    verdict::apply_reach(&mut ev, art);
     (ev.verdict().rc(), verdict::render_table(&ev))
 }
 
@@ -110,6 +121,23 @@ COMPLETE RUN-END marker\n\
 REQUIRE FIRST-WITNESS PASS\n\
 REQUIRE LAST-WITNESS PASS\n";
 const TRUNC_HEAD: &[u8] = b":: FIRST-WITNESS PASS ::\r\n";
+
+// FORBID-UNREACHABLE (B210) corpus: five spec FORBIDs against one "artifact" whose
+// bytes carry SOME of their literals (`kind=ax88179` is the real x86-usbnet.spec
+// row that motivated the gate: the artifact carries `kind=ecm`, not it). `-> FAIL` is the wire's default FORBID text
+// and IS in the artifact (reachable, 0 hits → ✅ as before); `RENAMED-WITNESS` is
+// NOT (→ ◦ UNREACHABLE); the third HITS the capture (a hit is a hit, reach or no
+// reach → ❌); the fourth's longest literal is under REACH_MIN, so it is never
+// checked (✅). The escaped-metachar and class shapes come from real specs.
+const REACH_SPEC: &[u8] = b"# FORBID-UNREACHABLE agreement spec\n\
+REQUIRE CAPSTONE COMPLETE\n\
+FORBID :: U[0-9]+: .* -> FAIL \\(sector\n\
+FORBID :: RENAMED-WITNESS: .* ::\n\
+FORBID :: U5: capabilities\n\
+FORBID U[45]:\n\
+FORBID kind=ax88179\n";
+const REACH_ART: &[u8] = b"\x7fELF\x02\x01\x01 :: U4: process model -> FAIL (sector mismatch) :: \
+:: U5: capabilities -> PASS :: kind=ecm \x00 CAPSTONE COMPLETE \x00";
 const TRUNC_TAIL: &[u8] = b":: LAST-WITNESS PASS ::\r\n:: RUN-END marker ::\r\n";
 
 fn cat(parts: &[&[u8]]) -> Vec<u8> {
@@ -224,4 +252,59 @@ fn agrees_with_mbench_on_the_shared_corpus() {
         mismatches.join("\n")
     );
     eprintln!("agreement: {checked} (log, spec) pairs — exit code and verdict table identical");
+}
+
+#[test]
+fn agrees_with_mbench_on_forbid_reachability() {
+    let root = repo_root();
+    if !mbench_py(&root).is_file() {
+        eprintln!("SKIP: {} not present", mbench_py(&root).display());
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("foreman-reach-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let spec = write(&tmp, "reach.spec", REACH_SPEC);
+    let art = write(&tmp, "reach-kernel.elf", REACH_ART);
+    let good = write(&tmp, "good.log", &cat(&[CANNED, CANNED_TAIL]));
+    let bad = write(&tmp, "bad.log", &cat(&[CANNED, CANNED_TAIL, CANNED_BAD]));
+
+    let mut mismatches: Vec<String> = Vec::new();
+    let mut unreach_seen = false;
+    for log in [&good, &bad] {
+        let Some((mrc, mtable)) = run_mbench_art(&root, log, &spec, Some(&art)) else {
+            eprintln!("SKIP: mbench did not run");
+            return;
+        };
+        let (frc, ftable) = run_foreman_art(log, &spec, Some(&art));
+        if mrc != frc || mtable.trim_end() != ftable.trim_end() {
+            mismatches.push(format!("{}:\n--- mbench\n{mtable}\n--- foreman\n{ftable}", log.display()));
+        }
+        // The rule itself, on foreman's table (mbench's is byte-identical by now).
+        if ftable.contains("UNREACHABLE: its literal \":: RENAMED-WITNESS: \"") {
+            unreach_seen = true;
+        }
+        assert!(
+            !ftable.contains("UNREACHABLE: its literal \"-> FAIL"),
+            "a literal present in the artifact was called unreachable:\n{ftable}"
+        );
+        assert!(
+            ftable.contains(", 2 unreachable FORBID(s)"),
+            "summary must count the two unreachable FORBIDs (RENAMED-WITNESS, kind=ax88179):\n{ftable}"
+        );
+    }
+    // Advisory: the verdict is the verdict without the artifact.
+    let (rc_no, _) = run_foreman(&good, &spec);
+    let (rc_art, _) = run_foreman_art(&good, &spec, Some(&art));
+    assert_eq!(rc_no, rc_art, "reachability changed a verdict");
+    let (rc_bad, table_bad) = run_foreman_art(&bad, &spec, Some(&art));
+    assert_ne!(rc_bad, 0, "the FORBID hit must still fail:\n{table_bad}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert!(unreach_seen, "the renamed token was not reported UNREACHABLE");
+    assert!(
+        mismatches.is_empty(),
+        "foreman disagrees with mbench with --artifact:\n{}",
+        mismatches.join("\n")
+    );
+    eprintln!("reach agreement: 2 pairs — tables identical, UNREACHABLE row and summary present");
 }

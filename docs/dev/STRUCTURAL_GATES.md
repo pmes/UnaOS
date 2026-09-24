@@ -2423,3 +2423,39 @@ claims byte identity means `./arroyo knoboff <knob>` is owed on that fold, not a
 and every one has already been judged), and an advisory line nobody reads is not a gate. GATE-SELFSYNTAX
 covers the script; a bad or missing ref is exit 2 with no verdict.
 
+## FORBID-UNREACHABLE — a FORBID whose token is not in the artifact says so (B210, 2026-09-24)
+
+**The rule it checks.** A `FORBID` with 0 hits read ✅, whether the wire never carried the line or the
+KERNEL never carried it. NEUTRAL2's go-red (rmbp-ledger B160, QUEUE §5) is the shape: a rename batch
+moved a witness family's spelling, the REQUIRE on the old spelling went 5/6 and named itself, and the
+FORBID on the same old spelling stayed ✅ with 0 hits — a FORBID-only gate would have passed a tree it
+no longer read. A check that cannot fire is an absent one (LAWS §5). So when the ARTIFACT the capture
+came from is known, both verdict tools count every spec FORBID's longest literal run (>= 6 chars: the
+text the wire must carry verbatim, SPECPINS2's notion, computed by the `literal_runs` walk that
+`orin-specscore.py` uses — class contents and `{n,m}` counts are not literal, an escaped metacharacter
+is) in the artifact's bytes. Zero → the row's glyph is ◦ and its note reads
+`0 hits — UNREACHABLE: its literal "<run>" has 0 hits in <artifact> (a check that cannot fire is an absent
+one, LAWS §5)`; the summary line appends `, N unreachable FORBID(s)`. The builtin FORBIDs (`-> FAIL`,
+`FAIL ::`, `PANIC`, `-> FLICKER`) are never counted: they are the wire's, not the spec's. A FORBID whose
+longest literal is under 6 chars is not checked either (`FORBID U[45]:` has nothing to count).
+
+**Advisory, by design.** The verdict and exit code do not change. Half the specs in this tree carry
+FORBIDs on ANOTHER knob's failure lines (`x86-usbnet.spec`'s `FORBID kind=ax88179` on an ECM boot;
+`FORBID :: USBNET: link down` on a knob-off image), and reddening those would be the false-strict
+LAWS §5 also forbids. The row is the finding; a reader who sees ◦ on a FORBID whose token they expected
+in the image has found the rename. The REQUIRE beside it is the present-control, as B160 said.
+
+**Where the artifact comes from.** `--artifact <file>` on `mbench.py --replay` and on `foreman`; or the
+run sidecar's new `artifact=` key, read only when the sidecar is FRESH (mode `fast`/`full`, identity
+checked — the same rule `mode=` obeys). `arroyo` writes it from `QEMU_RUN_ARTIFACT`, set beside each
+QEMU launch: `test` (`target/x86_64-unaos/release/unaos-kernel`), `test-arm`
+(`target/aarch64-unaos/release/unaos-kernel`), `kernel8-test` and `install-pi` (`kernel8.img`). A
+capture replayed without a sidecar and without `--artifact` behaves exactly as before.
+
+**Twinned.** `mbench.py` (`literal_runs`, `longest_literal`, `count_bytes`, `Directive.reach_check`,
+`apply_reach`, `sidecar_artifact`) and `tools/foreman/src/verdict.rs` (the same names) render the same
+row and summary; GATE-FOREMAN's agreement test gained `agrees_with_mbench_on_forbid_reachability`
+(`tests/agreement.rs`): five FORBIDs against one synthetic artifact — a reachable 0-hit row, two
+unreachable rows (one the real `kind=ax88179`), a hit that still ❌s with the artifact present, and a
+sub-6-char literal that is not checked — plus the assertion that the artifact never changes an exit
+code. Measured on a real pair in `docs/dev/evidence/rmbp-0924/gates/GATES.md` §B210.

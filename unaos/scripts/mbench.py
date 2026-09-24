@@ -164,6 +164,70 @@ RC_ERROR = 2
 RC_TRUNCATED = 3
 
 
+# FORBID-UNREACHABLE (rmbp-ledger B210; NEUTRAL2's finding, B160): a FORBID whose token is NOT IN THE
+# ARTIFACT can never fire, and until now it read ✅ with 0 hits — indistinguishable from a FORBID that
+# passed. A rename batch could therefore pass a FORBID-only gate having broken it. When the artifact
+# under test is known (`--artifact`, or the run sidecar's `artifact=` when the sidecar is fresh), every
+# spec FORBID's longest literal run (>= 6 chars, the text the wire must carry verbatim — the SPECPINS2
+# / orin-specscore notion) is counted in the artifact's bytes; 0 → the row reads ◦ UNREACHABLE and the
+# summary counts it. Advisory: the verdict is unchanged (LAWS §5 says a check that cannot fire is an
+# absent one; saying so is the fix, and reddening every spec whose FORBIDs name another knob's lines
+# would be the false-strict LAWS §5 also forbids). `foreman` implements the same rule, byte for byte.
+LITERAL_META = set(".^$*+?()[]{}|\\")
+REACH_MIN = 6
+
+def literal_runs(pat):
+    """The maximal LITERAL substrings of a regex (orin-specscore.py's `literal_runs`, verbatim in
+    semantics): class contents and `{n,m}` counts are not literal, an escaped metacharacter is."""
+    runs, cur, i, n = [], [], 0, len(pat)
+    while i < n:
+        c = pat[i]
+        if c == "\\" and i + 1 < n:
+            nxt = pat[i + 1]
+            if nxt in "[]().*+?^$|{}\\/-":
+                cur.append(nxt)
+            else:
+                runs.append("".join(cur)); cur = []
+            i += 2
+            continue
+        if c == "[":
+            runs.append("".join(cur)); cur = []
+            j = i + 1
+            if j < n and pat[j] == "^":
+                j += 1
+            if j < n and pat[j] == "]":
+                j += 1
+            while j < n and pat[j] != "]":
+                j += 2 if pat[j] == "\\" else 1
+            i = j + 1
+            continue
+        if c == "{":
+            runs.append("".join(cur)); cur = []
+            j = pat.find("}", i)
+            i = (j + 1) if j != -1 else i + 1
+            continue
+        if c in LITERAL_META:
+            runs.append("".join(cur)); cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    runs.append("".join(cur))
+    return [r for r in runs if r]
+
+def longest_literal(pat, min_len=REACH_MIN):
+    """The longest literal run of `pat` with at least `min_len` characters, or None. Ties: the first."""
+    best = None
+    for r in literal_runs(pat):
+        if len(r) >= min_len and (best is None or len(r) > len(best)):
+            best = r
+    return best
+
+def count_bytes(blob, needle):
+    """Non-overlapping occurrences of `needle` (bytes) in `blob` — Python's `bytes.count`, named so the
+    Rust twin has one definition to match."""
+    return blob.count(needle)
+
 class Directive:
     def __init__(self, kind, pattern, need=1, builtin=False, spec_line=0, spec_name=""):
         self.kind = kind          # REQUIRE | COUNT | OPTIONAL | FORBID | PENDING | COMPLETE
@@ -182,6 +246,24 @@ class Directive:
         self.hits = 0
         self.first_lineno = None
         self.first_text = None
+        # FORBID-UNREACHABLE: None = not checked (no artifact, not a spec FORBID, or no literal run of
+        # REACH_MIN); otherwise the literal's byte count in the artifact, and which literal/artifact.
+        self.reach = None
+        self.reach_run = None
+        self.reach_art = ""
+
+    def reach_check(self, blob, art_name):
+        if self.kind != "FORBID" or self.builtin:
+            return
+        run = longest_literal(self.pattern)
+        if run is None:
+            return
+        self.reach_run = run
+        self.reach_art = art_name
+        self.reach = count_bytes(blob, run.encode("utf-8"))
+
+    def unreachable(self):
+        return self.kind == "FORBID" and self.hits == 0 and self.reach == 0
 
     def feed(self, text, lineno):
         """Returns True if this line matched this directive."""
@@ -241,6 +323,8 @@ class Directive:
             return GLYPH["ok"] if self.hits else GLYPH["pending"]
         if self.kind == "OPTIONAL":
             return GLYPH["ok"] if self.hits else GLYPH["info"]
+        if self.unreachable():
+            return GLYPH["info"]
         return GLYPH["ok"]
 
     def origin(self):
@@ -262,6 +346,9 @@ class Directive:
         if self.kind == "FORBID":
             if self.hits:
                 return f"{self.hits} hit(s), first @ line {self.first_lineno}: {self.first_text}"
+            if self.unreachable():
+                return (f"0 hits — UNREACHABLE: its literal \"{self.reach_run}\" has 0 hits in {self.reach_art} "
+                        f"(a check that cannot fire is an absent one, LAWS §5)")
             return "0 hits"
         if self.hits == 0:
             if self.kind == "PENDING":
@@ -529,6 +616,9 @@ def verdict_table(matcher, spec_path, log_path, elapsed=None, out=None):
                f", {matcher.lineno} lines scanned")
     if pend:
         summary += f", pending {pmatched}/{len(pend)} matched"
+    unreach = sum(1 for d in ds if d.unreachable())
+    if unreach:
+        summary += f", {unreach} unreachable FORBID(s)"
     # QEMU-FAST: say on the verdict line WHICH KIND OF CAPTURE this verdict is about.
     # Three-valued (see read_run_sidecar): a reader who needs a final accumulator value
     # or a certified-clean tail must see `full` here and nothing else — `unknown` is not
@@ -582,7 +672,31 @@ def verdict_table(matcher, spec_path, log_path, elapsed=None, out=None):
 # Replay mode
 # ---------------------------------------------------------------------------
 
-def run_replay(log_path, spec_path, quiet=False):
+def sidecar_artifact(log_path):
+    """The artifact the run sidecar names, when the sidecar is FRESH (mode fast|full); else None. The
+    same rule, in the same words, in foreman's `sidecar_artifact`."""
+    mode, _detail, fields = read_run_sidecar(log_path)
+    if mode not in ("fast", "full"):
+        return None
+    art = fields.get("artifact", "")
+    return art or None
+
+def apply_reach(matcher, log_path, artifact=None):
+    """FORBID-UNREACHABLE: count every spec FORBID's longest literal in the artifact under test."""
+    art = artifact or sidecar_artifact(log_path)
+    if not art:
+        return
+    try:
+        with open(art, "rb") as f:
+            blob = f.read()
+    except OSError as e:
+        print(f"mbench: --artifact {art}: {e} — FORBID reachability not checked", file=sys.stderr)
+        return
+    name = os.path.basename(art)
+    for d in matcher.directives:
+        d.reach_check(blob, name)
+
+def run_replay(log_path, spec_path, quiet=False, artifact=None):
     directives = parse_spec(spec_path)
     matcher = Matcher(directives)
     with open(log_path, "rb") as f:
@@ -598,6 +712,7 @@ def run_replay(log_path, spec_path, quiet=False):
         for d, text in matcher.feed_raw(raw):
             if d.kind == "FORBID" and d.hits == 1 and not quiet:
                 print(f"  {GLYPH['fail']} FORBID hit @ line {matcher.lineno}: {text.strip()}")
+    apply_reach(matcher, log_path, artifact)
     return verdict_table(matcher, spec_path, log_path)
 
 
@@ -1100,6 +1215,9 @@ def main(argv=None):
     mode.add_argument("--self-test", action="store_true",
                       help="no hardware: verify the harness on canned lines")
     ap.add_argument("--spec", metavar="FILE", help="witness spec (*.spec)")
+    ap.add_argument("--artifact", metavar="FILE",
+                    help="FORBID-UNREACHABLE: the kernel ELF / image the capture came from; every spec FORBID's longest "
+                         "literal is counted in it and a 0 reads ◦ UNREACHABLE (default: the run sidecar's artifact=)")
     ap.add_argument("--timeout", type=float, default=120.0,
                     help="follow-mode bound in seconds (default 120)")
     ap.add_argument("--inject", metavar="FIFO",
@@ -1136,7 +1254,7 @@ def main(argv=None):
 
     try:
         if args.replay:
-            return run_replay(args.replay, args.spec, quiet=args.quiet)
+            return run_replay(args.replay, args.spec, quiet=args.quiet, artifact=args.artifact)
         rc = run_follow(args.follow, args.spec, args.timeout,
                         injector=injector, quiet=args.quiet)
         return rc

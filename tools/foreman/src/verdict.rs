@@ -138,9 +138,110 @@ pub struct Directive {
     /// Every matching line number, capped — the `context` module reads these to
     /// window the capture around FORBID hits without re-scanning.
     pub hit_linenos: Vec<usize>,
+    /// FORBID-UNREACHABLE (B210): `None` = not checked (no artifact, not a spec
+    /// FORBID, or no literal run of `REACH_MIN`); otherwise the byte count of
+    /// `reach_run` in the artifact named `reach_art`. mbench's `reach`.
+    pub reach: Option<usize>,
+    pub reach_run: Option<String>,
+    pub reach_art: String,
 }
 
 const HIT_LINENO_CAP: usize = 256;
+
+/// FORBID-UNREACHABLE (rmbp-ledger B210; NEUTRAL2's finding, B160): a FORBID whose
+/// token is NOT IN THE ARTIFACT can never fire, and read ✅ with 0 hits — the same
+/// row as a FORBID that passed. When the artifact under test is known (`--artifact`,
+/// or a FRESH run sidecar's `artifact=`), every spec FORBID's longest literal run
+/// (>= `REACH_MIN` chars) is counted in the artifact's bytes; 0 → ◦ UNREACHABLE and
+/// a summary count. Advisory: the verdict is unchanged (LAWS §5). mbench.py's
+/// `literal_runs` / `longest_literal` / `count_bytes`, byte for byte.
+const LITERAL_META: &str = ".^$*+?()[]{}|\\";
+pub const REACH_MIN: usize = 6;
+
+/// The maximal LITERAL substrings of a regex: class contents and `{n,m}` counts are
+/// not literal, an escaped metacharacter is.
+pub fn literal_runs(pat: &str) -> Vec<String> {
+    let cs: Vec<char> = pat.chars().collect();
+    let n = cs.len();
+    let mut runs: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0usize;
+    while i < n {
+        let c = cs[i];
+        if c == '\\' && i + 1 < n {
+            let nxt = cs[i + 1];
+            if "[]().*+?^$|{}\\/-".contains(nxt) {
+                cur.push(nxt);
+            } else {
+                runs.push(std::mem::take(&mut cur));
+            }
+            i += 2;
+            continue;
+        }
+        if c == '[' {
+            runs.push(std::mem::take(&mut cur));
+            let mut j = i + 1;
+            if j < n && cs[j] == '^' {
+                j += 1;
+            }
+            if j < n && cs[j] == ']' {
+                j += 1;
+            }
+            while j < n && cs[j] != ']' {
+                j += if cs[j] == '\\' { 2 } else { 1 };
+            }
+            i = j + 1;
+            continue;
+        }
+        if c == '{' {
+            runs.push(std::mem::take(&mut cur));
+            i = match cs[i..].iter().position(|&x| x == '}') {
+                Some(off) => i + off + 1,
+                None => i + 1,
+            };
+            continue;
+        }
+        if LITERAL_META.contains(c) {
+            runs.push(std::mem::take(&mut cur));
+            i += 1;
+            continue;
+        }
+        cur.push(c);
+        i += 1;
+    }
+    runs.push(cur);
+    runs.into_iter().filter(|r| !r.is_empty()).collect()
+}
+
+/// The longest literal run of `pat` with at least `min_len` chars; ties → the first.
+pub fn longest_literal(pat: &str, min_len: usize) -> Option<String> {
+    let mut best: Option<String> = None;
+    for r in literal_runs(pat) {
+        let longer = best.as_ref().map_or(true, |b| r.chars().count() > b.chars().count());
+        if r.chars().count() >= min_len && longer {
+            best = Some(r);
+        }
+    }
+    best
+}
+
+/// Non-overlapping occurrences of `needle` in `blob` — Python's `bytes.count`.
+pub fn count_bytes(blob: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || needle.len() > blob.len() {
+        return 0;
+    }
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i + needle.len() <= blob.len() {
+        if &blob[i..i + needle.len()] == needle {
+            n += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
 
 impl Directive {
     fn new(
@@ -165,7 +266,25 @@ impl Directive {
             first_lineno: None,
             first_text: None,
             hit_linenos: Vec::new(),
+            reach: None,
+            reach_run: None,
+            reach_art: String::new(),
         })
+    }
+
+    /// FORBID-UNREACHABLE: count this spec FORBID's longest literal in the artifact.
+    pub fn reach_check(&mut self, blob: &[u8], art_name: &str) {
+        if self.kind != Kind::Forbid || self.builtin {
+            return;
+        }
+        let Some(run) = longest_literal(&self.pattern, REACH_MIN) else { return };
+        self.reach = Some(count_bytes(blob, run.as_bytes()));
+        self.reach_run = Some(run);
+        self.reach_art = art_name.to_string();
+    }
+
+    pub fn unreachable(&self) -> bool {
+        self.kind == Kind::Forbid && self.hits == 0 && self.reach == Some(0)
     }
 
     fn feed(&mut self, text: &str, lineno: usize) -> bool {
@@ -224,6 +343,7 @@ impl Directive {
             Kind::Complete => if self.hits > 0 { glyph::OK } else { glyph::CUT },
             Kind::Pending => if self.hits > 0 { glyph::OK } else { glyph::PENDING },
             Kind::Optional => if self.hits > 0 { glyph::OK } else { glyph::INFO },
+            Kind::Forbid if self.unreachable() => glyph::INFO,
             _ => glyph::OK,
         }
     }
@@ -257,6 +377,12 @@ impl Directive {
                         "{} hit(s), first @ line {first}: {}",
                         self.hits,
                         self.first_text.as_deref().unwrap_or("")
+                    )
+                } else if self.unreachable() {
+                    format!(
+                        "0 hits — UNREACHABLE: its literal \"{}\" has 0 hits in {} (a check that cannot fire is an absent one, LAWS §5)",
+                        self.reach_run.as_deref().unwrap_or(""),
+                        self.reach_art
                     )
                 } else {
                     "0 hits".to_string()
@@ -643,6 +769,44 @@ fn sidecar_path(log_path: &Path) -> PathBuf {
 
 /// Read `<log_path>.run`. Returns `(mode, detail, fields)`, where `mode` is one
 /// of `"fast"`, `"full"`, `"unknown"` — never anything else, and never guessed.
+/// The artifact a FRESH run sidecar (mode fast|full) names, else `None` —
+/// mbench's `sidecar_artifact`, in the same words.
+pub fn sidecar_artifact(log_path: &Path) -> Option<PathBuf> {
+    let (mode, _detail, fields) = read_run_sidecar(log_path);
+    if mode != "fast" && mode != "full" {
+        return None;
+    }
+    fields.get("artifact").filter(|a| !a.is_empty()).map(PathBuf::from)
+}
+
+/// FORBID-UNREACHABLE: count every spec FORBID's longest literal in the artifact
+/// under test (`artifact`, else the fresh sidecar's `artifact=`). An unreadable
+/// artifact is said once on stderr and leaves every row unchecked — mbench's
+/// `apply_reach`.
+pub fn apply_reach(ev: &mut Evaluation, artifact: Option<&Path>) {
+    let art = match artifact {
+        Some(a) => a.to_path_buf(),
+        None => match sidecar_artifact(&ev.log_path) {
+            Some(a) => a,
+            None => return,
+        },
+    };
+    let blob = match std::fs::read(&art) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "foreman: --artifact {}: {e} — FORBID reachability not checked",
+                art.display()
+            );
+            return;
+        }
+    };
+    let name = basename(&art);
+    for d in ev.directives.iter_mut() {
+        d.reach_check(&blob, &name);
+    }
+}
+
 fn read_run_sidecar(log_path: &Path) -> (&'static str, String, HashMap<String, String>) {
     let empty = HashMap::new();
     let Ok(raw) = std::fs::read(sidecar_path(log_path)) else {
@@ -933,6 +1097,10 @@ pub fn render_table(ev: &Evaluation) -> String {
     );
     if !pend.is_empty() {
         summary.push_str(&format!(", pending {pmatched}/{} matched", pend.len()));
+    }
+    let unreach = ev.directives.iter().filter(|d| d.unreachable()).count();
+    if unreach > 0 {
+        summary.push_str(&format!(", {unreach} unreachable FORBID(s)"));
     }
     // QEMU-FAST: say on the verdict line WHICH KIND OF CAPTURE this verdict is
     // about. Three-valued (see `read_run_sidecar`): a reader who needs a final

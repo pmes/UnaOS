@@ -169,3 +169,29 @@ $ … --cap 3 --grace 0.5 --quiet 0.6   against a writer that never stops or end
 AWAIT status=complete complete_at=0.0 forbid_hits=0 wall=3.0 quiet_held=2.3
 ```
 Live measurement is the next bench `kernel8-test` (the leg that produced the false red); this container's QEMU has no raspi4b.
+
+## B210 — FORBID-UNREACHABLE: the two verdict tools against a real capture and a real ELF
+Pair: the saved `UNAOS_USBNET=1` capture (usbnet-on2, 2779 lines, `x86-usbnet.spec` 9/9) replayed against the
+x86 ELF the tree had at the time of the gate — a 09:02 build WITHOUT the usbnet knob. Exactly the B160 shape:
+the wire carried `:: USBNET:` (the REQUIREs pass, 9/9), the image under `--artifact` does not, and the three
+spec FORBIDs on USBNET spellings can no longer fire on it; the e1000 FORBIDs' literals are in the image and stay ✅.
+```
+$ python3 unaos/scripts/mbench.py --replay usbnet-on2-serial.log --spec unaos/scripts/specs/x86-usbnet.spec --quiet \
+      --artifact unaos/target/x86_64-unaos/release/unaos-kernel
+  ◦ FORBID     kind=ax88179
+       0 hits — UNREACHABLE: its literal "kind=ax88179" has 0 hits in unaos-kernel (a check that cannot fire is an absent one, LAWS §5)
+  ◦ FORBID     :: USBNET: .* -> FAIL ::
+       0 hits — UNREACHABLE: its literal ":: USBNET: " has 0 hits in unaos-kernel (a check that cannot fire is an absent one, LAWS §5)
+  ◦ FORBID     :: USBNET: link down
+       0 hits — UNREACHABLE: its literal ":: USBNET: link down" has 0 hits in unaos-kernel (a check that cannot fire is an absent one, LAWS §5)
+  ✅ FORBID     \[e1000\] up:
+       0 hits
+  ✅ MBENCH PASS — 9/9 required witnesses, 0 forbidden hit(s), 2779 lines scanned, 3 unreachable FORBID(s) [mode unknown: no run sidecar]
+$ target/debug/foreman --log usbnet-on2-serial.log --spec … --artifact … --quiet     → rc 0, table byte-identical (diff empty)
+$ LC_ALL=C grep -a -o -F ':: USBNET' unaos/target/x86_64-unaos/release/unaos-kernel | wc -l   → 0     ('[e1000] up:' → 1)
+$ cargo test -p foreman   → 38 + 2 (agreement: shared corpus, forbid reachability) + 2 passed, 0 failed
+$ python3 unaos/scripts/mbench.py --self-test   → SELF-TEST PASS — 46/46
+```
+Sidecar leg: `UNAOS_QEMU_MACHINE=pc-q35-8.2 UNAOS_WC=1 ./arroyo test` in this container writes `artifact=…/unaos-kernel`
+into `target/serial.log.run`, and a bare `mbench --replay target/serial.log --spec x86-wc.spec` (no `--artifact`) then
+counts against it — recorded below when the run lands.

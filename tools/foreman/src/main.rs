@@ -47,6 +47,12 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     spec: PathBuf,
 
+    /// FORBID-UNREACHABLE: the kernel ELF / image the capture came from; every spec
+    /// FORBID's longest literal is counted in it and a 0 reads ◦ UNREACHABLE
+    /// (default: the run sidecar's `artifact=`).
+    #[arg(long, value_name = "FILE")]
+    artifact: Option<PathBuf>,
+
     /// Which provider to consult. `none` runs the deterministic half only.
     #[arg(long, value_enum, default_value_t = ProviderKind::None)]
     provider: ProviderKind,
@@ -113,7 +119,8 @@ fn run(cli: &Cli) -> anyhow::Result<i32> {
     // regex crate's line-less complaint mid-evaluation. Silent on a valid spec.
     verdict::preflight_spec(&cli.spec).map_err(|r| anyhow::anyhow!("{r}"))?;
     let directives = verdict::parse_spec(&cli.spec).map_err(|e| anyhow::anyhow!("spec error: {e}"))?;
-    let ev = verdict::evaluate(directives, &capture, &cli.spec);
+    let mut ev = verdict::evaluate(directives, &capture, &cli.spec);
+    verdict::apply_reach(&mut ev, cli.artifact.as_deref());
 
     if !cli.quiet {
         // mbench prints the first hit of each FORBID above the table, in CAPTURE-CHRONOLOGICAL
