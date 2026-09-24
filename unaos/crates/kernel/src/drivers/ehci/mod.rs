@@ -18853,7 +18853,7 @@ fn bt_defer_boot_campaign(idx: usize, addr: u8) {
 /// is for.
 #[cfg(feature = "bt")]
 fn bt_drain_boot_campaign(ctrls: &mut [Controller]) {
-    if BT_BOOT_CAMPAIGN.load(core::sync::atomic::Ordering::SeqCst) == 0 {
+    if BT_BOOT_CAMPAIGN.load(core::sync::atomic::Ordering::SeqCst) == 0 || !crate::fs::bootdisk::root_pass_open("bt-campaign") { // BOOTSLOW (rmbp-ledger B201): the campaign waits for the ROOT PASS's verdict. Flight 12: this drain fired on the device-service pass's first iteration (8345 ms) and held that pass — and every storage call below `service_ehci_hid` in it — until 32010 ms, so the root (`X86BIND` 32220 ms), the desktop app (32152 ms), the BPACE ledger and the FTDI console all waited 23.7 s on a radio. The gate is a dependency, not a device name: `fs::bootdisk::root_pass_open` answers true once the root is bound or the pass has settled without one (bounded, `ROOT_PASS_SETTLE_MS`). ⚠ SAME-LINE fold, condition widened in place, so no `panic::Location` in this file moves.
         return;
     }
     // The `gui` stamp is read for the WITNESS, and is deliberately NOT a gate. Reaching this drain

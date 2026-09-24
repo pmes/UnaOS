@@ -1242,7 +1242,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // here rather than in the bring-up so the card lock is released — the same reason
             // `probe_once` and `piusb27_service` run from the loop. Reads only: it is not a FAT writer.
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-            unaos_kernel::fs::fat::sdhc_probe_once();
+            unaos_kernel::fs::fat::sdhc_probe_once(); #[cfg(target_arch = "x86_64")] unaos_kernel::fs::bootdisk::root_pass_service(); // BOOTSLOW (rmbp-ledger B201): THE ROOT PASS — on the first pass that has a block source, bind the root by content (`fs::bootdisk::locate`, the one survey every caller uses) and give the probes that do not serve it (the Bluetooth campaign, the audio tone) their verdict. Beside the storage probes and ahead of every consumer below; at all THREE x86 service loops, because which loop a build reaches depends on its knobs and a loop without it would hold those probes until the settle. ⚠ LINE-NEUTRAL append, statement BEFORE the comment.
             // FATVERB: the shell's storage witness — the read verbs, the exec probe and the write
             // gate must all name the same handle, and a write verb must consult the gate before it
             // mutates. One-shot. It MUST run here and not with the other shell fixtures at step 5:
@@ -1310,7 +1310,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // One-shot, gated on storage + after U6x.
             #[cfg(all(target_arch = "x86_64", feature = "witness"))]
             unaos_kernel::arch::syscall::u6bx_probe_once();
-            unaos_kernel::drivers::xhci::log_summary_once();
+            unaos_kernel::drivers::xhci::log_summary_once(); #[cfg(all(target_arch = "x86_64", feature = "hda"))] unaos_kernel::drivers::hda::probe_after_root(); // BOOTSLOW (rmbp-ledger B201): the HDA bring-up and its 1.2 s tone, MOVED here from `arch/x86_64/pci.rs` (flight 12: 7116 -> 8325 ms on the boot core, between the SD card registering and the service loop that binds the root). One-shot, late in the pass, and only once the root pass has its verdict (`fs::bootdisk::root_pass_open`); at all THREE x86 service loops for the root pass's reason. ⚠ LINE-NEUTRAL append on its own cfg (GATE-FC2 lexes one cfg per line).
             // FBCON-PACE: the console's present census, once, HERE — beside the xHCI summary, i.e.
             // after enumeration and after the boot burst the pacing gate reshapes, so the numbers
             // cover the burst. This is the only place it is emitted on the bench lane: the census
@@ -1727,7 +1727,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // under its own block handle, and emit the witness (one-shot). See the note at the other loop
         // site: it reads only and never becomes a second x86 FAT mutator.
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-        unaos_kernel::fs::fat::sdhc_probe_once();
+        unaos_kernel::fs::fat::sdhc_probe_once(); #[cfg(target_arch = "x86_64")] unaos_kernel::fs::bootdisk::root_pass_service(); // BOOTSLOW (rmbp-ledger B201): THE ROOT PASS — on the first pass that has a block source, bind the root by content (`fs::bootdisk::locate`, the one survey every caller uses) and give the probes that do not serve it (the Bluetooth campaign, the audio tone) their verdict. Beside the storage probes and ahead of every consumer below; at all THREE x86 service loops, because which loop a build reaches depends on its knobs and a loop without it would hold those probes until the settle. ⚠ LINE-NEUTRAL append, statement BEFORE the comment.
         // FATVERB: the shell's storage witness (one-shot) — see the note at the first loop site.
         // This file carries THREE storage-ready passes and which one a given x86 build reaches
         // depends on its knobs, so the call sits at all three and the latch inside makes it speak
@@ -1824,7 +1824,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
         // Drain any frames the NIC has received into the network stack (no-op when
         // no NIC is present, e.g. on aarch64).
-        unaos_kernel::drivers::e1000::service_net();
+        unaos_kernel::drivers::e1000::service_net(); #[cfg(all(target_arch = "x86_64", feature = "hda"))] unaos_kernel::drivers::hda::probe_after_root(); // BOOTSLOW (rmbp-ledger B201): the HDA bring-up and its 1.2 s tone, MOVED here from `arch/x86_64/pci.rs` (flight 12: 7116 -> 8325 ms on the boot core, between the SD card registering and the service loop that binds the root). One-shot, late in the pass, and only once the root pass has its verdict (`fs::bootdisk::root_pass_open`); at all THREE x86 service loops for the root pass's reason. ⚠ LINE-NEUTRAL append on its own cfg (GATE-FC2 lexes one cfg per line).
 
         // aarch64 (UEFI, or the bare-metal no-AP fallback): poll the UART here and feed the event
         // queue, draining all pending bytes so a burst isn't spread one-per-frame. On bare-metal with
@@ -5999,7 +5999,7 @@ fn x86_usb_pump(cpu: usize) {
         unaos_kernel::video::desktop_uefi::desktop_app_service();
         // SDHC-4b (x86, sdhcblk knob): mount the INTERNAL SD card READ-ONLY once registered (one-shot).
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
-        unaos_kernel::fs::fat::sdhc_probe_once();
+        unaos_kernel::fs::fat::sdhc_probe_once(); #[cfg(feature = "witness")] unaos_kernel::fs::bootdisk::root_pass_fixture(); #[cfg(target_arch = "x86_64")] unaos_kernel::fs::bootdisk::root_pass_service(); // BOOTSLOW (rmbp-ledger B201): THE ROOT PASS — on the first pass that has a block source, bind the root by content (`fs::bootdisk::locate`, the one survey every caller uses) and give the probes that do not serve it (the Bluetooth campaign, the audio tone) their verdict. Beside the storage probes and ahead of every consumer below; at all THREE x86 service loops, because which loop a build reaches depends on its knobs and a loop without it would hold those probes until the settle. The witness-only `root_pass_fixture` rides AHEAD of it on this loop alone (the one the wc QEMU lane and the metal desktop reach): a synthetic held probe that makes the ordering falsifiable on a machine with no radio. ⚠ LINE-NEUTRAL append, statements BEFORE the comment.
         // FATVERB: the shell's storage witness (one-shot) — see the note at the first loop site.
         // This file carries THREE storage-ready passes and which one a given x86 build reaches
         // depends on its knobs, so the call sits at all three and the latch inside makes it speak
@@ -6053,7 +6053,7 @@ fn x86_usb_pump(cpu: usize) {
         // and reasoning as the usbdebug loop's copy, because THIS is the loop the bench media runs.
         unaos_kernel::video::fbcon::console_pace_census_once();
         // Drain any frames the NIC has received into the network stack (no-op with no NIC).
-        unaos_kernel::drivers::e1000::service_net();
+        unaos_kernel::drivers::e1000::service_net(); #[cfg(all(target_arch = "x86_64", feature = "hda"))] unaos_kernel::drivers::hda::probe_after_root(); // BOOTSLOW (rmbp-ledger B201): the HDA bring-up and its 1.2 s tone, MOVED here from `arch/x86_64/pci.rs` (flight 12: 7116 -> 8325 ms on the boot core, between the SD card registering and the service loop that binds the root). One-shot, late in the pass, and only once the root pass has its verdict (`fs::bootdisk::root_pass_open`); at all THREE x86 service loops for the root pass's reason. ⚠ LINE-NEUTRAL append on its own cfg (GATE-FC2 lexes one cfg per line).
     }
 }
 
