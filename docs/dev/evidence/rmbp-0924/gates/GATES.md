@@ -68,3 +68,57 @@ rc=2
 GATE-ROOTS: usage: check-roots.sh [<unaos dir>] — got 2 arguments. No verdict.
 rc=2
 ```
+
+## K8REACH — the two new knobs (SR1's class, caught)
+`python3 unaos/scripts/k8-reach.py` on the tip before this commit: `❌ k8-reach UNREGISTERED: UNAOS_HDASIE
+UNAOS_USBNET — knob(s) with no K8_FEATS arm and no registry row`. USBNET got an arm (`kernel8` carries
+`usbnet` when the knob is set — a Pi with a dongle is the target); HDASIE an `NA` registry row with its
+`--evidence` (4 sites, all inside drivers/hda.rs, never lexed on aarch64). After:
+```
+  ✅ k8 reachability (163 knobs: 16 armed, 147 registered unarmed — 102 still TODO)
+```
+
+## B101 — the pstrip FORBID, order-free
+Old: `\[pstrip\] rollup samples=[1-9][0-9]* redraws=[0-9]+ skipped=0 srcdelta=0`.
+New: `\[pstrip\] rollup (?=.*\bsamples=[1-9][0-9]*\b)(?=.*\bskipped=0\b)(?=.*\bsrcdelta=0\b)`.
+Eight lines through Python `re.search` (mbench's matcher), old versus new:
+```
+case                                           old    new   (want: first four FIRE, rest SILENT)
+collapse line (real emitter)                   FIRE   FIRE
+paced= appended at the tail                    FIRE   FIRE
+paced= INSERTED between redraws and skipped    silent FIRE
+fields reordered                               silent FIRE
+honest line (skipped=90)                       silent silent
+honest line (srcdelta=7)                       silent silent
+degenerate zero-sample rollup                  silent silent
+skipped=05 (not zero)                          silent silent
+NEW REGEX VERDICT: PASS
+```
+`mbench.py --self-test` 46/46 after the edit. The emitter line in `ui_status.rs` now carries a same-line
+comment naming the spec and the three tokens it may never rename.
+
+## B94 — GATE-LINENEUTRAL on this session's own commits
+```
+$ line-neutral.sh 5f95e340 fe119dac   (USBNET)
+  unaos/crates/kernel/src/drivers/e1000.rs: neutral (3 hunk(s), every one same-line)
+  unaos/crates/kernel/src/drivers/xhci/mod.rs: moved +211 line(s), first at new line 17151 — no panic-bearing site below it (Location-neutral)
+  unaos/crates/kernel/src/drivers/xhci/usbnet.rs: moved +544 line(s), first at new line 1 — no panic-bearing site below it (Location-neutral)
+GATE-LINENEUTRAL: 5f95e340..fe119dac files=3 neutral=1 moved=2 moved-above-panic=0
+$ line-neutral.sh 9d7ffd3e a087eeb0   (SO22)
+  unaos/crates/kernel/src/arch/aarch64/boot.rs: neutral (1 hunk(s), every one same-line)
+  unaos/crates/kernel/src/arch/aarch64/mmu_tegra_el0.rs: neutral (1 hunk(s), every one same-line)
+  unaos/crates/kernel/src/arch/x86_64/memory.rs: neutral (1 hunk(s), every one same-line)
+  unaos/crates/kernel/src/arch/x86_64/syscall.rs: neutral (6 hunk(s), every one same-line)
+  unaos/crates/kernel/src/video/wm.rs: MOVED +6 line(s), first at new line 964 — 26 panic-bearing site(s) below it (first: line 1862) -> their `Location` literals moved
+GATE-LINENEUTRAL: 9d7ffd3e..a087eeb0 files=5 neutral=4 moved=1 moved-above-panic=1
+$ line-neutral.sh 86a8ecf2 9d7ffd3e --strict   (the settle relocation)
+  unaos/crates/kernel/src/video/strip.rs: MOVED +0 line(s), first at new line 1310 — 6 panic-bearing site(s) below it (first: line 1476) -> their `Location` literals mo
+GATE-LINENEUTRAL: 86a8ecf2..9d7ffd3e files=1 neutral=0 moved=1 moved-above-panic=1 — STRICT: RED
+exit=0
+$ line-neutral.sh nope
+GATE-LINENEUTRAL: control FAILED — nope is not a commit. No verdict.
+exit=2
+```
+Reading: same-line hooks are neutral; a tail append moves nothing that matters; a mid-file helper (SO22's
+`app_name_armed`) moved 26 sites — harmless here since no knob-off identity claim rides on wm.rs, and now
+visible rather than assumed; a relocated block is a +0 MOVE that still shifts what lies between its homes.

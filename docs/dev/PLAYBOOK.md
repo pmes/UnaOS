@@ -35,6 +35,8 @@ worktree `../UnaOS` (main), tracks `../UnaOS-orin` (hw-jetson), `../UnaOS-hw-pi4
    keep every id once; when both sides carry the same id, keep the newer text (the executor's for its own
    row). Count markers = 0. Never resolve a `.rs` conflict blind: rebuild from both versions and gate.
 2. `bash unaos/scripts/ledger-check.sh` rc=0 (an unpushed sha in a `fixed-unflown` row reds it: cite by name).
+   `bash unaos/scripts/line-neutral.sh <track-tip> exec-<...>` (GATE-LINENEUTRAL, B94): a `.rs` file reported MOVED with
+   panic-bearing sites below it means `./arroyo knoboff <knob>` is OWED for any knob that claims byte identity on it.
 3. Commit the merge with a message that carries the executor's rc list. One fold gate on the WHOLE fold
    before any card (R38), not one per branch.
 

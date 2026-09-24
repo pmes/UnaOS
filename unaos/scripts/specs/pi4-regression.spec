@@ -1546,7 +1546,13 @@ REQUIRE \[pstrip\] rollup samples=[0-9]+ redraws=[0-9]+ skipped=[1-9]
 # ---    are the same line, which is the residual the paragraph above already assigns to the emitter. The
 # ---    trade is a detector that is silent where it cannot tell, instead of one that convicts the honest
 # ---    reading; the emitter-side `paced=yes/no` remains the real fix and is still owed.
-FORBID \[pstrip\] rollup samples=[1-9][0-9]* redraws=[0-9]+ skipped=0 srcdelta=0
+# ---    B101 (rmbp-ledger; pi 9's finding, proven by execution): the old form `samples=… redraws=… skipped=0
+# ---    srcdelta=0` depended on FOUR FIELDS STAYING ADJACENT and went SILENT the moment a field was
+# ---    inserted between them — and the emitter (`ui_status.rs`, the `[pstrip] rollup` line) has fields
+# ---    owed (`paced=`). Now three lookaheads, one per field this rule actually reads, each a whole
+# ---    ` key=value ` token: field ORDER and any field in between are irrelevant, and the emitter's
+# ---    comment names this spec so the contract is visible from both ends.
+FORBID \[pstrip\] rollup (?=.*\bsamples=[1-9][0-9]*\b)(?=.*\bskipped=0\b)(?=.*\bsrcdelta=0\b)
 # --- PULSE-3: THE SOURCE, not the pacing.
 # ---
 # ---    P64, attended, capture pi4-r23s1o. Three vugs held the cores at a sustained 99% and the

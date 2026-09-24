@@ -9928,6 +9928,14 @@ kernel8() {
         K8_FEATS="${K8_FEATS},prtscrst"
         echo -e "${COLOR_YELLOW}  • UNAOS_PRTSCRST: kernel8 carries the Print Screen self-test (PRTSCR-ST)${COLOR_RESET}"
     fi
+    # USBNET (LEDGER SO56) — UNAOS_USBNET=1 adds the `usbnet` feature: the USB Ethernet link on the Pi's xHCI
+    # (CDC-ECM class front-end + the AX88179 front-end for Peter's dongles), registered into net6 at
+    # link-up when the image carries `net6`. Arch-neutral module; GATE-K8REACH found the knob with no arm
+    # here (2026-09-24) — a Pi with a dongle is exactly the target. OFF => cfg-erased, byte-identical.
+    if [ -n "${UNAOS_USBNET:-}" ]; then
+        K8_FEATS="${K8_FEATS},usbnet"
+        echo -e "${COLOR_YELLOW}  • UNAOS_USBNET: kernel8 carries the USB Ethernet link (CDC-ECM + AX88179 front-ends)${COLOR_RESET}"
+    fi
     # XHCIKBD (B45) — UNAOS_XHCIKBD=1 adds the `xhcikbd` feature: the burst scorer at the tail of
     # drivers/xhci/mod.rs, which prints `:: XHCIKBD: … -> PASS|FAIL ::` on an F12 press after keyboard
     # traffic. The shared xHCI keyboard decoder it scores IS the Pi's decoder, so the knob is reachable

@@ -2363,3 +2363,36 @@ restored, green at 76/76.
 shape: one line in each). A verb that one arch does not carry is still a spelling in both tables — the
 cfg lives on the tuple and on the arm, never on the gate.
 
+## GATE-LINENEUTRAL — a line moved above a panic site is a `Location` moved (B94, 2026-09-24)
+
+**The rule it checks.** `panic::Location` embeds the source LINE. Inserting or deleting a line ABOVE any
+`panic!` / `unwrap` / `expect` / `assert!` / `unreachable!` / `todo!` site moves that site's literal, and a
+knob-off image is then no longer byte-identical to its baseline — which is why this tree folds new
+statements onto existing lines and appends new functions at file tails. R26's economics ("no gate for a
+change that cannot affect it") are right; its natural misreading ("only a comment, skip the gate") is
+wrong here, because a comment that adds a line moves every `Location` below it. The judgement used to be
+made by eye, per patch. This is the machine.
+
+**What it does.** `unaos/scripts/line-neutral.sh <base-ref> [<head-ref>] [--strict] [--paths <dir>]`
+walks every changed `.rs` file's hunks in the range. A hunk whose added and removed counts are equal is
+same-line. For the first hunk that is not, it counts the panic-bearing sites in the NEW file at or below
+that line (string literals and `//` text stripped, so a panic named in prose is not a site). One line
+per file, then `GATE-LINENEUTRAL: files=N neutral=N moved=N moved-above-panic=N`. Advisory by default
+(exit 0): a moved line is often right (a tail function, a fixture leg); `--strict` exits 1 when any
+non-neutral hunk has panic sites below it, for a lane that promised byte identity on its files.
+
+**Measured on this session's own commits** (`docs/dev/evidence/rmbp-0924/gates/GATES.md` §B94):
+the USBNET commit — e1000.rs neutral (3 same-line hunks), xhci/mod.rs `+211` at the file tail with no
+panic site below (Location-neutral), usbnet.rs a new file; the SO22 commit — four files neutral and
+`video/wm.rs` `+6` at line 964 with **26 panic-bearing sites below it** (the `app_name_armed` helper was
+inserted mid-file: harmless because no knob-off identity claim rides on wm.rs, and exactly the kind of
+fact this gate makes visible instead of assumed); the `settle` relocation in strip.rs — `+0` lines yet
+MOVED, six sites below (a block that changes place shifts what lies between its old and new home).
+
+**Where it runs.** By hand and in the fold: PLAYBOOK §2 — before an executor branch's fold gate, run it
+from the track tip to the branch tip; a `MOVED … panic-bearing site(s) below` line on a file whose knob
+claims byte identity means `./arroyo knoboff <knob>` is owed on that fold, not assumed. Not wired into
+`./arroyo check`: `check` has no natural base ref (the whole track against main is hundreds of commits
+and every one has already been judged), and an advisory line nobody reads is not a gate. GATE-SELFSYNTAX
+covers the script; a bad or missing ref is exit 2 with no verdict.
+
