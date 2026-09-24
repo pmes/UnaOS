@@ -23551,7 +23551,7 @@ fn u11m2_launcher(demo_cpu: usize) {
     #[cfg(feature = "irqstorage")]
     s6_witness_launcher(demo_cpu);
     // U6x: chain the owner/grants ACL demo (program order, the u9x->..->u11m2 idiom; the LAST demo in the chain).
-    u6gx_launcher(demo_cpu); stor1_name_launcher(demo_cpu); stor1_mv_launcher(demo_cpu); stor2_mv_launcher(demo_cpu); stor1_wr_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); busx86_stamp_check(); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
+    u6gx_launcher(demo_cpu); stor1_name_launcher(demo_cpu); stor1_mv_launcher(demo_cpu); stor2_mv_launcher(demo_cpu); #[cfg(feature = "witness")] lfnmv_launcher(); stor1_wr_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); busx86_stamp_check(); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
 }
 
 /// Build a U6x fixture slot at a given entry symbol — the `u7x_build`/`u11m2_build` shape (allocate a private
@@ -29068,6 +29068,14 @@ unaos_user_stor2_mv:
     syscall
 
 .Ls2_clean:
+    // ---- LFNMV (B198): SYS_RENAME(STOR2.BIN -> a LONG name); the rc to [r15 + 0x2060], no bit ----
+    mov rax, 50
+    lea rdi, [rip + .Ls2_n2]
+    mov rsi, 9
+    lea rdx, [rip + .Ls2_nl]
+    mov r10, 24
+    syscall
+    mov qword ptr [r15 + 0x2060], rax
     // ---- bit6: cleanup. unlink STOR2.BIN, GO handshake (drain), unlink STOR1.BIN. rc recorded. ----
     mov rax, 11
     lea rdi, [rip + .Ls2_n2]
@@ -29126,6 +29134,9 @@ unaos_user_stor2_mv:
     .balign 8
 .Ls2_n2:
     .ascii "STOR2.BIN"
+    .balign 8
+.Ls2_nl:
+    .ascii "LongNameViaSysRename.txt"   // LFNMV: == shell::LFNMV_SYS_LONG, 24 bytes
     .balign 8
 .Ls2_pa:
     .ascii "stor2-mv-before!"
@@ -29237,7 +29248,7 @@ fn stor2_mv_launcher(demo_cpu: usize) {
         ":: STOR2-MV: rename with the source OPEN — the x86 -EBUSY divergence retired by irqstorage::submit_rename over fat::rename_entry; the descriptor follows the file ({}) ::",
         if s4_sync_storage() { "knob-on: the volume entry moves in place" } else { "knob-off: namespace only" }
     );
-    let cpu = crate::arch::smp::worker_cpu(0).unwrap_or(demo_cpu);
+    let cpu = crate::arch::smp::worker_cpu(0).unwrap_or(demo_cpu); s1mv_write(f.slot, LFNMV_RC_OFF, LFNMV_NOTRUN_U64); // LFNMV: seed the long-name leg's rc cell with the never-ran sentinel
     if s4_sync_storage() {
         crate::arch::sched::spawn_user_preemptible(
             "stor2-mv", f.entry, f.sp, cpu, f.cr3,
@@ -29264,7 +29275,7 @@ fn stor2_mv_launcher(demo_cpu: usize) {
     }
     let signalled = s1n_read(f.slot, S2MV_SIG_OFF) >= 2;
     let sealed = s1n_read(f.slot, S2MV_SEAL_OFF) == S2MV_SEAL;
-    let w = s1n_read(f.slot, S2MV_W_OFF);
+    let w = s1n_read(f.slot, S2MV_W_OFF); LFNMV_SYSRC.store(s1n_read(f.slot, LFNMV_RC_OFF) as i64, Ordering::Release); // LFNMV: the long-name leg's rc, read before the slot is freed
     let mut rc = [0i64; 11];
     for (i, cell) in rc.iter_mut().enumerate() {
         *cell = s1n_read(f.slot, S2MV_RC_OFF + i * 8) as i64;
@@ -29301,4 +29312,38 @@ fn stor2_mv_launcher(demo_cpu: usize) {
             rc[0], rc[1], rc[2], rc[3], rc[4], rc[5], rc[6], rc[7], rc[8], rc[9], rc[10]
         );
     }
+}
+
+// =================================================================================================
+// LFNMV (rmbp-ledger B198) — THE x86 HALF OF THE LONG-NAME VERDICT. File tail (B94).
+//
+// `stor2-mv` (above) asks `SYS_RENAME(STOR2.BIN, "LongNameViaSysRename.txt")` from ring 3 at the head
+// of its cleanup and leaves the rc at `LFNMV_RC_OFF`, which `stor2_mv_launcher` reads before it frees
+// the slot. `rename_created` resolves the SOURCE (`STOR2.BIN`, a creatable `U10_NAMES` id) and then
+// the DESTINATION through `u10_creatable_nameid`, which knows only the 8.3 `U10_NAMES` leaves — so a
+// long destination is answered from the NAME TABLE, before phase 1 takes the namespace lock and
+// before `submit_rename` (knob-on) could hand it to `fat::rename_entry`. The shared verdict
+// (`shell::lfnmv_witness`) then runs the shell `mv` leg and prints the one `:: LFNMV:` line.
+//
+// FAT-MUTATOR ROSTER: the shell leg writes the volume (create, write, rename, unlink) from THIS task,
+// the ring-3 ladder's launcher, in program order after STOR2-MV's drains and before STOR1-WR spawns
+// — row 4/5's context and row 4/5's serialization (fs/fat.rs, the roster's rows 4 and 5).
+// =================================================================================================
+
+/// LFNMV: the ring-3 rc cell (the data page, past STOR2-MV's eleven rc cells at 0x2008..0x2058).
+const LFNMV_RC_OFF: usize = 0x2060;
+/// LFNMV: the never-ran sentinel as the cell holds it (== `shell::LFNMV_NOTRUN`; no rename returns 1).
+const LFNMV_NOTRUN_U64: u64 = 1;
+/// LFNMV: the long-name leg's rc as `stor2_mv_launcher` read it.
+static LFNMV_SYSRC: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(1);
+
+/// LFNMV: the verdict, chained right after `stor2_mv_launcher`. M1 holds x86 to the answer it gives
+/// TODAY, measured: `-ENOENT` — a destination outside the created-name table "does not exist".
+#[cfg(feature = "witness")]
+fn lfnmv_launcher() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    crate::shell::lfnmv_witness("x86_64", LFNMV_SYSRC.load(Ordering::Acquire), ENOENT);
 }
