@@ -665,3 +665,34 @@ static NET6_OPS: crate::net_phy::net6::NicOps = crate::net_phy::net6::NicOps {
     link_up: is_up,
     name: "usbnet-ecm",
 };
+
+/// AX88179 register access behind a transport, so the xHCI (`XhciAx`, xhci/mod.rs tail) and the EHCI
+/// (`EhciAx`, ehci/mod.rs tail) front-ends drive the SAME register logic. Vendor requests only:
+/// `reg_read`/`reg_write` are bRequest 0x01 (bmRequestType 0xC0/0x40, wValue = reg, wIndex = len).
+pub mod ax_xport {
+    use super::ax::*;
+    pub trait AxTransport {
+        fn reg_read(&mut self, reg: u16, out: &mut [u8]) -> bool;
+        fn reg_write(&mut self, reg: u16, data: &[u8]) -> bool;
+        fn wait_ms(&mut self, ms: u64);
+    }
+    /// Power/reset, clock select, then the station address from NODE_ID — the front of the xHCI
+    /// bring-up (`usbnet_bringup_ax`), in the same order and with the same settles. Err names the step.
+    pub fn identity<T: AxTransport>(t: &mut T) -> Result<[u8; 6], &'static str> {
+        if !t.reg_write(REG_PHYPWR_RSTCTL, &0u16.to_le_bytes()) { return Err("PHYPWR_RSTCTL=0"); }
+        t.wait_ms(10);
+        if !t.reg_write(REG_PHYPWR_RSTCTL, &PHYPWR_IPRL.to_le_bytes()) { return Err("PHYPWR_RSTCTL=IPRL"); }
+        t.wait_ms(200);
+        if !t.reg_write(REG_CLK_SELECT, &[CLK_ACS_BCS]) { return Err("CLK_SELECT"); }
+        t.wait_ms(100);
+        let mut mac = [0u8; 6];
+        if !t.reg_read(REG_NODE_ID, &mut mac) { return Err("NODE_ID"); }
+        Ok(mac)
+    }
+    /// PHYSICAL_LINK_STATUS: (link up, raw byte). Bits 0x04 SS / 0x02 HS / 0x01 FS are the negotiated USB speed.
+    pub fn link<T: AxTransport>(t: &mut T) -> Option<(bool, u8)> {
+        let mut b = [0u8; 1];
+        if !t.reg_read(REG_PHYSICAL_LINK_STATUS, &mut b) { return None; }
+        Some((b[0] & 0x07 != 0, b[0]))
+    }
+}

@@ -181,6 +181,8 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
             ":: PORTSW-1: XUSB2PR mask={:#x} routed {:#x}->{:#x} + USB3_PSSEN mask={:#x} {:#x}->{:#x} (default-on) == witness ::",
             usb2_mask, usb2_before, usb2_after, ss_mask, ss_before, ss_after
         );
+        // PORTROUTE (USBNET2 M1+M2, read-only): the routing truth as it stands after the flip, per root port.
+        serial_println!(":: PORTROUTE: xusb2pr={:#06x} pssen={:#06x} mask={:#06x} switched=[{}] ehci_only=[{}] ::", usb2_after, ss_after, usb2_mask, PortBits(usb2_mask & usb2_after, false), PortBits(usb2_mask & usb2_after, true));
         // GUI-WITNESS: record the mux flip as a boot milestone. "flip" = a real XUSB2PR write on
         // matched Intel silicon (the rMBP metal path); "inert" = the no-op read-only case (QEMU, or
         // no EHCI companion). Distinguishing the two on-panel tells a silent-serial bench whether the
@@ -1169,4 +1171,23 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         #[cfg(feature = "intel-ivb")]
         crate::drivers::gpu::igpu::print_blt_stats();
     } // SECSTA2's call site WAS here (rmbp-ledger A1/B113, shut-out register §6 P7) and WIFISWEEP MOVED IT OUT, to `main.rs` immediately after `unaos_kernel::wifi::service()` at each of the three storage-ready passes. The claim that justified this site — "every enumeration walk is above it, and `init_network` → `find_device` is the last of them" — is true of THIS FUNCTION and false of the BOOT: `wifi::bus::census` (`wifi/bus.rs:125`, buses 0..=255, knob `UNAOS_WIFI`) sweeps config space from the main loop, and flight 8 measured it at 23516 ms against this clear at 23263 ms — 253 ms LATER — so the baseline the rung stored was taken before the last walk and `relatch=secsta:2000` could not be attributed. Nothing is left here on purpose: a THIRD clear at this point would print a second `relatch=` that a reader would have to be told to ignore. The move costs this site nothing else — GPACE samples `span` inside this function, so a call that now runs outside it cannot land in `resid` at all; the BSP, the CF8 accessors and the `bar1wedge` knob are unchanged. ⚠ THIS LINE STAYS ONE LINE, statement or no statement: `panic::Location` records embed line numbers, knob-off x86 image byte-identity is this rung's stated invariant, and deleting the line would shift every line below it exactly as adding a cfg'd-OFF block would.
+}
+
+/// PORTROUTE helper: a USB2 root-port bit set as a comma list without the heap. `invert` lists the
+/// ports (0..14, the PCH's USB2 root ports) NOT in the set, i.e. still on the EHCI companion.
+#[cfg(not(feature = "noportsw"))]
+struct PortBits(u32, bool);
+#[cfg(not(feature = "noportsw"))]
+impl core::fmt::Display for PortBits {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut first = true;
+        for i in 0..14u32 {
+            if ((self.0 >> i) & 1 != 0) != self.1 {
+                if !first { f.write_str(",")?; }
+                first = false;
+                write!(f, "{}", i)?;
+            }
+        }
+        Ok(())
+    }
 }
