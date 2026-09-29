@@ -487,3 +487,12 @@ REQUIRE :: LFNMV: sys_rename_long=-ENOENT shell_mv_long=ok alias_leak=false read
 # The fixture's two non-PASS spellings: no writable `/boot` (it measured nothing) and its FAIL line.
 FORBID :: LFNMV: SKIPPED
 FORBID :: LFNMV: .* -> FAIL ::
+
+# NETFETCH (shell `fetch <url> [dest]`, x86 smolnet). M1 PINS THE PURE HALF: `net_fetch::parse_gate` (URL parse,
+# basename, HTTP/1.0 request line, response-head split) runs in the witness battery beside DNS-X86-GATE. The live
+# `:: NETFETCH: url=.. status=.. bytes=.. saved=.. -> PASS|FAIL ::` line is emitted only when an operator runs
+# `fetch` (no fixture HTTP server exists in the tree for the slirp gateway), so it is FORBID-only here — a REQUIRE
+# would redden every hermetic boot.
+REQUIRE :: NETFETCH-PARSE: url=true basename=true request=true head=true -> PASS ::
+FORBID :: NETFETCH-PARSE: .* -> FAIL ::
+FORBID :: NETFETCH: .* -> FAIL ::

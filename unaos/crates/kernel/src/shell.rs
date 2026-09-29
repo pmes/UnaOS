@@ -5917,7 +5917,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         // argument becomes a URL rather than three positionals for the same reason `dd` takes
         // `if=`: the URL IS the standard's argument, and `curl 10.0.2.2 8000 /x` would be a verb
         // wearing a standard name over a private argument grammar.
-        "curl" => {
+        #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] "fetch" => { shell_fetch(&args, console); } "curl" => {
             // Minimal HTTP/1.0 GET over the streaming TCP client: connect, send the request,
             // read the whole response until the server closes, and print it.
             let url = args.first().copied().unwrap_or("");
@@ -8621,4 +8621,157 @@ fn view_verb(console: &mut Console, path: Option<&str>) {
         Ok((b, l, r, w)) => console.println(&alloc::format!("view: {} — {} bytes, {} lines, {} rows ({} wrapped)", full, b, l, r, w)),
         Err(e) => console.println(&alloc::format!("view: {}: {}", full, e)),
     }
+/// NETFETCH: `fetch <http-url> [<dest-path>]` / `fetch - <http-url>` — HTTP/1.0 GET over the smoltcp TCP
+/// client (x86 `smolnet`), body streamed in 1400-byte chunks into the VFS (default
+/// `/home/<user>/Desktop/<basename>`) or, with `-`, printed to the console. 4 MB cap, 10 s overall budget,
+/// progress every 64 KB, then `[fetch] <url> -> <path> bytes=N status=S ms=T` and the `NETFETCH` witness.
+/// IP literals, or a name through `smolnet::resolve` (DHCP-provided DNS, SOCK-8). Under a hermetic QEMU
+/// run nothing calls this (no fixture server in the tree); `net_fetch::parse_gate` covers the pure half.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn shell_fetch(args: &[&str], console: &mut Console) {
+    use crate::fs::vfs::NodeKind;
+    use crate::net_fetch as nf;
+    use crate::smolnet::{self as sn, ConnectOutcome, RecvOutcome};
+    let to_console = args.first().copied() == Some("-");
+    let rest: &[&str] = if to_console { &args[1..] } else { args };
+    let Some(&url_s) = rest.first() else {
+        return console.println("usage: fetch <http-url> [<dest-path>]   |   fetch - <http-url>");
+    };
+    let Some(url) = nf::parse_url(url_s) else {
+        return console.println("fetch: bad URL (want http://host[:port]/path; https is not supported)");
+    };
+    let ms_now = || crate::clock::logts_now().0.unwrap_or(0);
+    let t0 = ms_now();
+    let elapsed = || ms_now().saturating_sub(t0);
+    let witness = |status: u16, bytes: usize, saved: bool, ok: bool| {
+        serial_println!(
+            ":: NETFETCH: url={} status={} bytes={} saved={} -> {} ::",
+            url_s, status, bytes, saved as u8, if ok { "PASS" } else { "FAIL" });
+    };
+    let ip = match parse_ipv4(url.host).or_else(|| sn::resolve(url.host)) {
+        Some(ip) => ip,
+        None => {
+            console.println(&alloc::format!("fetch: cannot resolve {} (IP literals need no DNS)", url.host));
+            return witness(0, 0, false, false);
+        }
+    };
+    let Some(sid) = sn::stack_open_tcp(usize::MAX) else {
+        console.println("No network device ready.");
+        return witness(0, 0, false, false);
+    };
+    // Connect (re-driven: each call pumps a bounded budget) within the overall 10 s.
+    let mut up = false;
+    while elapsed() < nf::FETCH_TIMEOUT_MS {
+        match sn::stack_connect(sid, ip, url.port) {
+            ConnectOutcome::Established => { up = true; break; }
+            ConnectOutcome::InProgress => {}
+            ConnectOutcome::Refused => break,
+        }
+    }
+    if !up {
+        sn::stack_close(sid);
+        console.println("fetch: connection refused / timed out");
+        return witness(0, 0, false, false);
+    }
+    let req = nf::build_request(&url);
+    let (mut sent, rb) = (0usize, req.as_bytes());
+    while sent < rb.len() && elapsed() < nf::FETCH_TIMEOUT_MS {
+        match sn::stack_send(sid, &rb[sent..]) {
+            Ok(n) => sent += n,
+            Err(true) => {}
+            Err(false) => break,
+        }
+    }
+    let mut buf = [0u8; nf::FETCH_CHUNK];
+    let mut head: Vec<u8> = Vec::new();
+    let (mut status, mut body, mut next_prog) = (0u16, 0usize, nf::FETCH_PROGRESS);
+    let mut dest: Option<(crate::fs::vfs::MountTable, String)> = None;
+    let mut write_fail = false;
+    let mut timed_out = false;
+    'rx: while sent == rb.len() {
+        if elapsed() >= nf::FETCH_TIMEOUT_MS { timed_out = true; break; }
+        let n = match sn::stack_recv(sid, &mut buf) {
+            RecvOutcome::Data(n) => n,
+            RecvOutcome::WouldBlock => continue,
+            RecvOutcome::Eof => break,
+        };
+        let mut chunk: &[u8] = &buf[..n];
+        if status == 0 {
+            head.extend_from_slice(chunk);
+            if head.len() > nf::FETCH_HDR_MAX && nf::parse_response_head(&head).is_none() { break; }
+            let Some((code, off)) = nf::parse_response_head(&head) else { continue };
+            status = code;
+            let first = head.split_off(off); // bytes after the blank line
+            head.clear();
+            if status == 200 && !to_console {
+                let arg = match rest.get(1) {
+                    Some(d) => String::from(*d),
+                    None => {
+                        #[cfg(feature = "login")]
+                        let user = { let mut nm = [0u8; crate::fs::users::NAME_MAX]; crate::fs::users::whoami(&mut nm).and_then(|l| core::str::from_utf8(&nm[..l]).ok().map(String::from)) };
+                        #[cfg(not(feature = "login"))]
+                        let user: Option<String> = None;
+                        alloc::format!("/home/{}/Desktop/{}", user.as_deref().unwrap_or("user"), nf::basename(url.path))
+                    }
+                };
+                let mt = vfs_mount_table();
+                let path = vfs_path(&arg);
+                let _ = mt.unlink(&path, SHELL_PRINCIPAL);
+                if let Err(e) = mt.create(&path, NodeKind::File, SHELL_PRINCIPAL) {
+                    vfs_fail(console, "fetch", &path, e);
+                    write_fail = true;
+                    break 'rx;
+                }
+                dest = Some((mt, path));
+            }
+            // Feed the post-header remainder through the same body path below.
+            if !first.is_empty() {
+                let room = nf::FETCH_CAP - body;
+                let take = first.len().min(room);
+                if !fetch_body(console, &first[..take], &mut dest, to_console, body, &mut write_fail) { break 'rx; }
+                body += take;
+            }
+            chunk = &[];
+        }
+        if !chunk.is_empty() && status == 200 {
+            let take = chunk.len().min(nf::FETCH_CAP - body);
+            if !fetch_body(console, &chunk[..take], &mut dest, to_console, body, &mut write_fail) { break; }
+            body += take;
+        }
+        if body >= nf::FETCH_CAP { break; }
+        if body >= next_prog {
+            console.println(&alloc::format!("[fetch] {} bytes ...", body));
+            next_prog += nf::FETCH_PROGRESS;
+        }
+    }
+    sn::stack_close(sid);
+    let ms = elapsed();
+    let saved = dest.is_some() && !write_fail;
+    let path_s = match &dest { Some((_, p)) => p.as_str(), None if to_console => "-", None => "(none)" };
+    console.println(&alloc::format!("[fetch] {} -> {} bytes={} status={} ms={}", url_s, path_s, body, status, ms));
+    if timed_out { console.println("fetch: 10 s budget exhausted"); }
+    let ok = status == 200 && !write_fail && !timed_out && (saved || to_console);
+    witness(status, body, saved, ok);
+}
+
+/// NETFETCH: land one body slice — printable ASCII to the console for `fetch -`, else a VFS write at
+/// `off`. `false` on a failed write (the caller stops; `write_fail` is set).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn fetch_body(console: &mut Console, data: &[u8], dest: &mut Option<(crate::fs::vfs::MountTable, String)>,
+              to_console: bool, off: usize, write_fail: &mut bool) -> bool {
+    if to_console {
+        let text: String = data.iter().filter_map(|&b| match b {
+            b'\n' => Some('\n'), b'\r' => None, 0x20..=0x7e => Some(b as char), _ => Some('.'),
+        }).collect();
+        console.println(&text);
+        return true;
+    }
+    if let Some((mt, path)) = dest {
+        if let Err(e) = mt.write(path, off as u64, data, SHELL_PRINCIPAL) {
+            vfs_fail(console, "fetch", path, e);
+            *write_fail = true;
+            return false;
+        }
+    }
+    true
 }

@@ -290,7 +290,7 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     ("fdisk", Avail::Always), ("lsusb", Avail::Always), ("dd", Avail::Always),
     // network
     ("ifconfig", Avail::Always), ("ping", Avail::Always), ("arp", Avail::Always),
-    ("nc", Avail::Always), ("curl", Avail::Always),
+    ("nc", Avail::Always), ("curl", Avail::Always), ("fetch", Avail::Always),
     // SO47 (NETVERB, 2026-09-13): `dns` was MISSING from this group, so `dns google.com` fell to the
     // `Plan::Say(TerminalError)` at the bottom of `plan` and the shell's own `"dns"` arm
     // (`shell.rs:5594`, `#[cfg(all(feature = "net6", target_arch = "aarch64"))]`) had never been

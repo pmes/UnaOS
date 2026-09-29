@@ -907,7 +907,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // (well-formed A / truncated / compression-loop / rcode) under `./arroyo test` in any environment
         // (the live boot resolve in `service_net` stays a bonus). Prints `:: DNS-X86-GATE: ... PASS [w=0xf] ::`.
         #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "smolnet"))]
-        unaos_kernel::smolnet::dns_x86_gate();
+        unaos_kernel::smolnet::dns_x86_gate(); unaos_kernel::net_fetch::parse_gate();
 
         // U1a: x86 ring-3 round-trip (the aarch64 M6a equivalent). Turn scheduling on (the default
         // test build never enables the feature-gated demo below, so the APs would otherwise idle in

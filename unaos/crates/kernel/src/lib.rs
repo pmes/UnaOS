@@ -252,3 +252,7 @@ pub fn hlt_loop() -> ! {
 pub fn hlt() {
     arch::hlt()
 }
+
+// NETFETCH: the pure URL / request-line / response-head half of the shell `fetch` verb (x86 smolnet lane).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+pub mod net_fetch;
