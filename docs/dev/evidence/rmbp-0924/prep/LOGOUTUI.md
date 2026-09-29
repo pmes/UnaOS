@@ -1,5 +1,7 @@
 # LOGOUTUI — prep
 
+Status: M1..M3 written, uncompiled
+
 ## The finding
 
 Flight 15 read six silent `[users] logout REFUSED session=root reason=no-users` refusals — root's
@@ -125,3 +127,7 @@ independent line patterns, no look-around.)
 1. `grep -n "root_logout_refused\|reopen_after_logout" unaos/crates/kernel/src/fs/users.rs unaos/crates/kernel/src/video/login.rs` to re-anchor lines (this doc is from HEAD 4c1c1d75).
 2. Land M1 (`root_logout_reason` split) in `users.rs`, `arroyo check`.
 3. Land M2+M3 (`State::Alert`, `open_alert`, `alert_ok`, `reopen_after_logout` rewrite) in `login.rs`, then the spec pins above.
+
+## Written
+
+M1-M3: `fs/users.rs` `root_logout_reason`, `root_logout_refused` wrapper, `log_out_to_screen` calls `login::refused_alert` on refusal; `video/login.rs` `State::Alert`, `Ctl::AlertOk`, `ctl_rect`/`ctl_name`/repaint/press/`consume_key`/`is_open` arms, `open_alert`, `alert_ok`, `refused_alert`, `ALERT_PREV`. Spec pins in `x86-login.spec`. M4 (fixture leg) not written.

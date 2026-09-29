@@ -1,5 +1,7 @@
 # LOGOUTDESK — prep
 
+Status: M1..M3 written, uncompiled
+
 ## The finding
 
 Flight 15: `[users] logout epoch=3 ended=0 windows=0`. Peter: "we need to work on completely
@@ -143,3 +145,7 @@ serial_println!(":: LOGOUTDESK: closed={} kernel={} remaining={} -> {} ::",
    `reopen_after_logout()` with the `:: LOGOUTDESK: …` witness.
 3. Add the M2 re-ignition check and both spec blocks to `unaos/scripts/specs/x86-login.spec`, run
    `./arroyo test` locally once a build seat is free (not this round — no builds this session).
+
+## Written
+
+M1: `video/wm.rs` `close_all_furniture`, `live_window_count`; `login.rs` `reopen_after_logout` sweeps + witness. M2 (mechanism only): `dock.rs` `relaunch_furniture` posts Console+Shell launch latches; `login.rs` `SWEPT` + `close_into_session` calls it on the next login (x86 render service already clears a stale shell tuple and mints on `take_launch`). REIGNITE fixture/witness not written. M3: multiuser.md §8.1 rewritten. Spec pins added to `x86-login.spec`.

@@ -29272,3 +29272,33 @@ pub fn loginz_selftest() {
     close(wr);
     close(wm_);
 }
+
+/// LOGOUTDESK (R69): close EVERY remaining live non-compat row — kernel furniture included — through the
+/// id-scoped [`close`] (which has no kernel-owner refusal; [`close_owner`] deliberately does). Called by
+/// the login screen's Log Out after the session's own programs are ended. Returns `(closed, kernel)`.
+pub fn close_all_furniture() -> (usize, usize) {
+    let mut ids = [WIN_NONE; MAX_WINDOWS];
+    let (mut n, mut kernel) = (0usize, 0usize);
+    {
+        let t = table();
+        for r in t.rows.iter() {
+            if r.used && !r.compat && n < MAX_WINDOWS {
+                if is_kernel_owner(r.owner_asid) {
+                    kernel += 1;
+                }
+                ids[n] = r.id;
+                n += 1;
+            }
+        }
+    }
+    for &id in &ids[..n] {
+        close(id);
+    }
+    (n, kernel)
+}
+
+/// LOGOUTDESK: live non-compat rows in the table (the post-sweep re-scan; must be 0 after a Log Out).
+pub fn live_window_count() -> usize {
+    let t = table();
+    t.rows.iter().filter(|r| r.used && !r.compat).count()
+}
