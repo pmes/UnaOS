@@ -125,3 +125,8 @@ REQUIRE \[taskexit\] tid=\d+ name='[^']+' core=\d+ reason=(exit|killed)
 #
 # GATE-SPECROOTS (`scripts/spec-roots.sh`, a leg of `./arroyo check`) reds by name on any spec under
 # scripts/specs/ that is neither named in `arroyo`'s CODE nor carries a RUN-BY line above.
+
+# --- DIRNS M1/M2 (SO20, FSNS): the aarch64 path-namespace witness incl. `relhome` (a non-absolute path
+# resolves under the base directory, not the volume root). Needs the `witness` feature (test-arm exports it).
+REQUIRE :: DIRNS: abs=ok nested=ok escape=refused acl=refused root=ok relhome=ok .* -> PASS ::
+FORBID :: DIRNS: .* -> FAIL

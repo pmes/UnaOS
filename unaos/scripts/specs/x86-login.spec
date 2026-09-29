@@ -441,3 +441,8 @@ FORBID :: USERSREADY: .* -> FAIL
 REQUIRE :: USERSMOUNT: rmbp-shape=sdhc qemu-shape=global none=none old-mount-on-rmbp=none this-boot via=(global|sdhc) -> PASS ::
 FORBID :: USERSMOUNT: .* -> FAIL
 REQUIRE \[users\] load volume=el0-fat\(rw\) via=(global|sdhc) 
+
+# --- DIRNS M1 (SO20, FSNS): the x86 path-namespace witness, pinned. `dirns_witness` (arch/x86_64/syscall.rs)
+# was in tree and unpinned, so a regression failed silently. Root-pinned `el0_walk` flips `nested` (root_alias).
+REQUIRE :: DIRNS: abs=ok nested=ok ocreat=ok escape=refused collapse=ok acl=n/a\(SO35\) .* -> PASS ::
+FORBID :: DIRNS: .* -> FAIL
