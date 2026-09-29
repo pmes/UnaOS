@@ -869,6 +869,8 @@ _feats="${_feats}sdw,"
 # (`option_env!` + const-fn parse in video/dimidle.rs, the `UNAOS_HDA_AMP` pattern; default 10, 0 = never).
 # Not a cargo feature. Rides `wc` on x86 and `desktop_firmware` on aarch64. Witness
 # `:: DIMIDLE: idle_min=N blanked_at_ms=T woke_at_ms=T wake_key_swallowed=1 -> PASS ::` (needs `witness`).
+# SCREENLOCK M3: UNAOS_LOCK_ON_IDLE=1 makes DIMIDLE's wake open the lock screen (`login::lock`), read by rustc at BUILD
+# time via `option_env!` in video/dimidle.rs beside UNAOS_IDLE_MIN; not a cargo feature (needs `login`+`wc`). Default off.
 [ -n "${UNAOS_WC:-}" ] && _feats="${_feats}wc,"
 # PHASE31ROOT: UNAOS_BAR1EXP=<mode> selects a BAR1-wedge experiment arm (design + evidence:
 # docs/dev/OS/08_VIDEO/phase31-root.md). ONE mode exists today: `uc` -> feature `bar1exp-uc`,

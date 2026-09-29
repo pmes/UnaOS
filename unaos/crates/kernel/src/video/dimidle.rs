@@ -15,6 +15,8 @@
 use crate::pal::Event;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+/// SCREENLOCK M3: build-time `UNAOS_LOCK_ON_IDLE=1` — a wake from the idle blank opens the lock screen. Default off.
+pub const LOCK_ON_IDLE: bool = match option_env!("UNAOS_LOCK_ON_IDLE") { Some(v) => v.len() == 1 && v.as_bytes()[0] == b'1', None => false };
 /// Build-time idle minutes (`UNAOS_IDLE_MIN`), default 10, 0 = never.
 pub const IDLE_MIN: u32 = parse_min(option_env!("UNAOS_IDLE_MIN"));
 const IDLE_MIN_DEFAULT: u32 = 10;
@@ -87,6 +89,7 @@ pub fn service() {
             let _ = super::wm::damage_intersecting(0, 0, w, h);
         }
         super::wm::composite();
+        #[cfg(feature = "login")] if LOCK_ON_IDLE { let _ = super::crystal::login::lock(); } // SCREENLOCK M3 — the wake lands on the lock screen (`UNAOS_LOCK_ON_IDLE=1`); refused harmlessly with no session
     }
     let th = threshold_ms();
     if th != 0 && !BLANKED.load(Ordering::Relaxed) {
