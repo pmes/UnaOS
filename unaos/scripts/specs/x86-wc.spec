@@ -821,3 +821,10 @@ FORBID \[wm\] close-scope win=0
 REQUIRE :: CLOCKBAR: anchored=1 text=
 FORBID :: CLOCKBAR: .* -> FAIL ::
 FORBID :: CLOCKBAR: anchored=[01] text=[^ ]* drawn=0
+# ── DIMIDLE (rmbp-0929) — IDLE SCREEN BLANKING; the waking key is swallowed ─────────────────────────
+# After UNAOS_IDLE_MIN minutes (default 10) without input the panel is black and the compositor
+# refuses (`panel_refuse_term` -> "idle-blank"); the next key wakes it and is dropped at `pal::pop_event`,
+# so no window sees it. The fixture uses a 1 s threshold, blanks, injects a key, and scores it.
+# Needs `witness` and >= 12 s of boot. GO-RED: drop the `gate` swallow (wake_key_swallowed=0 -> FAIL).
+REQUIRE :: DIMIDLE: idle_min=[0-9]+ blanked_at_ms=[1-9][0-9]* woke_at_ms=[1-9][0-9]* wake_key_swallowed=1 -> PASS ::
+FORBID :: DIMIDLE: .* -> FAIL ::
