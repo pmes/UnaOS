@@ -774,12 +774,13 @@ const _: () = assert!(input_ev_pack(INPUT_EV_MENU_PICK, 0xFFFF_FFFF) < (1u64 << 
 
 #[cfg(test)]
 mod appmenu_tests {
+    extern crate std;
     use super::*;
     #[test]
     fn appmenu_wire_fits() {
         assert_eq!(MENU_ITEMS_MAX * MENU_ITEM_LEN, 2560);
         let it = MenuWireItem::new(7, 1, MENU_FLAG_CHECKED, b"Run");
         assert_eq!(MenuWireItem::from_bytes(&it.to_bytes()), Some(it));
-        println!(":: APPMENU: abi items={} wire_bytes={} cap_bytes={} body_max={} -> PASS ::", MENU_ITEMS_MAX, MENU_ITEM_LEN, MENU_ITEMS_MAX * MENU_ITEM_LEN, BUS_BODY_MAX);
+        std::println!(":: APPMENU: abi items={} wire_bytes={} cap_bytes={} body_max={} -> PASS ::", MENU_ITEMS_MAX, MENU_ITEM_LEN, MENU_ITEMS_MAX * MENU_ITEM_LEN, BUS_BODY_MAX);
     }
 }
