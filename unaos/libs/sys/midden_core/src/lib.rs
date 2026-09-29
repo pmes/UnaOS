@@ -274,6 +274,8 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // decides what it can capture, never whether the word exists. The ring arm refuses honestly and
     // by name when there is no panel, no writable volume, or no free index.
     ("screenshot", Avail::Always),
+    // WALLPAPER (rmbp-0929): `wallpaper <path.png>` / `wallpaper off` — the word exists everywhere (ONE-OS law); a kernel without the desktop backdrop simply has no arm and says so.
+    ("wallpaper", Avail::Always),
     // RELICS (R26 clause 2): the native-volume file verbs ARE the plain file verbs. The `u*`
     // family (`uls` `ucat` `utouch` `uwrite` `umkdir` `urm` `umv` `urmattr`) was a second spelling
     // of `ls`/`cat`/`touch`/`write`/`mkdir`/`rm`/`mv` that differed only in which volume it

@@ -5553,6 +5553,18 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // write-back cache to flush. `sync` is the honest confirmation of that (a no-op by design).
             console.println("sync: write-through storage — every write is already durable on the card");
         },
+        // WALLPAPER (rmbp-0929): `wallpaper <path>` decodes a PNG (<= 4 MB) into the desktop backdrop live; `wallpaper off`
+        // restores the flat colour. Whole mechanism in `video::wallpaper`; the witness line is its `:: WALLPAPER: ... ::`.
+        #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+        "wallpaper" => {
+            let arg = args.first().copied().unwrap_or("");
+            if arg.is_empty() {
+                console.println("usage: wallpaper <path.png> | wallpaper off");
+            } else {
+                let resolved = if arg == "off" { String::new() } else { vfs_path(arg) };
+                console.println(&crate::video::wallpaper::cmd(arg, &resolved));
+            }
+        },
         "screenshot" => {
             // PRTSCR: capture the panel to `SCREEN<n>.PNG` at the volume root. The whole mechanism
             // lives in `video::prtscr` because the Print Screen KEY reaches the same function from
