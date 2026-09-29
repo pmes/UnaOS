@@ -505,3 +505,9 @@ FORBID :: EHCI-HID: \[[0-9]+\] \[tp\] mt fingers=[0-9]+ mover=[2-9]
 # the line is reached on this lane. A verb that claims `ok=true` with N=0 is exactly the flight-14 bench symptom.
 REQUIRE \[fs\] mv .* lfn=1 ok=true sectors_written=[1-9][0-9]*
 FORBID \[fs\] mv .* lfn=1 ok=true sectors_written=0
+
+# SNTPDRV M1/M3: the arch-neutral net seam (`net_tick::service_tick`, driven from the 5 s scheduler hook,
+# not from the NIC driver) witnesses its verdict once per boot. synced=0 is the honest hermetic answer
+# (slirp answers no NTP); the link names the NIC family the stack is bound over.
+REQUIRE :: SNTP: link=(e1000|usbnet) synced=[01] offset_ms=-?[0-9]+ -> PASS ::
+FORBID :: SNTP: .* -> FAIL ::
