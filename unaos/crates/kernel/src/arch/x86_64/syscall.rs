@@ -7424,6 +7424,16 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         return false;
     };
     let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+    // DOCKRUN — the running tile's menu. Quit takes the close box's own path (registered here, one atomic
+    // store); a secondary press on a running tile opens the menu; ANY primary press while it is open goes
+    // to it first (a press outside closes it and falls through); a release ends the long-press hold.
+    #[cfg(feature = "wc")]
+    {
+        crate::video::dock::set_quit_hook(wc_close_click);
+        let eat = if mask & 0x02 != 0 { crate::video::dock::right_press_at(x, y) } else if mask & 0x01 != 0 && crate::video::dock::menu_open() { crate::video::dock::menu_press(x, y) } else { false };
+        if mask & 0x01 == 0 { crate::video::dock::lp_release(); }
+        if eat { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; }
+    }
     // ARC D M1 — **THE RULE, AND IT IS THE WHOLE RULE: PRIMARY BIT SET IS A PRESS, CLEAR IS A
     // RELEASE.** No latch, no edge re-derivation, no recovery arm.
     //
