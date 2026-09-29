@@ -602,3 +602,146 @@ pub fn restore_state(s: (u64, u8, u64, u8)) {
 pub fn set_byte_swap(on: bool) {
     SWAP.store(on as u8, Ordering::Relaxed);
 }
+
+// ===================== VOLKEYS — the volume model and its transient indicator =====================
+//
+// F10 / F11 / F12 (HID usages 0x43 / 0x44 / 0x45 in the boot report — the rMBP keyboard sends the
+// fn-row as plain F-keys) are mute / down / up. State is a boot-static `level` (0..=16) and a mute flag;
+// each key writes the codec's output amps through `drivers::hda::vol::apply` (x86 `hda` cfg; elsewhere
+// `amp_written` is 0) and arms a TRANSIENT indicator that `menubar` overlays on the bar's caption slot
+// for `OSD_MS`. The indicator is a generic (kind, level) pair so the brightness keys can use the same
+// slot: `osd_set(OSD_BRIGHT, n)` renders `brightness=N/16`. The bar repaints on expiry only when
+// something else recomposes it (the caption is in its signature); a bar with no other damage clears at
+// its next composite, not at the 1.5 s mark.
+
+/// Indicator lifetime after the last key.
+pub const OSD_MS: u64 = 1500;
+pub const OSD_VOL: u8 = 1;
+pub const OSD_MUTED: u8 = 2;
+pub const OSD_BRIGHT: u8 = 3;
+static VOL_LEVEL: AtomicU8 = AtomicU8::new(12);
+static VOL_MUTED: AtomicU8 = AtomicU8::new(0);
+static OSD_KIND: AtomicU8 = AtomicU8::new(0);
+static OSD_LEVEL: AtomicU8 = AtomicU8::new(0);
+static OSD_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+/// Arm the indicator (any kind) for `OSD_MS`.
+pub fn osd_set(kind: u8, level: u8) {
+    OSD_LEVEL.store(level, Ordering::Relaxed);
+    OSD_KIND.store(kind, Ordering::Relaxed);
+    OSD_UNTIL.store(crate::arch::ms().saturating_add(OSD_MS).max(1), Ordering::Relaxed);
+}
+
+/// Indicator text into `buf`, or 0 while it is not showing. No lock, no heap: safe from the composite.
+pub fn osd_text(buf: &mut [u8]) -> usize {
+    let until = OSD_UNTIL.load(Ordering::Relaxed);
+    if until == 0 || crate::arch::ms() >= until {
+        return 0;
+    }
+    let (kind, lv) = (OSD_KIND.load(Ordering::Relaxed), OSD_LEVEL.load(Ordering::Relaxed));
+    let mut n = 0usize;
+    let mut put = |s: &[u8]| {
+        for &c in s {
+            if n < buf.len() {
+                buf[n] = c;
+                n += 1;
+            }
+        }
+    };
+    match kind {
+        OSD_MUTED => put(b"muted"),
+        OSD_VOL | OSD_BRIGHT => {
+            put(if kind == OSD_VOL { b"vol=" } else { b"brightness=" });
+            if lv >= 10 {
+                put(&[b'0' + lv / 10]);
+            }
+            put(&[b'0' + lv % 10, b'/', b'1', b'6']);
+        }
+        _ => {}
+    }
+    n
+}
+
+/// Menubar seam: replace the caption with the indicator while it shows.
+pub fn osd_overlay(title: &mut [u8], len: &mut usize) {
+    let n = osd_text(title);
+    if n > 0 {
+        *len = n;
+    }
+}
+
+/// `(level, muted)`.
+pub fn volume() -> (u8, bool) {
+    (VOL_LEVEL.load(Ordering::Relaxed), VOL_MUTED.load(Ordering::Relaxed) != 0)
+}
+
+/// Decoder seam: a key usage that just went DOWN. Returns `Some((key, amp_written))` when it was a
+/// volume key (0 up / 1 down / 2 mute). Runs in the polled HID service, never an interrupt.
+pub fn volkey_usage(usage: u8) -> Option<(u8, bool)> {
+    let key = match usage {
+        0x45 => 0u8,
+        0x44 => 1,
+        0x43 => 2,
+        _ => return None,
+    };
+    let (mut lv, mut muted) = volume();
+    match key {
+        0 => {
+            lv = (lv + 1).min(16);
+            muted = false;
+        }
+        1 => {
+            lv = lv.saturating_sub(1);
+            muted = false;
+        }
+        _ => muted = !muted,
+    }
+    VOL_LEVEL.store(lv, Ordering::Relaxed);
+    VOL_MUTED.store(muted as u8, Ordering::Relaxed);
+    #[cfg(all(target_arch = "x86_64", feature = "hda"))]
+    let written = crate::drivers::hda::vol::apply(lv, muted) > 0;
+    #[cfg(not(all(target_arch = "x86_64", feature = "hda")))]
+    let written = false;
+    if muted { osd_set(OSD_MUTED, lv) } else { osd_set(OSD_VOL, lv) }
+    Some((key, written))
+}
+
+/// `:: VOLKEYS: … ::` — drives up, down, mute through the SAME seam the decoder calls, then restores the
+/// level and mute and clears the indicator. PASS = state moved as the key says, the indicator is
+/// showing, and the amp verb was issued (or no HDA path exists yet: the probe is deferred past the root
+/// pass and QEMU may not carry a codec, so `amp_written=0` there is a fact, not a failure).
+#[cfg(feature = "witness")]
+pub fn volkeys_selftest() {
+    let (l0, m0) = volume();
+    VOL_LEVEL.store(12, Ordering::Relaxed);
+    VOL_MUTED.store(0, Ordering::Relaxed);
+    #[cfg(all(target_arch = "x86_64", feature = "hda"))]
+    let ready = crate::drivers::hda::vol::ready();
+    #[cfg(not(all(target_arch = "x86_64", feature = "hda")))]
+    let ready = false;
+    for (usage, name) in [(0x45u8, "up"), (0x44, "down"), (0x43, "mute")] {
+        let r = volkey_usage(usage);
+        let (lv, muted) = volume();
+        let mut buf = [0u8; 20];
+        let shown = osd_text(&mut buf) > 0;
+        let (key_ok, written) = match r {
+            Some((_, w)) => (true, w),
+            None => (false, false),
+        };
+        let state_ok = match usage {
+            0x45 => lv == 13 && !muted,
+            0x44 => lv == 12 && !muted,
+            _ => lv == 12 && muted,
+        };
+        let ok = key_ok && state_ok && shown && (written || !ready);
+        serial_println!(
+            ":: VOLKEYS: key={} level={}/16 muted={} amp_written={} indicator={} -> {} ::",
+            name, lv, muted as u8, written as u8, shown as u8, if ok { "PASS" } else { "FAIL" }
+        );
+    }
+    VOL_LEVEL.store(l0, Ordering::Relaxed);
+    VOL_MUTED.store(m0, Ordering::Relaxed);
+    #[cfg(all(target_arch = "x86_64", feature = "hda"))]
+    let _ = crate::drivers::hda::vol::apply(l0, m0);
+    OSD_UNTIL.store(0, Ordering::Relaxed);
+}

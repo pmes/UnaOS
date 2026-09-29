@@ -1705,3 +1705,13 @@ FORBID :: EHCI-HID: \[\d+\] STOP-NOTE interrupt endpoint halted .* kind=boot-mou
 # scripts/specs/ that is neither named in `arroyo`'s CODE nor carries a RUN-BY line above — and a
 # `RUN-BY: verb:` claim is cross-checked against `arroyo`, so this file cannot claim a runner it
 # does not have. "A replay spec no gate command runs is a silent landmine."
+
+# --- VOLKEYS (2026-09-29) ---------------------------------------------------------------------
+# --- F10/F11/F12 -> mute/down/up through the decoder's own seam (`status::volkey_usage`): state moves,
+# --- the transient indicator is showing, and the HDA output-amp verb was issued (`amp_written=1`) or no
+# --- codec path exists on this boot (`amp_written=0`, then PASS does not require it).
+# --- GO-RED, ONE EDIT: make `volkey_usage` skip `osd_set` -> indicator=0 -> FAIL.
+REQUIRE :: VOLKEYS: key=up level=13/16 muted=0 amp_written=[01] indicator=1 -> PASS ::
+REQUIRE :: VOLKEYS: key=down level=12/16 muted=0 amp_written=[01] indicator=1 -> PASS ::
+REQUIRE :: VOLKEYS: key=mute level=12/16 muted=1 amp_written=[01] indicator=1 -> PASS ::
+FORBID :: VOLKEYS: .* -> FAIL ::

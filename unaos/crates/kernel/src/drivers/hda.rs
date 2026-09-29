@@ -1216,7 +1216,7 @@ pub fn probe() {
             if arc1_ok { "PASS" } else { "FAIL" }
         ); #[cfg(feature = "hda-tone")] run_tone(base, &mut rings, iss as u8, chosen.as_ref(), &ws, &mut a); // ARC 2's ONE call site, and the ONLY `hda-tone` statement above this file's arc-2 banner. HERE because the tone must run on a walked controller and before the rings are stopped. FOLDED onto the arc-1 statement's closing line rather than given lines of its own so that arc 1's line numbering is identical with and without arc 2 — the same LINE-NEUTRAL discipline the hook in `drivers/pci.rs` uses, for the same `panic::Location` reason. The append goes BEFORE this line's first `//` (LEDGER P7 — after it the statement is a comment, compiles nothing, and the check stays green).
 
-        rings.stop(&mut a);
+        vol::capture(base, chosen.as_ref(), &ws, &mut rings, &mut a); rings.stop(&mut a); // VOLKEYS: keep the output path
         a.line("end");
         // One controller per boot; see the comment at the top of this loop.
         return;
@@ -2186,4 +2186,86 @@ impl Audit {
             stage, self.cfg, self.ctrl, self.stream, self.verbs_get, self.verbs_set, self.intctl
         );
     }
+}
+
+// ===================== VOLKEYS — THE OUTPUT AMPLIFIER, DRIVEN AFTER THE PROBE =====================
+//
+// The probe walks the codec, finds the output path (pin -> ... -> DAC) and, under `hda-tone`, sets the
+// amplifiers for a diagnostic tone. Nothing kept the path afterwards, so nothing could set a volume.
+// `vol::capture` (one same-line call at the end of `probe`, before `rings.stop`) records the controller
+// base, the codec address and each path node that declares an OUTPUT amp with its step count (amp caps
+// bits 14:8). `vol::apply(level, muted)` then issues one SET_AMPLIFIER_GAIN_MUTE per such node
+// (both channels): gain = level * steps / 16, mute bit = the mute flag. The rings are re-initialised ONCE,
+// lazily, and kept (the probe's rings were stopped); the apply runs from the device-service pass, never
+// from the key decoder. Returns the number of verbs the codec answered. [HDA-SPEC §7.3.3.7, §7.3.4.12]
+pub mod vol {
+    use super::*;
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    static BASE: AtomicU64 = AtomicU64::new(0);
+    static CAD: AtomicU32 = AtomicU32::new(0);
+    /// Per path node: bit16 valid, bits15:8 steps, bits7:0 nid.
+    const Z: AtomicU32 = AtomicU32::new(0);
+    static NODES: [AtomicU32; MAX_PATH_DEPTH] = [Z; MAX_PATH_DEPTH];
+    static RINGS: spin::Mutex<Option<Rings>> = spin::Mutex::new(None);
+
+    pub(super) fn capture(base: u64, walk: Option<&CodecWalk>, ws: &[Widget; MAX_NODES], rings: &mut Rings, a: &mut Audit) {
+        let Some(w) = walk else { return };
+        let Some(p) = w.path.as_ref() else { return };
+        let mut n = 0u32;
+        for i in 0..p.len as usize {
+            let nid = p.nodes[i];
+            if !ws[nid as usize].out_amp() {
+                continue;
+            }
+            let caps = rings.cmd(w.cad, nid, VERB_GET_PARAMETER, 0x12, a).unwrap_or(0); // PARAM_OUT_AMP_CAPS
+            let steps = (caps >> 8) & 0x7F;
+            NODES[i].store((1 << 16) | (steps << 8) | nid as u32, Ordering::Relaxed);
+            n += 1;
+        }
+        CAD.store(w.cad as u32, Ordering::Relaxed);
+        BASE.store(if n > 0 { base } else { 0 }, Ordering::Relaxed);
+        serial_println!("[hda] vol path captured amps={} cad={}", n, w.cad);
+    }
+
+    /// True once `capture` found at least one output amp to drive.
+    pub fn ready() -> bool {
+        BASE.load(Ordering::Relaxed) != 0
+    }
+
+    /// Set every captured output amp to `level`/16 (or mute). Returns verbs answered (0 = none issued).
+    pub fn apply(level: u8, muted: bool) -> u32 {
+        let base = BASE.load(Ordering::Relaxed);
+        if base == 0 {
+            return 0;
+        }
+        let cad = CAD.load(Ordering::Relaxed) as u8;
+        let mut a = Audit::default();
+        let mut g = RINGS.lock();
+        if g.is_none() {
+            *g = Rings::init(base, &mut a);
+        }
+        let Some(rings) = g.as_mut() else { return 0 };
+        let mut ok = 0u32;
+        for slot in NODES.iter() {
+            let v = slot.load(Ordering::Relaxed);
+            if v & (1 << 16) == 0 {
+                continue;
+            }
+            let (nid, steps) = ((v & 0xFF) as u8, (v >> 8) & 0xFF);
+            let gain = (level.min(16) as u32 * steps / 16) as u8;
+            let payload = super::tone_free_amp_payload(muted, gain);
+            let word = ((cad as u32 & 0xF) << 28) | ((nid as u32) << 20) | (0x3 << 16) | payload;
+            if rings.issue(word, &mut a).is_some() {
+                ok += 1;
+            }
+        }
+        ok
+    }
+}
+
+/// SET_AMPLIFIER_GAIN_MUTE payload, output amp, both channels (the `tone` module's `amp_payload` is
+/// `hda-tone`-gated, so this file-tail copy keeps VOLKEYS independent of that knob).
+fn tone_free_amp_payload(mute: bool, gain: u8) -> u32 {
+    (1 << 15) | (1 << 13) | (1 << 12) | if mute { 1 << 7 } else { 0 } | (gain as u32 & 0x7F)
 }
