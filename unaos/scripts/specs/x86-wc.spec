@@ -814,3 +814,10 @@ REQUIRE \[wc-d\] latch-check forced=16 printed=1 rolled=16 win=31 reroll=0 -> PA
 # COUNT 2 reads 1 hit and the FORBID trips on `[wm] close-scope win=0 owner=0x3`.
 COUNT 2 \[wm\] close-scope win=[1-9][0-9]* owner=0x[0-9a-f]+ next_focus=
 FORBID \[wm\] close-scope win=0 
+
+# CLOCKBAR (rmbp-0929): the menubar clock draws `--:--` until anchored, then HH:MM; once per state per boot.
+# The unanchored line is bounded by state, not by count: SNTP may anchor before the first draw, so only the
+# anchored=1 line is REQUIRED; the FORBID rejects any draw that reports drawn=0 or FAILs.
+REQUIRE :: CLOCKBAR: anchored=1 text=
+FORBID :: CLOCKBAR: .* -> FAIL ::
+FORBID :: CLOCKBAR: anchored=[01] text=[^ ]* drawn=0

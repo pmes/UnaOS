@@ -1988,8 +1988,8 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // x and a second copy of `w - PAD - CLOCK_GLYPHS * CELL_W` is how a clock ends up in two places
     // at once. Same arithmetic, same guard, one definition — and it is the definition the fixture's
     // `clock=` term and [`batt_slot`] both read.
-    if let (Some(c), Some(cx)) = (m.clock, clock_slot(w)) {
-        super::font::draw_row(out, w, &c, cx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE); #[cfg(feature = "sntp6")] barclock_note(Some((cx, ty0, CLOCK_GLYPHS * CELL_W, CELL_H))); // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the SET half, reported from the one place that knows the clock's DRAWN rect. `compose_row` runs once per row per pass, so this call is on the compositor cadence and the latch at the file tail — not this site — is what makes it one line per boot (SO30).
+    if let (c, Some(cx)) = (m.clock.unwrap_or(*b"--:--"), clock_slot(w)) {
+        super::font::draw_row(out, w, &c, cx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE); clockbar_paint(out, w, sy, cx, m.clock.is_some(), &c); #[cfg(feature = "sntp6")] if m.clock.is_some() { barclock_note(Some((cx, ty0, CLOCK_GLYPHS * CELL_W, CELL_H))); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the SET half, reported from the one place that knows the clock's DRAWN rect. `compose_row` runs once per row per pass, so this call is on the compositor cadence and the latch at the file tail — not this site — is what makes it one line per boot (SO30).
     }
 }
 
@@ -3014,5 +3014,58 @@ pub fn crystal_persist_selftest(pw: usize, ph: usize) {
          tries={},{},{} decl_lock={} unread={} budget_ms={} -> {}",
         landed, present, landed, words[0], words[1], words[2], matched, want, stray, sym,
         tries[0], tries[1], tries[2], decl, unread, SETTLE_BUDGET_MS, verdict
+    );
+}
+
+// CLOCKBAR — the bar's clock reads `--:--` until the civil clock is anchored (SNTP or operator seed) instead of
+// vanishing, and on a wide bar the date rides to the clock's left. Tail-appended (B94: no Location above moves).
+// Colours are the clock's own theme ink; every metric is CELL_W-derived, so it scales with the face.
+
+/// `Tue 29 Sep` — 10 glyphs.
+const CLOCKBAR_DATE_GLYPHS: usize = 10;
+/// The bar width, in glyphs, from which the date is shown: room for the crystal, a long caption, menus,
+/// the status item, the date and the clock together. Cell units, so scale-aware.
+const CLOCKBAR_WIDE_CELLS: usize = 130;
+
+static CLOCKBAR_SEEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// UTC `Www DD Mon` from Unix seconds, no heap.
+fn clockbar_date(secs: u64) -> [u8; CLOCKBAR_DATE_GLYPHS] {
+    const WD: [&[u8; 3]; 7] = [b"Thu", b"Fri", b"Sat", b"Sun", b"Mon", b"Tue", b"Wed"];
+    const MO: [&[u8; 3]; 12] = [b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec"];
+    let (_, mo, d, _, _, _) = crate::clock::civil_from_unix(secs);
+    let wd = WD[((secs / 86_400) % 7) as usize];
+    let mn = MO[(mo.clamp(1, 12) - 1) as usize];
+    let mut o = [b' '; CLOCKBAR_DATE_GLYPHS];
+    o[..3].copy_from_slice(wd);
+    o[4] = b'0' + ((d / 10) % 10) as u8;
+    o[5] = b'0' + (d % 10) as u8;
+    o[7..10].copy_from_slice(mn);
+    o
+}
+
+/// Painter tail for the clock: the date on a wide bar (left of the status item when there is room
+/// for it, else left of the clock), and the once-per-state `:: CLOCKBAR:` witness.
+fn clockbar_paint(out: &mut [u32], w: usize, sy: usize, cx: usize, anchored: bool, c: &[u8; CLOCK_GLYPHS]) {
+    if anchored && w >= CLOCKBAR_WIDE_CELLS * CELL_W {
+        if let Some(secs) = crate::clock::try_unix_now() {
+            let dw = CLOCKBAR_DATE_GLYPHS * CELL_W;
+            // The status item (battery) sits one PAD left of the clock; when the date shares the row
+            // it goes one PAD left of that slot's left edge, so the two never overlap.
+            let right = batt_slot(w).unwrap_or(cx);
+            if let Some(dx) = right.checked_sub(strip::PAD + dw) {
+                let date = clockbar_date(secs);
+                super::font::draw_row(out, w, &date, dx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
+            }
+        }
+    }
+    let bit: u8 = if anchored { 0b10 } else { 0b01 };
+    if CLOCKBAR_SEEN.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    serial_println!(
+        ":: CLOCKBAR: anchored={} text={} drawn=1 -> PASS ::",
+        anchored as u8,
+        core::str::from_utf8(c).unwrap_or("?????")
     );
 }
