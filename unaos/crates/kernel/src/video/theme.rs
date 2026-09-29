@@ -541,7 +541,7 @@ const _: () = {
 // line inserted mid-file moves every `panic::Location` below it (LEDGER P7). Nothing follows this
 // block, so nothing moves.
 
-use super::keymap::{Action, Binding, Table, CMD, SHIFT};
+use super::keymap::{Action, Binding, Table, ALT, CMD, SHIFT};
 
 /// CRISPY's rows. PRECEDENCE ORDER — the resolver takes the first row whose usage edged and whose
 /// roles are held, so the two-modifier chords are written above the one-modifier ones. Every row
@@ -593,6 +593,9 @@ pub static CRISPY_ROWS: [Binding; 23] = [
     // TERMSEL — Esc drops the selection. `roles: 0`, like Print Screen; the key is STILL TYPED
     // (0x1B reaches every key consumer as before), so a menu that dismisses on it is unaffected.
     Binding { roles: 0, usage: 0x29, action: Action::Deselect, token: "esc" },
+    // WINCYCLE — Alt+Tab and the Mac's own ⌘Tab. Above the bare rows on usage 0x2B (none exist).
+    Binding { roles: ALT, usage: 0x2B, action: Action::CycleWindow, token: "alt-tab" },
+    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: "cmd-tab" },
     // Print Screen. `roles: 0` — the key means capture whatever else is held, which is precisely
     // what the `0x46` edge did before it was a row. A theme that drops this row disarms the key.
     Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: "print-screen" },
@@ -617,12 +620,13 @@ pub static CRISPY_BINDINGS: &Table = &Table {
 /// The rows are the SAME rows in role space. What differs is one field — `cmd_role` — plus the
 /// keyboard the operator is typing on: `Alt+C` is copy on a PC because R61 says the Command role
 /// moves to Alt there, not because a second Copy row was written.
-pub static PC_ROWS: [Binding; 15] = [
+pub static PC_ROWS: [Binding; 16] = [
     // PrtSc. The SHIFTED row is written ABOVE the bare one, and it has to be: the bare row names
     // no roles, so it matches with Shift held too and would shadow the region chord entirely. That
     // is this table's one ordering hazard; the `const` block at the foot of this file checks it.
     Binding { roles: SHIFT, usage: 0x46, action: Action::ScreenshotRegion, token: "shift-prtsc" },
     Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: "prtsc" },
+    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: "alt-tab" }, // WINCYCLE — Alt is the PC's cmd role
     Binding { roles: CMD, usage: 0x06, action: Action::Copy, token: "alt-c" },
     Binding { roles: CMD, usage: 0x19, action: Action::Paste, token: "alt-v" },
     Binding { roles: CMD, usage: 0x1B, action: Action::Cut, token: "alt-x" },

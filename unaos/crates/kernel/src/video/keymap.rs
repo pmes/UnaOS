@@ -132,6 +132,9 @@ pub enum Action {
     BrightnessDown,
     /// BRIGHTKEYS: panel backlight one step up (`F2`).
     BrightnessUp,
+    /// WINCYCLE: focus the least-recently-raised app window (`Alt+Tab`; `⌘Tab` on CRISPY). Acted on by
+    /// the window system's router, never by the terminal.
+    CycleWindow,
 }
 
 impl Action {
@@ -156,6 +159,7 @@ impl Action {
             Action::CursorLineEnd => "cursor-line-end",
             Action::BrightnessDown => "brightness-down",
             Action::BrightnessUp => "brightness-up",
+            Action::CycleWindow => "cycle-window",
         }
     }
 

@@ -828,3 +828,10 @@ FORBID :: CLOCKBAR: anchored=[01] text=[^ ]* drawn=0
 # Needs `witness` and >= 12 s of boot. GO-RED: drop the `gate` swallow (wake_key_swallowed=0 -> FAIL).
 REQUIRE :: DIMIDLE: idle_min=[0-9]+ blanked_at_ms=[1-9][0-9]* woke_at_ms=[1-9][0-9]* wake_key_swallowed=1 -> PASS ::
 FORBID :: DIMIDLE: .* -> FAIL ::
+# ── WINCYCLE (rmbp-0929) — Alt+Tab cycles app windows; a title double-click zooms/restores ──────────
+# The fixture mints three rows, cycles twice (bottom-raise rotation), zooms and restores one. GO-RED:
+# make `cycle_pick` return None -> `after_tab` no longer the second-least-recent and FAIL prints.
+REQUIRE :: WINCYCLE: windows=[0-9]+ order=\[[0-9, ]+\] after_tab=[1-9][0-9]* zoom=[0-9]+x[0-9]+->[0-9]+x[0-9]+ restored=1 -> PASS ::
+FORBID :: WINCYCLE: .* -> FAIL ::
+REQUIRE \[wm-act\] cycle win=[1-9][0-9]* owner=0x[0-9a-f]+ at \(0,0\) -> action=cycle raised
+REQUIRE \[wm-act\] action=zoom win=[1-9][0-9]* route=title-dbl -> zoomed
