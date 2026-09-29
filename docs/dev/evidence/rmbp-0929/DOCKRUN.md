@@ -8,3 +8,6 @@
 
 ## Written
 M1-M3 pre-existing. M4 state machine, geometry, quit, keep toggle, fixture, spec pins. NOT written: menu painting, arch wiring of `right_press_at`/`lp_release`/`lp_service`/`menu_press`/`set_quit_hook` (router ignores secondary buttons), and Keep-in-Dock does not yet render a tile for a non-running kept app (no generic launch seam).
+
+## Written (M4 completion)
+Menu painted in a band above the strip: the dock tenant's rect grows by the band while open (`ext_rect`, `menu_geo`, `menu_row`), signature folds open/x/hover/keep so it appears and vanishes; hover from `pal::cursor::pos`. x86 router (`wc_click_route_at` head) decodes the secondary bit to `right_press_at`, sends primary presses to `menu_press` while open (outside press closes and falls through), calls `lp_release` on release, registers `set_quit_hook(wc_close_click)`. `desktop_uefi.rs` calls `dock::lp_service(ms)` beside `status::poll()`. Witness gains `menu_drawn=1`. aarch64 router not wired.

@@ -817,5 +817,5 @@ FORBID \[wm\] close-scope win=0
 
 # --- DOCKRUN — the running tile's gestures: a window mints a tile with the running pip, a press raises it,
 # --- a right-click/long-press menu's Quit closes the owner and the tile leaves.
-REQUIRE :: DOCKRUN: tiles=\d+ running=\d+ pinned=\d+ raise=ok quit=ok -> PASS ::
+REQUIRE :: DOCKRUN: tiles=\d+ running=\d+ pinned=\d+ raise=ok quit=ok menu_drawn=1 -> PASS ::
 FORBID :: DOCKRUN: .* -> FAIL ::
