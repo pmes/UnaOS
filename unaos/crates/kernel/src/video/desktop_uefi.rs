@@ -452,6 +452,7 @@ pub fn activate_on(desc: SurfaceDesc) {
         fb.fill_screen(wm::DESKTOP_BG);
         fb.flush_all();
     }
+    super::wcpar::start(); // WCPAR — band workers exist before the first composite; prints `[wcpar] pool=`
     serial_println!(
         "[wc-x] desktop-clear panel={}x{} bg={:08X}",
         pw,

@@ -905,3 +905,7 @@ FORBID \[menubar\] pick owner=[0-9]+ item=[0-9]+ delivered=false
 
 # WCDPOOL M1 — the heap curve prints (PASS = the line prints; the numbers are the reading).
 REQUIRE :: HEAP: size=[0-9]+ used=[0-9]+ free=[0-9]+ largest=[0-9]+ -> PASS ::
+# WCPAR — the compositor band-worker pool. The lane runs -smp 6 (builder/src/main.rs), so APs exist;
+# PASS = every band of every fanned-out job completed (speedup_pct is the reading, not the gate).
+REQUIRE :: WCPAR: cores=
+REQUIRE [wcpar] pool=
