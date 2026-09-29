@@ -364,7 +364,7 @@ pub fn terminal_action_in(
         | Action::Deselect => ("ok", if !sel.apply(act, line.len()) { 0 } else if scroll { 2 } else { 1 }),
         // Not this consumer's business: the capture actions are delivered and acted on at the
         // decoder (`Action::is_capture`), and `LogOut` is KEYMAP's slot, bound by nobody.
-        Action::Screenshot | Action::ScreenshotRegion | Action::LogOut => ("ignored", 0),
+        Action::Screenshot | Action::ScreenshotRegion | Action::LogOut | Action::BrightnessDown | Action::BrightnessUp => ("ignored", 0),
         // TERMSEL2 M3 — the caret (`LineSel::caret_action`).
         Action::CursorLeft | Action::CursorRight | Action::CursorLineStart | Action::CursorLineEnd => {
             ("ok", sel.caret_action(act, line.len()))
@@ -397,6 +397,8 @@ pub const fn action_code(a: Action) -> u64 {
         Action::CursorRight => 14,
         Action::CursorLineStart => 15,
         Action::CursorLineEnd => 16,
+        Action::BrightnessDown => 17,
+        Action::BrightnessUp => 18,
     }
 }
 

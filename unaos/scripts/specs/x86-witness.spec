@@ -1705,3 +1705,10 @@ FORBID :: EHCI-HID: \[\d+\] STOP-NOTE interrupt endpoint halted .* kind=boot-mou
 # scripts/specs/ that is neither named in `arroyo`'s CODE nor carries a RUN-BY line above — and a
 # `RUN-BY: verb:` claim is cross-checked against `arroyo`, so this file cannot claim a runner it
 # does not have. "A replay spec no gate command runs is a silent landmine."
+
+# --- BRIGHTKEYS (rmbp-0929): F1/F2 step the backlight through the gmux; the bar shows `BRT nn/16` for 1.5 s.
+# --- The boot fixture drives an up and a down step through the real key path (no gmux write, so
+# --- `gmux_written=0` on QEMU and on the bench replay); a real key press on the metal prints its own line
+# --- with `gmux_written=1` when the register write completed. `indicator=1` is measured, not asserted.
+REQUIRE :: BRIGHTKEYS: key=(up|down) level=[0-9]+/16 gmux_written=[01] indicator=1 -> PASS ::
+FORBID :: BRIGHTKEYS: .* -> FAIL ::

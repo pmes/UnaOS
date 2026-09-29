@@ -1139,3 +1139,8 @@ impl<T> Drop for HeldGuard<'_, T> {
         self.lock.tag.store(0, Ordering::Relaxed);
     }
 }
+
+// BRIGHTKEYS — F1/F2 step the panel backlight (gmux) and light the bar's transient level item.
+// Appended, not inserted: this file is line-sensitive (panic::Location records).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod brightkeys;
