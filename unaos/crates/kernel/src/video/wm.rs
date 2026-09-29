@@ -2731,7 +2731,7 @@ pub fn close_owner(owner_asid: u64) -> usize {
     crate::wedge2::mark_composite("<D1>", "<d1>");
     // WMDIRECT — see `close`. Keyed on the OWNER here because this path clears every row the ASID
     // holds under one lock and no longer knows their ids by the time it returns.
-    drag_forget_owner(owner_asid); #[cfg(target_arch = "x86_64")] super::appmenu::reap(owner_asid);
+    drag_forget_owner(owner_asid); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::appmenu::reap(owner_asid);
     let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     // CLOSEISO — WHICH ids, not merely how many. A count cannot be falsified against the panel: the
     // Boot AR line `closed=1` was true and told the reader nothing about which window went. The list

@@ -702,7 +702,7 @@ pub const MENU_FLAGS_KNOWN: u32 = MENU_FLAG_DISABLED | MENU_FLAG_SEPARATOR | MEN
 /// One item on the wire: fixed width, so the kernel walks records and parses nothing.
 /// `parent == 0` is a top-level item, which MUST be a `MENU_FLAG_SUBMENU` title with a nonzero `id`.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MenuWireItem {
     pub id: u32,
     pub parent: u32,

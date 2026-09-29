@@ -900,7 +900,7 @@ pub(crate) fn note_panel_write_refused(_tier: u8, _term: &'static str, _site: &'
 // feature. So the gate is a DEPENDENCY fact, not a policy one, and it moves the day the furniture
 // family's does — together, in one place.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-pub mod winmenu; #[cfg(target_arch = "x86_64")] pub mod appmenu;
+pub mod winmenu; #[cfg(all(target_arch = "x86_64", feature = "wc"))] pub mod appmenu;
 
 // ── FACET (`facet` / UNAOS_FACET=1, implied by `deskcascade`) — the IMAGE VIEWER ────────────────
 //
