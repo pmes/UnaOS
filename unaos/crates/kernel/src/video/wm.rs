@@ -8003,8 +8003,8 @@ fn verify_reference(
     let mut want: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     if want.try_reserve_exact((row1 - row0) * cols).is_err() {
         if wcd_oom_say(i) { serial_println!(
-            "[wc-d] verify win={} -> SKIP (no memory for {}x{} source snapshot)",
-            r.id, cols, row1 - row0
+            "[wc-d] verify win={} -> SKIP (no memory for {}x{} source snapshot){}",
+            r.id, cols, row1 - row0, WcdHeapNote
         ); } // WCDFLOOD (SO30) — ⚠ LINE-NEUTRAL rewrite, 4 lines in and 4 out. LATCHED per window id: the FIRST OOM skip a window takes speaks, every later one only COUNTS, into `[comp2] wcd_skips=`. The hand-back four lines down is correct and is kept — but it is also what turned this from "one line per window, ever" into one line per PASS, and render13 boot 1 put 46 161 copies of it on a 115 200-baud wire (68 B each = 3.14 MB = ~36 % of that boot's entire 767 s UART budget). A producer that outruns the UART fills the 64-slot staging ring (`serial_ring::SLOTS`), and the ring is drained IRQ-MASKED and INLINE by whichever core prints next — here, the compositing core itself, from inside the blit loop. That is the drag stall: see the WCDFLOOD block at this file's tail for the byte arithmetic and the wire that convicts it.
         // RECORDED FOR THE PI4 WIRE: this changes aarch64 LINE COUNT even though no format changes.
         // Before, the OOM path claimed and the SKIP was terminal — one line per window, ever. Now the
@@ -13497,7 +13497,7 @@ fn comp2_emit(span: u64) {
         passes.saturating_mul(10_000) / span.max(1) / 10,
         passes.saturating_mul(10_000) / span.max(1) % 10,
         span
-    ); wcd_skip_rollup(); serwire_emit(max_cyc, span, passes); blitwire_note(max_cyc, passes, loop_cyc.saturating_sub(cache_cyc), wit_cyc, wit_n, wcd_cyc, bytes); // SERWIRE (SO45) — the transport's capped-drain odometer for THIS span, drained here and printed ONCE PER BOOT when `max_us` crosses the stall threshold, immediately under the `[comp2]` line it adjudicates. It is fed `max_cyc` (already swapped above, so this reads the identical number `[comp2]` just printed) rather than re-reading the counter, which by then is zero. `[comp2]` itself is NOT widened by one byte: a per-rollup field would be SO30 one layer up. ⚠ LINE-NEUTRAL append onto the emit's closing `);`, before the line's first `//`; the body is a FILE-TAIL append, so no `panic::Location` in this file moves. — BLITWIRE (fold, both calls on one `);`): BLITWIRE (SO45) — ⚠ LINE-NEUTRAL fold, before this line's first `//`. AFTER the rollup and never before it, so the one-shot reads as an annotation on the `[comp2]` line directly above it and the two are read as a pair. `[comp2]` is not widened by one byte; this is a separate, LATCHED line that speaks at most once per boot (SO30 — a per-rollup field at ~140 rollups on a 700 s boot is this defect one layer up). Takes the SAME `loop_cyc - cache_cyc` the `blit_us` argument above takes, so the two can never disagree about what they are decomposing.
+    ); wcd_skip_rollup(); wcd_heap_tick(); serwire_emit(max_cyc, span, passes); blitwire_note(max_cyc, passes, loop_cyc.saturating_sub(cache_cyc), wit_cyc, wit_n, wcd_cyc, bytes); // SERWIRE (SO45) — the transport's capped-drain odometer for THIS span, drained here and printed ONCE PER BOOT when `max_us` crosses the stall threshold, immediately under the `[comp2]` line it adjudicates. It is fed `max_cyc` (already swapped above, so this reads the identical number `[comp2]` just printed) rather than re-reading the counter, which by then is zero. `[comp2]` itself is NOT widened by one byte: a per-rollup field would be SO30 one layer up. ⚠ LINE-NEUTRAL append onto the emit's closing `);`, before the line's first `//`; the body is a FILE-TAIL append, so no `panic::Location` in this file moves. — BLITWIRE (fold, both calls on one `);`): BLITWIRE (SO45) — ⚠ LINE-NEUTRAL fold, before this line's first `//`. AFTER the rollup and never before it, so the one-shot reads as an annotation on the `[comp2]` line directly above it and the two are read as a pair. `[comp2]` is not widened by one byte; this is a separate, LATCHED line that speaks at most once per boot (SO30 — a per-rollup field at ~140 rollups on a 700 s boot is this defect one layer up). Takes the SAME `loop_cyc - cache_cyc` the `blit_us` argument above takes, so the two can never disagree about what they are decomposing.
     // CHROMEBAND — pi's `[chromeband]` ledger was RETIRED at the 0ed6fee2 fold: trunk's own
     // band-clamp landed with the `[wc-b]` witness family (per-window, rollup and fixture lines
     // carrying chrome_rows/chrome_rows_used/amp), which measures the same quantity as the
@@ -29488,3 +29488,49 @@ pub fn wp_paint(_fb: &super::framebuffer::FrameBuffer) {}
 #[cfg(not(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
 #[inline(always)]
 pub fn wp_take_stale() -> bool { false }
+
+// ---- WCDPOOL M1 — heap census at the wc-d OOM SKIP, and the `:: HEAP:` boot curve ----------------------
+//
+// Boot 16's `[wc-d] verify win=30|31 -> SKIP (no memory for 8x8 source snapshot)` (twice each) are NOT
+// real OOM: ids 30/31 and the 8x8 extent are the WCDLATCH / WCDMEM FIXTURES' literals
+// (`wcd_oom_latch_selftest`, `wcd_skip_latch_check`), which print the shipping line to prove the latch.
+// The heap on that boot was 256 MiB (`HEAP: chose 0x20200000..0x30200000 (256 MiB)`). A real skip now
+// carries ` heap_used= heap_free= largest=` (from `allocator::heap_census`, 4 KiB-aligned largest run)
+// so an actual exhaustion vs fragmentation reads off the same line. The census runs inside `fmt`, only
+// on the latched (first-per-window) OOM path, never on a fixture line.
+#[cfg(feature = "witness")]
+struct WcdHeapNote;
+#[cfg(feature = "witness")]
+impl core::fmt::Display for WcdHeapNote {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let c = crate::allocator::heap_census(0x1000);
+        write!(f, " heap_used={} heap_free={} largest={}", c.used, c.free, c.largest_run)
+    }
+}
+#[cfg(not(feature = "witness"))]
+struct WcdHeapNote;
+#[cfg(not(feature = "witness"))]
+impl core::fmt::Display for WcdHeapNote {
+    fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) }
+}
+
+/// `:: HEAP: size= used= free= -> PASS ::` on the first `[comp2]` rollup (the desktop's first composed
+/// passes = desktop-ready) and every 6th after (30 s at the 5 s `WCN_ROLLUP_MS` cadence: ~24 lines per
+/// 700 s boot), so a leak (used climbing) or the peak is visible over a boot. PASS = the line prints.
+#[cfg(feature = "witness")]
+fn wcd_heap_tick() {
+    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    static N: AtomicU32 = AtomicU32::new(0);
+    if N.fetch_add(1, Relaxed) % 6 != 0 {
+        return;
+    }
+    let (lo, hi) = crate::allocator::heap_bounds();
+    let c = crate::allocator::heap_census(0x1000);
+    serial_println!(
+        ":: HEAP: size={} used={} free={} largest={} -> PASS ::",
+        hi.saturating_sub(lo), c.used, c.free, c.largest_run
+    );
+}
+#[cfg(not(feature = "witness"))]
+#[inline(always)]
+fn wcd_heap_tick() {}
