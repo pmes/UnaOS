@@ -70,7 +70,7 @@ WORKSPACE_DIR="$(cd "$(dirname "$0")" && pwd)"
 # list must be checked against that cfg before it is: `witness` is not a free arming on x86.
 case "${1:-}" in
     test|test-x86|test_x86|test-fat|test_fat|test-arm|test-aarch64|kernel8-test|test-pi|test-install|test_install|test-ptr|test_ptr)
-        export UNAOS_WITNESS="${UNAOS_WITNESS:-1}" ;;
+        export UNAOS_WITNESS="${UNAOS_WITNESS:-1}"; export UNAOS_TESTS_AT_BOOT="${UNAOS_TESTS_AT_BOOT:-1}" ;; # R77 M3: the QEMU lanes keep their boot-time fixtures (the metal desktop defers them behind the `tests` verb)
 esac
 
 # BUILD-SHA-1: Export git SHA as UNAOS_GIT_SHA for compile-time embedding (option_env!("UNAOS_GIT_SHA")).
@@ -646,6 +646,8 @@ _feats="${_feats}sdw,"
 # not ask to WRITE its boot medium must be incapable of it, and a shipping login boot never carries a
 # fixture credential. Implies `login` in Cargo.toml. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_LOGINST:-}" ] && _feats="${_feats}loginst,"
+# R77 M3: UNAOS_TESTS_AT_BOOT=1 runs the desktop fixture registry (`tests.rs`) at registration, in boot order, exactly as before the `tests` verb existed; unset, the desktop boots quiet and `tests` fires them. The test/test-arm lanes default it ON (top of this file). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_TESTS_AT_BOOT:-}" ] && _feats="${_feats}tests-at-boot,"
 # PRTSCR-ST: UNAOS_PRTSCRST=1 arms the screen capture's BOOT-TIME-WRITE witness — one real capture
 # to SCREEN<n>.PNG at the volume root, then a read-back of what landed on the medium. Its own knob,
 # and NOT part of any other, by the rule stated for UNAOS_HCRONST above: a boot that did not ask to

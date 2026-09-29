@@ -245,7 +245,7 @@ pub fn capture(args: fmt::Arguments) {
     // Clean the label: text before the verdict marker, minus a leading ":: " frame, trimmed. The
     // marker can sit past `HEAD_MAX` on a very wide line; the label is clipped to `NAME_MAX` (40)
     // regardless, so the kept head is always enough.
-    let s = sc.head_str();
+    crate::tests::tally(pass); let s = sc.head_str();
     let mut cut = idx.min(s.len());
     while cut > 0 && !s.is_char_boundary(cut) {
         cut -= 1;

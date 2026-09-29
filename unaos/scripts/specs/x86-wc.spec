@@ -902,3 +902,6 @@ FORBID :: APPMENU: .* -> FAIL ::
 FORBID :: APPMENU: verb=publish owner=[0-9]+ items=(6[5-9]|[7-9][0-9]|[1-9][0-9][0-9]) .* -> PASS ::
 FORBID \[winmenu\] publish owner=0 
 FORBID \[menubar\] pick owner=[0-9]+ item=[0-9]+ delivered=false
+
+# R77 M3 — the desktop fixtures are registered, not ignited; the lane defaults UNAOS_TESTS_AT_BOOT=1 so the boot prints the one line (deferred=0 there) and every fixture still runs in its old order
+REQUIRE :: TESTS: deferred=

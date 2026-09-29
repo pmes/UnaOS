@@ -954,6 +954,8 @@ login = ["midden_core/login"]
 # the card IS a plaintext credential on disk). Implies `login`. DEFAULT OFF => the fixtures and their
 # call sites vanish.
 loginst = ["login"]
+# R77 M3 (THE TEST SUITE IS A COMMAND): run the registered desktop fixtures at registration, as before. Default OFF => they are deferred behind the `tests` shell verb. Kept in sync with arroyo and builder/src/main.rs.
+tests-at-boot = []
 # BT-BOND M1 / HOLOCRON SELFTESTS: `UNAOS_HCRONST=1` arms the store's two BOOT-TIME-WRITE selftests —
 # `fs::holocron::selftest_once` (writes then unlinks `/HCRON/HCRNTEST.DAT`) and
 # `drivers::ehci::btbond::selftest_once` (stages a fixture bond through the real flush, which creates

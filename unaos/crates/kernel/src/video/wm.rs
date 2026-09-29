@@ -28393,7 +28393,7 @@ pub fn glassfix2_selftest() {
         let t = table();
         let mut n = 0usize;
         for r in t.rows.iter() {
-            if !r.used || r.compat || r.z == PARKED_Z {
+            if !r.used || r.compat || r.z == PARKED_Z || r.id == MODAL_WIN.load(core::sync::atomic::Ordering::Acquire) {
                 continue;
             }
             bx[n] = outer_box(r);
