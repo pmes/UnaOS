@@ -1,5 +1,7 @@
 # USBNET2 — prep
 
+Status: M1..M3 rung 1 written, uncompiled
+
 ## The finding
 
 Flight 15 §2 "The dongle" (`docs/dev/evidence/rmbp-0915/flight15/FLIGHT15.md:27`):
@@ -132,3 +134,9 @@ serial_println!(
     xusb2pr_before, pssen_before, usb2prm_mask
 );
 ```
+
+## Written
+
+- M1+M2: `arch/x86_64/pci.rs` `enable_intel_xhci_ports` — one `:: PORTROUTE: xusb2pr= pssen= mask= switched=[..] ehci_only=[..] ::` line (post-flip values, ports 0..13) + `PortBits` Display helper at file tail.
+- M3 rung 1: `drivers/xhci/usbnet.rs` tail `ax_xport` (trait `AxTransport`, `identity`, `link`); `drivers/xhci/mod.rs` tail `XhciAx` adapter (bring-up not yet folded onto it); `drivers/ehci/mod.rs` tail `EhciAx` + `Controller::usbnet_ehci_front`, claimed at the enumeration site before `configure_hid` (vid 0b95 pid 1790). Bulk IN/OUT = stub witness.
+- Spec: `scripts/specs/x86-witness.spec` tail (REQUIRE PORTROUTE; OPTIONAL USBNET-EHCI PASS/stub; FORBID FAIL).

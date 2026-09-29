@@ -1711,3 +1711,12 @@ FORBID :: EHCI-HID: \[\d+\] STOP-NOTE interrupt endpoint halted .* kind=boot-mou
 # scripts/specs/ that is neither named in `arroyo`'s CODE nor carries a RUN-BY line above — and a
 # `RUN-BY: verb:` claim is cross-checked against `arroyo`, so this file cannot claim a runner it
 # does not have. "A replay spec no gate command runs is a silent landmine."
+
+# --- USBNET2 (RULED R72, "the port should not matter"): PORTROUTE is the read-only routing truth per USB2
+# --- root port (M1+M2) and prints on every x86 boot that reaches PORTSW-1 (default-on); the USBNET-EHCI lines
+# --- ride UNAOS_USBNET=1 AND the AX88179 (0b95:1790) enumerating on EHCI, so they are OPTIONAL (a boot
+# --- without the dongle never emits them) and the FAIL twin is FORBIDDEN.
+REQUIRE :: PORTROUTE: xusb2pr=0x[0-9a-f]+ pssen=0x[0-9a-f]+ mask=0x[0-9a-f]+ switched=\[[0-9,]*\] ehci_only=\[[0-9,]*\] ::
+OPTIONAL :: USBNET-EHCI: addr=\d+ mac=[0-9a-f:]{17} link=(up|down) -> PASS ::
+OPTIONAL :: USBNET-EHCI: datapath=stub next=bulk-in-out == witness ::
+FORBID :: USBNET-EHCI: .* -> FAIL ::

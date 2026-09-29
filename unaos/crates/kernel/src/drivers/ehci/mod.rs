@@ -4289,7 +4289,7 @@ impl Controller {
             }
             self.bring_up_hub(&t, depth);
         } else {
-            let hidcfg_t0 = crate::arch::now_cycles();
+            #[cfg(all(feature = "usbnet", feature = "ehcihid"))] { if vid == 0x0b95 && pid == 0x1790 { self.usbnet_ehci_front(&t); return; } } let hidcfg_t0 = crate::arch::now_cycles();
             self.configure_hid(&t);
             self.pace.add(EP_HIDCFG, hidcfg_t0);
         }
@@ -19324,3 +19324,67 @@ fn tpdrag_selftest() {
     );
 }
 
+
+// ── USBNET2 M3 rung 1 — the EHCI-side AX88179 front-end (identity only) ─────────────────────────
+// The AX88179 (0b95:1790) enumerated behind EHCI hub 1 port 2 on flight 15, where the xHCI USBNET never
+// sees it. This rung CLAIMS it at the enumeration site (before `configure_hid`), SET_CONFIGURATION, reads
+// the MAC and the physical link through the shared register logic (`usbnet::ax_xport`), and witnesses.
+// Control transfers only (EP0 through `control`); the bulk QH/toggle/ASE-stop discipline of `bt_acl_txn` is
+// the NEXT rung, stubbed by a witness. UNFLOWN.
+#[cfg(all(feature = "usbnet", feature = "ehcihid"))]
+struct EhciAx<'a> { c: &'a mut Controller, t: Target }
+#[cfg(all(feature = "usbnet", feature = "ehcihid"))]
+impl crate::drivers::xhci::usbnet::ax_xport::AxTransport for EhciAx<'_> {
+    fn reg_read(&mut self, reg: u16, out: &mut [u8]) -> bool {
+        if out.len() > 64 { return false; }
+        // SAFETY: main-loop enumeration context, the only EP0 user; data_buf is the driver's 256-byte EP0 buffer.
+        unsafe {
+            let n = out.len() as u16;
+            if self.c.control(&self.t, 0xC0, 0x01, reg, n, n, true).is_err() { return false; }
+            core::ptr::copy_nonoverlapping(self.c.data_buf as *const u8, out.as_mut_ptr(), out.len());
+        }
+        true
+    }
+    fn reg_write(&mut self, reg: u16, data: &[u8]) -> bool {
+        if data.len() > 64 { return false; }
+        // SAFETY: as reg_read; the payload is staged in data_buf before the OUT data stage.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), self.c.data_buf, data.len());
+            let n = data.len() as u16;
+            self.c.control(&self.t, 0x40, 0x01, reg, n, n, false).is_ok()
+        }
+    }
+    fn wait_ms(&mut self, ms: u64) {
+        let t0 = crate::arch::ms();
+        while crate::arch::ms().saturating_sub(t0) < ms { core::hint::spin_loop(); }
+    }
+}
+
+#[cfg(all(feature = "usbnet", feature = "ehcihid"))]
+impl Controller {
+    /// Claim an AX88179 that enumerated on this EHCI: identity + link, one witness, then the data-path stub.
+    /// Called from the enumeration site with the addressed target; the device is NOT handed to `configure_hid`.
+    unsafe fn usbnet_ehci_front(&mut self, t: &Target) {
+        use crate::drivers::xhci::usbnet::ax_xport;
+        let addr = t.addr;
+        // SET_CONFIGURATION 1 (the vendor configuration of the part).
+        if self.control(t, 0x00, 0x09, 1, 0, 0, false).is_err() {
+            serial_println!(":: USBNET-EHCI: addr={} stage=SET_CONFIGURATION -> FAIL ::", addr);
+            return;
+        }
+        let mut x = EhciAx { c: self, t: *t };
+        let mac = match ax_xport::identity(&mut x) {
+            Ok(m) => m,
+            Err(stage) => {
+                serial_println!(":: USBNET-EHCI: addr={} stage={} -> FAIL ::", addr, stage);
+                return;
+            }
+        };
+        let up = ax_xport::link(&mut x).map(|(u, _)| u).unwrap_or(false);
+        serial_println!(
+            ":: USBNET-EHCI: addr={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} -> PASS ::",
+            addr, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], if up { "up" } else { "down" }
+        );
+        serial_println!(":: USBNET-EHCI: datapath=stub next=bulk-in-out == witness ::");
+    }
+}
