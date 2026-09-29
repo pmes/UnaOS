@@ -1628,7 +1628,7 @@ static WITNESS_SNTP_DONE: AtomicBool = AtomicBool::new(false);
 static WITNESS_SNTP_TICKS: AtomicU32 = AtomicU32::new(0);
 /// Warm up past SOCK-6's witness (WARMUP 56) so the boot self-test, the ICMP/UDP/TCP/server witnesses, and
 /// the SOCK-5 DHCP lease all settle — the SNTP client then targets the leased router if DHCP replaced it.
-const WITNESS_SNTP_WARMUP: u32 = 72;
+const WITNESS_SNTP_WARMUP: u32 = 2; // SNTPDRV M3: was 72 service_net passes; now counts 5 s clock ticks (net_tick::service_tick), so ~10 s of settle
 
 /// SNTP-X86 boot witness: knob-on, one-shot — sync the shared clock from the live gateway over SNTP and
 /// emit the witness line. Runs on the BSP main loop from `service_net`, AFTER the NET_DEVICE guard drops
@@ -1968,4 +1968,9 @@ pub fn dns_x86_gate() {
         if pass { "PASS" } else { "FAIL" },
         w
     );
+}
+
+/// SNTPDRV M1: true once the SNTP-X86 one-shot has run to its verdict (`net_tick` witnesses on it).
+pub fn sntp_done() -> bool {
+    WITNESS_SNTP_DONE.load(Ordering::Relaxed)
 }

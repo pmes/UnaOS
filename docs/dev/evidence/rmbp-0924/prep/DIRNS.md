@@ -1,5 +1,7 @@
 # DIRNS — prep
 
+Status: M1..M2 written, uncompiled
+
 ## The finding
 
 LEDGER SO20: "`SYS_OPEN` has no directory namespace — every EL0 file is pinned to the volume
@@ -122,3 +124,8 @@ fn el0_walk_from<'p>(fs: &crate::fs::fat::FatFs, base: u32, path: &'p str)
 // let rel = open_locate_from(&fs, home, "RELHOME.TXT", O_CREAT, &mut created_rel);
 // let relhome_ok = matches!(rel, Ok(_)) && created_rel && !fs.locate_in_dir(0, "RELHOME.TXT").is_ok();
 ```
+
+## Written
+
+- M1: `unaos/scripts/specs/x86-login.spec` (x86 spelling) and `arm-login.spec` (aarch64 spelling incl. `relhome`) pin `:: DIRNS:`.
+- M2: `fs/vfs.rs` `el0_walk_from`, `el0_session_base`, `el0_dir_cluster`, `el0_locate_in`, `el0_locate_leaf` (el0_walk now seeds from the session home for non-absolute paths, falling back to root); aarch64 `dirns_witness` leg 6 `relhome`. x86 `dirns_witness` has no relhome leg (service task has no injectable base).

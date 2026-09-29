@@ -17456,3 +17456,14 @@ fn usbnet_dev_class(desc_type: u8, c: u8) -> bool { desc_type == 0x01 && usbnet:
 #[cfg(not(feature = "usbnet"))]
 #[inline(always)]
 fn usbnet_dev_class(_desc_type: u8, _c: u8) -> bool { false }
+
+/// USBNET2: the xHCI side of `usbnet::ax_xport::AxTransport` — the existing `ax_read`/`ax_write` behind the trait (the bring-up above still calls them directly; folding it onto `ax_xport::identity` is the follow-up so this rung moves no line).
+#[cfg(feature = "usbnet")]
+#[allow(dead_code)]
+pub struct XhciAx<'a> { pub c: &'a mut XhciController, pub slot: u8 }
+#[cfg(feature = "usbnet")]
+impl usbnet::ax_xport::AxTransport for XhciAx<'_> {
+    fn reg_read(&mut self, reg: u16, out: &mut [u8]) -> bool { self.c.ax_read(self.slot, reg, out) }
+    fn reg_write(&mut self, reg: u16, data: &[u8]) -> bool { self.c.ax_write(self.slot, reg, data) }
+    fn wait_ms(&mut self, ms: u64) { XhciController::ax_wait_ms(ms) }
+}

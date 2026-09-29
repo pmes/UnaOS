@@ -1247,3 +1247,80 @@ pub fn pointer_selftest() {
     user_input_set_active(saved_focus);
     wm::focus_reset();
 }
+
+// --- TERMWRAP — the fold from a flat run of cells to wrapped visual rows --------------------------
+//
+// The model above stays flat (a byte offset IS a cell column); the VIEW wraps at the window's column
+// count. `Console::cols_for` says how wide a row is; these three pure functions are the fold every
+// consumer (painter, layout, pointer) shares.
+
+/// Visual rows a run of `len` cells occupies at `cols` cells per row (an empty run is one row).
+pub fn visual_rows(len: usize, cols: usize) -> usize {
+    if cols == 0 {
+        return 1;
+    }
+    core::cmp::max(1, (len + cols - 1) / cols)
+}
+
+/// The `(visual_row, col)` of flat cell `offset` at `cols` cells per row.
+pub fn wrap_rc(offset: usize, cols: usize) -> (usize, usize) {
+    if cols == 0 {
+        return (0, offset);
+    }
+    (offset / cols, offset % cols)
+}
+
+/// Visual row `r` of `text` at `cols` characters per row (`""` past the end), cut on char boundaries.
+pub fn row_slice(text: &str, r: usize, cols: usize) -> &str {
+    let start = text.char_indices().nth(r * cols).map(|(i, _)| i).unwrap_or(text.len());
+    let end = text[start..].char_indices().nth(cols).map(|(i, _)| start + i).unwrap_or(text.len());
+    &text[start..end]
+}
+
+/// TERMWRAP fixture (no panel, no window): a `cols+40`-long edit line must take the rows the fold says
+/// (>= 2), its caret must sit at `wrap_rc(prompt+len)`, a `2*cols+5` history line must cost 3 rows and
+/// be cut into chunks that rejoin to the line, and a click on the edit line's second visual row must
+/// resolve to flat offset `cols + click_col - prompt` (M3). One line, once, per boot.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+pub fn termwrap_selftest() {
+    use alloc::string::String;
+    const W: usize = 640;
+    const H: usize = 480;
+    let m = crate::ui::Metrics::for_height(H);
+    let mut con = crate::console::Console::new();
+    con.mark_in_window();
+    let cols = con.cols_for(m, W);
+    let pc = con.prompt_cells();
+    let len = cols + 40;
+    con.current_input = String::new();
+    for i in 0..len {
+        con.current_input.push((b'a' + (i % 26) as u8) as char);
+    }
+    let rows = con.edit_rows_for(cols);
+    let (cr, cc) = wrap_rc(pc + len, cols);
+    let m1 = rows >= 2 && rows == visual_rows(pc + len + 1, cols) && cr < rows;
+    // M2 — a long history line costs 3 rows and its chunks rejoin.
+    let mut long = String::new();
+    for i in 0..(2 * cols + 5) {
+        long.push((b'A' + (i % 26) as u8) as char);
+    }
+    let mut joined = String::new();
+    for r in 0..visual_rows(long.len(), cols) {
+        joined.push_str(row_slice(&long, r, cols));
+    }
+    let m2 = visual_rows(long.len(), cols) == 3 && joined == long && row_slice(&long, 3, cols).is_empty();
+    // M3 — click the centre of cell 3 on the edit line's second visual row.
+    con.place_for_fixture("alpha");
+    let top = m.margin; // in_window: no chrome
+    let hist_rows = 1usize;
+    let lx = (m.margin + 3 * m.cell_w + m.cell_w / 2) as i32;
+    let ly = (top + (hist_rows + 1) * m.line_h + m.cell_h / 2) as i32;
+    let (row, col, _) = con.cell_at(m, W, H, lx, ly);
+    let want = (cols + 3).saturating_sub(pc);
+    let m3 = row == EDIT_ROW && col == core::cmp::min(want, len);
+    let ok = m1 && m2 && m3;
+    serial_println!(
+        ":: TERMWRAP: cols={} len={} rows={} caret=({},{}) -> {} ::",
+        cols, len, rows, cr, cc, if ok { "PASS" } else { "FAIL" }
+    );
+}

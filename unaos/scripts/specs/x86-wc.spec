@@ -641,7 +641,12 @@ FORBID \[status\] poll .* src=unresolved
 # the previous rotation with no writer in them, and the parent's own 72-row band holds the next one.
 # WINX-8 goes red beside it (`presents=1`) because the parent then blocks at the barrier — that is
 # the freeze half of the same mechanism, and it is why a present-only instrument could not see this.
-REQUIRE :: VUGART: frames=[1-9]\d* coherent=\d+ torn_rows=\d+ mixed_frames=0 -> PASS ::
+# VUGART2 (B221): the gate is the STREAK, not the count. Every metal FAIL in flights 14/15 was an isolated
+# one-frame barrier miss that healed the next frame (streak 1); the freeze shape is a REPEAT (streak >= 2).
+# mixed_frames / torn_rows / strand / score / severity / fps / ms ride the line as UNGATED diagnostics.
+# Go-red: PHASE.store(1, ..) reads streak_max=2 on the 2-frame QEMU population and trips the FORBID.
+REQUIRE :: VUGART: frames=[1-9]\d* coherent=\d+ torn_rows=\d+ mixed_frames=\d+ strand=\d+ score=\d+ streak_max=[01] severity=\d+ thr=streak<=1 fps=\d+ ms=\d+ -> PASS ::
+FORBID :: VUGART: .*streak_max=([2-9]|[1-9][0-9]+)
 FORBID :: VUGART: .* -> FAIL ::
 #
 # ── TSTETAP (2026-09-22), TAIL-APPENDED past VUGART ───────────────────────────────────────────────
@@ -765,6 +770,13 @@ FORBID :: MENUFIRST: .* :: SKIP ::
 # selection on the editable line (the rule TERMSEL deferred), `pc=` the PC table's four caret rows.
 REQUIRE :: TERMSEL2: legs=0x7ffff/0x7ffff hit=ok route=ok drag=ok up=ok dbl=ok sel=ok copy=ok cut_ro=ok esc=ok word=ok into_edit=ok edit=ok click_caret=ok arrows=ok insert=ok bs=ok replace=ok collapse=ok pc=ok -> PASS ::
 FORBID :: TERMSEL2: .* -> FAIL ::
+# ── TERMWRAP (rmbp-ledger B220): the shell's edit line and scrollback WRAP at the window's column count.
+# Fixture `termsel::termwrap_selftest` (panel-less Console): a cols+40 edit line takes >= 2 visual rows,
+# the caret sits at `wrap_rc(prompt+len)`, a 2*cols+5 history line costs 3 rows, and a click on the edit
+# line's second row resolves to the wrapped offset. FORBID rows=1 with a 3-digit len is the bug class.
+REQUIRE :: TERMWRAP: cols=\d+ len=\d+ rows=\d+ caret=\(\d+,\d+\) -> PASS ::
+FORBID :: TERMWRAP: .* -> FAIL ::
+FORBID :: TERMWRAP: cols=\d+ len=[0-9]{3,} rows=1 caret=
 #
 # --- BOOTSLOW (rmbp-ledger B201) — THE ROOT PASS RUNS BEFORE THE PROBES THAT DO NOT SERVE IT -----
 # Flight 12 (metal, `f12-boot1.log`): `:: SDHCBLK: registered internal SD card as block handle Sdhc`
@@ -861,3 +873,32 @@ FORBID \[fileview\] refuse
 # --- a right-click/long-press menu's Quit closes the owner and the tile leaves.
 REQUIRE :: DOCKRUN: tiles=\d+ running=\d+ pinned=\d+ raise=ok quit=ok menu_drawn=1 -> PASS ::
 FORBID :: DOCKRUN: .* -> FAIL ::
+# --- SHOTMOUNT (SO19, FSNS): a capture's bytes go THROUGH THE MOUNT TABLE (`mt.create`/`mt.write`, as
+# --- `shell::fs_write` does), so the file lands where `ls /` says the namespace is. The witness prints once per
+# --- capture at the verdict; `via=fat` means the table could not create the entry and the FAT-direct
+# --- fallback took it, which is the SO19 defect and is FORBIDDEN. A capture needs a user session + a writable
+# --- volume (`UNAOS_PRTSCRST=1 UNAOS_LOGIN=1 UNAOS_LOGINST=1`, plus the kepler knobs), so the REQUIRE below is
+# --- ARMED ONLY on that lane: uncomment it there (a REQUIRE on the plain lane would read silence as red).
+# REQUIRE :: SHOTMOUNT: via=vfs path=/home/una/Desktop/[A-Za-z0-9 ._-]+ bytes=[0-9]+ -> PASS ::
+FORBID :: SHOTMOUNT: via=fat
+FORBID :: SHOTMOUNT: .* -> FAIL
+# --- APPMENU (R73, arc (a)) — the ring-3 menu verb, exercised by the witness-gated fixture in
+# --- arch/x86_64/syscall.rs (`appmenu_fixture`, called from the head of `busx86_stamp_check`): a
+# --- kernel-minted owner (scratch row 6 -> owner 7) publishes a 3-item tree through the production
+# --- `busx_msend_for` path, reads it back through GET, has a 65-item tree and a caller-stamped
+# --- principal refused with the registry unchanged, takes a pick in ITS OWN ring while every other
+# --- ring stays quiet (ledger leg 1: identity, not focus), and is reaped (leg 4). Runs on this lane
+# --- because it needs `witness` + `wc`; the click-driven pick (`[menubar] pick owner= item=`) needs a
+# --- real ring-3 publisher and is pinned only negatively (never `delivered=false`).
+REQUIRE :: APPMENU: verb=publish owner=7 items=3 depth=2 bar=\d+/\d+ -> PASS ::
+REQUIRE :: APPMENU: owner=7 items=3 published=1 -> PASS ::
+REQUIRE :: APPMENU: readback owner=7 items=3 match=true -> PASS ::
+REQUIRE :: APPMENU: verb=publish owner=7 reason=items-cap -> REFUSED ::
+REQUIRE :: APPMENU: refuse items=65 principal=caller registry_unchanged=true -> PASS ::
+REQUIRE :: APPMENU: owner=7 items=3 pick_to=owner others_quiet=true -> PASS ::
+REQUIRE :: APPMENU: owner=7 closed reaped=true -> PASS ::
+REQUIRE :: APPMENU: owner=7 reaped empty=true -> PASS ::
+FORBID :: APPMENU: .* -> FAIL ::
+FORBID :: APPMENU: verb=publish owner=[0-9]+ items=(6[5-9]|[7-9][0-9]|[1-9][0-9][0-9]) .* -> PASS ::
+FORBID \[winmenu\] publish owner=0 
+FORBID \[menubar\] pick owner=[0-9]+ item=[0-9]+ delivered=false

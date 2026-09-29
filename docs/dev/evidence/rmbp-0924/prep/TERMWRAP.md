@@ -1,5 +1,7 @@
 # TERMWRAP — prep
 
+Status: M1..M3 written, uncompiled
+
 ## The finding
 
 Flight 14: "no word wrap in terminal" — the shell window's edit line (and scrollback) does not
@@ -127,3 +129,11 @@ fn draw_wrapped(&self, pal: &mut TargetPal, x0: usize, mut y: usize, text: &str,
     y
 }
 ```
+
+## Written
+
+- `unaos/crates/kernel/src/video/termsel.rs` (tail): `visual_rows`, `wrap_rc`, `row_slice`, fixture `termwrap_selftest` (prints the witness).
+- `unaos/crates/kernel/src/console.rs`: new field `last_edit_rows`; `draw_prompt_line` (prompt+input as one wrapped run, caret via `wrap_rc`), `draw` (visual rows per entry), `draw_input_line` (multi-row clear, full repaint when the edit row count changes), `prompt_y`, `cell_at` (folds pixel to visual row/col first), `draw_row_band`; tail impl: `cols_for`, `edit_rows_for`, `layout_for`, `draw_band_span`.
+- `unaos/crates/kernel/src/arch/x86_64/syscall.rs:17519`: fixture chained after `pointer_selftest` (same line).
+- `unaos/scripts/specs/x86-wc.spec`: REQUIRE + 2 FORBID for `:: TERMWRAP: ... ::`.
+- Design: the edit line wraps as prompt+input (one flat run of cells) with a reserved caret cell; offsets in `LineSel` stay flat; `cell_at` subtracts the prompt width. Resize reflow is free (cols recomputed per draw).

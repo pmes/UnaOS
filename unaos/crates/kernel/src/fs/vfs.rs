@@ -2943,9 +2943,66 @@ fn el0_walk<'p>(
     fs: &crate::fs::fat::FatFs,
     path: &'p str,
 ) -> Result<(u32, &'p str), El0LocateError> {
+    el0_walk_from(fs, path, el0_session_base(fs)) // DIRNS M2: a relative path starts at the session's home (0 = root when there is none)
+}
+
+/// DIRNS M2: the first cluster of the open session's `/home/<user>` on `fs`, or `0` (the volume root)
+/// when there is no session, no `login` store, or the home directory is not on this volume yet — the
+/// fallback is the pre-M2 root-only behaviour, so an image with no session resolves exactly as before.
+pub fn el0_session_base(fs: &crate::fs::fat::FatFs) -> u32 {
+    #[cfg(feature = "login")]
+    {
+        let mut nb = [0u8; crate::fs::users::NAME_MAX];
+        let mut hb = [0u8; crate::fs::users::HOME_MAX];
+        if let Some(n) = crate::fs::users::whoami(&mut nb) {
+            if let Some(h) = crate::fs::users::home_of(&nb[..n], &mut hb) {
+                if let Ok(hp) = core::str::from_utf8(&hb[..h]) {
+                    return el0_dir_cluster(fs, hp).unwrap_or(0);
+                }
+            }
+        }
+    }
+    let _ = fs;
+    0
+}
+
+/// DIRNS M2: the first cluster of the directory `path` names, walked downward from the root
+/// (`..` refused as everywhere in this namespace). `None` when any component is missing or a file.
+pub fn el0_dir_cluster(fs: &crate::fs::fat::FatFs, path: &str) -> Option<u32> {
+    let mut parent: u32 = 0;
+    for c in path.split('/').filter(|c| !c.is_empty()) {
+        if c == ".." {
+            return None;
+        }
+        match fs.locate_in_dir(parent, c) {
+            Ok((de, _, _)) if de.is_dir => parent = de.first_cluster(),
+            _ => return None,
+        }
+    }
+    Some(parent)
+}
+
+/// DIRNS M2: [`el0_locate`] with an explicit base directory for a NON-absolute `path` (an absolute
+/// one ignores `base`). The witness's `relhome` leg drives this without needing a live session.
+pub fn el0_locate_in(
+    fs: &crate::fs::fat::FatFs,
+    base: u32,
+    path: &str,
+    create: bool,
+    created: &mut bool,
+) -> Result<(crate::fs::fat::DirEntry, u64, usize), El0LocateError> {
+    let (parent, leaf) = el0_walk_from(fs, path, base)?;
+    el0_locate_leaf(fs, parent, leaf, create, created)
+}
+
+fn el0_walk_from<'p>(
+    fs: &crate::fs::fat::FatFs,
+    path: &'p str,
+    base: u32,
+) -> Result<(u32, &'p str), El0LocateError> {
     use crate::fs::fat::FatError;
     use core::sync::atomic::Ordering;
-    let mut parent: u32 = 0; // the volume root
+    let mut parent: u32 = if path.starts_with('/') { 0 } else { base }; // the volume root, or the home for a relative path
     let mut it = path.split('/').filter(|c| !c.is_empty()).peekable();
     let mut leaf: &str = "";
     while let Some(c) = it.next() {
@@ -2996,8 +3053,20 @@ pub fn el0_locate(
     create: bool,
     created: &mut bool,
 ) -> Result<(crate::fs::fat::DirEntry, u64, usize), El0LocateError> {
-    use crate::fs::fat::FatError;
     let (parent, leaf) = el0_walk(fs, path)?;
+    el0_locate_leaf(fs, parent, leaf, create, created)
+}
+
+/// DIRNS M2: the leaf half of [`el0_locate`] (kernel-owned refusal, lookup, optional create), split
+/// out so the base-explicit entry shares it.
+fn el0_locate_leaf(
+    fs: &crate::fs::fat::FatFs,
+    parent: u32,
+    leaf: &str,
+    create: bool,
+    created: &mut bool,
+) -> Result<(crate::fs::fat::DirEntry, u64, usize), El0LocateError> {
+    use crate::fs::fat::FatError;
     // SECLOGIN M4 (VFSOWNED) — the kernel's credential file is unreachable through ANY EL0 open, on
     // BOTH arches, at the one resolver they share (B169; multiuser.md §6; `login`-gated as `fs::users` is).
     #[cfg(feature = "login")]

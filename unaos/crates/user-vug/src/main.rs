@@ -1221,6 +1221,18 @@ static A_MIXED: AtomicU32 = AtomicU32::new(0);
 /// barrier eventually completes and the frame does reach a present after all.
 #[cfg(target_arch = "x86_64")]
 static A_STRAND_GEN: AtomicU32 = AtomicU32::new(u32::MAX);
+#[cfg(target_arch = "x86_64")]
+static A_STRAND_MIXED: AtomicU32 = AtomicU32::new(0); // art_strand's genuine barrier misses
+#[cfg(target_arch = "x86_64")]
+static A_SCORE_MIXED: AtomicU32 = AtomicU32::new(0); // art_score's present-time races
+#[cfg(target_arch = "x86_64")]
+static A_STREAK: AtomicU32 = AtomicU32::new(0); // current run of consecutive mixed frames
+#[cfg(target_arch = "x86_64")]
+static A_STREAK_MAX: AtomicU32 = AtomicU32::new(0); // longest run
+#[cfg(target_arch = "x86_64")]
+static A_MAX_TORN: AtomicU32 = AtomicU32::new(0); // worst single-frame torn rows (severity)
+#[cfg(target_arch = "x86_64")]
+static A_T0: AtomicU32 = AtomicU32::new(0); // tick of the first scored frame (fps clock, 0 = unset)
 
 /// VUGART: rows in each band, so `torn_rows` is a row count and not a band count.
 #[cfg(target_arch = "x86_64")]
@@ -1353,11 +1365,21 @@ fn art_strand(g: u32, passes: u32) {
     A_FRAMES.fetch_add(1, Ordering::Relaxed);
     A_MIXED.fetch_add(1, Ordering::Relaxed);
     A_TORN.fetch_add(bad, Ordering::Relaxed);
+    A_STRAND_MIXED.fetch_add(1, Ordering::Relaxed);
+    art_streak(bad);
     art_emit();
 }
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
 fn art_strand(_g: u32, _passes: u32) {}
+
+/// VUGART: one mixed frame — extend the streak (latching its max) and latch the worst frame's rows.
+#[cfg(target_arch = "x86_64")]
+fn art_streak(bad: u32) {
+    let st = A_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+    A_STREAK_MAX.fetch_max(st, Ordering::Relaxed);
+    A_MAX_TORN.fetch_max(bad, Ordering::Relaxed);
+}
 
 /// VUGART: score the surface the parent is about to present. Call site: immediately before the
 /// present, after every writer this frame could legitimately have.
@@ -1373,8 +1395,14 @@ fn art_score(g: u32) {
     if bad_rows != 0 || cl != seen {
         A_MIXED.fetch_add(1, Ordering::Relaxed);
         A_TORN.fetch_add(bad_rows, Ordering::Relaxed);
+        A_SCORE_MIXED.fetch_add(1, Ordering::Relaxed);
+        art_streak(bad_rows);
     } else {
         A_COHERENT.fetch_add(1, Ordering::Relaxed);
+        A_STREAK.store(0, Ordering::Relaxed); // a coherent frame ends the streak
+    }
+    if A_T0.load(Ordering::Relaxed) == 0 {
+        A_T0.store((getinfo_ticks() as u32).max(1), Ordering::Relaxed); // fps clock starts at the first scored frame
     }
     if n.is_power_of_two() || n % VUGART_PERIOD == 0 {
         art_emit();
@@ -1389,17 +1417,34 @@ fn art_score(_g: u32) {}
 /// intermittently on exactly the loaded box the defect needs.
 #[cfg(target_arch = "x86_64")]
 fn art_emit() {
-    let mixed = A_MIXED.load(Ordering::Relaxed);
+    let streak_max = A_STREAK_MAX.load(Ordering::Relaxed);
+    let frames = A_FRAMES.load(Ordering::Relaxed);
+    let t0 = A_T0.load(Ordering::Relaxed) as u64;
+    let dt = if t0 != 0 { (getinfo_ticks() as u32 as u64).wrapping_sub(t0) & 0xFFFF_FFFF } else { 0 };
+    let ms = dt * 1000 / (TICK_HZ as u64).max(1);
+    let fps = if ms != 0 { frames as u64 * 1000 / ms } else { 0 };
     let mut buf = Buf::new();
     buf.put(b":: VUGART: frames=");
-    buf.put_dec(A_FRAMES.load(Ordering::Relaxed));
+    buf.put_dec(frames);
     buf.put(b" coherent=");
     buf.put_dec(A_COHERENT.load(Ordering::Relaxed));
     buf.put(b" torn_rows=");
     buf.put_dec(A_TORN.load(Ordering::Relaxed));
     buf.put(b" mixed_frames=");
-    buf.put_dec(mixed);
-    buf.put(if mixed == 0 {
+    buf.put_dec(A_MIXED.load(Ordering::Relaxed));
+    buf.put(b" strand=");
+    buf.put_dec(A_STRAND_MIXED.load(Ordering::Relaxed));
+    buf.put(b" score=");
+    buf.put_dec(A_SCORE_MIXED.load(Ordering::Relaxed));
+    buf.put(b" streak_max=");
+    buf.put_dec(streak_max);
+    buf.put(b" severity=");
+    buf.put_dec(A_MAX_TORN.load(Ordering::Relaxed));
+    buf.put(b" thr=streak<=1 fps="); // the gate bound: one isolated self-healing miss passes, a repeat fails
+    buf.put_dec(fps as u32);
+    buf.put(b" ms=");
+    buf.put_dec(ms as u32);
+    buf.put(if streak_max <= 1 {
         b" -> PASS ::\n" as &[u8]
     } else {
         b" -> FAIL ::\n"

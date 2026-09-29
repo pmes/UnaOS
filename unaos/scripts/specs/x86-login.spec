@@ -456,3 +456,8 @@ FORBID :: NOTICE: .* -> FAIL
 # SCREENLOCK: lock without ending the session — name read-only, wrong refused, right unlocks, furniture untouched.
 REQUIRE :: SCREENLOCK: user=una locked=1 windows_kept=\d+ wrong=refused unlock=ok furniture_reignited=0 -> PASS ::
 FORBID :: SCREENLOCK: .* -> FAIL
+
+# --- DIRNS M1 (SO20, FSNS): the x86 path-namespace witness, pinned. `dirns_witness` (arch/x86_64/syscall.rs)
+# was in tree and unpinned, so a regression failed silently. Root-pinned `el0_walk` flips `nested` (root_alias).
+REQUIRE :: DIRNS: abs=ok nested=ok ocreat=ok escape=refused collapse=ok acl=n/a\(SO35\) .* -> PASS ::
+FORBID :: DIRNS: .* -> FAIL

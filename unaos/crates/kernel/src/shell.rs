@@ -1071,7 +1071,13 @@ fn fs_mv(console: &mut Console, src: &str, dst: &str, force: bool) {
             Err(e) => return vfs_fail(console, "mv", &dpath, e),
         }
     }
-    match mt.rename(&spath, &dpath, SHELL_PRINCIPAL) {
+    let lfn_before = crate::fs::fat::sector_write_count(); // LFNMV2 M1/M2
+    let lfn_r = mt.rename(&spath, &dpath, SHELL_PRINCIPAL);
+    if crate::fs::fat::is_long_name(dpath.rsplit('/').next().unwrap_or("")) {
+        // LFNMV2 M1: always on, no `witness` gate — the operator's own `mv` prints what reached the device.
+        serial_println!("[fs] mv {} -> {} lfn=1 ok={} sectors_written={}", spath, dpath, lfn_r.is_ok(), crate::fs::fat::sector_write_count().wrapping_sub(lfn_before));
+    }
+    match lfn_r {
         Ok(()) => vfs_say(console, &alloc::format!("moved {} -> {}", spath, dpath)),
         Err(VfsError::Backend("exists")) =>
             console.println(&alloc::format!("mv: {}: file exists (-EEXIST)", dpath)),

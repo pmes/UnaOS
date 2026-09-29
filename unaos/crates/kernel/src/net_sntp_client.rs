@@ -464,3 +464,8 @@ pub fn fixture() -> Result<(), &'static str> {
         Err("SNTP-NET6 fixture: one or more legs failed (see the [sntp6] lines on serial)")
     }
 }
+
+/// SNTPDRV M1: true once the boot's one attempt sequence has run (or stood down) — `net_tick` witnesses on it.
+pub fn attempted() -> bool {
+    SYNC_ATTEMPTED.load(Ordering::Relaxed)
+}

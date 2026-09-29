@@ -24808,6 +24808,9 @@ pub fn home_acl_fixture(path: &str) -> bool {
 const DIRNS_DIR: &str = "DIRNSD";
 #[cfg(feature = "witness")]
 const DIRNS_SUB: &str = "SUB";
+/// DIRNS M2: the fixture's SUB directory as an absolute path — the relhome leg's base.
+#[cfg(feature = "witness")]
+const DIRNS_SUB_ABS: &str = "/DIRNSD/SUB";
 #[cfg(feature = "witness")]
 const DIRNS_ROOTFILE: &str = "/DIRNS.TXT";
 #[cfg(feature = "witness")]
@@ -24949,15 +24952,36 @@ pub fn dirns_witness() {
         _ => false,
     };
 
+    // --- leg 6: relhome — a NON-absolute path resolves under the session home, not the root. ----
+    // DIRNS M2. Drives `el0_locate_in` with the fixture's own directory as the base (no live session
+    // needed): the file must land INSIDE that directory and must NOT appear at the volume root.
+    let mut c6 = false;
+    let relhome_ok = match crate::fs::vfs::el0_dir_cluster(&fs, DIRNS_SUB_ABS) {
+        Some(base) if base != 0 => {
+            let made = crate::fs::vfs::el0_locate_in(&fs, base, "REL.TXT", true, &mut c6).is_ok() && c6;
+            let inside = fs.locate_in_dir(base, "REL.TXT").is_ok();
+            let at_root = fs.locate_in_dir(0, "REL.TXT").is_ok();
+            let abs_ignores = matches!(crate::fs::vfs::el0_locate_in(&fs, base, DIRNS_ROOTFILE, false, &mut c6), Ok(_));
+            made && inside && !at_root && abs_ignores
+        }
+        _ => false,
+    };
+    let mut c7 = false;
+    if let Ok((de, lba, off)) = crate::fs::vfs::el0_locate(&fs, "/DIRNSD/SUB/REL.TXT", false, &mut c7) {
+        owned_clear(lba, off as u32);
+        let _ = fs.delete_located(lba, off, de.first_cluster()); // must go before the scrub, or SUB is non-empty and stays
+    }
+
     dirns_scrub(&fs);
-    let pass = abs_ok && nested_ok && escape_refused && acl_ok && root_ok;
+    let pass = abs_ok && nested_ok && escape_refused && acl_ok && root_ok && relhome_ok;
     serial_println!(
-        ":: DIRNS: abs={} nested={} escape={} acl={} root={} (wrote={} read={} root_alias={} esc={}->{}) -> {} ::",
+        ":: DIRNS: abs={} nested={} escape={} acl={} root={} relhome={} (wrote={} read={} root_alias={} esc={}->{}) -> {} ::",
         if abs_ok { "ok" } else { "FAIL" },
         if nested_ok { "ok" } else { "FAIL" },
         if escape_refused { "refused" } else { "FAIL" },
         if acl_ok { "refused" } else { "FAIL" },
         if root_ok { "ok" } else { "FAIL" },
+        if relhome_ok { "ok" } else { "FAIL" },
         wrote,
         body.len(),
         root_alias,

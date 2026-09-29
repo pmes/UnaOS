@@ -1023,8 +1023,20 @@ struct Job {
     /// value means an arrival has republished the handle since — a replug, or another disk on a
     /// recycled xHCI slot — and this job's parked `FatFs` addresses a volume that is no longer there.
     vol_gen: u64,
+    /// SHOTMOUNT (SO19): the capture's destination as the MOUNT TABLE spells it (`/home/una/Desktop/<name>`),
+    /// and the table the bytes go through once the entry is created there. `None` = the FAT-direct
+    /// fallback took the write (the mount table could not create the entry), which the witness names
+    /// `via=fat` and the spec forbids.
+    vpath: String,
+    routed: Option<RoutedMt>,
     phase: Phase,
 }
+
+/// SHOTMOUNT: a [`crate::fs::vfs::MountTable`] parked in [`JOB`] between slices.
+struct RoutedMt(crate::fs::vfs::MountTable);
+// SAFETY: the table is created, used and dropped only while the `JOB` lock is held (one capture in
+// flight, [`Refusal::InFlight`] refuses a second), so it is never shared between contexts.
+unsafe impl Send for RoutedMt {}
 
 /// PRTSCR-ASYNC — which half of the capture the next unit of work belongs to. Strictly sequential:
 /// the PNG cannot be written before `finish` patches the IDAT length and appends `IEND`, so the
@@ -1115,6 +1127,7 @@ impl Job {
             return Err(Refusal::Encode(PngError::OutOfMemory, width, height, need));
         }
 
+        let vpath = alloc::format!("{}/{}/{}", plan.home_str(), DIR_CAPTURE.0, name);
         Ok(Job {
             fs,
             panel,
@@ -1127,6 +1140,8 @@ impl Job {
             slices: 0,
             usb_backed,
             vol_gen,
+            vpath,
+            routed: None,
             phase: Phase::Encode { enc, row, y: 0 },
         })
     }
@@ -1227,10 +1242,23 @@ impl Job {
                 // four-step recipe `shell::fs_write` uses, minus the truncate branch, which cannot
                 // apply — `next_free_name` only ever returns a name that directory does not hold.
                 // PRTSCR-HOME: into `dir_cluster`, the user's own folder, where this was `0`.
-                let dc = self.dir_cluster;
-                let (dir_lba, dir_off) = match busy_retry(|| self.fs.create_in_dir(dc, &self.name, 0x20)) {
-                    Ok((_, lba, off)) => (lba, off),
-                    Err(e) => return Err(Refusal::Fat(vol_id(&self.fs), "create", e)),
+                // SHOTMOUNT (SO19): the entry is created THROUGH THE MOUNT TABLE, as `shell::fs_write`
+                // does, so the capture lands where `ls /` says the namespace is. If the table cannot
+                // create it (no route for the path), the FAT-direct create below is the fallback and
+                // the witness says `via=fat` — never silently.
+                let mt = crate::shell::vfs_mount_table();
+                let vfs_ok = mt
+                    .create(&self.vpath, crate::fs::vfs::NodeKind::File, crate::fs::vfs::KERNEL_PRINCIPAL)
+                    .is_ok();
+                let (dir_lba, dir_off) = if vfs_ok {
+                    self.routed = Some(RoutedMt(mt));
+                    (0u64, 0usize)
+                } else {
+                    let dc = self.dir_cluster;
+                    match busy_retry(|| self.fs.create_in_dir(dc, &self.name, 0x20)) {
+                        Ok((_, lba, off)) => (lba, off),
+                        Err(e) => return Err(Refusal::Fat(vol_id(&self.fs), "create", e)),
+                    }
                 };
                 Ok(Step::More(Phase::Write {
                     bytes,
@@ -1261,11 +1289,18 @@ impl Job {
                 let take = core::cmp::min(SLICE_WRITE, bytes.len() - done);
                 let at = done;
                 let chunk = &bytes[at..at + take];
-                let (wrote, new_size, new_first) =
+                let (wrote, new_size, new_first) = if let Some(r) = self.routed.as_ref() {
+                    // SHOTMOUNT: the slice through the table (`mt.write` at the running offset).
+                    match r.0.write(&self.vpath, at as u64, chunk, crate::fs::vfs::KERNEL_PRINCIPAL) {
+                        Ok(n) => (n, (at + n) as u32, first),
+                        Err(_) => return Err(Refusal::Fat(vol_id(&self.fs), "write", FatError::Io)),
+                    }
+                } else {
                     match busy_retry(|| self.fs.write_grow(first, size, dir_lba, dir_off, at as u32, chunk)) {
                         Ok(t) => t,
                         Err(e) => return Err(Refusal::Fat(vol_id(&self.fs), "write", e)),
-                    };
+                    }
+                };
                 if wrote != take {
                     return Err(Refusal::Short(
                         vol_id(&self.fs),
@@ -1280,6 +1315,15 @@ impl Job {
                 if done < bytes.len() {
                     Ok(Step::More(Phase::Write { bytes, done, first, size, dir_lba, dir_off }))
                 } else {
+                    // SHOTMOUNT (SO19): the route witness, once per capture, at the verdict.
+                    let via_vfs = self.routed.take().is_some();
+                    serial_println!(
+                        ":: SHOTMOUNT: via={} path={} bytes={} -> {} ::",
+                        if via_vfs { "vfs" } else { "fat" },
+                        self.vpath,
+                        done,
+                        if via_vfs { "PASS" } else { "FAIL" }
+                    );
                     Ok(Step::Done(Shot {
                         name: core::mem::take(&mut self.name),
                         width: self.width,
