@@ -1990,7 +1990,7 @@ fn pop_event() -> Option<Event> {
         // above the router drain's own `[uvug9]` totals names a second consumer as the thief.
         EVQ_POP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
-    ev
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let ev = match ev { Some(e) if crate::video::dimidle::gate(e) => None, o => o }; ev // DIMIDLE — idle clock + waking-key swallow at the one shared drain (same-line fold)
 }
 
 /// UVUG-10 — the RE-CIRCULATION seam: pop / re-push an event WITHOUT touching the accounting counters.

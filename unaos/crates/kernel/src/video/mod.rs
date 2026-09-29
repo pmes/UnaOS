@@ -839,7 +839,7 @@ pub(crate) fn panel_refuse_term() -> Option<&'static str> {
     } else if crate::serial_ring::in_panic_mode() {
         Some("serial-panic-mode")
     } else {
-        None
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if crate::video::dimidle::blanked() { return Some("idle-blank"); } None // DIMIDLE — the idle blank is a third refusal term (same-line fold)
     }
 }
 
@@ -1139,3 +1139,7 @@ impl<T> Drop for HeldGuard<'_, T> {
         self.lock.tag.store(0, Ordering::Relaxed);
     }
 }
+
+// DIMIDLE — idle screen blanking (docs/dev/evidence/rmbp-0929/DIMIDLE.md). Both desktops.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod dimidle;
