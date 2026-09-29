@@ -1694,7 +1694,7 @@ pub fn login_press_fixture(name: &[u8], password: &[u8]) -> bool {
     }
     let ok = behind_named
         && !down_swallowed
-        && !down_routed
+        && down_routed // LOGINZ: the screen is topmost, so a press at the stand-in's spot routes to the screen
         && up
         && up_at_window
         && up_at_corner

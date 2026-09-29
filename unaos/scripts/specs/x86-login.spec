@@ -61,9 +61,9 @@ FORBID :: LOGIN-IGNITION: .* -> FAIL
 # names it, proves `press_route` DECLINES that point with the screen DOWN — the control, without
 # which a gate that consumed everything would be indistinguishable from this one — then proves it
 # CONSUMES the same point and `(0,0)` with the screen UP while the row is still hit-testable.
-# `screen_down_routed=false` is the term that BITES and it is pinned LITERALLY: it is the control,
+# `screen_down_routed=true` (LOGINZ: the screen is topmost) is the term that BITES and it is pinned LITERALLY: it is the control,
 # and a `true` there is a gate that has become a constant.
-REQUIRE :: LOGIN-PRESS: win=\d+ at=\(\d+,\d+\) behind_named=true screen_down_routed=false screen_up=true up_at_window=true up_at_corner=true gone_after_logout=true logged_in=true after_login_routed=false -> PASS ::
+REQUIRE :: LOGIN-PRESS: win=\d+ at=\(\d+,\d+\) behind_named=true screen_down_routed=true screen_up=true up_at_window=true up_at_corner=true gone_after_logout=true logged_in=true after_login_routed=false -> PASS ::
 FORBID :: LOGIN-PRESS: .* -> FAIL
 # A SKIP is a panel below 256x256 or `wm::create` declining. On this gate (QEMU 1280x800, one 64x64
 # fixture row) neither is honest — `x86-wc.spec`'s standing DMGOVLP/MENUDROP rule — so a SKIP means
