@@ -2471,18 +2471,24 @@ pub fn login_adduser_fixture() {
 /// R63 — refuse the ROOT session's Log Out when it would strand the person at a screen with nobody to
 /// log in as. Prints the refusal and answers `true`; `false` (and silent) for every other session.
 pub fn root_logout_refused() -> bool {
+    root_logout_reason().is_some()
+}
+
+/// LOGOUTUI (R70): [`root_logout_refused`]'s body with the reason kept, so the screen can say WHY.
+/// `Some("storage-not-up" | "no-users")` (and prints the refusal) for the root session; `None` otherwise.
+pub fn root_logout_reason() -> Option<&'static str> {
     if !root_session() {
-        return false;
+        return None;
     }
     let reason = if !load_once() {
         "storage-not-up"
     } else if user_count() == 0 {
         "no-users"
     } else {
-        return false;
+        return None;
     };
     serial_println!("[users] logout REFUSED session=root reason={} (R63: `adduser <name>` first — root's Log Out would leave a login screen with nobody to log in as)", reason);
-    true
+    Some(reason)
 }
 
 /// LOGIN13 M3 — the shell's `logout`: close the open session (the root session included) and, where
@@ -2500,7 +2506,9 @@ pub fn log_out_to_screen(out: &mut [u8; NAME_MAX]) -> Result<usize, &'static str
             None => return Err("no-session"),
         }
     };
-    if root_logout_refused() {
+    if let Some(_reason) = root_logout_reason() {
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+        crate::video::crystal::login::refused_alert(_reason); // LOGOUTUI (R70): the shell's route says why on the glass too
         return Err("refused");
     }
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]

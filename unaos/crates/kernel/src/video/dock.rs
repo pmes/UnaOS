@@ -568,6 +568,15 @@ pub fn take_launch(app: PinnedApp) -> bool {
     LAUNCH_OWED.fetch_and(!app.bit(), Ordering::AcqRel) & app.bit() != 0
 }
 
+/// LOGOUTDESK (R69): after a Log Out swept every row, the next login posts the console's and the shell's
+/// launches — the SAME latches a pin-tile press posts, drained by the render bodies (`console_launch_service`;
+/// the shell's owning body, which clears its stale tuple when the row is gone and mints on `take_launch`).
+pub fn relaunch_furniture() {
+    post_launch(PinnedApp::Console);
+    post_launch(PinnedApp::Shell);
+    serial_println!("[dock] furniture relaunch posted console+shell (LOGOUTDESK/R69: a fresh session gets a fresh desktop)");
+}
+
 /// SHELLPIN — append the PERMANENT shell tile to a scanned model, iff no live row already carries
 /// `wm::KERNEL_OWNER_DESKTOP` (one live shell window max — a live shell's REAL tile is its raise
 /// route and a second tile would be a second shell). Returns the new count. Applied by every reader

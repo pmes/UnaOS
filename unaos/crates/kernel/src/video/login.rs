@@ -160,6 +160,8 @@ enum State {
     Session,
     /// LOGIN14: the set-password form is up for `Form::name` (root's at boot, a user's at first login).
     SetPw,
+    /// LOGOUTUI (R70): a refused Log Out says why — one line of `Form::message` and an OK, the set-password screen's shape.
+    Alert,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -250,6 +252,8 @@ enum Ctl {
     /// A user's row: the screen SHOWS who lives on this machine (the Mac model), and a press picks
     /// that name into the field and moves to the password. The `usize` is the store's row index.
     User(usize),
+    /// LOGOUTUI: the alert's OK — a press IS [`alert_ok`], the same call Enter and Esc make.
+    AlertOk,
 }
 
 const LX: usize = 24;
@@ -297,7 +301,7 @@ fn ctl_rect(c: Ctl, setpw: bool) -> (usize, usize, usize, usize) {
         (Ctl::PwField, false) => (FIELD_X, 112, FIELD_W, FIELD_H),
         (Ctl::PwField, true) => (FIELD_X, 76, FIELD_W, FIELD_H),
         (Ctl::Pw2Field, true) => (FIELD_X, 112, FIELD_W, FIELD_H),
-        (Ctl::Button, _) => (W - LX - BTN_W, 150, BTN_W, BTN_H),
+        (Ctl::Button, _) | (Ctl::AlertOk, _) => (W - LX - BTN_W, 150, BTN_W, BTN_H),
         _ => (0, 0, 0, 0),
     }
 }
@@ -335,6 +339,7 @@ fn ctl_name(c: Option<Ctl>) -> &'static str {
         Some(Ctl::Button) => "button",
         Some(Ctl::Pw2Field) => "retype-field",
         Some(Ctl::User(_)) => "user-row",
+        Some(Ctl::AlertOk) => "alert-ok",
         None => "none",
     }
 }
@@ -440,6 +445,20 @@ fn repaint() {
     let px: &mut [u32] = unsafe { &mut (*core::ptr::addr_of_mut!(SURF)).0 };
     fill(px, 0, 0, W, H, theme::CHROME_FACE);
     rect(px, 2, 2, W - 4, H - 4, theme::FRAME_LINE);
+    if f.state == State::Alert {
+        // LOGOUTUI (R70): the alert — "Log Out", one line of the reason, OK.
+        text(px, LX, 14, b"Log Out", theme::CONTENT_TEXT);
+        fill(px, LX, 36, W - 2 * LX, 2, theme::FRAME_LINE);
+        text(px, LX, 76, f.message.as_bytes(), theme::ACCENT);
+        button(px, Ctl::AlertOk, b"OK", true, false);
+        text(px, LX, 186, b"Enter, Esc or OK", theme::TITLE_TEXT_INACTIVE);
+        drop(f);
+        let id = WIN.load(Ordering::Relaxed);
+        if id != wm::WIN_NONE {
+            let _ = wm::present(id);
+        }
+        return;
+    }
     if f.state == State::SetPw {
         // LOGIN14: the set-password form — "Set a password for <name>", the password, its retype, Set.
         let mut title = [0u8; 19 + users::NAME_MAX];
@@ -555,7 +574,7 @@ pub fn open_set_password(name: &[u8], login_after: bool) {
 fn open_as(state: State) {
     {
         let mut f = FORM.lock();
-        if f.state == State::Open || f.state == State::SetPw {
+        if f.state == State::Open || f.state == State::SetPw || f.state == State::Alert {
             return;
         }
         f.state = state;
@@ -596,7 +615,7 @@ fn open_as(state: State) {
     // argument gives the login screen a close box and gives a one-click route to a machine with no
     // screen, no console and a swallowed keyboard. The fixture's CLOSE leg measures it every witness
     // boot, against a control row that differs only here.
-    let title: &[u8] = if state == State::SetPw { b"Set password" } else { b"Log in" };
+    let title: &[u8] = if state == State::SetPw { b"Set password" } else if state == State::Alert { b"Log Out" } else { b"Log in" };
     let id = wm::create_at(OWNER, surf, W * H * 4, W as u32, H as u32, (W * 4) as u32, title, ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
     if id == wm::WIN_NONE {
         FORM.lock().windowed = false;
@@ -628,24 +647,36 @@ fn take_down() {
 
 fn close_into_session() {
     take_down();
+    if SWEPT.swap(false, Ordering::AcqRel) {
+        super::super::dock::relaunch_furniture(); // LOGOUTDESK: the sweep emptied the desktop — this login's fresh session gets a fresh console and shell (the render bodies drain the latches)
+    }
     FORM.lock().state = State::Session;
 }
 
 /// M4: Log Out — close the session and put the screen back up. LOGIN13 M3 (R63): the ROOT session's
 /// Log Out comes here too (the crystal's row and the shell's `logout`), and is refused while the store
 /// has nobody to log in as (`users::root_logout_refused`, which prints why).
+/// LOGOUTDESK: set when Log Out swept the desktop; the next login's [`close_into_session`] re-mints the furniture once.
+static SWEPT: AtomicBool = AtomicBool::new(false);
+
 pub fn reopen_after_logout() {
-    if users::root_logout_refused() {
+    if let Some(reason) = users::root_logout_reason() {
+        refused_alert(reason);
         return;
     }
     users::logout();
+    take_down(); // LOGOUTUI: an alert left up by an earlier refusal goes with the session (no-op with no window)
+    let (closed, kernel) = wm::close_all_furniture(); // LOGOUTDESK (R69): the desktop closes down COMPLETELY — every row, kernel furniture included
+    SWEPT.store(true, Ordering::Release);
+    let remaining = wm::live_window_count();
+    serial_println!(":: LOGOUTDESK: closed={} kernel={} remaining={} -> {} ::", closed, kernel, remaining, if remaining == 0 { "PASS" } else { "FAIL" });
     FORM.lock().state = State::Closed;
     serial_println!("[login] logged out — screen returns");
     open();
 }
 
 pub fn is_open() -> bool {
-    matches!(FORM.lock().state, State::Open | State::SetPw)
+    matches!(FORM.lock().state, State::Open | State::SetPw | State::Alert)
 }
 
 /// SO36 + SO44 — **the screen's answer to a PRESS, and it is the same answer everywhere.**
@@ -704,7 +735,15 @@ pub fn press_swallow(x: i32, y: i32) -> bool {
     // press routed into a screen that is not on the glass is a press into nothing, and the row's
     // geometry is exactly what [`local_of`] is about to read.
     heal_if_row_gone();
-    let hit = local_of(x, y).and_then(|(lx, ly)| ctl_at(lx, ly, setpw_form()));
+    let alert = FORM.lock().state == State::Alert;
+    let hit = local_of(x, y).and_then(|(lx, ly)| {
+        if alert {
+            // LOGOUTUI: the alert carries exactly one control; the form's rects are not live under it.
+            let (rx, ry, rw, rh) = ctl_rect(Ctl::AlertOk, false);
+            return (lx >= rx as i32 && lx < (rx + rw) as i32 && ly >= ry as i32 && ly < (ry + rh) as i32).then_some(Ctl::AlertOk);
+        }
+        ctl_at(lx, ly, setpw_form())
+    });
     match hit {
         Some(Ctl::NameField) => FORM.lock().focus = Focus::Name,
         Some(Ctl::PwField) => FORM.lock().focus = Focus::Password,
@@ -713,6 +752,7 @@ pub fn press_swallow(x: i32, y: i32) -> bool {
         // there is no second submit path to keep in step with `consume_key`'s.
         Some(Ctl::Button) => submit(),
         Some(Ctl::User(i)) => pick_user(i),
+        Some(Ctl::AlertOk) => alert_ok(),
         None => {}
     }
     if hit.is_some() {
@@ -810,6 +850,14 @@ pub fn consume_key(c: u8) -> bool {
         serial_println!("[login] key taken by the screen (the first of this open — LOGIN13/R63: while the screen is up it is the only thing taking input; no typed byte is ever printed)");
     }
     match c {
+        b'\x1b' if FORM.lock().state == State::Alert => {
+            alert_ok();
+            return true;
+        }
+        b'\n' | b'\r' if FORM.lock().state == State::Alert => {
+            alert_ok();
+            return true;
+        }
         b'\x1b' => {} // R24: Esc dismisses menus only; the screen stays
         b'\t' => {
             let mut f = FORM.lock();
@@ -1533,4 +1581,73 @@ pub fn fixture_setpw_for(name: &[u8]) -> bool {
 pub fn fixture_reset() {
     take_down();
     FORM.lock().state = State::Closed;
+}
+
+// ---------------------------------------------------------------------------
+// LOGOUTUI (R70) — the refused Log Out's alert
+// ---------------------------------------------------------------------------
+
+/// The state the alert came from, so OK returns to it: 0 = Session (the usual case: Log Out pressed with
+/// the screen down), 1 = Open, 2 = SetPw.
+static ALERT_PREV: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// LOGOUTUI: a refused Log Out says why, in an alert of the set-password screen's shape. `reason` is
+/// [`users::root_logout_reason`]'s answer; the copy is R70's.
+pub fn open_alert(reason: &'static str) {
+    let text: &'static str = match reason {
+        "no-users" => "add a user first (adduser <name>)",
+        "storage-not-up" => "the user store is not mounted",
+        _ => "Log Out was refused",
+    };
+    let switched = {
+        let mut f = FORM.lock();
+        if f.state == State::Alert {
+            f.message = text;
+            true
+        } else {
+            let prev = match f.state {
+                State::Open => 1,
+                State::SetPw => 2,
+                _ => 0,
+            };
+            if prev != 0 {
+                ALERT_PREV.store(prev, Ordering::Relaxed);
+                f.state = State::Alert;
+                f.message = text;
+                true
+            } else {
+                ALERT_PREV.store(0, Ordering::Relaxed);
+                false
+            }
+        }
+    };
+    if !switched {
+        open_as(State::Alert); // inherits LOGINZ's modal pin (`wm::set_modal_top` in `open_as`)
+        FORM.lock().message = text;
+    }
+    repaint();
+}
+
+/// LOGOUTUI: OK / Enter / Esc — back to the state the alert came from (the screen down over the session,
+/// or the form it interrupted).
+fn alert_ok() {
+    let prev = ALERT_PREV.swap(0, Ordering::Relaxed);
+    match prev {
+        1 | 2 => {
+            FORM.lock().state = if prev == 1 { State::Open } else { State::SetPw };
+            repaint();
+        }
+        _ => {
+            take_down();
+            FORM.lock().state = State::Session;
+        }
+    }
+    serial_println!(":: LOGOUTUI: close=ok -> PASS ::");
+}
+
+/// LOGOUTUI: the refused Log Out's alert plus its witness — the ONE call both refusal routes make
+/// (`reopen_after_logout`, and the shell's `logout` through `users::log_out_to_screen`).
+pub fn refused_alert(reason: &'static str) {
+    open_alert(reason);
+    serial_println!(":: LOGOUTUI: reason={} alert=open -> PASS ::", reason);
 }
