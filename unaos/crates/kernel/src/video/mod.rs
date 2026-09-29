@@ -1139,3 +1139,7 @@ impl<T> Drop for HeldGuard<'_, T> {
         self.lock.tag.store(0, Ordering::Relaxed);
     }
 }
+
+// WALLPAPER (rmbp-0929) — the desktop backdrop picture; rides the `facet` decoder, so it has the same gate.
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub mod wallpaper;

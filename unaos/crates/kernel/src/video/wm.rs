@@ -21500,7 +21500,7 @@ fn stage_fill(
             pixel_format: info.pixel_format,
         },
     );
-    layer.fill_rect(0, 0, w, 1, color);
+    layer.fill_rect(0, 0, w, 1, color); let wp = color == DESKTOP_BG && wp_active(); // WALLPAPER — the row below is per-scanline when a picture is loaded
 
     #[cfg(feature = "witness")]
     let t1 = crate::arch::now_cycles();
@@ -21614,7 +21614,7 @@ fn stage_fill(
     // `[wc-k]` line stops being arch-dependent in meaning. Equals `h` wherever no clip exists.
     let mut blit_calls: usize = 0; let hb = super::beam::hold(y, y + h, info.height, false, true); // BEAM (orin 26) — the fill's bracket: opened here, after the compose and after every `defer!`/`drop_fill!` exit (a declined fill writes no pixel and must not wait for a beam), closed after the rows are cleaned below.
     for r in 0..h {
-        let py = y + r;
+        let py = y + r; if wp { wp_row(&layer, py, x, w); } // WALLPAPER — this scanline's pixels into the staged row
         let off = py * fb_row + x * bpp;
         if prev != usize::MAX && off != prev + fb_row {
             contig = false;
@@ -21649,7 +21649,7 @@ fn stage_fill(
         }
         for &(sx0, sx1) in spans[..ns].iter() {
             let len = (sx1 - sx0) * bpp;
-            fb.blit(py * fb_row + sx0 * bpp, &stage[..len]);
+            let so = if wp { (sx0 - x) * bpp } else { 0 }; fb.blit(py * fb_row + sx0 * bpp, &stage[so..so + len]); // WALLPAPER — a picture row is not constant: source offset follows the span
             blit_calls += 1;
             #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
             {
@@ -29272,3 +29272,32 @@ pub fn loginz_selftest() {
     close(wr);
     close(wm_);
 }
+
+// WALLPAPER (rmbp-0929) — the compositor-side seam to `video/wallpaper.rs`. Tail helpers so the three fold
+// sites (`stage_fill`, `Screen::fill_screen`, `Screen::flush`) stay line-neutral. Armed only where the
+// module exists; everywhere else these are constant-false / no-ops and every fill is the flat colour.
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+#[inline]
+fn wp_active() -> bool { super::wallpaper::active() }
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+#[inline]
+fn wp_row(layer: &super::FrameBuffer, py: usize, x: usize, w: usize) { super::wallpaper::row(layer, py, x, w) }
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn wp_paint(fb: &super::framebuffer::FrameBuffer) { if super::desktop_scene_owns_backdrop() { super::wallpaper::paint(fb) } }
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn wp_take_stale() -> bool { super::wallpaper::take_stale() }
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+/// Queue a whole-panel desktop erase; the drain paints it through `stage_fill` (wallpaper-aware) clipped by the windows.
+pub fn desktop_repaint() { if let Some(pi) = super::panel_info_nonblocking() { erase(&[(0, 0, pi.width, pi.height)]); } }
+#[cfg(not(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+#[inline(always)]
+fn wp_active() -> bool { false }
+#[cfg(not(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+#[inline(always)]
+fn wp_row(_l: &super::FrameBuffer, _py: usize, _x: usize, _w: usize) {}
+#[cfg(not(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+#[inline(always)]
+pub fn wp_paint(_fb: &super::framebuffer::FrameBuffer) {}
+#[cfg(not(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+#[inline(always)]
+pub fn wp_take_stale() -> bool { false }

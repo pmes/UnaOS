@@ -627,7 +627,7 @@ fn take_down() {
 }
 
 fn close_into_session() {
-    take_down();
+    take_down(); #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] super::wallpaper::rearm(); // WALLPAPER — the session user's ~/Desktop/WALL.PNG is probed on the next desktop flush
     FORM.lock().state = State::Session;
 }
 

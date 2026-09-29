@@ -1164,7 +1164,7 @@ impl Screen {
     }
 
     pub fn fill_screen(&mut self, color: u32) {
-        self.back.fill_screen(color);
+        self.back.fill_screen(color); if color == super::wm::DESKTOP_BG && !self.direct { super::wm::wp_paint(&self.back); } // WALLPAPER — the backdrop colour is the picture where one is loaded
         self.mark_full();
     }
 
@@ -1190,7 +1190,7 @@ impl Screen {
     /// arm build never sees this method and stays byte-identical.
     #[cfg(target_arch = "x86_64")]
     pub fn paint_desktop_scene(&mut self) {
-        self.back.fill_screen(super::wm::DESKTOP_BG);
+        self.back.fill_screen(super::wm::DESKTOP_BG); super::wm::wp_paint(&self.back); // WALLPAPER
         self.mark_full();
     }
 
@@ -1384,7 +1384,7 @@ impl Screen {
     /// CURSOR-9's colour-guard residual is therefore mended sooner than before, not later.
     /// `TOUCHED_SINCE_DRAW` is untouched: a present landing under a live sprite still arms the
     /// repair through `note_present_over_sprite`, and it now has a live sprite to arm it for.
-    pub fn flush(&mut self) {
+    pub fn flush(&mut self) { if !self.direct && super::wm::wp_take_stale() { self.back.fill_screen(super::wm::DESKTOP_BG); super::wm::wp_paint(&self.back); self.mark_full(); } // WALLPAPER — live reload / late-mounted volume: repaint the desktop layer once
         // SHELLWIN-OOM — single-buffer mode: every draw already landed in the one real surface, so
         // there is no back→front copy to perform (the pointers are equal — the row copy would be UB)
         // and no panel present to bracket: this front is a WINDOW surface the compositor reads on
