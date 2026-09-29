@@ -487,3 +487,10 @@ REQUIRE :: LFNMV: sys_rename_long=-ENOENT shell_mv_long=ok alias_leak=false read
 # The fixture's two non-PASS spellings: no writable `/boot` (it measured nothing) and its FAIL line.
 FORBID :: LFNMV: SKIPPED
 FORBID :: LFNMV: .* -> FAIL ::
+
+# ── LFNMV2 (B202 re-open, FSNS M1/M2): the operator verb reports what reached the DEVICE. `fs_mv` prints
+# `[fs] mv A -> B lfn=1 ok=<bool> sectors_written=N` for a long-name destination (N = fat.rs's device-write
+# counter delta across `mt.rename`). The LFNMV fixture above drives `fs_mv` with `LongNameViaShellMv.txt`, so
+# the line is reached on this lane. A verb that claims `ok=true` with N=0 is exactly the flight-14 bench symptom.
+REQUIRE \[fs\] mv .* lfn=1 ok=true sectors_written=[1-9][0-9]*
+FORBID \[fs\] mv .* lfn=1 ok=true sectors_written=0

@@ -1,5 +1,7 @@
 # LFNMV2 — prep
 
+Status: M1..M2 written, uncompiled
+
 ## The finding
 
 rmbp-ledger B202 row (reopened): "**LFNMV — A RENAME TO A LONG NAME, MEASURED ON BOTH ARCHES**"
@@ -202,3 +204,7 @@ pub(crate) fn sector_write_count() -> u64 {
 ```
 (unbuilt — the trailing PASS/FAIL boolean expression above needs cleanup before this compiles; left
 literal so next session sees the intent, not a hidden fix.)
+
+## Written
+
+- `fs/fat.rs` tail: `SECTOR_WRITES`, `sector_write_count()`, `is_long_name()`; counter folded onto `write_sector`/`write_sectors` result lines. `shell.rs` `fs_mv`: `[fs] mv A -> B lfn=1 ok=<b> sectors_written=N`, always on. Pin: `x86-default.spec` REQUIRE/FORBID. M3/M4 not done.

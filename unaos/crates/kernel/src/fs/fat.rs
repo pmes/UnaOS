@@ -840,7 +840,7 @@ fn write_sector(source: BlockSource, lba: u64, buf: &[u8; SECTOR_SIZE]) -> Resul
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
         BlockSource::SdMmc => crate::drivers::block::write_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::write_block_ahci_port(p, lba, buf), // AHCIBOOT: the block layer IS the refusal; forwarded so one place decides.
     };
-    r.map_err(|e| match e {
+    if r.is_ok() { SECTOR_WRITES.fetch_add(1, core::sync::atomic::Ordering::Relaxed); } r.map_err(|e| match e { // LFNMV2 M2: counted on device Ok, folded onto this line (line-sensitive file)
         // WEDGE-8 (F3): see `read_sector` — Busy stays Busy so it can be retried, not mourned.
         crate::drivers::block::BlockError::Busy => FatError::Busy,
         _ => FatError::Io,
@@ -955,7 +955,7 @@ fn write_sectors(source: BlockSource, lba: u64, buf: &[u8]) -> Result<(), FatErr
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
             BlockSource::SdMmc => crate::drivers::block::write_blocks_tegra_sd(at, chunk), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] BlockSource::Ahci(p) => crate::drivers::block::write_blocks_ahci_port(p, at, chunk), // AHCIBOOT: refuses, as the single-sector twin does.
         };
-        r.map_err(|_| FatError::Io)?;
+        if r.is_ok() { SECTOR_WRITES.fetch_add((take / SECTOR_SIZE) as u64, core::sync::atomic::Ordering::Relaxed); } r.map_err(|_| FatError::Io)?; // LFNMV2 M2: counted on device Ok, folded onto this line
         off += take;
     }
     Ok(())
@@ -6795,4 +6795,21 @@ fn lfn2_witness() {
         ":: FAT-LFN-MV: end state left in /{} for the HOST-SIDE read-back — a real VFAT driver must list `{}` and `{}`, must NOT list `{}`, `{}`, `{}` or `{}`, and must count zero orphan component slots ::",
         FATLFN_DIR, LFN2_MV_TO, LFN2_83, LFN2_MV_FROM, LFN2_IP_FROM, LFN2_IP_TO, LFN2_DEL
     );
+}
+
+// ===================== LFNMV2 M2 — the device-write counter =====================
+
+/// LFNMV2 (B202 re-open): every sector that `write_sector`/`write_sectors` got an `Ok` for, on ANY
+/// source. Read before/after a verb, it answers "did anything reach the medium" without trusting the
+/// verb's own success line.
+static SECTOR_WRITES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// LFNMV2: total sectors successfully written through this module this boot.
+pub(crate) fn sector_write_count() -> u64 {
+    SECTOR_WRITES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// LFNMV2 M1: true when `leaf` has no 8.3 form (so a rename to it takes the long-name path).
+pub(crate) fn is_long_name(leaf: &str) -> bool {
+    format_83(leaf).is_none()
 }
