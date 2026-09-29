@@ -441,3 +441,10 @@ FORBID :: USERSREADY: .* -> FAIL
 REQUIRE :: USERSMOUNT: rmbp-shape=sdhc qemu-shape=global none=none old-mount-on-rmbp=none this-boot via=(global|sdhc) -> PASS ::
 FORBID :: USERSMOUNT: .* -> FAIL
 REQUIRE \[users\] load volume=el0-fat\(rw\) via=(global|sdhc) 
+# LOGOUTUI (R70) — a refused Log Out says why in an alert; LOGOUTDESK (R69) — Log Out closes the whole desktop.
+REQUIRE :: LOGOUTUI: reason=(no-users|storage-not-up) alert=open -> PASS ::
+FORBID :: LOGOUTUI: .* -> FAIL
+FORBID \[users\] logout REFUSED session=root reason=no-users$
+REQUIRE :: LOGOUTDESK: closed=\d+ kernel=\d+ remaining=0 -> PASS ::
+FORBID :: LOGOUTDESK: .* -> FAIL
+FORBID :: LOGOUTDESK: closed=\d+ kernel=0 remaining=0 -> PASS

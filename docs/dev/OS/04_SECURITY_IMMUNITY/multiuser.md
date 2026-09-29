@@ -330,8 +330,12 @@ this section.
 5. **The user logs in** through the screen and lands in `/home/<name>` (`[users] home=/home/<name>
    exists`). A wrong password is `[login] denied user=<name>` and nothing else.
 
-What is NOT "over nothing": kernel windows (the console, the shell, Quarry) are not programs and stay
-on the desktop beneath the screen; the screen takes every key and press regardless. `STAT.ELF` is not
+R69 (LOGOUTDESK) supersedes the earlier "kernel windows stay beneath the screen": Log Out closes the desktop
+down COMPLETELY. After the session's programs end, `wm::close_all_furniture` closes every remaining row
+(console, shell, Quarry, the dock's furniture) through the id-scoped close, so the screen stands over an
+empty desktop (`:: LOGOUTDESK: closed=N kernel=N remaining=0 -> PASS ::`) and the next login posts the
+console and shell launches for a fresh desktop; the screen takes every key and press regardless.
+A refused Log Out (R70, LOGOUTUI) is an alert, not silence. `STAT.ELF` is not
 relaunched when the user logs in (owed, B189). The aarch64 root arm is owed: aarch64 stamps no epoch on
 a non-user program (`session_restamp` is a no-op with no session), so root's programs cannot be
 selected there and its Log Out ends what it always ended.
