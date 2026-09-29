@@ -83,7 +83,7 @@ pub use una_abi::BUS_VERB_MV;
 pub fn verb_valid(verb: u8) -> bool {
     matches!(
         verb,
-        BUS_VERB_LS | BUS_VERB_CAT | BUS_VERB_CP | BUS_VERB_WRITE | BUS_VERB_RM | BUS_VERB_MV
+        BUS_VERB_LS | BUS_VERB_CAT | BUS_VERB_CP | BUS_VERB_WRITE | BUS_VERB_RM | BUS_VERB_MV | una_abi::BUS_VERB_MENU_PUBLISH | una_abi::BUS_VERB_MENU_CLEAR | una_abi::BUS_VERB_MENU_GET
     )
 }
 
