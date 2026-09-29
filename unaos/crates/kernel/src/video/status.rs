@@ -602,3 +602,36 @@ pub fn restore_state(s: (u64, u8, u64, u8)) {
 pub fn set_byte_swap(on: bool) {
     SWAP.store(on as u8, Ordering::Relaxed);
 }
+
+// --- BRIGHTKEYS: the transient level indicator ---------------------------------------------------
+//
+// A second, short-lived status item: `brightness=N/16`, shown for `BRIGHT_SHOW_MS` after a
+// brightness key. Not a battery fact and not polled: `video::brightkeys` (or nothing, on a board
+// with no such keys) calls [`bright_show`]; the bar reads [`bright_item`] once per compose.
+
+/// How long the level indicator stays on the glass after the last key, ms.
+pub const BRIGHT_SHOW_MS: u64 = 1500;
+/// Last shown level, `0..=16`.
+static BRIGHT_LEVEL: AtomicU8 = AtomicU8::new(0);
+/// `arch::ms()` of the last key; 0 = never shown.
+static BRIGHT_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Show `level/16` on the bar for [`BRIGHT_SHOW_MS`]. Two relaxed stores; legal from any context.
+pub fn bright_show(level: u8) {
+    BRIGHT_LEVEL.store(level.min(16), Ordering::Relaxed);
+    BRIGHT_AT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
+}
+
+/// The level to draw, or `None` once the indicator has expired. Lock-free, like [`bar_item`].
+pub fn bright_item() -> Option<u8> {
+    let at = BRIGHT_AT_MS.load(Ordering::Relaxed);
+    if at == 0 || crate::arch::ms().wrapping_sub(at) >= BRIGHT_SHOW_MS {
+        return None;
+    }
+    Some(BRIGHT_LEVEL.load(Ordering::Relaxed))
+}
+
+/// Drop the indicator now (the boot self-test's key must not flash on the glass).
+pub fn bright_clear() {
+    BRIGHT_AT_MS.store(0, Ordering::Relaxed);
+}

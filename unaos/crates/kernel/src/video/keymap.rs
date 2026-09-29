@@ -127,6 +127,11 @@ pub enum Action {
     CursorLineStart,
     /// TERMSEL2: the caret to the line end (`⌘→` and `End` on CRISPY, `End` on PC).
     CursorLineEnd,
+    /// BRIGHTKEYS: panel backlight one step down (`F1`, the Apple keyboard's brightness-down key).
+    /// Consumed at `pal::push_event` by `video::brightkeys`; never reaches a ring consumer.
+    BrightnessDown,
+    /// BRIGHTKEYS: panel backlight one step up (`F2`).
+    BrightnessUp,
 }
 
 impl Action {
@@ -149,7 +154,14 @@ impl Action {
             Action::CursorRight => "cursor-right",
             Action::CursorLineStart => "cursor-line-start",
             Action::CursorLineEnd => "cursor-line-end",
+            Action::BrightnessDown => "brightness-down",
+            Action::BrightnessUp => "brightness-up",
         }
+    }
+
+    /// BRIGHTKEYS: is this a backlight step (handled by `video::brightkeys`, not delivered)?
+    pub const fn is_brightness(self) -> bool {
+        matches!(self, Action::BrightnessDown | Action::BrightnessUp)
     }
 
     /// Does this action arm the screen capture? The ONE question the HID decoders ask of an

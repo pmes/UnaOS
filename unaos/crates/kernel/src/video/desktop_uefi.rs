@@ -708,7 +708,7 @@ pub fn desktop_app_service() {
     // It self-throttles to `status::POLL_MS` (10 s) and costs one clock read and one relaxed load on
     // the ~999 passes in between. The FIRST pass finds `LAST_POLL_MS == 0` and sweeps immediately,
     // so the item is resolved before the bar reaches the glass rather than ten seconds after.
-    super::status::poll();
+    super::status::poll(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::brightkeys::service(); // BRIGHTKEYS — applies a pending backlight step (gmux port I/O belongs on this pass, not in the decoder). ⚠ SAME-LINE fold.
 
     // Not armed = the activation never completed. Cheapest test first, and it is the one that is
     // false on every boot without the Kepler takeover.

@@ -557,7 +557,7 @@ use super::keymap::{Action, Binding, Table, CMD, SHIFT};
 /// would otherwise shadow them (the `no_shadow` check at the foot of this block refuses the other
 /// order at compile time) — and `Shift+Home`/`Shift+End` as well, because the rMBP's internal
 /// keyboard has no Home or End key but an external one on the same desktop does.
-pub static CRISPY_ROWS: [Binding; 21] = [
+pub static CRISPY_ROWS: [Binding; 23] = [
     // The two chords flight 11 proved on metal. Their tokens are the exact bytes the `[prtscr]`
     // witness has always carried, so a capture from before KEYMAP and one from after grep alike.
     Binding { roles: CMD | SHIFT, usage: 0x20, action: Action::Screenshot, token: "cmd-shift-3" },
@@ -596,6 +596,10 @@ pub static CRISPY_ROWS: [Binding; 21] = [
     // Print Screen. `roles: 0` — the key means capture whatever else is held, which is precisely
     // what the `0x46` edge did before it was a row. A theme that drops this row disarms the key.
     Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: "print-screen" },
+    // BRIGHTKEYS: the Apple keyboard's F1/F2 are brightness down/up (HID 0x3A/0x3B). Consumed by
+    // `video::brightkeys` at `pal::push_event`.
+    Binding { roles: 0, usage: 0x3A, action: Action::BrightnessDown, token: "f1-brightness-down" },
+    Binding { roles: 0, usage: 0x3B, action: Action::BrightnessUp, token: "f2-brightness-up" },
 ];
 
 /// **The desktop's live table.** `cmd_role` is `HID_MOD_GUI`, so every `CMD` above is the Command
