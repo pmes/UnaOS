@@ -24770,7 +24770,7 @@ pub fn home_acl_fixture(path: &str) -> bool {
     let p_anon = slot_ppid_of(A_ANON);
     let p_user2 = slot_ppid_of(A_USER2);
     let mut created = false;
-    let (de, lba, off) = match open_locate(&fs, path, O_CREAT, &mut created) {
+    let (de, lba, off) = match open_locate(&fs, fixture_abs(path, &mut [0u8; 48]), O_CREAT, &mut created) {
         Ok(t) => t,
         Err(e) => {
             serial_println!("[users] home-acl: open_locate({}) -> errno {}", path, e);
@@ -25044,7 +25044,7 @@ pub fn session_epoch_fixture(path: &str, id: u32, name: &[u8]) -> bool {
     let p_own = slot_ppid_of(A_OWN);
     let p_stale_live = slot_ppid_of(A_STALE);
     let mut created = false;
-    let (de, lba, off) = match open_locate(&fs, path, O_CREAT, &mut created) {
+    let (de, lba, off) = match open_locate(&fs, fixture_abs(path, &mut [0u8; 48]), O_CREAT, &mut created) {
         Ok(t) => t,
         Err(e) => {
             serial_println!("[users] epoch: open_locate({}) -> errno {}", path, e);
@@ -25129,7 +25129,7 @@ pub fn ident_fixture(path: &str, name_a: &[u8], uid_a: u32, name_b: &[u8], uid_b
     slot_ppid_stamp(A_A2, p_a2);
     slot_epoch_stamp(A_A2);
     let mut created = false;
-    let (de, lba, off) = match open_locate(&fs, path, O_CREAT, &mut created) {
+    let (de, lba, off) = match open_locate(&fs, fixture_abs(path, &mut [0u8; 48]), O_CREAT, &mut created) {
         Ok(t) => t,
         Err(e) => {
             serial_println!("[users] ident: open_locate({}) -> errno {}", path, e);
@@ -25676,4 +25676,16 @@ fn lfnmv_launcher() {
         return;
     }
     crate::shell::lfnmv_witness("aarch64", LFNMV_SYSRC.load(Ordering::Acquire), EINVAL);
+}
+
+/// DIRNS M2 RULE: a path WITHOUT a leading `/` is HOME-relative; a leading `/` is volume-root. The
+/// in-kernel login fixtures spell root-relative multi-component paths (`HOME/una/NOTES.TXT`), so they
+/// are made absolute here (`/HOME/una/NOTES.TXT`) before they reach the resolver.
+fn fixture_abs<'a>(path: &'a str, buf: &'a mut [u8; 48]) -> &'a str {
+    if path.starts_with('/') || path.len() + 1 > buf.len() {
+        return path;
+    }
+    buf[0] = b'/';
+    buf[1..1 + path.len()].copy_from_slice(path.as_bytes());
+    core::str::from_utf8(&buf[..1 + path.len()]).unwrap_or(path)
 }

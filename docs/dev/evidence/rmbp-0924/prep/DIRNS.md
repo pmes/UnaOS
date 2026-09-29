@@ -129,3 +129,5 @@ fn el0_walk_from<'p>(fs: &crate::fs::fat::FatFs, base: u32, path: &'p str)
 
 - M1: `unaos/scripts/specs/x86-login.spec` (x86 spelling) and `arm-login.spec` (aarch64 spelling incl. `relhome`) pin `:: DIRNS:`.
 - M2: `fs/vfs.rs` `el0_walk_from`, `el0_session_base`, `el0_dir_cluster`, `el0_locate_in`, `el0_locate_leaf` (el0_walk now seeds from the session home for non-absolute paths, falling back to root); aarch64 `dirns_witness` leg 6 `relhome`. x86 `dirns_witness` has no relhome leg (service task has no injectable base).
+
+- Rule (callback fix): a path WITHOUT a leading `/` is HOME-relative, a leading `/` is volume-root. aarch64 login fixtures (`home_acl_fixture`, `session_epoch_fixture`, `ident_fixture`) made absolute via `fixture_abs` in arch/aarch64/syscall.rs (users.rs untouched). Other el0_locate callers pass leaves/absolute paths.
