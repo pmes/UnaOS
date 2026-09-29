@@ -127,6 +127,9 @@ pub enum Action {
     CursorLineStart,
     /// TERMSEL2: the caret to the line end (`⌘→` and `End` on CRISPY, `End` on PC).
     CursorLineEnd,
+    /// WINCYCLE: focus the least-recently-raised app window (`Alt+Tab`; `⌘Tab` on CRISPY). Acted on by
+    /// the window system's router, never by the terminal.
+    CycleWindow,
 }
 
 impl Action {
@@ -149,6 +152,7 @@ impl Action {
             Action::CursorRight => "cursor-right",
             Action::CursorLineStart => "cursor-line-start",
             Action::CursorLineEnd => "cursor-line-end",
+            Action::CycleWindow => "cycle-window",
         }
     }
 

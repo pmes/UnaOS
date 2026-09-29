@@ -814,3 +814,10 @@ REQUIRE \[wc-d\] latch-check forced=16 printed=1 rolled=16 win=31 reroll=0 -> PA
 # COUNT 2 reads 1 hit and the FORBID trips on `[wm] close-scope win=0 owner=0x3`.
 COUNT 2 \[wm\] close-scope win=[1-9][0-9]* owner=0x[0-9a-f]+ next_focus=
 FORBID \[wm\] close-scope win=0 
+# ── WINCYCLE (rmbp-0929) — Alt+Tab cycles app windows; a title double-click zooms/restores ──────────
+# The fixture mints three rows, cycles twice (bottom-raise rotation), zooms and restores one. GO-RED:
+# make `cycle_pick` return None -> `after_tab` no longer the second-least-recent and FAIL prints.
+REQUIRE :: WINCYCLE: windows=[0-9]+ order=\[[0-9, ]+\] after_tab=[1-9][0-9]* zoom=[0-9]+x[0-9]+->[0-9]+x[0-9]+ restored=1 -> PASS ::
+FORBID :: WINCYCLE: .* -> FAIL ::
+REQUIRE \[wm-act\] cycle win=[1-9][0-9]* owner=0x[0-9a-f]+ at \(0,0\) -> action=cycle raised
+REQUIRE \[wm-act\] action=zoom win=[1-9][0-9]* route=title-dbl -> zoomed

@@ -5815,6 +5815,7 @@ fn focus_ring_apps(out: &mut [u64; crate::video::wm::MAX_WINDOWS]) -> usize {
 ///    cannot reach, so a drain here would fix one seam and lie about the other.
 pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
     const K_TAB: u8 = b'\t';
+    #[cfg(feature = "wc")] if let crate::pal::Event::Action(crate::video::keymap::Action::CycleWindow) = ev { return match crate::video::wm::cycle_pick() { Some((id, owner)) => { if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_cancel("focus-key"); drag_settle_disarm(); } user_input_set_active(owner); crate::video::wm::cycle_commit(id, owner); true } None => true }; } // WINCYCLE M1 — Alt+Tab/Cmd+Tab (keymap `CycleWindow`): raise+focus the least-recent app window via `focus_changed`+`raise_one`; one window or none is a consumed no-op.
     // ALLKEYS (GR21 F4/F5): this matcher binds a BARE Tab, and it can only ever see a bare one —
     // `Event::Key` carries no modifier, so "require Tab with no modifiers" cannot be enforced here;
     // it is enforced upstream in `xhci::hid_key_ascii`, which is the ONLY producer of byte 0x09.
@@ -7617,6 +7618,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
                     user_input_set_active(owner);
                 }
                 crate::video::wm::focus_changed(owner);
+                if crate::video::wm::title_bar_hit(win, x, y) && !crate::video::wm::is_kernel_owner(owner) && crate::video::wm::title_dblclick(win, crate::arch::ms()) { crate::video::wm::zoom_titled(win, owner, x, y); clickroute_witness(x, y, win, owner, cur, "zoom-dbl", 0); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } // WINCYCLE M2 — a second title press within 400 ms zooms/restores (`action=zoom`), on the control's own `wm::zoom`.
                 let how = if crate::video::wm::drag_begin(win, x, y) {
                     // DRAGSETTLE — the grab point is the gesture's first settle point, so a
                     // grab-and-let-go with no motion between the edges rests exactly where it was
