@@ -68,6 +68,7 @@ pub mod wifi;
 pub mod allocator;
 pub mod shell;
 pub mod selftest;
+pub mod tests; // R77 M3 — the desktop fixture registry and the `tests` verb
 
 // ORIN-REBOOT (baton orin-6 §5.1 + the cold-boot ruling 2026-08-25): the arch-neutral POWER
 // VERBS — `reboot` (warm) and `shutdown` (power off, cold-boot-ready). One word each on

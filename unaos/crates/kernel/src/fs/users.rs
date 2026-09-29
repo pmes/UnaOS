@@ -1233,7 +1233,7 @@ pub fn service() {
     // last error is named so the line says which refusal it was.
     match try_load() {
         Ok(()) => {
-            #[cfg(feature = "loginst")]
+            #[cfg(all(feature = "loginst", feature = "tests-at-boot"))]
             LOGINST_LIVE.store(true, Ordering::Release); // LOGINORDER (B206): the chain is live from here to the end of this arm — the desktop press battery waits for it
             SERVICED.store(true, Ordering::Relaxed);
             root_credential_ignition(); // LOGIN14 (R65): root's row, and the set-password screen if its password is not chosen yet
@@ -1244,6 +1244,7 @@ pub fn service() {
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire, screen_press_via_router, screen_press_route_name()); #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::crystal::login::lock_fixture(b"una", b"correct-horse", b"wrong-horse"); #[cfg(feature = "loginst")] LOGINST_LIVE.store(false, Ordering::Release); // LOGINORDER (B206): the chain is over; the press battery may run. ⚠ SAME-LINE fold. // LOGIN M4 — the Log Out route under test is the CRYSTAL MENU'S ROW (`crystal::logout_row_fire`), not the screen's own reopen; M3's `logout_direct` retires with it. LOGINFLOW M1 — and the PRESS route under test is the arch's LIVE ROUTER (`screen_press_via_router`, this file's tail), handed in for exactly the reason the logout route is: a fixture that called `press_swallow` itself would stay green on a tree whose router gate had been deleted — B121's lesson one band over. The seam's NAME travels with it, so the verdict line says which entry was driven rather than leaving the reader to infer it from the arch.
         stage_resolve("store-loaded"); // FIRSTBOOT (R77): the stage, from the loaded store AFTER the loginst chain (a Desktop-stage store there); the desktop tenants wait on it
+            { crate::tests::register("login-chain", loginst_chain); crate::tests::source_done(crate::tests::SRC_LOGIN); } // R77 M3 — the loginst fixture chain is a registered test (`tests login-chain`); `tests-at-boot` runs it here, as before. Body: `loginst_chain`, this file's tail.
         }
         Err(e) => {
             let n = MOUNT_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1256,6 +1257,8 @@ pub fn service() {
                 // registered disk (`Io`, `BadChain`, `Unsupported`, …) IS a defect and takes the FAIL form.
                 SERVICED.store(true, Ordering::Relaxed);
                 stage_no_store(); // FIRSTBOOT (R77): no store to install into — the machine is a Desktop
+                #[cfg(feature = "loginst")]
+                crate::tests::source_done(crate::tests::SRC_LOGIN); // R77 M3 — nothing will register on a boot with no store
                 serial_println!("[users] el0-fat volume did not mount after {} passes — last={:?} — store unavailable this boot", n, e);
                 #[cfg(feature = "loginst")]
                 if matches!(e, FatError::NotFat | FatError::NoDisk) {
@@ -2906,8 +2909,7 @@ pub fn login_usermgmt_fixture() {
     }
 }
 
-// =========================================================================================
-// FIRSTBOOT (R77) — THE FIRST BOOT IS AN INSTALLER, NOT A DESKTOP
+// ==================================================================================// FIRSTBOOT (R77) — THE FIRST BOOT IS AN INSTALLER, NOT A DESKTOP
 // =========================================================================================
 //
 // Peter, 2026-09-29 (RULINGS R77): with no root password set NOTHING runs but the root password setter;
@@ -3105,4 +3107,20 @@ fn screen_create_user() {
     crate::video::crystal::login::open_create_user();
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     serial_println!("[login] create-user form not built in this image (R77: the stage stays create-user)");
+=======
+/// R77 M3 — the loginst fixture chain, moved verbatim out of [`service`] so it registers with
+/// `crate::tests` instead of igniting at boot. Under `tests-at-boot` `service` raises `LOGINST_LIVE`
+/// before root's credential ignition (the old order); fired by the verb it raises and drops it itself,
+/// so `loginst_settled()` reads true for the whole boot and nothing waits on a chain that never ran.
+#[cfg(feature = "loginst")]
+fn loginst_chain() {
+    use core::sync::atomic::Ordering;
+    #[cfg(not(feature = "tests-at-boot"))]
+    LOGINST_LIVE.store(true, Ordering::Release);
+    { login_rootpw_fixture(); login_bootroot_fixture(); login_adduser_fixture(); login_usermgmt_root_fixture(); login_rootout_fixture(); login_usermgmt_fixture(); login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); }
+    #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    crate::video::strip::login_press_fixture(b"una", b"correct-horse");
+    #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire, screen_press_via_router, screen_press_route_name()); #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::crystal::login::lock_fixture(b"una", b"correct-horse", b"wrong-horse"); #[cfg(feature = "loginst")] LOGINST_LIVE.store(false, Ordering::Release);
+    LOGINST_LIVE.store(false, Ordering::Release);
 }

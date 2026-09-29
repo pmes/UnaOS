@@ -909,3 +909,5 @@ REQUIRE :: HEAP: size=[0-9]+ used=[0-9]+ free=[0-9]+ largest=[0-9]+ -> PASS ::
 # PASS = every band of every fanned-out job completed (speedup_pct is the reading, not the gate).
 REQUIRE :: WCPAR: cores=
 REQUIRE [wcpar] pool=
+# R77 M3 — the desktop fixtures are registered, not ignited; the lane defaults UNAOS_TESTS_AT_BOOT=1 so the boot prints the one line (deferred=0 there) and every fixture still runs in its old order
+REQUIRE :: TESTS: deferred=
