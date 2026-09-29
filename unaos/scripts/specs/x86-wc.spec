@@ -765,6 +765,13 @@ FORBID :: MENUFIRST: .* :: SKIP ::
 # selection on the editable line (the rule TERMSEL deferred), `pc=` the PC table's four caret rows.
 REQUIRE :: TERMSEL2: legs=0x7ffff/0x7ffff hit=ok route=ok drag=ok up=ok dbl=ok sel=ok copy=ok cut_ro=ok esc=ok word=ok into_edit=ok edit=ok click_caret=ok arrows=ok insert=ok bs=ok replace=ok collapse=ok pc=ok -> PASS ::
 FORBID :: TERMSEL2: .* -> FAIL ::
+# ── TERMWRAP (rmbp-ledger B220): the shell's edit line and scrollback WRAP at the window's column count.
+# Fixture `termsel::termwrap_selftest` (panel-less Console): a cols+40 edit line takes >= 2 visual rows,
+# the caret sits at `wrap_rc(prompt+len)`, a 2*cols+5 history line costs 3 rows, and a click on the edit
+# line's second row resolves to the wrapped offset. FORBID rows=1 with a 3-digit len is the bug class.
+REQUIRE :: TERMWRAP: cols=\d+ len=\d+ rows=\d+ caret=\(\d+,\d+\) -> PASS ::
+FORBID :: TERMWRAP: .* -> FAIL ::
+FORBID :: TERMWRAP: cols=\d+ len=[0-9]{3,} rows=1 caret=
 #
 # --- BOOTSLOW (rmbp-ledger B201) — THE ROOT PASS RUNS BEFORE THE PROBES THAT DO NOT SERVE IT -----
 # Flight 12 (metal, `f12-boot1.log`): `:: SDHCBLK: registered internal SD card as block handle Sdhc`
