@@ -541,7 +541,7 @@ const _: () = {
 // line inserted mid-file moves every `panic::Location` below it (LEDGER P7). Nothing follows this
 // block, so nothing moves.
 
-use super::keymap::{Action, Binding, Table, ALT, CMD, SHIFT};
+use super::keymap::{Action, Binding, Table, ALT, CMD, CTRL, SHIFT};
 
 /// CRISPY's rows. PRECEDENCE ORDER — the resolver takes the first row whose usage edged and whose
 /// roles are held, so the two-modifier chords are written above the one-modifier ones. Every row
@@ -557,7 +557,7 @@ use super::keymap::{Action, Binding, Table, ALT, CMD, SHIFT};
 /// would otherwise shadow them (the `no_shadow` check at the foot of this block refuses the other
 /// order at compile time) — and `Shift+Home`/`Shift+End` as well, because the rMBP's internal
 /// keyboard has no Home or End key but an external one on the same desktop does.
-pub static CRISPY_ROWS: [Binding; 23] = [
+pub static CRISPY_ROWS: [Binding; 27] = [
     // The two chords flight 11 proved on metal. Their tokens are the exact bytes the `[prtscr]`
     // witness has always carried, so a capture from before KEYMAP and one from after grep alike.
     Binding { roles: CMD | SHIFT, usage: 0x20, action: Action::Screenshot, token: "cmd-shift-3" },
@@ -603,6 +603,9 @@ pub static CRISPY_ROWS: [Binding; 23] = [
     // `video::brightkeys` at `pal::push_event`.
     Binding { roles: 0, usage: 0x3A, action: Action::BrightnessDown, token: "f1-brightness-down" },
     Binding { roles: 0, usage: 0x3B, action: Action::BrightnessUp, token: "f2-brightness-up" },
+    // SCREENLOCK — ⌘L and Ctrl+Alt+L lock the session (usage 0x0F = L; no other row watches it).
+    Binding { roles: CMD, usage: 0x0F, action: Action::LockScreen, token: "cmd-l" },
+    Binding { roles: CTRL | ALT, usage: 0x0F, action: Action::LockScreen, token: "ctrl-alt-l" },
 ];
 
 /// **The desktop's live table.** `cmd_role` is `HID_MOD_GUI`, so every `CMD` above is the Command
@@ -620,7 +623,7 @@ pub static CRISPY_BINDINGS: &Table = &Table {
 /// The rows are the SAME rows in role space. What differs is one field — `cmd_role` — plus the
 /// keyboard the operator is typing on: `Alt+C` is copy on a PC because R61 says the Command role
 /// moves to Alt there, not because a second Copy row was written.
-pub static PC_ROWS: [Binding; 16] = [
+pub static PC_ROWS: [Binding; 17] = [
     // PrtSc. The SHIFTED row is written ABOVE the bare one, and it has to be: the bare row names
     // no roles, so it matches with Shift held too and would shadow the region chord entirely. That
     // is this table's one ordering hazard; the `const` block at the foot of this file checks it.
@@ -643,6 +646,7 @@ pub static PC_ROWS: [Binding; 16] = [
     Binding { roles: 0, usage: 0x4F, action: Action::CursorRight, token: "right" },
     Binding { roles: 0, usage: 0x4A, action: Action::CursorLineStart, token: "home" },
     Binding { roles: 0, usage: 0x4D, action: Action::CursorLineEnd, token: "end" },
+    Binding { roles: CTRL | ALT, usage: 0x0F, action: Action::LockScreen, token: "ctrl-alt-l" }, // SCREENLOCK — Ctrl+Alt+L
 ];
 
 /// The PC table. `cmd_role` is `HID_MOD_ALT` — R61's *"(alt-c on pc)"*, and the one field that

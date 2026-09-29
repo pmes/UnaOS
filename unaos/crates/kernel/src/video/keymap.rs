@@ -135,6 +135,8 @@ pub enum Action {
     /// WINCYCLE: focus the least-recently-raised app window (`Alt+Tab`; `⌘Tab` on CRISPY). Acted on by
     /// the window system's router, never by the terminal.
     CycleWindow,
+    /// SCREENLOCK: lock the session without ending it (`⌘L`, `Ctrl+Alt+L`). Acted on by the router (`login::lock`).
+    LockScreen,
 }
 
 impl Action {
@@ -160,6 +162,7 @@ impl Action {
             Action::BrightnessDown => "brightness-down",
             Action::BrightnessUp => "brightness-up",
             Action::CycleWindow => "cycle-window",
+            Action::LockScreen => "lock-screen",
         }
     }
 
