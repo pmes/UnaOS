@@ -29302,3 +29302,20 @@ pub fn live_window_count() -> usize {
     let t = table();
     t.rows.iter().filter(|r| r.used && !r.compat).count()
 }
+
+/// NOTICE — the armed program name of `owner` copied into `out`; returns its length (0 = none armed).
+/// The bus verb's title: the app is named by the kernel-stamped owner, never by the caller.
+pub fn app_name_of(owner: u64, out: &mut [u8; MAX_TITLE]) -> usize {
+    if owner == 0 {
+        return 0;
+    }
+    let t = APP_NAMES.lock();
+    match t.iter().find(|e| e.owner == owner) {
+        Some(e) => {
+            let n = (e.len as usize).min(MAX_TITLE);
+            out[..n].copy_from_slice(&e.name[..n]);
+            n
+        }
+        None => 0,
+    }
+}

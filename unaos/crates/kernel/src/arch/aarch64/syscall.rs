@@ -23155,6 +23155,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
             },
             Err(_) => return EINVAL,
         },
+        crate::bus::BUS_VERB_NOTICE => { crate::fs::users::screen_notice_from(asid as u64, body); 0 } // NOTICE: aarch64 wm owner IS the asid
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
     bus_reply_enqueue(asid, hdr.corr, hdr.verb, status, &text)

@@ -6346,7 +6346,7 @@ impl XhciController {
             // doesn't match), which keeps the retraction correct even if some earlier path already
             // zeroed `storage_slot`. A replug enumerates as a NEW slot and republishes through the
             // normal attach path, so the entry is fresh rather than duplicated.
-            crate::drivers::block::unpublish_usb_geometry(i as u8, crate::drivers::block::usb_publish_gen());
+            if crate::drivers::block::unpublish_usb_geometry(i as u8, crate::drivers::block::usb_publish_gen()) { crate::fs::users::screen_notice(b"USB stick removed", b"the disk was unplugged\nsaving to it has stopped"); } // NOTICE
             // BOT-RESCUE: a slot that leaves takes its escalation state with it. Without this a
             // surrendered slot id, once recycled by the controller for the NEXT device, would
             // refuse that innocent device's transfers up front — the surrender must bind to the
