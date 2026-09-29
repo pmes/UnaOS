@@ -5815,6 +5815,7 @@ fn focus_ring_apps(out: &mut [u64; crate::video::wm::MAX_WINDOWS]) -> usize {
 ///    cannot reach, so a drain here would fix one seam and lie about the other.
 pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
     const K_TAB: u8 = b'\t';
+    #[cfg(feature = "wc")] if let crate::pal::Event::Action(crate::video::keymap::Action::CycleWindow) = ev { return match crate::video::wm::cycle_pick() { Some((id, owner)) => { if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_cancel("focus-key"); drag_settle_disarm(); } user_input_set_active(owner); crate::video::wm::cycle_commit(id, owner); true } None => true }; } #[cfg(all(feature = "wc", feature = "login"))] if let crate::pal::Event::Action(crate::video::keymap::Action::LockScreen) = ev { let _ = crate::video::crystal::login::lock(); return true; } // WINCYCLE M1 — Alt+Tab/Cmd+Tab (keymap `CycleWindow`): raise+focus the least-recent app window via `focus_changed`+`raise_one`; one window or none is a consumed no-op.
     // ALLKEYS (GR21 F4/F5): this matcher binds a BARE Tab, and it can only ever see a bare one —
     // `Event::Key` carries no modifier, so "require Tab with no modifiers" cannot be enforced here;
     // it is enforced upstream in `xhci::hid_key_ascii`, which is the ONLY producer of byte 0x09.
@@ -7423,6 +7424,16 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
         return false;
     };
     let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+    // DOCKRUN — the running tile's menu. Quit takes the close box's own path (registered here, one atomic
+    // store); a secondary press on a running tile opens the menu; ANY primary press while it is open goes
+    // to it first (a press outside closes it and falls through); a release ends the long-press hold.
+    #[cfg(feature = "wc")]
+    {
+        crate::video::dock::set_quit_hook(wc_close_click);
+        let eat = if mask & 0x02 != 0 { crate::video::dock::right_press_at(x, y) } else if mask & 0x01 != 0 && crate::video::dock::menu_open() { crate::video::dock::menu_press(x, y) } else { false };
+        if mask & 0x01 == 0 { crate::video::dock::lp_release(); }
+        if eat { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; }
+    }
     // ARC D M1 — **THE RULE, AND IT IS THE WHOLE RULE: PRIMARY BIT SET IS A PRESS, CLEAR IS A
     // RELEASE.** No latch, no edge re-derivation, no recovery arm.
     //
@@ -7617,6 +7628,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
                     user_input_set_active(owner);
                 }
                 crate::video::wm::focus_changed(owner);
+                if crate::video::wm::title_bar_hit(win, x, y) && !crate::video::wm::is_kernel_owner(owner) && crate::video::wm::title_dblclick(win, crate::arch::ms()) { crate::video::wm::zoom_titled(win, owner, x, y); clickroute_witness(x, y, win, owner, cur, "zoom-dbl", 0); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } // WINCYCLE M2 — a second title press within 400 ms zooms/restores (`action=zoom`), on the control's own `wm::zoom`.
                 let how = if crate::video::wm::drag_begin(win, x, y) {
                     // DRAGSETTLE — the grab point is the gesture's first settle point, so a
                     // grab-and-let-go with no motion between the edges rests exactly where it was
@@ -8235,7 +8247,7 @@ pub fn wmdirect_selftest() {
     // would reach a tail that reads "button up" and end the drag through the new belt instead of
     // through the release EVENT it exists to test. Two legs, two paths, each driven honestly.
     crate::pal::cursor::set_button_level(true);
-    let grab_consumed = wc_click_route_at(Event::Button(1), tpx, tpy);
+    crate::video::wm::DBL_OFF.store(true, Ordering::Relaxed); let grab_consumed = wc_click_route_at(Event::Button(1), tpx, tpy); // compiler (WINCYCLE x [wm-act]): this fixture presses one title many times inside DBL_MS; the double-click zoom must not steal them
     let grab_ok = grab_consumed && wm::drag_active() == w && user_input_active() == OWNER_D;
 
     // Leg 3 — THE ROUTED SEAM. Park the arrow at the grab point, then push a synthetic
@@ -8870,7 +8882,7 @@ pub fn wmdirect_selftest() {
         && ctrlgeom_ok.unwrap_or(true)
         && zoom_ok.unwrap_or(true)
         && minim_ok.unwrap_or(true);
-    serial_println!(
+    crate::video::wm::DBL_OFF.store(false, Ordering::Relaxed); serial_println!(
         "[wm-act] direct partition={} grab={} route={} content={} level={} tabcancel={} settle={} lead={} close={} dragdead={} ctrlgeom={} zoom={} minimise={} from=({},{}) to=({},{}) -> {}",
         partition_ok,
         grab_ok,
@@ -17516,7 +17528,7 @@ fn winx_launcher(demo_cpu: usize) {
     #[cfg(feature = "witness")]
     { #[cfg(feature = "login")] { let t0 = crate::arch::ms(); while !crate::fs::users::loginst_settled() && crate::arch::ms().saturating_sub(t0) < 20_000 { core::hint::spin_loop(); } serial_println!("[clickroute] battery held {}ms for the loginst chain settled={} (LOGINORDER, B206 — B189 finding 1: the login fixtures open the screen and the screen swallows every press, so the click family waits for them; the bound is 20 s)", crate::arch::ms().saturating_sub(t0), crate::fs::users::loginst_settled()); } crate::video::wm::hittest_selftest(); } // LOGINORDER (B206) — ⚠ SAME-LINE fold, line-NEUTRAL: the wait rides the hittest statement's own line.
     #[cfg(feature = "witness")]
-    { clickroute_selftest(); crate::video::termsel::pointer_selftest(); } // TERMSEL2 — the pointer on the shell's text, driven through `wc_click_route_at` exactly as `clickroute_selftest` drives it, right after it and for its reason: it mints (and closes) a row of its own, so it belongs after every one-shot per-window latch and before `dock::selftest`, which must find NO `KERNEL_OWNER_DESKTOP` row. ⚠ FOLDED, line-neutral.
+    { clickroute_selftest(); crate::video::termsel::pointer_selftest(); crate::video::termsel::termwrap_selftest(); } // TERMSEL2 — the pointer on the shell's text, driven through `wc_click_route_at` exactly as `clickroute_selftest` drives it, right after it and for its reason: it mints (and closes) a row of its own, so it belongs after every one-shot per-window latch and before `dock::selftest`, which must find NO `KERNEL_OWNER_DESKTOP` row. ⚠ FOLDED, line-neutral.
     // DOCK — fourth of the click family. It mints three rows of its own and drives `focus_changed(0)`,
     // so it belongs here for the reason the two above do: after every one-shot per-window latch. It
     // runs after `clickroute_selftest` rather than before because it leaves a raised window behind
@@ -25044,6 +25056,8 @@ fn busx_msend_for(row: usize, cgen: u64, frame: &[u8]) -> i64 {
         // being no second implementation to drift from. Body parsing and the fail-closed `-EINVAL` on
         // a malformed one are the aarch64 dispatcher's, verb for verb. ⚠ LINE-NEUTRAL fold (B94).
         crate::bus::BUS_VERB_WRITE => match crate::bus::write_body_parse(body) { Ok((nb, c)) => match core::str::from_utf8(nb) { Ok(n) => busx_write(row, cgen, n, c), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_RM => match crate::bus::cat_body_parse(body) { Ok(nb) => match core::str::from_utf8(nb) { Ok(n) => busx_rm(row, cgen, n), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_MV => match crate::bus::cp_body_parse(body) { Ok((a, b)) => match (core::str::from_utf8(a), core::str::from_utf8(b)) { (Ok(x), Ok(y)) => busx_mv(row, cgen, x, y), _ => return EINVAL }, Err(_) => return EINVAL },
+        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(row as u64 + 1, body); 0 } // NOTICE: owner = slot + 1 (the wm key)
+        crate::bus::BUS_VERB_WRITE => match crate::bus::write_body_parse(body) { Ok((nb, c)) => match core::str::from_utf8(nb) { Ok(n) => busx_write(row, cgen, n, c), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_RM => match crate::bus::cat_body_parse(body) { Ok(nb) => match core::str::from_utf8(nb) { Ok(n) => busx_rm(row, cgen, n), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_MV => match crate::bus::cp_body_parse(body) { Ok((a, b)) => match (core::str::from_utf8(a), core::str::from_utf8(b)) { (Ok(x), Ok(y)) => busx_mv(row, cgen, x, y), _ => return EINVAL }, Err(_) => return EINVAL }, #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(row, body), #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(row, body), #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(row, body, &mut text),
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
     busx_reply_enqueue(row, hdr.corr, hdr.verb, status, &text)
@@ -25115,7 +25129,7 @@ fn busx86_stamp_check() {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    let mut w = 0u32;
+    let mut w = 0u32; #[cfg(all(feature = "witness", feature = "wc"))] appmenu_fixture();
     let row: usize = 7; // a scratch row (the kernel-fixture discipline; the ring-3 ladder is done by now)
     if row >= BUSX_MBOX.len() {
         return;
@@ -29431,4 +29445,97 @@ fn lfnmv_launcher() {
         return;
     }
     crate::shell::lfnmv_witness("x86_64", LFNMV_SYSRC.load(Ordering::Acquire), ENOENT);
+}
+
+// =================================================================================================
+// APPMENU (R73) — the pick-delivery seam and the kernel-minted-owner fixture. Appended at the tail so
+// no existing line moves; the fixture is called from the head of `busx86_stamp_check` (same-line fold).
+// =================================================================================================
+
+/// APPMENU: push one pre-packed event into the ring of the process that OWNS `owner` (the `slot + 1`
+/// wm key) — by identity, not focus. Returns whether it was queued. The caller is the input pump (the
+/// menu bar's press router), the ring's sole producer, exactly as `user_input_enqueue` is.
+pub fn user_input_push_owner(owner: u64, packed: u64) -> bool {
+    let Some(slot) = (owner as usize).checked_sub(1) else { return false };
+    if slot >= crate::arch::memory::USER_SLOTS {
+        return false;
+    }
+    user_input_push(slot, packed)
+}
+
+/// APPMENU fixture helper: one bus round trip on `row` — request in, `(send rc, reply status, reply body)`.
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn appmenu_call(row: usize, cgen: u64, verb: u8, corr: u32, body: &[u8], stamp: u8) -> (i64, i32, alloc::vec::Vec<u8>) {
+    let mut f = alloc::vec![0u8; crate::bus::BUS_FRAME_MAX];
+    let n = crate::bus::build_request(verb, corr, body, &mut f);
+    f[16] = stamp; // 0 = honest; nonzero = a hand-planted CALLER principal (the leg-2 probe)
+    let rc = busx_msend_for(row, cgen, &f[..n]);
+    if rc != 0 {
+        return (rc, 0, alloc::vec::Vec::new());
+    }
+    match busx_mbox_pop(row) {
+        Some(m) => match crate::bus::frame_parse(&m.frame) {
+            Ok(h) => (0, h.status, m.frame[crate::bus::BUS_HDR_LEN..].to_vec()),
+            Err(_) => (0, i32::MIN, alloc::vec::Vec::new()),
+        },
+        None => (0, i32::MIN, alloc::vec::Vec::new()),
+    }
+}
+
+/// APPMENU fixture: a kernel-minted owner (scratch row 6 -> owner 7) publishes a 3-item menu through the
+/// PRODUCTION `busx_msend_for` path, reads it back through GET, has a 65-item tree and a caller-stamped
+/// principal refused with the registry unchanged, receives a pick in ITS ring while no other ring moves
+/// (ledger leg 1), and is reaped (leg 4). One `:: APPMENU: ... ::` line per leg.
+#[cfg(all(feature = "witness", feature = "wc"))]
+#[inline(never)]
+fn appmenu_fixture() {
+    use una_abi::{MenuWireItem as W, BUS_VERB_MENU_GET, BUS_VERB_MENU_PUBLISH, INPUT_EV_MENU_PICK, MENU_FLAG_SUBMENU};
+    let row: usize = 6;
+    let owner: u64 = row as u64 + 1;
+    if row >= BUSX_MBOX.len() || row >= crate::arch::memory::USER_SLOTS {
+        return;
+    }
+    let cgen = SLOT_GEN[row].load(Ordering::Acquire);
+    busx_mbox_clear(row);
+    let items = [W::new(1, 0, MENU_FLAG_SUBMENU, b"Tools"), W::new(10, 1, 0, b"Run"), W::new(11, 1, 0, b"Stop")];
+    let mut body = alloc::vec![una_abi::MENU_WIRE_VERSION, 3, 0, 0];
+    for it in items.iter() {
+        body.extend_from_slice(&it.to_bytes());
+    }
+    let (rc, st, _) = appmenu_call(row, cgen, BUS_VERB_MENU_PUBLISH, 31, &body, 0);
+    let published = rc == 0 && st == 0 && crate::video::appmenu::has(owner);
+    // Leg: read-back through GET is byte-identical.
+    let (grc, gst, got) = appmenu_call(row, cgen, BUS_VERB_MENU_GET, 32, &[], 0);
+    let rb = grc == 0 && gst == 0 && got == body;
+    serial_println!(":: APPMENU: readback owner={} items=3 match={} -> {} ::", owner, rb, if rb && published { "PASS" } else { "FAIL" });
+    // Leg 3 + 2: an over-cap tree and a caller-stamped principal are refused; the registry is unchanged.
+    let mut big = alloc::vec![una_abi::MENU_WIRE_VERSION, 65, 0, 0];
+    for i in 0..65u32 {
+        big.extend_from_slice(&W::new(100 + i, 1, 0, b"x").to_bytes());
+    }
+    let (_, cst, _) = appmenu_call(row, cgen, BUS_VERB_MENU_PUBLISH, 33, &big, 0);
+    let (srcrc, _, _) = appmenu_call(row, cgen, BUS_VERB_MENU_PUBLISH, 34, &body, 2);
+    let (_, _, again) = appmenu_call(row, cgen, BUS_VERB_MENU_GET, 35, &[], 0);
+    busx_mbox_clear(row);
+    let refused = cst == -22 && srcrc == EINVAL && again == body;
+    serial_println!(":: APPMENU: refuse items=65 principal=caller registry_unchanged={} -> {} ::", again == body, if refused { "PASS" } else { "FAIL" });
+    // Leg 1: the pick lands in the OWNER's ring; every other ring is untouched.
+    clear_input_row(row);
+    let mut before = [0u32; crate::arch::memory::USER_SLOTS];
+    for (s, b) in before.iter_mut().enumerate() {
+        *b = USER_INPUT_TAIL[s].load(Ordering::Acquire);
+    }
+    let sent = crate::video::appmenu::deliver_pick(owner, 10);
+    let tail = USER_INPUT_TAIL[row].load(Ordering::Acquire);
+    let ev = USER_INPUT_BUF[row][(before[row] as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
+    let others_quiet = (0..crate::arch::memory::USER_SLOTS).all(|s| s == row || USER_INPUT_TAIL[s].load(Ordering::Acquire) == before[s]);
+    let ok = sent && tail == before[row].wrapping_add(1) && ev == una_abi::input_ev_pack(INPUT_EV_MENU_PICK, 10) && others_quiet;
+    clear_input_row(row);
+    serial_println!(":: APPMENU: owner={} items=3 pick_to=owner others_quiet={} -> {} ::", owner, others_quiet, if ok { "PASS" } else { "FAIL" });
+    // Leg 4: reaped on owner death, and GET then answers empty, not a dead tree.
+    crate::video::appmenu::reap(owner);
+    let (_, rst, after) = appmenu_call(row, cgen, BUS_VERB_MENU_GET, 36, &[], 0);
+    busx_mbox_clear(row);
+    let reaped = rst == 0 && after.is_empty() && !crate::video::appmenu::has(owner);
+    serial_println!(":: APPMENU: owner={} reaped empty={} -> {} ::", owner, reaped, if reaped { "PASS" } else { "FAIL" });
 }

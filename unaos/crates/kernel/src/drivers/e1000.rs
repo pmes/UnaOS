@@ -1211,12 +1211,12 @@ pub fn service_net() {
     // succeed (10.0.2.3 forwards to the host); otherwise it prints the honest `no answer` note.
     #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
     crate::smolnet::witness_tick_dns();
-    // SNTP-X86 (knob-on): the smoltcp SNTP client — one-shot, syncs the shared `crate::clock` from a
-    // resolved `pool.ntp.org` (SOCK-8) or the live gateway over SNTP. Same post-guard discipline (its UDP
-    // pump short-locks NET_DEVICE per ring op). Hermetically the target is silent for NTP, so it prints the
-    // honest `no reply` note; on real hardware with an NTP-answering server it anchors `time` for real.
-    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
-    crate::smolnet::witness_tick_sntp();
+    // SNTPDRV M3: the SNTP hang-off is RETIRED from this driver tick — a NIC driver only moves frames.
+    // The client is driven by `crate::net_tick::service_tick()` from the scheduler's 5 s periodic hook
+    // (main.rs, beside `emit_load_witness`), so changing the NIC (e1000 / USB Ethernet) cannot lose the clock.
+    // (Comment lines kept where the call was: the statement's removal must not shift this file's
+    // `panic::Location`s — LAWS §5.)
+    //
 }
 
 /// Outcome of a blocking [`ping`] (rendered by the `ping` shell command).
@@ -1304,4 +1304,11 @@ pub fn fmt_mac(mac: &[u8; 6]) -> alloc::string::String {
 /// Format an IPv4 address as `a.b.c.d`.
 pub fn fmt_ip(ip: &[u8; 4]) -> alloc::string::String {
     alloc::format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+}
+
+/// SNTPDRV M3: is an e1000 registered (vs. only a USB Ethernet link answering `hw_addr`)? Names the
+/// `link=` of the `:: SNTP:` witness; takes the `NET_DEVICE` lock briefly, never across a call out.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+pub fn nic_present() -> bool {
+    NET_DEVICE.lock().is_some()
 }

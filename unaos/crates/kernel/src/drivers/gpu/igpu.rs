@@ -2741,3 +2741,22 @@ const fn pipe_timing_regs(sel: u32) -> PipeTimingRegs {
         },
     }
 }
+
+/// BRIGHTKEYS — write the gmux backlight register (`GMUX_PORT_BRIGHTNESS`, index 0x74, 32-bit; the
+/// panel range is 0..=0xFFFF). Upstream `gmux_index_write32`: value bytes at 0x7C0..=0x7C3, wait,
+/// then the index. Bounded by `gmux_wait_*`; returns false when the gmux does not complete.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+pub fn gmux_set_brightness(raw: u16) -> bool {
+    const PORT_VALUE_BASE: u16 = 0x7C0;
+    const PORT_BRIGHTNESS: u8 = 0x74;
+    let v = raw as u32;
+    // SAFETY: gmux index/data ports (0x7C0-0x7D4) are the ones every other gmux helper above drives.
+    unsafe {
+        for i in 0..4u16 {
+            gmux_outb(PORT_VALUE_BASE + i, (v >> (8 * i)) as u8);
+        }
+        if !gmux_wait_ready() { return false; }
+        gmux_outb(GMUX_PORT_WRITE, PORT_BRIGHTNESS);
+        gmux_wait_complete()
+    }
+}

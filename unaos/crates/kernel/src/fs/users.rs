@@ -532,7 +532,7 @@ fn delete_root_file(fs: &FatFs, leaf: &str) -> Result<(), UsersError> {
 /// Create root-directory file `leaf` fresh (any prior one deleted first) with `data`.
 fn write_root_file(fs: &FatFs, leaf: &str, data: &[u8]) -> Result<(), UsersError> {
     if fs.write_veto().is_some() {
-        return Err(UsersError::Volume);
+        screen_notice(b"Storage read-only", b"changes were not saved"); return Err(UsersError::Volume);
     }
     delete_root_file(fs, leaf)?;
     let (_, l, o) = fs.create_in_dir(0, leaf, 0x20).map_err(map_fat)?;
@@ -1066,7 +1066,7 @@ pub fn shell_verb(verb: &str, args: &[&str], console: &mut crate::console::Conso
             }
         }
         "adduser" => adduser_begin(args, console), // LOGIN13 M2 (R63) — root adds a user; see `adduser_begin`
-        "passwd" => passwd_begin(args, console),   // LOGIN14 (R65) — the prompt: a password, twice, never echoed
+        "passwd" => passwd_begin(args, console), "users" | "deluser" | "whoami" => usermgmt_verb(verb, args, console), // USERMGMT (tail) — LOGIN14 (R65) — the prompt: a password, twice, never echoed
         _ => {}
     }
 }
@@ -1238,11 +1238,11 @@ pub fn service() {
             SERVICED.store(true, Ordering::Relaxed);
             root_credential_ignition(); // LOGIN14 (R65): root's row, and the set-password screen if its password is not chosen yet
             #[cfg(feature = "loginst")]
-            { login_rootpw_fixture(); login_bootroot_fixture(); login_adduser_fixture(); login_rootout_fixture(); login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
+            { login_rootpw_fixture(); login_bootroot_fixture(); login_adduser_fixture(); login_usermgmt_root_fixture(); login_rootout_fixture(); login_usermgmt_fixture(); login_fixture(); login_hard_fixture(); login_ident_fixture(); login_end_fixture(); login_kown_fixture(); login_rand_fixture(); } // SECLOGIN M1/M2/M3/M4/M5 — PWHARD's own leg, chained here because it needs `una` in the store and the session CLOSED (login_fixture leaves it closed). ONE braced block, because the `#[cfg]` above governs exactly one statement (x86-mix-2, the loginst-off leg, caught the unbraced form).
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-            crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire, screen_press_via_router, screen_press_route_name()); #[cfg(feature = "loginst")] LOGINST_LIVE.store(false, Ordering::Release); // LOGINORDER (B206): the chain is over; the press battery may run. ⚠ SAME-LINE fold. // LOGIN M4 — the Log Out route under test is the CRYSTAL MENU'S ROW (`crystal::logout_row_fire`), not the screen's own reopen; M3's `logout_direct` retires with it. LOGINFLOW M1 — and the PRESS route under test is the arch's LIVE ROUTER (`screen_press_via_router`, this file's tail), handed in for exactly the reason the logout route is: a fixture that called `press_swallow` itself would stay green on a tree whose router gate had been deleted — B121's lesson one band over. The seam's NAME travels with it, so the verdict line says which entry was driven rather than leaving the reader to infer it from the arch.
+            crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire, screen_press_via_router, screen_press_route_name()); #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::crystal::login::lock_fixture(b"una", b"correct-horse", b"wrong-horse"); #[cfg(feature = "loginst")] LOGINST_LIVE.store(false, Ordering::Release); // LOGINORDER (B206): the chain is over; the press battery may run. ⚠ SAME-LINE fold. // LOGIN M4 — the Log Out route under test is the CRYSTAL MENU'S ROW (`crystal::logout_row_fire`), not the screen's own reopen; M3's `logout_direct` retires with it. LOGINFLOW M1 — and the PRESS route under test is the arch's LIVE ROUTER (`screen_press_via_router`, this file's tail), handed in for exactly the reason the logout route is: a fixture that called `press_swallow` itself would stay green on a tree whose router gate had been deleted — B121's lesson one band over. The seam's NAME travels with it, so the verdict line says which entry was driven rather than leaving the reader to infer it from the arch.
         }
         Err(e) => {
             let n = MOUNT_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2471,18 +2471,24 @@ pub fn login_adduser_fixture() {
 /// R63 — refuse the ROOT session's Log Out when it would strand the person at a screen with nobody to
 /// log in as. Prints the refusal and answers `true`; `false` (and silent) for every other session.
 pub fn root_logout_refused() -> bool {
+    root_logout_reason().is_some()
+}
+
+/// LOGOUTUI (R70): [`root_logout_refused`]'s body with the reason kept, so the screen can say WHY.
+/// `Some("storage-not-up" | "no-users")` (and prints the refusal) for the root session; `None` otherwise.
+pub fn root_logout_reason() -> Option<&'static str> {
     if !root_session() {
-        return false;
+        return None;
     }
     let reason = if !load_once() {
         "storage-not-up"
     } else if user_count() == 0 {
         "no-users"
     } else {
-        return false;
+        return None;
     };
     serial_println!("[users] logout REFUSED session=root reason={} (R63: `adduser <name>` first — root's Log Out would leave a login screen with nobody to log in as)", reason);
-    true
+    Some(reason)
 }
 
 /// LOGIN13 M3 — the shell's `logout`: close the open session (the root session included) and, where
@@ -2500,7 +2506,9 @@ pub fn log_out_to_screen(out: &mut [u8; NAME_MAX]) -> Result<usize, &'static str
             None => return Err("no-session"),
         }
     };
-    if root_logout_refused() {
+    if let Some(_reason) = root_logout_reason() {
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+        crate::video::crystal::login::refused_alert(_reason); // LOGOUTUI (R70): the shell's route says why on the glass too
         return Err("refused");
     }
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
@@ -2720,4 +2728,177 @@ fn store_mount() -> Result<FatFs, FatError> {
         _ => return Err(FatError::NoDisk),
     };
     crate::fs::fat::mount_source(source)
+}
+
+// =========================================================================================
+// NOTICE — the OS's notice surface, reached from code that is not the screen (appended at the tail)
+// ==================================================================================
+/// NOTICE: queue a notice (title, up to two `\n`-separated lines) for the glass. QUEUE ONLY — no `wm`
+/// call, no heap, so it is safe from the xHCI event path, a fault handler or a flush; the window opens
+/// on the next key through the screen's pump. A no-op where no desktop is built.
+pub fn screen_notice(title: &[u8], text: &[u8]) {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    crate::video::crystal::login::notice_post(title, text);
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    let _ = (title, text);
+}
+
+/// NOTICE (`BUS_VERB_NOTICE`): a ring-3 app raises a notice; the title is the app's own name, looked up
+/// by the kernel-stamped `owner` in wm's title registry (`Program` when none is armed).
+pub fn screen_notice_from(owner: u64, body: &[u8]) {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        let mut t = [0u8; crate::video::wm::MAX_TITLE];
+        let n = crate::video::wm::app_name_of(owner, &mut t);
+        crate::video::crystal::login::notice_post(if n == 0 { b"Program" } else { &t[..n] }, body);
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    let _ = (owner, body);
+}
+
+// =========================================================================================
+// USERMGMT (rmbp-0929) — `users`, `deluser <name>`, `whoami`. `passwd` (LOGIN14) and `adduser` predate this.
+// =========================================================================================
+
+/// The last USERMGMT verb's outcome word (the wire vocabulary of `adduser`/`passwd`: one word per verdict).
+static USERMGMT_LAST: Mutex<&'static str> = Mutex::new("");
+
+fn usermgmt_refuse(verb: &str, name: &[u8], reason: &'static str, console: &mut crate::console::Console) {
+    *USERMGMT_LAST.lock() = reason;
+    serial_println!("[users] {} REFUSED user={} reason={}", verb, wire_name(name), reason);
+    console.println(&alloc::format!("{}: {} refused (reason={})", verb, wire_name(name), reason));
+}
+
+/// `whoami` prints `name uid=N`; `users` lists `name uid=N home=<path> password=set|unset` (never a hash or
+/// salt); `deluser <name>` is root only, refuses the logged-in user and the last user, removes the row
+/// and LEAVES the home folder (it says so).
+fn usermgmt_verb(verb: &str, args: &[&str], console: &mut crate::console::Console) {
+    match verb {
+        "whoami" => {
+            let mut nb = [0u8; NAME_MAX];
+            match whoami(&mut nb) {
+                Some(n) => {
+                    let uid = id_of(&nb[..n]).unwrap_or(0);
+                    console.println(&alloc::format!("{} uid={}", wire_name(&nb[..n]), uid));
+                }
+                None if root_session() => console.println("root uid=0"),
+                None => console.println("whoami: no session is open"),
+            }
+        }
+        "users" => {
+            if !load_once() {
+                return console.println("users: storage is not up (-ENODEV)");
+            }
+            let mut listed = 0usize;
+            let mut i = 0usize;
+            let mut nb = [0u8; NAME_MAX];
+            while let Some(n) = name_at(i, &mut nb) {
+                i += 1;
+                let nm = &nb[..n];
+                let mut hb = [0u8; HOME_MAX];
+                let home = home_of(nm, &mut hb).and_then(|h| core::str::from_utf8(&hb[..h]).ok()).unwrap_or("?");
+                let pw = if password_unset(nm) == Some(true) { "unset" } else { "set" };
+                console.println(&alloc::format!("{} uid={} home={} password={}", wire_name(nm), id_of(nm).unwrap_or(0), home, pw));
+                listed += 1;
+            }
+            *USERMGMT_LAST.lock() = "listed";
+            serial_println!("[users] users listed={}", listed);
+        }
+        "deluser" => {
+            let Some(name) = args.first().map(|s| s.as_bytes()) else {
+                return console.println("usage: deluser <name>");
+            };
+            let mut nb = [0u8; NAME_MAX];
+            if matches!(whoami(&mut nb), Some(n) if &nb[..n] == name) {
+                return usermgmt_refuse("deluser", name, "self", console);
+            }
+            if !root_session() {
+                return usermgmt_refuse("deluser", name, "not-root", console);
+            }
+            if !load_once() {
+                return usermgmt_refuse("deluser", name, "storage-not-up", console);
+            }
+            if name == ROOT_NAME {
+                return usermgmt_refuse("deluser", name, "root-row", console);
+            }
+            if password_unset(name).is_none() {
+                return usermgmt_refuse("deluser", name, "no-such-user", console);
+            }
+            if user_count() <= 1 {
+                return usermgmt_refuse("deluser", name, "last-user", console);
+            }
+            let mut hb = [0u8; HOME_MAX];
+            let home = home_of(name, &mut hb).and_then(|h| core::str::from_utf8(&hb[..h]).ok()).unwrap_or("?");
+            let mut homes = alloc::string::String::new();
+            homes.push_str(home);
+            match delete_user(name) {
+                Ok(uid) => {
+                    *USERMGMT_LAST.lock() = "deleted";
+                    console.println(&alloc::format!("deluser: {} (uid {}) removed; the home folder {} is LEFT in place", wire_name(name), uid, homes));
+                }
+                Err(e) => usermgmt_refuse("deluser", name, users_reason(e), console),
+            }
+        }
+        _ => {}
+    }
+}
+
+/// USERMGMT fixture, ROOT half (`loginst`, x86): runs right after LOGIN-ADDUSER while the root session is
+/// live and `boot13` is the store's only user. Results wait in `UM_ROOT` for the user half's line.
+#[cfg(feature = "loginst")]
+static UM_ROOT: Mutex<(bool, bool, bool, u32, u32)> = Mutex::new((false, false, false, 0, 0)); // (passwd_root_other, deluser_last, deluser_ok, users, deleted)
+
+#[cfg(feature = "loginst")]
+pub fn login_usermgmt_root_fixture() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        const N: &str = "umg2";
+        let mut con = crate::console::Console::new();
+        let feed = |con: &mut crate::console::Console, s: &[u8]| { for &b in s { let _ = prompt_key(b, con); } };
+        if !root_session() { return; }
+        let before = user_count();
+        shell_verb("users", &[], &mut con);
+        let users = if *USERMGMT_LAST.lock() == "listed" { user_count() as u32 } else { 0 };
+        // the last user is refused: boot13 is alone
+        let solo = user_count() == 1;
+        shell_verb("deluser", &["boot13"], &mut con);
+        let last = solo && *USERMGMT_LAST.lock() == "last-user" && id_of(b"boot13").is_some();
+        // root sets another user's password
+        let _ = create_user_unset(N.as_bytes());
+        shell_verb("passwd", &[N], &mut con);
+        feed(&mut con, b"umg2-pw\n");
+        feed(&mut con, b"umg2-pw\n");
+        let other = verify(N.as_bytes(), b"umg2-pw");
+        shell_verb("deluser", &[N], &mut con);
+        let ok = *USERMGMT_LAST.lock() == "deleted" && id_of(N.as_bytes()).is_none() && user_count() == before;
+        *UM_ROOT.lock() = (other, last, ok, users, if ok { 1 } else { 0 });
+    }
+}
+
+/// USERMGMT fixture, USER half: after LOGIN-ROOTOUT (root gone, store empty). Logs in a scratch user,
+/// asserts `deluser` self is refused and `passwd` changes the session's own password, then puts the store back.
+#[cfg(feature = "loginst")]
+pub fn login_usermgmt_fixture() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        const N: &str = "umg1";
+        let mut con = crate::console::Console::new();
+        let feed = |con: &mut crate::console::Console, s: &[u8]| { for &b in s { let _ = prompt_key(b, con); } };
+        let (other, last, del_ok, users, deleted) = *UM_ROOT.lock();
+        if create_user(N.as_bytes(), b"umg1-old").is_err() { return; }
+        let logged = login(N.as_bytes(), b"umg1-old").is_ok();
+        shell_verb("deluser", &[N], &mut con);
+        let self_refused = *USERMGMT_LAST.lock() == "self" && id_of(N.as_bytes()).is_some();
+        shell_verb("passwd", &[], &mut con);
+        feed(&mut con, b"umg1-new\n");
+        feed(&mut con, b"umg1-new\n");
+        let own = logged && verify(N.as_bytes(), b"umg1-new") && !verify(N.as_bytes(), b"umg1-old");
+        let _ = logout();
+        let cleaned = delete_user(N.as_bytes()).is_ok();
+        let ok = other && last && del_ok && own && self_refused && cleaned && users >= 1;
+        serial_println!(
+            ":: USERMGMT: users={} passwd_self={} passwd_root_other={} deluser_last={} deluser_self={} deluser_ok={} -> {} ::",
+            users, if own { "ok" } else { "FAIL" }, if other { "ok" } else { "FAIL" }, if last { "refused" } else { "ACCEPTED" }, if self_refused { "refused" } else { "ACCEPTED" }, deleted, if ok { "PASS" } else { "FAIL —" }
+        );
+    }
 }

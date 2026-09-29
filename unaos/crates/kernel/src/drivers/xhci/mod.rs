@@ -6346,7 +6346,7 @@ impl XhciController {
             // doesn't match), which keeps the retraction correct even if some earlier path already
             // zeroed `storage_slot`. A replug enumerates as a NEW slot and republishes through the
             // normal attach path, so the entry is fresh rather than duplicated.
-            crate::drivers::block::unpublish_usb_geometry(i as u8, crate::drivers::block::usb_publish_gen());
+            if crate::drivers::block::unpublish_usb_geometry(i as u8, crate::drivers::block::usb_publish_gen()) { #[cfg(feature = "login")] crate::fs::users::screen_notice(b"USB stick removed", b"the disk was unplugged\nsaving to it has stopped"); } // NOTICE
             // BOT-RESCUE: a slot that leaves takes its escalation state with it. Without this a
             // surrendered slot id, once recycled by the controller for the NEXT device, would
             // refuse that innocent device's transfers up front — the surrender must bind to the
@@ -17456,3 +17456,14 @@ fn usbnet_dev_class(desc_type: u8, c: u8) -> bool { desc_type == 0x01 && usbnet:
 #[cfg(not(feature = "usbnet"))]
 #[inline(always)]
 fn usbnet_dev_class(_desc_type: u8, _c: u8) -> bool { false }
+
+/// USBNET2: the xHCI side of `usbnet::ax_xport::AxTransport` — the existing `ax_read`/`ax_write` behind the trait (the bring-up above still calls them directly; folding it onto `ax_xport::identity` is the follow-up so this rung moves no line).
+#[cfg(feature = "usbnet")]
+#[allow(dead_code)]
+pub struct XhciAx<'a> { pub c: &'a mut XhciController, pub slot: u8 }
+#[cfg(feature = "usbnet")]
+impl usbnet::ax_xport::AxTransport for XhciAx<'_> {
+    fn reg_read(&mut self, reg: u16, out: &mut [u8]) -> bool { self.c.ax_read(self.slot, reg, out) }
+    fn reg_write(&mut self, reg: u16, data: &[u8]) -> bool { self.c.ax_write(self.slot, reg, data) }
+    fn wait_ms(&mut self, ms: u64) { XhciController::ax_wait_ms(ms) }
+}

@@ -1329,7 +1329,7 @@ fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint, coalesce: bool)
     stored
 }
 
-pub fn push_event(event: Event) {
+pub fn push_event(event: Event) { if let Event::Action(a) = event { if a.is_brightness() { #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::brightkeys::key(a); return; } } // BRIGHTKEYS — backlight keys are consumed HERE (never queued): one seam for the xHCI and EHCI decoders. ⚠ SAME-LINE fold, line-neutral.
     crate::arch::without_interrupts(|| {
         let mut q = EVENT_QUEUE.lock();
         // R0 / rtwit — EVENT_QUEUE max-hold. Declared AFTER the guard so it drops FIRST (just before
@@ -1990,7 +1990,7 @@ fn pop_event() -> Option<Event> {
         // above the router drain's own `[uvug9]` totals names a second consumer as the thief.
         EVQ_POP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
-    ev
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let ev = match ev { Some(e) if crate::video::dimidle::gate(e) => None, o => o }; ev // DIMIDLE — idle clock + waking-key swallow at the one shared drain (same-line fold)
 }
 
 /// UVUG-10 — the RE-CIRCULATION seam: pop / re-push an event WITHOUT touching the accounting counters.
@@ -2322,5 +2322,62 @@ pub fn next_event_unless_held() -> Option<Event> {
     if matches!(ev, Some(e) if !matches!(e, Event::Action(_))) {
         EVQ_POP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
-    ev
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let ev = match ev { Some(e) if crate::video::dimidle::gate(e) => None, o => o }; ev // DIMIDLE — the main router's drain (PTRLEAK) also passes the idle gate (compiler: it bypassed `pop_event`)
+}
+
+/// KEYREPEAT — timing witness for the host typematic engine, on the REAL clock. Presses 'k' at the report
+/// level, polls `typematic_tick` for 700 ms (counting emissions and the time of the first), releases through
+/// a report with an empty held set, then polls 120 ms more: `cancelled=1` iff nothing repeats after release.
+/// The delay/rate printed are the engine's own constants (`typematic::DELAY_MS`/`RATE_MS`), not restated.
+/// Bounded by a spin cap so a stopped clock FAILs instead of hanging the boot. `tick` only RETURNS the key
+/// (the pump pushes it), so the ring is untouched. Boot-time only; runs before any real keyboard report.
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
+pub fn keyrepeat_selftest() {
+    let mut spins: u64 = 0;
+    let cap: u64 = 400_000_000;
+    let t0 = crate::arch::ms();
+    typematic_note_report(b'k', &[b'k']);
+    let (mut repeats, mut first) = (0u32, 0u64);
+    while crate::arch::ms().wrapping_sub(t0) < 700 && spins < cap {
+        if typematic_tick() == Some(b'k') {
+            if repeats == 0 {
+                first = crate::arch::ms().wrapping_sub(t0);
+            }
+            repeats += 1;
+        }
+        spins += 1;
+        core::hint::spin_loop();
+    }
+    typematic_note_report(0, &[]); // release
+    let t1 = crate::arch::ms();
+    let mut after = 0u32;
+    while crate::arch::ms().wrapping_sub(t1) < 120 && spins < cap {
+        if typematic_tick().is_some() {
+            after += 1;
+        }
+        spins += 1;
+        core::hint::spin_loop();
+    }
+    let cancelled = after == 0;
+    let (d, r) = (typematic::DELAY_MS, typematic::RATE_MS);
+    // 700 ms hold: repeats expected ~ (700 - delay) / rate + 1; accept +-2 for tick granularity.
+    let want = ((700 - d) / r + 1) as u32;
+    let ok = spins < cap
+        && first >= d
+        && first <= d + 2 * r
+        && repeats + 2 >= want
+        && repeats <= want + 2
+        && cancelled;
+    serial_println!(
+        ":: KEYREPEAT: delay_ms={} rate_hz={} first_repeat_ms={} repeats={} cancelled={} -> {} ::",
+        d,
+        1000 / r,
+        first,
+        repeats,
+        cancelled as u8,
+        if ok { "PASS" } else { "FAIL" }
+    );
 }

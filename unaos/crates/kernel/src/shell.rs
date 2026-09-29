@@ -1071,7 +1071,13 @@ fn fs_mv(console: &mut Console, src: &str, dst: &str, force: bool) {
             Err(e) => return vfs_fail(console, "mv", &dpath, e),
         }
     }
-    match mt.rename(&spath, &dpath, SHELL_PRINCIPAL) {
+    let lfn_before = crate::fs::fat::sector_write_count(); // LFNMV2 M1/M2
+    let lfn_r = mt.rename(&spath, &dpath, SHELL_PRINCIPAL);
+    if crate::fs::fat::is_long_name(dpath.rsplit('/').next().unwrap_or("")) {
+        // LFNMV2 M1: always on, no `witness` gate — the operator's own `mv` prints what reached the device.
+        serial_println!("[fs] mv {} -> {} lfn=1 ok={} sectors_written={}", spath, dpath, lfn_r.is_ok(), crate::fs::fat::sector_write_count().wrapping_sub(lfn_before));
+    }
+    match lfn_r {
         Ok(()) => vfs_say(console, &alloc::format!("moved {} -> {}", spath, dpath)),
         Err(VfsError::Backend("exists")) =>
             console.println(&alloc::format!("mv: {}: file exists (-EEXIST)", dpath)),
@@ -5324,7 +5330,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // only file bytes are real; a directory's size is the recursive sum of its files.
             fs_du(console, args.first().copied().unwrap_or("."));
         },
-        #[cfg(feature = "login")] "login" | "logout" | "adduser" | "passwd" => { crate::fs::users::shell_verb(command, &args, console); } "uptime" => { // LOGIN M1 — `login <name> <password>` / `logout` (fs/users.rs); LOGIN13 M2 (R63) — `adduser <name>`, root only, the password asked for; reachable once midden_core's HOST_VERBS knows the two words (reported, not edited here). ⚠ LINE-NEUTRAL fold.
+        #[cfg(feature = "login")] "login" | "logout" | "adduser" | "passwd" | "users" | "deluser" | "whoami" => { crate::fs::users::shell_verb(command, &args, console); } "uptime" => { // LOGIN M1 — `login <name> <password>` / `logout` (fs/users.rs); LOGIN13 M2 (R63) — `adduser <name>`, root only, the password asked for; reachable once midden_core's HOST_VERBS knows the two words (reported, not edited here). ⚠ LINE-NEUTRAL fold.
             // JD18: seconds since boot from the architectural counter (aarch64 CNTPCT/CNTFRQ),
             // rendered `up HH:MM:SS`; when the JD17 wall clock is set, the current time is appended.
             // x86 has no calibrated counter plumbed → an honest note.
@@ -5552,6 +5558,18 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // (USB) / polled CMD24 (SD) that completes before the command returns, so there is no
             // write-back cache to flush. `sync` is the honest confirmation of that (a no-op by design).
             console.println("sync: write-through storage — every write is already durable on the card");
+        },
+        // WALLPAPER (rmbp-0929): `wallpaper <path>` decodes a PNG (<= 4 MB) into the desktop backdrop live; `wallpaper off`
+        // restores the flat colour. Whole mechanism in `video::wallpaper`; the witness line is its `:: WALLPAPER: ... ::`.
+        #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+        "wallpaper" => {
+            let arg = args.first().copied().unwrap_or("");
+            if arg.is_empty() {
+                console.println("usage: wallpaper <path.png> | wallpaper off");
+            } else {
+                let resolved = if arg == "off" { String::new() } else { vfs_path(arg) };
+                console.println(&crate::video::wallpaper::cmd(arg, &resolved));
+            }
         },
         "screenshot" => {
             // PRTSCR: capture the panel to `SCREEN<n>.PNG` at the volume root. The whole mechanism
@@ -5905,7 +5923,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         // argument becomes a URL rather than three positionals for the same reason `dd` takes
         // `if=`: the URL IS the standard's argument, and `curl 10.0.2.2 8000 /x` would be a verb
         // wearing a standard name over a private argument grammar.
-        "curl" => {
+        #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] "fetch" => { shell_fetch(&args, console); } "curl" => {
             // Minimal HTTP/1.0 GET over the streaming TCP client: connect, send the request,
             // read the whole response until the server closes, and print it.
             let url = args.first().copied().unwrap_or("");
@@ -6147,7 +6165,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("shutting down: invoking the platform firmware mechanism...");
             crate::power::shutdown();
         },
-        "reboot" => {
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "view" => { view_verb(console, args.first().copied()); } "reboot" => { // FILEVIEW M3 — `view <path>` opens a text file in the read-only viewer window (video/fileview.rs); ⚠ SAME-LINE fold, line-NEUTRAL, code before comment; helper at the file tail.
             console.println("rebooting: invoking the platform firmware mechanism...");
             crate::power::reboot();
         },
@@ -8595,4 +8613,173 @@ pub(crate) fn lfnmv_witness(arch: &str, sys_rc: i64, sys_want: i64) {
             said.char_indices().nth(120).map_or(said.as_str(), |(i, _)| &said[..i])
         );
     }
+}
+
+/// FILEVIEW M3 — the `view <path>` verb: open a text file in the viewer window. Read-only.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn view_verb(console: &mut Console, path: Option<&str>) {
+    let Some(p) = path else {
+        console.println("usage: view <path>   (open a text file in a read-only window)");
+        return;
+    };
+    let full = normalize_path(&cwd_path(), p);
+    match crate::video::fileview::open(&full) {
+        Ok((b, l, r, w)) => console.println(&alloc::format!("view: {} — {} bytes, {} lines, {} rows ({} wrapped)", full, b, l, r, w)),
+        Err(e) => console.println(&alloc::format!("view: {}: {}", full, e)),
+    }
+}
+
+/// NETFETCH: `fetch <http-url> [<dest-path>]` / `fetch - <http-url>` — HTTP/1.0 GET over the smoltcp TCP
+/// client (x86 `smolnet`), body streamed in 1400-byte chunks into the VFS (default
+/// `/home/<user>/Desktop/<basename>`) or, with `-`, printed to the console. 4 MB cap, 10 s overall budget,
+/// progress every 64 KB, then `[fetch] <url> -> <path> bytes=N status=S ms=T` and the `NETFETCH` witness.
+/// IP literals, or a name through `smolnet::resolve` (DHCP-provided DNS, SOCK-8). Under a hermetic QEMU
+/// run nothing calls this (no fixture server in the tree); `net_fetch::parse_gate` covers the pure half.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn shell_fetch(args: &[&str], console: &mut Console) {
+    use crate::fs::vfs::NodeKind;
+    use crate::net_fetch as nf;
+    use crate::smolnet::{self as sn, ConnectOutcome, RecvOutcome};
+    let to_console = args.first().copied() == Some("-");
+    let rest: &[&str] = if to_console { &args[1..] } else { args };
+    let Some(&url_s) = rest.first() else {
+        return console.println("usage: fetch <http-url> [<dest-path>]   |   fetch - <http-url>");
+    };
+    let Some(url) = nf::parse_url(url_s) else {
+        return console.println("fetch: bad URL (want http://host[:port]/path; https is not supported)");
+    };
+    let ms_now = || crate::arch::ms();
+    let t0 = ms_now();
+    let elapsed = || ms_now().saturating_sub(t0);
+    let witness = |status: u16, bytes: usize, saved: bool, ok: bool| {
+        serial_println!(
+            ":: NETFETCH: url={} status={} bytes={} saved={} -> {} ::",
+            url_s, status, bytes, saved as u8, if ok { "PASS" } else { "FAIL" });
+    };
+    let ip = match parse_ipv4(url.host).or_else(|| sn::resolve(url.host)) {
+        Some(ip) => ip,
+        None => {
+            console.println(&alloc::format!("fetch: cannot resolve {} (IP literals need no DNS)", url.host));
+            return witness(0, 0, false, false);
+        }
+    };
+    let Some(sid) = sn::stack_open_tcp(usize::MAX) else {
+        console.println("No network device ready.");
+        return witness(0, 0, false, false);
+    };
+    // Connect (re-driven: each call pumps a bounded budget) within the overall 10 s.
+    let mut up = false;
+    while elapsed() < nf::FETCH_TIMEOUT_MS {
+        match sn::stack_connect(sid, ip, url.port) {
+            ConnectOutcome::Established => { up = true; break; }
+            ConnectOutcome::InProgress => {}
+            ConnectOutcome::Refused => break,
+        }
+    }
+    if !up {
+        sn::stack_close(sid);
+        console.println("fetch: connection refused / timed out");
+        return witness(0, 0, false, false);
+    }
+    let req = nf::build_request(&url);
+    let (mut sent, rb) = (0usize, req.as_bytes());
+    while sent < rb.len() && elapsed() < nf::FETCH_TIMEOUT_MS {
+        match sn::stack_send(sid, &rb[sent..]) {
+            Ok(n) => sent += n,
+            Err(true) => {}
+            Err(false) => break,
+        }
+    }
+    let mut buf = [0u8; nf::FETCH_CHUNK];
+    let mut head: Vec<u8> = Vec::new();
+    let (mut status, mut body, mut next_prog) = (0u16, 0usize, nf::FETCH_PROGRESS);
+    let mut dest: Option<(crate::fs::vfs::MountTable, String)> = None;
+    let mut write_fail = false;
+    let mut timed_out = false;
+    'rx: while sent == rb.len() {
+        if elapsed() >= nf::FETCH_TIMEOUT_MS { timed_out = true; break; }
+        let n = match sn::stack_recv(sid, &mut buf) {
+            RecvOutcome::Data(n) => n,
+            RecvOutcome::WouldBlock => continue,
+            RecvOutcome::Eof => break,
+        };
+        let mut chunk: &[u8] = &buf[..n];
+        if status == 0 {
+            head.extend_from_slice(chunk);
+            if head.len() > nf::FETCH_HDR_MAX && nf::parse_response_head(&head).is_none() { break; }
+            let Some((code, off)) = nf::parse_response_head(&head) else { continue };
+            status = code;
+            let first = head.split_off(off); // bytes after the blank line
+            head.clear();
+            if status == 200 && !to_console {
+                let arg = match rest.get(1) {
+                    Some(d) => String::from(*d),
+                    None => {
+                        #[cfg(feature = "login")]
+                        let user = { let mut nm = [0u8; crate::fs::users::NAME_MAX]; crate::fs::users::whoami(&mut nm).and_then(|l| core::str::from_utf8(&nm[..l]).ok().map(String::from)) };
+                        #[cfg(not(feature = "login"))]
+                        let user: Option<String> = None;
+                        alloc::format!("/home/{}/Desktop/{}", user.as_deref().unwrap_or("user"), nf::basename(url.path))
+                    }
+                };
+                let mt = vfs_mount_table();
+                let path = vfs_path(&arg);
+                let _ = mt.unlink(&path, SHELL_PRINCIPAL);
+                if let Err(e) = mt.create(&path, NodeKind::File, SHELL_PRINCIPAL) {
+                    vfs_fail(console, "fetch", &path, e);
+                    write_fail = true;
+                    break 'rx;
+                }
+                dest = Some((mt, path));
+            }
+            // Feed the post-header remainder through the same body path below.
+            if !first.is_empty() {
+                let room = nf::FETCH_CAP - body;
+                let take = first.len().min(room);
+                if !fetch_body(console, &first[..take], &mut dest, to_console, body, &mut write_fail) { break 'rx; }
+                body += take;
+            }
+            chunk = &[];
+        }
+        if !chunk.is_empty() && status == 200 {
+            let take = chunk.len().min(nf::FETCH_CAP - body);
+            if !fetch_body(console, &chunk[..take], &mut dest, to_console, body, &mut write_fail) { break; }
+            body += take;
+        }
+        if body >= nf::FETCH_CAP { break; }
+        if body >= next_prog {
+            console.println(&alloc::format!("[fetch] {} bytes ...", body));
+            next_prog += nf::FETCH_PROGRESS;
+        }
+    }
+    sn::stack_close(sid);
+    let ms = elapsed();
+    let saved = dest.is_some() && !write_fail;
+    let path_s = match &dest { Some((_, p)) => p.as_str(), None if to_console => "-", None => "(none)" };
+    console.println(&alloc::format!("[fetch] {} -> {} bytes={} status={} ms={}", url_s, path_s, body, status, ms));
+    if timed_out { console.println("fetch: 10 s budget exhausted"); }
+    let ok = status == 200 && !write_fail && !timed_out && (saved || to_console);
+    witness(status, body, saved, ok);
+}
+
+/// NETFETCH: land one body slice — printable ASCII to the console for `fetch -`, else a VFS write at
+/// `off`. `false` on a failed write (the caller stops; `write_fail` is set).
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn fetch_body(console: &mut Console, data: &[u8], dest: &mut Option<(crate::fs::vfs::MountTable, String)>,
+              to_console: bool, off: usize, write_fail: &mut bool) -> bool {
+    if to_console {
+        let text: String = data.iter().filter_map(|&b| match b {
+            b'\n' => Some('\n'), b'\r' => None, 0x20..=0x7e => Some(b as char), _ => Some('.'),
+        }).collect();
+        console.println(&text);
+        return true;
+    }
+    if let Some((mt, path)) = dest {
+        if let Err(e) = mt.write(path, off as u64, data, SHELL_PRINCIPAL) {
+            vfs_fail(console, "fetch", path, e);
+            *write_fail = true;
+            return false;
+        }
+    }
+    true
 }

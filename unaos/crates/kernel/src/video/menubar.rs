@@ -865,6 +865,8 @@ struct Model {
     /// current, the voltage and the age are on the wire and nowhere near the damage test, which is
     /// what keeps the bar's `paints=` flat while the meter ticks at 10 s.
     batt: Option<super::status::BarItem>,
+    /// BRIGHTKEYS: the transient backlight level (`0..=16`), `Some` for 1.5 s after a brightness key.
+    bright: Option<u8>,
 }
 
 impl Model {
@@ -877,6 +879,7 @@ impl Model {
             cap_owner: wm::WIN_NONE,
             menus: super::winmenu::BarSnapshot::empty(),
             batt: None,
+            bright: None,
         }
     }
 
@@ -938,6 +941,8 @@ impl Model {
         // task (`super::status::poll`). A bar that read the SMC here would wait on six bounded
         // handshakes with interrupts off.
         m.batt = super::status::bar_item();
+        m.bright = super::status::bright_item(); // BRIGHTKEYS
+        m.batt = super::status::bar_item(); super::status::osd_overlay(&mut m.title, &mut m.title_len); // VOLKEYS: transient vol=N/16 / muted over the caption
         m.clock = clock_hhmm(); #[cfg(feature = "sntp6")] if m.clock.is_none() { barclock_note(None); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the UNSYNCED half of the bar's clock witness, latched to one line per boot at the file tail. It is reported from the MODEL, not the painter, because the painter's clock branch never runs when there is nothing to draw — which is precisely the state this half exists to say aloud.
         (m, clobbered)
     }
@@ -984,6 +989,14 @@ impl Model {
                 h = strip::fnv1a(h, 1);
                 h = strip::fnv1a(h, b.percent as u8);
                 h = strip::fnv1a(h, b.charging as u8);
+            }
+            None => h = strip::fnv1a(h, 0),
+        }
+        // BRIGHTKEYS — the transient level item: drawn state = the level, and its expiry.
+        match self.bright {
+            Some(l) => {
+                h = strip::fnv1a(h, 1);
+                h = strip::fnv1a(h, l);
             }
             None => h = strip::fnv1a(h, 0),
         }
@@ -1729,6 +1742,15 @@ fn batt_slot(w: usize) -> Option<usize> {
     Some(x0)
 }
 
+/// BRIGHTKEYS — x of the transient level item: left of the battery's (always reserved) item.
+fn bright_slot(w: usize) -> Option<usize> {
+    let x0 = clock_slot(w)?.checked_sub(strip::PAD + BATT_ITEM_W + strip::PAD + 9 * CELL_W)?;
+    if x0 < TITLE_X0 + CELL_W {
+        return None;
+    }
+    Some(x0)
+}
+
 /// **THE ONE transient-dropdown accessor** — the rect of whichever menu is currently down, or `None`.
 ///
 /// `wm::occ_clip`, `wm::composite_inner`'s sprite arm and `screen::present_background` each ask "where
@@ -1980,6 +2002,17 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
         super::font::draw_row(out, w, &pct, tx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
     }
 
+    // BRIGHTKEYS — the transient `BRT nn/16` item, one PAD left of the battery's slot (which is
+    // reserved whether or not the board has a battery, so the item never lands on the clock).
+    if let (Some(l), Some(bx0)) = (m.bright, bright_slot(w)) {
+        let l = l.min(16);
+        let mut t = *b"BRT 00/16";
+        t[4] = b'0' + l / 10;
+        t[5] = b'0' + l % 10;
+        if l < 10 { t[4] = b' '; }
+        super::font::draw_row(out, w, &t, bx0, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
+    }
+
     // Clock, right, at one PAD from the far edge — the crystal holds the LEFT corner, so nothing of
     // the brand sits out here. Secondary ink: the title is what the operator is reading, the clock is
     // what they glance at.
@@ -1988,8 +2021,8 @@ fn compose_row(out: &mut [u32], m: &Model, r: strip::Rect, j: usize) {
     // x and a second copy of `w - PAD - CLOCK_GLYPHS * CELL_W` is how a clock ends up in two places
     // at once. Same arithmetic, same guard, one definition — and it is the definition the fixture's
     // `clock=` term and [`batt_slot`] both read.
-    if let (Some(c), Some(cx)) = (m.clock, clock_slot(w)) {
-        super::font::draw_row(out, w, &c, cx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE); #[cfg(feature = "sntp6")] barclock_note(Some((cx, ty0, CLOCK_GLYPHS * CELL_W, CELL_H))); // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the SET half, reported from the one place that knows the clock's DRAWN rect. `compose_row` runs once per row per pass, so this call is on the compositor cadence and the latch at the file tail — not this site — is what makes it one line per boot (SO30).
+    if let (c, Some(cx)) = (m.clock.unwrap_or(*b"--:--"), clock_slot(w)) {
+        super::font::draw_row(out, w, &c, cx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE); clockbar_paint(out, w, sy, cx, m.clock.is_some(), &c); #[cfg(feature = "sntp6")] if m.clock.is_some() { barclock_note(Some((cx, ty0, CLOCK_GLYPHS * CELL_W, CELL_H))); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the SET half, reported from the one place that knows the clock's DRAWN rect. `compose_row` runs once per row per pass, so this call is on the compositor cadence and the latch at the file tail — not this site — is what makes it one line per boot (SO30).
     }
 }
 
@@ -2233,7 +2266,7 @@ pub fn selftest() {
     // drives `compose` with injected readings and must not perturb the census legs above; its own
     // function because it is a separate claim with a separate verdict line, and a leg folded into
     // `:: MENUBAR:` would have made a decode defect read as a geometry failure.
-    battery_selftest(pw, ph);
+    battery_selftest(pw, ph); super::status::volkeys_selftest(); // VOLKEYS fixture, own verdict lines
 
     // MENUFIRST — the enable→first-paint edge, AFTER the battery fixture and for the same two
     // reasons it is after the census legs: it drives `compose` (so it must not perturb a leg that
@@ -3014,5 +3047,58 @@ pub fn crystal_persist_selftest(pw: usize, ph: usize) {
          tries={},{},{} decl_lock={} unread={} budget_ms={} -> {}",
         landed, present, landed, words[0], words[1], words[2], matched, want, stray, sym,
         tries[0], tries[1], tries[2], decl, unread, SETTLE_BUDGET_MS, verdict
+    );
+}
+
+// CLOCKBAR — the bar's clock reads `--:--` until the civil clock is anchored (SNTP or operator seed) instead of
+// vanishing, and on a wide bar the date rides to the clock's left. Tail-appended (B94: no Location above moves).
+// Colours are the clock's own theme ink; every metric is CELL_W-derived, so it scales with the face.
+
+/// `Tue 29 Sep` — 10 glyphs.
+const CLOCKBAR_DATE_GLYPHS: usize = 10;
+/// The bar width, in glyphs, from which the date is shown: room for the crystal, a long caption, menus,
+/// the status item, the date and the clock together. Cell units, so scale-aware.
+const CLOCKBAR_WIDE_CELLS: usize = 130;
+
+static CLOCKBAR_SEEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// UTC `Www DD Mon` from Unix seconds, no heap.
+fn clockbar_date(secs: u64) -> [u8; CLOCKBAR_DATE_GLYPHS] {
+    const WD: [&[u8; 3]; 7] = [b"Thu", b"Fri", b"Sat", b"Sun", b"Mon", b"Tue", b"Wed"];
+    const MO: [&[u8; 3]; 12] = [b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec"];
+    let (_, mo, d, _, _, _) = crate::clock::civil_from_unix(secs);
+    let wd = WD[((secs / 86_400) % 7) as usize];
+    let mn = MO[(mo.clamp(1, 12) - 1) as usize];
+    let mut o = [b' '; CLOCKBAR_DATE_GLYPHS];
+    o[..3].copy_from_slice(wd);
+    o[4] = b'0' + ((d / 10) % 10) as u8;
+    o[5] = b'0' + (d % 10) as u8;
+    o[7..10].copy_from_slice(mn);
+    o
+}
+
+/// Painter tail for the clock: the date on a wide bar (left of the status item when there is room
+/// for it, else left of the clock), and the once-per-state `:: CLOCKBAR:` witness.
+fn clockbar_paint(out: &mut [u32], w: usize, sy: usize, cx: usize, anchored: bool, c: &[u8; CLOCK_GLYPHS]) {
+    if anchored && w >= CLOCKBAR_WIDE_CELLS * CELL_W {
+        if let Some(secs) = crate::clock::try_unix_now() {
+            let dw = CLOCKBAR_DATE_GLYPHS * CELL_W;
+            // The status item (battery) sits one PAD left of the clock; when the date shares the row
+            // it goes one PAD left of that slot's left edge, so the two never overlap.
+            let right = batt_slot(w).unwrap_or(cx);
+            if let Some(dx) = right.checked_sub(strip::PAD + dw) {
+                let date = clockbar_date(secs);
+                super::font::draw_row(out, w, &date, dx, sy, theme::TITLE_TEXT_INACTIVE, false, FACE);
+            }
+        }
+    }
+    let bit: u8 = if anchored { 0b10 } else { 0b01 };
+    if CLOCKBAR_SEEN.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    serial_println!(
+        ":: CLOCKBAR: anchored={} text={} drawn=1 -> PASS ::",
+        anchored as u8,
+        core::str::from_utf8(c).unwrap_or("?????")
     );
 }

@@ -76,6 +76,7 @@ pub use una_abi::BUS_VERB_CP;
 pub use una_abi::BUS_VERB_WRITE;
 pub use una_abi::BUS_VERB_RM;
 pub use una_abi::BUS_VERB_MV;
+pub use una_abi::BUS_VERB_NOTICE;
 
 /// The full set of valid verbs (both request and reply kinds). Kept as one predicate so the
 /// frozen `frame_parse` verb gate and the typed-body dispatch stay in lockstep.
@@ -83,7 +84,7 @@ pub use una_abi::BUS_VERB_MV;
 pub fn verb_valid(verb: u8) -> bool {
     matches!(
         verb,
-        BUS_VERB_LS | BUS_VERB_CAT | BUS_VERB_CP | BUS_VERB_WRITE | BUS_VERB_RM | BUS_VERB_MV
+        BUS_VERB_LS | BUS_VERB_CAT | BUS_VERB_CP | BUS_VERB_WRITE | BUS_VERB_RM | BUS_VERB_MV | BUS_VERB_NOTICE | una_abi::BUS_VERB_MENU_PUBLISH | una_abi::BUS_VERB_MENU_CLEAR | una_abi::BUS_VERB_MENU_GET
     )
 }
 

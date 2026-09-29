@@ -1,7 +1,7 @@
 # x86-wc.spec — the x86 window-compositor QEMU leg: DMGOVLP (overlap-forced banded damage, with
 # the sprite parked on the stack) plus the two ladder witnesses it depends on for ordering.
 #
-#   QEMU gate:  UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1 ./arroyo test 240 -> target/serial.log
+#   QEMU gate:  UNAOS_WC=1 UNAOS_FACET=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1 ./arroyo test 240 -> target/serial.log
 #               ./arroyo mbench --replay target/serial.log \
 #                        --spec scripts/specs/x86-wc.spec --platform x86
 #
@@ -641,7 +641,12 @@ FORBID \[status\] poll .* src=unresolved
 # the previous rotation with no writer in them, and the parent's own 72-row band holds the next one.
 # WINX-8 goes red beside it (`presents=1`) because the parent then blocks at the barrier — that is
 # the freeze half of the same mechanism, and it is why a present-only instrument could not see this.
-REQUIRE :: VUGART: frames=[1-9]\d* coherent=\d+ torn_rows=\d+ mixed_frames=0 -> PASS ::
+# VUGART2 (B221): the gate is the STREAK, not the count. Every metal FAIL in flights 14/15 was an isolated
+# one-frame barrier miss that healed the next frame (streak 1); the freeze shape is a REPEAT (streak >= 2).
+# mixed_frames / torn_rows / strand / score / severity / fps / ms ride the line as UNGATED diagnostics.
+# Go-red: PHASE.store(1, ..) reads streak_max=2 on the 2-frame QEMU population and trips the FORBID.
+REQUIRE :: VUGART: frames=[1-9]\d* coherent=\d+ torn_rows=\d+ mixed_frames=\d+ strand=\d+ score=\d+ streak_max=[01] severity=\d+ thr=streak<=1 fps=\d+ ms=\d+ -> PASS ::
+FORBID :: VUGART: .*streak_max=([2-9]|[1-9][0-9]+)
 FORBID :: VUGART: .* -> FAIL ::
 #
 # ── TSTETAP (2026-09-22), TAIL-APPENDED past VUGART ───────────────────────────────────────────────
@@ -765,6 +770,13 @@ FORBID :: MENUFIRST: .* :: SKIP ::
 # selection on the editable line (the rule TERMSEL deferred), `pc=` the PC table's four caret rows.
 REQUIRE :: TERMSEL2: legs=0x7ffff/0x7ffff hit=ok route=ok drag=ok up=ok dbl=ok sel=ok copy=ok cut_ro=ok esc=ok word=ok into_edit=ok edit=ok click_caret=ok arrows=ok insert=ok bs=ok replace=ok collapse=ok pc=ok -> PASS ::
 FORBID :: TERMSEL2: .* -> FAIL ::
+# ── TERMWRAP (rmbp-ledger B220): the shell's edit line and scrollback WRAP at the window's column count.
+# Fixture `termsel::termwrap_selftest` (panel-less Console): a cols+40 edit line takes >= 2 visual rows,
+# the caret sits at `wrap_rc(prompt+len)`, a 2*cols+5 history line costs 3 rows, and a click on the edit
+# line's second row resolves to the wrapped offset. FORBID rows=1 with a 3-digit len is the bug class.
+REQUIRE :: TERMWRAP: cols=\d+ len=\d+ rows=\d+ caret=\(\d+,\d+\) -> PASS ::
+FORBID :: TERMWRAP: .* -> FAIL ::
+FORBID :: TERMWRAP: cols=\d+ len=[0-9]{3,} rows=1 caret=
 #
 # --- BOOTSLOW (rmbp-ledger B201) — THE ROOT PASS RUNS BEFORE THE PROBES THAT DO NOT SERVE IT -----
 # Flight 12 (metal, `f12-boot1.log`): `:: SDHCBLK: registered internal SD card as block handle Sdhc`
@@ -814,3 +826,79 @@ REQUIRE \[wc-d\] latch-check forced=16 printed=1 rolled=16 win=31 reroll=0 -> PA
 # COUNT 2 reads 1 hit and the FORBID trips on `[wm] close-scope win=0 owner=0x3`.
 COUNT 2 \[wm\] close-scope win=[1-9][0-9]* owner=0x[0-9a-f]+ next_focus=
 FORBID \[wm\] close-scope win=0 
+
+# CLOCKBAR (rmbp-0929): the menubar clock draws `--:--` until anchored, then HH:MM; once per state per boot.
+# The unanchored line is bounded by state, not by count: SNTP may anchor before the first draw, so only the
+# anchored=1 line is REQUIRED; the FORBID rejects any draw that reports drawn=0 or FAILs.
+REQUIRE :: CLOCKBAR: anchored=1 text=
+FORBID :: CLOCKBAR: .* -> FAIL ::
+FORBID :: CLOCKBAR: anchored=[01] text=[^ ]* drawn=0
+# ── DIMIDLE (rmbp-0929) — IDLE SCREEN BLANKING; the waking key is swallowed ─────────────────────────
+# After UNAOS_IDLE_MIN minutes (default 10) without input the panel is black and the compositor
+# refuses (`panel_refuse_term` -> "idle-blank"); the next key wakes it and is dropped at `pal::pop_event`,
+# so no window sees it. The fixture uses a 1 s threshold, blanks, injects a key, and scores it.
+# Needs `witness` and >= 12 s of boot. GO-RED: drop the `gate` swallow (wake_key_swallowed=0 -> FAIL).
+REQUIRE :: DIMIDLE: idle_min=[0-9]+ blanked_at_ms=[1-9][0-9]* woke_at_ms=[1-9][0-9]* wake_key_swallowed=1 -> PASS ::
+FORBID :: DIMIDLE: .* -> FAIL ::
+# ── WINCYCLE (rmbp-0929) — Alt+Tab cycles app windows; a title double-click zooms/restores ──────────
+# The fixture mints three rows, cycles twice (bottom-raise rotation), zooms and restores one. GO-RED:
+# make `cycle_pick` return None -> `after_tab` no longer the second-least-recent and FAIL prints.
+REQUIRE :: WINCYCLE: windows=[0-9]+ order=\[[0-9, ]+\] after_tab=[1-9][0-9]* zoom=[0-9]+x[0-9]+->[0-9]+x[0-9]+ restored=1 -> PASS ::
+FORBID :: WINCYCLE: .* -> FAIL ::
+REQUIRE \[wm-act\] cycle win=[1-9][0-9]* owner=0x[0-9a-f]+ at \(0,0\) -> action=cycle raised
+REQUIRE \[wm-act\] action=zoom win=[1-9][0-9]* route=title-dbl -> zoomed
+# --- KEYREPEAT (2026-09-29) -------------------------------------------------------------------
+# --- typematic timing on the REAL clock: hold 'k' 700 ms, release, watch 120 ms more. Delay/rate
+# --- are the engine's own constants; `cancelled=1` = nothing repeats after the release report.
+# --- GO-RED, ONE EDIT: raise `typematic::DELAY_MS` above 700 -> first_repeat_ms=0 repeats=0 -> FAIL.
+REQUIRE :: KEYREPEAT: delay_ms=\d+ rate_hz=\d+ first_repeat_ms=\d+ repeats=\d+ cancelled=1 -> PASS ::
+FORBID :: KEYREPEAT: .* -> FAIL ::
+# --- WALLPAPER (rmbp-0929) --------------------------------------------------------------------
+# --- The desktop backdrop picture. Needs UNAOS_FACET=1 (it rides the viewer's PNG decoder). On QEMU
+# --- no `/WALL.PNG` exists on the volume, so the one line the boot can print is the `src=none`
+# --- witness (emitted by `wallpaper::poll` after its retries run out): pin exactly that, so a build
+# --- where the module or its hook never ran reads RED instead of silently absent. Metal with a real
+# --- file prints `src=<path> WxH=.. scaled=.. letterbox=.. ms=.. -> PASS` and is the bench's read.
+REQUIRE :: WALLPAPER: src=none WxH=0x0 scaled=0x0 letterbox=0 ms=0 -> PASS ::
+FORBID :: WALLPAPER: .* -> FAIL ::
+# FILEVIEW (rmbp-0929): the read-only text viewer window (video/fileview.rs). The fixture opens the
+# first plain text-named root file the mount table lists (or, with no volume bound yet, an in-memory
+# body named `mem:FILEVIEW.TXT`), scrolls one row, checks the window is registered, and closes it.
+# GO-RED: with fileview absent no line prints and the REQUIRE misses; a viewer that lays out zero rows,
+# will not scroll, or leaves its window open prints `-> FAIL ::` and trips the FORBID.
+REQUIRE :: FILEVIEW: path=\S+ bytes=[0-9]+ lines=[1-9][0-9]* rows=[1-9][0-9]* wrapped=[0-9]+ -> PASS ::
+FORBID :: FILEVIEW: .* -> FAIL ::
+FORBID \[fileview\] refuse 
+# --- DOCKRUN — the running tile's gestures: a window mints a tile with the running pip, a press raises it,
+# --- a right-click/long-press menu's Quit closes the owner and the tile leaves.
+REQUIRE :: DOCKRUN: tiles=\d+ running=\d+ pinned=\d+ raise=ok quit=ok menu_drawn=1 -> PASS ::
+FORBID :: DOCKRUN: .* -> FAIL ::
+# --- SHOTMOUNT (SO19, FSNS): a capture's bytes go THROUGH THE MOUNT TABLE (`mt.create`/`mt.write`, as
+# --- `shell::fs_write` does), so the file lands where `ls /` says the namespace is. The witness prints once per
+# --- capture at the verdict; `via=fat` means the table could not create the entry and the FAT-direct
+# --- fallback took it, which is the SO19 defect and is FORBIDDEN. A capture needs a user session + a writable
+# --- volume (`UNAOS_PRTSCRST=1 UNAOS_LOGIN=1 UNAOS_LOGINST=1`, plus the kepler knobs), so the REQUIRE below is
+# --- ARMED ONLY on that lane: uncomment it there (a REQUIRE on the plain lane would read silence as red).
+# REQUIRE :: SHOTMOUNT: via=vfs path=/home/una/Desktop/[A-Za-z0-9 ._-]+ bytes=[0-9]+ -> PASS ::
+FORBID :: SHOTMOUNT: via=fat
+FORBID :: SHOTMOUNT: .* -> FAIL
+# --- APPMENU (R73, arc (a)) — the ring-3 menu verb, exercised by the witness-gated fixture in
+# --- arch/x86_64/syscall.rs (`appmenu_fixture`, called from the head of `busx86_stamp_check`): a
+# --- kernel-minted owner (scratch row 6 -> owner 7) publishes a 3-item tree through the production
+# --- `busx_msend_for` path, reads it back through GET, has a 65-item tree and a caller-stamped
+# --- principal refused with the registry unchanged, takes a pick in ITS OWN ring while every other
+# --- ring stays quiet (ledger leg 1: identity, not focus), and is reaped (leg 4). Runs on this lane
+# --- because it needs `witness` + `wc`; the click-driven pick (`[menubar] pick owner= item=`) needs a
+# --- real ring-3 publisher and is pinned only negatively (never `delivered=false`).
+REQUIRE :: APPMENU: verb=publish owner=7 items=3 depth=2 bar=\d+/\d+ -> PASS ::
+REQUIRE :: APPMENU: owner=7 items=3 published=1 -> PASS ::
+REQUIRE :: APPMENU: readback owner=7 items=3 match=true -> PASS ::
+REQUIRE :: APPMENU: verb=publish owner=7 reason=items-cap -> REFUSED ::
+REQUIRE :: APPMENU: refuse items=65 principal=caller registry_unchanged=true -> PASS ::
+REQUIRE :: APPMENU: owner=7 items=3 pick_to=owner others_quiet=true -> PASS ::
+REQUIRE :: APPMENU: owner=7 closed reaped=true -> PASS ::
+REQUIRE :: APPMENU: owner=7 reaped empty=true -> PASS ::
+FORBID :: APPMENU: .* -> FAIL ::
+FORBID :: APPMENU: verb=publish owner=[0-9]+ items=(6[5-9]|[7-9][0-9]|[1-9][0-9][0-9]) .* -> PASS ::
+FORBID \[winmenu\] publish owner=0 
+FORBID \[menubar\] pick owner=[0-9]+ item=[0-9]+ delivered=false

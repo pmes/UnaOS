@@ -1,5 +1,7 @@
 # DIRNS — prep
 
+Status: M1..M2 written, uncompiled
+
 ## The finding
 
 LEDGER SO20: "`SYS_OPEN` has no directory namespace — every EL0 file is pinned to the volume
@@ -122,3 +124,12 @@ fn el0_walk_from<'p>(fs: &crate::fs::fat::FatFs, base: u32, path: &'p str)
 // let rel = open_locate_from(&fs, home, "RELHOME.TXT", O_CREAT, &mut created_rel);
 // let relhome_ok = matches!(rel, Ok(_)) && created_rel && !fs.locate_in_dir(0, "RELHOME.TXT").is_ok();
 ```
+
+## Written
+
+- M1: `unaos/scripts/specs/x86-login.spec` (x86 spelling) and `arm-login.spec` (aarch64 spelling incl. `relhome`) pin `:: DIRNS:`.
+- M2: `fs/vfs.rs` `el0_walk_from`, `el0_session_base`, `el0_dir_cluster`, `el0_locate_in`, `el0_locate_leaf` (el0_walk now seeds from the session home for non-absolute paths, falling back to root); aarch64 `dirns_witness` leg 6 `relhome`. x86 `dirns_witness` has no relhome leg (service task has no injectable base).
+
+- Rule (callback fix): a path WITHOUT a leading `/` is HOME-relative, a leading `/` is volume-root. aarch64 login fixtures (`home_acl_fixture`, `session_epoch_fixture`, `ident_fixture`) made absolute via `fixture_abs` in arch/aarch64/syscall.rs (users.rs untouched). Other el0_locate callers pass leaves/absolute paths.
+
+- x86 LOGIN-ROOTOUT `stat-elf-absent` (callback): NOT the home-relative rule. `FatFs::find_app` walks `find_in_root("APPS")` and never touches `el0_walk`/`el0_locate`; fs/fat.rs is unchanged since the LFN2 merge except the LFNMV2 counter. Program lookups are already root-based; no code change made. Suspect image staging (arroyo stages STAT.ELF at the DATA volume ROOT, `find_app` wants `/APPS/STAT.ELF`).

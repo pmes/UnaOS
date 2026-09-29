@@ -1,0 +1,426 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+//
+//! FILEVIEW — a read-only text viewer window: what a double-click on `NOTES.TXT` opens.
+//!
+//! Quarry launched ELFs and (with `facet`) showed PNGs; every other file said `no opener`. This is
+//! the second opener, and it is deliberately the smallest one that is a real window: a monospace
+//! grid painted into a cached-RAM surface with `font::draw_text` (the console's glyph path), scrolled
+//! by arrows / wheel / space, titled with the FILE's name (R36), closed by the close box.
+//!
+//! * [`open`] reads through `crate::shell::vfs_mount_table()`, at most [`MAX_BYTES`]; a longer file
+//!   shows its head and a final `...truncated` row. Long lines wrap at the window's column count.
+//! * [`request_open`] is the click-router-safe door (a latch drained by [`service`], chained from
+//!   `quarry::live::service`) — the same stack-depth reason `facet::request_open` documents.
+//! * Keys and wheel arrive through [`key_route`], chained from `quarry::live::key_route` (the router
+//!   files are byte-identity-critical); the press through [`press_route`], chained from
+//!   `quarry::live::press_route`.
+//!
+//! Text is bytes: printable ASCII is drawn, `\t` is four spaces, `\r` is dropped, anything else is
+//! `?` (the face carries no glyph for it). One viewer window at a time; opening another file
+//! replaces the first.
+//!
+//! Witness: `:: FILEVIEW: path=<p> bytes=<n> lines=<n> rows=<n> wrapped=<n> -> PASS ::` ([`selftest`]).
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use crate::video::{font, theme, wm};
+
+/// Kernel-furniture owner slot (`+ 5`, after Facet's `+ 4`).
+pub const OWNER: u64 = wm::KERNEL_OWNER_BASE + 5;
+const _: () = assert!(OWNER != wm::KERNEL_OWNER_CONSOLE && OWNER != wm::KERNEL_OWNER_DESKTOP);
+const _: () = assert!(OWNER != super::quarry::live::OWNER);
+
+/// Read ceiling, bytes.
+pub const MAX_BYTES: usize = 256 * 1024;
+const CHUNK: usize = 16 * 1024;
+const WIN_W: usize = 720;
+const WIN_H: usize = 480;
+const PAD: usize = 6;
+const WHEEL_ROWS: usize = 3;
+const TAIL: &str = "...truncated";
+
+static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
+static PENDING: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+static STATE: spin::Mutex<Option<State>> = spin::Mutex::new(None);
+
+struct State {
+    path: String,
+    /// Wrapped display rows, each a byte range into `text`.
+    rows: Vec<(u32, u32)>,
+    text: Vec<u8>,
+    top: usize,
+    vis: usize,
+    cols: usize,
+    w: usize,
+    h: usize,
+    surf: Vec<u32>,
+}
+
+/// What [`layout`] found.
+pub struct Layout {
+    pub rows: Vec<(u32, u32)>,
+    pub lines: usize,
+    pub wrapped: usize,
+}
+
+/// Sanitise raw bytes to drawable ASCII (see module header). Pure.
+pub fn sanitize(raw: &[u8]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(raw.len());
+    for &b in raw {
+        match b {
+            b'\n' => o.push(b'\n'),
+            b'\r' => {}
+            b'\t' => o.extend_from_slice(b"    "),
+            0x20..=0x7e => o.push(b),
+            _ => o.push(b'?'),
+        }
+    }
+    o
+}
+
+/// Split `text` (already sanitised) into display rows of at most `cols` bytes. `lines` counts logical
+/// lines (a trailing newline does not open one more); `wrapped` counts the EXTRA rows wrapping made.
+/// Pure.
+pub fn layout(text: &[u8], cols: usize) -> Layout {
+    let cols = cols.max(1);
+    let mut rows: Vec<(u32, u32)> = Vec::new();
+    let (mut lines, mut wrapped) = (0usize, 0usize);
+    let mut i = 0usize;
+    while i < text.len() {
+        let end = text[i..].iter().position(|&b| b == b'\n').map(|p| i + p).unwrap_or(text.len());
+        lines += 1;
+        let mut s = i;
+        if s == end {
+            rows.push((s as u32, s as u32));
+        }
+        while s < end {
+            let e = core::cmp::min(s + cols, end);
+            rows.push((s as u32, e as u32));
+            if e < end {
+                wrapped += 1;
+            }
+            s = e;
+        }
+        i = end + 1;
+    }
+    Layout { rows, lines, wrapped }
+}
+
+/// Clamp a scroll offset so the last page stays full. Pure.
+pub fn clamp_top(top: usize, rows: usize, vis: usize) -> usize {
+    core::cmp::min(top, rows.saturating_sub(vis))
+}
+
+fn title_of(path: &str) -> String {
+    String::from(path.rsplit('/').next().unwrap_or(path))
+}
+
+/// Is this a name Quarry should open here: `.TXT` `.MD` `.LOG` `.SPEC`, or no extension at all.
+/// (`.ELF`/`.BIN` are tested first by the caller and never reach this.) Pure.
+pub fn is_text_name(name: &str) -> bool {
+    match name.rfind('.') {
+        Some(i) if i > 0 && i + 1 < name.len() => {
+            let e = &name.as_bytes()[i + 1..];
+            e.eq_ignore_ascii_case(b"txt")
+                || e.eq_ignore_ascii_case(b"md")
+                || e.eq_ignore_ascii_case(b"log")
+                || e.eq_ignore_ascii_case(b"spec")
+        }
+        _ => !name.is_empty(),
+    }
+}
+
+pub fn is_open() -> bool {
+    WIN.load(Ordering::Relaxed) != wm::WIN_NONE
+}
+
+pub fn shown() -> String {
+    STATE.lock().as_ref().map(|s| s.path.clone()).unwrap_or_default()
+}
+
+/// Latch a path for [`service`] (click-router safe).
+pub fn request_open(path: &str) {
+    *PENDING.lock() = Some(String::from(path));
+}
+
+/// Drain the latch. Chained from `quarry::live::service`.
+pub fn service() {
+    let want = PENDING.lock().take();
+    if let Some(p) = want {
+        if let Err(e) = open(&p) {
+            serial_println!("[fileview] refuse path={} reason={}", p, e);
+        }
+    }
+}
+
+/// Read up to [`MAX_BYTES`] of `path`; `(bytes, truncated)`.
+fn read_capped(path: &str) -> Result<(Vec<u8>, bool), String> {
+    let mt = crate::shell::vfs_mount_table();
+    let st = mt.stat(path).map_err(|e| alloc::format!("vfs: {:?}", e))?;
+    if matches!(st.kind, crate::fs::vfs::NodeKind::Dir) {
+        return Err(String::from("is a directory"));
+    }
+    let want = core::cmp::min(st.size as usize, MAX_BYTES);
+    let mut out: Vec<u8> = Vec::new();
+    if out.try_reserve_exact(want).is_err() {
+        return Err(String::from("out of memory"));
+    }
+    while out.len() < want {
+        let n = core::cmp::min(CHUNK, want - out.len());
+        let got = mt.read(path, out.len() as u64, n).map_err(|e| alloc::format!("vfs: {:?}", e))?;
+        if got.is_empty() {
+            break;
+        }
+        out.extend_from_slice(&got);
+    }
+    Ok((out, st.size as usize > MAX_BYTES))
+}
+
+/// **Open `path` in a viewer window.** Returns `(bytes, lines, rows, wrapped)` on success.
+pub fn open(path: &str) -> Result<(usize, usize, usize, usize), String> {
+    let (raw, trunc) = read_capped(path)?;
+    open_bytes(path, &raw, trunc)
+}
+
+/// [`open`]'s body over bytes already in hand (also the fixture's fallback door).
+pub fn open_bytes(path: &str, raw: &[u8], truncated: bool) -> Result<(usize, usize, usize, usize), String> {
+    let mut text = sanitize(raw);
+    let n_bytes = raw.len();
+    if truncated {
+        if !text.is_empty() && *text.last().unwrap() != b'\n' {
+            text.push(b'\n');
+        }
+        text.extend_from_slice(TAIL.as_bytes());
+    }
+    let pi = crate::video::panel_info_nonblocking().ok_or_else(|| String::from("panel busy"))?;
+    let (pw, ph) = (pi.width, pi.height);
+    let w = WIN_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
+    let h = WIN_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
+    let face = font::Face::Body;
+    let (cw, ch) = (face.cell_w(), face.cell_h());
+    let cols = w.saturating_sub(2 * PAD + 6) / cw;
+    let vis = h.saturating_sub(2 * PAD) / ch;
+    if cols < 8 || vis < 2 {
+        return Err(String::from("window below floor"));
+    }
+    let lay = layout(&text, cols);
+    let len = w * h;
+    let mut surf: Vec<u32> = Vec::new();
+    if surf.try_reserve_exact(len).is_err() {
+        return Err(String::from("out of memory"));
+    }
+    surf.resize(len, theme::CONTENT_FILL);
+
+    if is_open() {
+        close();
+    }
+    let (_s, ow, oh) = wm::spawn_geometry(w, h).ok_or_else(|| String::from("geometry unavailable"))?;
+    let wtop = crate::ui_status::top_chrome_h(pw, ph);
+    let ox = pw.saturating_sub(ow) / 2;
+    let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
+    let (rows_n, lines_n, wrapped_n) = (lay.rows.len(), lay.lines, lay.wrapped);
+    let mut st = State {
+        path: String::from(path),
+        rows: lay.rows,
+        text,
+        top: 0,
+        vis,
+        cols,
+        w,
+        h,
+        surf,
+    };
+    paint(&mut st);
+    let base = st.surf.as_ptr() as usize;
+    let title = title_of(path);
+    // The Vec<u32> lives in STATE for the window's life; `close` drops the row before the buffer.
+    let id = wm::create_at(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, title.as_bytes(), ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
+    if id == wm::WIN_NONE {
+        return Err(String::from("window create failed"));
+    }
+    *STATE.lock() = Some(st);
+    WIN.store(id, Ordering::Relaxed);
+    wm::winid_register_holder(&WIN, "fileview");
+    wm::focus_changed(OWNER);
+    let _ = wm::present(id);
+    serial_println!(
+        "[fileview] open win={} path={} bytes={} lines={} rows={} wrapped={} cols={} vis={} truncated={}",
+        id, path, n_bytes, lines_n, rows_n, wrapped_n, cols, vis, truncated as u8
+    );
+    Ok((n_bytes, lines_n, rows_n, wrapped_n))
+}
+
+/// Close the window; the surface is freed after the row stops naming it.
+pub fn close() {
+    let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
+    if id == wm::WIN_NONE {
+        return;
+    }
+    wm::close(id);
+    *STATE.lock() = None;
+    serial_println!("[fileview] closed win={}", id);
+}
+
+/// Repaint `st.surf` for `st.top`.
+fn paint(st: &mut State) {
+    let face = font::Face::Body;
+    let (cw, ch) = (face.cell_w(), face.cell_h());
+    let _ = cw;
+    let (w, h) = (st.w, st.h);
+    for p in st.surf.iter_mut() {
+        *p = theme::CONTENT_FILL;
+    }
+    for r in 0..st.vis {
+        let Some(&(a, b)) = st.rows.get(st.top + r) else { break };
+        let s = &st.text[a as usize..b as usize];
+        font::draw_text(&mut st.surf, w, w - 6, h, PAD, PAD + r * ch, s, theme::CONTENT_TEXT, false, face);
+    }
+    // Scroll thumb on the right edge (proportional; full height when everything fits).
+    let total = st.rows.len().max(1);
+    let (x0, x1) = (w - 5, w - 1);
+    let th = if total <= st.vis { h } else { (h * st.vis / total).max(8) };
+    let ty = if total <= st.vis { 0 } else { (h - th) * st.top / (total - st.vis) };
+    for y in 0..h {
+        let c = if y >= ty && y < ty + th { theme::SCROLL_THUMB } else { theme::SCROLL_TRACK };
+        for x in x0..x1 {
+            st.surf[y * w + x] = c;
+        }
+    }
+}
+
+/// Scroll to `top` (clamped), repaint, present. `true` when the view moved.
+fn scroll_to(top: isize) -> bool {
+    let id = WIN.load(Ordering::Relaxed);
+    let mut g = STATE.lock();
+    let Some(st) = g.as_mut() else { return false };
+    let t = clamp_top(top.max(0) as usize, st.rows.len(), st.vis);
+    if t == st.top {
+        return false;
+    }
+    st.top = t;
+    paint(st);
+    drop(g);
+    let _ = wm::present(id);
+    true
+}
+
+fn cur() -> Option<(isize, usize, usize)> {
+    STATE.lock().as_ref().map(|s| (s.top as isize, s.vis, s.rows.len()))
+}
+
+/// Keys and wheel. `true` when consumed. Only while this window holds focus.
+pub fn key_route(ev: crate::pal::Event) -> bool {
+    if !is_open() || wm::focus_asid() != OWNER {
+        return false;
+    }
+    let Some((top, vis, n)) = cur() else { return false };
+    match ev {
+        crate::pal::Event::Wheel(d) => {
+            // Positive = wheel away = content moves down = view moves UP.
+            scroll_to(top - d as isize * WHEEL_ROWS as isize);
+            true
+        }
+        crate::pal::Event::Key(c) => {
+            let page = vis.saturating_sub(1).max(1) as isize;
+            match c {
+                0x1F => scroll_to(top - 1),
+                0x1E => scroll_to(top + 1),
+                // PageUp/PageDown have no decoded byte on either HID path yet: space/`b` page.
+                b' ' => scroll_to(top + page),
+                b'b' | b'B' => scroll_to(top - page),
+                b'g' => scroll_to(0),
+                b'G' => scroll_to(n as isize),
+                _ => return false,
+            };
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Pointer: close box, and raise on a press in the content. `true` when consumed.
+pub fn press_route(x: i32, y: i32) -> bool {
+    let id = WIN.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE {
+        return false;
+    }
+    match wm::hit_test(x, y) {
+        Some((w, _, _)) if w == id => {}
+        _ => return false,
+    }
+    if wm::close_box_hit(id, x, y) {
+        serial_println!("[fileview] press close win={} at ({},{})", id, x, y);
+        close();
+        return true;
+    }
+    let Some(info) = wm::info(id) else { return false };
+    if x < info.x as i32 || y < info.y as i32 {
+        return false;
+    }
+    let sc = info.scale.max(1);
+    if (x as usize - info.x) / sc >= info.w || (y as usize - info.y) / sc >= info.h {
+        return false;
+    }
+    wm::focus_changed(OWNER);
+    true
+}
+
+// ── The fixture ─────────────────────────────────────────────────────────────────────────────────
+
+/// FILEVIEW — open a file the boot image carries, count what the viewer laid out, close it.
+///
+/// The file is the first plain root entry with a text-ish name (`README`, `*.TXT`, `*.MD`…) found by
+/// listing `/` through the mount table. A boot whose volume is not bound yet (or carries none) falls
+/// back to an in-memory body and says so in `path=` (`mem:FILEVIEW.TXT`) — the layout/scroll legs are
+/// the claim there, and the file leg is the claim wherever a volume exists. Legs: rows > 0, a scroll
+/// step moves the view, and the window closes.
+#[cfg(feature = "witness")]
+pub fn selftest() {
+    use core::sync::atomic::AtomicBool;
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let mut chosen: Option<String> = None;
+    {
+        let mt = crate::shell::vfs_mount_table();
+        if let Ok(ents) = mt.read_dir("/") {
+            for e in ents.iter() {
+                if !matches!(e.kind, crate::fs::vfs::NodeKind::Dir) && is_text_name(&e.name) && !e.name.starts_with('.') {
+                    chosen = Some(alloc::format!("/{}", e.name));
+                    break;
+                }
+            }
+        }
+    }
+    let res = match chosen {
+        Some(p) => open(&p).map(|r| (p, r)),
+        None => {
+            let mut body = String::new();
+            for i in 0..80 {
+                body.push_str(&alloc::format!("line {} of the FILEVIEW fixture body, long enough that the narrow columns wrap it onto a second row when the window is small {}\n", i, "x".repeat(60)));
+            }
+            let p = String::from("mem:FILEVIEW.TXT");
+            open_bytes(&p, body.as_bytes(), false).map(|r| (p, r))
+        }
+    };
+    match res {
+        Ok((p, (bytes, lines, rows, wrapped))) => {
+            let (top0, vis, _) = cur().unwrap_or((0, 0, 0));
+            let moved = rows > vis && scroll_to(top0 + 1);
+            let scroll_ok = rows <= vis || moved;
+            let shown_ok = shown() == p && is_open();
+            close();
+            let closed = !is_open();
+            let ok = rows > 0 && lines > 0 && scroll_ok && shown_ok && closed;
+            serial_println!(
+                ":: FILEVIEW: path={} bytes={} lines={} rows={} wrapped={} -> {} ::",
+                p, bytes, lines, rows, wrapped, if ok { "PASS" } else { "FAIL" }
+            );
+        }
+        Err(e) => serial_println!(":: FILEVIEW: refused reason={} -> FAIL ::", e),
+    }
+}

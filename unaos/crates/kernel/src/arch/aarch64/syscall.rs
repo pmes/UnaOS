@@ -23155,6 +23155,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
             },
             Err(_) => return EINVAL,
         },
+        crate::bus::BUS_VERB_NOTICE => { crate::fs::users::screen_notice_from(asid as u64, body); 0 } // NOTICE: aarch64 wm owner IS the asid
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
     bus_reply_enqueue(asid, hdr.corr, hdr.verb, status, &text)
@@ -24769,7 +24770,7 @@ pub fn home_acl_fixture(path: &str) -> bool {
     let p_anon = slot_ppid_of(A_ANON);
     let p_user2 = slot_ppid_of(A_USER2);
     let mut created = false;
-    let (de, lba, off) = match open_locate(&fs, path, O_CREAT, &mut created) {
+    let (de, lba, off) = match open_locate(&fs, fixture_abs(path, &mut [0u8; 48]), O_CREAT, &mut created) {
         Ok(t) => t,
         Err(e) => {
             serial_println!("[users] home-acl: open_locate({}) -> errno {}", path, e);
@@ -24807,6 +24808,9 @@ pub fn home_acl_fixture(path: &str) -> bool {
 const DIRNS_DIR: &str = "DIRNSD";
 #[cfg(feature = "witness")]
 const DIRNS_SUB: &str = "SUB";
+/// DIRNS M2: the fixture's SUB directory as an absolute path — the relhome leg's base.
+#[cfg(feature = "witness")]
+const DIRNS_SUB_ABS: &str = "/DIRNSD/SUB";
 #[cfg(feature = "witness")]
 const DIRNS_ROOTFILE: &str = "/DIRNS.TXT";
 #[cfg(feature = "witness")]
@@ -24948,15 +24952,36 @@ pub fn dirns_witness() {
         _ => false,
     };
 
+    // --- leg 6: relhome — a NON-absolute path resolves under the session home, not the root. ----
+    // DIRNS M2. Drives `el0_locate_in` with the fixture's own directory as the base (no live session
+    // needed): the file must land INSIDE that directory and must NOT appear at the volume root.
+    let mut c6 = false;
+    let relhome_ok = match crate::fs::vfs::el0_dir_cluster(&fs, DIRNS_SUB_ABS) {
+        Some(base) if base != 0 => {
+            let made = crate::fs::vfs::el0_locate_in(&fs, base, "REL.TXT", true, &mut c6).is_ok() && c6;
+            let inside = fs.locate_in_dir(base, "REL.TXT").is_ok();
+            let at_root = fs.locate_in_dir(0, "REL.TXT").is_ok();
+            let abs_ignores = matches!(crate::fs::vfs::el0_locate_in(&fs, base, DIRNS_ROOTFILE, false, &mut c6), Ok(_));
+            made && inside && !at_root && abs_ignores
+        }
+        _ => false,
+    };
+    let mut c7 = false;
+    if let Ok((de, lba, off)) = crate::fs::vfs::el0_locate(&fs, "/DIRNSD/SUB/REL.TXT", false, &mut c7) {
+        owned_clear(lba, off as u32);
+        let _ = fs.delete_located(lba, off, de.first_cluster()); // must go before the scrub, or SUB is non-empty and stays
+    }
+
     dirns_scrub(&fs);
-    let pass = abs_ok && nested_ok && escape_refused && acl_ok && root_ok;
+    let pass = abs_ok && nested_ok && escape_refused && acl_ok && root_ok && relhome_ok;
     serial_println!(
-        ":: DIRNS: abs={} nested={} escape={} acl={} root={} (wrote={} read={} root_alias={} esc={}->{}) -> {} ::",
+        ":: DIRNS: abs={} nested={} escape={} acl={} root={} relhome={} (wrote={} read={} root_alias={} esc={}->{}) -> {} ::",
         if abs_ok { "ok" } else { "FAIL" },
         if nested_ok { "ok" } else { "FAIL" },
         if escape_refused { "refused" } else { "FAIL" },
         if acl_ok { "refused" } else { "FAIL" },
         if root_ok { "ok" } else { "FAIL" },
+        if relhome_ok { "ok" } else { "FAIL" },
         wrote,
         body.len(),
         root_alias,
@@ -25019,7 +25044,7 @@ pub fn session_epoch_fixture(path: &str, id: u32, name: &[u8]) -> bool {
     let p_own = slot_ppid_of(A_OWN);
     let p_stale_live = slot_ppid_of(A_STALE);
     let mut created = false;
-    let (de, lba, off) = match open_locate(&fs, path, O_CREAT, &mut created) {
+    let (de, lba, off) = match open_locate(&fs, fixture_abs(path, &mut [0u8; 48]), O_CREAT, &mut created) {
         Ok(t) => t,
         Err(e) => {
             serial_println!("[users] epoch: open_locate({}) -> errno {}", path, e);
@@ -25104,7 +25129,7 @@ pub fn ident_fixture(path: &str, name_a: &[u8], uid_a: u32, name_b: &[u8], uid_b
     slot_ppid_stamp(A_A2, p_a2);
     slot_epoch_stamp(A_A2);
     let mut created = false;
-    let (de, lba, off) = match open_locate(&fs, path, O_CREAT, &mut created) {
+    let (de, lba, off) = match open_locate(&fs, fixture_abs(path, &mut [0u8; 48]), O_CREAT, &mut created) {
         Ok(t) => t,
         Err(e) => {
             serial_println!("[users] ident: open_locate({}) -> errno {}", path, e);
@@ -25651,4 +25676,16 @@ fn lfnmv_launcher() {
         return;
     }
     crate::shell::lfnmv_witness("aarch64", LFNMV_SYSRC.load(Ordering::Acquire), EINVAL);
+}
+
+/// DIRNS M2 RULE: a path WITHOUT a leading `/` is HOME-relative; a leading `/` is volume-root. The
+/// in-kernel login fixtures spell root-relative multi-component paths (`HOME/una/NOTES.TXT`), so they
+/// are made absolute here (`/HOME/una/NOTES.TXT`) before they reach the resolver.
+fn fixture_abs<'a>(path: &'a str, buf: &'a mut [u8; 48]) -> &'a str {
+    if path.starts_with('/') || path.len() + 1 > buf.len() {
+        return path;
+    }
+    buf[0] = b'/';
+    buf[1..1 + path.len()].copy_from_slice(path.as_bytes());
+    core::str::from_utf8(&buf[..1 + path.len()]).unwrap_or(path)
 }

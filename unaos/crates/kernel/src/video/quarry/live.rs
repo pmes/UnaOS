@@ -453,6 +453,8 @@ enum Act {
     Launch(String),
     /// A double-click on something Quarry cannot open yet. Census, no action.
     NoOpener(String),
+    /// FILEVIEW — show this absolute path in the read-only text viewer (`video/fileview.rs`).
+    Text(String),
     /// FACET — show this absolute path in the image viewer. The FIRST opener this tree has ever had:
     /// [`Act::NoOpener`]'s census line says "no opener exists in this tree", and for `.PNG` that
     /// sentence has stopped being true. Kept as its own variant rather than folded into
@@ -748,6 +750,9 @@ fn open_handler(name: &str) -> &'static str {
     if crate::video::facet::is_png_name(name) {
         return "facet";
     }
+    if crate::video::fileview::is_text_name(name) {
+        return "fileview";
+    }
     "none"
 }
 
@@ -785,6 +790,7 @@ fn act_tail(act: &Act) -> Option<String> {
         // read "nothing", which is exactly the word an operator must not be given for a gesture
         // the window DID understand and DID refuse.
         Act::NoOpener(p) => Some(alloc::format!("select ({})", no_handler_reason(&leaf(p)))),
+        Act::Text(p) => Some(alloc::format!("open kind={} handler=fileview", open_kind(&leaf(p)))),
     }
 }
 
@@ -1271,6 +1277,10 @@ impl Model {
             if crate::video::facet::is_png_name(&name) {
                 return Act::View(p);
             }
+            // FILEVIEW — `.TXT`/`.MD`/`.LOG`/`.SPEC`/no extension open in the read-only text viewer.
+            if crate::video::fileview::is_text_name(&name) {
+                return Act::Text(p);
+            }
             Act::NoOpener(p)
         }
     }
@@ -1602,6 +1612,12 @@ fn run_act(act: Act) {
                 reap_jobs();
                 r
             }
+        }
+        // FILEVIEW — latched like FACET's View, for the same stack-depth reason (click-router depth).
+        Act::Text(p) => {
+            crate::video::fileview::request_open(&p);
+            serial_println!("[quarry] open TEXT path={} -> fileview (latched for the render pass)", p);
+            alloc::format!("opening {}", leaf(&p))
         }
         Act::NoOpener(p) => {
             // The honest census. An operator who double-presses `CONFIG.TXT` and sees nothing must
@@ -2299,6 +2315,11 @@ pub fn close() {
 /// a window above it. Gating it on focus would delete a working gesture no defect asks about. It
 /// keeps the [`on_glass`] guard only, exactly as before.
 pub fn key_route(ev: crate::pal::Event) -> bool {
+    // FILEVIEW — the text viewer's arrows / wheel / paging, asked first; it consumes only while ITS
+    // window holds focus, so a closed viewer changes nothing below.
+    if crate::video::fileview::key_route(ev) {
+        return true;
+    }
     // QSCROLL — the WHEEL arrives here, at the seam that already exists, because this function is
     // handed the whole `pal::Event` rather than a keycode and `arch/aarch64/syscall.rs` is a
     // byte-identity-critical file no arc may add a line to (PARITY.md §5.3). The name is a keyboard
@@ -2508,6 +2529,10 @@ pub fn press_route(x: i32, y: i32) -> bool {
     // window keeps every press — the same contract the router's own `pulsewin || quarry` pair keeps.
     #[cfg(feature = "facet")]
     if crate::video::facet::press_route(x, y) {
+        return true;
+    }
+    // FILEVIEW — the text viewer's close box / raise, chained here for FACET's reason.
+    if crate::video::fileview::press_route(x, y) {
         return true;
     }
     let id = WIN.load(Ordering::Relaxed);
@@ -2977,6 +3002,8 @@ pub fn service() {
     // strip-press arm), and neither file may gain a line. A quiet pass costs one uncontended lock.
     #[cfg(feature = "facet")]
     crate::video::facet::service();
+    // FILEVIEW — the text viewer's latch drains on the same pass, for the same reason.
+    crate::video::fileview::service();
 }
 
 // ── The witness ─────────────────────────────────────────────────────────────────────────────────
@@ -3344,13 +3371,13 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
     m.click_ms = 0;
     let _ = content_press(&mut m, px_x, row1_y);
     match (content_press(&mut m, px_x, row1_y), clock_live) {
-        (Act::NoOpener(p), true) => {
+        (Act::Text(p), true) => {
             if p != "/apps/CONFIG.TXT" {
-                return Err("the unhandled double-click named the wrong path");
+                return Err("the text double-click named the wrong path");
             }
         }
         (Act::None, false) => {}
-        (_, true) => return Err("a double-click on a document did not report that it has no opener"),
+        (_, true) => return Err("a double-click on a text document did not ask the viewer"),
         (_, false) => return Err("a document double-click fired on a zero clock"),
     }
 
@@ -3525,6 +3552,8 @@ pub fn selftest() {
     // the x86 battery reaches) prints nothing twice.
     #[cfg(feature = "facet")]
     crate::video::facet::selftest();
+    // FILEVIEW — the text viewer's fixture (`DONE`-latched, so both chains print once).
+    crate::video::fileview::selftest();
     // QUARRYSTAMP (SR3) — chained for the same reason and in the same shape, and it is the leg of
     // this family that runs identically on both arches: no panel, no window, no medium. Ahead of the
     // verdict below so a DECLINE in the geometry legs cannot take the invalidation proof with it;
@@ -3627,6 +3656,8 @@ pub fn door_selftest() {
     // it is not lost to a battery that already ran the door legs.
     #[cfg(feature = "facet")]
     crate::video::facet::selftest();
+    // FILEVIEW — the text viewer's fixture (`DONE`-latched, so both chains print once).
+    crate::video::fileview::selftest();
     // QUARRYSTAMP (SR3) — the invalidation-stamp proof, chained here for the reason the FACETPNG
     // block above states: this is the arm the x86 battery reaches (`crystal::selftest`'s tail), and
     // `selftest` — the arm aarch64's desktop reaches — is the other one. Ahead of this function's own
@@ -4134,12 +4165,13 @@ pub fn open_selftest() {
         "select (no handler for .PNG)"
     };
     let png_handler = if cfg!(feature = "facet") { "facet" } else { "none" };
-    let cases: [(&str, &str, &str, &str); 5] = [
+    let cases: [(&str, &str, &str, &str); 6] = [
         ("VUG.ELF", "elf", "launch", "open kind=elf handler=launch"),
         ("S8W.BIN", "bin", "launch", "open kind=bin handler=launch"),
         ("SCREEN6.PNG", "png", png_handler, png_tail),
-        ("CONFIG.TXT", "text", "none", "select (no handler for .TXT)"),
-        ("READ_ME", "unknown", "none", "select (no handler for READ_ME — it carries no extension)"),
+        ("CONFIG.TXT", "text", "fileview", "open kind=text handler=fileview"),
+        ("READ_ME", "unknown", "fileview", "open kind=unknown handler=fileview"),
+        ("CONFIG.CAB", "unknown", "none", "select (no handler for .CAB)"),
     ];
     let mut leg_agree = true;
     for (name, kind, handler, tail) in cases {
@@ -4204,7 +4236,7 @@ pub fn open_selftest() {
     let leg_gesture = if clock_live {
         out_elf == "open kind=elf handler=launch"
             && out_png == png_tail
-            && out_txt == "select (no handler for .TXT)"
+            && out_txt == "open kind=text handler=fileview"
     } else {
         // The zero-clock guard doing exactly its job: no activation, so no tail — the model-diff
         // word for a re-press of an already-selected row.

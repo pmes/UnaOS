@@ -2731,7 +2731,7 @@ pub fn close_owner(owner_asid: u64) -> usize {
     crate::wedge2::mark_composite("<D1>", "<d1>");
     // WMDIRECT — see `close`. Keyed on the OWNER here because this path clears every row the ASID
     // holds under one lock and no longer knows their ids by the time it returns.
-    drag_forget_owner(owner_asid);
+    drag_forget_owner(owner_asid); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::appmenu::reap(owner_asid);
     let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     // CLOSEISO — WHICH ids, not merely how many. A count cannot be falsified against the panel: the
     // Boot AR line `closed=1` was true and told the reader nothing about which window went. The list
@@ -21500,7 +21500,7 @@ fn stage_fill(
             pixel_format: info.pixel_format,
         },
     );
-    layer.fill_rect(0, 0, w, 1, color);
+    layer.fill_rect(0, 0, w, 1, color); let wp = color == DESKTOP_BG && wp_active(); // WALLPAPER — the row below is per-scanline when a picture is loaded
 
     #[cfg(feature = "witness")]
     let t1 = crate::arch::now_cycles();
@@ -21614,7 +21614,7 @@ fn stage_fill(
     // `[wc-k]` line stops being arch-dependent in meaning. Equals `h` wherever no clip exists.
     let mut blit_calls: usize = 0; let hb = super::beam::hold(y, y + h, info.height, false, true); // BEAM (orin 26) — the fill's bracket: opened here, after the compose and after every `defer!`/`drop_fill!` exit (a declined fill writes no pixel and must not wait for a beam), closed after the rows are cleaned below.
     for r in 0..h {
-        let py = y + r;
+        let py = y + r; if wp { wp_row(&layer, py, x, w); } // WALLPAPER — this scanline's pixels into the staged row
         let off = py * fb_row + x * bpp;
         if prev != usize::MAX && off != prev + fb_row {
             contig = false;
@@ -21649,7 +21649,7 @@ fn stage_fill(
         }
         for &(sx0, sx1) in spans[..ns].iter() {
             let len = (sx1 - sx0) * bpp;
-            fb.blit(py * fb_row + sx0 * bpp, &stage[..len]);
+            let so = if wp { (sx0 - x) * bpp } else { 0 }; fb.blit(py * fb_row + sx0 * bpp, &stage[so..so + len]); // WALLPAPER — a picture row is not constant: source offset follows the span
             blit_calls += 1;
             #[cfg(feature = "witness")] // ERASECLIP M1 — erase-side term, both arches
             {
@@ -25237,7 +25237,7 @@ pub fn hittest_selftest() {
     // `focus_changed(0)` leg pushed EVERY live window below the shell and consumed its damage flag).
     SHELL_Z.store(0, Ordering::Release);
     FOCUS_ASID.store(0, Ordering::Release);
-    repaint(); closemin_selftest(); wintitle_selftest(); // CLOSEMIN + WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. Both fixtures are sited HERE, at the tail of the one window battery BOTH arches drive (x86 `arch/x86_64/syscall.rs` and aarch64 alike), because each pins arch-neutral code reached from two arch routers. `winid_selftest`'s chain was refused for WINTITLE for the same reason: it has exactly one external caller and it is `arch/aarch64`, so a fixture folded there would never run under `UNAOS_WC=1 ./arroyo test`. After this battery's own teardown sweep and focus restore, so neither inherits a synthetic row; each mints, reaps and restores its own.
+    repaint(); closemin_selftest(); wintitle_selftest(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] wincycle_selftest(); // CLOSEMIN + WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. Both fixtures are sited HERE, at the tail of the one window battery BOTH arches drive (x86 `arch/x86_64/syscall.rs` and aarch64 alike), because each pins arch-neutral code reached from two arch routers. `winid_selftest`'s chain was refused for WINTITLE for the same reason: it has exactly one external caller and it is `arch/aarch64`, so a fixture folded there would never run under `UNAOS_WC=1 ./arroyo test`. After this battery's own teardown sweep and focus restore, so neither inherits a synthetic row; each mints, reaps and restores its own.
 }
 
 /// CLICK-X86 — the restore every selftest that drives [`focus_changed`] with SYNTHETIC owners owes:
@@ -29272,3 +29272,219 @@ pub fn loginz_selftest() {
     close(wr);
     close(wm_);
 }
+
+/// LOGOUTDESK (R69): close EVERY remaining live non-compat row — kernel furniture included — through the
+/// id-scoped [`close`] (which has no kernel-owner refusal; [`close_owner`] deliberately does). Called by
+/// the login screen's Log Out after the session's own programs are ended. Returns `(closed, kernel)`.
+pub fn close_all_furniture() -> (usize, usize) {
+    let mut ids = [WIN_NONE; MAX_WINDOWS];
+    let (mut n, mut kernel) = (0usize, 0usize);
+    {
+        let t = table();
+        for r in t.rows.iter() {
+            if r.used && !r.compat && n < MAX_WINDOWS {
+                if is_kernel_owner(r.owner_asid) {
+                    kernel += 1;
+                }
+                ids[n] = r.id;
+                n += 1;
+            }
+        }
+    }
+    for &id in &ids[..n] {
+        close(id);
+    }
+    (n, kernel)
+}
+
+/// LOGOUTDESK: live non-compat rows in the table (the post-sweep re-scan; must be 0 after a Log Out).
+pub fn live_window_count() -> usize {
+    let t = table();
+    t.rows.iter().filter(|r| r.used && !r.compat).count()
+}
+
+/// NOTICE — the armed program name of `owner` copied into `out`; returns its length (0 = none armed).
+/// The bus verb's title: the app is named by the kernel-stamped owner, never by the caller.
+pub fn app_name_of(owner: u64, out: &mut [u8; MAX_TITLE]) -> usize {
+    if owner == 0 {
+        return 0;
+    }
+    let t = APP_NAMES.lock();
+    match t.iter().find(|e| e.owner == owner) {
+        Some(e) => {
+            let n = (e.len as usize).min(MAX_TITLE);
+            out[..n].copy_from_slice(&e.name[..n]);
+            n
+        }
+        None => 0,
+    }
+}
+// ---- WINCYCLE: keyboard window cycling + title-bar double-click zoom ---------------------------
+//
+// TAIL-APPENDED. M1: `Action::CycleWindow` (Alt+Tab / Cmd+Tab, `keymap`) reaches the x86 router
+// (`wc_focus_key`), which asks [`cycle_pick`] for the LEAST-recently-raised live app window and
+// commits it through [`cycle_commit`] = `focus_changed` + `raise_one` (both end in
+// `reassert_modal_top`, so LOGINZ's pin still wins). Raising the bottom of the z stack each press is
+// a full rotation: three windows visit all three, where "raise the second" would only toggle two.
+// M2: [`title_dblclick`] is the pure edge detector the router's title arm asks; a hit calls the
+// existing [`zoom`] (max work-area scale, pre-zoom placement remembered per row in `zoom_saved`).
+// M3: both name themselves on the `[wm-act]` line (`action=cycle`, `action=zoom`).
+
+/// Live app windows a cycle may visit, most-recently-raised FIRST (z descending). Furniture, compat
+/// rows, parked rows and rows below the shell are not cycle targets. Returns the count written.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn cycle_order(out: &mut [WinId; MAX_WINDOWS]) -> usize {
+    let shell = SHELL_Z.load(core::sync::atomic::Ordering::Acquire);
+    let t = table();
+    let mut zs = [(0u32, WIN_NONE); MAX_WINDOWS];
+    let mut n = 0usize;
+    for r in t.rows.iter() {
+        if r.used && !r.compat && r.owner_asid != 0 && !is_kernel_owner(r.owner_asid) && r.z != PARKED_Z && above_shell(r, shell) {
+            zs[n] = (r.z, r.id);
+            n += 1;
+        }
+    }
+    drop(t);
+    zs[..n].sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    for i in 0..n {
+        out[i] = zs[i].1;
+    }
+    n
+}
+
+/// The window the next cycle press raises, as `(id, owner)`; `None` with fewer than two candidates.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn cycle_pick() -> Option<(WinId, u64)> {
+    let mut ord = [WIN_NONE; MAX_WINDOWS];
+    let n = cycle_order(&mut ord);
+    if n < 2 {
+        return None;
+    }
+    let id = ord[n - 1];
+    let mut t = table();
+    let owner = row_mut(&mut t, id).map(|r| r.owner_asid)?;
+    Some((id, owner))
+}
+
+/// Raise and focus the row [`cycle_pick`] named. The caller has already handed the KEYBOARD to
+/// `owner` (`user_input_set_active`), on the click router's order. Names itself `action=cycle`.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn cycle_commit(id: WinId, owner: u64) -> bool {
+    focus_changed(owner);
+    let ok = raise_one(id);
+    wm_act("cycle", id, owner, if ok { "action=cycle raised" } else { "action=cycle refused" }, 0, 0);
+    ok
+}
+
+/// Fixtures that press one title repeatedly inside [`title_dblclick`]'s window set this (the `[wm-act]` direct battery).
+pub static DBL_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Double-click detector for title-bar presses: `true` when `id` was title-pressed within
+/// [`DBL_MS`] of the previous title press (and consumes the pair, so a triple is press-dbl-press).
+pub fn title_dblclick(id: WinId, now_ms: u64) -> bool {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    if DBL_OFF.load(Relaxed) { return false; }
+    static LAST_ID: AtomicU32 = AtomicU32::new(WIN_NONE);
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    const DBL_MS: u64 = 400;
+    let (pid, pms) = (LAST_ID.load(Relaxed), LAST_MS.load(Relaxed));
+    if pid == id && id != WIN_NONE && now_ms.saturating_sub(pms) <= DBL_MS {
+        LAST_ID.store(WIN_NONE, Relaxed);
+        true
+    } else {
+        LAST_ID.store(id, Relaxed);
+        LAST_MS.store(now_ms, Relaxed);
+        false
+    }
+}
+
+/// Zoom `id` from a title double-click, naming `action=zoom` on the `[wm-act]` line.
+// (ungated: the x86 syscall click router calls it without a wc gate)
+pub fn zoom_titled(id: WinId, owner: u64, x: i32, y: i32) -> &'static str {
+    let settle = zoom(id);
+    wm_act("zoom", id, owner, settle, x as i64, y as i64);
+    serial_println!("[wm-act] action=zoom win={} route=title-dbl -> {}", id, settle);
+    settle
+}
+
+/// WINCYCLE fixture: three rows, two cycles, one zoom + restore. Sited at the tail of the window
+/// battery (beside `closemin_selftest`). Self-cleaning.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn wincycle_selftest() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let s = &raw const HT_SURF as usize;
+    let len = core::mem::size_of_val(&HT_SURF);
+    let asids = [0xC31u64, 0xC32, 0xC33];
+    let mut ids = [WIN_NONE; 3];
+    for (i, a) in asids.iter().enumerate() {
+        ids[i] = create(*a, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, b"wc-cyc");
+    }
+    if ids.contains(&WIN_NONE) {
+        serial_println!(":: WINCYCLE: SKIP (window table full) ::");
+        for a in asids { close_owner(a); }
+        return;
+    }
+    let mut o0 = [WIN_NONE; MAX_WINDOWS];
+    let n0 = cycle_order(&mut o0);
+    let mut after_tab = WIN_NONE;
+    let mut moved = 0usize;
+    for _ in 0..2 {
+        if let Some((id, owner)) = cycle_pick() {
+            if cycle_commit(id, owner) { moved += 1; }
+        }
+    }
+    let mut o1 = [WIN_NONE; MAX_WINDOWS];
+    let n1 = cycle_order(&mut o1);
+    if n1 > 0 { after_tab = o1[0]; }
+    // Two rotations of a bottom-raise: the top is the SECOND-least-recent of the start order.
+    let order_ok = n0 >= 3 && n1 == n0 && moved == 2 && after_tab == o0[n0 - 2] && o1[1] == o0[n0 - 1];
+    // Zoom and restore the first row.
+    let outer = |id: WinId| { let mut t = table(); row_mut(&mut t, id).map(|r| outer_box(r)) };
+    let b0 = outer(ids[0]);
+    let z1 = zoom_titled(ids[0], asids[0], 0, 0);
+    let b1 = outer(ids[0]);
+    let z2 = zoom_titled(ids[0], asids[0], 0, 0);
+    let b2 = outer(ids[0]);
+    let restored = b0.is_some() && b0 == b2;
+    let zoomed = b0 != b1 && b1.is_some();
+    let (w0, h0) = b0.map(|b| (b.2, b.3)).unwrap_or((0, 0));
+    let (w1, h1) = b1.map(|b| (b.2, b.3)).unwrap_or((0, 0));
+    let ok = order_ok && zoomed && restored;
+    let show = n0.min(6);
+    serial_println!(
+        ":: WINCYCLE: windows={} order={:?} after_tab={} zoom={}x{}->{}x{} restored={} -> {} :: ({} {})",
+        n0, &o0[..show], after_tab, w0, h0, w1, h1, restored as u8, if ok { "PASS" } else { "FAIL" }, z1, z2
+    );
+    for a in asids { close_owner(a); }
+}
+// WALLPAPER (rmbp-0929) — the compositor-side seam to `video/wallpaper.rs`. Tail helpers so the three fold
+// sites (`stage_fill`, `Screen::fill_screen`, `Screen::flush`) stay line-neutral. Armed only where the
+// module exists; everywhere else these are constant-false / no-ops and every fill is the flat colour.
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+#[inline]
+fn wp_active() -> bool { super::wallpaper::active() }
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+#[inline]
+fn wp_row(layer: &super::FrameBuffer, py: usize, x: usize, w: usize) { super::wallpaper::row(layer, py, x, w) }
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn wp_paint(fb: &super::framebuffer::FrameBuffer) { if super::desktop_scene_owns_backdrop() { super::wallpaper::paint(fb) } }
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn wp_take_stale() -> bool { super::wallpaper::take_stale() }
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+/// Queue a whole-panel desktop erase; the drain paints it through `stage_fill` (wallpaper-aware) clipped by the windows.
+pub fn desktop_repaint() { if let Some(pi) = super::panel_info_nonblocking() { erase(&[(0, 0, pi.width, pi.height)]); } }
+#[cfg(not(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+#[inline(always)]
+fn wp_active() -> bool { false }
+#[cfg(not(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+#[inline(always)]
+fn wp_row(_l: &super::FrameBuffer, _py: usize, _x: usize, _w: usize) {}
+#[cfg(not(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+#[inline(always)]
+pub fn wp_paint(_fb: &super::framebuffer::FrameBuffer) {}
+#[cfg(not(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
+#[inline(always)]
+pub fn wp_take_stale() -> bool { false }

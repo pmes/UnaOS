@@ -51,6 +51,8 @@ pub struct Console {
     /// `hist_base + i` is line `i`'s ABSOLUTE number: the row a selection records, which does not
     /// change as newer output pushes the line up the screen.
     hist_base: u64,
+    /// TERMWRAP — the edit line's visual-row count at the last full repaint (`draw`), so the per-keystroke path knows when a wrap changed the page layout and owes a full repaint.
+    last_edit_rows: core::cell::Cell<usize>,
 }
 
 impl Console {
@@ -63,6 +65,7 @@ impl Console {
             in_window: false,
             sel: crate::video::termsel::LineSel::new(),
             hist_base: 0,
+            last_edit_rows: core::cell::Cell::new(1),
         }
     }
 
@@ -215,6 +218,7 @@ impl Console {
     /// last row for the prompt/input line itself. Computed from [`Self::top_y`] so a windowed shell
     /// (no chrome) and a backdrop shell (chrome reserved) each get the budget for their own surface;
     /// for a backdrop shell this is identical to [`Self::page_rows`] by construction.
+    #[allow(dead_code)] // TERMWRAP: superseded by `layout_for` (visual rows); kept as the entry-count budget's name
     fn history_rows(&self, pal: &TargetPal) -> usize {
         self.history_rows_for(pal.metrics(), pal.width() as usize, pal.height() as usize)
     }
@@ -224,9 +228,9 @@ impl Console {
     /// last usable row because the history is scrolled).
     fn prompt_y(&self, pal: &TargetPal) -> usize {
         let m = pal.metrics();
-        let rows = self.history_rows(pal);
-        let shown = self.history.len().min(rows);
-        self.top_y(pal) + shown * m.line_h
+        // TERMWRAP M2 — the history above costs VISUAL rows (a long line wraps), not one per entry.
+        let (_, vrows) = self.layout_for(m, pal.width() as usize, pal.height() as usize);
+        self.top_y(pal) + vrows * m.line_h
     }
 
     /// Draw the prompt + live input + cursor at `prompt_y`. Shared by the full repaint and the
@@ -237,34 +241,39 @@ impl Console {
     fn draw_prompt_line(&self, pal: &mut TargetPal, prompt_y: usize) {
         let m = pal.metrics();
         let prompt = format!("{}@unaos:~$ ", self.session.username);
-        pal.draw_text(m.margin, prompt_y, &prompt, 0x00FF00); // Green Prompt
+        // TERMWRAP M1 — the prompt + input is ONE run of cells wrapped at the window's column count.
+        let cols = self.cols_for(m, pal.width() as usize);
+        let pc = prompt.len();
+        let len = self.current_input.len();
+        let rows = self.edit_rows_for(cols);
+        for r in 0..rows {
+            let (lo, hi) = (r * cols, r * cols + cols);
+            let y = prompt_y + r * m.line_h;
+            if lo < pc {
+                pal.draw_text(m.margin, y, prompt.get(lo..hi.min(pc)).unwrap_or(""), 0x00FF00); // Green Prompt
+            }
+            let (a, b) = (lo.max(pc), hi.min(pc + len));
+            if a < b {
+                pal.draw_text(m.margin + m.text_w(a - lo), y, self.current_input.get(a - pc..b - pc).unwrap_or(""), 0xFFFFFF);
+            }
+        }
 
-        let input_x = m.margin + m.text_w(prompt.len());
-        pal.draw_text(input_x, prompt_y, &self.current_input, 0xFFFFFF);
-
-        // TERMSEL — the selection as an INVERSE-VIDEO band: the selected cells filled with the text
-        // colour, their characters redrawn in the background colour. Here and nowhere else, so the
-        // full repaint and the per-keystroke path (both call this) paint the same band. One cell
-        // tall, exactly as the cursor below is. No witness: a repaint is not a state change (the
-        // model prints those).
+        // TERMSEL — the selection as an INVERSE-VIDEO band (see `draw_band_span`, which splits it
+        // across the wrapped rows). Here and nowhere else, so the full repaint and the per-keystroke
+        // path (both call this) paint the same band. No witness: a repaint is not a state change.
         // TERMSEL2: `cols_on(EDIT_ROW, …)` — the editable line's part of ANY selection, one that
         // started in the scrollback included; for a selection wholly on this line it is `range`.
-        let len = self.current_input.len();
         if let Some((lo, hi)) = self.sel.cols_on(crate::video::termsel::EDIT_ROW, len, len) {
-            let band_x = input_x + m.text_w(lo);
-            pal.draw_rect(band_x, prompt_y, m.text_w(hi - lo), m.cell_h, 0xFFFFFF);
-            pal.draw_text(band_x, prompt_y, self.current_input.get(lo..hi).unwrap_or(""), Self::BG);
+            self.draw_band_span(pal, prompt_y, cols, pc + lo, pc + hi, &self.current_input, pc);
         }
 
         // TERMSEL2 M3 — the CARET: a Mac-style insertion BAR at the caret's cell boundary, one font
-        // stroke wide (`m.scale` px — the glyphs' own stroke at every scale) and one cell tall, in the
-        // theme's selection/focus accent. It replaces TERMSEL's block, which stood one cell PAST the
-        // text and so was a cell of the row model that held no character; the bar sits ON a
-        // boundary and occupies none, so the row's cells are exactly its characters. Hidden while
-        // this line shows a band, as a Mac text field hides its insertion point over a selection.
+        // stroke wide and one cell tall, in the theme's accent; hidden while this line shows a band.
+        // TERMWRAP: the caret's flat cell is folded to (row, col) by `wrap_rc`, so it follows the wrap.
         if self.sel.cols_on(crate::video::termsel::EDIT_ROW, len, len).is_none() {
-            let cursor_x = input_x + m.text_w(self.sel.caret_col(len));
-            pal.draw_rect(cursor_x, prompt_y, m.scale.max(1), m.cell_h, crate::video::theme::ACCENT);
+            let (cr, cc) = crate::video::termsel::wrap_rc(pc + self.sel.caret_col(len), cols);
+            let cursor_x = m.margin + m.text_w(cc);
+            pal.draw_rect(cursor_x, prompt_y + cr * m.line_h, m.scale.max(1), m.cell_h, crate::video::theme::ACCENT);
         }
     }
 
@@ -272,17 +281,23 @@ impl Console {
         let m = pal.metrics();
         pal.clear_screen(Self::BG);
 
-        // Show the last `history_rows` lines (scroll the oldest off the top when full), top-down.
-        let rows = self.history_rows(pal);
-        let skip = self.history.len().saturating_sub(rows);
+        // Show the newest lines that fit (scroll the oldest off the top when full), top-down.
+        // TERMWRAP M2: an entry is `visual_rows(len, cols)` rows, drawn one `cols`-wide chunk per row.
+        let (w, h) = (pal.width() as usize, pal.height() as usize);
+        let cols = self.cols_for(m, w);
+        let (skip, _) = self.layout_for(m, w, h);
         let mut y = self.top_y(pal);
         for (i, line) in self.history.iter().enumerate().skip(skip) {
-            pal.draw_text(m.margin, y, line, 0xAAAAAA);
+            let rows = crate::video::termsel::visual_rows(line.chars().count(), cols);
+            for r in 0..rows {
+                pal.draw_text(m.margin, y + r * m.line_h, crate::video::termsel::row_slice(line, r, cols), 0xAAAAAA);
+            }
             // TERMSEL2 — a selection's band on a SCROLLBACK row, the same inverse video the editable
             // line gets (`draw_prompt_line`), read from the same model (`LineSel::cols_on`).
             self.draw_row_band(pal, y, self.hist_base + i as u64, line);
-            y += m.line_h;
+            y += rows * m.line_h;
         }
+        self.last_edit_rows.set(self.edit_rows_for(cols));
 
         // Prompt directly below the last output line.
         self.draw_prompt_line(pal, y);
@@ -295,9 +310,16 @@ impl Console {
     /// repaint after command output (history changes).
     pub fn draw_input_line(&self, pal: &mut TargetPal) {
         let m = pal.metrics();
+        // TERMWRAP: a change in the edit line's row count moves the history budget, so it owes the
+        // full repaint; otherwise clear the whole (possibly multi-row) strip.
+        let er = self.edit_rows_for(self.cols_for(m, pal.width() as usize));
+        if er != self.last_edit_rows.get() {
+            self.draw(pal);
+            return;
+        }
         let prompt_y = self.prompt_y(pal);
-        // Clear the input-line strip (one full line pitch) back to the background.
-        pal.draw_rect(0, prompt_y, pal.width() as usize, m.line_h, Self::BG);
+        // Clear the input-line strip (`er` line pitches) back to the background.
+        pal.draw_rect(0, prompt_y, pal.width() as usize, er * m.line_h, Self::BG);
         self.draw_prompt_line(pal, prompt_y);
     }
 }
@@ -336,22 +358,30 @@ impl Console {
     /// first cell — a drag that leaves the text keeps a cell to report.
     pub fn cell_at(&self, m: crate::ui::Metrics, w: usize, h: usize, lx: i32, ly: i32) -> (u64, usize, usize) {
         let top = self.top_y_for(m, w, h);
-        let shown = self.history.len().min(self.history_rows_for(m, w, h));
-        let skip = self.history.len() - shown;
+        let cols = self.cols_for(m, w);
+        let (skip, vrows) = self.layout_for(m, w, h);
         let (lx, ly) = (lx.max(0) as usize, ly.max(0) as usize);
+        // TERMWRAP M3 — fold the pixel into (visual_row, cell column) FIRST; the visual row then
+        // picks the entry (each costs `visual_rows` bands) and the flat offset LineSel keeps.
         let vrow = ly.saturating_sub(top) / m.line_h;
-        let (row, x0, cells) = if vrow < shown {
-            let i = skip + vrow;
-            (self.hist_base + i as u64, m.margin, self.history[i].chars().count())
-        } else {
-            (
-                crate::video::termsel::EDIT_ROW,
-                m.margin + m.text_w(self.prompt_cells()),
-                self.current_input.len(),
-            )
-        };
-        let col = core::cmp::min(lx.saturating_sub(x0) / m.cell_w, cells);
-        (row, col, cells)
+        let px = core::cmp::min(lx.saturating_sub(m.margin) / m.cell_w, cols.saturating_sub(1));
+        if vrow < vrows {
+            let mut start = 0usize;
+            for i in skip..self.history.len() {
+                let cells = self.history[i].chars().count();
+                let cost = crate::video::termsel::visual_rows(cells, cols);
+                if vrow < start + cost {
+                    let col = core::cmp::min((vrow - start) * cols + px, cells);
+                    return (self.hist_base + i as u64, col, cells);
+                }
+                start += cost;
+            }
+        }
+        let pc = self.prompt_cells();
+        let len = self.current_input.len();
+        let er = core::cmp::min(vrow.saturating_sub(vrows), self.edit_rows_for(cols) - 1);
+        let col = core::cmp::min((er * cols + px).saturating_sub(pc), len);
+        (crate::video::termsel::EDIT_ROW, col, len)
     }
 
     /// The text of row `row` (an absolute scrollback line or `termsel::EDIT_ROW`), or `""` for a line
@@ -409,10 +439,8 @@ impl Console {
         let m = pal.metrics();
         let cells = line.chars().count();
         if let Some((lo, hi)) = self.sel.cols_on(row, cells, self.current_input.len()) {
-            let x = m.margin + m.text_w(lo);
-            pal.draw_rect(x, y, m.text_w(hi - lo), m.cell_h, 0xFFFFFF);
-            let part: String = line.chars().skip(lo).take(hi - lo).collect();
-            pal.draw_text(x, y, &part, Self::BG);
+            let cols = self.cols_for(m, pal.width() as usize);
+            self.draw_band_span(pal, y, cols, lo, hi, line, 0);
         }
     }
 
@@ -443,5 +471,57 @@ impl Console {
     #[cfg(feature = "witness")]
     pub fn place_for_fixture(&mut self, text: &str) {
         self.place(text);
+    }
+}
+
+// --- TERMWRAP — the view wraps at the window's column count ----------------------------------------
+//
+// Tail-appended. The model stays flat (a byte offset IS a cell column, `termsel.rs`); only the view
+// folds: `cols_for` says how wide a row is, `termsel::visual_rows`/`wrap_rc`/`row_slice` fold a flat
+// run of cells into rows, and the painter, the layout and the pointer all use these same helpers.
+impl Console {
+    /// Cells per visual row on a surface `w` wide (page margin each side; at least 1).
+    pub fn cols_for(&self, m: crate::ui::Metrics, w: usize) -> usize {
+        (w.saturating_sub(2 * m.margin) / m.cell_w).max(1)
+    }
+
+    /// Visual rows the edit line occupies: prompt + input + one cell for a caret at the end.
+    pub fn edit_rows_for(&self, cols: usize) -> usize {
+        crate::video::termsel::visual_rows(self.prompt_cells() + self.current_input.len() + 1, cols)
+    }
+
+    /// `(skip, vrows)`: the first history entry shown and the visual rows the shown entries cost.
+    /// Walks back from the newest entry while the entries fit the row budget left after the edit
+    /// line's extra rows.
+    fn layout_for(&self, m: crate::ui::Metrics, w: usize, h: usize) -> (usize, usize) {
+        let cols = self.cols_for(m, w);
+        let budget = self.history_rows_for(m, w, h).saturating_sub(self.edit_rows_for(cols) - 1);
+        let (mut skip, mut used) = (self.history.len(), 0usize);
+        while skip > 0 {
+            let cost = crate::video::termsel::visual_rows(self.history[skip - 1].chars().count(), cols);
+            if used + cost > budget {
+                break;
+            }
+            used += cost;
+            skip -= 1;
+        }
+        (skip, used)
+    }
+
+    /// Paint the inverse-video band over flat cells `lo..hi` of `line` (whose cell `i` is flat cell
+    /// `base + i`), split across the wrapped rows it spans; `y0` is the first row's y.
+    fn draw_band_span(&self, pal: &mut TargetPal, y0: usize, cols: usize, lo: usize, hi: usize, line: &str, base: usize) {
+        if lo >= hi {
+            return;
+        }
+        let m = pal.metrics();
+        for r in (lo / cols)..=((hi - 1) / cols) {
+            let (a, b) = (lo.max(r * cols), hi.min(r * cols + cols));
+            let x = m.margin + m.text_w(a - r * cols);
+            let y = y0 + r * m.line_h;
+            pal.draw_rect(x, y, m.text_w(b - a), m.cell_h, 0xFFFFFF);
+            let part: String = line.chars().skip(a - base).take(b - a).collect();
+            pal.draw_text(x, y, &part, Self::BG);
+        }
     }
 }

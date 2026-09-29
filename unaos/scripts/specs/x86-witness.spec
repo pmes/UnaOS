@@ -1639,6 +1639,12 @@ REQUIRE :: PRTSCR-DIR-FIX: no session -> REFUSED reason=no-session .* -> PASS ::
 # --- lpib_advanced=1 bcis=0 tag_ok=1 fifo_ready=1 run_ms=1200 -> FAIL ::`. The `-> REFUSED` arms
 # --- (drivers/hda.rs:1457, :1566) miss the REQUIRE. Audibility is not on the wire and is not claimed.
 REQUIRE :: HDA-TONE: .* -> PASS ::
+# --- HDATONE3 (B218): the buffer carries a 20 ms fade at both ends (edges exactly 0), the knobs are named on the wire,
+# --- and the codec's own rate read-back + supported-rates word ride the amp line. FORBID pins the FAIL arm.
+REQUIRE :: HDA-PCM: amp=\d+ .* sine_ok=1 le_ok=1 frames=\d+ hz=(220|440) secs=[1-3] fade_ms=20 edge0=0 edge_last=0 -> PASS ::
+FORBID :: HDA-PCM: .* -> FAIL ::
+REQUIRE \[hda\] amp member=\d+ dac=0x[0-9a-f]+ .* fmt_conv=0x[0-9a-f]+ fmt_want=0x[0-9a-f]+ fmt_match=1 rate=48000 fmt_rd=0x[0-9a-f]+ pcmcaps=0x[0-9a-f]+
+FORBID \[hda\] amp .* fmt_match=0
 #
 # --- KVBLANK (B179, UNAOS_KEPLER_VBLANK). The two self-test verdicts only (drivers/gpu/kepler_vblank.rs:
 # --- 1009, :1038); `GO-RED-FAILED` misses the second REQUIRE. The period values (`period_us=127022`,
@@ -1705,3 +1711,27 @@ FORBID :: EHCI-HID: \[\d+\] STOP-NOTE interrupt endpoint halted .* kind=boot-mou
 # scripts/specs/ that is neither named in `arroyo`'s CODE nor carries a RUN-BY line above — and a
 # `RUN-BY: verb:` claim is cross-checked against `arroyo`, so this file cannot claim a runner it
 # does not have. "A replay spec no gate command runs is a silent landmine."
+
+# --- BRIGHTKEYS (rmbp-0929): F1/F2 step the backlight through the gmux; the bar shows `BRT nn/16` for 1.5 s.
+# --- The boot fixture drives an up and a down step through the real key path (no gmux write, so
+# --- `gmux_written=0` on QEMU and on the bench replay); a real key press on the metal prints its own line
+# --- with `gmux_written=1` when the register write completed. `indicator=1` is measured, not asserted.
+REQUIRE :: BRIGHTKEYS: key=(up|down) level=[0-9]+/16 gmux_written=[01] indicator=1 -> PASS ::
+FORBID :: BRIGHTKEYS: .* -> FAIL ::
+# --- VOLKEYS (2026-09-29) ---------------------------------------------------------------------
+# --- F10/F11/F12 -> mute/down/up through the decoder's own seam (`status::volkey_usage`): state moves,
+# --- the transient indicator is showing, and the HDA output-amp verb was issued (`amp_written=1`) or no
+# --- codec path exists on this boot (`amp_written=0`, then PASS does not require it).
+# --- GO-RED, ONE EDIT: make `volkey_usage` skip `osd_set` -> indicator=0 -> FAIL.
+REQUIRE :: VOLKEYS: key=up level=13/16 muted=0 amp_written=[01] indicator=1 -> PASS ::
+REQUIRE :: VOLKEYS: key=down level=12/16 muted=0 amp_written=[01] indicator=1 -> PASS ::
+REQUIRE :: VOLKEYS: key=mute level=12/16 muted=1 amp_written=[01] indicator=1 -> PASS ::
+FORBID :: VOLKEYS: .* -> FAIL ::
+# --- USBNET2 (RULED R72, "the port should not matter"): PORTROUTE is the read-only routing truth per USB2
+# --- root port (M1+M2) and prints on every x86 boot that reaches PORTSW-1 (default-on); the USBNET-EHCI lines
+# --- ride UNAOS_USBNET=1 AND the AX88179 (0b95:1790) enumerating on EHCI, so they are OPTIONAL (a boot
+# --- without the dongle never emits them) and the FAIL twin is FORBIDDEN.
+REQUIRE :: PORTROUTE: xusb2pr=0x[0-9a-f]+ pssen=0x[0-9a-f]+ mask=0x[0-9a-f]+ switched=\[[0-9,]*\] ehci_only=\[[0-9,]*\] ::
+OPTIONAL :: USBNET-EHCI: addr=\d+ mac=[0-9a-f:]{17} link=(up|down) -> PASS ::
+OPTIONAL :: USBNET-EHCI: datapath=stub next=bulk-in-out == witness ::
+FORBID :: USBNET-EHCI: .* -> FAIL ::

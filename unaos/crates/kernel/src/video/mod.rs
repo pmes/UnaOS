@@ -682,7 +682,7 @@ pub mod pulsewin;
 // inserted higher up renumbers every panic `Location` recorded below it in this file. Nothing is
 // below this, so nothing moves, and a knob-off `kernel8.img` is byte-identical.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-pub mod quarry;
+pub mod quarry; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod fileview; // FILEVIEW — the read-only text viewer window Quarry opens `.TXT`/`.MD`/`.LOG`/`.SPEC`/extensionless files in; same gate as `quarry` (its only door). ⚠ FOLDED onto the `quarry` line, code before comment: this module root is lexed into every image and a line added here moves every `panic::Location` below it.
 
 // ── REALDESK — THE DESKTOP SCENE'S TENANCY OF THE BACKDROP ──────────────────────────────────────
 //
@@ -839,7 +839,7 @@ pub(crate) fn panel_refuse_term() -> Option<&'static str> {
     } else if crate::serial_ring::in_panic_mode() {
         Some("serial-panic-mode")
     } else {
-        None
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if crate::video::dimidle::blanked() { return Some("idle-blank"); } None // DIMIDLE — the idle blank is a third refusal term (same-line fold)
     }
 }
 
@@ -900,7 +900,7 @@ pub(crate) fn note_panel_write_refused(_tier: u8, _term: &'static str, _site: &'
 // feature. So the gate is a DEPENDENCY fact, not a policy one, and it moves the day the furniture
 // family's does — together, in one place.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-pub mod winmenu;
+pub mod winmenu; #[cfg(all(target_arch = "x86_64", feature = "wc"))] pub mod appmenu;
 
 // ── FACET (`facet` / UNAOS_FACET=1, implied by `deskcascade`) — the IMAGE VIEWER ────────────────
 //
@@ -1139,3 +1139,14 @@ impl<T> Drop for HeldGuard<'_, T> {
         self.lock.tag.store(0, Ordering::Relaxed);
     }
 }
+
+// BRIGHTKEYS — F1/F2 step the panel backlight (gmux) and light the bar's transient level item.
+// Appended, not inserted: this file is line-sensitive (panic::Location records).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod brightkeys;
+// DIMIDLE — idle screen blanking (docs/dev/evidence/rmbp-0929/DIMIDLE.md). Both desktops.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod dimidle;
+// WALLPAPER (rmbp-0929) — the desktop backdrop picture; rides the `facet` decoder, so it has the same gate.
+#[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub mod wallpaper;

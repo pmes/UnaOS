@@ -61,9 +61,9 @@ FORBID :: LOGIN-IGNITION: .* -> FAIL
 # names it, proves `press_route` DECLINES that point with the screen DOWN — the control, without
 # which a gate that consumed everything would be indistinguishable from this one — then proves it
 # CONSUMES the same point and `(0,0)` with the screen UP while the row is still hit-testable.
-# `screen_down_routed=false` is the term that BITES and it is pinned LITERALLY: it is the control,
+# `screen_down_routed=true` (LOGINZ: the screen is topmost) is the term that BITES and it is pinned LITERALLY: it is the control,
 # and a `true` there is a gate that has become a constant.
-REQUIRE :: LOGIN-PRESS: win=\d+ at=\(\d+,\d+\) behind_named=true screen_down_routed=false screen_up=true up_at_window=true up_at_corner=true still_named=true logged_in=true after_login_routed=false -> PASS ::
+REQUIRE :: LOGIN-PRESS: win=\d+ at=\(\d+,\d+\) behind_named=true screen_down_routed=true screen_up=true up_at_window=true up_at_corner=true gone_after_logout=true logged_in=true after_login_routed=false -> PASS ::
 FORBID :: LOGIN-PRESS: .* -> FAIL
 # A SKIP is a panel below 256x256 or `wm::create` declining. On this gate (QEMU 1280x800, one 64x64
 # fixture row) neither is honest — `x86-wc.spec`'s standing DMGOVLP/MENUDROP rule — so a SKIP means
@@ -383,6 +383,8 @@ FORBID other-pw
 # the stored one (`verify=ok`), and the refusals each speak their own word and change nothing.
 REQUIRE :: LOGIN-ADDUSER: root=true created=unset:true prompted_at_adduser=false unset_verify=refused passwd_prompted=true echo=none uid=\d+ set=true verify=ok dup=exists empty=empty-password mismatch=mismatch on_line=password-on-line passwd_on_line=password-on-line -> PASS ::
 FORBID :: LOGIN-ADDUSER: .* -> FAIL
+REQUIRE :: USERMGMT: users=\d+ passwd_self=ok passwd_root_other=ok deluser_last=refused deluser_self=refused deluser_ok=1 -> PASS ::
+FORBID :: USERMGMT: .* -> FAIL
 # The success lines (the store's uid, the home's own verdict, the password's own line) and the refusals.
 REQUIRE \[users\] adduser user=boot13 id=\d+ home=/home/boot13 created=(true|false) password=unset
 REQUIRE \[users\] home=/home/boot13 (created|exists) volume=[0-9a-f]{8}
@@ -441,3 +443,20 @@ FORBID :: USERSREADY: .* -> FAIL
 REQUIRE :: USERSMOUNT: rmbp-shape=sdhc qemu-shape=global none=none old-mount-on-rmbp=none this-boot via=(global|sdhc) -> PASS ::
 FORBID :: USERSMOUNT: .* -> FAIL
 REQUIRE \[users\] load volume=el0-fat\(rw\) via=(global|sdhc) 
+# LOGOUTUI (R70) — a refused Log Out says why in an alert; LOGOUTDESK (R69) — Log Out closes the whole desktop.
+REQUIRE :: LOGOUTUI: reason=(no-users|storage-not-up) alert=open -> PASS ::
+FORBID :: LOGOUTUI: .* -> FAIL
+FORBID \[users\] logout REFUSED session=root reason=no-users$
+REQUIRE :: LOGOUTDESK: closed=\d+ kernel=\d+ remaining=0 -> PASS ::
+FORBID :: LOGOUTDESK: .* -> FAIL
+# NOTICE — the OS's notice surface: two notices back to back (the second queues), both dismissed by the OK path.
+REQUIRE :: NOTICE: title=Fixture-A lines=2 queued=1 shown=1 dismissed=1 -> PASS ::
+FORBID :: NOTICE: .* -> FAIL
+# SCREENLOCK: lock without ending the session — name read-only, wrong refused, right unlocks, furniture untouched.
+REQUIRE :: SCREENLOCK: user=una locked=1 windows_kept=\d+ wrong=refused unlock=ok furniture_reignited=0 -> PASS ::
+FORBID :: SCREENLOCK: .* -> FAIL
+
+# --- DIRNS M1 (SO20, FSNS): the x86 path-namespace witness, pinned. `dirns_witness` (arch/x86_64/syscall.rs)
+# was in tree and unpinned, so a regression failed silently. Root-pinned `el0_walk` flips `nested` (root_alias).
+REQUIRE :: DIRNS: abs=ok nested=ok ocreat=ok escape=refused collapse=ok acl=n/a\(SO35\) .* -> PASS ::
+FORBID :: DIRNS: .* -> FAIL

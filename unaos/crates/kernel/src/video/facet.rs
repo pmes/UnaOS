@@ -1308,3 +1308,39 @@ fn zlib_stored(raw: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&crate::video::png::adler32(raw).to_be_bytes());
     out
 }
+
+// ── WALLPAPER — the same decoder, pointed at the desktop backdrop ─────────────────────────────────
+// `video/wallpaper.rs` wants a decoded, box-downscaled picture in a heap buffer instead of a window
+// surface. This is `open_inner`'s decode half verbatim (stat, chunk index, `fit`, `decode_into` over
+// the `IdatSource`) with the window half dropped, so the wallpaper path shares every filter and every
+// refusal with the viewer instead of growing a second PNG reader. `cap` bounds the FILE (the brief's
+// 4 MB); `bw x bh` bounds the decode. Returns `(pixels 0x00RRGGBB, out_w, out_h, src_w, src_h)`.
+pub fn decode_file(
+    path: &str,
+    cap: u64,
+    bw: usize,
+    bh: usize,
+) -> Result<(Vec<u32>, usize, usize, u32, u32), FacetError> {
+    let mt = crate::shell::vfs_mount_table();
+    let st = mt.stat(path).map_err(|e| FacetError::Vfs(vfs_why(e)))?;
+    if matches!(st.kind, crate::fs::vfs::NodeKind::Dir) {
+        return Err(FacetError::Vfs(String::from("eisdir")));
+    }
+    if st.size == 0 || st.size > cap.min(MAX_FILE) {
+        return Err(FacetError::Size(st.size));
+    }
+    let (ihdr, spans, palette) = index_chunks(&mt, path, st.size)?;
+    let (k, out_w, out_h) = fit(ihdr.width, ihdr.height, bw, bh).ok_or(FacetError::NoWindow("fit"))?;
+    let mut px: Vec<u32> = Vec::new();
+    if px.try_reserve_exact(out_w * out_h).is_err() {
+        return Err(FacetError::OutOfMemory(out_w * out_h * 4));
+    }
+    px.resize(out_w * out_h, 0);
+    let mut src = IdatSource::new(&mt, path, &spans);
+    let r = decode_into(ihdr, &palette, &mut src, k, out_w, out_h, &mut px);
+    match (r, src.io_error.take()) {
+        (Err(FacetError::Inflate(InflateError::TruncatedInput)), Some(io)) => Err(FacetError::Vfs(io)),
+        (Err(e), _) => Err(e),
+        (Ok(d), _) => Ok((px, out_w, out_h, d.ihdr.width, d.ihdr.height)),
+    }
+}

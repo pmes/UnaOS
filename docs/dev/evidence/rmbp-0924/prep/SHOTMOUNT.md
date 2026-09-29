@@ -1,5 +1,7 @@
 # SHOTMOUNT — prep
 
+Status: M1..M3 written, uncompiled
+
 ## The finding
 
 `docs/dev/LEDGER.md`, `| SO19 |`: **"`screenshot` still writes FAT-direct."** Every file VERB
@@ -128,3 +130,7 @@ mt.create(&full_path, NodeKind::File, crate::fs::vfs::KERNEL_PRINCIPAL).map_err(
 let written = mt.write(&full_path, at as u64, chunk, crate::fs::vfs::KERNEL_PRINCIPAL)
     .map_err(Refusal::from_vfs)?; // Refusal::from_vfs does not exist yet — M1 adds it
 ```
+
+## Written
+
+- `video/prtscr.rs`: `Job.vpath`/`Job.routed` (`RoutedMt`), create+slice writes via `crate::shell::vfs_mount_table()` `mt.create`/`mt.write` with `KERNEL_PRINCIPAL`; FAT-direct kept only as a named `via=fat` fallback; witness `:: SHOTMOUNT: via=… path=… bytes=… -> PASS|FAIL ::` at the verdict. `next_free_name`/`ensure_capture_dir` still on FatFs (M2 naming over VfsBackend NOT done). Pin: `x86-wc.spec` (FORBID live; REQUIRE commented for the PRTSCRST+login lane).

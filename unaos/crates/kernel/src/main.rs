@@ -907,7 +907,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // (well-formed A / truncated / compression-loop / rcode) under `./arroyo test` in any environment
         // (the live boot resolve in `service_net` stays a bonus). Prints `:: DNS-X86-GATE: ... PASS [w=0xf] ::`.
         #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "smolnet"))]
-        unaos_kernel::smolnet::dns_x86_gate();
+        unaos_kernel::smolnet::dns_x86_gate(); unaos_kernel::net_fetch::parse_gate();
 
         // U1a: x86 ring-3 round-trip (the aarch64 M6a equivalent). Turn scheduling on (the default
         // test build never enables the feature-gated demo below, so the APs would otherwise idle in
@@ -1406,7 +1406,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // comment and the call site up in the `start_aps` block. The claim this comment used to make
             // ("EVENT_QUEUE is empty and no user slot is live") was false at this point in the boot: the
             // whole M6b..U7 fixture cascade is already spawned and running on the APs, holding ASIDs 1-8.
-            typematic_selftest(); // UVUG-6: prove the dropped-KeyUp wedge is closed (report-level + guards)
+            typematic_selftest(); unaos_kernel::pal::keyrepeat_selftest(); // UVUG-6: prove the dropped-KeyUp wedge is closed (report-level + guards)
             inwedge_selftest(); // INWEDGE: prove the input router refuses a held panel lock instead of wedging the input core on it
             unaos_kernel::arch::serial::RX_READY.init(); // M5c: the RX-wake semaphore's waiter list
             if !desktop_firmware_activate_maybe() { unaos_kernel::video::fbcon::detach(); } rast_demo_maybe(); // CONSWIN-PI: the DESKTOP-READY seam rides the detach line on the same zero-source-lines discipline PI-RAST established, and it GUARDS the detach — `desktop_firmware_activate_maybe` answers true only when the console is ROUTED into a compositor window, and a routed console does not write the panel (`fbcon::draw_fb` hands back the window surface), so the one thing the detach exists to guarantee — exactly one core writing the panel — is already true and skipping it leaves the console window LIVE instead of freezing it at the handoff. Knob-off it is `#[inline(always)] false`, so this folds to the bare `detach(); rast_demo_maybe();` it has always been. // PI-RAST demo (no-op unless UNAOS_PIRAST=1) on the SAME source line as the detach it rides, so the wire-in adds ZERO source lines ahead of any panic Location — the pi knob-off byte-identity constraint (PI-V3D-1 bisect-proven). Helper defined at file tail; runs here because the panel is up, fbcon has just stopped mirroring, and the input/render service tasks below are not spawned yet (nothing else paints).
@@ -7040,7 +7040,7 @@ fn x86_render_service(cpu: usize) {
             // Emitted from HERE — after `pal.render()`, inside the existing rate limit — deliberately.
             // The event-routing block above (`wc_click_route` -> `user_input_route` -> `handle_key`)
             // is the seam of the open focus-trap defect and is not to be perturbed by an instrument.
-            unaos_kernel::arch::sched::emit_load_witness(""); unaos_kernel::arch::sched::emit_smpload_witness(); #[cfg(feature = "witness")] unaos_kernel::arch::sched::smpload_selftest(); // SMPLOAD (B227) — ⚠ SAME-LINE fold, line-NEUTRAL: the VERDICT over the load line's own counters (its 10 s gate is inside) and the one-shot pure-judge fixture, riding the same 5 s clock.
+            unaos_kernel::arch::sched::emit_load_witness(""); unaos_kernel::arch::sched::emit_smpload_witness(); #[cfg(feature = "witness")] unaos_kernel::arch::sched::smpload_selftest(); unaos_kernel::net_tick::service_tick(); // SNTPDRV M1 (the 5 s clock drives the arch-neutral net seam) — SMPLOAD (B227) — ⚠ SAME-LINE fold, line-NEUTRAL: the VERDICT over the load line's own counters (its 10 s gate is inside) and the one-shot pure-judge fixture, riding the same 5 s clock.
             // R0 / rtwit: the WORST-CASE RULER's rollup, riding the same ~5 s gate. Emits the
             // `[rtwit]` line (input→present max/p99, per-lock max holds, max interrupt-mask span,
             // ruler overhead) and resets every per-span slot. A no-op inline shim when `rtwit` is off.
