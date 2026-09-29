@@ -1,5 +1,7 @@
 # APPMENU — prep
 
+Status: M1..M4 written, uncompiled
+
 ## The finding
 
 QUEUE.md `APPMENU`: **an app cannot publish a menu on ANY board — the ABI has no menu verb**
@@ -150,3 +152,12 @@ principal must never survive far enough to reach `[winmenu] publish` at all.)
 3. Read `arch/x86_64/syscall.rs:25007-25100` (`sys_msend` body) and the matching aarch64
    `bus_*` dispatch in full, to find the exact match arm `BUS_VERB_MV` sits in, before adding the
    three menu arms beside it for M2.
+
+## Written
+
+- M1 `unaos/crates/una-abi/src/lib.rs` (tail): `BUS_VERB_MENU_PUBLISH/CLEAR/GET` = 7/8/9, `INPUT_EV_MENU_PICK` = 8, `MENU_*` caps and flags, `MenuWireItem` (40 bytes; `new`/`to_bytes`/`from_bytes`), fit asserts, host `#[test] appmenu_wire_fits`. Wire body = 4-byte header `[ver][count][0][0]` + items; top-level items (parent 0) are SUBMENU titles, children carry `parent = title id`.
+- M2 `unaos/crates/kernel/src/video/appmenu.rs` (new, x86_64): owner-keyed registry (`verb_publish/verb_clear/verb_get/reap/has/deliver_pick`), whole refusals; dispatch arms folded onto the `BUS_VERB_MV` line of `busx_msend_for` (`arch/x86_64/syscall.rs`); `bus::verb_valid` extended (same line); `pub mod appmenu` folded onto `pub mod winmenu;` in `video/mod.rs`.
+- M3 same file: publish flattens the tree to leaked `'static` `MenuTitle`/`MenuItem` rows and hands them to `winmenu::publish` for each window the owner has, with a per-slot `fn(u32)` sink that pushes `INPUT_EV_MENU_PICK` into the OWNER's ring (`syscall::user_input_push_owner`, tail of syscall.rs), witness `[menubar] pick owner= item= delivered=`.
+- M4 `wm::close_owner`: `appmenu::reap(owner_asid)` folded after `drag_forget_owner`.
+- Fixture `appmenu_fixture` (syscall.rs tail, `witness`+`wc`), called from the `let mut w = 0u32;` line of `busx86_stamp_check`; pins in `unaos/scripts/specs/x86-wc.spec`.
+- Not done: aarch64 dispatch (frames with the new verbs fail closed `-EINVAL`), M5 host `SMessage`, windows created after a publish attach on the next publish.

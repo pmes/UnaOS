@@ -836,3 +836,23 @@ FORBID \[wm\] close-scope win=0
 # REQUIRE :: SHOTMOUNT: via=vfs path=/home/una/Desktop/[A-Za-z0-9 ._-]+ bytes=[0-9]+ -> PASS ::
 FORBID :: SHOTMOUNT: via=fat
 FORBID :: SHOTMOUNT: .* -> FAIL
+# --- APPMENU (R73, arc (a)) — the ring-3 menu verb, exercised by the witness-gated fixture in
+# --- arch/x86_64/syscall.rs (`appmenu_fixture`, called from the head of `busx86_stamp_check`): a
+# --- kernel-minted owner (scratch row 6 -> owner 7) publishes a 3-item tree through the production
+# --- `busx_msend_for` path, reads it back through GET, has a 65-item tree and a caller-stamped
+# --- principal refused with the registry unchanged, takes a pick in ITS OWN ring while every other
+# --- ring stays quiet (ledger leg 1: identity, not focus), and is reaped (leg 4). Runs on this lane
+# --- because it needs `witness` + `wc`; the click-driven pick (`[menubar] pick owner= item=`) needs a
+# --- real ring-3 publisher and is pinned only negatively (never `delivered=false`).
+REQUIRE :: APPMENU: verb=publish owner=7 items=3 depth=2 bar=\d+/\d+ -> PASS ::
+REQUIRE :: APPMENU: owner=7 items=3 published=1 -> PASS ::
+REQUIRE :: APPMENU: readback owner=7 items=3 match=true -> PASS ::
+REQUIRE :: APPMENU: verb=publish owner=7 reason=items-cap -> REFUSED ::
+REQUIRE :: APPMENU: refuse items=65 principal=caller registry_unchanged=true -> PASS ::
+REQUIRE :: APPMENU: owner=7 items=3 pick_to=owner others_quiet=true -> PASS ::
+REQUIRE :: APPMENU: owner=7 closed reaped=true -> PASS ::
+REQUIRE :: APPMENU: owner=7 reaped empty=true -> PASS ::
+FORBID :: APPMENU: .* -> FAIL ::
+FORBID :: APPMENU: verb=publish owner=[0-9]+ items=(6[5-9]|[7-9][0-9]|[1-9][0-9][0-9]) .* -> PASS ::
+FORBID \[winmenu\] publish owner=0 
+FORBID \[menubar\] pick owner=[0-9]+ item=[0-9]+ delivered=false

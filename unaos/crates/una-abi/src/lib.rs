@@ -657,3 +657,130 @@ const _: () = assert!(PULSE_WORDS * 8 == core::mem::size_of::<UserPulse>());
 const _: () = assert!(core::mem::size_of::<UserInfo>() == 16);
 /// `O_CREAT | O_RW` is the `3` every create fixture passes.
 const _: () = assert!(O_CREAT | O_RW == 3);
+
+// =================================================================================================
+// APPMENU (R73, arc (a)) — the menu verb. An app publishes a menu TREE over the frozen bus; the kernel
+// registry holds it keyed by the caller's kernel-stamped identity; a pick comes back to the owner as
+// `INPUT_EV_MENU_PICK`. No new syscall: `SYS_MSEND`/`SYS_MRECV` are board-uniform since BUSX86. The
+// design ledger is `video/menubar.rs` (THE MENU PROTOCOL); the two corrections it needed are applied
+// here — the input tag is 8 (6 and 7 landed first), and the transport is no longer aarch64-only.
+// Appended at the file tail so no existing line moves.
+// =================================================================================================
+
+/// Bus verb: publish this principal's menu tree (replaces its entry). Body = [`MenuWireHdr`] then
+/// `count` [`MenuWireItem`]s, exactly `MENU_HDR_LEN + count * MENU_ITEM_LEN` bytes. Refused whole.
+pub const BUS_VERB_MENU_PUBLISH: u8 = 7;
+/// Bus verb: drop this principal's menu entry. Empty body.
+pub const BUS_VERB_MENU_CLEAR: u8 = 8;
+/// Bus verb: read a menu tree. Body = empty (the caller's own) or 8 bytes LE = the target owner id.
+/// The reply body is the tree in the publish shape, or EMPTY when that owner has none.
+pub const BUS_VERB_MENU_GET: u8 = 9;
+
+/// A menu pick delivered to the TREE'S OWNER (never to the focused slot). Payload `[31:0]` = the
+/// publisher's own item id. Bit 63 stays clear ([`input_ev_pack`]'s invariant).
+pub const INPUT_EV_MENU_PICK: u64 = 8;
+
+/// The wire encoding's version. A bump is a protocol break: rule on it, never bump silently.
+pub const MENU_WIRE_VERSION: u8 = 1;
+/// Label bytes per item, ASCII, not NUL-terminated.
+pub const MENU_LABEL_MAX: usize = 24;
+/// Levels: a title and its rows. Deeper is refused.
+pub const MENU_DEPTH_MAX: usize = 2;
+/// Items per tree, total across depths.
+pub const MENU_ITEMS_MAX: usize = 64;
+/// Item flag: not pickable.
+pub const MENU_FLAG_DISABLED: u32 = 1 << 0;
+/// Item flag: a separator row.
+pub const MENU_FLAG_SEPARATOR: u32 = 1 << 1;
+/// Item flag: carries a check mark.
+pub const MENU_FLAG_CHECKED: u32 = 1 << 2;
+/// Item flag: a top-level TITLE whose children (items whose `parent` is this item's `id`) are its rows.
+pub const MENU_FLAG_SUBMENU: u32 = 1 << 3;
+/// The flag bits a publisher may set; any other bit refuses the tree.
+pub const MENU_FLAGS_KNOWN: u32 = MENU_FLAG_DISABLED | MENU_FLAG_SEPARATOR | MENU_FLAG_CHECKED | MENU_FLAG_SUBMENU;
+
+/// One item on the wire: fixed width, so the kernel walks records and parses nothing.
+/// `parent == 0` is a top-level item, which MUST be a `MENU_FLAG_SUBMENU` title with a nonzero `id`.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct MenuWireItem {
+    pub id: u32,
+    pub parent: u32,
+    pub flags: u32,
+    pub label_len: u8,
+    pub label: [u8; MENU_LABEL_MAX],
+    pub _pad: [u8; 3],
+}
+/// Bytes per wire item.
+pub const MENU_ITEM_LEN: usize = 40;
+/// The body header: `[version u8][count u8][0][0]`.
+pub const MENU_HDR_LEN: usize = 4;
+
+impl MenuWireItem {
+    /// An all-zero item (an unused record).
+    pub const ZERO: MenuWireItem = MenuWireItem { id: 0, parent: 0, flags: 0, label_len: 0, label: [0; MENU_LABEL_MAX], _pad: [0; 3] };
+    /// Build an item from an ASCII label; a label over [`MENU_LABEL_MAX`] is truncated HERE (a ring-3
+    /// helper's convenience) — the kernel never truncates, it refuses.
+    pub const fn new(id: u32, parent: u32, flags: u32, label: &[u8]) -> MenuWireItem {
+        let mut it = MenuWireItem::ZERO;
+        it.id = id;
+        it.parent = parent;
+        it.flags = flags;
+        let n = if label.len() < MENU_LABEL_MAX { label.len() } else { MENU_LABEL_MAX };
+        let mut i = 0;
+        while i < n {
+            it.label[i] = label[i];
+            i += 1;
+        }
+        it.label_len = n as u8;
+        it
+    }
+    /// The 40 wire bytes, little-endian, padding zero.
+    pub const fn to_bytes(&self) -> [u8; MENU_ITEM_LEN] {
+        let mut b = [0u8; MENU_ITEM_LEN];
+        let (i, p, f) = (self.id.to_le_bytes(), self.parent.to_le_bytes(), self.flags.to_le_bytes());
+        let mut k = 0;
+        while k < 4 {
+            b[k] = i[k];
+            b[4 + k] = p[k];
+            b[8 + k] = f[k];
+            k += 1;
+        }
+        b[12] = self.label_len;
+        let mut j = 0;
+        while j < MENU_LABEL_MAX {
+            b[13 + j] = self.label[j];
+            j += 1;
+        }
+        b
+    }
+    /// Decode one record from exactly [`MENU_ITEM_LEN`] bytes (`None` on a wrong length).
+    pub fn from_bytes(b: &[u8]) -> Option<MenuWireItem> {
+        if b.len() != MENU_ITEM_LEN {
+            return None;
+        }
+        let rd = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let mut label = [0u8; MENU_LABEL_MAX];
+        label.copy_from_slice(&b[13..13 + MENU_LABEL_MAX]);
+        Some(MenuWireItem { id: rd(0), parent: rd(4), flags: rd(8), label_len: b[12], label, _pad: [b[37], b[38], b[39]] })
+    }
+}
+
+/// The fixed record is 40 bytes and a full tree fits one bus body with room.
+const _: () = assert!(core::mem::size_of::<MenuWireItem>() == MENU_ITEM_LEN);
+const _: () = assert!(MENU_HDR_LEN + MENU_ITEMS_MAX * MENU_ITEM_LEN <= BUS_BODY_MAX);
+const _: () = assert!(MENU_ITEMS_MAX <= 255); // the header's count is a u8
+const _: () = assert!(input_ev_pack(INPUT_EV_MENU_PICK, 0xFFFF_FFFF) < (1u64 << 63));
+
+#[cfg(test)]
+mod appmenu_tests {
+    extern crate std;
+    use super::*;
+    #[test]
+    fn appmenu_wire_fits() {
+        assert_eq!(MENU_ITEMS_MAX * MENU_ITEM_LEN, 2560);
+        let it = MenuWireItem::new(7, 1, MENU_FLAG_CHECKED, b"Run");
+        assert_eq!(MenuWireItem::from_bytes(&it.to_bytes()), Some(it));
+        std::println!(":: APPMENU: abi items={} wire_bytes={} cap_bytes={} body_max={} -> PASS ::", MENU_ITEMS_MAX, MENU_ITEM_LEN, MENU_ITEMS_MAX * MENU_ITEM_LEN, BUS_BODY_MAX);
+    }
+}

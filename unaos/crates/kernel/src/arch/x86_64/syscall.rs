@@ -25043,7 +25043,7 @@ fn busx_msend_for(row: usize, cgen: u64, frame: &[u8]) -> i64 {
         // by-name delete and `SYS_RENAME` call — so these legs cannot drift from the syscall's, there
         // being no second implementation to drift from. Body parsing and the fail-closed `-EINVAL` on
         // a malformed one are the aarch64 dispatcher's, verb for verb. ⚠ LINE-NEUTRAL fold (B94).
-        crate::bus::BUS_VERB_WRITE => match crate::bus::write_body_parse(body) { Ok((nb, c)) => match core::str::from_utf8(nb) { Ok(n) => busx_write(row, cgen, n, c), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_RM => match crate::bus::cat_body_parse(body) { Ok(nb) => match core::str::from_utf8(nb) { Ok(n) => busx_rm(row, cgen, n), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_MV => match crate::bus::cp_body_parse(body) { Ok((a, b)) => match (core::str::from_utf8(a), core::str::from_utf8(b)) { (Ok(x), Ok(y)) => busx_mv(row, cgen, x, y), _ => return EINVAL }, Err(_) => return EINVAL },
+        crate::bus::BUS_VERB_WRITE => match crate::bus::write_body_parse(body) { Ok((nb, c)) => match core::str::from_utf8(nb) { Ok(n) => busx_write(row, cgen, n, c), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_RM => match crate::bus::cat_body_parse(body) { Ok(nb) => match core::str::from_utf8(nb) { Ok(n) => busx_rm(row, cgen, n), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_MV => match crate::bus::cp_body_parse(body) { Ok((a, b)) => match (core::str::from_utf8(a), core::str::from_utf8(b)) { (Ok(x), Ok(y)) => busx_mv(row, cgen, x, y), _ => return EINVAL }, Err(_) => return EINVAL }, una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(row, body), una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(row, body), una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(row, body, &mut text),
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
     busx_reply_enqueue(row, hdr.corr, hdr.verb, status, &text)
@@ -25115,7 +25115,7 @@ fn busx86_stamp_check() {
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    let mut w = 0u32;
+    let mut w = 0u32; #[cfg(all(feature = "witness", feature = "wc"))] appmenu_fixture();
     let row: usize = 7; // a scratch row (the kernel-fixture discipline; the ring-3 ladder is done by now)
     if row >= BUSX_MBOX.len() {
         return;
@@ -29431,4 +29431,97 @@ fn lfnmv_launcher() {
         return;
     }
     crate::shell::lfnmv_witness("x86_64", LFNMV_SYSRC.load(Ordering::Acquire), ENOENT);
+}
+
+// =================================================================================================
+// APPMENU (R73) — the pick-delivery seam and the kernel-minted-owner fixture. Appended at the tail so
+// no existing line moves; the fixture is called from the head of `busx86_stamp_check` (same-line fold).
+// =================================================================================================
+
+/// APPMENU: push one pre-packed event into the ring of the process that OWNS `owner` (the `slot + 1`
+/// wm key) — by identity, not focus. Returns whether it was queued. The caller is the input pump (the
+/// menu bar's press router), the ring's sole producer, exactly as `user_input_enqueue` is.
+pub fn user_input_push_owner(owner: u64, packed: u64) -> bool {
+    let Some(slot) = (owner as usize).checked_sub(1) else { return false };
+    if slot >= crate::arch::memory::USER_SLOTS {
+        return false;
+    }
+    user_input_push(slot, packed)
+}
+
+/// APPMENU fixture helper: one bus round trip on `row` — request in, `(send rc, reply status, reply body)`.
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn appmenu_call(row: usize, cgen: u64, verb: u8, corr: u32, body: &[u8], stamp: u8) -> (i64, i32, alloc::vec::Vec<u8>) {
+    let mut f = alloc::vec![0u8; crate::bus::BUS_FRAME_MAX];
+    let n = crate::bus::build_request(verb, corr, body, &mut f);
+    f[16] = stamp; // 0 = honest; nonzero = a hand-planted CALLER principal (the leg-2 probe)
+    let rc = busx_msend_for(row, cgen, &f[..n]);
+    if rc != 0 {
+        return (rc, 0, alloc::vec::Vec::new());
+    }
+    match busx_mbox_pop(row) {
+        Some(m) => match crate::bus::frame_parse(&m.frame) {
+            Ok(h) => (0, h.status, m.frame[crate::bus::BUS_HDR_LEN..].to_vec()),
+            Err(_) => (0, i32::MIN, alloc::vec::Vec::new()),
+        },
+        None => (0, i32::MIN, alloc::vec::Vec::new()),
+    }
+}
+
+/// APPMENU fixture: a kernel-minted owner (scratch row 6 -> owner 7) publishes a 3-item menu through the
+/// PRODUCTION `busx_msend_for` path, reads it back through GET, has a 65-item tree and a caller-stamped
+/// principal refused with the registry unchanged, receives a pick in ITS ring while no other ring moves
+/// (ledger leg 1), and is reaped (leg 4). One `:: APPMENU: ... ::` line per leg.
+#[cfg(all(feature = "witness", feature = "wc"))]
+#[inline(never)]
+fn appmenu_fixture() {
+    use una_abi::{MenuWireItem as W, BUS_VERB_MENU_GET, BUS_VERB_MENU_PUBLISH, INPUT_EV_MENU_PICK, MENU_FLAG_SUBMENU};
+    let row: usize = 6;
+    let owner: u64 = row as u64 + 1;
+    if row >= BUSX_MBOX.len() || row >= crate::arch::memory::USER_SLOTS {
+        return;
+    }
+    let cgen = SLOT_GEN[row].load(Ordering::Acquire);
+    busx_mbox_clear(row);
+    let items = [W::new(1, 0, MENU_FLAG_SUBMENU, b"Tools"), W::new(10, 1, 0, b"Run"), W::new(11, 1, 0, b"Stop")];
+    let mut body = alloc::vec![una_abi::MENU_WIRE_VERSION, 3, 0, 0];
+    for it in items.iter() {
+        body.extend_from_slice(&it.to_bytes());
+    }
+    let (rc, st, _) = appmenu_call(row, cgen, BUS_VERB_MENU_PUBLISH, 31, &body, 0);
+    let published = rc == 0 && st == 0 && crate::video::appmenu::has(owner);
+    // Leg: read-back through GET is byte-identical.
+    let (grc, gst, got) = appmenu_call(row, cgen, BUS_VERB_MENU_GET, 32, &[], 0);
+    let rb = grc == 0 && gst == 0 && got == body;
+    serial_println!(":: APPMENU: readback owner={} items=3 match={} -> {} ::", owner, rb, if rb && published { "PASS" } else { "FAIL" });
+    // Leg 3 + 2: an over-cap tree and a caller-stamped principal are refused; the registry is unchanged.
+    let mut big = alloc::vec![una_abi::MENU_WIRE_VERSION, 65, 0, 0];
+    for i in 0..65u32 {
+        big.extend_from_slice(&W::new(100 + i, 1, 0, b"x").to_bytes());
+    }
+    let (_, cst, _) = appmenu_call(row, cgen, BUS_VERB_MENU_PUBLISH, 33, &big, 0);
+    let (srcrc, _, _) = appmenu_call(row, cgen, BUS_VERB_MENU_PUBLISH, 34, &body, 2);
+    let (_, _, again) = appmenu_call(row, cgen, BUS_VERB_MENU_GET, 35, &[], 0);
+    busx_mbox_clear(row);
+    let refused = cst == -22 && srcrc == EINVAL && again == body;
+    serial_println!(":: APPMENU: refuse items=65 principal=caller registry_unchanged={} -> {} ::", again == body, if refused { "PASS" } else { "FAIL" });
+    // Leg 1: the pick lands in the OWNER's ring; every other ring is untouched.
+    clear_input_row(row);
+    let mut before = [0u32; crate::arch::memory::USER_SLOTS];
+    for (s, b) in before.iter_mut().enumerate() {
+        *b = USER_INPUT_TAIL[s].load(Ordering::Acquire);
+    }
+    let sent = crate::video::appmenu::deliver_pick(owner, 10);
+    let tail = USER_INPUT_TAIL[row].load(Ordering::Acquire);
+    let ev = USER_INPUT_BUF[row][(before[row] as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire);
+    let others_quiet = (0..crate::arch::memory::USER_SLOTS).all(|s| s == row || USER_INPUT_TAIL[s].load(Ordering::Acquire) == before[s]);
+    let ok = sent && tail == before[row].wrapping_add(1) && ev == una_abi::input_ev_pack(INPUT_EV_MENU_PICK, 10) && others_quiet;
+    clear_input_row(row);
+    serial_println!(":: APPMENU: owner={} items=3 pick_to=owner others_quiet={} -> {} ::", owner, others_quiet, if ok { "PASS" } else { "FAIL" });
+    // Leg 4: reaped on owner death, and GET then answers empty, not a dead tree.
+    crate::video::appmenu::reap(owner);
+    let (_, rst, after) = appmenu_call(row, cgen, BUS_VERB_MENU_GET, 36, &[], 0);
+    busx_mbox_clear(row);
+    let reaped = rst == 0 && after.is_empty() && !crate::video::appmenu::has(owner);
+    serial_println!(":: APPMENU: owner={} reaped empty={} -> {} ::", owner, reaped, if reaped { "PASS" } else { "FAIL" });
 }
