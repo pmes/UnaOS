@@ -3107,7 +3107,7 @@ fn screen_create_user() {
     crate::video::crystal::login::open_create_user();
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     serial_println!("[login] create-user form not built in this image (R77: the stage stays create-user)");
-=======
+}
 /// R77 M3 — the loginst fixture chain, moved verbatim out of [`service`] so it registers with
 /// `crate::tests` instead of igniting at boot. Under `tests-at-boot` `service` raises `LOGINST_LIVE`
 /// before root's credential ignition (the old order); fired by the verb it raises and drops it itself,
