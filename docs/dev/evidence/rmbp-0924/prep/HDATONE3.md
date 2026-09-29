@@ -1,5 +1,7 @@
 # HDATONE3 — prep
 
+Status: M1..M4 written, uncompiled
+
 ## The finding
 
 Flight line: `:: HDA-PCM: amp=4096 default=4096 peak=4094 min=-4094 q27=4090 interleave=1 peak_ok=1 sine_ok=1 le_ok=1 frames=48000 -> PASS ::`
@@ -129,3 +131,10 @@ fn envelope_q15(f: usize) -> i32 {
 // hda.rs, after AMPLITUDE's parse_amp — M4
 pub const FORCE_ONE_MEMBER: bool = option_env!("UNAOS_HDA_MEMBERS").is_some();
 ```
+
+## Written
+
+All in `unaos/crates/kernel/src/drivers/hda.rs`, `mod tone` (cfg hda-tone): `PARAM_SUPPORTED_PCM`, `fmt_rate_hz` (M1; amp line gains `rate= fmt_rd= pcmcaps=`);
+`FADE_FRAMES`, `envelope_q15`, `fill`/`check` (M2; check's quarter-period reference is faded identically, edges must be 0; witness gains `hz= secs= fade_ms= edge0= edge_last=`);
+`parse_hz`/`parse_secs`/`TONE_HZ`/`SECS`/`FRAMES` (M3, plus arroyo comment block); `FORCE_ONE_MEMBER` gating the pair-walk (M4).
+Spec pins added in `unaos/scripts/specs/x86-witness.spec` after the HDA-TONE REQUIRE.

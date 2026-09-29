@@ -1639,6 +1639,12 @@ REQUIRE :: PRTSCR-DIR-FIX: no session -> REFUSED reason=no-session .* -> PASS ::
 # --- lpib_advanced=1 bcis=0 tag_ok=1 fifo_ready=1 run_ms=1200 -> FAIL ::`. The `-> REFUSED` arms
 # --- (drivers/hda.rs:1457, :1566) miss the REQUIRE. Audibility is not on the wire and is not claimed.
 REQUIRE :: HDA-TONE: .* -> PASS ::
+# --- HDATONE3 (B218): the buffer carries a 20 ms fade at both ends (edges exactly 0), the knobs are named on the wire,
+# --- and the codec's own rate read-back + supported-rates word ride the amp line. FORBID pins the FAIL arm.
+REQUIRE :: HDA-PCM: amp=\d+ .* sine_ok=1 le_ok=1 frames=\d+ hz=(220|440) secs=[1-3] fade_ms=20 edge0=0 edge_last=0 -> PASS ::
+FORBID :: HDA-PCM: .* -> FAIL ::
+REQUIRE \[hda\] amp member=\d+ dac=0x[0-9a-f]+ .* fmt_conv=0x[0-9a-f]+ fmt_want=0x[0-9a-f]+ fmt_match=1 rate=48000 fmt_rd=0x[0-9a-f]+ pcmcaps=0x[0-9a-f]+
+FORBID \[hda\] amp .* fmt_match=0
 #
 # --- KVBLANK (B179, UNAOS_KEPLER_VBLANK). The two self-test verdicts only (drivers/gpu/kepler_vblank.rs:
 # --- 1009, :1038); `GO-RED-FAILED` misses the second REQUIRE. The period values (`period_us=127022`,
