@@ -814,3 +814,8 @@ REQUIRE \[wc-d\] latch-check forced=16 printed=1 rolled=16 win=31 reroll=0 -> PA
 # COUNT 2 reads 1 hit and the FORBID trips on `[wm] close-scope win=0 owner=0x3`.
 COUNT 2 \[wm\] close-scope win=[1-9][0-9]* owner=0x[0-9a-f]+ next_focus=
 FORBID \[wm\] close-scope win=0 
+
+# --- DOCKRUN — the running tile's gestures: a window mints a tile with the running pip, a press raises it,
+# --- a right-click/long-press menu's Quit closes the owner and the tile leaves.
+REQUIRE :: DOCKRUN: tiles=\d+ running=\d+ pinned=\d+ raise=ok quit=ok -> PASS ::
+FORBID :: DOCKRUN: .* -> FAIL ::

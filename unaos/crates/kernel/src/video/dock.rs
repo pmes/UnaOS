@@ -1088,7 +1088,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
         );
         return true;
     }
-    PRESS_OUTCOME.store(DOCK_OUT_RAISE, Ordering::Relaxed);
+    PRESS_OUTCOME.store(DOCK_OUT_RAISE, Ordering::Relaxed); lp_arm(t, r.owner_asid);
     let was_hidden = !r.visible;
     PRESSED.store(r.id, Ordering::Release);
     if crate::video::wm::is_kernel_owner(r.owner_asid) {
@@ -1385,7 +1385,7 @@ pub fn selftest() {
             park, park_ok
         );
     }
-    rollup("selftest"); dockid_selftest(); // DOCKID — the tile-IDENTITY battery, driven from here on `menubar::selftest`'s precedent (same `witness` gate, same real panel, same ordering) because this module's own call site is `arch/x86_64/syscall.rs`, outside this arc's lane. It runs LAST: it mints six rows of its own and closes them, and the legs above must not see them. Its own one-shot `DONE` latch makes a future move to the canonical call site idempotent. ⚠ FOLDED onto this line — PARITY.md §5.3.
+    rollup("selftest"); dockid_selftest(); #[cfg(feature = "witness")] dockrun_selftest(); // DOCKID — the tile-IDENTITY battery, driven from here on `menubar::selftest`'s precedent (same `witness` gate, same real panel, same ordering) because this module's own call site is `arch/x86_64/syscall.rs`, outside this arc's lane. It runs LAST: it mints six rows of its own and closes them, and the legs above must not see them. Its own one-shot `DONE` latch makes a future move to the canonical call site idempotent. ⚠ FOLDED onto this line — PARITY.md §5.3.
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2853,4 +2853,186 @@ fn vacate_settle(pw: usize, ph: usize) -> u64 {
         if ok { "SETTLED" } else if ran == 0 { "UNSETTLED why=no-pass" } else { "UNSETTLED why=pass-ran" }
     );
     SLOT.packed()
+}
+
+// ---------------------------------------------------------------------------
+// DOCKRUN — the dock as a person expects it (R49). M1 pip, M2 running tile and M3 raise already exist
+// (every live window IS a tile; `paint` lights the pip; `press_at` raises). This block adds M4: the
+// running tile's menu (Quit, Keep in Dock / Remove from Dock), opened by a right-click or a 600 ms hold.
+// The menu RECT is exposed ([`menu_rect`]); painting it is the compositor's (not wired here).
+// ---------------------------------------------------------------------------
+
+/// Hold time that turns a press on a running tile into the menu, ms.
+const LONGPRESS_MS: u64 = 600;
+const MENU_ITEMS: usize = 2;
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+static MENU_OWNER: AtomicU64 = AtomicU64::new(0);
+static MENU_TILE: AtomicU64 = AtomicU64::new(0);
+/// Long-press arm: owner held down (0 = none), tile index, press time.
+static LP_OWNER: AtomicU64 = AtomicU64::new(0);
+static LP_TILE: AtomicU64 = AtomicU64::new(0);
+static LP_T0: AtomicU64 = AtomicU64::new(0);
+/// Owners kept in the dock for this boot (0 = empty slot). A toggle, not persisted past the boot.
+static KEPT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Arch-registered quit path (the close-box's `wc_close_click`); `0` = fall back to `wm::close_owner`.
+static QUIT_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Register the close-box's owner-kill path so a menu Quit does exactly what the close box does.
+pub fn set_quit_hook(f: fn(wm::WinId, u64) -> &'static str) { QUIT_HOOK.store(f as usize, Ordering::Release); }
+
+/// Is this scan row a real window (not a synthetic pin)? The running indicator's predicate.
+fn row_running(r: &wm::DockEntry) -> bool { r.id != wm::WIN_NONE && (r.id as usize) <= wm::MAX_WINDOWS }
+
+pub fn is_kept(owner: u64) -> bool { KEPT.iter().any(|k| k.load(Ordering::Relaxed) == owner) }
+
+/// Toggle the pin flag for `owner`; returns the new state.
+pub fn toggle_keep(owner: u64) -> bool {
+    for k in KEPT.iter() {
+        if k.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { return false; }
+    }
+    for k in KEPT.iter() {
+        if k.compare_exchange(0, owner, Ordering::AcqRel, Ordering::Relaxed).is_ok() { return true; }
+    }
+    false
+}
+
+/// Quit `owner` through the close-box path when registered, else `wm::close_owner`.
+pub fn quit_owner(win: wm::WinId, owner: u64) -> &'static str {
+    let h = QUIT_HOOK.load(Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: only `set_quit_hook` stores here, always a valid `fn(WinId, u64) -> &'static str`.
+        let f: fn(wm::WinId, u64) -> &'static str = unsafe { core::mem::transmute(h) };
+        return f(win, owner);
+    }
+    if wm::close_owner(owner) > 0 { "closed" } else { "norow" }
+}
+
+/// The strip model exactly as the router assembles it, plus the layout.
+fn router_model(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS]) -> Option<(usize, Layout)> {
+    let (n, _) = wm::dock_scan(rows, (0, 0, 0, 0));
+    let n = pin_console(rows, n); let n = pin_shell(rows, n); let n = pin_quarry(rows, n); let n = pin_pulse(rows, n);
+    settle(rows, n, false);
+    let (pw, ph) = { let fb = *super::WRITER.lock(); if !fb.is_ready() { return None; } (fb.width(), fb.height()) };
+    Some((n, Layout::for_panel(n, pw, ph)?))
+}
+
+/// The open menu's box (x, y, w, h) above its tile, or `None` when closed.
+pub fn menu_rect() -> Option<(usize, usize, usize, usize)> {
+    if !MENU_OPEN.load(Ordering::Acquire) { return None; }
+    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let (_, l) = router_model(&mut rows)?;
+    let (tx, _, _, _) = l.tile(MENU_TILE.load(Ordering::Relaxed) as usize)?;
+    let (w, h) = (16 * CELL_W + 2 * PAD, MENU_ITEMS * TILE_H);
+    Some((tx, l.y.saturating_sub(h + PAD), w, h))
+}
+
+pub fn menu_open() -> bool { MENU_OPEN.load(Ordering::Acquire) }
+pub fn menu_close() { MENU_OPEN.store(false, Ordering::Release); }
+
+fn menu_open_at(t: usize, owner: u64) {
+    MENU_OWNER.store(owner, Ordering::Relaxed); MENU_TILE.store(t as u64, Ordering::Relaxed);
+    MENU_OPEN.store(true, Ordering::Release);
+    serial_println!("[dock] menu open tile={} owner={:#x} keep={}", t, owner, is_kept(owner));
+}
+
+/// Right-click on a RUNNING tile opens the menu. Consumes the press iff it landed on one.
+pub fn right_press_at(x: i32, y: i32) -> bool {
+    if x < 0 || y < 0 { return false; }
+    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let Some((_, l)) = router_model(&mut rows) else { return false };
+    let Some(t) = l.tile_at(x as usize, y as usize) else { return false };
+    if !row_running(&rows[t]) { return false; }
+    menu_open_at(t, rows[t].owner_asid);
+    true
+}
+
+/// A left press on a running tile starts the hold timer (called from [`press_at`]'s raise arm).
+fn lp_arm(t: usize, owner: u64) {
+    if wm::is_kernel_owner(owner) && owner == 0 { return; }
+    LP_TILE.store(t as u64, Ordering::Relaxed); LP_T0.store(crate::arch::ms(), Ordering::Relaxed);
+    LP_OWNER.store(owner, Ordering::Release);
+}
+/// The button came up: the hold ends.
+pub fn lp_release() { LP_OWNER.store(0, Ordering::Release); }
+/// Poll from the input-drain task: after [`LONGPRESS_MS`] of hold the menu opens. Returns true when it did.
+pub fn lp_service(now_ms: u64) -> bool {
+    let o = LP_OWNER.load(Ordering::Acquire);
+    if o == 0 || now_ms.wrapping_sub(LP_T0.load(Ordering::Relaxed)) < LONGPRESS_MS { return false; }
+    LP_OWNER.store(0, Ordering::Release);
+    menu_open_at(LP_TILE.load(Ordering::Relaxed) as usize, o);
+    true
+}
+
+/// A press while the menu is open. Item 0 = Quit, item 1 = Keep in Dock / Remove from Dock. Any press
+/// closes the menu; a press inside the box is consumed. Returns whether it was consumed.
+pub fn menu_press(x: i32, y: i32) -> bool {
+    let Some((mx, my, mw, mh)) = menu_rect() else { menu_close(); return false };
+    menu_close();
+    if x < 0 || y < 0 { return false; }
+    let (px, py) = (x as usize, y as usize);
+    if px < mx || px >= mx + mw || py < my || py >= my + mh { return false; }
+    let owner = MENU_OWNER.load(Ordering::Relaxed);
+    if (py - my) / TILE_H == 0 {
+        let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+        let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
+        let win = rows[..n].iter().find(|r| r.owner_asid == owner).map(|r| r.id).unwrap_or(wm::WIN_NONE);
+        let how = quit_owner(win, owner);
+        serial_println!("[dock] menu quit owner={:#x} -> {}", owner, how);
+    } else {
+        let now = toggle_keep(owner);
+        serial_println!("[dock] menu {} owner={:#x}", if now { "keep-in-dock" } else { "remove-from-dock" }, owner);
+    }
+    true
+}
+
+/// DOCKRUN fixture: mint an owner with a window, see its running tile (dot predicate), raise it, open
+/// the menu, press Quit, see the tile leave.
+#[cfg(feature = "witness")]
+pub fn dockrun_selftest() {
+    static SURF: [u32; 64] = [0x0030_90F0; 64];
+    const OWNER: u64 = 0xD2D1;
+    let census = |rows: &mut [wm::DockEntry; wm::MAX_WINDOWS]| -> Option<(usize, usize, usize, Layout)> {
+        composite_reconciled();
+        let (n, l) = router_model(rows)?;
+        let running = rows[..n].iter().filter(|r| row_running(r)).count();
+        Some((n, running, n - running, l))
+    };
+    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let saved_focus = focus_get();
+    let win = wm::create(OWNER, SURF.as_ptr() as usize, core::mem::size_of_val(&SURF), 8, 8, 32, b"runA");
+    if win == wm::WIN_NONE { serial_println!(":: DOCKRUN: fixture — table full :: SKIP ::"); return; }
+    let Some((n0, run0, _, _)) = census(&mut rows) else { wm::close(win); serial_println!(":: DOCKRUN: fixture — no panel :: SKIP ::"); return };
+    let t = rows[..n0].iter().position(|r| r.id == win);
+    let tile_ok = t.is_some() && t.map(|i| row_running(&rows[i]) && wm::info(win).is_some()).unwrap_or(false);
+    // M3 raise: a press at the tile centre.
+    let mut raise = false;
+    if let Some(i) = t {
+        let (pw, ph) = { let fb = *super::WRITER.lock(); (fb.width(), fb.height()) };
+        if let Some(l) = Layout::for_panel(n0, pw, ph) {
+            if let Some((tx, ty, tw, th)) = l.tile(i) {
+                raise = press_at((tx + tw / 2) as i32, (ty + th / 2) as i32) && last_press_outcome() == "raise";
+                lp_release();
+            }
+        }
+    }
+    // M4 quit: right-click, then the Quit item's centre.
+    let mut quit = false;
+    if let Some((_, _, _, l)) = census(&mut rows) {
+        if let Some(i) = rows.iter().position(|r| r.id == win) {
+            if let Some((tx, ty, tw, th)) = l.tile(i) {
+                let opened = right_press_at((tx + tw / 2) as i32, (ty + th / 2) as i32);
+                if let (true, Some((mx, my, _, _))) = (opened, menu_rect()) {
+                    let hit = menu_press((mx + PAD + 1) as i32, (my + TILE_H / 2) as i32);
+                    let (n1, _, _, _) = census(&mut rows).map(|c| (c.0, c.1, c.2, c.3)).unwrap_or((usize::MAX, 0, 0, l));
+                    quit = hit && wm::info(win).is_none() && !rows[..n1.min(wm::MAX_WINDOWS)].iter().any(|r| r.owner_asid == OWNER);
+                }
+            }
+        }
+    }
+    menu_close(); if wm::info(win).is_some() { wm::close(win); }
+    focus_set(saved_focus);
+    let (pins, kept_ok) = (n0 - run0.min(n0), !is_kept(OWNER));
+    let ok = tile_ok && raise && quit && kept_ok;
+    serial_println!(":: DOCKRUN: tiles={} running={} pinned={} raise={} quit={} -> {} ::", n0, run0, pins,
+        if raise { "ok" } else { "no" }, if quit { "ok" } else { "no" }, if ok { "PASS" } else { "FAIL" });
 }
