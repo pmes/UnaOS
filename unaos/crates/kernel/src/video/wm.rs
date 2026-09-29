@@ -29376,10 +29376,13 @@ pub fn cycle_commit(id: WinId, owner: u64) -> bool {
     ok
 }
 
+/// Fixtures that press one title repeatedly inside [`title_dblclick`]'s window set this (the `[wm-act]` direct battery).
+pub static DBL_OFF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Double-click detector for title-bar presses: `true` when `id` was title-pressed within
 /// [`DBL_MS`] of the previous title press (and consumes the pair, so a triple is press-dbl-press).
 pub fn title_dblclick(id: WinId, now_ms: u64) -> bool {
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    if DBL_OFF.load(Relaxed) { return false; }
     static LAST_ID: AtomicU32 = AtomicU32::new(WIN_NONE);
     static LAST_MS: AtomicU64 = AtomicU64::new(0);
     const DBL_MS: u64 = 400;

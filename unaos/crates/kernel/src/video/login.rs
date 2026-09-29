@@ -1806,6 +1806,7 @@ fn notice_fixture() {
     let (s0, d0) = (NOTICE_SHOWN.load(Ordering::Relaxed), NOTICE_DISMISSED.load(Ordering::Relaxed));
     let was = HEADLESS.swap(true, Ordering::Relaxed);
     FORM.lock().state = State::Closed;
+    { let mut g = NOTICES.lock(); g.cur = None; g.n = 0; } // compiler: an earlier fixture's `Log Out` notice may still be on the glass — start from an empty queue
     notice_show(b"Fixture-A", b"first line\nsecond line");
     let a_up = FORM.lock().state == State::Alert && notice_current().title() == b"Fixture-A" && notice_current().lines() == 2;
     notice_show(b"Fixture-B", b"only line");

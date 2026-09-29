@@ -8247,7 +8247,7 @@ pub fn wmdirect_selftest() {
     // would reach a tail that reads "button up" and end the drag through the new belt instead of
     // through the release EVENT it exists to test. Two legs, two paths, each driven honestly.
     crate::pal::cursor::set_button_level(true);
-    let grab_consumed = wc_click_route_at(Event::Button(1), tpx, tpy);
+    crate::video::wm::DBL_OFF.store(true, Ordering::Relaxed); let grab_consumed = wc_click_route_at(Event::Button(1), tpx, tpy); // compiler (WINCYCLE x [wm-act]): this fixture presses one title many times inside DBL_MS; the double-click zoom must not steal them
     let grab_ok = grab_consumed && wm::drag_active() == w && user_input_active() == OWNER_D;
 
     // Leg 3 — THE ROUTED SEAM. Park the arrow at the grab point, then push a synthetic
@@ -8882,7 +8882,7 @@ pub fn wmdirect_selftest() {
         && ctrlgeom_ok.unwrap_or(true)
         && zoom_ok.unwrap_or(true)
         && minim_ok.unwrap_or(true);
-    serial_println!(
+    crate::video::wm::DBL_OFF.store(false, Ordering::Relaxed); serial_println!(
         "[wm-act] direct partition={} grab={} route={} content={} level={} tabcancel={} settle={} lead={} close={} dragdead={} ctrlgeom={} zoom={} minimise={} from=({},{}) to=({},{}) -> {}",
         partition_ok,
         grab_ok,

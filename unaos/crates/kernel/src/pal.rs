@@ -2322,7 +2322,7 @@ pub fn next_event_unless_held() -> Option<Event> {
     if matches!(ev, Some(e) if !matches!(e, Event::Action(_))) {
         EVQ_POP.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     }
-    ev
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let ev = match ev { Some(e) if crate::video::dimidle::gate(e) => None, o => o }; ev // DIMIDLE — the main router's drain (PTRLEAK) also passes the idle gate (compiler: it bypassed `pop_event`)
 }
 
 /// KEYREPEAT — timing witness for the host typematic engine, on the REAL clock. Presses 'k' at the report
