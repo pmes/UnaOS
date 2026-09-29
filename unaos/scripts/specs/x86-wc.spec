@@ -902,3 +902,6 @@ FORBID :: APPMENU: .* -> FAIL ::
 FORBID :: APPMENU: verb=publish owner=[0-9]+ items=(6[5-9]|[7-9][0-9]|[1-9][0-9][0-9]) .* -> PASS ::
 FORBID \[winmenu\] publish owner=0 
 FORBID \[menubar\] pick owner=[0-9]+ item=[0-9]+ delivered=false
+
+# WCDPOOL M1 — the heap curve prints (PASS = the line prints; the numbers are the reading).
+REQUIRE :: HEAP: size=[0-9]+ used=[0-9]+ free=[0-9]+ largest=[0-9]+ -> PASS ::
