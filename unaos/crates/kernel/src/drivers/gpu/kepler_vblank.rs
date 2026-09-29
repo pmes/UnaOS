@@ -371,6 +371,22 @@ static WIN_SAMPLES: AtomicU32 = AtomicU32::new(0);
 /// §R3 — ISR entries. **THE counter the mode is decided by**, and the one number that says whether
 /// the GK107 delivered a vblank to this kernel at all.
 static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
+/// KVBLANK5 M1 — the ISR's own books, printed once on the close line and again on the census line.
+/// `ISR_CALLS` = entries that reached the MMIO branch, `ISR_ACKS` = latch-ack writes to `INTR_HOST_HEAD`,
+/// `ISR_REARMS` = head-enable re-arm decisions, `REARM_WRITTEN` = the enable word written, `REARM_READBACK`
+/// = re-arm writes whose read-back showed the vblank bit set. `ISR_STUCK` = consecutive acks after which the
+/// vblank bit was STILL pending (the level did not fall) — the storm condition, replacing a raw entry cap.
+static ISR_CALLS: AtomicU64 = AtomicU64::new(0);
+static ISR_ACKS: AtomicU64 = AtomicU64::new(0);
+static ISR_REARMS: AtomicU64 = AtomicU64::new(0);
+static REARM_WRITTEN: AtomicU64 = AtomicU64::new(0);
+static REARM_READBACK: AtomicU64 = AtomicU64::new(0);
+static ISR_STUCK: AtomicU64 = AtomicU64::new(0);
+static ISR_PENDING_PRE: AtomicU64 = AtomicU64::new(0);
+/// KVBLANK5 M3 — the close kept the interrupt armed (delivery ratio >= 90%), and the wait census split.
+static IRQ_KEPT: AtomicBool = AtomicBool::new(false);
+static VB_WAIT_VIA_IRQ: AtomicU64 = AtomicU64::new(0);
+static VB_WAIT_VIA_POLL: AtomicU64 = AtomicU64::new(0);
 /// §R3 — the allocated vector (plus 1; zero = none), the head the ISR disarms, the captured
 /// `NV_PMC_INTR_EN` word, and how the interrupt was wired.
 static IRQ_VECTOR1: AtomicU32 = AtomicU32::new(0);
@@ -727,12 +743,16 @@ fn edge(vline: u32) {
 fn report(n: u64, vline: u32) {
     let (p_cyc, j_cyc, src) = LIVE.period();
     serial_println!(
-        ":: kepler: vblank head={} count={} period_us={} jitter_us={} raster_at_irq={} vt={} mode={} vbwaits={} vbwait_us={} vbgaveup={} vbrecheck={} seen={} tight={} period_src={} ::",
+        ":: kepler: vblank head={} count={} period_us={} jitter_us={} raster_at_irq={} vt={} mode={} vbwaits={} vbwait_us={} vbgaveup={} vbrecheck={} seen={} tight={} period_src={} vbwait_mode={} vbwait_irq={} vbwait_poll={} isr_calls={} acks={} rearms={} rearm_written={:08X} rearm_readback={} ::",
         VB_HEAD1.load(Ordering::Relaxed).saturating_sub(1),
         n, cycles_to_us(p_cyc), cycles_to_us(j_cyc), vline, VB_VTOTAL.load(Ordering::Relaxed), mode_str(),
         VB_WAITS.load(Ordering::Relaxed), VB_WAIT_US.load(Ordering::Relaxed),
         VB_WAIT_GAVEUP.load(Ordering::Relaxed), VB_WAIT_RECHECK.load(Ordering::Relaxed),
         LIVE.seen.load(Ordering::Relaxed), LIVE.tight.load(Ordering::Relaxed), src,
+        if VB_WAIT_VIA_IRQ.load(Ordering::Relaxed) > VB_WAIT_VIA_POLL.load(Ordering::Relaxed) { "irq" } else { "poll" },
+        VB_WAIT_VIA_IRQ.load(Ordering::Relaxed), VB_WAIT_VIA_POLL.load(Ordering::Relaxed),
+        ISR_CALLS.load(Ordering::Relaxed), ISR_ACKS.load(Ordering::Relaxed), ISR_REARMS.load(Ordering::Relaxed),
+        REARM_WRITTEN.load(Ordering::Relaxed) as u32, REARM_READBACK.load(Ordering::Relaxed),
     );
 }
 
@@ -1075,15 +1095,22 @@ fn rung3_run(bar0: usize, head: usize, n: u64) {
     }
 
     // ── CLOSE. Order matters: stop the ISR touching MMIO, then mask, then restore. ──
-    IRQ_LIVE.store(false, Ordering::Release);
+    // KVBLANK5 M3 — a delivery ratio >= 90% keeps the interrupt ARMED past the window (the wait census then
+    // reads the live counter); a poor ratio or a storm closes as before.
+    let keep = {
+        let (i, v) = (IRQ_COUNT.load(Ordering::Relaxed), elapsed.max(1));
+        i * 100 >= v * 90 && !IRQ_STORMED.load(Ordering::Relaxed) && ISR_REARMS.load(Ordering::Relaxed) > 0
+    };
+    IRQ_KEPT.store(keep, Ordering::Release);
+    if !keep { IRQ_LIVE.store(false, Ordering::Release); }
     let pmc_entry = IRQ_PMC_ENTRY.load(Ordering::Relaxed);
     let mask_entry = IRQ_MASK_ENTRY.load(Ordering::Relaxed);
     let en_entry = WIN_EN_ENTRY.load(Ordering::Relaxed);
-    unsafe {
+    if !keep { unsafe {
         mmio_write(bar0, regs::NV_PMC_INTR_EN, pmc_entry); // the line first
         mmio_write(bar0, PMC_INTR_MASK_HOST, mask_entry);
         mmio_write(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head), en_entry);
-    }
+    } }
     let pmc_back = unsafe { mmio_read(bar0, regs::NV_PMC_INTR_EN) };
     let mask_back = unsafe { mmio_read(bar0, PMC_INTR_MASK_HOST) };
     let en_back = unsafe { mmio_read(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head)) };
@@ -1103,14 +1130,23 @@ fn rung3_run(bar0: usize, head: usize, n: u64) {
     // the registers were cited: by whether the GK107 delivered an interrupt to this kernel.
     IRQ_MODE.store(irq > 0, Ordering::Release);
 
-    let clean = pmc_back == pmc_entry && mask_back == mask_entry && en_back == en_entry;
+    let clean = keep || (pmc_back == pmc_entry && mask_back == mask_entry && en_back == en_entry);
     serial_println!(
         ":: kepler: vblank-intr vector close head={} irq={} vbl_delta={} rearms={} wire={} vector={:#04x} storm={} pmc_restored={:08X} pmc_readback={:08X} en_restored={:08X} en_readback={:08X} verdict={} mode={} deliver={} reason={} intr_or={:08X} line_or={:08X} mask_restored={:08X} mask_readback={:08X} :: — irq= is ISR ENTRIES and vbl_delta= is HEAD_STAT.VERT[31:16] vblanks over the same window, so irq/vbl_delta is the delivery ratio. deliver=/reason= (KVBLANK3, B192) name the FIRST broken link in the order the signal travels: wiring, bus master, PMC enable read-back, PMC mask read-back, INTR_0 bit 26 (PDISPLAY raised its input), INTR_LINE_HOST (the line asserted), delivery. writes=6 total (3 arm, 3 restore), all read back. mode= is set by irq= and by nothing else ::",
-        head, irq, elapsed, WIN_SEEN.load(Ordering::Relaxed), IRQ_WIRE.load(Ordering::Relaxed),
+        head, irq, elapsed, ISR_REARMS.load(Ordering::Relaxed), IRQ_WIRE.load(Ordering::Relaxed),
         IRQ_VECTOR1.load(Ordering::Relaxed).saturating_sub(1), IRQ_STORMED.load(Ordering::Relaxed) as u32,
         pmc_entry, pmc_back, en_entry, en_back,
         if clean { "clean" } else { "DIRTY" }, mode_str(), deliver, reason, intr_or, line_or,
         mask_entry, mask_back,
+    );
+    // KVBLANK5 M1 — the ISR's books, once per close (`rearms=` above is now ISR_REARMS; the old
+    // rung-3 poll re-arm count is `poll_rearms=` here).
+    serial_println!(
+        ":: kepler: vblank-isr books isr_calls={} acks={} rearms={} rearm_written={:08X} rearm_readback={} pending_pre={} stuck={} poll_rearms={} kept_live={} :: — KVBLANK5: acks = INTR_HOST_HEAD latch-ack writes; rearm_readback = re-arms whose HEAD_EN read back with the vblank bit; stuck = consecutive acks after which the vblank bit was still pending ::",
+        ISR_CALLS.load(Ordering::Relaxed), ISR_ACKS.load(Ordering::Relaxed), ISR_REARMS.load(Ordering::Relaxed),
+        REARM_WRITTEN.load(Ordering::Relaxed) as u32, REARM_READBACK.load(Ordering::Relaxed),
+        ISR_PENDING_PRE.load(Ordering::Relaxed), ISR_STUCK.load(Ordering::Relaxed), WIN_SEEN.load(Ordering::Relaxed),
+        IRQ_KEPT.load(Ordering::Relaxed) as u32,
     );
     LADDER.store(LADDER_DONE, Ordering::Release);
 }
@@ -1134,19 +1170,38 @@ extern "x86-interrupt" fn kepler_vblank_isr(_f: x86_64::structures::idt::Interru
     if bar0 != 0 && IRQ_LIVE.load(Ordering::Acquire) {
         let head = IRQ_HEAD.load(Ordering::Relaxed) as usize;
         if head < 4 {
+            ISR_CALLS.fetch_add(1, Ordering::Relaxed);
+            let vb = 1u32 << DISP_INTR_HEAD_BIT_VBLANK;
+            let entry = WIN_EN_ENTRY.load(Ordering::Relaxed);
+            let en_reg = disp_head(DISP_INTR_HOST_HEAD_EN, head);
+            let st_reg = disp_head(DISP_INTR_HOST_HEAD, head);
             unsafe {
-                mmio_write(
-                    bar0,
-                    disp_head(DISP_INTR_HOST_HEAD_EN, head),
-                    isr_head_en(WIN_EN_ENTRY.load(Ordering::Relaxed)), // KVBLANK4 (B192→R71): the ack write RE-ARMS the vblank bit on the same write — see `isr_head_en`
-                );
-                if n >= IRQ_STORM_CAP {
+                // KVBLANK5 M2 — flight 16 (`irq=1 vbl_delta=60 intr_or=04000000 line_or=00000000`): the enable
+                // WAS set (rung3's poll re-arm never fired, `rearms=0` counted only THAT branch), but the
+                // PDISPLAY latch was never cleared, so PMC bit 26 stayed raised and an MSI is an EDGE on the
+                // assertion — no new message while the source stays asserted. Order: disarm, ACK THE LATCH
+                // (write the vblank bit back to INTR_HOST_HEAD, write-1-to-clear as the nvkm gf119 head ISR
+                // does — UNVERIFIED on this die, the readback below is the witness), re-arm.
+                let pre = mmio_read(bar0, st_reg);
+                if pre & vb != 0 { ISR_PENDING_PRE.fetch_add(1, Ordering::Relaxed); }
+                mmio_write(bar0, en_reg, entry & !vb);
+                mmio_write(bar0, st_reg, vb);
+                ISR_ACKS.fetch_add(1, Ordering::Relaxed);
+                let post = mmio_read(bar0, st_reg);
+                if post & vb != 0 { ISR_STUCK.fetch_add(1, Ordering::Relaxed); } else { ISR_STUCK.store(0, Ordering::Relaxed); }
+                let w = isr_head_en(entry); // KVBLANK4: the entry value WITH the vblank bit
+                mmio_write(bar0, en_reg, w);
+                ISR_REARMS.fetch_add(1, Ordering::Relaxed);
+                REARM_WRITTEN.store(w as u64, Ordering::Relaxed);
+                if mmio_read(bar0, en_reg) & vb != 0 { REARM_READBACK.fetch_add(1, Ordering::Relaxed); }
+                if ISR_STUCK.load(Ordering::Relaxed) >= IRQ_STORM_CAP {
                     mmio_write(bar0, regs::NV_PMC_INTR_EN, IRQ_PMC_ENTRY.load(Ordering::Relaxed));
                     IRQ_STORMED.store(true, Ordering::Relaxed);
                 }
             }
         }
     }
+    let _ = n;
     crate::arch::apic::eoi();
 }
 
@@ -1226,6 +1281,7 @@ pub fn wait_next_edge(from: u64, deadline_cyc: u64) -> (bool, u64) {
     // Under the fixture the hardware source is not the one being driven, so the sample is skipped
     // and B145's two recorded verdicts are unchanged.
     let sample = SIM_MODE.load(Ordering::Relaxed) == 0;
+    let irq0 = IRQ_COUNT.load(Ordering::Relaxed);
     loop {
         if sample {
             let _ = crate::arch::scanout_beam();
@@ -1235,6 +1291,7 @@ pub fn wait_next_edge(from: u64, deadline_cyc: u64) -> (bool, u64) {
                 let dt = crate::arch::now_cycles().saturating_sub(t0);
                 VB_WAITS.fetch_add(1, Ordering::Relaxed);
                 VB_WAIT_US.fetch_add(cycles_to_us(dt), Ordering::Relaxed);
+                if IRQ_COUNT.load(Ordering::Relaxed) != irq0 { VB_WAIT_VIA_IRQ.fetch_add(1, Ordering::Relaxed); } else { VB_WAIT_VIA_POLL.fetch_add(1, Ordering::Relaxed); }
                 return (true, dt);
             }
             Some(_) => {}
@@ -1538,7 +1595,7 @@ fn selftest_rearm() {
     let ratio_pct = fixed * 100 / N;
     let ok = ratio_pct >= 95 && broken == 1;
     serial_println!(
-        ":: KVBLANK4: irq={} vbl={} ratio_pct={} fixed_isr=rearm broken={} -> {} ::",
-        fixed, N, ratio_pct, broken, if ok { "PASS" } else { "FAIL" }
+        ":: KVBLANK4: irq={} vbl={} ratio_pct={} fixed_isr=rearm broken={} rearm_written={:08X} vbwait_mode=poll -> {} ::",
+        fixed, N, ratio_pct, broken, isr_head_en(0), if ok { "PASS" } else { "FAIL" }
     );
 }

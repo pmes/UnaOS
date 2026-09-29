@@ -1653,7 +1653,8 @@ REQUIRE :: kepler: vblank selftest arm=wait sim=timer .* :: PASS ::
 REQUIRE :: kepler: vblank selftest arm=wait sim=stuck .* :: GO-RED-OK ::
 # --- KVBLANK4 (B192's falsifier answered; R71): the ISR's ack re-arms the vblank bit on the same write, so a
 # --- 62-vblank window delivers ~62 messages, not 1; `broken=1` is the flight-13..15 shape under the old ack.
-REQUIRE :: KVBLANK4: irq=\d+ vbl=62 ratio_pct=\d+ fixed_isr=rearm broken=1 -> PASS ::
+REQUIRE :: KVBLANK4: irq=\d+ vbl=62 ratio_pct=\d+ fixed_isr=rearm broken=1 rearm_written=00000001 vbwait_mode=poll -> PASS ::
+# KVBLANK5: the ISR books (isr_calls/acks/rearms/rearm_written/rearm_readback) print on the metal close + census lines only (QEMU has no Kepler); the fixture line carries rearm_written= so the field is pinned here.
 FORBID :: KVBLANK4: .* -> FAIL
 #
 # --- THE NEGATIVE PINS THE FLIGHTS TAUGHT. `GATE STOLEN` and `REHOMED the render role` are already
