@@ -88,6 +88,9 @@ pub mod vperf;
 // comment in `arroyo` for the hashes and the byte counts.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod desktop_uefi;
+// WCPAR — the compositor's band-worker pool (x86 + wc); see the module head.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod wcpar;
 // DOCK: the bottom strip — one tile per live window, INCLUDING the ones that are not on the panel,
 // and a press that raises and un-hides the window it names. Peter's ruling, white board Q10
 // (2026-08-09): "mac has had the dock forever so we should have a doc and all macos like

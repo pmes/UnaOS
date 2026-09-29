@@ -162,6 +162,8 @@ enum State {
     SetPw,
     /// LOGOUTUI (R70): a refused Log Out says why — one line of `Form::message` and an OK, the set-password screen's shape.
     Alert,
+    /// FIRSTBOOT (R77): the create-user form — name, password, retype — the Installer's second screen.
+    CreateUser,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -306,6 +308,21 @@ fn ctl_rect(c: Ctl, setpw: bool) -> (usize, usize, usize, usize) {
     }
 }
 
+/// FIRSTBOOT (R77): the create-user form's rects — name, password, retype stacked, the button where every form has it.
+fn cu_rect(c: Ctl) -> (usize, usize, usize, usize) {
+    match c {
+        Ctl::NameField => (FIELD_X, 46, FIELD_W, FIELD_H),
+        Ctl::PwField => (FIELD_X, 82, FIELD_W, FIELD_H),
+        Ctl::Pw2Field => (FIELD_X, 118, FIELD_W, FIELD_H),
+        Ctl::Button => (W - LX - BTN_W, 150, BTN_W, BTN_H),
+        _ => (0, 0, 0, 0),
+    }
+}
+
+fn cu_form() -> bool {
+    FORM.lock().state == State::CreateUser
+}
+
 fn setpw_form() -> bool {
     FORM.lock().state == State::SetPw
 }
@@ -319,6 +336,12 @@ fn ctl_at(lx: i32, ly: i32, setpw: bool) -> Option<Ctl> {
         let (rx, ry, rw, rh) = ctl_rect(c, setpw);
         rw > 0 && lx >= rx as i32 && lx < (rx + rw) as i32 && ly >= ry as i32 && ly < (ry + rh) as i32
     };
+    if cu_form() {
+        return [Ctl::NameField, Ctl::PwField, Ctl::Pw2Field, Ctl::Button].into_iter().find(|&c| {
+            let (rx, ry, rw, rh) = cu_rect(c);
+            rw > 0 && lx >= rx as i32 && lx < (rx + rw) as i32 && ly >= ry as i32 && ly < (ry + rh) as i32
+        });
+    }
     if setpw {
         return [Ctl::PwField, Ctl::Pw2Field, Ctl::Button].into_iter().find(|&c| inside(c));
     }
@@ -461,6 +484,33 @@ fn repaint() {
         }
         return;
     }
+    if f.state == State::CreateUser {
+        // FIRSTBOOT (R77): "Create your account" — name, password, retype, Create.
+        text(px, LX, 14, b"Create your account", theme::CONTENT_TEXT);
+        fill(px, LX, 36, W - 2 * LX, 2, theme::FRAME_LINE);
+        let (nx, ny, nw, _) = cu_rect(Ctl::NameField);
+        text(px, LX, ny + 4, b"Name", theme::TITLE_TEXT_INACTIVE);
+        field(px, nx, ny, nw, &f.name[..f.name_len], f.focus == Focus::Name, false);
+        let (pxf, py, pwf, _) = cu_rect(Ctl::PwField);
+        text(px, LX, py + 4, b"Password", theme::TITLE_TEXT_INACTIVE);
+        field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
+        let (p2x, p2y, p2w, _) = cu_rect(Ctl::Pw2Field);
+        text(px, LX, p2y + 4, b"Retype", theme::TITLE_TEXT_INACTIVE);
+        field(px, p2x, p2y, p2w, &f.pw2[..f.pw2_len], f.focus == Focus::Retype, true);
+        let (bx, by, _, _) = cu_rect(Ctl::Button);
+        let _ = (bx, by);
+        button(px, Ctl::Button, b"Create", true, false);
+        text(px, LX, 186, b"Enter or Create   Tab switches", theme::TITLE_TEXT_INACTIVE);
+        if !f.message.is_empty() {
+            text(px, LX, 212, f.message.as_bytes(), theme::ACCENT);
+        }
+        drop(f);
+        let id = WIN.load(Ordering::Relaxed);
+        if id != wm::WIN_NONE {
+            let _ = wm::present(id);
+        }
+        return;
+    }
     if f.state == State::SetPw {
         // LOGIN14: the set-password form — "Set a password for <name>", the password, its retype, Set.
         let mut title = [0u8; 19 + users::NAME_MAX];
@@ -574,10 +624,19 @@ pub fn open_set_password(name: &[u8], login_after: bool) {
     repaint();
 }
 
+/// FIRSTBOOT (R77): the create-user form — the Installer's second screen, after root's password is set. The
+/// setter's window is gone by now (`take_down`), so a fresh window is made.
+pub fn open_create_user() {
+    FORM.lock().state = State::Closed;
+    open_as(State::CreateUser);
+    serial_println!("[login] installer: create-user form open (R77: name, password, retype; the adduser path; the desktop ignites for that user)");
+    repaint();
+}
+
 fn open_as(state: State) {
     {
         let mut f = FORM.lock();
-        if f.state == State::Open || f.state == State::SetPw || f.state == State::Alert {
+        if f.state == State::Open || f.state == State::SetPw || f.state == State::Alert || f.state == State::CreateUser {
             return;
         }
         f.state = state;
@@ -619,7 +678,7 @@ fn open_as(state: State) {
     // screen, no console and a swallowed keyboard. The fixture's CLOSE leg measures it every witness
     // boot, against a control row that differs only here.
     let nt = notice_current(); // NOTICE: the alert's window is titled by the notice
-    let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::Alert { nt.title() } else { b"Log in" };
+    let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::CreateUser { b"Create account" } else if state == State::Alert { nt.title() } else { b"Log in" };
     let id = wm::create_at(OWNER, surf, W * H * 4, W as u32, H as u32, (W * 4) as u32, title, ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
     if id == wm::WIN_NONE {
         FORM.lock().windowed = false;
@@ -682,7 +741,7 @@ pub fn reopen_after_logout() {
 }
 
 pub fn is_open() -> bool {
-    matches!(FORM.lock().state, State::Open | State::SetPw | State::Alert)
+    matches!(FORM.lock().state, State::Open | State::SetPw | State::Alert | State::CreateUser)
 }
 
 /// SO36 + SO44 — **the screen's answer to a PRESS, and it is the same answer everywhere.**
@@ -827,7 +886,7 @@ fn pick_user(i: usize) {
 fn heal_if_row_gone() -> bool {
     let state = {
         let f = FORM.lock();
-        if !matches!(f.state, State::Open | State::SetPw) || !f.windowed {
+        if !matches!(f.state, State::Open | State::SetPw | State::CreateUser) || !f.windowed {
             return false;
         }
         f.state
@@ -874,6 +933,9 @@ pub fn consume_key(c: u8) -> bool {
             f.focus = match (f.state, f.focus) {
                 (State::SetPw, Focus::Password) => Focus::Retype,
                 (State::SetPw, _) => Focus::Password,
+                (State::CreateUser, Focus::Name) => Focus::Password,
+                (State::CreateUser, Focus::Password) => Focus::Retype,
+                (State::CreateUser, _) => Focus::Name,
                 (_, Focus::Name) => Focus::Password,
                 _ => Focus::Name,
             };
@@ -961,6 +1023,9 @@ fn submit_setpw() {
         take_down();
         FORM.lock().state = State::Closed;
         serial_println!("[login] set-password screen closed user={} (the root desktop continues)", who);
+        if n == users::ROOT_NAME {
+            users::installer_root_password_set(); // FIRSTBOOT (R77): the Installer advances — create-user, or the desktop
+        }
         return;
     }
     match users::login(n, &pw[..plen]) {
@@ -979,7 +1044,50 @@ fn submit_setpw() {
     }
 }
 
+/// FIRSTBOOT (R77): the create-user form's Enter/Create. Empty/mismatched/bad-name pairs keep the form; a good
+/// one goes through `users::installer_create_user` (the adduser path), then the session opens for THAT user
+/// (`users::login`, the call Log Out -> screen -> login makes) and the desktop ignites for them.
+fn submit_create() {
+    let (name, nlen, pw, plen, pw2, p2len) = {
+        let f = FORM.lock();
+        (f.name, f.name_len, f.pw, f.pw_len, f.pw2, f.pw2_len)
+    };
+    let n = &name[..nlen];
+    let who = core::str::from_utf8(n).unwrap_or("?");
+    if pw[..plen] != pw2[..p2len] {
+        serial_println!("[login] installer: create-user user={} retype mismatch (nothing written; the form stays)", who);
+        let mut f = FORM.lock();
+        f.message = "Passwords do not match";
+        clear_passwords(&mut f);
+        return;
+    }
+    if let Err(why) = users::installer_create_user(n, &pw[..plen]) {
+        serial_println!("[login] installer: create-user user={} refused ({})", who, why);
+        let mut f = FORM.lock();
+        f.message = why;
+        clear_passwords(&mut f);
+        return;
+    }
+    match users::login(n, &pw[..plen]) {
+        Ok(()) => {
+            LOGINS.fetch_add(1, Ordering::Relaxed);
+            serial_println!("[login] session open user={} (R77: the first user; root is not the assumed login)", who);
+            close_into_session();
+            users::installer_desktop_ignite();
+        }
+        Err(_) => {
+            serial_println!("[login] installer: user created but the session did not open — storage or slot refusal");
+            let mut f = FORM.lock();
+            f.message = "Could not open the session";
+            clear_passwords(&mut f);
+        }
+    }
+}
+
 fn submit() {
+    if cu_form() {
+        return submit_create();
+    }
     if setpw_form() {
         return submit_setpw();
     }
@@ -1928,4 +2036,22 @@ pub fn lock_fixture(name: &[u8], password: &[u8], wrong: &[u8]) -> bool {
         core::str::from_utf8(name).unwrap_or("?"), locked as u32, windows_before, if refused && name_kept { "refused" } else { "ACCEPTED" }, if unlocked { "ok" } else { "FAIL" }, reignited, if pass { "PASS" } else { "FAIL —" }
     );
     pass
+}
+
+/// FIRSTBOOT (R77): the Installer / CreateUser stage is known — close every window that already exists but the
+/// screen's own (the console minted at the takeover), and owe the furniture back (`SWEPT`, the LOGOUTDESK latch).
+pub fn installer_sweep() {
+    let keep = WIN.load(Ordering::Relaxed);
+    let n = wm::close_all_furniture_except(keep);
+    SWEPT.store(true, Ordering::Release);
+    serial_println!("[login] installer: furniture swept n={} re-minted=0 (R77: nothing but the setter / the form on the glass; the console is re-minted when the desktop is released)", n);
+}
+
+/// FIRSTBOOT (R77): the desktop is released — re-mint the furniture the way Log In after Log Out does, unless
+/// `close_into_session` already did.
+pub fn installer_release() {
+    if SWEPT.swap(false, Ordering::AcqRel) {
+        super::super::dock::relaunch_furniture();
+        serial_println!("[login] installer: furniture swept n=0 re-minted=2 (console+shell posted, the LOGOUTDESK re-mint)");
+    }
 }

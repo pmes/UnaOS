@@ -460,3 +460,10 @@ FORBID :: SCREENLOCK: .* -> FAIL
 # was in tree and unpinned, so a regression failed silently. Root-pinned `el0_walk` flips `nested` (root_alias).
 REQUIRE :: DIRNS: abs=ok nested=ok ocreat=ok escape=refused collapse=ok acl=n/a\(SO35\) .* -> PASS ::
 FORBID :: DIRNS: .* -> FAIL
+
+# FIRSTBOOT (R77) — the boot stage. The loginst chain seeds root's password and users itself, so this lane
+# resolves to the DESKTOP stage at the chain's end and the desktop tenants (the witness chain, STAT.ELF, the
+# furniture) run; the installer/create-user stages are metal-gated (a fresh card) and printed by the same seam.
+REQUIRE :: FIRSTBOOT: stage=desktop root_set=true users=\d+ desktop_ignited=true why=store-loaded -> PASS ::
+FORBID :: FIRSTBOOT: .* -> FAIL
+FORBID :: FIRSTBOOT: witness chain HELD

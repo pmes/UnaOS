@@ -452,6 +452,7 @@ pub fn activate_on(desc: SurfaceDesc) {
         fb.fill_screen(wm::DESKTOP_BG);
         fb.flush_all();
     }
+    super::wcpar::start(); // WCPAR — band workers exist before the first composite; prints `[wcpar] pool=`
     serial_println!(
         "[wc-x] desktop-clear panel={}x{} bg={:08X}",
         pw,
@@ -717,6 +718,12 @@ pub fn desktop_app_service() {
         return;
     }
     if DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    // FIRSTBOOT (R77): STAT.ELF is desktop furniture — held until the boot stage is Desktop (no root password
+    // -> nothing but the setter; no user -> the create-user form; the desktop ignites for that user).
+    #[cfg(feature = "login")]
+    if !crate::fs::users::desktop_allowed() {
         return;
     }
     // The same storage gate `fat::probe_once` uses, for the same reason: `mount()` on a boot whose
