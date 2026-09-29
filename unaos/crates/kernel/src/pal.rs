@@ -2324,3 +2324,60 @@ pub fn next_event_unless_held() -> Option<Event> {
     }
     ev
 }
+
+/// KEYREPEAT — timing witness for the host typematic engine, on the REAL clock. Presses 'k' at the report
+/// level, polls `typematic_tick` for 700 ms (counting emissions and the time of the first), releases through
+/// a report with an empty held set, then polls 120 ms more: `cancelled=1` iff nothing repeats after release.
+/// The delay/rate printed are the engine's own constants (`typematic::DELAY_MS`/`RATE_MS`), not restated.
+/// Bounded by a spin cap so a stopped clock FAILs instead of hanging the boot. `tick` only RETURNS the key
+/// (the pump pushes it), so the ring is untouched. Boot-time only; runs before any real keyboard report.
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
+pub fn keyrepeat_selftest() {
+    let mut spins: u64 = 0;
+    let cap: u64 = 400_000_000;
+    let t0 = crate::arch::ms();
+    typematic_note_report(b'k', &[b'k']);
+    let (mut repeats, mut first) = (0u32, 0u64);
+    while crate::arch::ms().wrapping_sub(t0) < 700 && spins < cap {
+        if typematic_tick() == Some(b'k') {
+            if repeats == 0 {
+                first = crate::arch::ms().wrapping_sub(t0);
+            }
+            repeats += 1;
+        }
+        spins += 1;
+        core::hint::spin_loop();
+    }
+    typematic_note_report(0, &[]); // release
+    let t1 = crate::arch::ms();
+    let mut after = 0u32;
+    while crate::arch::ms().wrapping_sub(t1) < 120 && spins < cap {
+        if typematic_tick().is_some() {
+            after += 1;
+        }
+        spins += 1;
+        core::hint::spin_loop();
+    }
+    let cancelled = after == 0;
+    let (d, r) = (typematic::DELAY_MS, typematic::RATE_MS);
+    // 700 ms hold: repeats expected ~ (700 - delay) / rate + 1; accept +-2 for tick granularity.
+    let want = ((700 - d) / r + 1) as u32;
+    let ok = spins < cap
+        && first >= d
+        && first <= d + 2 * r
+        && repeats + 2 >= want
+        && repeats <= want + 2
+        && cancelled;
+    serial_println!(
+        ":: KEYREPEAT: delay_ms={} rate_hz={} first_repeat_ms={} repeats={} cancelled={} -> {} ::",
+        d,
+        1000 / r,
+        first,
+        repeats,
+        cancelled as u8,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}

@@ -814,3 +814,10 @@ REQUIRE \[wc-d\] latch-check forced=16 printed=1 rolled=16 win=31 reroll=0 -> PA
 # COUNT 2 reads 1 hit and the FORBID trips on `[wm] close-scope win=0 owner=0x3`.
 COUNT 2 \[wm\] close-scope win=[1-9][0-9]* owner=0x[0-9a-f]+ next_focus=
 FORBID \[wm\] close-scope win=0 
+
+# --- KEYREPEAT (2026-09-29) -------------------------------------------------------------------
+# --- typematic timing on the REAL clock: hold 'k' 700 ms, release, watch 120 ms more. Delay/rate
+# --- are the engine's own constants; `cancelled=1` = nothing repeats after the release report.
+# --- GO-RED, ONE EDIT: raise `typematic::DELAY_MS` above 700 -> first_repeat_ms=0 repeats=0 -> FAIL.
+REQUIRE :: KEYREPEAT: delay_ms=\d+ rate_hz=\d+ first_repeat_ms=\d+ repeats=\d+ cancelled=1 -> PASS ::
+FORBID :: KEYREPEAT: .* -> FAIL ::
