@@ -814,3 +814,12 @@ REQUIRE \[wc-d\] latch-check forced=16 printed=1 rolled=16 win=31 reroll=0 -> PA
 # COUNT 2 reads 1 hit and the FORBID trips on `[wm] close-scope win=0 owner=0x3`.
 COUNT 2 \[wm\] close-scope win=[1-9][0-9]* owner=0x[0-9a-f]+ next_focus=
 FORBID \[wm\] close-scope win=0 
+
+# FILEVIEW (rmbp-0929): the read-only text viewer window (video/fileview.rs). The fixture opens the
+# first plain text-named root file the mount table lists (or, with no volume bound yet, an in-memory
+# body named `mem:FILEVIEW.TXT`), scrolls one row, checks the window is registered, and closes it.
+# GO-RED: with fileview absent no line prints and the REQUIRE misses; a viewer that lays out zero rows,
+# will not scroll, or leaves its window open prints `-> FAIL ::` and trips the FORBID.
+REQUIRE :: FILEVIEW: path=\S+ bytes=[0-9]+ lines=[1-9][0-9]* rows=[1-9][0-9]* wrapped=[0-9]+ -> PASS ::
+FORBID :: FILEVIEW: .* -> FAIL ::
+FORBID \[fileview\] refuse 
