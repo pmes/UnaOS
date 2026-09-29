@@ -1693,7 +1693,7 @@ pub fn login_press_fixture(name: &[u8], password: &[u8]) -> bool {
         wm::close(ctrl);
     }
     let ok = behind_named
-        && !down_swallowed
+        && down_swallowed // LOGINZ + SO44: the screen is topmost and takes every press — the down at the stand-in's spot is the screen's, swallowed AND routed to it
         && down_routed // LOGINZ: the screen is topmost, so a press at the stand-in's spot routes to the screen
         && up
         && up_at_window
