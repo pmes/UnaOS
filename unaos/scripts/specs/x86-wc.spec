@@ -814,3 +814,13 @@ REQUIRE \[wc-d\] latch-check forced=16 printed=1 rolled=16 win=31 reroll=0 -> PA
 # COUNT 2 reads 1 hit and the FORBID trips on `[wm] close-scope win=0 owner=0x3`.
 COUNT 2 \[wm\] close-scope win=[1-9][0-9]* owner=0x[0-9a-f]+ next_focus=
 FORBID \[wm\] close-scope win=0 
+
+# --- SHOTMOUNT (SO19, FSNS): a capture's bytes go THROUGH THE MOUNT TABLE (`mt.create`/`mt.write`, as
+# --- `shell::fs_write` does), so the file lands where `ls /` says the namespace is. The witness prints once per
+# --- capture at the verdict; `via=fat` means the table could not create the entry and the FAT-direct
+# --- fallback took it, which is the SO19 defect and is FORBIDDEN. A capture needs a user session + a writable
+# --- volume (`UNAOS_PRTSCRST=1 UNAOS_LOGIN=1 UNAOS_LOGINST=1`, plus the kepler knobs), so the REQUIRE below is
+# --- ARMED ONLY on that lane: uncomment it there (a REQUIRE on the plain lane would read silence as red).
+# REQUIRE :: SHOTMOUNT: via=vfs path=/home/una/Desktop/[A-Za-z0-9 ._-]+ bytes=[0-9]+ -> PASS ::
+FORBID :: SHOTMOUNT: via=fat
+FORBID :: SHOTMOUNT: .* -> FAIL
