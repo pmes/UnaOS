@@ -383,6 +383,8 @@ FORBID other-pw
 # the stored one (`verify=ok`), and the refusals each speak their own word and change nothing.
 REQUIRE :: LOGIN-ADDUSER: root=true created=unset:true prompted_at_adduser=false unset_verify=refused passwd_prompted=true echo=none uid=\d+ set=true verify=ok dup=exists empty=empty-password mismatch=mismatch on_line=password-on-line passwd_on_line=password-on-line -> PASS ::
 FORBID :: LOGIN-ADDUSER: .* -> FAIL
+REQUIRE :: USERMGMT: users=\d+ passwd_self=ok passwd_root_other=ok deluser_last=refused deluser_self=refused deluser_ok=1 -> PASS ::
+FORBID :: USERMGMT: .* -> FAIL
 # The success lines (the store's uid, the home's own verdict, the password's own line) and the refusals.
 REQUIRE \[users\] adduser user=boot13 id=\d+ home=/home/boot13 created=(true|false) password=unset
 REQUIRE \[users\] home=/home/boot13 (created|exists) volume=[0-9a-f]{8}
