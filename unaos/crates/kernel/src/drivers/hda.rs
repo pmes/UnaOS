@@ -1328,10 +1328,10 @@ mod tone {
     /// [HDA-SPEC §3.3.41 table 53]
     pub const FMT_48K_16_STEREO: u16 = 0x0011;
     pub const SAMPLE_RATE: usize = 48_000;
-    pub const TONE_HZ: usize = 440;
+    pub const TONE_HZ: usize = parse_hz(option_env!("UNAOS_HDA_HZ")); // HDATONE3 (B218) M3: build-time knob, allow-list 220|440, default 440
     /// One second. 48000 frames x 4 bytes = 192000, which is 1500 x 128 — the cyclic buffer length
     /// is a multiple of 128 bytes, as the specification requires. [HDA-SPEC §3.3.38]
-    pub const FRAMES: usize = SAMPLE_RATE;
+    pub const FRAMES: usize = SAMPLE_RATE * SECS; // HDATONE3 M3: `UNAOS_HDA_SECS` 1..=3 (default 1); SECS x 192000 bytes stays a multiple of 128 and of the two BDL halves
     pub const PCM_BYTES: usize = FRAMES * 4;
     /// Moderate amplitude: about -8.5 dBFS (12288 of 32767). Flights 8-12 used 4096 (-18 dBFS),
     /// which Peter could not hear over a loud room on 2026-09-24 ("raise the volume on your test
@@ -1340,6 +1340,41 @@ mod tone {
     pub const AMPLITUDE: i32 = parse_amp(option_env!("UNAOS_HDA_AMP")); // HDATONE2 (rmbp-ledger B215): a BUILD-TIME knob, default 4096 — flight 13 heard 12288 as "sandpaper" (§3), so the flown level is the default and a flight sweeps 4096/8192/12288 with `UNAOS_HDA_AMP=<n>`, no rebuild of anything else; the amplitude used is on the wire (`[hda] tone … amp=`) and checked in the buffer (`:: HDA-PCM:`).
     /// HDATONE2: the flown default (flights 8-12), -18 dBFS.
     pub const AMPLITUDE_DEFAULT: i32 = 4096;
+    /// HDATONE3 (B218) M1 — "Supported PCM Size, Rates" parameter. [HDA-SPEC §7.3.4.7]
+    pub const PARAM_SUPPORTED_PCM: u32 = 0x0A;
+    /// HDATONE3 M2 — 20 ms linear fade-in/-out at each end of the buffer (960 frames at 48 kHz).
+    pub const FADE_FRAMES: usize = SAMPLE_RATE / 50;
+    /// HDATONE3 M3 — tone length in seconds, `UNAOS_HDA_SECS` (1..=3, else 1).
+    pub const SECS: usize = parse_secs(option_env!("UNAOS_HDA_SECS"));
+    /// HDATONE3 M4 — `UNAOS_HDA_MEMBERS=1` forces ONE DAC member (the pair-walk is skipped).
+    pub const FORCE_ONE_MEMBER: bool = parse_one(option_env!("UNAOS_HDA_MEMBERS"));
+    const fn parse_hz(s: Option<&str>) -> usize {
+        let Some(s) = s else { return 440 };
+        let b = s.as_bytes();
+        if b.len() == 3 && b[0] == b'2' && b[1] == b'2' && b[2] == b'0' { 220 } else { 440 }
+    }
+    const fn parse_secs(s: Option<&str>) -> usize {
+        let Some(s) = s else { return 1 };
+        let b = s.as_bytes();
+        if b.len() == 1 && b[0] >= b'1' && b[0] <= b'3' { (b[0] - b'0') as usize } else { 1 }
+    }
+    const fn parse_one(s: Option<&str>) -> bool {
+        let Some(s) = s else { return false };
+        let b = s.as_bytes();
+        b.len() == 1 && b[0] == b'1'
+    }
+    /// HDATONE3 M1 — decode a converter format word to Hz: BASE bit 14 (0 = 48 kHz, 1 = 44.1 kHz),
+    /// MULT bits 13:11 (x(m+1)), DIV bits 10:8 (/(d+1)). [HDA-SPEC §3.3.41 table 53]
+    pub fn fmt_rate_hz(fmt: u32) -> u32 {
+        let base = if fmt & 0x4000 != 0 { 44_100 } else { 48_000 };
+        base * (((fmt >> 11) & 0x7) + 1) / (((fmt >> 8) & 0x7) + 1)
+    }
+    /// HDATONE3 M2 — the fade envelope in Q15 at frame `f` (0 at both buffer ends, 32768 mid-buffer).
+    pub fn envelope_q15(f: usize) -> i32 {
+        if f < FADE_FRAMES { ((f * 32768) / FADE_FRAMES) as i32 }
+        else if f >= FRAMES - FADE_FRAMES { (((FRAMES - 1 - f) * 32768) / FADE_FRAMES) as i32 }
+        else { 32768 }
+    }
     /// HDATONE2: parse `UNAOS_HDA_AMP` at compile time — decimal, 1..=32767; anything else is the default,
     /// never a louder-than-asked or a silent tone (a `const fn`: no float, no alloc, no panic on bad input).
     const fn parse_amp(s: Option<&str>) -> i32 {
@@ -1392,7 +1427,7 @@ mod tone {
         for f in 0..FRAMES {
             // Phase in 1/1024-turn units, accumulated in integers so there is no drift.
             let phase = ((f * TONE_HZ * 1024) / SAMPLE_RATE) as u32;
-            let s = ((sin_q15(phase) * AMPLITUDE) >> 15) as i16;
+            let s = ((((sin_q15(phase) * AMPLITUDE) >> 15) * envelope_q15(f)) >> 15) as i16; // HDATONE3 M2: faded
             unsafe {
                 core::ptr::write_volatile((buf + (f as u64) * 4) as *mut i16, s);
                 core::ptr::write_volatile((buf + (f as u64) * 4 + 2) as *mut i16, s);
@@ -1419,15 +1454,19 @@ mod tone {
             if l > peak { peak = l; }
             if l < min { min = l; }
         }
-        let q = rd(27, 0); // quarter period: 48000/440/4 ≈ 27.3 frames
-        let lo = unsafe { core::ptr::read_volatile((buf + 27 * 4) as *const u8) } as i32;
+        let qf = SAMPLE_RATE / TONE_HZ / 4; // quarter period: 27 frames at 440 Hz, 54 at 220 Hz — inside the fade-in, so the reference is faded identically
+        let q = rd(qf, 0);
+        let q_ref = (AMPLITUDE * envelope_q15(qf)) >> 15;
+        let lo = unsafe { core::ptr::read_volatile((buf + (qf as u64) * 4) as *const u8) } as i32;
+        let (edge0, edge_last) = (rd(0, 0), rd(FRAMES - 1, 0));
         let peak_ok = (peak - AMPLITUDE).abs() <= 2 && (min + AMPLITUDE).abs() <= 2;
-        let sine_ok = rd(0, 0) == 0 && (q - AMPLITUDE).abs() <= AMPLITUDE * 3 / 100 + 2;
+        let sine_ok = edge0 == 0 && edge_last == 0 && (q - q_ref).abs() <= q_ref * 3 / 100 + 2;
         let le_ok = lo == (q & 0xff);
         let ok = interleave && peak_ok && sine_ok && le_ok;
         serial_println!(
-            ":: HDA-PCM: amp={} default={} peak={} min={} q27={} interleave={} peak_ok={} sine_ok={} le_ok={} frames={} -> {} ::",
+            ":: HDA-PCM: amp={} default={} peak={} min={} q27={} interleave={} peak_ok={} sine_ok={} le_ok={} frames={} hz={} secs={} fade_ms={} edge0={} edge_last={} -> {} ::",
             AMPLITUDE, AMPLITUDE_DEFAULT, peak, min, q, interleave as u8, peak_ok as u8, sine_ok as u8, le_ok as u8, FRAMES,
+            TONE_HZ, SECS, FADE_FRAMES * 1000 / SAMPLE_RATE, edge0, edge_last,
             if ok { "PASS" } else { "FAIL" }
         );
     }
@@ -1540,7 +1579,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     let mut np = 1usize;
     // Association 0 is "no association" and 15 is "not grouped"; neither is a pair, so neither is
     // walked for one. [HDA-SPEC §7.3.3.31]
-    if assoc != 0x00 && assoc != 0x0F {
+    if assoc != 0x00 && assoc != 0x0F && !tone::FORCE_ONE_MEMBER { // HDATONE3 M4
         for nid in 0..MAX_NODES {
             if np >= PAIR_MAX {
                 break;
@@ -1894,16 +1933,18 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
         let amp_pin = rings.cmd(cad, mpin, VERB_GET_AMP_GAIN_MUTE, 0x80, a).unwrap_or(0xFFFF_FFFF);
         let pinctl_back = rings.cmd(cad, mpin, VERB_GET_PIN_CONTROL, 0, a).unwrap_or(0xFFFF_FFFF);
         let fmt_conv = rings.cmd(cad, mdac, VERB_GET_CONVERTER_FORMAT, 0, a).unwrap_or(0xFFFF_FFFF);
-        a.verbs_get += 4;
+        let pcm_caps = rings.cmd(cad, mdac, VERB_GET_PARAMETER, PARAM_SUPPORTED_PCM, a).unwrap_or(0xFFFF_FFFF); // HDATONE3 M1
+        a.verbs_get += 5;
         serial_println!(
-            "[hda] amp member={} dac=0x{:02x} raw={:#06x} mute={} gain={} pin=0x{:02x} raw={:#06x} mute={} out_amp={} pinctl={:#04x} out_en={} hp_en={} fmt_conv={:#06x} fmt_want={:#06x} fmt_match={}",
+            "[hda] amp member={} dac=0x{:02x} raw={:#06x} mute={} gain={} pin=0x{:02x} raw={:#06x} mute={} out_amp={} pinctl={:#04x} out_en={} hp_en={} fmt_conv={:#06x} fmt_want={:#06x} fmt_match={} rate={} fmt_rd={:#06x} pcmcaps={:#010x}",
             m, mdac, amp_dac & 0xFFFF, (amp_dac & 0x80 != 0) as u8, amp_dac & 0x7F,
             mpin, amp_pin & 0xFFFF, (amp_pin & 0x80 != 0) as u8, ws[mpin as usize].out_amp() as u8,
             pinctl_back & 0xFF,
             (pinctl_back & PINCTL_OUT_ENABLE as u32 != 0) as u8,
             (pinctl_back & PINCTL_HP_ENABLE as u32 != 0) as u8,
             fmt_conv & 0xFFFF, FMT_48K_16_STEREO,
-            ((fmt_conv & 0xFFFF) == FMT_48K_16_STEREO as u32) as u8
+            ((fmt_conv & 0xFFFF) == FMT_48K_16_STEREO as u32) as u8,
+            fmt_rate_hz(fmt_conv & 0xFFFF), fmt_conv & 0xFFFF, pcm_caps
         );
     }
 
