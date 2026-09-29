@@ -498,3 +498,10 @@ FORBID :: TPDRAG: .* -> FAIL ::
 # `:: TPRAW2: fingers=N bytes=<hex> ::` is the one-shot raw frame of the first report declaring >=2 fingers; a hex run shorter than one record is wrong.
 FORBID :: TPRAW2: fingers=[2-9] bytes=[0-9a-f]{2}( [0-9a-f]{2}){0,28} ::
 FORBID :: EHCI-HID: \[[0-9]+\] \[tp\] mt fingers=[0-9]+ mover=[2-9]
+
+# ── LFNMV2 (B202 re-open, FSNS M1/M2): the operator verb reports what reached the DEVICE. `fs_mv` prints
+# `[fs] mv A -> B lfn=1 ok=<bool> sectors_written=N` for a long-name destination (N = fat.rs's device-write
+# counter delta across `mt.rename`). The LFNMV fixture above drives `fs_mv` with `LongNameViaShellMv.txt`, so
+# the line is reached on this lane. A verb that claims `ok=true` with N=0 is exactly the flight-14 bench symptom.
+REQUIRE \[fs\] mv .* lfn=1 ok=true sectors_written=[1-9][0-9]*
+FORBID \[fs\] mv .* lfn=1 ok=true sectors_written=0
