@@ -835,3 +835,9 @@ REQUIRE :: WINCYCLE: windows=[0-9]+ order=\[[0-9, ]+\] after_tab=[1-9][0-9]* zoo
 FORBID :: WINCYCLE: .* -> FAIL ::
 REQUIRE \[wm-act\] cycle win=[1-9][0-9]* owner=0x[0-9a-f]+ at \(0,0\) -> action=cycle raised
 REQUIRE \[wm-act\] action=zoom win=[1-9][0-9]* route=title-dbl -> zoomed
+# --- KEYREPEAT (2026-09-29) -------------------------------------------------------------------
+# --- typematic timing on the REAL clock: hold 'k' 700 ms, release, watch 120 ms more. Delay/rate
+# --- are the engine's own constants; `cancelled=1` = nothing repeats after the release report.
+# --- GO-RED, ONE EDIT: raise `typematic::DELAY_MS` above 700 -> first_repeat_ms=0 repeats=0 -> FAIL.
+REQUIRE :: KEYREPEAT: delay_ms=\d+ rate_hz=\d+ first_repeat_ms=\d+ repeats=\d+ cancelled=1 -> PASS ::
+FORBID :: KEYREPEAT: .* -> FAIL ::

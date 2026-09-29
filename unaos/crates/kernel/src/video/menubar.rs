@@ -942,6 +942,7 @@ impl Model {
         // handshakes with interrupts off.
         m.batt = super::status::bar_item();
         m.bright = super::status::bright_item(); // BRIGHTKEYS
+        m.batt = super::status::bar_item(); super::status::osd_overlay(&mut m.title, &mut m.title_len); // VOLKEYS: transient vol=N/16 / muted over the caption
         m.clock = clock_hhmm(); #[cfg(feature = "sntp6")] if m.clock.is_none() { barclock_note(None); } // SNTP-NET6, folded LINE-NEUTRAL (code before the comment, LEDGER P7): the UNSYNCED half of the bar's clock witness, latched to one line per boot at the file tail. It is reported from the MODEL, not the painter, because the painter's clock branch never runs when there is nothing to draw — which is precisely the state this half exists to say aloud.
         (m, clobbered)
     }
@@ -2265,7 +2266,7 @@ pub fn selftest() {
     // drives `compose` with injected readings and must not perturb the census legs above; its own
     // function because it is a separate claim with a separate verdict line, and a leg folded into
     // `:: MENUBAR:` would have made a decode defect read as a geometry failure.
-    battery_selftest(pw, ph);
+    battery_selftest(pw, ph); super::status::volkeys_selftest(); // VOLKEYS fixture, own verdict lines
 
     // MENUFIRST — the enable→first-paint edge, AFTER the battery fixture and for the same two
     // reasons it is after the census legs: it drives `compose` (so it must not perturb a leg that

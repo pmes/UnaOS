@@ -1712,3 +1712,12 @@ FORBID :: EHCI-HID: \[\d+\] STOP-NOTE interrupt endpoint halted .* kind=boot-mou
 # --- with `gmux_written=1` when the register write completed. `indicator=1` is measured, not asserted.
 REQUIRE :: BRIGHTKEYS: key=(up|down) level=[0-9]+/16 gmux_written=[01] indicator=1 -> PASS ::
 FORBID :: BRIGHTKEYS: .* -> FAIL ::
+# --- VOLKEYS (2026-09-29) ---------------------------------------------------------------------
+# --- F10/F11/F12 -> mute/down/up through the decoder's own seam (`status::volkey_usage`): state moves,
+# --- the transient indicator is showing, and the HDA output-amp verb was issued (`amp_written=1`) or no
+# --- codec path exists on this boot (`amp_written=0`, then PASS does not require it).
+# --- GO-RED, ONE EDIT: make `volkey_usage` skip `osd_set` -> indicator=0 -> FAIL.
+REQUIRE :: VOLKEYS: key=up level=13/16 muted=0 amp_written=[01] indicator=1 -> PASS ::
+REQUIRE :: VOLKEYS: key=down level=12/16 muted=0 amp_written=[01] indicator=1 -> PASS ::
+REQUIRE :: VOLKEYS: key=mute level=12/16 muted=1 amp_written=[01] indicator=1 -> PASS ::
+FORBID :: VOLKEYS: .* -> FAIL ::
