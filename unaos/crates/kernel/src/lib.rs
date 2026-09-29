@@ -252,3 +252,9 @@ pub fn hlt_loop() -> ! {
 pub fn hlt() {
     arch::hlt()
 }
+
+// SNTPDRV M1: the arch-neutral NET drive seam (`net_tick::service_tick`). NOT named `net`: the extern
+// crate `net` (a dependency) would be shadowed by a crate-root module of that name. Tail statement,
+// so no existing line moves.
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "sntp6", feature = "net6", target_arch = "aarch64")))]
+pub mod net_tick;

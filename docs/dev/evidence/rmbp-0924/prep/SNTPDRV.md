@@ -1,4 +1,5 @@
 # SNTPDRV — prep
+Status: M1, M3 written (M4 confirmed, M2 not built), uncompiled
 
 ## The finding
 
@@ -130,3 +131,12 @@ pub fn service_tick() {
 ```rust
         crate::net::service_tick(); ok // SNTPDRV M1: same seam x86 now calls.
 ```
+
+## Written
+
+- New `unaos/crates/kernel/src/net_tick.rs`: `service_tick()` re-dispatches (x86: `smolnet::witness_tick_sntp`; aarch64+net6+sntp6: `net_sntp_client::service_tick`) and emits `:: SNTP: link=<e1000|usbnet|net6> synced=<0|1> offset_ms=<n> -> PASS ::` once. Named `net_tick`, NOT `net` (extern crate `net` is shadowed by a crate-root `mod net`). Declared at `lib.rs` tail.
+- Call sites: `main.rs` (same-line fold after `smpload_selftest();`, x86 5 s hook); `net_phy.rs:1041` (now via the seam).
+- M3: `drivers/e1000.rs service_net` SNTP call removed (comment-replaced, line-neutral); `e1000::nic_present()`, `smolnet::sntp_done()`, `net_sntp_client::attempted()` added at file tails; `WITNESS_SNTP_WARMUP` 72 -> 2 (now counts 5 s ticks, not service_net passes). NOT done: a `NicOps`/`register_nic` for e1000 — `net_phy::net6` is `cfg(target_arch="aarch64")` (uses cntpct asm), so x86 cannot ride net6 without porting it; smolnet's SNTP-X86 block stays, only its driver hang-off is retired. SNTP-X86-GATE/[net16] pins unchanged (not pinned in any spec).
+- M4: USBNET needs no driver code: `e1000::hw_addr/raw_rx/raw_tx` fall back to usbnet, so the seam's x86 arm covers it; `link=usbnet` when no e1000 is registered.
+- M2 not built: `genet.rs` has no `register_nic`/`NicOps` (grep empty); it owns its NIC path.
+- Spec: `x86-default.spec` REQUIRE + FORBID for the `:: SNTP:` line.

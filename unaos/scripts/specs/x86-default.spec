@@ -487,3 +487,9 @@ REQUIRE :: LFNMV: sys_rename_long=-ENOENT shell_mv_long=ok alias_leak=false read
 # The fixture's two non-PASS spellings: no writable `/boot` (it measured nothing) and its FAIL line.
 FORBID :: LFNMV: SKIPPED
 FORBID :: LFNMV: .* -> FAIL ::
+
+# SNTPDRV M1/M3: the arch-neutral net seam (`net_tick::service_tick`, driven from the 5 s scheduler hook,
+# not from the NIC driver) witnesses its verdict once per boot. synced=0 is the honest hermetic answer
+# (slirp answers no NTP); the link names the NIC family the stack is bound over.
+REQUIRE :: SNTP: link=(e1000|usbnet) synced=[01] offset_ms=-?[0-9]+ -> PASS ::
+FORBID :: SNTP: .* -> FAIL ::
