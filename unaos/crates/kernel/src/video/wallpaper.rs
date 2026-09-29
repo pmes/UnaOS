@@ -158,7 +158,7 @@ pub fn load(path: &str) -> Result<(), String> {
         Ok(t) => t,
         Err(e) => {
             let why = e.reason();
-            crate::serial_println!(
+            serial_println!(
                 ":: WALLPAPER: src={} WxH=0x0 scaled=0x0 letterbox=0 ms={} reason={} -> FAIL ::",
                 path, crate::arch::ms().saturating_sub(t0), why
             );
@@ -179,7 +179,7 @@ pub fn load(path: &str) -> Result<(), String> {
     *WALL.lock() = Some(Wall { w: pw, h: ph, px: buf });
     OFF.store(false, Ordering::Relaxed);
     repaint();
-    crate::serial_println!(
+    serial_println!(
         ":: WALLPAPER: src={} WxH={}x{} scaled={}x{} letterbox={} ms={} -> PASS ::",
         path, iw, ih, sw, sh, letterbox, crate::arch::ms().saturating_sub(t0)
     );
@@ -195,7 +195,7 @@ pub fn off() {
 }
 
 fn witness_none() {
-    crate::serial_println!(":: WALLPAPER: src=none WxH=0x0 scaled=0x0 letterbox=0 ms=0 -> PASS ::");
+    serial_println!(":: WALLPAPER: src=none WxH=0x0 scaled=0x0 letterbox=0 ms=0 -> PASS ::");
 }
 
 /// Both layers: the glass (queued desktop erase, drained through `stage_fill`) and the desktop

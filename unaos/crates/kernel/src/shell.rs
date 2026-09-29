@@ -8627,6 +8627,8 @@ fn view_verb(console: &mut Console, path: Option<&str>) {
         Ok((b, l, r, w)) => console.println(&alloc::format!("view: {} — {} bytes, {} lines, {} rows ({} wrapped)", full, b, l, r, w)),
         Err(e) => console.println(&alloc::format!("view: {}: {}", full, e)),
     }
+}
+
 /// NETFETCH: `fetch <http-url> [<dest-path>]` / `fetch - <http-url>` — HTTP/1.0 GET over the smoltcp TCP
 /// client (x86 `smolnet`), body streamed in 1400-byte chunks into the VFS (default
 /// `/home/<user>/Desktop/<basename>`) or, with `-`, printed to the console. 4 MB cap, 10 s overall budget,
@@ -8646,7 +8648,7 @@ fn shell_fetch(args: &[&str], console: &mut Console) {
     let Some(url) = nf::parse_url(url_s) else {
         return console.println("fetch: bad URL (want http://host[:port]/path; https is not supported)");
     };
-    let ms_now = || crate::clock::logts_now().0.unwrap_or(0);
+    let ms_now = || crate::arch::ms();
     let t0 = ms_now();
     let elapsed = || ms_now().saturating_sub(t0);
     let witness = |status: u16, bytes: usize, saved: bool, ok: bool| {

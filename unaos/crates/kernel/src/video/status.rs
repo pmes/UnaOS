@@ -634,6 +634,8 @@ pub fn bright_item() -> Option<u8> {
 /// Drop the indicator now (the boot self-test's key must not flash on the glass).
 pub fn bright_clear() {
     BRIGHT_AT_MS.store(0, Ordering::Relaxed);
+}
+
 // ===================== VOLKEYS — the volume model and its transient indicator =====================
 //
 // F10 / F11 / F12 (HID usages 0x43 / 0x44 / 0x45 in the boot report — the rMBP keyboard sends the
@@ -771,7 +773,7 @@ pub fn volkeys_selftest() {
         );
     }
     VOL_LEVEL.store(l0, Ordering::Relaxed);
-    VOL_MUTED.store(m0, Ordering::Relaxed);
+    VOL_MUTED.store(m0 as u8, Ordering::Relaxed);
     #[cfg(all(target_arch = "x86_64", feature = "hda"))]
     let _ = crate::drivers::hda::vol::apply(l0, m0);
     OSD_UNTIL.store(0, Ordering::Relaxed);

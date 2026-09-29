@@ -98,7 +98,7 @@ pub fn parse_gate() -> bool {
         && parse_response_head(b"HTTP/1.0 200 OK\r\nX: y\r\n").is_none()
         && parse_response_head(b"garbage\r\n\r\n").is_none();
     let ok = a_ok && b_ok && c_ok && d_ok && req_ok && h_ok;
-    crate::serial_println!(
+    serial_println!(
         ":: NETFETCH-PARSE: url={} basename={} request={} head={} -> {} ::",
         a_ok && b_ok && c_ok, d_ok, req_ok, h_ok, if ok { "PASS" } else { "FAIL" }
     );

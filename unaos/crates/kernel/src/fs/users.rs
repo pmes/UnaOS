@@ -2754,7 +2754,9 @@ pub fn screen_notice_from(owner: u64, body: &[u8]) {
     }
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     let _ = (owner, body);
-=======
+}
+
+// =========================================================================================
 // USERMGMT (rmbp-0929) — `users`, `deluser <name>`, `whoami`. `passwd` (LOGIN14) and `adduser` predate this.
 // =========================================================================================
 
