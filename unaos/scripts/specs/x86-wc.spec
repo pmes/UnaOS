@@ -1,7 +1,7 @@
 # x86-wc.spec — the x86 window-compositor QEMU leg: DMGOVLP (overlap-forced banded damage, with
 # the sprite parked on the stack) plus the two ladder witnesses it depends on for ordering.
 #
-#   QEMU gate:  UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1 ./arroyo test 240 -> target/serial.log
+#   QEMU gate:  UNAOS_WC=1 UNAOS_FACET=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1 ./arroyo test 240 -> target/serial.log
 #               ./arroyo mbench --replay target/serial.log \
 #                        --spec scripts/specs/x86-wc.spec --platform x86
 #
@@ -841,3 +841,11 @@ REQUIRE \[wm-act\] action=zoom win=[1-9][0-9]* route=title-dbl -> zoomed
 # --- GO-RED, ONE EDIT: raise `typematic::DELAY_MS` above 700 -> first_repeat_ms=0 repeats=0 -> FAIL.
 REQUIRE :: KEYREPEAT: delay_ms=\d+ rate_hz=\d+ first_repeat_ms=\d+ repeats=\d+ cancelled=1 -> PASS ::
 FORBID :: KEYREPEAT: .* -> FAIL ::
+# --- WALLPAPER (rmbp-0929) --------------------------------------------------------------------
+# --- The desktop backdrop picture. Needs UNAOS_FACET=1 (it rides the viewer's PNG decoder). On QEMU
+# --- no `/WALL.PNG` exists on the volume, so the one line the boot can print is the `src=none`
+# --- witness (emitted by `wallpaper::poll` after its retries run out): pin exactly that, so a build
+# --- where the module or its hook never ran reads RED instead of silently absent. Metal with a real
+# --- file prints `src=<path> WxH=.. scaled=.. letterbox=.. ms=.. -> PASS` and is the bench's read.
+REQUIRE :: WALLPAPER: src=none WxH=0x0 scaled=0x0 letterbox=0 ms=0 -> PASS ::
+FORBID :: WALLPAPER: .* -> FAIL ::
