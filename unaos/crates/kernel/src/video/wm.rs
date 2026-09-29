@@ -29488,3 +29488,22 @@ pub fn wp_paint(_fb: &super::framebuffer::FrameBuffer) {}
 #[cfg(not(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
 #[inline(always)]
 pub fn wp_take_stale() -> bool { false }
+
+/// FIRSTBOOT (R77): [`close_all_furniture`] except `keep` (the installer's own window). Returns the closed count.
+pub fn close_all_furniture_except(keep: WinId) -> usize {
+    let mut ids = [WIN_NONE; MAX_WINDOWS];
+    let mut n = 0usize;
+    {
+        let t = table();
+        for r in t.rows.iter() {
+            if r.used && !r.compat && r.id != keep && n < MAX_WINDOWS {
+                ids[n] = r.id;
+                n += 1;
+            }
+        }
+    }
+    for &id in &ids[..n] {
+        close(id);
+    }
+    n
+}

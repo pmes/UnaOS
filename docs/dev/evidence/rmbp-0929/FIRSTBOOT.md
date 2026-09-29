@@ -25,8 +25,11 @@ Root password unset -> `Installer`. The setter (`login::open_set_password`, unch
 
 Go-red: a fresh store showing any window but the setter -> ring-3 chain would run (drop the `u4x_launcher` gate); users==0 after root password showing a desktop -> `stage_of_store` returning Desktop.
 
+## Furniture sweep (call-back)
+At Installer/CreateUser, `stage_publish` -> `login::installer_sweep()` closes every row but the screen's own window (`wm::close_all_furniture_except`, new at wm.rs tail) and sets the LOGOUTDESK `SWEPT` latch; `[login] installer: furniture swept n=.. re-minted=0`. At the Desktop advance `login::installer_release()` (or `close_into_session`, whichever swaps `SWEPT` first) posts `dock::relaunch_furniture()` (console+shell), the Log-In-after-Log-Out re-mint; `... re-minted=2`.
+
 ## Not finished / residual
-- The console window minted by `activate_on` (`console_win`) exists before the store is known; it is not closed at Installer (bar and dock/strip paint are held). A later arc may defer the window.
+- SUPERSEDED by the sweep below. `activate_on` cannot hold its mint: it is a one-shot takeover from PCI enumeration, the store is read ~430 ms later by a different pass, and there is no re-entry point, so the bar/console flash before the store loads remains on the metal (the sweep removes it once the stage is known).
 - Non-loginst QEMU lanes with a fresh disk resolve to Installer and skip the witness chain (R77 intent); lanes needing it must seed the store or use `loginst`.
 
 ## Written

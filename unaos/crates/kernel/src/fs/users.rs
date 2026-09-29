@@ -3022,9 +3022,13 @@ fn stage_publish(st: BootStage, why: &str) {
             if crate::video::menubar::set_enabled(false) {
                 BAR_HELD.store(true, Ordering::Release);
             }
+            crate::video::crystal::login::installer_sweep();
         } else if BAR_HELD.swap(false, Ordering::AcqRel) {
             let _ = crate::video::menubar::set_enabled(true);
             crate::video::wm::composite();
+        }
+        if st == BootStage::Desktop {
+            crate::video::crystal::login::installer_release();
         }
     }
 }

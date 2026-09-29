@@ -2037,3 +2037,21 @@ pub fn lock_fixture(name: &[u8], password: &[u8], wrong: &[u8]) -> bool {
     );
     pass
 }
+
+/// FIRSTBOOT (R77): the Installer / CreateUser stage is known — close every window that already exists but the
+/// screen's own (the console minted at the takeover), and owe the furniture back (`SWEPT`, the LOGOUTDESK latch).
+pub fn installer_sweep() {
+    let keep = WIN.load(Ordering::Relaxed);
+    let n = wm::close_all_furniture_except(keep);
+    SWEPT.store(true, Ordering::Release);
+    serial_println!("[login] installer: furniture swept n={} re-minted=0 (R77: nothing but the setter / the form on the glass; the console is re-minted when the desktop is released)", n);
+}
+
+/// FIRSTBOOT (R77): the desktop is released — re-mint the furniture the way Log In after Log Out does, unless
+/// `close_into_session` already did.
+pub fn installer_release() {
+    if SWEPT.swap(false, Ordering::AcqRel) {
+        super::super::dock::relaunch_furniture();
+        serial_println!("[login] installer: furniture swept n=0 re-minted=2 (console+shell posted, the LOGOUTDESK re-mint)");
+    }
+}
