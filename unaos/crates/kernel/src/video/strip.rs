@@ -1676,7 +1676,7 @@ pub fn login_press_fixture(name: &[u8], password: &[u8]) -> bool {
     let up = login::is_open();
     let up_at_window = press_route(px, py);
     let up_at_corner = press_route(0, 0);
-    let still_named = matches!(wm::hit_test(px, py), Some((w, _, _)) if w == ctrl);
+    let gone_after_logout = !matches!(wm::hit_test(px, py), Some((w, _, _)) if w == ctrl); // R69/LOGOUTDESK: Log Out closes every row, so the stand-in behind the screen is GONE
     // Down again, through the form, exactly as a person does it.
     for &b in name {
         let _ = login::consume_key(b);
@@ -1698,12 +1698,12 @@ pub fn login_press_fixture(name: &[u8], password: &[u8]) -> bool {
         && up
         && up_at_window
         && up_at_corner
-        && still_named
+        && gone_after_logout
         && logged_in
         && !after_login;
     serial_println!(
-        ":: LOGIN-PRESS: win={} at=({},{}) behind_named={} screen_down_routed={} screen_up={} up_at_window={} up_at_corner={} still_named={} logged_in={} after_login_routed={} -> {} ::",
-        ctrl, px, py, behind_named, down_routed, up, up_at_window, up_at_corner, still_named,
+        ":: LOGIN-PRESS: win={} at=({},{}) behind_named={} screen_down_routed={} screen_up={} up_at_window={} up_at_corner={} gone_after_logout={} logged_in={} after_login_routed={} -> {} ::",
+        ctrl, px, py, behind_named, down_routed, up, up_at_window, up_at_corner, gone_after_logout,
         logged_in, after_login,
         if ok { "PASS" } else { "FAIL —" }
     );
