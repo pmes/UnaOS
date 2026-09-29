@@ -1,5 +1,7 @@
 # VUGART2 — prep
 
+Status: M1..M3 + fps feature written, uncompiled
+
 ## The finding
 
 Flight 14 §4 (`docs/dev/evidence/rmbp-0915/flight14/FLIGHT14.md:85-88`): glass "did much much
@@ -125,3 +127,8 @@ in the draft above. No regex look-around in either (plain anchors + `\d+`/`[1-9]
    `strand=1 score=0`.
 3. Land M2, re-run the go-red (expect `streak_max=2`), then M3 against the fixture's real field
    order — not the draft order above.
+
+## Written
+
+- `unaos/crates/user-vug/src/main.rs`: statics `A_STRAND_MIXED`, `A_SCORE_MIXED`, `A_STREAK`, `A_STREAK_MAX`, `A_MAX_TORN`, `A_T0`; new `art_streak`; `art_strand`/`art_score` bump them; `art_emit` prints `strand= score= streak_max= severity= thr=streak<=1 fps= ms=` and the verdict is `streak_max<=1` (open Q2 resolved: the token moved). fps = frames*1000/ms from `getinfo_ticks()` since the first scored frame (0 when ms==0).
+- `unaos/scripts/specs/x86-wc.spec`: REQUIRE/FORBID moved to streak_max.
