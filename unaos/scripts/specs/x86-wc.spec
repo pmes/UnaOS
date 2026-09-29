@@ -849,3 +849,11 @@ FORBID :: KEYREPEAT: .* -> FAIL ::
 # --- file prints `src=<path> WxH=.. scaled=.. letterbox=.. ms=.. -> PASS` and is the bench's read.
 REQUIRE :: WALLPAPER: src=none WxH=0x0 scaled=0x0 letterbox=0 ms=0 -> PASS ::
 FORBID :: WALLPAPER: .* -> FAIL ::
+# FILEVIEW (rmbp-0929): the read-only text viewer window (video/fileview.rs). The fixture opens the
+# first plain text-named root file the mount table lists (or, with no volume bound yet, an in-memory
+# body named `mem:FILEVIEW.TXT`), scrolls one row, checks the window is registered, and closes it.
+# GO-RED: with fileview absent no line prints and the REQUIRE misses; a viewer that lays out zero rows,
+# will not scroll, or leaves its window open prints `-> FAIL ::` and trips the FORBID.
+REQUIRE :: FILEVIEW: path=\S+ bytes=[0-9]+ lines=[1-9][0-9]* rows=[1-9][0-9]* wrapped=[0-9]+ -> PASS ::
+FORBID :: FILEVIEW: .* -> FAIL ::
+FORBID \[fileview\] refuse 

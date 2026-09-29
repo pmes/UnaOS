@@ -6159,7 +6159,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("shutting down: invoking the platform firmware mechanism...");
             crate::power::shutdown();
         },
-        "reboot" => {
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "view" => { view_verb(console, args.first().copied()); } "reboot" => { // FILEVIEW M3 — `view <path>` opens a text file in the read-only viewer window (video/fileview.rs); ⚠ SAME-LINE fold, line-NEUTRAL, code before comment; helper at the file tail.
             console.println("rebooting: invoking the platform firmware mechanism...");
             crate::power::reboot();
         },
@@ -8606,5 +8606,19 @@ pub(crate) fn lfnmv_witness(arch: &str, sys_rc: i64, sys_want: i64) {
             head, arch, lfnmv_errno(sys_want), sys_untouched, staged, listed, src_gone, added,
             said.char_indices().nth(120).map_or(said.as_str(), |(i, _)| &said[..i])
         );
+    }
+}
+
+/// FILEVIEW M3 — the `view <path>` verb: open a text file in the viewer window. Read-only.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn view_verb(console: &mut Console, path: Option<&str>) {
+    let Some(p) = path else {
+        console.println("usage: view <path>   (open a text file in a read-only window)");
+        return;
+    };
+    let full = normalize_path(&cwd_path(), p);
+    match crate::video::fileview::open(&full) {
+        Ok((b, l, r, w)) => console.println(&alloc::format!("view: {} — {} bytes, {} lines, {} rows ({} wrapped)", full, b, l, r, w)),
+        Err(e) => console.println(&alloc::format!("view: {}: {}", full, e)),
     }
 }
