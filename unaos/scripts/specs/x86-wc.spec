@@ -641,7 +641,12 @@ FORBID \[status\] poll .* src=unresolved
 # the previous rotation with no writer in them, and the parent's own 72-row band holds the next one.
 # WINX-8 goes red beside it (`presents=1`) because the parent then blocks at the barrier — that is
 # the freeze half of the same mechanism, and it is why a present-only instrument could not see this.
-REQUIRE :: VUGART: frames=[1-9]\d* coherent=\d+ torn_rows=\d+ mixed_frames=0 -> PASS ::
+# VUGART2 (B221): the gate is the STREAK, not the count. Every metal FAIL in flights 14/15 was an isolated
+# one-frame barrier miss that healed the next frame (streak 1); the freeze shape is a REPEAT (streak >= 2).
+# mixed_frames / torn_rows / strand / score / severity / fps / ms ride the line as UNGATED diagnostics.
+# Go-red: PHASE.store(1, ..) reads streak_max=2 on the 2-frame QEMU population and trips the FORBID.
+REQUIRE :: VUGART: frames=[1-9]\d* coherent=\d+ torn_rows=\d+ mixed_frames=\d+ strand=\d+ score=\d+ streak_max=[01] severity=\d+ thr=streak<=1 fps=\d+ ms=\d+ -> PASS ::
+FORBID :: VUGART: .*streak_max=([2-9]|[1-9][0-9]+)
 FORBID :: VUGART: .* -> FAIL ::
 #
 # ── TSTETAP (2026-09-22), TAIL-APPENDED past VUGART ───────────────────────────────────────────────
