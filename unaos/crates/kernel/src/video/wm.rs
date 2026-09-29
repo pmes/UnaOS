@@ -14485,7 +14485,7 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
     // `declined=` it reads against: `cores>1` here while the cross-core `DECL_LOCK` share falls is the
     // flow-arc's positive reading that the per-core pool spread compose off the one shared buffer. Both
     // arches stage, so unlike `[wcser]` (x86 gate only) this is unconditional.
-    wcpar_emit(span);
+    wcpar_emit(span); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "witness"))] super::wcpar::emit();
     // FLICKER-2 — stored only when a block actually went on the wire, so `burst_last` names the most
     // recent REAL burst rather than the last silent early-out. On metal this is dominated by the
     // IRQ-masked UART time of the lines above (plus any staged backlog the winning core drained);
@@ -21222,7 +21222,7 @@ fn stage_window(
         // tear-free contract is unchanged — a span is as atomic as a row was. What changes is only
         // which bytes are published, and the bytes withheld are bytes the pass is about to overwrite
         // from the window that owns them.
-        comp_mark(r.id, 33);
+        comp_mark(r.id, 33); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let par = clip.n == 0 && super::wcpar::par_blit(fb, &stage[..rows * row_bytes], row_bytes, (by + band) * fb_row + bx * bpp, fb_row, rows); #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] let par = false;
         for y in 0..rows {
             let src = y * row_bytes;
             let py = by + band + y;
@@ -21230,7 +21230,7 @@ fn stage_window(
             if clip.n == 0 {
                 // WEDGESRC — `blit_traced` IS `fb.blit` plus the per-core aim/issued/done ledger
                 // (three relaxed ops, x86+witness only; the shim is `fb.blit` verbatim elsewhere).
-                blit_traced(fb, py * fb_row + bx * bpp, &stage[src..src + row_bytes]);
+                if !par { blit_traced(fb, py * fb_row + bx * bpp, &stage[src..src + row_bytes]); }
                 #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
                 {
                     wrote_px += bw as u64;

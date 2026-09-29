@@ -902,3 +902,8 @@ FORBID :: APPMENU: .* -> FAIL ::
 FORBID :: APPMENU: verb=publish owner=[0-9]+ items=(6[5-9]|[7-9][0-9]|[1-9][0-9][0-9]) .* -> PASS ::
 FORBID \[winmenu\] publish owner=0 
 FORBID \[menubar\] pick owner=[0-9]+ item=[0-9]+ delivered=false
+
+# WCPAR — the compositor band-worker pool. The lane runs -smp 6 (builder/src/main.rs), so APs exist;
+# PASS = every band of every fanned-out job completed (speedup_pct is the reading, not the gate).
+REQUIRE :: WCPAR: cores=
+REQUIRE [wcpar] pool=
