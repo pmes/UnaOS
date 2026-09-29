@@ -1,5 +1,7 @@
 # TPSPEED — prep
 
+Status: M1..M2 written, uncompiled
+
 ## The finding
 
 **TPSPEED (B225).** "mousing is great" (flight 14, `div=8` freshly landed) vs. "the mouse takes a
@@ -117,3 +119,7 @@ After `mod.rs:17813` (`Wsp2Frame` struct fields):
 2. Implement M2a (86-byte one-shot capture) and get ONE real two-finger frame off the metal rMBP
    before touching `Wsp2Frame`/`mt_step` — M2b/M2c's offsets are a guess until that capture lands.
 3. `./arroyo check` after each milestone; land M1 and M2 as separate changes.
+
+## Written
+
+File `unaos/crates/kernel/src/drivers/ehci/mod.rs`: M1 `tp_scale` two-slope curve (`TP_MT_DIV_LOW=8`, `TP_MT_DIV_HIGH=3`, `TP_MT_CURVE_KNEE=24`), `tpscale_selftest` (curve + knee values), `[tp] mt` witness `curve=8/3@24`. M2a `TPRAW2` one-shot in the `TpRoute::Vendor` arm (`tp_hex_raw2`, `TpCensus.raw2_done`). M2b `Wsp2Frame` x1/y1/touch1 + `decode_wellspring_type2`. M2c `mt_step` mover choice (`mt_prev1`, `mt_mover`, `mt_2f_wit`), witness `mover=`, `tpdrag_selftest` (`:: TPDRAG: ... ::`). Spec: `unaos/scripts/specs/x86-default.spec` (TPSCALE, TPFRAME `d=-5/-1,0/0`, TPDRAG block).

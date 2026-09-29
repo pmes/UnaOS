@@ -372,7 +372,9 @@ FORBID :: EHCI-HID: PASSPERIOD self-test: .* -> FAIL
 # --- handed to the router 1:1 as pixels (a 1 cm stroke ≈ 1000 px, "unusable"). The divisor is a constant
 # --- with a self-test beside the decoder's: clamp ceiling 128 -> 16 px, the flight's largest step 88 -> 11,
 # --- a sub-divisor jitter frame -> 0 both signs. GO-RED: `TP_MT_DIV = 1` reads `-> px=128,88,-60,7,-7 … -> FAIL`.
-REQUIRE :: EHCI-HID: TPSCALE self-test: div=[2-9][0-9]* raw=128,88,-60,7,-7 -> px=16,11,-7,0,0 .* -> PASS ::
+# --- TPSPEED (B225): the flat divisor became a two-slope curve, |raw|<=24 -> /8, the excess above -> /3 (128 -> 37, 88 -> 24, -60 -> -15).
+# --- GO-RED: `TP_MT_DIV_HIGH = TP_MT_DIV_LOW` flattens the curve and the self-test reads `-> FAIL`.
+REQUIRE :: EHCI-HID: TPSCALE self-test: curve=8/3@24 raw=128,88,-60,7,-7 -> px=37,24,-15,0,0 knee=3,3,4,-4,5 .* -> PASS ::
 FORBID :: EHCI-HID: TPSCALE self-test: .* -> FAIL
 # ── STOR-2 (rmbp-ledger B185, 2026-09-23), TAIL-APPENDED ──────────────────────────────────────────
 # RENAME WITH THE SOURCE OPEN. `stor2_mv_launcher` is unconditional, chained right after STOR1-MV, so
@@ -471,8 +473,8 @@ FORBID \[ioapic\] armed .* masked=true
 # `d=` is the two captured deltas (dx/dy, y negated): -30/-12 and -3/-5. `relx10=2/2` is the wire's
 # own cross-check — the pad's rel_x/rel_y equal 10 x our abs delta on both captured pairs. The two
 # `mismatch_*` fields are M3's rule, the wire beats the register: each direction named exactly once.
-# --- TPSCALE (B214): `d=` is now the SCALED delta the router takes (raw -30/-12 -> -3/-1, -3/-5 -> 0/0 at div=8).
-REQUIRE :: TPFRAME: frames=7 fingers_max=1 deltas_ok=true click_edges=down@4,up@5 corpus=3 d=-3/-1,0/0 lift_reset=true relx10=2/2 wit_1in64=true legacy_ok=true mismatch_yes=true mismatch_no=true -> PASS ::
+# --- TPSCALE (B214): `d=` is now the SCALED delta the router takes (raw -30/-12 -> -5/-1, -3/-5 -> 0/0 at curve 8/3@24).
+REQUIRE :: TPFRAME: frames=7 fingers_max=1 deltas_ok=true click_edges=down@4,up@5 corpus=3 d=-5/-1,0/0 lift_reset=true relx10=2/2 wit_1in64=true legacy_ok=true mismatch_yes=true mismatch_no=true -> PASS ::
 FORBID :: TPFRAME: .* -> FAIL ::
 # ── LFNMV (2026-09-23, rmbp-ledger B202), TAIL-APPENDED past IOAPIC2 ──────────────────────────────────
 # A RENAME TO A LONG NAME, MEASURED. `lfnmv_launcher` runs right after STOR2-MV (whose ring-3 program
@@ -487,3 +489,12 @@ REQUIRE :: LFNMV: sys_rename_long=-ENOENT shell_mv_long=ok alias_leak=false read
 # The fixture's two non-PASS spellings: no writable `/boot` (it measured nothing) and its FAIL line.
 FORBID :: LFNMV: SKIPPED
 FORBID :: LFNMV: .* -> FAIL ::
+# ── TPDRAG (rmbp-ledger B219), TAIL-APPENDED ──────────────────────────────────────────────────────
+# finger[1] is decoded and the pointer follows the finger that MOVES (held finger drives the button). The synthetic two-finger sequence
+# runs through the live decode + `mt_step`. GO-RED: hard-code `mover = 0` in `mt_step` -> mover_seq reads 0000 and the line FAILs.
+REQUIRE :: TPDRAG: decoded=true mover_seq=0110 buttons=0111 d1=-15/0 d3=5/0 -> PASS ::
+FORBID :: TPDRAG: .* -> FAIL ::
+# The metal-only live witnesses (QEMU has no two-finger pad, so no REQUIRE here): a malformed raw dump or mover field is forbidden.
+# `:: TPRAW2: fingers=N bytes=<hex> ::` is the one-shot raw frame of the first report declaring >=2 fingers; a hex run shorter than one record is wrong.
+FORBID :: TPRAW2: fingers=[2-9] bytes=[0-9a-f]{2}( [0-9a-f]{2}){0,28} ::
+FORBID :: EHCI-HID: \[[0-9]+\] \[tp\] mt fingers=[0-9]+ mover=[2-9]

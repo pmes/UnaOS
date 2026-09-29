@@ -14190,11 +14190,16 @@ impl Controller {
                               // the 0x02 arm decodes, and from there the install is the 0x02 arm's:
                               // `note_buttons`, one `push_pointer_report`, the same click lines.
                               TpRoute::Vendor(f) => {
+                                if !e.tp.raw2_done && report.get(WSP2_NFINGER_OFF).copied().unwrap_or(0) >= 2 { // TPDRAG (B219): one-shot raw frame of the first declared >=2-finger report, before decode discards the bytes
+                                    e.tp.raw2_done = true;
+                                    let mut hb = [0u8; TP_RAW2_HEX_MAX];
+                                    serial_println!(":: TPRAW2: fingers={} bytes={} ::", report[WSP2_NFINGER_OFF], tp_hex_raw2(&mut hb, report));
+                                }
                                 let (buttons, dx, dy, wit) = e.tp.mt_step(f);
                                 if wit {
                                     serial_println!(
-                                        ":: EHCI-HID: [{}] [tp] mt fingers={} x={} y={} dx={} dy={} div={} frame={} == witness ::", // TPSCALE (B214): dx/dy are the SCALED pixels the router takes; div= names the divisor so a glass reading can re-derive raw units
-                                        idx, f.fingers, f.x0, f.y0, dx, dy, TP_MT_DIV, e.tp.mt_frames
+                                        ":: EHCI-HID: [{}] [tp] mt fingers={} mover={} x={} y={} dx={} dy={} curve={}/{}@{} frame={} == witness ::", // TPSCALE (B214): dx/dy are the SCALED pixels the router takes; div= names the divisor so a glass reading can re-derive raw units
+                                        idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, TP_MT_DIV_LOW, TP_MT_DIV_HIGH, TP_MT_CURVE_KNEE, e.tp.mt_frames
                                     );
                                 }
                                 let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx);
@@ -17422,6 +17427,14 @@ struct TpCensus {
     /// TPFRAME — the primary finger's last position in POINTER orientation (sensor y negated).
     /// `None` until a touching frame and again at every lift, so a re-touch never emits a jump.
     mt_prev: Option<(i32, i32)>,
+    /// TPDRAG (B219) — finger[1]'s last position (pointer orientation); `None` unless two fingers touched last frame.
+    mt_prev1: Option<(i32, i32)>,
+    /// TPDRAG — which finger moved the pointer last (0|1); ties keep it.
+    mt_mover: u8,
+    /// TPDRAG — the `TPRAW2` raw-frame one-shot has fired.
+    raw2_done: bool,
+    /// TPDRAG — two-finger `[tp] mt` witnesses emitted (bounded by `TP_2F_WITNESS_MAX`).
+    mt_2f_wit: u8,
 }
 
 impl TpCensus {
@@ -17437,6 +17450,10 @@ impl TpCensus {
         mismatch: 0,
         mt_frames: 0,
         mt_prev: None,
+        mt_prev1: None,
+        mt_mover: 0,
+        raw2_done: false,
+        mt_2f_wit: 0,
     };
 
     /// Which counter a report belongs to. Total: any byte sequence maps somewhere, and a report
@@ -17480,19 +17497,48 @@ impl TpCensus {
     /// is `ibt`@15 (`unverified`), mapped to the 0x02 arm's bit 0 so `note_buttons` sees one shape.
     fn mt_step(&mut self, f: Wsp2Frame) -> (u8, i32, i32, bool) {
         self.mt_frames = self.mt_frames.wrapping_add(1);
-        let buttons = if f.button != 0 { 0x01 } else { 0x00 };
+        let buttons = if f.button != 0 { 0x01 } else { 0x00 }; // TPDRAG (B219): `ibt` is the pad's physical click — the HELD finger's press — so it drives the button whichever finger moves
         let (mut dx, mut dy) = (0, 0);
+        let mut wit_2f = false;
         if f.fingers == 0 || f.touch0 == 0 {
             self.mt_prev = None;
+            self.mt_prev1 = None;
+            self.mt_mover = 0;
         } else {
-            let (x, y) = (f.x0, -f.y0);
-            if let Some((px, py)) = self.mt_prev {
-                dx = tp_scale((x - px).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP)); // TPSCALE (B214): sensor units -> pointer pixels, see `tp_scale`
-                dy = tp_scale((y - py).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP));
+            let p0 = (f.x0, -f.y0);
+            let two = f.fingers >= 2 && f.touch1 != 0;
+            let was_two = self.mt_prev1.is_some();
+            let mut prev = self.mt_prev;
+            let mut cur = p0;
+            if two {
+                // TPDRAG (B219): the mover is the finger whose delta is larger this frame; ties keep the last mover.
+                let p1 = (f.x1, -f.y1);
+                let mag = |p: Option<(i32, i32)>, q: (i32, i32)| p.map_or(0, |(a, b)| (q.0 - a).abs() + (q.1 - b).abs());
+                let (d0, d1) = (mag(self.mt_prev, p0), mag(self.mt_prev1, p1));
+                let m = if d0 > d1 { 0 } else if d1 > d0 { 1 } else { self.mt_mover };
+                wit_2f = !was_two || m != self.mt_mover;
+                self.mt_mover = m;
+                if m == 1 {
+                    prev = self.mt_prev1;
+                    cur = p1;
+                }
+                self.mt_prev1 = Some(p1);
+            } else {
+                // One finger: finger[0] drives, as before. A two->one step re-baselines (the survivor may have changed index).
+                self.mt_mover = 0;
+                if was_two {
+                    prev = None;
+                }
+                self.mt_prev1 = None;
             }
-            self.mt_prev = Some((x, y));
+            if let Some((px, py)) = prev {
+                dx = tp_scale((cur.0 - px).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP)); // TPSCALE (B214): sensor units -> pointer pixels, see `tp_scale`
+                dy = tp_scale((cur.1 - py).clamp(-TP_MT_MAX_STEP, TP_MT_MAX_STEP));
+            }
+            self.mt_prev = Some(p0);
         }
-        (buttons, dx, dy, self.mt_frames % TP_MT_WITNESS_EVERY == 1)
+        let wit_2f = wit_2f && self.mt_2f_wit < TP_2F_WITNESS_MAX && { self.mt_2f_wit += 1; true };
+        (buttons, dx, dy, self.mt_frames % TP_MT_WITNESS_EVERY == 1 || wit_2f)
     }
 
     /// TPFRAME (B197) M3 — does the STREAM contradict the mode READBACK? Returns `(readback,
@@ -17809,6 +17855,10 @@ struct Wsp2Frame {
     y0: i32,
     /// finger[0] `touch_major` (int16 LE, sign-extended); non-zero == in contact.
     touch0: i32,
+    /// TPDRAG (B219): finger[1] at `WSP2_HDR_LEN + WSP2_FSIZE`, same field offsets; zero unless `fingers >= 2`.
+    x1: i32,
+    y1: i32,
+    touch1: i32,
 }
 
 /// MT-INVESTIGATION (IVY) — decode one Apple Wellspring **TYPE2 raw multitouch frame**.
@@ -17849,14 +17899,21 @@ fn decode_wellspring_type2(frame: &[u8]) -> Option<Wsp2Frame> {
     let fingers = declared.min(WSP2_MAX_FINGERS).min(records);
     if fingers == 0 {
         // A well-formed frame reporting no fingers: valid, just empty. (All fingers lifted.)
-        return Some(Wsp2Frame { fingers: 0, button, x0: 0, y0: 0, touch0: 0 });
+        return Some(Wsp2Frame { fingers: 0, button, x0: 0, y0: 0, touch0: 0, x1: 0, y1: 0, touch1: 0 });
     }
     // finger[0] begins immediately after the header (`.delta = 0` for TYPE2).
     let f0 = WSP2_HDR_LEN;
     let x0 = read_le16(frame, f0 + WSP2_F_ABS_X)? as i16 as i32;
     let y0 = read_le16(frame, f0 + WSP2_F_ABS_Y)? as i16 as i32;
     let touch0 = read_le16(frame, f0 + WSP2_F_TOUCH_MAJOR)? as i16 as i32;
-    Some(Wsp2Frame { fingers: fingers as u8, button, x0, y0, touch0 })
+    let (mut x1, mut y1, mut touch1) = (0, 0, 0);
+    if fingers >= 2 {
+        let f1 = WSP2_HDR_LEN + WSP2_FSIZE; // TPDRAG (B219): the second record, same field offsets (the two-finger selftest fixture's layout)
+        x1 = read_le16(frame, f1 + WSP2_F_ABS_X)? as i16 as i32;
+        y1 = read_le16(frame, f1 + WSP2_F_ABS_Y)? as i16 as i32;
+        touch1 = read_le16(frame, f1 + WSP2_F_TOUCH_MAJOR)? as i16 as i32;
+    }
+    Some(Wsp2Frame { fingers: fingers as u8, button, x0, y0, touch0, x1, y1, touch1 })
 }
 
 /// MT-INVESTIGATION (IVY) — one bounded witness line per captured frame on the LIVE path. Called
@@ -17894,9 +17951,20 @@ const TP_MT_MAX_STEP: i32 = 128;
 /// a CONSTANT with a witness (`[tp] mt … raw=` beside `dx=`), not a knob: 8 is the first glass guess
 /// (~125 units per pixel); a clamped 128-unit frame step becomes 16 px at ~128 frames/s.
 /// Toward-zero division, so a sub-divisor jitter frame moves nothing.
-const TP_MT_DIV: i32 = 8;
+const TP_MT_DIV_LOW: i32 = 8;
+/// TPSPEED (B225): divisor for the part of a delta ABOVE `TP_MT_CURVE_KNEE` (first guess, a glass question).
+const TP_MT_DIV_HIGH: i32 = 3;
+/// TPSPEED (B225): the knee, in raw sensor units per frame (first guess).
+const TP_MT_CURVE_KNEE: i32 = 24;
 /// TPSCALE: one raw (clamped) sensor delta to pointer pixels.
-fn tp_scale(raw: i32) -> i32 { raw / TP_MT_DIV }
+fn tp_scale(raw: i32) -> i32 {
+    // TPSPEED (B225): two-slope integer curve. |raw| <= knee -> /LOW (precision work keeps flight 14's
+    // feel); above the knee the EXCESS is /HIGH, so a fast stroke crosses the screen with less finger.
+    // Continuous at the knee, sign-preserving, toward-zero on each segment.
+    let a = raw.abs();
+    let px = if a <= TP_MT_CURVE_KNEE { a / TP_MT_DIV_LOW } else { TP_MT_CURVE_KNEE / TP_MT_DIV_LOW + (a - TP_MT_CURVE_KNEE) / TP_MT_DIV_HIGH };
+    if raw < 0 { -px } else { px }
+}
 /// TPFRAME — one `[tp] mt` witness per this many vendor frames: the first, then every 64th (a
 /// resting hand streams ~100 frames/s; the FTDI ring is 64 KiB drop-oldest).
 const TP_MT_WITNESS_EVERY: u32 = 64;
@@ -18075,13 +18143,13 @@ unsafe fn wellspring_type2_selftest() {
     // Well-formed, all fingers lifted — accepted with zero fingers, no coordinates.
     let empty = [0u8; WSP2_HDR_LEN + WSP2_FSIZE];
     let empty_ok = decode_wellspring_type2(&empty)
-        == Some(Wsp2Frame { fingers: 0, button: 0, x0: 0, y0: 0, touch0: 0 });
+        == Some(Wsp2Frame { fingers: 0, button: 0, x0: 0, y0: 0, touch0: 0, x1: 0, y1: 0, touch1: 0 });
 
     let (fingers, x0, y0, touch0, button) = match good {
         Some(f) => (f.fingers, f.x0, f.y0, f.touch0, f.button),
         None => (0, 0, 0, 0, 0),
     };
-    let ok = good == Some(Wsp2Frame { fingers: 2, button: 0x01, x0: 1500, y0: -2000, touch0: 90 })
+    let ok = good == Some(Wsp2Frame { fingers: 2, button: 0x01, x0: 1500, y0: -2000, touch0: 90, x1: -400, y1: 3100, touch1: 70 })
         && clamped
         && hid_rejected
         && ragged_rejected
@@ -19179,11 +19247,80 @@ impl core::fmt::Display for IsrVia {
 fn tpscale_selftest() {
     let raw = [TP_MT_MAX_STEP, 88, -60, 7, -7];
     let got = [tp_scale(raw[0]), tp_scale(raw[1]), tp_scale(raw[2]), tp_scale(raw[3]), tp_scale(raw[4])];
-    let ok = got[0] == 16 && got[1] == 11 && got[2] == -7 && got[3] == 0 && got[4] == 0 && TP_MT_DIV > 1;
+    // TPSPEED (B225): curve 8/3@24 — |raw|<=24 -> /8 (24 -> 3), above: 3 + excess/3 (128 -> 37, 88 -> 24, -60 -> -15). The knee is continuous
+    // (24 -> 3, 25 -> 3, 27 -> 4), sign-preserving, and the high slope must be steeper than the low one (128 -> more than 128/8 = 16).
+    let knee = [tp_scale(24), tp_scale(25), tp_scale(27), tp_scale(-27), tp_scale(30)];
+    let ok = got[0] == 37 && got[1] == 24 && got[2] == -15 && got[3] == 0 && got[4] == 0
+        && knee[0] == 3 && knee[1] == 3 && knee[2] == 4 && knee[3] == -4 && knee[4] == 5
+        && TP_MT_DIV_LOW > 1 && TP_MT_DIV_HIGH < TP_MT_DIV_LOW && got[0] > TP_MT_MAX_STEP / TP_MT_DIV_LOW;
     serial_println!(
-        ":: EHCI-HID: TPSCALE self-test: div={} raw={},{},{},{},{} -> px={},{},{},{},{} (clamp-step={}px/frame, toward-zero) -> {} ::",
-        TP_MT_DIV, raw[0], raw[1], raw[2], raw[3], raw[4], got[0], got[1], got[2], got[3], got[4], tp_scale(TP_MT_MAX_STEP),
+        ":: EHCI-HID: TPSCALE self-test: curve={}/{}@{} raw={},{},{},{},{} -> px={},{},{},{},{} knee={},{},{},{},{} (clamp-step={}px/frame, toward-zero) -> {} ::",
+        TP_MT_DIV_LOW, TP_MT_DIV_HIGH, TP_MT_CURVE_KNEE, raw[0], raw[1], raw[2], raw[3], raw[4], got[0], got[1], got[2], got[3], got[4],
+        knee[0], knee[1], knee[2], knee[3], knee[4], tp_scale(TP_MT_MAX_STEP),
         if ok { "PASS" } else { "FAIL" }
+    );
+    tpdrag_selftest();
+}
+
+/// TPDRAG (B219) — bounded `[tp] mt` two-finger witnesses per endpoint (first two-finger frame, then each mover change).
+const TP_2F_WITNESS_MAX: u8 = 8;
+/// TPDRAG (B219) — the raw frame the `TPRAW2` one-shot dumps: header + two finger records (86 bytes).
+const TP_RAW2_BYTES: usize = WSP2_HDR_LEN + 2 * WSP2_FSIZE;
+/// TPDRAG: hex scratch for `TP_RAW2_BYTES` (`"xx "` per byte, less the trailing space).
+const TP_RAW2_HEX_MAX: usize = TP_RAW2_BYTES * 3;
+/// TPDRAG (B219) — `tp_hex` for up to `TP_RAW2_BYTES` bytes (allocation-free; longer input truncates).
+fn tp_hex_raw2<'a>(buf: &'a mut [u8; TP_RAW2_HEX_MAX], bytes: &[u8]) -> &'a str {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut n = 0usize;
+    for (k, b) in bytes.iter().take(TP_RAW2_BYTES).enumerate() {
+        if k > 0 {
+            buf[n] = b' ';
+            n += 1;
+        }
+        buf[n] = HEX[(b >> 4) as usize];
+        buf[n + 1] = HEX[(b & 0xF) as usize];
+        n += 2;
+    }
+    // Safe: every byte written above is ASCII hex or a space.
+    unsafe { core::str::from_utf8_unchecked(&buf[..n]) }
+}
+
+/// TPDRAG (B219) self-test — synthetic two-finger frames through the LIVE decode + `mt_step`: finger 0 HELD (touch, still) while finger 1
+/// moves, the pad click down. The pointer must follow finger 1 (`mover=1`, dx from finger 1's delta), the button must be the held press, and the
+/// decoder must read finger[1]. Then finger 0 moves with finger 1 held -> `mover=0`. GO-RED: hard-code `mover = 0` in `mt_step`.
+fn tpdrag_selftest() {
+    let mk = |b: u8, a: (i16, i16), c: (i16, i16)| -> [u8; TP_RAW2_BYTES] {
+        let mut fr = [0u8; TP_RAW2_BYTES];
+        fr[WSP2_NFINGER_OFF] = 2;
+        fr[WSP2_BUTTON_OFF] = b;
+        for (rec, p) in [(WSP2_HDR_LEN, a), (WSP2_HDR_LEN + WSP2_FSIZE, c)] {
+            fr[rec + WSP2_F_ABS_X..rec + WSP2_F_ABS_X + 2].copy_from_slice(&p.0.to_le_bytes());
+            fr[rec + WSP2_F_ABS_Y..rec + WSP2_F_ABS_Y + 2].copy_from_slice(&p.1.to_le_bytes());
+            fr[rec + WSP2_F_TOUCH_MAJOR..rec + WSP2_F_TOUCH_MAJOR + 2].copy_from_slice(&90i16.to_le_bytes());
+        }
+        fr
+    };
+    let frames = [mk(0, (100, 100), (500, 500)), mk(1, (100, 100), (500 - 60, 500)), mk(1, (100, 100), (500 - 90, 500 - 30)), mk(1, (100 + 30, 100), (500 - 90, 500 - 30))];
+    let mut c = TpCensus::EMPTY;
+    let mut out = [(0u8, 0u8, 0i32, 0i32); 4];
+    let mut decoded = true;
+    for (k, fr) in frames.iter().enumerate() {
+        match decode_wellspring_type2(fr) {
+            Some(f) => {
+                decoded &= f.fingers == 2 && f.x1 != 0 && f.touch1 == 90;
+                let (b, dx, dy, _) = c.mt_step(f);
+                out[k] = (b, c.mt_mover, dx, dy);
+            }
+            None => decoded = false,
+        }
+    }
+    // frame 1: finger 1 moves -60 raw x -> tp_scale(-60) = -15, y 0; frame 2: -30/-30 -> -5/-5 y is negated: finger 1 y 500->470 => pointer y +30.
+    let want = [(0u8, 0u8, 0i32, 0i32), (1, 1, tp_scale(-60), 0), (1, 1, tp_scale(-30), tp_scale(30)), (1, 0, tp_scale(30), 0)];
+    let ok = decoded && out == want;
+    serial_println!(
+        ":: TPDRAG: decoded={} mover_seq={}{}{}{} buttons={}{}{}{} d1={}/{} d3={}/{} -> {} ::",
+        decoded, out[0].1, out[1].1, out[2].1, out[3].1, out[0].0, out[1].0, out[2].0, out[3].0,
+        out[1].2, out[1].3, out[3].2, out[3].3, if ok { "PASS" } else { "FAIL" }
     );
 }
 
