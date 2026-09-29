@@ -1243,6 +1243,7 @@ pub fn service() {
             crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire, screen_press_via_router, screen_press_route_name()); #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::crystal::login::lock_fixture(b"una", b"correct-horse", b"wrong-horse"); #[cfg(feature = "loginst")] LOGINST_LIVE.store(false, Ordering::Release); // LOGINORDER (B206): the chain is over; the press battery may run. ⚠ SAME-LINE fold. // LOGIN M4 — the Log Out route under test is the CRYSTAL MENU'S ROW (`crystal::logout_row_fire`), not the screen's own reopen; M3's `logout_direct` retires with it. LOGINFLOW M1 — and the PRESS route under test is the arch's LIVE ROUTER (`screen_press_via_router`, this file's tail), handed in for exactly the reason the logout route is: a fixture that called `press_swallow` itself would stay green on a tree whose router gate had been deleted — B121's lesson one band over. The seam's NAME travels with it, so the verdict line says which entry was driven rather than leaving the reader to infer it from the arch.
+        stage_resolve("store-loaded"); // FIRSTBOOT (R77): the stage, from the loaded store AFTER the loginst chain (a Desktop-stage store there); the desktop tenants wait on it
         }
         Err(e) => {
             let n = MOUNT_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1254,6 +1255,7 @@ pub fn service() {
                 // leg red for a disk the harness never attached is wrong-strict. Any other refusal on a
                 // registered disk (`Io`, `BadChain`, `Unsupported`, …) IS a defect and takes the FAIL form.
                 SERVICED.store(true, Ordering::Relaxed);
+                stage_no_store(); // FIRSTBOOT (R77): no store to install into — the machine is a Desktop
                 serial_println!("[users] el0-fat volume did not mount after {} passes — last={:?} — store unavailable this boot", n, e);
                 #[cfg(feature = "loginst")]
                 if matches!(e, FatError::NotFat | FatError::NoDisk) {
@@ -1890,6 +1892,7 @@ pub fn boot_session(desktop: bool) {
     );
     DESKTOP_IGNITED.store(true, core::sync::atomic::Ordering::Release);
     let _ = open_pending_root_prompt();
+    open_pending_create_user(); // FIRSTBOOT (R77): the create-user form the store resolution owed before the glass was up
 }
 
 /// LOGIN14: the desktop is up — open the set-password screen the store's load deferred, if it did.
@@ -2901,4 +2904,201 @@ pub fn login_usermgmt_fixture() {
             users, if own { "ok" } else { "FAIL" }, if other { "ok" } else { "FAIL" }, if last { "refused" } else { "ACCEPTED" }, if self_refused { "refused" } else { "ACCEPTED" }, deleted, if ok { "PASS" } else { "FAIL —" }
         );
     }
+}
+
+// =========================================================================================
+// FIRSTBOOT (R77) — THE FIRST BOOT IS AN INSTALLER, NOT A DESKTOP
+// =========================================================================================
+//
+// Peter, 2026-09-29 (RULINGS R77): with no root password set NOTHING runs but the root password setter;
+// with root's password set and no user rows, a create-user dialog; only then the desktop, FOR THAT USER.
+// ONE predicate decides, derived from the loaded store and published once per stage change:
+//   root password unset               -> Installer   (the setter is the whole glass)
+//   root password set, no user rows   -> CreateUser  (name + password twice; the adduser path)
+//   else                              -> Desktop
+// Every desktop tenant asks [`desktop_allowed`]: the STAT.ELF launch, the witness launcher (`winx_launcher`),
+// the furniture compose (`strip::compose_all`). The store is known ~400 ms after the takeover on the rMBP
+// (boot 16: activate 7546 ms, store 7973 ms), so until it is known the TENANTS WAIT (bounded, then the
+// machine has no store to ask and is a Desktop). The QEMU `loginst` lane's chain seeds root's password and
+// users itself, so it resolves to Desktop at the END of the chain (a Desktop-stage store).
+
+/// The boot's stage. See the block comment above.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BootStage {
+    Installer,
+    CreateUser,
+    Desktop,
+}
+
+impl BootStage {
+    pub fn word(self) -> &'static str {
+        match self {
+            BootStage::Installer => "installer",
+            BootStage::CreateUser => "create-user",
+            BootStage::Desktop => "desktop",
+        }
+    }
+}
+
+const STAGE_UNRESOLVED: u8 = 255;
+static STAGE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(STAGE_UNRESOLVED);
+/// The create-user form was owed before the desktop ignition could hold a window: `boot_session` opens it.
+static CREATE_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The bar was switched off by the stage and is owed back at the Desktop advance.
+static BAR_HELD: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// How long a tenant waits for the store before the machine is taken to have none (a Desktop).
+const STAGE_WAIT_MS: u64 = 30_000;
+
+/// The stage the LOADED store says (pure read; `Installer` while the store is not loaded).
+pub fn stage_of_store() -> BootStage {
+    let loaded = TABLE.lock().loaded;
+    if !loaded || password_unset(ROOT_NAME) != Some(false) {
+        return BootStage::Installer;
+    }
+    if user_count() == 0 { BootStage::CreateUser } else { BootStage::Desktop }
+}
+
+/// The published stage. Unresolved (the store not read yet) reads `Installer`: nothing runs until known.
+pub fn boot_stage() -> BootStage {
+    match STAGE.load(core::sync::atomic::Ordering::Acquire) {
+        0 => BootStage::Installer,
+        1 => BootStage::CreateUser,
+        2 => BootStage::Desktop,
+        _ => BootStage::Installer,
+    }
+}
+
+/// Has the stage been read from the store (or the store declared absent)?
+pub fn stage_resolved() -> bool {
+    STAGE.load(core::sync::atomic::Ordering::Acquire) != STAGE_UNRESOLVED
+}
+
+/// **THE GATE.** May a desktop tenant run? `true` only at the Desktop stage. Before the store is read it is
+/// `false` until [`STAGE_WAIT_MS`] of boot, after which a store that never answered means a machine with no
+/// installer to run: the stage resolves to Desktop, said once.
+pub fn desktop_allowed() -> bool {
+    if !stage_resolved() {
+        if crate::arch::ms() < STAGE_WAIT_MS {
+            return false;
+        }
+        stage_publish(BootStage::Desktop, "no-store");
+    }
+    boot_stage() == BootStage::Desktop
+}
+
+/// The furniture (bar, dock, strip) is HELD: the stage is known and it is not the Desktop. Unresolved is
+/// not held (the first ~400 ms of a metal boot paint as before; the resolution then takes it down).
+pub fn furniture_held() -> bool {
+    stage_resolved() && boot_stage() != BootStage::Desktop
+}
+
+fn stage_witness(why: &str) {
+    let st = boot_stage();
+    let users = user_count();
+    let root_set = password_unset(ROOT_NAME) == Some(false);
+    let up = st == BootStage::Desktop;
+    serial_println!(
+        ":: FIRSTBOOT: stage={} root_set={} users={} desktop_ignited={} why={} -> {} ::",
+        st.word(), root_set, users, up, why,
+        if (st == BootStage::Installer && !root_set && !up) || (st == BootStage::CreateUser && root_set && users == 0 && !up) || (up && root_set && users > 0) || why == "no-store" { "PASS" } else { "FAIL" }
+    );
+}
+
+fn stage_publish(st: BootStage, why: &str) {
+    use core::sync::atomic::Ordering;
+    let prev = STAGE.swap(st as u8, Ordering::AcqRel);
+    if prev == st as u8 {
+        return;
+    }
+    stage_witness(why);
+    serial_println!("[login] installer: stage={} (R77: {})", st.word(), match st {
+        BootStage::Installer => "no root password — the setter is the whole glass; no desktop, no programs, no fixtures",
+        BootStage::CreateUser => "root's password is set and there is no user — the create-user form",
+        BootStage::Desktop => "the desktop ignites",
+    });
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        if st != BootStage::Desktop {
+            if crate::video::menubar::set_enabled(false) {
+                BAR_HELD.store(true, Ordering::Release);
+            }
+        } else if BAR_HELD.swap(false, Ordering::AcqRel) {
+            let _ = crate::video::menubar::set_enabled(true);
+            crate::video::wm::composite();
+        }
+    }
+}
+
+/// Read the stage from the store and publish it; open the create-user form when that is the stage.
+/// Called once at the end of [`service`]'s load arm (after the `loginst` chain), and by the advance below.
+pub fn stage_resolve(why: &str) {
+    let st = stage_of_store();
+    stage_publish(st, why);
+    if st == BootStage::CreateUser {
+        if DESKTOP_IGNITED.load(core::sync::atomic::Ordering::Acquire) {
+            screen_create_user();
+        } else {
+            CREATE_PENDING.store(true, core::sync::atomic::Ordering::Release);
+            serial_println!("[login] installer: create-user form deferred to the glass (the setter's window needs the surface)");
+        }
+    }
+}
+
+/// The store could not be mounted after the bound: there is nothing to install into; the machine is a Desktop.
+pub fn stage_no_store() {
+    stage_publish(BootStage::Desktop, "no-store");
+}
+
+/// `boot_session`'s tail: open the create-user form the resolution owed before the glass was up.
+fn open_pending_create_user() {
+    if CREATE_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        screen_create_user();
+    }
+}
+
+/// The root password setter (the Installer's only screen) has WRITTEN root's password: advance. A no-op
+/// unless the published stage is Installer (the `loginst` chain drives the same setter mid-chain).
+pub fn installer_root_password_set() {
+    if !stage_resolved() || boot_stage() != BootStage::Installer {
+        return;
+    }
+    serial_println!("[login] installer: root password set -> next stage");
+    stage_resolve("root-password-set");
+}
+
+/// The create-user form's submit: the adduser path (`adduser_commit`: row, home), then the password, then
+/// the session for THAT user and the desktop. `Err` is a one-line reason for the form; nothing is printed
+/// of the password.
+pub fn installer_create_user(name: &[u8], password: &[u8]) -> Result<(), &'static str> {
+    if boot_stage() != BootStage::CreateUser {
+        return Err("not the create-user stage");
+    }
+    if !name_ok(name) {
+        return Err("Name: a-z 0-9 _ - , letter first, 8 max");
+    }
+    if name == ROOT_NAME {
+        return Err("root is taken");
+    }
+    if password.is_empty() {
+        return Err("Type a password");
+    }
+    let made = adduser_commit(name).map_err(|_| "Could not create the user")?;
+    if set_first_password(name, password).is_err() {
+        serial_println!("[login] installer: create-user user={} row made but the password was NOT written (the form stays)", wire_name(name));
+        return Err("Could not save the password");
+    }
+    serial_println!("[login] installer: create-user user={} id={} home_created={}", wire_name(name), made.0, made.1);
+    Ok(())
+}
+
+/// After the create-user form logged the new user in: the desktop ignites for them.
+pub fn installer_desktop_ignite() {
+    stage_resolve("user-created");
+}
+
+fn screen_create_user() {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    crate::video::crystal::login::open_create_user();
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    serial_println!("[login] create-user form not built in this image (R77: the stage stays create-user)");
 }

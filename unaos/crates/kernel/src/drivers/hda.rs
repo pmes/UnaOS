@@ -2157,7 +2157,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
 /// BOOTSLOW — `probe()` once, from a device-service pass, after the root pass's verdict.
 pub fn probe_after_root() {
     static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    if DONE.load(core::sync::atomic::Ordering::Relaxed) || !crate::fs::bootdisk::root_pass_open("hda") {
+    if DONE.load(core::sync::atomic::Ordering::Relaxed) || !crate::fs::bootdisk::root_pass_open("hda") || { #[cfg(feature = "login")] { !crate::fs::users::desktop_allowed() } #[cfg(not(feature = "login"))] { false } } { // FIRSTBOOT (R77): no HDA bring-up (the boot tone) before the Desktop stage. LINE-NEUTRAL fold.
         return;
     }
     if DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {

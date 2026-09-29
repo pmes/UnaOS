@@ -700,6 +700,12 @@ pub fn rects(pw: usize, ph: usize, out: &mut [Option<Rect>; STRIP_MAX]) -> usize
 /// deliberately not `||`: both tenants must run, because a short-circuit would let the first
 /// repainting strip starve the second's damage test for the whole pass.
 pub fn compose_all() -> bool {
+    // FIRSTBOOT (R77): the bar, dock and menus are desktop furniture — nothing paints while the boot stage is the
+    // installer or the create-user form (the setter / the form is the whole glass).
+    #[cfg(feature = "login")]
+    if crate::fs::users::furniture_held() {
+        return false;
+    }
     let a = super::dock::compose();
     let b = super::menubar::compose();
     // CRYSTAL — the SHARD menu's dropdown is a TRANSIENT surface, not a registered strip tenant (it
