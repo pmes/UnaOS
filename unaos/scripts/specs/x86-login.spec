@@ -453,3 +453,6 @@ FORBID :: LOGOUTDESK: closed=\d+ kernel=0 remaining=0 -> PASS
 # NOTICE — the OS's notice surface: two notices back to back (the second queues), both dismissed by the OK path.
 REQUIRE :: NOTICE: title=Fixture-A lines=2 queued=1 shown=1 dismissed=1 -> PASS ::
 FORBID :: NOTICE: .* -> FAIL
+# SCREENLOCK: lock without ending the session — name read-only, wrong refused, right unlocks, furniture untouched.
+REQUIRE :: SCREENLOCK: user=una locked=1 windows_kept=\d+ wrong=refused unlock=ok furniture_reignited=0 -> PASS ::
+FORBID :: SCREENLOCK: .* -> FAIL

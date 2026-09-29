@@ -490,14 +490,15 @@ fn repaint() {
     }
     // LOGIN13 M1 (R63) — ONE face: the screen only logs in (`adduser` creates; see `submit`), so the
     // create-first-user title, button label and hint that keyed on `users::count() == 0` are gone.
-    let title: &[u8] = b"Log in to UnaOS";
+    let locked = LOCKED.load(Ordering::Relaxed);
+    let title: &[u8] = if locked { b"Locked" } else { b"Log in to UnaOS" };
     text(px, LX, 14, title, theme::CONTENT_TEXT);
     fill(px, LX, 36, W - 2 * LX, 2, theme::FRAME_LINE);
     // The user rows, when there are users. `name_at` is the store's own accessor, so the row a press
     // picks and the row the painter draws are the same row by construction — the `ctl_rect` argument
     // one layer up, applied to the CONTENT as well as to the geometry.
     let mut nb = [0u8; users::NAME_MAX];
-    for i in 0..user_rows() {
+    for i in 0..(if locked { 0 } else { user_rows() }) { // SCREENLOCK: no roster on a locked screen — the name is the session's
         if let Some(n) = users::name_at(i, &mut nb) {
             user_row(px, i, &nb[..n], f.name_len == n && f.name[..n] == nb[..n]);
         }
@@ -508,7 +509,7 @@ fn repaint() {
     let (pxf, py, pwf, _) = ctl_rect(Ctl::PwField, false);
     text(px, LX, py + 4, b"Password", theme::TITLE_TEXT_INACTIVE);
     field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
-    button(px, Ctl::Button, b"Log In", true, false);
+    button(px, Ctl::Button, if locked { b"Unlock" } else { b"Log In" }, true, false);
     let hint: &[u8] = b"Enter or Log In   Tab switches";
     text(px, LX, 186, hint, theme::TITLE_TEXT_INACTIVE);
     if !f.message.is_empty() {
@@ -618,7 +619,7 @@ fn open_as(state: State) {
     // screen, no console and a swallowed keyboard. The fixture's CLOSE leg measures it every witness
     // boot, against a control row that differs only here.
     let nt = notice_current(); // NOTICE: the alert's window is titled by the notice
-    let title: &[u8] = if state == State::SetPw { b"Set password" } else if state == State::Alert { nt.title() } else { b"Log in" };
+    let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::Alert { nt.title() } else { b"Log in" };
     let id = wm::create_at(OWNER, surf, W * H * 4, W as u32, H as u32, (W * 4) as u32, title, ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
     if id == wm::WIN_NONE {
         FORM.lock().windowed = false;
@@ -635,6 +636,7 @@ fn open_as(state: State) {
 }
 
 fn take_down() {
+    LOCKED.store(false, Ordering::Relaxed); // SCREENLOCK: the locked mode ends with the row, whichever way it ends
     let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
     if id != wm::WIN_NONE {
         wm::clear_modal_top(id); wm::close(id); // LOGINZ (B223): the ceiling goes with the row
@@ -748,6 +750,8 @@ pub fn press_swallow(x: i32, y: i32) -> bool {
         ctl_at(lx, ly, setpw_form())
     });
     match hit {
+        Some(Ctl::NameField) if LOCKED.load(Ordering::Relaxed) => FORM.lock().focus = Focus::Password, // SCREENLOCK: read-only name
+        Some(Ctl::User(_)) if LOCKED.load(Ordering::Relaxed) => {} // SCREENLOCK: no user switching while locked
         Some(Ctl::NameField) => FORM.lock().focus = Focus::Name,
         Some(Ctl::PwField) => FORM.lock().focus = Focus::Password,
         Some(Ctl::Pw2Field) => FORM.lock().focus = Focus::Retype,
@@ -863,6 +867,7 @@ pub fn consume_key(c: u8) -> bool {
             return true;
         }
         b'\x1b' => {} // R24: Esc dismisses menus only; the screen stays
+        b'\t' if LOCKED.load(Ordering::Relaxed) => {} // SCREENLOCK: one editable field
         b'\t' => {
             let mut f = FORM.lock();
             f.focus = match (f.state, f.focus) {
@@ -875,6 +880,7 @@ pub fn consume_key(c: u8) -> bool {
         8 | 0x7f => {
             let mut f = FORM.lock();
             match f.focus {
+                Focus::Name if LOCKED.load(Ordering::Relaxed) => {} // SCREENLOCK: read-only name
                 Focus::Name => f.name_len = f.name_len.saturating_sub(1),
                 Focus::Password => f.pw_len = f.pw_len.saturating_sub(1),
                 Focus::Retype => f.pw2_len = f.pw2_len.saturating_sub(1),
@@ -884,6 +890,7 @@ pub fn consume_key(c: u8) -> bool {
         0x20..=0x7e => {
             let mut f = FORM.lock();
             match f.focus {
+                Focus::Name if LOCKED.load(Ordering::Relaxed) => {} // SCREENLOCK: read-only name
                 Focus::Name => {
                     if f.name_len < FIELD_MAX {
                         let i = f.name_len;
@@ -985,6 +992,9 @@ fn submit() {
     }
     let n = &name[..nlen];
     let p = &pw[..plen];
+    if LOCKED.load(Ordering::Relaxed) {
+        return submit_unlock(n, p);
+    }
     if n == users::ROOT_NAME {
         // LOGIN14: root is reached by booting (R63); the screen logs root in when R64's arc lands.
         serial_println!("[login] denied user=root (root is the boot session; the screen does not open it yet)");
@@ -1812,4 +1822,108 @@ fn notice_fixture() {
         ":: NOTICE: title=Fixture-A lines=2 queued={} shown={} dismissed={} -> {} ::",
         queued, (shown == 2) as u8, (dismissed == 2) as u8, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ---------------------------------------------------------------------------
+// SCREENLOCK — lock the session without ending it
+// ---------------------------------------------------------------------------
+
+/// SCREENLOCK: the screen is up in LOCKED mode (name read-only, title "Locked"). Set by [`lock`], cleared by [`take_down`].
+static LOCKED: AtomicBool = AtomicBool::new(false);
+static UNLOCKS: AtomicU32 = AtomicU32::new(0);
+/// SCREENLOCK: [`close_into_session`]'s furniture branch was taken (`SWEPT` was set) — the unlock path must leave this untouched.
+static LOCK_REIGNITED: AtomicU32 = AtomicU32::new(0);
+
+/// **Lock the session.** The login screen comes up over the live desktop, in locked mode: the name is the
+/// session user's and cannot be edited, the modal pin (LOGINZ) keeps it on top, and NOTHING is swept — the
+/// session's programs and windows stay alive beneath. A correct password closes the screen back onto the
+/// session ([`submit_unlock`]); a wrong one is the login screen's own "Login failed".
+///
+/// Refused (`false`) when there is no session, when the screen is already up, or when the session's row has
+/// no credential to unlock with (a lock nobody can lift is a dead machine).
+pub fn lock() -> bool {
+    let mut nb = [0u8; users::NAME_MAX];
+    let Some(n) = users::whoami(&mut nb) else {
+        serial_println!("[login] lock refused (no session)");
+        return false;
+    };
+    if is_open() || users::password_unset(&nb[..n]) != Some(false) {
+        serial_println!("[login] lock refused (screen already up, or the session user has no password to unlock with)");
+        return false;
+    }
+    {
+        let mut f = FORM.lock();
+        f.state = State::Closed; // `open_as` starts from a down screen; the session state is restored by the unlock
+    }
+    LOCKED.store(true, Ordering::Relaxed);
+    open_as(State::Open);
+    let mut f = FORM.lock();
+    f.name[..n].copy_from_slice(&nb[..n]);
+    f.name_len = n;
+    f.focus = Focus::Password;
+    drop(f);
+    serial_println!("[login] screen locked user={} (the session stays open; nothing swept)", core::str::from_utf8(&nb[..n]).unwrap_or("?"));
+    repaint();
+    true
+}
+
+/// SCREENLOCK: the locked screen's Enter. Verify against the store; right closes back onto the session
+/// WITHOUT `users::login` (the session never ended: no new epoch, no re-stamp) and without the
+/// furniture branch of [`close_into_session`]; wrong is the login screen's answer.
+fn submit_unlock(n: &[u8], p: &[u8]) {
+    if !users::verify(n, p) {
+        serial_println!("[login] denied user={} (locked; one answer for every refusal)", core::str::from_utf8(n).unwrap_or("?"));
+        let mut f = FORM.lock();
+        f.message = "Login failed";
+        clear_passwords(&mut f);
+        return;
+    }
+    UNLOCKS.fetch_add(1, Ordering::Relaxed);
+    serial_println!("[login] unlocked user={}", core::str::from_utf8(n).unwrap_or("?"));
+    take_down(); // clears LOCKED, closes the row, resumes the console
+    if SWEPT.load(Ordering::Acquire) {
+        LOCK_REIGNITED.fetch_add(1, Ordering::Relaxed); // never on this path: a lock sweeps nothing
+    }
+    FORM.lock().state = State::Session;
+}
+
+/// SCREENLOCK: is the locked screen up?
+pub fn is_locked() -> bool {
+    LOCKED.load(Ordering::Relaxed) && is_open()
+}
+
+/// SCREENLOCK witness (`loginst`, headless form): log `name` in, lock, prove the name is read-only, a wrong
+/// password refused, the right one back to the session, the windows untouched and the furniture not re-lit.
+#[cfg(feature = "loginst")]
+pub fn lock_fixture(name: &[u8], password: &[u8], wrong: &[u8]) -> bool {
+    let was_headless = HEADLESS.swap(true, Ordering::Relaxed);
+    let mut nb = [0u8; users::NAME_MAX];
+    let feed = |s: &[u8]| { for &b in s { let _ = consume_key(b); } };
+    let mut ok = users::whoami(&mut nb).is_none() && !is_open();
+    if ok {
+        open_as(State::Open);
+        feed(name); let _ = consume_key(b'\t'); feed(password); let _ = consume_key(b'\n');
+        ok = users::whoami(&mut nb).is_some();
+    }
+    let windows_before = wm::live_window_count();
+    let reignite_before = LOCK_REIGNITED.load(Ordering::Relaxed);
+    let locked = ok && lock() && is_locked() && { let f = FORM.lock(); f.name_len == name.len() && f.name[..name.len()] == *name && f.focus == Focus::Password };
+    feed(b"zz"); let _ = consume_key(b'\t'); let _ = consume_key(8); // typing into / tabbing to the name goes nowhere
+    let name_kept = { let f = FORM.lock(); f.name_len == name.len() && f.name[..name.len()] == *name };
+    feed(wrong); let _ = consume_key(b'\n');
+    let refused = is_locked() && FORM.lock().message == "Login failed" && matches!(users::whoami(&mut nb), Some(k) if &nb[..k] == name);
+    feed(password); let _ = consume_key(b'\n');
+    let unlocked = !is_open() && !is_locked() && matches!(users::whoami(&mut nb), Some(k) if &nb[..k] == name) && UNLOCKS.load(Ordering::Relaxed) >= 1;
+    let kept = wm::live_window_count().saturating_sub(windows_before); // no window the lock made survives; none of the session's was closed
+    let reignited = LOCK_REIGNITED.load(Ordering::Relaxed) - reignite_before;
+    users::logout();
+    take_down();
+    FORM.lock().state = State::Closed;
+    HEADLESS.store(was_headless, Ordering::Relaxed);
+    let pass = ok && locked && name_kept && refused && unlocked && kept == 0 && reignited == 0;
+    serial_println!(
+        ":: SCREENLOCK: user={} locked={} windows_kept={} wrong={} unlock={} furniture_reignited={} -> {} ::",
+        core::str::from_utf8(name).unwrap_or("?"), locked as u32, windows_before, if refused && name_kept { "refused" } else { "ACCEPTED" }, if unlocked { "ok" } else { "FAIL" }, reignited, if pass { "PASS" } else { "FAIL —" }
+    );
+    pass
 }
