@@ -448,3 +448,6 @@ FORBID \[users\] logout REFUSED session=root reason=no-users$
 REQUIRE :: LOGOUTDESK: closed=\d+ kernel=\d+ remaining=0 -> PASS ::
 FORBID :: LOGOUTDESK: .* -> FAIL
 FORBID :: LOGOUTDESK: closed=\d+ kernel=0 remaining=0 -> PASS
+# NOTICE — the OS's notice surface: two notices back to back (the second queues), both dismissed by the OK path.
+REQUIRE :: NOTICE: title=Fixture-A lines=2 queued=1 shown=1 dismissed=1 -> PASS ::
+FORBID :: NOTICE: .* -> FAIL

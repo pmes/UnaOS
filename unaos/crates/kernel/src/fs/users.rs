@@ -532,7 +532,7 @@ fn delete_root_file(fs: &FatFs, leaf: &str) -> Result<(), UsersError> {
 /// Create root-directory file `leaf` fresh (any prior one deleted first) with `data`.
 fn write_root_file(fs: &FatFs, leaf: &str, data: &[u8]) -> Result<(), UsersError> {
     if fs.write_veto().is_some() {
-        return Err(UsersError::Volume);
+        screen_notice(b"Storage read-only", b"changes were not saved"); return Err(UsersError::Volume);
     }
     delete_root_file(fs, leaf)?;
     let (_, l, o) = fs.create_in_dir(0, leaf, 0x20).map_err(map_fat)?;
@@ -2728,4 +2728,31 @@ fn store_mount() -> Result<FatFs, FatError> {
         _ => return Err(FatError::NoDisk),
     };
     crate::fs::fat::mount_source(source)
+}
+
+// =========================================================================================
+// NOTICE — the OS's notice surface, reached from code that is not the screen (appended at the tail)
+// =========================================================================================
+
+/// NOTICE: queue a notice (title, up to two `\n`-separated lines) for the glass. QUEUE ONLY — no `wm`
+/// call, no heap, so it is safe from the xHCI event path, a fault handler or a flush; the window opens
+/// on the next key through the screen's pump. A no-op where no desktop is built.
+pub fn screen_notice(title: &[u8], text: &[u8]) {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    crate::video::crystal::login::notice_post(title, text);
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    let _ = (title, text);
+}
+
+/// NOTICE (`BUS_VERB_NOTICE`): a ring-3 app raises a notice; the title is the app's own name, looked up
+/// by the kernel-stamped `owner` in wm's title registry (`Program` when none is armed).
+pub fn screen_notice_from(owner: u64, body: &[u8]) {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        let mut t = [0u8; crate::video::wm::MAX_TITLE];
+        let n = crate::video::wm::app_name_of(owner, &mut t);
+        crate::video::crystal::login::notice_post(if n == 0 { b"Program" } else { &t[..n] }, body);
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    let _ = (owner, body);
 }

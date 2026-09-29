@@ -588,6 +588,10 @@ pub const BUS_VERB_WRITE: u8 = 4;
 pub const BUS_VERB_RM: u8 = 5;
 /// Write-side verb: rename a root file in place — owner-only, ACL name re-bind.
 pub const BUS_VERB_MV: u8 = 6;
+/// NOTICE: raise a notice on the glass — body = up to two lines of text (`\n`-separated, printable ASCII), the
+/// TITLE is the caller's own program name (kernel-stamped owner, never caller-supplied). Fire-and-forget:
+/// the reply is an empty status-0 frame. 7/8/9 are APPMENU's MENU_PUBLISH/CLEAR/GET; 10 is the next free tag.
+pub const BUS_VERB_NOTICE: u8 = 10;
 
 /// 8.3 name bound — mirrors the `SYS_OPEN` name bound the equivalence witness holds `cat`/`cp` to.
 pub const BUS_NAME_MAX: usize = 12;
