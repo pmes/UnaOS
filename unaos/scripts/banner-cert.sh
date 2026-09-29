@@ -301,6 +301,7 @@ bar1wedge|:: BAR1WEDGE: rung=first-stall|-|measured
 bar1exp-uc|:: x86 bar1exp: UC arm ARMED via=|-|measured
 beam|:: BEAMX86: head=|nvidia-kepler,nvidia-kepler-takeover|measured
 ftdirx|:: FTDIRX: first byte rx=|-|measured
+usbnet|:: USBNET: bus=xhci slot=|-|measured
 gen7r8|:: gen7: r8 begin rung=R8 wake=|-|measured
 nvidia-kepler-kfbind|:: KFBIND: pbdma[|-|measured
 nvidia-kepler-kdhead|:: KDHEAD: end rung=KD14|-|measured

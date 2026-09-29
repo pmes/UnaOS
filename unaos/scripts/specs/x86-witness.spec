@@ -1735,3 +1735,6 @@ REQUIRE :: PORTROUTE: xusb2pr=0x[0-9a-f]+ pssen=0x[0-9a-f]+ mask=0x[0-9a-f]+ swi
 OPTIONAL :: USBNET-EHCI: addr=\d+ mac=[0-9a-f:]{17} link=(up|down) -> PASS ::
 OPTIONAL :: USBNET-EHCI: datapath=stub next=bulk-in-out == witness ::
 FORBID :: USBNET-EHCI: .* -> FAIL ::
+# USBNET3: the xHCI-path AX88179 reading. QEMU has no AX88179, so no QEMU lane can produce it: OPTIONAL (metal, UNAOS_USBNET=1 + the dongle on an xHCI port).
+OPTIONAL :: USBNET: bus=xhci slot=\d+ mac=[0-9a-f:]{17} link=(up|down) speed=\d+ usb=(ss|hs|fs|\?) rx=\d+ tx=\d+ .* -> PASS ::
+FORBID :: USBNET: bus=xhci .* -> FAIL ::

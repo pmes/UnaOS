@@ -380,6 +380,7 @@ pub fn set_up(slot: u8, filter_ok: bool, failed_at: Option<&'static str>) {
         Some(why) => {
             STATE.store(ST_FAILED, Ordering::Relaxed);
             serial_println!(":: USBNET: bring-up kind={} slot={} refused at {} -> FAIL ::", kind_name(), slot, why);
+            serial_println!(":: USBNET: bus=xhci slot={} mac=00:00:00:00:00:00 link=down speed=0 usb=? rx=0 tx=0 refused={} -> FAIL ::", slot, why);
         }
     }
 }
@@ -600,6 +601,25 @@ pub mod ax {
     pub const RXHDR_CRC_ERR: u32 = 1 << 29;
     pub const RXHDR_DROP_ERR: u32 = 1 << 31;
     pub const RX_PAD: usize = 2; // the IPE alignment pad ahead of every frame
+    // ── PHY (MII) registers over REQ_PHY (bmRequestType 0xC0 read / 0x40 write, wValue = PHY_ID, wIndex = reg, 2 bytes) ──
+    pub const MII_BMCR: u16 = 0x00; // Basic Mode Control: ANENABLE 0x1000 | ANRESTART 0x0200
+    pub const MII_ADVERTISE: u16 = 0x04; // ADVERTISE_ALL 0x01e0 | CSMA 0x0001 | PAUSE_CAP 0x0400 (Linux ax88179_reset)
+    pub const ADVERTISE_ALL_PAUSE: u16 = 0x05e1;
+    pub const MII_CTRL1000: u16 = 0x09; // ADVERTISE_1000FULL 0x0200
+    pub const ADVERTISE_1000FULL: u16 = 0x0200;
+    pub const GMII_PHY_PHYSR: u16 = 0x11; // the part's PHY specific status (Linux GMII_PHY_PHYSR)
+    pub const PHYSR_LINK: u16 = 0x0400; // real-time link
+    pub const PHYSR_SMASK: u16 = 0xc000; // speed: 0x8000 gigabit, 0x4000 100M, 0 10M
+    pub const PHYSR_GIGA: u16 = 0x8000;
+    pub const PHYSR_100: u16 = 0x4000;
+    pub const PHYSR_FULL: u16 = 0x2000; // duplex
+    /// MEDIUM_STATUS_MODE bits (Linux AX_MEDIUM_*): GIGAMODE 0x0001, FULL_DUPLEX 0x0002, ALWAYS_ONE 0x0004,
+    /// EN_125MHZ 0x0008, RXFLOW 0x0010, TXFLOW 0x0020, PS (100M) 0x0200, RECEIVE_EN 0x0100.
+    pub const MEDIUM_BASE: u16 = 0x0100 | 0x0020 | 0x0010 | 0x0004;
+    pub const MEDIUM_GIGA: u16 = 0x0001 | 0x0008;
+    pub const MEDIUM_PS: u16 = 0x0200;
+    pub const MEDIUM_125: u16 = 0x0008;
+    pub const MEDIUM_FULL: u16 = 0x0002;
 }
 
 /// AX88179 receive: one bulk-IN transfer carries N frames and a trailer. The last 4 bytes are the
@@ -631,7 +651,10 @@ pub fn deliver_ax(buf: &[u8]) {
             return;
         }
         if pkt_hdr & (ax::RXHDR_CRC_ERR | ax::RXHDR_DROP_ERR) == 0 {
-            deliver(&buf[off + ax::RX_PAD..off + pkt_len]);
+            // Whether the hardware's pkt_len counts the 2-byte pad is not settled without the bench: hand the
+            // stack pkt_len bytes AFTER the pad (clamped to the header block), so a pad-inclusive length costs
+            // two trailing bytes (IP/UDP ignore bytes past their own length) and never a truncated frame.
+            deliver(&buf[off + ax::RX_PAD..(off + ax::RX_PAD + pkt_len).min(hdr_off)]);
         } else {
             RX_DROP.fetch_add(1, Ordering::Relaxed);
         }
@@ -695,4 +718,89 @@ pub mod ax_xport {
         if !t.reg_read(REG_PHYSICAL_LINK_STATUS, &mut b) { return None; }
         Some((b[0] & 0x07 != 0, b[0]))
     }
+}
+
+// ── USBNET3: the AX88179 link poll + the `bus=xhci` witness ─────────────────────────────────────
+// The link is polled from the controller's service pass (`Controller::usbnet_ax_poll`), never blocked on:
+// autonegotiation takes seconds, the main loop must keep painting. `poll_due` gates the cadence; `link_seen`
+// records what the PHY said and returns the MEDIUM_STATUS_MODE word to write when the link comes up.
+static LINK: AtomicBool = AtomicBool::new(false);
+static SPEED_MBPS: AtomicU16 = AtomicU16::new(0);
+static USB_SPD: AtomicU8 = AtomicU8::new(0); // PHYSICAL_LINK_STATUS raw byte
+static POLL_T0: AtomicU64 = AtomicU64::new(0);
+static POLL_NEXT: AtomicU64 = AtomicU64::new(0);
+static WIT_N: AtomicU8 = AtomicU8::new(0);
+static WIT_NEXT: AtomicU64 = AtomicU64::new(0);
+const LINK_WAIT_MS: u64 = 15_000;
+
+/// Bring-up finished for the AX front-end: start the poll clock.
+pub fn poll_start(now_ms: u64, plsr: u8) {
+    USB_SPD.store(plsr, Ordering::Relaxed);
+    POLL_T0.store(now_ms, Ordering::Relaxed);
+    POLL_NEXT.store(now_ms + 250, Ordering::Relaxed);
+    WIT_N.store(0, Ordering::Relaxed);
+    LINK.store(false, Ordering::Relaxed);
+}
+/// `true` when the service pass should read the PHY now (250 ms while waiting for link, 2 s after).
+pub fn poll_due(now_ms: u64) -> bool {
+    POLL_T0.load(Ordering::Relaxed) != 0 && now_ms >= POLL_NEXT.load(Ordering::Relaxed)
+}
+/// Record one PHYSR reading (`None` = the read failed). Returns the MEDIUM_STATUS_MODE word to write when
+/// the link has just come up (Linux `ax88179_link_reset`: speed bits from PHYSR, EN_125MHZ when USB is HS/SS).
+pub fn link_seen(now_ms: u64, physr: Option<u16>, plsr: u8) -> Option<u16> {
+    use ax::*;
+    let was = LINK.load(Ordering::Relaxed);
+    let up = physr.map(|p| p & PHYSR_LINK != 0).unwrap_or(false);
+    POLL_NEXT.store(now_ms + if up { 2000 } else { 250 }, Ordering::Relaxed);
+    USB_SPD.store(plsr, Ordering::Relaxed);
+    let mut medium = None;
+    if up && !was {
+        let p = physr.unwrap_or(0);
+        let mut m = MEDIUM_BASE;
+        let mbps = match p & PHYSR_SMASK { PHYSR_GIGA => { m |= MEDIUM_GIGA; 1000 } PHYSR_100 => { m |= MEDIUM_PS; if plsr & 0x06 != 0 { m |= MEDIUM_125; } 100 } _ => 10 };
+        if p & PHYSR_FULL != 0 { m |= MEDIUM_FULL; }
+        SPEED_MBPS.store(mbps, Ordering::Relaxed);
+        LINK.store(true, Ordering::Relaxed);
+        serial_println!("[usbnet] link up speed={}M duplex={} physr={:#06x} usb_plsr={:#04x} medium={:#06x}", mbps, if p & PHYSR_FULL != 0 { "full" } else { "half" }, p, plsr, m);
+        medium = Some(m);
+    } else if !up && was {
+        LINK.store(false, Ordering::Relaxed);
+        SPEED_MBPS.store(0, Ordering::Relaxed);
+        serial_println!("[usbnet] link down (PHYSR={:?})", physr);
+    }
+    medium
+}
+fn usb_name() -> &'static str {
+    let b = USB_SPD.load(Ordering::Relaxed);
+    if b & 0x04 != 0 { "ss" } else if b & 0x02 != 0 { "hs" } else if b & 0x01 != 0 { "fs" } else { "?" }
+}
+/// The one-line reading: `:: USBNET: bus=xhci slot= mac= link= speed= usb= rx= tx= -> PASS ::`. PASS = the MAC
+/// was read and the link was polled (link=down is a valid reading — no cable); rx/tx are the evidence.
+pub fn witness(bus: &str, slot: u8) {
+    let m = mac();
+    let ok = m.iter().any(|&b| b != 0);
+    serial_println!(
+        ":: USBNET: bus={} slot={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} speed={} usb={} rx={} tx={} rx_drop={} tx_drop={} errors={} -> {} ::",
+        bus, slot, m[0], m[1], m[2], m[3], m[4], m[5],
+        if LINK.load(Ordering::Relaxed) { "up" } else { "down" }, SPEED_MBPS.load(Ordering::Relaxed), usb_name(),
+        RX_FRAMES.load(Ordering::Relaxed), TX_FRAMES.load(Ordering::Relaxed),
+        RX_DROP.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed), ERRORS.load(Ordering::Relaxed),
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+/// Emit the witness at link resolution (up, or `LINK_WAIT_MS` without link), then at +20 s and +60 s so rx/tx
+/// carry the reading. Called from the service pass after each poll.
+pub fn witness_tick(now_ms: u64, slot: u8) {
+    let t0 = POLL_T0.load(Ordering::Relaxed);
+    if t0 == 0 { return; }
+    let n = WIT_N.load(Ordering::Relaxed);
+    let due = match n {
+        0 => LINK.load(Ordering::Relaxed) || now_ms.saturating_sub(t0) >= LINK_WAIT_MS,
+        1 | 2 => now_ms >= WIT_NEXT.load(Ordering::Relaxed),
+        _ => false,
+    };
+    if !due { return; }
+    witness("xhci", slot);
+    WIT_N.store(n + 1, Ordering::Relaxed);
+    WIT_NEXT.store(now_ms + if n == 0 { 20_000 } else { 40_000 }, Ordering::Relaxed);
 }
