@@ -125,7 +125,7 @@ pub fn start() {
     }
     WORKERS.store(n, Release);
     READY.store(n > 0, Release);
-    crate::serial_println!(
+    serial_println!(
         "[wcpar] pool={} workers={} cpus_online={} reason={}",
         n + 1,
         n,
@@ -157,8 +157,8 @@ pub fn par_blit(fb: &FrameBuffer, stage: &[u8], row_bytes: usize, dst0: usize, f
     J_BAND_ROWS.store(band_rows, Relaxed);
     J_DONE.store(0, Relaxed);
     J_NBANDS.store(nbands, Relaxed);
-    let gen = (J_CLAIM.load(Relaxed) >> 32) + 1;
-    J_CLAIM.store(gen << 32, Release); // publish: workers may claim from here
+    let generation = (J_CLAIM.load(Relaxed) >> 32) + 1;
+    J_CLAIM.store(generation << 32, Release); // publish: workers may claim from here
     while claim_one() {}
     let mut spins = 0u64;
     while J_DONE.load(Acquire) < nbands {
@@ -167,7 +167,7 @@ pub fn par_blit(fb: &FrameBuffer, stage: &[u8], row_bytes: usize, dst0: usize, f
     }
     let _ = spins;
     // Close the job to late claimants before the buffers are released.
-    J_CLAIM.store((gen << 32) | 0xFFFF_FFFF, Release); // closed: idx >= any nbands, so no late claim can land
+    J_CLAIM.store((generation << 32) | 0xFFFF_FFFF, Release); // closed: idx >= any nbands, so no late claim can land
     W_JOBS.fetch_add(1, Relaxed);
     W_BANDS.fetch_add(nbands as u64, Relaxed);
     W_WALL_CYC.fetch_add(crate::arch::now_cycles().saturating_sub(t0), Relaxed);
@@ -198,7 +198,7 @@ pub fn emit() {
     // serial_us = Σ band time (what one core would have spent); pass_us = wall inside par_blit.
     let speedup = if wall == 0 { 0 } else { (work.saturating_mul(100) / wall).saturating_sub(100) };
     let ok = failed == 0 && done == bands;
-    crate::serial_println!(
+    serial_println!(
         ":: WCPAR: cores={} workers={} bands={} pass_us={} serial_us={} speedup_pct={} -> {} ::",
         cores,
         WORKERS.load(Relaxed),
