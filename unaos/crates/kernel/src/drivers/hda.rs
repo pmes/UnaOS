@@ -1534,7 +1534,10 @@ impl Rings {
 #[cfg(feature = "hda-tone")]
 fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws: &[Widget; MAX_NODES], a: &mut Audit) {
     use tone::*;
-
+    if !TONE_NOW.load(core::sync::atomic::Ordering::Relaxed) { // HDATONE4 M3 (R77): the tone is a `tests hda` run, not a boot side-effect
+        serial_println!("[hda] tone deferred :: R77: the tone runs from `tests hda` (hda::hda_tone_test), the census/walk above stays a boot fact ::");
+        return;
+    }
     let (cad, path) = match walk.and_then(|c| c.path.as_ref().map(|p| (c.cad, *p))) {
         Some(v) => v,
         None => {
@@ -1775,6 +1778,8 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     let saved_lvi = r16(base, sd + SD_LVI);
 
     let mut s = [Saved::default(); PAIR_MAX];
+    let mut dac_actual = [0xFu8; PAIR_MAX]; // HDATONE4 M2: the DAC's ACTUAL power state after the settle poll (0xF = never read)
+    let mut settled_ms = [0u64; PAIR_MAX];
     for m in 0..np {
         let (mpin, mdac) = (paths[m].pin, paths[m].dac);
         if let Some(v) = rings.cmd(cad, mpin, VERB_GET_PIN_CONTROL, 0, a) {
@@ -1829,6 +1834,34 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
             if w.caps & WCAP_POWER_CTL != 0 {
                 if rings.cmd(cad, nid, VERB_SET_POWER_STATE, 0, a).is_some() {
                     a.verbs_set += 1;
+                }
+                // HDATONE4 M2 — poll GET_POWER_STATE (bits 7:4 = ACTUAL) up to 50 ms until D0, re-issue the SET once
+                // at 25 ms; the amp/format writes below only follow a settled node. [HDA-SPEC §7.3.3.10]
+                let ts = crate::arch::now_cycles();
+                let mut act = 0xFu8;
+                let mut reissued = false;
+                loop {
+                    if let Some(v) = rings.cmd(cad, nid, VERB_GET_POWER_STATE, 0, a) {
+                        a.verbs_get += 1;
+                        act = ((v >> 4) & 0x0F) as u8;
+                    }
+                    let el = elapsed_ms(ts);
+                    if act == 0 || el >= 50 {
+                        break;
+                    }
+                    if el >= 25 && !reissued {
+                        reissued = true;
+                        if rings.cmd(cad, nid, VERB_SET_POWER_STATE, 0, a).is_some() {
+                            a.verbs_set += 1;
+                        }
+                    }
+                    delay_us(500);
+                }
+                let el = elapsed_ms(ts);
+                serial_println!("[hda] power settle member={} nid=0x{:02x} actual=D{} settled_ms={} reissued={}", m, nid, act, el, reissued as u8);
+                if nid == p.dac {
+                    dac_actual[m] = act;
+                    settled_ms[m] = el;
                 }
             }
             // A selector on the path is pointed at the input the path actually took; a mixer is
@@ -1987,7 +2020,31 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     let ctl_running = (r8(base, sd + SD_CTL) as u32)
         | ((r8(base, sd + SD_CTL + 1) as u32) << 8)
         | ((r8(base, sd + SD_CTL + 2) as u32) << 16);
+    // HDATONE4 M1 — the RUN write's read-back. Flight 15 read `ctl_running=0x00140004` (RUN clear) on the SAME
+    // instant and still ran, so the FIRST read is not the verdict: poll up to 2 ms for RUN, and re-assert the
+    // whole 24-bit SDnCTL (tag byte included) up to 3 times if it never shows. QEMU's hda-duplex never drops it.
+    let mut run_readback_ok = ctl_running & SDCTL_RUN != 0;
+    let mut run_reasserts = 0u32;
+    let mut run_ctl = ctl_running;
+    {
+        let tr = crate::arch::now_cycles();
+        while !run_readback_ok && run_reasserts <= 3 {
+            while elapsed_ms(tr) < 2 && !run_readback_ok {
+                run_ctl = (r8(base, sd + SD_CTL) as u32) | ((r8(base, sd + SD_CTL + 1) as u32) << 8) | ((r8(base, sd + SD_CTL + 2) as u32) << 16);
+                run_readback_ok = run_ctl & SDCTL_RUN != 0;
+            }
+            if run_readback_ok || run_reasserts == 3 {
+                break;
+            }
+            run_reasserts += 1;
+            w8(base, sd + SD_CTL + 2, (STREAM_TAG << 4) as u8);
+            w8(base, sd + SD_CTL, SDCTL_IOCE as u8 | SDCTL_RUN as u8);
+            a.stream += 2;
+        }
+    }
+    serial_println!("[hda] run ctl={:#010x} readback={:#010x} run_bit={} reasserts={}", ctl_running, run_ctl, (run_ctl & SDCTL_RUN != 0) as u8, run_reasserts);
     let t0 = crate::arch::now_cycles();
+    let mut stall_reasserts = 0u32;
     let mut bcis = 0u32;
     let mut lpib_max = lpib0;
     let mut fifo_ready = 0u8;
@@ -2018,6 +2075,14 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
         prev = l;
         if l > lpib_max {
             lpib_max = l;
+        }
+        // HDATONE4 M1: LPIB still at its start 100 ms in (boot 16: 1200 ms of lpib=0) -> re-assert RUN, at most 3 times.
+        if lpib_max == lpib0 && wraps == 0 && stall_reasserts < 3 && elapsed_ms(t0) >= 100 * (stall_reasserts as u64 + 1) {
+            stall_reasserts += 1;
+            w8(base, sd + SD_CTL + 2, (STREAM_TAG << 4) as u8);
+            w8(base, sd + SD_CTL, SDCTL_IOCE as u8 | SDCTL_RUN as u8);
+            a.stream += 2;
+            serial_println!("[hda] run stall reassert n={} lpib={} sts={:#04x} ctl={:#04x}", stall_reasserts, l, sts, r8(base, sd + SD_CTL));
         }
         if elapsed_ms(t0) >= RUN_MS {
             break;
@@ -2132,10 +2197,13 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
         (sts_end & SDSTS_FIFOE != 0) as u8, (sts_end & SDSTS_DESE != 0) as u8, PCM_BYTES, STREAM_TAG,
         tag_bound0 & 0xFF, tag_ok as u8, wraps, consumed, rate_bps, expect_bps, np, ctl_running
     );
+    let dac_d0 = (0..np).all(|m| dac_actual[m] == 0);
+    let settled_max = (0..np).map(|m| settled_ms[m]).max().unwrap_or(0);
     serial_println!(
-        ":: HDA-TONE: lpib_advanced={} walked={} wraps={} bcis={} tag_ok={} fifo_ready={} run_ms={} members={} -> {} :: amp={} ::", // HDATONE2 (B215): the amplitude flown, as a SECOND `::` segment so `members=N -> PASS ::` stays contiguous for every scorer
+        ":: HDA-TONE: lpib_advanced={} walked={} wraps={} bcis={} tag_ok={} fifo_ready={} run_ms={} members={} -> {} :: amp={} :: run_bit={} run_readback_ok={} dac_pwr={} settled_ms={} run_reasserts={} stall_reasserts={} ::", // HDATONE2 (B215): the amplitude flown, as a SECOND `::` segment so `members=N -> PASS ::` stays contiguous for every scorer
         advanced as u8, walked as u8, wraps, bcis, tag_ok as u8, fifo_ready, run_ms, np,
-        if ok { "PASS" } else { "FAIL" }, tone::AMPLITUDE
+        if ok { "PASS" } else { "FAIL" }, tone::AMPLITUDE,
+        (run_ctl & SDCTL_RUN != 0) as u8, run_readback_ok as u8, if dac_d0 { "D0" } else { "D3" }, settled_max, run_reasserts, stall_reasserts
     );
     a.line("tone");
 }
@@ -2157,7 +2225,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
 /// BOOTSLOW — `probe()` once, from a device-service pass, after the root pass's verdict.
 pub fn probe_after_root() {
     static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    if DONE.load(core::sync::atomic::Ordering::Relaxed) || !crate::fs::bootdisk::root_pass_open("hda") {
+    if DONE.load(core::sync::atomic::Ordering::Relaxed) || !crate::fs::bootdisk::root_pass_open("hda") || { #[cfg(feature = "login")] { !crate::fs::users::desktop_allowed() } #[cfg(not(feature = "login"))] { false } } { // FIRSTBOOT (R77): no HDA bring-up (the boot tone) before the Desktop stage. LINE-NEUTRAL fold.
         return;
     }
     if DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
@@ -2309,4 +2377,19 @@ pub mod vol {
 /// `hda-tone`-gated, so this file-tail copy keeps VOLKEYS independent of that knob).
 fn tone_free_amp_payload(mute: bool, gain: u8) -> u32 {
     (1 << 15) | (1 << 13) | (1 << 12) | if mute { 1 << 7 } else { 0 } | (gain as u32 & 0x7F)
+}
+
+// ===================== HDATONE4 M3 — THE TONE IS A TEST, NOT A BOOT SIDE-EFFECT (R77) =====================
+// `probe()` at boot still resets, walks and censuses the codec; `run_tone` returns at its first line unless
+// `TONE_NOW` is set. `hda_tone_test()` sets it and re-runs the probe (the controller is reset and re-walked, as at
+// boot; `vol::capture` re-records the same path), then clears it. Returns true when a `:: HDA-TONE: … -> PASS ::`
+// line was printed by that run. Registration: `crate::tests::register("hda", …)` was not present at this tree
+// (tests.rs is firstboot3's) — the compiler executor registers `"hda"` -> `hda::hda_tone_test` at merge.
+#[cfg(feature = "hda-tone")]
+static TONE_NOW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "hda-tone")]
+pub fn hda_tone_test() {
+    TONE_NOW.store(true, core::sync::atomic::Ordering::Relaxed);
+    probe();
+    TONE_NOW.store(false, core::sync::atomic::Ordering::Relaxed);
 }

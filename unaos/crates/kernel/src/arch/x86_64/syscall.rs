@@ -15760,7 +15760,7 @@ pub fn u4x_launcher(demo_cpu: usize) {
     let wdeadline = crate::arch::ticks() + 10_000;
     while !U2_DONE.load(Ordering::Acquire) && crate::arch::ticks() < wdeadline {
         crate::arch::sched::yield_now();
-    }
+    } #[cfg(feature = "login")] { while !crate::fs::users::stage_resolved() && !crate::fs::users::desktop_allowed() { crate::arch::sched::yield_now(); } if !crate::fs::users::desktop_allowed() { serial_println!(":: FIRSTBOOT: witness chain HELD stage={} (R77: the first boot runs nothing but the installer; the tests are a verb fired from the desktop) ::", crate::fs::users::boot_stage().word()); return; } } // FIRSTBOOT (R77) — the ring-3 witness chain (u4x -> ... -> winx -> press batteries) waits for the boot stage and runs only at Desktop. SAME-LINE fold, line-neutral.
 
     // One-shot (spawned once; guard defensively).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -17426,7 +17426,7 @@ fn winx_build() -> Option<U7xFix> {
 /// the present counter still advances. The verdict is therefore about the SYSCALL SURFACE, which is what
 /// QEMU can honestly witness; the compositor binding is what `UNAOS_WC=1` on the bench proves.
 fn winx_launcher(demo_cpu: usize) {
-    static DONE: AtomicBool = AtomicBool::new(false);
+    static DONE: AtomicBool = AtomicBool::new(false); #[cfg(feature = "login")] if !crate::fs::users::desktop_allowed() { return; } // FIRSTBOOT (R77): no window demo or press battery before the Desktop stage.
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -17526,15 +17526,15 @@ fn winx_launcher(demo_cpu: usize) {
     // — and `hittest_selftest` goes first because its `focus_changed(0)` leg is the more disruptive of
     // the two and it restores `SHELL_Z`/`FOCUS_ASID` before returning.
     #[cfg(feature = "witness")]
-    { #[cfg(feature = "login")] { let t0 = crate::arch::ms(); while !crate::fs::users::loginst_settled() && crate::arch::ms().saturating_sub(t0) < 20_000 { core::hint::spin_loop(); } serial_println!("[clickroute] battery held {}ms for the loginst chain settled={} (LOGINORDER, B206 — B189 finding 1: the login fixtures open the screen and the screen swallows every press, so the click family waits for them; the bound is 20 s)", crate::arch::ms().saturating_sub(t0), crate::fs::users::loginst_settled()); } crate::video::wm::hittest_selftest(); } // LOGINORDER (B206) — ⚠ SAME-LINE fold, line-NEUTRAL: the wait rides the hittest statement's own line.
+    crate::tests::register("hittest", || { #[cfg(feature = "login")] { let t0 = crate::arch::ms(); while !crate::fs::users::loginst_settled() && crate::arch::ms().saturating_sub(t0) < 20_000 { core::hint::spin_loop(); } serial_println!("[clickroute] battery held {}ms for the loginst chain settled={} (LOGINORDER, B206 — B189 finding 1: the login fixtures open the screen and the screen swallows every press, so the click family waits for them; the bound is 20 s)", crate::arch::ms().saturating_sub(t0), crate::fs::users::loginst_settled()); } crate::video::wm::hittest_selftest(); }); // LOGINORDER (B206) — ⚠ SAME-LINE fold, line-NEUTRAL: the wait rides the hittest statement's own line.
     #[cfg(feature = "witness")]
-    { clickroute_selftest(); crate::video::termsel::pointer_selftest(); crate::video::termsel::termwrap_selftest(); } // TERMSEL2 — the pointer on the shell's text, driven through `wc_click_route_at` exactly as `clickroute_selftest` drives it, right after it and for its reason: it mints (and closes) a row of its own, so it belongs after every one-shot per-window latch and before `dock::selftest`, which must find NO `KERNEL_OWNER_DESKTOP` row. ⚠ FOLDED, line-neutral.
+    crate::tests::register("clickroute", || { clickroute_selftest(); crate::video::termsel::pointer_selftest(); crate::video::termsel::termwrap_selftest(); });// TERMSEL2 — the pointer on the shell's text, driven through `wc_click_route_at` exactly as `clickroute_selftest` drives it, right after it and for its reason: it mints (and closes) a row of its own, so it belongs after every one-shot per-window latch and before `dock::selftest`, which must find NO `KERNEL_OWNER_DESKTOP` row. ⚠ FOLDED, line-neutral.
     // DOCK — fourth of the click family. It mints three rows of its own and drives `focus_changed(0)`,
     // so it belongs here for the reason the two above do: after every one-shot per-window latch. It
     // runs after `clickroute_selftest` rather than before because it leaves a raised window behind
     // (that IS its verdict) and would otherwise change which owner the routing legs start from.
     #[cfg(all(feature = "witness", feature = "wc"))]
-    crate::video::dock::selftest();
+    crate::tests::register("dock", crate::video::dock::selftest);
     // CRYSTAL — the SHARD menu fixture. Runs after `dock::selftest` (which runs `menubar::selftest`),
     // so the bar tenant it enables is already proven present and flush. It enables the bar itself,
     // opens the menu off the crystal, resolves every item, fires the SAFE picks, and dismisses three
@@ -17542,14 +17542,14 @@ fn winx_launcher(demo_cpu: usize) {
     // so no gate can power the machine off (the PASS line printing after every leg is that guard's
     // own proof). See `crystal::selftest`.
     #[cfg(all(feature = "witness", feature = "wc"))]
-    crate::video::crystal::selftest();
+    crate::tests::register("crystal", crate::video::crystal::selftest);
     // CLICK-BAND — the band witness, PROVEN able to fire. `crystal::selftest` and `dock::selftest`
     // both call their `press_at` seams DIRECTLY, so nothing in the battery drove the ROUTER's band
     // arms — the very lines GR27's "menubar press inert" round was missing would themselves have
     // been unfired witnesses. This drives `wc_click_route_at` (the live seam) at the crystal, at a
     // point outside the open menu, and at the dock strip, and asserts one `band=` line per press.
     #[cfg(all(feature = "witness", feature = "wc"))]
-    { clickband_selftest(); menudrop_selftest(); serialdoor_selftest(); } // MENUDROP — the MENUBAR band, beside the two bands GR27 proved. Same `cfg` as the line it is folded onto, so no line is added and no panic `Location` moves (the `{ ptrdead_selftest(); lockfix_b1_selftest(); }` idiom, this ladder's own). AFTER `clickband_selftest` because that fixture reads `CLICK_BAND_LOG_X86` as a delta and asserts `owed == 3`: this one adds two more band lines and would red it from in front. BEFORE `wmdirect_selftest`, which is deliberately last (it pins a row against the tiler); this one closes its window and restores the focus it took.
+    crate::tests::register("clickband", || { clickband_selftest(); menudrop_selftest(); serialdoor_selftest(); });// MENUDROP — the MENUBAR band, beside the two bands GR27 proved. Same `cfg` as the line it is folded onto, so no line is added and no panic `Location` moves (the `{ ptrdead_selftest(); lockfix_b1_selftest(); }` idiom, this ladder's own). AFTER `clickband_selftest` because that fixture reads `CLICK_BAND_LOG_X86` as a delta and asserts `owed == 3`: this one adds two more band lines and would red it from in front. BEFORE `wmdirect_selftest`, which is deliberately last (it pins a row against the tiler); this one closes its window and restores the focus it took.
     // WMDIRECT — third and last of the click family, and deliberately last: it MOVES a row (a drag
     // is a `move_to`, which pins the row against the tiler) and closes it under a live drag, so it
     // is the most disruptive of the three. Running it after the other two means neither of them can
@@ -17561,9 +17561,9 @@ fn winx_launcher(demo_cpu: usize) {
     // for the same reason. Putting the two adjacent means one stretch of the boot owns that
     // discard instead of two, and no fixture between them can lose an event to it.
     #[cfg(feature = "witness")]
-    { ptrdead_selftest(); lockfix_b1_selftest(); } // LOCKFIX-B1 — the input band's panel read driven across a HELD `WRITER` (rmbp-ledger B1). A BLOCK under the line above's `cfg`, so no line is added and no panic `Location` below moves — `apppin_selftest`'s fold at this ladder's tail is the pattern. Shares `ptrdead`'s cfg exactly and wants no more: it needs neither `wc` nor a window, only `WRITER` and `click_pointer_pos`, both compiled in every x86 build. PLACED HERE for the same reason `ptrdead` is the least disruptive fixture in the ladder — this one mints no row, touches no window table, moves no pointer and posts no event; it takes one lock, releases it, and reads a counter. The only ordering it needs is "after the pointer position is set", which every fixture above it has already done, and which is why its `(x,y)` is an OBSERVATION rather than an assertion (see the function's own note).
+    crate::tests::register("ptrdead", || { ptrdead_selftest(); lockfix_b1_selftest(); });// LOCKFIX-B1 — the input band's panel read driven across a HELD `WRITER` (rmbp-ledger B1). A BLOCK under the line above's `cfg`, so no line is added and no panic `Location` below moves — `apppin_selftest`'s fold at this ladder's tail is the pattern. Shares `ptrdead`'s cfg exactly and wants no more: it needs neither `wc` nor a window, only `WRITER` and `click_pointer_pos`, both compiled in every x86 build. PLACED HERE for the same reason `ptrdead` is the least disruptive fixture in the ladder — this one mints no row, touches no window table, moves no pointer and posts no event; it takes one lock, releases it, and reads a counter. The only ordering it needs is "after the pointer position is set", which every fixture above it has already done, and which is why its `(x,y)` is an OBSERVATION rather than an assertion (see the function's own note).
     #[cfg(all(feature = "witness", feature = "wc"))]
-    wmdirect_selftest();
+    crate::tests::register("wmdirect", wmdirect_selftest);
     // DMGOVLP — the overlap-forcing damage leg, and the ladder's new tail. Six kernel-band rows in
     // two overlapping groups, banded seeds driven with the REAL sprite parked on the three-way
     // stack: the boot-8 wedge class (banded drags + cursor-repaint storm under overlap) is only
@@ -17572,13 +17572,13 @@ fn winx_launcher(demo_cpu: usize) {
     // pinned (no later fixture may inherit a re-tiled panel — moot here, but the rule is the
     // rule), and it MOVES the real pointer, which no earlier fixture may inherit either.
     #[cfg(all(feature = "witness", feature = "wc"))]
-    crate::video::wm::dmgovlp_selftest();
+    crate::tests::register("dmgovlp", crate::video::wm::dmgovlp_selftest);
     // VUGRES (D-3 RESUMEPAINT) — the pause/resume first-present witness, both arms, and the
     // ladder's new tail. After DMGOVLP because its negative leg deliberately runs a 2 s bound down
     // (nothing after it should wait behind that), and it is otherwise the least disruptive fixture
     // here: it moves no pointer, re-tiles nothing, and its two rows are its own and closed on exit.
     #[cfg(all(feature = "witness", feature = "wc"))]
-    { vugres_selftest(demo_cpu); crate::video::dock::apppin_selftest(); crate::video::wm::vugprobe_selftest(); crate::video::wm::loginz_selftest(); crate::video::wm::wci_rollup(); } // APPPIN — the pinned-app round trip, LAST: it drives the REAL render body (press -> launch, close -> quit, press -> fresh launch), parks the real pointer over the relaunched shell window for the sprite leg, and closes what it opened. A block under the line above's cfg, so no line is added and `apppin_selftest` compiles only where `dock` does. || CURSOREMIT — and the FIXTURE-SCOPE ROLLUP the x86 track has never had, mirroring `arch::aarch64::syscall`'s single `wm::wci_rollup()` call. `[cursor11]`/`[flick2]` (and the whole `[wc-i]`/`[cursor3..8]`/`[cursor12]` chain under them) have exactly one other emitter, `pal::cursor::rollup_tick`, which needs a HID pointer talking for 5 s — q35's usb-tablet delivers ONE report at the base, so that block printed ZERO lines on every x86 gate ever run (rmbp-ledger A11). Folded onto this line rather than given its own: panic `Location`s below this function are load-bearing, so the ladder's line count may not change. LAST, not at aarch64's pre-`hittest_selftest` position: that placement exists so the hit-test fixture's synthetic rows cannot perturb the counters, and here the whole click/drag/damage ladder ABOVE is what makes the counters non-zero at all — a rollup taken before it would print a vacuous all-zero `UNWITNESSED` block. Under this line's `wc` cfg and no wider: a knob-off x86 build has no compositor for the block to describe, and `x86-default.spec`'s capture stays byte-identical. || VUGPROBE (B142) — the DRIVEN pace-shadow fixture, folded onto this line for the same panic-`Location` reason everything else in this block is. It goes AFTER `apppin_selftest` and BEFORE `wci_rollup`: it mints one ring-3-band row, presents it twice inside one frame so the pacer coalesces and creates the shadow at a real present boundary, runs one `composite()` so `pace_pin_probe` has a population, and closes the row — so it must not run before a fixture that asserts a window-table census (every fixture above it does), and the cursor rollup must see the passes it ran rather than be taken in front of them. It moves no pointer, re-tiles nothing, focuses nothing, and leaves the table as it found it, which is why it can sit between those two. See `wm::vugprobe_selftest`.
+    crate::tests::register("vugres", || { vugres_selftest(TESTS_DEMO_CPU.load(Ordering::Relaxed)); crate::video::dock::apppin_selftest(); crate::video::wm::vugprobe_selftest(); crate::video::wm::loginz_selftest(); crate::video::wm::wci_rollup(); });// APPPIN — the pinned-app round trip, LAST: it drives the REAL render body (press -> launch, close -> quit, press -> fresh launch), parks the real pointer over the relaunched shell window for the sprite leg, and closes what it opened. A block under the line above's cfg, so no line is added and `apppin_selftest` compiles only where `dock` does. || CURSOREMIT — and the FIXTURE-SCOPE ROLLUP the x86 track has never had, mirroring `arch::aarch64::syscall`'s single `wm::wci_rollup()` call. `[cursor11]`/`[flick2]` (and the whole `[wc-i]`/`[cursor3..8]`/`[cursor12]` chain under them) have exactly one other emitter, `pal::cursor::rollup_tick`, which needs a HID pointer talking for 5 s — q35's usb-tablet delivers ONE report at the base, so that block printed ZERO lines on every x86 gate ever run (rmbp-ledger A11). Folded onto this line rather than given its own: panic `Location`s below this function are load-bearing, so the ladder's line count may not change. LAST, not at aarch64's pre-`hittest_selftest` position: that placement exists so the hit-test fixture's synthetic rows cannot perturb the counters, and here the whole click/drag/damage ladder ABOVE is what makes the counters non-zero at all — a rollup taken before it would print a vacuous all-zero `UNWITNESSED` block. Under this line's `wc` cfg and no wider: a knob-off x86 build has no compositor for the block to describe, and `x86-default.spec`'s capture stays byte-identical. || VUGPROBE (B142) — the DRIVEN pace-shadow fixture, folded onto this line for the same panic-`Location` reason everything else in this block is. It goes AFTER `apppin_selftest` and BEFORE `wci_rollup`: it mints one ring-3-band row, presents it twice inside one frame so the pacer coalesces and creates the shadow at a real present boundary, runs one `composite()` so `pace_pin_probe` has a population, and closes the row — so it must not run before a fixture that asserts a window-table census (every fixture above it does), and the cursor rollup must see the passes it ran rather than be taken in front of them. It moves no pointer, re-tiles nothing, focuses nothing, and leaves the table as it found it, which is why it can sit between those two. See `wm::vugprobe_selftest`.
 }
 
 // =============================================================================================
@@ -21509,12 +21509,12 @@ fn u8x_launcher(demo_cpu: usize) {
     // demos, so its line lands in a stable position whether or not a NIC is present and whether or not
     // `smolnet` is compiled. Unconditional (no feature gate): the window verbs are core process surface,
     // and `video::wm` is arch-neutral and always compiled. aarch64 never reaches this launcher at all.
-    winx_launcher(demo_cpu);
+    TESTS_DEMO_CPU.store(demo_cpu, Ordering::Relaxed); crate::tests::register("winx", || winx_launcher(TESTS_DEMO_CPU.load(Ordering::Relaxed))); // R77 M3 — the ring-3 window demo and the desktop battery beneath it are `tests`, not boot side-effects
 
     // WINX-6: chain the STAT.ELF end-to-end witness right after the inline-fixture one, so the isolated
     // verb proof lands first and the shipping-artifact proof second. It gates on the boot volume
     // internally, so a run with no FAT volume (or no staged STAT.ELF) skips cleanly with one honest line.
-    winx2_launcher(demo_cpu);
+    crate::tests::register("winx-stat", || winx2_launcher(TESTS_DEMO_CPU.load(Ordering::Relaxed)));
 
     // WINX-6b: the headless ELF-loader witness. WINX-2 above needs a block device the headless x86 run
     // does not have, so this one synthesizes a real multi-segment ELF64 in memory and pushes it through
@@ -21524,16 +21524,17 @@ fn u8x_launcher(demo_cpu: usize) {
     // WINX-7: the threads + futex + input fixture, after the loader witness so the machinery it
     // builds on is proved first. Unconditional and headless-complete — it needs no block device and
     // no panel, only the scheduler.
-    winx7_launcher(demo_cpu);
+    crate::tests::register("winx-threads", || winx7_launcher(TESTS_DEMO_CPU.load(Ordering::Relaxed)));
 
     // WINX-8: the VUG.ELF end-to-end witness. Gates on the mounted volume internally, so a run with no
     // FAT volume (or no staged VUG.ELF) skips cleanly with one honest line naming the volume.
-    winx8_launcher(demo_cpu);
+    crate::tests::register("winx-vug", || winx8_launcher(TESTS_DEMO_CPU.load(Ordering::Relaxed)));
 
     // PULSE-1: the PULSE.ELF end-to-end witness, after WINX-8 so the two shipped-artifact proofs sit
     // together and the newest one lands last. Gates on the mounted volume internally, so a run with no FAT
     // volume (or no staged PULSE.ELF) skips cleanly with one honest line naming the volume.
-    pulsew_launcher(demo_cpu);
+    #[cfg(feature = "hda-tone")] crate::tests::register("hda", crate::drivers::hda::hda_tone_test); // R77 M3 — the HDA tone is a `tests hda` run (HDATONE4); under tests-at-boot this registration runs it at once
+    crate::tests::register("winx-pulse", || pulsew_launcher(TESTS_DEMO_CPU.load(Ordering::Relaxed))); crate::tests::source_done(crate::tests::SRC_DESK); // R77 M3 — the last desktop source: the boot line may print now
 
     // SOCK-2 (knob-on, x86-only): chain the ring-3 UDP round-trip demo LAST — after the whole storage
     // chain u9x drives (so its line lands after every other demo, in both storage and no-storage modes,
@@ -29539,3 +29540,7 @@ fn appmenu_fixture() {
     let reaped = rst == 0 && after.is_empty() && !crate::video::appmenu::has(owner);
     serial_println!(":: APPMENU: owner={} reaped empty={} -> {} ::", owner, reaped, if reaped { "PASS" } else { "FAIL" });
 }
+
+/// R77 M3 — the boot CPU the deferred window demos were to be spawned on; the registered fixtures are
+/// plain `fn()`s, so `demo_cpu` travels here (stored just before the first registration).
+static TESTS_DEMO_CPU: AtomicUsize = AtomicUsize::new(0);

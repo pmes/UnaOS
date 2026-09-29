@@ -1639,6 +1639,9 @@ REQUIRE :: PRTSCR-DIR-FIX: no session -> REFUSED reason=no-session .* -> PASS ::
 # --- lpib_advanced=1 bcis=0 tag_ok=1 fifo_ready=1 run_ms=1200 -> FAIL ::`. The `-> REFUSED` arms
 # --- (drivers/hda.rs:1457, :1566) miss the REQUIRE. Audibility is not on the wire and is not claimed.
 REQUIRE :: HDA-TONE: .* -> PASS ::
+# --- HDATONE4: boot 16 was silent (lpib=0, RUN read back clear, DAC actual=D3). The RUN bit must read back set (re-asserted if not) and the DAC settle to D0.
+REQUIRE :: HDA-TONE: .* -> PASS :: amp=\d+ :: run_bit=1 run_readback_ok=1 dac_pwr=D0 settled_ms=\d+ 
+FORBID :: HDA-TONE: .* run_readback_ok=0
 # --- HDATONE3 (B218): the buffer carries a 20 ms fade at both ends (edges exactly 0), the knobs are named on the wire,
 # --- and the codec's own rate read-back + supported-rates word ride the amp line. FORBID pins the FAIL arm.
 REQUIRE :: HDA-PCM: amp=\d+ .* sine_ok=1 le_ok=1 frames=\d+ hz=(220|440) secs=[1-3] fade_ms=20 edge0=0 edge_last=0 -> PASS ::
@@ -1653,7 +1656,8 @@ REQUIRE :: kepler: vblank selftest arm=wait sim=timer .* :: PASS ::
 REQUIRE :: kepler: vblank selftest arm=wait sim=stuck .* :: GO-RED-OK ::
 # --- KVBLANK4 (B192's falsifier answered; R71): the ISR's ack re-arms the vblank bit on the same write, so a
 # --- 62-vblank window delivers ~62 messages, not 1; `broken=1` is the flight-13..15 shape under the old ack.
-REQUIRE :: KVBLANK4: irq=\d+ vbl=62 ratio_pct=\d+ fixed_isr=rearm broken=1 -> PASS ::
+REQUIRE :: KVBLANK4: irq=\d+ vbl=62 ratio_pct=\d+ fixed_isr=rearm broken=1 rearm_written=00000001 vbwait_mode=poll -> PASS ::
+# KVBLANK5: the ISR books (isr_calls/acks/rearms/rearm_written/rearm_readback) print on the metal close + census lines only (QEMU has no Kepler); the fixture line carries rearm_written= so the field is pinned here.
 FORBID :: KVBLANK4: .* -> FAIL
 #
 # --- THE NEGATIVE PINS THE FLIGHTS TAUGHT. `GATE STOLEN` and `REHOMED the render role` are already
@@ -1735,3 +1739,6 @@ REQUIRE :: PORTROUTE: xusb2pr=0x[0-9a-f]+ pssen=0x[0-9a-f]+ mask=0x[0-9a-f]+ swi
 OPTIONAL :: USBNET-EHCI: addr=\d+ mac=[0-9a-f:]{17} link=(up|down) -> PASS ::
 OPTIONAL :: USBNET-EHCI: datapath=stub next=bulk-in-out == witness ::
 FORBID :: USBNET-EHCI: .* -> FAIL ::
+# USBNET3: the xHCI-path AX88179 reading. QEMU has no AX88179, so no QEMU lane can produce it: OPTIONAL (metal, UNAOS_USBNET=1 + the dongle on an xHCI port).
+OPTIONAL :: USBNET: bus=xhci slot=\d+ mac=[0-9a-f:]{17} link=(up|down) speed=\d+ usb=(ss|hs|fs|\?) rx=\d+ tx=\d+ .* -> PASS ::
+FORBID :: USBNET: bus=xhci .* -> FAIL ::

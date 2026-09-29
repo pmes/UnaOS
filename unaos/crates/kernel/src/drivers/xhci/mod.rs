@@ -17228,6 +17228,7 @@ impl XhciController {
         if slot == 0 {
             return;
         }
+        if usbnet::kind() == usbnet::KIND_AX88179 { self.usbnet_ax_poll(slot); }
         let (in_ep, out_ep, data_phys) = {
             let s = &self.slots[slot as usize];
             let dp = match s.scsi_data_buffer { Some(p) => p as u64, None => return };
@@ -17370,6 +17371,37 @@ impl XhciController {
         unsafe { core::ptr::copy_nonoverlapping(v.to_le_bytes().as_ptr(), buf as *mut u8, 2) };
         matches!(self.sync_control(slot, 0x40, usbnet::ax::REQ_PHY, usbnet::ax::PHY_ID, reg, 2, buf, false), Ok(1) | Ok(13))
     }
+    /// AX88179 PHY (MII) register read: vendor request 0x02, bmRequestType 0xC0, wValue = phy id, wIndex = mii reg.
+    fn ax_phy_read(&mut self, slot: u8, reg: u16) -> Option<u16> {
+        let buf = self.slots[slot as usize].descriptor_buffer as u64;
+        if buf == 0 {
+            return None;
+        }
+        dma_coherency::clean(buf as usize, 64);
+        if !matches!(self.sync_control(slot, 0xC0, usbnet::ax::REQ_PHY, usbnet::ax::PHY_ID, reg, 2, buf, true), Ok(1) | Ok(13)) {
+            return None;
+        }
+        dma_coherency::inval(buf as usize, 64);
+        let mut b = [0u8; 2];
+        unsafe { core::ptr::copy_nonoverlapping(buf as *const u8, b.as_mut_ptr(), 2) };
+        Some(u16::from_le_bytes(b))
+    }
+    /// USBNET3: the non-blocking link poll — PHYSR (link, speed, duplex) on a cadence; on link-up the medium
+    /// mode is rewritten for the negotiated speed (the bring-up wrote a provisional one); the witness follows.
+    fn usbnet_ax_poll(&mut self, slot: u8) {
+        let now = crate::arch::ms();
+        if usbnet::poll_due(now) {
+            let physr = self.ax_phy_read(slot, usbnet::ax::GMII_PHY_PHYSR);
+            let mut l = [0u8; 1];
+            let _ = self.ax_read(slot, usbnet::ax::REG_PHYSICAL_LINK_STATUS, &mut l);
+            if let Some(m) = usbnet::link_seen(now, physr, l[0]) {
+                if !self.ax_write(slot, usbnet::ax::REG_MEDIUM_STATUS_MODE, &m.to_le_bytes()) {
+                    serial_println!("[usbnet] MEDIUM_STATUS_MODE rewrite refused for {:#06x}", m);
+                }
+            }
+        }
+        usbnet::witness_tick(now, slot);
+    }
     fn ax_wait_ms(ms: u64) {
         let t0 = crate::arch::ms();
         while crate::arch::ms().saturating_sub(t0) < ms {
@@ -17405,7 +17437,9 @@ impl XhciController {
         if !self.ax_write(slot, REG_MONITOR_MODE, &[0]) { usbnet::set_up(slot, false, Some("MONITOR_MODE")); return; }
         if !self.ax_write(slot, REG_RX_CTL, &RX_CTL_RUN.to_le_bytes()) { usbnet::set_up(slot, false, Some("RX_CTL")); return; }
         if !self.ax_write(slot, REG_MEDIUM_STATUS_MODE, &MEDIUM_RUN.to_le_bytes()) { usbnet::set_up(slot, false, Some("MEDIUM_STATUS_MODE")); return; }
-        let phy_ok = self.ax_phy_write(slot, 0, BMCR_ANEG_RESTART);
+        // PHY: advertise 10/100 + pause and 1000 full (MII ADVERTISE, CTRL1000), then restart autoneg (BMCR).
+        let phy_ok = self.ax_phy_write(slot, MII_ADVERTISE, ADVERTISE_ALL_PAUSE) && self.ax_phy_write(slot, MII_CTRL1000, ADVERTISE_1000FULL) && self.ax_phy_write(slot, MII_BMCR, BMCR_ANEG_RESTART);
+        usbnet::poll_start(crate::arch::ms(), link[0]);
         let mut medium = [0u8; 2];
         let _ = self.ax_read(slot, REG_MEDIUM_STATUS_MODE, &mut medium);
         serial_println!(
