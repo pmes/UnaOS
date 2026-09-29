@@ -16739,7 +16739,7 @@ unsafe fn decode_boot_keyboard(
                 }
             }
         }
-        crate::pal::typematic_note_report(newest_press, &held[..hn]); for &kc in cur_keys.iter() { if kc > 1 && !prev_keys.contains(&kc) { let _ = crate::video::status::volkey_usage(kc); } } // VOLKEYS: F10/F11/F12 press edges -> mute/down/up (codec amp + bar indicator)
+        crate::pal::typematic_note_report(newest_press, &held[..hn]); for &kc in cur_keys.iter() { if kc > 1 && !prev_keys.contains(&kc) { #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let _ = crate::video::status::volkey_usage(kc); } } // VOLKEYS: F10/F11/F12 press edges -> mute/down/up (codec amp + bar indicator)
     }
 
     // The release edges. Bounded by six per report, and a human's key releases are human-rate, so

@@ -29395,7 +29395,7 @@ pub fn title_dblclick(id: WinId, now_ms: u64) -> bool {
 }
 
 /// Zoom `id` from a title double-click, naming `action=zoom` on the `[wm-act]` line.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+// (ungated: the x86 syscall click router calls it without a wc gate)
 pub fn zoom_titled(id: WinId, owner: u64, x: i32, y: i32) -> &'static str {
     let settle = zoom(id);
     wm_act("zoom", id, owner, settle, x as i64, y as i64);
