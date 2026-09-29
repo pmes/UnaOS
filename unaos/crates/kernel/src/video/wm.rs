@@ -29534,3 +29534,21 @@ fn wcd_heap_tick() {
 #[cfg(not(feature = "witness"))]
 #[inline(always)]
 fn wcd_heap_tick() {}
+/// FIRSTBOOT (R77): [`close_all_furniture`] except `keep` (the installer's own window). Returns the closed count.
+pub fn close_all_furniture_except(keep: WinId) -> usize {
+    let mut ids = [WIN_NONE; MAX_WINDOWS];
+    let mut n = 0usize;
+    {
+        let t = table();
+        for r in t.rows.iter() {
+            if r.used && !r.compat && r.id != keep && n < MAX_WINDOWS {
+                ids[n] = r.id;
+                n += 1;
+            }
+        }
+    }
+    for &id in &ids[..n] {
+        close(id);
+    }
+    n
+}

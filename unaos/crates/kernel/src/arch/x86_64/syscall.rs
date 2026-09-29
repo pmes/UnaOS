@@ -15760,7 +15760,7 @@ pub fn u4x_launcher(demo_cpu: usize) {
     let wdeadline = crate::arch::ticks() + 10_000;
     while !U2_DONE.load(Ordering::Acquire) && crate::arch::ticks() < wdeadline {
         crate::arch::sched::yield_now();
-    }
+    } #[cfg(feature = "login")] { while !crate::fs::users::stage_resolved() && !crate::fs::users::desktop_allowed() { crate::arch::sched::yield_now(); } if !crate::fs::users::desktop_allowed() { serial_println!(":: FIRSTBOOT: witness chain HELD stage={} (R77: the first boot runs nothing but the installer; the tests are a verb fired from the desktop) ::", crate::fs::users::boot_stage().word()); return; } } // FIRSTBOOT (R77) — the ring-3 witness chain (u4x -> ... -> winx -> press batteries) waits for the boot stage and runs only at Desktop. SAME-LINE fold, line-neutral.
 
     // One-shot (spawned once; guard defensively).
     static DONE: AtomicBool = AtomicBool::new(false);
@@ -17426,7 +17426,7 @@ fn winx_build() -> Option<U7xFix> {
 /// the present counter still advances. The verdict is therefore about the SYSCALL SURFACE, which is what
 /// QEMU can honestly witness; the compositor binding is what `UNAOS_WC=1` on the bench proves.
 fn winx_launcher(demo_cpu: usize) {
-    static DONE: AtomicBool = AtomicBool::new(false);
+    static DONE: AtomicBool = AtomicBool::new(false); #[cfg(feature = "login")] if !crate::fs::users::desktop_allowed() { return; } // FIRSTBOOT (R77): no window demo or press battery before the Desktop stage.
     if DONE.swap(true, Ordering::Relaxed) {
         return;
     }

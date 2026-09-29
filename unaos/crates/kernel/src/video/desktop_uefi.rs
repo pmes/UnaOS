@@ -720,6 +720,12 @@ pub fn desktop_app_service() {
     if DONE.load(Ordering::Relaxed) {
         return;
     }
+    // FIRSTBOOT (R77): STAT.ELF is desktop furniture — held until the boot stage is Desktop (no root password
+    // -> nothing but the setter; no user -> the create-user form; the desktop ignites for that user).
+    #[cfg(feature = "login")]
+    if !crate::fs::users::desktop_allowed() {
+        return;
+    }
     // The same storage gate `fat::probe_once` uses, for the same reason: `mount()` on a boot whose
     // xHCI has not yet enumerated a stick is a "no volume" that means "not yet", not "not ever", and
     // consuming the one-shot on it would refuse a launch the media could have served.
