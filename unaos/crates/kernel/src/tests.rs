@@ -104,6 +104,7 @@ pub fn run(name: Option<&str>) -> usize {
 
 /// The `tests` shell verb: `tests` (all) · `tests <name>` · `tests list`.
 pub fn shell_verb(args: &[&str], console: &mut Console) {
+    #[cfg(feature = "login")]
     if !crate::fs::users::desktop_allowed() {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;

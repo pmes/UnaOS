@@ -21533,6 +21533,7 @@ fn u8x_launcher(demo_cpu: usize) {
     // PULSE-1: the PULSE.ELF end-to-end witness, after WINX-8 so the two shipped-artifact proofs sit
     // together and the newest one lands last. Gates on the mounted volume internally, so a run with no FAT
     // volume (or no staged PULSE.ELF) skips cleanly with one honest line naming the volume.
+    #[cfg(feature = "hda-tone")] crate::tests::register("hda", crate::drivers::hda::hda_tone_test); // R77 M3 — the HDA tone is a `tests hda` run (HDATONE4); under tests-at-boot this registration runs it at once
     crate::tests::register("winx-pulse", || pulsew_launcher(TESTS_DEMO_CPU.load(Ordering::Relaxed))); crate::tests::source_done(crate::tests::SRC_DESK); // R77 M3 — the last desktop source: the boot line may print now
 
     // SOCK-2 (knob-on, x86-only): chain the ring-3 UDP round-trip demo LAST — after the whole storage
