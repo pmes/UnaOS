@@ -2357,6 +2357,10 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     if crate::video::fileview::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::settings::key_route(ev) || crate::video::activity::key_route(ev) {
         return true;
     }
+    #[cfg(feature = "facet")]
+    if crate::video::facet::key_route(ev) {
+        return true;
+    }
     // QSCROLL — the WHEEL arrives here, at the seam that already exists, because this function is
     // handed the whole `pal::Event` rather than a keycode and `arch/aarch64/syscall.rs` is a
     // byte-identity-critical file no arc may add a line to (PARITY.md §5.3). The name is a keyboard

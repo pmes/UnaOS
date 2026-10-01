@@ -879,6 +879,12 @@ FORBID :: WALLPAPER: .* -> FAIL ::
 REQUIRE :: FILEVIEW: path=\S+ bytes=[0-9]+ lines=[1-9][0-9]* rows=[1-9][0-9]* wrapped=[0-9]+ -> PASS ::
 FORBID :: FILEVIEW: .* -> FAIL ::
 FORBID \[fileview\] refuse 
+# --- IMGVIEW (R75): the image viewer (video/facet.rs, UNAOS_FACET=1 is in this lane's gate). `tests imgview` writes a
+# --- 64x64 RGBA and a 16x16 palette PNG, opens, zooms (+ Fit), browses, opens the palette file, browses back, shows a
+# --- refusal window for a junk file, closes and unlinks. GO-RED: a decoder that mis-reads colour type 3/6, a zoom
+# --- that does not step, or a refusal that shows no window prints `-> FAIL ::`.
+REQUIRE :: IMGVIEW: path=\S+ WxH=64x64 zoom=[0-9]+ fit=[01] browse_n=[0-9]+ colour=rgba pal=1 refusal-window=1 -> PASS ::
+FORBID :: IMGVIEW: .* -> FAIL ::
 # --- DOCKRUN — the running tile's gestures: a window mints a tile with the running pip, a press raises it,
 # --- a right-click/long-press menu's Quit closes the owner and the tile leaves.
 REQUIRE :: DOCKRUN: tiles=\d+ running=\d+ pinned=\d+ raise=ok quit=ok menu_drawn=1 -> PASS ::
