@@ -348,6 +348,11 @@ pub fn source() -> ClockSource {
     (*UNIX_ANCHOR.lock()).as_ref().map(|a| a.source).unwrap_or(ClockSource::Unset)
 }
 
+/// TESTFIX2 — [`source`] for the compositor path: `try_lock`, never spins; contended reads as `Unset`.
+pub fn try_source() -> ClockSource {
+    UNIX_ANCHOR.try_lock().and_then(|g| g.as_ref().map(|a| a.source)).unwrap_or(ClockSource::Unset)
+}
+
 /// Drop the civil (Unix) anchor, returning the clock to the honest UNSET state (`unix_now()` → `None`,
 /// `source()` → `Unset`). Symmetric with `set_anchor`; used by the CLOCK-3 FAT-stamp witness to leave
 /// the civil clock EXACTLY as it found it after a deterministic self-test anchor. Does NOT touch the
