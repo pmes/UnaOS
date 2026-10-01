@@ -733,7 +733,6 @@ fn edge(vline: u32) {
     VB_PHASE1.store(vline + 1, Ordering::Relaxed);
     if !IN_PUMP.load(Ordering::Relaxed) {
         LAST_COMP_EDGE_MS.store(crate::arch::ms(), Ordering::Relaxed);
-        pump_spawn_once();
     }
     // KVBLANK2 — the three rungs, driven by the EDGE and by nothing else. Sited here because an
     // edge is the only moment at which "a bounded number of vblanks" is a measurable quantity, and
@@ -1649,7 +1648,8 @@ fn vbwait_mode() -> &'static str {
     if VB_WAIT_VIA_IRQ.load(Ordering::Relaxed) > VB_WAIT_VIA_POLL.load(Ordering::Relaxed) { "irq" } else { "poll" }
 }
 
-fn pump_spawn_once() {
+/// Task-context only (called from the desktop-ready site beside `wcpar::start()`); never from `edge()`.
+pub fn pump_spawn_once() {
     if PUMP_SPAWNED.load(Ordering::Relaxed) || VB_BAR0.load(Ordering::Acquire) == 0 {
         return;
     }

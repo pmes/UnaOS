@@ -14,5 +14,9 @@ Milestones
 
 Pins: `x86-witness.spec:1659` still matches on QEMU (fixture's `vbwait_mode` is `poll` there; no Kepler, pump never spawns — `VB_BAR0==0`). No spec change, no new knob.
 
+Confirmed on the in-tree boot-17 log (`f17-boot1.log`): no `vblank head=0` line between 8.3 s and 23.7 s; at 23.7 s `count=958 seen=25 vbwaits=4` (the sampler saw ~2.6% of vblanks), then `count=1567 seen=35 vbwaits=7` at 33.8 s; census `count_delta=921/609` between samples 2-4. The ladder is paced by compositor hold calls, not vblanks: starvation confirmed.
+
+Revision: the pump is spawned by `pump_spawn_once()` (task context) from `video/desktop_uefi.rs` beside `wcpar::start()`, not from `edge()` (which runs under `beam::hold` with IRQs masked and COMP_GATE held); `edge()` keeps only atomic bookkeeping.
+
 ## Written
 Boot 18 should show: `rung3 scheduled=boot` early (during the installer), `vector close … mode=irq deliver=msi` within ~60 vblanks of the census finishing, `books … kept_live=1`, then each second `vector census … mode=irq isr_calls≈acks≈rearms_isr` climbing, `stuck=0`, `vbwait_mode=irq`, and a `vector shutdown` line on shutdown. If `stuck` grows the W1C ack guess (KVBLANK5 M2) is wrong.
