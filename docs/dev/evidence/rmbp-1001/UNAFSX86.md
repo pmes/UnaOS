@@ -39,9 +39,9 @@ over its block layer through `fs/unafs.rs`'s SDSEAM handle routing. No second st
   bootloader still finds the ESP as partition 1), p2 = a `tools/unafs init` volume (size
   `UNAOS_X86_UNAFS_MB`, default 512, capped at 2048 MiB). `install ssd` does NOT yet mirror p2: its
   dry run says so in a line of its own when the image carries `unafs`.
-* **M4 — fixture.** `tests unafs`: create `/home/.unafsx86` on the root, write, re-read through
+* **M4 — fixture.** `tests unafs`: create `/home/unafsx86.tst` on the root (through the mount table), write, re-read through
   `with_unafs` (the remount half: drop the cached mount, rebind), set+get `owner` through the
-  crate's existing attribute API, delete. SKIP on a FAT root.
+  crate's existing attribute API, unlink. Wire: `:: UNAFSX86-T: root=unafs create=ok write=ok remount-read=ok owner=ok unlink=ok -> PASS ::`, or `root=<vol> (not unafs) -> SKIP`.
 
 ## The contract PREFS consumes
 
