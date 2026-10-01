@@ -7314,8 +7314,7 @@ pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event { #[cfg(featu
     // ⚠ LINE-NEUTRAL fold (four comment lines in, four out): this file is x86-only so `kernel8.img`'s panic-`Location` proof is untouched either way, but the idiom is the tree's and is kept.
     // QUARRYDOOR (KEYDOORS F1) — `|| quarry::key_route(raw)`: on x86 the file manager had NO KEY DOOR AT ALL. `video/mod.rs:685` compiles `quarry` under `wc` on this arch too, but `wc_route_event` never asked it and neither does `user_input_enqueue` here (x86's ring door has no key interception — this wrapper IS x86's interception), so <Esc>, the arrows, <Enter>, Backspace, `r` and the wheel had ZERO reachable consumers on this board. Asked in the SAME position as the two aarch64 doors: after `strip::key_escape` (a menu composites above Quarry, so the modal surface wins) and ahead of `wc_focus_key` (an open file manager eats its own arrows before the focus ring). `key_route` gates on `focus_asid() == OWNER && on_glass()` since SO9FIX 63b109f6 (was `on_glass()` alone — SO9), so a closed Quarry consumes nothing and this is behaviour-alike on every boot without one. Folded into the existing condition — no line added, the idiom this block already states.
     #[cfg(feature = "login")] if crate::fs::users::screen_up() && matches!(raw, crate::pal::Event::Key(_) | crate::pal::Event::KeyUp(_)) { if let crate::pal::Event::Key(c) = raw { let _ = crate::fs::users::screen_key(c); } return crate::pal::Event::Unknown; } #[cfg(feature = "wc")] // LOGIN13 M3 (R63) — THE SCREEN IS THE FIRST TAKER OF EVERY KEY while it is up: ahead of the Esc/Quarry doors, the Tab focus ring (`wc_focus_key`) and the focused ring (`user_input_route`). Flight 12's keys went to `[wc-c] focus tab-cycle` and the desktop because every one of those was asked first and the screen was asked last, in the render loop's fallback (`main.rs`, after this router). A key-UP is swallowed too, so no app sees half a keystroke. The SERIALDOOR arm on the signature line stays first: a wire byte is the console's, and the loop's own `screen_key` still hands it to the screen. ⚠ LINE-NEUTRAL fold.
-    if crate::video::shortcuts::overlay_key(raw) || crate::video::strip::key_escape(raw) || crate::video::quarry::key_route(raw) || wc_action_quarry_held(raw) { // SHORTCUTS M2 — the overlay takes ANY key while up, ahead of every other door.
-    if crate::video::shotsel::route(raw) || crate::video::strip::key_escape(raw) || crate::video::quarry::key_route(raw) || wc_action_quarry_held(raw) { // SHOTREGION: the selection mode is the FIRST door (one atomic load idle): Esc, the press/drag/release and the chords belong to it while it is up.
+    if crate::video::shortcuts::overlay_key(raw) || crate::video::shotsel::route(raw) || crate::video::strip::key_escape(raw) || crate::video::quarry::key_route(raw) || wc_action_quarry_held(raw) { // SHOTREGION: the selection mode is the FIRST door (one atomic load idle): Esc, the press/drag/release and the chords belong to it while it is up.
         return crate::pal::Event::Unknown;
     }
     if wc_focus_key(raw) {
@@ -29595,6 +29594,8 @@ fn restore_gate(slot: usize, id: usize) -> bool {
         serial_println!("[wpace] restore win={} slot={} repaced=1 via={}", id, slot, via);
     }
     true
+}
+
 // ── ACTIVITY (R75) — the process table and the kill, for `video/activity.rs` ───────────────────────
 /// One live `PROCS` row as the ACTIVITY window shows it. `slot` is the wm owner key (`Proc::slot`,
 /// +1-biased); `bg` is the user-owned (operator-launched) bit — the ACL predicate.
@@ -29627,6 +29628,8 @@ pub fn act_kill(pid: u64) -> &'static str {
     let Some((slot, bg)) = found else { return "no such running process" };
     if !bg && !crate::fs::users::root_session() { return "denied: not yours"; }
     wc_close_click(crate::video::wm::WIN_NONE, slot)
+}
+
 // =================================================================================================
 // WINRESIZE (R75) — TAIL-APPENDED. The router half (the press arm folded onto `chrome_hit`'s line in
 // `wc_click_route_at`; motion/end ride `wm::drag_motion`/`drag_end`) and the `tests winresize` fixture.

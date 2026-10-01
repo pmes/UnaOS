@@ -29643,6 +29643,8 @@ pub fn frame_at(x: i32, y: i32, skip: WinId) -> Option<(WinId, usize, usize, usi
         }
     }
     best.map(|(id, _, (bx, by, bw, bh))| (id, bx, by, bw, bh))
+}
+
 // =================================================================================================
 // WINRESIZE (R75) — TAIL-APPENDED. A window's frame is a resize handle: eight zones (edges
 // `RS_EDGE`, corners `RS_CORNER` panel px), a press+drag that re-sizes the row inside the capacity of
