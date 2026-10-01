@@ -25699,7 +25699,7 @@ fn fixture_abs<'a>(path: &'a str, buf: &'a mut [u8; 48]) -> &'a str {
 /// owner IS the asid) — by identity, not focus. Twin of `x86_64::syscall::user_input_push_owner`.
 #[cfg(feature = "desktop_firmware")]
 pub fn user_input_push_owner(owner: u64, packed: u64) -> bool {
-    if owner == 0 || owner as usize > uslots::USER_SLOTS {
+    if owner == 0 || owner as usize > super::uslots::USER_SLOTS {
         return false;
     }
     user_input_push(owner, packed)
@@ -25717,8 +25717,12 @@ fn armrouter_witness() {
     let df = cfg!(feature = "desktop_firmware");
     let lock = df && cfg!(feature = "login");
     let moved: u32 = if cfg!(feature = "witness") { 2 + 2 * cfg!(all(feature = "desktop_firmware", feature = "baremetal")) as u32 } else { 0 };
-    let seams = crate::video::brightkeys::step(0, false) == 0
-        && crate::video::brightkeys::step(crate::video::brightkeys::STEPS, true) == crate::video::brightkeys::STEPS
+    #[cfg(feature = "desktop_firmware")]
+    let bright_ok = crate::video::brightkeys::step(0, false) == 0
+        && crate::video::brightkeys::step(crate::video::brightkeys::STEPS, true) == crate::video::brightkeys::STEPS;
+    #[cfg(not(feature = "desktop_firmware"))]
+    let bright_ok = true;
+    let seams = bright_ok
         && crate::video::keymap::Action::CycleWindow.name() == "cycle-window"
         && crate::video::keymap::Action::LockScreen.name() == "lock-screen";
     serial_println!(

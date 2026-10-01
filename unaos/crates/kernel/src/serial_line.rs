@@ -143,7 +143,7 @@ pub fn emit(args: fmt::Arguments, nl: bool) {
         core::hint::spin_loop();
     }
     if lb.cut && !masked && !TRUNC_ANNOUNCED.swap(true, Relaxed) {
-        crate::serial_println!("[serial] trunc: a line exceeded {} bytes and was cut with `…` (count in :: SERIAL:)", LINE_MAX);
+        serial_println!("[serial] trunc: a line exceeded {} bytes and was cut with `…` (count in :: SERIAL:)", LINE_MAX);
     }
 }
 
@@ -198,5 +198,5 @@ pub fn census_poll() {
     }
     NEXT_CENSUS_MS.store(now.saturating_add(1000), Relaxed);
     let (l, m, t, d, dl, b) = census();
-    crate::serial_println!(":: SERIAL: lines={} merged_fixed={} trunc={} deferred={} defer_lost={} bypass={} -> PASS ::", l, m, t, d, dl, b);
+    serial_println!(":: SERIAL: lines={} merged_fixed={} trunc={} deferred={} defer_lost={} bypass={} -> PASS ::", l, m, t, d, dl, b);
 }

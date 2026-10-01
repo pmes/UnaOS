@@ -1145,7 +1145,7 @@ impl<T> Drop for HeldGuard<'_, T> {
 
 // BRIGHTKEYS — F1/F2 step the panel backlight (gmux) and light the bar's transient level item.
 // Appended, not inserted: this file is line-sensitive (panic::Location records).
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod brightkeys;
 // DIMIDLE — idle screen blanking (docs/dev/evidence/rmbp-0929/DIMIDLE.md). Both desktops.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
