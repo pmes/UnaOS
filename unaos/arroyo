@@ -2679,6 +2679,7 @@ fi
 #   UNAOS_HDA=1 UNAOS_HDATONE=1 UNAOS_HDA_AMP=8192 ./arroyo esp-x86
 # HDATONE3 (rmbp-ledger B218): three more build-time knobs, same `option_env!` idiom, none a cargo feature:
 #   UNAOS_HDA_HZ=<220|440>   tone pitch (anything else -> 440); UNAOS_HDA_SECS=<1..3>  buffer length in seconds (default 1);
+#   UNAOS_HDA_GPIO=<mask>    HDATONE6: Cirrus codec GPIO bits driven HIGH (decimal or 0x hex; default 0x08 = speaker amp, HP bit 0x02 held LOW); read by rustc via option_env!, no builder read.
 #   UNAOS_HDA_MEMBERS=1      force ONE DAC member (skips the association pair-walk; `members=1`).
 # `:: HDA-PCM: … hz= secs= fade_ms=` and `[hda] amp … rate= fmt_rd= pcmcaps=` on the wire name what an image carries.
 #   UNAOS_HDA=1 UNAOS_HDATONE=1 UNAOS_HDA_HZ=220 UNAOS_HDA_SECS=2 UNAOS_HDA_MEMBERS=1 ./arroyo esp-x86
