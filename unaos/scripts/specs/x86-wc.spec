@@ -645,7 +645,7 @@ FORBID \[status\] poll .* src=unresolved
 # one-frame barrier miss that healed the next frame (streak 1); the freeze shape is a REPEAT (streak >= 2).
 # mixed_frames / torn_rows / strand / score / severity / fps / ms ride the line as UNGATED diagnostics.
 # Go-red: PHASE.store(1, ..) reads streak_max=2 on the 2-frame QEMU population and trips the FORBID.
-REQUIRE :: VUGART: frames=[1-9]\d* coherent=\d+ torn_rows=\d+ mixed_frames=\d+ strand=\d+ score=\d+ streak_max=[01] severity=\d+ thr=streak<=1 beam=(held|off) fps=\d+ ms=\d+ -> PASS ::
+REQUIRE :: VUGART: frames=[1-9]\d* coherent=\d+ torn_rows=\d+ mixed_frames=\d+ strand=\d+ score=\d+ streak_max=[01] severity=\d+ thr=coherent==frames beam=(held|off) fps=\d+ ms=\d+ repaints=\d+ waits_us=\d+ -> PASS ::
 FORBID :: VUGART: .*streak_max=([2-9]|[1-9][0-9]+)
 FORBID :: VUGART: .* -> FAIL ::
 #

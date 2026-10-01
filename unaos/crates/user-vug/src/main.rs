@@ -1217,10 +1217,22 @@ static A_COHERENT: AtomicU32 = AtomicU32::new(0);
 static A_TORN: AtomicU32 = AtomicU32::new(0);
 #[cfg(target_arch = "x86_64")]
 static A_MIXED: AtomicU32 = AtomicU32::new(0);
-/// VUGART: the generation `art_strand` last charged, so `art_score` cannot charge it again if the
-/// barrier eventually completes and the frame does reach a present after all.
+/// STRAND: the generation each worker last ARRIVED for (the parent stamps it too when it repaints the
+/// band itself). The parent presents only when every live worker's word equals the frame's generation.
 #[cfg(target_arch = "x86_64")]
-static A_STRAND_GEN: AtomicU32 = AtomicU32::new(u32::MAX);
+static WGEN: [AtomicU32; 2] = [AtomicU32::new(u32::MAX), AtomicU32::new(u32::MAX)];
+/// STRAND: the generation that last CLAIMED each worker band. The worker and the parent's late-repaint both
+/// `swap` the frame's generation in; whoever reads back something else owns the band for that frame, the
+/// other skips it. One word, one winner: a late worker can never paint over a repainted band.
+#[cfg(target_arch = "x86_64")]
+static CLAIM: [AtomicU32; 2] = [AtomicU32::new(u32::MAX), AtomicU32::new(u32::MAX)];
+/// STRAND: bands the parent repainted itself (`repaints=`), barrier wait ticks (`waits_us=`), log counter.
+#[cfg(target_arch = "x86_64")]
+static A_REPAINTS: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_arch = "x86_64")]
+static A_WAIT_TICKS: AtomicU32 = AtomicU32::new(0);
+#[cfg(target_arch = "x86_64")]
+static A_SLOG: AtomicU32 = AtomicU32::new(0);
 #[cfg(target_arch = "x86_64")]
 static A_STRAND_MIXED: AtomicU32 = AtomicU32::new(0); // art_strand's genuine barrier misses
 #[cfg(target_arch = "x86_64")]
@@ -1334,44 +1346,160 @@ fn art_bad_rows(g: u32, abandoned: bool) -> u32 {
     bad_rows
 }
 
-/// VUGART — SCORE THE FRAME THE PARENT IS ABOUT TO ABANDON, and this is the hook that catches the
-/// defect Peter saw rather than a neighbour of it.
+/// STRAND (M1) — the barrier has outspun `BARRIER_SPIN_YIELDS` with a band still stale and nobody in it:
+/// a worker that was released and has not started. This USED to charge the frame as mixed on the spot
+/// (`strand=147 score=0` in boot 17) although the parent then waited and presented a finished surface;
+/// now it only COUNTS the event (`strand=`) and NAMES it on the wire. Whether the frame that reaches the
+/// present is coherent is `art_score`'s verdict alone, and `art_late` makes sure it is.
 ///
-/// `art_score` below runs immediately before the present, so it can only ever judge frames that
-/// REACH a present. The failure this arc is about does not: when a release is lost the workers never
-/// run, `DONE` never reaches `live`, and the parent BLOCKS at the barrier — with the new projection
-/// already published and its own band `BAND_PAR..SH` already rasterised from it. Nothing is
-/// presented, and `art_score` never runs, but the SURFACE IS ALREADY MIXED and the compositor
-/// composites a live window from the surface on the PANEL's cadence, not on this program's presents.
-/// So the eye sees a two-rotation crystal that no present ever announced, and a present-only
-/// instrument would have reported `mixed_frames=0` through the whole of it.
-///
-/// This fires exactly ONCE per stranded frame, on the pass where the parent stops spinning and
-/// starts parking — the moment it stops being "a slow frame" and becomes "a surface left this way".
-/// It EMITS immediately, because the parent may never come back to emit at all.
-///
-/// `A_STRAND_GEN` is the no-double-count latch: a barrier that eventually completes will go on to
-/// present, and `art_score` must not charge that frame a second time.
+/// Fires once per frame, on the pass where the parent stops spinning. `tw` is the barrier-entry tick.
 #[cfg(target_arch = "x86_64")]
-fn art_strand(g: u32, passes: u32) {
+fn art_strand(g: u32, passes: u32, tw: u32) {
     if passes != BARRIER_SPIN_YIELDS + 1 {
         return;
     }
-    let bad = art_bad_rows(g, true);
-    if bad == 0 {
-        return;
+    let late = art_tick().wrapping_sub(tw);
+    let mut b = 0usize;
+    let mut hit = false;
+    while b < 2 {
+        if BAND_GEN[b].load(Ordering::Acquire) != g && BAND_BUSY[b].load(Ordering::Acquire) == 0 {
+            hit = true;
+            art_log(g, b, late, 0);
+        }
+        b += 1;
     }
-    A_STRAND_GEN.store(g, Ordering::Relaxed);
-    A_FRAMES.fetch_add(1, Ordering::Relaxed);
-    A_MIXED.fetch_add(1, Ordering::Relaxed);
-    A_TORN.fetch_add(bad, Ordering::Relaxed);
-    A_STRAND_MIXED.fetch_add(1, Ordering::Relaxed);
-    art_streak(bad);
-    art_emit();
+    if hit {
+        A_STRAND_MIXED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
-fn art_strand(_g: u32, _passes: u32) {}
+fn art_strand(_g: u32, _passes: u32, _tw: u32) {}
+
+/// STRAND: the tick clock (0 is "unset", so a failed read is bumped to 1).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn art_tick() -> u32 {
+    (getinfo_ticks() as u32).max(1)
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn art_tick() -> u32 {
+    0
+}
+
+/// STRAND (M1): `[vug] strand gen= band= worker_gen= late_us= rep=` — which band was stale, which
+/// generation it still held, how long the parent had waited (tick resolution), and whether the line is the
+/// repaint decision (`rep=1`) or the spin-exhausted observation (`rep=0`). First 8, then one per 1024.
+#[cfg(target_arch = "x86_64")]
+fn art_log(g: u32, b: usize, late_ticks: u32, rep: u32) {
+    let n = A_SLOG.fetch_add(1, Ordering::Relaxed);
+    if n >= 8 && n % 1024 != 0 {
+        return;
+    }
+    let us = (late_ticks as u64 * 1_000_000 / (TICK_HZ as u64).max(1)).min(u32::MAX as u64) as u32;
+    let mut buf = Buf::new();
+    buf.put(b"[vug] strand gen=");
+    buf.put_dec(g);
+    buf.put(b" band=");
+    buf.put_dec(b as u32);
+    buf.put(b" worker_gen=");
+    buf.put_dec(BAND_GEN[b].load(Ordering::Acquire));
+    buf.put(b" late_us=");
+    buf.put_dec(us);
+    buf.put(b" rep=");
+    buf.put_dec(rep);
+    buf.put(b"\n");
+    buf.flush();
+}
+
+/// STRAND (M2): ticks the parent waits before it stops waiting for a late worker band and paints it.
+#[cfg(target_arch = "x86_64")]
+const LATE_TICKS: u32 = (TICK_HZ * 3 / 1000) as u32;
+
+/// STRAND (M2): worker side — own band `b` for generation `g`? false means the parent repainted it.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn art_claim(b: usize, g: u32) -> bool {
+    CLAIM[b].swap(g, Ordering::AcqRel) != g
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn art_claim(_b: usize, _g: u32) -> bool {
+    true
+}
+/// STRAND (M2): worker side — acknowledge generation `g` (painted or skipped), before the DONE bump.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn art_arrive(b: usize, g: u32) {
+    WGEN[b].store(g, Ordering::Release);
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn art_arrive(_b: usize, _g: u32) {}
+
+/// STRAND (M2): the barrier's exit test. x86: every worker band the parent is not painting inline has
+/// acknowledged generation `g` — a per-worker generation, not an arrival COUNT, so a late arrival from an
+/// older frame can never satisfy this frame. aarch64 keeps the arrival count (image unchanged).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn art_barrier_ok(_d: u32, _live: u32, g: u32, top: bool, bot: bool) -> bool {
+    (top || WGEN[0].load(Ordering::Acquire) == g) && (bot || WGEN[1].load(Ordering::Acquire) == g)
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn art_barrier_ok(d: u32, live: u32, _g: u32, _top: bool, _bot: bool) -> bool {
+    d >= live
+}
+
+/// STRAND (M2): called from the barrier once it has outspun the yield budget. Until `LATE_TICKS` have
+/// passed it yields (true = go round again); then, ONCE per frame, every worker band that has neither
+/// arrived nor been claimed is REPAINTED by the parent for generation `g` (the abandon path paints, it
+/// never skips) and stamped as acknowledged. A band a worker has claimed is in flight: the parent waits
+/// for it (false = park on `DONE`). Returns true after a repaint so the exit test is re-run first.
+#[cfg(target_arch = "x86_64")]
+fn art_late(g: u32, tw: u32, rep: &mut bool, top: bool, bot: bool, surf: *mut u8) -> bool {
+    if *rep {
+        return false;
+    }
+    let el = art_tick().wrapping_sub(tw);
+    if el < LATE_TICKS {
+        sys_yield();
+        return true;
+    }
+    *rep = true;
+    let mut b = 0usize;
+    while b < 2 {
+        let inl = if b == 0 { top } else { bot };
+        if !inl && WGEN[b].load(Ordering::Acquire) != g && art_claim(b, g) {
+            art_log(g, b, el, 1);
+            let (lo, hi) = if b == 0 { (0, BAND_MID) } else { (BAND_MID, BAND_PAR) };
+            art_begin(b);
+            unsafe { render_band(surf, lo, hi) };
+            art_end(b, g);
+            WGEN[b].store(g, Ordering::Release);
+            A_REPAINTS.fetch_add(1, Ordering::Relaxed);
+        }
+        b += 1;
+    }
+    true
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn art_late(_g: u32, _tw: u32, _rep: &mut bool, _top: bool, _bot: bool, _surf: *mut u8) -> bool {
+    false
+}
+
+/// STRAND (M2): after the barrier, charge the time spent in it (`waits_us=`). `tw == 0` = never waited.
+#[cfg(target_arch = "x86_64")]
+fn art_waited(tw: u32) {
+    if tw != 0 {
+        A_WAIT_TICKS.fetch_add(art_tick().wrapping_sub(tw), Ordering::Relaxed);
+    }
+}
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn art_waited(_tw: u32) {}
 
 /// VUGART: one mixed frame — extend the streak (latching its max) and latch the worst frame's rows.
 #[cfg(target_arch = "x86_64")]
@@ -1385,9 +1513,6 @@ fn art_streak(bad: u32) {
 /// present, after every writer this frame could legitimately have.
 #[cfg(target_arch = "x86_64")]
 fn art_score(g: u32) {
-    if A_STRAND_GEN.load(Ordering::Relaxed) == g {
-        return; // already charged to `mixed_frames` by `art_strand` — do not count the frame twice
-    }
     let bad_rows = art_bad_rows(g, false);
     let cl = A_CLASH.load(Ordering::Relaxed);
     let seen = A_CLASH_SEEN.swap(cl, Ordering::Relaxed);
@@ -1440,11 +1565,15 @@ fn art_emit() {
     buf.put_dec(streak_max);
     buf.put(b" severity=");
     buf.put_dec(A_MAX_TORN.load(Ordering::Relaxed));
-    buf.put(if option_env!("UNAOS_BEAM").is_some() { b" thr=streak<=1 beam=held fps=" as &[u8] } else { b" thr=streak<=1 beam=off fps=" }); // TEAR M3: the build's beam knob, so boot 18 reads torn_rows with and without. The gate bound: one isolated self-healing miss passes, a repeat fails
+    buf.put(if option_env!("UNAOS_BEAM").is_some() { b" thr=coherent==frames beam=held fps=" as &[u8] } else { b" thr=coherent==frames beam=off fps=" }); // STRAND: the gate is every presented frame coherent; TEAR M3: the build's beam knob, so boot 18 reads torn_rows with and without
     buf.put_dec(fps as u32);
     buf.put(b" ms=");
     buf.put_dec(ms as u32);
-    buf.put(if streak_max <= 1 {
+    buf.put(b" repaints=");
+    buf.put_dec(A_REPAINTS.load(Ordering::Relaxed));
+    buf.put(b" waits_us=");
+    buf.put_dec((A_WAIT_TICKS.load(Ordering::Relaxed) as u64 * 1_000_000 / (TICK_HZ as u64).max(1)).min(u32::MAX as u64) as u32);
+    buf.put(if A_MIXED.load(Ordering::Relaxed) == 0 {
         b" -> PASS ::\n" as &[u8]
     } else {
         b" -> FAIL ::\n"
@@ -2093,9 +2222,12 @@ extern "C" fn uvug_worker(arg: usize) -> ! {
         // precisely the "two rotations on one surface" the instrument exists to count. `arg` is the
         // band index by construction (0 = 0..BAND_MID, 1 = BAND_MID..BAND_PAR).
         let g = art_gen();
-        art_begin(arg);
-        unsafe { render_band(surf, y_lo, y_hi) };
-        art_end(arg, g);
+        if art_claim(arg, g) {
+            art_begin(arg);
+            unsafe { render_band(surf, y_lo, y_hi) };
+            art_end(arg, g);
+        }
+        art_arrive(arg, g); // STRAND: acknowledge generation g (painted, or skipped because the parent repainted)
         // Arrive: atomically bump `done`, then FUTEX WAKE the parent.
         DONE.fetch_add(1, Ordering::Release);
         futex_wake(core::ptr::addr_of!(DONE), 1);
@@ -2948,7 +3080,7 @@ fn surface_checksum(surf: *const u8) -> u64 {
 /// `pi4-regression.spec` pins cannot have moved. Nothing else about `Buf` changed: every existing
 /// caller puts the same bytes and the bound is still `self.b.len()`.
 #[cfg(target_arch = "x86_64")]
-const BUF_CAP: usize = 144; // TEAR M3: 112 -> 144, the beam= token is 10 bytes and the line was already near the old cap
+const BUF_CAP: usize = 192; // TEAR + STRAND: beam= (10 bytes) and repaints=/waits_us= joined the line
 #[cfg(not(target_arch = "x86_64"))]
 const BUF_CAP: usize = 64;
 struct Buf {
@@ -3643,12 +3775,17 @@ pub extern "C" fn _start() -> ! {
         // wait reaches the park after a bounded handful of syscalls, long enough that no healthy frame ever
         // does. `passes` still counts only PARKED passes, so `BARRIER_PASS_BUDGET` keeps its old meaning.
         let mut passes: u32 = 0;
+        let mut tw: u32 = 0; // STRAND: barrier-entry tick, taken on the first wait only (0 = never waited)
+        let mut repainted = false;
         while live > 0 {
             let d = DONE.load(Ordering::Acquire);
-            if d >= live {
+            if art_barrier_ok(d, live, gen, inline_top, inline_bot) {
                 break;
             }
             passes = passes.wrapping_add(1);
+            if passes == 1 {
+                tw = art_tick();
+            }
             if passes <= BARRIER_SPIN_YIELDS {
                 sys_yield();
             } else if passes == BARRIER_PASS_BUDGET {
@@ -3672,10 +3809,14 @@ pub extern "C" fn _start() -> ! {
             } else {
                 // VUGART: the pass where this stops being a slow frame and becomes a SURFACE LEFT
                 // MIXED. Fires once, emits immediately — the parent may never come back.
-                art_strand(gen, passes);
+                art_strand(gen, passes, tw);
+                if art_late(gen, tw, &mut repainted, inline_top, inline_bot, surf) {
+                    continue;
+                }
                 futex_wait(core::ptr::addr_of!(DONE), d);
             }
         }
+        art_waited(tw);
 
         // --- VUGFPS: measure, refresh once per second, draw (desktop/interactive only) ---
         // CLICK-PLAIN: the click counter rides the same gate, the same band and the same self-erasing
