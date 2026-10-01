@@ -1646,7 +1646,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
         );
     }
 
-    let sd = SD_BASE + (iss as u64) * SD_STRIDE;
+    let sd = SD_BASE + (iss as u64) * SD_STRIDE; np = solo_trim(&mut paths, &mut pchan, np); // HDATONE5 M2: `tests hda1`/`hda2` keep ONE member
     let pcm = dma_alloc(PCM_BYTES, 128);
     let bdl = dma_alloc(BDL_BYTES, BDL_ALIGN);
     if pcm == 0 || bdl == 0 {
@@ -1775,7 +1775,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     let saved_bdpl = r32(base, sd + SD_BDPL);
     let saved_bdpu = r32(base, sd + SD_BDPU);
     let saved_cbl = r32(base, sd + SD_CBL);
-    let saved_lvi = r16(base, sd + SD_LVI);
+    let saved_lvi = r16(base, sd + SD_LVI); let eapd_before = eapd_force(rings, cad, &paths, np, ws, a); // HDATONE5 M3: EAPD on, before/after printed
 
     let mut s = [Saved::default(); PAIR_MAX];
     let mut dac_actual = [0xFu8; PAIR_MAX]; // HDATONE4 M2: the DAC's ACTUAL power state after the settle poll (0xF = never read)
@@ -2002,7 +2002,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     w8(base, sd + SD_CTL, SDCTL_IOCE as u8);
     a.stream += 7;
 
-    let fmt_back = r16(base, sd + SD_FMT);
+    let fmt_back = r16(base, sd + SD_FMT); let disc = disc_read(base, sd, rings, cad, &paths, np, a); // HDATONE5 M1
     let cbl_back = r32(base, sd + SD_CBL);
     let lvi_back = r16(base, sd + SD_LVI);
     serial_println!(
@@ -2146,7 +2146,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
         }
     }
     // The GPIO set goes back in the mirror order of the drive: data, then direction, then enable.
-    if let Some((fg, mask, d0, dir0, en0)) = gpio_saved {
+    eapd_restore(rings, cad, &paths, np, &eapd_before, a); if let Some((fg, mask, d0, dir0, en0)) = gpio_saved {
         if rings.cmd(cad, fg, VERB_SET_GPIO_DATA, d0 as u32, a).is_some() {
             a.verbs_set += 1;
         }
@@ -2200,10 +2200,11 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     let dac_d0 = (0..np).all(|m| dac_actual[m] == 0);
     let settled_max = (0..np).map(|m| settled_ms[m]).max().unwrap_or(0);
     serial_println!(
-        ":: HDA-TONE: lpib_advanced={} walked={} wraps={} bcis={} tag_ok={} fifo_ready={} run_ms={} members={} -> {} :: amp={} :: run_bit={} run_readback_ok={} dac_pwr={} settled_ms={} run_reasserts={} stall_reasserts={} ::", // HDATONE2 (B215): the amplitude flown, as a SECOND `::` segment so `members=N -> PASS ::` stays contiguous for every scorer
+        ":: HDA-TONE: lpib_advanced={} walked={} wraps={} bcis={} tag_ok={} fifo_ready={} run_ms={} members={} -> {} :: amp={} :: run_bit={} run_readback_ok={} dac_pwr={} settled_ms={} run_reasserts={} stall_reasserts={} sdfmt={:#06x} chan={:?} eapd={:?} vendor={:04x}:{:04x} ::", // HDATONE2 (B215): the amplitude flown, as a SECOND `::` segment so `members=N -> PASS ::` stays contiguous for every scorer
         advanced as u8, walked as u8, wraps, bcis, tag_ok as u8, fifo_ready, run_ms, np,
         if ok { "PASS" } else { "FAIL" }, tone::AMPLITUDE,
-        (run_ctl & SDCTL_RUN != 0) as u8, run_readback_ok as u8, if dac_d0 { "D0" } else { "D3" }, settled_max, run_reasserts, stall_reasserts
+        (run_ctl & SDCTL_RUN != 0) as u8, run_readback_ok as u8, if dac_d0 { "D0" } else { "D3" }, settled_max, run_reasserts, stall_reasserts,
+        disc.sdfmt, &disc.chan[..np], &disc.eapd[..np], disc.vendor >> 16, disc.vendor & 0xFFFF
     );
     a.line("tone");
 }
@@ -2392,4 +2393,126 @@ pub fn hda_tone_test() {
     TONE_NOW.store(true, core::sync::atomic::Ordering::Relaxed);
     probe();
     TONE_NOW.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+// ===================== HDATONE5 — THE SCREECH SURVIVED THE RATE READBACK (boot 17) =====================
+// M1 `disc_read` prints the discriminators FLIGHT17 §2 (b)-(g) left: SDxFMT vs the converter's format, each DAC's stream/channel
+// word, each output pin's EAPD (read even where PIN_CAPS says "not capable"), the AFG power state, GPIO data/dir/enable, the codec
+// vendor/device. M2 `tests hda1` / `tests hda2` play ONE member (0 then 1). M3 `eapd_force` writes EAPD bit 1 on every member pin
+// (before/after printed) — and on a Cirrus (0x1013) codec names the Linux patch_cirrus.c GPIO policy. All read-only except EAPD.
+#[cfg(feature = "hda-tone")]
+static SOLO: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// 0 = both members (default), 1 = member 0 alone, 2 = member 1 alone.
+#[cfg(feature = "hda-tone")]
+pub fn hda_tone_test_solo(n: u8) {
+    SOLO.store(n, core::sync::atomic::Ordering::Relaxed);
+    hda_tone_test();
+    SOLO.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(feature = "hda-tone")]
+pub fn hda_tone_test_m0() { hda_tone_test_solo(1); }
+#[cfg(feature = "hda-tone")]
+pub fn hda_tone_test_m1() { hda_tone_test_solo(2); }
+
+/// M2: keep ONE member when a solo run is armed; returns the new member count. `chan` of the survivor is 0 (it is alone in the stream).
+#[cfg(feature = "hda-tone")]
+fn solo_trim(paths: &mut [Path; tone::PAIR_MAX], pchan: &mut [u8; tone::PAIR_MAX], np: usize) -> usize {
+    let sel = SOLO.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    if sel == 0 || np < 2 {
+        if sel != 0 {
+            serial_println!("[hda] tone member-solo={} IGNORED members={} (a solo run needs the pair)", sel - 1, np);
+        }
+        return np;
+    }
+    let k = if sel >= 2 { 1 } else { 0 };
+    paths[0] = paths[k];
+    pchan[0] = 0;
+    serial_println!("[hda] tone member-solo={} pin=0x{:02x} dac=0x{:02x} (the other member is NOT bound to the stream)", k, paths[0].pin, paths[0].dac);
+    1
+}
+
+/// M3: EAPD on every member pin, written whether or not PIN_CAPS says capable (CS4206: capable bit clear on 0x0a/0x0b). Returns the
+/// pre-write EAPD words for `eapd_restore`.
+#[cfg(feature = "hda-tone")]
+fn eapd_force(rings: &mut Rings, cad: u8, paths: &[Path; tone::PAIR_MAX], np: usize, ws: &[Widget; MAX_NODES], a: &mut Audit) -> [u32; tone::PAIR_MAX] {
+    use tone::*;
+    let mut before = [0xFFFF_FFFFu32; PAIR_MAX];
+    let vid = rings.cmd(cad, 0, VERB_GET_PARAMETER, PARAM_VENDOR_ID, a).unwrap_or(0);
+    a.verbs_get += 1;
+    let cirrus = (vid >> 16) == 0x1013;
+    if cirrus {
+        // Linux sound/pci/hda/patch_cirrus.c (CS420x): the speaker amp is switched by codec GPIOs, not by EAPD — `gpio_eapd_hp` /
+        // `gpio_eapd_speaker` bit masks per Apple model fixup (cs420x_fixup_gpio_13 / _23, cs4208_fixup_gpio0 …), `gpio_mask/dir/data`
+        // written at init and `cs_automute` flips the speaker bit when no headphone is plugged. The exact bits per MacBook model are NOT
+        // verified here; the driver's whole-GPIO-set drive (`[hda] gpio … -> set`) covers every bit and its `stuck=` field is the proof.
+        serial_println!("[hda] eapd cirrus vendor={:04x}:{:04x} linux=patch_cirrus.c speaker-amp=GPIO (gpio_eapd_speaker mask per model fixup; automute flips it) -> GPIO set above, EAPD written too", vid >> 16, vid & 0xFFFF);
+    }
+    for m in 0..np {
+        let pin = paths[m].pin;
+        let b = rings.cmd(cad, pin, VERB_GET_EAPD, 0, a).unwrap_or(0xFFFF_FFFF);
+        a.verbs_get += 1;
+        before[m] = b;
+        if rings.cmd(cad, pin, VERB_SET_EAPD, ((b & 0xFF) as u8 | EAPD_ENABLE) as u32, a).is_some() {
+            a.verbs_set += 1;
+        }
+        let after = rings.cmd(cad, pin, VERB_GET_EAPD, 0, a).unwrap_or(0xFFFF_FFFF);
+        a.verbs_get += 1;
+        serial_println!("[hda] eapd member={} pin=0x{:02x} pincap_eapd={} vendor={:04x}:{:04x} cirrus={} before={:#04x} after={:#04x} stuck={}",
+            m, pin, (ws[pin as usize].pincap & PINCAP_EAPD != 0) as u8, vid >> 16, vid & 0xFFFF, cirrus as u8, b & 0xFF, after & 0xFF, (after & 0x02 == 0) as u8);
+    }
+    before
+}
+
+/// Undo `eapd_force` (stream stopped).
+#[cfg(feature = "hda-tone")]
+fn eapd_restore(rings: &mut Rings, cad: u8, paths: &[Path; tone::PAIR_MAX], np: usize, before: &[u32; tone::PAIR_MAX], a: &mut Audit) {
+    for m in 0..np {
+        if before[m] != 0xFFFF_FFFF && rings.cmd(cad, paths[m].pin, tone::VERB_SET_EAPD, before[m] & 0xFF, a).is_some() {
+            a.verbs_set += 1;
+        }
+    }
+}
+
+/// M1 result, folded into the `:: HDA-TONE:` witness.
+#[cfg(feature = "hda-tone")]
+#[derive(Clone, Copy)]
+struct Disc { sdfmt: u16, chan: [u8; tone::PAIR_MAX], eapd: [u8; tone::PAIR_MAX], vendor: u32 }
+#[cfg(feature = "hda-tone")]
+impl Disc {
+    fn zero() -> Disc { Disc { sdfmt: 0, chan: [0xFF; tone::PAIR_MAX], eapd: [0xFF; tone::PAIR_MAX], vendor: 0 } }
+}
+
+/// M1: read-only discriminators, run after the stream descriptor is armed and before RUN.
+#[cfg(feature = "hda-tone")]
+fn disc_read(base: u64, sd: u64, rings: &mut Rings, cad: u8, paths: &[Path; tone::PAIR_MAX], np: usize, a: &mut Audit) -> Disc {
+    use tone::*;
+    let mut d = Disc::zero();
+    d.sdfmt = r16(base, sd + SD_FMT);
+    d.vendor = rings.cmd(cad, 0, VERB_GET_PARAMETER, PARAM_VENDOR_ID, a).unwrap_or(0);
+    a.verbs_get += 1;
+    for m in 0..np {
+        let conv = rings.cmd(cad, paths[m].dac, VERB_GET_CONVERTER_FORMAT, 0, a).unwrap_or(0xFFFF_FFFF);
+        let sc = rings.cmd(cad, paths[m].dac, VERB_GET_STREAM_CHANNEL, 0, a).unwrap_or(0xFFFF_FFFF);
+        let ep = rings.cmd(cad, paths[m].pin, VERB_GET_EAPD, 0, a).unwrap_or(0xFFFF_FFFF);
+        a.verbs_get += 3;
+        d.chan[m] = (sc & 0x0F) as u8;
+        d.eapd[m] = (ep & 0xFF) as u8;
+        serial_println!("[hda] sdfmt={:#06x} conv={:#06x} match={} member={}", d.sdfmt, conv & 0xFFFF, (conv & 0xFFFF == d.sdfmt as u32) as u8, m);
+        serial_println!("[hda] stream-id member={} dac=0x{:02x} tag={} chan={} raw={:#04x} (want tag={} stereo-chan=0) eapd={:#04x} pin=0x{:02x}",
+            m, paths[m].dac, (sc >> 4) & 0x0F, sc & 0x0F, sc & 0xFF, STREAM_TAG, ep & 0xFF, paths[m].pin);
+    }
+    // The AFG: power state and the GPIO trio, read now (the stream is armed, the amp is as the tone will have it).
+    let mut afg = 0x01u8;
+    if let Some(sub) = rings.cmd(cad, 0, VERB_GET_PARAMETER, PARAM_SUBNODE_COUNT, a) {
+        afg = ((sub >> 16) & 0xFF) as u8;
+        a.verbs_get += 1;
+    }
+    let pw = rings.cmd(cad, afg, VERB_GET_POWER_STATE, 0, a).unwrap_or(0xFFFF_FFFF);
+    let gd = rings.cmd(cad, afg, VERB_GET_GPIO_DATA, 0, a).unwrap_or(0xFFFF_FFFF);
+    let ge = rings.cmd(cad, afg, VERB_GET_GPIO_ENABLE, 0, a).unwrap_or(0xFFFF_FFFF);
+    let gr = rings.cmd(cad, afg, VERB_GET_GPIO_DIRECTION, 0, a).unwrap_or(0xFFFF_FFFF);
+    a.verbs_get += 4;
+    serial_println!("[hda] afg=0x{:02x} power=D{} actual=D{} gpio data={:#04x} enable={:#04x} dir={:#04x} vendor={:04x}:{:04x} (rd at tone arm)",
+        afg, pw & 0x0F, (pw >> 4) & 0x0F, gd & 0xFF, ge & 0xFF, gr & 0xFF, d.vendor >> 16, d.vendor & 0xFFFF);
+    d
 }
