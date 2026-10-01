@@ -185,7 +185,7 @@ pub fn set(t: WallTime) -> Result<(), ()> {
         let utc = (base_secs.saturating_add(UNIX_1980) as i64 - TZ_MIN * 60).max(0) as u64;
         let (y, mo, d, h, mi, s) = civil_from_unix(utc);
         let ok = crate::arch::rtc::write(y as u32, mo, d, h, mi, s);
-        crate::serial_println!("[rtc] written y={} mo={} d={} h={} mi={} s={} ok={}", y, mo, d, h, mi, s, ok as u8);
+        serial_println!("[rtc] written y={} mo={} d={} h={} mi={} s={} ok={}", y, mo, d, h, mi, s, ok as u8);
     }
     Ok(())
 }
@@ -442,7 +442,7 @@ pub fn rtc_boot() {
     #[cfg(target_arch = "x86_64")]
     crate::arch::rtc::boot_anchor();
     #[cfg(not(target_arch = "x86_64"))]
-    crate::serial_println!(":: RTC: rtc=none -> PASS ::");
+    serial_println!(":: RTC: rtc=none -> PASS ::");
 }
 
 /// A fixed-width byte writer for the ISO renderer (no allocation, no heap).

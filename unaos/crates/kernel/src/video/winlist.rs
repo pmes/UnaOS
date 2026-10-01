@@ -68,7 +68,7 @@ pub fn desktop_hidden() -> bool {
 pub fn rows() -> &'static [MenuItem] {
     let n = COUNT.load(Ordering::Acquire).min(CAP);
     // SAFETY: see `Store`.
-    unsafe { &(*STORE.rows.get())[..n] }
+    unsafe { &(&*STORE.rows.get())[..n] }
 }
 
 fn set_active(owner: u64) {

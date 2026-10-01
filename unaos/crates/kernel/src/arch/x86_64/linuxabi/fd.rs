@@ -131,7 +131,7 @@ pub fn out_take() -> Vec<u8> {
 
 /// Lock that never spins against a PREEMPTED holder on this core (IF can be open after a `yield_now` inside a syscall): on contention,
 /// yield and retry.
-pub fn lk<T>(m: &spin::Mutex<T>) -> spin::MutexGuard<'_, T> {
+pub fn lk<T>(m: &spin::Mutex<T>) -> spin::MutexGuard<'_, T, spin::Spin> {
     loop {
         if let Some(g) = m.try_lock() {
             return g;
