@@ -1153,3 +1153,6 @@ pub mod dimidle;
 // WALLPAPER (rmbp-0929) — the desktop backdrop picture; rides the `facet` decoder, so it has the same gate.
 #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 pub mod wallpaper;
+// SHOTREGION (R75) — region/window capture selection mode (x86 `wc`: its door is the x86 router's).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod shotsel;

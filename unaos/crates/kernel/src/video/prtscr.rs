@@ -408,6 +408,91 @@ static SLICING: AtomicBool = AtomicBool::new(false);
 /// are moves of a `String`, a `Vec` and a `FatFs`; nothing is copied.
 static JOB: Mutex<Option<Job>> = Mutex::new(None);
 
+/// SHOTREGION — the armed capture's kind (0 panel, 1 region, 2 window) and rectangle. Written by [`request_rect`] / [`set_rect`], consumed by `Job::begin` through [`take_rect`].
+static RECT_KIND: AtomicU32 = AtomicU32::new(0);
+static RECT_X: AtomicU32 = AtomicU32::new(0);
+static RECT_Y: AtomicU32 = AtomicU32::new(0);
+static RECT_W: AtomicU32 = AtomicU32::new(0);
+static RECT_H: AtomicU32 = AtomicU32::new(0);
+
+/// SHOTREGION — name of a kind code, for the witness.
+fn kind_name(k: u32) -> &'static str { match k { 1 => "region", 2 => "window", _ => "panel" } }
+
+/// SHOTREGION — record the rectangle the next capture takes (no request armed). `kind` 1 = region, 2 = window.
+pub fn set_rect(kind: u32, x: u32, y: u32, w: u32, h: u32) {
+    RECT_X.store(x, Ordering::Relaxed);
+    RECT_Y.store(y, Ordering::Relaxed);
+    RECT_W.store(w, Ordering::Relaxed);
+    RECT_H.store(h, Ordering::Relaxed);
+    RECT_KIND.store(kind, Ordering::Release);
+}
+
+/// SHOTREGION — the selection's key hook: arm a capture of one rectangle. Same cost as [`request`] (stores only); the slice machine in [`service`] does the work.
+pub fn request_rect(kind: u32, x: u32, y: u32, w: u32, h: u32) {
+    set_rect(kind, x, y, w, h);
+    REQUESTS.fetch_add(1, Ordering::Relaxed);
+    PENDING.store(true, Ordering::Relaxed);
+}
+
+/// SHOTREGION — drop an armed rectangle and its request (a refusal that came before `Job::begin` took it).
+pub fn disarm() {
+    RECT_KIND.store(0, Ordering::Release);
+    PENDING.store(false, Ordering::Relaxed);
+}
+
+/// SHOTREGION — consume the armed rectangle, clamped to a `pw x ph` panel: `(kind, x, y, w, h)`. A kind-0 or fully-clipped rectangle is the whole panel. A rect kind also clears [`PENDING`], so the synchronous `capture()` that takes it does not leave a second, panel-sized request behind.
+fn take_rect(pw: u32, ph: u32) -> (u32, u32, u32, u32, u32) {
+    let k = RECT_KIND.swap(0, Ordering::AcqRel);
+    if k == 0 {
+        return (0, 0, 0, pw, ph);
+    }
+    PENDING.store(false, Ordering::Relaxed);
+    let (x, y) = (RECT_X.load(Ordering::Relaxed), RECT_Y.load(Ordering::Relaxed));
+    if x >= pw || y >= ph {
+        return (0, 0, 0, pw, ph);
+    }
+    let w = RECT_W.load(Ordering::Relaxed).min(pw - x);
+    let h = RECT_H.load(Ordering::Relaxed).min(ph - y);
+    if w == 0 || h == 0 {
+        return (0, 0, 0, pw, ph);
+    }
+    (k, x, y, w, h)
+}
+
+/// SHOTREGION M3 — `SHOT-HHMMSS.PNG` when the clock is anchored and the name is free, else the `SHOT<n>.PNG` ladder. Never overwrites.
+fn shot_name(fs: &FatFs, dir: u32) -> Result<String, Refusal> {
+    let free = |name: &str| -> Result<bool, Refusal> {
+        match busy_retry(|| match fs.locate_in_dir(dir, name) {
+            Ok(hit) => Ok(Some(hit)),
+            Err(FatError::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }) {
+            Ok(None) => Ok(true),
+            Ok(Some(_)) => Ok(false),
+            Err(e) => Err(Refusal::Fat(vol_id(fs), "capture directory lookup", e)),
+        }
+    };
+    if let Some(name) = shot_clock_name() {
+        if free(&name)? {
+            return Ok(name);
+        }
+    }
+    for n in 0..MAX_CAPTURES {
+        let name = alloc::format!("SHOT{}.PNG", n);
+        if free(&name)? {
+            return Ok(name);
+        }
+    }
+    Err(Refusal::AllTaken(vol_id(fs)))
+}
+
+/// SHOTREGION M3 — the clock arm of [`shot_name`]: `None` until the clock is anchored (CLOCKBAR's `try_unix_now`).
+fn shot_clock_name() -> Option<String> {
+    let secs = crate::clock::try_unix_now()?;
+    let (_y, _mo, _d, h, mi, s) = crate::clock::civil_from_unix(secs);
+    Some(alloc::format!("SHOT-{:02}{:02}{:02}.PNG", h, mi, s))
+}
+
 /// PRTSCR — `(requests, captures, refusals)`.
 pub fn census() -> (u32, u32, u32) {
     (
@@ -423,6 +508,7 @@ pub fn census() -> (u32, u32, u32) {
 /// increment: no allocation, no lock, no I/O, no print beyond the single witness line the caller
 /// emits. Everything a screenshot actually costs happens later, in [`service`].
 pub fn request() {
+    RECT_KIND.store(0, Ordering::Relaxed); // SHOTREGION: a plain Print Screen is the whole panel
     REQUESTS.fetch_add(1, Ordering::Relaxed);
     PENDING.store(true, Ordering::Relaxed);
 }
@@ -522,6 +608,11 @@ fn finish(verdict: Result<Shot, Refusal>) {
         Ok(shot) => {
             CAPTURES.fetch_add(1, Ordering::Relaxed);
             shot.report_ok();
+            // SHOTREGION M3: a region/window capture says where it went (B229 `notice_show`); the whole-panel path stays silent as before.
+            #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+            if shot.kind != 0 {
+                crate::video::crystal::login::notice_show(b"Screenshot saved", alloc::format!("{}\nDesktop", shot.name).as_bytes());
+            }
         }
         Err(why) => {
             REFUSALS.fetch_add(1, Ordering::Relaxed);
@@ -546,6 +637,10 @@ pub struct Shot {
     pub dir_cluster: u32,
     /// SHOTZIP — IDAT chunks streamed (the verdict's `chunks=`).
     pub chunks: u32,
+    /// SHOTREGION — 0 panel, 1 region, 2 window; with the rectangle's origin (`width`x`height` is its size).
+    pub kind: u32,
+    pub rx: u32,
+    pub ry: u32,
 }
 
 /// Why a capture did not happen. Every variant carries what it inspected, not just what was
@@ -1014,6 +1109,10 @@ struct Job {
     dir: String,
     width: u32,
     height: u32,
+    /// SHOTREGION — what is captured: kind (0 panel, 1 region, 2 window) and the rectangle's panel origin; `width`/`height` are its size.
+    kind: u32,
+    rx: u32,
+    ry: u32,
     /// The reserved length the `-> capturing` line published. Denominator of the slice witness.
     need: usize,
     /// Slices spent so far — the witness's `n`, and what [`SLICE_LINES_MAX`] caps.
@@ -1101,7 +1200,7 @@ impl Job {
         if !matches!(info.pixel_format, PixelFormat::Rgb | PixelFormat::Bgr) {
             return Err(Refusal::NoFormat(info.pixel_format));
         }
-        let (width, height) = (info.width as u32, info.height as u32);
+        let (kind, rx, ry, width, height) = take_rect(info.width as u32, info.height as u32); // SHOTREGION: the whole panel unless a rectangle is armed
 
         // 2. The volume, by the PRTSCR-VOL ladder (module note), before anything is built. This is
         //    `mount_capture_target`, NOT `mount_program_source`: rung 2 is the whole reason a
@@ -1121,7 +1220,7 @@ impl Job {
         // SCRSHOT-DESKTOP (R60): `choose_name`, not `next_free_name` — the clock stamp when there is
         // a clock, the ladder when there is not, and a token saying which. Same never-overwrite
         // contract in both arms; see the naming block above `clock_name`.
-        let (name, name_from) = choose_name(&fs, dir_cluster)?;
+        let (name, name_from) = if kind != 0 { (shot_name(&fs, dir_cluster)?, if shot_clock_name().is_some() { "clock" } else { "clock-unset" }) } else { choose_name(&fs, dir_cluster)? };
 
         // PRTSCR2: name it on the wire BEFORE it can exist on the medium. From here every exit is
         // one of `-> OK`, a `— capture skipped` refusal, or a boot that ended inside this capture.
@@ -1151,6 +1250,9 @@ impl Job {
             dir,
             width,
             height,
+            kind,
+            rx,
+            ry,
             need,
             slices: 0,
             usb_backed,
@@ -1320,7 +1422,7 @@ impl Job {
                         for x in 0..self.width as usize {
                             // `read_pixel` is the format authority (see the module note); `None`
                             // (a firmware height overrunning its own buffer) is black.
-                            let rgb = self.panel.read_pixel(x, y as usize).unwrap_or(0);
+                            let rgb = self.panel.read_pixel(self.rx as usize + x, (self.ry + y) as usize).unwrap_or(0);
                             st.row.push(((rgb >> 16) & 0xFF) as u8);
                             st.row.push(((rgb >> 8) & 0xFF) as u8);
                             st.row.push((rgb & 0xFF) as u8);
@@ -1378,6 +1480,9 @@ impl Job {
                     dir: core::mem::take(&mut self.dir),
                     dir_cluster: self.dir_cluster,
                     chunks: st.enc.chunks(),
+                    kind: self.kind,
+                    rx: self.rx,
+                    ry: self.ry,
                 }))
             }
             // Unreachable: `slice` is the only caller and it always hands back a live phase.
@@ -1622,7 +1727,7 @@ impl Shot {
     /// in the 8.3 spelling the medium actually holds — beside the disk it landed on.
     pub fn report_ok(&self) {
         serial_println!(
-            ":: PRTSCR: {} {}x{} {} bytes -> OK :: source={} serial=0x{:08X} dir={} bytes_written={} chunks={} ::",
+            ":: PRTSCR: {} {}x{} {} bytes -> OK :: source={} serial=0x{:08X} dir={} bytes_written={} chunks={} kind={} rect={},{},{}x{} ::",
             self.name,
             self.width,
             self.height,
@@ -1631,7 +1736,12 @@ impl Shot {
             self.vol.serial,
             self.dir,
             self.bytes,
-            self.chunks
+            self.chunks,
+            kind_name(self.kind),
+            self.rx,
+            self.ry,
+            self.width,
+            self.height
         );
     }
 }

@@ -93,6 +93,8 @@ pub enum Action {
     /// Region capture. Honoured as a whole-screen capture until a pointer selector exists — the
     /// same reservation `hid_screenshot_chord_edge` carried for `⌘⇧4`, moved to the table.
     ScreenshotRegion,
+    /// SHOTREGION M2: window capture (`⌘⇧5`). Acted on by the x86 router (`shotsel`); not a decoder capture.
+    ScreenshotWindow,
     /// R61's first row. Consumed by the terminal (`clipboard::terminal_action`): the selection,
     /// or the whole line when none is live.
     Copy,
@@ -145,6 +147,7 @@ impl Action {
         match self {
             Action::Screenshot => "screenshot",
             Action::ScreenshotRegion => "screenshot-region",
+            Action::ScreenshotWindow => "screenshot-window",
             Action::Copy => "copy",
             Action::Cut => "cut",
             Action::Paste => "paste",
@@ -174,7 +177,8 @@ impl Action {
     /// Does this action arm the screen capture? The ONE question the HID decoders ask of an
     /// [`Action`] — everything else they resolve is delivered, not acted on.
     pub const fn is_capture(self) -> bool {
-        matches!(self, Action::Screenshot | Action::ScreenshotRegion)
+        // SHOTREGION: on x86 `wc` the region chord is the ROUTER's (selection mode, `shotsel`), so the decoder no longer arms a whole-panel capture for it; elsewhere it still does.
+        matches!(self, Action::Screenshot) || (cfg!(not(all(target_arch = "x86_64", feature = "wc"))) && matches!(self, Action::ScreenshotRegion))
     }
 }
 

@@ -138,6 +138,12 @@ FORBID :: STRIPVAC-DEBT: .* -> FAIL ::
 # --- `refuse(..)` reverted to a bare `.report()` (counted=0). SKIP is honest only mid-slice.
 REQUIRE :: PRTSCR-REFUSE: inflight door -> named=1 counted=1 slicing=0 -> PASS ::
 FORBID :: PRTSCR-REFUSE: .* -> FAIL ::
+# --- SHOTREGION (R75): `tests shotregion` drives the selection through the router seam (chord via `wc_route_event`,
+# --- press/drag/release via `route_at`, Esc via the router) and asserts the armed rect, then writes it. Reds by
+# --- `Action::is_capture` still claiming the region chord (the decoder arms a panel capture and the mode never opens)
+# --- or by `shotsel::route` dropped from `wc_route_event`. The file legs read `written` or `refused` (no volume/session).
+REQUIRE :: SHOTREGION: region_ok=1 window_ok=1 cancel_ok=1 .* -> PASS ::
+FORBID :: SHOTREGION: .* -> FAIL ::
 # --- SO22 (WINTITLE leftovers): the two launchers that minted UNNAMED windows now name them through
 # --- `wm::app_name_arm(owner_of_launch(slot), path)` at spawn (dock label = program name), and the
 # --- name dies with the slot (`free_user_space_by_cr3` on x86, `teardown_user_slot` on aarch64) — before,
