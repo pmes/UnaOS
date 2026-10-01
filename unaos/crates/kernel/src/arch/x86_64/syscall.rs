@@ -29831,7 +29831,10 @@ fn pref_caller_in_session(row: usize) -> bool {
         let _ = row;
         false
     }
-// ==========================================================================================// BANDY3 (ROADMAP §3b, the fulfiller seam): this arch's thin half of `crate::bus_route` — the mailbox
+}
+
+// =================================================================================================
+// BANDY3 (ROADMAP §3b, the fulfiller seam): this arch's thin half of `crate::bus_route` — the mailbox
 // ops table the router drives (HANDLES row + SLOT_GEN keyed, the existing BUSX_MBOX / BUSX_SEM), and the
 // `tests bandy3` fixture's hooks over the PRODUCTION `busx_msend_for`. Appended at the file tail.
 // =================================================================================================

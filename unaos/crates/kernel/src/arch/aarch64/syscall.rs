@@ -25748,7 +25748,10 @@ fn pref_caller_in_session(ppid: PrincipalRecord) -> bool {
         let _ = ppid;
         false
     }
-// ==========================================================================================// BANDY3 (ROADMAP §3b, the fulfiller seam): this arch's thin half of `crate::bus_route` — the mailbox
+}
+
+// =================================================================================================
+// BANDY3 (ROADMAP §3b, the fulfiller seam): this arch's thin half of `crate::bus_route` — the mailbox
 // ops table the router drives (ASID + ASID_GEN keyed, the existing BUS_MBOX / BUS_SEM), and the
 // `tests bandy3` fixture's hooks over the PRODUCTION `sys_msend_for`. Appended at the file tail.
 // =================================================================================================
