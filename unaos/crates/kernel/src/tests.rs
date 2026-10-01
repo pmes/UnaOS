@@ -71,6 +71,7 @@ pub fn register(name: &'static str, f: fn()) {
 
 /// A registering source has finished; once all required sources have, print the boot line ONCE.
 pub fn source_done(bit: u32) {
+    ensure_shellux();
     let done = SOURCES_DONE.fetch_or(bit, Ordering::AcqRel) | bit;
     if done & REQUIRED == REQUIRED && !ANNOUNCED.swap(true, Ordering::AcqRel) {
         serial_println!(":: TESTS: deferred={} fire=tests at_boot={} ::", deferred_count(), AT_BOOT.load(Ordering::Relaxed));
@@ -79,6 +80,7 @@ pub fn source_done(bit: u32) {
 
 /// Run one named fixture (`Some`) or all (`None`); returns how many ran.
 pub fn run(name: Option<&str>) -> usize {
+    ensure_shellux();
     if RUNNING.swap(true, Ordering::AcqRel) {
         serial_println!(":: TESTS: already running — refused ::");
         return 0;
@@ -109,6 +111,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
+    ensure_shellux();
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
@@ -123,5 +126,14 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: no such fixture (try `tests list`)");
     } else {
         console.println(&format!("tests: ran={} pass={} fail={}", ran, p, f));
+    }
+}
+
+/// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
+fn ensure_shellux() {
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("shellux", crate::shellux::selftest); }
     }
 }

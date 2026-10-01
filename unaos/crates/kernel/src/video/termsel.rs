@@ -1324,3 +1324,10 @@ pub fn termwrap_selftest() {
         cols, len, rows, cr, cc, if ok { "PASS" } else { "FAIL" }
     );
 }
+
+impl LineSel {
+    /// SHELLUX — a whole-line edit (history recall, kill, completion) ends any selection on the line.
+    pub fn end_selection(&mut self) {
+        self.live = false;
+    }
+}

@@ -2781,7 +2781,7 @@ fn handle_key(
             console.draw(pal);
         }
         return took_screen;
-    } else if c == 8 || c == 0x7F {
+    } else if unaos_kernel::shellux::wants(c) { let r = unaos_kernel::shellux::console_key(c, console); console.repaint(r, pal); } else if c == 8 || c == 0x7F { // SHELLUX (R75) — Up/Down history, Tab completion, Ctrl-C/L/A/E/U/W reach the line editor; line-neutral fold.
         let r = console.sel.type_byte(c, &mut console.current_input); // TERMSEL2 M3 — the edit happens AT THE CARET (`LineSel::type_byte`): Backspace deletes the byte before it, and with a selection on the line deletes the selection.
         console.repaint(r, pal);
     } else if c >= 32 && c <= 126 {
