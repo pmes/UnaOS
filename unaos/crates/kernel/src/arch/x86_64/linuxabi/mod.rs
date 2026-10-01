@@ -293,7 +293,7 @@ impl AddrSpace {
     }
 
     /// Free every frame and table. Call only when no core can be running on `pml4`.
-    pub fn release(&mut self) {
+    pub fn free_frames(&mut self) {
         for f in core::mem::take(&mut self.frames) {
             dealloc_frame(f);
         }
@@ -451,14 +451,14 @@ fn run_inner(path: &str, argv: &[&str], deadline_ms: u64) -> Result<Report, Stri
     let plan = elf::parse(&bytes).map_err(String::from)?;
     let mut asp = AddrSpace::new();
     if let Err(e) = elf::load(&mut asp, &bytes, &plan) {
-        asp.release();
+        asp.free_frames();
         return Err(String::from(e));
     }
     let envp = ["PATH=/apps:/", "HOME=/", "TERM=linux"];
     let sp = match elf::build_stack(&mut asp, &plan, &full, argv, &envp) {
         Ok(s) => s,
         Err(e) => {
-            asp.release();
+            asp.free_frames();
             return Err(String::from(e));
         }
     };
@@ -528,7 +528,7 @@ fn run_inner(path: &str, argv: &[&str], deadline_ms: u64) -> Result<Report, Stri
     };
     if let Some(mut p) = g.take() {
         if safe_to_free {
-            p.asp.release();
+            p.asp.free_frames();
         } // else: leak the space rather than free tables a still-live task may be running on
     }
     drop(g);
