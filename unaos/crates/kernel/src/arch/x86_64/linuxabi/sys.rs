@@ -350,6 +350,13 @@ pub fn handle(p: &mut LinuxProc, nr: u64, a: [u64; 6]) -> i64 {
             // ioctl: TCGETS on the std fds says "tty"; everything else is -ENOTTY
             if a[1] == 0x5401 && a[0] < 3 {
                 if p.asp.copy_out(a[2], &[0u8; 36], false) { 0 } else { -EFAULT }
+            } else if a[1] == 0x5413 && a[0] < 3 {
+                // TERMCOLOR M3 — TIOCGWINSZ: struct winsize { u16 rows, cols, xpixel, ypixel } from the console's geometry
+                let (c, r) = crate::console::geometry();
+                let mut ws = [0u8; 8];
+                ws[0..2].copy_from_slice(&(r.min(65535) as u16).to_le_bytes());
+                ws[2..4].copy_from_slice(&(c.min(65535) as u16).to_le_bytes());
+                if p.asp.copy_out(a[2], &ws, false) { 0 } else { -EFAULT }
             } else {
                 -ENOTTY
             }
