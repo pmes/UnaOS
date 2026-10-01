@@ -8783,3 +8783,22 @@ fn fetch_body(console: &mut Console, data: &[u8], dest: &mut Option<(crate::fs::
     }
     true
 }
+
+// --- SHELLUX (R75) — tail-appended seams for `shellux.rs`: the line editor's history, verb and path sources.
+/// SHELLUX: the retained command lines, oldest first (a copy; the editor never holds the lock).
+pub(crate) fn history_lines() -> Vec<String> { CMD_HISTORY.lock().clone() }
+/// SHELLUX: every word this build's verb table registers (`HOST_VERBS` filtered by `Avail::on`), the first-word completion set.
+pub(crate) fn verb_names() -> Vec<&'static str> {
+    let facts = midden_facts();
+    midden_core::HOST_VERBS.iter().filter(|(_, a)| a.on(&facts)).map(|(n, _)| *n).collect()
+}
+/// SHELLUX: the directory entries `(name, is_dir)` of `dir` as typed (`""` = the cwd), resolved by the same `vfs_path` every verb uses and read through the mount table.
+pub(crate) fn complete_ls(dir: &str) -> Vec<(String, bool)> {
+    let path = vfs_path(if dir.is_empty() { "." } else { dir });
+    match vfs_mount_table().read_dir(&path) {
+        Ok(v) => v.into_iter().map(|e| (e.name, matches!(e.kind, crate::fs::vfs::NodeKind::Dir))).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+/// SHELLUX: the session cwd (`pwd`'s answer) for the witness.
+pub(crate) fn cwd_now() -> String { cwd_path() }

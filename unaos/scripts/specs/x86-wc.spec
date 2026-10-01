@@ -911,3 +911,8 @@ REQUIRE :: WCPAR: cores=
 REQUIRE [wcpar] pool=
 # R77 M3 — the desktop fixtures are registered, not ignited; the lane defaults UNAOS_TESTS_AT_BOOT=1 so the boot prints the one line (deferred=0 there) and every fixture still runs in its old order
 REQUIRE :: TESTS: deferred=
+
+# SHELLUX (R75): the desktop shell's line editor — Up/Down history, Tab completion over verbs and
+# directory entries, Ctrl-C/L/A/E/U/W. A scripted key sequence against scripted sources, resulting lines checked.
+REQUIRE :: SHELLUX: history=up-down completions=verbs\+paths ctrl=\[c,l,a,e,u,w\] cwd=/.* -> PASS ::
+FORBID :: SHELLUX: .* -> FAIL ::
