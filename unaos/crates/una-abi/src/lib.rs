@@ -793,3 +793,21 @@ mod appmenu_tests {
         std::println!(":: APPMENU: abi items={} wire_bytes={} cap_bytes={} body_max={} -> PASS ::", MENU_ITEMS_MAX, MENU_ITEM_LEN, MENU_ITEMS_MAX * MENU_ITEM_LEN, BUS_BODY_MAX);
     }
 }
+
+// =================================================================================================
+// PREFS (rmbp-ledger B300): Principia's preference verbs on the v1 wire — additive verb tags, no header
+// or ceiling change (the BANDY-2 shape). Fulfilled in-kernel by `crate::prefs::bus_fulfil` over the ONE
+// store (`<home>/.config/unaos/preferences.toml`). Bodies (ASCII; a value is a TOML scalar literal):
+// GET `<ns>.<key>` -> reply body = the literal, -ENOENT unset; SET `<ns>.<key>` NUL `<literal>` -> empty,
+// -EACCES unless the caller runs in the open session; LIST `<ns>` or empty -> `<ns>.<key> = <literal>\n` lines.
+// =================================================================================================
+
+/// Bus verb: read one preference.
+pub const BUS_VERB_PREF_GET: u8 = 11;
+/// Bus verb: set one preference (session user only).
+pub const BUS_VERB_PREF_SET: u8 = 12;
+/// Bus verb: list a namespace (or every namespace).
+pub const BUS_VERB_PREF_LIST: u8 = 13;
+/// RESERVED for BANDY-3: the unsolicited PrefChanged frame (kind REPLY, corr 0, body = the SET body).
+/// Not admitted by `verb_valid` until interest registration exists to deliver it.
+pub const BUS_VERB_PREF_CHANGED: u8 = 14;

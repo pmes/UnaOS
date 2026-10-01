@@ -25070,7 +25070,7 @@ fn busx_msend_for(row: usize, cgen: u64, frame: &[u8]) -> i64 {
         // being no second implementation to drift from. Body parsing and the fail-closed `-EINVAL` on
         // a malformed one are the aarch64 dispatcher's, verb for verb. ⚠ LINE-NEUTRAL fold (B94).
         crate::bus::BUS_VERB_WRITE => match crate::bus::write_body_parse(body) { Ok((nb, c)) => match core::str::from_utf8(nb) { Ok(n) => busx_write(row, cgen, n, c), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_RM => match crate::bus::cat_body_parse(body) { Ok(nb) => match core::str::from_utf8(nb) { Ok(n) => busx_rm(row, cgen, n), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_MV => match crate::bus::cp_body_parse(body) { Ok((a, b)) => match (core::str::from_utf8(a), core::str::from_utf8(b)) { (Ok(x), Ok(y)) => busx_mv(row, cgen, x, y), _ => return EINVAL }, Err(_) => return EINVAL },
-        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(row as u64 + 1, body); 0 } // NOTICE: owner = slot + 1 (the wm key)
+        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(row as u64 + 1, body); 0 } una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST => crate::prefs::bus_fulfil(hdr.verb, body, pref_caller_in_session(row), &mut text), // PREFS (B300): Principia's verbs, fulfilled over the one store; NOTICE: owner = slot + 1 (the wm key)
         crate::bus::BUS_VERB_WRITE => match crate::bus::write_body_parse(body) { Ok((nb, c)) => match core::str::from_utf8(nb) { Ok(n) => busx_write(row, cgen, n, c), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_RM => match crate::bus::cat_body_parse(body) { Ok(nb) => match core::str::from_utf8(nb) { Ok(n) => busx_rm(row, cgen, n), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_MV => match crate::bus::cp_body_parse(body) { Ok((a, b)) => match (core::str::from_utf8(a), core::str::from_utf8(b)) { (Ok(x), Ok(y)) => busx_mv(row, cgen, x, y), _ => return EINVAL }, Err(_) => return EINVAL }, #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(row, body), #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(row, body), #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(row, body, &mut text),
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
@@ -29813,4 +29813,22 @@ pub fn winresize_selftest() {
         zones, strip_clear, wm::RS_MIN_W, wm::RS_MIN_H, drags, clamped, drag_ok, clamp_ok, min_ok, aspect_ok, keys_ok,
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+/// PREFS (rmbp-ledger B300): may slot `row` SET a preference? Only a program of the OPEN session: a session
+/// exists and the slot carries the session's uid (`SLOT_USER` is stamped from `SESSION_USER` at load).
+/// Without `login` there is no session, so nothing in ring 3 may set (reads stay open).
+fn pref_caller_in_session(row: usize) -> bool {
+    #[cfg(feature = "login")]
+    {
+        let mut nm = [0u8; crate::fs::users::NAME_MAX];
+        return crate::fs::users::whoami(&mut nm).is_some()
+            && row < SLOT_USER.len()
+            && SLOT_USER[row].load(Ordering::Acquire) == SESSION_USER.load(Ordering::Acquire);
+    }
+    #[cfg(not(feature = "login"))]
+    {
+        let _ = row;
+        false
+    }
 }

@@ -23155,7 +23155,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
             },
             Err(_) => return EINVAL,
         },
-        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(asid as u64, body); 0 } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), // ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid
+        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(asid as u64, body); 0 } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST => crate::prefs::bus_fulfil(hdr.verb, body, pref_caller_in_session(ppid), &mut text), // PREFS (B300): Principia's verbs over the one store. ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
     bus_reply_enqueue(asid, hdr.corr, hdr.verb, status, &text)
@@ -25732,4 +25732,20 @@ fn armrouter_witness() {
         if df { ",appmenu,brightkeys,volkeys" } else { "" },
         moved, if seams { "PASS" } else { "FAIL" }
     );
+}
+
+/// PREFS (rmbp-ledger B300): may a caller with principal `ppid` SET a preference? Only a program of the OPEN
+/// session: the session is a `user:` record and the caller carries exactly it (`session_restamp` stamps
+/// every program loaded in the session). Without `login` there is no session: reads only.
+fn pref_caller_in_session(ppid: PrincipalRecord) -> bool {
+    #[cfg(feature = "login")]
+    {
+        let s = { let _irq = IrqGuard::mask_save(); *SESSION.lock() };
+        return s.kind == PRIN_USER && s == ppid;
+    }
+    #[cfg(not(feature = "login"))]
+    {
+        let _ = ppid;
+        false
+    }
 }
