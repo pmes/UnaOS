@@ -26,7 +26,10 @@
 pub mod live;
 
 #[cfg(feature = "quarry")]
-pub use live::{close, is_open, key_route, open, press_route, request_open, service, OWNER};
+pub use live::{close, is_open, key_route, menu_press, open, press_route, request_open, right_press, service, OWNER};
+
+#[cfg(all(feature = "quarry", target_arch = "x86_64", feature = "wc"))]
+pub use live::ops_selftest;
 
 #[cfg(all(feature = "quarry", feature = "witness"))]
 pub use live::{door_selftest, selftest, selftest_result};
@@ -69,3 +72,12 @@ pub fn request_open() {}
 #[cfg(not(feature = "quarry"))]
 #[inline(always)]
 pub fn service() {}
+
+// QUARRYOPS knob-off stubs: the x86 click router's right-press / menu arms compile either way.
+#[cfg(not(feature = "quarry"))]
+#[inline(always)]
+pub fn right_press(_x: i32, _y: i32) -> bool { false }
+
+#[cfg(not(feature = "quarry"))]
+#[inline(always)]
+pub fn menu_press(_x: i32, _y: i32) -> bool { false }

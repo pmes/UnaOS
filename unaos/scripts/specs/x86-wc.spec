@@ -873,6 +873,11 @@ FORBID \[fileview\] refuse
 # --- a right-click/long-press menu's Quit closes the owner and the tile leaves.
 REQUIRE :: DOCKRUN: tiles=\d+ running=\d+ pinned=\d+ raise=ok quit=ok menu_drawn=1 -> PASS ::
 FORBID :: DOCKRUN: .* -> FAIL ::
+# --- QUARRYOPS (R75) — Quarry's file operations: mkdir / rename (a LONG name, the LFNMV2 `[fs] mv ... lfn=1` path) /
+# --- copy / delete on a scratch folder under /home, verified by LISTING, plus two DIRNS refusals (outside /home, the home
+# --- itself). The fixture is a `tests` registry entry the lane runs at boot; a SKIP (no /home volume) is not a pass.
+REQUIRE :: QUARRYOPS: ops=\[mkdir,rename,copy,delete\] ok=4 refused=2 -> PASS ::
+FORBID :: QUARRYOPS: .* -> (FAIL|SKIP) ::
 # --- SHOTMOUNT (SO19, FSNS): a capture's bytes go THROUGH THE MOUNT TABLE (`mt.create`/`mt.write`, as
 # --- `shell::fs_write` does), so the file lands where `ls /` says the namespace is. The witness prints once per
 # --- capture at the verdict; `via=fat` means the table could not create the entry and the FAT-direct
