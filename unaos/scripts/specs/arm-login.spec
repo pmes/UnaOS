@@ -134,3 +134,8 @@ FORBID :: DIRNS: .* -> FAIL
 # --- SPLASHX86 M3 (R74): the same splash at the aarch64 takeover (`desktop_firmware::activate`), held until `users::stage_publish`.
 REQUIRE :: SPLASH: arch=aarch64 WxH=[0-9]+x[0-9]+ ms=[0-9]+ -> PASS ::
 REQUIRE [splash] held_ms=[0-9]+ released_by=(store-loaded|timeout)
+# --- ARMROUTER (rmbp-0929): the aarch64 input router's arm census, printed once at the u7 launcher. This lane
+# (login,loginst,virt_el0) has NO desktop_firmware, so it reads `arms=[]` here; the PASS means the shared seams
+# answer. The six-arm line (arms=[wincycle,dockrun,lock,appmenu,brightkeys,volkeys]) needs UNAOS_PIDESK=1.
+REQUIRE :: ARMROUTER:
+FORBID :: ARMROUTER: .* -> FAIL

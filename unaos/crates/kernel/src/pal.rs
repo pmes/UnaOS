@@ -1329,7 +1329,7 @@ fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint, coalesce: bool)
     stored
 }
 
-pub fn push_event(event: Event) { if let Event::Action(a) = event { if a.is_brightness() { #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::brightkeys::key(a); return; } } // BRIGHTKEYS — backlight keys are consumed HERE (never queued): one seam for the xHCI and EHCI decoders. ⚠ SAME-LINE fold, line-neutral.
+pub fn push_event(event: Event) { if let Event::Action(a) = event { if a.is_brightness() { #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::brightkeys::key(a); return; } } // BRIGHTKEYS — backlight keys are consumed HERE (never queued): one seam for the xHCI and EHCI decoders. ⚠ SAME-LINE fold, line-neutral.
     crate::arch::without_interrupts(|| {
         let mut q = EVENT_QUEUE.lock();
         // R0 / rtwit — EVENT_QUEUE max-hold. Declared AFTER the guard so it drops FIRST (just before
