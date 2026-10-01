@@ -40,6 +40,8 @@
 
 # --- the ladder reached the compositor witnesses and they held --------------------------------
 REQUIRE \[wm-act\] direct .* -> PASS
+# WINRESIZE (R75) — `tests winresize`: eight frame zones, a routed corner drag, the panel/min clamps, Shift aspect and the Ctrl-arrow keys.
+REQUIRE :: WINRESIZE: zones=8 .* -> PASS ::
 REQUIRE \[clickroute\] route .* -> PASS
 
 # --- PTRDEAD (SELFTEST-RACE, 2026-08-27) ------------------------------------------------------

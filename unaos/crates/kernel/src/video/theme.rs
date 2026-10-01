@@ -567,6 +567,18 @@ pub static CRISPY_ROWS: [Binding; 43] = [
     Binding { roles: CTRL | ALT, usage: 0x4F, action: Action::SnapRight, token: "ctrl-alt-right" },
     Binding { roles: CTRL | ALT, usage: 0x52, action: Action::SnapZoom, token: "ctrl-alt-up" },
     Binding { roles: CTRL | ALT, usage: 0x51, action: Action::SnapRestore, token: "ctrl-alt-down" },
+pub static CRISPY_ROWS: [Binding; 35] = [
+    // WINRESIZE (R75) — Ctrl+arrow nudges the focused window, Ctrl+Shift+arrow resizes it. FIRST in the
+    // table: the Shift row is above the Ctrl row on every usage (`no_shadow`), and both are above the
+    // bare caret/select rows on the same usages, which they take over while Ctrl is held.
+    Binding { roles: CTRL | SHIFT, usage: 0x50, action: Action::WinSizeLeft, token: "ctrl-shift-left" },
+    Binding { roles: CTRL | SHIFT, usage: 0x4F, action: Action::WinSizeRight, token: "ctrl-shift-right" },
+    Binding { roles: CTRL | SHIFT, usage: 0x52, action: Action::WinSizeUp, token: "ctrl-shift-up" },
+    Binding { roles: CTRL | SHIFT, usage: 0x51, action: Action::WinSizeDown, token: "ctrl-shift-down" },
+    Binding { roles: CTRL, usage: 0x50, action: Action::WinNudgeLeft, token: "ctrl-left" },
+    Binding { roles: CTRL, usage: 0x4F, action: Action::WinNudgeRight, token: "ctrl-right" },
+    Binding { roles: CTRL, usage: 0x52, action: Action::WinNudgeUp, token: "ctrl-up" },
+    Binding { roles: CTRL, usage: 0x51, action: Action::WinNudgeDown, token: "ctrl-down" },
     // The two chords flight 11 proved on metal. Their tokens are the exact bytes the `[prtscr]`
     // witness has always carried, so a capture from before KEYMAP and one from after grep alike.
     Binding { roles: CMD | SHIFT, usage: 0x20, action: Action::Screenshot, token: super::shortcuts::C_CMD_SHIFT_3 },
@@ -648,6 +660,18 @@ pub static PC_ROWS: [Binding; 26] = [
     Binding { roles: CTRL | ALT, usage: 0x4F, action: Action::SnapRight, token: "ctrl-alt-right" },
     Binding { roles: CTRL | ALT, usage: 0x52, action: Action::SnapZoom, token: "ctrl-alt-up" },
     Binding { roles: CTRL | ALT, usage: 0x51, action: Action::SnapRestore, token: "ctrl-alt-down" },
+pub static PC_ROWS: [Binding; 25] = [
+    // WINRESIZE (R75) — Ctrl+arrow nudges the focused window, Ctrl+Shift+arrow resizes it. FIRST in the
+    // table: the Shift row is above the Ctrl row on every usage (`no_shadow`), and both are above the
+    // bare caret/select rows on the same usages, which they take over while Ctrl is held.
+    Binding { roles: CTRL | SHIFT, usage: 0x50, action: Action::WinSizeLeft, token: "ctrl-shift-left" },
+    Binding { roles: CTRL | SHIFT, usage: 0x4F, action: Action::WinSizeRight, token: "ctrl-shift-right" },
+    Binding { roles: CTRL | SHIFT, usage: 0x52, action: Action::WinSizeUp, token: "ctrl-shift-up" },
+    Binding { roles: CTRL | SHIFT, usage: 0x51, action: Action::WinSizeDown, token: "ctrl-shift-down" },
+    Binding { roles: CTRL, usage: 0x50, action: Action::WinNudgeLeft, token: "ctrl-left" },
+    Binding { roles: CTRL, usage: 0x4F, action: Action::WinNudgeRight, token: "ctrl-right" },
+    Binding { roles: CTRL, usage: 0x52, action: Action::WinNudgeUp, token: "ctrl-up" },
+    Binding { roles: CTRL, usage: 0x51, action: Action::WinNudgeDown, token: "ctrl-down" },
     // PrtSc. The SHIFTED row is written ABOVE the bare one, and it has to be: the bare row names
     // no roles, so it matches with Shift held too and would shadow the region chord entirely. That
     // is this table's one ordering hazard; the `const` block at the foot of this file checks it.
