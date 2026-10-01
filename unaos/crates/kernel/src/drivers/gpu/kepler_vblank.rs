@@ -385,6 +385,18 @@ static ISR_STUCK: AtomicU64 = AtomicU64::new(0);
 static ISR_PENDING_PRE: AtomicU64 = AtomicU64::new(0);
 /// KVBLANK5 M3 — the close kept the interrupt armed (delivery ratio >= 90%), and the wait census split.
 static IRQ_KEPT: AtomicBool = AtomicBool::new(false);
+/// KVBLANK6 — the ladder was driven ONLY by the compositor's `hold` (scanout_beam -> note -> edge), so a boot whose
+/// compositor is not presenting (the installer stages, R77) starves it. The pump is a kernel task that feeds
+/// `scanout_beam()` itself. Spawned once, at the first edge (a task context, so the scheduler is up).
+static PUMP_SPAWNED: AtomicBool = AtomicBool::new(false);
+/// `ms()` of the last edge a COMPOSITOR read produced; the pump only samples when that is stale.
+static LAST_COMP_EDGE_MS: AtomicU64 = AtomicU64::new(0);
+/// Set around the pump's own sample so [`edge`] does not count it as a compositor edge.
+static IN_PUMP: AtomicBool = AtomicBool::new(false);
+/// One ladder step at a time (the compositor and the pump can both reach [`ladder_tick`]).
+static LADDER_BUSY: AtomicBool = AtomicBool::new(false);
+/// `ms()` of the last `vector census` line.
+static CENSUS_LAST_MS: AtomicU64 = AtomicU64::new(0);
 static VB_WAIT_VIA_IRQ: AtomicU64 = AtomicU64::new(0);
 static VB_WAIT_VIA_POLL: AtomicU64 = AtomicU64::new(0);
 /// §R3 — the allocated vector (plus 1; zero = none), the head the ISR disarms, the captured
@@ -719,6 +731,9 @@ fn edge(vline: u32) {
     // it is where in the frame the edge was observed — `raster_at_irq`, and the number rung 2's
     // threshold is derived from.
     VB_PHASE1.store(vline + 1, Ordering::Relaxed);
+    if !IN_PUMP.load(Ordering::Relaxed) {
+        LAST_COMP_EDGE_MS.store(crate::arch::ms(), Ordering::Relaxed);
+    }
     // KVBLANK2 — the three rungs, driven by the EDGE and by nothing else. Sited here because an
     // edge is the only moment at which "a bounded number of vblanks" is a measurable quantity, and
     // because this is the one place per frame that is already off the fast path (`note`'s compare
@@ -749,11 +764,14 @@ fn report(n: u64, vline: u32) {
         VB_WAITS.load(Ordering::Relaxed), VB_WAIT_US.load(Ordering::Relaxed),
         VB_WAIT_GAVEUP.load(Ordering::Relaxed), VB_WAIT_RECHECK.load(Ordering::Relaxed),
         LIVE.seen.load(Ordering::Relaxed), LIVE.tight.load(Ordering::Relaxed), src,
-        if VB_WAIT_VIA_IRQ.load(Ordering::Relaxed) > VB_WAIT_VIA_POLL.load(Ordering::Relaxed) { "irq" } else { "poll" },
+        vbwait_mode(),
         VB_WAIT_VIA_IRQ.load(Ordering::Relaxed), VB_WAIT_VIA_POLL.load(Ordering::Relaxed),
         ISR_CALLS.load(Ordering::Relaxed), ISR_ACKS.load(Ordering::Relaxed), ISR_REARMS.load(Ordering::Relaxed),
         REARM_WRITTEN.load(Ordering::Relaxed) as u32, REARM_READBACK.load(Ordering::Relaxed),
     );
+    if IRQ_KEPT.load(Ordering::Relaxed) {
+        vector_census("census", n);
+    }
 }
 
 // ══ KVBLANK2 — the three rungs ════════════════════════════════════════════════════════════════
@@ -818,6 +836,14 @@ fn ladder_tick(n: u64) {
     if head >= 4 {
         return;
     }
+    if LADDER_BUSY.swap(true, Ordering::Acquire) {
+        return;
+    }
+    ladder_step(bar0, head, n);
+    LADDER_BUSY.store(false, Ordering::Release);
+}
+
+fn ladder_step(bar0: usize, head: usize, n: u64) {
     match LADDER.load(Ordering::Relaxed) {
         LADDER_CENSUS => rung1_census(bar0, head, n),
         LADDER_WINDOW_ARM => rung2_arm(bar0, head, n),
@@ -1099,7 +1125,7 @@ fn rung3_run(bar0: usize, head: usize, n: u64) {
     // reads the live counter); a poor ratio or a storm closes as before.
     let keep = {
         let (i, v) = (IRQ_COUNT.load(Ordering::Relaxed), elapsed.max(1));
-        i * 100 >= v * 90 && !IRQ_STORMED.load(Ordering::Relaxed) && ISR_REARMS.load(Ordering::Relaxed) > 0
+        i * 100 >= v * 90 && !IRQ_STORMED.load(Ordering::Relaxed) && ISR_REARMS.load(Ordering::Relaxed) > 0 && IRQ_WIRE.load(Ordering::Relaxed) != 0
     };
     IRQ_KEPT.store(keep, Ordering::Release);
     if !keep { IRQ_LIVE.store(false, Ordering::Release); }
@@ -1595,7 +1621,108 @@ fn selftest_rearm() {
     let ratio_pct = fixed * 100 / N;
     let ok = ratio_pct >= 95 && broken == 1;
     serial_println!(
-        ":: KVBLANK4: irq={} vbl={} ratio_pct={} fixed_isr=rearm broken={} rearm_written={:08X} vbwait_mode=poll -> {} ::",
-        fixed, N, ratio_pct, broken, isr_head_en(0), if ok { "PASS" } else { "FAIL" }
+        ":: KVBLANK4: irq={} vbl={} ratio_pct={} fixed_isr=rearm broken={} rearm_written={:08X} vbwait_mode={} -> {} ::",
+        fixed, N, ratio_pct, broken, isr_head_en(0), vbwait_mode(), if ok { "PASS" } else { "FAIL" }
     );
 }
+
+
+// ══ KVBLANK6 — rung 3 is a HARDWARE witness, scheduled and kept live ══════════════════════════════
+//
+// Boot 17 finding: `vbwait_irq=0 isr_calls=0 mode=poll` on every census line and no `vector close` line.
+// Rung 3 is NOT a `tests` fixture and was never gated on `desktop_allowed()`: it is the fifth step of a ladder
+// that [`edge`] steps, and `edge` runs only when the compositor's `hold` reads `scanout_beam()`. The installer
+// stages (R77) hold the furniture and present rarely, so rungs 1-3 (8 census samples, a 16-vblank window, a
+// 60-vblank vector window) starved. The pump below samples `scanout_beam()` itself whenever no compositor read
+// has produced an edge for [`PUMP_STALE_MS`], so the ladder runs at boot wherever the compositor is.
+
+/// A compositor edge older than this lets the pump sample.
+const PUMP_STALE_MS: u64 = 40;
+/// Pump cadence; under half a frame so no vblank is missed (fold counts by the field's difference anyway).
+const PUMP_MS: u64 = 8;
+/// `vector census` cadence, the deadman's.
+const CENSUS_MS: u64 = 1_000;
+
+/// `vbwait_mode=` for the census AND the fixture: the live mode, not a literal.
+fn vbwait_mode() -> &'static str {
+    if VB_WAIT_VIA_IRQ.load(Ordering::Relaxed) > VB_WAIT_VIA_POLL.load(Ordering::Relaxed) { "irq" } else { "poll" }
+}
+
+/// Task-context only (called from the desktop-ready site beside `wcpar::start()`); never from `edge()`.
+pub fn pump_spawn_once() {
+    if PUMP_SPAWNED.load(Ordering::Relaxed) || VB_BAR0.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    if PUMP_SPAWNED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // `desktop_allowed()` is NOT consulted: the pump reads one BAR0 word and the MSI vector needs no compositor.
+    serial_println!(
+        ":: kepler: vblank-intr rung3 scheduled=boot reason=ladder-fed-by-pump-not-by-compositor-presents stage_resolved={} pump_ms={} stale_ms={} :: — KVBLANK6: the ladder's edges came only from `beam::hold`; the pump task samples `scanout_beam()` when no compositor edge is newer than stale_ms ::",
+        stage_resolved_u32(),
+        PUMP_MS, PUMP_STALE_MS,
+    );
+    crate::arch::sched::spawn("kvblank-pump", pump_task, 0, crate::arch::percpu::this_cpu().cpu_index as usize, crate::arch::sched::PRIO_NORMAL);
+}
+
+fn pump_task(_: usize) {
+    loop {
+        crate::arch::sched::sleep_ms(PUMP_MS);
+        let now = crate::arch::ms();
+        if now.wrapping_sub(LAST_COMP_EDGE_MS.load(Ordering::Relaxed)) >= PUMP_STALE_MS {
+            IN_PUMP.store(true, Ordering::Relaxed);
+            let _ = crate::arch::scanout_beam(); // -> note -> edge -> ladder_tick (and `report`'s cadence)
+            IN_PUMP.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The kept-live vector's census (deadman cadence, from [`report`]) and the one at shutdown: the `vector close`
+/// fields, read live. `kind` is `census` or `shutdown`.
+fn vector_census(kind: &str, n: u64) {
+    if kind == "census" {
+        let now = crate::arch::ms();
+        if now.wrapping_sub(CENSUS_LAST_MS.load(Ordering::Relaxed)) < CENSUS_MS {
+            return;
+        }
+        CENSUS_LAST_MS.store(now, Ordering::Relaxed);
+    }
+    let irq = IRQ_COUNT.load(Ordering::Relaxed);
+    let (deliver, reason) = classify(DeliverIn {
+        irq,
+        wire: IRQ_WIRE.load(Ordering::Relaxed),
+        cmd: IRQ_CMD.load(Ordering::Relaxed),
+        en_armed: IRQ_EN_ARMED.load(Ordering::Relaxed),
+        mask_armed: IRQ_MASK_ARMED.load(Ordering::Relaxed),
+        intr_or: WIN_PMC_OR.load(Ordering::Relaxed),
+        line_or: WIN_LINE_OR.load(Ordering::Relaxed),
+    });
+    serial_println!(
+        ":: kepler: vblank-intr vector {} head={} irq={} vbl_delta={} rearms={} wire={} vector={:#04x} storm={} verdict=live mode={} deliver={} reason={} isr_calls={} acks={} rearms_isr={} stuck={} pending_pre={} vbwait_mode={} kept_live={} :: — KVBLANK6: the kept-live vector read at the deadman cadence (and once at shutdown); same fields as `vector close`",
+        kind, IRQ_HEAD.load(Ordering::Relaxed), irq, n.saturating_sub(WIN_AT.load(Ordering::Relaxed)),
+        ISR_REARMS.load(Ordering::Relaxed), IRQ_WIRE.load(Ordering::Relaxed),
+        IRQ_VECTOR1.load(Ordering::Relaxed).saturating_sub(1), IRQ_STORMED.load(Ordering::Relaxed) as u32,
+        mode_str(), deliver, reason, ISR_CALLS.load(Ordering::Relaxed), ISR_ACKS.load(Ordering::Relaxed),
+        ISR_REARMS.load(Ordering::Relaxed), ISR_STUCK.load(Ordering::Relaxed), ISR_PENDING_PRE.load(Ordering::Relaxed),
+        vbwait_mode(), IRQ_KEPT.load(Ordering::Relaxed) as u32,
+    );
+}
+
+/// Once at shutdown (`power::shutdown`): the census line with `shutdown` in the kind slot. Silent when the vector
+/// never armed (QEMU, no Kepler).
+pub fn shutdown_census() {
+    if IRQ_KEPT.load(Ordering::Relaxed) {
+        vector_census("shutdown", LIVE.count.load(Ordering::Relaxed));
+    }
+}
+
+/// `tests kvblank` — re-run the fixture only (the hardware ladder is untouched).
+pub fn selftest_rerun() {
+    SELFTEST_DONE.store(false, Ordering::Release);
+    selftest_once();
+}
+
+#[cfg(feature = "login")]
+fn stage_resolved_u32() -> u32 { crate::fs::users::stage_resolved() as u32 }
+#[cfg(not(feature = "login"))]
+fn stage_resolved_u32() -> u32 { 1 }

@@ -452,7 +452,7 @@ pub fn activate_on(desc: SurfaceDesc) {
         fb.fill_screen(wm::DESKTOP_BG);
         fb.flush_all();
     }
-    super::wcpar::start(); // WCPAR — band workers exist before the first composite; prints `[wcpar] pool=`
+    super::wcpar::start(); #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))] crate::drivers::gpu::kepler_vblank::pump_spawn_once(); // KVBLANK6 — task context; WCPAR — band workers exist before the first composite; prints `[wcpar] pool=`
     serial_println!(
         "[wc-x] desktop-clear panel={}x{} bg={:08X}",
         pw,
