@@ -971,3 +971,6 @@ FORBID :: SCROLLBACK: .* -> FAIL ::
 REQUIRE :: WINSNAP: zones=7 snaps=[0-9]+ restores=[0-9]+ preview_ok=true unsnaps=[0-9]+ left=true chords=true quarters=4 .* -> PASS ::
 FORBID :: WINSNAP: .* -> FAIL ::
 REQUIRE \[wm-act\] snap win=[0-9]+ zone=left rect=
+# ── POWERMENU (R75), TAIL-APPENDED — `tests power`: the battery panel opens and closes through the real crystal path on a forced reading, the low-battery NOTICE thresholds (10 %, 5 %, once each, discharging only) on forced percents, the two-step confirm armed/fired/re-armed. No real shutdown.
+REQUIRE :: POWER-UI: panel_ok=true notice_ok=true -> PASS ::
+FORBID :: POWER-UI: .* -> FAIL ::

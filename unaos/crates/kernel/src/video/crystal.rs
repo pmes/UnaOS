@@ -132,7 +132,7 @@ impl Verb {
     /// `true` when the verb is BACKED by a real action, `false` when it is an honest stub. On the
     /// witness so a capture reads `action=real` or `action=stub` beside the pick.
     const fn real(self) -> bool {
-        #[cfg(not(feature = "login"))] { return matches!(self, Verb::About) || (matches!(self, Verb::Restart) && cfg!(all(target_arch = "aarch64", not(feature = "pi")))) || (matches!(self, Verb::ShutDown) && !cfg!(all(target_arch = "aarch64", feature = "pi"))); } #[cfg(feature = "login")] { matches!(self, Verb::About) || matches!(self, Verb::LogOut) || matches!(self, Verb::Lock) || (matches!(self, Verb::Settings) && cfg!(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))) || (matches!(self, Verb::Restart) && cfg!(all(target_arch = "aarch64", not(feature = "pi")))) || (matches!(self, Verb::ShutDown) && !cfg!(all(target_arch = "aarch64", feature = "pi"))) } // LOGIN M4 — Log Out is REAL wherever the knob is on (the screen it returns to is built by the DESKTOP gate, but the teardown runs headless too), and A34's rule is why this is not left at `stub`: a verb announcing `real` and doing nothing spends the operator's trust, and so does the reverse. The knob-off arm is the original expression VERBATIM, early-returned so no line moves. ⚠ LINE-NEUTRAL fold. // A34: arch-TRUE, not arch-blind — the flat `About | ShutDown` printed `action=real` for a Shut Down that only printed a line (render7). Restart is real wherever PSCI answers; Shut Down everywhere except the Pi.
+        #[cfg(not(feature = "login"))] { return matches!(self, Verb::About) || (matches!(self, Verb::Restart) && cfg!(not(all(target_arch = "aarch64", feature = "pi")))) || (matches!(self, Verb::ShutDown) && !cfg!(all(target_arch = "aarch64", feature = "pi"))); } #[cfg(feature = "login")] { matches!(self, Verb::About) || matches!(self, Verb::LogOut) || matches!(self, Verb::Lock) || (matches!(self, Verb::Settings) && cfg!(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))) || (matches!(self, Verb::Restart) && cfg!(not(all(target_arch = "aarch64", feature = "pi")))) || (matches!(self, Verb::ShutDown) && !cfg!(all(target_arch = "aarch64", feature = "pi"))) } // LOGIN M4 — Log Out is REAL wherever the knob is on (the screen it returns to is built by the DESKTOP gate, but the teardown runs headless too), and A34's rule is why this is not left at `stub`: a verb announcing `real` and doing nothing spends the operator's trust, and so does the reverse. The knob-off arm is the original expression VERBATIM, early-returned so no line moves. ⚠ LINE-NEUTRAL fold. // A34: arch-TRUE, not arch-blind — the flat `About | ShutDown` printed `action=real` for a Shut Down that only printed a line (render7). Restart is real wherever PSCI answers; Shut Down everywhere except the Pi.
     }
 
     /// The verb's stable ordinal for the witness (`u8`), independent of its row index.
@@ -205,7 +205,7 @@ const fn max_label_glyphs() -> usize {
         }
         i += 1;
     }
-    m
+    if m < super::powerui::ARMED_LABEL_MAX { super::powerui::ARMED_LABEL_MAX } else { m } // POWERMENU: the armed "Click again to shut down" label must fit
 }
 
 /// The menu's total height, walked at compile time from the row heights plus the two borders.
@@ -390,6 +390,7 @@ pub fn last_press_outcome() -> &'static str {
 /// the guard even though its `x` is no longer read) or the panel is too small to hold the menu below
 /// the bar at all: the same decline-rather-than-squeeze rule the strip constructors follow.
 fn menu_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
+    if super::powerui::panel_open() { return panel_rect(pw, ph); } // POWERMENU M2: the battery panel mode
     // The crystal must EXIST for its menu to drop — but its `x` is deliberately not read. Binding it
     // to `_` rather than deleting the call keeps the "no mark, no menu" precondition, and keeps the
     // decoupling visible at the one place a future reader would be tempted to re-couple it.
@@ -606,6 +607,7 @@ fn dismiss(reason: &str) {
     if !OPEN.swap(false, Ordering::AcqRel) {
         return;
     }
+    super::powerui::panel_clear(); super::powerui::disarm(); // POWERMENU
     DISMISSES.fetch_add(1, Ordering::Relaxed);
     serial_println!(":: SHARD-MENU: crystal_press=dismiss reason={} ::", reason);
     // MENU-DRIVE — the mirrored half of [`open`]'s rule. The erase ([`compose`]'s closed path, which
@@ -668,11 +670,11 @@ fn fire(verb: Verb) {
         }
         Verb::Restart => {
             #[cfg(target_arch = "x86_64")]
-            serial_println!(":: SHARD: unimplemented: Restart (no reboot path) ::");
+            { serial_println!(":: SHARD: restart — the clean reboot path ::"); crate::power::reboot(); } // POWERMENU M1: the FADT/8042 ladder behind the clean prelude
             // A34 — the ACTION, at last: `power::crystal_restart` announces `[crystal] verb=restart ->
             // PSCI SYSTEM_RESET`, hands the board to ATF/BL31, and returns only to name the refusal code.
             #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
-            crate::power::crystal_restart();
+            { crate::power::prelude("reboot"); crate::power::crystal_restart(); }
             #[cfg(all(target_arch = "aarch64", feature = "pi"))]
             serial_println!(":: SHARD: unimplemented: Restart (no PSCI SYSTEM_RESET — Pi 4 bare-metal runs at EL2 with no secure monitor; a BCM2711 watchdog reset is the wiring this needs) ::");
         }
@@ -683,14 +685,14 @@ fn fire(verb: Verb) {
             #[cfg(target_arch = "x86_64")]
             {
                 serial_println!(":: SHARD: shut down — entering ACPI S5 soft-off ::");
-                crate::arch::acpi_power::poweroff();
+                crate::power::shutdown(); // POWERMENU M1: flush + close windows + stop HDA, then acpi_power::poweroff
             }
             // A34 — the ACTION. Twelve minutes of an Orin that had been told to shut down (render7)
             // is what this line closes: `power::crystal_shutdown` announces `[crystal] verb=shutdown
             // -> PSCI SYSTEM_OFF` and calls it. The Pi keeps its honest line — there is no EL3 PSCI monitor in the Pi's CURRENT boot chain (spin-table release, no BL31 — a boot-chain consequence, not a BCM2711 property)
             // behind its `smc`, and a verb that cannot act must not park the desktop to look decisive.
             #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
-            crate::power::crystal_shutdown();
+            { crate::power::prelude("shutdown"); crate::power::crystal_shutdown(); }
             #[cfg(all(target_arch = "aarch64", feature = "pi"))]
             serial_println!(":: SHARD: unimplemented: Shut Down (no PSCI SYSTEM_OFF — Pi 4 bare-metal runs at EL2 with no secure monitor; PM_RSTS/watchdog halt is the wiring this needs) ::");
         } #[cfg(feature = "login")] Verb::LogOut => { serial_println!(":: SHARD: log out — the session closes and the login screen returns ::"); login::reopen_after_logout(); } #[cfg(feature = "login")] Verb::Lock => { serial_println!(":: SHARD: lock — the login screen covers the live session ::"); let _ = login::lock(); } #[cfg(feature = "login")] Verb::Settings => { serial_println!(":: SHARD: settings — the settings window opens ::"); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::settings::request_open(); } // LOGIN M4 — the ACTION, not a print: `reopen_after_logout` calls `fs::users::logout()` (the session principal is dropped, so every later launch is anonymous and every owned file is refused it) and puts the screen back up, where a second login opens a NEW session. ⚠ LINE-NEUTRAL append.
@@ -735,7 +737,13 @@ pub fn press_at(x: i32, y: i32) -> bool {
     if OPEN.load(Ordering::Acquire) {
         if let Some(r) = menu_rect(pw, ph) {
             if menu_contains(r, px, py) {
+                if super::powerui::panel_open() { PRESS_OUTCOME.store(OUT_KEPT, Ordering::Relaxed); return true; } // POWERMENU M2: a press inside the battery panel is swallowed
                 return match item_at(r, px, py) {
+                    Some(verb) if matches!(verb, Verb::Restart | Verb::ShutDown) && verb.real() && !super::powerui::confirm(if matches!(verb, Verb::Restart) { 1 } else { 2 }) => { // POWERMENU M1: first click arms, the menu stays open and the row re-reads
+                        PRESS_OUTCOME.store(OUT_KEPT, Ordering::Relaxed);
+                        super::wm::composite();
+                        true
+                    }
                     Some(verb) => {
                         PICKS.fetch_add(1, Ordering::Relaxed);
                         LAST_VERB.store(verb.ord(), Ordering::Relaxed);
@@ -771,6 +779,9 @@ pub fn press_at(x: i32, y: i32) -> bool {
     // bar chrome composited above the windows, so this claims nothing a window's own chrome could
     // own. The DROPDOWN's position is NOT read from the glyph — [`menu_rect`] anchors it at the
     // panel's left edge independently (render9).
+    if let Some((bx, by, bw, bh)) = menubar::batt_box_abs(pw, ph) { // POWERMENU M2: a click on the battery item opens the panel
+        if px >= bx && px < bx + bw && py >= by && py < by + bh { open_battery_panel(pw, ph); return true; }
+    }
     if let Some((zx, zy, zw, zh)) = menubar::crystal_corner_abs(pw, ph) {
         if px >= zx && px < zx + zw && py >= zy && py < zy + zh {
             // The witness's `via=` word: on the painted glyph itself, or in the widened cell.
@@ -915,7 +926,7 @@ pub fn compose() -> bool {
     if clobbered {
         CLOBBERS.fetch_add(1, Ordering::Relaxed);
     }
-    let sig = strip::seal(strip::fnv1a_u64(strip::FNV_BASIS, strip::pack_rect(Some(r))));
+    let sig = strip::seal(strip::fnv1a_u64(strip::fnv1a_u64(strip::FNV_BASIS, strip::pack_rect(Some(r))), super::powerui::armed_code() as u64 | ((super::powerui::panel_open() as u64) << 8))); // POWERMENU: the armed label / panel mode repaint
     if sig == SLOT.sig() && SLOT.packed() == strip::pack_rect(Some(r)) && !clobbered {
         return false;
     }
@@ -970,6 +981,16 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
         return; // a pure border row — nothing else on it
     }
 
+    if super::powerui::panel_open() { // POWERMENU M2: one text line per ITEM_H band
+        let li = (j - BORDER) / ITEM_H;
+        let sy = (j - BORDER) % ITEM_H;
+        if sy >= (ITEM_H - CELL_H) / 2 && sy < (ITEM_H - CELL_H) / 2 + CELL_H {
+            let mut buf = [0u8; 48];
+            let n = super::powerui::panel_line(li, &mut buf);
+            super::font::draw_row(out, w, &buf[..n], BORDER + PADX, sy - (ITEM_H - CELL_H) / 2, theme::TITLE_TEXT_ACTIVE, false, FACE);
+        }
+        return;
+    }
     let Some(row) = row_at(j) else {
         return;
     };
@@ -995,7 +1016,7 @@ fn compose_row(out: &mut [u32], r: strip::Rect, j: usize) {
             // FONT (GR27) — the shared anti-aliased face, blended over the row fill the loop above
             // painted (RAM scratch — the blend's read is cached). Regular weight: menu items are
             // body text, not a caption.
-            let label = ROWS[row].label.as_bytes();
+            let label = match ROWS[row].verb { Some(Verb::Restart) => super::powerui::armed_label(1), Some(Verb::ShutDown) => super::powerui::armed_label(2), _ => None }.unwrap_or(ROWS[row].label).as_bytes(); // POWERMENU M1: the armed row re-reads
             super::font::draw_row(out, w, label, BORDER + PADX, sy, theme::TITLE_TEXT_ACTIVE, false, FACE);
         }
     }
@@ -1362,3 +1383,50 @@ pub fn logout_row_fire() -> bool {
     );
     ok
 }
+
+
+// ── POWERMENU (R75) M2 — the battery panel, a second MODE of this dropdown ─────────────────────
+/// The panel's rect: right-flush under the bar (the battery item lives at the bar's right), one text line per ITEM_H.
+fn panel_rect(pw: usize, ph: usize) -> Option<strip::Rect> {
+    let (_bx, by, _bw, bh) = menubar::strip_rect(pw, ph)?;
+    let w = 2 * BORDER + 2 * PADX + super::powerui::PANEL_GLYPHS * CELL_W;
+    let h = 2 * BORDER + super::powerui::panel_rows().max(1) * ITEM_H;
+    let my = by + bh;
+    if w > pw || my + h > ph { return None; }
+    Some((pw - w, my, w, h))
+}
+
+/// Open the battery panel (a click on the menubar battery item). A SHARD menu already open is dismissed first.
+pub fn open_battery_panel(pw: usize, ph: usize) {
+    if OPEN.load(Ordering::Acquire) { dismiss("battery"); }
+    let n = super::powerui::panel_fill();
+    super::powerui::panel_set();
+    serial_println!(":: POWER-UI: battery panel open rows={} ::", n);
+    open_via(pw, ph, "battery-item");
+}
+
+/// `tests power` leg: a forced reading, the panel opened through the real path, its rows resolved, then closed.
+#[cfg(feature = "witness")]
+pub fn power_panel_selftest() -> bool {
+    let saved = super::status::snapshot_state();
+    super::status::inject(Some(super::status::Battery { percent: 7, charging: false, minutes: None, ma: -1200, mv: 11800 }));
+    let n = super::powerui::panel_fill();
+    let fb = super::panel_snapshot().filter(|f| f.is_ready());
+    let mut ok = n >= 5;
+    if let Some(fb) = fb {
+        let (pw, ph) = (fb.width(), fb.height());
+        open_battery_panel(pw, ph);
+        let rect = menu_rect(pw, ph);
+        let mut row = [0u32; 512];
+        let drew = rect.map(|r| { let mut any = false; if r.2 <= row.len() { compose_row(&mut row, r, BORDER + (ITEM_H - CELL_H) / 2 + CELL_H / 2); any = row[BORDER + PADX..r.2 - BORDER].iter().any(|&c| c != theme::CHROME_FACE); } any }).unwrap_or(false);
+        ok = ok && OPEN.load(Ordering::Relaxed) && super::powerui::panel_open() && rect.is_some() && drew;
+        dismiss("fixture");
+        ok = ok && !OPEN.load(Ordering::Relaxed) && !super::powerui::panel_open();
+    } else {
+        super::powerui::panel_clear(); // no panel on this lane: the text model alone is the leg
+    }
+    super::status::restore_state(saved);
+    ok
+}
+#[cfg(not(feature = "witness"))]
+pub fn power_panel_selftest() -> bool { false }

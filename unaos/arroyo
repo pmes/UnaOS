@@ -262,6 +262,7 @@ _feats=""
 # reaches the boot media.
 [ -n "${UNAOS_WCDVALVE:-}" ] && _feats="${_feats}wcdvalve,"
 [ -n "${UNAOS_SKIP_XHCI:-}" ] && _feats="${_feats}skip_xhci,"
+[ -n "${UNAOS_LOWBAT_SHUTDOWN:-}" ] && _feats="${_feats}lowbat_shutdown," # POWERMENU M3: value (percent) is read by option_env! in video/powerui.rs
 [ -n "${UNAOS_BOOTLOG:-}" ] && _feats="${_feats}bootlog,"
 # CLOCK-2: UNAOS_LOGTS=1 arms the `logts` feature — a compact timestamp prefix on each serial LINE
 # (monotonic ms → UTC after a civil anchor). CLOCK-2b: the prefix covers the UART and both capture

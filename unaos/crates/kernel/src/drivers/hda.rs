@@ -2360,7 +2360,7 @@ pub mod vol {
     use super::*;
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-    static BASE: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BASE: AtomicU64 = AtomicU64::new(0);
     static CAD: AtomicU32 = AtomicU32::new(0);
     /// Per path node: bit16 valid, bits15:8 steps, bits7:0 nid.
     const Z: AtomicU32 = AtomicU32::new(0);
@@ -2614,3 +2614,22 @@ fn disc_read(base: u64, sd: u64, rings: &mut Rings, cad: u8, paths: &[Path; tone
 #[cfg(feature = "hda-tone")]
 #[path = "hda_play.rs"]
 pub mod play;
+
+/// POWERMENU (R75) M1: quiet the controller before the ACPI call.
+pub mod powerdown {
+    use super::*;
+    use core::sync::atomic::Ordering;
+    /// Clear RUN on every stream descriptor (input then output engines) of the controller the volume path captured.
+    /// `false` = no controller was captured (nothing to stop), never a failure.
+    pub fn stop() -> bool {
+        let base = vol::BASE.load(Ordering::Relaxed);
+        if base == 0 { return false; }
+        let gcap = r32(base, 0x00) & 0xFFFF;
+        let streams = ((gcap >> 12) & 0xF) + ((gcap >> 8) & 0xF) + ((gcap >> 4) & 0x1F); // OSS + ISS + BSS
+        for i in 0..streams as u64 {
+            let sd = 0x80 + 0x20 * i; // SD_BASE + stride
+            w8(base, sd, r8(base, sd) & !0x02); // SDCTL.RUN
+        }
+        true
+    }
+}
