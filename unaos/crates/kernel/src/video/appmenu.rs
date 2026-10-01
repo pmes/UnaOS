@@ -17,7 +17,7 @@
 // that EXIST at publish time (a window created later picks it up on the next publish); (2) the bar's
 // tables want `&'static` rows, so each DISTINCT tree is leaked once — bounded by `LEAK_MAX`, identical
 // re-publishes cost nothing; (3) x86-only, the board the input ring and bus dispatch live on.
-#![cfg(target_arch = "x86_64")]
+// ARMROUTER: opened to aarch64 desktop_firmware (the gate is on `pub mod appmenu` in video/mod.rs).
 
 use super::winmenu::{self, MenuItem, MenuTitle, MENU_TITLES_MAX};
 use super::wm;
