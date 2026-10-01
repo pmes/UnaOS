@@ -29579,6 +29579,7 @@ pub fn splash_open(surf: usize, surf_len: usize, w: usize, h: usize) -> WinId {
     }
     composite();
     id
+}
 
 /// TEXTEDIT — rename a live window's caption (the editor's dirty mark). Clamped to [`MAX_TITLE`];
 /// the row is damaged whole and repainted by the next compositor pass (no composite from here).
