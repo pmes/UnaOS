@@ -3728,6 +3728,9 @@ una-abi = { path = "../una-abi" }
 # `midden_core::Facts` built with `cfg!()`, so ONE compiled core tells the truth
 # on x86 and aarch64 both.
 midden_core = { path = "../../libs/sys/midden_core", default-features = false }
+# PREFS (rmbp-ledger B300): Principia's shared preference core — value model + TOML subset codec, the
+# same crate `handlers/principia` links. no_std + alloc, zero deps; arch-neutral.
+prefs_core = { path = "../../libs/sys/prefs_core" }
 net = { path = "../net" }
 fdt = "0.1.5"
 # RAST-1 / RAST-TEGRA: platform-neutral (no_std, arch-agnostic) software rasterizer. `optional` so

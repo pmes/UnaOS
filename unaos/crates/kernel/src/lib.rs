@@ -264,3 +264,5 @@ pub mod net_fetch;
 // so no existing line moves.
 #[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "sntp6", feature = "net6", target_arch = "aarch64")))]
 pub mod net_tick;
+// PREFS (rmbp-ledger B300): the kernel side of Principia's ONE preference store (prefs_core shared core); both arches. Tail statement, so no existing line moves.
+pub mod prefs;

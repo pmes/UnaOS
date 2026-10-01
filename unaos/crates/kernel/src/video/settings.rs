@@ -12,16 +12,17 @@
 //! 8 Change Password (the login screen's set-password form for the session user). The Clock 24h/12h
 //! toggle is omitted: CLOCKBAR's glyph path is not a runtime switch.
 //!
-//! Every change prints `[settings] <name>=<value> applied=<0|1>` and is saved to
-//! `<home>/.settings` (`key=value` lines) through the mount table; [`service`] reads it once per
-//! login (`[settings] loaded n=<n>`). Absent keys keep the OS defaults.
+//! Every change prints `[settings] <name>=<value> applied=<0|1>` and is persisted to PRINCIPIA'S store —
+//! `<home>/.config/unaos/preferences.toml`, namespace `system` (`crate::prefs`, PREFS B300; the private
+//! `<home>/.settings` this window used to keep is gone, imported once and deleted). [`service`] applies the
+//! store's keys once per login (`[settings] loaded n=<n>`). Absent keys keep the OS defaults.
 //!
 //! Mouse: press a slider track to set it, a toggle/segment/button to act. (No drag: the wm drag seam
 //! belongs to window frames; a press-to-set is the claim.) Keyboard: Up/Down/Tab move the selection,
 //! Left/Right adjust, Enter toggles/applies; typing edits the wallpaper path while it is selected.
 //!
 //! SETTINGS2: four TABS (General · Users · Display · About; Left/Right on the strip or a click switches, the choice
-//! persists as `tab=`); Users = list + Add / Delete (two-step) / Reset password, every action a
+//! persists as `system.settings.tab`); Users = list + Add / Delete (two-step) / Reset password, every action a
 //! `[settings] users op= name= ok= reason=` line; Display = idle blank, UI scale (read-only: the compositor fixes it at
 //! takeover), clock (fixed: CLOCKBAR has no runtime switch); About = version, board, CPUs, RAM, uptime.
 //!
@@ -81,7 +82,7 @@ pub struct Values {
     pub idle_min: u32,
     pub ptr: u8,
     pub wall: String,
-    /// The selected tab (M1), persisted as `tab=`.
+    /// The selected tab (M1), persisted as `system.settings.tab`.
     pub tab: u8,
 }
 
@@ -99,38 +100,39 @@ struct State {
     surf: Vec<u32>,
 }
 
-// ── Pure: the file format ─────────────────────────────────────────────────────────────────────
+// ── The store: Principia's, through `crate::prefs` ─────────────────────────────────────────────
 
-/// `key=value` lines for `v`. Pure.
-pub fn serialize(v: &Values) -> String {
-    alloc::format!(
-        "brightness={}\nvolume={}\nmute={}\nidle_min={}\npointer={}\nwallpaper={}\ntab={}\n",
-        v.bright, v.vol, v.mute as u8, v.idle_min, v.ptr, v.wall, v.tab
-    )
+/// Read the persisted keys from the preference store into `v`; returns a bitmask of the keys that were
+/// present and valid (bit order = control order 0..5, tab = 6) and how many that is. Out-of-range values
+/// and wrong types are ignored (the default holds).
+pub fn from_prefs(v: &mut Values) -> (u32, usize) {
+    use crate::prefs::{flag, int, key, text};
+    let mut mask = 0u32;
+    if let Some(x) = int(key::BRIGHTNESS, 0, 16) { v.bright = x as u8; mask |= 1 << 0; }
+    if let Some(x) = int(key::VOLUME, 0, 16) { v.vol = x as u8; mask |= 1 << 1; }
+    if let Some(x) = flag(key::MUTE) { v.mute = x; mask |= 1 << 2; }
+    if let Some(x) = int(key::IDLE_MIN, 0, 1440) { v.idle_min = x as u32; mask |= 1 << 3; }
+    if let Some(x) = int(key::POINTER, 0, 2) { v.ptr = x as u8; mask |= 1 << 4; }
+    if let Some(x) = text(key::WALLPAPER).filter(|w| w.len() <= WALL_MAX && w.bytes().all(|b| (0x20..=0x7e).contains(&b))) { v.wall = x; mask |= 1 << 5; }
+    if let Some(x) = int(key::SETTINGS_TAB, 0, TABS as i64 - 1) { v.tab = x as u8; mask |= 1 << 6; }
+    (mask, mask.count_ones() as usize)
 }
 
-/// Parse `text` into `v`; returns a bitmask of the keys that were present and valid (bit order =
-/// control order 0,1,2,3,4,5) and how many that is. Unknown keys and bad values are ignored. Pure.
-pub fn parse(text: &str, v: &mut Values) -> (u32, usize) {
-    let (mut mask, mut n) = (0u32, 0usize);
-    for line in text.lines() {
-        let Some((k, val)) = line.split_once('=') else { continue };
-        let (k, val) = (k.trim(), val.trim());
-        let num = val.parse::<u32>().ok();
-        let bit = match (k, num) {
-            ("brightness", Some(x)) if x <= 16 => { v.bright = x as u8; 0 }
-            ("volume", Some(x)) if x <= 16 => { v.vol = x as u8; 1 }
-            ("mute", Some(x)) if x <= 1 => { v.mute = x == 1; 2 }
-            ("idle_min", Some(x)) if x <= 1440 => { v.idle_min = x; 3 }
-            ("pointer", Some(x)) if x <= 2 => { v.ptr = x as u8; 4 }
-            ("wallpaper", _) if val.len() <= WALL_MAX && val.bytes().all(|b| (0x20..=0x7e).contains(&b)) => { v.wall = String::from(val); 5 }
-            ("tab", Some(x)) if (x as usize) < TABS => { v.tab = x as u8; 6 }
-            _ => continue,
-        };
-        mask |= 1 << bit;
-        n += 1;
+/// Persist control `i`'s current value (6 = the tab) as its `system.*` key — one key per change.
+fn persist(i: usize) {
+    use crate::prefs::{key, set_sys, PrefValue as P};
+    let c = CUR.lock().clone();
+    match i {
+        0 => set_sys(key::BRIGHTNESS, P::Int(c.bright as i64)),
+        1 | 2 => { set_sys(key::VOLUME, P::Int(c.vol as i64)); set_sys(key::MUTE, P::Bool(c.mute)); }
+        3 => set_sys(key::IDLE_MIN, P::Int(c.idle_min as i64)),
+        4 => set_sys(key::POINTER, P::Int(c.ptr as i64)),
+        5 => set_sys(key::WALLPAPER, P::Str(c.wall)),
+        _ => set_sys(key::SETTINGS_TAB, P::Int(c.tab as i64)),
     }
-    (mask, n)
+    let mut v = Values::DEFAULT;
+    SAVED_N.store(from_prefs(&mut v).1 as u32, Ordering::Relaxed);
+    witness(true);
 }
 
 /// Nearest [`IDLE_STEPS`] index for `m` minutes. Pure.
@@ -215,45 +217,6 @@ fn user_name() -> Option<String> {
     { None }
 }
 
-/// Where the values live: `<home>/.settings`, or `/.settings` with no session (the fixture's case).
-fn settings_path() -> String {
-    match home() { Some(h) => alloc::format!("{}/.settings", h.trim_end_matches('/')), None => String::from("/.settings") }
-}
-
-/// Write the current values to the file. `Ok(keys written)`.
-pub fn save(print: bool) -> Result<usize, String> {
-    use crate::fs::vfs::NodeKind;
-    let v = CUR.lock().clone();
-    let text = serialize(&v);
-    let path = settings_path();
-    let mt = crate::shell::vfs_mount_table();
-    let p = crate::fs::vfs::KERNEL_PRINCIPAL;
-    let _ = mt.unlink(&path, p);
-    mt.create(&path, NodeKind::File, p).map_err(|e| alloc::format!("create: {:?}", e))?;
-    let b = text.as_bytes();
-    let mut off = 0usize;
-    while off < b.len() {
-        let w = mt.write(&path, off as u64, &b[off..], p).map_err(|e| alloc::format!("write: {:?}", e))?;
-        if w == 0 { return Err(String::from("write: zero")); }
-        off += w;
-    }
-    SAVED_N.store(7, Ordering::Relaxed);
-    serial_println!("[settings] saved path={} bytes={}", path, off);
-    if print { witness(true); }
-    Ok(7)
-}
-
-/// Read the file, if there is one, into `v`. `(mask, n)`.
-fn read_file(v: &mut Values) -> Option<(u32, usize)> {
-    let path = settings_path();
-    let mt = crate::shell::vfs_mount_table();
-    let st = mt.stat(&path).ok()?;
-    let want = core::cmp::min(st.size as usize, 4096);
-    let got = mt.read(&path, 0, want).ok()?;
-    let text = core::str::from_utf8(&got).ok()?;
-    Some(parse(text, v))
-}
-
 fn witness(ok: bool) {
     serial_println!(
         ":: SETTINGS: controls={} tabs={} loaded={} saved={} -> {} ::",
@@ -261,13 +224,14 @@ fn witness(ok: bool) {
     );
 }
 
-/// Load the file for the session user and apply the keys it carries.
+/// Load the store for the session user and apply the keys it carries.
 fn load_for_login() {
+    crate::prefs::ensure_loaded();
     let mut v = CUR.lock().clone();
-    let (mask, n) = read_file(&mut v).unwrap_or((0, 0));
+    let (mask, n) = from_prefs(&mut v);
     *CUR.lock() = v.clone();
     LOADED_N.store(n as u32, Ordering::Relaxed);
-    serial_println!("[settings] loaded n={} user={}", n, user_name().unwrap_or_default());
+    serial_println!("[settings] loaded n={} user={} store={}", n, user_name().unwrap_or_default(), crate::prefs::path());
     if mask & 1 != 0 { apply_bright(v.bright); }
     if mask & 2 != 0 || mask & 4 != 0 { apply_volume(v.vol, v.mute); }
     if mask & 8 != 0 { apply_idle(v.idle_min); }
@@ -291,7 +255,7 @@ fn set(i: usize, val: usize) {
         }
     }
     say(NAMES[i], &vtxt, applied);
-    if let Err(e) = save(true) { serial_println!("[settings] save FAILED reason={}", e); }
+    persist(i);
     repaint();
 }
 
@@ -300,7 +264,7 @@ fn do_wallpaper(off: bool) {
     if off { CUR.lock().wall = String::new(); }
     let ok = apply_wall(if off { "off" } else { &path });
     say("wallpaper", if off { "off" } else { &path }, ok);
-    if let Err(e) = save(true) { serial_println!("[settings] save FAILED reason={}", e); }
+    persist(5);
     repaint();
 }
 
@@ -353,11 +317,28 @@ pub fn request_open() {
     OPEN_REQ.store(true, Ordering::Release);
 }
 
-/// Drain the open latch and load the file once per login. Chained from `quarry::live::service`.
+/// Drain the open latch and load the store once per login. Chained from `quarry::live::service`.
 pub fn service() {
+    crate::prefs::service();
     if let Some(u) = user_name() {
         let fresh = { let mut g = LOADED_FOR.lock(); if *g != u { *g = u; true } else { false } };
         if fresh { load_for_login(); }
+    }
+    // The brightness keys (F1/F2) and the volume keys (F10-F12) change the live level from the input
+    // paths, where no VFS work may run: this pass notices the change and persists it (PREFS B300).
+    if user_name().is_some() && !LOADED_FOR.lock().is_empty() {
+        let (lv, m) = crate::video::status::volume();
+        let bl = crate::video::brightkeys::level();
+        let (dv, db) = {
+            let mut c = CUR.lock();
+            let dv = c.vol != lv || c.mute != m;
+            let db = c.bright != bl;
+            if dv { c.vol = lv; c.mute = m; }
+            if db { c.bright = bl; }
+            (dv, db)
+        };
+        if db { persist(0); }
+        if dv { persist(1); }
     }
     if OPEN_REQ.swap(false, Ordering::AcqRel) {
         if let Err(e) = open() {
@@ -756,7 +737,7 @@ fn sel() -> usize {
     STATE.lock().as_ref().map(|s| s.sel).unwrap_or(0)
 }
 
-/// Switch to tab `t`: persist it (`tab=` in `.settings`), reset the tab's transient state, repaint.
+/// Switch to tab `t`: persist it (`system.settings.tab`), reset the tab's transient state, repaint.
 fn switch_tab(t: usize) {
     let t = t.min(TABS - 1);
     CUR.lock().tab = t as u8;
@@ -766,7 +747,7 @@ fn switch_tab(t: usize) {
         if let Some(&c) = tab_ctrls(t).first() { st.sel = c; }
     }
     serial_println!("[settings] tab={}", TAB_NAMES[t]);
-    if let Err(e) = save(true) { serial_println!("[settings] save FAILED reason={}", e); }
+    persist(6);
     repaint();
 }
 
@@ -975,25 +956,32 @@ fn press_users(row: usize, cx: usize) {
 
 // ── The fixture ───────────────────────────────────────────────────────────────────────────────
 
-/// SETTINGS — open the window, set idle to 5 minutes, save, re-read the file, compare, restore.
+/// SETTINGS — open the window, set idle to 5 minutes (persisted to Principia's store), re-read the FILE
+/// through the VFS, parse it with prefs_core, compare, restore.
 #[cfg(feature = "witness")]
 pub fn selftest() {
     let before = CUR.lock().clone();
     let opened = open().is_ok();
     set(3, idle_index(5));
     let want = CUR.lock().clone();
-    let saved = save(false);
+    let file = crate::prefs::read_file();
     let mut back = Values::DEFAULT;
-    let re = read_file(&mut back);
-    let same = re.map(|(mask, n)| mask & 0b001000 != 0 && n >= 4).unwrap_or(false)
-        && back.idle_min == 5 && back.bright == want.bright && back.vol == want.vol && back.mute == want.mute && back.ptr == want.ptr && back.wall == want.wall;
-    LOADED_N.store(re.map(|r| r.1 as u32).unwrap_or(0), Ordering::Relaxed);
+    let same = match &file {
+        Some(Ok(t)) => {
+            let n = |k: &str| t.get(crate::prefs::NS, k).and_then(|v| v.as_int());
+            back.idle_min = n(crate::prefs::key::IDLE_MIN).unwrap_or(0) as u32;
+            back.idle_min == 5 && *t == crate::prefs::snapshot() && from_prefs(&mut back).0 & 0b001000 != 0 && back.bright == want.bright && back.vol == want.vol && back.mute == want.mute && back.ptr == want.ptr && back.wall == want.wall
+        }
+        _ => false,
+    };
+    let saved = file.is_some();
+    LOADED_N.store(from_prefs(&mut Values::DEFAULT.clone()).1 as u32, Ordering::Relaxed);
     let live = crate::video::dimidle::idle_min() == 5;
-    // Restore the operator's idle value and the file.
+    // Restore the operator's idle value (and its key).
     set(3, idle_index(before.idle_min));
     if opened { close(); }
-    let ok = saved.is_ok() && same && live;
-    serial_println!("[settings] fixture opened={} saved={:?} reread_same={} live_idle={}", opened as u8, saved.is_ok(), same as u8, live as u8);
+    let ok = saved && same && live;
+    serial_println!("[settings] fixture opened={} saved={:?} reread_same={} live_idle={} store={}", opened as u8, saved, same as u8, live as u8, crate::prefs::path());
     witness(ok);
 }
 

@@ -217,15 +217,12 @@ const HEADER: &str = "\
 // VALIDATION
 // ---------------------------------------------------------------------------
 
-fn valid_segment(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
+// The rule itself lives in `prefs_core` (PREFS, rmbp-ledger B300) so the kernel, which reads and
+// writes this same file, cannot drift from it; these keep Principia's `anyhow` messages.
 
 /// A namespace is a single bare-key segment: `aether`, `stria`, `system`.
 pub fn validate_ns(ns: &str) -> Result<()> {
-    if !valid_segment(ns) {
+    if prefs_core::validate_ns(ns).is_err() {
         bail!(
             "invalid namespace `{ns}`: expected a non-empty \
              [A-Za-z0-9_-] identifier"
@@ -237,7 +234,7 @@ pub fn validate_ns(ns: &str) -> Result<()> {
 /// A key is one or more dot-separated bare-key segments: `homepage`,
 /// `window.width`.
 pub fn validate_key(key: &str) -> Result<()> {
-    if key.is_empty() || !key.split('.').all(valid_segment) {
+    if prefs_core::validate_key(key).is_err() {
         bail!(
             "invalid key `{key}`: expected dot-separated non-empty \
              [A-Za-z0-9_-] segments"
@@ -257,9 +254,27 @@ fn colliding_key<'a>(entries: &'a Namespace, key: &str) -> Option<&'a str> {
 }
 
 fn is_prefix_path(a: &str, b: &str) -> bool {
-    let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
-    long.strip_prefix(short)
-        .is_some_and(|rest| rest.starts_with('.'))
+    prefs_core::is_prefix_path(a, b)
+}
+
+/// The bus value as the shared core's value (lossless: the same four scalars).
+pub fn to_core(v: &PrefValue) -> prefs_core::PrefValue {
+    match v {
+        PrefValue::Str(s) => prefs_core::PrefValue::Str(s.clone()),
+        PrefValue::Int(i) => prefs_core::PrefValue::Int(*i),
+        PrefValue::Float(f) => prefs_core::PrefValue::Float(*f),
+        PrefValue::Bool(b) => prefs_core::PrefValue::Bool(*b),
+    }
+}
+
+/// The shared core's value as the bus value.
+pub fn from_core(v: &prefs_core::PrefValue) -> PrefValue {
+    match v {
+        prefs_core::PrefValue::Str(s) => PrefValue::Str(s.clone()),
+        prefs_core::PrefValue::Int(i) => PrefValue::Int(*i),
+        prefs_core::PrefValue::Float(f) => PrefValue::Float(*f),
+        prefs_core::PrefValue::Bool(b) => PrefValue::Bool(*b),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -515,5 +530,73 @@ mod tests {
         let path = dir.path().join("preferences.toml");
         fs::write(&path, "this is not = = toml").unwrap();
         assert!(PrefStore::load(&path).is_err());
+    }
+
+    /// PREFS (B300): the tree `prefs_core`'s golden test uses, built through THIS store.
+    fn golden_store(dir: &tempfile::TempDir) -> PrefStore {
+        let mut s = store(dir);
+        s.set("aether", "homepage", PrefValue::Str("https://una.os/".into())).unwrap();
+        s.set("aether", "window.width", PrefValue::Int(1280)).unwrap();
+        s.set("aether", "window.height", PrefValue::Int(-800)).unwrap();
+        s.set("aether", "window.deep.on", PrefValue::Bool(true)).unwrap();
+        s.set("aether", "quote", PrefValue::Str("say \"hi\" \\ there".into())).unwrap();
+        s.set("aether", "lines", PrefValue::Str("a\nb".into())).unwrap();
+        s.set("aether", "ctl", PrefValue::Str("a\tb\u{7}".into())).unwrap();
+        s.set("aether", "apos", PrefValue::Str("it's".into())).unwrap();
+        s.set("aether", "uni", PrefValue::Str("héllo — ok".into())).unwrap();
+        s.set("system", "display.brightness", PrefValue::Int(12)).unwrap();
+        s.set("system", "display.scale", PrefValue::Float(2.0)).unwrap();
+        s.set("system", "display.gamma", PrefValue::Float(1.5e-7)).unwrap();
+        s.set("system", "display.big", PrefValue::Float(1e20)).unwrap();
+        s.set("system", "audio.mute", PrefValue::Bool(false)).unwrap();
+        s.set("system", "dock.pins", PrefValue::Str("console,shell,quarry".into())).unwrap();
+        s
+    }
+
+    /// PREFS (B300): every file this store writes is inside the kernel's subset — `prefs_core` parses it
+    /// to the same values and re-emits it byte for byte; and the golden `prefs_core` tests against is
+    /// exactly what this store writes today (a `toml` upgrade that changed the layout fails HERE).
+    #[test]
+    fn prefs_core_accepts_every_to_toml_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = golden_store(&dir);
+        let text = s.to_toml().unwrap();
+        assert_eq!(
+            text,
+            include_str!("../../../unaos/libs/sys/prefs_core/tests/principia_golden.toml"),
+            "prefs_core's golden is no longer what principia writes"
+        );
+        let tree = prefs_core::PrefTree::parse(&text).expect("prefs_core accepts principia's output");
+        assert_eq!(tree.to_toml(), text, "byte-identical re-emit");
+        for ns in s.namespaces() {
+            let mine: Vec<_> = s.list(&ns).into_iter().map(|(k, v)| (k, to_core(&v))).collect();
+            let core: Vec<_> = tree.list(&ns).into_iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
+            assert_eq!(mine, core, "namespace {ns}");
+        }
+        // A single-key file (the shape a fresh kernel store writes) too.
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut one = store(&dir2);
+        one.set("system", "display.idle_min", PrefValue::Int(10)).unwrap();
+        let t1 = one.to_toml().unwrap();
+        assert_eq!(prefs_core::PrefTree::parse(&t1).unwrap().to_toml(), t1);
+    }
+
+    /// PREFS (B300): a file the KERNEL wrote (prefs_core's emitter) loads here to the same values.
+    #[test]
+    fn a_prefs_core_file_loads_in_principia() {
+        let mut t = prefs_core::PrefTree::new();
+        t.set("system", "display.brightness", prefs_core::PrefValue::Int(9)).unwrap();
+        t.set("system", "display.wallpaper", prefs_core::PrefValue::Str("/home/ann/SKY.PNG".into())).unwrap();
+        t.set("system", "audio.mute", prefs_core::PrefValue::Bool(true)).unwrap();
+        t.set("system", "dock.pins", prefs_core::PrefValue::Str("console,shell".into())).unwrap();
+        t.set("system", "pointer.speed", prefs_core::PrefValue::Int(2)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.toml");
+        fs::write(&path, t.to_toml()).unwrap();
+        let s = PrefStore::load(&path).unwrap();
+        for (ns, key, v) in t.entries() {
+            assert_eq!(s.get(ns, key).map(|v| to_core(&v)), Some(v.clone()), "{ns}.{key}");
+        }
+        assert_eq!(s.to_toml().unwrap(), t.to_toml(), "and principia re-writes it byte for byte");
     }
 }
