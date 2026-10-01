@@ -56,6 +56,7 @@
 /// platform resets, or the failure witness prints and the core parks in `hlt_loop`.
 pub fn reboot() -> ! {
     serial_println!("[pwrreboot] reboot verb invoked — dispatching the platform mechanism");
+    crate::fs::fat::flush_pending_dirent_by("shutdown"); // SDHCMULTI2 M2: a deferred dir entry must not die with the power
     platform_reboot()
 }
 
@@ -66,6 +67,7 @@ pub fn shutdown() -> ! {
     serial_println!("[pwrshutoff] shutdown verb invoked — dispatching the platform mechanism");
     #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
     crate::drivers::gpu::kepler_vblank::shutdown_census(); // KVBLANK6 — the kept-live vector's last census
+    crate::fs::fat::flush_pending_dirent_by("shutdown"); // SDHCMULTI2 M2
     platform_shutdown()
 }
 
