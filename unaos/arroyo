@@ -8284,6 +8284,18 @@ BRACEPY
         [ "$_vrrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a shell verb is in one table and not the other (see GATE-VERBS above)${COLOR_RESET}"; return 1; }
     fi
 
+    # GATE-CHARTER (AUDIT 2026-10-01, B297): every kernel file in the app-domain scope (video/, fs/,
+    #   install/, selfhost/, the shell files, hda_play) names the CODEX handler that owns its domain and
+    #   the seam it sits on (`CHARTER: <Handler> — <seam>` header, or a grandfather row in
+    #   `scripts/charter.registry`), and every `<home>/.name` literal the kernel writes is an allowlisted
+    #   dotfile. Four control probes first; a control that does not fire is exit 2 and NO verdict.
+    local _chrc=0
+    "$WORKSPACE_DIR/scripts/charter-check.sh" "$WORKSPACE_DIR" || _chrc=$?
+    if [ "$_chrc" -ne 0 ]; then
+        [ "$_chrc" -eq 2 ] && echo -e "${COLOR_RED}❌ charter gate gave NO VERDICT — its controls did not fire, which is not a clean tree${COLOR_RESET}"
+        [ "$_chrc" -eq 1 ] && { echo -e "${COLOR_RED}❌ check FAILED — a kernel file declares no owning handler, or writes a dotfile off the allowlist (see GATE-CHARTER above)${COLOR_RESET}"; return 1; }
+    fi
+
     # GATE-TESTROOTS (TESTROOTS, rmbp, 2026-09-16): GATE-ROOTS' shape applied to the THIRD kind of
     # root, and the CLASS that GATE-FOREMAN one leg above closed for exactly one file. A `#[test]`
     # is nobody's dependency either — `cargo build` never compiles it and no kernel leg links it —

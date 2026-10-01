@@ -40,4 +40,14 @@ MANDATORY HEAD (docs/dev/EXECUTOR-BRIEF.md):
    gate runs this way on 2026-09-16, and a seat then killed a fourth trusting a pid an executor had
    reported). Stop only your own task, or a pid whose `/proc/<pid>/cwd` you have READ and which is under
    YOUR worktree — read first, kill in a later command, never both in one. LAWS §4 and §6 say the same.
+11. CHARTER BEFORE CODE (GATE-CHARTER, AUDIT 2026-10-01): before the first edit, name the
+   `docs/CODEX.md` §2 handler that owns the domain you are about to build in, and the SEAM: `wm`,
+   `driver` or `fs-core` (the kernel's own), `shared-core` (a `no_std` lib both rings link — the
+   midden_core shape), `fulfiller` (the kernel fulfils the owner's bus verbs), `kernel-by-ruling R<id>`,
+   or `owed B<id>` (you are building beside a live handler and a ledger row says it must move). Write it
+   as the first `CHARTER:` line of every NEW kernel file in video/, fs/, install/, selfhost/ and the
+   shell files; `./arroyo check` reds a file without one. A PREFERENCE (anything the operator sets and
+   expects to find again) is Principia's: it goes in Principia's store, never a new `<home>/.name`
+   file — the gate reds a dotfile literal with no allowlist row. If the owner is live on the host and
+   you are not sharing its core, STOP and say so in your design before writing the duplicate.
 ```

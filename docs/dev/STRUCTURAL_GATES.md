@@ -2494,3 +2494,44 @@ row and summary; GATE-FOREMAN's agreement test gained `agrees_with_mbench_on_for
 that is not checked, a value-quoting literal reachable through its `whole=` label, and the VUG's line
 unreachable in the kernel alone (named `kernel.elf`) yet reachable in the directory (named `esp/`) —
 plus the assertion that the artifact never changes an exit code. Measured on a real pair in `docs/dev/evidence/rmbp-0924/gates/GATES.md` §B210.
+
+## GATE-CHARTER — a kernel file names the handler that owns its domain before the code exists (B297, 2026-10-01)
+
+**The hole.** Three waves of desktop features (2026-09-24 → 2026-10-01) went into the kernel beside
+live Ring-3 handlers that own the domain by `docs/CODEX.md` §2: a Settings window with its own
+`<home>/.settings` beside Principia's TOML store, a Trash beside Matrix, an editor beside Tabula, a
+WAV player beside Stria, each with private persistence. LAWS line 33 said charters come from the
+manifest; no brief step, fold step or check read it. Peter: "is there a pre-code audit to make sure
+these side steps go away" — there was not. Audit: `docs/dev/evidence/rmbp-0929/AUDIT-HANDLERS-UNAFS.md`.
+
+**The gate.** `unaos/scripts/charter-check.sh [<unaos dir>]`, run by `./arroyo check` after GATE-VERBS.
+Scope: `crates/kernel/src/{video,fs,install,selfhost}/**/*.rs` plus `help.rs`, `termcolor.rs`,
+`shellux.rs`, `clipboard.rs`, `shell.rs`, `drivers/hda_play.rs`. Two legs:
+
+1. **Owner declared.** A file passes with a header line `CHARTER: <Handler> — <seam>` in its first 40
+   lines (handler ∈ the CODEX §2 manifest ∪ {Kernel, pulse}; seam ∈ `wm driver fs-core shared-core
+   fulfiller kernel-by-ruling owed`) OR a row in `scripts/charter.registry`. The registry is the
+   GRANDFATHER table: the 77 files that existed when the gate was cut, each with its owner, seam and
+   audit row (`owed B287` etc.). A NEW file never gets a row — it declares in its own header, so the
+   owner question is answered in the file, at the time of writing, by the author.
+2. **No new dotfile.** Every `{}.name"` (the `<home>/.name` path-join form) and `".Name"` /
+   `".Name/..."` literal in the kernel must be a `dotfile |` row. Bare lowercase tokens (`.txt`,
+   `.png`) are extension tests and all-caps tokens (`.TRASHES`) are macOS leftovers FAT skips; neither
+   is matched. The three dotfiles that exist (`.settings`, `.dock`, `.Trash` + `.index`) are rows
+   carrying the ledger id that says they move (B287, B288).
+
+**Controls (exit 2, no verdict).** The CODEX manifest must parse ≥ 20 handlers; a synthetic header
+`CHARTER: Principia — owed B0` must be accepted; headerless text must be refused; a synthetic file
+must have no row; a synthetic `.nowhere` dotfile must be refused; the scope must enumerate ≥ 10 files.
+
+**Go-red, measured at the cut.** A copy of `video/` plus `video/newthing.rs` containing
+`alloc::format!("{}.recents", h)` and no header: exit 1 with two lines (the file declares no owner;
+`.recents` is off the allowlist). Both trees at the cut: `claude/optimistic-ramanujan-r3qyu5` 64 files
+✅, `exec-rmbp-merge8` 77 files ✅.
+
+**What it does not do.** It cannot tell a `shared-core` claim from a copy — a file may say
+`CHARTER: Stria — shared-core` while sharing nothing. The seam word is a claim the fold reads; the
+brief head (EXECUTOR-BRIEF step 11) makes the executor state it before coding and STOP when the owner
+is live and its core is not being shared. The audit's fix program (ATTRSURF, PREFS, BANDY-3) is what
+turns `owed` rows into `fulfiller`/`shared-core` ones; this gate only stops the count growing.
+
