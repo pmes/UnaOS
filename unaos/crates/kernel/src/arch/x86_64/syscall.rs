@@ -17534,7 +17534,7 @@ fn winx_launcher(demo_cpu: usize) {
     // runs after `clickroute_selftest` rather than before because it leaves a raised window behind
     // (that IS its verdict) and would otherwise change which owner the routing legs start from.
     #[cfg(all(feature = "witness", feature = "wc"))]
-    crate::tests::register("dock", crate::video::dock::selftest);
+    crate::tests::register("dock", crate::video::dock::selftest); #[cfg(feature = "nvidia-kepler-vblank")] crate::tests::register("kvblank", crate::drivers::gpu::kepler_vblank::selftest_rerun); // KVBLANK6 — `tests kvblank` re-runs the vblank fixture only.
     // CRYSTAL — the SHARD menu fixture. Runs after `dock::selftest` (which runs `menubar::selftest`),
     // so the bar tenant it enables is already proven present and flush. It enables the bar itself,
     // opens the menu off the crystal, resolves every item, fires the SAFE picks, and dismisses three
