@@ -136,3 +136,33 @@ unchanged.
 * An explicit UNREGISTER verb, delegation, and a fulfiller-side MRECV that blocks per verb rather than
   per mailbox.
 * The metal boot (R78).
+
+## Results (M2, M3) — compile legs only (R78: no QEMU)
+
+**Numbers taken.** `BUS_VERB_REGISTER` = 127. `BUS_VERB_FULFIL_MIN` = 128. `BUS_VERB_PREF_GET` = 128 and
+`BUS_VERB_PREF_LIST` = 129, the names the PREFS arc is told to use; one definition survives at the fold.
+`BUS_REG_MAX_PER_ROW` = 8. New errnos in `una_abi`: `EEXIST` = -17, `ENOSPC` = -28, `ECONNRESET` = -104.
+No new syscall: the transport is `SYS_MSEND`/`SYS_MRECV` (19/20).
+
+**Files.** `crates/kernel/src/bus_route.rs` (new; `//! CHARTER: Kernel — fulfiller`). In `bus.rs`,
+`verb_valid` changed on its own line and the file stays line-neutral. Each of `arch/{aarch64,x86_64}/syscall.rs`
+gets three same-line hooks (the REPLY hook at the kind check, the route hook after `text`, the exit
+hook beside the mailbox drain) and an ops table and fixture hooks at the file tail. `lib.rs` gets a
+same-line `pub mod bus_route`. `tests.rs` gets the same-line `bandy3` registration. `una_abi` constants
+and a host test are appended at the file tail. `crates/user-prefs` is new. In `arroyo`: the
+`build_user_prefs_x86` step, a check-matrix row, the `_feats` arm and the `K8_FEATS` arm. In
+`builder/src/main.rs`: the knob and the staging of `APPS/PREFS.BIN` on the ESP and the DATA volume.
+
+**Witness lines a metal boot should print.**
+`tests bandy3` →
+`:: BANDY3: registered=2 relayed=2 replied=1 orphan=1 -> PASS ::` on a boot where it is the first
+registrant (the counters are monotonic since boot, so a PREFS.BIN launched first adds its own).
+`bg /apps/PREFS.BIN` →
+`:: PREFS: probe=-2 register=0 kernel_tag=-17 self_get=0 stamp=kernel -> PASS ::`, then one
+`:: PREFS: served verb=<v> caller_kind=<k> caller=<principal> status=<s> ::` per request served.
+
+**Owed.** The two-program ring-3 leg (MIDDEN.BIN or a second fixture asking PREFS.BIN), `prefs_core`
+(the real TOML read), PrefSet/PrefChanged, an aarch64 media build step for PREFS (only x86 is built
+and staged), and the metal boot. One residual is stated rather than fixed: if a caller's mailbox is
+full when its fulfiller exits, that caller's `-ECONNRESET` cannot be queued and is not counted. The
+caller still has 16 frames to drain, so it does not hang, but it never receives that corr.
