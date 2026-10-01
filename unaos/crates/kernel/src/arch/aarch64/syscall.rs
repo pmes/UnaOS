@@ -13379,7 +13379,7 @@ fn focus_ring_apps(out: &mut [u64; crate::video::wm::MAX_WINDOWS]) -> usize {
 /// TABKEY: the rotation is over [`focus_ring_apps`], not `wm::focus_ring` directly — see that helper for
 /// why, and for the Pi capture that proves the raw ring parks focus on rows with no ring 41% of the time.
 fn wc_focus_key(ev: crate::pal::Event) -> bool {
-    const K_TAB: u8 = b'\t';
+    const K_TAB: u8 = b'\t'; #[cfg(feature = "desktop_firmware")] if let crate::pal::Event::Action(crate::video::keymap::Action::CycleWindow) = ev { return match crate::video::wm::cycle_pick() { Some((id, owner)) => { if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_cancel("focus-key"); } user_input_set_active(owner); crate::video::wm::cycle_commit(id, owner); true } None => true }; } #[cfg(all(feature = "desktop_firmware", feature = "login"))] if let crate::pal::Event::Action(crate::video::keymap::Action::LockScreen) = ev { let _ = crate::video::crystal::login::lock(); return true; } // ARMROUTER — WINCYCLE (Alt+Tab/Cmd+Tab -> keymap `CycleWindow`) and SCREENLOCK (Cmd-L / Ctrl-Alt-L -> `LockScreen`) arms, the x86 `wc_focus_key` pair with the SAME seam calls (`wm::cycle_pick`/`cycle_commit`, `login::lock`); no `drag_settle_disarm` (x86 PTRDEAD machinery, absent here). Same-line fold, line-neutral.
     let down = match ev {
         crate::pal::Event::Key(K_TAB) => true,
         crate::pal::Event::KeyUp(K_TAB) => false,
@@ -14319,7 +14319,7 @@ pub fn wc_click_route(ev: crate::pal::Event) -> bool {
         return false;
     };
     let prev = CLICK_PREV_MASK.swap(mask as u32, Ordering::Relaxed) as u8;
-    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire);
+    let cur = USER_INPUT_ACTIVE.load(Ordering::Acquire); #[cfg(feature = "desktop_firmware")] { let (dx, dy) = click_pointer_pos(); crate::video::dock::set_quit_hook(wc_close_click); let eat = if mask & 0x02 != 0 { crate::video::dock::right_press_at(dx, dy) } else if mask & 0x01 != 0 && crate::video::dock::menu_open() { crate::video::dock::menu_press(dx, dy) } else { false }; if mask & 0x01 == 0 { crate::video::dock::lp_release(); } if eat { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } } // ARMROUTER — DOCKRUN: secondary press on a running dock tile opens its menu, a primary press while it is open goes to it first, a release ends the 600 ms hold (`lp_service` runs on the bootpace pass). The x86 `wc_click_route_at` block, same seams. Same-line fold, line-neutral.
     if mask & !prev != 0 {
         // PRESS edge.
         let (x, y) = click_pointer_pos();
@@ -15516,17 +15516,17 @@ fn wcb_launcher(_demo_cpu: usize) {
     // rollup reports counters those rows would otherwise perturb. Self-cleaning (closes its windows,
     // restores SHELL_Z/FOCUS_ASID, repaints), so nothing after it sees a changed table.
     #[cfg(feature = "witness")]
-    crate::video::wm::hittest_selftest();
+    crate::tests::register("hittest", || crate::video::wm::hittest_selftest()); // ARMROUTER: FIRSTBOOT3 pattern — registered, fired by `tests` (UNAOS_TESTS_AT_BOOT runs it on the spot, same order)
     // CTRLWIT: the control-cluster DECLINE witness, right after the hit-test battery — it is the same shape of fixture (mints synthetic rows, reaps them, restores the panel) and it must run after every per-window one-shot above has been claimed, or its three probe rows would burn latches the arc's real windows are owed. It re-pins its rows at scale 1 so its verdict is a property of the compositor and not of the panel it happens to be running on.
     #[cfg(feature = "witness")]
-    crate::video::wm::ctrldecline_selftest();
+    crate::tests::register("ctrldecline", || crate::video::wm::ctrldecline_selftest()); // ARMROUTER: FIRSTBOOT3 pattern — registered, fired by `tests` (UNAOS_TESTS_AT_BOOT runs it on the spot, same order)
     // DRAG-PI M4: the drag COST witness, after the control battery for the same reason it sits after
     // the hit-test one — it mints a row, drives it edge to edge twice and reaps it, so it must not run while another fixture's one-shots are still owed. It restores nothing because it takes nothing: `move_to` on its own row, and a grab it cancels itself.
     #[cfg(all(feature = "witness", feature = "desktop_firmware", feature = "baremetal"))]
-    crate::video::wm::dragperf_selftest();
+    crate::tests::register("dragperf", || crate::video::wm::dragperf_selftest()); // ARMROUTER: FIRSTBOOT3 pattern — registered, fired by `tests` (UNAOS_TESTS_AT_BOOT runs it on the spot, same order)
     // DRAGWEDGE: the PA41 freeze fixture, immediately after the drag COST witness because it is the same shape of scene one hazard over — it mints a KERNEL-BAND row, presses its title strip through this file's own router, then holds a `BlitGuard` open to reproduce the metal's `blit_active=1` and proves the drag path is BOUNDED, that the grab it could not service is RELEASED, that a fresh grab is REFUSED while the stall stands, and that the refusal LIFTS when the compositor recovers. It runs AFTER `dragperf` deliberately: that fixture measures a healthy drag path and this one deliberately stalls the compositor for a bounded interval, so the order keeps the measurement out of the stall's shadow.
     #[cfg(all(feature = "witness", feature = "desktop_firmware", feature = "baremetal"))]
-    crate::video::wm::dragwedge_selftest();
+    crate::tests::register("dragwedge", || crate::video::wm::dragwedge_selftest()); // ARMROUTER: FIRSTBOOT3 pattern — registered, fired by `tests` (UNAOS_TESTS_AT_BOOT runs it on the spot, same order)
     // PAPER: the kit texture's determinism fixture, LAST — it neither mints a window nor reads the
     // panel, so it perturbs nothing above it, and its only side effect is generating the one tile
     // (which emits the unconditional `[paper]` wire line naming the checksum the verdict asserts).
@@ -16407,7 +16407,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // uncounted `:: EL0: window verbs — … ::` line.
     wcb_launcher(demo_cpu);
     u7stk!("after:wcb");
-    #[cfg(feature = "desktop_firmware")] crate::video::desktop_firmware::arm(); // SHELLWIN-PI: the last panel-READING fixture has returned, however it returned, so the desktop may now place furniture on the glass. At the CALLER rather than inside `wcb_launcher` deliberately: that fn has three early SKIP returns (blob oversize, no free slot, already-done), and arming from its tail would let a skipped fixture leave the Pi desktop with no shell window at all and no line saying why. This is the SECOND of the Pi's two desktop questions and it is not `desktop_firmware::activate`'s: that one runs at the GUI handoff and asks "is this a desktop yet?", while the cascade it was called from is still running on the APs. x86 gets the ordering for free because its Kepler takeover happens after the cascade. Minting the shell window ahead of this point put a half-panel row across `[wc-j]`'s vacated-box read-backs, `[wc-f]`'s probe strip and `[clickroute]`'s hit-test: measured, `MBENCH FAIL — 104/108`. ⚠ ONE LINE, paid for by one merged in `wcb_launcher`'s tail commentary.
+    #[cfg(feature = "desktop_firmware")] crate::video::desktop_firmware::arm(); armrouter_witness(); // ARMROUTER witness (once, ungated: the lane without desktop_firmware prints arms=[]). SHELLWIN-PI: the last panel-READING fixture has returned, however it returned, so the desktop may now place furniture on the glass. At the CALLER rather than inside `wcb_launcher` deliberately: that fn has three early SKIP returns (blob oversize, no free slot, already-done), and arming from its tail would let a skipped fixture leave the Pi desktop with no shell window at all and no line saying why. This is the SECOND of the Pi's two desktop questions and it is not `desktop_firmware::activate`'s: that one runs at the GUI handoff and asks "is this a desktop yet?", while the cascade it was called from is still running on the APs. x86 gets the ordering for free because its Kepler takeover happens after the cascade. Minting the shell window ahead of this point put a half-panel row across `[wc-j]`'s vacated-box read-backs, `[wc-f]`'s probe strip and `[clickroute]`'s hit-test: measured, `MBENCH FAIL — 104/108`. ⚠ ONE LINE, paid for by one merged in `wcb_launcher`'s tail commentary.
     u7stk!("after:pidesk_arm");
     // BGRUN-ST: the background-run contract, headless — bg spawn -> exit -> reap (ELFHELLO), then a
     // kill mid-run (UVUG) proving the confirmed-kill arm reaps the row in place. Placed AFTER the UVUG
@@ -23155,7 +23155,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
             },
             Err(_) => return EINVAL,
         },
-        crate::bus::BUS_VERB_NOTICE => { crate::fs::users::screen_notice_from(asid as u64, body); 0 } // NOTICE: aarch64 wm owner IS the asid
+        crate::bus::BUS_VERB_NOTICE => { crate::fs::users::screen_notice_from(asid as u64, body); 0 } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), // ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
     bus_reply_enqueue(asid, hdr.corr, hdr.verb, status, &text)
@@ -25688,4 +25688,44 @@ fn fixture_abs<'a>(path: &'a str, buf: &'a mut [u8; 48]) -> &'a str {
     buf[0] = b'/';
     buf[1..1 + path.len()].copy_from_slice(path.as_bytes());
     core::str::from_utf8(&buf[..1 + path.len()]).unwrap_or(path)
+}
+
+// =================================================================================================
+// ARMROUTER — the aarch64 input router's witness and the APPMENU pick seam. Appended at the tail so
+// no existing line moves (knob-off kernel8.img byte-identity, PARITY.md 5.3).
+// =================================================================================================
+
+/// APPMENU: push one pre-packed event into the ring of the process that OWNS `owner` (on aarch64 the wm
+/// owner IS the asid) — by identity, not focus. Twin of `x86_64::syscall::user_input_push_owner`.
+#[cfg(feature = "desktop_firmware")]
+pub fn user_input_push_owner(owner: u64, packed: u64) -> bool {
+    if owner == 0 || owner as usize > uslots::USER_SLOTS {
+        return false;
+    }
+    user_input_push(owner, packed)
+}
+
+/// `:: ARMROUTER: arms=[..] tests_moved=<n> -> PASS ::` — once, at the router's ignition (the u7 launcher
+/// arms the desktop). `arms` names what is COMPILED into this image's router (a build without
+/// `desktop_firmware` prints `arms=[]`); PASS = the shared seams answer (cycle with no windows is a
+/// no-op, the brightness step rule is monotone and clamped, the keymap names both new actions).
+fn armrouter_witness() {
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if ONCE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let df = cfg!(feature = "desktop_firmware");
+    let lock = df && cfg!(feature = "login");
+    let moved: u32 = if cfg!(feature = "witness") { 2 + 2 * cfg!(all(feature = "desktop_firmware", feature = "baremetal")) as u32 } else { 0 };
+    let seams = crate::video::brightkeys::step(0, false) == 0
+        && crate::video::brightkeys::step(crate::video::brightkeys::STEPS, true) == crate::video::brightkeys::STEPS
+        && crate::video::keymap::Action::CycleWindow.name() == "cycle-window"
+        && crate::video::keymap::Action::LockScreen.name() == "lock-screen";
+    serial_println!(
+        ":: ARMROUTER: arms=[{}{}{}] tests_moved={} -> {} ::",
+        if df { "wincycle,dockrun" } else { "" },
+        if lock { ",lock" } else { "" },
+        if df { ",appmenu,brightkeys,volkeys" } else { "" },
+        moved, if seams { "PASS" } else { "FAIL" }
+    );
 }

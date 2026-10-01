@@ -130,3 +130,9 @@ REQUIRE \[taskexit\] tid=\d+ name='[^']+' core=\d+ reason=(exit|killed)
 # resolves under the base directory, not the volume root). Needs the `witness` feature (test-arm exports it).
 REQUIRE :: DIRNS: abs=ok nested=ok escape=refused acl=refused root=ok relhome=ok .* -> PASS ::
 FORBID :: DIRNS: .* -> FAIL
+
+# --- ARMROUTER (rmbp-0929): the aarch64 input router's arm census, printed once at the u7 launcher. This lane
+# (login,loginst,virt_el0) has NO desktop_firmware, so it reads `arms=[]` here; the PASS means the shared seams
+# answer. The six-arm line (arms=[wincycle,dockrun,lock,appmenu,brightkeys,volkeys]) needs UNAOS_PIDESK=1.
+REQUIRE :: ARMROUTER:
+FORBID :: ARMROUTER: .* -> FAIL
