@@ -154,7 +154,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("shellux", crate::shellux::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("shellux", crate::shellux::selftest); register("shortcuts", crate::video::shortcuts::selftest); }
     }
     // SETTINGS (R75): the settings fixture (open, idle=5, save, re-read, compare) beside it.
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]

@@ -557,11 +557,11 @@ use super::keymap::{Action, Binding, Table, ALT, CMD, CTRL, SHIFT};
 /// would otherwise shadow them (the `no_shadow` check at the foot of this block refuses the other
 /// order at compile time) — and `Shift+Home`/`Shift+End` as well, because the rMBP's internal
 /// keyboard has no Home or End key but an external one on the same desktop does.
-pub static CRISPY_ROWS: [Binding; 27] = [
+pub static CRISPY_ROWS: [Binding; 28] = [
     // The two chords flight 11 proved on metal. Their tokens are the exact bytes the `[prtscr]`
     // witness has always carried, so a capture from before KEYMAP and one from after grep alike.
-    Binding { roles: CMD | SHIFT, usage: 0x20, action: Action::Screenshot, token: "cmd-shift-3" },
-    Binding { roles: CMD | SHIFT, usage: 0x21, action: Action::ScreenshotRegion, token: "cmd-shift-4" },
+    Binding { roles: CMD | SHIFT, usage: 0x20, action: Action::Screenshot, token: super::shortcuts::C_CMD_SHIFT_3 },
+    Binding { roles: CMD | SHIFT, usage: 0x21, action: Action::ScreenshotRegion, token: super::shortcuts::C_CMD_SHIFT_4 },
     // The SLOT (R60). LOGINFLOW may bind it; nothing else may, and nothing acts on it today.
     Binding { roles: CMD | SHIFT, usage: 0x14, action: Action::LogOut, token: "cmd-shift-q" },
     // TERMSEL — to the line start / end, the Mac chords. ABOVE the bare Shift rows (precedence).
@@ -594,18 +594,20 @@ pub static CRISPY_ROWS: [Binding; 27] = [
     // (0x1B reaches every key consumer as before), so a menu that dismisses on it is unaffected.
     Binding { roles: 0, usage: 0x29, action: Action::Deselect, token: "esc" },
     // WINCYCLE — Alt+Tab and the Mac's own ⌘Tab. Above the bare rows on usage 0x2B (none exist).
-    Binding { roles: ALT, usage: 0x2B, action: Action::CycleWindow, token: "alt-tab" },
-    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: "cmd-tab" },
+    Binding { roles: ALT, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_ALT_TAB },
+    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_CMD_TAB },
     // Print Screen. `roles: 0` — the key means capture whatever else is held, which is precisely
     // what the `0x46` edge did before it was a row. A theme that drops this row disarms the key.
-    Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: "print-screen" },
+    Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: super::shortcuts::C_PRINT_SCREEN },
     // BRIGHTKEYS: the Apple keyboard's F1/F2 are brightness down/up (HID 0x3A/0x3B). Consumed by
     // `video::brightkeys` at `pal::push_event`.
     Binding { roles: 0, usage: 0x3A, action: Action::BrightnessDown, token: "f1-brightness-down" },
     Binding { roles: 0, usage: 0x3B, action: Action::BrightnessUp, token: "f2-brightness-up" },
     // SCREENLOCK — ⌘L and Ctrl+Alt+L lock the session (usage 0x0F = L; no other row watches it).
-    Binding { roles: CMD, usage: 0x0F, action: Action::LockScreen, token: "cmd-l" },
-    Binding { roles: CTRL | ALT, usage: 0x0F, action: Action::LockScreen, token: "ctrl-alt-l" },
+    Binding { roles: CMD, usage: 0x0F, action: Action::LockScreen, token: super::shortcuts::C_CMD_L },
+    Binding { roles: CTRL | ALT, usage: 0x0F, action: Action::LockScreen, token: super::shortcuts::C_CTRL_ALT_L },
+    // SHORTCUTS — ⌘/ opens the help overlay (usage 0x38 = `/`; no other row watches it).
+    Binding { roles: CMD, usage: 0x38, action: Action::ShowShortcuts, token: super::shortcuts::C_CMD_SLASH },
 ];
 
 /// **The desktop's live table.** `cmd_role` is `HID_MOD_GUI`, so every `CMD` above is the Command
@@ -629,7 +631,7 @@ pub static PC_ROWS: [Binding; 17] = [
     // is this table's one ordering hazard; the `const` block at the foot of this file checks it.
     Binding { roles: SHIFT, usage: 0x46, action: Action::ScreenshotRegion, token: "shift-prtsc" },
     Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: "prtsc" },
-    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: "alt-tab" }, // WINCYCLE — Alt is the PC's cmd role
+    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_ALT_TAB }, // WINCYCLE — Alt is the PC's cmd role
     Binding { roles: CMD, usage: 0x06, action: Action::Copy, token: "alt-c" },
     Binding { roles: CMD, usage: 0x19, action: Action::Paste, token: "alt-v" },
     Binding { roles: CMD, usage: 0x1B, action: Action::Cut, token: "alt-x" },
@@ -646,7 +648,7 @@ pub static PC_ROWS: [Binding; 17] = [
     Binding { roles: 0, usage: 0x4F, action: Action::CursorRight, token: "right" },
     Binding { roles: 0, usage: 0x4A, action: Action::CursorLineStart, token: "home" },
     Binding { roles: 0, usage: 0x4D, action: Action::CursorLineEnd, token: "end" },
-    Binding { roles: CTRL | ALT, usage: 0x0F, action: Action::LockScreen, token: "ctrl-alt-l" }, // SCREENLOCK — Ctrl+Alt+L
+    Binding { roles: CTRL | ALT, usage: 0x0F, action: Action::LockScreen, token: super::shortcuts::C_CTRL_ALT_L }, // SCREENLOCK — Ctrl+Alt+L
 ];
 
 /// The PC table. `cmd_role` is `HID_MOD_ALT` — R61's *"(alt-c on pc)"*, and the one field that

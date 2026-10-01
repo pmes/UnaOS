@@ -137,6 +137,8 @@ pub enum Action {
     CycleWindow,
     /// SCREENLOCK: lock the session without ending it (`⌘L`, `Ctrl+Alt+L`). Acted on by the router (`login::lock`).
     LockScreen,
+    /// SHORTCUTS: open the keyboard-shortcut help overlay (`⌘/`). Acted on by the router.
+    ShowShortcuts,
 }
 
 impl Action {
@@ -163,6 +165,7 @@ impl Action {
             Action::BrightnessUp => "brightness-up",
             Action::CycleWindow => "cycle-window",
             Action::LockScreen => "lock-screen",
+            Action::ShowShortcuts => "show-shortcuts",
         }
     }
 
