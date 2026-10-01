@@ -81,7 +81,7 @@ mapping. FAT inherits the refusing defaults and answers `-ENOTSUP` honestly, as 
 
 ## Witness
 
-`:: ATTRSURF: set=3 get=3 list=<n> query=2 denied=3 dir=<dir> -> PASS ::` on a UnaFS volume;
+`:: ATTRSURF: set=3 get=3 list=3 query=2 denied=3 removed=1 dir=<dir> -> PASS ::` on a UnaFS volume;
 `:: ATTRSURF: set=0 get=0 list=0 query=0 denied=0 reason=no-unafs-volume -> SKIP ::` on a FAT-only tree
 (today's rMBP until UNAFSX86 lands). Codec: `:: BANDY-ATTR: ... -> PASS ::` every boot beside BANDY-CODEC2.
 

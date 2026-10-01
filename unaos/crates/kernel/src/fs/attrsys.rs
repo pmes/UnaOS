@@ -270,3 +270,72 @@ pub fn bus_fulfil(verb: u8, body: &[u8], principal: &str, text: &mut Vec<u8>) ->
         Err(e) => e,
     }
 }
+
+// --- M4: `tests attr` -----------------------------------------------------------------------------
+
+/// `tests attr` — the surface end to end on a real volume, through the mount table (the path every
+/// consumer takes): create a file, set int/string/vector attributes as its owner, get each back
+/// typed, list, query by equality and by vector similarity, deny a foreign principal (get, set, and
+/// the query hit is dropped), remove one and confirm the query no longer finds it, clean up.
+///
+/// The target directory is the first of `/home`, `/` whose volume carries typed attributes. A tree
+/// with none (FAT only — today's rMBP until UNAFSX86) prints SKIP with `reason=no-unafs-volume`,
+/// never FAIL.
+///
+/// Witness: `:: ATTRSURF: set=<n> get=<n> list=<n> query=<n> denied=<n> dir=<d> -> PASS|FAIL ::`.
+pub fn selftest() {
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as K};
+    const A: &str = "user:attra#9001";
+    const B: &str = "user:attrb#9002";
+    let mt = table();
+    let dir = ["/home", "/"].iter().copied().find(|d| {
+        !matches!(mt.list_attrs(d, K), Err(VfsError::Unsupported) | Err(VfsError::NoSuchVolume) | Err(VfsError::NoSuchPath))
+    });
+    let Some(dir) = dir else {
+        serial_println!(":: ATTRSURF: set=0 get=0 list=0 query=0 denied=0 reason=no-unafs-volume -> SKIP ::");
+        return;
+    };
+    let path = if dir == "/" { String::from("/ATTRSURF.T") } else { alloc::format!("{}/ATTRSURF.T", dir) };
+    let _ = mt.unlink(&path, K);
+    // Created by the kernel, then GIVEN an owner — the one place a reserved key is set, and only the
+    // kernel may (a non-kernel `owner` write is refused by the adapter).
+    if mt.create(&path, NodeKind::File, K).is_err() || mt.set_attr(&path, "owner", AttrValue::Str(String::from(A)), K).is_err() {
+        serial_println!(":: ATTRSURF: set=0 get=0 list=0 query=0 denied=0 dir={} reason=create -> FAIL ::", dir);
+        return;
+    }
+    let vals = [
+        ("attrsurf.n", AttrValue::Int(42)),
+        ("attrsurf.s", AttrValue::Str(String::from("hello"))),
+        ("attrsurf.v", AttrValue::Vector(alloc::vec![1.0, 0.0, 0.0])),
+    ];
+    let mut set = 0u32;
+    let mut get = 0u32;
+    for (k, v) in vals.iter() {
+        if mt.set_attr(&path, k, v.clone(), A).is_ok() {
+            set += 1;
+        }
+    }
+    for (k, v) in vals.iter() {
+        if mt.get_attr(&path, k, A).as_ref() == Ok(v) {
+            get += 1;
+        }
+    }
+    let list = match mt.list_attrs(&path, A) {
+        Ok(rows) => rows.iter().filter(|(k, v)| vals.iter().any(|(vk, vv)| vk == k && vv == v)).count() as u32,
+        Err(_) => 0,
+    };
+    let hits = |expr: &str, who: &str| mt.query(expr, who).map(|h| h.iter().any(|(_, p)| *p == path)).unwrap_or(false);
+    let eq = "attrsurf.s == \"hello\"";
+    let sim = "similarity(attrsurf.v, [1.0, 0.0, 0.0]) > 0.9";
+    let query = hits(eq, A) as u32 + hits(sim, A) as u32;
+    let denied = matches!(mt.get_attr(&path, "attrsurf.n", B), Err(VfsError::Denied)) as u32
+        + matches!(mt.set_attr(&path, "attrsurf.n", AttrValue::Int(7), B), Err(VfsError::Denied)) as u32
+        + (!hits(eq, B)) as u32;
+    let removed = mt.remove_attr(&path, "attrsurf.s", A).is_ok() && !hits(eq, A);
+    let _ = mt.unlink(&path, K);
+    let pass = set == 3 && get == 3 && list == 3 && query == 2 && denied == 3 && removed;
+    serial_println!(
+        ":: ATTRSURF: set={} get={} list={} query={} denied={} removed={} dir={} -> {} ::",
+        set, get, list, query, denied, removed as u8, dir, if pass { "PASS" } else { "FAIL" }
+    );
+}
