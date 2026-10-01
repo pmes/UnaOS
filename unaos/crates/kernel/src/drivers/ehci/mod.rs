@@ -19407,17 +19407,12 @@ impl Controller {
 /// reports the ISR dropped (drop-newest, never blocking), this endpoint's dark total and worst window, and
 /// the CPU WCPAR left free of band workers for the input service. FAIL = a single dark window over 500 ms.
 fn ptrstutter_witness(dark_ms: u64, dark_max_ms: u64) {
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-    let reserved: i64 = crate::video::wcpar::reserved_cpu();
-    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
-    let reserved: i64 = -1;
     serial_println!(
-        ":: PTRSTUTTER: ring={} dropped={} dark_ms={} dark_max_ms={} reserved_cpu={} -> {} ::",
+        ":: PTRSTUTTER: ring={} dropped={} dark_ms={} dark_max_ms={} reserved_cpu=none(ruling) -> {} ::",
         ISR_RING,
         ISR_DROPPED.load(Ordering::Relaxed),
         dark_ms,
         dark_max_ms,
-        reserved,
         if dark_max_ms > 500 { "FAIL" } else { "PASS" }
     );
 }

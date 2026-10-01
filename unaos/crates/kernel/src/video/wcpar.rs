@@ -27,7 +27,7 @@ const MIN_BYTES: usize = 128 * 1024;
 const MIN_BAND_ROWS: usize = 8;
 
 /// PTRSTUTTER: the CPU left free of band workers (-1 = none).
-static RESERVED_CPU: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(-1);
+static RESERVED_CPU: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(-1); // never set: no reserving cores (ruling)
 
 /// The CPU `start` kept free for the input service (-1 = none reserved).
 pub fn reserved_cpu() -> i64 {
@@ -108,11 +108,12 @@ fn claim_one() -> bool {
 
 fn worker(_arg: usize) {
     let hz = crate::arch::apic::tsc_hz();
-    let hot = if hz == 0 { 25_000_000 } else { hz / 50 }; // stay hot 20 ms after the last band
+    let hot = if hz == 0 { 25_000_000 } else { hz / 1000 }; // PTRSTUTTER: stay hot <= 1 ms (was 20 ms), then sleep so a PRIO_NORMAL wake gets the core
     let mut last = crate::arch::now_cycles();
     loop {
         if READY.load(Relaxed) && claim_one() {
             last = crate::arch::now_cycles();
+            crate::arch::sched::yield_now(); // PTRSTUTTER: between bands, let a ready peer (input service) run
         } else if crate::arch::now_cycles().saturating_sub(last) < hot {
             core::hint::spin_loop();
         } else {
@@ -126,28 +127,20 @@ pub fn start() {
     if STARTED.swap(true, AcqRel) {
         return;
     }
-    // PTRSTUTTER M2 — leave the INPUT SERVICE's CPU free of band workers (boot 17: seven pinned PRIO_LOW
-    // spinners on every AP starved the EHCI pass -> 76 s of dark trackpad). Reserved = the published
-    // service core, else the last online AP. Pool = online_aps - 1.
-    let all = crate::arch::smp::online_aps();
-    let reserved = match crate::arch::smp::service_cpu() {
-        Some(c) if all.contains(&c) => Some(c),
-        _ => all.last().copied(),
-    };
-    let aps: alloc::vec::Vec<usize> = all.iter().copied().filter(|c| Some(*c) != reserved).collect();
-    RESERVED_CPU.store(reserved.map(|c| c as i64).unwrap_or(-1), Relaxed);
-    let (n, reason) = if aps.is_empty() { (0, "no-aps-online") } else { (aps.len().min(MAX_W), "online-aps-minus-reserved") };
+    // PTRSTUTTER M2 (revised): Peter's ruling "THERE IS NO RESERVING CORES" stands - workers go on EVERY
+    // online AP; the pointer is kept healthy by priority + yielding (worker spin <= 1 ms, yield between bands).
+    let aps = crate::arch::smp::online_aps();
+    let (n, reason) = if aps.is_empty() { (0, "no-aps-online") } else { (aps.len().min(MAX_W), "one-per-online-ap") };
     for &cpu in aps.iter().take(n) {
         crate::arch::sched::spawn("wcpar-band", worker, 0, cpu, crate::arch::sched::PRIO_LOW);
     }
     WORKERS.store(n, Release);
     READY.store(n > 0, Release);
     serial_println!(
-        "[wcpar] pool={} workers={} cpus_online={} reserved_cpu={} reason={}",
+        "[wcpar] pool={} workers={} cpus_online={} reason={}",
         n + 1,
         n,
         crate::arch::sched::online_cpu_count(),
-        RESERVED_CPU.load(Relaxed),
         reason
     );
 }
