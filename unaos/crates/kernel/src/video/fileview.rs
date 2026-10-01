@@ -31,7 +31,7 @@ use crate::video::{font, theme, wm};
 /// Kernel-furniture owner slot (`+ 5`, after Facet's `+ 4`).
 pub const OWNER: u64 = wm::KERNEL_OWNER_BASE + 5;
 const _: () = assert!(OWNER != wm::KERNEL_OWNER_CONSOLE && OWNER != wm::KERNEL_OWNER_DESKTOP);
-const _: () = assert!(OWNER != super::quarry::live::OWNER);
+#[cfg(feature = "quarry")] const _: () = assert!(OWNER != super::quarry::live::OWNER);
 
 /// Read ceiling, bytes.
 pub const MAX_BYTES: usize = 256 * 1024;

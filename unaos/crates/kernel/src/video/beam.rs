@@ -389,7 +389,52 @@ pub fn settle(h: Option<Hold>) -> Option<Obs> {
         LAST[i].store(w, Ordering::Relaxed);
         LAST_WAIT[i].fetch_add(waited_us as u64, Ordering::Relaxed);
     }
+    #[cfg(target_arch = "x86_64")]
+    census(waited_us, h.gaveup);
     Some(obs)
+}
+
+// ── TEAR M1 (rmbp 0929): THE HOLD CENSUS ─────────────────────────────────────────────────────────
+// `hold` above IS the present hold on x86 (BEAMX86 armed the source; `wm::stage_window`'s band loop and
+// `strip` already bracket every band with it) — what boot 17 lacked was a COUNT of what it did. Every
+// closed bracket lands here: `bands` brackets, `holds` of them actually waited, `held_us` total spin,
+// `gaveup` the ones that ran out the two-frame budget. One rollup per `CENSUS_PERIOD` brackets, `PASS`
+// iff nothing gave up. Counters are global relaxed atomics (the present path is multi-core under WCPAR).
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+const CENSUS_PERIOD: u64 = 1024;
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+static C_BANDS: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+static C_HOLDS: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+static C_HELD_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+static C_GAVEUP: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(feature = "beam", target_arch = "x86_64"))]
+fn census(waited_us: u32, gaveup: bool) {
+    if waited_us > 0 {
+        C_HOLDS.fetch_add(1, Ordering::Relaxed);
+        C_HELD_US.fetch_add(waited_us as u64, Ordering::Relaxed);
+    }
+    if gaveup {
+        C_GAVEUP.fetch_add(1, Ordering::Relaxed);
+    }
+    let n = C_BANDS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % CENSUS_PERIOD == 0 {
+        let (h, us, g) = (
+            C_HOLDS.load(Ordering::Relaxed),
+            C_HELD_US.load(Ordering::Relaxed),
+            C_GAVEUP.load(Ordering::Relaxed),
+        );
+        serial_println!(
+            "[beam] holds={} held_us={} gaveup={} bands={} guard={}",
+            h, us, g, n, FETCH_LINES
+        );
+        serial_println!(
+            ":: BEAMHOLD: holds={} held_us={} gaveup={} bands={} -> {} ::",
+            h, us, g, n, if g == 0 { "PASS" } else { "FAIL" }
+        );
+    }
 }
 
 /// Take (and clear) the observation parked for this core, if a recorded bracket closed since the

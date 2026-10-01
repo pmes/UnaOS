@@ -446,13 +446,15 @@ pub fn activate_on(desc: SurfaceDesc) {
     // CURSOR-1's bracket applies here for the same reason it applies to `erase`: if the sprite is on
     // the panel, the fill would paint over it and its save-under would later restore pre-clear pixels
     // as a stale patch. Take it off first; the first composite below puts it back.
+    crate::splash::hold_prepare(); // SPLASHX86: render the splash into RAM BEFORE the glass is cleared (bare-glass time = the minting below, not the ray march)
     {
         super::cursor::undraw();
         let fb = *super::WRITER.lock();
         fb.fill_screen(wm::DESKTOP_BG);
         fb.flush_all();
     }
-    super::wcpar::start(); // WCPAR — band workers exist before the first composite; prints `[wcpar] pool=`
+    super::wcpar::start(); #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))] crate::drivers::gpu::kepler_vblank::pump_spawn_once(); // KVBLANK6 — task context; WCPAR — band workers exist before the first composite; prints `[wcpar] pool=`
+    crate::splash::hold_open(); // SPLASHX86: the splash row goes up NOW — above every window minted below, until `users::stage_publish` releases it
     serial_println!(
         "[wc-x] desktop-clear panel={}x{} bg={:08X}",
         pw,
@@ -683,6 +685,7 @@ pub fn desktop_app_service() {
     // drain is an ordinary unmasked composite, the same call `service_damage` and the paygo taker
     // already make from this lane. See `wm::pace_service`.
     super::wm::pace_service();
+    crate::splash::hold_service(); // SPLASHX86: the 5 s bound on the boot splash hold
 
     // MENUSTAT — the desktop STATUS MODEL's poll, here and for `pace_service`'s reason: this is the
     // `wc`-gated body the ~1 kHz device-service task calls on EVERY pass, and it must run AHEAD of

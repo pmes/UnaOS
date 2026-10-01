@@ -64,6 +64,8 @@ pub fn reboot() -> ! {
 /// platform cuts power, or the failure witness prints and the core parks in `hlt_loop`.
 pub fn shutdown() -> ! {
     serial_println!("[pwrshutoff] shutdown verb invoked — dispatching the platform mechanism");
+    #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
+    crate::drivers::gpu::kepler_vblank::shutdown_census(); // KVBLANK6 — the kept-live vector's last census
     platform_shutdown()
 }
 

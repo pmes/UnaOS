@@ -2731,7 +2731,7 @@ pub fn close_owner(owner_asid: u64) -> usize {
     crate::wedge2::mark_composite("<D1>", "<d1>");
     // WMDIRECT — see `close`. Keyed on the OWNER here because this path clears every row the ASID
     // holds under one lock and no longer knows their ids by the time it returns.
-    drag_forget_owner(owner_asid); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::appmenu::reap(owner_asid);
+    drag_forget_owner(owner_asid); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] super::appmenu::reap(owner_asid);
     let mut vacated = [(0usize, 0usize, 0usize, 0usize); MAX_WINDOWS];
     // CLOSEISO — WHICH ids, not merely how many. A count cannot be falsified against the panel: the
     // Boot AR line `closed=1` was true and told the reader nothing about which window went. The list
@@ -29551,4 +29551,46 @@ pub fn close_all_furniture_except(keep: WinId) -> usize {
         close(id);
     }
     n
+}
+/// SPLASHX86: the boot splash's row — a full-panel, CHROMELESS compat row (no title, no controls, `hit_test`
+/// never names it, `close_all_furniture_except` spares it, `COMPAT_WIN` is not touched so `close_compat` /
+/// `compat_live` never see it). The caller pins it with [`set_modal_top`] and closes it with [`close`].
+/// `surf` is a `w * h * 4` xRGB buffer that must outlive the row. Returns [`WIN_NONE`] on refusal.
+pub fn splash_open(surf: usize, surf_len: usize, w: usize, h: usize) -> WinId {
+    let stride = w.saturating_mul(4);
+    let id = create_inner(0, surf, surf_len, w, h, stride, b"", true, None);
+    if id == WIN_NONE {
+        return WIN_NONE;
+    }
+    {
+        let mut t = table();
+        if let Some(r) = row_mut(&mut t, id) {
+            r.surf = surf;
+            r.surf_len = surf_len;
+            r.w = w;
+            r.h = h;
+            r.stride = stride;
+            r.scale = 1;
+            r.x = 0;
+            r.y = 0;
+            r.damage_all();
+            r.presented = true;
+        }
+    }
+    composite();
+    id
+}
+
+/// TEXTEDIT — rename a live window's caption (the editor's dirty mark). Clamped to [`MAX_TITLE`];
+/// the row is damaged whole and repainted by the next compositor pass (no composite from here).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn retitle(id: WinId, name: &[u8]) {
+    let n = name.len().min(MAX_TITLE);
+    let mut t = table();
+    if let Some(r) = row_mut(&mut t, id) {
+        r.title = [0u8; MAX_TITLE];
+        r.title[..n].copy_from_slice(&name[..n]);
+        r.title_len = n;
+        r.damage_all();
+    }
 }

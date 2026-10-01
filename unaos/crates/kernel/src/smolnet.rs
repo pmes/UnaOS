@@ -522,6 +522,8 @@ fn apply_ipv4_config(stack: &mut SmolStack, cidr: Ipv4Cidr, gw: Ipv4Address) {
 /// client targets it as the time source (slirp's usernet gateway 10.0.2.2 answers as a router; a DHCP
 /// lease's router option replaces it). `0` = never configured — the client falls back to `GATEWAY_IP`.
 static CURRENT_GW: AtomicU32 = AtomicU32::new(0);
+/// USBNET4 M3: true only once a DHCP lease was applied (the static slirp config does not count).
+static LEASED: AtomicBool = AtomicBool::new(false);
 
 /// The current SNTP time-source target: the live default gateway, or the static slirp gateway before any
 /// config. When DNS is available (SOCK-8), the SNTP client prefers a resolved `pool.ntp.org`; this gateway
@@ -610,6 +612,7 @@ fn dhcp_acquire() {
             GATEWAY_IP[3],
         ));
         apply_ipv4_config(stack, cidr, gw);
+        LEASED.store(true, Ordering::Relaxed);
         // SOCK-8: record the leased DNS server (if any) so the resolver targets the real nameserver.
         if let Some(d) = dns_srv {
             let o = d.octets();
@@ -1651,7 +1654,24 @@ pub fn witness_tick_sntp() {
     // resolve fails (no lease DNS / no reply). Either way the target is an honest, reachable-or-not IP the
     // witness prints. Under hermetic slirp the resolve may actually succeed (10.0.2.3 forwards to the host),
     // but the SNTP leg then still needs an NTP-answering server on that address to anchor `time`.
-    let server = resolve(SNTP_POOL_HOST).unwrap_or_else(sntp_target);
+    // USBNET4 M3: never a hardcoded 10.0.2.2 on a metal that has no lease. Targets: pool.ntp.org via DNS
+    // (only with a lease), then the leased router; no lease -> `none`, no query.
+    let mut from = "none";
+    let mut server = [0u8; 4];
+    if LEASED.load(Ordering::Relaxed) {
+        match resolve(SNTP_POOL_HOST) {
+            Some(ip) => { server = ip; from = "dns"; }
+            None => { server = sntp_target(); from = "lease"; }
+        }
+    }
+    static NONE_SAID: AtomicBool = AtomicBool::new(false);
+    if from != "none" || !NONE_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!("[sntp] target={} from={}", e1000::fmt_ip(&server), from);
+    }
+    if from == "none" {
+        WITNESS_SNTP_DONE.store(false, Ordering::Relaxed); // retry on a later tick once a lease lands
+        return;
+    }
     match sntp_sync_once(server) {
         Some((unix, stratum)) => {
             let mut iso = [0u8; 24];

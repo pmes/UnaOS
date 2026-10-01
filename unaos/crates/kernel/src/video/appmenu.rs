@@ -17,7 +17,7 @@
 // that EXIST at publish time (a window created later picks it up on the next publish); (2) the bar's
 // tables want `&'static` rows, so each DISTINCT tree is leaked once — bounded by `LEAK_MAX`, identical
 // re-publishes cost nothing; (3) x86-only, the board the input ring and bus dispatch live on.
-#![cfg(target_arch = "x86_64")]
+// ARMROUTER: opened to aarch64 desktop_firmware (the gate is on `pub mod appmenu` in video/mod.rs).
 
 use super::winmenu::{self, MenuItem, MenuTitle, MENU_TITLES_MAX};
 use super::wm;
@@ -57,9 +57,19 @@ static LEAKS: AtomicU32 = AtomicU32::new(0);
 const _: () = assert!(wm::MAX_WINDOWS <= 64); // `WINS` is one word per slot
 
 /// The kernel-derived owner id of the calling bus row, or `None` for the shared window / a bad row.
+#[cfg(target_arch = "x86_64")]
 fn owner_of_row(row: usize) -> Option<u64> {
     if row < crate::arch::memory::USER_SLOTS { Some(row as u64 + 1) } else { None }
 }
+/// aarch64 (ARMROUTER): the wm owner IS the asid, and the bus passes the sender's asid as `row`.
+#[cfg(all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0")))]
+fn owner_of_row(row: usize) -> Option<u64> {
+    if row >= 1 && row <= crate::arch::aarch64::uslots::USER_SLOTS { Some(row as u64) } else { None }
+}
+
+/// aarch64 desktop with no EL0 chain (no `uslots`, no syscall module): there are no owners to name.
+#[cfg(all(target_arch = "aarch64", not(any(feature = "baremetal", feature = "tegra_el0"))))]
+fn owner_of_row(_row: usize) -> Option<u64> { None }
 
 fn slot_of(asid: u64) -> Option<usize> {
     (0..SLOTS).find(|&k| OWN[k].load(Ordering::Acquire) == asid)
@@ -161,8 +171,14 @@ static PICK_FNS: [fn(u32); SLOTS] = [pick0, pick1, pick2, pick3];
 /// Deliver a pick to slot `k`'s OWNER's input ring, by identity.
 fn pick_slot(k: usize, id: u32) {
     let asid = OWN[k].load(Ordering::Acquire);
+    #[cfg(target_arch = "x86_64")]
     let delivered = asid != 0
         && crate::arch::x86_64::syscall::user_input_push_owner(asid, una_abi::input_ev_pack(INPUT_EV_MENU_PICK, id as u64));
+    #[cfg(all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0")))]
+    let delivered = asid != 0
+        && crate::arch::aarch64::syscall::user_input_push_owner(asid, una_abi::input_ev_pack(INPUT_EV_MENU_PICK, id as u64));
+    #[cfg(all(target_arch = "aarch64", not(any(feature = "baremetal", feature = "tegra_el0"))))]
+    let delivered = false;
     serial_println!("[menubar] pick owner={} item={} delivered={}", asid, id, delivered);
 }
 

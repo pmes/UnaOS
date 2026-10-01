@@ -4055,3 +4055,115 @@ fn write_multiblock_selftest(num_blocks: u64, s0: &Sector0) {
         if restore_ok { "PASS" } else { "FAIL" },
     );
 }
+
+// ===================================================================================
+// SDHCMULTI M1 — the write census (measure first)
+//
+// Flight 17: the 15.5 MB screenshot took 44 s to reach the card (~350 KB/s) although the counted
+// write already rides ONE CMD25 per 32 KiB (SDHCPOST). This section names where the time goes:
+// `[sdhc] write census` every 2 s while writes are in flight, `:: SDHCWR: ... ::` once per burst
+// (a burst ends when the next write arrives after BURST_GAP_MS of quiet, or at `wr_burst_flush()`).
+// `ms` is the wall time of the block-layer call (PIO + busy + CMD13); `busy_ms` the DAT0 programming
+// window inside it; `calls` counts card commands (one per CMD24 / CMD25); `multi` the CMD25 ones.
+// ===================================================================================
+#[cfg(feature = "sdw")]
+mod wrcensus {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static MULTI: AtomicU64 = AtomicU64::new(0);
+    pub static ERRS: AtomicU64 = AtomicU64::new(0);
+    pub static MS: AtomicU64 = AtomicU64::new(0);
+    pub static BUSY_MS: AtomicU64 = AtomicU64::new(0);
+    pub static WINDOW_START: AtomicU64 = AtomicU64::new(0); // ms of the last 2 s line
+    pub static LAST_WRITE: AtomicU64 = AtomicU64::new(0); // ms of the last write end (0 = none yet)
+    pub static BURST_FIRST: AtomicU64 = AtomicU64::new(0);
+    pub static WIN_BLOCKS: AtomicU64 = AtomicU64::new(0);
+    pub static WIN_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static WIN_MULTI: AtomicU64 = AtomicU64::new(0);
+    pub static WIN_MS: AtomicU64 = AtomicU64::new(0);
+    pub static WIN_BUSY: AtomicU64 = AtomicU64::new(0);
+    pub const BURST_GAP_MS: u64 = 3000;
+    pub const WINDOW_MS: u64 = 2000;
+    pub fn now_ms() -> u64 {
+        let hz = crate::arch::apic::tsc_hz();
+        if hz == 0 { 0 } else { crate::arch::now_cycles().saturating_mul(1000) / hz }
+    }
+}
+
+/// Start stamp for a timed card write (cycles); pass the result to [`wr_census_note`].
+#[cfg(feature = "sdw")]
+pub fn wr_census_begin() -> u64 {
+    let now = wrcensus::now_ms();
+    let last = wrcensus::LAST_WRITE.load(core::sync::atomic::Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) > wrcensus::BURST_GAP_MS {
+        wr_burst_flush(); // the previous burst ended before this write began
+    }
+    crate::arch::now_cycles()
+}
+
+/// Account one finished card write: `blocks` sectors, `multi` = it was a CMD25, `busy_ms` the
+/// measured programming-busy window (0 when unmeasured), `ok` = the write was acknowledged.
+#[cfg(feature = "sdw")]
+pub fn wr_census_note(t0: u64, blocks: u64, multi: bool, busy_ms: u64, ok: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    use wrcensus::*;
+    let hz = crate::arch::apic::tsc_hz();
+    let el = crate::arch::now_cycles().wrapping_sub(t0);
+    let ms = if hz != 0 { el.saturating_mul(1000) / hz } else { 0 };
+    let now = now_ms();
+    if BURST_FIRST.load(Relaxed) == 0 { BURST_FIRST.store(now.max(1), Relaxed); WINDOW_START.store(now, Relaxed); }
+    if ok { BLOCKS.fetch_add(blocks, Relaxed); WIN_BLOCKS.fetch_add(blocks, Relaxed); } else { ERRS.fetch_add(1, Relaxed); }
+    CALLS.fetch_add(1, Relaxed); WIN_CALLS.fetch_add(1, Relaxed);
+    if multi { MULTI.fetch_add(1, Relaxed); WIN_MULTI.fetch_add(1, Relaxed); }
+    MS.fetch_add(ms, Relaxed); WIN_MS.fetch_add(ms, Relaxed);
+    BUSY_MS.fetch_add(busy_ms, Relaxed); WIN_BUSY.fetch_add(busy_ms, Relaxed);
+    LAST_WRITE.store(now.max(1), Relaxed);
+    let ws = WINDOW_START.load(Relaxed);
+    if now.saturating_sub(ws) >= WINDOW_MS {
+        let wall = now.saturating_sub(ws).max(1);
+        let wb = WIN_BLOCKS.swap(0, Relaxed);
+        serial_println!(
+            "[sdhc] write census blocks={} calls={} multi={} ms={} busy_ms={} wall_ms={} kbps={}",
+            wb, WIN_CALLS.swap(0, Relaxed), WIN_MULTI.swap(0, Relaxed), WIN_MS.swap(0, Relaxed),
+            WIN_BUSY.swap(0, Relaxed), wall, wb * 512 / wall // bytes per ms == KB/s (1000-based)
+        );
+        WINDOW_START.store(now, Relaxed);
+    }
+}
+
+/// Close the current burst: one `:: SDHCWR: ... ::` witness (PASS = every write acknowledged), then
+/// reset. A no-op when no write happened since the last flush.
+#[cfg(feature = "sdw")]
+pub fn wr_burst_flush() {
+    use core::sync::atomic::Ordering::Relaxed;
+    use wrcensus::*;
+    let calls = CALLS.swap(0, Relaxed);
+    if calls == 0 { return; }
+    let blocks = BLOCKS.swap(0, Relaxed);
+    let multi = MULTI.swap(0, Relaxed);
+    let errs = ERRS.swap(0, Relaxed);
+    let ms = MS.swap(0, Relaxed);
+    let busy = BUSY_MS.swap(0, Relaxed);
+    let first = BURST_FIRST.swap(0, Relaxed);
+    let last = LAST_WRITE.swap(0, Relaxed);
+    let wall = last.saturating_sub(first).max(ms).max(1);
+    let bytes = blocks * 512;
+    serial_println!(
+        ":: SDHCWR: blocks={} calls={} multi_calls={} bytes={} ms={} busy_ms={} wall_ms={} errs={} kbps={} -> {} ::",
+        blocks, calls, multi, bytes, ms, busy, wall, errs, bytes / wall,
+        if errs == 0 { "PASS" } else { "FAIL" }
+    );
+    WIN_BLOCKS.store(0, Relaxed); WIN_CALLS.store(0, Relaxed); WIN_MULTI.store(0, Relaxed);
+    WIN_MS.store(0, Relaxed); WIN_BUSY.store(0, Relaxed);
+}
+
+/// Close the burst if the last write is older than the burst gap (called from the read path, which
+/// runs long after a burst ends, so `:: SDHCWR:` appears without a timer).
+#[cfg(feature = "sdw")]
+pub fn wr_census_idle() {
+    let last = wrcensus::LAST_WRITE.load(core::sync::atomic::Ordering::Relaxed);
+    if last != 0 && wrcensus::now_ms().saturating_sub(last) > wrcensus::BURST_GAP_MS {
+        wr_burst_flush();
+    }
+}

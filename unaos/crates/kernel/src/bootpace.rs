@@ -340,7 +340,7 @@ pub fn service_dump() {
     // to an empty fn without `witness` + `wcg-paygo` — on either arch, since WMPAYGO dropped the
     // taker's arch term (this hook opened in the same fold; a taker that builds where the knob is
     // must also RUN there, or its PAYGO_SVC_MAX cap fills with nothing able to re-arm it).
-    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::dimidle::service(); crate::video::wm::paygo_service(); // DIMIDLE service (same-line fold)
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::dimidle::service(); crate::video::wm::paygo_service(); #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))] { crate::video::brightkeys::service(); crate::video::dock::lp_service(crate::arch::ms()); } // ARMROUTER: BRIGHTKEYS apply + DOCKRUN 600 ms hold on aarch64 (x86 gets both from desktop_uefi's pass). DIMIDLE service (same-line fold)
 
     let mut buf = [(0u64, ""); CAP];
     let n = snapshot(&mut buf);

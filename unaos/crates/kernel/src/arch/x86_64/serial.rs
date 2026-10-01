@@ -303,14 +303,14 @@ pub fn drain_owner() -> u64 {
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => {
-        $crate::arch::serial::_print(format_args!($($arg)*));
+        $crate::serial_line::emit(format_args!($($arg)*), false);
     };
 }
 
 #[macro_export]
 macro_rules! serial_println {
-    () => ($crate::arch::serial::_print(format_args!("\n")));
-    ($($arg:tt)*) => ($crate::arch::serial::_print(format_args!("{}\n", format_args!($($arg)*))));
+    () => ($crate::serial_line::emit(format_args!(""), true));
+    ($($arg:tt)*) => ($crate::serial_line::emit(format_args!($($arg)*), true));
 }
 
 /// One byte at the 16550, **taking no lock**: a bounded poll of `LSR` bit 5 (transmitter holding
