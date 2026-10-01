@@ -911,3 +911,6 @@ REQUIRE :: WCPAR: cores=
 REQUIRE [wcpar] pool=
 # R77 M3 — the desktop fixtures are registered, not ignited; the lane defaults UNAOS_TESTS_AT_BOOT=1 so the boot prints the one line (deferred=0 there) and every fixture still runs in its old order
 REQUIRE :: TESTS: deferred=
+# ── TEXTEDIT (R75), TAIL-APPENDED — the editor fixture opens a scratch file, types 40 chars, saves, re-reads, compares
+REQUIRE :: TEXTEDIT: path=
+FORBID :: TEXTEDIT: .* -> FAIL ::
