@@ -25717,8 +25717,12 @@ fn armrouter_witness() {
     let df = cfg!(feature = "desktop_firmware");
     let lock = df && cfg!(feature = "login");
     let moved: u32 = if cfg!(feature = "witness") { 2 + 2 * cfg!(all(feature = "desktop_firmware", feature = "baremetal")) as u32 } else { 0 };
-    let seams = crate::video::brightkeys::step(0, false) == 0
-        && crate::video::brightkeys::step(crate::video::brightkeys::STEPS, true) == crate::video::brightkeys::STEPS
+    #[cfg(feature = "desktop_firmware")]
+    let bright_ok = crate::video::brightkeys::step(0, false) == 0
+        && crate::video::brightkeys::step(crate::video::brightkeys::STEPS, true) == crate::video::brightkeys::STEPS;
+    #[cfg(not(feature = "desktop_firmware"))]
+    let bright_ok = true;
+    let seams = bright_ok
         && crate::video::keymap::Action::CycleWindow.name() == "cycle-window"
         && crate::video::keymap::Action::LockScreen.name() == "lock-screen";
     serial_println!(
