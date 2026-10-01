@@ -2456,7 +2456,7 @@ impl FatFs {
     /// stale or nonsensical hint (e.g. carried over from a different volume) is validated back into
     /// range and costs at most one extra wrap, never a bad allocation. The zero-fill-after-claim
     /// order, and with it the information-disclosure invariant, is untouched.
-    fn alloc_cluster(&self) -> Result<u32, FatError> {
+    fn alloc_cluster(&self) -> Result<u32, FatError> { self.alloc_cluster_z(true) } fn alloc_cluster_z(&self, zero: bool) -> Result<u32, FatError> { // SDHCMULTI M3: `zero=false` only from write_grow, for a cluster its own data fully overwrites
         let entry_bytes: u64 = if self.kind == FatKind::Fat32 { 4 } else { 2 };
         let last = self.count_of_clusters + 2; // exclusive: valid data clusters are 2 ..= count+1
         if last <= 2 {
@@ -2513,7 +2513,7 @@ impl FatFs {
                     ALLOC_HINT.store(next, core::sync::atomic::Ordering::Relaxed);
                     // Zero AFTER the claim (see the doc comment): EOC-reserved but unlinked, so no reader can
                     // see stale bytes; a failure here orphans `c` (benign lost cluster) rather than aliasing.
-                    self.zero_cluster(c)?;
+                    if zero { self.zero_cluster(c)?; } // SDHCMULTI M3: skipped only when the caller overwrites the WHOLE cluster before publishing the size
                     return Ok(c);
                 }
                 loaded = u64::MAX; // our search buffer is stale (a concurrent writer mutated this sector)
@@ -3304,7 +3304,14 @@ impl FatFs {
         let needed = (end + clus_bytes - 1) / clus_bytes; // ceil
         let mut new_first = first_cluster;
         while chain.len() < needed {
-            let n = self.alloc_cluster()?; // free + zero + EOC — a terminated orphan ready to link
+            // SDHCMULTI M3: a cluster that [start, end) covers entirely is overwritten by step 3 before
+            // step 4 publishes the size, so zero-filling it first is one wasted 32 KiB CMD25 per cluster
+            // (half of every sequential screenshot/fetch write). Partially covered clusters still zero.
+            let cs = chain.len() * clus_bytes;
+            let covered = (start as usize) <= cs && end >= cs + clus_bytes;
+            let n = self.alloc_cluster_z(!covered)?; // free + (zero unless covered) + EOC — a terminated orphan ready to link
+            WRITE_RUN_CLUSTERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if covered { WRITE_RUN_ZERO_SKIPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
             match chain.last() {
                 Some(&tail) => self.set_fat_entry(tail, n)?, // link old tail -> n
                 None => new_first = n,                       // the file had no clusters; n is the head
@@ -3334,6 +3341,7 @@ impl FatFs {
         // 4. LAST: publish size (+ chain head if it changed) to the directory — data + FAT already
         //    durable. JD17: the _mtime sibling also refreshes the last-write stamp in this same RMW.
         self.write_dir_entry_fields_mtime(dir_lba, dir_off, new_first, new_size)?;
+        write_run_note(data.len() / SECTOR_SIZE); // SDHCMULTI M3
         Ok((written, new_size, new_first))
     }
 
@@ -6812,4 +6820,28 @@ pub(crate) fn sector_write_count() -> u64 {
 /// LFNMV2 M1: true when `leaf` has no 8.3 form (so a rename to it takes the long-name path).
 pub(crate) fn is_long_name(leaf: &str) -> bool {
     format_83(leaf).is_none()
+}
+
+
+// SDHCMULTI M3 — `[fs] write run` census: how many clusters sequential writers appended, how many of
+// those skipped the zero-fill (the data overwrote them whole), and the whole-sector blocks pushed
+// through `write_grow`. One line per 64 appended clusters (a 15.5 MB capture is ~475), not per call.
+static WRITE_RUN_CLUSTERS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static WRITE_RUN_ZERO_SKIPPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static WRITE_RUN_BLOCKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static WRITE_RUN_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static WRITE_RUN_LAST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+fn write_run_note(blocks: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    WRITE_RUN_BLOCKS.fetch_add(blocks as u32, Relaxed);
+    // `multi` = calls that moved at least one counted run (>= 2 whole sectors) in one block-layer span.
+    if blocks >= 2 { WRITE_RUN_CALLS.fetch_add(1, Relaxed); }
+    let c = WRITE_RUN_CLUSTERS.load(Relaxed);
+    if c / 64 != WRITE_RUN_LAST.swap(c / 64, Relaxed) {
+        serial_println!(
+            "[fs] write run clusters={} blocks={} multi={} zero_skipped={}",
+            c, WRITE_RUN_BLOCKS.load(Relaxed), WRITE_RUN_CALLS.load(Relaxed), WRITE_RUN_ZERO_SKIPPED.load(Relaxed)
+        );
+    }
 }
