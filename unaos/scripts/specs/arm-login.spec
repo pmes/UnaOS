@@ -130,3 +130,7 @@ REQUIRE \[taskexit\] tid=\d+ name='[^']+' core=\d+ reason=(exit|killed)
 # resolves under the base directory, not the volume root). Needs the `witness` feature (test-arm exports it).
 REQUIRE :: DIRNS: abs=ok nested=ok escape=refused acl=refused root=ok relhome=ok .* -> PASS ::
 FORBID :: DIRNS: .* -> FAIL
+
+# --- SPLASHX86 M3 (R74): the same splash at the aarch64 takeover (`desktop_firmware::activate`), held until `users::stage_publish`.
+REQUIRE :: SPLASH: arch=aarch64 WxH=[0-9]+x[0-9]+ ms=[0-9]+ -> PASS ::
+REQUIRE [splash] held_ms=[0-9]+ released_by=(store-loaded|timeout)

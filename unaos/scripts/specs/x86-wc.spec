@@ -911,3 +911,7 @@ REQUIRE :: WCPAR: cores=
 REQUIRE [wcpar] pool=
 # R77 M3 — the desktop fixtures are registered, not ignited; the lane defaults UNAOS_TESTS_AT_BOOT=1 so the boot prints the one line (deferred=0 there) and every fixture still runs in its old order
 REQUIRE :: TESTS: deferred=
+
+# --- SPLASHX86 (R74): the boot splash rendered by the cross-arch ray tracer at the compositor takeover and HELD above the furniture until the stage is known.
+REQUIRE :: SPLASH: arch=x86_64 WxH=[0-9]+x[0-9]+ ms=[0-9]+ -> PASS ::
+REQUIRE [splash] held_ms=[0-9]+ released_by=(store-loaded|timeout)

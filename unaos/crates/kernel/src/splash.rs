@@ -34,7 +34,7 @@
 //! plus a 3x-wide halo strip per 1-px step), so total pixel traffic stays within a few
 //! megapixels — the same order as v0 — and boot is not measurably slowed.
 
-#![cfg(target_arch = "x86_64")]
+// SPLASHX86 (R74): arch-neutral ray tracer; only the animation tail (ANIM/advance/retire) stays x86.
 
 use crate::video::framebuffer::FrameBuffer;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -218,7 +218,7 @@ impl Poly {
 }
 
 /// SPLASH-2 — paint the crystal-cluster splash once onto the front framebuffer.
-pub fn boot_splash(base: usize, len: usize, info: FrameBufferInfo) {
+pub fn boot_splash(base: usize, len: usize, info: FrameBufferInfo) { paint(base, len, info, true); } fn paint(base: usize, len: usize, info: FrameBufferInfo, arm: bool) {
     let mut fb = FrameBuffer::new();
     fb.init(base, len, info);
     if !fb.is_ready() {
@@ -431,19 +431,19 @@ pub fn boot_splash(base: usize, len: usize, info: FrameBufferInfo) {
 
     // SPLASH-SEAMLESS: from here until the GUI's first frame, nothing text-paints over the
     // crystal (fbcon::milestone checks this flag; see its doc for the metal defect).
-    SPLASH_UP.store(true, Ordering::Relaxed);
+    if arm { SPLASH_UP.store(true, Ordering::Relaxed); }
 
-    serial_println!(":: SPLASH: crystal cluster traced — 3 shards, {} spectrum rays ::", NRAYS);
+    if arm { serial_println!(":: SPLASH: crystal cluster traced — 3 shards, {} spectrum rays ::", NRAYS); }
 
     // SPLASH-ALIVE: publish the framebuffer handle and arm the animation, as the LAST act of the
     // paint so no baseline statement above it shifts line. From here each boot milestone
     // (`bootpace::record`) drives one `advance()` frame until the `gui` stamp latches it off just
     // before the desktop's first paint. Gated off usbdebug/bootlog/witness — see the SPLASH-ALIVE
     // block at the foot of this file for why every addition is placed and gated the way it is.
-    #[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+    #[cfg(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))))]
     {
-        *SPLASH_FB.lock() = Some(fb);
-        ANIM.store(true, Ordering::Relaxed);
+        if arm { *SPLASH_FB.lock() = Some(fb); }
+        if arm { ANIM.store(true, Ordering::Relaxed); }
     }
 }
 
@@ -482,30 +482,30 @@ pub fn boot_splash(base: usize, len: usize, info: FrameBufferInfo) {
 /// The initialised front-framebuffer handle captured by `boot_splash`, so `advance()` can repaint
 /// without re-deriving it. `FrameBuffer` is `Copy`; the `Mutex` only guards the one-time publish and
 /// gives `advance()` a `try_lock` bail against any (theoretical) re-entrant milestone.
-#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+#[cfg(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))))]
 static SPLASH_FB: spin::Mutex<Option<FrameBuffer>> = spin::Mutex::new(None);
 
 /// Set once the base frame is up; cleared at the `gui` handoff stamp. While true, milestone stamps
 /// drive one animation frame each. Never armed on usbdebug/bootlog/witness (`boot_splash` is gated
 /// off there, so this stays false and `advance()` is a single-load no-op).
-#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+#[cfg(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))))]
 static ANIM: AtomicBool = AtomicBool::new(false);
 
 /// Monotonic frame counter — the animation's whole time base. Deterministic (no TSC read needed):
 /// the light angle is `PHASE` LUT steps and each glint's crawl offset is a function of `PHASE`.
-#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+#[cfg(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))))]
 static PHASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// cos(2π·i/32) · 256, i in 0..32 — the fixed-point light-direction table (no float, pre-heap).
 /// `sin(i) = COS_Q8[(i + 24) & 31]`.
-#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+#[cfg(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))))]
 const COS_Q8: [i32; 32] = [
     256, 251, 237, 213, 181, 142, 98, 50, 0, -50, -98, -142, -181, -213, -237, -251, -256, -251,
     -237, -213, -181, -142, -98, -50, 0, 50, 98, 142, 181, 213, 237, 251,
 ];
 
 /// Pixel length of a facet edge (Q16.16 endpoints → whole pixels).
-#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+#[cfg(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))))]
 #[inline]
 fn edge_steps(a: (i64, i64), b: (i64, i64)) -> i64 {
     ((b.0 - a.0).abs().max((b.1 - a.1).abs())) >> 16
@@ -516,7 +516,7 @@ fn edge_steps(a: (i64, i64), b: (i64, i64)) -> i64 {
 /// exact lerp of the two Q16.16 endpoints, so a sub-run traces a strict subset of the full edge's
 /// pixels. That is the seamlessness guarantee — repainting the WHOLE edge in `SPLASH_EDGE` erases
 /// any previous glint exactly, because both used this same locus. `put_pixel` clips to the panel.
-#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+#[cfg(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))))]
 fn edge_run(fb: &FrameBuffer, a: (i64, i64), b: (i64, i64), i0: i64, i1: i64, color: u32) {
     let steps = edge_steps(a, b);
     if steps <= 0 {
@@ -542,7 +542,7 @@ fn edge_run(fb: &FrameBuffer, a: (i64, i64), b: (i64, i64), i0: i64, i1: i64, co
 /// Resolve one shard's vertices to Q16.16 pixel space for the panel `(w, h, s)` — the same mapping
 /// `boot_splash` uses, factored out so `advance()` can re-derive the facet edges each frame without
 /// caching a `Poly` (the earliest frames predate the heap).
-#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+#[cfg(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))))]
 fn resolve_verts(sh: &Shard, w: i64, h: i64, s: i64) -> [(i64, i64); MAX_VERTS] {
     let cx = (w * sh.c.0 / 1000) << 16;
     let cy = (h * sh.c.1 / 1000) << 16;
@@ -560,7 +560,7 @@ fn resolve_verts(sh: &Shard, w: i64, h: i64, s: i64) -> [(i64, i64); MAX_VERTS] 
 /// over the desktop. Cheap by construction: per facet edge it repaints the edge (the eraser) and
 /// lays one short bright glint whose position crawls with `PHASE` and whose brightness is the
 /// specular alignment of that facet with the sweeping light — the beam-entry facet also throbs.
-#[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+#[cfg(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))))]
 pub fn advance(tag: &str) { #[cfg(feature = "wc")] if ANIM.load(Ordering::Relaxed) && crate::video::fbcon::panel_console_live() { retire("video/fbcon.rs panel_console_resume (the Kepler takeover's full-panel clear; under wc that clear is the compositor's ignition)"); return; } // SPLASHRETIRE (B137) ⚠ SAME-LINE fold. THE BROKEN CRYSTAL, and this is the line that ends it. `ANIM` used to latch off ONLY at the `gui` stamp (below), which `main.rs` records ~500 lines and one whole boot phase AFTER the panel has already been taken: `pci::init` -> `kepler::takeover_display` -> `fbcon::panel_console_resume` clears the WHOLE panel and starts mirroring console glyphs onto it, and under `wc` `desktop_uefi::activate_on` then fills it with `DESKTOP_BG` and composites the console window and the menu bar. The very next `bootpace::record` after that seam is `pci-usb` — flight 11 measured it at t=28036 ms against `[wc-x] desktop-clear` at 27428 ms and `gui` at 28059 ms — and the frame it drove painted, through the pre-heap front-framebuffer handle captured at `SPLASH_FB`, NOTHING BUT FACET EDGES: `edge_run(… SPLASH_EDGE)` per edge plus a glint, with no background fill, no fans and no spectrum. A crystal's wireframe laid over a live desktop with none of the body that made it read as a crystal is exactly "a broken crystal", and it is the LAST thing painted before the desktop's first paint. Asking the seam here, before any pixel moves, is the whole fix; nothing about the crystal's LOOK is touched.
     if !ANIM.load(Ordering::Relaxed) {
         return;
@@ -680,12 +680,129 @@ pub fn advance(tag: &str) { #[cfg(feature = "wc")] if ANIM.load(Ordering::Relaxe
 
 /// SPLASHRETIRE — hand the panel over: latch the animation off, clear `SPLASH_UP`, and witness the
 /// instant and the site that took the glass. Idempotent; only the first caller prints.
-#[cfg(feature = "wc")]
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub fn retire(site: &str) {
     if !SPLASH_UP.swap(false, Ordering::Relaxed) {
         return;
     }
-    #[cfg(not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))]
+    #[cfg(all(target_arch = "x86_64", not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))))]
     ANIM.store(false, Ordering::Relaxed);
     serial_println!(":: SPLASH: retired at {} ms by {} ::", crate::arch::ms(), site);
+}
+
+// =================================================================================================
+// SPLASHX86 (R74 + FIRSTBOOT) — the splash HOLDS the glass from the compositor takeover until the
+// installer stage is known.
+//
+// Metal boot 17: `activate_on` mints the bar and the console ~430 ms BEFORE the users store loads, so a
+// fresh card flashed desktop furniture and then swept it (`[login] installer: furniture swept n=2`). The
+// pre-GUI splash above is retired by the takeover's own panel clear; this block re-renders the SAME ray
+// tracer into a panel-sized RAM surface and parks it as a chromeless, input-less compat row
+// (`wm::splash_open`), pinned topmost with `wm::set_modal_top` (the LOGINZ ceiling), until
+// `users::stage_publish` (from `stage_resolve` / `stage_no_store` / `desktop_allowed`) releases it —
+// or `hold_service` does, 5 s after it opened. Furniture may mint beneath it; it only has to be ABOVE.
+// Same code path on both arches (x86 `desktop_uefi::activate_on`, aarch64 `desktop_firmware::activate`).
+
+/// The compat row holding the glass (0 = none).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+static HOLD_WIN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// `arch::ms()` when the row opened.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+static HOLD_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The rendered surface (xRGB, panel-sized, never grows) and its geometry, from `hold_prepare` until `hold_release`.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+static HOLD_SURF: spin::Mutex<Option<(alloc::vec::Vec<u8>, usize, usize)>> = spin::Mutex::new(None);
+
+#[cfg(target_arch = "x86_64")]
+const ARCH_NAME: &str = "x86_64";
+#[cfg(target_arch = "aarch64")]
+const ARCH_NAME: &str = "aarch64";
+
+/// Render the splash into a panel-sized RAM surface. Called BEFORE the takeover's desktop-clear so the
+/// glass is bare for as short a time as possible. Silent no-op once the stage is already known.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn hold_prepare() {
+    if HOLD_SURF.lock().is_some() || HOLD_WIN.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    #[cfg(feature = "login")]
+    if crate::fs::users::stage_resolved() {
+        serial_println!("[splash] hold SKIP reason=stage-known");
+        return;
+    }
+    let (w, h) = {
+        let fb = *crate::video::WRITER.lock();
+        if !fb.is_ready() {
+            return;
+        }
+        let i = fb.info();
+        (i.width, i.height)
+    };
+    let len = w * h * 4;
+    let mut store: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if w == 0 || h == 0 || store.try_reserve_exact(len).is_err() {
+        serial_println!("[splash] hold DECLINE reason=alloc len={}", len);
+        return;
+    }
+    store.resize(len, 0);
+    let t0 = crate::arch::ms();
+    // Same BGR/4-byte store the console window uses: the little-endian word 0x00RRGGBB wm reads.
+    paint(
+        store.as_mut_ptr() as usize,
+        len,
+        FrameBufferInfo { width: w, height: h, stride: w, bytes_per_pixel: 4, pixel_format: unaos_boot_info::PixelFormat::Bgr },
+        false,
+    );
+    let ms = crate::arch::ms().saturating_sub(t0);
+    *HOLD_SURF.lock() = Some((store, w, h));
+    serial_println!(":: SPLASH: arch={} WxH={}x{} ms={} -> PASS ::", ARCH_NAME, w, h, ms);
+}
+
+/// Park the prepared surface as the topmost chromeless row. Called AFTER the desktop-clear and BEFORE the
+/// console window is minted. The furniture minted later lands beneath it (the modal pin re-claims the top
+/// on every create / raise).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn hold_open() {
+    let (addr, len, w, h) = match HOLD_SURF.lock().as_ref() {
+        Some((v, w, h)) => (v.as_ptr() as usize, v.len(), *w, *h),
+        None => return,
+    };
+    let id = crate::video::wm::splash_open(addr, len, w, h);
+    if id == crate::video::wm::WIN_NONE {
+        *HOLD_SURF.lock() = None;
+        serial_println!("[splash] hold DECLINE reason=window-table");
+        return;
+    }
+    crate::video::wm::set_modal_top(id);
+    HOLD_T0.store(crate::arch::ms(), Ordering::Relaxed);
+    HOLD_WIN.store(id, Ordering::Release);
+    serial_println!("[splash] hold OPEN win={} {}x{} (until users::stage_resolve; 5000 ms bound)", id, w, h);
+}
+
+/// Release the glass: unpin, close the row (the compositor repaints what is beneath), free the surface.
+/// Idempotent. The clear is immediate (fade_ms=0, inside the 300 ms bound). `by` is `store-loaded` or `timeout`.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn hold_release(by: &str) {
+    let id = HOLD_WIN.swap(0, Ordering::AcqRel);
+    if id == 0 {
+        return;
+    }
+    let t_rel = crate::arch::ms();
+    crate::video::wm::clear_modal_top(id);
+    crate::video::wm::close(id);
+    *HOLD_SURF.lock() = None; // after the row is gone: nothing reads the surface any more
+    serial_println!(
+        "[splash] held_ms={} released_by={} fade_ms={}",
+        t_rel.saturating_sub(HOLD_T0.load(Ordering::Relaxed)),
+        by,
+        crate::arch::ms().saturating_sub(t_rel)
+    );
+}
+
+/// The 5 s bound: a store that never answers must not strand the splash. Polled from the device-service pass.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn hold_service() {
+    if HOLD_WIN.load(Ordering::Relaxed) != 0 && crate::arch::ms().saturating_sub(HOLD_T0.load(Ordering::Relaxed)) >= 5000 {
+        hold_release("timeout");
+    }
 }

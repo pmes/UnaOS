@@ -158,6 +158,7 @@ pub fn activate() -> bool {
     //    thirty lines below the console's way to glass is its WINDOW, which is why the hold lifts
     //    there by construction rather than by a second call. See `fbcon::panel_mirror_held` for that
     //    term, for the panic override, and for what the decline path gets.
+    crate::splash::hold_prepare(); // SPLASHX86 (M3): the same ray tracer, rendered into RAM before the glass is cleared
     {
         super::cursor::undraw();
         fbcon::panel_mirror_hold(true);
@@ -165,6 +166,7 @@ pub fn activate() -> bool {
         fb.fill_screen(wm::DESKTOP_BG);
         fb.flush_all();
     }
+    crate::splash::hold_open(); // SPLASHX86 (M3): held above the furniture until `users::stage_publish` releases it (the 5 s `hold_service` poll is x86-only: aarch64 relies on `desktop_allowed`'s no-store publish)
     serial_println!(
         "[deskfw] desktop-clear panel={}x{} bg={:08X} (pre-desktop residue off the glass; the window table is empty at this line; the panel mirror is held from this line — DESKHOLD)",
         pw,
