@@ -428,7 +428,7 @@ pub fn set_sys(k: &str, v: PrefValue) {
 /// The frame BANDY-3 carries, to every ring-3 program that registered interest:
 ///
 /// ```text
-/// header: kind = REPLY (2), verb = BUS_VERB_PREF_CHANGED (14), corr = 0, status = 0,
+/// header: kind = REPLY (2), verb = BUS_VERB_PREF_CHANGED (19), corr = 0, status = 0,
 ///         principal = the kernel reply record, body_len = n
 /// body:   <ns> "." <key> NUL <value as a TOML literal (prefs_core::PrefValue::to_literal)>
 /// ```
@@ -525,6 +525,7 @@ pub fn list_body_parse(body: &[u8]) -> Option<Option<&str>> {
     prefs_core::validate_ns(ns).is_ok().then_some(Some(ns))
 }
 
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] // the `crate::bus` cfg (lib.rs): no bus on this build, no bus fulfiller (merge9 fold)
 /// Fulfil one PREF verb. `in_session`: the caller runs in the open session (the transport decides, from
 /// the stamped principal). Reply body into `text`; returns the status (0 or a negative errno).
 /// GET: the value as a TOML literal, -ENOENT unset. SET: empty, -EACCES outside the session, -EIO when the
@@ -579,6 +580,7 @@ pub fn bus_fulfil(verb: u8, body: &[u8], in_session: bool, text: &mut Vec<u8>) -
     }
 }
 
+#[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] // the `crate::bus` cfg (lib.rs): no bus on this build, no bus fulfiller (merge9 fold)
 /// PREFS-CODEC KATs (M3): the three request bodies through the frozen v1 frame — build, `frame_parse`
 /// (the verb gate admits them), body-parse — plus one frozen golden and the refusals. Pure, in RAM.
 /// Prints `:: PREFS-CODEC: kats=<n> -> PASS ::`.
@@ -627,7 +629,8 @@ pub fn codec_selftest() -> bool {
 #[cfg(feature = "witness")]
 pub fn selftest() {
     ensure_loaded();
-    let codec = codec_selftest();
+    #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] let codec = codec_selftest();
+    #[cfg(not(any(feature = "aarch64_el0", target_arch = "x86_64")))] let codec = true; // no bus on this build: the codec leg is vacuous, not failed
     let p = path();
     let original = read_all(&p);
     let tree0 = TREE.lock().clone();
