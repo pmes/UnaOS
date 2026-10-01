@@ -20,7 +20,12 @@
 //! belongs to window frames; a press-to-set is the claim.) Keyboard: Up/Down/Tab move the selection,
 //! Left/Right adjust, Enter toggles/applies; typing edits the wallpaper path while it is selected.
 //!
-//! Witness: `:: SETTINGS: controls=<n> loaded=<n> saved=<n> -> PASS ::` on open and on save, and the
+//! SETTINGS2: four TABS (General · Users · Display · About; Left/Right on the strip or a click switches, the choice
+//! persists as `tab=`); Users = list + Add / Delete (two-step) / Reset password, every action a
+//! `[settings] users op= name= ok= reason=` line; Display = idle blank, UI scale (read-only: the compositor fixes it at
+//! takeover), clock (fixed: CLOCKBAR has no runtime switch); About = version, board, CPUs, RAM, uptime.
+//!
+//! Witness: `:: SETTINGS: controls=<n> tabs=<n> loaded=<n> saved=<n> -> PASS ::` on open and on save, and the
 //! `tests` fixture `settings` ([`selftest`]: set idle to 5, save, re-read the file, compare).
 
 use alloc::string::String;
@@ -42,9 +47,13 @@ const PTR_NAMES: [&str; 3] = ["slow", "normal", "fast"];
 const WALL_MAX: usize = 120;
 
 const WIN_W: usize = 520;
-const TOP: usize = 12;
+const TAB_H: usize = 28;
+const TOP: usize = 12 + TAB_H;
 const ROW_H: usize = 40;
-const ROWS: usize = 8;
+const ROWS: usize = 10;
+/// The tab strip: General · Users · Display · About.
+pub const TABS: usize = 4;
+const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About"];
 const WIN_H: usize = TOP + ROWS * ROW_H + 8;
 const LABEL_X: usize = 12;
 const TRACK_X: usize = 150;
@@ -72,14 +81,19 @@ pub struct Values {
     pub idle_min: u32,
     pub ptr: u8,
     pub wall: String,
+    /// The selected tab (M1), persisted as `tab=`.
+    pub tab: u8,
 }
 
 impl Values {
-    const DEFAULT: Values = Values { bright: 12, vol: 12, mute: false, idle_min: 10, ptr: 1, wall: String::new() };
+    const DEFAULT: Values = Values { bright: 12, vol: 12, mute: false, idle_min: 10, ptr: 1, wall: String::new(), tab: 0 };
 }
 
 struct State {
     sel: usize,
+    /// Focus is on the tab strip (Left/Right switch tabs).
+    strip: bool,
+    u: UsersUi,
     w: usize,
     h: usize,
     surf: Vec<u32>,
@@ -90,8 +104,8 @@ struct State {
 /// `key=value` lines for `v`. Pure.
 pub fn serialize(v: &Values) -> String {
     alloc::format!(
-        "brightness={}\nvolume={}\nmute={}\nidle_min={}\npointer={}\nwallpaper={}\n",
-        v.bright, v.vol, v.mute as u8, v.idle_min, v.ptr, v.wall
+        "brightness={}\nvolume={}\nmute={}\nidle_min={}\npointer={}\nwallpaper={}\ntab={}\n",
+        v.bright, v.vol, v.mute as u8, v.idle_min, v.ptr, v.wall, v.tab
     )
 }
 
@@ -110,6 +124,7 @@ pub fn parse(text: &str, v: &mut Values) -> (u32, usize) {
             ("idle_min", Some(x)) if x <= 1440 => { v.idle_min = x; 3 }
             ("pointer", Some(x)) if x <= 2 => { v.ptr = x as u8; 4 }
             ("wallpaper", _) if val.len() <= WALL_MAX && val.bytes().all(|b| (0x20..=0x7e).contains(&b)) => { v.wall = String::from(val); 5 }
+            ("tab", Some(x)) if (x as usize) < TABS => { v.tab = x as u8; 6 }
             _ => continue,
         };
         mask |= 1 << bit;
@@ -222,10 +237,10 @@ pub fn save(print: bool) -> Result<usize, String> {
         if w == 0 { return Err(String::from("write: zero")); }
         off += w;
     }
-    SAVED_N.store(6, Ordering::Relaxed);
+    SAVED_N.store(7, Ordering::Relaxed);
     serial_println!("[settings] saved path={} bytes={}", path, off);
     if print { witness(true); }
-    Ok(6)
+    Ok(7)
 }
 
 /// Read the file, if there is one, into `v`. `(mask, n)`.
@@ -241,8 +256,8 @@ fn read_file(v: &mut Values) -> Option<(u32, usize)> {
 
 fn witness(ok: bool) {
     serial_println!(
-        ":: SETTINGS: controls={} loaded={} saved={} -> {} ::",
-        CONTROLS, LOADED_N.load(Ordering::Relaxed), SAVED_N.load(Ordering::Relaxed), if ok { "PASS" } else { "FAIL" }
+        ":: SETTINGS: controls={} tabs={} loaded={} saved={} -> {} ::",
+        CONTROLS, TABS, LOADED_N.load(Ordering::Relaxed), SAVED_N.load(Ordering::Relaxed), if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -351,9 +366,16 @@ pub fn service() {
     }
 }
 
-/// Row index (0-based) of control `i`.
+// ── Tabs: which controls live where, and the layout helpers ──────────────────────────────────
+
+/// Control indices on `tab`, in keyboard order (General: all but idle; Display: idle; Users/About: none).
+fn tab_ctrls(tab: usize) -> &'static [usize] {
+    match tab { 0 => &[0, 1, 2, 4, 5, 6, 7, 8], 2 => &[3], _ => &[] }
+}
+
+/// Row of control `i` on its tab.
 const fn row_of(i: usize) -> usize {
-    match i { 0..=5 => i, 6 | 7 => 6, _ => 7 }
+    match i { 0 | 1 | 2 => i, 3 => 0, 4 => 3, 5 => 4, 6 | 7 => 5, _ => 6 }
 }
 
 fn fill(s: &mut [u32], w: usize, x: usize, y: usize, rw: usize, rh: usize, c: u32) {
@@ -364,68 +386,311 @@ fn fill(s: &mut [u32], w: usize, x: usize, y: usize, rw: usize, rh: usize, c: u3
     }
 }
 
-fn paint(st: &mut State, v: &Values) {
+fn txt(st: &mut State, x: usize, r: usize, t: &str) {
     let face = font::Face::Body;
+    let (w, h, ch) = (st.w, st.h, face.cell_h());
+    font::draw_text(&mut st.surf, w, w, h, x, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::CONTENT_TEXT, false, face);
+}
+
+fn btn(st: &mut State, r: usize, x: usize, t: &str) {
+    let face = font::Face::Body;
+    let (w, h, ch) = (st.w, st.h, face.cell_h());
+    let y = TOP + r * ROW_H + (ROW_H - BTN_H) / 2;
+    fill(&mut st.surf, w, x, y, BTN_W, BTN_H, theme::BUTTON_FACE);
+    fill(&mut st.surf, w, x, y, BTN_W, 1, theme::FRAME_LINE);
+    fill(&mut st.surf, w, x, y + BTN_H - 1, BTN_W, 1, theme::FRAME_LINE);
+    font::draw_text(&mut st.surf, w, w, h, x + 8, y + (BTN_H - ch) / 2, t.as_bytes(), theme::BUTTON_TEXT, false, face);
+}
+
+fn field(st: &mut State, r: usize, t: &str, focus: bool) {
+    let face = font::Face::Body;
+    let (w, h, ch) = (st.w, st.h, face.cell_h());
+    fill(&mut st.surf, w, TRACK_X, TOP + r * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::BUTTON_FACE);
+    let mut shown = String::from(t);
+    if focus { shown.push('_'); }
+    font::draw_text(&mut st.surf, w, w - 14, h, TRACK_X + 4, TOP + r * ROW_H + (ROW_H - ch) / 2, shown.as_bytes(), theme::BUTTON_TEXT, false, face);
+}
+
+fn slider(st: &mut State, r: usize, pos: usize, max: usize) {
+    let w = st.w;
+    let y = TOP + r * ROW_H + ROW_H / 2;
+    fill(&mut st.surf, w, TRACK_X, y - 2, TRACK_W, 4, theme::SCROLL_TRACK);
+    let kx = TRACK_X + pos * TRACK_W / max.max(1);
+    fill(&mut st.surf, w, TRACK_X, y - 2, kx - TRACK_X, 4, theme::ACCENT);
+    fill(&mut st.surf, w, kx.saturating_sub(KNOB_W / 2), y - 9, KNOB_W, 18, theme::ACCENT);
+}
+
+fn paint(st: &mut State, v: &Values) {
     let (w, h) = (st.w, st.h);
-    let ch = face.cell_h();
     for p in st.surf.iter_mut() { *p = theme::CONTENT_FILL; }
-    let label = |s: &mut [u32], r: usize, t: &str| {
-        font::draw_text(s, w, w, h, LABEL_X, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::CONTENT_TEXT, false, face);
-    };
-    let val = |s: &mut [u32], r: usize, t: &str| {
-        font::draw_text(s, w, w, h, VAL_X, TOP + r * ROW_H + (ROW_H - ch) / 2, t.as_bytes(), theme::CONTENT_TEXT, false, face);
-    };
-    let slider = |s: &mut [u32], r: usize, pos: usize, max: usize| {
-        let y = TOP + r * ROW_H + ROW_H / 2;
-        fill(s, w, TRACK_X, y - 2, TRACK_W, 4, theme::SCROLL_TRACK);
-        let kx = TRACK_X + pos * TRACK_W / max.max(1);
-        fill(s, w, TRACK_X, y - 2, kx - TRACK_X, 4, theme::ACCENT);
-        fill(s, w, kx.saturating_sub(KNOB_W / 2), y - 9, KNOB_W, 18, theme::ACCENT);
-    };
-    let button = |s: &mut [u32], r: usize, x: usize, t: &str| {
-        let y = TOP + r * ROW_H + (ROW_H - BTN_H) / 2;
-        fill(s, w, x, y, BTN_W, BTN_H, theme::BUTTON_FACE);
-        fill(s, w, x, y, BTN_W, 1, theme::FRAME_LINE);
-        fill(s, w, x, y + BTN_H - 1, BTN_W, 1, theme::FRAME_LINE);
-        font::draw_text(s, w, w, h, x + 8, y + (BTN_H - ch) / 2, t.as_bytes(), theme::BUTTON_TEXT, false, face);
-    };
-    label(&mut st.surf, 0, "Brightness");
-    slider(&mut st.surf, 0, v.bright as usize, 16);
-    val(&mut st.surf, 0, &alloc::format!("{}/16", v.bright));
-    label(&mut st.surf, 1, "Volume");
-    slider(&mut st.surf, 1, v.vol as usize, 16);
-    val(&mut st.surf, 1, &alloc::format!("{}/16", v.vol));
-    label(&mut st.surf, 2, "Mute");
+    let face = font::Face::Body;
+    let ch = face.cell_h();
+    // The tab strip.
+    let tw = w / TABS;
+    for k in 0..TABS {
+        let on = k == v.tab as usize;
+        fill(&mut st.surf, w, k * tw, 0, tw - 2, TAB_H, if on { theme::ACCENT } else { theme::SCROLL_TRACK });
+        font::draw_text(&mut st.surf, w, w, h, k * tw + 10, (TAB_H - ch) / 2, TAB_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+    }
+    if st.strip { fill(&mut st.surf, w, 0, TAB_H - 3, w, 2, theme::ACCENT); }
+    match v.tab {
+        0 => paint_general(st, v),
+        1 => paint_users(st),
+        2 => paint_display(st, v),
+        _ => paint_about(st),
+    }
+    if !st.strip && matches!(v.tab, 0 | 2) {
+        let r = row_of(st.sel);
+        fill(&mut st.surf, w, 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::ACCENT);
+        if st.sel == 7 { fill(&mut st.surf, w, TRACK_X + BTN_W + 10, TOP + 5 * ROW_H + ROW_H - 8, BTN_W, 2, theme::ACCENT); }
+    }
+}
+
+fn paint_general(st: &mut State, v: &Values) {
+    let (w, h, ch) = (st.w, st.h, font::Face::Body.cell_h());
+    let face = font::Face::Body;
+    txt(st, LABEL_X, 0, "Brightness");
+    slider(st, 0, v.bright as usize, 16);
+    txt(st, VAL_X, 0, &alloc::format!("{}/16", v.bright));
+    txt(st, LABEL_X, 1, "Volume");
+    slider(st, 1, v.vol as usize, 16);
+    txt(st, VAL_X, 1, &alloc::format!("{}/16", v.vol));
+    txt(st, LABEL_X, 2, "Mute");
     fill(&mut st.surf, w, TRACK_X, TOP + 2 * ROW_H + 8, 24, 24, theme::SCROLL_TRACK);
     if v.mute { fill(&mut st.surf, w, TRACK_X + 4, TOP + 2 * ROW_H + 12, 16, 16, theme::ACCENT); }
-    val(&mut st.surf, 2, if v.mute { "muted" } else { "sound on" });
-    label(&mut st.surf, 3, "Blank screen");
-    slider(&mut st.surf, 3, idle_index(v.idle_min), IDLE_STEPS.len() - 1);
-    let it = if v.idle_min == 0 { String::from("never") } else { alloc::format!("{} min", v.idle_min) };
-    val(&mut st.surf, 3, &it);
-    label(&mut st.surf, 4, "Pointer");
+    txt(st, VAL_X, 2, if v.mute { "muted" } else { "sound on" });
+    txt(st, LABEL_X, 3, "Pointer");
     let seg = TRACK_W / 3;
     for k in 0..3usize {
         let c = if k as u8 == v.ptr { theme::ACCENT } else { theme::SCROLL_TRACK };
-        fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 4 * ROW_H + 6, seg - 2, ROW_H - 12, c);
-        font::draw_text(&mut st.surf, w, w, h, TRACK_X + k * seg + 8, TOP + 4 * ROW_H + (ROW_H - ch) / 2, PTR_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
+        fill(&mut st.surf, w, TRACK_X + k * seg, TOP + 3 * ROW_H + 6, seg - 2, ROW_H - 12, c);
+        font::draw_text(&mut st.surf, w, w, h, TRACK_X + k * seg + 8, TOP + 3 * ROW_H + (ROW_H - ch) / 2, PTR_NAMES[k].as_bytes(), theme::CONTENT_TEXT, false, face);
     }
-    label(&mut st.surf, 5, "Wallpaper");
-    fill(&mut st.surf, w, TRACK_X, TOP + 5 * ROW_H + 6, w - TRACK_X - 12, ROW_H - 12, theme::BUTTON_FACE);
-    let mut shown = v.wall.clone();
-    if st.sel == 5 { shown.push('_'); }
-    font::draw_text(&mut st.surf, w, w - 14, h, TRACK_X + 4, TOP + 5 * ROW_H + (ROW_H - ch) / 2, shown.as_bytes(), theme::BUTTON_TEXT, false, face);
-    button(&mut st.surf, 6, TRACK_X, "Apply");
-    button(&mut st.surf, 6, TRACK_X + BTN_W + 10, "Off");
-    label(&mut st.surf, 7, "Account");
+    txt(st, LABEL_X, 4, "Wallpaper");
+    let (focus, wall) = (!st.strip && st.sel == 5, v.wall.clone());
+    field(st, 4, &wall, focus);
+    btn(st, 5, TRACK_X, "Apply");
+    btn(st, 5, TRACK_X + BTN_W + 10, "Off");
+    txt(st, LABEL_X, 6, "Account");
     let who = user_name().unwrap_or_else(|| String::from("(no session)"));
-    font::draw_text(&mut st.surf, w, w, h, TRACK_X, TOP + 7 * ROW_H + (ROW_H - ch) / 2, who.as_bytes(), theme::CONTENT_TEXT, false, face);
-    button(&mut st.surf, 7, VAL_X - 30, "Password");
-    // Selection mark: a bar at the left edge of the selected control's row.
-    let r = row_of(st.sel);
-    let off = if st.sel == 7 { BTN_W + 10 } else { 0 };
-    fill(&mut st.surf, w, 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::ACCENT);
-    if st.sel == 7 { fill(&mut st.surf, w, TRACK_X + off, TOP + 6 * ROW_H + ROW_H - 8, BTN_W, 2, theme::ACCENT); }
+    txt(st, TRACK_X, 6, &who);
+    btn(st, 6, VAL_X - 30, "Password");
+}
+
+fn paint_display(st: &mut State, v: &Values) {
+    txt(st, LABEL_X, 0, "Blank screen");
+    slider(st, 0, idle_index(v.idle_min), IDLE_STEPS.len() - 1);
+    let it = if v.idle_min == 0 { String::from("never") } else { alloc::format!("{} min", v.idle_min) };
+    txt(st, VAL_X, 0, &it);
+    txt(st, LABEL_X, 1, "UI scale");
+    let id = WIN.load(Ordering::Relaxed);
+    let sc = wm::info(id).map(|i| i.scale).unwrap_or(1);
+    txt(st, TRACK_X, 1, &alloc::format!("{}x - read-only, fixed at takeover", sc));
+    txt(st, LABEL_X, 2, "Menubar clock");
+    txt(st, TRACK_X, 2, "24h - fixed, no runtime switch");
+}
+
+fn paint_about(st: &mut State) {
+    let ver = option_env!("UNAOS_GIT_SHA").unwrap_or("dev build");
+    txt(st, LABEL_X, 0, "Version");
+    txt(st, TRACK_X, 0, ver);
+    txt(st, LABEL_X, 1, "Board");
+    txt(st, TRACK_X, 1, if cfg!(target_arch = "x86_64") { "x86_64 (UEFI)" } else { "aarch64" });
+    txt(st, LABEL_X, 2, "CPUs");
+    #[cfg(target_arch = "x86_64")]
+    let cpus = alloc::format!("{}", crate::arch::x86_64::acpi::cpu_count());
+    #[cfg(not(target_arch = "x86_64"))]
+    let cpus = String::from("n/a");
+    txt(st, TRACK_X, 2, &cpus);
+    txt(st, LABEL_X, 3, "Memory");
+    let (a, b) = crate::allocator::heap_bounds();
+    txt(st, TRACK_X, 3, &alloc::format!("{} MiB kernel heap", b.saturating_sub(a) >> 20));
+    txt(st, LABEL_X, 4, "Uptime");
+    let up = crate::clock::uptime_secs().map(|u| alloc::format!("{}h {}m {}s", u / 3600, (u / 60) % 60, u % 60)).unwrap_or_else(|| String::from("n/a"));
+    txt(st, TRACK_X, 4, &up);
+}
+
+// ── Users tab (M2) ────────────────────────────────────────────────────────────────────────────
+
+/// The Users tab's own state: list selection, the Add form, the pending delete confirm, a status line.
+struct UsersUi {
+    sel: usize,
+    form: bool,
+    focus: u8,
+    name: String,
+    pw: String,
+    pw2: String,
+    confirm: Option<String>,
+    msg: String,
+}
+
+impl UsersUi {
+    fn new() -> Self {
+        UsersUi { sel: 0, form: false, focus: 0, name: String::new(), pw: String::new(), pw2: String::new(), confirm: None, msg: String::new() }
+    }
+}
+
+static U_LISTED: AtomicU32 = AtomicU32::new(0);
+static U_ADDED: AtomicU32 = AtomicU32::new(0);
+static U_DELETED: AtomicU32 = AtomicU32::new(0);
+static U_REFUSED: AtomicU32 = AtomicU32::new(0);
+
+/// The user table, `(name, password unset)` in row order (root included; it is a row).
+fn user_list() -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    #[cfg(feature = "login")]
+    {
+        use crate::fs::users;
+        if !users::load_once() { return out; }
+        let mut nb = [0u8; users::NAME_MAX];
+        let mut i = 0usize;
+        while let Some(n) = users::name_at(i, &mut nb) {
+            i += 1;
+            let unset = users::password_unset(&nb[..n]) == Some(true);
+            out.push((String::from(core::str::from_utf8(&nb[..n]).unwrap_or("?")), unset));
+        }
+        U_LISTED.store(out.len() as u32, Ordering::Relaxed);
+    }
+    out
+}
+
+fn is_root() -> bool {
+    #[cfg(feature = "login")]
+    { crate::fs::users::root_session() }
+    #[cfg(not(feature = "login"))]
+    { false }
+}
+
+fn users_say(op: &str, name: &str, ok: bool, reason: &str) {
+    if !ok { U_REFUSED.fetch_add(1, Ordering::Relaxed); }
+    serial_println!("[settings] users op={} name={} ok={} reason={}", op, name, ok as u8, reason);
+}
+
+/// Add a user (root only): the create-user form's rules, then the `adduser` path and a first password.
+fn users_add(name: &str, pw: &str, pw2: &str) -> Result<(), &'static str> {
+    #[cfg(feature = "login")]
+    {
+        use crate::fs::users;
+        users::create_user_rules(name.as_bytes(), pw.as_bytes())?;
+        if pw != pw2 { return Err("Passwords do not match"); }
+        users::adduser_commit(name.as_bytes())?;
+        if users::set_first_password(name.as_bytes(), pw.as_bytes()).is_err() { return Err("Could not save the password"); }
+        U_ADDED.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    #[cfg(not(feature = "login"))]
+    { let _ = (name, pw, pw2); Err("login-feature-off") }
+}
+
+/// Delete through the real `deluser` verb (so its refusals and its `[users]` witness are the verb's own).
+/// `Ok` = removed; `Err(reason)` = the verb's wire word.
+fn users_delete(name: &str) -> Result<(), &'static str> {
+    #[cfg(feature = "login")]
+    {
+        let mut con = crate::console::Console::new();
+        crate::fs::users::shell_verb("deluser", &[name], &mut con);
+        let r = crate::fs::users::usermgmt_last();
+        if r == "deleted" { U_DELETED.fetch_add(1, Ordering::Relaxed); return Ok(()); }
+        return Err(r);
+    }
+    #[cfg(not(feature = "login"))]
+    { let _ = name; Err("login-feature-off") }
+}
+
+fn users_reset(name: &str) {
+    #[cfg(feature = "login")]
+    {
+        crate::video::login::open_set_password(name.as_bytes(), false);
+        users_say("reset", name, true, "set-password-screen");
+    }
+    #[cfg(not(feature = "login"))]
+    { users_say("reset", name, false, "login-feature-off"); }
+}
+
+fn paint_users(st: &mut State) {
+    let list = user_list();
+    let root = is_root();
+    let me = user_name().unwrap_or_default();
+    if st.u.form {
+        txt(st, LABEL_X, 0, "New user");
+        txt(st, LABEL_X, 1, "Name");
+        let (n, f) = (st.u.name.clone(), st.u.focus == 0);
+        field(st, 1, &n, f);
+        txt(st, LABEL_X, 2, "Password");
+        let (p, f) = ("*".repeat(st.u.pw.len()), st.u.focus == 1);
+        field(st, 2, &p, f);
+        txt(st, LABEL_X, 3, "Retype");
+        let (p, f) = ("*".repeat(st.u.pw2.len()), st.u.focus == 2);
+        field(st, 3, &p, f);
+        btn(st, 4, TRACK_X, "Create");
+        btn(st, 4, TRACK_X + BTN_W + 10, "Cancel");
+    } else {
+        txt(st, LABEL_X, 0, &alloc::format!("Users ({})", list.len()));
+        if root { btn(st, 0, TRACK_X, "Add user"); } else { txt(st, TRACK_X, 0, "(only root can change the list)"); }
+        let sel = st.u.sel.min(list.len().saturating_sub(1));
+        for (i, (nm, unset)) in list.iter().enumerate().take(8) {
+            let r = 1 + i;
+            let tag = if *nm == me { " (you)" } else if *unset { " (no password)" } else { "" };
+            let w = st.w;
+            if i == sel { fill(&mut st.surf, w, 2, TOP + r * ROW_H + 6, 3, ROW_H - 12, theme::ACCENT); }
+            txt(st, LABEL_X, r, &alloc::format!("{}{}", nm, tag));
+            if st.u.confirm.as_deref() == Some(nm.as_str()) {
+                txt(st, TRACK_X + 130, r, "delete?");
+                btn(st, r, TRACK_X + 200, "Yes");
+                btn(st, r, TRACK_X + 200 + BTN_W + 6, "No");
+            } else if root {
+                btn(st, r, TRACK_X, if *nm == me { "Password" } else { "Reset" });
+                btn(st, r, TRACK_X + BTN_W + 10, "Delete");
+            } else if *nm == me {
+                btn(st, r, TRACK_X, "Password");
+            }
+        }
+    }
+    let m = st.u.msg.clone();
+    txt(st, LABEL_X, 9, &m);
+}
+
+fn users_form_submit() {
+    let (n, p, p2) = { let s = STATE.lock(); match s.as_ref() { Some(s) => (s.u.name.clone(), s.u.pw.clone(), s.u.pw2.clone()), None => return } };
+    let r = users_add(&n, &p, &p2);
+    if let Some(s) = STATE.lock().as_mut() {
+        match r {
+            Ok(()) => { s.u.form = false; s.u.msg = alloc::format!("added {}", n); }
+            Err(e) => { s.u.msg = String::from(e); s.u.pw.clear(); s.u.pw2.clear(); }
+        }
+    }
+    users_say("add", &n, r.is_ok(), r.err().unwrap_or("created"));
+    repaint();
+}
+
+/// Press / Enter on a user row's first or second button. `which` 0 = Reset/Password, 1 = Delete.
+fn users_row_action(name: &str, which: usize) {
+    if which == 0 {
+        users_reset(name);
+        return;
+    }
+    let armed = STATE.lock().as_ref().map(|s| s.u.confirm.as_deref() == Some(name)).unwrap_or(false);
+    if !armed {
+        if let Some(s) = STATE.lock().as_mut() { s.u.confirm = Some(String::from(name)); s.u.msg = alloc::format!("delete {}? Yes / No", name); }
+        users_say("delete-arm", name, true, "confirm");
+    } else {
+        users_confirm(name, true);
+    }
+    repaint();
+}
+
+fn users_confirm(name: &str, yes: bool) {
+    if let Some(s) = STATE.lock().as_mut() { s.u.confirm = None; }
+    if !yes {
+        if let Some(s) = STATE.lock().as_mut() { s.u.msg = String::from("cancelled"); }
+        users_say("delete", name, false, "cancelled-by-user");
+        return;
+    }
+    let r = users_delete(name);
+    if let Some(s) = STATE.lock().as_mut() {
+        s.u.msg = match r { Ok(()) => alloc::format!("deleted {}", name), Err(e) => alloc::format!("refused: {}", e) };
+    }
+    users_say("delete", name, r.is_ok(), r.err().unwrap_or("deleted"));
 }
 
 fn repaint() {
@@ -457,7 +722,8 @@ pub fn open() -> Result<(), String> {
     let wtop = crate::ui_status::top_chrome_h(pw, ph);
     let ox = pw.saturating_sub(ow) / 2;
     let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
-    let mut st = State { sel: 0, w, h, surf };
+    let tab0 = CUR.lock().tab as usize;
+    let mut st = State { sel: tab_ctrls(tab0).first().copied().unwrap_or(0), strip: true, u: UsersUi::new(), w, h, surf };
     paint(&mut st, &CUR.lock().clone());
     let base = st.surf.as_ptr() as usize;
     let id = wm::create_at(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, b"Settings", ox + wm::BORDER, oy + wm::TITLE_H + wm::BORDER);
@@ -482,7 +748,7 @@ pub fn close() {
 }
 
 fn select(i: usize) {
-    if let Some(st) = STATE.lock().as_mut() { st.sel = i.min(CONTROLS - 1); }
+    if let Some(st) = STATE.lock().as_mut() { st.sel = i.min(CONTROLS - 1); st.strip = false; }
     repaint();
 }
 
@@ -490,34 +756,133 @@ fn sel() -> usize {
     STATE.lock().as_ref().map(|s| s.sel).unwrap_or(0)
 }
 
+/// Switch to tab `t`: persist it (`tab=` in `.settings`), reset the tab's transient state, repaint.
+fn switch_tab(t: usize) {
+    let t = t.min(TABS - 1);
+    CUR.lock().tab = t as u8;
+    if let Some(st) = STATE.lock().as_mut() {
+        st.u = UsersUi::new();
+        st.strip = true;
+        if let Some(&c) = tab_ctrls(t).first() { st.sel = c; }
+    }
+    serial_println!("[settings] tab={}", TAB_NAMES[t]);
+    if let Err(e) = save(true) { serial_println!("[settings] save FAILED reason={}", e); }
+    repaint();
+}
+
+fn cur_tab() -> usize { CUR.lock().tab as usize }
+
 /// Keys and actions, only while this window holds focus. `true` when consumed.
 pub fn key_route(ev: crate::pal::Event) -> bool {
     use crate::video::keymap::Action;
     if !is_open() || wm::focus_asid() != OWNER { return false; }
-    let s = sel();
+    let (s, strip) = STATE.lock().as_ref().map(|x| (x.sel, x.strip)).unwrap_or((0, true));
+    let tab = cur_tab();
+    let form = tab == 1 && STATE.lock().as_ref().map(|x| x.u.form).unwrap_or(false);
+    let ctrls = tab_ctrls(tab);
+    let horiz = !strip && ((tab == 0 && matches!(s, 0 | 1 | 2 | 4)) || (tab == 2 && s == 3));
     match ev {
-        crate::pal::Event::Action(Action::CursorLeft) => { adjust(s, -1); true }
-        crate::pal::Event::Action(Action::CursorRight) => { adjust(s, 1); true }
-        crate::pal::Event::Key(c) => match c {
-            // Up/Down arrows (0x1E / 0x1F — the TEXTEDIT reading) and Tab.
-            0x1E => { select(s.saturating_sub(1)); true }
-            0x1F | 0x09 => { select(if s + 1 >= CONTROLS { 0 } else { s + 1 }); true }
-            // Left/Right bytes ride beside their Action; the Action adjusts.
-            0x1C | 0x1D => true,
-            0x0A | 0x0D => { activate(s); true }
-            0x08 | 0x7F if s == 5 => { CUR.lock().wall.pop(); repaint(); true }
-            0x20..=0x7e if s == 5 => {
-                { let mut c2 = CUR.lock(); if c2.wall.len() < WALL_MAX { c2.wall.push(c as char); } }
-                repaint();
-                true
+        crate::pal::Event::Action(Action::CursorLeft) | crate::pal::Event::Action(Action::CursorRight) => {
+            let d: isize = if matches!(ev, crate::pal::Event::Action(Action::CursorLeft)) { -1 } else { 1 };
+            if form { return true; }
+            if horiz { adjust(s, d); } else { switch_tab((tab as isize + d).clamp(0, TABS as isize - 1) as usize); }
+            true
+        }
+        crate::pal::Event::Key(c) => {
+            if form {
+                return users_form_key(c);
             }
-            _ => false,
-        },
+            match c {
+                0x1C | 0x1D => true,
+                0x1E => {
+                    // Up: previous control; from the first one, the tab strip.
+                    if tab == 1 {
+                        let mut g = STATE.lock();
+                        if let Some(x) = g.as_mut() { if x.strip { } else if x.u.sel > 0 { x.u.sel -= 1; } else { x.strip = true; } }
+                        drop(g);
+                        repaint();
+                    } else if !strip {
+                        let p = ctrls.iter().position(|&k| k == s).unwrap_or(0);
+                        if p == 0 { if let Some(x) = STATE.lock().as_mut() { x.strip = true; } repaint(); } else { select(ctrls[p - 1]); }
+                    }
+                    true
+                }
+                0x1F | 0x09 => {
+                    if tab == 1 {
+                        let n = user_list().len();
+                        if let Some(x) = STATE.lock().as_mut() { if x.strip { x.strip = false; } else if x.u.sel + 1 < n { x.u.sel += 1; } }
+                        repaint();
+                    } else if strip { if let Some(&f) = ctrls.first() { select(f); } else { repaint(); } }
+                    else {
+                        let p = ctrls.iter().position(|&k| k == s).unwrap_or(0);
+                        select(ctrls[if p + 1 >= ctrls.len() { 0 } else { p + 1 }]);
+                    }
+                    true
+                }
+                0x0A | 0x0D if tab == 1 && !strip => { users_key_enter(); true }
+                0x0A | 0x0D if tab == 0 && !strip => { activate(s); true }
+                0x1B if tab == 1 => { if let Some(x) = STATE.lock().as_mut() { x.u.confirm = None; } repaint(); true }
+                b'a' if tab == 1 && !strip && is_root() => {
+                    if let Some(x) = STATE.lock().as_mut() { x.u = UsersUi::new(); x.u.form = true; }
+                    repaint();
+                    true
+                }
+                0x7F | b'd' if tab == 1 && !strip && is_root() => { users_key_delete(); true }
+                0x08 | 0x7F if tab == 0 && !strip && s == 5 => { CUR.lock().wall.pop(); repaint(); true }
+                0x20..=0x7e if tab == 0 && !strip && s == 5 => {
+                    { let mut c2 = CUR.lock(); if c2.wall.len() < WALL_MAX { c2.wall.push(c as char); } }
+                    repaint();
+                    true
+                }
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
 
-/// Pointer press: close box, then the control under it. `true` when consumed.
+fn users_key_name() -> Option<String> {
+    let n = STATE.lock().as_ref().map(|x| x.u.sel).unwrap_or(0);
+    user_list().get(n).map(|x| x.0.clone())
+}
+
+fn users_key_enter() {
+    let Some(nm) = users_key_name() else { return };
+    let armed = STATE.lock().as_ref().map(|s| s.u.confirm.as_deref() == Some(nm.as_str())).unwrap_or(false);
+    if armed { users_confirm(&nm, true); repaint(); return; }
+    let me = user_name().unwrap_or_default();
+    if is_root() || nm == me { users_reset(&nm); }
+}
+
+fn users_key_delete() {
+    if let Some(nm) = users_key_name() { users_row_action(&nm, 1); }
+}
+
+/// Typing in the Add form: Tab/Enter move on (Enter on the last field submits), Backspace, Esc cancels.
+fn users_form_key(c: u8) -> bool {
+    let mut submit = false;
+    {
+        let mut g = STATE.lock();
+        let Some(x) = g.as_mut() else { return true };
+        let u = &mut x.u;
+        match c {
+            0x1B => { u.form = false; }
+            0x09 | 0x1F => u.focus = (u.focus + 1) % 3,
+            0x1E => u.focus = (u.focus + 2) % 3,
+            0x0A | 0x0D => { if u.focus < 2 { u.focus += 1; } else { submit = true; } }
+            0x08 | 0x7F => { match u.focus { 0 => { u.name.pop(); } 1 => { u.pw.pop(); } _ => { u.pw2.pop(); } } }
+            0x20..=0x7e => {
+                let f = match u.focus { 0 => &mut u.name, 1 => &mut u.pw, _ => &mut u.pw2 };
+                if f.len() < 32 { f.push(c as char); }
+            }
+            _ => {}
+        }
+    }
+    if submit { users_form_submit(); } else { repaint(); }
+    true
+}
+
+/// Pointer press: close box, tab strip, then the control under it. `true` when consumed.
 pub fn press_route(x: i32, y: i32) -> bool {
     let id = WIN.load(Ordering::Relaxed);
     if id == wm::WIN_NONE { return false; }
@@ -536,23 +901,76 @@ pub fn press_route(x: i32, y: i32) -> bool {
     let (cx, cy) = ((x as usize - info.x) / sc, (y as usize - info.y) / sc);
     if cx >= info.w || cy >= info.h { return false; }
     wm::focus_changed(OWNER);
+    if cy < TAB_H {
+        let t = (cx / (info.w / TABS).max(1)).min(TABS - 1);
+        if t != cur_tab() { switch_tab(t); } else { if let Some(st) = STATE.lock().as_mut() { st.strip = true; } repaint(); }
+        return true;
+    }
     if cy < TOP { return true; }
     let row = (cy - TOP) / ROW_H;
+    match cur_tab() {
+        0 => press_general(row, cx),
+        1 => press_users(row, cx),
+        2 => {
+            if row == 0 && cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 { select(3); set(3, slider_at(cx, IDLE_STEPS.len() - 1)); }
+        }
+        _ => {}
+    }
+    true
+}
+
+fn press_general(row: usize, cx: usize) {
     match row {
         0 if cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 => { select(0); set(0, slider_at(cx, 16)); }
         1 if cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 => { select(1); set(1, slider_at(cx, 16)); }
         2 => { select(2); if cx >= TRACK_X && cx < TRACK_X + 24 { let m = CUR.lock().mute; set(2, (!m) as usize); } }
-        3 if cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 => { select(3); set(3, slider_at(cx, IDLE_STEPS.len() - 1)); }
-        4 => { select(4); if cx >= TRACK_X && cx < TRACK_X + TRACK_W { set(4, (cx - TRACK_X) / (TRACK_W / 3)); } }
-        5 => select(5),
-        6 => {
+        3 => { select(4); if cx >= TRACK_X && cx < TRACK_X + TRACK_W { set(4, (cx - TRACK_X) / (TRACK_W / 3)); } }
+        4 => select(5),
+        5 => {
             if cx >= TRACK_X && cx < TRACK_X + BTN_W { select(6); do_wallpaper(false); }
             else if cx >= TRACK_X + BTN_W + 10 && cx < TRACK_X + 2 * BTN_W + 10 { select(7); do_wallpaper(true); }
         }
-        7 => { if cx >= VAL_X - 30 && cx < VAL_X - 30 + BTN_W { select(8); change_password(); } }
+        6 => { if cx >= VAL_X - 30 && cx < VAL_X - 30 + BTN_W { select(8); change_password(); } }
         _ => {}
     }
-    true
+}
+
+fn press_users(row: usize, cx: usize) {
+    let in_b = |x0: usize| cx >= x0 && cx < x0 + BTN_W;
+    let form = STATE.lock().as_ref().map(|s| s.u.form).unwrap_or(false);
+    if form {
+        match row {
+            1 | 2 | 3 => { if let Some(s) = STATE.lock().as_mut() { s.u.focus = (row - 1) as u8; } repaint(); }
+            4 => {
+                if in_b(TRACK_X) { users_form_submit(); }
+                else if in_b(TRACK_X + BTN_W + 10) { if let Some(s) = STATE.lock().as_mut() { s.u.form = false; } repaint(); }
+            }
+            _ => {}
+        }
+        return;
+    }
+    if row == 0 {
+        if is_root() && in_b(TRACK_X) {
+            if let Some(s) = STATE.lock().as_mut() { s.u = UsersUi::new(); s.u.form = true; s.strip = false; }
+            repaint();
+        }
+        return;
+    }
+    let list = user_list();
+    let Some((nm, _)) = list.get(row - 1) else { return };
+    if let Some(s) = STATE.lock().as_mut() { s.u.sel = row - 1; s.strip = false; }
+    let armed = STATE.lock().as_ref().map(|s| s.u.confirm.as_deref() == Some(nm.as_str())).unwrap_or(false);
+    let me = user_name().unwrap_or_default();
+    if armed {
+        if in_b(TRACK_X + 200) { users_confirm(nm, true); } else if in_b(TRACK_X + 200 + BTN_W + 6) { users_confirm(nm, false); }
+        repaint();
+    } else if in_b(TRACK_X) && (is_root() || *nm == me) {
+        users_row_action(nm, 0);
+    } else if in_b(TRACK_X + BTN_W + 10) && is_root() {
+        users_row_action(nm, 1);
+    } else {
+        repaint();
+    }
 }
 
 // ── The fixture ───────────────────────────────────────────────────────────────────────────────
@@ -577,4 +995,45 @@ pub fn selftest() {
     let ok = saved.is_ok() && same && live;
     serial_println!("[settings] fixture opened={} saved={:?} reread_same={} live_idle={}", opened as u8, saved.is_ok(), same as u8, live as u8);
     witness(ok);
+}
+
+/// SETTINGS-USERS — the Users tab's ops against the real table: list, add `tmpuser`, delete it, and the refusals
+/// (root row; the session's own row). Root session: add and delete must both succeed. Any other session: the add
+/// and the delete are refused (`not-root`) and that is the pass. Prints `:: SETTINGS-USERS: ... ::`.
+#[cfg(feature = "witness")]
+pub fn selftest_users() {
+    const T: &str = "tmpuser";
+    let (l0, a0, d0, r0) = (U_LISTED.load(Ordering::Relaxed), U_ADDED.load(Ordering::Relaxed), U_DELETED.load(Ordering::Relaxed), U_REFUSED.load(Ordering::Relaxed));
+    let _ = (l0, a0, d0, r0);
+    let list = user_list();
+    let listed = list.len();
+    let root = is_root();
+    let had = list.iter().any(|x| x.0 == T);
+    let add = users_add(T, "tmp-pw1", "tmp-pw1");
+    users_say("add", T, add.is_ok(), add.err().unwrap_or("created"));
+    let present = user_list().iter().any(|x| x.0 == T);
+    let del = users_delete(T);
+    users_say("delete", T, del.is_ok(), del.err().unwrap_or("deleted"));
+    let gone = !user_list().iter().any(|x| x.0 == T);
+    let rr = users_delete("root");
+    users_say("delete", "root", rr.is_ok(), rr.err().unwrap_or("deleted"));
+    let me = user_name();
+    let rs = match me.as_deref() { Some(m) => { let r = users_delete(m); users_say("delete", m, r.is_ok(), r.err().unwrap_or("deleted")); r.is_err() } None => true };
+    let refused = U_REFUSED.load(Ordering::Relaxed) - r0;
+    let ok = if root {
+        listed >= 1 && add.is_ok() && present && del.is_ok() && gone && rr == Err("root-row") && rs
+    } else {
+        listed >= 1 && add.is_err() && del.is_err() && rr.is_err() && rs && !had
+    };
+    serial_println!(
+        ":: SETTINGS-USERS: listed={} added={} deleted={} refused={} -> {} ::",
+        listed, U_ADDED.load(Ordering::Relaxed) - a0, U_DELETED.load(Ordering::Relaxed) - d0, refused, if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// The `tests settings` fixture: the controls leg, then the Users leg.
+#[cfg(feature = "witness")]
+pub fn selftest_all() {
+    selftest();
+    selftest_users();
 }

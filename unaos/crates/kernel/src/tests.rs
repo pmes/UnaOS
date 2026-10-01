@@ -166,7 +166,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         static DONE2: AtomicBool = AtomicBool::new(false);
-        if !DONE2.swap(true, Ordering::AcqRel) { register("settings", crate::video::settings::selftest); }
+        if !DONE2.swap(true, Ordering::AcqRel) { register("settings", crate::video::settings::selftest_all); }
     }
 }
 
