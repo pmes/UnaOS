@@ -2692,3 +2692,57 @@ fn span_fit_report(
         }
     }
 }
+
+/// UNAFSX86 M4 (rmbp-ledger B298): `tests unafs` — the whole seam on the ROOT the boot bound.
+///
+/// Walks the path a real program's file takes and then checks it from underneath: (1) `create` a file
+/// under `/home` through the MOUNT TABLE (so it lands on whichever backend owns `/`), (2) `write` it
+/// through the table, (3) `force_remount` and re-read it through [`with_unafs`] (the bytes reached the
+/// medium, not a RAM cache), (4) set and get the `owner` attribute through the crate's existing API (no
+/// VFS attribute method — ATTRSURF owns that surface), (5) `unlink` through the table and confirm it is
+/// gone. SKIP when `/` is not the native volume (a FAT-only card) — the fixture never invents a volume.
+#[cfg(feature = "unafs")]
+pub fn unafsx86_selftest() {
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL};
+    const DIR: &str = "/home";
+    const PATH: &str = "/home/unafsx86.tst";
+    const BODY: &[u8] = b"UNAFSX86 seam: create, write, remount, attr, unlink";
+    const OWNER: &str = "user:unafsx86";
+    let mt = crate::shell::vfs_mount_table();
+    let root = mt.volume_name("/").unwrap_or_else(|_| String::from("-"));
+    if root != "native" {
+        serial_println!(":: UNAFSX86-T: root={} (not unafs) -> SKIP ::", root);
+        return;
+    }
+    let _ = mt.stat(DIR).or_else(|_| mt.create(DIR, NodeKind::Dir, KERNEL_PRINCIPAL));
+    let _ = mt.unlink(PATH, KERNEL_PRINCIPAL); // a stale scratch from an interrupted run
+    let create = mt.create(PATH, NodeKind::File, KERNEL_PRINCIPAL).is_ok();
+    let write = create && mt.write(PATH, 0, BODY, KERNEL_PRINCIPAL).map(|n| n == BODY.len()).unwrap_or(false);
+    force_remount();
+    let reread = matches!(
+        with_unafs(|fs| match fs.resolve_path(PATH) {
+            Ok(id) => fs.read_data(id, 0, BODY.len() as u64).map(|d| d == BODY).unwrap_or(false),
+            Err(_) => false,
+        }),
+        Ok(true)
+    );
+    let owner = matches!(
+        with_unafs(|fs| {
+            let id = fs.resolve_path(PATH).ok()?;
+            fs.set_attribute(id, String::from("owner"), AttributeValue::String(String::from(OWNER))).ok()?;
+            match fs.get_attribute(id, "owner").ok()? {
+                Some(AttributeValue::String(v)) => Some(v == OWNER),
+                _ => Some(false),
+            }
+        }),
+        Ok(Some(true))
+    );
+    let unlink = mt.unlink(PATH, KERNEL_PRINCIPAL).is_ok() && mt.stat(PATH).is_err();
+    let w = |b: bool| if b { "ok" } else { "no" };
+    let pass = create && write && reread && owner && unlink;
+    serial_println!(
+        ":: UNAFSX86-T: root=unafs create={} write={} remount-read={} owner={} unlink={} -> {} ::",
+        w(create), w(write), w(reread), w(owner), w(unlink),
+        if pass { "PASS" } else { "FAIL" }
+    );
+}
