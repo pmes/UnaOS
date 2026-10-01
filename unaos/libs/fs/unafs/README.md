@@ -479,6 +479,15 @@ reads (bounded at 4096 links — a cycle is `CorruptVolume`). fsck walks the nam
 tree and reports `bad_parent_links`; repair restamps them. A pre-v6 volume
 derives paths by one name-tree walk per query.
 
+**Timestamps (M4, audit B292).** The same trailer carries `ctime` (last
+metadata change: create, attribute, rename), `mtime` (last data change: create,
+write, a directory's entry list) and `atime` (stamped at create and write only
+— under CoW a read that wrote would cost a commit, so the policy is noatime),
+all unix seconds from `clock::now()`: an embedder's `clock::set_clock_hook`
+(the kernel's wall clock), else `SystemTime` under `std`, else 0. `UnaFS::stat`
+returns them with the parent link; on a v3–v5 volume they read 0 (nowhere to
+keep them), which is what the kernel's `DirEnt.mtime` maps to `None`.
+
 v3–v5 volumes still mount read/write with their flat catalog (overwrite now
 scrubs the replaced entry; the same planner and verifier answer the full
 grammar over it). `tools/unafs migrate --from old.img --to new.img` replays a

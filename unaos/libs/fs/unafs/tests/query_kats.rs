@@ -383,7 +383,10 @@ fn grammar_parses_and_refuses() {
     }
     let deep = format!("{}a == 1{}", "(".repeat(40), ")".repeat(40));
     assert!(Query::parse(&deep).is_err(), "nesting bomb refused");
-    assert!(Query::parse(&"a == 1 OR ".repeat(1000)).is_err(), "length bound");
+    assert!(Query::parse(&"a == 1 OR ".repeat(30_000)).is_err(), "length bound");
+    // A real embedding query (384 dims inline) is well inside the bound.
+    let emb: Vec<String> = (0..384).map(|i| format!("{:?}", i as f32 * -0.001)).collect();
+    assert!(Query::parse(&format!("similarity(e, [{}]) > 0.5 AND type == \"engram\"", emb.join(", "))).is_ok());
 }
 
 /// Differential sweep: 400 objects with pseudo-random Int/Float/String values

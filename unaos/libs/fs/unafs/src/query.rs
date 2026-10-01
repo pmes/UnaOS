@@ -234,8 +234,11 @@ impl Tok {
     }
 }
 
-/// Bound on the query length (the kernel hands this user input).
-pub const MAX_QUERY_LEN: usize = 4096;
+/// Bound on the query length (the kernel hands this user input). Generous on
+/// purpose: a similarity query spells its whole embedding inline (a 1536-dim
+/// vector is ~20 KiB of text); the parse is linear, so the cap only stops a
+/// pathological input, not a real one.
+pub const MAX_QUERY_LEN: usize = 256 * 1024;
 /// Bound on parenthesis nesting.
 pub const MAX_QUERY_DEPTH: usize = 32;
 

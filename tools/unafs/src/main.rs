@@ -75,6 +75,13 @@ enum Commands {
         #[arg(short, long, default_value = "unafs.img")]
         img: String,
     },
+    /// Show an object's id, kind, size, parent and timestamps (v6; a pre-v6
+    /// volume reports 0 for what it cannot store)
+    Stat {
+        path: String,
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+    },
     /// Execute a semantic query; prints `id path score` per hit.
     ///
     /// Grammar: `k == v`, `k != v`, `k > v`, `k < v`, `k >= v`, `k <= v`,
@@ -174,9 +181,10 @@ enum Commands {
         #[arg(long, default_value = "512")]
         size_mb: u64,
     },
-    /// One-way migration of a pre-K8 (version 2) volume into the K8
-    /// copy-on-write format: walks the old tree read-only and replays it
-    /// (names, data, attributes) into a freshly formatted K8 image.
+    /// One-way migration of a pre-K8 (version 2) or a K8 v3–v5 volume into
+    /// the current format (v6: B+tree catalog, parent pointers, timestamps):
+    /// walks the old tree read-only and replays it (names, data, attributes)
+    /// into a freshly formatted image.
     Migrate {
         /// The source image: pre-K8 (v2) or a K8 v3–v5 volume (opened
         /// read-only, never written) — replayed into a fresh current-format
@@ -681,6 +689,23 @@ async fn main() -> Result<()> {
                 println!("(Attribute not found)");
             }
         }
+        Commands::Stat { path, img } => {
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let id = fs.resolve_path(path).context("Path not found")?;
+            let st = fs.stat(id).map_err(|e| anyhow::anyhow!(e))?;
+            println!(
+                "id {} kind {:?} size {} parent {} ctime {} mtime {} atime {} path {}",
+                st.inode_id,
+                st.kind,
+                st.size,
+                st.parent,
+                st.ctime,
+                st.mtime,
+                st.atime,
+                fs.path_of(id).map_err(|e| anyhow::anyhow!(e))?
+            );
+        }
         Commands::Query { query, img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
             let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
@@ -769,6 +794,7 @@ async fn main() -> Result<()> {
                 println!("  stale index inodes   : {}", report.orphan_inodes.len());
                 println!("  catalog entries scrubbed: {}", report.scrubbed_catalog_entries);
                 println!("  blocks reclaimed     : {}", report.reclaimed_blocks);
+                println!("  parent links restamped: {}", report.bad_parent_links.len());
             } else {
                 let report = fs
                     .fsck(false)
@@ -782,6 +808,7 @@ async fn main() -> Result<()> {
                 println!("  reachable blocks     : {}", report.reachable_blocks);
                 println!("  leaked blocks        : {}", report.leaked_blocks.len());
                 println!("  stale index inodes   : {}", report.orphan_inodes.len());
+                println!("  bad parent links     : {}", report.bad_parent_links.len());
                 if report.is_clean() {
                     println!("  ✅ volume is clean");
                 }
