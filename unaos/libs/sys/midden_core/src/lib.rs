@@ -355,6 +355,8 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // Always: the VERB is one word on every UnaOS (ONE-OS law); the per-platform mechanism
     // decides what it does, never whether the word exists.
     ("reboot", Avail::Always),
+    // FILEVIEW `view` / TEXTEDIT `edit`: ring arms are desktop-gated (wc or desktop_firmware); registered Always on the `dns` precedent (a gated-off arm falls through to bare-name launch, never a typo refusal).
+    ("view", Avail::Always), ("edit", Avail::Always),
     // processes
     ("run", Avail::Proc), ("bg", Avail::Proc), ("storm", Avail::Proc),
     ("jobs", Avail::Proc), ("kill", Avail::Proc),
