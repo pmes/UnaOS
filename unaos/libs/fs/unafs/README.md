@@ -467,6 +467,18 @@ carrying the key — there is no ANN index.
 `query` returns `Vec<QueryHit { inode_id, path, score }>` in ascending id
 order; `query_inodes` keeps the older `(Inode, f32)` shape.
 
+**Paths (M3).** Every v6 inode block carries a hand-packed META TRAILER right
+after its unchanged bincode bytes — `UNAFSMT1 | parent | ctime | mtime | atime
+| name_len | name` (KAT `kat_inode_meta_trailer_v6`; names over 255 B store
+`0xFFFF` and the path asks the parent's listing). `Inode`'s own encoding is
+untouched (the new fields are `serde(skip)`), so every kept golden holds; the
+trailer is magic-discriminated like the spill trailer, which follows it.
+`mkdir`/`create_file`/the batch path stamp the link, `rename` restamps it in
+the same transaction, and `UnaFS::path_of` derives `/a/b/c` in O(depth) inode
+reads (bounded at 4096 links — a cycle is `CorruptVolume`). fsck walks the name
+tree and reports `bad_parent_links`; repair restamps them. A pre-v6 volume
+derives paths by one name-tree walk per query.
+
 v3–v5 volumes still mount read/write with their flat catalog (overwrite now
 scrubs the replaced entry; the same planner and verifier answer the full
 grammar over it). `tools/unafs migrate --from old.img --to new.img` replays a

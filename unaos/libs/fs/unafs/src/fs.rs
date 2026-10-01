@@ -3314,6 +3314,15 @@ impl<D: BlockDevice> UnaFS<D> {
         Ok(map)
     }
 
+    /// Restamp an inode's parent pointer and name (fsck repair), inside the
+    /// caller's transaction.
+    pub(crate) fn relink_inode(&mut self, id: u64, parent: u64, name: &str) -> Result<(), FileSystemError> {
+        let mut inode = self.read_inode(id)?;
+        inode.parent = parent;
+        inode.name = Some(String::from(name));
+        self.write_inode(&inode)
+    }
+
     /// Identity, size, parent link and timestamps of an inode (the kernel's
     /// `DirEnt.mtime` source).
     pub fn stat(&mut self, inode_id: u64) -> Result<Stat, FileSystemError> {
