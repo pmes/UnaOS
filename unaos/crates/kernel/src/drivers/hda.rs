@@ -2493,7 +2493,7 @@ fn pin_power_fallback(rings: &mut Rings, cad: u8, afg: Option<u8>, dac: u8, pin:
     let ts = crate::arch::now_cycles();
     let mut act = 0xFu8;
     loop {
-        if let Some(v) = rings.cmd(cad, pin, VERB_GET_POWER_STATE, 0, a) { a.verbs_get += 1; act = ((v >> 4) & 0x0F) as u8; }
+        if let Some(v) = rings.cmd(cad, pin, tone::VERB_GET_POWER_STATE, 0, a) { a.verbs_get += 1; act = ((v >> 4) & 0x0F) as u8; }
         let el = tone::elapsed_ms(ts);
         if act == 0 || el >= 50 { break; }
         delay_us(500);

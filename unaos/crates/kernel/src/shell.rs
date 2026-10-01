@@ -6168,7 +6168,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("shutting down: invoking the platform firmware mechanism...");
             crate::power::shutdown();
         },
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "view" => { view_verb(console, args.first().copied()); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "edit" => { edit_verb(console, args.first().copied()); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "settings" => { settings_verb(console); } "reboot" => { // FILEVIEW M3 — `view <path>` opens a text file in the read-only viewer window (video/fileview.rs); ⚠ SAME-LINE fold, line-NEUTRAL, code before comment; helper at the file tail. "activity" => { match crate::video::activity::open() { Ok(()) => console.println("activity: open (q closes, k kills the selected process)"), Err(e) => console.println(&alloc::format!("activity: {}", e)) } } "reboot" => { // FILEVIEW M3 — `view <path>` opens a text file in the read-only viewer window (video/fileview.rs); ⚠ SAME-LINE fold, line-NEUTRAL, code before comment; helper at the file tail.
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "view" => { view_verb(console, args.first().copied()); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "edit" => { edit_verb(console, args.first().copied()); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "settings" => { settings_verb(console); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "activity" => { match crate::video::activity::open() { Ok(()) => console.println("activity: open (q closes, k kills the selected process)"), Err(e) => console.println(&alloc::format!("activity: {}", e)) } } "reboot" => { // FILEVIEW M3 — `view <path>` opens a text file in the read-only viewer window (video/fileview.rs); ⚠ SAME-LINE fold, line-NEUTRAL, code before comment; helper at the file tail.
             console.println("rebooting: invoking the platform firmware mechanism...");
             crate::power::reboot();
         },
@@ -8830,6 +8830,8 @@ fn settings_verb(console: &mut Console) {
     match crate::video::settings::open() {
         Ok(()) => console.println("settings: window open"),
         Err(e) => console.println(&alloc::format!("settings: {}", e)),
+    }
+}
 /// SRCEXTRACT: the `src` verb — `src extract [--dry-run]` · `src status` · `src verify`. Writes the verified
 /// SRC.TGZ payload under `/SRC/` on the system volume (see `selfhost/extract.rs`).
 #[cfg(feature = "selfhost")]

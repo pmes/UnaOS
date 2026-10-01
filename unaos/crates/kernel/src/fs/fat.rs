@@ -6866,9 +6866,9 @@ fn write_run_note(blocks: usize) {
 // whole contiguous run to the block layer; `max_run_blocks` witnesses it (the card driver's CMD25 bound is
 // still 64 blocks = its 32 KiB DMA bounce, a driver change not made here).
 // =================================================================================================
-static FAT_WRITES: AtomicU32 = AtomicU32::new(0);
-static DIRENT_WRITES: AtomicU32 = AtomicU32::new(0);
-static MAX_RUN_BLOCKS: AtomicU32 = AtomicU32::new(0);
+static FAT_WRITES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static DIRENT_WRITES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static MAX_RUN_BLOCKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn note_run_blocks(n: u32) { MAX_RUN_BLOCKS.fetch_max(n, core::sync::atomic::Ordering::Relaxed); }
 

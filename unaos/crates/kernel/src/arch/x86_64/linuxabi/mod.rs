@@ -351,11 +351,11 @@ impl AddrSpace {
         let mut c = AddrSpace::new();
         for (va, f, e) in list {
             if !c.map_new(va, e & W != 0, e & NX == 0) {
-                c.release();
+                c.free_frames();
                 return None;
             }
             let Some((cf, _)) = c.user_page(va) else {
-                c.release();
+                c.free_frames();
                 return None;
             };
             unsafe { core::ptr::copy_nonoverlapping(f as *const u8, cf as *mut u8, 4096) };
@@ -388,7 +388,7 @@ impl AddrSpace {
     }
 
     /// Free every frame and table. Call only when no core can be running on `pml4`.
-    pub fn release(&mut self) {
+    pub fn free_frames(&mut self) {
         for f in core::mem::take(&mut self.frames) {
             dealloc_frame(f);
         }
@@ -674,14 +674,14 @@ fn run_inner(path: &str, argv: &[&str], deadline_ms: u64, interactive: bool, out
     let plan = elf::parse(&bytes).map_err(String::from)?;
     let mut asp = AddrSpace::new();
     if let Err(e) = elf::load(&mut asp, &bytes, &plan) {
-        asp.release();
+        asp.free_frames();
         return Err(String::from(e));
     }
     let envp = ["PATH=/apps:/", "HOME=/", "TERM=linux"];
     let sp = match elf::build_stack(&mut asp, &plan, &full, argv, &envp) {
         Ok(s) => s,
         Err(e) => {
-            asp.release();
+            asp.free_frames();
             return Err(String::from(e));
         }
     };
@@ -781,7 +781,7 @@ fn run_inner(path: &str, argv: &[&str], deadline_ms: u64, interactive: bool, out
             if safe_to_free {
                 let mut lp = i.lp.lock();
                 lp.fds.clear();
-                lp.asp.release();
+                lp.asp.free_frames();
             } // else: leak the space rather than free tables a still-live task may be running on
             fs_tab_clear(i.pml4);
         }

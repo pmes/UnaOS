@@ -709,7 +709,7 @@ pub fn scrollback_selftest() {
     let (live_row, _, _) = con.cell_at(m, W, H, lx, ly);
     let moved = con.scroll_by_at(100, m, W, H);
     let view_off = con.view_off();
-    let (abs1, text1) = con.top_row_at(m, W, H);
+    let (abs1, text1) = { let (a, t) = con.top_row_at(m, W, H); (a, alloc::string::String::from(t)) };
     let top_ok = moved && view_off == 100 && abs1 + 100 == abs0 && text1 == format!("line {:03}", abs1);
     con.place_for_fixture("line 300");
     let (abs2, text2) = con.top_row_at(m, W, H);

@@ -135,7 +135,7 @@ pub fn gc() {
         if !i.is_live() && !i.freed.load(Ordering::Acquire) && now >= i.exit_tick.load(Ordering::Acquire) + 50 {
             if let Some(mut lp) = i.lp.try_lock() {
                 lp.fds.clear(); // pipe EOF for the peers
-                lp.asp.release();
+                lp.asp.free_frames();
                 super::fs_tab_clear(i.pml4);
                 i.freed.store(true, Ordering::Release);
             }

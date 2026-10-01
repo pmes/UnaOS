@@ -8110,7 +8110,7 @@ BRACEPY
     # no_std)]` precisely so a plain `cargo test` can run them on the host: net's 29 TCP assertions
     # guard a crate the kernel links, and rast's golden images are the "same scene ⇒ same pixels on
     # both arches" oracle. Neither was run by anything.
-    if (cd "$WORKSPACE_DIR" && cargo test -p net -p rast); then
+    if (cd "$WORKSPACE_DIR" && cargo test -p net -p rast -p una-abi); then
         echo -e "${COLOR_GREEN}  ✅ host suites, kernel workspace (net, rast)${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}  ❌ a kernel-workspace host test suite FAILED${COLOR_RESET}"
@@ -8262,6 +8262,13 @@ BRACEPY
         echo -e "${COLOR_GREEN}  ✅ builder (host)${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}  ❌ builder (host) FAILED to compile${COLOR_RESET}"
+        _rrc=1
+    fi
+    echo -e "${COLOR_YELLOW}⚡ Syntax Check: user-linux-hello (host fixture generator, LINUXABI)...${COLOR_RESET}"
+    if (cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo +nightly check --release); then
+        echo -e "${COLOR_GREEN}  ✅ user-linux-hello (host)${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}  ❌ user-linux-hello (host) FAILED to compile${COLOR_RESET}"
         _rrc=1
     fi
     if "$WORKSPACE_DIR/scripts/check-roots.sh"; then

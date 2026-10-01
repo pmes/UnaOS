@@ -2190,12 +2190,18 @@ core::arch::global_asm!(
     // C argument register) BEFORE the shuffle below, so nothing in the shuffle can clobber it. `r8`
     // was previously untouched here and is scrubbed on the way out with the other caller-saved
     // registers, so the return half is unchanged.
-    crate::linuxabi_r8!(), crate::linuxabi_save!(), "mov r8, r10",                  // arg3 -> 5th C arg (SYS_THREAD_SPAWN's `place`; junk otherwise)
+    // LINUXABI/LINUXABI2: park r8 (the Linux 5th arg) and push the six callee-saved GPRs so fork can
+    // copy them (`FORK_REGS`). Unconditional: `global_asm!` takes string literals only, so the knob
+    // cannot gate these lines (the percpu.rs macros exist for the record; cfg cannot reach in here).
+    "mov gs:[{uoff}], r8",
+    "push rbx", "push rbp", "push r12", "push r13", "push r14", "push r15",
+    "mov r8, r10",                  // arg3 -> 5th C arg (SYS_THREAD_SPAWN's `place`; junk otherwise)
     "mov rcx, rdx",                 // arg2 -> 4th C arg
     "mov rdx, rsi",                 // arg1 -> 3rd C arg
     "mov rsi, rdi",                 // arg0 -> 2nd C arg
     "mov rdi, rax",                 // number -> 1st C arg
-    "call {dispatch}", crate::linuxabi_restore!(),              // rax = return value (or never returns: SYS_EXIT -> scheduler)
+    "call {dispatch}",              // rax = return value (or never returns: SYS_EXIT -> scheduler)
+    "pop r15", "pop r14", "pop r13", "pop r12", "pop rbp", "pop rbx", // LINUXABI2: the matching pops (rax survives)
     "pop rcx",                      // restore user RIP   (SYSRET's target)
     "pop r11",                      // restore user RFLAGS; rsp now = ktop-16, 16-aligned
     // --- U1b B2: canonical-rcx guard (CVE-2012-0217 shape). A non-canonical SYSRET target #GPs at
@@ -7314,8 +7320,7 @@ pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event { #[cfg(featu
     // ⚠ LINE-NEUTRAL fold (four comment lines in, four out): this file is x86-only so `kernel8.img`'s panic-`Location` proof is untouched either way, but the idiom is the tree's and is kept.
     // QUARRYDOOR (KEYDOORS F1) — `|| quarry::key_route(raw)`: on x86 the file manager had NO KEY DOOR AT ALL. `video/mod.rs:685` compiles `quarry` under `wc` on this arch too, but `wc_route_event` never asked it and neither does `user_input_enqueue` here (x86's ring door has no key interception — this wrapper IS x86's interception), so <Esc>, the arrows, <Enter>, Backspace, `r` and the wheel had ZERO reachable consumers on this board. Asked in the SAME position as the two aarch64 doors: after `strip::key_escape` (a menu composites above Quarry, so the modal surface wins) and ahead of `wc_focus_key` (an open file manager eats its own arrows before the focus ring). `key_route` gates on `focus_asid() == OWNER && on_glass()` since SO9FIX 63b109f6 (was `on_glass()` alone — SO9), so a closed Quarry consumes nothing and this is behaviour-alike on every boot without one. Folded into the existing condition — no line added, the idiom this block already states.
     #[cfg(feature = "login")] if crate::fs::users::screen_up() && matches!(raw, crate::pal::Event::Key(_) | crate::pal::Event::KeyUp(_)) { if let crate::pal::Event::Key(c) = raw { let _ = crate::fs::users::screen_key(c); } return crate::pal::Event::Unknown; } #[cfg(feature = "wc")] // LOGIN13 M3 (R63) — THE SCREEN IS THE FIRST TAKER OF EVERY KEY while it is up: ahead of the Esc/Quarry doors, the Tab focus ring (`wc_focus_key`) and the focused ring (`user_input_route`). Flight 12's keys went to `[wc-c] focus tab-cycle` and the desktop because every one of those was asked first and the screen was asked last, in the render loop's fallback (`main.rs`, after this router). A key-UP is swallowed too, so no app sees half a keystroke. The SERIALDOOR arm on the signature line stays first: a wire byte is the console's, and the loop's own `screen_key` still hands it to the screen. ⚠ LINE-NEUTRAL fold.
-    if crate::video::shortcuts::overlay_key(raw) || crate::video::strip::key_escape(raw) || crate::video::quarry::key_route(raw) || wc_action_quarry_held(raw) { // SHORTCUTS M2 — the overlay takes ANY key while up, ahead of every other door.
-    if crate::video::shotsel::route(raw) || crate::video::strip::key_escape(raw) || crate::video::quarry::key_route(raw) || wc_action_quarry_held(raw) { // SHOTREGION: the selection mode is the FIRST door (one atomic load idle): Esc, the press/drag/release and the chords belong to it while it is up.
+    if crate::video::shortcuts::overlay_key(raw) || crate::video::shotsel::route(raw) || crate::video::strip::key_escape(raw) || crate::video::quarry::key_route(raw) || wc_action_quarry_held(raw) { // SHOTREGION: the selection mode is the FIRST door (one atomic load idle): Esc, the press/drag/release and the chords belong to it while it is up.
         return crate::pal::Event::Unknown;
     }
     if wc_focus_key(raw) {
@@ -7345,7 +7350,7 @@ pub fn wc_route_tail(raw: crate::pal::Event) {
         raw,
         crate::pal::Event::Mouse { .. } | crate::pal::Event::MouseAbsolute { .. }
     ) {
-        wc_drag_motion(); crate::video::shotsel::motion(); if crate::video::termsel::pointer_held() { let (x, y) = click_pointer_pos(); crate::video::termsel::pointer_motion(x, y); } // TERMSEL2 — a drag on the shell's text: while a press is held there, each pointer report is a `drag` note at the live cursor (the same position `wc_drag_motion` steers a title-bar drag by). One atomic load otherwise. ⚠ FOLDED, line-neutral.
+        wc_drag_motion(); #[cfg(feature = "wc")] crate::video::shotsel::motion(); if crate::video::termsel::pointer_held() { let (x, y) = click_pointer_pos(); crate::video::termsel::pointer_motion(x, y); } // TERMSEL2 — a drag on the shell's text: while a press is held there, each pointer report is a `drag` note at the live cursor (the same position `wc_drag_motion` steers a title-bar drag by). One atomic load otherwise. ⚠ FOLDED, line-neutral.
     }
 }
 
@@ -17540,7 +17545,7 @@ fn winx_launcher(demo_cpu: usize) {
     // runs after `clickroute_selftest` rather than before because it leaves a raised window behind
     // (that IS its verdict) and would otherwise change which owner the routing legs start from.
     #[cfg(all(feature = "witness", feature = "wc"))]
-    crate::tests::register("dock", crate::video::dock::selftest); #[cfg(all(feature = "witness", feature = "wc", feature = "quarry"))] crate::tests::register("fileopen", crate::video::quarry::live::fileopen_selftest); #[cfg(feature = "nvidia-kepler-vblank")] crate::tests::register("kvblank", crate::drivers::gpu::kepler_vblank::selftest_rerun); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("textedit", crate::video::textedit::selftest); // KVBLANK6 — `tests kvblank` re-runs the vblank fixture only. // TEXTEDIT (R75) — editor fixture; #[cfg(feature = "nvidia-kepler-vblank")] crate::tests::register("kvblank", crate::drivers::gpu::kepler_vblank::selftest_rerun); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("textedit", crate::video::textedit::selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("activity", crate::video::activity::selftest); // KVBLANK6 — `tests kvblank` re-runs the vblank fixture only. // TEXTEDIT (R75) — editor fixture;
+    crate::tests::register("dock", crate::video::dock::selftest); #[cfg(all(feature = "witness", feature = "wc", feature = "quarry"))] crate::tests::register("fileopen", crate::video::quarry::live::fileopen_selftest); #[cfg(feature = "nvidia-kepler-vblank")] crate::tests::register("kvblank", crate::drivers::gpu::kepler_vblank::selftest_rerun); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("textedit", crate::video::textedit::selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("activity", crate::video::activity::selftest); // KVBLANK6 — `tests kvblank` re-runs the vblank fixture only. // TEXTEDIT (R75) — editor fixture; ACTIVITY (R75) — the activity window fixture.
     // CRYSTAL — the SHARD menu fixture. Runs after `dock::selftest` (which runs `menubar::selftest`),
     // so the bar tenant it enables is already proven present and flush. It enables the bar itself,
     // opens the menu off the crystal, resolves every item, fires the SAFE picks, and dismisses three
@@ -17548,7 +17553,7 @@ fn winx_launcher(demo_cpu: usize) {
     // so no gate can power the machine off (the PASS line printing after every leg is that guard's
     // own proof). See `crystal::selftest`.
     #[cfg(all(feature = "witness", feature = "wc"))]
-    crate::tests::register("crystal", crate::video::crystal::selftest); crate::tests::register("shotregion", crate::video::shotsel::selftest); // SHOTREGION (R75)
+    crate::tests::register("crystal", crate::video::crystal::selftest); #[cfg(feature = "wc")] crate::tests::register("shotregion", crate::video::shotsel::selftest); // SHOTREGION (R75)
     // CLICK-BAND — the band witness, PROVEN able to fire. `crystal::selftest` and `dock::selftest`
     // both call their `press_at` seams DIRECTLY, so nothing in the battery drove the ROUTER's band
     // arms — the very lines GR27's "menubar press inert" round was missing would themselves have
@@ -21541,7 +21546,7 @@ fn u8x_launcher(demo_cpu: usize) {
     // PULSE-1: the PULSE.ELF end-to-end witness, after WINX-8 so the two shipped-artifact proofs sit
     // together and the newest one lands last. Gates on the mounted volume internally, so a run with no FAT
     // volume (or no staged PULSE.ELF) skips cleanly with one honest line naming the volume.
-    #[cfg(feature = "hda-tone")] crate::tests::register("hda", crate::drivers::hda::hda_tone_test_default); #[cfg(feature = "hda-tone")] { crate::tests::register("hdaboth", crate::drivers::hda::hda_tone_test_both); crate::tests::register("hda220", crate::drivers::hda::hda_tone_test_220); crate::tests::register("hda880", crate::drivers::hda::hda_tone_test_880); crate::tests::register("hda1", crate::drivers::hda::hda_tone_test_m0); crate::tests::register("hda2", crate::drivers::hda::hda_tone_test_m1); } // HDATONE5 M2: solo members; R77 M3 — the HDA tone is a `tests hda` run (HDATONE4); under tests-at-boot this registration runs it at once crate::drivers::hda::hda_tone_test); #[cfg(feature = "hda-tone")] { crate::tests::register("hda1", crate::drivers::hda::hda_tone_test_m0); crate::tests::register("hda2", crate::drivers::hda::hda_tone_test_m1); } #[cfg(feature = "hda-tone")] crate::tests::register("playwav", crate::drivers::hda::play::selftest); // HDATONE5 M2: solo members; R77 M3 — the HDA tone is a `tests hda` run (HDATONE4); under tests-at-boot this registration runs it at once
+    #[cfg(feature = "hda-tone")] crate::tests::register("hda", crate::drivers::hda::hda_tone_test_default); #[cfg(feature = "hda-tone")] { crate::tests::register("hdaboth", crate::drivers::hda::hda_tone_test_both); crate::tests::register("hda220", crate::drivers::hda::hda_tone_test_220); crate::tests::register("hda880", crate::drivers::hda::hda_tone_test_880); crate::tests::register("hda1", crate::drivers::hda::hda_tone_test_m0); crate::tests::register("hda2", crate::drivers::hda::hda_tone_test_m1); } #[cfg(feature = "hda-tone")] crate::tests::register("playwav", crate::drivers::hda::play::selftest); // HDATONE5 M2: solo members; R77 M3 — the HDA tone is a `tests hda` run (HDATONE4); under tests-at-boot this registration runs it at once
     crate::tests::register("winx-pulse", || pulsew_launcher(TESTS_DEMO_CPU.load(Ordering::Relaxed))); crate::tests::source_done(crate::tests::SRC_DESK); // R77 M3 — the last desktop source: the boot line may print now
 
     // SOCK-2 (knob-on, x86-only): chain the ring-3 UDP round-trip demo LAST — after the whole storage
@@ -22908,9 +22913,9 @@ fn cfu_efault_witness() {
     let window = USER_WINDOW_PAGES * PAGE_SIZE;
     // The three rejected shapes, each driven through the real dispatcher. None dereferences the pointer —
     // `user_range_ok` returns `Err(EFAULT)` before `copy_from_user` copies, so this is safe in any CR3.
-    let wrap = syscall_dispatch(SYS_OPEN, u64::MAX - 2, NLEN, 0, 0); // ptr + NLEN overflows (end < ptr)
-    let below = syscall_dispatch(SYS_OPEN, USER_BASE - PAGE_SIZE, NLEN, 0, 0); // ptr < USER_BASE
-    let above = syscall_dispatch(SYS_OPEN, USER_BASE + window - 4, NLEN, 0, 0); // end past the window
+    let wrap = syscall_dispatch(SYS_OPEN, u64::MAX - 2, NLEN, 0, 0, #[cfg(feature = "linuxabi")] 0); // ptr + NLEN overflows (end < ptr)
+    let below = syscall_dispatch(SYS_OPEN, USER_BASE - PAGE_SIZE, NLEN, 0, 0, #[cfg(feature = "linuxabi")] 0); // ptr < USER_BASE
+    let above = syscall_dispatch(SYS_OPEN, USER_BASE + window - 4, NLEN, 0, 0, #[cfg(feature = "linuxabi")] 0); // end past the window
     // Positive controls (validate-only, no deref): a valid in-window READ range is accepted, and the READ
     // bound admits page 0 (a legal read source) while the WRITE bound rejects it (page 0 is RO/RX).
     let inwin_ok = user_range_ok(USER_BASE + PAGE_SIZE, NLEN, UserAccess::Read).is_ok();
@@ -29583,7 +29588,7 @@ fn restore_gate(slot: usize, id: usize) -> bool {
     let mut via = "sleep";
     #[cfg(feature = "nvidia-kepler-vblank")]
     {
-        if crate::drivers::gpu::kepler_vblank::wait_vblank_bounded(2 * PANEL_FRAME_US) {
+        if crate::drivers::gpu::kepler_vblank::wait_vblank_bounded(2 * 16_667u64) {
             via = "vblank";
         }
     }
@@ -29595,6 +29600,8 @@ fn restore_gate(slot: usize, id: usize) -> bool {
         serial_println!("[wpace] restore win={} slot={} repaced=1 via={}", id, slot, via);
     }
     true
+}
+
 // ── ACTIVITY (R75) — the process table and the kill, for `video/activity.rs` ───────────────────────
 /// One live `PROCS` row as the ACTIVITY window shows it. `slot` is the wm owner key (`Proc::slot`,
 /// +1-biased); `bg` is the user-owned (operator-launched) bit — the ACL predicate.
@@ -29625,8 +29632,13 @@ pub fn act_kill(pid: u64) -> &'static str {
         }
     }
     let Some((slot, bg)) = found else { return "no such running process" };
+    #[cfg(feature = "login")]
     if !bg && !crate::fs::users::root_session() { return "denied: not yours"; }
+    #[cfg(not(feature = "login"))]
+    let _ = bg;
     wc_close_click(crate::video::wm::WIN_NONE, slot)
+}
+
 // =================================================================================================
 // WINRESIZE (R75) — TAIL-APPENDED. The router half (the press arm folded onto `chrome_hit`'s line in
 // `wc_click_route_at`; motion/end ride `wm::drag_motion`/`drag_end`) and the `tests winresize` fixture.

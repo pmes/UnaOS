@@ -310,7 +310,7 @@ fn change_password() {
         return;
     };
     #[cfg(feature = "login")]
-    { crate::video::login::open_set_password(n.as_bytes(), false); say("password", "set-password-screen", true); }
+    { crate::video::crystal::login::open_set_password(n.as_bytes(), false); say("password", "set-password-screen", true); }
     #[cfg(not(feature = "login"))]
     { let _ = n; say("password", "login-feature-off", false); }
 }

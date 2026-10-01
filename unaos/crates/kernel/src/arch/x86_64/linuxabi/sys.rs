@@ -285,7 +285,7 @@ fn fstat(p: &LinuxProc, fd: u64, buf: u64) -> i64 {
 }
 
 fn console_out(v: &[u8]) {
-    crate::serial_print!("{}", String::from_utf8_lossy(v));
+    serial_print!("{}", String::from_utf8_lossy(v));
     fd::out_push(v);
 }
 
