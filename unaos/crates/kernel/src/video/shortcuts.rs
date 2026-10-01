@@ -37,6 +37,8 @@ pub const C_CMD_SHIFT_3: &str = "cmd-shift-3";
 pub const C_CMD_SHIFT_4: &str = "cmd-shift-4";
 pub const C_PRINT_SCREEN: &str = "print-screen";
 pub const C_CMD_SLASH: &str = "cmd-/";
+pub const C_CMD_M: &str = "cmd-m";
+pub const C_CMD_GRAVE: &str = "cmd-`";
 
 const fn s(chord: &'static str, scope: &'static str, action: &'static str, arc: &'static str) -> Shortcut {
     Shortcut { chord, scope, action, arc }
@@ -55,6 +57,10 @@ pub static SHORTCUTS: &[Shortcut] = &[
     s(C_CMD_SHIFT_4, "Capture", "Screenshot region", "SHOTREGION"),
     s(C_PRINT_SCREEN, "Capture", "Screenshot", "PRTSCR"),
     s("title double-click", "Window", "Zoom / restore", "WINCYCLE"),
+    s(C_CMD_M, "Window", "Minimize", "WINDOWLIST"),
+    s(C_CMD_GRAVE, "Window", "Next window of app", "WINDOWLIST"),
+    s("cmd-alt-left", "Window", "Snap Left", "WINSNAP"),
+    s("cmd-alt-right", "Window", "Snap Right", "WINSNAP"),
     s("right-click tile", "Dock", "Tile menu (Quit)", "DOCKRUN"),
     s("right-click entry", "Quarry", "File operations", "QUARRYOPS"),
     s("Ctrl-C", "Shell", "Cancel line", "SHELLUX"),

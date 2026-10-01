@@ -165,7 +165,7 @@ pub enum Action {
     WinSizeLeft,
     WinSizeRight,
     WinSizeUp,
-    WinSizeDown,
+    WinSizeDown, Minimize /* WINDOWLIST: ⌘M, code 39 */, CycleApp /* WINDOWLIST: ⌘` — next window of the SAME app, code 40 */,
 }
 
 impl Action {
@@ -209,7 +209,7 @@ impl Action {
             Action::WinSizeLeft => "win-size-left",
             Action::WinSizeRight => "win-size-right",
             Action::WinSizeUp => "win-size-up",
-            Action::WinSizeDown => "win-size-down",
+            Action::WinSizeDown => "win-size-down", Action::Minimize => "minimize", Action::CycleApp => "cycle-app", // WINDOWLIST
         }
     }
 

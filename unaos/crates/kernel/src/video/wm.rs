@@ -29938,3 +29938,107 @@ pub fn win_key(dx: i32, dy: i32, resize: bool) -> bool {
     }
     changed
 }
+
+// WINDOWLIST (R75) — TAIL-APPENDED. The window menu's / ⌘M's / ⌘` 's read-and-act helpers over the table
+// (`video/winlist.rs` is the client). Gated like `cycle_order`: the desktop families only.
+/// One live app window as the Window menu lists it.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+#[derive(Clone, Copy)]
+pub struct WlRow {
+    pub id: WinId,
+    pub owner: u64,
+    /// Parked below the shell by [`minimise`].
+    pub minimised: bool,
+    pub title: [u8; MAX_TITLE],
+    pub len: usize,
+}
+
+/// Every live APP window (no compat row, no kernel furniture), minimised ones included, in id order.
+/// The title is the row's own; an empty one falls back to the owner's armed program name.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn wl_rows(out: &mut [WlRow; MAX_WINDOWS]) -> usize {
+    let shell = SHELL_Z.load(core::sync::atomic::Ordering::Acquire);
+    let mut n = 0usize;
+    {
+        let t = table();
+        for r in t.rows.iter() {
+            if r.used && !r.compat && r.owner_asid != 0 && !is_kernel_owner(r.owner_asid) && n < MAX_WINDOWS {
+                out[n] = WlRow { id: r.id, owner: r.owner_asid, minimised: r.z == PARKED_Z || !above_shell(r, shell), title: r.title, len: r.title_len.min(MAX_TITLE) };
+                n += 1;
+            }
+        }
+    }
+    for i in 0..n {
+        if out[i].len == 0 {
+            let mut nm = [0u8; MAX_TITLE];
+            let l = app_name_of(out[i].owner, &mut nm);
+            out[i].title = nm;
+            out[i].len = l;
+        }
+    }
+    n
+}
+
+/// The frontmost window of the focused owner, or `None` when the shell holds focus.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn wl_focused() -> Option<(WinId, u64)> {
+    let asid = focus_asid();
+    if asid == 0 {
+        return None;
+    }
+    let t = table();
+    let mut best: Option<(u32, WinId)> = None;
+    for r in t.rows.iter() {
+        if r.used && !r.compat && r.owner_asid == asid && best.map_or(true, |(z, _)| r.z >= z) {
+            best = Some((r.z, r.id));
+        }
+    }
+    best.map(|b| (b.1, asid))
+}
+
+/// The least-recently-raised VISIBLE window of `owner` when it has two or more (the ⌘` target).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn wl_same_app_pick(owner: u64) -> Option<WinId> {
+    let mut ord = [WIN_NONE; MAX_WINDOWS];
+    let n = cycle_order(&mut ord);
+    let mut last = None;
+    let mut count = 0usize;
+    for i in 0..n {
+        let mut t = table();
+        if row_mut(&mut t, ord[i]).map(|r| r.owner_asid) == Some(owner) {
+            count += 1;
+            last = Some(ord[i]); // z descending, so the last match is the least recent
+        }
+    }
+    if count >= 2 { last } else { None }
+}
+
+/// Raise + focus `id` (restoring it when parked): the cycle's own commit, which ends in `raise_one`.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn wl_focus(id: WinId) -> bool {
+    let owner = { let mut t = table(); row_mut(&mut t, id).map(|r| r.owner_asid) };
+    match owner {
+        Some(o) => cycle_commit(id, o),
+        None => false,
+    }
+}
+
+/// Is `id` live and parked below the shell?
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn wl_is_minimised(id: WinId) -> bool {
+    let shell = SHELL_Z.load(core::sync::atomic::Ordering::Acquire);
+    let mut t = table();
+    let v = row_mut(&mut t, id).map(|r| r.z == PARKED_Z || !above_shell(r, shell)).unwrap_or(false);
+    v
+}
+
+/// Front-to-back z order is `cycle_order`'s; this raises every visible window back-to-front so the stack keeps its order.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn wl_raise_all() -> usize {
+    let mut ord = [WIN_NONE; MAX_WINDOWS];
+    let n = cycle_order(&mut ord);
+    for i in (0..n).rev() {
+        raise_one(ord[i]);
+    }
+    n
+}
