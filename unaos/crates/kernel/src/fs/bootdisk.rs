@@ -1485,7 +1485,7 @@ pub(crate) fn bind_root(
 
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     let native_root = unafs == "present";
-    // `NativeBackend` is `#[cfg(target_arch = "aarch64")]` in fs/vfs.rs, so on a build that does not
+    // `NativeBackend` is `#[cfg(any(target_arch = "aarch64", feature = "unafs"))]` in fs/vfs.rs (UNAFSX86), so on a build that does not
     // have the type there is no native root to bind whatever the state string says. This cannot
     // change a real boot's answer — [`unafs_state`] returns `"unbuilt"` on those targets — but it
     // makes leg 6's `present` case HONEST on x86_64 (it asserts the FAT fallback there, and says so
@@ -1522,6 +1522,7 @@ pub(crate) fn bind_root(
             );
         }
     }
+    #[cfg(feature = "unafs")] if announce { unafsx86_witness(src, native_root); } // UNAFSX86 (B298): ONE line naming which root this disk got
 
     let boot = FatBackend::new_source("boot", KERNEL_PRINCIPAL, true, src);
     let boot_rw = !boot.read_only();
@@ -3012,5 +3013,30 @@ fn root_candidates(disks: &[Disk], root_ix: Option<usize>) {
         fam(disks, "usb"),
         root_ix.map_or("none", |i| disks[i].source.name()),
         prefer
+    );
+}
+
+/// UNAFSX86 (rmbp-ledger B298): the ONE bind-time witness for the native-root decision, printed with the
+/// root announce (once per boot). `root=unafs` when `/` is the disk's UnaFS volume (PASS), `root=fat` when
+/// it fell back to the FAT boot volume (SKIP — a card with no UnaFS partition, or the shared mount riding
+/// another disk; the `[vfs] root mount` line beside it names the source). `blocks`/`gen` are the mounted
+/// volume's superblock block count and last committed root generation, 0 on a FAT root; `home` is where
+/// `users::ensure_home` will put `/home/<user>` (lowercase on UnaFS, the 8.3 `HOME/<NAME>` on FAT).
+/// Decimal only, so one awk reads it.
+#[cfg(feature = "unafs")]
+fn unafsx86_witness(src: BlockSource, native_root: bool) {
+    let (blocks, generation) = if native_root {
+        crate::fs::unafs::with_unafs(|fs| (fs.superblock.block_count, fs.root_generation())).unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
+    serial_println!(
+        ":: UNAFSX86: root={} disk={} blocks={} gen={} home={} -> {} ::",
+        if native_root { "unafs" } else { "fat" },
+        src.name(),
+        blocks,
+        generation,
+        if native_root { "/home" } else { "/HOME" },
+        if native_root { "PASS" } else { "SKIP" }
     );
 }
