@@ -29594,3 +29594,24 @@ pub fn retitle(id: WinId, name: &[u8]) {
         r.damage_all();
     }
 }
+
+/// SHORTCUTS: the help overlay's row — [`splash_open`]'s chromeless compat row, placed at `(x, y)` instead
+/// of the panel origin. Same contract: `surf` is a `w * h * 4` xRGB buffer that must outlive the row; the
+/// caller pins it with [`set_modal_top`] and closes it with [`close`]. [`WIN_NONE`] on refusal.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn overlay_open(surf: usize, surf_len: usize, w: usize, h: usize, x: usize, y: usize) -> WinId {
+    let id = splash_open(surf, surf_len, w, h);
+    if id == WIN_NONE {
+        return WIN_NONE;
+    }
+    {
+        let mut t = table();
+        if let Some(r) = row_mut(&mut t, id) {
+            r.x = x;
+            r.y = y;
+            r.damage_all();
+        }
+    }
+    composite();
+    id
+}

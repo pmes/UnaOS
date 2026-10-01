@@ -154,6 +154,6 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("shellux", crate::shellux::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("shellux", crate::shellux::selftest); register("shortcuts", crate::video::shortcuts::selftest); }
     }
 }

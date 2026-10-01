@@ -144,12 +144,16 @@ pub const FLAG_APPNAME: u32 = 1 << 3;
 pub const APP_ITEM_ABOUT: u32 = 0xA0;
 /// SO3 — the default app menu's `Quit` row: it closes the window, on the close box's own path.
 pub const APP_ITEM_QUIT: u32 = 0xA1;
+/// SHORTCUTS (M3) — the default app menu's `Help > Keyboard Shortcuts` row: opens the help overlay.
+pub const APP_ITEM_SHORTCUTS: u32 = 0xA2;
 
 /// SO3 — **the menu every window gets.** `About <name>`, a keyline, `Quit`.
 const APP_MENU_DEFAULT: &[MenuItem] = &[
     MenuItem { id: APP_ITEM_ABOUT, label: "About", flags: FLAG_APPNAME },
     MenuItem { id: 0, label: "", flags: FLAG_SEPARATOR },
     MenuItem { id: APP_ITEM_QUIT, label: "Quit", flags: 0 },
+    MenuItem { id: 0, label: "", flags: FLAG_SEPARATOR },
+    MenuItem { id: APP_ITEM_SHORTCUTS, label: "Help > Keyboard Shortcuts", flags: 0 },
 ];
 
 /// One row of a dropdown.
@@ -972,9 +976,20 @@ const CHECK_GLYPHS: usize = 2;
 /// — [`super::pulsewin`]'s own argument, kept.
 const CHECK_MARK: &[u8] = b">";
 
+/// SHORTCUTS (M3) — the chord the table lists for this row, drawn on its right (`None` when it has none).
+fn item_chord(it: &MenuItem) -> Option<&'static str> {
+    if it.flags & (FLAG_SEPARATOR | FLAG_APPNAME) != 0 || it.label.is_empty() {
+        return None;
+    }
+    super::shortcuts::chord_for(it.label.strip_prefix("Help > ").unwrap_or(it.label))
+}
+
 /// SO3 — an item's rendered width in GLYPHS, with [`FLAG_APPNAME`]'s live suffix folded in.
 #[inline]
 fn item_glyphs(it: &MenuItem, name_len: usize) -> usize {
+    if let Some(c) = item_chord(it) {
+        return it.label.len() + 2 + c.len(); // SHORTCUTS M3 — the chord sits right-aligned, two glyphs clear of the label
+    }
     if it.flags & FLAG_APPNAME != 0 && name_len > 0 {
         it.label.len() + 1 + name_len
     } else {
@@ -1437,6 +1452,10 @@ fn app_pick(win: wm::WinId, id: u32) {
                 core::str::from_utf8(&name[..len]).unwrap_or("?")
             );
         }
+        APP_ITEM_SHORTCUTS => {
+            let opened = super::shortcuts::open();
+            serial_println!("[winmenu] app-menu shortcuts win={} opened={}", win, opened);
+        }
         other => serial_println!("[winmenu] app-menu REFUSE win={} id={} reason=unknown-item", win, other),
     }
 }
@@ -1686,6 +1705,11 @@ fn compose_row(out: &mut [u32], r: strip::Rect, items: &[MenuItem], j: usize, na
     if it.flags & FLAG_APPNAME != 0 && !name.is_empty() {
         let nx = lx + (it.label.len() + 1) * CELL_W;
         super::font::draw_row(out, w, name, nx, sy, ink, BOLD, FACE);
+    }
+    // SHORTCUTS M3 — the row's chord, right-aligned inside the padding.
+    if let Some(c) = item_chord(&it) {
+        let cx = w.saturating_sub(BORDER + PADX + c.len() * CELL_W);
+        super::font::draw_row(out, w, c.as_bytes(), cx, sy, theme::TITLE_TEXT_INACTIVE, BOLD, FACE);
     }
 }
 
