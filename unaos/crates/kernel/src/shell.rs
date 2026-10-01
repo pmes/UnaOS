@@ -5994,6 +5994,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         #[cfg(feature = "selfhost")]
         "src" => { shell_src(&args, console); }
         "trash" => { crate::fs::trash::shell_verb(&args, console); } "shortcuts" => { crate::video::shortcuts::shell_verb(console); } #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))] "play" => { crate::drivers::hda::play::shell_verb(&args, &vfs_path(args.first().copied().unwrap_or("")), console); } "tests" => { crate::tests::shell_verb(&args, console); } "tste" | "selftest" => {
+        "tests" => { crate::tests::shell_verb(&args, console); } #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))] "linux" => { crate::arch::linuxabi::shell_verb(&args, console); } "tste" | "selftest" => {
             // The in-OS self-test suite (TSTE-1). Prints a three-section PASS/FAIL/SKIP table in the
             // console (like `ps` — it does NOT take the screen) and mirrors every line to serial.
             crate::selftest::run(console, pal);
@@ -7404,7 +7405,7 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
 /// FIX, not just a move: `run`, `bg` and `mount` used their argument VERBATIM, so after a `cd` they
 /// silently resolved against the root while every other verb honoured the cwd. One seam means one
 /// answer to "what does this path name", which is the point of the layer.
-fn vfs_path(arg: &str) -> String {
+pub(crate) fn vfs_path(arg: &str) -> String {
     normalize_path(&cwd_path(), arg)
 }
 

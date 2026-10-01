@@ -319,6 +319,10 @@ wc = []
 vsyncpace = []
 # INSTGUI: the graphical installer window (UNAOS_INSTGUI=1; requires wc + the x86 engine).
 instgui = ["wc", "installdemo"]
+# LINUXABI (UNAOS_LINUXABI=1): a Linux x86_64 syscall-compatibility layer — loads a STATIC Linux ELF into a private
+# address space and dispatches its SYSCALLs to a Linux-numbered table. x86-only (arch/x86_64/linuxabi/). Default OFF =>
+# no module, no verb, no dispatch branch. Kept in sync with arroyo, builder/src/main.rs and scripts/banner-cert.sh.
+linuxabi = []
 intel-ivb = []
 unaos_ivb = ["unaos-boot-info/unaos_ivb"]
 # GEN7-3D R1: the Ivy Bridge render-engine reconnaissance rung (`UNAOS_IVB3D=1`, mapped in
