@@ -17975,7 +17975,7 @@ fn tp_scale(raw: i32) -> i32 {
     // feel); above the knee the EXCESS is /HIGH, so a fast stroke crosses the screen with less finger.
     // Continuous at the knee, sign-preserving, toward-zero on each segment.
     let a = raw.abs();
-    let px = if a <= TP_MT_CURVE_KNEE { a / TP_MT_DIV_LOW } else { TP_MT_CURVE_KNEE / TP_MT_DIV_LOW + (a - TP_MT_CURVE_KNEE) / TP_MT_DIV_HIGH };
+    let px = if a <= TP_MT_CURVE_KNEE { a / tp_div_low() } else { TP_MT_CURVE_KNEE / tp_div_low() + (a - TP_MT_CURVE_KNEE) / tp_div_high() };
     if raw < 0 { -px } else { px }
 }
 /// TPFRAME — one `[tp] mt` witness per this many vendor frames: the first, then every 64th (a
@@ -19533,3 +19533,11 @@ fn ptr2_stage_split() -> (u64, u64) {
     }
     (PTR2_DROP_INSTALLER.load(Ordering::Relaxed), PTR2_DROP_DESKTOP.load(Ordering::Relaxed))
 }
+/// SETTINGS (R75) — pointer speed, runtime: 0 slow, 1 normal (the TPSPEED constants), 2 fast. Read by `tp_scale`.
+static TP_SPEED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+/// SETTINGS: choose the pointer speed step (clamped to 0..=2).
+pub fn tp_speed_set(n: u8) { TP_SPEED.store(n.min(2), core::sync::atomic::Ordering::Relaxed); }
+/// SETTINGS: the current speed step.
+pub fn tp_speed_get() -> u8 { TP_SPEED.load(core::sync::atomic::Ordering::Relaxed) }
+fn tp_div_low() -> i32 { match tp_speed_get() { 0 => 12, 2 => 5, _ => TP_MT_DIV_LOW } }
+fn tp_div_high() -> i32 { match tp_speed_get() { 0 => 4, 2 => 2, _ => TP_MT_DIV_HIGH } }

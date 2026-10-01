@@ -934,3 +934,6 @@ FORBID :: TEXTEDIT: .* -> FAIL ::
 # ── FILEOPEN (FILEVIEW2), TAIL-APPENDED — boot 18 "open a txt file, nothing happens": the Quarry open path (latch -> drain) is driven for a file at / (viewer) and one under /home (editor); both must mint a window
 REQUIRE :: FILEOPEN:
 FORBID :: FILEOPEN: .* -> FAIL ::
+# ── SETTINGS (R75), TAIL-APPENDED — the settings fixture: open, idle=5, save, re-read, compare
+REQUIRE :: SETTINGS: controls=[0-9]+ loaded=[0-9]+ saved=[0-9]+ -> PASS ::
+FORBID :: SETTINGS: .* -> FAIL ::
