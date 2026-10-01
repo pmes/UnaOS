@@ -212,7 +212,7 @@ fn log_op(op: &str, src: &str, dst: &str, r: &Result<(), String>) {
 /// B229 — a refusal the operator can read: the NOTICE (when the login stack is built) and the path bar.
 fn refuse_notice(why: &str) {
     #[cfg(feature = "login")]
-    crate::video::login::notice_show(b"Quarry", why.as_bytes());
+    crate::video::crystal::login::notice_show(b"Quarry", why.as_bytes());
     let _ = why;
 }
 
@@ -548,7 +548,7 @@ fn do_info() {
     body.push('\n');
     body.push_str(&l2);
     #[cfg(feature = "login")]
-    crate::video::login::notice_show(leaf(&path).as_bytes(), body.as_bytes());
+    crate::video::crystal::login::notice_show(leaf(&path).as_bytes(), body.as_bytes());
     say(l1);
 }
 

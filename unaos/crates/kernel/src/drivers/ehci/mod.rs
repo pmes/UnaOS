@@ -14014,7 +14014,7 @@ impl Controller {
                             idx, chars & 0x7F, (chars >> 8) & 0xF, int_ep_kind(e),
                             e.reports.wrapping_add(1), e.dark_cad_ms, e.dark_windows,
                             e.dark_ms, e.dark_max_ms, e.dark_missed, pp_max_us, pp_mean_us
-                        ); ptrstutter_witness(e.dark_ms, e.dark_max_ms);
+                        ); ptrstutter_witness(e.dark_ms, e.dark_max_ms as u64);
                     }
                     // ══════════════════════════════════════════════════════════════════════════════
                     // Boot reports are ≤ 8 B; a parsed report-pointer report can be longer (the
