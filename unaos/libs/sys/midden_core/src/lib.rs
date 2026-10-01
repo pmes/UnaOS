@@ -356,7 +356,7 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // decides what it does, never whether the word exists.
     ("reboot", Avail::Always),
     // FILEVIEW `view` / TEXTEDIT `edit`: ring arms are desktop-gated (wc or desktop_firmware); registered Always on the `dns` precedent (a gated-off arm falls through to bare-name launch, never a typo refusal).
-    ("view", Avail::Always), ("edit", Avail::Always), ("activity", Avail::Always), ("settings", Avail::Always), // ACTIVITY (R75)
+    ("view", Avail::Always), ("edit", Avail::Always), ("activity", Avail::Always), ("settings", Avail::Always), ("trash", Avail::Always), ("shortcuts", Avail::Always), ("play", Avail::Always), ("linux", Avail::Always), ("shot", Avail::Always), // ACTIVITY (R75); TRASH/SHORTCUTS/PLAYWAV/LINUXABI/SHOTREGION: arms are cfg-gated, registered Always like `src`
     // processes
     ("run", Avail::Proc), ("bg", Avail::Proc), ("storm", Avail::Proc),
     ("jobs", Avail::Proc), ("kill", Avail::Proc),
