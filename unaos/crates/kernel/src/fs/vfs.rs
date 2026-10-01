@@ -3475,6 +3475,7 @@ pub fn attr_key_reserved(key: &str) -> bool {
     key == "owner" || key.starts_with("grants:")
 }
 
+#[cfg(target_arch = "aarch64")]
 fn attr_key_guard(key: &str, principal: &str) -> Result<(), VfsError> {
     if key.is_empty() || key.len() > 255 {
         return Err(VfsError::Backend("bad-key"));

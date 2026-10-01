@@ -76,7 +76,7 @@ pub use una_abi::BUS_VERB_CP;
 pub use una_abi::BUS_VERB_WRITE;
 pub use una_abi::BUS_VERB_RM;
 pub use una_abi::BUS_VERB_MV;
-pub use una_abi::BUS_VERB_NOTICE;
+pub use una_abi::BUS_VERB_NOTICE; pub mod attr; // ATTRSURF (B299): the five attribute verbs (11..=15) — codec + KATs in `bus/attr.rs`, declared on this line because this file is LINE-NEUTRAL.
 
 /// The full set of valid verbs (both request and reply kinds). Kept as one predicate so the
 /// frozen `frame_parse` verb gate and the typed-body dispatch stay in lockstep.
@@ -84,7 +84,7 @@ pub use una_abi::BUS_VERB_NOTICE;
 pub fn verb_valid(verb: u8) -> bool {
     matches!(
         verb,
-        BUS_VERB_LS | BUS_VERB_CAT | BUS_VERB_CP | BUS_VERB_WRITE | BUS_VERB_RM | BUS_VERB_MV | BUS_VERB_NOTICE | una_abi::BUS_VERB_MENU_PUBLISH | una_abi::BUS_VERB_MENU_CLEAR | una_abi::BUS_VERB_MENU_GET
+        BUS_VERB_LS | BUS_VERB_CAT | BUS_VERB_CP | BUS_VERB_WRITE | BUS_VERB_RM | BUS_VERB_MV | BUS_VERB_NOTICE | una_abi::BUS_VERB_MENU_PUBLISH | una_abi::BUS_VERB_MENU_CLEAR | una_abi::BUS_VERB_MENU_GET | una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT
     )
 }
 

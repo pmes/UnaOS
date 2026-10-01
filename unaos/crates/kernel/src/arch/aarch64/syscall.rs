@@ -6898,7 +6898,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_OPEN => sys_open(a0, a1, a2),
         SYS_READ => sys_read(a0, a1, a2),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), // STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
+        SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
         SYS_CLOSE => sys_close(a0),
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(), #[cfg(feature = "net6")] una_abi::SYS_SOCKET => net6_sys_socket(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_BIND => net6_sys_bind(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_SENDTO => net6_sys_sendto(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_RECVFROM => net6_sys_recvfrom(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_CONNECT => net6_sys_connect(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SEND => net6_sys_send(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SOCK_RECV => net6_sys_sock_recv(a0, a1, a2), // NET6 (SOCKNUM 40..46) — the aarch64 arm of the socket family, over the SHARED `net_phy::net6` stack. Fully-qualified `una_abi::` paths (not `use` lines) and all seven folded onto this ONE existing arm: `syscall.rs` compiles into every aarch64 image and `panic::Location` embeds the source line, so a new line here would move the knob-off jetson/kernel8 images. ⚠ LINE-NEUTRAL append — bodies at the FILE TAIL.
@@ -16548,7 +16548,7 @@ pub fn u7_launcher(demo_cpu: usize) {
     // [name_len][name][content] payload + empty/at-ceiling content, decode fail-closed. A SIBLING
     // of BANDY-CODEC (the BANDY-1 goldens/witness stay byte-identical). Read-only, in-RAM; its own
     // uncounted `:: BANDY-CODEC2: … PASS ::` line.
-    crate::bus::bus_codec2_selftest();
+    crate::bus::bus_codec2_selftest(); crate::bus::attr::selftest(); // ATTRSURF: the attribute-verb goldens beside BANDY-2's.
     u7stk!("after:bus_codec2");
     // BANDY-1 M5 (verdict C): the stamping witness — caller-supplied principal rejected, replies
     // stamped with the reserved kernel kind (fail-closed everywhere a grantee/owner can appear),
@@ -23155,7 +23155,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
             },
             Err(_) => return EINVAL,
         },
-        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(asid as u64, body); 0 } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), // ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid
+        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(asid as u64, body); 0 } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal_of(&ppid), &mut text), // ATTRSURF (B299): the attribute verbs under the STAMPED principal, the SAME body SYS_ATTR_* calls. ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
     bus_reply_enqueue(asid, hdr.corr, hdr.verb, status, &text)
@@ -25732,4 +25732,49 @@ fn armrouter_witness() {
         if df { ",appmenu,brightkeys,volkeys" } else { "" },
         moved, if seams { "PASS" } else { "FAIL" }
     );
+}
+
+// =================================================================================================
+// ATTRSURF (B299) — the attribute syscalls, aarch64 arm. The body is `fs::attrsys::syscall_fulfil`,
+// shared with x86 and with both bus arms; this arm only copies in, names the caller, and copies out.
+// =================================================================================================
+
+/// The VFS principal string for a stamped record — the SAME projection a native `owner` row is written
+/// with (`principal_native_string`), so the attribute ACL and the SYS_OPEN ACL name one person one
+/// way. An anonymous / un-projectable caller is `anon` (public objects only).
+fn attrsurf_principal_of(rec: &PrincipalRecord) -> alloc::string::String {
+    let mut b = [0u8; K4_STR_MAX];
+    match principal_native_string(rec, &mut b) {
+        Some(n) => match core::str::from_utf8(&b[..n]) {
+            Ok(s) => alloc::string::String::from(s),
+            Err(_) => alloc::string::String::from("anon"),
+        },
+        None => alloc::string::String::from("anon"),
+    }
+}
+
+/// `SYS_ATTR_SET/GET/LIST`, `SYS_QUERY`, `SYS_STAT` — see una-abi's ATTRSURF block for the layouts.
+fn sys_attrsurf(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let principal = attrsurf_principal_of(&current_principal());
+    let n = a1 as usize;
+    if n == 0 || n > crate::fs::attrsys::IN_MAX {
+        return EINVAL;
+    }
+    let mut inb = alloc::vec![0u8; n];
+    if copy_from_user(&mut inb, a0, n).is_err() {
+        return EFAULT;
+    }
+    let cap = match nr {
+        una_abi::SYS_ATTR_SET => 0,
+        una_abi::SYS_STAT => una_abi::USER_STAT_LEN,
+        _ => a3 as usize,
+    };
+    let out = match crate::fs::attrsys::syscall_fulfil(nr, &inb, &principal, cap) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    if !out.is_empty() && copy_to_user(a2, &out, out.len()).is_err() {
+        return EFAULT;
+    }
+    if nr == una_abi::SYS_STAT { 0 } else { out.len() as i64 }
 }
