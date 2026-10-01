@@ -2330,6 +2330,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     // FILEVIEW — the text viewer's arrows / wheel / paging, asked first; it consumes only while ITS
     // window holds focus, so a closed viewer changes nothing below.
     if crate::video::fileview::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::settings::key_route(ev) {
+    if crate::video::fileview::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::activity::key_route(ev) {
         return true;
     }
     // QSCROLL — the WHEEL arrives here, at the seam that already exists, because this function is
@@ -2557,6 +2558,9 @@ pub fn press_route(x: i32, y: i32) -> bool {
         return true;
     }
     // TEXTEDIT — the editor's close box / caret placement / raise.
+    if crate::video::activity::press_route(x, y) {
+        return true;
+    }
     if crate::video::textedit::press_route(x, y) {
         return true;
     }
@@ -3031,6 +3035,8 @@ pub fn service() {
     crate::video::fileview::service(); crate::video::settings::service();
     // TEXTEDIT — the editor's latch drains on the same pass.
     crate::video::textedit::service();
+    // ACTIVITY (R75) — the once-a-second census repaint rides the same pass.
+    crate::video::activity::service();
 }
 
 // ── The witness ─────────────────────────────────────────────────────────────────────────────────
