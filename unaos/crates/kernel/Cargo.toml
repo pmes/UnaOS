@@ -3571,6 +3571,14 @@ ahci-write = ["ahci"]
 # Kept in sync with builder/src/main.rs and unaos/arroyo.
 root-prefer-ahci = []
 root-prefer-sdhc = []
+# UNAFSX86 (rmbp-ledger B298, SH-2 rung 1): `UNAOS_UNAFS=1` compiles the native UnaFS volume into the x86
+# kernel — `fs/unafs.rs`, the VFS `NativeBackend`, and `bootdisk::bind_root`'s native `/` — so a boot disk
+# carrying a UnaFS partition (`UNAOS_UNAFS=1 ./arroyo esp-x86` lays one as GPT p2) roots on it and FAT is
+# demoted to `/boot` + `/apps` (the ESP). aarch64 carries the module UNCONDITIONALLY (every cfg reads
+# `any(target_arch = "aarch64", feature = "unafs")`), so Pi/Orin images are unchanged with or without it;
+# on x86 the dependency is `optional` and default OFF keeps the x86 image byte-identical (the K3-N1 size
+# band). See docs/dev/evidence/rmbp-1001/UNAFSX86.md.
+unafs = ["dep:unafs"]
 # HDA (rmbp-ledger B127, arc 1) — the Intel High Definition Audio controller, `UNAOS_HDA=1`.
 # Nothing in this kernel had ever touched audio before this feature existed: `PciScanner::
 # enumerate_buses` matches exactly one class triple (xHCI) and the `[PCI-STOR]` census matches
@@ -3760,6 +3768,8 @@ smoltcp = { version = "=0.13.1", default-features = false, features = ["medium-e
 unaos-xusb-fw = { path = "../xusb-fw", optional = true }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
+# UNAFSX86: the same no_std UnaFS core, OPTIONAL on x86 — pulled only by the `unafs` feature (UNAOS_UNAFS=1).
+unafs = { path = "../../libs/fs/unafs", default-features = false, optional = true }
 x86_64 = "0.15.5"
 uart_16550 = "0.6.0"
 # SOCK-1: mature TCP/IP stack (0BSD, #![no_std], heap-optional). x86-only + optional so aarch64 and

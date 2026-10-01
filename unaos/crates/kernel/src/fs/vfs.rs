@@ -1463,17 +1463,17 @@ impl VfsBackend for FatBackend {
     }
 }
 
-/// Native UnaFS backend adapter (aarch64 only — the kernel `unafs` module is
-/// aarch64-gated). Wraps the one coherent [`crate::fs::unafs::with_unafs`] mount
+/// Native UnaFS backend adapter (aarch64 always; x86 under `unafs`/UNAOS_UNAFS=1 since UNAFSX86 —
+/// the gate the kernel `unafs` module carries). Wraps the one coherent [`crate::fs::unafs::with_unafs`] mount
 /// and defers the ACL to [`crate::fs::unafs::read_authz`] — the SAME per-object
 /// owner/grants evaluator the syscall layer's live-read check uses, so the VFS
 /// open and the existing SYS_OPEN authorize identically.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 pub struct NativeBackend {
     volume: String,
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 impl NativeBackend {
     pub fn new(volume: &str) -> Self {
         Self {
@@ -1483,7 +1483,7 @@ impl NativeBackend {
 }
 
 /// Map a unafs mount error into the VFS error space.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn unafs_err(_e: crate::fs::unafs::MountError) -> VfsError {
     VfsError::Backend("unafs-mount")
 }
@@ -1505,7 +1505,7 @@ fn unafs_err(_e: crate::fs::unafs::MountError) -> VfsError {
 /// This write evaluator lives in the VFS adapter (not beside `read_authz` in
 /// `unafs.rs`) to keep VFS-2 within the VFS lane; a follow-up may hoist it into
 /// `unafs.rs` as a `write_authz` sibling the way the read side already defers.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn native_write_authz(
     fs: &mut crate::fs::unafs::KernelUnaFS,
     id: u64,
@@ -1558,7 +1558,7 @@ fn native_write_authz(
 /// the native create/unlink path. `rel` must name a leaf under a directory: the
 /// bare root has no leaf ([`VfsError::IsADirectory`]); a missing parent is
 /// [`VfsError::NoSuchPath`].
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn native_parent(
     fs: &mut crate::fs::unafs::KernelUnaFS,
     rel: &str,
@@ -1579,7 +1579,7 @@ fn native_parent(
     Ok((parent_id, leaf))
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 impl VfsBackend for NativeBackend {
     fn volume_name(&self) -> &str {
         &self.volume
@@ -1886,7 +1886,7 @@ impl VfsBackend for NativeBackend {
 
 /// A volume-relative path → the absolute path the unafs `resolve_path` expects
 /// (it is rooted at `/`). `""` → `"/"`.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn native_abs(rel: &str) -> String {
     if rel.is_empty() || rel == "/" {
         "/".to_string()
@@ -1899,7 +1899,7 @@ fn native_abs(rel: &str) -> String {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn native_kind(k: ::unafs::inode::FileKind) -> NodeKind {
     match k {
         ::unafs::inode::FileKind::Directory => NodeKind::Dir,

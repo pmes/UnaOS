@@ -2634,6 +2634,13 @@ fi
 # Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
 [ "${UNAOS_ROOT_PREFER:-}" = "ahci" ] && _feats="${_feats}root-prefer-ahci,"
 [ "${UNAOS_ROOT_PREFER:-}" = "sdhc" ] && _feats="${_feats}root-prefer-sdhc,"
+# UNAFSX86 (rmbp-ledger B298, SH-2 rung 1): UNAOS_UNAFS=1 compiles the native UnaFS volume into the x86
+# kernel (fs/unafs.rs, the VFS NativeBackend, bootdisk's native `/`), and `esp-x86` additionally lays
+# target/unaos-x86-card.img — GPT p1 = the EFI System FAT (ESP + data trees), p2 = a `tools/unafs init`
+# volume. The boot prints `:: UNAFSX86: root=unafs|fat disk=... -> PASS|SKIP ::`. aarch64 carries the
+# module unconditionally, so this knob changes nothing there (its K8_FEATS arm is harmless by design).
+# Default OFF => the x86 image is byte-identical. Kept in sync with builder/src/main.rs and Cargo.toml.
+[ -n "${UNAOS_UNAFS:-}" ] && _feats="${_feats}unafs,"
 # HDA (rmbp-ledger B127, arc 1): UNAOS_HDA=1 arms drivers/hda.rs — the High Definition Audio
 # controller, the kernel's first audio line. NOTHING IN THIS KERNEL HAS EVER TOUCHED AUDIO, and the
 # reason is structural rather than an omission: `PciScanner::enumerate_buses` matches exactly one
@@ -9966,6 +9973,12 @@ kernel8() {
     # DEFAULT-QUIET: `kernel8-test` (the battery) arms UNAOS_WITNESS so the Pi bare-metal image carries the
     # M6b..U7 fixture cascade (CAPSTONE + all -> PASS lines). The plain `kernel8` media build leaves it unset,
     # so the flashed image is quiet — reaches the shell with CAPSTONE + device honesty lines only.
+    # UNAFSX86 (B298): the Pi image carries fs::unafs unconditionally (every gate is `any(target_arch =
+    # "aarch64", feature = "unafs")`), so this arm arms nothing new there — it exists so the knob reaches
+    # every image by one name (GATE-K8REACH) and a Pi build with the knob set is the same kernel.
+    if [ -n "${UNAOS_UNAFS:-}" ]; then
+        K8_FEATS="${K8_FEATS},unafs"
+    fi
     if [ -n "${UNAOS_WITNESS:-}" ]; then
         K8_FEATS="${K8_FEATS},witness"
         echo -e "${COLOR_YELLOW}  • UNAOS_WITNESS: kernel8 carries the M6b..U7 fixture battery (CAPSTONE + PASS lines)${COLOR_RESET}"

@@ -7635,7 +7635,7 @@ fn setfattr_x(console: &mut Console, key: &str, path: &str) {
 /// the name, because names are not unique and a generation is; `ls <gen> [path]` and `cat <gen>
 /// <path>` read AS OF a snapshot and enforce the LIVE object's current ACL (the K8c ruling — a file
 /// deleted from the live tree has no current ACL row and therefore fails closed).
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn snap_cmd(console: &mut Console, args: &[&str]) {
     let usage = "usage: snap list | snap create <name> | snap drop <gen> | snap ls <gen> [path] | snap cat <gen> <path>";
     match args.first().copied() {
@@ -7675,8 +7675,8 @@ fn snap_cmd(console: &mut Console, args: &[&str]) {
     }
 }
 
-/// x86 has no native volume, so there is nothing to retain. Honest refusal, by name.
-#[cfg(not(target_arch = "aarch64"))]
+/// x86 without `unafs` (UNAOS_UNAFS unset) has no native volume, so there is nothing to retain. Honest refusal, by name.
+#[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
 fn snap_cmd(console: &mut Console, _args: &[&str]) {
     console.println("snap: no native volume on this build (retained roots are a UnaFS feature)");
 }
@@ -7700,7 +7700,7 @@ fn snap_cmd(console: &mut Console, _args: &[&str]) {
 /// RELICS (R26 clause 2) / K8b: list retained snapshots (the on-disk snapshot index) on the native
 /// volume — the body the retired `usnaps` arm carried inline, lifted so `snap list` can call it and
 /// so the whole snapshot family sits together with its siblings.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn unafs_verb_snaps() -> alloc::vec::Vec<String> {
     let out = crate::fs::unafs::with_unafs(|fs| match fs.snapshot_index() {
         Ok(snaps) => {
@@ -7731,9 +7731,9 @@ fn unafs_verb_snaps() -> alloc::vec::Vec<String> {
 /// is a kernel-authority surface, so the creator principal is "kernel"
 /// (owner-or-kernel destructive authority — a later `usnapdrop` from this
 /// surface is always permitted). Returns the generation stamp.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn unafs_verb_snap(name: &str) -> String {
-    let ts = crate::arch::timer::cntpct();
+    let ts = { #[cfg(target_arch = "aarch64")] { crate::arch::timer::cntpct() } #[cfg(not(target_arch = "aarch64"))] { crate::arch::now_cycles() } }; // UNAFSX86: the arch's free-running counter on both (CNTPCT / TSC), the same unit class as before
     match crate::fs::unafs::with_unafs(|fs| {
         fs.snapshot_create(name.into(), "kernel".into(), ts)
             .map_err(|e| alloc::format!("{:?}", e))
@@ -7746,7 +7746,7 @@ fn unafs_verb_snap(name: &str) -> String {
 
 /// `snap drop <generation>`: drop a retained snapshot; reclamation drains
 /// eagerly, freeing only blocks no live/retained root still reaches.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn unafs_verb_snapdrop(generation: u64) -> String {
     match crate::fs::unafs::with_unafs(|fs| {
         fs.snapshot_drop(generation)
@@ -7764,7 +7764,7 @@ fn unafs_verb_snapdrop(generation: u64) -> String {
 /// evaluator as `usnapcat` ([`read_authz`] on the target directory's live id) —
 /// no snapshot-read surface bypasses it: a directory deleted from the live tree
 /// fails closed, symmetrically with the file read (lens A fold).
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn unafs_verb_snapls(generation: u64, path: &str) -> alloc::vec::Vec<String> {
     use crate::fs::unafs::{read_authz, ReadAuthz, KERNEL_PRINCIPAL};
     let out = crate::fs::unafs::with_unafs(|fs| {
@@ -7827,7 +7827,7 @@ fn unafs_verb_snapls(generation: u64, path: &str) -> alloc::vec::Vec<String> {
 /// object's CURRENT ACL (K8c high-security ruling). The shell runs at kernel
 /// authority, so it reads any LIVE object — but a file DELETED from the live
 /// tree fails closed (no current ACL row), and that refusal is reported plainly.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn unafs_verb_snapcat(generation: u64, path: &str) -> String {
     use crate::fs::unafs::{ReadAuthz, SnapReadResult, KERNEL_PRINCIPAL};
     match crate::fs::unafs::snapshot_read(generation, path, KERNEL_PRINCIPAL) {

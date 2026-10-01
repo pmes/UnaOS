@@ -317,6 +317,9 @@ fn main() {
         Ok("sdhc") => feats.push("root-prefer-sdhc"),
         _ => {}
     }
+    // UNAFSX86 (rmbp-ledger B298): UNAOS_UNAFS=1 compiles the native UnaFS volume into the x86 kernel so a boot
+    // disk carrying a UnaFS partition roots on it. Default OFF => byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_UNAFS").is_ok() { feats.push("unafs"); }
     // HDA (rmbp-ledger B127, arc 1): UNAOS_HDA=1 arms drivers/hda.rs — the High Definition Audio
     // controller, the kernel's first audio line. THIS list is what reaches the kernel binary for
     // MEDIA builds and for every QEMU run that goes through this builder: the builder re-derives

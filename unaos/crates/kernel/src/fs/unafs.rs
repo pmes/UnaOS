@@ -161,7 +161,7 @@ fn handle_info(handle: block::BlockHandle) -> Option<block::BlockDeviceInfo> {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => block::tegra_sd_info(),
+        block::BlockHandle::SdMmc => block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::ahci_info_port(port), // UNAFSX86: the SATA disk's own row
     }
 }
 
@@ -182,7 +182,7 @@ fn handle_read(
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::read_block_sdhc(lba, buf),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => block::read_block_tegra_sd(lba, buf),
+        block::BlockHandle::SdMmc => block::read_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::read_block_ahci_port(port, lba, buf), // UNAFSX86
     }
 }
 
@@ -196,7 +196,7 @@ fn handle_write(handle: block::BlockHandle, lba: u64, buf: &[u8]) -> Result<(), 
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::write_block_sdhc(lba, buf),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => block::write_block_tegra_sd(lba, buf),
+        block::BlockHandle::SdMmc => block::write_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::write_block_ahci_port(port, lba, buf), // UNAFSX86: refuses unless ahci-write's grant path — the twin of the read arm
     }
 }
 
@@ -253,7 +253,7 @@ impl SdSectorDevice {
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             block::BlockHandle::Sdhc => dev.num_blocks,
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            block::BlockHandle::SdMmc => dev.num_blocks,
+            block::BlockHandle::SdMmc => dev.num_blocks, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => dev.num_blocks, // UNAFSX86: a dedicated per-port row
         };
         Ok(Self { handle, sectors })
     }
@@ -554,7 +554,7 @@ fn bind_probe_admitted(handle: block::BlockHandle) -> bool {
         // TEGRASD merge arm — prescribed by the MERGE NOTE above: the orin's unafs volume rides
         // the card's dedicated handle while `Global` is the USB stick; admit the probe.
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => true,
+        block::BlockHandle::SdMmc => true, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => false, // UNAFSX86: NOT probed — the shared mount is read-write and this transport refuses ordinary writes; a SATA volume is reached by `mount_on` read-only, never by the lazy bind
     }
 }
 
@@ -584,7 +584,7 @@ fn handle_kind_name(handle: block::BlockHandle) -> &'static str {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => "sdhc",
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => "tegra-sd",
+        block::BlockHandle::SdMmc => "tegra-sd", #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => "ahci", // UNAFSX86
     }
 }
 
@@ -1770,9 +1770,8 @@ const K8_PAYLOAD: &[u8] = b"K8a copy-on-write commit -- old tree or new tree, ne
 ///
 /// Skips honestly on media without a unafs partition.
 ///
-/// Tick source: `CNTPCT_EL0` on aarch64; 0 on other arches (the witness is
-/// only chained on the Pi, but this module compiles on both — zero x86
-/// behavior change).
+/// Tick source: `CNTPCT_EL0` on aarch64; on x86 (UNAFSX86) the TSC through
+/// `arch::now_cycles()` — a real counter, never a 0 that reads as "free".
 fn bench_ticks() -> u64 {
     #[cfg(target_arch = "aarch64")]
     {
@@ -1780,7 +1779,7 @@ fn bench_ticks() -> u64 {
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
-        0
+        crate::arch::now_cycles()
     }
 }
 
