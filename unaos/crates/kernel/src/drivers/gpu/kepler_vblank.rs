@@ -731,6 +731,7 @@ fn edge(vline: u32) {
     // it is where in the frame the edge was observed — `raster_at_irq`, and the number rung 2's
     // threshold is derived from.
     VB_PHASE1.store(vline + 1, Ordering::Relaxed);
+    edge_ring_push(crate::arch::now_cycles(), n, IN_PUMP.load(Ordering::Relaxed));
     if !IN_PUMP.load(Ordering::Relaxed) {
         LAST_COMP_EDGE_MS.store(crate::arch::ms(), Ordering::Relaxed);
     }
@@ -769,6 +770,8 @@ fn report(n: u64, vline: u32) {
         ISR_CALLS.load(Ordering::Relaxed), ISR_ACKS.load(Ordering::Relaxed), ISR_REARMS.load(Ordering::Relaxed),
         REARM_WRITTEN.load(Ordering::Relaxed) as u32, REARM_READBACK.load(Ordering::Relaxed),
     );
+    census_tail();
+    vbjitter_witness(cycles_to_us(p_cyc), cycles_to_us(j_cyc));
     if IRQ_KEPT.load(Ordering::Relaxed) {
         vector_census("census", n);
     }
@@ -1210,16 +1213,46 @@ extern "x86-interrupt" fn kepler_vblank_isr(_f: x86_64::structures::idt::Interru
                 // does — UNVERIFIED on this die, the readback below is the witness), re-arm.
                 let pre = mmio_read(bar0, st_reg);
                 if pre & vb != 0 { ISR_PENDING_PRE.fetch_add(1, Ordering::Relaxed); }
-                mmio_write(bar0, en_reg, entry & !vb);
+                // KVBLANK7 M1 — the ISR ring: when this message ran, and where the beam was.
+                isr_ring_push(crate::arch::now_cycles(), mmio_read(bar0, regs::NV_PDISPLAY_BASE + 0x6000 + head * 0x800 + 0x340) & 0xFFFF);
+                // KVBLANK7 M2 — ACK FIRST (write-1-to-clear), THEN re-arm, read the latch back in between. The old
+                // order (disarm, ack, re-arm) is gone: flight 18 still read `isr_calls=1` for the whole boot.
                 mmio_write(bar0, st_reg, vb);
                 ISR_ACKS.fetch_add(1, Ordering::Relaxed);
-                let post = mmio_read(bar0, st_reg);
+                let mut post = mmio_read(bar0, st_reg);
+                if post & vb == 0 {
+                    ISR_ACK_VIA.store(1, Ordering::Relaxed);
+                } else {
+                    // The W1C guess did not clear it: the alternatives, each read back, the winner recorded.
+                    mmio_write(bar0, disp_head(DISP_INTR_HEAD_STATUS, head), vb);
+                    post = mmio_read(bar0, st_reg);
+                    if post & vb == 0 {
+                        ISR_ACK_VIA.store(2, Ordering::Relaxed);
+                    } else {
+                        mmio_write(bar0, en_reg, entry & !vb);
+                        post = mmio_read(bar0, st_reg);
+                        ISR_ACK_VIA.store(if post & vb == 0 { 3 } else { 0 }, Ordering::Relaxed);
+                    }
+                }
                 if post & vb != 0 { ISR_STUCK.fetch_add(1, Ordering::Relaxed); } else { ISR_STUCK.store(0, Ordering::Relaxed); }
                 let w = isr_head_en(entry); // KVBLANK4: the entry value WITH the vblank bit
                 mmio_write(bar0, en_reg, w);
                 ISR_REARMS.fetch_add(1, Ordering::Relaxed);
                 REARM_WRITTEN.store(w as u64, Ordering::Relaxed);
                 if mmio_read(bar0, en_reg) & vb != 0 { REARM_READBACK.fetch_add(1, Ordering::Relaxed); }
+                // KVBLANK7 M2 — the MSI RE-ARM (nouveau `nvkm_pci_msi_rearm`: config byte 0x68 = 0xFF). UNVERIFIED on GK107;
+                // `msi_rearms=` counts it and `isr_calls=` after it says whether it was the missing step.
+                if IRQ_WIRE.load(Ordering::Relaxed) == 1 {
+                    let bdf1 = VB_BDF1.load(Ordering::Relaxed);
+                    if bdf1 != 0 {
+                        let bdf = bdf1 - 1;
+                        let (bus, slot, func) = ((bdf >> 16) as u8, (bdf >> 8) as u8, bdf as u8);
+                        let v = crate::arch::pci::read_config_32(bus, slot, func, 0x68);
+                        crate::arch::pci::write_config_32(bus, slot, func, 0x68, v | 0xFF);
+                        MSI_REARMS.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                ISR_LAST_CYC.store(crate::arch::now_cycles(), Ordering::Relaxed);
                 if ISR_STUCK.load(Ordering::Relaxed) >= IRQ_STORM_CAP {
                     mmio_write(bar0, regs::NV_PMC_INTR_EN, IRQ_PMC_ENTRY.load(Ordering::Relaxed));
                     IRQ_STORMED.store(true, Ordering::Relaxed);
@@ -1252,10 +1285,10 @@ pub fn counter() -> Option<u64> {
                 // would have stopped watching the counter that actually advances inside a hold
                 // (`hold` runs IRQ-masked — see §R2b), and every wide-zone present would have
                 // regressed to the give-up budget. The sum can only ever shorten a wait.
-                Some(
-                    LIVE.count.load(Ordering::Relaxed)
-                        .wrapping_add(IRQ_COUNT.load(Ordering::Relaxed)),
-                )
+                // KVBLANK7 M2 — NOT the union any more. Summing both let one vblank count twice whenever the ISR
+                // and the sampler both saw it; ONE source per read: the ISR counter when it is delivering,
+                // the sampler's otherwise.
+                if irq_source() { Some(IRQ_COUNT.load(Ordering::Relaxed)) } else { Some(LIVE.count.load(Ordering::Relaxed)) }
             }
         }
         // A counter the TIMER advances, one tick per simulated period.
@@ -1306,7 +1339,8 @@ pub fn wait_next_edge(from: u64, deadline_cyc: u64) -> (bool, u64) {
     // the full `GIVEUP_FRAMES` budget before falling through to the spin. See the module doc.
     // Under the fixture the hardware source is not the one being driven, so the sample is skipped
     // and B145's two recorded verdicts are unchanged.
-    let sample = SIM_MODE.load(Ordering::Relaxed) == 0;
+    let via_irq = irq_source();
+    let sample = SIM_MODE.load(Ordering::Relaxed) == 0 && !via_irq;
     let irq0 = IRQ_COUNT.load(Ordering::Relaxed);
     loop {
         if sample {
@@ -1334,6 +1368,9 @@ pub fn wait_next_edge(from: u64, deadline_cyc: u64) -> (bool, u64) {
             VB_WAITS.fetch_add(1, Ordering::Relaxed);
             VB_WAIT_US.fetch_add(cycles_to_us(dt), Ordering::Relaxed);
             VB_WAIT_GAVEUP.fetch_add(1, Ordering::Relaxed);
+            if via_irq && !IRQ_DEMOTED.swap(true, Ordering::Relaxed) {
+                serial_println!(":: kepler: vblank wait-source demoted irq->poll reason=irq-wait-gaveup isr_calls={} msi_rearms={} ack_via={} ::", ISR_CALLS.load(Ordering::Relaxed), MSI_REARMS.load(Ordering::Relaxed), ISR_ACK_VIA.load(Ordering::Relaxed));
+            }
             return (false, dt);
         }
         core::hint::spin_loop();
@@ -1726,3 +1763,116 @@ pub fn selftest_rerun() {
 fn stage_resolved_u32() -> u32 { crate::fs::users::stage_resolved() as u32 }
 #[cfg(not(feature = "login"))]
 fn stage_resolved_u32() -> u32 { 1 }
+
+
+// ══ KVBLANK7 — who delivers, how regularly, and which source a wait trusts ════════════════════════
+//
+// Flight 18: `isr_calls=1` for the whole boot and `jitter_us` of a whole period. M1 measures; M2's source choice is here.
+
+/// Which ack cleared the INTR_HOST_HEAD latch last: 1 = W1C on INTR_HOST_HEAD, 2 = W1C on INTR_HEAD_STATUS,
+/// 3 = the enable toggle, 0 = none did (or no delivery yet).
+static ISR_ACK_VIA: AtomicU32 = AtomicU32::new(0);
+static MSI_REARMS: AtomicU64 = AtomicU64::new(0);
+static ISR_LAST_CYC: AtomicU64 = AtomicU64::new(0);
+/// The irq source was trusted by a wait and gave up: demoted to the beam sampler for the rest of the boot.
+static IRQ_DEMOTED: AtomicBool = AtomicBool::new(false);
+
+const RING_N: usize = 64;
+static ISR_RING_T: [AtomicU64; RING_N] = [const { AtomicU64::new(0) }; RING_N];
+static ISR_RING_V: [AtomicU32; RING_N] = [const { AtomicU32::new(0) }; RING_N];
+static ISR_RING_I: AtomicU64 = AtomicU64::new(0);
+/// Poll edges: timestamp, hardware count `n`, and whether the pump (8 ms-grained) took the sample.
+static EDGE_RING_T: [AtomicU64; RING_N] = [const { AtomicU64::new(0) }; RING_N];
+static EDGE_RING_N: [AtomicU64; RING_N] = [const { AtomicU64::new(0) }; RING_N];
+static EDGE_RING_P: [AtomicBool; RING_N] = [const { AtomicBool::new(false) }; RING_N];
+static EDGE_RING_I: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn isr_ring_push(tsc: u64, vline: u32) {
+    let i = (ISR_RING_I.fetch_add(1, Ordering::Relaxed) as usize) % RING_N;
+    ISR_RING_T[i].store(tsc, Ordering::Relaxed);
+    ISR_RING_V[i].store(vline, Ordering::Relaxed);
+}
+
+#[inline]
+fn edge_ring_push(tsc: u64, n: u64, pump: bool) {
+    let i = (EDGE_RING_I.fetch_add(1, Ordering::Relaxed) as usize) % RING_N;
+    EDGE_RING_T[i].store(tsc, Ordering::Relaxed);
+    EDGE_RING_N[i].store(n, Ordering::Relaxed);
+    EDGE_RING_P[i].store(pump, Ordering::Relaxed);
+}
+
+/// `[<8ms, 8-24, 24-40, >40]`, `missed` (dt >= 25 ms: a vblank lost) and `doubled` (dt < 8.3 ms: two together),
+/// against the 16.67 ms period. Pure.
+fn dt_classify(dt_us: u64, h: &mut [u32; 4], missed: &mut u32, doubled: &mut u32) {
+    let b = if dt_us < 8_000 { 0 } else if dt_us < 24_000 { 1 } else if dt_us < 40_000 { 2 } else { 3 };
+    h[b] += 1;
+    if dt_us >= 25_000 { *missed += 1; }
+    if dt_us < 8_333 { *doubled += 1; }
+}
+
+/// Histogram over the ISR ring (consecutive messages) and the edge ring (consecutive NON-pump edges one vblank apart).
+fn dt_hist() -> ([u32; 4], u32, u32, [u32; 4], u32, u32) {
+    let (mut ih, mut im, mut id) = ([0u32; 4], 0u32, 0u32);
+    let n = (ISR_RING_I.load(Ordering::Relaxed) as usize).min(RING_N);
+    let mut prev = 0u64;
+    let start = if (ISR_RING_I.load(Ordering::Relaxed) as usize) > RING_N { (ISR_RING_I.load(Ordering::Relaxed) as usize) % RING_N } else { 0 };
+    for k in 0..n {
+        let t = ISR_RING_T[(start + k) % RING_N].load(Ordering::Relaxed);
+        if prev != 0 && t > prev { dt_classify(cycles_to_us(t - prev), &mut ih, &mut im, &mut id); }
+        prev = t;
+    }
+    let (mut eh, mut em, mut ed) = ([0u32; 4], 0u32, 0u32);
+    let total = EDGE_RING_I.load(Ordering::Relaxed) as usize;
+    let n = total.min(RING_N);
+    let start = if total > RING_N { total % RING_N } else { 0 };
+    let (mut pt, mut pn, mut pp) = (0u64, 0u64, true);
+    for k in 0..n {
+        let j = (start + k) % RING_N;
+        let (t, c, p) = (EDGE_RING_T[j].load(Ordering::Relaxed), EDGE_RING_N[j].load(Ordering::Relaxed), EDGE_RING_P[j].load(Ordering::Relaxed));
+        if !p && !pp && pt != 0 && c == pn + 1 && t > pt { dt_classify(cycles_to_us(t - pt), &mut eh, &mut em, &mut ed); }
+        pt = t; pn = c; pp = p;
+    }
+    (ih, im, id, eh, em, ed)
+}
+
+/// The KVBLANK7 census fields, printed on the line right after `:: kepler: vblank head=` (no allocation: [`report`] runs
+/// from the compositor's IRQ-masked hold).
+fn census_tail() {
+    let (ih, im, id, eh, em, ed) = dt_hist();
+    serial_println!(
+        ":: kepler: vblank-dt dt_hist=[<8ms:{},8-24:{},24-40:{},>40:{}] poll_dt_hist=[<8ms:{},8-24:{},24-40:{},>40:{}] isr_missed={} isr_doubled={} poll_missed={} poll_doubled={} isr_stuck={} ack_via={} msi_rearms={} irq_demoted={} :: — KVBLANK7: dt between consecutive ISR messages, and between consecutive NON-pump poll edges one vblank apart; missed = dt >= 25 ms, doubled = dt < 8.3 ms. isr missed without doubled = lost messages; poll missed+doubled symmetric = late timestamps (a measurement artefact) ::",
+        ih[0], ih[1], ih[2], ih[3], eh[0], eh[1], eh[2], eh[3], im, id, em, ed,
+        ISR_STUCK.load(Ordering::Relaxed), ISR_ACK_VIA.load(Ordering::Relaxed), MSI_REARMS.load(Ordering::Relaxed),
+        IRQ_DEMOTED.load(Ordering::Relaxed) as u32,
+    );
+}
+
+fn vbjitter_witness(period_us: u64, jitter_us: u64) {
+    let (_, im, id, _, em, ed) = dt_hist();
+    let (missed, doubled) = (im + em, id + ed);
+    serial_println!(
+        ":: VBJITTER: period_us={} jitter_us={} missed={} doubled={} isr_calls={} bound=jitter_us<=4000 -> {} ::",
+        period_us, jitter_us, missed, doubled, ISR_CALLS.load(Ordering::Relaxed),
+        if jitter_us <= 4_000 { "PASS" } else { "FAIL" },
+    );
+}
+
+/// M2 — ONE source per wait. The ISR counter only when the vector was kept live, was not demoted, and delivered within
+/// three periods; otherwise the beam sampler (and the sampler is then the only thing advancing the count).
+#[inline]
+fn irq_source() -> bool {
+    if SIM_MODE.load(Ordering::Relaxed) != 0 || !IRQ_KEPT.load(Ordering::Relaxed) || IRQ_DEMOTED.load(Ordering::Relaxed) {
+        return false;
+    }
+    let last = ISR_LAST_CYC.load(Ordering::Relaxed);
+    last != 0 && crate::arch::now_cycles().saturating_sub(last) <= us_to_cycles(3 * 16_667)
+}
+
+/// KVBLANK7 M3 — block (spin, never past `max_us`) until the next vblank; false when no source is counting or it ran out.
+pub fn wait_vblank_bounded(max_us: u64) -> bool {
+    match counter() {
+        Some(c0) => wait_next_edge(c0, crate::arch::now_cycles().saturating_add(us_to_cycles(max_us))).0,
+        None => false,
+    }
+}
