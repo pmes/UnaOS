@@ -179,6 +179,7 @@ fn ensure_shellux() {
     {
         static DONE3: AtomicBool = AtomicBool::new(false);
         if !DONE3.swap(true, Ordering::AcqRel) { register("imgview", crate::video::facet::imgview_selftest); }
+        if !DONE2.swap(true, Ordering::AcqRel) { register("settings", crate::video::settings::selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ }
     }
 }
 

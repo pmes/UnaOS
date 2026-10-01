@@ -991,3 +991,6 @@ FORBID :: TERMCOLOR: .* -> FAIL ::
 # ── POWERMENU (R75), TAIL-APPENDED — `tests power`: the battery panel opens and closes through the real crystal path on a forced reading, the low-battery NOTICE thresholds (10 %, 5 %, once each, discharging only) on forced percents, the two-step confirm armed/fired/re-armed. No real shutdown.
 REQUIRE :: POWER-UI: panel_ok=true notice_ok=true -> PASS ::
 FORBID :: POWER-UI: .* -> FAIL ::
+# ── WINDOWLIST (R75) — `tests windowlist`: the bar's Window menu opened through the press router, the second window's row picked (focus asserted), Show Desktop minimises every live app window and a second pick restores them.
+REQUIRE :: WINDOWLIST: rows=[0-9]+ live=[0-9]+ focused=[1-9][0-9]* minimised=[0-9]+ show_desktop_ok=true -> PASS ::
+FORBID :: WINDOWLIST: .* -> FAIL ::

@@ -111,7 +111,7 @@ pub const MENU_TITLES_MAX: usize = 4;
 /// tenant's [`MENU_TITLES_MAX`] published titles. The snapshot arrays are sized by this, not by
 /// `MENU_TITLES_MAX`, because Peter's ruling gives every window a name-menu whether or not it ever
 /// publishes one of its own — so the app box is not one of the tenant's four.
-pub const BAR_BOXES_MAX: usize = MENU_TITLES_MAX + 1;
+pub const BAR_BOXES_MAX: usize = MENU_TITLES_MAX + 2; // WINDOWLIST — +1 for the Window menu, the LAST box
 
 /// The item is not pickable; it renders dimmed and a press on it keeps the menu open.
 pub const FLAG_DISABLED: u32 = 1 << 0;
@@ -255,6 +255,10 @@ static APP_NAME_LEN: AtomicUsize = AtomicUsize::new(0);
 /// beside [`OPEN_TITLE`] and cleared with it, so "which menu is down" is never inferred from a
 /// layout that may have changed under it.
 static OPEN_APP: AtomicBool = AtomicBool::new(false);
+/// WINDOWLIST — is the OPEN dropdown the Window menu? Stored and cleared beside [`OPEN_APP`].
+static OPEN_WIN: AtomicBool = AtomicBool::new(false);
+/// WINDOWLIST — the pseudo-owner the Window menu opens under (no window owns it; `0` is `WIN_NONE`).
+const WIN_OWNER: wm::WinId = wm::WinId::MAX;
 
 /// Which title is dropped, 1-based; `0` is closed. One value, so "is a menu open" and "which one" can
 /// never disagree.
@@ -690,6 +694,8 @@ pub struct BarSnapshot {
     /// SO3 — the window the app menu belongs to, and the row its `Quit` reaps. [`wm::WIN_NONE`] when
     /// [`app`](Self::app) is `false`.
     pub app_owner: wm::WinId,
+    /// WINDOWLIST — the LAST box is the Window menu (`winlist`).
+    pub win: bool,
     /// Box origin and width, panel-absolute. Height is the bar's, and `y` is the bar's.
     pub x: [usize; BAR_BOXES_MAX],
     pub w: [usize; BAR_BOXES_MAX],
@@ -709,6 +715,7 @@ impl BarSnapshot {
             owner: wm::WIN_NONE,
             app: false,
             app_owner: wm::WIN_NONE,
+            win: false,
             x: [0; BAR_BOXES_MAX],
             w: [0; BAR_BOXES_MAX],
             label: [[0; MENU_LABEL_MAX]; BAR_BOXES_MAX],
@@ -728,6 +735,12 @@ impl BarSnapshot {
     #[inline]
     fn is_app_box(&self, k: usize) -> bool {
         self.app && k == 0
+    }
+
+    /// WINDOWLIST — is box `k` the Window menu?
+    #[inline]
+    fn is_win_box(&self, k: usize) -> bool {
+        self.win && self.n > 0 && k + 1 == self.n
     }
 
     /// Which title box, if any, panel point `(px, py)` lands in.
@@ -862,7 +875,7 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
     // as "nothing to lay out" — a window with no menus still has a NAME — but not what it costs: two
     // relaxed loads and a return on a desktop with no focused window and no publisher, and the bar's
     // own `ENABLED` load below on a boot with no bar at all. No lock on either.
-    if LIVE.load(Ordering::Relaxed) == 0 && app_owner == wm::WIN_NONE {
+    if LIVE.load(Ordering::Relaxed) == 0 && app_owner == wm::WIN_NONE && !super::winlist::desktop_hidden() {
         return s;
     }
     let Some(bar) = menubar::strip_rect(pw, ph) else {
@@ -938,6 +951,21 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
             x += w;
         }
     }
+    // WINDOWLIST — the Window menu is the LAST box: after the app name (and any tenant titles) whenever a window is
+    // named on the bar, or while Show Desktop holds every window down (the way back must stay reachable).
+    if (s.app || super::winlist::desktop_hidden()) && s.n < BAR_BOXES_MAX {
+        let w = super::winlist::LABEL.len() * CELL_W + 2 * TPAD;
+        let x = if s.n > 0 { s.x[s.n - 1] + s.w[s.n - 1] } else { (bx + menubar::menus_x0()).saturating_sub(TPAD) };
+        if x + w <= limit && x + w <= bx + bw {
+            let k = s.n;
+            s.x[k] = x;
+            s.w[k] = w;
+            s.label_len[k] = super::winlist::LABEL.len();
+            s.label[k][..super::winlist::LABEL.len()].copy_from_slice(super::winlist::LABEL.as_bytes());
+            s.win = true;
+            s.n += 1;
+        }
+    }
     // Which box, if any, is DOWN. SO3 adds the second half of the question: the app menu and a
     // tenant title are different surfaces that share one index space, so "box 1 is open" is only
     // true if the box 1 this layout produced is the same KIND of box the open was taken on. An app
@@ -946,7 +974,7 @@ pub fn bar_boxes(pw: usize, ph: usize) -> BarSnapshot {
     let open = OPEN_TITLE.load(Ordering::Relaxed) as usize;
     let open_owner = OPEN_OWNER.load(Ordering::Relaxed);
     let is_app = OPEN_APP.load(Ordering::Relaxed);
-    let (wanted, kind_ok) = if is_app { (s.app_owner, open == 1) } else { (owner, !s.is_app_box(open.saturating_sub(1))) };
+    let (wanted, kind_ok) = if OPEN_WIN.load(Ordering::Relaxed) { (WIN_OWNER, s.is_win_box(open.saturating_sub(1))) } else if is_app { (s.app_owner, open == 1) } else { (owner, !s.is_app_box(open.saturating_sub(1)) && !s.is_win_box(open.saturating_sub(1))) }; // WINDOWLIST — the Window menu is its own kind
     s.open = if open != 0 && open <= s.n && kind_ok && wanted != wm::WIN_NONE && open_owner == wanted {
         open
     } else {
@@ -1024,6 +1052,8 @@ enum Sink {
     App(wm::WinId),
     /// The tenant's handler, called with the item id the tenant itself chose.
     Tenant(fn(u32)),
+    /// WINDOWLIST — the WM's Window menu: [`super::winlist::pick`].
+    Win,
 }
 
 /// SO3 — what box `k` drops, and where its picks go. Three-valued for [`Look`]'s reason.
@@ -1040,6 +1070,9 @@ enum Menu {
 /// The default app menu costs NO lock on the common boot: `tree_of` short-circuits on [`LIVE`], so a
 /// window that published nothing resolves straight to [`APP_MENU_DEFAULT`].
 fn menu_of(s: &BarSnapshot, k: usize, site: &str) -> Menu {
+    if s.is_win_box(k) {
+        return Menu::Found(super::winlist::rows(), Sink::Win); // WINDOWLIST
+    }
     if s.is_app_box(k) {
         return match tree_of(s.app_owner, site) {
             Look::Found(t) => match t.app {
@@ -1119,7 +1152,7 @@ enum Layout {
 /// This is the half that TAKES THE LOCK, so its callers are counted: [`open_title`] (task context)
 /// and [`compose`] (once per pass). The per-window occlusion walk reads [`OPEN_RECT`] instead.
 fn layout_open_rect(pw: usize, ph: usize, s: &BarSnapshot) -> Layout {
-    if s.busy && !s.is_app_box(s.open.saturating_sub(1)) {
+    if s.busy && !s.is_app_box(s.open.saturating_sub(1)) && !s.is_win_box(s.open.saturating_sub(1)) {
         return Layout::Busy;
     }
     if !is_open() || s.open == 0 {
@@ -1170,7 +1203,12 @@ fn republish_open_rect(pw: usize, ph: usize, s: &BarSnapshot) -> Option<strip::R
 /// Drop title `k` (0-based) of the bar owner's tree.
 fn open_title(k: usize, s: &BarSnapshot) {
     let is_app = s.is_app_box(k);
-    let owner = if is_app { s.app_owner } else { s.owner };
+    let is_win = s.is_win_box(k); // WINDOWLIST — rows are rebuilt from the live table at every open
+    if is_win {
+        super::winlist::rebuild();
+    }
+    OPEN_WIN.store(is_win, Ordering::Release);
+    let owner = if is_win { WIN_OWNER } else if is_app { s.app_owner } else { s.owner };
     OPEN_APP.store(is_app, Ordering::Release);
     OPEN_OWNER.store(owner, Ordering::Release);
     OPEN_TITLE.store((k + 1) as u32, Ordering::Release);
@@ -1192,7 +1230,7 @@ fn open_title(k: usize, s: &BarSnapshot) {
         "[winmenu] open title={} items={} at ({},{}) title-x={} font={} kind={} owner={}",
         core::str::from_utf8(s.label_of(k)).unwrap_or("?"),
         items, mx, my, s.text_x(k), menubar::BAR_FONT_NAME,
-        if is_app { "app" } else { "title" }, owner
+        if is_win { "window" } else if is_app { "app" } else { "title" }, owner
     );
     drive();
 }
@@ -1233,6 +1271,7 @@ fn dismiss_state(reason: &str) -> bool {
     OPEN_RECT.store(0, Ordering::Release);
     let owner = OPEN_OWNER.swap(wm::WIN_NONE, Ordering::AcqRel);
     let was_app = OPEN_APP.swap(false, Ordering::AcqRel);
+    OPEN_WIN.store(false, Ordering::Release); // WINDOWLIST
     DISMISSES.fetch_add(1, Ordering::Relaxed);
     serial_println!(
         "[winmenu] dismiss reason={} kind={} owner={}",
@@ -1343,6 +1382,10 @@ pub fn press_at(x: i32, y: i32) -> bool {
                         PICKS.fetch_add(1, Ordering::Relaxed);
                         dismiss("pick");
                         match sink {
+                            Sink::Win => {
+                                serial_println!("[winmenu] pick owner=window id={} label={}", id, items[i].label);
+                                super::winlist::pick(id);
+                            }
                             Sink::Tenant(f) => {
                                 serial_println!("[winmenu] pick owner={} id={} label={}", owner, id, items[i].label);
                                 f(id);
@@ -2081,7 +2124,7 @@ const _: () = {
     // SO3 — the caption is carried in two `u64`s, so the window title must fit in sixteen bytes.
     assert!(wm::MAX_TITLE <= 16);
     // SO3 — the snapshot must hold the app box AND the tenant's full complement of titles.
-    assert!(BAR_BOXES_MAX == MENU_TITLES_MAX + 1);
+    assert!(BAR_BOXES_MAX == MENU_TITLES_MAX + 2);
     // SO3 — the default app menu is legal in the registry it is served from.
     assert!(APP_MENU_DEFAULT.len() <= MENU_ITEMS_MAX);
     // SO3 — `Quit` and `About` must be distinguishable, or `app_pick` cannot route.
@@ -2828,4 +2871,32 @@ pub fn shotmenu_selftest() {
     );
     // NO dismiss. NO wm::close. NO focus restore. NO set_enabled(saved). The menu is HELD DOWN for
     // the camera — that is this fixture's entire contract and the reason it is last.
+}
+
+// WINDOWLIST (R75) — TAIL-APPENDED. The fixture's seam into the bar's geometry: where the Window box is,
+// and where a row of its open dropdown is, as panel points a real press can land on.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn wl_box_center() -> Option<(i32, i32)> {
+    let (pw, ph) = panel();
+    if pw == 0 {
+        return None;
+    }
+    let s = bar_boxes(pw, ph);
+    if !s.win || s.n == 0 {
+        return None;
+    }
+    let k = s.n - 1;
+    Some(((s.x[k] + s.w[k] / 2) as i32, (s.bar.1 + s.bar.3 / 2) as i32))
+}
+
+/// The centre of the open Window dropdown's row `id`, or `None` when it is not down / has no such row.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn wl_row_center(id: u32) -> Option<(i32, i32)> {
+    if !OPEN_WIN.load(Ordering::Relaxed) {
+        return None;
+    }
+    let (mx, my, mw, _mh) = open_rect(0, 0)?;
+    let items = super::winlist::rows();
+    let i = items.iter().position(|it| it.id == id)?;
+    Some(((mx + mw / 2) as i32, (my + item_top(items, i) + ITEM_H / 2) as i32))
 }

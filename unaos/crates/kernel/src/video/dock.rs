@@ -2942,7 +2942,7 @@ fn ext_rect(l: &Layout, mb: usize) -> (usize, usize, usize, usize) { (l.x, l.y -
 
 /// The open menu, placed in a band above the strip. `band` rows tall (menu + one PAD gap).
 #[derive(Clone, Copy)]
-struct MenuGeo { mx: usize, my: usize, mw: usize, mh: usize, band: usize, hover: usize, keep: bool }
+struct MenuGeo { mx: usize, my: usize, mw: usize, mh: usize, band: usize, hover: usize, keep: bool, rows: usize, owner: u64 }
 
 /// Geometry of the open menu over `rows`, clamped inside the strip's width; closes the menu when its
 /// tile no longer names the owner that opened it. `hover` is the row under the pointer (`MENU_ITEMS` =
@@ -2953,18 +2953,19 @@ fn menu_geo(l: &Layout, rows: &[wm::DockEntry], dims: Option<(usize, usize)>) ->
     if t >= rows.len() || rows[t].owner_asid != owner { MENU_OPEN.store(false, Ordering::Release); return None; }
     let (tx, _, _, _) = l.tile(t)?;
     let mw = (16 * CELL_W + 2 * PAD).min(l.w);
-    let mh = MENU_ITEMS * TILE_H;
+    let nrows = MENU_ITEMS + menu_win_rows(owner); // WINDOWLIST M3 — one extra row per window when the app has more than one
+    let mh = nrows * TILE_H;
     let band = mh + PAD;
     if l.y < band { return None; }
     let mx = tx.min(l.x + l.w - mw);
     let my = l.y - band;
-    let mut hover = MENU_ITEMS;
+    let mut hover = nrows;
     if let Some((pw, ph)) = dims {
         let (cx, cy) = crate::pal::cursor::pos(pw as i32, ph as i32);
         let (cx, cy) = (cx.max(0) as usize, cy.max(0) as usize);
         if cx >= mx && cx < mx + mw && cy >= my && cy < my + mh { hover = (cy - my) / TILE_H; }
     }
-    Some(MenuGeo { mx, my, mw, mh, band, hover, keep: is_kept(owner) })
+    Some(MenuGeo { mx, my, mw, mh, band, hover, keep: is_kept(owner), rows: nrows, owner })
 }
 
 /// Menu band row `j` (0 = top of the band) as logical colours into `out[0..l.w]`: the desktop where the
@@ -2982,7 +2983,8 @@ fn menu_row(out: &mut [u32], l: &Layout, g: Option<MenuGeo>, j: usize) {
     for i in 0..g.mw {
         out[bx + i] = if edge_row || i == 0 || i + 1 == g.mw { theme::FRAME_LINE } else { face };
     }
-    let label: &[u8] = if row == 0 { b"Quit" } else if g.keep { b"Remove from Dock" } else { b"Keep in Dock" };
+    let mut wbuf = [0u8; wm::MAX_TITLE];
+    let label: &[u8] = if row == 0 { b"Quit" } else if row == 1 { if g.keep { b"Remove from Dock" } else { b"Keep in Dock" } } else { let (_, n) = menu_win_row(g.owner, row - MENU_ITEMS, &mut wbuf); &wbuf[..n] }; // WINDOWLIST M3
     if sy0 >= 0 { super::font::draw_row(out, l.w, label, bx + PAD, sy0 as usize, ink, false, FACE); }
 }
 
@@ -3039,7 +3041,15 @@ pub fn menu_press(x: i32, y: i32) -> bool {
     let (px, py) = (x as usize, y as usize);
     if px < mx || px >= mx + mw || py < my || py >= my + mh { return false; }
     let owner = MENU_OWNER.load(Ordering::Relaxed);
-    if (py - my) / TILE_H == 0 {
+    let prow = (py - my) / TILE_H;
+    if prow >= MENU_ITEMS { // WINDOWLIST M3 — a per-window row raises and focuses that window
+        let mut wb = [0u8; wm::MAX_TITLE];
+        let (win, _) = menu_win_row(owner, prow - MENU_ITEMS, &mut wb);
+        let ok = win != wm::WIN_NONE && menu_win_focus(win);
+        serial_println!("[dock] menu window owner={:#x} win={} focused={}", owner, win, ok);
+        return true;
+    }
+    if prow == 0 {
         let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
         let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
         let win = rows[..n].iter().find(|r| r.owner_asid == owner).map(|r| r.id).unwrap_or(wm::WIN_NONE);
@@ -3413,3 +3423,35 @@ pub fn dockpin_selftest() {
     serial_println!(":: DOCKPIN: tiles={} pinned={} running={} loaded={} saved={} fixture parse={} toggle={} file={} -> {} ::",
         DP_PINS.len(), DP_ALL.count_ones(), 0, 5, bytes, parse_ok as u8, toggle_ok as u8, if skip { "skip" } else if file_ok { "ok" } else { "no" }, if ok { "PASS" } else { "FAIL" });
 }
+
+// WINDOWLIST M3 (R75) — TAIL-APPENDED. The running tile's menu lists the app's windows (one row each) when it has more than one.
+// `dock` is a bare `pub mod`, the window-list helpers exist only on the desktop families: the fallbacks list nothing.
+/// How many per-window rows `owner`'s tile menu gains: its live window count when that is two or more, else none.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn menu_win_rows(owner: u64) -> usize {
+    let mut wr = [wm::WlRow { id: 0, owner: 0, minimised: false, title: [0; wm::MAX_TITLE], len: 0 }; wm::MAX_WINDOWS];
+    let n = wm::wl_rows(&mut wr);
+    let c = wr[..n].iter().filter(|r| r.owner == owner).count();
+    if c >= 2 { c } else { 0 }
+}
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn menu_win_rows(_owner: u64) -> usize { 0 }
+
+/// The `k`-th window row of `owner`'s menu: its id and the label bytes (title) written into `buf`, returning `(id, len)`.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn menu_win_row(owner: u64, k: usize, buf: &mut [u8; wm::MAX_TITLE]) -> (wm::WinId, usize) {
+    let mut wr = [wm::WlRow { id: 0, owner: 0, minimised: false, title: [0; wm::MAX_TITLE], len: 0 }; wm::MAX_WINDOWS];
+    let n = wm::wl_rows(&mut wr);
+    match wr[..n].iter().filter(|r| r.owner == owner).nth(k) {
+        Some(r) => { buf[..r.len].copy_from_slice(&r.title[..r.len]); (r.id, r.len) }
+        None => (wm::WIN_NONE, 0),
+    }
+}
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn menu_win_row(_owner: u64, _k: usize, _buf: &mut [u8; wm::MAX_TITLE]) -> (wm::WinId, usize) { (wm::WIN_NONE, 0) }
+
+/// Raise and focus `win` (the cycle's own commit). `false` where the helper does not exist.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn menu_win_focus(win: wm::WinId) -> bool { wm::wl_focus(win) }
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn menu_win_focus(_win: wm::WinId) -> bool { false }
