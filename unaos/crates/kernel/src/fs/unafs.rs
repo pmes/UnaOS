@@ -1516,7 +1516,7 @@ pub fn k3_mount_selftest() {
             r |= 1 << 1;
         }
         // bit2: version + block size are the pinned format constants.
-        if fs.superblock.version == ::unafs::superblock::VERSION
+        if (::unafs::superblock::MIN_SUPPORTED_VERSION..=::unafs::superblock::VERSION).contains(&fs.superblock.version)
             && fs.superblock.block_size as u64 == ::unafs::BLOCK_SIZE
         {
             r |= 1 << 2;

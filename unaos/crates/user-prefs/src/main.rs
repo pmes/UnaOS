@@ -29,8 +29,8 @@
 // Syscall stubs — the user-pulse stubs verbatim (see that crate for the register-clobber contract).
 // ---------------------------------------------------------------------------------------------
 use una_abi::{
-    BUS_FRAME_MAX, BUS_HDR_LEN, BUS_KIND_REPLY, BUS_KIND_REQUEST, BUS_MAGIC, BUS_VERB_LS, BUS_VERB_PREF_GET,
-    BUS_VERB_PREF_LIST, BUS_VERB_REGISTER, BUS_VERSION, ENOENT, SYS_EXIT, SYS_MRECV, SYS_MSEND, SYS_WRITE,
+    BUS_FRAME_MAX, BUS_HDR_LEN, BUS_KIND_REPLY, BUS_KIND_REQUEST, BUS_MAGIC, BUS_VERB_LS, BUS_VERB_R3PREF_GET,
+    BUS_VERB_R3PREF_LIST, BUS_VERB_REGISTER, BUS_VERSION, ENOENT, SYS_EXIT, SYS_MRECV, SYS_MSEND, SYS_WRITE,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -274,7 +274,7 @@ fn serve(h: &Hdr) -> i32 {
     let mut out = [0u8; 512];
     let mut len = 0usize;
     let status: i32 = match h.verb {
-        BUS_VERB_PREF_GET => match TABLE.iter().find(|(k, _)| *k == body) {
+        BUS_VERB_R3PREF_GET => match TABLE.iter().find(|(k, _)| *k == body) {
             Some((_, v)) => {
                 out[..v.len()].copy_from_slice(v);
                 len = v.len();
@@ -282,7 +282,7 @@ fn serve(h: &Hdr) -> i32 {
             }
             None => ENOENT as i32,
         },
-        BUS_VERB_PREF_LIST => {
+        BUS_VERB_R3PREF_LIST => {
             for (k, v) in TABLE.iter().filter(|(k, _)| k.starts_with(body)) {
                 for part in [*k, b"=".as_slice(), *v, b"\n".as_slice()] {
                     if len + part.len() <= out.len() {
@@ -359,9 +359,9 @@ impl Line {
 pub extern "C" fn _start() -> ! {
     // 1. probe: no fulfiller yet -> -ENOENT, an answer and not a hang. (Knob off: the tag is refused at
     //    SYS_MSEND with -EINVAL, and the program says so and exits — nothing to serve.)
-    let probe = ask(BUS_VERB_PREF_GET, 1, b"ui.theme");
+    let probe = ask(BUS_VERB_R3PREF_GET, 1, b"ui.theme");
     // 2. register Principia's two read verbs.
-    let register = ask(BUS_VERB_REGISTER, 2, &[BUS_VERB_PREF_GET, BUS_VERB_PREF_LIST]);
+    let register = ask(BUS_VERB_REGISTER, 2, &[BUS_VERB_R3PREF_GET, BUS_VERB_R3PREF_LIST]);
     // 3. a kernel-owned verb cannot be taken over.
     let kernel_tag = ask(BUS_VERB_REGISTER, 3, &[BUS_VERB_LS]);
     // 4. self_get: the relayed request arrives here with a kernel stamp; answer it; read the answer.
@@ -369,10 +369,10 @@ pub extern "C" fn _start() -> ! {
     let mut stamp_kernel = false;
     let mut stamped_caller = false;
     if register == 0 {
-        let n = build(BUS_KIND_REQUEST, BUS_VERB_PREF_GET, 4, 0, b"ui.theme");
+        let n = build(BUS_KIND_REQUEST, BUS_VERB_R3PREF_GET, 4, 0, b"ui.theme");
         if send(n) == 0 {
             if let Some(h) = hdr(recv()) {
-                if h.kind == BUS_KIND_REQUEST && h.verb == BUS_VERB_PREF_GET {
+                if h.kind == BUS_KIND_REQUEST && h.verb == BUS_VERB_R3PREF_GET {
                     stamped_caller = rx()[16] != 0; // the kernel wrote the caller's principal
                     serve(&h);
                     if let Some(r) = hdr(recv()) {

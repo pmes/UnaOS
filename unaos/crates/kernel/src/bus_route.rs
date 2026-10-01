@@ -375,7 +375,7 @@ const GOLDEN_FUL_REPLY: &[u8] = &[
 pub fn codec_kats() -> u32 {
     let mut w = 0u32;
     let mut f = [0u8; 128];
-    let n = crate::bus::build_request(BUS_VERB_REGISTER, 1, &[una_abi::BUS_VERB_PREF_GET, una_abi::BUS_VERB_PREF_LIST], &mut f);
+    let n = crate::bus::build_request(BUS_VERB_REGISTER, 1, &[una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_LIST], &mut f);
     if &f[..n] == GOLDEN_REQ_REGISTER && matches!(crate::bus::frame_parse(&f[..n]), Ok(h) if h.verb == BUS_VERB_REGISTER && crate::bus::request_validate(&h).is_ok()) {
         w |= 1 << 0;
     }
@@ -383,7 +383,7 @@ pub fn codec_kats() -> u32 {
     prin[0] = 1;
     prin[1] = 15;
     prin[2..17].copy_from_slice(b"prog:MIDDEN.BIN");
-    let h = crate::bus::BusHdr { kind: crate::bus::BUS_KIND_REQUEST, verb: una_abi::BUS_VERB_PREF_GET, corr: 5, status: 0, principal: prin, body_len: 8 };
+    let h = crate::bus::BusHdr { kind: crate::bus::BUS_KIND_REQUEST, verb: una_abi::BUS_VERB_R3PREF_GET, corr: 5, status: 0, principal: prin, body_len: 8 };
     let mut g = [0u8; 128];
     crate::bus::hdr_write(&h, &mut g);
     g[52..60].copy_from_slice(b"ui.theme");
@@ -392,7 +392,7 @@ pub fn codec_kats() -> u32 {
         w |= 1 << 1;
     }
     let mut r = [0u8; 128];
-    let rn = crate::bus::build_reply(una_abi::BUS_VERB_PREF_GET, 5, 0, [0u8; 32], b"dark", &mut r);
+    let rn = crate::bus::build_reply(una_abi::BUS_VERB_R3PREF_GET, 5, 0, [0u8; 32], b"dark", &mut r);
     if &r[..rn] == GOLDEN_FUL_REPLY && matches!(crate::bus::frame_parse(&r[..rn]), Ok(p) if p.kind == crate::bus::BUS_KIND_REPLY && p.corr == 5) {
         w |= 1 << 2;
     }
@@ -427,8 +427,8 @@ pub fn selftest(fx: &Fixture) {
     }
     // The verb pair: Principia's GET/LIST when no live fulfiller owns them (the normal case), else the
     // top two registrable tags, so a running PREFS.BIN is never displaced by the fixture.
-    let (vg, vl) = if lookup(fx.ops, una_abi::BUS_VERB_PREF_GET).is_none() && lookup(fx.ops, una_abi::BUS_VERB_PREF_LIST).is_none() {
-        (una_abi::BUS_VERB_PREF_GET, una_abi::BUS_VERB_PREF_LIST)
+    let (vg, vl) = if lookup(fx.ops, una_abi::BUS_VERB_R3PREF_GET).is_none() && lookup(fx.ops, una_abi::BUS_VERB_R3PREF_LIST).is_none() {
+        (una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_LIST)
     } else {
         (254u8, 255u8)
     };

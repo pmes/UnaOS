@@ -801,15 +801,14 @@ mod appmenu_tests {
 // GET `<ns>.<key>` -> reply body = the literal, -ENOENT unset; SET `<ns>.<key>` NUL `<literal>` -> empty,
 // -EACCES unless the caller runs in the open session; LIST `<ns>` or empty -> `<ns>.<key> = <literal>\n` lines.
 // ===================================================================================/// Bus verb: read one preference.
-pub const BUS_VERB_PREF_GET: u8 = 11;
+pub const BUS_VERB_PREF_GET: u8 = 16;
 /// Bus verb: set one preference (session user only).
-pub const BUS_VERB_PREF_SET: u8 = 12;
+pub const BUS_VERB_PREF_SET: u8 = 17;
 /// Bus verb: list a namespace (or every namespace).
-pub const BUS_VERB_PREF_LIST: u8 = 13;
+pub const BUS_VERB_PREF_LIST: u8 = 18;
 /// RESERVED for BANDY-3: the unsolicited PrefChanged frame (kind REPLY, corr 0, body = the SET body).
 /// Not admitted by `verb_valid` until interest registration exists to deliver it.
-pub const BUS_VERB_PREF_CHANGED: u8 = 14;
-=======
+pub const BUS_VERB_PREF_CHANGED: u8 = 19;
 // BANDY3 (ROADMAP §3b, the fulfiller seam) — fulfiller registration on the wire. A ring-3 program
 // registers the verb tags it fulfils; the kernel relays a caller's request to it re-stamped with the
 // CALLER's principal (the kernel's stamp, never the caller's claim) and relays the fulfiller's answer
@@ -828,11 +827,12 @@ pub const BUS_VERB_REGISTER: u8 = 127;
 pub const BUS_VERB_FULFIL_MIN: u8 = 128;
 /// Registrations one row may hold.
 pub const BUS_REG_MAX_PER_ROW: usize = 8;
-/// Principia's preference read: body = the dotted key bytes; reply body = the value text. Read-only in
-/// v1. The PREFS arc names the same verb; the numbers reconcile at the fold.
-pub const BUS_VERB_PREF_GET: u8 = 128;
+/// The ring-3 fulfiller DEMO pair (BANDY3): a preference read answered by `PREFS.BIN` from the registrable
+/// range. Principia's real verbs are the kernel-fulfilled `BUS_VERB_PREF_*` (16..=19, PREFS); this pair
+/// proves registration and relay, and retires when a ring-3 Principia takes the real tags over.
+pub const BUS_VERB_R3PREF_GET: u8 = 128;
 /// Principia's preference listing: body = a key prefix (may be empty); reply body = `key=value\n` lines.
-pub const BUS_VERB_PREF_LIST: u8 = 129;
+pub const BUS_VERB_R3PREF_LIST: u8 = 129;
 
 /// File exists — and, on the bus, "that verb already has a fulfiller" (the kernel, or another live row).
 pub const EEXIST: i64 = -17;
@@ -843,7 +843,7 @@ pub const ECONNRESET: i64 = -104;
 
 const _: () = assert!(BUS_VERB_REGISTER < BUS_VERB_FULFIL_MIN);
 const _: () = assert!(BUS_VERB_NOTICE < BUS_VERB_REGISTER && BUS_VERB_MENU_GET < BUS_VERB_REGISTER);
-const _: () = assert!(BUS_VERB_PREF_GET >= BUS_VERB_FULFIL_MIN && BUS_VERB_PREF_LIST >= BUS_VERB_FULFIL_MIN);
+const _: () = assert!(BUS_VERB_R3PREF_GET >= BUS_VERB_FULFIL_MIN && BUS_VERB_R3PREF_LIST >= BUS_VERB_FULFIL_MIN);
 const _: () = assert!(BUS_REG_MAX_PER_ROW <= u8::MAX as usize);
 
 #[cfg(test)]
@@ -857,11 +857,10 @@ mod bandy3_tests {
             assert!(v < BUS_VERB_REGISTER);
         }
         assert_eq!(BUS_VERB_FULFIL_MIN, BUS_VERB_REGISTER + 1);
-        assert_ne!(BUS_VERB_PREF_GET, BUS_VERB_PREF_LIST);
+        assert_ne!(BUS_VERB_R3PREF_GET, BUS_VERB_R3PREF_LIST);
         // A full registration body fits a frame with room.
         assert!(BUS_REG_MAX_PER_ROW < BUS_BODY_MAX);
-        std::println!(":: BANDY3: abi register={} fulfil_min={} pref_get={} pref_list={} max_per_row={} -> PASS ::", BUS_VERB_REGISTER, BUS_VERB_FULFIL_MIN, BUS_VERB_PREF_GET, BUS_VERB_PREF_LIST, BUS_REG_MAX_PER_ROW);
-=======
+        std::println!(":: BANDY3: abi register={} fulfil_min={} pref_get={} pref_list={} max_per_row={} -> PASS ::", BUS_VERB_REGISTER, BUS_VERB_FULFIL_MIN, BUS_VERB_R3PREF_GET, BUS_VERB_R3PREF_LIST, BUS_REG_MAX_PER_ROW);
 // ATTRSURF (B299) — the typed-attribute surface: five syscalls, five bus verbs, ONE byte layout.
 //
 // The syscall inputs ARE the bus request bodies and the syscall outputs ARE the bus reply bodies, so
