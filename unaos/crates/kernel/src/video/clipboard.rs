@@ -364,8 +364,7 @@ pub fn terminal_action_in(
         | Action::Deselect => ("ok", if !sel.apply(act, line.len()) { 0 } else if scroll { 2 } else { 1 }),
         // Not this consumer's business: the capture actions are delivered and acted on at the
         // decoder (`Action::is_capture`), and `LogOut` is KEYMAP's slot, bound by nobody.
-        Action::Screenshot | Action::ScreenshotRegion | Action::LogOut | Action::BrightnessDown | Action::BrightnessUp | Action::CycleWindow | Action::LockScreen | Action::ShowShortcuts | Action::ScrollPageUp | Action::ScrollPageDown | Action::ScrollTop | Action::ScrollBottom | Action::SnapLeft | Action::SnapRight | Action::SnapZoom | Action::SnapRestore | Action::ScreenshotWindow => ("ignored", 0),
-        Action::Screenshot | Action::ScreenshotRegion | Action::LogOut | Action::BrightnessDown | Action::BrightnessUp | Action::CycleWindow | Action::LockScreen | Action::WinNudgeLeft | Action::WinNudgeRight | Action::WinNudgeUp | Action::WinNudgeDown | Action::WinSizeLeft | Action::WinSizeRight | Action::WinSizeUp | Action::WinSizeDown => ("ignored", 0),
+        Action::Screenshot | Action::ScreenshotRegion | Action::LogOut | Action::BrightnessDown | Action::BrightnessUp | Action::CycleWindow | Action::LockScreen | Action::ShowShortcuts | Action::ScrollPageUp | Action::ScrollPageDown | Action::ScrollTop | Action::ScrollBottom | Action::SnapLeft | Action::SnapRight | Action::SnapZoom | Action::SnapRestore | Action::ScreenshotWindow | Action::WinNudgeLeft | Action::WinNudgeRight | Action::WinNudgeUp | Action::WinNudgeDown | Action::WinSizeLeft | Action::WinSizeRight | Action::WinSizeUp | Action::WinSizeDown => ("ignored", 0),
         // TERMSEL2 M3 — the caret (`LineSel::caret_action`).
         Action::CursorLeft | Action::CursorRight | Action::CursorLineStart | Action::CursorLineEnd => {
             ("ok", sel.caret_action(act, line.len()))
@@ -412,14 +411,14 @@ pub const fn action_code(a: Action) -> u64 {
         Action::SnapRight => 27,
         Action::SnapZoom => 28,
         Action::SnapRestore => 29,
-        Action::WinNudgeLeft => 21,
-        Action::WinNudgeRight => 22,
-        Action::WinNudgeUp => 23,
-        Action::WinNudgeDown => 24,
-        Action::WinSizeLeft => 25,
-        Action::WinSizeRight => 26,
-        Action::WinSizeUp => 27,
-        Action::WinSizeDown => 28,
+        Action::WinNudgeLeft => 31,
+        Action::WinNudgeRight => 32,
+        Action::WinNudgeUp => 33,
+        Action::WinNudgeDown => 34,
+        Action::WinSizeLeft => 35,
+        Action::WinSizeRight => 36,
+        Action::WinSizeUp => 37,
+        Action::WinSizeDown => 38,
     }
 }
 

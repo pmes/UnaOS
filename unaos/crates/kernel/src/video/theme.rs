@@ -557,7 +557,7 @@ use super::keymap::{Action, Binding, Table, ALT, CMD, CTRL, SHIFT};
 /// would otherwise shadow them (the `no_shadow` check at the foot of this block refuses the other
 /// order at compile time) — and `Shift+Home`/`Shift+End` as well, because the rMBP's internal
 /// keyboard has no Home or End key but an external one on the same desktop does.
-pub static CRISPY_ROWS: [Binding; 43] = [
+pub static CRISPY_ROWS: [Binding; 51] = [
     // WINSNAP — window snapping. Written ABOVE every row on the arrow usages: `no_shadow` refuses the other order (bare `⌘←` is CursorLineStart).
     Binding { roles: CMD | ALT, usage: 0x50, action: Action::SnapLeft, token: "cmd-alt-left" },
     Binding { roles: CMD | ALT, usage: 0x4F, action: Action::SnapRight, token: "cmd-alt-right" },
@@ -567,7 +567,6 @@ pub static CRISPY_ROWS: [Binding; 43] = [
     Binding { roles: CTRL | ALT, usage: 0x4F, action: Action::SnapRight, token: "ctrl-alt-right" },
     Binding { roles: CTRL | ALT, usage: 0x52, action: Action::SnapZoom, token: "ctrl-alt-up" },
     Binding { roles: CTRL | ALT, usage: 0x51, action: Action::SnapRestore, token: "ctrl-alt-down" },
-pub static CRISPY_ROWS: [Binding; 35] = [
     // WINRESIZE (R75) — Ctrl+arrow nudges the focused window, Ctrl+Shift+arrow resizes it. FIRST in the
     // table: the Shift row is above the Ctrl row on every usage (`no_shadow`), and both are above the
     // bare caret/select rows on the same usages, which they take over while Ctrl is held.
@@ -654,13 +653,12 @@ pub static CRISPY_BINDINGS: &Table = &Table {
 /// The rows are the SAME rows in role space. What differs is one field — `cmd_role` — plus the
 /// keyboard the operator is typing on: `Alt+C` is copy on a PC because R61 says the Command role
 /// moves to Alt there, not because a second Copy row was written.
-pub static PC_ROWS: [Binding; 26] = [
+pub static PC_ROWS: [Binding; 33] = [
     // WINSNAP — window snapping. Written ABOVE every row on the arrow usages: `no_shadow` refuses the other order (bare `⌘←` is CursorLineStart).
     Binding { roles: CTRL | ALT, usage: 0x50, action: Action::SnapLeft, token: "ctrl-alt-left" },
     Binding { roles: CTRL | ALT, usage: 0x4F, action: Action::SnapRight, token: "ctrl-alt-right" },
     Binding { roles: CTRL | ALT, usage: 0x52, action: Action::SnapZoom, token: "ctrl-alt-up" },
     Binding { roles: CTRL | ALT, usage: 0x51, action: Action::SnapRestore, token: "ctrl-alt-down" },
-pub static PC_ROWS: [Binding; 25] = [
     // WINRESIZE (R75) — Ctrl+arrow nudges the focused window, Ctrl+Shift+arrow resizes it. FIRST in the
     // table: the Shift row is above the Ctrl row on every usage (`no_shadow`), and both are above the
     // bare caret/select rows on the same usages, which they take over while Ctrl is held.
@@ -682,7 +680,6 @@ pub static PC_ROWS: [Binding; 25] = [
     Binding { roles: SHIFT, usage: 0x4E, action: Action::ScrollPageDown, token: "shift-pgdn" },
     Binding { roles: CTRL, usage: 0x4A, action: Action::ScrollTop, token: "ctrl-home" },
     Binding { roles: CTRL, usage: 0x4D, action: Action::ScrollBottom, token: "ctrl-end" },
-    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: "alt-tab" }, // WINCYCLE — Alt is the PC's cmd role
     Binding { roles: CMD, usage: 0x06, action: Action::Copy, token: "alt-c" },
     Binding { roles: CMD, usage: 0x19, action: Action::Paste, token: "alt-v" },
     Binding { roles: CMD, usage: 0x1B, action: Action::Cut, token: "alt-x" },
