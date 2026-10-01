@@ -3426,7 +3426,7 @@ impl AttrValue {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     fn into_native(self) -> ::unafs::inode::AttributeValue {
         use ::unafs::inode::AttributeValue as N;
         match self {
@@ -3438,7 +3438,7 @@ impl AttrValue {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     fn from_native(v: ::unafs::inode::AttributeValue) -> AttrValue {
         use ::unafs::inode::AttributeValue as N;
         match v {
@@ -3475,7 +3475,7 @@ pub fn attr_key_reserved(key: &str) -> bool {
     key == "owner" || key.starts_with("grants:")
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn attr_key_guard(key: &str, principal: &str) -> Result<(), VfsError> {
     if key.is_empty() || key.len() > 255 {
         return Err(VfsError::Backend("bad-key"));
@@ -3487,7 +3487,7 @@ fn attr_key_guard(key: &str, principal: &str) -> Result<(), VfsError> {
 }
 
 /// The native READ gate for a resolved inode — `unafs::read_authz`, the SYS_OPEN evaluator.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn native_read_gate(fs: &mut crate::fs::unafs::KernelUnaFS, id: u64, principal: &str) -> Result<(), VfsError> {
     match crate::fs::unafs::read_authz(fs, id, principal) {
         crate::fs::unafs::ReadAuthz::Permit => Ok(()),
@@ -3503,7 +3503,7 @@ fn native_read_gate(fs: &mut crate::fs::unafs::KernelUnaFS, id: u64, principal: 
 /// An id the walk cannot reach (unlinked but still catalogued, or past a bound) has no path and is
 /// dropped. F3F4 changes the crate's `query` to return `(inode_id, path)`; at that fold this
 /// function goes and `NativeBackend::query` maps the crate's pairs directly.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
 fn native_query_paths(fs: &mut crate::fs::unafs::KernelUnaFS, ids: &[u64]) -> Vec<(u64, String)> {
     const QWALK_NODES: usize = 16_384;
     const QWALK_DEPTH: usize = 32;

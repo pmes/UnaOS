@@ -29887,7 +29887,6 @@ static BUSREG_FX: crate::bus_route::Fixture = crate::bus_route::Fixture {
 pub fn bandy3_selftest() {
     busx_sem_init_once();
     crate::bus_route::selftest(&BUSREG_FX);
-=======
 // =================================================================================================
 // ATTRSURF (B299) — the attribute syscalls, x86 arm. The body is `fs::attrsys::syscall_fulfil`, shared
 // with aarch64 and with both bus arms; this arm only copies in, names the caller, and copies out.
