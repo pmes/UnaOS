@@ -34,6 +34,7 @@ fn main() {
         .arg("-Z").arg("build-std=core,compiler_builtins,alloc")
         .arg("-Z").arg("build-std-features=compiler-builtins-mem")
         .arg("-Z").arg("json-target-spec");
+    // RTCCLOCK: UNAOS_TZ_MIN is an `option_env!` value knob read by clock.rs — no cargo feature, nothing to push here.
     // Optional kernel features from env knobs: UNAOS_SKIP_XHCI=1 (disable xHCI/USB bring-up),
     // UNAOS_BOOTLOG=1 (hold the boot log on screen instead of the GUI), UNAOS_USBDEBUG=1 (run the
     // USB main loop but keep the boot log on screen + print input events), UNAOS_PI=1 (Pi 4,
@@ -60,6 +61,7 @@ fn main() {
     // witness at all. Kept in sync with arroyo.
     if std::env::var("UNAOS_SELFHOST").is_ok() { feats.push("selfhost"); }
     if std::env::var("UNAOS_SKIP_XHCI").is_ok() { feats.push("skip_xhci"); }
+    if std::env::var("UNAOS_LOWBAT_SHUTDOWN").is_ok() { feats.push("lowbat_shutdown"); } // POWERMENU M3
     if std::env::var("UNAOS_BOOTLOG").is_ok() { feats.push("bootlog"); }
     // CLOCK-2: UNAOS_LOGTS=1 arms `logts` — a compact per-line timestamp prefix (monotonic ms → UTC
     // after a civil anchor) on the UART and both capture transports (FTDI capture ring, UNAOS.LOG).
@@ -308,6 +310,16 @@ fn main() {
     // Default OFF => no ATA write opcode is linked (`WRITE-DMA-EXT-0x35` is 0 hits on the ELF) and
     // media are byte-identical. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
     if std::env::var("UNAOS_AHCI_WRITE").is_ok() { feats.push("ahci-write"); }
+    // SELFINSTALL M3 (SH-3): UNAOS_ROOT_PREFER=ahci|sdhc picks the bootdisk root when both the card and the SSD carry
+    // UnaOS (cargo features root-prefer-ahci / root-prefer-sdhc). Default OFF => first-found. Kept in sync with arroyo.
+    match std::env::var("UNAOS_ROOT_PREFER").as_deref() {
+        Ok("ahci") => feats.push("root-prefer-ahci"),
+        Ok("sdhc") => feats.push("root-prefer-sdhc"),
+        _ => {}
+    }
+    // UNAFSX86 (rmbp-ledger B298): UNAOS_UNAFS=1 compiles the native UnaFS volume into the x86 kernel so a boot
+    // disk carrying a UnaFS partition roots on it. Default OFF => byte-identical. Kept in sync with arroyo's mapping.
+    if std::env::var("UNAOS_UNAFS").is_ok() { feats.push("unafs"); }
     // HDA (rmbp-ledger B127, arc 1): UNAOS_HDA=1 arms drivers/hda.rs — the High Definition Audio
     // controller, the kernel's first audio line. THIS list is what reaches the kernel binary for
     // MEDIA builds and for every QEMU run that goes through this builder: the builder re-derives
@@ -718,6 +730,10 @@ fn main() {
     // media, so the knob must be mapped here too (arroyo's own list only covers non-media paths —
     // that asymmetry is why s42 shipped without the dialog).
     if std::env::var("UNAOS_INSTGUI").is_ok() { feats.push("instgui"); }
+    // LINUXABI: UNAOS_LINUXABI=1 arms the Linux x86_64 syscall-compat layer. Kept in sync with arroyo and banner-cert.sh.
+    if std::env::var("UNAOS_LINUXABI").is_ok() { feats.push("linuxabi"); }
+    // BANDY3: UNAOS_BUSREG=1 arms fulfiller registration on the bus wire. Kept in sync with arroyo.
+    if std::env::var("UNAOS_BUSREG").is_ok() { feats.push("busreg"); }
     // WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` last-words
     // breadcrumbs along the focus-raise/composite chain (x86: bare 16550 at 0x3F8, no lock). Media
     // builds come from THIS list, not arroyo's (the s42/INSTGUI lesson), so the knob is mapped here
@@ -922,6 +938,11 @@ fn main() {
         // `m` key cycles its three historical screens. Same reasoning as the pins: no argv, so the only
         // channel a mode set can travel down is a distinct image with a distinct 8.3 name.
         ("VUGK-X86.ELF", "VUGK.ELF"),
+        // LINUXABI: the hand-assembled static Linux x86_64 fixture (crates/user-linux-hello) — `linux /apps/HELLO.LNX`, `tests linuxabi`.
+        ("HELLO.LNX", "HELLO.LNX"),
+        // LINUXABI2: the fork/pipe and stdin/getdents64 fixtures (same generator) — `tests linuxabi2`.
+        ("PIPE.LNX", "PIPE.LNX"),
+        ("LS.LNX", "LS.LNX"),
     ] {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {
@@ -941,6 +962,17 @@ fn main() {
         println!("   PULSE: copied PULSE.ELF into APPS/ on the ESP (bg /apps/PULSE.ELF)");
     } else {
         println!("   PULSE: target/PULSE-X86.ELF absent — ESP has no PULSE.ELF (run via ./arroyo esp-x86)");
+    }
+
+    // BANDY3 M3: the first ring-3 FULFILLER (crates/user-prefs, built by arroyo's build_user_prefs_x86 to
+    // target/PREFS-X86.ELF), staged as APPS/PREFS.BIN beside PULSE.ELF — `bg /apps/PREFS.BIN` registers
+    // Principia's PrefGet/PrefList bus verbs (UNAOS_BUSREG=1) and serves them.
+    let prefs_elf = target_dir.join("PREFS-X86.ELF");
+    if prefs_elf.exists() {
+        std::fs::copy(&prefs_elf, esp_apps.join("PREFS.BIN")).unwrap();
+        println!("   PREFS: copied PREFS.BIN into APPS/ on the ESP (bg /apps/PREFS.BIN)");
+    } else {
+        println!("   PREFS: target/PREFS-X86.ELF absent — ESP has no PREFS.BIN (run via ./arroyo esp-x86)");
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1000,6 +1032,8 @@ fn main() {
         // /apps/VUGK.ELF` must reach the volume the kernel actually reads.
         (target_dir.join("VUGK-X86.ELF"), "VUGK.ELF"),
         (target_dir.join("PULSE-X86.ELF"), "PULSE.ELF"),
+        // BANDY3 M3: the prefs fulfiller rides the DATA volume too — `bg /apps/PREFS.BIN` reads it there.
+        (target_dir.join("PREFS-X86.ELF"), "PREFS.BIN"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();

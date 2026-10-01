@@ -1,0 +1,32 @@
+# UnaOS preferences — written by the principia handler.
+# One table per namespace; dotted keys are expanded into sub-tables.
+# Hand edits are read on next load (live reload is not implemented yet).
+
+[aether]
+apos = "it's"
+ctl = "a\tb\u0007"
+homepage = "https://una.os/"
+lines = """
+a
+b"""
+quote = 'say "hi" \ there'
+uni = "héllo — ok"
+
+[aether.window]
+height = -800
+width = 1280
+
+[aether.window.deep]
+on = true
+
+[system.audio]
+mute = false
+
+[system.display]
+big = 100000000000000000000.0
+brightness = 12
+gamma = 0.00000015
+scale = 2.0
+
+[system.dock]
+pins = "console,shell,quarry"

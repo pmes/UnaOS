@@ -128,6 +128,12 @@ fn build_header(
 /// Write a full GPT (protective MBR + primary/backup headers + entry array) with an ESP and a data
 /// partition, then re-read and re-validate everything. Returns the ESP/data layout on success.
 pub fn write_gpt<T: InstallTarget>(t: &mut T) -> Result<GptLayout, InstallError> {
+    write_gpt_sized(t, 64 * 1024 * 1024 / SECTOR as u64, true)
+}
+
+/// SELFINSTALL: [`write_gpt`] with the ESP size and the data partition made parameters. `write_gpt` is
+/// this with its historical 64 MiB + data; the self-install writes ONE bigger ESP and no data partition.
+pub fn write_gpt_sized<T: InstallTarget>(t: &mut T, esp_target: u64, with_data: bool) -> Result<GptLayout, InstallError> {
     let total_sectors = t.capacity_sectors();
     // Need room for: primary GPT (34 sectors) + ESP + backup array + backup header, with the ESP
     // large enough to format FAT32. Refuse a disk too small to hold a meaningful layout.
@@ -142,19 +148,19 @@ pub fn write_gpt<T: InstallTarget>(t: &mut T) -> Result<GptLayout, InstallError>
 
     // ESP: from ESP_LBA_START, sized to the smaller of 64 MiB or half the usable tail, but at least
     // the FAT32 floor (~34 MiB with 512-byte, 1-sector clusters). The data partition takes the rest.
-    const ESP_TARGET: u64 = 64 * 1024 * 1024 / SECTOR as u64; // 131072 sectors = 64 MiB
+    let esp_target_sectors: u64 = esp_target;
     const ESP_MIN: u64 = 40 * 1024 * 1024 / SECTOR as u64; // comfortably above the FAT32 floor
     let usable_tail = last_usable - ESP_LBA_START + 1;
     if usable_tail < ESP_MIN + 1 {
         return Err(InstallError::TooSmall);
     }
-    let esp_sectors = core::cmp::min(ESP_TARGET, usable_tail - 1); // leave >=1 sector for data
+    let esp_sectors = core::cmp::min(esp_target_sectors, if with_data { usable_tail - 1 } else { usable_tail }); // leave >=1 sector for data
     let esp_first = ESP_LBA_START;
     let esp_last = esp_first + esp_sectors - 1;
 
     // Data partition: 1 MiB-aligned start after the ESP, through last_usable.
     let data_aligned = (esp_last + 1 + 2047) & !2047;
-    let (data_first_out, data_last_out) = if data_aligned <= last_usable {
+    let (data_first_out, data_last_out) = if with_data && data_aligned <= last_usable {
         (data_aligned, last_usable)
     } else {
         (0, 0)

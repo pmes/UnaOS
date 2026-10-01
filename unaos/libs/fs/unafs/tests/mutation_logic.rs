@@ -102,7 +102,7 @@ fn unlink_removes_name_and_every_query_path() {
     assert_eq!(sid, survivor_id);
     let results = fs.query("emotion == \"steady\"").unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].0.id, survivor_id);
+    assert_eq!(results[0].inode_id, survivor_id);
 }
 
 #[test]
@@ -226,7 +226,7 @@ fn rename_same_directory_old_gone_new_found_content_identical() {
     // Catalog consistent: the query still returns exactly this inode.
     let results = fs.query("state == \"polished\"").unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].0.id, file_id);
+    assert_eq!(results[0].inode_id, file_id);
 
     // A pure rename allocates nothing net (directory rewrite nets to zero).
     assert_eq!(fs.free_blocks(), free_before);
@@ -268,7 +268,7 @@ fn rename_cross_directory_moves_the_entry() {
     assert_eq!(fs.read_data(file_id, 0, inode.size).unwrap(), b"move me");
     let results = fs.query("kind == \"memo\"").unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].0.id, file_id);
+    assert_eq!(results[0].inode_id, file_id);
 }
 
 #[test]
@@ -424,7 +424,7 @@ fn remove_attribute_inline_query_misses_others_intact() {
     );
     let results = fs.query("priority == 7").unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].0.id, file_id);
+    assert_eq!(results[0].inode_id, file_id);
 
     // Removing it again is AttributeNotFound.
     assert!(matches!(
@@ -554,7 +554,7 @@ fn mutated_volume_remounts_clean() {
     assert!(fs2.query("state == \"junk\"").unwrap().is_empty());
     let results = fs2.query("state == \"final\"").unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].0.id, keep_id);
+    assert_eq!(results[0].inode_id, keep_id);
 }
 
 #[test]

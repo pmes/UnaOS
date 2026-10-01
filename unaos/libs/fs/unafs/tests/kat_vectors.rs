@@ -91,7 +91,8 @@ fn kat_superblock_v5() {
     // pre-v5 reader misreading a two-level refmap index. (A v5 volume of
     // ≤ 2 GiB keeps the single-level index, so its every OTHER byte matches
     // what v4 would have written.)
-    let sb = Superblock::new(4096);
+    let mut sb = Superblock::new(4096);
+    sb.version = 5; // the v5 golden is KEPT: v6 moved only this byte again
     kat(
         &sb,
         "554e4146530500000000100000001000000000000001000000000000000200000000000000",
@@ -100,11 +101,26 @@ fn kat_superblock_v5() {
     assert_eq!(sb.to_bytes().unwrap(), enc(&sb));
 
     // Boundary flavor: the largest representable volume.
-    let sb_b = Superblock::new(u64::MAX / 4096);
+    let mut sb_b = Superblock::new(u64::MAX / 4096);
+    sb_b.version = 5;
     kat(
         &sb_b,
         "554e4146530500000000100000ffffffffffff0f0001000000000000000200000000000000",
     );
+}
+
+/// v6 (B302): the indexed-catalog + inode-meta-trailer bump. Again ONLY the
+/// version byte moves (05 → 06); the superblock layout is unchanged.
+#[test]
+fn kat_superblock_v6() {
+    let sb = Superblock::new(4096);
+    assert_eq!(sb.version, 6);
+    kat(
+        &sb,
+        "554e4146530600000000100000001000000000000001000000000000000200000000000000",
+    );
+    assert_eq!(sb.to_bytes().unwrap(), enc(&sb));
+    assert!(sb.indexed());
 }
 
 /// THE root-fits-one-sector KAT (brief §1): the packed root record is a
@@ -297,4 +313,66 @@ fn kat_direntry() {
     assert_eq!(enc(&empty), h("0000000000000000"));
     let decoded: Vec<DirEntry> = dec(&h("0000000000000000"));
     assert_eq!(decoded, empty);
+}
+
+// =============================================================================
+// v6 (B302) records: the catalog record, the index keys, the inode meta trailer
+// =============================================================================
+
+/// The 40 B catalog record (the v6 catalog inode's whole data): magic, the
+/// two tree roots, the entry count, FNV-1a over the first 32 bytes.
+#[test]
+fn kat_catalog_record_v6() {
+    use unafs::index::{CATALOG_RECORD_SIZE, CatalogRecord};
+    let rec = CatalogRecord { eq_root: 0x10, ord_root: 0x11, entries: 3 };
+    let golden = h("554e4146534358311000000000000000110000000000000003000000000000000223f12885d7c624");
+    assert_eq!(golden.len(), CATALOG_RECORD_SIZE);
+    assert_eq!(rec.to_bytes().to_vec(), golden);
+    assert_eq!(CatalogRecord::from_bytes(&golden, 1 << 20), Some(rec));
+}
+
+/// The equality- and ordered-tree keys: their byte order IS the query order,
+/// so these encodings are format, exactly like a record layout.
+#[test]
+fn kat_index_keys_v6() {
+    use unafs::index::IndexFact;
+    let eq = IndexFact::new("kind", &AttributeValue::String("doc".into()), 42).eq_key();
+    assert_eq!(eq.to_vec(), h("ef9c96d721673243caaf3f18f4747fb5000000000000002a"));
+
+    let ord = |v: AttributeValue| IndexFact::new("n", &v, 7).ord_key().unwrap();
+    // key_hash("n") ‖ tag ‖ ordered bytes ‖ inode id 7
+    assert_eq!(ord(AttributeValue::Int(-1)), h("af63e34c8601f871017fffffffffffffff0000000000000007"));
+    assert_eq!(ord(AttributeValue::Int(5)), h("af63e34c8601f8710180000000000000050000000000000007"));
+    assert_eq!(ord(AttributeValue::Float(-0.5)), h("af63e34c8601f87102401fffffffffffff0000000000000007"));
+    assert_eq!(ord(AttributeValue::Float(2.0)), h("af63e34c8601f87102c0000000000000000000000000000007"));
+    // NUL escaped 00 FF; exact strings end 00 00.
+    assert_eq!(ord(AttributeValue::String("a\0b".into())), h("af63e34c8601f871036100ff6200000000000000000007"));
+    // Past the 96 B cap: truncated, spill marker 00 01.
+    let golden_spill = format!("af63e34c8601f87103{}00010000000000000007", "7a".repeat(96));
+    assert_eq!(ord(AttributeValue::String("z".repeat(100))), h(&golden_spill));
+    // Equality-only types have no ordered key.
+    assert!(IndexFact::new("n", &AttributeValue::Blob(vec![1]), 7).ord_key().is_none());
+    assert!(IndexFact::new("n", &AttributeValue::Vector(vec![1.0]), 7).ord_key().is_none());
+}
+
+/// The inode META TRAILER (parent, ctime, mtime, atime, name) that follows a
+/// v6 inode's unchanged bincode bytes.
+#[test]
+fn kat_inode_meta_trailer_v6() {
+    let mut i = Inode::new(9, FileKind::File);
+    i.parent = 1;
+    i.name = Some("ab".into());
+    i.ctime = 1;
+    i.mtime = 2;
+    i.atime = 3;
+    let golden = h("554e4146534d5431010000000000000001000000000000000200000000000000030000000000000002006162");
+    assert_eq!(i.meta_bytes(), golden);
+    let mut back = Inode::new(9, FileKind::File);
+    assert_eq!(back.apply_meta(&golden).unwrap(), Some(golden.len()));
+    assert_eq!((back.parent, back.name.as_deref(), back.ctime, back.mtime, back.atime), (1, Some("ab"), 1, 2, 3));
+    // No name stored: length sentinel FFFF.
+    i.name = None;
+    assert_eq!(i.meta_bytes(), h("554e4146534d54310100000000000000010000000000000002000000000000000300000000000000ffff"));
+    // The trailer never changes the inode's own encoding (serde-skipped).
+    assert_eq!(enc(&i), enc(&Inode::new(9, FileKind::File)));
 }

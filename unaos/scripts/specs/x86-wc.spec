@@ -40,6 +40,8 @@
 
 # --- the ladder reached the compositor witnesses and they held --------------------------------
 REQUIRE \[wm-act\] direct .* -> PASS
+# WINRESIZE (R75) — `tests winresize`: eight frame zones, a routed corner drag, the panel/min clamps, Shift aspect and the Ctrl-arrow keys.
+REQUIRE :: WINRESIZE: zones=8 .* -> PASS ::
 REQUIRE \[clickroute\] route .* -> PASS
 
 # --- PTRDEAD (SELFTEST-RACE, 2026-08-27) ------------------------------------------------------
@@ -138,6 +140,12 @@ FORBID :: STRIPVAC-DEBT: .* -> FAIL ::
 # --- `refuse(..)` reverted to a bare `.report()` (counted=0). SKIP is honest only mid-slice.
 REQUIRE :: PRTSCR-REFUSE: inflight door -> named=1 counted=1 slicing=0 -> PASS ::
 FORBID :: PRTSCR-REFUSE: .* -> FAIL ::
+# --- SHOTREGION (R75): `tests shotregion` drives the selection through the router seam (chord via `wc_route_event`,
+# --- press/drag/release via `route_at`, Esc via the router) and asserts the armed rect, then writes it. Reds by
+# --- `Action::is_capture` still claiming the region chord (the decoder arms a panel capture and the mode never opens)
+# --- or by `shotsel::route` dropped from `wc_route_event`. The file legs read `written` or `refused` (no volume/session).
+REQUIRE :: SHOTREGION: region_ok=1 window_ok=1 cancel_ok=1 .* -> PASS ::
+FORBID :: SHOTREGION: .* -> FAIL ::
 # --- SO22 (WINTITLE leftovers): the two launchers that minted UNNAMED windows now name them through
 # --- `wm::app_name_arm(owner_of_launch(slot), path)` at spawn (dock label = program name), and the
 # --- name dies with the slot (`free_user_space_by_cr3` on x86, `teardown_user_slot` on aarch64) — before,
@@ -831,6 +839,8 @@ FORBID \[wm\] close-scope win=0
 # The unanchored line is bounded by state, not by count: SNTP may anchor before the first draw, so only the
 # anchored=1 line is REQUIRED; the FORBID rejects any draw that reports drawn=0 or FAILs.
 REQUIRE :: CLOCKBAR: anchored=1 text=
+# RTCCLOCK (R75): the first-second draw is from=rtc; from=sntp|verb|rtc|none are the accepted sources (placeholder is a bug).
+FORBID :: CLOCKBAR: .*from=placeholder
 FORBID :: CLOCKBAR: .* -> FAIL ::
 FORBID :: CLOCKBAR: anchored=[01] text=[^ ]* drawn=0
 # ── DIMIDLE (rmbp-0929) — IDLE SCREEN BLANKING; the waking key is swallowed ─────────────────────────
@@ -869,15 +879,28 @@ FORBID :: WALLPAPER: .* -> FAIL ::
 REQUIRE :: FILEVIEW: path=\S+ bytes=[0-9]+ lines=[1-9][0-9]* rows=[1-9][0-9]* wrapped=[0-9]+ -> PASS ::
 FORBID :: FILEVIEW: .* -> FAIL ::
 FORBID \[fileview\] refuse 
+# --- IMGVIEW (R75): the image viewer (video/facet.rs, UNAOS_FACET=1 is in this lane's gate). `tests imgview` writes a
+# --- 64x64 RGBA and a 16x16 palette PNG, opens, zooms (+ Fit), browses, opens the palette file, browses back, shows a
+# --- refusal window for a junk file, closes and unlinks. GO-RED: a decoder that mis-reads colour type 3/6, a zoom
+# --- that does not step, or a refusal that shows no window prints `-> FAIL ::`.
+REQUIRE :: IMGVIEW: path=\S+ WxH=64x64 zoom=[0-9]+ fit=[01] browse_n=[0-9]+ colour=rgba pal=1 refusal-window=1 -> PASS ::
+FORBID :: IMGVIEW: .* -> FAIL ::
 # --- DOCKRUN — the running tile's gestures: a window mints a tile with the running pip, a press raises it,
 # --- a right-click/long-press menu's Quit closes the owner and the tile leaves.
 REQUIRE :: DOCKRUN: tiles=\d+ running=\d+ pinned=\d+ raise=ok quit=ok menu_drawn=1 -> PASS ::
 FORBID :: DOCKRUN: .* -> FAIL ::
+# --- DOCKPIN (R75) — the dock's pinned apps are a table persisted at `<home>/.dock`: the line prints on login and on each Keep/Remove change.
+REQUIRE :: DOCKPIN: tiles=\d+ pinned=\d+ running=\d+ loaded=\d+ saved=-?\d+ .*-> PASS ::
+FORBID :: DOCKPIN: .* -> FAIL ::
 # --- QUARRYOPS (R75) — Quarry's file operations: mkdir / rename (a LONG name, the LFNMV2 `[fs] mv ... lfn=1` path) /
 # --- copy / delete on a scratch folder under /home, verified by LISTING, plus two DIRNS refusals (outside /home, the home
 # --- itself). The fixture is a `tests` registry entry the lane runs at boot; a SKIP (no /home volume) is not a pass.
 REQUIRE :: QUARRYOPS: ops=\[mkdir,rename,copy,delete\] ok=4 refused=2 -> PASS ::
 FORBID :: QUARRYOPS: .* -> (FAIL|SKIP) ::
+# --- TRASH (R75) — `tests trash`: a scratch file under /home is trashed (moved into `.Trash`, indexed), restored,
+# --- trashed again and emptied, the listing and `.Trash/.index` verified at each step, plus a `~1` collision name.
+REQUIRE :: TRASH: trashed=2 restored=1 emptied=1 index_ok=3 -> PASS ::
+FORBID :: TRASH: .* -> (FAIL|SKIP) ::
 # --- SHOTMOUNT (SO19, FSNS): a capture's bytes go THROUGH THE MOUNT TABLE (`mt.create`/`mt.write`, as
 # --- `shell::fs_write` does), so the file lands where `ls /` says the namespace is. The witness prints once per
 # --- capture at the verdict; `via=fat` means the table could not create the entry and the FAT-direct
@@ -921,9 +944,53 @@ REQUIRE :: TESTS: deferred=
 # directory entries, Ctrl-C/L/A/E/U/W. A scripted key sequence against scripted sources, resulting lines checked.
 REQUIRE :: SHELLUX: history=up-down completions=verbs\+paths ctrl=\[c,l,a,e,u,w\] cwd=/.* -> PASS ::
 FORBID :: SHELLUX: .* -> FAIL ::
+# HELPVERB (R75): every registered verb carries a one-line summary + usage (help.rs DOCS); `tests helpdoc` FAILs on any missing.
+REQUIRE :: HELPVERB: verbs=[0-9]+ documented=[0-9]+ missing=\[\] groups=[0-9]+ -> PASS ::
+FORBID :: HELPVERB: .* -> FAIL ::
 # --- SPLASHX86 (R74): the boot splash rendered by the cross-arch ray tracer at the compositor takeover and HELD above the furniture until the stage is known.
 REQUIRE :: SPLASH: arch=x86_64 WxH=[0-9]+x[0-9]+ ms=[0-9]+ -> PASS ::
+# --- SPLASH2: the splash owns the glass from the GOP frame, through the takeover, to the first real screen (witness lines of boot 19).
+REQUIRE :: SPLASH: stage=gop at_ms=[0-9]+ 
+REQUIRE :: SPLASH: stage=takeover at_ms=[0-9]+ ::
+REQUIRE [splash] held_ms=[0-9]+ released_by=(first-screen|timeout)
+
+# --- SHORTCUTS (R75): ONE table of every desktop chord and the Cmd+/ help overlay (`tests shortcuts` opens it and closes it through the key door).
+REQUIRE :: SHORTCUTS: entries=[0-9]+ scopes=[0-9]+ shown=[0-9]+ -> PASS ::
 REQUIRE [splash] held_ms=[0-9]+ released_by=(store-loaded|timeout)
 # ── TEXTEDIT (R75), TAIL-APPENDED — the editor fixture opens a scratch file, types 40 chars, saves, re-reads, compares
 REQUIRE :: TEXTEDIT: path=
 FORBID :: TEXTEDIT: .* -> FAIL ::
+
+# ── FILEOPEN (FILEVIEW2), TAIL-APPENDED — boot 18 "open a txt file, nothing happens": the Quarry open path (latch -> drain) is driven for a file at / (viewer) and one under /home (editor); both must mint a window
+REQUIRE :: FILEOPEN:
+FORBID :: FILEOPEN: .* -> FAIL ::
+# ── SETTINGS (R75), TAIL-APPENDED — the settings fixture: open, idle=5, save, re-read, compare
+REQUIRE :: SETTINGS: controls=[0-9]+ tabs=4 loaded=[0-9]+ saved=[0-9]+ -> PASS ::
+FORBID :: SETTINGS: .* -> FAIL ::
+# SETTINGS2 — the Users tab leg of the same fixture (tmpuser add/list/delete; root + self refusals)
+REQUIRE :: SETTINGS-USERS: listed=[0-9]+ added=[0-9]+ deleted=[0-9]+ refused=[0-9]+ -> PASS ::
+FORBID :: SETTINGS-USERS: .* -> FAIL ::
+# ── ACTIVITY (R75), TAIL-APPENDED — the load/process/heap window: open, two repaints, close (`tests activity`)
+REQUIRE :: ACTIVITY: cpus=
+FORBID :: ACTIVITY: .* -> FAIL ::
+# ── SCROLLBACK (R75): the shell window keeps 2000 lines and a view offset ───────────────────────────
+# Fixture `console::scrollback_selftest` (`tests scrollback`, panel-less Console): 300 lines printed,
+# view scrolled up 100 (`view_off=100`, the top buffer row asserted), one more line leaves the view
+# where it was and counts in the `[N new lines]` marker (`marker_ok`), a pointer cell on the scrolled
+# view resolves to its BUFFER row (`sel_ok` — selection rows are absolute), a typed key snaps back,
+# `clear` keeps the lines and `clear --all` drops them (`clear_ok`).
+REQUIRE :: SCROLLBACK: rows=2000 cols=\d+ view_off=\d+ marker_ok=ok sel_ok=ok clear_ok=ok -> PASS ::
+FORBID :: SCROLLBACK: .* -> FAIL ::
+# ── WINSNAP (R75), TAIL-APPENDED — `tests winsnap`: a real drag to the left edge snaps to the left half, the preview painted, the chords (Cmd/Ctrl+Alt+arrows) and Down restore, un-snap on drag-away
+REQUIRE :: WINSNAP: zones=7 snaps=[0-9]+ restores=[0-9]+ preview_ok=true unsnaps=[0-9]+ left=true chords=true quarters=4 .* -> PASS ::
+FORBID :: WINSNAP: .* -> FAIL ::
+REQUIRE \[wm-act\] snap win=[0-9]+ zone=left rect=
+# ── TERMCOLOR (R75), TAIL-APPENDED — `tests termcolor`: per-cell SGR spans (<=16/line), erase-line / clear-screen / caret moves, 16+256+rgb palette
+REQUIRE :: TERMCOLOR: spans_max=16 sgr_ok=ok erase_ok=ok palette=16\+256\+rgb -> PASS ::
+FORBID :: TERMCOLOR: .* -> FAIL ::
+# ── POWERMENU (R75), TAIL-APPENDED — `tests power`: the battery panel opens and closes through the real crystal path on a forced reading, the low-battery NOTICE thresholds (10 %, 5 %, once each, discharging only) on forced percents, the two-step confirm armed/fired/re-armed. No real shutdown.
+REQUIRE :: POWER-UI: panel_ok=true notice_ok=true -> PASS ::
+FORBID :: POWER-UI: .* -> FAIL ::
+# ── WINDOWLIST (R75) — `tests windowlist`: the bar's Window menu opened through the press router, the second window's row picked (focus asserted), Show Desktop minimises every live app window and a second pick restores them.
+REQUIRE :: WINDOWLIST: rows=[0-9]+ live=[0-9]+ focused=[1-9][0-9]* minimised=[0-9]+ show_desktop_ok=true -> PASS ::
+FORBID :: WINDOWLIST: .* -> FAIL ::

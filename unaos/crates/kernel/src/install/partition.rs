@@ -601,7 +601,7 @@ pub fn mint_grant(
             row.entry.last_lba,
             row.entry.sectors()
         );
-        return Ok(Some(block::WriteGrant::new(port, row.entry.first_lba, row.entry.last_lba)));
+        return Ok(Some(grant_range(port, row.entry.first_lba, row.entry.last_lba)));
     }
     Ok(no_grant())
 }
@@ -865,7 +865,7 @@ pub struct Written {
 /// content read-back. THE CALLER HAS ALREADY RUN [`check_partition`]; this function performs no
 /// policy of its own beyond the bounds the target enforces. Splitting it that way is deliberate — a
 /// writer that also decided whether to write could be reached by a future caller that forgot to ask.
-fn write_partition<T: InstallTarget>(
+pub(super) fn write_partition<T: InstallTarget>(
     disk: &mut T,
     e: &gpt::GptEntryView,
     tree: &super::clone::SnapTree,
@@ -918,7 +918,9 @@ fn write_partition<T: InstallTarget>(
         if super::verify_extents(&pt, &r.extents, &r.sha)? {
             verified += 1;
             bytes += r.size;
+            serial_println!("[install] file={} bytes={} ok=1 sha={}", r.path.as_str(), r.size, super::clone::sha_hex(&r.sha));
         } else {
+            serial_println!("[install] file={} bytes={} ok=0", r.path.as_str(), r.size);
             serial_println!(
                 ":: INSTALL: verify part={} file={} => MISMATCH ::",
                 index,
@@ -1567,4 +1569,35 @@ fn sata_fixture() -> bool {
     );
 
     true
+}
+
+// ---------------------------------------------------------------------------------------------
+// SELFINSTALL — the whole-disk grant for a disk the self-guard cleared as BLANK or OURS.
+// ---------------------------------------------------------------------------------------------
+
+/// The ONE `WriteGrant::new` call site (the audit grep still prints declaration + this line). Both
+/// [`mint_grant`] (one partition) and [`mint_disk_grant`] (one cleared whole disk) route through it.
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+fn grant_range(port: u8, first: u64, last: u64) -> block::WriteGrant {
+    block::WriteGrant::new(port, first, last)
+}
+
+/// SELFINSTALL: the capability to lay a GPT and an ESP over a WHOLE SATA disk. Minted only from a
+/// `selfinstall::Verdict` of `Blank` or `Ours`; a `Stranger` earns `None` and the reason is printed by
+/// the caller (R20). Also refused when the boot volume is on this very disk (we would erase ourselves).
+#[cfg(all(target_arch = "x86_64", feature = "ahci-write"))]
+pub fn mint_disk_grant(
+    id: block::BlockDeviceId,
+    total_sectors: u64,
+    v: &super::selfinstall::Verdict,
+) -> Option<block::WriteGrant> {
+    let block::BlockHandle::Ahci { port } = id.handle else { return None };
+    if !v.writable() || total_sectors < 4096 || sata_is_boot_device(id.handle) {
+        return None;
+    }
+    serial_println!(
+        ":: INSTALL: grant minted transport=ahci port={} WHOLE-DISK verdict={} lba=0..{} — blank/ours only ::",
+        port, v.tag(), total_sectors - 1
+    );
+    Some(grant_range(port, 0, total_sectors - 1))
 }

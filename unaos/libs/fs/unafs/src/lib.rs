@@ -36,11 +36,13 @@ extern crate alloc;
 
 pub mod adapter;
 pub mod btree;
+pub mod clock;
 pub mod catalog;
 pub mod codec;
 pub mod fs;
 pub mod fsck;
 pub mod hash;
+pub mod index;
 pub mod inode;
 #[cfg(feature = "std")]
 pub mod io;
@@ -62,12 +64,13 @@ pub use btree::{
 };
 pub use catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
 pub use fs::{
-    BatchFile, CommitStats, DirEntry, ReclaimEntry, SNAPSHOT_CAP, SnapshotEntry, SnapshotView,
-    UnaFS, cosine_similarity,
+    BatchFile, CommitStats, DirEntry, QueryHit, ReclaimEntry, SNAPSHOT_CAP, SnapshotEntry,
+    SnapshotView, Stat, UnaFS, cosine_similarity,
 };
+pub use index::CatalogRecord;
 pub use fsck::FsckReport;
 pub use inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
-pub use query::{Query, QueryOp, parse_value};
+pub use query::{Expr, Predicate, Query, QueryOp, parse_value};
 pub use root::{ROOT_RECORD_SIZE, RootRecord, RootSlot};
 #[cfg(feature = "std")]
 pub use storage::FileDevice;

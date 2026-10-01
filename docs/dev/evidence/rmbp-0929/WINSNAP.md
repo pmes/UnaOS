@@ -1,0 +1,13 @@
+# WINSNAP (R75) — window snapping
+
+## Design
+**Finding.** No snapping exists. `wm::zoom` (`video/wm.rs:15782`) maximises by changing only origin and integer `scale` and keeps the pre-zoom `(x,y,scale)` on the row (`zoom_saved`); `drag_begin/drag_motion/drag_end/drag_cancel` (`wm.rs:17132/17432/17518/17553`) own a title drag; the x86 router ends a drag at `syscall.rs:7758` (release) and in `wc_drag_motion` (`release-level` belt). Surfaces are the app's (`w`/`h` never change), so "half" = the half-screen ZONE the window is anchored in at the largest scale that fits (`zoom_scale`), menu bar/status chrome excluded (`work_top`/`work_h`). WINRESIZE (sibling) will add real resizing; `winsnap::snap_zone` is the one place that then asks for the zone rect itself.
+
+**Mechanism.** All code in new `video/winsnap.rs`, declared from the tail of `wm.rs` as a `#[path]` child module (reaches the table, `zoom`, `erase`/`DrainBarrier`, `DRAG_*` without widening anything). Four line-neutral one-line seams: `drag_motion` -> `winsnap::motion` (un-snap + zone tracking + preview), `drag_end` -> `winsnap::end` (snap), `drag_cancel` -> `winsnap::cancel` (`release-level` snaps, others drop the preview), `wc_focus_key` -> `winsnap::key`. Pre-snap placement lives in a side table keyed by window id (not on `Window`), trusted only while the row still sits where the snap put it.
+
+**Milestones.** M1 drag: pointer within 8 px of an edge arms a zone (left/right half, corner band = top/bottom sixth of the work area -> quarters, top edge -> zoom); preview = 3 px checkerboard ring on the front buffer (write-only, desktop shows through; `vacate` of the rect is the eraser); release snaps. M2 keys: new keymap actions `SnapLeft/Right/Zoom/Restore`, rows `Cmd+Alt+arrow` and `Ctrl+Alt+arrow` above the bare-arrow rows (`theme.rs`; `no_shadow` order), consumed in `wc_focus_key`. M3: dragging a snapped title >= 6 px restores the pre-snap scale under the cursor and the drag continues.
+
+**Witness.** `[wm-act] snap win= zone=left|right|tl|tr|bl|br|zoom|restore|unsnap rect=WxH+X+Y via=drag|key|fixture`; `:: WINSNAP: zones=7 snaps= restores= preview_ok= unsnaps= left= chords= quarters= rect= -> PASS ::` from `tests winsnap`. **Pins** (`x86-wc.spec`): REQUIRE the PASS line, FORBID `-> FAIL`, REQUIRE a `zone=left` act line. The `[wm-act] direct ... -> PASS` row is untouched. No knob.
+
+## Written
+M1-M3 in one commit. Boot 17 (x86 wc, `tests winsnap`) should show `:: WINSNAP: zones=7 snaps=>=8 restores=>=3 preview_ok=true unsnaps=>=1 left=true chords=true quarters=4 ... -> PASS ::`. aarch64 is not wired (keymap actions exist and are ignored there).

@@ -252,3 +252,76 @@ pub struct MigrationReport {
     pub directories: u64,
     pub bytes: u64,
 }
+
+/// B302: replay a mounted K8 volume of ANY supported version (in practice a
+/// v3–v5 image with the flat catalog) into a freshly formatted volume — the
+/// v5 → v6 migration pass. The live crate still mounts v3–v5 read/write, so
+/// no read-only shadow reader is needed: the old volume is walked through the
+/// ordinary API (names, data, inline + spilled attributes) and replayed with
+/// `mkdir`/`create_file`/`write_data`/`set_attribute`, which on a v6 target
+/// builds the B+tree catalog and stamps every parent pointer and timestamp.
+///
+/// What does NOT carry over (by design, and reported by the CLI): retained
+/// snapshots (their generations name the OLD volume's commit history) and
+/// objects no directory names (a bare `create_inode`). The target must be
+/// empty (freshly formatted); name collisions surface as errors.
+pub fn migrate_k8_into<S: BlockDevice, T: BlockDevice>(
+    old: &mut crate::UnaFS<S>,
+    new: &mut crate::UnaFS<T>,
+) -> Result<MigrationReport, FileSystemError> {
+    let mut report = MigrationReport::default();
+
+    fn attrs_of<S: BlockDevice>(
+        fs: &mut crate::UnaFS<S>,
+        id: u64,
+    ) -> Result<Vec<(String, AttributeValue)>, FileSystemError> {
+        let inode = fs.read_inode(id)?;
+        let mut keys: Vec<String> = inode.attributes.keys().cloned().collect();
+        keys.extend(inode.large_attributes.keys().cloned());
+        keys.sort();
+        keys.dedup();
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            if let Some(v) = fs.get_attribute(id, &k)? {
+                out.push((k, v));
+            }
+        }
+        Ok(out)
+    }
+
+    let old_root = old.superblock.root_inode;
+    let new_root = new.superblock.root_inode;
+    for (k, v) in attrs_of(old, old_root)? {
+        new.set_attribute(new_root, k, v)?;
+    }
+
+    let mut stack: Vec<(u64, u64)> = alloc::vec![(old_root, new_root)];
+    while let Some((old_dir, new_dir)) = stack.pop() {
+        for entry in old.ls(old_dir)? {
+            match entry.kind {
+                FileKind::Directory => {
+                    let nd = new.mkdir(new_dir, entry.name.clone())?;
+                    report.directories += 1;
+                    for (k, v) in attrs_of(old, entry.inode_id)? {
+                        new.set_attribute(nd, k, v)?;
+                    }
+                    stack.push((entry.inode_id, nd));
+                }
+                FileKind::File | FileKind::Symlink | FileKind::System => {
+                    let nf = new.create_file(new_dir, entry.name.clone())?;
+                    let size = old.read_inode(entry.inode_id)?.size;
+                    if size > 0 {
+                        let data = old.read_data(entry.inode_id, 0, size)?;
+                        new.write_data(nf, 0, &data)?;
+                        report.bytes += data.len() as u64;
+                    }
+                    for (k, v) in attrs_of(old, entry.inode_id)? {
+                        new.set_attribute(nf, k, v)?;
+                    }
+                    report.files += 1;
+                }
+            }
+        }
+    }
+    Ok(report)
+}

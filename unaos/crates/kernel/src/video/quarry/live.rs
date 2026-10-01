@@ -460,6 +460,8 @@ enum Act {
     NoOpener(String),
     /// FILEVIEW — show this absolute path in the read-only text viewer (`video/fileview.rs`).
     Text(String),
+    /// PLAYWAV (R75) — a `.WAV`: latch it for the HDA player (`drivers/hda_play.rs`), serviced on the tick.
+    Play(String),
     /// FACET — show this absolute path in the image viewer. The FIRST opener this tree has ever had:
     /// [`Act::NoOpener`]'s census line says "no opener exists in this tree", and for `.PNG` that
     /// sentence has stopped being true. Kept as its own variant rather than folded into
@@ -724,6 +726,12 @@ fn ext_of(name: &str) -> String {
 /// `bin` is its own token rather than folded into `elf`: `is_executable` admits both and the loader
 /// treats them as genuinely different shapes (a validated ELF64 against a flat blob bounded to one
 /// code page), so a witness that called a `.BIN` an ELF would be wrong about the thing it names.
+/// PLAYWAV (R75): is this a `.WAV` name. Pure.
+fn is_wav_name(name: &str) -> bool {
+    let n = name.as_bytes();
+    n.len() > 4 && n[n.len() - 4..].eq_ignore_ascii_case(b".wav")
+}
+
 fn open_kind(name: &str) -> &'static str {
     let n = name.as_bytes();
     let ends = |ext: &[u8]| n.len() > ext.len() && n[n.len() - ext.len()..].eq_ignore_ascii_case(ext);
@@ -733,6 +741,8 @@ fn open_kind(name: &str) -> &'static str {
         "bin"
     } else if ends(b".png") {
         "png"
+    } else if ends(b".wav") {
+        "wav"
     } else if ends(b".txt") || ends(b".md") || ends(b".log") || ends(b".sha") || ends(b".cfg") || ends(b".ini") {
         "text"
     } else {
@@ -754,6 +764,9 @@ fn open_handler(name: &str) -> &'static str {
     #[cfg(feature = "facet")]
     if crate::video::facet::is_png_name(name) {
         return "facet";
+    }
+    if is_wav_name(name) {
+        return "play";
     }
     if crate::video::fileview::is_text_name(name) {
         return "fileview";
@@ -796,6 +809,7 @@ fn act_tail(act: &Act) -> Option<String> {
         // the window DID understand and DID refuse.
         Act::NoOpener(p) => Some(alloc::format!("select ({})", no_handler_reason(&leaf(p)))),
         Act::Text(p) => Some(alloc::format!("open kind={} handler=fileview", open_kind(&leaf(p)))),
+        Act::Play(p) => Some(alloc::format!("open kind={} handler=play", open_kind(&leaf(p)))),
     }
 }
 
@@ -1282,6 +1296,10 @@ impl Model {
             if crate::video::facet::is_png_name(&name) {
                 return Act::View(p);
             }
+            // PLAYWAV (R75) — `.WAV` plays through the HDA stream.
+            if is_wav_name(&name) {
+                return Act::Play(p);
+            }
             // FILEVIEW — `.TXT`/`.MD`/`.LOG`/`.SPEC`/no extension open in the read-only text viewer.
             if crate::video::fileview::is_text_name(&name) {
                 return Act::Text(p);
@@ -1629,6 +1647,13 @@ fn run_act(act: Act) {
                 serial_println!("[quarry] open TEXT path={} -> fileview (latched for the render pass)", p);
             }
             alloc::format!("opening {}", leaf(&p))
+        }
+        Act::Play(p) => {
+            #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+            { crate::drivers::hda::play::request_open(&p); serial_println!("[quarry] open PLAY path={} -> play (latched for the service tick)", p); }
+            #[cfg(not(all(target_arch = "x86_64", feature = "hda-tone")))]
+            serial_println!("[quarry] open PLAY path={} -> no audio in this build (UNAOS_HDA+UNAOS_HDATONE arm it)", p);
+            alloc::format!("playing {}", leaf(&p))
         }
         Act::NoOpener(p) => {
             // The honest census. An operator who double-presses `CONFIG.TXT` and sees nothing must
@@ -2329,7 +2354,11 @@ pub fn close() {
 pub fn key_route(ev: crate::pal::Event) -> bool {
     // FILEVIEW — the text viewer's arrows / wheel / paging, asked first; it consumes only while ITS
     // window holds focus, so a closed viewer changes nothing below.
-    if crate::video::fileview::key_route(ev) || crate::video::textedit::key_route(ev) {
+    if crate::video::fileview::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::settings::key_route(ev) || crate::video::activity::key_route(ev) {
+        return true;
+    }
+    #[cfg(feature = "facet")]
+    if crate::video::facet::key_route(ev) {
         return true;
     }
     // QSCROLL — the WHEEL arrives here, at the seam that already exists, because this function is
@@ -2553,10 +2582,13 @@ pub fn press_route(x: i32, y: i32) -> bool {
         return true;
     }
     // FILEVIEW — the text viewer's close box / raise, chained here for FACET's reason.
-    if crate::video::fileview::press_route(x, y) {
+    if crate::video::fileview::press_route(x, y) || crate::video::settings::press_route(x, y) {
         return true;
     }
     // TEXTEDIT — the editor's close box / caret placement / raise.
+    if crate::video::activity::press_route(x, y) {
+        return true;
+    }
     if crate::video::textedit::press_route(x, y) {
         return true;
     }
@@ -3028,9 +3060,11 @@ pub fn service() {
     #[cfg(feature = "facet")]
     crate::video::facet::service();
     // FILEVIEW — the text viewer's latch drains on the same pass, for the same reason.
-    crate::video::fileview::service();
+    crate::video::fileview::service(); crate::video::settings::service();
     // TEXTEDIT — the editor's latch drains on the same pass.
     crate::video::textedit::service();
+    // ACTIVITY (R75) — the once-a-second census repaint rides the same pass.
+    crate::video::activity::service();
 }
 
 // ── The witness ─────────────────────────────────────────────────────────────────────────────────
@@ -4290,6 +4324,54 @@ enter_matches_press={} :: {} ::",
         DOUBLE_CLICK_MS + 1, w_past,
         out_dir, out_elf, out_png, out_txt,
         leg_parity,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// FILEOPEN (FILEVIEW2, boot 18 "tried to open a txt file but nothing happens") — drive the REAL Quarry
+/// open path (`run_act(Act::Text(..))` -> latch -> [`service`] drain) for a file at `/` and one under the
+/// user's home, and assert a window was minted each time: root -> viewer, home -> editor.
+/// `:: FILEOPEN: root=viewer home=editor windows=2 -> PASS ::` (registered as `tests fileopen`).
+#[cfg(all(feature = "witness", feature = "wc"))]
+pub fn fileopen_selftest() {
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL};
+    let mt = crate::shell::vfs_mount_table();
+    let root = String::from("/FILEOPEN.TXT");
+    let home_dir = crate::video::textedit::home_dir();
+    let home = alloc::format!("{}FILEOPEN.TXT", home_dir);
+    let _ = mt.create(home_dir.trim_end_matches('/'), NodeKind::Dir, KERNEL_PRINCIPAL);
+    let body = b"fileopen fixture\nsecond line\n";
+    let mut staged = [false; 2];
+    for (i, p) in [&root, &home].iter().enumerate() {
+        let _ = mt.unlink(p, KERNEL_PRINCIPAL);
+        staged[i] = mt.create(p, NodeKind::File, KERNEL_PRINCIPAL).is_ok() && mt.write(p, 0, body, KERNEL_PRINCIPAL).is_ok();
+    }
+    let mut windows = 0usize;
+    let mut root_v = false;
+    let mut home_e = false;
+    if staged[0] {
+        run_act(Act::Text(root.clone()));
+        service();
+        root_v = crate::video::fileview::is_open() && crate::video::fileview::shown() == root && !crate::video::textedit::is_open();
+        if root_v { windows += 1; }
+    }
+    if staged[1] {
+        run_act(Act::Text(home.clone()));
+        service();
+        home_e = crate::video::textedit::is_open() && crate::video::textedit::may_edit(&home);
+        if home_e { windows += 1; }
+    }
+    crate::video::fileview::close();
+    crate::video::textedit::close();
+    for p in [&root, &home] {
+        let _ = mt.unlink(p, KERNEL_PRINCIPAL);
+    }
+    let ok = root_v && home_e && windows == 2;
+    serial_println!(
+        ":: FILEOPEN: root={} home={} windows={} staged={}{} -> {} ::",
+        if root_v { "viewer" } else { "none" },
+        if home_e { "editor" } else { "none" },
+        windows, staged[0] as u8, staged[1] as u8,
         if ok { "PASS" } else { "FAIL" }
     );
 }

@@ -1328,7 +1328,30 @@ mod tone {
     /// [HDA-SPEC §3.3.41 table 53]
     pub const FMT_48K_16_STEREO: u16 = 0x0011;
     pub const SAMPLE_RATE: usize = 48_000;
-    pub const TONE_HZ: usize = parse_hz(option_env!("UNAOS_HDA_HZ")); // HDATONE3 (B218) M3: build-time knob, allow-list 220|440, default 440
+    pub const TONE_HZ_BUILD: usize = parse_hz(option_env!("UNAOS_HDA_HZ")); // HDATONE3 (B218) M3: build-time knob, allow-list 220|440 (HDATONE6: 880 too), default 440
+    /// HDATONE6 M3 — `tests hda220` / `hda880` set this for one run (0 = the build default).
+    pub static HZ_OVERRIDE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    pub fn tone_hz() -> usize { let o = HZ_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed); if o != 0 { o } else { TONE_HZ_BUILD } }
+    /// HDATONE6 M1 — `UNAOS_HDA_GPIO=<mask>` (decimal or 0x hex, 0..=255) is the GPIO bits DRIVEN HIGH on a Cirrus codec; -1 = unset (default 0x08).
+    pub const GPIO_KNOB: i32 = parse_gpio(option_env!("UNAOS_HDA_GPIO"));
+    /// CS4206 on the rMBP 10,1 (Linux CS420X_MBP101): speaker amp = GPIO bit 3, headphone amp = GPIO bit 1 (uncertain recall: patch_cirrus.c gpio_eapd_speaker=8, gpio_eapd_hp=2).
+    pub const CIRRUS_SPK_BIT: u8 = 0x08;
+    pub const CIRRUS_HP_BIT: u8 = 0x02;
+    const fn parse_gpio(s: Option<&str>) -> i32 {
+        let Some(s) = s else { return -1 };
+        let b = s.as_bytes();
+        let (mut i, base) = if b.len() > 2 && b[0] == b'0' && (b[1] == b'x' || b[1] == b'X') { (2, 16u32) } else { (0, 10u32) };
+        if i >= b.len() { return -1; }
+        let mut v = 0u32;
+        while i < b.len() {
+            let c = b[i];
+            let d = if c >= b'0' && c <= b'9' { (c - b'0') as u32 } else if base == 16 && c >= b'a' && c <= b'f' { (c - b'a') as u32 + 10 } else if base == 16 && c >= b'A' && c <= b'F' { (c - b'A') as u32 + 10 } else { return -1 };
+            v = v * base + d;
+            if v > 255 { return -1; }
+            i += 1;
+        }
+        v as i32
+    }
     /// One second. 48000 frames x 4 bytes = 192000, which is 1500 x 128 — the cyclic buffer length
     /// is a multiple of 128 bytes, as the specification requires. [HDA-SPEC §3.3.38]
     pub const FRAMES: usize = SAMPLE_RATE * SECS; // HDATONE3 M3: `UNAOS_HDA_SECS` 1..=3 (default 1); SECS x 192000 bytes stays a multiple of 128 and of the two BDL halves
@@ -1351,7 +1374,7 @@ mod tone {
     const fn parse_hz(s: Option<&str>) -> usize {
         let Some(s) = s else { return 440 };
         let b = s.as_bytes();
-        if b.len() == 3 && b[0] == b'2' && b[1] == b'2' && b[2] == b'0' { 220 } else { 440 }
+        if b.len() == 3 && b[0] == b'2' && b[1] == b'2' && b[2] == b'0' { 220 } else if b.len() == 3 && b[0] == b'8' && b[1] == b'8' && b[2] == b'0' { 880 } else { 440 }
     }
     const fn parse_secs(s: Option<&str>) -> usize {
         let Some(s) = s else { return 1 };
@@ -1426,7 +1449,7 @@ mod tone {
     pub fn fill(buf: u64) {
         for f in 0..FRAMES {
             // Phase in 1/1024-turn units, accumulated in integers so there is no drift.
-            let phase = ((f * TONE_HZ * 1024) / SAMPLE_RATE) as u32;
+            let phase = ((f * tone_hz() * 1024) / SAMPLE_RATE) as u32;
             let s = ((((sin_q15(phase) * AMPLITUDE) >> 15) * envelope_q15(f)) >> 15) as i16; // HDATONE3 M2: faded
             unsafe {
                 core::ptr::write_volatile((buf + (f as u64) * 4) as *mut i16, s);
@@ -1454,7 +1477,7 @@ mod tone {
             if l > peak { peak = l; }
             if l < min { min = l; }
         }
-        let qf = SAMPLE_RATE / TONE_HZ / 4; // quarter period: 27 frames at 440 Hz, 54 at 220 Hz — inside the fade-in, so the reference is faded identically
+        let qf = SAMPLE_RATE / tone_hz() / 4; // quarter period: 27 frames at 440 Hz, 54 at 220 Hz — inside the fade-in, so the reference is faded identically
         let q = rd(qf, 0);
         let q_ref = (AMPLITUDE * envelope_q15(qf)) >> 15;
         let lo = unsafe { core::ptr::read_volatile((buf + (qf as u64) * 4) as *const u8) } as i32;
@@ -1466,7 +1489,7 @@ mod tone {
         serial_println!(
             ":: HDA-PCM: amp={} default={} peak={} min={} q27={} interleave={} peak_ok={} sine_ok={} le_ok={} frames={} hz={} secs={} fade_ms={} edge0={} edge_last={} -> {} ::",
             AMPLITUDE, AMPLITUDE_DEFAULT, peak, min, q, interleave as u8, peak_ok as u8, sine_ok as u8, le_ok as u8, FRAMES,
-            TONE_HZ, SECS, FADE_FRAMES * 1000 / SAMPLE_RATE, edge0, edge_last,
+            tone_hz(), SECS, FADE_FRAMES * 1000 / SAMPLE_RATE, edge0, edge_last,
             if ok { "PASS" } else { "FAIL" }
         );
     }
@@ -1719,6 +1742,8 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     }
     // (function group, mask, data, direction, enable) as read BEFORE anything was driven.
     let mut gpio_saved: Option<(u8, u8, u8, u8, u8)> = None;
+    let mut gpio_final: u8 = 0; // HDATONE6: the GPIO data readback after the drive, for the witness
+    let mut pin_actual = [0xFu8; PAIR_MAX]; // HDATONE6 M2: each member pin's ACTUAL power state after settle (+ fallback)
     match afg {
         None => serial_println!("[hda] gpio afg=none caps=0 -> none (no audio function group answered)"),
         Some(fg) => {
@@ -1741,15 +1766,27 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
                 let en0 = rings.cmd(cad, fg, VERB_GET_GPIO_ENABLE, 0, a).unwrap_or(0) as u8;
                 a.verbs_get += 3;
                 gpio_saved = Some((fg, mask, d0, dir0, en0));
+                // HDATONE6 M1 — boot 18: driving ALL FOUR GPIOs (data=0x0f) made member 0 tone, member 1 silent, both a screech.
+                // Linux patch_cirrus.c drives the speaker-amp GPIO and the headphone-amp GPIO MUTUALLY EXCLUSIVELY (cs_automute:
+                // gpio_data = speaker_on ? gpio_eapd_speaker : gpio_eapd_hp). On a Cirrus codec (vendor 0x1013) drive ONLY the speaker
+                // bit high (default 0x08, `UNAOS_HDA_GPIO=<mask>` overrides), the HP bit is an output held LOW; any other vendor keeps the whole-set drive.
+                let vend = rings.cmd(cad, 0, VERB_GET_PARAMETER, PARAM_VENDOR_ID, a).unwrap_or(0);
+                a.verbs_get += 1;
+                let cirrus = (vend >> 16) == 0x1013;
+                let (drive_hi, drive_oe): (u8, u8) = if cirrus {
+                    let hi = (if GPIO_KNOB >= 0 { GPIO_KNOB as u8 } else { CIRRUS_SPK_BIT }) & mask;
+                    (hi, (hi | CIRRUS_HP_BIT) & mask)
+                } else { (mask, mask) };
                 // Enable, then direction, then data: a pin driven before it is an enabled output is
                 // a write to a pin the codec is not yet driving. Restore runs in the mirror order.
-                if rings.cmd(cad, fg, VERB_SET_GPIO_ENABLE, (en0 | mask) as u32, a).is_some() {
+                if rings.cmd(cad, fg, VERB_SET_GPIO_ENABLE, (en0 | drive_oe) as u32, a).is_some() {
                     a.verbs_set += 1;
                 }
-                if rings.cmd(cad, fg, VERB_SET_GPIO_DIRECTION, (dir0 | mask) as u32, a).is_some() {
+                if rings.cmd(cad, fg, VERB_SET_GPIO_DIRECTION, (dir0 | drive_oe) as u32, a).is_some() {
                     a.verbs_set += 1;
                 }
-                if rings.cmd(cad, fg, VERB_SET_GPIO_DATA, (d0 | mask) as u32, a).is_some() {
+                let data_w = if cirrus { (d0 & !drive_oe) | drive_hi } else { d0 | drive_hi };
+                if rings.cmd(cad, fg, VERB_SET_GPIO_DATA, data_w as u32, a).is_some() {
                     a.verbs_set += 1;
                 }
                 let d1 = rings.cmd(cad, fg, VERB_GET_GPIO_DATA, 0, a).unwrap_or(0) as u8;
@@ -1762,8 +1799,11 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
                     en0, en1, dir0, dir1, d0, d1,
                     // A pin that will not read back as driven is a pin the codec refused, and that
                     // is a different answer from "driven and the speaker is still silent".
-                    (d1 & mask != mask || dir1 & mask != mask || en1 & mask != mask) as u8
+                    (d1 & drive_hi != drive_hi || dir1 & drive_oe != drive_oe || en1 & drive_oe != drive_oe) as u8
                 );
+                serial_println!("[hda] gpio data={:#04x} speaker_bit={} hp_bit={} drive_hi={:#04x} drive_oe={:#04x} cirrus={} knob={}",
+                    d1, (d1 >> 3) & 1, (d1 >> 1) & 1, drive_hi, drive_oe, cirrus as u8, GPIO_KNOB);
+                gpio_final = d1;
             }
         }
     }
@@ -1862,6 +1902,14 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
                 if nid == p.dac {
                     dac_actual[m] = act;
                     settled_ms[m] = el;
+                }
+                if nid == p.pin {
+                    pin_actual[m] = act;
+                    serial_println!("[hda] pin power member={} pin=0x{:02x} actual=D{} settled={}", m, nid, act, (act == 0) as u8);
+                    if act != 0 {
+                        act = pin_power_fallback(rings, cad, afg, p.dac, nid, a);
+                        pin_actual[m] = act;
+                    }
                 }
             }
             // A selector on the path is pointed at the input the path actually took; a mixer is
@@ -1983,7 +2031,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
 
     // ── Program the stream descriptor. [HDA-SPEC §3.3.35 ff.] ───────────────────────────────────
     // Stream reset, which the specification requires before a descriptor is reprogrammed.
-    w8(base, sd + SD_CTL, (saved_ctl as u8 & !(SDCTL_RUN as u8)) | SDCTL_SRST as u8);
+    if play::gate(base, sd, iss, rings, cad, &paths[..np], a) { return; } w8(base, sd + SD_CTL, (saved_ctl as u8 & !(SDCTL_RUN as u8)) | SDCTL_SRST as u8); // PLAYWAV (R75): LINE-NEUTRAL fold — a `play` request takes the stream here (the tone has powered/unmuted/bound everything above)
     a.stream += 1;
     let srst_set = wait_us(10_000, || r8(base, sd + SD_CTL) & SDCTL_SRST as u8 != 0);
     w8(base, sd + SD_CTL, r8(base, sd + SD_CTL) & !(SDCTL_SRST as u8));
@@ -2200,10 +2248,10 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     let dac_d0 = (0..np).all(|m| dac_actual[m] == 0);
     let settled_max = (0..np).map(|m| settled_ms[m]).max().unwrap_or(0);
     serial_println!(
-        ":: HDA-TONE: lpib_advanced={} walked={} wraps={} bcis={} tag_ok={} fifo_ready={} run_ms={} members={} -> {} :: amp={} :: run_bit={} run_readback_ok={} dac_pwr={} settled_ms={} run_reasserts={} stall_reasserts={} sdfmt={:#06x} chan={:?} eapd={:?} vendor={:04x}:{:04x} ::", // HDATONE2 (B215): the amplitude flown, as a SECOND `::` segment so `members=N -> PASS ::` stays contiguous for every scorer
+        ":: HDA-TONE: lpib_advanced={} walked={} wraps={} bcis={} tag_ok={} fifo_ready={} run_ms={} members={} -> {} :: amp={} :: run_bit={} run_readback_ok={} dac_pwr={} settled_ms={} gpio={:#04x} hp_gpio={} spk_gpio={} pin_pwr=[D{},D{}] run_reasserts={} stall_reasserts={} sdfmt={:#06x} chan={:?} eapd={:?} vendor={:04x}:{:04x} ::", // HDATONE2 (B215): the amplitude flown, as a SECOND `::` segment so `members=N -> PASS ::` stays contiguous for every scorer
         advanced as u8, walked as u8, wraps, bcis, tag_ok as u8, fifo_ready, run_ms, np,
         if ok { "PASS" } else { "FAIL" }, tone::AMPLITUDE,
-        (run_ctl & SDCTL_RUN != 0) as u8, run_readback_ok as u8, if dac_d0 { "D0" } else { "D3" }, settled_max, run_reasserts, stall_reasserts,
+        (run_ctl & SDCTL_RUN != 0) as u8, run_readback_ok as u8, if dac_d0 { "D0" } else { "D3" }, settled_max, gpio_final, (gpio_final >> 1) & 1, (gpio_final >> 3) & 1, pin_hex(pin_actual[0]), if np > 1 { pin_hex(pin_actual[1]) } else { '-' }, run_reasserts, stall_reasserts,
         disc.sdfmt, &disc.chan[..np], &disc.eapd[..np], disc.vendor >> 16, disc.vendor & 0xFFFF
     );
     a.line("tone");
@@ -2225,7 +2273,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
 
 /// BOOTSLOW — `probe()` once, from a device-service pass, after the root pass's verdict.
 pub fn probe_after_root() {
-    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    #[cfg(feature = "hda-tone")] play::service(); static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false); // PLAYWAV (R75): the stream's refill tick (idle = one atomic load), LINE-NEUTRAL fold
     if DONE.load(core::sync::atomic::Ordering::Relaxed) || !crate::fs::bootdisk::root_pass_open("hda") || { #[cfg(feature = "login")] { !crate::fs::users::desktop_allowed() } #[cfg(not(feature = "login"))] { false } } { // FIRSTBOOT (R77): no HDA bring-up (the boot tone) before the Desktop stage. LINE-NEUTRAL fold.
         return;
     }
@@ -2312,7 +2360,7 @@ pub mod vol {
     use super::*;
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-    static BASE: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BASE: AtomicU64 = AtomicU64::new(0);
     static CAD: AtomicU32 = AtomicU32::new(0);
     /// Per path node: bit16 valid, bits15:8 steps, bits7:0 nid.
     const Z: AtomicU32 = AtomicU32::new(0);
@@ -2411,6 +2459,48 @@ pub fn hda_tone_test_solo(n: u8) {
 }
 #[cfg(feature = "hda-tone")]
 pub fn hda_tone_test_m0() { hda_tone_test_solo(1); }
+/// HDATONE6 M3 — `tests hda`: member 0 ONLY (the one that sounds) until both work. `tests hdaboth` is the old pair run.
+#[cfg(feature = "hda-tone")]
+pub fn hda_tone_test_default() {
+    serial_println!("[hda] tests hda members=1 default=solo-primary (member 0 = DAC 0x04 -> pin 0x0b; `tests hdaboth` = both members, `hda2` = member 1)");
+    hda_tone_test_solo(1);
+}
+#[cfg(feature = "hda-tone")]
+pub fn hda_tone_test_both() { hda_tone_test_solo(0); }
+/// HDATONE6 M3 — pitch checks on member 0 only.
+#[cfg(feature = "hda-tone")]
+pub fn hda_tone_test_220() { hda_hz_run(220); }
+#[cfg(feature = "hda-tone")]
+pub fn hda_tone_test_880() { hda_hz_run(880); }
+#[cfg(feature = "hda-tone")]
+fn hda_hz_run(hz: usize) {
+    serial_println!("[hda] tests hda{} members=1 hz={} (member 0 only)", hz, hz);
+    tone::HZ_OVERRIDE.store(hz, core::sync::atomic::Ordering::Relaxed);
+    hda_tone_test_solo(1);
+    tone::HZ_OVERRIDE.store(0, core::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(feature = "hda-tone")]
+fn pin_hex(x: u8) -> char { if x < 10 { (b'0' + x) as char } else { '?' } }
+/// HDATONE6 M2 — a member pin that stays D3 after its own SET_POWER_STATE D0: some Cirrus pins follow the AFG / their DAC. Set D0 on the
+/// AFG, the member's DAC, then the pin again; poll the pin up to 50 ms; print what happened; returns the pin's actual state.
+#[cfg(feature = "hda-tone")]
+fn pin_power_fallback(rings: &mut Rings, cad: u8, afg: Option<u8>, dac: u8, pin: u8, a: &mut Audit) -> u8 {
+    if let Some(fg) = afg {
+        if rings.cmd(cad, fg, VERB_SET_POWER_STATE, 0, a).is_some() { a.verbs_set += 1; }
+    }
+    if rings.cmd(cad, dac, VERB_SET_POWER_STATE, 0, a).is_some() { a.verbs_set += 1; }
+    if rings.cmd(cad, pin, VERB_SET_POWER_STATE, 0, a).is_some() { a.verbs_set += 1; }
+    let ts = crate::arch::now_cycles();
+    let mut act = 0xFu8;
+    loop {
+        if let Some(v) = rings.cmd(cad, pin, tone::VERB_GET_POWER_STATE, 0, a) { a.verbs_get += 1; act = ((v >> 4) & 0x0F) as u8; }
+        let el = tone::elapsed_ms(ts);
+        if act == 0 || el >= 50 { break; }
+        delay_us(500);
+    }
+    serial_println!("[hda] pin power fallback pin=0x{:02x} via afg={:?} dac=0x{:02x} actual=D{} settled={} ms={}", pin, afg, dac, act, (act == 0) as u8, tone::elapsed_ms(ts));
+    act
+}
 #[cfg(feature = "hda-tone")]
 pub fn hda_tone_test_m1() { hda_tone_test_solo(2); }
 
@@ -2515,4 +2605,31 @@ fn disc_read(base: u64, sd: u64, rings: &mut Rings, cad: u8, paths: &[Path; tone
     serial_println!("[hda] afg=0x{:02x} power=D{} actual=D{} gpio data={:#04x} enable={:#04x} dir={:#04x} vendor={:04x}:{:04x} (rd at tone arm)",
         afg, pw & 0x0F, (pw >> 4) & 0x0F, gd & 0xFF, ge & 0xFF, gr & 0xFF, d.vendor >> 16, d.vendor & 0xFFFF);
     d
+}
+
+// ===================== PLAYWAV (R75) — THE SEAMS hda_play.rs NEEDS (one small tail block) =====================
+// The streaming PCM path + WAV player live in `drivers/hda_play.rs`, declared here as a CHILD module so it reaches
+// the private `Rings`/`Path`/register helpers. `run_tone` calls `play::gate(..)` once (same-line fold before its SDnCTL
+// reset) and returns when it takes the stream; `probe_after_root` calls `play::service()` (same-line fold at its top).
+#[cfg(feature = "hda-tone")]
+#[path = "hda_play.rs"]
+pub mod play;
+
+/// POWERMENU (R75) M1: quiet the controller before the ACPI call.
+pub mod powerdown {
+    use super::*;
+    use core::sync::atomic::Ordering;
+    /// Clear RUN on every stream descriptor (input then output engines) of the controller the volume path captured.
+    /// `false` = no controller was captured (nothing to stop), never a failure.
+    pub fn stop() -> bool {
+        let base = vol::BASE.load(Ordering::Relaxed);
+        if base == 0 { return false; }
+        let gcap = r32(base, 0x00) & 0xFFFF;
+        let streams = ((gcap >> 12) & 0xF) + ((gcap >> 8) & 0xF) + ((gcap >> 4) & 0x1F); // OSS + ISS + BSS
+        for i in 0..streams as u64 {
+            let sd = 0x80 + 0x20 * i; // SD_BASE + stride
+            w8(base, sd, r8(base, sd) & !0x02); // SDCTL.RUN
+        }
+        true
+    }
 }

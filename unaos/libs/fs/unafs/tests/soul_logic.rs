@@ -92,7 +92,7 @@ fn test_soul_logic() {
     // Exact Match
     let results = fs.query("emotion == \"happy\"").expect("Query failed");
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].0.id, file1_id);
+    assert_eq!(results[0].inode_id, file1_id);
 
     // Similarity Query
     // [0.9, 0.1] vs [1.0, 0.0] -> dot=0.9, mag_a=sqrt(0.81+0.01)=0.905, mag_b=1.0. Sim = 0.9/0.905 ~= 0.99
@@ -102,10 +102,10 @@ fn test_soul_logic() {
         .query("similarity(embedding, [1.0, 0.0]) > 0.9")
         .expect("Sim query failed");
     // Should match file1
-    assert!(results_sim.iter().any(|(inode, _)| inode.id == file1_id));
+    assert!(results_sim.iter().any(|h| h.inode_id == file1_id));
 
     // Should NOT match file3 (vectors are very different)
-    assert!(!results_sim.iter().any(|(inode, _)| inode.id == file3_id));
+    assert!(!results_sim.iter().any(|h| h.inode_id == file3_id));
 
     // 6. Verify Catalog Persistence (Implicitly tested by query working)
     // But let's verify mount restores it.
@@ -117,5 +117,5 @@ fn test_soul_logic() {
         .query("emotion == \"sad\"")
         .expect("Query after mount failed");
     assert_eq!(results2.len(), 1);
-    assert_eq!(results2[0].0.id, file2_id);
+    assert_eq!(results2[0].inode_id, file2_id);
 }

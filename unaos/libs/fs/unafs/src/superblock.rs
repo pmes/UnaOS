@@ -52,7 +52,20 @@ pub const MAGIC: [u8; 5] = *b"UNAFS";
 ///   reason v4's was: a pre-v5 reader pointed at a two-level index would
 ///   misread mid pointers as leaf pointers. v3/v4 volumes (whose geometry
 ///   guarantees one level) mount and read exactly as before.
-pub const VERSION: u32 = 5;
+/// * 6 — F3/F4/M3/M4 (B302): the ATTRIBUTE CATALOG is two on-disk B+trees
+///   (equality + ordered, [`crate::index`]) named by a 40 B catalog record in
+///   the catalog inode's data, instead of one flat list rewritten whole; and
+///   every inode block carries a META TRAILER (parent id, name, ctime, mtime,
+///   atime — [`crate::inode::INODE_META_MAGIC`]) after its unchanged bincode
+///   bytes. INCOMPAT for the same reason as v4/v5: a pre-v6 reader would parse
+///   the catalog record as a flat list. v3–v5 volumes still mount read/write
+///   on the flat catalog they were written with; `tools/unafs migrate` replays
+///   one into a fresh v6 image ([`crate::legacy::migrate_k8_into`]).
+pub const VERSION: u32 = 6;
+
+/// First version whose catalog is the B+tree pair and whose inode blocks carry
+/// the meta trailer (parent pointer + timestamps).
+pub const VERSION_INDEXED: u32 = 6;
 
 /// The oldest on-disk version this build still mounts. A v3 volume mounts
 /// read/write but never spills (it has no v4 inodes and gains none), and no
@@ -162,6 +175,13 @@ impl Superblock {
     /// does not declare.
     pub fn spill_capable(&self) -> bool {
         self.version >= VERSION_EXTENT_SPILL
+    }
+
+    /// Whether this volume's attribute catalog is the B+tree pair and its
+    /// inode blocks carry the meta trailer (v6+). A v3–v5 volume answers
+    /// `false` and keeps its flat catalog and trailer-free inodes byte-for-byte.
+    pub fn indexed(&self) -> bool {
+        self.version >= VERSION_INDEXED
     }
 
     /// Whether this volume's refcount map uses the TWO-LEVEL index tree — a

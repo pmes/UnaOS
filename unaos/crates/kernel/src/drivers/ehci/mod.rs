@@ -13975,7 +13975,7 @@ impl Controller {
                     // trusting a `bInterval` that describes neither the host's poll rate nor the hand's.
                     // It is updated AFTER the window test so a pass cannot be judged against a cadence
                     // it is itself establishing.
-                    if e.dark_cad_ms != u32::MAX && e.dark_cad_ms > 0 {
+                    let in_touch = ptr2_touch_note(e.isr_slot, now_ms, dark_gap_ms, core::slice::from_raw_parts(rpt_ptr, len)); if in_touch && e.dark_cad_ms != u32::MAX && e.dark_cad_ms > 0 { // PTRSTUTTER2 M2: a window counts only inside a touch session
                         let slots = (dark_gap_ms / e.dark_cad_ms as u64) as u32;
                         if slots > 1 {
                             e.dark_windows = e.dark_windows.saturating_add(1);
@@ -14014,7 +14014,7 @@ impl Controller {
                             idx, chars & 0x7F, (chars >> 8) & 0xF, int_ep_kind(e),
                             e.reports.wrapping_add(1), e.dark_cad_ms, e.dark_windows,
                             e.dark_ms, e.dark_max_ms, e.dark_missed, pp_max_us, pp_mean_us
-                        ); ptrstutter_witness(e.dark_ms, e.dark_max_ms as u64);
+                        ); ptrstutter_witness(e.dark_ms, e.dark_max_ms as u64, e.isr_slot);
                     }
                     // ══════════════════════════════════════════════════════════════════════════════
                     // Boot reports are ≤ 8 B; a parsed report-pointer report can be longer (the
@@ -15050,7 +15050,7 @@ unsafe fn isr_rearm(ep: &IsrEp) {
 /// Consumer side of the SPSC ring; called ONLY from the polled pass, under `EHCI_HID`.
 unsafe fn isr_take(slot: usize, out: &mut [u8; ISR_SLOT_LEN]) -> Option<(usize, u64, u64)> {
     let ep = &ISR_EPS[slot];
-    let head = ep.head.load(Ordering::Relaxed);
+    let head = ep.head.load(Ordering::Relaxed); ptr2_attach_note(slot, ep.tail.load(Ordering::Relaxed).wrapping_sub(head)); // PTRSTUTTER2 M1
     // `Acquire`: pairs with the producer's `Release` store, which is what makes the slot bytes
     // written before it visible here.
     if head == ep.tail.load(Ordering::Acquire) {
@@ -15133,7 +15133,7 @@ unsafe fn isr_service_ep(slot: usize, now_ms: u64) {
     }
     let head = ep.head.load(Ordering::Acquire);
     let tail = ep.tail.load(Ordering::Relaxed);
-    let depth = tail.wrapping_sub(head);
+    let depth = tail.wrapping_sub(head); if ptr2_isr_idle_drop(ep, slot, len, depth, tail, now_ms) { return; } // PTRSTUTTER2 M1
     if depth as usize >= ISR_RING {
         // PTRSTUTTER M1 — the pass is more than a ring (64 reports) behind. Policy: DROP NEWEST. The ring
         // keeps the oldest 64 (in order, so a press stays ahead of its release); this report is
@@ -17975,7 +17975,7 @@ fn tp_scale(raw: i32) -> i32 {
     // feel); above the knee the EXCESS is /HIGH, so a fast stroke crosses the screen with less finger.
     // Continuous at the knee, sign-preserving, toward-zero on each segment.
     let a = raw.abs();
-    let px = if a <= TP_MT_CURVE_KNEE { a / TP_MT_DIV_LOW } else { TP_MT_CURVE_KNEE / TP_MT_DIV_LOW + (a - TP_MT_CURVE_KNEE) / TP_MT_DIV_HIGH };
+    let px = if a <= TP_MT_CURVE_KNEE { a / tp_div_low() } else { TP_MT_CURVE_KNEE / tp_div_low() + (a - TP_MT_CURVE_KNEE) / tp_div_high() };
     if raw < 0 { -px } else { px }
 }
 /// TPFRAME — one `[tp] mt` witness per this many vendor frames: the first, then every 64th (a
@@ -19406,13 +19406,138 @@ impl Controller {
 /// PTRSTUTTER (boot 17, "mouse very studdery") — the verdict line, on the EHCIDARK cadence: the ring depth,
 /// reports the ISR dropped (drop-newest, never blocking), this endpoint's dark total and worst window, and
 /// the CPU WCPAR left free of band workers for the input service. FAIL = a single dark window over 500 ms.
-fn ptrstutter_witness(dark_ms: u64, dark_max_ms: u64) {
+fn ptrstutter_witness(dark_ms: u64, dark_max_ms: u64, slot: usize) {
+    let (sessions, dark_touch) = ptr2_touch_totals(slot);
+    let (d_inst, d_desk) = ptr2_stage_split();
     serial_println!(
-        ":: PTRSTUTTER: ring={} dropped={} dark_ms={} dark_max_ms={} reserved_cpu=none(ruling) -> {} ::",
+        ":: PTRSTUTTER: ring={} dropped={} dropped_idle={} dropped_installer={} dropped_desktop={} dark_ms={} touch_sessions={} dark_in_touch_ms={} dark_max_ms={} reserved_cpu=none(ruling) -> {} ::",
         ISR_RING,
         ISR_DROPPED.load(Ordering::Relaxed),
+        PTR2_DROPPED_IDLE.load(Ordering::Relaxed),
+        d_inst,
+        d_desk,
         dark_ms,
+        sessions,
+        dark_touch,
         dark_max_ms,
         if dark_max_ms > 500 { "FAIL" } else { "PASS" }
     );
 }
+
+// ── PTRSTUTTER2 ─────────────────────────────────────────────────────────────────────────────────────
+// Boot 18: `dropped=316` all before 43 s (the installer stage), constant after; `pmp=0` from 10 s to 37 s
+// (the polled pass — the ring's ONLY consumer — was not entered while the usb-pump task sat in the SD/FAT
+// bring-up), and EHCIDARK's `dark_ms` was a whole-idle-gap (a still pad's first report after 10 s of
+// silence counted as 9903 ms "dark"). M1: the ISR coalesces a report identical to the newest UNCONSUMED
+// one (idle repeat) instead of filling the ring, and the first consumer take is witnessed. M2: dark
+// windows count only inside a touch session. M3: drops are split by boot stage.
+const PTR2_TOUCH_GAP_MS: u64 = 200; // a non-idle report this soon after the last continues the session
+const PTR2_TOUCH_DARK_CAP_MS: u64 = 1500; // a gap longer than this after the last non-idle report is the finger lifting, not a stall
+/// Reports the ISR coalesced because they equalled the newest unconsumed report (never ringed).
+static PTR2_DROPPED_IDLE: AtomicU64 = AtomicU64::new(0);
+static PTR2_ATTACHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static PTR2_DROP_SEEN: AtomicU64 = AtomicU64::new(0);
+static PTR2_DROP_INSTALLER: AtomicU64 = AtomicU64::new(0);
+static PTR2_DROP_DESKTOP: AtomicU64 = AtomicU64::new(0);
+
+/// ISR side: drop (and re-arm) a report byte-identical to the newest report still waiting in the ring.
+/// True = handled, the caller returns. Never blocks, never prints.
+unsafe fn ptr2_isr_idle_drop(ep: &IsrEp, slot: usize, len: usize, depth: u32, tail: u32, now_ms: u64) -> bool {
+    if depth == 0 || len == 0 {
+        return false;
+    }
+    let last = &(*core::ptr::addr_of_mut!(ISR_RINGS))[slot][(tail.wrapping_sub(1) as usize) % ISR_RING];
+    if last.len as usize != len {
+        return false;
+    }
+    let cur = core::slice::from_raw_parts(ep.buf.load(Ordering::Relaxed) as *const u8, len);
+    if cur != &last.data[..len] {
+        return false;
+    }
+    PTR2_DROPPED_IDLE.fetch_add(1, Ordering::Relaxed);
+    ep.seen_ms.swap(now_ms, Ordering::Relaxed);
+    isr_rearm(ep);
+    ISR_REARMS.fetch_add(1, Ordering::Relaxed);
+    ep.claim.store(0, Ordering::Release);
+    true
+}
+
+/// Consumer side: the first `isr_take` ever — one line, from the pass (never the ISR).
+fn ptr2_attach_note(slot: usize, backlog: u32) {
+    if !PTR2_ATTACHED.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            ":: EHCI-HID: [ehci] consumer attached at={}ms slot={} ring_backlog={} dropped_before={} dropped_idle_before={} == witness ::",
+            crate::arch::ms(), slot, backlog, ISR_DROPPED.load(Ordering::Relaxed), PTR2_DROPPED_IDLE.load(Ordering::Relaxed)
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Ptr2Touch {
+    prev: [u8; 16],
+    prev_len: u8,
+    last_active_ms: u64,
+    sessions: u32,
+    dark_ms: u64,
+}
+static mut PTR2_TOUCH: [Ptr2Touch; ISR_MAX_EPS] =
+    [Ptr2Touch { prev: [0; 16], prev_len: 0, last_active_ms: 0, sessions: 0, dark_ms: 0 }; ISR_MAX_EPS];
+
+/// Pass side (under `EHCI_HID`): classify this report. ACTIVE = differs from the previous report on the
+/// endpoint. Returns true when the gap that ended in it is a dark window worth counting: the previous
+/// non-idle report was recent (<= cap + session gap) and the gap itself is <= the cap. Idle => false.
+fn ptr2_touch_note(slot: usize, now_ms: u64, gap_ms: u64, rpt: &[u8]) -> bool {
+    if slot >= ISR_MAX_EPS {
+        return false;
+    }
+    let t = unsafe { &mut (*core::ptr::addr_of_mut!(PTR2_TOUCH))[slot] };
+    let n = rpt.len().min(16);
+    let active = t.prev_len as usize != n || t.prev[..n] != rpt[..n];
+    let counts = t.last_active_ms != 0
+        && gap_ms <= PTR2_TOUCH_DARK_CAP_MS
+        && now_ms.wrapping_sub(t.last_active_ms) <= PTR2_TOUCH_DARK_CAP_MS + PTR2_TOUCH_GAP_MS;
+    t.prev[..n].copy_from_slice(&rpt[..n]);
+    t.prev_len = n as u8;
+    if active {
+        if t.last_active_ms == 0 || now_ms.wrapping_sub(t.last_active_ms) > PTR2_TOUCH_GAP_MS {
+            t.sessions = t.sessions.saturating_add(1);
+        }
+        t.last_active_ms = now_ms;
+    }
+    if counts {
+        t.dark_ms = t.dark_ms.saturating_add(gap_ms);
+    }
+    counts
+}
+
+fn ptr2_touch_totals(slot: usize) -> (u32, u64) {
+    if slot >= ISR_MAX_EPS {
+        return (0, 0);
+    }
+    let t = unsafe { &(*core::ptr::addr_of!(PTR2_TOUCH))[slot] };
+    (t.sessions, t.dark_ms)
+}
+
+/// Attribute the drops since the last witness to the boot stage that is current NOW (coarse: the
+/// witness cadence is ~5 s). Returns the cumulative (installer, desktop) split.
+fn ptr2_stage_split() -> (u64, u64) {
+    let now = ISR_DROPPED.load(Ordering::Relaxed);
+    let prev = PTR2_DROP_SEEN.swap(now, Ordering::Relaxed);
+    let delta = now.saturating_sub(prev);
+    if delta > 0 {
+        #[cfg(feature = "login")]
+        let desk = crate::fs::users::boot_stage() == crate::fs::users::BootStage::Desktop;
+        #[cfg(not(feature = "login"))]
+        let desk = true;
+        (if desk { &PTR2_DROP_DESKTOP } else { &PTR2_DROP_INSTALLER }).fetch_add(delta, Ordering::Relaxed);
+    }
+    (PTR2_DROP_INSTALLER.load(Ordering::Relaxed), PTR2_DROP_DESKTOP.load(Ordering::Relaxed))
+}
+/// SETTINGS (R75) — pointer speed, runtime: 0 slow, 1 normal (the TPSPEED constants), 2 fast. Read by `tp_scale`.
+static TP_SPEED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+/// SETTINGS: choose the pointer speed step (clamped to 0..=2).
+pub fn tp_speed_set(n: u8) { TP_SPEED.store(n.min(2), core::sync::atomic::Ordering::Relaxed); }
+/// SETTINGS: the current speed step.
+pub fn tp_speed_get() -> u8 { TP_SPEED.load(core::sync::atomic::Ordering::Relaxed) }
+fn tp_div_low() -> i32 { match tp_speed_get() { 0 => 12, 2 => 5, _ => TP_MT_DIV_LOW } }
+fn tp_div_high() -> i32 { match tp_speed_get() { 0 => 4, 2 => 2, _ => TP_MT_DIV_HIGH } }

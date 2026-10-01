@@ -67,7 +67,7 @@ pub mod wifi;
 
 pub mod allocator;
 pub mod shell;
-pub mod shellux; // SHELLUX (R75) — line editor: history, Tab completion, control keys (new file, tail-neutral)
+pub mod shellux; pub mod help; // SHELLUX (R75) — line editor: history, Tab completion, control keys (new file, tail-neutral)
 pub mod selftest;
 pub mod tests; // R77 M3 — the desktop fixture registry and the `tests` verb
 
@@ -109,7 +109,7 @@ pub mod install;
     feature = "selfhost",
     feature = "holocron", feature = "selfup", feature = "facet", feature = "login", feature = "ga10bprobe5", feature = "ahci" // AHCI (SMALLFIX-HASHCFG, rmbp-0915): an `ahci`-only build could not reach this module at all — the tree's ONLY SHA-256 — so AHCIBOOT fell back to FNV for its fixture; the SATA arc digests what it reads, so `ahci` joins the consumer list as ONE MORE TERM on the same line, no line moved. LOGIN: fs/users.rs CRC-32s its store and SHA-256s the credential. ORIN-SELFUP: selfup_tegra streams Sha256 over the payload + every staged file. FACET: `selfhost::inflate` CRC-32s every produced byte, so the PNG viewer's decoder pulls this module in with `selfhost` itself off — SAME-LINE append, no line moved. GA10B-PROBE5 (orin-0912b): the rung-5 firmware loader digests each vendor section IN the DMA window with this Sha256 — one more term on the same line, no line moved.
 ))]
-pub mod hash; #[cfg(feature = "login")] pub mod rand; // SECLOGIN M5 (2026-09-22): the kernel's entropy source — RDRAND / RNDR where the CPU says so, a documented timer-jitter fallback elsewhere, the source SAID on the wire once per boot (`[rand] source=`). Gated on `login`, its one consumer today (`fs/users.rs`, itself `login`-gated at fs/mod.rs:105) and a member of `hash`'s own cfg list above, which `rand` builds on — the attribute above binds `hash` alone, so a bare `pub mod rand;` here compiled on every `hash`-less leg and redded 31 of them. A second consumer widens this one cfg. LINE-NEUTRAL fold onto hash's line so no panic::Location below it moves.
+pub mod hash; #[cfg(any(feature = "login", feature = "selfhost"))] pub mod rand; // SECLOGIN M5 (2026-09-22): the kernel's entropy source — RDRAND / RNDR where the CPU says so, a documented timer-jitter fallback elsewhere, the source SAID on the wire once per boot (`[rand] source=`). Gated on `login`, its one consumer today (`fs/users.rs`, itself `login`-gated at fs/mod.rs:105) and a member of `hash`'s own cfg list above, which `rand` builds on — the attribute above binds `hash` alone, so a bare `pub mod rand;` here compiled on every `hash`-less leg and redded 31 of them. A second consumer widens this one cfg. LINE-NEUTRAL fold onto hash's line so no panic::Location below it moves.
 
 // SELFHOST-2 (`selfhost` / UNAOS_SELFHOST=1): the source tree is READABLE ON THE SHARD — mount the
 // program-source volume, verify SRC.TGZ against SRC.SHA, then gunzip + tar-walk it and enumerate the
@@ -187,6 +187,7 @@ pub mod clock;
 #[cfg(feature = "logts")]
 pub mod logts;
 pub mod console;
+pub mod termcolor; // TERMCOLOR (R75) — per-cell attributes + the escape parser
 pub mod user;
 pub mod splash; // FC-2 (GATE-FC2, 2026-09-15): measured as an instance — refs=3, ALL under target_arch="x86_64" (`bootpace.rs:168`, `main.rs:233`, `video/fbcon.rs:1554`) — and deliberately NOT gated here, because rmbp-ledger B6 ("Cross-arch splash: `splash.rs` stays, call sites x86-gated", open, Peter asked by name) owns this declaration. Registered in `scripts/fc2.registry`; B6's seat rules.
 // VUGRAS (hw-jetson): the RAS localizer instrument riding the vug frame loop. Declared
@@ -239,7 +240,7 @@ pub mod rtpi;
 // `arch/x86_64/sched.rs`, which is exactly why the Pi never got the repair; lifted here so both
 // schedulers call ONE definition instead of drifting copies. Declared unconditionally and carrying
 // no state — it is `const fn` arithmetic over its arguments, so nothing is linked that is not used.
-pub mod sched_spread; #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] pub mod bus; // BUSX86 (ROADMAP §3b, 2026-09-22): the on-UnaOS SMessage v1 CODEC — the SAME lift, one arc later, and for the same reason VUGSPREAD gives above. `bus.rs` sat under `arch/aarch64/` and said "aarch64-only; zero x86 surface" in its own header, which made SYS_MSEND/SYS_MRECV a board-split of the PROGRAM story (LAWS §3: ONE OS; R16) — the rMBP desktop's EL0 programs had no bus to speak on. The module names no register, no board and no arch: it is frame layout, decode ceilings and the frozen UnaOS-NATIVE v1 goldens, so `git mv` to the crate root is the whole port (history follows the file; `arch/aarch64/mod.rs` keeps five comment lines where its `pub mod bus;` stood, so no panic `Location` in THAT file shifts). The cfg is the UNION of the two arches' EL0 conditions, not a new knob: aarch64 keeps `aarch64_el0` (the gate syscall.rs is under — an aarch64 build with no EL0 has no transport to carry a frame), x86 compiles it unconditionally exactly as x86 compiles SYS_OPEN/SYS_READ (ring 3 is not optional there). ⚠ LINE-NEUTRAL fold onto sched_spread's line: a `pub mod` on its own line would shift every Location below it in this file. The KATs (`bus_codec_selftest` / `bus_codec2_selftest`) are the spec of record and are byte-unchanged by this move — both arches now run them every boot.
+pub mod sched_spread; #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64"))] pub mod bus; #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] pub mod bus_route; // BUSX86 (ROADMAP §3b, 2026-09-22): the on-UnaOS SMessage v1 CODEC — the SAME lift, one arc later, and for the same reason VUGSPREAD gives above. `bus.rs` sat under `arch/aarch64/` and said "aarch64-only; zero x86 surface" in its own header, which made SYS_MSEND/SYS_MRECV a board-split of the PROGRAM story (LAWS §3: ONE OS; R16) — the rMBP desktop's EL0 programs had no bus to speak on. The module names no register, no board and no arch: it is frame layout, decode ceilings and the frozen UnaOS-NATIVE v1 goldens, so `git mv` to the crate root is the whole port (history follows the file; `arch/aarch64/mod.rs` keeps five comment lines where its `pub mod bus;` stood, so no panic `Location` in THAT file shifts). The cfg is the UNION of the two arches' EL0 conditions, not a new knob: aarch64 keeps `aarch64_el0` (the gate syscall.rs is under — an aarch64 build with no EL0 has no transport to carry a frame), x86 compiles it unconditionally exactly as x86 compiles SYS_OPEN/SYS_READ (ring 3 is not optional there). ⚠ LINE-NEUTRAL fold onto sched_spread's line: a `pub mod` on its own line would shift every Location below it in this file. The KATs (`bus_codec_selftest` / `bus_codec2_selftest`) are the spec of record and are byte-unchanged by this move — both arches now run them every boot.
 
 pub fn init() {
     arch::init();
@@ -263,3 +264,5 @@ pub mod net_fetch;
 // so no existing line moves.
 #[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "sntp6", feature = "net6", target_arch = "aarch64")))]
 pub mod net_tick;
+// PREFS (rmbp-ledger B300): the kernel side of Principia's ONE preference store (prefs_core shared core); both arches. Tail statement, so no existing line moves.
+pub mod prefs;

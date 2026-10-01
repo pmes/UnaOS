@@ -111,8 +111,12 @@ pub fn request_open(path: &str) {
 pub fn service() {
     let want = PENDING.lock().take();
     if let Some(p) = want {
-        if let Err(e) = open(&p) {
-            serial_println!("[edit] refuse path={} reason={}", p, e);
+        match open(&p) {
+            Ok(_) => serial_println!("[quarry] open TEXT consumed=editor path={}", p),
+            Err(e) => {
+                serial_println!("[quarry] open TEXT consumed=refused path={} reason={}", p, e);
+                serial_println!("[edit] refuse path={} reason={}", p, e);
+            }
         }
     }
 }
@@ -650,4 +654,10 @@ pub fn selftest() {
 #[cfg(feature = "witness")]
 fn apply_direct(op: Op) {
     let _ = run(op);
+}
+
+/// FILEOPEN — the directory [`may_edit`] treats as the user's own (`/home/<user>/`, or `/home/` with no login).
+#[cfg(feature = "witness")]
+pub fn home_dir() -> String {
+    home_prefix().unwrap_or_else(|| String::from("/home/"))
 }

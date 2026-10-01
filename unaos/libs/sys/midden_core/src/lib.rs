@@ -283,6 +283,10 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // (`/` native, `/boot`, `/usb`) - the rule `ls`, `cat`, `run` and `bg` already followed. The
     // one member with no plain twin, `urmattr`, becomes the standard extended-attribute verb.
     ("setfattr", Avail::Always),
+    // ATTRSURF (B299): the read half of the attribute surface and the query over it. `getfattr`
+    // with no key IS the listing (one verb per job, R26 — no `lsattr`). Always: a FAT volume answers
+    // `-ENOTSUP` from its own backend; the word exists everywhere.
+    ("getfattr", Avail::Always), ("query", Avail::Always),
     // RELICS (R26 clause 2): the five `usnap*` spellings collapse into ONE verb with subcommands,
     // the way `git` / `ip` / `systemctl` spell a family. `snap list|create|drop|ls|cat`.
     ("snap", Avail::Always),
@@ -344,7 +348,7 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // refuses honestly and by name, exactly as `top` and `batmon` (registered `Always` since they
     // were written) do. The word exists on every UnaOS; the platform decides the answer.
     ("burst", Avail::Always), ("simmer", Avail::Always),
-    ("tste", Avail::Always), ("selftest", Avail::Always), ("tests", Avail::Always),
+    ("tste", Avail::Always), ("selftest", Avail::Always), ("tests", Avail::Always), ("src", Avail::Always), // SRCEXTRACT: arm is cfg(selfhost), registered Always like `fetch`
     ("ps", Avail::Always), ("top", Avail::Always), ("batmon", Avail::Always),
     ("dmesg", Avail::Always), ("shutdown", Avail::Always), ("off", Avail::Always),
     // ORIN-REBOOT (baton orin-6 5.1 + the cold-boot ruling 2026-08-25): the arch-neutral
@@ -354,9 +358,9 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // aarch64: PSCI SYSTEM_RESET via SMC; unwired platforms refuse with an honest witness).
     // Always: the VERB is one word on every UnaOS (ONE-OS law); the per-platform mechanism
     // decides what it does, never whether the word exists.
-    ("reboot", Avail::Always),
+    ("reboot", Avail::Always), // HELPVERB (R75): `man` is NOT a table row — help.rs intercepts `help`/`man`/`--help` BEFORE the planner (shell.rs `help::intercept`), so a row would be a verb with no arm (GATE-VERBS, merge9 fold). (was: `man` is the help-in-a-window verb (help.rs intercepts it); the five verbs HELPVERB also registered (trash/shortcuts/play/linux/shot) live on the DONE2 row below, once (merge9 fold: the duplicate rows failed `the_table_has_no_duplicates`). LINE-NEUTRAL fold.
     // FILEVIEW `view` / TEXTEDIT `edit`: ring arms are desktop-gated (wc or desktop_firmware); registered Always on the `dns` precedent (a gated-off arm falls through to bare-name launch, never a typo refusal).
-    ("view", Avail::Always), ("edit", Avail::Always),
+    ("view", Avail::Always), ("edit", Avail::Always), ("activity", Avail::Always), ("settings", Avail::Always), ("trash", Avail::Always), ("shortcuts", Avail::Always), ("play", Avail::Always), ("linux", Avail::Always), ("shot", Avail::Always), ("pref", Avail::Always), ("battery", Avail::Always), // POWERMENU: `battery` (cfg-gated arm, registered Always like `src`). PREFS (B300): Principia's store, ungated arm; ACTIVITY (R75); TRASH/SHORTCUTS/PLAYWAV/LINUXABI/SHOTREGION: arms are cfg-gated, registered Always like `src`
     // processes
     ("run", Avail::Proc), ("bg", Avail::Proc), ("storm", Avail::Proc),
     ("jobs", Avail::Proc), ("kill", Avail::Proc),
@@ -653,7 +657,8 @@ pub fn help(facts: &Facts) -> String {
     // native volume through the one namespace. Only the two words with no plain twin are left, and
     // both wear their standard spelling: extended attributes and snapshots.
     say!("NATIVE:   the plain file verbs reach the native volume: `/` native, /boot the boot FAT, /usb stick");
-    say!("          setfattr -x <key> <path>  (drop one typed attribute)");
+    say!("          setfattr <path> <key>=<value>, setfattr -x <key> <path>  (typed attributes: 42 1.5 \"s\" b64:.. [f,f])");
+    say!("          getfattr <path> [key]  (one or all attributes), query <expr>  (id path of every match)");
     say!("SNAP:     snap list, snap create <name>, snap drop <gen>  (retained roots / snapshots)");
     say!("          snap ls <gen> [path], snap cat <gen> <path>  (read a snapshot; current-ACL enforced)");
     say!("CLOCK:    date, date -s YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");

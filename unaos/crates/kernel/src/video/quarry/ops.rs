@@ -223,27 +223,56 @@ enum Item {
     Open,
     Rename,
     Delete,
+    DeletePerm,
     NewFolder,
     Copy,
     Paste,
     Info,
+    ShowTrash,
+    Restore,
+    EmptyTrash,
 }
 
 impl Item {
-    fn label(self) -> &'static str {
-        match self {
+    fn label(self) -> String {
+        if self == Item::EmptyTrash {
+            return if empty_armed() { String::from("Click again: Empty") } else { alloc::format!("Empty Trash ({} items)", crate::fs::trash::count()) };
+        }
+        String::from(match self {
             Item::Open => "Open",
             Item::Rename => "Rename",
-            Item::Delete => "Delete",
+            Item::Delete => "Move to Trash",
+            Item::DeletePerm => "Delete Permanently",
             Item::NewFolder => "New Folder",
             Item::Copy => "Copy",
             Item::Paste => "Paste",
             Item::Info => "Show Info",
-        }
+            Item::ShowTrash => "Show Trash",
+            Item::Restore => "Restore",
+            Item::EmptyTrash => "",
+        })
     }
 }
 
-const ITEMS: [Item; 7] = [Item::Open, Item::Rename, Item::Delete, Item::NewFolder, Item::Copy, Item::Paste, Item::Info];
+const ITEMS: [Item; 11] = [Item::Open, Item::Rename, Item::Delete, Item::DeletePerm, Item::NewFolder, Item::Copy, Item::Paste, Item::Info, Item::ShowTrash, Item::Restore, Item::EmptyTrash];
+
+/// TRASH (R75) — `Empty Trash` is a TWO-STEP (no yes/no alert exists; `login::open_alert` is OK-only): the
+/// first press arms it (uptime seconds + 1), a second within [`EMPTY_WINDOW_S`] empties.
+static EMPTY_ARMED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const EMPTY_WINDOW_S: u64 = 5;
+/// TRASH (R75) — Shift+Delete = permanent. Quarry's key stream is bare bytes (no modifier), so whatever
+/// owns the modifier state sets this (`ops::set_shift`); until wired, `D` (Shift+d) and the menu row do it.
+static SHIFT_HELD: AtomicBool = AtomicBool::new(false);
+pub fn set_shift(down: bool) {
+    SHIFT_HELD.store(down, Ordering::Relaxed);
+}
+fn now_s() -> u64 {
+    crate::clock::uptime_secs().unwrap_or(0)
+}
+fn empty_armed() -> bool {
+    let a = EMPTY_ARMED.load(Ordering::Relaxed);
+    a != 0 && now_s().saturating_sub(a - 1) <= EMPTY_WINDOW_S
+}
 
 /// The open context menu: source-pixel origin.
 struct Menu {
@@ -266,7 +295,7 @@ static EDIT: spin::Mutex<Option<Edit>> = spin::Mutex::new(None);
 static CLIP: spin::Mutex<Option<String>> = spin::Mutex::new(None);
 
 fn menu_w(g: &Geom) -> usize {
-    12 * g.cell_w() + 2 * PAD
+    22 * g.cell_w() + 2 * PAD
 }
 fn menu_h(g: &Geom) -> usize {
     ITEMS.len() * g.row_h() + 2
@@ -442,7 +471,11 @@ fn run_item(it: Item) {
         }
         Item::Rename => start_rename(),
         Item::NewFolder => start_new_folder(),
-        Item::Delete => do_delete(),
+        Item::Delete => do_trash(),
+        Item::DeletePerm => do_delete(),
+        Item::ShowTrash => do_show_trash(),
+        Item::Restore => do_restore(),
+        Item::EmptyTrash => do_empty_trash(),
         Item::Copy => do_copy(),
         Item::Paste => do_paste(),
         Item::Info => do_info(),
@@ -481,6 +514,71 @@ fn do_delete() {
         say(alloc::format!("delete refused ({})", e));
     }
     refresh(None);
+}
+
+/// TRASH (R75): Delete = move to `.Trash` (index line appended).
+fn do_trash() {
+    let Some((_, path, _)) = selection() else { return };
+    match crate::fs::trash::trash(&path) {
+        Ok(n) => say(alloc::format!("moved to Trash as {}", n)),
+        Err(e) => {
+            refuse_notice(&e);
+            say(alloc::format!("trash refused ({})", e));
+        }
+    }
+    refresh(None);
+}
+
+fn do_show_trash() {
+    let td = crate::fs::trash::trash_dir();
+    if mt().stat(&td).is_err() {
+        refuse_notice("the Trash is empty (nothing has been trashed yet)");
+        return;
+    }
+    if let Some(m) = MODEL.lock().as_mut() {
+        m.invalidate();
+        m.show(&td);
+        m.status = None;
+        m.settle();
+    }
+}
+
+/// Restore the selected Trash row to its original path (refused, with a NOTICE, if the folder is gone).
+fn do_restore() {
+    let Some((c, path, _)) = selection() else { return };
+    if !starts_ci(&c, &crate::fs::trash::trash_dir()) {
+        refuse_notice("Restore works on a row inside the Trash (use Show Trash)");
+        return;
+    }
+    match crate::fs::trash::restore(&leaf(&path)) {
+        Ok(p) => say(alloc::format!("restored {}", p)),
+        Err(e) => {
+            refuse_notice(&e);
+            say(alloc::format!("restore refused ({})", e));
+        }
+    }
+    refresh(None);
+}
+
+/// Two-step Empty: the first press arms (a NOTICE says so), a second within 5 s empties.
+fn do_empty_trash() {
+    if empty_armed() {
+        EMPTY_ARMED.store(0, Ordering::Relaxed);
+        match crate::fs::trash::empty() {
+            Ok(n) => say(alloc::format!("emptied the Trash ({} items)", n)),
+            Err(e) => {
+                refuse_notice(&e);
+                say(alloc::format!("empty refused ({})", e));
+            }
+        }
+        refresh(None);
+    } else {
+        EMPTY_ARMED.store(now_s() + 1, Ordering::Relaxed);
+        let msg = alloc::format!("Empty Trash again within {} s to delete {} items for good", EMPTY_WINDOW_S, crate::fs::trash::count());
+        #[cfg(feature = "login")]
+        crate::video::crystal::login::notice_show(b"Trash", msg.as_bytes());
+        say(msg);
+    }
 }
 
 fn do_copy() {
@@ -627,7 +725,9 @@ pub fn key_pre(c: u8) -> bool {
         return false;
     }
     match c {
-        0x7F => do_delete(),
+        0x7F if SHIFT_HELD.load(Ordering::Relaxed) => do_delete(),
+        0x7F => do_trash(),
+        b'D' => do_delete(),
         b'e' | b'E' => start_rename(),
         b'n' | b'N' => start_new_folder(),
         _ => return false,
