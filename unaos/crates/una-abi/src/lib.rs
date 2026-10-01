@@ -683,6 +683,11 @@ pub const BUS_VERB_MENU_GET: u8 = 9;
 /// A menu pick delivered to the TREE'S OWNER (never to the focused slot). Payload `[31:0]` = the
 /// publisher's own item id. Bit 63 stays clear ([`input_ev_pack`]'s invariant).
 pub const INPUT_EV_MENU_PICK: u64 = 8;
+/// WINRESIZE (R75): the window system resized this process's window (a frame drag, or Ctrl+Shift+arrow).
+/// Payload `[31:16]` = new content width, `[15:0]` = new content height, both SOURCE pixels (`u16`). The
+/// surface slot and stride are unchanged: the program redraws `w` x `h` of it. Programs that do not
+/// resize ignore the unknown type. Numbered 9, the next free code.
+pub const INPUT_EV_WIN_RESIZE: u64 = 9;
 
 /// The wire encoding's version. A bump is a protocol break: rule on it, never bump silently.
 pub const MENU_WIRE_VERSION: u8 = 1;

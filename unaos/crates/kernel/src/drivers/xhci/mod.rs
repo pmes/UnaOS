@@ -363,7 +363,7 @@ pub(crate) fn hid_screenshot_chord_edge(
     prev_keys: &[u8; 6],
     modifiers: u8,
 ) -> Option<(crate::video::keymap::Action, &'static str)> {
-    crate::video::keymap::resolve_edge(crate::video::keymap::active(), cur_keys, prev_keys, modifiers)
+    crate::video::keymap::note_mods(modifiers); crate::video::keymap::resolve_edge(crate::video::keymap::active(), cur_keys, prev_keys, modifiers) // WINRESIZE M2 — the latest modifier byte, for Shift-drag aspect
 }
 
 /// KEYMAP — the 0x46 press edge's MEANING, resolved through the theme's table instead of assumed.

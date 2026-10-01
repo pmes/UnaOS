@@ -5815,7 +5815,7 @@ fn focus_ring_apps(out: &mut [u64; crate::video::wm::MAX_WINDOWS]) -> usize {
 ///    cannot reach, so a drain here would fix one seam and lie about the other.
 pub fn wc_focus_key(ev: crate::pal::Event) -> bool {
     const K_TAB: u8 = b'\t';
-    #[cfg(feature = "wc")] if let crate::pal::Event::Action(crate::video::keymap::Action::CycleWindow) = ev { return match crate::video::wm::cycle_pick() { Some((id, owner)) => { if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_cancel("focus-key"); drag_settle_disarm(); } user_input_set_active(owner); crate::video::wm::cycle_commit(id, owner); true } None => true }; } #[cfg(all(feature = "wc", feature = "login"))] if let crate::pal::Event::Action(crate::video::keymap::Action::LockScreen) = ev { let _ = crate::video::crystal::login::lock(); return true; } // WINCYCLE M1 — Alt+Tab/Cmd+Tab (keymap `CycleWindow`): raise+focus the least-recent app window via `focus_changed`+`raise_one`; one window or none is a consumed no-op.
+    #[cfg(feature = "wc")] if let crate::pal::Event::Action(a) = ev { if let Some((dx, dy, rz)) = a.win_key() { crate::video::wm::win_key(dx, dy, rz); return true; } } #[cfg(feature = "wc")] if let crate::pal::Event::Action(crate::video::keymap::Action::CycleWindow) = ev { return match crate::video::wm::cycle_pick() { Some((id, owner)) => { if crate::video::wm::drag_active() != crate::video::wm::WIN_NONE { crate::video::wm::drag_cancel("focus-key"); drag_settle_disarm(); } user_input_set_active(owner); crate::video::wm::cycle_commit(id, owner); true } None => true }; } #[cfg(all(feature = "wc", feature = "login"))] if let crate::pal::Event::Action(crate::video::keymap::Action::LockScreen) = ev { let _ = crate::video::crystal::login::lock(); return true; } // WINCYCLE M1 — Alt+Tab/Cmd+Tab (keymap `CycleWindow`): raise+focus the least-recent app window via `focus_changed`+`raise_one`; one window or none is a consumed no-op.
     // ALLKEYS (GR21 F4/F5): this matcher binds a BARE Tab, and it can only ever see a bare one —
     // `Event::Key` carries no modifier, so "require Tab with no modifiers" cannot be enforced here;
     // it is enforced upstream in `xhci::hid_key_ascii`, which is the ONLY producer of byte 0x09.
@@ -7615,7 +7615,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
                 }
                 None => {}
             }
-            if crate::video::wm::chrome_hit(win, x, y) {
+            if wc_resize_press(win, owner, cur, x, y) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } if crate::video::wm::chrome_hit(win, x, y) {
                 // TITLE BAR / BORDER — raise and focus through the SAME primitives the content arms
                 // use (no second focus mechanism), then, on the title strip only, grab the window.
                 // Kernel furniture and focus-exempt rows keep their own rule: raise the row, but
@@ -17564,7 +17564,7 @@ fn winx_launcher(demo_cpu: usize) {
     #[cfg(feature = "witness")]
     crate::tests::register("ptrdead", || { ptrdead_selftest(); lockfix_b1_selftest(); });// LOCKFIX-B1 — the input band's panel read driven across a HELD `WRITER` (rmbp-ledger B1). A BLOCK under the line above's `cfg`, so no line is added and no panic `Location` below moves — `apppin_selftest`'s fold at this ladder's tail is the pattern. Shares `ptrdead`'s cfg exactly and wants no more: it needs neither `wc` nor a window, only `WRITER` and `click_pointer_pos`, both compiled in every x86 build. PLACED HERE for the same reason `ptrdead` is the least disruptive fixture in the ladder — this one mints no row, touches no window table, moves no pointer and posts no event; it takes one lock, releases it, and reads a counter. The only ordering it needs is "after the pointer position is set", which every fixture above it has already done, and which is why its `(x,y)` is an OBSERVATION rather than an assertion (see the function's own note).
     #[cfg(all(feature = "witness", feature = "wc"))]
-    crate::tests::register("wmdirect", wmdirect_selftest);
+    crate::tests::register("wmdirect", wmdirect_selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("winresize", winresize_selftest); // WINRESIZE (R75)
     // DMGOVLP — the overlap-forcing damage leg, and the ladder's new tail. Six kernel-band rows in
     // two overlapping groups, banded seeds driven with the REAL sprite parked on the three-way
     // stack: the boot-8 wedge class (banded drags + cursor-repaint storm under overlap) is only
@@ -29547,3 +29547,179 @@ fn appmenu_fixture() {
 /// R77 M3 — the boot CPU the deferred window demos were to be spawned on; the registered fixtures are
 /// plain `fn()`s, so `demo_cpu` travels here (stored just before the first registration).
 static TESTS_DEMO_CPU: AtomicUsize = AtomicUsize::new(0);
+
+// =================================================================================================
+// WINRESIZE (R75) — TAIL-APPENDED. The router half (the press arm folded onto `chrome_hit`'s line in
+// `wc_click_route_at`; motion/end ride `wm::drag_motion`/`drag_end`) and the `tests winresize` fixture.
+// =================================================================================================
+
+/// WINRESIZE M1 — a press at `(x, y)` on window `win`: if it lands in one of the eight frame zones, raise
+/// and focus exactly as the chrome arm does and begin a resize. `true` = the press is consumed (the
+/// caller sets the DROP target). Kernel furniture the user cannot meaningfully resize (the shell/console
+/// row and the desktop row) is declined, so their frames keep today's behaviour.
+fn wc_resize_press(win: u32, owner: u64, cur: u64, x: i32, y: i32) -> bool {
+    if owner == 0 || owner == crate::video::wm::KERNEL_OWNER_DESKTOP {
+        return false;
+    }
+    let zone = crate::video::wm::resize_zone_at(win, x, y);
+    if zone == 0 {
+        return false;
+    }
+    if crate::video::wm::is_kernel_owner(owner) || owner_is_focus_exempt(owner) {
+        furniture_keyboard_to_shell(owner, cur);
+    } else if owner != cur {
+        user_input_set_active(owner);
+    }
+    crate::video::wm::focus_changed(owner);
+    let how = if crate::video::wm::resize_begin(win, zone, x, y) {
+        drag_settle_arm(x, y);
+        "resize"
+    } else {
+        "chrome"
+    };
+    clickroute_witness(x, y, win, owner, cur, how, 0);
+    true
+}
+
+#[cfg(all(feature = "witness", feature = "wc"))]
+#[repr(align(4))]
+struct WrzSurf([u32; WRZ_CW * WRZ_CH]);
+#[cfg(all(feature = "witness", feature = "wc"))]
+const WRZ_CW: usize = 400;
+#[cfg(all(feature = "witness", feature = "wc"))]
+const WRZ_CH: usize = 300;
+#[cfg(all(feature = "witness", feature = "wc"))]
+static WRZ_SURF: WrzSurf = WrzSurf([0x0040_9060; WRZ_CW * WRZ_CH]);
+
+/// WINRESIZE — the gate. Mints a ring-3-band window (200x120 over a 400x300 slot), then drives a REAL
+/// corner drag through `wc_click_route_at` (press, `wm::drag_motion` on the live seam, release), and
+/// asserts: `zones` — eight distinct frame zones at eight probe points; `drag` — the BR corner drag grew
+/// the content by the pointer delta (scale-divided); `clamp` — a drag past the panel edge stops inside it
+/// and counts a clamp; `min` — a drag toward the origin stops at `RS_MIN_W x RS_MIN_H`; `aspect` —
+/// Shift-drag keeps the ratio; `keys` — Ctrl+arrow moved the window 16 px and Ctrl+Shift+arrow resized it.
+#[cfg(all(feature = "witness", feature = "wc"))]
+pub fn winresize_selftest() {
+    use crate::pal::Event;
+    use crate::video::wm;
+    use core::sync::atomic::Ordering::Relaxed;
+    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, Relaxed) {
+        return;
+    }
+    let (pw, ph) = {
+        let fb = *crate::video::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!(":: WINRESIZE: -> SKIP (framebuffer not ready) ::");
+            return;
+        }
+        let i = fb.info();
+        (i.width, i.height)
+    };
+    if pw < 800 || ph < 600 {
+        serial_println!(":: WINRESIZE: -> SKIP (panel {}x{} too small) ::", pw, ph);
+        return;
+    }
+    const OWNER: u64 = 3; // slot 2, the `wmdirect` probe's own ring-3-band key
+    let s = &raw const WRZ_SURF as usize;
+    let len = core::mem::size_of_val(&WRZ_SURF);
+    let w = wm::create(OWNER, s, len, 200, 120, (WRZ_CW * 4) as u32, b"wrz");
+    if w == wm::WIN_NONE {
+        serial_println!(":: WINRESIZE: -> SKIP (window table full) ::");
+        return;
+    }
+    let saved_focus = user_input_active();
+    user_input_set_active(OWNER);
+    wm::focus_changed(OWNER);
+    wm::move_to(w, pw / 4, ph / 4 + wm::TITLE_H + wm::BORDER);
+    let Some(i0) = wm::info(w) else {
+        serial_println!(":: WINRESIZE: -> SKIP (row vanished) ::");
+        return;
+    };
+    let sc = i0.scale.max(1) as i64;
+    let (cw, ch) = ((i0.w * i0.scale) as i32, (i0.h * i0.scale) as i32);
+    let (ox, oy) = (i0.x as i32 - wm::BORDER as i32, i0.y as i32 - (wm::TITLE_H + wm::BORDER) as i32);
+    let (ow, oh) = (cw + 2 * wm::BORDER as i32, ch + (wm::TITLE_H + 2 * wm::BORDER) as i32);
+    // Leg 1 — the eight zones, each probe distinct and nonzero.
+    let probes = [
+        (ox + 1, i0.y as i32 + ch / 2, wm::RS_L),
+        (ox + ow - 2, i0.y as i32 + ch / 2, wm::RS_R),
+        (ox + ow / 2, oy + 1, wm::RS_T),
+        (ox + ow / 2, oy + oh - 2, wm::RS_B),
+        (ox + 1, oy + 1, wm::RS_L | wm::RS_T),
+        (ox + ow - 2, oy + 1, wm::RS_R | wm::RS_T),
+        (ox + 1, oy + oh - 2, wm::RS_L | wm::RS_B),
+        (ox + ow - 2, oy + oh - 2, wm::RS_R | wm::RS_B),
+    ];
+    let mut zones = 0u32;
+    for (px, py, want) in probes.iter() {
+        if wm::resize_zone_at(w, *px, *py) == *want {
+            zones += 1;
+        }
+    }
+    // The title strip's drag handle must NOT be a zone (the `wm-act` fixture's grab point).
+    let strip_clear = wm::resize_zone_at(w, i0.x as i32 + 1, i0.y as i32 - (wm::TITLE_H / 2 + wm::BORDER) as i32) == 0;
+    let (brx, bry) = (ox + ow - 2, oy + oh - 2);
+    // One routed drag: press at the zone, move, release through the router. Returns (w, h) after.
+    let drag = |fx: i32, fy: i32, tx: i32, ty: i32| -> Option<(usize, usize)> {
+        crate::pal::cursor::set_button_level(true);
+        let consumed = wc_click_route_at(Event::Button(1), fx, fy);
+        if !consumed || wm::drag_active() != w || wm::resize_zone_now() == 0 {
+            crate::pal::cursor::set_button_level(false);
+            wm::drag_end();
+            return None;
+        }
+        wm::drag_motion(tx, ty);
+        drag_settle_arm(tx, ty); // the release settles where the hand was last seen with the button down
+        crate::pal::cursor::set_button_level(false);
+        wc_click_route_at(Event::Button(0), tx, ty);
+        wm::drag_end();
+        wm::info(w).map(|i| (i.w, i.h))
+    };
+    // Leg 2 — the plain BR drag.
+    let (dx, dy) = (40i32, 30i32);
+    let drag_ok = drag(brx, bry, brx + dx, bry + dy) == Some(((i0.w as i64 + dx as i64 / sc) as usize, (i0.h as i64 + dy as i64 / sc) as usize));
+    // Leg 3 — past the panel edge: clamps inside the panel and inside the 400x300 slot.
+    let c0 = wm::RS_CLAMPED.load(Relaxed);
+    let i1 = wm::info(w);
+    let (bx1, by1) = i1.map(|i| ((i.x + i.w * i.scale + wm::BORDER) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER) as i32 - 2)).unwrap_or((brx, bry));
+    let r3 = drag(bx1, by1, pw as i32 + 400, ph as i32 + 400);
+    let clamp_ok = match (r3, wm::info(w)) {
+        (Some((w3, h3)), Some(i)) => w3 <= WRZ_CW && h3 <= WRZ_CH && i.x + w3 * i.scale + wm::BORDER <= pw && i.y + h3 * i.scale + wm::BORDER <= ph && wm::RS_CLAMPED.load(Relaxed) > c0,
+        _ => false,
+    };
+    // Leg 4 — toward the origin: stops at the minimum.
+    let i2 = wm::info(w);
+    let (bx2, by2) = i2.map(|i| ((i.x + i.w * i.scale + wm::BORDER) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER) as i32 - 2)).unwrap_or((brx, bry));
+    let min_ok = drag(bx2, by2, 0, 0) == Some((wm::RS_MIN_W, wm::RS_MIN_H));
+    // Leg 5 — Shift keeps the aspect (from the minimum, grow width only).
+    crate::video::keymap::note_mods(crate::drivers::xhci::HID_MOD_SHIFT);
+    let a0 = wm::info(w);
+    let (bx3, by3) = a0.map(|i| ((i.x + i.w * i.scale + wm::BORDER) as i32 - 2, (i.y + i.h * i.scale + wm::BORDER) as i32 - 2)).unwrap_or((brx, bry));
+    let ar = drag(bx3, by3, bx3 + 60 * sc as i32, by3);
+    crate::video::keymap::note_mods(0);
+    let aspect_ok = match (a0, ar) {
+        (Some(a), Some((aw, ah))) => aw > a.w && ((aw * a.h) as i64 - (ah * a.w) as i64).abs() <= a.w.max(a.h) as i64,
+        _ => false,
+    };
+    // Leg 6 — the keyboard: Ctrl+arrow nudge (16 px), Ctrl+Shift+arrow resize (16 px / scale).
+    let k0 = wm::info(w);
+    let nudged = wm::win_key(1, 0, false);
+    let k1 = wm::info(w);
+    let sized = wm::win_key(1, 0, true);
+    let k2 = wm::info(w);
+    let keys_ok = match (k0, k1, k2) {
+        (Some(a), Some(b), Some(c)) => nudged && sized && b.x == a.x + 16 && c.w as i64 == b.w as i64 + 16 / sc,
+        _ => false,
+    };
+    let drags = wm::RS_DRAGS.load(Relaxed);
+    let clamped = wm::RS_CLAMPED.load(Relaxed);
+    wm::close(w);
+    wm::composite();
+    user_input_set_active(saved_focus);
+    let pass = zones == 8 && strip_clear && drag_ok && clamp_ok && min_ok && aspect_ok && keys_ok && drags >= 3;
+    serial_println!(
+        ":: WINRESIZE: zones={} strip={} min={}x{} drags={} clamped={} drag={} clamp={} minstop={} aspect={} keys={} -> {} ::",
+        zones, strip_clear, wm::RS_MIN_W, wm::RS_MIN_H, drags, clamped, drag_ok, clamp_ok, min_ok, aspect_ok, keys_ok,
+        if pass { "PASS" } else { "FAIL" }
+    );
+}

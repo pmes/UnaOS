@@ -137,6 +137,15 @@ pub enum Action {
     CycleWindow,
     /// SCREENLOCK: lock the session without ending it (`⌘L`, `Ctrl+Alt+L`). Acted on by the router (`login::lock`).
     LockScreen,
+    /// WINRESIZE M3: Ctrl+arrow nudges the focused window 16 px (L/R/U/D), Ctrl+Shift+arrow resizes it.
+    WinNudgeLeft,
+    WinNudgeRight,
+    WinNudgeUp,
+    WinNudgeDown,
+    WinSizeLeft,
+    WinSizeRight,
+    WinSizeUp,
+    WinSizeDown,
 }
 
 impl Action {
@@ -163,6 +172,14 @@ impl Action {
             Action::BrightnessUp => "brightness-up",
             Action::CycleWindow => "cycle-window",
             Action::LockScreen => "lock-screen",
+            Action::WinNudgeLeft => "win-nudge-left",
+            Action::WinNudgeRight => "win-nudge-right",
+            Action::WinNudgeUp => "win-nudge-up",
+            Action::WinNudgeDown => "win-nudge-down",
+            Action::WinSizeLeft => "win-size-left",
+            Action::WinSizeRight => "win-size-right",
+            Action::WinSizeUp => "win-size-up",
+            Action::WinSizeDown => "win-size-down",
         }
     }
 
@@ -409,4 +426,34 @@ const fn yn(v: bool) -> &'static str {
     } else {
         "no"
     }
+}
+
+// WINRESIZE (R75) — TAIL-APPENDED.
+impl Action {
+    /// WINRESIZE M3: `(dx, dy, resize)` for the eight window-key actions (`-1/0/1`; `resize` = Ctrl+Shift),
+    /// `None` for every other action.
+    pub const fn win_key(self) -> Option<(i32, i32, bool)> {
+        match self {
+            Action::WinNudgeLeft => Some((-1, 0, false)),
+            Action::WinNudgeRight => Some((1, 0, false)),
+            Action::WinNudgeUp => Some((0, -1, false)),
+            Action::WinNudgeDown => Some((0, 1, false)),
+            Action::WinSizeLeft => Some((-1, 0, true)),
+            Action::WinSizeRight => Some((1, 0, true)),
+            Action::WinSizeUp => Some((0, -1, true)),
+            Action::WinSizeDown => Some((0, 1, true)),
+            _ => None,
+        }
+    }
+}
+
+/// WINRESIZE M2 — the modifier byte of the latest HID key report (written by the xhci chord resolver).
+static HID_MODS_LAST: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// WINRESIZE — record the latest HID modifier byte.
+pub fn note_mods(m: u8) {
+    HID_MODS_LAST.store(m, core::sync::atomic::Ordering::Relaxed);
+}
+/// WINRESIZE M2 — is Shift down per the latest HID report (either side)?
+pub fn shift_held() -> bool {
+    HID_MODS_LAST.load(core::sync::atomic::Ordering::Relaxed) & HID_MOD_SHIFT != 0
 }

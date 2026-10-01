@@ -17453,7 +17453,7 @@ pub fn drag_motion(x: i32, y: i32) -> bool {
             return false;
         }
     }
-    let nx = (x as i64 - DRAG_OFF_X.load(Ordering::Relaxed)).max(0);
+    if RS_ZONE.load(Ordering::Relaxed) != 0 { return resize_motion(id, want, x, y); } let nx = (x as i64 - DRAG_OFF_X.load(Ordering::Relaxed)).max(0);
     let ny = (y as i64 - DRAG_OFF_Y.load(Ordering::Relaxed)).max(0);
     if nx == DRAG_LAST_X.load(Ordering::Relaxed) && ny == DRAG_LAST_Y.load(Ordering::Relaxed) {
         return false; // no pixel would change; skip the lock, the damage and the composite.
@@ -17517,7 +17517,7 @@ pub fn drag_motion(x: i32, y: i32) -> bool {
 /// WMDIRECT — end the live drag, if any. Returns the window that was being dragged.
 pub fn drag_end() -> WinId {
     use core::sync::atomic::Ordering;
-    let id = DRAG_WIN.swap(WIN_NONE, Ordering::AcqRel);
+    let id = DRAG_WIN.swap(WIN_NONE, Ordering::AcqRel); if id != WIN_NONE { resize_finish(id); } // WINRESIZE — print `[wm-act] resize` and clear the zone
     if id != WIN_NONE {
         let owner = DRAG_OWNER.swap(0, Ordering::AcqRel);
         let n = DRAG_MOVES.swap(0, Ordering::Relaxed);
@@ -17552,7 +17552,7 @@ pub fn drag_end() -> WinId {
 /// the end by verb (`drag-end` vs `drag-cancel`) and then by reason.
 pub fn drag_cancel(why: &str) {
     use core::sync::atomic::Ordering;
-    let id = DRAG_WIN.swap(WIN_NONE, Ordering::AcqRel);
+    let id = DRAG_WIN.swap(WIN_NONE, Ordering::AcqRel); if id != WIN_NONE { resize_finish(id); } // WINRESIZE — print `[wm-act] resize` and clear the zone
     if id != WIN_NONE {
         let owner = DRAG_OWNER.swap(0, Ordering::AcqRel);
         let n = DRAG_MOVES.swap(0, Ordering::Relaxed);
@@ -29593,4 +29593,300 @@ pub fn retitle(id: WinId, name: &[u8]) {
         r.title_len = n;
         r.damage_all();
     }
+}
+
+// =================================================================================================
+// WINRESIZE (R75) — TAIL-APPENDED. A window's frame is a resize handle: eight zones (edges
+// `RS_EDGE`, corners `RS_CORNER` panel px), a press+drag that re-sizes the row inside the capacity of
+// its mapped surface slot, Shift-drag that keeps the aspect, a clamp at the panel edge and the
+// minimum, and Ctrl+arrow / Ctrl+Shift+arrow nudge/resize (16 px). The gesture RIDES THE DRAG
+// MACHINERY (`DRAG_WIN`/`DRAG_OWNER` are published by `resize_begin`) so the router's release arm,
+// the level belt, `<TAB>` cancel and the row-recycle guards all end it for free; `drag_motion`
+// diverts to `resize_motion` while `RS_ZONE` is nonzero (one folded `if`), and `drag_end`/
+// `drag_cancel` call `resize_finish`, which prints `[wm-act] resize win= from=WxH to=WxH zone=`.
+// =================================================================================================
+
+/// WINRESIZE — edge band depth, panel px (clipped to the chrome: the content is never taken).
+pub const RS_EDGE: usize = 6;
+/// WINRESIZE — corner square, panel px.
+pub const RS_CORNER: usize = 12;
+/// WINRESIZE — minimum content size in SOURCE px. Width clears the control cluster (148 px floor).
+pub const RS_MIN_W: usize = 160;
+pub const RS_MIN_H: usize = 64;
+pub const RS_L: u8 = 1;
+pub const RS_R: u8 = 2;
+pub const RS_T: u8 = 4;
+pub const RS_B: u8 = 8;
+
+static RS_ZONE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// grab point, then start geometry: x0, y0, w0, h0, scale, capw, caph, current w, current h.
+static RS_G: [core::sync::atomic::AtomicI64; 11] = [const { core::sync::atomic::AtomicI64::new(0) }; 11];
+/// WINRESIZE — gestures that changed a size / steps that hit a clamp (witness census, never reset).
+pub static RS_DRAGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static RS_CLAMPED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The zone token on the `[wm-act] resize` line.
+pub const fn resize_zone_name(z: u8) -> &'static str {
+    match z {
+        1 => "l", 2 => "r", 4 => "t", 8 => "b",
+        5 => "tl", 6 => "tr", 9 => "bl", 10 => "br",
+        _ => "none",
+    }
+}
+
+/// Pure zone classifier over an outer box and content box (see [`resize_zone_at`]).
+fn rs_zone_of(ob: (usize, usize, usize, usize), cb: (usize, usize, usize, usize), px: usize, py: usize) -> u8 {
+    if !in_box(px, py, ob) || in_box(px, py, cb) {
+        return 0;
+    }
+    let (bx, by, bw, bh) = ob;
+    let (dl, dr, dt, db) = (px - bx, bx + bw - 1 - px, py - by, by + bh - 1 - py);
+    let (nl, nr, nt, nb) = (dl < RS_CORNER, dr < RS_CORNER, dt < RS_CORNER, db < RS_CORNER);
+    if (nl || nr) && (nt || nb) {
+        return (if nl { RS_L } else { RS_R }) | (if nt { RS_T } else { RS_B });
+    }
+    if dt < RS_EDGE { return RS_T; }
+    if db < RS_EDGE { return RS_B; }
+    // The side bands stop at the title strip: the strip is the drag handle (`title_bar_hit`), and only
+    // its corners (above) are resize.
+    if py >= cb.1 {
+        if dl < RS_EDGE { return RS_L; }
+        if dr < RS_EDGE { return RS_R; }
+    }
+    0
+}
+
+/// WINRESIZE M1 — which of the eight resize zones (`RS_L|RS_R|RS_T|RS_B` bits; `0` = none) panel point
+/// `(x, y)` is in on window `id`. CHROME ONLY (outer box minus content box), so no app click is taken.
+pub fn resize_zone_at(id: WinId, x: i32, y: i32) -> u8 {
+    if x < 0 || y < 0 {
+        return 0;
+    }
+    let t = table();
+    match row(&t, id) {
+        Some(r) if !r.compat => rs_zone_of(outer_box(r), content_box(r), x as usize, y as usize),
+        _ => 0,
+    }
+}
+
+/// WINRESIZE — the live gesture's zone (`0` = none, or a plain move).
+pub fn resize_zone_now() -> u8 {
+    RS_ZONE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// WINRESIZE — the pure solver. `g` = (x0, y0, w0, h0, scale) of the content at the grab, `(dx, dy)` the
+/// pointer delta in panel px, `cap` = (capw, caph) source px of the mapped slot, `pan` = (pw, ph, top).
+/// Returns `(x, y, w, h, clamped)`; `aspect` keeps `w0:h0`. Total: never inverts min/max.
+pub fn rs_solve(zone: u8, dx: i64, dy: i64, g: (i64, i64, i64, i64, i64), cap: (i64, i64), pan: (i64, i64, i64), aspect: bool) -> (i64, i64, i64, i64, bool) {
+    let (x0, y0, w0, h0, sc) = g;
+    let sc = sc.max(1);
+    let (pw, ph, top) = pan;
+    let (b, th) = (BORDER as i64, TITLE_H as i64);
+    let (minw, minh) = ((RS_MIN_W as i64).min(cap.0), (RS_MIN_H as i64).min(cap.1));
+    let horiz = zone & (RS_L | RS_R) != 0;
+    let vert = zone & (RS_T | RS_B) != 0;
+    let mut w = w0;
+    let mut h = h0;
+    if zone & RS_R != 0 { w = w0 + dx / sc; } else if zone & RS_L != 0 { w = w0 - dx / sc; }
+    if zone & RS_B != 0 { h = h0 + dy / sc; } else if zone & RS_T != 0 { h = h0 - dy / sc; }
+    let (mut maxw, mut maxh) = (cap.0, cap.1);
+    if zone & RS_R != 0 { maxw = maxw.min((pw - b - x0) / sc); }
+    if zone & RS_L != 0 { maxw = maxw.min((x0 + w0 * sc - b) / sc); }
+    if zone & RS_B != 0 { maxh = maxh.min((ph - b - y0) / sc); }
+    if zone & RS_T != 0 { maxh = maxh.min((y0 + h0 * sc - (top + th + b)) / sc); }
+    let (maxw, maxh) = (maxw.max(minw), maxh.max(minh));
+    if aspect && horiz && w0 > 0 && h0 > 0 {
+        // the driver: the horizontal axis unless the gesture is vertical-only or moved more vertically
+        let wdrive = !vert || ((w - w0).abs() * h0 >= (h - h0).abs() * w0);
+        if wdrive { h = w * h0 / w0; } else { w = h * w0 / h0; }
+    } else if aspect && vert && w0 > 0 && h0 > 0 {
+        w = h * w0 / h0;
+    }
+    let (dw, dh) = (w, h);
+    if horiz || aspect { w = w.clamp(minw, maxw); }
+    if vert || aspect { h = h.clamp(minh, maxh); }
+    if aspect && w0 > 0 && h0 > 0 {
+        // one axis clamped: re-derive the other from it, then clamp again (min wins over aspect)
+        let hw = (h * w0 / h0).clamp(minw, maxw);
+        let wh = (w * h0 / w0).clamp(minh, maxh);
+        if (wh - h).abs() > (hw - w).abs() { w = hw; h = (w * h0 / w0).clamp(minh, maxh); } else { h = wh; w = (h * w0 / h0).clamp(minw, maxw); }
+    }
+    let x = if zone & RS_L != 0 { x0 + (w0 - w) * sc } else { x0 };
+    let y = if zone & RS_T != 0 { y0 + (h0 - h) * sc } else { y0 };
+    (x, y, w, h, (w, h) != (dw, dh))
+}
+
+/// WINRESIZE — set a row's geometry and repaint it. `None` = no such row / owner mismatch (slot
+/// recycled); `Some(false)` = nothing changed or the size is outside the slot's capacity; `Some(true)` =
+/// resized. The vacated-box handling is `move_to_inner`'s tail, verbatim in shape.
+fn resize_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize, w: usize, h: usize) -> Option<bool> {
+    crate::wedge2::mark_composite("<D1>", "<d1>");
+    if !super::WRITER.lock().is_ready() {
+        return None;
+    }
+    let (b, a) = {
+        let mut t = table();
+        let r = row_mut(&mut t, id)?;
+        if !expect_owner.is_none_or(|o| r.owner_asid == o) {
+            return None;
+        }
+        if w == 0 || h == 0 || w.saturating_mul(4) > r.stride || h.saturating_mul(r.stride) > r.surf_len {
+            return Some(false);
+        }
+        let before = outer_box(r);
+        r.x = x;
+        r.y = y;
+        r.w = w;
+        r.h = h;
+        r.pinned = true;
+        r.zoom_saved = None;
+        r.damage_all();
+        (before, outer_box(r))
+    };
+    if a == b {
+        return Some(false);
+    }
+    let barrier = DrainBarrier::drain_bounded(DRAIN_MOVE_SPINS, true);
+    let mut parts = [(0usize, 0usize, 0usize, 0usize); 4];
+    let n = subtract_box(b, a, &mut parts);
+    erase(&parts[..n]);
+    damage_intersecting(b.0, b.1, b.2, b.3);
+    super::screen::request_present_rect(b.0, b.1, b.2, b.3);
+    super::screen::request_present_rect(a.0, a.1, a.2, a.3);
+    drop(barrier);
+    composite();
+    Some(true)
+}
+
+/// WINRESIZE — tell the content its new size: the una-abi `INPUT_EV_WIN_RESIZE` event (payload
+/// `[31:16]` w, `[15:0]` h, SOURCE px) into the owner's ring. Kernel rows have no ring; they re-layout
+/// on their next paint from [`info`].
+fn resize_notify(owner: u64, w: usize, h: usize) {
+    let ev = una_abi::input_ev_pack(una_abi::INPUT_EV_WIN_RESIZE, ((w as u64 & 0xFFFF) << 16) | (h as u64 & 0xFFFF));
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    let _ = !is_kernel_owner(owner) && crate::arch::x86_64::syscall::user_input_push_owner(owner, ev);
+    #[cfg(all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0")))]
+    let _ = !is_kernel_owner(owner) && crate::arch::aarch64::syscall::user_input_push_owner(owner, ev);
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0")))))]
+    let _ = (owner, ev);
+}
+
+/// WINRESIZE M1 — begin a resize of `id` in `zone`, grabbed at `(x, y)`. Publishes the drag state so the
+/// existing release/belt/cancel machinery ends it. `false` (nothing started) for a dead/compat row, an
+/// empty zone or a stalled barrier.
+pub fn resize_begin(id: WinId, zone: u8, x: i32, y: i32) -> bool {
+    use core::sync::atomic::Ordering::{Relaxed, Release};
+    if zone == 0 || barrier_stalled() {
+        return false;
+    }
+    let (owner, g) = {
+        let t = table();
+        match row(&t, id) {
+            Some(r) if !r.compat && r.stride >= 4 => (
+                r.owner_asid,
+                [x as i64, y as i64, r.x as i64, r.y as i64, r.w as i64, r.h as i64, r.scale as i64,
+                 (r.stride / 4) as i64, (r.surf_len / r.stride) as i64, r.w as i64, r.h as i64],
+            ),
+            _ => return false,
+        }
+    };
+    for (c, v) in RS_G.iter().zip(g.iter()) { c.store(*v, Relaxed); }
+    DRAG_OFF_X.store(0, Relaxed);
+    DRAG_OFF_Y.store(0, Relaxed);
+    DRAG_LAST_X.store(g[2], Relaxed);
+    DRAG_LAST_Y.store(g[3], Relaxed);
+    DRAG_MOVES.store(0, Relaxed);
+    DRAG_PACE_LAST_MS.store(0, Relaxed);
+    DRAG_PACE_ADMITTED.store(0, Relaxed);
+    DRAG_PACE_COALESCED.store(0, Relaxed);
+    RS_ZONE.store(zone, Release);
+    DRAG_OWNER.store(owner, Release);
+    DRAG_WIN.store(id, Release);
+    wm_act("resize-begin", id, owner, resize_zone_name(zone), x as i64, y as i64);
+    true
+}
+
+/// WINRESIZE — `drag_motion`'s divert while a resize is live. Returns whether the size changed.
+fn resize_motion(id: WinId, owner: u64, x: i32, y: i32) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let (pw, ph) = {
+        let fb = *super::WRITER.lock();
+        if !fb.is_ready() { return false; }
+        let i = fb.info();
+        (i.width as i64, i.height as i64)
+    };
+    let g: [i64; 11] = core::array::from_fn(|i| RS_G[i].load(Relaxed));
+    let shift = super::keymap::shift_held();
+    let top = work_top(pw as usize, ph as usize) as i64;
+    let (nx, ny, nw, nh, clamped) = rs_solve(RS_ZONE.load(Relaxed), x as i64 - g[0], y as i64 - g[1], (g[2], g[3], g[4], g[5], g[6]), (g[7], g[8]), (pw, ph, top), shift);
+    if nw == g[9] && nh == g[10] {
+        return false;
+    }
+    match resize_to_inner(id, Some(owner), nx.max(0) as usize, ny.max(0) as usize, nw as usize, nh as usize) {
+        None => { drag_cancel("row-recycled"); false }
+        Some(changed) => {
+            if changed {
+                RS_G[9].store(nw, Relaxed);
+                RS_G[10].store(nh, Relaxed);
+                DRAG_MOVES.fetch_add(1, Relaxed);
+                if clamped { RS_CLAMPED.fetch_add(1, Relaxed); }
+                resize_notify(owner, nw as usize, nh as usize);
+            }
+            changed
+        }
+    }
+}
+
+/// WINRESIZE — the gesture is over (release or cancel): print the witness once and clear the zone.
+fn resize_finish(id: WinId) {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed};
+    let zone = RS_ZONE.swap(0, AcqRel);
+    if zone == 0 {
+        return;
+    }
+    let (w0, h0, w1, h1) = (RS_G[4].load(Relaxed), RS_G[5].load(Relaxed), RS_G[9].load(Relaxed), RS_G[10].load(Relaxed));
+    if (w0, h0) != (w1, h1) {
+        RS_DRAGS.fetch_add(1, Relaxed);
+    }
+    if WM_ACT_LOG.fetch_add(1, Relaxed) < WM_ACT_LOG_MAX {
+        serial_println!("[wm-act] resize win={} from={}x{} to={}x{} zone={} owner={:#x}", id, w0, h0, w1, h1, resize_zone_name(zone), DRAG_OWNER.load(Relaxed));
+    }
+}
+
+/// WINRESIZE M3 — the window the keyboard is on: the highest-z non-compat row of the focus owner.
+fn rs_focused() -> Option<WinId> {
+    let fa = focus_asid();
+    let t = table();
+    t.rows.iter().filter(|r| r.used && !r.compat && r.owner_asid == fa && fa != 0).max_by_key(|r| r.z).map(|r| r.id)
+}
+
+/// WINRESIZE M3 — Ctrl+arrow nudges the focused window 16 panel px, Ctrl+Shift+arrow resizes it by 16
+/// (`dx`/`dy` are -1/0/1). Clamped like the pointer paths. Returns whether anything changed.
+pub fn win_key(dx: i32, dy: i32, resize: bool) -> bool {
+    let Some(id) = rs_focused() else { return false };
+    let (pw, ph) = {
+        let fb = *super::WRITER.lock();
+        if !fb.is_ready() { return false; }
+        let i = fb.info();
+        (i.width as i64, i.height as i64)
+    };
+    let Some(inf) = info(id) else { return false };
+    if !resize {
+        let nx = (inf.x as i64 + 16 * dx as i64).max(0) as usize;
+        let ny = (inf.y as i64 + 16 * dy as i64).max(0) as usize;
+        let ok = move_to(id, nx, ny);
+        wm_act("nudge", id, inf.owner_asid, if ok { "key" } else { "refused" }, nx as i64, ny as i64);
+        return ok;
+    }
+    let (cw, ch, cap) = { let t = table(); match row(&t, id) { Some(r) if r.stride >= 4 => (r.w, r.h, ((r.stride / 4) as i64, (r.surf_len / r.stride) as i64)), _ => return false } };
+    let zone = (if dx != 0 { RS_R } else { 0 }) | (if dy != 0 { RS_B } else { 0 });
+    let top = work_top(pw as usize, ph as usize) as i64;
+    let (nx, ny, nw, nh, _) = rs_solve(zone, 16 * dx as i64, 16 * dy as i64, (inf.x as i64, inf.y as i64, cw as i64, ch as i64, inf.scale as i64), cap, (pw, ph, top), false);
+    let r = resize_to_inner(id, Some(inf.owner_asid), nx.max(0) as usize, ny.max(0) as usize, nw as usize, nh as usize);
+    let changed = r == Some(true);
+    if changed {
+        resize_notify(inf.owner_asid, nw as usize, nh as usize);
+        wm_act("resize-key", id, inf.owner_asid, "key", nw, nh);
+    }
+    changed
 }
