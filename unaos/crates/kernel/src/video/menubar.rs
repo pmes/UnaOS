@@ -3080,6 +3080,13 @@ fn clockbar_date(secs: u64) -> [u8; CLOCKBAR_DATE_GLYPHS] {
 /// Painter tail for the clock: the date on a wide bar (left of the status item when there is room
 /// for it, else left of the clock), and the once-per-state `:: CLOCKBAR:` witness.
 fn clockbar_paint(out: &mut [u32], w: usize, sy: usize, cx: usize, anchored: bool, c: &[u8; CLOCK_GLYPHS]) {
+    // TESTFIX2 — boot 17 printed `:: CLOCKBAR: anchored=1 text=12:34 ::` with no SNTP reply: that was
+    // `crystal_persist_selftest`'s SYNTHETIC model (`persist_build`, `*b"12:34"`) riding the real painter.
+    // A synthetic bar is not the civil clock — no date, no witness, until the live model paints again.
+    #[cfg(feature = "witness")]
+    if PERSIST_MODEL.load(Ordering::Relaxed) != 0 {
+        return;
+    }
     if anchored && w >= CLOCKBAR_WIDE_CELLS * CELL_W {
         if let Some(secs) = crate::clock::try_unix_now() {
             let dw = CLOCKBAR_DATE_GLYPHS * CELL_W;
@@ -3097,8 +3104,15 @@ fn clockbar_paint(out: &mut [u32], w: usize, sy: usize, cx: usize, anchored: boo
         return;
     }
     serial_println!(
-        ":: CLOCKBAR: anchored={} text={} drawn=1 -> PASS ::",
+        ":: CLOCKBAR: anchored={} text={} from={} drawn=1 -> PASS ::",
         anchored as u8,
-        core::str::from_utf8(c).unwrap_or("?????")
+        core::str::from_utf8(c).unwrap_or("?????"),
+        // The anchor's real source: `sntp` (a reply), `verb` (`date -s`), `placeholder` (the bar shows a
+        // time with NO anchor behind it — a bug the line now names; there is no RTC source in `ClockSource`).
+        match crate::clock::try_source() {
+            crate::clock::ClockSource::Sntp { .. } => "sntp",
+            crate::clock::ClockSource::Manual => "verb",
+            crate::clock::ClockSource::Unset => if anchored { "placeholder" } else { "none" },
+        }
     );
 }

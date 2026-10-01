@@ -5021,7 +5021,7 @@ static VUGRES_LAST_WIN: [AtomicU32; crate::arch::memory::USER_SLOTS] =
 static VUGRES_ACTIVITY: AtomicU64 = AtomicU64::new(0);
 /// D-3: emit counters — positive / negative lines printed, cumulative. Read by the selftest so its
 /// verdict gates the lines actually printing, not merely the state machine cycling.
-static VUGRES_EMITTED_POS: AtomicU64 = AtomicU64::new(0);
+static VUGRES_EMITTED_POS: AtomicU64 = AtomicU64::new(0); static VUGRES_POS_FIX: AtomicU64 = AtomicU64::new(0); // TESTFIX2 — the fixture's OWN positive count (top slot only): the global `VUGRES_EMITTED_POS` is bumped by every live vug window's resume under the desktop, so `pos == before+1` read false on boot 17 (`pos=false neg=true armed=true done=2`).
 static VUGRES_EMITTED_NEG: AtomicU64 = AtomicU64::new(0);
 
 /// D-3: the stage's wire name, with the loss reading baked into the token — see the ladder in the
@@ -5100,7 +5100,7 @@ fn vugres_present_outcome(slot: usize, id: usize, outcome: crate::video::wm::Pre
             let t0 = VUGRES_RESUME_MS[slot].swap(0, Ordering::AcqRel);
             if t0 != 0 {
                 VUGRES_STAGE[slot].store(VUGRES_STAGE_NONE, Ordering::Release);
-                VUGRES_EMITTED_POS.fetch_add(1, Ordering::Relaxed);
+                VUGRES_EMITTED_POS.fetch_add(1, Ordering::Relaxed); if slot == crate::arch::memory::USER_SLOTS - 1 { VUGRES_POS_FIX.fetch_add(1, Ordering::Relaxed); }
                 serial_println!(
                     "[vugres] first present win={} asid={} gap_ms={}",
                     id,
@@ -5279,20 +5279,20 @@ fn vugres_selftest(cpu: usize) {
     while !USER_INPUT_PARKED[slot].load(Ordering::Acquire) && crate::arch::ticks() < deadline {
         crate::arch::sched::yield_now();
     }
-    let pos_before = VUGRES_EMITTED_POS.load(Ordering::Relaxed);
+    let pos_before = VUGRES_POS_FIX.load(Ordering::Relaxed);
     // Fire the unhide edge; retried because the blind backstop can race the park window (the task
     // re-parks on a blind wake, but an edge landing IN that window wakes nobody and retracts).
     'pos: for _ in 0..10 {
         set_hidden(asid, false);
         let until = crate::arch::ticks() + 300;
         while crate::arch::ticks() < until {
-            if VUGRES_EMITTED_POS.load(Ordering::Relaxed) != pos_before {
+            if VUGRES_POS_FIX.load(Ordering::Relaxed) != pos_before {
                 break 'pos;
             }
             crate::arch::sched::yield_now();
         }
     }
-    let pos_ok = VUGRES_EMITTED_POS.load(Ordering::Relaxed) == pos_before + 1;
+    let pos_ok = VUGRES_POS_FIX.load(Ordering::Relaxed) == pos_before + 1;
     deadline = crate::arch::ticks() + 1000;
     while VUGRES_FIX_DONE.load(Ordering::Acquire) == 0 && crate::arch::ticks() < deadline {
         crate::arch::sched::yield_now();
@@ -8825,7 +8825,8 @@ pub fn wmdirect_selftest() {
     // its no-process arm, and report NOPROC — while `close_owner` still removes the row, which is the
     // "closing the windows was the whole effect" contract.
     CLOSE_LAST_SETTLE_X86.store(CLOSE_SETTLE_NONE_X86, Ordering::Release);
-    let wc = wm::create(OWNER_D, s, len, wm::FIX_W as u32, wm::FIX_H as u32, wm::FIX_STRIDE as u32, b"wmc");
+    let owner_c: u64 = { let mut pick = (MAX_PROCS as u64) + 1; let mut cand = MAX_PROCS as u64; while cand >= 1 { let mut live = false; for pi in 0..MAX_PROCS { if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && PROCS[pi].slot.load(Ordering::Acquire) as u64 == cand { live = true; break; } } if !live { pick = cand; break; } cand -= 1; } pick }; // TESTFIX2 — the close leg's owner must carry NO live Proc row: `OWNER_D`=3 (slot 2) is free headless but a REAL process holds it under the live desktop (boot 17 `close=false`: `wc_close_click` took the KILL arm, settle=KILLED not NOPROC, and killed a live window's process). Pick a free slot.
+    let wc = wm::create(owner_c, s, len, wm::FIX_W as u32, wm::FIX_H as u32, wm::FIX_STRIDE as u32, b"wmc");
     let close_ok = if wc == wm::WIN_NONE {
         None
     } else {
