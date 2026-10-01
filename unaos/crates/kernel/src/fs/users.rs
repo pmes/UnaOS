@@ -1243,7 +1243,9 @@ pub fn service() {
             crate::video::strip::login_press_fixture(b"una", b"correct-horse"); // SO36/SO44 — the INPUT GATE. Here, BEFORE the screen fixture, because it needs three things this point in `service` guarantees: the panel real (the fixture mints a stand-in `wm` row to be the window behind), `una` already in the store (`login_fixture` above created it), and the screen DOWN — which it does not assume: it measures `screen_press` at its own point first and REDS if that reads true, so a boot that had the screen up here goes loud instead of quietly passing. It puts the boot back where it found it: row closed, screen down, no session.
             #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
             crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire, screen_press_via_router, screen_press_route_name()); #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::crystal::login::lock_fixture(b"una", b"correct-horse", b"wrong-horse"); #[cfg(feature = "loginst")] LOGINST_LIVE.store(false, Ordering::Release); // LOGINORDER (B206): the chain is over; the press battery may run. ⚠ SAME-LINE fold. // LOGIN M4 — the Log Out route under test is the CRYSTAL MENU'S ROW (`crystal::logout_row_fire`), not the screen's own reopen; M3's `logout_direct` retires with it. LOGINFLOW M1 — and the PRESS route under test is the arch's LIVE ROUTER (`screen_press_via_router`, this file's tail), handed in for exactly the reason the logout route is: a fixture that called `press_swallow` itself would stay green on a tree whose router gate had been deleted — B121's lesson one band over. The seam's NAME travels with it, so the verdict line says which entry was driven rather than leaving the reader to infer it from the arch.
+        #[cfg(all(feature = "loginst", feature = "tests-at-boot"))] LOGINST_LIVE.store(true, Ordering::Release); // LOGINFLOW2 — boot 2's screen is up from the resolution to the fixtures below; the press battery waits (the chain's tail drops it)
         stage_resolve("store-loaded"); // FIRSTBOOT (R77): the stage, from the loaded store AFTER the loginst chain (a Desktop-stage store there); the desktop tenants wait on it
+            #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] { crate::tests::register("boot2-login", boot2_login_entry); crate::tests::register("logout", logout_entry); } // LOGINFLOW2 M1/M2 — boot 2's login through the screen (BEFORE the chain's second pass: it needs the screen up), then LOGOUTUI M4
             #[cfg(feature = "loginst")] { crate::tests::register("login-chain", loginst_chain); crate::tests::source_done(crate::tests::SRC_LOGIN); } // R77 M3 — the loginst fixture chain is a registered test (`tests login-chain`); `tests-at-boot` runs it here, as before. Body: `loginst_chain`, this file's tail.
             #[cfg(not(feature = "loginst"))] crate::tests::source_done(crate::tests::SRC_LOGIN); // no loginst on the flight image: the login source has nothing to register and must not be waited on (boot 17 compile fix)
         }
@@ -1896,6 +1898,7 @@ pub fn boot_session(desktop: bool) {
     );
     DESKTOP_IGNITED.store(true, core::sync::atomic::Ordering::Release);
     let _ = open_pending_root_prompt();
+    open_pending_boot2(); // LOGINFLOW2 M1 — boot 2's login screen, owed when the store resolved before the glass
     open_pending_create_user(); // FIRSTBOOT (R77): the create-user form the store resolution owed before the glass was up
 }
 
@@ -2786,10 +2789,10 @@ fn usermgmt_verb(verb: &str, args: &[&str], console: &mut crate::console::Consol
             match whoami(&mut nb) {
                 Some(n) => {
                     let uid = id_of(&nb[..n]).unwrap_or(0);
-                    console.println(&alloc::format!("{} uid={}", wire_name(&nb[..n]), uid));
+                    console.println(&alloc::format!("{} uid={} stage={}", wire_name(&nb[..n]), uid, stage_name())); // LOGINFLOW2 M4
                 }
-                None if root_session() => console.println("root uid=0"),
-                None => console.println("whoami: no session is open"),
+                None if root_session() => console.println(&alloc::format!("root uid=0 stage={}", stage_name())),
+                None => console.println(&alloc::format!("whoami: no session is open (stage={})", stage_name())),
             }
         }
         "users" => {
@@ -2809,6 +2812,7 @@ fn usermgmt_verb(verb: &str, args: &[&str], console: &mut crate::console::Consol
                 listed += 1;
             }
             *USERMGMT_LAST.lock() = "listed";
+            { let mut sb = [0u8; NAME_MAX]; let who = whoami(&mut sb).map(|n| wire_name(&sb[..n])).unwrap_or(if root_session() { "root" } else { "none" }); console.println(&alloc::format!("session={} stage={}", who, stage_name())); } // LOGINFLOW2 M4
             serial_println!("[users] users listed={}", listed);
         }
         "deluser" => {
@@ -2992,18 +2996,19 @@ pub fn desktop_allowed() -> bool {
 /// The furniture (bar, dock, strip) is HELD: the stage is known and it is not the Desktop. Unresolved is
 /// not held (the first ~400 ms of a metal boot paint as before; the resolution then takes it down).
 pub fn furniture_held() -> bool {
-    stage_resolved() && boot_stage() != BootStage::Desktop
+    stage_resolved() && (boot_stage() != BootStage::Desktop || stage_name() == "login-screen") // LOGINFLOW2 M1 — boot 2's screen stands over an EMPTY desktop: no furniture paints until a session opens
 }
 
 fn stage_witness(why: &str) {
     let st = boot_stage();
     let users = user_count();
     let root_set = password_unset(ROOT_NAME) == Some(false);
-    let up = st == BootStage::Desktop;
+    let login = why == "store-has-users"; // LOGINFLOW2 M1 — boot 2: the store has root's password and users, so the LOGIN SCREEN is the boot session (R64/R65/R77), not root's desktop
+    let up = st == BootStage::Desktop && !login;
     serial_println!(
         ":: FIRSTBOOT: stage={} root_set={} users={} desktop_ignited={} why={} -> {} ::",
-        st.word(), root_set, users, up, why,
-        if (st == BootStage::Installer && !root_set && !up) || (st == BootStage::CreateUser && root_set && users == 0 && !up) || (up && root_set && users > 0) || why == "no-store" { "PASS" } else { "FAIL" }
+        if login { "login-screen" } else { st.word() }, root_set, users, up, why,
+        if (st == BootStage::Installer && !root_set && !up) || (st == BootStage::CreateUser && root_set && users == 0 && !up) || (up && root_set && users > 0) || (login && st == BootStage::Desktop && root_set && users > 0) || why == "no-store" { "PASS" } else { "FAIL" }
     );
 }
 
@@ -3030,7 +3035,7 @@ fn stage_publish(st: BootStage, why: &str) {
             let _ = crate::video::menubar::set_enabled(true);
             crate::video::wm::composite();
         }
-        if st == BootStage::Desktop {
+        if st == BootStage::Desktop && why != "store-has-users" {
             crate::video::crystal::login::installer_release();
         }
         crate::splash::hold_release("store-loaded"); // SPLASHX86: the stage is known and its first window is up beneath — the glass is handed over
@@ -3041,7 +3046,19 @@ fn stage_publish(st: BootStage, why: &str) {
 /// Called once at the end of [`service`]'s load arm (after the `loginst` chain), and by the advance below.
 pub fn stage_resolve(why: &str) {
     let st = stage_of_store();
-    stage_publish(st, why);
+    // LOGINFLOW2 M1 — BOOT 2: a store with root's password AND users resolves to the LOGIN SCREEN, over an empty desktop (R64/R65;
+    // R77 "root is not the assumed login"). `user-created` is the installer's own advance (the form already logged that user in).
+    let boot2 = st == BootStage::Desktop && why == "store-loaded" && user_count() > 0;
+    stage_publish(st, if boot2 { "store-has-users" } else { why });
+    if boot2 {
+        BOOT2.store(true, core::sync::atomic::Ordering::Release);
+        if DESKTOP_IGNITED.load(core::sync::atomic::Ordering::Acquire) {
+            screen_boot2();
+        } else {
+            BOOT2_PENDING.store(true, core::sync::atomic::Ordering::Release);
+            serial_println!("[login] boot 2: login screen deferred to the glass (the screen's window needs the surface)");
+        }
+    }
     if st == BootStage::CreateUser {
         if DESKTOP_IGNITED.load(core::sync::atomic::Ordering::Acquire) {
             screen_create_user();
@@ -3062,6 +3079,53 @@ fn open_pending_create_user() {
     if CREATE_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
         screen_create_user();
     }
+}
+
+/// LOGINFLOW2 M1 — boot 2 resolved: the store has users. `boot_session` opens the screen the resolution owed before the glass was up.
+static BOOT2_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// LOGINFLOW2 — this boot resolved to the login screen (boot 2); [`stage_name`] reads it.
+static BOOT2: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn open_pending_boot2() {
+    if BOOT2_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        screen_boot2();
+    }
+}
+
+/// LOGINFLOW2 M1 — open the login screen as the boot session and sweep the desktop empty (the LOGOUTDESK state:
+/// no furniture until a session opens). No session is open while it is up: root's boot session is NOT assumed
+/// (`ROOT_LIVE` drops; typing `root` + its password at the screen opens root's session, `login_root`).
+fn screen_boot2() {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        ROOT_LIVE.store(false, core::sync::atomic::Ordering::Release);
+        crate::video::crystal::login::open_boot2();
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    serial_println!("[login] boot 2: login screen not built in this image (the root session stays the boot session)");
+}
+
+/// LOGINFLOW2 M4 — the stage as `whoami`/`users` say it: `login-screen` from boot 2's resolution until a session opens.
+pub fn stage_name() -> &'static str {
+    let mut nb = [0u8; NAME_MAX];
+    if BOOT2.load(core::sync::atomic::Ordering::Acquire) && whoami(&mut nb).is_none() && !root_session() {
+        return "login-screen";
+    }
+    if !stage_resolved() { return "unresolved"; }
+    boot_stage().word()
+}
+
+/// LOGINFLOW2 M1 — the screen logs ROOT in when its password is set and typed right (R64: root can log in too;
+/// R77: it is not the assumed login). The root session is "no user session + `ROOT_LIVE`" (uid 0, the current epoch).
+pub fn login_root(password: &[u8]) -> Result<(), UsersError> {
+    if !verify(ROOT_NAME, password) {
+        serial_println!("[users] login refused");
+        return Err(UsersError::Refused);
+    }
+    SESSION_LOCAL.lock().1 = 0;
+    ROOT_LIVE.store(true, core::sync::atomic::Ordering::Release);
+    serial_println!("[users] login ok user=root id=0 principal=root (R64: root typed at the login screen)");
+    Ok(())
 }
 
 /// The root password setter (the Installer's only screen) has WRITTEN root's password: advance. A no-op
@@ -3126,3 +3190,12 @@ fn loginst_chain() {
     crate::video::crystal::login::screen_fixture(b"una", b"correct-horse", b"wrong-horse", crate::video::crystal::logout_row_fire, screen_press_via_router, screen_press_route_name()); #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::crystal::login::lock_fixture(b"una", b"correct-horse", b"wrong-horse"); #[cfg(feature = "loginst")] LOGINST_LIVE.store(false, Ordering::Release);
     LOGINST_LIVE.store(false, Ordering::Release);
 }
+
+/// LOGINFLOW2 M1 — the boot-2 fixture entry: the login screen is up (the `store-has-users` stage); log in as the
+/// lane's seeded user through it. Pinned in `x86-login.spec`.
+#[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn boot2_login_entry() { crate::video::crystal::login::boot2_fixture(b"una", b"correct-horse"); }
+
+/// LOGINFLOW2 M2 — LOGOUTUI M4: the refused-logout alert and the accepted Log Out round trip.
+#[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn logout_entry() { crate::video::crystal::login::logout_fixture(b"una", b"correct-horse"); }
