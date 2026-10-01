@@ -106,6 +106,7 @@ UNAOS_TEGRADESK            TODO  seeded 2026-09-06; 413 Pi-live cfg site(s)
 UNAOS_TEGRASMP             TODO  seeded 2026-09-06; 242 Pi-live cfg site(s)
 UNAOS_TEGRA_EL0            TODO  seeded 2026-09-06; 262 Pi-live cfg site(s)
 UNAOS_THERM                TODO  seeded 2026-09-06; no Pi-live cfg site
+UNAOS_TZ_MIN            NA    option_env! value knob (clock.rs TZ_MIN, display offset in minutes for the x86 CMOS RTC anchor, RTCCLOCK R75); x86 behaviour only — aarch64 prints `:: RTC: rtc=none ::` and has no RTC to offset.
 UNAOS_USBDEBUG             TODO  seeded 2026-09-06; 28 Pi-live cfg site(s)
 UNAOS_VIDEOBENCH           TODO  seeded 2026-09-06; 1 Pi-live cfg site(s)
 UNAOS_VIDEOCAP             TODO  seeded 2026-09-06; no Pi-live cfg site

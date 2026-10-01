@@ -135,6 +135,9 @@ NIGHTLY_FLAGS="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=c
 # configuration the WC-D `[wc-d] verify` verdict was cleared in. NOTE these change compiled-in behaviour:
 # a build made with them is NOT the flashable default image.
 #
+# RTCCLOCK (R75): UNAOS_TZ_MIN=<minutes east of UTC> is read with `option_env!` by clock.rs (TZ_MIN, default 0); the
+# CMOS RTC is read as UTC and the menubar clock shows it plus this offset. Not a cargo feature.
+#
 # PI-V3D-81: UNAOS_V3D81_SETTLE_MS is the same kind of knob — read with `option_env!` by
 # arch/aarch64/v3d.rs, not a cargo feature. It sets how long a reply-less NOTIFY post settles before
 # the effect is read (default 250 ms, capped at 10 s, ignored unless a UNAOS_V3D81_* leg is armed).

@@ -825,7 +825,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Every stamp BEFORE this one was still taken in raw counter ticks; they only become
     // milliseconds because the conversion happens at print time, downstream of this call.
     #[cfg(target_arch = "x86_64")]
-    unaos_kernel::bootpace::record("calib"); #[cfg(target_arch = "x86_64")] bootclock_report(bootclock); // BOOTCLOCK: the ONE line, emitted at the first instant the kernel can convert a cycle count honestly — `apic::calibrate` ran three lines up, so `bootpace::origin_hz()` stops returning 0 exactly here. Earlier would mean either raw cycles or a guessed Hz; later would mean after the first `BPACE` block (`service_dump` runs in the main loop, far below), and this line is meant to be read BEFORE it. LINE-NEUTRAL fold, x86-gated; the fn is at this file's tail — see its header.
+    unaos_kernel::bootpace::record("calib"); #[cfg(target_arch = "x86_64")] bootclock_report(bootclock); unaos_kernel::clock::rtc_boot(); // BOOTCLOCK: the ONE line, emitted at the first instant the kernel can convert a cycle count honestly — `apic::calibrate` ran three lines up, so `bootpace::origin_hz()` stops returning 0 exactly here. Earlier would mean either raw cycles or a guessed Hz; later would mean after the first `BPACE` block (`service_dump` runs in the main loop, far below), and this line is meant to be read BEFORE it. LINE-NEUTRAL fold, x86-gated; the fn is at this file's tail — see its header.
 
     // 4c. SMP: start the application processors (INIT-SIPI-SIPI). Each AP brings up its own
     // per-CPU GDT/TSS + local APIC, then waits to enter its scheduler loop; the BSP continues to

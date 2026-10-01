@@ -34,6 +34,7 @@ fn main() {
         .arg("-Z").arg("build-std=core,compiler_builtins,alloc")
         .arg("-Z").arg("build-std-features=compiler-builtins-mem")
         .arg("-Z").arg("json-target-spec");
+    // RTCCLOCK: UNAOS_TZ_MIN is an `option_env!` value knob read by clock.rs — no cargo feature, nothing to push here.
     // Optional kernel features from env knobs: UNAOS_SKIP_XHCI=1 (disable xHCI/USB bring-up),
     // UNAOS_BOOTLOG=1 (hold the boot log on screen instead of the GUI), UNAOS_USBDEBUG=1 (run the
     // USB main loop but keep the boot log on screen + print input events), UNAOS_PI=1 (Pi 4,

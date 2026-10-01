@@ -5200,7 +5200,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                     let src = match crate::clock::source() {
                         crate::clock::ClockSource::Sntp { stratum } =>
                             alloc::format!("sntp, stratum {}", stratum),
-                        crate::clock::ClockSource::Manual => alloc::format!("manual"),
+                        crate::clock::ClockSource::Manual => alloc::format!("manual"), crate::clock::ClockSource::Rtc => alloc::format!("rtc"),
                         crate::clock::ClockSource::Unset => alloc::format!("unsynced"),
                     };
                     // PI-UI-3: mirror to serial (verb output is panel-only on the bench).
@@ -5776,7 +5776,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                                     crate::clock::ClockSource::Sntp { stratum } =>
                                         alloc::format!("{} (sntp, stratum {})", iso, stratum),
                                     crate::clock::ClockSource::Manual =>
-                                        alloc::format!("{} (manual)", iso),
+                                        alloc::format!("{} (manual)", iso), crate::clock::ClockSource::Rtc => alloc::format!("{} (rtc)", iso),
                                     crate::clock::ClockSource::Unset =>
                                         alloc::format!("unsynced"),
                                 }

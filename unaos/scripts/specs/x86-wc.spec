@@ -839,6 +839,8 @@ FORBID \[wm\] close-scope win=0
 # The unanchored line is bounded by state, not by count: SNTP may anchor before the first draw, so only the
 # anchored=1 line is REQUIRED; the FORBID rejects any draw that reports drawn=0 or FAILs.
 REQUIRE :: CLOCKBAR: anchored=1 text=
+# RTCCLOCK (R75): the first-second draw is from=rtc; from=sntp|verb|rtc|none are the accepted sources (placeholder is a bug).
+FORBID :: CLOCKBAR: .*from=placeholder
 FORBID :: CLOCKBAR: .* -> FAIL ::
 FORBID :: CLOCKBAR: anchored=[01] text=[^ ]* drawn=0
 # ── DIMIDLE (rmbp-0929) — IDLE SCREEN BLANKING; the waking key is swallowed ─────────────────────────
