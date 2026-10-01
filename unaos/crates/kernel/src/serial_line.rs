@@ -12,7 +12,7 @@
 //! merged (`...thr=streak<=1:: VUGART: frames=2 ...`). `_print` is atomic per sink call, but a line is
 //! several calls (a `serial_print!` fragment, then the `serial_println!` that ends it), and the format
 //! arguments are evaluated sink by sink. So the macros now (1) format the WHOLE line into a fixed
-//! 512-byte stack buffer first (truncated with `…`), then (2) hand that one `&str` to `_print` inside
+//! 2048-byte stack buffer (SERIAL2: was 512; x86 task stacks are 16 KiB, IST 8 KiB, and panic mode bypasses the buffer) first (truncated with `…`), then (2) hand that one `&str` to `_print` inside
 //! ONE critical section (`LINE_BUSY`). Lines from different cores can no longer interleave.
 //!
 //! Context rule. A caller with interrupts MASKED (an ISR, the deadman tick, a `without_interrupts`
@@ -25,7 +25,7 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 /// One line, including its `\n` and a possible `…` marker.
-pub const LINE_MAX: usize = 512;
+pub const LINE_MAX: usize = 2048;
 const DEFER_SLOTS: usize = 8;
 const MASKED_SPINS: u32 = 4096;
 const UNMASKED_SPINS: u32 = 1 << 22;
@@ -37,6 +37,8 @@ static TRUNC: AtomicU64 = AtomicU64::new(0);
 static DEFERRED: AtomicU64 = AtomicU64::new(0);
 static DEFER_LOST: AtomicU64 = AtomicU64::new(0);
 static BYPASS: AtomicU64 = AtomicU64::new(0);
+static SRC_EMIT: AtomicU64 = AtomicU64::new(0);
+static SRC_USER: AtomicU64 = AtomicU64::new(0);
 static TRUNC_ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
 struct Buf {
@@ -96,6 +98,10 @@ fn forward(s: &str) {
 /// The macros' single entry. `nl` is true for `serial_println!`.
 #[doc(hidden)]
 pub fn emit(args: fmt::Arguments, nl: bool) {
+    emit_src(args, nl, false)
+}
+
+fn emit_src(args: fmt::Arguments, nl: bool, user: bool) {
     if crate::serial_ring::in_panic_mode() {
         // Last words: no lock, no buffer.
         crate::arch::serial::_print(format_args!("{}{}", args, if nl { "\n" } else { "" }));
@@ -114,6 +120,7 @@ pub fn emit(args: fmt::Arguments, nl: bool) {
     }
     let line = core::str::from_utf8(&lb.b[..lb.n]).unwrap_or("[serial] utf8?\n");
     LINES.fetch_add(1, Relaxed);
+    if user { SRC_USER.fetch_add(1, Relaxed); } else { SRC_EMIT.fetch_add(1, Relaxed); }
 
     let masked = irq_masked();
     let bound = if masked { MASKED_SPINS } else { UNMASKED_SPINS };
@@ -198,5 +205,74 @@ pub fn census_poll() {
     }
     NEXT_CENSUS_MS.store(now.saturating_add(1000), Relaxed);
     let (l, m, t, d, dl, b) = census();
-    serial_println!(":: SERIAL: lines={} merged_fixed={} trunc={} deferred={} defer_lost={} bypass={} -> PASS ::", l, m, t, d, dl, b);
+    let (e, u, raw, ring) = by_source();
+    serial_println!(":: SERIAL: lines={} merged_fixed={} trunc={} deferred={} defer_lost={} bypass={} by_source=[emit:{},user:{},raw:{},ring:{}] -> PASS ::", l, m, t, d, dl, b, e, u, raw, ring);
+}
+
+/// SERIAL2 M1 — where the wire's lines came from: `emit` (kernel macros through the line lock), `user`
+/// (ring-3 `SYS_WRITE` lines through [`emit_user`]), `raw` (`_print` submissions that did NOT come through
+/// `emit`: direct callers and panic mode = SUBMITTED minus the two), `ring` (lines the FTDI capture tap
+/// lost or tore — the sink-side damage the line lock cannot see; boot 18's 1136 merged lines were this
+/// class, `[mirror] tste: 1101 line(s) dropped`, plus ring-3's own 192-byte `Buf` clipping the `\n`).
+pub fn by_source() -> (u64, u64, u64, u64) {
+    let e = SRC_EMIT.load(Relaxed);
+    let u = SRC_USER.load(Relaxed);
+    let sub = crate::serial_ring::SUBMITTED.load(Relaxed);
+    let t = &crate::serial_ring::TAP_FTDI;
+    (e, u, sub.saturating_sub(e + u), t.dropped.load(Relaxed) + t.torn.load(Relaxed))
+}
+
+const USER_SLOTS: usize = 16;
+/// Per-process partial-line bound (SERIAL2 M3).
+const USER_LINE_MAX: usize = 1536;
+struct UserLine {
+    b: [u8; USER_LINE_MAX],
+    n: usize,
+}
+static USER_LINES: [spin::Mutex<UserLine>; USER_SLOTS] =
+    [const { spin::Mutex::new(UserLine { b: [0; USER_LINE_MAX], n: 0 }) }; USER_SLOTS];
+
+/// SERIAL2 M3 — the ring-3 console write path. `sys_write` used to hand each raw write to `serial_print!`;
+/// a vug whose line exceeds one write (or two vugs' writes) could split a line across the lock. Now the
+/// bytes are buffered per process (`row`) until a `\n` and each COMPLETE line goes out as ONE `emit`
+/// (one critical section). A partial line is held up to [`USER_LINE_MAX`] bytes, then flushed as is. The
+/// syscall runs IF-masked: the slot is `try_lock`ed and on contention the text goes out directly.
+pub fn emit_user(row: usize, text: &str) {
+    let mut guard = match USER_LINES.get(row).and_then(|m| m.try_lock()) {
+        Some(g) => g,
+        None => return emit_src(format_args!("{}", text), false, true),
+    };
+    let mut rest = text;
+    while !rest.is_empty() {
+        let (chunk, tail) = match rest.find('\n') {
+            Some(i) => rest.split_at(i + 1),
+            None => (rest, ""),
+        };
+        rest = tail;
+        let complete = chunk.ends_with('\n');
+        if guard.n + chunk.len() > USER_LINE_MAX {
+            // Flush what is held, then fall through with the chunk on its own.
+            if guard.n > 0 {
+                let n = guard.n;
+                if let Ok(h) = core::str::from_utf8(&guard.b[..n]) {
+                    emit_src(format_args!("{}", h), false, true);
+                }
+                guard.n = 0;
+            }
+            if chunk.len() > USER_LINE_MAX {
+                emit_src(format_args!("{}", chunk), false, true);
+                continue;
+            }
+        }
+        let n = guard.n;
+        guard.b[n..n + chunk.len()].copy_from_slice(chunk.as_bytes());
+        guard.n += chunk.len();
+        if complete {
+            let n = guard.n;
+            if let Ok(l) = core::str::from_utf8(&guard.b[..n]) {
+                emit_src(format_args!("{}", l), false, true);
+            }
+            guard.n = 0;
+        }
+    }
 }

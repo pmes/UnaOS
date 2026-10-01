@@ -9,7 +9,16 @@ log="${1:?usage: serial-merged.sh <log>}"
 n=$(LC_ALL=C awk '{
   c = 0; s = $0
   while (match(s, /:: [A-Z][A-Z0-9_\/-]*:/)) { c++; s = substr(s, RSTART + RLENGTH) }
-  if (c >= 2) { m++; if (m <= 5) printf("  e.g. line %d: %.140s\n", NR, $0) > "/dev/stderr" }
+  if (c >= 2) {
+    m++
+    if (m <= 10) {
+      # name the two heads and where the first one was cut (SERIAL2 M1)
+      t = $0; h1 = ""; h2 = ""; p2 = 0
+      if (match(t, /:: [A-Z][A-Z0-9_\/-]*:/)) { h1 = substr(t, RSTART, RLENGTH); r1 = RSTART; t2 = substr(t, RSTART + RLENGTH); off = RSTART + RLENGTH - 1
+        if (match(t2, /:: [A-Z][A-Z0-9_\/-]*:/)) { h2 = substr(t2, RSTART, RLENGTH); p2 = off + RSTART } }
+      printf("  merged #%d line %d: head1=%s head2=%s head1_cut_at=%d len=%d :: %.120s\n", m, NR, h1, h2, p2 - 1, length($0), $0) > "/dev/stderr"
+    }
+  }
 } END { print m + 0 }' "$log")
 echo "$n"
 [ "$n" -eq 0 ]

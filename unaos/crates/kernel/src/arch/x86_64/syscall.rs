@@ -9620,7 +9620,7 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
             (unsafe { core::str::from_utf8_unchecked(&bytes[..v]) }, v as u64)
         }
     };
-    serial_print!("{}", text);
+    crate::serial_line::emit_user(row, text);
     written as i64
 }
 
