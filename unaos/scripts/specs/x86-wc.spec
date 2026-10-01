@@ -936,6 +936,9 @@ REQUIRE :: TESTS: deferred=
 # directory entries, Ctrl-C/L/A/E/U/W. A scripted key sequence against scripted sources, resulting lines checked.
 REQUIRE :: SHELLUX: history=up-down completions=verbs\+paths ctrl=\[c,l,a,e,u,w\] cwd=/.* -> PASS ::
 FORBID :: SHELLUX: .* -> FAIL ::
+# HELPVERB (R75): every registered verb carries a one-line summary + usage (help.rs DOCS); `tests helpdoc` FAILs on any missing.
+REQUIRE :: HELPVERB: verbs=[0-9]+ documented=[0-9]+ missing=\[\] groups=[0-9]+ -> PASS ::
+FORBID :: HELPVERB: .* -> FAIL ::
 # --- SPLASHX86 (R74): the boot splash rendered by the cross-arch ray tracer at the compositor takeover and HELD above the furniture until the stage is known.
 REQUIRE :: SPLASH: arch=x86_64 WxH=[0-9]+x[0-9]+ ms=[0-9]+ -> PASS ::
 # --- SPLASH2: the splash owns the glass from the GOP frame, through the takeover, to the first real screen (witness lines of boot 19).

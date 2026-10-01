@@ -428,3 +428,8 @@ pub fn selftest() {
         Err(e) => serial_println!(":: FILEVIEW: refused reason={} -> FAIL ::", e),
     }
 }
+
+/// HELPVERB (R75) — open in-memory text (a `man` page) in the viewer under `title`. Same body as [`open`].
+pub fn open_text(title: &str, text: &str) -> Result<(usize, usize, usize, usize), String> {
+    open_bytes(title, text.as_bytes(), false)
+}

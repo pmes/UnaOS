@@ -5076,7 +5076,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
     // what the operator typed — including the line the shell is about to refuse. A record taken
     // after `plan` would hold only the commands that worked, which is the opposite of what anyone
     // reads a history for.
-    history_record(cmd_line);
+    history_record(cmd_line); if crate::help::intercept(cmd_line, console) { return false; } // HELPVERB (R75): `help [verb]`, `man <verb>`, `<verb> --help` — help.rs; LINE-NEUTRAL fold.
     let facts = midden_facts();
     let mut vol = FatVolume;
     let plan = midden_core::plan(cmd_line, &facts, &mut vol);
