@@ -137,9 +137,17 @@ const fn parse_pct(s: Option<&str>) -> u16 {
     while i < b.len() { if b[i] >= b'0' && b[i] <= b'9' { n = n * 10 + (b[i] - b'0') as u16; } i += 1; }
     n
 }
-/// `UNAOS_LOWBAT_SHUTDOWN=<pct>` — 0 = off (the default).
+/// `UNAOS_LOWBAT_SHUTDOWN=<pct>` — 0 = off (the default). PREFS (B300): this is now only the DEFAULT; the
+/// preference `system.power.lowbat_shutdown_pct` (Principia's store) overrides it at run time.
 #[cfg(feature = "lowbat_shutdown")]
 pub const LOWBAT_SHUTDOWN_PCT: u16 = parse_pct(option_env!("UNAOS_LOWBAT_SHUTDOWN"));
+
+/// The shutdown percent in force: `system.power.lowbat_shutdown_pct` (0..=100) when set, else the build
+/// default. Read with `prefs::peek_int` (a try-lock: this runs on the device-service path).
+#[cfg(feature = "lowbat_shutdown")]
+pub fn lowbat_shutdown_pct() -> u16 {
+    crate::prefs::peek_int(crate::prefs::key::LOWBAT_PCT, 0, 100).map(|x| x as u16).unwrap_or(LOWBAT_SHUTDOWN_PCT)
+}
 
 fn post_notice(level: u8, pct: u16) {
     #[cfg(feature = "login")]
@@ -154,8 +162,10 @@ pub fn lowbat_service() {
     let hit = threshold_hit(b.percent, b.charging, &mut m);
     if hit != 0 { DONE_MASK.store(m, Ordering::Relaxed); post_notice(hit, b.percent); }
     #[cfg(feature = "lowbat_shutdown")]
-    if LOWBAT_SHUTDOWN_PCT > 0 && !b.charging && b.percent <= LOWBAT_SHUTDOWN_PCT && !SHUT_REQ.swap(true, Ordering::AcqRel) {
-        serial_println!(":: LOWBAT-SHUTDOWN armed: pct={} <= {} — clean shutdown ::", b.percent, LOWBAT_SHUTDOWN_PCT);
+    let pct = lowbat_shutdown_pct();
+    #[cfg(feature = "lowbat_shutdown")]
+    if pct > 0 && !b.charging && b.percent <= pct && !SHUT_REQ.swap(true, Ordering::AcqRel) {
+        serial_println!(":: LOWBAT-SHUTDOWN armed: pct={} <= {} — clean shutdown ::", b.percent, pct);
         crate::power::shutdown();
     }
     let _ = &SHUT_REQ;

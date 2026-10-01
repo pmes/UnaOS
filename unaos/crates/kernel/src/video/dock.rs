@@ -574,7 +574,7 @@ pub fn take_launch(app: PinnedApp) -> bool {
 pub fn relaunch_furniture() {
     post_launch(PinnedApp::Console);
     post_launch(PinnedApp::Shell);
-    dp_request_load(); // DOCKPIN — a fresh session reads ITS `<home>/.dock` (the service pass drains it).
+    dp_request_load(); // DOCKPIN — a fresh session reads ITS `system.dock.pins` (the service pass drains it).
     serial_println!("[dock] furniture relaunch posted console+shell (LOGOUTDESK/R69: a fresh session gets a fresh desktop)");
 }
 
@@ -2907,7 +2907,7 @@ pub fn is_kept(owner: u64) -> bool { if let Some(i) = dp_spec_of_owner(owner) { 
 
 /// Toggle the pin flag for `owner`; returns the new state.
 pub fn toggle_keep(owner: u64) -> bool {
-    if let Some(i) = dp_spec_of_owner(owner) { return dp_toggle(i); } // DOCKPIN — a table app: the pin set is the state, and it is saved to `<home>/.dock` by the service pass.
+    if let Some(i) = dp_spec_of_owner(owner) { return dp_toggle(i); } // DOCKPIN — a table app: the pin set is the state, and it is saved to `system.dock.pins` by the service pass.
     for k in KEPT.iter() {
         if k.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { return false; }
     }
@@ -3129,8 +3129,9 @@ pub fn launch_posted(app: PinnedApp) -> bool {
 // hand-written pins, and DOCKRUN's "Keep in Dock" flag was boot-scoped and drove nothing. New windows
 // this wave (Activity, Settings, the editor) had no tile. Now: [`DP_PINS`] is one row per pinned app
 // (name, initial, kind, launch verb, sentinel id), the pin SET is a bitmask over it ([`DP_MASK`]),
-// "Keep in Dock" / "Remove from Dock" toggle a bit and the service pass writes `<home>/.dock` (one name
-// per line) through the mount table, the same pattern as `<home>/.settings`. A login reads it back
+// "Keep in Dock" / "Remove from Dock" toggle a bit and the service pass persists the set as
+// `system.dock.pins` (comma-joined names) in PRINCIPIA'S store (`crate::prefs`, PREFS B300 — the private
+// `<home>/.dock` is gone, imported once and deleted). A login reads it back
 // (`relaunch_furniture` -> [`dp_request_load`] -> [`dockpin_service`]). Default = all six.
 //
 // LAUNCH goes through the SAME seams the shell verbs use: quarry -> `quarry::request_open` (the existing
@@ -3282,69 +3283,43 @@ pub fn verb_launch_posted() -> bool { DP_VERB_OWED.load(Ordering::Acquire) != 0 
 
 fn dp_request_load() { DP_LOAD_OWED.store(true, Ordering::Release); }
 
-fn dp_home() -> Option<alloc::string::String> {
-    #[cfg(feature = "login")]
-    {
-        let mut b = [0u8; crate::fs::users::NAME_MAX];
-        let n = crate::fs::users::whoami(&mut b)?;
-        let name = core::str::from_utf8(&b[..n]).ok()?;
-        return Some(alloc::format!("/home/{}/", name));
-    }
-    #[cfg(not(feature = "login"))]
-    { None }
-}
-fn dp_path() -> Option<alloc::string::String> { dp_home().map(|h| alloc::format!("{}.dock", h)) }
+/// The session user's home with a trailing `/`, from the users table (never a `/home/<name>` literal).
+fn dp_home() -> Option<alloc::string::String> { crate::prefs::home().map(|h| alloc::format!("{}/", h)) }
 
-/// Parse `.dock` text: the mask of known names. Pure.
+/// Parse a pin list (comma- or newline-separated names): the mask of known names. Pure.
 pub fn dp_parse(text: &[u8]) -> (u32, u32) {
     let (mut mask, mut count) = (0u32, 0u32);
-    for line in text.split(|&b| b == b'\n') {
-        let l = core::str::from_utf8(line).unwrap_or("").trim();
+    for item in text.split(|&b| b == b',' || b == b'\n') {
+        let l = core::str::from_utf8(item).unwrap_or("").trim();
         if let Some(i) = DP_PINS.iter().position(|s| s.name.eq_ignore_ascii_case(l)) {
             if mask & (1 << i) == 0 { mask |= 1 << i; count += 1; }
         }
     }
     (mask, count)
 }
-/// Render a mask as `.dock` text. Pure.
+/// Render a mask as the `system.dock.pins` value (comma-joined; TOML arrays are outside prefs_core's subset). Pure.
 pub fn dp_render(mask: u32) -> alloc::string::String {
     let mut s = alloc::string::String::new();
-    for (i, sp) in DP_PINS.iter().enumerate() { if mask & (1 << i) != 0 { s.push_str(sp.name); s.push('\n'); } }
+    for (i, sp) in DP_PINS.iter().enumerate() { if mask & (1 << i) != 0 { if !s.is_empty() { s.push(','); } s.push_str(sp.name); } }
     s
 }
 
-fn dp_write(path: &str, mask: u32) -> Result<usize, alloc::string::String> {
-    use crate::fs::vfs::NodeKind;
-    let mt = crate::shell::vfs_mount_table();
-    let p = crate::fs::vfs::KERNEL_PRINCIPAL;
-    let text = dp_render(mask);
-    let _ = mt.unlink(path, p);
-    mt.create(path, NodeKind::File, p).map_err(|e| alloc::format!("create: {:?}", e))?;
-    let b = text.as_bytes();
-    let mut off = 0usize;
-    while off < b.len() {
-        let w = mt.write(path, off as u64, &b[off..], p).map_err(|e| alloc::format!("write: {:?}", e))?;
-        if w == 0 { return Err(alloc::string::String::from("write: zero")); }
-        off += w;
-    }
-    Ok(off)
-}
-fn dp_read(path: &str) -> Option<alloc::vec::Vec<u8>> {
-    let mt = crate::shell::vfs_mount_table();
-    let st = mt.stat(path).ok()?;
-    if st.size == 0 || st.size > 1024 { return Some(alloc::vec::Vec::new()); }
-    mt.read(path, 0, st.size as usize).ok()
+/// Persist `mask` as `system.dock.pins`. `Ok(bytes of the value)`.
+fn dp_write(mask: u32) -> Result<usize, alloc::string::String> {
+    let v = dp_render(mask);
+    let n = v.len();
+    crate::prefs::set(crate::prefs::NS, crate::prefs::key::DOCK_PINS, crate::prefs::PrefValue::Str(v)).map(|_| n)
 }
 
-/// Read `<home>/.dock` into the mask. Missing file or no home = the default set. Returns names loaded (0 = default).
+/// Read `system.dock.pins` into the mask. Unset or no known name = the default set. Returns names loaded (0 = default).
 fn dp_load() -> u32 {
-    let Some(path) = dp_path() else { DP_MASK.store(DP_ALL, Ordering::Release); return 0 };
-    match dp_read(&path) {
-        Some(t) if !t.is_empty() => {
-            let (m, c) = dp_parse(&t);
+    crate::prefs::ensure_loaded();
+    match crate::prefs::text(crate::prefs::key::DOCK_PINS) {
+        Some(t) => {
+            let (m, c) = dp_parse(t.as_bytes());
             if c == 0 { DP_MASK.store(DP_ALL, Ordering::Release); 0 } else { DP_MASK.store(m, Ordering::Release); c }
         }
-        _ => { DP_MASK.store(DP_ALL, Ordering::Release); 0 }
+        None => { DP_MASK.store(DP_ALL, Ordering::Release); 0 }
     }
 }
 
@@ -3377,7 +3352,7 @@ pub fn dockpin_service() {
     }
     if DP_SAVE_OWED.swap(false, Ordering::AcqRel) {
         let m = DP_MASK.load(Ordering::Acquire);
-        let r = match dp_path() { Some(p) => dp_write(&p, m).map(|b| b as i64), None => Ok(0) };
+        let r = dp_write(m).map(|b| b as i64);
         match r {
             Ok(b) => DP_SAVED.store(b, Ordering::Relaxed),
             Err(e) => { DP_SAVED.store(-1, Ordering::Relaxed); serial_println!("[dock] dockpin save failed: {}", e); }
@@ -3386,12 +3361,12 @@ pub fn dockpin_service() {
     }
 }
 
-/// `tests dockpin` — pin, save, re-read, unpin; pure parse legs plus the real file round trip when a home exists.
+/// `tests dockpin` — pin, save, re-read, unpin; pure parse legs plus the real round trip through Principia's store.
 #[cfg(feature = "witness")]
 pub fn dockpin_selftest() {
     let saved_mask = DP_MASK.load(Ordering::Relaxed);
     // Leg 1 — pure: render/parse round trip, unknown names ignored, duplicates folded.
-    let (m, c) = dp_parse(b"shell\nbogus\neditor\nshell\n");
+    let (m, c) = dp_parse(b"shell,bogus,editor,shell");
     let parse_ok = m == (1 << 1 | 1 << 5) && c == 2 && dp_parse(&*dp_render(DP_ALL).into_bytes()) == (DP_ALL, 6);
     // Leg 2 — pin/unpin changes the model: unpin editor -> its tile (pin or live) leaves; pin -> returns.
     let has = |i: usize| -> Option<bool> {
@@ -3405,19 +3380,21 @@ pub fn dockpin_selftest() {
     let off = has(5);
     DP_MASK.store(DP_ALL, Ordering::Release);
     let toggle_ok = match (on, off) { (Some(a), Some(b)) => a && !b, _ => true };
-    // Leg 3 — file round trip through the mount table at `<home>/.dock` (skipped, and said so, with no home).
-    let (mut file_ok, mut bytes, mut skip) = (true, 0i64, false);
-    match dp_path() {
-        Some(p) => {
-            let want = DP_ALL & !(1 << 4);
-            match dp_write(&p, want) {
-                Ok(b) => { bytes = b as i64; DP_MASK.store(DP_ALL, Ordering::Release); let c = dp_load(); file_ok = c == 5 && DP_MASK.load(Ordering::Relaxed) == want; }
-                Err(_) => file_ok = false,
-            }
-            let _ = dp_write(&p, saved_mask); // leave the operator's own set behind
+    // Leg 3 — store round trip: `system.dock.pins` set, the preferences FILE re-read through the VFS and
+    // parsed with prefs_core, the mask reloaded from it; the operator's own set is left behind.
+    let (mut file_ok, mut bytes, skip) = (true, 0i64, false);
+    let want = DP_ALL & !(1 << 4);
+    match dp_write(want) {
+        Ok(b) => {
+            bytes = b as i64;
+            let in_file = matches!(crate::prefs::read_file(), Some(Ok(t)) if t.get(crate::prefs::NS, crate::prefs::key::DOCK_PINS).and_then(|v| v.as_str()).map(|s| dp_parse(s.as_bytes())) == Some((want, 5)));
+            DP_MASK.store(DP_ALL, Ordering::Release);
+            let c = dp_load();
+            file_ok = in_file && c == 5 && DP_MASK.load(Ordering::Relaxed) == want;
         }
-        None => skip = true,
+        Err(_) => file_ok = false,
     }
+    let _ = dp_write(saved_mask);
     DP_MASK.store(saved_mask, Ordering::Release);
     let ok = parse_ok && toggle_ok && file_ok;
     serial_println!(":: DOCKPIN: tiles={} pinned={} running={} loaded={} saved={} fixture parse={} toggle={} file={} -> {} ::",

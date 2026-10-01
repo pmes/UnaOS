@@ -74,6 +74,7 @@ pub static DOCS: &[VerbDoc] = &[
     d("man", "windows", "open a verb's help text in the viewer window", "man <verb>", &["man ls"]),
     d("activity", "windows", "open the activity monitor window (q closes, k kills the selected process)", "activity", &["activity"]),
     d("settings", "windows", "open the settings window", "settings", &["settings"]),
+    d("pref", "windows", "read or set a preference in Principia's store (<home>/.config/unaos/preferences.toml)", "pref get <ns.key> | pref set <ns.key> <value> | pref list [<ns>]", &["pref list system", "pref get system.display.brightness", "pref set system.display.idle_min 5"]),
     d("shortcuts", "windows", "print the desktop keyboard shortcuts", "shortcuts", &["shortcuts"]),
     d("wallpaper", "windows", "set the desktop backdrop from a PNG (<= 4 MB), or `off` for the flat colour", "wallpaper <path.png> | wallpaper off", &["wallpaper /home/ann/SKY.PNG", "wallpaper off"]),
     d("screenshot", "windows", "capture the panel to SCREEN<n>.PNG at the volume root", "screenshot", &["screenshot"]),
