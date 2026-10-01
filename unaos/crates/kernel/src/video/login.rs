@@ -1024,7 +1024,7 @@ fn submit_setpw() {
         clear_passwords(&mut f);
         return;
     }
-    if let Err(e) = users::set_first_password(n, &pw[..plen]) {
+    if let Err(e) = users::set_password_checked(n, &pw[..plen]) {
         serial_println!("[login] set-password user={} NOT written reason={} (the form stays)", who, users::users_reason(e));
         let mut f = FORM.lock();
         f.message = "Could not save the password";

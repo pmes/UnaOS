@@ -3145,15 +3145,7 @@ pub fn installer_create_user(name: &[u8], password: &[u8]) -> Result<(), &'stati
     if boot_stage() != BootStage::CreateUser {
         return Err("not the create-user stage");
     }
-    if !name_ok(name) {
-        return Err("Name: a-z 0-9 _ - , letter first, 8 max");
-    }
-    if name == ROOT_NAME {
-        return Err("root is taken");
-    }
-    if password.is_empty() {
-        return Err("Type a password");
-    }
+    create_user_rules(name, password)?;
     let made = adduser_commit(name).map_err(|_| "Could not create the user")?;
     if set_first_password(name, password).is_err() {
         serial_println!("[login] installer: create-user user={} row made but the password was NOT written (the form stays)", wire_name(name));
@@ -3199,3 +3191,41 @@ fn boot2_login_entry() { crate::video::crystal::login::boot2_fixture(b"una", b"c
 /// LOGINFLOW2 M2 — LOGOUTUI M4: the refused-logout alert and the accepted Log Out round trip.
 #[cfg(all(feature = "loginst", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn logout_entry() { crate::video::crystal::login::logout_fixture(b"una", b"correct-horse"); }
+
+/// SETTINGS2 (R75): the create-user form's validation, shared with the Settings Users tab (the same
+/// words the installer form shows). `Ok` = name and password are acceptable to create with.
+pub fn create_user_rules(name: &[u8], password: &[u8]) -> Result<(), &'static str> {
+    if !name_ok(name) {
+        return Err("Name: a-z 0-9 _ - , letter first, 8 max");
+    }
+    if name == ROOT_NAME {
+        return Err("root is taken");
+    }
+    if password.is_empty() {
+        return Err("Type a password");
+    }
+    Ok(())
+}
+
+/// SETTINGS2: the reason the last `users`/`deluser` verb ended with (`listed`, `deleted`, `self`, `root-row`, `last-user`, ...).
+pub fn usermgmt_last() -> &'static str {
+    *USERMGMT_LAST.lock()
+}
+
+/// SETTINGS2: may the set-password screen WRITE `name`'s password? An unset row (the first choice), any row
+/// from the root session (Reset password), or the session's own row (Change password).
+pub fn setpw_allowed(name: &[u8]) -> bool {
+    if password_unset(name) == Some(true) || root_session() {
+        return true;
+    }
+    let mut nb = [0u8; NAME_MAX];
+    matches!(whoami(&mut nb), Some(n) if &nb[..n] == name)
+}
+
+/// SETTINGS2: write `name`'s password under [`setpw_allowed`] (the screen's entry).
+pub fn set_password_checked(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
+    if !setpw_allowed(name) {
+        return Err(UsersError::Refused);
+    }
+    set_password(name, password)
+}
