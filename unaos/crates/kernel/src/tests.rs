@@ -129,7 +129,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
-    ensure_shellux();
+    ensure_shellux(); ensure_selfinstall();
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
@@ -155,5 +155,15 @@ fn ensure_shellux() {
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("shellux", crate::shellux::selftest); }
+    }
+}
+
+/// SELFINSTALL: register `selfinstall` (the `install ssd --dry-run` plan) exactly once. x86 + the
+/// installer + AHCI only; on a lane with no SATA disk the fixture prints SKIP, never a pin.
+fn ensure_selfinstall() {
+    #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("selfinstall", crate::install::selfinstall::selftest); }
     }
 }

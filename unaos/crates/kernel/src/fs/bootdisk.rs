@@ -923,7 +923,7 @@ fn aliased_field(disks: &[Disk]) -> String {
 /// `unafs` is passed in rather than probed here so this stays pure: the walk knows which disks carry
 /// a UnaFS volume, and asking the block layer from inside a planner would make it untestable.
 fn plan(disks: &[Disk], unafs: &[bool]) -> (Option<usize>, Vec<Home>) {
-    let root_ix = disks.iter().position(|d| !d.hits.is_empty());
+    let root_ix = pick_root(disks);
     let mut used: Vec<String> = Vec::new();
     let mut others: Vec<Home> = Vec::new();
     for (i, d) in disks.iter().enumerate() {
@@ -997,7 +997,7 @@ fn walk_and_witness() -> Survey {
         }
     }
 
-    let (root_ix, others) = plan(&disks, &unafs);
+    let (root_ix, others) = plan(&disks, &unafs); root_candidates(&disks, root_ix); // SELFINSTALL M3: name what the root walk chose when both the card and the SSD carry UnaOS
     let matching = disks.iter().filter(|d| !d.hits.is_empty()).count();
     let win = window_addr();
 
@@ -2956,5 +2956,61 @@ pub fn root_pass_fixture() {
         crate::arch::ms().saturating_sub(start),
         start,
         seen
+    );
+}
+
+// =================================================================================================
+// SELFINSTALL M3 (SH-3) — the SSD boot: the root walk names its candidates, and a knob picks between them.
+// File tail: nothing above moves.
+//
+// The walk already finds a SATA root by CONTENT (AHCIBOOT). Once the card has cloned itself onto the
+// internal SSD, BOTH carry this kernel, and `plan` bound whichever the live-source order listed first
+// (the card's rungs before the SATA rung). `[bootdisk] root candidates:` says which disks carried the
+// kernel and which was chosen, so the boot-19/20 capture names it instead of leaving it to inference;
+// `UNAOS_ROOT_PREFER=ahci|sdhc` (cargo features `root-prefer-ahci` / `root-prefer-sdhc`) pins the pick
+// to that source family when it has a hit, and falls back to first-found when it has none.
+// =================================================================================================
+
+/// First disk with a kernel hit — or, under a `root-prefer-*` build, the first such disk of that family.
+fn pick_root(disks: &[Disk]) -> Option<usize> {
+    #[cfg(feature = "root-prefer-ahci")]
+    if let Some(i) = disks.iter().position(|d| !d.hits.is_empty() && d.source.name().starts_with("ahci")) {
+        return Some(i);
+    }
+    #[cfg(feature = "root-prefer-sdhc")]
+    if let Some(i) = disks.iter().position(|d| !d.hits.is_empty() && d.source.name().starts_with("sdhc")) {
+        return Some(i);
+    }
+    disks.iter().position(|d| !d.hits.is_empty())
+}
+
+/// `[bootdisk] root candidates: sdhc=<hit|nohit|absent> ahci=<hit|nohit|absent> usb=<..> chose=<source|none> prefer=<ahci|sdhc|none>`
+fn root_candidates(disks: &[Disk], root_ix: Option<usize>) {
+    fn fam(disks: &[Disk], prefix: &str) -> &'static str {
+        let mut seen = false;
+        for d in disks {
+            if d.source.name().starts_with(prefix) {
+                seen = true;
+                if !d.hits.is_empty() {
+                    return "hit";
+                }
+            }
+        }
+        if seen { "nohit" } else { "absent" }
+    }
+    let prefer = if cfg!(feature = "root-prefer-ahci") {
+        "ahci"
+    } else if cfg!(feature = "root-prefer-sdhc") {
+        "sdhc"
+    } else {
+        "none"
+    };
+    serial_println!(
+        "[bootdisk] root candidates: sdhc={} ahci={} usb={} chose={} prefer={}",
+        fam(disks, "sdhc"),
+        fam(disks, "ahci"),
+        fam(disks, "usb"),
+        root_ix.map_or("none", |i| disks[i].source.name()),
+        prefer
     );
 }

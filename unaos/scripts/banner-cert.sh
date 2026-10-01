@@ -297,6 +297,7 @@ gen7|:: gen7: r6 next=STOP-window-or-register-block-out-of-range|-|measured
 gmux_igd|:: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD|intel-ivb|measured
 unaos_ivb|@boot iGPU trace 1 (pre-EBS) collected.|-|measured
 ahci|:: AHCI: port=|-|measured
+root-prefer|[bootdisk] root candidates:|-|measured
 bar1wedge|:: BAR1WEDGE: rung=first-stall|-|measured
 bar1exp-uc|:: x86 bar1exp: UC arm ARMED via=|-|measured
 beam|:: BEAMX86: head=|nvidia-kepler,nvidia-kepler-takeover|measured

@@ -36,7 +36,7 @@ pub use crate::hash;
 // system booted from. Arch-neutral (it compares a FAT volume serial carried in `BootInfo` against the
 // serials found on each candidate), so it rides with the engine on both arches; on aarch64 the serial
 // is absent and the guard disarms with a witness line.
-pub mod selfguard;
+pub mod selfguard; #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))] pub mod selfinstall; // SELFINSTALL (SH-3): `install ssd --dry-run|--write`; see install/selfinstall.rs
 
 // INSTALL-PI: the Pi 4 emmc2 microSD installer flow (three-gate escalation), driving this same engine
 // onto the seated card via `drivers::emmc2`. `piinstall`-gated (⇒ baremetal); compiled out otherwise.

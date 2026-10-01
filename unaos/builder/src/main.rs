@@ -308,6 +308,13 @@ fn main() {
     // Default OFF => no ATA write opcode is linked (`WRITE-DMA-EXT-0x35` is 0 hits on the ELF) and
     // media are byte-identical. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
     if std::env::var("UNAOS_AHCI_WRITE").is_ok() { feats.push("ahci-write"); }
+    // SELFINSTALL M3 (SH-3): UNAOS_ROOT_PREFER=ahci|sdhc picks the bootdisk root when both the card and the SSD carry
+    // UnaOS (cargo features root-prefer-ahci / root-prefer-sdhc). Default OFF => first-found. Kept in sync with arroyo.
+    match std::env::var("UNAOS_ROOT_PREFER").as_deref() {
+        Ok("ahci") => feats.push("root-prefer-ahci"),
+        Ok("sdhc") => feats.push("root-prefer-sdhc"),
+        _ => {}
+    }
     // HDA (rmbp-ledger B127, arc 1): UNAOS_HDA=1 arms drivers/hda.rs — the High Definition Audio
     // controller, the kernel's first audio line. THIS list is what reaches the kernel binary for
     // MEDIA builds and for every QEMU run that goes through this builder: the builder re-derives
