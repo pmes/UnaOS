@@ -653,10 +653,12 @@ fn open_as(state: State) {
     KEY_SAID.store(false, Ordering::Relaxed); // LOGIN13 M3 — and so is the one key line
     if HEADLESS.load(Ordering::Relaxed) {
         serial_println!("[login] screen open window=no (fixture — headless form)");
+        crate::splash::hold_release("first-screen");
         return;
     }
     let Some((_s, ow, oh)) = wm::spawn_geometry(W, H) else {
         serial_println!("[login] screen open window=no (no surface yet — headless form)");
+        crate::splash::hold_release("first-screen");
         return;
     };
     let (pw, ph) = {
@@ -683,6 +685,7 @@ fn open_as(state: State) {
     if id == wm::WIN_NONE {
         FORM.lock().windowed = false;
         serial_println!("[login] screen open window=no (create refused — headless form)");
+        crate::splash::hold_release("first-screen");
         return;
     }
     WIN.store(id, Ordering::Relaxed); wm::set_modal_top(id); // LOGINZ (B223): the screen and the alert are the ceiling — a later create or focus-raise cannot pass them (flight 15 §2: "the pw dialog got covered up")
@@ -692,6 +695,7 @@ fn open_as(state: State) {
     fbcon::console_present_suspend(true);
     serial_println!("[login] screen open window={} box={}x{} at ({},{}) modal=true", id, ow, oh, ox, oy);
     repaint();
+    crate::splash::hold_release("first-screen"); // SPLASH2 M3: the first real screen (setter / create-user / login) is PAINTED — the splash gives the glass up now
 }
 
 fn take_down() {
