@@ -1787,8 +1787,16 @@ pub fn panel_console_resume() -> usize {
             c.row = 0;
             c.fg = FG_DEFAULT;
             c.bg = BG_DEFAULT;
-            c.full_fb().fill_screen(BG_DEFAULT);
-            c.full_fb().flush_all();
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+            let spl = crate::splash::takeover_blit(&c.full_fb()); // SPLASH2 M2: the first frame after the takeover IS the splash
+            #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+            let spl = false;
+            if !spl {
+                c.full_fb().fill_screen(BG_DEFAULT);
+                c.full_fb().flush_all();
+            } else {
+                PANEL_MIRROR_HOLD.store(true, Ordering::Relaxed); // no console glyphs over the splash; lifts when the console window route installs
+            }
             base = c.fb.base() as u64;
             pitch = info.stride * info.bytes_per_pixel;
             cell = (c.cell_w, c.cell_h);

@@ -450,7 +450,7 @@ pub fn activate_on(desc: SurfaceDesc) {
     {
         super::cursor::undraw();
         let fb = *super::WRITER.lock();
-        fb.fill_screen(wm::DESKTOP_BG);
+        if !crate::splash::glass_held() { fb.fill_screen(wm::DESKTOP_BG); } // SPLASH2 M2: the takeover already blitted the splash — no DESKTOP_BG flash under it
         fb.flush_all();
     }
     super::wcpar::start(); #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))] crate::drivers::gpu::kepler_vblank::pump_spawn_once(); // KVBLANK6 — task context; WCPAR — band workers exist before the first composite; prints `[wcpar] pool=`

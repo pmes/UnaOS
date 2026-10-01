@@ -923,7 +923,10 @@ REQUIRE :: SHELLUX: history=up-down completions=verbs\+paths ctrl=\[c,l,a,e,u,w\
 FORBID :: SHELLUX: .* -> FAIL ::
 # --- SPLASHX86 (R74): the boot splash rendered by the cross-arch ray tracer at the compositor takeover and HELD above the furniture until the stage is known.
 REQUIRE :: SPLASH: arch=x86_64 WxH=[0-9]+x[0-9]+ ms=[0-9]+ -> PASS ::
-REQUIRE [splash] held_ms=[0-9]+ released_by=(store-loaded|timeout)
+# --- SPLASH2: the splash owns the glass from the GOP frame, through the takeover, to the first real screen (witness lines of boot 19).
+REQUIRE :: SPLASH: stage=gop at_ms=[0-9]+ 
+REQUIRE :: SPLASH: stage=takeover at_ms=[0-9]+ ::
+REQUIRE [splash] held_ms=[0-9]+ released_by=(first-screen|timeout)
 # ── TEXTEDIT (R75), TAIL-APPENDED — the editor fixture opens a scratch file, types 40 chars, saves, re-reads, compares
 REQUIRE :: TEXTEDIT: path=
 FORBID :: TEXTEDIT: .* -> FAIL ::

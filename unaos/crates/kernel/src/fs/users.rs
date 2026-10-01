@@ -3038,7 +3038,7 @@ fn stage_publish(st: BootStage, why: &str) {
         if st == BootStage::Desktop && why != "store-has-users" {
             crate::video::crystal::login::installer_release();
         }
-        crate::splash::hold_release("store-loaded"); // SPLASHX86: the stage is known and its first window is up beneath — the glass is handed over
+        if st == BootStage::Desktop { crate::splash::hold_release("first-screen"); } // SPLASH2 M3: the desktop furniture has composited above (BAR_HELD composite) — hand the glass over; setter / login screens release from `login::open_as` AFTER their first paint (5 s `hold_service` bound stays)
     }
 }
 

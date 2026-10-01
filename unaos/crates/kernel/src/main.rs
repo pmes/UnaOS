@@ -227,10 +227,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // batteries stay byte-identical.
     #[cfg(all(
         target_arch = "x86_64",
-        not(any(feature = "usbdebug", feature = "bootlog", feature = "witness"))
+        any(feature = "wc", not(any(feature = "usbdebug", feature = "bootlog", feature = "witness")))
     ))]
     if framebuffer_addr != 0 {
-        unaos_kernel::splash::boot_splash(framebuffer_addr as usize, framebuffer_size, info);
+        unaos_kernel::splash::gop_stage(framebuffer_addr as usize, framebuffer_size, info);
     }
 
     // EDID/mode-selection diagnostics (read before memory::init consumes boot_info); only the
