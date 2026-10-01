@@ -161,5 +161,6 @@ fn ensure_shellux() {
     {
         static DONE2: AtomicBool = AtomicBool::new(false);
         if !DONE2.swap(true, Ordering::AcqRel) { register("settings", crate::video::settings::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("shellux", crate::shellux::selftest); register("scrollback", crate::console::scrollback_selftest); } // SCROLLBACK (R75)
     }
 }

@@ -948,3 +948,11 @@ FORBID :: SETTINGS: .* -> FAIL ::
 # ── ACTIVITY (R75), TAIL-APPENDED — the load/process/heap window: open, two repaints, close (`tests activity`)
 REQUIRE :: ACTIVITY: cpus=
 FORBID :: ACTIVITY: .* -> FAIL ::
+# ── SCROLLBACK (R75): the shell window keeps 2000 lines and a view offset ───────────────────────────
+# Fixture `console::scrollback_selftest` (`tests scrollback`, panel-less Console): 300 lines printed,
+# view scrolled up 100 (`view_off=100`, the top buffer row asserted), one more line leaves the view
+# where it was and counts in the `[N new lines]` marker (`marker_ok`), a pointer cell on the scrolled
+# view resolves to its BUFFER row (`sel_ok` — selection rows are absolute), a typed key snaps back,
+# `clear` keeps the lines and `clear --all` drops them (`clear_ok`).
+REQUIRE :: SCROLLBACK: rows=2000 cols=\d+ view_off=\d+ marker_ok=ok sel_ok=ok clear_ok=ok -> PASS ::
+FORBID :: SCROLLBACK: .* -> FAIL ::

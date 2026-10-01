@@ -558,12 +558,20 @@ use super::keymap::{Action, Binding, Table, ALT, CMD, CTRL, SHIFT};
 /// order at compile time) — and `Shift+Home`/`Shift+End` as well, because the rMBP's internal
 /// keyboard has no Home or End key but an external one on the same desktop does.
 pub static CRISPY_ROWS: [Binding; 28] = [
+pub static CRISPY_ROWS: [Binding; 33] = [
     // The two chords flight 11 proved on metal. Their tokens are the exact bytes the `[prtscr]`
     // witness has always carried, so a capture from before KEYMAP and one from after grep alike.
     Binding { roles: CMD | SHIFT, usage: 0x20, action: Action::Screenshot, token: super::shortcuts::C_CMD_SHIFT_3 },
     Binding { roles: CMD | SHIFT, usage: 0x21, action: Action::ScreenshotRegion, token: super::shortcuts::C_CMD_SHIFT_4 },
     // The SLOT (R60). LOGINFLOW may bind it; nothing else may, and nothing acts on it today.
     Binding { roles: CMD | SHIFT, usage: 0x14, action: Action::LogOut, token: "cmd-shift-q" },
+    // SCROLLBACK (R75) — ABOVE every bare Home/End row (`no_shadow`). Cmd+Home/End and Ctrl+Home/End jump, Shift+PgUp/PgDn page.
+    Binding { roles: SHIFT, usage: 0x4B, action: Action::ScrollPageUp, token: "shift-pgup" },
+    Binding { roles: SHIFT, usage: 0x4E, action: Action::ScrollPageDown, token: "shift-pgdn" },
+    Binding { roles: CMD, usage: 0x4A, action: Action::ScrollTop, token: "cmd-home" },
+    Binding { roles: CMD, usage: 0x4D, action: Action::ScrollBottom, token: "cmd-end" },
+    Binding { roles: CTRL, usage: 0x4A, action: Action::ScrollTop, token: "ctrl-home" },
+    Binding { roles: CTRL, usage: 0x4D, action: Action::ScrollBottom, token: "ctrl-end" },
     // TERMSEL — to the line start / end, the Mac chords. ABOVE the bare Shift rows (precedence).
     Binding { roles: CMD | SHIFT, usage: 0x50, action: Action::SelectLineStart, token: "cmd-shift-left" },
     Binding { roles: CMD | SHIFT, usage: 0x4F, action: Action::SelectLineEnd, token: "cmd-shift-right" },
@@ -625,13 +633,18 @@ pub static CRISPY_BINDINGS: &Table = &Table {
 /// The rows are the SAME rows in role space. What differs is one field — `cmd_role` — plus the
 /// keyboard the operator is typing on: `Alt+C` is copy on a PC because R61 says the Command role
 /// moves to Alt there, not because a second Copy row was written.
-pub static PC_ROWS: [Binding; 17] = [
+pub static PC_ROWS: [Binding; 21] = [
     // PrtSc. The SHIFTED row is written ABOVE the bare one, and it has to be: the bare row names
     // no roles, so it matches with Shift held too and would shadow the region chord entirely. That
     // is this table's one ordering hazard; the `const` block at the foot of this file checks it.
     Binding { roles: SHIFT, usage: 0x46, action: Action::ScreenshotRegion, token: "shift-prtsc" },
     Binding { roles: 0, usage: 0x46, action: Action::Screenshot, token: "prtsc" },
     Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: super::shortcuts::C_ALT_TAB }, // WINCYCLE — Alt is the PC's cmd role
+    Binding { roles: SHIFT, usage: 0x4B, action: Action::ScrollPageUp, token: "shift-pgup" }, // SCROLLBACK (R75) — above the bare Home/End rows
+    Binding { roles: SHIFT, usage: 0x4E, action: Action::ScrollPageDown, token: "shift-pgdn" },
+    Binding { roles: CTRL, usage: 0x4A, action: Action::ScrollTop, token: "ctrl-home" },
+    Binding { roles: CTRL, usage: 0x4D, action: Action::ScrollBottom, token: "ctrl-end" },
+    Binding { roles: CMD, usage: 0x2B, action: Action::CycleWindow, token: "alt-tab" }, // WINCYCLE — Alt is the PC's cmd role
     Binding { roles: CMD, usage: 0x06, action: Action::Copy, token: "alt-c" },
     Binding { roles: CMD, usage: 0x19, action: Action::Paste, token: "alt-v" },
     Binding { roles: CMD, usage: 0x1B, action: Action::Cut, token: "alt-x" },

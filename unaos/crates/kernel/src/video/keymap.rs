@@ -139,6 +139,14 @@ pub enum Action {
     LockScreen,
     /// SHORTCUTS: open the keyboard-shortcut help overlay (`⌘/`). Acted on by the router.
     ShowShortcuts,
+    /// SCROLLBACK: the shell view one page toward older output (`Shift+PgUp`). Consumed by `Console::act`.
+    ScrollPageUp,
+    /// SCROLLBACK: one page toward the live bottom (`Shift+PgDn`).
+    ScrollPageDown,
+    /// SCROLLBACK: the oldest page (`Cmd+Home` / `Ctrl+Home`).
+    ScrollTop,
+    /// SCROLLBACK: back to the live bottom (`Cmd+End` / `Ctrl+End`).
+    ScrollBottom,
 }
 
 impl Action {
@@ -166,6 +174,10 @@ impl Action {
             Action::CycleWindow => "cycle-window",
             Action::LockScreen => "lock-screen",
             Action::ShowShortcuts => "show-shortcuts",
+            Action::ScrollPageUp => "scroll-page-up",
+            Action::ScrollPageDown => "scroll-page-down",
+            Action::ScrollTop => "scroll-top",
+            Action::ScrollBottom => "scroll-bottom",
         }
     }
 
