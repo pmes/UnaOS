@@ -6958,7 +6958,7 @@ fn x86_render_service(cpu: usize) {
                         dock::app_launched(PinnedApp::Shell, id, "x86_render_service", 1);
                     }
                 }
-            }
+            } if unaos_kernel::video::dock::verb_launch_posted() && shell_id != unaos_kernel::video::wm::WIN_NONE { if let Some(v) = unaos_kernel::video::dock::take_verb_launch() { serial_println!("[dock] dockpin verb {}", v); let _ = unaos_kernel::shell::dispatch_command(v, &mut shell_console, &mut shell_pal); shell_console.draw(&mut shell_pal); shell_pal.render(); } } // DOCKPIN — LINE-NEUTRAL fold (main.rs is line-sensitive). A ring-3 table app's tile (activity, settings) latched its VERB; the shell window is the seam that runs it, exactly as if typed. Held until the shell is live (the press also posted the shell launch above).
         }
 
         // CURSOR-HIDE: restore the pixels under the sprite once when the auto-hide delay expires

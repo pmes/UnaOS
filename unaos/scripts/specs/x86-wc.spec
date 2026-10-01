@@ -873,6 +873,9 @@ FORBID \[fileview\] refuse
 # --- a right-click/long-press menu's Quit closes the owner and the tile leaves.
 REQUIRE :: DOCKRUN: tiles=\d+ running=\d+ pinned=\d+ raise=ok quit=ok menu_drawn=1 -> PASS ::
 FORBID :: DOCKRUN: .* -> FAIL ::
+# --- DOCKPIN (R75) — the dock's pinned apps are a table persisted at `<home>/.dock`: the line prints on login and on each Keep/Remove change.
+REQUIRE :: DOCKPIN: tiles=\d+ pinned=\d+ running=\d+ loaded=\d+ saved=-?\d+ .*-> PASS ::
+FORBID :: DOCKPIN: .* -> FAIL ::
 # --- QUARRYOPS (R75) — Quarry's file operations: mkdir / rename (a LONG name, the LFNMV2 `[fs] mv ... lfn=1` path) /
 # --- copy / delete on a scratch folder under /home, verified by LISTING, plus two DIRNS refusals (outside /home, the home
 # --- itself). The fixture is a `tests` registry entry the lane runs at boot; a SKIP (no /home volume) is not a pass.
