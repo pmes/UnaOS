@@ -163,6 +163,8 @@ pub struct Ihdr {
     pub height: u32,
     pub depth: u8,
     pub colour: u8,
+    /// IHDR interlace method 1 (Adam7).
+    pub interlaced: bool,
 }
 
 impl Ihdr {
@@ -247,7 +249,7 @@ impl FacetError {
             FacetError::NotPng => String::from("not-png"),
             FacetError::Truncated => String::from("truncated"),
             FacetError::BadIhdr(w) => alloc::format!("bad-ihdr({})", w),
-            FacetError::Interlaced => String::from("interlaced-adam7-unsupported"),
+            FacetError::Interlaced => String::from("interlaced-adam7-over-3Mpx"),
             FacetError::BadPalette(w) => alloc::format!("bad-palette({})", w),
             FacetError::BadIdat(w) => alloc::format!("bad-idat({})", w),
             // The decoder's own sentence, HYPHENATED: `inflate_reason` writes prose ("zlib trailer
@@ -545,58 +547,9 @@ impl<'a> RowSink<'a> {
         })
     }
 
-    /// Read the `n`-th sample of the `x`-th pixel out of the unfiltered scanline, normalised to 8
-    /// bits. Sub-byte depths are unpacked MSB-first, which is PNG's order (§7.2); depth 16 keeps the
-    /// high byte, which is exactly what a truncation to 8 bits per channel is.
-    #[inline]
-    fn sample(&self, x: usize, chan: usize, chans: usize) -> u8 {
-        let d = self.ihdr.depth as usize;
-        match d {
-            8 => *self.cur.get(x * chans + chan).unwrap_or(&0),
-            16 => *self.cur.get((x * chans + chan) * 2).unwrap_or(&0),
-            _ => {
-                // 1, 2 or 4 bits — only ever one channel (greyscale or palette index).
-                let idx = x * chans + chan;
-                let per = 8 / d;
-                let byte = *self.cur.get(idx / per).unwrap_or(&0);
-                let shift = 8 - d - (idx % per) * d;
-                let raw = (byte >> shift) & ((1u16 << d) - 1) as u8;
-                if self.ihdr.colour == 3 {
-                    raw // a palette INDEX is not a level; it must not be scaled
-                } else {
-                    // Scale the level to full range by bit replication: 1 -> 0xFF, 0b10 -> 0xAA.
-                    let max = ((1u16 << d) - 1) as u32;
-                    ((raw as u32 * 255 + max / 2) / max) as u8
-                }
-            }
-        }
-    }
-
-    /// The `x`-th pixel of the current scanline as an 8-bit RGB triple.
     #[inline]
     fn rgb(&self, x: usize) -> (u8, u8, u8) {
-        match self.ihdr.colour {
-            0 => {
-                let g = self.sample(x, 0, 1);
-                (g, g, g)
-            }
-            2 => (self.sample(x, 0, 3), self.sample(x, 1, 3), self.sample(x, 2, 3)),
-            3 => {
-                let i = self.sample(x, 0, 1) as usize * 3;
-                match self.palette.get(i..i + 3) {
-                    Some(e) => (e[0], e[1], e[2]),
-                    // An index past the PLTE. `decode`'s pre-check refuses a palette that is short
-                    // for the DEPTH, so reaching here needs a file that is both short and lying;
-                    // black is the bounded answer and the image still shows.
-                    None => (0, 0, 0),
-                }
-            }
-            4 => {
-                let g = self.sample(x, 0, 2);
-                (g, g, g)
-            }
-            _ => (self.sample(x, 0, 4), self.sample(x, 1, 4), self.sample(x, 2, 4)),
-        }
+        pix_rgb(&self.ihdr, self.palette, &self.cur, x)
     }
 
     /// Fold one completed source scanline into the accumulator, emitting an output row every `k`.
@@ -672,6 +625,63 @@ impl Sink for RowSink<'_> {
     }
 }
 
+// ── Pixel conversion (shared by the row sink and the Adam7 sink) ────────────────────────────────
+
+/// Read the `n`-th sample of the `x`-th pixel out of the unfiltered scanline, normalised to 8
+/// bits. Sub-byte depths are unpacked MSB-first, which is PNG's order (§7.2); depth 16 keeps the
+/// high byte, which is exactly what a truncation to 8 bits per channel is.
+#[inline]
+fn pix_sample(ihdr: &Ihdr, cur: &[u8], x: usize, chan: usize, chans: usize) -> u8 {
+    let d = ihdr.depth as usize;
+    match d {
+        8 => *cur.get(x * chans + chan).unwrap_or(&0),
+        16 => *cur.get((x * chans + chan) * 2).unwrap_or(&0),
+        _ => {
+            // 1, 2 or 4 bits — only ever one channel (greyscale or palette index).
+            let idx = x * chans + chan;
+            let per = 8 / d;
+            let byte = *cur.get(idx / per).unwrap_or(&0);
+            let shift = 8 - d - (idx % per) * d;
+            let raw = (byte >> shift) & ((1u16 << d) - 1) as u8;
+            if ihdr.colour == 3 {
+                raw // a palette INDEX is not a level; it must not be scaled
+            } else {
+                // Scale the level to full range by bit replication: 1 -> 0xFF, 0b10 -> 0xAA.
+                let max = ((1u16 << d) - 1) as u32;
+                ((raw as u32 * 255 + max / 2) / max) as u8
+            }
+        }
+    }
+}
+
+/// The `x`-th pixel of the current scanline as an 8-bit RGB triple.
+#[inline]
+fn pix_rgb(ihdr: &Ihdr, palette: &[u8], cur: &[u8], x: usize) -> (u8, u8, u8) {
+    match ihdr.colour {
+        0 => {
+            let g = pix_sample(ihdr, cur, x, 0, 1);
+            (g, g, g)
+        }
+        2 => (pix_sample(ihdr, cur, x, 0, 3), pix_sample(ihdr, cur, x, 1, 3), pix_sample(ihdr, cur, x, 2, 3)),
+        3 => {
+            let i = pix_sample(ihdr, cur, x, 0, 1) as usize * 3;
+            match palette.get(i..i + 3) {
+                Some(e) => (e[0], e[1], e[2]),
+                // An index past the PLTE. `decode`'s pre-check refuses a palette that is short
+                // for the DEPTH, so reaching here needs a file that is both short and lying;
+                // black is the bounded answer and the image still shows.
+                None => (0, 0, 0),
+            }
+        }
+        4 => {
+            let g = pix_sample(ihdr, cur, x, 0, 2);
+            (g, g, g)
+        }
+        _ => (pix_sample(ihdr, cur, x, 0, 4), pix_sample(ihdr, cur, x, 1, 4), pix_sample(ihdr, cur, x, 2, 4)),
+    }
+}
+
+
 // ── Reading the container ───────────────────────────────────────────────────────────────────────
 
 /// The VFS's own words for a refusal — Quarry's `why`, in this module's vocabulary so a `[facet]`
@@ -699,6 +709,7 @@ pub fn parse_ihdr(d: &[u8]) -> Result<Ihdr, FacetError> {
         height: u32::from_be_bytes([d[4], d[5], d[6], d[7]]),
         depth: d[8],
         colour: d[9],
+        interlaced: d[12] == 1,
     };
     if ihdr.width == 0 || ihdr.height == 0 {
         return Err(FacetError::BadIhdr("zero dimension"));
@@ -718,8 +729,8 @@ pub fn parse_ihdr(d: &[u8]) -> Result<Ihdr, FacetError> {
     if d[11] != 0 {
         return Err(FacetError::BadIhdr("filter method != 0"));
     }
-    if d[12] != 0 {
-        return Err(FacetError::Interlaced);
+    if d[12] > 1 {
+        return Err(FacetError::BadIhdr("interlace method"));
     }
     // The scanline arithmetic must not overflow before anything allocates against it.
     if ihdr.row_bytes().is_none() {
@@ -806,6 +817,121 @@ fn index_chunks(
     Ok((ihdr, spans, palette))
 }
 
+// ── Adam7 ───────────────────────────────────────────────────────────────────────────────────────
+
+/// PNG §8.2's seven passes: `(x0, y0, dx, dy)`.
+const ADAM7: [(usize, usize, usize, usize); 7] =
+    [(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)];
+
+/// Pixels per row and rows of pass `p` for a `w x h` image (either may be 0: the pass is empty and
+/// carries no filter bytes at all).
+fn adam7_dims(p: usize, w: usize, h: usize) -> (usize, usize) {
+    let (x0, y0, dx, dy) = ADAM7[p];
+    ((w + dx - 1 - x0.min(w + dx - 1)) / dx, (h + dy - 1 - y0.min(h + dy - 1)) / dy)
+}
+
+/// The interlaced counterpart of [`RowSink`]: each pass is its own little image with its own filter
+/// chain, scattered into the full-size `px` (k = 1 only — an interlaced image cannot be reduced
+/// row by row, which is why it is refused over the base cap).
+struct Adam7Sink<'a> {
+    ihdr: Ihdr,
+    palette: &'a [u8],
+    bpp: usize,
+    pass: usize,
+    pw: usize,
+    ph: usize,
+    row_bytes: usize,
+    row: usize,
+    cur: Vec<u8>,
+    prev: Vec<u8>,
+    fill: usize,
+    filter: Option<u8>,
+    px: &'a mut [u32],
+    done: bool,
+    err: Option<FacetError>,
+}
+
+impl<'a> Adam7Sink<'a> {
+    fn new(ihdr: Ihdr, palette: &'a [u8], px: &'a mut [u32]) -> Result<Self, FacetError> {
+        let bpp = ihdr.filter_unit().ok_or(FacetError::BadIhdr("colour type"))?;
+        let max = ihdr.row_bytes().ok_or(FacetError::BadIhdr("scanline overflow"))?;
+        let (mut cur, mut prev) = (Vec::new(), Vec::new());
+        if cur.try_reserve_exact(max).is_err() || prev.try_reserve_exact(max).is_err() {
+            return Err(FacetError::OutOfMemory(max * 2));
+        }
+        cur.resize(max, 0);
+        prev.resize(max, 0);
+        let mut s = Self {
+            ihdr, palette, bpp, pass: 0, pw: 0, ph: 0, row_bytes: 0, row: 0, cur, prev, fill: 0,
+            filter: None, px, done: false, err: None,
+        };
+        s.enter_pass(0);
+        Ok(s)
+    }
+
+    /// Move to the first non-empty pass at or after `p`; `done` when there is none.
+    fn enter_pass(&mut self, mut p: usize) {
+        while p < 7 {
+            let (pw, ph) = adam7_dims(p, self.ihdr.width as usize, self.ihdr.height as usize);
+            if pw > 0 && ph > 0 {
+                self.pass = p;
+                self.pw = pw;
+                self.ph = ph;
+                self.row = 0;
+                self.row_bytes = (pw * self.ihdr.bits_per_pixel().unwrap_or(8)).div_ceil(8);
+                for v in self.prev.iter_mut() {
+                    *v = 0;
+                }
+                return;
+            }
+            p += 1;
+        }
+        self.done = true;
+    }
+}
+
+impl Sink for Adam7Sink<'_> {
+    fn push(&mut self, byte: u8) -> Result<(), ()> {
+        if self.err.is_some() {
+            return Err(());
+        }
+        if self.done {
+            self.err = Some(FacetError::RowCount { got: self.ihdr.height + 1, want: self.ihdr.height });
+            return Err(());
+        }
+        let Some(f) = self.filter else {
+            self.filter = Some(byte);
+            return Ok(());
+        };
+        self.cur[self.fill] = byte;
+        self.fill += 1;
+        if self.fill < self.row_bytes {
+            return Ok(());
+        }
+        let n = self.row_bytes;
+        if let Err(e) = unfilter(f, &mut self.cur[..n], &self.prev[..n], self.bpp) {
+            self.err = Some(e);
+            return Err(());
+        }
+        let (x0, y0, dx, dy) = ADAM7[self.pass];
+        let y = y0 + self.row * dy;
+        let w = self.ihdr.width as usize;
+        for i in 0..self.pw {
+            let (r, g, b) = pix_rgb(&self.ihdr, self.palette, &self.cur[..n], i);
+            self.px[y * w + x0 + i * dx] = 0xFF00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+        }
+        core::mem::swap(&mut self.cur, &mut self.prev);
+        self.fill = 0;
+        self.filter = None;
+        self.row += 1;
+        if self.row >= self.ph {
+            let p = self.pass + 1;
+            self.enter_pass(p);
+        }
+        Ok(())
+    }
+}
+
 // ── Decoding ────────────────────────────────────────────────────────────────────────────────────
 
 /// What a completed decode produced.
@@ -834,6 +960,21 @@ pub fn decode_into<S: ByteSource>(
     out_h: usize,
     px: &mut [u32],
 ) -> Result<Decoded, FacetError> {
+    if ihdr.interlaced {
+        if k != 1 || out_w != ihdr.width as usize || out_h != ihdr.height as usize {
+            return Err(FacetError::Interlaced);
+        }
+        let mut sink = Adam7Sink::new(ihdr, palette, px)?;
+        let r = inflate::zlib_inflate(src, &mut sink);
+        if let Some(e) = sink.err.clone() {
+            return Err(e);
+        }
+        r.map_err(FacetError::Inflate)?;
+        if !sink.done {
+            return Err(FacetError::RowCount { got: 0, want: ihdr.height });
+        }
+        return Ok(Decoded { ihdr, k, out_w, out_h, rows: ihdr.height });
+    }
     let mut sink = RowSink::new(ihdr, palette, k, out_w, out_h, px)?;
     let r = inflate::zlib_inflate(src, &mut sink);
     // The sink's own error outranks the decoder's: `SinkRejected` is what the decoder says when THIS
@@ -850,45 +991,106 @@ pub fn decode_into<S: ByteSource>(
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────────────────────────
 
-/// The window's surface. Owned here, named by the `wm` row, and cleared by [`close`] — the same
-/// discipline Quarry keeps, and for the same reason: the row must stop naming the buffer before the
-/// buffer goes away.
-static SURF: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
+/// IMGVIEW — the BASE image is what zoom and pan re-sample, so unlike the first viewer this one
+/// holds a decoded picture: at most `BASE_W x BASE_H` pixels (12 MB at the cap), box-reduced by an
+/// integer `k` only when the file is larger. The window surface is a separate viewport buffer.
+const BASE_W: usize = 2048;
+const BASE_H: usize = 1536;
+/// Zoom steps, percent of the BASE image.
+const ZSTEPS: [u32; 8] = [25, 50, 75, 100, 150, 200, 300, 400];
+/// Letterbox colour.
+const BG: u32 = 0xFF20_2020;
 
-/// The path currently on the glass, for the census line and for the idempotent re-open.
+/// Everything the window needs to re-render itself.
+struct View {
+    path: String,
+    /// Base image, 0xFFRRGGBB, `bw * bh`.
+    px: Vec<u32>,
+    bw: usize,
+    bh: usize,
+    /// Integer reduction of the base against the file.
+    k: usize,
+    src_w: u32,
+    src_h: u32,
+    ihdr: Ihdr,
+    bytes: u64,
+    mtime: Option<crate::fs::vfs::VfsTime>,
+    /// Viewport size (the window content).
+    vw: usize,
+    vh: usize,
+    /// Zoom, percent of the base image.
+    zoom: u32,
+    fit_zoom: u32,
+    /// Top-left of the zoomed image in viewport coordinates (re-clamped by [`layout`]).
+    ox: i32,
+    oy: i32,
+    info: bool,
+}
+
+static VIEW: spin::Mutex<Option<View>> = spin::Mutex::new(None);
+
+/// The viewport surface — the window's own buffer, ARGB8888 `vw * vh` words. Re-rendered IN PLACE (it
+/// is never reallocated while the row names it) and freed by [`close`].
+static SURF: spin::Mutex<Vec<u32>> = spin::Mutex::new(Vec::new());
+
+/// The path currently on the glass, for the census line, browse and the idempotent re-open.
 static SHOWN: spin::Mutex<String> = spin::Mutex::new(String::new());
 
 /// The path a gesture asked for, waiting for a pass that is allowed to open it.
 static PENDING: spin::Mutex<Option<String>> = spin::Mutex::new(None);
 
 /// Ask for `path` to be opened. **This is what a click or a key press calls, and [`open_path`] is
-/// not.**
-///
-/// THE LATCH IS NOT CEREMONY — it is `dock::press_at`'s law and it is written in a boot log. The
-/// click router runs in the input-drain band on a kernel stack that is 16 KiB, and Pi boot 11
-/// overflowed exactly that stack with `quarry::open()` called at click-router depth: a directory
-/// read plus an allocation plus the window table, synchronously, under the router. [`open_inner`] is
-/// strictly heavier — it walks the chunk list through the VFS, streams megabytes in [`CHUNK`] reads
-/// and runs the whole inflate — so putting it under a press would be re-committing that defect with
-/// a bigger frame. The gesture stores a path; [`service`] opens it from the render pass, which is
-/// where the shell's own volume reads already happen.
-///
-/// A second request before the first is drained REPLACES it: the operator's latest double-click is
-/// the one they meant, and a queue of pictures nobody asked to see is not a feature.
+/// not.** THE LATCH IS NOT CEREMONY — it is `dock::press_at`'s law: the click router runs on a 16 KiB
+/// kernel stack and [`open_inner`] walks the chunk list, streams megabytes and inflates them. The
+/// gesture stores a path; [`service`] opens it from the render pass. A second request before the
+/// first is drained REPLACES it.
 pub fn request_open(path: &str) {
     *PENDING.lock() = Some(String::from(path));
 }
 
-/// Drain a pending open request. Idempotent, and safe to call on every pass: a quiet pass is one
-/// uncontended `try`-free lock and a `None`.
+/// A viewer command, queued by the router-band input hooks and applied by [`service`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cmd {
+    ZoomIn,
+    ZoomOut,
+    Fit,
+    Actual,
+    Next,
+    Prev,
+    Delete,
+    Info,
+    Wheel(i8),
+}
+
+static CMDS: spin::Mutex<Vec<Cmd>> = spin::Mutex::new(Vec::new());
+/// Drag anchor (screen coordinates of the last sample); `DRAG_ON` says whether a drag is live.
+static DRAG_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DRAG_X: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+static DRAG_Y: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+fn push_cmd(c: Cmd) {
+    let mut q = CMDS.lock();
+    if q.len() < 16 {
+        q.push(c);
+    }
+}
+
+/// Drain a pending open request, queued commands and a live drag. Safe to call on every pass: a
+/// quiet pass is two uncontended locks and an atomic read.
 ///
 /// Chained from [`super::quarry::live::service`], which is already drained from both places this
-/// desktop services furniture — `main.rs`'s render pass on the Orin and the strip-press arm in
-/// `arch/aarch64/syscall.rs` — so Facet needs no drain site of its own in either file.
+/// desktop services furniture, so Facet needs no drain site of its own.
 pub fn service() {
     let want = PENDING.lock().take();
     if let Some(p) = want {
         open_path(&p);
+    }
+    let cmds: Vec<Cmd> = core::mem::take(&mut *CMDS.lock());
+    for c in cmds {
+        apply(c);
+    }
+    if DRAG_ON.load(Ordering::Relaxed) {
+        drag_poll();
     }
 }
 
@@ -902,70 +1104,259 @@ pub fn shown() -> String {
     SHOWN.lock().clone()
 }
 
-/// Close the window and free the surface.
+/// Close the window and free the surface and the base image.
 pub fn close() {
     let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
     if id == wm::WIN_NONE {
         return;
     }
+    DRAG_ON.store(false, Ordering::Relaxed);
     // `wm::close` FIRST — the row must stop naming the buffer before the buffer goes away. It spins
     // on the drain barrier, so it is called with no lock of ours held.
     wm::close(id);
-    // `Vec::clear` would keep the capacity; the picture is megabytes, so the allocation is RETURNED.
-    // Without this a viewer that opened three screenshots would hold the largest one's surface for
-    // the rest of the boot, which is exactly the leak the streaming decode exists to avoid.
+    *VIEW.lock() = None;
     *SURF.lock() = Vec::new();
     SHOWN.lock().clear();
     serial_println!("[facet] closed win={} paints={}", id, PAINTS.load(Ordering::Relaxed));
 }
 
-/// Does this name end `.PNG`, case-insensitively? Quarry's routing test, and the only thing that
-/// decides whether a double-click reaches this module.
+/// Does this name end `.PNG`, case-insensitively? Quarry's routing test.
 pub fn is_png_name(name: &str) -> bool {
     let n = name.as_bytes();
     n.len() > 4 && n[n.len() - 4..].eq_ignore_ascii_case(b".png")
 }
 
-/// The name a window carries: the DOCUMENT's, not the app's.
-///
-/// Peter's R36 — an app window is titled with the app's NAME, and a DOCUMENT window with the
-/// document's. So this window says `SCREEN6.PNG` and never `facet`, which is also how an operator
-/// with two pictures open tells them apart in the dock and the window menu.
+/// The name a window carries: the DOCUMENT's, not the app's (Peter's R36).
 fn title_of(path: &str) -> String {
     String::from(path.rsplit('/').next().unwrap_or(path))
 }
 
-/// **Open `path` in Facet.** The whole mechanism, and the only entry [`super::quarry`] calls.
-///
-/// Idempotent per PATH: opening the file already shown raises the existing window rather than
-/// decoding it again. Opening a DIFFERENT file closes the old window first — one canvas, which is
-/// what "double-click the next screenshot" should do and what keeps the surface count at one.
-///
-/// Every arm prints exactly one line. On success that is three (`open`, `decoded`, `present`); on a
-/// refusal it is `open` — which is the honest record that the gesture was seen — followed by
-/// `refuse`, whose `reason=` names which claim broke.
+fn colour_name(c: u8) -> &'static str {
+    match c {
+        2 => "rgb",
+        6 => "rgba",
+        3 => "pal",
+        _ => "gray",
+    }
+}
+
+/// `(folder, sorted image names with their file times)` for `path`'s folder — PNG only (no JPEG
+/// decoder exists in this tree). Case-insensitive order, so Next/Prev are stable.
+fn siblings(path: &str) -> (String, Vec<(String, Option<crate::fs::vfs::VfsTime>)>) {
+    let cut = path.rfind('/').unwrap_or(0);
+    let dir = if cut == 0 { String::from("/") } else { String::from(&path[..cut]) };
+    let mut v: Vec<(String, Option<crate::fs::vfs::VfsTime>)> = Vec::new();
+    if let Ok(ents) = crate::shell::vfs_mount_table().read_dir(&dir) {
+        for e in ents {
+            if matches!(e.kind, crate::fs::vfs::NodeKind::File) && is_png_name(&e.name) {
+                v.push((e.name, e.mtime));
+            }
+        }
+    }
+    v.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+    (dir, v)
+}
+
+fn join_path(dir: &str, name: &str) -> String {
+    if dir.ends_with('/') { alloc::format!("{}{}", dir, name) } else { alloc::format!("{}/{}", dir, name) }
+}
+
+/// Zoomed size and the effective top-left, written back into the view. Centred when the zoomed
+/// picture is smaller than the viewport on that axis; clamped so no gap opens when it is larger.
+fn layout(v: &mut View) -> (i32, i32, i64, i64) {
+    let zw = ((v.bw as u64 * v.zoom as u64) / 100).max(1) as i64;
+    let zh = ((v.bh as u64 * v.zoom as u64) / 100).max(1) as i64;
+    let (vw, vh) = (v.vw as i64, v.vh as i64);
+    let ox = if zw <= vw { (vw - zw) / 2 } else { (v.ox as i64).clamp(vw - zw, 0) };
+    let oy = if zh <= vh { (vh - zh) / 2 } else { (v.oy as i64).clamp(vh - zh, 0) };
+    v.ox = ox as i32;
+    v.oy = oy as i32;
+    (v.ox, v.oy, zw, zh)
+}
+
+/// Re-render the viewport from the base image: nearest at >= 100 %, area average below.
+fn render(v: &mut View) {
+    let (ox, oy, zw, zh) = layout(v);
+    let mut s = SURF.lock();
+    if s.len() != v.vw * v.vh {
+        return;
+    }
+    let z = v.zoom.max(1) as i64;
+    for y in 0..v.vh {
+        let zy = y as i64 - oy as i64;
+        for x in 0..v.vw {
+            let zx = x as i64 - ox as i64;
+            s[y * v.vw + x] = if zx < 0 || zy < 0 || zx >= zw || zy >= zh {
+                BG
+            } else if z >= 100 {
+                let sx = ((zx * 100 / z) as usize).min(v.bw - 1);
+                let sy = ((zy * 100 / z) as usize).min(v.bh - 1);
+                v.px[sy * v.bw + sx]
+            } else {
+                let sx0 = (zx * 100 / z) as usize;
+                let sy0 = (zy * 100 / z) as usize;
+                let sx1 = (((zx + 1) * 100 / z) as usize).max(sx0 + 1).min(v.bw);
+                let sy1 = (((zy + 1) * 100 / z) as usize).max(sy0 + 1).min(v.bh);
+                let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+                for yy in sy0.min(v.bh - 1)..sy1 {
+                    for xx in sx0.min(v.bw - 1)..sx1 {
+                        let p = v.px[yy * v.bw + xx];
+                        r += (p >> 16) & 0xFF;
+                        g += (p >> 8) & 0xFF;
+                        b += p & 0xFF;
+                        n += 1;
+                    }
+                }
+                let n = n.max(1);
+                0xFF00_0000 | ((r / n) << 16) | ((g / n) << 8) | (b / n)
+            };
+        }
+    }
+    if v.info {
+        let face = crate::video::font::Face::Body;
+        let ch = face.cell_h();
+        let h = (ch + 4).min(v.vh);
+        let y0 = v.vh - h;
+        for p in s[y0 * v.vw..].iter_mut() {
+            *p = 0xFF10_1010;
+        }
+        let t = match v.mtime {
+            Some(t) => alloc::format!("{:04}-{:02}-{:02} {:02}:{:02}", t.year, t.month, t.day, t.hour, t.min),
+            None => String::from("no time"),
+        };
+        let line = alloc::format!(
+            "{}x{}  {} bytes  {}-bit {}  {}",
+            v.src_w, v.src_h, v.bytes, v.ihdr.depth, colour_name(v.ihdr.colour), t
+        );
+        let vw = v.vw;
+        crate::video::font::draw_text(&mut s, vw, vw, v.vh, 4, y0 + 2, line.as_bytes(), 0x00F0_F0F0, false, face);
+    }
+}
+
+fn title_for(v: &View) -> String {
+    alloc::format!("{} - {}x{} - {}%", title_of(&v.path), v.src_w, v.src_h, (v.zoom / v.k.max(1) as u32).max(1))
+}
+
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn retitle(id: wm::WinId, t: &str) {
+    wm::retitle(id, t.as_bytes());
+}
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn retitle(_id: wm::WinId, _t: &str) {}
+
+/// Render, retitle and present after any change to the view.
+fn refresh(v: &mut View) {
+    render(v);
+    let id = WIN.load(Ordering::Relaxed);
+    retitle(id, &title_for(v));
+    let _ = wm::present(id);
+    PAINTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Mint the window over the already-filled [`SURF`] (`vw x vh`). Centred in the work area.
+fn mint(title: &str, vw: usize, vh: usize) -> Result<wm::WinId, FacetError> {
+    let pi = crate::video::panel_info_nonblocking().ok_or(FacetError::NoWindow("panel-busy"))?;
+    let (pw, ph) = (pi.width, pi.height);
+    let Some((_scale, ow, oh)) = wm::spawn_geometry(vw, vh) else {
+        return Err(FacetError::NoWindow("geometry-unavailable"));
+    };
+    let wtop = crate::ui_status::top_chrome_h(pw, ph);
+    let ox = pw.saturating_sub(ow) / 2;
+    let oy = wtop
+        + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 2;
+    let base = SURF.lock().as_ptr() as usize;
+    let id = wm::create_at(
+        OWNER,
+        base,
+        vw * vh * 4,
+        vw as u32,
+        vh as u32,
+        (vw * 4) as u32,
+        title.as_bytes(),
+        ox + wm::BORDER,
+        oy + wm::TITLE_H + wm::BORDER,
+    );
+    if id == wm::WIN_NONE {
+        return Err(FacetError::NoWindow("create-failed"));
+    }
+    WIN.store(id, Ordering::Relaxed);
+    wm::winid_register_holder(&WIN, "facet");
+    wm::focus_changed(OWNER);
+    Ok(id)
+}
+
+/// M3 — a decode failure is shown IN a window: the file name and the reason.
+fn show_message(path: &str, reason: &str) {
+    close();
+    let (vw, vh) = (460usize, 64usize);
+    let mut surf: Vec<u32> = Vec::new();
+    if surf.try_reserve_exact(vw * vh).is_err() {
+        return;
+    }
+    surf.resize(vw * vh, 0xFFF5_F2EA);
+    let face = crate::video::font::Face::Body;
+    let ch = face.cell_h();
+    let l1 = alloc::format!("Cannot show {}", title_of(path));
+    let l2 = alloc::format!("reason: {}", reason);
+    crate::video::font::draw_text(&mut surf, vw, vw - 8, vh, 8, 8, l1.as_bytes(), 0x0021_201E, false, face);
+    crate::video::font::draw_text(&mut surf, vw, vw - 8, vh, 8, 8 + ch + 4, l2.as_bytes(), 0x00A0_2020, false, face);
+    *SURF.lock() = surf;
+    match mint(&title_of(path), vw, vh) {
+        Ok(id) => {
+            *SHOWN.lock() = String::from(path);
+            let _ = wm::present(id);
+        }
+        Err(_) => {
+            *SURF.lock() = Vec::new();
+        }
+    }
+}
+
+/// What a successful open reports.
+struct Opened {
+    id: wm::WinId,
+    ihdr: Ihdr,
+    k: usize,
+    zoom: u32,
+    fit: bool,
+    browse_n: usize,
+    out_w: usize,
+    out_h: usize,
+}
+
+/// **Open `path` in Facet.** Idempotent per PATH; a different file replaces the window (one canvas).
+/// A failure is a `[facet] refuse` line, a `[facet] decode refused reason=` line AND a message
+/// window — never nothing.
 pub fn open_path(path: &str) {
-    if shown() == path && is_open() {
+    if shown() == path && is_open() && VIEW.lock().is_some() {
         let id = WIN.load(Ordering::Relaxed);
         wm::focus_changed(OWNER);
         serial_println!("[facet] open SKIP reason=already-shown win={} path={}", id, path);
         return;
     }
     match open_inner(path) {
-        Ok((id, d)) => {
+        Ok(o) => {
             serial_println!(
                 "[facet] present win={} scale=1/{} src={}x{} shown={}x{} title={}",
-                id, d.k, d.ihdr.width, d.ihdr.height, d.out_w, d.out_h, title_of(path)
+                o.id, o.k, o.ihdr.width, o.ihdr.height, o.out_w, o.out_h, title_of(path)
+            );
+            serial_println!(
+                ":: IMGVIEW: path={} WxH={}x{} zoom={} fit={} browse_n={} colour={} -> PASS ::",
+                path, o.ihdr.width, o.ihdr.height, (o.zoom / o.k.max(1) as u32).max(1), o.fit as u8,
+                o.browse_n, colour_name(o.ihdr.colour)
             );
         }
         Err(e) => {
-            serial_println!("[facet] refuse path={} reason={}", path, e.reason());
+            let why = e.reason();
+            serial_println!("[facet] refuse path={} reason={}", path, why);
+            serial_println!("[facet] decode refused reason={} path={}", why, path);
+            show_message(path, &why);
         }
     }
 }
 
 /// [`open_path`]'s body, so every failure is one `?` and the caller owns the wire format.
-fn open_inner(path: &str) -> Result<(wm::WinId, Decoded), FacetError> {
+fn open_inner(path: &str) -> Result<Opened, FacetError> {
     let t0 = crate::arch::ms();
     let mt = crate::shell::vfs_mount_table();
     let st = mt.stat(path).map_err(|e| FacetError::Vfs(vfs_why(e)))?;
@@ -976,137 +1367,280 @@ fn open_inner(path: &str) -> Result<(wm::WinId, Decoded), FacetError> {
         return Err(FacetError::Size(st.size));
     }
     let (ihdr, spans, palette) = index_chunks(&mt, path, st.size)?;
-
-    // The panel bounds the window, and the window bounds the decode. Read the panel through the
-    // NON-BLOCKING door for `quarry::open`'s reason: this runs from the click router's input band,
-    // where a blocking `WRITER.lock()` is the INWEDGE defect.
     let pi = crate::video::panel_info_nonblocking().ok_or(FacetError::NoWindow("panel-busy"))?;
     let (pw, ph) = (pi.width, pi.height);
-    let bw = CEIL_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
-    let bh = CEIL_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
-    let (k, out_w, out_h) = fit(ihdr.width, ihdr.height, bw, bh).ok_or(FacetError::NoWindow("fit"))?;
-    if out_w < FLOOR_W || out_h < FLOOR_H {
-        return Err(FacetError::NoWindow("below-floor"));
+    let win_w = CEIL_W.min(pw.saturating_sub(2 * wm::BORDER).max(1));
+    let win_h = CEIL_H.min(ph.saturating_sub(wm::TITLE_H + 2 * wm::BORDER).max(1));
+    let (k, bw, bh) = fit(ihdr.width, ihdr.height, BASE_W, BASE_H).ok_or(FacetError::NoWindow("fit"))?;
+    if ihdr.interlaced && k != 1 {
+        return Err(FacetError::Interlaced);
     }
     serial_println!(
-        "[facet] open path={} ihdr={}x{} depth={} colour={} bytes={} idat-chunks={} -> DECODING",
-        path, ihdr.width, ihdr.height, ihdr.depth, ihdr.colour, st.size, spans.len()
+        "[facet] open path={} ihdr={}x{} depth={} colour={} interlaced={} bytes={} idat-chunks={} -> DECODING",
+        path, ihdr.width, ihdr.height, ihdr.depth, ihdr.colour, ihdr.interlaced as u8, st.size, spans.len()
     );
-
-    // The ONE real allocation, sized and taken before a single compressed byte is pulled — so an
-    // out-of-memory answer arrives before the work rather than halfway through it.
-    let len = out_w * out_h * 4;
-    let mut surf: Vec<u8> = Vec::new();
-    if surf.try_reserve_exact(len).is_err() {
-        return Err(FacetError::OutOfMemory(len));
+    // One canvas, and one base image at a time: the old window and its base go BEFORE the decode, so
+    // the peak is a single base (a failed decode then shows the message window in its place).
+    close();
+    let mut px: Vec<u32> = Vec::new();
+    if px.try_reserve_exact(bw * bh).is_err() {
+        return Err(FacetError::OutOfMemory(bw * bh * 4));
     }
-    surf.resize(len, 0);
-
-    let d = {
-        // SAFETY: `surf` is exactly `out_w * out_h * 4` bytes from the global allocator, which meets
-        // `u32`'s alignment, and the view is `out_w * out_h` words — in bounds by construction. It is
-        // the same ARGB8888 aliasing `wm` will read the buffer with. The borrow ends before the Vec
-        // is moved into `SURF`.
-        let px: &mut [u32] =
-            unsafe { core::slice::from_raw_parts_mut(surf.as_mut_ptr() as *mut u32, out_w * out_h) };
-        let mut src = IdatSource::new(&mt, path, &spans);
-        let r = decode_into(ihdr, &palette, &mut src, k, out_w, out_h, px);
-        // A VFS failure mid-stream reaches the decoder as `TruncatedInput`; the source recorded what
-        // actually happened, and THAT is the finding worth printing.
-        match (r, src.io_error.take()) {
-            (Err(FacetError::Inflate(InflateError::TruncatedInput)), Some(io)) => {
-                serial_println!(
-                    "[facet] decoded rows=0 inflate=vfs-{} ms={}",
-                    io,
-                    crate::arch::ms().saturating_sub(t0)
-                );
-                return Err(FacetError::Vfs(io));
-            }
-            (r, _) => r,
+    px.resize(bw * bh, 0xFF00_0000);
+    let mut src = IdatSource::new(&mt, path, &spans);
+    let r = decode_into(ihdr, &palette, &mut src, k, bw, bh, &mut px);
+    let d = match (r, src.io_error.take()) {
+        (Err(FacetError::Inflate(InflateError::TruncatedInput)), Some(io)) => {
+            serial_println!("[facet] decoded rows=0 inflate=vfs-{} ms={}", io, crate::arch::ms().saturating_sub(t0));
+            return Err(FacetError::Vfs(io));
         }
+        (r, _) => r,
     };
-    let d = match d {
-        Ok(d) => {
-            serial_println!(
-                "[facet] decoded rows={} inflate=OK ms={}",
-                d.rows,
-                crate::arch::ms().saturating_sub(t0)
-            );
-            d
-        }
+    match &d {
+        Ok(d) => serial_println!("[facet] decoded rows={} inflate=OK ms={}", d.rows, crate::arch::ms().saturating_sub(t0)),
         Err(e) => {
-            serial_println!(
-                "[facet] decoded rows=0 inflate={} ms={}",
-                e.reason(),
-                crate::arch::ms().saturating_sub(t0)
-            );
+            serial_println!("[facet] decoded rows=0 inflate={} ms={}", e.reason(), crate::arch::ms().saturating_sub(t0));
+        }
+    }
+    d?;
+
+    // Fit-to-window: reduce when larger than the window, never enlarge on open; the window takes the
+    // fitted shape (floor 32x32, the only place a letterbox can appear on open).
+    let zf = ((win_w * 100 / bw).min(win_h * 100 / bh).min(100)).max(1) as u32;
+    let vw = (bw * zf as usize / 100).max(FLOOR_W);
+    let vh = (bh * zf as usize / 100).max(FLOOR_H);
+    let (dir, list) = siblings(path);
+    let _ = dir;
+    let leaf = title_of(path);
+    let mtime = list.iter().find(|(n, _)| n.eq_ignore_ascii_case(&leaf)).and_then(|(_, t)| *t);
+    let mut surf: Vec<u32> = Vec::new();
+    if surf.try_reserve_exact(vw * vh).is_err() {
+        return Err(FacetError::OutOfMemory(vw * vh * 4));
+    }
+    surf.resize(vw * vh, BG);
+    *SURF.lock() = surf;
+    let mut v = View {
+        path: String::from(path),
+        px,
+        bw,
+        bh,
+        k,
+        src_w: ihdr.width,
+        src_h: ihdr.height,
+        ihdr,
+        bytes: st.size,
+        mtime,
+        vw,
+        vh,
+        zoom: zf,
+        fit_zoom: zf,
+        ox: 0,
+        oy: 0,
+        info: false,
+    };
+    render(&mut v);
+    let id = match mint(&title_for(&v), vw, vh) {
+        Ok(id) => id,
+        Err(e) => {
+            *SURF.lock() = Vec::new();
             return Err(e);
         }
     };
-
-    // One canvas: a different picture replaces this one rather than stacking a second window.
-    if is_open() {
-        close();
-    }
-    let Some((_scale, ow, oh)) = wm::spawn_geometry(out_w, out_h) else {
-        return Err(FacetError::NoWindow("geometry-unavailable"));
-    };
-    // Centred in the WORK AREA — below the menu bar's reservation, above the instrument strip — the
-    // same seating `quarry::open` uses, so the two windows land on the same grid.
-    let wtop = crate::ui_status::top_chrome_h(pw, ph);
-    let ox = pw.saturating_sub(ow) / 2;
-    let oy = wtop
-        + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh)
-            / 2;
-    *SURF.lock() = surf;
-    let base = SURF.lock().as_ptr() as usize;
-    let title = title_of(path);
-    let id = wm::create_at(
-        OWNER,
-        base,
-        len,
-        out_w as u32,
-        out_h as u32,
-        (out_w * 4) as u32,
-        title.as_bytes(),
-        ox + wm::BORDER,
-        oy + wm::TITLE_H + wm::BORDER,
-    );
-    if id == wm::WIN_NONE {
-        *SURF.lock() = Vec::new();
-        return Err(FacetError::NoWindow("create-failed"));
-    }
-    WIN.store(id, Ordering::Relaxed);
-    wm::winid_register_holder(&WIN, "facet");
     *SHOWN.lock() = String::from(path);
-    wm::focus_changed(OWNER);
+    let fit_flag = zf < 100;
+    let out = Opened { id, ihdr, k, zoom: zf, fit: fit_flag, browse_n: list.len(), out_w: vw, out_h: vh };
+    *VIEW.lock() = Some(v);
     let _ = wm::present(id);
     PAINTS.fetch_add(1, Ordering::Relaxed);
-    Ok((id, d))
+    Ok(out)
+}
+
+// ── Commands ────────────────────────────────────────────────────────────────────────────────────
+
+/// The pointer in viewport coordinates when it is over the content, else the viewport centre.
+fn anchor_point(vw: usize, vh: usize) -> (i32, i32) {
+    let id = WIN.load(Ordering::Relaxed);
+    if let (Some(pi), Some(info)) = (crate::video::panel_info_nonblocking(), wm::info(id)) {
+        let (x, y) = crate::pal::cursor::pos(pi.width as i32, pi.height as i32);
+        let sc = info.scale.max(1) as i32;
+        let (cx, cy) = ((x - info.x as i32) / sc, (y - info.y as i32) / sc);
+        if x >= info.x as i32 && y >= info.y as i32 && cx < vw as i32 && cy < vh as i32 {
+            return (cx, cy);
+        }
+    }
+    ((vw / 2) as i32, (vh / 2) as i32)
+}
+
+/// Set the zoom keeping the image point under `(cx, cy)` fixed.
+fn set_zoom(v: &mut View, z: u32, cx: i32, cy: i32) {
+    let (ox, oy, _, _) = layout(v);
+    let old = v.zoom.max(1) as i64;
+    let (bx, by) = ((cx as i64 - ox as i64) * 100 / old, (cy as i64 - oy as i64) * 100 / old);
+    v.zoom = z.clamp(1, 400);
+    v.ox = (cx as i64 - bx * v.zoom as i64 / 100) as i32;
+    v.oy = (cy as i64 - by * v.zoom as i64 / 100) as i32;
+}
+
+fn step_up(z: u32) -> u32 {
+    ZSTEPS.iter().copied().find(|&s| s > z).unwrap_or(400)
+}
+
+fn step_down(z: u32) -> u32 {
+    ZSTEPS.iter().rev().copied().find(|&s| s < z).unwrap_or(ZSTEPS[0])
+}
+
+/// Neighbour of the shown file in its folder: `(path, count)`, wrapping; `None` when it is alone.
+fn neighbour(path: &str, forward: bool) -> (Option<String>, usize) {
+    let (dir, list) = siblings(path);
+    let leaf = title_of(path);
+    let n = list.len();
+    let Some(i) = list.iter().position(|(nm, _)| nm.eq_ignore_ascii_case(&leaf)) else {
+        return (None, n);
+    };
+    if n < 2 {
+        return (None, n);
+    }
+    let j = if forward { (i + 1) % n } else { (i + n - 1) % n };
+    (Some(join_path(&dir, &list[j].0)), n)
+}
+
+/// Apply one queued command.
+fn apply(c: Cmd) {
+    if !is_open() {
+        return;
+    }
+    let path = shown();
+    match c {
+        Cmd::Next | Cmd::Prev => {
+            let (nb, n) = neighbour(&path, c == Cmd::Next);
+            match nb {
+                Some(p) => {
+                    serial_println!("[facet] browse {} n={} -> {}", if c == Cmd::Next { "next" } else { "prev" }, n, p);
+                    open_path(&p);
+                }
+                None => serial_println!("[facet] browse n={} -> none (alone in folder)", n),
+            }
+        }
+        Cmd::Delete => {
+            let (nb, _) = neighbour(&path, true);
+            match crate::fs::trash::trash(&path) {
+                Ok(_) => {
+                    serial_println!("[facet] trash path={} -> ok", path);
+                    match nb {
+                        Some(p) => open_path(&p),
+                        None => close(),
+                    }
+                }
+                Err(e) => serial_println!("[facet] trash path={} -> refused {}", path, e),
+            }
+        }
+        _ => {
+            let mut g = VIEW.lock();
+            let Some(v) = g.as_mut() else { return };
+            let (cx, cy) = anchor_point(v.vw, v.vh);
+            match c {
+                Cmd::ZoomIn => {
+                    let z = step_up(v.zoom);
+                    set_zoom(v, z, cx, cy)
+                }
+                Cmd::ZoomOut => {
+                    let z = step_down(v.zoom);
+                    set_zoom(v, z, cx, cy)
+                }
+                Cmd::Wheel(d) => {
+                    let z = if d > 0 { step_up(v.zoom) } else { step_down(v.zoom) };
+                    set_zoom(v, z, cx, cy)
+                }
+                Cmd::Fit => {
+                    let z = v.fit_zoom;
+                    set_zoom(v, z, cx, cy)
+                }
+                Cmd::Actual => set_zoom(v, 100, cx, cy),
+                Cmd::Info => v.info = !v.info,
+                _ => {}
+            }
+            refresh(v);
+        }
+    }
+}
+
+/// Pan while the primary button is held: follow the pointer since the last sample.
+fn drag_poll() {
+    if !crate::pal::cursor::button_down() {
+        DRAG_ON.store(false, Ordering::Relaxed);
+        return;
+    }
+    let id = WIN.load(Ordering::Relaxed);
+    let (Some(pi), Some(info)) = (crate::video::panel_info_nonblocking(), wm::info(id)) else { return };
+    let (x, y) = crate::pal::cursor::pos(pi.width as i32, pi.height as i32);
+    let (dx, dy) = (x - DRAG_X.load(Ordering::Relaxed), y - DRAG_Y.load(Ordering::Relaxed));
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    DRAG_X.store(x, Ordering::Relaxed);
+    DRAG_Y.store(y, Ordering::Relaxed);
+    let sc = info.scale.max(1) as i32;
+    let mut g = VIEW.lock();
+    if let Some(v) = g.as_mut() {
+        v.ox += dx / sc;
+        v.oy += dy / sc;
+        refresh(v);
+    }
 }
 
 // ── Input ───────────────────────────────────────────────────────────────────────────────────────
 
-/// Pointer. Returns `true` when the press was CONSUMED.
-///
-/// Facet binds ONE gesture — the close disc — and raises on any press inside its own content, which
-/// is the minimum a tenant owes: a window the operator cannot focus and cannot close is furniture,
-/// not an app. Every other press falls through to the router's own arms, so the title bar still
-/// drags and the minimise disc still parks, unchanged and without a line in either arch's router.
-///
-/// ⚠ **THIS IS CHAINED FROM `quarry::live::press_route`, NOT FROM THE ROUTER.** The routers that
-/// would name it — `arch/aarch64/syscall.rs`'s click arm and `arch/x86_64/syscall.rs`'s — are files
-/// this arc may not add a line to (the knob-off `kernel8.img` byte-identity proof, PARITY.md §5.3,
-/// and another lane owns the x86 half). Quarry is already named there and Facet's only door is
-/// Quarry, so the chain costs nothing and is honest about the dependency: no file manager, no
-/// viewer. The wm hook that does not exist and would replace it is named in this arc's report.
+/// Keys and wheel, chained from `quarry::live::key_route`. QUEUES a command (router stack depth);
+/// [`service`] applies it. Keys only while this window holds focus; the wheel only when the pointer
+/// is over it. `+`/`=` `-`/`_` zoom, `0` fit, `1` 100 %, Left/`[` Right/`]` browse, Delete trash,
+/// `i` info.
+pub fn key_route(ev: crate::pal::Event) -> bool {
+    let id = WIN.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE {
+        return false;
+    }
+    match ev {
+        crate::pal::Event::Wheel(d) => {
+            let Some(pi) = crate::video::panel_info_nonblocking() else { return false };
+            let (x, y) = crate::pal::cursor::pos(pi.width as i32, pi.height as i32);
+            match wm::hit_test(x, y) {
+                Some((w, _, _)) if w == id && d != 0 => {
+                    push_cmd(Cmd::Wheel(d));
+                    true
+                }
+                _ => false,
+            }
+        }
+        crate::pal::Event::Key(c) => {
+            if wm::focus_asid() != OWNER {
+                return false;
+            }
+            let cmd = match c {
+                b'+' | b'=' => Cmd::ZoomIn,
+                b'-' | b'_' => Cmd::ZoomOut,
+                b'0' => Cmd::Fit,
+                b'1' => Cmd::Actual,
+                0x1D | b'[' => Cmd::Prev,
+                0x1C | b']' => Cmd::Next,
+                0x7F => Cmd::Delete,
+                b'i' | b'I' => Cmd::Info,
+                _ => return false,
+            };
+            push_cmd(cmd);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Pointer. Returns `true` when the press was CONSUMED: the close disc closes, a press on the
+/// picture raises/focuses and arms a pan drag (applied by [`service`]). Chained from
+/// `quarry::live::press_route`.
 pub fn press_route(x: i32, y: i32) -> bool {
     let id = WIN.load(Ordering::Relaxed);
     if id == wm::WIN_NONE {
         return false;
     }
-    // `hit_test` never reports a row that is not compositing, so a parked Facet declines by
-    // construction and an occluding window keeps every press.
     match wm::hit_test(x, y) {
         Some((w, _, _)) if w == id => {}
         _ => return false,
@@ -1127,8 +1661,10 @@ pub fn press_route(x: i32, y: i32) -> bool {
     if sx >= info.w || sy >= info.h {
         return false;
     }
-    // A press on the picture RAISES and focuses, exactly as the router's own select arm would.
     wm::focus_changed(OWNER);
+    DRAG_X.store(x, Ordering::Relaxed);
+    DRAG_Y.store(y, Ordering::Relaxed);
+    DRAG_ON.store(true, Ordering::Relaxed);
     true
 }
 
@@ -1209,7 +1745,7 @@ fn selftest_result() -> Result<(u32, u32, String), &'static str> {
         }
     }
     let idat = zlib_stored(&filtered);
-    let ihdr = Ihdr { width: W as u32, height: H as u32, depth: 8, colour: 2 };
+    let ihdr = Ihdr { width: W as u32, height: H as u32, depth: 8, colour: 2, interlaced: false };
 
     // Leg A — decode at 1:1 and checksum the pixels.
     let mut px = [0u32; W * H];
@@ -1272,11 +1808,39 @@ fn selftest_result() -> Result<(u32, u32, String), &'static str> {
     interlaced[8] = 8;
     interlaced[9] = 2;
     interlaced[12] = 1;
-    if parse_ihdr(&interlaced) != Err(FacetError::Interlaced) {
-        return Err("parse_ihdr accepted an Adam7-interlaced image");
+    if !matches!(parse_ihdr(&interlaced), Ok(h) if h.interlaced) {
+        return Err("parse_ihdr did not accept an Adam7 image");
     }
     if is_png_name("SCREEN6.TXT") || !is_png_name("SCREEN6.PNG") || !is_png_name("shot.png") {
         return Err("is_png_name does not route .PNG/.png and only .PNG/.png");
+    }
+
+    // Leg E — Adam7: a 5x5 truecolour image sent as seven passes (filter 0) decodes to the same pixels
+    // as the raster order above, so the pass geometry and the scatter are checked, not just parsed.
+    {
+        let mut inter: Vec<u8> = Vec::new();
+        for p in 0..7 {
+            let (pw, ph) = adam7_dims(p, W, H);
+            if pw == 0 || ph == 0 {
+                continue;
+            }
+            let (x0, y0, dx, dy) = ADAM7[p];
+            for r in 0..ph {
+                inter.push(0);
+                for i in 0..pw {
+                    inter.extend_from_slice(&raw[y0 + r * dy][(x0 + i * dx) * 3..(x0 + i * dx) * 3 + 3]);
+                }
+            }
+        }
+        let z = zlib_stored(&inter);
+        let ih = Ihdr { width: W as u32, height: H as u32, depth: 8, colour: 2, interlaced: true };
+        let mut pa = [0u32; W * H];
+        decode_into(ih, &[], &mut SliceSource::new(&z), 1, W, H, &mut pa)
+            .map_err(|_| "decode of the Adam7 fixture failed")?;
+        let s7 = pa.iter().fold(0u32, |a, p| a.wrapping_mul(31).wrapping_add(*p));
+        if s7 != want {
+            return Err("the Adam7 fixture decoded the wrong PIXELS");
+        }
     }
 
     Ok((sum, want, reason))
@@ -1343,4 +1907,118 @@ pub fn decode_file(
         (Err(e), _) => Err(e),
         (Ok(d), _) => Ok((px, out_w, out_h, d.ihdr.width, d.ihdr.height)),
     }
+}
+
+// ── IMGVIEW fixture ─────────────────────────────────────────────────────────────────────────────
+
+/// One PNG chunk: length, type, data, CRC over type+data.
+#[cfg(feature = "witness")]
+fn push_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(kind);
+    body.extend_from_slice(data);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crate::video::png::crc32(&body).to_be_bytes());
+}
+
+/// A whole PNG from already-filtered scanlines, hand-built (the SHOTZIP encoder writes depth-8 RGB
+/// only, so RGBA and palette files cannot come from it).
+#[cfg(feature = "witness")]
+fn build_png(w: u32, h: u32, depth: u8, colour: u8, plte: &[u8], filtered: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&SIGNATURE);
+    let mut ih = [0u8; 13];
+    ih[..4].copy_from_slice(&w.to_be_bytes());
+    ih[4..8].copy_from_slice(&h.to_be_bytes());
+    ih[8] = depth;
+    ih[9] = colour;
+    push_chunk(&mut out, b"IHDR", &ih);
+    if !plte.is_empty() {
+        push_chunk(&mut out, b"PLTE", plte);
+    }
+    push_chunk(&mut out, b"IDAT", &zlib_stored(filtered));
+    push_chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+/// IMGVIEW — write a 64x64 RGBA and a 16x16 palette PNG under `/home/<user>/`, open the first,
+/// zoom, browse to a neighbour, open the palette image, browse back, close, unlink both.
+#[cfg(feature = "witness")]
+pub fn imgview_selftest() {
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as P};
+    let fail = |why: &str| serial_println!(":: IMGVIEW: {} :: FAIL ::", why);
+    if crate::video::panel_info_nonblocking().is_none() {
+        serial_println!(":: IMGVIEW: no panel :: SKIP ::");
+        return;
+    }
+    let home = crate::fs::trash::home_base();
+    let (pa, pb) = (alloc::format!("{}/IVTESTA.PNG", home), alloc::format!("{}/IVTESTB.PNG", home));
+    // 64x64 RGBA, filter 0.
+    let mut a: Vec<u8> = Vec::new();
+    for y in 0..64usize {
+        a.push(0);
+        for x in 0..64usize {
+            a.extend_from_slice(&[(x * 4) as u8, (y * 4) as u8, ((x ^ y) * 4) as u8, 255]);
+        }
+    }
+    // 16x16 palette, depth 4, 16 entries, index (x + y) & 15.
+    let mut plte: Vec<u8> = Vec::new();
+    for i in 0..16u8 {
+        plte.extend_from_slice(&[i * 16, 255 - i * 16, i * 8]);
+    }
+    let mut b: Vec<u8> = Vec::new();
+    for y in 0..16usize {
+        b.push(0);
+        for x in (0..16usize).step_by(2) {
+            b.push((((x + y) & 15) as u8) << 4 | (((x + 1 + y) & 15) as u8));
+        }
+    }
+    let files = [(&pa, build_png(64, 64, 8, 6, &[], &a)), (&pb, build_png(16, 16, 4, 3, &plte, &b))];
+    let mt = crate::shell::vfs_mount_table();
+    for (p, bytes) in files.iter() {
+        let _ = mt.unlink(p, P);
+        if mt.create(p, NodeKind::File, P).is_err() || mt.write(p, 0, bytes, P).is_err() {
+            fail("could not write the fixture PNGs");
+            let _ = mt.unlink(&pa, P);
+            let _ = mt.unlink(&pb, P);
+            return;
+        }
+    }
+    let view = |f: &dyn Fn(&View) -> bool| VIEW.lock().as_ref().map(|v| f(v)).unwrap_or(false);
+    open_path(&pa);
+    let opened = is_open() && shown() == pa && view(&|v| v.src_w == 64 && v.ihdr.colour == 6);
+    apply(Cmd::ZoomIn);
+    let zoomed = view(&|v| v.zoom == 150);
+    let zoom = VIEW.lock().as_ref().map(|v| v.zoom).unwrap_or(0);
+    let fitted = {
+        apply(Cmd::Fit);
+        view(&|v| v.zoom == v.fit_zoom)
+    };
+    apply(Cmd::ZoomIn);
+    let (_, list) = siblings(&pa);
+    let n = list.len();
+    apply(Cmd::Next);
+    let browsed = n >= 2 && shown() != pa && is_open();
+    open_path(&pb);
+    let pal_ok = shown() == pb && view(&|v| v.src_w == 16 && v.ihdr.colour == 3 && v.px[0] == 0xFF00_FF00);
+    apply(Cmd::Prev);
+    let back = shown() != pb && is_open();
+    // A refused file shows a message window, not nothing.
+    let junk = alloc::format!("{}/IVTESTC.PNG", home);
+    let _ = mt.unlink(&junk, P);
+    let junk_ok = mt.create(&junk, NodeKind::File, P).is_ok() && mt.write(&junk, 0, b"not a png at all", P).is_ok() && {
+        open_path(&junk);
+        is_open() && shown() == junk && VIEW.lock().is_none()
+    };
+    close();
+    let closed = !is_open();
+    let _ = mt.unlink(&junk, P);
+    let _ = mt.unlink(&pa, P);
+    let _ = mt.unlink(&pb, P);
+    let ok = opened && zoomed && fitted && browsed && pal_ok && back && junk_ok && closed;
+    serial_println!(
+        ":: IMGVIEW: path={} WxH=64x64 zoom={} fit={} browse_n={} colour=rgba pal={} refusal-window={} -> {} ::",
+        pa, zoom, fitted as u8, n, pal_ok as u8, junk_ok as u8, if ok { "PASS" } else { "FAIL" }
+    );
 }
