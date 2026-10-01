@@ -1,0 +1,11 @@
+[package]
+name = "prefs_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Principia's preference core: the value model, the namespaced tree and the TOML subset codec — shared by Ring 0 and Ring 3."
+
+# PREFS (rmbp-ledger B300, R79): the shared core of the ONE preference store. `#![no_std]` + `alloc`,
+# `#![forbid(unsafe_code)]`, and NO dependencies — the midden_core shape: a member of the ROOT host
+# workspace (Principia links it) and a path dep of the kernel.
+[dependencies]
