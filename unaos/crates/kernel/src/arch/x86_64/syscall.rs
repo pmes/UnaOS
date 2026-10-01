@@ -3789,7 +3789,7 @@ fn sys_win_present(win: u64) -> i64 {
             // an event that happens on every boot, while the pacer is compiled only under `vsyncpace`.
             // Same placement rule as the deadline: inside the ownership proof, so a slot cannot inflate
             // another slot's window. One relaxed atomic.
-            wpace_note_present(id);
+            #[cfg(feature = "wc")] crate::video::activity::note_present(id); wpace_note_present(id);
             // VSYNC-PACE: the deadline moves only for a present that PASSED the ownership gate, so no
             // slot can push another slot's window into the future. Two atomics and one `arch::ms()`
             // register read; no call leaves the crate and nothing here can block. UNPACED BUILD: `{}`.
@@ -4711,7 +4711,7 @@ fn sys_win_present_rows(win: u64, y0: u64, y1: u64) -> i64 {
             // VSYNC-PACE r3: the `[wpace]` present count, for `sys_win_present`'s reason — a banded
             // present is a present, and the witness must not go blind on a client that switched to
             // damage bands.
-            wpace_note_present(id);
+            #[cfg(feature = "wc")] crate::video::activity::note_present(id); wpace_note_present(id);
             // VSYNC-PACE: and the same deadline, advanced under the same proof of ownership. The band is
             // deliberately NOT a discount — the panel scans the whole frame either way, so a banded
             // present consumes exactly one frame slot, as a whole-box one does.
@@ -17535,7 +17535,7 @@ fn winx_launcher(demo_cpu: usize) {
     // runs after `clickroute_selftest` rather than before because it leaves a raised window behind
     // (that IS its verdict) and would otherwise change which owner the routing legs start from.
     #[cfg(all(feature = "witness", feature = "wc"))]
-    crate::tests::register("dock", crate::video::dock::selftest); #[cfg(feature = "nvidia-kepler-vblank")] crate::tests::register("kvblank", crate::drivers::gpu::kepler_vblank::selftest_rerun); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("textedit", crate::video::textedit::selftest); // KVBLANK6 — `tests kvblank` re-runs the vblank fixture only. // TEXTEDIT (R75) — editor fixture; 
+    crate::tests::register("dock", crate::video::dock::selftest); #[cfg(feature = "nvidia-kepler-vblank")] crate::tests::register("kvblank", crate::drivers::gpu::kepler_vblank::selftest_rerun); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("textedit", crate::video::textedit::selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("activity", crate::video::activity::selftest); // KVBLANK6 — `tests kvblank` re-runs the vblank fixture only. // TEXTEDIT (R75) — editor fixture; 
     // CRYSTAL — the SHARD menu fixture. Runs after `dock::selftest` (which runs `menubar::selftest`),
     // so the bar tenant it enables is already proven present and flush. It enables the bar itself,
     // opens the menu off the crystal, resolves every item, fires the SAFE picks, and dismisses three
@@ -29547,3 +29547,37 @@ fn appmenu_fixture() {
 /// R77 M3 — the boot CPU the deferred window demos were to be spawned on; the registered fixtures are
 /// plain `fn()`s, so `demo_cpu` travels here (stored just before the first registration).
 static TESTS_DEMO_CPU: AtomicUsize = AtomicUsize::new(0);
+
+// ── ACTIVITY (R75) — the process table and the kill, for `video/activity.rs` ───────────────────────
+/// One live `PROCS` row as the ACTIVITY window shows it. `slot` is the wm owner key (`Proc::slot`,
+/// +1-biased); `bg` is the user-owned (operator-launched) bit — the ACL predicate.
+#[derive(Clone, Copy)]
+pub struct ActProc { pub pid: u64, pub slot: u64, pub running: bool, pub bg: bool }
+/// Copy the claimed rows (`PRUNNING`/`PEXITED`, pid known) into `out`; returns how many. Lock-free.
+pub fn act_proc_rows(out: &mut [ActProc]) -> usize {
+    let mut n = 0usize;
+    for pi in 0..MAX_PROCS {
+        let st = PROCS[pi].state.load(Ordering::Acquire);
+        if st != PRUNNING && st != PEXITED { continue; }
+        let pid = PROCS[pi].pid.load(Ordering::Acquire);
+        if pid == 0 || n >= out.len() { continue; }
+        out[n] = ActProc { pid, slot: PROCS[pi].slot.load(Ordering::Acquire) as u64, running: st == PRUNNING, bg: PROCS[pi].bg_owned.load(Ordering::Acquire) };
+        n += 1;
+    }
+    n
+}
+/// ACTIVITY `k`: kill `pid` through `wc_close_click`'s kill arm (the close-box path: windows closed,
+/// the process reaped). ACL: root may kill any row; the session user only an operator-launched
+/// (`bg_owned`) one. Returns the verdict word the window prints.
+pub fn act_kill(pid: u64) -> &'static str {
+    let mut found: Option<(u64, bool)> = None;
+    for pi in 0..MAX_PROCS {
+        if PROCS[pi].state.load(Ordering::Acquire) == PRUNNING && PROCS[pi].pid.load(Ordering::Acquire) == pid {
+            found = Some((PROCS[pi].slot.load(Ordering::Acquire) as u64, PROCS[pi].bg_owned.load(Ordering::Acquire)));
+            break;
+        }
+    }
+    let Some((slot, bg)) = found else { return "no such running process" };
+    if !bg && !crate::fs::users::root_session() { return "denied: not yours"; }
+    wc_close_click(crate::video::wm::WIN_NONE, slot)
+}

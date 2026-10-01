@@ -927,3 +927,6 @@ REQUIRE [splash] held_ms=[0-9]+ released_by=(store-loaded|timeout)
 # ── TEXTEDIT (R75), TAIL-APPENDED — the editor fixture opens a scratch file, types 40 chars, saves, re-reads, compares
 REQUIRE :: TEXTEDIT: path=
 FORBID :: TEXTEDIT: .* -> FAIL ::
+# ── ACTIVITY (R75), TAIL-APPENDED — the load/process/heap window: open, two repaints, close (`tests activity`)
+REQUIRE :: ACTIVITY: cpus=
+FORBID :: ACTIVITY: .* -> FAIL ::

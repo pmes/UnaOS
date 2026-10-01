@@ -7690,3 +7690,9 @@ pub fn run_queue_stealable(cpu: usize) -> usize {
     let (ready, pinned) = RUN_QUEUES[cpu].lock().census();
     ready.saturating_sub(pinned)
 }
+
+/// ACTIVITY (R75) — the cumulative count of tasks the work-stealer has moved between cores since boot
+/// (the SMPLOAD witness's `migr=` is the per-window delta of this). One relaxed load.
+pub fn migrations_total() -> u64 {
+    STEAL_MOVES.load(Ordering::Relaxed)
+}
