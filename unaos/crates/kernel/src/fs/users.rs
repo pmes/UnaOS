@@ -3033,6 +3033,7 @@ fn stage_publish(st: BootStage, why: &str) {
         if st == BootStage::Desktop {
             crate::video::crystal::login::installer_release();
         }
+        crate::splash::hold_release("store-loaded"); // SPLASHX86: the stage is known and its first window is up beneath — the glass is handed over
     }
 }
 

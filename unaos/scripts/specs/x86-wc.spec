@@ -916,3 +916,6 @@ REQUIRE :: TESTS: deferred=
 # directory entries, Ctrl-C/L/A/E/U/W. A scripted key sequence against scripted sources, resulting lines checked.
 REQUIRE :: SHELLUX: history=up-down completions=verbs\+paths ctrl=\[c,l,a,e,u,w\] cwd=/.* -> PASS ::
 FORBID :: SHELLUX: .* -> FAIL ::
+# --- SPLASHX86 (R74): the boot splash rendered by the cross-arch ray tracer at the compositor takeover and HELD above the furniture until the stage is known.
+REQUIRE :: SPLASH: arch=x86_64 WxH=[0-9]+x[0-9]+ ms=[0-9]+ -> PASS ::
+REQUIRE [splash] held_ms=[0-9]+ released_by=(store-loaded|timeout)

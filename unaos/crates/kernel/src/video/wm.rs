@@ -29552,3 +29552,31 @@ pub fn close_all_furniture_except(keep: WinId) -> usize {
     }
     n
 }
+/// SPLASHX86: the boot splash's row — a full-panel, CHROMELESS compat row (no title, no controls, `hit_test`
+/// never names it, `close_all_furniture_except` spares it, `COMPAT_WIN` is not touched so `close_compat` /
+/// `compat_live` never see it). The caller pins it with [`set_modal_top`] and closes it with [`close`].
+/// `surf` is a `w * h * 4` xRGB buffer that must outlive the row. Returns [`WIN_NONE`] on refusal.
+pub fn splash_open(surf: usize, surf_len: usize, w: usize, h: usize) -> WinId {
+    let stride = w.saturating_mul(4);
+    let id = create_inner(0, surf, surf_len, w, h, stride, b"", true, None);
+    if id == WIN_NONE {
+        return WIN_NONE;
+    }
+    {
+        let mut t = table();
+        if let Some(r) = row_mut(&mut t, id) {
+            r.surf = surf;
+            r.surf_len = surf_len;
+            r.w = w;
+            r.h = h;
+            r.stride = stride;
+            r.scale = 1;
+            r.x = 0;
+            r.y = 0;
+            r.damage_all();
+            r.presented = true;
+        }
+    }
+    composite();
+    id
+}
