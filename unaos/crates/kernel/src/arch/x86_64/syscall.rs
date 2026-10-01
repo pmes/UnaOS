@@ -2190,12 +2190,12 @@ core::arch::global_asm!(
     // C argument register) BEFORE the shuffle below, so nothing in the shuffle can clobber it. `r8`
     // was previously untouched here and is scrubbed on the way out with the other caller-saved
     // registers, so the return half is unchanged.
-    crate::linuxabi_r8!(), "mov r8, r10",                  // arg3 -> 5th C arg (SYS_THREAD_SPAWN's `place`; junk otherwise)
+    crate::linuxabi_r8!(), crate::linuxabi_save!(), "mov r8, r10",                  // arg3 -> 5th C arg (SYS_THREAD_SPAWN's `place`; junk otherwise)
     "mov rcx, rdx",                 // arg2 -> 4th C arg
     "mov rdx, rsi",                 // arg1 -> 3rd C arg
     "mov rsi, rdi",                 // arg0 -> 2nd C arg
     "mov rdi, rax",                 // number -> 1st C arg
-    "call {dispatch}",              // rax = return value (or never returns: SYS_EXIT -> scheduler)
+    "call {dispatch}", crate::linuxabi_restore!(),              // rax = return value (or never returns: SYS_EXIT -> scheduler)
     "pop rcx",                      // restore user RIP   (SYSRET's target)
     "pop r11",                      // restore user RFLAGS; rsp now = ktop-16, 16-aligned
     // --- U1b B2: canonical-rcx guard (CVE-2012-0217 shape). A non-canonical SYSRET target #GPs at
