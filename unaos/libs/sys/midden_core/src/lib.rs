@@ -283,6 +283,10 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // (`/` native, `/boot`, `/usb`) - the rule `ls`, `cat`, `run` and `bg` already followed. The
     // one member with no plain twin, `urmattr`, becomes the standard extended-attribute verb.
     ("setfattr", Avail::Always),
+    // ATTRSURF (B299): the read half of the attribute surface and the query over it. `getfattr`
+    // with no key IS the listing (one verb per job, R26 — no `lsattr`). Always: a FAT volume answers
+    // `-ENOTSUP` from its own backend; the word exists everywhere.
+    ("getfattr", Avail::Always), ("query", Avail::Always),
     // RELICS (R26 clause 2): the five `usnap*` spellings collapse into ONE verb with subcommands,
     // the way `git` / `ip` / `systemctl` spell a family. `snap list|create|drop|ls|cat`.
     ("snap", Avail::Always),
@@ -653,7 +657,8 @@ pub fn help(facts: &Facts) -> String {
     // native volume through the one namespace. Only the two words with no plain twin are left, and
     // both wear their standard spelling: extended attributes and snapshots.
     say!("NATIVE:   the plain file verbs reach the native volume: `/` native, /boot the boot FAT, /usb stick");
-    say!("          setfattr -x <key> <path>  (drop one typed attribute)");
+    say!("          setfattr <path> <key>=<value>, setfattr -x <key> <path>  (typed attributes: 42 1.5 \"s\" b64:.. [f,f])");
+    say!("          getfattr <path> [key]  (one or all attributes), query <expr>  (id path of every match)");
     say!("SNAP:     snap list, snap create <name>, snap drop <gen>  (retained roots / snapshots)");
     say!("          snap ls <gen> [path], snap cat <gen> <path>  (read a snapshot; current-ACL enforced)");
     say!("CLOCK:    date, date -s YYYY-MM-DD HH:MM[:SS]  (seeds mtime stamps; unset = honest dashes)");
