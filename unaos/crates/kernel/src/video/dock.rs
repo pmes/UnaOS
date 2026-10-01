@@ -574,6 +574,7 @@ pub fn take_launch(app: PinnedApp) -> bool {
 pub fn relaunch_furniture() {
     post_launch(PinnedApp::Console);
     post_launch(PinnedApp::Shell);
+    dp_request_load(); // DOCKPIN — a fresh session reads ITS `<home>/.dock` (the service pass drains it).
     serial_println!("[dock] furniture relaunch posted console+shell (LOGOUTDESK/R69: a fresh session gets a fresh desktop)");
 }
 
@@ -692,7 +693,8 @@ static UNHIDES: AtomicU64 = AtomicU64::new(0);
 /// crystal's `PRESS_OUTCOME` twin; see `crystal.rs`). Written by every consuming arm of
 /// [`press_at`], read by [`last_press_outcome`] immediately after the call on the same task.
 static PRESS_OUTCOME: AtomicU64 = AtomicU64::new(0);
-const DOCK_OUT_BACKGROUND: u64 = 1;
+const DOCK_OUT_BACKGROUND: u64 = 1; const DOCK_OUT_LAUNCH_PIN: u64 = 6; // DOCKPIN — a table app's pin tile posted a launch
+
 const DOCK_OUT_LAUNCH_SHELL: u64 = 2;
 const DOCK_OUT_RAISE: u64 = 3; const DOCK_OUT_LAUNCH_CONSOLE: u64 = 4; #[cfg(feature = "quarry")] const DOCK_OUT_OPEN_REQUESTED: u64 = 5; // APPPIN — one outcome word per pinned app, so the router's `band=dock` witness tells a console launch from a shell launch. DOCKPRESS (rmbp-ledger B129, the finding QUARRYCLICK handed on rather than took) — **the QUARRY PIN needs a FIFTH word, and none of the four above can be borrowed.** Measured on `~/unaos-bench/scratch/rmbp-0915/quarryclick-logs/serial-caps.log`: line 2058 `[dock] press at (424,762) tile=0/5 quarry=pin -> open requested` and line 2059, ONE LINE UNDER IT, `[clickroute] press at (424,762) band=dock -> launch-console deliver=0`. The router's CLICK-BAND witness and the dock's own line disagree about the SAME press, because the `QUARRY_PIN_ID` arm in [`press_at`] returns consumed WITHOUT writing `PRESS_OUTCOME` — so [`last_press_outcome`] hands back whatever the previous consumed press left, and on that capture the previous one was the CONSOLE pin at (640,762) (line 1798, `-> launch-console`). A STALE word, not a wrong constant: the arm launches nothing (`post_launch` is never called), raises nothing, and is not the dock's background, so each of the four is a different lie about it, and `none` would read as "no arm consumed this press" when an arm did. `quarry`-gated, and the gate is the arm's own, so the DEFAULT image — the one `./arroyo knoboff` measures — gains no byte. ⚠ FOLDED onto this const line, onto the match arm below and onto the arm's existing `request_open()` call; CODE BEFORE COMMENT (LEDGER P7), line count unchanged.
 
@@ -701,7 +703,7 @@ pub fn last_press_outcome() -> &'static str {
     match PRESS_OUTCOME.load(Ordering::Relaxed) {
         DOCK_OUT_BACKGROUND => "background",
         DOCK_OUT_LAUNCH_SHELL => "launch-shell", DOCK_OUT_LAUNCH_CONSOLE => "launch-console", #[cfg(feature = "quarry")] DOCK_OUT_OPEN_REQUESTED => "open-requested", // DOCKPRESS — the word is the dock's OWN sentence, hyphenated to this witness's vocabulary: `[dock] … quarry=pin -> open requested` becomes `band=dock -> open-requested`, so the two adjacent lines now say the same thing about the same press and a reader needs neither to interpret the other.
-        DOCK_OUT_RAISE => "raise",
+        DOCK_OUT_RAISE => "raise", DOCK_OUT_LAUNCH_PIN => "launch-pin",
         _ => "none",
     }
 }
@@ -789,7 +791,7 @@ pub fn compose() -> bool {
     let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
     // Ask `wm` for the tile model AND the damage question in ONE table scan: "were any of the
     // windows that intersect the strip I last painted damaged in the pass that just ran?"
-    let (n, clobbered) = wm::dock_scan(&mut rows, SLOT.rect());
+    let (n, clobbered) = wm::dock_scan(&mut rows, SLOT.rect()); dp_refresh(&rows, n); // DOCKPIN — learn which owners are the table's ring-3 apps BEFORE the pins read `present`.
     // SHELLPIN — the permanent shell tile, appended before the signature so a shell close (the row
     // vanishing, the pin appearing) is a MODEL change and repaints on its own.
     let n = pin_console(&mut rows, n); let n = pin_shell(&mut rows, n); // CONSOLEPIN — the CONSOLE window's own reopen tile, applied FIRST so the settled strip reads `[quarry] [live rows…] [console] [shell] [pulse]`: the console's pin sits where its live row sat, immediately left of the permanent shell tail. Permanent since APPPIN (R49): the console is a pinned app and its tile is always on the strip. Folded, not added — PARITY.md §5.3.
@@ -1040,7 +1042,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     }
     let (px, py) = (x as usize, y as usize);
     let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
-    let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0));
+    let (n, _) = wm::dock_scan(&mut rows, (0, 0, 0, 0)); dp_refresh(&rows, n);
     // SHELLPIN — the router routes over the same pinned model the painter drew.
     let n = pin_console(&mut rows, n); let n = pin_shell(&mut rows, n); // CONSOLEPIN — the CONSOLE window's own reopen tile, applied FIRST so the settled strip reads `[quarry] [live rows…] [console] [shell] [pulse]`: the console's pin sits where its live row sat, immediately left of the permanent shell tail. Permanent since APPPIN (R49): the console is a pinned app and its tile is always on the strip. Folded, not added — PARITY.md §5.3.
     // QUARRY-PIN — after the shell pin, and PREPENDING (see `pin_quarry`): the settled strip is
@@ -1084,6 +1086,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
         return true;
     }
     if r.id == PULSE_PIN_ID { crate::video::pulsewin::arm(); serial_println!("[dock] press at ({},{}) tile={}/{} pulse=pin -> rearmed (render pass opens it)", x, y, t, n); return true; } // A30 — the pulse instrument's pinned tile. Unlike Quarry's this needs no latch and no deferral: `pulsewin::arm()` is two release stores and touches no device, and `service()`'s open arm on the next render pass is what actually mints the window — the same split that keeps the create on the compositor's own core (see that arm's readback). So the router re-arms and is done, and the press is consumed so it never falls through to a window beneath.
+    if let Some(i) = dp_pin_index(r.id) { PRESS_OUTCOME.store(DOCK_OUT_LAUNCH_PIN, Ordering::Relaxed); let how = dp_launch(i); serial_println!("[dock] press at ({},{}) tile={}/{} app={} -> launch {}", x, y, t, n, DP_PINS[i].name, how); return true; } // DOCKPIN — the table apps' pin tiles (activity, settings, editor): one arm, `dp_launch` is the seam.
     let app = if r.id == CONSOLE_PIN_ID {
         Some((PinnedApp::Console, DOCK_OUT_LAUNCH_CONSOLE))
     } else if r.id == SHELL_PIN_ID {
@@ -1431,7 +1434,7 @@ pub fn selftest() {
 /// Returns the new count. Applied by every reader of the model — `compose`, [`press_at`],
 /// [`strip_rect`], `selftest` — so painter, router, registry and self-test cannot disagree about the
 /// tile count, which is the invariant `pin_shell`'s header states and `selftest` checks.
-fn pin_pulse(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+fn pin_pulse_only(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
     // PINCOUNT — the condition lives ONCE (`pin_pulse_wanted`, this file's tail); this is its only
     // mutator, and `pins_applied` folds the same predicate for the two count-only readers. This one
     // takes NO row census: `ever_armed`/`is_open` are runtime cells, not a scan of the model.
@@ -1955,6 +1958,8 @@ const RANK_APPS: u64 = 1;
 /// pass later the tile has its real rank and never moves again.
 const RANK_UNSEEN: u64 = 0x4000_0000_0000_0000;
 /// DOCKID — the permanent tail, in the order the pin headers name: console, shell, pulse.
+/// DOCKPIN — the table apps' band: above `RANK_UNSEEN`, below the permanent tail.
+const RANK_EXTRA: u64 = 0x7000_0000_0000_0000;
 const RANK_CONSOLE: u64 = u64::MAX - 2;
 const RANK_SHELL: u64 = u64::MAX - 1;
 const RANK_PULSE: u64 = u64::MAX;
@@ -1966,6 +1971,7 @@ const RANK_PULSE: u64 = u64::MAX;
 /// away. Any other owner — an app, or a kernel row with no pin such as the window menu — is ranked by
 /// arrival instead.
 fn fixed_rank(owner: u64) -> Option<u64> {
+    if let Some(i) = dp_extra_of_owner(owner) { return Some(RANK_EXTRA + i as u64); } // DOCKPIN — a pinned table app keeps ONE tile open or closed, in the band between the arrival run and the permanent tail.
     #[cfg(feature = "quarry")]
     if owner == crate::video::quarry::OWNER {
         return Some(RANK_QUARRY);
@@ -2048,7 +2054,7 @@ fn pin_word(id: wm::WinId) -> Option<&'static str> {
         QUARRY_PIN_ID => Some("quarry"),
         PULSE_PIN_ID => Some("pulse"),
         CONSOLE_PIN_ID => Some("console"),
-        _ => None,
+        _ => dp_pin_word(id),
     }
 }
 
@@ -2500,20 +2506,21 @@ type Present<'a> = &'a dyn Fn(u64) -> bool;
 /// permanent, on every desktop, whether or not this boot has minted its window yet.
 fn pin_console_wanted(n: usize, present: Present<'_>) -> bool {
     n < wm::MAX_WINDOWS
+        && dp_is_pinned(0)
         && !crate::video::fbcon::console_is_routed()
         && !present(wm::KERNEL_OWNER_CONSOLE)
 }
 
 /// PINCOUNT — [`pin_shell`]'s condition, stated once: one live shell window max.
 fn pin_shell_wanted(n: usize, present: Present<'_>) -> bool {
-    n < wm::MAX_WINDOWS && !present(wm::KERNEL_OWNER_DESKTOP)
+    n < wm::MAX_WINDOWS && dp_is_pinned(1) && !present(wm::KERNEL_OWNER_DESKTOP)
 }
 
 /// PINCOUNT — [`pin_quarry`]'s condition, stated once. `cfg`-gated in both polarities exactly as the
 /// pin is, so a build without the file manager counts no tile for it and compiles no reference to it.
 #[cfg(feature = "quarry")]
 fn pin_quarry_wanted(n: usize, present: Present<'_>) -> bool {
-    n < wm::MAX_WINDOWS && !present(crate::video::quarry::OWNER)
+    n < wm::MAX_WINDOWS && dp_is_pinned(2) && !present(crate::video::quarry::OWNER)
 }
 
 /// PINCOUNT — the erasing twin. No file manager, no tile, and the count is unchanged.
@@ -2554,6 +2561,7 @@ pub(super) fn pins_applied(n: usize, present: impl Fn(u64) -> bool) -> usize {
     if pin_pulse_wanted(n) {
         n += 1;
     }
+    for i in DP_FIRST_EXTRA..DP_PINS.len() { if dp_extra_wanted(i, n, &present) { n += 1; } } // DOCKPIN — the three table-driven pins (activity, settings, editor), folded through the SAME predicate `pin_pulse` (the chain's tail) applies, so `wm::dock_tiles` and `strip_rect` count the strip the painter paints.
     n
 }
 
@@ -2895,10 +2903,11 @@ pub fn set_quit_hook(f: fn(wm::WinId, u64) -> &'static str) { QUIT_HOOK.store(f 
 /// Is this scan row a real window (not a synthetic pin)? The running indicator's predicate.
 fn row_running(r: &wm::DockEntry) -> bool { r.id != wm::WIN_NONE && (r.id as usize) <= wm::MAX_WINDOWS }
 
-pub fn is_kept(owner: u64) -> bool { KEPT.iter().any(|k| k.load(Ordering::Relaxed) == owner) }
+pub fn is_kept(owner: u64) -> bool { if let Some(i) = dp_spec_of_owner(owner) { return dp_is_pinned(i); } KEPT.iter().any(|k| k.load(Ordering::Relaxed) == owner) }
 
 /// Toggle the pin flag for `owner`; returns the new state.
 pub fn toggle_keep(owner: u64) -> bool {
+    if let Some(i) = dp_spec_of_owner(owner) { return dp_toggle(i); } // DOCKPIN — a table app: the pin set is the state, and it is saved to `<home>/.dock` by the service pass.
     for k in KEPT.iter() {
         if k.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { return false; }
     }
@@ -2921,7 +2930,7 @@ pub fn quit_owner(win: wm::WinId, owner: u64) -> &'static str {
 
 /// The strip model exactly as the router assembles it, plus the layout.
 fn router_model(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS]) -> Option<(usize, Layout)> {
-    let (n, _) = wm::dock_scan(rows, (0, 0, 0, 0));
+    let (n, _) = wm::dock_scan(rows, (0, 0, 0, 0)); dp_refresh(&*rows, n);
     let n = pin_console(rows, n); let n = pin_shell(rows, n); let n = pin_quarry(rows, n); let n = pin_pulse(rows, n);
     settle(rows, n, false);
     let (pw, ph) = { let fb = *super::WRITER.lock(); if !fb.is_ready() { return None; } (fb.width(), fb.height()) };
@@ -2999,7 +3008,7 @@ pub fn right_press_at(x: i32, y: i32) -> bool {
     let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
     let Some((_, l)) = router_model(&mut rows) else { return false };
     let Some(t) = l.tile_at(x as usize, y as usize) else { return false };
-    if !row_running(&rows[t]) { return false; }
+    if !row_running(&rows[t]) && pin_word(rows[t].id).is_none() { return false; } // DOCKPIN — a closed PIN tile opens the menu too, so a default tile can be removed without opening its app first.
     menu_open_at(t, rows[t].owner_asid);
     true
 }
@@ -3100,4 +3109,307 @@ pub fn dockrun_selftest() {
 /// LOGINFLOW2 M3 — is a launch for `app` posted and not yet drained (a read; clears nothing)?
 pub fn launch_posted(app: PinnedApp) -> bool {
     LAUNCH_OWED.load(Ordering::Acquire) & app.bit() != 0
+}
+
+// =================================================================================================
+// DOCKPIN (R75, 2026-09-29) — **the dock's pinned apps are a TABLE, and the table is a file.**
+// =================================================================================================
+//
+// Before: `PinnedApp` named exactly Console and Shell, Quarry and the pulse instrument were two more
+// hand-written pins, and DOCKRUN's "Keep in Dock" flag was boot-scoped and drove nothing. New windows
+// this wave (Activity, Settings, the editor) had no tile. Now: [`DP_PINS`] is one row per pinned app
+// (name, initial, kind, launch verb, sentinel id), the pin SET is a bitmask over it ([`DP_MASK`]),
+// "Keep in Dock" / "Remove from Dock" toggle a bit and the service pass writes `<home>/.dock` (one name
+// per line) through the mount table, the same pattern as `<home>/.settings`. A login reads it back
+// (`relaunch_furniture` -> [`dp_request_load`] -> [`dockpin_service`]). Default = all six.
+//
+// LAUNCH goes through the SAME seams the shell verbs use: quarry -> `quarry::request_open` (the existing
+// tile arm); editor -> `textedit::request_open` (an untitled buffer, `<home>/untitled.txt`, a missing path
+// being a new buffer; drained by `quarry::live::service`, so the editor tile needs the `quarry` feature to
+// launch); activity / settings -> the VERB string is latched ([`dp_launch`]) and [`take_verb_launch`] hands
+// it to the render body that owns the shell `Console`, which runs `shell::dispatch_command(verb, ..)` —
+// the very line an operator would type. With no shell window open the shell launch is posted too and the
+// verb stays latched until the shell exists.
+//
+// RUNNING / RAISE: a table app's live window is an ordinary dock row (every window is a tile). Kernel-
+// window apps are matched by owner (console, shell, quarry, editor); ring-3 apps (activity, settings) by
+// `wm::app_name_of(owner)` == the verb name, cached by [`dp_refresh`] into [`DP_PROG_OWNER`] so the pin
+// predicates (which only get `present(owner)`, and run under the window-table lock via `wm::dock_tiles`)
+// take no lock. While pinned, the app's tile has a FIXED rank (`RANK_EXTRA + i`) open or closed, so it
+// never moves; the DOCKID arrival-order stamp is untouched. While NOT pinned its window is an ordinary
+// arrival-ranked tile and no pin tile exists.
+//
+// M3 (reorder by drag) is NOT done: the dock has no drag seam (`[wm-act]` drag belongs to window moves,
+// press_at consumes presses only), and the tile order is rank-derived by DOCKID; see DOCKPIN.md.
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DpKind { KernelWindow, Ring3Program }
+
+pub struct DpSpec { pub name: &'static str, pub initial: u8, pub kind: DpKind, pub verb: &'static str, pub id: wm::WinId }
+
+pub const DP_PINS: [DpSpec; 6] = [
+    DpSpec { name: "console",  initial: b'C', kind: DpKind::KernelWindow, verb: "",         id: CONSOLE_PIN_ID },
+    DpSpec { name: "shell",    initial: b'S', kind: DpKind::KernelWindow, verb: "",         id: SHELL_PIN_ID },
+    DpSpec { name: "quarry",   initial: b'Q', kind: DpKind::KernelWindow, verb: "",         id: QUARRY_PIN_ID },
+    DpSpec { name: "activity", initial: b'A', kind: DpKind::Ring3Program, verb: "activity", id: wm::WinId::MAX - 4 },
+    DpSpec { name: "settings", initial: b'G', kind: DpKind::Ring3Program, verb: "settings", id: wm::WinId::MAX - 5 },
+    DpSpec { name: "editor",   initial: b'E', kind: DpKind::KernelWindow, verb: "edit",     id: wm::WinId::MAX - 6 },
+];
+const DP_FIRST_EXTRA: usize = 3;
+/// A pin row's synthetic owner for a ring-3 app with no live window: never a real owner id.
+const DP_PIN_OWNER: u64 = 0xD0C0_0000;
+const DP_ALL: u32 = (1 << DP_PINS.len()) - 1;
+static DP_MASK: AtomicU32 = AtomicU32::new(DP_ALL);
+static DP_PROG_OWNER: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static DP_VERB_OWED: AtomicU32 = AtomicU32::new(0);
+static DP_SAVE_OWED: AtomicBool = AtomicBool::new(false);
+static DP_LOAD_OWED: AtomicBool = AtomicBool::new(true); // true at boot: the first service pass loads (or keeps the default)
+static DP_LOADED: AtomicU32 = AtomicU32::new(0);
+static DP_SAVED: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+fn dp_available(i: usize) -> bool { i != 2 || cfg!(feature = "quarry") }
+pub fn dp_is_pinned(i: usize) -> bool { i < DP_PINS.len() && DP_MASK.load(Ordering::Relaxed) & (1 << i) != 0 }
+fn dp_pin_word(id: wm::WinId) -> Option<&'static str> { dp_pin_index(id).filter(|&i| i >= DP_FIRST_EXTRA).map(|i| DP_PINS[i].name) }
+fn dp_pin_index(id: wm::WinId) -> Option<usize> { (DP_FIRST_EXTRA..DP_PINS.len()).find(|&i| DP_PINS[i].id == id) }
+
+/// Does `owner` own the table app `i`'s window (or is it app `i`'s synthetic pin owner)?
+fn dp_owner_is(i: usize, o: u64) -> bool {
+    if o == 0 { return false; }
+    match i {
+        0 => o == wm::KERNEL_OWNER_CONSOLE,
+        1 => o == wm::KERNEL_OWNER_DESKTOP,
+        2 => quarry_owner() == Some(o),
+        5 => o == crate::video::textedit::OWNER,
+        _ => o == DP_PIN_OWNER + i as u64 || o == DP_PROG_OWNER[i].load(Ordering::Relaxed),
+    }
+}
+fn dp_spec_of_owner(o: u64) -> Option<usize> { (0..DP_PINS.len()).find(|&i| dp_owner_is(i, o)) }
+/// The extra index (0-based within the extras) whose PINNED app owns `o`, for [`fixed_rank`].
+fn dp_extra_of_owner(o: u64) -> Option<usize> {
+    (DP_FIRST_EXTRA..DP_PINS.len()).find(|&i| dp_is_pinned(i) && dp_owner_is(i, o)).map(|i| i - DP_FIRST_EXTRA)
+}
+fn dp_extra_wanted(i: usize, n: usize, present: &dyn Fn(u64) -> bool) -> bool {
+    let o = match i { 5 => crate::video::textedit::OWNER, _ => DP_PROG_OWNER[i].load(Ordering::Relaxed) };
+    n < wm::MAX_WINDOWS && dp_is_pinned(i) && !(o != 0 && present(o))
+}
+
+/// The table pins, appended after the pulse pin (the chain's tail). Same shape as `pin_pulse_only`.
+fn pin_extras(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+    let mut n = n;
+    for i in DP_FIRST_EXTRA..DP_PINS.len() {
+        if !dp_extra_wanted(i, n, &|o| rows[..n].iter().any(|r| r.owner_asid == o)) { continue; }
+        let sp = &DP_PINS[i];
+        let mut e = wm::DockEntry::empty();
+        e.id = sp.id;
+        e.owner_asid = if i == 5 { crate::video::textedit::OWNER } else { DP_PIN_OWNER + i as u64 };
+        let b = sp.name.as_bytes();
+        e.title[..b.len()].copy_from_slice(b);
+        e.title_len = b.len();
+        e.visible = false;
+        e.focused = false;
+        rows[n] = e;
+        n += 1;
+    }
+    n
+}
+fn pin_pulse(rows: &mut [wm::DockEntry; wm::MAX_WINDOWS], n: usize) -> usize {
+    let n = pin_pulse_only(rows, n);
+    pin_extras(rows, n)
+}
+
+/// Cache the owner of each ring-3 table app's live window (by `app_name_of` == name), from a scan.
+fn dp_refresh(rows: &[wm::DockEntry; wm::MAX_WINDOWS], n: usize) {
+    for i in DP_FIRST_EXTRA..DP_PINS.len() {
+        if DP_PINS[i].kind != DpKind::Ring3Program { continue; }
+        let mut found = 0u64;
+        for r in rows[..n].iter() {
+            let o = r.owner_asid;
+            if o == 0 || wm::is_kernel_owner(o) { continue; }
+            let mut nm = [0u8; wm::MAX_TITLE];
+            let l = wm::app_name_of(o, &mut nm);
+            if l > 0 && nm[..l].eq_ignore_ascii_case(DP_PINS[i].name.as_bytes()) { found = o; break; }
+        }
+        if DP_PROG_OWNER[i].load(Ordering::Relaxed) != found { DP_PROG_OWNER[i].store(found, Ordering::Relaxed); }
+    }
+}
+
+/// Toggle table app `i`; latches a save. Returns the new pinned state.
+fn dp_toggle(i: usize) -> bool {
+    let bit = 1u32 << i;
+    let now = DP_MASK.fetch_xor(bit, Ordering::AcqRel) & bit == 0;
+    DP_SAVE_OWED.store(true, Ordering::Release);
+    serial_println!("[dock] dockpin {} {}", DP_PINS[i].name, if now { "pinned" } else { "unpinned" });
+    now
+}
+
+fn dp_untitled() -> Option<alloc::string::String> { dp_home().map(|h| alloc::format!("{}untitled.txt", h)) }
+
+/// POST (never perform) the launch of table app `i`: this runs inside the click router. Returns the word.
+fn dp_launch(i: usize) -> &'static str {
+    match i {
+        5 => match dp_untitled() {
+            Some(p) => { crate::video::textedit::request_open(&p); "editor-requested" }
+            None => "editor-no-home",
+        },
+        _ => {
+            DP_VERB_OWED.fetch_or(1 << i, Ordering::AcqRel);
+            post_launch(PinnedApp::Shell); // the verb needs a shell window to run in; a live one just raises
+            "verb-posted"
+        }
+    }
+}
+
+/// Drained by the render body that owns the shell `Console` AFTER its shell launch arm: the verb line of
+/// the next owed ring-3 table app, or `None`.
+pub fn take_verb_launch() -> Option<&'static str> {
+    let m = DP_VERB_OWED.load(Ordering::Acquire);
+    let i = (DP_FIRST_EXTRA..DP_PINS.len()).find(|&i| m & (1 << i) != 0)?;
+    DP_VERB_OWED.fetch_and(!(1 << i), Ordering::AcqRel);
+    Some(DP_PINS[i].verb)
+}
+/// Is a verb launch owed (read; clears nothing)? The shell-owning body runs it only once its window is live.
+pub fn verb_launch_posted() -> bool { DP_VERB_OWED.load(Ordering::Acquire) != 0 }
+
+fn dp_request_load() { DP_LOAD_OWED.store(true, Ordering::Release); }
+
+fn dp_home() -> Option<alloc::string::String> {
+    #[cfg(feature = "login")]
+    {
+        let mut b = [0u8; crate::fs::users::NAME_MAX];
+        let n = crate::fs::users::whoami(&mut b)?;
+        let name = core::str::from_utf8(&b[..n]).ok()?;
+        return Some(alloc::format!("/home/{}/", name));
+    }
+    #[cfg(not(feature = "login"))]
+    { None }
+}
+fn dp_path() -> Option<alloc::string::String> { dp_home().map(|h| alloc::format!("{}.dock", h)) }
+
+/// Parse `.dock` text: the mask of known names. Pure.
+pub fn dp_parse(text: &[u8]) -> (u32, u32) {
+    let (mut mask, mut count) = (0u32, 0u32);
+    for line in text.split(|&b| b == b'\n') {
+        let l = core::str::from_utf8(line).unwrap_or("").trim();
+        if let Some(i) = DP_PINS.iter().position(|s| s.name.eq_ignore_ascii_case(l)) {
+            if mask & (1 << i) == 0 { mask |= 1 << i; count += 1; }
+        }
+    }
+    (mask, count)
+}
+/// Render a mask as `.dock` text. Pure.
+pub fn dp_render(mask: u32) -> alloc::string::String {
+    let mut s = alloc::string::String::new();
+    for (i, sp) in DP_PINS.iter().enumerate() { if mask & (1 << i) != 0 { s.push_str(sp.name); s.push('\n'); } }
+    s
+}
+
+fn dp_write(path: &str, mask: u32) -> Result<usize, alloc::string::String> {
+    use crate::fs::vfs::NodeKind;
+    let mt = crate::shell::vfs_mount_table();
+    let p = crate::fs::vfs::KERNEL_PRINCIPAL;
+    let text = dp_render(mask);
+    let _ = mt.unlink(path, p);
+    mt.create(path, NodeKind::File, p).map_err(|e| alloc::format!("create: {:?}", e))?;
+    let b = text.as_bytes();
+    let mut off = 0usize;
+    while off < b.len() {
+        let w = mt.write(path, off as u64, &b[off..], p).map_err(|e| alloc::format!("write: {:?}", e))?;
+        if w == 0 { return Err(alloc::string::String::from("write: zero")); }
+        off += w;
+    }
+    Ok(off)
+}
+fn dp_read(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    let mt = crate::shell::vfs_mount_table();
+    let st = mt.stat(path).ok()?;
+    if st.size == 0 || st.size > 1024 { return Some(alloc::vec::Vec::new()); }
+    mt.read(path, 0, st.size as usize).ok()
+}
+
+/// Read `<home>/.dock` into the mask. Missing file or no home = the default set. Returns names loaded (0 = default).
+fn dp_load() -> u32 {
+    let Some(path) = dp_path() else { DP_MASK.store(DP_ALL, Ordering::Release); return 0 };
+    match dp_read(&path) {
+        Some(t) if !t.is_empty() => {
+            let (m, c) = dp_parse(&t);
+            if c == 0 { DP_MASK.store(DP_ALL, Ordering::Release); 0 } else { DP_MASK.store(m, Ordering::Release); c }
+        }
+        _ => { DP_MASK.store(DP_ALL, Ordering::Release); 0 }
+    }
+}
+
+/// The witness: tiles on the strip, pinned set, running windows, names loaded, bytes saved (-1 = failed).
+fn dp_witness(why: &str) {
+    let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+    let Some((n, _)) = router_model(&mut rows) else { return };
+    let running = rows[..n].iter().filter(|r| row_running(r)).count();
+    let mut pinned = 0usize; let mut shown = 0usize;
+    for i in 0..DP_PINS.len() {
+        if !dp_available(i) || !dp_is_pinned(i) || (i == 0 && crate::video::fbcon::console_is_routed()) { continue; }
+        pinned += 1;
+        if rows[..n].iter().any(|r| r.id == DP_PINS[i].id || dp_owner_is(i, r.owner_asid)) { shown += 1; }
+    }
+    let saved = DP_SAVED.load(Ordering::Relaxed);
+    // `shown < pinned` only legitimately happens when the strip is full (n == MAX_WINDOWS).
+    let ok = saved >= 0 && (shown == pinned || n >= wm::MAX_WINDOWS);
+    serial_println!("[dock] dockpin {}", why);
+    serial_println!(":: DOCKPIN: tiles={} pinned={} running={} loaded={} saved={} -> {} ::", n, pinned, running, DP_LOADED.load(Ordering::Relaxed), saved, if ok { "PASS" } else { "FAIL" });
+}
+
+/// The service pass (called from `desktop_app_service`, never from a click path): drain an owed load
+/// and an owed save, each followed by the witness line.
+pub fn dockpin_service() {
+    if DP_LOAD_OWED.swap(false, Ordering::AcqRel) {
+        let c = dp_load();
+        DP_LOADED.store(c, Ordering::Relaxed);
+        DP_SAVED.store(0, Ordering::Relaxed);
+        dp_witness("login");
+    }
+    if DP_SAVE_OWED.swap(false, Ordering::AcqRel) {
+        let m = DP_MASK.load(Ordering::Acquire);
+        let r = match dp_path() { Some(p) => dp_write(&p, m).map(|b| b as i64), None => Ok(0) };
+        match r {
+            Ok(b) => DP_SAVED.store(b, Ordering::Relaxed),
+            Err(e) => { DP_SAVED.store(-1, Ordering::Relaxed); serial_println!("[dock] dockpin save failed: {}", e); }
+        }
+        dp_witness("change");
+    }
+}
+
+/// `tests dockpin` — pin, save, re-read, unpin; pure parse legs plus the real file round trip when a home exists.
+#[cfg(feature = "witness")]
+pub fn dockpin_selftest() {
+    let saved_mask = DP_MASK.load(Ordering::Relaxed);
+    // Leg 1 — pure: render/parse round trip, unknown names ignored, duplicates folded.
+    let (m, c) = dp_parse(b"shell\nbogus\neditor\nshell\n");
+    let parse_ok = m == (1 << 1 | 1 << 5) && c == 2 && dp_parse(&*dp_render(DP_ALL).into_bytes()) == (DP_ALL, 6);
+    // Leg 2 — pin/unpin changes the model: unpin editor -> its tile (pin or live) leaves; pin -> returns.
+    let has = |i: usize| -> Option<bool> {
+        let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
+        let (n, _) = router_model(&mut rows)?;
+        Some(rows[..n].iter().any(|r| r.id == DP_PINS[i].id))
+    };
+    DP_MASK.store(DP_ALL, Ordering::Release);
+    let on = has(5); // None = no panel
+    DP_MASK.store(DP_ALL & !(1 << 5), Ordering::Release);
+    let off = has(5);
+    DP_MASK.store(DP_ALL, Ordering::Release);
+    let toggle_ok = match (on, off) { (Some(a), Some(b)) => a && !b, _ => true };
+    // Leg 3 — file round trip through the mount table at `<home>/.dock` (skipped, and said so, with no home).
+    let (mut file_ok, mut bytes, mut skip) = (true, 0i64, false);
+    match dp_path() {
+        Some(p) => {
+            let want = DP_ALL & !(1 << 4);
+            match dp_write(&p, want) {
+                Ok(b) => { bytes = b as i64; DP_MASK.store(DP_ALL, Ordering::Release); let c = dp_load(); file_ok = c == 5 && DP_MASK.load(Ordering::Relaxed) == want; }
+                Err(_) => file_ok = false,
+            }
+            let _ = dp_write(&p, saved_mask); // leave the operator's own set behind
+        }
+        None => skip = true,
+    }
+    DP_MASK.store(saved_mask, Ordering::Release);
+    let ok = parse_ok && toggle_ok && file_ok;
+    serial_println!(":: DOCKPIN: tiles={} pinned={} running={} loaded={} saved={} fixture parse={} toggle={} file={} -> {} ::",
+        DP_PINS.len(), DP_ALL.count_ones(), 0, 5, bytes, parse_ok as u8, toggle_ok as u8, if skip { "skip" } else if file_ok { "ok" } else { "no" }, if ok { "PASS" } else { "FAIL" });
 }
