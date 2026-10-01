@@ -308,20 +308,20 @@ pub fn _print(args: fmt::Arguments) {
 #[macro_export]
 macro_rules! serial_print {
     ($($arg:tt)*) => (
-        $crate::arch::aarch64::serial::_print(format_args!($($arg)*))
+        $crate::serial_line::emit(format_args!($($arg)*), false)
     );
 }
 
 #[macro_export]
 macro_rules! serial_println {
     () => (
-        $crate::arch::aarch64::serial::_print(format_args!("\n"))
+        $crate::serial_line::emit(format_args!(""), true)
     );
     ($fmt:expr) => (
-        $crate::arch::aarch64::serial::_print(format_args!(concat!($fmt, "\n")))
+        $crate::serial_line::emit(format_args!($fmt), true)
     );
     ($fmt:expr, $($arg:tt)*) => (
-        $crate::arch::aarch64::serial::_print(format_args!(concat!($fmt, "\n"), $($arg)*))
+        $crate::serial_line::emit(format_args!($fmt, $($arg)*), true)
     );
 }
 

@@ -1771,7 +1771,7 @@ pub fn mirror_service() {
             );
         }
     }
-    mirror_verdict_once();
+    mirror_verdict_once(); crate::serial_line::census_poll();
     // SO29/DRAINCAP — the drain-cap fixture, one-shot, riding this poll for the same reason the
     // SERWIT-2 verdict does: `mirror_service`'s stated contract is IRQs unmasked, no locks held, not
     // a print context, and it is reached on BOTH arches (x86 via `flight_recorder::service`'s first
