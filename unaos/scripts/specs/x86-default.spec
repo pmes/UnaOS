@@ -520,3 +520,9 @@ FORBID \[fs\] mv .* lfn=1 ok=true sectors_written=0
 # (slirp answers no NTP); the link names the NIC family the stack is bound over.
 REQUIRE :: SNTP: link=(e1000|usbnet) synced=[01] offset_ms=-?[0-9]+ -> PASS ::
 FORBID :: SNTP: .* -> FAIL ::
+#
+# ── SERIALLOCK (2026-09-29), TAIL-APPENDED ────────────────────────────────────────────────────────
+# `serial_line::census_poll` (riding `serial_ring::mirror_service`, every lane, once a second): the
+# line-level lock's census. PASS = it printed; `unaos/scripts/serial-merged.sh <log>` is the check on a
+# capture (boot 17: 197 merged lines; boot 18 should be 0).
+REQUIRE :: SERIAL: lines=[1-9]\d* merged_fixed=\d+ trunc=\d+ deferred=\d+ defer_lost=\d+ bypass=\d+ -> PASS ::

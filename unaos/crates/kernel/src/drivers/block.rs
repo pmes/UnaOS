@@ -1793,6 +1793,7 @@ pub fn read_block_sdhc(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 pub fn read_blocks_sdhc(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
     let dev = sdhc_info().ok_or(BlockError::NotReady)?;
     let count = span_blocks(&dev, lba, buf.len())?;
+    #[cfg(feature = "sdw")] crate::drivers::sdhc::wr_census_idle(); // SDHCMULTI M1: a read after a quiet gap closes the write burst
     let n = crate::drivers::sdhc::read_blocks_512(lba, count, buf)?;
     // A short counted read is an error, never a silent prefix — the same rule the xHCI counted forms
     // enforce, and the one failure mode a filesystem above has no way to notice.
@@ -1825,7 +1826,10 @@ pub fn write_block_sdhc(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     if lba >= dev.num_blocks {
         return Err(BlockError::BadLba);
     }
-    crate::drivers::sdhc::write_block_512(lba, buf)
+    let t0 = crate::drivers::sdhc::wr_census_begin(); // SDHCMULTI M1: the census times the whole call
+    let r = crate::drivers::sdhc::write_block_512(lba, buf);
+    crate::drivers::sdhc::wr_census_note(t0, 1, false, 0, r.is_ok());
+    r
 }
 
 /// SDHC-4b: without `sdw` there is no CMD24 command word in this image at all (SDHC-4a's property),
@@ -3599,5 +3603,8 @@ pub fn write_blocks_sdhc_mb(lba: u64, count: usize, buf: &[u8]) -> Result<(), Bl
     if buf.len() < count * SECTOR_BYTES {
         return Err(BlockError::Io);
     }
-    crate::drivers::sdhc::write_blocks_512(lba, count as u16, &buf[..count * SECTOR_BYTES]).map(|_| ())
+    let t0 = crate::drivers::sdhc::wr_census_begin(); // SDHCMULTI M1
+    let r = crate::drivers::sdhc::write_blocks_512(lba, count as u16, &buf[..count * SECTOR_BYTES]);
+    crate::drivers::sdhc::wr_census_note(t0, count as u64, true, *r.as_ref().unwrap_or(&0), r.is_ok());
+    r.map(|_| ())
 }

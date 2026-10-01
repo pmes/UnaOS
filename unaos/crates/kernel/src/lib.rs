@@ -67,6 +67,7 @@ pub mod wifi;
 
 pub mod allocator;
 pub mod shell;
+pub mod shellux; // SHELLUX (R75) — line editor: history, Tab completion, control keys (new file, tail-neutral)
 pub mod selftest;
 pub mod tests; // R77 M3 — the desktop fixture registry and the `tests` verb
 
@@ -201,7 +202,7 @@ pub mod wedge2;
 // for". Declared unconditionally (both arches' `_print` go through it and the panic escape hatch is
 // not knob-gated); costs ~16 KiB of `.bss` and introduces no lock. See the module docs for the
 // deadlock analysis that keeps the panic and WEDGE-2/WEDGE-4 breadcrumb paths unblockable.
-pub mod serial_ring;
+pub mod serial_ring; pub mod serial_line; // SERIALLOCK M1 (2026-09-29): the line-level lock in front of `_print`; LINE-NEUTRAL fold.
 // TERM_RING (MIDDEN_CONVERGENCE §3, M2): the bounded terminal OUTPUT transport between a producer and
 // whatever task owns the console view. Built on `serial_ring::LineRing` — lock-free, alloc-free,
 // drop-newest with a counted refusal — so a producer in an IRQ-masked or print-locked context can emit

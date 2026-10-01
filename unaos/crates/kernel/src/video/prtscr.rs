@@ -245,9 +245,10 @@
 //!    volume it settles on is [`mount_capture_target`]'s, the PRTSCR-VOL ladder above, NOT
 //!    `mount_program_source`: slicing must not quietly re-narrow the target back to rung 1 and
 //!    strand the rMBP's read-only boot medium all over again.
-//!  * [`Phase::Encode`] pushes [`SLICE_ROWS`] scanlines at a time into the streaming encoder.
-//!  * [`Phase::Write`] writes [`SLICE_WRITE`] bytes per `write_grow`, **in order**, from offset 0
-//!    upward, so what is on the medium is always a valid PREFIX of the finished PNG.
+//!  * [`Phase::Stream`] (SHOTZIP) is one unit loop: write a waiting piece in [`SLICE_WRITE`] slices
+//!    (**in order**, from offset 0 upward, so the medium always holds a valid PREFIX), else cut the
+//!    next piece out of the compressing encoder (header, IDAT chunks of <= 64 KiB, IEND), else push
+//!    [`SLICE_ROWS`] scanlines until a chunk is ready. Nothing the size of the image is held.
 //!  * [`Job::slice`] runs those units until [`slice_budget`] cycles have been spent, then returns.
 //!    The budget is a fraction of the arch's own `hw_wait_budget()`, so it is a DURATION on every
 //!    board (~31 ms on x86, ~37 ms on QEMU virt, ~43 ms on the Pi, ~75 ms on the Orin) without this
@@ -543,6 +544,8 @@ pub struct Shot {
     /// PRTSCR-HOME — that directory's first cluster, so a reader (PRTSCR-ST) can find the file
     /// again without re-walking the path.
     pub dir_cluster: u32,
+    /// SHOTZIP — IDAT chunks streamed (the verdict's `chunks=`).
+    pub chunks: u32,
 }
 
 /// Why a capture did not happen. Every variant carries what it inspected, not just what was
@@ -1038,25 +1041,37 @@ struct RoutedMt(crate::fs::vfs::MountTable);
 // flight, [`Refusal::InFlight`] refuses a second), so it is never shared between contexts.
 unsafe impl Send for RoutedMt {}
 
-/// PRTSCR-ASYNC — which half of the capture the next unit of work belongs to. Strictly sequential:
-/// the PNG cannot be written before `finish` patches the IDAT length and appends `IEND`, so the
-/// whole encode precedes the whole write. That is also what keeps the on-medium bytes a valid
-/// PREFIX of the final file at every slice boundary.
+/// SHOTZIP — the capture is ONE streaming phase now: pixels go into the compressing encoder, and
+/// every finished PNG piece (the header, then IDAT chunks of at most 64 KiB, then IEND) is written to
+/// the volume IN ORDER as soon as it exists, so nothing the size of the image is ever held. The
+/// on-medium bytes stay a valid PREFIX of the final file at every slice boundary.
 enum Phase {
-    /// Reading the panel into the streaming encoder, `y` rows done.
-    Encode { enc: PngEncoder, row: Vec<u8>, y: u32 },
-    /// Writing the finished bytes to the volume in order, `done` bytes published.
-    Write {
-        bytes: Vec<u8>,
-        done: usize,
-        first: u32,
-        size: u32,
-        dir_lba: u64,
-        dir_off: usize,
-    },
+    Stream(Stream),
     /// Transient placeholder while a unit of work owns the phase by value. Never observed by a
     /// caller: every path that takes the phase out puts one back or returns a verdict.
     Spent,
+}
+
+/// SHOTZIP — everything the streaming phase carries between units.
+struct Stream {
+    enc: PngEncoder,
+    /// One scanline of RGB, reused.
+    row: Vec<u8>,
+    /// Rows pushed into the encoder.
+    y: u32,
+    /// The PNG piece being written, and how much of it the volume has taken.
+    buf: Vec<u8>,
+    buf_at: usize,
+    /// The directory entry exists (it is created when the first piece is ready).
+    created: bool,
+    /// Bytes on the medium — the file offset of the next write, and the witness's `bytes_written`.
+    done: usize,
+    first: u32,
+    size: u32,
+    dir_lba: u64,
+    dir_off: usize,
+    /// `arch::ms()` milliseconds spent inside the encoder (rows + finish), for `enc_ms=`.
+    enc_ms: u64,
 }
 
 /// What one unit of work produced.
@@ -1114,8 +1129,8 @@ impl Job {
         // an entry SHORTER than the reserved length, because the size is published per slice.
         let need = PngEncoder::encoded_len(width, height).unwrap_or(0);
         serial_println!(
-            ":: PRTSCR: {} {}x{} name_from={} -> capturing ({} bytes reserved; the verdict line follows — a boot cut before it leaves the entry short of that) ::",
-            name, width, height, name_from, need
+            ":: PRTSCR: {} {}x{} name_from={} -> capturing (streamed in IDAT chunks of <= {} bytes, 0 bytes reserved; stored-size bound {}; the verdict line follows — a boot cut before it leaves a truncated PNG with no IEND) ::",
+            name, width, height, name_from, crate::video::png::CHUNK, need
         );
 
         // 5. The encoder. `PngEncoder::new` reserves the whole output up front, so an allocator
@@ -1142,7 +1157,20 @@ impl Job {
             vol_gen,
             vpath,
             routed: None,
-            phase: Phase::Encode { enc, row, y: 0 },
+            phase: Phase::Stream(Stream {
+                enc,
+                row,
+                y: 0,
+                buf: Vec::new(),
+                buf_at: 0,
+                created: false,
+                done: 0,
+                first: 0,
+                size: 0,
+                dir_lba: 0,
+                dir_off: 0,
+                enc_ms: 0,
+            }),
         })
     }
 
@@ -1183,7 +1211,7 @@ impl Job {
                 self.slices += 1;
                 if self.slices <= SLICE_LINES_MAX {
                     let done = match &self.phase {
-                        Phase::Write { done, .. } => *done,
+                        Phase::Stream(st) => st.done,
                         _ => 0,
                     };
                     serial_println!(
@@ -1201,139 +1229,156 @@ impl Job {
     /// One unit of work: [`SLICE_ROWS`] scanlines, or [`SLICE_WRITE`] bytes.
     fn unit(&mut self, phase: Phase) -> Result<Step, Refusal> {
         match phase {
-            Phase::Encode { mut enc, mut row, mut y } => {
-                let end = core::cmp::min(y.saturating_add(SLICE_ROWS), self.height);
-                while y < end {
-                    row.clear();
-                    for x in 0..self.width as usize {
-                        // `read_pixel` is the format authority (see the module note). A pixel it
-                        // cannot decode cannot happen here — the layout was checked in `begin` —
-                        // but an out-of-length tail row on a firmware whose reported height
-                        // overruns its own buffer would answer `None`, and black is the honest
-                        // answer for "this pixel is not in the framebuffer".
-                        let rgb = self.panel.read_pixel(x, y as usize).unwrap_or(0);
-                        row.push(((rgb >> 16) & 0xFF) as u8);
-                        row.push(((rgb >> 8) & 0xFF) as u8);
-                        row.push((rgb & 0xFF) as u8);
+            Phase::Stream(mut st) => {
+                // (1) A piece is waiting on the volume: hand it a slice, in order from `done`.
+                if st.buf_at < st.buf.len() {
+                    // PRTSCR-ASYNC/UNPLUG: probe BEFORE the write, never after.
+                    if !self.volume_alive() {
+                        return Err(Refusal::Vanished(
+                            vol_id(&self.fs),
+                            core::mem::take(&mut self.name),
+                            st.done,
+                            self.need,
+                        ));
                     }
-                    enc.push_row(&row)
+                    let take = core::cmp::min(SLICE_WRITE, st.buf.len() - st.buf_at);
+                    let at = st.done;
+                    let (first, size, dir_lba, dir_off) = (st.first, st.size, st.dir_lba, st.dir_off);
+                    let chunk = &st.buf[st.buf_at..st.buf_at + take];
+                    let (wrote, new_size, new_first) = if let Some(r) = self.routed.as_ref() {
+                        // SHOTMOUNT: the slice through the table (`mt.write` at the running offset).
+                        match r.0.write(&self.vpath, at as u64, chunk, crate::fs::vfs::KERNEL_PRINCIPAL) {
+                            Ok(n) => (n, (at + n) as u32, first),
+                            Err(_) => return Err(Refusal::Fat(vol_id(&self.fs), "write", FatError::Io)),
+                        }
+                    } else {
+                        match busy_retry(|| self.fs.write_grow(first, size, dir_lba, dir_off, at as u32, chunk)) {
+                            Ok(t) => t,
+                            Err(e) => return Err(Refusal::Fat(vol_id(&self.fs), "write", e)),
+                        }
+                    };
+                    if wrote != take {
+                        return Err(Refusal::Short(
+                            vol_id(&self.fs),
+                            core::mem::take(&mut self.name),
+                            at + wrote,
+                            at + st.buf.len() - st.buf_at,
+                        ));
+                    }
+                    st.done += wrote;
+                    st.buf_at += wrote;
+                    st.size = new_size;
+                    st.first = new_first;
+                    return Ok(Step::More(Phase::Stream(st)));
+                }
+                // (2) Cut the next finished piece out of the encoder. The very first piece (the
+                //     signature + IHDR) is ready before any pixel is read, so the directory entry is
+                //     created here, once, and every later piece appends to it.
+                if st.enc.next_piece(&mut st.buf) {
+                    st.buf_at = 0;
+                    if !st.created {
+                        if !self.volume_alive() {
+                            return Err(Refusal::Vanished(
+                                vol_id(&self.fs),
+                                core::mem::take(&mut self.name),
+                                0,
+                                self.need,
+                            ));
+                        }
+                        // The same four-step recipe `shell::fs_write` uses, minus the truncate
+                        // branch (the name is one the directory does not hold).
+                        // SHOTMOUNT (SO19): created THROUGH THE MOUNT TABLE; the FAT-direct create is
+                        // the fallback and the witness says `via=fat` — never silently.
+                        let mt = crate::shell::vfs_mount_table();
+                        let vfs_ok = mt
+                            .create(&self.vpath, crate::fs::vfs::NodeKind::File, crate::fs::vfs::KERNEL_PRINCIPAL)
+                            .is_ok();
+                        if vfs_ok {
+                            self.routed = Some(RoutedMt(mt));
+                        } else {
+                            let dc = self.dir_cluster;
+                            match busy_retry(|| self.fs.create_in_dir(dc, &self.name, 0x20)) {
+                                Ok((_, lba, off)) => {
+                                    st.dir_lba = lba;
+                                    st.dir_off = off;
+                                }
+                                Err(e) => return Err(Refusal::Fat(vol_id(&self.fs), "create", e)),
+                            }
+                        }
+                        st.created = true;
+                    }
+                    return Ok(Step::More(Phase::Stream(st)));
+                }
+                // (3) Nothing to cut: feed the encoder rows until a chunk is ready or the unit's rows
+                //     are spent.
+                if st.y < self.height {
+                    let t0 = crate::arch::ms();
+                    let end = core::cmp::min(st.y.saturating_add(SLICE_ROWS), self.height);
+                    while st.y < end {
+                        let y = st.y;
+                        st.row.clear();
+                        for x in 0..self.width as usize {
+                            // `read_pixel` is the format authority (see the module note); `None`
+                            // (a firmware height overrunning its own buffer) is black.
+                            let rgb = self.panel.read_pixel(x, y as usize).unwrap_or(0);
+                            st.row.push(((rgb >> 16) & 0xFF) as u8);
+                            st.row.push(((rgb >> 8) & 0xFF) as u8);
+                            st.row.push((rgb & 0xFF) as u8);
+                        }
+                        st.enc
+                            .push_row(&st.row)
+                            .map_err(|e| Refusal::Encode(e, self.width, self.height, self.need))?;
+                        st.y += 1;
+                        if st.enc.ready() {
+                            break;
+                        }
+                    }
+                    st.enc_ms += crate::arch::ms().saturating_sub(t0);
+                    return Ok(Step::More(Phase::Stream(st)));
+                }
+                // (4) All rows in: close the zlib stream (its tail drains through (2)).
+                if !st.enc.finished() {
+                    let t0 = crate::arch::ms();
+                    st.enc
+                        .finish()
                         .map_err(|e| Refusal::Encode(e, self.width, self.height, self.need))?;
-                    y += 1;
+                    st.enc_ms += crate::arch::ms().saturating_sub(t0);
+                    return Ok(Step::More(Phase::Stream(st)));
                 }
-                if y < self.height {
-                    return Ok(Step::More(Phase::Encode { enc, row, y }));
-                }
-                let bytes = enc
-                    .finish()
-                    .map_err(|e| Refusal::Encode(e, self.width, self.height, self.need))?;
-                // PRTSCR-ASYNC/UNPLUG: the encode spent seconds of passes during which the stick
-                // could have gone. This is the first volume-touching step since `begin` verified
-                // the mount, so it is probed like every write below — an entry created on a disk
-                // that left, or on a stranger's, is exactly the stale-handle write this refuses.
-                if !self.volume_alive() {
-                    return Err(Refusal::Vanished(
-                        vol_id(&self.fs),
-                        core::mem::take(&mut self.name),
-                        0,
-                        bytes.len(),
-                    ));
-                }
-                // The entry is created only now, with the pixels already in hand: the same
-                // four-step recipe `shell::fs_write` uses, minus the truncate branch, which cannot
-                // apply — `next_free_name` only ever returns a name that directory does not hold.
-                // PRTSCR-HOME: into `dir_cluster`, the user's own folder, where this was `0`.
-                // SHOTMOUNT (SO19): the entry is created THROUGH THE MOUNT TABLE, as `shell::fs_write`
-                // does, so the capture lands where `ls /` says the namespace is. If the table cannot
-                // create it (no route for the path), the FAT-direct create below is the fallback and
-                // the witness says `via=fat` — never silently.
-                let mt = crate::shell::vfs_mount_table();
-                let vfs_ok = mt
-                    .create(&self.vpath, crate::fs::vfs::NodeKind::File, crate::fs::vfs::KERNEL_PRINCIPAL)
-                    .is_ok();
-                let (dir_lba, dir_off) = if vfs_ok {
-                    self.routed = Some(RoutedMt(mt));
-                    (0u64, 0usize)
-                } else {
-                    let dc = self.dir_cluster;
-                    match busy_retry(|| self.fs.create_in_dir(dc, &self.name, 0x20)) {
-                        Ok((_, lba, off)) => (lba, off),
-                        Err(e) => return Err(Refusal::Fat(vol_id(&self.fs), "create", e)),
-                    }
-                };
-                Ok(Step::More(Phase::Write {
-                    bytes,
-                    done: 0,
-                    first: 0,
-                    size: 0,
-                    dir_lba,
-                    dir_off,
+                // (5) IEND is on the medium. The verdict.
+                let raw = st.enc.raw_len();
+                let deflated = st.enc.deflated_len();
+                let ratio10 = if deflated > 0 { raw * 10 / deflated } else { 0 };
+                let pass = st.enc.verified() && deflated < raw;
+                serial_println!(
+                    ":: SHOTZIP: raw={} deflated={} ratio={}.{}x enc_ms={} filter=sub chain={} blocks=fixed-huffman verify=inflate -> {} ::",
+                    raw,
+                    deflated,
+                    ratio10 / 10,
+                    ratio10 % 10,
+                    st.enc_ms,
+                    crate::video::png::MAX_CHAIN,
+                    if pass { "PASS" } else { "FAIL" }
+                );
+                // SHOTMOUNT (SO19): the route witness, once per capture, at the verdict.
+                let via_vfs = self.routed.take().is_some();
+                serial_println!(
+                    ":: SHOTMOUNT: via={} path={} bytes={} -> {} ::",
+                    if via_vfs { "vfs" } else { "fat" },
+                    self.vpath,
+                    st.done,
+                    if via_vfs { "PASS" } else { "FAIL" }
+                );
+                Ok(Step::Done(Shot {
+                    name: core::mem::take(&mut self.name),
+                    width: self.width,
+                    height: self.height,
+                    bytes: st.done,
+                    vol: vol_id(&self.fs),
+                    dir: core::mem::take(&mut self.dir),
+                    dir_cluster: self.dir_cluster,
+                    chunks: st.enc.chunks(),
                 }))
-            }
-            Phase::Write { bytes, mut done, mut first, mut size, dir_lba, dir_off } => {
-                // PRTSCR-ASYNC/UNPLUG: probe BEFORE the write, never after — the whole point is that
-                // the write is not issued. `done` is the byte count the wire reports, and it is the
-                // count the medium actually holds, because `write_grow` published each slice's size
-                // as it went.
-                if !self.volume_alive() {
-                    return Err(Refusal::Vanished(
-                        vol_id(&self.fs),
-                        core::mem::take(&mut self.name),
-                        done,
-                        bytes.len(),
-                    ));
-                }
-                // In order, from `done` upward. `start == size` on every call after the first, so
-                // no hole is ever asked for, and each call publishes the grown size + chain head —
-                // which is what makes the partial file on the medium a valid PNG PREFIX rather than
-                // a size that claims bytes the data does not back.
-                let take = core::cmp::min(SLICE_WRITE, bytes.len() - done);
-                let at = done;
-                let chunk = &bytes[at..at + take];
-                let (wrote, new_size, new_first) = if let Some(r) = self.routed.as_ref() {
-                    // SHOTMOUNT: the slice through the table (`mt.write` at the running offset).
-                    match r.0.write(&self.vpath, at as u64, chunk, crate::fs::vfs::KERNEL_PRINCIPAL) {
-                        Ok(n) => (n, (at + n) as u32, first),
-                        Err(_) => return Err(Refusal::Fat(vol_id(&self.fs), "write", FatError::Io)),
-                    }
-                } else {
-                    match busy_retry(|| self.fs.write_grow(first, size, dir_lba, dir_off, at as u32, chunk)) {
-                        Ok(t) => t,
-                        Err(e) => return Err(Refusal::Fat(vol_id(&self.fs), "write", e)),
-                    }
-                };
-                if wrote != take {
-                    return Err(Refusal::Short(
-                        vol_id(&self.fs),
-                        core::mem::take(&mut self.name),
-                        at + wrote,
-                        bytes.len(),
-                    ));
-                }
-                done += wrote;
-                size = new_size;
-                first = new_first;
-                if done < bytes.len() {
-                    Ok(Step::More(Phase::Write { bytes, done, first, size, dir_lba, dir_off }))
-                } else {
-                    // SHOTMOUNT (SO19): the route witness, once per capture, at the verdict.
-                    let via_vfs = self.routed.take().is_some();
-                    serial_println!(
-                        ":: SHOTMOUNT: via={} path={} bytes={} -> {} ::",
-                        if via_vfs { "vfs" } else { "fat" },
-                        self.vpath,
-                        done,
-                        if via_vfs { "PASS" } else { "FAIL" }
-                    );
-                    Ok(Step::Done(Shot {
-                        name: core::mem::take(&mut self.name),
-                        width: self.width,
-                        height: self.height,
-                        bytes: done,
-                        vol: vol_id(&self.fs),
-                        dir: core::mem::take(&mut self.dir),
-                        dir_cluster: self.dir_cluster,
-                    }))
-                }
             }
             // Unreachable: `slice` is the only caller and it always hands back a live phase.
             // Answered rather than panicked, per this module's guard-with-a-return discipline.
@@ -1577,14 +1622,16 @@ impl Shot {
     /// in the 8.3 spelling the medium actually holds — beside the disk it landed on.
     pub fn report_ok(&self) {
         serial_println!(
-            ":: PRTSCR: {} {}x{} {} bytes -> OK :: source={} serial=0x{:08X} dir={} ::",
+            ":: PRTSCR: {} {}x{} {} bytes -> OK :: source={} serial=0x{:08X} dir={} bytes_written={} chunks={} ::",
             self.name,
             self.width,
             self.height,
             self.bytes,
             self.vol.source,
             self.vol.serial,
-            self.dir
+            self.dir,
+            self.bytes,
+            self.chunks
         );
     }
 }

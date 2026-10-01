@@ -907,7 +907,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // (well-formed A / truncated / compression-loop / rcode) under `./arroyo test` in any environment
         // (the live boot resolve in `service_net` stays a bonus). Prints `:: DNS-X86-GATE: ... PASS [w=0xf] ::`.
         #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "smolnet"))]
-        unaos_kernel::smolnet::dns_x86_gate(); unaos_kernel::net_fetch::parse_gate();
+        unaos_kernel::smolnet::dns_x86_gate(); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] unaos_kernel::net_fetch::parse_gate();
 
         // U1a: x86 ring-3 round-trip (the aarch64 M6a equivalent). Turn scheduling on (the default
         // test build never enables the feature-gated demo below, so the APs would otherwise idle in
@@ -2781,7 +2781,7 @@ fn handle_key(
             console.draw(pal);
         }
         return took_screen;
-    } else if c == 8 || c == 0x7F {
+    } else if unaos_kernel::shellux::wants(c) { let r = unaos_kernel::shellux::console_key(c, console); console.repaint(r, pal); } else if c == 8 || c == 0x7F { // SHELLUX (R75) — Up/Down history, Tab completion, Ctrl-C/L/A/E/U/W reach the line editor; line-neutral fold.
         let r = console.sel.type_byte(c, &mut console.current_input); // TERMSEL2 M3 — the edit happens AT THE CARET (`LineSel::type_byte`): Backspace deletes the byte before it, and with a selection on the line deletes the selection.
         console.repaint(r, pal);
     } else if c >= 32 && c <= 126 {
@@ -7040,7 +7040,7 @@ fn x86_render_service(cpu: usize) {
             // Emitted from HERE — after `pal.render()`, inside the existing rate limit — deliberately.
             // The event-routing block above (`wc_click_route` -> `user_input_route` -> `handle_key`)
             // is the seam of the open focus-trap defect and is not to be perturbed by an instrument.
-            unaos_kernel::arch::sched::emit_load_witness(""); unaos_kernel::arch::sched::emit_smpload_witness(); #[cfg(feature = "witness")] unaos_kernel::arch::sched::smpload_selftest(); unaos_kernel::net_tick::service_tick(); // SNTPDRV M1 (the 5 s clock drives the arch-neutral net seam) — SMPLOAD (B227) — ⚠ SAME-LINE fold, line-NEUTRAL: the VERDICT over the load line's own counters (its 10 s gate is inside) and the one-shot pure-judge fixture, riding the same 5 s clock.
+            unaos_kernel::arch::sched::emit_load_witness(""); unaos_kernel::arch::sched::emit_smpload_witness(); #[cfg(feature = "witness")] unaos_kernel::arch::sched::smpload_selftest(); #[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "sntp6", feature = "net6", target_arch = "aarch64")))] unaos_kernel::net_tick::service_tick(); // SNTPDRV M1 (the 5 s clock drives the arch-neutral net seam) — SMPLOAD (B227) — ⚠ SAME-LINE fold, line-NEUTRAL: the VERDICT over the load line's own counters (its 10 s gate is inside) and the one-shot pure-judge fixture, riding the same 5 s clock.
             // R0 / rtwit: the WORST-CASE RULER's rollup, riding the same ~5 s gate. Emits the
             // `[rtwit]` line (input→present max/p99, per-lock max holds, max interrupt-mask span,
             // ruler overhead) and resets every per-span slot. A no-op inline shim when `rtwit` is off.

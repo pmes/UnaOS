@@ -634,10 +634,14 @@ pub fn deliver_ax(buf: &[u8]) {
     }
     let rx_hdr = u32::from_le_bytes([buf[n - 4], buf[n - 3], buf[n - 2], buf[n - 1]]);
     let pkt_cnt = (rx_hdr & 0xffff) as usize;
-    let hdr_off = (rx_hdr >> 16) as usize;
-    if pkt_cnt == 0 || hdr_off + pkt_cnt * 4 > n - 4 {
+    let hdr_off = ((rx_hdr >> 16) & 0xffff) as usize;
+    let first_hdr = if hdr_off + 4 <= n { u32::from_le_bytes([buf[hdr_off], buf[hdr_off + 1], buf[hdr_off + 2], buf[hdr_off + 3]]) } else { 0 };
+    // Linux ax88179_rx_fixup: the transfer must hold the header array; geometry failure drops the whole transfer.
+    if pkt_cnt == 0 || hdr_off + pkt_cnt * 4 > n || hdr_off + 4 > n {
+        RX_SHORT.fetch_add(1, Ordering::Relaxed);
         ERRORS.fetch_add(1, Ordering::Relaxed);
         RX_DROP.fetch_add(1, Ordering::Relaxed);
+        rx_raw_once(n, rx_hdr, pkt_cnt, hdr_off, first_hdr, "short-geometry");
         return;
     }
     let mut off = 0usize;
@@ -646,20 +650,43 @@ pub fn deliver_ax(buf: &[u8]) {
         let pkt_hdr = u32::from_le_bytes([buf[h], buf[h + 1], buf[h + 2], buf[h + 3]]);
         let pkt_len = ((pkt_hdr >> 16) & 0x1fff) as usize;
         if pkt_len < ax::RX_PAD + 14 || off + pkt_len > hdr_off {
+            RX_SHORT.fetch_add(1, Ordering::Relaxed);
             ERRORS.fetch_add(1, Ordering::Relaxed);
             RX_DROP.fetch_add(1, Ordering::Relaxed);
+            rx_raw_once(n, rx_hdr, pkt_cnt, hdr_off, pkt_hdr, "pkt-len-bad");
             return;
         }
-        if pkt_hdr & (ax::RXHDR_CRC_ERR | ax::RXHDR_DROP_ERR) == 0 {
-            // Whether the hardware's pkt_len counts the 2-byte pad is not settled without the bench: hand the
-            // stack pkt_len bytes AFTER the pad (clamped to the header block), so a pad-inclusive length costs
-            // two trailing bytes (IP/UDP ignore bytes past their own length) and never a truncated frame.
-            deliver(&buf[off + ax::RX_PAD..(off + ax::RX_PAD + pkt_len).min(hdr_off)]);
-        } else {
+        if pkt_hdr & ax::RXHDR_CRC_ERR != 0 {
+            RX_CRC.fetch_add(1, Ordering::Relaxed);
             RX_DROP.fetch_add(1, Ordering::Relaxed);
+            rx_raw_once(n, rx_hdr, pkt_cnt, hdr_off, pkt_hdr, "crc");
+        } else if pkt_hdr & ax::RXHDR_DROP_ERR != 0 {
+            RX_DROP_ERR.fetch_add(1, Ordering::Relaxed);
+            RX_DROP.fetch_add(1, Ordering::Relaxed);
+            rx_raw_once(n, rx_hdr, pkt_cnt, hdr_off, pkt_hdr, "drop-err");
+        } else {
+            // Frame at pkt_start+2, length pkt_len-2 (Linux skb_pull(2) of a pkt_len-long clone).
+            RX_OK.fetch_add(1, Ordering::Relaxed);
+            deliver(&buf[off + ax::RX_PAD..off + pkt_len]);
         }
         off += (pkt_len + 7) & !7;
     }
+}
+
+static RX_OK: AtomicU64 = AtomicU64::new(0);
+static RX_CRC: AtomicU64 = AtomicU64::new(0);
+static RX_DROP_ERR: AtomicU64 = AtomicU64::new(0);
+static RX_SHORT: AtomicU64 = AtomicU64::new(0);
+static RX_RAW_SEEN: AtomicU64 = AtomicU64::new(0);
+/// M1: print the first dropped transfer's shape once, so a geometry mismatch is named on the bench.
+fn rx_raw_once(len: usize, rx_hdr: u32, pkt_cnt: usize, hdr_off: usize, first_pkt_hdr: u32, reason: &str) {
+    if RX_RAW_SEEN.fetch_add(1, Ordering::Relaxed) != 0 {
+        return;
+    }
+    serial_println!(
+        "[usbnet] rx raw len={} rx_hdr={:#010x} pkt_cnt={} hdr_off={} first_pkt_hdr={:#010x} reason={}",
+        len, rx_hdr, pkt_cnt, hdr_off, first_pkt_hdr, reason
+    );
 }
 
 fn rollup() {
@@ -670,9 +697,10 @@ fn rollup() {
     }
     REPORTED.store(total, Ordering::Relaxed);
     serial_println!(
-        ":: USBNET: rx={} tx={} rx_drop={} tx_drop={} errors={} ::",
+        ":: USBNET: rx={} tx={} rx_drop={} tx_drop={} errors={} rx_ok={} rx_crc={} rx_drop_err={} rx_short={} ::",
         RX_FRAMES.load(Ordering::Relaxed), TX_FRAMES.load(Ordering::Relaxed),
-        RX_DROP.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed), ERRORS.load(Ordering::Relaxed)
+        RX_DROP.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed), ERRORS.load(Ordering::Relaxed),
+        RX_OK.load(Ordering::Relaxed), RX_CRC.load(Ordering::Relaxed), RX_DROP_ERR.load(Ordering::Relaxed), RX_SHORT.load(Ordering::Relaxed)
     );
 }
 
@@ -780,11 +808,12 @@ pub fn witness(bus: &str, slot: u8) {
     let m = mac();
     let ok = m.iter().any(|&b| b != 0);
     serial_println!(
-        ":: USBNET: bus={} slot={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} speed={} usb={} rx={} tx={} rx_drop={} tx_drop={} errors={} -> {} ::",
+        ":: USBNET: bus={} slot={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} speed={} usb={} rx={} tx={} rx_drop={} tx_drop={} errors={} rx_ok={} rx_crc={} rx_drop_err={} rx_short={} -> {} ::",
         bus, slot, m[0], m[1], m[2], m[3], m[4], m[5],
         if LINK.load(Ordering::Relaxed) { "up" } else { "down" }, SPEED_MBPS.load(Ordering::Relaxed), usb_name(),
         RX_FRAMES.load(Ordering::Relaxed), TX_FRAMES.load(Ordering::Relaxed),
         RX_DROP.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed), ERRORS.load(Ordering::Relaxed),
+        RX_OK.load(Ordering::Relaxed), RX_CRC.load(Ordering::Relaxed), RX_DROP_ERR.load(Ordering::Relaxed), RX_SHORT.load(Ordering::Relaxed),
         if ok { "PASS" } else { "FAIL" }
     );
 }

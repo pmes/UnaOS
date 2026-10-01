@@ -5212,7 +5212,7 @@ impl XhciController {
                                                         if !prev_keys.contains(&keycode) { newest_press = ascii; }
                                                     }
                                                 }
-                                                crate::pal::typematic_note_report(newest_press, &held[..hn]);
+                                                crate::pal::typematic_note_report(newest_press, &held[..hn]); #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))] for i in 2..8 { let kc = report[i]; if kc > 1 && !prev_keys.contains(&kc) { let _ = crate::video::status::volkey_usage(kc); } } // ARMROUTER (VOLKEYS arm, aarch64): F10/F11/F12 press edges through the same `status::volkey_usage` seam the EHCI decoder calls; the board's backend says `amp_written=false` (no HDA here). Same-line fold, line-neutral.
                                             }
 
                                             // HID-KEYS: key-UP edges. A boot report carries the FULL

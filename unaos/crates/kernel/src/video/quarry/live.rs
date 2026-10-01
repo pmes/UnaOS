@@ -131,6 +131,11 @@ use crate::video::theme;
 use crate::video::wm;
 use crate::fs::vfs::{DirEnt, NodeKind, VfsTime};
 
+/// QUARRYOPS (R75) — right-click menu, rename field, copy/paste, delete, new folder, info.
+#[path = "ops.rs"]
+pub mod ops;
+pub use ops::{menu_press, right_press, selftest as ops_selftest};
+
 // ── Identity ────────────────────────────────────────────────────────────────────────────────────
 
 /// Quarry's owner ASID: kernel FURNITURE, in the reserved band, and deliberately neither
@@ -1615,8 +1620,14 @@ fn run_act(act: Act) {
         }
         // FILEVIEW — latched like FACET's View, for the same stack-depth reason (click-router depth).
         Act::Text(p) => {
-            crate::video::fileview::request_open(&p);
-            serial_println!("[quarry] open TEXT path={} -> fileview (latched for the render pass)", p);
+            // TEXTEDIT (R75) — a file the user owns opens the EDITOR, any other the read-only viewer.
+            if crate::video::textedit::may_edit(&p) {
+                crate::video::textedit::request_open(&p);
+                serial_println!("[quarry] open TEXT path={} -> textedit (latched for the render pass)", p);
+            } else {
+                crate::video::fileview::request_open(&p);
+                serial_println!("[quarry] open TEXT path={} -> fileview (latched for the render pass)", p);
+            }
             alloc::format!("opening {}", leaf(&p))
         }
         Act::NoOpener(p) => {
@@ -1950,6 +1961,7 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
         }
     }
     paint_scrollbar(px, g, li, body_y, m.list.len(), lvis, m.list_scroll);
+    ops::paint_overlay(m, px); // QUARRYOPS — the context menu and the inline edit field, over the finished frame
 }
 
 /// Repaint the whole surface and present it.
@@ -2317,7 +2329,7 @@ pub fn close() {
 pub fn key_route(ev: crate::pal::Event) -> bool {
     // FILEVIEW — the text viewer's arrows / wheel / paging, asked first; it consumes only while ITS
     // window holds focus, so a closed viewer changes nothing below.
-    if crate::video::fileview::key_route(ev) {
+    if crate::video::fileview::key_route(ev) || crate::video::textedit::key_route(ev) {
         return true;
     }
     // QSCROLL — the WHEEL arrives here, at the seam that already exists, because this function is
@@ -2331,6 +2343,10 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     if let crate::pal::Event::Wheel(d) = ev {
         return on_glass() && wheel_route(d);
     }
+    // QUARRYOPS — Cmd/Ctrl-C / V arrive as `Action`s; Quarry takes them only while it holds the keyboard.
+    if let crate::pal::Event::Action(a) = ev {
+        return is_open() && wm::focus_asid() == OWNER && on_glass() && ops::action(a);
+    }
     let crate::pal::Event::Key(c) = ev else {
         return false;
     };
@@ -2342,6 +2358,11 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
             key_witness(c, focused, false);
         }
         return false;
+    }
+    // QUARRYOPS — the edit field / Delete / rename / new-folder keys, asked before the table below.
+    if ops::key_pre(c) {
+        key_witness(c, true, true);
+        return true;
     }
     let mut acted = true;
     let mut refreshed = false;
@@ -2533,6 +2554,10 @@ pub fn press_route(x: i32, y: i32) -> bool {
     }
     // FILEVIEW — the text viewer's close box / raise, chained here for FACET's reason.
     if crate::video::fileview::press_route(x, y) {
+        return true;
+    }
+    // TEXTEDIT — the editor's close box / caret placement / raise.
+    if crate::video::textedit::press_route(x, y) {
         return true;
     }
     let id = WIN.load(Ordering::Relaxed);
@@ -3004,6 +3029,8 @@ pub fn service() {
     crate::video::facet::service();
     // FILEVIEW — the text viewer's latch drains on the same pass, for the same reason.
     crate::video::fileview::service();
+    // TEXTEDIT — the editor's latch drains on the same pass.
+    crate::video::textedit::service();
 }
 
 // ── The witness ─────────────────────────────────────────────────────────────────────────────────

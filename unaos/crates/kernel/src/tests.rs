@@ -42,8 +42,21 @@ static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 
 /// Called by the verdict tap for every fixture verdict line.
 pub fn tally(pass: bool) {
-    if pass { PASS.fetch_add(1, Ordering::Relaxed); } else { FAIL.fetch_add(1, Ordering::Relaxed); }
+    if pass { PASS.fetch_add(1, Ordering::Relaxed); } else {
+        FAIL.fetch_add(1, Ordering::Relaxed);
+        // TESTFIX2 — remember WHICH fixture failed (the one `run` is executing), de-duplicated, for the summary line.
+        if let (Some(cur), Some(mut fl)) = (CUR.try_lock(), FAILED.try_lock()) {
+            let n = *cur;
+            if !n.is_empty() && !fl.iter().flatten().any(|x| *x == n) {
+                if let Some(slot) = fl.iter_mut().find(|x| x.is_none()) { *slot = Some(n); }
+            }
+        }
+    }
 }
+
+/// TESTFIX2 — the fixture `run` is executing now, and the names of those that printed a FAIL this run.
+static CUR: spin::Mutex<&'static str> = spin::Mutex::new("");
+static FAILED: spin::Mutex<[Option<&'static str>; 16]> = spin::Mutex::new([None; 16]);
 
 /// How many fixtures are parked behind the verb.
 pub fn deferred_count() -> usize { DEFERRED.load(Ordering::Relaxed) }
@@ -71,6 +84,7 @@ pub fn register(name: &'static str, f: fn()) {
 
 /// A registering source has finished; once all required sources have, print the boot line ONCE.
 pub fn source_done(bit: u32) {
+    ensure_shellux();
     let done = SOURCES_DONE.fetch_or(bit, Ordering::AcqRel) | bit;
     if done & REQUIRED == REQUIRED && !ANNOUNCED.swap(true, Ordering::AcqRel) {
         serial_println!(":: TESTS: deferred={} fire=tests at_boot={} ::", deferred_count(), AT_BOOT.load(Ordering::Relaxed));
@@ -79,11 +93,13 @@ pub fn source_done(bit: u32) {
 
 /// Run one named fixture (`Some`) or all (`None`); returns how many ran.
 pub fn run(name: Option<&str>) -> usize {
+    ensure_shellux();
     if RUNNING.swap(true, Ordering::AcqRel) {
         serial_println!(":: TESTS: already running — refused ::");
         return 0;
     }
     let (p0, f0) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
+    *FAILED.lock() = [None; 16];
     let mut ran = 0usize;
     let mut i = 0usize;
     loop {
@@ -93,11 +109,15 @@ pub fn run(name: Option<&str>) -> usize {
         i += 1;
         if let Some(want) = name { if want != n { continue; } }
         serial_println!(":: TESTS: run {} ::", n);
+        *CUR.lock() = n;
         f();
+        *CUR.lock() = "";
         ran += 1;
     }
     let (p, f) = (PASS.load(Ordering::Relaxed).wrapping_sub(p0), FAIL.load(Ordering::Relaxed).wrapping_sub(f0));
-    serial_println!(":: TESTS: ran={} pass={} fail={} ::", ran, p, f);
+    let mut names = alloc::string::String::new();
+    for n in FAILED.lock().iter().flatten() { if !names.is_empty() { names.push(','); } names.push_str(n); }
+    serial_println!(":: TESTS: ran={} pass={} fail={} failed=[{}] ::", ran, p, f, names);
     RUNNING.store(false, Ordering::Release);
     ran
 }
@@ -109,6 +129,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
+    ensure_shellux();
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
@@ -122,6 +143,17 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     if ran == 0 && name.is_some() {
         console.println("tests: no such fixture (try `tests list`)");
     } else {
-        console.println(&format!("tests: ran={} pass={} fail={}", ran, p, f));
+        let mut names = alloc::string::String::new();
+        for n in FAILED.lock().iter().flatten() { if !names.is_empty() { names.push(','); } names.push_str(n); }
+        console.println(&format!("tests: ran={} pass={} fail={} failed=[{}]", ran, p, f, names));
+    }
+}
+
+/// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
+fn ensure_shellux() {
+    #[cfg(all(feature = "witness", target_arch = "x86_64"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("shellux", crate::shellux::selftest); }
     }
 }
