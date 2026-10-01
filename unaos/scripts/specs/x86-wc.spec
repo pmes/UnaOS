@@ -971,3 +971,6 @@ FORBID :: SCROLLBACK: .* -> FAIL ::
 REQUIRE :: WINSNAP: zones=7 snaps=[0-9]+ restores=[0-9]+ preview_ok=true unsnaps=[0-9]+ left=true chords=true quarters=4 .* -> PASS ::
 FORBID :: WINSNAP: .* -> FAIL ::
 REQUIRE \[wm-act\] snap win=[0-9]+ zone=left rect=
+# ── WINDOWLIST (R75) — `tests windowlist`: the bar's Window menu opened through the press router, the second window's row picked (focus asserted), Show Desktop minimises every live app window and a second pick restores them.
+REQUIRE :: WINDOWLIST: rows=[0-9]+ live=[0-9]+ focused=[1-9][0-9]* minimised=[0-9]+ show_desktop_ok=true -> PASS ::
+FORBID :: WINDOWLIST: .* -> FAIL ::

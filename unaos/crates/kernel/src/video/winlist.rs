@@ -266,3 +266,73 @@ pub fn key(a: Action) -> bool {
         _ => false,
     }
 }
+
+/// WINDOWLIST fixture (`tests windowlist`): two minted windows; the Window menu is opened through the bar's press
+/// router (`winmenu::press_at`, the seam every desktop click takes first), the SECOND window's row is picked and focus
+/// asserted; Show Desktop is picked and both windows asserted minimised; picked again, both asserted restored.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+pub fn selftest() {
+    use super::winmenu;
+    const A: u64 = 0xD51;
+    const B: u64 = 0xD52;
+    let ida = wm::wl_fixture_mint(A, b"wl-a");
+    let idb = wm::wl_fixture_mint(B, b"wl-b");
+    let done = |ids: bool| {
+        if ids {
+            wm::close_owner(A);
+            wm::close_owner(B);
+        }
+    };
+    if ida == wm::WIN_NONE || idb == wm::WIN_NONE {
+        serial_println!(":: WINDOWLIST: SKIP (window table full) ::");
+        done(true);
+        return;
+    }
+    // Focus ends on A (raised last), so picking B's row is a real change of focus.
+    wm::wl_focus(idb);
+    wm::wl_focus(ida);
+    winmenu::set_app_window(ida, b"wl-a");
+    // Open the menu by pressing the Window box.
+    let Some((bx, by)) = winmenu::wl_box_center() else {
+        serial_println!(":: WINDOWLIST: SKIP (no bar / panel) ::");
+        done(true);
+        return;
+    };
+    let opened = winmenu::press_at(bx, by) && winmenu::is_open();
+    let nrows = rows().len();
+    let mut wr = [wm::WlRow { id: 0, owner: 0, minimised: false, title: [0; wm::MAX_TITLE], len: 0 }; wm::MAX_WINDOWS];
+    let live = wm::wl_rows(&mut wr);
+    let rows_ok = nrows == FIXED_ROWS + live && live >= 2;
+    let pick_second = match winmenu::wl_row_center(ID_WIN_BASE + idb) {
+        Some((x, y)) => winmenu::press_at(x, y),
+        None => false,
+    };
+    let focused_id = wm::wl_focused().map(|f| f.0).unwrap_or(0);
+    let focus_ok = opened && pick_second && focused_id == idb && wm::focus_asid() == B && !winmenu::is_open();
+    // Show Desktop, through the menu.
+    let open_and_pick = |id: u32| -> bool {
+        let Some((x, y)) = winmenu::wl_box_center() else { return false };
+        if !winmenu::press_at(x, y) {
+            return false;
+        }
+        match winmenu::wl_row_center(id) {
+            Some((rx, ry)) => winmenu::press_at(rx, ry),
+            None => false,
+        }
+    };
+    let hid = open_and_pick(ID_SHOW_DESKTOP);
+    let live_now = wm::wl_rows(&mut wr);
+    let minimised = wr[..live_now].iter().filter(|r| r.minimised).count();
+    let all_down = hid && live_now >= 2 && minimised == live_now && desktop_hidden();
+    let back = open_and_pick(ID_SHOW_DESKTOP);
+    let live_after = wm::wl_rows(&mut wr);
+    let restored = back && wr[..live_after].iter().filter(|r| r.id == ida || r.id == idb).all(|r| !r.minimised) && !desktop_hidden();
+    let show_desktop_ok = all_down && restored;
+    let ok = rows_ok && focus_ok && show_desktop_ok;
+    serial_println!(
+        ":: WINDOWLIST: rows={} live={} focused={} minimised={} show_desktop_ok={} -> {} ::",
+        nrows, live, focused_id, minimised, show_desktop_ok, if ok { "PASS" } else { "FAIL" }
+    );
+    winmenu::set_app_window(wm::WIN_NONE, b"");
+    done(true);
+}

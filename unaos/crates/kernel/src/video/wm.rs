@@ -30042,3 +30042,11 @@ pub fn wl_raise_all() -> usize {
     }
     n
 }
+
+/// WINDOWLIST fixture: mint one fixture-surface window for `asid` named `title` (`WIN_NONE` when the table is full).
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+pub fn wl_fixture_mint(asid: u64, title: &[u8]) -> WinId {
+    let s = &raw const HT_SURF as usize;
+    let len = core::mem::size_of_val(&HT_SURF);
+    create(asid, s, len, FIX_W as u32, FIX_H as u32, FIX_STRIDE as u32, title)
+}
