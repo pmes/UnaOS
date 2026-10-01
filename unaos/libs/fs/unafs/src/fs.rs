@@ -39,7 +39,9 @@
 //!   before the mount returns — a half-drained queue is crash-safe because
 //!   the drain itself is one commit).
 
+use crate::btree::{Btree, BtreeError, DeviceStore, LexCmp};
 use crate::catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
+use crate::index::{CatalogRecord, IndexFact, ReadStore};
 use crate::inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
 use crate::refmap::RefMap;
 use crate::root::{ROOT_BLOCK, RootRecord, RootSlot};
@@ -55,8 +57,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::catalog::hash_value;
-use crate::hash::hash_bytes;
-use crate::query::{Query, QueryOp};
+
+use crate::query::{Expr, Predicate, Query, QueryOp};
+use alloc::collections::BTreeSet;
 #[cfg(feature = "std")]
 use bandy::{BandyMember, SMessage};
 
@@ -251,14 +254,32 @@ impl<D: BlockDevice> UnaFS<D> {
     /// [`crate::superblock::MAX_BLOCK_COUNT`] blocks = 1 TiB) via a second
     /// refcount-map index level; a volume of ≤ 2 GiB stays single-level and
     /// byte-identical to v4 apart from the version stamp.
-    pub fn format(mut device: D, size_mb: u64) -> Result<Self, FileSystemError> {
+    pub fn format(device: D, size_mb: u64) -> Result<Self, FileSystemError> {
+        Self::format_with_version(device, size_mb, crate::superblock::VERSION)
+    }
+
+    /// Format with an EXPLICIT on-disk version in
+    /// `MIN_SUPPORTED_VERSION..=VERSION` — the compatibility seam: a v5 image
+    /// (flat catalog, no inode meta trailers) for a pre-v6 reader, and the
+    /// genuine old-format fixtures the migration and compatibility tests run
+    /// against. Everything the chosen version does not declare is simply not
+    /// written (no trees, no trailers, no spill on v3).
+    pub fn format_with_version(
+        mut device: D,
+        size_mb: u64,
+        version: u32,
+    ) -> Result<Self, FileSystemError> {
+        if !(crate::superblock::MIN_SUPPORTED_VERSION..=crate::superblock::VERSION).contains(&version) {
+            return Err(SuperblockError::InvalidVersion(version).into());
+        }
         let blocks_from_size = (size_mb * 1024 * 1024) / BLOCK_SIZE;
         let mut block_count = device.block_count();
         if block_count == 0 {
             block_count = blocks_from_size;
         }
 
-        let superblock = Superblock::new(block_count);
+        let mut superblock = Superblock::new(block_count);
+        superblock.version = version;
         superblock.validate()?;
 
         // Static identity: block 0, written once.
@@ -302,16 +323,28 @@ impl<D: BlockDevice> UnaFS<D> {
         };
 
         // The reserved system objects, in id order (1..=4).
-        let root_id = fs.create_inode_inner(FileKind::Directory, BTreeMap::new())?;
+        let root_id = fs.create_inode_inner(FileKind::Directory, BTreeMap::new(), 0, None)?;
         debug_assert_eq!(root_id, ROOT_INODE_ID);
-        let catalog_id = fs.create_inode_inner(FileKind::System, BTreeMap::new())?;
+        let catalog_id = fs.create_inode_inner(FileKind::System, BTreeMap::new(), 0, None)?;
         debug_assert_eq!(catalog_id, CATALOG_INODE_ID);
-        let snap_id = fs.create_inode_inner(FileKind::System, BTreeMap::new())?;
+        if fs.superblock.indexed() {
+            // v6: the catalog is two EMPTY B+trees named by the catalog record.
+            let (eq_root, ord_root, written) = {
+                let mut store = DeviceStore::new(&mut fs.device, &mut fs.refmap);
+                let eq = Btree::create(&mut store, LexCmp)?;
+                let ord = Btree::create(&mut store, LexCmp)?;
+                (eq.root(), ord.root(), store.written)
+            };
+            fs.count_index_writes(written);
+            let rec = CatalogRecord { eq_root, ord_root, entries: 0 };
+            fs.rewrite_data_inner(catalog_id, &rec.to_bytes())?;
+        }
+        let snap_id = fs.create_inode_inner(FileKind::System, BTreeMap::new(), 0, None)?;
         debug_assert_eq!(snap_id, SNAP_INDEX_INODE_ID);
         let empty_snaps: Vec<SnapshotEntry> = Vec::new();
         let bytes = crate::codec::serialize(&empty_snaps)?;
         fs.rewrite_data_inner(snap_id, &bytes)?;
-        let reclaim_id = fs.create_inode_inner(FileKind::System, BTreeMap::new())?;
+        let reclaim_id = fs.create_inode_inner(FileKind::System, BTreeMap::new(), 0, None)?;
         debug_assert_eq!(reclaim_id, RECLAIM_INODE_ID);
         let empty_queue: Vec<ReclaimEntry> = Vec::new();
         let bytes = crate::codec::serialize(&empty_queue)?;
@@ -893,19 +926,33 @@ impl<D: BlockDevice> UnaFS<D> {
     /// overflow to indirect blocks when it will not fit inline. Allocates and
     /// writes the indirect blocks as a side effect (they join the transaction).
     fn encode_inode_block(&mut self, inode: &Inode) -> Result<Vec<u8>, FileSystemError> {
+        // v6: the meta trailer (parent, name, times) rides right after the
+        // inode's unchanged bincode bytes. v3–v5: no trailer, bytes as before.
+        let meta = if self.superblock.indexed() {
+            inode.meta_bytes()
+        } else {
+            Vec::new()
+        };
         // Fast path: the whole inode fits one block → inline, unchanged bytes.
         match inode.to_bytes() {
-            Ok(bytes) => {
+            Ok(bytes) if bytes.len() + meta.len() <= BLOCK_SIZE as usize => {
                 let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
                 block[..bytes.len()].copy_from_slice(&bytes);
+                block[bytes.len()..bytes.len() + meta.len()].copy_from_slice(&meta);
                 Ok(block)
+            }
+            Ok(_) => {
+                if !self.superblock.spill_capable() {
+                    return Err(InodeError::InodeTooLarge(0, BLOCK_SIZE).into());
+                }
+                self.encode_spilled_inode_block(inode, &meta)
             }
             Err(InodeError::InodeTooLarge(_, _)) => {
                 if !self.superblock.spill_capable() {
                     // v3 volume: no spill format is declared — reject as before.
                     return Err(InodeError::InodeTooLarge(0, BLOCK_SIZE).into());
                 }
-                self.encode_spilled_inode_block(inode)
+                self.encode_spilled_inode_block(inode, &meta)
             }
             Err(e) => Err(e.into()),
         }
@@ -916,8 +963,9 @@ impl<D: BlockDevice> UnaFS<D> {
     fn encode_spilled_inode_block(
         &mut self,
         inode: &Inode,
+        meta: &[u8],
     ) -> Result<Vec<u8>, FileSystemError> {
-        let k = inode.inline_extent_count()?;
+        let k = inode.inline_extent_count_with(meta.len())?;
         if k >= inode.chunks.len() {
             // The inode is oversized for a reason other than extent count
             // (e.g. attributes) — spilling extents cannot help.
@@ -943,29 +991,35 @@ impl<D: BlockDevice> UnaFS<D> {
         let inode_bytes = crate::codec::serialize(&stub)?;
         let trailer_bytes = crate::codec::serialize(&trailer)?;
 
-        if inode_bytes.len() + trailer_bytes.len() > BLOCK_SIZE as usize {
+        if inode_bytes.len() + meta.len() + trailer_bytes.len() > BLOCK_SIZE as usize {
             // The index fragmented past the reserve — undo the just-written
             // indirect blocks so nothing leaks, and fail gracefully.
             self.decref_extents(&index);
             return Err(InodeError::InodeTooLarge(
-                inode_bytes.len() + trailer_bytes.len(),
+                inode_bytes.len() + meta.len() + trailer_bytes.len(),
                 BLOCK_SIZE,
             )
             .into());
         }
 
         let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
-        block[..inode_bytes.len()].copy_from_slice(&inode_bytes);
-        block[inode_bytes.len()..inode_bytes.len() + trailer_bytes.len()]
-            .copy_from_slice(&trailer_bytes);
+        let mut off = 0;
+        for part in [&inode_bytes[..], meta, &trailer_bytes[..]] {
+            block[off..off + part.len()].copy_from_slice(part);
+            off += part.len();
+        }
         Ok(block)
     }
 
     /// Allocate the next logical inode id and CoW-write a fresh inode there.
+    /// `parent`/`name` are the v6 parent pointer (0/`None` for an unnamed
+    /// object); every timestamp is stamped now.
     fn create_inode_inner(
         &mut self,
         kind: FileKind,
         attributes: BTreeMap<String, AttributeValue>,
+        parent: u64,
+        name: Option<&str>,
     ) -> Result<u64, FileSystemError> {
         let id = self.imap.len() as u64;
         if (id + 1).div_ceil(IMAP_ENTRIES_PER_LEAF) > IMAP_MAX_LEAVES {
@@ -974,6 +1028,9 @@ impl<D: BlockDevice> UnaFS<D> {
         self.imap.push(0);
         let mut inode = Inode::new(id, kind);
         inode.attributes = attributes;
+        inode.parent = parent;
+        inode.name = name.map(String::from);
+        stamp_all(&mut inode);
         self.write_inode(&inode)?;
         Ok(id)
     }
@@ -983,7 +1040,14 @@ impl<D: BlockDevice> UnaFS<D> {
         &mut self,
         attributes: BTreeMap<String, AttributeValue>,
     ) -> Result<u64, FileSystemError> {
-        let id = self.create_inode_inner(FileKind::File, attributes)?;
+        let facts: Vec<(String, AttributeValue)> =
+            attributes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let id = self.create_inode_inner(FileKind::File, attributes, 0, None)?;
+        // Index the initial attributes exactly as `set_attribute` would (the
+        // pre-v6 path never indexed them — a query could not find a bare
+        // `create_inode` object by its creation attributes).
+        let facts: Vec<IndexFact> = facts.iter().map(|(k, v)| IndexFact::new(k, v, id)).collect();
+        self.index_apply(&[], &facts)?;
         self.maybe_commit()?;
         Ok(id)
     }
@@ -1118,6 +1182,7 @@ impl<D: BlockDevice> UnaFS<D> {
 
         inode.chunks = Self::emit_extents(&map, new_size);
         inode.size = new_size;
+        stamp_data(&mut inode);
         self.write_inode(&inode)?;
         Ok(())
     }
@@ -1403,17 +1468,10 @@ impl<D: BlockDevice> UnaFS<D> {
             Vec::new()
         };
 
-        // Read the attribute catalog ONCE; every file's attrs append to it and
-        // it is rewritten a single time below (vs the per-op path's full
-        // re-serialize per attribute).
-        let catalog_id = self.superblock.catalog_inode;
-        let mut catalog = if catalog_id != 0 {
-            let cinode = self.read_inode(catalog_id)?;
-            let cdata = self.read_data(catalog_id, 0, cinode.size)?;
-            deserialize_catalog(&cdata)?
-        } else {
-            Vec::new()
-        };
+        // Every file's index facts are collected and applied ONCE below (one
+        // catalog-record rewrite for the whole batch on v6, one flat-list
+        // rewrite on v3–v5).
+        let mut facts: Vec<IndexFact> = Vec::new();
 
         let mut new_ids = Vec::with_capacity(files.len());
         for f in files {
@@ -1423,8 +1481,7 @@ impl<D: BlockDevice> UnaFS<D> {
             if entries.iter().any(|e| e.name == f.name) {
                 return Err(FileSystemError::FileExists);
             }
-            let id =
-                self.create_file_with_attrs_inner(&f.attributes, catalog_id, &mut catalog)?;
+            let id = self.create_file_with_attrs_inner(&f.attributes, parent_id, &f.name, &mut facts)?;
             if !f.data.is_empty() {
                 self.write_data_inner(id, 0, &f.data)?;
             }
@@ -1441,11 +1498,8 @@ impl<D: BlockDevice> UnaFS<D> {
         let dir_data = crate::codec::serialize(&entries)?;
         self.rewrite_data_inner(parent_id, &dir_data)?;
 
-        // ONE catalog rewrite for the whole batch.
-        if catalog_id != 0 {
-            let cat_data = serialize_catalog(&catalog)?;
-            self.rewrite_data_inner(catalog_id, &cat_data)?;
-        }
+        // ONE index application for the whole batch.
+        self.index_apply(&[], &facts)?;
 
         Ok(new_ids)
     }
@@ -1458,8 +1512,9 @@ impl<D: BlockDevice> UnaFS<D> {
     fn create_file_with_attrs_inner(
         &mut self,
         attributes: &BTreeMap<String, AttributeValue>,
-        catalog_id: u64,
-        catalog: &mut Vec<CatalogEntry>,
+        parent_id: u64,
+        name: &str,
+        facts: &mut Vec<IndexFact>,
     ) -> Result<u64, FileSystemError> {
         let id = self.imap.len() as u64;
         if (id + 1).div_ceil(IMAP_ENTRIES_PER_LEAF) > IMAP_MAX_LEAVES {
@@ -1468,6 +1523,9 @@ impl<D: BlockDevice> UnaFS<D> {
         self.imap.push(0);
 
         let mut inode = Inode::new(id, FileKind::File);
+        inode.parent = parent_id;
+        inode.name = Some(String::from(name));
+        stamp_all(&mut inode);
         for (key, value) in attributes {
             let is_large = match value {
                 AttributeValue::Vector(v) => v.len() > 64, // > 256 bytes
@@ -1482,9 +1540,7 @@ impl<D: BlockDevice> UnaFS<D> {
             } else {
                 inode.attributes.insert(key.clone(), value.clone());
             }
-            if catalog_id != 0 {
-                catalog.push(CatalogEntry::new(key, value, id));
-            }
+            facts.push(IndexFact::new(key, value, id));
         }
         self.write_inode(&inode)?;
         Ok(id)
@@ -1558,7 +1614,7 @@ impl<D: BlockDevice> UnaFS<D> {
             return Err(FileSystemError::FileExists);
         }
 
-        let new_id = self.create_inode_inner(kind, BTreeMap::new())?;
+        let new_id = self.create_inode_inner(kind, BTreeMap::new(), parent_id, Some(&name))?;
 
         entries.push(DirEntry {
             name,
@@ -1586,6 +1642,10 @@ impl<D: BlockDevice> UnaFS<D> {
     ) -> Result<(), FileSystemError> {
         let mut inode = self.read_inode(inode_id)?;
 
+        // The value being replaced (if any) leaves the index: read it BEFORE
+        // its spilled extents are released.
+        let old = self.attribute_of(&inode, &key)?;
+
         if let Some(extents) = inode.large_attributes.remove(&key) {
             self.decref_extents(&extents);
         }
@@ -1604,10 +1664,16 @@ impl<D: BlockDevice> UnaFS<D> {
             inode.attributes.remove(&key);
         } else {
             inode.attributes.insert(key.clone(), value.clone());
+            inode.large_attributes.remove(&key);
         }
+        stamp_meta(&mut inode);
 
         self.write_inode(&inode)?;
-        self.update_catalog(&key, &value, inode_id)?;
+        let removes: Vec<IndexFact> = old
+            .iter()
+            .map(|v| IndexFact::new(&key, v, inode_id))
+            .collect();
+        self.index_apply(&removes, &[IndexFact::new(&key, &value, inode_id)])?;
         self.maybe_commit()?;
 
         #[cfg(feature = "std")]
@@ -1698,8 +1764,9 @@ impl<D: BlockDevice> UnaFS<D> {
         // Read the doomed inode up front.
         let inode = self.read_inode(inode_id)?;
 
-        // 1. Scrub the attribute index.
-        self.remove_catalog_entries_inner(|e| e.inode_id == inode_id)?;
+        // 1. Scrub the attribute index (by the inode's own keys).
+        let removes = self.facts_of(&inode)?;
+        self.index_apply(&removes, &[])?;
 
         // 2. Unhook the name.
         entries.remove(pos);
@@ -1806,7 +1873,8 @@ impl<D: BlockDevice> UnaFS<D> {
         let inode = self.read_inode(inode_id)?;
 
         // 1. Scrub the attribute index (a directory carries owner/grants rows).
-        self.remove_catalog_entries_inner(|e| e.inode_id == inode_id)?;
+        let removes = self.facts_of(&inode)?;
+        self.index_apply(&removes, &[])?;
 
         // 2. Unhook the name from the parent.
         entries.remove(pos);
@@ -1910,6 +1978,16 @@ impl<D: BlockDevice> UnaFS<D> {
             self.rewrite_data_inner(new_parent_id, &dst_data)?;
         }
 
+        // v6: the moved inode's parent pointer + name follow it (same
+        // transaction — a power cut leaves the old link or the new one).
+        if self.superblock.indexed() {
+            let mut inode = self.read_inode(moved.inode_id)?;
+            inode.parent = new_parent_id;
+            inode.name = Some(String::from(new_name));
+            stamp_meta(&mut inode);
+            self.write_inode(&inode)?;
+        }
+
         self.maybe_commit()?;
 
         #[cfg(feature = "std")]
@@ -1932,11 +2010,13 @@ impl<D: BlockDevice> UnaFS<D> {
             return Err(FileSystemError::AttributeNotFound);
         }
 
-        let key_hash = hash_bytes(key.as_bytes());
-        self.remove_catalog_entries_inner(|e| e.inode_id == inode_id && e.key_hash == key_hash)?;
+        let old = self.attribute_of(&inode, key)?;
+        let removes: Vec<IndexFact> = old.iter().map(|v| IndexFact::new(key, v, inode_id)).collect();
+        self.index_apply(&removes, &[])?;
 
         inode.attributes.remove(key);
         let spilled = inode.large_attributes.remove(key);
+        stamp_meta(&mut inode);
         self.write_inode(&inode)?;
 
         if let Some(extents) = spilled {
@@ -2142,6 +2222,15 @@ impl<D: BlockDevice> UnaFS<D> {
                 Self::push_extent_blocks(&index, block_count, &mut blocks)?;
                 for extents in inode.large_attributes.values() {
                     Self::push_extent_blocks(extents, block_count, &mut blocks)?;
+                }
+                // v6: the catalog inode owns its two index trees' nodes — a
+                // snapshot pins the index AS-OF, exactly like file data.
+                if inode.id == CATALOG_INODE_ID && self.superblock.indexed() {
+                    blocks.extend(Self::catalog_tree_blocks_via(
+                        &mut self.device,
+                        block_count,
+                        &inode,
+                    )?);
                 }
             }
         }
@@ -2422,90 +2511,38 @@ impl<D: BlockDevice> UnaFS<D> {
     // Query engine
     // =====================================================================
 
-    /// Semantic query engine. no_std-capable: the similarity path routes its
+    /// Semantic query engine (F4, B302): parse, gather index candidates,
+    /// verify every candidate against the inode's real values, and name each
+    /// hit by its path. no_std-capable: the similarity path routes its
     /// floating-point `sqrt` through `libm`, so kernel (`no_std`) and host
-    /// (`std`) builds score along the same code path.
-    pub fn query(&mut self, query_str: &str) -> Result<Vec<(Inode, f32)>, FileSystemError> {
-        let query = Query::parse(query_str).map_err(FileSystemError::Query)?;
-
-        let catalog_id = self.superblock.catalog_inode;
-        let mut candidates = Vec::new();
-
-        if catalog_id != 0 {
-            let inode = self.read_inode(catalog_id)?;
-            let data = self.read_data(catalog_id, 0, inode.size)?;
-            let entries = deserialize_catalog(&data)?;
-
-            let target_key_hash = hash_bytes(query.key.as_bytes());
-
-            let target_val_hash = if let QueryOp::Eq = query.op {
-                Some(hash_value(&query.value))
+    /// (`std`) builds score along the same code path. Hits are in ascending
+    /// inode-id order.
+    pub fn query(&mut self, query_str: &str) -> Result<Vec<QueryHit>, FileSystemError> {
+        let matched = self.query_matches(query_str)?;
+        let mut names: Option<BTreeMap<u64, String>> = None;
+        let mut out = Vec::with_capacity(matched.len());
+        for (inode, score) in matched {
+            let path = if self.superblock.indexed() {
+                self.path_of(inode.id)?
             } else {
-                None
+                // v3–v5 carry no parent pointers: one name-tree walk per query.
+                if names.is_none() {
+                    names = Some(self.path_map()?);
+                }
+                names
+                    .as_ref()
+                    .and_then(|m| m.get(&inode.id).cloned())
+                    .unwrap_or_default()
             };
-
-            for entry in entries {
-                if entry.key_hash == target_key_hash {
-                    if let Some(tv) = target_val_hash {
-                        if entry.val_hash == tv {
-                            candidates.push(entry.inode_id);
-                        }
-                    } else {
-                        candidates.push(entry.inode_id);
-                    }
-                }
-            }
+            out.push(QueryHit { inode_id: inode.id, path, score });
         }
+        Ok(out)
+    }
 
-        candidates.sort();
-        candidates.dedup();
-
-        let mut results = Vec::new();
-        for id in candidates {
-            let inode = match self.read_inode(id) {
-                Ok(i) => i,
-                Err(FileSystemError::NotFound) => continue, // stale index entry
-                Err(e) => return Err(e),
-            };
-
-            let mut val_opt = None;
-            if let Some(v) = inode.attributes.get(&query.key) {
-                val_opt = Some(v.clone());
-            } else if let Some(extents) = inode.large_attributes.get(&query.key) {
-                let total = checked_extent_total(extents)?;
-                let data = self.read_from_extents(extents, 0, total, total)?;
-                if let Ok(v) = crate::codec::deserialize::<AttributeValue>(&data) {
-                    val_opt = Some(v);
-                }
-            }
-
-            if let Some(val) = val_opt {
-                if let Some(score) = check_condition(&val, &query.op, &query.value) {
-                    // Check secondary filters
-                    let mut pass_secondary = true;
-                    for (sec_key, sec_val) in &query.secondary_filters {
-                        let mut match_found = false;
-                        if let Some(v) = inode.attributes.get(sec_key) {
-                            if let AttributeValue::String(s) = v {
-                                if s == sec_val {
-                                    match_found = true;
-                                }
-                            }
-                        }
-                        if !match_found {
-                            pass_secondary = false;
-                            break;
-                        }
-                    }
-
-                    if pass_secondary {
-                        results.push((inode, score));
-                    }
-                }
-            }
-        }
-
-        Ok(results)
+    /// [`query`](Self::query) returning the matched inodes themselves (the
+    /// pre-B302 shape: callers that read data/attributes off each hit).
+    pub fn query_inodes(&mut self, query_str: &str) -> Result<Vec<(Inode, f32)>, FileSystemError> {
+        self.query_matches(query_str)
     }
 
     // =====================================================================
@@ -2541,6 +2578,7 @@ impl<D: BlockDevice> UnaFS<D> {
         let mut inode = self.read_inode(inode_id)?;
         let old_chunks = core::mem::replace(&mut inode.chunks, new_chunks);
         inode.size = data.len() as u64;
+        stamp_data(&mut inode);
         self.write_inode(&inode)?;
         self.decref_extents(&old_chunks);
         Ok(())
@@ -2561,39 +2599,6 @@ impl<D: BlockDevice> UnaFS<D> {
             }
         }
         Ok(false)
-    }
-
-    /// Rewrite the attribute catalog with every entry matching `pred`
-    /// removed, inside the caller's transaction.
-    fn remove_catalog_entries_inner<F: Fn(&CatalogEntry) -> bool>(
-        &mut self,
-        pred: F,
-    ) -> Result<(), FileSystemError> {
-        let catalog_id = self.superblock.catalog_inode;
-        if catalog_id == 0 {
-            return Ok(());
-        }
-        let inode = self.read_inode(catalog_id)?;
-        let data = self.read_data(catalog_id, 0, inode.size)?;
-        let mut entries = deserialize_catalog(&data)?;
-        let before = entries.len();
-        entries.retain(|e| !pred(e));
-        if entries.len() == before {
-            return Ok(());
-        }
-        let new_data = serialize_catalog(&entries)?;
-        self.rewrite_data_inner(catalog_id, &new_data)?;
-        Ok(())
-    }
-
-    /// Public catalog scrub (its own transaction) — the fsck repair path
-    /// uses it.
-    pub(crate) fn remove_catalog_entries<F: Fn(&CatalogEntry) -> bool>(
-        &mut self,
-        pred: F,
-    ) -> Result<(), FileSystemError> {
-        self.remove_catalog_entries_inner(pred)?;
-        self.maybe_commit()
     }
 
     /// Write `data` to freshly allocated extents (always fresh — this IS the
@@ -2631,29 +2636,6 @@ impl<D: BlockDevice> UnaFS<D> {
         }
 
         Ok(extents)
-    }
-
-    fn update_catalog(
-        &mut self,
-        key: &str,
-        value: &AttributeValue,
-        inode_id: u64,
-    ) -> Result<(), FileSystemError> {
-        let catalog_id = self.superblock.catalog_inode;
-        if catalog_id == 0 {
-            return Ok(());
-        }
-
-        let inode = self.read_inode(catalog_id)?;
-        let data = self.read_data(catalog_id, 0, inode.size)?;
-        let mut entries = deserialize_catalog(&data)?;
-
-        entries.push(CatalogEntry::new(key, value, inode_id));
-
-        let new_data = serialize_catalog(&entries)?;
-        self.rewrite_data_inner(catalog_id, &new_data)?;
-
-        Ok(())
     }
 }
 
@@ -2793,63 +2775,557 @@ fn checked_extent_total(extents: &ExtentList) -> Result<u64, FileSystemError> {
         .ok_or(FileSystemError::CorruptVolume("extent lengths overflow"))
 }
 
-fn check_condition(val: &AttributeValue, op: &QueryOp, target: &AttributeValue) -> Option<f32> {
-    match op {
-        QueryOp::Eq => {
-            if val == target {
-                Some(1.0)
-            } else {
-                None
-            }
-        }
-        QueryOp::Neq => {
-            if val != target {
-                Some(1.0)
-            } else {
-                None
-            }
-        }
-        QueryOp::Gt => {
-            if partial_cmp_attr(val, target)
-                .map(|o| o.is_gt())
-                .unwrap_or(false)
-            {
-                Some(1.0)
-            } else {
-                None
-            }
-        }
-        QueryOp::Lt => {
-            if partial_cmp_attr(val, target)
-                .map(|o| o.is_lt())
-                .unwrap_or(false)
-            {
-                Some(1.0)
-            } else {
-                None
-            }
-        }
-        QueryOp::SimilarityGt(threshold) => {
-            if let (AttributeValue::Vector(v1), AttributeValue::Vector(v2)) = (val, target) {
-                let score = cosine_similarity(v1, v2);
-                if score > *threshold {
-                    Some(score)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+// =========================================================================
+// B302: the indexed catalog, the query planner, paths, timestamps
+// =========================================================================
+
+/// One query hit: the inode, its path, and its score (1.0 for boolean
+/// predicates, the cosine similarity for a similarity predicate; `AND`
+/// multiplies, `OR` takes the max).
+///
+/// `path` is absolute (`/a/b/c`, `/` for the root). It is EMPTY for an
+/// object no directory names (a bare [`UnaFS::create_inode`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryHit {
+    pub inode_id: u64,
+    pub path: String,
+    pub score: f32,
+}
+
+/// What [`UnaFS::stat`] reports: the inode's identity, kind, size, parent
+/// link and timestamps (unix seconds; all 0 on a pre-v6 volume, which has
+/// nowhere to keep them).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stat {
+    pub inode_id: u64,
+    pub kind: FileKind,
+    pub size: u64,
+    pub parent: u64,
+    pub ctime: u64,
+    pub mtime: u64,
+    pub atime: u64,
+}
+
+/// Longest parent chain [`UnaFS::path_of`] follows before calling the volume
+/// corrupt (a cycle or a forged chain can never spin it forever).
+pub const MAX_PATH_DEPTH: usize = 4096;
+
+impl From<BtreeError> for FileSystemError {
+    fn from(e: BtreeError) -> Self {
+        match e {
+            BtreeError::Storage(s) => FileSystemError::Storage(s),
+            BtreeError::NoSpace => FileSystemError::NoSpace,
+            BtreeError::BadMagic(_) => FileSystemError::CorruptVolume("index node: bad magic"),
+            BtreeError::BadVersion(_, _) => FileSystemError::CorruptVolume("index node: bad version"),
+            BtreeError::BadChecksum(_) => FileSystemError::CorruptVolume("index node: bad checksum"),
+            BtreeError::Malformed(_, why) => FileSystemError::CorruptVolume(why),
+            BtreeError::Corrupt(why) => FileSystemError::CorruptVolume(why),
+            BtreeError::KeyTooLarge(_) => FileSystemError::CorruptVolume("index key too large"),
+            BtreeError::ValueTooLarge(_) => FileSystemError::CorruptVolume("index value too large"),
+            BtreeError::NodeOverflow(_) => FileSystemError::CorruptVolume("index node overflow"),
         }
     }
 }
 
-use core::cmp::Ordering;
-fn partial_cmp_attr(a: &AttributeValue, b: &AttributeValue) -> Option<Ordering> {
-    match (a, b) {
-        (AttributeValue::Int(i1), AttributeValue::Int(i2)) => i1.partial_cmp(i2),
-        (AttributeValue::Float(f1), AttributeValue::Float(f2)) => f1.partial_cmp(f2),
-        (AttributeValue::String(s1), AttributeValue::String(s2)) => s1.partial_cmp(s2),
-        _ => None,
+/// Stamp every timestamp (creation).
+fn stamp_all(inode: &mut Inode) {
+    let now = crate::clock::now();
+    inode.ctime = now;
+    inode.mtime = now;
+    inode.atime = now;
+}
+
+/// Stamp a data change (POSIX: a data write changes mtime AND ctime).
+fn stamp_data(inode: &mut Inode) {
+    let now = crate::clock::now();
+    inode.ctime = now;
+    inode.mtime = now;
+    inode.atime = now;
+}
+
+/// Stamp a metadata-only change (attributes, rename).
+fn stamp_meta(inode: &mut Inode) {
+    inode.ctime = crate::clock::now();
+}
+
+/// Where a query's candidates come from: the v6 trees, or the v3–v5 flat list.
+enum CandidateSource {
+    Tree(CatalogRecord),
+    Flat(Vec<CatalogEntry>),
+}
+
+impl<D: BlockDevice> UnaFS<D> {
+    /// Account index-node writes in the bench counters (the tree writes
+    /// through its own store, not `write_fresh`).
+    fn count_index_writes(&mut self, written: u64) {
+        self.txn_blocks += written;
+        self.stats.blocks_written += written;
+    }
+
+    /// The v6 catalog record (`None` on a v3–v5 volume, whose catalog is the
+    /// flat list).
+    pub fn catalog_record(&mut self) -> Result<Option<CatalogRecord>, FileSystemError> {
+        if !self.superblock.indexed() {
+            return Ok(None);
+        }
+        let id = self.superblock.catalog_inode;
+        let inode = self.read_inode(id)?;
+        let data = self.read_data(id, 0, inode.size)?;
+        CatalogRecord::from_bytes(&data, self.superblock.block_count)
+            .map(Some)
+            .ok_or(FileSystemError::CorruptVolume("catalog record invalid"))
+    }
+
+    /// One attribute's value off an already-read inode (inline, or spilled —
+    /// read from its extents).
+    fn attribute_of(
+        &mut self,
+        inode: &Inode,
+        key: &str,
+    ) -> Result<Option<AttributeValue>, FileSystemError> {
+        if let Some(v) = inode.attributes.get(key) {
+            return Ok(Some(v.clone()));
+        }
+        if let Some(extents) = inode.large_attributes.get(key) {
+            let total = checked_extent_total(extents)?;
+            let data = self.read_from_extents(extents, 0, total, total)?;
+            let val: AttributeValue = crate::codec::deserialize(&data)
+                .map_err(|_| FileSystemError::InvalidAttributeData)?;
+            return Ok(Some(val));
+        }
+        Ok(None)
+    }
+
+    /// Every index fact an inode contributes (one per attribute).
+    fn facts_of(&mut self, inode: &Inode) -> Result<Vec<IndexFact>, FileSystemError> {
+        let mut out = Vec::new();
+        for (k, v) in &inode.attributes {
+            out.push(IndexFact::new(k, v, inode.id));
+        }
+        for k in inode.large_attributes.keys().cloned().collect::<Vec<_>>() {
+            if inode.attributes.contains_key(&k) {
+                continue;
+            }
+            if let Some(v) = self.attribute_of(inode, &k)? {
+                out.push(IndexFact::new(&k, &v, inode.id));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Remove then insert index facts, inside the caller's transaction.
+    ///
+    /// v6: log-time B+tree removes/inserts on both trees (path-copy CoW through
+    /// the volume's refcount map) and ONE catalog-record rewrite when a root
+    /// moved. v3–v5: the flat list, read once, filtered by `(inode, key)`,
+    /// appended, rewritten once (the legacy O(n) path those volumes keep).
+    fn index_apply(
+        &mut self,
+        removes: &[IndexFact],
+        inserts: &[IndexFact],
+    ) -> Result<(), FileSystemError> {
+        if removes.is_empty() && inserts.is_empty() {
+            return Ok(());
+        }
+        let catalog_id = self.superblock.catalog_inode;
+        if catalog_id == 0 {
+            return Ok(());
+        }
+        let Some(rec) = self.catalog_record()? else {
+            let inode = self.read_inode(catalog_id)?;
+            let data = self.read_data(catalog_id, 0, inode.size)?;
+            let mut entries = deserialize_catalog(&data)?;
+            entries.retain(|e| {
+                !removes
+                    .iter()
+                    .any(|f| f.inode_id == e.inode_id && f.key_hash == e.key_hash)
+            });
+            for f in inserts {
+                entries.push(CatalogEntry {
+                    key_hash: f.key_hash,
+                    val_hash: hash_value(&f.value),
+                    inode_id: f.inode_id,
+                });
+            }
+            let new_data = serialize_catalog(&entries)?;
+            if new_data != data {
+                self.rewrite_data_inner(catalog_id, &new_data)?;
+            }
+            return Ok(());
+        };
+
+        let mut eq = Btree::open(rec.eq_root, LexCmp);
+        let mut ord = Btree::open(rec.ord_root, LexCmp);
+        let mut entries = rec.entries;
+        let written = {
+            let mut store = DeviceStore::new(&mut self.device, &mut self.refmap);
+            for f in removes {
+                if eq.remove(&mut store, &f.eq_key())?.is_some() {
+                    entries = entries.saturating_sub(1);
+                }
+                if let Some(k) = f.ord_key() {
+                    ord.remove(&mut store, &k)?;
+                }
+            }
+            for f in inserts {
+                if eq.insert(&mut store, &f.eq_key(), &[])?.is_none() {
+                    entries = entries.saturating_add(1);
+                }
+                if let Some(k) = f.ord_key() {
+                    ord.insert(&mut store, &k, &[])?;
+                }
+            }
+            store.written
+        };
+        self.count_index_writes(written);
+        let new = CatalogRecord {
+            eq_root: eq.root(),
+            ord_root: ord.root(),
+            entries,
+        };
+        if new != rec {
+            self.rewrite_data_inner(catalog_id, &new.to_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Every block the catalog inode's two index trees reach (v6), read
+    /// through an explicit device — shared by the live fsck walk and the
+    /// snapshot walk. Empty for a catalog without a record.
+    fn catalog_tree_blocks_via(
+        device: &mut D,
+        block_count: u64,
+        catalog: &Inode,
+    ) -> Result<Vec<u64>, FileSystemError> {
+        if catalog.size == 0 {
+            return Ok(Vec::new());
+        }
+        let data = Self::read_from_extents_via(
+            device,
+            block_count,
+            &catalog.chunks,
+            0,
+            catalog.size,
+            catalog.size,
+        )?;
+        let rec = CatalogRecord::from_bytes(&data, block_count)
+            .ok_or(FileSystemError::CorruptVolume("catalog record invalid"))?;
+        let mut store = ReadStore { device };
+        let mut out = Btree::open(rec.eq_root, LexCmp).reachable_blocks(&mut store)?;
+        out.extend(Btree::open(rec.ord_root, LexCmp).reachable_blocks(&mut store)?);
+        for &b in &out {
+            if b >= block_count {
+                return Err(FileSystemError::CorruptVolume("index node past volume"));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The live catalog's tree blocks (fsck's reachability walk).
+    pub(crate) fn catalog_tree_blocks(&mut self) -> Result<Vec<u64>, FileSystemError> {
+        if !self.superblock.indexed() {
+            return Ok(Vec::new());
+        }
+        let catalog = self.read_inode(self.superblock.catalog_inode)?;
+        Self::catalog_tree_blocks_via(&mut self.device, self.superblock.block_count, &catalog)
+    }
+
+    /// Every `(inode id, eq-key, ord-key?)` the index holds — fsck's orphan
+    /// scan. v3–v5: the flat list's ids.
+    pub(crate) fn index_inode_ids(&mut self) -> Result<BTreeSet<u64>, FileSystemError> {
+        let mut ids = BTreeSet::new();
+        match self.candidate_source()? {
+            Some(CandidateSource::Flat(entries)) => {
+                ids.extend(entries.iter().map(|e| e.inode_id));
+            }
+            Some(CandidateSource::Tree(rec)) => {
+                let mut store = ReadStore { device: &mut self.device };
+                for root in [rec.eq_root, rec.ord_root] {
+                    for (k, _) in Btree::open(root, LexCmp).range(&mut store, None, None, false)? {
+                        if let Some(id) = crate::index::inode_of_key(&k) {
+                            ids.insert(id);
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+        Ok(ids)
+    }
+
+    /// Scrub every index entry naming an inode in `dead` (fsck repair), in the
+    /// caller's transaction. Returns the number of equality / flat entries
+    /// removed (one per indexed attribute).
+    pub(crate) fn index_scrub_ids(&mut self, dead: &BTreeSet<u64>) -> Result<usize, FileSystemError> {
+        let catalog_id = self.superblock.catalog_inode;
+        match self.candidate_source()? {
+            Some(CandidateSource::Flat(mut entries)) => {
+                let before = entries.len();
+                entries.retain(|e| !dead.contains(&e.inode_id));
+                let n = before - entries.len();
+                if n > 0 {
+                    let data = serialize_catalog(&entries)?;
+                    self.rewrite_data_inner(catalog_id, &data)?;
+                }
+                Ok(n)
+            }
+            Some(CandidateSource::Tree(rec)) => {
+                let mut doomed: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
+                {
+                    let mut store = ReadStore { device: &mut self.device };
+                    for (i, root) in [rec.eq_root, rec.ord_root].into_iter().enumerate() {
+                        for (k, _) in Btree::open(root, LexCmp).range(&mut store, None, None, false)? {
+                            if crate::index::inode_of_key(&k).is_some_and(|id| dead.contains(&id)) {
+                                doomed[i].push(k);
+                            }
+                        }
+                    }
+                }
+                let n = doomed[0].len();
+                if n == 0 && doomed[1].is_empty() {
+                    return Ok(0);
+                }
+                let mut eq = Btree::open(rec.eq_root, LexCmp);
+                let mut ord = Btree::open(rec.ord_root, LexCmp);
+                let written = {
+                    let mut store = DeviceStore::new(&mut self.device, &mut self.refmap);
+                    for k in &doomed[0] {
+                        eq.remove(&mut store, k)?;
+                    }
+                    for k in &doomed[1] {
+                        ord.remove(&mut store, k)?;
+                    }
+                    store.written
+                };
+                self.count_index_writes(written);
+                let new = CatalogRecord {
+                    eq_root: eq.root(),
+                    ord_root: ord.root(),
+                    entries: rec.entries.saturating_sub(n as u64),
+                };
+                self.rewrite_data_inner(catalog_id, &new.to_bytes())?;
+                Ok(n)
+            }
+            None => Ok(0),
+        }
+    }
+
+    fn candidate_source(&mut self) -> Result<Option<CandidateSource>, FileSystemError> {
+        let catalog_id = self.superblock.catalog_inode;
+        if catalog_id == 0 {
+            return Ok(None);
+        }
+        if let Some(rec) = self.catalog_record()? {
+            return Ok(Some(CandidateSource::Tree(rec)));
+        }
+        let inode = self.read_inode(catalog_id)?;
+        let data = self.read_data(catalog_id, 0, inode.size)?;
+        Ok(Some(CandidateSource::Flat(deserialize_catalog(&data)?)))
+    }
+
+    /// The candidate inode ids for one predicate: a SUPERSET of its matches
+    /// (the verifier decides). Equality is one prefix range of the equality
+    /// tree; `!=` and similarity take every inode carrying the key; the
+    /// ordering operators are ordered-tree range scans.
+    fn predicate_candidates(
+        &mut self,
+        src: &CandidateSource,
+        p: &Predicate,
+    ) -> Result<BTreeSet<u64>, FileSystemError> {
+        let kh = crate::hash::hash_bytes(p.key.as_bytes());
+        let mut out = BTreeSet::new();
+        match src {
+            CandidateSource::Flat(entries) => {
+                let vh = matches!(p.op, QueryOp::Eq).then(|| hash_value(&p.value));
+                for e in entries {
+                    if e.key_hash == kh && vh.is_none_or(|v| v == e.val_hash) {
+                        out.insert(e.inode_id);
+                    }
+                }
+            }
+            CandidateSource::Tree(rec) => {
+                let mut store = ReadStore { device: &mut self.device };
+                let ranges: Vec<(u64, Vec<u8>, Vec<u8>)> = match &p.op {
+                    QueryOp::Eq => {
+                        let (lo, hi) = crate::index::eq_range(kh, Some(hash_value(&p.value)));
+                        alloc::vec![(rec.eq_root, lo, hi)]
+                    }
+                    QueryOp::Neq | QueryOp::SimilarityGt(_) => {
+                        let (lo, hi) = crate::index::eq_range(kh, None);
+                        alloc::vec![(rec.eq_root, lo, hi)]
+                    }
+                    QueryOp::Gt | QueryOp::Ge => crate::index::ordered_scans(kh, Some(&p.value), None)
+                        .into_iter()
+                        .map(|s| (rec.ord_root, s.lo, s.hi))
+                        .collect(),
+                    QueryOp::Lt | QueryOp::Le => crate::index::ordered_scans(kh, None, Some(&p.value))
+                        .into_iter()
+                        .map(|s| (rec.ord_root, s.lo, s.hi))
+                        .collect(),
+                    QueryOp::Range { .. } => {
+                        crate::index::ordered_scans(kh, Some(&p.value), p.value_hi.as_ref())
+                            .into_iter()
+                            .map(|s| (rec.ord_root, s.lo, s.hi))
+                            .collect()
+                    }
+                };
+                for (root, lo, hi) in ranges {
+                    let tree = Btree::open(root, LexCmp);
+                    for (k, _) in tree.range(&mut store, Some(&lo), Some(&hi), false)? {
+                        if let Some(id) = crate::index::inode_of_key(&k) {
+                            out.insert(id);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `AND` intersects, `OR` unions, a predicate asks the index.
+    fn expr_candidates(
+        &mut self,
+        src: &CandidateSource,
+        e: &Expr,
+    ) -> Result<BTreeSet<u64>, FileSystemError> {
+        match e {
+            Expr::Pred(p) => self.predicate_candidates(src, p),
+            Expr::And(v) => {
+                let mut acc: Option<BTreeSet<u64>> = None;
+                for c in v {
+                    let set = self.expr_candidates(src, c)?;
+                    acc = Some(match acc {
+                        None => set,
+                        Some(a) => a.intersection(&set).copied().collect(),
+                    });
+                    if acc.as_ref().is_some_and(|a| a.is_empty()) {
+                        break;
+                    }
+                }
+                Ok(acc.unwrap_or_default())
+            }
+            Expr::Or(v) => {
+                let mut acc = BTreeSet::new();
+                for c in v {
+                    acc.extend(self.expr_candidates(src, c)?);
+                }
+                Ok(acc)
+            }
+        }
+    }
+
+    /// Parse, gather candidates, verify. The shared body of
+    /// [`query`](Self::query) and [`query_inodes`](Self::query_inodes).
+    fn query_matches(&mut self, query_str: &str) -> Result<Vec<(Inode, f32)>, FileSystemError> {
+        let query = Query::parse(query_str).map_err(FileSystemError::Query)?;
+        let Some(src) = self.candidate_source()? else {
+            return Ok(Vec::new());
+        };
+        let candidates = self.expr_candidates(&src, &query.expr)?;
+        let mut keys: Vec<String> = query.expr.predicates().iter().map(|p| p.key.clone()).collect();
+        keys.sort();
+        keys.dedup();
+
+        let mut results = Vec::new();
+        for id in candidates {
+            let inode = match self.read_inode(id) {
+                Ok(i) => i,
+                Err(FileSystemError::NotFound) => continue, // stale index entry
+                Err(e) => return Err(e),
+            };
+            let mut values: BTreeMap<&str, AttributeValue> = BTreeMap::new();
+            for k in &keys {
+                // A spilled value that fails to decode is "absent", as before.
+                match self.attribute_of(&inode, k) {
+                    Ok(Some(v)) => {
+                        values.insert(k.as_str(), v);
+                    }
+                    Ok(None) | Err(FileSystemError::InvalidAttributeData) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            if let Some(score) = query.expr.eval(&mut |k: &str| values.get(k).cloned()) {
+                results.push((inode, score));
+            }
+        }
+        Ok(results)
+    }
+
+    /// The absolute path of `inode_id`, derived from the v6 parent pointers
+    /// in O(depth) inode reads — no name-tree walk. `/` for the root; EMPTY
+    /// for an unnamed object (a bare `create_inode`, a system inode). On a
+    /// v3–v5 volume (no parent pointers) this walks the name tree once.
+    pub fn path_of(&mut self, inode_id: u64) -> Result<String, FileSystemError> {
+        let root = self.superblock.root_inode;
+        if inode_id == root {
+            return Ok(String::from("/"));
+        }
+        if !self.superblock.indexed() {
+            return Ok(self.path_map()?.remove(&inode_id).unwrap_or_default());
+        }
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = inode_id;
+        for _ in 0..MAX_PATH_DEPTH {
+            if cur == root {
+                let mut path = String::new();
+                for p in parts.iter().rev() {
+                    path.push('/');
+                    path.push_str(p);
+                }
+                return Ok(path);
+            }
+            let inode = self.read_inode(cur)?;
+            if inode.parent == 0 {
+                return Ok(String::new());
+            }
+            let name = match inode.name {
+                Some(n) => n,
+                // A name too long for the trailer: the parent's listing has it.
+                None => match self.ls(inode.parent)?.into_iter().find(|e| e.inode_id == cur) {
+                    Some(e) => e.name,
+                    None => return Ok(String::new()),
+                },
+            };
+            parts.push(name);
+            cur = inode.parent;
+        }
+        Err(FileSystemError::CorruptVolume("parent chain too deep or cyclic"))
+    }
+
+    /// Every name-reachable inode's absolute path, by one walk of the name
+    /// tree (the v3–v5 fallback; the first name found wins).
+    fn path_map(&mut self) -> Result<BTreeMap<u64, String>, FileSystemError> {
+        let root = self.superblock.root_inode;
+        let mut map: BTreeMap<u64, String> = BTreeMap::new();
+        map.insert(root, String::from("/"));
+        let mut stack: Vec<(u64, String)> = alloc::vec![(root, String::new())];
+        while let Some((dir, prefix)) = stack.pop() {
+            for e in self.ls(dir)? {
+                if map.contains_key(&e.inode_id) {
+                    continue; // a corrupt volume's cycle: first name wins
+                }
+                let path = format!("{}/{}", prefix, e.name);
+                map.insert(e.inode_id, path.clone());
+                if e.kind == FileKind::Directory {
+                    stack.push((e.inode_id, path));
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    /// Identity, size, parent link and timestamps of an inode (the kernel's
+    /// `DirEnt.mtime` source).
+    pub fn stat(&mut self, inode_id: u64) -> Result<Stat, FileSystemError> {
+        let inode = self.read_inode(inode_id)?;
+        Ok(Stat {
+            inode_id,
+            kind: inode.kind,
+            size: inode.size,
+            parent: inode.parent,
+            ctime: inode.ctime,
+            mtime: inode.mtime,
+            atime: inode.atime,
+        })
     }
 }

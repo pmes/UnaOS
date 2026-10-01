@@ -164,7 +164,7 @@ fn main() -> Result<()> {
     );
 
     let query_start = Instant::now();
-    let results = fs.query(&query_str)?;
+    let results = fs.query_inodes(&query_str)?;
     let query_latency = query_start.elapsed();
 
     println!("-> Query executed, analyzing {} results...", results.len());
@@ -227,7 +227,7 @@ fn main() -> Result<()> {
     // unaos/libs/fs/unafs/tests/query_kats.rs). The 384-dim random inodes mismatch
     // the 2-dim target (score 0.0), so exactly the sentinel survives.
     println!("-> Executing golden-KAT correctness query...");
-    let golden = fs.query("similarity(embedding, [4.0, 3.0]) > 0.5 AND type == \"engram\"")?;
+    let golden = fs.query_inodes("similarity(embedding, [4.0, 3.0]) > 0.5 AND type == \"engram\"")?;
     assert_eq!(
         golden.len(),
         1,
@@ -248,7 +248,7 @@ fn main() -> Result<()> {
     );
 
     // Strict `>`: a threshold exactly equal to the score must exclude it.
-    let strict = fs.query("similarity(embedding, [4.0, 3.0]) > 0.96")?;
+    let strict = fs.query_inodes("similarity(embedding, [4.0, 3.0]) > 0.96")?;
     assert!(
         strict.iter().all(|(inode, _)| inode.id != sentinel_id),
         "Strict-threshold breach! Score 0.96 cleared threshold 0.96"

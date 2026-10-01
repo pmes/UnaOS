@@ -439,11 +439,13 @@ similarity — semantic search as a filesystem primitive.
 Known honest caveats in the current implementation, which the arcs below
 address:
 
-- The attribute catalog is a flat, hash-bucketed list, (de)serialized whole:
-  every non-equality query scans it, and **every `set_attribute` rewrites the
-  entire catalog** — O(n), a scaling cliff rather than an index. (The bulk
-  create+write path amortizes this across a batch — one catalog rewrite for the
-  whole set — but the per-op single-attribute cost is still O(n) until F4.)
+- ~~The attribute catalog is a flat list rewritten whole on every
+  `set_attribute`~~ — **retired on v6 (B302)**: the catalog is two B+trees
+  (equality + ordered) behind a 40 B catalog record; `set_attribute` is a
+  log-time insert, range operators are range scans, and `query` returns paths.
+  A v3–v5 volume keeps its flat catalog (still O(n)) until
+  `tools/unafs migrate` replays it into v6. Vector similarity has no index: it
+  scans the inodes carrying the key.
 - Directories are flat serialized vectors; data blocks are unchecksummed (the
   root record is checksummed); extents are a flat inline list (large-file
   depth limit).
@@ -454,8 +456,8 @@ Planned arcs (sequencing in [`docs/ROADMAP.md`](../../docs/ROADMAP.md) §2):
 | :--- | :--- |
 | F1 | ~~Journal rollback/replay~~ — **superseded by K8a** (commit is one atomic root flip; there is no torn state to roll back) |
 | F2 | `unlink` / `rename` / `remove_attribute` + catalog removal — **✅ landed** (each a single atomic CoW transaction; kernel verbs `urm`/`umv`/`urmattr` + the `F2-mutations` witness complete the surface) |
-| F3 | Generic on-disk B+tree (shared by indexes and directories, as BeFS did) |
-| F4 | Per-attribute B+tree indexes: log-time equality, true range queries |
+| F3 | Generic on-disk B+tree (shared by indexes and directories, as BeFS did) — **✅ wired (B302): the v6 attribute catalog lives on it** |
+| F4 | Per-attribute B+tree indexes: log-time equality, true range queries — **✅ landed (B302): `>= <= BETWEEN`, two-sided ranges, `AND`/`OR`/parentheses, typed operands, paths in every hit** |
 | F5 | **Live queries** — delta-emitting persistent queries published over bandy (the query-driven spatial UI, now including similarity) |
 | F6–F8 | B+tree directories; metadata checksums; extent trees |
 | K1–K4 | Kernel convergence: **`no_std` core (K1, ✅)** → **512↔4096 block adapter + partitions (K2, ✅)** → **read-only kernel mount (K3, ✅)** → **kernel writes (K4, ✅)** |

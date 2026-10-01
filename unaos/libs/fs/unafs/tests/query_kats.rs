@@ -185,12 +185,12 @@ fn query_engine_end_to_end_golden_scores() {
         .query("similarity(embedding, [4.0, 3.0]) > 0.5")
         .expect("similarity query failed");
     assert_eq!(results.len(), 1, "expected exactly one match");
-    assert_eq!(results[0].0.id, a_id);
+    assert_eq!(results[0].inode_id, a_id);
     assert_eq!(
-        results[0].1.to_bits(),
+        results[0].score.to_bits(),
         0x3f75_c28f, // 0.96, the swapped_345 golden
         "end-to-end score diverged from the golden: got {:?}",
-        results[0].1
+        results[0].score
     );
 
     // Strict `>`: a threshold exactly equal to the score must exclude it.
@@ -198,7 +198,7 @@ fn query_engine_end_to_end_golden_scores() {
         .query("similarity(embedding, [4.0, 3.0]) > 0.96")
         .expect("strict-threshold query failed");
     assert!(
-        strict.iter().all(|(inode, _)| inode.id != a_id),
+        strict.iter().all(|h| h.inode_id != a_id),
         "score 0.96 must NOT clear the strict threshold 0.96"
     );
 
@@ -208,11 +208,11 @@ fn query_engine_end_to_end_golden_scores() {
     let q = format!("similarity(embedding, [{}]) > 0.9999", target.join(", "));
     let spilled = fs.query(&q).expect("spilled similarity query failed");
     assert_eq!(spilled.len(), 1, "expected exactly the spilled match");
-    assert_eq!(spilled[0].0.id, d_id);
+    assert_eq!(spilled[0].inode_id, d_id);
     assert_eq!(
-        spilled[0].1.to_bits(),
+        spilled[0].score.to_bits(),
         0x3f7f_ffff,
         "spilled-vector score diverged from the golden: got {:?}",
-        spilled[0].1
+        spilled[0].score
     );
 }

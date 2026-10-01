@@ -42,7 +42,6 @@
 //! K8b's retained roots ADD roots to this walk — that arc must extend
 //! [`UnaFS::fsck`]'s root set before it lands (standing STOP-class note).
 
-use crate::catalog::deserialize_catalog;
 use crate::fs::{FileSystemError, UnaFS};
 use crate::root::ROOT_BLOCK;
 use crate::storage::{BLOCK_SIZE, BlockDevice};
@@ -141,8 +140,7 @@ impl<D: BlockDevice> UnaFS<D> {
         // rewrite reshapes the catalog's blocks, hence the re-walk below).
         if !orphan_inodes.is_empty() {
             let orphan_set: BTreeSet<u64> = orphan_inodes.iter().copied().collect();
-            report.scrubbed_catalog_entries = self.count_catalog_entries(&orphan_set)?;
-            self.remove_catalog_entries(|e| orphan_set.contains(&e.inode_id))?;
+            report.scrubbed_catalog_entries = self.index_scrub_ids(&orphan_set)?;
         }
 
         // Phase 2: re-walk and rebuild the refcount map to the computed
@@ -242,6 +240,10 @@ impl<D: BlockDevice> UnaFS<D> {
                 }
             }
         }
+        // v6: the catalog's two index trees are owned by the catalog inode.
+        for b in self.catalog_tree_blocks()? {
+            Self::bump_block(b, block_count, &mut counts);
+        }
 
         // --- Every retained snapshot root (K8b) ---
         // A snapshot holds one reference to each block its inode-map tree
@@ -282,33 +284,9 @@ impl<D: BlockDevice> UnaFS<D> {
         }
     }
 
-    /// The set of inode ids the attribute catalog references (deduplicated).
+    /// The set of inode ids the attribute index references (deduplicated):
+    /// both B+trees on v6, the flat list on v3–v5.
     fn catalog_inode_ids(&mut self) -> Result<BTreeSet<u64>, FileSystemError> {
-        let catalog = self.superblock.catalog_inode;
-        if catalog == 0 {
-            return Ok(BTreeSet::new());
-        }
-        let inode = self.read_inode(catalog)?;
-        if inode.size == 0 {
-            return Ok(BTreeSet::new());
-        }
-        let data = self.read_data(catalog, 0, inode.size)?;
-        let entries = deserialize_catalog(&data)?;
-        Ok(entries.iter().map(|e| e.inode_id).collect())
-    }
-
-    /// Count catalog entries (with duplicates) whose inode is in `ids`.
-    fn count_catalog_entries(&mut self, ids: &BTreeSet<u64>) -> Result<usize, FileSystemError> {
-        let catalog = self.superblock.catalog_inode;
-        if catalog == 0 {
-            return Ok(0);
-        }
-        let inode = self.read_inode(catalog)?;
-        if inode.size == 0 {
-            return Ok(0);
-        }
-        let data = self.read_data(catalog, 0, inode.size)?;
-        let entries = deserialize_catalog(&data)?;
-        Ok(entries.iter().filter(|e| ids.contains(&e.inode_id)).count())
+        self.index_inode_ids()
     }
 }

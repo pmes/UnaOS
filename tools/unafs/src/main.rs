@@ -75,7 +75,12 @@ enum Commands {
         #[arg(short, long, default_value = "unafs.img")]
         img: String,
     },
-    /// Execute a semantic query
+    /// Execute a semantic query; prints `id path score` per hit.
+    ///
+    /// Grammar: `k == v`, `k != v`, `k > v`, `k < v`, `k >= v`, `k <= v`,
+    /// `k BETWEEN a AND b`, `a <= k <= b`, `similarity(k, [..]) > t`, combined
+    /// with AND / OR and parentheses. Strings are quoted; ordering compares
+    /// Int/Float numerically. Example: 'size >= 10 AND (kind == "doc" OR kind == "memo")'
     Query {
         query: String,
         #[arg(short, long, default_value = "unafs.img")]
@@ -173,7 +178,9 @@ enum Commands {
     /// copy-on-write format: walks the old tree read-only and replays it
     /// (names, data, attributes) into a freshly formatted K8 image.
     Migrate {
-        /// The pre-K8 (v2) source image (opened read-only, never written).
+        /// The source image: pre-K8 (v2) or a K8 v3–v5 volume (opened
+        /// read-only, never written) — replayed into a fresh current-format
+        /// (v6, indexed catalog) image.
         from: String,
         /// The K8 target image (created/overwritten, freshly formatted).
         to: String,
@@ -680,12 +687,12 @@ async fn main() -> Result<()> {
 
             let results = fs.query(query).map_err(|e| anyhow::anyhow!(e))?;
 
+            // One hit per line: `id path score` (B302 — the path comes from
+            // the v6 parent pointers; an unnamed object prints `-`).
             println!("Found {} results:", results.len());
-            for (inode, score) in results {
-                println!(
-                    "  Inode {} (Size: {} bytes) [Score: {:.4}]",
-                    inode.id, inode.size, score
-                );
+            for hit in results {
+                let path = if hit.path.is_empty() { "-" } else { hit.path.as_str() };
+                println!("{} {} {:.4}", hit.inode_id, path, hit.score);
             }
         }
         Commands::Rm { path, img } => {
@@ -910,26 +917,60 @@ async fn main() -> Result<()> {
             run_bench_batch(source, out_dir, *size_mb)?;
         }
         Commands::Migrate { from, to, size_mb } => {
-            println!("⚡ [OPERATOR] Migrating pre-K8 vault '{}' → K8 '{}'...", from, to);
+            // Which format is the source? v2 → the legacy walker; v3–v5 → a
+            // live (read-only device) mount replayed into v6 (B302).
+            let k8_source = unafs::legacy::LegacyVolume::open(
+                FileDevice::open_read_only(from).context("Failed to open source image read-only")?,
+            )
+            .is_err();
 
-            let old_dev = FileDevice::open_read_only(from)
-                .context("Failed to open source image read-only")?;
-            let mut old = unafs::legacy::LegacyVolume::open(old_dev)
-                .map_err(|e| anyhow::anyhow!("source is not a pre-K8 (v2) volume: {:?}", e))?;
+            let make_target = |src_blocks: u64| -> Result<FileSystem> {
+                let src_mb = (src_blocks * unafs::BLOCK_SIZE).div_ceil(1024 * 1024);
+                let target_mb = size_mb.unwrap_or(src_mb.max(1));
+                let file = std::fs::File::create(to).context("Failed to create target file")?;
+                file.set_len(target_mb * 1024 * 1024)
+                    .context("Failed to size target file")?;
+                let new_dev = FileDevice::open(to).context("Failed to open target device")?;
+                FileSystem::format(new_dev, target_mb)
+                    .map_err(|e| anyhow::anyhow!("failed to format target: {:?}", e))
+            };
 
-            // Size the target like the source unless told otherwise.
-            let src_mb = (old.superblock.block_count * unafs::BLOCK_SIZE).div_ceil(1024 * 1024);
-            let target_mb = size_mb.unwrap_or(src_mb.max(1));
-
-            let file = std::fs::File::create(to).context("Failed to create target file")?;
-            file.set_len(target_mb * 1024 * 1024)
-                .context("Failed to size target file")?;
-            let new_dev = FileDevice::open(to).context("Failed to open target device")?;
-            let mut new = FileSystem::format(new_dev, target_mb)
-                .map_err(|e| anyhow::anyhow!("failed to format K8 target: {:?}", e))?;
-
-            let report = unafs::legacy::migrate_into(&mut old, &mut new)
-                .map_err(|e| anyhow::anyhow!("migration failed: {:?}", e))?;
+            let (report, mut new) = if k8_source {
+                let old_dev = FileDevice::open_read_only(from)
+                    .context("Failed to open source image read-only")?;
+                let mut old = FileSystem::mount(old_dev)
+                    .map_err(|e| anyhow::anyhow!("source is neither v2 nor a mountable K8 volume: {:?}", e))?;
+                anyhow::ensure!(
+                    !old.superblock.indexed(),
+                    "source is already v{} (indexed catalog) — nothing to migrate",
+                    old.superblock.version
+                );
+                println!(
+                    "⚡ [OPERATOR] Migrating v{} vault '{}' → v{} '{}'...",
+                    old.superblock.version,
+                    from,
+                    unafs::superblock::VERSION,
+                    to
+                );
+                let snaps = old.snapshot_index().map(|v| v.len()).unwrap_or(0);
+                if snaps > 0 {
+                    println!("   (note: {snaps} retained snapshot(s) are not carried over — they name the old volume's history)");
+                }
+                let mut new = make_target(old.superblock.block_count)?;
+                let report = unafs::legacy::migrate_k8_into(&mut old, &mut new)
+                    .map_err(|e| anyhow::anyhow!("migration failed: {:?}", e))?;
+                (report, new)
+            } else {
+                println!("⚡ [OPERATOR] Migrating pre-K8 vault '{}' → v{} '{}'...", from, unafs::superblock::VERSION, to);
+                let old_dev = FileDevice::open_read_only(from)
+                    .context("Failed to open source image read-only")?;
+                let mut old = unafs::legacy::LegacyVolume::open(old_dev)
+                    .map_err(|e| anyhow::anyhow!("source is not a pre-K8 (v2) volume: {:?}", e))?;
+                let mut new = make_target(old.superblock.block_count)?;
+                let report = unafs::legacy::migrate_into(&mut old, &mut new)
+                    .map_err(|e| anyhow::anyhow!("migration failed: {:?}", e))?;
+                (report, new)
+            };
 
             // Belt-and-braces: the migrated volume must be consistent.
             let check = new
@@ -938,11 +979,12 @@ async fn main() -> Result<()> {
             anyhow::ensure!(check.is_clean(), "post-migration fsck not clean: {check:?}");
 
             println!(
-                "✅ [OPERATOR] Migrated {} files, {} directories, {} bytes → '{}' (v3, gen {}) — fsck clean",
+                "✅ [OPERATOR] Migrated {} files, {} directories, {} bytes → '{}' (v{}, gen {}) — fsck clean",
                 report.files,
                 report.directories,
                 report.bytes,
                 to,
+                new.superblock.version,
                 new.root_generation()
             );
         }

@@ -101,14 +101,17 @@ fn inline_small_file_inode_is_byte_identical() {
     // A small file fits inline: no spill, one contiguous extent.
     assert!(inode.chunks.len() <= 1, "small file should not fragment");
 
-    // The on-disk block is EXACTLY the plain inline serialization followed by
-    // zero padding — no trailer, byte-for-byte the old format.
+    // The on-disk block is EXACTLY the plain inline serialization, then (v6)
+    // the hand-packed meta trailer, then zero padding — no spill trailer; the
+    // inode's own bytes are byte-for-byte the old format.
     let block = raw_inode_block(&mut fs, id);
     let inline = inode.to_bytes().expect("small inode fits inline");
     assert_eq!(&block[..inline.len()], &inline[..], "inline prefix unchanged");
+    let meta = inode.meta_bytes();
+    assert_eq!(&block[inline.len()..inline.len() + meta.len()], &meta[..], "v6 meta trailer follows");
     assert!(
-        block[inline.len()..].iter().all(|&b| b == 0),
-        "tail is zero padding, not a trailer"
+        block[inline.len() + meta.len()..].iter().all(|&b| b == 0),
+        "tail is zero padding, not a spill trailer"
     );
 
     // And decode_block agrees there is no indirect trailer.

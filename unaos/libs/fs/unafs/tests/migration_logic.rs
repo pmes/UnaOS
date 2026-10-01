@@ -181,7 +181,7 @@ fn v2_volume_migrates_whole_into_k8() {
     }
     let hits = fs.query("mood == \"archival\"").unwrap();
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].0.id, hello_id);
+    assert_eq!(hits[0].inode_id, hello_id);
 
     // The migrated volume is a first-class K8 citizen: consistent and CoW.
     assert!(fs.fsck(false).unwrap().is_clean());
