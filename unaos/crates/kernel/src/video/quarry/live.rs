@@ -2329,8 +2329,7 @@ pub fn close() {
 pub fn key_route(ev: crate::pal::Event) -> bool {
     // FILEVIEW — the text viewer's arrows / wheel / paging, asked first; it consumes only while ITS
     // window holds focus, so a closed viewer changes nothing below.
-    if crate::video::fileview::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::settings::key_route(ev) {
-    if crate::video::fileview::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::activity::key_route(ev) {
+    if crate::video::fileview::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::settings::key_route(ev) || crate::video::activity::key_route(ev) {
         return true;
     }
     // QSCROLL — the WHEEL arrives here, at the seam that already exists, because this function is
