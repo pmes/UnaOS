@@ -2178,6 +2178,7 @@ impl FatFs {
     /// Extent-checked [`read_sector`].
     fn rd_sector(&self, lba: u64, buf: &mut [u8; SECTOR_SIZE]) -> Result<(), FatError> {
         self.in_extent(lba, 1)?;
+        pend_flush_if_covers(lba, 1); // SDHCMULTI2 M2: a read of the sector holding a deferred dirent sees it
         read_sector(self.source, lba, buf)
     }
 
@@ -2194,6 +2195,7 @@ impl FatFs {
             return Err(FatError::Io);
         }
         self.in_extent(lba, (buf.len() / SECTOR_SIZE) as u64)?;
+        pend_flush_if_covers(lba, (buf.len() / SECTOR_SIZE) as u64); // SDHCMULTI2 M2
         read_sectors(self.source, lba, buf)
     }
 
@@ -2385,6 +2387,7 @@ impl FatFs {
                 }
             }
             self.wr_sector(lba, &buf)?;
+            FAT_WRITES.fetch_add(1, core::sync::atomic::Ordering::Relaxed); // SDHCMULTI2
         }
         Ok(())
     }
@@ -3025,6 +3028,7 @@ impl FatFs {
             // inside the chain we were given. No read — `data` supplies every byte.
             let run = core::cmp::min(full, self.contiguous_sectors(clusters, ci, s0));
             let bytes = run as usize * SECTOR_SIZE;
+            note_run_blocks(run as u32); // SDHCMULTI2 M3 witness: the longest contiguous request
             self.wr_sectors(lba, &data[done..done + bytes])?;
             done += bytes;
             pos += bytes;
@@ -3304,19 +3308,24 @@ impl FatFs {
         let needed = (end + clus_bytes - 1) / clus_bytes; // ceil
         let mut new_first = first_cluster;
         while chain.len() < needed {
-            // SDHCMULTI M3: a cluster that [start, end) covers entirely is overwritten by step 3 before
-            // step 4 publishes the size, so zero-filling it first is one wasted 32 KiB CMD25 per cluster
-            // (half of every sequential screenshot/fetch write). Partially covered clusters still zero.
-            let cs = chain.len() * clus_bytes;
-            let covered = (start as usize) <= cs && end >= cs + clus_bytes;
-            let n = self.alloc_cluster_z(!covered)?; // free + (zero unless covered) + EOC — a terminated orphan ready to link
-            WRITE_RUN_CLUSTERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if covered { WRITE_RUN_ZERO_SKIPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
-            match chain.last() {
-                Some(&tail) => self.set_fat_entry(tail, n)?, // link old tail -> n
-                None => new_first = n,                       // the file had no clusters; n is the head
+            // SDHCMULTI2 M1: claim the WHOLE run of fully-covered clusters in one pass (one FAT multi-block
+            // RMW per copy, the tail link folded into the same write); a partially covered cluster still
+            // takes the zero-then-link order, one at a time.
+            let cs0 = chain.len() * clus_bytes;
+            let fc = if (start as usize) <= cs0 && end >= cs0 { (end - cs0) / clus_bytes } else { 0 };
+            let link_now = fc > 0;
+            let want = if link_now { core::cmp::min(core::cmp::min(fc, needed - chain.len()), 128) } else { 1 };
+            let run = self.claim_run(want, chain.last().copied(), link_now)?;
+            for (i, &n) in run.iter().enumerate() {
+                let cs = (chain.len() + i) * clus_bytes;
+                let covered = (start as usize) <= cs && end >= cs + clus_bytes;
+                WRITE_RUN_CLUSTERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if covered { WRITE_RUN_ZERO_SKIPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+                else if !link_now { self.zero_cluster(n)?; } // zero BEFORE the link below (disclosure invariant)
             }
-            chain.push(n);
+            if !link_now { if let Some(&tail) = chain.last() { self.set_fat_entry(tail, run[0])?; } }
+            if chain.is_empty() { new_first = run[0]; }
+            chain.extend_from_slice(&run);
         }
 
         // 3. RMW the data across the chain. `start <= size <= end`, and the chain now covers [0, needed*clus),
@@ -3340,7 +3349,7 @@ impl FatFs {
 
         // 4. LAST: publish size (+ chain head if it changed) to the directory — data + FAT already
         //    durable. JD17: the _mtime sibling also refreshes the last-write stamp in this same RMW.
-        self.write_dir_entry_fields_mtime(dir_lba, dir_off, new_first, new_size)?;
+        self.publish_dirent(dir_lba, dir_off, new_first, new_size)?; // SDHCMULTI2 M2
         write_run_note(data.len() / SECTOR_SIZE); // SDHCMULTI M3
         Ok((written, new_size, new_first))
     }
@@ -6843,5 +6852,197 @@ fn write_run_note(blocks: usize) {
             "[fs] write run clusters={} blocks={} multi={} zero_skipped={}",
             c, WRITE_RUN_BLOCKS.load(Relaxed), WRITE_RUN_CALLS.load(Relaxed), WRITE_RUN_ZERO_SKIPPED.load(Relaxed)
         );
+    }
+}
+
+
+// =================================================================================================
+// SDHCMULTI2 — the FAT layer between card calls. Boot 18: the controller spent 70 ms of a 1063 ms burst;
+// the rest was one-cluster-per-call FAT claim (rd + 2x RMW), FAT link (2x RMW) and a dir-entry RMW per
+// cluster. M1: `claim_run` claims a contiguous run and writes the touched FAT sectors with ONE multi-block
+// write per FAT copy (tail link folded in when the run needs no zero-fill). M2: the dir entry of a grown
+// file on the internal SD card is DEFERRED (`PEND`) and written once — flushed before any FatFs read of its
+// sector, by the burst-idle read hook, or by `flush_pending_dirent()`. M3: `write_span` already hands the
+// whole contiguous run to the block layer; `max_run_blocks` witnesses it (the card driver's CMD25 bound is
+// still 64 blocks = its 32 KiB DMA bounce, a driver change not made here).
+// =================================================================================================
+static FAT_WRITES: AtomicU32 = AtomicU32::new(0);
+static DIRENT_WRITES: AtomicU32 = AtomicU32::new(0);
+static MAX_RUN_BLOCKS: AtomicU32 = AtomicU32::new(0);
+
+fn note_run_blocks(n: u32) { MAX_RUN_BLOCKS.fetch_max(n, core::sync::atomic::Ordering::Relaxed); }
+
+/// Take-and-reset `(fat_writes, dirent_writes, max_run_blocks)` for the `:: SDHCWR:` witness.
+pub fn wr_stats_take() -> (u32, u32, u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (FAT_WRITES.swap(0, Relaxed), DIRENT_WRITES.swap(0, Relaxed), MAX_RUN_BLOCKS.swap(0, Relaxed))
+}
+
+struct PendDirent { source: BlockSource, lba: u64, off: usize, first: u32, size: u32 }
+struct PendCell(core::cell::UnsafeCell<Option<PendDirent>>);
+unsafe impl Sync for PendCell {}
+static PEND: PendCell = PendCell(core::cell::UnsafeCell::new(None));
+static PEND_LOCK: AtomicBool = AtomicBool::new(false);
+static PEND_VALID: AtomicBool = AtomicBool::new(false);
+static PEND_LBA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn pend_lock(block: bool) -> bool {
+    loop {
+        if PEND_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() { return true; }
+        if !block { return false; }
+        core::hint::spin_loop();
+    }
+}
+
+/// Write the pending dir entry (RMW of its sector: first cluster, size, mtime) and clear it. Lock held.
+fn pend_write_locked() {
+    // SAFETY: PEND_LOCK is held by the caller.
+    let slot = unsafe { &mut *PEND.0.get() };
+    let Some(p) = slot.take() else { return };
+    PEND_VALID.store(false, Ordering::Release);
+    let mut buf = [0u8; SECTOR_SIZE];
+    if read_sector(p.source, p.lba, &mut buf).is_err() { serial_println!("[fs] deferred dirent read FAILED lba={}", p.lba); return; }
+    let o = p.off;
+    buf[o + 20..o + 22].copy_from_slice(&((p.first >> 16) as u16).to_le_bytes());
+    buf[o + 26..o + 28].copy_from_slice(&((p.first & 0xFFFF) as u16).to_le_bytes());
+    buf[o + 28..o + 32].copy_from_slice(&p.size.to_le_bytes());
+    let (mt, md) = crate::clock::fat_stamp();
+    if (mt, md) != (0, 0) {
+        buf[o + 22..o + 24].copy_from_slice(&mt.to_le_bytes());
+        buf[o + 24..o + 26].copy_from_slice(&md.to_le_bytes());
+    }
+    if write_sector(p.source, p.lba, &buf).is_err() { serial_println!("[fs] deferred dirent write FAILED lba={}", p.lba); return; }
+    DIRENT_WRITES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Flush the deferred dir entry (blocking). Safe to call any time; a no-op when nothing is pending.
+#[allow(dead_code)]
+pub fn flush_pending_dirent() {
+    if !PEND_VALID.load(Ordering::Acquire) { return; }
+    pend_lock(true);
+    pend_write_locked();
+    PEND_LOCK.store(false, Ordering::Release);
+}
+
+/// Non-blocking flush for the card read path's idle hook (never spins, never re-enters a flush in progress).
+#[allow(dead_code)]
+pub fn flush_pending_dirent_try() {
+    if !PEND_VALID.load(Ordering::Acquire) { return; }
+    if !pend_lock(false) { return; }
+    pend_write_locked();
+    PEND_LOCK.store(false, Ordering::Release);
+}
+
+/// Every FatFs read funnels here: a read covering the deferred entry's sector writes it first.
+#[inline]
+fn pend_flush_if_covers(lba: u64, n: u64) {
+    if !PEND_VALID.load(Ordering::Acquire) { return; }
+    let p = PEND_LBA.load(Ordering::Relaxed);
+    if p >= lba && p < lba + n { flush_pending_dirent(); }
+}
+
+impl FatFs {
+    /// SDHCMULTI2 M2: publish size/first-cluster for a grown file. On the internal SD card the write is
+    /// deferred (one RMW per file per burst); everywhere else it is the immediate step-4 publish.
+    fn publish_dirent(&self, lba: u64, off: usize, first: u32, size: u32) -> Result<(), FatError> {
+        #[cfg(all(target_arch = "x86_64", feature = "sdhcblk", feature = "sdw"))]
+        if self.source == BlockSource::Sdhc {
+            if off + 32 > SECTOR_SIZE { return Err(FatError::Io); }
+            self.in_extent(lba, 1)?;
+            pend_lock(true);
+            // SAFETY: PEND_LOCK held.
+            let slot = unsafe { &mut *PEND.0.get() };
+            if let Some(p) = slot.as_ref() { if p.lba != lba || p.off != off { pend_write_locked(); } }
+            let slot = unsafe { &mut *PEND.0.get() };
+            *slot = Some(PendDirent { source: self.source, lba, off, first, size });
+            PEND_LBA.store(lba, Ordering::Relaxed);
+            PEND_VALID.store(true, Ordering::Release);
+            PEND_LOCK.store(false, Ordering::Release);
+            return Ok(());
+        }
+        let r = self.write_dir_entry_fields_mtime(lba, off, first, size);
+        if r.is_ok() { DIRENT_WRITES.fetch_add(1, core::sync::atomic::Ordering::Relaxed); }
+        r
+    }
+
+    /// SDHCMULTI2 M1: claim a contiguous run of up to `want` free clusters (>= 1), chain them to each other
+    /// and terminate the last with EOC, and when `tail` is `Some` and `link_now`, link the old tail onto
+    /// the run's head in the same FAT write. The search is unlocked; the commit re-reads the touched FAT
+    /// span under `FAT_MUTATION` and claims only if every entry is STILL free (the F3-M1 compare-and-claim,
+    /// for a run). Touched FAT sectors go out as ONE multi-block write per FAT copy. The caller zero-fills
+    /// any not-fully-overwritten cluster BEFORE linking (so it passes `link_now = false` for those).
+    fn claim_run(&self, want: usize, tail: Option<u32>, link_now: bool) -> Result<alloc::vec::Vec<u32>, FatError> {
+        let eb: u64 = if self.kind == FatKind::Fat32 { 4 } else { 2 };
+        let last = self.count_of_clusters + 2;
+        if last <= 2 || want == 0 { return Err(FatError::NoSpace); }
+        let rd_entry = |buf: &[u8; SECTOR_SIZE], within: usize| -> u32 {
+            match self.kind { FatKind::Fat16 => u16le(buf, within) as u32, FatKind::Fat32 => u32le(buf, within) & 0x0FFF_FFFF }
+        };
+        for _attempt in 0..4 {
+            let hint = ALLOC_HINT.load(Ordering::Relaxed);
+            let mut c = if hint < 2 || hint >= last { 2 } else { hint };
+            let span = last - 2;
+            let mut visited = 0u32;
+            let mut buf = [0u8; SECTOR_SIZE];
+            let mut loaded = u64::MAX;
+            let mut run: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+            while visited < span && run.len() < want {
+                visited += 1;
+                let offset = c as u64 * eb;
+                let sec = offset / SECTOR_SIZE as u64;
+                if sec >= self.fat_sz as u64 { break; }
+                if sec != loaded { self.rd_sector(self.fat_start + sec, &mut buf)?; loaded = sec; }
+                let e = rd_entry(&buf, (offset % SECTOR_SIZE as u64) as usize);
+                if e == 0 {
+                    if run.last().map_or(true, |&p| p + 1 == c) { run.push(c); } else { break; }
+                } else if !run.is_empty() { break; }
+                c += 1;
+                if c >= last { if !run.is_empty() { break; } c = 2; loaded = u64::MAX; }
+            }
+            if run.is_empty() { return Err(FatError::NoSpace); }
+            let lk = if link_now { tail } else { None };
+            let ok = with_fat_lock_src(self.source, "claim_run", || -> Result<bool, FatError> {
+                let sec_of = |cl: u32| cl as u64 * eb / SECTOR_SIZE as u64;
+                let lo = sec_of(run[0]);
+                let hi = sec_of(*run.last().unwrap());
+                if hi >= self.fat_sz as u64 { return Err(FatError::BadChain); }
+                let n = (hi - lo + 1) as usize;
+                let mut sb = alloc::vec![0u8; n * SECTOR_SIZE];
+                self.rd_sectors(self.fat_start + lo, &mut sb)?;
+                let at = |cl: u32| ((cl as u64 * eb) - lo * SECTOR_SIZE as u64) as usize;
+                for &cl in run.iter() {
+                    let w = at(cl);
+                    let cur = match self.kind { FatKind::Fat16 => u16le(&sb, w) as u32, FatKind::Fat32 => u32le(&sb, w) & 0x0FFF_FFFF };
+                    if cur != 0 { return Ok(false); } // lost the race
+                }
+                let put = |sb: &mut [u8], cl: u32, v: u32| {
+                    let w = at(cl);
+                    match self.kind {
+                        FatKind::Fat16 => sb[w..w + 2].copy_from_slice(&((v & 0xFFFF) as u16).to_le_bytes()),
+                        FatKind::Fat32 => { let ex = u32le(sb, w); sb[w..w + 4].copy_from_slice(&((ex & 0xF000_0000) | (v & 0x0FFF_FFFF)).to_le_bytes()); }
+                    }
+                };
+                for i in 0..run.len() {
+                    let v = if i + 1 < run.len() { run[i + 1] } else { self.eoc_value() };
+                    put(&mut sb, run[i], v);
+                }
+                let mut tail_sep = None;
+                if let Some(t) = lk {
+                    if self.valid_cluster(t) && sec_of(t) >= lo && sec_of(t) <= hi { put(&mut sb, t, run[0]); } else { tail_sep = Some(t); }
+                }
+                for f in 0..self.num_fats as u64 {
+                    self.wr_sectors(self.fat_start + f * self.fat_sz as u64 + lo, &sb)?;
+                    FAT_WRITES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(t) = tail_sep { self.set_fat_entry_inner(t, run[0])?; }
+                Ok(true)
+            })?;
+            if ok {
+                let l = *run.last().unwrap();
+                ALLOC_HINT.store(if l + 1 >= last { 2 } else { l + 1 }, Ordering::Relaxed);
+                return Ok(run);
+            }
+        }
+        Err(FatError::Busy)
     }
 }
