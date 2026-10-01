@@ -25699,7 +25699,7 @@ fn fixture_abs<'a>(path: &'a str, buf: &'a mut [u8; 48]) -> &'a str {
 /// owner IS the asid) — by identity, not focus. Twin of `x86_64::syscall::user_input_push_owner`.
 #[cfg(feature = "desktop_firmware")]
 pub fn user_input_push_owner(owner: u64, packed: u64) -> bool {
-    if owner == 0 || owner as usize > uslots::USER_SLOTS {
+    if owner == 0 || owner as usize > super::uslots::USER_SLOTS {
         return false;
     }
     user_input_push(owner, packed)
