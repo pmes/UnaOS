@@ -1578,6 +1578,7 @@ fn art_emit() {
     } else {
         b" -> FAIL ::\n"
     });
+    if buf.n == BUF_CAP { buf.b[BUF_CAP - 1] = b'\n'; } // SERIAL2: a clipped line still ends its line
     buf.flush();
 }
 #[cfg(not(target_arch = "x86_64"))]
@@ -3080,7 +3081,7 @@ fn surface_checksum(surf: *const u8) -> u64 {
 /// `pi4-regression.spec` pins cannot have moved. Nothing else about `Buf` changed: every existing
 /// caller puts the same bytes and the bound is still `self.b.len()`.
 #[cfg(target_arch = "x86_64")]
-const BUF_CAP: usize = 192; // TEAR + STRAND: beam= (10 bytes) and repaints=/waits_us= joined the line
+const BUF_CAP: usize = 256; // SERIAL2: 192 clipped the verdict's ` -> PASS ::\n` tail (boot 18: 1136 merged lines, each a line cut at exactly 192 bytes);  TEAR + STRAND: beam= (10 bytes) and repaints=/waits_us= joined the line
 #[cfg(not(target_arch = "x86_64"))]
 const BUF_CAP: usize = 64;
 struct Buf {
