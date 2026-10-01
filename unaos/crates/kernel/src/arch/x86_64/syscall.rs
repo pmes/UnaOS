@@ -2624,7 +2624,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), // STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
+        SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
         SYS_CLOSE => sys_close(a0),
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
@@ -23577,7 +23577,7 @@ fn u11m2_launcher(demo_cpu: usize) {
     #[cfg(feature = "irqstorage")]
     s6_witness_launcher(demo_cpu);
     // U6x: chain the owner/grants ACL demo (program order, the u9x->..->u11m2 idiom; the LAST demo in the chain).
-    u6gx_launcher(demo_cpu); stor1_name_launcher(demo_cpu); stor1_mv_launcher(demo_cpu); stor2_mv_launcher(demo_cpu); #[cfg(feature = "witness")] lfnmv_launcher(); stor1_wr_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); busx86_stamp_check(); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
+    u6gx_launcher(demo_cpu); stor1_name_launcher(demo_cpu); stor1_mv_launcher(demo_cpu); stor2_mv_launcher(demo_cpu); #[cfg(feature = "witness")] lfnmv_launcher(); stor1_wr_launcher(demo_cpu); busx86_midden_launcher(demo_cpu); crate::bus::bus_codec_selftest(); crate::bus::bus_codec2_selftest(); crate::bus::attr::selftest(); busx86_stamp_check(); // BUSX86 M3 — the ring-3 midden runs HERE, last of the RING-3 ladder and BEFORE the kernel-side witnesses, for a reason each of them states: `busx86_stamp_check` drives scratch row 7 and BUMPS its `SLOT_GEN`, and it is allowed to only because "the ring-3 ladder is done by now" — so the ladder must actually be done, which puts M3 ahead of it and not after. It is also chained after `u6gx_launcher` because it needs u6gx's two slots and cores BACK. BUSX86 — THE KATS NOW RUN ON THIS ARCH TOO, which is half of what "one module on both arches" has to mean: a shared codec whose goldens are only ever asserted on the Pi is a shared codec on paper. `bus_codec_selftest` / `bus_codec2_selftest` are `crate::bus`'s own frozen UnaOS-NATIVE v1 witnesses (request + both reply shapes, typed ls/cat/cp and write/rm/mv payloads, fail-closed decode at the 4 KiB body ceiling) — read-only, in-RAM, no disk and no card, so they are safe anywhere; `busx86_stamp_check` is the x86 transport/stamping witness that drives the PRODUCTION `busx_msend_for` path. UNCONDITIONAL and LAST in the chain, both mirroring the aarch64 call site: last because a codec KAT asserts nothing about the machine's state and must not perturb a fixture that does, unconditional because `arroyo test`'s default x86 lane carries no `witness` feature and a KAT nobody runs on the default medium is the SPECROWS shape. ⚠ SAME-LINE fold — see the `use` line's note.
 }
 
 /// Build a U6x fixture slot at a given entry symbol — the `u7x_build`/`u11m2_build` shape (allocate a private
@@ -25071,6 +25071,7 @@ fn busx_msend_for(row: usize, cgen: u64, frame: &[u8]) -> i64 {
         // a malformed one are the aarch64 dispatcher's, verb for verb. ⚠ LINE-NEUTRAL fold (B94).
         crate::bus::BUS_VERB_WRITE => match crate::bus::write_body_parse(body) { Ok((nb, c)) => match core::str::from_utf8(nb) { Ok(n) => busx_write(row, cgen, n, c), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_RM => match crate::bus::cat_body_parse(body) { Ok(nb) => match core::str::from_utf8(nb) { Ok(n) => busx_rm(row, cgen, n), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_MV => match crate::bus::cp_body_parse(body) { Ok((a, b)) => match (core::str::from_utf8(a), core::str::from_utf8(b)) { (Ok(x), Ok(y)) => busx_mv(row, cgen, x, y), _ => return EINVAL }, Err(_) => return EINVAL },
         crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(row as u64 + 1, body); 0 } una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST => crate::prefs::bus_fulfil(hdr.verb, body, pref_caller_in_session(row), &mut text), // PREFS (B300): Principia's verbs, fulfilled over the one store; NOTICE: owner = slot + 1 (the wm key)
+        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(row as u64 + 1, body); 0 } una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal(row), &mut text), // ATTRSURF (B299): the attribute verbs, the SAME body SYS_ATTR_* calls. NOTICE: owner = slot + 1 (the wm key)
         crate::bus::BUS_VERB_WRITE => match crate::bus::write_body_parse(body) { Ok((nb, c)) => match core::str::from_utf8(nb) { Ok(n) => busx_write(row, cgen, n, c), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_RM => match crate::bus::cat_body_parse(body) { Ok(nb) => match core::str::from_utf8(nb) { Ok(n) => busx_rm(row, cgen, n), Err(_) => return EINVAL }, Err(_) => return EINVAL }, crate::bus::BUS_VERB_MV => match crate::bus::cp_body_parse(body) { Ok((a, b)) => match (core::str::from_utf8(a), core::str::from_utf8(b)) { (Ok(x), Ok(y)) => busx_mv(row, cgen, x, y), _ => return EINVAL }, Err(_) => return EINVAL }, #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(row, body), #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(row, body), #[cfg(feature = "wc")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(row, body, &mut text),
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
@@ -29831,8 +29832,7 @@ fn pref_caller_in_session(row: usize) -> bool {
         let _ = row;
         false
     }
-// =================================================================================================
-// BANDY3 (ROADMAP §3b, the fulfiller seam): this arch's thin half of `crate::bus_route` — the mailbox
+// ==========================================================================================// BANDY3 (ROADMAP §3b, the fulfiller seam): this arch's thin half of `crate::bus_route` — the mailbox
 // ops table the router drives (HANDLES row + SLOT_GEN keyed, the existing BUSX_MBOX / BUSX_SEM), and the
 // `tests bandy3` fixture's hooks over the PRODUCTION `busx_msend_for`. Appended at the file tail.
 // =================================================================================================
@@ -29888,4 +29888,53 @@ static BUSREG_FX: crate::bus_route::Fixture = crate::bus_route::Fixture {
 pub fn bandy3_selftest() {
     busx_sem_init_once();
     crate::bus_route::selftest(&BUSREG_FX);
+=======
+// =================================================================================================
+// ATTRSURF (B299) — the attribute syscalls, x86 arm. The body is `fs::attrsys::syscall_fulfil`, shared
+// with aarch64 and with both bus arms; this arm only copies in, names the caller, and copies out.
+// =================================================================================================
+
+/// The VFS principal string for slot `row`: `user:<name>#<uid>` when the slot carries a stamp from the
+/// LIVE session (the projection aarch64's `principal_native_string` gives the same user, so a native
+/// `owner` row means the same person on both arches), else `anon` (public objects only).
+fn attrsurf_principal(row: usize) -> alloc::string::String {
+    #[cfg(feature = "login")]
+    {
+        let uid = slot_user_live(row);
+        if uid != 0 {
+            let (nb, nl) = crate::arch::without_interrupts(|| { let g = SESSION_NAME.lock(); (g.0, g.1) });
+            if let Ok(name) = core::str::from_utf8(&nb[..nl as usize]) {
+                return alloc::format!("user:{}#{}", name, uid);
+            }
+        }
+    }
+    let _ = row;
+    alloc::string::String::from("anon")
+}
+
+/// `SYS_ATTR_SET/GET/LIST`, `SYS_QUERY`, `SYS_STAT` — see una-abi's ATTRSURF block for the layouts.
+fn sys_attrsurf(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let n = a1 as usize;
+    if n == 0 || n > crate::fs::attrsys::IN_MAX {
+        return EINVAL;
+    }
+    let mut inb = alloc::vec![0u8; n];
+    if let Err(e) = copy_from_user(&mut inb, a0) {
+        return e;
+    }
+    let cap = match nr {
+        una_abi::SYS_ATTR_SET => 0,
+        una_abi::SYS_STAT => una_abi::USER_STAT_LEN,
+        _ => a3 as usize,
+    };
+    let out = match crate::fs::attrsys::syscall_fulfil(nr, &inb, &attrsurf_principal(caller_row()), cap) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    if !out.is_empty() {
+        if let Err(e) = copy_to_user(a2, &out) {
+            return e;
+        }
+    }
+    if nr == una_abi::SYS_STAT { 0 } else { out.len() as i64 }
 }

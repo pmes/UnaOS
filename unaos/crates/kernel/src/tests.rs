@@ -152,6 +152,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
     crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } // HELPVERB: `tests helpdoc`
+    crate::help::ensure(); ensure_attr(); // HELPVERB: `tests helpdoc`. ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
         static LDONE: AtomicBool = AtomicBool::new(false);
@@ -200,4 +201,9 @@ fn ensure_unafsx86() {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("unafs", crate::fs::unafs::unafsx86_selftest); }
     }
+/// ATTRSURF (B299): register `tests attr` exactly once, every build — the fixture decides PASS or an
+/// honest SKIP (`reason=no-unafs-volume`) from the mounted tree, so it needs no knob.
+fn ensure_attr() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::AcqRel) { register("attr", crate::fs::attrsys::selftest); }
 }

@@ -1288,7 +1288,7 @@ fn fs_stat(console: &mut Console, arg: &str) {
     console.println(&alloc::format!("  volume: {}", volume));
     console.println(&alloc::format!(
         "  kind:   {}", if matches!(st.kind, NodeKind::Dir) { "dir" } else { "file" }));
-    console.println(&alloc::format!("  size:   {} byte(s)", st.size));
+    console.println(&alloc::format!("  size:   {} byte(s)", st.size)); console.println(&match st.id { Some(id) => alloc::format!("  id:     {}", id), None => String::from("  id:     - (this volume exposes no object id)") }); if let Some(t) = st.mtime { console.println(&alloc::format!("  epoch:  {} (unix seconds)", t)); } // ATTRSURF (B294): the object's identity and its mtime as the number SYS_STAT returns. ⚠ SAME-LINE fold.
     console.println(&alloc::format!("  mtime:  {}", vfs_mtime_field(mtime.as_ref()).trim()));
     if path == "/" {
         console.println("  entry:  the volume root has no directory entry of its own");
@@ -5430,9 +5430,9 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "setfattr" => {
             match (args.first().copied(), args.get(1).copied(), args.get(2).copied()) {
                 (Some("-x"), Some(key), Some(path)) => setfattr_x(console, key, path),
-                _ => console.println_styled(crate::video::theme::TERM_RED, "usage: setfattr -x <key> <path>  (drop one typed attribute)"),
+                _ => setfattr_cmd(console, &args), // ATTRSURF: `setfattr <path> <key>=<value>` (body at the file tail)
             }
-        },
+        }, "getfattr" => getfattr_cmd(console, &args), "query" => query_cmd(console, &args), // ATTRSURF (B299): getfattr (no key = the listing; no `lsattr`, R26) and query, bodies at the file tail. ⚠ SAME-LINE fold.
         // RELICS (R26 clause 2): five spellings (`usnaps` `usnap` `usnapdrop` `usnapls` `usnapcat`)
         // become ONE verb with subcommands. They were never five commands: they were one noun with
         // five operations, which is what a subcommand is for, and the `u` prefix said only "the
@@ -8851,5 +8851,87 @@ fn shell_src(args: &[&str], console: &mut Console) {
         Some("status") => extract::status(&mut say),
         Some("verify") => { let _ = extract::verify(&mut say); }
         _ => say("usage: src extract [--dry-run] | src status | src verify"),
+    }
+}
+
+// --- ATTRSURF (B299): the attribute verbs ---------------------------------------------------------
+//
+// `setfattr <path> <key>=<value>` · `setfattr -x <key> <path>` · `getfattr <path> [<key>]` ·
+// `query <expr>`. One verb per job (R26): `getfattr` with no key IS the listing, so there is no
+// `lsattr`. Every body goes through the mount table under the shell's principal; a FAT target
+// answers `-ENOTSUP` from its own backend. Refusals print the errno name `SYS_ATTR_*` returns
+// (`fs::attrsys::refusal`), so a program and an operator see the same answer.
+
+/// `setfattr <path> <key>=<value>` — the value typed BY SHAPE (`AttrValue::parse_shaped`): an
+/// integer, a float, `"a string"`, `b64:` a blob, `[f, f, ...]` a vector; anything else a bare string.
+fn setfattr_cmd(console: &mut Console, args: &[&str]) {
+    let usage = "usage: setfattr <path> <key>=<value>  |  setfattr -x <key> <path>   (value: 42, 1.5, \"text\", b64:..., [0.1,0.2])";
+    if args.len() < 2 {
+        console.println_styled(crate::video::theme::TERM_RED, usage);
+        return;
+    }
+    let assign = args[1..].join(" ");
+    let Some((key, raw)) = assign.split_once('=') else {
+        console.println_styled(crate::video::theme::TERM_RED, usage);
+        return;
+    };
+    let key = key.trim();
+    let value = match crate::fs::vfs::AttrValue::parse_shaped(raw) {
+        Ok(v) => v,
+        Err(why) => return vfs_say(console, &alloc::format!("setfattr: {}: {} (-EINVAL)", key, why)),
+    };
+    let Some((mt, path)) = vfs_write_open(console, "setfattr", args[0]) else { return };
+    let shown = value.render();
+    match mt.set_attr(&path, key, value, SHELL_PRINCIPAL) {
+        Ok(()) => vfs_say(console, &alloc::format!("setfattr: {}: {} = {}", path, key, shown)),
+        Err(e) => vfs_say(console, &alloc::format!("setfattr: {}: {}: {}", path, key, crate::fs::attrsys::refusal(&e))),
+    }
+}
+
+/// `getfattr <path> [<key>]` — one `key: type value` line per attribute (all of them without a key).
+fn getfattr_cmd(console: &mut Console, args: &[&str]) {
+    let Some(&target) = args.first() else {
+        console.println_styled(crate::video::theme::TERM_RED, "usage: getfattr <path> [<key>]");
+        return;
+    };
+    let Some((mt, path)) = vfs_read_open(console, "getfattr", target) else { return };
+    match args.get(1) {
+        Some(&key) => match mt.get_attr(&path, key, SHELL_PRINCIPAL) {
+            Ok(v) => vfs_say(console, &alloc::format!("{}: {}", key, v.render())),
+            Err(e) => vfs_say(console, &alloc::format!("getfattr: {}: {}: {}", path, key, crate::fs::attrsys::refusal(&e))),
+        },
+        None => match mt.list_attrs(&path, SHELL_PRINCIPAL) {
+            Ok(rows) if rows.is_empty() => vfs_say(console, &alloc::format!("getfattr: {}: no attributes", path)),
+            Ok(rows) => {
+                for (k, v) in rows {
+                    vfs_say(console, &alloc::format!("{}: {}", k, v.render()));
+                }
+            }
+            Err(e) => vfs_say(console, &alloc::format!("getfattr: {}: {}", path, crate::fs::attrsys::refusal(&e))),
+        },
+    }
+}
+
+/// `query <expr>` — every object in the namespace whose attributes match, one `id path` line each,
+/// readable hits only. Grammar: `key == v`, `!=`, `>`, `<`, `similarity(key, [..]) > t`, and
+/// ` AND key == "s"` filters.
+fn query_cmd(console: &mut Console, args: &[&str]) {
+    if args.is_empty() {
+        console.println_styled(crate::video::theme::TERM_RED, "usage: query <expr>   e.g. query kind == \"photo\"   query similarity(emb, [1,0,0]) > 0.9");
+        return;
+    }
+    let expr = args.join(" ");
+    let mt = vfs_mount_table();
+    if mt.prefixes().is_empty() {
+        return vfs_say(console, "query: no filesystem mounted (-ENODEV)");
+    }
+    match mt.query(&expr, SHELL_PRINCIPAL) {
+        Ok(hits) => {
+            for (id, p) in &hits {
+                vfs_say(console, &alloc::format!("{} {}", id, p));
+            }
+            vfs_say(console, &alloc::format!("query: {} hit(s)", hits.len()));
+        }
+        Err(e) => vfs_say(console, &alloc::format!("query: {}", crate::fs::attrsys::refusal(&e))),
     }
 }
