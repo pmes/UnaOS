@@ -14014,7 +14014,7 @@ impl Controller {
                             idx, chars & 0x7F, (chars >> 8) & 0xF, int_ep_kind(e),
                             e.reports.wrapping_add(1), e.dark_cad_ms, e.dark_windows,
                             e.dark_ms, e.dark_max_ms, e.dark_missed, pp_max_us, pp_mean_us
-                        );
+                        ); ptrstutter_witness(e.dark_ms, e.dark_max_ms);
                     }
                     // ══════════════════════════════════════════════════════════════════════════════
                     // Boot reports are ≤ 8 B; a parsed report-pointer report can be longer (the
@@ -14846,7 +14846,7 @@ const ISR_MAX_EPS: usize = MAX_CONTROLLERS * MAX_INT_EPS;
 /// may lift out and hold for a pass that is late. Eight is the same number the refused ring wanted,
 /// for the same arithmetic (8 report periods), except that here it costs 8 x 64 B of kernel image
 /// per endpoint and no controller behaviour whatsoever.
-const ISR_RING: usize = 8;
+const ISR_RING: usize = 64; // PTRSTUTTER M1: 8 -> 64 (boot 17: the 8-deep ring filled 272 times)
 /// Bytes of one hand-off slot. `INT_BUF_LEN` knob-off is exactly 64, so on default media no
 /// completion can ever exceed it. Knob-on (`mtraw`, 1024) the vendor-multitouch endpoint's frames
 /// can, and those are DECLINED by the ISR (`ISR_OVERSIZE`) and left for the pass — a bounded,
@@ -14952,6 +14952,8 @@ static POLL_CONTENDED: AtomicU64 = AtomicU64::new(0);
 /// Completions the ISR found with a full hand-off ring — it declined and left them for the pass.
 /// **This is the residual defect**: the pass was >= 8 reports late even with the interrupt live.
 static ISR_RING_FULL: AtomicU64 = AtomicU64::new(0);
+/// PTRSTUTTER M1 — reports the ISR DISCARDED (drop-newest) because the ring was full; per boot, never reset.
+static ISR_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Completions longer than one hand-off slot (`mtraw` only), declined and left for the pass.
 static ISR_OVERSIZE: AtomicU64 = AtomicU64::new(0);
 /// Deepest hand-off occupancy ever observed, across all endpoints. 1 means the pass was never more
@@ -15133,9 +15135,15 @@ unsafe fn isr_service_ep(slot: usize, now_ms: u64) {
     let tail = ep.tail.load(Ordering::Relaxed);
     let depth = tail.wrapping_sub(head);
     if depth as usize >= ISR_RING {
-        // The pass is more than a ring behind. Decline: the report stays in the endpoint buffer and
-        // the endpoint stays un-re-armed — i.e. exactly today's state — and the pass takes it.
+        // PTRSTUTTER M1 — the pass is more than a ring (64 reports) behind. Policy: DROP NEWEST. The ring
+        // keeps the oldest 64 (in order, so a press stays ahead of its release); this report is
+        // discarded, COUNTED in `ISR_DROPPED` (the `dropped=` of ISRARM / PTRSTUTTER), and the endpoint is
+        // re-armed so the device never goes dark behind a starved consumer. The ISR never blocks.
         ISR_RING_FULL.fetch_add(1, Ordering::Relaxed);
+        ISR_DROPPED.fetch_add(1, Ordering::Relaxed);
+        ep.seen_ms.swap(now_ms, Ordering::Relaxed);
+        isr_rearm(ep);
+        ISR_REARMS.fetch_add(1, Ordering::Relaxed);
         ep.claim.store(0, Ordering::Release);
         return;
     }
@@ -15299,6 +15307,7 @@ unsafe fn isr_selftest() {
         ISR_RING_FULL.load(Ordering::Relaxed),
         ISR_CONTENDED.load(Ordering::Relaxed),
         ISR_DEPTH_MAX.load(Ordering::Relaxed),
+        ISR_DROPPED.load(Ordering::Relaxed),
     );
     const RX: u32 = 8;
     let mut order_ok = true;
@@ -15313,6 +15322,7 @@ unsafe fn isr_selftest() {
         // with the endpoint left un-re-armed — that refusal is the residual-defect path
         // (`ISR_RING_FULL`) and the one branch a live machine hits only when it is already late.
         let full_before = ISR_RING_FULL.load(Ordering::Relaxed);
+        let drop_before = ISR_DROPPED.load(Ordering::Relaxed);
         for k in 1..=(ISR_RING + 1) {
             // Stand in for the controller: land a payload and retire the transfer. Active clear,
             // no error bits, zero residue => the ISR should read exactly RX bytes.
@@ -15333,7 +15343,7 @@ unsafe fn isr_selftest() {
                 core::ptr::read_volatile(&(*qtd).token)
             };
             let armed = tok & QTD_ACTIVE != 0;
-            let expect_armed = k <= ISR_RING;
+            let expect_armed = true; // PTRSTUTTER M1: the overflow report is dropped AND the endpoint re-armed
             if armed != expect_armed {
                 rearm_ok = false;
             }
@@ -15352,7 +15362,7 @@ unsafe fn isr_selftest() {
                 }
             }
         }
-        if ISR_RING_FULL.load(Ordering::Relaxed) != full_before + 1 {
+        if ISR_RING_FULL.load(Ordering::Relaxed) != full_before + 1 || ISR_DROPPED.load(Ordering::Relaxed) != drop_before + 1 {
             full_ok = false;
         }
         // Drain. FIFO across the wrap, payload intact, and the ring empty afterwards.
@@ -15386,6 +15396,7 @@ unsafe fn isr_selftest() {
     core::ptr::write_bytes(buf, 0, INT_BUF_LEN);
     ISR_REARMS.store(saved.0, Ordering::Relaxed);
     ISR_RING_FULL.store(saved.1, Ordering::Relaxed);
+    ISR_DROPPED.store(saved.4, Ordering::Relaxed);
     ISR_CONTENDED.store(saved.2, Ordering::Relaxed);
     ISR_DEPTH_MAX.store(saved.3, Ordering::Relaxed);
     let ok = order_ok && payload_ok && rearm_ok && toggle_ok && full_ok && modes == 2;
@@ -15439,13 +15450,15 @@ fn isr_rollup(now_ms: u64) {
     ISR_LOG_MS.store(now_ms, Ordering::Relaxed);
     ISR_LOG_REARMS.store(rearms, Ordering::Relaxed);
     serial_println!(
-        ":: EHCI-HID: ISRARM armed={} refused={} irq={} isr_rearm={} poll_rearm={} depth_max={} ringfull={} cont_isr={} cont_poll={} oversize={} == witness ::",
+        ":: EHCI-HID: ISRARM armed={} refused={} irq={} isr_rearm={} poll_rearm={} depth_max={} ring={} dropped={} ringfull={} cont_isr={} cont_poll={} oversize={} == witness ::",
         armed,
         ISR_REFUSED.load(Ordering::Relaxed),
         entries,
         rearms,
         POLL_REARMS.load(Ordering::Relaxed),
         ISR_DEPTH_MAX.load(Ordering::Relaxed),
+        ISR_RING,
+        ISR_DROPPED.load(Ordering::Relaxed),
         ISR_RING_FULL.load(Ordering::Relaxed),
         ISR_CONTENDED.load(Ordering::Relaxed),
         POLL_CONTENDED.load(Ordering::Relaxed),
@@ -19387,4 +19400,19 @@ impl Controller {
         );
         serial_println!(":: USBNET-EHCI: datapath=stub next=bulk-in-out == witness ::");
     }
+}
+
+
+/// PTRSTUTTER (boot 17, "mouse very studdery") — the verdict line, on the EHCIDARK cadence: the ring depth,
+/// reports the ISR dropped (drop-newest, never blocking), this endpoint's dark total and worst window, and
+/// the CPU WCPAR left free of band workers for the input service. FAIL = a single dark window over 500 ms.
+fn ptrstutter_witness(dark_ms: u64, dark_max_ms: u64) {
+    serial_println!(
+        ":: PTRSTUTTER: ring={} dropped={} dark_ms={} dark_max_ms={} reserved_cpu=none(ruling) -> {} ::",
+        ISR_RING,
+        ISR_DROPPED.load(Ordering::Relaxed),
+        dark_ms,
+        dark_max_ms,
+        if dark_max_ms > 500 { "FAIL" } else { "PASS" }
+    );
 }
