@@ -137,6 +137,14 @@ pub enum Action {
     CycleWindow,
     /// SCREENLOCK: lock the session without ending it (`⌘L`, `Ctrl+Alt+L`). Acted on by the router (`login::lock`).
     LockScreen,
+    /// WINSNAP: snap the focused window to the left half (`⌘⌥←`, `Ctrl+Alt+←`). Acted on by the router.
+    SnapLeft,
+    /// WINSNAP: right half (`⌘⌥→`, `Ctrl+Alt+→`).
+    SnapRight,
+    /// WINSNAP: zoom (`⌘⌥↑`, `Ctrl+Alt+↑`).
+    SnapZoom,
+    /// WINSNAP: restore the pre-snap placement (`⌘⌥↓`, `Ctrl+Alt+↓`).
+    SnapRestore,
 }
 
 impl Action {
@@ -163,6 +171,10 @@ impl Action {
             Action::BrightnessUp => "brightness-up",
             Action::CycleWindow => "cycle-window",
             Action::LockScreen => "lock-screen",
+            Action::SnapLeft => "snap-left",
+            Action::SnapRight => "snap-right",
+            Action::SnapZoom => "snap-zoom",
+            Action::SnapRestore => "snap-restore",
         }
     }
 

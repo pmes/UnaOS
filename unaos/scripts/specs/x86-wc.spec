@@ -927,3 +927,7 @@ REQUIRE [splash] held_ms=[0-9]+ released_by=(store-loaded|timeout)
 # ── TEXTEDIT (R75), TAIL-APPENDED — the editor fixture opens a scratch file, types 40 chars, saves, re-reads, compares
 REQUIRE :: TEXTEDIT: path=
 FORBID :: TEXTEDIT: .* -> FAIL ::
+# ── WINSNAP (R75), TAIL-APPENDED — `tests winsnap`: a real drag to the left edge snaps to the left half, the preview painted, the chords (Cmd/Ctrl+Alt+arrows) and Down restore, un-snap on drag-away
+REQUIRE :: WINSNAP: zones=7 snaps=[0-9]+ restores=[0-9]+ preview_ok=true unsnaps=[0-9]+ left=true chords=true quarters=4 .* -> PASS ::
+FORBID :: WINSNAP: .* -> FAIL ::
+REQUIRE \[wm-act\] snap win=[0-9]+ zone=left rect=

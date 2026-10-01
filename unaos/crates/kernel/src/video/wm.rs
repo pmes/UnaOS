@@ -17434,7 +17434,7 @@ pub fn drag_motion(x: i32, y: i32) -> bool {
     if id == WIN_NONE {
         return false;
     }
-    let want = DRAG_OWNER.load(Ordering::Acquire);
+    let want = DRAG_OWNER.load(Ordering::Acquire); #[cfg(all(target_arch = "x86_64", feature = "wc"))] winsnap::motion(id, x, y); // WINSNAP seam: un-snap + edge preview, before the move math reads DRAG_OFF_*
     // A cheap PRE-FILTER, and deliberately only that. It ends the drag promptly on a row that is
     // already gone, but it is NOT the safety property: the guard is dropped before the move, and an
     // id is a recyclable slot alias, so between here and the mutation the slot can be closed and
@@ -17519,7 +17519,7 @@ pub fn drag_end() -> WinId {
     use core::sync::atomic::Ordering;
     let id = DRAG_WIN.swap(WIN_NONE, Ordering::AcqRel);
     if id != WIN_NONE {
-        let owner = DRAG_OWNER.swap(0, Ordering::AcqRel);
+        let owner = DRAG_OWNER.swap(0, Ordering::AcqRel); #[cfg(all(target_arch = "x86_64", feature = "wc"))] winsnap::end(id); // WINSNAP seam: the release snaps to the zone the pointer is in (video/winsnap.rs)
         let n = DRAG_MOVES.swap(0, Ordering::Relaxed);
         let (x, y) = (
             DRAG_LAST_X.load(Ordering::Relaxed),
@@ -17554,7 +17554,7 @@ pub fn drag_cancel(why: &str) {
     use core::sync::atomic::Ordering;
     let id = DRAG_WIN.swap(WIN_NONE, Ordering::AcqRel);
     if id != WIN_NONE {
-        let owner = DRAG_OWNER.swap(0, Ordering::AcqRel);
+        let owner = DRAG_OWNER.swap(0, Ordering::AcqRel); #[cfg(all(target_arch = "x86_64", feature = "wc"))] winsnap::cancel(id, why); // WINSNAP seam: release-level snaps, any other cancel just clears the preview
         let n = DRAG_MOVES.swap(0, Ordering::Relaxed);
         // DRAGFLICK — a cancelled drag painted just as much as a placed one, and most of the bench's
         // real gestures end HERE (`release-level`, `focus-key`), so the budget is reported on this arm
@@ -29594,3 +29594,7 @@ pub fn retitle(id: WinId, name: &[u8]) {
         r.damage_all();
     }
 }
+// WINSNAP — window snapping lives in its own file; declared HERE (a child module) so it reaches the table, `zoom`, the vacate steps and the DRAG_* cells without widening any of them. See docs/dev/evidence/rmbp-0929/WINSNAP.md.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[path = "winsnap.rs"]
+pub mod winsnap;
