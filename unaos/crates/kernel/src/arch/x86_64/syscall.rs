@@ -7344,7 +7344,7 @@ pub fn wc_route_tail(raw: crate::pal::Event) {
         raw,
         crate::pal::Event::Mouse { .. } | crate::pal::Event::MouseAbsolute { .. }
     ) {
-        wc_drag_motion(); crate::video::shotsel::motion(); if crate::video::termsel::pointer_held() { let (x, y) = click_pointer_pos(); crate::video::termsel::pointer_motion(x, y); } // TERMSEL2 — a drag on the shell's text: while a press is held there, each pointer report is a `drag` note at the live cursor (the same position `wc_drag_motion` steers a title-bar drag by). One atomic load otherwise. ⚠ FOLDED, line-neutral.
+        wc_drag_motion(); #[cfg(feature = "wc")] crate::video::shotsel::motion(); if crate::video::termsel::pointer_held() { let (x, y) = click_pointer_pos(); crate::video::termsel::pointer_motion(x, y); } // TERMSEL2 — a drag on the shell's text: while a press is held there, each pointer report is a `drag` note at the live cursor (the same position `wc_drag_motion` steers a title-bar drag by). One atomic load otherwise. ⚠ FOLDED, line-neutral.
     }
 }
 
@@ -17539,7 +17539,7 @@ fn winx_launcher(demo_cpu: usize) {
     // runs after `clickroute_selftest` rather than before because it leaves a raised window behind
     // (that IS its verdict) and would otherwise change which owner the routing legs start from.
     #[cfg(all(feature = "witness", feature = "wc"))]
-    crate::tests::register("dock", crate::video::dock::selftest); #[cfg(all(feature = "witness", feature = "wc", feature = "quarry"))] crate::tests::register("fileopen", crate::video::quarry::live::fileopen_selftest); #[cfg(feature = "nvidia-kepler-vblank")] crate::tests::register("kvblank", crate::drivers::gpu::kepler_vblank::selftest_rerun); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("textedit", crate::video::textedit::selftest); // KVBLANK6 — `tests kvblank` re-runs the vblank fixture only. // TEXTEDIT (R75) — editor fixture; #[cfg(feature = "nvidia-kepler-vblank")] crate::tests::register("kvblank", crate::drivers::gpu::kepler_vblank::selftest_rerun); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("textedit", crate::video::textedit::selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("activity", crate::video::activity::selftest); // KVBLANK6 — `tests kvblank` re-runs the vblank fixture only. // TEXTEDIT (R75) — editor fixture;
+    crate::tests::register("dock", crate::video::dock::selftest); #[cfg(all(feature = "witness", feature = "wc", feature = "quarry"))] crate::tests::register("fileopen", crate::video::quarry::live::fileopen_selftest); #[cfg(feature = "nvidia-kepler-vblank")] crate::tests::register("kvblank", crate::drivers::gpu::kepler_vblank::selftest_rerun); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("textedit", crate::video::textedit::selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("activity", crate::video::activity::selftest); // KVBLANK6 — `tests kvblank` re-runs the vblank fixture only. // TEXTEDIT (R75) — editor fixture; ACTIVITY (R75) — the activity window fixture.
     // CRYSTAL — the SHARD menu fixture. Runs after `dock::selftest` (which runs `menubar::selftest`),
     // so the bar tenant it enables is already proven present and flush. It enables the bar itself,
     // opens the menu off the crystal, resolves every item, fires the SAFE picks, and dismisses three
@@ -17547,7 +17547,7 @@ fn winx_launcher(demo_cpu: usize) {
     // so no gate can power the machine off (the PASS line printing after every leg is that guard's
     // own proof). See `crystal::selftest`.
     #[cfg(all(feature = "witness", feature = "wc"))]
-    crate::tests::register("crystal", crate::video::crystal::selftest); crate::tests::register("shotregion", crate::video::shotsel::selftest); // SHOTREGION (R75)
+    crate::tests::register("crystal", crate::video::crystal::selftest); #[cfg(feature = "wc")] crate::tests::register("shotregion", crate::video::shotsel::selftest); // SHOTREGION (R75)
     // CLICK-BAND — the band witness, PROVEN able to fire. `crystal::selftest` and `dock::selftest`
     // both call their `press_at` seams DIRECTLY, so nothing in the battery drove the ROUTER's band
     // arms — the very lines GR27's "menubar press inert" round was missing would themselves have
@@ -21540,7 +21540,7 @@ fn u8x_launcher(demo_cpu: usize) {
     // PULSE-1: the PULSE.ELF end-to-end witness, after WINX-8 so the two shipped-artifact proofs sit
     // together and the newest one lands last. Gates on the mounted volume internally, so a run with no FAT
     // volume (or no staged PULSE.ELF) skips cleanly with one honest line naming the volume.
-    #[cfg(feature = "hda-tone")] crate::tests::register("hda", crate::drivers::hda::hda_tone_test_default); #[cfg(feature = "hda-tone")] { crate::tests::register("hdaboth", crate::drivers::hda::hda_tone_test_both); crate::tests::register("hda220", crate::drivers::hda::hda_tone_test_220); crate::tests::register("hda880", crate::drivers::hda::hda_tone_test_880); crate::tests::register("hda1", crate::drivers::hda::hda_tone_test_m0); crate::tests::register("hda2", crate::drivers::hda::hda_tone_test_m1); } // HDATONE5 M2: solo members; R77 M3 — the HDA tone is a `tests hda` run (HDATONE4); under tests-at-boot this registration runs it at once crate::drivers::hda::hda_tone_test); #[cfg(feature = "hda-tone")] { crate::tests::register("hda1", crate::drivers::hda::hda_tone_test_m0); crate::tests::register("hda2", crate::drivers::hda::hda_tone_test_m1); } #[cfg(feature = "hda-tone")] crate::tests::register("playwav", crate::drivers::hda::play::selftest); // HDATONE5 M2: solo members; R77 M3 — the HDA tone is a `tests hda` run (HDATONE4); under tests-at-boot this registration runs it at once
+    #[cfg(feature = "hda-tone")] crate::tests::register("hda", crate::drivers::hda::hda_tone_test_default); #[cfg(feature = "hda-tone")] { crate::tests::register("hdaboth", crate::drivers::hda::hda_tone_test_both); crate::tests::register("hda220", crate::drivers::hda::hda_tone_test_220); crate::tests::register("hda880", crate::drivers::hda::hda_tone_test_880); crate::tests::register("hda1", crate::drivers::hda::hda_tone_test_m0); crate::tests::register("hda2", crate::drivers::hda::hda_tone_test_m1); } #[cfg(feature = "hda-tone")] crate::tests::register("playwav", crate::drivers::hda::play::selftest); // HDATONE5 M2: solo members; R77 M3 — the HDA tone is a `tests hda` run (HDATONE4); under tests-at-boot this registration runs it at once
     crate::tests::register("winx-pulse", || pulsew_launcher(TESTS_DEMO_CPU.load(Ordering::Relaxed))); crate::tests::source_done(crate::tests::SRC_DESK); // R77 M3 — the last desktop source: the boot line may print now
 
     // SOCK-2 (knob-on, x86-only): chain the ring-3 UDP round-trip demo LAST — after the whole storage
@@ -29626,7 +29626,10 @@ pub fn act_kill(pid: u64) -> &'static str {
         }
     }
     let Some((slot, bg)) = found else { return "no such running process" };
+    #[cfg(feature = "login")]
     if !bg && !crate::fs::users::root_session() { return "denied: not yours"; }
+    #[cfg(not(feature = "login"))]
+    let _ = bg;
     wc_close_click(crate::video::wm::WIN_NONE, slot)
 }
 

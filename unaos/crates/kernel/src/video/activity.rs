@@ -165,7 +165,8 @@ fn take_census(prev_pres: &mut [u32; NPRES], dt_ms: u64) -> Census {
     c.heap_used = h.used;
     c.heap_free = h.free;
     c.wins = wm::live_window_count();
-    c.workers = super::wcpar::workers();
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    { c.workers = super::wcpar::workers(); }
     let mut total = 0u32;
     for i in 0..NPRES {
         let now = PRES[i].load(Ordering::Relaxed);
@@ -177,11 +178,14 @@ fn take_census(prev_pres: &mut [u32; NPRES], dt_ms: u64) -> Census {
     let per = |d: u32| -> u32 { if dt_ms == 0 { 0 } else { (d as u64 * 1000 / dt_ms) as u32 } };
     c.hot_pps = per(c.hot_pps);
     c.tot_pps = per(total);
-    let mut nm = [0u8; crate::fs::users::NAME_MAX];
-    if let Some(n) = crate::fs::users::whoami(&mut nm) {
-        let n = n.min(32);
-        c.user[..n].copy_from_slice(&nm[..n]);
-        c.ulen = n;
+    #[cfg(feature = "login")]
+    {
+        let mut nm = [0u8; crate::fs::users::NAME_MAX];
+        if let Some(n) = crate::fs::users::whoami(&mut nm) {
+            let n = n.min(32);
+            c.user[..n].copy_from_slice(&nm[..n]);
+            c.ulen = n;
+        }
     }
     if let Some((_, tag)) = crate::bootpace::last_stamp() { c.stage = tag; }
     c

@@ -29815,9 +29815,9 @@ fn resize_notify(owner: u64, w: usize, h: usize) {
     let ev = una_abi::input_ev_pack(una_abi::INPUT_EV_WIN_RESIZE, ((w as u64 & 0xFFFF) << 16) | (h as u64 & 0xFFFF));
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     let _ = !is_kernel_owner(owner) && crate::arch::x86_64::syscall::user_input_push_owner(owner, ev);
-    #[cfg(all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0")))]
+    #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
     let _ = !is_kernel_owner(owner) && crate::arch::aarch64::syscall::user_input_push_owner(owner, ev);
-    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0")))))]
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     let _ = (owner, ev);
 }
 
