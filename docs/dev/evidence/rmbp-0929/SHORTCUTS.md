@@ -25,5 +25,5 @@ F1/F2 (`f1-brightness-down` tokens), `prtsc` (PC table), the HID usages themselv
 F10-F12 volume. The table lists them as display text; they are not read from it.
 
 ## Written
-M1+M2+M3 written, not compiled (R76). Boot 17 should show `:: SHORTCUTS: entries=22 scopes=7 shown=22 -> PASS ::` after
+M1+M2+M3 written, not compiled (R76). Boot 17 should show `:: SHORTCUTS: entries=22 scopes=8 shown=22 -> PASS ::` after
 `tests shortcuts` (or `tests`), and `[shortcuts] overlay OPEN/CLOSE` lines.
