@@ -5991,7 +5991,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
             // On a real replay `took_screen` keeps the console off the freshly-blitted tiles.
         },
-        "tests" => { crate::tests::shell_verb(&args, console); } "tste" | "selftest" => {
+        #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))] "play" => { crate::drivers::hda::play::shell_verb(&args, &vfs_path(args.first().copied().unwrap_or("")), console); } "tests" => { crate::tests::shell_verb(&args, console); } "tste" | "selftest" => {
             // The in-OS self-test suite (TSTE-1). Prints a three-section PASS/FAIL/SKIP table in the
             // console (like `ps` — it does NOT take the screen) and mirrors every line to serial.
             crate::selftest::run(console, pal);
