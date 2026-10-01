@@ -973,3 +973,6 @@ FORBID :: SCROLLBACK: .* -> FAIL ::
 REQUIRE :: WINSNAP: zones=7 snaps=[0-9]+ restores=[0-9]+ preview_ok=true unsnaps=[0-9]+ left=true chords=true quarters=4 .* -> PASS ::
 FORBID :: WINSNAP: .* -> FAIL ::
 REQUIRE \[wm-act\] snap win=[0-9]+ zone=left rect=
+# ── TERMCOLOR (R75), TAIL-APPENDED — `tests termcolor`: per-cell SGR spans (<=16/line), erase-line / clear-screen / caret moves, 16+256+rgb palette
+REQUIRE :: TERMCOLOR: spans_max=16 sgr_ok=ok erase_ok=ok palette=16\+256\+rgb -> PASS ::
+FORBID :: TERMCOLOR: .* -> FAIL ::

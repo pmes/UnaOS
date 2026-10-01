@@ -26,6 +26,10 @@ pub struct Console {
     pub current_input: String,
     pub session: UserSession,
     history: alloc::vec::Vec<String>,
+    /// TERMCOLOR (R75) — parallel to `history`: line `i`'s run-length attribute spans (empty = plain, no allocation).
+    attrs: alloc::vec::Vec<alloc::vec::Vec<crate::termcolor::Span>>,
+    /// TERMCOLOR — the running SGR pen, carried across lines like a terminal's.
+    pen: crate::termcolor::Attr,
     /// Optional mirror for command-output lines (JD11). When set, every `println` line is also
     /// handed to this sink — the tegra console pump installs one that emits the line on the serial
     /// UART, so an attended Orin bench captures a durable, mbench-able output transcript instead of
@@ -67,6 +71,8 @@ impl Console {
             current_input: String::new(),
             session: UserSession::new(),
             history: alloc::vec::Vec::new(),
+            attrs: alloc::vec::Vec::new(),
+            pen: crate::termcolor::Attr::DEFAULT,
             out_sink: None,
             in_window: false,
             sel: crate::video::termsel::LineSel::new(),
@@ -113,6 +119,7 @@ impl Console {
         let _ = crate::termring::drain(|_| {});
         self.hist_base += self.history.len() as u64;
         self.history.clear();
+        self.attrs.clear();
         self.clear_abs = self.hist_base;
         self.view_off = 0;
         self.new_lines = 0;
@@ -125,12 +132,9 @@ impl Console {
     /// not make a producer wait, but a scrollback that discarded the newest line would stop showing
     /// the present.
     fn place(&mut self, text: &str) {
-        self.history.push(String::from(text));
-        if self.history.len() > Self::HISTORY_MAX {
-            self.history.remove(0);
-            self.hist_base += 1;
-        }
-        self.note_new(1);
+        // TERMCOLOR — escapes are parsed at ingest: the store keeps plain text + spans.
+        let n = push_parsed(&mut self.history, &mut self.attrs, &mut self.hist_base, &mut self.clear_abs, &mut self.pen, text);
+        self.note_new(n);
     }
 
     /// SCROLLBACK — `n` lines were appended. A scrolled-up view is ANCHORED (its offset grows with the tail so the rows on the glass do not move) and the marker counts them; the live view is untouched.
@@ -155,17 +159,10 @@ impl Console {
     /// array §3 describes rather than a second caller of this method, and it is a precondition to
     /// check before adding one, not a refactor to discover afterwards.
     pub fn drain_output(&mut self) -> u64 {
-        let history = &mut self.history;
-        let base = &mut self.hist_base;
-        let max = Self::HISTORY_MAX;
-        let n = crate::termring::drain(|line| {
-            history.push(String::from(line));
-            if history.len() > max {
-                history.remove(0);
-                *base += 1;
-            }
-        });
-        self.note_new(n as usize);
+        let (history, attrs, base, clear_abs, pen) = (&mut self.history, &mut self.attrs, &mut self.hist_base, &mut self.clear_abs, &mut self.pen);
+        let mut placed = 0usize;
+        let n = crate::termring::drain(|line| { placed += push_parsed(history, attrs, base, clear_abs, pen, line); });
+        self.note_new(placed);
         n
     }
 
@@ -287,7 +284,7 @@ impl Console {
             let (lo, hi) = (r * cols, r * cols + cols);
             let y = prompt_y + r * m.line_h;
             if lo < pc {
-                pal.draw_text(m.margin, y, prompt.get(lo..hi.min(pc)).unwrap_or(""), 0x00FF00); // Green Prompt
+                pal.draw_text(m.margin, y, prompt.get(lo..hi.min(pc)).unwrap_or(""), crate::video::theme::TERM_ACCENT); // TERMCOLOR: the prompt in the accent colour
             }
             let (a, b) = (lo.max(pc), hi.min(pc + len));
             if a < b {
@@ -317,6 +314,8 @@ impl Console {
     pub fn draw(&self, pal: &mut TargetPal) {
         let m = pal.metrics();
         pal.clear_screen(Self::BG);
+        GEOM_COLS.store(self.cols_for(m, pal.width() as usize), core::sync::atomic::Ordering::Relaxed); // TERMCOLOR M3 — TIOCGWINSZ's answer
+        GEOM_ROWS.store(self.history_rows_for(m, pal.width() as usize, pal.height() as usize) + 1, core::sync::atomic::Ordering::Relaxed);
 
         // Show the newest lines that fit (scroll the oldest off the top when full), top-down.
         // TERMWRAP M2: an entry is `visual_rows(len, cols)` rows, drawn one `cols`-wide chunk per row.
@@ -326,8 +325,13 @@ impl Console {
         let mut y = self.top_y(pal);
         for (i, line) in self.history.iter().enumerate().skip(skip).take(end - skip) {
             let rows = crate::video::termsel::visual_rows(line.chars().count(), cols);
+            let spans: &[crate::termcolor::Span] = self.attrs.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
             for r in 0..rows {
-                pal.draw_text(m.margin, y + r * m.line_h, crate::video::termsel::row_slice(line, r, cols), 0xAAAAAA);
+                if spans.is_empty() {
+                    pal.draw_text(m.margin, y + r * m.line_h, crate::video::termsel::row_slice(line, r, cols), crate::video::theme::TERM_FG);
+                } else {
+                    Self::draw_span_row(pal, m, y + r * m.line_h, line, spans, r, cols); // TERMCOLOR
+                }
             }
             // TERMSEL2 — a selection's band on a SCROLLBACK row, the same inverse video the editable
             // line gets (`draw_prompt_line`), read from the same model (`LineSel::cols_on`).
@@ -725,4 +729,73 @@ pub fn scrollback_selftest() {
         ":: SCROLLBACK: rows={} cols={} view_off={} marker_ok={} sel_ok={} clear_ok={} -> {} ::",
         Console::HISTORY_MAX, cols, view_off, t(marker_ok), t(sel_ok), t(clear_ok), if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// --- TERMCOLOR (R75) — ingest, the span painter, the style seam, the geometry ------------------------
+static GEOM_COLS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(80);
+static GEOM_ROWS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(25);
+/// The console's last painted geometry `(cols, rows)` — what a LINUXABI program's `TIOCGWINSZ` is told.
+pub fn geometry() -> (usize, usize) {
+    (GEOM_COLS.load(core::sync::atomic::Ordering::Relaxed).max(1), GEOM_ROWS.load(core::sync::atomic::Ordering::Relaxed).max(1))
+}
+
+/// Place one ingested line (escapes parsed) into the store; returns how many lines were appended (0 or 1).
+fn push_parsed(
+    history: &mut alloc::vec::Vec<String>, attrs: &mut alloc::vec::Vec<alloc::vec::Vec<crate::termcolor::Span>>,
+    base: &mut u64, clear_abs: &mut u64, pen: &mut crate::termcolor::Attr, text: &str,
+) -> usize {
+    let (line, spans) = if crate::termcolor::needs_parse(text, pen) {
+        let p = crate::termcolor::parse_line(pen, text);
+        if p.cleared { *clear_abs = *base + history.len() as u64; } // ESC[2J: the live view starts below everything so far
+        if p.cleared && p.text.is_empty() { return 0; }
+        (p.text, p.spans)
+    } else {
+        (String::from(text), alloc::vec::Vec::new())
+    };
+    history.push(line);
+    attrs.push(spans);
+    while history.len() > Console::HISTORY_MAX {
+        history.remove(0);
+        attrs.remove(0);
+        *base += 1;
+    }
+    1
+}
+
+impl Console {
+    /// Paint visual row `r` of `line` as attribute runs (bg rect first, then the glyph run).
+    fn draw_span_row(pal: &mut TargetPal, m: crate::ui::Metrics, y: usize, line: &str, spans: &[crate::termcolor::Span], r: usize, cols: usize) {
+        use crate::termcolor as tc;
+        let (lo, hi) = (r * cols, r * cols + cols);
+        let mut cuts: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(spans.len() + 2);
+        cuts.push(lo);
+        for s in spans { let st = s.start as usize; if st > lo && st < hi { cuts.push(st); } }
+        cuts.push(hi);
+        for w in cuts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let seg: String = line.chars().skip(a).take(b - a).collect();
+            if seg.is_empty() { break; }
+            let at = tc::attr_at(spans, a);
+            let x = m.margin + m.text_w(a - lo);
+            if at.bg & tc::SET != 0 {
+                pal.draw_rect(x, y, m.text_w(seg.chars().count()), m.cell_h, at.bg & 0x00FF_FFFF);
+            }
+            let mut fg = tc::resolve(at.fg, if at.bold { 0x00FF_FFFF } else { crate::video::theme::TERM_FG });
+            if at.bold && at.fg & tc::SET != 0 { fg = tc::lighten(fg); }
+            pal.draw_text(x, y, &seg, fg);
+        }
+    }
+
+    /// TERMCOLOR M2 — the SGR prefix for a palette pick (`theme::TERM_*`): `style(TERM_RED)` is `ESC[31m`.
+    pub fn style(fg: u8) -> String { format!("\x1b[{}m", fg) }
+    /// Print `text` in colour `fg` (one line; the pen is reset after it so the colour never leaks).
+    pub fn println_styled(&mut self, fg: u8, text: &str) {
+        let line = format!("{}{}\x1b[0m", Self::style(fg), text);
+        self.println(&line);
+    }
+    /// Lines in the live view (those since the last `clear` / `ESC[2J`).
+    pub fn live_rows(&self) -> usize { (self.hist_base + self.history.len() as u64).saturating_sub(self.clear_abs) as usize }
+    /// Line `i`'s attribute spans (fixture / test read).
+    pub fn spans_of(&self, i: usize) -> alloc::vec::Vec<crate::termcolor::Span> { self.attrs.get(i).cloned().unwrap_or_default() }
+    pub fn hist_base_for_fixture(&self) -> u64 { self.hist_base }
 }

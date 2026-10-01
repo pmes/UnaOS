@@ -772,3 +772,19 @@ pub const CAPTURE_DIR: &str = "Desktop";
 /// second theme lands: `dir=/home/una/Desktop` alone cannot be told from a Windows-shaped theme
 /// that happens to agree. Every line that prints [`CAPTURE_DIR`]'s consequence prints this first.
 pub const NAME: &str = "crispy";
+
+// --- TERMCOLOR (R75) — the terminal's 16-colour palette --------------------------------------------
+/// The console's default text colour (what an attribute-less cell paints).
+pub const TERM_FG: u32 = 0x00AA_AAAA;
+/// The prompt's colour on the Moonstone console ground — the accent, lifted so it reads on dark.
+pub const TERM_ACCENT: u32 = 0x007F_B2F0;
+/// ANSI 0..7 (normal) then 8..15 (bright), tuned for the dark `0x2D2B55` ground.
+pub const ANSI16: [u32; 16] = [
+    0x0000_0000, 0x00CD_3131, 0x000D_BC79, 0x00E5_E510, 0x0024_72C8, 0x00BC_3FBC, 0x0011_A8CD, 0x00E5_E5E5,
+    0x0066_6666, 0x00F1_4C4C, 0x0023_D18B, 0x00F5_F543, 0x003B_8EEA, 0x00D6_70D6, 0x0029_B8DB, 0x00FF_FFFF,
+];
+/// Named picks the shell's own output uses (`Console::style`).
+pub const TERM_RED: u8 = 31;
+pub const TERM_GREEN: u8 = 32;
+pub const TERM_BLUE: u8 = 94;
+pub const TERM_DIM: u8 = 90;

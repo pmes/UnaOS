@@ -141,11 +141,11 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     let ran = run(name);
     let (p, f) = (PASS.load(Ordering::Relaxed).wrapping_sub(p0), FAIL.load(Ordering::Relaxed).wrapping_sub(f0));
     if ran == 0 && name.is_some() {
-        console.println("tests: no such fixture (try `tests list`)");
+        console.println_styled(crate::video::theme::TERM_RED, "tests: no such fixture (try `tests list`)");
     } else {
         let mut names = alloc::string::String::new();
         for n in FAILED.lock().iter().flatten() { if !names.is_empty() { names.push(','); } names.push_str(n); }
-        console.println(&format!("tests: ran={} pass={} fail={} failed=[{}]", ran, p, f, names));
+        console.println_styled(if f == 0 { crate::video::theme::TERM_GREEN } else { crate::video::theme::TERM_RED }, &format!("tests: ran={} pass={} fail={} failed=[{}]", ran, p, f, names));
     }
 }
 
@@ -159,7 +159,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("shellux", crate::shellux::selftest); register("shortcuts", crate::video::shortcuts::selftest); register("scrollback", crate::console::scrollback_selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("shellux", crate::shellux::selftest); register("shortcuts", crate::video::shortcuts::selftest); register("scrollback", crate::console::scrollback_selftest); register("termcolor", crate::termcolor::selftest); }
     }
     // SETTINGS (R75): the settings fixture (open, idle=5, save, re-read, compare) beside it.
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]

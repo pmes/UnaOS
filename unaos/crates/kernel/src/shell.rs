@@ -621,7 +621,7 @@ fn fs_rm(console: &mut Console, arg: &str, force: bool) {
         Ok(()) => vfs_say(console, &alloc::format!("removed {}", path)),
         Err(VfsError::NoSuchPath) => {
             if !force {
-                console.println(&alloc::format!("rm: {}: not found (-ENOENT)", path));
+                console.println_styled(crate::video::theme::TERM_RED, &alloc::format!("rm: {}: not found (-ENOENT)", path));
             }
         }
         Err(e) => vfs_fail(console, "rm", &path, e),
@@ -928,7 +928,7 @@ fn fs_rm_recursive(console: &mut Console, arg: &str, force: bool) {
         Ok(s) => s,
         Err(VfsError::NoSuchPath) => {
             if !force {
-                console.println(&alloc::format!("rm: {}: not found (-ENOENT)", path));
+                console.println_styled(crate::video::theme::TERM_RED, &alloc::format!("rm: {}: not found (-ENOENT)", path));
             }
             return;
         }
@@ -1180,7 +1180,7 @@ fn fs_head(console: &mut Console, arg: &str, n: u32) {
         lines += 1;
     }
     if more || (lines < n && off < size) {
-        console.println(&alloc::format!("[... first {} line(s) shown]", lines));
+        console.println_styled(crate::video::theme::TERM_DIM, &alloc::format!("[... first {} line(s) shown]", lines));
     }
 }
 
@@ -1587,9 +1587,9 @@ fn vfs_print_rows(console: &mut Console, rows: &[crate::fs::vfs::DirEnt], long: 
         if matches!(de.kind, NodeKind::Dir) {
             dirs += 1;
             if long {
-                console.println(&alloc::format!("  <DIR>        {}  {}/", date, de.name));
+                console.println_styled(crate::video::theme::TERM_BLUE, &alloc::format!("  <DIR>        {}  {}/", date, de.name));
             } else {
-                console.println(&alloc::format!("  <DIR>         {}", de.name));
+                console.println_styled(crate::video::theme::TERM_BLUE, &alloc::format!("  <DIR>         {}", de.name));
             }
         } else {
             files += 1;
@@ -1636,7 +1636,7 @@ fn vfs_ls(console: &mut Console, arg: &str, long: bool) {
             }
         }
         Err(msg) => {
-            console.println(&alloc::format!("ls: {}", msg));
+            console.println_styled(crate::video::theme::TERM_RED, &alloc::format!("ls: {}", msg));
             serial_println!(":: ls1: {}: ERR {} ::", path, msg);
         }
     }
@@ -1678,7 +1678,7 @@ fn cat_globbed(console: &mut Console, arg: &str) {
             for r in &rows {
                 let child = vfs_join(&parent, &r.name);
                 if matches!(r.kind, NodeKind::Dir) {
-                    console.println(&alloc::format!("cat: {}: is a directory (-EISDIR)", child));
+                    console.println_styled(crate::video::theme::TERM_RED, &alloc::format!("cat: {}: is a directory (-EISDIR)", child));
                 } else {
                     vfs_cat(console, &child);
                 }
@@ -2556,7 +2556,7 @@ fn set_cmd(console: &mut Console, args: &[&str], rest: &str) {
     }
     if args[0] == "-u" {
         let Some(name) = args.get(1) else {
-            return console.println("usage: set -u <NAME>");
+            return console.println_styled(crate::video::theme::TERM_RED, "usage: set -u <NAME>");
         };
         let mut vars = ENV_VARS.lock();
         let before = vars.len();
@@ -2630,7 +2630,7 @@ fn which_report(console: &mut Console, word: &str) {
         if let Some(name) = midden_core::resolve_exec(word, &mut vol) {
             return console.println(&alloc::format!("{}: program {}", word, name));
         }
-        return console.println(&alloc::format!("{}: not found (no verb, no program)", word));
+        return console.println_styled(crate::video::theme::TERM_RED, &alloc::format!("{}: not found (no verb, no program)", word));
     }
     console.println(&alloc::format!(
         "{}: not a verb on this build (and this build cannot launch programs)", word));
@@ -2735,11 +2735,11 @@ fn fs_wc(console: &mut Console, args: &[&str]) {
         } else if path.is_none() {
             path = Some(a);
         } else {
-            return console.println("usage: wc [-l|-w|-c] <path>  (one path)");
+            return console.println_styled(crate::video::theme::TERM_RED, "usage: wc [-l|-w|-c] <path>  (one path)");
         }
     }
     let Some(path) = path else {
-        return console.println("usage: wc [-l|-w|-c] <path>");
+        return console.println_styled(crate::video::theme::TERM_RED, "usage: wc [-l|-w|-c] <path>");
     };
     if !want_l && !want_w && !want_c {
         want_l = true;
@@ -2865,7 +2865,7 @@ fn fs_grep(console: &mut Console, args: &[&str]) {
         }
     }
     if positional.len() != 2 {
-        return console.println("usage: grep [-i] [-n] [-v] [-c] <pattern> <path>");
+        return console.println_styled(crate::video::theme::TERM_RED, "usage: grep [-i] [-n] [-v] [-c] <pattern> <path>");
     }
     let (pat, path) = (positional[0], positional[1]);
     let opts = GrepOpts { ci, numbered, invert, count_only };
@@ -5123,7 +5123,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             #[cfg(not(any(all(any(feature = "baremetal", feature = "tegra_el0", feature = "virt_el0"), target_arch = "aarch64"), target_arch = "x86_64")))] // EL0-NAMING: NEGATED/RUNTIME — KEPT LONGHAND ON PURPOSE. Cargo feature implication is ONE-WAY: `baremetal`/`tegra_el0` imply `aarch64_el0`, not the reverse, so `not(aarch64_el0)` would diverge from this predicate for anyone who enabled `aarch64_el0` ALONE. No gate leg builds that combination, which is the trap — a byte-identity check over the legs would PASS while the hazard shipped. Positive sites are safe because implication runs their way; these are not.
             {
                 let _ = (&typed, &name);
-                console.println("Unknown command. Type 'help' for assistance.");
+                console.println_styled(crate::video::theme::TERM_RED, "Unknown command. Type 'help' for assistance.");
             }
             return false;
         }
@@ -5288,7 +5288,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // FAT-direct twin printing the same text), and JD12 glob expansion now walks the mount
             // table too — `cat *.TXT` reaches whichever volume the pattern's parent lives on.
             match args.first() {
-                None => console.println("usage: cat <path>"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: cat <path>"),
                 Some(name) if has_glob(name) => cat_globbed(console, name),
                 Some(name) => vfs_cat(console, name),
             }
@@ -5296,7 +5296,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "head" => {
             // JD12: print the FIRST n lines of a file (default 10). `head <path> [n]`.
             match args.first() {
-                None => console.println("usage: head <path> [lines]"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: head <path> [lines]"),
                 Some(path) => {
                     let n = args.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(10);
                     fs_head(console, path, n);
@@ -5306,7 +5306,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "tail" => {
             // JD12: print the LAST n lines of a file (default 10). `tail <path> [n]`.
             match args.first() {
-                None => console.println("usage: tail <path> [lines]"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: tail <path> [lines]"),
                 Some(path) => {
                     let n = args.get(1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(10);
                     fs_tail(console, path, n);
@@ -5319,7 +5319,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // an honest `N match(es), M dir(s) scanned` tally. Missing root → -ENOENT; a file root
             // degrades to a self-match test; a mid-walk read error reports the partial results.
             match args.len() {
-                0 => console.println("usage: find [root] <pattern>"),
+                0 => console.println_styled(crate::video::theme::TERM_RED, "usage: find [root] <pattern>"),
                 1 => fs_find(console, ".", args[0]),
                 _ => fs_find(console, args[0], args[1]),
             }
@@ -5388,14 +5388,14 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // Bounded twice: a deadline on `arch::ms()` and a spin cap for a clock that is frozen.
             match args.first().and_then(|s| parse_num(s)) {
                 Some(ms) => shell_sleep(console, ms),
-                None => console.println("usage: sleep <ms>  (decimal or 0x-hex, capped at 10000)"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: sleep <ms>  (decimal or 0x-hex, capped at 10000)"),
             }
         },
         "which" => {
             // Verb, program, or neither — answered through `midden_core`, never re-derived here.
             match args.first() {
                 Some(word) => which_report(console, word),
-                None => console.println("usage: which <word>"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: which <word>"),
             }
         },
         "stat" => {
@@ -5403,7 +5403,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // first cluster, FAT mtime, and the forensic dir-entry LBA + slot offset). Read-only; no
             // glob (a metacharacter resolves literally → -ENOENT). `stat /` reports the root honestly.
             match args.first() {
-                None => console.println("usage: stat <path>"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: stat <path>"),
                 Some(path) => fs_stat(console, path),
             }
         },
@@ -5414,7 +5414,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // capped at 4096). off/len accept decimal or 0x-hex. off past EOF = honest empty; a
             // directory = -EISDIR; an honest `[... n more byte(s)]` tail note when the file is larger.
             match args.first() {
-                None => console.println("usage: hexdump <path> [off] [len]"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: hexdump <path> [off] [len]"),
                 Some(path) => {
                     let off = args.get(1).and_then(|s| parse_num(s)).unwrap_or(0) as u32;
                     let len = args.get(2).and_then(|s| parse_num(s)).map(|n| n as usize).unwrap_or(256);
@@ -5430,7 +5430,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "setfattr" => {
             match (args.first().copied(), args.get(1).copied(), args.get(2).copied()) {
                 (Some("-x"), Some(key), Some(path)) => setfattr_x(console, key, path),
-                _ => console.println("usage: setfattr -x <key> <path>  (drop one typed attribute)"),
+                _ => console.println_styled(crate::video::theme::TERM_RED, "usage: setfattr -x <key> <path>  (drop one typed attribute)"),
             }
         },
         // RELICS (R26 clause 2): five spellings (`usnaps` `usnap` `usnapdrop` `usnapls` `usnapcat`)
@@ -5443,14 +5443,14 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "touch" => {
             // JD6: create a 0-length file if absent (idempotent), in any reachable dir. `touch <path>`.
             match args.first() {
-                None => console.println("usage: touch <path>"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: touch <path>"),
                 Some(name) => fs_touch(console, name),
             }
         },
         "append" => {
             // JD5: append text at EOF, creating the file if absent (like `>>`). `append <path> <text>`.
             match args.first() {
-                None => console.println("usage: append <path> <text>"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: append <path> <text>"),
                 Some(name) => fs_append(console, name, args[1..].join(" ").as_bytes()),
             }
         },
@@ -5465,7 +5465,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // quiet, and a no-match wildcard is quiet); bundled short flags parse (`rm -rf DIR`).
             let (recursive, force, _no_clobber, paths) = split_flags(&args);
             if paths.is_empty() {
-                console.println("usage: rm [-r] [-f] <path> [path ...]");
+                console.println_styled(crate::video::theme::TERM_RED, "usage: rm [-r] [-f] <path> [path ...]");
             } else if !paths.iter().any(|a| has_glob(a)) {
                 // No wildcard: delete each literal target (a single non-recursive/non-force arg is
                 // byte-identical to pre-JD14).
@@ -5479,14 +5479,14 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "mkdir" | "md" => {
             // JD7: create a directory in any reachable parent (name exists → -EEXIST). `mkdir <path>`.
             match args.first() {
-                None => console.println("usage: mkdir <path>"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: mkdir <path>"),
                 Some(name) => fs_mkdir(console, name),
             }
         },
         "rmdir" | "rd" => {
             // JD7: remove an EMPTY directory (non-empty → -ENOTEMPTY; root refused). `rmdir <path>`.
             match args.first() {
-                None => console.println("usage: rmdir <path>"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: rmdir <path>"),
                 Some(name) => fs_rmdir(console, name),
             }
         },
@@ -5503,7 +5503,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // this arch) but nothing else does — see `read_el0_image`'s x86 twin for the path rules.
             // `run /apps/VUG.ELF` and `run VUG.ELF` both reach the DATA volume's `APPS/` there.
             match args.first() {
-                None => console.println("usage: run <path>   (load + execute an ELF64 user program)"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: run <path>   (load + execute an ELF64 user program)"),
                 Some(&path) => run_program(console, path),
             }
         },
@@ -5518,7 +5518,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             let (recursive, force_raw, no_clobber, paths) = split_flags(&args);
             let force = force_raw && !no_clobber; // `-n` (no-clobber) overrides `-f` for safety
             if paths.len() < 2 {
-                console.println("usage: cp [-r] [-f|-n] <src...> <dst>");
+                console.println_styled(crate::video::theme::TERM_RED, "usage: cp [-r] [-f|-n] <src...> <dst>");
             } else if paths.len() == 2 && !has_glob(paths[0]) && !has_glob(paths[1]) {
                 // No wildcard, one src: byte-identical to pre-JD12 cp (plus the JD14 no-clobber default).
                 if recursive {
@@ -5544,7 +5544,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             let (_recursive, force_raw, no_clobber, paths) = split_flags(&args);
             let force = force_raw && !no_clobber; // `-n` (no-clobber) overrides `-f` for safety
             if paths.len() < 2 {
-                console.println("usage: mv [-f|-n] <src...> <dst>");
+                console.println_styled(crate::video::theme::TERM_RED, "usage: mv [-f|-n] <src...> <dst>");
             } else if paths.len() == 2 && !has_glob(paths[0]) && !has_glob(paths[1]) {
                 // No wildcard, one src: byte-identical to pre-JD12 mv (plus the JD14 flag parse).
                 fs_mv(console, paths[0], paths[1], force);
@@ -5565,13 +5565,13 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         "wallpaper" => {
             let arg = args.first().copied().unwrap_or("");
             if arg.is_empty() {
-                console.println("usage: wallpaper <path.png> | wallpaper off");
+                console.println_styled(crate::video::theme::TERM_RED, "usage: wallpaper <path.png> | wallpaper off");
             } else {
                 let resolved = if arg == "off" { String::new() } else { vfs_path(arg) };
                 console.println(&crate::video::wallpaper::cmd(arg, &resolved));
             }
         },
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))] "shot" => { let w = args.first().copied().unwrap_or(""); if w == "region" || w == "window" { if crate::video::shotsel::enter(w == "window") { console.println("shot: selection mode — drag (region) or click (window); Esc cancels"); } else { console.println("shot: no desktop panel"); } } else { console.println("usage: shot region | shot window"); } }, "screenshot" => {
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] "shot" => { let w = args.first().copied().unwrap_or(""); if w == "region" || w == "window" { if crate::video::shotsel::enter(w == "window") { console.println("shot: selection mode — drag (region) or click (window); Esc cancels"); } else { console.println("shot: no desktop panel"); } } else { console.println_styled(crate::video::theme::TERM_RED, "usage: shot region | shot window"); } }, "screenshot" => {
             // PRTSCR: capture the panel to `SCREEN<n>.PNG` at the volume root. The whole mechanism
             // lives in `video::prtscr` because the Print Screen KEY reaches the same function from
             // the device-service pass — a verb that reimplemented any of it would be a second
@@ -5605,7 +5605,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         // did the read-only half of an interactive tool would be teaching the wrong reflex.
         #[cfg(feature = "installdemo")] "install" => { if args.first().copied() == Some("ssd") { #[cfg(all(target_arch = "x86_64", feature = "ahci"))] crate::install::selfinstall::verb(&mut |s: &str| console.println(s), &args[1..]); #[cfg(not(all(target_arch = "x86_64", feature = "ahci")))] console.println("install ssd: this build has no SATA driver (UNAOS_AHCI=1)"); } else { install_verb(console, &args); } } "fdisk" => { // INSTALLVERB (rmbp-ledger B89 fourth rung, B91): the OPERATOR path to PARTINSTALL. `install` alone is a read-only census over every registered disk carrying the refusal each partition would give; `install <disk> <slot> [--as-esp]` installs into that ONE partition through `install::partition::install_into_partition`. There is NO whole-disk spelling — the block at this file's tail says why the grammar refuses to admit one (R25). ⚠ SAME-LINE fold, LINE-NEUTRAL: `shell.rs` is compiled into every image and one added source line would move every `panic::Location` record below it (LEDGER P7); the body is a FILE-TAIL append, where nothing below it can move. Knob-off (`installdemo` absent) this arm is `cfg`-erased and `midden_core::HOST_VERBS` does not carry the word either, so the image is byte-identical.
             if args.first().copied() != Some("-l") {
-                console.println("usage: fdisk -l  (list block devices; no partition editor here)");
+                console.println_styled(crate::video::theme::TERM_RED, "usage: fdisk -l  (list block devices; no partition editor here)");
                 return took_screen;
             }
             // PI-FS-5: on the Pi report BOTH storage devices — the SD card (emmc2, the global block device that
@@ -5729,7 +5729,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 }
                 (None, Some(_), None) => console.println("dd: of= needs byte=<0xNN>  (no source given)"),
                 (Some(_), Some(_), _) => console.println("dd: if= and of= together are not supported"),
-                _ => console.println("usage: dd if=<lba> | dd of=<lba> byte=<0xNN>  (ONE 512-byte block)"),
+                _ => console.println_styled(crate::video::theme::TERM_RED, "usage: dd if=<lba> | dd of=<lba> byte=<0xNN>  (ONE 512-byte block)"),
             }
         },
         "write" => {
@@ -5737,7 +5737,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // (create-or-truncate; text = the rest of the line, whitespace-collapsed like `echo`).
             // The raw-block overload that used to live here is `dd` — see that arm.
             match args.first() {
-                None => console.println("usage: write <path> <text>"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: write <path> <text>"),
                 Some(name) => fs_write(console, name, args[1..].join(" ").as_bytes()),
             }
         },
@@ -5838,7 +5838,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         None => console.println("No network device ready."),
                     }
                 }
-                None => console.println("usage: ping <a.b.c.d> [count]"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: ping <a.b.c.d> [count]"),
             }
         },
         "arp" => {
@@ -5859,7 +5859,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         None => console.println("no ARP reply (host unreachable / no NIC)"),
                     }
                 }
-                None => console.println("usage: arp <a.b.c.d>"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: arp <a.b.c.d>"),
             }
         }, #[cfg(all(feature = "net6", target_arch = "aarch64"))] "dns" => net6_shell_dns(console, args.first().copied()), // NET6 — the third verb the arc owes: an A-record lookup through the SHARED `crate::net_dns` builder/parser over the stack's own UDP socket, at the DHCP-offered nameserver (the gateway when the lease carried none). Emits `:: NET6: dns <host> -> A a.b.c.d (server s.s.s.s) ::` or a TYPED failure (SERVER ERROR rcode / NO A RECORD / MALFORMED REPLY / NO ANSWER), so a boot log distinguishes "the resolver said no" from "nothing came back". The ARM is `net6`+aarch64-gated rather than universal, and that is a deliberate, measured compromise, not an oversight: `knoboff` compares the x86 image too, and a new verb there would add a string and a call to the SHIPPED x86 build for a resolver x86 reaches another way (`smolnet::resolve`, used by the SNTP client). An x86 `dns` verb is owed and is a one-line arc. ⚠ LINE-NEUTRAL append — an arm on the existing closing line, body at the FILE TAIL.
         // RELICS (R26 clause 1): `connect` and `udpsend` were TWO verbs for one job — open a
@@ -5892,7 +5892,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                             None => console.println("No network device ready."),
                         }
                     }
-                    _ => console.println("usage: nc -u <a.b.c.d> <port> [message]"),
+                    _ => console.println_styled(crate::video::theme::TERM_RED, "usage: nc -u <a.b.c.d> <port> [message]"),
                 }
                 return took_screen;
             }
@@ -5914,7 +5914,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         None => console.println("No network device ready."),
                     }
                 }
-                _ => console.println("usage: nc [-u] <a.b.c.d> <port> [message]"),
+                _ => console.println_styled(crate::video::theme::TERM_RED, "usage: nc [-u] <a.b.c.d> <port> [message]"),
             }
         },
         // RELICS (R26 clause 1): `get` was ours; an HTTP/1.0 GET over a socket, printed to the
@@ -5967,7 +5967,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                         None => console.println("No network device ready."),
                     }
                 }
-                _ => console.println("usage: curl [http://]<a.b.c.d>[:port][/path]  (HTTP/1.0 GET)"),
+                _ => console.println_styled(crate::video::theme::TERM_RED, "usage: curl [http://]<a.b.c.d>[:port][/path]  (HTTP/1.0 GET)"),
             }
         },
         // The in-kernel 3D sculptor. Aarch64 only, matching `crate::vug`: the whole arm vanishes on
@@ -6178,7 +6178,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // walk — this is what turns the WC-TAB binding into a workflow: `run` blocks until its app
             // dies, so real windows never coexisted before this verb). `bg <path>`.
             match args.first() {
-                None => console.println("usage: bg <path>   (run an ELF64 user program in the background)"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: bg <path>   (run an ELF64 user program in the background)"),
                 Some(&path) => {
                     bg_program(console, path);
                 }
@@ -6368,7 +6368,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // sibling threads die with it; unconfirmed kills park the row PORPHANED and settle at the
             // task's next boundary). `kill <pid>`.
             match args.first().and_then(|s| s.parse::<u64>().ok()) {
-                None => console.println("usage: kill <pid>   (see `jobs` for pids)"),
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: kill <pid>   (see `jobs` for pids)"),
                 Some(pid) => bg_kill_cmd(console, pid),
             }
         },
@@ -7572,7 +7572,7 @@ fn vfs_cmd(console: &mut Console, args: &[&str]) {
     let op = match args.first() {
         Some(&o) => o,
         None => {
-            console.println("usage: mount <write|append|rm|mkdir> <path> [text ...]");
+            console.println_styled(crate::video::theme::TERM_RED, "usage: mount <write|append|rm|mkdir> <path> [text ...]");
             console.println("  bare `mount` lists the namespace: prefix, volume, capacity, access");
             return;
         }
@@ -7644,15 +7644,15 @@ fn snap_cmd(console: &mut Console, args: &[&str]) {
             }
         }
         Some("create") => match args.get(1).copied() {
-            None => console.println("usage: snap create <name>"),
+            None => console.println_styled(crate::video::theme::TERM_RED, "usage: snap create <name>"),
             Some(name) => console.println(&unafs_verb_snap(name)),
         },
         Some("drop") => match args.get(1).copied().and_then(|s| s.parse::<u64>().ok()) {
-            None => console.println("usage: snap drop <generation>"),
+            None => console.println_styled(crate::video::theme::TERM_RED, "usage: snap drop <generation>"),
             Some(generation) => console.println(&unafs_verb_snapdrop(generation)),
         },
         Some("ls") => match args.get(1).copied().and_then(|s| s.parse::<u64>().ok()) {
-            None => console.println("usage: snap ls <generation> [path]"),
+            None => console.println_styled(crate::video::theme::TERM_RED, "usage: snap ls <generation> [path]"),
             Some(generation) => {
                 let path = args.get(2).copied().unwrap_or("/");
                 for line in &unafs_verb_snapls(generation, path) {
@@ -7665,7 +7665,7 @@ fn snap_cmd(console: &mut Console, args: &[&str]) {
             args.get(2).copied(),
         ) {
             (Some(generation), Some(path)) => console.println(&unafs_verb_snapcat(generation, path)),
-            _ => console.println("usage: snap cat <generation> <path>"),
+            _ => console.println_styled(crate::video::theme::TERM_RED, "usage: snap cat <generation> <path>"),
         },
         Some(other) => {
             console.println(&alloc::format!("snap: unknown subcommand '{}'", other));
@@ -7915,7 +7915,7 @@ fn net6_shell_arp(ip: [u8; 4]) -> Option<[u8; 6]> {
 #[cfg(all(feature = "net6", target_arch = "aarch64"))]
 fn net6_shell_dns(console: &mut Console, host: Option<&str>) {
     match host {
-        None => console.println("usage: dns <hostname>"),
+        None => console.println_styled(crate::video::theme::TERM_RED, "usage: dns <hostname>"),
         Some(h) => {
             let server = crate::net_phy::net6::resolver();
             match server {
@@ -8395,7 +8395,7 @@ fn install_verb(console: &mut Console, args: &[&str]) {
         for (name, id) in &disks {
             install_census_disk(console, name, *id);
         }
-        console.println("usage: install <disk> <slot> [--as-esp]   (one partition; never a whole disk)");
+        console.println_styled(crate::video::theme::TERM_RED, "usage: install <disk> <slot> [--as-esp]   (one partition; never a whole disk)");
         return;
     }
     // --- the acting form. ---
@@ -8621,7 +8621,7 @@ pub(crate) fn lfnmv_witness(arch: &str, sys_rc: i64, sys_want: i64) {
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn view_verb(console: &mut Console, path: Option<&str>) {
     let Some(p) = path else {
-        console.println("usage: view <path>   (open a text file in a read-only window)");
+        console.println_styled(crate::video::theme::TERM_RED, "usage: view <path>   (open a text file in a read-only window)");
         return;
     };
     let full = normalize_path(&cwd_path(), p);
@@ -8645,7 +8645,7 @@ fn shell_fetch(args: &[&str], console: &mut Console) {
     let to_console = args.first().copied() == Some("-");
     let rest: &[&str] = if to_console { &args[1..] } else { args };
     let Some(&url_s) = rest.first() else {
-        return console.println("usage: fetch <http-url> [<dest-path>]   |   fetch - <http-url>");
+        return console.println_styled(crate::video::theme::TERM_RED, "usage: fetch <http-url> [<dest-path>]   |   fetch - <http-url>");
     };
     let Some(url) = nf::parse_url(url_s) else {
         return console.println("fetch: bad URL (want http://host[:port]/path; https is not supported)");
@@ -8809,7 +8809,7 @@ pub(crate) fn cwd_now() -> String { cwd_path() }
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn edit_verb(console: &mut Console, path: Option<&str>) {
     let Some(p) = path else {
-        console.println("usage: edit <path>   (edit a text file under /home/<user>; Ctrl-S saves)");
+        console.println_styled(crate::video::theme::TERM_RED, "usage: edit <path>   (edit a text file under /home/<user>; Ctrl-S saves)");
         return;
     };
     let full = normalize_path(&cwd_path(), p);
