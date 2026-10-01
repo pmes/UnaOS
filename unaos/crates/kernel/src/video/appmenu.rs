@@ -62,10 +62,14 @@ fn owner_of_row(row: usize) -> Option<u64> {
     if row < crate::arch::memory::USER_SLOTS { Some(row as u64 + 1) } else { None }
 }
 /// aarch64 (ARMROUTER): the wm owner IS the asid, and the bus passes the sender's asid as `row`.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0")))]
 fn owner_of_row(row: usize) -> Option<u64> {
     if row >= 1 && row <= crate::arch::aarch64::uslots::USER_SLOTS { Some(row as u64) } else { None }
 }
+
+/// aarch64 desktop with no EL0 chain (no `uslots`, no syscall module): there are no owners to name.
+#[cfg(all(target_arch = "aarch64", not(any(feature = "baremetal", feature = "tegra_el0"))))]
+fn owner_of_row(_row: usize) -> Option<u64> { None }
 
 fn slot_of(asid: u64) -> Option<usize> {
     (0..SLOTS).find(|&k| OWN[k].load(Ordering::Acquire) == asid)
@@ -170,9 +174,11 @@ fn pick_slot(k: usize, id: u32) {
     #[cfg(target_arch = "x86_64")]
     let delivered = asid != 0
         && crate::arch::x86_64::syscall::user_input_push_owner(asid, una_abi::input_ev_pack(INPUT_EV_MENU_PICK, id as u64));
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra_el0")))]
     let delivered = asid != 0
         && crate::arch::aarch64::syscall::user_input_push_owner(asid, una_abi::input_ev_pack(INPUT_EV_MENU_PICK, id as u64));
+    #[cfg(all(target_arch = "aarch64", not(any(feature = "baremetal", feature = "tegra_el0"))))]
+    let delivered = false;
     serial_println!("[menubar] pick owner={} item={} delivered={}", asid, id, delivered);
 }
 

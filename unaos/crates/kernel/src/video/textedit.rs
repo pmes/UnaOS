@@ -30,7 +30,7 @@ use crate::video::{font, theme, wm};
 pub const OWNER: u64 = wm::KERNEL_OWNER_BASE + 6;
 const _: () = assert!(OWNER != wm::KERNEL_OWNER_CONSOLE && OWNER != wm::KERNEL_OWNER_DESKTOP);
 const _: () = assert!(OWNER != super::fileview::OWNER);
-const _: () = assert!(OWNER != super::quarry::live::OWNER);
+#[cfg(feature = "quarry")] const _: () = assert!(OWNER != super::quarry::live::OWNER);
 
 pub const MAX_BYTES: usize = 256 * 1024;
 const CHUNK: usize = 16 * 1024;
