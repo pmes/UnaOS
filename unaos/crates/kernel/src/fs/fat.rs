@@ -6915,22 +6915,31 @@ fn pend_write_locked() {
     DIRENT_WRITES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Flush the deferred dir entry (blocking). Safe to call any time; a no-op when nothing is pending.
+/// Flush the deferred dir entry (blocking). `by` names the trigger for the `[fs] dirent flushed by=` line
+/// (shutdown|close|sync|idle|read). A no-op (silent) when nothing is pending.
 #[allow(dead_code)]
-pub fn flush_pending_dirent() {
+pub fn flush_pending_dirent_by(by: &str) {
     if !PEND_VALID.load(Ordering::Acquire) { return; }
     pend_lock(true);
+    let had = PEND_VALID.load(Ordering::Acquire);
     pend_write_locked();
     PEND_LOCK.store(false, Ordering::Release);
+    if had { serial_println!("[fs] dirent flushed by={}", by); }
 }
+
+/// `flush_pending_dirent_by("close")` — for a writer that has produced its last span.
+#[allow(dead_code)]
+pub fn flush_pending_dirent() { flush_pending_dirent_by("close"); }
 
 /// Non-blocking flush for the card read path's idle hook (never spins, never re-enters a flush in progress).
 #[allow(dead_code)]
 pub fn flush_pending_dirent_try() {
     if !PEND_VALID.load(Ordering::Acquire) { return; }
     if !pend_lock(false) { return; }
+    let had = PEND_VALID.load(Ordering::Acquire);
     pend_write_locked();
     PEND_LOCK.store(false, Ordering::Release);
+    if had { serial_println!("[fs] dirent flushed by=idle"); }
 }
 
 /// Every FatFs read funnels here: a read covering the deferred entry's sector writes it first.
@@ -6938,7 +6947,7 @@ pub fn flush_pending_dirent_try() {
 fn pend_flush_if_covers(lba: u64, n: u64) {
     if !PEND_VALID.load(Ordering::Acquire) { return; }
     let p = PEND_LBA.load(Ordering::Relaxed);
-    if p >= lba && p < lba + n { flush_pending_dirent(); }
+    if p >= lba && p < lba + n { flush_pending_dirent_by("read"); }
 }
 
 impl FatFs {

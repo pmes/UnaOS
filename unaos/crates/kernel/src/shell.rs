@@ -5557,7 +5557,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // JD5-M3: storage is WRITE-THROUGH — block::write_block issues a synchronous BOT WRITE(10)
             // (USB) / polled CMD24 (SD) that completes before the command returns, so there is no
             // write-back cache to flush. `sync` is the honest confirmation of that (a no-op by design).
-            console.println("sync: write-through storage — every write is already durable on the card");
+            crate::fs::fat::flush_pending_dirent_by("sync"); console.println("sync: write-through storage — every write is already durable on the card");
         },
         // WALLPAPER (rmbp-0929): `wallpaper <path>` decodes a PNG (<= 4 MB) into the desktop backdrop live; `wallpaper off`
         // restores the flat colour. Whole mechanism in `video::wallpaper`; the witness line is its `:: WALLPAPER: ... ::`.
