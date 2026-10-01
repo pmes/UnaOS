@@ -793,3 +793,58 @@ mod appmenu_tests {
         std::println!(":: APPMENU: abi items={} wire_bytes={} cap_bytes={} body_max={} -> PASS ::", MENU_ITEMS_MAX, MENU_ITEM_LEN, MENU_ITEMS_MAX * MENU_ITEM_LEN, BUS_BODY_MAX);
     }
 }
+
+// =================================================================================================
+// BANDY3 (ROADMAP §3b, the fulfiller seam) — fulfiller registration on the wire. A ring-3 program
+// registers the verb tags it fulfils; the kernel relays a caller's request to it re-stamped with the
+// CALLER's principal (the kernel's stamp, never the caller's claim) and relays the fulfiller's answer
+// back as a KERNEL-stamped reply. The verb space splits at 128: `1..=127` is the kernel's (a register
+// of any of them is `-EEXIST` — kernel fulfilment wins); `128..=255` is registrable. The correlation id
+// of a relay rides the header's `corr` field of the frame the kernel BUILDS for the fulfiller (the
+// header is unchanged; see docs/dev/evidence/rmbp-1001/BANDY3.md). Appended at the file tail.
+// =================================================================================================
+
+/// Bus verb: register this row as the fulfiller of the verb tags in the body (1..=
+/// [`BUS_REG_MAX_PER_ROW`] tags, one byte each, all `>=` [`BUS_VERB_FULFIL_MIN`], no duplicates). Reply:
+/// an empty status-0 frame, or `-EINVAL` / [`EEXIST`] / [`ENOSPC`]. A kernel-owned tag at the top of the
+/// kernel range, clear of the next-free counter the in-kernel verbs mint from.
+pub const BUS_VERB_REGISTER: u8 = 127;
+/// The first REGISTRABLE verb tag. Every tag below it is the kernel's.
+pub const BUS_VERB_FULFIL_MIN: u8 = 128;
+/// Registrations one row may hold.
+pub const BUS_REG_MAX_PER_ROW: usize = 8;
+/// Principia's preference read: body = the dotted key bytes; reply body = the value text. Read-only in
+/// v1. The PREFS arc names the same verb; the numbers reconcile at the fold.
+pub const BUS_VERB_PREF_GET: u8 = 128;
+/// Principia's preference listing: body = a key prefix (may be empty); reply body = `key=value\n` lines.
+pub const BUS_VERB_PREF_LIST: u8 = 129;
+
+/// File exists — and, on the bus, "that verb already has a fulfiller" (the kernel, or another live row).
+pub const EEXIST: i64 = -17;
+/// No space — a full registration table, or a row over [`BUS_REG_MAX_PER_ROW`].
+pub const ENOSPC: i64 = -28;
+/// Connection reset — the fulfiller a caller was waiting on exited before it answered.
+pub const ECONNRESET: i64 = -104;
+
+const _: () = assert!(BUS_VERB_REGISTER < BUS_VERB_FULFIL_MIN);
+const _: () = assert!(BUS_VERB_NOTICE < BUS_VERB_REGISTER && BUS_VERB_MENU_GET < BUS_VERB_REGISTER);
+const _: () = assert!(BUS_VERB_PREF_GET >= BUS_VERB_FULFIL_MIN && BUS_VERB_PREF_LIST >= BUS_VERB_FULFIL_MIN);
+const _: () = assert!(BUS_REG_MAX_PER_ROW <= u8::MAX as usize);
+
+#[cfg(test)]
+mod bandy3_tests {
+    extern crate std;
+    use super::*;
+    #[test]
+    fn bandy3_verb_space() {
+        // Every in-kernel verb is below the register tag; the registrable range starts right after it.
+        for v in [BUS_VERB_LS, BUS_VERB_CAT, BUS_VERB_CP, BUS_VERB_WRITE, BUS_VERB_RM, BUS_VERB_MV, BUS_VERB_NOTICE, BUS_VERB_MENU_PUBLISH, BUS_VERB_MENU_CLEAR, BUS_VERB_MENU_GET] {
+            assert!(v < BUS_VERB_REGISTER);
+        }
+        assert_eq!(BUS_VERB_FULFIL_MIN, BUS_VERB_REGISTER + 1);
+        assert_ne!(BUS_VERB_PREF_GET, BUS_VERB_PREF_LIST);
+        // A full registration body fits a frame with room.
+        assert!(BUS_REG_MAX_PER_ROW < BUS_BODY_MAX);
+        std::println!(":: BANDY3: abi register={} fulfil_min={} pref_get={} pref_list={} max_per_row={} -> PASS ::", BUS_VERB_REGISTER, BUS_VERB_FULFIL_MIN, BUS_VERB_PREF_GET, BUS_VERB_PREF_LIST, BUS_REG_MAX_PER_ROW);
+    }
+}

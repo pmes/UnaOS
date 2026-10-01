@@ -85,7 +85,7 @@ pub fn verb_valid(verb: u8) -> bool {
     matches!(
         verb,
         BUS_VERB_LS | BUS_VERB_CAT | BUS_VERB_CP | BUS_VERB_WRITE | BUS_VERB_RM | BUS_VERB_MV | BUS_VERB_NOTICE | una_abi::BUS_VERB_MENU_PUBLISH | una_abi::BUS_VERB_MENU_CLEAR | una_abi::BUS_VERB_MENU_GET
-    )
+    ) || (cfg!(feature = "busreg") && (verb == una_abi::BUS_VERB_REGISTER || verb >= una_abi::BUS_VERB_FULFIL_MIN)) // BANDY3: the register verb + the registrable range, ONLY under `busreg` (knob off: refused exactly as before). LINE-NEUTRAL: folded onto the matches! close.
 }
 
 /// 8.3 name bound — mirrors syscall.rs MAX_NAME (the sys_open bound the equivalence witness

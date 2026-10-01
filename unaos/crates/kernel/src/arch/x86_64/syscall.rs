@@ -15103,7 +15103,7 @@ pub fn clear_handle_row(slot: usize) {
     // keeps the bounded table self-cleaning and enforces the owner-exit-reverts-to-public rule. Before
     // `clear_files_row` (the open-descriptor decrefs) — order-independent (a separate lock), placed here for
     // adjacency with the file teardown (the aarch64 `owned_clear_owner_asid` twin).
-    owned_clear_owner_slot(slot); busx_mbox_clear(slot); // BUSX86: drain this row's bus mailbox alongside its handles, owner rows and inbox. It lands AFTER the `SLOT_GEN` bump at the top of this function, which is what makes it sufficient rather than merely tidy: every queued reply carries the recipient's generation and `busx_mbox_pop` discards a stale-gen frame, so a reply enqueued in the window between the bump and this drain is already dead-on-arrival for the row's next tenant. The aarch64 twin drains at the same point in `clear_handle_row` for the same reason. ⚠ SAME-LINE fold.
+    owned_clear_owner_slot(slot); busx_mbox_clear(slot); #[cfg(feature = "busreg")] crate::bus_route::on_exit(&BUSREG_OPS, slot); // BUSX86: drain this row's bus mailbox alongside its handles, owner rows and inbox. It lands AFTER the `SLOT_GEN` bump at the top of this function, which is what makes it sufficient rather than merely tidy: every queued reply carries the recipient's generation and `busx_mbox_pop` discards a stale-gen frame, so a reply enqueued in the window between the bump and this drain is already dead-on-arrival for the row's next tenant. The aarch64 twin drains at the same point in `clear_handle_row` for the same reason. ⚠ SAME-LINE fold.
     // U6bx: the slot's open-FILE row rides the same teardown (handles first, so no File handle can name a
     // descriptor this wipe has already freed) — covers both the exit and the fault-kill path, exactly like
     // the handles (the aarch64 `clear_handle_row` -> `clear_files_row` twin).
@@ -25038,14 +25038,14 @@ fn busx_msend_for(row: usize, cgen: u64, frame: &[u8]) -> i64 {
         Ok(h) => h,
         Err(_) => return EINVAL,
     };
-    if hdr.kind != crate::bus::BUS_KIND_REQUEST || crate::bus::request_validate(&hdr).is_err() {
+    #[cfg(feature = "busreg")] { if hdr.kind == crate::bus::BUS_KIND_REPLY { return crate::bus_route::fulfiller_reply(&BUSREG_OPS, row, cgen, &hdr, frame); } } if hdr.kind != crate::bus::BUS_KIND_REQUEST || crate::bus::request_validate(&hdr).is_err() { // BANDY3: under `busreg` a ring-3 REPLY frame is legal only as a fulfiller's answer to a relay it holds (bus_route.rs)
         return EINVAL; // a REPLY frame, a nonzero status, or a CALLER-SUPPLIED PRINCIPAL — rejected
     }
     let body = &frame[crate::bus::BUS_HDR_LEN..];
     if row >= BUSX_MBOX.len() || !busx_mbox_has_room(row) {
         return EAGAIN; // capacity BEFORE fulfillment — a side effect must never lose its reply
     }
-    let mut text: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut text: alloc::vec::Vec<u8> = alloc::vec::Vec::new(); #[cfg(feature = "busreg")] { match crate::bus_route::route_request(&BUSREG_OPS, row, cgen, crate::bus_route::row_principal(row, cgen), &hdr, body) { crate::bus_route::Route::Kernel => {} crate::bus_route::Route::Relayed => return 0, crate::bus_route::Route::Reply(st) => return busx_reply_enqueue(row, hdr.corr, hdr.verb, st, &[]) } }
     let status = match hdr.verb {
         crate::bus::BUS_VERB_LS => busx_ls(&mut text),
         crate::bus::BUS_VERB_CAT => match crate::bus::cat_body_parse(body) {
@@ -29813,4 +29813,63 @@ pub fn winresize_selftest() {
         zones, strip_clear, wm::RS_MIN_W, wm::RS_MIN_H, drags, clamped, drag_ok, clamp_ok, min_ok, aspect_ok, keys_ok,
         if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// =================================================================================================
+// BANDY3 (ROADMAP §3b, the fulfiller seam): this arch's thin half of `crate::bus_route` — the mailbox
+// ops table the router drives (HANDLES row + SLOT_GEN keyed, the existing BUSX_MBOX / BUSX_SEM), and the
+// `tests bandy3` fixture's hooks over the PRODUCTION `busx_msend_for`. Appended at the file tail.
+// =================================================================================================
+#[cfg(feature = "busreg")]
+fn busreg_push(row: usize, frame: alloc::boxed::Box<[u8]>) -> bool {
+    if row >= BUSX_MBOX.len() {
+        return false;
+    }
+    busx_sem_init_once();
+    let rgen = SLOT_GEN[row].load(Ordering::Acquire);
+    if !busx_mbox_push(row, rgen, frame) {
+        return false;
+    }
+    BUSX_SEM[row].post();
+    true
+}
+#[cfg(feature = "busreg")]
+fn busreg_has_room(row: usize) -> bool {
+    row < BUSX_MBOX.len() && busx_mbox_has_room(row)
+}
+#[cfg(feature = "busreg")]
+fn busreg_gen(row: usize) -> u64 {
+    if row < SLOT_GEN.len() { SLOT_GEN[row].load(Ordering::Acquire) } else { u64::MAX }
+}
+#[cfg(feature = "busreg")]
+static BUSREG_OPS: crate::bus_route::Ops = crate::bus_route::Ops { push: busreg_push, has_room: busreg_has_room, rgen: busreg_gen };
+
+#[cfg(feature = "busreg")]
+fn busreg_fx_send(row: usize, frame: &[u8]) -> i64 {
+    let cgen = SLOT_GEN[row].load(Ordering::Acquire);
+    busx_msend_for(row, cgen, frame)
+}
+#[cfg(feature = "busreg")]
+fn busreg_fx_pop(row: usize) -> Option<alloc::boxed::Box<[u8]>> {
+    busx_mbox_pop(row).map(|m| m.frame)
+}
+#[cfg(feature = "busreg")]
+fn busreg_fx_stamp(row: usize) -> [u8; 32] {
+    crate::bus_route::row_principal(row, SLOT_GEN[row].load(Ordering::Acquire))
+}
+#[cfg(feature = "busreg")]
+static BUSREG_FX: crate::bus_route::Fixture = crate::bus_route::Fixture {
+    ops: &BUSREG_OPS,
+    send: busreg_fx_send,
+    pop: busreg_fx_pop,
+    clear: busx_mbox_clear,
+    stamp: busreg_fx_stamp,
+    rows: (6, 7), // the scratch rows the BUSX86-STAMP fixture already uses (caller 6, fulfiller 7)
+};
+
+/// `tests bandy3` — the fulfiller-registration witness on x86.
+#[cfg(feature = "busreg")]
+pub fn bandy3_selftest() {
+    busx_sem_init_once();
+    crate::bus_route::selftest(&BUSREG_FX);
 }
