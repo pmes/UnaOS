@@ -169,3 +169,4 @@ UNAOS_DMAWIN   ENV   option_env! at arch/aarch64/rtl8168_tegra.rs:5286 (the NET4
 UNAOS_NET4_RINGDUMP   ENV   option_env! at arch/aarch64/rtl8168_tegra.rs:2461 and :2808 (dumps the RX ring on the NET4 descriptor-17 hunt, R19); orin debugging knob set by hand, named by no verb
 UNAOS_NET4_BUF1   ENV   option_env! at arch/aarch64/rtl8168_tegra.rs:2947 and :3151 (the single-buffer RX classification arm of the same hunt); orin debugging knob set by hand, named by no verb
 UNAOS_NET4_DHCP_MS   ENV   option_env! at arch/aarch64/rtl8168_tegra.rs:5522 (the NET4 driver-DHCP wait in ms, parsed at build time); orin tuning knob set by hand, named by no verb
+UNAOS_LINUXABI   NA   --evidence: linuxabi lives only in arch/x86_64/linuxabi (x86 mod tree), 0 Pi-live; the Linux-compat layer is an x86 rung.

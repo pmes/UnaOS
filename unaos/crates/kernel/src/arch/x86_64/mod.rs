@@ -319,3 +319,8 @@ pub fn ioapic_route_intx_why(bus: u8, dev: u8, func: u8, vector: u8) -> Result<u
         Err("no-ioapic-in-kernel")
     }
 }
+
+/// LINUXABI — the Linux x86_64 syscall-compat layer (static ELF loader + Linux syscall table). Declared at the FILE TAIL so no
+/// `panic::Location` above shifts.
+#[cfg(feature = "linuxabi")]
+pub mod linuxabi;

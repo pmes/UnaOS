@@ -2190,7 +2190,7 @@ core::arch::global_asm!(
     // C argument register) BEFORE the shuffle below, so nothing in the shuffle can clobber it. `r8`
     // was previously untouched here and is scrubbed on the way out with the other caller-saved
     // registers, so the return half is unchanged.
-    "mov r8, r10",                  // arg3 -> 5th C arg (SYS_THREAD_SPAWN's `place`; junk otherwise)
+    crate::linuxabi_r8!(), "mov r8, r10",                  // arg3 -> 5th C arg (SYS_THREAD_SPAWN's `place`; junk otherwise)
     "mov rcx, rdx",                 // arg2 -> 4th C arg
     "mov rdx, rsi",                 // arg1 -> 3rd C arg
     "mov rsi, rdi",                 // arg0 -> 2nd C arg
@@ -2318,7 +2318,7 @@ extern "C" fn syscall_ret_noncanonical() -> ! {
 /// vector/address, which count-only bookkeeping would false-PASS. `vec` is the exception number and
 /// `err` its raw error code (the #PF error bits for vector 14; ignored otherwise). `cr2` is the
 /// faulting linear address for #PF (0 for other vectors).
-pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
+pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) { #[cfg(feature = "linuxabi")] if name == crate::arch::linuxabi::TASK_NAME { crate::arch::linuxabi::note_fault(vec, err, cr2); } // LINUXABI: tell the waiting `linux` verb the program faulted. Folded onto the signature line.
     const PF: u8 = 14;
     // U2 Part-0a: a ring-3 #DB on the TF+SYSCALL fixture (a platform that delivers the single-step
     // trap in ring 3 rather than at the CPL-0 entry stub). Count it as its own clean-kill outcome,
@@ -2549,7 +2549,7 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) {
 /// other arm ignores it, and a program that does not load `r10` simply passes junk to a verb that
 /// does not read it.
 #[unsafe(no_mangle)]
-extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, #[cfg(feature = "linuxabi")] a5: u64) -> i64 { #[cfg(feature = "linuxabi")] { let a4 = crate::arch::linuxabi::take_user_r8(); if crate::arch::linuxabi::is_linux_task() { return crate::arch::linuxabi::dispatch(nr, a0, a1, a2, a3, a4, a5); } } // LINUXABI: a Linux task speaks the Linux table; a4 is user r8 from the stub's scratch, a5 is r9 (the 6th C arg). Folded onto the signature line.
     if !SYSCALL_LOGGED.swap(true, Ordering::Relaxed) {
         serial_println!(":: SYSCALL: nr={} — ring-3 -> ring-0 path live ::", nr);
     }

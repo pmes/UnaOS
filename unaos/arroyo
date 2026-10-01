@@ -1211,6 +1211,8 @@ fi
 [ -n "${UNAOS_VSYNCPACE:-}" ] && _feats="${_feats}vsyncpace,"
 # INSTGUI: UNAOS_INSTGUI=1 opens the graphical installer dialog on the wc desktop (implies wc).
 [ -n "${UNAOS_INSTGUI:-}" ] && _feats="${_feats}instgui,"
+# LINUXABI: UNAOS_LINUXABI=1 arms the Linux x86_64 syscall-compat layer (`linux <path>`, `tests linuxabi`). x86-only. Kept in sync with builder/src/main.rs and scripts/banner-cert.sh.
+[ -n "${UNAOS_LINUXABI:-}" ] && _feats="${_feats}linuxabi,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
@@ -3635,6 +3637,15 @@ build_user_vug_x86() {
     # 2143, so `kvug` compiles out the shard raytracer it replaces. Measured 0x1fc5 with `kvug`, against
     # an unchanged 0x1f57 without it.
     build_one_vug_x86 VUGK-X86.ELF "kvug"
+    build_user_linux_hello_x86   # LINUXABI: target/HELLO.LNX — staged as APPS/HELLO.LNX by the builder
+}
+
+# LINUXABI: generate the ~170-byte static Linux x86_64 fixture from bytes (crates/user-linux-hello is a HOST
+# program that writes the ELF; no binary blob is checked in). Always built: it is a 170-byte file, inert
+# unless the kernel carries `linuxabi` and someone runs `linux`/`tests linuxabi`.
+build_user_linux_hello_x86() {
+    mkdir -p "${WORKSPACE_DIR}/target"
+    ( cd "$WORKSPACE_DIR/crates/user-linux-hello" && cargo +nightly run --release --quiet -- "${WORKSPACE_DIR}/target/HELLO.LNX" )
 }
 
 # PULSE-1: build the x86_64 static ELF64 EL0 CPU-PULSE MONITOR (crates/user-pulse → target/PULSE-X86.ELF).

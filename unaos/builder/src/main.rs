@@ -718,6 +718,8 @@ fn main() {
     // media, so the knob must be mapped here too (arroyo's own list only covers non-media paths —
     // that asymmetry is why s42 shipped without the dialog).
     if std::env::var("UNAOS_INSTGUI").is_ok() { feats.push("instgui"); }
+    // LINUXABI: UNAOS_LINUXABI=1 arms the Linux x86_64 syscall-compat layer. Kept in sync with arroyo and banner-cert.sh.
+    if std::env::var("UNAOS_LINUXABI").is_ok() { feats.push("linuxabi"); }
     // WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` last-words
     // breadcrumbs along the focus-raise/composite chain (x86: bare 16550 at 0x3F8, no lock). Media
     // builds come from THIS list, not arroyo's (the s42/INSTGUI lesson), so the knob is mapped here
@@ -922,6 +924,8 @@ fn main() {
         // `m` key cycles its three historical screens. Same reasoning as the pins: no argv, so the only
         // channel a mode set can travel down is a distinct image with a distinct 8.3 name.
         ("VUGK-X86.ELF", "VUGK.ELF"),
+        // LINUXABI: the hand-assembled static Linux x86_64 fixture (crates/user-linux-hello) — `linux /apps/HELLO.LNX`, `tests linuxabi`.
+        ("HELLO.LNX", "HELLO.LNX"),
     ] {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {

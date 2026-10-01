@@ -151,6 +151,11 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
+    #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
+    {
+        static LDONE: AtomicBool = AtomicBool::new(false);
+        if !LDONE.swap(true, Ordering::AcqRel) { register("linuxabi", crate::arch::linuxabi::selftest); }
+    }
     #[cfg(all(feature = "witness", target_arch = "x86_64"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);

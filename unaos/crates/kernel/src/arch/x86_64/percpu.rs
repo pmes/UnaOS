@@ -137,3 +137,22 @@ pub fn note_tick() {
 pub fn note_ipi() {
     this_cpu().ipis.fetch_add(1, Ordering::Relaxed);
 }
+
+/// LINUXABI — one template line for the SYSCALL stub (`unaos_syscall_entry`): park the user's r8 (Linux
+/// syscall arg 4, which the stub overwrites with r10 for the 5-arg C ABI) in the per-CPU scratch that
+/// `syscall_user_rsp` vacated two pushes earlier. Knob-off expands to an EMPTY template line, so the stub's
+/// machine code is byte-identical. Defined at the FILE TAIL: no `panic::Location` above shifts.
+#[cfg(feature = "linuxabi")]
+#[macro_export]
+macro_rules! linuxabi_r8 {
+    () => {
+        "mov gs:[{uoff}], r8"
+    };
+}
+#[cfg(not(feature = "linuxabi"))]
+#[macro_export]
+macro_rules! linuxabi_r8 {
+    () => {
+        ""
+    };
+}
