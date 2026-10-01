@@ -40,7 +40,7 @@ pub mod bootdisk;
 #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
 pub mod sdhc4c;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))] // UNAFSX86: x86 arms it with UNAOS_UNAFS=1
 pub mod unafs;
 
 /// VFS-1: the unifying virtual-filesystem spine (mount table + resolver + the

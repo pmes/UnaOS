@@ -2628,7 +2628,7 @@ pub fn tegra_sd_write_blocks_through(lba: u64, buf: &[u8]) -> Result<(), BlockEr
 /// a side effect, and a lock this function has no business taking on a caller's behalf.
 /// `target_arch = "aarch64"`-gated because `fs::unafs` is (`fs/mod.rs:43`), and `NativeBackend` —
 /// the only caller — is gated the same way.
-#[cfg(all(target_arch = "aarch64", feature = "sdwrite"))]
+#[cfg(all(any(target_arch = "aarch64", feature = "unafs"), feature = "sdwrite"))]
 pub fn native_mount_write_veto() -> Option<&'static str> {
     let Some(handle) = crate::fs::unafs::mount_bound_handle() else {
         return None;

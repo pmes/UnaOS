@@ -129,7 +129,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
-    ensure_shellux(); ensure_selfinstall();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86();
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
@@ -189,5 +189,15 @@ fn ensure_selfinstall() {
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("selfinstall", crate::install::selfinstall::selftest); }
+    }
+}
+
+/// UNAFSX86 M4: register `unafs` (the root-volume seam fixture) exactly once, on any build carrying the
+/// native module under the `unafs` feature; on a FAT root the fixture prints SKIP, never a pin.
+fn ensure_unafsx86() {
+    #[cfg(feature = "unafs")]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("unafs", crate::fs::unafs::unafsx86_selftest); }
     }
 }

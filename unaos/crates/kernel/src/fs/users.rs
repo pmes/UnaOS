@@ -864,6 +864,7 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
 /// ACL row (LEDGER SO35); the FILES a program creates inside it are owned through the SYS_OPEN
 /// owner/grants rows exactly as any private create, and that is what the home ACL proof exercises.
 pub fn ensure_home(name: &[u8]) -> Result<&'static str, UsersError> {
+    #[cfg(feature = "unafs")] if let Some(v) = ensure_home_native(name) { return v; } // UNAFSX86 (B298): a UnaFS `/` owns /home; the FAT body below is the fallback
     let fs = store_mount().map_err(|_| UsersError::Volume)?;
     let home_fc = match fs.locate_in_dir(0, "HOME") {
         Ok((de, _, _)) if de.is_dir => de.first_cluster(),
@@ -3228,4 +3229,43 @@ pub fn set_password_checked(name: &[u8], password: &[u8]) -> Result<(), UsersErr
         return Err(UsersError::Refused);
     }
     set_password(name, password)
+}
+
+/// UNAFSX86 (rmbp-ledger B298): `/home/<name>` on whichever backend owns `/`, through the mount table.
+///
+/// `None` = the root is NOT the native UnaFS volume (a FAT-only card, or no root at all) — the caller
+/// keeps the FAT 8.3 path (`HOME/<NAME>`), so a card with no UnaFS partition boots exactly as before.
+/// `Some(..)` = the root is native: `/home` and `/home/<name>` are created as directories through
+/// `MountTable::create` (idempotent), lowercase because `name_ok` admits only lowercase. THE CONTRACT
+/// PREFS and every later home consumer rely on: `/home/<user>` is the same string on both roots
+/// (`home_of`), and the mount table — not the caller — decides which medium it lands on.
+#[cfg(feature = "unafs")]
+fn ensure_home_native(name: &[u8]) -> Option<Result<&'static str, UsersError>> {
+    use crate::fs::vfs::{NodeKind, VfsError, KERNEL_PRINCIPAL};
+    let mt = crate::shell::vfs_mount_table();
+    if mt.volume_name("/").ok()? != "native" {
+        return None;
+    }
+    let leaf = match core::str::from_utf8(name) {
+        Ok(l) => l,
+        Err(_) => return Some(Err(UsersError::BadName)),
+    };
+    let child = alloc::format!("{}/{}", HOME_ROOT, leaf);
+    let mut verdict = "exists";
+    for p in [HOME_ROOT, child.as_str()] {
+        match mt.stat(p) {
+            Ok(st) if st.kind == NodeKind::Dir => {}
+            Ok(_) => return Some(Err(UsersError::Volume)),
+            Err(VfsError::NoSuchPath) => {
+                if mt.create(p, NodeKind::Dir, KERNEL_PRINCIPAL).is_err() {
+                    serial_println!("[users] home=/home/{} NOT created reason=native-create volume=unafs", leaf);
+                    return Some(Err(UsersError::Volume));
+                }
+                verdict = "created";
+            }
+            Err(_) => return Some(Err(UsersError::Volume)),
+        }
+    }
+    serial_println!("[users] home=/home/{} {} volume=unafs", leaf, verdict);
+    Some(Ok(verdict))
 }
