@@ -2051,15 +2051,13 @@ impl VfsBackend for NativeBackend {
                 ::unafs::fs::FileSystemError::Query(_) => VfsError::Backend("bad-query"),
                 _ => VfsError::Backend("unafs-query"),
             })?;
-            let mut ids: Vec<u64> = hits.iter().map(|(ino, _)| ino.id).collect();
-            ids.sort_unstable();
-            ids.dedup();
-            let paths = native_query_paths(fs, &ids);
+            // F3F4: the crate returns `QueryHit { inode_id, path, score }` — the path comes from its
+            // parent pointers, so the v1 kernel reverse walk (`native_query_paths`) is gone (merge9 fold).
             let mut out = Vec::new();
-            for (id, p) in paths {
+            for h in hits {
                 // ACL on results: a hit the principal may not read is DROPPED, never shown.
-                if native_read_gate(fs, id, principal).is_ok() {
-                    out.push((id, p));
+                if native_read_gate(fs, h.inode_id, principal).is_ok() {
+                    out.push((h.inode_id, h.path));
                 }
             }
             Ok(out)
@@ -3493,51 +3491,6 @@ fn native_read_gate(fs: &mut crate::fs::unafs::KernelUnaFS, id: u64, principal: 
         crate::fs::unafs::ReadAuthz::Permit => Ok(()),
         _ => Err(VfsError::Denied),
     }
-}
-
-/// ATTRSURF v1 — THE REVERSE WALK, and it is meant to be deleted. The crate's `query` returns
-/// inodes, not paths; this walks the volume ONCE from the root (breadth-first, `System` objects and
-/// `.`/`..` skipped exactly as `read_dir` skips them), recording `inode -> path` for the ids asked
-/// for, and stops as soon as every id is found. Bounded: at most `QWALK_NODES` objects visited and
-/// `QWALK_DEPTH` levels. Cost: O(objects on the volume) directory reads per query in the worst case.
-/// An id the walk cannot reach (unlinked but still catalogued, or past a bound) has no path and is
-/// dropped. F3F4 changes the crate's `query` to return `(inode_id, path)`; at that fold this
-/// function goes and `NativeBackend::query` maps the crate's pairs directly.
-#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
-fn native_query_paths(fs: &mut crate::fs::unafs::KernelUnaFS, ids: &[u64]) -> Vec<(u64, String)> {
-    const QWALK_NODES: usize = 16_384;
-    const QWALK_DEPTH: usize = 32;
-    let mut found: Vec<(u64, String)> = Vec::new();
-    if ids.is_empty() {
-        return found;
-    }
-    let Ok(root) = fs.resolve_path("/") else { return found };
-    if ids.binary_search(&root).is_ok() {
-        found.push((root, String::from("/")));
-    }
-    let mut frontier: Vec<(u64, String, usize)> = alloc::vec![(root, String::new(), 0)];
-    let mut visited = 0usize;
-    while let Some((dir, dpath, depth)) = frontier.pop() {
-        if found.len() == ids.len() || visited >= QWALK_NODES {
-            break;
-        }
-        let Ok(entries) = fs.ls(dir) else { continue };
-        for e in entries {
-            if e.name == "." || e.name == ".." || e.kind == ::unafs::FileKind::System {
-                continue;
-            }
-            visited += 1;
-            let p = alloc::format!("{}/{}", dpath, e.name);
-            if ids.binary_search(&e.inode_id).is_ok() && !found.iter().any(|(i, _)| *i == e.inode_id) {
-                found.push((e.inode_id, p.clone()));
-            }
-            if e.kind == ::unafs::FileKind::Directory && depth + 1 < QWALK_DEPTH {
-                frontier.push((e.inode_id, p, depth + 1));
-            }
-        }
-    }
-    found.sort_by_key(|(i, _)| *i);
-    found
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
