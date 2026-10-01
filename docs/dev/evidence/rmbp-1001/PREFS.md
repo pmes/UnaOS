@@ -70,3 +70,50 @@ is the KERNEL-facing subset and Principia reads the same file unchanged.
 - PrefChanged mailbox delivery → BANDY-3 (fulfiller/interest registration does not exist yet).
 - Mirroring `system.*` as attributes on the preferences file → ATTRSURF (`set_attr` not in this tree).
 - The charter row `dotfile | .config/unaos/preferences.toml | B300 (Principia's path)` at the fold.
+
+## As built
+
+**Who writes what.** settings.rs: `from_prefs` reads the keys at login and applies them; every change sets its
+ONE key (`persist`). dock.rs: `system.dock.pins` read at login, written by the service pass. The brightness
+keys (F1/F2) and the volume keys (F10-F12) change the live level on the input path, where no VFS work runs;
+the settings service pass notices the live value differs and persists it. `wallpaper <path>|off` sets
+`display.wallpaper` when it took. POWERMENU: `UNAOS_LOWBAT_SHUTDOWN` is now the default only;
+`power.lowbat_shutdown_pct` overrides it (read with a try-lock on the device-service path). DIMIDLE keeps no
+store: its runtime minutes are applied from `display.idle_min` at login by the settings pass.
+
+**A refused file** (outside the subset): defaults hold, saves are HELD (`[prefs] save held`), the operator's
+file is never overwritten — Principia's rule. Principia, for its part, quarantines writes to
+`preferences.toml.new`, the same name the kernel uses as its swap temp; a kernel load that finds only a
+parseable `.new` adopts it (the users.rs rule), which is the right answer in both cases.
+
+**Bus (una-abi 11/12/13).** Bodies are ASCII; a value is a TOML scalar literal (`prefs_core` spells it).
+
+| verb | request body | reply |
+| :--- | :--- | :--- |
+| PREF_GET 11 | `<ns>.<key>` | body = literal; -ENOENT unset; -EINVAL malformed |
+| PREF_SET 12 | `<ns>.<key>` NUL `<literal>` | empty; -EACCES outside the session; -EIO save failed or held |
+| PREF_LIST 13 | `<ns>` or empty (all) | `<ns>.<key> = <literal>\n` lines; -E2BIG past 4 KiB |
+
+Rule: ANY principal may read. Only a program of the OPEN session may set, in any namespace (the file is the
+session user's): x86 — a session exists and the caller's `SLOT_USER` equals `SESSION_USER`; aarch64 — the
+caller's stamped principal IS the session's `user:` record (`session_restamp`). No `login` = no setter.
+KATs: `prefs::codec_selftest` (`:: PREFS-CODEC: kats=9/9 -> PASS ::`, one frozen golden GET frame), run by
+`tests prefs`.
+
+**PrefChanged (owed BANDY-3).** Today: `[prefs] changed <ns>.<key>` on the serial. The frame for BANDY-3 to
+deliver to every registered mailbox: kind REPLY (2), verb `BUS_VERB_PREF_CHANGED` = 14 (reserved in una-abi,
+NOT yet admitted by `verb_valid`), corr 0, status 0, principal = the kernel reply record, body = the PREF_SET
+body (`<ns>.<key>` NUL `<literal>`).
+
+**ATTRSURF hook.** `prefs::mirror_attr` is called on every accepted change and is empty: `set_attr` is not in
+this tree. Owed ATTRSURF.
+
+**Fixture** `tests prefs`: codec KATs; the four types set/get and saved; the FILE re-read through the VFS and
+parsed with prefs_core equals the tree; no temp left; a malformed file is refused (defaults hold, save held,
+file untouched); the operator's file restored byte for byte. `:: PREFS-FIXTURE: ... -> PASS ::`.
+
+**Charter gate.** `charter-check.sh` exit 1, flagging `".new"` (the `"{}.new"` swap-temp suffix in prefs.rs —
+not a dotfile). The preferences path itself (`"{}/.config/unaos/preferences.toml"`) was not flagged by the
+current regex. Rows for the fold: `dotfile | .config/unaos/preferences.toml | B300 (Principia's path)` and
+one for the `.new` suffix (or a gate refinement). The migration still names `.settings` / `.dock`
+(already allowlisted); those literals go when the import is retired.
