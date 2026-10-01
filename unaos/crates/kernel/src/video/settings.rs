@@ -600,7 +600,7 @@ fn users_delete(name: &str) -> Result<(), &'static str> {
 fn users_reset(name: &str) {
     #[cfg(feature = "login")]
     {
-        crate::video::login::open_set_password(name.as_bytes(), false);
+        crate::video::crystal::login::open_set_password(name.as_bytes(), false);
         users_say("reset", name, true, "set-password-screen");
     }
     #[cfg(not(feature = "login"))]

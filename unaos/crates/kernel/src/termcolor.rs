@@ -190,7 +190,7 @@ pub fn selftest() {
     let pal_ok = capped && palette256(1) == crate::video::theme::ANSI16[1] && palette256(16) == 0 && palette256(231) == 0xFFFFFF && palette256(232) == 0x080808
         && parse_line(&mut Attr::DEFAULT, "\x1b[38;5;196mx").spans[0].fg == SET | 0xFF0000;
     let t = |b: bool| if b { "ok" } else { "bad" };
-    crate::serial_println!(
+    serial_println!(
         ":: TERMCOLOR: spans_max={} sgr_ok={} erase_ok={} palette={} -> {} ::",
         SPANS_MAX, t(sgr_ok), t(erase_ok), if pal_ok { "16+256+rgb" } else { "bad" }, if sgr_ok && erase_ok && pal_ok { "PASS" } else { "FAIL" }
     );
