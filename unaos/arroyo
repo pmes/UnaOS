@@ -9931,6 +9931,13 @@ kernel8() {
         K8_FEATS="${K8_FEATS},witness"
         echo -e "${COLOR_YELLOW}  • UNAOS_WITNESS: kernel8 carries the M6b..U7 fixture battery (CAPSTONE + PASS lines)${COLOR_RESET}"
     fi
+    # R77 M3: UNAOS_TESTS_AT_BOOT=1 adds `tests-at-boot` — the desktop fixture registry (`tests.rs`) runs at
+    # registration in boot order, as before the `tests` verb; the kernel8-test lane exports it (top of this file),
+    # the flashed Pi image leaves it unset and boots quiet, `tests` fires the battery from the shell.
+    if [ -n "${UNAOS_TESTS_AT_BOOT:-}" ]; then
+        K8_FEATS="${K8_FEATS},tests-at-boot"
+        echo -e "${COLOR_YELLOW}  • UNAOS_TESTS_AT_BOOT: kernel8 runs the desktop fixture registry at boot (R77 M3)${COLOR_RESET}"
+    fi
     # CLOCK-2: UNAOS_LOGTS=1 adds the `logts` feature — a compact timestamp prefix on each serial LINE
     # (monotonic ms → UTC after a civil anchor). K8_FEATS is CURATED (does not draw from the general
     # `_feats`), so the arm must be added here too or logts never reaches the Pi image. OFF => the
