@@ -33,3 +33,34 @@ Nothing in the boot-18 log bears on it (a feature arc, not a finding).
 No new knob (rides `UNAOS_LINUXABI=1`).
 
 **Witness.** `:: LINUXABI2: fork_ok=<0|1> pipe_ok=<0|1> dents=<n> stdin=<0|1> -> PASS|FAIL ::` (SKIP when fixtures are not staged).
+
+## Written
+Boot 17 (x86, `UNAOS_LINUXABI=1`, builder-staged media: `APPS/{HELLO,PIPE,LS}.LNX`), desktop shell `tests linuxabi2`:
+```
+[linuxabi] load path=/apps/PIPE.LNX segs=1 entry=0x400078 ...
+ping
+[linuxabi] load path=/apps/LS.LNX ...
+:: LINUXABI2: fork_ok=1 pipe_ok=1 dents=<n>=3+ stdin=1 -> PASS ::
+```
+(`-> SKIP (fixtures not staged)` when APPS/ lacks them.) `fork_ok` = >=1 fork and the child exited 0 having seen the parent's rbx/r12 canaries;
+`pipe_ok` = parent read "ping\n" through the pipe, wait4 status 0, exit_group(0); `stdin` = the line pre-queued with `stdin_push` came back
+first on stdout; `dents` = names `getdents64("/")` returned (incl `.`/`..`). Interactive: `linux /apps/LS.LNX` then type a line + Enter.
+`tests linuxabi` (HELLO) is unchanged. No new knob, no spec pin (x86-wc.spec does not pin `tests linuxabi`).
+
+**Not done / limits.** Never compiled or run (R76/R78). Work-list items not done: `select`, `ftruncate`, `readlinkat`, `futex`, `rt_sig*` delivery
+(kill = end the task), real threads (`clone` with CLONE_VM|CLONE_THREAD -> -ENOSYS), `#!` scripts in execve, `/proc`, symlinks, `getrandom` is a
+clock xorshift (not crypto). fork is an EAGER copy (<=64 MiB), not CoW — there is no CoW fault hook in `page_fault`. The FS_BASE/pinning limit stays:
+FS_BASE is per-core, so every process is pinned to the verb's core; `sched.rs` now re-asserts it per switch-in via `linuxabi::on_dispatch`.
+Ring 3 has no SSE (CR4.OSFXSR=0): a stock musl/busybox build (SSE2 memcpy/float) will #UD until that is lifted or the toolchain targets `-mno-sse`.
+stdout reaches the shell window per completed LINE (a bare prompt appears when its line completes); stdin echo is likewise per line.
+Files are slurped at open (a 100 MB file costs 100 MB); writes are write-through per 4 KiB through `MountTable::write` with the kernel principal,
+only under `/home/<user>/`. A failed `execve` AFTER the point of no return returns into unmapped memory (SIGSEGV zombie).
+
+## Notes for the compiler executor (guessed signatures / cfgs)
+- `syscall.rs` stub: `crate::linuxabi_save!()` folded onto the `linuxabi_r8!` template line, `crate::linuxabi_restore!()` onto the `call {dispatch}` line;
+  macros at `percpu.rs` tail (multi-line string literals "push rbx\npush rbp..."). If `global_asm!` rejects a macro-produced multi-line literal, split into six macros.
+- `sched.rs`: `user_task_trampoline` fork-child asm block (explicit `in("rax")`, `in(reg)` operands consumed by the pushes before rbx..r15 are loaded) and the
+  `{ ... on_dispatch(uc) ... }` fold on the `target_cr3` line. `take_fork_regs` returns `Option<[u64; 6]>`.
+- Guessed APIs: `crate::arch::sched::{current_user_cr3, KillSwitch::{new,request,is_reaped}, exit, yield_now, kill_check_current}`, `crate::pal::{pump_and_poll, Event::Key(u8)}`,
+  `crate::shell::{cwd_now, vfs_path, vfs_mount_table}`, `MountTable::{stat,read,read_dir,create,write,unlink,remove_dir,rename,prefixes}`, `fs::users::whoami` under `feature = "login"`.
+- `percpu::KERNEL_RSP_OFFSET` as an asm `const` operand (same shape as `USER_RSP_OFFSET`).

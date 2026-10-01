@@ -933,6 +933,9 @@ fn main() {
         ("VUGK-X86.ELF", "VUGK.ELF"),
         // LINUXABI: the hand-assembled static Linux x86_64 fixture (crates/user-linux-hello) — `linux /apps/HELLO.LNX`, `tests linuxabi`.
         ("HELLO.LNX", "HELLO.LNX"),
+        // LINUXABI2: the fork/pipe and stdin/getdents64 fixtures (same generator) — `tests linuxabi2`.
+        ("PIPE.LNX", "PIPE.LNX"),
+        ("LS.LNX", "LS.LNX"),
     ] {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {
