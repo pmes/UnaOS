@@ -8537,6 +8537,36 @@ pack_source_along() {
 # had put on the card. The old one-line instruction ("copy the contents to a FAT32 USB root") was
 # correct for a ONE-STICK boot and silently wrong for a two-device one; naming the two volumes is
 # the fix. On a single stick, write BOTH trees to that one root and everything behaves as before.
+# UNAFSX86 M3 (rmbp-ledger B298, SH-2 rung 1): with UNAOS_UNAFS=1, `esp-x86` also lays ONE card image —
+# target/unaos-x86-card.img, GPT: p1 = EFI System FAT32 (the ESP tree + the data tree, so the firmware
+# still finds the ESP as partition 1 and the kernel mounts it at /boot and /apps), p2 = a `tools/unafs
+# init` volume the kernel's `locate_unafs` finds by superblock magic and `bind_root` makes `/`.
+# UNAOS_X86_UNAFS_MB sizes p2 (default 512, capped at 2048 per LAWS' 2 GiB image cap). Write the
+# whole image to the card (`dd`), not the trees. Boot witness:
+#   :: UNAFSX86: root=unafs disk=<source> blocks=<n> gen=<g> home=/home -> PASS ::
+esp_x86_unafs_card() {
+    local unafs_mb="${UNAOS_X86_UNAFS_MB:-512}"
+    if [ "$unafs_mb" -gt 2048 ] 2>/dev/null; then
+        echo -e "${COLOR_YELLOW}⚠ UNAOS_X86_UNAFS_MB=${unafs_mb} capped at 2048 (the 2 GiB image cap)${COLOR_RESET}"
+        unafs_mb=2048
+    fi
+    local vol="${WORKSPACE_DIR}/target/unafs-x86.img"
+    local card="${WORKSPACE_DIR}/target/unaos-x86-card.img"
+    local UNAFS_CLI_MANIFEST="${WORKSPACE_DIR}/../tools/unafs/Cargo.toml"
+    echo -e "${COLOR_YELLOW}⚡ UNAFSX86: formatting the x86 UnaFS system volume (${unafs_mb} MiB)...${COLOR_RESET}"
+    rm -f "$vol" "$card"
+    cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- init -p "$vol" -s "$unafs_mb" || {
+        echo -e "${COLOR_RED}❌ UNAFSX86: tools/unafs init failed — no card image${COLOR_RESET}"; return 1; }
+    python3 "${WORKSPACE_DIR}/scripts/make-x86-card.py" \
+        --esp "${WORKSPACE_DIR}/target/x86_64_esp" --data "${WORKSPACE_DIR}/target/x86_64_data" \
+        --unafs "$vol" -o "$card" || {
+        echo -e "${COLOR_RED}❌ UNAFSX86: make-x86-card.py failed — no card image${COLOR_RESET}"; return 1; }
+    rm -f "$vol"
+    echo -e "${COLOR_GREEN}✅ x86 CARD (UnaFS root): ${card}${COLOR_RESET}"
+    echo -e "   sha256: $(sha256_of "$card")"
+    echo -e "   p1 = ESP (FAT32, boot + data trees) · p2 = UnaFS system volume (${unafs_mb} MiB) — dd the whole image"
+}
+
 esp_x86() {
     echo -e "${COLOR_CYAN}⚡ Building x86_64 kernel + bootloader and packaging the ESP (no QEMU)...${COLOR_RESET}"
     build_user_hello_x86   # U2: target/hello.bin — the builder copies it onto the ESP as HELLO.BIN
@@ -8579,6 +8609,7 @@ esp_x86() {
     echo -e "               data tree -> the USB stick, or \`bg /apps/VUG.ELF\` reports -ENOENT."
     echo -e "   Probe after boot: \`cat hello.txt\` must say 'DATA volume' — if it says anything else,"
     echo -e "               the kernel is reading a stick you did not stage."
+    if [ -n "${UNAOS_UNAFS:-}" ]; then esp_x86_unafs_card || exit $?; fi   # UNAFSX86 M3
 }
 
 # VMIMAGE-1: emit ONE self-contained, distributable bootable disk image — a GPT disk with a FAT32

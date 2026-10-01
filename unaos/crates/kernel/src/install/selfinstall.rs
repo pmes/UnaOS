@@ -218,6 +218,7 @@ pub fn dry_run(out: &mut dyn FnMut(&str)) -> Option<Probe> {
                 p.port, p.model, p.sectors, p.gpt, p.verdict.tag()
             ));
             out(&alloc::format!("  plan: {}", plan));
+            #[cfg(feature = "unafs")] { serial_println!("[install] unafs-root mirror=NOT-YET (UNAFSX86 owed: --write copies the ESP files only; the SSD gets no UnaFS partition and boots with a FAT root)"); out("  unafs: the UnaFS root partition is NOT mirrored yet — the installed SSD boots with a FAT root"); }
             Some(p)
         }
     }
