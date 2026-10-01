@@ -17575,7 +17575,7 @@ fn winx_launcher(demo_cpu: usize) {
     #[cfg(all(feature = "witness", feature = "wc"))]
     crate::tests::register("dmgovlp", crate::video::wm::dmgovlp_selftest);
     #[cfg(all(feature = "wc", feature = "quarry"))]
-    crate::tests::register("quarryops", crate::video::quarry::ops_selftest); // QUARRYOPS (R75) — mkdir/rename(LFN)/copy/delete on a scratch folder under /home, verified by listing.
+    crate::tests::register("quarryops", crate::video::quarry::ops_selftest); crate::tests::register("trash", crate::fs::trash::selftest); // TRASH (R75) — trash/restore/trash/empty a scratch file under /home, verified by listing + the `.Trash/.index`; folded here (same cfg) so no line is added. // QUARRYOPS (R75) — mkdir/rename(LFN)/copy/delete on a scratch folder under /home, verified by listing.
     // VUGRES (D-3 RESUMEPAINT) — the pause/resume first-present witness, both arms, and the
     // ladder's new tail. After DMGOVLP because its negative leg deliberately runs a 2 s bound down
     // (nothing after it should wait behind that), and it is otherwise the least disruptive fixture

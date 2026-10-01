@@ -878,6 +878,10 @@ FORBID :: DOCKRUN: .* -> FAIL ::
 # --- itself). The fixture is a `tests` registry entry the lane runs at boot; a SKIP (no /home volume) is not a pass.
 REQUIRE :: QUARRYOPS: ops=\[mkdir,rename,copy,delete\] ok=4 refused=2 -> PASS ::
 FORBID :: QUARRYOPS: .* -> (FAIL|SKIP) ::
+# --- TRASH (R75) — `tests trash`: a scratch file under /home is trashed (moved into `.Trash`, indexed), restored,
+# --- trashed again and emptied, the listing and `.Trash/.index` verified at each step, plus a `~1` collision name.
+REQUIRE :: TRASH: trashed=2 restored=1 emptied=1 index_ok=3 -> PASS ::
+FORBID :: TRASH: .* -> (FAIL|SKIP) ::
 # --- SHOTMOUNT (SO19, FSNS): a capture's bytes go THROUGH THE MOUNT TABLE (`mt.create`/`mt.write`, as
 # --- `shell::fs_write` does), so the file lands where `ls /` says the namespace is. The witness prints once per
 # --- capture at the verdict; `via=fat` means the table could not create the entry and the FAT-direct
