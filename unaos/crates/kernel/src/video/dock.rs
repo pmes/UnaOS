@@ -3096,3 +3096,8 @@ pub fn dockrun_selftest() {
     serial_println!(":: DOCKRUN: tiles={} running={} pinned={} raise={} quit={} menu_drawn={} -> {} ::", n0, run0, pins,
         if raise { "ok" } else { "no" }, if quit { "ok" } else { "no" }, drawn as u8, if ok { "PASS" } else { "FAIL" });
 }
+
+/// LOGINFLOW2 M3 — is a launch for `app` posted and not yet drained (a read; clears nothing)?
+pub fn launch_posted(app: PinnedApp) -> bool {
+    LAUNCH_OWED.load(Ordering::Acquire) & app.bit() != 0
+}

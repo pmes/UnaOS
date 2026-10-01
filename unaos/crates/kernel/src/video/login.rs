@@ -713,6 +713,11 @@ fn close_into_session() {
     take_down();
     if SWEPT.swap(false, Ordering::AcqRel) {
         super::super::dock::relaunch_furniture(); // LOGOUTDESK: the sweep emptied the desktop — this login's fresh session gets a fresh console and shell (the render bodies drain the latches)
+        REIGNITED.fetch_add(1, Ordering::Relaxed);
+        // LOGINFLOW2 M3 — LOGOUTDESK-REIGNITE: a session opened over a swept desktop; the console's and the shell's launches are POSTED (the render bodies mint them on their next pass).
+        let closed = SWEPT_N.load(Ordering::Relaxed);
+        let (c, sh) = (super::super::dock::launch_posted(super::super::dock::PinnedApp::Console), super::super::dock::launch_posted(super::super::dock::PinnedApp::Shell));
+        serial_println!(":: LOGOUTDESK: windows_closed={} reignited={} console={} shell={} -> {} ::", closed, c as u32 + sh as u32, if c { "posted" } else { "NO" }, if sh { "posted" } else { "NO" }, if c && sh { "PASS" } else { "FAIL —" });
     }
     take_down(); #[cfg(all(feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] crate::video::wallpaper::rearm(); // WALLPAPER — the session user's ~/Desktop/WALL.PNG is probed on the next desktop flush
     FORM.lock().state = State::Session;
@@ -723,6 +728,9 @@ fn close_into_session() {
 /// has nobody to log in as (`users::root_logout_refused`, which prints why).
 /// LOGOUTDESK: set when Log Out swept the desktop; the next login's [`close_into_session`] re-mints the furniture once.
 static SWEPT: AtomicBool = AtomicBool::new(false);
+/// LOGINFLOW2 M3: how many windows the last sweep closed, and how many times a session re-minted the furniture after one.
+static SWEPT_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static REIGNITED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 pub fn reopen_after_logout() {
     if let Some(reason) = users::root_logout_reason() {
@@ -732,7 +740,7 @@ pub fn reopen_after_logout() {
     users::logout();
     take_down(); // LOGOUTUI: an alert left up by an earlier refusal goes with the session (no-op with no window)
     let (closed, kernel) = wm::close_all_furniture(); // LOGOUTDESK (R69): the desktop closes down COMPLETELY — every row, kernel furniture included
-    SWEPT.store(true, Ordering::Release);
+    SWEPT.store(true, Ordering::Release); SWEPT_N.store(closed as u32, Ordering::Relaxed);
     let remaining = wm::live_window_count();
     serial_println!(":: LOGOUTDESK: closed={} kernel={} remaining={} -> {} ::", closed, kernel, remaining, if remaining == 0 { "PASS" } else { "FAIL" });
     FORM.lock().state = State::Closed;
@@ -1105,11 +1113,18 @@ fn submit() {
         return submit_unlock(n, p);
     }
     if n == users::ROOT_NAME {
-        // LOGIN14: root is reached by booting (R63); the screen logs root in when R64's arc lands.
-        serial_println!("[login] denied user=root (root is the boot session; the screen does not open it yet)");
-        let mut f = FORM.lock();
-        f.message = "Root logs in by booting";
-        clear_passwords(&mut f);
+        // LOGINFLOW2 M1 (R64/R77): root logs in at the screen like anyone — by typing `root` and its password. Same one answer on a refusal.
+        if users::password_unset(n) != Some(false) || users::login_root(p).is_err() {
+            serial_println!("[login] denied user=root (one answer for every refusal: `users::verify` decides)");
+            let mut f = FORM.lock();
+            f.message = "Login failed";
+            clear_passwords(&mut f);
+            f.focus = Focus::Password;
+            return;
+        }
+        LOGINS.fetch_add(1, Ordering::Relaxed);
+        serial_println!("[login] session open user=root");
+        close_into_session();
         return;
     }
     if users::password_unset(n) == Some(true) {
@@ -2043,7 +2058,7 @@ pub fn lock_fixture(name: &[u8], password: &[u8], wrong: &[u8]) -> bool {
 pub fn installer_sweep() {
     let keep = WIN.load(Ordering::Relaxed);
     let n = wm::close_all_furniture_except(keep);
-    SWEPT.store(true, Ordering::Release);
+    SWEPT.store(true, Ordering::Release); SWEPT_N.store(n as u32, Ordering::Relaxed);
     serial_println!("[login] installer: furniture swept n={} re-minted=0 (R77: nothing but the setter / the form on the glass; the console is re-minted when the desktop is released)", n);
 }
 
@@ -2054,4 +2069,80 @@ pub fn installer_release() {
         super::super::dock::relaunch_furniture();
         serial_println!("[login] installer: furniture swept n=0 re-minted=2 (console+shell posted, the LOGOUTDESK re-mint)");
     }
+}
+
+/// LOGINFLOW2 M1 — BOOT 2: the store has users, so the login screen is the boot session. Opens the screen, then
+/// sweeps the desktop empty (no furniture until a session opens — the LOGOUTDESK state); the next login re-mints it.
+pub fn open_boot2() {
+    FORM.lock().state = State::Closed;
+    OPENED_ONCE.store(true, Ordering::Release);
+    open();
+    installer_sweep();
+    serial_println!("[login] boot 2: the login screen is the boot session (R64/R65/R77: root is not the assumed login; the furniture returns when a session opens)");
+}
+
+/// LOGINFLOW2 M1 fixture (`loginst`): the boot-2 screen is up with no session; `root` with a wrong password and
+/// `name` with a wrong one are refused with one answer, `name`'s password opens THAT user's session, and the swept
+/// furniture is re-minted (`LOGOUTDESK`). Skipped (no verdict) when no screen is up (a human already logged in).
+#[cfg(feature = "loginst")]
+pub fn boot2_fixture(name: &[u8], password: &[u8]) {
+    let mut nb = [0u8; users::NAME_MAX];
+    if FORM.lock().state != State::Open {
+        serial_println!("[login] boot2-login skipped (no login screen is up: a session is already open)");
+        return;
+    }
+    let screen_first = users::whoami(&mut nb).is_none() && !users::root_session();
+    let r0 = REIGNITED.load(Ordering::Relaxed);
+    let feed = |s: &[u8]| { for &b in s { let _ = consume_key(b); } };
+    feed(users::ROOT_NAME); let _ = consume_key(b'\t'); feed(b"wrong-horse-root"); let _ = consume_key(b'\n');
+    let root_refused = is_open() && !users::root_session() && users::whoami(&mut nb).is_none() && FORM.lock().message == "Login failed";
+    // the name field is cleared by hand: Enter on a refusal keeps it, and the form holds the typed root
+    { let mut f = FORM.lock(); f.name_len = 0; f.pw_len = 0; f.focus = Focus::Name; }
+    feed(name); let _ = consume_key(b'\t'); feed(b"wrong-horse"); let _ = consume_key(b'\n');
+    let wrong_refused = is_open() && users::whoami(&mut nb).is_none();
+    feed(password); let _ = consume_key(b'\n');
+    let opened = !is_open() && matches!(users::whoami(&mut nb), Some(n) if &nb[..n] == name) && !users::root_session();
+    let reignited = REIGNITED.load(Ordering::Relaxed).wrapping_sub(r0) == 1;
+    let ok = screen_first && root_refused && wrong_refused && opened && reignited;
+    serial_println!(
+        ":: FIRSTBOOT-LOGIN: user={} screen_first={} root_wrong={} wrong={} opened={} furniture_reignited={} -> {} ::",
+        core::str::from_utf8(name).unwrap_or("?"), screen_first, if root_refused { "refused" } else { "ACCEPTED" }, if wrong_refused { "refused" } else { "ACCEPTED" }, opened, reignited, if ok { "PASS" } else { "FAIL —" }
+    );
+}
+
+/// LOGINFLOW2 M2 (LOGOUTUI M4) fixture (`loginst`): (1) a refused Log Out's alert opens and OK/Enter closes it
+/// (`:: LOGOUTUI: close=ok`); (2) an accepted Log Out (session open as `name`) puts the screen back over an empty
+/// desktop, and logging in again re-mints the furniture. Registered in `tests` as "logout".
+#[cfg(feature = "loginst")]
+pub fn logout_fixture(name: &[u8], password: &[u8]) {
+    let was = HEADLESS.swap(true, Ordering::Relaxed);
+    let mut nb = [0u8; users::NAME_MAX];
+    // 1 — the refused Log Out's alert
+    FORM.lock().state = State::Closed;
+    { let mut g = NOTICES.lock(); g.cur = None; g.n = 0; }
+    let d0 = NOTICE_DISMISSED.load(Ordering::Relaxed);
+    refused_alert("no-users");
+    let alert_up = FORM.lock().state == State::Alert;
+    let _ = consume_key(b'\n');
+    let alert_closed = !is_open() && NOTICE_DISMISSED.load(Ordering::Relaxed).wrapping_sub(d0) == 1;
+    FORM.lock().state = State::Closed;
+    // 2 — the accepted Log Out round trip
+    let _ = users::logout();
+    let in_ok = users::login(name, password).is_ok();
+    let r0 = REIGNITED.load(Ordering::Relaxed);
+    reopen_after_logout();
+    let screen_back = is_open() && users::whoami(&mut nb).is_none() && SWEPT.load(Ordering::Relaxed);
+    let feed = |s: &[u8]| { for &b in s { let _ = consume_key(b); } };
+    feed(name); let _ = consume_key(b'\t'); feed(password); let _ = consume_key(b'\n');
+    let back_in = !is_open() && matches!(users::whoami(&mut nb), Some(n) if &nb[..n] == name);
+    let furniture = REIGNITED.load(Ordering::Relaxed).wrapping_sub(r0) == 1 && !SWEPT.load(Ordering::Relaxed);
+    let _ = users::logout();
+    take_down();
+    FORM.lock().state = State::Closed;
+    HEADLESS.store(was, Ordering::Relaxed);
+    let ok = alert_up && alert_closed && in_ok && screen_back && back_in && furniture;
+    serial_println!(
+        ":: LOGOUT: alert_open={} alert_ok_closes={} session={} screen_back_empty={} relogin={} furniture_back={} -> {} ::",
+        alert_up, alert_closed, in_ok, screen_back, back_in, furniture, if ok { "PASS" } else { "FAIL —" }
+    );
 }
