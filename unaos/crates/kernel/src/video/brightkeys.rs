@@ -91,11 +91,11 @@ fn apply(write: bool) {
     );
 }
 
-#[cfg(feature = "gmux_igd")]
+#[cfg(all(feature = "gmux_igd", feature = "intel-ivb"))]
 fn write_gmux(raw: u16) -> bool {
     crate::drivers::gpu::igpu::gmux_set_brightness(raw)
 }
-#[cfg(not(feature = "gmux_igd"))]
+#[cfg(not(all(feature = "gmux_igd", feature = "intel-ivb")))]
 fn write_gmux(_raw: u16) -> bool {
     false
 }
