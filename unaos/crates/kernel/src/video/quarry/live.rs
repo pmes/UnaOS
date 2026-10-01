@@ -4293,3 +4293,51 @@ enter_matches_press={} :: {} ::",
         if ok { "PASS" } else { "FAIL" }
     );
 }
+
+/// FILEOPEN (FILEVIEW2, boot 18 "tried to open a txt file but nothing happens") — drive the REAL Quarry
+/// open path (`run_act(Act::Text(..))` -> latch -> [`service`] drain) for a file at `/` and one under the
+/// user's home, and assert a window was minted each time: root -> viewer, home -> editor.
+/// `:: FILEOPEN: root=viewer home=editor windows=2 -> PASS ::` (registered as `tests fileopen`).
+#[cfg(all(feature = "witness", feature = "wc"))]
+pub fn fileopen_selftest() {
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL};
+    let mt = crate::shell::vfs_mount_table();
+    let root = String::from("/FILEOPEN.TXT");
+    let home_dir = crate::video::textedit::home_dir();
+    let home = alloc::format!("{}FILEOPEN.TXT", home_dir);
+    let _ = mt.create(home_dir.trim_end_matches('/'), NodeKind::Dir, KERNEL_PRINCIPAL);
+    let body = b"fileopen fixture\nsecond line\n";
+    let mut staged = [false; 2];
+    for (i, p) in [&root, &home].iter().enumerate() {
+        let _ = mt.unlink(p, KERNEL_PRINCIPAL);
+        staged[i] = mt.create(p, NodeKind::File, KERNEL_PRINCIPAL).is_ok() && mt.write(p, 0, body, KERNEL_PRINCIPAL).is_ok();
+    }
+    let mut windows = 0usize;
+    let mut root_v = false;
+    let mut home_e = false;
+    if staged[0] {
+        run_act(Act::Text(root.clone()));
+        service();
+        root_v = crate::video::fileview::is_open() && crate::video::fileview::shown() == root && !crate::video::textedit::is_open();
+        if root_v { windows += 1; }
+    }
+    if staged[1] {
+        run_act(Act::Text(home.clone()));
+        service();
+        home_e = crate::video::textedit::is_open() && crate::video::textedit::may_edit(&home);
+        if home_e { windows += 1; }
+    }
+    crate::video::fileview::close();
+    crate::video::textedit::close();
+    for p in [&root, &home] {
+        let _ = mt.unlink(p, KERNEL_PRINCIPAL);
+    }
+    let ok = root_v && home_e && windows == 2;
+    serial_println!(
+        ":: FILEOPEN: root={} home={} windows={} staged={}{} -> {} ::",
+        if root_v { "viewer" } else { "none" },
+        if home_e { "editor" } else { "none" },
+        windows, staged[0] as u8, staged[1] as u8,
+        if ok { "PASS" } else { "FAIL" }
+    );
+}

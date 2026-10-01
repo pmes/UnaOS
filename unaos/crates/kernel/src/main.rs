@@ -9732,7 +9732,7 @@ fn shellwin_service_rearm(
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
 fn console_launch_drain(who: &'static str) {
-    let _ = unaos_kernel::video::dock::console_launch_service(who);
+    let _ = unaos_kernel::video::dock::console_launch_service(who); #[cfg(all(target_arch = "x86_64", feature = "quarry"))] unaos_kernel::video::quarry::service(); // FILEVIEW2 (boot 18: `open TEXT path=/hello.txt -> fileview (latched…)` and nothing) — the x86 render pass NEVER drained Quarry's latches: `quarry::service()` ran only from the dock-press arm (arch/x86_64/syscall.rs:7511) and the Orin pass, so a double-click latched fileview/textedit/facet and they waited for the next DOCK press (the PNG latched at 398 s opened at 416 s). Drained here, from the pass both x86 loops already run; folded on this line, line count unchanged.
 }
 
 /// APPPIN — the knob-off twin, so the folds at the three call sites cost the knob-off

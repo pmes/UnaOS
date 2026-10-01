@@ -927,3 +927,7 @@ REQUIRE [splash] held_ms=[0-9]+ released_by=(store-loaded|timeout)
 # ── TEXTEDIT (R75), TAIL-APPENDED — the editor fixture opens a scratch file, types 40 chars, saves, re-reads, compares
 REQUIRE :: TEXTEDIT: path=
 FORBID :: TEXTEDIT: .* -> FAIL ::
+
+# ── FILEOPEN (FILEVIEW2), TAIL-APPENDED — boot 18 "open a txt file, nothing happens": the Quarry open path (latch -> drain) is driven for a file at / (viewer) and one under /home (editor); both must mint a window
+REQUIRE :: FILEOPEN:
+FORBID :: FILEOPEN: .* -> FAIL ::
