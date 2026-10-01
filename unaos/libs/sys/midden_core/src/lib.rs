@@ -354,7 +354,7 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // aarch64: PSCI SYSTEM_RESET via SMC; unwired platforms refuse with an honest witness).
     // Always: the VERB is one word on every UnaOS (ONE-OS law); the per-platform mechanism
     // decides what it does, never whether the word exists.
-    ("reboot", Avail::Always),
+    ("reboot", Avail::Always), ("man", Avail::Always), ("trash", Avail::Always), ("shortcuts", Avail::Always), ("play", Avail::Always), ("linux", Avail::Always), ("shot", Avail::Always), // HELPVERB (R75): `man` is the help-in-a-window verb (help.rs intercepts it); the other five had shell.rs arms but no registry row, so the planner never routed them — registered Always (a cfg-gated-off arm refuses by name via the `other =>` net), LINE-NEUTRAL fold.
     // FILEVIEW `view` / TEXTEDIT `edit`: ring arms are desktop-gated (wc or desktop_firmware); registered Always on the `dns` precedent (a gated-off arm falls through to bare-name launch, never a typo refusal).
     ("view", Avail::Always), ("edit", Avail::Always), ("activity", Avail::Always), ("settings", Avail::Always), // ACTIVITY (R75)
     // processes

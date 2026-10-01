@@ -67,7 +67,7 @@ pub mod wifi;
 
 pub mod allocator;
 pub mod shell;
-pub mod shellux; // SHELLUX (R75) — line editor: history, Tab completion, control keys (new file, tail-neutral)
+pub mod shellux; pub mod help; // SHELLUX (R75) — line editor: history, Tab completion, control keys (new file, tail-neutral)
 pub mod selftest;
 pub mod tests; // R77 M3 — the desktop fixture registry and the `tests` verb
 
