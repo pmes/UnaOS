@@ -2622,6 +2622,12 @@ fi
 # (stripped by arm_features below, exactly as `ahci` itself is).
 # Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
 [ -n "${UNAOS_AHCI_WRITE:-}" ] && _feats="${_feats}ahci-write,"
+# SELFINSTALL M3 (SH-3): UNAOS_ROOT_PREFER=ahci|sdhc pins the bootdisk root walk to that source family when
+# it carries this kernel (the card AND the internal SSD both do after `install ssd --write`); the boot
+# prints `[bootdisk] root candidates: ... chose= prefer=` either way. Default OFF => first-found.
+# Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
+[ "${UNAOS_ROOT_PREFER:-}" = "ahci" ] && _feats="${_feats}root-prefer-ahci,"
+[ "${UNAOS_ROOT_PREFER:-}" = "sdhc" ] && _feats="${_feats}root-prefer-sdhc,"
 # HDA (rmbp-ledger B127, arc 1): UNAOS_HDA=1 arms drivers/hda.rs — the High Definition Audio
 # controller, the kernel's first audio line. NOTHING IN THIS KERNEL HAS EVER TOUCHED AUDIO, and the
 # reason is structural rather than an omission: `PciScanner::enumerate_buses` matches exactly one

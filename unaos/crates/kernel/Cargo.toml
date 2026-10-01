@@ -3560,6 +3560,11 @@ ahci = []
 # THIS knob the quiet failure reads on the wire as a working refusal.
 # See docs/dev/OS/07_USB_STORAGE/ahci.md and docs/dev/OS/10_INSTALL/partition-install.md.
 ahci-write = ["ahci"]
+# SELFINSTALL M3 (SH-3): `UNAOS_ROOT_PREFER=ahci|sdhc` pins the bootdisk root walk to that source family when it carries
+# this kernel (both the card and the SSD do after `install ssd --write`). Default OFF => first-found, byte-identical pick.
+# Kept in sync with builder/src/main.rs and unaos/arroyo.
+root-prefer-ahci = []
+root-prefer-sdhc = []
 # HDA (rmbp-ledger B127, arc 1) — the Intel High Definition Audio controller, `UNAOS_HDA=1`.
 # Nothing in this kernel had ever touched audio before this feature existed: `PciScanner::
 # enumerate_buses` matches exactly one class triple (xHCI) and the `[PCI-STOR]` census matches

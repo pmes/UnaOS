@@ -78,10 +78,17 @@ pub struct FileRec {
 /// destructive write. `src` is a mounted source volume (on the Pi, the seated card's own FAT boot
 /// partition). Every file is materialized whole; bounds guard the heap. Returns the buffered tree.
 pub fn snapshot(src: &FatFs) -> Result<SnapTree, InstallError> {
+    snapshot_capped(src, MAX_FILE_BYTES, MAX_TOTAL_BYTES)
+}
+
+/// SELFINSTALL: [`snapshot`] with the per-file and total caps as parameters — the x86 card carries a
+/// multi-MiB SRC.TGZ and the x86 heap is 256 MiB, so its caller raises the Pi-sized defaults.
+pub fn snapshot_capped(src: &FatFs, max_file: usize, max_total: usize) -> Result<SnapTree, InstallError> {
+    let caps = (max_file, max_total);
     let root_entries = src.read_root().map_err(|_| InstallError::Io)?;
     let mut file_count = 0usize;
     let mut total_bytes = 0usize;
-    let root = snap_dir(src, &root_entries, 0, &mut file_count, &mut total_bytes)?;
+    let root = snap_dir(src, &root_entries, 0, &mut file_count, &mut total_bytes, caps)?;
     Ok(SnapTree { root, file_count, total_bytes })
 }
 
@@ -91,6 +98,7 @@ fn snap_dir(
     depth: u32,
     file_count: &mut usize,
     total_bytes: &mut usize,
+    caps: (usize, usize),
 ) -> Result<SnapDir, InstallError> {
     if depth > MAX_DEPTH {
         return Err(InstallError::BadArg);
@@ -103,14 +111,14 @@ fn snap_dir(
         }
         if e.is_dir {
             let child_entries = src.read_dir(e.first_cluster()).map_err(|_| InstallError::Io)?;
-            let sub = snap_dir(src, &child_entries, depth + 1, file_count, total_bytes)?;
+            let sub = snap_dir(src, &child_entries, depth + 1, file_count, total_bytes, caps)?;
             dir.subdirs.push((String::from(name), sub));
         } else {
             let size = e.size as usize;
-            if size > MAX_FILE_BYTES {
+            if size > caps.0 {
                 return Err(InstallError::BadArg);
             }
-            if total_bytes.saturating_add(size) > MAX_TOTAL_BYTES {
+            if total_bytes.saturating_add(size) > caps.1 {
                 return Err(InstallError::NoSpace);
             }
             let mut data: Vec<u8> = Vec::new();
