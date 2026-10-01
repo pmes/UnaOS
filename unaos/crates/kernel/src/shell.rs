@@ -6165,7 +6165,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("shutting down: invoking the platform firmware mechanism...");
             crate::power::shutdown();
         },
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "view" => { view_verb(console, args.first().copied()); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "edit" => { edit_verb(console, args.first().copied()); } "reboot" => { // FILEVIEW M3 — `view <path>` opens a text file in the read-only viewer window (video/fileview.rs); ⚠ SAME-LINE fold, line-NEUTRAL, code before comment; helper at the file tail.
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "view" => { view_verb(console, args.first().copied()); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "edit" => { edit_verb(console, args.first().copied()); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "settings" => { settings_verb(console); } "reboot" => { // FILEVIEW M3 — `view <path>` opens a text file in the read-only viewer window (video/fileview.rs); ⚠ SAME-LINE fold, line-NEUTRAL, code before comment; helper at the file tail.
             console.println("rebooting: invoking the platform firmware mechanism...");
             crate::power::reboot();
         },
@@ -8818,5 +8818,14 @@ fn edit_verb(console: &mut Console, path: Option<&str>) {
     match crate::video::textedit::open(&full) {
         Ok((b, l)) => console.println(&alloc::format!("edit: {} — {} bytes, {} lines (Ctrl-S saves)", full, b, l)),
         Err(e) => console.println(&alloc::format!("edit: {}: {}", full, e)),
+    }
+}
+
+/// SETTINGS (R75): `settings` opens the settings window (sliders/toggles over brightness, volume, idle blank, pointer speed, wallpaper, account).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn settings_verb(console: &mut Console) {
+    match crate::video::settings::open() {
+        Ok(()) => console.println("settings: window open"),
+        Err(e) => console.println(&alloc::format!("settings: {}", e)),
     }
 }

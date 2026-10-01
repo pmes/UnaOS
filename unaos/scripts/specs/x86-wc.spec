@@ -927,3 +927,6 @@ REQUIRE [splash] held_ms=[0-9]+ released_by=(store-loaded|timeout)
 # ── TEXTEDIT (R75), TAIL-APPENDED — the editor fixture opens a scratch file, types 40 chars, saves, re-reads, compares
 REQUIRE :: TEXTEDIT: path=
 FORBID :: TEXTEDIT: .* -> FAIL ::
+# ── SETTINGS (R75), TAIL-APPENDED — the settings fixture: open, idle=5, save, re-read, compare
+REQUIRE :: SETTINGS: controls=[0-9]+ loaded=[0-9]+ saved=[0-9]+ -> PASS ::
+FORBID :: SETTINGS: .* -> FAIL ::

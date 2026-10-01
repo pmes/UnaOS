@@ -156,4 +156,10 @@ fn ensure_shellux() {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("shellux", crate::shellux::selftest); }
     }
+    // SETTINGS (R75): the settings fixture (open, idle=5, save, re-read, compare) beside it.
+    #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        static DONE2: AtomicBool = AtomicBool::new(false);
+        if !DONE2.swap(true, Ordering::AcqRel) { register("settings", crate::video::settings::selftest); }
+    }
 }
