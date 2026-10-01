@@ -74,10 +74,10 @@ pub fn parse(b: &[u8]) -> Result<Plan, &'static str> {
     for i in 0..phnum as usize {
         let ph = phoff as usize + i * 56;
         let ty = u32_at(b, ph).ok_or("bad p_type")?;
-        if ty == PT_INTERP {
+        if ty == PT_INTERP as u64 {
             return Err("dynamic executable (PT_INTERP) — only static binaries are supported");
         }
-        if ty != PT_LOAD {
+        if ty != PT_LOAD as u64 {
             continue;
         }
         let flags = u32_at(b, ph + 4).ok_or("bad p_flags")? as u32;

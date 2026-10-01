@@ -2190,7 +2190,7 @@ core::arch::global_asm!(
     // C argument register) BEFORE the shuffle below, so nothing in the shuffle can clobber it. `r8`
     // was previously untouched here and is scrubbed on the way out with the other caller-saved
     // registers, so the return half is unchanged.
-    crate::linuxabi_r8!(), "mov r8, r10",                  // arg3 -> 5th C arg (SYS_THREAD_SPAWN's `place`; junk otherwise)
+    "mov gs:[{uoff}], r8", "mov r8, r10",               // arg3 -> 5th C arg (SYS_THREAD_SPAWN's `place`; junk otherwise)
     "mov rcx, rdx",                 // arg2 -> 4th C arg
     "mov rdx, rsi",                 // arg1 -> 3rd C arg
     "mov rsi, rdi",                 // arg0 -> 2nd C arg
@@ -22907,9 +22907,9 @@ fn cfu_efault_witness() {
     let window = USER_WINDOW_PAGES * PAGE_SIZE;
     // The three rejected shapes, each driven through the real dispatcher. None dereferences the pointer —
     // `user_range_ok` returns `Err(EFAULT)` before `copy_from_user` copies, so this is safe in any CR3.
-    let wrap = syscall_dispatch(SYS_OPEN, u64::MAX - 2, NLEN, 0, 0); // ptr + NLEN overflows (end < ptr)
-    let below = syscall_dispatch(SYS_OPEN, USER_BASE - PAGE_SIZE, NLEN, 0, 0); // ptr < USER_BASE
-    let above = syscall_dispatch(SYS_OPEN, USER_BASE + window - 4, NLEN, 0, 0); // end past the window
+    let wrap = syscall_dispatch(SYS_OPEN, u64::MAX - 2, NLEN, 0, 0, #[cfg(feature = "linuxabi")] 0); // ptr + NLEN overflows (end < ptr)
+    let below = syscall_dispatch(SYS_OPEN, USER_BASE - PAGE_SIZE, NLEN, 0, 0, #[cfg(feature = "linuxabi")] 0); // ptr < USER_BASE
+    let above = syscall_dispatch(SYS_OPEN, USER_BASE + window - 4, NLEN, 0, 0, #[cfg(feature = "linuxabi")] 0); // end past the window
     // Positive controls (validate-only, no deref): a valid in-window READ range is accepted, and the READ
     // bound admits page 0 (a legal read source) while the WRITE bound rejects it (page 0 is RO/RX).
     let inwin_ok = user_range_ok(USER_BASE + PAGE_SIZE, NLEN, UserAccess::Read).is_ok();
@@ -29582,7 +29582,7 @@ fn restore_gate(slot: usize, id: usize) -> bool {
     let mut via = "sleep";
     #[cfg(feature = "nvidia-kepler-vblank")]
     {
-        if crate::drivers::gpu::kepler_vblank::wait_vblank_bounded(2 * PANEL_FRAME_US) {
+        if crate::drivers::gpu::kepler_vblank::wait_vblank_bounded(2 * 16_667u64) {
             via = "vblank";
         }
     }

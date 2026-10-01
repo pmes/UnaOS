@@ -42,7 +42,7 @@ fn console_write(p: &LinuxProc, buf: u64, len: u64) -> i64 {
         if !p.asp.copy_in(buf + done, &mut chunk[..n]) {
             return if done > 0 { done as i64 } else { -EFAULT };
         }
-        crate::serial_print!("{}", String::from_utf8_lossy(&chunk[..n]));
+        serial_print!("{}", String::from_utf8_lossy(&chunk[..n]));
         done += n as u64;
     }
     done as i64
