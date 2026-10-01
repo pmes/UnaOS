@@ -793,3 +793,211 @@ mod appmenu_tests {
         std::println!(":: APPMENU: abi items={} wire_bytes={} cap_bytes={} body_max={} -> PASS ::", MENU_ITEMS_MAX, MENU_ITEM_LEN, MENU_ITEMS_MAX * MENU_ITEM_LEN, BUS_BODY_MAX);
     }
 }
+
+// =================================================================================================
+// ATTRSURF (B299) — the typed-attribute surface: five syscalls, five bus verbs, ONE byte layout.
+//
+// The syscall inputs ARE the bus request bodies and the syscall outputs ARE the bus reply bodies, so
+// a program speaks the same bytes either way (the SYS_RENAME / `mv` equivalence, kept on purpose).
+// All integers little-endian. Appended at the file tail so no existing line moves.
+//
+//   value wire   [AttrWireHdr: tag u8, rsv [u8;3] = 0, len u32][len payload bytes]
+//                tag 1 int (len 8, i64) · 2 float (len 8, f64) · 3 string (UTF-8) · 4 blob ·
+//                5 vector (len % 4 == 0, f32 each); len <= ATTR_VALUE_MAX
+//   request      [path_len u16][key_len u16][path][key][value wire — SET only, absent otherwise]
+//                path absolute, 1..=ATTR_PATH_MAX; key 0..=ATTR_KEY_MAX (0 only for LIST)
+//   LIST reply   repeated [key_len u16][key][value wire]
+//   QUERY reply  repeated [id u64][path_len u16][path]
+//   STAT reply   UserStat (32 bytes)
+// =================================================================================================
+
+/// `SYS_ATTR_SET(req_ptr, req_len) -> 0 / -errno` — set (create or replace) one typed attribute.
+pub const SYS_ATTR_SET: u64 = 51;
+/// `SYS_ATTR_GET(req_ptr, req_len, out_ptr, out_cap) -> value-wire bytes written / -errno`
+/// (`-ENODATA` absent key, `-ERANGE` out too small).
+pub const SYS_ATTR_GET: u64 = 52;
+/// `SYS_ATTR_LIST(path_ptr, path_len, out_ptr, out_cap) -> bytes written / -errno`.
+pub const SYS_ATTR_LIST: u64 = 53;
+/// `SYS_QUERY(expr_ptr, expr_len, out_ptr, out_cap) -> bytes written / -errno` — every readable hit.
+pub const SYS_QUERY: u64 = 54;
+/// `SYS_STAT(path_ptr, path_len, out_ptr) -> 0 / -errno` — writes one [`UserStat`].
+pub const SYS_STAT: u64 = 55;
+
+/// Bus verbs, same bodies as the syscalls above (request body = syscall input; reply body = output).
+pub const BUS_VERB_ATTR_SET: u8 = 11;
+pub const BUS_VERB_ATTR_GET: u8 = 12;
+pub const BUS_VERB_ATTR_LIST: u8 = 13;
+pub const BUS_VERB_ATTR_QUERY: u8 = 14;
+pub const BUS_VERB_ATTR_STAT: u8 = 15;
+
+/// Value tags.
+pub const ATTR_TAG_INT: u8 = 1;
+pub const ATTR_TAG_FLOAT: u8 = 2;
+pub const ATTR_TAG_STR: u8 = 3;
+pub const ATTR_TAG_BLOB: u8 = 4;
+pub const ATTR_TAG_VECTOR: u8 = 5;
+
+/// Payload ceiling of one value. A SET request at the ceiling still fits one bus body.
+pub const ATTR_VALUE_MAX: usize = 3072;
+/// Path and key ceilings (each fits the u16 length field with room).
+pub const ATTR_PATH_MAX: usize = 255;
+pub const ATTR_KEY_MAX: usize = 255;
+/// Bytes of the value header.
+pub const ATTR_WIRE_HDR_LEN: usize = 8;
+/// Bytes of the request's two length fields.
+pub const ATTR_REQ_HDR_LEN: usize = 4;
+/// Ceiling on an out buffer the kernel will fill (GET/LIST/QUERY) — one bus body.
+pub const ATTR_OUT_MAX: usize = BUS_BODY_MAX;
+
+/// `-ERANGE`: the caller's out buffer is smaller than the answer.
+pub const ERANGE: i64 = -34;
+/// `-ENODATA`: the object has no attribute by that key.
+pub const ENODATA: i64 = -61;
+/// `-ENOTSUP`: the volume carries no typed attributes (FAT).
+pub const ENOTSUP: i64 = -95;
+/// `-ENOTDIR` / `-EISDIR` / `-ENODEV` / `-EIO` as the attribute verbs report them.
+pub const ENOTDIR: i64 = -20;
+pub const EISDIR: i64 = -21;
+pub const ENODEV: i64 = -19;
+pub const EIO: i64 = -5;
+
+/// The value header, `#[repr(C)]` so a ring-3 program may overlay it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttrWireHdr {
+    pub tag: u8,
+    pub _rsv: [u8; 3],
+    pub len: u32,
+}
+
+impl AttrWireHdr {
+    pub const fn to_bytes(&self) -> [u8; ATTR_WIRE_HDR_LEN] {
+        let l = self.len.to_le_bytes();
+        [self.tag, 0, 0, 0, l[0], l[1], l[2], l[3]]
+    }
+}
+
+/// Validate one value wire at the head of `b`: returns `(tag, payload, bytes consumed)`. Fail-closed:
+/// unknown tag, nonzero reserved bytes, a length past the ceiling or past `b`, a scalar whose len is
+/// not 8, a vector whose len is not a multiple of 4, a string that is not UTF-8.
+pub fn attr_wire_parse(b: &[u8]) -> Result<(u8, &[u8], usize), i64> {
+    if b.len() < ATTR_WIRE_HDR_LEN || b[1] != 0 || b[2] != 0 || b[3] != 0 {
+        return Err(EINVAL);
+    }
+    let tag = b[0];
+    let len = u32::from_le_bytes([b[4], b[5], b[6], b[7]]) as usize;
+    if len > ATTR_VALUE_MAX || ATTR_WIRE_HDR_LEN + len > b.len() {
+        return Err(EINVAL);
+    }
+    let p = &b[ATTR_WIRE_HDR_LEN..ATTR_WIRE_HDR_LEN + len];
+    let ok = match tag {
+        ATTR_TAG_INT | ATTR_TAG_FLOAT => len == 8,
+        ATTR_TAG_STR => core::str::from_utf8(p).is_ok(),
+        ATTR_TAG_BLOB => true,
+        ATTR_TAG_VECTOR => len % 4 == 0,
+        _ => false,
+    };
+    if !ok {
+        return Err(EINVAL);
+    }
+    Ok((tag, p, ATTR_WIRE_HDR_LEN + len))
+}
+
+/// Split a request: `(path, key, rest)`. `rest` is the value wire for SET and must be EMPTY for the
+/// other verbs (the caller checks). Fail-closed on any length that does not fit.
+pub fn attr_req_parse(b: &[u8]) -> Result<(&[u8], &[u8], &[u8]), i64> {
+    if b.len() < ATTR_REQ_HDR_LEN {
+        return Err(EINVAL);
+    }
+    let pl = u16::from_le_bytes([b[0], b[1]]) as usize;
+    let kl = u16::from_le_bytes([b[2], b[3]]) as usize;
+    if pl == 0 || pl > ATTR_PATH_MAX || kl > ATTR_KEY_MAX || ATTR_REQ_HDR_LEN + pl + kl > b.len() {
+        return Err(EINVAL);
+    }
+    let path = &b[ATTR_REQ_HDR_LEN..ATTR_REQ_HDR_LEN + pl];
+    let key = &b[ATTR_REQ_HDR_LEN + pl..ATTR_REQ_HDR_LEN + pl + kl];
+    Ok((path, key, &b[ATTR_REQ_HDR_LEN + pl + kl..]))
+}
+
+/// Build a request into `out`; returns its length, or `None` when it does not fit / a field is
+/// over its ceiling. `value` is an already-encoded value wire (empty for GET/LIST).
+pub fn attr_req_build(path: &[u8], key: &[u8], value: &[u8], out: &mut [u8]) -> Option<usize> {
+    let n = ATTR_REQ_HDR_LEN + path.len() + key.len() + value.len();
+    if path.is_empty() || path.len() > ATTR_PATH_MAX || key.len() > ATTR_KEY_MAX || n > out.len() {
+        return None;
+    }
+    out[0..2].copy_from_slice(&(path.len() as u16).to_le_bytes());
+    out[2..4].copy_from_slice(&(key.len() as u16).to_le_bytes());
+    let mut o = ATTR_REQ_HDR_LEN;
+    out[o..o + path.len()].copy_from_slice(path);
+    o += path.len();
+    out[o..o + key.len()].copy_from_slice(key);
+    o += key.len();
+    out[o..o + value.len()].copy_from_slice(value);
+    Some(n)
+}
+
+/// `SYS_STAT`'s answer. `flags` bit0 = `id` valid, bit1 = `mtime` valid (unix seconds).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UserStat {
+    /// 0 file, 1 directory.
+    pub kind: u32,
+    pub flags: u32,
+    pub size: u64,
+    pub id: u64,
+    pub mtime: u64,
+}
+pub const STAT_HAS_ID: u32 = 1;
+pub const STAT_HAS_MTIME: u32 = 2;
+pub const USER_STAT_LEN: usize = 32;
+
+impl UserStat {
+    pub const fn to_bytes(&self) -> [u8; USER_STAT_LEN] {
+        let mut b = [0u8; USER_STAT_LEN];
+        let (k, f, s, i, m) = (self.kind.to_le_bytes(), self.flags.to_le_bytes(), self.size.to_le_bytes(), self.id.to_le_bytes(), self.mtime.to_le_bytes());
+        let mut j = 0;
+        while j < 4 { b[j] = k[j]; b[4 + j] = f[j]; j += 1; }
+        j = 0;
+        while j < 8 { b[8 + j] = s[j]; b[16 + j] = i[j]; b[24 + j] = m[j]; j += 1; }
+        b
+    }
+}
+
+/// The number line moved: `SYS_STAT` is the high-water mark, the next verb minted takes 56.
+const _: () = assert!(SYS_ATTR_SET == SYS_RENAME + 1 && SYS_STAT == 55);
+const _: () = assert!(core::mem::size_of::<UserStat>() == USER_STAT_LEN);
+const _: () = assert!(core::mem::size_of::<AttrWireHdr>() == ATTR_WIRE_HDR_LEN);
+/// A SET at every ceiling fits one bus body.
+const _: () = assert!(ATTR_REQ_HDR_LEN + ATTR_PATH_MAX + ATTR_KEY_MAX + ATTR_WIRE_HDR_LEN + ATTR_VALUE_MAX <= BUS_BODY_MAX);
+const _: () = assert!(BUS_VERB_ATTR_SET > BUS_VERB_NOTICE);
+
+#[cfg(test)]
+mod attrsurf_tests {
+    extern crate std;
+    use super::*;
+    #[test]
+    fn attr_wire_roundtrip_and_refusals() {
+        let mut buf = [0u8; 64];
+        let v = 42i64.to_le_bytes();
+        let mut val = [0u8; 16];
+        val[..8].copy_from_slice(&AttrWireHdr { tag: ATTR_TAG_INT, _rsv: [0; 3], len: 8 }.to_bytes());
+        val[8..].copy_from_slice(&v);
+        let n = attr_req_build(b"/home/A", b"n", &val, &mut buf).unwrap();
+        let (p, k, rest) = attr_req_parse(&buf[..n]).unwrap();
+        assert_eq!((p, k), (b"/home/A".as_slice(), b"n".as_slice()));
+        let (tag, payload, used) = attr_wire_parse(rest).unwrap();
+        assert_eq!((tag, payload, used), (ATTR_TAG_INT, v.as_slice(), 16));
+        // refusals
+        assert_eq!(attr_wire_parse(&[9, 0, 0, 0, 0, 0, 0, 0]), Err(EINVAL)); // unknown tag
+        assert_eq!(attr_wire_parse(&[1, 0, 0, 0, 4, 0, 0, 0, 1, 2, 3, 4]), Err(EINVAL)); // int len 4
+        assert_eq!(attr_wire_parse(&[5, 0, 0, 0, 3, 0, 0, 0, 1, 2, 3]), Err(EINVAL)); // vector len 3
+        assert_eq!(attr_wire_parse(&[3, 1, 0, 0, 0, 0, 0, 0]), Err(EINVAL)); // reserved byte
+        assert_eq!(attr_req_parse(&[0, 0, 0, 0]), Err(EINVAL)); // empty path
+        assert_eq!(attr_req_parse(&[5, 0, 0, 0, b'/']), Err(EINVAL)); // path overruns
+        let st = UserStat { kind: 1, flags: STAT_HAS_ID, size: 7, id: 9, mtime: 0 }.to_bytes();
+        assert_eq!(st[0], 1);
+        assert_eq!(st[16], 9);
+        std::println!(":: ATTRSURF-ABI: wire hdr={} value_max={} syscalls=51..=55 bus=11..=15 -> PASS ::", ATTR_WIRE_HDR_LEN, ATTR_VALUE_MAX);
+    }
+}

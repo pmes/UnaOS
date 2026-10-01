@@ -104,6 +104,14 @@ pub enum NodeKind {
 pub struct Stat {
     pub kind: NodeKind,
     pub size: u64,
+    /// ATTRSURF (B294): the object's stable identity where the medium has one — the unafs inode id
+    /// (stable since K8a's CoW inode map). `None` on FAT, whose only "identity" is a directory
+    /// position that a rename moves. Paths stay the addressing contract; this is the handle a caller
+    /// keeps across a rename (trash, recents, query results).
+    pub id: Option<u64>,
+    /// ATTRSURF: last write, unix seconds, when the medium records one (FAT's last-write stamp).
+    /// `None` on native UnaFS until UNAFSTIME gives the inode a time field — never fabricated.
+    pub mtime: Option<u64>,
 }
 
 /// A wall-clock stamp as the VFS presents it — the fields a listing renders, and
@@ -334,6 +342,34 @@ pub trait VfsBackend {
     /// typed attributes, so the FAT backend inherits the default refusal and
     /// `setfattr -x k /boot/F` says so rather than pretending to succeed.
     fn remove_attr(&self, _rel: &str, _key: &str, _principal: &str) -> Result<(), VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
+    // --- ATTRSURF (B299) — the typed-attribute surface ---------------------------------------
+    //
+    // Four verbs over [`AttrValue`], each a refusal by default so FAT (and any backend with no
+    // typed attributes) answers `Unsupported` -> `-ENOTSUP` in the type system, as `remove_attr`
+    // already does. Implementors authorize FIRST: read for get/list/query, write for set.
+
+    /// Set (create or replace) the typed attribute `key` on the object at `rel`.
+    fn set_attr(&self, _rel: &str, _key: &str, _value: AttrValue, _principal: &str) -> Result<(), VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Read one typed attribute. An absent key is [`VfsError::Backend`]`("no-attr")` (`-ENODATA`).
+    fn get_attr(&self, _rel: &str, _key: &str, _principal: &str) -> Result<AttrValue, VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Every typed attribute on the object at `rel`, sorted by key.
+    fn list_attrs(&self, _rel: &str, _principal: &str) -> Result<Vec<(String, AttrValue)>, VfsError> {
+        Err(VfsError::Unsupported)
+    }
+
+    /// Run an attribute query (the crate's grammar: `k == v`, `!=`, `>`, `<`,
+    /// `similarity(k, [..]) > t`, ` AND k == "s"` filters) over THIS volume. Returns
+    /// `(object id, volume-relative path)`; a hit `principal` may not read is dropped, not shown.
+    fn query(&self, _expr: &str, _principal: &str) -> Result<Vec<(u64, String)>, VfsError> {
         Err(VfsError::Unsupported)
     }
 
@@ -746,6 +782,71 @@ impl MountTable {
     pub fn remove_attr(&self, path: &str, key: &str, principal: &str) -> Result<(), VfsError> {
         let (b, rel) = self.resolve(path)?;
         b.remove_attr(rel, key, principal)
+    }
+
+    /// ATTRSURF: resolve-then-dispatch for the attribute surface.
+    pub fn set_attr(&self, path: &str, key: &str, value: AttrValue, principal: &str) -> Result<(), VfsError> {
+        let (b, rel) = self.resolve(path)?;
+        b.set_attr(rel, key, value, principal)
+    }
+
+    pub fn get_attr(&self, path: &str, key: &str, principal: &str) -> Result<AttrValue, VfsError> {
+        let (b, rel) = self.resolve(path)?;
+        b.get_attr(rel, key, principal)
+    }
+
+    pub fn list_attrs(&self, path: &str, principal: &str) -> Result<Vec<(String, AttrValue)>, VfsError> {
+        let (b, rel) = self.resolve(path)?;
+        b.list_attrs(rel, principal)
+    }
+
+    /// ATTRSURF: a query over the WHOLE namespace — every mounted volume that answers queries, each
+    /// asked ONCE however many prefixes bind it (deduped by [`same_storage`]), its hits re-rooted
+    /// under the prefix that reaches them. Hits outside a rooted mount's sub-root are not reachable
+    /// at that prefix and are dropped there. `Unsupported` only when NO volume answers.
+    pub fn query(&self, expr: &str, principal: &str) -> Result<Vec<(u64, String)>, VfsError> {
+        let mut out: Vec<(u64, String)> = Vec::new();
+        let mut answered = false;
+        let mut asked: Vec<&dyn VfsBackend> = Vec::new();
+        // Shortest prefix first so a volume bound at `/` and `/x` is reported under `/`.
+        let mut order: Vec<&Mount> = self.mounts.iter().collect();
+        order.sort_by_key(|m| m.prefix.len());
+        for m in order {
+            let b = m.backend.as_ref();
+            if asked.iter().any(|a| same_storage(*a, b)) {
+                continue;
+            }
+            asked.push(b);
+            let hits = match b.query(expr, principal) {
+                Ok(h) => h,
+                Err(VfsError::Unsupported) => continue,
+                Err(e) => return Err(e),
+            };
+            answered = true;
+            let root = b.mount_root();
+            for (id, vpath) in hits {
+                let rest = if root.is_empty() {
+                    vpath.as_str()
+                } else {
+                    match vpath.strip_prefix(root) {
+                        Some(r) if r.is_empty() || r.starts_with('/') => r,
+                        _ => continue,
+                    }
+                };
+                let mut p = String::new();
+                if m.prefix != "/" {
+                    p.push_str(&m.prefix);
+                }
+                if rest.is_empty() {
+                    if p.is_empty() { p.push('/'); }
+                } else {
+                    if !rest.starts_with('/') { p.push('/'); }
+                    p.push_str(rest);
+                }
+                out.push((id, p));
+            }
+        }
+        if answered { Ok(out) } else { Err(VfsError::Unsupported) }
     }
 
     /// One row per mount, for the `mount`/`df` listing: `(prefix, volume name,
@@ -1241,10 +1342,14 @@ impl VfsBackend for FatBackend {
             None => Ok(Stat {
                 kind: NodeKind::Dir,
                 size: 0,
+                id: None,
+                mtime: None,
             }), // the volume root is a directory
             Some(e) => Ok(Stat {
                 kind: if e.is_dir { NodeKind::Dir } else { NodeKind::File },
                 size: e.size as u64,
+                id: None,
+                mtime: { let t = e.mtime(); if t.is_zero() { None } else { Some(VfsTime { year: t.year, month: t.month, day: t.day, hour: t.hour, min: t.min, sec: t.sec }.unix_secs()) } },
             }),
         }
     }
@@ -1319,12 +1424,12 @@ impl VfsBackend for FatBackend {
             // 0x20 = plain file; create_in_dir yields a 0-length entry.
             NodeKind::File => {
                 fs.create_in_dir(parent, &leaf, 0x20).map_err(fat_create_err)?;
-                Ok(Stat { kind: NodeKind::File, size: 0 })
+                Ok(Stat { kind: NodeKind::File, size: 0, id: None, mtime: None })
             }
             // create_dir allocates the child cluster + `.`/`..` and publishes it.
             NodeKind::Dir => {
                 fs.create_dir(parent, &leaf).map_err(fat_create_err)?;
-                Ok(Stat { kind: NodeKind::Dir, size: 0 })
+                Ok(Stat { kind: NodeKind::Dir, size: 0, id: None, mtime: None })
             }
         }
     }
@@ -1647,6 +1752,8 @@ impl VfsBackend for NativeBackend {
             Ok(Stat {
                 kind: native_kind(ino.kind),
                 size: ino.size,
+                id: Some(id), // ATTRSURF (B294): the inode id is the object's identity
+                mtime: None,  // UnaFS has no time field until UNAFSTIME
             })
         })
         .map_err(unafs_err)?
@@ -1727,6 +1834,8 @@ impl VfsBackend for NativeBackend {
             Ok(Stat {
                 kind,
                 size: 0,
+                id: Some(id), // ATTRSURF (B294)
+                mtime: None,
             })
         })
         .map_err(unafs_err)?
@@ -1873,12 +1982,87 @@ impl VfsBackend for NativeBackend {
     }
 
     fn remove_attr(&self, rel: &str, key: &str, principal: &str) -> Result<(), VfsError> {
+        attr_key_guard(key, principal)?; // ATTRSURF: dropping `owner` would make the object public — ACL rows are not attributes to a non-kernel caller
         let path = native_abs(rel);
         crate::fs::unafs::with_unafs(|fs| {
             let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
             native_write_authz(fs, id, principal)?;
             fs.remove_attribute(id, key)
                 .map_err(|_| VfsError::Backend("unafs-rmattr"))
+        })
+        .map_err(unafs_err)?
+    }
+
+    // --- ATTRSURF (B299): the attribute surface over the one coherent mount -------------------
+
+    fn set_attr(&self, rel: &str, key: &str, value: AttrValue, principal: &str) -> Result<(), VfsError> {
+        attr_key_guard(key, principal)?;
+        value.check()?;
+        let path = native_abs(rel);
+        crate::fs::unafs::with_unafs(|fs| {
+            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            native_write_authz(fs, id, principal)?;
+            fs.set_attribute(id, key.to_string(), value.clone().into_native()) // `with_unafs` takes FnMut
+                .map_err(|_| VfsError::Backend("unafs-setattr"))
+        })
+        .map_err(unafs_err)?
+    }
+
+    fn get_attr(&self, rel: &str, key: &str, principal: &str) -> Result<AttrValue, VfsError> {
+        let path = native_abs(rel);
+        crate::fs::unafs::with_unafs(|fs| {
+            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            native_read_gate(fs, id, principal)?;
+            match fs.get_attribute(id, key) {
+                Ok(Some(v)) => Ok(AttrValue::from_native(v)),
+                Ok(None) => Err(VfsError::Backend("no-attr")),
+                Err(_) => Err(VfsError::Backend("unafs-getattr")),
+            }
+        })
+        .map_err(unafs_err)?
+    }
+
+    fn list_attrs(&self, rel: &str, principal: &str) -> Result<Vec<(String, AttrValue)>, VfsError> {
+        let path = native_abs(rel);
+        crate::fs::unafs::with_unafs(|fs| {
+            let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
+            native_read_gate(fs, id, principal)?;
+            let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;
+            let mut out: Vec<(String, AttrValue)> = ino
+                .attributes
+                .iter()
+                .map(|(k, v)| (k.clone(), AttrValue::from_native(v.clone())))
+                .collect();
+            // Spilled (> 256 B) values live in their own extents; read each through the crate.
+            for k in ino.large_attributes.keys() {
+                if let Ok(Some(v)) = fs.get_attribute(id, k) {
+                    out.push((k.clone(), AttrValue::from_native(v)));
+                }
+            }
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(out)
+        })
+        .map_err(unafs_err)?
+    }
+
+    fn query(&self, expr: &str, principal: &str) -> Result<Vec<(u64, String)>, VfsError> {
+        crate::fs::unafs::with_unafs(|fs| {
+            let hits = fs.query(expr).map_err(|e| match e {
+                ::unafs::fs::FileSystemError::Query(_) => VfsError::Backend("bad-query"),
+                _ => VfsError::Backend("unafs-query"),
+            })?;
+            let mut ids: Vec<u64> = hits.iter().map(|(ino, _)| ino.id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let paths = native_query_paths(fs, &ids);
+            let mut out = Vec::new();
+            for (id, p) in paths {
+                // ACL on results: a hit the principal may not read is DROPPED, never shown.
+                if native_read_gate(fs, id, principal).is_ok() {
+                    out.push((id, p));
+                }
+            }
+            Ok(out)
         })
         .map_err(unafs_err)?
     }
@@ -1990,6 +2174,8 @@ impl VfsBackend for MockBackend {
             return Ok(Stat {
                 kind: NodeKind::Dir,
                 size: 0,
+                id: None,
+                mtime: None,
             });
         }
         self.files
@@ -1998,6 +2184,8 @@ impl VfsBackend for MockBackend {
             .map(|(_, d)| Stat {
                 kind: NodeKind::File,
                 size: d.len() as u64,
+                id: None,
+                mtime: None,
             })
             .ok_or(VfsError::NoSuchPath)
     }
@@ -2735,13 +2923,13 @@ impl VfsBackend for NsMockBackend {
     }
     fn stat(&self, rel: &str) -> Result<Stat, VfsError> {
         if Self::is_root(rel) {
-            return Ok(Stat { kind: NodeKind::Dir, size: 0 });
+            return Ok(Stat { kind: NodeKind::Dir, size: 0, id: None, mtime: None });
         }
         self.nodes
             .lock()
             .iter()
             .find(|(p, _, _)| p == rel)
-            .map(|(_, k, s)| Stat { kind: *k, size: *s })
+            .map(|(_, k, s)| Stat { kind: *k, size: *s, id: None, mtime: None })
             .ok_or(VfsError::NoSuchPath)
     }
     fn read(&self, rel: &str, _offset: u64, _len: usize) -> Result<Vec<u8>, VfsError> {
@@ -2775,7 +2963,7 @@ impl VfsBackend for NsMockBackend {
             return Err(VfsError::NoSuchPath);
         }
         n.push((rel.to_string(), kind, 0));
-        Ok(Stat { kind, size: 0 })
+        Ok(Stat { kind, size: 0, id: None, mtime: None })
     }
     fn write(&self, rel: &str, offset: u64, data: &[u8], principal: &str) -> Result<usize, VfsError> {
         self.authorize_write(rel, principal)?;
@@ -3139,4 +3327,245 @@ pub fn el0_rmdir(fs: &crate::fs::fat::FatFs, path: &str) -> Result<bool, El0Loca
         Err(FatError::Busy) => Err(El0LocateError::Busy),
         Err(_) => Err(El0LocateError::Io),
     }
+}
+
+// =========================================================================================
+// ATTRSURF (B299) — the backend-neutral attribute value, and the native helpers under it.
+// =========================================================================================
+
+/// A typed attribute value as the VFS presents it — the unafs crate's five variants, mirrored so no
+/// crate type crosses the trait (the crate is aarch64-only in this kernel today; this enum is not).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttrValue {
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Blob(Vec<u8>),
+    Vector(Vec<f32>),
+}
+
+/// Largest value the surface accepts (bytes of payload) — one bus body with room for path and key.
+pub const ATTR_VALUE_MAX: usize = una_abi::ATTR_VALUE_MAX;
+
+impl AttrValue {
+    /// The type word `getfattr` prints and the wire tag names.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            AttrValue::Int(_) => "int",
+            AttrValue::Float(_) => "float",
+            AttrValue::Str(_) => "string",
+            AttrValue::Blob(_) => "blob",
+            AttrValue::Vector(_) => "vector",
+        }
+    }
+
+    /// Payload size in bytes (the wire `len`).
+    pub fn payload_len(&self) -> usize {
+        match self {
+            AttrValue::Int(_) | AttrValue::Float(_) => 8,
+            AttrValue::Str(s) => s.len(),
+            AttrValue::Blob(b) => b.len(),
+            AttrValue::Vector(v) => v.len() * 4,
+        }
+    }
+
+    /// The bound every writer checks before it reaches the medium.
+    pub fn check(&self) -> Result<(), VfsError> {
+        if self.payload_len() > ATTR_VALUE_MAX {
+            return Err(VfsError::Backend("attr-too-big"));
+        }
+        Ok(())
+    }
+
+    /// Parse a value BY SHAPE (the `setfattr k=v` grammar): `"..."` string · `b64:...` blob ·
+    /// `[f, f, ...]` vector · an integer · a float · anything else is a bare string.
+    pub fn parse_shaped(s: &str) -> Result<AttrValue, &'static str> {
+        let t = s.trim();
+        if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+            return Ok(AttrValue::Str(t[1..t.len() - 1].to_string()));
+        }
+        if let Some(b) = t.strip_prefix("b64:") {
+            return b64_decode(b).map(AttrValue::Blob).ok_or("bad base64");
+        }
+        if t.starts_with('[') && t.ends_with(']') {
+            let inner = t[1..t.len() - 1].trim();
+            let mut v = Vec::new();
+            if !inner.is_empty() {
+                for p in inner.split(',') {
+                    v.push(p.trim().parse::<f32>().map_err(|_| "bad number in vector")?);
+                }
+            }
+            return Ok(AttrValue::Vector(v));
+        }
+        if let Ok(i) = t.parse::<i64>() {
+            return Ok(AttrValue::Int(i));
+        }
+        if let Ok(f) = t.parse::<f64>() {
+            return Ok(AttrValue::Float(f));
+        }
+        Ok(AttrValue::Str(t.to_string()))
+    }
+
+    /// `type value` — one `getfattr` line's right half. Blobs render as `b64:` so the output
+    /// round-trips through `setfattr`.
+    pub fn render(&self) -> String {
+        match self {
+            AttrValue::Int(i) => alloc::format!("int {}", i),
+            AttrValue::Float(f) => alloc::format!("float {}", f),
+            AttrValue::Str(s) => alloc::format!("string \"{}\"", s),
+            AttrValue::Blob(b) => alloc::format!("blob b64:{}", b64_encode(b)),
+            AttrValue::Vector(v) => {
+                let mut o = String::from("vector [");
+                for (i, x) in v.iter().enumerate() {
+                    if i > 0 { o.push_str(", "); }
+                    o.push_str(&alloc::format!("{}", x));
+                }
+                o.push(']');
+                o
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn into_native(self) -> ::unafs::inode::AttributeValue {
+        use ::unafs::inode::AttributeValue as N;
+        match self {
+            AttrValue::Int(i) => N::Int(i),
+            AttrValue::Float(f) => N::Float(f),
+            AttrValue::Str(s) => N::String(s),
+            AttrValue::Blob(b) => N::Blob(b),
+            AttrValue::Vector(v) => N::Vector(v),
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn from_native(v: ::unafs::inode::AttributeValue) -> AttrValue {
+        use ::unafs::inode::AttributeValue as N;
+        match v {
+            N::Int(i) => AttrValue::Int(i),
+            N::Float(f) => AttrValue::Float(f),
+            N::String(s) => AttrValue::Str(s),
+            N::Blob(b) => AttrValue::Blob(b),
+            N::Vector(v) => AttrValue::Vector(v),
+        }
+    }
+}
+
+impl VfsTime {
+    /// ATTRSURF: the stamp as unix seconds (civil-from-days, proleptic Gregorian, no zone — FAT
+    /// stores none). Used for [`Stat::mtime`].
+    pub fn unix_secs(&self) -> u64 {
+        let (y, m, d) = (self.year as i64, self.month as i64, self.day as i64);
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let mp = (m + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        let secs = days * 86_400 + self.hour as i64 * 3600 + self.min as i64 * 60 + self.sec as i64;
+        if secs < 0 { 0 } else { secs as u64 }
+    }
+}
+
+/// The per-object ACL lives in attributes (`owner`, `grants:<principal>`). They are NOT ordinary
+/// attributes to anyone but the kernel: a `w` grantee who could set or drop `owner` could take the
+/// object or make it public. ACL edits stay with the grant machinery (`SYS_FGRANT`).
+pub fn attr_key_reserved(key: &str) -> bool {
+    key == "owner" || key.starts_with("grants:")
+}
+
+fn attr_key_guard(key: &str, principal: &str) -> Result<(), VfsError> {
+    if key.is_empty() || key.len() > 255 {
+        return Err(VfsError::Backend("bad-key"));
+    }
+    if attr_key_reserved(key) && principal != KERNEL_PRINCIPAL {
+        return Err(VfsError::Denied);
+    }
+    Ok(())
+}
+
+/// The native READ gate for a resolved inode — `unafs::read_authz`, the SYS_OPEN evaluator.
+#[cfg(target_arch = "aarch64")]
+fn native_read_gate(fs: &mut crate::fs::unafs::KernelUnaFS, id: u64, principal: &str) -> Result<(), VfsError> {
+    match crate::fs::unafs::read_authz(fs, id, principal) {
+        crate::fs::unafs::ReadAuthz::Permit => Ok(()),
+        _ => Err(VfsError::Denied),
+    }
+}
+
+/// ATTRSURF v1 — THE REVERSE WALK, and it is meant to be deleted. The crate's `query` returns
+/// inodes, not paths; this walks the volume ONCE from the root (breadth-first, `System` objects and
+/// `.`/`..` skipped exactly as `read_dir` skips them), recording `inode -> path` for the ids asked
+/// for, and stops as soon as every id is found. Bounded: at most `QWALK_NODES` objects visited and
+/// `QWALK_DEPTH` levels. Cost: O(objects on the volume) directory reads per query in the worst case.
+/// An id the walk cannot reach (unlinked but still catalogued, or past a bound) has no path and is
+/// dropped. F3F4 changes the crate's `query` to return `(inode_id, path)`; at that fold this
+/// function goes and `NativeBackend::query` maps the crate's pairs directly.
+#[cfg(target_arch = "aarch64")]
+fn native_query_paths(fs: &mut crate::fs::unafs::KernelUnaFS, ids: &[u64]) -> Vec<(u64, String)> {
+    const QWALK_NODES: usize = 16_384;
+    const QWALK_DEPTH: usize = 32;
+    let mut found: Vec<(u64, String)> = Vec::new();
+    if ids.is_empty() {
+        return found;
+    }
+    let Ok(root) = fs.resolve_path("/") else { return found };
+    if ids.binary_search(&root).is_ok() {
+        found.push((root, String::from("/")));
+    }
+    let mut frontier: Vec<(u64, String, usize)> = alloc::vec![(root, String::new(), 0)];
+    let mut visited = 0usize;
+    while let Some((dir, dpath, depth)) = frontier.pop() {
+        if found.len() == ids.len() || visited >= QWALK_NODES {
+            break;
+        }
+        let Ok(entries) = fs.ls(dir) else { continue };
+        for e in entries {
+            if e.name == "." || e.name == ".." || e.kind == ::unafs::FileKind::System {
+                continue;
+            }
+            visited += 1;
+            let p = alloc::format!("{}/{}", dpath, e.name);
+            if ids.binary_search(&e.inode_id).is_ok() && !found.iter().any(|(i, _)| *i == e.inode_id) {
+                found.push((e.inode_id, p.clone()));
+            }
+            if e.kind == ::unafs::FileKind::Directory && depth + 1 < QWALK_DEPTH {
+                frontier.push((e.inode_id, p, depth + 1));
+            }
+        }
+    }
+    found.sort_by_key(|(i, _)| *i);
+    found
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 (padded) — the `b64:` blob spelling.
+pub fn b64_encode(b: &[u8]) -> String {
+    let mut o = String::with_capacity(b.len().div_ceil(3) * 4);
+    for c in b.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        o.push(B64[(n >> 18) as usize & 63] as char);
+        o.push(B64[(n >> 12) as usize & 63] as char);
+        o.push(if c.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
+        o.push(if c.len() > 2 { B64[n as usize & 63] as char } else { '=' });
+    }
+    o
+}
+
+/// Decode standard base64; padding optional; `None` on any foreign byte.
+pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &c in s.trim_end_matches('=').as_bytes() {
+        let v = B64.iter().position(|&x| x == c)? as u32;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
