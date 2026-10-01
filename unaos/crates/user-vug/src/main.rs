@@ -1440,7 +1440,7 @@ fn art_emit() {
     buf.put_dec(streak_max);
     buf.put(b" severity=");
     buf.put_dec(A_MAX_TORN.load(Ordering::Relaxed));
-    buf.put(b" thr=streak<=1 fps="); // the gate bound: one isolated self-healing miss passes, a repeat fails
+    buf.put(if option_env!("UNAOS_BEAM").is_some() { b" thr=streak<=1 beam=held fps=" as &[u8] } else { b" thr=streak<=1 beam=off fps=" }); // TEAR M3: the build's beam knob, so boot 18 reads torn_rows with and without. The gate bound: one isolated self-healing miss passes, a repeat fails
     buf.put_dec(fps as u32);
     buf.put(b" ms=");
     buf.put_dec(ms as u32);
@@ -2948,7 +2948,7 @@ fn surface_checksum(surf: *const u8) -> u64 {
 /// `pi4-regression.spec` pins cannot have moved. Nothing else about `Buf` changed: every existing
 /// caller puts the same bytes and the bound is still `self.b.len()`.
 #[cfg(target_arch = "x86_64")]
-const BUF_CAP: usize = 112;
+const BUF_CAP: usize = 144; // TEAR M3: 112 -> 144, the beam= token is 10 bytes and the line was already near the old cap
 #[cfg(not(target_arch = "x86_64"))]
 const BUF_CAP: usize = 64;
 struct Buf {
