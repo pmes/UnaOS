@@ -2031,7 +2031,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
 
     // ── Program the stream descriptor. [HDA-SPEC §3.3.35 ff.] ───────────────────────────────────
     // Stream reset, which the specification requires before a descriptor is reprogrammed.
-    w8(base, sd + SD_CTL, (saved_ctl as u8 & !(SDCTL_RUN as u8)) | SDCTL_SRST as u8);
+    if play::gate(base, sd, iss, rings, cad, &paths[..np], a) { return; } w8(base, sd + SD_CTL, (saved_ctl as u8 & !(SDCTL_RUN as u8)) | SDCTL_SRST as u8); // PLAYWAV (R75): LINE-NEUTRAL fold — a `play` request takes the stream here (the tone has powered/unmuted/bound everything above)
     a.stream += 1;
     let srst_set = wait_us(10_000, || r8(base, sd + SD_CTL) & SDCTL_SRST as u8 != 0);
     w8(base, sd + SD_CTL, r8(base, sd + SD_CTL) & !(SDCTL_SRST as u8));
@@ -2273,7 +2273,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
 
 /// BOOTSLOW — `probe()` once, from a device-service pass, after the root pass's verdict.
 pub fn probe_after_root() {
-    static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    #[cfg(feature = "hda-tone")] play::service(); static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false); // PLAYWAV (R75): the stream's refill tick (idle = one atomic load), LINE-NEUTRAL fold
     if DONE.load(core::sync::atomic::Ordering::Relaxed) || !crate::fs::bootdisk::root_pass_open("hda") || { #[cfg(feature = "login")] { !crate::fs::users::desktop_allowed() } #[cfg(not(feature = "login"))] { false } } { // FIRSTBOOT (R77): no HDA bring-up (the boot tone) before the Desktop stage. LINE-NEUTRAL fold.
         return;
     }
@@ -2606,3 +2606,11 @@ fn disc_read(base: u64, sd: u64, rings: &mut Rings, cad: u8, paths: &[Path; tone
         afg, pw & 0x0F, (pw >> 4) & 0x0F, gd & 0xFF, ge & 0xFF, gr & 0xFF, d.vendor >> 16, d.vendor & 0xFFFF);
     d
 }
+
+// ===================== PLAYWAV (R75) — THE SEAMS hda_play.rs NEEDS (one small tail block) =====================
+// The streaming PCM path + WAV player live in `drivers/hda_play.rs`, declared here as a CHILD module so it reaches
+// the private `Rings`/`Path`/register helpers. `run_tone` calls `play::gate(..)` once (same-line fold before its SDnCTL
+// reset) and returns when it takes the stream; `probe_after_root` calls `play::service()` (same-line fold at its top).
+#[cfg(feature = "hda-tone")]
+#[path = "hda_play.rs"]
+pub mod play;

@@ -460,6 +460,8 @@ enum Act {
     NoOpener(String),
     /// FILEVIEW — show this absolute path in the read-only text viewer (`video/fileview.rs`).
     Text(String),
+    /// PLAYWAV (R75) — a `.WAV`: latch it for the HDA player (`drivers/hda_play.rs`), serviced on the tick.
+    Play(String),
     /// FACET — show this absolute path in the image viewer. The FIRST opener this tree has ever had:
     /// [`Act::NoOpener`]'s census line says "no opener exists in this tree", and for `.PNG` that
     /// sentence has stopped being true. Kept as its own variant rather than folded into
@@ -724,6 +726,12 @@ fn ext_of(name: &str) -> String {
 /// `bin` is its own token rather than folded into `elf`: `is_executable` admits both and the loader
 /// treats them as genuinely different shapes (a validated ELF64 against a flat blob bounded to one
 /// code page), so a witness that called a `.BIN` an ELF would be wrong about the thing it names.
+/// PLAYWAV (R75): is this a `.WAV` name. Pure.
+fn is_wav_name(name: &str) -> bool {
+    let n = name.as_bytes();
+    n.len() > 4 && n[n.len() - 4..].eq_ignore_ascii_case(b".wav")
+}
+
 fn open_kind(name: &str) -> &'static str {
     let n = name.as_bytes();
     let ends = |ext: &[u8]| n.len() > ext.len() && n[n.len() - ext.len()..].eq_ignore_ascii_case(ext);
@@ -733,6 +741,8 @@ fn open_kind(name: &str) -> &'static str {
         "bin"
     } else if ends(b".png") {
         "png"
+    } else if ends(b".wav") {
+        "wav"
     } else if ends(b".txt") || ends(b".md") || ends(b".log") || ends(b".sha") || ends(b".cfg") || ends(b".ini") {
         "text"
     } else {
@@ -754,6 +764,9 @@ fn open_handler(name: &str) -> &'static str {
     #[cfg(feature = "facet")]
     if crate::video::facet::is_png_name(name) {
         return "facet";
+    }
+    if is_wav_name(name) {
+        return "play";
     }
     if crate::video::fileview::is_text_name(name) {
         return "fileview";
@@ -796,6 +809,7 @@ fn act_tail(act: &Act) -> Option<String> {
         // the window DID understand and DID refuse.
         Act::NoOpener(p) => Some(alloc::format!("select ({})", no_handler_reason(&leaf(p)))),
         Act::Text(p) => Some(alloc::format!("open kind={} handler=fileview", open_kind(&leaf(p)))),
+        Act::Play(p) => Some(alloc::format!("open kind={} handler=play", open_kind(&leaf(p)))),
     }
 }
 
@@ -1282,6 +1296,10 @@ impl Model {
             if crate::video::facet::is_png_name(&name) {
                 return Act::View(p);
             }
+            // PLAYWAV (R75) — `.WAV` plays through the HDA stream.
+            if is_wav_name(&name) {
+                return Act::Play(p);
+            }
             // FILEVIEW — `.TXT`/`.MD`/`.LOG`/`.SPEC`/no extension open in the read-only text viewer.
             if crate::video::fileview::is_text_name(&name) {
                 return Act::Text(p);
@@ -1629,6 +1647,13 @@ fn run_act(act: Act) {
                 serial_println!("[quarry] open TEXT path={} -> fileview (latched for the render pass)", p);
             }
             alloc::format!("opening {}", leaf(&p))
+        }
+        Act::Play(p) => {
+            #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+            { crate::drivers::hda::play::request_open(&p); serial_println!("[quarry] open PLAY path={} -> play (latched for the service tick)", p); }
+            #[cfg(not(all(target_arch = "x86_64", feature = "hda-tone")))]
+            serial_println!("[quarry] open PLAY path={} -> no audio in this build (UNAOS_HDA+UNAOS_HDATONE arm it)", p);
+            alloc::format!("playing {}", leaf(&p))
         }
         Act::NoOpener(p) => {
             // The honest census. An operator who double-presses `CONFIG.TXT` and sees nothing must

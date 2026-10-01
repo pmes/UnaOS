@@ -1639,6 +1639,9 @@ REQUIRE :: PRTSCR-DIR-FIX: no session -> REFUSED reason=no-session .* -> PASS ::
 # --- lpib_advanced=1 bcis=0 tag_ok=1 fifo_ready=1 run_ms=1200 -> FAIL ::`. The `-> REFUSED` arms
 # --- (drivers/hda.rs:1457, :1566) miss the REQUIRE. Audibility is not on the wire and is not claimed.
 REQUIRE :: HDA-TONE: .* -> PASS ::
+# --- PLAYWAV (R75): `tests playwav` (the lane runs the whole `tests` set, as HDA-TONE's `tests hda` shows) plays a generated 2 s WAV through the 4-entry ring; under=0 is the ring's underrun count.
+REQUIRE :: PLAYWAV: path=\S+ rate=48000 ch=2 bits=16 secs=2\.0 under=0 -> PASS ::
+FORBID :: PLAYWAV: .* -> FAIL ::
 # --- HDATONE4: boot 16 was silent (lpib=0, RUN read back clear, DAC actual=D3). The RUN bit must read back set (re-asserted if not) and the DAC settle to D0.
 REQUIRE :: HDA-TONE: .* -> PASS :: amp=\d+ :: run_bit=1 run_readback_ok=1 dac_pwr=D0 settled_ms=\d+ 
 FORBID :: HDA-TONE: .* run_readback_ok=0
