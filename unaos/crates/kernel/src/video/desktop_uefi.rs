@@ -455,7 +455,6 @@ pub fn activate_on(desc: SurfaceDesc) {
     }
     super::wcpar::start(); #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))] crate::drivers::gpu::kepler_vblank::pump_spawn_once(); // KVBLANK6 — task context; WCPAR — band workers exist before the first composite; prints `[wcpar] pool=`
     crate::splash::hold_open(); // SPLASHX86: the splash row goes up NOW — above every window minted below, until `users::stage_publish` releases it
-    super::wcpar::start(); // WCPAR — band workers exist before the first composite; prints `[wcpar] pool=`
     serial_println!(
         "[wc-x] desktop-clear panel={}x{} bg={:08X}",
         pw,
