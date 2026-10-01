@@ -10054,6 +10054,12 @@ kernel8() {
         K8_FEATS="${K8_FEATS},tests-at-boot"
         echo -e "${COLOR_YELLOW}  • UNAOS_TESTS_AT_BOOT: kernel8 runs the desktop fixture registry at boot (R77 M3)${COLOR_RESET}"
     fi
+    # POWERMENU M3 (merge9 fold, GATE-K8REACH): UNAOS_LOWBAT_SHUTDOWN=<pct> adds `lowbat_shutdown` (the percent itself
+    # is read by option_env! in video/powerui.rs, so the knob must be on the kernel8 build command too).
+    if [ -n "${UNAOS_LOWBAT_SHUTDOWN:-}" ]; then
+        K8_FEATS="${K8_FEATS},lowbat_shutdown"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LOWBAT_SHUTDOWN=${UNAOS_LOWBAT_SHUTDOWN}: kernel8 shuts down cleanly at that battery percent (POWERMENU M3)${COLOR_RESET}"
+    fi
     # CLOCK-2: UNAOS_LOGTS=1 adds the `logts` feature — a compact timestamp prefix on each serial LINE
     # (monotonic ms → UTC after a civil anchor). K8_FEATS is CURATED (does not draw from the general
     # `_feats`), so the arm must be added here too or logts never reaches the Pi image. OFF => the
