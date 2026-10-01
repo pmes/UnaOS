@@ -729,6 +729,8 @@ fn main() {
     if std::env::var("UNAOS_INSTGUI").is_ok() { feats.push("instgui"); }
     // LINUXABI: UNAOS_LINUXABI=1 arms the Linux x86_64 syscall-compat layer. Kept in sync with arroyo and banner-cert.sh.
     if std::env::var("UNAOS_LINUXABI").is_ok() { feats.push("linuxabi"); }
+    // BANDY3: UNAOS_BUSREG=1 arms fulfiller registration on the bus wire. Kept in sync with arroyo.
+    if std::env::var("UNAOS_BUSREG").is_ok() { feats.push("busreg"); }
     // WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` last-words
     // breadcrumbs along the focus-raise/composite chain (x86: bare 16550 at 0x3F8, no lock). Media
     // builds come from THIS list, not arroyo's (the s42/INSTGUI lesson), so the knob is mapped here
@@ -959,6 +961,17 @@ fn main() {
         println!("   PULSE: target/PULSE-X86.ELF absent — ESP has no PULSE.ELF (run via ./arroyo esp-x86)");
     }
 
+    // BANDY3 M3: the first ring-3 FULFILLER (crates/user-prefs, built by arroyo's build_user_prefs_x86 to
+    // target/PREFS-X86.ELF), staged as APPS/PREFS.BIN beside PULSE.ELF — `bg /apps/PREFS.BIN` registers
+    // Principia's PrefGet/PrefList bus verbs (UNAOS_BUSREG=1) and serves them.
+    let prefs_elf = target_dir.join("PREFS-X86.ELF");
+    if prefs_elf.exists() {
+        std::fs::copy(&prefs_elf, esp_apps.join("PREFS.BIN")).unwrap();
+        println!("   PREFS: copied PREFS.BIN into APPS/ on the ESP (bg /apps/PREFS.BIN)");
+    } else {
+        println!("   PREFS: target/PREFS-X86.ELF absent — ESP has no PREFS.BIN (run via ./arroyo esp-x86)");
+    }
+
     // -----------------------------------------------------------------------------------------
     // WINX-7 PKG — the DATA tree: the EL0 artifacts staged for the volume the RUNNING KERNEL reads.
     //
@@ -1016,6 +1029,8 @@ fn main() {
         // /apps/VUGK.ELF` must reach the volume the kernel actually reads.
         (target_dir.join("VUGK-X86.ELF"), "VUGK.ELF"),
         (target_dir.join("PULSE-X86.ELF"), "PULSE.ELF"),
+        // BANDY3 M3: the prefs fulfiller rides the DATA volume too — `bg /apps/PREFS.BIN` reads it there.
+        (target_dir.join("PREFS-X86.ELF"), "PREFS.BIN"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();
