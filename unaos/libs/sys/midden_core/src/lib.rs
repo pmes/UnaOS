@@ -344,7 +344,7 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // refuses honestly and by name, exactly as `top` and `batmon` (registered `Always` since they
     // were written) do. The word exists on every UnaOS; the platform decides the answer.
     ("burst", Avail::Always), ("simmer", Avail::Always),
-    ("tste", Avail::Always), ("selftest", Avail::Always), ("tests", Avail::Always),
+    ("tste", Avail::Always), ("selftest", Avail::Always), ("tests", Avail::Always), ("src", Avail::Always), // SRCEXTRACT: arm is cfg(selfhost), registered Always like `fetch`
     ("ps", Avail::Always), ("top", Avail::Always), ("batmon", Avail::Always),
     ("dmesg", Avail::Always), ("shutdown", Avail::Always), ("off", Avail::Always),
     // ORIN-REBOOT (baton orin-6 5.1 + the cold-boot ruling 2026-08-25): the arch-neutral
