@@ -685,7 +685,7 @@ pub mod pulsewin;
 // inserted higher up renumbers every panic `Location` recorded below it in this file. Nothing is
 // below this, so nothing moves, and a knob-off `kernel8.img` is byte-identical.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-pub mod quarry; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod fileview; // FILEVIEW — the read-only text viewer window Quarry opens `.TXT`/`.MD`/`.LOG`/`.SPEC`/extensionless files in; same gate as `quarry` (its only door). ⚠ FOLDED onto the `quarry` line, code before comment: this module root is lexed into every image and a line added here moves every `panic::Location` below it.
+pub mod quarry; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod fileview; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod textedit; // TEXTEDIT (R75) — the editor window beside FILEVIEW, same gate; code before comment. // FILEVIEW — the read-only text viewer window Quarry opens `.TXT`/`.MD`/`.LOG`/`.SPEC`/extensionless files in; same gate as `quarry` (its only door). ⚠ FOLDED onto the `quarry` line, code before comment: this module root is lexed into every image and a line added here moves every `panic::Location` below it.
 
 // ── REALDESK — THE DESKTOP SCENE'S TENANCY OF THE BACKDROP ──────────────────────────────────────
 //

@@ -1615,8 +1615,14 @@ fn run_act(act: Act) {
         }
         // FILEVIEW — latched like FACET's View, for the same stack-depth reason (click-router depth).
         Act::Text(p) => {
-            crate::video::fileview::request_open(&p);
-            serial_println!("[quarry] open TEXT path={} -> fileview (latched for the render pass)", p);
+            // TEXTEDIT (R75) — a file the user owns opens the EDITOR, any other the read-only viewer.
+            if crate::video::textedit::may_edit(&p) {
+                crate::video::textedit::request_open(&p);
+                serial_println!("[quarry] open TEXT path={} -> textedit (latched for the render pass)", p);
+            } else {
+                crate::video::fileview::request_open(&p);
+                serial_println!("[quarry] open TEXT path={} -> fileview (latched for the render pass)", p);
+            }
             alloc::format!("opening {}", leaf(&p))
         }
         Act::NoOpener(p) => {
@@ -2317,7 +2323,7 @@ pub fn close() {
 pub fn key_route(ev: crate::pal::Event) -> bool {
     // FILEVIEW — the text viewer's arrows / wheel / paging, asked first; it consumes only while ITS
     // window holds focus, so a closed viewer changes nothing below.
-    if crate::video::fileview::key_route(ev) {
+    if crate::video::fileview::key_route(ev) || crate::video::textedit::key_route(ev) {
         return true;
     }
     // QSCROLL — the WHEEL arrives here, at the seam that already exists, because this function is
@@ -2533,6 +2539,10 @@ pub fn press_route(x: i32, y: i32) -> bool {
     }
     // FILEVIEW — the text viewer's close box / raise, chained here for FACET's reason.
     if crate::video::fileview::press_route(x, y) {
+        return true;
+    }
+    // TEXTEDIT — the editor's close box / caret placement / raise.
+    if crate::video::textedit::press_route(x, y) {
         return true;
     }
     let id = WIN.load(Ordering::Relaxed);
@@ -3004,6 +3014,8 @@ pub fn service() {
     crate::video::facet::service();
     // FILEVIEW — the text viewer's latch drains on the same pass, for the same reason.
     crate::video::fileview::service();
+    // TEXTEDIT — the editor's latch drains on the same pass.
+    crate::video::textedit::service();
 }
 
 // ── The witness ─────────────────────────────────────────────────────────────────────────────────

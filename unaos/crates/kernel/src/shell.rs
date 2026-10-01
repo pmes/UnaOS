@@ -6165,7 +6165,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             console.println("shutting down: invoking the platform firmware mechanism...");
             crate::power::shutdown();
         },
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "view" => { view_verb(console, args.first().copied()); } "reboot" => { // FILEVIEW M3 — `view <path>` opens a text file in the read-only viewer window (video/fileview.rs); ⚠ SAME-LINE fold, line-NEUTRAL, code before comment; helper at the file tail.
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "view" => { view_verb(console, args.first().copied()); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "edit" => { edit_verb(console, args.first().copied()); } "reboot" => { // FILEVIEW M3 — `view <path>` opens a text file in the read-only viewer window (video/fileview.rs); ⚠ SAME-LINE fold, line-NEUTRAL, code before comment; helper at the file tail.
             console.println("rebooting: invoking the platform firmware mechanism...");
             crate::power::reboot();
         },
@@ -8782,4 +8782,23 @@ fn fetch_body(console: &mut Console, data: &[u8], dest: &mut Option<(crate::fs::
         }
     }
     true
+}
+
+/// TEXTEDIT — the `edit <path>` verb: open (or start) a text file in the editor window. Only under
+/// the session user's `/home/<user>/` (the DIRNS rule); anything else is `view` territory.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn edit_verb(console: &mut Console, path: Option<&str>) {
+    let Some(p) = path else {
+        console.println("usage: edit <path>   (edit a text file under /home/<user>; Ctrl-S saves)");
+        return;
+    };
+    let full = normalize_path(&cwd_path(), p);
+    if !crate::video::textedit::may_edit(&full) {
+        console.println(&alloc::format!("edit: {}: not under your /home/<user> (use `view`)", full));
+        return;
+    }
+    match crate::video::textedit::open(&full) {
+        Ok((b, l)) => console.println(&alloc::format!("edit: {} — {} bytes, {} lines (Ctrl-S saves)", full, b, l)),
+        Err(e) => console.println(&alloc::format!("edit: {}: {}", full, e)),
+    }
 }

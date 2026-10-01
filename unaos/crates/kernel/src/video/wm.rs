@@ -29552,3 +29552,17 @@ pub fn close_all_furniture_except(keep: WinId) -> usize {
     }
     n
 }
+
+/// TEXTEDIT — rename a live window's caption (the editor's dirty mark). Clamped to [`MAX_TITLE`];
+/// the row is damaged whole and repainted by the next compositor pass (no composite from here).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn retitle(id: WinId, name: &[u8]) {
+    let n = name.len().min(MAX_TITLE);
+    let mut t = table();
+    if let Some(r) = row_mut(&mut t, id) {
+        r.title = [0u8; MAX_TITLE];
+        r.title[..n].copy_from_slice(&name[..n]);
+        r.title_len = n;
+        r.damage_all();
+    }
+}
