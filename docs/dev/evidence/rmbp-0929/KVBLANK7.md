@@ -48,3 +48,14 @@ Second finding (fps=2000 after restore): `set_hidden(.., false)` only wakes the 
 
 `:: VBJITTER: ... -> PASS|FAIL ::` once per census; `:: kepler: vblank head=0 ... dt_hist=[..] missed= doubled= ack_via= msi_rearms= ::`.
 No QEMU pins (no Kepler, R78).
+
+## Written
+
+* M1/M2 `drivers/gpu/kepler_vblank.rs`: line `:: kepler: vblank-dt dt_hist=[<8ms:..,8-24:..,24-40:..,>40:..] poll_dt_hist=[..] isr_missed= isr_doubled= poll_missed= poll_doubled= isr_stuck= ack_via= msi_rearms= irq_demoted= ::`
+  right after each `:: kepler: vblank head=` census, and `:: VBJITTER: period_us= jitter_us= missed= doubled= isr_calls= bound=jitter_us<=4000 -> PASS|FAIL ::`.
+  Boot 19 reading: `isr_calls` far above 1 after the window and `msi_rearms` == `isr_calls` = the MSI re-arm was the missing step (hypothesis d'); `ack_via=1` the W1C
+  guess was right, `2|3` the alternative that cleared it, `0` none did (stuck grows). `isr_missed>0, isr_doubled=0` = lost messages (c); poll missed/doubled
+  symmetric with the ISR histogram clean = late timestamps, i.e. a measurement artefact (b). `wait-source demoted irq->poll` is printed once if an irq-trusting wait gave up.
+* M3 `arch/x86_64/syscall.rs`: `[wpace] restore win=N slot=S repaced=1 via=vblank|sleep` on the first present after an unminimise
+  (cap 64 lines). fps after a restore should start at the panel rate, not ~2000.
+* Not pinned (no QEMU, R78; Kepler only).

@@ -3529,7 +3529,7 @@ pub fn set_hidden(asid: u64, on: bool) {
     // (~256 ms) or, if the tick is not live, forever. Ordered AFTER the info-page publish so the woken
     // app's first read of the flags word already shows it visible and it does not immediately re-park.
     if !on {
-        user_input_wake_edge(slot, "unhide");
+        repace_arm(slot); user_input_wake_edge(slot, "unhide");
     }
 }
 
@@ -4172,7 +4172,7 @@ static SLOT_FOCUS_SEQ: [AtomicU64; crate::arch::memory::USER_SLOTS] =
 /// shipped desktop therefore reaches `WINDOWS` with nothing between it and the composite. Everything
 /// above describes the sleeping build; nothing above describes what Peter boots.
 #[cfg(all(feature = "wc", feature = "vsyncpace"))]
-fn present_pace(slot: usize, id: usize) {
+fn present_pace(slot: usize, id: usize) { if restore_gate(slot, id) { WIN_PACE_DUE_US[id].store(crate::arch::ms().saturating_mul(1000).saturating_add(PANEL_FRAME_US), Ordering::Relaxed); return; }
     // The focus exemption, first: it must beat every other consideration, including a deadline that is
     // legitimately in the future. `swap` publishes the generation and reads the old one in one step, so
     // exactly one present per arrival takes the exemption however many cores race for it.
@@ -4357,7 +4357,7 @@ fn pace_focus_arrival(slot: usize) {
 // keeps the fixture batteries, whose ring-3 witnesses present in tight bounded loops, unperturbed.
 #[cfg(not(all(feature = "wc", feature = "vsyncpace")))]
 #[inline(always)]
-fn present_pace(_slot: usize, _id: usize) {}
+fn present_pace(_slot: usize, _id: usize) { let _ = restore_gate(_slot, _id); }
 #[cfg(not(all(feature = "wc", feature = "vsyncpace")))]
 #[inline(always)]
 fn pace_advance(_id: usize) {}
@@ -29547,3 +29547,47 @@ fn appmenu_fixture() {
 /// R77 M3 — the boot CPU the deferred window demos were to be spawned on; the registered fixtures are
 /// plain `fn()`s, so `demo_cpu` travels here (stored just before the first registration).
 static TESTS_DEMO_CPU: AtomicUsize = AtomicUsize::new(0);
+
+
+// ---- KVBLANK7 M3 — a restored (un-minimised) window is re-paced onto the next vblank ----------------
+// Boot 18: "a minimized and restored vug runs really high fps for a little bit" (`fps=2000`). `set_hidden(.., false)`
+// only wakes the app; nothing re-engaged any wait for the presents that follow, and the pacer's own deadline (under
+// `vsyncpace`) was whatever it was when the window went quiet. `repace_arm` (called from `set_hidden` on unhide) flags
+// the slot; the next present of that slot, BEFORE it takes any lock, waits for the first vblank.
+
+static SLOT_REPACE: [AtomicBool; crate::arch::memory::USER_SLOTS] =
+    [const { AtomicBool::new(false) }; crate::arch::memory::USER_SLOTS];
+static REPACE_LINES: AtomicU64 = AtomicU64::new(0);
+
+fn repace_arm(slot: usize) {
+    if let Some(f) = SLOT_REPACE.get(slot) {
+        f.store(true, Ordering::Release);
+    }
+}
+
+/// Consume the flag; on a restore, wait for the next vblank (bounded two frames; without a vblank counter, sleep to the
+/// next 16 ms boundary) and print `[wpace] restore win= repaced=1`. Returns whether it re-paced.
+fn restore_gate(slot: usize, id: usize) -> bool {
+    let armed = match SLOT_REPACE.get(slot) {
+        Some(f) => f.swap(false, Ordering::AcqRel),
+        None => false,
+    };
+    if !armed {
+        return false;
+    }
+    let mut via = "sleep";
+    #[cfg(feature = "nvidia-kepler-vblank")]
+    {
+        if crate::drivers::gpu::kepler_vblank::wait_vblank_bounded(2 * PANEL_FRAME_US) {
+            via = "vblank";
+        }
+    }
+    if via == "sleep" {
+        let ms = crate::arch::ms();
+        crate::arch::sched::sleep_ms(16 - (ms % 16));
+    }
+    if REPACE_LINES.fetch_add(1, Ordering::Relaxed) < 64 {
+        serial_println!("[wpace] restore win={} slot={} repaced=1 via={}", id, slot, via);
+    }
+    true
+}

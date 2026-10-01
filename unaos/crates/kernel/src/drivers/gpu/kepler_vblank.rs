@@ -1868,3 +1868,11 @@ fn irq_source() -> bool {
     let last = ISR_LAST_CYC.load(Ordering::Relaxed);
     last != 0 && crate::arch::now_cycles().saturating_sub(last) <= us_to_cycles(3 * 16_667)
 }
+
+/// KVBLANK7 M3 — block (spin, never past `max_us`) until the next vblank; false when no source is counting or it ran out.
+pub fn wait_vblank_bounded(max_us: u64) -> bool {
+    match counter() {
+        Some(c0) => wait_next_edge(c0, crate::arch::now_cycles().saturating_add(us_to_cycles(max_us))).0,
+        None => false,
+    }
+}
