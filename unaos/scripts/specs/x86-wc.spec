@@ -919,3 +919,6 @@ FORBID :: SHELLUX: .* -> FAIL ::
 # --- SPLASHX86 (R74): the boot splash rendered by the cross-arch ray tracer at the compositor takeover and HELD above the furniture until the stage is known.
 REQUIRE :: SPLASH: arch=x86_64 WxH=[0-9]+x[0-9]+ ms=[0-9]+ -> PASS ::
 REQUIRE [splash] held_ms=[0-9]+ released_by=(store-loaded|timeout)
+# ── TEXTEDIT (R75), TAIL-APPENDED — the editor fixture opens a scratch file, types 40 chars, saves, re-reads, compares
+REQUIRE :: TEXTEDIT: path=
+FORBID :: TEXTEDIT: .* -> FAIL ::
