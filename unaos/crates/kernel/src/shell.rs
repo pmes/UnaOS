@@ -5219,7 +5219,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // If the user wants a blank slate, we should probably clear the history buffer.
             // BUT, the prompt said "Reset cursor logic here".
             // Let's implement a clear method on Console.
-            console.clear();
+            if args.iter().any(|a| *a == "--all") { console.clear_all(); } else { console.clear(); } // SCROLLBACK (R75): `clear` keeps the scrollback, `clear --all` drops it
         },
         "panic" => {
             // Test the Exception Handler

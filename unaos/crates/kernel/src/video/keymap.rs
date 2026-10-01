@@ -137,6 +137,14 @@ pub enum Action {
     CycleWindow,
     /// SCREENLOCK: lock the session without ending it (`⌘L`, `Ctrl+Alt+L`). Acted on by the router (`login::lock`).
     LockScreen,
+    /// SCROLLBACK: the shell view one page toward older output (`Shift+PgUp`). Consumed by `Console::act`.
+    ScrollPageUp,
+    /// SCROLLBACK: one page toward the live bottom (`Shift+PgDn`).
+    ScrollPageDown,
+    /// SCROLLBACK: the oldest page (`Cmd+Home` / `Ctrl+Home`).
+    ScrollTop,
+    /// SCROLLBACK: back to the live bottom (`Cmd+End` / `Ctrl+End`).
+    ScrollBottom,
 }
 
 impl Action {
@@ -163,6 +171,10 @@ impl Action {
             Action::BrightnessUp => "brightness-up",
             Action::CycleWindow => "cycle-window",
             Action::LockScreen => "lock-screen",
+            Action::ScrollPageUp => "scroll-page-up",
+            Action::ScrollPageDown => "scroll-page-down",
+            Action::ScrollTop => "scroll-top",
+            Action::ScrollBottom => "scroll-bottom",
         }
     }
 

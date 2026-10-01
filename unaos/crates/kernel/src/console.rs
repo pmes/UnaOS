@@ -53,6 +53,12 @@ pub struct Console {
     hist_base: u64,
     /// TERMWRAP — the edit line's visual-row count at the last full repaint (`draw`), so the per-keystroke path knows when a wrap changed the page layout and owes a full repaint.
     last_edit_rows: core::cell::Cell<usize>,
+    /// SCROLLBACK (R75) — how many history ENTRIES the view is scrolled up from the bottom (0 = live view). Entry-relative, not row-relative, so a resize that re-wraps lines cannot strand it.
+    view_off: usize,
+    /// SCROLLBACK — lines that arrived while `view_off > 0` (the `[N new lines]` marker); zero again at the bottom.
+    new_lines: usize,
+    /// SCROLLBACK — absolute row below which the LIVE view shows (`clear` / Ctrl-L moves it; the lines above stay reachable by scrolling). `clear --all` drops them instead.
+    clear_abs: u64,
 }
 
 impl Console {
@@ -66,6 +72,9 @@ impl Console {
             sel: crate::video::termsel::LineSel::new(),
             hist_base: 0,
             last_edit_rows: core::cell::Cell::new(1),
+            view_off: 0,
+            new_lines: 0,
+            clear_abs: 0,
         }
     }
 
@@ -91,8 +100,24 @@ impl Console {
         // would repaint lines the operator just cleared. The records are charged as absorbed — they
         // reached the view's owner, which then discarded them; that is a view decision, not transport
         // loss, and the ledger must not book it as one.
+        // SCROLLBACK — `clear` blanks the LIVE view and KEEPS the lines (scroll up to read them); `clear_all` drops them. Pending transport records are placed first so they sit above the mark, not on the fresh screen.
+        self.drain_output();
+        self.clear_abs = self.hist_base + self.history.len() as u64;
+        self.view_off = 0;
+        self.new_lines = 0;
+        self.last_edit_rows.set(usize::MAX);
+    }
+
+    /// SCROLLBACK — `clear --all`: the screen AND the scrollback go. `hist_base` advances past the dropped lines so no stale selection row can alias a new line.
+    pub fn clear_all(&mut self) {
         let _ = crate::termring::drain(|_| {});
+        self.hist_base += self.history.len() as u64;
         self.history.clear();
+        self.clear_abs = self.hist_base;
+        self.view_off = 0;
+        self.new_lines = 0;
+        self.sel.end_selection();
+        self.last_edit_rows.set(usize::MAX);
     }
 
     /// Place one line in the VIEW's own store. The scrollback is bounded ([`Self::HISTORY_MAX`]) and
@@ -104,6 +129,16 @@ impl Console {
         if self.history.len() > Self::HISTORY_MAX {
             self.history.remove(0);
             self.hist_base += 1;
+        }
+        self.note_new(1);
+    }
+
+    /// SCROLLBACK — `n` lines were appended. A scrolled-up view is ANCHORED (its offset grows with the tail so the rows on the glass do not move) and the marker counts them; the live view is untouched.
+    fn note_new(&mut self, n: usize) {
+        if n > 0 && self.view_off > 0 {
+            self.view_off = core::cmp::min(self.view_off + n, self.history.len().saturating_sub(1));
+            self.new_lines += n;
+            self.last_edit_rows.set(usize::MAX);
         }
     }
 
@@ -123,13 +158,15 @@ impl Console {
         let history = &mut self.history;
         let base = &mut self.hist_base;
         let max = Self::HISTORY_MAX;
-        crate::termring::drain(|line| {
+        let n = crate::termring::drain(|line| {
             history.push(String::from(line));
             if history.len() > max {
                 history.remove(0);
                 *base += 1;
             }
-        })
+        });
+        self.note_new(n as usize);
+        n
     }
 
     /// Emit one line of console output.
@@ -173,7 +210,7 @@ impl Console {
     /// 25-line cap did exactly that at native resolution). The tallest is a 4K panel: 2160 rows puts
     /// `Metrics::for_height` at scale 2, so `line_h` is 24 and `page_rows` is 88. 256 is therefore
     /// just under three screenfuls there, and many more on anything smaller.
-    const HISTORY_MAX: usize = 256;
+    pub const HISTORY_MAX: usize = 2000; // SCROLLBACK (R75): was 256 — the store keeps whole lines (they re-wrap on resize), bounded here, oldest dropped.
     /// The console background (Moonstone).
     const BG: u32 = 0x2D2B55;
 
@@ -285,9 +322,9 @@ impl Console {
         // TERMWRAP M2: an entry is `visual_rows(len, cols)` rows, drawn one `cols`-wide chunk per row.
         let (w, h) = (pal.width() as usize, pal.height() as usize);
         let cols = self.cols_for(m, w);
-        let (skip, _) = self.layout_for(m, w, h);
+        let (skip, end, _) = self.layout_span(m, w, h);
         let mut y = self.top_y(pal);
-        for (i, line) in self.history.iter().enumerate().skip(skip) {
+        for (i, line) in self.history.iter().enumerate().skip(skip).take(end - skip) {
             let rows = crate::video::termsel::visual_rows(line.chars().count(), cols);
             for r in 0..rows {
                 pal.draw_text(m.margin, y + r * m.line_h, crate::video::termsel::row_slice(line, r, cols), 0xAAAAAA);
@@ -299,6 +336,11 @@ impl Console {
         }
         self.last_edit_rows.set(self.edit_rows_for(cols));
 
+        // SCROLLBACK — scrolled up: no prompt (it is below the glass); the marker and the bar instead.
+        if self.view_off > 0 {
+            self.draw_scroll_furniture(pal, m, w, h, skip, end);
+            return;
+        }
         // Prompt directly below the last output line.
         self.draw_prompt_line(pal, y);
     }
@@ -313,7 +355,7 @@ impl Console {
         // TERMWRAP: a change in the edit line's row count moves the history budget, so it owes the
         // full repaint; otherwise clear the whole (possibly multi-row) strip.
         let er = self.edit_rows_for(self.cols_for(m, pal.width() as usize));
-        if er != self.last_edit_rows.get() {
+        if er != self.last_edit_rows.get() || self.view_off > 0 {
             self.draw(pal);
             return;
         }
@@ -359,7 +401,7 @@ impl Console {
     pub fn cell_at(&self, m: crate::ui::Metrics, w: usize, h: usize, lx: i32, ly: i32) -> (u64, usize, usize) {
         let top = self.top_y_for(m, w, h);
         let cols = self.cols_for(m, w);
-        let (skip, vrows) = self.layout_for(m, w, h);
+        let (skip, end, vrows) = self.layout_span(m, w, h);
         let (lx, ly) = (lx.max(0) as usize, ly.max(0) as usize);
         // TERMWRAP M3 — fold the pixel into (visual_row, cell column) FIRST; the visual row then
         // picks the entry (each costs `visual_rows` bands) and the flat offset LineSel keeps.
@@ -367,7 +409,7 @@ impl Console {
         let px = core::cmp::min(lx.saturating_sub(m.margin) / m.cell_w, cols.saturating_sub(1));
         if vrow < vrows {
             let mut start = 0usize;
-            for i in skip..self.history.len() {
+            for i in skip..end {
                 let cells = self.history[i].chars().count();
                 let cost = crate::video::termsel::visual_rows(cells, cols);
                 if vrow < start + cost {
@@ -449,6 +491,7 @@ impl Console {
     /// reach), and the repaint that action owes paid on `pal`. Returns whether anything was painted,
     /// so the caller can mark its window dirty as it does for a keystroke.
     pub fn act(&mut self, a: crate::video::keymap::Action, pal: &mut TargetPal) -> bool {
+        if let Some(painted) = self.scroll_action(a, pal) { return painted; } // SCROLLBACK — view motion, not an edit
         let (_, r) = crate::video::clipboard::terminal_action_in(
             a,
             &mut self.current_input,
@@ -494,10 +537,18 @@ impl Console {
     /// Walks back from the newest entry while the entries fit the row budget left after the edit
     /// line's extra rows.
     fn layout_for(&self, m: crate::ui::Metrics, w: usize, h: usize) -> (usize, usize) {
+        let (skip, _, used) = self.layout_span(m, w, h);
+        (skip, used)
+    }
+
+    /// SCROLLBACK — `(skip, end, vrows)`: the shown entries are `skip..end`. `end` is the tail minus `view_off`; the walk back stops at the clear mark in the LIVE view (`view_off == 0`) and at the front when scrolled.
+    fn layout_span(&self, m: crate::ui::Metrics, w: usize, h: usize) -> (usize, usize, usize) {
         let cols = self.cols_for(m, w);
         let budget = self.history_rows_for(m, w, h).saturating_sub(self.edit_rows_for(cols) - 1);
-        let (mut skip, mut used) = (self.history.len(), 0usize);
-        while skip > 0 {
+        let end = self.history.len() - core::cmp::min(self.view_off, self.history.len());
+        let floor = if self.view_off == 0 { core::cmp::min(self.clear_abs.saturating_sub(self.hist_base) as usize, end) } else { 0 };
+        let (mut skip, mut used) = (end, 0usize);
+        while skip > floor {
             let cost = crate::video::termsel::visual_rows(self.history[skip - 1].chars().count(), cols);
             if used + cost > budget {
                 break;
@@ -505,7 +556,7 @@ impl Console {
             used += cost;
             skip -= 1;
         }
-        (skip, used)
+        (skip, end, used)
     }
 
     /// Paint the inverse-video band over flat cells `lo..hi` of `line` (whose cell `i` is flat cell
@@ -524,4 +575,154 @@ impl Console {
             pal.draw_text(x, y, &part, Self::BG);
         }
     }
+}
+
+// --- SCROLLBACK (R75) — the view's offset, the wheel/key routes, the marker and the bar ----------------
+//
+// Tail-appended. The model (`history`, absolute rows, `LineSel`) is unchanged: a selection records
+// ABSOLUTE rows (`hist_base + i`), so it already survives the view moving; `layout_span`/`cell_at`/`draw`
+// just all read the same `end = len - view_off`, which is what makes a click on a scrolled-back row
+// resolve to that row's buffer number and not to the screen row it happens to occupy.
+impl Console {
+    /// Entries scrolled up (0 = live).
+    pub fn view_off(&self) -> usize { self.view_off }
+    /// Lines that arrived while scrolled up (the marker's N).
+    pub fn new_lines(&self) -> usize { self.new_lines }
+    /// Retained entries.
+    pub fn history_len(&self) -> usize { self.history.len() }
+
+    /// Largest offset: the one whose page is the oldest full page.
+    fn max_off(&self, m: crate::ui::Metrics, w: usize, h: usize) -> usize {
+        let cols = self.cols_for(m, w);
+        let budget = self.history_rows_for(m, w, h).saturating_sub(self.edit_rows_for(cols) - 1);
+        let (mut used, mut k) = (0usize, 0usize);
+        for e in self.history.iter() {
+            let c = crate::video::termsel::visual_rows(e.chars().count(), cols);
+            if used + c > budget { break; }
+            used += c;
+            k += 1;
+        }
+        self.history.len().saturating_sub(k.max(1))
+    }
+
+    /// Move the view `delta` entries (positive = toward OLDER). Returns whether it moved.
+    pub fn scroll_by_at(&mut self, delta: isize, m: crate::ui::Metrics, w: usize, h: usize) -> bool {
+        let max = self.max_off(m, w, h) as isize;
+        let old = self.view_off;
+        let n = (old as isize + delta).clamp(0, max) as usize;
+        self.view_off = n;
+        if n == 0 { self.new_lines = 0; }
+        self.last_edit_rows.set(usize::MAX);
+        n != old
+    }
+
+    /// Jump to the oldest page (`top`) or back to the live bottom.
+    pub fn scroll_to_at(&mut self, top: bool, m: crate::ui::Metrics, w: usize, h: usize) -> bool {
+        let d = if top { self.history.len() as isize } else { -(self.view_off as isize) };
+        self.scroll_by_at(d, m, w, h)
+    }
+
+    /// Entries in one PgUp/PgDn step: a page less one line of overlap.
+    pub fn page_step_at(&self, m: crate::ui::Metrics, w: usize, h: usize) -> isize {
+        let cols = self.cols_for(m, w);
+        (self.history_rows_for(m, w, h).saturating_sub(self.edit_rows_for(cols) - 1).saturating_sub(1)).max(1) as isize
+    }
+
+    /// The buffer row (absolute number, text) at the top of the glass — the fixture's assertion.
+    pub fn top_row_at(&self, m: crate::ui::Metrics, w: usize, h: usize) -> (u64, &str) {
+        let (skip, end, _) = self.layout_span(m, w, h);
+        if skip >= end { return (self.hist_base + skip as u64, ""); }
+        (self.hist_base + skip as u64, self.history[skip].as_str())
+    }
+
+    /// A key that TYPES (printable, CR/LF, BS/DEL) snaps the view back to the live bottom and owes a full repaint (`last_edit_rows` poisoned so the caller's `draw_input_line` repaints everything). Called from `handle_key`'s head.
+    pub fn snap_for_key(&mut self, c: u8) {
+        if self.view_off > 0 && (c >= 0x20 || c == b'\n' || c == b'\r' || c == 8) {
+            self.view_off = 0;
+            self.new_lines = 0;
+            self.last_edit_rows.set(usize::MAX);
+        }
+    }
+
+    /// Wheel detents (positive = up, as `Event::Wheel`): 3 entries each. PLAIN wheel scrolls the shell window — it reaches this console only when no ring-3 window took it, so the pointer-focus rule already made it the shell's; Shift is not visible at the event, so Shift+wheel is not a separate route. Returns whether anything was painted.
+    pub fn wheel(&mut self, d: i8, pal: &mut TargetPal) -> bool {
+        let (m, w, h) = (pal.metrics(), pal.width() as usize, pal.height() as usize);
+        if self.scroll_by_at(d as isize * 3, m, w, h) { self.draw(pal); true } else { false }
+    }
+
+    /// The four scroll ACTIONS (Shift+PgUp/PgDn, Cmd/Ctrl+Home/End). `None` = not a scroll action.
+    pub fn scroll_action(&mut self, a: crate::video::keymap::Action, pal: &mut TargetPal) -> Option<bool> {
+        use crate::video::keymap::Action;
+        let (m, w, h) = (pal.metrics(), pal.width() as usize, pal.height() as usize);
+        let moved = match a {
+            Action::ScrollPageUp => { let s = self.page_step_at(m, w, h); self.scroll_by_at(s, m, w, h) }
+            Action::ScrollPageDown => { let s = self.page_step_at(m, w, h); self.scroll_by_at(-s, m, w, h) }
+            Action::ScrollTop => self.scroll_to_at(true, m, w, h),
+            Action::ScrollBottom => self.scroll_to_at(false, m, w, h),
+            _ => return None,
+        };
+        if moved { self.draw(pal); }
+        Some(moved)
+    }
+
+    /// The `[N new lines]` marker (in the freed prompt row) and the 4 px bar at the right edge.
+    fn draw_scroll_furniture(&self, pal: &mut TargetPal, m: crate::ui::Metrics, w: usize, h: usize, skip: usize, end: usize) {
+        let top = self.top_y_for(m, w, h);
+        let rows = self.history_rows_for(m, w, h);
+        let page_h = rows * m.line_h;
+        let total = self.history.len().max(1);
+        let shown = (end - skip).max(1);
+        let thumb_h = core::cmp::max(page_h * shown / total, 8).min(page_h);
+        let span = total.saturating_sub(shown).max(1);
+        let thumb_y = top + (page_h - thumb_h) * skip.min(span) / span;
+        pal.draw_rect(w.saturating_sub(4), top, 4, page_h, 0x3A3868);
+        pal.draw_rect(w.saturating_sub(4), thumb_y, 4, thumb_h, crate::video::theme::ACCENT);
+        if self.new_lines > 0 {
+            let y = top + rows * m.line_h;
+            pal.draw_rect(0, y, w, m.line_h, 0x3A3868);
+            let msg = format!("[{} new lines]", self.new_lines);
+            pal.draw_text(m.margin, y, &msg, 0xFFFFFF);
+        }
+    }
+}
+
+/// SCROLLBACK fixture (panel-less console; `tests scrollback`): print 300 lines, scroll up 100 and
+/// assert the top buffer row, print one more and assert the view did not move and the marker counts it,
+/// resolve a pointer cell on the scrolled view to its BUFFER row (selection coordinates), snap back on a
+/// typed key, then `clear` keeps and `clear --all` drops.
+#[cfg(all(feature = "witness", target_arch = "x86_64"))]
+pub fn scrollback_selftest() {
+    const W: usize = 640;
+    const H: usize = 480;
+    let m = crate::ui::Metrics::for_height(H);
+    let mut con = Console::new();
+    con.mark_in_window();
+    for i in 0..300 { con.place_for_fixture(&format!("line {:03}", i)); }
+    let cols = con.cols_for(m, W);
+    let (abs0, _) = con.top_row_at(m, W, H);
+    let lx = (m.margin + m.cell_w / 2) as i32;
+    let ly = (m.margin + m.cell_h / 2) as i32;
+    let (live_row, _, _) = con.cell_at(m, W, H, lx, ly);
+    let moved = con.scroll_by_at(100, m, W, H);
+    let view_off = con.view_off();
+    let (abs1, text1) = con.top_row_at(m, W, H);
+    let top_ok = moved && view_off == 100 && abs1 + 100 == abs0 && text1 == format!("line {:03}", abs1);
+    con.place_for_fixture("line 300");
+    let (abs2, text2) = con.top_row_at(m, W, H);
+    let marker_ok = con.new_lines() == 1 && con.view_off() == 101 && abs2 == abs1 && text2 == text1;
+    let (srow, _, _) = con.cell_at(m, W, H, lx, ly);
+    let sel_ok = srow == abs1 && live_row == abs0 && con.row_text(srow) == text1;
+    con.snap_for_key(b'x');
+    let snap_ok = con.view_off() == 0 && con.new_lines() == 0;
+    let n0 = con.history_len();
+    con.clear();
+    let keep = con.history_len() == n0 && con.top_row_at(m, W, H).1.is_empty() && con.scroll_by_at(1, m, W, H);
+    con.clear_all();
+    let clear_ok = keep && snap_ok && con.history_len() == 0;
+    let ok = top_ok && marker_ok && sel_ok && clear_ok;
+    let t = |b: bool| if b { "ok" } else { "bad" };
+    serial_println!(
+        ":: SCROLLBACK: rows={} cols={} view_off={} marker_ok={} sel_ok={} clear_ok={} -> {} ::",
+        Console::HISTORY_MAX, cols, view_off, t(marker_ok), t(sel_ok), t(clear_ok), if ok { "PASS" } else { "FAIL" }
+    );
 }
