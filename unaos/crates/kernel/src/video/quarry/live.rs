@@ -131,6 +131,11 @@ use crate::video::theme;
 use crate::video::wm;
 use crate::fs::vfs::{DirEnt, NodeKind, VfsTime};
 
+/// QUARRYOPS (R75) — right-click menu, rename field, copy/paste, delete, new folder, info.
+#[path = "ops.rs"]
+pub mod ops;
+pub use ops::{menu_press, right_press, selftest as ops_selftest};
+
 // ── Identity ────────────────────────────────────────────────────────────────────────────────────
 
 /// Quarry's owner ASID: kernel FURNITURE, in the reserved band, and deliberately neither
@@ -1950,6 +1955,7 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
         }
     }
     paint_scrollbar(px, g, li, body_y, m.list.len(), lvis, m.list_scroll);
+    ops::paint_overlay(m, px); // QUARRYOPS — the context menu and the inline edit field, over the finished frame
 }
 
 /// Repaint the whole surface and present it.
@@ -2331,6 +2337,10 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     if let crate::pal::Event::Wheel(d) = ev {
         return on_glass() && wheel_route(d);
     }
+    // QUARRYOPS — Cmd/Ctrl-C / V arrive as `Action`s; Quarry takes them only while it holds the keyboard.
+    if let crate::pal::Event::Action(a) = ev {
+        return is_open() && wm::focus_asid() == OWNER && on_glass() && ops::action(a);
+    }
     let crate::pal::Event::Key(c) = ev else {
         return false;
     };
@@ -2342,6 +2352,11 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
             key_witness(c, focused, false);
         }
         return false;
+    }
+    // QUARRYOPS — the edit field / Delete / rename / new-folder keys, asked before the table below.
+    if ops::key_pre(c) {
+        key_witness(c, true, true);
+        return true;
     }
     let mut acted = true;
     let mut refreshed = false;

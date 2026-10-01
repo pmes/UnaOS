@@ -7430,7 +7430,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
     #[cfg(feature = "wc")]
     {
         crate::video::dock::set_quit_hook(wc_close_click);
-        let eat = if mask & 0x02 != 0 { crate::video::dock::right_press_at(x, y) } else if mask & 0x01 != 0 && crate::video::dock::menu_open() { crate::video::dock::menu_press(x, y) } else { false };
+        let eat = if mask & 0x02 != 0 { crate::video::dock::right_press_at(x, y) || crate::video::quarry::right_press(x, y) } else if mask & 0x01 != 0 && crate::video::dock::menu_open() { crate::video::dock::menu_press(x, y) } else if mask & 0x01 != 0 && crate::video::quarry::menu_press(x, y) { true } else { false };
         if mask & 0x01 == 0 { crate::video::dock::lp_release(); }
         if eat { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; }
     }
@@ -17573,6 +17573,8 @@ fn winx_launcher(demo_cpu: usize) {
     // rule), and it MOVES the real pointer, which no earlier fixture may inherit either.
     #[cfg(all(feature = "witness", feature = "wc"))]
     crate::tests::register("dmgovlp", crate::video::wm::dmgovlp_selftest);
+    #[cfg(all(feature = "wc", feature = "quarry"))]
+    crate::tests::register("quarryops", crate::video::quarry::ops_selftest); // QUARRYOPS (R75) — mkdir/rename(LFN)/copy/delete on a scratch folder under /home, verified by listing.
     // VUGRES (D-3 RESUMEPAINT) — the pause/resume first-present witness, both arms, and the
     // ladder's new tail. After DMGOVLP because its negative leg deliberately runs a 2 s bound down
     // (nothing after it should wait behind that), and it is otherwise the least disruptive fixture
