@@ -8677,6 +8677,16 @@ test_selfhost() {
         echo -e "${COLOR_RED}❌ SELFHOST: no 'src verified ... -> PASS ::' line in ${log}${COLOR_RESET}"
         exit 1
     fi
+    # SRCEXTRACT: the `tests srcextract` fixture (the extraction DRY RUN) registers after the PASS above and
+    # runs at boot on this lane (`tests-at-boot`). Its own verdict is pinned here, not in a spec — this lane
+    # has none (see the UNAOS_SELFHOST note above) — so the rung-3 walk cannot rot behind rung 2's PASS.
+    awk '/SRCEXTRACT:/' "$log" || true
+    if awk '/:: SRCEXTRACT: files=[0-9]+ dirs=[0-9]+ bytes=[0-9]+ renamed=[0-9]+ ms=[0-9]+ verify=dry -> PASS ::/{f=1} END{exit !f}' "$log"; then
+        echo -e "${COLOR_GREEN}✅ SRCEXTRACT: the extraction walk (dry run) passed over the shard's own source${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}❌ SRCEXTRACT: no ':: SRCEXTRACT: ... verify=dry -> PASS ::' line in ${log}${COLOR_RESET}"
+        exit 1
+    fi
     scan_serial_faults "$log"
 }
 

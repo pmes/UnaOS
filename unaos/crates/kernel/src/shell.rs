@@ -5991,6 +5991,8 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
             // On a real replay `took_screen` keeps the console off the freshly-blitted tiles.
         },
+        #[cfg(feature = "selfhost")]
+        "src" => { shell_src(&args, console); }
         "tests" => { crate::tests::shell_verb(&args, console); } "tste" | "selftest" => {
             // The in-OS self-test suite (TSTE-1). Prints a three-section PASS/FAIL/SKIP table in the
             // console (like `ps` — it does NOT take the screen) and mirrors every line to serial.
@@ -8818,5 +8820,27 @@ fn edit_verb(console: &mut Console, path: Option<&str>) {
     match crate::video::textedit::open(&full) {
         Ok((b, l)) => console.println(&alloc::format!("edit: {} — {} bytes, {} lines (Ctrl-S saves)", full, b, l)),
         Err(e) => console.println(&alloc::format!("edit: {}: {}", full, e)),
+    }
+}
+
+/// SRCEXTRACT: the `src` verb — `src extract [--dry-run]` · `src status` · `src verify`. Writes the verified
+/// SRC.TGZ payload under `/SRC/` on the system volume (see `selfhost/extract.rs`).
+#[cfg(feature = "selfhost")]
+fn shell_src(args: &[&str], console: &mut Console) {
+    use crate::selfhost::extract;
+    let mut say = |s: &str| console.println(s);
+    match args.first().copied() {
+        Some("extract") => {
+            let dry = args.iter().skip(1).any(|a| *a == "--dry-run");
+            #[cfg(feature = "login")]
+            if !dry && !crate::fs::users::desktop_allowed() {
+                say("src: refused — finish first-boot setup before writing the system volume");
+                return;
+            }
+            let _ = extract::extract(dry, &mut say);
+        }
+        Some("status") => extract::status(&mut say),
+        Some("verify") => { let _ = extract::verify(&mut say); }
+        _ => say("usage: src extract [--dry-run] | src status | src verify"),
     }
 }

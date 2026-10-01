@@ -186,7 +186,7 @@ impl Sink for TarWalk {
 }
 
 /// `prefix` + `/` + `name`, both NUL-padded (POSIX.1-1988 ustar).
-fn full_path(block: &[u8; BLOCK]) -> String {
+pub(super) fn full_path(block: &[u8; BLOCK]) -> String {
     let name = cstr(&block[0..100]);
     let prefix = cstr(&block[345..500]);
     let mut s = String::new();
@@ -198,13 +198,13 @@ fn full_path(block: &[u8; BLOCK]) -> String {
     s
 }
 
-fn cstr(field: &[u8]) -> &str {
+pub(super) fn cstr(field: &[u8]) -> &str {
     let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
     core::str::from_utf8(&field[..end]).unwrap_or("")
 }
 
 /// A NUL/space-padded octal field. Leading and trailing spaces are legal padding in the wild.
-fn octal(field: &[u8]) -> Option<u64> {
+pub(super) fn octal(field: &[u8]) -> Option<u64> {
     let mut v: u64 = 0;
     let mut any = false;
     for &b in field {
@@ -226,7 +226,7 @@ fn octal(field: &[u8]) -> Option<u64> {
 
 /// The header checksum: the sum of all 512 header bytes with the checksum field itself read as eight
 /// spaces. Both the unsigned and the (historical) signed interpretation are accepted.
-fn verify_checksum(block: &[u8; BLOCK]) -> Result<(), TarError> {
+pub(super) fn verify_checksum(block: &[u8; BLOCK]) -> Result<(), TarError> {
     let want = octal(&block[148..156]).ok_or(TarError::BadChecksum)?;
     let mut unsigned: u64 = 0;
     let mut signed: i64 = 0;

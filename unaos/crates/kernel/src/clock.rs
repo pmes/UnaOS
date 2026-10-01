@@ -467,3 +467,9 @@ pub fn fat_stamp() -> (u16, u16) {
         None => (0, 0),
     }
 }
+
+/// SRCEXTRACT: milliseconds since boot from the free-running counter (`None` where the arch has no
+/// calibrated counter). The ms twin of [`uptime_secs`], for a verb that reports its own elapsed time.
+pub fn uptime_ms() -> Option<u64> {
+    monotonic().map(|(ticks, freq)| ticks.saturating_mul(1000) / freq.max(1))
+}
