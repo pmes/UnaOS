@@ -959,3 +959,7 @@ FORBID :: ACTIVITY: .* -> FAIL ::
 # `clear` keeps the lines and `clear --all` drops them (`clear_ok`).
 REQUIRE :: SCROLLBACK: rows=2000 cols=\d+ view_off=\d+ marker_ok=ok sel_ok=ok clear_ok=ok -> PASS ::
 FORBID :: SCROLLBACK: .* -> FAIL ::
+# ── WINSNAP (R75), TAIL-APPENDED — `tests winsnap`: a real drag to the left edge snaps to the left half, the preview painted, the chords (Cmd/Ctrl+Alt+arrows) and Down restore, un-snap on drag-away
+REQUIRE :: WINSNAP: zones=7 snaps=[0-9]+ restores=[0-9]+ preview_ok=true unsnaps=[0-9]+ left=true chords=true quarters=4 .* -> PASS ::
+FORBID :: WINSNAP: .* -> FAIL ::
+REQUIRE \[wm-act\] snap win=[0-9]+ zone=left rect=

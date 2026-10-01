@@ -147,6 +147,14 @@ pub enum Action {
     ScrollTop,
     /// SCROLLBACK: back to the live bottom (`Cmd+End` / `Ctrl+End`).
     ScrollBottom,
+    /// WINSNAP: snap the focused window to the left half (`⌘⌥←`, `Ctrl+Alt+←`). Acted on by the router.
+    SnapLeft,
+    /// WINSNAP: right half (`⌘⌥→`, `Ctrl+Alt+→`).
+    SnapRight,
+    /// WINSNAP: zoom (`⌘⌥↑`, `Ctrl+Alt+↑`).
+    SnapZoom,
+    /// WINSNAP: restore the pre-snap placement (`⌘⌥↓`, `Ctrl+Alt+↓`).
+    SnapRestore,
 }
 
 impl Action {
@@ -178,6 +186,10 @@ impl Action {
             Action::ScrollPageDown => "scroll-page-down",
             Action::ScrollTop => "scroll-top",
             Action::ScrollBottom => "scroll-bottom",
+            Action::SnapLeft => "snap-left",
+            Action::SnapRight => "snap-right",
+            Action::SnapZoom => "snap-zoom",
+            Action::SnapRestore => "snap-restore",
         }
     }
 
