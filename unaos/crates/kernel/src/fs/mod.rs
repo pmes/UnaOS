@@ -153,3 +153,6 @@ pub fn ns_bump<T, E>(r: Result<T, E>) -> Result<T, E> {
     }
     r
 }
+
+/// TRASH (R75): the desktop Trash — `.Trash/` + `.index`, moved by `rename`. See the module docs.
+pub mod trash;
