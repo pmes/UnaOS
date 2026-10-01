@@ -861,6 +861,9 @@ mod bandy3_tests {
         // A full registration body fits a frame with room.
         assert!(BUS_REG_MAX_PER_ROW < BUS_BODY_MAX);
         std::println!(":: BANDY3: abi register={} fulfil_min={} pref_get={} pref_list={} max_per_row={} -> PASS ::", BUS_VERB_REGISTER, BUS_VERB_FULFIL_MIN, BUS_VERB_R3PREF_GET, BUS_VERB_R3PREF_LIST, BUS_REG_MAX_PER_ROW);
+    }
+}
+
 // ATTRSURF (B299) — the typed-attribute surface: five syscalls, five bus verbs, ONE byte layout.
 //
 // The syscall inputs ARE the bus request bodies and the syscall outputs ARE the bus reply bodies, so

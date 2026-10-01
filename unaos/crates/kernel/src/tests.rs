@@ -200,6 +200,8 @@ fn ensure_unafsx86() {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("unafs", crate::fs::unafs::unafsx86_selftest); }
     }
+}
+
 /// ATTRSURF (B299): register `tests attr` exactly once, every build — the fixture decides PASS or an
 /// honest SKIP (`reason=no-unafs-volume`) from the mounted tree, so it needs no knob.
 fn ensure_attr() {
