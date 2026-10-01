@@ -982,3 +982,6 @@ REQUIRE \[wm-act\] snap win=[0-9]+ zone=left rect=
 # ── TERMCOLOR (R75), TAIL-APPENDED — `tests termcolor`: per-cell SGR spans (<=16/line), erase-line / clear-screen / caret moves, 16+256+rgb palette
 REQUIRE :: TERMCOLOR: spans_max=16 sgr_ok=ok erase_ok=ok palette=16\+256\+rgb -> PASS ::
 FORBID :: TERMCOLOR: .* -> FAIL ::
+# ── POWERMENU (R75), TAIL-APPENDED — `tests power`: the battery panel opens and closes through the real crystal path on a forced reading, the low-battery NOTICE thresholds (10 %, 5 %, once each, discharging only) on forced percents, the two-step confirm armed/fired/re-armed. No real shutdown.
+REQUIRE :: POWER-UI: panel_ok=true notice_ok=true -> PASS ::
+FORBID :: POWER-UI: .* -> FAIL ::

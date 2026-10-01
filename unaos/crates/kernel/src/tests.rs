@@ -168,6 +168,12 @@ fn ensure_shellux() {
         static DONE2: AtomicBool = AtomicBool::new(false);
         if !DONE2.swap(true, Ordering::AcqRel) { register("settings", crate::video::settings::selftest_all); }
     }
+    // POWERMENU (R75): `tests power` — battery panel open/close + the NOTICE thresholds on a forced percent (no shutdown).
+    #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        static DONE3: AtomicBool = AtomicBool::new(false);
+        if !DONE3.swap(true, Ordering::AcqRel) { register("power", crate::video::powerui::selftest); }
+    }
 }
 
 /// SELFINSTALL: register `selfinstall` (the `install ssd --dry-run` plan) exactly once. x86 + the

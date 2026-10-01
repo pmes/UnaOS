@@ -3117,3 +3117,11 @@ fn clockbar_paint(out: &mut [u32], w: usize, sy: usize, cx: usize, anchored: boo
         }
     );
 }
+
+/// POWERMENU (R75) M2 — the battery item's PRESS cell on the panel (`None` when the bar is off, there is no room, or there is no battery source).
+pub fn batt_box_abs(pw: usize, ph: usize) -> Option<strip::Rect> {
+    super::status::bar_item()?;
+    let (rx, ry, w, h) = strip_rect(pw, ph)?;
+    let x0 = batt_slot(w)?;
+    Some((rx + x0, ry, BATT_ITEM_W, h))
+}

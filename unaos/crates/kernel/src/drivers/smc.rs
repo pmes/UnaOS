@@ -1416,6 +1416,14 @@ pub mod battery {
         KeyRead::Stuck
     }
 
+    /// POWERMENU (R75): the keys the battery panel wants that `snapshot` does not carry — `B0CT`
+    /// (cycle count), `B0DC` (design capacity, mAh), plus `B0FC`/`B0RM` again for the health ratio and the
+    /// discharge ETA. Four bounded reads; `None` is an honest absence (the key is not on this SMC).
+    /// Returns `(cycles, design_mah, full_mah, rem_mah)`.
+    pub fn extras() -> (Option<u16>, Option<u16>, Option<u16>, Option<u16>) {
+        (opt(read_u16k(b"B0CT")), opt(read_u16k(b"B0DC")), opt(read_u16k(b"B0FC")), opt(read_u16k(b"B0RM")))
+    }
+
     fn opt(r: KeyRead) -> Option<u16> {
         match r {
             KeyRead::Val(v) => Some(v),

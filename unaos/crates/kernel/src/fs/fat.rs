@@ -7055,3 +7055,6 @@ impl FatFs {
         Err(FatError::Busy)
     }
 }
+
+/// POWERMENU (R75): is a deferred directory entry waiting to be written? (the `flushed=` term of `:: POWER:`).
+pub fn dirent_pending() -> bool { PEND_VALID.load(Ordering::Acquire) }

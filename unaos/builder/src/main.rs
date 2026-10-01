@@ -61,6 +61,7 @@ fn main() {
     // witness at all. Kept in sync with arroyo.
     if std::env::var("UNAOS_SELFHOST").is_ok() { feats.push("selfhost"); }
     if std::env::var("UNAOS_SKIP_XHCI").is_ok() { feats.push("skip_xhci"); }
+    if std::env::var("UNAOS_LOWBAT_SHUTDOWN").is_ok() { feats.push("lowbat_shutdown"); } // POWERMENU M3
     if std::env::var("UNAOS_BOOTLOG").is_ok() { feats.push("bootlog"); }
     // CLOCK-2: UNAOS_LOGTS=1 arms `logts` — a compact per-line timestamp prefix (monotonic ms → UTC
     // after a civil anchor) on the UART and both capture transports (FTDI capture ring, UNAOS.LOG).
