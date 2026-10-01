@@ -1156,3 +1156,6 @@ pub mod wallpaper;
 // SETTINGS (R75) — the settings window: sliders/toggles over the knobs the OS already has; same gate as fileview.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod settings;
+// SHOTREGION (R75) — region/window capture selection mode (x86 `wc`: its door is the x86 router's).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod shotsel;

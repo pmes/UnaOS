@@ -29619,3 +29619,28 @@ pub fn overlay_open(surf: usize, surf_len: usize, w: usize, h: usize, x: usize, 
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 #[path = "winsnap.rs"]
 pub mod winsnap;
+/// SHOTREGION M2: the frame (title bar and border included) of the topmost window under `(x, y)`, for the window capture's highlight and click. Unlike [`hit_test`] this includes KERNEL rows (the console is a window worth capturing) and skips `skip` (the selection overlay's own row) and every compat row (the splash and full-screen apps). Returns `(id, x, y, w, h)` in panel pixels, or `None`.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn frame_at(x: i32, y: i32, skip: WinId) -> Option<(WinId, usize, usize, usize, usize)> {
+    if x < 0 || y < 0 {
+        return None;
+    }
+    let (px, py) = (x as usize, y as usize);
+    let shell = shell_z();
+    let t = table();
+    let mut best: Option<(WinId, u32, (usize, usize, usize, usize))> = None;
+    for r in t.rows.iter() {
+        if !r.used || r.compat || r.id == skip || !above_shell(r, shell) {
+            continue;
+        }
+        let (bx, by, bw, bh) = outer_box(r);
+        if bw == 0 || bh == 0 || px < bx || py < by || px >= bx.saturating_add(bw) || py >= by.saturating_add(bh) {
+            continue;
+        }
+        match best {
+            Some((bid, bz, _)) if (r.z, r.id) <= (bz, bid) => {}
+            _ => best = Some((r.id, r.z, (bx, by, bw, bh))),
+        }
+    }
+    best.map(|(id, _, (bx, by, bw, bh))| (id, bx, by, bw, bh))
+}

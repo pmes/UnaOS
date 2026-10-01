@@ -571,6 +571,12 @@ pub static CRISPY_ROWS: [Binding; 42] = [
     // witness has always carried, so a capture from before KEYMAP and one from after grep alike.
     Binding { roles: CMD | SHIFT, usage: 0x20, action: Action::Screenshot, token: super::shortcuts::C_CMD_SHIFT_3 },
     Binding { roles: CMD | SHIFT, usage: 0x21, action: Action::ScreenshotRegion, token: super::shortcuts::C_CMD_SHIFT_4 },
+pub static CRISPY_ROWS: [Binding; 28] = [
+    // The two chords flight 11 proved on metal. Their tokens are the exact bytes the `[prtscr]`
+    // witness has always carried, so a capture from before KEYMAP and one from after grep alike.
+    Binding { roles: CMD | SHIFT, usage: 0x20, action: Action::Screenshot, token: "cmd-shift-3" },
+    Binding { roles: CMD | SHIFT, usage: 0x21, action: Action::ScreenshotRegion, token: "cmd-shift-4" },
+    Binding { roles: CMD | SHIFT, usage: 0x22, action: Action::ScreenshotWindow, token: "cmd-shift-5" }, // SHOTREGION M2
     // The SLOT (R60). LOGINFLOW may bind it; nothing else may, and nothing acts on it today.
     Binding { roles: CMD | SHIFT, usage: 0x14, action: Action::LogOut, token: "cmd-shift-q" },
     // SCROLLBACK (R75) — ABOVE every bare Home/End row (`no_shadow`). Cmd+Home/End and Ctrl+Home/End jump, Shift+PgUp/PgDn page.

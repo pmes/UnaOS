@@ -7314,6 +7314,7 @@ pub fn wc_route_event(raw: crate::pal::Event) -> crate::pal::Event { #[cfg(featu
     // QUARRYDOOR (KEYDOORS F1) — `|| quarry::key_route(raw)`: on x86 the file manager had NO KEY DOOR AT ALL. `video/mod.rs:685` compiles `quarry` under `wc` on this arch too, but `wc_route_event` never asked it and neither does `user_input_enqueue` here (x86's ring door has no key interception — this wrapper IS x86's interception), so <Esc>, the arrows, <Enter>, Backspace, `r` and the wheel had ZERO reachable consumers on this board. Asked in the SAME position as the two aarch64 doors: after `strip::key_escape` (a menu composites above Quarry, so the modal surface wins) and ahead of `wc_focus_key` (an open file manager eats its own arrows before the focus ring). `key_route` gates on `focus_asid() == OWNER && on_glass()` since SO9FIX 63b109f6 (was `on_glass()` alone — SO9), so a closed Quarry consumes nothing and this is behaviour-alike on every boot without one. Folded into the existing condition — no line added, the idiom this block already states.
     #[cfg(feature = "login")] if crate::fs::users::screen_up() && matches!(raw, crate::pal::Event::Key(_) | crate::pal::Event::KeyUp(_)) { if let crate::pal::Event::Key(c) = raw { let _ = crate::fs::users::screen_key(c); } return crate::pal::Event::Unknown; } #[cfg(feature = "wc")] // LOGIN13 M3 (R63) — THE SCREEN IS THE FIRST TAKER OF EVERY KEY while it is up: ahead of the Esc/Quarry doors, the Tab focus ring (`wc_focus_key`) and the focused ring (`user_input_route`). Flight 12's keys went to `[wc-c] focus tab-cycle` and the desktop because every one of those was asked first and the screen was asked last, in the render loop's fallback (`main.rs`, after this router). A key-UP is swallowed too, so no app sees half a keystroke. The SERIALDOOR arm on the signature line stays first: a wire byte is the console's, and the loop's own `screen_key` still hands it to the screen. ⚠ LINE-NEUTRAL fold.
     if crate::video::shortcuts::overlay_key(raw) || crate::video::strip::key_escape(raw) || crate::video::quarry::key_route(raw) || wc_action_quarry_held(raw) { // SHORTCUTS M2 — the overlay takes ANY key while up, ahead of every other door.
+    if crate::video::shotsel::route(raw) || crate::video::strip::key_escape(raw) || crate::video::quarry::key_route(raw) || wc_action_quarry_held(raw) { // SHOTREGION: the selection mode is the FIRST door (one atomic load idle): Esc, the press/drag/release and the chords belong to it while it is up.
         return crate::pal::Event::Unknown;
     }
     if wc_focus_key(raw) {
@@ -7343,7 +7344,7 @@ pub fn wc_route_tail(raw: crate::pal::Event) {
         raw,
         crate::pal::Event::Mouse { .. } | crate::pal::Event::MouseAbsolute { .. }
     ) {
-        wc_drag_motion(); if crate::video::termsel::pointer_held() { let (x, y) = click_pointer_pos(); crate::video::termsel::pointer_motion(x, y); } // TERMSEL2 — a drag on the shell's text: while a press is held there, each pointer report is a `drag` note at the live cursor (the same position `wc_drag_motion` steers a title-bar drag by). One atomic load otherwise. ⚠ FOLDED, line-neutral.
+        wc_drag_motion(); crate::video::shotsel::motion(); if crate::video::termsel::pointer_held() { let (x, y) = click_pointer_pos(); crate::video::termsel::pointer_motion(x, y); } // TERMSEL2 — a drag on the shell's text: while a press is held there, each pointer report is a `drag` note at the live cursor (the same position `wc_drag_motion` steers a title-bar drag by). One atomic load otherwise. ⚠ FOLDED, line-neutral.
     }
 }
 
@@ -17546,7 +17547,7 @@ fn winx_launcher(demo_cpu: usize) {
     // so no gate can power the machine off (the PASS line printing after every leg is that guard's
     // own proof). See `crystal::selftest`.
     #[cfg(all(feature = "witness", feature = "wc"))]
-    crate::tests::register("crystal", crate::video::crystal::selftest);
+    crate::tests::register("crystal", crate::video::crystal::selftest); crate::tests::register("shotregion", crate::video::shotsel::selftest); // SHOTREGION (R75)
     // CLICK-BAND — the band witness, PROVEN able to fire. `crystal::selftest` and `dock::selftest`
     // both call their `press_at` seams DIRECTLY, so nothing in the battery drove the ROUTER's band
     // arms — the very lines GR27's "menubar press inert" round was missing would themselves have

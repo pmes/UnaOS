@@ -5571,7 +5571,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
                 console.println(&crate::video::wallpaper::cmd(arg, &resolved));
             }
         },
-        "screenshot" => {
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] "shot" => { let w = args.first().copied().unwrap_or(""); if w == "region" || w == "window" { if crate::video::shotsel::enter(w == "window") { console.println("shot: selection mode — drag (region) or click (window); Esc cancels"); } else { console.println("shot: no desktop panel"); } } else { console.println("usage: shot region | shot window"); } }, "screenshot" => {
             // PRTSCR: capture the panel to `SCREEN<n>.PNG` at the volume root. The whole mechanism
             // lives in `video::prtscr` because the Print Screen KEY reaches the same function from
             // the device-service pass — a verb that reimplemented any of it would be a second

@@ -1971,10 +1971,12 @@ fn block_scale(fb: &FrameBuffer) -> usize {
 /// a restore must match against. That single-answer property is why save and restore can walk the
 /// same scan order and pair up entry for entry with no per-pixel bookkeeping.
 fn sprite_color(s: usize, col: usize, row: usize) -> Option<u32> {
+    // SHOTREGION: while a selection is up the arrow is a crosshair — one `s`-thick vertical and horizontal bar through the cell's centre block.
+    let cross = CROSSHAIR.load(Ordering::Relaxed);
     let hit = |c: usize, r: usize| -> bool {
         c < crate::ui::BASE_CELL * s
             && r < crate::ui::BASE_CELL * s
-            && ARROW[r / s] & (0x80 >> (c / s)) != 0
+            && if cross { c / s == 3 || r / s == 3 } else { ARROW[r / s] & (0x80 >> (c / s)) != 0 }
     };
     if hit(col, row) {
         Some(FILL)
@@ -4939,4 +4941,17 @@ fn ptrpaint_selftest(held: SpriteLoan) {
         if painted { "PAINTED" } else { "OWED" },
         if ok { "PASS" } else { "FAIL" }
     );
+}
+
+/// SHOTREGION M1 — the selection crosshair. Read by [`sprite_color`] on every sprite paint, so flipping it takes effect on the very next draw (the next pointer report or composite); the sprite's box is the same either way.
+static CROSSHAIR: AtomicBool = AtomicBool::new(false);
+
+/// SHOTREGION M1 — turn the crosshair shape on or off.
+pub fn set_crosshair(on: bool) {
+    CROSSHAIR.store(on, Ordering::Relaxed);
+}
+
+/// SHOTREGION M1 — is the crosshair the current shape (the fixture's witness).
+pub fn crosshair() -> bool {
+    CROSSHAIR.load(Ordering::Relaxed)
 }
