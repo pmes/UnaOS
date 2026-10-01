@@ -3703,6 +3703,13 @@ uvc = ["ehcihid"]
 # See docs/dev/OS/01_BOOT_HAL/ioapic.md.
 ioapic = []
 
+# BANDY3 (ROADMAP §3b, the fulfiller seam): UNAOS_BUSREG=1 arms fulfiller registration on the bus wire —
+# `BUS_VERB_REGISTER` (127), the registrable verb range 128..=255, the kernel relay to a ring-3 fulfiller
+# (crate::bus_route) and the `tests bandy3` fixture. Both arches. Off: `bus::verb_valid` refuses those
+# tags exactly as before and nothing of the router is compiled. Kept in sync with `unaos/arroyo` (the
+# x86 `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
+busreg = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

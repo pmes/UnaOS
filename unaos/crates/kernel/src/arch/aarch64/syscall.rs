@@ -4494,7 +4494,7 @@ pub fn clear_handle_row(asid: u64) {
     // BANDY-1 M2: drain this ASID's bus mailbox alongside its handles/inbox — undelivered replies
     // die with their tenant (the boxes free here), and the gen bump above already makes any reply
     // enqueued in a race dead-on-arrival for the next tenant (bus_mrecv verifies the stamp).
-    bus_mbox_clear(asid);
+    bus_mbox_clear(asid); #[cfg(feature = "busreg")] crate::bus_route::on_exit(&BUSREG_OPS, asid as usize);
     // U7: DISOWN any still-live transfer this dying ASID sent (SENDER -> u64::MAX, never a real ASID):
     // revoke authority dies with the sender, so the ASID's next tenant can neither revoke nor be blamed
     // for the old tenant's transfers (txids are monotonic and were returned to EL0 — without this, a
@@ -23101,7 +23101,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
         Ok(h) => h,
         Err(_) => return EINVAL,
     };
-    if hdr.kind != crate::bus::BUS_KIND_REQUEST || crate::bus::request_validate(&hdr).is_err() {
+    #[cfg(feature = "busreg")] { if hdr.kind == crate::bus::BUS_KIND_REPLY { return crate::bus_route::fulfiller_reply(&BUSREG_OPS, asid as usize, agen, &hdr, frame); } } if hdr.kind != crate::bus::BUS_KIND_REQUEST || crate::bus::request_validate(&hdr).is_err() { // BANDY3: under `busreg` a ring-3 REPLY frame is legal only as a fulfiller's answer to a relay it holds (bus_route.rs)
         return EINVAL; // a REPLY frame, nonzero status, or CALLER-SUPPLIED PRINCIPAL — rejected
     }
     let body = &frame[crate::bus::BUS_HDR_LEN..];
@@ -23113,7 +23113,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
     // EL0 bytes for this field were required zero above, and fulfillment below receives `ppid`
     // (the stamped identity) directly; hdr.principal is never read again.
     // Fulfill under the INVOKER's identity (verdict D) — synchronously, in this SVC context.
-    let mut text: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut text: alloc::vec::Vec<u8> = alloc::vec::Vec::new(); #[cfg(feature = "busreg")] { let mut pw = [0u8; 32]; ppid.write(&mut pw); match crate::bus_route::route_request(&BUSREG_OPS, asid as usize, agen, pw, &hdr, body) { crate::bus_route::Route::Kernel => {} crate::bus_route::Route::Relayed => return 0, crate::bus_route::Route::Reply(st) => return bus_reply_enqueue(asid, hdr.corr, hdr.verb, st, &[]) } }
     let status = match hdr.verb {
         crate::bus::BUS_VERB_LS => bus_ls(&mut text),
         crate::bus::BUS_VERB_CAT => match crate::bus::cat_body_parse(body) {
@@ -25748,4 +25748,72 @@ fn pref_caller_in_session(ppid: PrincipalRecord) -> bool {
         let _ = ppid;
         false
     }
+// =================================================================================================
+// BANDY3 (ROADMAP §3b, the fulfiller seam): this arch's thin half of `crate::bus_route` — the mailbox
+// ops table the router drives (ASID + ASID_GEN keyed, the existing BUS_MBOX / BUS_SEM), and the
+// `tests bandy3` fixture's hooks over the PRODUCTION `sys_msend_for`. Appended at the file tail.
+// =================================================================================================
+#[cfg(feature = "busreg")]
+fn busreg_push(row: usize, frame: alloc::boxed::Box<[u8]>) -> bool {
+    if row >= BUS_MBOX.len() {
+        return false;
+    }
+    bus_sem_init_once();
+    let agen = ASID_GEN[row].load(Ordering::Acquire);
+    if !bus_mbox_push(row as u64, agen, frame) {
+        return false;
+    }
+    BUS_SEM[row].post();
+    true
+}
+#[cfg(feature = "busreg")]
+fn busreg_has_room(row: usize) -> bool {
+    row < BUS_MBOX.len() && bus_mbox_has_room(row as u64)
+}
+#[cfg(feature = "busreg")]
+fn busreg_gen(row: usize) -> u64 {
+    if row < ASID_GEN.len() { ASID_GEN[row].load(Ordering::Acquire) } else { u64::MAX }
+}
+#[cfg(feature = "busreg")]
+static BUSREG_OPS: crate::bus_route::Ops = crate::bus_route::Ops { push: busreg_push, has_room: busreg_has_room, rgen: busreg_gen };
+
+/// The scratch principal the fixture's rows are stamped with (kernel-minted, like every stamp).
+#[cfg(feature = "busreg")]
+fn busreg_fx_prin(row: usize) -> PrincipalRecord {
+    if row == 6 { PrincipalRecord::program(b"prog:BANDY3A") } else { PrincipalRecord::program(b"prog:BANDY3F") }
+}
+#[cfg(feature = "busreg")]
+fn busreg_fx_send(row: usize, frame: &[u8]) -> i64 {
+    let agen = ASID_GEN[row].load(Ordering::Acquire);
+    sys_msend_for(row as u64, agen, busreg_fx_prin(row), frame)
+}
+#[cfg(feature = "busreg")]
+fn busreg_fx_pop(row: usize) -> Option<alloc::boxed::Box<[u8]>> {
+    bus_mbox_pop(row as u64).map(|m| m.frame)
+}
+#[cfg(feature = "busreg")]
+fn busreg_fx_clear(row: usize) {
+    bus_mbox_clear(row as u64);
+}
+#[cfg(feature = "busreg")]
+fn busreg_fx_stamp(row: usize) -> [u8; 32] {
+    let mut p = [0u8; 32];
+    busreg_fx_prin(row).write(&mut p);
+    p
+}
+#[cfg(feature = "busreg")]
+static BUSREG_FX: crate::bus_route::Fixture = crate::bus_route::Fixture {
+    ops: &BUSREG_OPS,
+    send: busreg_fx_send,
+    pop: busreg_fx_pop,
+    clear: busreg_fx_clear,
+    stamp: busreg_fx_stamp,
+    rows: (6, 7), // the scratch ASIDs the BANDY-STAMP fixture already uses (caller 6, fulfiller 7)
+};
+
+/// `tests bandy3` — the fulfiller-registration witness on aarch64.
+#[cfg(feature = "busreg")]
+pub fn bandy3_selftest() {
+    bus_sem_init_once();
+    crate::bus_route::selftest(&BUSREG_FX);
 }
