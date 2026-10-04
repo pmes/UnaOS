@@ -1056,7 +1056,9 @@ static CE_VRAM: AtomicUsize = AtomicUsize::new(0);
 
 /// Bank the GPU context for the fixtures. Called ONCE from `kepler::init`; writes nothing to
 /// the device. Replaces the boot-time `ladder(...)` call (R80).
-pub fn arm_context(bar0: usize, bar1_base: usize, bar1_size: usize, vram_size: usize) {
+pub fn arm_context(bar0: usize, bar1_base: usize, bar1_size: usize, vram_size: usize, vram: &mut super::kepler::VramAllocator) {
+    // GPUTESTS M4: reserve the KBLIT window from the boot allocator (a bump of an integer; no device access).
+    CE_KB_BASE.store(vram.alloc(KB_SPAN).unwrap_or(0), Ordering::Release);
     CE_BAR0.store(bar0, Ordering::Release);
     CE_BAR1.store(bar1_base, Ordering::Release);
     CE_BAR1_SIZE.store(bar1_size, Ordering::Release);
@@ -1161,17 +1163,24 @@ pub fn tests_ce() {
 /// Base VRAM offset of the KBLIT scratch window. Above the 32 MiB the firmware GOP framebuffer
 /// occupies (VramAllocator skips it) and above the fifo leg's own channel, so the two never
 /// collide. [TREE] — `kepler.rs::VramAllocator::new` skips the first 32 MiB for exactly this.
-const KB_BASE: usize = 48 * 1024 * 1024;
-const KB_INST: usize = KB_BASE;                 // instance block (RAMFC)   0x1000
-const KB_PD: usize = KB_BASE + 0x1000;          // identity page directory  0x1000
-const KB_PT: usize = KB_BASE + 0x2000;          // identity page table      0x1000
-const KB_GPFIFO: usize = KB_BASE + 0x3000;      // gpfifo ring              0x1000
-const KB_USERD: usize = KB_BASE + 0x4000;       // USERD doorbell page      0x1000
-const KB_PUSH: usize = KB_BASE + 0x5000;        // pushbuffer               0x1000
-const KB_SEM: usize = KB_BASE + 0x6000;         // semaphore page           0x1000
-const KB_SRC: usize = KB_BASE + 0x8000;         // 256x256 ARGB source      0x40000
-const KB_DST: usize = KB_BASE + 0x48000;        // 256x256 ARGB destination 0x40000
-const KB_TOP: usize = KB_BASE + 0x90000;        // one past the last byte used
+// GPUTESTS M4 (B334): the window is no longer the hand-picked `48 MiB`. `kepler::init` hands
+// `arm_context` its live `VramAllocator` and the span is RESERVED there (`alloc(KB_SPAN)`), so the
+// takeover's framebuffer below it and the fifo leg's channel above it come from the same bump and
+// cannot meet it. The banked base is read here; zero means the allocator refused (no window).
+static CE_KB_BASE: AtomicUsize = AtomicUsize::new(0);
+/// Bytes the KBLIT window spans (instance block .. destination).
+const KB_SPAN: usize = 0x90000;
+#[inline] fn kb_base() -> usize { CE_KB_BASE.load(Ordering::Acquire) }
+#[inline] fn kb_inst() -> usize { kb_base() }               // instance block (RAMFC)   0x1000
+#[inline] fn kb_pd() -> usize { kb_base() + 0x1000 }        // identity page directory  0x1000
+#[inline] fn kb_pt() -> usize { kb_base() + 0x2000 }        // identity page table      0x1000
+#[inline] fn kb_gpfifo() -> usize { kb_base() + 0x3000 }    // gpfifo ring              0x1000
+#[inline] fn kb_userd() -> usize { kb_base() + 0x4000 }     // USERD doorbell page      0x1000
+#[inline] fn kb_push() -> usize { kb_base() + 0x5000 }      // pushbuffer               0x1000
+#[inline] fn kb_sem() -> usize { kb_base() + 0x6000 }       // semaphore page           0x1000
+#[inline] fn kb_src() -> usize { kb_base() + 0x8000 }       // 256x256 ARGB source      0x40000
+#[inline] fn kb_dst() -> usize { kb_base() + 0x48000 }      // 256x256 ARGB destination 0x40000
+#[inline] fn kb_top() -> usize { kb_base() + KB_SPAN }      // one past the last byte used
 
 /// The blit geometry. 256x256 ARGB, 4 B/px.
 const KB_W: usize = 256;
@@ -1243,8 +1252,8 @@ fn kb_mmio(bar0: usize, off: usize, val: u32) -> u32 {
 /// The wedge detector (M4, the BAR1WEDGE lesson): poll `f` until it returns `true` or the
 /// millisecond budget expires. Returns `(ok, elapsed_us)`. A stalled GPU NEVER hangs the
 /// console — the wait is bounded and the caller prints the timeout. Timed with the arch-neutral
-/// `crate::arch::ms()` (present on both arches) so this file type-checks on the aarch64 leg too,
-/// where the whole kepler driver is dead code but must still compile under the knob.
+/// `crate::arch::ms()` (present on both arches). Since GPUTESTS M3 (B334) this module is declared
+/// x86_64-only in `drivers/gpu/mod.rs`, so the aarch64 leg no longer compiles it at all.
 const KB_WAIT_MS: u64 = 1500;
 fn kb_wait<F: Fn() -> bool>(f: F) -> (bool, u64) {
     let t0 = crate::arch::ms();
@@ -1269,55 +1278,55 @@ fn pb_hdr(subc: u32, method: u32, count: u32) -> u32 {
 
 /// Build the identity page directory + page table so the channel's GPU-virtual addresses equal
 /// the VRAM offsets for the scratch window. **[EXT-UNPINNED]** — the Kepler GMMU PDE/PTE format
-/// is recalled, not pinned; a small-page identity map of `[KB_BASE, KB_TOP)` is all one blit
+/// is recalled, not pinned; a small-page identity map of `[kb_base(), kb_top())` is all one blit
 /// needs. If the format is wrong the engine faults and `sem=timeout`/`advanced=0` says so; no
 /// confident claim is made about the entries.
 fn kb_build_identity_pd(bar1: usize) {
-    kb_zero(bar1, KB_PD, 0x1000);
-    kb_zero(bar1, KB_PT, 0x1000);
+    kb_zero(bar1, kb_pd(), 0x1000);
+    kb_zero(bar1, kb_pt(), 0x1000);
     // One PDE pointing at the small-page PT (PDE[.] = PT_phys>>8 | small-page present). The PT
-    // identity-maps 4 KiB pages covering KB_BASE..KB_TOP. Entry = (page>>8)<<4 ... kept minimal.
-    let pde_lo = ((KB_PT as u32) >> 8) | 0x1; // [EXT-UNPINNED] small-page table present
-    kb_wr(bar1, KB_PD + 0x0, pde_lo);
-    kb_wr(bar1, KB_PD + 0x4, 0);
-    let first = KB_BASE / 0x1000;
-    let last = (KB_TOP + 0xFFF) / 0x1000;
+    // identity-maps 4 KiB pages covering kb_base()..kb_top(). Entry = (page>>8)<<4 ... kept minimal.
+    let pde_lo = ((kb_pt() as u32) >> 8) | 0x1; // [EXT-UNPINNED] small-page table present
+    kb_wr(bar1, kb_pd() + 0x0, pde_lo);
+    kb_wr(bar1, kb_pd() + 0x4, 0);
+    let first = kb_base() / 0x1000;
+    let last = (kb_top() + 0xFFF) / 0x1000;
     for p in first..last {
         let pte_lo = ((p as u32) << 4) | 0x1; // [EXT-UNPINNED] VRAM, read/write, present
         let idx = p - first;
-        kb_wr(bar1, KB_PT + idx * 8, pte_lo);
-        kb_wr(bar1, KB_PT + idx * 8 + 4, 0);
+        kb_wr(bar1, kb_pt() + idx * 8, pte_lo);
+        kb_wr(bar1, kb_pt() + idx * 8 + 4, 0);
     }
 }
 
 /// Lay down the instance block (RAMFC) for the copy channel. Reuses `kepler.rs`'s UNAUDITED
 /// layout — every write with a readback (M4). Points gpfifo/userd at the KBLIT scratch window.
 fn kb_build_inst(bar1: usize, chan_id: u32) {
-    kb_zero(bar1, KB_INST, 0x1000);
+    kb_zero(bar1, kb_inst(), 0x1000);
     // USERD pointer (inst+0x08/0x0C), gpfifo pointer (inst+0x48/0x4C), and the housekeeping
     // magics kepler.rs writes. GPU addresses are VRAM offsets (KF24 identity).
-    kb_wr(bar1, KB_INST + 0x08, (KB_USERD & 0xFFFF_FFFF) as u32);
-    kb_wr(bar1, KB_INST + 0x0C, ((KB_USERD >> 32) as u32) | 0x8000_0000);
-    kb_wr(bar1, KB_INST + 0x10, 0x0000_face);
-    kb_wr(bar1, KB_INST + 0x30, 0xffff_f902);
-    kb_wr(bar1, KB_INST + 0x48, (KB_GPFIFO & 0xFFFF_FFFF) as u32);
-    kb_wr(bar1, KB_INST + 0x4C, ((KB_GPFIFO >> 32) as u32) | (9 << 16)); // ORDER 9 = 512 entries
+    kb_wr(bar1, kb_inst() + 0x08, (kb_userd() & 0xFFFF_FFFF) as u32);
+    kb_wr(bar1, kb_inst() + 0x0C, ((kb_userd() >> 32) as u32) | 0x8000_0000);
+    kb_wr(bar1, kb_inst() + 0x10, 0x0000_face);
+    kb_wr(bar1, kb_inst() + 0x30, 0xffff_f902);
+    kb_wr(bar1, kb_inst() + 0x48, (kb_gpfifo() & 0xFFFF_FFFF) as u32);
+    kb_wr(bar1, kb_inst() + 0x4C, ((kb_gpfifo() >> 32) as u32) | (9 << 16)); // ORDER 9 = 512 entries
     // Page-directory pointer for this channel's address space (inst+0x0200 area). [EXT-UNPINNED].
-    kb_wr(bar1, KB_INST + 0x0200, ((KB_PD as u32) >> 12) | 0x1);
-    kb_wr(bar1, KB_INST + 0x0204, 0);
-    kb_wr(bar1, KB_INST + 0x84, 0x2040_0000);
-    kb_wr(bar1, KB_INST + 0x94, 0x3000_0000); // VRAM devm=0
-    kb_wr(bar1, KB_INST + 0x9C, 0x0000_0100);
-    kb_wr(bar1, KB_INST + 0xAC, 0x0000_001f);
-    kb_wr(bar1, KB_INST + 0xE8, chan_id);
-    kb_wr(bar1, KB_INST + 0xB8, 0xf800_0000);
+    kb_wr(bar1, kb_inst() + 0x0200, ((kb_pd() as u32) >> 12) | 0x1);
+    kb_wr(bar1, kb_inst() + 0x0204, 0);
+    kb_wr(bar1, kb_inst() + 0x84, 0x2040_0000);
+    kb_wr(bar1, kb_inst() + 0x94, 0x3000_0000); // VRAM devm=0
+    kb_wr(bar1, kb_inst() + 0x9C, 0x0000_0100);
+    kb_wr(bar1, kb_inst() + 0xAC, 0x0000_001f);
+    kb_wr(bar1, kb_inst() + 0xE8, chan_id);
+    kb_wr(bar1, kb_inst() + 0xB8, 0xf800_0000);
 }
 
 /// Dump the first 8 dwords of the instance block — the M2-STOP deliverable (the brief: "the
 /// full instance-block dump in the doc").
 fn kb_dump_inst(bar1: usize) {
     for row in 0..4 {
-        let b = KB_INST + row * 0x20;
+        let b = kb_inst() + row * 0x20;
         serial_println!(
             "[ce] instblk off={:03X} [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
             row * 0x20,
@@ -1327,26 +1336,26 @@ fn kb_dump_inst(bar1: usize) {
     }
 }
 
-/// Submit one gpfifo entry (a pushbuffer segment of `len_dw` dwords at VRAM offset `KB_PUSH`),
+/// Submit one gpfifo entry (a pushbuffer segment of `len_dw` dwords at VRAM offset `kb_push()`),
 /// ring the doorbell (USERD IB_PUT), and poll IB_GET with a bounded wait. Returns
 /// `(ib_get, ib_put, advanced, us)`. **[EXT-UNPINNED]** gpfifo entry encoding.
 fn kb_submit(bar0: usize, bar1: usize, len_dw: u32) -> (u32, u32, bool, u64) {
     // gpfifo entry at index 0: lower = PB addr & ~3, upper = addr_hi | (len_dw << 10).
-    let ent_lo = (KB_PUSH as u32) & 0xFFFF_FFFC;
-    let ent_hi = ((KB_PUSH >> 32) as u32) | (len_dw << 10);
-    kb_wr(bar1, KB_GPFIFO + 0, ent_lo);
-    kb_wr(bar1, KB_GPFIFO + 4, ent_hi);
+    let ent_lo = (kb_push() as u32) & 0xFFFF_FFFC;
+    let ent_hi = ((kb_push() >> 32) as u32) | (len_dw << 10);
+    kb_wr(bar1, kb_gpfifo() + 0, ent_lo);
+    kb_wr(bar1, kb_gpfifo() + 4, ent_hi);
 
-    let get_pre = kb_rd(bar1, KB_USERD + USERD_IB_GET);
+    let get_pre = kb_rd(bar1, kb_userd() + USERD_IB_GET);
     // Doorbell: advance IB_PUT to 1 (one gpfifo entry queued) and read it back.
-    let put_rb = kb_wr(bar1, KB_USERD + USERD_IB_PUT, 1);
+    let put_rb = kb_wr(bar1, kb_userd() + USERD_IB_PUT, 1);
     // Kick the runlist so the scheduler can pick the channel up (the fifo leg's path).
-    let _ = kb_mmio(bar0, 0x2270, (KB_INST as u32) >> 12); // runlist[0].base = inst page
+    let _ = kb_mmio(bar0, 0x2270, (kb_inst() as u32) >> 12); // runlist[0].base = inst page
     let _ = kb_mmio(bar0, 0x2274, 1);                       // submit 1 entry
 
     // Bounded wait for IB_GET to advance to IB_PUT (the engine fetched our entry).
-    let (ok, us) = kb_wait(|| kb_rd(bar1, KB_USERD + USERD_IB_GET) != get_pre);
-    let get_post = kb_rd(bar1, KB_USERD + USERD_IB_GET);
+    let (ok, us) = kb_wait(|| kb_rd(bar1, kb_userd() + USERD_IB_GET) != get_pre);
+    let get_post = kb_rd(bar1, kb_userd() + USERD_IB_GET);
     let _ = ok;
     (get_post, put_rb, get_post != get_pre, us)
 }
@@ -1359,12 +1368,12 @@ fn kb_fill_src(bar1: usize) -> u32 {
     for y in 0..KB_H {
         for x in 0..KB_W {
             let px = 0xFF00_0000 | ((x as u32) << 8) | (y as u32) | (((x ^ y) as u32) << 16);
-            let off = KB_SRC + (y * KB_PITCH) + x * KB_BPP;
+            let off = kb_src() + (y * KB_PITCH) + x * KB_BPP;
             unsafe { core::ptr::write_volatile((bar1 + off) as *mut u32, px) };
             csum = csum.rotate_left(1) ^ px;
         }
     }
-    kb_zero(bar1, KB_DST, KB_BYTES);
+    kb_zero(bar1, kb_dst(), KB_BYTES);
     csum
 }
 
@@ -1373,7 +1382,7 @@ fn kb_csum_dst(bar1: usize) -> u32 {
     let mut csum: u32 = 0x1357_9BDF;
     for y in 0..KB_H {
         for x in 0..KB_W {
-            let off = KB_DST + (y * KB_PITCH) + x * KB_BPP;
+            let off = kb_dst() + (y * KB_PITCH) + x * KB_BPP;
             let px = unsafe { core::ptr::read_volatile((bar1 + off) as *const u32) };
             csum = csum.rotate_left(1) ^ px;
         }
@@ -1391,14 +1400,18 @@ pub fn tests_kblit() {
         serial_println!(":: KBLIT: engine=none get_advanced=0 sem=skip csum=skip us=0 -> FAIL :: (no GPU context banked; is UNAOS_KEPLER_TAKEOVER on?)");
         return;
     }
+    if kb_base() == 0 {
+        serial_println!(":: KBLIT: engine=none get_advanced=0 sem=skip csum=skip us=0 -> FAIL :: (the boot VramAllocator refused the {:#x}-byte KBLIT window at kepler::init; nothing reserved, nothing written)", KB_SPAN);
+        return;
+    }
     // The scratch window must fit inside the VRAM BAR1 actually exposes.
     let limit = core::cmp::min(bar1_size, vram);
-    if KB_TOP > limit {
-        serial_println!(":: KBLIT: engine=none get_advanced=0 sem=skip csum=skip us=0 -> FAIL :: (scratch top {:#x} > BAR1/VRAM {:#x}; refused rather than writing out of range)", KB_TOP, limit);
+    if kb_top() > limit {
+        serial_println!(":: KBLIT: engine=none get_advanced=0 sem=skip csum=skip us=0 -> FAIL :: (scratch top {:#x} > BAR1/VRAM {:#x}; refused rather than writing out of range)", kb_top(), limit);
         return;
     }
 
-    serial_println!("[ce] KBLIT begin knob=UNAOS_KEPLER_CE scratch={:#x}..{:#x} (VRAM, BAR1-identity KF24)", KB_BASE, KB_TOP);
+    serial_println!("[ce] KBLIT begin knob=UNAOS_KEPLER_CE scratch={:#x}..{:#x} (VRAM, BAR1-identity KF24)", kb_base(), kb_top());
 
     // M2 — confirm a live CE base this boot (R2's FALCON-REST gate), then build the channel.
     let (_r2, falcon_base) = r2_ce_probe(bar0);
@@ -1420,15 +1433,15 @@ pub fn tests_kblit() {
     kb_build_inst(bar1, 1);
 
     // Zero gpfifo / userd / pushbuffer / semaphore.
-    kb_zero(bar1, KB_GPFIFO, 0x1000);
-    kb_zero(bar1, KB_USERD, 0x1000);
-    kb_zero(bar1, KB_PUSH, 0x1000);
-    kb_zero(bar1, KB_SEM, 0x1000);
+    kb_zero(bar1, kb_gpfifo(), 0x1000);
+    kb_zero(bar1, kb_userd(), 0x1000);
+    kb_zero(bar1, kb_push(), 0x1000);
+    kb_zero(bar1, kb_sem(), 0x1000);
 
     // A minimal first pushbuffer: SET_OBJECT(copy class) only, so the ONLY thing being tested
     // in M2 is whether the engine fetches. [EXT-UNPINNED] SET_OBJECT = method 0 on subchannel 0.
     let mut pw = 0usize;
-    let mut push = |v: u32| { kb_wr(bar1, KB_PUSH + pw * 4, v); pw += 1; };
+    let mut push = |v: u32| { kb_wr(bar1, kb_push() + pw * 4, v); pw += 1; };
     push(pb_hdr(0, 0x0000, 1));
     push(CLASS_COPY);
     let m2_len = pw as u32;
@@ -1451,24 +1464,24 @@ pub fn tests_kblit() {
     serial_println!("[ce] src filled 256x256 ARGB cpu_csum={:08X}; dst zeroed", src_csum);
 
     pw = 0;
-    let mut push = |v: u32| { kb_wr(bar1, KB_PUSH + pw * 4, v); pw += 1; };
+    let mut push = |v: u32| { kb_wr(bar1, kb_push() + pw * 4, v); pw += 1; };
     push(pb_hdr(0, 0x0000, 1)); push(CLASS_COPY);
-    push(pb_hdr(0, M_OFFSET_IN_UPPER, 2)); push((KB_SRC >> 32) as u32); push((KB_SRC & 0xFFFF_FFFF) as u32);
-    push(pb_hdr(0, M_OFFSET_OUT_UPPER, 2)); push((KB_DST >> 32) as u32); push((KB_DST & 0xFFFF_FFFF) as u32);
+    push(pb_hdr(0, M_OFFSET_IN_UPPER, 2)); push((kb_src() >> 32) as u32); push((kb_src() & 0xFFFF_FFFF) as u32);
+    push(pb_hdr(0, M_OFFSET_OUT_UPPER, 2)); push((kb_dst() >> 32) as u32); push((kb_dst() & 0xFFFF_FFFF) as u32);
     push(pb_hdr(0, M_PITCH_IN, 1)); push(KB_PITCH as u32);
     push(pb_hdr(0, M_PITCH_OUT, 1)); push(KB_PITCH as u32);
     push(pb_hdr(0, M_LINE_LENGTH_IN, 1)); push(KB_PITCH as u32);
     push(pb_hdr(0, M_LINE_COUNT, 1)); push(KB_H as u32);
-    push(pb_hdr(0, M_SET_SEM_A, 3)); push((KB_SEM >> 32) as u32); push((KB_SEM & 0xFFFF_FFFF) as u32); push(KB_SEM_MAGIC);
+    push(pb_hdr(0, M_SET_SEM_A, 3)); push((kb_sem() >> 32) as u32); push((kb_sem() & 0xFFFF_FFFF) as u32); push(KB_SEM_MAGIC);
     push(pb_hdr(0, M_LAUNCH_DMA, 1)); push(LAUNCH_PITCH_PITCH_SEM);
     let m3_len = pw as u32;
 
-    kb_wr(bar1, KB_SEM, 0); // clear the semaphore before launch
+    kb_wr(bar1, kb_sem(), 0); // clear the semaphore before launch
     let (get2, put2, adv2, _us2) = kb_submit(bar0, bar1, m3_len);
     serial_println!("[ce] blit submit get={} put={} advanced={}", get2, put2, if adv2 { 1 } else { 0 });
 
-    let (sem_ok, sem_us) = kb_wait(|| kb_rd(bar1, KB_SEM) == KB_SEM_MAGIC);
-    let sem_rb = kb_rd(bar1, KB_SEM);
+    let (sem_ok, sem_us) = kb_wait(|| kb_rd(bar1, kb_sem()) == KB_SEM_MAGIC);
+    let sem_rb = kb_rd(bar1, kb_sem());
     serial_println!("[ce] semaphore wait ok={} rb={:08X} want={:08X} us={}", sem_ok, sem_rb, KB_SEM_MAGIC, sem_us);
 
     if !sem_ok {
