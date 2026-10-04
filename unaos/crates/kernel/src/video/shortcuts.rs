@@ -39,6 +39,7 @@ pub const C_PRINT_SCREEN: &str = "print-screen";
 pub const C_CMD_SLASH: &str = "cmd-/";
 pub const C_CMD_M: &str = "cmd-m";
 pub const C_CMD_GRAVE: &str = "cmd-`";
+pub const C_CMD_K: &str = "cmd-k"; // LUMENBIN
 
 const fn s(chord: &'static str, scope: &'static str, action: &'static str, arc: &'static str) -> Shortcut {
     Shortcut { chord, scope, action, arc }
@@ -72,6 +73,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     s("Ctrl-S", "Editor", "Save", "TEXTEDIT"),
     s("q", "Activity", "Quit", "ACTIVITY"),
     s("k", "Activity", "Kill selected", "ACTIVITY"),
+    s(C_CMD_K, "Lumen", "Clear transcript", "LUMENBIN"),
 ];
 
 /// The chord an app-menu row labelled `label` shows on its right (first table entry whose action matches).

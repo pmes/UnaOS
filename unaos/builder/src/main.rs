@@ -736,6 +736,8 @@ fn main() {
     if std::env::var("UNAOS_BUSREG").is_ok() { feats.push("busreg"); }
     // VEINCORE (B304): UNAOS_VEIN=1 arms the chat verbs' kernel relay plumbing (`vein` verb, `tests vein`); implies busreg. Kept in sync with arroyo.
     if std::env::var("UNAOS_VEIN").is_ok() { feats.push("vein"); }
+    // LUMENBIN: UNAOS_LUMEN=1 arms the lumen dock pin by default and `tests lumen`. Kept in sync with arroyo.
+    if std::env::var("UNAOS_LUMEN").is_ok() { feats.push("lumen"); }
     // WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` last-words
     // breadcrumbs along the focus-raise/composite chain (x86: bare 16550 at 0x3F8, no lock). Media
     // builds come from THIS list, not arroyo's (the s42/INSTGUI lesson), so the knob is mapped here
@@ -985,6 +987,15 @@ fn main() {
         println!("   VEIN: copied VEIN.BIN into APPS/ on the ESP (bg /apps/VEIN.BIN)");
     } else {
         println!("   VEIN: target/VEIN-X86.ELF absent — ESP has no VEIN.BIN (run via ./arroyo esp-x86)");
+    // LUMENBIN (B305): the ring-3 chat window (crates/user-lumen, built by arroyo's build_user_lumen_x86 to
+    // target/LUMEN-X86.ELF), staged as APPS/LUMEN.BIN beside PREFS.BIN — `lumen` (= `bg /apps/LUMEN.BIN`)
+    // opens it; it speaks the chat verbs VEIN.BIN fulfils.
+    let lumen_elf = target_dir.join("LUMEN-X86.ELF");
+    if lumen_elf.exists() {
+        std::fs::copy(&lumen_elf, esp_apps.join("LUMEN.BIN")).unwrap();
+        println!("   LUMEN: copied LUMEN.BIN into APPS/ on the ESP (lumen / bg /apps/LUMEN.BIN)");
+    } else {
+        println!("   LUMEN: target/LUMEN-X86.ELF absent — ESP has no LUMEN.BIN (run via ./arroyo esp-x86)");
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1048,6 +1059,8 @@ fn main() {
         (target_dir.join("PREFS-X86.ELF"), "PREFS.BIN"),
         // VEINCORE (B304): the chat fulfiller rides the DATA volume too.
         (target_dir.join("VEIN-X86.ELF"), "VEIN.BIN"),
+        // LUMENBIN: the chat window rides the DATA volume too — `lumen` reads it there.
+        (target_dir.join("LUMEN-X86.ELF"), "LUMEN.BIN"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();

@@ -362,7 +362,7 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // FILEVIEW `view` / TEXTEDIT `edit`: ring arms are desktop-gated (wc or desktop_firmware); registered Always on the `dns` precedent (a gated-off arm falls through to bare-name launch, never a typo refusal).
     ("view", Avail::Always), ("edit", Avail::Always), ("activity", Avail::Always), ("settings", Avail::Always), ("trash", Avail::Always), ("shortcuts", Avail::Always), ("play", Avail::Always), ("linux", Avail::Always), ("shot", Avail::Always), ("pref", Avail::Always), ("battery", Avail::Always), ("vein", Avail::Always), // VEINCORE (B304): `vein` (cfg-gated arm `vein`, registered Always like `src`). POWERMENU: `battery` (cfg-gated arm, registered Always like `src`). PREFS (B300): Principia's store, ungated arm; ACTIVITY (R75); TRASH/SHORTCUTS/PLAYWAV/LINUXABI/SHOTREGION: arms are cfg-gated, registered Always like `src`
     // processes
-    ("run", Avail::Proc), ("bg", Avail::Proc), ("storm", Avail::Proc),
+    ("run", Avail::Proc), ("bg", Avail::Proc), ("storm", Avail::Proc), ("lumen", Avail::Proc), // LUMENBIN: `lumen` = `bg /apps/LUMEN.BIN`, so `bg`'s availability
     ("jobs", Avail::Proc), ("kill", Avail::Proc),
     // BASICS (orin 17, Peter: "some of the commands were 1 off tests we need basic commands
     // back"). The everyday words a prompt is unusable without. Every one is `Plan::Host` and not

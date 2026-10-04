@@ -1221,6 +1221,8 @@ fi
 [ -n "${UNAOS_BUSREG:-}" ] && _feats="${_feats}busreg,"
 # VEINCORE (B304): UNAOS_VEIN=1 arms the chat verbs' kernel relay plumbing (crate::vein_bus: `vein` verb, `tests vein`); implies busreg. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_VEIN:-}" ] && _feats="${_feats}vein,"
+# LUMENBIN: UNAOS_LUMEN=1 arms the Lumen chat window's dock pin by default and `tests lumen` (crate::lumen). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_LUMEN:-}" ] && _feats="${_feats}lumen,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
@@ -3704,6 +3706,9 @@ build_user_pulse_x86() {
 # as APPS/PREFS.BIN by the builder. The exact shape of build_user_pulse_x86 above (same linker-script SHAPE, same
 # four assertions, same explicit --target). PREFS.BIN registers Principia's PrefGet/PrefList bus verbs and
 # answers the requests the kernel relays to it (UNAOS_BUSREG=1; knob off it prints its refusal and exits).
+# LUMENBIN: this function was spelled `build_user_pulse_x86` — a second definition that SHADOWED the PULSE
+# builder above (bash keeps the last one) and left `build_user_prefs_x86` undefined, so every caller below
+# died on exit 127 under `set -e` and no x86 ESP could be built. Renamed to the name its callers use.
 build_user_prefs_x86() {
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 Principia prefs fulfiller static-ELF program (crates/user-prefs → target/PREFS-X86.ELF)...${COLOR_RESET}"
@@ -3747,6 +3752,30 @@ build_user_vein_x86() {
     local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/VEIN-X86.ELF" | tr -d ' ')"
     [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: VEIN-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
     echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 Vein chat fulfiller program: VEIN-X86.ELF (${psz} B)${COLOR_RESET}"
+# LUMENBIN (B305): build the x86_64 static ELF64 ring-3 CHAT WINDOW (crates/user-lumen → target/LUMEN-X86.ELF),
+# staged as APPS/LUMEN.BIN by the builder. The exact shape of build_user_prefs_x86 above (same linker-script
+# SHAPE, same four assertions, same explicit --target). Built on every x86 media run like PREFS.BIN: the
+# image is inert until launched (`lumen` / `bg /apps/LUMEN.BIN`); UNAOS_LUMEN=1 adds the dock pin and the
+# `tests lumen` fixture. Its link script asserts the 16 KiB window's stack headroom itself.
+build_user_lumen_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 Lumen chat window static-ELF program (crates/user-lumen → target/LUMEN-X86.ELF)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-lumen"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-lumen/target/x86_64-unknown-none/release/user-lumen" \
+      "${WORKSPACE_DIR}/target/LUMEN-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: LUMEN-X86.ELF missing/empty — x86 LUMEN build failed${COLOR_RESET}"; exit 1; }
+    local fmag; fmag="$(head -c 4 "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$fmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: LUMEN-X86.ELF does not start with the ELF magic; first 4 bytes = ${fmag}${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" | tr -d ' \n')"
+    [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: LUMEN-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" | tr -d ' ')"
+    [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: LUMEN-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 Lumen chat window program: LUMEN-X86.ELF (${psz} B)${COLOR_RESET}"
 }
 
 build_kernel_aarch64() {
@@ -3788,6 +3817,7 @@ launch_x86_64() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     build_kernel_x86_64
 
     echo -e "${COLOR_CYAN}⚡ Launching x86_64 via Builder (kernel + bootloader + QEMU)...${COLOR_RESET}"
@@ -4755,6 +4785,7 @@ test_x86_64() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     build_kernel_x86_64
 
     # VPERF: UNAOS_QMP_SHOT=<png path> arms a QMP framebuffer screendump of the headless x86 run
@@ -5184,6 +5215,8 @@ test_x86_64() {
 #                  the dispatcher it calls. The STUB half — register constraints, clobber lists, and
 #                  the per-arch `cfg` blocks around them — is still hand-written per crate and is
 #                  still exactly what these legs exist to catch.
+#   user-lumen     BOTH type-checked (LUMENBIN). x86 media only (LUMEN-X86.ELF): on aarch64 the text passes 8 KiB,
+#                  the data page lands at 0x3000 and the crate's own link assert refuses the image.
 #
 # Fields (whitespace-separated; the 4th field runs to end-of-line):
 #   1 crate dir under crates/
@@ -5213,12 +5246,14 @@ USER_CHECK_MATRIX=(
   "user-pulse    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-prefs    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-prefs/user-prefs-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-vein     x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-vein/user-vein-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-lumen    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-blob     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld"
   "user-elf      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-stat     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-vug      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-pulse    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-vein     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-vein/user-vein.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-lumen    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
 )
 
 # Type-check every USER_CHECK_MATRIX row whose arch label matches $1, and print one summary line in the
@@ -8647,6 +8682,7 @@ esp_x86() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -8706,6 +8742,7 @@ vm_image() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     cd "$WORKSPACE_DIR/builder"
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -8750,6 +8787,7 @@ fat_img() {
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
         esp_x86
@@ -10947,6 +10985,9 @@ kernel8() {
     if [ -n "${UNAOS_VEIN:-}" ]; then
         K8_FEATS="${K8_FEATS},vein"
         echo -e "${COLOR_YELLOW}  • UNAOS_VEIN: VEINCORE chat verbs 130..=133 owned by ring-3 VEIN.BIN (kernel relay plumbing: vein verb, tests vein)${COLOR_RESET}"
+    if [ -n "${UNAOS_LUMEN:-}" ]; then
+        K8_FEATS="${K8_FEATS},lumen"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LUMEN: LUMENBIN — the lumen dock pin in the default set (the Pi image carries no LUMEN.BIN yet: its aarch64 text exceeds the window; tests lumen is x86)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_FATPERF:-}" ]; then
         K8_FEATS="${K8_FEATS},fatperf"

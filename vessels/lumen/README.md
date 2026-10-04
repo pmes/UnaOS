@@ -49,6 +49,10 @@ In parallel, the cortex loop (`src/core.rs`) subscribes to the same bus and pers
 
 Lumen is the reference **vessel** in the userspace layer documented in [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md): it composes `libs/` infrastructure and `handlers/` domain services over the Bandy bus and renders through the Quartzite GUI API. See [`docs/CODEX.md`](../../docs/CODEX.md) for the full system canon and handler manifest.
 
+## On UnaOS: LUMEN.BIN
+
+On the UnaOS desktop the same face is `APPS/LUMEN.BIN` ([`unaos/crates/user-lumen`](../../unaos/crates/user-lumen), launched by the `lumen` verb or its dock pin): a ring-3 window that draws the transcript and the input line and owns nothing else. It reaches the model over the kernel's BUS v1 wire through the chat verbs — `ChatSend` 130, `ChatReply` 131, `ChatCancel` 132, `ChatStatus` 133 — which VEIN.BIN registers and fulfils, so the window is wiring exactly as this vessel is (ROADMAP §3b principle 5); with no fulfiller it says "no provider: start VEIN.BIN". This GTK/Quartzite vessel stays as it is on the host, where the prompt rides the in-process `Synapse`; it will speak the same chat verbs when host Bandy migrates to the kernel wire (ROADMAP §3b, "host bandy/midden migrate to this wire in a later HOST arc"). Design and wire: [`docs/dev/evidence/rmbp-1004/LUMENBIN.md`](../../docs/dev/evidence/rmbp-1004/LUMENBIN.md).
+
 ## Build features
 
 Platform GUI backends are selected via Cargo features, each forwarding to the corresponding `quartzite` backend: `gtk`, `gnome`, `qt`, and `macos`. The macOS path uses a distinct `bootstrap` closure signature (gated by `#[cfg]`).
