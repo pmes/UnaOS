@@ -13,6 +13,7 @@ fn run(prefixes: &[&str]) {
         for t in kat::run_all(Some(p)) {
             match &t.skipped {
                 Some(why) => println!("{:<36} SKIPPED ({why})", t.name),
+                None if t.unsupported > 0 => println!("{:<36} pass={:<6} fail={} unsupported={}", t.name, t.pass, t.fail, t.unsupported),
                 None => println!("{:<36} pass={:<6} fail={}", t.name, t.pass, t.fail),
             }
             if t.fail > 0 {
@@ -29,4 +30,9 @@ fn run(prefixes: &[&str]) {
 #[test]
 fn m1_hashes_macs_kdfs() {
     run(&["sha2/", "hmac/", "hkdf/", "pbkdf2/"]);
+}
+
+#[test]
+fn m2_aead() {
+    run(&["chacha20/", "poly1305/", "chacha20poly1305/", "aes/", "gcm/"]);
 }

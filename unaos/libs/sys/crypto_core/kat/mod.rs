@@ -26,6 +26,9 @@ pub struct Tally {
     pub skipped: Option<String>,
     /// The first few failure descriptions.
     pub failures: Vec<String>,
+    /// Individual vectors not run because they exercise something this crate does not offer (named in
+    /// the set's doc comment) — counted, never silently dropped.
+    pub unsupported: usize,
 }
 
 impl Tally {
@@ -47,7 +50,7 @@ impl Tally {
     }
 }
 
-/// Every KAT set, in milestone order. `filter` keeps the sets whose name contains it.
+/// Every KAT set, in milestone order. `filter` keeps the sets whose name starts with it.
 pub fn run_all(filter: Option<&str>) -> Vec<Tally> {
     let sets: Vec<(&str, fn() -> Tally)> = m1::SETS
         .iter()
@@ -59,7 +62,7 @@ pub fn run_all(filter: Option<&str>) -> Vec<Tally> {
     let mut out = Vec::new();
     for (name, f) in sets {
         if let Some(flt) = filter {
-            if !name.contains(flt) {
+            if !name.starts_with(flt) {
                 continue;
             }
         }
