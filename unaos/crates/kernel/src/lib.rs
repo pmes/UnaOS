@@ -266,6 +266,6 @@ pub mod net_fetch;
 pub mod net_tick;
 // PREFS (rmbp-ledger B300): the kernel side of Principia's ONE preference store (prefs_core shared core); both arches. Tail statement, so no existing line moves.
 pub mod prefs;
-// LUMENBIN (rmbp-ledger B305): `tests lumen`, the fixture for the ring-3 Lumen chat window (APPS/LUMEN.BIN). Tail statement, so no existing line moves.
+// LUMENAPP (rmbp-ledger B323): `tests lumen`, the ring-3-free fixture for the one-program Lumen (APPS/LUMEN.ELF). Tail statement, so no existing line moves.
 #[cfg(feature = "lumen")]
 pub mod lumen;

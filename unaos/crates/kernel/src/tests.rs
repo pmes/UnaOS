@@ -213,8 +213,8 @@ fn ensure_attr() {
     if !DONE.swap(true, Ordering::AcqRel) { register("attr", crate::fs::attrsys::selftest); }
 }
 
-/// LUMENBIN (B305): register `lumen` (the LUMEN.BIN chat-window fixture, crate::lumen) exactly once on a
-/// `lumen` build; off x86 `wc` the fixture prints SKIP with its reason, never a pin.
+/// LUMENAPP (B323): register `lumen` (the ring-3-free LUMEN.ELF fixture, crate::lumen) exactly once on a
+/// `lumen` build; on aarch64 (no LUMEN.ELF image yet) the fixture prints SKIP with its reason, never a pin.
 fn ensure_lumen() {
     #[cfg(feature = "lumen")]
     {

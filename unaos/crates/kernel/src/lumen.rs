@@ -3,156 +3,144 @@
 //
 //! CHARTER: Kernel — wm
 //!
-//! LUMENBIN (rmbp-ledger B305) — `tests lumen`: the kernel-side fixture for `APPS/LUMEN.BIN`, the ring-3
-//! Lumen chat window (crates/user-lumen). This file fulfils NOTHING: the chat verbs (130..=133) are owned
-//! by VEIN.BIN in ring 3, and the kernel may not register them (kernel tags win, so a kernel fake would
-//! change the very routing the fixture is meant to observe). It only drives window and input plumbing.
+//! LUMENAPP (rmbp-ledger B323, R82) — `tests lumen`: a RING-3-FREE witness that the one-program Lumen is
+//! on the volume and is the program the loader will take. It runs nothing and fulfils nothing (the old
+//! LUMENBIN fixture drove the window against a VEIN.BIN chat daemon over bus verbs; both are retired).
 //!
-//! WHAT IT DOES. Loads LUMEN.BIN off the mounted program volume through the real ELF loader (the `bg`
-//! path), focuses it, types `hi` + Enter through the production router seam (`user_input_enqueue`, the
-//! function the shell's drain calls), and reads the program's WITNESS BLOCK straight out of its slot: the
-//! first eight words of its RW segment (`.data.lumenwit`, pinned there by the crate's link script; the
-//! segment's p_vaddr is read from the same ELF bytes that were loaded). Leg 1 — with nobody registered for
-//! ChatSend the kernel answers `-ENOENT` and the window must count it (`enoent=1`, the line it renders is
-//! "no provider: start VEIN.BIN"). Leg 2 — VEIN.BIN is spawned if the volume carries it, then a second
-//! message must get at least one ChatReply; with no VEIN.BIN the leg is SKIP with the reason, never a
-//! fabricated pass.
+//! WHAT IT CHECKS. `/apps/LUMEN.ELF` is staged; the production validator (`arch::x86_64::elf::
+//! validate_elf`, the one `bg` runs) accepts it in the ELF-window model; its `.note.unaos.app` names
+//! "UnaOS", type 1, flags bit0 = windowed. And it reports what the program will run on, by the SAME rule
+//! the program applies (`vein_core::prefs::plan` — the shared core, so the two cannot disagree): the
+//! provider from Principia's `vein` namespace, and the key's state from `vein.key_file` stat'ed through
+//! the VFS (an inode id = UnaFS; FAT is refused).
 //!
-//! WITNESS. `:: LUMEN: window=<0|1> sent=<n> replies=<n> enoent=<0|1> -> PASS|SKIP|FAIL ::`, preceded on
-//! a SKIP by `:: LUMEN: skip reason=<why> ::`.
+//! WITNESS. `:: LUMENAPP: image=/apps/LUMEN.ELF window=<elf|fixed|bad> provider=<claude|echo>
+//! key=<unafs|none|fat-refused> -> PASS|SKIP|FAIL ::`, preceded on SKIP/FAIL by `:: LUMENAPP: reason=… ::`.
 
-#![cfg_attr(not(all(target_arch = "x86_64", feature = "wc")), allow(dead_code))]
+use vein_core::prefs::{self as rules, KeyState, Plan};
 
+const IMAGE: &str = "/apps/LUMEN.ELF";
 
-/// The witness block's layout (crates/user-lumen/src/main.rs `WIT`): magic, window, sent, replies,
-/// enoent, ready, cleared, keys.
-const WIT_MAGIC: u32 = 0x4E4D_554C;
-const W_WINDOW: usize = 1;
-const W_SENT: usize = 2;
-const W_REPLIES: usize = 3;
-const W_ENOENT: usize = 4;
-const W_KEYS: usize = 7;
+/// The provider and key state the program will see (the shared rule over the kernel's own store).
+fn session() -> (&'static str, KeyState) {
+    let lit = |k: &str| crate::prefs::get("vein", k).map(|v| v.to_literal());
+    let s = |k: &str| crate::prefs::get("vein", k).and_then(|v| v.as_str().map(alloc::string::String::from));
+    let key = match s("key_file") {
+        None => KeyState::None,
+        Some(path) => {
+            let mut out = alloc::vec::Vec::new();
+            if crate::fs::attrsys::do_stat(path.as_bytes(), crate::fs::vfs::KERNEL_PRINCIPAL, &mut out) != 0 || out.len() < 8 {
+                KeyState::None
+            } else if u32::from_le_bytes([out[4], out[5], out[6], out[7]]) & una_abi::STAT_HAS_ID != 0 {
+                KeyState::UnaFs
+            } else {
+                KeyState::OnFat
+            }
+        }
+    };
+    let prov = lit("provider");
+    let tls = lit("tls");
+    let ep_s = s("endpoint");
+    let ep = match ep_s.as_deref() {
+        None | Some("") => Some(rules::DEFAULT_ENDPOINT),
+        Some(u) => rules::parse_endpoint(u),
+    };
+    // The program cannot verify certificates yet (vein_ring3::VERIFIES_CERTS = false); same input here.
+    let plan = rules::plan(rules::provider_pref(prov.as_deref().map(str::as_bytes)), ep.as_ref(), key, rules::tls_policy(tls.as_deref().map(str::as_bytes)), false);
+    (if matches!(plan, Plan::Claude { .. }) { "claude" } else { "echo" }, key)
+}
 
-/// The RW PT_LOAD's p_vaddr in a static ELF64 image (the witness block's offset from the window base).
-fn rw_vaddr(elf: &[u8]) -> Option<usize> {
+/// The `.note.unaos.app` flags word, if the image carries one (PT_NOTE, name "UnaOS", type 1).
+fn app_note_flags(elf: &[u8]) -> Option<u32> {
     let rd16 = |o: usize| elf.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
     let rd32 = |o: usize| elf.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     let rd64 = |o: usize| elf.get(o..o + 8).map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as usize);
-    if elf.get(0..4)? != b"\x7fELF" {
-        return None;
-    }
     let (phoff, phent, phnum) = (rd64(0x20)?, rd16(0x36)?, rd16(0x38)?);
-    (0..phnum).map(|i| phoff + i * phent).find(|&p| rd32(p) == Some(1) && rd32(p + 4).is_some_and(|f| f & 2 != 0)).and_then(|p| rd64(p + 0x10))
+    for i in 0..phnum {
+        let p = phoff + i * phent;
+        if rd32(p)? != 4 {
+            continue; // PT_NOTE only
+        }
+        let (off, sz) = (rd64(p + 8)?, rd64(p + 0x20)?);
+        let mut o = off;
+        while o + 12 <= off + sz {
+            let (nsz, dsz, ty) = (rd32(o)? as usize, rd32(o + 4)? as usize, rd32(o + 8)?);
+            let name = elf.get(o + 12..o + 12 + nsz)?;
+            let d = o + 12 + ((nsz + 3) & !3);
+            if name == b"UnaOS\0" && ty == 1 && dsz >= 4 {
+                return rd32(d);
+            }
+            o = d + ((dsz + 3) & !3);
+        }
+    }
+    None
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(target_arch = "x86_64")]
 pub fn selftest() {
-    use crate::arch::syscall as sc;
-    let verdict = |w: [u32; 8], v: &str| {
-        serial_println!(":: LUMEN: window={} sent={} replies={} enoent={} -> {} ::", w[W_WINDOW], w[W_SENT], w[W_REPLIES], w[W_ENOENT], v);
+    let (provider, key) = session();
+    let verdict = |window: &str, v: &str| {
+        serial_println!(":: LUMENAPP: image={} window={} provider={} key={} -> {} ::", IMAGE, window, provider, key.as_str(), v);
     };
-    let skip = |why: &str| {
-        serial_println!(":: LUMEN: skip reason={} ::", why);
-        verdict([0; 8], "SKIP");
+    let why = |r: &str| serial_println!(":: LUMENAPP: reason={} ::", r);
+    let Ok(fs) = crate::fs::fat::mount_program_source() else {
+        why("no-program-volume");
+        return verdict("bad", "SKIP");
     };
-    let Ok(fs) = crate::fs::fat::mount_program_source() else { return skip("no-program-volume") };
-    let load = |name: &str| -> Option<alloc::vec::Vec<u8>> {
-        let de = fs.find_app(name).ok()?;
-        let cap = sc::user_window_size();
-        if de.size == 0 || de.size as usize > cap {
-            return None;
-        }
-        let mut b = alloc::vec::Vec::new();
-        fs.read_file(&de, &mut b, cap).ok()?;
-        Some(b)
-    };
-    let Some(img) = load("LUMEN.BIN") else { return skip("LUMEN.BIN-not-on-the-volume") };
-    let Some(off) = rw_vaddr(&img).filter(|&o| o + 32 <= sc::user_window_size()) else { return skip("LUMEN.BIN-has-no-RW-segment") };
-    let (pid, slot, _entry) = match sc::spawn_user_image_bg(&img) {
-        Ok(v) => v,
-        Err(why) => {
-            serial_println!(":: LUMEN: spawn refused: {} ::", why);
-            return verdict([0; 8], "FAIL");
-        }
-    };
-    let slot = slot as usize;
-    crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot as u64), "LUMEN.BIN");
-    let read = || -> [u32; 8] {
-        let p = unsafe { crate::arch::memory::slot_backing_ptr(slot).add(off) } as *const u32;
-        core::array::from_fn(|i| unsafe { p.add(i).read_volatile() })
-    };
-    let wait = |ms: u64, done: &dyn Fn([u32; 8]) -> bool| -> [u32; 8] {
-        let end = crate::arch::ticks() + ms;
-        loop {
-            let w = read();
-            if (w[0] == WIT_MAGIC && done(w)) || crate::arch::ticks() >= end {
-                return w;
-            }
-            crate::arch::sched::yield_now();
-        }
-    };
-    let type_line = |s: &[u8]| {
-        sc::user_input_set_active(slot as u64 + 1);
-        for &b in s {
-            let _ = sc::user_input_enqueue(crate::pal::Event::Key(b));
-        }
-    };
-
-    // The window exists and the first ChatStatus has had time to come back.
-    let w = wait(4_000, &|w| w[W_WINDOW] == 1);
-    let w = if w[W_WINDOW] == 1 { wait(1_500, &|_| false) } else { w };
-    // Leg 1: a send with (normally) nobody on ChatSend.
-    type_line(b"hi\n");
-    let w1 = wait(4_000, &|w| w[W_SENT] >= 1 && (w[W_ENOENT] == 1 || w[W_REPLIES] >= 1));
-    let window_ok = w[0] == WIT_MAGIC && w[W_WINDOW] == 1;
-    let leg1 = w1[W_SENT] >= 1 && w1[W_KEYS] >= 3 && (w1[W_ENOENT] == 1 || w1[W_REPLIES] >= 1);
-
-    // Leg 2: VEIN.BIN, if staged, registers 130..=133; the second send must get a reply.
-    let mut vein = None;
-    let mut w2 = w1;
-    let mut skip_why = None;
-    if w1[W_REPLIES] >= 1 {
-        // A fulfiller was already live in this boot: leg 2 is already proved by leg 1.
-    } else if let Some(vimg) = load("VEIN.BIN") {
-        match sc::spawn_user_image_bg(&vimg) {
-            Ok((vp, vs, _)) => {
-                crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(vs), "VEIN.BIN");
-                vein = Some((vp, vs));
-                let _ = wait(1_500, &|_| false); // registration
-                type_line(b"ping\n");
-                w2 = wait(30_000, &|w| w[W_SENT] >= 2 && w[W_REPLIES] >= 1); // a model's first chunk; bounded
-            }
-            Err(why) => {
-                serial_println!(":: LUMEN: VEIN.BIN spawn refused: {} ::", why);
-                skip_why = Some("VEIN.BIN-spawn-refused");
+    let cap = crate::arch::syscall::user_image_cap();
+    let img = match fs.find_app("LUMEN.ELF") {
+        Ok(de) if de.size != 0 && de.size as usize <= cap => {
+            let mut b = alloc::vec::Vec::new();
+            match fs.read_file(&de, &mut b, cap) {
+                Ok(_) => b,
+                Err(_) => {
+                    why("read-failed");
+                    return verdict("bad", "FAIL");
+                }
             }
         }
-    } else {
-        skip_why = Some("VEIN.BIN-not-on-the-volume-reply-leg-unproved");
-    }
-
-    if let Some((vp, vs)) = vein {
-        let _ = sc::bg_kill(vp, vs);
-    }
-    let _ = sc::bg_kill(pid, slot as u64);
-    sc::user_input_set_active(0); // the keyboard back to the shell
-
-    if !(window_ok && leg1) {
-        serial_println!(":: LUMEN: leg1 window_ok={} sent={} keys={} enoent={} replies={} ::", window_ok as u8, w1[W_SENT], w1[W_KEYS], w1[W_ENOENT], w1[W_REPLIES]);
-        return verdict(w1, "FAIL");
-    }
-    match skip_why {
-        Some(why) => {
-            serial_println!(":: LUMEN: skip reason={} ::", why);
-            verdict(w2, "SKIP")
+        Ok(_) => {
+            why("size-out-of-range");
+            return verdict("bad", "FAIL");
         }
-        None => verdict(w2, if w2[W_REPLIES] >= 1 { "PASS" } else { "FAIL" }),
+        Err(_) => {
+            why("LUMEN.ELF-not-on-the-volume");
+            return verdict("bad", "SKIP");
+        }
+    };
+    let plan = match crate::arch::x86_64::elf::validate_elf(&img, crate::arch::syscall::user_window_size()) {
+        Ok(p) => p,
+        Err(e) => {
+            serial_println!(":: LUMENAPP: reason=loader-refused ({}) ::", e);
+            return verdict("bad", "FAIL");
+        }
+    };
+    let window = if plan.model_elf { "elf" } else { "fixed" };
+    let note = app_note_flags(&img);
+    serial_println!(
+        "[lumenapp] bytes={} entry={:#x} segs={} stack={} note_flags={:?}",
+        img.len(),
+        plan.entry,
+        plan.nsegs,
+        plan.stack,
+        note
+    );
+    if !plan.model_elf {
+        why("not-the-elf-model");
+        return verdict(window, "FAIL");
     }
+    if note.map_or(true, |f| f & una_abi::APP_NOTE_WINDOWED == 0) {
+        why("no-windowed-app-note");
+        return verdict(window, "FAIL");
+    }
+    verdict(window, "PASS")
 }
 
-/// Off x86 `wc` the window plumbing this fixture drives (focus + the x86 slot backing) is not compiled.
-#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+/// aarch64: no ELF window on that loader yet, so no LUMEN.ELF image is built for it (owed).
+#[cfg(not(target_arch = "x86_64"))]
 pub fn selftest() {
-    serial_println!(":: LUMEN: skip reason=needs-x86-wc ::");
-    serial_println!(":: LUMEN: window=0 sent=0 replies=0 enoent=0 -> SKIP ::");
+    let (provider, key) = session();
+    let _ = app_note_flags;
+    serial_println!(":: LUMENAPP: reason=aarch64-image-owed ::");
+    serial_println!(":: LUMENAPP: image={} window=bad provider={} key={} -> SKIP ::", IMAGE, provider, key.as_str());
 }
