@@ -827,7 +827,7 @@ pub const BUS_VERB_REGISTER: u8 = 127;
 pub const BUS_VERB_FULFIL_MIN: u8 = 128;
 /// Registrations one row may hold.
 pub const BUS_REG_MAX_PER_ROW: usize = 8;
-/// The ring-3 fulfiller DEMO pair (BANDY3): a preference read answered by `PREFS.BIN` from the registrable
+/// The ring-3 fulfiller DEMO pair (BANDY3): a preference read answered by `PREFS.ELF` from the registrable
 /// range. Principia's real verbs are the kernel-fulfilled `BUS_VERB_PREF_*` (16..=19, PREFS); this pair
 /// proves registration and relay, and retires when a ring-3 Principia takes the real tags over.
 pub const BUS_VERB_R3PREF_GET: u8 = 128;
@@ -1073,7 +1073,7 @@ mod attrsurf_tests {
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // VEINCORE (rmbp-ledger B304; docs/dev/evidence/rmbp-1004/VEINCORE.md): the CHAT verbs, OWNED by ring 3
-// (`APPS/VEIN.BIN` registers them with BUS_VERB_REGISTER; the kernel only relays). The bodies are
+// (`APPS/VEIN.ELF` registers them with BUS_VERB_REGISTER; the kernel only relays). The bodies are
 // `unaos/libs/sys/vein_core/src/wire.rs` (its KATs are the spec); the kernel const-asserts these tags
 // against that crate's mirrors under feature `vein`.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -1081,7 +1081,7 @@ mod attrsurf_tests {
 /// ChatSend `conv u32 · text` — answered by a SEQUENCE of REPLY frames on the caller's corr, each a
 /// ChatReply body; non-final frames ride [`BUS_STATUS_MORE`], the last rides 0 with `done = 1`.
 pub const BUS_VERB_CHAT_SEND: u8 = 130;
-/// ChatReply as a REQUEST: accepted by VEIN.BIN from the KERNEL principal only — the relay companion's
+/// ChatReply as a REQUEST: accepted by VEIN.ELF from the KERNEL principal only — the relay companion's
 /// answer typed into the serial console as `vein rsp …` and injected by the kernel (`bus_route::inject`).
 pub const BUS_VERB_CHAT_REPLY: u8 = 131;
 /// ChatCancel `conv u32` — the cut stream ends with [`ECANCELED`]; the cancel's own reply is status 0.

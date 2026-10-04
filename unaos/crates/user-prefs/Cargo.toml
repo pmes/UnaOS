@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 The Architect & Una
 #
-# BANDY3 M3: PREFS.BIN — the FIRST ring-3 FULFILLER on the bus wire. It registers Principia's
+# BANDY3 M3: PREFS.ELF — the FIRST ring-3 FULFILLER on the bus wire. It registers Principia's
 # `PrefGet`/`PrefList` verb tags with the kernel (BUS_VERB_REGISTER) and answers the requests the kernel
 # relays to it, each carrying the CALLER's kernel-stamped principal. Read-only in v1; it answers a
 # fixed small table until the PREFS arc's `no_std` `prefs_core` lands (the real TOML parse is OWED).
 # Static ELF64 like user-pulse/user-stat, built by arroyo's build_user_prefs_x86 and staged as
-# APPS/PREFS.BIN on the ESP and the x86 DATA volume.
+# APPS/PREFS.ELF on the ESP and the x86 DATA volume.
 #
 # The empty [workspace] table makes this crate its OWN workspace root, so the parent UnaOS workspace never
 # tries to build this no_std/no_main program for the host toolchain during `./arroyo check`.

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# x86_64 only, and `alloc` is built: BIG.BIN is the first ring-3 program with a global allocator (over
+# x86_64 only, and `alloc` is built: BIG.ELF is the first ring-3 program with a global allocator (over
 # SYS_SBRK). arroyo passes the linker script via RUSTFLAGS and the target explicitly.
 [build]
 target = "../../x86_64-unknown-none.json"

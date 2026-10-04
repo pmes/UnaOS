@@ -55,7 +55,7 @@ pub fn resolve(name: &[u8]) -> Result<[u8; RESOLVE_OUT_LEN], i64> {
     }
 }
 
-/// The name the fixture and NET.BIN resolve: the host the whole ladder is for.
+/// The name the fixture and NET.ELF resolve: the host the whole ladder is for.
 pub const PROBE_HOST: &str = "api.anthropic.com";
 
 /// `tests net`: M1 (entropy) then M2 (resolve).

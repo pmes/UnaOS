@@ -3747,8 +3747,8 @@ build_user_pulse_x86() {
 }
 
 # BANDY3 M3: build the x86_64 static ELF64 ring-3 FULFILLER (crates/user-prefs → target/PREFS-X86.ELF), staged
-# as APPS/PREFS.BIN by the builder. The exact shape of build_user_pulse_x86 above (same linker-script SHAPE, same
-# four assertions, same explicit --target). PREFS.BIN registers Principia's PrefGet/PrefList bus verbs and
+# as APPS/PREFS.ELF by the builder. The exact shape of build_user_pulse_x86 above (same linker-script SHAPE, same
+# four assertions, same explicit --target). PREFS.ELF registers Principia's PrefGet/PrefList bus verbs and
 # answers the requests the kernel relays to it (UNAOS_BUSREG=1; knob off it prints its refusal and exits).
 # LUMENBIN: this function was spelled `build_user_pulse_x86` — a second definition that SHADOWED the PULSE
 # builder above (bash keeps the last one) and left `build_user_prefs_x86` undefined, so every caller below
@@ -3775,7 +3775,7 @@ build_user_prefs_x86() {
 }
 
 # VEINCORE (B304): build the x86_64 static ELF64 ring-3 CHAT FULFILLER (crates/user-vein → target/VEIN-X86.ELF),
-# staged as APPS/VEIN.BIN by the builder. The exact shape of build_user_prefs_x86 above. VEIN.BIN registers the
+# staged as APPS/VEIN.ELF by the builder. The exact shape of build_user_prefs_x86 above. VEIN.ELF registers the
 # chat verbs 130..=133 and answers ChatSend through vein_core's Echo / Relay providers (UNAOS_VEIN=1).
 build_user_vein_x86() {
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
@@ -3799,9 +3799,9 @@ build_user_vein_x86() {
 }
 
 # LUMENBIN (B305): build the x86_64 static ELF64 ring-3 CHAT WINDOW (crates/user-lumen → target/LUMEN-X86.ELF),
-# staged as APPS/LUMEN.BIN by the builder. The exact shape of build_user_prefs_x86 above (same linker-script
-# SHAPE, same four assertions, same explicit --target). Built on every x86 media run like PREFS.BIN: the
-# image is inert until launched (`lumen` / `bg /apps/LUMEN.BIN`); UNAOS_LUMEN=1 adds the dock pin and the
+# staged as APPS/LUMEN.ELF by the builder. The exact shape of build_user_prefs_x86 above (same linker-script
+# SHAPE, same four assertions, same explicit --target). Built on every x86 media run like PREFS.ELF: the
+# image is inert until launched (`lumen` / `bg /apps/LUMEN.ELF`); UNAOS_LUMEN=1 adds the dock pin and the
 # `tests lumen` fixture. Its link script asserts the 16 KiB window's stack headroom itself.
 build_user_lumen_x86() {
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
@@ -3825,7 +3825,7 @@ build_user_lumen_x86() {
 }
 
 # NETRING3 M3 (B306): build the x86_64 static ELF64 ring-3 network client (crates/user-net → target/NET-X86.ELF),
-# staged as APPS/NET.BIN by the builder. The exact shape of build_user_prefs_x86 above. NET.BIN draws entropy,
+# staged as APPS/NET.ELF by the builder. The exact shape of build_user_prefs_x86 above. NET.ELF draws entropy,
 # resolves api.anthropic.com, connects :80 and prints the status line (UNAOS_NETRING3=1; knob off the two new
 # syscalls answer the unknown-syscall default and it says so in its verdict line).
 build_user_net_x86() {
@@ -3849,8 +3849,8 @@ build_user_net_x86() {
     echo -e "${COLOR_GREEN}✅ x86 static-ELF ring-3 network client program: NET-X86.ELF (${psz} B)${COLOR_RESET}"
 }
 
-# RING3WIN M4 (B316): build BIG.BIN — the ELF-window proof program (crates/user-big → target/BIG-X86.ELF),
-# staged as APPS/BIG.BIN by the builder; `tests ring3win` runs it. x86 only. Unlike its siblings it links at
+# RING3WIN M4 (B316): build BIG.ELF — the ELF-window proof program (crates/user-big → target/BIG-X86.ELF),
+# staged as APPS/BIG.ELF by the builder; `tests ring3win` runs it. x86 only. Unlike its siblings it links at
 # the ABSOLUTE ELF-window VA (crates/user-big/user-big-x86.ld, no PHDRS) and declares a 256 KiB stack with
 # `-z stack-size`, which lld writes into PT_GNU_STACK's p_memsz — the kernel's stack request.
 build_user_big_x86() {
@@ -3908,10 +3908,10 @@ launch_x86_64() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
-    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
-    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
+    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.ELF
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     build_kernel_x86_64
 
     echo -e "${COLOR_CYAN}⚡ Launching x86_64 via Builder (kernel + bootloader + QEMU)...${COLOR_RESET}"
@@ -4877,10 +4877,10 @@ test_x86_64() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
-    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
-    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
+    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.ELF
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     build_kernel_x86_64
 
     # VPERF: UNAOS_QMP_SHOT=<png path> arms a QMP framebuffer screendump of the headless x86 run
@@ -8781,10 +8781,10 @@ esp_x86() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
-    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
-    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
+    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.ELF
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -8842,10 +8842,10 @@ vm_image() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
-    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
-    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
+    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.ELF
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     cd "$WORKSPACE_DIR/builder"
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -8888,10 +8888,10 @@ fat_img() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
-    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
-    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
+    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.ELF
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
         esp_x86
@@ -11093,11 +11093,11 @@ kernel8() {
     fi
     if [ -n "${UNAOS_VEIN:-}" ]; then
         K8_FEATS="${K8_FEATS},vein"
-        echo -e "${COLOR_YELLOW}  • UNAOS_VEIN: VEINCORE chat verbs 130..=133 owned by ring-3 VEIN.BIN (kernel relay plumbing: vein verb, tests vein)${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}  • UNAOS_VEIN: VEINCORE chat verbs 130..=133 owned by ring-3 VEIN.ELF (kernel relay plumbing: vein verb, tests vein)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_LUMEN:-}" ]; then
         K8_FEATS="${K8_FEATS},lumen"
-        echo -e "${COLOR_YELLOW}  • UNAOS_LUMEN: LUMENBIN — the lumen dock pin in the default set (the Pi image carries no LUMEN.BIN yet: its aarch64 text exceeds the window; tests lumen is x86)${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LUMEN: LUMENBIN — the lumen dock pin in the default set (the Pi image carries no LUMEN.ELF yet: its aarch64 text exceeds the window; tests lumen is x86)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_NETRING3:-}" ]; then
         K8_FEATS="${K8_FEATS},netring3"

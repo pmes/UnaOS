@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright (C) 2026 The Architect & Una
 
-   RING3WIN M4 link script for BIG.BIN — the first ELF-WINDOW program. Unlike every user-*-x86.ld before
+   RING3WIN M4 link script for BIG.ELF — the first ELF-WINDOW program. Unlike every user-*-x86.ld before
    it, this links at an ABSOLUTE ring-3 VA: 0x10000200000 = una_abi::USER_XWIN_VA_X86 (USER_BASE 1 TiB +
    USER_XWIN_OFF 2 MiB). The kernel reads "lowest PT_LOAD >= USER_XWIN_VA_X86" as the elf model: every
    segment mapped at exactly its p_vaddr from heap frames, BSS zeroed, the stack at the top of the 4 MiB

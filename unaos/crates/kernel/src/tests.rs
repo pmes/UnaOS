@@ -213,7 +213,7 @@ fn ensure_attr() {
     if !DONE.swap(true, Ordering::AcqRel) { register("attr", crate::fs::attrsys::selftest); }
 }
 
-/// LUMENBIN (B305): register `lumen` (the LUMEN.BIN chat-window fixture, crate::lumen) exactly once on a
+/// LUMENBIN (B305): register `lumen` (the LUMEN.ELF chat-window fixture, crate::lumen) exactly once on a
 /// `lumen` build; off x86 `wc` the fixture prints SKIP with its reason, never a pin.
 fn ensure_lumen() {
     #[cfg(feature = "lumen")]
@@ -233,7 +233,7 @@ fn ensure_netring3() {
 }
 
 /// RING3WIN (B316): register `tests ring3win` exactly once on x86 (the ELF window is x86's this arc; the
-/// fixture SKIPs when the volume carries no `/apps/BIG.BIN`).
+/// fixture SKIPs when the volume carries no `/apps/BIG.ELF`).
 fn ensure_ring3win() {
     #[cfg(target_arch = "x86_64")]
     {

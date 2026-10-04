@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-// BANDY3 M3: PREFS.BIN — the first ring-3 FULFILLER (ROADMAP §3b principle 3: a command is addressable
+// BANDY3 M3: PREFS.ELF — the first ring-3 FULFILLER (ROADMAP §3b principle 3: a command is addressable
 // the same way whether fulfilled in-kernel, by a handler, or by a spawned vessel). Principia owns every
 // preference decision (LAWS §Handler manifest); this is Principia's read side on the metal, as a ring-3
 // program that OWNS two bus verbs instead of a second store inside the kernel.

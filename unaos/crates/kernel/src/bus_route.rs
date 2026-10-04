@@ -442,7 +442,7 @@ pub fn selftest(fx: &Fixture) {
         return;
     }
     // The verb pair: Principia's GET/LIST when no live fulfiller owns them (the normal case), else the
-    // top two registrable tags, so a running PREFS.BIN is never displaced by the fixture.
+    // top two registrable tags, so a running PREFS.ELF is never displaced by the fixture.
     let (vg, vl) = if lookup(fx.ops, una_abi::BUS_VERB_R3PREF_GET).is_none() && lookup(fx.ops, una_abi::BUS_VERB_R3PREF_LIST).is_none() {
         (una_abi::BUS_VERB_R3PREF_GET, una_abi::BUS_VERB_R3PREF_LIST)
     } else {

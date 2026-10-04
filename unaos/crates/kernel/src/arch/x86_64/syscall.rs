@@ -30008,14 +30008,14 @@ pub fn user_image_cap() -> usize {
 }
 
 // =================================================================================================
-// RING3WIN (B316) — `tests ring3win`: run `/apps/BIG.BIN` (crates/user-big, linked in the ELF window) and
+// RING3WIN (B316) — `tests ring3win`: run `/apps/BIG.ELF` (crates/user-big, linked in the ELF window) and
 // prove the elf model end to end: the 64 KiB static array's checksum matches the kernel's own computation,
 // the 32 KiB-frame recursion ran on the declared stack, the SYS_SBRK heap carried a 100 KiB `Vec`, a
 // request past the cap was refused -ENOMEM, and after the exit every ELF-window frame went back to the
 // heap (the live-frame count returns to its value before the launch).
 // =================================================================================================
 
-/// RING3WIN: the checksum BIG.BIN computes over its static array — FNV-1a 32 over `a[i] = i*7 + (i>>8)`.
+/// RING3WIN: the checksum BIG.ELF computes over its static array — FNV-1a 32 over `a[i] = i*7 + (i>>8)`.
 /// Computed here independently, never trusted from the program.
 pub fn ring3win_big_fnv() -> u32 {
     let mut h: u32 = 0x811C_9DC5;
@@ -30026,9 +30026,9 @@ pub fn ring3win_big_fnv() -> u32 {
     h
 }
 
-/// RING3WIN: the `tests ring3win` fixture. SKIP (never a pin) when the volume carries no BIG.BIN.
+/// RING3WIN: the `tests ring3win` fixture. SKIP (never a pin) when the volume carries no BIG.ELF.
 pub fn ring3win_selftest() {
-    const PATH: &str = "/apps/BIG.BIN";
+    const PATH: &str = "/apps/BIG.ELF";
     let mt = crate::shell::vfs_mount_table();
     let full = crate::shell::vfs_path(PATH);
     let st = match mt.stat(&full) {
