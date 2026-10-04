@@ -238,6 +238,7 @@ static USER_LINES: [spin::Mutex<UserLine>; USER_SLOTS] =
 /// (one critical section). A partial line is held up to [`USER_LINE_MAX`] bytes, then flushed as is. The
 /// syscall runs IF-masked: the slot is `try_lock`ed and on contention the text goes out directly.
 pub fn emit_user(row: usize, text: &str) {
+    line_watch_check(text); // LUMENCRASH M3 (B326): a fixture may be waiting for this line (file tail)
     let mut guard = match USER_LINES.get(row).and_then(|m| m.try_lock()) {
         Some(g) => g,
         None => return emit_src(format_args!("{}", text), false, true),
@@ -338,4 +339,44 @@ pub fn tag_top(out: &mut [([u8; 8], u64)]) -> usize {
         w += 1;
     }
     w
+}
+
+// ── LUMENCRASH M3 (rmbp-ledger B326) — a one-shot watch on ring-3 console lines, for a kernel fixture ──
+// `tests lumen` spawns the real LUMEN.ELF and needs to know that the program reached its first wire line. A ring-3
+// program's console bytes all pass through `emit_user` (SYS_WRITE on a Console handle), so the watch sits at its
+// head: armed with a `'static` prefix BEFORE the spawn (the program may speak before the spawner learns its slot),
+// it latches `line_watch_hit` on the first write that begins with the prefix. Two atomics publish the prefix (len
+// first, then the pointer with Release); a disarmed watch costs one Acquire load per ring-3 write.
+static WATCH_PTR: AtomicU64 = AtomicU64::new(0);
+static WATCH_LEN: AtomicU64 = AtomicU64::new(0);
+static WATCH_HIT: AtomicBool = AtomicBool::new(false);
+
+/// Arm the watch for writes that begin with `prefix` (clears a previous hit).
+pub fn line_watch_arm(prefix: &'static str) {
+    WATCH_HIT.store(false, core::sync::atomic::Ordering::Release);
+    WATCH_LEN.store(prefix.len() as u64, Relaxed);
+    WATCH_PTR.store(prefix.as_ptr() as u64, core::sync::atomic::Ordering::Release);
+}
+
+/// Disarm the watch (the hit latch keeps its value until the next arm).
+pub fn line_watch_disarm() {
+    WATCH_PTR.store(0, core::sync::atomic::Ordering::Release);
+}
+
+/// True once a watched write was seen since the last arm.
+pub fn line_watch_hit() -> bool {
+    WATCH_HIT.load(core::sync::atomic::Ordering::Acquire)
+}
+
+fn line_watch_check(text: &str) {
+    let p = WATCH_PTR.load(core::sync::atomic::Ordering::Acquire);
+    if p == 0 {
+        return;
+    }
+    let n = WATCH_LEN.load(Relaxed) as usize;
+    // SAFETY: `p`/`n` came from a `&'static str` in `line_watch_arm`, published len-then-pointer.
+    let pre = unsafe { core::slice::from_raw_parts(p as *const u8, n) };
+    if text.as_bytes().starts_with(pre) {
+        WATCH_HIT.store(true, core::sync::atomic::Ordering::Release);
+    }
 }

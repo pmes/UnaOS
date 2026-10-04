@@ -16,6 +16,11 @@
 //!
 //! WITNESS. `:: LUMENAPP: image=/apps/LUMEN.ELF window=<elf|fixed|bad> provider=<claude|echo>
 //! key=<unafs|none|fat-refused> -> PASS|SKIP|FAIL ::`, preceded on SKIP/FAIL by `:: LUMENAPP: reason=… ::`.
+//!
+//! LUMENCRASH (rmbp-ledger B326) adds a SPAWN step after a PASS: the image is RUN as `bg` runs it, and the
+//! fixture reads the program's first wire line or its fault — `:: LUMENCRASH: spawned=1 first_line=<ok|fault
+//! vec=N rip=+0x..|timeout> -> PASS|FAIL ::` (see `spawn_step` at the file tail). The "runs nothing" above is
+//! LUMENAPP's static half only.
 
 use vein_core::prefs::{self as rules, KeyState, Plan};
 
@@ -76,11 +81,22 @@ fn app_note_flags(elf: &[u8]) -> Option<u32> {
     None
 }
 
+/// LUMENAPP's static checks, then (LUMENCRASH M3) the spawn step on the image they accepted.
 #[cfg(target_arch = "x86_64")]
 pub fn selftest() {
+    match check() {
+        Some(img) => spawn_step(&img),
+        None => serial_println!(":: LUMENCRASH: spawned=0 first_line=none -> SKIP ::"),
+    }
+}
+
+/// The LUMENAPP verdict; `Some(image)` only on PASS (the image the spawn step then runs).
+#[cfg(target_arch = "x86_64")]
+fn check() -> Option<alloc::vec::Vec<u8>> {
     let (provider, key) = session();
-    let verdict = |window: &str, v: &str| {
+    let verdict = |window: &str, v: &str| -> Option<alloc::vec::Vec<u8>> {
         serial_println!(":: LUMENAPP: image={} window={} provider={} key={} -> {} ::", IMAGE, window, provider, key.as_str(), v);
+        None
     };
     let why = |r: &str| serial_println!(":: LUMENAPP: reason={} ::", r);
     let Ok(fs) = crate::fs::fat::mount_program_source() else {
@@ -133,7 +149,8 @@ pub fn selftest() {
         why("no-windowed-app-note");
         return verdict(window, "FAIL");
     }
-    verdict(window, "PASS")
+    verdict(window, "PASS");
+    Some(img)
 }
 
 /// aarch64: no ELF window on that loader yet, so no LUMEN.ELF image is built for it (owed).
@@ -143,4 +160,81 @@ pub fn selftest() {
     let _ = app_note_flags;
     serial_println!(":: LUMENAPP: reason=aarch64-image-owed ::");
     serial_println!(":: LUMENAPP: image={} window=bad provider={} key={} -> SKIP ::", IMAGE, provider, key.as_str());
+}
+
+// ── LUMENCRASH M3 (rmbp-ledger B326) — the SPAWN step: run the real image as `bg` does and read its first line ──
+// Boot 20 killed `lumen` at entry+0x3f (a GOT load through a discarded `.got`, LUMENCRASH M1) and no fixture
+// could have seen it: LUMENAPP's checks never run the program. This step spawns the accepted LUMEN.ELF through
+// `spawn_user_image_bg` — the call `bg` and the bare-name launch make — and waits up to 2 s for the program's
+// first wire line `:: LUMEN: start …` (watched at the ring-3 console seam, `serial_line::line_watch_*`) or a
+// ring-3 fault of its pid (`note_ring3_fault`, called by the x86 fault-kill path), then kills the job so the
+// fixture leaves no window and no network session behind.
+//
+// WITNESS. `:: LUMENCRASH: spawned=1 first_line=<ok|fault vec=N rip=+0x..|timeout> -> PASS|FAIL ::` (rip
+// relative to the entry the loader reported); `spawned=0 … -> FAIL` with the loader's reason if the spawn is
+// refused.
+
+#[cfg(target_arch = "x86_64")]
+static FAULT_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(target_arch = "x86_64")]
+static FAULT_VEC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(target_arch = "x86_64")]
+static FAULT_RIP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Called by `arch::x86_64::interrupts::ring3_fault_kill` (the faulting task is still current): record the
+/// last ring-3 fault's pid, vector and rip. Vector and rip are published before the pid (Release), so a
+/// reader that sees its pid sees that fault's values.
+#[cfg(target_arch = "x86_64")]
+pub fn note_ring3_fault(vec: u8, rip: u64) {
+    use core::sync::atomic::Ordering;
+    let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let pid = crate::arch::sched::current_task_id(cpu).unwrap_or(0);
+    FAULT_VEC.store(vec as u64, Ordering::Relaxed);
+    FAULT_RIP.store(rip, Ordering::Relaxed);
+    FAULT_PID.store(pid, Ordering::Release);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn spawn_step(img: &[u8]) {
+    use core::sync::atomic::Ordering;
+    const FIRST: &str = ":: LUMEN: start";
+    const WAIT_MS: u64 = 2_000;
+    FAULT_PID.store(0, Ordering::Release);
+    crate::serial_line::line_watch_arm(FIRST);
+    let (pid, slot, entry) = match crate::arch::syscall::spawn_user_image_bg(img) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::serial_line::line_watch_disarm();
+            serial_println!(":: LUMENCRASH: reason=spawn-refused ({}) ::", e);
+            serial_println!(":: LUMENCRASH: spawned=0 first_line=none -> FAIL ::");
+            return;
+        }
+    };
+    let deadline = crate::arch::ticks() + WAIT_MS;
+    let mut fault: Option<(u64, u64)> = None;
+    let mut ok = false;
+    while crate::arch::ticks() < deadline {
+        if crate::serial_line::line_watch_hit() {
+            ok = true;
+            break;
+        }
+        if FAULT_PID.load(Ordering::Acquire) == pid {
+            fault = Some((FAULT_VEC.load(Ordering::Relaxed), FAULT_RIP.load(Ordering::Relaxed)));
+            break;
+        }
+        crate::arch::sched::yield_now();
+    }
+    crate::serial_line::line_watch_disarm();
+    // A faulted task is already dead; a live one (PASS or timeout) is killed so the fixture leaves nothing.
+    let killed = if fault.is_none() { crate::arch::syscall::bg_kill(pid, slot) } else { "faulted" };
+    serial_println!("[lumencrash] pid={} slot={} entry={:#x} wait_ms={} kill={}", pid, slot, entry, WAIT_MS, killed);
+    match fault {
+        Some((vec, rip)) => serial_println!(
+            ":: LUMENCRASH: spawned=1 first_line=fault vec={} rip=+{:#x} -> FAIL ::",
+            vec,
+            rip.wrapping_sub(entry)
+        ),
+        None if ok => serial_println!(":: LUMENCRASH: spawned=1 first_line=ok -> PASS ::"),
+        None => serial_println!(":: LUMENCRASH: spawned=1 first_line=timeout -> FAIL ::"),
+    }
 }

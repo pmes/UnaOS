@@ -481,6 +481,7 @@ unsafe fn ring3_fault_kill(vec: u8, err: u64, rip: u64, cr2: u64) -> ! {
         ":: RING-3 FAULT: task '{}' KILLED — vec={} err={:#x} rip={:#x} cr2={:#x} ::",
         name, vec, err, rip, cr2
     );
+    #[cfg(feature = "lumen")] crate::lumen::note_ring3_fault(vec, rip); // LUMENCRASH M3 (B326): the faulting task's pid, vector and rip, for `tests lumen`'s spawn step
     crate::arch::syscall::record_ring3_kill(name, vec, err, cr2); if !(name.len() > 1 && name.as_bytes()[0] == b'u' && name.as_bytes()[1].is_ascii_digit()) { #[cfg(feature = "login")] crate::fs::users::screen_notice(b"Program stopped", name.as_bytes()); } // NOTICE: queue only (fixtures u1.. u4x are silent)
     crate::arch::sched::exit() // never returns; switches to the scheduler on this task's kstack
 }
