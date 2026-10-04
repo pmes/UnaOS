@@ -1035,3 +1035,74 @@ mod tests {
         assert_eq!(PrefTree::parse(HEADER), Ok(PrefTree::new()));
     }
 }
+
+/// BRIGHTFLOOR (rmbp-ledger B312) — the schema rule for `system.display.*`, here so BOTH rings apply it:
+/// a persisted brightness can never be a dark one. Flight 19: a stored level re-applied at login left the
+/// session dark and the card had to be rewritten. The backlight's OFF belongs to the idle blank (DIMIDLE),
+/// never to a preference, so the stored range is `BRIGHTNESS_MIN..=BRIGHTNESS_MAX` and anything else —
+/// a 0, a negative, a value above the top — is CLAMPED on load and on save, not refused (a refused value
+/// would fall back to the default and silently drop the operator's choice; a clamped one keeps it lit).
+/// Owed B287: Principia's host `PrefSet` calling [`display::clamp_brightness`] too.
+pub mod display {
+    /// The `system` key (namespace-relative) the rule governs.
+    pub const BRIGHTNESS_KEY: &str = "display.brightness";
+    /// The lowest stored level: 1/16 of the panel's range, lit.
+    pub const BRIGHTNESS_MIN: i64 = 1;
+    /// The top level.
+    pub const BRIGHTNESS_MAX: i64 = 16;
+    /// The level a reset (safe mode) restores.
+    pub const BRIGHTNESS_DEFAULT: i64 = 12;
+    /// The idle-blank default, minutes (a reset restores it with the brightness).
+    pub const IDLE_MIN_DEFAULT: i64 = 10;
+    /// Every `system` key under `display.` a reset puts back to its default (wallpaper = removed).
+    pub const RESET_KEYS: [&str; 3] = ["display.brightness", "display.idle_min", "display.wallpaper"];
+
+    /// Clamp a stored brightness into the lit range. Pure.
+    pub const fn clamp_brightness(v: i64) -> i64 {
+        if v < BRIGHTNESS_MIN { BRIGHTNESS_MIN } else if v > BRIGHTNESS_MAX { BRIGHTNESS_MAX } else { v }
+    }
+
+    /// The `(key, default)` pairs a reset (safe mode) writes back — wallpaper `""` is "off", the
+    /// consumer's default. Pure.
+    pub fn defaults() -> [(&'static str, super::PrefValue); 3] {
+        use super::PrefValue as P;
+        [
+            (RESET_KEYS[0], P::Int(BRIGHTNESS_DEFAULT)),
+            (RESET_KEYS[1], P::Int(IDLE_MIN_DEFAULT)),
+            (RESET_KEYS[2], P::Str(alloc::string::String::new())),
+        ]
+    }
+
+    /// Reset `system.display.*` in `t` to [`defaults`]; returns how many keys were written. Pure — the
+    /// kernel's live reset is the same pairs through its own store's `set`.
+    pub fn reset(t: &mut super::PrefTree) -> usize {
+        let mut n = 0;
+        for (k, v) in defaults() {
+            if t.set("system", k, v).is_ok() { n += 1; }
+        }
+        n
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn reset_restores_a_lit_panel() {
+            let mut t = crate::PrefTree::parse("[system]\ndisplay.brightness = 0\ndisplay.idle_min = 0\ndisplay.wallpaper = \"X.PNG\"\n").unwrap();
+            assert_eq!(reset(&mut t), 3);
+            assert_eq!(t.get("system", BRIGHTNESS_KEY), Some(&crate::PrefValue::Int(BRIGHTNESS_DEFAULT)));
+            assert_eq!(t.get("system", "display.idle_min"), Some(&crate::PrefValue::Int(IDLE_MIN_DEFAULT)));
+            assert_eq!(t.get("system", "display.wallpaper"), Some(&crate::PrefValue::Str(alloc::string::String::new())));
+        }
+        #[test]
+        fn a_dark_value_never_survives() {
+            assert_eq!(clamp_brightness(0), 1);
+            assert_eq!(clamp_brightness(-5), 1);
+            assert_eq!(clamp_brightness(1), 1);
+            assert_eq!(clamp_brightness(11), 11);
+            assert_eq!(clamp_brightness(16), 16);
+            assert_eq!(clamp_brightness(99), 16);
+            assert_eq!(clamp_brightness(BRIGHTNESS_DEFAULT), BRIGHTNESS_DEFAULT);
+        }
+    }
+}

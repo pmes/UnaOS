@@ -2742,21 +2742,51 @@ const fn pipe_timing_regs(sel: u32) -> PipeTimingRegs {
     }
 }
 
-/// BRIGHTKEYS — write the gmux backlight register (`GMUX_PORT_BRIGHTNESS`, index 0x74, 32-bit; the
-/// panel range is 0..=0xFFFF). Upstream `gmux_index_write32`: value bytes at 0x7C0..=0x7C3, wait,
-/// then the index. Bounded by `gmux_wait_*`; returns false when the gmux does not complete.
+/// BRIGHTKEYS / BRIGHTFLOOR — write the gmux backlight register (`GMUX_PORT_BRIGHTNESS`, index 0x74,
+/// 32-bit). Upstream `gmux_index_write32`: the four value bytes at `GMUX_PORT_VALUE` (0x7C2..=0x7C5),
+/// wait, then the index. BRIGHTFLOOR: this used to write the bytes at 0x7C0..=0x7C3, so the register
+/// got bytes 2..3 of a 16-bit value (always 0) in its low half — every level wrote 0 = backlight OFF
+/// (flight 19). The caller scales to [`gmux_max_brightness`] (the panel's range, 0x3FF on the bench
+/// machine), never to 0xFFFF. Bounded by `gmux_wait_*`; returns false when the gmux does not complete.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-pub fn gmux_set_brightness(raw: u16) -> bool {
-    const PORT_VALUE_BASE: u16 = 0x7C0;
+pub fn gmux_set_brightness(raw: u32) -> bool {
     const PORT_BRIGHTNESS: u8 = 0x74;
-    let v = raw as u32;
-    // SAFETY: gmux index/data ports (0x7C0-0x7D4) are the ones every other gmux helper above drives.
+    // SAFETY: gmux index/data ports (0x7C2-0x7D4) are the ones every other gmux helper above drives.
     unsafe {
         for i in 0..4u16 {
-            gmux_outb(PORT_VALUE_BASE + i, (v >> (8 * i)) as u8);
+            gmux_outb(GMUX_PORT_VALUE + i, (raw >> (8 * i)) as u8);
         }
         if !gmux_wait_ready() { return false; }
         gmux_outb(GMUX_PORT_WRITE, PORT_BRIGHTNESS);
         gmux_wait_complete()
     }
+}
+
+/// BRIGHTFLOOR — one 32-bit gmux index read (upstream `gmux_index_read32`: wait, index to
+/// `GMUX_PORT_READ`, wait for completion, `inl` at `GMUX_PORT_VALUE`). `None` on a timeout.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+fn gmux_index_read32(reg: u8) -> Option<u32> {
+    // SAFETY: the same bounded gmux port window every helper above drives.
+    unsafe {
+        if !gmux_wait_ready() { return None; }
+        gmux_outb(GMUX_PORT_READ, reg);
+        if !gmux_wait_complete() { return None; }
+        let mut v: u32;
+        core::arch::asm!("in eax, dx", out("eax") v, in("dx") GMUX_PORT_VALUE, options(nomem, nostack, preserves_flags));
+        Some(v)
+    }
+}
+
+/// BRIGHTFLOOR — the backlight register's READBACK (index 0x74, masked to the 24 bits upstream's
+/// `GMUX_BRIGHTNESS_MASK` keeps). `None` when the gmux does not answer.
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+pub fn gmux_get_brightness() -> Option<u32> {
+    gmux_index_read32(0x74).map(|v| v & 0x00FF_FFFF)
+}
+
+/// BRIGHTFLOOR — the panel's range (`GMUX_PORT_MAX_BRIGHTNESS`, index 0x70; 0x3FF on the bench rMBP).
+/// `None` on a timeout or a value no backlight carries (0, or the all-ones float of an absent gmux).
+#[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
+pub fn gmux_max_brightness() -> Option<u32> {
+    gmux_index_read32(0x70).map(|v| v & 0x00FF_FFFF).filter(|&m| m != 0 && m != 0x00FF_FFFF)
 }

@@ -16655,7 +16655,7 @@ unsafe fn decode_boot_keyboard(
     if report.len() < 8 {
         return false; // short/partial boot report — refused whole (keyup F1); see SHORT REPORTS above
     }
-    let modifiers = report[0];
+    let modifiers = report[0]; crate::video::keymap::note_mods(modifiers); // BRIGHTFLOOR M2 — the latest modifier byte (Shift = safe mode at Log In), as the xHCI decoder already records it. SAME-LINE fold.
     // ALLKEYS P1: the live caps-lock bit feeds the case fold, so the lit key and the typed case
     // are the same fact read twice rather than two states that can drift apart.
     let caps = *leds & 0x02 != 0;

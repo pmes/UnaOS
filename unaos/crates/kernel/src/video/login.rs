@@ -564,6 +564,13 @@ fn repaint() {
     text(px, LX, 186, hint, theme::TITLE_TEXT_INACTIVE);
     if !f.message.is_empty() {
         text(px, LX, 212, f.message.as_bytes(), theme::ACCENT);
+    } else if !locked {
+        // BRIGHTFLOOR M5 — the safe-mode escape, in small text on the footer (`settings::safe_mode_check`).
+        let fy = H.saturating_sub(font::CHROME_CELL_H + 4);
+        const LONG: &[u8] = b"hold Shift after login to reset display settings";
+        const SHORT: &[u8] = b"Shift after login: reset display";
+        let msg = if LX + LONG.len() * font::CHROME_CELL_W <= W { LONG } else { SHORT };
+        let _ = font::draw_text(px, W, W, H, LX, fy, msg, theme::TITLE_TEXT_INACTIVE, false, font::Face::Chrome);
     }
     drop(f);
     let id = WIN.load(Ordering::Relaxed);

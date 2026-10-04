@@ -155,6 +155,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
     crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } #[cfg(all(feature = "vein", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static VN: AtomicBool = AtomicBool::new(false); if !VN.swap(true, Ordering::AcqRel) { register("vein", crate::arch::syscall::vein_selftest); } } ensure_attr(); // VEINCORE (B304): `tests vein`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
         static LDONE: AtomicBool = AtomicBool::new(false);
@@ -282,4 +283,12 @@ pub fn quietboot_selftest() {
         serial_println!(":: QUIETBOOT: top=[{}] ::", s);
     }
     serial_println!(":: QUIETBOOT: lines={} bound={} census={} -> {} ::", n, QUIETBOOT_BOUND, crate::census::bits(), if ok { "PASS" } else { "FAIL" });
+/// BRIGHTFLOOR (B312): register `brightfloor` (the backlight floor, the load clamp, the safe-mode reset,
+/// and the BRIGHTKEYS key path that used to run at boot — R80) exactly once, wherever the desktop builds.
+fn ensure_brightfloor() {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); }
+    }
 }

@@ -3740,6 +3740,13 @@ vein = ["busreg"]
 # sync with `unaos/arroyo` (the x86 `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 netring3 = []
 
+# BRIGHTFLOOR (B312): UNAOS_PREFS_RESET=1 — the boot-knob half of the safe-mode escape: every login resets
+# `system.display.*` (brightness, idle blank, wallpaper) to Principia's defaults before the store's keys are
+# applied (`[prefs] display reset=1 reason=knob`). A rescue image for a store that darkens a login; the key
+# half (Shift held at Log In) needs no knob. Both arches. Kept in sync with `unaos/arroyo` (the x86
+# `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
+prefs_reset = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
