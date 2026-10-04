@@ -98,6 +98,11 @@ pub struct ToolStats {
     pub segmentation: bool,
     /// Loop-restoration units by decoded type: [NONE, WIENER, SGRPROJ, -].
     pub lr_units: [u32; 4],
+    /// Tiles whose exit_symbol() padding check (§8.2.4: the trailing one bit sits exactly where
+    /// the arithmetic decoder says it must, zeros after it) passed / failed. A failure means the
+    /// symbol decoder lost sync with the encoder somewhere in that tile.
+    pub tiles_exit_ok: u32,
+    pub tiles_exit_bad: u32,
 }
 
 impl FrameState {
@@ -458,6 +463,11 @@ impl<'a, 'f> Dec<'a, 'f> {
             self.cdf = CdfContext::new(self.hdr.base_q_idx);
             self.sd = SymbolDecoder::new(&data[off..off + tile_size], self.hdr.disable_cdf_update)?;
             self.decode_tile()?;
+            if self.sd.exit_check() {
+                self.fs.stats.tiles_exit_ok += 1;
+            } else {
+                self.fs.stats.tiles_exit_bad += 1;
+            }
             off += tile_size;
         }
         Ok(tg_end == num_tiles - 1)

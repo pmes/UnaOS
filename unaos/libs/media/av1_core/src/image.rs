@@ -73,13 +73,50 @@ pub fn decode_obus(data: &[u8], config_obus: &[u8], filters: Filters) -> Result<
             }
         }
     }
+    decode_with_seq(data, &mut seq, filters)
+}
+
+/// A decoder for a stream of temporal units (one per container packet), keeping the sequence
+/// header across them — the shape a video player's decoder seam needs. Key frames and intra-only
+/// frames decode; an inter frame returns `Err(Unsupported("inter frame"))` (owed, see the doc).
+#[derive(Debug, Clone, Default)]
+pub struct StreamDecoder {
+    seq: Option<SequenceHeader>,
+    pub filters: Filters,
+}
+
+impl StreamDecoder {
+    /// `av1c` is the container's AV1CodecConfigurationRecord body (MP4 `av1C`, Matroska
+    /// CodecPrivate) or empty.
+    pub fn new(av1c: &[u8]) -> Result<StreamDecoder> {
+        let mut d = StreamDecoder { seq: None, filters: Filters::default() };
+        if !av1c.is_empty() {
+            let cfg = crate::avif::Av1Config::parse(av1c)?;
+            for o in split_obus(&cfg.config_obus)? {
+                if o.obu_type == OBU_SEQUENCE_HEADER_T {
+                    d.seq = Some(SequenceHeader::parse(o.payload)?);
+                }
+            }
+        }
+        Ok(d)
+    }
+    /// Decode one temporal unit; `Ok(planes)` for its shown frame.
+    pub fn decode_temporal_unit(&mut self, tu: &[u8]) -> Result<Planes> {
+        decode_with_seq(tu, &mut self.seq, self.filters)
+    }
+    /// After a seek. Intra-only decoding keeps no reference frames, so there is nothing to drop
+    /// yet; the sequence header stays valid. (Inter will clear the reference slots here.)
+    pub fn reset(&mut self) {}
+}
+
+fn decode_with_seq(data: &[u8], seq: &mut Option<SequenceHeader>, filters: Filters) -> Result<Planes> {
     let obus = split_obus(data)?;
     let mut i = 0;
     while i < obus.len() {
         let o = obus[i];
         i += 1;
         match o.obu_type {
-            OBU_SEQUENCE_HEADER_T => seq = Some(SequenceHeader::parse(o.payload)?),
+            OBU_SEQUENCE_HEADER_T => *seq = Some(SequenceHeader::parse(o.payload)?),
             OBU_FRAME_T | OBU_FRAME_HEADER_T => {
                 let s = seq.as_ref().ok_or(Error::Invalid("frame before sequence header"))?;
                 if s.operating_point_idc != 0 && o.has_extension {

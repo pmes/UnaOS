@@ -57,6 +57,28 @@ pub struct Obus {
     pub has_clap: bool,
 }
 
+impl Av1Config {
+    /// Parse an AV1CodecConfigurationRecord body (AV1-ISOBMFF §2.3.3): marker/version, profile,
+    /// level, tier, bit depth, mono, subsampling, chroma position, then the configOBUs.
+    pub fn parse(b: &[u8]) -> Result<Av1Config> {
+        if b.len() < 4 || b[0] & 0x7f != 1 {
+            return Err(Error::Invalid("av1C"));
+        }
+        Ok(Av1Config {
+            seq_profile: b[1] >> 5,
+            seq_level_idx_0: b[1] & 31,
+            seq_tier_0: b[2] >> 7,
+            high_bitdepth: b[2] & 0x40 != 0,
+            twelve_bit: b[2] & 0x20 != 0,
+            monochrome: b[2] & 0x10 != 0,
+            chroma_subsampling_x: b[2] & 0x08 != 0,
+            chroma_subsampling_y: b[2] & 0x04 != 0,
+            chroma_sample_position: b[2] & 3,
+            config_obus: b[4..].to_vec(),
+        })
+    }
+}
+
 impl Obus {
     /// The OBUs of the payload.
     pub fn obus(&self) -> Result<Vec<Obu<'_>>> {
@@ -288,22 +310,7 @@ pub fn avif_payload(file: &[u8]) -> Result<Obus> {
                     out.bits_per_channel = file.get(body + 5..body + 5 + n).ok_or(Error::Truncated)?.to_vec();
                 }
                 b"av1C" => {
-                    let b = file.get(body..end).ok_or(Error::Truncated)?;
-                    if b.len() < 4 || b[0] & 0x7f != 1 {
-                        return Err(Error::Invalid("av1C"));
-                    }
-                    out.av1c = Some(Av1Config {
-                        seq_profile: b[1] >> 5,
-                        seq_level_idx_0: b[1] & 31,
-                        seq_tier_0: b[2] >> 7,
-                        high_bitdepth: b[2] & 0x40 != 0,
-                        twelve_bit: b[2] & 0x20 != 0,
-                        monochrome: b[2] & 0x10 != 0,
-                        chroma_subsampling_x: b[2] & 0x08 != 0,
-                        chroma_subsampling_y: b[2] & 0x04 != 0,
-                        chroma_sample_position: b[2] & 3,
-                        config_obus: b[4..].to_vec(),
-                    });
+                    out.av1c = Some(Av1Config::parse(file.get(body..end).ok_or(Error::Truncated)?)?);
                 }
                 b"colr" => {
                     let t = file.get(body..body + 4).ok_or(Error::Truncated)?;
