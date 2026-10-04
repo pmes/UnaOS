@@ -282,7 +282,8 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
             out(console, &summary_line());
         }
         Some("dump") => dump(console),
-        _ => console.println("usage: prof [status] | prof start [hz] | prof stop | prof dump"),
+        Some("top") => top(console, num(1).unwrap_or(10) as usize),
+        _ => console.println("usage: prof [status] | prof start [hz] | prof stop | prof top [n] | prof dump"),
     }
 }
 
@@ -296,3 +297,49 @@ fn dump(console: &mut Console) {
     serial_println!("[prof] dump end samples={}", v.len());
     console.println(&format!("[prof] dump: {} samples written to serial", v.len()));
 }
+
+/// `(ring, bucket)` -> samples, hottest first. A bucket is `rip >> BUCKET_SHIFT`.
+pub fn buckets(v: &[Sample]) -> Vec<((u8, u64), usize)> {
+    let mut keys: Vec<(u8, u64)> = v.iter().map(|s| (s.ring, s.rip >> BUCKET_SHIFT)).collect();
+    keys.sort_unstable();
+    let mut out: Vec<((u8, u64), usize)> = Vec::new();
+    for k in keys {
+        match out.last_mut() {
+            Some((lk, n)) if *lk == k => *n += 1,
+            _ => out.push((k, 1)),
+        }
+    }
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// Per-mille as `x.y%`.
+fn pct(n: usize, total: usize) -> String {
+    let pm = if total == 0 { 0 } else { n * 1000 / total };
+    format!("{}.{}%", pm / 10, pm % 10)
+}
+
+/// A bucket's start address, and its offset from the anchor (link-address independent: add it to the
+/// anchor's `kernel.syms` address to land in the symbol table). Ring-3 buckets are user addresses.
+pub fn bucket_name(ring: u8, b: u64) -> String {
+    let a = b << BUCKET_SHIFT;
+    if ring == 3 {
+        return format!("{:#x} [ring3]", a);
+    }
+    let off = a as i64 - anchor() as i64;
+    if off < 0 { format!("{:#x} anchor-{:#x}", a, -off) } else { format!("{:#x} anchor+{:#x}", a, off) }
+}
+
+/// `prof top [n]` — the hottest N 256-byte RIP buckets with sample %.
+fn top(console: &mut Console, n: usize) {
+    let v = samples();
+    out(console, &summary_line());
+    let total = v.len();
+    for (rank, ((ring, b), c)) in buckets(&v).into_iter().take(n.max(1)).enumerate() {
+        out(console, &format!("[prof] top rank={} samples={} pct={} ring={} bucket={}", rank + 1, c, pct(c, total), ring, bucket_name(ring, b)));
+    }
+    comp_rows(console);
+}
+
+/// M4 slot: the compositor split rows (filled by M4).
+fn comp_rows(_console: &mut Console) {}
