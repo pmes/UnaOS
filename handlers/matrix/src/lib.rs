@@ -25,6 +25,7 @@ use std::collections::HashMap;
 pub mod finder;
 pub mod graft;
 pub mod indexer;
+pub mod trash; // TRASHTIME M3 (B308): the Trash on a UnaFS vault, by attributes
 
 pub use finder::Finder;
 

@@ -57,6 +57,8 @@ const TRASH_DIR: &str = ".una-trash";
 /// and out of the Finder are workspace-relative (`""` = the root itself).
 pub struct Finder {
     root: PathBuf,
+    /// TRASHTIME M3: the Trash on a UnaFS vault (attributes, by inode id), when one is attached.
+    vault: Option<std::sync::Mutex<Box<dyn crate::trash::TrashStore>>>,
 }
 
 fn deny(reason: impl Into<String>) -> FsOutcome {
@@ -91,7 +93,36 @@ fn bare_name(name: &str) -> Result<&str, FsOutcome> {
 impl Finder {
     /// Anchor a Finder at an absolute workspace root.
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self { root, vault: None }
+    }
+
+    /// TRASHTIME M3: a Finder whose `Trash`/`Restore`/`Empty` verbs act on a UnaFS vault's Trash
+    /// (the same `una:trash-*` attributes the kernel's Quarry stamps).
+    pub fn with_trash(root: PathBuf, store: Box<dyn crate::trash::TrashStore>) -> Self {
+        Self { root, vault: Some(std::sync::Mutex::new(store)) }
+    }
+
+    /// Run one Trash verb against the attached vault. `path`: the vault path to trash, or the
+    /// trashed name to restore; ignored by `Empty`, which requires `confirmed`.
+    fn trash_verb(&self, verb: FsVerb, path: &str, confirmed: bool) -> FsOutcome {
+        let Some(v) = &self.vault else {
+            return deny("no UnaFS vault attached: the Trash lives in attributes");
+        };
+        let mut v = match v.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let r = match verb {
+            FsVerb::Trash => v.trash(path),
+            FsVerb::Restore => v.restore(path),
+            FsVerb::Empty if !confirmed => return FsOutcome::NeedsConfirm,
+            FsVerb::Empty => v.empty().map(|n| format!("{n}")),
+            _ => return deny("not a trash verb"),
+        };
+        match r {
+            Ok(p) => FsOutcome::Ok { path: p },
+            Err(reason) => deny(reason),
+        }
     }
 
     /// The absolute root this Finder is anchored at.
@@ -421,6 +452,7 @@ impl Finder {
                 None => deny("move requires a destination directory"),
             },
             FsVerb::Delete => self.delete(path, confirmed),
+            FsVerb::Trash | FsVerb::Restore | FsVerb::Empty => self.trash_verb(verb, path, confirmed),
         }
     }
 
@@ -434,6 +466,8 @@ impl Finder {
             // Rename/Delete change the target's own parent.
             FsVerb::Rename | FsVerb::Delete => parent_rel(path),
             FsVerb::Open => path.to_string(),
+            // The Trash verbs act on the vault, not the workspace: nothing to refresh here.
+            FsVerb::Trash | FsVerb::Restore | FsVerb::Empty => String::new(),
         }
     }
 
@@ -462,7 +496,7 @@ impl Finder {
                 }];
                 // A successful mutation refreshes the affected directory so the
                 // browse view stays live without the UI re-requesting it.
-                if verb.is_write() {
+                if verb.is_write() && !matches!(verb, FsVerb::Trash | FsVerb::Restore | FsVerb::Empty) {
                     if let FsOutcome::Ok { .. } = outcome {
                         let dir = self.refresh_dir(*verb, path, arg.as_deref());
                         if let Ok(listing) = self.list(&dir) {

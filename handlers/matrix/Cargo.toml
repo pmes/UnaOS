@@ -17,6 +17,9 @@ glib = { version = "0.22", optional = true }
 async-channel = "2.5"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
+# TRASHTIME M3 (B308): the vault Trash; the key literals live once in una-abi (both rings link it).
+unafs = { path = "../../unaos/libs/fs/unafs" }
+una-abi = { path = "../../unaos/crates/una-abi" }
 
 [dev-dependencies]
 tempfile = "3"
