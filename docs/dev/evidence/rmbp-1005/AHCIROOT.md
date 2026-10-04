@@ -51,3 +51,19 @@ and prints one `:: [ahci] write -EPERM …` line (rate-limited).
 its own ESP as before). p2 is not grown to the disk (fresh p2 = 4 GiB). No multi-sector PRDT (one
 sector per command). The operator-confirmation path on the GLASS (instgui) is not wired; the shell
 token is. Unflown (R78).
+
+## Results (unflown, R78)
+
+Commits: M2 d35847d4 · M1 e0c4f5b1 · M3 ecf71433 · M4+M5 f60e83d1 (M3 and M4+M5 were finished from the
+previous executor's uncommitted tree after a harness interrupt; only the tip is compile-proven).
+
+- `cargo test -p amber_core` (repo root): exit 0, 3 tests, KAT 44 checks.
+- x86 metal shape + `ahciroot`: exit 0. x86 metal shape without `ahciroot`: exit 0.
+- aarch64 login shape (`login,loginst,virt_el0`, blob head 280080d2): exit 0.
+- charter-check: exit 0.
+
+Expected wire on a metal boot of an installed SSD (knob `UNAOS_AHCIROOT=1`):
+`:: UNAFSX86: root=unafs src=ahci:<port> blocks=<n> gen=<g> home=/home boot=<card> -> PASS ::`, and on
+`tests ahciw`: `:: AHCIROOT: grant=port <N> <a>..<b> kind=root (lba 0 outside) write=refused errno=-EPERM lba=0 … -> PASS ::`
+then `:: AHCIROOT: grant=port <N> write=ok readback=eq flush=ok scratch=<s>..<e> lba=<s> restored=ok -> PASS ::`.
+An SSD laid before AHCIROOT reads `-> SKIP (… reinstall)` on the second line (its volume reaches the tail).
