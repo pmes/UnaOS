@@ -22,9 +22,10 @@
 # Boot 2 (GUI scale-2 / vug / pulse) is eyeball+photo — out of serial scope.
 
 # --- console-cap slice (boot-automatic; TX-only console) ----------------------------
-REQUIRE U2.5-0: DR7 cleared
+# QUIETBOOT2 (B325, R80): a quiet metal boot prints none of these OPTIONAL lines — the W^X census (WXN/WXAUDIT) is `census`, the U2.5/fb-wc bring-up prose is `bootlog`, U2-0c is `tests u20c`/`tests canonguard`. A `UNAOS_TESTS_AT_BOOT=1 UNAOS_CENSUS=1` capture prints them all.
+OPTIONAL U2.5-0: DR7 cleared
 REQUIRE U2.5: FTDI console up
-REQUIRE U2.5: FTDI TX mirror -> PASS
+OPTIONAL U2.5: FTDI TX mirror -> PASS
 
 # --- STOR-1: service task + transfer-IRQ I/O re-confirm on the FIXED code -----------
 REQUIRE STOR-1: storage service task live on cpu
@@ -33,8 +34,8 @@ REQUIRE S3: synchronous write-through.*-> PASS
 
 # --- the full U-chain, knob-ON (all captured 2026-07-10) ----------------------------
 COUNT 25 -> PASS
-REQUIRE U2-0c: self-NMI taken on IST -> PASS
-REQUIRE U2-0c: canonical-rcx guard refuses
+OPTIONAL U2-0c: self-NMI taken on IST -> PASS
+OPTIONAL U2-0c: canonical-rcx guard refuses
 REQUIRE U1a: user exited ok
 REQUIRE U1b: fault isolation.*-> PASS
 REQUIRE U2-0a: TF\+SYSCALL survived -> PASS
@@ -97,7 +98,7 @@ REQUIRE vperf: fbmem mtrr=.*pte=.*pat=.*eff=.*fb=
 # the round-6 eff=UC to eff=WC (pat=WC, PTE PAT bit set) and the retype line fires.
 # 2026-07-12 round-9 bench: BOTH fired on the real rMBP (eff=UC → eff=WC) — PROMOTED to REQUIRE.
 REQUIRE vperf: fbmem .*pat=WC eff=WC
-REQUIRE x86 fb-wc: retyped .* leaf\(s\) WC \(PAT PA4\)
+OPTIONAL x86 fb-wc: retyped .* leaf\(s\) WC \(PAT PA4\)
 # Expect BOTH GPUs named (GT 650M scans out via gmux default; HD 4000 also present).
 REQUIRE vperf: display.*class
 REQUIRE vperf: display.*owns fb
@@ -155,13 +156,13 @@ REQUIRE S5: cross-process read serves LIVE shared backing
 # --- from its knob-ON build. The 2026-07-11 Boot-1 capture this spec was written against predates
 # --- the sweep and reds all four REQUIREs — its kernel could not print them. Date a capture before
 # --- reading a red here.
-REQUIRE :: WXN-x86: ehdr=0x[0-9A-F]+ img=\[0x[0-9A-F]+,0x[0-9A-F]+\) .*pdpt_seen=[0-9]+ nx_set=[0-9]+ .*residue_leaves=[0-9]+ .*wp=[0-9]+ -> SWEPT ::
+OPTIONAL :: WXN-x86: ehdr=0x[0-9A-F]+ img=\[0x[0-9A-F]+,0x[0-9A-F]+\) .*pdpt_seen=[0-9]+ nx_set=[0-9]+ .*residue_leaves=[0-9]+ .*wp=[0-9]+ -> SWEPT ::
 FORBID :: WXN-x86: .*-> VACUOUS ::
 FORBID :: WXN-x86: .*-> REFUSED
-REQUIRE :: WXAUDIT x86: leaves=[0-9]+ user=[0-9]+ user_WX=[0-9]+ kern_WX=[0-9]+ \([0-9]+ MiB\) tables=[0-9]+ nxe=[0-9]+ walk=[0-9]+kcyc l1=[0-9]+ l2=[0-9]+ l3=[0-9]+
+OPTIONAL :: WXAUDIT x86: leaves=[0-9]+ user=[0-9]+ user_WX=[0-9]+ kern_WX=[0-9]+ \([0-9]+ MiB\) tables=[0-9]+ nxe=[0-9]+ walk=[0-9]+kcyc l1=[0-9]+ l2=[0-9]+ l3=[0-9]+
 FORBID :: WXAUDIT x86: .* TRUNCATED ::
-REQUIRE :: WXAUDIT-NXE: cores=[0-9]+ nxe=[0-9]+ nxe_mask=0x[0-9A-F]+ wp=[0-9]+ wp_mask=0x[0-9A-F]+ -> PASS ::
-REQUIRE :: WXN-FBWC: fb=0x[0-9A-F]+ lvl=[0-9]+ e=0x[0-9A-F]{16} pat=[0-9]+ pcd=[0-9]+ pwt=[0-9]+ w=[0-9]+ fx=[0-9]+ -> LEAF BIT-IDENTICAL ::
+OPTIONAL :: WXAUDIT-NXE: cores=[0-9]+ nxe=[0-9]+ nxe_mask=0x[0-9A-F]+ wp=[0-9]+ wp_mask=0x[0-9A-F]+ -> PASS ::
+OPTIONAL :: WXN-FBWC: fb=0x[0-9A-F]+ lvl=[0-9]+ e=0x[0-9A-F]{16} pat=[0-9]+ pcd=[0-9]+ pwt=[0-9]+ w=[0-9]+ fx=[0-9]+ -> LEAF BIT-IDENTICAL ::
 FORBID :: WXN-FBWC: .*-> SKIPPED ::
 
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────

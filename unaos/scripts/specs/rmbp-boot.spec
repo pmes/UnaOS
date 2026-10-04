@@ -8,9 +8,10 @@
 # and the U-chain ran to its tail. The full chain assertion is x86-fat.spec;
 # the full round-6 witness list is round6-rmbp.spec.
 
-REQUIRE U2.5-0: DR7 cleared
+# QUIETBOOT2 (B325, R80): a quiet metal boot prints none of these OPTIONAL lines — the W^X census (WXN/WXAUDIT) is `census`, the U2.5/fb-wc bring-up prose is `bootlog`, U2-0c is `tests u20c`/`tests canonguard`. A `UNAOS_TESTS_AT_BOOT=1 UNAOS_CENSUS=1` capture prints them all.
+OPTIONAL U2.5-0: DR7 cleared
 REQUIRE U2.5: FTDI console up
-REQUIRE U2.5: FTDI TX mirror -> PASS
+OPTIONAL U2.5: FTDI TX mirror -> PASS
 REQUIRE U1a: user exited ok
 REQUIRE U3.5: ring-3 preemption.*-> PASS
 REQUIRE xHCI: Disk
@@ -59,13 +60,13 @@ FORBID EXCEPTION:
 # LEAF BIT-IDENTICAL`), and against an x86 QEMU `./arroyo test` capture on the dev host
 # (`~/unaos-bench/scratch/qemu-x86-gr18.log`), which is the knob-independence claim above made
 # good on a second configuration. Date a capture with `git log` before reading any red here.
-REQUIRE :: WXN-x86: ehdr=0x[0-9A-F]+ img=\[0x[0-9A-F]+,0x[0-9A-F]+\) .*pdpt_seen=[0-9]+ nx_set=[0-9]+ .*residue_leaves=[0-9]+ .*wp=[0-9]+ -> SWEPT ::
+OPTIONAL :: WXN-x86: ehdr=0x[0-9A-F]+ img=\[0x[0-9A-F]+,0x[0-9A-F]+\) .*pdpt_seen=[0-9]+ nx_set=[0-9]+ .*residue_leaves=[0-9]+ .*wp=[0-9]+ -> SWEPT ::
 FORBID :: WXN-x86: .*-> VACUOUS ::
 FORBID :: WXN-x86: .*-> REFUSED
-REQUIRE :: WXAUDIT x86: leaves=[0-9]+ user=[0-9]+ user_WX=[0-9]+ kern_WX=[0-9]+ \([0-9]+ MiB\) tables=[0-9]+ nxe=[0-9]+ walk=[0-9]+kcyc l1=[0-9]+ l2=[0-9]+ l3=[0-9]+
+OPTIONAL :: WXAUDIT x86: leaves=[0-9]+ user=[0-9]+ user_WX=[0-9]+ kern_WX=[0-9]+ \([0-9]+ MiB\) tables=[0-9]+ nxe=[0-9]+ walk=[0-9]+kcyc l1=[0-9]+ l2=[0-9]+ l3=[0-9]+
 FORBID :: WXAUDIT x86: .* TRUNCATED ::
-REQUIRE :: WXAUDIT-NXE: cores=[0-9]+ nxe=[0-9]+ nxe_mask=0x[0-9A-F]+ wp=[0-9]+ wp_mask=0x[0-9A-F]+ -> PASS ::
-REQUIRE :: WXN-FBWC: fb=0x[0-9A-F]+ lvl=[0-9]+ e=0x[0-9A-F]{16} pat=[0-9]+ pcd=[0-9]+ pwt=[0-9]+ w=[0-9]+ fx=[0-9]+ -> LEAF BIT-IDENTICAL ::
+OPTIONAL :: WXAUDIT-NXE: cores=[0-9]+ nxe=[0-9]+ nxe_mask=0x[0-9A-F]+ wp=[0-9]+ wp_mask=0x[0-9A-F]+ -> PASS ::
+OPTIONAL :: WXN-FBWC: fb=0x[0-9A-F]+ lvl=[0-9]+ e=0x[0-9A-F]{16} pat=[0-9]+ pcd=[0-9]+ pwt=[0-9]+ w=[0-9]+ fx=[0-9]+ -> LEAF BIT-IDENTICAL ::
 FORBID :: WXN-FBWC: .*-> SKIPPED ::
 
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
