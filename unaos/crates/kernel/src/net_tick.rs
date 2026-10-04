@@ -15,6 +15,8 @@ static WITNESSED: AtomicBool = AtomicBool::new(false);
 
 /// Drive the SNTP client for this arch; cheap and idempotent once settled. Not for interrupt context.
 pub fn service_tick() {
+    #[cfg(all(feature = "smolnet", feature = "usbnet", target_arch = "x86_64"))]
+    crate::smolnet::dhcp_link_tick(); // USBNET6 M3: the dongle's lease is asked for once its PHY has link (no-op once leased / with an e1000)
     if WITNESSED.load(Ordering::Relaxed) {
         return;
     }

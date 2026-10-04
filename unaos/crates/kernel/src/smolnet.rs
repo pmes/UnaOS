@@ -1994,3 +1994,43 @@ pub fn dns_x86_gate() {
 pub fn sntp_done() -> bool {
     WITNESS_SNTP_DONE.load(Ordering::Relaxed)
 }
+
+/// USBNET6: true once a DHCP lease replaced the static config (the `tests usbnet` census reads it).
+pub fn leased() -> bool {
+    LEASED.load(Ordering::Relaxed)
+}
+
+/// USBNET6 M3: tries so far of the link-driven DHCP acquisition (bounded: a silent network is not retried forever).
+#[cfg(feature = "usbnet")]
+static DHCP_LINK_TRIES: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "usbnet")]
+const DHCP_LINK_MAX: u32 = 6;
+
+/// USBNET6 M3: DHCP on the USB Ethernet link. Flight 19 printed NO `SOCK-5` line on any boot: `dhcp_acquire`
+/// runs only from `init()`, and `init()` only from the ring-3 socket syscalls, while the stack on the metal is
+/// built lazily by the SOCK-2 witness with the static slirp config — so the dongle received frames for minutes
+/// and the lease was never asked for. Driven from the 5 s `net_tick::service_tick` (main loop, large stack):
+/// once the dongle's PHY reports link and no lease has landed, build the stack if needed and run the same
+/// chunked one-shot acquisition (re-armed per try), at most `DHCP_LINK_MAX` tries, one `SOCK-5` line each.
+/// The e1000 path is untouched (its DHCP stays where it was).
+#[cfg(feature = "usbnet")]
+pub fn dhcp_link_tick() {
+    use crate::drivers::xhci::usbnet;
+    if LEASED.load(Ordering::Relaxed) || e1000::nic_present() {
+        return;
+    }
+    if !usbnet::is_up() || (usbnet::kind() == usbnet::KIND_AX88179 && !usbnet::link_up()) {
+        return;
+    }
+    if DHCP_LINK_TRIES.fetch_add(1, Ordering::Relaxed) >= DHCP_LINK_MAX {
+        return;
+    }
+    {
+        let mut g = STACK.lock();
+        if !ensure_stack(&mut g) {
+            return;
+        }
+    }
+    DHCP_ATTEMPTED.store(false, Ordering::Release);
+    dhcp_acquire();
+}
