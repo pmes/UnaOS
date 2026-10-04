@@ -39,6 +39,9 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod rules;
+pub mod schema;
+
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
