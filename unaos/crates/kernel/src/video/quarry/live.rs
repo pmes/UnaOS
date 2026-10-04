@@ -702,6 +702,8 @@ fn kind_token(mime: &str) -> &'static str {
         ft::LINUX_ELF => "linux",
         ft::IMAGE_PNG => "png",
         ft::AUDIO_WAV => "wav",
+        ft::APP_JSON => "json", // QUARRY2 (B336)
+        ft::IMAGE_GIF => "gif", // QUARRY2 (B336)
         m if m.starts_with("text/") => "text",
         _ => "unknown",
     }
@@ -1152,6 +1154,7 @@ impl Model {
                 self.err = Some(e);
             }
         }
+        columns::after_show(self); // QUARRY2 (B336): the TYPE/ORIGIN facts and the sort, derived from the listing just read
     }
 
     /// Navigate the list pane into `path` AND reveal it in the tree when the tree already carries it,
@@ -1703,7 +1706,7 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     // QUARRYFONT — the two units, named apart. `cell_w` is the glyph ADVANCE and drives every column
     // count and clip below; `mark_w` is the disclosure triangle's width and drives the indent ladder.
     // They were one number (`cell()`) only because a doubled 8x8 bitmap is square.
-    let cell_w = g.cell_w();
+    let _cell_w = g.cell_w(); // QUARRY2 (B336): the list columns read it inside `columns::layout` now
     let mark_w = g.mark_w();
     let row_h = g.row_h();
 
@@ -1774,82 +1777,7 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     keyline(px, g, lp, theme::FRAME_LINE);
     let lvis = m.list_visible();
     let lsb = if m.list.len() > lvis { SBW } else { 0 };
-    let cols_w = li.w.saturating_sub(lsb).saturating_sub(2 * PAD);
-    // Columns degrade rather than overlap: the date goes first, then the size, so a narrow pane still
-    // shows names instead of three columns of ellipsis.
-    let (size_cols, date_cols) = if cols_w >= 34 * cell_w {
-        (9usize, 16usize)
-    } else if cols_w >= 22 * cell_w {
-        (9, 0)
-    } else {
-        (0, 0)
-    };
-    let name_cols = (cols_w / cell_w).saturating_sub(size_cols + date_cols + 2);
-    let name_x = li.x + PAD;
-    let size_x = name_x + (name_cols + 1) * cell_w;
-    let date_x = size_x + (size_cols + 1) * cell_w;
-    let clip = li.x + li.w - lsb;
-
-    // Header — outside the scrolled band by construction, so a scrolled list never loses its columns.
-    fill(px, g, li.x, li.y, li.w, row_h, theme::CHROME_FACE);
-    fill(px, g, li.x, li.y + row_h - 1, li.w, 1, theme::FRAME_LINE);
-    text(px, g, name_x, li.y + g.ts, b"NAME", clip, theme::TITLE_TEXT_INACTIVE);
-    if size_cols > 0 {
-        text(px, g, size_x, li.y + g.ts, b"SIZE", clip, theme::TITLE_TEXT_INACTIVE);
-    }
-    if date_cols > 0 {
-        text(px, g, date_x, li.y + g.ts, b"MODIFIED", clip, theme::TITLE_TEXT_INACTIVE);
-    }
-    let body_y = li.y + row_h;
-
-    if let Some(e) = &m.err {
-        text(px, g, name_x, body_y + g.ts, e.as_bytes(), clip, theme::CONTROL_CLOSE);
-    } else {
-        for r in 0..lvis {
-            let i = m.list_scroll + r;
-            if i >= m.list.len() {
-                break;
-            }
-            let ent = &m.list[i];
-            let y = body_y + r * row_h;
-            let sel = i == m.list_sel;
-            if sel {
-                let c = if m.focus == Pane::List { theme::ACCENT } else { theme::SCROLL_THUMB };
-                fill(px, g, li.x, y, li.w - lsb, row_h, c);
-            }
-            let ink = if sel && m.focus == Pane::List {
-                theme::CHROME_FACE
-            } else {
-                theme::CONTENT_TEXT
-            };
-            let dir = matches!(ent.kind, NodeKind::Dir);
-            let mut nm: Vec<u8> = Vec::new();
-            nm.extend_from_slice(ent.name.as_bytes());
-            // `ls -F`'s two marks, and they are the row's whole contract with the pointer: `/` is
-            // "double-click descends", `*` is "double-click RUNS this". A window that starts programs
-            // must show which rows start programs — an operator should never have to discover that
-            // by double-clicking and finding out.
-            if dir {
-                nm.push(b'/');
-            } else if is_executable(&ent.name) {
-                nm.push(b'*');
-            }
-            nm.truncate(name_cols);
-            text(px, g, name_x, y + g.ts, &nm, size_x.min(clip), ink);
-            if size_cols > 0 {
-                let s = if dir {
-                    alloc::format!("{:>1$}", "--", size_cols)
-                } else {
-                    size_field(ent.size, size_cols)
-                };
-                text(px, g, size_x, y + g.ts, s.as_bytes(), date_x.min(clip), ink);
-            }
-            if date_cols > 0 {
-                let d = mtime_field(ent.mtime.as_ref());
-                text(px, g, date_x, y + g.ts, d.as_bytes(), clip, ink);
-            }
-        }
-    }
+    let body_y = columns::paint_list(m, px, li, lsb, lvis); // QUARRY2 (B336): the header (sortable, with a chevron) and the NAME SIZE MODIFIED TYPE ORIGIN columns
     paint_scrollbar(px, g, li, body_y, m.list.len(), lvis, m.list_scroll);
     ops::paint_overlay(m, px); // QUARRYOPS — the context menu and the inline edit field, over the finished frame
 }
@@ -2258,6 +2186,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
         key_witness(c, true, true);
         return true;
     }
+    if columns::key(c) { key_witness(c, true, true); repaint(); return true; } // QUARRY2 (B336): `s` sort column, `[`/`]` column width
     let mut acted = true;
     let mut refreshed = false;
     // Decided under the lock, run without it — see [`Act`].
@@ -2690,6 +2619,7 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
             m.settle();
             return Act::None;
         }
+        if sy < body_y && columns::header_press(m, sx) { m.settle(); return Act::None; } // QUARRY2 (B336): a header press sorts by its column
         if sy < body_y {
             return Act::None; // the header is not a row
         }
@@ -2930,6 +2860,7 @@ pub fn service() {
     crate::video::textedit::service();
     // ACTIVITY (R75) — the once-a-second census repaint rides the same pass.
     crate::video::activity::service();
+    columns::service(); // QUARRY2 (B336): the latched column-width / sort preference write
 }
 
 // ── The witness ─────────────────────────────────────────────────────────────────────────────────
@@ -4248,3 +4179,8 @@ pub fn fileopen_selftest() {
 // `Act` without widening them. CHARTER in its header.
 #[path = "openers.rs"]
 pub mod openers;
+
+// QUARRY2 (B336): the list view's columns, header sort and their preference — a child module like
+// `ops`/`openers`, so it reaches the model and the painter's helpers without widening them.
+#[path = "columns.rs"]
+pub mod columns;
