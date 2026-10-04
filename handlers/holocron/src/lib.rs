@@ -17,10 +17,27 @@
 //! every subscriber would see every reply. Holocron's bus is point-to-point and principal-stamped.
 #![feature(peer_credentials_unix_socket)]
 
-
-
+pub mod client;
+pub mod daemon;
 pub mod principal;
 pub mod store;
 pub mod unafs_store;
 
 pub use holocron_core;
+
+/// The sealer the host daemon runs: CRYPTOCORE with `--features crypto_core` (after SR27 folds), the
+/// INSECURE test suite otherwise — which the daemon announces on every start.
+#[cfg(feature = "crypto_core")]
+pub type HostSealer = holocron_core::cc::CryptoCore;
+/// The signer the host daemon runs.
+#[cfg(feature = "crypto_core")]
+pub type HostSigner = holocron_core::cc::CryptoCore;
+/// The sealer the host daemon runs: CRYPTOCORE with `--features crypto_core` (after SR27 folds), the
+/// INSECURE test suite otherwise — which the daemon announces on every start.
+#[cfg(not(feature = "crypto_core"))]
+pub type HostSealer = holocron_core::testseal::TestSealer;
+/// The signer the host daemon runs.
+#[cfg(not(feature = "crypto_core"))]
+pub type HostSigner = holocron_core::testseal::TestSigner;
+/// The host service: the host suite over the `~/.holocron` directory and `/dev/urandom`.
+pub type HostHolocron = holocron_core::service::Holocron<HostSealer, HostSigner, store::DirStore, daemon::OsEntropy>;

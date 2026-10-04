@@ -13,3 +13,8 @@ description = "Holocron (CODEX §2, The Key): the host keyring daemon, its Unix-
 holocron_core = { path = "../../unaos/libs/sys/holocron_core" }
 # The no_std core of UnaFS only (the `std` feature would pull gneiss_pal's network stack into a keyring).
 unafs = { path = "../../unaos/libs/fs/unafs", default-features = false }
+
+[features]
+default = []
+# The SR27 fold: the daemon runs CRYPTOCORE instead of the TEST suite.
+crypto_core = ["holocron_core/crypto_core"]
