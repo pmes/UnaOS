@@ -266,6 +266,7 @@ cat <<'TABLE'
 witness|:: U1a: no application processors online — ring-3 demo SKIPPED ::|!baremetal,!bootlog,!usbdebug@except:x86_64+wc,!tegra|measured(1)
 wc|[wc-x] desktop-app DECLINE reason=no-storage name=/|-|measured(1)
 linuxabi|:: LINUXABI: path=|-|measured(1)
+busreg|:: BANDY3: registered=|-|measured
 wcg-paygo|[wc-g] paygo win=|witness|measured
 wcdvalve|[wc-d] valve CLOSED util~|witness|measured
 logts|:: LOGWIT-1 probe seq=|witness|measured
@@ -381,7 +382,7 @@ REGISTERED
 bc_controls() {
 cat <<'CONTROLS'
 instgui|[wc-x] instgui install-go with NO committed target
-selfhost|:: SELFHOST: src payload holds no regular files -> FAIL ::
+selfhost|:: SELFHOST:|-|measured
 holocron|:: [hcron] framing fixture leg=roundtrip -> FAIL
 videobench|:: vperf: fbmem no framebuffer registered ::
 irqstorage|irqstorage::submit called off a scheduled task
