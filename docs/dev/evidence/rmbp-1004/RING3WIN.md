@@ -41,16 +41,18 @@ buffers) cannot exist on the metal; LUMEN.BIN and VEIN.BIN hit the same wall.
   PD[1] and PD[2] of the slot's existing PDPT/PD, two PTs per slot in `.bss` (12 × 2 × 4 KiB = 96 KiB).
   `USER_XWIN_OFF = 0x200000` and `USER_WINDOW_BYTES = 4 MiB` live in `una-abi` (one number for kernel, user
   crates and arroyo).
-* **Which model a program gets** is decided by where its ELF asks to be: `min PT_LOAD p_vaddr >= 0x200000` ⇒
-  **elf model** (p_vaddr is the offset from the window base; the classic `base - min_vaddr` bias equals that
-  for every shipped image, which links at 0). Anything else ⇒ **fixed model**, the old path byte-for-byte.
+* **Which model a program gets** is decided by where its ELF asks to be: `min PT_LOAD p_vaddr >=
+  USER_XWIN_VA_X86` (= 0x10000200000, USER_BASE + 2 MiB) ⇒ **elf model**: the program LINKS at its real
+  ring-3 address, so absolute pointers in its data (vtables, `core::fmt`, `&str` in statics) are right with
+  no relocation — what a 78 KiB TLS client needs, and the linuxabi shape (fixed vaddrs). Anything else ⇒
+  **fixed model**, the old path byte-for-byte.
   Every existing program (STAT, VUG/VUGC/VUGX/VUGK, PULSE, PREFS, HELLO.BIN flat) links at 0 and stays fixed.
 * **Elf model.** Each PT_LOAD page is mapped on demand from the kernel heap (`alloc_zeroed`, 4 KiB-aligned —
   the same allocator linuxabi's `AddrSpace` uses), copied through the identity alias, BSS zeroed, leaf W/X from
   the segment flags (a page two segments share takes the union; W+X is refused). Stack at the XWIN top, sized
   by `PT_GNU_STACK.p_memsz` (`-z stack-size=`) or a 64 KiB default, clamped to 1 MiB, mapped eagerly, with one
   unmapped guard page beneath. Heap = `SYS_SBRK` from the page after the highest segment up to the guard.
-  The program finds its classic landmarks as `base = _start_page - 0x200000` (it may still open windows).
+  Its classic landmarks are at the fixed `una_abi::USER_BASE_X86 + 0x4000/0x5000` (it may still open windows).
 * **Fixed model gets a heap too.** Its `SYS_SBRK` break starts at `base + 0x200000` and may use the whole 4 MiB
   XWIN (its stack stays in the classic window). So `alloc` works for a small program without relinking.
 * **Cap.** Image span + stack (+ guard) > 4 MiB ⇒ refused at load with `-ENOMEM` and a line
@@ -111,3 +113,68 @@ The only new reachable surface for an old program is `SYS_SBRK` (which it never 
 (fixture: `tests ring3win` — reads `/apps/BIG.BIN`, runs it, checks the exit checksum against the kernel's own
 computation, waits for the slot release and asserts the XWIN live-frame count returned to its value before the
 launch.)
+
+## M2–M4 as built
+
+* Kernel (`arch/x86_64/memory.rs` tail): `SLOT_XPT[12][2]` static PTs, `xwin_map_page` / `xwin_copy_in` /
+  `xwin_free` / `xwin_set_heap` / `sys_sbrk`, live-frame counter `xwin_live_pages()`; teardown hook on the
+  `clear_slot_fb` line of `free_user_space_by_cr3`. `elf.rs`: `PT_GNU_STACK` read, `validate_elf_model`
+  (rebases to window offsets), `map_elf_model`; the fixed path also arms the XWIN heap. `syscall.rs`:
+  `SYS_SBRK` arm (same-line fold on `SYS_CLOSE`), `user_range_ok` admits the XWIN, `user_image_cap()`;
+  `shell.rs` / `desktop_uefi.rs` readers cap at it. Load line `:: RING3WIN: model=elf slot=… segs=… span=…
+  stack=… heap=[…) frames=… ::`; refusals `:: RING3WIN: refused … -ENOMEM ::`.
+* arroyo: `USER_WINDOW_BYTES=4194304`, `USER_XWIN_VA_X86`, `user_elf_window_check` (replaces the four x86
+  `[ size -le 16384 ]` asserts; reads the PT_LOAD layout: fixed span <= 16384, elf span + stack + guard <=
+  cap), `build_user_big_x86` called beside `build_user_prefs_x86` at all five sites; `check` runs
+  `scripts/window-parity.sh` beside knob-parity (una-abi = kernel-derived = arroyo = builder; negative
+  control: arroyo at 16384 ⇒ rc=1).
+* `crates/user-big` → `target/BIG-X86.ELF` → `APPS/BIG.BIN` (ESP + DATA). lld drops PT_GNU_STACK's size when
+  the script has a PHDRS clause (measured: p_memsz 0), so `user-big-x86.ld` has none and lld fills it from
+  `-z stack-size=0x40000`.
+
+### Every x86 program against the new cap (measured by `user_elf_window_check`)
+
+| image | file | model | in-window span | against |
+|---|---|---|---|---|
+| STAT-X86.ELF | 8472 | fixed | 4112 | 16384 |
+| VUG-X86.ELF | 12664 | fixed | 13588 | 16384 |
+| VUGC-X86.ELF | 12664 | fixed | 12540 | 16384 |
+| VUGX-X86.ELF | 12664 | fixed | 13588 | 16384 |
+| VUGK-X86.ELF | 12664 | fixed | 12832 | 16384 |
+| PULSE-X86.ELF | 12568 | fixed | 9760 | 16384 |
+| PREFS-X86.ELF | 8704 | fixed | 9428 | 16384 |
+| HELLO.BIN (flat) | 72 | flat | 72 | 4096 |
+| BIG-X86.ELF | 12640 | elf | 73744 + 262144 stack + 4096 guard = 339984 | 4194304 |
+
+All existing programs are unchanged (fixed model, same bytes, same layout). NET.BIN / LUMEN.BIN / VEIN.BIN are
+in parallel arcs and not in this tree; MIDDEN.BIN is aarch64 (untouched).
+
+### NETRING3's TLS note
+
+`tls=skip reason=window` → **unblocked: the spike fits.** `embedded-tls` ≈ 78 KiB code + ≈ 20 KiB buffers ≈
+98 KiB of image span; linked at `USER_XWIN_VA_X86` with the 64 KiB default stack and a guard page that is
+≈ 167 KiB against a 4 MiB window (≈ 4 %), and its record buffers can live on the `SYS_SBRK` heap instead. NET.BIN
+moves to the elf model by swapping its linker script for the `user-big-x86.ld` shape (absolute link VA, no
+PHDRS) — no kernel knob. (NETRING3's branch is not edited here; the fold carries this.)
+
+## Proof (metal; R78 — no QEMU)
+
+`tests ring3win` on a boot whose DATA volume carries `APPS/BIG.BIN`:
+
+```
+:: RING3WIN: model=elf slot=<s> segs=3 span=73744 stack=262144 heap=[0x10000213000,0x100005bf000) frames=<n> ::
+BIG: static=ok fnv=<n> stack=ok sbrk=<>=102400> cap=refused
+:: RING3WIN: sbrk refused slot=<s> brk=… delta=8388608 cap=… -ENOMEM ::
+[ring3win] status=Some(..) bits=0xf fnv_want=… ck_ok=true live0=0 live1=0 freed_pages=<n> heap=<bytes>
+:: RING3WIN: model=elf window=4194304 big_ok=1 sbrk=<bytes> freed=1 -> PASS ::
+```
+
+Without BIG.BIN on the volume: `:: RING3WIN: … reason=no-big-bin -> SKIP ::`.
+
+## Owed
+
+* aarch64: the ELF window and `SYS_SBRK` (the number is minted; the arm answers `-ENOSYS`).
+* One `crate::elf` validator for x86 UnaOS, aarch64 UnaOS and linuxabi (the R28 "one mapper" fold).
+* `SYS_SBRK` on a fixed-model program is reachable but untested by a shipped program (BIG is elf-model).
+* Free-on-shrink is page-granular and the user allocator in BIG is a bump (no free); a real user `alloc`
+  crate (linked_list over sbrk) is the next consumer's to choose.
