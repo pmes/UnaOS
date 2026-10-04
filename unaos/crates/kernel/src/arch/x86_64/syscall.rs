@@ -10325,7 +10325,7 @@ pub fn init() {
     }
     if !SMEP_LOGGED.swap(true, Ordering::Relaxed) {
         if smep {
-            serial_println!(":: SMEP on ::");
+            crate::bootlog_println!(":: SMEP on ::");
         } else {
             serial_println!(":: SMEP unsupported (TCG?) — metal Ivy Bridge has it ::");
         }
@@ -10387,7 +10387,7 @@ pub fn init() {
         core::arch::asm!("mov dr7, {0}", in(reg) 0u64, options(nomem, nostack, preserves_flags));
     }
     if !DR7_LOGGED.swap(true, Ordering::Relaxed) {
-        serial_println!(":: U2.5-0: DR7 cleared ::");
+        crate::bootlog_println!(":: U2.5-0: DR7 cleared ::");
     }
 }
 
@@ -10741,7 +10741,7 @@ pub fn clock_x1_witness() {
     // `:: CLOCK-X1:` line is a boot that never reached a service pass — the same reading as a
     // missing `:: BPACE:` ledger block, and it is stated here so the absence is legible rather than
     // silent (bootpace.md §8e).
-    serial_println!(
+    crate::bootlog_println!(
         ":: CLOCK-X1: TSC invariant, ~{} MHz; uptime {} s SAMPLED — second-advance DEFERRED to the first service pass (pay-as-you-go; a capture with no verdict line below never reached one) == witness ::",
         mhz, u1
     );
@@ -10828,7 +10828,7 @@ pub fn clock_x1_poll() {
         // are printed so "the APIC is dead as well" is legible rather than inferred.
         if elapsed_ms >= CLOCK_X1_FROZEN_MS || (hz != 0 && b.wrapping_sub(a) >= hz * 3) {
             if claim_clock_x1_verdict() {
-                serial_println!(
+                crate::bootlog_println!(
                     ":: CLOCK-X1: FROZEN — uptime still {} s after {} ms APIC / {} ms TSC (rdtsc +{}, core={}); the JD17 second derivation does NOT advance == witness ::",
                     u1, elapsed_ms, tsc_ms, b.wrapping_sub(a), core
                 );
@@ -21534,7 +21534,7 @@ fn u8x_launcher(demo_cpu: usize) {
     // WINX-6b: the headless ELF-loader witness. WINX-2 above needs a block device the headless x86 run
     // does not have, so this one synthesizes a real multi-segment ELF64 in memory and pushes it through
     // the same `spawn_user_image_bg`, keeping the loader proven in CI rather than only at the bench.
-    winx3_launcher(demo_cpu);
+    crate::tests::register("winx3", || winx3_launcher(TESTS_DEMO_CPU.load(Ordering::Relaxed))); // QUIETBOOT2 (B325, R80): a boot fixture — `tests winx3` fires it.
 
     // WINX-7: the threads + futex + input fixture, after the loader witness so the machinery it
     // builds on is proved first. Unconditional and headless-complete — it needs no block device and

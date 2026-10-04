@@ -38,7 +38,7 @@ pub unsafe fn takeover_display(
     _allocator: &mut VramAllocator,
     kdisp_trace: &mut [u32; 7],
 ) -> Option<usize> {
-    serial_println!(":: kdisp: begin-trace ::");
+    crate::census_println!(":: kdisp: begin-trace ::");
 
     // Note: Five early return paths exist in this function. If an early return
     // fires, the inner phase sum will not match the outer kdisp_takeover delta.
@@ -46,7 +46,7 @@ pub unsafe fn takeover_display(
     macro_rules! kdisp_phase {
         ($name:expr) => {
             let t_now = crate::arch::ms();
-            serial_println!(":: kdisp: inner phase={} d={} ::", $name, t_now.wrapping_sub(t_last));
+            crate::census_println!(":: kdisp: inner phase={} d={} ::", $name, t_now.wrapping_sub(t_last));
             t_last = t_now;
         }
     }
@@ -55,7 +55,7 @@ pub unsafe fn takeover_display(
     let caps = mmio_read(bar0, regs::NV_PDISPLAY_BASE + 0x0000);
     let version = caps & 0xFFFF;
     let class_id = (caps >> 16) & 0xFFFF;
-    serial_println!(":: kdisp: caps version={:04X} class={:04X} ::", version, class_id);
+    crate::census_println!(":: kdisp: caps version={:04X} class={:04X} ::", version, class_id);
     // GK107 should report VERSION=0x0210, CLASS=0x917D (GK104_DISPLAY_MASTER).
 
     // ── Locate GOP FB ──────────────────────────────────────────────────
@@ -83,7 +83,7 @@ pub unsafe fn takeover_display(
     let gop_vram_offset = (gop_fb_phys - vram_base as u64) as usize;
     let expected_addr = (gop_vram_offset >> 8) as u32;
     let expected_phys = (gop_fb_phys >> 8) as u32;
-    serial_println!(":: kdisp: gop phys={:X} vram_off={:X} expected_addr={:08X} ::",
+    crate::census_println!(":: kdisp: gop phys={:X} vram_off={:X} expected_addr={:08X} ::",
         gop_fb_phys, gop_vram_offset, expected_addr);
 
     // ── Per-head read-only scan ────────────────────────────────────────
@@ -120,7 +120,7 @@ pub unsafe fn takeover_display(
         let evo_addr    = mmio_read(bar0, evo_base + 0x0);  // OFFSET_ORIGIN
         let evo_size    = mmio_read(bar0, evo_base + 0x8);  // SIZE
         let evo_storage = mmio_read(bar0, evo_base + 0xC);  // STORAGE
-        serial_println!(":: kdisp: head[{}] evo addr={:08X} size={:08X} storage={:08X} ::",
+        crate::census_println!(":: kdisp: head[{}] evo addr={:08X} size={:08X} storage={:08X} ::",
             head, evo_addr, evo_size, evo_storage);
 
         // ── Candidate B: HEAD_VAL (pre-GF119 layout) ──
@@ -128,7 +128,7 @@ pub unsafe fn takeover_display(
         let hv_fb_pos  = mmio_read(bar0, hv_base + 0x128); // FB_POS
         let hv_fb_size = mmio_read(bar0, hv_base + 0x118); // FB_SIZE
         let hv_fb_pitch = mmio_read(bar0, hv_base + 0x120); // FB_PITCH
-        serial_println!(":: kdisp: head[{}] hv  fb_pos={:08X} fb_size={:08X} fb_pitch={:08X} ::",
+        crate::census_println!(":: kdisp: head[{}] hv  fb_pos={:08X} fb_size={:08X} fb_pitch={:08X} ::",
             head, hv_fb_pos, hv_fb_size, hv_fb_pitch);
 
         // ── HEAD_STAT (always valid per rnndb, stride 0x800, GK104 length 4) ──
@@ -137,7 +137,7 @@ pub unsafe fn takeover_display(
         let underflow   = mmio_read(bar0, hs_base + 0x308); // REPORT_UNDERFLOW
         let vert        = mmio_read(bar0, hs_base + 0x340); // VERT (vline[15:0], vblank_count[31:16])
         let horz        = mmio_read(bar0, hs_base + 0x344); // HORZ (hline[15:0])
-        serial_println!(":: kdisp: head[{}] stat underflow={:08X} vert={:08X} horz={:08X} ::",
+        crate::census_println!(":: kdisp: head[{}] stat underflow={:08X} vert={:08X} horz={:08X} ::",
             head, underflow, vert, horz);
 
         // ── Match logic: try candidate A first, fall back to B ──
@@ -146,17 +146,17 @@ pub unsafe fn takeover_display(
         } else if is_live(hv_fb_pos) {
             (hv_fb_pos, hv_fb_size, 0u32, "hv")
         } else {
-            serial_println!(":: kdisp: head[{}] skip — no live candidate ::", head);
+            crate::census_println!(":: kdisp: head[{}] skip — no live candidate ::", head);
             continue;
         };
 
         if !is_live(size) {
-            serial_println!(":: kdisp: head[{}] skip — size sentinel {:08X} ::", head, size);
+            crate::census_println!(":: kdisp: head[{}] skip — size sentinel {:08X} ::", head, size);
             continue;
         }
 
         if addr == expected_addr || addr == expected_phys {
-            serial_println!(":: kdisp: head[{}] MATCH via {} addr={:08X} ::", head, label, addr);
+            crate::census_println!(":: kdisp: head[{}] MATCH via {} addr={:08X} ::", head, label, addr);
             found_head = Some(head);
             matched_addr = addr;
             matched_size = size;
@@ -187,7 +187,7 @@ pub unsafe fn takeover_display(
         kdisp_trace[1] = 0xFFFF;
         for s in kdisp_trace[2..].iter_mut() { *s = SENTINEL; }
     }
-    serial_println!(":: kdisp: trace [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] ::",
+    crate::census_println!(":: kdisp: trace [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] ::",
         kdisp_trace[0], kdisp_trace[1], kdisp_trace[2], kdisp_trace[3],
         kdisp_trace[4], kdisp_trace[5], kdisp_trace[6]);
 
@@ -197,10 +197,10 @@ pub unsafe fn takeover_display(
         let mut rows = 0;
         for addr in (0x610480..=0x6104FC).step_by(4) {
             let val = mmio_read(bar0, addr);
-            serial_println!(":: kdisp: evo-core pass{} off={:03X} val={:08X} ::", pass, addr - 0x610480, val);
+            crate::census_println!(":: kdisp: evo-core pass{} off={:03X} val={:08X} ::", pass, addr - 0x610480, val);
             rows += 1;
         }
-        serial_println!(":: kdisp: evo-core pass{} done rows={} ::", pass, rows);
+        crate::census_println!(":: kdisp: evo-core pass{} done rows={} ::", pass, rows);
 
         if pass == 0 {
             for _ in 0..2_000_000 { core::hint::spin_loop(); }
@@ -229,17 +229,17 @@ pub unsafe fn takeover_display(
         if !keyname.is_empty() {
             hits += 1;
             if hits <= 64 {
-                serial_println!(":: kdisp: evo-scan hit off={:06X} val={:08X} key={} ::", addr, val, keyname);
+                crate::census_println!(":: kdisp: evo-scan hit off={:06X} val={:08X} key={} ::", addr, val, keyname);
             }
         }
     }
     let capped = if hits > 64 { "true" } else { "false" };
-    serial_println!(":: kdisp: evo-scan done range=610000-613FFC hits={} capped={} ::", hits, capped);
+    crate::census_println!(":: kdisp: evo-scan done range=610000-613FFC hits={} capped={} ::", hits, capped);
     kdisp_phase!("evo_scan");
 
     // ── Phase 2: Assembly Write + UPDATE Latch (Pull 11) ────────────────────
     if !cfg!(feature = "nvidia-kepler-takeover") {
-        serial_println!(":: kdisp: trace-only — takeover feature not set ::");
+        crate::census_println!(":: kdisp: trace-only — takeover feature not set ::");
         return None;
     }
 
@@ -257,18 +257,18 @@ pub unsafe fn takeover_display(
     let fbcon_stride = gop_info.stride as u32;
     let fbcon_bpp = gop_info.bytes_per_pixel as u32;
     let fbcon_row_bytes = fbcon_stride * fbcon_bpp;
-    serial_println!(":: kdisp: fbcon-view base={:016X} stride_px={} bpp={} w={} h={} row_bytes={} ::",
+    crate::census_println!(":: kdisp: fbcon-view base={:016X} stride_px={} bpp={} w={} h={} row_bytes={} ::",
         crate::video::fbcon::current_base().unwrap_or(0), fbcon_stride, fbcon_bpp, expected_width, expected_height, fbcon_row_bytes);
     
     let hw_pitch = 16384;
-    serial_println!(":: kdisp: fbcon-vs-hw row_bytes={} hw_pitch={} match={} ::",
+    crate::census_println!(":: kdisp: fbcon-vs-hw row_bytes={} hw_pitch={} match={} ::",
         fbcon_row_bytes, hw_pitch, fbcon_row_bytes == hw_pitch);
     let fb_size = (expected_width * expected_height * 4) as usize;
 
     let bar1 = vram_base;
     let dst = (bar1 + gop_vram_offset) as *mut u8;
     
-    serial_println!(":: kdisp: surf2 geom w={} h={} pitch={} ::", expected_width, expected_height, expected_pitch);
+    crate::census_println!(":: kdisp: surf2 geom w={} h={} pitch={} ::", expected_width, expected_height, expected_pitch);
     
     // (GOB constants removed — s25 mirror decode proved the scanout is
     // LINEAR pitch 0x4000; block-linear road retired.)
@@ -282,7 +282,7 @@ pub unsafe fn takeover_display(
     let pre_asm = mmio_read(bar0, asm_reg);
     let pre_armed = mmio_read(bar0, armed_reg);
     let pre_shadow = mmio_read(bar0, shadow_reg);
-    serial_println!(":: kdisp: latch pre asm={:08X} armed={:08X} shadow={:08X} ::", pre_asm, pre_armed, pre_shadow);
+    crate::census_println!(":: kdisp: latch pre asm={:08X} armed={:08X} shadow={:08X} ::", pre_asm, pre_armed, pre_shadow);
 
     // ── SHUTRESTORE (R19) — the deleted display rungs, back behind their own knobs ──────────
     // RULINGS R19: a rung that FAILED once keeps its CODE and its KNOB, because many boots later a
@@ -305,7 +305,7 @@ pub unsafe fn takeover_display(
         for offset in (0x400..=0x5FC).step_by(4) {
             let val = mmio_read(bar0, 0x640000 + offset);
             let abs = if val == 0xFFFFFFFF || (val & 0xFFFF0000) == 0xBAD00000 { " ABSENT?" } else { "" };
-            serial_println!(":: kdisp: mirror-sp off={:03X} val={:08X}{} ::", offset, val, abs);
+            crate::census_println!(":: kdisp: mirror-sp off={:03X} val={:08X}{} ::", offset, val, abs);
         }
 
         // Settle
@@ -315,12 +315,12 @@ pub unsafe fn takeover_display(
         for offset in (0x400..=0x5FC).step_by(4) {
             let val = mmio_read(bar0, 0x640000 + offset);
             let abs = if val == 0xFFFFFFFF || (val & 0xFFFF0000) == 0xBAD00000 { " ABSENT?" } else { "" };
-            serial_println!(":: kdisp: mirror-sp2 off={:03X} val={:08X}{} ::", offset, val, abs);
+            crate::census_println!(":: kdisp: mirror-sp2 off={:03X} val={:08X}{} ::", offset, val, abs);
         }
 
         // Pass 3: Cross-Check Candidates
         let ptr_val = mmio_read(bar0, 0x640460);
-        serial_println!(":: kdisp: mirror-sp ptr-slot val={:08X} expect=00090000-ish (fw surface ptr>>8?) ::", ptr_val);
+        crate::census_println!(":: kdisp: mirror-sp ptr-slot val={:08X} expect=00090000-ish (fw surface ptr>>8?) ::", ptr_val);
 
         for offset in (0x400..=0x5FC).step_by(4) {
             let val = mmio_read(bar0, 0x640000 + offset);
@@ -336,7 +336,7 @@ pub unsafe fn takeover_display(
             }
             
             if !kind.is_empty() {
-                serial_println!(":: kdisp: mirror-sp cand off={:03X} val={:08X} kind={} ::", offset, val, kind);
+                crate::census_println!(":: kdisp: mirror-sp cand off={:03X} val={:08X} kind={} ::", offset, val, kind);
             }
         }
     }
@@ -412,7 +412,7 @@ pub unsafe fn takeover_display(
     }
     kdisp_phase!("blit");
 
-    serial_println!(":: kdisp: fb-draw base={:08X} pitch={} rows={} bytes={:08X} ::", gop_vram_offset, pitch_bytes, expected_height, total_bytes);
+    crate::census_println!(":: kdisp: fb-draw base={:08X} pitch={} rows={} bytes={:08X} ::", gop_vram_offset, pitch_bytes, expected_height, total_bytes);
 
     // Overlap check (intentional for fb-draw)
     let gop_bytes = (expected_height * pitch_bytes) as usize;
@@ -421,7 +421,7 @@ pub unsafe fn takeover_display(
     // yes and no longer informative. The live question is whether our extent
     // exactly covers the scanned surface — a mismatch means rows are missing
     // off the bottom or we are writing past the FB into allocator territory.
-    serial_println!(":: kdisp: fb-draw cover={} ours={:08X}+{:08X} gop={:08X}+{:08X} ::",
+    crate::census_println!(":: kdisp: fb-draw cover={} ours={:08X}+{:08X} gop={:08X}+{:08X} ::",
         if surf2_bytes == gop_bytes { "exact" } else { "SIZE-MISMATCH" },
         gop_vram_offset, total_bytes, gop_vram_offset, gop_bytes);
 
@@ -440,32 +440,32 @@ pub unsafe fn takeover_display(
     // Predictions with hold off: kepler=1521 -> ~400 ms, gui=3408 -> ~2290 ms — which would be the largest single boot win left on the machine.
     #[cfg(feature = "nvidia-kepler-kdisp-hold")]
     {
-        serial_println!(":: kdisp: fb-draw hold begin (photo A — full panel calibration) ::");
+        crate::census_println!(":: kdisp: fb-draw hold begin (photo A — full panel calibration) ::");
         for t in 1..=5 {
             for _ in 0..60_000_000 { core::hint::spin_loop(); }
-            serial_println!(":: kdisp: fb-draw hold t={}/5 (1.12s total) ::", t);
+            crate::census_println!(":: kdisp: fb-draw hold t={}/5 (1.12s total) ::", t);
             // Dump on the FIRST and LAST tick
             if t == 1 || t == 5 {
-                serial_println!(":: kdisp: fb-draw reg-dump t={} ptr={:08X} ptr_hi={:08X} size={:08X} store={:08X} fmt={:08X} ::",
+                crate::census_println!(":: kdisp: fb-draw reg-dump t={} ptr={:08X} ptr_hi={:08X} size={:08X} store={:08X} fmt={:08X} ::",
                     t,
                     mmio_read(bar0, 0x640460),
                     mmio_read(bar0, 0x640464),
                     mmio_read(bar0, 0x640468),
                     mmio_read(bar0, 0x64046C),
                     mmio_read(bar0, 0x640470));
-                serial_println!(":: kdisp: fb-draw reg-dump t={} armed={:08X} shadow={:08X} ::",
+                crate::census_println!(":: kdisp: fb-draw reg-dump t={} armed={:08X} shadow={:08X} ::",
                     t, mmio_read(bar0, armed_reg), mmio_read(bar0, shadow_reg));
                 for off in (0x4B8..=0x4C8).step_by(4) {
-                    serial_println!(":: kdisp: fb-draw reg-dump off={:03X} val={:08X} ::", off, mmio_read(bar0, 0x640000 + off));
+                    crate::census_println!(":: kdisp: fb-draw reg-dump off={:03X} val={:08X} ::", off, mmio_read(bar0, 0x640000 + off));
                 }
                 // Which head is actually live: the one whose vline/vblank advances.
                 for h in 0..4usize {
                     let vert = mmio_read(bar0, 0x610000 + 0x6000 + h * 0x800 + 0x340);
-                    serial_println!(":: kdisp: fb-draw head-stat t={} h={} vert={:08X} ::", t, h, vert);
+                    crate::census_println!(":: kdisp: fb-draw head-stat t={} h={} vert={:08X} ::", t, h, vert);
                 }
             }
         }
-        serial_println!(":: kdisp: fb-draw hold end ::");
+        crate::census_println!(":: kdisp: fb-draw hold end ::");
     }
 
     #[cfg(feature = "nvidia-kepler-kdisp-hold")]
@@ -474,7 +474,7 @@ pub unsafe fn takeover_display(
     let hold_state = "OFF";
 
     kdisp_phase!("nvidia_kepler_kdisp_hold");
-    serial_println!(":: kdisp: inner phase kdisp_hold cfg_hold={} ::", hold_state);
+    crate::census_println!(":: kdisp: inner phase kdisp_hold cfg_hold={} ::", hold_state);
 
     // Pull 20: Draw console-like glyph blocks using the true 16384 pitch
     for y in 64..72 {
@@ -487,9 +487,9 @@ pub unsafe fn takeover_display(
             }
         }
     }
-    serial_println!(":: kdisp: fbcon-probe drawn rows=8 ::");
+    crate::census_println!(":: kdisp: fbcon-probe drawn rows=8 ::");
 
-    serial_println!(":: kdisp: fb-draw done ::");
+    crate::census_println!(":: kdisp: fb-draw done ::");
     kdisp_phase!("glyph_draw");
 
     // CONSOLE-ON-PANEL seam. The calibration pattern above has been drawn, held for its 5 s photo
@@ -498,7 +498,7 @@ pub unsafe fn takeover_display(
     // (see `fbcon::panel_console_resume` for why it was painting nothing before). Everything above
     // this line — the draw, the hold, the register dumps — is untouched.
     let repainted = crate::video::fbcon::panel_console_resume();
-    serial_println!(":: kdisp: console-repaint rows={} ::", repainted);
+    crate::census_println!(":: kdisp: console-repaint rows={} ::", repainted);
     kdisp_phase!("panel_console_resume"); #[cfg(all(feature = "nvidia-kepler", feature = "beam"))] beam_probe(bar0); #[cfg(all(feature = "nvidia-kepler", feature = "nvidia-kepler-kdhead"))] kdhead_probe(bar0, gop_vram_offset, expected_width, expected_height, fbcon_row_bytes); // BEAMX86 (rmbp A5) — the beam source's ONE call site, folded onto this line so the knob-off image cannot shift. Strictly AFTER the console resume (the head is repointed, the pattern cleared, the surface settled, so the raster this samples is the one presents will be ordered against) and strictly BEFORE the compositor activation below, so the first window present is already bracketed. Read-only and bounded: 4 heads x 45 ms = 180 ms, every head sampled even after one ARMS, because a NONE that names only the chosen head is not diagnosable from a flight log and the per-head census is what makes it so. Negligible beside the 1.12 s x5 `fb-draw hold` this same function already spends. ── KDHEAD (register §1 rung KD14) rides the SAME line, for the same reason and in the same shape: its call sits immediately after beam_probe's because the control bracket it scores every head against IS the census beam_probe just published — the same sample, never a second one — and folding it here means a build without `nvidia-kepler-kdhead` keeps this function's line numbering byte-for-byte. Read-only and bounded: 5 candidate blocks x 4 heads x <=4 words, read twice with one settle spin per block; writes=0. Without `beam` the rung still runs its stride census and prints `bracket=absent`, and every decode is withheld — see the tail block for why a bracketless capture may never be read as a statement about a head.
 
     // WC-X86 seam. Strictly AFTER the console resume above, and for the same reason the console
@@ -516,7 +516,7 @@ pub unsafe fn takeover_display(
     let desktop_uefi_state = "OFF";
 
     kdisp_phase!("wcx_activate");
-    serial_println!(":: kdisp: inner phase wcx_activate cfg_wc={} ::", desktop_uefi_state);
+    crate::census_println!(":: kdisp: inner phase wcx_activate cfg_wc={} ::", desktop_uefi_state);
 
     let _ = t_last;
     // Completed fb-draw cycle: return the gop pointer so the late recap
@@ -554,10 +554,10 @@ unsafe fn repoint_surface(bar0: usize, head: usize, gop_vram_offset: usize) {
     let hs_base = regs::NV_PDISPLAY_BASE + 0x6000 + (head * 0x800);
     let pre_vert = mmio_read(bar0, hs_base + 0x340);
     let pre_horz = mmio_read(bar0, hs_base + 0x344);
-    serial_println!(":: kdisp: repoint pre 6101E0={:08X} stat vert={:08X} horz={:08X} ::", orig_ptr, pre_vert, pre_horz);
+    crate::census_println!(":: kdisp: repoint pre 6101E0={:08X} stat vert={:08X} horz={:08X} ::", orig_ptr, pre_vert, pre_horz);
 
     if orig_ptr == 0xFFFFFFFF || (orig_ptr & 0xFFF00000) == 0xBAD00000 {
-        serial_println!(":: kdisp: repoint ABSENT/POISON rb={:08X} — no write attempted ::", orig_ptr);
+        crate::census_println!(":: kdisp: repoint ABSENT/POISON rb={:08X} — no write attempted ::", orig_ptr);
         return;
     }
 
@@ -567,19 +567,19 @@ unsafe fn repoint_surface(bar0: usize, head: usize, gop_vram_offset: usize) {
     let new_ptr = (gop_vram_offset >> 8) as u32;
     mmio_write(bar0, repoint_reg, new_ptr);
     let rb = mmio_read(bar0, repoint_reg);
-    serial_println!(":: kdisp: repoint wrote={:08X} rb={:08X} ::", new_ptr, rb);
+    crate::census_println!(":: kdisp: repoint wrote={:08X} rb={:08X} ::", new_ptr, rb);
 
     // Bounded panel window (~5 s) — the camera length Peter calibrated at s21.
     for t in 1..=5 {
         for _ in 0..60_000_000 { core::hint::spin_loop(); }
         let vert = mmio_read(bar0, hs_base + 0x340);
         let horz = mmio_read(bar0, hs_base + 0x344);
-        serial_println!(":: kdisp: repoint hold t={}s stat vert={:08X} horz={:08X} ::", t, vert, horz);
+        crate::census_println!(":: kdisp: repoint hold t={}s stat vert={:08X} horz={:08X} ::", t, vert, horz);
     }
 
     mmio_write(bar0, repoint_reg, orig_ptr);
     let rb_restored = mmio_read(bar0, repoint_reg);
-    serial_println!(":: kdisp: repoint restored rb={:08X} ::", rb_restored);
+    crate::census_println!(":: kdisp: repoint restored rb={:08X} ::", rb_restored);
 }
 
 /// KD7 — the EVO assembly write + UPDATE latch, restored from bfeedd94.
@@ -608,26 +608,26 @@ unsafe fn latch_arm_update(
     let rb_asm = mmio_read(bar0, asm_reg);
 
     if rb_asm != new_ptr {
-        serial_println!(":: kdisp: latch skip — asm rb={:08X} want={:08X} ::", rb_asm, new_ptr);
+        crate::census_println!(":: kdisp: latch skip — asm rb={:08X} want={:08X} ::", rb_asm, new_ptr);
         let final_asm = mmio_read(bar0, asm_reg);
         let final_armed = mmio_read(bar0, armed_reg);
         let final_shadow = mmio_read(bar0, shadow_reg);
-        serial_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
-        serial_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
+        crate::census_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
+        crate::census_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
         return;
     }
 
     mmio_write(bar0, update_reg, 0x00000000);
 
     // 5 s hold (standing length — Peter's camera calibration, s21)
-    serial_println!(":: kdisp: pm-step hold begin (photo B — post-latch) ::");
+    crate::census_println!(":: kdisp: pm-step hold begin (photo B — post-latch) ::");
     for t in 1..=5 {
         for _ in 0..60_000_000 { core::hint::spin_loop(); }
-        serial_println!(":: kdisp: pm-step hold t={}s ::", t);
+        crate::census_println!(":: kdisp: pm-step hold t={}s ::", t);
         // Dump on the FIRST and LAST tick: a latch that reverts mid-hold is
         // invisible to a single sample.
         if t == 1 || t == 5 {
-            serial_println!(":: kdisp: pm-step reg-dump t={} ptr={:08X} ptr_hi={:08X} size={:08X} store={:08X} fmt={:08X} ::",
+            crate::census_println!(":: kdisp: pm-step reg-dump t={} ptr={:08X} ptr_hi={:08X} size={:08X} store={:08X} fmt={:08X} ::",
                 t,
                 mmio_read(bar0, 0x640460),
                 mmio_read(bar0, 0x640464),
@@ -636,19 +636,19 @@ unsafe fn latch_arm_update(
                 mmio_read(bar0, 0x640470));
             // Armed/shadow readouts separate "armed a truncated value" from
             // "UPDATE never propagated" — currently byte-identical states.
-            serial_println!(":: kdisp: pm-step reg-dump t={} armed={:08X} shadow={:08X} ::",
+            crate::census_println!(":: kdisp: pm-step reg-dump t={} armed={:08X} shadow={:08X} ::",
                 t, mmio_read(bar0, armed_reg), mmio_read(bar0, shadow_reg));
             for off in (0x4B8..=0x4C8).step_by(4) {
-                serial_println!(":: kdisp: pm-step reg-dump off={:03X} val={:08X} ::", off, mmio_read(bar0, 0x640000 + off));
+                crate::census_println!(":: kdisp: pm-step reg-dump off={:03X} val={:08X} ::", off, mmio_read(bar0, 0x640000 + off));
             }
             // Which head is actually live: the one whose vline/vblank advances.
             for h in 0..4usize {
                 let vert = mmio_read(bar0, 0x610000 + 0x6000 + h * 0x800 + 0x340);
-                serial_println!(":: kdisp: pm-step head-stat t={} h={} vert={:08X} ::", t, h, vert);
+                crate::census_println!(":: kdisp: pm-step head-stat t={} h={} vert={:08X} ::", t, h, vert);
             }
         }
     }
-    serial_println!(":: kdisp: pm-step hold end ::");
+    crate::census_println!(":: kdisp: pm-step hold end ::");
 
     // Step 3: Restore
     mmio_write(bar0, asm_reg, pre_asm);
@@ -656,9 +656,9 @@ unsafe fn latch_arm_update(
 
     // 1 s recovery gap
     for _ in 0..15_000_000 { core::hint::spin_loop(); }
-    serial_println!(":: kdisp: pm-step done ::");
+    crate::census_println!(":: kdisp: pm-step done ::");
 
-    serial_println!(":: kdisp: latch verdict asm-stuck=y ::");
+    crate::census_println!(":: kdisp: latch verdict asm-stuck=y ::");
 }
 
 /// The display parameter ladders — `lin-step` (pull 17, eee60395) and `bwpg-step` (pull 14,
@@ -690,25 +690,25 @@ unsafe fn pitch_ladders(
         mmio_write(bar0, asm_reg, new_ptr);
         let rb_asm = mmio_read(bar0, asm_reg);
         if rb_asm != new_ptr {
-            serial_println!(":: kdisp: latch skip — asm rb unchanged ::");
+            crate::census_println!(":: kdisp: latch skip — asm rb unchanged ::");
             let final_asm = mmio_read(bar0, asm_reg);
             let final_armed = mmio_read(bar0, armed_reg);
             let final_shadow = mmio_read(bar0, shadow_reg);
-            serial_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
-            serial_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
+            crate::census_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
+            crate::census_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
             return false;
         }
         mmio_write(bar0, update_reg, 0x00000000);
         // 5 s per hold — the bench needs camera time between cycles (Peter, s21 prep).
         for t in 1..=5 {
             for _ in 0..60_000_000 { core::hint::spin_loop(); }
-            serial_println!(":: kdisp: {} hold t={}s ::", label, t);
+            crate::census_println!(":: kdisp: {} hold t={}s ::", label, t);
         }
         // Restore, then a 1 s recovery gap.
         mmio_write(bar0, asm_reg, pre_asm);
         mmio_write(bar0, update_reg, 0x00000000);
         for _ in 0..15_000_000 { core::hint::spin_loop(); }
-        serial_println!(":: kdisp: {} done bytes={:08X} ::", label, total_bytes);
+        crate::census_println!(":: kdisp: {} done bytes={:08X} ::", label, total_bytes);
         true
     };
 
@@ -742,7 +742,7 @@ unsafe fn pitch_ladders(
             core::ptr::write_volatile(target_ptr, final_color);
         }
     }
-    serial_println!(":: kdisp: lin-step pitch=4000 fill done bytes={:08X} ::", total_bytes);
+    crate::census_println!(":: kdisp: lin-step pitch=4000 fill done bytes={:08X} ::", total_bytes);
     latch_and_hold("lin-step pitch=4000", total_bytes);
 
     // ── Rung B: `bwpg-step` — block-linear, the block-width vs pitch-in-gobs matrix (pull 14) ──
@@ -807,31 +807,31 @@ unsafe fn pitch_ladders(
                 core::ptr::write_volatile(target_ptr, final_color);
             }
         }
-        serial_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} fill done bytes={:08X} ::", bw, pg, total_bytes);
+        crate::census_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} fill done bytes={:08X} ::", bw, pg, total_bytes);
         // The hold label carries the cycle so a capture can tell the four apart.
         mmio_write(bar0, asm_reg, new_ptr);
         let rb_asm = mmio_read(bar0, asm_reg);
         if rb_asm != new_ptr {
-            serial_println!(":: kdisp: latch skip — asm rb unchanged ::");
+            crate::census_println!(":: kdisp: latch skip — asm rb unchanged ::");
             let final_asm = mmio_read(bar0, asm_reg);
             let final_armed = mmio_read(bar0, armed_reg);
             let final_shadow = mmio_read(bar0, shadow_reg);
-            serial_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
-            serial_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
+            crate::census_println!(":: kdisp: latch restored asm={:08X} armed={:08X} shadow={:08X} ::", final_asm, final_armed, final_shadow);
+            crate::census_println!(":: kdisp: latch verdict asm-stuck=n armed-followed=n ::");
             return;
         }
         mmio_write(bar0, update_reg, 0x00000000);
         for t in 1..=5 {
             for _ in 0..60_000_000 { core::hint::spin_loop(); }
-            serial_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} hold t={}s ::", bw, pg, t);
+            crate::census_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} hold t={}s ::", bw, pg, t);
         }
         mmio_write(bar0, asm_reg, pre_asm);
         mmio_write(bar0, update_reg, 0x00000000);
         for _ in 0..15_000_000 { core::hint::spin_loop(); }
-        serial_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} done ::", bw, pg);
+        crate::census_println!(":: kdisp: bwpg-step bw={} bh=4 pg={} done ::", bw, pg);
     }
 
-    serial_println!(":: kdisp: latch verdict asm-stuck=y ::");
+    crate::census_println!(":: kdisp: latch verdict asm-stuck=y ::");
 }
 
 /// The `gop-overlap` detector (restored from bfeedd94) — the probe that FOUND the confound of the
@@ -844,7 +844,7 @@ unsafe fn pitch_ladders(
 #[cfg(feature = "nvidia-kepler-gopoverlap")]
 fn gop_overlap_probe(surf2_offset: usize, surf2_bytes: usize, gop_offset: usize, gop_bytes: usize) {
     let overlap = surf2_offset < gop_offset + gop_bytes && gop_offset < surf2_offset + surf2_bytes;
-    serial_println!(":: kdisp: fb-draw gop-overlap={} surf2={:08X}+{:08X} gop={:08X}+{:08X} ::",
+    crate::census_println!(":: kdisp: fb-draw gop-overlap={} surf2={:08X}+{:08X} gop={:08X}+{:08X} ::",
         if overlap { "YES-RESULT-VOID" } else { "no" },
         surf2_offset, surf2_bytes, gop_offset, gop_bytes);
 }

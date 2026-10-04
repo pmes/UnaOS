@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use crate::console::Console;
 
 /// Registry capacity — a full table is loud (`:: TESTS: table full … -> FAIL ::`), never silent.
-const CAP: usize = 80; // QUIETBOOT: 48 -> 80, the boot witnesses R80 moved here (flight 19 registered 45).
+const CAP: usize = 128; // QUIETBOOT2: 80 -> 128, the ~20 boot fixtures B325 moved here. // QUIETBOOT: 48 -> 80, the boot witnesses R80 moved here (flight 19 registered 45).
 
 static TABLE: spin::Mutex<[Option<(&'static str, fn())>; CAP]> = spin::Mutex::new([None; CAP]);
 static DEFERRED: AtomicUsize = AtomicUsize::new(0);
@@ -265,7 +265,7 @@ pub fn defer(name: &'static str, f: fn()) -> bool {
 /// Kepler/KFBIND/KDHEAD, iGPU, BT). This arc takes the census + witness ~290 out, so the same knob line
 /// should read ~2420; 2500 leaves room for enumeration variance and FAILS if a census or a witness creeps
 /// back. A boot without the recon knobs reads ~500 and the bound tightens with the knob line.
-pub const QUIETBOOT_BOUND: u64 = 2500;
+pub const QUIETBOOT_BOUND: u64 = 250; // QUIETBOOT2 (B325): the seat's bound (FLIGHT20) — the sweep moves the fixtures, walks and prose; the boot prints its stages and refusals.
 
 /// `tests quietboot`: `:: QUIETBOOT: lines=<n> bound=<B> census=<bits> -> PASS|FAIL|SKIP ::`, naming the
 /// eight loudest tags when over. SKIP on a build that runs its fixtures at boot or arms every census
@@ -334,4 +334,17 @@ fn ensure_gen7() {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("gen7", crate::drivers::gpu::gen7::r8_test); }
     }
+}
+
+/// QUIETBOOT2 (B325, R80) — [`defer`] for a fixture that sits on a path the boot passes MANY times (a service
+/// pass, a paint): the caller's own `latch` makes every call after the first one relaxed swap, no table scan.
+/// Same answer as `defer`: `false` (run the body) under `tests-at-boot` or while `tests` is running it.
+pub fn defer_fast(name: &'static str, f: fn(), latch: &AtomicBool) -> bool {
+    if cfg!(feature = "tests-at-boot") || RUNNING.load(Ordering::Acquire) {
+        return false;
+    }
+    if !latch.swap(true, Ordering::AcqRel) {
+        defer(name, f);
+    }
+    true
 }

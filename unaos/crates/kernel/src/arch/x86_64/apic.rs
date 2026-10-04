@@ -144,7 +144,7 @@ pub fn init() {
         lapic_write(REG_LVT_LINT0, X2_LVT_LINT0, 1 << 16); // masked
         lapic_write(REG_LVT_LINT1, X2_LVT_LINT1, 0x400); // delivery mode 100b = NMI, unmasked
 
-        serial_println!(
+        crate::bootlog_println!(
             "APIC: {} software-enabled (id={}, SVR={:#x}, LINT0=masked, LINT1=NMI).",
             if x2apic() { "x2APIC" } else { "xAPIC" },
             apic_id_u32(),
@@ -191,7 +191,7 @@ pub fn init_timer() {
         // Writing the initial count (last) arms the countdown; it reloads each period.
         lapic_write(REG_TIMER_INITCNT, X2_TIMER_INITCNT, initcnt);
     }
-    serial_println!(
+    crate::bootlog_println!(
         "APIC: timer armed (vector {:#x}, periodic, ÷16, initcnt={} [{}]).",
         vector,
         initcnt,
@@ -291,7 +291,7 @@ pub fn calibrate(pm: &crate::arch::acpi::PmTimer) {
     let sane = (200_000_000..=20_000_000_000).contains(&tsc_hz) && (100_000..=2_000_000_000).contains(&apic_hz);
     if !sane {
         init_timer(); // fallback re-arm (measurement rejected; nothing stored)
-        serial_println!(
+        crate::bootlog_println!(
             "APIC: calibration REJECTED (implausible: TSC {} Hz, APIC ÷16 {} Hz over {} PM ticks) — staying uncalibrated.",
             tsc_hz, apic_hz, elapsed_pm
         );
@@ -300,7 +300,7 @@ pub fn calibrate(pm: &crate::arch::acpi::PmTimer) {
 
     TSC_HZ.store(tsc_hz, Ordering::Relaxed);
     APIC_TIMER_HZ.store(apic_hz, Ordering::Relaxed);
-    serial_println!(
+    crate::bootlog_println!(
         "APIC: calibrated over {} PM ticks ({} ms) — TSC {}.{:03} GHz, APIC timer {}.{:03} MHz (÷16); 1 kHz tick => initcnt {}.",
         elapsed_pm,
         elapsed_pm * 1000 / pm_hz,
@@ -319,7 +319,7 @@ pub fn calibrate(pm: &crate::arch::acpi::PmTimer) {
     // CLOCK-X1 (M1): note the wall-clock timebase honestly. The invariant-TSC bit is what gates
     // `clock::monotonic()` on x86 — with it the JD17 wall clock advances here; without it a set clock
     // stays frozen. Emitted AFTER the re-arm so it can't disturb the calibrated→armed line ordering.
-    serial_println!(
+    crate::bootlog_println!(
         "clock: TSC calibrated ~{} MHz ({})",
         tsc_hz / 1_000_000,
         if tsc_invariant() { "invariant" } else { "NOT invariant — wall clock stays frozen" }
@@ -407,7 +407,7 @@ pub fn report_tick_rate(pm: &crate::arch::acpi::PmTimer) {
 
     let ticks_delta = ticks().wrapping_sub(ticks_start);
     let observed_hz = (ticks_delta as u128 * pm_hz as u128 / elapsed_pm as u128) as u64;
-    serial_println!(
+    crate::bootlog_println!(
         "APIC: global ms-clock {} ticks / {} ms => {} Hz (single-rate; want ~1000 on metal, lower under QEMU/TCG timer coalescing).",
         ticks_delta,
         elapsed_pm as u64 * 1000 / pm_hz,

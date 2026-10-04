@@ -190,7 +190,7 @@ pub mod vectors {
         // returned below. `TABLE`'s mutex serialises the choice of slot, and each slot is written
         // exactly once, so there is one writer per descriptor.
         let v = alloc_in(unsafe { &mut *idt }, name, handler)?;
-        serial_println!(
+        crate::bootlog_println!(
             "[vectors] alloc name={} vector={:#04x} == witness ::",
             name, v
         );
@@ -292,7 +292,7 @@ pub mod vectors {
         // Every byte came from a `&str`, so the slice is UTF-8 by construction; the fallback exists
         // so a truncation that lands mid-codepoint prints a line instead of losing the census.
         let table = core::str::from_utf8(&buf.b[..buf.n]).unwrap_or("<non-utf8>");
-        serial_println!(
+        crate::bootlog_println!(
             "[vectors] allocated={} free={} table={}{} == witness ::",
             allocated,
             free,
@@ -717,7 +717,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
         // One-shot breadcrumb the first time the BSP's timer fires — confirms the local-APIC timer
         // path (xAPIC MMIO or x2APIC MSR LVT) is delivering, without spamming every tick.
         if prev == 0 {
-            serial_println!("APIC: heartbeat live (first timer tick).");
+            crate::bootlog_println!("APIC: heartbeat live (first timer tick).");
         }
     }
     // EOI BEFORE any context switch: otherwise the in-service bit would block this CPU's

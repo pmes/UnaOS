@@ -276,7 +276,7 @@ pub fn arm(
     if end <= start || start == 0 {
         // Degenerate. Leave the extent at its fail-closed (0, 0) and land in the permanent refusal.
         PERMIT_STATE.store(ST_UNARMED, Ordering::Release);
-        serial_println!(
+        crate::bootlog_println!(
             ":: SDHC4C: reserve NAME={} cluster={} size={} runs={} lba=[{}..{}) permit=UNARMED \
              (empty, inverted, or LBA-0-anchored extent) — the card stays READ-ONLY ::",
             name, cluster, size, runs, start, end
@@ -288,7 +288,7 @@ pub fn arm(
     EXTENT_LBA.store(start, Ordering::Release);
     EXTENT_END.store(end, Ordering::Release);
     PERMIT_STATE.store(ST_ARMED, Ordering::Release);
-    serial_println!(
+    crate::bootlog_println!(
         ":: SDHC4C: reserve NAME={} cluster={} size={} runs={} lba=[{}..{}) sectors={} \
          permit=ARMED (host-staged, adopt-only: the kernel creates/grows/deletes nothing on this \
          volume; boot-serial=0x{:08x} card-vol-serial=0x{:08x}) ::",
@@ -314,14 +314,14 @@ pub fn disarm(name: &str, reason: &str) {
     // extent is published it is immutable, and quietly retracting it would make the witness a lie.
     let prev = PERMIT_STATE.load(Ordering::Acquire);
     if prev == ST_ARMED {
-        serial_println!(
+        crate::bootlog_println!(
             ":: SDHC4C: disarm IGNORED ({}) — the extent is already published and is immutable ::",
             reason
         );
         return;
     }
     PERMIT_STATE.store(ST_UNARMED, Ordering::Release);
-    serial_println!(
+    crate::bootlog_println!(
         ":: SDHC4C: reserve NAME={} permit=UNARMED ({}) — the card stays READ-ONLY (SDHC-4b \
          behaviour, no CMD24 is reachable from the FAT layer) ::",
         name, reason
@@ -405,7 +405,7 @@ pub fn selftest_bounds() {
         PERMIT_STATE.store(ST_UNARMED, Ordering::Release);
         EXTENT_LBA.store(0, Ordering::Release);
         EXTENT_END.store(0, Ordering::Release);
-        serial_println!(
+        crate::bootlog_println!(
             ":: SDHC4C: permit DISARMED by its own self-test ({} of 4 out-of-extent spans were \
              admitted) — the card stays READ-ONLY ::",
             leaked
@@ -433,7 +433,7 @@ pub fn fnv1a(data: &[u8]) -> u32 {
 /// The closing tally. Printed by the reserve pass whatever the outcome, so "nothing happened" and
 /// "the pass did not run" are distinguishable in a capture.
 pub fn tally() { #[cfg(all(feature = "sdw", not(feature = "sdw-ro")))] if sdhcpost_tally() { return; } // SDHCPOST (B155): the counter's NAME must name the command the card saw, so the two polarities print two lines and neither lies. `ro` build: the CMD24 loop below is the write path, and the line below is byte-for-byte the one every capture since 4c has carried. DEFAULT build (SDHCRW, R59): the path is CMD25, so `cmd24=` would be false and `sdhcpost_tally` prints `sectors=` instead — so `sectors=` is what a plain `./arroyo test` capture carries now, and `cmd24=` is the opt-out's line.
-    serial_println!(
+    crate::bootlog_println!(
         ":: SDHC4C: tally fat-mutations-on-sdhc={} permits={} refusals={} cmd24={} armed={} ::",
         FAT_MUTATIONS.load(Ordering::Relaxed),
         PERMITS.load(Ordering::Relaxed),
@@ -496,7 +496,7 @@ fn sdhcpost_admits(site: &str, lba: u64, count: u64) -> bool {
         return false;
     }
     if !RW_SAID.swap(true, Ordering::Relaxed) {
-        serial_println!(
+        crate::bootlog_println!(
             ":: SDHC4C: permit BYPASSED at {} lba={} count={} \u{2014} the posture is rw and the \
              posture says sdhc=rw, so the reserved-extent bound is NOT the gate this boot; the gate \
              is the mount posture (SDHCPOST) plus the block layer's bounds and the driver's \
@@ -522,7 +522,7 @@ fn sdhcpost_note_expected_mutation(site: &str) -> bool {
     }
     RW_MUTATIONS.fetch_add(1, Ordering::Relaxed);
     if !RW_MUTATION_SAID.swap(true, Ordering::Relaxed) {
-        serial_println!(
+        crate::bootlog_println!(
             ":: SDHC4C: mutation expected on the Sdhc source at {} \u{2014} the volume's posture is \
              rw (R59 default; no `sdw-ro`), so a FAT-table or directory RMW is a file verb doing its job, not the \
              invariant breach the `!!` line reports on a read-only build (first, once) ::",
@@ -536,7 +536,7 @@ fn sdhcpost_note_expected_mutation(site: &str) -> bool {
 /// reserve-once accounting and the posture accounting without either line changing shape.
 #[cfg(all(feature = "sdw", not(feature = "sdw-ro")))]
 fn sdhcpost_tally() -> bool {
-    serial_println!(
+    crate::bootlog_println!(
         ":: SDHC4C: tally fat-mutations-on-sdhc={} permits={} refusals={} sectors={} armed={} \
          posture={} permits-by-posture={} expected-mutations={} ::",
         FAT_MUTATIONS.load(Ordering::Relaxed),

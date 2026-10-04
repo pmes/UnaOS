@@ -167,7 +167,7 @@ pub fn init(rsdp_addr: u64) {
     // (there is no other datum whose visibility is ordered against it).
     RSDP_ADDR.store(rsdp_addr, core::sync::atomic::Ordering::Relaxed);
     let topo = TOPOLOGY.call_once(|| parse(rsdp_addr)); #[cfg(feature = "ioapic")] crate::arch::ioapic::census(); // IOAPIC (rmbp-ledger B147) — LINE-NEUTRAL append, and the position is the whole argument: `parse` is what walks the MADT, so the census table is full exactly here and not one statement earlier. READ-ONLY with respect to the redirection table — this prints what firmware declared and what IOAPICVER answers, and writes no entry. CODE BEFORE THE COMMENT (LEDGER P7).
-    serial_println!(
+    crate::bootlog_println!(
         "ACPI: {} CPU(s) discovered, local APIC @ {:#x}, apic ids {:?}",
         topo.count,
         topo.local_apic_addr,
@@ -196,7 +196,7 @@ fn parse(rsdp_addr: u64) -> Topology {
     const DEFAULT_LAPIC: u64 = 0xFEE0_0000;
 
     if rsdp_addr == 0 {
-        serial_println!("ACPI: no RSDP from bootloader; assuming uniprocessor.");
+        crate::bootlog_println!("ACPI: no RSDP from bootloader; assuming uniprocessor.");
         return uniprocessor(DEFAULT_LAPIC);
     }
 
@@ -204,7 +204,7 @@ fn parse(rsdp_addr: u64) -> Topology {
         let rsdp = (rsdp_addr as *const Rsdp).read_unaligned();
         let signature = rsdp.signature;
         if &signature != b"RSD PTR " {
-            serial_println!("ACPI: bad RSDP signature; assuming uniprocessor.");
+            crate::bootlog_println!("ACPI: bad RSDP signature; assuming uniprocessor.");
             return uniprocessor(DEFAULT_LAPIC);
         }
 
@@ -226,7 +226,7 @@ fn parse(rsdp_addr: u64) -> Topology {
         match find_table(sdt_addr, entry_size, b"APIC") {
             Some(madt_addr) => parse_madt(madt_addr),
             None => {
-                serial_println!("ACPI: MADT not found; assuming uniprocessor.");
+                crate::bootlog_println!("ACPI: MADT not found; assuming uniprocessor.");
                 uniprocessor(DEFAULT_LAPIC)
             }
         }
@@ -350,7 +350,7 @@ pub fn dmar_report(rsdp_addr: u64) {
         let dmar_addr = match find_table(sdt_addr, entry_size, b"DMAR") {
             Some(a) => a,
             None => {
-                serial_println!("DMAR: no IOMMU table (VT-d absent or disabled in firmware) — direct device DMA OK.");
+                crate::bootlog_println!("DMAR: no IOMMU table (VT-d absent or disabled in firmware) — direct device DMA OK.");
                 return;
             }
         };
@@ -385,13 +385,13 @@ pub fn dmar_report(rsdp_addr: u64) {
         }
 
         if translation_on {
-            serial_println!(
+            crate::bootlog_println!(
                 "DMAR: *** VT-d translation ENABLED *** ({} DRHD, reg @ {:#x}, flags {:#x}) — device \
                  DMA to identity-mapped heap may be BLOCKED. Disable VT-d in firmware (or add DMAR passthrough).",
                 drhd_count, first_reg_base, flags
             );
         } else {
-            serial_println!(
+            crate::bootlog_println!(
                 "DMAR: IOMMU present ({} DRHD, reg @ {:#x}, flags {:#x}) but translation OFF — direct device DMA OK.",
                 drhd_count, first_reg_base, flags
             );
@@ -540,7 +540,7 @@ pub fn pm_timer_report(rsdp_addr: u64) {
             let b = pm.read();
             spin(1_000_000);
             let c = pm.read();
-            serial_println!(
+            crate::bootlog_println!(
                 "ACPI PM timer: port {:#x}, {}-bit; {:#x} -> {:#x} -> {:#x} ({})",
                 pm.port(),
                 pm.bits(),
@@ -550,7 +550,7 @@ pub fn pm_timer_report(rsdp_addr: u64) {
                 if b != a || c != b { "advancing" } else { "STUCK?" }
             );
         }
-        None => serial_println!(
+        None => crate::bootlog_println!(
             "ACPI PM timer: not found (no FADT / no PM_TMR_BLK) — timebase stays uncalibrated."
         ),
     }

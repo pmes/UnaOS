@@ -2035,7 +2035,7 @@ fn usbreg_selftest() {
 /// `witness`, on both arches (main.rs, same-line appends), and [`homesoil_selftest`] calls it too
 /// so the metal wire keeps all six legs together; the latch makes the second call a no-op.
 #[cfg(feature = "witness")]
-pub fn unafsroot_selftest() {
+pub fn unafsroot_selftest() { if crate::tests::defer("unafsroot", unafsroot_selftest) { return; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests unafsroot` fires it.
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::Relaxed) {
@@ -2514,7 +2514,7 @@ pub fn ahciboot_selftest() {
         if vol_id != 0 || label != "-" {
             volumes += 1;
         }
-        serial_println!(
+        crate::bootlog_println!(
             "[bootdisk] volume source=ahci port={} vol={} serial=0x{:08x} blocks={} volumes_by_content={} ::",
             port, label, vol_id, blocks, serials.len()
         );
@@ -2559,7 +2559,7 @@ pub fn ahciboot_selftest() {
 
     // The closing census. It prints unconditionally, so "no SATA disk" and "the fixture never ran"
     // are different lines on the wire rather than the same silence.
-    serial_println!(
+    crate::bootlog_println!(
         "[bootdisk] ahci census: sata_sources={} with_fat_volume={} carrying_{}={} ::",
         sata, volumes, AHCIBOOT_FILE, staged
     );
@@ -3006,7 +3006,7 @@ fn root_candidates(disks: &[Disk], root_ix: Option<usize>) {
     } else {
         "none"
     };
-    serial_println!(
+    crate::bootlog_println!(
         "[bootdisk] root candidates: sdhc={} ahci={} usb={} chose={} prefer={}",
         fam(disks, "sdhc"),
         fam(disks, "ahci"),

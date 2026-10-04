@@ -385,7 +385,7 @@ pub fn activate_on(desc: SurfaceDesc) {
         let fb = *super::WRITER.lock();
         if !fb.is_ready() {
             ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
-            serial_println!("[wc-x] activate DECLINE reason=fb-not-ready latch=released");
+            crate::census_println!("[wc-x] activate DECLINE reason=fb-not-ready latch=released");
             return;
         }
         let i = fb.info();
@@ -408,10 +408,10 @@ pub fn activate_on(desc: SurfaceDesc) {
     // and a swap that skipped them would be the kind of half-activation the rest of this function
     // refuses to perform.
     if desc.is_live() {
-        serial_println!("[wc-x] surface adopt SKIP (already live)");
+        crate::census_println!("[wc-x] surface adopt SKIP (already live)");
     } else {
         ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
-        serial_println!(
+        crate::census_println!(
             "[wc-x] activate DECLINE reason=surface-adopt-not-implemented origin={} want=base={:#x} len={} {}x{} stride={} bpp={} latch=released",
             desc.origin.name(),
             desc.base,
@@ -456,7 +456,7 @@ pub fn activate_on(desc: SurfaceDesc) {
     super::wcpar::start(); #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))] crate::drivers::gpu::kepler_vblank::pump_spawn_once(); // KVBLANK6 — task context; WCPAR — band workers exist before the first composite; prints `[wcpar] pool=`
     super::blitter::ignite(); // KCOMP (B321): pick the blitter in task context, beside the band workers; prints `[wc] blitter=<cpu|gpu> reason=…` once
     crate::splash::hold_open(); // SPLASHX86: the splash row goes up NOW — above every window minted below, until `users::stage_publish` releases it
-    serial_println!(
+    crate::census_println!(
         "[wc-x] desktop-clear panel={}x{} bg={:08X}",
         pw,
         ph,
@@ -480,7 +480,7 @@ pub fn activate_on(desc: SurfaceDesc) {
     // `wm::DESKTOP_BG` — the same constant the fill above used — and no new one is invented. The
     // adoption is a back-buffer (cached RAM) fill; nothing reads the panel back.
     super::screen::adopt_desktop_bg(wm::DESKTOP_BG);
-    serial_println!(
+    crate::census_println!(
         "[wc-x] backbuffer resync ARMED bg={:08X} (desktop layer not yet constructed)",
         wm::DESKTOP_BG
     );
@@ -513,7 +513,7 @@ pub fn activate_on(desc: SurfaceDesc) {
     // table state the boot can reach, not for the empty table it happens to be run against.
     if super::dock::Layout::for_panel(wm::MAX_WINDOWS, pw, ph).is_none() {
         ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
-        serial_println!(
+        crate::census_println!(
             "[wc-x] activate DECLINE reason=dock-cannot-host-full-strip panel={}x{} rows={} \
              (the console's minimise disc would have no way back) latch=released",
             pw, ph, wm::MAX_WINDOWS
@@ -527,10 +527,10 @@ pub fn activate_on(desc: SurfaceDesc) {
     let cwin = super::fbcon::panel_console_window_open();
     if cwin == wm::WIN_NONE {
         ACTIVATED.store(ORIGIN_NONE, Ordering::Release);
-        serial_println!("[wc-x] activate DECLINE reason=console-window-declined latch=released");
+        crate::census_println!("[wc-x] activate DECLINE reason=console-window-declined latch=released");
         return;
     }
-    serial_println!("[wc-x] activate panel={}x{} console_win={}", pw, ph, cwin);
+    crate::census_println!("[wc-x] activate panel={}x{} console_win={}", pw, ph, cwin);
 
     // SHELLDESK — **THE DESKTOP SHELL ASKS FOR ITS MENU BAR. This is the seam that means
     // "desktop-ready" on x86.**
@@ -554,7 +554,7 @@ pub fn activate_on(desc: SurfaceDesc) {
     // decision, so a capture separates "the shell never asked" from "the shell asked and the bar
     // declined the panel" (`geometry` answers `None` below its floors, and says so there).
     let bar_was = super::menubar::set_enabled(true);
-    serial_println!(
+    crate::census_println!(
         "[wc-x] menubar ENABLED panel={}x{} rect={:?} was={} (the desktop scene owns the top of the glass)",
         pw,
         ph,
@@ -619,7 +619,7 @@ pub fn activate_on(desc: SurfaceDesc) {
     } else {
         false
     };
-    serial_println!(
+    crate::census_println!(
         "[wc-x] menubar {} owns_pixels={} retried={} (composite at the enable seam, read back rather than assumed)",
         if super::menubar::owns_pixels() { "PAINTED" } else { "NOT-PAINTED" },
         super::menubar::owns_pixels(),
@@ -634,7 +634,7 @@ pub fn activate_on(desc: SurfaceDesc) {
     // returns with this still clear, so the service task cannot put a window on a desktop the
     // compositor released.
     DESKTOP_APP_ARMED.store(true, Ordering::Release);
-    serial_println!(
+    crate::census_println!(
         "[wc-x] desktop-app ARMED name=/{} (deferred to the device-service pass — no FAT volume or ELF loader at this seam)",
         DESKTOP_APP
     );
@@ -770,7 +770,7 @@ pub fn desktop_app_service() {
         // enumerated" — an assertion about the whole machine drawn from ONE of three registry slots,
         // and it was false on the boot that exposed this. `handles=` says what was actually
         // inspected, so this refusal is falsifiable by the capture it appears in.
-        serial_println!(
+        crate::census_println!(
             "[wc-x] desktop-app DECLINE reason=no-storage name=/{} waited={}ms threshold={}ms handles={} — no handle offered a program source; the desktop keeps the console window only",
             DESKTOP_APP, waited, STORAGE_WAIT_MS, crate::drivers::block::source_census()
         );
@@ -805,7 +805,7 @@ pub fn desktop_app_service() {
     // APPLOAD: the same handle ladder the storage gate above cleared — mounting `Default` here after
     // clearing the gate on `program_source` would be the identical defect one line later.
     let Ok(fs) = crate::fs::fat::mount_program_source() else {
-        serial_println!(
+        crate::census_println!(
             "[wc-x] desktop-app DECLINE reason=no-fat-volume name=/{} handles={} — the desktop keeps the console window only",
             DESKTOP_APP, crate::drivers::block::source_census()
         );
@@ -816,7 +816,7 @@ pub fn desktop_app_service() {
         // xHCI enumerated, and the volume UEFI booted from is a different thing the kernel cannot
         // read after `ExitBootServices`. The WINX-2 witness learned this the hard way on an attended
         // rMBP boot and its message is the model for this one.
-        serial_println!(
+        crate::census_println!(
             "[wc-x] desktop-app DECLINE reason=absent name=/apps/{} — not in APPS/ on the mounted DATA volume (the USB mass-storage device, NOT the UEFI boot volume); stage target/x86_64_data/ onto it",
             DESKTOP_APP
         );
@@ -826,14 +826,14 @@ pub fn desktop_app_service() {
     // be reported as `read-failed` — contained, but mislabelled, and the operator would go looking
     // for a bad volume instead of a bad name.
     if de.is_dir {
-        serial_println!(
+        crate::census_println!(
             "[wc-x] desktop-app DECLINE reason=is-directory name=/apps/{}", DESKTOP_APP
         );
         return;
     }
     let cap = crate::arch::syscall::user_image_cap(); // RING3WIN: the image cap (4 MiB); the loader decides the model
     if de.size == 0 || de.size as usize > cap {
-        serial_println!(
+        crate::census_println!(
             "[wc-x] desktop-app DECLINE reason=size name=/{} bytes={} cap={} (the ring-3 program window)",
             DESKTOP_APP, de.size, cap
         );
@@ -849,7 +849,7 @@ pub fn desktop_app_service() {
     // what blocked `bg /apps/STAT.ELF` on x86 — and the shell's `read_el0_image` carries this check
     // for that reason. Without it the loader gets a truncated image and reports something unrelated.
     if bytes.len() != de.size as usize {
-        serial_println!(
+        crate::census_println!(
             "[wc-x] desktop-app DECLINE reason=short-read name=/{} got={} want={}",
             DESKTOP_APP, bytes.len(), de.size
         );
@@ -865,7 +865,7 @@ pub fn desktop_app_service() {
         // the flight would silently conflate "not an ELF at all" with "an ELF32". It was the only
         // prefix collision among the image's `reason=` literals; every one is now independently
         // greppable, which is a property worth keeping as reasons are added.
-        serial_println!(
+        crate::census_println!(
             "[wc-x] desktop-app DECLINE reason=not-elf64-magic name=/{} bytes={}",
             DESKTOP_APP, bytes.len()
         );
@@ -879,21 +879,21 @@ pub fn desktop_app_service() {
     // `reason=spawn-rejected why=<loader string>` — contained, but naming the loader's complaint
     // rather than the operator's error.
     if bytes.len() < 20 {
-        serial_println!(
+        crate::census_println!(
             "[wc-x] desktop-app DECLINE reason=truncated-header name=/{} bytes={} (need >= 20 for e_machine)",
             DESKTOP_APP, bytes.len()
         );
         return;
     }
     if bytes[4] != 2 {
-        serial_println!(
+        crate::census_println!(
             "[wc-x] desktop-app DECLINE reason=not-elf64-class name=/{} ei_class={} (want 2)",
             DESKTOP_APP, bytes[4]
         );
         return;
     }
     if bytes[5] != 1 {
-        serial_println!(
+        crate::census_println!(
             "[wc-x] desktop-app DECLINE reason=not-little-endian name=/{} ei_data={} (want 1)",
             DESKTOP_APP, bytes[5]
         );
@@ -902,7 +902,7 @@ pub fn desktop_app_service() {
     let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
     if machine != 62 {
         // 62 = EM_X86_64; 183 = EM_AARCH64, i.e. the Pi's STAT.ELF staged on x86 media.
-        serial_println!(
+        crate::census_println!(
             "[wc-x] desktop-app DECLINE reason=wrong-arch name=/{} e_machine={} (want 62 = EM_X86_64; 183 = EM_AARCH64 means the aarch64 STAT.ELF is on this stick)",
             DESKTOP_APP, machine
         );
@@ -937,12 +937,12 @@ pub fn desktop_app_service() {
             // furniture the operator did not ask for still has to be identifiable on the glass.
             crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), DESKTOP_APP);
             let tracked = crate::shell::adopt_bg_job(pid, slot, "/STAT.ELF");
-            serial_println!(
+            crate::census_println!(
                 "[wc-x] desktop-app LAUNCH name=/{} bytes={} entry={:#x} pid={} slot={} DETACHED, left RUNNING, tracked={}",
                 DESKTOP_APP, bytes.len(), entry, pid, slot, tracked
             );
         }
-        Err(why) => serial_println!(
+        Err(why) => crate::census_println!(
             "[wc-x] desktop-app DECLINE reason=spawn-rejected name=/{} why={}",
             DESKTOP_APP, why
         ),
@@ -997,7 +997,7 @@ fn move_vacate_probe(pw: usize, ph: usize) {
     let step = ow + 2 * EDGE_GAP;
     let (ax, ay) = (EDGE_GAP, EDGE_GAP.max(crate::ui_status::top_chrome_h(pw, ph)));
     if pw < 2 * step + EDGE_GAP || ph < ay + oh + EDGE_GAP {
-        serial_println!("[wc-x] move-vacate SKIP (panel {}x{} too small)", pw, ph);
+        crate::census_println!("[wc-x] move-vacate SKIP (panel {}x{} too small)", pw, ph);
         return;
     }
     let bx = EDGE_GAP + step;
@@ -1015,7 +1015,7 @@ fn move_vacate_probe(pw: usize, ph: usize) {
         ay + wm::TITLE_H + wm::BORDER,
     );
     if id == wm::WIN_NONE {
-        serial_println!("[wc-x] move-vacate SKIP (create declined)");
+        crate::census_println!("[wc-x] move-vacate SKIP (create declined)");
         return;
     }
     wm::present(id);
@@ -1048,7 +1048,7 @@ fn move_vacate_probe(pw: usize, ph: usize) {
         }
     }
     wm::close(id);
-    serial_println!(
+    crate::census_println!(
         "[wc-x] move-vacate win={} scale={}x from=({},{}) to=({},{}) box={}x{} painted={} desktop={}/5 stale={}/5 -> {}",
         id, scale, ax, ay, bx, ay, ow, oh, painted, clean, stale,
         if painted && clean == pts.len() { "PASS" } else { "FAIL" }
@@ -1075,14 +1075,14 @@ fn move_vacate_test() {
     let (pw, ph) = {
         let fb = *super::WRITER.lock();
         if !fb.is_ready() {
-            serial_println!("[wc-x] move-vacate SKIP (framebuffer not ready)");
+            crate::census_println!("[wc-x] move-vacate SKIP (framebuffer not ready)");
             return;
         }
         let i = fb.info();
         (i.width, i.height)
     };
     if wm::modal_top_held() {
-        serial_println!("[wc-x] move-vacate SKIP (a modal row holds the top — splash, login screen or alert)");
+        crate::census_println!("[wc-x] move-vacate SKIP (a modal row holds the top — splash, login screen or alert)");
         return;
     }
     move_vacate_probe(pw, ph);

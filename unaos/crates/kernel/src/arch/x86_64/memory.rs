@@ -46,7 +46,7 @@ pub fn init(boot_info: &'static mut BootInfo) {
     // extraction, and (on a non-witness build) the SPLASH-1 paint. `heap d=` is then this function
     // ALONE: the region scan, the diagnostics, the identity-map probe and `init_heap_raw`.
     crate::bootpace::record("mem-init");
-    serial_println!(":: X86_64 Memory Init ::");
+    crate::bootlog_println!(":: X86_64 Memory Init ::");
 
     let regions: &'static [MemoryRegion] = unsafe {
         core::slice::from_raw_parts(
@@ -79,7 +79,7 @@ pub fn init(boot_info: &'static mut BootInfo) {
         // Diagnostics (serial_println! mirrors to fbcon, so these are visible on the serial-less
         // Mac): the heap choice, the low-memory layout (exposes the AP trampoline neighborhood @
         // 0x8000 and any reserved bands), total usable RAM, and an identity-map reachability probe.
-        serial_println!(
+        crate::bootlog_println!(
             "HEAP: chose {:#x}..{:#x} ({} MiB)",
             heap_start,
             heap_start + heap_size as u64,
@@ -90,7 +90,7 @@ pub fn init(boot_info: &'static mut BootInfo) {
             if region.kind == MemoryRegionKind::Usable {
                 total_usable += region.page_count * 4096;
                 if region.phys_start < 0x0010_0000 {
-                    serial_println!(
+                    crate::bootlog_println!(
                         "HEAP: low Usable {:#x}..{:#x}",
                         region.phys_start,
                         region.phys_start + region.page_count * 4096
@@ -98,14 +98,14 @@ pub fn init(boot_info: &'static mut BootInfo) {
                 }
             }
         }
-        serial_println!("HEAP: total usable RAM {} MiB", total_usable / (1024 * 1024));
+        crate::bootlog_println!("HEAP: total usable RAM {} MiB", total_usable / (1024 * 1024));
 
         // The xHCI rings/buffers and e1000 descriptors are allocated from this heap and handed to
         // devices as physical==bus addresses (identity map). The brief mandates DMA buffers < 4 GiB;
         // warn if the chosen window crosses 4 GiB so a 32-bit-only DMA path can't fail mysteriously.
         // In practice the first >=16 MiB Usable region is low, so this should not fire.
         if heap_start + heap_size as u64 > 0x1_0000_0000 {
-            serial_println!(
+            crate::bootlog_println!(
                 "HEAP: WARNING: heap ends above 4 GiB ({:#x}) — 32-bit-only device DMA may be unreachable.",
                 heap_start + heap_size as u64
             );
@@ -124,7 +124,7 @@ pub fn init(boot_info: &'static mut BootInfo) {
             core::ptr::read_volatile(lo) == 0xA55A_1234_DEAD_BEEF
                 && core::ptr::read_volatile(hi) == 0x0BAD_F00D_5EED_C0DE
         };
-        serial_println!("HEAP: identity-map probe {}", if probe_ok { "OK" } else { "FAIL" });
+        crate::bootlog_println!("HEAP: identity-map probe {}", if probe_ok { "OK" } else { "FAIL" });
 
         unsafe {
             crate::allocator::init_heap_raw(heap_start as *mut u8, heap_size);
@@ -1395,7 +1395,7 @@ pub fn wx_slots_checked() -> u32 {
 /// **The armed-proof line.** Run the negative control, then audit the live kernel map and publish
 /// both. Called once from `arch::init` after `syscall::init` has set EFER.NXE and CR4.SMEP, so the
 /// numbers describe an actually-enforcing kernel. Panics if a ring-3-reachable page is W∧X.
-pub fn wx_audit_report() {
+pub fn wx_audit_report() { if crate::tests::defer("wxaudit", wx_audit_report) { return; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests wxaudit` fires it.
     if wx_selftest() {
         serial_println!(
             ":: WXAUDIT-0: classifier fires on W+X, clears RO-X, honours parent NX, voids on NXE=0 -> PASS ::"
@@ -1413,7 +1413,7 @@ pub fn wx_audit_report() {
     // O1 — the leaf histogram, APPENDED (never inserted): every existing `awk` pattern that matched
     // this line before still matches it. `l1/l2/l3` are the 1 GiB / 2 MiB / 4 KiB leaf counts over the
     // WHOLE map, which is what the spared-GiB census in the WXN line structurally cannot see.
-    serial_println!(
+    crate::census_println!(
         ":: WXAUDIT x86: leaves={} user={} user_WX={} kern_WX={} ({} MiB) tables={} nxe={} walk={}kcyc l1={} l2={} l3={}{} ::",
         a.leaves,
         a.user_leaves,
@@ -1545,7 +1545,7 @@ fn wx_probe_addr(at: &str, va: u64, nxe: bool) {
     match wx_probe_leaf(va) {
         Some((e, level, acc)) => {
             let pat = pat_bit_for_level(level);
-            serial_println!(
+            crate::census_println!(
                 ":: WXPROBE map: at={} va=0x{:X} lvl={} e=0x{:016X} p={} w={} u={} nx={} g={} pat={} pcd={} pwt={} fw={} fx={} fu={} ::",
                 at,
                 va,
@@ -1570,7 +1570,7 @@ fn wx_probe_addr(at: &str, va: u64, nxe: bool) {
                 acc.0 as u8,
             );
         }
-        None => serial_println!(
+        None => crate::census_println!(
             ":: WXPROBE map: at={} va=0x{:X} lvl=none e=0x0 p=0 w=0 u=0 nx=0 g=0 pat=0 pcd=0 pwt=0 fw=0 fx=0 fu=0 ::",
             at,
             va
@@ -1599,7 +1599,7 @@ fn wx_probe_elf() {
             && core::ptr::read_unaligned(p.add(54).cast::<u16>()) == 56 // e_phentsize
     };
     if !ok {
-        serial_println!(":: WXPROBE elf: ehdr=0x{:X} ok=0 phnum=0 load=0 ::", ehdr);
+        crate::census_println!(":: WXPROBE elf: ehdr=0x{:X} ok=0 phnum=0 load=0 ::", ehdr);
         return;
     }
     let (phoff, phnum) = unsafe {
@@ -1649,7 +1649,7 @@ fn wx_probe_elf() {
     let (v3, m3, f3) = s(3);
     let t = |x: [u8; 3]| -> [char; 3] { [x[0] as char, x[1] as char, x[2] as char] };
     let (f0, f1, f2, f3) = (t(f0), t(f1), t(f2), t(f3));
-    serial_println!(
+    crate::census_println!(
         ":: WXPROBE elf: ehdr=0x{:X} ok=1 phnum={} load={} s0=0x{:X}+0x{:X}/{}{}{} s1=0x{:X}+0x{:X}/{}{}{} s2=0x{:X}+0x{:X}/{}{}{} s3=0x{:X}+0x{:X}/{}{}{} ::",
         ehdr, phnum, loads,
         v0, m0, f0[0], f0[1], f0[2],
@@ -1670,7 +1670,7 @@ pub fn wx_probe_report() {
     // SAFETY: reading IA32_EFER is a pure ring-0 MSR read with no side effects.
     let efer = unsafe { x86_64::registers::model_specific::Msr::new(IA32_EFER).read() };
     let nxe = efer & (1 << 11) != 0;
-    serial_println!(
+    crate::census_println!(
         ":: WXPROBE cpu: cr0=0x{:016X} wp={} cr4=0x{:016X} pge={} smep={} smap={} la57={} efer=0x{:016X} nxe={} lme={} ::",
         cr0,
         ((cr0 >> 16) & 1) as u8,  // CR0.WP — what makes the firmware's own table pages read-only
@@ -2143,7 +2143,7 @@ pub fn wxn_pdpt_sweep() {
     // us, and `already_nx=` on this same line says which of the two it was.)
     let vacuous = nx_set == 0 && (pdpt_seen == 0 || (spare.n as u32) < pdpt_seen);
     let verdict = if vacuous { "-> VACUOUS" } else { "-> SWEPT" };
-    serial_println!(
+    crate::census_println!(
         ":: WXN-x86: ehdr=0x{:X} img=[0x{:X},0x{:X}) gib_img={} gib_tramp={} spare_n={} pdpt_seen={} nx_set={} \
          huge_leaf_nx={} skip_spare={} skip_user={} skip_pml4_user={} skip_selfmap={} already_nx={} \
          skip_fb_lock={} skip_fb_base={} skip_fb_walk={} residue_leaves={} \
@@ -2216,7 +2216,7 @@ pub fn wxn_pdpt_sweep() {
                     e_before, e_after, delta, l_after
                 );
                 let pat = pat_bit_for_level(l_after);
-                serial_println!(
+                crate::census_println!(
                     ":: WXN-FBWC: fb=0x{:X} lvl={} e=0x{:016X} pat={} pcd={} pwt={} w={} fx={} {} ::",
                     fb,
                     l_after,
@@ -2243,7 +2243,7 @@ pub fn wxn_pdpt_sweep() {
         // F2 — the interlock did not run, and says so. Without this line a capture with no
         // `WXN-FBWC:` in it is indistinguishable from a build that never had the tripwire; the
         // `skip_fb_*` fields on the WXN line above name which of the three paths it took.
-        serial_println!(
+        crate::census_println!(
             ":: WXN-FBWC: fb=0x{:X} skip_lock={} skip_base={} skip_walk={} -> SKIPPED ::",
             fb, skip_fb_lock, skip_fb_base, skip_fb_walk
         );
@@ -2948,7 +2948,7 @@ fn wxn_split_stage(spare: &WxnSpare, img_lo: u64, img_hi: u64, pge: bool, cr4: u
     // inserted), so zero writes means every descent bailed on a `skip_` branch.
     let wrote = demote_1g + split_2m + nx_pdpt + nx_2m + nx_pt + nx_4k;
     let verdict = if wrote == 0 { "-> VACUOUS" } else { "-> SPLIT" };
-    serial_println!(
+    crate::census_println!(
         ":: WXN-M2: xseg=[0x{:X},0x{:X}) xsegs={} xpages={} tramp=0x{:X} spare_n={} demote_1g={} split_2m={} \
          pool_used={}/{} nx_pdpt={} nx_2m={} nx_pt={} nx_4k={} keep_x={} already_nx={} skip_user={} \
          fb=0x{:X} fb_delta=0x{:X} pge={} flush={} {} ::",
@@ -3253,7 +3253,7 @@ fn wxn_ro_stage(pge: bool, cr4: u64) {
 
     // The census, on the wire BEFORE anything is written. Everything a separate dry-run flight was
     // going to prove is on this line, and it survives a death anywhere below it.
-    serial_println!(
+    crate::census_println!(
         ":: WXN-M3B-PRE: xseg=[0x{:X},0x{:X}) xpages={} wseg=[0x{:X},0x{:X}) armed={} would={} \
          already_ro={} wskip={} absent={} huge_leaves={} huge_pages={} pre_w={} would_w={} \
          tramp=0x{:X} -> CENSUS ::",
@@ -3714,7 +3714,7 @@ pub fn set_framebuffer_wc(fb_base: u64, fb_len: u64) {
         va = va.saturating_add(1 << 12);
     }
     #[cfg(not(feature = "bar1exp-uc"))]
-    serial_println!(
+    crate::bootlog_println!(
         ":: x86 fb-wc: retyped {} leaf(s) WC (PAT PA4) over {:#x}..{:#x} ::",
         leaves,
         fb_base,
@@ -3894,7 +3894,7 @@ pub fn map_mmio_window(pa: u64, size: usize) {
     // Wire line: says what the walk DID, so a boot log can show the WC leaves surviving a containing
     // BAR map rather than leaving it to be inferred from a frame rate. `wc-kept` is nonzero only for
     // a window that overlaps the framebuffer's leaves; every other window prints `wc-kept=0`.
-    serial_println!(
+    crate::bootlog_println!(
         ":: x86 mmio-map: {:#x}..{:#x} uc={} (PAT PA3) wc-kept={} ::",
         pa,
         end,
@@ -4026,7 +4026,7 @@ pub fn fb_wc_witness() {
         if FBWC_SAID.swap(true, Ordering::AcqRel) {
             return;
         }
-        serial_println!(
+        crate::bootlog_println!(
             ":: x86 fb-wc: ARM=wc leaves={} range={:#x}..{:#x} ::",
             FBWC_LEAVES.load(Ordering::Relaxed),
             FBWC_LO.load(Ordering::Relaxed),

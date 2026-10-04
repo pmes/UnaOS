@@ -636,7 +636,7 @@ fn occpar_once(pw: usize, ph: usize, rect: Option<strip::Rect>) {
     match occ_bar_reading(bar, win) {
         Some((pop, px_prot, pop_fault, px_fault)) => {
             let ok = pre_ok && pop > 0 && px_prot > 0 && pop_fault > 0 && px_fault == 0;
-            serial_println!(
+            if !ok || cfg!(any(feature = "census", feature = "tests-at-boot")) { serial_println!(
                 ":: MENUBAR-OCC-PAR: arch={} bar_enabled=true clip_arm=present \
                  clip_gate=x86+wc|aarch64+desktop_firmware probe=present blocked_on=none \
                  occclip_bar={} occclip_bar_px={} forbid_bar={} forbid_bar_px={} \
@@ -649,7 +649,7 @@ fn occpar_once(pw: usize, ph: usize, rect: Option<strip::Rect>) {
                 win.2, win.3, win.0, win.1,
                 crossed, at_risk_px, clob, pre_ok,
                 if ok { "PASS" } else { "FAIL" }
-            );
+            ); } // QUIETBOOT2 (B325, R80): a PASS is census; a FAIL always prints.
         }
         // The aarch64 outcome. The blocking symbol and its exact gate go ON THE WIRE, so a Pi/Orin
         // capture says "this instrument is absent, and here is what would restore it" rather than
@@ -682,7 +682,7 @@ fn occpar_never_enabled(off_passes: u64) {
     if OCCPAR_DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    serial_println!(
+    crate::census_println!(
         ":: MENUBAR-OCC-PAR: arch={} bar_enabled=false clip_arm=present \
          clip_gate=x86+wc|aarch64+desktop_firmware probe={} occclip_bar=unasked \
          occclip_bar_px=unasked bar=none off_passes={} reason=bar_never_enabled_this_boot \
@@ -1211,7 +1211,7 @@ fn menurow_witness(m: &Model) {
     if MENUROW_KEY.swap(key, Ordering::Relaxed) == key {
         return;
     }
-    serial_println!(
+    crate::bootlog_println!(
         "[menubar] menus cap_owner={} cap={} menu_owner={} boxes={} items={}",
         m.cap_owner,
         core::str::from_utf8(&m.title[..m.title_len]).unwrap_or("?"),
@@ -1289,7 +1289,7 @@ fn battery_witness() {
                 return;
             }
             let (polls, answers) = super::status::counts();
-            serial_println!(
+            crate::bootlog_println!(
                 "[menubar] battery pct={} charging={} mins={} age_s={} src={} mv={} ma={} polls={}/{}",
                 b.percent,
                 if b.charging { "y" } else { "n" },
@@ -1314,7 +1314,7 @@ fn battery_witness() {
             // read `src=smc` — a source that answered and has since gone past `status::STALE_MS`,
             // i.e. a pack removed or an SMC that stopped answering for a minute. Both are "the item
             // is not on the glass", and the term says which.
-            serial_println!("[menubar] battery absent src={}", src.as_str());
+            crate::bootlog_println!("[menubar] battery absent src={}", src.as_str());
         }
     }
 }
@@ -1540,7 +1540,7 @@ fn firstpaint_witness(m: &Model, r: strip::Rect) {
     if FIRSTPAINT_SAID.swap(true, Ordering::AcqRel) {
         return;
     }
-    serial_println!(
+    crate::bootlog_println!(
         "[menubar] first-paint at={} after_enable_ms={} model={}{} crystal={} rect={}x{}+{}+{} gem_px={}/{} stray={} sym={}",
         Ms(at),
         Ms(after),
@@ -3042,7 +3042,7 @@ pub fn crystal_persist_selftest(pw: usize, ph: usize) {
     } else {
         "FAIL"
     };
-    serial_println!(
+    crate::bootlog_println!(
         "[menubar] crystal-persist paints={} present={}/{} models={},{},{} gem_px={}/{} stray={} sym={} \
          tries={},{},{} decl_lock={} unread={} budget_ms={} -> {}",
         landed, present, landed, words[0], words[1], words[2], matched, want, stray, sym,
@@ -3103,7 +3103,7 @@ fn clockbar_paint(out: &mut [u32], w: usize, sy: usize, cx: usize, anchored: boo
     if CLOCKBAR_SEEN.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit != 0 {
         return;
     }
-    serial_println!(
+    crate::census_println!(
         ":: CLOCKBAR: anchored={} text={} from={} drawn=1 -> PASS ::",
         anchored as u8,
         core::str::from_utf8(c).unwrap_or("?????"),

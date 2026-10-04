@@ -124,7 +124,7 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
         let device = read_config_16(bus, dev, func, 0x02);
         // Always log the controller's identity so a serial-less metal boot can SEE which xHCI this is
         // — the live test of whether the rMBP's Panther Point id (0x1e31) is the one we gate on.
-        serial_println!(":: xHCI PCI id {:04x}:{:04x} @ {}:{}.{} (PORTSW default-on) ::", vendor, device, bus, dev, func);
+        crate::bootlog_println!(":: xHCI PCI id {:04x}:{:04x} @ {}:{}.{} (PORTSW default-on) ::", vendor, device, bus, dev, func);
 
         // A config-space write is issued ONLY on a known Intel shared-port controller (an EHCI
         // companion routes the USB2 ports). On anything else — notably QEMU's qemu-xhci (0x1b36) —
@@ -153,7 +153,7 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
                 write_config_32(bus, dev, func, USB3_PSSEN, want);
                 read_config_32(bus, dev, func, USB3_PSSEN) // read-back = the metal proof
             } else {
-                serial_println!(":: PORTSW-1: USB3PRM mask=0 — no switchable SuperSpeed ports advertised; skipping USB3_PSSEN write ::");
+                crate::bootlog_println!(":: PORTSW-1: USB3PRM mask=0 — no switchable SuperSpeed ports advertised; skipping USB3_PSSEN write ::");
                 ss_before
             };
             // --- USB2 routing (EHCI->xHCI) ---
@@ -164,7 +164,7 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
             } else {
                 // STOP-tripwire condition: no USB2 port advertised switchable — the internal
                 // keyboard/trackpad cannot be routed on this silicon as read. Report, don't force.
-                serial_println!(":: PORTSW-1: USB2PRM mask=0 — NO switchable USB2 ports advertised; internal kbd/trackpad NOT routable on this silicon; skipping XUSB2PR write ::");
+                crate::bootlog_println!(":: PORTSW-1: USB2PRM mask=0 — NO switchable USB2 ports advertised; internal kbd/trackpad NOT routable on this silicon; skipping XUSB2PR write ::");
                 usb2_before
             };
             (ss_after, usb2_after)
@@ -177,12 +177,12 @@ fn enable_intel_xhci_ports(bus: u8, dev: u8, func: u8) {
         // Intel part a read-back that equals `before | mask` confirms the mux toggled; a smaller
         // value means firmware locked some shared-port bits (Apple EFI may pre-own or refuse to
         // release them). On QEMU before == after (inert). Uncounted witness (`== witness ::`).
-        serial_println!(
+        crate::bootlog_println!(
             ":: PORTSW-1: XUSB2PR mask={:#x} routed {:#x}->{:#x} + USB3_PSSEN mask={:#x} {:#x}->{:#x} (default-on) == witness ::",
             usb2_mask, usb2_before, usb2_after, ss_mask, ss_before, ss_after
         );
         // PORTROUTE (USBNET2 M1+M2, read-only): the routing truth as it stands after the flip, per root port.
-        serial_println!(":: PORTROUTE: xusb2pr={:#06x} pssen={:#06x} mask={:#06x} switched=[{}] ehci_only=[{}] ::", usb2_after, ss_after, usb2_mask, PortBits(usb2_mask & usb2_after, false), PortBits(usb2_mask & usb2_after, true));
+        crate::bootlog_println!(":: PORTROUTE: xusb2pr={:#06x} pssen={:#06x} mask={:#06x} switched=[{}] ehci_only=[{}] ::", usb2_after, ss_after, usb2_mask, PortBits(usb2_mask & usb2_after, false), PortBits(usb2_mask & usb2_after, true));
         // GUI-WITNESS: record the mux flip as a boot milestone. "flip" = a real XUSB2PR write on
         // matched Intel silicon (the rMBP metal path); "inert" = the no-op read-only case (QEMU, or
         // no EHCI companion). Distinguishing the two on-panel tells a silent-serial bench whether the
@@ -760,7 +760,7 @@ fn init_network() {
     // QEMU's e1000 (82540EM) lands here; bring it up for polled RX.
     if let Some((bus, slot, func)) = crate::drivers::pci::PciScanner::find_device(0x02, 0x00) {
         let vendor = unsafe { read_config_16(bus, slot, func, 0x00) };
-        serial_println!(
+        crate::bootlog_println!(
             ":: x86_64 PCI: Found network controller (class 0x02) vendor {:#06x} at {}:{}.{} ::",
             vendor, bus, slot, func
         );
@@ -768,7 +768,7 @@ fn init_network() {
         // Broadcom Wi-Fi part (vendor 0x14e4) that also reports class 0x02 — poking it with e1000
         // register writes is wrong and its RX/TX bring-up (+ DHCP) just stalls. Gate to Intel.
         if vendor != 0x8086 {
-            serial_println!(":: x86_64 PCI: non-Intel NIC ({:#06x}) — no e1000 driver, skipping ::", vendor);
+            crate::bootlog_println!(":: x86_64 PCI: non-Intel NIC ({:#06x}) — no e1000 driver, skipping ::", vendor);
             return;
         }
         crate::drivers::e1000::init(bus, slot, func);
@@ -788,12 +788,12 @@ fn init_network() {
                     bus, slot, func, msg_addr, vector as u32,
                 );
             }
-            None => serial_println!(
+            None => crate::bootlog_println!(
                 ":: x86_64 PCI: NIC MSI NOT ARMED — this kernel allocated no `nic` interrupt vector, so there is no number to program and no handler to deliver to. RX stays on the polled path, unchanged == witness ::"
             ),
         }
     } else {
-        serial_println!(":: x86_64 PCI: No network controller (class 0x02) found ::");
+        crate::bootlog_println!(":: x86_64 PCI: No network controller (class 0x02) found ::");
     }
 }
 
@@ -895,7 +895,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     crate::bootpace::record("pci-probes"); let xhci_found = crate::drivers::pci::PciScanner::scan(); // BOOTWAITS (rmbp-ledger B152): `pci-scan` is stamped AFTER the walk and BPACE's `d=` is always the delta from the PREVIOUS stamp — which was `ehci-hid-done`, four knob-gated passenger blocks upstream (SMC-SCOUT, PCI-CENSUS, BCMA-RECON, and until this arc the HDA hook inside the walk itself). So the tag reported whatever had been hooked in above it, under a name that promises a config-space walk. Flight 11: `pci-scan d=1315ms`, of which the walk is ~1 ms (it early-returns at 0:20.0) and a full census is 6 ms (bootpace.md §10o) — the other 1314 ms is 104 ms of SMC key sweep (`UNAOS_SMC=1`, 25626->25730 ms) and 1210 ms of HDA. This stamp closes the window: everything between `ehci-hid-done` and here is `pci-probes`, and `pci-scan d=` is the walk. UNCONDITIONAL on purpose — a knob-gated stamp would make the tag mean different things on different builds, which is the exact failure being fixed. Costs one ring slot (flight 11 ran `n=28` of `CAP=64`, drop-NEWEST). ⚠ LINE-NEUTRAL append, statement BEFORE the first `//`.
     crate::bootpace::record("pci-scan");
     if let Some((xhci_phys_addr, bus, dev, func)) = xhci_found {
-        serial_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
+        crate::bootlog_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
 
         // DIAGNOSTIC (read-only): dump interrupt line/pin + capability list to plan
         // interrupt-driven bring-up (INTx IRQ vs MSI-X).
@@ -959,7 +959,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
                         bus, dev, func, xhci_phys_addr, msg_addr, vector as u32,
                     );
                 }
-                None => serial_println!(
+                None => crate::bootlog_println!(
                     ":: x86_64 PCI: xHCI MSI-X NOT ARMED — this kernel allocated no `xhci` interrupt vector, so there is no number to program and no handler to deliver to. The event ring stays on the polled drain, unchanged == witness ::"
                 ),
             };
@@ -1113,7 +1113,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         // One branch, never taken in a sound build, turns that mask into a conviction.
         let sum_cy = pace.sum();
         if sum_cy > span {
-            serial_println!(
+            crate::census_println!(
                 ":: GPACE: OVERLAP sum>span by {}cy — classes are not disjoint ::",
                 sum_cy - span
             );
@@ -1144,7 +1144,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
             j += 1;
         }
         let rv = sv.saturating_sub(named);
-        serial_println!(
+        crate::census_println!(
             ":: GPACE: {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) {}={}{}(n={}) resid={}{} == witness ::",
             GPACE_TAGS[G_XTAIL], v[G_XTAIL], unit, pace.n[G_XTAIL],
             GPACE_TAGS[G_BENCH], v[G_BENCH], unit, pace.n[G_BENCH],
@@ -1162,7 +1162,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
             Some(e) => gpace_fmt(now.wrapping_sub(e)),
             None => (0, "?"),
         };
-        serial_println!(
+        crate::census_println!(
             ":: GPACE: span={}{} anchor={} since-entry={}{} hz={} build={}{}{}{}{}{}{}{}{}{} == the pci-usb d= split ::",
             sv, su, anchor_tag, tv, tu, crate::bootpace::origin_hz(),
             GB_NONE, GB_KEPLER, GB_TAKEOVER, GB_FIFO, GB_IVB, GB_WC, GB_SMC,

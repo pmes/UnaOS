@@ -1337,7 +1337,7 @@ pub fn stage_flush(id: u32) {
         // is one absurd present beside a normal floor, which is exactly the pi's 218876-vs-2594. A
         // window whose floor is up there with it is uniformly slow, which is a different fault.
         let minp = H_MINPRES[i].load(Ordering::Relaxed);
-        serial_println!(
+        crate::census_println!(
             "[wc-h] win={} present_us={} bound_us={} minpresent_us={} -> STALL",
             id,
             longus,
@@ -1573,7 +1573,7 @@ fn emit_sample(id: u32, i: usize) {
         // Both INSERTED before `torn=`: the five keys another track's gate matches keep their order.
         let ob = H_OBS[i].load(Ordering::Relaxed);
         let torn = if ob & (1 << 48) != 0 { ob & (1 << 49) != 0 } else { present_us > rectscan_us };
-        serial_println!(
+        crate::census_println!(
             "[wc-h] win={} box={}x{} span={} band={} bytes={} compose_us={} present_us={} rectscan_us={} beam={} beamwait_us={} torn={} -> BUFFERED",
             id,
             bx >> 32,
@@ -1592,7 +1592,7 @@ fn emit_sample(id: u32, i: usize) {
         // A composite that ran on the pre-WC-H direct path. `-> DIRECT` deliberately does NOT carry
         // the rollup's verdict strings: one decline is a fact to report, not a boot to fail, and the
         // FORBIDs sit on the rollup where the aggregate lives.
-        serial_println!("[wc-h] win={} staged=no reason={} -> DIRECT", id, decl_name(kind));
+        crate::census_println!("[wc-h] win={} staged=no reason={} -> DIRECT", id, decl_name(kind));
     }
 }
 
@@ -2043,7 +2043,7 @@ pub fn erase_defer(w: usize, h: usize, reason: u32, requeued: bool) {
         // threshold gets its own one-shot line here, on the same reasoning that makes the deferral
         // lines unbudgeted: the FORBID is only worth having if the boot can still trip it.
         if r == E_REDEFER_MAX + 1 {
-            serial_println!(
+            crate::census_println!(
                 "[wc-k] rollup scope=starve redefers={} limit={} -> STARVED",
                 r,
                 E_REDEFER_MAX
@@ -2065,7 +2065,7 @@ pub fn erase_defer(w: usize, h: usize, reason: u32, requeued: bool) {
             return;
         }
     }
-    serial_println!(
+    crate::census_println!(
         "[wc-k] erase box={}x{} staged=defer reason={} requeued={} -> DEFERRED",
         w,
         h,
@@ -2111,7 +2111,7 @@ pub fn erase_wakeup_rescue() {
         // fires at sample 4 and a rescue by its nature arrives later (it needs a DECLINED pass, which
         // needs two cores compositing at once). A counter whose only home is a rollup that has
         // already printed is a counter nobody reads.
-        serial_println!("[wc-k] rollup scope=wakeup rescues={} -> RESCUED", n);
+        crate::census_println!("[wc-k] rollup scope=wakeup rescues={} -> RESCUED", n);
     }
 }
 
@@ -2127,7 +2127,7 @@ pub fn erase_wakeup_rescue() {
 pub fn erase_outside_publish(w: usize, h: usize) {
     let n = E_OUTSIDE.fetch_add(1, Ordering::Relaxed) + 1;
     if n == 1 {
-        serial_println!(
+        crate::census_println!(
             "[wc-k] rollup scope=publish box={}x{} outside={} -> UNPUBLISHED",
             w,
             h,
@@ -2267,7 +2267,7 @@ pub fn erase_note(
         } else {
             "TEAR-FREE"
         };
-        serial_println!(
+        crate::census_println!(
             "[wc-k] rollup scope=fills samples={} rows={} torn={} beam={} beamobs={} beamwait_us={} beamgiveup={} beamcross_ppk={} noncontig={} declines={} outside={} defers={} redefers={} coalesced={} rescues={} maxpresent_us={} frame_us={} -> {}",
             n,
             E_ROWS.load(Ordering::Relaxed),
@@ -3469,7 +3469,7 @@ fn paygo_note(id: u32, i: usize, state: &str, verdict: &str, chunks: Option<(u32
     // convicting.
     let (since_ms, clock, _) = paygo_clock();
     match chunks {
-        None => serial_println!(
+        None => crate::census_println!(
             "[wc-g] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} taken={} budget={} -> {}",
             id,
             state,
@@ -3483,7 +3483,7 @@ fn paygo_note(id: u32, i: usize, state: &str, verdict: &str, chunks: Option<(u32
             SAMPLES,
             verdict
         ),
-        Some((n, hold_max_us)) => serial_println!(
+        Some((n, hold_max_us)) => crate::census_println!(
             "[wc-g] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} taken={} budget={} -> {} chunks={} hold_max_us={}",
             id,
             state,
@@ -4254,7 +4254,7 @@ pub fn end(
     #[cfg(not(feature = "wcg-paygo"))]
     let (pf_bytes, pf_blit_us, pf_civac_us, pf_after_us, pf_probes, pf_rb_us) =
         (p.surf_len, p.cks_blit_us, p.civac_us, cks_after_us, checked, readback_us);
-    serial_println!(
+    crate::census_println!(
         "[wc-g] prof win={} seq={} surf_bytes={} cks_blit_us={} civac_us={} cks_after_us={} probes={} readback_us={}",
         p.id,
         p.seq,

@@ -4855,7 +4855,7 @@ static PP_SELFTEST_DONE: AtomicBool = AtomicBool::new(false);
 fn ptrpaint_selftest_once() {
     if PP_SELFTEST_DONE.load(Ordering::Relaxed) || crate::arch::irqs_masked() {
         return;
-    }
+    } static QB2: AtomicBool = AtomicBool::new(false); if crate::tests::defer_fast("ptrpaint", ptrpaint_selftest_once, &QB2) { return; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests ptrpaint` fires it.
     let Ok(held) = claim() else {
         return; // not latched: the sprite was in use, try again at the next unmasked pass
     };

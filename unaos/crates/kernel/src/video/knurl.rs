@@ -322,7 +322,7 @@ pub const TILE_FNV: u64 = 0x5695_7202_a422_b4b1;
 /// metal image is built without the `witness` feature, so a gated line is absent from the only
 /// artefact that matters. Cost is one bounded serial line per boot.
 fn witness(t: &[u32]) {
-    serial_println!(
+    crate::bootlog_println!(
         "[knurl] derived=peter-2026-08-09 algo=crosshatch-2x45 pitch={} amp_a_q16={} amp_b_q16={} budget_q16={} box={} tile={}x{} hash={:#018x}",
         PITCH,
         AMP_A_Q16,

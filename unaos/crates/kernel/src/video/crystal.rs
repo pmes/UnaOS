@@ -571,7 +571,7 @@ fn open_via(pw: usize, ph: usize, via: &str) {
     // `gap_left=` is the dropdown's gap (0) and `glyph_gap_left=` the mark's (12) — the two halves of
     // Peter's complaint as two falsifiable integers.
     let (cbx, _cby, cbw, cbh) = menubar::crystal_box_abs(pw, ph).unwrap_or((0, 0, 0, 0));
-    serial_println!(
+    crate::bootlog_println!(
         "[menubar] crystal menu={}x{}+{}+{} anchor=panel-left glyph={}x{}+{} bar_w={} \
          menu_x={} glyph_x={} gap_left={} glyph_gap_left={} ::",
         mw, mh, mx, my, cbw, cbh, cbx, pw, mx, cbx, mx, cbx

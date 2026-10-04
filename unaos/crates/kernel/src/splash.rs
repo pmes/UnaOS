@@ -794,7 +794,7 @@ pub fn hold_release(by: &str) {
     crate::video::wm::clear_modal_top(id);
     crate::video::wm::close(id);
     *HOLD_SURF.lock() = None; // after the row is gone: nothing reads the surface any more
-    serial_println!(
+    crate::bootlog_println!(
         "[splash] held_ms={} released_by={} fade_ms={}",
         t_rel.saturating_sub(HOLD_T0.load(Ordering::Relaxed)),
         by,

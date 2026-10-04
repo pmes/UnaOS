@@ -5577,7 +5577,7 @@ pub fn run_bsp(cpu: usize) -> ! {
     // "the BSP reached the handoff" from "the BSP is dispatching": everything after it is scheduler
     // work, and its absence with the spawn line present means the handoff block ran but `run()` was
     // never entered.
-    serial_println!(":: SCHED-X86: BSP entered run loop cpu={} ::", cpu);
+    crate::bootlog_println!(":: SCHED-X86: BSP entered run loop cpu={} ::", cpu);
     // SCHEDLOAD-X86 ANTI-WITNESS, and the only instant on the whole boot at which it can be taken.
     // Core 0 has not yet folded a single span — it is one statement away from `run()` — while the APs
     // have been dispatching since the scheduler was enabled. So this line MUST read `c0=--` with at

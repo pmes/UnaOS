@@ -55,7 +55,7 @@
 /// Warm-reboot the machine via the platform's firmware mechanism. Never returns: either the
 /// platform resets, or the failure witness prints and the core parks in `hlt_loop`.
 pub fn reboot() -> ! {
-    serial_println!("[pwrreboot] reboot verb invoked — dispatching the platform mechanism");
+    crate::bootlog_println!("[pwrreboot] reboot verb invoked — dispatching the platform mechanism");
     prelude("reboot"); // POWERMENU M1
     crate::fs::fat::flush_pending_dirent_by("shutdown"); // SDHCMULTI2 M2: a deferred dir entry must not die with the power
     platform_reboot()
@@ -112,7 +112,7 @@ fn psci_call(func: u64) -> i64 {
 
 #[cfg(all(target_arch = "aarch64", not(feature = "pi")))]
 fn platform_reboot() -> ! {
-    serial_println!(
+    crate::bootlog_println!(
         "[pwrreboot] PSCI SYSTEM_RESET ({:#010x}) via SMC — firmware owns the machine from here",
         PSCI_SYSTEM_RESET
     );
@@ -156,7 +156,7 @@ fn platform_shutdown() -> ! {
 
 #[cfg(all(target_arch = "aarch64", feature = "pi"))]
 fn platform_reboot() -> ! {
-    serial_println!(
+    crate::bootlog_println!(
         "[pwrreboot] no reboot mechanism wired on this platform (Pi: no PSCI; the BCM2711 PM/WDOG path is the pi lane's) — parking in hlt"
     );
     // PWRDRAIN: `hlt_loop` is also a context with no next print — a staged line would sit in the ring
@@ -183,7 +183,7 @@ fn platform_shutdown() -> ! {
 /// with its own line if the platform will not comply). It takes no lock past this line.
 #[cfg(target_arch = "x86_64")]
 fn platform_reboot() -> ! {
-    serial_println!("[pwrreboot] x86 mechanism: FADT RESET_REG ladder (acpi_power::reboot)");
+    crate::bootlog_println!("[pwrreboot] x86 mechanism: FADT RESET_REG ladder (acpi_power::reboot)");
     // PWRDRAIN: `acpi_power::reboot` already drains (it has since LOCKFIX), but it does so with no
     // witness, so a capture could not tell a flushed ring from a ring that was never reached. The
     // count goes on the wire here; the second drain downstream then finds the ring empty.
