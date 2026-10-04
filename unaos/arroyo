@@ -11094,12 +11094,15 @@ kernel8() {
     if [ -n "${UNAOS_VEIN:-}" ]; then
         K8_FEATS="${K8_FEATS},vein"
         echo -e "${COLOR_YELLOW}  • UNAOS_VEIN: VEINCORE chat verbs 130..=133 owned by ring-3 VEIN.BIN (kernel relay plumbing: vein verb, tests vein)${COLOR_RESET}"
+    fi
     if [ -n "${UNAOS_LUMEN:-}" ]; then
         K8_FEATS="${K8_FEATS},lumen"
         echo -e "${COLOR_YELLOW}  • UNAOS_LUMEN: LUMENBIN — the lumen dock pin in the default set (the Pi image carries no LUMEN.BIN yet: its aarch64 text exceeds the window; tests lumen is x86)${COLOR_RESET}"
+    fi
     if [ -n "${UNAOS_NETRING3:-}" ]; then
         K8_FEATS="${K8_FEATS},netring3"
         echo -e "${COLOR_YELLOW}  • UNAOS_NETRING3: ring-3 SYS_GETRANDOM (56) + SYS_RESOLVE (57, -ENODEV on aarch64); tests net${COLOR_RESET}"
+    fi
     if [ -n "${UNAOS_PREFS_RESET:-}" ]; then
         K8_FEATS="${K8_FEATS},prefs_reset"
         echo -e "${COLOR_YELLOW}  • UNAOS_PREFS_RESET: BRIGHTFLOOR safe mode — system.display.* reset to defaults at every login${COLOR_RESET}"
