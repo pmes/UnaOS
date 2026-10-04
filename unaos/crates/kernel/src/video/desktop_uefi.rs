@@ -639,7 +639,7 @@ pub fn activate_on(desc: SurfaceDesc) {
     );
 
     #[cfg(feature = "witness")]
-    move_vacate_probe(pw, ph);
+    move_vacate_register(); // TESTFIX3 (R80): the probe runs under `tests movevacate`, never here — at this seam the splash hold covers the glass (FLIGHT 19: `painted=false desktop=0/5 stale=0/5` on all four boots)
 
     // INSTGUI — the graphical installer dialog, in front of everything (created last = top z).
     // Double-gated: `wc` (this module) AND `instgui` (`UNAOS_INSTGUI=1`).
@@ -1053,3 +1053,37 @@ fn move_vacate_probe(pw: usize, ph: usize) {
         if painted && clean == pts.len() { "PASS" } else { "FAIL" }
     );
 }
+
+/// TESTFIX3 (R80) — `tests movevacate`. FLIGHT 19 printed `[wc-x] move-vacate … painted=false
+/// desktop=0/5 stale=0/5 -> FAIL` on every boot: the probe ran inside `activate`, one second after
+/// `[splash] hold OPEN win=1 2880x1800` pinned the full-panel splash as the modal top, so every sample
+/// read the SPLASH's pixels (neither the probe colour nor the desktop) — a fixture-ordering fault, not
+/// a vacate bug. It is now a registered fixture fired by `tests`, and it SKIPs (by name) if a modal row
+/// (the splash, the login screen, an alert) still holds the top, since such a row occludes the probe
+/// box by design. Witness shape unchanged.
+#[cfg(feature = "witness")]
+fn move_vacate_register() {
+    static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !ONCE.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        crate::tests::register("movevacate", move_vacate_test);
+    }
+}
+
+#[cfg(feature = "witness")]
+fn move_vacate_test() {
+    let (pw, ph) = {
+        let fb = *super::WRITER.lock();
+        if !fb.is_ready() {
+            serial_println!("[wc-x] move-vacate SKIP (framebuffer not ready)");
+            return;
+        }
+        let i = fb.info();
+        (i.width, i.height)
+    };
+    if wm::modal_top_held() {
+        serial_println!("[wc-x] move-vacate SKIP (a modal row holds the top — splash, login screen or alert)");
+        return;
+    }
+    move_vacate_probe(pw, ph);
+}
+
