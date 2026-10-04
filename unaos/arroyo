@@ -3801,7 +3801,7 @@ build_user_vein_x86() {
 # LUMENBIN (B305): build the x86_64 static ELF64 ring-3 CHAT WINDOW (crates/user-lumen → target/LUMEN-X86.ELF),
 # staged as APPS/LUMEN.ELF by the builder. The exact shape of build_user_prefs_x86 above (same linker-script
 # SHAPE, same four assertions, same explicit --target). Built on every x86 media run like PREFS.ELF: the
-# image is inert until launched (`lumen` / `bg /apps/LUMEN.ELF`); UNAOS_LUMEN=1 adds the dock pin and the
+# image is inert until launched (a bare `lumen`: its note detaches it — EXECNAME B322); UNAOS_LUMEN=1 adds the dock pin and the
 # `tests lumen` fixture. Its link script asserts the 16 KiB window's stack headroom itself.
 build_user_lumen_x86() {
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"

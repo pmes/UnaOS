@@ -2628,7 +2628,7 @@ fn which_report(console: &mut Console, word: &str) {
     if facts.exec {
         let mut vol = FatVolume;
         if let Some(name) = midden_core::resolve_exec(word, &mut vol) {
-            return console.println(&alloc::format!("{}: program {}", word, name));
+            return console.println(&alloc::format!("{}: program {}", word, exec_display_path(&name).unwrap_or(name))); // EXECNAME (B322): the on-disk path, e.g. `lumen: program /apps/LUMEN.ELF`. ⚠ SAME-LINE fold, line-NEUTRAL.
         }
         return console.println_styled(crate::video::theme::TERM_RED, &alloc::format!("{}: not found (no verb, no program)", word));
     }
@@ -6173,7 +6173,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             crate::power::reboot();
         },
         #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
-        "lumen" => { bg_program(console, "/apps/LUMEN.ELF"); } #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))] "bg" => { // LUMENBIN (B305) — `lumen` opens the ring-3 chat window: EXACTLY `bg /apps/LUMEN.ELF` (same spawn, job table, window title), so it carries `bg`'s cfg; the dock's lumen pin runs this verb. ⚠ SAME-LINE fold, line-NEUTRAL, code before comment.
+        "bg" => { // EXECNAME (B322, R82): the `lumen` arm that sat here (a hard-wired `bg /apps/LUMEN.BIN`) is DELETED — `lumen` is the program LUMEN.ELF, resolved by `midden_core::resolve_exec` and launched by its own note like every program; the dock pin dispatches `/apps/LUMEN.ELF` through the same path. ⚠ SAME-LINE fold, line-NEUTRAL.
             // BGRUN-1: run a user program in the BACKGROUND — the shell returns to its prompt at once and
             // the program keeps running (and, if windowed, its window stays OPEN, so TAB has a ring to
             // walk — this is what turns the WC-TAB binding into a workflow: `run` blocks until its app
@@ -8952,4 +8952,32 @@ fn exec_detaches(bytes: &[u8], canon: &str, typed: &str) -> bool {
     serial_println!(":: BAREXEC: {} (typed '{}') — note flags={} -> {} ::", canon, typed, flags,
         if detach { "detach" } else { "foreground" });
     detach
+}
+
+/// EXECNAME (B322): the absolute, ON-DISK spelling of a program the core resolved — `which lumen`
+/// answers `/apps/LUMEN.ELF`, not the elided probe string `lumen.elf`. The same two probes the launch
+/// makes (the cwd, then [`EXEC_ROOT`]) asked of the namespace, then the parent listing for the
+/// spelling (a case-insensitive backend matched the probe; the listing holds the name as stored).
+/// `None` = the namespace no longer has it; the caller falls back to the core's string.
+fn exec_display_path(name: &str) -> Option<String> {
+    let mt = vfs_mount_table();
+    let is_file = |p: &str| matches!(mt.stat(p), Ok(st) if !matches!(st.kind, crate::fs::vfs::NodeKind::Dir));
+    let from_cwd = vfs_path(name);
+    let hit = if is_file(&from_cwd) {
+        from_cwd
+    } else if !name.starts_with('/') && is_file(&normalize_path(EXEC_ROOT, name)) {
+        normalize_path(EXEC_ROOT, name)
+    } else {
+        return None;
+    };
+    let (dir, leaf) = match hit.rfind('/') {
+        Some(0) => ("/", &hit[1..]),
+        Some(i) => (&hit[..i], &hit[i + 1..]),
+        None => return Some(hit.clone()),
+    };
+    match mt.read_dir(dir) {
+        Ok(rows) => Some(rows.iter().find(|r| r.name.eq_ignore_ascii_case(leaf))
+            .map(|r| normalize_path(dir, &r.name)).unwrap_or_else(|| hit.clone())),
+        Err(_) => Some(hit.clone()),
+    }
 }

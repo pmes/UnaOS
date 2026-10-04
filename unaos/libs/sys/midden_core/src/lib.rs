@@ -366,7 +366,7 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // FILEVIEW `view` / TEXTEDIT `edit`: ring arms are desktop-gated (wc or desktop_firmware); registered Always on the `dns` precedent (a gated-off arm falls through to bare-name launch, never a typo refusal).
     ("view", Avail::Always), ("edit", Avail::Always), ("activity", Avail::Always), ("settings", Avail::Always), ("trash", Avail::Always), ("shortcuts", Avail::Always), ("play", Avail::Always), ("linux", Avail::Always), ("shot", Avail::Always), ("pref", Avail::Always), ("battery", Avail::Always), ("vein", Avail::Always), // VEINCORE (B304): `vein` (cfg-gated arm `vein`, registered Always like `src`). POWERMENU: `battery` (cfg-gated arm, registered Always like `src`). PREFS (B300): Principia's store, ungated arm; ACTIVITY (R75); TRASH/SHORTCUTS/PLAYWAV/LINUXABI/SHOTREGION: arms are cfg-gated, registered Always like `src`
     // processes
-    ("run", Avail::Proc), ("bg", Avail::Proc), ("storm", Avail::Proc), ("lumen", Avail::Proc), // LUMENBIN: `lumen` = `bg /apps/LUMEN.ELF`, so `bg`'s availability
+    ("run", Avail::Proc), ("bg", Avail::Proc), ("storm", Avail::Proc), // EXECNAME (B322, R82): the `lumen` row is GONE with its shortcut arm — `lumen` is the program LUMEN.ELF, reached by bare name like every program
     ("jobs", Avail::Proc), ("kill", Avail::Proc),
     // BASICS (orin 17, Peter: "some of the commands were 1 off tests we need basic commands
     // back"). The everyday words a prompt is unusable without. Every one is `Plan::Host` and not
@@ -676,16 +676,16 @@ pub fn help(facts: &Facts) -> String {
         say!("APPS:     v3d (replay the visible GPU graphics battery)");
     }
     if facts.proc_verbs {
-        say!("PROC:     bg <path> (background), jobs (list+reap), kill <pid>");
+        say!("PROC:     bg <path> / run <path> (force background / foreground), jobs (list+reap), kill <pid>");
     }
     // BARENAME (PARITY 6.6a): keyed off `exec`, the fact these two lines actually describe, not
     // off `x86`, the arch that happened to be the only one carrying it. A help line that names a
     // capability must be gated on the capability.
     if facts.exec {
-        say!("          <name.elf>  (just type it: vug.elf runs VUG.ELF in a window, prompt returns)");
+        say!("          <name>      (just type it: lumen opens its window and the prompt returns; net runs, then prints its exit)");
         // BARE-NAME (M1): the elision is a resolution rule, so it is stated
         // where the launch rule is stated. `.elf` stays visible in `ls`.
-        say!("          <name>      (the .elf is optional: vug finds VUG.ELF; ls still shows VUG.ELF)");
+        say!("          the .elf is optional (lumen finds LUMEN.ELF); the program says how it runs: a window or a server detaches, else foreground");
     }
     say!("POWER:    reboot (warm reboot), shutdown|off (power off, cold-boot-ready) - via the platform firmware");
     // RELICS (R26 clause 1): `netinfo` is `ifconfig` and not `ip`, and the OUTPUT is the reason.
@@ -1245,5 +1245,10 @@ mod execname_tests {
         }
         // B322: the old staging name was unreachable by bare name — the reason the `lumen` arm existed.
         assert_eq!(resolve_exec("lumen", &mut NameList(&["LUMEN.BIN"])), None);
+        // M3: `lumen` is no verb any more — the line plans as Exec, which is what the dock pin dispatches too.
+        let f = Facts { exec: true, proc_verbs: true, x86: true, ..Facts::bare() };
+        assert!(!is_verb("lumen", &f));
+        assert_eq!(plan("lumen", &f, &mut NameList(&staged)), Plan::Exec { typed: "lumen".to_string(), name: "LUMEN.ELF".to_string() });
+        assert_eq!(plan("/apps/LUMEN.ELF", &f, &mut NameList(&["/apps/LUMEN.ELF"])), Plan::Exec { typed: "/apps/LUMEN.ELF".to_string(), name: "/apps/LUMEN.ELF".to_string() });
     }
 }

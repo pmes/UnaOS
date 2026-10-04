@@ -1012,7 +1012,7 @@ fn main() {
     } else {
         println!("   VEIN: target/VEIN-X86.ELF absent — ESP has no VEIN.ELF (run via ./arroyo esp-x86)");
     // LUMENBIN (B305): the ring-3 chat window (crates/user-lumen, built by arroyo's build_user_lumen_x86 to
-    // target/LUMEN-X86.ELF), staged as APPS/LUMEN.ELF beside PREFS.ELF — `lumen` (= `bg /apps/LUMEN.ELF`)
+    // target/LUMEN-X86.ELF), staged as APPS/LUMEN.ELF beside PREFS.ELF — a bare `lumen` (EXECNAME: its note detaches it)
     // opens it; it speaks the chat verbs VEIN.ELF fulfils.
     let lumen_elf = target_dir.join("LUMEN-X86.ELF");
     if lumen_elf.exists() {

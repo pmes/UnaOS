@@ -3165,7 +3165,7 @@ pub const DP_PINS: [DpSpec; 7] = [
     DpSpec { name: "activity", initial: b'A', kind: DpKind::Ring3Program, verb: "activity", id: wm::WinId::MAX - 4 },
     DpSpec { name: "settings", initial: b'G', kind: DpKind::Ring3Program, verb: "settings", id: wm::WinId::MAX - 5 },
     DpSpec { name: "editor",   initial: b'E', kind: DpKind::KernelWindow, verb: "edit",     id: wm::WinId::MAX - 6 },
-    DpSpec { name: "lumen",    initial: b'L', kind: DpKind::Ring3Program, verb: "lumen",    id: wm::WinId::MAX - 7 }, // LUMENBIN (B305): LUMEN.ELF, the ring-3 chat window; launch = the `lumen` verb (= `bg /apps/LUMEN.ELF`), matched by `app_name_of` == "lumen". Index 6, default-pinned only under `lumen` (DP_ALL).
+    DpSpec { name: "lumen",    initial: b'L', kind: DpKind::Ring3Program, verb: "/apps/LUMEN.ELF", id: wm::WinId::MAX - 7 }, // EXECNAME (B322): the launch line is the PROGRAM PATH, dispatched by `shell::dispatch_command` exactly as typed — midden_core resolves it (Plan::Exec) and its note detaches it; one launch path, the shell's. LUMENBIN (B305): LUMEN.ELF, the ring-3 chat window, matched by `app_name_of` == "lumen". Index 6, default-pinned only under `lumen` (DP_ALL).
 ];
 const DP_FIRST_EXTRA: usize = 3;
 /// A pin row's synthetic owner for a ring-3 app with no live window: never a real owner id.

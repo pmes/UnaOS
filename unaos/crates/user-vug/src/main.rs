@@ -4013,3 +4013,10 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
         core::hint::spin_loop();
     }
 }
+
+/// EXECNAME (B322, R82): this program's launch declaration — it opens a window (SYS_WIN_CREATE), so a
+/// bare `vug` detaches like `bg`. Kept by both link scripts under a PT_NOTE header; read by
+/// `midden_core::app_note_flags`.
+#[used]
+#[link_section = ".note.unaos.app"]
+static APP_NOTE: una_abi::AppNote = una_abi::AppNote::new(una_abi::APP_FLAG_WINDOWED);
