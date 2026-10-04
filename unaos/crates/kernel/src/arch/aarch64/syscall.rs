@@ -6898,7 +6898,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         SYS_OPEN => sys_open(a0, a1, a2),
         SYS_READ => sys_read(a0, a1, a2),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), #[cfg(feature = "netring3")] una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
+        SYS_UNLINK => sys_unlink(a0), una_abi::SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-2 (B185): the rename verb beside the unlink whose authority it spends — `bus_mv`'s body under the caller's own identity (fourth arg in x3). Fully-qualified so no `use` line is added; body at the FILE TAIL. ⚠ SAME-LINE fold.
         SYS_CLOSE => sys_close(a0),
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(), #[cfg(feature = "net6")] una_abi::SYS_SOCKET => net6_sys_socket(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_BIND => net6_sys_bind(a0, a1), #[cfg(feature = "net6")] una_abi::SYS_SENDTO => net6_sys_sendto(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_RECVFROM => net6_sys_recvfrom(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_CONNECT => net6_sys_connect(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SEND => net6_sys_send(a0, a1, a2), #[cfg(feature = "net6")] una_abi::SYS_SOCK_RECV => net6_sys_sock_recv(a0, a1, a2), // NET6 (SOCKNUM 40..46) — the aarch64 arm of the socket family, over the SHARED `net_phy::net6` stack. Fully-qualified `una_abi::` paths (not `use` lines) and all seven folded onto this ONE existing arm: `syscall.rs` compiles into every aarch64 image and `panic::Location` embeds the source line, so a new line here would move the knob-off jetson/kernel8 images. ⚠ LINE-NEUTRAL append — bodies at the FILE TAIL.
@@ -25867,14 +25867,16 @@ fn sys_attrsurf(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 
 /// NETRING3 M1 (B306): `SYS_GETRANDOM(buf, len) -> count / -errno` — the aarch64 twin (RNDR-seeded where
 /// the CPU has it, else jitter; the seed source is said on the wire).
-#[cfg(feature = "netring3")]
 fn sys_getrandom(buf_ptr: u64, len: u64) -> i64 {
     let n = (len as usize).min(una_abi::GETRANDOM_MAX);
     if n == 0 {
         return 0;
     }
     let mut k = [0u8; una_abi::GETRANDOM_MAX];
+    #[cfg(feature = "netring3")]
     let got = crate::netring3::getrandom(&mut k[..n]);
+    #[cfg(not(feature = "netring3"))]
+    let got = crate::rand::getrandom(&mut k[..n]); // RING3ABI2 M1: unconditional
     let r = copy_to_user(buf_ptr, &k[..got], got);
     k.fill(0);
     if r.is_err() { EFAULT } else { got as i64 }

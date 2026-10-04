@@ -202,10 +202,8 @@ pub fn draws() -> u64 {
 // =================================================================================================
 
 /// Output bytes between reseeds.
-#[cfg(feature = "netring3")]
 pub const RESEED_BYTES: u64 = 65536;
 
-#[cfg(feature = "netring3")]
 struct Drbg {
     key: [u8; 32],
     ctr: u64,
@@ -213,16 +211,12 @@ struct Drbg {
     seeded: bool,
 }
 
-#[cfg(feature = "netring3")]
 static DRBG: spin::Mutex<Drbg> = spin::Mutex::new(Drbg { key: [0; 32], ctr: 0, since_seed: 0, seeded: false });
-#[cfg(feature = "netring3")]
 static DRBG_SAID: AtomicU8 = AtomicU8::new(0);
 /// The seed source the last reseed used (0 rdseed, else a `Source` + 1).
-#[cfg(feature = "netring3")]
 static SEED_SRC: AtomicU8 = AtomicU8::new(0xFF);
 
 /// RDSEED: CPUID.(EAX=07H,ECX=0):EBX[18]. 32 bytes, ten retries per word, or `None`.
-#[cfg(feature = "netring3")]
 fn rdseed32(out: &mut [u8; 32]) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -251,7 +245,6 @@ fn rdseed32(out: &mut [u8; 32]) -> bool {
 }
 
 /// Name of the source the DRBG was last seeded from.
-#[cfg(feature = "netring3")]
 pub fn seed_source() -> &'static str {
     match SEED_SRC.load(Ordering::Relaxed) {
         0 => "rdseed",
@@ -262,7 +255,6 @@ pub fn seed_source() -> &'static str {
     }
 }
 
-#[cfg(feature = "netring3")]
 fn reseed(d: &mut Drbg) {
     let mut hw = [0u8; 32];
     let src: u8 = if rdseed32(&mut hw) {
@@ -288,7 +280,6 @@ fn reseed(d: &mut Drbg) {
 }
 
 /// Fill `out` (any length) from the DRBG. Returns the seed source's name.
-#[cfg(feature = "netring3")]
 pub fn drbg_fill(out: &mut [u8]) -> &'static str {
     let mut d = DRBG.lock();
     if !d.seeded || d.since_seed >= RESEED_BYTES {
@@ -310,4 +301,16 @@ pub fn drbg_fill(out: &mut [u8]) -> &'static str {
     h.update(b"next");
     d.key = h.finalize();
     seed_source()
+}
+
+/// RING3ABI2 M1 (rmbp-ledger B333): the body of `SYS_GETRANDOM` (56) on both arches and in EVERY build —
+/// an entropy syscall is core ABI, not a network feature. At most `una_abi::GETRANDOM_MAX` bytes from the
+/// DRBG above; returns the count written. (`netring3::getrandom` adds its first-call wire line and lands
+/// here.)
+pub fn getrandom(buf: &mut [u8]) -> usize {
+    let n = buf.len().min(una_abi::GETRANDOM_MAX);
+    if n > 0 {
+        drbg_fill(&mut buf[..n]);
+    }
+    n
 }
