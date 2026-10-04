@@ -741,6 +741,8 @@ fn main() {
     if std::env::var("UNAOS_LUMEN").is_ok() { feats.push("lumen"); }
     // NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM / SYS_RESOLVE and `tests net`. Kept in sync with arroyo.
     if std::env::var("UNAOS_NETRING3").is_ok() { feats.push("netring3"); }
+    // SELFDIAG (B324): UNAOS_SELFDIAG=1 arms the boot log on disk, SYS_PATH_READ/WRITE and `tests selfdiag`. Kept in sync with arroyo.
+    if std::env::var("UNAOS_SELFDIAG").is_ok() { feats.push("selfdiag"); }
     // BRIGHTFLOOR: UNAOS_PREFS_RESET=1 resets system.display.* at every login (safe-mode knob). Kept in sync with arroyo.
     if std::env::var("UNAOS_PREFS_RESET").is_ok() { feats.push("prefs_reset"); }
     // KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the copy-engine blitter (cpu until KBLIT binds its channel). Kept in sync with arroyo.
@@ -1026,6 +1028,23 @@ fn main() {
     } else {
         println!("   NET: target/NET-X86.ELF absent — ESP has no NET.ELF (run via ./arroyo esp-x86)");
     }
+    // SELFDIAG M2 (B324, R82): the diagnosis program (crates/user-diag, built by arroyo's build_user_diag_x86 to
+    // target/DIAG-X86.ELF), staged as APPS/DIAG.ELF — a bare `diag` runs it in the foreground (console, app
+    // note flags 0) — and the witness OWNERS table (scripts/witness-owners.py → target/witness-owners.txt),
+    // staged as system/witness-owners.txt: the program pairs each FAIL line with the file that prints it.
+    let diag_elf = target_dir.join("DIAG-X86.ELF");
+    if diag_elf.exists() {
+        std::fs::copy(&diag_elf, esp_apps.join("DIAG.ELF")).unwrap();
+        println!("   DIAG: copied DIAG.ELF into APPS/ on the ESP (diag)");
+    } else {
+        println!("   DIAG: target/DIAG-X86.ELF absent — ESP has no DIAG.ELF (run via ./arroyo esp-x86)");
+    }
+    let owners_txt = target_dir.join("witness-owners.txt");
+    if owners_txt.exists() {
+        std::fs::create_dir_all(esp_dir.join("system")).unwrap();
+        std::fs::copy(&owners_txt, esp_dir.join("system").join("witness-owners.txt")).unwrap();
+        println!("   DIAG: copied witness-owners.txt into system/ on the ESP");
+    }
 
     // -----------------------------------------------------------------------------------------
     // WINX-7 PKG — the DATA tree: the EL0 artifacts staged for the volume the RUNNING KERNEL reads.
@@ -1092,11 +1111,19 @@ fn main() {
         (target_dir.join("NET-X86.ELF"), "NET.ELF"),
         // RING3WIN (B316): the ELF-window proof program — `tests ring3win` reads /apps/BIG.ELF there.
         (target_dir.join("BIG-X86.ELF"), "BIG.ELF"),
+        // SELFDIAG M2 (B324): the diagnosis program rides the DATA volume too — `diag` reads it there.
+        (target_dir.join("DIAG-X86.ELF"), "DIAG.ELF"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();
             staged_data.push(dst);
         }
+    }
+    // SELFDIAG M2 (B324): the owners table rides the DATA volume too (system/witness-owners.txt).
+    if target_dir.join("witness-owners.txt").exists() {
+        std::fs::create_dir_all(data_dir.join("system")).unwrap();
+        std::fs::copy(target_dir.join("witness-owners.txt"), data_dir.join("system").join("witness-owners.txt")).unwrap();
+        staged_data.push("system/witness-owners.txt");
     }
     // `hello.txt` rides along so the operator has a trivial `cat hello.txt` probe that proves the
     // kernel is reading THIS volume — the one-command answer to "did I write the right stick?".

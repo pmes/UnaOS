@@ -23,6 +23,7 @@ const STAGED: &[(&str, Option<u32>)] = &[
     ("lumen", Some(una_abi::APP_FLAG_WINDOWED)),
     ("net", Some(0)),
     ("big", Some(0)),
+    ("diag", Some(0)), // SELFDIAG (B324): APPS/DIAG.ELF, console
 ];
 
 pub fn selftest() {
