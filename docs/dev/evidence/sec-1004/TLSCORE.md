@@ -15,7 +15,7 @@ by nothing but this crate's own `[dev-dependencies]` self-reference). Non-dev de
 
 | RFC 8446 | what |
 |---|---|
-| §4.1.1–4.1.4 | ClientHello (SNI, supported_groups x25519+P-256, key_share, signature_algorithms filtered by `supports_signature`, ALPN, supported_versions, psk_key_exchange_modes absent), ServerHello checks (suite/extension/session-id echo, downgrade sentinel), HelloRetryRequest (cookie, group change, message_hash transcript) |
+| §4.1.1–4.1.4 | ClientHello (SNI, supported_groups x25519+P-256, key_share, signature_algorithms filtered by `supports_signature`, ALPN, supported_versions, psk_key_exchange_modes absent), ServerHello checks (suite/extension/session-id echo; no supported_versions = a TLS 1.2 server → protocol_version alert, so the downgrade sentinel never arises), HelloRetryRequest (cookie, group change, message_hash transcript) |
 | §4.2 | EncryptedExtensions checks (ALPN must be one we offered; unsolicited extensions refused) |
 | §4.4.1–4.4.4 | Certificate (chain to the verifier), CertificateVerify (scheme must be offered and CV-legal; 64×0x20 context), Finished both ways (constant-time compare) |
 | §4.6.1, §4.6.3 | NewSessionTicket parsed and kept (resumption not offered), KeyUpdate sent and answered both directions |
@@ -23,7 +23,7 @@ by nothing but this crate's own `[dev-dependencies]` self-reference). Non-dev de
 | §6 | alerts: close_notify both ways, fatal alerts sent with the right description, peer alerts surfaced |
 | §7.1–7.5 | HKDF-Extract/Expand-Label, Derive-Secret, every traffic secret, finished keys, exporter + resumption master, resumption PSK |
 | RFC 5280 §4.1, §4.2.1.{1,2,3,9,10,12}, §6 (Web PKI profile) | DER-strict parse; AKI/SKI, KeyUsage, BasicConstraints + pathLen, NameConstraints (dNSName/iPAddress), EKU serverAuth; unknown critical extension rejects; path building with backtracking over the presented intermediates (any order, junk skipped), signature budget 64, depth 6 |
-| RFC 6125 §6 | SAN dNSName / iPAddress only (CN ignored), left-most-label wildcard only, IDNA A-labels compared case-insensitively |
+| RFC 6125 §6 | SAN dNSName / iPAddress only (CN ignored), left-most-label wildcard only, names compared as ASCII (A-labels), case-insensitively; no U-label conversion |
 
 ## Oracles and results
 
@@ -103,8 +103,9 @@ loaded with `tls_core::x509::TrustStore::from_pem`.
 * No PSK / resumption / 0-RTT (tickets are parsed and dropped); no client certificates (post-handshake auth refused).
 * No revocation: no OCSP, no OCSP stapling, no CRL; no Certificate Transparency (SCTs ignored).
 * X.509: Name comparison is byte-equality (no RFC 5280 §7.1 normalisation — Web PKI CAs encode identically, all 5
-  captured chains pass); certificatePolicies / policy constraints / inhibitAnyPolicy not processed (non-critical
-  ones are ignored, critical ones reject); name constraints only for dNSName/iPAddress (others → refuse when
+  captured chains pass); certificatePolicies, CRL distribution points and issuerAltName are recognised and accepted WITHOUT
+  processing (even when marked critical — a gap vs RFC 5280 §6.1 policy processing); policyConstraints /
+  inhibitAnyPolicy are unknown and reject when critical; name constraints only for dNSName/iPAddress (others → refuse when
   they are the only constraint); no P-521, no Ed448, no DSA; no AIA fetching of missing intermediates.
 * Groups: X25519 and P-256 only (no X25519MLKEM768 hybrid yet); suites: the three mandatory-ish TLS 1.3 suites.
 * No HTTP — the oracle's GET is a byte string; `vein_ring3` still uses `embedded-tls` until the fold wires this in.
