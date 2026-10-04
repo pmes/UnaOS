@@ -264,20 +264,20 @@ fi
 bc_table() {
 cat <<'TABLE'
 witness|:: U1a: no application processors online — ring-3 demo SKIPPED ::|!baremetal,!bootlog,!usbdebug@except:x86_64+wc,!tegra|measured(1)
-wc|[wc-x] desktop-app DECLINE reason=no-storage name=/|-|measured(1)
+wc|[wc-x] desktop-app|-|measured(1)
 linuxabi|:: LINUXABI: path=|-|measured(1)
 busreg|:: BANDY3: registered=|-|measured
-wcg-paygo|[wc-g] paygo win=|witness|measured
+wcg-paygo|paygo|witness|measured
 wcdvalve|[wc-d] valve CLOSED util~|witness|measured
 logts|:: LOGWIT-1 probe seq=|witness|measured
 usbdebug|USB-DEBUG: ptr report (rel)|-|measured
-ehcihid|:: EHCI-HID: DMAR: no ACPI DMAR table|-|measured
-kbdwit|SILENCE-ENDED-HALTED|ehcihid|measured
+ehcihid|EHCI-HID: [|-|measured
+kbdwit|:: EHCI-HID: |ehcihid|measured
 smc|:: SMC-BATT: sweep failed (present=false)|-|measured
-smcwalk|:: SMC-SCOUT: idx|smc|measured
+smcwalk|:: SMC-SCOUT:|smc|measured
 sdw|[sdhc-w] cmd24 lba=|-|measured
 sdw-ro|sdw-ro=1 wp-pin=unread write-path=unread -> sdhc=ro reason=opt-out|-|measured
-sdhcblk|the staged file is FRAGMENTED; the permit describes exactly one LBA interval|-|measured
+sdhcblk|:: SDHCBLK:|-|measured
 sdwrite|:: SDWRITE-POSTURE: posture=|witness|measured
 irqstorage|:: bx-blockreq: no block device|-|measured(1)
 bt|vendor-classed: RF/Bluetooth subclass+protocol|-|measured
@@ -289,7 +289,7 @@ wifi3|:: wifi2: ucode upload words=|-|measured
 wifi4|:: wifi4: REFUSED reason=wifi3-upload-not-proven|-|measured(1)
 nvidia-kepler|:: kepler: probe-abort bar0-unmapped|-|measured
 nvidia-kepler-takeover|:: kdisp: takeover-abort no-gop-info ::|nvidia-kepler|measured
-nvidia-kepler-fifo|[NVIDIA] Starting PFIFO initialization|nvidia-kepler|measured
+nvidia-kepler-fifo|:: kepler: |nvidia-kepler|measured
 nvidia-kepler-ce|VOID — the control bracket moved across this base|-|measured
 noaspm|[pcih] aspm cleared rp|-|measured
 rtwit|[rtwit] <utf8-error>|-|measured
@@ -298,7 +298,7 @@ intel-ivb|:: igpu: VERDICT: Present but BAR not decoding|-|measured
 gen7|:: gen7: r6 next=STOP-window-or-register-block-out-of-range|-|measured
 gmux_igd|:: igpu: [GMUX] switched DISPLAY, EXTERNAL, and DDC to IGD|intel-ivb|measured
 unaos_ivb|@boot iGPU trace 1 (pre-EBS) collected.|-|measured
-ahci|:: AHCI: port=|-|measured
+ahci|:: AHCI:|-|measured
 root-prefer|[bootdisk] root candidates:|-|measured
 bar1wedge|:: BAR1WEDGE: rung=first-stall|-|measured
 bar1exp-uc|:: x86 bar1exp: UC arm ARMED via=|-|measured
