@@ -3,19 +3,19 @@
 //
 //! CHARTER: Kernel — wm
 //!
-//! LUMENBIN (rmbp-ledger B305) — `tests lumen`: the kernel-side fixture for `APPS/LUMEN.BIN`, the ring-3
+//! LUMENBIN (rmbp-ledger B305) — `tests lumen`: the kernel-side fixture for `APPS/LUMEN.ELF`, the ring-3
 //! Lumen chat window (crates/user-lumen). This file fulfils NOTHING: the chat verbs (130..=133) are owned
-//! by VEIN.BIN in ring 3, and the kernel may not register them (kernel tags win, so a kernel fake would
+//! by VEIN.ELF in ring 3, and the kernel may not register them (kernel tags win, so a kernel fake would
 //! change the very routing the fixture is meant to observe). It only drives window and input plumbing.
 //!
-//! WHAT IT DOES. Loads LUMEN.BIN off the mounted program volume through the real ELF loader (the `bg`
+//! WHAT IT DOES. Loads LUMEN.ELF off the mounted program volume through the real ELF loader (the `bg`
 //! path), focuses it, types `hi` + Enter through the production router seam (`user_input_enqueue`, the
 //! function the shell's drain calls), and reads the program's WITNESS BLOCK straight out of its slot: the
 //! first eight words of its RW segment (`.data.lumenwit`, pinned there by the crate's link script; the
 //! segment's p_vaddr is read from the same ELF bytes that were loaded). Leg 1 — with nobody registered for
 //! ChatSend the kernel answers `-ENOENT` and the window must count it (`enoent=1`, the line it renders is
-//! "no provider: start VEIN.BIN"). Leg 2 — VEIN.BIN is spawned if the volume carries it, then a second
-//! message must get at least one ChatReply; with no VEIN.BIN the leg is SKIP with the reason, never a
+//! "no provider: start VEIN.ELF"). Leg 2 — VEIN.ELF is spawned if the volume carries it, then a second
+//! message must get at least one ChatReply; with no VEIN.ELF the leg is SKIP with the reason, never a
 //! fabricated pass.
 //!
 //! WITNESS. `:: LUMEN: window=<0|1> sent=<n> replies=<n> enoent=<0|1> -> PASS|SKIP|FAIL ::`, preceded on
@@ -66,8 +66,8 @@ pub fn selftest() {
         fs.read_file(&de, &mut b, cap).ok()?;
         Some(b)
     };
-    let Some(img) = load("LUMEN.BIN") else { return skip("LUMEN.BIN-not-on-the-volume") };
-    let Some(off) = rw_vaddr(&img).filter(|&o| o + 32 <= sc::user_window_size()) else { return skip("LUMEN.BIN-has-no-RW-segment") };
+    let Some(img) = load("LUMEN.ELF") else { return skip("LUMEN.ELF-not-on-the-volume") };
+    let Some(off) = rw_vaddr(&img).filter(|&o| o + 32 <= sc::user_window_size()) else { return skip("LUMEN.ELF-has-no-RW-segment") };
     let (pid, slot, _entry) = match sc::spawn_user_image_bg(&img) {
         Ok(v) => v,
         Err(why) => {
@@ -76,7 +76,7 @@ pub fn selftest() {
         }
     };
     let slot = slot as usize;
-    crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot as u64), "LUMEN.BIN");
+    crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot as u64), "LUMEN.ELF");
     let read = || -> [u32; 8] {
         let p = unsafe { crate::arch::memory::slot_backing_ptr(slot).add(off) } as *const u32;
         core::array::from_fn(|i| unsafe { p.add(i).read_volatile() })
@@ -107,28 +107,28 @@ pub fn selftest() {
     let window_ok = w[0] == WIT_MAGIC && w[W_WINDOW] == 1;
     let leg1 = w1[W_SENT] >= 1 && w1[W_KEYS] >= 3 && (w1[W_ENOENT] == 1 || w1[W_REPLIES] >= 1);
 
-    // Leg 2: VEIN.BIN, if staged, registers 130..=133; the second send must get a reply.
+    // Leg 2: VEIN.ELF, if staged, registers 130..=133; the second send must get a reply.
     let mut vein = None;
     let mut w2 = w1;
     let mut skip_why = None;
     if w1[W_REPLIES] >= 1 {
         // A fulfiller was already live in this boot: leg 2 is already proved by leg 1.
-    } else if let Some(vimg) = load("VEIN.BIN") {
+    } else if let Some(vimg) = load("VEIN.ELF") {
         match sc::spawn_user_image_bg(&vimg) {
             Ok((vp, vs, _)) => {
-                crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(vs), "VEIN.BIN");
+                crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(vs), "VEIN.ELF");
                 vein = Some((vp, vs));
                 let _ = wait(1_500, &|_| false); // registration
                 type_line(b"ping\n");
                 w2 = wait(30_000, &|w| w[W_SENT] >= 2 && w[W_REPLIES] >= 1); // a model's first chunk; bounded
             }
             Err(why) => {
-                serial_println!(":: LUMEN: VEIN.BIN spawn refused: {} ::", why);
-                skip_why = Some("VEIN.BIN-spawn-refused");
+                serial_println!(":: LUMEN: VEIN.ELF spawn refused: {} ::", why);
+                skip_why = Some("VEIN.ELF-spawn-refused");
             }
         }
     } else {
-        skip_why = Some("VEIN.BIN-not-on-the-volume-reply-leg-unproved");
+        skip_why = Some("VEIN.ELF-not-on-the-volume-reply-leg-unproved");
     }
 
     if let Some((vp, vs)) = vein {

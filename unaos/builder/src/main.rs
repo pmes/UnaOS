@@ -983,17 +983,17 @@ fn main() {
     }
 
     // BANDY3 M3: the first ring-3 FULFILLER (crates/user-prefs, built by arroyo's build_user_prefs_x86 to
-    // target/PREFS-X86.ELF), staged as APPS/PREFS.BIN beside PULSE.ELF — `bg /apps/PREFS.BIN` registers
+    // target/PREFS-X86.ELF), staged as APPS/PREFS.ELF beside PULSE.ELF — `bg /apps/PREFS.ELF` registers
     // Principia's PrefGet/PrefList bus verbs (UNAOS_BUSREG=1) and serves them.
     let prefs_elf = target_dir.join("PREFS-X86.ELF");
     if prefs_elf.exists() {
-        std::fs::copy(&prefs_elf, esp_apps.join("PREFS.BIN")).unwrap();
-        println!("   PREFS: copied PREFS.BIN into APPS/ on the ESP (bg /apps/PREFS.BIN)");
+        std::fs::copy(&prefs_elf, esp_apps.join("PREFS.ELF")).unwrap();
+        println!("   PREFS: copied PREFS.ELF into APPS/ on the ESP (bg /apps/PREFS.ELF)");
     } else {
-        println!("   PREFS: target/PREFS-X86.ELF absent — ESP has no PREFS.BIN (run via ./arroyo esp-x86)");
+        println!("   PREFS: target/PREFS-X86.ELF absent — ESP has no PREFS.ELF (run via ./arroyo esp-x86)");
     }
-    // RING3WIN (B316): BIG.BIN — the ELF-window proof program (crates/user-big, built by arroyo's
-    // build_user_big_x86 to target/BIG-X86.ELF), staged as APPS/BIG.BIN; `tests ring3win` runs it.
+    // RING3WIN (B316): BIG.ELF — the ELF-window proof program (crates/user-big, built by arroyo's
+    // build_user_big_x86 to target/BIG-X86.ELF), staged as APPS/BIG.ELF; `tests ring3win` runs it.
     let big_elf = target_dir.join("BIG-X86.ELF");
     if big_elf.exists() {
         // The ring-3 image cap — una_abi::USER_WINDOW_BYTES; scripts/window-parity.sh holds this literal,
@@ -1001,38 +1001,38 @@ fn main() {
         const USER_WINDOW_BYTES: u64 = 4194304;
         let n = std::fs::metadata(&big_elf).unwrap().len();
         assert!(n <= USER_WINDOW_BYTES, "BIG-X86.ELF {} bytes > USER_WINDOW_BYTES {}", n, USER_WINDOW_BYTES);
-        std::fs::copy(&big_elf, esp_apps.join("BIG.BIN")).unwrap();
-        println!("   BIG: copied BIG.BIN into APPS/ on the ESP (tests ring3win)");
+        std::fs::copy(&big_elf, esp_apps.join("BIG.ELF")).unwrap();
+        println!("   BIG: copied BIG.ELF into APPS/ on the ESP (tests ring3win)");
     } else {
-        println!("   BIG: target/BIG-X86.ELF absent — ESP has no BIG.BIN (run via ./arroyo esp-x86)");
+        println!("   BIG: target/BIG-X86.ELF absent — ESP has no BIG.ELF (run via ./arroyo esp-x86)");
     }
 
     // VEINCORE (B304): the chat fulfiller (crates/user-vein → target/VEIN-X86.ELF by arroyo's
-    // build_user_vein_x86), staged as APPS/VEIN.BIN — `bg /apps/VEIN.BIN` registers the chat verbs 130..=133.
+    // build_user_vein_x86), staged as APPS/VEIN.ELF — `bg /apps/VEIN.ELF` registers the chat verbs 130..=133.
     let vein_elf = target_dir.join("VEIN-X86.ELF");
     if vein_elf.exists() {
-        std::fs::copy(&vein_elf, esp_apps.join("VEIN.BIN")).unwrap();
-        println!("   VEIN: copied VEIN.BIN into APPS/ on the ESP (bg /apps/VEIN.BIN)");
+        std::fs::copy(&vein_elf, esp_apps.join("VEIN.ELF")).unwrap();
+        println!("   VEIN: copied VEIN.ELF into APPS/ on the ESP (bg /apps/VEIN.ELF)");
     } else {
-        println!("   VEIN: target/VEIN-X86.ELF absent — ESP has no VEIN.BIN (run via ./arroyo esp-x86)");
+        println!("   VEIN: target/VEIN-X86.ELF absent — ESP has no VEIN.ELF (run via ./arroyo esp-x86)");
     // LUMENBIN (B305): the ring-3 chat window (crates/user-lumen, built by arroyo's build_user_lumen_x86 to
-    // target/LUMEN-X86.ELF), staged as APPS/LUMEN.BIN beside PREFS.BIN — `lumen` (= `bg /apps/LUMEN.BIN`)
-    // opens it; it speaks the chat verbs VEIN.BIN fulfils.
+    // target/LUMEN-X86.ELF), staged as APPS/LUMEN.ELF beside PREFS.ELF — a bare `lumen` (EXECNAME: its note detaches it)
+    // opens it; it speaks the chat verbs VEIN.ELF fulfils.
     let lumen_elf = target_dir.join("LUMEN-X86.ELF");
     if lumen_elf.exists() {
-        std::fs::copy(&lumen_elf, esp_apps.join("LUMEN.BIN")).unwrap();
-        println!("   LUMEN: copied LUMEN.BIN into APPS/ on the ESP (lumen / bg /apps/LUMEN.BIN)");
+        std::fs::copy(&lumen_elf, esp_apps.join("LUMEN.ELF")).unwrap();
+        println!("   LUMEN: copied LUMEN.ELF into APPS/ on the ESP (lumen / bg /apps/LUMEN.ELF)");
     } else {
-        println!("   LUMEN: target/LUMEN-X86.ELF absent — ESP has no LUMEN.BIN (run via ./arroyo esp-x86)");
+        println!("   LUMEN: target/LUMEN-X86.ELF absent — ESP has no LUMEN.ELF (run via ./arroyo esp-x86)");
     // NETRING3 M3 (B306): the ring-3 network client (crates/user-net, built by arroyo's build_user_net_x86 to
-    // target/NET-X86.ELF), staged as APPS/NET.BIN — `bg /apps/NET.BIN` resolves, connects :80 and prints
+    // target/NET-X86.ELF), staged as APPS/NET.ELF — `bg /apps/NET.ELF` resolves, connects :80 and prints
     // the `:: NETRING3:` verdict (UNAOS_NETRING3=1).
     let net_elf = target_dir.join("NET-X86.ELF");
     if net_elf.exists() {
-        std::fs::copy(&net_elf, esp_apps.join("NET.BIN")).unwrap();
-        println!("   NET: copied NET.BIN into APPS/ on the ESP (bg /apps/NET.BIN)");
+        std::fs::copy(&net_elf, esp_apps.join("NET.ELF")).unwrap();
+        println!("   NET: copied NET.ELF into APPS/ on the ESP (bg /apps/NET.ELF)");
     } else {
-        println!("   NET: target/NET-X86.ELF absent — ESP has no NET.BIN (run via ./arroyo esp-x86)");
+        println!("   NET: target/NET-X86.ELF absent — ESP has no NET.ELF (run via ./arroyo esp-x86)");
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1092,16 +1092,16 @@ fn main() {
         // /apps/VUGK.ELF` must reach the volume the kernel actually reads.
         (target_dir.join("VUGK-X86.ELF"), "VUGK.ELF"),
         (target_dir.join("PULSE-X86.ELF"), "PULSE.ELF"),
-        // BANDY3 M3: the prefs fulfiller rides the DATA volume too — `bg /apps/PREFS.BIN` reads it there.
-        (target_dir.join("PREFS-X86.ELF"), "PREFS.BIN"),
+        // BANDY3 M3: the prefs fulfiller rides the DATA volume too — `bg /apps/PREFS.ELF` reads it there.
+        (target_dir.join("PREFS-X86.ELF"), "PREFS.ELF"),
         // VEINCORE (B304): the chat fulfiller rides the DATA volume too.
-        (target_dir.join("VEIN-X86.ELF"), "VEIN.BIN"),
+        (target_dir.join("VEIN-X86.ELF"), "VEIN.ELF"),
         // LUMENBIN: the chat window rides the DATA volume too — `lumen` reads it there.
-        (target_dir.join("LUMEN-X86.ELF"), "LUMEN.BIN"),
-        // NETRING3 M3: the network client rides the DATA volume too — `bg /apps/NET.BIN` reads it there.
-        (target_dir.join("NET-X86.ELF"), "NET.BIN"),
-        // RING3WIN (B316): the ELF-window proof program — `tests ring3win` reads /apps/BIG.BIN there.
-        (target_dir.join("BIG-X86.ELF"), "BIG.BIN"),
+        (target_dir.join("LUMEN-X86.ELF"), "LUMEN.ELF"),
+        // NETRING3 M3: the network client rides the DATA volume too — `bg /apps/NET.ELF` reads it there.
+        (target_dir.join("NET-X86.ELF"), "NET.ELF"),
+        // RING3WIN (B316): the ELF-window proof program — `tests ring3win` reads /apps/BIG.ELF there.
+        (target_dir.join("BIG-X86.ELF"), "BIG.ELF"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();

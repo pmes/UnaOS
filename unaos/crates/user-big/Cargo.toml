@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 The Architect & Una
 #
-# RING3WIN M4 (rmbp-ledger B316): BIG.BIN — the proof program for the ELF window. Linked at
+# RING3WIN M4 (rmbp-ledger B316): BIG.ELF — the proof program for the ELF window. Linked at
 # una_abi::USER_XWIN_VA_X86 (crates/user-big/user-big-x86.ld), so the kernel places it in the elf model:
 # a 64 KiB static array (BSS) it fills and checksums, a 32 KiB stack frame it recurses into on a declared
 # 256 KiB stack (PT_GNU_STACK via `-z stack-size`), and a 100 KiB `alloc::vec::Vec` on a SYS_SBRK heap.
 # x86_64 only (the ELF window is x86's this arc). Built by arroyo's build_user_big_x86, staged as
-# APPS/BIG.BIN; `tests ring3win` runs it.
+# APPS/BIG.ELF; `tests ring3win` runs it.
 #
 # The empty [workspace] table makes this crate its OWN workspace root (the user-prefs idiom).
 [workspace]

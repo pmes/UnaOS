@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 The Architect & Una
 #
-# NETRING3 M3 (rmbp-ledger B306): NET.BIN — the first ring-3 program to speak to the outside world. It
+# NETRING3 M3 (rmbp-ledger B306): NET.ELF — the first ring-3 program to speak to the outside world. It
 # draws entropy (SYS_GETRANDOM 56), resolves a name through the kernel resolver (SYS_RESOLVE 57), opens a
 # TCP socket, connects to port 80, sends `GET / HTTP/1.0` and prints the status line; then the TLS leg,
 # which in v1 reports `tls=skip reason=window` (embedded-tls builds for this target but needs ~100 KiB
 # against the 16 KiB ring-3 window — see tls-spike/ and docs/dev/evidence/rmbp-1004/NETRING3.md).
-# Static ELF64 like user-prefs, built by arroyo's build_user_net_x86 and staged as APPS/NET.BIN on the ESP
+# Static ELF64 like user-prefs, built by arroyo's build_user_net_x86 and staged as APPS/NET.ELF on the ESP
 # and the x86 DATA volume. No dependencies beyond the ABI.
 #
 # The empty [workspace] table makes this crate its OWN workspace root, so the parent UnaOS workspace never

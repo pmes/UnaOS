@@ -2628,7 +2628,7 @@ fn which_report(console: &mut Console, word: &str) {
     if facts.exec {
         let mut vol = FatVolume;
         if let Some(name) = midden_core::resolve_exec(word, &mut vol) {
-            return console.println(&alloc::format!("{}: program {}", word, name));
+            return console.println(&alloc::format!("{}: program {}", word, exec_display_path(&name).unwrap_or(name))); // EXECNAME (B322): the on-disk path, e.g. `lumen: program /apps/LUMEN.ELF`. ⚠ SAME-LINE fold, line-NEUTRAL.
         }
         return console.println_styled(crate::video::theme::TERM_RED, &alloc::format!("{}: not found (no verb, no program)", word));
     }
@@ -6173,7 +6173,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             crate::power::reboot();
         },
         #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
-        "lumen" => { bg_program(console, "/apps/LUMEN.BIN"); } #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))] "bg" => { // LUMENBIN (B305) — `lumen` opens the ring-3 chat window: EXACTLY `bg /apps/LUMEN.BIN` (same spawn, job table, window title), so it carries `bg`'s cfg; the dock's lumen pin runs this verb. ⚠ SAME-LINE fold, line-NEUTRAL, code before comment.
+        "bg" => { // EXECNAME (B322, R82): the `lumen` arm that sat here (a hard-wired `bg /apps/LUMEN.BIN`) is DELETED — `lumen` is the program LUMEN.ELF, resolved by `midden_core::resolve_exec` and launched by its own note like every program; the dock pin dispatches `/apps/LUMEN.ELF` through the same path. ⚠ SAME-LINE fold, line-NEUTRAL.
             // BGRUN-1: run a user program in the BACKGROUND — the shell returns to its prompt at once and
             // the program keeps running (and, if windowed, its window stays OPEN, so TAB has a ring to
             // walk — this is what turns the WC-TAB binding into a workflow: `run` blocks until its app
@@ -6608,7 +6608,7 @@ fn cyc_to_us(dt: u64) -> u64 {
 fn run_program(console: &mut Console, path: &str) {
     let Some(bytes) = read_el0_image(console, "run", path) else {
         return;
-    };
+    }; run_image(console, path, bytes) } #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))] fn run_image(console: &mut Console, path: &str, bytes: alloc::vec::Vec<u8>) { // EXECNAME (B322) — ⚠ SAME-LINE fold, line-NEUTRAL: `run` is split at its read so the bare-name launch (bare_exec, a foreground program) runs the bytes it already read through this SAME body; `run <path>` is unchanged.
     // Hand the bytes to the kernel loader: map into a fresh user slot, run co-located, wait (bounded 5 s) for
     // the program to exit or fault. The image length + entry are reported for the witness.
     let n = bytes.len();
@@ -7362,7 +7362,7 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
     // The ELF64 / little-endian / e_machine pre-checks already ran inside `read_el0_image` (the
     // arch's own twin, so EM_X86_64 there and EM_AARCH64 here), which named any of them; the kernel
     // loader re-validates from scratch regardless.
-    let n = bytes.len();
+    if !exec_detaches(&bytes, &canon, typed) { run_image(console, &canon, bytes); return true; } let n = bytes.len(); // EXECNAME (B322, R82) — ⚠ SAME-LINE fold, line-NEUTRAL: the program decides — a window or a resident server detaches below (the `bg` body), anything else runs in the foreground through `run`'s own body.
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
         Ok((pid, slot, entry)) => { crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), &canon); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. The bare-name launch names its windows exactly as `bg_program` does and is armed first for the same reason. `canon` is the spelling the operator's typed name resolved to, which is the spelling they expect to read back in the title bar.
             if !adopt_bg_job(pid, slot, &canon) {
@@ -8934,4 +8934,62 @@ fn query_cmd(console: &mut Console, args: &[&str]) {
         }
         Err(e) => vfs_say(console, &alloc::format!("query: {}", crate::fs::attrsys::refusal(&e))),
     }
+}
+
+/// EXECNAME (rmbp-ledger B322, R82): does a bare-name launch of `bytes` DETACH (the `bg` body) or run in
+/// the FOREGROUND (the `run` body)? The program says, in its `.note.unaos.app` note
+/// (`una_abi::AppNote`, emitted by its own link); `midden_core::launch_mode` applies the rule — a window
+/// or a resident server detaches, anything else (and an image with no note) runs in the foreground.
+/// x86 asks its loader's door (`elf::app_flags`, which refuses a foreign `e_machine`); aarch64 asks the
+/// shared core directly (that arch's loader lives inside its syscall module). One serial line either way.
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
+fn exec_detaches(bytes: &[u8], canon: &str, typed: &str) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    let flags = crate::arch::elf::app_flags(bytes);
+    #[cfg(not(target_arch = "x86_64"))]
+    let flags = midden_core::app_note_flags(bytes).unwrap_or(0);
+    let detach = midden_core::launch_mode(flags) == midden_core::LaunchMode::Detach;
+    serial_println!(":: BAREXEC: {} (typed '{}') — note flags={} -> {} ::", canon, typed, flags,
+        if detach { "detach" } else { "foreground" });
+    detach
+}
+
+/// EXECNAME (B322): the absolute, ON-DISK spelling of a program the core resolved — `which lumen`
+/// answers `/apps/LUMEN.ELF`, not the elided probe string `lumen.elf`. The same two probes the launch
+/// makes (the cwd, then [`EXEC_ROOT`]) asked of the namespace, then the parent listing for the
+/// spelling (a case-insensitive backend matched the probe; the listing holds the name as stored).
+/// `None` = the namespace no longer has it; the caller falls back to the core's string.
+fn exec_display_path(name: &str) -> Option<String> {
+    let mt = vfs_mount_table();
+    let is_file = |p: &str| matches!(mt.stat(p), Ok(st) if !matches!(st.kind, crate::fs::vfs::NodeKind::Dir));
+    let from_cwd = vfs_path(name);
+    let hit = if is_file(&from_cwd) {
+        from_cwd
+    } else if !name.starts_with('/') && is_file(&normalize_path(EXEC_ROOT, name)) {
+        normalize_path(EXEC_ROOT, name)
+    } else {
+        return None;
+    };
+    let (dir, leaf) = match hit.rfind('/') {
+        Some(0) => ("/", &hit[1..]),
+        Some(i) => (&hit[..i], &hit[i + 1..]),
+        None => return Some(hit.clone()),
+    };
+    match mt.read_dir(dir) {
+        Ok(rows) => Some(rows.iter().find(|r| r.name.eq_ignore_ascii_case(leaf))
+            .map(|r| normalize_path(dir, &r.name)).unwrap_or_else(|| hit.clone())),
+        Err(_) => Some(hit.clone()),
+    }
+}
+
+/// EXECNAME (B322): what a bare `word` resolves to RIGHT NOW, through the very path `which` and the
+/// launch take (`midden_core::resolve_exec` over [`FatVolume`], then [`exec_display_path`]) — for the
+/// `tests exec` fixture (`crate::execname`), so the witness cannot test a second resolver.
+#[cfg(target_arch = "x86_64")] // its one caller, `tests exec`, is x86 (the five images are x86 images)
+pub(crate) fn exec_resolve_display(word: &str) -> Option<String> {
+    if !midden_facts().exec {
+        return None;
+    }
+    let name = midden_core::resolve_exec(word, &mut FatVolume)?;
+    Some(exec_display_path(&name).unwrap_or(name))
 }

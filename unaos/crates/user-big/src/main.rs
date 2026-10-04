@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-// RING3WIN M4 (rmbp-ledger B316): BIG.BIN — the program the 16 KiB window could not hold.
+// RING3WIN M4 (rmbp-ledger B316): BIG.ELF — the program the 16 KiB window could not hold.
 //
 //   1. static — a 64 KiB BSS array (zero on entry: the loader's memsz > filesz path), filled with
 //      a[i] = i*7 + (i>>8) and FNV-1a-32 checksummed. The kernel recomputes the same value itself.
@@ -192,3 +192,9 @@ pub extern "C" fn _start() -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     exit(0xF0)
 }
+
+/// EXECNAME (B322, R82): this program's launch declaration — a console program (no SYS_WIN_CREATE): a bare `big` runs in the foreground like `run`.
+/// Kept by the x86 link script under a PT_NOTE header; read by `midden_core::app_note_flags`.
+#[used]
+#[link_section = ".note.unaos.app"]
+static APP_NOTE: una_abi::AppNote = una_abi::AppNote::new(0);

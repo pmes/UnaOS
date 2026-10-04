@@ -26,6 +26,7 @@ PHDRS
 {
     text PT_LOAD FLAGS(5);   /* R + X */
     data PT_LOAD FLAGS(6);   /* R + W */
+    note PT_NOTE FLAGS(4);   /* R — EXECNAME: the .note.unaos.app launch declaration */
 }
 
 SECTIONS
@@ -40,6 +41,11 @@ SECTIONS
         *(.text .text.*)
         *(.rodata .rodata.*)
     } :text
+
+    /* EXECNAME (B322, R82): the program's launch declaration (una_abi::AppNote), KEPT here — ahead of the
+       /DISCARD/ *(.note*) line below, and the first matching rule wins — inside the text segment and under
+       its own PT_NOTE header, so the shell finds it by program header after --strip-all. */
+    .note.unaos.app : { KEEP(*(.note.unaos.app)) } :text :note
 
     /* LDPIN (WINX-8 class, commit 442f1cfa; provenance: the sibling linker-script audit,
        ~/.claude/plans/unaos/review/pi4-sibling-ld-audit.md): main.rs:418 derives the window base as

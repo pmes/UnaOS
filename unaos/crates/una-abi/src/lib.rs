@@ -827,7 +827,7 @@ pub const BUS_VERB_REGISTER: u8 = 127;
 pub const BUS_VERB_FULFIL_MIN: u8 = 128;
 /// Registrations one row may hold.
 pub const BUS_REG_MAX_PER_ROW: usize = 8;
-/// The ring-3 fulfiller DEMO pair (BANDY3): a preference read answered by `PREFS.BIN` from the registrable
+/// The ring-3 fulfiller DEMO pair (BANDY3): a preference read answered by `PREFS.ELF` from the registrable
 /// range. Principia's real verbs are the kernel-fulfilled `BUS_VERB_PREF_*` (16..=19, PREFS); this pair
 /// proves registration and relay, and retires when a ring-3 Principia takes the real tags over.
 pub const BUS_VERB_R3PREF_GET: u8 = 128;
@@ -1073,7 +1073,7 @@ mod attrsurf_tests {
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // VEINCORE (rmbp-ledger B304; docs/dev/evidence/rmbp-1004/VEINCORE.md): the CHAT verbs, OWNED by ring 3
-// (`APPS/VEIN.BIN` registers them with BUS_VERB_REGISTER; the kernel only relays). The bodies are
+// (`APPS/VEIN.ELF` registers them with BUS_VERB_REGISTER; the kernel only relays). The bodies are
 // `unaos/libs/sys/vein_core/src/wire.rs` (its KATs are the spec); the kernel const-asserts these tags
 // against that crate's mirrors under feature `vein`.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -1081,7 +1081,7 @@ mod attrsurf_tests {
 /// ChatSend `conv u32 · text` — answered by a SEQUENCE of REPLY frames on the caller's corr, each a
 /// ChatReply body; non-final frames ride [`BUS_STATUS_MORE`], the last rides 0 with `done = 1`.
 pub const BUS_VERB_CHAT_SEND: u8 = 130;
-/// ChatReply as a REQUEST: accepted by VEIN.BIN from the KERNEL principal only — the relay companion's
+/// ChatReply as a REQUEST: accepted by VEIN.ELF from the KERNEL principal only — the relay companion's
 /// answer typed into the serial console as `vein rsp …` and injected by the kernel (`bus_route::inject`).
 pub const BUS_VERB_CHAT_REPLY: u8 = 131;
 /// ChatCancel `conv u32` — the cut stream ends with [`ECANCELED`]; the cancel's own reply is status 0.
@@ -1200,3 +1200,37 @@ pub const ATTR_KEY_TRASH_BY: &str = "una:trash-by";
 pub const TRASH_DIR_NAME: &str = ".Trash";
 /// The listing query (every object carrying an origin; callers scope it to their Trash folder).
 pub const TRASH_QUERY: &str = "una:trash-origin != \"\"";
+// EXECNAME (B322, R82) — a ring-3 program DECLARES how it is launched, in its own image: one ELF note
+// in section `.note.unaos.app` (SHT_NOTE, allocated, kept by each x86 link script under a PT_NOTE
+// header). Name "UnaOS" (namesz 6, padded to 8), type APP_NOTE_TYPE, desc one LE u32 of APP_FLAG_*.
+// The shell reads it (`midden_core::app_note_flags`) when a bare name resolves to a program: WINDOWED or
+// RESIDENT detaches (the `bg` path: job row, window title), otherwise the program runs in the foreground
+// (the `run` path). A missing note is flags 0 — foreground. Zero code in an EL0 blob: a const struct.
+/// The note's section name (the user crates' `#[link_section]`).
+pub const APP_NOTE_SECTION: &str = ".note.unaos.app";
+/// The note's owner name, NUL-terminated as the ELF note format counts it (namesz = 6).
+pub const APP_NOTE_NAME: &[u8; 6] = b"UnaOS\0";
+/// The note's type: the launch-flags record.
+pub const APP_NOTE_TYPE: u32 = 1;
+/// The program creates a window (SYS_WIN_CREATE): a bare-name launch detaches.
+pub const APP_FLAG_WINDOWED: u32 = 1 << 0;
+/// The program stays running to serve (a bus fulfiller, e.g. PREFS.ELF): a bare-name launch detaches.
+pub const APP_FLAG_RESIDENT: u32 = 1 << 1;
+/// The whole note record exactly as it lies in the image (24 bytes, 4-aligned).
+#[repr(C, align(4))]
+pub struct AppNote {
+    pub namesz: u32,
+    pub descsz: u32,
+    pub ntype: u32,
+    pub name: [u8; 8],
+    pub desc: u32,
+}
+impl AppNote {
+    /// The note a program with `flags` carries:
+    /// `#[used] #[link_section = ".note.unaos.app"] static APP_NOTE: AppNote = AppNote::new(..);`
+    pub const fn new(flags: u32) -> Self {
+        let n = APP_NOTE_NAME;
+        AppNote { namesz: 6, descsz: 4, ntype: APP_NOTE_TYPE, name: [n[0], n[1], n[2], n[3], n[4], n[5], 0, 0], desc: flags }
+    }
+}
+const _: () = assert!(core::mem::size_of::<AppNote>() == 24);

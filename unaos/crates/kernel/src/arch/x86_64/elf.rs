@@ -495,3 +495,23 @@ fn map_elf_model(bytes: &[u8], plan: &ElfPlan) -> Result<Mapped, MapErr> {
         nsegs: plan.nsegs as u32,
     })
 }
+
+// EXECNAME (rmbp-ledger B322, R82): the program's launch declaration, for the x86 loader's callers.
+// The note walk itself is `midden_core::app_note_flags` — the shell core both rings link, so the
+// aarch64 bare-name launch reads the same record the same way and the host tests it — and this is the
+// x86 loader's door onto it: an image this loader would refuse by magic or machine declares nothing.
+/// The `una_abi::APP_FLAG_*` bits `bytes` declares in its `.note.unaos.app` note; 0 when it carries no
+/// note, is not ELF, or is not EM_X86_64 (0 = the foreground fallback).
+pub fn app_flags(bytes: &[u8]) -> u32 {
+    if !is_elf_image(bytes) || rd_u16(bytes, 18) != Some(EM_X86_64) {
+        return 0;
+    }
+    midden_core::app_note_flags(bytes).unwrap_or(0)
+}
+// The core carries its own copies (it takes no dependencies); they ARE the ABI's, or this does not build.
+const _: () = assert!(
+    midden_core::APP_NOTE_TYPE == una_abi::APP_NOTE_TYPE
+        && midden_core::APP_FLAG_WINDOWED == una_abi::APP_FLAG_WINDOWED
+        && midden_core::APP_FLAG_RESIDENT == una_abi::APP_FLAG_RESIDENT
+        && midden_core::APP_NOTE_NAME.len() == una_abi::APP_NOTE_NAME.len()
+);
