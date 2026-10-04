@@ -1,0 +1,13 @@
+# A GUI binary under Xvfb, screen grabbed from Xvfb's own framebuffer (-fbdir), vs headless Chromium.
+[[case]]
+name = "chromium-window"
+page = "hello.html"
+subject = { kind = "xvfb", run = "/opt/pw-browsers/chromium --no-sandbox --no-first-run --disable-gpu --kiosk --force-device-scale-factor=1 --user-data-dir={outdir}/{case}.profile --window-position=0,0 --window-size={w},{h} file://{page}", wait_ms = 6000 }
+oracle = { kind = "chromium", url = "file://{page}" }
+
+# An existing PNG (e.g. a kernel screenshot pulled off the ESP) against a checked-in golden.
+[[case]]
+name = "png-vs-golden"
+subject = { kind = "png", path = "golden/swatch.png" }
+oracle = { kind = "golden", path = "golden/swatch.png" }
+mask = [[0, 0, 64, 16]]

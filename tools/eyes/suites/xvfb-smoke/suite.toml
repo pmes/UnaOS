@@ -1,0 +1,8 @@
+# EYES suite: proves the generic subject kinds. UnaOS vessels open windows only through
+# quartzite's macOS AppKit backend or its `gtk` feature (GTK 4), and this host has no GTK 4,
+# so the GUI process under Xvfb here is Chromium itself, shown full-screen in app mode.
+build = []
+
+[defaults]
+width = 640
+height = 400

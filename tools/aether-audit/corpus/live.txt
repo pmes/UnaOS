@@ -1,4 +1,0 @@
-# Optional live URLs (run.sh --live). Network-dependent, never in the gate.
-example https://example.com/
-wikipedia https://en.wikipedia.org/wiki/Web_browser
-news https://text.npr.org/
