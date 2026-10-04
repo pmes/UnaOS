@@ -5738,6 +5738,7 @@ mod r8 {
     // teardown-gate `const fn`s — is the parent module's. A child module sees them, so the rung is
     // built out of the SAME code flight 4 executed rather than out of a copy of it.
     use super::*;
+    use alloc::vec::Vec;
 
     /// R8's own GGTT window base. Sixteen slots above R7's three, so a window that is left claimed by
     /// an R7 safety override can never overlap R8's — and `base * 4096 = 0x10010000` keeps
@@ -5760,43 +5761,18 @@ mod r8 {
     /// below and `win_slots` at the claim site are then the same expression and cannot drift apart.
     /// 64x64x4 = 16 KiB = 4 pages.
     const R8_SRC_PAGES: usize = (R8_RECT_W * R8_RECT_H * 4 + 4095) / 4096;
-    /// The widest destination stride the window RESERVES FOR, in pixels. This is the one number in the
-    /// ceiling that is a choice rather than arithmetic, and it is taken from the geometry the takeover
-    /// already publishes: `:: KDHEAD: gop w=2880 h=1800 vram_off=00020000 pitch=16384` — the rMBP's
-    /// firmware pads a 2880-pixel panel to a 4096-pixel scanout stride, so 16 384 B/row is the REAL
-    /// pitch and not an over-estimate (`fb_len=29491200 = 1800 * 16384` confirms it independently).
-    /// It also covers every narrower panel including 3840-wide UHD at the same padded stride.
-    ///
-    /// It is not raised further because the cost is stack and the stack is measured: the PTE table is
-    /// this function's frame, reserving for BR13's widest encodable pitch (65 535 B, below) would put
-    /// `fb_blit` at a ~6.4 KiB frame, and no function in this kernel's x86 artifact exceeds 4 096 B.
-    /// A panel wider than this therefore REFUSES — and the refusal now prints `rows= pitch=
-    /// slots_have= slots_need=` so raising this constant is arithmetic a reader can do from the wire.
-    const R8_MAX_STRIDE_PX: usize = 4096;
-    /// Destination pages reserved: 65 rows x 4096 px x 4 B = 1 064 960 B = 260 pages.
-    const R8_DST_MAX_PAGES: usize = (R8_DST_ROWS * R8_MAX_STRIDE_PX * 4 + 4095) / 4096;
-    /// **The bound that actually protects the experiment.** R8's GGTT window is `1 + src + dst` slots
-    /// and `ptes` is a fixed table of exactly that many entries, so the destination ceiling is not a
-    /// round number about memory — it is however much destination these reserved slots can map. Stated
-    /// here, once, and the ceiling below is derived from it.
-    const R8_WIN_SLOTS_MAX: usize = 1 + R8_SRC_PAGES + R8_DST_MAX_PAGES;
-    /// The destination surface's hard ceiling, DERIVED from the reservation rather than chosen. A panel
-    /// geometry that would ask for more than this is REFUSED rather than trimmed: a rung that silently
-    /// shrinks its own experiment is a rung whose verdict means something different from what it says.
-    ///
-    /// Flight 8 (hw-rmbp, 2026-09-16) refused here at `dst_bytes=1064960 max=1048576`. The old ceiling
-    /// was the literal `1024 * 1024` and its comment claimed "the bench rMBP's 1920x1200 panel asks for
-    /// 123" pages; the bench rMBP is 2880x1800 at a 16 384-byte pitch and asks for 260, so the rung
-    /// refused its own experiment by 16 KiB over a constant whose premise was a panel this machine does
-    /// not have. The ceiling is now the reservation, and the reservation is the panel.
-    const R8_DST_MAX_BYTES: usize = R8_DST_MAX_PAGES * 4096;
+    // GEN7R8 M1 (B320) — THE WINDOW IS THE PANEL'S, COMPUTED AT RUN TIME. R8CAP (flights 8/9) derived
+    // the ceiling from a compile-time stride reservation (`R8_MAX_STRIDE_PX = 4096`) because the PTE
+    // table was a stack array; a panel wider than that refused on a constant again. The table is now a
+    // heap `Vec` of exactly `win_slots`, so the destination window is `rows x pitch` rounded up to the
+    // 4 KiB GGTT page, and the ONLY capacity refusal left is the GGTT itself (`need=`/`have=` bytes on
+    // the wire). Flights 10-19 ran this rung at 265 slots thirteen times; that geometry is unchanged.
     // The runtime `src_pages` is `src_bytes / 4096` with `src_bytes = R8_RECT_H * R8_RECT_W * 4`, and
     // the table is sized with `R8_SRC_PAGES`. If the rectangle is ever changed to a size that is not a
     // whole number of pages those two stop being the same number and the table is one entry short, so
     // the relationship is checked at COMPILE time rather than trusted. This is the defect this arc
     // fixed, one layer down: a table whose size and whose consumer were written in different terms.
     const _: () = assert!(R8_SRC_PAGES * 4096 == R8_RECT_W * R8_RECT_H * 4);
-    const _: () = assert!(R8_DST_MAX_PAGES * 4096 >= R8_DST_ROWS * R8_MAX_STRIDE_PX * 4);
     /// Fallback geometry, used ONLY when the framebuffer is unattached or its lock is held. Stated as a
     /// constant and printed as `fb=fallback` so a capture never has to guess which geometry flew.
     const R8_FALLBACK_W: usize = 1920;
@@ -5946,23 +5922,6 @@ mod r8 {
             serial_println!(":: gen7: r8 end ::");
             return;
         }
-        // The refusal is scored on SLOTS, not on a byte count, because slots are what it protects: the
-        // `ptes` table below is `R8_WIN_SLOTS_MAX` entries and the claim loop walks `win_slots` of them.
-        // `dst_bytes`/`max` stay on the wire so the old flight-8 line still reads, but a refusal that
-        // cannot say WHICH resource ran out is a refusal the next flight has to re-derive by hand —
-        // flight 8's did, and the derivation was wrong (64 rows assumed, 65 flown).
-        let slots_need = 1 + R8_SRC_PAGES + (dst_bytes / 4096);
-        if slots_need > R8_WIN_SLOTS_MAX {
-            serial_println!(
-                ":: gen7: r8 verdict=r8-refused-surface-too-large dst_bytes={} max={} rows={} pitch={} stride_px={} max_stride_px={} slots_have={} slots_need={} short_by={} writes=0 note=refused-not-trimmed-a-rung-that-shrinks-its-own-experiment-reports-a-verdict-about-a-different-experiment ::",
-                dst_bytes, R8_DST_MAX_BYTES, dst_rows, dst_pitch_bytes, fb_stride_px,
-                R8_MAX_STRIDE_PX, R8_WIN_SLOTS_MAX, slots_need, slots_need - R8_WIN_SLOTS_MAX
-            );
-            serial_println!(":: gen7: r8 next=STOP-window-reservation-short-raise-R8_MAX_STRIDE_PX-to-cover-stride_px-above-the-cost-is-4-bytes-of-stack-per-slot note=no-hold-no-ring-armed ::");
-            serial_println!(":: gen7: r8 end ::");
-            return;
-        }
-
         const GTT_BASE: usize = 0x200000; // igpu::regs::GTT_BASE — [EXT-UNPINNED], as R1/R4/R5/R6/R7 carry it
         const SLOTS: usize = 524_288;
         const MAX_REG_OFF: usize = g7regs::HYP_RENFW_ACK + 4;
@@ -5971,6 +5930,21 @@ mod r8 {
         let win_slots = 1 + src_pages + dst_pages;
         let win_next_slot = R8_BASE_SLOT + win_slots; // the trailing neighbour
         let win_end_off = GTT_BASE + (win_next_slot + 1) * 4;
+        // GEN7R8 M1 — the one capacity refusal: can the GGTT, as BAR0 maps it, hold this window? `have` is
+        // every slot from `R8_BASE_SLOT` to the GGTT's end (or BAR0's, whichever is first), less the ring
+        // page, the source pages and the trailing neighbour, in bytes; `need` is the destination window.
+        // Refused, never trimmed: a rung that shrinks its own experiment reports on a different one.
+        let ggtt_slots = core::cmp::min(SLOTS, bar0_size.saturating_sub(GTT_BASE) / 4);
+        let have_bytes = ggtt_slots.saturating_sub(R8_BASE_SLOT + 1 + src_pages + 1) * 4096;
+        if dst_bytes > have_bytes {
+            serial_println!(
+                ":: gen7: r8 verdict=r8-refused-surface-too-large need={} have={} rows={} pitch={} stride_px={} ggtt_slots={} base_slot={} src_pages={} writes=0 note=refused-not-trimmed-a-rung-that-shrinks-its-own-experiment-reports-a-verdict-about-a-different-experiment ::",
+                dst_bytes, have_bytes, dst_rows, dst_pitch_bytes, fb_stride_px, ggtt_slots, R8_BASE_SLOT, src_pages
+            );
+            serial_println!(":: gen7: r8 next=STOP-the-GGTT-above-R8_BASE_SLOT-cannot-map-the-panels-window-lower-the-base-slot-or-split-the-blit note=no-hold-no-ring-armed ::");
+            serial_println!(":: gen7: r8 end ::");
+            return;
+        }
         if win_next_slot >= SLOTS
             || bar0_size < win_end_off
             || bar0_size < MAX_REG_OFF
@@ -6148,12 +6122,20 @@ mod r8 {
         // `ptes[k]` is the PTE for window slot `R8_BASE_SLOT + k`: k=0 the ring, k=1.. the source, then
         // the destination. Built and checked BEFORE the first GGTT write, so a single bad page aborts
         // the rung with nothing claimed.
-        // Exactly the reservation, named once. The old form spelled the same table as
-        // `1 + 4 + (R8_DST_MAX_BYTES / 4096)` — the `4` a bare literal for the source's page count and
-        // the ceiling a round number — which is how the ceiling came to be the table's size without any
-        // reader being told that is what it was for. `slots_need <= R8_WIN_SLOTS_MAX` is the refusal
-        // above, so the claim loop's `ptes[k]` is in range for every geometry that gets this far.
-        let mut ptes = [0u32; R8_WIN_SLOTS_MAX];
+        // GEN7R8 M1 — exactly `win_slots` entries, on the heap: the table and the claim loop are the same
+        // number by construction, and the window is whatever the panel asks for (the GGTT refusal above is
+        // the only bound). Reserved fallibly and refused by name, before any page is translated.
+        let mut ptes: Vec<u32> = Vec::new();
+        if ptes.try_reserve_exact(win_slots).is_err() {
+            dealloc(dst_page, dst_layout);
+            dealloc(src_page, src_layout);
+            dealloc(ring_page, ring_layout);
+            serial_println!(":: gen7: r8 verdict=r8-alloc-failed which=ptes entries={} writes=0 note=all-three-surfaces-freed-nothing-written ::", win_slots);
+            serial_println!(":: gen7: r8 next=STOP-no-PTE-table note=no-hold-no-ring-armed ::");
+            serial_println!(":: gen7: r8 end ::");
+            return;
+        }
+        ptes.resize(win_slots, 0);
         let mut bad: Option<(&str, usize, u64)> = None;
         for k in 0..win_slots {
             let va = if k == 0 {
