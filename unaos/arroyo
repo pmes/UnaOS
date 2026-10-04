@@ -6604,7 +6604,7 @@ KERNEL_CFG_MATRIX=(
   # feature table, the board union, the unnamed-knob set, `x86_cfg_universe` and the derived mix-leg
   # count are all unchanged. Board legs +1 (40 -> 41, counted from the runner's own banner, not from
   # the prose figures above — those are older and were not re-derived here); gate +1.
-  "arm-tegra-supstate-el0-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,supstate,busreg"
+  "arm-tegra-supstate-el0-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,supstate,busreg,vein"
 
   # GA10B-PROBE1 armed (appended 2026-08-25) — `ga10bprobe1` gates `arch/aarch64/ga10b_probe.rs` (the
   # whole first-probe-rung module) and its one appended call site in `tegra_early_stop`. Without a leg
