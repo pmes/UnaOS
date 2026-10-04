@@ -20,11 +20,13 @@ use super::{InstallError, InstallTarget};
 use alloc::vec::Vec;
 
 const SECTOR: usize = 512;
-const RESERVED: u32 = 32;
-const NUM_FATS: u32 = 2;
-const SPC: u32 = 1; // sectors per cluster (1 => extent == sector; simplest deterministic layout)
-const VOL_ID: u32 = 0x554E_4153; // "UNAS"
-const ROOT_CLUSTER: u32 = 2;
+// SELFINSTALL2 (B310): the BPB/FSInfo/FAT0 bytes and the geometry math come from the shared core
+// `amber_core::fat32` (encode only, the layout this file always wrote); the constants below are the
+// core's, re-exported for the tree writer further down.
+use amber_core::fat32 as core_fat;
+const NUM_FATS: u32 = core_fat::NUM_FATS;
+const SPC: u32 = core_fat::SPC; // sectors per cluster (1 => extent == sector; simplest deterministic layout)
+const ROOT_CLUSTER: u32 = core_fat::ROOT_CLUSTER;
 const FIRST_FILE_CLUSTER: u32 = 3; // cluster 2 is the root directory
 
 /// Geometry of the formatted ESP, all in VOLUME-RELATIVE sectors (add `esp_first` for absolute LBA).
@@ -55,115 +57,37 @@ pub struct Extent {
     pub len: usize,
 }
 
-/// Standard Microsoft FAT32 FAT-size computation (fatgen §"Determining FAT type").
-fn compute_fat_sz(tot_sec: u32) -> u32 {
-    let tmpval1 = tot_sec - RESERVED; // root_dir_sectors == 0 on FAT32
-    let tmpval2 = (256 * SPC + NUM_FATS) / 2;
-    (tmpval1 + (tmpval2 - 1)) / tmpval2
-}
-
 /// The count of leading ESP sectors `format_esp` requires to be ZERO for its blank-precondition
-/// optimization to hold: the reserved region + both FAT copies (an empty FAT is all-free = 0). The
-/// engine's demo target is always blank, so it never zeroes; a REAL installer target (a possibly
-/// non-blank microSD) must zero exactly this region — no more (the data area's free clusters may hold
-/// stale bytes harmlessly) and no less (a stale FAT entry would forge an allocation). Same
-/// `compute_fat_sz` math the formatter uses, so the two never diverge. Returns `TooSmall` if the ESP
-/// cannot hold a FAT32 layout.
+/// optimization to hold: the reserved region + both FAT copies. A REAL installer target must zero
+/// exactly this region. Same math the formatter uses (`amber_core::fat32`), so the two never diverge.
 pub fn blank_region_sectors(esp_sectors: u64) -> Result<u64, InstallError> {
-    if esp_sectors > u32::MAX as u64 {
-        return Err(InstallError::TooSmall);
-    }
-    let tot_sec = esp_sectors as u32;
-    if tot_sec <= RESERVED {
-        return Err(InstallError::TooSmall);
-    }
-    let fat_sz = compute_fat_sz(tot_sec);
-    Ok((RESERVED + NUM_FATS * fat_sz) as u64)
+    core_fat::blank_region_sectors(esp_sectors).map_err(|_| InstallError::TooSmall)
 }
 
-/// Format the ESP `[esp_first .. esp_first+esp_sectors)` as FAT32. Returns the geometry the payload
-/// writer + verifier use. `esp_sectors` must be large enough for a FAT32 volume (>= 65525 clusters);
-/// the GPT writer sizes the ESP so this always holds.
+/// Format the ESP `[esp_first .. esp_first+esp_sectors)` as FAT32 (blank precondition: only the
+/// defining structures are written). Returns the geometry the payload writer + verifier use.
 pub fn format_esp<T: InstallTarget>(
     t: &mut T,
     esp_first: u64,
     esp_sectors: u64,
 ) -> Result<FatGeom, InstallError> {
-    if esp_sectors > u32::MAX as u64 {
-        return Err(InstallError::TooSmall);
-    }
-    let tot_sec = esp_sectors as u32;
-    let fat_sz = compute_fat_sz(tot_sec);
-    let fat_region = NUM_FATS * fat_sz;
-    let data_start = RESERVED + fat_region;
-    if data_start >= tot_sec {
-        return Err(InstallError::TooSmall);
-    }
-    let count_of_clusters = (tot_sec - data_start) / SPC;
-    if count_of_clusters < 65525 || count_of_clusters > 0x0FFF_FFF4 {
-        return Err(InstallError::TooSmall); // not a valid FAT32 cluster count
-    }
-
-    // --- Boot sector (BPB) ---
-    let mut bs = [0u8; SECTOR];
-    bs[0] = 0xEB;
-    bs[1] = 0x58;
-    bs[2] = 0x90;
-    bs[3..11].copy_from_slice(b"UNAOS   "); // OEM name (8)
-    bs[11..13].copy_from_slice(&(SECTOR as u16).to_le_bytes());
-    bs[13] = SPC as u8;
-    bs[14..16].copy_from_slice(&(RESERVED as u16).to_le_bytes());
-    bs[16] = NUM_FATS as u8;
-    // root_ent_cnt(17..19)=0, tot_sec16(19..21)=0, fat_sz16(22..24)=0 — all FAT32
-    bs[21] = 0xF8; // media
-    bs[24..26].copy_from_slice(&63u16.to_le_bytes()); // sectors per track
-    bs[26..28].copy_from_slice(&255u16.to_le_bytes()); // number of heads
-    bs[28..32].copy_from_slice(&(esp_first as u32).to_le_bytes()); // hidden sectors (part LBA)
-    bs[32..36].copy_from_slice(&tot_sec.to_le_bytes());
-    bs[36..40].copy_from_slice(&fat_sz.to_le_bytes());
-    // ext_flags(40..42)=0, fs_ver(42..44)=0
-    bs[44..48].copy_from_slice(&ROOT_CLUSTER.to_le_bytes());
-    bs[48..50].copy_from_slice(&1u16.to_le_bytes()); // FSInfo sector
-    bs[50..52].copy_from_slice(&6u16.to_le_bytes()); // backup boot sector
-    bs[64] = 0x80; // drive number
-    bs[66] = 0x29; // extended boot signature
-    bs[67..71].copy_from_slice(&VOL_ID.to_le_bytes());
-    bs[71..82].copy_from_slice(b"UNAOS      "); // volume label (11)
-    bs[82..90].copy_from_slice(b"FAT32   "); // FS type (8)
-    bs[510] = 0x55;
-    bs[511] = 0xAA;
-
-    // --- FSInfo ---
-    let mut fsi = [0u8; SECTOR];
-    fsi[0..4].copy_from_slice(&0x4161_5252u32.to_le_bytes()); // lead signature "RRaA"
-    fsi[484..488].copy_from_slice(&0x6141_7272u32.to_le_bytes()); // struct signature "rrAa"
-    fsi[488..492].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // free count: unknown
-    fsi[492..496].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // next free: unknown
-    fsi[510] = 0x55;
-    fsi[511] = 0xAA;
-
-    // --- reserved FAT entries (first FAT sector of each copy) ---
-    let mut fat0 = [0u8; SECTOR];
-    fat0[0..4].copy_from_slice(&0x0FFF_FFF8u32.to_le_bytes()); // entry 0: media | high bits
-    fat0[4..8].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes()); // entry 1: EOC
-    fat0[8..12].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes()); // entry 2 (root): EOC (1 cluster)
-
+    let l = core_fat::Layout::for_sectors(esp_sectors).map_err(|_| InstallError::TooSmall)?;
+    let bs = l.boot_sector(esp_first);
+    let fsi = core_fat::fsinfo();
+    let fat0 = core_fat::fat0();
     let geom = FatGeom {
         esp_first,
-        fat_sz,
-        fat_start: RESERVED,
-        data_start,
-        count_of_clusters,
+        fat_sz: l.fat_sz,
+        fat_start: l.fat_start,
+        data_start: l.data_start,
+        count_of_clusters: l.count_of_clusters,
     };
-
-    // Write the defining structures (blank-precondition: the rest is already zero).
     t.write_sectors(geom.abs(0), &bs)?;
-    t.write_sectors(geom.abs(1), &fsi)?;
-    t.write_sectors(geom.abs(6), &bs)?; // backup boot sector
-    t.write_sectors(geom.abs(7), &fsi)?; // backup FSInfo
-    t.write_sectors(geom.abs(RESERVED), &fat0)?; // FAT copy 0, sector 0
-    t.write_sectors(geom.abs(RESERVED + fat_sz), &fat0)?; // FAT copy 1, sector 0
-
+    t.write_sectors(geom.abs(core_fat::FSINFO_SECTOR), &fsi)?;
+    t.write_sectors(geom.abs(core_fat::BACKUP_BOOT_SECTOR), &bs)?; // backup boot sector
+    t.write_sectors(geom.abs(core_fat::BACKUP_FSINFO_SECTOR), &fsi)?; // backup FSInfo
+    t.write_sectors(geom.abs(l.fat_copy(0)), &fat0)?; // FAT copy 0, sector 0
+    t.write_sectors(geom.abs(l.fat_copy(1)), &fat0)?; // FAT copy 1, sector 0
     Ok(geom)
 }
 

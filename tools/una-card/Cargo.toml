@@ -1,0 +1,14 @@
+[package]
+name = "una-card"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Lays the x86 UnaOS card image (p1 ESP FAT32, p2 UnaFS) with amber_core's GPT — the same code path the kernel installer lays the SSD with."
+
+# SELFINSTALL2 (rmbp-ledger B310): REPLACES unaos/scripts/make-x86-card.py (UNAFSX86 M3). The GPT is
+# encoded by `amber_core`, so the image a host writes and the layout the kernel installs are one code
+# path (R28). The FAT32 CONTENT of p1 is still made by mkfs.vfat + mcopy, exactly as the script did:
+# the core encodes a BPB but has no FAT tree writer for a host directory (the kernel's TreeWriter is
+# I/O-bound to an InstallTarget) — moving that is the next rung, not this one.
+[dependencies]
+amber_core = { path = "../../unaos/libs/sys/amber_core" }

@@ -1,0 +1,18 @@
+[package]
+name = "amber_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Amber Bytes core: the ring-neutral disk-layout logic (GPT, partition plan, FAT32 BPB, clone plan) shared by the kernel installer and the host Amber Bytes handler."
+
+# SELFINSTALL2 (rmbp-ledger B310, audit B296): the installer ensemble's first shared core.
+# `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, NO dependencies — the `midden_core` shape: a
+# member of the ROOT host workspace, pulled by the kernel as a path dep with `default-features = false`.
+# Callers: the kernel's `install/gpt.rs` + `install/fat32.rs`, `tools/una-card` (the x86 card image),
+# `handlers/amber_bytes` (`amber_bytes gpt show`).
+[dependencies]
+
+[features]
+default = ["std"]
+# Declared so the kernel's `default-features = false` spelling is honest; nothing in `src/` is gated.
+std = []

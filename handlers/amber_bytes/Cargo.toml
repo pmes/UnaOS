@@ -27,3 +27,6 @@ memchr = "2.8"
 
 # NEW: The Chaos Engine
 rand = "0.10"
+
+# SELFINSTALL2 (B310): the shared disk-layout core (GPT encode/decode) the kernel installer links too.
+amber_core = { path = "../../unaos/libs/sys/amber_core" }
