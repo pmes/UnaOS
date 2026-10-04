@@ -3585,6 +3585,13 @@ root-prefer-sdhc = []
 # on x86 the dependency is `optional` and default OFF keeps the x86 image byte-identical (the K3-N1 size
 # band). See docs/dev/evidence/rmbp-1001/UNAFSX86.md.
 unafs = ["dep:unafs"]
+# AHCIROOT (rmbp-ledger B332, R82): `UNAOS_AHCIROOT=1` — the rMBP's internal SSD becomes the UnaFS root. The
+# kernel-held SATA write grant (`block::AHCI_LIVE_GRANT`, one port, one LBA range, held only by
+# `install ssd --write` for the verb's lifetime, by the boot's root bind over an OURS disk's UnaFS p2, or by
+# `tests ahciw` over p2's 64-sector scratch tail), FLUSH CACHE EXT + readback on the port write path, the
+# installer's p2 (cloned or `UnaFS::format`ed) and the SSD-first root bind. x86 only (k8-reach NA row).
+# See docs/dev/evidence/rmbp-1005/AHCIROOT.md. Kept in sync with unaos/arroyo and builder/src/main.rs.
+ahciroot = ["ahci-write", "unafs", "installdemo"]
 # HDA (rmbp-ledger B127, arc 1) — the Intel High Definition Audio controller, `UNAOS_HDA=1`.
 # Nothing in this kernel had ever touched audio before this feature existed: `PciScanner::
 # enumerate_buses` matches exactly one class triple (xHCI) and the `[PCI-STOR]` census matches
