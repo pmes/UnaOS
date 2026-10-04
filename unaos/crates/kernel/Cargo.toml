@@ -639,7 +639,7 @@ botwedge = []
 # models no BCM4331, so a QEMU run only ever witnesses the honest no-radio refusal. Default OFF =>
 # module + call sites vanish, byte-identical. Enable via `UNAOS_WIFI=1`. See
 # docs/dev/OS/06_NETWORK_STACK/wifi_bcma.md.
-wifi = []
+wifi = ["dep:wifi_core"] # WIFI1 (B338): arc 1+ link the shared no_std codec seam `wifi_core` (firmware container + 802.11 frames). A `dep:` so a knob-off image carries not one byte of it.
 # WIFI-2: arc 2 of the same ladder — the WRITE rungs (`src/wifi/bringup.rs`). Maps BAR0 (two 4 KiB
 # apertures), moves the backplane window selector cfg:0x80 onto ChipCommon and then onto the
 # enumeration ROM, walks the core table from our own reads with a TAG-driven parse (the declared port
@@ -3784,6 +3784,9 @@ prefs_core = { path = "../../libs/sys/prefs_core" }
 # LUMENAPP (B323): Vein's shared no_std core — `tests lumen` applies the SAME provider/key rule the ring-3
 # LUMEN.ELF applies (vein_core::prefs::plan). Zero deps; only under feature `lumen`.
 vein_core = { path = "../../libs/sys/vein_core", default-features = false, optional = true }
+# WIFI1 (B338, R79): the BCM4331 driver's shared no_std core — the firmware container codec and the
+# IEEE 802.11 frame codec, the same crate the host tests link. `optional`, pulled only by `wifi`.
+wifi_core = { path = "../../libs/sys/wifi_core", default-features = false, optional = true }
 # SELFINSTALL2 (rmbp-ledger B310): Amber Bytes' shared disk-layout core — GPT encode/decode, the partition
 # Plan, the FAT32 BPB, the clone plan — the same crate `tools/una-card` and `handlers/amber_bytes` link.
 # no_std + alloc, zero deps; arch-neutral (install/gpt.rs and install/fat32.rs are its kernel callers).
