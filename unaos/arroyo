@@ -3518,6 +3518,11 @@ EOF
     return $rc
 }
 
+# PROFILE (rmbp-ledger B331, M2): the kernel's symbol table, written BESIDE the ELF the link step just produced
+# (address-sorted, demangled, one line per defined symbol) for `tools/flame` to resolve `prof dump` samples
+# against. The kernel embeds nothing; a missing llvm-nm warns and never fails the build.
+emit_kernel_syms() { "$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin/llvm-nm" -n -C --defined-only "$1" > "$2" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: $2 ($(wc -l < "$2") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on $1 — no $2 (prof dump stays unresolved)${COLOR_RESET}"; }
+
 build_kernel_x86_64() {
     echo -e "${COLOR_YELLOW}⚡ Building x86_64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
@@ -3526,6 +3531,7 @@ build_kernel_x86_64() {
       $NIGHTLY_FLAGS $KERNEL_FEATURES
     cd "$WORKSPACE_DIR"
     gate_x86_rodata_no_code "${WORKSPACE_DIR}/target/x86_64-unaos/release/unaos-kernel"
+    emit_kernel_syms "${WORKSPACE_DIR}/target/x86_64-unaos/release/unaos-kernel" "${WORKSPACE_DIR}/target/kernel.syms"  # PROFILE M2
     # BANNER-ARTIFACT: beside the other post-build artifact gate, on the ELF cargo just wrote, with
     # the list THIS compile was handed (x86 keeps the full $KERNEL_FEATURES — the `arm_features`
     # strip is aarch64-only).
@@ -3875,6 +3881,7 @@ build_kernel_aarch64() {
     # describes the aarch64 artifact, because `arm_features` above strips smolnet/kbdwit/deadman out
     # of every aarch64 compile while the banner still names them.
     banner_artifact_check "${WORKSPACE_DIR}/target/aarch64-unaos/release/unaos-kernel" "${_af#--features }" aarch64
+    emit_kernel_syms "${WORKSPACE_DIR}/target/aarch64-unaos/release/unaos-kernel" "${WORKSPACE_DIR}/target/kernel-aarch64.syms"  # PROFILE M2
     echo -e "${COLOR_GREEN}✅ aarch64 Kernel Built.${COLOR_RESET}"
 }
 
@@ -8764,6 +8771,7 @@ esp_x86() {
     # itself), so the .rodata gate runs here too — on the STAGED image, which is the ELF the
     # firmware actually loads. A gate that only covers the QEMU path is not a gate on the boot media.
     gate_x86_rodata_no_code "${WORKSPACE_DIR}/target/x86_64_esp/kernel.elf"
+    emit_kernel_syms "${WORKSPACE_DIR}/target/x86_64_esp/kernel.elf" "${WORKSPACE_DIR}/target/kernel.syms"  # PROFILE M2: the staged ELF the firmware loads
     # BANNERCERT — the banner this run printed is now a CLAIM the artifact has to answer for.
     # `$_feats` is the very string the `⚡ kernel features:` line was composed from at script load
     # (top of file), so this asks the produced ELF whether it carries a certifying string for each

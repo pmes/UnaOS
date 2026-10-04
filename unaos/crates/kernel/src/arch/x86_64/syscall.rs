@@ -2555,11 +2555,11 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) { #[cfg(featur
 /// other arm ignores it, and a program that does not load `r10` simply passes junk to a verb that
 /// does not read it.
 #[unsafe(no_mangle)]
-extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, #[cfg(feature = "linuxabi")] a5: u64) -> i64 { #[cfg(feature = "linuxabi")] { let a4 = crate::arch::linuxabi::take_user_r8(); if crate::arch::linuxabi::is_linux_task() { return crate::arch::linuxabi::dispatch(nr, a0, a1, a2, a3, a4, a5); } } // LINUXABI: a Linux task speaks the Linux table; a4 is user r8 from the stub's scratch, a5 is r9 (the 6th C arg). Folded onto the signature line.
+extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, #[cfg(feature = "linuxabi")] a5: u64) -> i64 { #[cfg(feature = "linuxabi")] { let a4 = crate::arch::linuxabi::take_user_r8(); if crate::arch::linuxabi::is_linux_task() { return crate::arch::linuxabi::dispatch(nr, a0, a1, a2, a3, a4, a5); } } let prof_t0 = crate::prof::sys_t0(); // LINUXABI: a Linux task speaks the Linux table; a4 is user r8 from the stub's scratch, a5 is r9 (the 6th C arg). Folded onto the signature line.
     if !SYSCALL_LOGGED.swap(true, Ordering::Relaxed) {
         serial_println!(":: SYSCALL: nr={} — ring-3 -> ring-0 path live ::", nr);
     }
-    let rc = syscall_dispatch_inner(nr, a0, a1, a2, a3);
+    let rc = syscall_dispatch_inner(nr, a0, a1, a2, a3); crate::prof::sys_note(nr, prof_t0);
     // TEARDOWN-1: the SYSCALL KILL BOUNDARY. A task whose `KillSwitch` is armed retires HERE, on the way
     // out, and this call does not return in that case — the scheduler's existing reap arm owns the
     // teardown (see `sched::kill_check_current`).

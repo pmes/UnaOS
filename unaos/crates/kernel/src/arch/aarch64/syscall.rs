@@ -6850,7 +6850,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
     // (and the one-shot SVC log, which would otherwise be spent on a dead task's last call). Never
     // returns for a killed task: it retires here, on its own kernel stack, IRQ-masked, exactly as
     // SYS_EXIT / SYS_THREAD_EXIT already do from this same frame. Four relaxed loads otherwise.
-    super::sched::kill_check_current();
+    super::sched::kill_check_current(); let prof_t0 = crate::prof::sys_t0();
 
     if !SVC_LOGGED.swap(true, Ordering::Relaxed) {
         serial_println!(":: SVC: EC=0x15 nr={} — EL0->EL1 syscall path live ::", nr);
@@ -7191,7 +7191,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         }
         _ => -38, // -ENOSYS
     };
-    unsafe { *frame.add(0) = ret as u64 }; // return value in x0
+    unsafe { *frame.add(0) = ret as u64 }; crate::prof::sys_note(nr, prof_t0); // return value in x0
 }
 
 // =============================================================================================

@@ -30066,3 +30066,19 @@ pub(super) fn kcomp_row(fb: &super::FrameBuffer, byte_offset: usize, src: &[u8],
     comp_mark_row(py);
     blit_traced(fb, byte_offset, src);
 }
+
+/// PROFILE M4 (rmbp-ledger B331) — the `[comp2]` split's raw counters for `prof top`'s three compositor
+/// rows: `[passes, loop_cyc, cache_cyc, compose_cyc, present_cyc]`. LOADS, never swaps: `comp2_emit`
+/// owns the drain, and `prof` reads a delta against its own baseline (falling back to the since-drain
+/// value when a rollup drained in between). `blit = loop - cache`, exactly as the rollup prints it.
+#[cfg(feature = "witness")]
+pub fn prof_comp2() -> [u64; 5] {
+    use core::sync::atomic::Ordering::Relaxed;
+    [
+        C2_PASSES.load(Relaxed),
+        C2_LOOP_CYC.load(Relaxed),
+        C2_CACHE_CYC.load(Relaxed),
+        C2_COMPOSE_CYC.load(Relaxed),
+        C2_PRESENT_CYC.load(Relaxed),
+    ]
+}
