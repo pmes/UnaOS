@@ -19407,7 +19407,7 @@ impl Controller {
 /// reports the ISR dropped (drop-newest, never blocking), this endpoint's dark total and worst window, and
 /// the CPU WCPAR left free of band workers for the input service. FAIL = a single dark window over 500 ms.
 fn ptrstutter_witness(dark_ms: u64, dark_max_ms: u64, slot: usize) {
-    let (sessions, dark_touch) = ptr2_touch_totals(slot);
+    let (sessions, dark_touch) = ptr2_touch_totals(slot); if !crate::census::on(crate::census::PTRSTUTTER) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
     let (d_inst, d_desk) = ptr2_stage_split();
     serial_println!(
         ":: PTRSTUTTER: ring={} dropped={} dropped_idle={} dropped_installer={} dropped_desktop={} dark_ms={} touch_sessions={} dark_in_touch_ms={} dark_max_ms={} reserved_cpu=none(ruling) -> {} ::",

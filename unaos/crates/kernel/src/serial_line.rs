@@ -199,7 +199,7 @@ static NEXT_CENSUS_MS: AtomicU64 = AtomicU64::new(0);
 /// M2 — the census witness, once per second, riding `serial_ring::mirror_service` (unmasked,
 /// no locks held, reached on both arches). PASS = it printed; the numbers are for the reader.
 pub fn census_poll() {
-    let now = crate::arch::ms();
+    let now = crate::arch::ms(); if !crate::census::on(crate::census::SERIAL) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
     if now < NEXT_CENSUS_MS.load(Relaxed) {
         return;
     }

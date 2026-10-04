@@ -7022,14 +7022,14 @@ fn x86_render_service(cpu: usize) {
             // nothing was queued and a channel that is empty because the consumer summed a whole
             // gesture into one dispatch read identically in `sent`/`recv`/`inflight`; `fold` is how
             // many reports took the second path, i.e. how far behind the pad this core fell.
-            serial_println!(
+            if unaos_kernel::census::on(unaos_kernel::census::SCHEDX86) { serial_println!(
                 "[schedx86] depth sent={} recv={} inflight={} (render core {}) fold={}",
                 sent,
                 recv,
                 sent.wrapping_sub(recv),
                 cpu,
                 GUI_FOLD_X86.load(Ordering::Relaxed)
-            ); #[cfg(feature = "wc")] ptrinstall_rollup(); // PTRINSTALL (B117) — rides the depth line's 5 s gate as a SIBLING LINE rather than a term on the depth line: the depth format string is in every x86 image, `wc` on or off, so a term appended there moves the knob-off image (`./arroyo knoboff wc` exit 1); a `wc`-erased statement folded here does not. ⚠ LINE-NEUTRAL fold; the fn is at this file's tail.
+            ); } #[cfg(feature = "wc")] ptrinstall_rollup(); // PTRINSTALL (B117) — rides the depth line's 5 s gate as a SIBLING LINE rather than a term on the depth line: the depth format string is in every x86 image, `wc` on or off, so a term appended there moves the knob-off image (`./arroyo knoboff wc` exit 1); a `wc`-erased statement folded here does not. ⚠ LINE-NEUTRAL fold; the fn is at this file's tail.
             // SCHEDLOAD-X86 load witness, riding the depth line's clock gate — the two are the answer
             // halves of one question and are worth reading as a pair: `depth` says whether the GUI
             // pipe is backed up, `load` says what the other seven cores were doing while it was not.
@@ -10108,7 +10108,7 @@ fn ptrinstall_rollup() {
     let fold_age = PTRI_FOLD_AGE_MAX_MS.load(Relaxed);
     let drain_gap = PTRI_DRAIN_GAP_MAX_MS.load(Relaxed);
     let panel_busy = PTRI_PANEL_BUSY.load(Relaxed);
-    if reports != 0 || drains != 0 {
+    if (reports != 0 || drains != 0) && unaos_kernel::census::on(unaos_kernel::census::PTRINSTALL) {
         serial_println!(
             "[ptrinstall] installs={} reports={} lag_max_ms={} coalesced={} drains={} folds={} fold_age_max_ms={} drain_gap_max_ms={} panel_busy={}",
             installs, reports, lag, coalesced, drains, folds, fold_age, drain_gap, panel_busy

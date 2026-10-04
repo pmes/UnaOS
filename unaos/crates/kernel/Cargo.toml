@@ -962,6 +962,8 @@ login = ["midden_core/login"]
 loginst = ["login"]
 # R77 M3 (THE TEST SUITE IS A COMMAND): run the registered desktop fixtures at registration, as before. Default OFF => they are deferred behind the `tests` shell verb. Kept in sync with arroyo and builder/src/main.rs.
 tests-at-boot = []
+# QUIETBOOT (R80, rmbp-ledger B311): `UNAOS_CENSUS=1` boots with every periodic sampler in `census.rs` ON (the old always-on SERIAL/VBJITTER/SMPLOAD/WCPAR/PTRSTUTTER/deadman/... lines). Default OFF => they stay silent until `census start <name>`. The QEMU battery verbs arm it (arroyo head `case`) so their pinned census lines stay reachable. Kept in sync with arroyo and builder/src/main.rs.
+census = []
 # BT-BOND M1 / HOLOCRON SELFTESTS: `UNAOS_HCRONST=1` arms the store's two BOOT-TIME-WRITE selftests —
 # `fs::holocron::selftest_once` (writes then unlinks `/HCRON/HCRNTEST.DAT`) and
 # `drivers::ehci::btbond::selftest_once` (stages a fixture bond through the real flush, which creates

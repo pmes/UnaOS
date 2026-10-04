@@ -211,7 +211,7 @@ pub fn emit() {
     // PTRSTUTTER M3 — the verdict is about COMPLETION: every band ran (a speedup of 14-28% under six vug
     // windows is the machine being busy, not a defect). Only an IDLE machine is held to a speedup floor.
     let busy = cores_busy();
-    let ok = failed == 0 && (busy || speedup >= 20);
+    let ok = failed == 0 && (busy || speedup >= 20); if !crate::census::on(crate::census::WCPAR) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
     serial_println!(
         ":: WCPAR: cores={} workers={} bands={} pass_us={} serial_us={} speedup_pct={} load={} -> {} ::",
         cores,

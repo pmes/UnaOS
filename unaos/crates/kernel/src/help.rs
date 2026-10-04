@@ -135,6 +135,7 @@ pub static DOCS: &[VerbDoc] = &[
     d("play", "audio", "stream a WAV file to the sound device, or stop playback", "play <path.wav> | play stop", &["play /home/ann/TUNE.WAV", "play stop"]),
     // ── tests ──
     d("tests", "tests", "run the desktop test fixtures (all, one by name, or list them); refused until first-boot setup is done", "tests [name] | tests list", &["tests list", "tests helpdoc", "tests"]),
+    d("census", "tests", "start, stop or list the periodic samplers (all off at boot, R80)", "census list | census start <name>|all | census stop [<name>|all]", &["census list", "census start serial", "census stop"]),
     d("tste", "tests", "run the in-OS self-test suite: a PASS/FAIL/SKIP table", "tste", &["tste"]),
     d("selftest", "tests", "alias of tste", "selftest", &["selftest"]),
     // ── self-host ──
