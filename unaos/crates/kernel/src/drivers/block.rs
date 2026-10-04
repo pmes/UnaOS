@@ -2636,6 +2636,7 @@ pub fn native_mount_write_veto() -> Option<&'static str> {
     let Some(handle) = crate::fs::unafs::mount_bound_handle() else {
         return None;
     };
+    #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let BlockHandle::Ahci { port } = handle { if crate::install::ahciroot::root_port() == Some(port) { return None; } } // AHCIROOT (B332): the native root on a root-granted SSD is writable (the grant bounds it to p2); the per-HANDLE answer below is unchanged, so leg 8's FAT/handle agreement is untouched
     handle_write_veto(handle)
 }
 
