@@ -626,6 +626,10 @@ impl<'a, T: Transport> Client<'a, T> {
             return Err(illegal("cipher suite not offered"));
         }
         for e in &sh.extensions {
+            // §4.1.4: a HelloRetryRequest may carry a cookie the client never offered.
+            if sh.is_hrr && *e == msgs::ext::COOKIE {
+                continue;
+            }
             if !offered.extensions.contains(e) {
                 return Err(TlsError::Protocol(AlertDescription::UnsupportedExtension, "unsolicited ServerHello extension"));
             }
