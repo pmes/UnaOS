@@ -39,9 +39,9 @@ GATE-CHARTER is not in scope.
 Lumen's console on connect: `:: BRAIN :: ONLINE (claude / claude-opus-5-5)` (or the configured pair),
 and with no key `:: BRAIN :: NO PROVIDER :: set ANTHROPIC_API_KEY, or choose a provider in Settings`.
 
-**Owed.** Embeddings with Claude (Anthropic has no embeddings endpoint: semantic recall degrades to
+**Owed.** `tools/foreman/src/advisor/provider.rs` is a scaffold provider trait that says it migrates onto this one at the Vein rung — that migration is a follow-up. Embeddings with Claude (Anthropic has no embeddings endpoint: semantic recall degrades to
 an empty query vector unless a Gemini embedder is configured — an `vein.embed.*` provider split is
-owed); Gemini streaming is one chunk (the trait shape is there); attachments are Gemini `gs://` URIs
+owed); nothing in Vein consumes `stream` yet (both providers implement it over SSE; the chat path still calls `generate`); attachments are Gemini `gs://` URIs
 from the upload service, which Claude cannot fetch (Claude gets a URL document/image block for an
 `https://` URI and a clear refusal-to-attach error otherwise); the quartzite dropdown is GTK-gated and
 not compiled on a host without GTK4; Holocron custody of the key.
