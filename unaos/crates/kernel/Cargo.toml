@@ -3717,6 +3717,12 @@ ioapic = []
 # tags exactly as before and nothing of the router is compiled. Kept in sync with `unaos/arroyo` (the
 # x86 `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 busreg = []
+# LUMENBIN (rmbp-ledger B305): UNAOS_LUMEN=1 arms the Lumen chat window's desktop presence — the `lumen` dock
+# pin joins the DEFAULT pin set (video/dock.rs DP_ALL) — and the `tests lumen` fixture (crate::lumen; x86 +
+# `wc`: LUMEN.BIN driven with synthetic keys, its witness block read out of its slot). The program itself
+# (APPS/LUMEN.BIN, crates/user-lumen) and the `lumen` verb exist on every build. Kept in sync with
+# `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
+lumen = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage

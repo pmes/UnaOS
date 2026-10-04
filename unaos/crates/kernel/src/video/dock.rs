@@ -3158,20 +3158,21 @@ pub enum DpKind { KernelWindow, Ring3Program }
 
 pub struct DpSpec { pub name: &'static str, pub initial: u8, pub kind: DpKind, pub verb: &'static str, pub id: wm::WinId }
 
-pub const DP_PINS: [DpSpec; 6] = [
+pub const DP_PINS: [DpSpec; 7] = [
     DpSpec { name: "console",  initial: b'C', kind: DpKind::KernelWindow, verb: "",         id: CONSOLE_PIN_ID },
     DpSpec { name: "shell",    initial: b'S', kind: DpKind::KernelWindow, verb: "",         id: SHELL_PIN_ID },
     DpSpec { name: "quarry",   initial: b'Q', kind: DpKind::KernelWindow, verb: "",         id: QUARRY_PIN_ID },
     DpSpec { name: "activity", initial: b'A', kind: DpKind::Ring3Program, verb: "activity", id: wm::WinId::MAX - 4 },
     DpSpec { name: "settings", initial: b'G', kind: DpKind::Ring3Program, verb: "settings", id: wm::WinId::MAX - 5 },
     DpSpec { name: "editor",   initial: b'E', kind: DpKind::KernelWindow, verb: "edit",     id: wm::WinId::MAX - 6 },
+    DpSpec { name: "lumen",    initial: b'L', kind: DpKind::Ring3Program, verb: "lumen",    id: wm::WinId::MAX - 7 }, // LUMENBIN (B305): LUMEN.BIN, the ring-3 chat window; launch = the `lumen` verb (= `bg /apps/LUMEN.BIN`), matched by `app_name_of` == "lumen". Index 6, default-pinned only under `lumen` (DP_ALL).
 ];
 const DP_FIRST_EXTRA: usize = 3;
 /// A pin row's synthetic owner for a ring-3 app with no live window: never a real owner id.
 const DP_PIN_OWNER: u64 = 0xD0C0_0000;
-const DP_ALL: u32 = (1 << DP_PINS.len()) - 1;
+const DP_ALL: u32 = ((1 << DP_PINS.len()) - 1) & !(if cfg!(feature = "lumen") { 0 } else { 1 << 6 }); // LUMENBIN: the lumen pin (index 6) joins the DEFAULT set only on a `lumen` build; any build pins it on request
 static DP_MASK: AtomicU32 = AtomicU32::new(DP_ALL);
-static DP_PROG_OWNER: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static DP_PROG_OWNER: [AtomicU64; DP_PINS.len()] = [const { AtomicU64::new(0) }; DP_PINS.len()];
 static DP_VERB_OWED: AtomicU32 = AtomicU32::new(0);
 static DP_SAVE_OWED: AtomicBool = AtomicBool::new(false);
 static DP_LOAD_OWED: AtomicBool = AtomicBool::new(true); // true at boot: the first service pass loads (or keeps the default)
@@ -3367,7 +3368,7 @@ pub fn dockpin_selftest() {
     let saved_mask = DP_MASK.load(Ordering::Relaxed);
     // Leg 1 — pure: render/parse round trip, unknown names ignored, duplicates folded.
     let (m, c) = dp_parse(b"shell,bogus,editor,shell");
-    let parse_ok = m == (1 << 1 | 1 << 5) && c == 2 && dp_parse(&*dp_render(DP_ALL).into_bytes()) == (DP_ALL, 6);
+    let parse_ok = m == (1 << 1 | 1 << 5) && c == 2 && dp_parse(&*dp_render(DP_ALL).into_bytes()) == (DP_ALL, DP_ALL.count_ones()); // LUMENBIN: the count is DERIVED (6, or 7 with the lumen pin)
     // Leg 2 — pin/unpin changes the model: unpin editor -> its tile (pin or live) leaves; pin -> returns.
     let has = |i: usize| -> Option<bool> {
         let mut rows = [wm::DockEntry::empty(); wm::MAX_WINDOWS];
@@ -3387,10 +3388,10 @@ pub fn dockpin_selftest() {
     match dp_write(want) {
         Ok(b) => {
             bytes = b as i64;
-            let in_file = matches!(crate::prefs::read_file(), Some(Ok(t)) if t.get(crate::prefs::NS, crate::prefs::key::DOCK_PINS).and_then(|v| v.as_str()).map(|s| dp_parse(s.as_bytes())) == Some((want, 5)));
+            let in_file = matches!(crate::prefs::read_file(), Some(Ok(t)) if t.get(crate::prefs::NS, crate::prefs::key::DOCK_PINS).and_then(|v| v.as_str()).map(|s| dp_parse(s.as_bytes())) == Some((want, want.count_ones())));
             DP_MASK.store(DP_ALL, Ordering::Release);
             let c = dp_load();
-            file_ok = in_file && c == 5 && DP_MASK.load(Ordering::Relaxed) == want;
+            file_ok = in_file && c == want.count_ones() && DP_MASK.load(Ordering::Relaxed) == want;
         }
         Err(_) => file_ok = false,
     }
@@ -3398,7 +3399,7 @@ pub fn dockpin_selftest() {
     DP_MASK.store(saved_mask, Ordering::Release);
     let ok = parse_ok && toggle_ok && file_ok;
     serial_println!(":: DOCKPIN: tiles={} pinned={} running={} loaded={} saved={} fixture parse={} toggle={} file={} -> {} ::",
-        DP_PINS.len(), DP_ALL.count_ones(), 0, 5, bytes, parse_ok as u8, toggle_ok as u8, if skip { "skip" } else if file_ok { "ok" } else { "no" }, if ok { "PASS" } else { "FAIL" });
+        DP_PINS.len(), DP_ALL.count_ones(), 0, want.count_ones(), bytes, parse_ok as u8, toggle_ok as u8, if skip { "skip" } else if file_ok { "ok" } else { "no" }, if ok { "PASS" } else { "FAIL" });
 }
 
 // WINDOWLIST M3 (R75) — TAIL-APPENDED. The running tile's menu lists the app's windows (one row each) when it has more than one.

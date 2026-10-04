@@ -734,6 +734,8 @@ fn main() {
     if std::env::var("UNAOS_LINUXABI").is_ok() { feats.push("linuxabi"); }
     // BANDY3: UNAOS_BUSREG=1 arms fulfiller registration on the bus wire. Kept in sync with arroyo.
     if std::env::var("UNAOS_BUSREG").is_ok() { feats.push("busreg"); }
+    // LUMENBIN: UNAOS_LUMEN=1 arms the lumen dock pin by default and `tests lumen`. Kept in sync with arroyo.
+    if std::env::var("UNAOS_LUMEN").is_ok() { feats.push("lumen"); }
     // WEDGE-2: UNAOS_WEDGE2=1 arms the `wedge2` feature — raw-UART `<F1>`..`<F9>` last-words
     // breadcrumbs along the focus-raise/composite chain (x86: bare 16550 at 0x3F8, no lock). Media
     // builds come from THIS list, not arroyo's (the s42/INSTGUI lesson), so the knob is mapped here

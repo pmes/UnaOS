@@ -165,7 +165,7 @@ pub enum Action {
     WinSizeLeft,
     WinSizeRight,
     WinSizeUp,
-    WinSizeDown, Minimize /* WINDOWLIST: ⌘M, code 39 */, CycleApp /* WINDOWLIST: ⌘` — next window of the SAME app, code 40 */,
+    WinSizeDown, Minimize /* WINDOWLIST: ⌘M, code 39 */, CycleApp /* WINDOWLIST: ⌘` — next window of the SAME app, code 40 */, ClearView /* LUMENBIN: ⌘K — clear the focused view (LUMEN.BIN's transcript), code 41 */,
 }
 
 impl Action {
@@ -209,7 +209,7 @@ impl Action {
             Action::WinSizeLeft => "win-size-left",
             Action::WinSizeRight => "win-size-right",
             Action::WinSizeUp => "win-size-up",
-            Action::WinSizeDown => "win-size-down", Action::Minimize => "minimize", Action::CycleApp => "cycle-app", // WINDOWLIST
+            Action::WinSizeDown => "win-size-down", Action::Minimize => "minimize", Action::CycleApp => "cycle-app", Action::ClearView => "clear-view", // WINDOWLIST · LUMENBIN
         }
     }
 
