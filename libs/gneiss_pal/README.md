@@ -12,8 +12,9 @@ prevents each handler from carrying its own copy of the same host-facing code.
 
 Today the crate covers four concrete areas:
 
-- **External service clients** — an LLM client (Google Vertex / Gemini) and a
-  GitHub client.
+- **External service clients** — the model-provider seam (`api::ModelProvider`:
+  Claude and Gemini today, chosen by the person in Settings, none hardwired —
+  VEINPROV) and a GitHub client.
 - **Filesystem layout** — the canonical on-disk directory tree for UnaOS state.
 - **Persistence** — saving and loading message history to JSON.
 - **Contracts and utilities** — a memory-mapping trait, a UI handler trait, and
@@ -23,8 +24,11 @@ Today the crate covers four concrete areas:
 
 | Item | Module | Description |
 | --- | --- | --- |
-| `ResilientClient` | `api` | Async LLM client for Google Vertex (`generate_content`, `embed_content`). Fetches credentials via `gcloud` ADC and retries once on a 401 by refreshing the token. |
-| `Content`, `Part`, `FileData`, `UsageMetadata` | `api` | Serde request/response types for the Vertex content API. |
+| `ModelProvider`, `ChatRequest`, `ChatResponse`, `StopReason`, `ChatDelta`, `ProviderError` | `api::provider` | The provider-neutral seam Vein talks through: `generate`, `stream`, `embed`, `name`, `model`. `ProviderConfig::from_prefs` + `build_provider` construct the configured provider (API key read from the env var a preference names). |
+| `ClaudeProvider` | `api::claude` | Anthropic Messages API over raw HTTP (`reqwest`): default model `claude-opus-5-5`, SSE streaming, refusal mapping, server-side fallbacks on by default. |
+| `GeminiProvider` | `api::gemini` | Vertex AI (gcloud ADC, token refreshed once on a 401) or the Generative Language API (API key); project, region, model and embedding model are configuration. Also the only embedder today. |
+| `RetryPolicy`, `send_with_backoff` | `api::retry` | The one backoff every provider (and Vein's `SynapticRetry`) uses: 408/409/429/5xx and connection errors retried, `retry-after` honoured. |
+| `Content`, `Part`, `FileData`, `UsageMetadata` | `api` | Vein's message parts (Gemini wire shape) and Gemini usage. |
 | `api::format::format_network_log` | `api::format` | Renders a raw JSON network-log line into a human-readable string for display. |
 | `ForgeClient` | `forge` | GitHub client built on `octocrab`; reads `GITHUB_TOKEN`, exposes `get_user_info`, `list_repos`, `get_file_content`. |
 | `UnaPaths` | `paths` | Resolves the UnaOS state tree (`root`, `vault`, `cortex`, `config`, …) honoring `UNA_ROOT` with per-OS defaults; `awaken()` creates the directories. |
@@ -55,7 +59,7 @@ and the canon in [`docs/CODEX.md`](../../docs/CODEX.md).
 
 ## Status
 
-Partial. The implemented surface — the Vertex and GitHub clients, `UnaPaths`,
+Partial. The implemented surface — the model-provider seam (Claude, Gemini) and the GitHub client, `UnaPaths`,
 `BrainManager`, the `AppHandler` / `MemoryMappedRegion` traits, and the text
 utilities — is functional and in use by userspace components. The broader
 "great library" role described in the CODEX (geometry, DSP, windowing, and a

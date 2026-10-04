@@ -521,3 +521,15 @@ mod tests {
         assert!(dir.path().join("preferences.toml").exists());
     }
 }
+
+/// The standard preference file, `~/.config/unaos/preferences.toml` (via
+/// `dirs::config_dir()`): the path [`Principia::new`] serves. A reader that
+/// is not the store's writer (Vein reading its `vein` namespace, VEINPROV
+/// B303) opens it read-only through [`prefs::PrefStore::load`].
+pub fn default_prefs_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.config"))
+        .join("unaos")
+        .join("preferences.toml")
+}
+
