@@ -1289,7 +1289,7 @@ fn fs_stat(console: &mut Console, arg: &str) {
     console.println(&alloc::format!(
         "  kind:   {}", if matches!(st.kind, NodeKind::Dir) { "dir" } else { "file" }));
     console.println(&alloc::format!("  size:   {} byte(s)", st.size)); console.println(&match st.id { Some(id) => alloc::format!("  id:     {}", id), None => String::from("  id:     - (this volume exposes no object id)") }); if let Some(t) = st.mtime { console.println(&alloc::format!("  epoch:  {} (unix seconds)", t)); } // ATTRSURF (B294): the object's identity and its mtime as the number SYS_STAT returns. ⚠ SAME-LINE fold.
-    console.println(&alloc::format!("  mtime:  {}", vfs_mtime_field(mtime.as_ref()).trim()));
+    console.println(&alloc::format!("  mtime:  {}", vfs_mtime_field(mtime.as_ref()).trim())); crate::fs::unafstime::stat_ctime_line(console, &mt, &path);
     if path == "/" {
         console.println("  entry:  the volume root has no directory entry of its own");
     }

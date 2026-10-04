@@ -110,7 +110,7 @@ pub struct Stat {
     /// keeps across a rename (trash, recents, query results).
     pub id: Option<u64>,
     /// ATTRSURF: last write, unix seconds, when the medium records one (FAT's last-write stamp).
-    /// `None` on native UnaFS until UNAFSTIME gives the inode a time field — never fabricated.
+    /// On native UnaFS the v6 inode stamp (UNAFSTIME, B308); `None` when it is 0 (unknown) — never fabricated.
     pub mtime: Option<u64>,
 }
 
@@ -1728,17 +1728,17 @@ impl VfsBackend for NativeBackend {
                     // arc deleted — the filter moves here rather than disappearing.
                     e.name != "." && e.name != ".." && e.kind != ::unafs::FileKind::System
                 })
-                .map(|e| DirEnt {
+                .map(|e| { let ino = fs.read_inode(e.inode_id).ok(); DirEnt {
                     name: e.name,
                     kind: native_kind(e.kind),
                     // unafs holds size on the inode, not the directory entry, so the listing costs
                     // one inode read per row — the same cost `pi_ls_collect` paid. A row whose
                     // inode cannot be read reports 0 rather than failing the whole listing.
-                    size: fs.read_inode(e.inode_id).map(|i| i.size).unwrap_or(0),
-                    // unafs records no last-write time; §3 says a backend answers for its own
-                    // medium, so this is `None`, never a fabricated stamp.
-                    mtime: None,
-                })
+                    size: ino.as_ref().map(|i| i.size).unwrap_or(0),
+                    // UNAFSTIME (B308): the v6 inode's mtime (stamped by the kernel clock hook);
+                    // 0 = unknown (pre-v6 volume, unanchored clock) renders `None`, never fabricated.
+                    mtime: ino.as_ref().and_then(|i| crate::fs::unafstime::vfs_time(i.mtime)),
+                } })
                 .collect())
         })
         .map_err(unafs_err)?
@@ -1753,7 +1753,7 @@ impl VfsBackend for NativeBackend {
                 kind: native_kind(ino.kind),
                 size: ino.size,
                 id: Some(id), // ATTRSURF (B294): the inode id is the object's identity
-                mtime: None,  // UnaFS has no time field until UNAFSTIME
+                mtime: if ino.mtime == 0 { None } else { Some(ino.mtime) }, // UNAFSTIME (B308): the inode's stamp
             })
         })
         .map_err(unafs_err)?
