@@ -13,6 +13,9 @@ pub mod skeleton;
 pub mod storage;
 pub mod synapse;
 pub mod vault;
+/// VEINCORE (B304): the shared no_std core — `Conversation`, `ChatMessage`, `ChatRequest`/`ChatResponse`,
+/// the chat bus codec — re-exported so a vessel (Lumen) speaks to Vein in the same types on host and metal.
+pub use vein_core;
 
 use chrono::Local;
 use gneiss_pal::api::{Content, Part, ResilientClient};

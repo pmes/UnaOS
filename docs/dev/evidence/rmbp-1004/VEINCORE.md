@@ -100,6 +100,35 @@ accepted). Unset / -ENOENT / anything else → `echo`. `claude` is reserved (TLS
   at start, then per served request `:: VEIN: served=<n> frames=<n> verb=<v> conv=<c> status=<s> ::`.
 * `tests vein` → `:: VEINBUS: mode=<live|scratch> kats=<n> frames=<n> more=<n> done=1 cancel=0 status=0 -> PASS ::`.
 
+### Bridge (the bench companion, documented not shipped)
+
+The bench machine holds the rMBP's serial console (the FTDI wire, `/dev/ttyUSB0` here) and answers each
+REQ with the host Vein. `VEIN_CMD` is whatever turns a prompt on stdin into an answer on stdout (the host
+Vein CLI once VEINPROV lands; `rev` proves the loop). Python 3, pyserial:
+
+```python
+import base64, os, re, serial, subprocess, sys
+port = serial.Serial(sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyUSB0", 115200, timeout=1)
+cmd = os.environ.get("VEIN_CMD", "rev")
+req = re.compile(rb"\[vein-relay\] REQ (\d+) ([A-Za-z0-9+/=]*)")
+while True:
+    m = req.search(port.readline())
+    if not m:
+        continue
+    conv, prompt = int(m.group(1)), base64.b64decode(m.group(2))
+    answer = subprocess.run(cmd, shell=True, input=prompt, capture_output=True).stdout
+    chunks = [answer[i:i + 120] for i in range(0, len(answer), 120)] or [b""]
+    for seq, c in enumerate(chunks):
+        done = 1 if seq == len(chunks) - 1 else 0
+        body = base64.b64encode(c).decode() if c else "-"
+        port.write(f"vein rsp {conv} {seq} {done} {body}\r".encode())
+        port.flush()
+```
+
+120 bytes of answer is 160 base64 characters (`RSP_B64_MAX`), so every line stays under 200. The shell
+prints `[vein] rsp conv=<c> seq=<s> done=<d> bytes=<n> inject=0` per line; `inject=-2` means no VEIN.BIN
+owns the verbs, `-11` that its mailbox was full (resend the line).
+
 ### What stays owed
 
 `claude` provider on the metal (TLS + DNS: NETRING3); the window (LUMENBIN); an aarch64 VEIN.BIN media

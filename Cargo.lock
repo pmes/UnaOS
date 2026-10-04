@@ -8189,6 +8189,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "unafs",
+ "vein_core",
 ]
 
 [[package]]
