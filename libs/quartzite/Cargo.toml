@@ -14,6 +14,8 @@ macos = []
 [dependencies]
 gneiss_pal = { path = "../gneiss_pal" }
 bandy = { path = "../bandy" }
+# VEINPROV (B303): the sidebar's model menu preselects the provider configured in Principia's `vein` namespace.
+principia = { path = "../../handlers/principia" }
 # The Console pane runs every log line through Tabula's control-byte sanitizer
 # before it reaches glass. Default-features is the pure `sanitize` core (no GTK).
 tabula = { path = "../../handlers/tabula", default-features = false }

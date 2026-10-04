@@ -139,10 +139,10 @@ pub async fn send_classified(template: RequestBuilder, policy: &RetryPolicy) -> 
 /// Pull `error.message` out of a JSON error body (both Anthropic and Google
 /// shape it that way); otherwise the body itself, trimmed.
 pub fn error_message(body: &str) -> String {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
-        if let Some(m) = v.pointer("/error/message").and_then(|m| m.as_str()) {
-            return m.to_string();
-        }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body)
+        && let Some(m) = v.pointer("/error/message").and_then(|m| m.as_str())
+    {
+        return m.to_string();
     }
     body.trim().chars().take(2000).collect()
 }

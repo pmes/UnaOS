@@ -39,7 +39,7 @@ pub use claude::ClaudeProvider;
 pub use gemini::{GeminiAuth, GeminiConfig, GeminiProvider};
 pub use provider::{
     AuthMode, BoxFuture, ChatDelta, ChatMessage, ChatRequest, ChatResponse, DeltaStream, GeminiSettings, MODEL_CHOICES,
-    ModelProvider, PREF_NS, ProviderConfig, ProviderError, ProviderKind, Role, StopReason, Usage, build_provider,
+    ModelProvider, PREF_NS, model_menu, ProviderConfig, ProviderError, ProviderKind, Role, StopReason, Usage, build_provider,
     build_provider_with_env,
 };
 pub use retry::RetryPolicy;

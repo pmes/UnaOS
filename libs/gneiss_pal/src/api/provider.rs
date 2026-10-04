@@ -212,6 +212,24 @@ pub const MODEL_CHOICES: &[(&str, &str)] = &[
     ("gemini", GEMINI_DEFAULT_MODEL),
 ];
 
+/// The settings-surface menu: one label per [`MODEL_CHOICES`] entry
+/// (`"<model> (<provider>)"`), plus the configured model if a person typed one
+/// the menu does not list, and the index to preselect (the configured one, or
+/// 0 when nothing is configured).
+pub fn model_menu(configured: Option<&ProviderConfig>) -> (Vec<String>, u32) {
+    let mut labels: Vec<String> = MODEL_CHOICES.iter().map(|(p, m)| format!("{m} ({p})")).collect();
+    let Some(cfg) = configured else { return (labels, 0) };
+    let want = format!("{} ({})", cfg.model, cfg.kind.as_str());
+    let idx = match labels.iter().position(|l| *l == want) {
+        Some(i) => i,
+        None => {
+            labels.push(want);
+            labels.len() - 1
+        }
+    };
+    (labels, idx as u32)
+}
+
 /// Which provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -482,6 +500,24 @@ mod tests {
         assert!(!c.claude_fallbacks);
         assert_eq!(c.max_tokens, 4096);
         assert_eq!(c.temperature, Some(0.25));
+    }
+
+    #[test]
+    fn model_menu_preselects_the_configured_model() {
+        let (labels, i) = model_menu(None);
+        assert_eq!(labels[0], "claude-opus-5-5 (claude)");
+        assert_eq!(i, 0);
+        let mut c = ProviderConfig::from_prefs(prefs(&[
+            ("provider", PrefValue::Str("gemini".into())),
+            ("gemini.auth", PrefValue::Str("api_key".into())),
+        ]))
+        .unwrap();
+        let (labels, i) = model_menu(Some(&c));
+        assert_eq!(labels[i as usize], "gemini-3.1-pro-preview (gemini)");
+        c.model = "a-typed-model".into();
+        let (labels, i) = model_menu(Some(&c));
+        assert_eq!(labels.len(), MODEL_CHOICES.len() + 1);
+        assert_eq!(labels[i as usize], "a-typed-model (gemini)");
     }
 
     #[test]

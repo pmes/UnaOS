@@ -182,8 +182,20 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         vbox.set_margin_end(12);
 
         vbox.append(&Label::new(Some("Model")));
-        let models = StringList::new(&["Gemini 2.0 Flash", "Gemini 1.5 Pro", "Claude 3.5 Sonnet"]);
+        // VEINPROV (B303): the menu is the provider seam's model list, preselected on the
+        // provider/model the person configured in Principia's `vein` namespace (no hardcoded list).
+        let configured = {
+            let store = principia::prefs::PrefStore::load(principia::default_prefs_path()).ok();
+            gneiss_pal::api::ProviderConfig::from_prefs(|k: &str| {
+                store.as_ref().and_then(|s| s.get(gneiss_pal::api::PREF_NS, k))
+            })
+            .ok()
+        };
+        let (model_labels, model_selected) = gneiss_pal::api::model_menu(configured.as_ref());
+        let model_label_refs: Vec<&str> = model_labels.iter().map(String::as_str).collect();
+        let models = StringList::new(&model_label_refs);
         let dropdown = DropDown::new(Some(models), None::<gtk4::Expression>);
+        dropdown.set_selected(model_selected);
         vbox.append(&dropdown);
 
         let hbox_hist = Box::new(Orientation::Horizontal, 12);
