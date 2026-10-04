@@ -1,40 +1,40 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-// INSTALL-CORE — the GPT writer + parse-back verifier (UEFI 2.x spec).
+// INSTALL-CORE — the GPT writer + parse-back verifier + reader/editor, now a THIN CALLER of
+// `amber_core::gpt` (SELFINSTALL2, rmbp-ledger B310: the installer ensemble's shared core, audit B296).
 //
-// Lays a UEFI-conformant GUID Partition Table onto an `InstallTarget`:
-//   * a protective MBR at LBA 0 (single 0xEE partition spanning the disk);
-//   * a primary GPT header (LBA 1) + partition entry array (LBA 2..33);
-//   * a backup entry array + backup header at the tail;
-//   * TWO partition entries: one EFI System Partition (ESP) and one data partition, so the platform
-//     boot layout (an ESP the firmware boots + a data area) has room from the first write.
-// The header/array CRC-32s are the UEFI-mandated CRC-32/ISO-HDLC (see hash::crc32). This mirrors the
-// host-side hand-written GPT in builder/src/vm_image.rs — same layout constants, same GUIDs — so an
-// image the kernel writes is byte-compatible with the one the builder ships, and the in-tree FAT
-// reader's `scan_gpt` mounts either.
+// Every byte of the table — protective MBR, headers, entry array, CRC-32s, the decoder's geometry
+// bounds — is encoded and decoded by `unaos/libs/sys/amber_core`, the same `no_std` crate
+// `tools/una-card` lays the x86 card image with and `amber_bytes gpt show` reads. What stays here is
+// the I/O: reading and writing sectors through an `InstallTarget`, and the installer's own rules (the
+// write order, the self-verify after every write, the one-field editor's scope).
 //
-// SELF-VERIFY is part of the write API: `write_gpt` re-reads the primary + backup headers and the
-// entry array straight back off the device, recomputes every CRC, and checks the fixed invariants
-// (signatures, cross-linked backup LBA, the two partition entries) before returning Ok. A write that
-// cannot be read back and re-validated is a failure, not a success.
+// SELF-VERIFY is part of the write API: `write_gpt*` / `write_plan` re-read the primary + backup
+// headers and the entry array straight back off the device, re-validate them through the core, and
+// check the entries are the ones written before returning Ok. A write that cannot be read back and
+// re-validated is a failure, not a success.
+//
+// THE EDITOR'S SCOPE. `set_entry_type_guid` changes a partition entry's TYPE GUID and nothing else
+// (`amber_core::gpt::retype`), rewrites BOTH arrays then BOTH headers with fresh CRCs, and re-reads
+// the table before returning — a half-edited GPT is worse than an unedited one.
 
 use super::{InstallError, InstallTarget};
+use amber_core::gpt::{self as core_gpt, GptError, Header};
+use amber_core::plan::{PartKind, PartReq, Plan, Size};
 
-const SECTOR: usize = 512;
-pub const GPT_ENTRIES: u32 = 128;
-pub const GPT_ENTRY_SIZE: u32 = 128;
-const GPT_ARRAY_SECTORS: u64 = (GPT_ENTRIES as u64 * GPT_ENTRY_SIZE as u64) / SECTOR as u64; // 32
-pub const ESP_LBA_START: u64 = 2048; // 1 MiB alignment for the ESP.
+const SECTOR: usize = core_gpt::SECTOR;
+pub const GPT_ENTRIES: u32 = core_gpt::ENTRIES;
+pub const GPT_ENTRY_SIZE: u32 = core_gpt::ENTRY_SIZE;
+const GPT_ARRAY_SECTORS: u64 = core_gpt::ARRAY_SECTORS; // 32
+pub const ESP_LBA_START: u64 = core_gpt::ALIGN; // 1 MiB alignment for the ESP.
 
-// EFI System Partition type GUID C12A7328-F81F-11D2-BA4B-00A0C93EC93B (GPT mixed-endian layout).
-const EFI_SYSTEM_TYPE_GUID: [u8; 16] = [
-    0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B,
-];
-// Microsoft Basic Data partition type GUID EBD0A0A2-B9E5-4433-87C0-68B6B72699C7 — the data area.
-const BASIC_DATA_TYPE_GUID: [u8; 16] = [
-    0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
-];
+/// The EFI System Partition type GUID, for callers that must recognise an ESP they did not write.
+pub const ESP_TYPE_GUID: [u8; 16] = core_gpt::ESP_TYPE;
+/// The Microsoft Basic Data type GUID.
+pub const DATA_TYPE_GUID: [u8; 16] = core_gpt::BASIC_DATA_TYPE;
+/// SELFINSTALL2: the (advisory) UnaFS system-volume type GUID the card's p2 and the installed SSD's p2 carry.
+pub const UNAFS_TYPE_GUID: [u8; 16] = core_gpt::UNAFS_TYPE;
 
 /// Where the ESP landed, for the FAT formatter that follows.
 #[derive(Clone, Copy)]
@@ -46,298 +46,106 @@ pub struct GptLayout {
     pub total_sectors: u64,
 }
 
-fn u32le(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
-}
-fn u64le(b: &[u8], o: usize) -> u64 {
-    let mut v = [0u8; 8];
-    v.copy_from_slice(&b[o..o + 8]);
-    u64::from_le_bytes(v)
-}
-
-/// Deterministic 16-byte GUID from a label seed (a fixed identity per disk build — reproducible, not
-/// a random v4). RFC-4122 variant/version nibbles stamped so it is well-formed.
-fn derive_guid(label: &[u8]) -> [u8; 16] {
-    let mut g = [0u8; 16];
-    for (i, b) in g.iter_mut().enumerate() {
-        *b = label
-            .get(i)
-            .copied()
-            .unwrap_or_else(|| (0x11u8.wrapping_mul(i as u8 + 1)) ^ 0x5A);
-    }
-    g[7] = (g[7] & 0x0F) | 0x40; // version 4
-    g[8] = (g[8] & 0x3F) | 0x80; // variant RFC 4122
-    g
-}
-
-fn write_protective_mbr(mbr: &mut [u8; SECTOR], total_sectors: u64) {
-    let e = 446;
-    mbr[e + 2] = 0x02; // CHS first
-    mbr[e + 4] = 0xEE; // type: GPT protective
-    mbr[e + 5] = 0xFF; // CHS last
-    mbr[e + 6] = 0xFF;
-    mbr[e + 7] = 0xFF;
-    mbr[e + 8..e + 12].copy_from_slice(&1u32.to_le_bytes()); // first LBA
-    let count = core::cmp::min(total_sectors - 1, 0xFFFF_FFFF) as u32;
-    mbr[e + 12..e + 16].copy_from_slice(&count.to_le_bytes());
-    mbr[510] = 0x55;
-    mbr[511] = 0xAA;
-}
-
-fn write_entry(entry: &mut [u8], type_guid: &[u8; 16], first: u64, last: u64, name: &str, seed: &[u8]) {
-    entry[0..16].copy_from_slice(type_guid);
-    entry[16..32].copy_from_slice(&derive_guid(seed));
-    entry[32..40].copy_from_slice(&first.to_le_bytes());
-    entry[40..48].copy_from_slice(&last.to_le_bytes());
-    for (i, ch) in name.encode_utf16().enumerate() {
-        if 56 + i * 2 + 2 > entry.len() {
-            break;
-        }
-        entry[56 + i * 2..58 + i * 2].copy_from_slice(&ch.to_le_bytes());
+fn map(e: GptError) -> InstallError {
+    match e {
+        GptError::TooSmall => InstallError::TooSmall,
+        GptError::BadIndex => InstallError::BadArg,
+        _ => InstallError::VerifyFailed,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_header(
-    current_lba: u64,
-    backup_lba: u64,
-    first_usable: u64,
-    last_usable: u64,
-    disk_guid: &[u8; 16],
-    entries_start_lba: u64,
-    entries_crc: u32,
-) -> [u8; SECTOR] {
-    let mut h = [0u8; SECTOR];
-    h[0..8].copy_from_slice(b"EFI PART");
-    h[8..12].copy_from_slice(&0x0001_0000u32.to_le_bytes()); // revision 1.0
-    h[12..16].copy_from_slice(&92u32.to_le_bytes()); // header size
-    h[24..32].copy_from_slice(&current_lba.to_le_bytes());
-    h[32..40].copy_from_slice(&backup_lba.to_le_bytes());
-    h[40..48].copy_from_slice(&first_usable.to_le_bytes());
-    h[48..56].copy_from_slice(&last_usable.to_le_bytes());
-    h[56..72].copy_from_slice(disk_guid);
-    h[72..80].copy_from_slice(&entries_start_lba.to_le_bytes());
-    h[80..84].copy_from_slice(&GPT_ENTRIES.to_le_bytes());
-    h[84..88].copy_from_slice(&GPT_ENTRY_SIZE.to_le_bytes());
-    h[88..92].copy_from_slice(&entries_crc.to_le_bytes());
-    let crc = super::hash::crc32(&h[0..92]);
-    h[16..20].copy_from_slice(&crc.to_le_bytes());
-    h
-}
+/// The historical installer disk identity and partition names (unchanged GUIDs: the core's
+/// `derive_guid` is the derivation this file always used).
+pub const INSTALL_DISK_SEED: &[u8] = b"UNAOS-INSTALL-DISK";
 
-/// Write a full GPT (protective MBR + primary/backup headers + entry array) with an ESP and a data
-/// partition, then re-read and re-validate everything. Returns the ESP/data layout on success.
+/// Write a full GPT with an ESP and a data partition, then re-read and re-validate everything.
 pub fn write_gpt<T: InstallTarget>(t: &mut T) -> Result<GptLayout, InstallError> {
     write_gpt_sized(t, 64 * 1024 * 1024 / SECTOR as u64, true)
 }
 
-/// SELFINSTALL: [`write_gpt`] with the ESP size and the data partition made parameters. `write_gpt` is
-/// this with its historical 64 MiB + data; the self-install writes ONE bigger ESP and no data partition.
+/// [`write_gpt`] with the ESP size and the data partition made parameters (the historical shape:
+/// ESP from LBA 2048, at least ~40 MiB of room, the data partition 1 MiB-aligned through the end).
 pub fn write_gpt_sized<T: InstallTarget>(t: &mut T, esp_target: u64, with_data: bool) -> Result<GptLayout, InstallError> {
     let total_sectors = t.capacity_sectors();
-    // Need room for: primary GPT (34 sectors) + ESP + backup array + backup header, with the ESP
-    // large enough to format FAT32. Refuse a disk too small to hold a meaningful layout.
-    let backup_reserve = GPT_ARRAY_SECTORS + 1;
-    let first_usable = 2 + GPT_ARRAY_SECTORS; // LBA 34
-    let last_usable = total_sectors
-        .checked_sub(backup_reserve + 1)
-        .ok_or(InstallError::TooSmall)?;
-    if ESP_LBA_START < first_usable || last_usable <= ESP_LBA_START {
+    let last_usable = core_gpt::last_usable(total_sectors).ok_or(InstallError::TooSmall)?;
+    if last_usable <= ESP_LBA_START {
         return Err(InstallError::TooSmall);
     }
-
-    // ESP: from ESP_LBA_START, sized to the smaller of 64 MiB or half the usable tail, but at least
-    // the FAT32 floor (~34 MiB with 512-byte, 1-sector clusters). The data partition takes the rest.
-    let esp_target_sectors: u64 = esp_target;
     const ESP_MIN: u64 = 40 * 1024 * 1024 / SECTOR as u64; // comfortably above the FAT32 floor
     let usable_tail = last_usable - ESP_LBA_START + 1;
     if usable_tail < ESP_MIN + 1 {
         return Err(InstallError::TooSmall);
     }
-    let esp_sectors = core::cmp::min(esp_target_sectors, if with_data { usable_tail - 1 } else { usable_tail }); // leave >=1 sector for data
-    let esp_first = ESP_LBA_START;
-    let esp_last = esp_first + esp_sectors - 1;
-
-    // Data partition: 1 MiB-aligned start after the ESP, through last_usable.
-    let data_aligned = (esp_last + 1 + 2047) & !2047;
-    let (data_first_out, data_last_out) = if with_data && data_aligned <= last_usable {
-        (data_aligned, last_usable)
-    } else {
-        (0, 0)
-    };
-
-    let disk_guid = derive_guid(b"UNAOS-INSTALL-DISK");
-
-    // Entry array (identical bytes for primary + backup).
-    let mut entries = alloc::vec![0u8; (GPT_ARRAY_SECTORS * SECTOR as u64) as usize];
-    write_entry(
-        &mut entries[0..GPT_ENTRY_SIZE as usize],
-        &EFI_SYSTEM_TYPE_GUID,
-        esp_first,
-        esp_last,
-        "UNAOS-ESP",
-        b"UNAOS-INSTALL-ESP",
-    );
-    if data_first_out != 0 {
-        let o = GPT_ENTRY_SIZE as usize;
-        write_entry(
-            &mut entries[o..o + GPT_ENTRY_SIZE as usize],
-            &BASIC_DATA_TYPE_GUID,
-            data_first_out,
-            data_last_out,
-            "UNAOS-DATA",
-            b"UNAOS-INSTALL-DATA",
-        );
-    }
-    let entries_crc = super::hash::crc32(&entries);
-
-    let backup_header_lba = total_sectors - 1;
-    let backup_array_lba = total_sectors - 1 - GPT_ARRAY_SECTORS;
-
-    // Protective MBR (LBA 0).
-    let mut mbr = [0u8; SECTOR];
-    write_protective_mbr(&mut mbr, total_sectors);
-    t.write_sectors(0, &mbr)?;
-
-    // Primary header (LBA 1) + array (LBA 2..).
-    let primary = build_header(1, backup_header_lba, first_usable, last_usable, &disk_guid, 2, entries_crc);
-    t.write_sectors(1, &primary)?;
-    t.write_sectors(2, &entries)?;
-
-    // Backup array + header (tail).
-    t.write_sectors(backup_array_lba, &entries)?;
-    let backup = build_header(
-        backup_header_lba,
-        1,
-        first_usable,
-        last_usable,
-        &disk_guid,
-        backup_array_lba,
-        entries_crc,
-    );
-    t.write_sectors(backup_header_lba, &backup)?;
-
-    // --- SELF-VERIFY: re-read + re-validate everything off the device ---
-    verify_gpt(t, esp_first, esp_last, data_first_out, data_last_out)?;
-
-    Ok(GptLayout {
-        esp_first_lba: esp_first,
-        esp_last_lba: esp_last,
-        data_first_lba: data_first_out,
-        data_last_lba: data_last_out,
-        total_sectors,
-    })
+    let esp_sectors = core::cmp::min(esp_target, if with_data { usable_tail - 1 } else { usable_tail });
+    let esp = PartReq { kind: PartKind::Esp, size: Size::Sectors(esp_sectors), name: "UNAOS-ESP", seed: b"UNAOS-INSTALL-ESP" };
+    let data = PartReq { kind: PartKind::Data, size: Size::Rest, name: "UNAOS-DATA", seed: b"UNAOS-INSTALL-DATA" };
+    let reqs: &[PartReq<'_>] = if with_data { &[esp, data] } else { &[esp] };
+    let plan = Plan::layout(total_sectors, INSTALL_DISK_SEED, reqs).map_err(|_| InstallError::TooSmall)?;
+    write_plan(t, &plan)?;
+    let e = plan.part(PartKind::Esp).ok_or(InstallError::VerifyFailed)?;
+    let (df, dl) = plan.part(PartKind::Data).map_or((0, 0), |d| (d.first, d.last));
+    Ok(GptLayout { esp_first_lba: e.first, esp_last_lba: e.last, data_first_lba: df, data_last_lba: dl, total_sectors })
 }
 
-/// Parse-back verification: read the primary header, backup header, and entry array straight off the
-/// device and re-check the UEFI invariants + every CRC. Used by `write_gpt` (and re-runnable).
-pub fn verify_gpt<T: InstallTarget>(
-    t: &T,
-    esp_first: u64,
-    esp_last: u64,
-    data_first: u64,
-    data_last: u64,
-) -> Result<(), InstallError> {
-    let total_sectors = t.capacity_sectors();
-    let backup_header_lba = total_sectors - 1;
-    let backup_array_lba = total_sectors - 1 - GPT_ARRAY_SECTORS;
+/// SELFINSTALL2: lay the table an `amber_core::Plan` describes, then re-read and re-validate it.
+/// The plan must have been made for this target's capacity.
+pub fn write_plan<T: InstallTarget>(t: &mut T, plan: &Plan) -> Result<(), InstallError> {
+    if plan.disk_sectors != t.capacity_sectors() {
+        return Err(InstallError::BadArg);
+    }
+    let img = plan.gpt().map_err(map)?;
+    for (lba, bytes) in img.writes() {
+        t.write_sectors(lba, bytes)?;
+    }
+    verify_plan(t, plan)
+}
 
-    // Protective MBR sanity.
-    let mut mbr = [0u8; SECTOR];
-    t.read_sectors(0, &mut mbr)?;
-    if mbr[510] != 0x55 || mbr[511] != 0xAA || mbr[446 + 4] != 0xEE {
+/// Parse-back verification of a written plan: protective MBR, both headers (CRC, cross-linked LBAs,
+/// equal array CRCs), the array off the device, and every planned entry in its slot.
+pub fn verify_plan<T: InstallTarget>(t: &T, plan: &Plan) -> Result<(), InstallError> {
+    let total = t.capacity_sectors();
+    let mut s = [0u8; SECTOR];
+    t.read_sectors(0, &mut s)?;
+    core_gpt::check_protective_mbr(&s).map_err(map)?;
+    t.read_sectors(1, &mut s)?;
+    let p = Header::decode(&s, total).map_err(map)?;
+    t.read_sectors(total - 1, &mut s)?;
+    let b = Header::decode(&s, total).map_err(map)?;
+    let backup_array_lba = total - 1 - GPT_ARRAY_SECTORS;
+    if p.current_lba != 1 || p.backup_lba != total - 1 || b.current_lba != total - 1 || b.backup_lba != 1 {
         return Err(InstallError::VerifyFailed);
     }
-
-    let check_header = |lba: u64, expect_backup: u64| -> Result<(u64, u32), InstallError> {
-        let mut h = [0u8; SECTOR];
-        t.read_sectors(lba, &mut h)?;
-        if &h[0..8] != b"EFI PART" {
-            return Err(InstallError::VerifyFailed);
-        }
-        // Header CRC-32 over 92 bytes with the CRC field zeroed.
-        let stored = u32le(&h, 16);
-        h[16..20].copy_from_slice(&0u32.to_le_bytes());
-        if super::hash::crc32(&h[0..92]) != stored {
-            return Err(InstallError::VerifyFailed);
-        }
-        if u64le(&h, 24) != lba || u64le(&h, 32) != expect_backup {
-            return Err(InstallError::VerifyFailed);
-        }
-        let entries_lba = u64le(&h, 72);
-        let entries_crc = u32le(&h, 88);
-        Ok((entries_lba, entries_crc))
-    };
-
-    let (p_entries_lba, p_entries_crc) = check_header(1, backup_header_lba)?;
-    let (b_entries_lba, b_entries_crc) = check_header(backup_header_lba, 1)?;
-    if p_entries_lba != 2 || b_entries_lba != backup_array_lba || p_entries_crc != b_entries_crc {
+    if p.entries_lba != 2 || b.entries_lba != backup_array_lba || p.entries_crc != b.entries_crc {
         return Err(InstallError::VerifyFailed);
     }
-
-    // Entry array: re-read, re-CRC, and confirm the ESP + data entries parse as written.
-    let mut entries = alloc::vec![0u8; (GPT_ARRAY_SECTORS * SECTOR as u64) as usize];
-    t.read_sectors(2, &mut entries)?;
-    if super::hash::crc32(&entries) != p_entries_crc {
+    let mut raw = alloc::vec![0u8; (GPT_ARRAY_SECTORS as usize) * SECTOR];
+    t.read_sectors(2, &mut raw)?;
+    let ents = core_gpt::decode_array(&raw, &p).map_err(map)?;
+    let want = plan.entries();
+    if ents.len() != want.len() || ents.iter().zip(want.iter()).enumerate().any(|(i, ((slot, e), w))| *slot != i as u32 || e != w) {
         return Err(InstallError::VerifyFailed);
     }
-    // ESP entry.
-    if EFI_SYSTEM_TYPE_GUID != entries[0..16]
-        || u64le(&entries, 32) != esp_first
-        || u64le(&entries, 40) != esp_last
-    {
-        return Err(InstallError::VerifyFailed);
-    }
-    // Data entry (if one was laid).
-    if data_first != 0 {
-        let o = GPT_ENTRY_SIZE as usize;
-        if BASIC_DATA_TYPE_GUID != entries[o..o + 16]
-            || u64le(&entries, o + 32) != data_first
-            || u64le(&entries, o + 40) != data_last
-        {
-            return Err(InstallError::VerifyFailed);
-        }
-    }
-    // Backup array copy matches.
-    let mut backup_entries = alloc::vec![0u8; (GPT_ARRAY_SECTORS * SECTOR as u64) as usize];
-    t.read_sectors(backup_array_lba, &mut backup_entries)?;
-    if backup_entries != entries {
+    let mut backup_raw = alloc::vec![0u8; (GPT_ARRAY_SECTORS as usize) * SECTOR];
+    t.read_sectors(backup_array_lba, &mut backup_raw)?;
+    if backup_raw != raw {
         return Err(InstallError::VerifyFailed);
     }
     Ok(())
 }
 
-// ---------------------------------------------------------------------------------------------
-// PARTINSTALL — the GPT READER / EDITOR, beside the writer above.
-//
-// Everything above this line LAYS a new table over a blank disk. This half READS a table that is
-// already there and, in one narrowly-scoped case, edits ONE field of it. The two halves share the
-// layout constants and `hash::crc32` on purpose: a reader that re-derived the offsets would be a
-// second spec of the same format, and the first divergence between them would be silent.
-//
-// APPENDED AT THE TAIL, deliberately (LAWS §5, byte identity): a `#[cfg]`'d block inserted mid-file
-// still shifts every `panic::Location` line below it, so new code goes after the last existing one.
-//
-// THE EDITOR'S SCOPE. `set_entry_type_guid` changes a partition entry's TYPE GUID and nothing else.
-// It is the only write in this arc that touches the partition tables at all, it is off by default
-// (`--as-esp`), and it rewrites BOTH headers and BOTH array copies with fresh CRCs so a table that
-// validated before the edit validates after it — a half-edited GPT is worse than an unedited one.
-// It never moves a boundary, never adds or removes an entry, and refuses an index that is not
-// already in use.
-// ---------------------------------------------------------------------------------------------
+/// Parse-back verification of the historical ESP(+data) layout (kept for its callers).
+pub fn verify_gpt<T: InstallTarget>(t: &T, esp_first: u64, esp_last: u64, data_first: u64, data_last: u64) -> Result<(), InstallError> {
+    let tb = read_table(t)?;
+    let esp_ok = tb.entries.iter().any(|e| e.index == 0 && e.is_esp() && e.first_lba == esp_first && e.last_lba == esp_last);
+    let data_ok = data_first == 0
+        || tb.entries.iter().any(|e| e.index == 1 && e.type_guid == DATA_TYPE_GUID && e.first_lba == data_first && e.last_lba == data_last);
+    if esp_ok && data_ok { Ok(()) } else { Err(InstallError::VerifyFailed) }
+}
 
-/// The EFI System Partition type GUID, for callers that must recognise an ESP they did not write.
-pub const ESP_TYPE_GUID: [u8; 16] = EFI_SYSTEM_TYPE_GUID;
-/// The Microsoft Basic Data type GUID — what a Disk-Utility-made data partition carries, and what
-/// the partition installer leaves a target as unless the operator asks for `--as-esp`.
-pub const DATA_TYPE_GUID: [u8; 16] = BASIC_DATA_TYPE_GUID;
-
-/// One IN-USE entry of an existing GPT, as read off the medium.
+/// One IN-USE entry of an existing GPT, as read off the medium. `index` is the SLOT position — the
+/// number the operator names and the witness prints, never "the nth non-empty entry".
 #[derive(Clone, Copy)]
 pub struct GptEntryView {
-    /// Position in the 128-slot array — the number the operator names, and the number the witness
-    /// prints. Slot position, never "the nth non-empty entry": those differ on a real disk the
-    /// moment a partition is deleted, and a target named by the wrong one is the whole hazard.
     pub index: u32,
     pub type_guid: [u8; 16],
     pub first_lba: u64,
@@ -349,18 +157,15 @@ impl GptEntryView {
         self.last_lba - self.first_lba + 1
     }
     pub fn is_esp(&self) -> bool {
-        self.type_guid == EFI_SYSTEM_TYPE_GUID
+        self.type_guid == ESP_TYPE_GUID
     }
-    /// The first four bytes of the type GUID, the short form the census line prints. Enough to tell
-    /// ESP from Basic Data from APFS at a glance; the full GUID is on the medium for anyone who
-    /// needs it.
+    /// SELFINSTALL2: carries the (advisory) UnaFS type GUID.
+    pub fn is_unafs_type(&self) -> bool {
+        self.type_guid == UNAFS_TYPE_GUID
+    }
+    /// The first four bytes of the type GUID, the short form the census line prints.
     pub fn type_short(&self) -> u32 {
-        u32::from_le_bytes([
-            self.type_guid[0],
-            self.type_guid[1],
-            self.type_guid[2],
-            self.type_guid[3],
-        ])
+        u32::from_le_bytes([self.type_guid[0], self.type_guid[1], self.type_guid[2], self.type_guid[3]])
     }
 }
 
@@ -372,159 +177,53 @@ pub struct GptTable {
     pub total_sectors: u64,
 }
 
-/// Read and VALIDATE the primary GPT: `EFI PART`, the header CRC over its 92 declared bytes with
-/// the CRC field zeroed, the entry-array CRC, and the array geometry. A table that does not
-/// validate is not a table — this returns `VerifyFailed` rather than handing back entries parsed
-/// out of bytes whose integrity nothing vouched for.
-///
-/// Returns only the IN-USE entries (a zero type GUID is an empty slot per UEFI 2.x §5.3.3), each
-/// carrying its slot index.
+/// Read and VALIDATE the primary GPT through the core (signature, header CRC over its declared size,
+/// geometry bounds, array CRC, every entry inside the usable range). A table that does not validate is
+/// not a table: `VerifyFailed`, never entries parsed out of bytes nothing vouched for.
 pub fn read_table<T: InstallTarget>(t: &T) -> Result<GptTable, InstallError> {
     let total_sectors = t.capacity_sectors();
     if total_sectors < 2 + GPT_ARRAY_SECTORS + 1 {
         return Err(InstallError::TooSmall);
     }
-
     let mut h = [0u8; SECTOR];
     t.read_sectors(1, &mut h)?;
-    if &h[0..8] != b"EFI PART" {
-        return Err(InstallError::VerifyFailed);
-    }
-    let hdr_size = u32le(&h, 12) as usize;
-    if hdr_size < 92 || hdr_size > SECTOR {
-        return Err(InstallError::VerifyFailed);
-    }
-    let stored = u32le(&h, 16);
-    h[16..20].copy_from_slice(&0u32.to_le_bytes());
-    if super::hash::crc32(&h[0..hdr_size]) != stored {
-        return Err(InstallError::VerifyFailed);
-    }
-
-    let first_usable = u64le(&h, 40);
-    let last_usable = u64le(&h, 48);
-    let entries_lba = u64le(&h, 72);
-    let num_entries = u32le(&h, 80);
-    let entry_size = u32le(&h, 84);
-    let entries_crc = u32le(&h, 88);
-    // Bound every geometry field before it is used as a length or an LBA: these come off the medium
-    // and a hostile or corrupt table must not be able to steer a read.
-    if entry_size < 128 || entry_size % 8 != 0 || num_entries == 0 || num_entries > 512 {
-        return Err(InstallError::VerifyFailed);
-    }
-    let array_bytes = num_entries as u64 * entry_size as u64;
-    let array_sectors = array_bytes.div_ceil(SECTOR as u64);
-    if entries_lba < 2 || entries_lba + array_sectors > total_sectors {
-        return Err(InstallError::VerifyFailed);
-    }
-    if first_usable >= last_usable || last_usable >= total_sectors {
-        return Err(InstallError::VerifyFailed);
-    }
-
-    let mut raw = alloc::vec![0u8; (array_sectors * SECTOR as u64) as usize];
-    t.read_sectors(entries_lba, &mut raw)?;
-    if super::hash::crc32(&raw[..array_bytes as usize]) != entries_crc {
-        return Err(InstallError::VerifyFailed);
-    }
-
-    let mut entries = alloc::vec::Vec::new();
-    for i in 0..num_entries {
-        let o = (i as usize) * entry_size as usize;
-        let e = &raw[o..o + entry_size as usize];
-        if e[0..16].iter().all(|&b| b == 0) {
-            continue; // unused slot
-        }
-        let first_lba = u64le(e, 32);
-        let last_lba = u64le(e, 40);
-        // An entry whose extent is nonsense, or which escapes the usable range, invalidates the
-        // table: the installer is about to reason about "which partition is which" off these
-        // numbers, and a reader that quietly dropped a bad one would shrink the census it uses to
-        // decide whether the disk carries foreign volumes.
-        if last_lba < first_lba || first_lba < first_usable || last_lba > last_usable {
-            return Err(InstallError::VerifyFailed);
-        }
-        let mut type_guid = [0u8; 16];
-        type_guid.copy_from_slice(&e[0..16]);
-        entries.push(GptEntryView { index: i, type_guid, first_lba, last_lba });
-    }
-
-    Ok(GptTable { entries, first_usable, last_usable, total_sectors })
+    let hd = Header::decode(&h, total_sectors).map_err(|_| InstallError::VerifyFailed)?;
+    let mut raw = alloc::vec![0u8; (hd.array_sectors() as usize) * SECTOR];
+    t.read_sectors(hd.entries_lba, &mut raw)?;
+    let ents = core_gpt::decode_array(&raw, &hd).map_err(|_| InstallError::VerifyFailed)?;
+    let entries = ents
+        .into_iter()
+        .map(|(index, e)| GptEntryView { index, type_guid: e.type_guid, first_lba: e.first_lba, last_lba: e.last_lba })
+        .collect();
+    Ok(GptTable { entries, first_usable: hd.first_usable, last_usable: hd.last_usable, total_sectors })
 }
 
-/// THE ONE PARTITION-TABLE WRITE THIS ARC MAKES, and it is off by default.
-///
-/// Set slot `index`'s TYPE GUID to `type_guid`, leaving every other byte of the table — boundaries,
-/// unique GUIDs, names, attributes, the other 127 slots — exactly as found. Both array copies and
-/// both headers are rewritten with recomputed CRCs, then the whole table is re-read and
-/// re-validated through [`read_table`] before this returns Ok, so the medium is never left carrying
-/// a table whose CRC does not match its contents.
-///
-/// Refuses an unused slot: turning an empty entry into a typed one would be CREATING a partition,
-/// which is the operator's act in Disk Utility, not ours.
-pub fn set_entry_type_guid<T: InstallTarget>(
-    t: &mut T,
-    index: u32,
-    type_guid: &[u8; 16],
-) -> Result<(), InstallError> {
+/// THE ONE PARTITION-TABLE EDIT (off by default, `--as-esp`): set slot `index`'s TYPE GUID, leaving
+/// every other byte as found; both arrays then both headers rewritten with recomputed CRCs (a power
+/// cut leaves OLD headers over NEW arrays, which fails CRC loudly), then re-read and re-validated.
+pub fn set_entry_type_guid<T: InstallTarget>(t: &mut T, index: u32, type_guid: &[u8; 16]) -> Result<(), InstallError> {
     let total_sectors = t.capacity_sectors();
-
-    // Re-read the primary header for the array geometry AND for every field the rebuilt headers
-    // must preserve. Nothing here is remembered from an earlier call: the table on the medium at
-    // this instant is the only authority.
     let mut h = [0u8; SECTOR];
     t.read_sectors(1, &mut h)?;
-    if &h[0..8] != b"EFI PART" {
-        return Err(InstallError::VerifyFailed);
-    }
-    let hdr_size = u32le(&h, 12) as usize;
-    if hdr_size < 92 || hdr_size > SECTOR {
-        return Err(InstallError::VerifyFailed);
-    }
-    let first_usable = u64le(&h, 40);
-    let last_usable = u64le(&h, 48);
-    let p_entries_lba = u64le(&h, 72);
-    let num_entries = u32le(&h, 80);
-    let entry_size = u32le(&h, 84);
-    if index >= num_entries || entry_size < 128 || entry_size % 8 != 0 || num_entries > 512 {
+    let hd = Header::decode(&h, total_sectors).map_err(|_| InstallError::VerifyFailed)?;
+    if index >= hd.num_entries {
         return Err(InstallError::BadArg);
     }
-    let mut disk_guid = [0u8; 16];
-    disk_guid.copy_from_slice(&h[56..72]);
-
-    let array_bytes = num_entries as usize * entry_size as usize;
-    let array_sectors = (array_bytes as u64).div_ceil(SECTOR as u64);
+    let array_sectors = hd.array_sectors();
     let backup_header_lba = total_sectors - 1;
     let backup_array_lba = total_sectors - 1 - array_sectors;
-    if p_entries_lba < 2 || p_entries_lba + array_sectors > backup_array_lba {
+    if hd.entries_lba + array_sectors > backup_array_lba {
         return Err(InstallError::VerifyFailed);
     }
-
-    let mut raw = alloc::vec![0u8; (array_sectors * SECTOR as u64) as usize];
-    t.read_sectors(p_entries_lba, &mut raw)?;
-    let o = index as usize * entry_size as usize;
-    if raw[o..o + 16].iter().all(|&b| b == 0) {
-        return Err(InstallError::BadArg); // an unused slot is not ours to type
-    }
-    raw[o..o + 16].copy_from_slice(type_guid);
-    let entries_crc = super::hash::crc32(&raw[..array_bytes]);
-
-    // Order matters on a medium that can lose power mid-sequence: write both ARRAYS first, then the
-    // headers that point at them. A header written before its array would name a CRC the array does
-    // not yet carry; this order's worst interruption leaves the OLD headers over NEW arrays, which
-    // fails CRC loudly instead of validating against stale contents.
-    t.write_sectors(p_entries_lba, &raw)?;
+    let mut raw = alloc::vec![0u8; (array_sectors as usize) * SECTOR];
+    t.read_sectors(hd.entries_lba, &mut raw)?;
+    let crc = core_gpt::retype(&mut raw, &hd, index, type_guid).map_err(map)?;
+    t.write_sectors(hd.entries_lba, &raw)?;
     t.write_sectors(backup_array_lba, &raw)?;
-    let primary = build_header(
-        1, backup_header_lba, first_usable, last_usable, &disk_guid, p_entries_lba, entries_crc,
-    );
-    t.write_sectors(1, &primary)?;
-    let backup = build_header(
-        backup_header_lba, 1, first_usable, last_usable, &disk_guid, backup_array_lba, entries_crc,
-    );
-    t.write_sectors(backup_header_lba, &backup)?;
-
-    // Parse-back: the edited table must validate off the medium, and the slot must read back as the
-    // type we asked for. A write that cannot be re-read and re-validated is a failure (the writer
-    // half's rule, applied to the editor).
+    let primary = Header { current_lba: 1, backup_lba: backup_header_lba, entries_crc: crc, header_size: 92, ..hd };
+    t.write_sectors(1, &primary.encode())?;
+    let backup = Header { current_lba: backup_header_lba, backup_lba: 1, entries_lba: backup_array_lba, entries_crc: crc, header_size: 92, ..hd };
+    t.write_sectors(backup_header_lba, &backup.encode())?;
     let table = read_table(t)?;
     match table.entries.iter().find(|e| e.index == index) {
         Some(e) if &e.type_guid == type_guid => Ok(()),

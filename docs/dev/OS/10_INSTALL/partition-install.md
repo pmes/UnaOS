@@ -442,3 +442,55 @@ measurements, not one measurement and one silence.
   `reason=transport-write-disabled transport=ahci knob=UNAOS_AHCI_WRITE`, and
   `LC_ALL=C grep -a -o -F 'WRITE-DMA-EXT-0x35'` on the ELF is **0 hits**. This is the one that has to
   be a rebuild: it is a statement about what the artifact contains, not about what it does.
+
+## SELFINSTALL2 — the two-partition SSD and the shared core (rmbp-ledger B310)
+
+### The layout `install ssd --write` lays
+
+| Slot | Kind | Type GUID (advisory for UnaFS) | Size | Content |
+| :--- | :--- | :--- | :--- | :--- |
+| p1 | ESP | C12A7328-F81F-11D2-BA4B-00A0C93EC93B | 512 MiB from LBA 2048 | FAT32, the running card's ESP files mirrored and sha-verified (SELFINSTALL, unchanged) |
+| p2 | UnaFS | `UNAFS` + fixed tail (`amber_core::gpt::UNAFS_TYPE`) | exactly the running volume's span, 1 MiB aligned after p1 | a sector clone of the running UnaFS root, then `unafs::fsck(false)` on the copy |
+
+The same two-partition shape as the x86 card image (`tools/una-card`, UNAFSX86 M3), laid by the same
+code. When the running system has no UnaFS root (a FAT-root boot), the plan is p1 alone.
+
+The live copy is consistent by construction: UnaFS is copy-on-write, so the copy is fenced on the root
+block (block 1, slots A/B) — identical bytes before and after means no commit happened during the
+copy; a moved fence fails the mirror (`SourceMoved`), it is never reported as one.
+
+Refusals, in order: a stranger's disk (R20, unchanged); the boot disk itself (`selfguard::refuses`,
+then `mint_disk_grant`'s own boot-device check); an existing UnaFS volume on the target without
+`install ssd --write --force`. A re-install over our own SSD (ESP carrying UnaOS + a UnaFS volume) is
+now `Ours`, not `Stranger` — the census used to count our own FAT ESP as foreign.
+
+Witness: `:: SELFINSTALL2: plan=<n parts> esp=<MiB> unafs=<MiB> cloned=<MiB> fsck=<ok|skip|fail> boot_pick=<ahci|sdhc> -> PASS|DRY|FAIL ::`
+(the dry run prints `-> DRY` with `fsck=skip` and the `cloned=` it would copy; `[install] unafs mirror:`
+carries the clone plan, the measured source rate and the ETA). `tests install` runs the core's KATs and
+the planner on a synthetic 500 GB disk in-kernel, then the dry run.
+
+**Owed:** the SSD's UnaFS is not yet `/` when the SSD boots: the lazy UnaFS bind does not probe the AHCI
+handle (`bind_probe_admitted` — the shared mount is read-write and ordinary SATA writes are refused,
+B91). `boot_pick` names the FAT-root pick (`UNAOS_ROOT_PREFER`). A granted AHCI write path for the
+shared mount is the next rung.
+
+### The ensemble: who owns which leg
+
+The installer is a handler ensemble (R79; audit B296), delivered as the `UnaOS_Installer` vessel (R31).
+
+| Leg | Owner (CODEX §2) | Shared now | Still kernel-only |
+| :--- | :--- | :--- | :--- |
+| Partition table (GPT encode/decode, protective MBR, CRCs, LBA bounds) | **Amber Bytes** | `unaos/libs/sys/amber_core::gpt` — kernel `install/gpt.rs`, `tools/una-card`, `amber_bytes gpt show` | the type-GUID editor's I/O and write order |
+| Partition plan (`Plan`, its `Display`) | **Amber Bytes** | `amber_core::plan` — the dry run, the installer window (`i`), `tools/una-card` | — |
+| Format (FAT32 BPB/FSInfo/FAT0, geometry) | **Amber Bytes** | `amber_core::fat32` (encode only) | the FAT tree writer (`install/fat32.rs` TreeWriter), the host's mkfs.vfat/mcopy |
+| Clone (span → span, bytes, ETA) | **Amber Bytes** | `amber_core::clone::ClonePlan` | the sector I/O and the root-block fence (`install/unafsmirror.rs`), the FAT file mirror (`install/clone.rs`) |
+| Image/archive format | **Geode** | — | `selfhost/extract.rs` (no core yet) |
+| Diagnosis (SH-4) | **Vein** | — | — |
+| Installer settings | **Principia** | (prefs_core exists; the installer has no settings yet) | — |
+| Credentials | **Holocron** | — | `fs/users.rs` |
+| Companion-mode serial wire | **Comscan** | — | — |
+| Verbs (`install ssd`, `tests install`) | **Midden** | `midden_core` HOST_VERBS (unchanged row) | — |
+
+GPT readers NOT yet on the core (each a second reader of the same spec, each owed): `fs/fat.rs`
+`scan_gpt`, `drivers/ahci.rs`, `arch/aarch64/sdmmc_tegra.rs`, the unafs crate's
+`adapter.rs::parse_partitions`, `builder/src/vm_image.rs`, `scripts/make-gpt-fixture.py`.

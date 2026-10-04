@@ -191,7 +191,7 @@ fn ensure_selfinstall() {
     #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("selfinstall", crate::install::selfinstall::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("selfinstall", crate::install::selfinstall::selftest); register("install", crate::install::selfinstall::install_selftest); }
     }
 }
 

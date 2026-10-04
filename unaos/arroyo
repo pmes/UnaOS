@@ -8754,10 +8754,12 @@ esp_x86_unafs_card() {
     rm -f "$vol" "$card"
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- init -p "$vol" -s "$unafs_mb" || {
         echo -e "${COLOR_RED}❌ UNAFSX86: tools/unafs init failed — no card image${COLOR_RESET}"; return 1; }
-    python3 "${WORKSPACE_DIR}/scripts/make-x86-card.py" \
+    # SELFINSTALL2 (B310): the card's GPT is laid by `tools/una-card` over `amber_core` — the SAME core the
+    # kernel's `install ssd --write` lays the SSD with (it replaced scripts/make-x86-card.py, byte-identical).
+    cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/una-card/Cargo.toml" -- \
         --esp "${WORKSPACE_DIR}/target/x86_64_esp" --data "${WORKSPACE_DIR}/target/x86_64_data" \
         --unafs "$vol" -o "$card" || {
-        echo -e "${COLOR_RED}❌ UNAFSX86: make-x86-card.py failed — no card image${COLOR_RESET}"; return 1; }
+        echo -e "${COLOR_RED}❌ UNAFSX86: tools/una-card failed — no card image${COLOR_RESET}"; return 1; }
     rm -f "$vol"
     echo -e "${COLOR_GREEN}✅ x86 CARD (UnaFS root): ${card}${COLOR_RESET}"
     echo -e "   sha256: $(sha256_of "$card")"

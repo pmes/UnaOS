@@ -3769,6 +3769,10 @@ prefs_core = { path = "../../libs/sys/prefs_core" }
 # VEINCORE (B304): Vein's shared no_std core — the chat bus codec the `vein` shell verb and `tests vein`
 # use (the same crate VEIN.BIN and handlers/vein link). Zero deps; only reached under feature `vein`.
 vein_core = { path = "../../libs/sys/vein_core" }
+# SELFINSTALL2 (rmbp-ledger B310): Amber Bytes' shared disk-layout core — GPT encode/decode, the partition
+# Plan, the FAT32 BPB, the clone plan — the same crate `tools/una-card` and `handlers/amber_bytes` link.
+# no_std + alloc, zero deps; arch-neutral (install/gpt.rs and install/fat32.rs are its kernel callers).
+amber_core = { path = "../../libs/sys/amber_core", default-features = false }
 net = { path = "../net" }
 fdt = "0.1.5"
 # RAST-1 / RAST-TEGRA: platform-neutral (no_std, arch-agnostic) software rasterizer. `optional` so

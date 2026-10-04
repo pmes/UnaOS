@@ -479,7 +479,7 @@ fn repaint() {
         H - 8 - 2 * theme::BEVEL,
     );
 
-    let lx = 24;
+    let lx = 24; if st == State::Choose && plan_view_paint(px, lx) { let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { wm::present(id); } return; } // SELFINSTALL2 M3: the SSD plan view (key `i`), see the file tail
     match st {
         State::Choose => {
             text(px, lx, 20, b"Install UnaOS", theme::CONTENT_TEXT);
@@ -550,7 +550,7 @@ fn repaint() {
             // Exits are ALWAYS on screen: an installer that can only go forward is a trap.
             text(px, lx, H - 100, b"w/s select   Enter continue", theme::TITLE_TEXT_INACTIVE);
             text(px, lx, H - 100 + CELL_H + 4, b"Esc boot this live system", theme::TITLE_TEXT_INACTIVE);
-            text(px, lx, H - 100 + 2 * (CELL_H + 4), b"q  halt the machine", theme::TITLE_TEXT_INACTIVE);
+            text(px, lx, H - 100 + 2 * (CELL_H + 4), b"q  halt the machine", theme::TITLE_TEXT_INACTIVE); text(px, lx, H - 100 + 3 * (CELL_H + 4), b"i  SSD install plan", theme::TITLE_TEXT_INACTIVE); // SELFINSTALL2 M3
             if n > 0 && selectable {
                 button(px, W - 190, H - 52, 160, b"Continue", true);
             }
@@ -930,7 +930,7 @@ pub fn consume_key(c: u8) -> bool {
         close();
         halt_machine();
     }
-    match (st, c) {
+    match (st, c) { _ if plan_view_key(st, c) => {} // SELFINSTALL2 M3: `i` toggles the SSD plan view; Esc/Enter leave it
         (State::Choose, b'\x1b') => close(),
         // INSTALL-SELF: both directions step over rows the guard marked, so the highlight can only ever
         // rest on a disk the engine would accept.
@@ -1139,5 +1139,84 @@ pub fn consume_key(c: u8) -> bool {
         (State::Done(_), b'\x1b') | (State::Done(_), b'\r') | (State::Done(_), b'\n') => close(),
         _ => {}
     }
+    true
+}
+
+// ------------------------------------------------------------ SELFINSTALL2 --
+//
+// M3 (rmbp-ledger B310): the SSD self-install plan on glass. Key `i` on the chooser shows what
+// `install ssd --write` would lay — the two partitions (ESP + UnaFS) and the UnaFS mirror step — and
+// the TEXT is `amber_core::Plan`'s `Display`, the very lines `install ssd --dry-run` prints (via
+// `install::selfinstall::plan_lines`). Read-only: computing it probes the SATA disk and the running
+// UnaFS volume, it writes nothing; the write stays the shell verb's (`install ssd --write`).
+
+static PLAN_VIEW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static PLAN_LINES: spin::Mutex<Option<alloc::vec::Vec<alloc::string::String>>> = spin::Mutex::new(None);
+
+fn plan_lines_now() -> alloc::vec::Vec<alloc::string::String> {
+    #[cfg(feature = "ahci")]
+    if let Some(l) = crate::install::selfinstall::plan_lines() {
+        return l;
+    }
+    let mut v = alloc::vec::Vec::new();
+    if cfg!(feature = "ahci") {
+        v.push(alloc::string::String::from("No SATA disk answered the probe, or it"));
+        v.push(alloc::string::String::from("cannot hold the plan (see the serial log)."));
+    } else {
+        v.push(alloc::string::String::from("This build has no SATA driver (UNAOS_AHCI=1)."));
+    }
+    v
+}
+
+/// Key handler for the plan view; true = the key was the view's.
+fn plan_view_key(st: State, c: u8) -> bool {
+    if st != State::Choose {
+        return false;
+    }
+    let on = PLAN_VIEW.load(Ordering::Relaxed);
+    if c == b'i' && !on {
+        let lines = plan_lines_now();
+        for l in &lines {
+            serial_println!("[wc-x] instgui plan: {}", l);
+        }
+        *PLAN_LINES.lock() = Some(lines);
+        PLAN_VIEW.store(true, Ordering::Relaxed);
+        repaint();
+        return true;
+    }
+    if on {
+        if matches!(c, b'i' | b'\x1b' | b'\r' | b'\n') {
+            PLAN_VIEW.store(false, Ordering::Relaxed);
+            repaint();
+        }
+        return true;
+    }
+    false
+}
+
+/// Paint the plan view if it is up; false = not up, paint the chooser as usual.
+fn plan_view_paint(px: &mut [u32], lx: usize) -> bool {
+    if !PLAN_VIEW.load(Ordering::Relaxed) {
+        return false;
+    }
+    let guard = PLAN_LINES.lock();
+    let Some(lines) = guard.as_ref() else { return false };
+    text(px, lx, 20, b"SSD install plan", theme::CONTENT_TEXT);
+    fill(px, lx, 42, W - 2 * lx, 2, theme::FRAME_LINE);
+    let cols = (W - 2 * lx) / CELL_W;
+    let mut y = 54;
+    for l in lines.iter() {
+        let b = l.as_bytes();
+        let mut off = 0;
+        // Wrap long lines at the column budget so nothing the verb prints is clipped off glass.
+        while off < b.len() && y + CELL_H < H - 60 {
+            let end = core::cmp::min(off + cols, b.len());
+            text(px, lx, y, &b[off..end], theme::CONTENT_TEXT);
+            off = end;
+            y += CELL_H + 4;
+        }
+    }
+    text(px, lx, H - 52, b"Enter/Esc back - write it with", theme::TITLE_TEXT_INACTIVE);
+    text(px, lx, H - 52 + CELL_H + 4, b"`install ssd --write` in the shell", theme::TITLE_TEXT_INACTIVE);
     true
 }

@@ -61,6 +61,9 @@ pub struct Probe {
     pub parts: usize,
     pub verdict: Verdict,
     pub saw: String,
+    /// SELFINSTALL2: a UnaFS volume (by superblock magic) already lives on the target — `--write`
+    /// then needs `--force`.
+    pub unafs_present: bool,
 }
 
 fn first_ahci() -> Option<(u8, BlockDeviceId)> {
@@ -100,7 +103,7 @@ pub fn probe(sel: BlockDeviceId, port: u8) -> Result<Probe, InstallError> {
     t.read_sectors(0, &mut head)?;
     let zero_head = head.iter().all(|&b| b == 0);
     let mk = |gpt: &'static str, parts: usize, verdict: Verdict, saw: String| Probe {
-        id: sel, port, model: model.clone(), sectors, gpt, parts, verdict, saw,
+        id: sel, port, model: model.clone(), sectors, gpt, parts, verdict, saw, unafs_present: false,
     };
     let table = match super::gpt::read_table(&t) {
         Ok(tb) => tb,
@@ -129,9 +132,27 @@ pub fn probe(sel: BlockDeviceId, port: u8) -> Result<Probe, InstallError> {
         saw.push('-');
     }
     let n = c.rows.len();
+    // SELFINSTALL2: what a previous `install ssd --write` leaves — an ESP-typed FAT volume carrying
+    // UnaOS plus (now) a UnaFS volume — is OURS, not a stranger. Before this the census counted our own
+    // FAT ESP as `foreign` (FAT is somebody's filesystem in R25's model) and a UnaFS volume as `friend`,
+    // so a re-install over our own SSD could never reach the Ours verdict. A foreign TYPE GUID anywhere,
+    // a non-ESP FAT, or any unknown content still makes the whole disk a stranger.
+    let unafs_present = c.rows.iter().any(|r| r.content == partition::Content::UnaFs);
+    let ours_shaped = |r: &partition::CensusRow| {
+        partition::foreign_type(&r.entry.type_guid).is_none()
+            && ((r.entry.is_esp() && matches!(r.content, partition::Content::Fat | partition::Content::Esp))
+                || r.content == partition::Content::UnaFs)
+    };
+    if c.rows.iter().all(ours_shaped) && c.rows.iter().any(|r| r.entry.is_esp()) && port_carries_unaos(port) {
+        let mut pr = mk("valid", n, Verdict::Ours, saw);
+        pr.unafs_present = unafs_present;
+        return Ok(pr);
+    }
     if c.foreign > 0 || c.friend > 0 {
         let why = alloc::format!("foreign={} friend={} [{}] — a stranger's OS lives here", c.foreign, c.friend, saw);
-        return Ok(mk("valid", n, Verdict::Stranger(why), saw));
+        let mut pr = mk("valid", n, Verdict::Stranger(why), saw);
+        pr.unafs_present = unafs_present;
+        return Ok(pr);
     }
     let all_esp = c.rows.iter().all(|r| r.entry.is_esp());
     if all_esp && port_carries_unaos(port) {
@@ -218,7 +239,7 @@ pub fn dry_run(out: &mut dyn FnMut(&str)) -> Option<Probe> {
                 p.port, p.model, p.sectors, p.gpt, p.verdict.tag()
             ));
             out(&alloc::format!("  plan: {}", plan));
-            #[cfg(feature = "unafs")] { serial_println!("[install] unafs-root mirror=NOT-YET (UNAFSX86 owed: --write copies the ESP files only; the SSD gets no UnaFS partition and boots with a FAT root)"); out("  unafs: the UnaFS root partition is NOT mirrored yet — the installed SSD boots with a FAT root"); }
+            print_plan(&p, out);
             Some(p)
         }
     }
@@ -278,7 +299,7 @@ fn fail(out: &mut dyn FnMut(&str), why: &str) {
 
 /// M2: `install ssd --write`.
 #[cfg(feature = "ahci-write")]
-pub fn write_ssd(out: &mut dyn FnMut(&str)) {
+pub fn write_ssd(out: &mut dyn FnMut(&str), force: bool) {
     let Some((port, sel)) = first_ahci() else {
         out("install ssd: no AHCI disk registered");
         return;
@@ -299,6 +320,18 @@ pub fn write_ssd(out: &mut dyn FnMut(&str)) {
         // R20: no destructive work on a disk that is not ours.
         serial_println!("[install] REFUSED target=ahci:{} verdict=stranger saw: {} — nothing was written (R20) ::", port, why);
         out(&alloc::format!("install ssd --write: REFUSED — this disk is not ours ({}). Nothing was written.", why));
+        return;
+    }
+    // SELFINSTALL2: the boot disk itself is refused here by name (selfguard), before the grant's own
+    // refusal one step later, and an existing UnaFS volume is not overwritten without `--force`.
+    if super::selfguard::refuses(sel) {
+        serial_println!("[install] REFUSED target=ahci:{} reason=boot-device (selfguard) — nothing written ::", port);
+        out("install ssd --write: REFUSED — this disk is the one the system booted from. Nothing was written.");
+        return;
+    }
+    if p.unafs_present && !force {
+        serial_println!("[install] REFUSED target=ahci:{} reason=unafs-present (a UnaFS volume is already on the target; --force replaces it) — nothing written ::", port);
+        out("install ssd --write: REFUSED — the SSD already carries a UnaFS volume; `install ssd --write --force` replaces it. Nothing was written.");
         return;
     }
     let t0 = crate::arch::ticks();
@@ -328,12 +361,31 @@ pub fn write_ssd(out: &mut dyn FnMut(&str)) {
             return fail(out, "write grant refused (boot device, or disk too small)");
         }
     };
-    let layout = match super::gpt::write_gpt_sized(&mut disk, ESP_SECTORS, false) {
-        Ok(l) => l,
+    // SELFINSTALL2: the table comes from the shared core's Plan — ESP + (when the running system has
+    // one) a UnaFS partition the size of the running volume.
+    #[cfg(feature = "unafs")] let unafs_src = super::unafsmirror::source().filter(|s| !s.is_ahci()); #[cfg(not(feature = "unafs"))] let unafs_src: Option<()> = None;
+    #[cfg(feature = "unafs")] let unafs_sectors = unafs_src.map(|s| s.sectors()); #[cfg(not(feature = "unafs"))] let unafs_sectors: Option<u64> = None;
+    let plan = match ssd_plan(p.sectors, unafs_sectors) {
+        Ok(pl) => pl,
         Err(e) => {
-            serial_println!("[install] GPT write failed err={:?}", e);
-            return fail(out, "GPT write/verify failed");
+            serial_println!("[install] plan refused: {}", e);
+            return fail(out, "the SSD is too small for the plan");
         }
+    };
+    for line in plan.lines() {
+        serial_println!("[install] {}", line);
+    }
+    if let Err(e) = super::gpt::write_plan(&mut disk, &plan) {
+        serial_println!("[install] GPT write failed err={:?}", e);
+        return fail(out, "GPT write/verify failed");
+    }
+    let esp_part = plan.part(amber_core::PartKind::Esp).expect("plan carries an ESP");
+    let layout = super::gpt::GptLayout {
+        esp_first_lba: esp_part.first,
+        esp_last_lba: esp_part.last,
+        data_first_lba: 0,
+        data_last_lba: 0,
+        total_sectors: plan.disk_sectors,
     };
     serial_println!(
         "[install] gpt written esp={}..{} sectors={}",
@@ -352,12 +404,15 @@ pub fn write_ssd(out: &mut dyn FnMut(&str)) {
             return fail(out, "ESP format/clone failed");
         }
     };
+    // SELFINSTALL2 M2: mirror the UnaFS volume (sector clone of the running span) and fsck the copy.
+    #[cfg(feature = "unafs")] let (cloned_mib, fsck_tag, unafs_ok) = mirror_unafs(&mut disk, &plan, unafs_src, out); #[cfg(not(feature = "unafs"))] let (cloned_mib, fsck_tag, unafs_ok) = { let _ = unafs_src; (0u64, "skip", true) };
     let ms = crate::arch::ticks().wrapping_sub(t0);
-    let pass = w.files > 0 && w.verified == w.files;
+    let pass = w.files > 0 && w.verified == w.files && unafs_ok;
     serial_println!(
         ":: SELFINSTALL: files={} bytes={} ms={} verified={} -> {} ::",
         w.files, w.bytes, ms, w.verified, if pass { "PASS" } else { "FAIL" }
     );
+    witness(&plan, cloned_mib, fsck_tag, if pass { "PASS" } else { "FAIL" });
     out(&alloc::format!(
         "install ssd --write: {} files, {} bytes, verified {}/{}{}",
         w.files, w.bytes, w.verified, w.files,
@@ -366,7 +421,7 @@ pub fn write_ssd(out: &mut dyn FnMut(&str)) {
 }
 
 #[cfg(not(feature = "ahci-write"))]
-pub fn write_ssd(out: &mut dyn FnMut(&str)) {
+pub fn write_ssd(out: &mut dyn FnMut(&str), _force: bool) {
     serial_println!("[install] --write REFUSED reason=transport-write-disabled transport=ahci knob=UNAOS_AHCI_WRITE");
     out("install ssd --write: this build has no SATA write path (rebuild with UNAOS_AHCI_WRITE=1)");
 }
@@ -377,8 +432,9 @@ pub fn verb(out: &mut dyn FnMut(&str), args: &[&str]) {
         Some("--dry-run") if args.len() == 1 => {
             let _ = dry_run(out);
         }
-        Some("--write") if args.len() == 1 => write_ssd(out),
-        _ => out("usage: install ssd --dry-run | install ssd --write   (the SSD install; --write needs UNAOS_AHCI_WRITE=1 and refuses a stranger's disk)"),
+        Some("--write") if args.len() == 1 => write_ssd(out, false),
+        Some("--write") if args.len() == 2 && args[1] == "--force" => write_ssd(out, true),
+        _ => out("usage: install ssd --dry-run | install ssd --write [--force]   (the SSD install: ESP + UnaFS; --write needs UNAOS_AHCI_WRITE=1, refuses a stranger's disk, and needs --force over an existing UnaFS volume)"),
     }
 }
 
@@ -391,5 +447,167 @@ pub fn selftest() {
             ":: SELFINSTALL: dry-run target=ahci:{} verdict={} gpt={} parts={} -> PASS ::",
             p.port, p.verdict.tag(), p.gpt, p.parts
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// SELFINSTALL2 (rmbp-ledger B310) — the two-partition plan from the shared core, the dry run's plan
+// print, the UnaFS mirror step, and the witness. File tail: nothing above moves.
+// ---------------------------------------------------------------------------------------------
+
+/// The SSD plan: ESP (512 MiB) and, when the running system has a UnaFS volume, a UnaFS partition of
+/// exactly that volume's size — laid by `amber_core::Plan`, the same planner `tools/una-card` uses.
+pub fn ssd_plan(disk_sectors: u64, unafs_sectors: Option<u64>) -> Result<amber_core::Plan, amber_core::PlanError> {
+    use amber_core::{PartKind, PartReq, Size};
+    let esp = PartReq { kind: PartKind::Esp, size: Size::Sectors(ESP_SECTORS), name: "UNAOS-ESP", seed: b"UNAOS-INSTALL-ESP" };
+    match unafs_sectors {
+        Some(n) if n > 0 => {
+            let ufs = PartReq { kind: PartKind::UnaFS, size: Size::Sectors(n), name: "UNAOS-UNAFS", seed: b"UNAOS-INSTALL-UFS" };
+            amber_core::Plan::layout(disk_sectors, super::gpt::INSTALL_DISK_SEED, &[esp, ufs])
+        }
+        _ => amber_core::Plan::layout(disk_sectors, super::gpt::INSTALL_DISK_SEED, &[esp]),
+    }
+}
+
+/// The root the NEXT boot picks when the card and the SSD both carry this kernel (bootdisk `pick_root`).
+fn boot_pick() -> &'static str {
+    if cfg!(feature = "root-prefer-ahci") { "ahci" } else { "sdhc" }
+}
+
+/// `:: SELFINSTALL2: plan=<n parts> esp=<MiB> unafs=<MiB> cloned=<MiB> fsck=<ok|skip|fail> boot_pick=<ahci|sdhc> -> PASS|DRY|FAIL ::`
+fn witness(plan: &amber_core::Plan, cloned_mib: u64, fsck: &str, verdict: &str) {
+    let mib = |k| plan.part(k).map_or(0, |p: &amber_core::Part| amber_core::sectors_mib(p.sectors()));
+    serial_println!(
+        ":: SELFINSTALL2: plan={} esp={} unafs={} cloned={} fsck={} boot_pick={} -> {} ::",
+        plan.parts.len(), mib(amber_core::PartKind::Esp), mib(amber_core::PartKind::UnaFS), cloned_mib, fsck, boot_pick(), verdict
+    );
+}
+
+/// The plan the dry run (and the installer window) shows for the first AHCI disk, as display lines.
+/// `None` when there is no AHCI disk, the probe fails, or the disk cannot hold the plan.
+pub fn plan_lines() -> Option<alloc::vec::Vec<String>> {
+    let (port, sel) = first_ahci()?;
+    let p = probe(sel, port).ok()?;
+    #[cfg(feature = "unafs")] let ufs = super::unafsmirror::source().filter(|s| !s.is_ahci()); #[cfg(not(feature = "unafs"))] let ufs: Option<()> = None;
+    #[cfg(feature = "unafs")] let n = ufs.map(|s| s.sectors()); #[cfg(not(feature = "unafs"))] let n: Option<u64> = { let _ = ufs; None };
+    let plan = ssd_plan(p.sectors, n).ok()?;
+    let mut lines = plan.lines();
+    #[cfg(feature = "unafs")]
+    if let (Some(s), Some(dst)) = (ufs, plan.part(amber_core::PartKind::UnaFS)) {
+        if let Some(cp) = amber_core::ClonePlan::into_part(s.span.base_lba, s.sectors(), dst) {
+            lines.push(alloc::format!("  then: mirror the ESP files, {}", cp));
+        }
+    }
+    lines.push(alloc::format!("  verdict={} — `install ssd --write` lays it", p.verdict.tag()));
+    Some(lines)
+}
+
+/// Dry run: the whole plan from `amber_core::Plan`, the clone byte count, the ETA from a measured read.
+fn print_plan(p: &Probe, out: &mut dyn FnMut(&str)) {
+    #[cfg(feature = "unafs")] let ufs = super::unafsmirror::source().filter(|s| !s.is_ahci()); #[cfg(not(feature = "unafs"))] let ufs: Option<()> = None;
+    #[cfg(feature = "unafs")] let n = ufs.map(|s| s.sectors()); #[cfg(not(feature = "unafs"))] let n: Option<u64> = { let _ = ufs; None };
+    let plan = match ssd_plan(p.sectors, n) {
+        Ok(pl) => pl,
+        Err(e) => {
+            serial_println!("[install] plan: none ({})", e);
+            out(&alloc::format!("  plan: none ({})", e));
+            return;
+        }
+    };
+    for line in plan.lines() {
+        serial_println!("[install] {}", line);
+        out(&alloc::format!("  {}", line));
+    }
+    let mut cloned = 0u64;
+    #[cfg(feature = "unafs")]
+    match (ufs, plan.part(amber_core::PartKind::UnaFS)) {
+        (Some(s), Some(dst)) => {
+            if let Some(cp) = amber_core::ClonePlan::into_part(s.span.base_lba, s.sectors(), dst) {
+                let rate = super::unafsmirror::measure_rate(&s, 2048);
+                let eta = rate.and_then(|r| cp.eta_ms(r));
+                serial_println!(
+                    "[install] unafs mirror: {} src={} rate={}KiB/s eta_ms={}",
+                    cp, super::unafsmirror::handle_name(s.handle), rate.map_or(0, |r| r / 1024), eta.unwrap_or(0)
+                );
+                out(&alloc::format!("  unafs: {} — about {} s at the measured {} KiB/s", cp, eta.unwrap_or(0) / 1000, rate.map_or(0, |r| r / 1024)));
+                cloned = amber_core::sectors_mib(cp.sectors);
+            }
+        }
+        _ => {
+            serial_println!("[install] unafs mirror: none (the running system has no UnaFS root to mirror; the SSD gets the ESP only)");
+            out("  unafs: none — the running system has no UnaFS root; the SSD gets the ESP only");
+        }
+    }
+    let _ = &mut cloned;
+    witness(&plan, cloned, "skip", "DRY");
+}
+
+/// `--write`'s UnaFS leg: sector-clone the running volume into the plan's UnaFS partition, then fsck
+/// the copy through the grant. Returns `(cloned MiB, fsck tag, ok)`.
+#[cfg(all(feature = "unafs", feature = "ahci-write"))]
+fn mirror_unafs(
+    disk: &mut AhciDisk,
+    plan: &amber_core::Plan,
+    src: Option<super::unafsmirror::Source>,
+    out: &mut dyn FnMut(&str),
+) -> (u64, &'static str, bool) {
+    let (Some(s), Some(dst)) = (src, plan.part(amber_core::PartKind::UnaFS)) else {
+        serial_println!("[install] unafs mirror: none (no UnaFS root on the running system)");
+        return (0, "skip", true);
+    };
+    let Some(cp) = amber_core::ClonePlan::into_part(s.span.base_lba, s.sectors(), dst) else {
+        serial_println!("[install] unafs mirror: the volume does not fit the planned partition");
+        out("install ssd --write: the UnaFS volume does not fit its partition — NOT mirrored");
+        return (0, "skip", false);
+    };
+    serial_println!("[install] unafs mirror: {} src={}", cp, super::unafsmirror::handle_name(s.handle));
+    match super::unafsmirror::clone_span(disk, &s, &cp) {
+        Ok(ms) => serial_println!("[install] unafs mirror done {} MiB ms={}", amber_core::sectors_mib(cp.sectors), ms),
+        Err(e) => {
+            serial_println!("[install] unafs mirror FAILED err={:?} (SourceMoved = the live volume committed during the copy; re-run when idle)", e);
+            out("install ssd --write: the UnaFS mirror FAILED — the SSD's UnaFS partition is not trustworthy");
+            return (0, "skip", false);
+        }
+    }
+    let cloned = amber_core::sectors_mib(cp.sectors);
+    match super::unafsmirror::fsck_target(disk, dst.first, s.span.block_count) {
+        Ok(true) => (cloned, "ok", true),
+        Ok(false) => {
+            serial_println!("[install] unafs fsck of the copy: NOT clean");
+            (cloned, "fail", false)
+        }
+        Err(why) => {
+            serial_println!("[install] unafs fsck of the copy: {}", why);
+            (cloned, "fail", false)
+        }
+    }
+}
+
+/// SELFINSTALL2 M4: `tests install` — the shared core's GPT encode/decode KATs and the planner on a
+/// synthetic disk, IN-KERNEL and with no I/O, then the real dry run (which prints `-> DRY`, or SKIPs on
+/// a machine with no SATA disk). Nothing is written on any path.
+pub fn install_selftest() {
+    let kat = amber_core::kat::run();
+    // A synthetic 500 GB SSD and a 512 MiB running volume: the two-partition plan, 1 MiB aligned.
+    let synth = ssd_plan(976_773_168, Some(1_048_576));
+    let planner_ok = synth.as_ref().is_ok_and(|p| {
+        p.parts.len() == 2
+            && p.parts[0].first == 2048
+            && p.parts[1].first == 2048 + ESP_SECTORS
+            && p.parts[1].sectors() == 1_048_576
+            && p.gpt().is_ok()
+    });
+    let tiny_refused = ssd_plan(500_000, Some(1_048_576)).is_err();
+    let pass = kat.is_ok() && planner_ok && tiny_refused;
+    serial_println!(
+        ":: SELFINSTALL2: kat={} planner={} tiny={} -> {} ::",
+        match kat { Ok(n) => alloc::format!("{}", n), Err(why) => alloc::format!("FAIL({})", why) },
+        if planner_ok { "ok" } else { "bad" },
+        if tiny_refused { "refused" } else { "ACCEPTED" },
+        if pass { "PASS" } else { "FAIL" }
+    );
+    let mut sink = |_s: &str| {};
+    if dry_run(&mut sink).is_none() {
+        serial_println!(":: SELFINSTALL2: dry-run disks=0 -> SKIP (no AHCI disk on this machine) ::");
     }
 }

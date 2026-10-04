@@ -111,6 +111,22 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// GUID Partition Table tools over amber_core (the shared core the kernel installer uses)
+    Gpt {
+        #[command(subcommand)]
+        action: GptAction,
+    },
+}
+
+/// SELFINSTALL2 (rmbp-ledger B310): `amber_bytes gpt ...` — CLI only, no bus.
+#[derive(Subcommand)]
+enum GptAction {
+    /// Read and validate the GPT of an image or device (read-only) and print its partitions
+    Show {
+        /// The image file or drive
+        #[arg(required = true)]
+        image: PathBuf,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -141,6 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             passes,
             force,
         } => wipe_target(target, method, passes, force),
+        Commands::Gpt { action: GptAction::Show { image } } => gpt_show(image),
     }
 }
 
@@ -462,4 +479,76 @@ fn wipe_target(
     println!("--------------------------------------------------");
 
     Ok(())
+}
+
+// --- COMMAND 6: THE TABLE (SELFINSTALL2) ---
+// Reads only LBA 0, LBA 1 and the entry array the header names; every byte is validated by
+// `amber_core::gpt` — the same decoder the kernel's `install/gpt.rs` reads an SSD with.
+fn gpt_show(image: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    use amber_core::gpt::{self, Header, SECTOR};
+    let mut f = File::open(&image)?;
+    let len = f.seek(SeekFrom::End(0))?;
+    let total = len / SECTOR as u64;
+    let mut read_at = |lba: u64, n: usize| -> std::io::Result<Vec<u8>> {
+        let mut b = vec![0u8; n * SECTOR];
+        f.seek(SeekFrom::Start(lba * SECTOR as u64))?;
+        f.read_exact(&mut b)?;
+        Ok(b)
+    };
+    let mbr = read_at(0, 1)?;
+    let mbr_ok = gpt::check_protective_mbr(&mbr).is_ok();
+    let h = Header::decode(&read_at(1, 1)?, total).map_err(|e| format!("{:?}: primary GPT: {e}", image))?;
+    let raw = read_at(h.entries_lba, h.array_sectors() as usize)?;
+    let entries = gpt::decode_array(&raw, &h).map_err(|e| format!("{:?}: entry array: {e}", image))?;
+    let backup = Header::decode(&read_at(h.backup_lba, 1)?, total);
+    println!(
+        "{:?}: {} sectors, protective MBR {}, disk {}, usable {}..{}, backup header {}",
+        image,
+        total,
+        if mbr_ok { "ok" } else { "MISSING" },
+        gpt::guid_string(&h.disk_guid),
+        h.first_usable,
+        h.last_usable,
+        match backup {
+            Ok(b) if b.entries_crc == h.entries_crc => "ok",
+            Ok(_) => "DIFFERS",
+            Err(_) => "INVALID",
+        }
+    );
+    for (slot, e) in &entries {
+        println!(
+            "  slot {:<3} {:<5} lba {}..{} {} MiB {:?} type {}",
+            slot,
+            gpt::type_name(&e.type_guid),
+            e.first_lba,
+            e.last_lba,
+            amber_core::sectors_mib(e.sectors()),
+            e.name_string(),
+            gpt::guid_string(&e.type_guid)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod gpt_tests {
+    // The golden card table, written to a sparse temp image, read back through `gpt_show`'s decoder.
+    #[test]
+    fn gpt_show_reads_the_golden_card() {
+        let plan = amber_core::kat::golden_card_plan();
+        let img = plan.gpt().unwrap();
+        let path = std::env::temp_dir().join(format!("amber-gpt-{}.img", std::process::id()));
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.set_len(plan.disk_sectors * 512).unwrap();
+            for (lba, bytes) in img.writes() {
+                f.seek(SeekFrom::Start(lba * 512)).unwrap();
+                f.write_all(bytes).unwrap();
+            }
+        }
+        let r = super::gpt_show(path.clone());
+        let _ = std::fs::remove_file(&path);
+        assert!(r.is_ok());
+    }
 }
