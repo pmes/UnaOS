@@ -468,8 +468,21 @@ kat!(
         ns: "stria".to_string(),
         key: "muted".to_string(),
         value: PrefValue::Bool(true),
+        clamped: false,
     }),
     r#"{"Principia":{"PrefChanged":{"ns":"stria","key":"muted","value":{"Bool":true}}}}"#
+);
+// PRINCIPIA2 (SR32): an out-of-range write to a declared key is clamped; the flag rides the wire
+// only when true, so the unclamped golden above is unchanged.
+kat!(
+    kat_principia_pref_changed_clamped,
+    SMessage::Principia(PrincipiaCommand::PrefChanged {
+        ns: "system".to_string(),
+        key: "display.brightness".to_string(),
+        value: PrefValue::Int(16),
+        clamped: true,
+    }),
+    r#"{"Principia":{"PrefChanged":{"ns":"system","key":"display.brightness","value":{"Int":16},"clamped":true}}}"#
 );
 kat!(
     kat_principia_pref_error,

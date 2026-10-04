@@ -19,10 +19,37 @@ A preference is addressed by a **namespace** — a per-app/domain string
 losslessly, so nothing is retyped by a save/load cycle (a whole-numbered float
 stays a float).
 
-**Defaults live with the consumer, never in the store.** A `get` on an unset key
-answers `None`; the consumer applies its own default. The store therefore never
-has to know what any app considers reasonable, and a settings file only ever
-contains choices a user actually made.
+**Defaults never live in the store.** A `get` on an unset key answers `None`,
+and a settings file only ever contains choices a user actually made.
+
+### The schema (PRINCIPIA2, LEDGER SR32)
+
+Every key UnaOS declares — namespace, key, type, range or enum, default, who
+writes it, who reads it — is ONE table, `prefs_core::schema::SCHEMA`
+(`unaos/libs/sys/prefs_core/src/schema.rs`), linked by the kernel and by
+Principia. [`docs/dev/PREFS-SCHEMA.md`](../../docs/dev/PREFS-SCHEMA.md) is
+generated from it; `cargo test -p prefs_core --test schema_gate` fails when the
+committed document is not the generated one, and runs
+`tools/prefs-schema-check.py`, which fails when a key referenced anywhere in
+the tree is missing from the table.
+
+- **Clamp.** `PrefStore::set` (so `PrefSet`, and the byte surface below) runs
+  `prefs_core::schema::check`, the validator the kernel's `prefs::set` adopts at
+  the fold: a declared int/float written out of range is CLAMPED, stored, and
+  answered with the clamp and `clamped: true` on `PrefChanged`; a wrong type, a
+  value outside an enum, an over-long or unprintable string answers `PrefError`.
+  Undeclared keys (an app's own namespace) are stored as given.
+- **Defaults and rules.** `Principia::effective(ns, key)` answers the value in
+  force: stored, else the schema's default, else a derived default
+  (`prefs_core::rules::Rule`). R81's embedder is the first rule:
+  `vein.embed.provider` = `gemini` when `vein.gemini.api_key_env` (default
+  `GEMINI_API_KEY`) names a set variable, else `local` when the local model is
+  installed (`tools/una-models` manifest present in the model cache), else
+  `off`; `vein.provider` defaults to `claude` and `vein.model` follows it.
+- **Bytes.** `principia::wire::fulfil` answers the kernel's `PREF_GET` /
+  `PREF_SET` / `PREF_LIST` bodies (una-abi 16/17/18) from this store through
+  the shared `prefs_core::wire::fulfil`: same status, same reply bytes as the
+  kernel (a test drives one script through both).
 
 ### File format
 
@@ -63,8 +90,8 @@ All carried on `SMessage::Principia(PrincipiaCommand)`:
 | In | `PrefGet { ns, key }` | Read one preference. |
 | Out | `PrefValueIs { ns, key, value: Option<PrefValue> }` | The answer; `None` = unset. |
 | In | `PrefSet { ns, key, value }` | Validate, persist atomically. |
-| Out | `PrefChanged { ns, key, value }` | Broadcast after every successful set — both the acknowledgement and the live-update signal running apps subscribe to. |
-| Out | `PrefError { ns, key, message }` | A rejected set (bad namespace/key, path collision, failed persist). |
+| Out | `PrefChanged { ns, key, value, clamped }` | Broadcast after every successful set — both the acknowledgement and the live-update signal running apps subscribe to. `value` is what was stored (the clamp of an out-of-range write); `clamped` is omitted from the wire when false. |
+| Out | `PrefError { ns, key, message }` | A rejected set (bad namespace/key, schema refusal, path collision, failed persist). |
 | In | `PrefList { ns }` | Every key set in one namespace. |
 | Out | `PrefListIs { ns, entries: Vec<(String, PrefValue)> }` | The answer, sorted by key; an unknown namespace lists empty. |
 
@@ -83,8 +110,8 @@ an explicit config lobe (tests, and any future multi-profile boot).
   the next load. A file watcher that reloads and emits `PrefChanged` per delta
   is the follow-up.
 - **The GUI surface.** Settings are served but have no face yet; a quartzite
-  view over `PrefList`/`PrefSet` is the natural next step, and the schema needed
-  to render a *good* one (labels, ranges, enums per key) is not defined.
+  view over `PrefList`/`PrefSet` is the natural next step, rendered from
+  `prefs_core::schema::SCHEMA` (types, ranges, enums per key).
 - **First consumers.** Aether's homepage (`aether`.`homepage`) and window size
   (`aether`.`window.width` / `window.height`) are the intended first two;
   wiring them belongs to the aether-shell lane, not here.
