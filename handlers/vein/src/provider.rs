@@ -348,4 +348,24 @@ mod tests {
         let line = slot.status_line();
         assert!(line.starts_with(":: BRAIN :: EMBED gemini/text-embedding-004 UNAVAILABLE\n:: BRAIN :: RECALL OFF :: set GEMINI_API_KEY"), "{line}");
     }
+
+    /// EMBED (B317) M2: `embed.provider = "local"` — online when the model is installed, else the
+    /// in-chat line names the fetch command (never a panic).
+    #[cfg(feature = "local-embed")]
+    #[test]
+    fn embed_slot_local() {
+        let slot = EmbedSlot::from_lookup(
+            |k| (k == "embed.provider").then(|| PrefValue::Str("local".into())),
+            none,
+        );
+        let installed = gneiss_pal::api::local::model_dir("all-MiniLM-L6-v2").join("model.onnx").is_file();
+        if installed {
+            assert_eq!(slot.status_line(), ":: BRAIN :: EMBED local/all-MiniLM-L6-v2 dims=384\n\n");
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let (e, why) = rt.block_on(slot.embed_one("semantic recall with no network"));
+            assert_eq!((e.vector.len(), e.tag.as_str(), why), (384, "local/all-MiniLM-L6-v2", None));
+        } else {
+            assert!(slot.status_line().contains("run `tools/una-models fetch all-MiniLM-L6-v2`"), "{}", slot.status_line());
+        }
+    }
 }
