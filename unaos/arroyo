@@ -3902,7 +3902,6 @@ launch_x86_64() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
@@ -4872,7 +4871,6 @@ test_x86_64() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
@@ -8776,7 +8774,6 @@ esp_x86() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
@@ -8838,7 +8835,6 @@ vm_image() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
@@ -8885,7 +8881,6 @@ fat_img() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
     build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
     build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN

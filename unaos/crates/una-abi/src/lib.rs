@@ -1133,7 +1133,6 @@ pub const SYS_RESOLVE: u64 = 57;
 pub const RESOLVE_OUT_LEN: usize = 20;
 /// Longest name `SYS_RESOLVE` accepts.
 pub const RESOLVE_NAME_MAX: usize = 253;
-=======
 // =================================================================================================
 // RING3WIN (rmbp-ledger B316) — the ELF window. A UnaOS ring-3 program gets the address space its ELF
 // asks for: beside the classic 16 KiB window at the window base (and the FB hole above it, which is ABI
@@ -1187,7 +1186,6 @@ mod ring3win_tests {
         std::println!(":: RING3WIN-ABI: sbrk={} window={} xwin_off={:#x} -> PASS ::", SYS_SBRK, USER_WINDOW_BYTES, USER_XWIN_OFF);
     }
 }
-=======
 // TRASHTIME (B308) — what a trashed object IS, declared once for both Finders (the kernel's Quarry
 // Trash, `fs/trash.rs`, and Matrix's host Finder over a UnaFS vault): three attributes ON the object,
 // found by one query scoped to `/home/<user>/.Trash/`. Strings, not code: zero bytes in an EL0 blob.

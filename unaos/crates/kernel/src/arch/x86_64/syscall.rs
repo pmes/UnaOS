@@ -2625,8 +2625,6 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
         SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), #[cfg(feature = "netring3")] una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
-        SYS_CLOSE => sys_close(a0),
-        SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
         SYS_CLOSE => sys_close(a0), una_abi::SYS_SBRK => super::memory::sys_sbrk(a0 as i64), // RING3WIN (B316): the heap verb, body in memory.rs's ELF-window block. ⚠ SAME-LINE fold.
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
@@ -29959,6 +29957,8 @@ pub fn vein_owned(verb: u8) -> bool {
 pub fn vein_selftest() {
     busx_sem_init_once();
     crate::vein_bus::selftest(&BUSREG_FX);
+}
+
 /// NETRING3 M1 (B306): `SYS_GETRANDOM(buf, len) -> count / -errno` — at most `GETRANDOM_MAX` bytes from
 /// the kernel DRBG (`crate::netring3::getrandom`); the kernel copy is zeroed before return.
 #[cfg(feature = "netring3")]
@@ -29996,7 +29996,8 @@ fn sys_resolve(name_ptr: u64, name_len: u64, out_ptr: u64) -> i64 {
         },
         Err(e) => e,
     }
-=======
+}
+
 /// RING3WIN (B316): the largest program IMAGE a reader may hand the loader — the ELF window
 /// (`una_abi::USER_WINDOW_BYTES`, 4 MiB). The loader then decides fixed vs elf model from the PT_LOAD
 /// layout; a fixed-model image still has to fit `user_window_size()` (16 KiB) span-wise.
@@ -30070,7 +30071,8 @@ pub fn ring3win_selftest() {
         ":: RING3WIN: model=elf window={} big_ok={} sbrk={} freed={} -> {} ::",
         user_image_cap(), big_ok as u8, heap, freed as u8, if big_ok && freed { "PASS" } else { "FAIL" }
     );
-=======
+}
+
 /// FILETYPE (B307) — the KERNEL hands a ring-3 program one unsolicited `BUS_VERB_NOTICE` frame in its
 /// mailbox (`row` = the slot `spawn_user_image_bg` returned), body = the bytes given (Quarry's program
 /// opener: the path of the file to open, because there is no `SYS_EXEC` with an argv — `quarry.md` §7

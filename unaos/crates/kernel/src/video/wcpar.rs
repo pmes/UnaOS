@@ -211,7 +211,7 @@ pub fn emit() {
     // PTRSTUTTER M3 — the verdict is about COMPLETION: every band ran (a speedup of 14-28% under six vug
     // windows is the machine being busy, not a defect). Only an IDLE machine is held to a speedup floor.
     let busy = cores_busy();
-    let ok = failed == 0 && (busy || speedup >= 20); if !crate::census::on(crate::census::WCPAR) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
+    if !crate::census::on(crate::census::WCPAR) { return; } // QUIETBOOT (R80): a census, OFF until `census start wcpar` (merge10 fold: the verdict line itself is TESTFIX3's below)
     // TESTFIX3 — and only when the bands carry enough work for a fan-out to pay: FLIGHT 19's one FAIL
     // (`bands=126 pass_us=1559 serial_us=1821 speedup_pct=16 load=idle`, right after `tests` closed its
     // windows) is 14 us of blit per band, the same order as a claim + wake, so no speedup is owed there;

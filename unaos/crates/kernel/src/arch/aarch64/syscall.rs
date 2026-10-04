@@ -25882,7 +25882,8 @@ pub fn vein_owned(verb: u8) -> bool {
 pub fn vein_selftest() {
     bus_sem_init_once();
     crate::vein_bus::selftest(&BUSREG_FX);
-=======
+}
+
 /// NETRING3 M1 (B306): `SYS_GETRANDOM(buf, len) -> count / -errno` — the aarch64 twin (RNDR-seeded where
 /// the CPU has it, else jitter; the seed source is said on the wire).
 #[cfg(feature = "netring3")]

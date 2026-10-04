@@ -129,8 +129,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); // LUMENBIN: `tests lumen`
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_netring3();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); // LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win();
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); // FILETYPE (B307): `tests filetype`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet();
@@ -221,12 +220,18 @@ fn ensure_lumen() {
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); }
+    }
+}
+
 /// NETRING3 (B306): register `tests net` (M1 entropy + M2 resolve) exactly once under `netring3`.
 fn ensure_netring3() {
     #[cfg(feature = "netring3")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("net", crate::netring3::selftest); }
+    }
+}
+
 /// RING3WIN (B316): register `tests ring3win` exactly once on x86 (the ELF window is x86's this arc; the
 /// fixture SKIPs when the volume carries no `/apps/BIG.BIN`).
 fn ensure_ring3win() {
@@ -235,6 +240,8 @@ fn ensure_ring3win() {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("ring3win", crate::arch::syscall::ring3win_selftest); }
     }
+}
+
 /// QUIETBOOT M3 (R80) — the one-statement shape for a boot-time WITNESS: `if crate::tests::defer("name", f) { return; }`
 /// as the first statement of the fixture `f` itself. Returns `false` (run the body now, as before) under
 /// `tests-at-boot` — so a QEMU lane sees the old line in the old order — and while `tests` is executing a
@@ -284,6 +291,8 @@ pub fn quietboot_selftest() {
         serial_println!(":: QUIETBOOT: top=[{}] ::", s);
     }
     serial_println!(":: QUIETBOOT: lines={} bound={} census={} -> {} ::", n, QUIETBOOT_BOUND, crate::census::bits(), if ok { "PASS" } else { "FAIL" });
+}
+
 /// BRIGHTFLOOR (B312): register `brightfloor` (the backlight floor, the load clamp, the safe-mode reset,
 /// and the BRIGHTKEYS key path that used to run at boot — R80) exactly once, wherever the desktop builds.
 fn ensure_brightfloor() {
@@ -291,6 +300,9 @@ fn ensure_brightfloor() {
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); }
+    }
+}
+
 /// USBNET6 M4: register `tests usbnet` (the dongle receives a frame within 5 s) exactly once, on any build
 /// carrying the USB Ethernet driver; no dongle or no link prints SKIP, never a pin.
 fn ensure_usbnet() {
