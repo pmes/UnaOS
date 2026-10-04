@@ -14,10 +14,10 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use gneiss_pal::api::{Content, Part, ResilientClient};
+use gneiss_pal::api::{ChatRequest, ModelProvider, Part, StopReason};
 
 pub async fn compress_into_engram(
-    client: &mut ResilientClient,
+    provider: &dyn ModelProvider,
     user_prompt: &str,
     ai_response: &str,
 ) -> Result<String, String> {
@@ -36,18 +36,16 @@ Example Output format:
 - AI supplied Directive 065 to implement 'directive' memory class and Engram compression.
 - User approved implementation."#;
 
-    let mut request_contents = Vec::new();
-
+    // VEINPROV (B303): the compression rules travel as the system prompt, the
+    // exchange as the one user turn — provider-neutral.
     let combined_text = format!(
-        "{}\n\n[CONVERSATION HISTORY TO COMPRESS]:\nUser: {}\n\nAI: {}\n",
-        system_instruction, user_prompt, ai_response
+        "[CONVERSATION HISTORY TO COMPRESS]:\nUser: {}\n\nAI: {}\n",
+        user_prompt, ai_response
     );
-
-    request_contents.push(Content {
-        role: "user".to_string(),
-        parts: vec![Part::text(combined_text)],
-    });
-
-    let (response, _) = client.generate_content(&request_contents).await?;
-    Ok(response)
+    let req = ChatRequest::single(Some(system_instruction.to_string()), vec![Part::text(combined_text)]);
+    let resp = provider.generate(&req).await.map_err(|e| e.to_string())?;
+    match resp.stop {
+        StopReason::EndTurn | StopReason::MaxTokens => Ok(resp.text),
+        other => Err(format!("engram compression stopped: {other:?}")),
+    }
 }

@@ -9,13 +9,14 @@
 pub mod context;
 pub mod cortex;
 pub mod gravity;
+pub mod provider;
 pub mod skeleton;
 pub mod storage;
 pub mod synapse;
 pub mod vault;
 
 use chrono::Local;
-use gneiss_pal::api::{Content, Part, ResilientClient};
+use gneiss_pal::api::Part;
 use gneiss_pal::forge::ForgeClient;
 use gneiss_pal::persistence::BrainManager;
 use gneiss_pal::AppHandler;
@@ -277,12 +278,14 @@ impl VeinHandler {
                 Err(_) => None,
             };
 
-            let client_res = ResilientClient::new().await;
-            match client_res {
-                Ok(mut client) => {
+            // VEINPROV (B303): the provider the person configured (Principia `vein` namespace);
+            // a slot that could not be built still runs the loop and answers each call with the fix.
+            let mut brain = provider::ProviderSlot::load();
+            {
+                {
                     {
                         let mut s = state_bg.write().unwrap();
-                        s.console_logs.push_back(":: BRAIN :: ONLINE (PLEXUS ENABLED)\n\n".into());
+                        s.console_logs.push_back(brain.status_line());
                         s.console_seq += 1;
                         while s.console_logs.len() > MAX_STATE_CAPACITY {
                             s.console_logs.pop_front();
@@ -309,6 +312,18 @@ impl VeinHandler {
                                         tokio::spawn(async move {
                                             execute_upload(path, app_state_upload, synapse_upload).await;
                                         });
+                                    }
+                                    ref m if provider::is_vein_pref_change(m) => {
+                                        brain = provider::ProviderSlot::load();
+                                        {
+                                            let mut s = state_bg.write().unwrap();
+                                            s.console_logs.push_back(brain.status_line());
+                                            s.console_seq += 1;
+                                            while s.console_logs.len() > MAX_STATE_CAPACITY {
+                                                s.console_logs.pop_front();
+                                            }
+                                        }
+                                        let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                                     }
                                     SMessage::StorageLoadPagedResult { records, receipt_id: _ } => {
                                         {
@@ -446,7 +461,7 @@ impl VeinHandler {
                                     let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                                     let synapse_clone = synapse_loop.clone();
 
-                                    match client.embed_content(&dir_text).await {
+                                    match brain.embed(&dir_text).await {
                                         Ok(embedding) => {
                                             receipt_counter += 1;
                                             let _ = synapse_clone.fire_async(SMessage::StorageSave {
@@ -480,7 +495,7 @@ impl VeinHandler {
                                             }
                                         }
 
-                                        let user_embedding = match client.embed_content(&payload.prompt).await {
+                                        let user_embedding = match brain.embed(&payload.prompt).await {
                                             Ok(vec) => vec,
                                             Err(_) => vec![]
                                         };
@@ -531,17 +546,20 @@ impl VeinHandler {
                                         }
                                         // END JIT MATRIX EVALUATION
 
-                                        let mut context: Vec<Content> = Vec::new();
-                                        let current_text = format!("{}\n\n[CURRENT PROMPT]:\n{}", system_builder, payload.prompt);
-                                        context.push(Content {
-                                            role: "user".into(),
-                                            parts: parse_multimodal_text(&current_text),
-                                        });
+                                        // VEINPROV (B303): system prompt as the request's system, the prompt as the turn.
+                                        let turn_text = if payload.prompt.trim().is_empty() {
+                                            "[System: User provided multimodal input without text.]".to_string()
+                                        } else {
+                                            payload.prompt.clone()
+                                        };
+                                        let request = brain.request(Some(system_builder), parse_multimodal_text(&turn_text));
 
                                         let _ = synapse_loop.fire_async(SMessage::NetworkState("network-transmit-receive-symbolic".to_string())).await;
 
-                                        match client.generate_content(&context).await {
-                                            Ok((response, metadata)) => {
+                                        match brain.generate(&request).await {
+                                            Ok(reply) => {
+                                                let response = provider::render_reply(&reply);
+                                                let usage = reply.usage;
                                                 let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                                                 let display = format!("\n[UNA] [{}] :: {}\n", timestamp, response);
 
@@ -552,19 +570,14 @@ impl VeinHandler {
                                                     while s.console_logs.len() > MAX_STATE_CAPACITY {
                                                         s.console_logs.pop_front();
                                                     }
-                                                    if let Some(meta) = metadata {
-                                                        s.token_usage = (
-                                                            meta.prompt_token_count.unwrap_or(0) as i32,
-                                                            meta.candidates_token_count.unwrap_or(0) as i32,
-                                                            meta.total_token_count.unwrap_or(0) as i32
-                                                        );
-                                                    }
+                                                    let (i, o) = (usage.input_tokens as i32, usage.output_tokens as i32);
+                                                    s.token_usage = (i, o, i.saturating_add(o));
                                                     s.sidebar_status = WolfpackState::Idle;
                                                 }
                                                 let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
 
                                                 let safe_embed: String = response.chars().take(6000).collect();
-                                                let response_embedding = match client.embed_content(&safe_embed).await {
+                                                let response_embedding = match brain.embed(&safe_embed).await {
                                                     Ok(vec) => vec,
                                                     Err(_) => vec![],
                                                 };
@@ -590,10 +603,11 @@ impl VeinHandler {
 
                                                 let ai_response_clone = response.clone();
                                                 let _tx_inner = synapse_clone.clone();
+                                                let engram_provider = brain.provider();
                                                 tokio::spawn(async move {
-                                                    if let Ok(mut client_clone) = ResilientClient::new().await {
-                                                        if let Ok(engram) = crate::context::compress_into_engram(&mut client_clone, &raw_user_prompt, &ai_response_clone).await {
-                                                            if let Ok(engram_embedding) = client_clone.embed_content(&engram).await {
+                                                    if let Ok(engram_brain) = engram_provider {
+                                                        if let Ok(engram) = crate::context::compress_into_engram(engram_brain.as_ref(), &raw_user_prompt, &ai_response_clone).await {
+                                                            if let Ok(engram_embedding) = engram_brain.embed(&engram).await {
                                                                 let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                                                                 let _ = synapse_clone.fire_async(SMessage::StorageSave {
                                                                     receipt_id: 0,
@@ -612,6 +626,12 @@ impl VeinHandler {
                                                 {
                                                     let mut s = state_bg.write().unwrap();
                                                     s.synapse_error = Some(format!("Synapse failure: {}", e));
+                                                    s.console_logs.push_back(format!("\n[SYSTEM ERROR] :: {}\n", e));
+                                                    s.console_seq += 1;
+                                                    while s.console_logs.len() > MAX_STATE_CAPACITY {
+                                                        s.console_logs.pop_front();
+                                                    }
+                                                    s.sidebar_status = WolfpackState::Idle;
                                                 }
                                                 let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                                             }
@@ -753,7 +773,7 @@ impl VeinHandler {
                                     continue;
                                 }
 
-                                let user_embedding = match client.embed_content(&user_input_text).await {
+                                let user_embedding = match brain.embed(&user_input_text).await {
                                     Ok(vec) => vec,
                                     Err(_e) => vec![]
                                 };
@@ -770,17 +790,6 @@ impl VeinHandler {
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    {
-                        let mut s = state_bg.write().unwrap();
-                        s.console_logs.push_back(format!(":: FATAL :: {}\n", e));
-                        s.console_seq += 1;
-                        while s.console_logs.len() > MAX_STATE_CAPACITY {
-                            s.console_logs.pop_front();
-                        }
-                    }
-                    let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
                 }
             }
         });

@@ -21,6 +21,8 @@ unafs = { path = "../../unaos/libs/fs/unafs" }
 elessar = { path = "../../libs/elessar" }
 quartzite = { path = "../../libs/quartzite" }
 matrix = { path = "../../handlers/matrix" }
+# VEINPROV (B303): the provider choice is a preference — read from Principia's store, namespace `vein`.
+principia = { path = "../../handlers/principia" }
 syn = { version = "3.0", features = ["full", "extra-traits"] }
 quote = "1.0"
 
