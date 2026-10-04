@@ -3,14 +3,17 @@
 //
 //! The CRYPTOCORE adapter — the fold of SR27 into Holocron is THIS file plus one Cargo line.
 //!
-//! Compiled only with `--features crypto_core`, which today has no dependency behind it (crypto_core is
-//! being written on `exec-sec-crypto`), so enabling the feature before the fold fails to build — on
-//! purpose. At the fold: uncomment the `crypto_core` dependency in this crate's Cargo.toml, make the
-//! feature `crypto_core = ["dep:crypto_core"]`, confirm the four function names below against the
-//! landed crate (`chacha20poly1305::{seal, open}` and `hkdf::hkdf` match exec-sec-crypto d74813aa;
-//! `argon2::argon2id` and `ed25519::{public_key, sign, verify}` are that crate's M-later modules), and
-//! run `cargo test -p holocron_core --features crypto_core` (the `cc_*` tests in tests/kat.rs then run
-//! the RFC 8032 §7.1 TEST 1 vector through the agent and a real seal/open round trip).
+//! Compiled only with `--features crypto_core`, which on this branch has no dependency behind it
+//! (crypto_core is being written on `exec-sec-crypto`), so enabling the feature before the fold fails to
+//! build — on purpose. At the fold: uncomment the `crypto_core` dependency in this crate's Cargo.toml,
+//! make the feature `crypto_core = ["dep:crypto_core"]`, and run
+//! `cargo test -p holocron_core --features crypto_core` (the `cc_*` tests in tests/cc.rs then run the
+//! RFC 8032 §7.1 TEST 1 vector through the agent and a real Argon2id + ChaCha20-Poly1305 ring).
+//!
+//! The calls below are written against exec-sec-crypto as it stood at 66c835b7 + its in-flight
+//! `argon2.rs` (`argon2::hash(&Params, pw, salt, secret, ad, out)`, `ed25519::SigningKey::from_seed`,
+//! `ed25519::verify -> Result<(), Error>`, `chacha20poly1305::{seal, open}`, `hkdf::hkdf::<Sha256>`),
+//! and were compiled and tested against that tree from a scratch copy (HOLOCRON1.md, "the fold proof").
 
 use crate::seal::{KdfParams, NONCE_LEN, SALT_LEN, SealError, Sealer, Signer};
 use crate::zero::{Key, wipe};
@@ -24,10 +27,13 @@ impl Sealer for CryptoCore {
     const SUITE: u8 = crate::format::SUITE_ARGON2ID_CHACHA20POLY1305;
 
     fn derive_key(&self, password: &[u8], salt: &[u8; SALT_LEN], params: &KdfParams) -> Result<Key, SealError> {
+        use crypto_core::argon2::{Params, Variant, Version};
+        let p = Params { variant: Variant::Argon2id, version: Version::V0x13, m_kib: params.m_kib, t: params.t, p: params.p };
         let mut out = [0u8; 32];
-        crypto_core::argon2::argon2id(password, salt, params.m_kib, params.t, params.p, &mut out)
-            .map_err(|_| SealError::Param)?;
-        Ok(Key::from_bytes(out))
+        crypto_core::argon2::hash(&p, password, salt, &[], &[], &mut out).map_err(|_| SealError::Param)?;
+        let k = Key::from_bytes(out);
+        wipe(&mut out);
+        Ok(k)
     }
 
     fn subkey(&self, key: &Key, salt: &[u8], info: &[u8]) -> Key {
@@ -53,14 +59,14 @@ impl Signer for CryptoCore {
     const REAL: bool = true;
 
     fn public_key(&self, seed: &[u8; 32]) -> [u8; 32] {
-        crypto_core::ed25519::public_key(seed)
+        crypto_core::ed25519::SigningKey::from_seed(seed).public_key()
     }
 
     fn sign(&self, seed: &[u8; 32], msg: &[u8]) -> [u8; 64] {
-        crypto_core::ed25519::sign(seed, msg)
+        crypto_core::ed25519::SigningKey::from_seed(seed).sign(msg)
     }
 
     fn verify(&self, public: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
-        crypto_core::ed25519::verify(public, msg, sig)
+        crypto_core::ed25519::verify(public, msg, sig).is_ok()
     }
 }
