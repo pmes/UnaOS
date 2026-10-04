@@ -325,14 +325,14 @@ fn ensure_kvblank8() {
     }
 }
 
-/// GEN7R8 (B320, R80): register `tests gen7` — the Ivy Bridge ladder's rung R8 (the BCS blit at the
-/// panel's geometry into scratch) — exactly once, on a `gen7r8` (`UNAOS_IVB3D_R8`) build. The boot only
-/// stashes R8's inputs at R7's tail; this fixture runs the rung and prints `:: GEN7R8: … ::`.
+/// GEN7R8 (B320, R80) + GPUTESTS (B334): register `tests gen7` — the whole Ivy Bridge ladder, R1..R7 from
+/// the boot bank (`:: GEN7LADDER: … ::`) then R8 under `gen7r8` (`:: GEN7R8: … ::`) — exactly once, on a
+/// `gen7` (`UNAOS_IVB3D`) build. The boot only banks the inputs (`gen7::bank`) and prints nothing.
 fn ensure_gen7() {
-    #[cfg(all(target_arch = "x86_64", feature = "gen7r8"))]
+    #[cfg(all(target_arch = "x86_64", feature = "gen7"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("gen7", crate::drivers::gpu::gen7::r8_test); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("gen7", crate::drivers::gpu::gen7::ladder_test); }
     }
 }
 

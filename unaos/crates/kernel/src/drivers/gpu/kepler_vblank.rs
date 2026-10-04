@@ -934,7 +934,7 @@ fn rung2_run(bar0: usize, head: usize, n: u64) {
         if en_back == en_entry { "clean" } else { "DIRTY" },
         WINDOW_VBLANKS,
     );
-    LADDER.store(LADDER_IRQ_ARM, Ordering::Release);
+    LADDER.store(gt_after_window(), Ordering::Release); // GPUTESTS M2: rung 3 parks for `tests kvblank8` (R80) unless `kvblank_trace`
 }
 
 /// **§R3 — THE VECTOR.** Allocate `kepler-vblank` from the VECTORS allocator (B168), program the
@@ -1143,7 +1143,7 @@ fn rung3_run(bar0: usize, head: usize, n: u64) {
     let pmc_back = unsafe { mmio_read(bar0, regs::NV_PMC_INTR_EN) };
     let mask_back = unsafe { mmio_read(bar0, PMC_INTR_MASK_HOST) };
     let en_back = unsafe { mmio_read(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head)) };
-    let irq = IRQ_COUNT.load(Ordering::Relaxed);
+    let irq = IRQ_COUNT.load(Ordering::Relaxed); GT_R3_VBL.store(elapsed, Ordering::Relaxed); GT_R3_IRQ.store(irq, Ordering::Relaxed); // GPUTESTS M2: the 90 % window's inputs, for the fixture line
     let (intr_or, line_or) = (WIN_PMC_OR.load(Ordering::Relaxed), WIN_LINE_OR.load(Ordering::Relaxed));
     let (deliver, reason) = classify(DeliverIn {
         irq,
@@ -2102,6 +2102,10 @@ struct Kv8Census {
     apic_held: u32,
     lapic_valid: u32,
     isr_delta: u64,
+    /// GPUTESTS M5: hardware frames timed edge-to-edge on the TSC across the census, and the ISR's own period.
+    pace_frames: u64,
+    pace_us: u64,
+    isr_period_us_x1000: u64,
 }
 
 /// Pure: the stage the edge is lost at, in the order the signal travels. `none` when the ISR kept up (>= 30 per s).
@@ -2134,6 +2138,8 @@ fn kv8_census() -> Kv8Census {
     let v1 = IRQ_VECTOR1.load(Ordering::Relaxed);
     let dest1 = KV8_DEST1.load(Ordering::Acquire);
     let i0 = IRQ_COUNT.load(Ordering::Relaxed);
+    let (pa_cyc, pa_frame) = gt_frame_edge(bar0, head); // GPUTESTS M5: the census window starts ON a frame edge
+    let (pa_isr, pa_last) = (IRQ_COUNT.load(Ordering::Relaxed), ISR_LAST_CYC.load(Ordering::Relaxed));
     let mut prev = i0;
     for _ in 0..60 {
         crate::arch::sched::sleep_ms(16);
@@ -2183,6 +2189,17 @@ fn kv8_census() -> Kv8Census {
         }
     }
     c.isr_delta = IRQ_COUNT.load(Ordering::Relaxed).saturating_sub(i0);
+    // GPUTESTS M5: ...and ends on one, so frames/elapsed is exact to the TSC, not to a sample's phase.
+    let (pb_cyc, pb_frame) = gt_frame_edge(bar0, head);
+    if pa_cyc != 0 && pb_cyc != 0 {
+        c.pace_frames = (pb_frame.wrapping_sub(pa_frame) & 0xFFFF) as u64;
+        c.pace_us = cycles_to_us(pb_cyc.saturating_sub(pa_cyc));
+    }
+    let (pb_isr, pb_last) = (IRQ_COUNT.load(Ordering::Relaxed), ISR_LAST_CYC.load(Ordering::Relaxed));
+    let n_isr = pb_isr.saturating_sub(pa_isr);
+    if n_isr >= 2 && pa_last != 0 && pb_last > pa_last {
+        c.isr_period_us_x1000 = cycles_to_us(pb_last - pa_last).saturating_mul(1000) / n_isr;
+    }
     c
 }
 
@@ -2203,9 +2220,16 @@ fn kv8_trace() -> (Kv8Census, &'static str) {
     let _ = kv8_snapshot(if first != 0 { "isr+100ms" } else { "isr+100ms(no-isr-in-500ms)" });
     let c = kv8_census();
     let lost = kv8_verdict(&c);
+    let (waited_us, pace_ppm) = gt_pace(&c);
+    let isr_ppm = if c.isr_period_us_x1000 == 0 {
+        alloc::string::String::from("-")
+    } else {
+        alloc::format!("{}", gt_ppm_x1000(c.isr_period_us_x1000))
+    };
     serial_println!(
-        ":: KVBLANK8: census samples={} isr_delta={} disp_seen={} disp_set_no_isr={} pmc_set_no_isr={} pmc_line_off={} msi_held={} apic_held={} lapic_valid={} :: — 60 Hz for 1 s: a sample counts against a stage only when the ISR has NOT run since the previous sample",
+        ":: KVBLANK8: census samples={} isr_delta={} disp_seen={} disp_set_no_isr={} pmc_set_no_isr={} pmc_line_off={} msi_held={} apic_held={} lapic_valid={} waited_us={} pace_frames={} pace_err_ppm={} isr_pace_err_ppm={} :: — 60 Hz for 1 s: a sample counts against a stage only when the ISR has NOT run since the previous sample; waited_us/pace_err_ppm = the hardware frame (HEAD_STAT.VERT[31:16]) timed edge-to-edge on the TSC against 16667 us, isr_pace_err_ppm = the ISR's own delivery period (GPUTESTS M5)",
         c.samples, c.isr_delta, c.disp_seen, c.disp_set_no_isr, c.pmc_set_no_isr, c.pmc_line_off, c.msi_held, c.apic_held, c.lapic_valid,
+        waited_us, c.pace_frames, pace_ppm, isr_ppm,
     );
     let t2 = arm + 2_000;
     let now = crate::arch::ms();
@@ -2371,6 +2395,7 @@ pub fn kvblank8_selftest() {
         serial_println!(":: KVBLANK8: lost_at=- isr_calls=0 eoi=- rearm=- -> SKIP (no GK107 head armed: bar0={} bdf={} head={}) ::", (bar0 != 0) as u32, (bdf1 != 0) as u32, head1);
         return;
     }
+    gt_rung3_from_fixture(); // GPUTESTS M2: rung 3 and its 90 % delivery window run HERE, not at boot (R80)
     // Rung 3 (or a knob trace) still owns the window: wait for it, bounded.
     let mut w = 0u32;
     while (LADDER.load(Ordering::Acquire) == LADDER_IRQ_RUN || kv8_hold()) && w < 600 {
@@ -2461,4 +2486,107 @@ pub fn kvblank8_selftest() {
         lost, c.isr_delta, if eoi_ok { "ok" } else { "missing" }, if rearm_ok { "ok" } else { "missing" },
         if pass { "PASS" } else { "FAIL" },
     );
+}
+
+// ── GPUTESTS M2 (B334, R80) — rung 3 arms from `tests kvblank8`, not at boot ─────────────────────────────────────
+//
+// The edge-driven ladder used to walk census → enable window → VECTOR on its own, so the MSI arm, the 60-vblank
+// delivery window and its 90 % keep decision all ran on the boot path. Rung 2's close now PARKS the ladder; the
+// fixture un-parks it, lets the edge driver run rung 3 unchanged (its `vector armed` / `vector close` / `isr books`
+// lines keep their format), and scores the 90 % window as a fixture line. `kvblank_trace` keeps the boot-time arm:
+// a knob is R80-admissible, and the trace exists to watch the takeover.
+
+/// Rung 3 waits here for the fixture.
+const LADDER_IRQ_PARKED: u32 = 6;
+/// The 90 % window's inputs as rung 3's close read them (`vbl_delta=`, `irq=`).
+static GT_R3_VBL: AtomicU64 = AtomicU64::new(0);
+static GT_R3_IRQ: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn gt_after_window() -> u32 {
+    if cfg!(feature = "kvblank_trace") { LADDER_IRQ_ARM } else { LADDER_IRQ_PARKED }
+}
+
+/// Un-park rung 3 and wait (bounded) for its window to close on the edge driver; print the 90 % check.
+fn gt_rung3_from_fixture() {
+    // Rungs 1-2 still own the ladder for ~4.5 s after the takeover: wait for the park, bounded 10 s.
+    let mut w = 0u32;
+    while matches!(LADDER.load(Ordering::Acquire), LADDER_CENSUS | LADDER_WINDOW_ARM | LADDER_WINDOW_RUN) && w < 1_000 {
+        crate::arch::sched::sleep_ms(10);
+        w += 1;
+    }
+    let st = LADDER.load(Ordering::Acquire);
+    if st != LADDER_IRQ_PARKED {
+        serial_println!(
+            ":: KVBLANK8: rung3 state={} note={} ::",
+            match st { LADDER_IRQ_ARM | LADDER_IRQ_RUN => "running", LADDER_DONE => "done", _ => "not-parked" },
+            if st == LADDER_DONE { "rung-3-already-ran-this-boot-its-close-line-above-is-the-window" } else { "rung-3-not-parked-the-instrument-waits-for-it" },
+        );
+        return;
+    }
+    if LADDER.compare_exchange(LADDER_IRQ_PARKED, LADDER_IRQ_ARM, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
+    // The arm runs on the next edge; the window is IRQ_WINDOW_VBLANKS edges (1 s at 60 Hz). Bounded 5 s.
+    let mut w = 0u32;
+    while matches!(LADDER.load(Ordering::Acquire), LADDER_IRQ_ARM | LADDER_IRQ_RUN) && w < 500 {
+        crate::arch::sched::sleep_ms(10);
+        w += 1;
+    }
+    let (irq, vbl) = (GT_R3_IRQ.load(Ordering::Relaxed), GT_R3_VBL.load(Ordering::Relaxed));
+    let kept = IRQ_KEPT.load(Ordering::Acquire);
+    let open = matches!(LADDER.load(Ordering::Acquire), LADDER_IRQ_ARM | LADDER_IRQ_RUN);
+    serial_println!(
+        ":: KVBLANK8: rung3 irq={} vbl_delta={} ratio_pct={} kept={} window={} -> {} ::",
+        irq, vbl, irq.saturating_mul(100) / vbl.max(1), kept as u32,
+        if open { "still-open-after-5s" } else { "closed" },
+        if kept && !open { "PASS" } else { "FAIL" },
+    );
+}
+
+
+// ── GPUTESTS M5 (B334) — `pace_err_ppm=`: the real frame period against the TSC ──────────────────────────────────
+//
+// Flight 19's `kvblank selftest arm=wait sim=timer … waited_us=16833 bound=waited_us<=16667 FAIL` was read as a 1 %
+// pace error. It is ONE wait on a SIMULATED counter (the timer, not the display), so it measures the wait loop's
+// overshoot past one edge, not a clock. The census now times the hardware frame counter edge-to-edge on the TSC over
+// its whole ~1 s window: `pace_err_ppm` near 0 clears the display clock; a large `isr_pace_err_ppm` with a small
+// `pace_err_ppm` convicts delivery, not the panel.
+
+/// The nominal frame the error is taken against, in µs (60 Hz).
+const GT_FRAME_US: u64 = 16_667;
+
+/// Spin (bounded 50 ms) until `HEAD_STAT.VERT[31:16]` ticks; return `(tsc at the tick, the new frame count)`,
+/// or `(0, 0)` when no tick came.
+fn gt_frame_edge(bar0: usize, head: usize) -> (u64, u32) {
+    let reg = regs::NV_PDISPLAY_BASE + 0x6000 + head * 0x800 + 0x340;
+    let f0 = unsafe { mmio_read(bar0, reg) } >> 16;
+    let t0 = crate::arch::now_cycles();
+    let budget = us_to_cycles(50_000);
+    loop {
+        let f = unsafe { mmio_read(bar0, reg) } >> 16;
+        let t = crate::arch::now_cycles();
+        if f != f0 {
+            return (t, f);
+        }
+        if t.saturating_sub(t0) > budget {
+            return (0, 0);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// `period_us_x1000` → signed ppm against [`GT_FRAME_US`].
+fn gt_ppm_x1000(period_us_x1000: u64) -> i64 {
+    let nom = (GT_FRAME_US * 1000) as i64;
+    (period_us_x1000 as i64 - nom).saturating_mul(1_000_000) / nom
+}
+
+/// `(mean waited_us per frame, pace_err_ppm)` from the census's edge-aligned window; `(0, 0)` with no frames.
+fn gt_pace(c: &Kv8Census) -> (u64, i64) {
+    if c.pace_frames == 0 {
+        return (0, 0);
+    }
+    let x1000 = c.pace_us.saturating_mul(1000) / c.pace_frames;
+    (x1000 / 1000, gt_ppm_x1000(x1000))
 }

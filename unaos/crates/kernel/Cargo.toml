@@ -3750,8 +3750,9 @@ prefs_reset = []
 # answers `kblit-channel-absent` and the CPU blitter is selected (`[wc] blitter=cpu reason=…` once at the
 # compositor ignition); any GPU blit error falls back to the CPU for that frame (`gpu_fallback=`). x86 only,
 # pairs with UNAOS_WC=1. Off: the probe answers `feature-off` and nothing else changes. Kept in sync with
-# `unaos/arroyo` (the x86 `_feats` arm) and `unaos/builder/src/main.rs`.
-wc_gpublit = []
+# `unaos/arroyo` (the x86 `_feats` arm) and `unaos/builder/src/main.rs`. GPUTESTS M3 (B334): implies `wc` —
+# the blitter sits under the window compositor and is meaningless without it.
+wc_gpublit = ["wc"]
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
