@@ -340,6 +340,7 @@ pirast|:: RAST: no mailbox framebuffer (headless boot) — cube demo skipped ::|
 desktop_firmware|[deskfw] activate DECLINE reason=no-panel|@arch:aarch64|measured(1)
 quarry|[quarry] DECLINE reason=dock-cannot-host-full-strip panel=|-|measured(1)
 wedge2|-|no gated string literal anywhere under cfg(feature="wedge2") — the knob only re-times an existing path; certify it from its serial witness, not from the artifact|unmeasured-here
+selfhost|:: SELFHOST:|-|measured
 TABLE
 }
 
@@ -382,7 +383,7 @@ REGISTERED
 bc_controls() {
 cat <<'CONTROLS'
 instgui|[wc-x] instgui install-go with NO committed target
-selfhost|:: SELFHOST:|-|measured
+selfhost|:: SELFHOST: src payload holds no regular files -> FAIL ::
 holocron|:: [hcron] framing fixture leg=roundtrip -> FAIL
 videobench|:: vperf: fbmem no framebuffer registered ::
 irqstorage|irqstorage::submit called off a scheduled task
