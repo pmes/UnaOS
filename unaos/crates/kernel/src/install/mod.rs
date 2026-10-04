@@ -749,3 +749,8 @@ fn demo_multicluster_dir<T: InstallTarget>(
 // compile an x86 partition fixture it can never reach.
 #[cfg(feature = "installdemo")]
 pub mod partition;
+
+// SELFINSTALL2 M2 (rmbp-ledger B310): the UnaFS leg of `install ssd --write` (sector clone of the running
+// volume + fsck of the copy). Gated on exactly its consumer, `selfinstall`, plus the `unafs` module it reads.
+#[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci", feature = "unafs"))]
+pub mod unafsmirror;
