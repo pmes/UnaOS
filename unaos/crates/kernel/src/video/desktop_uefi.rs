@@ -454,6 +454,7 @@ pub fn activate_on(desc: SurfaceDesc) {
         fb.flush_all();
     }
     super::wcpar::start(); #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))] crate::drivers::gpu::kepler_vblank::pump_spawn_once(); // KVBLANK6 — task context; WCPAR — band workers exist before the first composite; prints `[wcpar] pool=`
+    super::blitter::ignite(); // KCOMP (B321): pick the blitter in task context, beside the band workers; prints `[wc] blitter=<cpu|gpu> reason=…` once
     crate::splash::hold_open(); // SPLASHX86: the splash row goes up NOW — above every window minted below, until `users::stage_publish` releases it
     serial_println!(
         "[wc-x] desktop-clear panel={}x{} bg={:08X}",

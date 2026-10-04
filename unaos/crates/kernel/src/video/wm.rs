@@ -21222,7 +21222,7 @@ fn stage_window(
         // tear-free contract is unchanged — a span is as atomic as a row was. What changes is only
         // which bytes are published, and the bytes withheld are bytes the pass is about to overwrite
         // from the window that owns them.
-        comp_mark(r.id, 33); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let par = clip.n == 0 && super::wcpar::par_blit(fb, &stage[..rows * row_bytes], row_bytes, (by + band) * fb_row + bx * bpp, fb_row, rows); #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] let par = false;
+        comp_mark(r.id, 33); let par = clip.n == 0 && super::blitter::present_band(r.id, fb, &layer, bx, by + band, bw, rows); // KCOMP (B321) — the no-clip present goes through the selected blitter (CpuBlitter = WCPAR's par_blit, then the traced row loop it replaced); `par` false leaves the inline loop below to copy
         for y in 0..rows {
             let src = y * row_bytes;
             let py = by + band + y;
@@ -30059,3 +30059,10 @@ pub fn modal_top_held() -> bool {
     MODAL_WIN.load(core::sync::atomic::Ordering::Acquire) != WIN_NONE
 }
 
+
+/// KCOMP — one present row for `blitter::CpuBlitter`'s serial arm: the row gauge, then the traced blit —
+/// exactly the pair `stage_window`'s inline loop ran per row (WCSER-H / WEDGESRC keep naming the row).
+pub(super) fn kcomp_row(fb: &super::FrameBuffer, byte_offset: usize, src: &[u8], py: usize) {
+    comp_mark_row(py);
+    blit_traced(fb, byte_offset, src);
+}

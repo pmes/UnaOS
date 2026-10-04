@@ -3751,6 +3751,14 @@ netring3 = []
 # `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 prefs_reset = []
 
+# KCOMP (rmbp-ledger B321; docs/dev/evidence/rmbp-1005/KCOMP.md): UNAOS_WC_BLITTER=gpu asks the compositor
+# for the Kepler copy-engine blitter (video/blitter.rs GpuBlitter). Until KBLIT binds its channel the probe
+# answers `kblit-channel-absent` and the CPU blitter is selected (`[wc] blitter=cpu reason=…` once at the
+# compositor ignition); any GPU blit error falls back to the CPU for that frame (`gpu_fallback=`). x86 only,
+# pairs with UNAOS_WC=1. Off: the probe answers `feature-off` and nothing else changes. Kept in sync with
+# `unaos/arroyo` (the x86 `_feats` arm) and `unaos/builder/src/main.rs`.
+wc_gpublit = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

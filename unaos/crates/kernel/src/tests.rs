@@ -133,6 +133,8 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win();
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); // FILETYPE (B307): `tests filetype`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet();
+    crate::video::blitter::ensure_tests(); // KCOMP (B321): `tests blitter`.
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
