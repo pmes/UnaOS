@@ -975,6 +975,17 @@ fn main() {
         println!("   PREFS: target/PREFS-X86.ELF absent — ESP has no PREFS.BIN (run via ./arroyo esp-x86)");
     }
 
+    // LUMENBIN (B305): the ring-3 chat window (crates/user-lumen, built by arroyo's build_user_lumen_x86 to
+    // target/LUMEN-X86.ELF), staged as APPS/LUMEN.BIN beside PREFS.BIN — `lumen` (= `bg /apps/LUMEN.BIN`)
+    // opens it; it speaks the chat verbs VEIN.BIN fulfils.
+    let lumen_elf = target_dir.join("LUMEN-X86.ELF");
+    if lumen_elf.exists() {
+        std::fs::copy(&lumen_elf, esp_apps.join("LUMEN.BIN")).unwrap();
+        println!("   LUMEN: copied LUMEN.BIN into APPS/ on the ESP (lumen / bg /apps/LUMEN.BIN)");
+    } else {
+        println!("   LUMEN: target/LUMEN-X86.ELF absent — ESP has no LUMEN.BIN (run via ./arroyo esp-x86)");
+    }
+
     // -----------------------------------------------------------------------------------------
     // WINX-7 PKG — the DATA tree: the EL0 artifacts staged for the volume the RUNNING KERNEL reads.
     //
@@ -1034,6 +1045,8 @@ fn main() {
         (target_dir.join("PULSE-X86.ELF"), "PULSE.ELF"),
         // BANDY3 M3: the prefs fulfiller rides the DATA volume too — `bg /apps/PREFS.BIN` reads it there.
         (target_dir.join("PREFS-X86.ELF"), "PREFS.BIN"),
+        // LUMENBIN: the chat window rides the DATA volume too — `lumen` reads it there.
+        (target_dir.join("LUMEN-X86.ELF"), "LUMEN.BIN"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();
