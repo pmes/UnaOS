@@ -276,7 +276,7 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   **Never write to `/tmp`** (Peter, standing since 2026-08-19: 3-day clear and RAM-backed; it
   OOM-killed a session): every temp path, FIFO, lock and mktemp default is under
   `~/unaos-bench/scratch/<seat>/`.
-- **Dependencies: latest stable, always** (Peter 2026-07-21). Never a pre-release, never a downgrade.
+- **Dependencies: built in UnaOS whenever possible; otherwise latest stable, always** (Peter 2026-07-21, amended R83 2026-10-04). Never a downgrade. A pre-release only when a feature UnaOS needs is only there yet, named in the doc. A crate that does the work of a capability UnaOS claims (decoding, crypto, TLS, layout) is chicken wire: the ledger names it until a UnaOS core replaces it.
 - **Docs:** the brief-named doc updates as part of DONE; professional voice; the lore voice only in
   `docs/CODEX.md` and `MEMORIA.md`; re-verify line numbers when touching prose around them (a
   drifted citation defeats the one check a reader runs). Vessels in `vessels/`, CLI in `tools/`.
