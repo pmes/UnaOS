@@ -3806,10 +3806,10 @@ build_user_lumen_x86() {
 # syscalls answer the unknown-syscall default and it says so in its verdict line).
 build_user_net_x86() {
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
-    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 network client static-ELF program (crates/user-net → target/NET-X86.ELF)...${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 network client static-ELF program (crates/user-net → target/NET-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-net"
-    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x10000" \
       cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
@@ -3820,10 +3820,8 @@ build_user_net_x86() {
     [ "$fmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF does not start with the ELF magic; first 4 bytes = ${fmag}${COLOR_RESET}"; exit 1; }
     local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/NET-X86.ELF" | tr -d ' \n')"
     [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
-    local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/NET-X86.ELF" | tr -d ' ')"
-    [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
-    bash "${WORKSPACE_DIR}/scripts/elf-entry-check.sh" "${WORKSPACE_DIR}/target/NET-X86.ELF" || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF cannot run at its entry (LUMENCRASH gate)${COLOR_RESET}"; exit 1; }   # LUMENCRASH M4 (B326)
-    echo -e "${COLOR_GREEN}✅ x86 static-ELF ring-3 network client program: NET-X86.ELF (${psz} B)${COLOR_RESET}"
+    user_elf_window_check "${WORKSPACE_DIR}/target/NET-X86.ELF" "NET-X86.ELF"   # RING3ABI2 M4 (B333): was `[ size -le 16384 ]` + a bare elf-entry-check; NET.ELF now links at the ELF window (user-net-x86.ld, the user-big shape), and the gate runs elf-entry-check.sh itself
+    echo -e "${COLOR_GREEN}✅ x86 static-ELF ring-3 network client program: NET-X86.ELF (ELF window)${COLOR_RESET}"
 }
 
 # RING3WIN M4 (B316): build BIG.ELF — the ELF-window proof program (crates/user-big → target/BIG-X86.ELF),

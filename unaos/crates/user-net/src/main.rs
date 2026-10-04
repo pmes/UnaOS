@@ -16,7 +16,9 @@
 //
 // One witness line: `:: NETRING3: resolve=<ip> connect=<0|err> http=<status> tls=<skip|...> -> PASS|SKIP|FAIL ::`.
 // SKIP (never FAIL) when the resolve finds no link or no answer: a dark NIC is not a broken program.
-// There is no argv for ring-3 programs yet, so the host is fixed (OWED: `NET.ELF tls <host>`).
+// RING3ABI2 (B333): the host is `argv[1]` (`net example.com`, `run /apps/NET.ELF example.com`), read
+// from the args page (`una_abi::args()`); with no word it is api.anthropic.com. The witness line adds
+// `host=<host> argc=<n>`. NET.ELF now links at the ELF window (user-net-x86.ld, the user-big shape).
 //
 // ---------------------------------------------------------------------------------------------
 // Syscall stubs — the user-prefs stubs verbatim (see user-pulse for the register-clobber contract).
@@ -171,6 +173,8 @@ mod sysabi {
 use sysabi::{sys0, sys1, sys2, sys3};
 
 const HOST: &[u8] = b"api.anthropic.com";
+/// The longest host name accepted from argv (DNS's 253, rounded).
+const HOST_MAX: usize = 255;
 const PORT: u16 = 80;
 /// Connect polls (x 50 ms) before giving up: 10 s.
 const CONNECT_TRIES: u32 = 200;
@@ -286,18 +290,25 @@ impl Sock {
 
 /// The verdict line. `resolve`/`connect`/`http` are pre-rendered cells.
 fn verdict(l: &mut Line, tail: &[u8]) -> ! {
-    l.s(b" tls=skip reason=window -> ").s(tail).s(b" ::").print();
+    l.s(b" tls=skip reason=lumen -> ").s(tail).s(b" ::").print(); // RING3ABI2: the window no longer refuses TLS; LUMEN.ELF carries it
     exit(0)
 }
 
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
+    // 0. argv — RING3ABI2 M2 (B333): the host is argv[1] when given.
+    let args = una_abi::args();
+    let argc = args.map(|a| a.argc()).unwrap_or(0);
+    let host: &[u8] = match args.and_then(|a| a.get(1)) {
+        Some(h) if !h.is_empty() && h.len() <= HOST_MAX => h,
+        _ => HOST,
+    };
     // 1. entropy
     let mut seed = [0u8; 32];
     let got = unsafe { sys2(SYS_GETRANDOM, seed.as_mut_ptr() as u64, seed.len() as u64) } as i64;
     let mut l = Line::new();
-    l.s(b":: NETRING3: rand=").i(got);
+    l.s(b":: NETRING3: host=").s(host).s(b" argc=").u(argc as u64).s(b" rand=").i(got);
     if got != 32 || seed == [0u8; 32] {
         l.s(b" resolve=skip connect=skip http=skip");
         verdict(&mut l, b"FAIL reason=getrandom");
@@ -305,7 +316,7 @@ pub extern "C" fn _start() -> ! {
 
     // 2. resolve
     let mut out = [0u8; RESOLVE_OUT_LEN];
-    let r = unsafe { sys3(SYS_RESOLVE, HOST.as_ptr() as u64, HOST.len() as u64, out.as_mut_ptr() as u64) } as i64;
+    let r = unsafe { sys3(SYS_RESOLVE, host.as_ptr() as u64, host.len() as u64, out.as_mut_ptr() as u64) } as i64;
     l.s(b" resolve=");
     if r != 0 {
         l.s(b"err").i(r).s(b" connect=skip http=skip");
@@ -344,8 +355,13 @@ pub extern "C" fn _start() -> ! {
     }
 
     // 4. http
-    let req: &[u8] = b"GET / HTTP/1.0\r\nHost: api.anthropic.com\r\nUser-Agent: UnaOS-NET/1\r\nConnection: close\r\n\r\n";
-    if let Err(e) = sock.write_all(req) {
+    let mut req = [0u8; 64 + HOST_MAX + 64];
+    let mut rn = 0usize;
+    for part in [&b"GET / HTTP/1.0\r\nHost: "[..], host, &b"\r\nUser-Agent: UnaOS-NET/1\r\nConnection: close\r\n\r\n"[..]] {
+        req[rn..rn + part.len()].copy_from_slice(part);
+        rn += part.len();
+    }
+    if let Err(e) = sock.write_all(&req[..rn]) {
         sock.close();
         l.s(b" http=send").i(e);
         verdict(&mut l, b"FAIL reason=send");
