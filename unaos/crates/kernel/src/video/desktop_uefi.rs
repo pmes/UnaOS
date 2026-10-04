@@ -830,7 +830,7 @@ pub fn desktop_app_service() {
         );
         return;
     }
-    let cap = crate::arch::syscall::user_window_size();
+    let cap = crate::arch::syscall::user_image_cap(); // RING3WIN: the image cap (4 MiB); the loader decides the model
     if de.size == 0 || de.size as usize > cap {
         serial_println!(
             "[wc-x] desktop-app DECLINE reason=size name=/{} bytes={} cap={} (the ring-3 program window)",

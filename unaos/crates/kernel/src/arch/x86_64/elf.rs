@@ -82,7 +82,19 @@ pub struct ElfPlan {
     pub min_vaddr: u64,
     pub segs: [ElfSeg; MAX_LOAD_SEGS],
     pub nsegs: usize,
+    /// RING3WIN: true = the elf model (lowest PT_LOAD at or above `USER_BASE + memory::XWIN_OFF`; p_vaddr
+    /// are ABSOLUTE ring-3 VAs inside the ELF window, linked there). false = the fixed 16 KiB model. In an
+    /// elf-model plan `entry`, `min_vaddr`, `max_end` and every `segs[i].vaddr` are rebased to WINDOW
+    /// OFFSETS (VA - USER_BASE) by `validate_elf_model`, so the mapper speaks offsets in both models.
+    pub model_elf: bool,
+    /// RING3WIN: the elf model's stack bytes (PT_GNU_STACK p_memsz page-rounded, or the 64 KiB default).
+    pub stack: usize,
+    /// RING3WIN: the elf model's highest segment end (window offset) — the heap starts at the next page.
+    pub max_end: u64,
 }
+
+/// RING3WIN: `PT_GNU_STACK` — its p_memsz (set by `-z stack-size=`) is the elf model's stack request.
+const PT_GNU_STACK: u32 = 0x6474_E551;
 
 /// True iff `b` begins with the ELF magic (`\x7fELF`). The dispatch between the ELF loader and the flat
 /// fallback — a flat `.BIN` never begins with this magic (the x86 blobs start with `xor`/`mov`), so they
@@ -144,9 +156,14 @@ pub fn validate_elf(b: &[u8], win_size: usize) -> Result<ElfPlan, &'static str> 
     let mut segs = [ElfSeg { off: 0, vaddr: 0, filesz: 0, memsz: 0, flags: 0 }; MAX_LOAD_SEGS];
     let mut nsegs = 0usize;
     let mut min_vaddr = u64::MAX;
+    let mut stack_req = 0usize;
     for i in 0..e_phnum {
         let ph = e_phoff + i * PHDR_SIZE;
         let p_type = rd_u32(b, ph).ok_or("bad p_type")?;
+        if p_type == PT_GNU_STACK {
+            stack_req = rd_u64(b, ph + 40).ok_or("bad p_memsz")? as usize; // RING3WIN: the stack request
+            continue;
+        }
         if p_type != PT_LOAD {
             continue; // ignore PT_GNU_STACK / PT_PHDR / etc. — a minimal loader maps only PT_LOAD
         }
@@ -179,6 +196,9 @@ pub fn validate_elf(b: &[u8], win_size: usize) -> Result<ElfPlan, &'static str> 
     }
     if nsegs == 0 {
         return Err("no PT_LOAD segments");
+    }
+    if min_vaddr >= super::syscall::user_base() + memory::XWIN_OFF as u64 {
+        return validate_elf_model(e_entry, min_vaddr, segs, nsegs, stack_req);
     }
     // Every segment must fit the slot's user window once biased so min_vaddr maps to the window base.
     let mut entry_in_exec = false;
@@ -235,7 +255,54 @@ pub fn validate_elf(b: &[u8], win_size: usize) -> Result<ElfPlan, &'static str> 
     if !entry_in_exec {
         return Err("entry not in an executable segment");
     }
-    Ok(ElfPlan { entry: e_entry, min_vaddr, segs, nsegs })
+    Ok(ElfPlan { entry: e_entry, min_vaddr, segs, nsegs, model_elf: false, stack: 0, max_end: 0 })
+}
+
+/// RING3WIN: the elf-model half of [`validate_elf`] — every segment (p_vaddr = absolute VA in the ELF
+/// window) plus the stack and its guard page must fit the window; anything larger is refused `-ENOMEM`
+/// with a line. Rebases every address to a window offset before returning.
+fn validate_elf_model(
+    e_entry: u64,
+    min_vaddr: u64,
+    mut segs: [ElfSeg; MAX_LOAD_SEGS],
+    nsegs: usize,
+    stack_req: usize,
+) -> Result<ElfPlan, &'static str> {
+    let base = super::syscall::user_base();
+    let e_entry = e_entry.checked_sub(base).ok_or("entry below the window base")?;
+    let min_vaddr = min_vaddr - base;
+    for s in &mut segs[..nsegs] {
+        s.vaddr -= base; // >= min_vaddr >= base, checked by the caller's branch
+    }
+    let top = (memory::XWIN_OFF + memory::XWIN_BYTES) as u64;
+    let stack = if stack_req == 0 { una_abi::USER_STACK_DEFAULT as usize } else { (stack_req + 0xFFF) & !0xFFF };
+    if stack > una_abi::USER_STACK_MAX as usize {
+        serial_println!(":: RING3WIN: refused stack={} max={} -ENOMEM ::", stack, una_abi::USER_STACK_MAX);
+        return Err("RING3WIN: declared stack exceeds the 1 MiB cap (-ENOMEM)");
+    }
+    let limit = top - stack as u64 - memory::PAGE_4K; // the guard page sits between image/heap and stack
+    let mut max_end = 0u64;
+    let mut entry_in_exec = false;
+    for s in &segs[..nsegs] {
+        let end = s.vaddr.checked_add(s.memsz as u64).ok_or("segment span overflow")?;
+        if end > max_end {
+            max_end = end;
+        }
+        if s.flags & PF_X != 0 && e_entry >= s.vaddr && e_entry < end {
+            entry_in_exec = true;
+        }
+    }
+    if max_end > limit {
+        serial_println!(
+            ":: RING3WIN: refused image span={} stack={} cap={} -ENOMEM ::",
+            max_end - min_vaddr, stack, memory::XWIN_BYTES
+        );
+        return Err("RING3WIN: image + stack exceed the 4 MiB ELF window (-ENOMEM)");
+    }
+    if !entry_in_exec {
+        return Err("entry not in an executable segment");
+    }
+    Ok(ElfPlan { entry: e_entry, min_vaddr, segs, nsegs, model_elf: true, stack, max_end })
 }
 
 /// The result of [`map_image_into_slot`]: the ring-3 run parameters.
@@ -298,7 +365,11 @@ pub fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
     let base = super::syscall::user_base();
     let size = super::syscall::user_window_size();
     let elf_plan = if is_elf_image(bytes) {
-        Some(validate_elf(bytes, size).map_err(MapErr::BadElf)?)
+        let plan = validate_elf(bytes, size).map_err(MapErr::BadElf)?;
+        if plan.model_elf {
+            return map_elf_model(bytes, &plan); // RING3WIN: the image asked for the ELF window
+        }
+        Some(plan)
     } else {
         // FLAT path: the historical U2 model — one code page, entered at offset 0,
         // position-independent. Keep the exact one-page bound.
@@ -349,6 +420,9 @@ pub fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
             (base, 1, false)
         }
     };
+    // RING3WIN: a fixed-model program's heap is the whole ELF window (its stack stays in the classic one).
+    unsafe { memory::xwin_free(slot) };
+    memory::xwin_set_heap(slot, memory::XWIN_OFF as u64, (memory::XWIN_OFF + memory::XWIN_BYTES) as u64);
     Ok(Mapped {
         entry,
         sp: (base + size as u64) & !0xF, // 16-aligned window top = the initial ring-3 RSP
@@ -357,5 +431,67 @@ pub fn map_image_into_slot(bytes: &[u8]) -> Result<Mapped, MapErr> {
         len: bytes.len(),
         is_elf,
         nsegs,
+    })
+}
+
+/// RING3WIN: place an elf-model image (validated) into a fresh slot's ELF window: every PT_LOAD page
+/// mapped from the heap with its segment's rights (shared pages take the union; W+X refused), the file
+/// bytes copied through the identity alias (frames arrive zeroed, so the BSS tail is zero), the stack
+/// mapped eagerly at the window top with an unmapped guard page beneath, the heap armed from the page after
+/// the highest segment to the guard. Any failure releases the slot through the ordinary teardown.
+fn map_elf_model(bytes: &[u8], plan: &ElfPlan) -> Result<Mapped, MapErr> {
+    let base = super::syscall::user_base();
+    let slot = memory::alloc_user_space().ok_or(MapErr::NoSlot)?;
+    unsafe {
+        memory::xwin_free(slot);
+        // The classic window is mapped by `build_slot` regardless; scrub it so a recycled slot leaks nothing.
+        core::ptr::write_bytes(memory::slot_backing_ptr(slot), 0, super::syscall::user_window_size());
+    }
+    let fail = |why: &'static str| -> Result<Mapped, MapErr> {
+        serial_println!(":: RING3WIN: refused slot={} reason={} -ENOMEM ::", slot, why);
+        crate::arch::memory::free_user_space_by_cr3(memory::slot_cr3(slot));
+        Err(MapErr::BadElf(why))
+    };
+    let pg = memory::PAGE_4K;
+    for s in &plan.segs[..plan.nsegs] {
+        let (w, x) = (s.flags & PF_W != 0, s.flags & PF_X != 0);
+        let mut p = s.vaddr & !(pg - 1);
+        let end = (s.vaddr + s.memsz as u64 + pg - 1) & !(pg - 1);
+        while p < end {
+            if unsafe { memory::xwin_map_page(slot, p as usize, w, x) }.is_err() {
+                return fail("RING3WIN: out of frames, or segments share a page with conflicting W/X");
+            }
+            p += pg;
+        }
+    }
+    for s in &plan.segs[..plan.nsegs] {
+        if !memory::xwin_copy_in(slot, s.vaddr as usize, &bytes[s.off..s.off + s.filesz]) {
+            return fail("RING3WIN: segment copy hit an unmapped page");
+        }
+    }
+    let top = (memory::XWIN_OFF + memory::XWIN_BYTES) as u64;
+    let stack_lo = top - plan.stack as u64;
+    let mut p = stack_lo;
+    while p < top {
+        if unsafe { memory::xwin_map_page(slot, p as usize, true, false) }.is_err() {
+            return fail("RING3WIN: out of frames mapping the stack");
+        }
+        p += pg;
+    }
+    let heap_lo = (plan.max_end + pg - 1) & !(pg - 1);
+    memory::xwin_set_heap(slot, heap_lo, stack_lo - pg);
+    serial_println!(
+        ":: RING3WIN: model=elf slot={} segs={} span={} stack={} heap=[{:#x},{:#x}) frames={} ::",
+        slot, plan.nsegs, plan.max_end - plan.min_vaddr, plan.stack, base + heap_lo, base + stack_lo - pg,
+        memory::xwin_live_pages()
+    );
+    Ok(Mapped {
+        entry: base + plan.entry,
+        sp: (base + top) & !0xF,
+        cr3: memory::slot_cr3(slot),
+        slot,
+        len: bytes.len(),
+        is_elf: true,
+        nsegs: plan.nsegs as u32,
     })
 }

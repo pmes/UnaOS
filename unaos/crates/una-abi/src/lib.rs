@@ -1070,3 +1070,57 @@ mod attrsurf_tests {
         std::println!(":: ATTRSURF-ABI: wire hdr={} value_max={} syscalls=51..=55 bus=11..=15 -> PASS ::", ATTR_WIRE_HDR_LEN, ATTR_VALUE_MAX);
     }
 }
+
+// =================================================================================================
+// RING3WIN (rmbp-ledger B316) — the ELF window. A UnaOS ring-3 program gets the address space its ELF
+// asks for: beside the classic 16 KiB window at the window base (and the FB hole above it, which is ABI
+// and does not move), every address space carries a second window at `base + USER_XWIN_OFF` of
+// `USER_WINDOW_BYTES`. An image whose lowest PT_LOAD p_vaddr is `>= USER_XWIN_VA_X86` is placed there
+// (p_vaddr = the absolute VA `USER_XWIN_VA_X86 + …`); its stack sits at the top (PT_GNU_STACK p_memsz or
+// `USER_STACK_DEFAULT`) and `SYS_SBRK` grows its heap from the page after its highest segment. An image
+// linked at 0 keeps the fixed 16 KiB model unchanged, and gets the whole ELF window as its heap.
+// arroyo's `USER_WINDOW_BYTES` and the kernel's constant are proven equal to this one by
+// `unaos/scripts/window-parity.sh`.
+// =================================================================================================
+
+/// Grow (or query, delta 0; or shrink, delta < 0) the caller's heap. Returns the OLD break VA, or a
+/// negative errno (`ENOMEM` past the cap / the stack guard / out of frames). Additive after NETRING3's
+/// 56 (SYS_GETRANDOM) and 57 (SYS_RESOLVE).
+pub const SYS_SBRK: u64 = 58;
+/// Out of memory — the ELF window cap, or the kernel heap, refused the request.
+pub const ENOMEM: i64 = -12;
+/// Byte offset of the ELF window from the ring-3 window base: PD entry 1 of the slot's user PDPT, clear
+/// of the 2 MiB the classic window + FB hole live in.
+pub const USER_XWIN_OFF: u64 = 0x20_0000;
+/// x86_64: the ring-3 window base (USER_BASE, PML4 index 2 = 1 TiB) — the kernel asserts it equals its own.
+pub const USER_BASE_X86: u64 = 0x0000_0100_0000_0000;
+/// x86_64: the ELF window's absolute VA. An elf-model program LINKS here (`. = 0x10000200000;` in its
+/// linker script): its p_vaddr are real addresses, so absolute pointers in its data (vtables, `&str` in
+/// statics, `core::fmt`) are correct with no relocation — the linuxabi shape (fixed vaddrs).
+pub const USER_XWIN_VA_X86: u64 = USER_BASE_X86 + USER_XWIN_OFF;
+/// The ELF window size = the per-program cap (image span + stack + guard, or heap): 4 MiB.
+pub const USER_WINDOW_BYTES: u64 = 4 << 20;
+/// The stack an elf-model program gets when its ELF declares none (no PT_GNU_STACK or p_memsz 0).
+pub const USER_STACK_DEFAULT: u64 = 64 << 10;
+/// The largest stack an elf-model program may declare.
+pub const USER_STACK_MAX: u64 = 1 << 20;
+/// The classic fixed program window (code + data + two stack pages) — unchanged since U1a.
+pub const USER_FIXED_WINDOW_BYTES: u64 = 16 << 10;
+
+const _: () = assert!(USER_XWIN_OFF % (2 << 20) == 0 && USER_WINDOW_BYTES % (2 << 20) == 0);
+const _: () = assert!(USER_STACK_MAX + 4096 < USER_WINDOW_BYTES && USER_STACK_DEFAULT <= USER_STACK_MAX);
+const _: () = assert!(SYS_SBRK > SYS_STAT + 2); // 56/57 are NETRING3's
+
+#[cfg(test)]
+mod ring3win_tests {
+    extern crate std;
+    use super::*;
+    #[test]
+    fn ring3win_window_constants() {
+        assert_eq!(SYS_SBRK, 58);
+        assert_eq!(USER_WINDOW_BYTES, 4_194_304);
+        assert!(USER_XWIN_OFF >= USER_FIXED_WINDOW_BYTES + 0x14_5000); // clear of the FB hole
+        assert_eq!(USER_XWIN_VA_X86, 0x0000_0100_0020_0000);
+        std::println!(":: RING3WIN-ABI: sbrk={} window={} xwin_off={:#x} -> PASS ::", SYS_SBRK, USER_WINDOW_BYTES, USER_XWIN_OFF);
+    }
+}

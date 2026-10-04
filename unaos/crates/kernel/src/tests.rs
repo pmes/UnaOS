@@ -129,7 +129,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win();
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
@@ -207,4 +207,14 @@ fn ensure_unafsx86() {
 fn ensure_attr() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) { register("attr", crate::fs::attrsys::selftest); }
+}
+
+/// RING3WIN (B316): register `tests ring3win` exactly once on x86 (the ELF window is x86's this arc; the
+/// fixture SKIPs when the volume carries no `/apps/BIG.BIN`).
+fn ensure_ring3win() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("ring3win", crate::arch::syscall::ring3win_selftest); }
+    }
 }
