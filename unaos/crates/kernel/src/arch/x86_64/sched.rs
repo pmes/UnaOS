@@ -6366,6 +6366,7 @@ fn run() -> ! {
                     let uc = unsafe { (*raw).user_cr3 };
                     { #[cfg(feature = "linuxabi")] if uc != 0 { crate::arch::linuxabi::on_dispatch(uc); } /* LINUXABI2: re-assert this process's FS_BASE per switch-in */ if uc != 0 { uc } else { crate::arch::memory::kernel_cr3() } }
                 };
+                #[cfg(feature = "linuxabi")] crate::arch::linuxabi::fpu::dispatch(cpu, unsafe { (*raw).user_cr3 }, unsafe { (*raw).name }, unsafe { (*raw).user_entry } != 0); // LINUXABI3: a Linux task gets CR4.OSFXSR + its FXSAVE image; a UnaOS ring-3 task gets OSFXSR cleared (its SSE #UD fence).
                 //
                 // VUGSPREAD adds one counter and no branch. `CR3_RELOADS` already counted the RARE
                 // arm — the generation-behind revalidation — but the arm that a MIGRATION actually
@@ -6454,6 +6455,7 @@ fn run() -> ! {
                 // free it is below).
                 stack_guard_check(cpu, raw);
 
+                #[cfg(feature = "linuxabi")] crate::arch::linuxabi::fpu::switch_out(cpu); // LINUXABI3: save a Linux task's x87/XMM file and scrub it before anything else runs on this core.
                 // --- The task switched back to us (yield / preempt / block / exit). IF=0. ---
                 SCHED[cpu].current.store(0, Ordering::Release);
                 SCHED[cpu].current_prio.store(PRIO_IDLE, Ordering::Release);

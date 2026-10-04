@@ -28,12 +28,13 @@
 //! window, files writable under `/home/<user>/` (`fd.rs`, `sys.rs`). Blocking syscalls are RETRY loops in [`dispatch`].
 //!
 //! Known limits: no threads/signals delivery (kill = end the task); fork copies eagerly (no CoW fault hook); FS_BASE is per-core, so every
-//! process is PINNED to one core (the scheduler hook re-asserts it per switch-in); files are slurped whole at open; no SSE for ring 3
-//! (CR4.OSFXSR=0), so SSE-compiled musl needs that fenced off first; the cloned low-memory page-table copy does not see kernel mapping
+//! process is PINNED to one core (the scheduler hook re-asserts it per switch-in); files are slurped whole at open; x87/SSE state is
+//! saved per process (LINUXABI3, `fpu.rs`: eager FXSAVE, CR4.OSFXSR only while a Linux task runs; no AVX); the cloned low-memory page-table copy does not see kernel mapping
 //! edits made while the process runs.
 
 pub mod elf;
 pub mod fd;
+pub mod fpu;
 pub mod proc;
 pub mod sys;
 

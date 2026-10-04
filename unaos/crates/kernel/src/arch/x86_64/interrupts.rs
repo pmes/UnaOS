@@ -31,6 +31,8 @@ const VEC_GP: u8 = 13; // general protection
 const VEC_PF: u8 = 14; // page fault
 const VEC_AC: u8 = 17; // alignment check
 const VEC_MC: u8 = 18; // machine check
+const VEC_MF: u8 = 16; // LINUXABI3: x87 floating-point error
+const VEC_XM: u8 = 19; // LINUXABI3: SIMD floating-point exception (CR4.OSXMMEXCPT)
 
 /// IDT vectors. This is a pure local-APIC system — there is no 8259 PIC, hence no PIC vector
 /// offset. THREE numbers are RESERVED BY NAME and cannot move: the APIC timer's `TIMER_VECTOR`,
@@ -369,6 +371,8 @@ lazy_static! {
         idt.divide_error.set_handler_fn(divide_error_handler);
         idt.bound_range_exceeded.set_handler_fn(bound_range_exceeded_handler);
         idt.alignment_check.set_handler_fn(alignment_check_handler);
+        idt.x87_floating_point.set_handler_fn(x87_fp_handler); // LINUXABI3: #MF, a ring-3-provokable vector like the ones above
+        idt.simd_floating_point.set_handler_fn(simd_fp_handler); // LINUXABI3: #XM (an unmasked SSE exception once OSXMMEXCPT is set)
         // All interrupts are delivered directly by the local APIC: the timer (heartbeat), the
         // allocated device vectors, the reschedule IPI, and the APIC spurious-interrupt vector.
         //
@@ -1255,4 +1259,28 @@ mod w5nmi {
             );
         }
     }
+}
+
+// --- LINUXABI3: the two FP exception vectors. A Linux task can unmask x87 (FCW) or SSE (MXCSR) exceptions; with CR0.NE and
+// CR4.OSXMMEXCPT set those arrive as #MF (16) / #XM (19). Same contract as the vectors above: kill from CPL 3, fatal from CPL 0
+// (the kernel is softfloat, so a CPL-0 FP exception is a kernel bug). Signal delivery (SIGFPE) is owed with LINUXABI signals. ---
+
+extern "x86-interrupt" fn x87_fp_handler(stack_frame: InterruptStackFrame) {
+    if from_ring3(&stack_frame) {
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+            ring3_fault_kill(VEC_MF, 0, stack_frame.instruction_pointer.as_u64(), 0);
+        }
+    }
+    fatal_fault("X87 FLOATING-POINT ERROR", VEC_MF, 0, &stack_frame);
+}
+
+extern "x86-interrupt" fn simd_fp_handler(stack_frame: InterruptStackFrame) {
+    if from_ring3(&stack_frame) {
+        unsafe {
+            core::arch::asm!("swapgs", options(nostack, preserves_flags));
+            ring3_fault_kill(VEC_XM, 0, stack_frame.instruction_pointer.as_u64(), 0);
+        }
+    }
+    fatal_fault("SIMD FLOATING-POINT EXCEPTION", VEC_XM, 0, &stack_frame);
 }
