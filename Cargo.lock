@@ -344,6 +344,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "av1_core"
+version = "0.1.0"
+
+[[package]]
 name = "avif-serialize"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

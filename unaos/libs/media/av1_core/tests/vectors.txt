@@ -1,0 +1,22 @@
+# AVCODEC test vectors — public AVIF files, fetched at test time (never committed).
+# Columns: name  sha256  bytes  url
+# Tests skip a vector (and say so) when it cannot be fetched (offline) — they never pass silently
+# on a mismatched hash: a wrong sha256 is a hard failure.
+# Sources: libavif test data, link-u/avif-sample-images, AOMediaCodec/av1-avif testFiles (see each repo for licence).
+white_1x1                                   ea4e43d1f07e4c00de16c13afa32376111bb306e51f08212cf4c1b6064df3667    305 https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/white_1x1.avif
+extended_pixi                               7de53620b571aa61f54df2fc00cfa32955cd4e474a6a4b723a513b51ef21e946    330 https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/extended_pixi.avif
+colors_sdr_srgb                             24463b9b79e4624d06e247079efddf624f9062c516d43ddf6fe5e150343629d6  18845 https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/colors_sdr_srgb.avif
+colors_text_sdr_srgb                        b38e0e8f818e0a6f7db2c12ef5da5937c4378d35adec2dc46e5a1c35c095af36  22288 https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/colors_text_sdr_srgb.avif
+kodim23_yuv420_8bpc                         fa97744b1bad2137cac0f81fb653175362e16c6d8d20613d0769a847f2769bd1  21032 https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/io/kodim23_yuv420_8bpc.avif
+kodim03_yuv420_8bpc                         e69c973a3ddf635412c9a0c6cda66798102d0030303614873b337f658983ef5d  25430 https://raw.githubusercontent.com/AOMediaCodec/libavif/main/tests/data/io/kodim03_yuv420_8bpc.avif
+fox.profile1.8bpc.yuv444.odd-width.odd-height fad3b6dd9cb99e6925858f69aafae3f68c861845f2c3d4a6d1c51c6161490134 89658 https://raw.githubusercontent.com/link-u/avif-sample-images/master/fox.profile1.8bpc.yuv444.odd-width.odd-height.avif
+fox.profile0.10bpc.yuv420                   811af5e96631309030a14cbc30c3bacfaa667f2e36e16a4f30434b8f5a23310c  83040 https://raw.githubusercontent.com/link-u/avif-sample-images/master/fox.profile0.10bpc.yuv420.avif
+fox.profile0.8bpc.yuv420.monochrome         15d84077066c47fdbe2a7b8ed583a17017d09a033144ac1b31486d6c8f6f5c82  69856 https://raw.githubusercontent.com/link-u/avif-sample-images/master/fox.profile0.8bpc.yuv420.monochrome.avif
+fox.profile2.12bpc.yuv422                   51476b8471e1c0a5ebbd1e7545709495bef619cc96c02d277aad32b1deff8ea9  90198 https://raw.githubusercontent.com/link-u/avif-sample-images/master/fox.profile2.12bpc.yuv422.avif
+Chimera_8bit_cropped_480x256                  d86d67a6c37e61dfa34e071116daa467afe6304b9ca110ab87ba898631f262fc  38534 https://raw.githubusercontent.com/AOMediaCodec/av1-avif/master/testFiles/Microsoft/Chimera_8bit_cropped_480x256.avif
+kids_720p                                     a68913ccfff7194f0de62de88e09b2d0b65df463aa98d00df068e17436759c98  57637 https://raw.githubusercontent.com/AOMediaCodec/av1-avif/master/testFiles/Microsoft/kids_720p.avif
+Irvine_CA                                     ee9b8544668ba71e584311be8eb590d0a92464aa24aa75ab05af92ab4c9ccf4c  28133 https://raw.githubusercontent.com/AOMediaCodec/av1-avif/master/testFiles/Microsoft/Irvine_CA.avif
+sdr_cosmos01000_cicp1-13-6_yuv420_limited_qp40 a8b8a5707bf0c09701a49802772a9b2a645baa212f329429dd9f9c5275796a69  12486 https://raw.githubusercontent.com/AOMediaCodec/av1-avif/master/testFiles/Netflix/avif/sdr_cosmos01000_cicp1-13-6_yuv420_limited_qp40.avif
+sdr_cosmos01000_cicp1-13-6_yuv444_full_qp40   87bdf7f8956811f68dc3fc425b87a28fefd86ee1cccb4e44ebb8c3888cddfff2  17026 https://raw.githubusercontent.com/AOMediaCodec/av1-avif/master/testFiles/Netflix/avif/sdr_cosmos01000_cicp1-13-6_yuv444_full_qp40.avif
+Monochrome                                    deeb37c2cf321d3ccacff085a6fed50cc774dd38d7ed271c15517ccd01bd7a4f   7436 https://raw.githubusercontent.com/AOMediaCodec/av1-avif/master/testFiles/Microsoft/Monochrome.avif
+fruits_2layer_thumbsize                       50946ccc489beec9e649f8f6bb63a18582043218afd1c1ee0df4c2cdf72b7e22  35527 https://raw.githubusercontent.com/AOMediaCodec/av1-avif/master/testFiles/Xiph/fruits_2layer_thumbsize.avif
