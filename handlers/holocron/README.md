@@ -1,55 +1,33 @@
-# Holocron — Secrets and Identity Handler
+# Holocron — Secrets ("The Key")
 
-**Status: design-stage (not yet implemented).** This directory currently contains
-only this design document; there is no crate, entry point, or working code yet.
+CODEX §2: keyring, SSH agent, wallet, biometric auth. HOLOCRON1 (LEDGER SR33) built the keyring, its bus
+surface, the SSH agent and the first consumer (Vein's Claude API key). Design, formats, oracles and the honest
+ceiling: [`docs/dev/evidence/host-1004/HOLOCRON1.md`](../../docs/dev/evidence/host-1004/HOLOCRON1.md).
 
-Holocron is the UnaOS handler responsible for **secrets management and identity**:
-a keyring for passwords, SSH keys, API tokens, and signing identities, together
-with the authentication agents that present those credentials to other
-components. It is the planned replacement for the role filled today by tools such
-as 1Password, the system keychain, `ssh-agent`, and `gpg-agent`.
+> **Until CRYPTOCORE (SR27) folds, the host build seals with the TEST suite (0xFE), which is not
+> cryptography.** The daemon says so on every start. `--features crypto_core` is the production suite.
 
-Like every UnaOS handler, Holocron is intended to be a self-contained domain
-service crate that exposes an async entry point (by convention `ignite(...)`),
-subscribes to the message bus, and reacts to messages — it does not call other
-handlers directly. See [`docs/dev/USERLAND/ARCHITECTURE.md`](../../docs/dev/USERLAND/ARCHITECTURE.md)
-for the handler/vessel model and [`docs/CODEX.md`](../../docs/CODEX.md) for the
-full handler manifest.
+## Layout
 
-## Planned responsibilities
+* `unaos/libs/sys/holocron_core` — `no_std`, zero dependencies: formats, ring, bus codec, dispatcher, agent
+  framing, consumer rule. Shared with the metal.
+* this crate — the host's I/O: `store` (`~/.holocron`), `unafs_store` (typed attributes), `principal`
+  (SO_PEERCRED), `daemon` (bus + agent sockets), `client`.
+* `tools/holocron` — the CLI.
 
-- **Vault** — a single encrypted store for passwords, SSH keys, API tokens, and
-  signing identities, with hardware-backed protection (TPM / Secure Enclave)
-  where available and a software cryptography backend otherwise.
-- **Memory hygiene** — secret material is zeroized as soon as it is no longer
-  needed and is never written to disk in plaintext.
-- **Unified agent** — one unlock action makes SSH, signing, and web credentials
-  available for the session, replacing the separate `ssh-agent` / `gpg-agent`
-  daemons.
-- **Context-aware authorization** — when another handler requests a credential
-  (for example a shell `sudo` from the Midden handler, or a Git push from the
-  Vairë handler), Holocron prompts for explicit confirmation out-of-band rather
-  than releasing keys automatically.
-- **Key lifecycle** — generation of modern keys (e.g. Ed25519) without raw
-  OpenSSL invocations, plus policy-driven rotation reminders.
-- **Credential injection** — supplies credentials to consumers without exposing
-  the underlying secret (e.g. bounded-lifetime clipboard entries, form fill via
-  the web handler) so the requesting component never sees the raw store.
+## Use
 
-## Integration with the Synapse / SMessage bus
+```sh
+holocron daemon &                       # bus: ~/.holocron/.bus.sock · agent: ~/.holocron/.agent.sock
+holocron init                           # the ring password (twice)
+holocron put vein claude.api_key --kind api-key --label Claude < keyfile
+holocron keygen id_ed25519 --label me@host
+eval "$(holocron agent-env)"; ssh-add -l
+holocron lock
+```
 
-Holocron is planned to follow the standard handler contract defined by `bandy`:
+## Bus verbs (144..=151)
 
-- It subscribes to the **Synapse** (the broadcast message bus) and reacts to
-  **`SMessage`** variants rather than being invoked directly.
-- Credential requests from other handlers and authorization
-  prompts/results are expected to be modeled as dedicated `SMessage` variants.
-  Adding such variants is a deliberate, reviewed change to the shared `SMessage`
-  enum and is **not yet defined**.
-
-## Scope notes
-
-This document describes intended behavior only. None of the cryptographic
-storage, agent, or bus integration described above exists in code yet; the
-specific `SMessage` variants, crate layout, and `ignite(...)` signature will be
-defined when implementation begins.
+`SecretGet(ns, name)`, `SecretPut(ns, name, kind, label, data)`, `SecretList(ns)`, `SecretDelete(ns, name)`,
+`Unlock(create?, password)`, `Lock`, `Sign(key, data)`, `Status`. Answered only to the ring's owner principal;
+unlock is rate-limited. Secrets never ride the `bandy` Synapse (a broadcast channel with no principal).
