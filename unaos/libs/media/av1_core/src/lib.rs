@@ -31,10 +31,20 @@ extern crate std;
 
 pub mod avif;
 pub mod bits;
+pub mod cdef;
+pub mod cdf;
+pub mod decode;
+pub mod image;
+pub mod loopfilter;
 pub mod obu;
+pub mod predict;
+pub mod restoration;
+pub mod symbol;
 pub mod tables;
+pub mod transform;
 
 pub use avif::{avif_payload, Obus};
+pub use image::{decode_avif, Image};
 
 /// Every way a decode can fail.
 #[derive(Debug, Clone, PartialEq, Eq)]

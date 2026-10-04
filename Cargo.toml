@@ -34,6 +34,7 @@ members = [
     "tools/unafs_bench",
     "tools/sentinel",
     "tools/foreman",
+    "tools/av1-check",
     "vessels/lumen",
     "vessels/pulse",
     "vessels/phonolite",

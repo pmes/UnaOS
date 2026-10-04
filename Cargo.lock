@@ -330,6 +330,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "av1-check"
+version = "0.1.0"
+dependencies = [
+ "av1_core",
+]
+
+[[package]]
 name = "av1-grain"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
