@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# NETRING3 M3 (rmbp-ledger B306): the COMPILE-ONLY TLS spike. It answers one question — does
+# `embedded-tls` (TLS 1.3 client, no_std, no alloc) build for the x86 ring-3 target, and what does a
+# handshake cost — and it is NOT in arroyo's USER_CHECK_MATRIX (it pulls crates.io deps; the matrix
+# crates are dependency-free). Measured 2026-10-04 on nightly-2026-07-15:
+#   builds: yes (default-features = false; atomics via portable-atomic; no alloc)
+#   .text 78025 B, .rodata 1850 B, .bss 20736 B (16640 B read record + 4096 B write record);
+#   stripped ELF 80824 B — against the 16 KiB x86 ring-3 window (memory.rs U3_WINDOW_PAGES = 4).
+# Build (from this directory; --unresolved-symbols because `sys` is a stand-in for the syscall stubs):
+#   RUSTFLAGS="-C link-arg=--unresolved-symbols=ignore-all" cargo +nightly build --release \
+#     -Z json-target-spec --target ../../../x86_64-unknown-none.json
+[workspace]
+
+[package]
+name = "tls-spike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+embedded-tls = { version = "0.19", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+embedded-io = "0.7"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true

@@ -1219,6 +1219,8 @@ fi
 [ -n "${UNAOS_LINUXABI:-}" ] && _feats="${_feats}linuxabi,"
 # BANDY3: UNAOS_BUSREG=1 arms fulfiller registration on the bus wire (crate::bus_route; `tests bandy3`). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_BUSREG:-}" ] && _feats="${_feats}busreg,"
+# NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM 56 / SYS_RESOLVE 57 for ring 3 and `tests net`. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_NETRING3:-}" ] && _feats="${_feats}netring3,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
@@ -3702,7 +3704,7 @@ build_user_pulse_x86() {
 # as APPS/PREFS.BIN by the builder. The exact shape of build_user_pulse_x86 above (same linker-script SHAPE, same
 # four assertions, same explicit --target). PREFS.BIN registers Principia's PrefGet/PrefList bus verbs and
 # answers the requests the kernel relays to it (UNAOS_BUSREG=1; knob off it prints its refusal and exits).
-build_user_pulse_x86() {
+build_user_prefs_x86() {
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
     echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 Principia prefs fulfiller static-ELF program (crates/user-prefs → target/PREFS-X86.ELF)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
@@ -3721,6 +3723,31 @@ build_user_pulse_x86() {
     local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/PREFS-X86.ELF" | tr -d ' ')"
     [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: PREFS-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
     echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 Principia prefs fulfiller program: PREFS-X86.ELF (${psz} B)${COLOR_RESET}"
+}
+
+# NETRING3 M3 (B306): build the x86_64 static ELF64 ring-3 network client (crates/user-net → target/NET-X86.ELF),
+# staged as APPS/NET.BIN by the builder. The exact shape of build_user_prefs_x86 above. NET.BIN draws entropy,
+# resolves api.anthropic.com, connects :80 and prints the status line (UNAOS_NETRING3=1; knob off the two new
+# syscalls answer the unknown-syscall default and it says so in its verdict line).
+build_user_net_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 network client static-ELF program (crates/user-net → target/NET-X86.ELF)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-net"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-net/target/x86_64-unknown-none/release/user-net" \
+      "${WORKSPACE_DIR}/target/NET-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/NET-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF missing/empty — x86 NET build failed${COLOR_RESET}"; exit 1; }
+    local fmag; fmag="$(head -c 4 "${WORKSPACE_DIR}/target/NET-X86.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$fmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF does not start with the ELF magic; first 4 bytes = ${fmag}${COLOR_RESET}"; exit 1; }
+    local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/NET-X86.ELF" | tr -d ' \n')"
+    [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/NET-X86.ELF" | tr -d ' ')"
+    [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
+    echo -e "${COLOR_GREEN}✅ x86 static-ELF ring-3 network client program: NET-X86.ELF (${psz} B)${COLOR_RESET}"
 }
 
 build_kernel_aarch64() {
@@ -3761,6 +3788,7 @@ launch_x86_64() {
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
     build_kernel_x86_64
 
     echo -e "${COLOR_CYAN}⚡ Launching x86_64 via Builder (kernel + bootloader + QEMU)...${COLOR_RESET}"
@@ -4727,6 +4755,7 @@ test_x86_64() {
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
     build_kernel_x86_64
 
     # VPERF: UNAOS_QMP_SHOT=<png path> arms a QMP framebuffer screendump of the headless x86 run
@@ -5184,6 +5213,7 @@ USER_CHECK_MATRIX=(
   "user-vug      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-pulse    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-prefs    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-prefs/user-prefs-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-blob     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld"
   "user-elf      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-stat     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
@@ -5669,6 +5699,8 @@ KERNEL_CFG_MATRIX=(
   # fix was present. It is also what obliges `scripts/banner-cert.sh` to carry a row: without one the
   # first armed `esp-x86` exits 2 by name rather than passing silently.
   "x86-ioapic  ../../x86_64-unaos.json  ioapic,ehcihid"
+  # NETRING3 (B306): the ring-3 entropy + resolve syscalls over the smolnet resolver, with `tests net`.
+  "x86-netring3 ../../x86_64-unaos.json  netring3,smolnet,witness"
   # JETSON-EL0 (M1b) — the ARMED Orin, appended GR26. Until this leg, `tegra_el0` appeared in NO leg of
   # this matrix, which means `./arroyo check` type-checked the configuration
   # `UNAOS_TEGRA_EL0=1 ./arroyo esp-jetson` ships NOWHERE — and `UNAOS_TEGRA_EL0=1 ./arroyo check` did
@@ -8616,6 +8648,7 @@ esp_x86() {
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -8674,6 +8707,7 @@ vm_image() {
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
     cd "$WORKSPACE_DIR/builder"
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -8717,6 +8751,7 @@ fat_img() {
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
     build_user_prefs_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
         esp_x86
@@ -10910,6 +10945,10 @@ kernel8() {
     if [ -n "${UNAOS_BUSREG:-}" ]; then
         K8_FEATS="${K8_FEATS},busreg"
         echo -e "${COLOR_YELLOW}  • UNAOS_BUSREG: BANDY3 fulfiller registration on the bus wire (register verb 127, registrable tags 128..=255, kernel relay; tests bandy3)${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_NETRING3:-}" ]; then
+        K8_FEATS="${K8_FEATS},netring3"
+        echo -e "${COLOR_YELLOW}  • UNAOS_NETRING3: ring-3 SYS_GETRANDOM (56) + SYS_RESOLVE (57, -ENODEV on aarch64); tests net${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_FATPERF:-}" ]; then
         K8_FEATS="${K8_FEATS},fatperf"
