@@ -931,7 +931,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // reordering that moved this block after the handoff would stop aiming at the render core
             // instead of silently landing on it.
             if let Some(cpu) = unaos_kernel::arch::smp::worker_cpu(0) {
-                unaos_kernel::arch::sched::enable();
+                unaos_kernel::arch::sched::enable(); if !cfg!(feature = "tests-at-boot") { unaos_kernel::tests::register("u3", unaos_kernel::arch::syscall::u3_probe_once); } else { // QUIETBOOT (R80): the ring-3 battery + SERWIT-1 run at boot only on a tests-at-boot lane; the CR3 probe is `tests u3`.
                 let demo = unaos_kernel::arch::syscall::setup();
                 serial_println!(":: U1a: ring-3 demo — user task on core {} ::", cpu);
                 unaos_kernel::arch::sched::spawn_user("u1a-hello", demo.hello, demo.sp, cpu);
@@ -987,7 +987,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 // lines are sequence-numbered so the assertion can be falsified from the log itself
                 // (`awk '/\[serwit\]/' target/serial.log | wc -l` == cores x burst) — a counter that
                 // only ever agreed with itself would prove nothing.
-                serwit1_run(&online);
+                serwit1_run(&online); } // QUIETBOOT: closes the tests-at-boot arm.
             } else {
                 serial_println!(":: U1a: no application processors online — ring-3 demo SKIPPED ::");
             }

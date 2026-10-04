@@ -7704,7 +7704,7 @@ pub fn emit_smpload_witness() {
 /// unchanged on a skewed sample never reaches 2.
 #[cfg(feature = "witness")]
 pub fn smpload_selftest() {
-    static DONE: AtomicBool = AtomicBool::new(false);
+    static DONE: AtomicBool = AtomicBool::new(false); if crate::tests::defer("smpload", smpload_selftest) { return; } // QUIETBOOT (R80): a boot witness — `tests smpload` fires it.
     if DONE.swap(true, Ordering::Relaxed) { return; }
     let flat = smpload_judge(&[Some(40), Some(35), Some(50), Some(45)], &[0, 0, 0, 0], 0);          // spread: PASS
     let pegged = smpload_judge(&[Some(95), Some(10), Some(30), Some(30)], &[0, 0, 0, 0], 0);        // one task, nothing queued: PASS (the compositor's shape)

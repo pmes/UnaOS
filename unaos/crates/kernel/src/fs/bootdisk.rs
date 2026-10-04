@@ -1679,7 +1679,7 @@ static MOUNTS_ANNOUNCED: core::sync::atomic::AtomicBool =
 /// HOMESOIL: the counting, dedupe, indexing and posture-sampling legs. See the block comment above.
 #[cfg(feature = "witness")]
 fn homesoil_selftest() {
-    use crate::fs::vfs::{FatBackend, KERNEL_PRINCIPAL};
+    use crate::fs::vfs::{FatBackend, KERNEL_PRINCIPAL}; if crate::tests::defer("homesoil", homesoil_selftest) { return; } // QUIETBOOT (R80): a boot witness — `tests homesoil` fires it.
     // SO38 (X86BIND): the latch `usbreg_selftest` has always carried, and this one relied on
     // `walk_and_witness` running exactly once to do without. That stopped being true when a no-root
     // survey stopped being cached: the walk now re-runs whenever the machine's disk set changes, so

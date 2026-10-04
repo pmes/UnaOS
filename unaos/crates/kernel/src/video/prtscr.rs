@@ -1533,7 +1533,7 @@ impl Job {
 /// and never a false FAIL.
 #[cfg(feature = "prtscrst")]
 pub fn selftest_once() {
-    static DONE: AtomicBool = AtomicBool::new(false);
+    static DONE: AtomicBool = AtomicBool::new(false); if crate::tests::defer("prtscr", selftest_once) { return; } // QUIETBOOT (R80): a boot witness — `tests prtscr` fires it.
     static SAID_NO_VOLUME: AtomicBool = AtomicBool::new(false);
     static SAID_READ_ONLY: AtomicBool = AtomicBool::new(false);
     static SAID_NO_SESSION: AtomicBool = AtomicBool::new(false);

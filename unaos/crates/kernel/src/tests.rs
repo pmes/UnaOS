@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use crate::console::Console;
 
 /// Registry capacity — a full table is loud (`:: TESTS: table full … -> FAIL ::`), never silent.
-const CAP: usize = 48;
+const CAP: usize = 80; // QUIETBOOT: 48 -> 80, the boot witnesses R80 moved here (flight 19 registered 45).
 
 static TABLE: spin::Mutex<[Option<(&'static str, fn())>; CAP]> = spin::Mutex::new([None; CAP]);
 static DEFERRED: AtomicUsize = AtomicUsize::new(0);
@@ -208,3 +208,20 @@ fn ensure_attr() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) { register("attr", crate::fs::attrsys::selftest); }
 }
+
+/// QUIETBOOT M3 (R80) — the one-statement shape for a boot-time WITNESS: `if crate::tests::defer("name", f) { return; }`
+/// as the first statement of the fixture `f` itself. Returns `false` (run the body now, as before) under
+/// `tests-at-boot` — so a QEMU lane sees the old line in the old order — and while `tests` is executing a
+/// fixture (so the registered `f` re-entering here runs its body). Otherwise registers `f` under `name`
+/// ONCE and returns `true`: the boot prints nothing and `tests <name>` fires it.
+pub fn defer(name: &'static str, f: fn()) -> bool {
+    if cfg!(feature = "tests-at-boot") || RUNNING.load(Ordering::Acquire) {
+        return false;
+    }
+    let present = TABLE.lock().iter().flatten().any(|e| e.0 == name);
+    if !present {
+        register(name, f);
+    }
+    true
+}
+

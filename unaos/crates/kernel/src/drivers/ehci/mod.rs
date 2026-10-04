@@ -18397,7 +18397,7 @@ pub fn init() {
     let init_t0 = crate::arch::now_cycles();
     // Hardening self-test up front (default-ON driver parses ANY device's descriptor): proves the
     // report-parser is bounded against a hostile Report Count before we enumerate anything.
-    unsafe { parser_selftest() };
+    if !crate::tests::defer("ehci", ehci_selftest) { unsafe { parser_selftest() }; } // QUIETBOOT (R80): the parser/multitouch/dispatch/keymap/clip/termsel self-tests — `tests ehci`.
     // ISRARM: and the completion-interrupt half, for a blunter reason — on QEMU the interrupt CANNOT
     // fire. QEMU's `hcd-ehci` exposes no PCI capability list at all, so `isr_arm_controller` refuses
     // MSI and the entire ISR body would otherwise be dead code in every automated gate this repo
@@ -19541,3 +19541,8 @@ pub fn tp_speed_set(n: u8) { TP_SPEED.store(n.min(2), core::sync::atomic::Orderi
 pub fn tp_speed_get() -> u8 { TP_SPEED.load(core::sync::atomic::Ordering::Relaxed) }
 fn tp_div_low() -> i32 { match tp_speed_get() { 0 => 12, 2 => 5, _ => TP_MT_DIV_LOW } }
 fn tp_div_high() -> i32 { match tp_speed_get() { 0 => 4, 2 => 2, _ => TP_MT_DIV_HIGH } }
+
+/// QUIETBOOT (R80): `tests ehci` — the hardening self-test chain `init` used to run at every boot.
+fn ehci_selftest() {
+    unsafe { parser_selftest() };
+}
