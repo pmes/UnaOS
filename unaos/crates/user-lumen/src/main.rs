@@ -13,19 +13,19 @@
 // four verbs. That is ROADMAP §3b principle 5 — the desktop is a scene of live capabilities viewed over
 // the bus — and it is why there is no second chat implementation in the kernel.
 //
-// THE VERBS (body layouts; the fallback set in the LUMENBIN brief, because VEINCORE's evidence doc was
-// not yet written when this was cut — the fold reconciles against una-abi's declaration):
-//   CHAT_SEND   130  request [conv_id u32 LE][text utf8 to the end]
-//                    reply   a ChatReply body (the first chunk)
-//   CHAT_REPLY  131  ChatReply body = [conv_id u32][seq u32][done u8][text]
-//                    request [conv_id u32][seq u32] = "the chunk at seq" — the PULL half of streaming
+// THE VERBS — VEINCORE's wire (docs/dev/evidence/rmbp-1004/VEINCORE.md §THE WIRE, codec of record
+// `unaos/libs/sys/vein_core/src/wire.rs`):
+//   CHAT_SEND   130  request [conv_id u32 LE][text utf8]
+//                    replies a SEQUENCE of ChatReply frames on the one correlation id:
+//                    [conv_id u32][seq u16][done u8][rsvd u8][text]; every non-final frame has header
+//                    status BUS_STATUS_MORE (= 1) and done = 0, the final one status 0 and done = 1; an
+//                    error ends the stream with a negative errno and an empty body (-ECANCELED, -EIO, ..)
+//   CHAT_REPLY  131  kernel -> VEIN only (the relay companion's injected answer); never sent from here
 //   CHAT_CANCEL 132  request [conv_id u32]; reply empty
-//   CHAT_STATUS 133  request empty; reply [ready u8][provider utf8 up to NUL][model utf8]
-// STREAMING IS PULLED, not pushed, because the kernel relay (bus_route.rs) answers each request with
-// exactly ONE reply: a pending relay is taken by the fulfiller's first answer, and a second REPLY on it
-// is -ENOENT. So a reply with done=0 makes this program ask CHAT_REPLY for seq+1, and the text grows a
-// chunk per round trip. No fulfiller at all is the kernel's own -ENOENT reply (an answer, never a hang),
-// rendered as "no provider: start VEIN.BIN".
+//   CHAT_STATUS 133  request empty; reply [ready u8][plen u8][mlen u8][rsvd u8][provider][model]
+// STREAMING IS PUSHED: VEINCORE's `more` flag keeps the relay's pending entry open, so the chunks simply
+// arrive in this program's mailbox in order. No fulfiller at all is the kernel's own -ENOENT reply (an
+// answer, never a hang), rendered as "no provider: start VEIN.BIN".
 //
 // THE UI STAYS ALIVE. SYS_MRECV blocks while the mailbox is empty and the ABI has no non-blocking form,
 // so a RECEIVER THREAD (SYS_THREAD_SPAWN, same address space, same mailbox — the mailbox is per slot)
@@ -58,9 +58,9 @@ use una_abi::{
 };
 
 // The chat verbs. VEINCORE declares these in una-abi in parallel; until that fold they are restated here
-// with the SAME values (the brief's numbers). At the fold: delete these four and import them.
+// with the SAME values. At the fold: delete these and import them from una_abi.
 const BUS_VERB_CHAT_SEND: u8 = 130;
-const BUS_VERB_CHAT_REPLY: u8 = 131;
+const BUS_STATUS_MORE: i64 = 1;
 const BUS_VERB_CHAT_CANCEL: u8 = 132;
 const BUS_VERB_CHAT_STATUS: u8 = 133;
 /// INPUT_EV_ACTION payload for ⌘K (`video::clipboard::action_code(Action::ClearView)`).
@@ -426,11 +426,11 @@ impl App {
         self.dirty = true;
         match r[6] {
             BUS_VERB_CHAT_STATUS => {
-                if status == 0 && !body.is_empty() {
+                if status == 0 && blen >= 4 {
                     self.ready = body[0] != 0;
-                    let rest = &body[1..];
-                    let nul = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
-                    let (prov, model) = (&rest[..nul], if nul < rest.len() { &rest[nul + 1..] } else { &[][..] });
+                    let pe = (4 + body[1] as usize).min(blen);
+                    let me = (pe + body[2] as usize).min(blen);
+                    let (prov, model) = (&body[4..pe], &body[pe..me]);
                     self.set_status(prov, b"");
                     if !model.is_empty() {
                         let mut tmp = [0u8; 40];
@@ -447,11 +447,14 @@ impl App {
                 }
                 wit(W_READY, self.ready as u32);
             }
-            BUS_VERB_CHAT_SEND | BUS_VERB_CHAT_REPLY => {
+            BUS_VERB_CHAT_SEND => {
+                if status == BUS_STATUS_MORE {
+                    self.pending += 1; // a non-final chunk: the request is still open
+                }
                 if !self.waiting {
                     return; // cancelled or cleared: a late chunk is dropped, and nothing more is pulled
                 }
-                if status != 0 {
+                if status < 0 {
                     self.waiting = false;
                     if status == ENOENT {
                         self.enoent = 1;
@@ -462,9 +465,9 @@ impl App {
                     self.progress();
                     return;
                 }
-                // [conv u32][seq u32][done u8][text]; a body shorter than the header is taken as one
-                // final chunk of plain text rather than refused (a tolerant reader, a strict writer).
-                let (seq, done, text) = if blen >= 9 { (u(BUS_HDR_LEN + 4), body[8] != 0, &body[9..]) } else { (0, true, body) };
+                // [conv u32][seq u16][done u8][rsvd u8][text]; the stream is over on done = 1 or a status-0
+                // frame. A body shorter than the header is one final chunk of plain text (a tolerant reader).
+                let (done, text) = if blen >= 8 { (body[6] != 0 || status == 0, &body[8..]) } else { (status != BUS_STATUS_MORE, body) };
                 if !self.turn_open {
                     self.turn(ROLE_AI, b"");
                     self.turn_open = true;
@@ -475,17 +478,6 @@ impl App {
                     self.waiting = false;
                     self.turn_open = false;
                     self.progress();
-                } else {
-                    let mut req = [0u8; 8];
-                    req[..4].copy_from_slice(&self.conv.to_le_bytes());
-                    req[4..].copy_from_slice(&seq.wrapping_add(1).to_le_bytes());
-                    if send(BUS_VERB_CHAT_REPLY, &req, &[]) == 0 {
-                        self.pending += 1;
-                    } else {
-                        self.waiting = false;
-                        self.note(b"vein: pull refused");
-                        self.progress();
-                    }
                 }
             }
             _ => {} // CHAT_CANCEL's empty reply and anything else

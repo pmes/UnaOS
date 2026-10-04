@@ -15,12 +15,15 @@ ring-3 fulfiller of `CHAT_SEND 130 / CHAT_REPLY 131 / CHAT_CANCEL 132 / CHAT_STA
 parallel). The kernel's part is plumbing only: the relay it already has (bus_route.rs), one desktop
 action (⌘K = `Action::ClearView`, code 41), one dock pin row, one verb, one fixture.
 
-**Wire used** (VEINCORE.md was not yet written at cut; the brief's fallback, reconciled at the fold):
-ChatSend `[conv_id u32 LE][text]`; ChatReply `[conv_id u32][seq u32][done u8][text]`; ChatStatus
-request empty, reply `[ready u8][provider up to NUL][model]`; ChatCancel `[conv_id u32]`. Streaming is
-PULLED: the relay answers each request exactly once, so on `done=0` LUMEN sends CHAT_REPLY
-`[conv_id][seq+1]` for the next chunk. No fulfiller = the kernel's own `-ENOENT` reply, rendered as
-"no provider: start VEIN.BIN".
+**Wire used** — VEINCORE's (`/home/user/exec/veincore/docs/dev/evidence/rmbp-1004/VEINCORE.md` §THE WIRE,
+read once it existed; the first cut used the brief's fallback and was aligned before the report):
+ChatSend `[conv_id u32][text]`; its replies are a SEQUENCE of ChatReply frames
+`[conv_id u32][seq u16][done u8][rsvd u8][text]` on the one correlation id, non-final ones with header status
+`BUS_STATUS_MORE` (1), the last with status 0 and done 1, an error ending the stream with a negative errno;
+ChatCancel `[conv_id u32]`; ChatStatus reply `[ready u8][plen u8][mlen u8][rsvd u8][provider][model]`; 131 is
+kernel → VEIN only and LUMEN never sends it. Streaming is PUSHED (VEINCORE's `more` flag keeps the relay's
+pending entry open). No fulfiller = the kernel's own `-ENOENT` reply, rendered as "no provider: start
+VEIN.BIN". The verb and status constants are restated locally until the fold imports them from una-abi.
 
 **Budget.** The whole program (code + data + bss + main stack) lives in the 16 KiB program window, and
 the receive buffer must be `BUS_FRAME_MAX` = 4148 bytes. x86 layout: text 0x0..0x1df2, data 0x2000 (the
