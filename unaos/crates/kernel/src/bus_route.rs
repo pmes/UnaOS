@@ -528,6 +528,11 @@ pub fn is_owned(ops: &Ops, verb: u8) -> bool {
     lookup(ops, verb).is_some()
 }
 
+/// The live row owning `verb` (a fixture must never scratch over a running fulfiller's row).
+pub fn owner_row(ops: &Ops, verb: u8) -> Option<usize> {
+    lookup(ops, verb).map(|(row, _)| row)
+}
+
 /// Push `REQUEST(verb, corr 0, KERNEL principal, body)` into `verb`'s fulfiller's mailbox. 0, or
 /// `-EINVAL` (a kernel tag / an over-ceiling body), `-ENOENT` (unowned), `-EAGAIN` (mailbox full).
 pub fn inject(ops: &Ops, verb: u8, body: &[u8]) -> i64 {

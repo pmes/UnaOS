@@ -110,6 +110,9 @@ impl ProviderIo for ScratchIo<'_> {
 /// status, in_order)`. `wait` polls (yielding) for a live fulfiller; scratch mode needs none.
 fn collect(f: &Fx<'_>, row: usize, corr: u32, conv: u32, wait: bool) -> (u32, u32, Vec<u8>, Option<i32>, bool) {
     let (mut frames, mut more, mut text, mut fin, mut order) = (0u32, 0u32, Vec::new(), None, true);
+    // A live fulfiller gets up to 3 s of wall time (the counter where the arch has one; else a bounded
+    // count of yields) — the shell may run where a yield is a no-op, so a count alone would mean ~1 ms.
+    let t0 = crate::clock::uptime_ms();
     let mut idle = 0u32;
     while fin.is_none() {
         match f.pop(row) {
@@ -131,7 +134,7 @@ fn collect(f: &Fx<'_>, row: usize, corr: u32, conv: u32, wait: bool) -> (u32, u3
                 }
             }
             Some(_) => order = false, // a frame for some other corr — not ours
-            None if wait && idle < 400_000 => {
+            None if wait && match (t0, crate::clock::uptime_ms()) { (Some(a), Some(b)) => b.saturating_sub(a) < 3000, _ => idle < 4_000_000 } => {
                 idle += 1;
                 crate::arch::sched::yield_now();
                 core::hint::spin_loop();
@@ -146,6 +149,11 @@ fn collect(f: &Fx<'_>, row: usize, corr: u32, conv: u32, wait: bool) -> (u32, u3
 pub fn selftest(fx: &crate::bus_route::Fixture) {
     let f = Fx { fx };
     let (a, ful) = fx.rows;
+    // A running VEIN.BIN that happens to sit on a scratch row is never disturbed (the BANDY3 rule).
+    if crate::bus_route::owner_row(fx.ops, BUS_VERB_CHAT_SEND).is_some_and(|r| r == a || r == ful) {
+        serial_println!(":: VEINBUS: scratch rows {}/{} hold the live chat fulfiller — fixture SKIP ::", a, ful);
+        return;
+    }
     (fx.clear)(a);
     (fx.clear)(ful);
     let (kp, kt) = wire::kats();
