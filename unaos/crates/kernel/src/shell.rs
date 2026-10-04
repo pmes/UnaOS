@@ -2630,9 +2630,9 @@ fn which_report(console: &mut Console, word: &str) {
         if let Some(name) = midden_core::resolve_exec(word, &mut vol) {
             return console.println(&alloc::format!("{}: program {}", word, exec_display_path(&name).unwrap_or(name))); // EXECNAME (B322): the on-disk path, e.g. `lumen: program /apps/LUMEN.ELF`. ⚠ SAME-LINE fold, line-NEUTRAL.
         }
-        return console.println_styled(crate::video::theme::TERM_RED, &alloc::format!("{}: not found (no verb, no program)", word));
+        if let Some(l) = midden_core::gated_off_line(word) { return console.println(&l); } return console.println_styled(crate::video::theme::TERM_RED, &alloc::format!("{}: not found (no verb, no program)", word)); // GATED-OFF (TESTFIX4, B330): a verb of other builds names its knob
     }
-    console.println(&alloc::format!(
+    if let Some(l) = midden_core::gated_off_line(word) { return console.println(&l); } console.println(&alloc::format!( // GATED-OFF (TESTFIX4, B330)
         "{}: not a verb on this build (and this build cannot launch programs)", word));
 }
 
@@ -5079,7 +5079,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
     history_record(cmd_line); if crate::help::intercept(cmd_line, console) { return false; } // HELPVERB (R75): `help [verb]`, `man <verb>`, `<verb> --help` — help.rs; LINE-NEUTRAL fold.
     let facts = midden_facts();
     let mut vol = FatVolume;
-    let plan = midden_core::plan(cmd_line, &facts, &mut vol);
+    let plan = midden_core::plan(cmd_line, &facts, &mut vol); if let (midden_core::Plan::Say(_), Some(k)) = (&plan, cmd_line.split_whitespace().next().and_then(midden_core::gated_off)) { serial_println!(":: [midden] gated-off verb={} knob={} ::", midden_core::canon_verb(cmd_line.split_whitespace().next().unwrap_or("")), k); } // GATED-OFF (TESTFIX4, B330)
 
     // WITNESS (must be able to fail): one line per dispatched line, naming the message the core
     // produced. A line that never reached the core cannot print this, and a core that produced

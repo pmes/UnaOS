@@ -99,7 +99,7 @@ pub fn run(name: Option<&str>) -> usize {
         return 0;
     }
     let (p0, f0) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
-    *FAILED.lock() = [None; 16];
+    *FAILED.lock() = [None; 16]; skip_reset();
     let mut ran = 0usize;
     let mut i = 0usize;
     loop {
@@ -110,14 +110,14 @@ pub fn run(name: Option<&str>) -> usize {
         if let Some(want) = name { if want != n { continue; } }
         serial_println!(":: TESTS: run {} ::", n);
         *CUR.lock() = n;
-        f();
+        let vb = verdicts(); f(); skip_note(n, vb);
         *CUR.lock() = "";
         ran += 1;
     }
     let (p, f) = (PASS.load(Ordering::Relaxed).wrapping_sub(p0), FAIL.load(Ordering::Relaxed).wrapping_sub(f0));
     let mut names = alloc::string::String::new();
     for n in FAILED.lock().iter().flatten() { if !names.is_empty() { names.push(','); } names.push_str(n); }
-    serial_println!(":: TESTS: ran={} pass={} fail={} failed=[{}] ::", ran, p, f, names);
+    serial_println!(":: TESTS: ran={} pass={} fail={} failed=[{}] skipped=[{}] ::", ran, p, f, names, skipped_names());
     RUNNING.store(false, Ordering::Release);
     ran
 }
@@ -150,7 +150,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     } else {
         let mut names = alloc::string::String::new();
         for n in FAILED.lock().iter().flatten() { if !names.is_empty() { names.push(','); } names.push_str(n); }
-        console.println_styled(if f == 0 { crate::video::theme::TERM_GREEN } else { crate::video::theme::TERM_RED }, &format!("tests: ran={} pass={} fail={} failed=[{}]", ran, p, f, names));
+        console.println_styled(if f == 0 { crate::video::theme::TERM_GREEN } else { crate::video::theme::TERM_RED }, &format!("tests: ran={} pass={} fail={} failed=[{}] skipped=[{}]", ran, p, f, names, skipped_names()));
     }
 }
 
@@ -334,4 +334,27 @@ fn ensure_gen7() {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("gen7", crate::drivers::gpu::gen7::r8_test); }
     }
+}
+
+// TESTFIX4 (B330) — TAIL-APPENDED. `skipped=[…]` on the summary: a fixture that RAN and printed no `-> PASS`
+// and no `-> FAIL` verdict (its SKIP line, or nothing) is named there, so a read of the summary tells SKIP from
+// FAIL without the log. Counted from the same verdict tap as pass/fail, before and after the fixture.
+static SKIPPED: spin::Mutex<[Option<&'static str>; CAP]> = spin::Mutex::new([None; CAP]);
+
+fn verdicts() -> (u32, u32) { (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed)) }
+
+fn skip_reset() { *SKIPPED.lock() = [None; CAP]; }
+
+fn skip_note(n: &'static str, before: (u32, u32)) {
+    if verdicts() != before { return; }
+    let mut sk = SKIPPED.lock();
+    if !sk.iter().flatten().any(|x| *x == n) {
+        if let Some(slot) = sk.iter_mut().find(|x| x.is_none()) { *slot = Some(n); }
+    }
+}
+
+fn skipped_names() -> alloc::string::String {
+    let mut s = alloc::string::String::new();
+    for n in SKIPPED.lock().iter().flatten() { if !s.is_empty() { s.push(','); } s.push_str(n); }
+    s
 }

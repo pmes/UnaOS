@@ -581,6 +581,9 @@ pub fn plan(line: &str, facts: &Facts, vol: &mut dyn Volume) -> Plan {
             return Plan::Exec { typed: word.to_string(), name };
         }
     }
+    if let Some(line) = gated_off_line(canon) {
+        return Plan::Say(Message::TerminalOutput(line)); // GATED-OFF (TESTFIX4, B330): a verb of other builds, named with its knob
+    }
     Plan::Say(Message::TerminalError(
         "Unknown command. Type 'help' for assistance.".to_string(),
     ))
@@ -1250,5 +1253,98 @@ mod execname_tests {
         assert!(!is_verb("lumen", &f));
         assert_eq!(plan("lumen", &f, &mut NameList(&staged)), Plan::Exec { typed: "lumen".to_string(), name: "LUMEN.ELF".to_string() });
         assert_eq!(plan("/apps/LUMEN.ELF", &f, &mut NameList(&["/apps/LUMEN.ELF"])), Plan::Exec { typed: "/apps/LUMEN.ELF".to_string(), name: "/apps/LUMEN.ELF".to_string() });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GATED-OFF (TESTFIX4, rmbp-ledger B330) — a verb this build does not carry, named with its knob
+// ---------------------------------------------------------------------------
+//
+// Boot 20: `install` answered "Unknown command" because the verb is built only with the `installdemo`
+// feature and the line did not carry `UNAOS_INSTALLDEMO=1`. The word is a verb of this OS; it is the BUILD
+// that lacks it. So the core, which already decides "is this a command?", also answers "it is a command on
+// other builds — this knob": one table of the cfg-gated rows of [`HOST_VERBS`] and the arroyo knob that arms
+// each. A program by that name still wins (`plan` asks the resolver first), exactly as for any non-verb word.
+
+/// Every cfg-gated [`HOST_VERBS`] row, with the build knob that carries it.
+pub const GATED_VERBS: &[(&str, &str)] = &[
+    ("install", "UNAOS_INSTALLDEMO=1"),
+    ("login", "UNAOS_LOGIN=1"),
+    ("logout", "UNAOS_LOGIN=1"),
+    ("adduser", "UNAOS_LOGIN=1"),
+    ("passwd", "UNAOS_LOGIN=1"),
+    ("users", "UNAOS_LOGIN=1"),
+    ("deluser", "UNAOS_LOGIN=1"),
+    ("whoami", "UNAOS_LOGIN=1"),
+];
+
+/// The knob of a verb that exists on other builds but is NOT compiled into this one, or `None` (the verb is
+/// here — whatever its platform `Avail` — or it is no gated verb at all).
+pub fn gated_off(word: &str) -> Option<&'static str> {
+    let w = canon_verb(word);
+    let w: &str = &w;
+    if HOST_VERBS.iter().any(|(n, _)| *n == w) {
+        return None;
+    }
+    GATED_VERBS.iter().find(|(n, _)| *n == w).map(|(_, k)| *k)
+}
+
+/// The operator-facing answer for a gated-off verb: `install: verb present on UNAOS_INSTALLDEMO=1 builds only`.
+pub fn gated_off_line(word: &str) -> Option<String> {
+    gated_off(word).map(|k| format!("{}: verb present on {} builds only", canon_verb(word), k))
+}
+
+#[cfg(test)]
+mod gated_tests {
+    use super::*;
+
+    #[test]
+    fn every_gated_row_is_a_cfg_gated_host_verb() {
+        // A GATED_VERBS row never names a core verb, and it is a HOST_VERBS row exactly when its feature is on.
+        for (v, k) in GATED_VERBS {
+            assert!(!CORE_VERBS.contains(v), "{v}");
+            assert!(k.starts_with("UNAOS_") && k.ends_with("=1"), "{k}");
+        }
+        assert_eq!(gated_off("ls"), None);
+        assert_eq!(gated_off("nosuchword"), None);
+        assert_eq!(gated_off("help"), None);
+    }
+
+    #[cfg(not(feature = "installdemo"))]
+    #[test]
+    fn install_without_the_knob_names_the_knob() {
+        let f = Facts { exec: true, proc_verbs: true, x86: true, ..Facts::bare() };
+        assert!(!is_verb("install", &f));
+        assert_eq!(gated_off("INSTALL"), Some("UNAOS_INSTALLDEMO=1"));
+        let want = "install: verb present on UNAOS_INSTALLDEMO=1 builds only".to_string();
+        assert_eq!(gated_off_line("install"), Some(want.clone()));
+        assert_eq!(plan("install", &f, &mut NameList(&[])), Plan::Say(Message::TerminalOutput(want)));
+        // A staged program by that name is still a program.
+        assert_eq!(plan("install", &f, &mut NameList(&["INSTALL.ELF"])), Plan::Exec { typed: "install".to_string(), name: "INSTALL.ELF".to_string() });
+        // An unknown word stays unknown.
+        assert!(matches!(plan("nosuchword", &f, &mut NameList(&[])), Plan::Say(Message::TerminalError(_))));
+    }
+
+    #[cfg(feature = "installdemo")]
+    #[test]
+    fn install_with_the_knob_is_a_host_verb() {
+        let f = Facts { exec: true, proc_verbs: true, x86: true, ..Facts::bare() };
+        assert_eq!(gated_off("install"), None);
+        assert!(matches!(plan("install", &f, &mut NameList(&[])), Plan::Host { .. }));
+    }
+
+    #[cfg(all(feature = "installdemo", feature = "login"))]
+    #[test]
+    fn with_every_knob_every_gated_row_is_carried() {
+        for (v, _) in GATED_VERBS {
+            assert!(HOST_VERBS.iter().any(|(n, _)| n == v), "{v}");
+            assert_eq!(gated_off(v), None);
+        }
+    }
+
+    #[cfg(not(feature = "login"))]
+    #[test]
+    fn login_verbs_without_the_knob_name_the_knob() {
+        assert_eq!(gated_off("whoami"), Some("UNAOS_LOGIN=1"));
     }
 }
