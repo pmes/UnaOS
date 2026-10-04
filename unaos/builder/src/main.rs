@@ -949,6 +949,11 @@ fn main() {
         // LINUXABI2: the fork/pipe and stdin/getdents64 fixtures (same generator) — `tests linuxabi2`.
         ("PIPE.LNX", "PIPE.LNX"),
         ("LS.LNX", "LS.LNX"),
+        // LINUXABI3: the SSE + live-XMM-across-fork fixture (same generator) — `linux /apps/SSE.LNX`, `tests linuxabi3`.
+        ("SSE.LNX", "SSE.LNX"),
+        // LINUXABI3: an OPERATOR-supplied static musl busybox dropped at target/BUSYBOX.LNX (nothing builds it; absent = skipped,
+        // `tests linuxabi3` then reports busybox=skip) — `linux /apps/BUSYBOX.LNX ls /`.
+        ("BUSYBOX.LNX", "BUSYBOX.LNX"),
     ] {
         let vug_elf = target_dir.join(src);
         if vug_elf.exists() {

@@ -190,6 +190,7 @@ pub fn build_stack(
     let mut s = Vec::from(execfn.as_bytes());
     s.push(0);
     let execfn_p = put(asp, &s)?;
+    let platform_p = put(asp, b"x86_64\0")?; // LINUXABI3: AT_PLATFORM
     let mut env_p = Vec::new();
     for e in envp.iter().rev() {
         let mut s = Vec::from(e.as_bytes());
@@ -204,7 +205,7 @@ pub fn build_stack(
         arg_p.push(put(asp, &s)?);
     }
     arg_p.reverse();
-    let aux: [(u64, u64); 17] = [
+    let aux: [(u64, u64); 19] = [
         (3, plan.phdr_va),
         (4, plan.phent),
         (5, plan.phnum),
@@ -220,7 +221,9 @@ pub fn build_stack(
         (23, 0),
         (25, random_p),
         (31, execfn_p),
-        (16, 0),
+        (16, super::fpu::hwcap()), // LINUXABI3: AT_HWCAP = CPUID.1:EDX (FXSR/SSE/SSE2 = bits 24/25/26)
+        (26, 0),                   // AT_HWCAP2: no ring3mwait/fsgsbase advertised
+        (15, platform_p),          // AT_PLATFORM "x86_64"
         (0, 0),
     ];
     let mut words: Vec<u64> = Vec::new();

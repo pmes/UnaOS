@@ -3701,7 +3701,7 @@ build_user_vug_x86() {
     # 2143, so `kvug` compiles out the shard raytracer it replaces. Measured 0x1fc5 with `kvug`, against
     # an unchanged 0x1f57 without it.
     build_one_vug_x86 VUGK-X86.ELF "kvug"
-    build_user_linux_hello_x86   # LINUXABI: target/HELLO.LNX — staged as APPS/HELLO.LNX by the builder
+    build_user_linux_hello_x86   # LINUXABI: target/HELLO.LNX (+ PIPE/LS, LINUXABI3 SSE.LNX) — staged into APPS/ by the builder
 }
 
 # LINUXABI: generate the ~170-byte static Linux x86_64 fixture from bytes (crates/user-linux-hello is a HOST

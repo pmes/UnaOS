@@ -3,6 +3,19 @@
 .globl _start
 _start:
   sub rsp, 0x2000
+  # LINUXABI3 M5: read stdin only when a line is already waiting (poll fd 0, timeout 0). Before, the first syscall was a
+  # blocking read(0): run interactively with nothing typed, `linux /apps/LS.LNX` sat in it until Ctrl-C (boot 19, 50 s).
+  mov dword ptr [rsp+0x1f00], 0
+  mov dword ptr [rsp+0x1f04], 1
+  mov eax, 7
+  lea rdi, [rsp+0x1f00]
+  mov esi, 1
+  xor edx, edx
+  syscall
+  test rax, rax
+  jle skipw
+  test word ptr [rsp+0x1f06], 1
+  jz skipw
   xor eax, eax
   xor edi, edi
   mov rsi, rsp

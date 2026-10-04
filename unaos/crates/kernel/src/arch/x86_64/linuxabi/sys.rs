@@ -305,6 +305,9 @@ fn do_read(p: &mut LinuxProc, fd: u64, buf: u64, cnt: u64, off: Option<u64>) -> 
             Kind::Console => {
                 let v = fd::stdin_take_line(cnt);
                 if v.is_empty() {
+                    if fd::stdin_eof_take() {
+                        return 0; // LINUXABI3 M5: Ctrl-D in the `linux` verb
+                    }
                     return if nb { -EAGAIN } else { RETRY };
                 }
                 v
@@ -576,7 +579,7 @@ fn poll_ready(d: &Desc, events: i16) -> i16 {
     let mut r = 0i16;
     match &*fd::lk(&d.k) {
         Kind::Console => {
-            if fd::stdin_has_data() {
+            if fd::stdin_has_data() || fd::stdin_eof_pending() {
                 r |= IN;
             }
             r |= OUT;

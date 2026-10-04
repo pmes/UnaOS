@@ -139,3 +139,19 @@ pub fn lk<T>(m: &spin::Mutex<T>) -> spin::MutexGuard<'_, T, spin::Spin> {
         crate::arch::sched::yield_now();
     }
 }
+
+// ---- LINUXABI3 M5: Ctrl-D on an empty line = end of file on stdin (one `read(0)` returns 0, like a tty) ----
+static STDIN_EOF: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn stdin_eof_set() {
+    STDIN_EOF.store(true, core::sync::atomic::Ordering::Release);
+}
+
+pub fn stdin_eof_pending() -> bool {
+    STDIN_EOF.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Consume a pending EOF (the read that sees it returns 0).
+pub fn stdin_eof_take() -> bool {
+    STDIN_EOF.swap(false, core::sync::atomic::Ordering::AcqRel)
+}

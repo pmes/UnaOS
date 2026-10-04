@@ -28,12 +28,13 @@
 //! window, files writable under `/home/<user>/` (`fd.rs`, `sys.rs`). Blocking syscalls are RETRY loops in [`dispatch`].
 //!
 //! Known limits: no threads/signals delivery (kill = end the task); fork copies eagerly (no CoW fault hook); FS_BASE is per-core, so every
-//! process is PINNED to one core (the scheduler hook re-asserts it per switch-in); files are slurped whole at open; no SSE for ring 3
-//! (CR4.OSFXSR=0), so SSE-compiled musl needs that fenced off first; the cloned low-memory page-table copy does not see kernel mapping
+//! process is PINNED to one core (the scheduler hook re-asserts it per switch-in); files are slurped whole at open; x87/SSE state is
+//! saved per process (LINUXABI3, `fpu.rs`: eager FXSAVE, CR4.OSFXSR only while a Linux task runs; no AVX); the cloned low-memory page-table copy does not see kernel mapping
 //! edits made while the process runs.
 
 pub mod elf;
 pub mod fd;
+pub mod fpu;
 pub mod proc;
 pub mod sys;
 
@@ -542,11 +543,16 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
     let ktop = take_ktop();
     let Some(info) = proc::cur_info() else { return -38 };
     NSYS.fetch_add(1, Ordering::AcqRel);
+    let traced = TRACE_N.fetch_add(1, Ordering::AcqRel) < TRACE_MAX; // LINUXABI3 M5: the first TRACE_MAX syscalls of a session
     if nr == 60 || nr == 231 {
+        if traced {
+            serial_println!("[linux] sys={} {} pid={} a0={:#x} -> (exit)", nr, sys_name(nr), info.pid, a0);
+        }
         proc::exit_current(&info, a0, nr == 231); // never returns
     }
     let args = [a0, a1, a2, a3, a4, a5];
     let lp = info.lp.clone();
+    let mut blocked = false;
     let rc = loop {
         let rc = {
             let mut p = fd::lk(&lp);
@@ -555,13 +561,67 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         if rc != sys::RETRY {
             break rc;
         }
+        if !blocked {
+            // LINUXABI3 M5: name every syscall that BLOCKS (always, not capped), and publish it so a timeout can say which.
+            blocked = true;
+            BLOCKED.store(nr + 1, Ordering::Release);
+            BLOCKED_A0.store(a0, Ordering::Release);
+            BLOCKED_T.store(crate::arch::ms(), Ordering::Release);
+            serial_println!("[linux] sys={} {} pid={} a0={:#x} a1={:#x} a2={:#x} -> blocks", nr, sys_name(nr), info.pid, a0, a1, a2);
+        }
         // would block: no lock is held now. Let the others (pipe peer, children, the verb's key pump) run.
         proc::gc();
         crate::arch::sched::kill_check_current();
         crate::arch::sched::yield_now();
     };
+    if blocked {
+        let _ = BLOCKED.compare_exchange(nr + 1, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+    if traced || blocked {
+        serial_println!("[linux] sys={} {} pid={} a0={:#x} a1={:#x} a2={:#x} -> {}", nr, sys_name(nr), info.pid, a0, a1, a2, rc);
+    }
     crate::arch::sched::kill_check_current();
     rc
+}
+
+// ---- LINUXABI3 M5: syscall trace + "which syscall is it stuck in" ----
+const TRACE_MAX: u64 = 48;
+static TRACE_N: AtomicU64 = AtomicU64::new(0);
+/// `nr + 1` of the syscall a process of this session is blocked in right now (0 = none), its first arg, and since when (ms).
+static BLOCKED: AtomicU64 = AtomicU64::new(0);
+static BLOCKED_A0: AtomicU64 = AtomicU64::new(0);
+static BLOCKED_T: AtomicU64 = AtomicU64::new(0);
+
+/// Linux x86_64 syscall names for the trace and the FAIL line (the ones this layer answers, plus the usual libc start-up set).
+pub fn sys_name(nr: u64) -> &'static str {
+    match nr {
+        0 => "read", 1 => "write", 2 => "open", 3 => "close", 4 => "stat", 5 => "fstat", 6 => "lstat", 7 => "poll",
+        8 => "lseek", 9 => "mmap", 10 => "mprotect", 11 => "munmap", 12 => "brk", 13 => "rt_sigaction",
+        14 => "rt_sigprocmask", 15 => "rt_sigreturn", 16 => "ioctl", 17 => "pread64", 19 => "readv", 20 => "writev",
+        21 => "access", 22 => "pipe", 23 => "select", 24 => "sched_yield", 32 => "dup", 33 => "dup2", 35 => "nanosleep",
+        39 => "getpid", 56 => "clone", 57 => "fork", 58 => "vfork", 59 => "execve", 60 => "exit", 61 => "wait4",
+        62 => "kill", 63 => "uname", 72 => "fcntl", 78 => "getdents", 79 => "getcwd", 80 => "chdir", 82 => "rename",
+        83 => "mkdir", 87 => "unlink", 89 => "readlink", 96 => "gettimeofday", 97 => "getrlimit", 102 => "getuid",
+        104 => "getgid", 107 => "geteuid", 108 => "getegid", 109 => "setpgid", 110 => "getppid", 111 => "getpgrp",
+        121 => "getpgid", 158 => "arch_prctl", 186 => "gettid", 200 => "tkill", 202 => "futex", 217 => "getdents64",
+        218 => "set_tid_address", 228 => "clock_gettime", 230 => "clock_nanosleep", 231 => "exit_group",
+        234 => "tgkill", 247 => "waitid", 257 => "openat", 262 => "newfstatat", 267 => "readlinkat", 269 => "faccessat",
+        273 => "set_robust_list", 293 => "pipe2", 302 => "prlimit64", 318 => "getrandom", 332 => "statx", 334 => "rseq",
+        _ => "?",
+    }
+}
+
+/// The blocked-syscall tag for a FAIL line: `read(fd=0)`, `wait4`, … (empty when nothing is blocked).
+fn blocked_tag() -> String {
+    let b = BLOCKED.load(Ordering::Acquire);
+    if b == 0 {
+        return String::new();
+    }
+    let nr = b - 1;
+    match nr {
+        0 | 1 | 3 | 5 | 16 | 17 | 72 | 217 => alloc::format!("{}(fd={})", sys_name(nr), BLOCKED_A0.load(Ordering::Acquire) as i64),
+        _ => alloc::format!("{}({})", sys_name(nr), nr),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -576,6 +636,8 @@ pub struct Report {
     pub ms: u64,
     pub forks: u64,
     pub child_ok: u64,
+    /// LINUXABI3 M5: the syscall a process was blocked in when the session timed out / was interrupted (empty otherwise).
+    pub blocked: String,
 }
 
 impl Report {
@@ -587,9 +649,10 @@ impl Report {
             }
             e.push_str(&alloc::format!("{}", n));
         }
+        let blk = if self.blocked.is_empty() { String::new() } else { alloc::format!(" blocked={}", self.blocked) };
         alloc::format!(
-            ":: LINUXABI: path={} exit={} syscalls={} enosys=[{}] ms={} -> {} ::",
-            path, self.exit, self.nsys, e, self.ms, if self.pass { "PASS" } else { "FAIL" }
+            ":: LINUXABI: path={} exit={} syscalls={} enosys=[{}] ms={}{} -> {} ::",
+            path, self.exit, self.nsys, e, self.ms, blk, if self.pass { "PASS" } else { "FAIL" }
         )
     }
 }
@@ -646,6 +709,15 @@ fn pump_keys(edit: &mut String, pend: &mut String, out: &mut dyn FnMut(&str)) ->
         if let crate::pal::Event::Key(c) = ev {
             match c {
                 3 => return true,
+                4 => {
+                    // LINUXABI3 M5: Ctrl-D — a partial line is sent as-is (no newline); on an empty line it is end of input.
+                    if edit.is_empty() {
+                        fd::stdin_eof_set();
+                    } else {
+                        pend.push_str(edit);
+                        fd::stdin_push(core::mem::take(edit).as_bytes());
+                    }
+                }
                 b'\n' | b'\r' => {
                     pend.push_str(edit);
                     pend.push('\n'); // the echo: prompt-so-far + what was typed
@@ -700,6 +772,9 @@ fn run_inner(path: &str, argv: &[&str], deadline_ms: u64, interactive: bool, out
     EXIT_CODE.store(-1, Ordering::Release);
     FAULT.store(0, Ordering::Release);
     NSYS.store(0, Ordering::Release);
+    TRACE_N.store(0, Ordering::Release);
+    BLOCKED.store(0, Ordering::Release);
+    let _ = fd::stdin_eof_take();
     ENOSYS_LIST.lock().clear();
     proc::reset_session();
     let _ = fd::out_take();
@@ -727,15 +802,25 @@ fn run_inner(path: &str, argv: &[&str], deadline_ms: u64, interactive: bool, out
     let deadline = crate::arch::ticks() + deadline_ms;
     let (mut pend, mut edit) = (String::new(), String::new());
     let mut ctrl_c = false;
+    let mut hinted = false;
     while root.is_live() && crate::arch::ticks() < deadline && !ctrl_c {
         proc::gc();
         drain_out(&mut pend, out, false);
         if interactive {
             ctrl_c = pump_keys(&mut edit, &mut pend, out);
+            // LINUXABI3 M5: a program waiting on stdin is not a hang — say so once, after 1 s, with any half-printed prompt shown.
+            if !hinted && edit.is_empty() && BLOCKED.load(Ordering::Acquire) == 1 && BLOCKED_A0.load(Ordering::Acquire) == 0
+                && !fd::stdin_has_data() && crate::arch::ms().saturating_sub(BLOCKED_T.load(Ordering::Acquire)) >= 1000
+            {
+                hinted = true;
+                drain_out(&mut pend, out, true);
+                out("(linux: the program is waiting for a line on stdin: type it + Enter; Ctrl-D = end of input, Ctrl-C = stop)");
+            }
         }
         crate::arch::sched::yield_now();
     }
     let timed_out = root.is_live();
+    let blocked = if timed_out { blocked_tag() } else { String::new() };
     // Let the finishing tasks leave their CR3 (sched::exit) before any table is freed.
     let settle = crate::arch::ticks() + 50;
     while crate::arch::ticks() < settle {
@@ -784,12 +869,13 @@ fn run_inner(path: &str, argv: &[&str], deadline_ms: u64, interactive: bool, out
                 lp.asp.free_frames();
             } // else: leak the space rather than free tables a still-live task may be running on
             fs_tab_clear(i.pml4);
+            fpu::release(i.pml4); // LINUXABI3
         }
     }
     proc::reset_session();
     x86_64::instructions::interrupts::without_interrupts(|| FORK_REGS.lock().clear());
     x86_64::instructions::interrupts::without_interrupts(|| fd::STDIN.lock().clear());
-    Ok(Report { pass: !timed_out && VIA_GROUP.load(Ordering::Acquire) && fault == 0, exit, nsys, enosys, ms, forks, child_ok })
+    Ok(Report { pass: !timed_out && VIA_GROUP.load(Ordering::Acquire) && fault == 0, exit, nsys, enosys, ms, forks, child_ok, blocked })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -802,7 +888,18 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
         console.println("usage: linux <path> [args...]   (run a static Linux x86_64 ELF; Ctrl-C ends it)");
         return;
     };
-    report(path, args, console);
+    // LINUXABI3: busybox picks its applet from argv[0]'s basename and accepts only names starting with lowercase "busybox";
+    // the FAT 8.3 name reads BUSYBOX.LNX, so hand it "busybox" (then `linux /apps/BUSYBOX.LNX ls /` runs the ls applet).
+    let mut argv: Vec<&str> = args.to_vec();
+    if is_busybox(path) {
+        argv[0] = "busybox";
+    }
+    report(path, &argv, console);
+}
+
+fn is_busybox(path: &str) -> bool {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    base.len() >= 7 && base.as_bytes()[..7].eq_ignore_ascii_case(b"busybox")
 }
 
 fn report(path: &str, argv: &[&str], console: &mut crate::console::Console) {
@@ -826,7 +923,7 @@ fn report(path: &str, argv: &[&str], console: &mut crate::console::Console) {
 /// `tests linuxabi` — run `/apps/HELLO.LNX`. Absent fixture = SKIP (staging is the arroyo/builder lane's).
 pub fn selftest() {
     const P: &str = "/apps/HELLO.LNX";
-    match run_path(P, &[P], 10_000, false, &mut |_| {}) {
+    match run_path(P, &[P], 5_000, false, &mut |_| {}) {
         Ok(r) => serial_println!("{}", r.witness(P)),
         Err(e) if e.contains("-ENOENT") => {
             serial_println!(":: LINUXABI: path={} exit=? syscalls=0 enosys=[] ms=0 -> SKIP (fixture not staged) ::", P)
@@ -840,18 +937,26 @@ pub fn selftest2() {
     const PIPE: &str = "/apps/PIPE.LNX";
     const LS: &str = "/apps/LS.LNX";
     let mut cap1 = String::new();
-    let r1 = run_path(PIPE, &[PIPE], 15_000, false, &mut |l| {
+    let r1 = run_path(PIPE, &[PIPE], 5_000, false, &mut |l| {
         cap1.push_str(l);
         cap1.push('\n');
     });
     let mut cap2 = String::new();
     fd::stdin_push(b"hello-stdin\n");
-    let r2 = run_path(LS, &[LS], 15_000, false, &mut |l| {
+    let r2 = run_path(LS, &[LS], 5_000, false, &mut |l| {
         cap2.push_str(l);
         cap2.push('\n');
     });
     fd::stdin_take_line(1 << 16);
     let missing = |r: &Result<Report, String>| matches!(r, Err(e) if e.contains("-ENOENT"));
+    // LINUXABI3 M5: a non-passing run prints its own witness first, which names the syscall it was blocked in on a timeout.
+    for (r, path) in [(&r1, PIPE), (&r2, LS)] {
+        if let Ok(rep) = r {
+            if !rep.pass {
+                serial_println!("{}", rep.witness(path));
+            }
+        }
+    }
     if missing(&r1) || missing(&r2) {
         serial_println!(":: LINUXABI2: fork_ok=0 pipe_ok=0 dents=0 stdin=0 -> SKIP (fixtures not staged) ::");
         return;
@@ -880,5 +985,75 @@ pub fn selftest2() {
     serial_println!(
         ":: LINUXABI2: fork_ok={} pipe_ok={} dents={} stdin={} -> {} ::",
         fork_ok as u8, pipe_ok as u8, dents, stdin_ok as u8, if pass { "PASS" } else { "FAIL" }
+    );
+}
+
+/// `tests linuxabi3` — `SSE.LNX` (SSE/SSE2 in ring 3, MXCSR, a 64-byte SSE memcpy, then two forks that verify inherited xmm8..15,
+/// mutate them across context switches and re-verify; the parent re-verifies its own after reaping) and, when an operator staged one,
+/// a static musl `BUSYBOX.LNX ls /`. Absent SSE.LNX = SKIP (staging is the arroyo/builder lane's); absent busybox = `busybox=skip`.
+pub fn selftest3() {
+    const SSE: &str = "/apps/SSE.LNX";
+    const BB: &str = "/apps/BUSYBOX.LNX";
+    let r0 = fpu::RESTORES.load(Ordering::Relaxed);
+    let (s0, k0, f0) = (fpu::SAVES.load(Ordering::Relaxed), fpu::FORK_COPIES.load(Ordering::Relaxed), fpu::CR4_FLIPS.load(Ordering::Relaxed));
+    let mut cap = String::new();
+    let r = run_path(SSE, &[SSE], 5_000, false, &mut |l| {
+        cap.push_str(l);
+        cap.push('\n');
+    });
+    if matches!(&r, Err(e) if e.contains("-ENOENT")) {
+        serial_println!(":: LINUXABI3: cr4=? save=fx sse_lnx=skip fork_fp=skip busybox=skip -> SKIP (fixture not staged) ::");
+        return;
+    }
+    let (mut sse_ok, mut fork_fp) = (false, false);
+    match &r {
+        Ok(rep) => {
+            let clean = rep.pass && rep.exit == "0";
+            sse_ok = clean && cap.lines().any(|l| l == "sse ok");
+            fork_fp = clean && rep.forks >= 2 && rep.child_ok >= 2;
+            if !clean {
+                // SSE.LNX exits with the id of the check that failed: 11-16 parent (11 paddd, 12/13 cvt*, 14 initial MXCSR,
+                // 15 parent xmm8..15 after the children, 16 MXCSR after the switches, 17 fork, 18/19 wait4), 21/22 a child.
+                serial_println!("[linuxabi] SSE.LNX exit={} forks={} child_ok={} blocked={}", rep.exit, rep.forks, rep.child_ok, rep.blocked);
+            }
+        }
+        Err(e) => serial_println!("[linuxabi] SSE.LNX: {}", e),
+    }
+    let restores = fpu::RESTORES.load(Ordering::Relaxed).wrapping_sub(r0);
+    let mut cap2 = String::new();
+    let rb = run_path(BB, &["busybox", "ls", "/"], 5_000, false, &mut |l| {
+        cap2.push_str(l);
+        cap2.push('\n');
+    });
+    let busybox = match &rb {
+        Err(e) if e.contains("-ENOENT") => "skip",
+        Ok(rep) if rep.pass && rep.exit == "0" && cap2.lines().filter(|l| !l.is_empty()).count() >= 3 => "ok",
+        Ok(rep) => {
+            serial_println!("{}", rep.witness(BB));
+            "fail"
+        }
+        Err(e) => {
+            serial_println!("[linuxabi] BUSYBOX.LNX: {}", e);
+            "fail"
+        }
+    };
+    let slots = fpu::in_use();
+    serial_println!(
+        "[linuxabi] fpu restores={} saves={} fork_copies={} cr4_flips={} slots_in_use_after={}",
+        restores,
+        fpu::SAVES.load(Ordering::Relaxed).wrapping_sub(s0),
+        fpu::FORK_COPIES.load(Ordering::Relaxed).wrapping_sub(k0),
+        fpu::CR4_FLIPS.load(Ordering::Relaxed).wrapping_sub(f0),
+        slots
+    );
+    let ok = |b: bool| if b { "ok" } else { "fail" };
+    let pass = sse_ok && fork_fp && busybox != "fail" && restores > 0 && slots == 0;
+    serial_println!(
+        ":: LINUXABI3: cr4={} save=fx sse_lnx={} fork_fp={} busybox={} -> {} ::",
+        if restores > 0 { "osfxsr" } else { "off" },
+        ok(sse_ok),
+        ok(fork_fp),
+        busybox,
+        if pass { "PASS" } else { "FAIL" }
     );
 }
