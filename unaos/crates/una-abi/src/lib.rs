@@ -1115,7 +1115,8 @@ mod veincore_abi {
         std::println!(":: VEINCORE-ABI: chat=130..=133 more={} ecanceled={} -> PASS ::", BUS_STATUS_MORE, ECANCELED);
     }
 }
-// ==========================================================================================// NETRING3 (B306) — entropy and name resolution for ring 3, the rungs under a metal HTTPS client.
+// ==========================================================================================
+// NETRING3 (B306) — entropy and name resolution for ring 3, the rungs under a metal HTTPS client.
 // Both numbers mean the same verb on both arches. Appended at the file tail so no existing line moves.
 // ==========================================================================================
 /// `SYS_GETRANDOM(buf, len) -> bytes written / -errno` — fill `buf` from the kernel DRBG (SHA-256,

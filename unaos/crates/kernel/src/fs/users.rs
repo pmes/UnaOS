@@ -2915,7 +2915,8 @@ pub fn login_usermgmt_fixture() {
     }
 }
 
-// ==================================================================================// FIRSTBOOT (R77) — THE FIRST BOOT IS AN INSTALLER, NOT A DESKTOP
+// ==================================================================================
+// FIRSTBOOT (R77) — THE FIRST BOOT IS AN INSTALLER, NOT A DESKTOP
 // =========================================================================================
 //
 // Peter, 2026-09-29 (RULINGS R77): with no root password set NOTHING runs but the root password setter;
