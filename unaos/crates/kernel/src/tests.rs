@@ -129,7 +129,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet();
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
@@ -207,4 +207,14 @@ fn ensure_unafsx86() {
 fn ensure_attr() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) { register("attr", crate::fs::attrsys::selftest); }
+}
+
+/// USBNET6 M4: register `tests usbnet` (the dongle receives a frame within 5 s) exactly once, on any build
+/// carrying the USB Ethernet driver; no dongle or no link prints SKIP, never a pin.
+fn ensure_usbnet() {
+    #[cfg(feature = "usbnet")]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("usbnet", crate::drivers::xhci::usbnet::selftest); }
+    }
 }
