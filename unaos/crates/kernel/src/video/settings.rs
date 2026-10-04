@@ -6,7 +6,7 @@
 //! cached-RAM surface, `wm::create_at`, keys/press chained from `quarry::live`, a latch drained by
 //! [`service`].
 //!
-//! Controls (index = keyboard order): 0 Brightness (BRIGHTKEYS level 0..16) · 1 Volume (VOLKEYS /
+//! Controls (index = keyboard order): 0 Brightness (BRIGHTFLOOR: level 1..16, through `backlight::set_level_via`; 0 is never written) · 1 Volume (VOLKEYS /
 //! HDA amp 0..16) · 2 Mute · 3 Idle blank minutes (DIMIDLE `set_idle_min`, 0 = never) · 4 Pointer
 //! speed (TPSPEED divisors: slow / normal / fast) · 5 Wallpaper path (text field) · 6 Apply · 7 Off ·
 //! 8 Change Password (the login screen's set-password form for the session user). The Clock 24h/12h
@@ -108,7 +108,7 @@ struct State {
 pub fn from_prefs(v: &mut Values) -> (u32, usize) {
     use crate::prefs::{flag, int, key, text};
     let mut mask = 0u32;
-    if let Some(x) = int(key::BRIGHTNESS, 0, 16) { v.bright = x as u8; mask |= 1 << 0; }
+    if let Some(x) = crate::prefs::get(crate::prefs::NS, key::BRIGHTNESS).and_then(|p| p.as_int()) { let (l, c) = load_brightness(Some(x)); v.bright = l; mask |= 1 << 0; if c { LOAD_CLAMPED.store(x, Ordering::Relaxed); } }
     if let Some(x) = int(key::VOLUME, 0, 16) { v.vol = x as u8; mask |= 1 << 1; }
     if let Some(x) = flag(key::MUTE) { v.mute = x; mask |= 1 << 2; }
     if let Some(x) = int(key::IDLE_MIN, 0, 1440) { v.idle_min = x as u32; mask |= 1 << 3; }
@@ -123,7 +123,7 @@ fn persist(i: usize) {
     use crate::prefs::{key, set_sys, PrefValue as P};
     let c = CUR.lock().clone();
     match i {
-        0 => set_sys(key::BRIGHTNESS, P::Int(c.bright as i64)),
+        0 => set_sys(key::BRIGHTNESS, P::Int(prefs_core::display::clamp_brightness(c.bright as i64))),
         1 | 2 => { set_sys(key::VOLUME, P::Int(c.vol as i64)); set_sys(key::MUTE, P::Bool(c.mute)); }
         3 => set_sys(key::IDLE_MIN, P::Int(c.idle_min as i64)),
         4 => set_sys(key::POINTER, P::Int(c.ptr as i64)),
@@ -157,8 +157,11 @@ fn say(name: &str, val: &str, applied: bool) {
 }
 
 fn apply_bright(v: u8) -> bool {
-    crate::video::brightkeys::set_level(v);
-    true
+    apply_bright_via(v, "slider")
+}
+/// BRIGHTFLOOR: THE backlight writer; `applied` is the READBACK verdict (`on`).
+fn apply_bright_via(v: u8, via: &str) -> bool {
+    crate::video::backlight::set_level_via(v, via).on
 }
 fn apply_volume(level: u8, mute: bool) -> bool {
     crate::video::status::set_volume(level, mute)
@@ -227,12 +230,21 @@ fn witness(ok: bool) {
 /// Load the store for the session user and apply the keys it carries.
 fn load_for_login() {
     crate::prefs::ensure_loaded();
+    safe_mode_check();
     let mut v = CUR.lock().clone();
     let (mask, n) = from_prefs(&mut v);
     *CUR.lock() = v.clone();
     LOADED_N.store(n as u32, Ordering::Relaxed);
     serial_println!("[settings] loaded n={} user={} store={}", n, user_name().unwrap_or_default(), crate::prefs::path());
-    if mask & 1 != 0 { apply_bright(v.bright); }
+    // BRIGHTFLOOR M2: a stored level below the floor (a stale 0) loads CLAMPED and is re-saved clamped;
+    // the level is applied on the NEXT desktop pass (the login screen stays at the boot level).
+    let lc = LOAD_CLAMPED.swap(NO_CLAMP, Ordering::Relaxed);
+    if lc != NO_CLAMP && mask & 1 != 0 {
+        serial_println!("[settings] brightness stored={} clamped={}", lc, v.bright);
+        persist(0);
+    }
+    // Staged (no I/O) so the key-sync below sees the loaded level, applied one pass later.
+    if mask & 1 != 0 { crate::video::backlight::stage(v.bright); LOGIN_APPLY.store(v.bright, Ordering::Release); }
     if mask & 2 != 0 || mask & 4 != 0 { apply_volume(v.vol, v.mute); }
     if mask & 8 != 0 { apply_idle(v.idle_min); }
     if mask & 16 != 0 { apply_ptr(v.ptr); }
@@ -246,7 +258,7 @@ fn set(i: usize, val: usize) {
     {
         let mut c = CUR.lock();
         match i {
-            0 => { c.bright = val.min(16) as u8; vtxt = alloc::format!("{}", c.bright); applied = apply_bright(c.bright); }
+            0 => { c.bright = crate::video::backlight::clamp(val.min(16) as u8); vtxt = alloc::format!("{}", c.bright); applied = apply_bright(c.bright); }
             1 => { c.vol = val.min(16) as u8; c.mute = false; vtxt = alloc::format!("{}", c.vol); applied = apply_volume(c.vol, false); }
             2 => { c.mute = val != 0; vtxt = alloc::format!("{}", c.mute as u8); applied = apply_volume(c.vol, c.mute); }
             3 => { c.idle_min = IDLE_STEPS[val.min(IDLE_STEPS.len() - 1)]; vtxt = alloc::format!("{}", c.idle_min); applied = apply_idle(c.idle_min); }
@@ -284,7 +296,7 @@ fn adjust(i: usize, d: isize) {
     let c = CUR.lock().clone();
     let step = |cur: usize, max: usize| -> usize { (cur as isize + d).clamp(0, max as isize) as usize };
     match i {
-        0 => set(0, step(c.bright as usize, 16)),
+        0 => set(0, step(c.bright as usize, 16).max(crate::video::backlight::FLOOR as usize)),
         1 => set(1, step(c.vol as usize, 16)),
         2 => set(2, (d > 0) as usize),
         3 => set(3, step(idle_index(c.idle_min), IDLE_STEPS.len() - 1)),
@@ -320,6 +332,10 @@ pub fn request_open() {
 /// Drain the open latch and load the store once per login. Chained from `quarry::live::service`.
 pub fn service() {
     crate::prefs::service();
+    boot_shift_latch();
+    // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
+    let la = LOGIN_APPLY.swap(0, Ordering::AcqRel);
+    if la != 0 { let on = apply_bright_via(la, "login"); say("brightness", &alloc::format!("{}", la), on); }
     if let Some(u) = user_name() {
         let fresh = { let mut g = LOADED_FOR.lock(); if *g != u { *g = u; true } else { false } };
         if fresh { load_for_login(); }
@@ -432,7 +448,7 @@ fn paint_general(st: &mut State, v: &Values) {
     let face = font::Face::Body;
     txt(st, LABEL_X, 0, "Brightness");
     slider(st, 0, v.bright as usize, 16);
-    txt(st, VAL_X, 0, &alloc::format!("{}/16", v.bright));
+    txt(st, VAL_X, 0, &alloc::format!("{}/16 {}%", v.bright, crate::video::backlight::percent(v.bright)));
     txt(st, LABEL_X, 1, "Volume");
     slider(st, 1, v.vol as usize, 16);
     txt(st, VAL_X, 1, &alloc::format!("{}/16", v.vol));
@@ -489,6 +505,9 @@ fn paint_about(st: &mut State) {
     txt(st, LABEL_X, 4, "Uptime");
     let up = crate::clock::uptime_secs().map(|u| alloc::format!("{}h {}m {}s", u / 3600, (u / 60) % 60, u % 60)).unwrap_or_else(|| String::from("n/a"));
     txt(st, TRACK_X, 4, &up);
+    txt(st, LABEL_X, 5, "Safe mode");
+    txt(st, TRACK_X, 5, "hold Shift at Log In: display prefs reset");
+    txt(st, TRACK_X, 6, "(or boot an UNAOS_PREFS_RESET=1 image)");
 }
 
 // ── Users tab (M2) ────────────────────────────────────────────────────────────────────────────
@@ -902,7 +921,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
 
 fn press_general(row: usize, cx: usize) {
     match row {
-        0 if cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 => { select(0); set(0, slider_at(cx, 16)); }
+        0 if cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 => { select(0); set(0, bright_at(cx)); }
         1 if cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6 => { select(1); set(1, slider_at(cx, 16)); }
         2 => { select(2); if cx >= TRACK_X && cx < TRACK_X + 24 { let m = CUR.lock().mute; set(2, (!m) as usize); } }
         3 => { select(4); if cx >= TRACK_X && cx < TRACK_X + TRACK_W { set(4, (cx - TRACK_X) / (TRACK_W / 3)); } }
@@ -1024,4 +1043,54 @@ pub fn selftest_users() {
 pub fn selftest_all() {
     selftest();
     selftest_users();
+}
+
+// ── BRIGHTFLOOR (B312): the floor, the load clamp, safe mode ───────────────────────────────────
+
+/// A stored level that loaded clamped ([`NO_CLAMP`] = none). Set by [`from_prefs`].
+static LOAD_CLAMPED: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(NO_CLAMP);
+const NO_CLAMP: i64 = i64::MIN;
+/// The level to apply on the next pass after a login's load (0 = none; levels are never 0).
+static LOGIN_APPLY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// Safe mode was asked for at boot (Shift held at the first desktop pass).
+static SAFE_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static BOOT_PASS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The stored brightness as a lit level: `(level, clamped)`. `None` (unset) = the default, not clamped.
+/// The rule is `prefs_core::display::clamp_brightness` — Principia's, shared by both rings. Pure.
+pub fn load_brightness(stored: Option<i64>) -> (u8, bool) {
+    match stored {
+        None => (crate::video::backlight::DEFAULT_LEVEL, false),
+        Some(x) => {
+            let c = prefs_core::display::clamp_brightness(x);
+            (c as u8, c != x)
+        }
+    }
+}
+
+/// Slider press → brightness level: the track maps to `FLOOR..=16`, never 0 (M3). Pure.
+pub fn bright_at(cx: usize) -> usize {
+    let f = crate::video::backlight::FLOOR as usize;
+    f + slider_at(cx, 16 - f)
+}
+
+/// Shift held at the first desktop pass (the HID modifier byte, EHCI and xHCI) latches safe mode.
+fn boot_shift_latch() {
+    if !BOOT_PASS.swap(true, Ordering::AcqRel) && crate::video::keymap::shift_held() {
+        SAFE_REQ.store(true, Ordering::Release);
+    }
+}
+
+/// SAFE MODE (M2): Shift held at the session's open (Shift+Enter / Shift-click on Log In), Shift held at
+/// boot, or the `UNAOS_PREFS_RESET=1` knob → `system.display.*` back to Principia's defaults, before the
+/// store's keys are applied. `[prefs] display reset=1 reason=<key|knob>`.
+fn safe_mode_check() {
+    let key = crate::video::keymap::shift_held() || SAFE_REQ.swap(false, Ordering::AcqRel);
+    let knob = cfg!(feature = "prefs_reset");
+    if !(key || knob) { return; }
+    let mut n = 0usize;
+    for (k, v) in prefs_core::display::defaults() {
+        if crate::prefs::set(crate::prefs::NS, k, v).is_ok() { n += 1; }
+    }
+    serial_println!("[prefs] display reset=1 reason={} keys={}", if knob { "knob" } else { "key" }, n);
 }

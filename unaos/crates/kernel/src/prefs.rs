@@ -33,7 +33,7 @@
 //!
 //! # Keys (namespace `system`)
 //!
-//! `display.brightness` (0..16) · `display.idle_min` (minutes, 0 = never) · `display.wallpaper` (a path,
+//! `display.brightness` (1..16; BRIGHTFLOOR clamps a stored 0 on load and save) · `display.idle_min` (minutes, 0 = never) · `display.wallpaper` (a path,
 //! empty = off) · `audio.volume` (0..16) · `audio.mute` (bool) · `pointer.speed` (0 slow, 1 normal, 2 fast)
 //! · `power.lowbat_shutdown_pct` (0 = off) · `dock.pins` (comma-joined app names — TOML arrays are outside
 //! the subset) · `settings.tab` (0..3). Defaults live with each consumer, as in Principia.

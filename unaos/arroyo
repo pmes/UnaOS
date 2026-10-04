@@ -1219,6 +1219,8 @@ fi
 [ -n "${UNAOS_LINUXABI:-}" ] && _feats="${_feats}linuxabi,"
 # BANDY3: UNAOS_BUSREG=1 arms fulfiller registration on the bus wire (crate::bus_route; `tests bandy3`). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_BUSREG:-}" ] && _feats="${_feats}busreg,"
+# BRIGHTFLOOR: UNAOS_PREFS_RESET=1 resets system.display.* to defaults at every login (the safe-mode boot knob; `[prefs] display reset=1 reason=knob`). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_PREFS_RESET:-}" ] && _feats="${_feats}prefs_reset,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
@@ -10910,6 +10912,10 @@ kernel8() {
     if [ -n "${UNAOS_BUSREG:-}" ]; then
         K8_FEATS="${K8_FEATS},busreg"
         echo -e "${COLOR_YELLOW}  • UNAOS_BUSREG: BANDY3 fulfiller registration on the bus wire (register verb 127, registrable tags 128..=255, kernel relay; tests bandy3)${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_PREFS_RESET:-}" ]; then
+        K8_FEATS="${K8_FEATS},prefs_reset"
+        echo -e "${COLOR_YELLOW}  • UNAOS_PREFS_RESET: BRIGHTFLOOR safe mode — system.display.* reset to defaults at every login${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_FATPERF:-}" ]; then
         K8_FEATS="${K8_FEATS},fatperf"
