@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 The Architect & Una
 #
-# LUMENBIN (rmbp-ledger B305): `APPS/LUMEN.BIN` — Lumen, the chat window, as a RING-3 program on the
-# kernel desktop. The host `vessels/lumen` (GTK/quartzite/Tokio) is the same face on a host; this crate
-# is its UnaOS form: one compositor window (SYS_WIN_CREATE .. SYS_WIN_PRESENT), the INPUT_EV_* ring, and
-# the chat verbs on the BUS v1 wire (SYS_MSEND / SYS_MRECV) fulfilled by VEIN.BIN. The vessel is wiring:
-# the model lives in Vein, the window only speaks the verbs (ROADMAP §3b principle 5).
+# LUMENAPP (rmbp-ledger B323, R82): `APPS/LUMEN.ELF` — Lumen on UnaOS as ONE program, like the Claude app:
+# one compositor window (SYS_WIN_CREATE .. SYS_WIN_PRESENT, the INPUT_EV_* ring) that talks to the
+# provider ITSELF through the Vein library — vein_core (pure: Messages encoder, SSE decoder, HTTP framing,
+# client, the prefs rules) + vein_ring3 (DNS, TCP, TLS, PREF_GET, the UnaFS key file). No daemon, no bus
+# chat verbs (LUMENBIN's VEIN.BIN relay is retired). Linked in the ELF window (user-lumen-x86.ld).
 #
-# Kept AS AN ELF64 and handed to the kernel's ELF loader exactly like user-pulse / user-prefs. The empty
-# [workspace] table makes this crate its OWN workspace root, so the parent workspace never builds this
-# no_std/no_main program for the host during `./arroyo check`.
+# The empty [workspace] table makes this crate its OWN workspace root, so the parent workspace never builds
+# this no_std/no_main program for the host during `./arroyo check`.
 [workspace]
 
 [package]
@@ -21,19 +20,17 @@ edition = "2021"
 name = "user-lumen"
 path = "src/main.rs"
 
-# Size first: the whole image (code + data + bss + stack) lives in the 16 KiB program window, and the bus
-# receive buffer alone is 4148 bytes of it. The link script asserts the stack's headroom.
 [profile.release]
-opt-level = "z"
+opt-level = "s"
 panic = "abort"
 lto = true
 codegen-units = 1
 
-# una-abi: the syscall numbers, the INPUT_EV_* layout and the BUS v1 wire constants (zero bytes).
-# font8x8: the glyph table — the SAME crate the kernel already links (crates/kernel/Cargo.toml), reused
-# rather than a third hand-typed bitmap copy (user-pulse and user-vug carry digit-only 5x7 tables; the
-# kernel's anti-aliased Noto atlases are ~10 KiB per face and cannot fit the window). no_std with
-# default features off; only `legacy::BASIC_LEGACY` (128 glyphs x 8 bytes = 1 KiB) is linked.
+# una-abi: the syscall numbers, the INPUT_EV_* layout, the window landmarks (zero bytes).
+# font8x8: the glyph table — the SAME crate the kernel links; only `legacy::BASIC_LEGACY` (1 KiB) is used.
+# vein_core / vein_ring3: Vein, linked as a library (the R82 shape).
 [dependencies]
 una-abi = { path = "../una-abi" }
 font8x8 = { version = "0.3.1", default-features = false }
+vein_core = { path = "../../libs/sys/vein_core", default-features = false }
+vein_ring3 = { path = "../../libs/sys/vein_ring3" }

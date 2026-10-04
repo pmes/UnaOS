@@ -2,30 +2,14 @@
 // Copyright (C) 2026 The Architect & Una
 //
 //! The conversation model (feature `alloc`). The type NAMES mirror VEINPROV's `gneiss_pal::api`
-//! (`ChatRequest`, `ChatResponse`, `ChatMessage`) — VEINPROV's types are not in this tree; the fold
-//! reconciles the two so that `ClaudeProvider` speaks these.
+//! (`ChatRequest`, `ChatResponse`, `ChatMessage`); `claude::encode_messages_request` encodes a
+//! [`ChatRequest`] for the Messages API.
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    System,
-    User,
-    Assistant,
-}
-
-impl Role {
-    /// The wire / API spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
-        }
-    }
-}
+pub use crate::role::Role;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {

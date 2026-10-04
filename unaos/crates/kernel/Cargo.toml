@@ -3723,19 +3723,13 @@ ioapic = []
 # tags exactly as before and nothing of the router is compiled. Kept in sync with `unaos/arroyo` (the
 # x86 `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 busreg = []
-# LUMENBIN (rmbp-ledger B305): UNAOS_LUMEN=1 arms the Lumen chat window's desktop presence — the `lumen` dock
-# pin joins the DEFAULT pin set (video/dock.rs DP_ALL) — and the `tests lumen` fixture (crate::lumen; x86 +
-# `wc`: LUMEN.ELF driven with synthetic keys, its witness block read out of its slot). The program itself
-# (APPS/LUMEN.ELF, crates/user-lumen) and a bare `lumen` (the program, no verb — EXECNAME B322) work on every build. Kept in sync with
-# `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
-lumen = []
-
-# VEINCORE (rmbp-ledger B304; docs/dev/evidence/rmbp-1004/VEINCORE.md): UNAOS_VEIN=1 arms the CHAT verbs'
-# kernel side — relay plumbing only (the verbs are OWNED by ring 3: APPS/VEIN.ELF): `bus_route::inject`
-# reached from the `vein` shell verb (`vein rsp …`, the bench relay companion's answer line) and the
-# `tests vein` fixture. Implies `busreg`. Off: nothing of crate::vein_bus is compiled. Kept in sync with
-# `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
-vein = ["busreg"]
+# LUMENBIN (rmbp-ledger B305), reshaped by LUMENAPP (B323, R82): UNAOS_LUMEN=1 arms the Lumen app's desktop
+# presence — the `lumen` dock pin joins the DEFAULT pin set (video/dock.rs DP_ALL) — and the ring-3-free
+# `tests lumen` fixture (crate::lumen: LUMEN.ELF staged, accepted by the loader in the ELF-window model,
+# windowed app note; provider/key by vein_core's shared rule). The program itself (APPS/LUMEN.ELF,
+# crates/user-lumen, ONE program that talks to the provider) and the `lumen` verb exist on every build.
+# Kept in sync with `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
+lumen = ["dep:vein_core"]
 
 # NETRING3 (rmbp-ledger B306): UNAOS_NETRING3=1 arms ring-3 entropy and name resolution — `SYS_GETRANDOM`
 # (56, the SHA-256 DRBG on top of `rand.rs`, whose cfg and `hash`'s widen to this feature) and
@@ -3787,9 +3781,9 @@ midden_core = { path = "../../libs/sys/midden_core", default-features = false }
 # PREFS (rmbp-ledger B300): Principia's shared preference core — value model + TOML subset codec, the
 # same crate `handlers/principia` links. no_std + alloc, zero deps; arch-neutral.
 prefs_core = { path = "../../libs/sys/prefs_core" }
-# VEINCORE (B304): Vein's shared no_std core — the chat bus codec the `vein` shell verb and `tests vein`
-# use (the same crate VEIN.ELF and handlers/vein link). Zero deps; only reached under feature `vein`.
-vein_core = { path = "../../libs/sys/vein_core" }
+# LUMENAPP (B323): Vein's shared no_std core — `tests lumen` applies the SAME provider/key rule the ring-3
+# LUMEN.ELF applies (vein_core::prefs::plan). Zero deps; only under feature `lumen`.
+vein_core = { path = "../../libs/sys/vein_core", default-features = false, optional = true }
 # SELFINSTALL2 (rmbp-ledger B310): Amber Bytes' shared disk-layout core — GPT encode/decode, the partition
 # Plan, the FAT32 BPB, the clone plan — the same crate `tools/una-card` and `handlers/amber_bytes` link.
 # no_std + alloc, zero deps; arch-neutral (install/gpt.rs and install/fat32.rs are its kernel callers).

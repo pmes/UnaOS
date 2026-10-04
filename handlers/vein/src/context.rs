@@ -46,10 +46,13 @@ mod tests {
         assert!(p.ends_with("\n\n[CONVERSATION HISTORY TO COMPRESS]:\nUser: fix the cortex\n\nAI: done\n"));
     }
 
-    /// The chat wire the host speaks to a metal VEIN.BIN is the same codec (KATs shared).
+    /// The Messages request a metal caller of Vein (LUMEN.ELF) builds is the shared core's encoder; the
+    /// host sees the same bytes (LUMENAPP B323).
     #[test]
-    fn chat_wire_kats_pass_on_the_host() {
-        let (p, t) = vein_core::wire::kats();
-        assert_eq!(p, t);
+    fn shared_core_encodes_the_messages_request() {
+        use vein_core::claude::{encode_body, Msg, Params};
+        let mut b = [0u8; 256];
+        let n = encode_body(&Params::new("claude-opus-5-5", 16, ""), [Msg { role: vein_core::Role::User, text: "hi" }].into_iter(), &mut b).unwrap();
+        assert!(core::str::from_utf8(&b[..n]).unwrap().ends_with(r#""messages":[{"role":"user","content":"hi"}]}"#));
     }
 }

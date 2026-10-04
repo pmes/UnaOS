@@ -3,213 +3,98 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-// LUMENBIN (rmbp-ledger B305): `APPS/LUMEN.BIN` — Lumen, the chat window, as a ring-3 program on the
-// kernel desktop. Peter, 2026-10-04: "port vessels/lumen to UnaOS".
+// LUMENAPP (rmbp-ledger B323, R82): `APPS/LUMEN.ELF` — Lumen on UnaOS is ONE program, like the Claude
+// app. Peter: "just make it work like the claude app. it does not need system services running."
 //
-// WHAT IT IS. The host Lumen (`vessels/lumen`, GTK/quartzite/Tokio) is a window over a model. On UnaOS
-// the window is this static ELF64 program and the model is VEIN.BIN, a ring-3 FULFILLER of the chat
-// verbs on the BUS v1 wire (BANDY3 registration, tags 130..=133 in the registrable range). This program
-// owns NO model, NO provider key and NO network: it draws a transcript and an input line, and it speaks
-// four verbs. That is ROADMAP §3b principle 5 — the desktop is a scene of live capabilities viewed over
-// the bus — and it is why there is no second chat implementation in the kernel.
+// WHAT IT IS. A window over a conversation that talks to the provider ITSELF: it links Vein as a library
+// (`vein_core`, the pure encoder/decoder/client/rules, and `vein_ring3`, the syscall transport), resolves
+// the endpoint (SYS_RESOLVE), opens TCP (the NETRING3 socket verbs), runs TLS 1.3 over it (embedded-tls),
+// POSTs /v1/messages with `stream: true` and draws the deltas as they arrive. Nothing else runs: no
+// daemon, no bus chat verbs, no autostart. (LUMENBIN's two-program shape — this window relaying to a
+// VEIN.BIN service over bus verbs 130..133 — is retired.)
 //
-// THE VERBS — VEINCORE's wire (docs/dev/evidence/rmbp-1004/VEINCORE.md §THE WIRE, codec of record
-// `unaos/libs/sys/vein_core/src/wire.rs`):
-//   CHAT_SEND   130  request [conv_id u32 LE][text utf8]
-//                    replies a SEQUENCE of ChatReply frames on the one correlation id:
-//                    [conv_id u32][seq u16][done u8][rsvd u8][text]; every non-final frame has header
-//                    status BUS_STATUS_MORE (= 1) and done = 0, the final one status 0 and done = 1; an
-//                    error ends the stream with a negative errno and an empty body (-ECANCELED, -EIO, ..)
-//   CHAT_REPLY  131  kernel -> VEIN only (the relay companion's injected answer); never sent from here
-//   CHAT_CANCEL 132  request [conv_id u32]; reply empty
-//   CHAT_STATUS 133  request empty; reply [ready u8][plen u8][mlen u8][rsvd u8][provider][model]
-// STREAMING IS PUSHED: VEINCORE's `more` flag keeps the relay's pending entry open, so the chunks simply
-// arrive in this program's mailbox in order. No fulfiller at all is the kernel's own -ENOENT reply (an
-// answer, never a hang), rendered as "no provider: start VEIN.BIN".
+// CONFIGURATION is Principia's (BUS_VERB_PREF_GET, namespace `vein`): `vein.provider`, `vein.model`,
+// `vein.endpoint`, `vein.tls`, `vein.key_file`. The KEY is read only from a file on the UnaFS volume (it
+// stats with an inode id); on FAT it is refused with the reason in the window. With no key the Echo
+// provider answers, so the window works on the FAT card. `vein_core::prefs::plan` is the rule.
 //
-// THE UI STAYS ALIVE. SYS_MRECV blocks while the mailbox is empty and the ABI has no non-blocking form,
-// so a RECEIVER THREAD (SYS_THREAD_SPAWN, same address space, same mailbox — the mailbox is per slot)
-// blocks in it and hands each frame to the main loop through one atomic length word. The main loop only
-// polls input, drains that word, redraws when dirty and sleeps. If the thread cannot be spawned the main
-// loop falls back to a blocking receive while a request is outstanding (one chunk of latency at a time).
+// THE ELF MODEL. Linked at una_abi::USER_XWIN_VA_X86 (user-lumen-x86.ld, the user-big shape), so the
+// kernel maps it in the 4 MiB ELF window with a 256 KiB stack (`-z stack-size`): ~80 KiB of TLS code and
+// ~90 KiB of buffers cannot live in the 16 KiB fixed window. The window landmarks (info page, surface)
+// stay at the fixed USER_BASE_X86 + 0x4000 / + 0x5000.
 //
-// KEYS. Printable ASCII inserts at the caret; Backspace deletes; Left/Right (and the TERMSEL2 caret
-// actions) move the caret; Enter sends; Up/Down and the wheel scroll the transcript; Ctrl-K or ⌘K
-// (INPUT_EV_ACTION code 41, ClearView) clears the transcript and starts a new conversation id; Esc
-// cancels a reply in flight and NEVER closes the window (R24 — the chrome's close box and `kill` do).
-// Shift+Enter cannot insert a newline: INPUT_EV_KEY_DOWN carries the ASCII byte only, no modifier bits,
-// and Shift+Enter arrives as the same '\n' as Enter. Stated, not faked.
+// KEYS. Printable ASCII inserts at the caret; Backspace deletes; Left/Right (and the caret actions) move
+// it; Enter sends; Up/Down and the wheel scroll; Ctrl-K or Cmd-K (INPUT_EV_ACTION 41, ClearView) starts a
+// new conversation; Esc cancels an answer in flight and NEVER closes the window (R24).
 //
-// WINDOW. 288x288 (the FB_WIN_MAX ceiling on both arches); INPUT_EV_WIN_RESIZE re-lays everything out
-// to the new content size (the surface slot and stride are unchanged). Text is the 8x8 face of the
-// `font8x8` crate — the same crate the kernel links — at 1x: 35 columns at full width.
-//
-// WITNESS. The first words of the RW segment are a fixed block (`.data.lumenwit`, pinned first by the
-// link script) that the kernel's `tests lumen` fixture reads out of the slot after driving this program
-// with synthetic keys. The program prints NO verdict itself — only `:: LUMEN: start ..` and one
-// `:: LUMEN: window=.. ::` progress line per finished exchange.
+// WIRE. `:: LUMEN: start provider=<claude|echo> model=<m> key=<unafs|none|fat-refused> transport=<tls|http|none> ::`
+// once, then per answer `:: LUMEN: reply provider=<p> first_token_ms=<n> bytes=<n> stop=<s> ::` or
+// `:: LUMEN: fail stage=<s> code=<n> ::`. The window's footer shows the provider and the first token's latency.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
 use una_abi::{
-    input_ev_payload, input_ev_type, BUS_FRAME_MAX, BUS_HDR_LEN, BUS_KIND_REPLY, BUS_KIND_REQUEST, BUS_MAGIC,
-    BUS_VERSION, ENOENT, INPUT_EV_ACTION, INPUT_EV_KEY_DOWN, INPUT_EV_WHEEL, INPUT_EV_WIN_RESIZE, KEY_DOWN,
-    KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP, SYS_EXIT, SYS_INPUT_POLL, SYS_MRECV, SYS_MSEND, SYS_SLEEP_MS,
-    SYS_THREAD_SPAWN, SYS_WIN_CREATE, SYS_WIN_PRESENT, SYS_WRITE,
+    input_ev_payload, input_ev_type, INPUT_EV_ACTION, INPUT_EV_KEY_DOWN, INPUT_EV_WHEEL, INPUT_EV_WIN_RESIZE, KEY_DOWN, KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP,
+    SYS_EXIT, SYS_INPUT_POLL, SYS_WIN_CREATE, SYS_WIN_PRESENT,
 };
+use vein_core::claude::{Event, Msg, Params, Stop};
+use vein_core::prefs::{KeyState, Plan};
+use vein_core::Role;
+use vein_ring3::sys::{now_ms, sleep_ms, sys, write};
 
-// The chat verbs. VEINCORE declares these in una-abi in parallel; until that fold they are restated here
-// with the SAME values. At the fold: delete these and import them from una_abi.
-const BUS_VERB_CHAT_SEND: u8 = 130;
-const BUS_STATUS_MORE: i64 = 1;
-const BUS_VERB_CHAT_CANCEL: u8 = 132;
-const BUS_VERB_CHAT_STATUS: u8 = 133;
-/// INPUT_EV_ACTION payload for ⌘K (`video::clipboard::action_code(Action::ClearView)`).
+/// The app note the loader and the shell read (EXECNAME): name "UnaOS", type 1, desc = flags, bit0 =
+/// windowed (a bare-word launch detaches it).
+#[repr(C, align(4))]
+struct AppNote {
+    namesz: u32,
+    descsz: u32,
+    ntype: u32,
+    name: [u8; 8],
+    flags: u32,
+}
+#[used]
+#[link_section = ".note.unaos.app"]
+static APP_NOTE: AppNote = AppNote { namesz: 6, descsz: 4, ntype: 1, name: *b"UnaOS\0\0\0", flags: una_abi::APP_NOTE_WINDOWED };
+
 const ACTION_CLEAR_VIEW: u64 = 41;
 const ACTION_CURSOR_LEFT: u64 = 13;
 const ACTION_CURSOR_RIGHT: u64 = 14;
 const ACTION_LINE_START: u64 = 15;
 const ACTION_LINE_END: u64 = 16;
 
-#[cfg(target_arch = "aarch64")]
-mod sysabi {
-    #[inline(always)]
-    pub unsafe fn sys4(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-        let mut r: u64;
-        unsafe {
-            core::arch::asm!("svc #0", inout("x0") a0 => r, in("x1") a1, in("x2") a2, in("x3") a3, in("x8") n, options(nostack))
-        };
-        r
-    }
-}
-/// x86_64: the kernel's `sysretq` tail scrubs rdi/rsi/rdx/r8/r9/r10 on EVERY return, so all six are
-/// declared as not surviving (U1b B1; see user-pulse for the long form). One 4-argument stub serves every
-/// call: unused argument registers are passed as 0, which every verb here ignores.
-#[cfg(target_arch = "x86_64")]
-mod sysabi {
-    #[inline(always)]
-    pub unsafe fn sys4(n: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-        let mut r: u64;
-        unsafe {
-            core::arch::asm!(
-                "syscall",
-                inlateout("rax") n => r,
-                inlateout("rdi") a0 => _,
-                inlateout("rsi") a1 => _,
-                inlateout("rdx") a2 => _,
-                inlateout("r10") a3 => _,
-                lateout("rcx") _, lateout("r11") _, lateout("r8") _, lateout("r9") _,
-                options(nostack),
-            )
-        };
-        r
-    }
-}
-use sysabi::sys4;
+const SYSTEM: &str = "You are Claude, talking with the person through Lumen, the chat window of UnaOS. The window shows plain ASCII text only, 35 columns wide: answer briefly, without markdown tables or images.";
 
-#[inline(never)]
-fn sys(n: u64, a0: u64, a1: u64, a2: u64) -> i64 {
-    unsafe { sys4(n, a0, a1, a2, 0) as i64 }
-}
-fn sleep_ms(ms: u64) {
-    sys(SYS_SLEEP_MS, ms, 0, 0);
-}
 fn exit(code: u64) -> ! {
-    sys(SYS_EXIT, code, 0, 0);
+    sys(SYS_EXIT, code, 0, 0, 0);
     loop {
         core::hint::spin_loop();
     }
 }
 
-// ---- witness block (read by the kernel fixture) -------------------------------------------------
-const WIT_MAGIC: u32 = 0x4E4D_554C; // "LUMN" little-endian
-const W_WINDOW: usize = 1;
-const W_SENT: usize = 2;
-const W_REPLIES: usize = 3;
-const W_ENOENT: usize = 4;
-const W_READY: usize = 5;
-const W_CLEARED: usize = 6;
-const W_KEYS: usize = 7;
-#[used]
-#[no_mangle]
-#[link_section = ".data.lumenwit"]
-static mut WIT: [u32; 8] = [WIT_MAGIC, 0, 0, 0, 0, 0, 0, 0];
-fn wit(i: usize, v: u32) {
-    unsafe { core::ptr::addr_of_mut!(WIT).cast::<u32>().add(i).write_volatile(v) }
-}
-
-// ---- bus ----------------------------------------------------------------------------------------
-static mut RX: [u8; BUS_FRAME_MAX] = [0; BUS_FRAME_MAX];
-/// Length of the frame waiting in RX (0 = empty; the receiver may refill).
-static RX_LEN: AtomicUsize = AtomicUsize::new(0);
-const TX_BODY: usize = 8 + INP_CAP;
-static mut TX: [u8; BUS_HDR_LEN + TX_BODY] = [0; BUS_HDR_LEN + TX_BODY];
-static mut CORR: u32 = 0;
-
-fn recv() -> i64 {
-    sys(SYS_MRECV, core::ptr::addr_of_mut!(RX) as u64, BUS_FRAME_MAX as u64, 0)
-}
-
-/// One REQUEST frame: header, then `head` ++ `tail` as the body. Returns SYS_MSEND's status.
-fn send(verb: u8, head: &[u8], tail: &[u8]) -> i64 {
-    let t = unsafe { &mut *core::ptr::addr_of_mut!(TX) };
-    let tail = &tail[..tail.len().min(TX_BODY - head.len())];
-    let blen = head.len() + tail.len();
-    let corr = unsafe {
-        CORR = CORR.wrapping_add(1);
-        CORR
-    };
-    t[..BUS_HDR_LEN].fill(0); // status 0, principal zero: the kernel stamps
-    t[0..4].copy_from_slice(&BUS_MAGIC);
-    t[4] = BUS_VERSION;
-    t[5] = BUS_KIND_REQUEST;
-    t[6] = verb;
-    t[8..12].copy_from_slice(&corr.to_le_bytes());
-    t[48..52].copy_from_slice(&(blen as u32).to_le_bytes());
-    t[BUS_HDR_LEN..BUS_HDR_LEN + head.len()].copy_from_slice(head);
-    t[BUS_HDR_LEN + head.len()..BUS_HDR_LEN + blen].copy_from_slice(tail);
-    sys(SYS_MSEND, t.as_ptr() as u64, (BUS_HDR_LEN + blen) as u64, 0)
-}
-
-#[repr(C, align(16))]
-struct Stack([u8; 384]);
-static mut TSTACK: Stack = Stack([0; 384]);
-
-/// The receiver thread: block in SYS_MRECV, publish the frame, wait for the main loop to take it.
-extern "C" fn rx_thread(_arg: u64) -> ! {
-    loop {
-        while RX_LEN.load(Ordering::Acquire) != 0 {
-            sleep_ms(4);
-        }
-        let n = recv();
-        if n > 0 {
-            RX_LEN.store(n as usize, Ordering::Release);
-        } else {
-            sleep_ms(50);
-        }
-    }
-}
-
-// ---- serial -------------------------------------------------------------------------------------
+// ---- console lines --------------------------------------------------------------------------------
 struct Line {
-    b: [u8; 96],
+    b: [u8; 200],
     n: usize,
 }
 impl Line {
     fn new(s: &[u8]) -> Line {
-        let mut l = Line { b: [0; 96], n: 0 };
+        let mut l = Line { b: [0; 200], n: 0 };
         l.put(s);
         l
     }
-    fn put(&mut self, s: &[u8]) {
+    fn put(&mut self, s: &[u8]) -> &mut Self {
         for &c in s {
             if self.n < self.b.len() {
                 self.b[self.n] = c;
                 self.n += 1;
             }
         }
+        self
     }
-    fn dec(&mut self, mut v: u32) {
-        let mut d = [0u8; 10];
+    fn dec(&mut self, v: i64) -> &mut Self {
+        if v < 0 {
+            self.put(b"-");
+        }
+        let mut v = v.unsigned_abs();
+        let mut d = [0u8; 20];
         let mut i = d.len();
         loop {
             i -= 1;
@@ -219,24 +104,26 @@ impl Line {
                 break;
             }
         }
-        self.put(&d[i..]);
+        self.put(&d[i..])
     }
-    fn kv(&mut self, k: &[u8], v: u32) {
-        self.put(k);
-        self.dec(v);
+    fn s(&self) -> &[u8] {
+        &self.b[..self.n]
     }
-    fn flush(&self) {
-        sys(SYS_WRITE, 1, self.b.as_ptr() as u64, self.n as u64);
+    fn wire(&mut self) {
+        self.put(b"\n");
+        write(&self.b[..self.n]);
+        self.n -= 1;
     }
 }
 
-// ---- the app ------------------------------------------------------------------------------------
+// ---- the app --------------------------------------------------------------------------------------
 const MAX_W: i32 = 288;
 const MAX_H: i32 = 288;
 const STRIDE: usize = MAX_W as usize * 4;
-const LH: i32 = 10; // line height: the 8 px glyph + 2 px leading
-const LOG_CAP: usize = 1024; // scrollback bytes: the window shows ~800 characters; see the budget note
-const INP_CAP: usize = 160;
+const LH: i32 = 10;
+/// Scrollback = the conversation sent to the model (oldest turns drop first).
+const LOG_CAP: usize = 32 * 1024;
+const INP_CAP: usize = 1024;
 const ROLE_USER: u8 = 1;
 const ROLE_AI: u8 = 2;
 const ROLE_NOTE: u8 = 3;
@@ -249,8 +136,6 @@ const NOTE_INK: u32 = 0xFF9A_92A8;
 const CARET: u32 = 0xFFB0_8CFF;
 const OK_INK: u32 = 0xFF7C_D992;
 
-const NO_PROVIDER: &[u8] = b"no provider: start VEIN.BIN";
-
 static FONT: [[u8; 8]; 128] = font8x8::legacy::BASIC_LEGACY;
 
 struct App {
@@ -259,22 +144,19 @@ struct App {
     inp: [u8; INP_CAP],
     inp_n: usize,
     caret: usize,
-    status: [u8; 40],
+    status: [u8; 64],
     status_n: usize,
     w: i32,
     h: i32,
     scroll: i32,
-    conv: u32,
-    pending: u32,
-    waiting: bool,
+    busy: bool,
+    cancel: bool,
     turn_open: bool,
-    ready: bool,
     dirty: bool,
-    sent: u32,
-    replies: u32,
-    enoent: u32,
-    cleared: u32,
-    keys: u32,
+    last_paint: u64,
+    win: i64,
+    flags: *const u32,
+    surf: *mut u8,
 }
 static mut APP: App = App {
     log: [0; LOG_CAP],
@@ -282,36 +164,42 @@ static mut APP: App = App {
     inp: [0; INP_CAP],
     inp_n: 0,
     caret: 0,
-    status: [0; 40],
+    status: [0; 64],
     status_n: 0,
     w: 0,
     h: 0,
     scroll: 0,
-    conv: 0,
-    pending: 0,
-    waiting: false,
+    busy: false,
+    cancel: false,
     turn_open: false,
-    ready: false,
     dirty: false,
-    sent: 0,
-    replies: 0,
-    enoent: 0,
-    cleared: 0,
-    keys: 0,
+    last_paint: 0,
+    win: 0,
+    flags: core::ptr::null(),
+    surf: core::ptr::null_mut(),
 };
+/// The one App. The program is single-threaded: the main loop and the network wait hook (`tick`, run
+/// from inside vein_ring3's socket waits) are never live at the same time, so each takes it in turn.
+fn app() -> &'static mut App {
+    unsafe { &mut *core::ptr::addr_of_mut!(APP) }
+}
+
+static mut BUFS: vein_ring3::Buffers = vein_ring3::Buffers::new();
+static mut KEY: [u8; 320] = [0; 320];
 
 impl App {
-    fn set_status(&mut self, a: &[u8], b: &[u8]) {
+    fn set_status(&mut self, parts: &[&[u8]]) {
         self.status_n = 0;
-        for &c in a.iter().chain(b.iter()) {
+        for &c in parts.iter().flat_map(|p| p.iter()) {
             if self.status_n < self.status.len() {
                 self.status[self.status_n] = if (0x20..0x7f).contains(&c) { c } else { b'?' };
                 self.status_n += 1;
             }
         }
+        self.dirty = true;
     }
 
-    /// Make room for `k` more bytes by dropping the OLDEST turn(s) — never a byte of the newest.
+    /// Make room for `k` more bytes by dropping the OLDEST turn(s).
     fn room(&mut self, k: usize) {
         while self.log_n + k > LOG_CAP && self.log_n > 0 {
             let mut cut = 1;
@@ -319,21 +207,22 @@ impl App {
                 cut += 1;
             }
             if cut >= self.log_n {
-                cut = (self.log_n / 2).max(1); // one turn larger than the log: keep its tail
+                cut = (self.log_n / 2).max(1);
             }
             self.log.copy_within(cut..self.log_n, 0);
             self.log_n -= cut;
             if self.log_n > 0 && self.log[0] > ROLE_NOTE {
-                self.log[0] = ROLE_AI; // a clipped turn still starts with a role byte
+                self.log[0] = ROLE_NOTE; // a clipped turn is shown, never sent half
             }
         }
     }
 
-    /// Append `text` (sanitised to printable ASCII + '\n'; UTF-8 sequences become one '?') to the log.
+    /// Append text (printable ASCII + '\n'; a UTF-8 sequence becomes one '?', tabs a space).
     fn add(&mut self, text: &[u8]) {
         for &c in text {
             let c = match c {
                 b'\n' | 0x20..=0x7e => c,
+                b'\t' => b' ',
                 0x80..=0xbf | b'\r' => continue,
                 _ => b'?',
             };
@@ -349,147 +238,45 @@ impl App {
         self.log[self.log_n] = role;
         self.log_n += 1;
         self.add(text);
+        self.turn_open = role == ROLE_AI;
     }
     fn note(&mut self, text: &[u8]) {
         self.turn(ROLE_NOTE, text);
-        self.turn_open = false;
-    }
-
-    fn progress(&self) {
-        let mut l = Line::new(b":: LUMEN: window=1");
-        l.kv(b" sent=", self.sent);
-        l.kv(b" replies=", self.replies);
-        l.kv(b" enoent=", self.enoent);
-        l.put(b" ::\n");
-        l.flush();
-        wit(W_SENT, self.sent);
-        wit(W_REPLIES, self.replies);
-        wit(W_ENOENT, self.enoent);
-        wit(W_READY, self.ready as u32);
-    }
-
-    fn submit(&mut self) {
-        if self.inp_n == 0 {
-            return;
-        }
-        let n = self.inp_n;
-        let rc = send(BUS_VERB_CHAT_SEND, &self.conv.to_le_bytes(), &self.inp[..n]);
-        self.turn(ROLE_USER, b"");
-        let mut i = 0;
-        while i < n {
-            let c = self.inp[i];
-            self.add(&[c]);
-            i += 1;
-        }
-        self.inp_n = 0;
-        self.caret = 0;
-        self.sent += 1;
-        if rc == 0 {
-            self.pending += 1;
-            self.waiting = true;
-            self.turn_open = false;
-        } else if rc == ENOENT {
-            self.enoent = 1;
-            self.note(NO_PROVIDER);
-        } else {
-            self.note(b"bus send refused");
-        }
-        self.progress();
     }
 
     fn clear(&mut self) {
-        if self.waiting {
-            send(BUS_VERB_CHAT_CANCEL, &self.conv.to_le_bytes(), &[]);
-            self.pending += 1;
-            self.waiting = false;
-        }
         self.log_n = 0;
         self.scroll = 0;
         self.turn_open = false;
-        self.conv = self.conv.wrapping_add(1);
-        self.cleared += 1;
-        wit(W_CLEARED, self.cleared);
         self.dirty = true;
     }
 
-    /// One reply frame of `n` bytes in RX.
-    fn frame(&mut self, n: usize) {
-        let r = unsafe { &*core::ptr::addr_of!(RX) };
-        if n < BUS_HDR_LEN || r[0..4] != BUS_MAGIC || r[5] != BUS_KIND_REPLY {
-            return; // not a reply: this program fulfils nothing
-        }
-        let u = |o: usize| u32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]]);
-        let status = u(12) as i32 as i64;
-        let blen = (u(48) as usize).min(n - BUS_HDR_LEN);
-        let body = &r[BUS_HDR_LEN..BUS_HDR_LEN + blen];
-        self.pending = self.pending.saturating_sub(1);
+    /// One input event. While an answer streams, Enter does nothing and Esc cancels.
+    fn event(&mut self, ev: u64) {
+        let p = input_ev_payload(ev);
         self.dirty = true;
-        match r[6] {
-            BUS_VERB_CHAT_STATUS => {
-                if status == 0 && blen >= 4 {
-                    self.ready = body[0] != 0;
-                    let pe = (4 + body[1] as usize).min(blen);
-                    let me = (pe + body[2] as usize).min(blen);
-                    let (prov, model) = (&body[4..pe], &body[pe..me]);
-                    self.set_status(prov, b"");
-                    if !model.is_empty() {
-                        let mut tmp = [0u8; 40];
-                        let k = self.status_n;
-                        tmp[..k].copy_from_slice(&self.status[..k]);
-                        self.set_status(&tmp[..k], b" / ");
-                        tmp[..self.status_n].copy_from_slice(&self.status[..self.status_n]);
-                        let k = self.status_n;
-                        self.set_status(&tmp[..k], model);
-                    }
-                } else {
-                    self.ready = false;
-                    self.set_status(if status == ENOENT { NO_PROVIDER } else { b"vein: status refused" }, b"");
-                }
-                wit(W_READY, self.ready as u32);
+        match input_ev_type(ev) {
+            INPUT_EV_KEY_DOWN => self.key(p as u8),
+            INPUT_EV_ACTION => match p {
+                ACTION_CLEAR_VIEW if !self.busy => self.clear(),
+                ACTION_CURSOR_LEFT => self.caret = self.caret.saturating_sub(1),
+                ACTION_CURSOR_RIGHT => self.caret = (self.caret + 1).min(self.inp_n),
+                ACTION_LINE_START => self.caret = 0,
+                ACTION_LINE_END => self.caret = self.inp_n,
+                _ => {}
+            },
+            INPUT_EV_WHEEL => self.scroll = (self.scroll + (p as u8 as i8 as i32)).max(0),
+            INPUT_EV_WIN_RESIZE => {
+                self.w = (((p >> 16) & 0xffff) as i32).clamp(64, MAX_W);
+                self.h = ((p & 0xffff) as i32).clamp(64, MAX_H);
             }
-            BUS_VERB_CHAT_SEND => {
-                if status == BUS_STATUS_MORE {
-                    self.pending += 1; // a non-final chunk: the request is still open
-                }
-                if !self.waiting {
-                    return; // cancelled or cleared: a late chunk is dropped, and nothing more is pulled
-                }
-                if status < 0 {
-                    self.waiting = false;
-                    if status == ENOENT {
-                        self.enoent = 1;
-                        self.note(NO_PROVIDER);
-                    } else {
-                        self.note(b"vein: reply refused");
-                    }
-                    self.progress();
-                    return;
-                }
-                // [conv u32][seq u16][done u8][rsvd u8][text]; the stream is over on done = 1 or a status-0
-                // frame. A body shorter than the header is one final chunk of plain text (a tolerant reader).
-                let (done, text) = if blen >= 8 { (body[6] != 0 || status == 0, &body[8..]) } else { (status != BUS_STATUS_MORE, body) };
-                if !self.turn_open {
-                    self.turn(ROLE_AI, b"");
-                    self.turn_open = true;
-                }
-                self.add(text); // `text` borrows the static RX, not `self`
-                self.replies += 1;
-                if done {
-                    self.waiting = false;
-                    self.turn_open = false;
-                    self.progress();
-                }
-            }
-            _ => {} // CHAT_CANCEL's empty reply and anything else
+            _ => {}
         }
     }
 
     fn key(&mut self, k: u8) {
-        self.keys += 1;
-        wit(W_KEYS, self.keys);
-        self.dirty = true;
         match k {
-            b'\n' => self.submit(),
+            b'\n' => {}
             0x08 | 0x7f => {
                 if self.caret > 0 {
                     self.inp.copy_within(self.caret..self.inp_n, self.caret - 1);
@@ -497,13 +284,10 @@ impl App {
                     self.inp_n -= 1;
                 }
             }
-            0x0b => self.clear(), // Ctrl-K
+            0x0b if !self.busy => self.clear(),
             KEY_ESC => {
-                if self.waiting {
-                    send(BUS_VERB_CHAT_CANCEL, &self.conv.to_le_bytes(), &[]);
-                    self.pending += 1;
-                    self.waiting = false;
-                    self.note(b"cancelled");
+                if self.busy {
+                    self.cancel = true;
                 }
             }
             KEY_LEFT => self.caret = self.caret.saturating_sub(1),
@@ -522,36 +306,7 @@ impl App {
         }
     }
 
-    fn event(&mut self, ev: u64) {
-        let p = input_ev_payload(ev);
-        match input_ev_type(ev) {
-            INPUT_EV_KEY_DOWN => self.key(p as u8),
-            INPUT_EV_ACTION => {
-                match p {
-                    ACTION_CLEAR_VIEW => self.clear(),
-                    ACTION_CURSOR_LEFT => self.caret = self.caret.saturating_sub(1),
-                    ACTION_CURSOR_RIGHT => self.caret = (self.caret + 1).min(self.inp_n),
-                    ACTION_LINE_START => self.caret = 0,
-                    ACTION_LINE_END => self.caret = self.inp_n,
-                    _ => {}
-                }
-                self.dirty = true;
-            }
-            INPUT_EV_WHEEL => {
-                self.scroll = (self.scroll + (p as u8 as i8 as i32)).max(0);
-                self.dirty = true;
-            }
-            INPUT_EV_WIN_RESIZE => {
-                self.w = (((p >> 16) & 0xffff) as i32).clamp(64, MAX_W);
-                self.h = ((p & 0xffff) as i32).clamp(64, MAX_H);
-                self.dirty = true;
-            }
-            _ => {}
-        }
-    }
-
-    /// Lay the transcript out at `cols` columns, calling `emit(role, text, first_line_of_turn)` per line.
-    /// User and note turns carry a 2-column prefix; a blank line follows every turn.
+    /// Lay the transcript out at `cols`, calling `emit(role, text, first_line_of_turn)` per line.
     fn layout(&self, cols: usize, emit: &mut dyn FnMut(u8, &[u8], bool)) {
         let mut i = 0;
         while i < self.log_n {
@@ -589,9 +344,226 @@ impl App {
             i = e;
         }
     }
+
+    /// Repaint now if something changed and the window is visible.
+    fn paint(&mut self) {
+        if !self.dirty || unsafe { self.flags.read_volatile() } & 2 != 0 {
+            return;
+        }
+        self.dirty = false;
+        self.last_paint = now_ms();
+        let s = Surf { p: self.surf, w: self.w, h: self.h };
+        render(self, &s);
+        sys(SYS_WIN_PRESENT, self.win as u64, 0, 0, 0);
+    }
 }
 
-// ---- raster -------------------------------------------------------------------------------------
+/// The conversation as the model sees it: user and assistant turns from the transcript, notes skipped.
+#[derive(Clone)]
+struct Turns<'a> {
+    log: &'a [u8],
+    i: usize,
+}
+impl<'a> Iterator for Turns<'a> {
+    type Item = Msg<'a>;
+    fn next(&mut self) -> Option<Msg<'a>> {
+        while self.i < self.log.len() {
+            let role = self.log[self.i];
+            let mut e = self.i + 1;
+            while e < self.log.len() && self.log[e] > ROLE_NOTE {
+                e += 1;
+            }
+            let text = &self.log[self.i + 1..e];
+            self.i = e;
+            let role = match role {
+                ROLE_USER => Role::User,
+                ROLE_AI => Role::Assistant,
+                _ => continue,
+            };
+            if let Ok(t) = core::str::from_utf8(text) {
+                return Some(Msg { role, text: t });
+            }
+        }
+        None
+    }
+}
+
+/// vein_ring3's wait hook: keep the window alive while the network waits.
+fn tick() -> bool {
+    let a = app();
+    let mut k = 0;
+    while k < 16 {
+        let ev = sys(SYS_INPUT_POLL, 0, 0, 0, 0);
+        if ev < 0 {
+            break;
+        }
+        a.event(ev as u64);
+        k += 1;
+    }
+    if now_ms().wrapping_sub(a.last_paint) >= 33 {
+        a.paint();
+    }
+    !a.cancel
+}
+
+/// What the session runs on, decided once at start.
+struct Session {
+    plan: Plan,
+    key: KeyState,
+    key_n: usize,
+    cfg: vein_ring3::prefs::Config,
+}
+
+impl Session {
+    fn provider(&self) -> &'static [u8] {
+        match self.plan {
+            Plan::Claude { .. } => b"claude",
+            Plan::Echo(_) => b"echo",
+        }
+    }
+    fn transport(&self) -> &'static [u8] {
+        match (self.plan, self.cfg.endpoint()) {
+            (Plan::Claude { .. }, Some(ep)) if ep.tls => b"tls",
+            (Plan::Claude { .. }, Some(_)) => b"http",
+            _ => b"none",
+        }
+    }
+    fn model(&self) -> &[u8] {
+        match self.plan {
+            Plan::Claude { .. } => self.cfg.model().as_bytes(),
+            Plan::Echo(_) => vein_core::provider::ECHO_MODEL.as_bytes(),
+        }
+    }
+    fn key(&self) -> Option<&'static str> {
+        match self.plan {
+            Plan::Claude { send_key: true } if self.key == KeyState::UnaFs => {
+                let b = unsafe { &*core::ptr::addr_of!(KEY) };
+                vein_core::prefs::key_from_file(&b[..self.key_n])
+            }
+            _ => None,
+        }
+    }
+}
+
+fn footer(sess: &Session, first_ms: Option<u64>) {
+    let mut l = Line::new(sess.provider());
+    l.put(b" / ").put(sess.model());
+    if let Some(ms) = first_ms {
+        l.put(b"  1st ").dec(ms as i64).put(b"ms");
+    }
+    let a = app();
+    let n = l.n;
+    a.set_status(&[&l.b[..n]]);
+}
+
+fn submit(sess: &Session) {
+    let a = app();
+    if a.inp_n == 0 || a.busy {
+        return;
+    }
+    let n = a.inp_n;
+    a.turn(ROLE_USER, b"");
+    let mut tmp = [0u8; INP_CAP];
+    tmp[..n].copy_from_slice(&a.inp[..n]);
+    a.add(&tmp[..n]);
+    a.inp_n = 0;
+    a.caret = 0;
+    a.busy = true;
+    a.cancel = false;
+    a.paint();
+
+    let t0 = now_ms();
+    let mut first: Option<u64> = None;
+    let mut bytes = 0usize;
+    let mut on = |e: Event<'_>| {
+        let a = app();
+        match e {
+            Event::Text(t) => {
+                if first.is_none() {
+                    first = Some(now_ms().saturating_sub(t0));
+                }
+                if !a.turn_open {
+                    a.turn(ROLE_AI, b"");
+                }
+                a.add(t.as_bytes());
+                bytes += t.len();
+            }
+            Event::Stop(Stop::Refusal) => a.note(b"the model declined this request (stop_reason refusal)"),
+            Event::Stop(Stop::MaxTokens) => a.note(b"answer cut at max_tokens"),
+            Event::Stop(_) | Event::Done => {}
+            Event::Error(m) => {
+                a.note(b"error: ");
+                a.add(m.as_bytes());
+            }
+            Event::Dropped => a.note(b"(a stream line too long for the buffer was skipped)"),
+        }
+        if now_ms().wrapping_sub(a.last_paint) >= 33 {
+            a.paint();
+        }
+    };
+
+    let mut stop: &[u8] = b"end_turn";
+    match sess.plan {
+        Plan::Echo(_) => {
+            let text = core::str::from_utf8(&tmp[..n]).unwrap_or("");
+            vein_core::provider::echo(text, 12, &mut |p| on(Event::Text(p)));
+        }
+        Plan::Claude { .. } => {
+            let ep = sess.cfg.endpoint().unwrap_or(vein_core::prefs::DEFAULT_ENDPOINT);
+            let p = Params::new(sess.cfg.model(), vein_core::claude::DEFAULT_MAX_TOKENS, SYSTEM);
+            let bufs = unsafe { &mut *core::ptr::addr_of_mut!(BUFS) };
+            let prepared = {
+                let a = app();
+                let turns = Turns { log: &a.log[..a.log_n], i: 0 };
+                vein_ring3::prepare(&ep, &p, turns, sess.key(), bufs)
+            };
+            let r = prepared.and_then(|req| vein_ring3::send(&ep, req, bufs, &mut on));
+            match r {
+                Ok(o) => {
+                    stop = o.stop.map_or(if o.status == 200 { b"none" as &[u8] } else { b"http-error" }, |s| s.as_str().as_bytes());
+                    if o.status != 200 {
+                        let mut l = Line::new(b"HTTP ");
+                        l.dec(o.status as i64);
+                        if let Some(ra) = o.retry_after {
+                            l.put(b", retry after ").dec(ra as i64).put(b" s");
+                        }
+                        let a = app();
+                        a.note(l.s());
+                    }
+                }
+                Err(st) => {
+                    stop = b"failed";
+                    let a = app();
+                    let mut l = Line::new(b":: LUMEN: fail stage=");
+                    l.put(st.name().as_bytes()).put(b" code=").dec(st.code());
+                    #[cfg(target_arch = "x86_64")]
+                    if matches!(st, vein_ring3::Stage::Handshake(_)) {
+                        l.put(b" tls=").put(vein_ring3::tls::last_error().as_bytes());
+                    }
+                    l.put(b" ::");
+                    l.wire();
+                    if a.cancel {
+                        a.note(b"cancelled");
+                    } else {
+                        let mut w = Line::new(b"could not reach the provider: ");
+                        w.put(st.name().as_bytes()).put(b" (").dec(st.code()).put(b")");
+                        a.note(w.s());
+                    }
+                }
+            }
+        }
+    }
+    let a = app();
+    a.busy = false;
+    a.turn_open = false;
+    footer(sess, first);
+    let mut l = Line::new(b":: LUMEN: reply provider=");
+    l.put(sess.provider()).put(b" first_token_ms=").dec(first.map_or(-1, |m| m as i64)).put(b" bytes=").dec(bytes as i64).put(b" stop=").put(stop).put(b" ::");
+    l.wire();
+    a.paint();
+}
+
+// ---- raster ---------------------------------------------------------------------------------------
 struct Surf {
     p: *mut u8,
     w: i32,
@@ -633,18 +605,10 @@ fn render(a: &App, s: &Surf) {
     let (w, h) = (a.w, a.h);
     s.fill(0, 0, w, h, BG);
     let cols = ((w - 8) / 8).max(4) as usize;
-    // Footer: the provider / model status line.
     let fy = h - LH - 2;
     s.fill(0, fy - 3, w, 1, RULE);
-    let (sc, st): (u32, &[u8]) = if a.waiting {
-        (CARET, b"... thinking (Esc cancels)")
-    } else if a.status_n == 0 {
-        (NOTE_INK, b"asking vein ...")
-    } else {
-        (if a.ready { OK_INK } else { NOTE_INK }, &a.status[..a.status_n])
-    };
+    let (sc, st): (u32, &[u8]) = if a.busy { (CARET, b"... answering (Esc cancels)") } else { (OK_INK, &a.status[..a.status_n]) };
     s.text(4, fy, &st[..st.len().min(cols)], sc);
-    // Input: up to three wrapped rows above the footer, scrolled so the caret's row is visible.
     let iw = cols.saturating_sub(2).max(1);
     let total = a.inp_n / iw + 1;
     let shown = total.min(3);
@@ -667,7 +631,6 @@ fn render(a: &App, s: &Surf) {
         }
         r += 1;
     }
-    // Transcript: bottom-anchored, `scroll` lines up from the newest.
     let rows = ((iy - 6 - 4) / LH).max(1) as usize;
     let mut n = 0usize;
     a.layout(cols, &mut |_, _, _| n += 1);
@@ -694,78 +657,103 @@ fn render(a: &App, s: &Surf) {
     });
 }
 
+/// The window landmarks: the RO info page at base + 0x4000, surface slot 0 at base + 0x5000. An
+/// elf-model program finds them at the FIXED slot base (RING3WIN), not at its own `_start`.
+#[cfg(target_arch = "x86_64")]
+fn landmark_base() -> u64 {
+    una_abi::USER_BASE_X86
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn landmark_base() -> u64 {
+    _start as *const () as u64
+}
+
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start() -> ! {
-    let base = _start as *const () as u64; // the window base (the link script pins e_entry at 0)
-    let a = unsafe { &mut *core::ptr::addr_of_mut!(APP) };
-
-    let win = sys(SYS_WIN_CREATE, MAX_W as u64, MAX_H as u64, 0);
+    let _ = &APP_NOTE;
+    let base = landmark_base();
+    let win = sys(SYS_WIN_CREATE, MAX_W as u64, MAX_H as u64, 0, 0);
     if win < 0 {
-        Line::new(b":: LUMEN: SYS_WIN_CREATE refused ::\n").flush();
+        Line::new(b":: LUMEN: SYS_WIN_CREATE refused ::").wire();
         exit(1);
     }
-    wit(W_WINDOW, 1);
-    (a.w, a.h, a.conv, a.dirty) = (MAX_W, MAX_H, 1, true); // APP is all-zero so it lands in .bss, not the file
-    let surf = Surf { p: (base + 0x5000) as *mut u8, w: MAX_W, h: MAX_H };
-    let flags = unsafe { ((base + 0x4000) as *const u32).add(0x20 / 4) }; // VUGMIN: bit 1 = all hidden
+    {
+        let a = app();
+        a.win = win;
+        (a.w, a.h, a.dirty) = (MAX_W, MAX_H, true);
+        a.surf = (base + 0x5000) as *mut u8;
+        a.flags = unsafe { ((base + 0x4000) as *const u32).add(0x20 / 4) }; // VUGMIN: bit 1 = all hidden
+        a.set_status(&[b"reading preferences ..."]);
+        a.paint();
+    }
 
-    let sp = core::ptr::addr_of_mut!(TSTACK) as u64 + core::mem::size_of::<Stack>() as u64;
-    let threaded = sys(SYS_THREAD_SPAWN, rx_thread as *const () as u64, sp, 0) >= 0;
+    // The session: Principia's `vein` namespace, the key file, the rule.
+    let cfg = vein_ring3::prefs::Config::read();
+    let keybuf = unsafe { &mut *core::ptr::addr_of_mut!(KEY) };
+    let (key, key_n) = vein_ring3::key::read(cfg.key_file(), keybuf);
+    let plan = cfg.plan(key);
+    let sess = Session { plan, key, key_n, cfg };
+    vein_ring3::net::set_tick(Some(tick));
 
-    let mut l = Line::new(b":: LUMEN: start");
-    l.kv(b" win=", win as u32);
-    l.kv(b" threaded=", threaded as u32);
-    l.put(b" verbs=130..133 ::\n");
-    l.flush();
+    let mut l = Line::new(b":: LUMEN: start provider=");
+    l.put(sess.provider()).put(b" model=").put(sess.model()).put(b" key=").put(key.as_str().as_bytes()).put(b" transport=").put(sess.transport());
+    if sess.cfg.bus_err != 0 {
+        l.put(b" prefs=").dec(sess.cfg.bus_err);
+    }
+    l.put(b" ::");
+    l.wire();
 
-    a.note(b"Lumen on UnaOS. Enter sends, Ctrl-K or Cmd-K clears, Esc cancels.");
-    let mut status_due = 0u32;
+    {
+        let a = app();
+        a.note(b"Lumen on UnaOS. Enter sends, Ctrl-K or Cmd-K starts over, Esc cancels.");
+        match sess.plan {
+            Plan::Echo(r) => {
+                a.note(b"offline: the echo provider answers. ");
+                a.add(r.text().as_bytes());
+            }
+            Plan::Claude { send_key } => {
+                if send_key && sess.transport() == b"tls" {
+                    a.note(b"TLS without certificate checks (vein.tls = insecure): the trust store is owed.");
+                } else if !send_key {
+                    a.note(b"relay endpoint: the key stays on the relay.");
+                }
+            }
+        }
+        if key == KeyState::OnFat {
+            a.note(KeyState::OnFat.as_str().as_bytes());
+        }
+    }
+    footer(&sess, None);
+
     loop {
-        // Ask Vein who is answering: at start, then every ~4 s while nobody is.
-        if !a.ready && status_due == 0 {
-            if send(BUS_VERB_CHAT_STATUS, &[], &[]) == 0 {
-                a.pending += 1;
-            }
-            status_due = 250;
-        }
-        status_due = status_due.saturating_sub(1);
-
-        let mut k = 0;
-        while k < 16 {
-            let ev = sys(SYS_INPUT_POLL, 0, 0, 0);
-            if ev < 0 {
-                break;
-            }
-            a.event(ev as u64);
-            k += 1;
-        }
-
-        if threaded {
-            let n = RX_LEN.load(Ordering::Acquire);
-            if n != 0 {
-                a.frame(n);
-                RX_LEN.store(0, Ordering::Release);
-            }
-        } else if a.pending > 0 {
-            let n = recv(); // no receiver thread: one blocking receive per outstanding request
-            if n > 0 {
-                a.frame(n as usize);
+        let mut send = false;
+        {
+            let a = app();
+            let mut k = 0;
+            while k < 16 {
+                let ev = sys(SYS_INPUT_POLL, 0, 0, 0, 0);
+                if ev < 0 {
+                    break;
+                }
+                if input_ev_type(ev as u64) == INPUT_EV_KEY_DOWN && input_ev_payload(ev as u64) as u8 == b'\n' {
+                    send = true;
+                }
+                a.event(ev as u64);
+                k += 1;
             }
         }
-
-        if a.dirty && unsafe { flags.read_volatile() } & 2 == 0 {
-            a.dirty = false;
-            let s = Surf { w: a.w, h: a.h, ..surf };
-            render(a, &s);
-            sys(SYS_WIN_PRESENT, win as u64, 0, 0);
+        if send {
+            submit(&sess);
         }
+        app().paint();
         sleep_ms(16);
     }
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
+    write(b":: LUMEN: panic ::\n");
     exit(3)
 }
 
