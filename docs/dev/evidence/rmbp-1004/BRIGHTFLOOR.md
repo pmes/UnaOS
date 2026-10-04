@@ -76,3 +76,14 @@ system.display.brightness=1 ok=1`.
 * Whether the 1/16 floor is comfortably visible on the bench panel — the metal boot says; the floor is
   one constant (`backlight::FLOOR_NUM`).
 * The aarch64 desktops have no backlight driver: `set_level` keeps the level and prints `driver=none`.
+
+## M5 (the seat's two decisions)
+
+* The reset key is Shift held during the FIRST DESKTOP PASS of the session — the pass `SAFE_SETTLE_MS`
+  (500 ms) after the session opened, before the stored keys are read or applied — never the Enter that
+  logged in (a password ending in a capital would have reset). The boot-time latch and the at-Enter read
+  are gone; the knob stays. The login screen's footer carries the hint in the small (Chrome) face. The
+  key-to-store sync waits for that load, so a key pressed in the settle cannot overwrite the store.
+* Brightness moved to the Display tab (row 0, then Blank screen); General keeps volume, mute, pointer,
+  wallpaper, apply, off, password, one row up each. Control indices unchanged; keyboard order per tab is in
+  the settings.rs header.

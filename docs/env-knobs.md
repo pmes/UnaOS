@@ -5083,8 +5083,9 @@ the `usb_xhci.md` paragraph is kept, marked retired.
 - Safe mode for the display preferences: an image built with `UNAOS_PREFS_RESET=1` (feature `prefs_reset`,
   both arches) resets `system.display.brightness`, `system.display.idle_min` and `system.display.wallpaper`
   to Principia's defaults (12, 10, off) at every login, before the store's keys are applied, and prints
-  `[prefs] display reset=1 reason=knob`. The knob-free half of the escape: hold **Shift** while pressing
-  Enter / clicking Log In (or at power-on, through the first desktop pass) — `reason=key`. A stored
+  `[prefs] display reset=1 reason=knob`. The knob-free half of the escape: hold **Shift** AFTER logging in,
+  through the first desktop pass (500 ms after the session opens; never the Enter itself) — `reason=key`;
+  the login screen's footer says so. A stored
   brightness of 0 can no longer dark a login in any case: it loads clamped to 1 (`prefs_core::display`).
 
 ## `UNAOS_QEMU_DEBUG_LOG`
