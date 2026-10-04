@@ -188,6 +188,7 @@ fn list(console: &mut Console) {
 }
 
 fn help_one(console: &mut Console, w: &str) {
+    if let Some(l) = midden_core::gated_off_line(w) { return console.println(&l); } // GATED-OFF (TESTFIX4, B330): the doc row stays, the build lacks the verb
     match find(&w.to_ascii_lowercase()) {
         Some(x) => print_text(console, &render(x)),
         None => console.println(&alloc::format!("help: no help for `{}` (try `help`)", w)),
@@ -196,6 +197,7 @@ fn help_one(console: &mut Console, w: &str) {
 
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn man_one(console: &mut Console, w: &str) {
+    if let Some(l) = midden_core::gated_off_line(w) { return console.println(&l); } // GATED-OFF (TESTFIX4, B330)
     match find(&w.to_ascii_lowercase()) {
         Some(x) => match crate::video::fileview::open_text(&alloc::format!("man:{}", x.name), &render(x)) {
             Ok(_) => console.println(&alloc::format!("man: {} - window open", x.name)),
