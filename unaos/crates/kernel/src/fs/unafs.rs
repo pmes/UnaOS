@@ -327,6 +327,7 @@ impl SectorDevice for SdSectorDevice {
     /// otherwise the root flip can reach the medium before the tree it points
     /// at, and commit ordering silently breaks.
     fn flush(&mut self) -> Result<(), SectorError> {
+        #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let block::BlockHandle::Ahci { port } = self.handle { return block::flush_ahci_port(port).map_err(|_| SectorError::Io(alloc::string::String::from("ahci: FLUSH CACHE EXT failed"))); } // AHCIROOT (B332): a SATA SSD HAS a write cache — this is the real drain the note above demands
         Ok(())
     }
 }

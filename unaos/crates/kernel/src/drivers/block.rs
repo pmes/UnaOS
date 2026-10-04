@@ -48,6 +48,9 @@ pub enum BlockError {
     /// this family is named for; the FAT layer retries OUTSIDE its masked span and surfaces
     /// `-EAGAIN` on exhaustion.
     Busy,
+    /// AHCIROOT (rmbp-ledger B332): -EPERM — a write to a SATA port with no live kernel-held grant
+    /// covering that LBA (`AHCI_LIVE_GRANT`, drivers/block.rs tail). Nothing was written.
+    Denied,
 }
 
 /// WEDGE-8 (F3): claim the xHCI controller for one block transaction.
@@ -2949,13 +2952,13 @@ pub fn read_blocks_ahci_port(port: u8, lba: u64, buf: &mut [u8]) -> Result<usize
 /// exactly one witness that names it.
 #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
 pub fn write_block_ahci_port(_port: u8, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
-    write_block_ahci(lba, buf)
+    #[cfg(feature = "ahciroot")] let r = ahci_port_write(_port, lba, buf); #[cfg(not(feature = "ahciroot"))] let r = write_block_ahci(lba, buf); r // AHCIROOT (B332): the live grant decides; -EPERM without one
 }
 
 /// AHCIBOOT: the counted twin of [`write_block_ahci_port`] — refuses before touching the medium.
 #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
 pub fn write_blocks_ahci_port(_port: u8, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
-    write_block_ahci(lba, buf)
+    #[cfg(feature = "ahciroot")] let r = ahci_port_write(_port, lba, buf); #[cfg(not(feature = "ahciroot"))] let r = write_block_ahci(lba, buf); r // AHCIROOT (B332): the live grant decides; -EPERM without one
 }
 
 /// AHCIBOOT: the SATA root's standing write refusal, as [`handle_write_veto`] reports it.
@@ -3607,4 +3610,186 @@ pub fn write_blocks_sdhc_mb(lba: u64, count: usize, buf: &[u8]) -> Result<(), Bl
     let r = crate::drivers::sdhc::write_blocks_512(lba, count as u16, &buf[..count * SECTOR_BYTES]);
     crate::drivers::sdhc::wr_census_note(t0, count as u64, true, *r.as_ref().unwrap_or(&0), r.is_ok());
     r.map(|_| ())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// AHCIROOT (rmbp-ledger B332, R82) — THE KERNEL-HELD SATA WRITE GRANT and the port write path.
+//
+// AHCIWRITE gave the installer a `WriteGrant` VALUE it carries inside its own `InstallTarget`; the
+// PLAIN port path (`write_block_ahci_port`, which UnaFS's sector seam and the FAT writer reach) kept
+// refusing, so the SSD's UnaFS could never be the read-write `/`. This section is the one door that
+// path gains, and it is a SLOT, not a flag:
+//
+//   * ONE grant at a time, for ONE port and ONE inclusive LBA range, plus who holds it (`install`,
+//     `root`, `test`). The slot is filled only with a `WriteGrant` that `install::partition` minted —
+//     `WriteGrant::new` keeps its single call site, so the AHCIWRITE audit greps are unchanged.
+//   * [`hold_ahci_grant`] returns a [`GrantHold`]; dropping it FLUSHES the drive and empties the slot.
+//     `install ssd --write` and `tests ahciw` hold it for the verb's lifetime only. The boot's root
+//     bind keeps its hold for the boot ([`hold_ahci_grant_for_boot`]) — and an occupied slot is why
+//     `install ssd --write` cannot run over the live root.
+//   * With no live grant covering the sector, [`ahci_port_write`] returns [`BlockError::Denied`]
+//     (-EPERM) and prints `:: [ahci] write -EPERM … ::` (first few per boot, then counted).
+//   * A granted write goes through `write_sectors_granted` (the one caller of `ahci::write_block_at`)
+//     and every sector is READ BACK and compared. The flush is the commit barrier: UnaFS's
+//     `SdSectorDevice::flush` (its pre-root-flip barrier) calls [`flush_ahci_port`] on an AHCI handle.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// AHCIROOT: who holds the live SATA write grant.
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GrantKind {
+    /// `install ssd --write`, for the verb's lifetime, on a disk the self-guard judged.
+    Install,
+    /// The boot's root bind, over an OURS disk's UnaFS partition, for the boot.
+    Root,
+    /// `tests ahciw`, over the 64-sector scratch tail of an OURS disk's UnaFS partition.
+    Test,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+impl GrantKind {
+    pub fn tag(self) -> &'static str {
+        match self {
+            GrantKind::Install => "install",
+            GrantKind::Root => "root",
+            GrantKind::Test => "test",
+        }
+    }
+}
+
+/// AHCIROOT: THE slot. `None` = every SATA port write through the plain path is -EPERM.
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+static AHCI_LIVE_GRANT: Mutex<Option<(WriteGrant, GrantKind)>> = Mutex::new(None);
+
+/// AHCIROOT: refusal lines printed so far (the first [`DENY_LINES`] print; the rest are counted).
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+static AHCI_DENIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+const DENY_LINES: u32 = 4;
+
+/// AHCIROOT: the live grant, if any — `(port, first_lba, last_lba, kind)`.
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+pub fn ahci_live_grant() -> Option<(u8, u64, u64, GrantKind)> {
+    crate::arch::without_interrupts(|| AHCI_LIVE_GRANT.lock().map(|(g, k)| (g.port(), g.first_lba(), g.last_lba(), k)))
+}
+
+/// AHCIROOT: how many port writes have been refused -EPERM this boot.
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+pub fn ahci_denied_count() -> u32 {
+    AHCI_DENIED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// AHCIROOT: the RAII face of a live grant. Dropping it flushes the drive and empties the slot.
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+#[must_use = "the grant is dropped (and the slot emptied) the moment the hold is"]
+pub struct GrantHold {
+    port: u8,
+    kind: GrantKind,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+impl GrantHold {
+    pub fn port(&self) -> u8 {
+        self.port
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+impl Drop for GrantHold {
+    fn drop(&mut self) {
+        let flushed = flush_ahci_port(self.port).is_ok();
+        crate::arch::without_interrupts(|| *AHCI_LIVE_GRANT.lock() = None);
+        if self.kind != GrantKind::Root {
+            serial_println!(
+                "[ahci] grant dropped port={} kind={} flush={}",
+                self.port,
+                self.kind.tag(),
+                if flushed { "ok" } else { "FAIL" }
+            );
+        }
+    }
+}
+
+/// AHCIROOT: put a minted grant in the slot. `None` when the slot is already held (by anyone) — the
+/// caller refuses; it never waits and never replaces another holder's grant.
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+pub fn hold_ahci_grant(g: WriteGrant, kind: GrantKind) -> Option<GrantHold> {
+    let prior = crate::arch::without_interrupts(|| {
+        let mut s = AHCI_LIVE_GRANT.lock();
+        match *s {
+            Some((h, hk)) => Some((h.port(), hk)),
+            None => {
+                *s = Some((g, kind));
+                None
+            }
+        }
+    });
+    if let Some((p, hk)) = prior {
+        if kind != GrantKind::Root {
+            serial_println!("[ahci] grant REFUSED port={} kind={} — the slot is held (port={} kind={})", g.port(), kind.tag(), p, hk.tag());
+        }
+        return None;
+    }
+    if kind != GrantKind::Root {
+        serial_println!("[ahci] grant held port={} kind={} lba={}..{}", g.port(), kind.tag(), g.first_lba(), g.last_lba());
+    }
+    Some(GrantHold { port: g.port(), kind })
+}
+
+/// AHCIROOT: the boot's root hold — kept for the life of the boot (the hold is leaked on purpose:
+/// the root volume is written until power-off). Silent (R80: the root line is the boot's one line).
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+pub fn hold_ahci_grant_for_boot(g: WriteGrant) -> bool {
+    match hold_ahci_grant(g, GrantKind::Root) {
+        Some(h) => {
+            core::mem::forget(h);
+            true
+        }
+        None => false,
+    }
+}
+
+/// AHCIROOT: ATA `FLUSH CACHE EXT` on the disk at HBA `port`.
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+pub fn flush_ahci_port(port: u8) -> Result<(), BlockError> {
+    let ix = ahci_ix_of_port(port).ok_or(BlockError::NotReady)?;
+    crate::drivers::ahci::flush_at(ix).map_err(|_| BlockError::Io)
+}
+
+/// AHCIROOT: THE plain SATA port write. -EPERM unless the live grant names this port and covers
+/// every sector of the run; otherwise written through the grant and read back sector by sector.
+#[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
+pub fn ahci_port_write(port: u8, lba: u64, buf: &[u8]) -> Result<(), BlockError> {
+    if buf.is_empty() || buf.len() % SECTOR_BYTES != 0 {
+        return Err(BlockError::BadLba);
+    }
+    let n = (buf.len() / SECTOR_BYTES) as u64;
+    let last = lba.checked_add(n - 1).ok_or(BlockError::BadLba)?;
+    let live = crate::arch::without_interrupts(|| *AHCI_LIVE_GRANT.lock());
+    let g = match live {
+        Some((g, _)) if g.port() == port && g.allows(lba) && g.allows(last) => g,
+        other => {
+            let k = AHCI_DENIED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if k < DENY_LINES {
+                match other {
+                    None => serial_println!(":: [ahci] write -EPERM port={} lba={} grant=none — nothing written ::", port, lba),
+                    Some((g, gk)) => serial_println!(
+                        ":: [ahci] write -EPERM port={} lba={} grant=port {} {}..{} kind={} — outside it, nothing written ::",
+                        port, lba, g.port(), g.first_lba(), g.last_lba(), gk.tag()
+                    ),
+                }
+            }
+            return Err(BlockError::Denied);
+        }
+    };
+    write_sectors_granted(&g, lba, buf)?;
+    let mut rb = [0u8; SECTOR_BYTES];
+    for i in 0..n as usize {
+        read_block_ahci_port(port, lba + i as u64, &mut rb)?;
+        if rb[..] != buf[i * SECTOR_BYTES..(i + 1) * SECTOR_BYTES] {
+            serial_println!(":: [ahci] write readback MISMATCH port={} lba={} — the medium does not hold what was written ::", port, lba + i as u64);
+            return Err(BlockError::Io);
+        }
+    }
+    Ok(())
 }

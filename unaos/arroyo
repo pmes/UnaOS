@@ -2655,6 +2655,12 @@ fi
 # module unconditionally, so this knob changes nothing there (its K8_FEATS arm is harmless by design).
 # Default OFF => the x86 image is byte-identical. Kept in sync with builder/src/main.rs and Cargo.toml.
 [ -n "${UNAOS_UNAFS:-}" ] && _feats="${_feats}unafs,"
+# AHCIROOT (rmbp-ledger B332, R82): UNAOS_AHCIROOT=1 makes the internal SSD's UnaFS p2 the root when the disk
+# is judged OURS, lets `install ssd --write` lay ESP + UnaFS (cloned or freshly formatted) under a kernel-held
+# write grant, and adds `tests ahciw`. Implies ahci-write, unafs and installdemo (Cargo.toml). x86 only.
+# ⚠ like UNAOS_AHCI_WRITE this can write Peter's SSD — but only through the grant, never ambient.
+# Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
+[ -n "${UNAOS_AHCIROOT:-}" ] && _feats="${_feats}ahciroot,"
 # HDA (rmbp-ledger B127, arc 1): UNAOS_HDA=1 arms drivers/hda.rs — the High Definition Audio
 # controller, the kernel's first audio line. NOTHING IN THIS KERNEL HAS EVER TOUCHED AUDIO, and the
 # reason is structural rather than an omission: `PciScanner::enumerate_buses` matches exactly one
@@ -3043,6 +3049,7 @@ arm_features() {
     # substring (the trailing comma is part of the pattern), so neither line can half-rewrite the
     # other — the same argument the `wifi2`/`wifi` pair above makes about itself.
     f="${f//,ahci-write,/,}"
+    f="${f//,ahciroot,/,}"   # AHCIROOT (B332): x86-only like its parents; stripped for the same -Cmetadata reason.
     # WIFI-1 (GR25) rides the same strip, for the same reason and by the same mechanism as
     # `bcmarecon` above: `src/wifi/` is declared `#[cfg(all(feature = "wifi", target_arch =
     # "x86_64"))]` and all three main-loop call sites carry the same pair, so `wifi` emits not one

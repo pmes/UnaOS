@@ -247,6 +247,7 @@ fn map_blk(e: block::BlockError) -> InstallError {
         // retry loop, so this is COARSE BUT HONEST `Io`: the install fails cleanly rather than
         // proceeding on a sector it never read or wrote. Twin of `install::pi::map_blk`'s arm.
         block::BlockError::Busy => InstallError::Io,
+        block::BlockError::Denied => InstallError::NotBlank, // AHCIROOT (B332): no live grant covers the sector — a refusal, not a fault
     }
 }
 

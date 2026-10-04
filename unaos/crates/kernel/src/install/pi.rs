@@ -107,6 +107,7 @@ fn map_blk(e: crate::drivers::block::BlockError) -> InstallError {
         // context can hold the loan.) If this path ever grows a retry, `Busy` is the one error worth
         // retrying — see the reaper's requeue arm in `arch::aarch64::syscall::free_orphan_chain`.
         crate::drivers::block::BlockError::Busy => InstallError::Io,
+        crate::drivers::block::BlockError::Denied => InstallError::Io, // AHCIROOT (B332): SATA-only variant; unreachable on the Pi
     }
 }
 

@@ -36,6 +36,10 @@ pub enum Verdict {
     Ours,
     /// Anything else — somebody's OS, an unreadable table over data, a foreign volume. Carries what was seen.
     Stranger(String),
+    /// AHCIROOT (B332): a Stranger the OPERATOR cleared by typing the confirmation token the refusal
+    /// printed (`--erase-stranger ERASE-<port>-<sectors>`). Carries what was seen, for the wire.
+    #[cfg(feature = "ahciroot")]
+    Confirmed(String),
 }
 
 impl Verdict {
@@ -44,6 +48,8 @@ impl Verdict {
             Verdict::Blank => "blank",
             Verdict::Ours => "ours",
             Verdict::Stranger(_) => "stranger",
+            #[cfg(feature = "ahciroot")]
+            Verdict::Confirmed(_) => "confirmed",
         }
     }
     pub fn writable(&self) -> bool {
@@ -300,11 +306,18 @@ fn fail(out: &mut dyn FnMut(&str), why: &str) {
 /// M2: `install ssd --write`.
 #[cfg(feature = "ahci-write")]
 pub fn write_ssd(out: &mut dyn FnMut(&str), force: bool) {
+    write_ssd_confirmed(out, force, None)
+}
+
+/// AHCIROOT (B332): `install ssd --write [--force] [--erase-stranger <token>]` — `confirm` is the token
+/// the operator typed; it clears a Stranger verdict only when it equals [`stranger_token`] for THIS disk.
+#[cfg(feature = "ahci-write")]
+pub fn write_ssd_confirmed(out: &mut dyn FnMut(&str), force: bool, _confirm: Option<&str>) {
     let Some((port, sel)) = first_ahci() else {
         out("install ssd: no AHCI disk registered");
         return;
     };
-    let p = match probe(sel, port) {
+    #[cfg_attr(not(feature = "ahciroot"), allow(unused_mut))] let mut p = match probe(sel, port) {
         Ok(p) => p,
         Err(e) => {
             serial_println!("[install] target=ahci:{} probe err={:?} — nothing written", port, e);
@@ -312,6 +325,8 @@ pub fn write_ssd(out: &mut dyn FnMut(&str), force: bool) {
             return;
         }
     };
+    #[cfg(feature = "ahciroot")] if let Some((gp, _, _, crate::drivers::block::GrantKind::Root)) = block::ahci_live_grant() { serial_println!("[install] REFUSED target=ahci:{} reason=ssd-is-live-root (port {} holds the boot's root grant) — nothing written ::", port, gp); out("install ssd --write: REFUSED — the SSD's UnaFS is the running root; boot without it to reinstall. Nothing was written."); return; } // AHCIROOT (B332)
+    #[cfg(feature = "ahciroot")] if let (Verdict::Stranger(why), Some(tok)) = (&p.verdict, _confirm) { if tok == stranger_token(port, p.sectors).as_str() { serial_println!("[install] target=ahci:{} verdict=stranger CONFIRMED by the operator token — the disk will be erased (R25: the operator's word, typed)", port); p.verdict = Verdict::Confirmed(why.clone()); } } // AHCIROOT (B332)
     serial_println!(
         "[install] target=ahci:{} model={} sectors={} gpt={} verdict={} saw={}",
         p.port, p.model, p.sectors, p.gpt, p.verdict.tag(), p.saw
@@ -320,6 +335,7 @@ pub fn write_ssd(out: &mut dyn FnMut(&str), force: bool) {
         // R20: no destructive work on a disk that is not ours.
         serial_println!("[install] REFUSED target=ahci:{} verdict=stranger saw: {} — nothing was written (R20) ::", port, why);
         out(&alloc::format!("install ssd --write: REFUSED — this disk is not ours ({}). Nothing was written.", why));
+        #[cfg(feature = "ahciroot")] out(&alloc::format!("  to ERASE it anyway (everything on it is lost): install ssd --write --erase-stranger {}", stranger_token(port, p.sectors))); // AHCIROOT (B332): the glass asks; the operator types
         return;
     }
     // SELFINSTALL2: the boot disk itself is refused here by name (selfguard), before the grant's own
@@ -361,6 +377,7 @@ pub fn write_ssd(out: &mut dyn FnMut(&str), force: bool) {
             return fail(out, "write grant refused (boot device, or disk too small)");
         }
     };
+    #[cfg(feature = "ahciroot")] let _hold = match block::hold_ahci_grant(disk.grant, block::GrantKind::Install) { Some(h) => h, None => return fail(out, "the SATA write grant slot is held (the SSD is the live root, or a test holds it)") }; // AHCIROOT (B332) M1: the kernel-held grant, dropped (and the drive flushed) when this verb returns
     // SELFINSTALL2: the table comes from the shared core's Plan — ESP + (when the running system has
     // one) a UnaFS partition the size of the running volume.
     #[cfg(feature = "unafs")] let unafs_src = super::unafsmirror::source().filter(|s| !s.is_ahci()); #[cfg(not(feature = "unafs"))] let unafs_src: Option<()> = None;
@@ -434,6 +451,8 @@ pub fn verb(out: &mut dyn FnMut(&str), args: &[&str]) {
         }
         Some("--write") if args.len() == 1 => write_ssd(out, false),
         Some("--write") if args.len() == 2 && args[1] == "--force" => write_ssd(out, true),
+        #[cfg(feature = "ahciroot")]
+        Some("--write") if args.len() == 3 && args[1] == "--erase-stranger" => write_ssd_confirmed(out, false, Some(args[2])),
         _ => out("usage: install ssd --dry-run | install ssd --write [--force]   (the SSD install: ESP + UnaFS; --write needs UNAOS_AHCI_WRITE=1, refuses a stranger's disk, and needs --force over an existing UnaFS volume)"),
     }
 }
@@ -610,4 +629,15 @@ pub fn install_selftest() {
     if dry_run(&mut sink).is_none() {
         serial_println!(":: SELFINSTALL2: dry-run disks=0 -> SKIP (no AHCI disk on this machine) ::");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// AHCIROOT (rmbp-ledger B332) — the operator's confirmation token for a Stranger disk.
+// ---------------------------------------------------------------------------------------------
+
+/// The token the refusal prints and `--erase-stranger` must repeat: the port and the disk's exact
+/// sector count, so a token copied from another machine (or another disk) does not match.
+#[cfg(feature = "ahciroot")]
+pub fn stranger_token(port: u8, sectors: u64) -> String {
+    alloc::format!("ERASE-{}-{}", port, sectors)
 }
