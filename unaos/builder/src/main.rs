@@ -974,6 +974,20 @@ fn main() {
     } else {
         println!("   PREFS: target/PREFS-X86.ELF absent — ESP has no PREFS.BIN (run via ./arroyo esp-x86)");
     }
+    // RING3WIN (B316): BIG.BIN — the ELF-window proof program (crates/user-big, built by arroyo's
+    // build_user_big_x86 to target/BIG-X86.ELF), staged as APPS/BIG.BIN; `tests ring3win` runs it.
+    let big_elf = target_dir.join("BIG-X86.ELF");
+    if big_elf.exists() {
+        // The ring-3 image cap — una_abi::USER_WINDOW_BYTES; scripts/window-parity.sh holds this literal,
+        // arroyo's USER_WINDOW_BYTES and the una-abi constant to one number.
+        const USER_WINDOW_BYTES: u64 = 4194304;
+        let n = std::fs::metadata(&big_elf).unwrap().len();
+        assert!(n <= USER_WINDOW_BYTES, "BIG-X86.ELF {} bytes > USER_WINDOW_BYTES {}", n, USER_WINDOW_BYTES);
+        std::fs::copy(&big_elf, esp_apps.join("BIG.BIN")).unwrap();
+        println!("   BIG: copied BIG.BIN into APPS/ on the ESP (tests ring3win)");
+    } else {
+        println!("   BIG: target/BIG-X86.ELF absent — ESP has no BIG.BIN (run via ./arroyo esp-x86)");
+    }
 
     // -----------------------------------------------------------------------------------------
     // WINX-7 PKG — the DATA tree: the EL0 artifacts staged for the volume the RUNNING KERNEL reads.
@@ -1034,6 +1048,8 @@ fn main() {
         (target_dir.join("PULSE-X86.ELF"), "PULSE.ELF"),
         // BANDY3 M3: the prefs fulfiller rides the DATA volume too — `bg /apps/PREFS.BIN` reads it there.
         (target_dir.join("PREFS-X86.ELF"), "PREFS.BIN"),
+        // RING3WIN (B316): the ELF-window proof program — `tests ring3win` reads /apps/BIG.BIN there.
+        (target_dir.join("BIG-X86.ELF"), "BIG.BIN"),
     ] {
         if src.exists() {
             std::fs::copy(&src, data_apps.join(dst)).unwrap();
