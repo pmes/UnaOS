@@ -137,6 +137,7 @@ pub fn gc() {
                 lp.fds.clear(); // pipe EOF for the peers
                 lp.asp.free_frames();
                 super::fs_tab_clear(i.pml4);
+                super::fpu::release(i.pml4); // LINUXABI3
                 i.freed.store(true, Ordering::Release);
             }
         }
@@ -194,7 +195,11 @@ pub fn fork(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, child_sp: u64) -
     if p.asp.pages() > FORK_MAX_PAGES {
         return -ENOMEM;
     }
-    let Some(casp) = p.asp.fork_copy() else { return -ENOMEM };
+    let Some(mut casp) = p.asp.fork_copy() else { return -ENOMEM };
+    if !super::fpu::fork_into(casp.pml4) {
+        casp.free_frames(); // LINUXABI3: no FP slot for the child — refuse the fork rather than run it without its x87/XMM state
+        return -EAGAIN;
+    }
     let rip = frame_w(ktop, 32);
     let usp = if child_sp != 0 { child_sp } else { frame_w(ktop, 8) };
     let regs = [
@@ -309,6 +314,7 @@ pub fn execve(p: &mut LinuxProc, info: &Arc<ProcInfo>, ktop: u64, path_va: u64, 
     p.mmap_next = MMAP_BASE;
     p.fs_base = 0;
     super::fs_tab_clear(info.pml4);
+    super::fpu::exec_reset(); // LINUXABI3: the new image starts from the Linux initial x87/SSE state
     for s in p.fds.iter_mut() {
         if s.as_ref().is_some_and(|e| e.cloexec) {
             *s = None;
