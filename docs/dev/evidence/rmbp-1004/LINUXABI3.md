@@ -1,5 +1,8 @@
 # LINUXABI3 — SSE in ring 3 for Linux-ABI tasks, and the first SSE-compiled Linux code running (ledger B309, extends B286)
 
+**What the Linux ABI is for on UnaOS:** it lets existing, unmodified static Linux x86_64 programs (busybox, compilers, build tools) run
+on UnaOS today, the compatibility rung of SH-5 (ROADMAP §1c) toward building UnaOS on UnaOS — `linux <path> [args]` runs one.
+
 ## Design
 **Finding.** B286/LINUXABI2: "Ring 3 has no SSE enabled, which blocks busybox-class binaries." Read of the tree at b42b87cc: the kernel
 target (`x86_64-unaos.json`) is `-mmx,-sse,…,+soft-float`, so no kernel code ever touches x87/XMM; CR4.OSFXSR is never set (nothing in
@@ -70,3 +73,18 @@ children, 16 MXCSR across the switches, 17 fork, 18/19 wait4, 21 a child's inher
 (the line `[linuxabi] SSE.LNX exit=<n> …` precedes the witness). Interactive: `linux /apps/SSE.LNX` prints `sse ok`.
 `tests linuxabi` / `tests linuxabi2` are unchanged and must still PASS on the same boot (HELLO/PIPE/LS never touch XMM; their dispatches now
 restore an initial image — a regression there is this arc's).
+
+## M5 — the boot-19 `linux /apps/ls.lnx` hang (coordinator, 2026-10-04)
+**Finding.** `f19-boots.log`: `:: LINUXABI: path=/apps/ls.lnx exit=INTERRUPTED syscalls=1 enosys=[] ms=50343 -> FAIL ::`. LS.LNX's first
+syscall was `read(0, …, 64)` (asm/ls.s line 1 of the old fixture: echo one stdin line, then list `/`). `tests linuxabi2` pre-queues
+`hello-stdin` so it passes (boot 19 `dents=19 stdin=1 -> PASS`); run interactively with nothing typed, `read(0)` returns RETRY forever,
+and the verb printed nothing that said so, so it looked hung until Ctrl-C. Not TIOCGWINSZ, fstat or getdents64: syscalls=1.
+**Fix.** (a) LS.LNX polls fd 0 with timeout 0 and reads only when a line is waiting (host-verified: `</dev/null` lists `/`, `echo x |`
+echoes then lists). (b) `[linux] sys=<nr> <name> pid=<p> a0= a1= a2= -> <ret>` for the first 48 syscalls of a session, and a
+`… -> blocks` line for EVERY syscall that blocks (uncapped), then its completion. (c) A timed-out or interrupted session's witness carries
+`blocked=<name>(fd=<n>)`, e.g. `exit=TIMEOUT … blocked=read(fd=0) -> FAIL`. (d) `tests linuxabi`/`linuxabi2`/`linuxabi3` deadlines 5 s
+(were 10/15 s); a non-passing linuxabi2 run prints its own witness with the blocked tag. (e) Interactive `linux`: after 1 s blocked in
+`read(0)` with nothing typed, one line `(linux: the program is waiting for a line on stdin: type it + Enter; Ctrl-D = end of input,
+Ctrl-C = stop)`, with any half-printed prompt flushed first; Ctrl-D on an empty line is EOF (one `read(0)` returns 0; poll reports IN).
+The interactive deadline stays 600 s on purpose: a program legitimately waiting for its user (a shell, `cat`) is not a hang, and now says so.
+**Wire next boot:** `linux /apps/LS.LNX` lists `/` at once; `tests linuxabi2` still `-> PASS` (the pre-queued line is seen by poll).
