@@ -7,6 +7,8 @@ license = "LGPL-3.0-or-later"
 [features]
 default = ["std"]
 std = ["reqwest", "octocrab", "tokio", "futures-core", "futures-util"]
+# EMBED (B317): the in-process local embedder (all-MiniLM-L6-v2 on candle, CPU).
+local-embed = ["std", "dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:unicode-normalization"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -20,6 +22,11 @@ futures-core = { version = "0.3", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 chrono = { version = "0.4", default-features = false }
 bandy = { version = "0.1.0", path = "../bandy", default-features = false }
+# EMBED (B317): the local embedder — candle on the CPU (BERT), NFD for the WordPiece normaliser.
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
+unicode-normalization = { version = "0.1", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "macros", "time"] }

@@ -427,23 +427,25 @@ data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"lo\"}]},\"finishReas
     assert_eq!(rx.recv().unwrap().path, "/v1beta/models/gemini-test-model:streamGenerateContent?alt=sse");
 }
 
+// EMBED (B317): the embedding call is the embedder's, not the chat provider's.
 #[tokio::test]
-async fn gemini_embed_both_modes() {
+async fn gemini_embedder_both_modes() {
+    let settings = gemini_cfg(GeminiAuth::GcloudAdc).settings;
     let (base, rx) = mock(vec![ok_json(&json!({"predictions": [{"embeddings": {"values": [0.5, 0.25]}}]}))]);
-    let p = GeminiProvider::with_token(gemini_cfg(GeminiAuth::GcloudAdc), "t".into()).unwrap().with_base_url(&base);
-    assert_eq!(p.embed("x").await.unwrap(), vec![0.5, 0.25]);
+    let e = GeminiEmbedder::with_token(GeminiAuth::GcloudAdc, settings.clone(), 2, "t".into()).unwrap().with_base_url(&base);
+    assert_eq!(e.embed(&["x"]).await.unwrap(), vec![vec![0.5, 0.25]]);
     let c = rx.recv().unwrap();
     assert!(c.path.ends_with("/locations/us-central1/publishers/google/models/text-embedding-004:predict"), "{}", c.path);
     assert_eq!(c.json(), json!({"instances": [{"content": "x"}]}));
+    assert_eq!(e.tag(), "gemini/text-embedding-004");
 
     let (base, rx) = mock(vec![ok_json(&json!({"embedding": {"values": [1.0]}}))]);
-    let p = GeminiProvider::with_token(gemini_cfg(GeminiAuth::ApiKey("gk".into())), String::new()).unwrap().with_base_url(&base);
-    assert_eq!(p.embed("y").await.unwrap(), vec![1.0]);
+    let e = GeminiEmbedder::with_token(GeminiAuth::ApiKey("gk".into()), settings.clone(), 0, String::new()).unwrap().with_base_url(&base);
+    assert_eq!(e.embed(&["y"]).await.unwrap(), vec![vec![1.0]]);
     assert_eq!(rx.recv().unwrap().path, "/v1beta/models/text-embedding-004:embedContent");
-}
 
-#[tokio::test]
-async fn claude_has_no_embeddings() {
-    let p = ClaudeProvider::new("k".into(), "claude-opus-5-5".into(), true).unwrap();
-    assert!(matches!(p.embed("x").await, Err(ProviderError::Unsupported(_))));
+    // A width that disagrees with the configured dims is refused, never stored.
+    let (base, _rx) = mock(vec![ok_json(&json!({"embedding": {"values": [1.0]}}))]);
+    let e = GeminiEmbedder::with_token(GeminiAuth::ApiKey("gk".into()), settings, 768, String::new()).unwrap().with_base_url(&base);
+    assert!(matches!(e.embed(&["z"]).await, Err(ProviderError::Malformed(_))));
 }

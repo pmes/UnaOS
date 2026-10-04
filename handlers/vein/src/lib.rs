@@ -10,6 +10,7 @@ pub mod context;
 pub mod cortex;
 pub mod gravity;
 pub mod provider;
+pub mod reembed;
 pub mod skeleton;
 pub mod storage;
 pub mod synapse;
@@ -284,11 +285,15 @@ impl VeinHandler {
             // VEINPROV (B303): the provider the person configured (Principia `vein` namespace);
             // a slot that could not be built still runs the loop and answers each call with the fix.
             let mut brain = provider::ProviderSlot::load();
+            // EMBED (B317): the embedder is its own setting (R81), independent of the chat provider.
+            let mut embedder = provider::EmbedSlot::load();
+            let mut reembed = reembed::ReEmbedDriver::new(embed_batch_pref());
             {
                 {
                     {
                         let mut s = state_bg.write().unwrap();
                         s.console_logs.push_back(brain.status_line());
+                        s.console_logs.push_back(embedder.status_line());
                         s.console_seq += 1;
                         while s.console_logs.len() > MAX_STATE_CAPACITY {
                             s.console_logs.pop_front();
@@ -300,6 +305,10 @@ impl VeinHandler {
                     let mut shutdown_rx_brain = shutdown_tx.subscribe();
                     let mut bandy_rx_brain = synapse_loop.subscribe();
                     let mut receipt_counter: u64 = 1;
+                    receipt_counter += 1;
+                    if let Some(m) = reembed.count(receipt_counter, &embedder) {
+                        let _ = synapse_loop.fire_async(m).await;
+                    }
 
                     // Simple local state for loop variables not in AppState
                     let mut pending_prompts: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
@@ -318,15 +327,39 @@ impl VeinHandler {
                                     }
                                     ref m if provider::is_vein_pref_change(m) => {
                                         brain = provider::ProviderSlot::load();
+                                        let embed_tag_before = embedder.tag();
+                                        embedder = provider::EmbedSlot::load();
+                                        reembed.batch = embed_batch_pref();
+                                        if embedder.tag() != embed_tag_before {
+                                            receipt_counter += 1;
+                                            if let Some(m) = reembed.count(receipt_counter, &embedder) {
+                                                let _ = synapse_loop.fire_async(m).await;
+                                            }
+                                        }
                                         {
                                             let mut s = state_bg.write().unwrap();
                                             s.console_logs.push_back(brain.status_line());
+                                            s.console_logs.push_back(embedder.status_line());
                                             s.console_seq += 1;
                                             while s.console_logs.len() > MAX_STATE_CAPACITY {
                                                 s.console_logs.pop_front();
                                             }
                                         }
                                         let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
+                                    }
+                                    SMessage::ReEmbedBatch { receipt_id, items, stale_total } => {
+                                        let (lines, next) = reembed.on_batch(receipt_id, items, stale_total, &embedder).await;
+                                        console_lines(&state_bg, &synapse_loop, lines).await;
+                                        if let Some(m) = next {
+                                            let _ = synapse_loop.fire_async(m).await;
+                                        }
+                                    }
+                                    SMessage::ReEmbedDone { receipt_id, written, remaining, error } => {
+                                        let (lines, next) = reembed.on_done(receipt_id, written, remaining, error);
+                                        console_lines(&state_bg, &synapse_loop, lines).await;
+                                        if let Some(m) = next {
+                                            let _ = synapse_loop.fire_async(m).await;
+                                        }
                                     }
                                     SMessage::StorageLoadPagedResult { records, receipt_id: _ } => {
                                         {
@@ -464,21 +497,19 @@ impl VeinHandler {
                                     let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                                     let synapse_clone = synapse_loop.clone();
 
-                                    match brain.embed(&dir_text).await {
-                                        Ok(embedding) => {
-                                            receipt_counter += 1;
-                                            let _ = synapse_clone.fire_async(SMessage::StorageSave {
-                                                receipt_id: receipt_counter,
-                                                sender: "system".to_string(),
-                                                content: dir_text,
-                                                timestamp,
-                                                embedding,
-                                                memory_type: "directive".to_string(),
-                                            }).await;
-                                        }
-                                        Err(_e) => {
-                                        }
-                                    }
+                                    // EMBED (B317): a directive is stored even when recall is off (no vector then).
+                                    let (emb, why) = embedder.embed_one(&dir_text).await;
+                                    console_lines(&state_bg, &synapse_loop, why.into_iter().map(|w| format!("{w}\n")).collect()).await;
+                                    receipt_counter += 1;
+                                    let _ = synapse_clone.fire_async(SMessage::StorageSave {
+                                        receipt_id: receipt_counter,
+                                        sender: "system".to_string(),
+                                        content: dir_text,
+                                        timestamp,
+                                        embedding: emb.vector,
+                                        memory_type: "directive".to_string(),
+                                        embed_model: emb.tag,
+                                    }).await;
                                     continue;
                                 }
 
@@ -498,10 +529,8 @@ impl VeinHandler {
                                             }
                                         }
 
-                                        let user_embedding = match brain.embed(&payload.prompt).await {
-                                            Ok(vec) => vec,
-                                            Err(_) => vec![]
-                                        };
+                                        let (user_embedding, why) = embedder.embed_one(&payload.prompt).await;
+                                        console_lines(&state_bg, &synapse_loop, why.into_iter().map(|w| format!("{w}\n")).collect()).await;
 
                                         let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                                         receipt_counter += 1;
@@ -511,8 +540,9 @@ impl VeinHandler {
                                             sender: "user".to_string(),
                                             content: clean_memory_text,
                                             timestamp: timestamp.clone(),
-                                            embedding: user_embedding,
+                                            embedding: user_embedding.vector,
                                             memory_type: "chat".to_string(),
+                                            embed_model: user_embedding.tag,
                                         }).await;
                                         // --------------------------------------------------------
 
@@ -580,10 +610,8 @@ impl VeinHandler {
                                                 let _ = synapse_loop.fire_async(SMessage::StateInvalidated).await;
 
                                                 let safe_embed: String = response.chars().take(6000).collect();
-                                                let response_embedding = match brain.embed(&safe_embed).await {
-                                                    Ok(vec) => vec,
-                                                    Err(_) => vec![],
-                                                };
+                                                let (response_embedding, why) = embedder.embed_one(&safe_embed).await;
+                                                console_lines(&state_bg, &synapse_loop, why.into_iter().map(|w| format!("{w}\n")).collect()).await;
 
                                                 let response_clone = response.clone();
                                                 let timestamp_clone = timestamp.clone();
@@ -595,8 +623,9 @@ impl VeinHandler {
                                                     sender: "model".to_string(),
                                                     content: response_clone,
                                                     timestamp: timestamp_clone,
-                                                    embedding: response_embedding,
+                                                    embedding: response_embedding.vector,
                                                     memory_type: "chat".to_string(),
+                                                    embed_model: response_embedding.tag,
                                                 }).await;
 
                                                 let mut raw_user_prompt = payload.prompt.clone();
@@ -607,18 +636,21 @@ impl VeinHandler {
                                                 let ai_response_clone = response.clone();
                                                 let _tx_inner = synapse_clone.clone();
                                                 let engram_provider = brain.provider();
+                                                let engram_embedder = embedder.clone();
                                                 tokio::spawn(async move {
                                                     if let Ok(engram_brain) = engram_provider {
                                                         if let Ok(engram) = crate::context::compress_into_engram(engram_brain.as_ref(), &raw_user_prompt, &ai_response_clone).await {
-                                                            if let Ok(engram_embedding) = engram_brain.embed(&engram).await {
+                                                            {
+                                                                let (engram_embedding, _) = engram_embedder.embed_one(&engram).await;
                                                                 let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
                                                                 let _ = synapse_clone.fire_async(SMessage::StorageSave {
                                                                     receipt_id: 0,
                                                                     sender: "system".to_string(),
                                                                     content: engram,
                                                                     timestamp,
-                                                                    embedding: engram_embedding,
+                                                                    embedding: engram_embedding.vector,
                                                                     memory_type: "engram".to_string(),
+                                                                    embed_model: engram_embedding.tag,
                                                                 }).await;
                                                             }
                                                         }
@@ -776,10 +808,26 @@ impl VeinHandler {
                                     continue;
                                 }
 
-                                let user_embedding = match brain.embed(&user_input_text).await {
-                                    Ok(vec) => vec,
-                                    Err(_e) => vec![]
-                                };
+                                // EMBED (B317): `/reembed` walks the vault onto the configured embedder.
+                                if user_input_text.trim() == "/reembed" {
+                                    receipt_counter += 1;
+                                    match reembed.start(receipt_counter, &embedder) {
+                                        Ok(m) => {
+                                            console_lines(&state_bg, &synapse_loop, vec![format!(":: BRAIN :: REEMBED start :: {} ({} per pass)\n", embedder.tag(), reembed.batch)]).await;
+                                            let _ = synapse_loop.fire_async(m).await;
+                                        }
+                                        Err(line) => console_lines(&state_bg, &synapse_loop, vec![line]).await,
+                                    }
+                                    continue;
+                                }
+
+                                // EMBED (B317): recall is said in-chat when it is off — never a silent empty vector.
+                                let (user_embedding, why) = embedder.embed_one(&user_input_text).await;
+                                let mut said: Vec<String> = why.into_iter().map(|w| format!("{w}\n")).collect();
+                                if let Some(off) = embedder.recall_off() {
+                                    said.push(format!("{off}\n"));
+                                }
+                                console_lines(&state_bg, &synapse_loop, said).await;
 
                                 receipt_counter += 1;
                                 let query_receipt_id = receipt_counter;
@@ -788,7 +836,8 @@ impl VeinHandler {
                                 // ONLY query storage to build the pre-flight payload. DO NOT save to history yet.
                                 let _ = synapse_loop.fire_async(SMessage::StorageQuery {
                                     receipt_id: query_receipt_id,
-                                    embedding: user_embedding,
+                                    embedding: user_embedding.vector,
+                                    embed_model: user_embedding.tag,
                                 }).await;
                             }
                         }
@@ -928,4 +977,33 @@ impl AppHandler for VeinHandler {
     fn view(&self) -> bandy::state::DashboardState {
         bandy::state::DashboardState::default()
     }
+}
+
+/// EMBED (B317): push console lines (if any) and invalidate the UI once.
+async fn console_lines(state: &Arc<RwLock<AppState>>, synapse: &Synapse, lines: Vec<String>) {
+    if lines.is_empty() {
+        return;
+    }
+    {
+        let mut s = state.write().unwrap();
+        for l in lines {
+            s.console_logs.push_back(l);
+            s.console_seq += 1;
+        }
+        while s.console_logs.len() > MAX_STATE_CAPACITY {
+            s.console_logs.pop_front();
+        }
+    }
+    let _ = synapse.fire_async(SMessage::StateInvalidated).await;
+}
+
+/// EMBED (B317): `vein.embed.reembed_batch` — memories per re-embed pass.
+fn embed_batch_pref() -> usize {
+    principia::prefs::PrefStore::load(principia::default_prefs_path())
+        .ok()
+        .and_then(|s| match s.get(gneiss_pal::api::PREF_NS, "embed.reembed_batch") {
+            Some(bandy::PrefValue::Int(n)) if n > 0 => Some(n as usize),
+            _ => None,
+        })
+        .unwrap_or(reembed::DEFAULT_REEMBED_BATCH)
 }

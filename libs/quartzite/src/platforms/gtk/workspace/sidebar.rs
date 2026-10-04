@@ -184,19 +184,22 @@ pub fn build(window: &NativeWindow, tx_event: Sender<Event>, _workspace_tetra: &
         vbox.append(&Label::new(Some("Model")));
         // VEINPROV (B303): the menu is the provider seam's model list, preselected on the
         // provider/model the person configured in Principia's `vein` namespace (no hardcoded list).
-        let configured = {
-            let store = principia::prefs::PrefStore::load(principia::default_prefs_path()).ok();
-            gneiss_pal::api::ProviderConfig::from_prefs(|k: &str| {
-                store.as_ref().and_then(|s| s.get(gneiss_pal::api::PREF_NS, k))
-            })
-            .ok()
-        };
+        let store = principia::prefs::PrefStore::load(principia::default_prefs_path()).ok();
+        let pref = |k: &str| store.as_ref().and_then(|s| s.get(gneiss_pal::api::PREF_NS, k));
+        let configured = gneiss_pal::api::ProviderConfig::from_prefs(pref).ok();
+        // EMBED (B317): the embedder is its own setting (R81); the label names both halves.
+        let embed_cfg = gneiss_pal::api::EmbedConfig::from_prefs(pref, |k| std::env::var(k).ok()).ok();
         let (model_labels, model_selected) = gneiss_pal::api::model_menu(configured.as_ref());
         let model_label_refs: Vec<&str> = model_labels.iter().map(String::as_str).collect();
         let models = StringList::new(&model_label_refs);
         let dropdown = DropDown::new(Some(models), None::<gtk4::Expression>);
         dropdown.set_selected(model_selected);
         vbox.append(&dropdown);
+        let provider_label = gneiss_pal::api::provider_label(
+            configured.as_ref().map(|c| (c.kind.as_str(), c.model.as_str())),
+            embed_cfg.as_ref(),
+        );
+        vbox.append(&Label::new(Some(provider_label.as_str())));
 
         let hbox_hist = Box::new(Orientation::Horizontal, 12);
         hbox_hist.append(&Label::new(Some("Enable History")));

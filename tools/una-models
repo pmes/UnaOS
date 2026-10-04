@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# una-models — fetch the local models UnaOS runs, sha256-pinned (EMBED, rmbp-ledger B317).
+#
+# Model files are never committed to the repository. This puts them in
+#   ${XDG_CACHE_HOME:-$HOME/.cache}/unaos/models/<name>/
+# where Vein's local embedder (vein.embed.provider = "local") looks for them.
+#
+#   tools/una-models list
+#   tools/una-models fetch all-MiniLM-L6-v2
+#   tools/una-models verify all-MiniLM-L6-v2
+#
+# Every download is checked against the pinned sha256 BEFORE it is unpacked, and every unpacked
+# file against its own pin; a mismatch deletes what was fetched and exits non-zero.
+set -euo pipefail
+
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/unaos/models"
+
+# name | archive URL | archive sha256 | the directory inside the archive
+# all-MiniLM-L6-v2: sentence-transformers' model (Apache-2.0) as Chroma publishes it for its default
+# embedding function — an ONNX export plus the BERT tokenizer files. The huggingface.co safetensors
+# are the canonical upstream; they could not be pinned from the build container (egress refused).
+MODELS=(
+  "all-MiniLM-L6-v2|https://chroma-onnx-models.s3.amazonaws.com/all-MiniLM-L6-v2/onnx.tar.gz|913d7300ceae3b2dbc2c50d1de4baacab4be7b9380491c27fab7418616a16ec3|onnx"
+)
+
+# name | file | sha256 — the files the local embedder reads.
+FILES=(
+  "all-MiniLM-L6-v2|model.onnx|4f148ba8ae9c2c7fbee4af2b132db8d06c6a6545b47fc83bbb98c3d22b8393e6"
+  "all-MiniLM-L6-v2|vocab.txt|07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+  "all-MiniLM-L6-v2|config.json|b567c7d5a55b636c95186aaf993f9a8920842b7e05a9e703e68b23cab2c3a670"
+)
+
+die() { echo "una-models: $*" >&2; exit 1; }
+
+sha() { sha256sum "$1" | awk '{print $1}'; }
+
+entry() {
+  local m
+  for m in "${MODELS[@]}"; do
+    [[ "${m%%|*}" == "$1" ]] && { echo "$m"; return 0; }
+  done
+  die "unknown model '$1' (try: una-models list)"
+}
+
+verify() {
+  local name="$1" dir="$CACHE/$1" f n file want got bad=0
+  for f in "${FILES[@]}"; do
+    IFS='|' read -r n file want <<<"$f"
+    [[ "$n" == "$name" ]] || continue
+    if [[ ! -f "$dir/$file" ]]; then echo "missing  $dir/$file"; bad=1; continue; fi
+    got=$(sha "$dir/$file")
+    if [[ "$got" == "$want" ]]; then echo "ok       $file  $got"; else echo "MISMATCH $file  $got (pinned $want)"; bad=1; fi
+  done
+  return $bad
+}
+
+fetch() {
+  local name="$1" url want inner got
+  IFS='|' read -r _ url want inner <<<"$(entry "$name")"
+  if verify "$name" >/dev/null 2>&1; then echo "una-models: $name already installed in $CACHE/$name"; return 0; fi
+  TMPD=$(mktemp -d)
+  trap 'rm -rf "$TMPD"' EXIT
+  local tmp="$TMPD"
+  echo "una-models: fetching $name from $url"
+  curl -fL --retry 3 -o "$tmp/archive" "$url" || die "download failed: $url"
+  got=$(sha "$tmp/archive")
+  [[ "$got" == "$want" ]] || die "archive sha256 $got does not match the pin $want — nothing installed"
+  mkdir -p "$tmp/x" && tar -xzf "$tmp/archive" -C "$tmp/x"
+  mkdir -p "$CACHE/$name"
+  local f n file
+  for f in "${FILES[@]}"; do
+    IFS='|' read -r n file _ <<<"$f"
+    [[ "$n" == "$name" ]] || continue
+    install -m 0644 "$tmp/x/$inner/$file" "$CACHE/$name/$file"
+  done
+  verify "$name" || { rm -rf "${CACHE:?}/$name"; die "an unpacked file failed its pin — removed $CACHE/$name"; }
+  echo "una-models: $name installed in $CACHE/$name"
+}
+
+case "${1:-}" in
+  list)   for m in "${MODELS[@]}"; do echo "${m%%|*}"; done ;;
+  fetch)  [[ -n "${2:-}" ]] || die "usage: una-models fetch <name>"; fetch "$2" ;;
+  verify) [[ -n "${2:-}" ]] || die "usage: una-models verify <name>"; verify "$2" ;;
+  *)      sed -n '4,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

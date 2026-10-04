@@ -43,6 +43,7 @@ use super::provider::{
     BoxFuture, ChatDelta, ChatRequest, ChatResponse, DeltaStream, GeminiSettings, f32_json, ModelProvider, ProviderError, Role,
     StopReason, Usage,
 };
+use super::embed::{Embedder, check_batch};
 use super::retry::{RetryPolicy, send_classified};
 use super::sse::{SseEvent, SseHandler, sse_stream};
 use super::Content;
@@ -396,32 +397,95 @@ impl ModelProvider for GeminiProvider {
             Ok(sse_stream(res, GeminiSse::default()))
         })
     }
+}
 
-    fn embed<'a>(&'a self, text: &'a str) -> BoxFuture<'a, Result<Vec<f32>, ProviderError>> {
+// ---------------------------------------------------------------------------
+// EMBED (B317): the embedding call lives here, behind `Embedder` — the chat
+// provider no longer embeds.
+// ---------------------------------------------------------------------------
+
+impl GeminiProvider {
+    /// One embedding of `text` with the configured `embed_model` (Vertex
+    /// `predict` under gcloud ADC, `embedContent` under an API key).
+    async fn embed_one(&self, text: &str) -> Result<Vec<f32>, ProviderError> {
+        let em = &self.cfg.settings.embed_model;
+        let (url, body) = match self.cfg.auth {
+            GeminiAuth::GcloudAdc => (
+                self.url(em, "predict", true),
+                serde_json::to_value(EmbedContentRequest {
+                    instances: vec![EmbedContentInstance { content: text.to_string() }],
+                })
+                .unwrap_or_default(),
+            ),
+            GeminiAuth::ApiKey(_) => (self.url(em, "embedContent", true), json!({ "content": { "parts": [{ "text": text }] } })),
+        };
+        let res = self.send(&url, &body).await?;
+        let data: EmbedContentResponse =
+            res.json().await.map_err(|e| ProviderError::Malformed(format!("embedding: {e}")))?;
+        if let Some(e) = data.embedding {
+            return Ok(e.values);
+        }
+        data.predictions
+            .and_then(|p| p.into_iter().next())
+            .map(|p| p.embeddings.values)
+            .ok_or_else(|| ProviderError::Malformed("no embedding returned".into()))
+    }
+}
+
+/// Gemini's embedding model behind [`Embedder`] (`vein.embed.provider = "gemini"`).
+pub struct GeminiEmbedder {
+    inner: GeminiProvider,
+    dims: usize,
+}
+
+impl GeminiEmbedder {
+    /// Build. In ADC mode this fetches the first token now (a machine without
+    /// gcloud hears about it at start). `settings.embed_model` is the model.
+    pub fn new(auth: GeminiAuth, settings: GeminiSettings, dims: usize) -> Result<Self, ProviderError> {
+        let model = settings.embed_model.clone();
+        let inner = GeminiProvider::new(GeminiConfig { model, auth, settings, temperature: None })?;
+        Ok(GeminiEmbedder { inner, dims })
+    }
+
+    /// Build without fetching a token (tests).
+    pub fn with_token(auth: GeminiAuth, settings: GeminiSettings, dims: usize, token: String) -> Result<Self, ProviderError> {
+        let model = settings.embed_model.clone();
+        let inner = GeminiProvider::with_token(GeminiConfig { model, auth, settings, temperature: None }, token)?;
+        Ok(GeminiEmbedder { inner, dims })
+    }
+
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.inner = self.inner.with_base_url(url);
+        self
+    }
+
+    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.inner = self.inner.with_retry(retry);
+        self
+    }
+}
+
+impl Embedder for GeminiEmbedder {
+    fn name(&self) -> &str {
+        "gemini"
+    }
+
+    fn model(&self) -> &str {
+        &self.inner.cfg.settings.embed_model
+    }
+
+    fn dims(&self) -> usize {
+        self.dims
+    }
+
+    fn embed<'a>(&'a self, texts: &'a [&'a str]) -> BoxFuture<'a, Result<Vec<Vec<f32>>, ProviderError>> {
         Box::pin(async move {
-            let em = &self.cfg.settings.embed_model;
-            let (url, body) = match self.cfg.auth {
-                GeminiAuth::GcloudAdc => (
-                    self.url(em, "predict", true),
-                    serde_json::to_value(EmbedContentRequest {
-                        instances: vec![EmbedContentInstance { content: text.to_string() }],
-                    })
-                    .unwrap_or_default(),
-                ),
-                GeminiAuth::ApiKey(_) => {
-                    (self.url(em, "embedContent", true), json!({ "content": { "parts": [{ "text": text }] } }))
-                }
-            };
-            let res = self.send(&url, &body).await?;
-            let data: EmbedContentResponse =
-                res.json().await.map_err(|e| ProviderError::Malformed(format!("embedding: {e}")))?;
-            if let Some(e) = data.embedding {
-                return Ok(e.values);
+            let mut out = Vec::with_capacity(texts.len());
+            for t in texts {
+                out.push(self.inner.embed_one(t).await?);
             }
-            data.predictions
-                .and_then(|p| p.into_iter().next())
-                .map(|p| p.embeddings.values)
-                .ok_or_else(|| ProviderError::Malformed("no embedding returned".into()))
+            check_batch("gemini", self.dims, texts.len(), &out)?;
+            Ok(out)
         })
     }
 }

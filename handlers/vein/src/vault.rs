@@ -34,6 +34,21 @@ use std::path::{Path, PathBuf};
 use tokio::task;
 use unafs::{AttributeValue, FileSystem, UnaFS, FileDevice};
 
+/// EMBED (B317): the model that made a memory's vector (`<provider>/<model>`).
+pub const ATTR_EMBED_MODEL: &str = "una:embed-model";
+/// EMBED (B317): that vector's width.
+pub const ATTR_EMBED_DIMS: &str = "una:embed-dims";
+/// The memory types the vault holds vectors for.
+pub const MEMORY_TYPES: [&str; 3] = ["chat", "directive", "engram"];
+
+/// The `una:embed-model` tag on an inode, if it has one.
+pub fn embed_tag(inode: &unafs::Inode) -> Option<&str> {
+    match inode.attributes.get(ATTR_EMBED_MODEL) {
+        Some(AttributeValue::String(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
 /// The DiskManager is the synchronous guardian of the Semantic Vault.
 ///
 /// ARCHITECTURAL NOTE (THE CAN-AM RULE):
@@ -87,6 +102,7 @@ impl DiskManager {
         timestamp: &str,
         embedding: Vec<f32>,
         memory_type: &str,
+        embed_model: &str,
     ) -> Result<()> {
         let mut attrs = BTreeMap::new();
         attrs.insert(
@@ -110,14 +126,9 @@ impl DiskManager {
             .write_data(inode_id, 0, content.as_bytes())
             .context("Failed to write content")?;
 
-        // Save embedding separately to handle potentially large attributes safely
-        self.fs
-            .set_attribute(
-                inode_id,
-                "embedding".to_string(),
-                AttributeValue::Vector(embedding),
-            )
-            .context("Failed to save embedding")?;
+        // EMBED (B317): a vector is written only when there is one (recall off writes none), and it
+        // carries the model that made it so vectors from different models never compare.
+        self.write_vector(inode_id, embedding, embed_model)?;
 
         // CRITICAL FIX: The `create_inode` call does not update the catalog.
         // We MUST explicitly call `set_attribute` on "type" so the query engine
@@ -133,12 +144,79 @@ impl DiskManager {
         Ok(())
     }
 
+    /// EMBED (B317): store `embedding` + `una:embed-model` + `una:embed-dims` on `inode_id`.
+    /// An empty vector writes nothing.
+    pub fn write_vector(&mut self, inode_id: u64, embedding: Vec<f32>, embed_model: &str) -> Result<()> {
+        if embedding.is_empty() {
+            return Ok(());
+        }
+        let dims = embedding.len() as i64;
+        // Save embedding separately to handle potentially large attributes safely
+        self.fs
+            .set_attribute(inode_id, "embedding".to_string(), AttributeValue::Vector(embedding))
+            .context("Failed to save embedding")?;
+        self.fs
+            .set_attribute(inode_id, ATTR_EMBED_MODEL.to_string(), AttributeValue::String(embed_model.to_string()))
+            .context("Failed to save embed model")?;
+        self.fs
+            .set_attribute(inode_id, ATTR_EMBED_DIMS.to_string(), AttributeValue::Int(dims))
+            .context("Failed to save embed dims")?;
+        Ok(())
+    }
+
+    /// EMBED (B317): every memory (chat, directive, engram) whose vector was not made by
+    /// `embed_model` — tagged with another model, untagged (pre-B317), or stored with no vector.
+    /// Ascending `(inode id, data size)`.
+    pub fn stale_memories(&mut self, embed_model: &str) -> Result<Vec<(u64, u64)>> {
+        let mut ids = Vec::new();
+        for t in MEMORY_TYPES {
+            let hits = self
+                .fs
+                .query_inodes(&format!("type == \"{t}\""))
+                .map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
+            ids.extend(hits.into_iter().filter(|(i, _)| embed_tag(i) != Some(embed_model)).map(|(i, _)| (i.id, i.size)));
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// EMBED (B317): up to `limit` stale memories with their content, and the stale total.
+    pub fn reembed_batch(&mut self, embed_model: &str, limit: usize) -> Result<(Vec<(u64, String)>, usize)> {
+        let stale = self.stale_memories(embed_model)?;
+        let total = stale.len();
+        let items = stale
+            .into_iter()
+            .take(limit)
+            .map(|(id, size)| (id, String::from_utf8_lossy(&self.fs.read_data(id, 0, size).unwrap_or_default()).into_owned()))
+            .collect();
+        Ok((items, total))
+    }
+
+    /// EMBED (B317): write a re-embed batch; answers `(written, still stale)`.
+    pub fn write_vectors(&mut self, embed_model: &str, vectors: Vec<(u64, Vec<f32>)>) -> Result<(usize, usize)> {
+        let mut written = 0;
+        for (id, v) in vectors {
+            if v.is_empty() {
+                continue;
+            }
+            self.write_vector(id, v, embed_model)?;
+            written += 1;
+        }
+        Ok((written, self.stale_memories(embed_model)?.len()))
+    }
+
     pub fn search_memories(
         &mut self,
         embedding: &[f32],
         threshold: f32,
         memory_type: &str,
+        embed_model: &str,
     ) -> Result<Vec<String>> {
+        // EMBED (B317): no vector, no comparison (recall off).
+        if embedding.is_empty() {
+            return Ok(Vec::new());
+        }
         // Query syntax: similarity(embedding, [0.1,0.2,...]) > 0.7
         let vec_str = format!(
             "[{}]",
@@ -157,6 +235,12 @@ impl DiskManager {
             .fs
             .query_inodes(&query_str)
             .map_err(|e| anyhow::anyhow!("Query failed: {:?}", e))?;
+
+        // EMBED (B317): only vectors made by the same model compare. An empty tag (an older sender)
+        // keeps the pre-B317 behaviour.
+        if !embed_model.is_empty() {
+            inodes.retain(|(inode, _)| embed_tag(inode) == Some(embed_model));
+        }
 
         // === THE NEUROSURGERY: ATTENTION SPAN ===
         // Sort by pure vector gravity (descending)
@@ -305,16 +389,18 @@ pub async fn ignite(vault_path: PathBuf, synapse: Synapse) {
                 SMessage::StorageQuery {
                     receipt_id,
                     embedding,
+                    embed_model,
                 } => {
                     let mut dm = disk_manager;
                     let emb = embedding.clone();
                     let (dm_returned, result) = task::spawn_blocking(move || {
-                        let chat_mem = dm.search_memories(&emb, 0.45, "chat").unwrap_or_default();
+                        let m = embed_model.as_str();
+                        let chat_mem = dm.search_memories(&emb, 0.45, "chat", m).unwrap_or_default();
                         let directive_mem = dm
-                            .search_memories(&emb, 0.45, "directive")
+                            .search_memories(&emb, 0.45, "directive", m)
                             .unwrap_or_default();
                         let engram_mem =
-                            dm.search_memories(&emb, 0.45, "engram").unwrap_or_default();
+                            dm.search_memories(&emb, 0.45, "engram", m).unwrap_or_default();
                         let chrono_mem = dm.get_latest_engrams(2).unwrap_or_default();
                         (dm, (chat_mem, directive_mem, engram_mem, chrono_mem))
                     })
@@ -341,11 +427,11 @@ pub async fn ignite(vault_path: PathBuf, synapse: Synapse) {
                     timestamp,
                     embedding,
                     memory_type,
+                    embed_model,
                 } => {
                     let mut dm = disk_manager;
                     let (dm_returned, result) = task::spawn_blocking(move || {
-                        let res =
-                            dm.save_memory(&sender, &content, &timestamp, embedding, &memory_type);
+                        let res = dm.save_memory(&sender, &content, &timestamp, embedding, &memory_type, &embed_model);
                         (dm, res)
                     })
                     .await
@@ -392,6 +478,35 @@ pub async fn ignite(vault_path: PathBuf, synapse: Synapse) {
                         })
                         .await;
                 }
+                // EMBED (B317): the re-embed walk — the vault hands out bounded batches of memories
+                // whose vector was not made by the configured model, and writes the new vectors back.
+                SMessage::ReEmbed { receipt_id, embed_model, limit } => {
+                    let mut dm = disk_manager;
+                    let (dm_returned, result) = task::spawn_blocking(move || {
+                        let res = dm.reembed_batch(&embed_model, limit);
+                        (dm, res)
+                    })
+                    .await
+                    .unwrap();
+                    disk_manager = dm_returned;
+                    let (items, stale_total) = result.unwrap_or_default();
+                    synapse_clone.fire_async(SMessage::ReEmbedBatch { receipt_id, items, stale_total }).await;
+                }
+                SMessage::ReEmbedWrite { receipt_id, embed_model, vectors } => {
+                    let mut dm = disk_manager;
+                    let (dm_returned, result) = task::spawn_blocking(move || {
+                        let res = dm.write_vectors(&embed_model, vectors);
+                        (dm, res)
+                    })
+                    .await
+                    .unwrap();
+                    disk_manager = dm_returned;
+                    let (written, remaining, error) = match result {
+                        Ok((w, r)) => (w, r, None),
+                        Err(e) => (0, 0, Some(e.to_string())),
+                    };
+                    synapse_clone.fire_async(SMessage::ReEmbedDone { receipt_id, written, remaining, error }).await;
+                }
                 _ => {} // Ignore other messages
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -430,6 +545,7 @@ mod tests {
             "2026-07-13T00:00:00Z",
             vec![0.5; 4],
             "engram",
+            "test/model",
         )
         .expect("fresh vault must accept writes");
         let engrams = dm
@@ -501,6 +617,7 @@ mod tests {
                 "2026-07-13T00:00:00Z",
                 vec![0.25; 4],
                 "engram",
+                "test/model",
             )
             .expect("write memory");
         }
@@ -510,5 +627,44 @@ mod tests {
             .get_latest_engrams(1)
             .expect("reopened vault must answer queries");
         assert_eq!(engrams, vec!["remember me".to_string()]);
+    }
+
+    /// EMBED (B317): the model tag is stored beside each vector, vectors from another model never
+    /// compare, a memory stored with recall off has no vector, and the re-embed walk finds and fixes
+    /// both — bounded per batch.
+    #[test]
+    fn embed_model_tags_gate_recall_and_drive_reembed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut dm = DiskManager::new(&dir.path().join("vault.unafs")).expect("vault");
+        let a = vec![1.0, 0.0, 0.0, 0.0];
+        dm.save_memory("user", "alpha", "t", a.clone(), "chat", "local/m1").unwrap();
+        dm.save_memory("user", "beta", "t", a.clone(), "chat", "gemini/m2").unwrap();
+        dm.save_memory("user", "gamma", "t", Vec::new(), "chat", "").unwrap();
+
+        // Tags on disk.
+        let hits = dm.fs.query_inodes("type == \"chat\"").unwrap();
+        let alpha = hits.iter().find(|(i, _)| i.size == 5).map(|(i, _)| i.clone()).unwrap();
+        assert_eq!(embed_tag(&alpha), Some("local/m1"));
+        assert_eq!(alpha.attributes.get(ATTR_EMBED_DIMS), Some(&AttributeValue::Int(4)));
+        let gamma = hits.iter().find(|(i, _)| embed_tag(i).is_none()).map(|(i, _)| i.clone()).unwrap();
+        assert!(!gamma.attributes.contains_key("embedding") && !gamma.large_attributes.contains_key("embedding"));
+
+        // Only same-model vectors compare.
+        assert_eq!(dm.search_memories(&a, 0.45, "chat", "local/m1").unwrap(), vec!["[user]: alpha".to_string()]);
+        assert_eq!(dm.search_memories(&a, 0.45, "chat", "gemini/m2").unwrap(), vec!["[user]: beta".to_string()]);
+        assert!(dm.search_memories(&[], 0.45, "chat", "local/m1").unwrap().is_empty());
+
+        // Stale under local/m1: beta (other model) and gamma (no vector).
+        let (batch, total) = dm.reembed_batch("local/m1", 1).unwrap();
+        assert_eq!((batch.len(), total), (1, 2));
+        assert_eq!(batch[0].1, "beta");
+        let (written, remaining) = dm.write_vectors("local/m1", vec![(batch[0].0, vec![0.0, 1.0, 0.0, 0.0])]).unwrap();
+        assert_eq!((written, remaining), (1, 1));
+        let (batch, total) = dm.reembed_batch("local/m1", 8).unwrap();
+        assert_eq!((batch.len(), total, batch[0].1.as_str()), (1, 1, "gamma"));
+        let (_, remaining) = dm.write_vectors("local/m1", vec![(batch[0].0, vec![0.0, 0.0, 1.0, 0.0])]).unwrap();
+        assert_eq!(remaining, 0);
+        assert_eq!(dm.search_memories(&a, 0.45, "chat", "local/m1").unwrap().len(), 1);
+        assert_eq!(dm.search_memories(&[0.0, 0.0, 1.0, 0.0], 0.45, "chat", "local/m1").unwrap(), vec!["[user]: gamma".to_string()]);
     }
 }
