@@ -565,6 +565,33 @@ pub fn dump_layout(layout: &LayoutTree) {
     walk(layout, layout.root_node, 0.0, 0.0, 0, max_depth);
 }
 
+/// The colour that fills the whole canvas: `html`'s background-color, or,
+/// when the root has none, `body`'s. None = no author background (white).
+pub fn canvas_background(layout: &LayoutTree) -> Option<(u8, u8, u8)> {
+    let find = |tag: &str| -> Option<NodeId> {
+        // html and body sit within the top three levels of the box tree.
+        let mut level = vec![layout.root_node];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for id in level {
+                let is_tag = layout
+                    .node_map
+                    .get(&id)
+                    .and_then(|n| n.as_element().map(|e| e.name.local.as_ref() == tag))
+                    .unwrap_or(false);
+                if is_tag {
+                    return Some(id);
+                }
+                next.extend(layout.taffy.children(id).unwrap_or_default());
+            }
+            level = next;
+        }
+        None
+    };
+    let bg = |id: Option<NodeId>| id.and_then(|i| layout.paint_map.get(&i)).and_then(|p| p.background);
+    bg(find("html")).or_else(|| bg(find("body")))
+}
+
 pub fn render_frame(
     layout: &LayoutTree,
     surface: &mut [u8],
@@ -579,13 +606,16 @@ pub fn render_frame(
     }
     dump_layout(layout);
 
-    // Clear damaged regions to the page background.
+    // Clear damaged regions to the CANVAS background: the root element's
+    // background, else body's (CSS Backgrounds §2.11.2 — the root/body
+    // background propagates to the whole canvas, not just their boxes).
+    let canvas = canvas_background(layout).unwrap_or((255, 255, 255));
     for &(dx, dy, dw, dh) in damage_rects {
         let ex = (dx + dw).min(width);
         let ey = (dy + dh).min(height);
         for y in dy..ey {
             for x in dx..ex {
-                put_px(surface, width, x, y, (255, 255, 255));
+                put_px(surface, width, x, y, canvas);
             }
         }
     }

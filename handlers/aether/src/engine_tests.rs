@@ -2261,4 +2261,21 @@ mod tests {
         }
         panic!("text run not found");
     }
+
+    #[test]
+    fn aethersee_body_background_fills_the_canvas() {
+        // AETHERSEE fix 2 (corpus 15-landing): a body background painted
+        // only the body box; below the content the canvas stayed white.
+        let html = r#"<!DOCTYPE html><html><body style="margin:0"><p>short</p></body></html>"#;
+        let mut tree = layout::compute_layout_sized(&dom::parse_html(html), 100.0, 100.0);
+        css::apply_css(&mut tree, "body { background: #102030; }");
+        assert_eq!(render::canvas_background(&tree), Some((0x10, 0x20, 0x30)));
+        let mut surface = vec![0u8; 100 * 100 * 4];
+        render::render_frame(&tree, &mut surface, 100, 100, 0.0, 0.0, &[(0, 0, 100, 100)]);
+        let px = |x: usize, y: usize| surface[(y * 100 + x) * 4..(y * 100 + x) * 4 + 3].to_vec();
+        assert_eq!(px(50, 95), vec![0x30, 0x20, 0x10], "canvas below the content is body's colour (BGRA)");
+        // The root's own background wins over body's.
+        css::apply_css(&mut tree, "html { background: #ff0000; } body { background: #102030; }");
+        assert_eq!(render::canvas_background(&tree), Some((255, 0, 0)));
+    }
 }
