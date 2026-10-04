@@ -72,7 +72,7 @@ fn blend_px(surface: &mut [u8], width: u32, x: u32, y: u32, (r, g, b): (u8, u8, 
 /// (bold, glyph id, quarter-px font size); holds the coverage bitmap and
 /// its raster-bounds origin. Cleared implicitly by process lifetime —
 /// glyphs are font-global, not page-scoped.
-type GlyphKey = (u8, u32, u32); // (family*2+bold, glyph, quarter-px size)
+type GlyphKey = (u8, u32, u32); // (fonts::face_key, glyph, quarter-px size)
 struct CachedGlyph {
     origin: (i32, i32),
     w: i32,
@@ -383,7 +383,7 @@ pub(crate) fn test_bg_geometry(
 }
 
 /// Transforms text based on text-transform property: 0 = none, 1 = uppercase, 2 = lowercase, 3 = capitalize.
-fn transform_text(text: &str, transform: u8) -> String {
+pub(crate) fn transform_text(text: &str, transform: u8) -> String {
     match transform {
         1 => text.to_uppercase(),
         2 => text.to_lowercase(),
@@ -683,13 +683,9 @@ pub fn render_frame(
                 let tag = el.name.local.as_ref();
                 inherited.font_size =
                     spec.font_size.unwrap_or_else(|| default_font_size(tag, inherited.font_size));
-                inherited.bold = spec.bold.unwrap_or(
-                    inherited.bold
-                        || matches!(tag, "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th"),
-                );
-                inherited.italic = spec.italic.unwrap_or(
-                    inherited.italic || matches!(tag, "i" | "em"),
-                );
+                inherited.bold = spec.bold.unwrap_or_else(|| crate::layout::default_bold(tag, inherited.bold));
+                inherited.italic =
+                    spec.italic.unwrap_or_else(|| crate::layout::default_italic(tag, inherited.italic));
                 inherited.family = spec
                     .family
                     .unwrap_or_else(|| crate::layout::default_family(tag, inherited.family));
@@ -1003,16 +999,12 @@ pub fn render_frame(
                     }
                 }
             } else if dom_node.as_text().is_some() && !inherited.text_hidden {
-                // Family font first (serif/mono), falling back to the
-                // preloaded sans pair; bold uses the sans-bold face for
-                // non-sans families (approximation).
-                let fam_font = if inherited.family != 0 && !inherited.bold {
-                    crate::layout::family_font(inherited.family)
-                } else {
-                    None
-                };
-                let font = if fam_font.is_some() {
-                    &fam_font
+                // The same face the measurer wrapped this run with
+                // (fonts::face): family x weight x style. The preloaded sans
+                // pair is only the fallback when no face loads at all.
+                let face = crate::fonts::face(inherited.family, inherited.bold, inherited.italic);
+                let font = if face.is_some() {
+                    &face
                 } else if inherited.bold {
                     font_bold
                 } else {
@@ -1049,7 +1041,7 @@ pub fn render_frame(
                             ty,
                             max_w,
                             font,
-                            inherited.family * 2 + if inherited.bold { 1 } else { 0 },
+                            crate::fonts::face_key(inherited.family, inherited.bold, inherited.italic),
                             inherited.font_size,
                             inherited.line_height,
                             inherited.color,

@@ -580,6 +580,16 @@ pub fn family_font(family: u8) -> Option<std::sync::Arc<font_kit::font::Font>> {
     })
 }
 
+/// UA default bold per element, shared by the measurer and the painter.
+pub fn default_bold(tag: &str, inherited: bool) -> bool {
+    inherited || matches!(tag, "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "th")
+}
+
+/// UA default italic per element, shared by the measurer and the painter.
+pub fn default_italic(tag: &str, inherited: bool) -> bool {
+    inherited || matches!(tag, "i" | "em" | "cite" | "var" | "dfn" | "address")
+}
+
 /// UA default font sizes per element (shared with the renderer).
 pub fn default_font_size(tag: &str, inherited: f32) -> f32 {
     match tag {
@@ -648,31 +658,38 @@ pub fn remeasure(tree: &mut LayoutTree) {
     propagate_text_align(tree);
     // Pass 1: resolve font size down the box tree for text leaves, and
     // intrinsic sizes for images.
-    let mut text_info: HashMap<taffy::NodeId, (String, f32, f32, bool, u8)> = HashMap::new();
+    let mut text_info: HashMap<taffy::NodeId, TextRun> = HashMap::new();
     let mut img_info: HashMap<taffy::NodeId, (f32, f32)> = HashMap::new();
     fn resolve(
         node_id: taffy::NodeId,
-        inherited: (f32, f32, bool, u8), // (font size, line-height; 0=natural, nowrap, family)
+        inherited: TextRun, // `text` unused here: the inherited text properties
         tree: &LayoutTree,
-        out: &mut HashMap<taffy::NodeId, (String, f32, f32, bool, u8)>,
+        out: &mut HashMap<taffy::NodeId, TextRun>,
         imgs: &mut HashMap<taffy::NodeId, (f32, f32)>,
     ) {
-        let mut size = inherited;
+        let mut size = inherited.clone();
         if let Some(dom_node) = tree.node_map.get(&node_id) {
             if let Some(el) = dom_node.as_element() {
                 let paint = tree.paint_map.get(&node_id);
-                size.0 = paint
+                let tag = el.name.local.as_ref();
+                size.font_size = paint
                     .and_then(|p| p.font_size)
-                    .unwrap_or_else(|| default_font_size(el.name.local.as_ref(), inherited.0));
+                    .unwrap_or_else(|| default_font_size(tag, inherited.font_size));
                 if let Some(lh) = paint.and_then(|p| p.line_height) {
-                    size.1 = lh;
+                    size.line_height = lh;
                 }
                 if let Some(nw) = paint.and_then(|p| p.nowrap) {
-                    size.2 = nw;
+                    size.nowrap = nw;
                 }
-                size.3 = paint
+                size.family = paint
                     .and_then(|p| p.family)
-                    .unwrap_or_else(|| default_family(el.name.local.as_ref(), inherited.3));
+                    .unwrap_or_else(|| default_family(tag, inherited.family));
+                size.bold = paint.and_then(|p| p.bold).unwrap_or_else(|| default_bold(tag, inherited.bold));
+                size.italic =
+                    paint.and_then(|p| p.italic).unwrap_or_else(|| default_italic(tag, inherited.italic));
+                if let Some(tt) = paint.and_then(|p| p.text_transform) {
+                    size.text_transform = tt;
+                }
                 if el.name.local.as_ref() == "img" {
                     let attrs = el.attributes.borrow();
                     // width/height attributes win; else intrinsic dimensions.
@@ -690,19 +707,22 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 }
             } else if dom_node.as_text().is_some() {
                 let text = dom_node.text_contents();
-                let text = text.trim().to_string();
+                let text = text.trim();
                 if !text.is_empty() {
-                    out.insert(node_id, (text, inherited.0, inherited.1, inherited.2, inherited.3));
+                    // Measured exactly as painted: transformed text, same face.
+                    let text = crate::render::transform_text(text, inherited.text_transform);
+                    out.insert(node_id, TextRun { text, ..inherited.clone() });
                 }
             }
         }
         if let Ok(children) = tree.taffy.children(node_id) {
             for child in children {
-                resolve(child, size, tree, out, imgs);
+                resolve(child, size.clone(), tree, out, imgs);
             }
         }
     }
-    resolve(tree.root_node, (16.0, 0.0, false, 0), tree, &mut text_info, &mut img_info);
+    let root = TextRun { font_size: 16.0, ..Default::default() };
+    resolve(tree.root_node, root, tree, &mut text_info, &mut img_info);
 
     // Taffy caches leaf measurements; a cascade pass can change resolved
     // font sizes without touching the leaf's style, so stale cached sizes
@@ -731,7 +751,7 @@ pub fn remeasure(tree: &mut LayoutTree) {
                     height: known.height.unwrap_or(h),
                 };
             }
-            let Some((text, font_size, line_mult, nowrap, family)) = text_info.get(&node_id) else {
+            let Some(run) = text_info.get(&node_id) else {
                 return Size { width: known.width.unwrap_or(0.0), height: known.height.unwrap_or(0.0) };
             };
             // Min-content (a flex item's automatic minimum size) is the
@@ -743,16 +763,32 @@ pub fn remeasure(tree: &mut LayoutTree) {
                 AvailableSpace::MinContent => 0.0,
                 AvailableSpace::MaxContent => vw_cap,
             });
-            let effective_wrap = if *nowrap { f32::MAX } else { wrap_width.max(1.0) };
-            let fam_font = family_font(*family);
-            let use_font = fam_font.as_deref().or(font.as_deref());
-            let (w, h) = measure_text_family(use_font, *family, text, *font_size, *line_mult, effective_wrap);
+            let effective_wrap = if run.nowrap { f32::MAX } else { wrap_width.max(1.0) };
+            let face = crate::fonts::face(run.family, run.bold, run.italic);
+            let use_font = face.as_deref().or(font.as_deref());
+            let key = crate::fonts::face_key(run.family, run.bold, run.italic);
+            let (w, h) = measure_text_family(use_font, key, &run.text, run.font_size, run.line_height, effective_wrap);
             Size {
                 width: known.width.unwrap_or(w),
                 height: known.height.unwrap_or(h),
             }
         },
     );
+}
+
+/// One text run's resolved text properties (inherited down the box tree the
+/// same way render::draw_node inherits them).
+#[derive(Clone, Default)]
+struct TextRun {
+    text: String,
+    font_size: f32,
+    /// Multiplier of font size; 0 = the face's natural line height.
+    line_height: f32,
+    nowrap: bool,
+    family: u8,
+    bold: bool,
+    italic: bool,
+    text_transform: u8,
 }
 
 /// Measures wrapped text: returns (widest line, total height). Mirrors the
@@ -769,7 +805,7 @@ fn measure_text(
 
 fn measure_text_family(
     font: Option<&font_kit::font::Font>,
-    family: u8,
+    family: u8, // the face key (fonts::face_key): advances are cached per face
     text: &str,
     font_size: f32,
     line_mult: f32,

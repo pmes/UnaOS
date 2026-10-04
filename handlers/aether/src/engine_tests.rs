@@ -2278,4 +2278,28 @@ mod tests {
         css::apply_css(&mut tree, "html { background: #ff0000; } body { background: #102030; }");
         assert_eq!(render::canvas_background(&tree), Some((255, 0, 0)));
     }
+
+    #[test]
+    fn aethersee_text_is_measured_with_the_face_it_is_painted_with() {
+        // AETHERSEE fix 3 (corpus 01-blog-article): the measurer always used
+        // the family's REGULAR face, the painter the bold face, so every bold
+        // heading painted wider than its box and overlapped the next block.
+        let html = r#"<!DOCTYPE html><html><body>
+            <div><span id="r">Three stages of a browser</span></div>
+            <div><b id="b">Three stages of a browser</b></div>
+            <div><span id="u" style="text-transform:uppercase">Three stages of a browser</span></div>
+        </body></html>"#;
+        let mut tree = layout::compute_layout_sized(&dom::parse_html(html), 800.0, 600.0);
+        css::apply_css(&mut tree, "");
+        let (r, b, u) = (box_by_id(&tree, "r"), box_by_id(&tree, "b"), box_by_id(&tree, "u"));
+        assert!(b.size.width > r.size.width, "bold run measured with the bold face ({} vs {})", b.size.width, r.size.width);
+        assert!(u.size.width > r.size.width, "uppercase run measured after its transform");
+        // One resolver: the key distinguishes every face the painter can pick.
+        use crate::fonts::face_key;
+        let keys: std::collections::HashSet<u8> = (0..3u8)
+            .flat_map(|f| [(f, false, false), (f, true, false), (f, false, true), (f, true, true)])
+            .map(|(f, b, i)| face_key(f, b, i))
+            .collect();
+        assert_eq!(keys.len(), 12);
+    }
 }
