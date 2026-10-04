@@ -4020,6 +4020,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "holocron-cli"
+version = "0.1.0"
+dependencies = [
+ "holocron",
+]
+
+[[package]]
 name = "holocron_core"
 version = "0.1.0"
 

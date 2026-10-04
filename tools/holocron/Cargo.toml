@@ -1,0 +1,19 @@
+[package]
+name = "holocron-cli"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "`holocron` — the command line over Holocron's bus: daemon, init/unlock/lock/status, put/get/list/delete, keygen/sign, agent-env."
+
+# HOLOCRON1 (LEDGER SR33). No third-party dependencies: argument parsing is twenty lines.
+
+[[bin]]
+name = "holocron"
+path = "src/main.rs"
+
+[dependencies]
+holocron = { path = "../../handlers/holocron" }
+
+[features]
+default = []
+crypto_core = ["holocron/crypto_core"]
