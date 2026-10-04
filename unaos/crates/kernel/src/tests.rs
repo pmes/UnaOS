@@ -129,7 +129,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); // LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold)
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); // LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win();
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); // FILETYPE (B307): `tests filetype`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8();
@@ -357,4 +357,14 @@ fn skipped_names() -> alloc::string::String {
     let mut s = alloc::string::String::new();
     for n in SKIPPED.lock().iter().flatten() { if !s.is_empty() { s.push(','); } s.push_str(n); }
     s
+}
+
+/// NETCLOCK (B335): register `tests netclock` (5 s idle on a live USB link: polls/s, tx/s, the stack-side
+/// xHCI loan hold) exactly once on an x86 smolnet + usbnet build.
+fn ensure_netclock() {
+    #[cfg(all(feature = "smolnet", feature = "usbnet", target_arch = "x86_64"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("netclock", crate::smolnet::netclock_selftest); }
+    }
 }

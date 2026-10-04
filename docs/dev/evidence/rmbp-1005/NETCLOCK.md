@@ -71,3 +71,14 @@ DISCOVER every 10 s (0.1 tx/s) until a lease, polls about 1/s plus one per recei
 - `drive()` still drains the whole event ring (`poll_events`), so a hold can include another device's events. The fixture measures
   it as it is.
 - The ICMP `ping`/`arp` pump keeps its own throwaway interface. It is now real-clocked and capped at 2 s.
+
+## Results (M2..M5, one commit)
+M2..M5 are one commit: the previous executor was interrupted with all four in flight across the same seven files
+(the TX back-pressure in `smolnet.rs` calls into the M3 ring, so no earlier split compiles on its own).
+- M2 `now_ms` (the real clock), `poll_now`/`poll_due`/`kick`, `pump_until`, `service_poll` on the `service_net` line (same-line append).
+- M3 `usbnet_data_pass` + `usbnet_tx_issue` (no `ftdi_pending`, no wait), `tx_claim` on `usbnet::claim`, `RawNic::tx_ready` -> `tx_room`.
+- M4 `tcp_pump_chunked`, `stack_recvfrom_bounded`, `stack_accept`, `dhcp_acquire` go through `pump_until` (one poll per `STACK` hold).
+- M5 `tests netclock` (`smolnet::netclock_selftest`, registered by `tests::ensure_netclock`); census `polls= tx_q= tx_stuck=`.
+Compile legs (inline, from `unaos/crates/kernel`): x86 metal shape exit 0; x86 metal shape + `usbdebug` exit 0.
+charter-check exit 0. The aarch64 leg was not run (the only aarch64-visible edit is the defaulted `RawNic::tx_ready`).
+Not touched: the aarch64 smoltcp stack in `net_phy.rs` (its own per-poll `POLL_CLOCK`, the same flaw, owed to the arm tracks).
