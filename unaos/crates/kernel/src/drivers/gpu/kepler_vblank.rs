@@ -353,7 +353,7 @@ const LADDER_WINDOW_RUN: u32 = 2;
 const LADDER_IRQ_ARM: u32 = 3;
 const LADDER_IRQ_RUN: u32 = 4;
 const LADDER_DONE: u32 = 5;
-static LADDER: AtomicU32 = AtomicU32::new(LADDER_CENSUS);
+static LADDER: AtomicU32 = AtomicU32::new(KV9_LADDER_BOOT); // KVBLANK9 M1: PARKED at boot unless `kvblank_trace`
 
 /// §R1 — census samples taken, and the edge count at the last one (for `count_delta=`).
 static CENSUS_N: AtomicU32 = AtomicU32::new(0);
@@ -644,6 +644,20 @@ pub unsafe fn arm_pmc_pdisplay(bar0: usize) {
     if let Some((b, s, f)) = bdf {
         VB_BDF1.store((((b as u32) << 16) | ((s as u32) << 8) | f as u32) + 1, Ordering::Release);
     }
+    kv9_bank_pmc(bar0); // KVBLANK9 M1 (R80): the boot BANKS rung 1's inputs and prints nothing
+    if cfg!(feature = "kvblank_trace") {
+        kv9_pmc_probe(bar0); // the knob keeps the boot-time probe (R80-admissible)
+    }
+}
+
+/// KVBLANK9 M1 — rung 1's PMC half: the `bdf-hunt` line (from the bank) and the 50 ms `INTR_MASK_HOST`
+/// probe (live). Run by `tests kvblank8`; by the boot only under `kvblank_trace`.
+///
+/// # Safety
+/// `bar0` must be the mapped BAR0 base `kepler::init` banked.
+unsafe fn kv9_pmc_probe(bar0: usize) {
+    let bdf1 = VB_BDF1.load(Ordering::Acquire);
+    let bdf = if bdf1 == 0 { None } else { let v = bdf1 - 1; Some(((v >> 16) as u8, (v >> 8) as u8, v as u8)) };
     serial_println!(
         ":: kepler: vblank bdf-hunt bar0={:08X} bus_max={} found={} bdf={}:{}.{} :: — the GK107's PCI function, matched by BAR0 against config-space offset 0x10 on every NVIDIA (0x10DE) function up to the bound. Needed by KVBLANK2 §R3 (MSI/INTx) and resolved HERE because `kepler::init`'s call site is a fenced same-line append that hands this rung BAR0 alone. READ-ONLY: config writes=0 ::",
         bar0, GK107_BUS_MAX, bdf.is_some() as u32,
@@ -702,6 +716,14 @@ pub fn arm(head: u32, vtotal: u32) {
     VB_VTOTAL.store(vtotal, Ordering::Relaxed);
     VB_LAST_PRINT_MS.store(crate::arch::ms(), Ordering::Relaxed);
     VB_HEAD1.store(head + 1, Ordering::Release);
+    kv9_bank_head(head as usize); // KVBLANK9 M1 (R80): bank the head's interrupt block; the line prints from `tests kvblank8`
+    if cfg!(feature = "kvblank_trace") {
+        arm_line(head, vtotal);
+    }
+}
+
+/// The `vblank arm` line (the head, the frame, the source the wait trusts right now).
+fn arm_line(head: u32, vtotal: u32) {
     serial_println!(
         ":: kepler: vblank arm head={} vt={} mode={} src=HEAD_STAT.VERT[31:16] :: — rnndb display/g80_pdisplay.xml:647 (HEAD_STAT 0x6000, stride 0x800, +0x340 VERT: vline[15:0], vblank_count[31:16]). mode= starts at poll and is set to irq ONLY by KVBLANK2 rung 3 observing the wire deliver (see the `vblank-intr vector close` line); KVBLANK's reason for poll — no vector allocator a PCI function could join — was closed by VECTORS (rmbp-ledger B168) and the NOT-IN-TREE enable/status pair by KVBLANK2's citation (B179). The polled sampler is the compositor's own scanout_beam read: zero extra MMIO. READ-ONLY: writes=0 ::",
         head, vtotal, mode_str(),
@@ -872,6 +894,7 @@ fn rung1_census(bar0: usize, head: usize, n: u64) {
     }
     CENSUS_AT.store(n, Ordering::Relaxed);
     CENSUS_N.store(taken + 1, Ordering::Relaxed);
+    if taken == 0 { kv9_census_boot(head); } // KVBLANK9 M1: sample `boot` answers from the bank
     let (sum, hsum, st, hst, en, disp) = unsafe { read_intr_block(bar0, head) };
     let vb = 1u32 << DISP_INTR_HEAD_BIT_VBLANK;
     serial_println!(
@@ -2395,6 +2418,7 @@ pub fn kvblank8_selftest() {
         serial_println!(":: KVBLANK8: lost_at=- isr_calls=0 eoi=- rearm=- -> SKIP (no GK107 head armed: bar0={} bdf={} head={}) ::", (bar0 != 0) as u32, (bdf1 != 0) as u32, head1);
         return;
     }
+    kv9_rungs12(bar0, (head1 - 1) as usize); // KVBLANK9 M1: rungs 1-2 run HERE from the boot bank, not at boot (R80)
     gt_rung3_from_fixture(); // GPUTESTS M2: rung 3 and its 90 % delivery window run HERE, not at boot (R80)
     // Rung 3 (or a knob trace) still owns the window: wait for it, bounded.
     let mut w = 0u32;
@@ -2589,4 +2613,105 @@ fn gt_pace(c: &Kv8Census) -> (u64, i64) {
     }
     let x1000 = c.pace_us.saturating_mul(1000) / c.pace_frames;
     (x1000 / 1000, gt_ppm_x1000(x1000))
+}
+
+
+// ── KVBLANK9 M1 (B341, R80) — rungs 1 and 2 behind `tests kvblank8`, their inputs banked at boot ──────────────────
+//
+// GPUTESTS parked rung 3; rungs 1 (the PMC probe, the head-arm line, eight census samples) and 2 (the 16-vblank
+// enable window) still walked and printed at boot. Now the boot BANKS what those rungs read at the moment it owned
+// the device — the PMC entry words at `kepler::init`, the head's six-word PDISPLAY interrupt block at the head arm
+// (post-takeover) — and the ladder starts PARKED. `tests kvblank8` prints the bank, runs the PMC probe live and walks
+// census -> window on the edge driver (bounded) before rung 3. Under `kvblank_trace` the boot walks the whole ladder
+// as before: a knob is R80-admissible, and the trace exists to watch the takeover.
+
+/// The ladder's state at boot.
+const KV9_LADDER_BOOT: u32 = if cfg!(feature = "kvblank_trace") { LADDER_CENSUS } else { LADDER_IRQ_PARKED };
+
+/// `kepler::init`'s PMC words: `INTR_EN`, `INTR_MASK_HOST`, `INTR_0`; `KV9_BANKED_PMC` once taken.
+static KV9_PMC: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+static KV9_BANKED_PMC: AtomicBool = AtomicBool::new(false);
+/// The head's interrupt block at its arm: summary, host_summary, head_status, host_head, host_head_en, dispatch.
+static KV9_INTR: [AtomicU32; 6] = [const { AtomicU32::new(0) }; 6];
+static KV9_BANKED_HEAD: AtomicBool = AtomicBool::new(false);
+static KV9_BANK_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Boot: read (never write) the three PMC words rung 1's probe starts from.
+unsafe fn kv9_bank_pmc(bar0: usize) {
+    KV9_PMC[0].store(mmio_read(bar0, regs::NV_PMC_INTR_EN), Ordering::Relaxed);
+    KV9_PMC[1].store(mmio_read(bar0, PMC_INTR_MASK_HOST), Ordering::Relaxed);
+    KV9_PMC[2].store(mmio_read(bar0, regs::NV_PMC_INTR_0), Ordering::Relaxed);
+    KV9_BANKED_PMC.store(true, Ordering::Release);
+}
+
+/// Boot, at the head arm: read (never write) the head's interrupt block, as rung 1's census reads it.
+fn kv9_bank_head(head: usize) {
+    let bar0 = VB_BAR0.load(Ordering::Acquire);
+    if bar0 == 0 || head >= 4 {
+        return;
+    }
+    let (a, b, c, d, e, f) = unsafe { read_intr_block(bar0, head) };
+    for (slot, v) in KV9_INTR.iter().zip([a, b, c, d, e, f]) {
+        slot.store(v, Ordering::Relaxed);
+    }
+    KV9_BANK_MS.store(crate::arch::ms(), Ordering::Relaxed);
+    KV9_BANKED_HEAD.store(true, Ordering::Release);
+}
+
+/// The census's sample `boot` — the banked block, in the census line's field names.
+fn kv9_census_boot(head: usize) {
+    if !KV9_BANKED_HEAD.load(Ordering::Acquire) {
+        serial_println!(":: kepler: vblank-intr census sample=boot/{} head={} source=none (the head arm banked nothing) ::", CENSUS_SAMPLES, head);
+        return;
+    }
+    let w: [u32; 6] = core::array::from_fn(|i| KV9_INTR[i].load(Ordering::Relaxed));
+    let vb = 1u32 << DISP_INTR_HEAD_BIT_VBLANK;
+    serial_println!(
+        ":: kepler: vblank-intr census sample=boot/{} head={} status={:08X} en={:08X} host_status={:08X} host_dispatch={:08X} summary={:08X} host_summary={:08X} vblank_bit={} host_vblank_bit={} summary_head_bit={} source=boot-bank at_ms={} :: — KVBLANK9: the block as the head arm read it after the takeover; samples 1..{} are live ::",
+        CENSUS_SAMPLES, head, w[2], w[4], w[3], w[5], w[0], w[1],
+        (w[2] & vb != 0) as u32, (w[3] & vb != 0) as u32,
+        (w[1] >> (DISP_INTR_SUMMARY_HEAD0_SHIFT + head as u32)) & 1,
+        KV9_BANK_MS.load(Ordering::Relaxed), CENSUS_SAMPLES,
+    );
+}
+
+/// `tests kvblank8`, before rung 3: the bank, rung 1's lines, then census -> window on the edge driver. Bounded:
+/// 6 s for a rung-3 window already open, 10 s for rungs 1-2 (8 samples x 30 vblanks + 16, ~4.3 s at 60 Hz).
+fn kv9_rungs12(bar0: usize, head: usize) {
+    let pmc: [u32; 3] = core::array::from_fn(|i| KV9_PMC[i].load(Ordering::Relaxed));
+    serial_println!(
+        ":: kepler: vblank bank source=boot-bank pmc={} pmc_en={:08X} pmc_mask={:08X} pmc_intr={:08X} head_block={} head={} at_ms={} :: — KVBLANK9 (R80): what rungs 1-2 read, as the boot read it; the boot printed none of it ::",
+        KV9_BANKED_PMC.load(Ordering::Acquire) as u32, pmc[0], pmc[1], pmc[2],
+        KV9_BANKED_HEAD.load(Ordering::Acquire) as u32, head, KV9_BANK_MS.load(Ordering::Relaxed),
+    );
+    arm_line(head as u32, VB_VTOTAL.load(Ordering::Relaxed));
+    unsafe { kv9_pmc_probe(bar0) };
+    let mut w = 0u32;
+    while matches!(LADDER.load(Ordering::Acquire), LADDER_IRQ_ARM | LADDER_IRQ_RUN) && w < 600 {
+        crate::arch::sched::sleep_ms(10);
+        w += 1;
+    }
+    let st = LADDER.load(Ordering::Acquire);
+    if st != LADDER_IRQ_PARKED && st != LADDER_DONE {
+        serial_println!(":: KVBLANK8: rungs12 state={} note=ladder-busy-not-restarted ::", st);
+        return;
+    }
+    CENSUS_N.store(0, Ordering::Relaxed);
+    CENSUS_AT.store(0, Ordering::Relaxed);
+    if LADDER.compare_exchange(st, LADDER_CENSUS, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        serial_println!(":: KVBLANK8: rungs12 state=raced note=ladder-taken-by-first-need ::");
+        return;
+    }
+    let mut w = 0u32;
+    while matches!(LADDER.load(Ordering::Acquire), LADDER_CENSUS | LADDER_WINDOW_ARM | LADDER_WINDOW_RUN) && w < 1_000 {
+        crate::arch::sched::sleep_ms(10);
+        w += 1;
+    }
+    let open = matches!(LADDER.load(Ordering::Acquire), LADDER_CENSUS | LADDER_WINDOW_ARM | LADDER_WINDOW_RUN);
+    serial_println!(
+        ":: KVBLANK8: rungs12 census={}/{} window={} waited_ms={} -> {} ::",
+        CENSUS_N.load(Ordering::Relaxed), CENSUS_SAMPLES,
+        if open { "still-open-after-10s" } else { "closed" }, w * 10,
+        if open { "FAIL" } else { "PASS" },
+    );
 }
