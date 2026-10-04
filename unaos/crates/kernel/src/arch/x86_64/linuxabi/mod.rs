@@ -804,7 +804,18 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
         console.println("usage: linux <path> [args...]   (run a static Linux x86_64 ELF; Ctrl-C ends it)");
         return;
     };
-    report(path, args, console);
+    // LINUXABI3: busybox picks its applet from argv[0]'s basename and accepts only names starting with lowercase "busybox";
+    // the FAT 8.3 name reads BUSYBOX.LNX, so hand it "busybox" (then `linux /apps/BUSYBOX.LNX ls /` runs the ls applet).
+    let mut argv: Vec<&str> = args.to_vec();
+    if is_busybox(path) {
+        argv[0] = "busybox";
+    }
+    report(path, &argv, console);
+}
+
+fn is_busybox(path: &str) -> bool {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    base.len() >= 7 && base.as_bytes()[..7].eq_ignore_ascii_case(b"busybox")
 }
 
 fn report(path: &str, argv: &[&str], console: &mut crate::console::Console) {
@@ -882,5 +893,75 @@ pub fn selftest2() {
     serial_println!(
         ":: LINUXABI2: fork_ok={} pipe_ok={} dents={} stdin={} -> {} ::",
         fork_ok as u8, pipe_ok as u8, dents, stdin_ok as u8, if pass { "PASS" } else { "FAIL" }
+    );
+}
+
+/// `tests linuxabi3` — `SSE.LNX` (SSE/SSE2 in ring 3, MXCSR, a 64-byte SSE memcpy, then two forks that verify inherited xmm8..15,
+/// mutate them across context switches and re-verify; the parent re-verifies its own after reaping) and, when an operator staged one,
+/// a static musl `BUSYBOX.LNX ls /`. Absent SSE.LNX = SKIP (staging is the arroyo/builder lane's); absent busybox = `busybox=skip`.
+pub fn selftest3() {
+    const SSE: &str = "/apps/SSE.LNX";
+    const BB: &str = "/apps/BUSYBOX.LNX";
+    let r0 = fpu::RESTORES.load(Ordering::Relaxed);
+    let (s0, k0, f0) = (fpu::SAVES.load(Ordering::Relaxed), fpu::FORK_COPIES.load(Ordering::Relaxed), fpu::CR4_FLIPS.load(Ordering::Relaxed));
+    let mut cap = String::new();
+    let r = run_path(SSE, &[SSE], 15_000, false, &mut |l| {
+        cap.push_str(l);
+        cap.push('\n');
+    });
+    if matches!(&r, Err(e) if e.contains("-ENOENT")) {
+        serial_println!(":: LINUXABI3: cr4=? save=fx sse_lnx=skip fork_fp=skip busybox=skip -> SKIP (fixture not staged) ::");
+        return;
+    }
+    let (mut sse_ok, mut fork_fp) = (false, false);
+    match &r {
+        Ok(rep) => {
+            let clean = rep.pass && rep.exit == "0";
+            sse_ok = clean && cap.lines().any(|l| l == "sse ok");
+            fork_fp = clean && rep.forks >= 2 && rep.child_ok >= 2;
+            if !clean {
+                // SSE.LNX exits with the id of the check that failed: 11-16 parent (11 paddd, 12/13 cvt*, 14 initial MXCSR,
+                // 15 parent xmm8..15 after the children, 16 MXCSR after the switches, 17 fork, 18/19 wait4), 21/22 a child.
+                serial_println!("[linuxabi] SSE.LNX exit={} forks={} child_ok={}", rep.exit, rep.forks, rep.child_ok);
+            }
+        }
+        Err(e) => serial_println!("[linuxabi] SSE.LNX: {}", e),
+    }
+    let restores = fpu::RESTORES.load(Ordering::Relaxed).wrapping_sub(r0);
+    let mut cap2 = String::new();
+    let rb = run_path(BB, &["busybox", "ls", "/"], 20_000, false, &mut |l| {
+        cap2.push_str(l);
+        cap2.push('\n');
+    });
+    let busybox = match &rb {
+        Err(e) if e.contains("-ENOENT") => "skip",
+        Ok(rep) if rep.pass && rep.exit == "0" && cap2.lines().filter(|l| !l.is_empty()).count() >= 3 => "ok",
+        Ok(rep) => {
+            serial_println!("{}", rep.witness(BB));
+            "fail"
+        }
+        Err(e) => {
+            serial_println!("[linuxabi] BUSYBOX.LNX: {}", e);
+            "fail"
+        }
+    };
+    let slots = fpu::in_use();
+    serial_println!(
+        "[linuxabi] fpu restores={} saves={} fork_copies={} cr4_flips={} slots_in_use_after={}",
+        restores,
+        fpu::SAVES.load(Ordering::Relaxed).wrapping_sub(s0),
+        fpu::FORK_COPIES.load(Ordering::Relaxed).wrapping_sub(k0),
+        fpu::CR4_FLIPS.load(Ordering::Relaxed).wrapping_sub(f0),
+        slots
+    );
+    let ok = |b: bool| if b { "ok" } else { "fail" };
+    let pass = sse_ok && fork_fp && busybox != "fail" && restores > 0 && slots == 0;
+    serial_println!(
+        ":: LINUXABI3: cr4={} save=fx sse_lnx={} fork_fp={} busybox={} -> {} ::",
+        if restores > 0 { "osfxsr" } else { "off" },
+        ok(sse_ok),
+        ok(fork_fp),
+        busybox,
+        if pass { "PASS" } else { "FAIL" }
     );
 }
