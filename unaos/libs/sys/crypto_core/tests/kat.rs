@@ -36,3 +36,8 @@ fn m1_hashes_macs_kdfs() {
 fn m2_aead() {
     run(&["chacha20/", "poly1305/", "chacha20poly1305/", "aes/", "gcm/"]);
 }
+
+#[test]
+fn m3_curves() {
+    run(&["x25519/", "ed25519/", "p256/"]);
+}
