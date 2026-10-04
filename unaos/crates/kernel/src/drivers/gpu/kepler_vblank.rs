@@ -934,7 +934,7 @@ fn rung2_run(bar0: usize, head: usize, n: u64) {
         if en_back == en_entry { "clean" } else { "DIRTY" },
         WINDOW_VBLANKS,
     );
-    LADDER.store(LADDER_IRQ_ARM, Ordering::Release);
+    LADDER.store(gt_after_window(), Ordering::Release); // GPUTESTS M2: rung 3 parks for `tests kvblank8` (R80) unless `kvblank_trace`
 }
 
 /// **§R3 — THE VECTOR.** Allocate `kepler-vblank` from the VECTORS allocator (B168), program the
@@ -1143,7 +1143,7 @@ fn rung3_run(bar0: usize, head: usize, n: u64) {
     let pmc_back = unsafe { mmio_read(bar0, regs::NV_PMC_INTR_EN) };
     let mask_back = unsafe { mmio_read(bar0, PMC_INTR_MASK_HOST) };
     let en_back = unsafe { mmio_read(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head)) };
-    let irq = IRQ_COUNT.load(Ordering::Relaxed);
+    let irq = IRQ_COUNT.load(Ordering::Relaxed); GT_R3_VBL.store(elapsed, Ordering::Relaxed); GT_R3_IRQ.store(irq, Ordering::Relaxed); // GPUTESTS M2: the 90 % window's inputs, for the fixture line
     let (intr_or, line_or) = (WIN_PMC_OR.load(Ordering::Relaxed), WIN_LINE_OR.load(Ordering::Relaxed));
     let (deliver, reason) = classify(DeliverIn {
         irq,
@@ -2371,6 +2371,7 @@ pub fn kvblank8_selftest() {
         serial_println!(":: KVBLANK8: lost_at=- isr_calls=0 eoi=- rearm=- -> SKIP (no GK107 head armed: bar0={} bdf={} head={}) ::", (bar0 != 0) as u32, (bdf1 != 0) as u32, head1);
         return;
     }
+    gt_rung3_from_fixture(); // GPUTESTS M2: rung 3 and its 90 % delivery window run HERE, not at boot (R80)
     // Rung 3 (or a knob trace) still owns the window: wait for it, bounded.
     let mut w = 0u32;
     while (LADDER.load(Ordering::Acquire) == LADDER_IRQ_RUN || kv8_hold()) && w < 600 {
@@ -2460,5 +2461,61 @@ pub fn kvblank8_selftest() {
         ":: KVBLANK8: lost_at={} isr_calls={} eoi={} rearm={} -> {} ::",
         lost, c.isr_delta, if eoi_ok { "ok" } else { "missing" }, if rearm_ok { "ok" } else { "missing" },
         if pass { "PASS" } else { "FAIL" },
+    );
+}
+
+// ── GPUTESTS M2 (B334, R80) — rung 3 arms from `tests kvblank8`, not at boot ─────────────────────────────────────
+//
+// The edge-driven ladder used to walk census → enable window → VECTOR on its own, so the MSI arm, the 60-vblank
+// delivery window and its 90 % keep decision all ran on the boot path. Rung 2's close now PARKS the ladder; the
+// fixture un-parks it, lets the edge driver run rung 3 unchanged (its `vector armed` / `vector close` / `isr books`
+// lines keep their format), and scores the 90 % window as a fixture line. `kvblank_trace` keeps the boot-time arm:
+// a knob is R80-admissible, and the trace exists to watch the takeover.
+
+/// Rung 3 waits here for the fixture.
+const LADDER_IRQ_PARKED: u32 = 6;
+/// The 90 % window's inputs as rung 3's close read them (`vbl_delta=`, `irq=`).
+static GT_R3_VBL: AtomicU64 = AtomicU64::new(0);
+static GT_R3_IRQ: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn gt_after_window() -> u32 {
+    if cfg!(feature = "kvblank_trace") { LADDER_IRQ_ARM } else { LADDER_IRQ_PARKED }
+}
+
+/// Un-park rung 3 and wait (bounded) for its window to close on the edge driver; print the 90 % check.
+fn gt_rung3_from_fixture() {
+    // Rungs 1-2 still own the ladder for ~4.5 s after the takeover: wait for the park, bounded 10 s.
+    let mut w = 0u32;
+    while matches!(LADDER.load(Ordering::Acquire), LADDER_CENSUS | LADDER_WINDOW_ARM | LADDER_WINDOW_RUN) && w < 1_000 {
+        crate::arch::sched::sleep_ms(10);
+        w += 1;
+    }
+    let st = LADDER.load(Ordering::Acquire);
+    if st != LADDER_IRQ_PARKED {
+        serial_println!(
+            ":: KVBLANK8: rung3 state={} note={} ::",
+            match st { LADDER_IRQ_ARM | LADDER_IRQ_RUN => "running", LADDER_DONE => "done", _ => "not-parked" },
+            if st == LADDER_DONE { "rung-3-already-ran-this-boot-its-close-line-above-is-the-window" } else { "rung-3-not-parked-the-instrument-waits-for-it" },
+        );
+        return;
+    }
+    if LADDER.compare_exchange(LADDER_IRQ_PARKED, LADDER_IRQ_ARM, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
+    // The arm runs on the next edge; the window is IRQ_WINDOW_VBLANKS edges (1 s at 60 Hz). Bounded 5 s.
+    let mut w = 0u32;
+    while matches!(LADDER.load(Ordering::Acquire), LADDER_IRQ_ARM | LADDER_IRQ_RUN) && w < 500 {
+        crate::arch::sched::sleep_ms(10);
+        w += 1;
+    }
+    let (irq, vbl) = (GT_R3_IRQ.load(Ordering::Relaxed), GT_R3_VBL.load(Ordering::Relaxed));
+    let kept = IRQ_KEPT.load(Ordering::Acquire);
+    let open = matches!(LADDER.load(Ordering::Acquire), LADDER_IRQ_ARM | LADDER_IRQ_RUN);
+    serial_println!(
+        ":: KVBLANK8: rung3 irq={} vbl_delta={} ratio_pct={} kept={} window={} -> {} ::",
+        irq, vbl, irq.saturating_mul(100) / vbl.max(1), kept as u32,
+        if open { "still-open-after-5s" } else { "closed" },
+        if kept && !open { "PASS" } else { "FAIL" },
     );
 }
