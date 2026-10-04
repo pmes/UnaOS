@@ -133,6 +133,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_netring3();
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win();
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); // FILETYPE (B307): `tests filetype`.
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet();
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
@@ -290,5 +291,12 @@ fn ensure_brightfloor() {
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); }
+/// USBNET6 M4: register `tests usbnet` (the dongle receives a frame within 5 s) exactly once, on any build
+/// carrying the USB Ethernet driver; no dongle or no link prints SKIP, never a pin.
+fn ensure_usbnet() {
+    #[cfg(feature = "usbnet")]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("usbnet", crate::drivers::xhci::usbnet::selftest); }
     }
 }

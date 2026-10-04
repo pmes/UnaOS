@@ -485,6 +485,7 @@ pub fn deliver(frame: &[u8]) {
     }
     if RXQ.lock().push(frame) {
         RX_FRAMES.fetch_add(1, Ordering::Relaxed);
+        note_ethertype(frame);
     } else {
         RX_DROP.fetch_add(1, Ordering::Relaxed);
     }
@@ -664,13 +665,18 @@ pub fn deliver_ax(buf: &[u8]) {
         let h = hdr_off + i * 4;
         let pkt_hdr = u32::from_le_bytes([buf[h], buf[h + 1], buf[h + 2], buf[h + 3]]);
         let pkt_len = ((pkt_hdr >> 16) & 0x1fff) as usize;
-        // USBNET5 M3: the chip's own DROP marker (boot 18: 0x80008000, len 0) is counted and skipped, never a whole-transfer short.
-        if pkt_hdr & ax::RXHDR_DROP_ERR != 0 {
-            RX_CHIP_DROP.fetch_add(1, Ordering::Relaxed);
+        // USBNET6 M2: pkt_len 0 is the part's alignment DUMMY header (flight 19: 0x80008000 after every real header),
+        // skipped exactly as Linux `ax88179_rx_fixup` does — never a drop. Was counted `rx_chip_drop` by USBNET5.
+        if pkt_len == 0 {
+            RX_PAD_HDR.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        // A DROP_ERR / CRC_ERR on a real-length packet is the chip's own verdict: counted, skipped, first three printed raw.
+        if pkt_hdr & (ax::RXHDR_DROP_ERR | ax::RXHDR_CRC_ERR) != 0 && off + pkt_len <= hdr_off {
+            if pkt_hdr & ax::RXHDR_DROP_ERR != 0 { RX_CHIP_DROP.fetch_add(1, Ordering::Relaxed); } else { RX_CRC.fetch_add(1, Ordering::Relaxed); }
             RX_DROP.fetch_add(1, Ordering::Relaxed);
-            rx_raw_once(n, rx_hdr, pkt_cnt, hdr_off, pkt_hdr, "chip-drop");
-            rx_dump_once(buf, hdr_off);
-            if pkt_len != 0 && off + pkt_len <= hdr_off { off += (pkt_len + 7) & !7; }
+            flagged_once(pkt_hdr, &buf[off..(off + pkt_len).min(off + 16)]);
+            off += (pkt_len + 7) & !7;
             continue;
         }
         if pkt_len < ax::RX_PAD + 14 || off + pkt_len > hdr_off {
@@ -680,19 +686,9 @@ pub fn deliver_ax(buf: &[u8]) {
             rx_raw_once(n, rx_hdr, pkt_cnt, hdr_off, pkt_hdr, "pkt-len-bad");
             return;
         }
-        if pkt_hdr & ax::RXHDR_CRC_ERR != 0 {
-            RX_CRC.fetch_add(1, Ordering::Relaxed);
-            RX_DROP.fetch_add(1, Ordering::Relaxed);
-            rx_raw_once(n, rx_hdr, pkt_cnt, hdr_off, pkt_hdr, "crc");
-        } else if pkt_hdr & ax::RXHDR_DROP_ERR != 0 {
-            RX_DROP_ERR.fetch_add(1, Ordering::Relaxed);
-            RX_DROP.fetch_add(1, Ordering::Relaxed);
-            rx_raw_once(n, rx_hdr, pkt_cnt, hdr_off, pkt_hdr, "drop-err");
-        } else {
-            // Frame at pkt_start+2, length pkt_len-2 (Linux skb_pull(2) of a pkt_len-long clone).
-            RX_OK.fetch_add(1, Ordering::Relaxed);
-            deliver(&buf[off + ax::RX_PAD..off + pkt_len]);
-        }
+        // Frame at pkt_start+2, length pkt_len-2 (Linux skb_pull(2) of a pkt_len-long clone).
+        RX_OK.fetch_add(1, Ordering::Relaxed);
+        deliver(&buf[off + ax::RX_PAD..off + pkt_len]);
         off += (pkt_len + 7) & !7;
     }
 }
@@ -707,6 +703,7 @@ static RX_DUMPED: AtomicU8 = AtomicU8::new(0);
 /// Last MEDIUM_STATUS_MODE read back from the part (`re=` is its RECEIVE_EN bit).
 pub fn note_medium_readback(m: u16) { MEDIUM_RB.store(m, Ordering::Relaxed); }
 /// USBNET5: the first chip-dropped transfer's head and trailer bytes, once, so the payload under a DROP header is readable.
+#[allow(dead_code)] // USBNET6: the dummy header is no longer a drop; kept for the next geometry read
 fn rx_dump_once(buf: &[u8], hdr_off: usize) {
     if RX_DUMPED.swap(1, Ordering::Relaxed) != 0 { return; }
     let n = buf.len();
@@ -727,6 +724,7 @@ fn rx_raw_once(len: usize, rx_hdr: u32, pkt_cnt: usize, hdr_off: usize, first_pk
 }
 
 fn rollup() {
+    if !CENSUS.load(Ordering::Relaxed) { return; } // USBNET6 (R80): the doubling RX/TX census runs only under `tests usbnet`
     let total = RX_FRAMES.load(Ordering::Relaxed) + TX_FRAMES.load(Ordering::Relaxed);
     let reported = REPORTED.load(Ordering::Relaxed);
     if total < reported.saturating_mul(2).max(1) {
@@ -867,7 +865,113 @@ pub fn witness_tick(now_ms: u64, slot: u8) {
         _ => false,
     };
     if !due { return; }
-    witness("xhci", slot);
+    if n == 0 { verdict(); } else if CENSUS.load(Ordering::Relaxed) { witness("xhci", slot); } // USBNET6 (R80): the driver's verdict at link resolution; the census repeats only under `tests usbnet`
     WIT_N.store(n + 1, Ordering::Relaxed);
     WIT_NEXT.store(now_ms + if n == 0 { 20_000 } else { 40_000 }, Ordering::Relaxed);
 }
+
+// ── USBNET6 ─────────────────────────────────────────────────────────────────────────────────────────
+// The alignment-dummy count, the RX_CTL readback, the first three chip-flagged headers, the per-ethertype
+// census the `tests usbnet` fixture reads, and the bring-up verdict line.
+static RX_PAD_HDR: AtomicU64 = AtomicU64::new(0);
+static RX_CTL_RB: AtomicU16 = AtomicU16::new(0);
+static FLAGGED: AtomicU8 = AtomicU8::new(0);
+static CENSUS: AtomicBool = AtomicBool::new(false);
+static FIRST_ETYPE: AtomicU16 = AtomicU16::new(0);
+static RX_ARP: AtomicU64 = AtomicU64::new(0);
+static RX_V4: AtomicU64 = AtomicU64::new(0);
+static RX_V6: AtomicU64 = AtomicU64::new(0);
+static RX_DHCP: AtomicU64 = AtomicU64::new(0);
+
+/// 0x-prefixed hex of a register value: little-endian number for 1-2 bytes, bytes in written order for longer ones.
+pub struct HexLe<'a>(pub &'a [u8]);
+impl core::fmt::Display for HexLe<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0.len() {
+            0 => f.write_str("-"),
+            1 => write!(f, "{:#04x}", self.0[0]),
+            2 => write!(f, "{:#06x}", u16::from_le_bytes([self.0[0], self.0[1]])),
+            _ => { f.write_str("0x")?; for b in self.0 { write!(f, "{:02x}", b)?; } Ok(()) }
+        }
+    }
+}
+/// The RX_CTL value the part reads back (bring-up `reg RX_CTL=` and the link-up `regs` dump).
+pub fn note_rx_ctl_readback(v: u16) { RX_CTL_RB.store(v, Ordering::Relaxed); }
+/// PHY link (PHYSR LINK) — distinct from `is_up()`, which is "bring-up finished".
+pub fn link_up() -> bool { LINK.load(Ordering::Relaxed) }
+/// The first three chip-flagged (DROP_ERR / CRC_ERR with a real length) packet headers of the boot, raw.
+fn flagged_once(pkt_hdr: u32, head: &[u8]) {
+    let k = FLAGGED.fetch_add(1, Ordering::Relaxed);
+    if k >= 3 { return; }
+    serial_println!("[usbnet] rx flagged #{} hdr={:#010x} drop={} crc={} len={} head={:02x?}", k + 1, pkt_hdr, (pkt_hdr >> 31) & 1, (pkt_hdr >> 29) & 1, (pkt_hdr >> 16) & 0x1fff, head);
+}
+/// Per-ethertype counts of frames that reached the RX ring (ARP / IPv4 / IPv6, and IPv4 UDP from port 67 = a DHCP server reply).
+fn note_ethertype(f: &[u8]) {
+    if f.len() < 14 { return; }
+    let et = u16::from_be_bytes([f[12], f[13]]);
+    let _ = FIRST_ETYPE.compare_exchange(0, et, Ordering::Relaxed, Ordering::Relaxed);
+    match et {
+        0x0806 => { RX_ARP.fetch_add(1, Ordering::Relaxed); }
+        0x86dd => { RX_V6.fetch_add(1, Ordering::Relaxed); }
+        0x0800 => {
+            RX_V4.fetch_add(1, Ordering::Relaxed);
+            let ihl = ((f.get(14).copied().unwrap_or(0) & 0x0f) as usize) * 4;
+            if f.len() >= 14 + ihl + 4 && f[23] == 17 && u16::from_be_bytes([f[14 + ihl], f[15 + ihl]]) == 67 { RX_DHCP.fetch_add(1, Ordering::Relaxed); }
+        }
+        _ => {}
+    }
+}
+/// The bring-up verdict, once at link resolution (R80: the driver deciding, not a census).
+fn verdict() {
+    let m = mac();
+    serial_println!(
+        "[usbnet] link={} speed={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rx_ctl={:#06x} rx_ok={} rx_drop={} rx_pad={}",
+        if LINK.load(Ordering::Relaxed) { "up" } else { "down" }, SPEED_MBPS.load(Ordering::Relaxed),
+        m[0], m[1], m[2], m[3], m[4], m[5], RX_CTL_RB.load(Ordering::Relaxed),
+        RX_OK.load(Ordering::Relaxed), RX_DROP.load(Ordering::Relaxed), RX_PAD_HDR.load(Ordering::Relaxed)
+    );
+}
+
+/// USBNET6 M4 — `tests usbnet`: with a link, pull frames off the dongle for up to 5 s and PASS on the first one
+/// (its ethertype printed); no dongle / no link → SKIP; nothing received while the chip flagged packets → FAIL
+/// naming the RX_CTL readback. The census (rollup + the full `:: USBNET: bus=` line) is switched on for the run.
+/// Frames pulled here are consumed by the fixture, not the stack (5 s at most).
+pub fn selftest() {
+    CENSUS.store(true, Ordering::Relaxed);
+    let chip = match kind() { KIND_AX88179 => "ax88179", KIND_ECM => "ecm", _ => "none" };
+    let mfb = rx_len();
+    let rxctl = RX_CTL_RB.load(Ordering::Relaxed);
+    let skip = if !is_up() { Some("no-dongle") } else if kind() == KIND_AX88179 && !link_up() { Some("no-link") } else { None };
+    if let Some(r) = skip {
+        serial_println!(":: USBNET6: chip={} rx_ctl={:#06x} mfb=qctrl-buf{} frames=0 dropped=0 first_ethertype=none reason={} -> SKIP ::", chip, rxctl, mfb, r);
+        return;
+    }
+    witness("xhci", slot());
+    let d0 = RX_CHIP_DROP.load(Ordering::Relaxed) + RX_CRC.load(Ordering::Relaxed);
+    let t0 = crate::arch::ms();
+    let mut buf = [0u8; FRAME_CAP];
+    let mut frames = 0u32;
+    let mut first: Option<u16> = None;
+    while crate::arch::ms().saturating_sub(t0) < 5000 {
+        if let Some(n) = raw_rx(&mut buf) {
+            frames += 1;
+            if first.is_none() && n >= 14 { first = Some(u16::from_be_bytes([buf[12], buf[13]])); }
+            if frames >= 4 { break; }
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+    let dropped = RX_CHIP_DROP.load(Ordering::Relaxed) + RX_CRC.load(Ordering::Relaxed) - d0;
+    let et = match first { Some(e) => alloc::format!("{:#06x}", e), None => alloc::string::String::from("none") };
+    let (v, why) = if frames > 0 { ("PASS", "") } else if dropped > 0 { ("FAIL", " reason=chip-drop-see-rx_ctl") } else { ("FAIL", " reason=no-frame-5s") };
+    serial_println!(
+        "[usbnet] census arp={} ipv4={} ipv6={} dhcp_replies={} rx_pad={} rx_ok={} leased={}",
+        RX_ARP.load(Ordering::Relaxed), RX_V4.load(Ordering::Relaxed), RX_V6.load(Ordering::Relaxed), RX_DHCP.load(Ordering::Relaxed),
+        RX_PAD_HDR.load(Ordering::Relaxed), RX_OK.load(Ordering::Relaxed), leased() as u8
+    );
+    serial_println!(":: USBNET6: chip={} rx_ctl={:#06x} mfb=qctrl-buf{} frames={} dropped={} first_ethertype={}{} -> {} ::", chip, rxctl, mfb, frames, dropped, et, why, v);
+}
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn leased() -> bool { crate::smolnet::leased() }
+#[cfg(not(all(feature = "smolnet", target_arch = "x86_64")))]
+fn leased() -> bool { false }
