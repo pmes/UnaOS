@@ -118,19 +118,11 @@ fn title_of(path: &str) -> String {
     String::from(path.rsplit('/').next().unwrap_or(path))
 }
 
-/// Is this a name Quarry should open here: `.TXT` `.MD` `.LOG` `.SPEC`, or no extension at all.
-/// (`.ELF`/`.BIN` are tested first by the caller and never reach this.) Pure.
+/// Is this a TEXT name by the one extension table (`fs::filetype::EXT_TABLE`). FILETYPE (B307):
+/// Quarry no longer routes through this — it opens by type — and a dotless name is no longer text by
+/// fiat; this answers only for the viewer's own fixture, which picks a file to show. Pure.
 pub fn is_text_name(name: &str) -> bool {
-    match name.rfind('.') {
-        Some(i) if i > 0 && i + 1 < name.len() => {
-            let e = &name.as_bytes()[i + 1..];
-            e.eq_ignore_ascii_case(b"txt")
-                || e.eq_ignore_ascii_case(b"md")
-                || e.eq_ignore_ascii_case(b"log")
-                || e.eq_ignore_ascii_case(b"spec")
-        }
-        _ => !name.is_empty(),
-    }
+    crate::fs::filetype::by_extension(name) == Some(crate::fs::filetype::TEXT_PLAIN)
 }
 
 pub fn is_open() -> bool {

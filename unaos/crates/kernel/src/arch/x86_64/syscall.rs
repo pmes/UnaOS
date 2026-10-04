@@ -29940,3 +29940,19 @@ fn sys_attrsurf(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     }
     if nr == una_abi::SYS_STAT { 0 } else { out.len() as i64 }
 }
+
+/// FILETYPE (B307) — the KERNEL hands a ring-3 program one unsolicited `BUS_VERB_NOTICE` frame in its
+/// mailbox (`row` = the slot `spawn_user_image_bg` returned), body = the bytes given (Quarry's program
+/// opener: the path of the file to open, because there is no `SYS_EXEC` with an argv — `quarry.md` §7
+/// item 8). The SAME enqueue a fulfilled verb's reply takes (`busx_reply_enqueue`, generation-stamped,
+/// semaphore posted), corr 0, status 0. Returns 0, or the errno (`EINVAL` row out of range or body over
+/// the ceiling, `EAGAIN` mailbox full). A program that never calls `SYS_MRECV` simply never reads it.
+pub fn bus_notice_to(row: usize, body: &[u8]) -> i64 {
+    if row >= BUSX_MBOX.len() || body.len() > crate::bus::BUS_BODY_MAX {
+        return EINVAL;
+    }
+    if !busx_mbox_has_room(row) {
+        return EAGAIN;
+    }
+    busx_reply_enqueue(row, 0, crate::bus::BUS_VERB_NOTICE, 0, body)
+}
