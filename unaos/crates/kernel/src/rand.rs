@@ -189,3 +189,125 @@ pub fn source() -> Source {
 pub fn draws() -> u64 {
     DRAWS.load(Ordering::Relaxed)
 }
+
+// =================================================================================================
+// NETRING3 M1 (B306): the DRBG behind `SYS_GETRANDOM`. Ring 3 asks for arbitrary lengths, many times;
+// the hardware/jitter sources above are a SEED, not a stream. A SHA-256 hash-DRBG:
+//   block   = SHA-256(K ‖ ctr ‖ "out"), ctr += 1
+//   after every request K = SHA-256(K ‖ ctr ‖ "next")    (backtracking resistance)
+//   reseed  at first use and every RESEED_BYTES: K = SHA-256(K ‖ hw32 ‖ jitter32 ‖ tsc ‖ "seed")
+// hw32 is RDSEED where CPUID.07H:EBX[18] says it exists (Broadwell and later; the 2012 rMBP's Ivy Bridge
+// does not), else `fill` (RDRAND / RNDR / jitter). jitter32 is always folded in, so the TSC and the walk
+// latency land in the key even on an RDRAND machine. Seed source SAID once: `[rand] drbg=sha256 seed=`.
+// =================================================================================================
+
+/// Output bytes between reseeds.
+#[cfg(feature = "netring3")]
+pub const RESEED_BYTES: u64 = 65536;
+
+#[cfg(feature = "netring3")]
+struct Drbg {
+    key: [u8; 32],
+    ctr: u64,
+    since_seed: u64,
+    seeded: bool,
+}
+
+#[cfg(feature = "netring3")]
+static DRBG: spin::Mutex<Drbg> = spin::Mutex::new(Drbg { key: [0; 32], ctr: 0, since_seed: 0, seeded: false });
+#[cfg(feature = "netring3")]
+static DRBG_SAID: AtomicU8 = AtomicU8::new(0);
+/// The seed source the last reseed used (0 rdseed, else a `Source` + 1).
+#[cfg(feature = "netring3")]
+static SEED_SRC: AtomicU8 = AtomicU8::new(0xFF);
+
+/// RDSEED: CPUID.(EAX=07H,ECX=0):EBX[18]. 32 bytes, ten retries per word, or `None`.
+#[cfg(feature = "netring3")]
+fn rdseed32(out: &mut [u8; 32]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let max = unsafe { core::arch::x86_64::__cpuid(0) }.eax;
+        if max < 7 || (unsafe { core::arch::x86_64::__cpuid_count(7, 0) }.ebx >> 18) & 1 == 0 {
+            return false;
+        }
+        for w in 0..4 {
+            let mut got = None;
+            for _ in 0..HW_RETRIES {
+                let v: u64;
+                let ok: u8;
+                unsafe { core::arch::asm!("rdseed {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nomem, nostack)); }
+                if ok == 1 { got = Some(v); break; }
+                core::hint::spin_loop();
+            }
+            match got {
+                Some(v) => out[w * 8..w * 8 + 8].copy_from_slice(&v.to_le_bytes()),
+                None => return false,
+            }
+        }
+        return true;
+    }
+    #[allow(unreachable_code)]
+    { let _ = out; false }
+}
+
+/// Name of the source the DRBG was last seeded from.
+#[cfg(feature = "netring3")]
+pub fn seed_source() -> &'static str {
+    match SEED_SRC.load(Ordering::Relaxed) {
+        0 => "rdseed",
+        1 => "rdrand",
+        2 => "rndr",
+        3 => "jitter",
+        _ => "unseeded",
+    }
+}
+
+#[cfg(feature = "netring3")]
+fn reseed(d: &mut Drbg) {
+    let mut hw = [0u8; 32];
+    let src: u8 = if rdseed32(&mut hw) {
+        0
+    } else {
+        match fill(&mut hw) { Source::Rdrand => 1, Source::Rndr => 2, Source::Jitter => 3 }
+    };
+    let mut jit = [0u8; 32];
+    jitter_fill(&mut jit);
+    let mut h = crate::hash::Sha256::new();
+    h.update(&d.key);
+    h.update(&hw);
+    h.update(&jit);
+    h.update(&crate::arch::now_cycles().to_le_bytes());
+    h.update(b"seed");
+    d.key = h.finalize();
+    d.since_seed = 0;
+    d.seeded = true;
+    SEED_SRC.store(src, Ordering::Relaxed);
+    if DRBG_SAID.swap(1, Ordering::AcqRel) == 0 {
+        serial_println!("[rand] drbg=sha256 seed={} reseed={}", seed_source(), RESEED_BYTES);
+    }
+}
+
+/// Fill `out` (any length) from the DRBG. Returns the seed source's name.
+#[cfg(feature = "netring3")]
+pub fn drbg_fill(out: &mut [u8]) -> &'static str {
+    let mut d = DRBG.lock();
+    if !d.seeded || d.since_seed >= RESEED_BYTES {
+        reseed(&mut d);
+    }
+    for chunk in out.chunks_mut(32) {
+        let mut h = crate::hash::Sha256::new();
+        h.update(&d.key);
+        h.update(&d.ctr.to_le_bytes());
+        h.update(b"out");
+        let blk = h.finalize();
+        chunk.copy_from_slice(&blk[..chunk.len()]);
+        d.ctr = d.ctr.wrapping_add(1);
+    }
+    d.since_seed = d.since_seed.saturating_add(out.len() as u64);
+    let mut h = crate::hash::Sha256::new();
+    h.update(&d.key);
+    h.update(&d.ctr.to_le_bytes());
+    h.update(b"next");
+    d.key = h.finalize();
+    seed_source()
+}

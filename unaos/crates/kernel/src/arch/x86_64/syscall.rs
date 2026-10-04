@@ -2624,7 +2624,7 @@ fn syscall_dispatch_inner(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         SYS_XFER => sys_xfer(a0, a1, a2),
         SYS_RECV => sys_recv(),
         SYS_SEEK => sys_seek(a0, a1),
-        SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
+        SYS_UNLINK => sys_unlink(a0), SYS_RENAME => sys_rename(a0, a1, a2, a3), una_abi::SYS_ATTR_SET..=una_abi::SYS_STAT => sys_attrsurf(nr, a0, a1, a2, a3), #[cfg(feature = "netring3")] una_abi::SYS_GETRANDOM => sys_getrandom(a0, a1), #[cfg(feature = "netring3")] una_abi::SYS_RESOLVE => sys_resolve(a0, a1, a2), // ATTRSURF (B299): the five attribute verbs, body at the FILE TAIL. STOR-1 M2: rename sits beside unlink because it IS unlink's authority (owner-only) spent on a different outcome, and because a reader comparing the two destructive verbs should not have to page to find the second. Four arguments: the fourth rides `r10` from ring 3 (SYSCALL destroys rcx) and the entry stub has moved it to the 5th C register by here. ⚠ SAME-LINE fold.
         SYS_CLOSE => sys_close(a0),
         SYS_FGRANT => sys_fgrant(a0, a1, a2), SYS_MSEND => sys_msend(a0, a1), SYS_MRECV => sys_mrecv(a0, a1), // BUSX86: the bus arms, UNCONDITIONAL exactly as SYS_OPEN/SYS_READ/SYS_FGRANT above are — ring 3 is not optional on this arch and a bus a program cannot count on is not surface it can be written against (the WINX-1 reasoning at the window verbs, verbatim). aarch64 gates its pair on `aarch64_el0` because EL0 ITSELF is gated there; the condition is the same one, spelled in each arch's own terms. ⚠ SAME-LINE fold — see the `use` line's note.
         // SOCK-2: the UDP socket family (x86-only, knob-on). Knob-off / aarch64 never emit these arms,
@@ -29939,4 +29939,43 @@ fn sys_attrsurf(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         }
     }
     if nr == una_abi::SYS_STAT { 0 } else { out.len() as i64 }
+}
+
+/// NETRING3 M1 (B306): `SYS_GETRANDOM(buf, len) -> count / -errno` — at most `GETRANDOM_MAX` bytes from
+/// the kernel DRBG (`crate::netring3::getrandom`); the kernel copy is zeroed before return.
+#[cfg(feature = "netring3")]
+fn sys_getrandom(buf_ptr: u64, len: u64) -> i64 {
+    let n = (len as usize).min(una_abi::GETRANDOM_MAX);
+    if n == 0 {
+        return 0;
+    }
+    let mut k = [0u8; una_abi::GETRANDOM_MAX];
+    let got = crate::netring3::getrandom(&mut k[..n]);
+    let r = copy_to_user(buf_ptr, &k[..got]);
+    k.fill(0);
+    match r {
+        Ok(()) => got as i64,
+        Err(e) => e,
+    }
+}
+
+/// NETRING3 M2 (B306): `SYS_RESOLVE(name_ptr, name_len, out_ptr) -> 0 / -errno` — the kernel resolver
+/// (`smolnet::resolve`, DHCP-leased DNS) for ring 3; writes `RESOLVE_OUT_LEN` bytes `[v4][v6]`.
+#[cfg(feature = "netring3")]
+fn sys_resolve(name_ptr: u64, name_len: u64, out_ptr: u64) -> i64 {
+    let n = name_len as usize;
+    if n == 0 || n > una_abi::RESOLVE_NAME_MAX {
+        return EINVAL;
+    }
+    let mut nb = [0u8; una_abi::RESOLVE_NAME_MAX];
+    if let Err(e) = copy_from_user(&mut nb[..n], name_ptr) {
+        return e;
+    }
+    match crate::netring3::resolve(&nb[..n]) {
+        Ok(out) => match copy_to_user(out_ptr, &out) {
+            Ok(()) => 0,
+            Err(e) => e,
+        },
+        Err(e) => e,
+    }
 }
