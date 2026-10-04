@@ -89,7 +89,7 @@ drivers/hda_play.rs | Stria | owed | B289
 dotfile | .settings | B287 (moves to Principia's store)
 dotfile | .dock | B287
 dotfile | .Trash | B288
-dotfile | .Trash/.index | B288
-dotfile | .index | B288
+dotfile | .Trash/.index | B288 → TRASHTIME (B308): FAT fallback only; on UnaFS trash state is attributes on the object
+dotfile | .index | B288 → TRASHTIME (B308): FAT fallback only
 dotfile | .config/unaos/preferences.toml | B300 (Principia's path — the ONE preference store, PREFS)
 dotfile | .new | swap-temp suffix of the atomic write pattern (USERS.NEW shape; prefs.rs), not a dotfile

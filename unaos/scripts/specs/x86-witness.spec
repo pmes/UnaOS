@@ -1752,3 +1752,5 @@ FORBID :: USBNET-EHCI: .* -> FAIL ::
 # USBNET3: the xHCI-path AX88179 reading. QEMU has no AX88179, so no QEMU lane can produce it: OPTIONAL (metal, UNAOS_USBNET=1 + the dongle on an xHCI port).
 OPTIONAL :: USBNET: bus=xhci slot=\d+ mac=[0-9a-f:]{17} link=(up|down) speed=\d+ usb=(ss|hs|fs|\?) rx=\d+ tx=\d+ .* -> PASS ::
 FORBID :: USBNET: bus=xhci .* -> FAIL ::
+# USBNET6 (B314): the dongle verdict is informational on a QEMU lane (no AX88179 here), so OPTIONAL.
+OPTIONAL :: USBNET6: chip=.* -> (PASS|SKIP|FAIL) ::
