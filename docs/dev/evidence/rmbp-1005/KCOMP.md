@@ -20,7 +20,7 @@ the glass never goes dark because an engine stalled (the A1/BAR1WEDGE lesson: a 
 not take the panel with it).
 
 **Knob.** `UNAOS_WC_BLITTER=gpu` → feature `wc_gpublit` (default OFF, x86 only). Off, or on with no
-channel, the kernel selects cpu and prints once, at the first composite:
+channel, the kernel selects cpu and prints once at compositor ignition (x86: beside `wcpar::start`, task context):
 `[wc] blitter=cpu reason=<feature-off|kblit-channel-absent>`.
 
 **Milestones.** M1 census (below) · M2 `video/blitter.rs` · M3 `stage_window`'s no-clip present
@@ -106,7 +106,7 @@ source it cannot address.
   `[kcomp] w=512 h=512 inline_us=… cpu_us=… gpu_path_us=… cks_inline=… cks_cpu=… cks_gpu=… blank=… par=… gpu_direct=unavailable fallback_counted=1 bounds_refused=1`
   `:: KCOMP: blitter=cpu census=10 hot=window-present cpu_us=<n> gpu=unavailable fallback_ok=1 -> PASS ::`
 
-**On metal, expect** `[wc] blitter=cpu reason=feature-off` once at the first composite (or
+**On metal, expect** `[wc] blitter=cpu reason=feature-off` once at compositor ignition (or
 `reason=kblit-channel-absent` with `UNAOS_WC_BLITTER=gpu`), and every `[wc-h] rollup` carrying
 `blitter=cpu blit_us=<n> gpu_fallback=0`. The unchanged-ness proof on metal is the existing lines:
 `:: WCPAR: … -> PASS`, `[wc-g] … -> CLEAN`, `[wc-h] rollup … -> TEAR-FREE` at flight 19's rates, and the

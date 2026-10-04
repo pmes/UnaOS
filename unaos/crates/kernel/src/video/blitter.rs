@@ -17,8 +17,9 @@
 //! frame and counts `gpu_fallback` — the glass never goes dark because an engine stalled (A1 /
 //! BAR1WEDGE: a wedged engine must not take the panel with it).
 //!
-//! SELECTION. `UNAOS_WC_BLITTER=gpu` arms feature `wc_gpublit` (default OFF, x86 only). [`ignite`] runs
-//! once, at the first composite, asks [`GpuBlitter::probe`], and prints
+//! SELECTION. `UNAOS_WC_BLITTER=gpu` arms feature `wc_gpublit` (default OFF, x86 only). [`ignite`] runs at
+//! compositor ignition (x86: `desktop_uefi`, task context, beside `wcpar::start`; elsewhere lazily),
+//! once, asks [`GpuBlitter::probe`], and prints
 //! `[wc] blitter=<cpu|gpu> reason=<…>` once. With the feature off, or on with no KBLIT channel, the
 //! answer is cpu.
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
@@ -266,7 +267,7 @@ static GPU_FALLBACK: AtomicU64 = AtomicU64::new(0);
 static BLITS: AtomicU64 = AtomicU64::new(0);
 static BLIT_CYC: AtomicU64 = AtomicU64::new(0);
 
-/// Compositor ignition (lazily, at the first composite): pick the blitter and say why, once.
+/// Compositor ignition (x86: `desktop_uefi` beside `wcpar::start`; `present_band` calls it lazily too): pick the blitter and say why, once.
 pub fn ignite() {
     if IGNITED.swap(true, AcqRel) {
         return;
