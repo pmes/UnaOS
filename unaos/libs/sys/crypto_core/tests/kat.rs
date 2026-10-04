@@ -46,3 +46,8 @@ fn m3_curves() {
 fn m4_argon2_drbg_ct() {
     run(&["blake2b/", "argon2/", "drbg/", "ct/"]);
 }
+
+#[test]
+fn m5_p384() {
+    run(&["p384/"]);
+}

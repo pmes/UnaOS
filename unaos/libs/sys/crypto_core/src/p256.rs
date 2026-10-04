@@ -367,6 +367,13 @@ pub fn verify_sha256(key: &PublicKey, msg: &[u8], sig: &[u8; 64]) -> Result<(), 
 /// minimal lengths, positive minimal integers (no superfluous leading zero, no negative), r and s at
 /// most 32 bytes of magnitude, nothing trailing. Anything else is `Error::Encoding`.
 pub fn signature_from_der(der: &[u8]) -> Result<[u8; 64], Error> {
+    let mut sig = [0u8; 64];
+    der_sig_decode(der, &mut sig, 32)?;
+    Ok(sig)
+}
+
+/// The strict DER reader shared with P-384: `out` is `2 * w` bytes, r and s right-aligned in `w` each.
+pub(crate) fn der_sig_decode(der: &[u8], out: &mut [u8], w: usize) -> Result<(), Error> {
     fn len(b: &[u8], i: &mut usize) -> Result<usize, Error> {
         let l0 = *b.get(*i).ok_or(Error::Encoding)?;
         *i += 1;
@@ -381,7 +388,7 @@ pub fn signature_from_der(der: &[u8]) -> Result<[u8; 64], Error> {
             }
             return Ok(l as usize);
         }
-        Err(Error::Encoding) // a P-256 signature is never longer than 72 bytes
+        Err(Error::Encoding) // an ECDSA P-256/P-384 signature is never longer than 255 bytes
     }
     fn int(b: &[u8], i: &mut usize, out: &mut [u8]) -> Result<(), Error> {
         if b.get(*i) != Some(&0x02) {
@@ -398,10 +405,11 @@ pub fn signature_from_der(der: &[u8]) -> Result<[u8; 64], Error> {
             return Err(Error::Encoding); // superfluous leading zero
         }
         let mag = if v[0] == 0 { &v[1..] } else { v };
-        if mag.len() > 32 {
+        if mag.len() > out.len() {
             return Err(Error::Encoding);
         }
-        out[32 - mag.len()..].copy_from_slice(mag);
+        let w = out.len();
+        out[w - mag.len()..].copy_from_slice(mag);
         Ok(())
     }
     let mut i = 0;
@@ -413,13 +421,13 @@ pub fn signature_from_der(der: &[u8]) -> Result<[u8; 64], Error> {
     if i + l != der.len() {
         return Err(Error::Encoding);
     }
-    let mut sig = [0u8; 64];
-    int(der, &mut i, &mut sig[..32])?;
-    int(der, &mut i, &mut sig[32..])?;
+    let (r, s) = out.split_at_mut(w);
+    int(der, &mut i, r)?;
+    int(der, &mut i, s)?;
     if i != der.len() {
         return Err(Error::Encoding);
     }
-    Ok(sig)
+    Ok(())
 }
 
 /// DER encoding of a raw `r || s` signature (at most 72 bytes); returns the length written.

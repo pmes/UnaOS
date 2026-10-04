@@ -15,6 +15,8 @@ pub mod m1;
 pub mod m2;
 pub mod m3;
 pub mod m4;
+pub mod m5;
+pub mod m6;
 
 /// One KAT set's result.
 #[derive(Debug, Default)]
@@ -57,6 +59,8 @@ pub fn run_all(filter: Option<&str>) -> Vec<Tally> {
         .chain(m2::SETS.iter())
         .chain(m3::SETS.iter())
         .chain(m4::SETS.iter())
+        .chain(m5::SETS.iter())
+        .chain(m6::SETS.iter())
         .copied()
         .collect();
     let mut out = Vec::new();
