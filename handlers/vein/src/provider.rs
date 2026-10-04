@@ -287,6 +287,7 @@ mod tests {
                 ns: ns.into(),
                 key: "provider".into(),
                 value: PrefValue::Str("claude".into()),
+                clamped: false,
             })
         };
         assert!(is_vein_pref_change(&mk("vein")));

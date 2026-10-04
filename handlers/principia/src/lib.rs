@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 
 use bandy::{PrefValue, PrincipiaCommand, SMessage, Synapse};
 
-pub use prefs::PrefStore;
+pub use prefs::{PrefStore, SetOutcome};
 
 /// The Architect's live state: the preference store plus the system root.
 pub struct Principia {
@@ -164,21 +164,18 @@ impl Principia {
     /// (the acknowledgement *and* the live-update signal) or with `PrefError`.
     fn set_pref(&mut self, ns: &str, key: &str, value: &PrefValue) -> SMessage {
         match self.prefs.set(ns, key, value.clone()) {
-            Ok(()) => {
+            Ok(out) => {
                 log::info!(
-                    "[PRINCIPIA] :: {ns}.{key} = {} ({})",
-                    match value {
-                        PrefValue::Str(s) => s.clone(),
-                        PrefValue::Int(i) => i.to_string(),
-                        PrefValue::Float(f) => f.to_string(),
-                        PrefValue::Bool(b) => b.to_string(),
-                    },
-                    value.type_name()
+                    "[PRINCIPIA] :: {ns}.{key} = {} ({}){}",
+                    prefs::to_core(&out.value),
+                    out.value.type_name(),
+                    if out.clamped { " clamped=true" } else { "" }
                 );
                 SMessage::Principia(PrincipiaCommand::PrefChanged {
                     ns: ns.to_string(),
                     key: key.to_string(),
-                    value: value.clone(),
+                    value: out.value,
+                    clamped: out.clamped,
                 })
             }
             Err(e) => {
@@ -311,7 +308,7 @@ mod tests {
             },
         )));
         match changed {
-            PrincipiaCommand::PrefChanged { ns, key, value } => {
+            PrincipiaCommand::PrefChanged { ns, key, value, .. } => {
                 assert_eq!((ns.as_str(), key.as_str()), ("aether", "window.width"));
                 assert_eq!(value, PrefValue::Int(1280));
             }
@@ -401,6 +398,50 @@ mod tests {
         }
     }
 
+    /// PRINCIPIA2 (SR32, B300 owed): the host `PrefSet` clamps a declared key
+    /// through the SAME prefs_core function the kernel's Settings path uses,
+    /// stores the clamp, and answers it with `clamped = true`.
+    #[test]
+    fn an_out_of_range_set_clamps_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = handler(&dir);
+        let set = |p: &mut Principia, key: &str, value: PrefValue| {
+            pref_reply(p.process_impulse(&SMessage::Principia(PrincipiaCommand::PrefSet {
+                ns: "system".into(),
+                key: key.into(),
+                value,
+            })))
+        };
+        match set(&mut p, "display.brightness", PrefValue::Int(0)) {
+            PrincipiaCommand::PrefChanged { value, clamped, .. } => {
+                assert_eq!(value, PrefValue::Int(prefs_core::display::clamp_brightness(0)));
+                assert!(clamped, "a dark brightness is clamped and said");
+            }
+            other => panic!("expected PrefChanged, got {other:?}"),
+        }
+        match set(&mut p, "audio.volume", PrefValue::Int(99)) {
+            PrincipiaCommand::PrefChanged { value, clamped, .. } => {
+                assert_eq!((value, clamped), (PrefValue::Int(16), true));
+            }
+            other => panic!("expected PrefChanged, got {other:?}"),
+        }
+        match set(&mut p, "audio.volume", PrefValue::Int(9)) {
+            PrincipiaCommand::PrefChanged { value, clamped, .. } => {
+                assert_eq!((value, clamped), (PrefValue::Int(9), false));
+            }
+            other => panic!("expected PrefChanged, got {other:?}"),
+        }
+        // The clamp is what persisted.
+        let back = PrefStore::load(dir.path().join("preferences.toml")).unwrap();
+        assert_eq!(back.get("system", "display.brightness"), Some(PrefValue::Int(1)));
+        // A wrong type is refused, and the store is untouched.
+        match set(&mut p, "audio.volume", PrefValue::Str("loud".into())) {
+            PrincipiaCommand::PrefError { message, .. } => assert!(message.contains("expected int"), "{message}"),
+            other => panic!("expected PrefError, got {other:?}"),
+        }
+        assert_eq!(p.prefs().get("system", "audio.volume"), Some(PrefValue::Int(9)));
+    }
+
     /// Principia hears its own broadcasts on the Synapse; a reply must never
     /// provoke another reply (an echo storm on a broadcast bus).
     #[test]
@@ -412,6 +453,7 @@ mod tests {
                 ns: "aether".into(),
                 key: "homepage".into(),
                 value: PrefValue::Str("x".into()),
+                clamped: false,
             },
             PrincipiaCommand::PrefValueIs {
                 ns: "aether".into(),
@@ -486,7 +528,7 @@ mod tests {
 
         let changed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if let SMessage::Principia(PrincipiaCommand::PrefChanged { ns, key, value }) =
+                if let SMessage::Principia(PrincipiaCommand::PrefChanged { ns, key, value, .. }) =
                     rx.recv().await.unwrap()
                 {
                     return (ns, key, value);

@@ -1045,7 +1045,8 @@ mod tests {
 /// never to a preference, so the stored range is `BRIGHTNESS_MIN..=BRIGHTNESS_MAX` and anything else —
 /// a 0, a negative, a value above the top — is CLAMPED on load and on save, not refused (a refused value
 /// would fall back to the default and silently drop the operator's choice; a clamped one keeps it lit).
-/// Owed B287: Principia's host `PrefSet` calling [`display::clamp_brightness`] too.
+/// PRINCIPIA2 (SR32): the generic form is [`schema::check`]'s `system.display.brightness` row (a test pins
+/// them equal); Principia's host `PrefSet` runs it, the kernel's `prefs::set` adopts it at the fold.
 pub mod display {
     /// The `system` key (namespace-relative) the rule governs.
     pub const BRIGHTNESS_KEY: &str = "display.brightness";

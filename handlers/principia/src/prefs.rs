@@ -59,6 +59,16 @@ use bandy::PrefValue;
 /// One namespace's flat key → value map (sorted: a stable file diff).
 type Namespace = BTreeMap<String, PrefValue>;
 
+/// What a [`PrefStore::set`] stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetOutcome {
+    /// The value stored: the written one, or its clamp.
+    pub value: PrefValue,
+    /// `true` when the written value was outside the key's declared range and
+    /// [`SetOutcome::value`] is the clamp.
+    pub clamped: bool,
+}
+
 /// The namespaced preference store, cached in memory and backed by a TOML file.
 ///
 /// Reload-on-external-change is **not** implemented: the store is the writer of
@@ -124,12 +134,23 @@ impl PrefStore {
 
     /// Set `ns`/`key` and persist the whole document atomically.
     ///
-    /// Errors on a malformed namespace/key, on a key that collides with an
-    /// existing dotted path, or on a failed write — and on error the in-memory
-    /// cache is left exactly as it was, so cache and file never disagree.
-    pub fn set(&mut self, ns: &str, key: &str, value: PrefValue) -> Result<()> {
+    /// The write first goes through the ONE schema validator both rings run,
+    /// `prefs_core::schema::check` (PRINCIPIA2, SR32): a declared key written
+    /// out of range is CLAMPED (the answer says so: [`SetOutcome::clamped`]);
+    /// a wrong type, a value outside the key's enum, an over-long or
+    /// unprintable string is refused. An undeclared key is stored as given.
+    ///
+    /// Errors on a malformed namespace/key, a schema refusal, a key that
+    /// collides with an existing dotted path, or a failed write — and on error
+    /// the in-memory cache is left exactly as it was, so cache and file never
+    /// disagree.
+    pub fn set(&mut self, ns: &str, key: &str, value: PrefValue) -> Result<SetOutcome> {
         validate_ns(ns)?;
         validate_key(key)?;
+        let applied = prefs_core::schema::check(ns, key, to_core(&value))
+            .map_err(|r| anyhow::anyhow!("refused `{ns}`.`{key}` = {}: {r}", to_core(&value)))?;
+        let outcome = SetOutcome { value: from_core(&applied.value), clamped: applied.clamped };
+        let value = outcome.value.clone();
 
         let entry = self.namespaces.entry(ns.to_string()).or_default();
         if let Some(other) = colliding_key(entry, key) {
@@ -156,7 +177,7 @@ impl PrefStore {
             }
             return Err(e);
         }
-        Ok(())
+        Ok(outcome)
     }
 
     /// Serialize the store and replace the file atomically: write a sibling
@@ -496,6 +517,31 @@ mod tests {
         let mut s2 = store(&tempfile::tempdir().unwrap());
         s2.set("aether", "window.width", PrefValue::Int(2)).unwrap();
         assert!(s2.set("aether", "window", PrefValue::Int(1)).is_err());
+    }
+
+    /// PRINCIPIA2 (SR32): every declared key clamps exactly as the shared core
+    /// says, at the store — the in-process writer cannot bypass it.
+    #[test]
+    fn the_store_clamps_every_declared_range_through_prefs_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(&dir);
+        for k in prefs_core::schema::SCHEMA {
+            if let prefs_core::schema::Kind::Int { min, max } = k.kind {
+                for x in [min.saturating_sub(1), min, max, max.saturating_add(1)] {
+                    let want = prefs_core::schema::check(k.ns, k.key, prefs_core::PrefValue::Int(x)).unwrap();
+                    let got = s.set(k.ns, k.key, PrefValue::Int(x)).unwrap();
+                    assert_eq!((to_core(&got.value), got.clamped), (want.value, want.clamped), "{}.{} = {x}", k.ns, k.key);
+                    assert_eq!(s.get(k.ns, k.key), Some(got.value));
+                }
+            }
+        }
+        let t = s.set("vein", "temperature", PrefValue::Float(9.0)).unwrap();
+        assert_eq!((t.value, t.clamped), (PrefValue::Float(2.0), true));
+        // Undeclared keys are the app's own business: stored as given.
+        let a = s.set("aether", "window.width", PrefValue::Int(-5)).unwrap();
+        assert_eq!((a.value, a.clamped), (PrefValue::Int(-5), false));
+        assert!(s.set("vein", "provider", PrefValue::Str("hal9000".into())).is_err());
+        assert_eq!(s.get("vein", "provider"), None, "a refused write leaves no trace");
     }
 
     #[test]

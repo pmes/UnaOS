@@ -311,6 +311,11 @@ impl From<bool> for PrefValue {
     }
 }
 
+/// serde helper: omit a `false` flag from the wire.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PrincipiaCommand {
     SetSystemRoot(PathBuf),
@@ -353,7 +358,14 @@ pub enum PrincipiaCommand {
     PrefChanged {
         ns: String,
         key: String,
+        /// The value STORED — for a declared key written out of range, its
+        /// clamp (`prefs_core::schema::check`, PRINCIPIA2 SR32).
         value: PrefValue,
+        /// `true` when the written value was out of range and `value` is the
+        /// clamp. Omitted from the wire when false, so every unclamped
+        /// `PrefChanged` keeps its frozen shape (smessage_kats).
+        #[serde(default, skip_serializing_if = "is_false")]
+        clamped: bool,
     },
     /// A rejected preference operation (malformed namespace/key, a key that
     /// collides with an existing dotted path, or a failed persist).
