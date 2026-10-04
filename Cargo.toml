@@ -33,6 +33,7 @@ members = [
     "tools/unafs_bench",
     "tools/sentinel",
     "tools/foreman",
+    "tools/aether-audit",
     "vessels/lumen",
     "vessels/pulse",
     "vessels/phonolite",

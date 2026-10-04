@@ -56,6 +56,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aether-audit"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "serde_json",
+]
+
+[[package]]
 name = "aether-shell"
 version = "0.1.0"
 dependencies = [
