@@ -1,7 +1,7 @@
 # AUDIO8 — the speaker amp is a held state, not a per-run bracket (rmbp-ledger B329)
 
 Branch `exec-rmbp-audio8`, cut from 4e48ab03. Answers FLIGHT20 (boot 20: sound works, and it pops).
-Seam: `CHARTER: Stria — owed B289` (as AUDIO7: the HDA driver's stream half a Stria fulfiller would call).
+Seam: `CHARTER: Stria — owed B289`. Commits: 2d12914f (M1+M2+M4), e3e411f5 (M3) (as AUDIO7: the HDA driver's stream half a Stria fulfiller would call).
 New file `unaos/crates/kernel/src/drivers/hda_amp.rs` (a child of `hda`, `hda-tone` only; drivers/ is
 outside GATE-CHARTER's directories, the line is carried anyway).
 
@@ -43,7 +43,9 @@ outside GATE-CHARTER's directories, the line is carried anyway).
   it is set to gain 0 muted (the converter is idle, so this is inaudible), after RUN it ramps to the
   rearm's gain in 10 steps over ~10 ms, and before STOP it ramps back to 0 and mutes. Tone: inside
   `run_tone` on its rings. Play: prepared in `gate`, ramped in `ring_pump`/`hw_stop` through the amp
-  module's own CORB/RIRB pair (`svc_rings`: allocated once, re-pointed on use, stopped after).
+  module's own CORB/RIRB pair (`svc_rings`: allocated once, re-pointed on use, stopped after). The ramp-down also
+  UNBINDS the converters (stream/channel 0, Linux `snd_hda_codec_cleanup_stream`): with no per-run restore, a
+  converter left on the tag would sound in the next run of another shape (`tests hda2` after `tests hda`).
 - **M3 FIXTURE.** `stream::rearm` keeps the last run PER SHAPE (who, SDxFMT, member DAC/pin list) and diffs
   only like against like; a new shape reads `diff vs run=- … (first <who> run of shape …)` and is stable.
   The driver is unchanged for the second DAC.
@@ -55,7 +57,7 @@ outside GATE-CHARTER's directories, the line is carried anyway).
 
 ```
 [hda] amp=up why=first-play gpio=0x00->0x08 holdoff_ms=5000 pins=1
-[hda] ramp dac=0x04 out_amp=1 steps=127 target=115 step_ms=1 n=10 (once per DAC)
+[hda] ramp dac=0x04 out_amp=1 steps=<n> target=115 step_us=1000 n=10   (once per DAC per boot)
 :: HDA: runs=1 fields_stable=1 … -> PASS ::
 :: AUDIO8: runs=1 plays=0 amp_up=1 amp_down=0 pops_bracketed=0 -> PENDING :: …
 :: HDA: runs=2 … -> PASS ::
