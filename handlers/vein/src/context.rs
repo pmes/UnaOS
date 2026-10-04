@@ -24,40 +24,15 @@ pub async fn compress_into_engram(
     user_prompt: &str,
     ai_response: &str,
 ) -> Result<String, String> {
-    let system_instruction = r#"You are a highly efficient cognitive compression subroutine.
-Your task is to compress the provided conversation history into a dense, token-efficient "Engram".
-
-Rules:
-1. Extract only the core intent, the specific technical constraints, and the final outcome or consensus.
-2. Strip out all pleasantries, conversational filler, and redundant explanations.
-3. Format the output as a concise, bulleted list.
-4. Do not include introductory or concluding remarks. Output strictly the compiled facts.
-
-Example Output format:
-- User requested fix for Cortex amnesia.
-- AI identified DiskManager semantic embeddings missing from Vertex payload.
-- AI supplied Directive 065 to implement 'directive' memory class and Engram compression.
-- User approved implementation."#;
-
-    // VEINPROV (B303): the compression rules travel as the system prompt, the
-    // exchange as the one user turn — provider-neutral.
-    let combined_text = format!(
-        "[CONVERSATION HISTORY TO COMPRESS]:\nUser: {}\n\nAI: {}\n",
-        user_prompt, ai_response
-    );
-    let req = ChatRequest::single(Some(system_instruction.to_string()), vec![Part::text(combined_text)]);
+    // merge10 fold: VEINCORE (B304) owns the prompt text — `vein_core::context::engram_prompt` carries the
+    // instruction and the history block, byte-identical on host and metal — and VEINPROV (B303) owns the
+    // call: one provider-neutral request, the stop reason read before the text.
+    let req = ChatRequest::single(None, vec![Part::text(vein_core::context::engram_prompt(user_prompt, ai_response))]);
     let resp = provider.generate(&req).await.map_err(|e| e.to_string())?;
     match resp.stop {
         StopReason::EndTurn | StopReason::MaxTokens => Ok(resp.text),
         other => Err(format!("engram compression stopped: {other:?}")),
     }
-    let request_contents = vec![Content {
-        role: "user".to_string(),
-        parts: vec![Part::text(vein_core::context::engram_prompt(user_prompt, ai_response))],
-    }];
-
-    let (response, _) = client.generate_content(&request_contents).await?;
-    Ok(response)
 }
 
 #[cfg(test)]
