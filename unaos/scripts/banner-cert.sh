@@ -343,6 +343,8 @@ quarry|[quarry] DECLINE reason=dock-cannot-host-full-strip panel=|-|measured(1)
 wedge2|-|no gated string literal anywhere under cfg(feature="wedge2") — the knob only re-times an existing path; certify it from its serial witness, not from the artifact|unmeasured-here
 selfhost|:: SELFHOST:|-|measured
 unafs|:: UNAFSX86: root=|-|measured
+vein|154::: VEINBUS:|-|measured
+lumen|52::: LUMEN:|-|measured
 TABLE
 }
 
