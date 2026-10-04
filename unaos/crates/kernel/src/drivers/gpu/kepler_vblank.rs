@@ -1902,6 +1902,7 @@ static KV8_EOI_MISS: AtomicU64 = AtomicU64::new(0);
 /// The trace task holds the rung-3 window open while it runs (so the close cannot restore under it).
 static KV8_HOLD: AtomicBool = AtomicBool::new(false);
 /// The trace task was spawned (knob path), once per boot.
+#[cfg(feature = "kvblank_trace")]
 static KV8_SPAWNED: AtomicBool = AtomicBool::new(false);
 /// M2's books (written by the ISR; zero until M2): PMC line re-arms, re-arms whose read-back showed the hw bit,
 /// MSI re-arms through the BAR0 config mirror, `PMC_INTR_0` and `INTR_HOST_SUMMARY` read right after the last ack.
@@ -2354,4 +2355,110 @@ pub fn vbl_isr_rate() -> (u64, &'static str) {
     }
     let src = if IRQ_KEPT.load(Ordering::Relaxed) && !IRQ_DEMOTED.load(Ordering::Relaxed) && ISR_LAST_CYC.load(Ordering::Relaxed) != 0 { "irq" } else { "poll" };
     (KV8_RATE.load(Ordering::Relaxed), src)
+}
+
+// ── KVBLANK8 M4 — `tests kvblank8` ───────────────────────────────────────────────────────────────────────────────
+//
+// Re-opens the vector window on the shell's cpu (MSI re-targeted there so the LAPIC bits the census reads are the
+// target's), runs the M1 instrument for 1 s, and asserts `isr_calls >= 30` with `lost_at=none`. PASS leaves the vector
+// live (`IRQ_KEPT`, demotion cleared) so M3's wait paces on the ISR; FAIL restores every captured word with a read-back.
+
+pub fn kvblank8_selftest() {
+    let bar0 = VB_BAR0.load(Ordering::Acquire);
+    let bdf1 = VB_BDF1.load(Ordering::Acquire);
+    let head1 = VB_HEAD1.load(Ordering::Acquire);
+    if bar0 == 0 || bdf1 == 0 || head1 == 0 {
+        serial_println!(":: KVBLANK8: lost_at=- isr_calls=0 eoi=- rearm=- -> SKIP (no GK107 head armed: bar0={} bdf={} head={}) ::", (bar0 != 0) as u32, (bdf1 != 0) as u32, head1);
+        return;
+    }
+    // Rung 3 (or a knob trace) still owns the window: wait for it, bounded.
+    let mut w = 0u32;
+    while (LADDER.load(Ordering::Acquire) == LADDER_IRQ_RUN || kv8_hold()) && w < 600 {
+        crate::arch::sched::sleep_ms(10);
+        w += 1;
+    }
+    if LADDER.load(Ordering::Acquire) == LADDER_IRQ_RUN || kv8_hold() {
+        serial_println!(":: KVBLANK8: lost_at=- isr_calls=0 eoi=- rearm=- -> SKIP (rung 3 window still open after 6 s) ::");
+        return;
+    }
+    let head = (head1 - 1) as usize;
+    let bdf = bdf1 - 1;
+    let (bus, slot, func) = ((bdf >> 16) as u8, (bdf >> 8) as u8, bdf as u8);
+    let Some(vec) = ensure_vector() else {
+        serial_println!(":: KVBLANK8: lost_at=apic isr_calls=0 eoi=- rearm=- -> FAIL (vectors::alloc refused kepler-vblank) ::");
+        return;
+    };
+    let msg_addr = 0xFEE0_0000u32 | ((crate::arch::x86_64::apic::apic_id() as u32) << 12);
+    if IRQ_WIRE.load(Ordering::Relaxed) != 2 {
+        if !crate::drivers::pci::PciScanner::enable_msi(bus, slot, func, msg_addr, vec as u32) {
+            serial_println!(":: KVBLANK8: lost_at=msi isr_calls=0 eoi=- rearm=- -> FAIL (enable_msi refused on {}:{}.{}) ::", bus, slot, func);
+            return;
+        }
+        IRQ_WIRE.store(1, Ordering::Relaxed);
+    }
+    let vb = 1u32 << DISP_INTR_HEAD_BIT_VBLANK;
+    let pd = 1u32 << PMC_INTR_BIT_PDISPLAY;
+    let (was_live, was_kept) = (IRQ_LIVE.load(Ordering::Acquire), IRQ_KEPT.load(Ordering::Acquire));
+    let (pmc_entry, mask_entry, en_entry) = unsafe {
+        (
+            mmio_read(bar0, regs::NV_PMC_INTR_EN),
+            mmio_read(bar0, PMC_INTR_MASK_HOST),
+            mmio_read(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head)),
+        )
+    };
+    // The ISR's bases: the line enable without its hw bit, the head enable without the vblank bit.
+    IRQ_PMC_ENTRY.store(pmc_entry & !PMC_ENABLE_HOST_HW, Ordering::Relaxed);
+    WIN_EN_ENTRY.store(en_entry & !vb, Ordering::Relaxed);
+    IRQ_HEAD.store(head as u32, Ordering::Relaxed);
+    IRQ_STORMED.store(false, Ordering::Relaxed);
+    KV8_SAME_FRAME.store(0, Ordering::Relaxed);
+    kv8_note_arm(msg_addr);
+    let (b_isr, b_acks, b_rr, b_rrb, b_prr, b_prrb, b_eom) = (
+        ISR_CALLS.load(Ordering::Relaxed), ISR_ACKS.load(Ordering::Relaxed), ISR_REARMS.load(Ordering::Relaxed),
+        REARM_READBACK.load(Ordering::Relaxed), KV8_PMC_REARMS.load(Ordering::Relaxed),
+        KV8_PMC_REARM_RB.load(Ordering::Relaxed), KV8_EOI_MISS.load(Ordering::Relaxed),
+    );
+    IRQ_LIVE.store(true, Ordering::Release);
+    unsafe {
+        mmio_write(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head), en_entry | vb);
+        mmio_write(bar0, PMC_INTR_MASK_HOST, pd);
+        mmio_write(bar0, regs::NV_PMC_INTR_EN, pmc_entry | PMC_ENABLE_HOST_HW);
+    }
+    let _ = kv8_snapshot("test-arm");
+    let (c, lost) = kv8_trace();
+    let eoi_ok = KV8_EOI_MISS.load(Ordering::Relaxed) == b_eom;
+    let rearm_ok = ISR_REARMS.load(Ordering::Relaxed) - b_rr == REARM_READBACK.load(Ordering::Relaxed) - b_rrb
+        && KV8_PMC_REARMS.load(Ordering::Relaxed) - b_prr == KV8_PMC_REARM_RB.load(Ordering::Relaxed) - b_prrb;
+    let pass = c.isr_delta >= 30 && lost == "none";
+    if pass {
+        IRQ_KEPT.store(true, Ordering::Release);
+        IRQ_MODE.store(true, Ordering::Release);
+        IRQ_DEMOTED.store(false, Ordering::Release);
+    } else {
+        IRQ_LIVE.store(was_live, Ordering::Release);
+        IRQ_KEPT.store(was_kept, Ordering::Release);
+        unsafe {
+            mmio_write(bar0, regs::NV_PMC_INTR_EN, pmc_entry);
+            mmio_write(bar0, PMC_INTR_MASK_HOST, mask_entry);
+            mmio_write(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head), en_entry);
+        }
+    }
+    let (pb, mb, eb) = unsafe {
+        (
+            mmio_read(bar0, regs::NV_PMC_INTR_EN),
+            mmio_read(bar0, PMC_INTR_MASK_HOST),
+            mmio_read(bar0, disp_head(DISP_INTR_HOST_HEAD_EN, head)),
+        )
+    };
+    serial_println!(
+        ":: KVBLANK8: test isr_entries={} acks={} head_rearms={} pmc_rearms={} kept_live={} restored={} pmc_en={:08X}/{:08X} mask={:08X}/{:08X} head_en={:08X}/{:08X} :: — entry/readback pairs; restored=0 on PASS (the vector stays live for the M3 wait)",
+        ISR_CALLS.load(Ordering::Relaxed) - b_isr, ISR_ACKS.load(Ordering::Relaxed) - b_acks,
+        ISR_REARMS.load(Ordering::Relaxed) - b_rr, KV8_PMC_REARMS.load(Ordering::Relaxed) - b_prr,
+        pass as u32, (!pass) as u32, pmc_entry, pb, mask_entry, mb, en_entry, eb,
+    );
+    serial_println!(
+        ":: KVBLANK8: lost_at={} isr_calls={} eoi={} rearm={} -> {} ::",
+        lost, c.isr_delta, if eoi_ok { "ok" } else { "missing" }, if rearm_ok { "ok" } else { "missing" },
+        if pass { "PASS" } else { "FAIL" },
+    );
 }

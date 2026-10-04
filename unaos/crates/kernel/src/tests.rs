@@ -132,7 +132,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); // LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win();
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); // FILETYPE (B307): `tests filetype`.
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8();
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
@@ -310,5 +310,15 @@ fn ensure_usbnet() {
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("usbnet", crate::drivers::xhci::usbnet::selftest); }
+    }
+}
+
+/// KVBLANK8 (B318): register `tests kvblank8` (the vblank interrupt path, 1 s, `lost_at=`) exactly once on a Kepler
+/// vblank build; no GK107 prints SKIP, never a pin.
+fn ensure_kvblank8() {
+    #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("kvblank8", crate::drivers::gpu::kepler_vblank::kvblank8_selftest); }
     }
 }

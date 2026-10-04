@@ -64,3 +64,16 @@ never sees a new rising edge, and that is "fires once" exactly.
 The fix is the M1-predicted one and flown by nobody; if the boot prints `lost_at=` other than `none`,
 the named stage is the next arc. IOAPIC redirection-entry readback for the INTx wire is not printed
 (this machine runs MSI). No QEMU pin (no Kepler, R78).
+
+## Written
+
+* M1 `drivers/gpu/kepler_vblank.rs` tail (`kv8_snapshot`, `kv8_census`, `kv8_verdict`, `kv8_trace`, the pump hook that
+  spawns `kvblank8-trace` on the MSI's target cpu under `kvblank_trace`), `apic::vector_state` at the tail of
+  `arch/x86_64/apic.rs`; hooks: `rung3_arm` records the destination (`kv8_takeover`), `rung3_run` holds the window while
+  the trace runs (bounded 5 s from the arm), the ISR checks its EOI. Knob wiring: Cargo `kvblank_trace`, arroyo
+  `UNAOS_KVBLANK_TRACE`, builder, `k8-reach.registry` NA row.
+* M2 `kv8_isr_enter` / `kv8_isr_exit` in the ISR. The MSI capability offset is cached at the arm so the ISR issues
+  no CF8/CFC cycle of its own (the KVBLANK7 CF8 re-arm is left as it was).
+* M3 `irq_source()` refuses the ISR counter on the masked target core; `vbl_isr_rate()`; `[wc-h] vbl win= vbl_isr= vbl_src=`
+  printed after each rollup by `video/wcg.rs` (a line of its own, so the rollup's arity is unchanged).
+* M4 `kvblank8_selftest`, registered by `tests.rs` `ensure_kvblank8()`.
