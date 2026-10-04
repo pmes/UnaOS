@@ -4780,10 +4780,10 @@ impl XhciController {
                                                 if (ep_attr & 0x03) == 0x02 { // Bulk transfer type
                                                     if (ep_addr & 0x80) != 0 {
                                                         serial_println!("xHCI: >>> BULK IN EP FOUND: {:#x}, MPS: {} <<<", ep_addr, ep_mps);
-                                                        bulk_in = Some((ep_addr, ep_mps));
+                                                        bulk_in = Some((ep_addr, ep_mps)); #[cfg(feature = "usbnet")] usbnet::note_bulk_ep(slot_id as u8, ep_addr, ep_mps); // USBNET7: the FIRST bulk endpoint of each direction is remembered (Linux usbnet_get_endpoints); this walk keeps the last
                                                     } else {
                                                         serial_println!("xHCI: >>> BULK OUT EP FOUND: {:#x}, MPS: {} <<<", ep_addr, ep_mps);
-                                                        bulk_out = Some((ep_addr, ep_mps));
+                                                        bulk_out = Some((ep_addr, ep_mps)); #[cfg(feature = "usbnet")] usbnet::note_bulk_ep(slot_id as u8, ep_addr, ep_mps); // USBNET7: see the IN twin above
                                                     }
                                                 }
                                             }
@@ -17163,6 +17163,7 @@ impl XhciController {
     /// After the descriptor walk of a non-storage, non-FTDI device: configure the ECM bulk pair, or
     /// request the device's other configuration, or leave the slot to the stock path.
     fn usbnet_after_walk(&mut self, slot_id: u8, is_usbnet: bool, bulk_in: Option<(u8, u16)>, bulk_out: Option<(u8, u16)>) {
+        let (bulk_in, bulk_out) = usbnet::first_bulk(slot_id, bulk_in, bulk_out); // USBNET7: the AX88179 pair is the FIRST of each direction (OUT 0x03, not 0x05)
         if is_usbnet && usbnet::walk_is_candidate(slot_id) {
             match (bulk_in, bulk_out) {
                 (Some((ia, im)), Some((oa, om))) => {
@@ -17247,6 +17248,7 @@ impl XhciController {
             if code == 1 || code == 13 {
                 let rxl = usbnet::rx_len(); // USBNET5 M1: 20/24/26 KiB for the AX88179, 2 KiB for ECM
                 let n = rxl.saturating_sub(residue as usize);
+                usbnet::note_xfer(n); // USBNET7: every IN completion counted, the sub-4-byte ones too (they were silent)
                 dma_coherency::inval(rx_phys as usize, rxl);
                 let frame = unsafe { core::slice::from_raw_parts(rx_phys as *const u8, n.min(rxl)) };
                 if usbnet::kind() == usbnet::KIND_AX88179 { usbnet::deliver_ax(frame); } else { usbnet::deliver(frame); }
@@ -17265,6 +17267,7 @@ impl XhciController {
                 }
             };
             usbnet::arm(in_dci, wait_trb_phys);
+            usbnet::note_arm(1, in_ep); // USBNET7: `[usbnet] rx_arm n= ep= mps=` once, then a counter
             self.ring_doorbell(slot, in_dci as u32);
         }
 
@@ -17410,6 +17413,13 @@ impl XhciController {
                 if !self.ax_write_rb(slot, "MEDIUM_STATUS_MODE", usbnet::ax::REG_MEDIUM_STATUS_MODE, &m.to_le_bytes()) {
                     serial_println!("[usbnet] MEDIUM_STATUS_MODE rewrite refused for {:#06x}", m);
                 }
+                // USBNET7 M2: Linux `ax88179_link_reset` rewrites the bulk-IN queue control with the medium, and usbnet open's
+                // `set_rx_mode` (re)writes RX_CTL START once the MAC runs at the negotiated speed. Both are read back on the
+                // `regs when=linkup` line just below (no new boot line, R80).
+                let q = usbnet::qctrl();
+                if !self.ax_write(slot, usbnet::ax::REG_RX_BULKIN_QCTRL, &q) || !self.ax_write(slot, usbnet::ax::REG_RX_CTL, &usbnet::ax::RX_CTL_RUN.to_le_bytes()) {
+                    serial_println!("[usbnet] link-up QCTRL/RX_CTL rewrite refused");
+                }
                 self.usbnet_ax_regs(slot, "linkup"); // USBNET5 M2: the RX-side registers as the part holds them once the link is negotiated
             }
         }
@@ -17457,27 +17467,35 @@ impl XhciController {
         Self::ax_wait_ms(100);
         let mut mac = [0u8; 6];
         if !self.ax_read(slot, REG_NODE_ID, &mut mac) || !usbnet::set_mac_bytes(&mac) { usbnet::set_up(slot, false, Some("NODE_ID")); return; }
+        if !self.ax_write_rb(slot, "NODE_ID", REG_NODE_ID, &mac) { usbnet::set_up(slot, false, Some("NODE_ID write")); return; } // USBNET7: Linux ax88179_get_mac_addr writes the station address back right here, before the queue setup
         let mut link = [0u8; 1];
         let _ = self.ax_read(slot, REG_PHYSICAL_LINK_STATUS, &mut link);
         let qctrl = if usbnet::out_mps() >= 1024 || link[0] & 0x04 != 0 { BULKIN_QCTRL_SS } else if link[0] & 0x02 != 0 { BULKIN_QCTRL_HS } else { BULKIN_QCTRL_FS };
         let rxbuf = usbnet::set_rx_len_from_qctrl(&qctrl); // USBNET5 M1: post 1024*(q[3]+2) bytes per bulk-IN TD, as Linux rx_urb_size
+        usbnet::set_qctrl(&qctrl); // USBNET7: the tuple is rewritten at link-up (Linux link_reset)
         serial_println!("[usbnet] rx buf={} qctrl={:02x?}", rxbuf, qctrl);
         if !self.ax_write_rb(slot, "RX_BULKIN_QCTRL", REG_RX_BULKIN_QCTRL, &qctrl) { usbnet::set_up(slot, false, Some("RX_BULKIN_QCTRL")); return; }
         if !self.ax_write_rb(slot, "PAUSE_WATERLVL_LOW", REG_PAUSE_WATERLVL_LOW, &[0x34]) || !self.ax_write_rb(slot, "PAUSE_WATERLVL_HIGH", REG_PAUSE_WATERLVL_HIGH, &[0x52]) { usbnet::set_up(slot, false, Some("PAUSE_WATERLVL")); return; }
         if !self.ax_write_rb(slot, "RXCOE_CTL", REG_RXCOE_CTL, &[0]) || !self.ax_write_rb(slot, "TXCOE_CTL", REG_TXCOE_CTL, &[0]) { usbnet::set_up(slot, false, Some("COE_CTL")); return; }
-        if !self.ax_write_rb(slot, "MONITOR_MODE", REG_MONITOR_MODE, &[0]) { usbnet::set_up(slot, false, Some("MONITOR_MODE")); return; }
-        // USBNET6 M1: the order is PHY up -> medium -> node id -> RX_CTL START (receive enabled last, once everything it filters on is set).
-        // PHY: advertise 10/100 + pause and 1000 full (MII ADVERTISE, CTRL1000), then restart autoneg (BMCR).
-        let phy_ok = self.ax_phy_write(slot, MII_ADVERTISE, ADVERTISE_ALL_PAUSE) && self.ax_phy_write(slot, MII_CTRL1000, ADVERTISE_1000FULL) && self.ax_phy_write(slot, MII_BMCR, BMCR_ANEG_RESTART);
-        if !self.ax_write_rb(slot, "MEDIUM_STATUS_MODE", REG_MEDIUM_STATUS_MODE, &MEDIUM_RUN.to_le_bytes()) { usbnet::set_up(slot, false, Some("MEDIUM_STATUS_MODE")); return; }
-        if !self.ax_write_rb(slot, "NODE_ID", REG_NODE_ID, &mac) { usbnet::set_up(slot, false, Some("NODE_ID write")); return; } // Linux ax88179_get_mac_addr writes the station address back
+        // USBNET7 M2 (B328): Linux `ax88179_reset` order, which boot 19 flew and received on — RX_CTL START, then MONITOR, then
+        // MEDIUM (RECEIVE_EN), and the PHY autoneg restart LAST. USBNET6 had moved the PHY restart first and RX_CTL after MEDIUM
+        // and a NODE_ID write; boot 20 then received nothing with every readback identical to boot 19's.
         if !self.ax_write_rb(slot, "RX_CTL", REG_RX_CTL, &RX_CTL_RUN.to_le_bytes()) { usbnet::set_up(slot, false, Some("RX_CTL")); return; }
+        if !self.ax_write_rb(slot, "MONITOR_MODE", REG_MONITOR_MODE, &[0]) { usbnet::set_up(slot, false, Some("MONITOR_MODE")); return; }
+        if !self.ax_write_rb(slot, "MEDIUM_STATUS_MODE", REG_MEDIUM_STATUS_MODE, &MEDIUM_RUN.to_le_bytes()) { usbnet::set_up(slot, false, Some("MEDIUM_STATUS_MODE")); return; }
+        // PHY: advertise 10/100 + pause and 1000 full (MII ADVERTISE, CTRL1000), then restart autoneg (BMCR); each read back onto
+        // the `ax88179 link_status=` line below.
+        let phy_ok = self.ax_phy_write(slot, MII_ADVERTISE, ADVERTISE_ALL_PAUSE) && self.ax_phy_write(slot, MII_CTRL1000, ADVERTISE_1000FULL) && self.ax_phy_write(slot, MII_BMCR, BMCR_ANEG_RESTART);
+        let adv_rb = self.ax_phy_read(slot, MII_ADVERTISE).unwrap_or(0xffff);
+        let c1000_rb = self.ax_phy_read(slot, MII_CTRL1000).unwrap_or(0xffff);
+        let bmcr_rb = self.ax_phy_read(slot, MII_BMCR).unwrap_or(0xffff);
         usbnet::poll_start(crate::arch::ms(), link[0]);
         let mut medium = [0u8; 2];
         let _ = self.ax_read(slot, REG_MEDIUM_STATUS_MODE, &mut medium);
         serial_println!(
-            "[usbnet] ax88179 link_status={:#04x} medium(readback)={:#06x} qctrl={} phy_aneg={} — UNFLOWN register map, confirm on the bench",
-            link[0], u16::from_le_bytes(medium), if qctrl == BULKIN_QCTRL_SS { "ss" } else { "hs" }, phy_ok as u8
+            "[usbnet] ax88179 link_status={:#04x} medium(readback)={:#06x} qctrl={} phy_aneg={} adv={:#06x}/{:#06x} ctrl1000={:#06x}/{:#06x} bmcr={:#06x}/{:#06x} — UNFLOWN register map, confirm on the bench",
+            link[0], u16::from_le_bytes(medium), if qctrl == BULKIN_QCTRL_SS { "ss" } else { "hs" }, phy_ok as u8,
+            ADVERTISE_ALL_PAUSE, adv_rb, ADVERTISE_1000FULL, c1000_rb, BMCR_ANEG_RESTART, bmcr_rb
         );
         usbnet::set_up(slot, phy_ok, None); // USBNET6 M1: the per-register `[usbnet] reg` lines above replace the bring-up `regs` dump
     }
@@ -17533,4 +17551,19 @@ impl usbnet::ax_xport::AxTransport for XhciAx<'_> {
     fn reg_read(&mut self, reg: u16, out: &mut [u8]) -> bool { self.c.ax_read(self.slot, reg, out) }
     fn reg_write(&mut self, reg: u16, data: &[u8]) -> bool { self.c.ax_write(self.slot, reg, data) }
     fn wait_ms(&mut self, ms: u64) { XhciController::ax_wait_ms(ms) }
+}
+
+/// USBNET7 M3: the link's bulk-IN ring as the controller holds it, for the `tests usbnet` FAIL dump —
+/// (TR Dequeue Pointer raw from the output endpoint context, our enqueue index, our cycle bit, the endpoint state).
+#[cfg(feature = "usbnet")]
+impl XhciController {
+    pub fn usbnet_ring_state(&self) -> Option<(u64, usize, bool, u8)> {
+        let slot = usbnet::slot();
+        if slot == 0 { return None; }
+        let s = &self.slots[slot as usize];
+        if s.bulk_in_ep == 0 { return None; }
+        let dci = ((s.bulk_in_ep & 0x0F) * 2) + 1;
+        let r = s.bulk_in_ring.as_ref()?;
+        Some((self.ep_ctx_deq(slot, dci), r.enqueue_index(), r.cycle_bit(), self.ep_state_of(slot, dci)))
+    }
 }
