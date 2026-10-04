@@ -400,6 +400,7 @@ pub fn mount() -> Result<KernelUnaFS, MountError> {
 /// are all built on the same handle, so a mount can no longer be assembled from two disks.
 pub fn mount_on(handle: block::BlockHandle) -> Result<KernelUnaFS, MountError> {
     install_warn_hook();
+    crate::fs::unafstime::install_clock_hook(); // UNAFSTIME (B308): the kernel clock stamps inodes
     let span = locate_on(handle)?;
     partition_witness(handle, &span);
     let dev = SdSectorDevice::open_on(handle)?;

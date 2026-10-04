@@ -1117,8 +1117,7 @@ mod veincore_abi {
 }
 // ==========================================================================================// NETRING3 (B306) — entropy and name resolution for ring 3, the rungs under a metal HTTPS client.
 // Both numbers mean the same verb on both arches. Appended at the file tail so no existing line moves.
-// =================================================================================================
-
+// ==========================================================================================
 /// `SYS_GETRANDOM(buf, len) -> bytes written / -errno` — fill `buf` from the kernel DRBG (SHA-256,
 /// seeded from RDSEED/RDRAND/RNDR plus cycle-counter jitter, reseeded every 64 KiB). At most
 /// [`GETRANDOM_MAX`] bytes per call; a short count is a legal answer and ring 3 loops for more.
@@ -1188,3 +1187,17 @@ mod ring3win_tests {
         std::println!(":: RING3WIN-ABI: sbrk={} window={} xwin_off={:#x} -> PASS ::", SYS_SBRK, USER_WINDOW_BYTES, USER_XWIN_OFF);
     }
 }
+=======
+// TRASHTIME (B308) — what a trashed object IS, declared once for both Finders (the kernel's Quarry
+// Trash, `fs/trash.rs`, and Matrix's host Finder over a UnaFS vault): three attributes ON the object,
+// found by one query scoped to `/home/<user>/.Trash/`. Strings, not code: zero bytes in an EL0 blob.
+/// The original absolute path (String).
+pub const ATTR_KEY_TRASH_ORIGIN: &str = "una:trash-origin";
+/// When it was trashed, unix seconds (Int).
+pub const ATTR_KEY_TRASH_TIME: &str = "una:trash-time";
+/// The session user who trashed it (String).
+pub const ATTR_KEY_TRASH_BY: &str = "una:trash-by";
+/// The Trash folder's name under the user's home.
+pub const TRASH_DIR_NAME: &str = ".Trash";
+/// The listing query (every object carrying an origin; callers scope it to their Trash folder).
+pub const TRASH_QUERY: &str = "una:trash-origin != \"\"";

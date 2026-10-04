@@ -253,6 +253,13 @@ pub enum FsVerb {
     Move,
     /// Delete the target `path` (move-to-trash; requires confirmation).
     Delete,
+    /// TRASHTIME (B308): trash the vault object `path` — stamp `una:trash-origin/-time/-by` on it
+    /// and rename it into `/home/<user>/.Trash/` (same inode id). Appended: earlier wire tags hold.
+    Trash,
+    /// TRASHTIME: restore the trashed name `path` to its `una:trash-origin`.
+    Restore,
+    /// TRASHTIME: unlink everything in the Trash (requires confirmation).
+    Empty,
 }
 
 impl FsVerb {

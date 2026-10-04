@@ -154,6 +154,9 @@ pub fn ns_bump<T, E>(r: Result<T, E>) -> Result<T, E> {
     r
 }
 
+/// UNAFSTIME (B308): the kernel clock as the unafs inode stamp source, and the VFS face of the stamps.
+pub mod unafstime;
+
 /// TRASH (R75): the desktop Trash — `.Trash/` + `.index`, moved by `rename`. See the module docs.
 pub mod trash;
 

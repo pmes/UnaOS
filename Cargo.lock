@@ -4608,6 +4608,8 @@ dependencies = [
  "serde",
  "tempfile",
  "tokio",
+ "una-abi",
+ "unafs",
 ]
 
 [[package]]
@@ -7932,6 +7934,10 @@ dependencies = [
  "tabula",
  "tokio",
 ]
+
+[[package]]
+name = "una-abi"
+version = "0.1.0"
 
 [[package]]
 name = "unafs"
