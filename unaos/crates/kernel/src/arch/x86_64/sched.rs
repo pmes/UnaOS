@@ -1470,7 +1470,7 @@ impl core::fmt::Write for LineBuf {
 ///
 /// Call from a rate-limited path only; it is introspection, never a scheduling decision.
 pub fn emit_load_witness(tag: &str) {
-    use core::fmt::Write;
+    use core::fmt::Write; if !crate::census::on(crate::census::SCHEDX86) { return; } // QUIETBOOT (R80): a census, OFF until `census start schedx86`.
     let seen = crate::arch::acpi::cpu_count().max(1);
     let n = meter_cpu_count();
 
@@ -7613,7 +7613,7 @@ fn stack_high_water(task: &Task) -> usize {
 /// shared instrument.
 #[cfg(feature = "witness")]
 fn emit_stack_witness() {
-    let cpu = percpu::this_cpu().cpu_index as usize;
+    let cpu = percpu::this_cpu().cpu_index as usize; if !crate::census::on(crate::census::STACK) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
     let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
     if raw.is_null() {
         return;
@@ -7669,7 +7669,7 @@ pub fn emit_smpload_witness() {
     use core::fmt::Write;
     let now = crate::arch::ms();
     if now.saturating_sub(SMPLOAD_LAST_MS.load(Ordering::Relaxed)) < SMPLOAD_PERIOD_MS { return; }
-    SMPLOAD_LAST_MS.store(now, Ordering::Relaxed);
+    SMPLOAD_LAST_MS.store(now, Ordering::Relaxed); if !crate::census::on(crate::census::SMPLOAD) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
     let n = meter_cpu_count();
     let mut busy: [Option<u32>; MAX_CPUS] = [None; MAX_CPUS];
     let mut runq = [0usize; MAX_CPUS];
@@ -7706,7 +7706,7 @@ pub fn emit_smpload_witness() {
 /// unchanged on a skewed sample never reaches 2.
 #[cfg(feature = "witness")]
 pub fn smpload_selftest() {
-    static DONE: AtomicBool = AtomicBool::new(false);
+    static DONE: AtomicBool = AtomicBool::new(false); if crate::tests::defer("smpload", smpload_selftest) { return; } // QUIETBOOT (R80): a boot witness — `tests smpload` fires it.
     if DONE.swap(true, Ordering::Relaxed) { return; }
     let flat = smpload_judge(&[Some(40), Some(35), Some(50), Some(45)], &[0, 0, 0, 0], 0);          // spread: PASS
     let pegged = smpload_judge(&[Some(95), Some(10), Some(30), Some(30)], &[0, 0, 0, 0], 0);        // one task, nothing queued: PASS (the compositor's shape)

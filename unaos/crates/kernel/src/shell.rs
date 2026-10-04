@@ -2927,7 +2927,7 @@ fn fs_grep(console: &mut Console, args: &[&str]) {
 /// It can fail: every assertion compares against a literal expected value, and a FAIL line names
 /// what it got.
 #[cfg(feature = "witness")]
-pub fn midden_witness() {
+pub fn midden_witness() { if crate::tests::defer("tste", midden_witness) { return; } // QUIETBOOT (R80): a boot witness — `tests tste` fires it.
     fn verdict(name: &str, ok: bool, got: &str) {
         if ok {
             serial_println!(":: TSTE: {} -> PASS ::", name);
@@ -4719,7 +4719,7 @@ const STORAGE_WAIT_MS: u64 = 30_000;
 /// but they pass on inputs that were free to differ, and the counters prove the verbs ran.
 #[cfg(target_arch = "x86_64")]
 pub fn fatverb_storage_witness() {
-    use core::sync::atomic::Ordering;
+    use core::sync::atomic::Ordering; if crate::tests::defer("fatverb", fatverb_storage_witness) { return; } // QUIETBOOT (R80): a boot witness — `tests fatverb` fires it.
     if FATVERB_WITNESS_DONE.load(Ordering::Acquire) {
         return;
     }
@@ -5993,7 +5993,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         #[cfg(feature = "selfhost")]
         "src" => { shell_src(&args, console); }
-        "trash" => { crate::fs::trash::shell_verb(&args, console); } "shortcuts" => { crate::video::shortcuts::shell_verb(console); } #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))] "play" => { crate::drivers::hda::play::shell_verb(&args, &vfs_path(args.first().copied().unwrap_or("")), console); } "tests" => { crate::tests::shell_verb(&args, console); } #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))] "linux" => { crate::arch::linuxabi::shell_verb(&args, console); } "tste" | "selftest" => {
+        "trash" => { crate::fs::trash::shell_verb(&args, console); } "shortcuts" => { crate::video::shortcuts::shell_verb(console); } #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))] "play" => { crate::drivers::hda::play::shell_verb(&args, &vfs_path(args.first().copied().unwrap_or("")), console); } "tests" => { crate::tests::shell_verb(&args, console); } "census" => { crate::census::shell_verb(&args, console); } #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))] "linux" => { crate::arch::linuxabi::shell_verb(&args, console); } "tste" | "selftest" => {
             // The in-OS self-test suite (TSTE-1). Prints a three-section PASS/FAIL/SKIP table in the
             // console (like `ps` — it does NOT take the screen) and mirrors every line to serial.
             crate::selftest::run(console, pal);

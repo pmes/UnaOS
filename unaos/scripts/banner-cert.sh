@@ -317,6 +317,7 @@ uvc|[uvc] commit=withheld|-|measured(1)
 login|[login] screen open window=|-|measured
 loginst|:: LOGIN: users+session|-|measured
 tests-at-boot|:: TESTS: deferred=|-|measured
+census|:: CENSUS: armed=all|-|measured(1)
 ioapic|[ioapic] census ioapics=|-|measured(2)
 facet|[facet] closed win=|-|measured
 tegra|:: tegra: JB5 — XUSB domain not ON at handoff|-|measured(1)

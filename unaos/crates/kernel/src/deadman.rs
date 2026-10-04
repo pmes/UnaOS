@@ -313,7 +313,7 @@ mod imp {
         // Re-base off `now`, not off the old deadline: if the ISR was starved for several seconds
         // the instrument resumes at one line per second instead of emitting a burst of backlog.
         NEXT_DUE_MS.store(now.saturating_add(PERIOD_MS), Relaxed);
-        emit(now);
+        if crate::census::on(crate::census::DEADMAN) { emit(now); } // QUIETBOOT (R80): a census, OFF until `census start deadman`.
     }
 
     /// Format and emit the line. Runs in the timer ISR with IF=0.

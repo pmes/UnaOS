@@ -497,6 +497,7 @@ fn main() {
     // LOGIN SELFTESTS (its own knob, the UNAOS_HCRONST rule): the fixtures, never on a shipping login boot.
     if std::env::var("UNAOS_LOGINST").is_ok() { feats.push("loginst"); }
     if std::env::var("UNAOS_TESTS_AT_BOOT").is_ok() { feats.push("tests-at-boot"); }
+    if std::env::var("UNAOS_CENSUS").is_ok() { feats.push("census"); } // QUIETBOOT (R80): every census sampler on at boot. Kept in sync with arroyo.
     // BT-BOND M1 / HOLOCRON SELFTESTS: UNAOS_HCRONST=1 arms the store's two BOOT-TIME-WRITE selftests
     // (`holocron::selftest_once`, `btbond::selftest_once`). Its own knob and NOT part of
     // UNAOS_HOLOCRON, by the same rule that gives `sdw` a knob apart from `sdhcblk`: a boot that did

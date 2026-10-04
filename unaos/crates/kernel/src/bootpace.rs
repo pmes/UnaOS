@@ -381,3 +381,45 @@ pub fn service_dump() {
     #[cfg(all(target_arch = "x86_64", feature = "intel-ivb"))]
     crate::drivers::gpu::igpu::print_blt_stats();
 }
+
+// ── QUIETBOOT M4 (R80, rmbp-ledger B311) — THE ONE BOOT MEASUREMENT ────────────────────────────────────
+//
+// `:: BOOT: firmware->loader=<ms> loader->desktop=<ms> total=<ms> lines=<n> ::`, printed ONCE, right
+// after the boot's first `:: FIRSTBOOT:` stage line (the first screen: installer, login screen or
+// desktop). `firmware->loader` is BOOTCLOCK's own number (the loader's entry rdtsc, handed over by
+// `main.rs::bootclock_report`), not a second measurement; `loader->desktop` is the same counter from
+// that stamp to now; `lines` is SERIALLOCK's `LINES` — every serial line the boot printed before this
+// one. R80's number to watch fall.
+static LOADER_ENTRY: AtomicU64 = AtomicU64::new(0);
+static BOOT_LINES: AtomicU64 = AtomicU64::new(u64::MAX);
+static BOOT_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// BOOTCLOCK hands over the loader's entry stamp (cycles since reset) when its triple was sane.
+pub fn note_loader_entry(c: u64) {
+    LOADER_ENTRY.store(c, Ordering::Relaxed);
+}
+
+/// Lines printed before the BOOT line, once it has printed.
+pub fn boot_lines() -> Option<u64> {
+    match BOOT_LINES.load(Ordering::Relaxed) { u64::MAX => None, n => Some(n) }
+}
+
+/// The BOOT line (once per boot), then `tests quietboot` registered behind it.
+pub fn boot_line() {
+    if BOOT_SAID.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let lines = crate::serial_line::census().0;
+    crate::serial_line::tag_close();
+    BOOT_LINES.store(lines, Ordering::Relaxed);
+    let hz = counter_hz();
+    let now = crate::arch::now_cycles();
+    let fw = LOADER_ENTRY.load(Ordering::Relaxed);
+    let start = if fw != 0 { fw } else { ORIGIN.load(Ordering::Relaxed) };
+    let fw_d = Dur { raw: if fw != 0 { Some(fw) } else { None }, hz };
+    let ld = Dur { raw: Some(now.wrapping_sub(start)), hz };
+    let total = Dur { raw: Some(if fw != 0 { now } else { now.wrapping_sub(start) }), hz };
+    serial_println!(":: BOOT: firmware->loader={} loader->desktop={} total={} lines={} ::", fw_d, ld, total, lines);
+    crate::census::boot_banner();
+    crate::tests::register("quietboot", crate::tests::quietboot_selftest);
+}

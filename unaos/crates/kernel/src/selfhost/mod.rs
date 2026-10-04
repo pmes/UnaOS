@@ -219,6 +219,7 @@ fn hex32(d: &[u8; 32]) -> String {
 ///
 /// Called from the boot loop after storage is up, beside `fs::fat::probe_once()`.
 pub fn verify_source_once() {
+    if crate::tests::defer("selfhost", verify_source_once) { return; } // QUIETBOOT (R80): a boot witness — `tests selfhost` fires it. A 24 MB read is a boot cost Peter does not want.
     if DONE.swap(true, Ordering::SeqCst) {
         return;
     }

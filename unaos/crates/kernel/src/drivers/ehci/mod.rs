@@ -18397,7 +18397,7 @@ pub fn init() {
     let init_t0 = crate::arch::now_cycles();
     // Hardening self-test up front (default-ON driver parses ANY device's descriptor): proves the
     // report-parser is bounded against a hostile Report Count before we enumerate anything.
-    unsafe { parser_selftest() };
+    if !crate::tests::defer("ehci", ehci_selftest) { unsafe { parser_selftest() }; } // QUIETBOOT (R80): the parser/multitouch/dispatch/keymap/clip/termsel self-tests — `tests ehci`.
     // ISRARM: and the completion-interrupt half, for a blunter reason — on QEMU the interrupt CANNOT
     // fire. QEMU's `hcd-ehci` exposes no PCI capability list at all, so `isr_arm_controller` refuses
     // MSI and the entire ISR body would otherwise be dead code in every automated gate this repo
@@ -19407,7 +19407,7 @@ impl Controller {
 /// reports the ISR dropped (drop-newest, never blocking), this endpoint's dark total and worst window, and
 /// the CPU WCPAR left free of band workers for the input service. FAIL = a single dark window over 500 ms.
 fn ptrstutter_witness(dark_ms: u64, dark_max_ms: u64, slot: usize) {
-    let (sessions, dark_touch) = ptr2_touch_totals(slot);
+    let (sessions, dark_touch) = ptr2_touch_totals(slot); if !crate::census::on(crate::census::PTRSTUTTER) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
     let (d_inst, d_desk) = ptr2_stage_split();
     serial_println!(
         ":: PTRSTUTTER: ring={} dropped={} dropped_idle={} dropped_installer={} dropped_desktop={} dark_ms={} touch_sessions={} dark_in_touch_ms={} dark_max_ms={} reserved_cpu=none(ruling) -> {} ::",
@@ -19541,3 +19541,8 @@ pub fn tp_speed_set(n: u8) { TP_SPEED.store(n.min(2), core::sync::atomic::Orderi
 pub fn tp_speed_get() -> u8 { TP_SPEED.load(core::sync::atomic::Ordering::Relaxed) }
 fn tp_div_low() -> i32 { match tp_speed_get() { 0 => 12, 2 => 5, _ => TP_MT_DIV_LOW } }
 fn tp_div_high() -> i32 { match tp_speed_get() { 0 => 4, 2 => 2, _ => TP_MT_DIV_HIGH } }
+
+/// QUIETBOOT (R80): `tests ehci` — the hardening self-test chain `init` used to run at every boot.
+fn ehci_selftest() {
+    unsafe { parser_selftest() };
+}

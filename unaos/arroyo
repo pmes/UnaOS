@@ -70,7 +70,7 @@ WORKSPACE_DIR="$(cd "$(dirname "$0")" && pwd)"
 # list must be checked against that cfg before it is: `witness` is not a free arming on x86.
 case "${1:-}" in
     test|test-x86|test_x86|test-fat|test_fat|test-arm|test-aarch64|kernel8-test|test-pi|test-install|test_install|test-ptr|test_ptr)
-        export UNAOS_WITNESS="${UNAOS_WITNESS:-1}"; export UNAOS_TESTS_AT_BOOT="${UNAOS_TESTS_AT_BOOT:-1}" ;; # R77 M3: the QEMU lanes keep their boot-time fixtures (the metal desktop defers them behind the `tests` verb)
+        export UNAOS_WITNESS="${UNAOS_WITNESS:-1}"; export UNAOS_TESTS_AT_BOOT="${UNAOS_TESTS_AT_BOOT:-1}"; export UNAOS_CENSUS="${UNAOS_CENSUS:-1}" ;; # R77 M3: the QEMU lanes keep their boot-time fixtures (the metal desktop defers them behind the `tests` verb)
 esac
 
 # BUILD-SHA-1: Export git SHA as UNAOS_GIT_SHA for compile-time embedding (option_env!("UNAOS_GIT_SHA")).
@@ -652,6 +652,8 @@ _feats="${_feats}sdw,"
 [ -n "${UNAOS_LOGINST:-}" ] && _feats="${_feats}loginst,"
 # R77 M3: UNAOS_TESTS_AT_BOOT=1 runs the desktop fixture registry (`tests.rs`) at registration, in boot order, exactly as before the `tests` verb existed; unset, the desktop boots quiet and `tests` fires them. The test/test-arm lanes default it ON (top of this file). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_TESTS_AT_BOOT:-}" ] && _feats="${_feats}tests-at-boot,"
+# QUIETBOOT (R80): UNAOS_CENSUS=1 boots with every periodic sampler (`census.rs`) on; unset, the boot prints the boot and `census start <name>` turns one on. The battery verbs export it (head `case`).
+[ -n "${UNAOS_CENSUS:-}" ] && _feats="${_feats}census,"
 # PRTSCR-ST: UNAOS_PRTSCRST=1 arms the screen capture's BOOT-TIME-WRITE witness — one real capture
 # to SCREEN<n>.PNG at the volume root, then a read-back of what landed on the medium. Its own knob,
 # and NOT part of any other, by the rule stated for UNAOS_HCRONST above: a boot that did not ask to
@@ -8938,8 +8940,8 @@ test_selfhost() {
     # export produced a builder banner reading `selfhost,...` over a booted kernel with the module
     # compiled OUT, and a gate that could only ever report "not packed". Re-exec with the environment
     # already set is the only way a lane can arm a knob for its own build.
-    if [ -z "${UNAOS_SELFHOST:-}" ] || [ -n "${UNAOS_NOSRC:-}" ]; then
-        exec env -u UNAOS_NOSRC UNAOS_SELFHOST=1 "$0" test-selfhost "$layout" "$secs"
+    if [ -z "${UNAOS_SELFHOST:-}" ] || [ -n "${UNAOS_NOSRC:-}" ] || [ -z "${UNAOS_TESTS_AT_BOOT:-}" ]; then # QUIETBOOT (R80): the verify is a registered test now (`tests selfhost`); this lane runs it at boot via tests-at-boot
+        exec env -u UNAOS_NOSRC UNAOS_SELFHOST=1 UNAOS_TESTS_AT_BOOT=1 "$0" test-selfhost "$layout" "$secs"
     fi
     esp_x86
     UNAOS_SRCFIXTURE=1 bash "${WORKSPACE_DIR}/scripts/make-fat-img.sh" "$layout"
@@ -10234,6 +10236,11 @@ kernel8() {
     if [ -n "${UNAOS_TESTS_AT_BOOT:-}" ]; then
         K8_FEATS="${K8_FEATS},tests-at-boot"
         echo -e "${COLOR_YELLOW}  • UNAOS_TESTS_AT_BOOT: kernel8 runs the desktop fixture registry at boot (R77 M3)${COLOR_RESET}"
+    fi
+    # QUIETBOOT (R80): UNAOS_CENSUS=1 adds `census` — every periodic sampler on at boot (kernel8-test exports it).
+    if [ -n "${UNAOS_CENSUS:-}" ]; then
+        K8_FEATS="${K8_FEATS},census"
+        echo -e "${COLOR_YELLOW}  • UNAOS_CENSUS: kernel8 boots with every periodic census sampler on (R80)${COLOR_RESET}"
     fi
     # POWERMENU M3 (merge9 fold, GATE-K8REACH): UNAOS_LOWBAT_SHUTDOWN=<pct> adds `lowbat_shutdown` (the percent itself
     # is read by option_env! in video/powerui.rs, so the knob must be on the kernel8 build command too).

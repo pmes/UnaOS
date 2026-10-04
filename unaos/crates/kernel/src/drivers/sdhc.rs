@@ -4139,7 +4139,7 @@ pub fn wr_burst_flush() {
     use core::sync::atomic::Ordering::Relaxed;
     use wrcensus::*;
     let calls = CALLS.swap(0, Relaxed);
-    if calls == 0 { return; }
+    if calls == 0 || !crate::census::on(crate::census::SDHCWR) { return; } // QUIETBOOT (R80): the burst still closes (counters reset), the line is a census.
     let blocks = BLOCKS.swap(0, Relaxed);
     let multi = MULTI.swap(0, Relaxed);
     let errs = ERRS.swap(0, Relaxed);

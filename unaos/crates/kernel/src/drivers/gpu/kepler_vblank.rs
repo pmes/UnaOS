@@ -1849,7 +1849,7 @@ fn census_tail() {
 }
 
 fn vbjitter_witness(period_us: u64, jitter_us: u64) {
-    let (_, im, id, _, em, ed) = dt_hist();
+    let (_, im, id, _, em, ed) = dt_hist(); if !crate::census::on(crate::census::VBJITTER) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
     let (missed, doubled) = (im + em, id + ed);
     serial_println!(
         ":: VBJITTER: period_us={} jitter_us={} missed={} doubled={} isr_calls={} bound=jitter_us<=4000 -> {} ::",

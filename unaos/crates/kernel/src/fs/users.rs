@@ -3010,7 +3010,7 @@ fn stage_witness(why: &str) {
         ":: FIRSTBOOT: stage={} root_set={} users={} desktop_ignited={} why={} -> {} ::",
         if login { "login-screen" } else { st.word() }, root_set, users, up, why,
         if (st == BootStage::Installer && !root_set && !up) || (st == BootStage::CreateUser && root_set && users == 0 && !up) || (up && root_set && users > 0) || (login && st == BootStage::Desktop && root_set && users > 0) || why == "no-store" { "PASS" } else { "FAIL" }
-    );
+    ); crate::bootpace::boot_line(); // QUIETBOOT M4 (R80): the boot's one measurement, after its first stage line.
 }
 
 fn stage_publish(st: BootStage, why: &str) {

@@ -722,7 +722,7 @@ fn desk_amp_flush() {
     if n == 0 {
         return;
     }
-    let a = desk_amp_x100(req, pres);
+    let a = desk_amp_x100(req, pres); if !crate::census::on(crate::census::WCW) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
     // BRACKETQ — the rescued-bracket pair rides THIS line rather than `[flick2]`'s, for two
     // reasons. It belongs to DRAGWIDE's arc (the queue this census already reports on is the queue
     // the peek reads), and `[flick2]` lives in `cursor`, which is read-only to this change.

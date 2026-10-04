@@ -1762,7 +1762,7 @@ fn tap_cost_take() -> [(u64, u64); 4] {
 /// nothing at all and a tap that is prints once per burst, never once per line.
 pub fn mirror_service() {
     for (name, t) in taps() {
-        if t.take_pending() > 0 {
+        if t.take_pending() > 0 && crate::census::on(crate::census::MIRROR) { // QUIETBOOT (R80): the loss is still counted (`dropped=`), the announcement is a census.
             serial_println!(
                 "[mirror] {}: {} line(s) dropped, {} truncated since boot (sink contended or full)",
                 name,
@@ -3299,7 +3299,7 @@ pub fn tx_rollup() {
         return;
     }
     SERTX_LAST_MS.store(now, Ordering::Relaxed);
-    let (n, mmax, msum, drain, emit, spin, b_un, b_m, tmax, tsum) = tx_take();
+    let (n, mmax, msum, drain, emit, spin, b_un, b_m, tmax, tsum) = tx_take(); if !crate::census::on(crate::census::SERTX) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
     // TAPSMAX — the same span, decomposed by tap. Taken in `taps()`' order (fbcon, ftdi, tste,
     // flightrec), which is also the order `_print` calls them in on both arches, so a reader can
     // line `tap_max=` up against the `:: SERWIT-2 tap …` lines without a lookup.

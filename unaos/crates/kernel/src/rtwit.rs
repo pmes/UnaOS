@@ -319,7 +319,7 @@ mod imp {
     /// Emit the `[rtwit]` rollup line and reset every per-span slot. Called from the ~5 s witness
     /// gate in `x86_render_service`.
     pub fn rollup() {
-        use core::fmt::Write;
+        use core::fmt::Write; if !crate::census::on(crate::census::RTWIT) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
         // A bounded stack buffer — no allocation on the witness path.
         let mut buf = Buf::new();
         let _ = write!(buf, "[rtwit]");

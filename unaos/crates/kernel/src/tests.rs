@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use crate::console::Console;
 
 /// Registry capacity — a full table is loud (`:: TESTS: table full … -> FAIL ::`), never silent.
-const CAP: usize = 48;
+const CAP: usize = 80; // QUIETBOOT: 48 -> 80, the boot witnesses R80 moved here (flight 19 registered 45).
 
 static TABLE: spin::Mutex<[Option<(&'static str, fn())>; CAP]> = spin::Mutex::new([None; CAP]);
 static DEFERRED: AtomicUsize = AtomicUsize::new(0);
@@ -233,4 +233,53 @@ fn ensure_ring3win() {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("ring3win", crate::arch::syscall::ring3win_selftest); }
     }
+/// QUIETBOOT M3 (R80) — the one-statement shape for a boot-time WITNESS: `if crate::tests::defer("name", f) { return; }`
+/// as the first statement of the fixture `f` itself. Returns `false` (run the body now, as before) under
+/// `tests-at-boot` — so a QEMU lane sees the old line in the old order — and while `tests` is executing a
+/// fixture (so the registered `f` re-entering here runs its body). Otherwise registers `f` under `name`
+/// ONCE and returns `true`: the boot prints nothing and `tests <name>` fires it.
+pub fn defer(name: &'static str, f: fn()) -> bool {
+    if cfg!(feature = "tests-at-boot") || RUNNING.load(Ordering::Acquire) {
+        return false;
+    }
+    let present = TABLE.lock().iter().flatten().any(|e| e.0 == name);
+    if !present {
+        register(name, f);
+    }
+    true
+}
+
+/// QUIETBOOT M4 — the bound on serial lines before `:: BOOT:`, set from the flight-19 sweep: boot 1 printed
+/// 2710 lines to its first stage, ~1900 of them knob-recon rungs the flight line armed (SMC walk, gen7,
+/// Kepler/KFBIND/KDHEAD, iGPU, BT). This arc takes the census + witness ~290 out, so the same knob line
+/// should read ~2420; 2500 leaves room for enumeration variance and FAILS if a census or a witness creeps
+/// back. A boot without the recon knobs reads ~500 and the bound tightens with the knob line.
+pub const QUIETBOOT_BOUND: u64 = 2500;
+
+/// `tests quietboot`: `:: QUIETBOOT: lines=<n> bound=<B> census=<bits> -> PASS|FAIL|SKIP ::`, naming the
+/// eight loudest tags when over. SKIP on a build that runs its fixtures at boot or arms every census
+/// (`tests-at-boot` / `census` — the QEMU lanes), which is not the quiet boot being measured.
+pub fn quietboot_selftest() {
+    let Some(n) = crate::bootpace::boot_lines() else {
+        serial_println!(":: QUIETBOOT: lines=- bound={} -> SKIP (no `:: BOOT:` line yet: no first-boot stage resolved) ::", QUIETBOOT_BOUND);
+        return;
+    };
+    if cfg!(feature = "tests-at-boot") || cfg!(feature = "census") {
+        serial_println!(":: QUIETBOOT: lines={} bound={} census={} -> SKIP (tests-at-boot/census build: not the quiet boot) ::", n, QUIETBOOT_BOUND, crate::census::bits());
+        return;
+    }
+    let ok = n <= QUIETBOOT_BOUND;
+    if !ok {
+        let mut top = [([0u8; 8], 0u64); 8];
+        let k = crate::serial_line::tag_top(&mut top);
+        let mut s = alloc::string::String::new();
+        for (t, c) in &top[..k] {
+            let end = t.iter().position(|b| *b == 0).unwrap_or(8);
+            if !s.is_empty() { s.push(','); }
+            s.push_str(core::str::from_utf8(&t[..end]).unwrap_or("?"));
+            s.push_str(&format!(":{}", c));
+        }
+        serial_println!(":: QUIETBOOT: top=[{}] ::", s);
+    }
+    serial_println!(":: QUIETBOOT: lines={} bound={} census={} -> {} ::", n, QUIETBOOT_BOUND, crate::census::bits(), if ok { "PASS" } else { "FAIL" });
 }

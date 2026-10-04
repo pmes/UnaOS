@@ -732,7 +732,7 @@ fn rollup() {
     if total < reported.saturating_mul(2).max(1) {
         return;
     }
-    REPORTED.store(total, Ordering::Relaxed);
+    REPORTED.store(total, Ordering::Relaxed); if !crate::census::on(crate::census::USBNET) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
     serial_println!(
         ":: USBNET: rx={} tx={} rx_drop={} tx_drop={} errors={} rx_ok={} rx_crc={} rx_drop_err={} rx_short={} rx_chip_drop={} ::",
         RX_FRAMES.load(Ordering::Relaxed), TX_FRAMES.load(Ordering::Relaxed),
