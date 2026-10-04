@@ -68,12 +68,33 @@ pub fn init() {
 
 pub fn hlt_loop() -> ! {
     loop {
-        hlt();
+        x86_64::instructions::hlt(); // a deliberate stop: never the IF-aware `hlt` below
     }
 }
 
+/// NETHANG (B327 re-aim, boot 20): the WAIT-LOOP yield. With IF set this is `hlt` exactly as before:
+/// sleep until the next interrupt (the 1 kHz APIC tick at worst). With IF CLEAR, `hlt` wakes only on
+/// NMI/SMI/INIT, so a wait loop that yields this way NEVER comes back to check its deadline. That is
+/// what froze boot 20: `SYS_RESOLVE` runs IF-masked (SFMASK), the smolnet pump's `usbnet::raw_tx`
+/// took the xHCI loan and waited in `pump_until_ftdi_done`, and the first empty event-ring pass hit
+/// `hlt` with IF=0. That core stopped for good holding the xHCI loan (so the FTDI console, the wire,
+/// went dark) and smolnet's `STACK` lock. With IF clear this now does one `pause` and returns, so every
+/// `loop { …; crate::hlt(); if elapsed >= budget { … } }` stays bounded by its TSC deadline. Counted:
+/// `masked_hlt_count()` is on the `tests nethang` witness.
 pub fn hlt() {
-    x86_64::instructions::hlt();
+    if x86_64::instructions::interrupts::are_enabled() {
+        x86_64::instructions::hlt();
+    } else {
+        MASKED_HLT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        core::hint::spin_loop();
+    }
+}
+
+static MASKED_HLT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// NETHANG: how many `hlt()` yields were taken with IF clear and turned into a `pause`.
+pub fn masked_hlt_count() -> u64 {
+    MASKED_HLT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Counterpart to aarch64's framebuffer cache-clean (`DC CVAC` + `DSB`). VPERF-WC made the x86

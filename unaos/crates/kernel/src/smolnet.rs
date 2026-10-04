@@ -644,9 +644,19 @@ fn dhcp_acquire() {
 /// egress of queued datagrams, and inbound delivery — no interrupts required.
 fn stack_pump(stack: &mut SmolStack, iters: i64) {
     let SmolStack { iface, sockets, dev, .. } = stack;
-    for _ in 0..iters {
+    // NETHANG: a wall-clock cap beside the iteration count. On the USB dongle every poll can drive a
+    // controller pass (`usbnet::raw_rx`/`raw_tx` -> `drive()`), so the cost of an iteration is no
+    // longer a ring read. The cap keeps one call's hold of `STACK` (and of the xHCI loan, per pass)
+    // bounded whatever the link does. Checked every 256 iterations; the TSC advances with IF clear.
+    let t0 = crate::arch::now_cycles();
+    let cap = crate::arch::hw_wait_budget();
+    for i in 0..iters {
         let now = POLL_CLOCK.fetch_add(1, Ordering::Relaxed);
         iface.poll(Instant::from_millis(now), dev, sockets);
+        if i & 0xFF == 0xFF && crate::arch::now_cycles().wrapping_sub(t0) >= cap {
+            PUMP_CAPPED.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
     }
 }
 
@@ -731,6 +741,14 @@ pub fn stack_bind(sid: usize, port: u16) -> Result<(), ()> {
 /// + egress. `Ok(len)` once queued (best-effort egress), or `Err(())` (socket can't send /
 /// buffer full / unbound / unknown sid) → the syscall maps that to `-EAGAIN`.
 pub fn stack_sendto(sid: usize, ip: [u8; 4], port: u16, payload: &[u8]) -> Result<usize, ()> {
+    #[cfg(feature = "usbdebug")]
+    serial_println!("[net] poll enter op=sendto sid={} len={} masked={}", sid, payload.len(), !x86_64::instructions::interrupts::are_enabled() as u8);
+    let r = stack_sendto_inner(sid, ip, port, payload);
+    #[cfg(feature = "usbdebug")]
+    serial_println!("[net] poll exit op=sendto sid={} ok={}", sid, r.is_ok() as u8);
+    r
+}
+fn stack_sendto_inner(sid: usize, ip: [u8; 4], port: u16, payload: &[u8]) -> Result<usize, ()> {
     let mut g = STACK.lock();
     let stack = g.as_mut().ok_or(())?;
     let (handle, _, kind) = *stack.reg.get(sid).and_then(|s| s.as_ref()).ok_or(())?;
@@ -754,29 +772,62 @@ pub fn stack_sendto(sid: usize, ip: [u8; 4], port: u16, payload: &[u8]) -> Resul
 /// `(src_ip, src_port, len)` copied into `out` (truncated to `out.len()`), or `None` if
 /// none arrived within the budget → the syscall maps that to `-EAGAIN`. NEVER blocks.
 pub fn stack_recvfrom(sid: usize, out: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
-    let mut g = STACK.lock();
-    let stack = g.as_mut()?;
-    let (handle, _, kind) = *stack.reg.get(sid).and_then(|s| s.as_ref())?;
-    if kind != SockKind::Udp {
-        return None; // a TCP handle routed to sys_recvfrom — reject before the typed accessor panics
-    }
-    // Pump in chunks, checking for a delivered datagram between chunks so a fast reply
-    // returns promptly without burning the whole budget.
+    #[cfg(feature = "usbdebug")]
+    serial_println!("[net] poll enter op=recvfrom sid={} masked={}", sid, !x86_64::instructions::interrupts::are_enabled() as u8);
+    let r = stack_recvfrom_bounded(sid, out);
+    #[cfg(feature = "usbdebug")]
+    serial_println!("[net] poll exit op=recvfrom sid={} got={}", sid, r.is_some() as u8);
+    r
+}
+
+/// NETHANG: the receive pump with `STACK` released between chunks (the `TCP_CHUNK` rule
+/// `dhcp_acquire` already follows) and a wall-clock deadline beside the iteration budget. A dead link
+/// costs the caller at most `hw_wait_budget()` (2 s) and then answers `None` (-> -EAGAIN / ENOENT).
+/// The BSP main loop's `net_tick` can take `STACK` between two chunks. Before, one IF-masked syscall
+/// held it for all `RECV_PUMP` polls.
+fn stack_recvfrom_bounded(sid: usize, out: &mut [u8]) -> Option<([u8; 4], u16, usize)> {
+    let t0 = crate::arch::now_cycles();
+    let cap = crate::arch::hw_wait_budget();
     let mut spent = 0i64;
     while spent < RECV_PUMP {
-        stack_pump(stack, 4_000);
-        spent += 4_000;
-        let sock = stack.sockets.get_mut::<udp::Socket>(handle);
-        if sock.can_recv() {
-            if let Ok((data, meta)) = sock.recv() {
-                let n = data.len().min(out.len());
-                out[..n].copy_from_slice(&data[..n]);
-                let IpAddress::Ipv4(v4) = meta.endpoint.addr;
-                return Some((v4.octets(), meta.endpoint.port, n));
+        {
+            let mut g = STACK.lock();
+            let stack = g.as_mut()?;
+            // Re-validated every chunk: the lock was released, so the slot may have been closed.
+            let (handle, _, kind) = *stack.reg.get(sid).and_then(|s| s.as_ref())?;
+            if kind != SockKind::Udp {
+                return None; // a TCP handle routed to sys_recvfrom — reject before the typed accessor panics
+            }
+            stack_pump(stack, TCP_CHUNK);
+            let sock = stack.sockets.get_mut::<udp::Socket>(handle);
+            if sock.can_recv() {
+                if let Ok((data, meta)) = sock.recv() {
+                    let n = data.len().min(out.len());
+                    out[..n].copy_from_slice(&data[..n]);
+                    let IpAddress::Ipv4(v4) = meta.endpoint.addr;
+                    return Some((v4.octets(), meta.endpoint.port, n));
+                }
             }
         }
+        spent += TCP_CHUNK;
+        if crate::arch::now_cycles().wrapping_sub(t0) >= cap {
+            PUMP_CAPPED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        core::hint::spin_loop();
     }
     None
+}
+
+/// NETHANG: how many pumps hit the wall-clock cap rather than their iteration budget.
+static PUMP_CAPPED: AtomicU32 = AtomicU32::new(0);
+pub fn pump_capped() -> u32 {
+    PUMP_CAPPED.load(Ordering::Relaxed)
+}
+/// NETHANG: is `STACK` free right now? (The fixture's `held_locks` count: a call that returned and
+/// left this held is the boot-20 shape.)
+pub fn stack_lock_free() -> bool {
+    STACK.try_lock().is_some()
 }
 
 /// Remove socket `sid` from the persistent set (drops the udp socket, releasing its static
