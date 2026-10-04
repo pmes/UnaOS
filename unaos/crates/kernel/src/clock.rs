@@ -442,7 +442,7 @@ pub fn rtc_boot() {
     #[cfg(target_arch = "x86_64")]
     crate::arch::rtc::boot_anchor();
     #[cfg(not(target_arch = "x86_64"))]
-    serial_println!(":: RTC: rtc=none -> PASS ::");
+    crate::census_println!(":: RTC: rtc=none -> PASS ::");
 }
 
 /// A fixed-width byte writer for the ISO renderer (no allocation, no heap).

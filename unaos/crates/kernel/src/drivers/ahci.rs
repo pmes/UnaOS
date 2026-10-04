@@ -326,14 +326,14 @@ fn hba_take(bus: u8, slot: u8, func: u8, vend: u16, devid: u16) -> Option<u64> {
     let bar5_raw = unsafe { crate::arch::pci::read_config_32(bus, slot, func, 0x24) };
     let command = unsafe { crate::arch::pci::read_config_16(bus, slot, func, 0x04) };
 
-    serial_println!(
+    crate::bootlog_println!(
         "[ahci] bdf {}:{}.{} {:04x}:{:04x} bar5={:#010x} cmd={:#06x} mem-decode={} bus-master={}",
         bus, slot, func, vend, devid, bar5_raw, command,
         (command & 0x0002 != 0) as u8, (command >> 2) & 1
     );
 
     if (bar5_raw & 0x1) != 0 {
-        serial_println!(
+        crate::bootlog_println!(
             "[ahci] bdf {}:{}.{} ABAR (BAR5) is an I/O BAR (io={:#x}) — not an AHCI register block, skipped",
             bus, slot, func, bar5_raw & 0xFFFF_FFFC
         );
@@ -355,7 +355,7 @@ fn hba_take(bus: u8, slot: u8, func: u8, vend: u16, devid: u16) -> Option<u64> {
     }
     let abar = (bar5_raw & 0xFFFF_FFF0) as u64;
     if abar == 0 {
-        serial_println!(
+        crate::bootlog_println!(
             "[ahci] bdf {}:{}.{} ABAR unassigned by firmware — no MMIO probe", bus, slot, func
         );
         return None;
@@ -365,12 +365,12 @@ fn hba_take(bus: u8, slot: u8, func: u8, vend: u16, devid: u16) -> Option<u64> {
     if command & 0x0006 != 0x0006 {
         unsafe { crate::arch::pci::write_config_16(bus, slot, func, 0x04, command | 0x0006) };
         let after = unsafe { crate::arch::pci::read_config_16(bus, slot, func, 0x04) };
-        serial_println!(
+        crate::bootlog_println!(
             "[ahci] claim bdf {}:{}.{} cmd {:#06x} -> {:#06x} (mem-decode + bus-master; DMA is the only data path AHCI has)",
             bus, slot, func, command, after
         );
         if after & 0x0006 != 0x0006 {
-            serial_println!(
+            crate::bootlog_println!(
                 "[ahci] claim bdf {}:{}.{} decode/bus-master did not stick (cmd={:#06x}) — controller not claimable",
                 bus, slot, func, after
             );
@@ -383,7 +383,7 @@ fn hba_take(bus: u8, slot: u8, func: u8, vend: u16, devid: u16) -> Option<u64> {
     // 0x1100 covers generic host control (0x00..0x100) plus all 32 ports (0x100 + 32*0x80); the
     // identity map's leaves are 2 MiB, so this types the containing leaf UC either way.
     crate::arch::memory::map_mmio_window(abar, 0x1100);
-    serial_println!("[ahci] map bdf {}:{}.{} abar={:#x} len={:#x} uncacheable", bus, slot, func, abar, 0x1100);
+    crate::bootlog_println!("[ahci] map bdf {}:{}.{} abar={:#x} len={:#x} uncacheable", bus, slot, func, abar, 0x1100);
     Some(abar)
 }
 
@@ -396,7 +396,7 @@ fn hba_take(bus: u8, slot: u8, func: u8, vend: u16, devid: u16) -> Option<u64> {
 fn bios_handoff(abar: u64) {
     let cap2 = r32(abar, REG_CAP2);
     if cap2 & CAP2_BOH == 0 {
-        serial_println!("[ahci] handoff: CAP2.BOH=0 — controller implements no BIOS/OS handoff, nothing to take");
+        crate::bootlog_println!("[ahci] handoff: CAP2.BOH=0 — controller implements no BIOS/OS handoff, nothing to take");
         return;
     }
     let before = r32(abar, REG_BOHC);
@@ -408,7 +408,7 @@ fn bios_handoff(abar: u64) {
         wait_ms(2000, || r32(abar, REG_BOHC) & BOHC_BOS == 0);
     }
     let after = r32(abar, REG_BOHC);
-    serial_println!(
+    crate::bootlog_println!(
         "[ahci] handoff: BOHC {:#010x} -> {:#010x} (BOS={} OOS={} BB={})",
         before, after, after & BOHC_BOS, (after & BOHC_OOS) >> 1, (after & BOHC_BB) >> 4
     );
@@ -427,7 +427,7 @@ fn port_stop(abar: u64, port: u8) -> bool {
         pw32(abar, port, P_CMD, cmd & !PCMD_ST);
     }
     if !wait_ms(T_PORT_MS, || pr32(abar, port, P_CMD) & PCMD_CR == 0) {
-        serial_println!("[ahci] port {} CR never cleared after ST=0 (PxCMD={:#010x}) — port left alone",
+        crate::bootlog_println!("[ahci] port {} CR never cleared after ST=0 (PxCMD={:#010x}) — port left alone",
             port, pr32(abar, port, P_CMD));
         return false;
     }
@@ -436,7 +436,7 @@ fn port_stop(abar: u64, port: u8) -> bool {
         pw32(abar, port, P_CMD, cmd & !PCMD_FRE);
     }
     if !wait_ms(T_PORT_MS, || pr32(abar, port, P_CMD) & PCMD_FR == 0) {
-        serial_println!("[ahci] port {} FR never cleared after FRE=0 (PxCMD={:#010x}) — port left alone",
+        crate::bootlog_println!("[ahci] port {} FR never cleared after FRE=0 (PxCMD={:#010x}) — port left alone",
             port, pr32(abar, port, P_CMD));
         return false;
     }
@@ -450,14 +450,14 @@ fn port_start(abar: u64, port: u8) -> bool {
     let cmd = pr32(abar, port, P_CMD);
     pw32(abar, port, P_CMD, cmd | PCMD_FRE);
     if !wait_ms(T_PORT_MS, || pr32(abar, port, P_CMD) & PCMD_FR != 0) {
-        serial_println!("[ahci] port {} FR never set after FRE=1 — receive engine did not start", port);
+        crate::bootlog_println!("[ahci] port {} FR never set after FRE=1 — receive engine did not start", port);
         return false;
     }
     if !wait_ms(T_PORT_MS, || {
         let tfd = pr32(abar, port, P_TFD);
         tfd & (TFD_BSY | TFD_DRQ) == 0
     }) {
-        serial_println!("[ahci] port {} task file still BSY/DRQ (PxTFD={:#010x}) — ST not set", port,
+        crate::bootlog_println!("[ahci] port {} task file still BSY/DRQ (PxTFD={:#010x}) — ST not set", port,
             pr32(abar, port, P_TFD));
         return false;
     }
@@ -743,14 +743,14 @@ fn bring_up_port(abar: u64, port: u8, cap: u32, next_ix: usize) -> Option<usize>
     };
 
     if det != DET_PRESENT {
-        serial_println!("[ahci] port {} no device (PxSSTS={:#010x} DET={} IPM={})",
+        crate::bootlog_println!("[ahci] port {} no device (PxSSTS={:#010x} DET={} IPM={})",
             port, pr32(abar, port, P_SSTS), det, ipm);
         return None;
     }
 
     let sig = pr32(abar, port, P_SIG);
     if sig != SIG_SATA_DISK {
-        serial_println!(
+        crate::bootlog_println!(
             "[ahci] port {} device present but PxSIG={:#010x} is not a plain SATA disk ({:#010x}) — skipped",
             port, sig, SIG_SATA_DISK
         );
@@ -758,7 +758,7 @@ fn bring_up_port(abar: u64, port: u8, cap: u32, next_ix: usize) -> Option<usize>
     }
 
     if next_ix >= MAX_AHCI_DISKS {
-        serial_println!("[ahci] port {} SATA disk present but the registry is full ({} entries) — not published",
+        crate::bootlog_println!("[ahci] port {} SATA disk present but the registry is full ({} entries) — not published",
             port, MAX_AHCI_DISKS);
         return None;
     }
@@ -807,11 +807,11 @@ fn bring_up_port(abar: u64, port: u8, cap: u32, next_ix: usize) -> Option<usize>
     let p = AhciPort { num_sectors: id.sectors, lba48: id.lba48, ..p };
     PORTS.lock()[next_ix] = Some(p);
 
-    serial_println!(
+    crate::bootlog_println!(
         ":: AHCI: port={} model=\"{}\" sectors={} lba48={} ::",
         port, trimmed(&id.model), id.sectors, id.lba48 as u8
     );
-    serial_println!(
+    crate::bootlog_println!(
         "[ahci] port {} serial=\"{}\" capacity={} MiB registry-index={}",
         port, trimmed(&id.serial), id.sectors.saturating_mul(SECTOR_BYTES as u64) / (1024 * 1024), next_ix
     );
@@ -823,10 +823,10 @@ fn bring_up_port(abar: u64, port: u8, cap: u32, next_ix: usize) -> Option<usize>
     let kind = if identify_ok && read_block_at(next_ix, 0, &mut s0).is_ok() {
         let k = sector0_kind(&s0);
         let sig16 = u16::from_le_bytes([s0[510], s0[511]]);
-        serial_println!(":: AHCI: port={} sector0 sig={:#06x} kind={} ::", port, sig16, k);
+        crate::bootlog_println!(":: AHCI: port={} sector0 sig={:#06x} kind={} ::", port, sig16, k);
         k
     } else {
-        serial_println!(":: AHCI: port={} sector0 sig=0x0000 kind=none ::", port);
+        crate::bootlog_println!(":: AHCI: port={} sector0 sig=0x0000 kind=none ::", port);
         "none"
     };
 
@@ -859,7 +859,7 @@ pub fn probe() {
     let (bus, slot, func, vend, devid) = match find_controller() {
         Some(t) => t,
         None => {
-            serial_println!("[ahci] no AHCI controller (class 0x01/0x06 progif 0x01) on this machine");
+            crate::bootlog_println!("[ahci] no AHCI controller (class 0x01/0x06 progif 0x01) on this machine");
             return;
         }
     };
@@ -886,7 +886,7 @@ pub fn probe() {
     let n_ports = (cap & 0x1F) + 1;
     let n_slots = ((cap >> 8) & 0x1F) + 1;
 
-    serial_println!(
+    crate::bootlog_println!(
         "[ahci] hba VS={}.{}.{} CAP={:#010x} (np={} ncs={} s64a={} sss={} sncq={}) PI={:#010x} GHC={:#010x} (AE={} HR={})",
         (vs >> 16) & 0xFFFF, (vs >> 8) & 0xFF, vs & 0xFF,
         cap, n_ports, n_slots, (cap >> 31) & 1, (cap >> 27) & 1, (cap >> 30) & 1,
@@ -894,7 +894,7 @@ pub fn probe() {
     );
 
     if pi == 0 {
-        serial_println!("[ahci] PI=0 — the controller implements no ports; nothing to enumerate");
+        crate::bootlog_println!("[ahci] PI=0 — the controller implements no ports; nothing to enumerate");
         return;
     }
 
@@ -910,7 +910,7 @@ pub fn probe() {
         }
     }
 
-    serial_println!(
+    crate::bootlog_println!(
         "[ahci] done: implemented-ports={} published={} (READ-ONLY arc — no WRITE opcode is compiled into this image)",
         seen, next_ix
     ); #[cfg(feature = "witness")] crate::fs::bootdisk::ahciboot_selftest(); // AHCIBOOT (B89 second rung): the wire fixture, folded onto this line so knob-off byte identity is untouched. It runs HERE because this is the last statement of the one enumeration pass — registry populated, every HBA and port lock released, heap up — and because on x86 nothing else on a headless boot runs after it: `shell::vfs_mount_table`'s `bootdisk::bind` arm is `target_arch = "aarch64"`. Default-quiet (`witness`), like `homesoil_selftest`.

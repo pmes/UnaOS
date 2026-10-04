@@ -84,7 +84,7 @@ are off-limits and are not a source for anything in this ladder.
 | R5 | `execute` | 2 GGTT PTEs + 4 RCS ring regs, all restored | `enable-void` — **failed under *no hold in force*, and R6 re-opened it by changing that one condition** (§2.5) |
 | R6 | `rearm` | as R5, **under a held wake**, + 1 GTT-flush reg | **`r6-sentinel-hit by=mt … attempts=1/3`** — flight 4, both boots |
 | R7 | `blit` | as R6 on the **BCS**, 3 GGTT PTEs + 4 BCS ring regs | **`r7-blit-verified … best_dst_match=256/256`, `dst_crc==src_crc`** — flight 4, both boots |
-| R8 | `fb_blit` | as R7, **at the panel's pitch**: `1 + 4 + ceil((64+1)·pitch/4096)` GGTT PTEs (265 on the bench panel) + 4 BCS ring regs + 1 GTT-flush reg, all restored | **flew flights 8/9 2026-09-16 and refused on its own ceiling (R8CAP, §2.8); pending a metal run that reaches the blit.** Verdicts: `r8-fb-blit-verified` (the win) · `r8-fb-blit-verified-spill` · `r8-fb-blit-verified-head-stuck` · `r8-fb-blit-full-sentinel-miss` · `r8-fb-blit-partial` · `r8-sentinel-miss` · `r8-head-stuck`/`-partial` · `r8-enable-void-under-every-hold` · `r8-seed-collision` · `r8-ring-would-not-disable` · `r8-ring-drain-timeout` · the refusals `r8-gated-on-r7`, `r8-gated-on-wake`, `r8-refused-no-bar0`, `r8-refused-bpp-not-32`, `r8-refused-pitch-too-wide`, `r8-refused-panel-too-small`, `r8-refused-surface-too-large`, `r8-refused-bar0-too-small`, `r8-range-owned-refused`, `r8-fill-hypothesis-refuted`, `r8-alloc-failed`, `r8-virt-unmapped`, `r8-phys-above-4g`, `r8-pte-indistinct`, `r8-entry-drifted`, `r8-claim-write-void` (§2.8) |
+| R8 | `fb_blit` | as R7, **at the panel's pitch**: `1 + 4 + ceil((64+1)·pitch/4096)` GGTT PTEs (265 on the bench panel) + 4 BCS ring regs + 1 GTT-flush reg, all restored | **`r8-fb-blit-verified` on 13 of 13 metal boots since R8CAP (flights 10, 13-17, 19); since GEN7R8 (B320) it runs under `tests gen7`, not at boot, and scores itself on one `:: GEN7R8: … ::` line (§2.8).** History: flights 8/9 refused on the old 1 MiB ceiling (R8CAP, §2.8). Verdicts: `r8-fb-blit-verified` (the win) · `r8-fb-blit-verified-spill` · `r8-fb-blit-verified-head-stuck` · `r8-fb-blit-full-sentinel-miss` · `r8-fb-blit-partial` · `r8-sentinel-miss` · `r8-head-stuck`/`-partial` · `r8-enable-void-under-every-hold` · `r8-seed-collision` · `r8-ring-would-not-disable` · `r8-ring-drain-timeout` · the refusals `r8-gated-on-r7`, `r8-gated-on-wake`, `r8-refused-no-bar0`, `r8-refused-bpp-not-32`, `r8-refused-pitch-too-wide`, `r8-refused-panel-too-small`, `r8-refused-surface-too-large`, `r8-refused-bar0-too-small`, `r8-range-owned-refused`, `r8-fill-hypothesis-refuted`, `r8-alloc-failed`, `r8-virt-unmapped`, `r8-phys-above-4g`, `r8-pte-indistinct`, `r8-entry-drifted`, `r8-claim-write-void` (§2.8) |
 
 ### 2.1 R1 — `recon` (read-only)
 
@@ -157,6 +157,16 @@ Collapsing both arms would have been the mirror of the original error.
 The `next=` line now points the reader at the rungs that answer the question instead of at a
 re-run of the same blind battery. Conditions and the queue row: `SHUTOUT-REGISTER.md` §4 (R2),
 `docs/dev/OS/rmbp-queue.md` GEN7R2.
+
+#### GEN7R8 — the behavioural witness arrives from R8 (B320, 2026-10-05)
+
+The structural argument above stands: R2's call site still has no window and no hold. What changed is
+that R8, which has both, now prints a one-line verdict under `tests gen7`, and that line carries R2's
+re-score as a field: **`r2=behavioural-ok`** when R8 passed on that boot — 4096 dwords copied by the
+BCS through a held wake, the ring head advanced to the tail, the checksums agree; a dark GT cannot do
+that — and **`r2=still-dark`** on any other outcome. The boot line above is kept verbatim (every capture
+and `awk` compares against it); on a boot whose `tests gen7` printed PASS, the authoritative R2 reading
+is the `GEN7R8` line, and `instrument_blind=1` is closed by behaviour rather than by the battery.
 
 ### 2.3 R3 — `forcewake`
 
@@ -763,6 +773,17 @@ the call site would mean changing `blit`'s signature and `igpu.rs`, and would le
 pass a verdict R7 never reached. And the call is the last statement in the file's last function, so
 with `gen7r8` off there is nothing below it to shift and no `panic::Location` line moves.
 
+**GEN7R8 (B320, R80): the tail now stashes, and the rung runs under `tests gen7`.** R80 ("nothing runs
+at boot but the boot") makes R8 a test. The call at R7's tail became `r8::stash(…)` with the same
+arguments: it records BAR0, the BDF, R3's `GtWake`, R7's own verdict and the panel geometry (read with
+the same `try_lock` the rung always used, at the same point in `igpu::init` where flights 10-19 read
+`fb=panel`) and prints nothing. `tests gen7` (`tests.rs` `ensure_gen7`, registered only on a `gen7r8`
+build) runs the unchanged rung from that stash. R19 still holds: the stash carries R7's verdict, the rung
+still refuses with `r8-gated-on-r7` on anything but `r7-blit-verified`, and a boot whose R7 returned
+before its tail has no stash and prints `r8-gated-on-r7 r7=not-reached`. The cost of the move is time:
+R8 now runs minutes after R7 rather than microseconds, so if the GT sleeps in between the wire will say
+`r8-enable-void-under-every-hold` — the rung takes its own holds, so that would itself be a finding.
+
 #### Refusals — stated, never trimmed
 
 `r8-refused-bpp-not-32` · `r8-refused-pitch-too-wide` (BR13's pitch field is 16 bits; a wider panel
@@ -838,6 +859,31 @@ does not have to re-derive it (and get 16 640):
 Had that line existed for flight 8 it would have read `rows=65 pitch=16384 stride_px=4096
 slots_have=261 slots_need=265 short_by=4`, and the fix would have been legible from the wire.
 
+#### GEN7R8 M1 — the window from the panel, at run time (B320)
+
+R8CAP's reservation was the right repair for flights 8/9 and it held on every boot since. Its one
+remaining choice — `R8_MAX_STRIDE_PX = 4096`, forced by the PTE table being a stack array — meant a wider
+panel would refuse on a constant again. **The table is now a heap `Vec<u32>` of exactly `win_slots`**
+(`try_reserve_exact`, refused as `r8-alloc-failed which=ptes` on failure), so the window is the panel's:
+`dst_bytes = ceil((R8_RECT_H + 1) × pitch / 4096) × 4096`, computed at run time from the geometry. The
+reservation constants (`R8_MAX_STRIDE_PX`, `R8_DST_MAX_PAGES`, `R8_WIN_SLOTS_MAX`, `R8_DST_MAX_BYTES`)
+are gone, and `fb_blit`'s frame loses the 1 060 B table.
+
+The only capacity refusal left is the one that protects something real — the GGTT:
+
+```
+:: gen7: r8 verdict=r8-refused-surface-too-large need=<dst_bytes> have=<bytes> rows= pitch= stride_px=
+   ggtt_slots= base_slot= src_pages= writes=0 …
+```
+
+`have = (min(524 288, (bar0_size − 0x200000) / 4) − (R8_BASE_SLOT + 1 + src_pages + 1)) × 4096`: every
+GGTT slot above R8's base as BAR0 maps it, less the ring page, the source and the trailing neighbour.
+On the bench part (`bar0_size=4194304`) that is 458 730 slots ≈ 1.75 GiB against `need=1064960`, so the
+refusal is reachable only by a panel whose pitch already fails `r8-refused-pitch-too-wide` (BR13's
+16-bit field) — which is the honest order: the encoding gives out before the GGTT does. **The numbers
+on the bench panel are unchanged:** 65 rows × 16 384 B = 1 064 960 B = 260 destination pages, a 265-slot
+window, as flown thirteen times.
+
 #### The metal falsifier, stated before the boot
 
 **With a wake held and R7 verified on the same boot: `ctl_readback==0x1`, `head_moved=1`,
@@ -861,6 +907,70 @@ Expected on a healthy armed boot and **not** a defect: `battery_moved=0/17` (§2
 instrument, kept on the wire precisely so a reader sees it stay at zero while the engine works),
 `fw_evidence=blind` (§2.7's residual), and `reclaim=held reason=no-invalidation-evidence` (§2.6's
 GEN7TLB decision).
+
+#### The falsifier was met — thirteen times (counted 2026-10-05, GEN7R8)
+
+`awk 'index($0,":: gen7: r8 verdict=")'` over `docs/dev/evidence/`: flight 10 (`rmbp-0917/flight10/
+FLIGHT10.md`) 1/1, flight 13 1/1, flight 14 1/1, flight 15 4/4, flight 16 (`rmbp-0929`) 1/1, flight 17
+1/1, flight 19 4/4 — **every R8 verdict line since R8CAP is `r8-fb-blit-verified`.** Flight 19, `col=exec`:
+`ctl_readback=00000001 head_at_arm=00000000 head_post=00000040 head_moved=1 tail=00000040
+sentinel_post=0B8C0DE8 sentinel_hit=1 rect_match=4096/4096 spill=0 dst_crc=E7E603AE src_crc=E7E603AE
+iters=15 cyc=25668`; `col=drain … settled=1`. So the BCS copied a system-memory pattern to a non-zero
+origin of a 265-page GGTT surface at the panel's 16 384-byte pitch, `X2`/`Y2` are exclusive (`spill=0`
+with the slack row present), the pitch is in bytes, and the store ordered behind `MI_FLUSH_DW` retired.
+The ledger (B111) and the queue had not recorded it; B320 does.
+
+#### The witness under `tests gen7` (GEN7R8)
+
+The thirty-line transcript is unchanged and still prints. Two lines are added. After each attempt's
+drain column, the ring's own readback:
+
+```
+[gen7] r8 ring head=<HEAD & 0x1FFFFC> tail=<RING_TAIL> advanced=<head left its arm image: 0|1>
+```
+
+and, once per run, the verdict:
+
+```
+:: GEN7R8: window=<dst_bytes> ring_advanced=<0|1> csum=<match|mismatch> us=<n> r2=<behavioural-ok|still-dark>
+   verdict=<r8 verdict> replay=<0|1> -> PASS|FAIL|REFUSED ::
+```
+
+`ring_advanced=1` is the armed attempt's head leaving its arm image AND reaching the tail; `csum=match`
+is `rect_match == 4096`, `spill == 0` and the settled destination checksum equal to the source's;
+`us` is submit → drained from the TSC (`apic::tsc_hz`; flight 19's 25 668 + 1 804 cycles is ≈ 10 µs at
+the part's measured `tsc_hz=2693860820` from the same boot's BOOTCLOCK line). **PASS** = `r8-fb-blit-verified` with both. **REFUSED** = the rung returned before
+the GGTT claim (every such return is `writes=0`): no stash, R7 not verified, a geometry or GGTT refusal,
+an unconfirmed wake, an owned window. **FAIL** = anything else once the window was claimed. An armed
+run's witness is cached and a second `tests gen7` replays it (`replay=1`): R8's pages are `reclaim=held`
+(GEN7TLB HOLD), so a re-run would hold another ~1 MiB for an answer this boot already has.
+
+Expected on the bench: `window=1064960 ring_advanced=1 csum=match us≈10 r2=behavioural-ok
+verdict=r8-fb-blit-verified replay=0 -> PASS`.
+
+#### The gmux is not touched, and how a visible frame would be taken (GEN7R8 M4)
+
+R8 proves the **engine**, not the display. The destination is heap scratch carrying the panel's
+geometry, never the scanout, and nothing in `gen7.rs` reads or writes the gmux — on this boot the Kepler
+owns the panel (`SHUTOUT-REGISTER.md` §5 G4, `SW_DISPLAY=0x03`) and BRIGHTFLOOR's backlight path is the
+gmux's only writer.
+
+A future rung that puts one iGPU frame on the glass needs, in order: **(1)** the gmux to *accept* the
+switch — G7's line prints on flights 8/9/10 but the read-back is `DDC=0x01 DISP=0x02`, i.e. the display
+mux stayed discrete (GMUX-2 / G6); **(2)** a lit iGPU pipe — today every IGD plane is off
+(`igpu-blt: ring=absent why=no-active-surface`), so the eDP link on Port A would have to be trained and
+pipe A / plane A programmed with a GGTT-mapped surface at the panel's mode, with panel power (G10) and
+the post-switch settle cited; **(3)** then the frame itself: capture `SW_DISPLAY`/`SW_DDC` and the
+brightness, switch DISPLAY to IGD, R8's blit with the plane's surface as destination, hold a bounded
+number of vblanks, switch back to DISCRETE, verify the read-back equals the capture and that the Kepler
+scanout re-asserts (`KDHEAD`), and print one line with both read-backs. Every leg reversible, the whole
+frame under one `tests` verb, never at boot.
+
+**Why not now:** (1) is not met, so the switch would not take; if it did, (2) is not met, so the panel
+would go black with no iGPU mode to show and the only way back on that boot is the switch-back write
+itself; and `UNAOS_GMUX_IGD` is single-use media. Doing it in this arc would trade a proven engine
+result for an unrecoverable screen on Peter's desktop. The engine half is done; the display half is
+the G-ladder's.
 
 ---
 
@@ -952,7 +1062,7 @@ words on the wire:
 
 **All three queued decisions are taken, 2026-09-15 (GEN7NEXT).**
 
-- **GEN7R8 — flown 2026-09-16, refused on its own ceiling, ceiling fixed (R8CAP, §2.8).** The rung is `fb_blit`, behind `UNAOS_IVB3D_R8`, and it
+- **GEN7R8 — PASSED on 13/13 metal boots since R8CAP (flights 10-19); since B320 it runs under `tests gen7` with a one-line witness and a run-time window (§2.8).** (History: flown 2026-09-16, refused on its own ceiling, ceiling fixed by R8CAP.) The rung is `fb_blit`, behind `UNAOS_IVB3D_R8`, and it
   is R7's command at the panel's own geometry: a 64×64×32bpp rectangle at the **top-right corner**
   of a **framebuffer-pitch**, **multi-page** GGTT surface, with a third witness — `spill`, the bytes
   outside the rectangle — that R7's single-page destination could not carry. It blits into
@@ -969,6 +1079,7 @@ words on the wire:
   `r2-unscorable-until-behavioural-witness` with the old `gt-still-dark` reading kept verbatim in
   `battery=`.
 
-**What is owed is a boot.** Nothing above is a fact about silicon until the rMBP flies it; each
+**What is owed is a boot of the `tests gen7` line** (GEN7R8, B320); R8's engine result itself is
+thirteen boots old. The paragraph below is the rule this section was written under: each
 verdict string and its falsifier are stated here first, which is the only order in which a flight can
 settle anything.

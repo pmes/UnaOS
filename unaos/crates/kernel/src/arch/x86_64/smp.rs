@@ -149,7 +149,7 @@ fn wxn_nxe_report(cores: u32) {
     let wp = WP_MASK.load(Ordering::SeqCst);
     let armed = nxe.count_ones();
     let wp_armed = wp.count_ones();
-    serial_println!(
+    if !(armed == cores && wp_armed == cores) || cfg!(any(feature = "census", feature = "tests-at-boot")) { serial_println!(
         ":: WXAUDIT-NXE: cores={} nxe={} nxe_mask=0x{:X} wp={} wp_mask=0x{:X} -> {} ::",
         cores,
         armed,
@@ -157,7 +157,7 @@ fn wxn_nxe_report(cores: u32) {
         wp_armed,
         wp,
         if armed == cores && wp_armed == cores { "PASS" } else { "FAIL" }
-    );
+    ); } // QUIETBOOT2 (B325, R80): a PASS is census; a FAIL always prints.
     // The per-core CR0 witness line, right after the census it cross-checks. One line, BSP-emitted.
     wxn_cores_report(cores);
 }
@@ -196,7 +196,7 @@ fn wxn_cores_report(cores: u32) {
         let _ = write!(cb, "{}0x{:X}", if i == 0 { "" } else { "," }, cr0);
     }
     let arr = core::str::from_utf8(&cb.buf[..cb.len]).unwrap_or("<utf8>");
-    serial_println!(
+    crate::census_println!(
         ":: WXAUDIT-CORES: n={} cr0=[{}] wp=0x{:X} nxe=0x{:X} ::",
         n,
         arr,
@@ -415,7 +415,7 @@ pub fn publish_sched_split(render: usize, service: usize) {
     ];
     let x = [CpuOpt(xhci_worker_cpu(0)), CpuOpt(xhci_worker_cpu(1))];
 
-    serial_println!(
+    crate::bootlog_println!(
         ":: SCHED-X86 PLACE: aps={} rsvc=c{} svc=c{} worker=[{},{},{}] xhci=[{},{}] tier={} pool={} sched=all-cores ::",
         online_aps().len(),
         render,
@@ -485,7 +485,7 @@ pub fn confirm_render_core(arg: usize) {
         "PASS"
     };
 
-    serial_println!(
+    crate::bootlog_println!(
         ":: SCHED-X86 PLACE-CHECK: actual=c{} arg=c{} published={} pool={} collide={} tier={} verdict={} ::",
         actual,
         arg,
@@ -699,7 +699,7 @@ pub extern "C" fn ap_entry(cpu_index: u64) -> ! {
     wxn_record_core(idx);
 
     AP_ONLINE.fetch_add(1, Ordering::SeqCst);
-    serial_println!("SMP: AP {} online (apic id {}).", idx, apic_id);
+    crate::bootlog_println!("SMP: AP {} online (apic id {}).", idx, apic_id);
 
     x86_64::instructions::interrupts::enable();
     // Wait until the BSP has run SMP verification and turned scheduling on, then run this AP's
@@ -745,14 +745,14 @@ pub fn start_aps() {
     let topo = match acpi::topology() {
         Some(t) => t,
         None => {
-            serial_println!("SMP: no ACPI topology; staying uniprocessor.");
+            crate::bootlog_println!("SMP: no ACPI topology; staying uniprocessor.");
             wxn_nxe_report(1);
             return;
         }
     };
     let apic_ids = topo.apic_ids();
     if apic_ids.len() <= 1 {
-        serial_println!("SMP: 1 CPU; no APs to start.");
+        crate::bootlog_println!("SMP: 1 CPU; no APs to start.");
         wxn_nxe_report(1);
         return;
     }
@@ -782,7 +782,7 @@ pub fn start_aps() {
         patch_param(&raw const ap_param_cr3, cr3);
         patch_param(&raw const ap_param_entry, ap_entry as *const () as u64);
     }
-    serial_println!(
+    crate::bootlog_println!(
         "SMP: starting APs (trampoline @ {:#x}, cr3 {:#x}, {} CPUs)...",
         TRAMPOLINE_ADDR,
         cr3,
@@ -799,7 +799,7 @@ pub fn start_aps() {
             continue;
         }
         if index >= gdt::MAX_CPUS {
-            serial_println!("SMP: MAX_CPUS reached; skipping remaining APs.");
+            crate::bootlog_println!("SMP: MAX_CPUS reached; skipping remaining APs.");
             break;
         }
 
@@ -836,7 +836,7 @@ pub fn start_aps() {
         index += 1;
     }
 
-    serial_println!(
+    crate::bootlog_println!(
         "SMP: bring-up complete — {} of {} CPUs online (incl. BSP).",
         AP_ONLINE.load(Ordering::SeqCst) + 1,
         apic_ids.len()
@@ -868,14 +868,14 @@ fn verify_smp(online_aps: &[usize]) {
     }
 
     // Per-CPU timer: BSP first, then each online AP.
-    serial_println!(
+    crate::bootlog_println!(
         "SMP: per-CPU timer — cpu 0 (apic {}) ticks={}",
         bsp_ticks.apic_id,
         bsp_ticks.ticks.load(Ordering::Relaxed)
     );
     for &i in online_aps {
         if let Some(c) = percpu::cpu(i) {
-            serial_println!(
+            crate::bootlog_println!(
                 "SMP: per-CPU timer — cpu {} (apic {}) ticks={}",
                 i,
                 c.apic_id,
@@ -899,7 +899,7 @@ fn verify_smp(online_aps: &[usize]) {
             }
             core::hint::spin_loop();
         }
-        serial_println!(
+        crate::bootlog_println!(
             "SMP: IPI -> cpu {} (apic {}): {}",
             i,
             c.apic_id,

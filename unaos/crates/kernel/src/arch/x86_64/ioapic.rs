@@ -346,7 +346,7 @@ pub fn census() {
         c.ioapics[i].entries = entries;
         c.ioapics[i].version = version;
         gsis += entries as u32;
-        serial_println!(
+        crate::bootlog_println!(
             "[ioapic] id={} addr={:#x} gsi_base={} entries={} version={:#04x} hw_id={} == witness ::",
             c.ioapics[i].id,
             addr,

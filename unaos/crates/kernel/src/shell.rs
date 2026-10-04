@@ -2628,11 +2628,11 @@ fn which_report(console: &mut Console, word: &str) {
     if facts.exec {
         let mut vol = FatVolume;
         if let Some(name) = midden_core::resolve_exec(word, &mut vol) {
-            return console.println(&alloc::format!("{}: program {}", word, name));
+            return console.println(&alloc::format!("{}: program {}", word, exec_display_path(&name).unwrap_or(name))); // EXECNAME (B322): the on-disk path, e.g. `lumen: program /apps/LUMEN.ELF`. ⚠ SAME-LINE fold, line-NEUTRAL.
         }
-        return console.println_styled(crate::video::theme::TERM_RED, &alloc::format!("{}: not found (no verb, no program)", word));
+        if let Some(l) = midden_core::gated_off_line(word) { return console.println(&l); } return console.println_styled(crate::video::theme::TERM_RED, &alloc::format!("{}: not found (no verb, no program)", word)); // GATED-OFF (TESTFIX4, B330): a verb of other builds names its knob
     }
-    console.println(&alloc::format!(
+    if let Some(l) = midden_core::gated_off_line(word) { return console.println(&l); } console.println(&alloc::format!( // GATED-OFF (TESTFIX4, B330)
         "{}: not a verb on this build (and this build cannot launch programs)", word));
 }
 
@@ -5042,7 +5042,7 @@ pub fn fatverb_storage_witness() {
     // go-red measured missing. Both share one latch, so on a boot that bound a root the leg has
     // already spoken by here and this is a no-op.
     #[cfg(feature = "witness")]
-    x86bind_witness(&vfs_mount_table(), true);
+    if !crate::tests::defer("x86bind", x86bind_test) { x86bind_witness(&vfs_mount_table(), true); }
 }
 
 /// Run one command. Returns `true` if the command took over the whole screen with its own
@@ -5079,7 +5079,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
     history_record(cmd_line); if crate::help::intercept(cmd_line, console) { return false; } // HELPVERB (R75): `help [verb]`, `man <verb>`, `<verb> --help` — help.rs; LINE-NEUTRAL fold.
     let facts = midden_facts();
     let mut vol = FatVolume;
-    let plan = midden_core::plan(cmd_line, &facts, &mut vol);
+    let plan = midden_core::plan(cmd_line, &facts, &mut vol); if let (midden_core::Plan::Say(_), Some(k)) = (&plan, cmd_line.split_whitespace().next().and_then(midden_core::gated_off)) { serial_println!(":: [midden] gated-off verb={} knob={} ::", midden_core::canon_verb(cmd_line.split_whitespace().next().unwrap_or("")), k); } // GATED-OFF (TESTFIX4, B330)
 
     // WITNESS (must be able to fail): one line per dispatched line, naming the message the core
     // produced. A line that never reached the core cannot print this, and a core that produced
@@ -5993,7 +5993,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         },
         #[cfg(feature = "selfhost")]
         "src" => { shell_src(&args, console); }
-        "trash" => { crate::fs::trash::shell_verb(&args, console); } "shortcuts" => { crate::video::shortcuts::shell_verb(console); } #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))] "play" => { crate::drivers::hda::play::shell_verb(&args, &vfs_path(args.first().copied().unwrap_or("")), console); } "tests" => { crate::tests::shell_verb(&args, console); } "census" => { crate::census::shell_verb(&args, console); } #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))] "linux" => { crate::arch::linuxabi::shell_verb(&args, console); } "tste" | "selftest" => {
+        "trash" => { crate::fs::trash::shell_verb(&args, console); } "shortcuts" => { crate::video::shortcuts::shell_verb(console); } #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))] "play" => { crate::drivers::hda::play::shell_verb(&args, &vfs_path(args.first().copied().unwrap_or("")), console); } "tests" => { crate::tests::shell_verb(&args, console); } "census" => { crate::census::shell_verb(&args, console); } "prof" => { crate::prof::shell_verb(&args, console); } #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))] "linux" => { crate::arch::linuxabi::shell_verb(&args, console); } "tste" | "selftest" => {
             // The in-OS self-test suite (TSTE-1). Prints a three-section PASS/FAIL/SKIP table in the
             // console (like `ps` — it does NOT take the screen) and mirrors every line to serial.
             crate::selftest::run(console, pal);
@@ -6163,7 +6163,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         // neither cold-boot-ready nor honest. The console line goes out BEFORE each call because a
         // successful reset/off kills the machine mid-instruction — same last-line discipline as
         // `acpi_power::poweroff`.
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "battery" => { crate::video::powerui::shell_verb(console); } #[cfg(all(feature = "vein", any(feature = "aarch64_el0", target_arch = "x86_64")))] "vein" => { crate::vein_bus::shell_verb(console, &args); } // VEINCORE (B304): `vein status` / `vein rsp …` (the relay companion's answer line). POWERMENU M2
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "battery" => { crate::video::powerui::shell_verb(console); } // POWERMENU M2
         "shutdown" | "off" => {
             console.println("shutting down: invoking the platform firmware mechanism...");
             crate::power::shutdown();
@@ -6173,7 +6173,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             crate::power::reboot();
         },
         #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
-        "lumen" => { bg_program(console, "/apps/LUMEN.BIN"); } #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))] "bg" => { // LUMENBIN (B305) — `lumen` opens the ring-3 chat window: EXACTLY `bg /apps/LUMEN.BIN` (same spawn, job table, window title), so it carries `bg`'s cfg; the dock's lumen pin runs this verb. ⚠ SAME-LINE fold, line-NEUTRAL, code before comment.
+        "bg" => { // EXECNAME (B322, R82): the `lumen` arm that sat here (a hard-wired `bg /apps/LUMEN.BIN`) is DELETED — `lumen` is the program LUMEN.ELF, resolved by `midden_core::resolve_exec` and launched by its own note like every program; the dock pin dispatches `/apps/LUMEN.ELF` through the same path. ⚠ SAME-LINE fold, line-NEUTRAL.
             // BGRUN-1: run a user program in the BACKGROUND — the shell returns to its prompt at once and
             // the program keeps running (and, if windowed, its window stays OPEN, so TAB has a ring to
             // walk — this is what turns the WC-TAB binding into a workflow: `run` blocks until its app
@@ -6608,7 +6608,7 @@ fn cyc_to_us(dt: u64) -> u64 {
 fn run_program(console: &mut Console, path: &str) {
     let Some(bytes) = read_el0_image(console, "run", path) else {
         return;
-    };
+    }; run_image(console, path, bytes) } #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))] fn run_image(console: &mut Console, path: &str, bytes: alloc::vec::Vec<u8>) { // EXECNAME (B322) — ⚠ SAME-LINE fold, line-NEUTRAL: `run` is split at its read so the bare-name launch (bare_exec, a foreground program) runs the bytes it already read through this SAME body; `run <path>` is unchanged.
     // Hand the bytes to the kernel loader: map into a fresh user slot, run co-located, wait (bounded 5 s) for
     // the program to exit or fault. The image length + entry are reported for the witness.
     let n = bytes.len();
@@ -6941,9 +6941,9 @@ fn bg_program(console: &mut Console, path: &str) -> bool {
     let Some(bytes) = read_el0_image(console, "bg", path) else {
         return false;
     };
-    let n = bytes.len();
+    let n = bytes.len(); serial_println!("[bg] spawn path={} bytes={} pid=pending", path, n); // NETHANG M1: the breadcrumb AHEAD of the spawn — boot 20 went dark after `[gui] app-enter` with no line naming which step it reached
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
-        Ok((pid, asid, entry)) => { crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL: no `panic::Location` in this shared file moves. Name the launch BEFORE the job row is claimed — the task is runnable the instant the spawn returns and may reach its window create first, and a name armed late is a title the operator watches change. `owner_of_launch` corrects the per-arch off-by-one in the spawn handle; the rule and that correction are both stated at `wm::app_name_arm`. Fail-closed: a full name table costs the window its name, never the launch.
+        Ok((pid, asid, entry)) => { serial_println!("[bg] spawn path={} pid={} asid={:#x} -> started", path, pid, asid); crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(asid), path); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL: no `panic::Location` in this shared file moves. Name the launch BEFORE the job row is claimed — the task is runnable the instant the spawn returns and may reach its window create first, and a name armed late is a title the operator watches change. `owner_of_launch` corrects the per-arch off-by-one in the spawn handle; the rule and that correction are both stated at `wm::app_name_arm`. Fail-closed: a full name table costs the window its name, never the launch.
             let mut jobs = BG_JOBS.lock();
             // BGREAP-CLOSE: `bg_jobs_claim` reclaims rows whose job is provably finished before it
             // reports the table full — a close-box press retires the kernel row without telling this
@@ -7362,9 +7362,9 @@ fn bare_exec(console: &mut Console, typed: &str, name: &str) -> bool {
     // The ELF64 / little-endian / e_machine pre-checks already ran inside `read_el0_image` (the
     // arch's own twin, so EM_X86_64 there and EM_AARCH64 here), which named any of them; the kernel
     // loader re-validates from scratch regardless.
-    let n = bytes.len();
+    if !exec_detaches(&bytes, &canon, typed) { serial_println!("[bg] spawn path={} bytes={} pid=foreground", load_path, bytes.len()); run_image(console, &canon, bytes); return true; } let n = bytes.len(); serial_println!("[bg] spawn path={} bytes={} pid=pending", load_path, n); // NETHANG M1 breadcrumbs (code first). EXECNAME (B322, R82) — ⚠ SAME-LINE fold, line-NEUTRAL: the program decides — a window or a resident server detaches below (the `bg` body), anything else runs in the foreground through `run`'s own body.
     match crate::arch::syscall::spawn_user_image_bg(&bytes) {
-        Ok((pid, slot, entry)) => { crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), &canon); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. The bare-name launch names its windows exactly as `bg_program` does and is armed first for the same reason. `canon` is the spelling the operator's typed name resolved to, which is the spelling they expect to read back in the title bar.
+        Ok((pid, slot, entry)) => { serial_println!("[bg] spawn path={} pid={} asid={:#x} -> started", load_path, pid, slot); crate::video::wm::app_name_arm(crate::video::wm::owner_of_launch(slot), &canon); // WINTITLE — ⚠ SAME-LINE fold, line-NEUTRAL. The bare-name launch names its windows exactly as `bg_program` does and is armed first for the same reason. `canon` is the spelling the operator's typed name resolved to, which is the spelling they expect to read back in the title bar.
             if !adopt_bg_job(pid, slot, &canon) {
                 // Spawned but untrackable — kill it rather than leave a job `jobs` could never reap
                 // and `kill` could never name. Same rule `bg` follows, same reason.
@@ -7479,7 +7479,7 @@ pub(crate) fn vfs_mount_table() -> crate::fs::vfs::MountTable {
         stamp(&READ_BIND, &READ_BIND_SEQ, match crate::fs::bootdisk::locate() {
             crate::fs::bootdisk::Verdict::Bound(f) => bind::of_name(f.source.name()),
             crate::fs::bootdisk::Verdict::None_(_) => bind::DECLINED,
-        }); #[cfg(feature = "witness")] x86bind_witness(&mt, false); // X86BIND: the fixture, folded onto this line so arming `witness` shifts no ungated line (LAWS §5 byte identity). `settled=false`: a table builder cannot know enumeration is finished.
+        }); #[cfg(feature = "witness")] { if !crate::tests::defer("x86bind", x86bind_test) { x86bind_witness(&mt, false); } } // X86BIND: the fixture, folded onto this line so arming `witness` shifts no ungated line (LAWS §5 byte identity). `settled=false`: a table builder cannot know enumeration is finished.
     }
     mt
 }
@@ -8934,4 +8934,68 @@ fn query_cmd(console: &mut Console, args: &[&str]) {
         }
         Err(e) => vfs_say(console, &alloc::format!("query: {}", crate::fs::attrsys::refusal(&e))),
     }
+}
+
+/// EXECNAME (rmbp-ledger B322, R82): does a bare-name launch of `bytes` DETACH (the `bg` body) or run in
+/// the FOREGROUND (the `run` body)? The program says, in its `.note.unaos.app` note
+/// (`una_abi::AppNote`, emitted by its own link); `midden_core::launch_mode` applies the rule — a window
+/// or a resident server detaches, anything else (and an image with no note) runs in the foreground.
+/// x86 asks its loader's door (`elf::app_flags`, which refuses a foreign `e_machine`); aarch64 asks the
+/// shared core directly (that arch's loader lives inside its syscall module). One serial line either way.
+#[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]
+fn exec_detaches(bytes: &[u8], canon: &str, typed: &str) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    let flags = crate::arch::elf::app_flags(bytes);
+    #[cfg(not(target_arch = "x86_64"))]
+    let flags = midden_core::app_note_flags(bytes).unwrap_or(0);
+    let detach = midden_core::launch_mode(flags) == midden_core::LaunchMode::Detach;
+    serial_println!(":: BAREXEC: {} (typed '{}') — note flags={} -> {} ::", canon, typed, flags,
+        if detach { "detach" } else { "foreground" });
+    detach
+}
+
+/// EXECNAME (B322): the absolute, ON-DISK spelling of a program the core resolved — `which lumen`
+/// answers `/apps/LUMEN.ELF`, not the elided probe string `lumen.elf`. The same two probes the launch
+/// makes (the cwd, then [`EXEC_ROOT`]) asked of the namespace, then the parent listing for the
+/// spelling (a case-insensitive backend matched the probe; the listing holds the name as stored).
+/// `None` = the namespace no longer has it; the caller falls back to the core's string.
+fn exec_display_path(name: &str) -> Option<String> {
+    let mt = vfs_mount_table();
+    let is_file = |p: &str| matches!(mt.stat(p), Ok(st) if !matches!(st.kind, crate::fs::vfs::NodeKind::Dir));
+    let from_cwd = vfs_path(name);
+    let hit = if is_file(&from_cwd) {
+        from_cwd
+    } else if !name.starts_with('/') && is_file(&normalize_path(EXEC_ROOT, name)) {
+        normalize_path(EXEC_ROOT, name)
+    } else {
+        return None;
+    };
+    let (dir, leaf) = match hit.rfind('/') {
+        Some(0) => ("/", &hit[1..]),
+        Some(i) => (&hit[..i], &hit[i + 1..]),
+        None => return Some(hit.clone()),
+    };
+    match mt.read_dir(dir) {
+        Ok(rows) => Some(rows.iter().find(|r| r.name.eq_ignore_ascii_case(leaf))
+            .map(|r| normalize_path(dir, &r.name)).unwrap_or_else(|| hit.clone())),
+        Err(_) => Some(hit.clone()),
+    }
+}
+
+/// EXECNAME (B322): what a bare `word` resolves to RIGHT NOW, through the very path `which` and the
+/// launch take (`midden_core::resolve_exec` over [`FatVolume`], then [`exec_display_path`]) — for the
+/// `tests exec` fixture (`crate::execname`), so the witness cannot test a second resolver.
+#[cfg(target_arch = "x86_64")] // its one caller, `tests exec`, is x86 (the five images are x86 images)
+pub(crate) fn exec_resolve_display(word: &str) -> Option<String> {
+    if !midden_facts().exec {
+        return None;
+    }
+    let name = midden_core::resolve_exec(word, &mut FatVolume)?;
+    Some(exec_display_path(&name).unwrap_or(name))
+}
+
+/// QUIETBOOT2 (B325, R80): `tests x86bind` — the X86BIND root-binding fixture against the live mount table, settled.
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
+fn x86bind_test() {
+    x86bind_witness(&vfs_mount_table(), true);
 }

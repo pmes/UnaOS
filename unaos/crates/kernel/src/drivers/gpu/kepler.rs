@@ -1304,7 +1304,7 @@ fn poll_hz() -> Option<u64> {
 }
 
 pub fn init(gpu: &GpuInfo) {
-    serial_println!("[NVIDIA] Initializing Kepler GPU at BDF {}:{}:{}", gpu.bus, gpu.slot, gpu.func);
+    crate::bootlog_println!("[NVIDIA] Initializing Kepler GPU at BDF {}:{}:{}", gpu.bus, gpu.slot, gpu.func);
 
     // 1. Enable Bus Master and Memory Space
     PciScanner::enable_bus_master(gpu.bus, gpu.slot, gpu.func);
@@ -1402,7 +1402,7 @@ pub fn init(gpu: &GpuInfo) {
         macro_rules! phase {
             ($name:expr) => {
                 let t_now = crate::arch::ms();
-                serial_println!(":: kdisp: bring-up phase={} d={} ::", $name, t_now.wrapping_sub(t_last));
+                crate::census_println!(":: kdisp: bring-up phase={} d={} ::", $name, t_now.wrapping_sub(t_last));
                 t_last = t_now;
             }
         }
@@ -1412,22 +1412,22 @@ pub fn init(gpu: &GpuInfo) {
         let chipset = (boot_0 >> 20) & 0xFF;
         let major = (boot_0 >> 16) & 0xF;
         let minor = boot_0 & 0xFFFF;
-        serial_println!("[NVIDIA] Chipset: 0x{:02X}, Stepping: {}.{}", chipset, major, minor);
+        crate::bootlog_println!("[NVIDIA] Chipset: 0x{:02X}, Stepping: {}.{}", chipset, major, minor);
 
         if chipset != 0xE7 {
-            serial_println!("[NVIDIA] Warning: Expected GK107 (0xE7), found 0x{:02X}", chipset);
+            crate::bootlog_println!("[NVIDIA] Warning: Expected GK107 (0xE7), found 0x{:02X}", chipset);
         }
 
         // 3. Verify POST
         let pmc_enable = mmio_read(bar0, regs::NV_PMC_ENABLE);
-        serial_println!("[NVIDIA] PMC Enable: 0x{:08X}", pmc_enable);
+        crate::bootlog_println!("[NVIDIA] PMC Enable: 0x{:08X}", pmc_enable);
         if pmc_enable == 0 {
-            serial_println!("[NVIDIA] Warning: GPU does not appear to be POST'd (PMC_ENABLE is 0)");
+            crate::bootlog_println!("[NVIDIA] Warning: GPU does not appear to be POST'd (PMC_ENABLE is 0)");
         }
 
         // 4. Disable Interrupts
         mmio_write(bar0, regs::NV_PMC_INTR_EN, 0);
-        serial_println!("[NVIDIA] Disabled interrupts via PMC_INTR_EN"); #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))] crate::drivers::gpu::kepler_vblank::arm_pmc_pdisplay(bar0); // KVBLANK rung 1, PMC half — SAME-LINE APPEND, deliberately: this file's panic `Location` records embed line numbers and the knob-off byte-identity contract (`./arroyo knoboff nvidia-kepler-vblank`) is this track's standing proof, so the rung costs ZERO lines here. The statement above has written PMC_INTR_EN = 0 since the driver's first day; under the knob the rung then sets EXACTLY ONE bit (PDISPLAY, bit 26) in INTR_MASK_HOST 0x640 — NOT in the 0x140 written above, which is INTR_ENABLE_HOST with only a hw and a sw enable bit (envytools pmc.rst:30, :345-349; KVBLANK3 B192, flight 12 read back 0) — watches NV_PMC_INTR_0 for 50 ms to ask whether the display engine raises its PMC input AT ALL, and RESTORES the captured mask with a READ-BACK (`restored=… verdict=clean|DIRTY`, the ctrlbind idiom). Delivery is impossible by construction here because 0x140 stays 0: the rung asks whether the SOURCE is alive; KVBLANK2's R3 is the delivery rung. See drivers/gpu/kepler_vblank.rs.
+        crate::bootlog_println!("[NVIDIA] Disabled interrupts via PMC_INTR_EN"); #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))] crate::drivers::gpu::kepler_vblank::arm_pmc_pdisplay(bar0); // KVBLANK rung 1, PMC half — SAME-LINE APPEND, deliberately: this file's panic `Location` records embed line numbers and the knob-off byte-identity contract (`./arroyo knoboff nvidia-kepler-vblank`) is this track's standing proof, so the rung costs ZERO lines here. The statement above has written PMC_INTR_EN = 0 since the driver's first day; under the knob the rung then sets EXACTLY ONE bit (PDISPLAY, bit 26) in INTR_MASK_HOST 0x640 — NOT in the 0x140 written above, which is INTR_ENABLE_HOST with only a hw and a sw enable bit (envytools pmc.rst:30, :345-349; KVBLANK3 B192, flight 12 read back 0) — watches NV_PMC_INTR_0 for 50 ms to ask whether the display engine raises its PMC input AT ALL, and RESTORES the captured mask with a READ-BACK (`restored=… verdict=clean|DIRTY`, the ctrlbind idiom). Delivery is impossible by construction here because 0x140 stays 0: the rung asks whether the SOURCE is alive; KVBLANK2's R3 is the delivery rung. See drivers/gpu/kepler_vblank.rs.
 
         // 5. VRAM Detection & Initialization
         let vram_size_mb = mmio_read(bar0, regs::NV_PFB_RAM_AMOUNT) as usize;
@@ -1441,10 +1441,10 @@ pub fn init(gpu: &GpuInfo) {
             serial_println!(":: kepler: probe-abort vram-size-invalid ::");
             return;
         }
-        serial_println!("[NVIDIA] PFB Reported VRAM Size: {} MB", vram_size_mb);
+        crate::bootlog_println!("[NVIDIA] PFB Reported VRAM Size: {} MB", vram_size_mb);
 
         let mut vram_allocator = VramAllocator::new(bar1_base, bar1_size, vram_size);
-        serial_println!("[NVIDIA] Initialized VRAM bump allocator. Total BAR1 visible: {} MB", vram_allocator.total_size >> 20);
+        crate::bootlog_println!("[NVIDIA] Initialized VRAM bump allocator. Total BAR1 visible: {} MB", vram_allocator.total_size >> 20);
 
         // 6. Display Engine — read-only trace + optional takeover
         let mut kdisp_trace = [0u32; 7];
@@ -1456,15 +1456,15 @@ pub fn init(gpu: &GpuInfo) {
         for (i, offset) in (0..=0x3FC).step_by(4).enumerate() {
             let val = mmio_read(bar0, 0x640000 + offset);
             mirror_hdr_pre[i] = val;
-            if MIRROR_HDR_DENSE { serial_println!(":: kepler: mirror-hdr pre off={:03X} val={:08X} ::", offset, val); }
+            if MIRROR_HDR_DENSE { crate::census_println!(":: kepler: mirror-hdr pre off={:03X} val={:08X} ::", offset, val); }
         }
-        serial_println!(":: kepler: mirror-hdr pre done rows=256 ::");
+        crate::census_println!(":: kepler: mirror-hdr pre done rows=256 ::");
         phase!("pmc_vram_init");
 
         let fb_offset = crate::drivers::gpu::kepler_display::takeover_display(
             gpu, bar0, &mut vram_allocator, &mut kdisp_trace,
         );
-        serial_println!(":: kdisp: landed trace [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] ::",
+        crate::census_println!(":: kdisp: landed trace [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] ::",
             kdisp_trace[0], kdisp_trace[1], kdisp_trace[2], kdisp_trace[3],
             kdisp_trace[4], kdisp_trace[5], kdisp_trace[6]);
         phase!("kdisp_takeover");
@@ -1473,7 +1473,7 @@ pub fn init(gpu: &GpuInfo) {
         // Kepler requires Falcon microcode to fully initialize PGRAPH.
         // We log its presence but leave it disabled to prevent hangs.
         let pgraph_status = mmio_read(bar0, regs::NV_PGRAPH_BASE);
-        serial_println!("[NVIDIA] PGRAPH Engine Status (0x400000): 0x{:08X}. Requires firmware for full 2D/3D.", pgraph_status);
+        crate::bootlog_println!("[NVIDIA] PGRAPH Engine Status (0x400000): 0x{:08X}. Requires firmware for full 2D/3D.", pgraph_status);
 
         // ================== CE-LADDER — read-only, and it goes HERE ==================
         // Copy-engine reconnaissance (`kepler_ce.rs`, design of record
@@ -1496,14 +1496,17 @@ pub fn init(gpu: &GpuInfo) {
         // the 0x700000 aperture in one shot. It is restored at every use and the restore is
         // READ BACK — a restore that is written but never read is a success echo that
         // cannot fail, and a failure VOIDs the affected verdict rather than passing quietly.
+        // KBLIT / R80 — the ladder no longer RUNS at boot: nothing runs at boot but the boot.
+        // `kepler::init` only banks the context the two fixtures need; `tests ce` runs the
+        // read-only ladder and `tests kblit` the channel + blit, both fired from the shell.
         #[cfg(feature = "nvidia-kepler-ce")]
-        crate::drivers::gpu::kepler_ce::ladder(bar0, vram_size);
+        crate::drivers::gpu::kepler_ce::arm_context(bar0, bar1_base, bar1_size, vram_size);
 
         // Recon Probe before any engine state modification
 
 // 8. Phase 4: 3D Foundation - PFIFO and Pushbuffer setup
         if cfg!(feature = "nvidia-kepler-fifo") {
-            serial_println!("[NVIDIA] Starting PFIFO initialization...");
+            crate::bootlog_println!("[NVIDIA] Starting PFIFO initialization...");
             
             // Enable PFIFO and SUBFIFO (PBDMA) in PMC
             let pmc_enable = mmio_read(bar0, regs::NV_PMC_ENABLE);
@@ -1522,7 +1525,7 @@ pub fn init(gpu: &GpuInfo) {
             serial_println!(":: kepler: pbdma-eng-mask set ::");
 
             let check = mmio_read(bar0, regs::NV_PMC_ENABLE);
-            serial_println!("[NVIDIA] NV_PMC_ENABLE after bit 8 set: 0x{:08X}", check);
+            crate::bootlog_println!("[NVIDIA] NV_PMC_ENABLE after bit 8 set: 0x{:08X}", check);
 
             if let Some(inst_off) = vram_allocator.alloc(0x1000) {
                 if let Some(gpfifo_off) = vram_allocator.alloc(0x1000) {
@@ -1530,7 +1533,7 @@ pub fn init(gpu: &GpuInfo) {
                         if let Some(pb_off) = vram_allocator.alloc(64 * 1024) {
                             if let Some(runlist_off) = vram_allocator.alloc(0x1000) {
                                 if let Some(fence_off) = vram_allocator.alloc(0x1000) {
-                                    serial_println!("[NVIDIA] Allocated Channel Instance, GPFIFO, USERD, PushBuffer, Runlist, Fence.");
+                                    crate::bootlog_println!("[NVIDIA] Allocated Channel Instance, GPFIFO, USERD, PushBuffer, Runlist, Fence.");
 
                                     let bar1 = vram_allocator.base_phys;
                                     
@@ -1813,14 +1816,14 @@ pub fn init(gpu: &GpuInfo) {
                                     for (i, offset) in (0..=0x3FC).step_by(4).enumerate() {
                                         let val = mmio_read(bar0, 0x640000 + offset);
                                         let pre_val = mirror_hdr_pre[i];
-                                        if MIRROR_HDR_DENSE { serial_println!(":: kepler: mirror-hdr pass0 off={:03X} val={:08X} ::", offset, val); }
+                                        if MIRROR_HDR_DENSE { crate::census_println!(":: kepler: mirror-hdr pass0 off={:03X} val={:08X} ::", offset, val); }
                                         if val != pre_val {
                                             serial_println!(":: kepler: latch-delta off={:03X} pre={:08X} post={:08X} ::", offset, pre_val, val);
                                             diff_found = true;
                                         }
                                         rows += 1;
                                     }
-                                    serial_println!(":: kepler: mirror-hdr pass0 done rows={} ::", rows);
+                                    crate::census_println!(":: kepler: mirror-hdr pass0 done rows={} ::", rows);
                                     if !diff_found {
                                         serial_println!(":: kepler: latch-delta none ::");
                                     }
@@ -1995,7 +1998,7 @@ pub fn init(gpu: &GpuInfo) {
                                     let mut beacons_seen = 0;
                                     for offset in (0..=0x3FC).step_by(4) {
                                         let val = mmio_read(bar0, 0x640000 + offset);
-                                        if MIRROR_HDR_DENSE { serial_println!(":: kepler: mirror-hdr pass1 off={:03X} val={:08X} ::", offset, val); }
+                                        if MIRROR_HDR_DENSE { crate::census_println!(":: kepler: mirror-hdr pass1 off={:03X} val={:08X} ::", offset, val); }
                                         if val >= 0xBEAC0001 && val <= 0xBEAC0008 {
                                             serial_println!(":: kepler: beacon SEEN off={:03X} val={:08X} ::", offset, val);
                                             beacons_seen += 1;
@@ -2003,7 +2006,7 @@ pub fn init(gpu: &GpuInfo) {
                                         rows_pass1 += 1;
                                     }
                                     phase!("plant_and_pass1");
-                                    serial_println!(":: kepler: mirror-hdr pass1 done rows={} ::", rows_pass1);
+                                    crate::census_println!(":: kepler: mirror-hdr pass1 done rows={} ::", rows_pass1);
                                     if beacons_seen == 0 {
                                         serial_println!(":: kepler: beacon none-seen ::");
                                     }
@@ -2015,10 +2018,10 @@ pub fn init(gpu: &GpuInfo) {
                                     let mut rows_pass2 = 0;
                                     for offset in (0..=0x3FC).step_by(4) {
                                         let val = mmio_read(bar0, 0x640000 + offset);
-                                        if MIRROR_HDR_DENSE { serial_println!(":: kepler: mirror-hdr pass2 off={:03X} val={:08X} ::", offset, val); }
+                                        if MIRROR_HDR_DENSE { crate::census_println!(":: kepler: mirror-hdr pass2 off={:03X} val={:08X} ::", offset, val); }
                                         rows_pass2 += 1;
                                     }
-                                    serial_println!(":: kepler: mirror-hdr pass2 done rows={} ::", rows_pass2);
+                                    crate::census_println!(":: kepler: mirror-hdr pass2 done rows={} ::", rows_pass2);
                                     
                                     // M2: Disp-Era USERD Reconnaissance (Read-Only)
                                     let disp_base = 0x610000;
@@ -3461,7 +3464,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     let want_base = (runlist_off as u32) >> 12;
                                     mmio_write(bar0, 0x2270, want_base); // target=0 (VRAM), addr
                                     mmio_write(bar0, 0x2274, RUNLIST_LEN); // ENG=0 | LEN
-                                    serial_println!("[NVIDIA] Configured Runlist and bound channel.");
+                                    crate::bootlog_println!("[NVIDIA] Configured Runlist and bound channel.");
 
                                     // Wait for PLAYLIST_RD/_RD_LEN to echo the submit.
                                     //
@@ -3667,7 +3670,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                     // The display leg runs before the FTDI link is live and its
                                     // lines can fall off the 64K drop-oldest boot ring. Re-emit
                                     // the display verdict here, inside the surviving window.
-                                    serial_println!(":: kdisp: late-recap fb={:08X} ran={} trace [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] ::",
+                                    crate::census_println!(":: kdisp: late-recap fb={:08X} ran={} trace [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] ::",
                                         fb_offset.unwrap_or(0xFFFFFFFF) as u32,
                                         fb_offset.is_some(),
                                         kdisp_trace[0], kdisp_trace[1], kdisp_trace[2], kdisp_trace[3],
@@ -3965,7 +3968,7 @@ fecs_write(bar0, base + 0x104, 0); // BOOTVEC=0
                                         let mut w_idx_str = alloc::string::String::from("none");
                                         let w_idx = FECS_504_WRITE_INDEX.load(Ordering::SeqCst);
                                         if w_idx != 0xFFFFFFFF { w_idx_str = alloc::format!("{}", w_idx); }
-                                        serial_println!(":: kepler: fecs-ledger accesses={} first_offset={:08X} 504_read_touched={} 504_read_idx={} 504_write_touched={} 504_write_idx={} ::",
+                                        crate::census_println!(":: kepler: fecs-ledger accesses={} first_offset={:08X} 504_read_touched={} 504_read_idx={} 504_write_touched={} 504_write_idx={} ::",
                                             count, first, FECS_504_READ_TOUCHED.load(Ordering::SeqCst), r_idx_str,
                                             FECS_504_WRITE_TOUCHED.load(Ordering::SeqCst), w_idx_str);
                                     }
@@ -3996,11 +3999,11 @@ serial_println!(":: kepler: terminal-poke 0x409504 wr=0 (post: no further FECS r
                                         let mut w_idx_str = alloc::string::String::from("none");
                                         let w_idx = FECS_504_WRITE_INDEX.load(Ordering::SeqCst);
                                         if w_idx != 0xFFFFFFFF { w_idx_str = alloc::format!("{}", w_idx); }
-                                        serial_println!(":: kepler: fecs-ledger accesses={} first_offset={:08X} 504_read_touched={} 504_read_idx={} 504_write_touched={} 504_write_idx={} ::",
+                                        crate::census_println!(":: kepler: fecs-ledger accesses={} first_offset={:08X} 504_read_touched={} 504_read_idx={} 504_write_touched={} 504_write_idx={} ::",
                                             count, first, FECS_504_READ_TOUCHED.load(Ordering::SeqCst), r_idx_str,
                                             FECS_504_WRITE_TOUCHED.load(Ordering::SeqCst), w_idx_str);
                                     }
-    serial_println!("[NVIDIA] Initialization complete (Phases 1-4)");
+    crate::bootlog_println!("[NVIDIA] Initialization complete (Phases 1-4)");
 }
 
 /// A simple bump allocator for VRAM (CPU-visible via BAR1).

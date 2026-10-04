@@ -6850,7 +6850,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
     // (and the one-shot SVC log, which would otherwise be spent on a dead task's last call). Never
     // returns for a killed task: it retires here, on its own kernel stack, IRQ-masked, exactly as
     // SYS_EXIT / SYS_THREAD_EXIT already do from this same frame. Four relaxed loads otherwise.
-    super::sched::kill_check_current();
+    super::sched::kill_check_current(); let prof_t0 = crate::prof::sys_t0();
 
     if !SVC_LOGGED.swap(true, Ordering::Relaxed) {
         serial_println!(":: SVC: EC=0x15 nr={} — EL0->EL1 syscall path live ::", nr);
@@ -7191,7 +7191,7 @@ extern "C" fn aarch64_svc_handler(frame: *mut u64) {
         }
         _ => -38, // -ENOSYS
     };
-    unsafe { *frame.add(0) = ret as u64 }; // return value in x0
+    unsafe { *frame.add(0) = ret as u64 }; crate::prof::sys_note(nr, prof_t0); // return value in x0
 }
 
 // =============================================================================================
@@ -25863,26 +25863,6 @@ fn sys_attrsurf(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         return EFAULT;
     }
     if nr == una_abi::SYS_STAT { 0 } else { out.len() as i64 }
-}
-
-// ==========================================================================================
-// VEINCORE (B304): this arch's thin half of `crate::vein_bus` — the kernel-as-caller inject (the
-// `vein rsp` shell line) and the `tests vein` fixture over the SAME BANDY3 ops/fixture tables.
-// =================================================================================================
-#[cfg(feature = "vein")]
-pub fn vein_inject(verb: u8, body: &[u8]) -> i64 {
-    bus_sem_init_once();
-    crate::bus_route::inject(&BUSREG_OPS, verb, body)
-}
-#[cfg(feature = "vein")]
-pub fn vein_owned(verb: u8) -> bool {
-    crate::bus_route::is_owned(&BUSREG_OPS, verb)
-}
-/// `tests vein` — the chat-verb witness on aarch64.
-#[cfg(feature = "vein")]
-pub fn vein_selftest() {
-    bus_sem_init_once();
-    crate::vein_bus::selftest(&BUSREG_FX);
 }
 
 /// NETRING3 M1 (B306): `SYS_GETRANDOM(buf, len) -> count / -errno` — the aarch64 twin (RNDR-seeded where

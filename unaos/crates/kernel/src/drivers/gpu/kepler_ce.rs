@@ -1035,52 +1035,453 @@ fn r5_inst_walk(bar0: usize, vram_size: usize) -> &'static str {
 }
 
 // ===========================================================================
-// Entry point
+// Boot context (R80) — banked at kepler::init, consumed by `tests ce` / `tests kblit`
+// ===========================================================================
+//
+// R80: nothing runs at boot but the boot. The ladder USED to run inside `kepler::init`
+// under the knob; it now only banks the four numbers the two fixtures need. The fixtures
+// (`tests ce`, `tests kblit`) are the only entry points (M4), fired from the desktop shell.
+
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// BAR0 physical base, identity-mapped (kepler.rs maps it and aborts the probe on a failed
+/// translate). Zero until `arm_context`; every fixture refuses on zero rather than reading at
+/// `0 + off`, the KVBLANK idiom.
+static CE_BAR0: AtomicUsize = AtomicUsize::new(0);
+/// BAR1 physical base. KF24 (Boot A, `proven`): a BAR1 offset IS a physical VRAM address, so
+/// `CE_BAR1 + off` is the CPU window onto VRAM offset `off`, and `off` is also the GPU pointer.
+static CE_BAR1: AtomicUsize = AtomicUsize::new(0);
+static CE_BAR1_SIZE: AtomicUsize = AtomicUsize::new(0);
+static CE_VRAM: AtomicUsize = AtomicUsize::new(0);
+
+/// Bank the GPU context for the fixtures. Called ONCE from `kepler::init`; writes nothing to
+/// the device. Replaces the boot-time `ladder(...)` call (R80).
+pub fn arm_context(bar0: usize, bar1_base: usize, bar1_size: usize, vram_size: usize) {
+    CE_BAR0.store(bar0, Ordering::Release);
+    CE_BAR1.store(bar1_base, Ordering::Release);
+    CE_BAR1_SIZE.store(bar1_size, Ordering::Release);
+    CE_VRAM.store(vram_size, Ordering::Release);
+    serial_println!(
+        ":: kepler: CE context banked bar0={:#x} bar1={:#x} bar1_size={}MB vram={}MB — the CE ladder and the KBLIT channel run from `tests ce` / `tests kblit`, NEVER at boot (R80) ::",
+        bar0, bar1_base, bar1_size >> 20, vram_size >> 20
+    );
+}
+
+// ===========================================================================
+// M1 — `tests ce`: the ladder as a behavioural witness, STOP at first fail (R80)
 // ===========================================================================
 
-/// Run the read-only rungs of the CE ladder.
-///
-/// # Placement contract
-///
-/// This is called from `kepler::init` **before** the `nvidia-kepler-fifo` leg, and that
-/// position is load-bearing in three separate ways:
-///
-/// 1. **Above every FECS access.** The FIFO leg's POKE ucode deliberately poisons the unit
-///    and the terminal `0x409504` write closes the boot; the first access to that offset
-///    wedges every later read in the unit (spec §5.4). Everything here is upstream of both.
-/// 2. **Pre-submit, which makes R3 sharp.** Nothing in the runlist array is ours yet, so a
-///    populated slot is unambiguously the firmware's — the CE payoff, by construction
-///    rather than by inference.
-/// 3. **Independent of the FIFO knob.** `UNAOS_KEPLER_CE` alone arms this; a boot may run
-///    the reconnaissance without building a channel at all.
-///
-/// # QEMU says nothing
-///
-/// There is no Kepler in QEMU. A green `./arroyo check` proves the lattice and the types
-/// and NOTHING about any rung. Do not cite emulation for a line in this file.
-pub fn ladder(bar0: usize, vram_size: usize) {
-    serial_println!(
-        ":: kepler: CE-LADDER begin knob=UNAOS_KEPLER_CE rungs=R1,R2,R3,R5,R2b — READ-ONLY except (a) the PRAMIN window base, metal-proven (Boot A), restored+read-back at every use, and (b) R2b's SINGLE authored-magic write to a CE scratch, which fires ONLY behind a same-boot FALCON-REST verdict and is entry-captured, restored, and read back. R0=ANSWERED(present_us~73% of blit, Boot A) R4={} ::",
-        R4_RESULT
-    );
+/// `true` if this rung's token is a FAILURE that must stop the ladder, per each rung's §3
+/// falsification story (SHUTOUT-REGISTER §3): a VOID bracket, R1's REFUTED-CLEANLY, R2's
+/// all-ABSENT, R2b's REJECTED / NOT-RESTORED, R5's VOID. An inconclusive token (ambiguous,
+/// partial, present, skipped, empty, no-data, inconclusive-n1, discriminating) is NOT a
+/// failure of the register — the ladder prints it and walks on.
+fn ce_rung_fails(token: &str) -> bool {
+    matches!(token, "void" | "refuted" | "absent" | "rejected" | "not-restored")
+}
+
+/// `tests ce` — run R1/R2/R2b/R3/R5 in order, each printing its own readbacks, and STOP at
+/// the first that fails. The per-rung `:: CE:` line carries the token and a fresh
+/// `NV_PMC_BOOT_0` control readback (`ctl=<pre>/<post>`) — the one register every rung uses
+/// as its bracket, so the summary line itself is a readback. The §3 decision for each rung is
+/// in the rung's own verdict line, unchanged.
+pub fn tests_ce() {
+    let bar0 = CE_BAR0.load(Ordering::Acquire);
+    let vram = CE_VRAM.load(Ordering::Acquire);
+    if bar0 == 0 {
+        serial_println!(":: CE: rung=none verdict=no-context ctl=0/0 -> FAIL :: (kepler::init never banked a context; is UNAOS_KEPLER_TAKEOVER on?)");
+        return;
+    }
+    serial_println!(":: kepler: CE-LADDER begin knob=UNAOS_KEPLER_CE rungs=R1,R2,R2b,R3,R5 STOP-at-first-fail (tests ce) R4={} ::", R4_RESULT);
+
+    macro_rules! ce_line {
+        ($rung:expr, $tok:expr) => {{
+            let pre = unsafe { mmio_read(bar0, regs::NV_PMC_BOOT_0) };
+            let post = unsafe { mmio_read(bar0, regs::NV_PMC_BOOT_0) };
+            let fails = ce_rung_fails($tok);
+            serial_println!(
+                ":: CE: rung={} verdict={} ctl={:08X}/{:08X} -> {} ::",
+                $rung, $tok, pre, post, if fails { "STOP" } else { "ok" }
+            );
+            fails
+        }};
+    }
 
     let r1 = r1_ptop(bar0);
+    if ce_line!("R1", r1) { return; }
     let (r2, r2_falcon_base) = r2_ce_probe(bar0);
-    let r3 = r3_runlist_scan(bar0);
-    let r5 = r5_inst_walk(bar0, vram_size);
-
-    // R2b — the first CE WRITE — goes LAST, after every read-only rung. Two reasons, both
-    // §5.4 ordering law: (1) a boot's reconnaissance is complete and banked before the
-    // campaign's first write, so a write-induced fault cannot contaminate any read above it;
-    // (2) it is self-gated on r2_ce_probe's FALCON-REST base, captured above and consumed
-    // here, so it never writes to a base this boot did not just confirm live.
+    if ce_line!("R2", r2) { return; }
     let r2b = r2b_ce_arm(bar0, r2_falcon_base);
+    if ce_line!("R2b", r2b) { return; }
+    let r3 = r3_runlist_scan(bar0);
+    if ce_line!("R3", r3) { return; }
+    let r5 = r5_inst_walk(bar0, vram);
+    if ce_line!("R5", r5) { return; }
 
-    // A rollup that always prints. A probe whose absence cannot be distinguished from a
-    // quiet pass is an instrument that cannot fire, and this repo has convicted three of
-    // those. If the ladder ran, this line exists.
     serial_println!(
-        ":: kepler: CE-LADDER end r1_ptop={} r2_ce_probe={} r3_rlscan={} r5_inst={} r2b_arm={} — next gate: a genuine VRAM->VRAM copy (draft R7) is WITHHELD until r2b reports ARMED (a writable CE target), r1/r3 name a CE runlist id, and r5 yields an audited instance-block layout OR the CE falcon datapath map is derived ::",
-        r1, r2, r3, r5, r2b
+        ":: kepler: CE-LADDER end r1={} r2={} r2b={} r3={} r5={} — every rung ran, none failed; `tests kblit` is the next gate (a genuine VRAM->VRAM copy on the copy engine) ::",
+        r1, r2, r2b, r3, r5
+    );
+}
+
+// ===========================================================================
+// M2 + M3 — KBLIT: a copy-engine channel, and one VRAM->VRAM blit by checksum
+// ===========================================================================
+//
+// `CHARTER: Kernel — driver`. The copy engine is a device; its driver is the kernel's.
+//
+// # Why the copy-engine channel and NOT the graphics channel
+//
+// The FIFO/PGRAPH channel has NEVER validated — ten eliminations, the strip signature never
+// moved (SHUTOUT-REGISTER §2), and the remaining actor is FECS context-switch microcode we do
+// not have and may not clean-room. GRCOPY (class 0xA0B5 on the graphics channel) would inherit
+// that wall. KBLIT instead builds a DEDICATED copy-engine channel (PCOPY on the GK107), the
+// path §3's CE ladder judged most alive: "independent of nvidia-kepler-fifo … a CE falcon as a
+// bare DMA microcontroller, no PFIFO, no channel, no FECS wall" (draft §4.2 path 2). It stands
+// on KF24 (BAR1 identity, proven Boot A): a BAR1 offset IS a physical VRAM address, so every
+// pointer below is a VRAM offset the CPU reaches at `bar1 + off` and the GPU reaches at `off`,
+// and the blit is VRAM->VRAM — the reachable form of draft R7.
+//
+// # Honest expectation (M2 may STOP)
+//
+// Ten sittings say the engine may never fetch. M2's milestone is the gpfifo GET pointer
+// advancing past our PUT (`[ce] get= put= advanced=1`). If it does not advance, the arc STOPS
+// at M2 with the full instance-block dump — that is the deliverable, not a hack (the brief).
+//
+// # Clean-room
+//
+// The instance-block RAMFC layout is reused from `kepler.rs` and is UNAUDITED (CLEAN_ROOM_
+// POLICY §5; `kepler_ce.rs` R5 is the rung that would supply a Group-A layout, never-run). The
+// copy-class method numbers and the pushbuffer/gpfifo encodings are [EXT-UNPINNED] — no rnndb
+// file was opened. Every one is marked at its definition. A metal boot's `advanced`/`csum` is
+// what pins or kills them; nothing here is claimed validated.
+
+// --- scratch window (VRAM offsets; CPU at `bar1 + off`, GPU at `off`) --------------------
+
+/// Base VRAM offset of the KBLIT scratch window. Above the 32 MiB the firmware GOP framebuffer
+/// occupies (VramAllocator skips it) and above the fifo leg's own channel, so the two never
+/// collide. [TREE] — `kepler.rs::VramAllocator::new` skips the first 32 MiB for exactly this.
+const KB_BASE: usize = 48 * 1024 * 1024;
+const KB_INST: usize = KB_BASE;                 // instance block (RAMFC)   0x1000
+const KB_PD: usize = KB_BASE + 0x1000;          // identity page directory  0x1000
+const KB_PT: usize = KB_BASE + 0x2000;          // identity page table      0x1000
+const KB_GPFIFO: usize = KB_BASE + 0x3000;      // gpfifo ring              0x1000
+const KB_USERD: usize = KB_BASE + 0x4000;       // USERD doorbell page      0x1000
+const KB_PUSH: usize = KB_BASE + 0x5000;        // pushbuffer               0x1000
+const KB_SEM: usize = KB_BASE + 0x6000;         // semaphore page           0x1000
+const KB_SRC: usize = KB_BASE + 0x8000;         // 256x256 ARGB source      0x40000
+const KB_DST: usize = KB_BASE + 0x48000;        // 256x256 ARGB destination 0x40000
+const KB_TOP: usize = KB_BASE + 0x90000;        // one past the last byte used
+
+/// The blit geometry. 256x256 ARGB, 4 B/px.
+const KB_W: usize = 256;
+const KB_H: usize = 256;
+const KB_BPP: usize = 4;
+const KB_PITCH: usize = KB_W * KB_BPP;          // 1024 B/row
+const KB_BYTES: usize = KB_PITCH * KB_H;        // 256 KiB
+
+/// USERD channel-control offsets. **[EXT-UNPINNED / TREE]** — envytools dma-pusher "Channel
+/// control area" as quoted in SHUTOUT-REGISTER §2's KF27 bullet: IB_GET 0x88, IB_PUT 0x8C. The
+/// campaign's founding `gp_get=0` was read at 0x8C/0x90 and may never have been GP_GET at all;
+/// KF27 read IB_GET (0x88) for the first time. KBLIT reads IB_GET at 0x88 as the fetch witness.
+const USERD_IB_PUT: usize = 0x8C;
+const USERD_IB_GET: usize = 0x88;
+
+/// Copy class 0xA0B5 (KEPLER_DMA_COPY_A / GK104_COPY) method offsets, in BYTES.
+/// **[EXT-UNPINNED]** — recalled, no rnndb opened (clean-room §2). A metal `csum=match` pins them.
+const CLASS_COPY: u32 = 0x0000_A0B5;
+const M_LAUNCH_DMA: u32 = 0x0300;
+const M_OFFSET_IN_UPPER: u32 = 0x0400;
+const M_OFFSET_IN_LOWER: u32 = 0x0404;
+const M_OFFSET_OUT_UPPER: u32 = 0x0408;
+const M_OFFSET_OUT_LOWER: u32 = 0x040C;
+const M_PITCH_IN: u32 = 0x0410;
+const M_PITCH_OUT: u32 = 0x0414;
+const M_LINE_LENGTH_IN: u32 = 0x0418;
+const M_LINE_COUNT: u32 = 0x041C;
+const M_SET_SEM_A: u32 = 0x0240;   // upper 32 of semaphore address
+const M_SET_SEM_B: u32 = 0x0244;   // lower 32
+const M_SET_SEM_PAYLOAD: u32 = 0x0248;
+/// LAUNCH_DMA flags: PITCH->PITCH, non-blocking, release a 4-byte semaphore. **[EXT-UNPINNED]**.
+const LAUNCH_PITCH_PITCH_SEM: u32 = 0x0000_0186;
+/// The payload the engine writes to the semaphore on completion — a high-entropy authored magic
+/// (never a plausible residue), so a `sem=ok` can never be a stale read.
+const KB_SEM_MAGIC: u32 = 0x0B11_7A55;
+
+// --- raw VRAM access through BAR1 (KF24 identity) -----------------------------------------
+
+/// Write one dword into VRAM offset `off` through BAR1 and READ IT BACK (M4: every write has a
+/// readback on its line). Returns the readback so the caller prints `wrote/read` inline.
+#[inline]
+fn kb_wr(bar1: usize, off: usize, val: u32) -> u32 {
+    unsafe {
+        core::ptr::write_volatile((bar1 + off) as *mut u32, val);
+        core::ptr::read_volatile((bar1 + off) as *const u32)
+    }
+}
+#[inline]
+fn kb_rd(bar1: usize, off: usize) -> u32 {
+    unsafe { core::ptr::read_volatile((bar1 + off) as *const u32) }
+}
+
+/// Zero a VRAM page-sized span through BAR1.
+fn kb_zero(bar1: usize, off: usize, bytes: usize) {
+    for i in 0..(bytes / 4) {
+        unsafe { core::ptr::write_volatile((bar1 + off + i * 4) as *mut u32, 0) };
+    }
+}
+
+/// A BAR0 MMIO write with its readback, for the witness line (M4).
+#[inline]
+fn kb_mmio(bar0: usize, off: usize, val: u32) -> u32 {
+    unsafe {
+        mmio_write(bar0, off, val);
+        mmio_read(bar0, off)
+    }
+}
+
+/// The wedge detector (M4, the BAR1WEDGE lesson): poll `f` until it returns `true` or the
+/// millisecond budget expires. Returns `(ok, elapsed_us)`. A stalled GPU NEVER hangs the
+/// console — the wait is bounded and the caller prints the timeout. Timed with the arch-neutral
+/// `crate::arch::ms()` (present on both arches) so this file type-checks on the aarch64 leg too,
+/// where the whole kepler driver is dead code but must still compile under the knob.
+const KB_WAIT_MS: u64 = 1500;
+fn kb_wait<F: Fn() -> bool>(f: F) -> (bool, u64) {
+    let t0 = crate::arch::ms();
+    loop {
+        if f() {
+            return (true, crate::arch::ms().wrapping_sub(t0).saturating_mul(1000));
+        }
+        let el = crate::arch::ms().wrapping_sub(t0);
+        if el >= KB_WAIT_MS {
+            return (false, el.saturating_mul(1000));
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Fermi+ pushbuffer "increasing methods" command header. **[EXT-UNPINNED]** — the GF100+
+/// encoding `0x20000000 | (count<<16) | (subc<<13) | (method>>2)`; no rnndb opened.
+#[inline]
+fn pb_hdr(subc: u32, method: u32, count: u32) -> u32 {
+    0x2000_0000 | (count << 16) | (subc << 13) | (method >> 2)
+}
+
+/// Build the identity page directory + page table so the channel's GPU-virtual addresses equal
+/// the VRAM offsets for the scratch window. **[EXT-UNPINNED]** — the Kepler GMMU PDE/PTE format
+/// is recalled, not pinned; a small-page identity map of `[KB_BASE, KB_TOP)` is all one blit
+/// needs. If the format is wrong the engine faults and `sem=timeout`/`advanced=0` says so; no
+/// confident claim is made about the entries.
+fn kb_build_identity_pd(bar1: usize) {
+    kb_zero(bar1, KB_PD, 0x1000);
+    kb_zero(bar1, KB_PT, 0x1000);
+    // One PDE pointing at the small-page PT (PDE[.] = PT_phys>>8 | small-page present). The PT
+    // identity-maps 4 KiB pages covering KB_BASE..KB_TOP. Entry = (page>>8)<<4 ... kept minimal.
+    let pde_lo = ((KB_PT as u32) >> 8) | 0x1; // [EXT-UNPINNED] small-page table present
+    kb_wr(bar1, KB_PD + 0x0, pde_lo);
+    kb_wr(bar1, KB_PD + 0x4, 0);
+    let first = KB_BASE / 0x1000;
+    let last = (KB_TOP + 0xFFF) / 0x1000;
+    for p in first..last {
+        let pte_lo = ((p as u32) << 4) | 0x1; // [EXT-UNPINNED] VRAM, read/write, present
+        let idx = p - first;
+        kb_wr(bar1, KB_PT + idx * 8, pte_lo);
+        kb_wr(bar1, KB_PT + idx * 8 + 4, 0);
+    }
+}
+
+/// Lay down the instance block (RAMFC) for the copy channel. Reuses `kepler.rs`'s UNAUDITED
+/// layout — every write with a readback (M4). Points gpfifo/userd at the KBLIT scratch window.
+fn kb_build_inst(bar1: usize, chan_id: u32) {
+    kb_zero(bar1, KB_INST, 0x1000);
+    // USERD pointer (inst+0x08/0x0C), gpfifo pointer (inst+0x48/0x4C), and the housekeeping
+    // magics kepler.rs writes. GPU addresses are VRAM offsets (KF24 identity).
+    kb_wr(bar1, KB_INST + 0x08, (KB_USERD & 0xFFFF_FFFF) as u32);
+    kb_wr(bar1, KB_INST + 0x0C, ((KB_USERD >> 32) as u32) | 0x8000_0000);
+    kb_wr(bar1, KB_INST + 0x10, 0x0000_face);
+    kb_wr(bar1, KB_INST + 0x30, 0xffff_f902);
+    kb_wr(bar1, KB_INST + 0x48, (KB_GPFIFO & 0xFFFF_FFFF) as u32);
+    kb_wr(bar1, KB_INST + 0x4C, ((KB_GPFIFO >> 32) as u32) | (9 << 16)); // ORDER 9 = 512 entries
+    // Page-directory pointer for this channel's address space (inst+0x0200 area). [EXT-UNPINNED].
+    kb_wr(bar1, KB_INST + 0x0200, ((KB_PD as u32) >> 12) | 0x1);
+    kb_wr(bar1, KB_INST + 0x0204, 0);
+    kb_wr(bar1, KB_INST + 0x84, 0x2040_0000);
+    kb_wr(bar1, KB_INST + 0x94, 0x3000_0000); // VRAM devm=0
+    kb_wr(bar1, KB_INST + 0x9C, 0x0000_0100);
+    kb_wr(bar1, KB_INST + 0xAC, 0x0000_001f);
+    kb_wr(bar1, KB_INST + 0xE8, chan_id);
+    kb_wr(bar1, KB_INST + 0xB8, 0xf800_0000);
+}
+
+/// Dump the first 8 dwords of the instance block — the M2-STOP deliverable (the brief: "the
+/// full instance-block dump in the doc").
+fn kb_dump_inst(bar1: usize) {
+    for row in 0..4 {
+        let b = KB_INST + row * 0x20;
+        serial_println!(
+            "[ce] instblk off={:03X} [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+            row * 0x20,
+            kb_rd(bar1, b), kb_rd(bar1, b + 4), kb_rd(bar1, b + 8), kb_rd(bar1, b + 12),
+            kb_rd(bar1, b + 16), kb_rd(bar1, b + 20), kb_rd(bar1, b + 24), kb_rd(bar1, b + 28)
+        );
+    }
+}
+
+/// Submit one gpfifo entry (a pushbuffer segment of `len_dw` dwords at VRAM offset `KB_PUSH`),
+/// ring the doorbell (USERD IB_PUT), and poll IB_GET with a bounded wait. Returns
+/// `(ib_get, ib_put, advanced, us)`. **[EXT-UNPINNED]** gpfifo entry encoding.
+fn kb_submit(bar0: usize, bar1: usize, len_dw: u32) -> (u32, u32, bool, u64) {
+    // gpfifo entry at index 0: lower = PB addr & ~3, upper = addr_hi | (len_dw << 10).
+    let ent_lo = (KB_PUSH as u32) & 0xFFFF_FFFC;
+    let ent_hi = ((KB_PUSH >> 32) as u32) | (len_dw << 10);
+    kb_wr(bar1, KB_GPFIFO + 0, ent_lo);
+    kb_wr(bar1, KB_GPFIFO + 4, ent_hi);
+
+    let get_pre = kb_rd(bar1, KB_USERD + USERD_IB_GET);
+    // Doorbell: advance IB_PUT to 1 (one gpfifo entry queued) and read it back.
+    let put_rb = kb_wr(bar1, KB_USERD + USERD_IB_PUT, 1);
+    // Kick the runlist so the scheduler can pick the channel up (the fifo leg's path).
+    let _ = kb_mmio(bar0, 0x2270, (KB_INST as u32) >> 12); // runlist[0].base = inst page
+    let _ = kb_mmio(bar0, 0x2274, 1);                       // submit 1 entry
+
+    // Bounded wait for IB_GET to advance to IB_PUT (the engine fetched our entry).
+    let (ok, us) = kb_wait(|| kb_rd(bar1, KB_USERD + USERD_IB_GET) != get_pre);
+    let get_post = kb_rd(bar1, KB_USERD + USERD_IB_GET);
+    let _ = ok;
+    (get_post, put_rb, get_post != get_pre, us)
+}
+
+/// Fill the source buffer with a known ARGB pattern and return the CPU's own checksum of it.
+/// The destination is zeroed. The checksum is a simple rolling sum — cheap, and enough to tell
+/// a correct copy from a wrong one.
+fn kb_fill_src(bar1: usize) -> u32 {
+    let mut csum: u32 = 0x1357_9BDF;
+    for y in 0..KB_H {
+        for x in 0..KB_W {
+            let px = 0xFF00_0000 | ((x as u32) << 8) | (y as u32) | (((x ^ y) as u32) << 16);
+            let off = KB_SRC + (y * KB_PITCH) + x * KB_BPP;
+            unsafe { core::ptr::write_volatile((bar1 + off) as *mut u32, px) };
+            csum = csum.rotate_left(1) ^ px;
+        }
+    }
+    kb_zero(bar1, KB_DST, KB_BYTES);
+    csum
+}
+
+/// Checksum the destination the GPU wrote, read back through BAR1, with the same rolling sum.
+fn kb_csum_dst(bar1: usize) -> u32 {
+    let mut csum: u32 = 0x1357_9BDF;
+    for y in 0..KB_H {
+        for x in 0..KB_W {
+            let off = KB_DST + (y * KB_PITCH) + x * KB_BPP;
+            let px = unsafe { core::ptr::read_volatile((bar1 + off) as *const u32) };
+            csum = csum.rotate_left(1) ^ px;
+        }
+    }
+    csum
+}
+
+/// `tests kblit` — M2 (channel + fetch witness) then M3 (the blit by checksum).
+pub fn tests_kblit() {
+    let bar0 = CE_BAR0.load(Ordering::Acquire);
+    let bar1 = CE_BAR1.load(Ordering::Acquire);
+    let bar1_size = CE_BAR1_SIZE.load(Ordering::Acquire);
+    let vram = CE_VRAM.load(Ordering::Acquire);
+    if bar0 == 0 || bar1 == 0 {
+        serial_println!(":: KBLIT: engine=none get_advanced=0 sem=skip csum=skip us=0 -> FAIL :: (no GPU context banked; is UNAOS_KEPLER_TAKEOVER on?)");
+        return;
+    }
+    // The scratch window must fit inside the VRAM BAR1 actually exposes.
+    let limit = core::cmp::min(bar1_size, vram);
+    if KB_TOP > limit {
+        serial_println!(":: KBLIT: engine=none get_advanced=0 sem=skip csum=skip us=0 -> FAIL :: (scratch top {:#x} > BAR1/VRAM {:#x}; refused rather than writing out of range)", KB_TOP, limit);
+        return;
+    }
+
+    serial_println!("[ce] KBLIT begin knob=UNAOS_KEPLER_CE scratch={:#x}..{:#x} (VRAM, BAR1-identity KF24)", KB_BASE, KB_TOP);
+
+    // M2 — confirm a live CE base this boot (R2's FALCON-REST gate), then build the channel.
+    let (_r2, falcon_base) = r2_ce_probe(bar0);
+    let engine = match falcon_base {
+        Some(b) => { serial_println!("[ce] CE base FALCON-REST at {:06X} — building the copy channel there", b); "ce0" }
+        None => {
+            serial_println!("[ce] no FALCON-REST CE base this boot — nothing submitted (R2 named none; a channel on a base this boot did not confirm live is the mistake the fence arc made)");
+            serial_println!(":: KBLIT: engine=none get_advanced=0 sem=skip csum=skip us=0 -> FAIL ::");
+            return;
+        }
+    };
+
+    // Enable the copy engine + PFIFO in PMC (readback on the line, M4). [EXT-UNPINNED] bit.
+    let pmc = unsafe { mmio_read(bar0, regs::NV_PMC_ENABLE) };
+    let pmc_rb = kb_mmio(bar0, regs::NV_PMC_ENABLE, pmc | 0x100 | 0x0000_0002);
+    serial_println!("[ce] pmc_enable wrote/read={:08X}/{:08X}", pmc | 0x100 | 0x0000_0002, pmc_rb);
+
+    kb_build_identity_pd(bar1);
+    kb_build_inst(bar1, 1);
+
+    // Zero gpfifo / userd / pushbuffer / semaphore.
+    kb_zero(bar1, KB_GPFIFO, 0x1000);
+    kb_zero(bar1, KB_USERD, 0x1000);
+    kb_zero(bar1, KB_PUSH, 0x1000);
+    kb_zero(bar1, KB_SEM, 0x1000);
+
+    // A minimal first pushbuffer: SET_OBJECT(copy class) only, so the ONLY thing being tested
+    // in M2 is whether the engine fetches. [EXT-UNPINNED] SET_OBJECT = method 0 on subchannel 0.
+    let mut pw = 0usize;
+    let mut push = |v: u32| { kb_wr(bar1, KB_PUSH + pw * 4, v); pw += 1; };
+    push(pb_hdr(0, 0x0000, 1));
+    push(CLASS_COPY);
+    let m2_len = pw as u32;
+
+    let (get1, put1, advanced, us1) = kb_submit(bar0, bar1, m2_len);
+    serial_println!("[ce] get={} put={} advanced={}", get1, put1, if advanced { 1 } else { 0 });
+
+    if !advanced {
+        // THE M2 STOP. The engine never fetched — ten sittings predicted it. The deliverable is
+        // the instance-block dump, not a hack (the brief). No blit is attempted.
+        kb_dump_inst(bar1);
+        serial_println!("[ce] STOP at M2: the copy engine never fetched our gpfifo entry (IB_GET did not move past IB_PUT). This is the KF27 wall on the copy channel; the instance block above is the deliverable. See SHUTOUT-REGISTER §2/§3.");
+        serial_println!(":: KBLIT: engine={} get_advanced=0 sem=skip csum=skip us={} -> FAIL ::", engine, us1);
+        return;
+    }
+
+    // M3 — the blit. Fill the source, zero the dest, build the copy pushbuffer with a semaphore
+    // release, submit, wait on the semaphore (bounded), checksum the dest against the CPU copy.
+    let src_csum = kb_fill_src(bar1);
+    serial_println!("[ce] src filled 256x256 ARGB cpu_csum={:08X}; dst zeroed", src_csum);
+
+    pw = 0;
+    let mut push = |v: u32| { kb_wr(bar1, KB_PUSH + pw * 4, v); pw += 1; };
+    push(pb_hdr(0, 0x0000, 1)); push(CLASS_COPY);
+    push(pb_hdr(0, M_OFFSET_IN_UPPER, 2)); push((KB_SRC >> 32) as u32); push((KB_SRC & 0xFFFF_FFFF) as u32);
+    push(pb_hdr(0, M_OFFSET_OUT_UPPER, 2)); push((KB_DST >> 32) as u32); push((KB_DST & 0xFFFF_FFFF) as u32);
+    push(pb_hdr(0, M_PITCH_IN, 1)); push(KB_PITCH as u32);
+    push(pb_hdr(0, M_PITCH_OUT, 1)); push(KB_PITCH as u32);
+    push(pb_hdr(0, M_LINE_LENGTH_IN, 1)); push(KB_PITCH as u32);
+    push(pb_hdr(0, M_LINE_COUNT, 1)); push(KB_H as u32);
+    push(pb_hdr(0, M_SET_SEM_A, 3)); push((KB_SEM >> 32) as u32); push((KB_SEM & 0xFFFF_FFFF) as u32); push(KB_SEM_MAGIC);
+    push(pb_hdr(0, M_LAUNCH_DMA, 1)); push(LAUNCH_PITCH_PITCH_SEM);
+    let m3_len = pw as u32;
+
+    kb_wr(bar1, KB_SEM, 0); // clear the semaphore before launch
+    let (get2, put2, adv2, _us2) = kb_submit(bar0, bar1, m3_len);
+    serial_println!("[ce] blit submit get={} put={} advanced={}", get2, put2, if adv2 { 1 } else { 0 });
+
+    let (sem_ok, sem_us) = kb_wait(|| kb_rd(bar1, KB_SEM) == KB_SEM_MAGIC);
+    let sem_rb = kb_rd(bar1, KB_SEM);
+    serial_println!("[ce] semaphore wait ok={} rb={:08X} want={:08X} us={}", sem_ok, sem_rb, KB_SEM_MAGIC, sem_us);
+
+    if !sem_ok {
+        serial_println!(":: KBLIT: engine={} get_advanced=1 sem=timeout csum=skip us={} -> FAIL ::", engine, sem_us);
+        return;
+    }
+
+    let dst_csum = kb_csum_dst(bar1);
+    let matched = dst_csum == src_csum;
+    serial_println!("[ce] dst checksum read-back cpu={:08X} gpu_dst={:08X} match={}", src_csum, dst_csum, matched);
+    serial_println!(
+        ":: KBLIT: engine={} get_advanced=1 sem=ok csum={} us={} -> {} ::",
+        engine, if matched { "match" } else { "mismatch" }, sem_us,
+        if matched { "PASS" } else { "FAIL" }
     );
 }

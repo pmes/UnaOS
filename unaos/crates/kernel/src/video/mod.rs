@@ -341,7 +341,7 @@ pub(crate) fn publish_panel_owner(next: PanelOwner, site: &'static str) {
     let prev = PANEL_OWNER.swap(next as u8, Ordering::AcqRel);
     #[cfg(feature = "witness")]
     if prev != next as u8 {
-        serial_println!(
+        crate::bootlog_println!(
             "[panel-owner] panel-ownership-handover from={} to={} site={}",
             PanelOwner::from_u8(prev).name(),
             next.name(),
@@ -361,7 +361,7 @@ pub(crate) fn publish_panel_owner(next: PanelOwner, site: &'static str) {
 /// it did not. The reader wants to count these, not skim past them.
 #[cfg(feature = "witness")]
 pub(crate) fn note_panel_overpaint(site: &'static str) {
-    serial_println!(
+    crate::bootlog_println!(
         "[panel-owner] panel-repaint-over-owner owner={} site={} (whole-surface fill; the owner word is NOT changed)",
         panel_owner().name(),
         site
@@ -467,15 +467,15 @@ pub const PANEL_BG: u32 = 0x001E_1E1E;
 /// [`FrameBuffer`] handle rather than `WRITER` so format and bounds are handled in exactly one
 /// place and no lock is held across the fill.
 pub fn init_panel(base: usize, len: usize, info: FrameBufferInfo) {
-    serial_println!(":: FB Init ::");
-    serial_println!(":: FB Size: {}x{} (stride {}) ::", info.width, info.height, info.stride);
+    crate::bootlog_println!(":: FB Init ::");
+    crate::bootlog_println!(":: FB Size: {}x{} (stride {}) ::", info.width, info.height, info.stride);
     serial_println!(":: FB Format: {:?} ::", info.pixel_format);
 
     let mut surface = FrameBuffer::new();
     surface.init(base, len, info);
     surface.fill_screen(PANEL_BG);
 
-    serial_println!(":: Framebuffer painted #1E1E1E ::");
+    crate::bootlog_println!(":: Framebuffer painted #1E1E1E ::");
 
     // PANELOWN — THIS SITE IS AN OVER-PAINT, NOT A HANDOVER, AND THE FIRST THING THE OWNER WORD
     // MEASURED WAS THAT THE OPPOSITE ASSUMPTION IS FALSE.
@@ -611,7 +611,7 @@ pub fn edid_total_len() -> u16 {
 /// content, which is what this function is here to check.
 pub fn init_edid(block: &[u8; 128], valid: bool, total_len: u16) {
     if !valid {
-        serial_println!(":: video: edid present=0 hdr=- sum=- native=- len=0 ::");
+        crate::bootlog_println!(":: video: edid present=0 hdr=- sum=- native=- len=0 ::");
         return;
     }
 
@@ -638,7 +638,7 @@ pub fn init_edid(block: &[u8; 128], valid: bool, total_len: u16) {
     EDID_TOTAL_LEN.store(total_len, Ordering::Relaxed);
 
     let yn = |b: bool| if b { "OK" } else { "BAD" };
-    serial_println!(
+    crate::bootlog_println!(
         ":: video: edid present=1 hdr={} sum={} native={}x{} pclk_khz={} ext={} len={} ::",
         yn(hdr_ok),
         yn(sum_ok),
@@ -1167,3 +1167,7 @@ pub mod powerui;
 // BRIGHTFLOOR (B312): THE one backlight writer — floor, gmux register, readback. Same gate as brightkeys.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod backlight;
+
+// KCOMP (B321): the compositor's one blitter interface — CpuBlitter (WCPAR inside) today, the Kepler
+// copy engine's GpuBlitter when KBLIT lands. Every compositing build; see the module head.
+pub mod blitter;

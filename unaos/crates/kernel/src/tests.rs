@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use crate::console::Console;
 
 /// Registry capacity — a full table is loud (`:: TESTS: table full … -> FAIL ::`), never silent.
-const CAP: usize = 80; // QUIETBOOT: 48 -> 80, the boot witnesses R80 moved here (flight 19 registered 45).
+const CAP: usize = 128; // QUIETBOOT2: 80 -> 128, the ~20 boot fixtures B325 moved here. // QUIETBOOT: 48 -> 80, the boot witnesses R80 moved here (flight 19 registered 45).
 
 static TABLE: spin::Mutex<[Option<(&'static str, fn())>; CAP]> = spin::Mutex::new([None; CAP]);
 static DEFERRED: AtomicUsize = AtomicUsize::new(0);
@@ -99,7 +99,7 @@ pub fn run(name: Option<&str>) -> usize {
         return 0;
     }
     let (p0, f0) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
-    *FAILED.lock() = [None; 16];
+    *FAILED.lock() = [None; 16]; skip_reset();
     let mut ran = 0usize;
     let mut i = 0usize;
     loop {
@@ -110,14 +110,14 @@ pub fn run(name: Option<&str>) -> usize {
         if let Some(want) = name { if want != n { continue; } }
         serial_println!(":: TESTS: run {} ::", n);
         *CUR.lock() = n;
-        f();
+        let vb = verdicts(); f(); skip_note(n, vb);
         *CUR.lock() = "";
         ran += 1;
     }
     let (p, f) = (PASS.load(Ordering::Relaxed).wrapping_sub(p0), FAIL.load(Ordering::Relaxed).wrapping_sub(f0));
     let mut names = alloc::string::String::new();
     for n in FAILED.lock().iter().flatten() { if !names.is_empty() { names.push(','); } names.push_str(n); }
-    serial_println!(":: TESTS: ran={} pass={} fail={} failed=[{}] ::", ran, p, f, names);
+    serial_println!(":: TESTS: ran={} pass={} fail={} failed=[{}] skipped=[{}] ::", ran, p, f, names, skipped_names());
     RUNNING.store(false, Ordering::Release);
     ran
 }
@@ -132,7 +132,9 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); // LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_ring3win();
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); // FILETYPE (B307): `tests filetype`.
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet();
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8();
+    crate::video::blitter::ensure_tests(); crate::prof::ensure_tests(); // KCOMP (B321): `tests blitter`. PROFILE (B331): `tests prof`.
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); #[cfg(target_arch = "x86_64")] crate::execname::ensure(); // EXECNAME (B322): `tests exec`.
     if args.first().copied() == Some("list") {
         let t = TABLE.lock();
         for e in t.iter().flatten() { console.println(e.0); }
@@ -148,14 +150,14 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     } else {
         let mut names = alloc::string::String::new();
         for n in FAILED.lock().iter().flatten() { if !names.is_empty() { names.push(','); } names.push_str(n); }
-        console.println_styled(if f == 0 { crate::video::theme::TERM_GREEN } else { crate::video::theme::TERM_RED }, &format!("tests: ran={} pass={} fail={} failed=[{}]", ran, p, f, names));
+        console.println_styled(if f == 0 { crate::video::theme::TERM_GREEN } else { crate::video::theme::TERM_RED }, &format!("tests: ran={} pass={} fail={} failed=[{}] skipped=[{}]", ran, p, f, names, skipped_names()));
     }
 }
 
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
-    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } #[cfg(all(feature = "vein", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static VN: AtomicBool = AtomicBool::new(false); if !VN.swap(true, Ordering::AcqRel) { register("vein", crate::arch::syscall::vein_selftest); } } ensure_attr(); // VEINCORE (B304): `tests vein`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
-    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
         static LDONE: AtomicBool = AtomicBool::new(false);
@@ -213,8 +215,8 @@ fn ensure_attr() {
     if !DONE.swap(true, Ordering::AcqRel) { register("attr", crate::fs::attrsys::selftest); }
 }
 
-/// LUMENBIN (B305): register `lumen` (the LUMEN.BIN chat-window fixture, crate::lumen) exactly once on a
-/// `lumen` build; off x86 `wc` the fixture prints SKIP with its reason, never a pin.
+/// LUMENAPP (B323): register `lumen` (the ring-3-free LUMEN.ELF fixture, crate::lumen) exactly once on a
+/// `lumen` build; on aarch64 (no LUMEN.ELF image yet) the fixture prints SKIP with its reason, never a pin.
 fn ensure_lumen() {
     #[cfg(feature = "lumen")]
     {
@@ -228,12 +230,12 @@ fn ensure_netring3() {
     #[cfg(feature = "netring3")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("net", crate::netring3::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("net", crate::netring3::selftest); register("nethang", crate::netring3::nethang_selftest); } // NETHANG: `tests nethang` (code first)
     }
 }
 
 /// RING3WIN (B316): register `tests ring3win` exactly once on x86 (the ELF window is x86's this arc; the
-/// fixture SKIPs when the volume carries no `/apps/BIG.BIN`).
+/// fixture SKIPs when the volume carries no `/apps/BIG.ELF`).
 fn ensure_ring3win() {
     #[cfg(target_arch = "x86_64")]
     {
@@ -263,7 +265,7 @@ pub fn defer(name: &'static str, f: fn()) -> bool {
 /// Kepler/KFBIND/KDHEAD, iGPU, BT). This arc takes the census + witness ~290 out, so the same knob line
 /// should read ~2420; 2500 leaves room for enumeration variance and FAILS if a census or a witness creeps
 /// back. A boot without the recon knobs reads ~500 and the bound tightens with the knob line.
-pub const QUIETBOOT_BOUND: u64 = 2500;
+pub const QUIETBOOT_BOUND: u64 = 250; // QUIETBOOT2 (B325): the seat's bound (FLIGHT20) — the sweep moves the fixtures, walks and prose; the boot prints its stages and refusals.
 
 /// `tests quietboot`: `:: QUIETBOOT: lines=<n> bound=<B> census=<bits> -> PASS|FAIL|SKIP ::`, naming the
 /// eight loudest tags when over. SKIP on a build that runs its fixtures at boot or arms every census
@@ -311,4 +313,61 @@ fn ensure_usbnet() {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("usbnet", crate::drivers::xhci::usbnet::selftest); }
     }
+}
+
+/// KVBLANK8 (B318): register `tests kvblank8` (the vblank interrupt path, 1 s, `lost_at=`) exactly once on a Kepler
+/// vblank build; no GK107 prints SKIP, never a pin.
+fn ensure_kvblank8() {
+    #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("kvblank8", crate::drivers::gpu::kepler_vblank::kvblank8_selftest); }
+    }
+}
+
+/// GEN7R8 (B320, R80): register `tests gen7` — the Ivy Bridge ladder's rung R8 (the BCS blit at the
+/// panel's geometry into scratch) — exactly once, on a `gen7r8` (`UNAOS_IVB3D_R8`) build. The boot only
+/// stashes R8's inputs at R7's tail; this fixture runs the rung and prints `:: GEN7R8: … ::`.
+fn ensure_gen7() {
+    #[cfg(all(target_arch = "x86_64", feature = "gen7r8"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("gen7", crate::drivers::gpu::gen7::r8_test); }
+    }
+}
+
+// TESTFIX4 (B330) — TAIL-APPENDED. `skipped=[…]` on the summary: a fixture that RAN and printed no `-> PASS`
+// and no `-> FAIL` verdict (its SKIP line, or nothing) is named there, so a read of the summary tells SKIP from
+// FAIL without the log. Counted from the same verdict tap as pass/fail, before and after the fixture.
+static SKIPPED: spin::Mutex<[Option<&'static str>; CAP]> = spin::Mutex::new([None; CAP]);
+
+fn verdicts() -> (u32, u32) { (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed)) }
+
+fn skip_reset() { *SKIPPED.lock() = [None; CAP]; }
+
+fn skip_note(n: &'static str, before: (u32, u32)) {
+    if verdicts() != before { return; }
+    let mut sk = SKIPPED.lock();
+    if !sk.iter().flatten().any(|x| *x == n) {
+        if let Some(slot) = sk.iter_mut().find(|x| x.is_none()) { *slot = Some(n); }
+    }
+}
+
+fn skipped_names() -> alloc::string::String {
+    let mut s = alloc::string::String::new();
+    for n in SKIPPED.lock().iter().flatten() { if !s.is_empty() { s.push(','); } s.push_str(n); }
+    s
+}
+
+/// QUIETBOOT2 (B325, R80) — [`defer`] for a fixture that sits on a path the boot passes MANY times (a service
+/// pass, a paint): the caller's own `latch` makes every call after the first one relaxed swap, no table scan.
+/// Same answer as `defer`: `false` (run the body) under `tests-at-boot` or while `tests` is running it.
+pub fn defer_fast(name: &'static str, f: fn(), latch: &AtomicBool) -> bool {
+    if cfg!(feature = "tests-at-boot") || RUNNING.load(Ordering::Acquire) {
+        return false;
+    }
+    if !latch.swap(true, Ordering::AcqRel) {
+        defer(name, f);
+    }
+    true
 }

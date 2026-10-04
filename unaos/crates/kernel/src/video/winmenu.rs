@@ -1331,7 +1331,7 @@ pub fn press_at(x: i32, y: i32) -> bool {
     // would have declined every press on the app title and shipped an unreachable feature that
     // type-checked. The boot that pays nothing is still the boot with no bar and no focused window,
     // which is what the second load answers.
-    if x < 0 || y < 0 || (LIVE.load(Ordering::Relaxed) == 0 && APP_OWNER.load(Ordering::Relaxed) == wm::WIN_NONE) {
+    if x < 0 || y < 0 || (LIVE.load(Ordering::Relaxed) == 0 && APP_OWNER.load(Ordering::Relaxed) == wm::WIN_NONE && !super::winlist::desktop_hidden()) { // TESTFIX4 (B330): Show Desktop leaves no menus and no focus, and `bar_boxes` keeps the Window box up for the way back; the press must reach it (boot 20 WINDOWLIST show_desktop_ok=false)
         return false;
     }
     let (px, py) = (x as usize, y as usize);

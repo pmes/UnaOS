@@ -320,7 +320,7 @@ pub const ROWS_FNV: u64 = 0x2c52_5bfd_b49d_f67d;
 /// `wm::crispy_witness`'s): the metal image is built without the `witness` feature, so a gated line
 /// is absent from the only artefact that matters. Cost is one bounded serial line per boot.
 fn witness(r: &[u32]) {
-    serial_println!(
+    crate::bootlog_println!(
         "[ceramic] derived=peter-2026-08-09 algo=brushed-1d grain_oct={} pitch={} grain_amp_q16={} curve_amp_q16={} ctrl_gain_q16={} seed={:#010x} rows={} hash={:#018x}",
         GRAIN_OCTAVES,
         GRAIN_PITCH,

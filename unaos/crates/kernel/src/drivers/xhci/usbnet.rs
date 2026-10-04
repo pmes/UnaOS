@@ -242,6 +242,7 @@ pub fn note_config_header(slot: u8, cfg_value: u8) {
     }
     CFG_VALUE.store(cfg_value, Ordering::Relaxed);
     CTRL_SEEN.store(false, Ordering::Relaxed);
+    FIRST_IN.store(0, Ordering::Relaxed); FIRST_OUT.store(0, Ordering::Relaxed); // USBNET7: the first-bulk memory is per walk
     RNDIS_SEEN.store(false, Ordering::Relaxed);
 }
 
@@ -486,6 +487,7 @@ pub fn deliver(frame: &[u8]) {
     if RXQ.lock().push(frame) {
         RX_FRAMES.fetch_add(1, Ordering::Relaxed);
         note_ethertype(frame);
+        let _ = FIRST_FRAME_AT.compare_exchange(0, crate::arch::ms().max(1), Ordering::Relaxed, Ordering::Relaxed); // USBNET7
     } else {
         RX_DROP.fetch_add(1, Ordering::Relaxed);
     }
@@ -732,10 +734,10 @@ fn rollup() {
     }
     REPORTED.store(total, Ordering::Relaxed); if !crate::census::on(crate::census::USBNET) { return; } // QUIETBOOT (R80): a census, OFF until `census start`.
     serial_println!(
-        ":: USBNET: rx={} tx={} rx_drop={} tx_drop={} errors={} rx_ok={} rx_crc={} rx_drop_err={} rx_short={} rx_chip_drop={} ::",
+        ":: USBNET: rx={} tx={} rx_drop={} tx_drop={} errors={} rx_ok={} rx_crc={} rx_drop_err={} rx_short={} rx_chip_drop={} rx_xfers={} rx_zlp={} rx_arms={} ::",
         RX_FRAMES.load(Ordering::Relaxed), TX_FRAMES.load(Ordering::Relaxed),
         RX_DROP.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed), ERRORS.load(Ordering::Relaxed),
-        RX_OK.load(Ordering::Relaxed), RX_CRC.load(Ordering::Relaxed), RX_DROP_ERR.load(Ordering::Relaxed), RX_SHORT.load(Ordering::Relaxed), RX_CHIP_DROP.load(Ordering::Relaxed)
+        RX_OK.load(Ordering::Relaxed), RX_CRC.load(Ordering::Relaxed), RX_DROP_ERR.load(Ordering::Relaxed), RX_SHORT.load(Ordering::Relaxed), RX_CHIP_DROP.load(Ordering::Relaxed), RX_XFERS.load(Ordering::Relaxed), RX_ZLP.load(Ordering::Relaxed), RX_ARMS.load(Ordering::Relaxed)
     );
 }
 
@@ -843,13 +845,13 @@ pub fn witness(bus: &str, slot: u8) {
     let m = mac();
     let ok = m.iter().any(|&b| b != 0);
     serial_println!(
-        ":: USBNET: bus={} slot={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} speed={} usb={} rx={} tx={} rx_drop={} tx_drop={} errors={} rx_ok={} rx_crc={} rx_drop_err={} rx_short={} rx_chip_drop={} buf={} re={} -> {} ::",
+        ":: USBNET: bus={} slot={} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} speed={} usb={} rx={} tx={} rx_drop={} tx_drop={} errors={} rx_ok={} rx_crc={} rx_drop_err={} rx_short={} rx_chip_drop={} rx_xfers={} rx_zlp={} rx_arms={} buf={} re={} -> {} ::",
         bus, slot, m[0], m[1], m[2], m[3], m[4], m[5],
         if LINK.load(Ordering::Relaxed) { "up" } else { "down" }, SPEED_MBPS.load(Ordering::Relaxed), usb_name(),
         RX_FRAMES.load(Ordering::Relaxed), TX_FRAMES.load(Ordering::Relaxed),
         RX_DROP.load(Ordering::Relaxed), TX_DROP.load(Ordering::Relaxed), ERRORS.load(Ordering::Relaxed),
         RX_OK.load(Ordering::Relaxed), RX_CRC.load(Ordering::Relaxed), RX_DROP_ERR.load(Ordering::Relaxed), RX_SHORT.load(Ordering::Relaxed),
-        RX_CHIP_DROP.load(Ordering::Relaxed), rx_len(), (MEDIUM_RB.load(Ordering::Relaxed) >> 8) & 1,
+        RX_CHIP_DROP.load(Ordering::Relaxed), RX_XFERS.load(Ordering::Relaxed), RX_ZLP.load(Ordering::Relaxed), RX_ARMS.load(Ordering::Relaxed), rx_len(), (MEDIUM_RB.load(Ordering::Relaxed) >> 8) & 1,
         if ok { "PASS" } else { "FAIL" }
     );
 }
@@ -944,6 +946,7 @@ pub fn selftest() {
     let skip = if !is_up() { Some("no-dongle") } else if kind() == KIND_AX88179 && !link_up() { Some("no-link") } else { None };
     if let Some(r) = skip {
         serial_println!(":: USBNET6: chip={} rx_ctl={:#06x} mfb=qctrl-buf{} frames=0 dropped=0 first_ethertype=none reason={} -> SKIP ::", chip, rxctl, mfb, r);
+        serial_println!(":: USBNET7: rx_ok=0 first_frame_ms=none ethertype=none reason={} -> SKIP ::", r);
         return;
     }
     witness("xhci", slot());
@@ -952,8 +955,10 @@ pub fn selftest() {
     let mut buf = [0u8; FRAME_CAP];
     let mut frames = 0u32;
     let mut first: Option<u16> = None;
+    let mut first_at = 0u64;
     while crate::arch::ms().saturating_sub(t0) < 5000 {
         if let Some(n) = raw_rx(&mut buf) {
+            if frames == 0 { first_at = crate::arch::ms(); } // USBNET7: when the first frame of the run arrived
             frames += 1;
             if first.is_none() && n >= 14 { first = Some(u16::from_be_bytes([buf[12], buf[13]])); }
             if frames >= 4 { break; }
@@ -970,8 +975,84 @@ pub fn selftest() {
         RX_PAD_HDR.load(Ordering::Relaxed), RX_OK.load(Ordering::Relaxed), leased() as u8
     );
     serial_println!(":: USBNET6: chip={} rx_ctl={:#06x} mfb=qctrl-buf{} frames={} dropped={} first_ethertype={}{} -> {} ::", chip, rxctl, mfb, frames, dropped, et, why, v);
+    usbnet7_verdict(t0, first_at, first);
 }
 #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
 fn leased() -> bool { crate::smolnet::leased() }
 #[cfg(not(all(feature = "smolnet", target_arch = "x86_64")))]
 fn leased() -> bool { false }
+
+// ── USBNET7 (B328) ──────────────────────────────────────────────────────────────────────────────────
+// Boot 20 received NOTHING after USBNET6 and the wire could not say whether the armed bulk-IN TD ever completed: a completion
+// under 4 bytes went nowhere, the arm itself printed nothing. These count every IN completion, every empty one, every arm, and
+// keep the FIRST bulk endpoint of each direction from the descriptor walk (the walk keeps the last: OUT 0x05 instead of 0x03).
+static RX_XFERS: AtomicU64 = AtomicU64::new(0);
+static RX_ZLP: AtomicU64 = AtomicU64::new(0);
+static RX_ARMS: AtomicU64 = AtomicU64::new(0);
+static FIRST_FRAME_AT: AtomicU64 = AtomicU64::new(0);
+/// The first bulk IN / OUT endpoint of the current walk: `addr << 16 | mps`, 0 = none yet.
+static FIRST_IN: AtomicU32 = AtomicU32::new(0);
+static FIRST_OUT: AtomicU32 = AtomicU32::new(0);
+/// The RX_BULKIN_QCTRL tuple written at bring-up, rewritten at link-up.
+static QCTRL: [AtomicU8; 5] = [const { AtomicU8::new(0) }; 5];
+
+/// Descriptor walk: one bulk endpoint of the link's slot. First of each direction wins.
+pub fn note_bulk_ep(slot: u8, addr: u8, mps: u16) {
+    if SLOT.load(Ordering::Relaxed) != slot || STATE.load(Ordering::Relaxed) >= ST_CONFIGURED {
+        return;
+    }
+    let cell = if addr & 0x80 != 0 { &FIRST_IN } else { &FIRST_OUT };
+    let _ = cell.compare_exchange(0, ((addr as u32) << 16) | mps as u32, Ordering::Relaxed, Ordering::Relaxed);
+}
+/// The bulk pair the link configures: for the AX88179 the FIRST of each direction (Linux `usbnet_get_endpoints`: IN 0x82,
+/// OUT 0x03 — the part's descriptor also lists a bulk OUT 0x05, which the walk's last-wins picked); ECM keeps the walk's pair.
+pub fn first_bulk(slot: u8, walk_in: Option<(u8, u16)>, walk_out: Option<(u8, u16)>) -> (Option<(u8, u16)>, Option<(u8, u16)>) {
+    if SLOT.load(Ordering::Relaxed) != slot || kind() != KIND_AX88179 {
+        return (walk_in, walk_out);
+    }
+    let dec = |v: u32| if v == 0 { None } else { Some(((v >> 16) as u8, (v & 0xffff) as u16)) };
+    (dec(FIRST_IN.load(Ordering::Relaxed)).or(walk_in), dec(FIRST_OUT.load(Ordering::Relaxed)).or(walk_out))
+}
+pub fn set_qctrl(q: &[u8; 5]) {
+    for i in 0..5 { QCTRL[i].store(q[i], Ordering::Relaxed); }
+}
+pub fn qctrl() -> [u8; 5] {
+    let mut q = [0u8; 5];
+    for i in 0..5 { q[i] = QCTRL[i].load(Ordering::Relaxed); }
+    q
+}
+/// One bulk-IN completion of `n` bytes (success / short packet).
+pub fn note_xfer(n: usize) {
+    RX_XFERS.fetch_add(1, Ordering::Relaxed);
+    if n < 4 { RX_ZLP.fetch_add(1, Ordering::Relaxed); }
+}
+/// One bulk-IN TD posted. The first prints `[usbnet] rx_arm n=<queued> ep=<addr> mps=<n>` once (bring-up, not per frame).
+pub fn note_arm(queued: u32, ep: u8) {
+    if RX_ARMS.fetch_add(1, Ordering::Relaxed) == 0 {
+        serial_println!("[usbnet] rx_arm n={} ep={:#04x} mps={} buf={}", queued, ep, IN_MPS.load(Ordering::Relaxed), rx_len());
+    }
+}
+/// `tests usbnet`, USBNET7: did ANY frame arrive within 3 s of the fixture's start?
+/// `:: USBNET7: rx_ok=<n> first_frame_ms=<n> ethertype=<0x....> -> PASS|FAIL ::`; on FAIL the bulk-IN ring once.
+fn usbnet7_verdict(t0: u64, first_at: u64, first: Option<u16>) {
+    let ms = if first_at != 0 { Some(first_at.saturating_sub(t0)) } else { None };
+    let pass = matches!(ms, Some(m) if m <= 3000);
+    let et = match first { Some(e) => alloc::format!("{:#06x}", e), None => alloc::string::String::from("none") };
+    let fms = match ms { Some(m) => alloc::format!("{}", m), None => alloc::string::String::from("none") };
+    serial_println!(":: USBNET7: rx_ok={} first_frame_ms={} ethertype={} -> {} ::", RX_OK.load(Ordering::Relaxed), fms, et, if pass { "PASS" } else { "FAIL" });
+    if pass { return; }
+    let st = match crate::drivers::xhci::claim() { Ok(x) => x.usbnet_ring_state(), Err(_) => None };
+    let pending = (ARMED.load(Ordering::Relaxed) && !DONE.load(Ordering::Relaxed)) as u8;
+    match st {
+        Some((deq, enq, cyc, eps)) => serial_println!(
+            "[usbnet] ring deq={:#x} enq={} cycle={} pending={} ep_state={} trb={:#x} xfers={} zlp={} arms={} first_frame_at={}",
+            deq, enq, cyc as u8, pending, eps, TRB_PHYS.load(Ordering::Relaxed), RX_XFERS.load(Ordering::Relaxed), RX_ZLP.load(Ordering::Relaxed),
+            RX_ARMS.load(Ordering::Relaxed), FIRST_FRAME_AT.load(Ordering::Relaxed)
+        ),
+        None => serial_println!(
+            "[usbnet] ring deq=? enq=? cycle=? pending={} ep_state=? trb={:#x} xfers={} zlp={} arms={} first_frame_at={}",
+            pending, TRB_PHYS.load(Ordering::Relaxed), RX_XFERS.load(Ordering::Relaxed), RX_ZLP.load(Ordering::Relaxed),
+            RX_ARMS.load(Ordering::Relaxed), FIRST_FRAME_AT.load(Ordering::Relaxed)
+        ),
+    }
+}

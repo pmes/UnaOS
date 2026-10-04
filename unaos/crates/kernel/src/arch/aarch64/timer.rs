@@ -189,7 +189,7 @@ pub fn on_tick() {
             super::percpu::this_cpu().cpu_index,
             local + 1
         );
-    } #[cfg(all(feature = "tegra", feature = "bsptick"))] bsptick_witness(); #[cfg(feature = "virt_tick")] virttick_witness(); // ORIN-BSPTICK + VIRTPREEMPT (both appended to this line per the Location-shift convention; see file tail). ORIN-BSPTICK (appended to this line per the Location-shift convention; see file tail)
+    } #[cfg(all(feature = "tegra", feature = "bsptick"))] bsptick_witness(); #[cfg(feature = "virt_tick")] virttick_witness(); crate::prof::on_tick_arm(); // ORIN-BSPTICK + VIRTPREEMPT (both appended to this line per the Location-shift convention; see file tail). ORIN-BSPTICK (appended to this line per the Location-shift convention; see file tail)
 }
 
 /// Monotonic count of timer ticks since boot.

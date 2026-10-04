@@ -352,7 +352,7 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // refuses honestly and by name, exactly as `top` and `batmon` (registered `Always` since they
     // were written) do. The word exists on every UnaOS; the platform decides the answer.
     ("burst", Avail::Always), ("simmer", Avail::Always),
-    ("tste", Avail::Always), ("selftest", Avail::Always), ("tests", Avail::Always), ("census", Avail::Always), ("src", Avail::Always), // SRCEXTRACT: arm is cfg(selfhost), registered Always like `fetch`
+    ("tste", Avail::Always), ("selftest", Avail::Always), ("tests", Avail::Always), ("census", Avail::Always), ("prof", Avail::Always), ("src", Avail::Always), // SRCEXTRACT: arm is cfg(selfhost), registered Always like `fetch`
     ("ps", Avail::Always), ("top", Avail::Always), ("batmon", Avail::Always),
     ("dmesg", Avail::Always), ("shutdown", Avail::Always), ("off", Avail::Always),
     // ORIN-REBOOT (baton orin-6 5.1 + the cold-boot ruling 2026-08-25): the arch-neutral
@@ -364,9 +364,9 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // decides what it does, never whether the word exists.
     ("reboot", Avail::Always), // HELPVERB (R75): `man` is NOT a table row — help.rs intercepts `help`/`man`/`--help` BEFORE the planner (shell.rs `help::intercept`), so a row would be a verb with no arm (GATE-VERBS, merge9 fold). (was: `man` is the help-in-a-window verb (help.rs intercepts it); the five verbs HELPVERB also registered (trash/shortcuts/play/linux/shot) live on the DONE2 row below, once (merge9 fold: the duplicate rows failed `the_table_has_no_duplicates`). LINE-NEUTRAL fold.
     // FILEVIEW `view` / TEXTEDIT `edit`: ring arms are desktop-gated (wc or desktop_firmware); registered Always on the `dns` precedent (a gated-off arm falls through to bare-name launch, never a typo refusal).
-    ("view", Avail::Always), ("edit", Avail::Always), ("activity", Avail::Always), ("settings", Avail::Always), ("trash", Avail::Always), ("shortcuts", Avail::Always), ("play", Avail::Always), ("linux", Avail::Always), ("shot", Avail::Always), ("pref", Avail::Always), ("battery", Avail::Always), ("vein", Avail::Always), // VEINCORE (B304): `vein` (cfg-gated arm `vein`, registered Always like `src`). POWERMENU: `battery` (cfg-gated arm, registered Always like `src`). PREFS (B300): Principia's store, ungated arm; ACTIVITY (R75); TRASH/SHORTCUTS/PLAYWAV/LINUXABI/SHOTREGION: arms are cfg-gated, registered Always like `src`
+    ("view", Avail::Always), ("edit", Avail::Always), ("activity", Avail::Always), ("settings", Avail::Always), ("trash", Avail::Always), ("shortcuts", Avail::Always), ("play", Avail::Always), ("linux", Avail::Always), ("shot", Avail::Always), ("pref", Avail::Always), ("battery", Avail::Always), // POWERMENU: `battery` (cfg-gated arm, registered Always like `src`). PREFS (B300): Principia's store, ungated arm; ACTIVITY (R75); TRASH/SHORTCUTS/PLAYWAV/LINUXABI/SHOTREGION: arms are cfg-gated, registered Always like `src`
     // processes
-    ("run", Avail::Proc), ("bg", Avail::Proc), ("storm", Avail::Proc), ("lumen", Avail::Proc), // LUMENBIN: `lumen` = `bg /apps/LUMEN.BIN`, so `bg`'s availability
+    ("run", Avail::Proc), ("bg", Avail::Proc), ("storm", Avail::Proc), // EXECNAME (B322, R82): the `lumen` row is GONE with its shortcut arm — `lumen` is the program LUMEN.ELF, reached by bare name like every program
     ("jobs", Avail::Proc), ("kill", Avail::Proc),
     // BASICS (orin 17, Peter: "some of the commands were 1 off tests we need basic commands
     // back"). The everyday words a prompt is unusable without. Every one is `Plan::Host` and not
@@ -581,6 +581,9 @@ pub fn plan(line: &str, facts: &Facts, vol: &mut dyn Volume) -> Plan {
             return Plan::Exec { typed: word.to_string(), name };
         }
     }
+    if let Some(line) = gated_off_line(canon) {
+        return Plan::Say(Message::TerminalOutput(line)); // GATED-OFF (TESTFIX4, B330): a verb of other builds, named with its knob
+    }
     Plan::Say(Message::TerminalError(
         "Unknown command. Type 'help' for assistance.".to_string(),
     ))
@@ -676,16 +679,16 @@ pub fn help(facts: &Facts) -> String {
         say!("APPS:     v3d (replay the visible GPU graphics battery)");
     }
     if facts.proc_verbs {
-        say!("PROC:     bg <path> (background), jobs (list+reap), kill <pid>");
+        say!("PROC:     bg <path> / run <path> (force background / foreground), jobs (list+reap), kill <pid>");
     }
     // BARENAME (PARITY 6.6a): keyed off `exec`, the fact these two lines actually describe, not
     // off `x86`, the arch that happened to be the only one carrying it. A help line that names a
     // capability must be gated on the capability.
     if facts.exec {
-        say!("          <name.elf>  (just type it: vug.elf runs VUG.ELF in a window, prompt returns)");
+        say!("          <name>      (just type it: lumen opens its window and the prompt returns; net runs, then prints its exit)");
         // BARE-NAME (M1): the elision is a resolution rule, so it is stated
         // where the launch rule is stated. `.elf` stays visible in `ls`.
-        say!("          <name>      (the .elf is optional: vug finds VUG.ELF; ls still shows VUG.ELF)");
+        say!("          the .elf is optional (lumen finds LUMEN.ELF); the program says how it runs: a window or a server detaches, else foreground");
     }
     say!("POWER:    reboot (warm reboot), shutdown|off (power off, cold-boot-ready) - via the platform firmware");
     // RELICS (R26 clause 1): `netinfo` is `ifconfig` and not `ip`, and the OUTPUT is the reason.
@@ -1038,5 +1041,310 @@ mod tests {
         // The process verbs follow `proc_verbs`, not the arch.
         assert!(!is_verb("storm", &Facts::bare()));
         assert!(is_verb("storm", &Facts { proc_verbs: true, ..Facts::bare() }));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EXECNAME (rmbp-ledger B322, RULINGS R82): HOW a resolved program is launched
+// ---------------------------------------------------------------------------
+//
+// Peter, 2026-10-04: "nobody wants to type bg." A bare name that `resolve_exec` found is launched with
+// no verb, and the PROGRAM says how: an ELF note its own link emits (`una_abi::AppNote`, section
+// `.note.unaos.app`). The parse lives here, in the shell core both rings link, so the x86 and aarch64
+// shells (and the dock, which dispatches the same line) cannot disagree, and the host proves it.
+// The three constants are the `una_abi` ones (this crate takes no dependencies); the kernel asserts the
+// two agree at compile time (`arch/x86_64/elf.rs`).
+
+/// `una_abi::APP_NOTE_NAME`: the note owner, NUL included (namesz = 6).
+pub const APP_NOTE_NAME: &[u8] = b"UnaOS\0";
+/// `una_abi::APP_NOTE_TYPE`.
+pub const APP_NOTE_TYPE: u32 = 1;
+/// `una_abi::APP_FLAG_WINDOWED`: the program opens a window.
+pub const APP_FLAG_WINDOWED: u32 = 1 << 0;
+/// `una_abi::APP_FLAG_RESIDENT`: the program stays running to serve (a bus fulfiller).
+pub const APP_FLAG_RESIDENT: u32 = 1 << 1;
+
+/// What a bare-name launch does with a program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    /// The `bg` path: spawn, title the window, claim a job row, give the prompt back.
+    Detach,
+    /// The `run` path: run it, wait (bounded), print its exit status.
+    Foreground,
+}
+
+/// The rule (R82): a program that makes a window, or that stays to serve, detaches; anything else runs
+/// in the foreground. Flags 0 (no note) is the foreground fallback.
+pub fn launch_mode(flags: u32) -> LaunchMode {
+    if flags & (APP_FLAG_WINDOWED | APP_FLAG_RESIDENT) != 0 {
+        LaunchMode::Detach
+    } else {
+        LaunchMode::Foreground
+    }
+}
+
+fn le16(b: &[u8], o: usize) -> Option<u16> {
+    let s = b.get(o..o.checked_add(2)?)?;
+    Some(u16::from_le_bytes([s[0], s[1]]))
+}
+fn le32(b: &[u8], o: usize) -> Option<u32> {
+    let s = b.get(o..o.checked_add(4)?)?;
+    Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+fn le64(b: &[u8], o: usize) -> Option<usize> {
+    let s = b.get(o..o.checked_add(8)?)?;
+    usize::try_from(u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])).ok()
+}
+fn align4(n: usize) -> Option<usize> {
+    n.checked_add(3).map(|v| v & !3)
+}
+
+/// Walk one note area `[off, off+len)` of the image; the flags of the first UnaOS launch note, if any.
+fn walk_notes(b: &[u8], off: usize, len: usize) -> Option<u32> {
+    let area = b.get(off..off.checked_add(len)?)?;
+    let mut i = 0usize;
+    while i.checked_add(12)? <= area.len() {
+        let namesz = le32(area, i)? as usize;
+        let descsz = le32(area, i + 4)? as usize;
+        let ntype = le32(area, i + 8)?;
+        let name_at = i + 12;
+        let desc_at = name_at.checked_add(align4(namesz)?)?;
+        let next = desc_at.checked_add(align4(descsz)?)?;
+        if next > area.len() {
+            return None; // a record that runs off its area: malformed, stop (never index past it)
+        }
+        if ntype == APP_NOTE_TYPE && descsz >= 4 && area.get(name_at..name_at + namesz) == Some(APP_NOTE_NAME) {
+            return le32(area, desc_at);
+        }
+        i = next;
+    }
+    None
+}
+
+/// The launch flags a program image declares in its `.note.unaos.app` note, or `None` when it carries
+/// none (or is not a little-endian ELF64). UNTRUSTED bytes: every read is bounds-checked and every sum
+/// is checked, so a malformed image is `None`, never a panic. Program headers (`PT_NOTE`) are walked
+/// first — they survive `--strip-all` by construction — then section headers (`SHT_NOTE`) for a link
+/// that kept the section but gave it no header.
+pub fn app_note_flags(b: &[u8]) -> Option<u32> {
+    const PT_NOTE: u32 = 4;
+    const SHT_NOTE: u32 = 7;
+    if b.len() < 64 || b[0..4] != [0x7F, b'E', b'L', b'F'] || b[4] != 2 || b[5] != 1 {
+        return None;
+    }
+    let (phoff, phent, phnum) = (le64(b, 32)?, le16(b, 54)? as usize, le16(b, 56)? as usize);
+    if phent == 56 {
+        for k in 0..phnum {
+            let ph = phoff.checked_add(k.checked_mul(56)?)?;
+            if le32(b, ph) == Some(PT_NOTE) {
+                if let Some(f) = walk_notes(b, le64(b, ph + 8)?, le64(b, ph + 32)?) {
+                    return Some(f);
+                }
+            }
+        }
+    }
+    let (shoff, shent, shnum) = (le64(b, 40)?, le16(b, 58)? as usize, le16(b, 60)? as usize);
+    if shent == 64 && shoff != 0 {
+        for k in 0..shnum {
+            let sh = shoff.checked_add(k.checked_mul(64)?)?;
+            if le32(b, sh + 4) == Some(SHT_NOTE) {
+                if let Some(f) = walk_notes(b, le64(b, sh + 24)?, le64(b, sh + 32)?) {
+                    return Some(f);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod execname_tests {
+    use super::*;
+    use alloc::vec;
+
+    /// A minimal ELF64 LE image: header, one program header, and the note area at 0x100.
+    fn image(note: &[u8], via_phdr: bool) -> Vec<u8> {
+        let mut b = vec![0u8; 0x200];
+        b[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+        b[4] = 2;
+        b[5] = 1;
+        b[16..18].copy_from_slice(&2u16.to_le_bytes());
+        b[18..20].copy_from_slice(&62u16.to_le_bytes());
+        if via_phdr {
+            b[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+            b[54..56].copy_from_slice(&56u16.to_le_bytes());
+            b[56..58].copy_from_slice(&1u16.to_le_bytes());
+            b[64..68].copy_from_slice(&4u32.to_le_bytes()); // PT_NOTE
+            b[72..80].copy_from_slice(&0x100u64.to_le_bytes());
+            b[96..104].copy_from_slice(&(note.len() as u64).to_le_bytes());
+        } else {
+            b[40..48].copy_from_slice(&0x180u64.to_le_bytes()); // e_shoff
+            b[58..60].copy_from_slice(&64u16.to_le_bytes());
+            b[60..62].copy_from_slice(&1u16.to_le_bytes());
+            b[0x184..0x188].copy_from_slice(&7u32.to_le_bytes()); // SHT_NOTE
+            b[0x198..0x1a0].copy_from_slice(&0x100u64.to_le_bytes());
+            b[0x1a0..0x1a8].copy_from_slice(&(note.len() as u64).to_le_bytes());
+        }
+        b[0x100..0x100 + note.len()].copy_from_slice(note);
+        b
+    }
+
+    fn note(name: &[u8], ntype: u32, flags: u32) -> Vec<u8> {
+        let mut n = Vec::new();
+        n.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        n.extend_from_slice(&4u32.to_le_bytes());
+        n.extend_from_slice(&ntype.to_le_bytes());
+        n.extend_from_slice(name);
+        while n.len() % 4 != 0 {
+            n.push(0);
+        }
+        n.extend_from_slice(&flags.to_le_bytes());
+        n
+    }
+
+    #[test]
+    fn the_note_is_read_by_program_header_and_by_section_header() {
+        let w = note(APP_NOTE_NAME, APP_NOTE_TYPE, APP_FLAG_WINDOWED);
+        assert_eq!(app_note_flags(&image(&w, true)), Some(APP_FLAG_WINDOWED));
+        assert_eq!(app_note_flags(&image(&w, false)), Some(APP_FLAG_WINDOWED));
+        // A foreign note before ours is skipped, ours is still found.
+        let mut two = note(b"GNU\0", 3, 0xdead);
+        two.extend_from_slice(&note(APP_NOTE_NAME, APP_NOTE_TYPE, APP_FLAG_RESIDENT));
+        assert_eq!(app_note_flags(&image(&two, true)), Some(APP_FLAG_RESIDENT));
+    }
+
+    #[test]
+    fn no_note_or_a_bad_one_is_the_foreground_fallback() {
+        assert_eq!(app_note_flags(&image(&[], true)), None);
+        assert_eq!(app_note_flags(&image(&note(b"UnaOX\0", APP_NOTE_TYPE, 1), true)), None);
+        assert_eq!(app_note_flags(&image(&note(APP_NOTE_NAME, 2, 1), true)), None);
+        assert_eq!(app_note_flags(b"\x7fELF"), None);
+        assert_eq!(app_note_flags(&[0u8; 128]), None);
+        // namesz that runs off the area and off the image: None, never a panic.
+        let mut bad = note(APP_NOTE_NAME, APP_NOTE_TYPE, 1);
+        bad[0..4].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        assert_eq!(app_note_flags(&image(&bad, true)), None);
+        // A note area pointing past the end of the image.
+        let mut far = image(&note(APP_NOTE_NAME, APP_NOTE_TYPE, 1), true);
+        far[72..80].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(app_note_flags(&far), None);
+        assert_eq!(launch_mode(app_note_flags(&image(&[], true)).unwrap_or(0)), LaunchMode::Foreground);
+    }
+
+    #[test]
+    fn windowed_and_resident_detach_console_runs_foreground() {
+        assert_eq!(launch_mode(APP_FLAG_WINDOWED), LaunchMode::Detach);
+        assert_eq!(launch_mode(APP_FLAG_RESIDENT), LaunchMode::Detach);
+        assert_eq!(launch_mode(0), LaunchMode::Foreground);
+        assert_eq!(launch_mode(1 << 7), LaunchMode::Foreground); // an unknown bit does not detach
+    }
+
+    #[test]
+    fn the_staged_elf_names_resolve_by_bare_name_and_bin_never_did() {
+        let staged = ["PREFS.ELF", "LUMEN.ELF", "NET.ELF", "BIG.ELF"];
+        let mut v = NameList(&staged);
+        for (w, want) in [("prefs", "PREFS.ELF"), ("lumen", "LUMEN.ELF"), ("net", "NET.ELF"), ("big", "BIG.ELF")] {
+            assert_eq!(resolve_exec(w, &mut v).as_deref(), Some(want), "{w}");
+        }
+        // B322: the old staging name was unreachable by bare name — the reason the `lumen` arm existed.
+        assert_eq!(resolve_exec("lumen", &mut NameList(&["LUMEN.BIN"])), None);
+        // M3: `lumen` is no verb any more — the line plans as Exec, which is what the dock pin dispatches too.
+        let f = Facts { exec: true, proc_verbs: true, x86: true, ..Facts::bare() };
+        assert!(!is_verb("lumen", &f));
+        assert_eq!(plan("lumen", &f, &mut NameList(&staged)), Plan::Exec { typed: "lumen".to_string(), name: "LUMEN.ELF".to_string() });
+        assert_eq!(plan("/apps/LUMEN.ELF", &f, &mut NameList(&["/apps/LUMEN.ELF"])), Plan::Exec { typed: "/apps/LUMEN.ELF".to_string(), name: "/apps/LUMEN.ELF".to_string() });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GATED-OFF (TESTFIX4, rmbp-ledger B330) — a verb this build does not carry, named with its knob
+// ---------------------------------------------------------------------------
+//
+// Boot 20: `install` answered "Unknown command" because the verb is built only with the `installdemo`
+// feature and the line did not carry `UNAOS_INSTALLDEMO=1`. The word is a verb of this OS; it is the BUILD
+// that lacks it. So the core, which already decides "is this a command?", also answers "it is a command on
+// other builds — this knob": one table of the cfg-gated rows of [`HOST_VERBS`] and the arroyo knob that arms
+// each. A program by that name still wins (`plan` asks the resolver first), exactly as for any non-verb word.
+
+/// Every cfg-gated [`HOST_VERBS`] row, with the build knob that carries it.
+pub const GATED_VERBS: &[(&str, &str)] = &[
+    ("install", "UNAOS_INSTALLDEMO=1"),
+    ("login", "UNAOS_LOGIN=1"),
+    ("logout", "UNAOS_LOGIN=1"),
+    ("adduser", "UNAOS_LOGIN=1"),
+    ("passwd", "UNAOS_LOGIN=1"),
+    ("users", "UNAOS_LOGIN=1"),
+    ("deluser", "UNAOS_LOGIN=1"),
+    ("whoami", "UNAOS_LOGIN=1"),
+];
+
+/// The knob of a verb that exists on other builds but is NOT compiled into this one, or `None` (the verb is
+/// here — whatever its platform `Avail` — or it is no gated verb at all).
+pub fn gated_off(word: &str) -> Option<&'static str> {
+    let w = canon_verb(word);
+    let w: &str = &w;
+    if HOST_VERBS.iter().any(|(n, _)| *n == w) {
+        return None;
+    }
+    GATED_VERBS.iter().find(|(n, _)| *n == w).map(|(_, k)| *k)
+}
+
+/// The operator-facing answer for a gated-off verb: `install: verb present on UNAOS_INSTALLDEMO=1 builds only`.
+pub fn gated_off_line(word: &str) -> Option<String> {
+    gated_off(word).map(|k| format!("{}: verb present on {} builds only", canon_verb(word), k))
+}
+
+#[cfg(test)]
+mod gated_tests {
+    use super::*;
+
+    #[test]
+    fn every_gated_row_is_a_cfg_gated_host_verb() {
+        // A GATED_VERBS row never names a core verb, and it is a HOST_VERBS row exactly when its feature is on.
+        for (v, k) in GATED_VERBS {
+            assert!(!CORE_VERBS.contains(v), "{v}");
+            assert!(k.starts_with("UNAOS_") && k.ends_with("=1"), "{k}");
+        }
+        assert_eq!(gated_off("ls"), None);
+        assert_eq!(gated_off("nosuchword"), None);
+        assert_eq!(gated_off("help"), None);
+    }
+
+    #[cfg(not(feature = "installdemo"))]
+    #[test]
+    fn install_without_the_knob_names_the_knob() {
+        let f = Facts { exec: true, proc_verbs: true, x86: true, ..Facts::bare() };
+        assert!(!is_verb("install", &f));
+        assert_eq!(gated_off("INSTALL"), Some("UNAOS_INSTALLDEMO=1"));
+        let want = "install: verb present on UNAOS_INSTALLDEMO=1 builds only".to_string();
+        assert_eq!(gated_off_line("install"), Some(want.clone()));
+        assert_eq!(plan("install", &f, &mut NameList(&[])), Plan::Say(Message::TerminalOutput(want)));
+        // A staged program by that name is still a program.
+        assert_eq!(plan("install", &f, &mut NameList(&["INSTALL.ELF"])), Plan::Exec { typed: "install".to_string(), name: "INSTALL.ELF".to_string() });
+        // An unknown word stays unknown.
+        assert!(matches!(plan("nosuchword", &f, &mut NameList(&[])), Plan::Say(Message::TerminalError(_))));
+    }
+
+    #[cfg(feature = "installdemo")]
+    #[test]
+    fn install_with_the_knob_is_a_host_verb() {
+        let f = Facts { exec: true, proc_verbs: true, x86: true, ..Facts::bare() };
+        assert_eq!(gated_off("install"), None);
+        assert!(matches!(plan("install", &f, &mut NameList(&[])), Plan::Host { .. }));
+    }
+
+    #[cfg(all(feature = "installdemo", feature = "login"))]
+    #[test]
+    fn with_every_knob_every_gated_row_is_carried() {
+        for (v, _) in GATED_VERBS {
+            assert!(HOST_VERBS.iter().any(|(n, _)| n == v), "{v}");
+            assert_eq!(gated_off(v), None);
+        }
+    }
+
+    #[cfg(not(feature = "login"))]
+    #[test]
+    fn login_verbs_without_the_knob_name_the_knob() {
+        assert_eq!(gated_off("whoami"), Some("UNAOS_LOGIN=1"));
     }
 }

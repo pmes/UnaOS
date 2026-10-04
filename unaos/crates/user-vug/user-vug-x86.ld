@@ -88,6 +88,7 @@ PHDRS
        segment, which is what lets that segment start at file offset 0. See the note above. */
     text PT_LOAD FILEHDR PHDRS FLAGS(5);   /* R + X */
     data PT_LOAD FLAGS(6);   /* R + W */
+    note PT_NOTE FLAGS(4);   /* R — EXECNAME: the .note.unaos.app launch declaration */
 }
 
 SECTIONS
@@ -104,6 +105,11 @@ SECTIONS
         *(.text .text.*)
         *(.rodata .rodata.*)
     } :text
+
+    /* EXECNAME (B322, R82): the program's launch declaration (una_abi::AppNote), KEPT here — ahead of the
+       /DISCARD/ *(.note*) line below, and the first matching rule wins — inside the text segment and under
+       its own PT_NOTE header, so the shell finds it by program header after --strip-all. */
+    .note.unaos.app : { KEEP(*(.note.unaos.app)) } :text :note
 
     /* WINX-8: page 3 (0x3000..0x4000) must stay a data/stack page — text ending past 0x3000 would
        turn the image's ONLY RW page RO+X and take both worker stacks with it. This is the same line

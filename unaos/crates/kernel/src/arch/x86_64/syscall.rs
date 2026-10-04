@@ -2555,11 +2555,11 @@ pub fn record_ring3_kill(name: &str, vec: u8, err: u64, cr2: u64) { #[cfg(featur
 /// other arm ignores it, and a program that does not load `r10` simply passes junk to a verb that
 /// does not read it.
 #[unsafe(no_mangle)]
-extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, #[cfg(feature = "linuxabi")] a5: u64) -> i64 { #[cfg(feature = "linuxabi")] { let a4 = crate::arch::linuxabi::take_user_r8(); if crate::arch::linuxabi::is_linux_task() { return crate::arch::linuxabi::dispatch(nr, a0, a1, a2, a3, a4, a5); } } // LINUXABI: a Linux task speaks the Linux table; a4 is user r8 from the stub's scratch, a5 is r9 (the 6th C arg). Folded onto the signature line.
+extern "C" fn syscall_dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, #[cfg(feature = "linuxabi")] a5: u64) -> i64 { #[cfg(feature = "linuxabi")] { let a4 = crate::arch::linuxabi::take_user_r8(); if crate::arch::linuxabi::is_linux_task() { return crate::arch::linuxabi::dispatch(nr, a0, a1, a2, a3, a4, a5); } } let prof_t0 = crate::prof::sys_t0(); // LINUXABI: a Linux task speaks the Linux table; a4 is user r8 from the stub's scratch, a5 is r9 (the 6th C arg). Folded onto the signature line.
     if !SYSCALL_LOGGED.swap(true, Ordering::Relaxed) {
         serial_println!(":: SYSCALL: nr={} — ring-3 -> ring-0 path live ::", nr);
     }
-    let rc = syscall_dispatch_inner(nr, a0, a1, a2, a3);
+    let rc = syscall_dispatch_inner(nr, a0, a1, a2, a3); crate::prof::sys_note(nr, prof_t0);
     // TEARDOWN-1: the SYSCALL KILL BOUNDARY. A task whose `KillSwitch` is armed retires HERE, on the way
     // out, and this call does not return in that case — the scheduler's existing reap arm owns the
     // teardown (see `sched::kill_check_current`).
@@ -10325,7 +10325,7 @@ pub fn init() {
     }
     if !SMEP_LOGGED.swap(true, Ordering::Relaxed) {
         if smep {
-            serial_println!(":: SMEP on ::");
+            crate::bootlog_println!(":: SMEP on ::");
         } else {
             serial_println!(":: SMEP unsupported (TCG?) — metal Ivy Bridge has it ::");
         }
@@ -10387,7 +10387,7 @@ pub fn init() {
         core::arch::asm!("mov dr7, {0}", in(reg) 0u64, options(nomem, nostack, preserves_flags));
     }
     if !DR7_LOGGED.swap(true, Ordering::Relaxed) {
-        serial_println!(":: U2.5-0: DR7 cleared ::");
+        crate::bootlog_println!(":: U2.5-0: DR7 cleared ::");
     }
 }
 
@@ -10741,7 +10741,7 @@ pub fn clock_x1_witness() {
     // `:: CLOCK-X1:` line is a boot that never reached a service pass — the same reading as a
     // missing `:: BPACE:` ledger block, and it is stated here so the absence is legible rather than
     // silent (bootpace.md §8e).
-    serial_println!(
+    crate::bootlog_println!(
         ":: CLOCK-X1: TSC invariant, ~{} MHz; uptime {} s SAMPLED — second-advance DEFERRED to the first service pass (pay-as-you-go; a capture with no verdict line below never reached one) == witness ::",
         mhz, u1
     );
@@ -10828,7 +10828,7 @@ pub fn clock_x1_poll() {
         // are printed so "the APIC is dead as well" is legible rather than inferred.
         if elapsed_ms >= CLOCK_X1_FROZEN_MS || (hz != 0 && b.wrapping_sub(a) >= hz * 3) {
             if claim_clock_x1_verdict() {
-                serial_println!(
+                crate::bootlog_println!(
                     ":: CLOCK-X1: FROZEN — uptime still {} s after {} ms APIC / {} ms TSC (rdtsc +{}, core={}); the JD17 second derivation does NOT advance == witness ::",
                     u1, elapsed_ms, tsc_ms, b.wrapping_sub(a), core
                 );
@@ -17546,6 +17546,8 @@ fn winx_launcher(demo_cpu: usize) {
     // (that IS its verdict) and would otherwise change which owner the routing legs start from.
     #[cfg(all(feature = "witness", feature = "wc"))]
     crate::tests::register("dock", crate::video::dock::selftest); #[cfg(all(feature = "witness", feature = "wc", feature = "quarry"))] crate::tests::register("fileopen", crate::video::quarry::live::fileopen_selftest); #[cfg(feature = "nvidia-kepler-vblank")] crate::tests::register("kvblank", crate::drivers::gpu::kepler_vblank::selftest_rerun); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("textedit", crate::video::textedit::selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("activity", crate::video::activity::selftest); // KVBLANK6 — `tests kvblank` re-runs the vblank fixture only. // TEXTEDIT (R75) — editor fixture; ACTIVITY (R75) — the activity window fixture.
+    // KBLIT (B319, R80) — the CE ladder and the first copy-engine blit, moved OFF boot into `tests ce` / `tests kblit` (kepler::init only banks the GPU context). Both behind `nvidia-kepler-ce`, default OFF; the module and both registrations vanish unarmed.
+    #[cfg(feature = "nvidia-kepler-ce")] crate::tests::register("ce", crate::drivers::gpu::kepler_ce::tests_ce); #[cfg(feature = "nvidia-kepler-ce")] crate::tests::register("kblit", crate::drivers::gpu::kepler_ce::tests_kblit);
     // CRYSTAL — the SHARD menu fixture. Runs after `dock::selftest` (which runs `menubar::selftest`),
     // so the bar tenant it enables is already proven present and flush. It enables the bar itself,
     // opens the menu off the crystal, resolves every item, fires the SAFE picks, and dismisses three
@@ -21532,7 +21534,7 @@ fn u8x_launcher(demo_cpu: usize) {
     // WINX-6b: the headless ELF-loader witness. WINX-2 above needs a block device the headless x86 run
     // does not have, so this one synthesizes a real multi-segment ELF64 in memory and pushes it through
     // the same `spawn_user_image_bg`, keeping the loader proven in CI rather than only at the bench.
-    winx3_launcher(demo_cpu);
+    crate::tests::register("winx3", || winx3_launcher(TESTS_DEMO_CPU.load(Ordering::Relaxed))); // QUIETBOOT2 (B325, R80): a boot fixture — `tests winx3` fires it.
 
     // WINX-7: the threads + futex + input fixture, after the loader witness so the machinery it
     // builds on is proved first. Unconditional and headless-complete — it needs no block device and
@@ -29941,26 +29943,6 @@ fn sys_attrsurf(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     if nr == una_abi::SYS_STAT { 0 } else { out.len() as i64 }
 }
 
-// ==========================================================================================
-// VEINCORE (B304): this arch's thin half of `crate::vein_bus` — the kernel-as-caller inject (the
-// `vein rsp` shell line) and the `tests vein` fixture over the SAME BANDY3 ops/fixture tables.
-// ==========================================================================================
-#[cfg(feature = "vein")]
-pub fn vein_inject(verb: u8, body: &[u8]) -> i64 {
-    busx_sem_init_once();
-    crate::bus_route::inject(&BUSREG_OPS, verb, body)
-}
-#[cfg(feature = "vein")]
-pub fn vein_owned(verb: u8) -> bool {
-    crate::bus_route::is_owned(&BUSREG_OPS, verb)
-}
-/// `tests vein` — the chat-verb witness on x86.
-#[cfg(feature = "vein")]
-pub fn vein_selftest() {
-    busx_sem_init_once();
-    crate::vein_bus::selftest(&BUSREG_FX);
-}
-
 /// NETRING3 M1 (B306): `SYS_GETRANDOM(buf, len) -> count / -errno` — at most `GETRANDOM_MAX` bytes from
 /// the kernel DRBG (`crate::netring3::getrandom`); the kernel copy is zeroed before return.
 #[cfg(feature = "netring3")]
@@ -30008,14 +29990,14 @@ pub fn user_image_cap() -> usize {
 }
 
 // =================================================================================================
-// RING3WIN (B316) — `tests ring3win`: run `/apps/BIG.BIN` (crates/user-big, linked in the ELF window) and
+// RING3WIN (B316) — `tests ring3win`: run `/apps/BIG.ELF` (crates/user-big, linked in the ELF window) and
 // prove the elf model end to end: the 64 KiB static array's checksum matches the kernel's own computation,
 // the 32 KiB-frame recursion ran on the declared stack, the SYS_SBRK heap carried a 100 KiB `Vec`, a
 // request past the cap was refused -ENOMEM, and after the exit every ELF-window frame went back to the
 // heap (the live-frame count returns to its value before the launch).
 // =================================================================================================
 
-/// RING3WIN: the checksum BIG.BIN computes over its static array — FNV-1a 32 over `a[i] = i*7 + (i>>8)`.
+/// RING3WIN: the checksum BIG.ELF computes over its static array — FNV-1a 32 over `a[i] = i*7 + (i>>8)`.
 /// Computed here independently, never trusted from the program.
 pub fn ring3win_big_fnv() -> u32 {
     let mut h: u32 = 0x811C_9DC5;
@@ -30026,9 +30008,9 @@ pub fn ring3win_big_fnv() -> u32 {
     h
 }
 
-/// RING3WIN: the `tests ring3win` fixture. SKIP (never a pin) when the volume carries no BIG.BIN.
+/// RING3WIN: the `tests ring3win` fixture. SKIP (never a pin) when the volume carries no BIG.ELF.
 pub fn ring3win_selftest() {
-    const PATH: &str = "/apps/BIG.BIN";
+    const PATH: &str = "/apps/BIG.ELF";
     let mt = crate::shell::vfs_mount_table();
     let full = crate::shell::vfs_path(PATH);
     let st = match mt.stat(&full) {

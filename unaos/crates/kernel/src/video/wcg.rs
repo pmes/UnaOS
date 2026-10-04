@@ -1337,7 +1337,7 @@ pub fn stage_flush(id: u32) {
         // is one absurd present beside a normal floor, which is exactly the pi's 218876-vs-2594. A
         // window whose floor is up there with it is uniformly slow, which is a different fault.
         let minp = H_MINPRES[i].load(Ordering::Relaxed);
-        serial_println!(
+        crate::census_println!(
             "[wc-h] win={} present_us={} bound_us={} minpresent_us={} -> STALL",
             id,
             longus,
@@ -1573,7 +1573,7 @@ fn emit_sample(id: u32, i: usize) {
         // Both INSERTED before `torn=`: the five keys another track's gate matches keep their order.
         let ob = H_OBS[i].load(Ordering::Relaxed);
         let torn = if ob & (1 << 48) != 0 { ob & (1 << 49) != 0 } else { present_us > rectscan_us };
-        serial_println!(
+        crate::census_println!(
             "[wc-h] win={} box={}x{} span={} band={} bytes={} compose_us={} present_us={} rectscan_us={} beam={} beamwait_us={} torn={} -> BUFFERED",
             id,
             bx >> 32,
@@ -1592,7 +1592,7 @@ fn emit_sample(id: u32, i: usize) {
         // A composite that ran on the pre-WC-H direct path. `-> DIRECT` deliberately does NOT carry
         // the rollup's verdict strings: one decline is a fact to report, not a boot to fail, and the
         // FORBIDs sit on the rollup where the aggregate lives.
-        serial_println!("[wc-h] win={} staged=no reason={} -> DIRECT", id, decl_name(kind));
+        crate::census_println!("[wc-h] win={} staged=no reason={} -> DIRECT", id, decl_name(kind));
     }
 }
 
@@ -1807,7 +1807,7 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
     // `decl_lock=` on the same line is comparing eight different moments to a ninth.
     let blitnet = super::wm::blit_net_snapshot();
     serial_println!(
-        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} longpres={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} shrunk={} blitnet=[{},{},{},{},{},{},{},{}] beam={} beamobs={} beamwaits={} beamwait_us={} beammaxwait_us={} beamgiveup={} beamcross_ppk={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} stallbound_us={} -> {}",
+        "[wc-h] rollup win={} scope={} emit={} age_ms={} pop=budgeted samples={} budget={} pop=all-presents torn={} stalls={} longpres={} declines={} decl_geom={} decl_cap={} decl_lock={} decl_alloc={} shrunk={} blitnet=[{},{},{},{},{},{},{},{}] beam={} beamobs={} beamwaits={} beamwait_us={} beammaxwait_us={} beamgiveup={} beamcross_ppk={} blitter={} blit_us={} gpu_fallback={} fixture={} whole={} banded={} lines={} minspan={} minspan_bytes={} maxpresent_us={} minpresent_us={} presspread={} presspop={} pop=constant frame_us={} stallbound_us={} -> {}",
         id,
         scope,
         emit,
@@ -1838,6 +1838,9 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         H_BEAMMAXWAIT[i].load(Ordering::Relaxed),
         H_BEAMGIVEUP[i].load(Ordering::Relaxed),
         H_BEAMCROSS[i].load(Ordering::Relaxed),
+        super::blitter::selected().name(),
+        cycles_to_us(H_BLITCYC[i].load(Ordering::Relaxed)),
+        H_GPUFB[i].load(Ordering::Relaxed),
         H_FIXTURE[i].load(Ordering::Relaxed),
         H_WHOLE[i].load(Ordering::Relaxed),
         H_BANDED[i].load(Ordering::Relaxed),
@@ -1852,6 +1855,13 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         STALL_PRESENT_US,
         verdict
     );
+    // KVBLANK8 M3 — the vblank ISR's delivery rate beside every rollup (`vbl_isr=60` = the interrupt paces; `vbl_src=`
+    // is the source the beam wait trusts). A line of its own so the rollup's arity is untouched.
+    #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
+    {
+        let (r, src) = crate::drivers::gpu::kepler_vblank::vbl_isr_rate();
+        serial_println!("[wc-h] vbl win={} vbl_isr={} vbl_src={}", id, r, src);
+    }
     // Re-arm the refresh from AFTER the serial write, so `CENSUS_PERIOD_US` bounds the time this
     // instrument occupies the composite path and not merely the gap between line starts. All three
     // stores happen on every emission — including the two latched ones — so the first refresh is
@@ -2033,7 +2043,7 @@ pub fn erase_defer(w: usize, h: usize, reason: u32, requeued: bool) {
         // threshold gets its own one-shot line here, on the same reasoning that makes the deferral
         // lines unbudgeted: the FORBID is only worth having if the boot can still trip it.
         if r == E_REDEFER_MAX + 1 {
-            serial_println!(
+            crate::census_println!(
                 "[wc-k] rollup scope=starve redefers={} limit={} -> STARVED",
                 r,
                 E_REDEFER_MAX
@@ -2055,7 +2065,7 @@ pub fn erase_defer(w: usize, h: usize, reason: u32, requeued: bool) {
             return;
         }
     }
-    serial_println!(
+    crate::census_println!(
         "[wc-k] erase box={}x{} staged=defer reason={} requeued={} -> DEFERRED",
         w,
         h,
@@ -2101,7 +2111,7 @@ pub fn erase_wakeup_rescue() {
         // fires at sample 4 and a rescue by its nature arrives later (it needs a DECLINED pass, which
         // needs two cores compositing at once). A counter whose only home is a rollup that has
         // already printed is a counter nobody reads.
-        serial_println!("[wc-k] rollup scope=wakeup rescues={} -> RESCUED", n);
+        crate::census_println!("[wc-k] rollup scope=wakeup rescues={} -> RESCUED", n);
     }
 }
 
@@ -2117,7 +2127,7 @@ pub fn erase_wakeup_rescue() {
 pub fn erase_outside_publish(w: usize, h: usize) {
     let n = E_OUTSIDE.fetch_add(1, Ordering::Relaxed) + 1;
     if n == 1 {
-        serial_println!(
+        crate::census_println!(
             "[wc-k] rollup scope=publish box={}x{} outside={} -> UNPUBLISHED",
             w,
             h,
@@ -2257,7 +2267,7 @@ pub fn erase_note(
         } else {
             "TEAR-FREE"
         };
-        serial_println!(
+        crate::census_println!(
             "[wc-k] rollup scope=fills samples={} rows={} torn={} beam={} beamobs={} beamwait_us={} beamgiveup={} beamcross_ppk={} noncontig={} declines={} outside={} defers={} redefers={} coalesced={} rescues={} maxpresent_us={} frame_us={} -> {}",
             n,
             E_ROWS.load(Ordering::Relaxed),
@@ -3459,7 +3469,7 @@ fn paygo_note(id: u32, i: usize, state: &str, verdict: &str, chunks: Option<(u32
     // convicting.
     let (since_ms, clock, _) = paygo_clock();
     match chunks {
-        None => serial_println!(
+        None => crate::census_println!(
             "[wc-g] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} taken={} budget={} -> {}",
             id,
             state,
@@ -3473,7 +3483,7 @@ fn paygo_note(id: u32, i: usize, state: &str, verdict: &str, chunks: Option<(u32
             SAMPLES,
             verdict
         ),
-        Some((n, hold_max_us)) => serial_println!(
+        Some((n, hold_max_us)) => crate::census_println!(
             "[wc-g] paygo win={} state={} emit={} lattice_n={} deferred={} defer_ms={} since_entry_ms={} clock={} taken={} budget={} -> {} chunks={} hold_max_us={}",
             id,
             state,
@@ -4244,7 +4254,7 @@ pub fn end(
     #[cfg(not(feature = "wcg-paygo"))]
     let (pf_bytes, pf_blit_us, pf_civac_us, pf_after_us, pf_probes, pf_rb_us) =
         (p.surf_len, p.cks_blit_us, p.civac_us, cks_after_us, checked, readback_us);
-    serial_println!(
+    crate::census_println!(
         "[wc-g] prof win={} seq={} surf_bytes={} cks_blit_us={} civac_us={} cks_after_us={} probes={} readback_us={}",
         p.id,
         p.seq,
@@ -4557,4 +4567,23 @@ fn seam_census_emit(id: u32) {
             "QUIET"
         }
     );
+}
+
+// ---- KCOMP — the blitter's share of each window's present, on the `[wc-h] rollup` -------------------
+//
+// `blitter=` `blit_us=` `gpu_fallback=` are INSERTED directly after `beamcross_ppk=` (the tail of the
+// beam run, inside `pop=all-presents`, the one place no spec keys an adjacency on — the COMPGATE and
+// BEAM paragraphs above). Arity 43 -> 46. Both counters are cumulative per window, like the beam keys.
+static H_BLITCYC: [AtomicU64; IDS] = [const { AtomicU64::new(0) }; IDS];
+static H_GPUFB: [AtomicU32; IDS] = [const { AtomicU32::new(0) }; IDS];
+
+/// KCOMP — one present through `blitter::present_band`: its cycles, and whether the CPU fallback ran.
+pub fn blit_note(id: u32, cyc: u64, fell_back: bool) {
+    let i = id as usize;
+    if i < IDS {
+        H_BLITCYC[i].fetch_add(cyc, Ordering::Relaxed);
+        if fell_back {
+            H_GPUFB[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }

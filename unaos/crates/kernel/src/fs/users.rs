@@ -568,7 +568,7 @@ fn try_load() -> Result<(), FatError> {
     match img {
         None => {
             t.next_uid = fresh_uid_base();
-            serial_println!("[users] load volume=el0-fat({}) via={} src=none users=0 (fresh store) next_uid={}", veto, via, t.next_uid);
+            crate::bootlog_println!("[users] load volume=el0-fat({}) via={} src=none users=0 (fresh store) next_uid={}", veto, via, t.next_uid);
         }
         Some(b) => match parse_image(&b) {
             Ok(p) => {
@@ -576,7 +576,7 @@ fn try_load() -> Result<(), FatError> {
                 t.count = p.count;
                 t.rows = p.rows;
                 t.next_uid = p.next_uid;
-                serial_println!(
+                crate::bootlog_println!(
                     "[users] load volume=el0-fat({}) via={} src={} users={} seq={} ver={} next_uid={} legacy_rows={}",
                     veto, via, src, p.count, p.seq, p.ver, p.next_uid,
                     (0..p.count as usize).filter(|&i| p.rows[i].kdf == KDF_LEGACY).count()
@@ -1892,7 +1892,7 @@ pub fn boot_ignition(desktop: bool) {
 /// false on QEMU); `screen=` is READ BACK after [`boot_ignition`] ran, never assumed from it.
 pub fn boot_session(desktop: bool) {
     boot_ignition(desktop);
-    serial_println!(
+    crate::bootlog_println!(
         "[login] boot session=root desktop={} screen={} (R63: the machine boots to the root desktop; the login screen opens at the root session's Log Out, never at boot)",
         desktop,
         if screen_up() { "open" } else { "closed" }
@@ -2670,7 +2670,7 @@ fn ahci_registered() -> usize {
 #[cfg(feature = "witness")]
 static USERSREADY_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 #[cfg(feature = "witness")]
-fn usersready_fixture() {
+fn usersready_fixture() { if crate::tests::defer("usersready", usersready_fixture) { return; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests usersready` fires it.
     if USERSREADY_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) { return; } // once: the guard opens on every pass until the mount lands (the first QEMU run printed it 24 times)
     let (g, s, a) = (crate::drivers::block::info().is_some(), sdhc_registered(), ahci_registered());
     let rmbp = store_ready_from(false, true, 1);      // flight 13: SDHC + AHCI registered, global untouched

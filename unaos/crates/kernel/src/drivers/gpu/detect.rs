@@ -21,7 +21,7 @@ pub enum GpuType {
 
 pub fn detect_gpus() -> Vec<GpuInfo> {
     let mut gpus = Vec::new();
-    serial_println!("[GPU] Scanning for Display Controllers (Class 0x03)...");
+    crate::bootlog_println!("[GPU] Scanning for Display Controllers (Class 0x03)...");
 
     for bus in 0u16..256 {
         for slot in 0u8..32 {
@@ -53,9 +53,9 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
                     let bar0_phys = PciScanner::get_bar_address(bus as u8, slot, func);
                     let bar0_size = get_bar_size(bus as u8, slot, func, 0x10);
 
-                    serial_println!("[GPU] Found: {:?} (Vendor: {:04X}, Device: {:04X}) at bus {} slot {} func {}", 
+                    crate::bootlog_println!("[GPU] Found: {:?} (Vendor: {:04X}, Device: {:04X}) at bus {} slot {} func {}", 
                         gpu_type, vendor_id, device_id, bus, slot, func);
-                    serial_println!("[GPU] BAR0: 0x{:X} (Size: {} bytes)", bar0_phys, bar0_size);
+                    crate::bootlog_println!("[GPU] BAR0: 0x{:X} (Size: {} bytes)", bar0_phys, bar0_size);
 
                     gpus.push(GpuInfo {
                         vendor: vendor_id,

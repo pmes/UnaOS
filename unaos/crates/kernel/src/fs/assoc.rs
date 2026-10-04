@@ -4,7 +4,7 @@
 //!
 //! Each type is one system object `/system/types/<mime with '/' as '.'>` (`/system/types/image.png`)
 //! carrying `una:opener` (an opener id — `facet` `fileview` `textedit` `play` `launch` `linux` `none`
-//! — or a ring-3 program path such as `/apps/LUMEN.BIN`), `una:icon` (a glyph name) and `una:name`
+//! — or a ring-3 program path such as `/apps/LUMEN.ELF`), `una:icon` (a glyph name) and `una:name`
 //! ("PNG image"). They are ordinary attributes: `setfattr /system/types/text.plain una:opener=fileview`
 //! changes the default opener with no code. A file's own `una:preferred` wins over its type's row
 //! (`BEOS:PREFERRED_APP`).
@@ -144,8 +144,8 @@ pub fn seed_once() {
     }
     let mt = crate::shell::vfs_mount_table();
     match seed_in(&mt) {
-        Ok(n) => serial_println!("[assoc] seed dir={} created={} types={} source=db", TYPES_DIR, n, BUILTIN.len()),
-        Err(VfsError::Unsupported) => serial_println!("[assoc] seed=skip reason=enotsup (root takes no attributes) source=builtin types={}", BUILTIN.len()),
+        Ok(n) => crate::bootlog_println!("[assoc] seed dir={} created={} types={} source=db", TYPES_DIR, n, BUILTIN.len()),
+        Err(VfsError::Unsupported) => crate::bootlog_println!("[assoc] seed=skip reason=enotsup (root takes no attributes) source=builtin types={}", BUILTIN.len()),
         Err(e) => serial_println!("[assoc] seed=fail ({}) source=builtin", crate::fs::attrsys::refusal(&e)),
     }
 }

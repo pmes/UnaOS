@@ -548,13 +548,13 @@ fn raw_witness(args: core::fmt::Arguments) {
 /// Nothing is written to any register. This is `discover_reset()` plus one line.
 pub fn reset_report() {
     match discover_reset() {
-        Ok(r) => serial_println!(
+        Ok(r) => crate::bootlog_println!(
             "[pwrreboot] FADT RESET_REG discovered at boot: space={} addr={:#x} value={:#x} — the reboot verb will write this",
             gas_space_name(r.space),
             r.addr,
             r.value
         ),
-        Err(why) => serial_println!(
+        Err(why) => crate::bootlog_println!(
             "[pwrreboot] FADT RESET_REG absent at boot — the reboot verb will fall through to the 8042 pulse (why: {})",
             why
         ),

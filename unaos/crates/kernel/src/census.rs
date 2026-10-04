@@ -113,3 +113,13 @@ pub fn boot_banner() {
     #[cfg(feature = "census")]
     serial_println!(":: CENSUS: armed=all knob=UNAOS_CENSUS bits={} ::", bits());
 }
+
+/// QUIETBOOT2 (B325, R80) — a boot-time WALK or TABLE line (the PCI/ACPI/SMC/EHCI-config/Kepler-display
+/// recon a boot does not need to decide anything): printed on a `census` build (`UNAOS_CENSUS=1`, which the
+/// QEMU battery verbs arm) and silent on the quiet metal boot. The arguments stay type-checked either way.
+#[macro_export]
+macro_rules! census_println {
+    ($($arg:tt)*) => {
+        if cfg!(any(feature = "census", feature = "tests-at-boot")) { $crate::serial_line::emit(format_args!($($arg)*), true); }
+    };
+}

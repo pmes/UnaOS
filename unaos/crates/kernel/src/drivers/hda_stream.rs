@@ -77,8 +77,9 @@ pub(super) struct Rearm {
 static RUNS: AtomicU32 = AtomicU32::new(0);
 static TONE_RUNS: AtomicU32 = AtomicU32::new(0);
 /// (run number, post snapshot) of the previous tone run and the previous play arm.
-static LAST_TONE: spin::Mutex<Option<(u32, Snap, Snap)>> = spin::Mutex::new(None);
-static LAST_PLAY: spin::Mutex<Option<(u32, Snap, Snap)>> = spin::Mutex::new(None);
+/// AUDIO8 (B329) M3: (shape, run, pre, post) of the last run PER SHAPE — see [`shape`].
+const SHAPES: usize = 8;
+static LAST: spin::Mutex<[Option<(u64, u32, Snap, Snap)>; SHAPES]> = spin::Mutex::new([None; SHAPES]);
 static LAST_RES: spin::Mutex<Rearm> = spin::Mutex::new(Rearm { run: 0, stop_ok: false, srst_set: false, srst_clr: false, fmt_match: false, tag_match: false, stable: false, sdfmt_rd: 0 });
 /// The controller's PCI function, found once by matching BAR0 against `base`. 0 = not looked up.
 static BDF_BASE: AtomicU64 = AtomicU64::new(0);
@@ -407,17 +408,22 @@ pub(super) fn rearm(rings: &mut Rings, p: &Params, who: &'static str, a: &mut Au
 
     let post = snapshot(rings, p, a);
     print(n, who, "post", &post);
-    let last = if who == "play" { &LAST_PLAY } else { &LAST_TONE };
-    let mut g = last.lock();
-    let stable = match g.as_ref() {
-        Some((pn, ppre, ppost)) => {
+    // AUDIO8 (B329) M3: like against like. FLIGHT20's hdaboth / hda220 / hda2 FAILs were `fields_stable=0` on
+    // `post=[members]` / `[m.path]` only — each diffed against the previous run of a DIFFERENT shape (two members
+    // vs one, DAC 0x03 vs 0x04). The previous run is now looked up by shape: who, SDxFMT, the member DAC/pin list.
+    let key = shape(who, p);
+    let mut g = LAST.lock();
+    let slot = g.iter().position(|e| e.as_ref().map_or(false, |x| x.0 == key));
+    let stable = match slot.and_then(|i| g[i].as_ref()) {
+        Some((_, pn, ppre, ppost)) => {
             let (dp, dq) = (diff(ppre, &pre), diff(ppost, &post));
-            serial_println!("[hda] run={} diff vs run={}: pre=[{}] post=[{}] stable={}", n, pn, dp, dq, dq.is_empty() as u8);
+            serial_println!("[hda] run={} diff vs run={}: pre=[{}] post=[{}] stable={} shape={:#x}", n, pn, dp, dq, dq.is_empty() as u8, key);
             dq.is_empty()
         }
-        None => { serial_println!("[hda] run={} diff vs run=-: pre=[] post=[] stable=1 (first {} run)", n, who); true }
+        None => { serial_println!("[hda] run={} diff vs run=-: pre=[] post=[] stable=1 (first {} run of shape={:#x})", n, who, key); true }
     };
-    *g = Some((n, pre, post));
+    let i = slot.or_else(|| g.iter().position(|e| e.is_none())).unwrap_or((n as usize) % SHAPES);
+    g[i] = Some((key, n, pre, post));
     drop(g);
     let r = Rearm { run: n, stop_ok, srst_set, srst_clr, fmt_match, tag_match, stable, sdfmt_rd };
     *LAST_RES.lock() = r;
@@ -450,3 +456,13 @@ pub(super) fn verdict_tone(lpib_moved: bool) {
 
 /// The last rearm's readback (play's witness reads tag/format match from here).
 pub(super) fn last() -> Rearm { *LAST_RES.lock() }
+
+/// AUDIO8 (B329) M3 — a run's shape: who (bit 63 = play), SDxFMT (bits 47:32), then each member's DAC and pin
+/// (8 bits each, member 0 lowest). Two runs are diffed only when their shapes are equal.
+fn shape(who: &str, p: &Params) -> u64 {
+    let mut k = ((who == "play") as u64) << 63 | (p.fmt as u64) << 32;
+    for (m, path) in p.paths.iter().enumerate().take(2) {
+        k |= ((path.dac as u64) | (path.pin as u64) << 8) << (16 * m);
+    }
+    k
+}

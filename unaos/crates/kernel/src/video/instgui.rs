@@ -283,7 +283,7 @@ fn run_census(id: block::BlockDeviceId) {
     let mut whole_ok = false;
     match crate::install::BlockTarget::bind_id(id) {
         Err(e) => {
-            serial_println!("[wc-x] instgui census — the disk did not bind ({:?}); nothing read, nothing written", e);
+            crate::census_println!("[wc-x] instgui census — the disk did not bind ({:?}); nothing read, nothing written", e);
         }
         Ok(t) => match partition::census(&t) {
             Err(e) => {
@@ -291,7 +291,7 @@ fn run_census(id: block::BlockDeviceId) {
                 // and it is the ONE shape in which that demo stays reachable: there are no
                 // partitions to census, so there is no foreign volume to stand it down.
                 // PARTINSTALL's words for the other case: "stood down by content".
-                serial_println!(
+                crate::census_println!(
                     "[wc-x] instgui census — no readable GPT ({:?}): no partitions to install into, and the whole-disk demo stays available on this disk",
                     e
                 );
@@ -345,7 +345,7 @@ fn run_census(id: block::BlockDeviceId) {
         Ordering::Relaxed,
     );
     *PARTS.lock() = rows;
-    serial_println!(
+    crate::census_println!(
         "[wc-x] instgui census step=1 gpt={} parts={} installable={} whole_disk_offered={} — READ-ONLY, nothing written",
         has_gpt as u8,
         PARTS.lock().len(),
@@ -750,7 +750,7 @@ pub fn open() {
     let (_s, ow, oh) = match wm::spawn_geometry(W, H) {
         Some(g) => g,
         None => {
-            serial_println!("[wc-x] instgui DECLINE reason=geometry-unavailable");
+            crate::census_println!("[wc-x] instgui DECLINE reason=geometry-unavailable");
             *STATE.lock() = State::Closed;
             return;
         }
@@ -785,7 +785,7 @@ pub fn open() {
     // repaints the console window AND (through wm's upward occlusion closure) this dialog —
     // ~24 ms of GOP writes per line, which reads as a hard flicker.
     super::fbcon::console_present_suspend(true); SUSPEND_MIRROR.store(true, Ordering::Release); // QUITLEAK — the mirror moves on the same line as the call it mirrors, so the two can never drift apart by an edit that touches one of them.
-    serial_println!("[wc-x] instgui open win={} box={}x{} at ({},{}) (console presents suspended)", id, ow, oh, ox, oy);
+    crate::census_println!("[wc-x] instgui open win={} box={}x{} at ({},{}) (console presents suspended)", id, ow, oh, ox, oy);
     repaint();
 }
 
@@ -815,7 +815,7 @@ pub fn close() {
     HAS_GPT.store(false, Ordering::Relaxed);
     // The console gets the glass back and repaints everything it accumulated.
     super::fbcon::console_present_suspend(false); SUSPEND_MIRROR.store(false, Ordering::Release); CLOSES.fetch_add(1, Ordering::Release); // QUITLEAK — the mirror on the same line as the call, and the counter that says this path ran: a bypassed `Quit` reaches neither, which is what `winmenu::appquit_selftest` scores.
-    serial_println!(
+    crate::census_println!(
         "[wc-x] instgui closed win={} — console presents resumed (suspended={}), booting on (closes={})",
         id,
         SUSPEND_MIRROR.load(Ordering::Acquire) as u32,
@@ -926,7 +926,7 @@ pub fn consume_key(c: u8) -> bool {
     }
     // Halt is offered from every screen: an installer must always be leaveable.
     if c == b'q' && st != State::Running {
-        serial_println!("[wc-x] instgui halt requested — powering the machine off");
+        crate::census_println!("[wc-x] instgui halt requested — powering the machine off");
         close();
         halt_machine();
     }
@@ -977,7 +977,7 @@ pub fn consume_key(c: u8) -> bool {
                 return true;
             }
             *PENDING.lock() = Some((row.id, sel as u8));
-            serial_println!(
+            crate::census_println!(
                 "[wc-x] instgui selected row {} -> {:?} slot {} ({} sectors)",
                 sel, row.id.handle, row.id.slot_id, row.id.num_blocks
             );
@@ -1026,7 +1026,7 @@ pub fn consume_key(c: u8) -> bool {
                 // Selection cannot rest on a refused row, so reaching this means there is no
                 // installable row at all. Say so and stay put; an installer must not invent a
                 // target because a key was pressed.
-                serial_println!(
+                crate::census_println!(
                     "[wc-x] instgui Enter on the census with no empty partition — nothing to install into, nothing written"
                 );
                 repaint();
@@ -1034,7 +1034,7 @@ pub fn consume_key(c: u8) -> bool {
             };
             *STATE.lock() = State::Running;
             repaint();
-            serial_println!(
+            crate::census_println!(
                 "[wc-x] instgui install-go step=2 part={} (attended Enter on the census screen)",
                 pr.index
             );
@@ -1072,7 +1072,7 @@ pub fn consume_key(c: u8) -> bool {
         // once at the affordance is a UI filter and not a guard.
         (State::Census, b'd') => {
             if WHOLE_OK.load(Ordering::Relaxed) {
-                serial_println!(
+                crate::census_println!(
                     "[wc-x] instgui whole-disk demo requested — the census found no foreign volume on this disk"
                 );
                 *STATE.lock() = State::Warn;
@@ -1119,7 +1119,7 @@ pub fn consume_key(c: u8) -> bool {
             }
             *STATE.lock() = State::Running;
             repaint();
-            serial_println!("[wc-x] instgui install-go (attended Enter on warn screen)");
+            crate::census_println!("[wc-x] instgui install-go (attended Enter on warn screen)");
             match crate::install::run_gui(id, row) {
                 crate::install::GuiOutcome::Pass => *STATE.lock() = State::Done(true),
                 crate::install::GuiOutcome::Refused => *STATE.lock() = State::Done(false),
@@ -1177,7 +1177,7 @@ fn plan_view_key(st: State, c: u8) -> bool {
     if c == b'i' && !on {
         let lines = plan_lines_now();
         for l in &lines {
-            serial_println!("[wc-x] instgui plan: {}", l);
+            crate::census_println!("[wc-x] instgui plan: {}", l);
         }
         *PLAN_LINES.lock() = Some(lines);
         PLAN_VIEW.store(true, Ordering::Relaxed);

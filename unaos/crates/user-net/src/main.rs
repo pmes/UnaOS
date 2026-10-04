@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-// NETRING3 M3 (rmbp-ledger B306): NET.BIN — a ring-3 TCP client on the rMBP, the first rung of Vein on
+// NETRING3 M3 (rmbp-ledger B306): NET.ELF — a ring-3 TCP client on the rMBP, the first rung of Vein on
 // the metal reaching `https://api.anthropic.com`.
 //
 //   1. entropy  — SYS_GETRANDOM(32): the kernel DRBG answers 32 bytes (the TLS client's RNG to be).
@@ -16,7 +16,7 @@
 //
 // One witness line: `:: NETRING3: resolve=<ip> connect=<0|err> http=<status> tls=<skip|...> -> PASS|SKIP|FAIL ::`.
 // SKIP (never FAIL) when the resolve finds no link or no answer: a dark NIC is not a broken program.
-// There is no argv for ring-3 programs yet, so the host is fixed (OWED: `NET.BIN tls <host>`).
+// There is no argv for ring-3 programs yet, so the host is fixed (OWED: `NET.ELF tls <host>`).
 //
 // ---------------------------------------------------------------------------------------------
 // Syscall stubs — the user-prefs stubs verbatim (see user-pulse for the register-clobber contract).
@@ -380,3 +380,9 @@ pub extern "C" fn _start() -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     exit(3)
 }
+
+/// EXECNAME (B322, R82): this program's launch declaration — a console program (no SYS_WIN_CREATE): a bare `net` runs in the foreground like `run`.
+/// Kept by the x86 link script under a PT_NOTE header; read by `midden_core::app_note_flags`.
+#[used]
+#[link_section = ".note.unaos.app"]
+static APP_NOTE: una_abi::AppNote = una_abi::AppNote::new(0);

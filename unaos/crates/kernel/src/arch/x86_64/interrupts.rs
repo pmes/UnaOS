@@ -190,7 +190,7 @@ pub mod vectors {
         // returned below. `TABLE`'s mutex serialises the choice of slot, and each slot is written
         // exactly once, so there is one writer per descriptor.
         let v = alloc_in(unsafe { &mut *idt }, name, handler)?;
-        serial_println!(
+        crate::bootlog_println!(
             "[vectors] alloc name={} vector={:#04x} == witness ::",
             name, v
         );
@@ -292,7 +292,7 @@ pub mod vectors {
         // Every byte came from a `&str`, so the slice is UTF-8 by construction; the fallback exists
         // so a truncation that lands mid-codepoint prints a line instead of losing the census.
         let table = core::str::from_utf8(&buf.b[..buf.n]).unwrap_or("<non-utf8>");
-        serial_println!(
+        crate::bootlog_println!(
             "[vectors] allocated={} free={} table={}{} == witness ::",
             allocated,
             free,
@@ -481,6 +481,7 @@ unsafe fn ring3_fault_kill(vec: u8, err: u64, rip: u64, cr2: u64) -> ! {
         ":: RING-3 FAULT: task '{}' KILLED — vec={} err={:#x} rip={:#x} cr2={:#x} ::",
         name, vec, err, rip, cr2
     );
+    #[cfg(feature = "lumen")] crate::lumen::note_ring3_fault(vec, rip); // LUMENCRASH M3 (B326): the faulting task's pid, vector and rip, for `tests lumen`'s spawn step
     crate::arch::syscall::record_ring3_kill(name, vec, err, cr2); if !(name.len() > 1 && name.as_bytes()[0] == b'u' && name.as_bytes()[1].is_ascii_digit()) { #[cfg(feature = "login")] crate::fs::users::screen_notice(b"Program stopped", name.as_bytes()); } // NOTICE: queue only (fixtures u1.. u4x are silent)
     crate::arch::sched::exit() // never returns; switches to the scheduler on this task's kstack
 }
@@ -707,7 +708,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     }
     // Local APIC timer tick. Lock-free. This CPU's own tick counter (each core's timer fires
     // independently at the calibrated 1 kHz) drives the per-CPU `sleep_ticks` deadlines.
-    crate::arch::percpu::note_tick();
+    crate::arch::percpu::note_tick(); crate::prof::sample_tick(stack_frame.instruction_pointer.as_u64(), from_user);
     // The GLOBAL millisecond clock (`APIC_TICKS`, read by `ticks()`/`ms()`) is advanced by ONE core
     // only — the BSP (logical cpu 0). Every core ticks at 1 kHz, so summing all of them would run
     // the "ms since boot" clock at (core-count) kHz — 8× fast on the 8-core rMBP. The BSP is always
@@ -717,7 +718,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
         // One-shot breadcrumb the first time the BSP's timer fires — confirms the local-APIC timer
         // path (xAPIC MMIO or x2APIC MSR LVT) is delivering, without spamming every tick.
         if prev == 0 {
-            serial_println!("APIC: heartbeat live (first timer tick).");
+            crate::bootlog_println!("APIC: heartbeat live (first timer tick).");
         }
     }
     // EOI BEFORE any context switch: otherwise the in-service bit would block this CPU's

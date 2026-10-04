@@ -122,6 +122,10 @@ pub(super) fn gate(base: u64, sd: u64, iss: u8, rings: &mut Rings, cad: u8, path
         cbl: RING_BYTES as u32, lvi: (ENTRIES - 1) as u16, fmt, tag: STREAM_TAG, paths, chan }, "play", a);
     let mut s = ST.lock();
     s.armed = true; s.base = base; s.sd = sd; s.eff_rate = eff; s.resampled = eff != want; s.tag = STREAM_TAG; s.armed_ms = crate::arch::ms();
+    // AUDIO8 (B329): the stream is the player's now (the amp stays held while it is open); the DAC out amp is muted
+    // until RUN, then ramped (ring_pump), and ramped down before the stop (hw_stop).
+    super::amp::to_play();
+    super::amp::ramp_prep(rings, cad, paths, a);
     serial_println!("[play] arm sd={} iss={} want_rate={} eff_rate={} fmt={:#06x}(readback {:#06x}) pcmcaps={:#010x} ring={:#x} entries={}x{} cbl={}(readback {}) lvi={}(readback {}) ioc=1 poll=lpib",
         0, iss, want, eff, fmt, back, caps, ring, ENTRIES, ENTRY_BYTES, RING_BYTES, r32(base, sd + SD_CBL), ENTRIES - 1, r16(base, sd + SD_LVI));
     serial_println!("[play] rearm run={} dac_fmt_match={} tag_match={} sdfmt_rd={:#06x} stable={}", rr.run, rr.fmt_match as u8, rr.tag_match as u8, rr.sdfmt_rd, rr.stable as u8);
@@ -193,12 +197,14 @@ pub fn stop() {
         if s.armed { hw_stop(&mut s); }
         s.armed = false; s.running = false; s.done = true;
     }
+    super::amp::amp_release(super::amp::PLAY); // AUDIO8 (B329): idempotent — a stop with nothing armed still closes the owner bit
     ACTIVE.store(false, Ordering::Release);
     *WAV.lock() = None; // after the ST guard drops: wav_pump takes WAV then ST, so never the other order
 }
 
 fn hw_stop(s: &mut St) {
     let (b, sd) = (s.base, s.sd);
+    super::amp::ramp_svc(false); // AUDIO8 (B329) M2: down and muted before RUN clears
     w8(b, sd + SD_CTL, 0);
     wait_us(10_000, || r8(b, sd + SD_CTL) & SDCTL_RUN as u8 == 0);
     w8(b, sd + SD_CTL, SDCTL_SRST as u8);
@@ -206,6 +212,7 @@ fn hw_stop(s: &mut St) {
     w8(b, sd + SD_CTL, 0);
     wait_us(10_000, || r8(b, sd + SD_CTL) & SDCTL_SRST as u8 == 0);
     w8(b, sd + SD_STS, SDSTS_BCIS | SDSTS_FIFOE | SDSTS_DESE);
+    super::amp::amp_release(super::amp::PLAY); // AUDIO8 (B329) M1: the last close starts the amp's idle hold-off
 }
 
 fn refill(s: &mut St, i: usize, prefill: bool) {
@@ -231,6 +238,7 @@ fn ring_pump(s: &mut St) {
         s.lpib0 = r32(b, sd + SD_LPIB);
         s.lpib_last = s.lpib0;
         let (ctl, on) = super::stream::run(b, sd, s.tag);
+        super::amp::ramp_svc(true); // AUDIO8 (B329) M2
         s.run_bit = on; s.run_ms = crate::arch::ms(); s.moved_ms = s.run_ms; s.next_print = s.run_ms + 100;
         serial_println!("[play] run ctl={:#08x} run_bit={} lpib0={} level={} fifo={}", ctl, on as u8, s.lpib0, s.level, s.fifo.len());
         s.running = true;
@@ -343,6 +351,7 @@ fn report() {
 
 /// The service tick (folded at the top of `probe_after_root`): latched opens, file pump, ring refill.
 pub fn service() {
+    super::amp::tick(); // AUDIO8 (B329) M1: the amp's idle hold-off (idle cost: one atomic load)
     if !ACTIVE.load(Ordering::Acquire) { return; }
     if let Some(p) = PENDING.try_lock().and_then(|mut g| g.take()) { let _ = open_wav(&p); }
     wav_pump();

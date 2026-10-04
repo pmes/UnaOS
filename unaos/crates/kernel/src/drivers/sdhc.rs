@@ -407,20 +407,20 @@ fn claim(bus: u8, slot: u8, func: u8) -> Option<u64> {
     let bar0 = PciScanner::get_bar_address(bus, slot, func);
 
     // Milestone-1's line, unchanged, so a milestone-2 log is comparable with a milestone-1 log.
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] bdf {}:{}.{} {:04x}:{:04x} bar0={:#x} cmd={:#06x} mem-decode={}",
         bus, slot, func, vendor, device, bar0, command, (command & 0x0002 != 0) as u8
     );
 
     if (bar0_raw & 0x1) != 0 {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] bdf {}:{}.{} bar0 is an I/O BAR (io={:#x}) — MMIO probe skipped",
             bus, slot, func, bar0_raw & 0xFFFF_FFFC
         );
         return None;
     }
     if bar0 == 0 {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] bdf {}:{}.{} bar0 unassigned by firmware — no MMIO probe",
             bus, slot, func
         );
@@ -433,19 +433,19 @@ fn claim(bus: u8, slot: u8, func: u8) -> Option<u64> {
     if command & 0x0002 == 0 {
         unsafe { crate::arch::pci::write_config_16(bus, slot, func, 0x04, command | 0x0002) };
         let after = unsafe { crate::arch::pci::read_config_16(bus, slot, func, 0x04) };
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] claim bdf {}:{}.{} mem-decode was OFF: cmd {:#06x} -> {:#06x} bus-master={} (PIO only)",
             bus, slot, func, command, after, (after >> 2) & 1
         );
         if after & 0x0002 == 0 {
-            serial_println!(
+            crate::bootlog_println!(
                 "[sdhc] claim bdf {}:{}.{} memory decode did not stick — controller not claimable",
                 bus, slot, func
             );
             return None;
         }
     } else {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] claim bdf {}:{}.{} mem-decode already ON (cmd={:#06x}) bus-master={} (PIO only)",
             bus, slot, func, command, (command >> 2) & 1
         );
@@ -454,7 +454,7 @@ fn claim(bus: u8, slot: u8, func: u8) -> Option<u64> {
     // Identity-map the register block Uncacheable (PCD|PWT), the same seam the GPU drivers use for
     // their BARs. Creating a mapping is not a device access; the device sees nothing here.
     crate::arch::memory::map_mmio_window(bar0, SDHCI_MMIO_LEN);
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] map bdf {}:{}.{} bar0={:#x} len={:#x} uncacheable",
         bus, slot, func, bar0, SDHCI_MMIO_LEN
     );
@@ -482,14 +482,14 @@ fn survey(base: u64, bus: u8, slot: u8, func: u8) -> HostCaps {
     let clkctl = r16(base, REG_CLOCK_CONTROL);
 
     // RAW, before any decoding — so a decode bug can never hide the evidence it was derived from.
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] raw bdf {}:{}.{} hcver={:#06x} caps={:#010x} caps2={:#010x} present={:#010x} hostctl1={:#04x} pwrctl={:#04x} clkctl={:#06x}",
         bus, slot, func, hcver, caps, caps2, present, hostctl1, pwrctl, clkctl
     );
 
     let sver = (hcver & 0xFF) as u8;
     let vver = (hcver >> 8) as u8;
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] bdf {}:{}.{} hcver={:#06x} spec={} vendor-ver={:#04x}",
         bus, slot, func, hcver, spec_version_name(sver), vver
     );
@@ -507,7 +507,7 @@ fn survey(base: u64, bus: u8, slot: u8, func: u8) -> HostCaps {
         2 => "shared-bus",
         _ => "reserved",
     };
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] bdf {}:{}.{} caps={:#010x} caps2={:#010x} base-clk={}MHz max-blk={} v3.3={} v3.0={} v1.8={} sdma={} adma2={} hispeed={} 64bit={} slot={}",
         bus, slot, func, caps, caps2, base_mhz, max_blk,
         (caps & CAP_V33 != 0) as u8, (caps & CAP_V30 != 0) as u8, (caps & CAP_V18 != 0) as u8,
@@ -520,7 +520,7 @@ fn survey(base: u64, bus: u8, slot: u8, func: u8) -> HostCaps {
     // is taken BEFORE the reset, i.e. of a controller the firmware has had settled for a long time,
     // so Card State Stable is expected 1 here. The post-reset reading is taken separately, after an
     // explicit wait for the debounce to re-settle (see `wait_card_detect`).
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] bdf {}:{}.{} present={:#010x} card-inserted={} cd-stable={} write-protected={}",
         bus, slot, func, present,
         (present & PS_CARD_INSERTED != 0) as u8,
@@ -549,12 +549,12 @@ fn reset_all(base: u64) -> bool {
     w8(base, REG_SOFTWARE_RESET, SRST_ALL);
     let cleared = wait_ms(RESET_TIMEOUT_MS, || r8(base, REG_SOFTWARE_RESET) & SRST_ALL == 0);
     let srst = r8(base, REG_SOFTWARE_RESET);
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] reset-all srst={:#04x} cleared={} (bound {}ms)",
         srst, cleared as u8, RESET_TIMEOUT_MS
     );
     if !cleared {
-        serial_println!("[sdhc] reset-all did NOT complete — controller unresponsive, stopping");
+        crate::bootlog_println!("[sdhc] reset-all did NOT complete — controller unresponsive, stopping");
     }
     cleared
 }
@@ -594,7 +594,7 @@ fn set_power(base: u64, caps: &HostCaps) -> Option<u32> {
     } else if caps.caps & CAP_V18 != 0 {
         (PWR_V18, 1800)
     } else {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] power: caps {:#010x} advertise NO supported bus voltage (v3.3/v3.0/v1.8 all 0) — stopping",
             caps.caps
         );
@@ -605,12 +605,12 @@ fn set_power(base: u64, caps: &HostCaps) -> Option<u32> {
     w8(base, REG_POWER_CONTROL, sel);
     w8(base, REG_POWER_CONTROL, sel | PWR_ON);
     let readback = r8(base, REG_POWER_CONTROL);
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] power sel={:#04x} pwrctl={:#04x} v={}mV on={} (healthy-idle pre-power reading is 0x00)",
         sel, readback, mv, (readback & PWR_ON != 0) as u8
     );
     if readback & PWR_ON == 0 {
-        serial_println!("[sdhc] power: SD Bus Power did not latch — stopping");
+        crate::bootlog_println!("[sdhc] power: SD Bus Power did not latch — stopping");
         return None;
     }
     Some(mv)
@@ -629,7 +629,7 @@ fn set_power(base: u64, caps: &HostCaps) -> Option<u32> {
 /// Returns the actual SDCLK in Hz on success.
 fn set_clock(base: u64, caps: &HostCaps, target_hz: u32) -> Option<u32> {
     if caps.base_hz == 0 {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] clock: Capabilities base-clock field is 0 — the controller does not report its\
              clock and x86 has no second source (no VideoCore mailbox); stopping"
         );
@@ -678,7 +678,7 @@ fn set_clock(base: u64, caps: &HostCaps, target_hz: u32) -> Option<u32> {
     });
     let cc_now = r16(base, REG_CLOCK_CONTROL);
     if !stable {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] clock: internal clock NOT stable after {}ms (clkctl={:#06x}) — stopping",
             CLK_STABLE_TIMEOUT_MS, cc_now
         );
@@ -687,7 +687,7 @@ fn set_clock(base: u64, caps: &HostCaps, target_hz: u32) -> Option<u32> {
 
     w16(base, REG_CLOCK_CONTROL, cc_now | CLK_SD_EN);
     let cc_final = r16(base, REG_CLOCK_CONTROL);
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] clock mode={} base={}Hz target={}Hz actual={}Hz clkctl={:#06x} stable=1 sd-clk-en={}",
         mode, caps.base_hz, target_hz, actual, cc_final, (cc_final & CLK_SD_EN != 0) as u8
     );
@@ -707,7 +707,7 @@ fn wait_card_detect(base: u64) -> Option<bool> {
         r32(base, REG_PRESENT_STATE) & PS_CARD_STABLE != 0
     });
     let present = r32(base, REG_PRESENT_STATE);
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] card-detect present={:#010x} cd-stable={} card-inserted={} cd-pin={} wp-switch={} (bound {}ms)",
         present,
         (present & PS_CARD_STABLE != 0) as u8,
@@ -717,7 +717,7 @@ fn wait_card_detect(base: u64) -> Option<bool> {
         CD_STABLE_TIMEOUT_MS
     );
     if !settled {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] card-detect: debounce never settled — 'card inserted' is UNDEFINED here, not 0; stopping"
         );
         return None;
@@ -830,7 +830,7 @@ fn send_command(base: u64, command: u16, arg: u32, data: bool) -> CmdResult {
         r32(base, REG_PRESENT_STATE) & (PS_CMD_INHIBIT | PS_DAT_INHIBIT) == 0
     }) {
         let ps = r32(base, REG_PRESENT_STATE);
-        serial_println!("[sdhc] cmd{}: line still busy, present={:#010x}", (command >> 8) & 0x3F, ps);
+        crate::bootlog_println!("[sdhc] cmd{}: line still busy, present={:#010x}", (command >> 8) & 0x3F, ps);
         reset_cmd_dat(base);
         return Err(0);
     }
@@ -880,7 +880,7 @@ fn read_response(base: u64) -> [u32; 4] {
 fn r1_check(base: u64, who: &str) -> Result<(), u32> {
     let r1 = r32(base, REG_RESPONSE0);
     if r1 & R1_ERROR_MASK != 0 {
-        serial_println!("[sdhc] {} rejected by the CARD: R1={:#010x}", who, r1);
+        crate::bootlog_println!("[sdhc] {} rejected by the CARD: R1={:#010x}", who, r1);
         return Err(r1);
     }
     Ok(())
@@ -1073,7 +1073,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
         serial_println!("[sdhc] cmd0 go-idle FAILED int={:#010x} ({})", int, int_error_name(int));
         return None;
     }
-    serial_println!("[sdhc] cmd0 go-idle ok");
+    crate::bootlog_println!("[sdhc] cmd0 go-idle ok");
 
     // --- CMD8 SEND_IF_COND (R7). Argument 0x1AA = supply-voltage class 1 (2.7–3.6 V) plus the
     // check pattern 0xAA. The card must ECHO both back; that echo is the first proof that data flows
@@ -1125,7 +1125,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
                 );
                 return None;
             }
-            serial_println!("[sdhc] cmd8 send-if-cond resp0={:#010x} echo=0x1aa ok (v2.00+ card)", r7);
+            crate::bootlog_println!("[sdhc] cmd8 send-if-cond resp0={:#010x} echo=0x1aa ok (v2.00+ card)", r7);
             true
         }
         // BARE timeout only: the error half equal to the command-timeout bit, every other error bit
@@ -1195,7 +1195,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
             break ocr;
         }
         if crate::arch::now_cycles().wrapping_sub(start) >= budget {
-            serial_println!(
+            crate::bootlog_println!(
                 "[sdhc] acmd41 arg={:#010x} (hcs={}) still busy after {}ms and {} polls \
                  (ocr={:#010x}) — card never finished power-up; stopping",
                 acmd41_arg, (acmd41_arg & ACMD41_HCS != 0) as u8, ACMD41_TIMEOUT_MS, polls, ocr
@@ -1208,7 +1208,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
     // v2.00+ standard-capacity card gives — and both mean byte-addressed, so no version-dependent
     // interpretation is needed here. The CSD cross-check below is what makes either reading evidence.
     let ccs = ocr & (1 << 30) != 0;
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] acmd41 arg={:#010x} hcs={} ocr={:#010x} powered-up=1 ccs={} ({}-addressed) after {} polls",
         acmd41_arg, (acmd41_arg & ACMD41_HCS != 0) as u8, ocr, ccs as u8,
         if ccs { "block" } else { "byte" },
@@ -1222,7 +1222,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
         return None;
     }
     let cid = read_response(base);
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] cmd2 cid raw=[{:#010x},{:#010x},{:#010x},{:#010x}]",
         cid[0], cid[1], cid[2], cid[3]
     );
@@ -1237,7 +1237,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
         let mut pnm_buf = [0u8; 5];
         ascii_field(&mut oid_buf, oid, 2);
         ascii_field(&mut pnm_buf, pnm, 5);
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] cid mid={:#04x} oid={} pnm={} prv={}.{} psn={:#010x} mdt={}-{:02}",
             mid,
             core::str::from_utf8(&oid_buf).unwrap_or("??"),
@@ -1258,10 +1258,10 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
     let rca = r6 >> 16;
     let rca_arg = rca << 16;
     if rca == 0 {
-        serial_println!("[sdhc] cmd3 returned RCA 0 (resp0={:#010x}) — RCA 0 deselects; stopping", r6);
+        crate::bootlog_println!("[sdhc] cmd3 returned RCA 0 (resp0={:#010x}) — RCA 0 deselects; stopping", r6);
         return None;
     }
-    serial_println!("[sdhc] cmd3 resp0={:#010x} rca={:#06x}", r6, rca);
+    crate::bootlog_println!("[sdhc] cmd3 resp0={:#010x} rca={:#06x}", r6, rca);
 
     // --- CMD9 SEND_CSD (R2). Must be issued while the card is in stand-by — after CMD3 and BEFORE
     // CMD7 SELECT. Issued after CMD7 the card is in transfer state and rejects it, which is why the
@@ -1271,7 +1271,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
         return None;
     }
     let csd = read_response(base);
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] cmd9 csd raw=[{:#010x},{:#010x},{:#010x},{:#010x}]",
         csd[0], csd[1], csd[2], csd[3]
     );
@@ -1279,7 +1279,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
     let num_blocks = if csd_structure == 1 {
         // CSD v2 (SDHC/SDXC): C_SIZE = CSD[69:48]; capacity = (C_SIZE+1) · 512 KiB.
         let c_size = r2_bits(&csd, 69, 48);
-        serial_println!("[sdhc] csd v2 c_size={} -> blocks=(c_size+1)*1024", c_size);
+        crate::bootlog_println!("[sdhc] csd v2 c_size={} -> blocks=(c_size+1)*1024", c_size);
         (c_size + 1) * 1024
     } else if csd_structure == 0 {
         // CSD v1 (SDSC): capacity is THREE fields multiplied, not v2's single C_SIZE —
@@ -1295,7 +1295,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
         let c_size = r2_bits(&csd, 73, 62);
         let c_size_mult = r2_bits(&csd, 49, 47) as u32;
         let blocks = ((c_size + 1) << (c_size_mult + 2)) * (1u64 << read_bl_len) / 512;
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] csd v1 c_size={} c_size_mult={} read_bl_len={} ({} B) read_bl_partial={} \
              -> blocks=(c_size+1)<<(c_size_mult+2) * 2^read_bl_len / 512 = {}",
             c_size, c_size_mult, read_bl_len, 1u32 << read_bl_len, read_bl_partial, blocks
@@ -1320,7 +1320,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
         // different reason: its scratch LBA is `num_blocks - 1`, so an inflated count puts it past
         // the end of the card and rung 6 refuses it as `scratch-unreadable`.
         if !(9..=11).contains(&read_bl_len) {
-            serial_println!(
+            crate::bootlog_println!(
                 "[sdhc] csd v1 read_bl_len={} is outside the spec's 9..=11 — the CSD unpack is \
                  SUSPECT and the capacity above should not be believed. read_bl_partial={}: {}",
                 read_bl_len,
@@ -1337,7 +1337,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
         }
         blocks
     } else {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] csd structure {} is not 0 (v1) or 1 (v2) — capacity cannot be derived; stopping",
             csd_structure
         );
@@ -1358,7 +1358,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
     let csd_perm_wp = r2_bits(&csd, 13, 13) != 0;
     let csd_tmp_wp = r2_bits(&csd, 12, 12) != 0;
     let wp_grp_enable = r2_bits(&csd, 31, 31) != 0;
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] csd write-protect perm={} tmp={} wp-grp-enable={} -> card-declares-{}",
         csd_perm_wp as u8, csd_tmp_wp as u8, wp_grp_enable as u8,
         if csd_perm_wp || csd_tmp_wp { "READ-ONLY" } else { "writable" }
@@ -1423,7 +1423,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
     // necessarily 1 by the time this runs — the check above stopped the case where it is not — and
     // is printed anyway because it is what the witness's addressing claim is made of.
     if !v2_card && csd_structure == 1 {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] CONTRADICTION: cmd8 concluded pre-v2.00 but the csd is structure=1 (v2), and \
              csd v2 arrived with the SAME spec (2.00) that introduced cmd8 — a card that did not \
              answer cmd8 cannot hold a v2 csd. Evidence: v2_card={} ccs={} csd_structure={}. One of \
@@ -1444,7 +1444,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
         "SDXC"
     };
     let class = if ccs { class_short } else { "SDSC (standard capacity)" };
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] card {} blocks x512 = {}MiB class={} addressing={} (ccs governs, csd v{} agrees)",
         num_blocks, mib, class,
         if ccs { "block" } else { "byte" },
@@ -1487,7 +1487,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
     if r1_check(base, "cmd7 select").is_err() {
         return None;
     }
-    serial_println!("[sdhc] cmd7 select ok (transfer state)");
+    crate::bootlog_println!("[sdhc] cmd7 select ok (transfer state)");
 
     // --- CMD16 SET_BLOCKLEN 512 (R1). Meaningful for SDSC; on a block-addressed card 512 is fixed
     // and this is a harmless confirmation.
@@ -1498,11 +1498,11 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
     if r1_check(base, "cmd16 set-blocklen").is_err() {
         return None;
     }
-    serial_println!("[sdhc] cmd16 set-blocklen=512 ok");
+    crate::bootlog_println!("[sdhc] cmd16 set-blocklen=512 ok");
 
     // --- Identification is over; raise the clock from 400 kHz to default speed.
     let actual = set_clock(base, caps, CLK_TRANSFER_HZ)?;
-    serial_println!("[sdhc] transfer clock {}Hz engaged", actual);
+    crate::bootlog_println!("[sdhc] transfer clock {}Hz engaged", actual);
 
     Some(SdCard {
         base,
@@ -1758,7 +1758,7 @@ fn read_blocks_pio_on(
     // rejected the read never fills the buffer, and draining it anyway would return stale bytes with
     // an Ok beside them.
     if let Err(r1) = r1_check(base, "multi-block read") {
-        serial_println!("[sdhc-mb] {} lba={} blocks={} rejected by the CARD r1={:#010x}", name, lba, count, r1);
+        crate::bootlog_println!("[sdhc-mb] {} lba={} blocks={} rejected by the CARD r1={:#010x}", name, lba, count, r1);
         abort_data_transfer(base);
         return Err(BlockError::Io);
     }
@@ -2010,7 +2010,7 @@ fn adma2_init(card: &mut SdCard, caps: &HostCaps) {
 
     fn refuse(card: &mut SdCard, why: &'static str) {
         card.adma = Adma2State::Unavailable(why);
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc-adma] UNAVAILABLE ({}) — every read is served by the PIO path; a named \
              limitation, never a silent one",
             why
@@ -2021,7 +2021,7 @@ fn adma2_init(card: &mut SdCard, caps: &HostCaps) {
     // from a previous observation of this machine: the only evidence for the bench part's ADMA2
     // support is an uncommitted bench note, so the register decides, every boot.
     if caps.caps & CAP_ADMA2 == 0 {
-        serial_println!("[sdhc-adma] caps={:#010x} adma2-bit=0", caps.caps);
+        crate::bootlog_println!("[sdhc-adma] caps={:#010x} adma2-bit=0", caps.caps);
         refuse(card, "controller advertises no ADMA2");
         return;
     }
@@ -2056,12 +2056,12 @@ fn adma2_init(card: &mut SdCard, caps: &HostCaps) {
     if table + ADMA2_TABLE_BYTES as u64 > DMA_CEILING
         || bounce + ADMA2_BOUNCE_BYTES as u64 > DMA_CEILING
     {
-        serial_println!("[sdhc-adma] table={:#x} buf={:#x} ceiling={:#x}", table, bounce, DMA_CEILING);
+        crate::bootlog_println!("[sdhc-adma] table={:#x} buf={:#x} ceiling={:#x}", table, bounce, DMA_CEILING);
         refuse(card, "dma window above 4GiB");
         return;
     }
     if table & 0x3 != 0 || bounce & 0x3 != 0 {
-        serial_println!("[sdhc-adma] table={:#x} buf={:#x} not 4-byte aligned", table, bounce);
+        crate::bootlog_println!("[sdhc-adma] table={:#x} buf={:#x} not 4-byte aligned", table, bounce);
         refuse(card, "dma window misaligned");
         return;
     }
@@ -2072,7 +2072,7 @@ fn adma2_init(card: &mut SdCard, caps: &HostCaps) {
     let hc1_want = (hc1 & !HC1_DMA_SELECT_MASK) | HC1_DMA_ADMA2_32;
     w8(base, REG_HOST_CONTROL1, hc1_want);
     let hc1_back = r8(base, REG_HOST_CONTROL1);
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc-adma] host-control1 {:#04x} -> {:#04x} readback={:#04x} dma-select={:#03b}",
         hc1, hc1_want, hc1_back, (hc1_back & HC1_DMA_SELECT_MASK) >> 3
     );
@@ -2088,7 +2088,7 @@ fn adma2_init(card: &mut SdCard, caps: &HostCaps) {
     let cmd_before = unsafe { crate::arch::pci::read_config_16(bus, slot, func, 0x04) };
     unsafe { crate::arch::pci::write_config_16(bus, slot, func, 0x04, cmd_before | 0x0004) };
     let cmd_after = unsafe { crate::arch::pci::read_config_16(bus, slot, func, 0x04) };
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc-adma] bus-master grant bdf {}:{}.{} cmd {:#06x} -> {:#06x} bus-master {} -> {}",
         bus, slot, func, cmd_before, cmd_after,
         (cmd_before >> 2) & 1, (cmd_after >> 2) & 1
@@ -2101,7 +2101,7 @@ fn adma2_init(card: &mut SdCard, caps: &HostCaps) {
     card.adma_table = table;
     card.adma_bounce = bounce;
     card.adma = Adma2State::Ready;
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc-adma] engine ready bm=1 table={:#x} buf={:#x} descs-max={} mode=adma2-32",
         table, bounce, ADMA2_MAX_DESCS
     );
@@ -2187,7 +2187,7 @@ fn read_blocks_adma_on(
         return Err(BlockError::Io);
     }
     if let Err(r1) = r1_check(base, "adma2 read") {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc-adma] {} lba={} blocks={} rejected by the CARD r1={:#010x}",
             name, lba, count, r1
         );
@@ -2255,13 +2255,13 @@ fn adma2_smoke(num_blocks: u64) {
     }
     let blocks = VERIFY_WINDOW_BLOCKS;
     if num_blocks < blocks as u64 {
-        serial_println!("[sdhc-adma] smoke SKIPPED — card holds {} blocks", num_blocks);
+        crate::bootlog_println!("[sdhc-adma] smoke SKIPPED — card holds {} blocks", num_blocks);
         return;
     }
     let n = blocks * 512;
     let mut mb = MB_BUF.lock();
     match read_blocks_512_adma(0, blocks as u16, &mut mb[..n]) {
-        Ok((bytes, wrote)) => serial_println!(
+        Ok((bytes, wrote)) => crate::bootlog_println!(
             "[sdhc-adma] read lba=0 blocks={} ok wrote={} bytes={}",
             blocks, wrote as u8, bytes
         ),
@@ -2314,7 +2314,7 @@ fn verify_read(bus: u8, slot: u8, func: u8, num_blocks: u64) {
 
     // --- Claim 1a: read LBA 0.
     match read_block_512(0, &mut buf[..]) {
-        Ok(n) => serial_println!("[sdhc] read lba0 ok ({} bytes)", n),
+        Ok(n) => crate::bootlog_println!("[sdhc] read lba0 ok ({} bytes)", n),
         Err(e) => {
             serial_println!("[sdhc] read lba0 FAILED ({:?}) — no block was transferred", e);
             return;
@@ -2323,7 +2323,7 @@ fn verify_read(bus: u8, slot: u8, func: u8, num_blocks: u64) {
     let h0 = fnv1a(&buf[..]);
     let sig = [buf[510], buf[511]];
     // RAW before decoded: the first 16 bytes of the sector as the card delivered them.
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] lba0 head={:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} sig=[{:#04x},{:#04x}] fnv={:#018x}",
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
         buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
@@ -2348,7 +2348,7 @@ fn verify_read(bus: u8, slot: u8, func: u8, num_blocks: u64) {
             return;
         }
     };
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] verify repeat lba0 fnv={:#018x} match={} (a mismatch means FIFO residue or a \
          desynchronised drain, not a bad card)",
         h0_again, (h0_again == h0) as u8
@@ -2359,7 +2359,7 @@ fn verify_read(bus: u8, slot: u8, func: u8, num_blocks: u64) {
         match read_block_512(1, &mut buf[..]) {
             Ok(_) => {
                 let h1 = fnv1a(&buf[..]);
-                serial_println!(
+                crate::bootlog_println!(
                     "[sdhc] verify lba1 fnv={:#018x} differs-from-lba0={} (if 0, the address \
                      argument may not be reaching the card)",
                     h1, (h1 != h0) as u8
@@ -2371,7 +2371,7 @@ fn verify_read(bus: u8, slot: u8, func: u8, num_blocks: u64) {
 
     // --- Claim 3: the MBR cross-check.
     if sig != [0x55, 0xAA] {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] verify mbr: no 55 aa boot signature at offset 510 (sig=[{:#04x},{:#04x}]) — the \
              card is unpartitioned or superfloppy-formatted, so the capacity cross-check is \
              UNAVAILABLE on this card, not failed",
@@ -2389,19 +2389,19 @@ fn verify_read(bus: u8, slot: u8, func: u8, num_blocks: u64) {
         let end = start as u64 + count as u64;
         let fits = end <= num_blocks;
         all_fit &= fits;
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] verify mbr p{} type={:#04x} start={} count={} end={} fits-capacity={}",
             i, ptype, start, count, end, fits as u8
         );
     }
     if !any {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] verify mbr: boot signature present but the partition table is empty — no \
              capacity cross-check available"
         );
         return;
     }
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] verify mbr bdf {}:{}.{}: partition extents vs CSD capacity {} blocks -> all-fit={} \
          ({})",
         bus, slot, func, num_blocks, all_fit as u8,
@@ -2460,7 +2460,7 @@ fn first_difference(a: &[u8], b: &[u8]) -> Option<(usize, usize)> {
 fn verify_multiblock(num_blocks: u64) {
     let blocks = VERIFY_WINDOW_BLOCKS;
     if num_blocks < blocks as u64 {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc-mb] SKIPPED — card holds {} blocks, fewer than the {}-block window",
             num_blocks, blocks
         );
@@ -2496,11 +2496,11 @@ fn verify_multiblock(num_blocks: u64) {
     let mb_fnv = fnv1a(&mb[..n]);
 
     match first_difference(&ctl[..n], &mb[..n]) {
-        None => serial_println!(
+        None => crate::bootlog_println!(
             "[sdhc-mb] window lba=0 blocks={} match=1 first-diff=none ctl-fnv={:#018x} mb-fnv={:#018x}",
             blocks, ctl_fnv, mb_fnv
         ),
-        Some((blk, off)) => serial_println!(
+        Some((blk, off)) => crate::bootlog_println!(
             "[sdhc-mb] window lba=0 blocks={} match=0 first-diff=blk{},off{} ctl={:#04x} mb={:#04x} \
              ctl-fnv={:#018x} mb-fnv={:#018x}",
             blocks, blk, off, ctl[blk * 512 + off], mb[blk * 512 + off], ctl_fnv, mb_fnv
@@ -2546,7 +2546,7 @@ fn ab_window(lba: u64) -> Option<(bool, bool)> {
 
     match first_difference(&ctl[..n], &mb[..n]) {
         None => {
-            serial_println!(
+            crate::bootlog_println!(
                 "[sdhc-ab] window lba={} blocks={} match=1 wrote={} first-diff=none",
                 lba, blocks, wrote as u8
             );
@@ -2555,7 +2555,7 @@ fn ab_window(lba: u64) -> Option<(bool, bool)> {
         Some((blk, off)) => {
             // The evidence, not a summary of it. `off0` of a block means a lost block boundary; an
             // offset that is 0 mod 4 means a lost word; anything else, a lost byte.
-            serial_println!(
+            crate::bootlog_println!(
                 "[sdhc-ab] window lba={} blocks={} match=0 wrote={} first-diff=blk{},off{} \
                  (absolute lba={} byte={}) ctl={:#04x} adma={:#04x}",
                 lba, blocks, wrote as u8, blk, off, lba + blk as u64, off,
@@ -2580,12 +2580,12 @@ fn verify_adma_ab(num_blocks: u64) {
         return;
     };
     if state != Adma2State::Ready {
-        serial_println!("[sdhc-ab] SKIPPED — adma2 unavailable ({})", state.reason());
+        crate::bootlog_println!("[sdhc-ab] SKIPPED — adma2 unavailable ({})", state.reason());
         return;
     }
     let blocks = VERIFY_WINDOW_BLOCKS as u64;
     if num_blocks < blocks * 2 {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc-ab] SKIPPED — card holds {} blocks, too few for three distinct {}-block windows",
             num_blocks, blocks
         );
@@ -2607,7 +2607,7 @@ fn verify_adma_ab(num_blocks: u64) {
         }
     }
 
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc-ab] verdict windows={} match={}/{} — {}",
         windows.len(), matched, windows.len(),
         if matched == windows.len() {
@@ -2640,7 +2640,7 @@ pub fn read_blocks_512(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, 
     }
     let need = count.checked_mul(512).ok_or(BlockError::BadLba)?;
     if buf.len() < need {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] read_blocks_512 lba={} count={}: caller buffer is {} bytes, {} needed",
             lba, count, buf.len(), need
         );
@@ -2669,7 +2669,7 @@ pub fn read_blocks_512(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, 
                     // `read_blocks_adma_on` has already printed the raw evidence. Latch, announce,
                     // and fall through to the PIO retry below — never silently.
                     card.adma = Adma2State::Faulted("a live adma2 transfer failed");
-                    serial_println!(
+                    crate::bootlog_println!(
                         "[sdhc-adma] engine DISABLED — falling back to PIO ({}) after {:?} at \
                          lba={} blocks={}; every later read on this boot is PIO",
                         card.adma.reason(), e, at, this
@@ -2688,7 +2688,7 @@ pub fn read_blocks_512(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, 
                 // the FTDI ring (64 KiB, drop-oldest) on any controller without ADMA2 — evicting the
                 // bring-up evidence to announce, repeatedly, that nothing went wrong.
                 if matches!(card.adma, Adma2State::Faulted(_)) {
-                    serial_println!("[sdhc-mb] pio lba={} blocks={} ok ({})", at, this, card.adma.reason());
+                    crate::bootlog_println!("[sdhc-mb] pio lba={} blocks={} ok ({})", at, this, card.adma.reason());
                 }
                 done += this as usize;
             }
@@ -3129,12 +3129,12 @@ fn sdw_verdict(
     verdict: &str,
 ) {
     match lba {
-        Some(l) => serial_println!(
+        Some(l) => crate::census_println!(
             ":: sdhc: w1 armed={} lba={} wp_sw={} csd_perm={} csd_tmp={} class={} blank={} \
              verify={} restore={} reason={} -> {} ::",
             armed as u8, l, wp_sw, perm, tmp, class, blank, verify, restore, reason, verdict
         ),
-        None => serial_println!(
+        None => crate::census_println!(
             ":: sdhc: w1 armed={} lba=NONE wp_sw={} csd_perm={} csd_tmp={} class={} blank={} \
              verify={} restore={} reason={} -> {} ::",
             armed as u8, wp_sw, perm, tmp, class, blank, verify, restore, reason, verdict
@@ -3353,14 +3353,14 @@ fn bring_up(base: u64, bus: u8, slot: u8, func: u8) -> bool {
         return false;
     };
     if !inserted {
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] bdf {}:{}.{} bus is up (powered, clocked) but NO CARD is inserted — nothing to identify",
             bus, slot, func
         );
         return false;
     }
 
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] bdf {}:{}.{} bus ready: powered, {}Hz identification clock, card present",
         bus, slot, func, CLK_IDENT_HZ
     );
@@ -3368,7 +3368,7 @@ fn bring_up(base: u64, bus: u8, slot: u8, func: u8) -> bool {
     let Some(mut card) = identify(base, &caps, (bus, slot, func)) else {
         return false;
     };
-    serial_println!(
+    crate::bootlog_println!(
         "[sdhc] bdf {}:{}.{} CARD IDENTIFIED — {} blocks, {}-addressed, csd v{}",
         bus, slot, func, card.num_blocks,
         if card.block_addressing { "block" } else { "byte" },
@@ -3457,14 +3457,14 @@ fn bring_up(base: u64, bus: u8, slot: u8, func: u8) -> bool {
 pub fn probe() {
     let controllers = PciScanner::storage_inventory();
     if controllers.is_empty() {
-        serial_println!("[sdhc] no SD host controller found (class 0x08/0x05)");
+        crate::bootlog_println!("[sdhc] no SD host controller found (class 0x08/0x05)");
         return;
     }
 
     let mut driven = false;
     for (bus, slot, func) in controllers {
         if driven {
-            serial_println!(
+            crate::bootlog_println!(
                 "[sdhc] bdf {}:{}.{} additional SD host controller — left untouched (milestone 2 drives one)",
                 bus, slot, func
             );
@@ -3892,7 +3892,7 @@ static SDW_MB_READBACK: Mutex<[u8; SDW_MB_BLOCKS as usize * 512]> =
 fn mb_verdict(lba: Option<u64>, count: u16, verify: &str, busy_ms: u64, restore: &str, reason: &str, verdict: &str) {
     match lba {
         Some(l) => {
-            serial_println!(
+            crate::bootlog_println!(
                 "[sdhc] write n={} lba={} verify={} busy_ms={}",
                 count, l, verify, busy_ms
             );
@@ -3902,7 +3902,7 @@ fn mb_verdict(lba: Option<u64>, count: u16, verify: &str, busy_ms: u64, restore:
             );
         }
         None => {
-            serial_println!("[sdhc] write n={} lba=NONE verify={} busy_ms={}", count, verify, busy_ms);
+            crate::bootlog_println!("[sdhc] write n={} lba=NONE verify={} busy_ms={}", count, verify, busy_ms);
             serial_println!(
                 ":: sdhc: w2 armed=1 lba=NONE n={} verify={} busy_ms={} restore={} reason={} -> {} ::",
                 count, verify, busy_ms, restore, reason, verdict
@@ -4123,7 +4123,7 @@ pub fn wr_census_note(t0: u64, blocks: u64, multi: bool, busy_ms: u64, ok: bool)
     if now.saturating_sub(ws) >= WINDOW_MS {
         let wall = now.saturating_sub(ws).max(1);
         let wb = WIN_BLOCKS.swap(0, Relaxed);
-        serial_println!(
+        crate::bootlog_println!(
             "[sdhc] write census blocks={} calls={} multi={} ms={} busy_ms={} wall_ms={} kbps={}",
             wb, WIN_CALLS.swap(0, Relaxed), WIN_MULTI.swap(0, Relaxed), WIN_MS.swap(0, Relaxed),
             WIN_BUSY.swap(0, Relaxed), wall, wb * 512 / wall // bytes per ms == KB/s (1000-based)

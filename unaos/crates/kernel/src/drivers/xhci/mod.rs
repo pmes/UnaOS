@@ -416,7 +416,7 @@ fn wait_until<F: Fn() -> bool>(pred: F, budget: u64, what: &str) -> Result<(), (
             return Err(());
         }
         if progress != 0 && now.wrapping_sub(last_report) >= progress {
-            serial_println!("xHCI: still waiting for {} ...", what);
+            crate::bootlog_println!("xHCI: still waiting for {} ...", what);
             last_report = now;
         }
         core::hint::spin_loop();
@@ -459,7 +459,7 @@ fn bios_handoff(base_address: u64) {
                 let usblegctlsts = cap + 4;
                 let legsup = core::ptr::read_volatile(usblegsup as *const u32);
                 if legsup & HC_BIOS_OWNED != 0 {
-                    serial_println!("xHCI: claiming controller from BIOS (USBLEGSUP)...");
+                    crate::bootlog_println!("xHCI: claiming controller from BIOS (USBLEGSUP)...");
                 }
                 // Request OS ownership, then wait (bounded) for the BIOS to release it.
                 core::ptr::write_volatile(usblegsup as *mut u32, legsup | HC_OS_OWNED);
@@ -473,7 +473,7 @@ fn bios_handoff(base_address: u64) {
                     // Firmware stuck — force ownership: keep OS-owned, clear BIOS-owned.
                     let v = core::ptr::read_volatile(usblegsup as *const u32);
                     core::ptr::write_volatile(usblegsup as *mut u32, (v | HC_OS_OWNED) & !HC_BIOS_OWNED);
-                    serial_println!("xHCI: BIOS did not release ownership; forced OS ownership.");
+                    crate::bootlog_println!("xHCI: BIOS did not release ownership; forced OS ownership.");
                 }
                 // Disable the firmware's legacy SMIs and acknowledge any pending SMI status.
                 let legctl = core::ptr::read_volatile(usblegctlsts as *const u32);
@@ -481,7 +481,7 @@ fn bios_handoff(base_address: u64) {
                     usblegctlsts as *mut u32,
                     (legctl & !LEGCTL_DISABLE_SMI) | LEGCTL_SMI_EVENTS,
                 );
-                serial_println!("xHCI: BIOS->OS handoff complete.");
+                crate::bootlog_println!("xHCI: BIOS->OS handoff complete.");
                 return;
             }
 
@@ -494,14 +494,14 @@ fn bios_handoff(base_address: u64) {
 }
 
 pub fn init(base_address: u64) {
-    serial_println!("xHCI: Virtual Handoff. Base Address: {:#x}", base_address);
+    crate::bootlog_println!("xHCI: Virtual Handoff. Base Address: {:#x}", base_address);
 
     let cap_ptr = base_address as *const u32;
     let cap_word = unsafe { core::ptr::read_volatile(cap_ptr) };
     let cap_length = (cap_word & 0xFF) as u8;
 
     let op_base = base_address + cap_length as u64;
-    serial_println!("xHCI: CapLength: {}, Operational Base: {:#x}", cap_length, op_base);
+    crate::bootlog_println!("xHCI: CapLength: {}, Operational Base: {:#x}", cap_length, op_base);
 
     // Claim the controller from the firmware (real hardware) before we touch it.
     bios_handoff(base_address);
@@ -522,7 +522,7 @@ pub fn init(base_address: u64) {
         let _ = wait_until(
             || (core::ptr::read_volatile(usbsts_ptr) & 1) != 0,
             hw_wait_budget(), "USBSTS.HCH=1 (halt)");
-        serial_println!("xHCI: Controller Halted.");
+        crate::bootlog_println!("xHCI: Controller Halted.");
         // BPACE (M4): USBSTS.HCH=1 — the controller stopped. Budget-bounded (~2 s x86); a firmware
         // that left the controller running with a live schedule pays real time here.
         crate::bootpace::record("xhci-halt");
@@ -550,7 +550,7 @@ pub fn init(base_address: u64) {
         let _ = wait_until(
             || (core::ptr::read_volatile(usbsts_ptr) & (1 << 11)) == 0,
             hw_wait_budget(), "USBSTS.CNR=0");
-        serial_println!("xHCI: Controller Reset Complete.");
+        crate::bootlog_println!("xHCI: Controller Reset Complete.");
         // BPACE (M4): USBSTS.CNR=0 — the controller is Ready and register programming may begin.
         // Intel clears CNR near-instantly (expect `d=`~0 on the rMBP); the Pi's VL805 holds it for
         // up to ~100s of ms while it loads its firmware (§1a "the CNR wall"), which is exactly the
@@ -558,7 +558,7 @@ pub fn init(base_address: u64) {
         crate::bootpace::record("xhci-cnr");
     }
 
-    serial_println!("[XHCI] CONTROLLER RESET.");
+    crate::bootlog_println!("[XHCI] CONTROLLER RESET.");
 }
 
 /// Every PORTSC change bit (all RW1C): CSC(17) PEC(18) WRC(19) OCC(20) PRC(21) PLC(22) CEC(23).
@@ -738,9 +738,9 @@ pub fn log_summary_once() {
     }
     let claimed = claim();
     if let Ok(x) = claimed.as_ref() {
-        serial_println!("xHCI: === USB topology summary ===");
+        crate::bootlog_println!("xHCI: === USB topology summary ===");
         for line in x.port_slot_summary() {
-            serial_println!("xHCI: {}", line);
+            crate::bootlog_println!("xHCI: {}", line);
         }
         // IVY: BOT pump headroom alongside the topology it was measured on. This is a SNAPSHOT at
         // summary time (the main loop's 2000th pass), not an end-of-run tally — the authoritative
@@ -897,7 +897,7 @@ pub fn vugras_dump() {
 #[allow(unused_variables)]
 fn x200_witness(op_base: usize, tag: &str, val: u64) {
     if val < 0x1000 {
-        serial_println!(
+        crate::bootlog_println!(
             "xHCI: X200 FLAG !! {} = {:#x} < 0x1000 — low/default-shaped DMA pointer handed to the controller",
             tag, val
         );
@@ -960,7 +960,7 @@ fn wait_for_cnr_clear(op_base: usize) -> bool {
         polls += 1;
         if unsafe { core::ptr::read_volatile(usbsts) } & (1 << 11) == 0 {
             #[cfg(target_arch = "aarch64")]
-            serial_println!("xHCI: CNR cleared after {} polls", polls);
+            crate::bootlog_println!("xHCI: CNR cleared after {} polls", polls);
             return true;
         }
         if crate::arch::now_cycles().wrapping_sub(start) > budget {
@@ -1704,7 +1704,7 @@ fn bot_park_forget(tab: &mut [BotDevLedger; BOT_PARK_SLOTS], id: BotDevIdent) ->
 ///
 /// Runs on every boot of both arches, needs no controller (it is called before/independently of
 /// xHCI bring-up, and passes under `skip_xhci`), allocates nothing, and touches no hardware.
-pub fn bot_park_selftest() {
+pub fn bot_park_selftest() { if crate::tests::defer("botpark", bot_park_selftest) { return; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests botpark` fires it.
     BOT_PARK_QUIET.store(true, Ordering::Relaxed);
     let per_ms: u64 = 1_000; // a nominal timebase; the assertions are about arithmetic, not clocks
     let a = BotDevIdent { port: 1, route: 0x1, vid: 0x058f, pid: 0x6362 };
@@ -2874,7 +2874,7 @@ fn parse_supported_protocols(base_address: usize) -> Vec<PortProtocol> {
                     port_offset: (dw2 & 0xFF) as u8,
                     port_count: ((dw2 >> 8) & 0xFF) as u8,
                 };
-                serial_println!(
+                crate::bootlog_println!(
                     "xHCI: Supported Protocol: USB {}.{} ports {}..{}",
                     p.major, p.minor >> 4, p.port_offset,
                     p.port_offset as u32 + p.port_count.saturating_sub(1) as u32);
@@ -2887,7 +2887,7 @@ fn parse_supported_protocols(base_address: usize) -> Vec<PortProtocol> {
         }
     }
     if out.is_empty() {
-        serial_println!("xHCI: no Supported Protocol capabilities found (port types unknown).");
+        crate::bootlog_println!("xHCI: no Supported Protocol capabilities found (port types unknown).");
     }
     out
 }
@@ -3606,7 +3606,7 @@ impl XhciController {
         let op_base = base_addr + cap_length as usize;
 
         // Log it to verify we aren't seeing ghosts anymore
-        serial_println!("xHCI: CapBase={:#x}, OpBase={:#x}, Version={:#x}", base_addr, op_base, version);
+        crate::bootlog_println!("xHCI: CapBase={:#x}, OpBase={:#x}, Version={:#x}", base_addr, op_base, version);
 
         // Read Max Slots and Max Ports from HCSPARAMS1
         let hcsparams1_ptr = (base_addr + 0x04) as *const u32;
@@ -3614,7 +3614,7 @@ impl XhciController {
         let max_slots = (hcsparams1 & 0xFF) as u8;
         let max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
 
-        serial_println!("xHCI: MaxSlots={}, MaxPorts={}", max_slots, max_ports);
+        crate::bootlog_println!("xHCI: MaxSlots={}, MaxPorts={}", max_slots, max_ports);
 
         let port_protocols = parse_supported_protocols(base_addr);
 
@@ -3698,7 +3698,7 @@ impl XhciController {
         self.enum_stage = stage;
         self.enum_stage_set_at = crate::arch::now_cycles();
         if self.enumerating_port != 0 {
-            serial_println!("xHCI: [enum port {}] stage -> {}", self.enumerating_port, stage);
+            crate::bootlog_println!("xHCI: [enum port {}] stage -> {}", self.enumerating_port, stage);
         }
     }
 
@@ -3974,7 +3974,7 @@ impl XhciController {
     fn advance_erdp(&self, dequeue_index: usize) {
         unsafe {
             if EVENT_RING_PHYS_BASE == 0 {
-                serial_println!("xHCI: WARNING - EVENT_RING_PHYS_BASE is 0, skipping ERDP update!");
+                crate::bootlog_println!("xHCI: WARNING - EVENT_RING_PHYS_BASE is 0, skipping ERDP update!");
                 return;
             }
             let rtsoff = core::ptr::read_volatile((self.base_addr + 0x18) as *const u32) & !0x1F;
@@ -4020,7 +4020,7 @@ impl XhciController {
                         // (exactly what recovery runs against) must not be able to panic the
                         // kernel with an out-of-range slot index.
                         if slot_id as usize >= self.slots.len() {
-                            serial_println!("xHCI: command completion with bogus slot {}; ignoring.", slot_id);
+                            crate::bootlog_println!("xHCI: command completion with bogus slot {}; ignoring.", slot_id);
                             return;
                         }
 
@@ -4030,7 +4030,7 @@ impl XhciController {
                         // matched against pending commands (it can coincide with a freshly
                         // pushed TRB's address). The abort machinery owns the restart.
                         if completion_code == 24 {
-                            serial_println!("xHCI: [Event] Command Ring Stopped (dequeue={:#x}).", command_ptr);
+                            crate::bootlog_println!("xHCI: [Event] Command Ring Stopped (dequeue={:#x}).", command_ptr);
                             return;
                         }
 
@@ -4046,7 +4046,7 @@ impl XhciController {
                                     *p = 0;
                                 }
                             }
-                            serial_println!(
+                            crate::bootlog_println!(
                                 "xHCI: JB9i eviction completion: slot {} code {} ({}).",
                                 slot_id, completion_code,
                                 match completion_code {
@@ -4071,7 +4071,7 @@ impl XhciController {
                             }
                         }
 
-                        serial_println!("xHCI: [Event] Command Completion. Ptr={:#x}, Slot={}, Code={}",
+                        crate::bootlog_println!("xHCI: [Event] Command Completion. Ptr={:#x}, Slot={}, Code={}",
                             command_ptr, slot_id, completion_code);
 
                         // Does this completion answer the root enumeration FSM's own in-flight
@@ -4085,21 +4085,21 @@ impl XhciController {
 
                         // Completion Code 1 = Success
                         if completion_code == 1 {
-                            serial_println!("xHCI: >>> COMMAND SUCCESS <<<");
+                            crate::bootlog_println!("xHCI: >>> COMMAND SUCCESS <<<");
                             if slot_id > 0 {
-                                serial_println!("xHCI: SLOT ID ALLOCATED: {}", slot_id);
+                                crate::bootlog_println!("xHCI: SLOT ID ALLOCATED: {}", slot_id);
 
                                 // UNA-18-ADDRESS: our ENABLE_SLOT completed — the controller
                                 // allocated `slot_id` for the port we are enumerating.
                                 // Proceed to Address Device.
                                 if ours && !self.pending_ports.is_empty() {
                                     let port_to_map = self.pending_ports.pop().unwrap();
-                                    serial_println!("xHCI: Proceeding to Address Device (Slot {}, Port {})...", slot_id, port_to_map);
+                                    crate::bootlog_println!("xHCI: Proceeding to Address Device (Slot {}, Port {})...", slot_id, port_to_map);
                                     self.address_device(slot_id as u8, port_to_map);
                                 }
                                 // UNA-21-ACCELERATE: Check if we were configuring endpoints
                                 else if self.configuring_slot == slot_id as u8 {
-                                    serial_println!("xHCI: Endpoints Configured (Slot {}). Storage ready.", slot_id);
+                                    crate::bootlog_println!("xHCI: Endpoints Configured (Slot {}). Storage ready.", slot_id);
                                     self.configuring_slot = 0;
                                     // STORSLOT: claim this device's OWN storage record and defer
                                     // the SCSI bring-up + read to the main loop (a safe, non-event
@@ -4139,7 +4139,7 @@ impl XhciController {
                                 // so this is not misclaimed by the storage branch above or the
                                 // address-device (`ours`) branch below.
                                 else if self.usbnet_cfg_done(slot_id as u8) { self.start_next_port(); } else if self.ftdi_configuring_slot == slot_id as u8 { // USBNET: the link's Configure-Endpoint completion, ahead of the FTDI's; knob-off the helper is `#[inline(always)] false`
-                                    serial_println!("xHCI: FTDI Endpoints Configured (Slot {}). Console bring-up pending.", slot_id);
+                                    crate::bootlog_println!("xHCI: FTDI Endpoints Configured (Slot {}). Console bring-up pending.", slot_id);
                                     self.ftdi_configuring_slot = 0;
                                     self.ftdi_slot = slot_id as u8;
                                     self.ftdi_pending_bringup = true;
@@ -4152,7 +4152,7 @@ impl XhciController {
                                     // slot's own state, not on enum_cmd_phys, so the hub path keeps
                                     // working). Advance whichever endpoints it covered, then issue
                                     // ONE device-level SET_CONFIGURATION for the whole device.
-                                    serial_println!("xHCI: HID Endpoints Configured (Slot {}). Proceeding to Set Configuration...", slot_id);
+                                    crate::bootlog_println!("xHCI: HID Endpoints Configured (Slot {}). Proceeding to Set Configuration...", slot_id);
                                     if self.slots[slot_id as usize].keyboard_state == 1 {
                                         self.slots[slot_id as usize].keyboard_state = 2;
                                     }
@@ -4173,10 +4173,10 @@ impl XhciController {
                                     // dead slot's EP0 ring would be use-after-dispose.
                                     if self.slots[slot_id as usize].active
                                         && self.slots[slot_id as usize].ep0_ring.is_some() {
-                                        serial_println!("xHCI: >>> SLOT {} ENABLED & ADDRESSED <<<", slot_id);
+                                        crate::bootlog_println!("xHCI: >>> SLOT {} ENABLED & ADDRESSED <<<", slot_id);
                                         self.begin_device_descriptor(slot_id as u8);
                                     } else {
-                                        serial_println!("xHCI: completion for disposed slot {}; ignoring.", slot_id);
+                                        crate::bootlog_println!("xHCI: completion for disposed slot {}; ignoring.", slot_id);
                                     }
                                 }
                                 else {
@@ -4187,14 +4187,14 @@ impl XhciController {
                                     // ENABLE_SLOT still allocated a slot nothing references —
                                     // dispose it, or retries slowly drain the MaxSlots pool.
                                     if !self.slots[slot_id as usize].active {
-                                        serial_println!(
+                                        crate::bootlog_println!(
                                             "xHCI: untracked completion allocated slot {}; queueing DISABLE_SLOT.",
                                             slot_id);
                                         if !self.slots_to_disable.iter().any(|(s, _)| *s == slot_id as u8) {
                                             self.slots_to_disable.push((slot_id as u8, 0));
                                         }
                                     } else {
-                                        serial_println!("xHCI: untracked command completion (slot {}); ignoring.", slot_id);
+                                        crate::bootlog_println!("xHCI: untracked command completion (slot {}); ignoring.", slot_id);
                                     }
                                 }
                             }
@@ -4216,7 +4216,7 @@ impl XhciController {
                     },
                     34 => { // PORT STATUS CHANGE EVENT
                         let port_id = ((param >> 24) & 0xFF) as u8;
-                        serial_println!("xHCI: [Event] Port Status Change. Port={}", port_id);
+                        crate::bootlog_println!("xHCI: [Event] Port Status Change. Port={}", port_id);
                         self.handle_port_status(port_id);
                     },
                     32 => { // TRANSFER EVENT
@@ -4230,7 +4230,7 @@ impl XhciController {
 
                         // Bounds: slot_id comes from the controller (see the type-33 guard).
                         if slot_id as usize >= self.slots.len() {
-                            serial_println!("xHCI: transfer event with bogus slot {}; ignoring.", slot_id);
+                            crate::bootlog_println!("xHCI: transfer event with bogus slot {}; ignoring.", slot_id);
                             return;
                         }
 
@@ -4483,7 +4483,7 @@ impl XhciController {
                                 let p = (self.enumerating_port as usize) & 31;
                                 if !self.fs_ep0_mps64[p] {
                                     self.fs_ep0_mps64[p] = true;
-                                    serial_println!(
+                                    crate::bootlog_println!(
                                         "xHCI: EP0 babble on port {} -> retrying with FS MPS0=64.",
                                         self.enumerating_port);
                                 }
@@ -4588,7 +4588,7 @@ impl XhciController {
                                 // EP0 TDs (hub bring-up) were already claimed above.
                                 let expect = self.slots[slot_id as usize].ep0_expect_phys;
                                 if expect == 0 || param != expect {
-                                    serial_println!(
+                                    crate::bootlog_println!(
                                         "xHCI: stale/spurious EP0 event (slot {}, trb {:#x}, expected {:#x}); ignoring.",
                                         slot_id, param, expect);
                                     return;
@@ -4600,7 +4600,7 @@ impl XhciController {
                                     // a read on each endpoint that was configured (keyboard into
                                     // data_buffer, pointer into mouse_data_buffer — separate buffers so a
                                     // composite device's two endpoints don't race), then advance ports.
-                                    serial_println!("xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<");
+                                    crate::bootlog_println!("xHCI: >>> HID SET_CONFIGURATION COMPLETE <<<");
                                     if self.slots[slot_id as usize].keyboard_state == 2 {
                                         self.slots[slot_id as usize].keyboard_state = 3;
                                         self.slots[slot_id as usize].keyboard_report_count = 0;
@@ -4644,7 +4644,7 @@ impl XhciController {
                                         self.start_next_port();
                                     }
                                 } else {
-                                    serial_println!("xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<");
+                                    crate::bootlog_println!("xHCI: >>> INTERCEPTED DESCRIPTOR EVENT (Slot 1 EP 1) <<<");
                                     unsafe {
                                         let desc_buf = self.slots[slot_id as usize].descriptor_buffer;
                                         // XHCI-COHERENCE: consumer boundary — the descriptor was
@@ -4673,7 +4673,7 @@ impl XhciController {
                                         self.slots[slot_id as usize].vid = vid;
                                         self.slots[slot_id as usize].pid = pid;
                                     } else {
-                                        serial_println!(
+                                        crate::bootlog_println!(
                                             "xHCI: descriptor event slot {} type={:#04x} (not a device descriptor; no VID/PID banner)",
                                             slot_id, desc_data[1]
                                         );
@@ -4686,32 +4686,32 @@ impl XhciController {
                                     let protocol = desc_data[6]; #[cfg(feature = "usbnet")] { if desc_data[1] == 0x01 { usbnet::note_device(slot_id as u8, class_code, desc_data[17], vid, pid); } } // USBNET: bNumConfigurations (byte 17) — a walk of configuration 0 that finds no ECM asks for configuration 1 only if the device declares one
 
                                     if desc_data[1] == 0x01 {
-                                        serial_println!("xHCI: Device Found. Class={:#x} Sub={:#x} Proto={:#x}",
+                                        crate::bootlog_println!("xHCI: Device Found. Class={:#x} Sub={:#x} Proto={:#x}",
                                             class_code, subclass, protocol);
                                     }
 
                                     if class_code == 0x08 { // 0x08 = Mass Storage (device-level)
-                                        serial_println!("xHCI: >>> CARGO DETECTED (MASS STORAGE) <<<");
-                                        serial_println!("xHCI: Requesting Configuration Descriptor for bulk endpoints...");
+                                        crate::bootlog_println!("xHCI: >>> CARGO DETECTED (MASS STORAGE) <<<");
+                                        crate::bootlog_println!("xHCI: Requesting Configuration Descriptor for bulk endpoints...");
                                         // Route through the config-descriptor parser so the
                                         // real bulk endpoint addresses + MPS drive configure_endpoints.
                                         self.request_configuration_descriptor(slot_id as u8);
                                     } else if class_code == 0x09 {
                                         // USB Hub. Defer the (multi-step, synchronous) hub
                                         // bring-up to the main loop and continue root enumeration.
-                                        serial_println!("xHCI: >>> HUB DETECTED (slot {}) <<<", slot_id);
+                                        crate::bootlog_println!("xHCI: >>> HUB DETECTED (slot {}) <<<", slot_id);
                                         self.hubs_pending.push(slot_id as u8);
                                         self.start_next_port();
                                     } else if class_code == 0x00 || usbnet_dev_class(desc_data[1], class_code) { // USBNET: a Communications device (0x02) reports its class at the DEVICE level; the helper answers only for a DEVICE descriptor (byte 1 == 0x01) because this same chain runs on the CONFIGURATION descriptor's completion, where byte 4 is bNumInterfaces (measured: 2 here looped the request); knob-off the helper is `#[inline(always)] false`
                                         // Class 0 means "Look at Interface Descriptor" (Common for Flash Drives too)
-                                        serial_println!("xHCI: Composite Device. Requesting Configuration Descriptor...");
+                                        crate::bootlog_println!("xHCI: Composite Device. Requesting Configuration Descriptor...");
                                         self.request_configuration_descriptor(slot_id as u8);
                                     } else if desc_data[1] == 0x02 { // Configuration Descriptor Response
-                                        serial_println!("xHCI: >>> CONFIGURATION DESCRIPTOR RECEIVED <<<");
+                                        crate::bootlog_println!("xHCI: >>> CONFIGURATION DESCRIPTOR RECEIVED <<<");
                                         // Parse Configuration Descriptor to find HID Interfaces
                                         let mut offset = 0;
                                         let total_length = (desc_data[2] as u16) | ((desc_data[3] as u16) << 8);
-                                        serial_println!("xHCI: Configuration Descriptor Total Length: {}", total_length);
+                                        crate::bootlog_println!("xHCI: Configuration Descriptor Total Length: {}", total_length);
                                         
                                         // Track current interface class/protocol while parsing (for the
                                         // serial trace + MSC/FTDI detection). HID interrupt-IN interfaces —
@@ -4742,7 +4742,7 @@ impl XhciController {
                                                 current_intf_class = desc_data[offset + 5];
                                                 let intf_subclass = desc_data[offset + 6];
                                                 current_intf_protocol = desc_data[offset + 7]; #[cfg(feature = "usbnet")] { if usbnet::note_interface(slot_id as u8, desc_data[offset + 2], desc_data[offset + 3], current_intf_class, intf_subclass, current_intf_protocol) { is_usbnet = true; } } // USBNET: the ECM DATA interface (0x0A, after a 0x02/0x06 control interface) — its bulk pair is collected below exactly as storage's and the FTDI's
-                                                serial_println!("xHCI: Interface: Class={:#x} Sub={:#x} Proto={:#x}",
+                                                crate::bootlog_println!("xHCI: Interface: Class={:#x} Sub={:#x} Proto={:#x}",
                                                     current_intf_class, intf_subclass, current_intf_protocol);
 
                                                 if current_intf_class == 0x08 {
@@ -4750,7 +4750,7 @@ impl XhciController {
                                                     // This device reports class 0 at the device level, so the
                                                     // interface descriptor is the only place to detect it. We
                                                     // collect its bulk endpoints below and configure after the walk.
-                                                    serial_println!("xHCI: >>> MASS STORAGE INTERFACE DETECTED (Class 0x08) <<<");
+                                                    crate::bootlog_println!("xHCI: >>> MASS STORAGE INTERFACE DETECTED (Class 0x08) <<<");
                                                     is_mass_storage = true;
                                                     // PIUSB-38: remember the MSC bInterfaceNumber
                                                     // (descriptor byte +2) — the `wIndex` a Bulk-Only
@@ -4767,7 +4767,7 @@ impl XhciController {
                                                         (s.vid, s.pid)
                                                     };
                                                     if vid == ftdi::FTDI_VID && pid == ftdi::FTDI_PID {
-                                                        serial_println!("xHCI: >>> FTDI USB-SERIAL DETECTED (0403:6001) <<<");
+                                                        crate::bootlog_println!("xHCI: >>> FTDI USB-SERIAL DETECTED (0403:6001) <<<");
                                                         is_ftdi = true;
                                                     }
                                                 }
@@ -4779,11 +4779,11 @@ impl XhciController {
                                                 let ep_mps = ((desc_data[offset + 4] as u16) | ((desc_data[offset + 5] as u16) << 8)) & 0x07FF;
                                                 if (ep_attr & 0x03) == 0x02 { // Bulk transfer type
                                                     if (ep_addr & 0x80) != 0 {
-                                                        serial_println!("xHCI: >>> BULK IN EP FOUND: {:#x}, MPS: {} <<<", ep_addr, ep_mps);
-                                                        bulk_in = Some((ep_addr, ep_mps));
+                                                        crate::bootlog_println!("xHCI: >>> BULK IN EP FOUND: {:#x}, MPS: {} <<<", ep_addr, ep_mps);
+                                                        bulk_in = Some((ep_addr, ep_mps)); #[cfg(feature = "usbnet")] usbnet::note_bulk_ep(slot_id as u8, ep_addr, ep_mps); // USBNET7: the FIRST bulk endpoint of each direction is remembered (Linux usbnet_get_endpoints); this walk keeps the last
                                                     } else {
-                                                        serial_println!("xHCI: >>> BULK OUT EP FOUND: {:#x}, MPS: {} <<<", ep_addr, ep_mps);
-                                                        bulk_out = Some((ep_addr, ep_mps));
+                                                        crate::bootlog_println!("xHCI: >>> BULK OUT EP FOUND: {:#x}, MPS: {} <<<", ep_addr, ep_mps);
+                                                        bulk_out = Some((ep_addr, ep_mps)); #[cfg(feature = "usbnet")] usbnet::note_bulk_ep(slot_id as u8, ep_addr, ep_mps); // USBNET7: see the IN twin above
                                                     }
                                                 }
                                             }
@@ -4808,7 +4808,7 @@ impl XhciController {
                                                     self.configure_endpoints(slot_id as u8, ia, im, oa, om);
                                                 }
                                                 _ => {
-                                                    serial_println!("xHCI: Mass storage missing bulk endpoints (in={:?}, out={:?}); skipping device.", bulk_in, bulk_out);
+                                                    crate::bootlog_println!("xHCI: Mass storage missing bulk endpoints (in={:?}, out={:?}); skipping device.", bulk_in, bulk_out);
                                                     self.start_next_port();
                                                 }
                                             }
@@ -4824,7 +4824,7 @@ impl XhciController {
                                                     self.configure_endpoints(slot_id as u8, ia, im, oa, om);
                                                 }
                                                 _ => {
-                                                    serial_println!("xHCI: FTDI missing bulk endpoints (in={:?}, out={:?}); skipping device.", bulk_in, bulk_out);
+                                                    crate::bootlog_println!("xHCI: FTDI missing bulk endpoints (in={:?}, out={:?}); skipping device.", bulk_in, bulk_out);
                                                     self.start_next_port();
                                                 }
                                             }
@@ -4841,7 +4841,7 @@ impl XhciController {
                                         // device enumerated cleanly; we simply have no driver, so
                                         // release the port and advance instead of parking. (Downstream
                                         // slots never drive the root port queue — see the HID path.)
-                                        serial_println!(
+                                        crate::bootlog_println!(
                                             "xHCI: no driver for device class {:#x} (slot {}, {:04x}:{:04x}); releasing port.",
                                             class_code, slot_id,
                                             self.slots[slot_id as usize].vid,
@@ -5306,7 +5306,7 @@ impl XhciController {
                                             let bytes = core::slice::from_raw_parts(buf_ptr, len);
                                             // Bit 0 = the hub itself (over-current / local change).
                                             if (bytes[0] & 1) != 0 {
-                                                serial_println!("xHCI: HUB slot {} status-change: hub-local (bit 0).", slot_id);
+                                                crate::bootlog_println!("xHCI: HUB slot {} status-change: hub-local (bit 0).", slot_id);
                                             }
                                             // Bit N = downstream port N changed. Queue each for the
                                             // main-loop service_hub_changes (GET_PORT_STATUS + action).
@@ -5319,7 +5319,7 @@ impl XhciController {
                                             for port in 1..=max_port {
                                                 let bit = port as usize;
                                                 if (bytes[bit / 8] & (1 << (bit % 8))) != 0 {
-                                                    serial_println!("xHCI: HUB slot {} status-change: port {}", slot_id, port);
+                                                    crate::bootlog_println!("xHCI: HUB slot {} status-change: port {}", slot_id, port);
                                                     if !self.hub_changes_pending.iter().any(|&e| e == (slot_id as u8, port)) {
                                                         self.hub_changes_pending.push((slot_id as u8, port));
                                                     }
@@ -5337,7 +5337,7 @@ impl XhciController {
                         }
                     },
                     _ => {
-                        serial_println!("xHCI: [Event] Unknown Type {}. Param={:#x}, Status={:#x}",
+                        crate::bootlog_println!("xHCI: [Event] Unknown Type {}. Param={:#x}, Status={:#x}",
                             trb_type, param, status);
                     }
                 }
@@ -5356,7 +5356,7 @@ impl XhciController {
         let usbsts_ptr = (self.op_base + 0x04) as *const u32; // Status reg is at +0x04
 
         unsafe {
-            serial_println!("xHCI: Asserting HCRST...");
+            crate::bootlog_println!("xHCI: Asserting HCRST...");
             let cmd = core::ptr::read_volatile(usbcmd_ptr);
             // Write 1 to Bit 1 (HCRST)
             core::ptr::write_volatile(usbcmd_ptr, cmd | 2);
@@ -5373,14 +5373,14 @@ impl XhciController {
             let _ = wait_until(
                 || (core::ptr::read_volatile(usbcmd_ptr) & 2) == 0,
                 hw_wait_budget(), "USBCMD.HCRST=0 (reset)");
-            serial_println!("xHCI: Reset Complete.");
+            crate::bootlog_println!("xHCI: Reset Complete.");
 
             // POLL: Wait for CNR (Controller Not Ready, Bit 11 in USBSTS) to clear
             // The controller needs time to re-initialize after reset.
             let _ = wait_until(
                 || (core::ptr::read_volatile(usbsts_ptr) & (1 << 11)) == 0,
                 hw_wait_budget(), "USBSTS.CNR=0");
-            serial_println!("xHCI: Controller Ready.");
+            crate::bootlog_println!("xHCI: Controller Ready.");
         }
     }
 
@@ -5388,7 +5388,7 @@ impl XhciController {
         // PIUSB-10: if CNR never cleared (init_interrupter aborted), do NOT program CRCR/DCBAAP —
         // the controller is not ready and would silently drop the writes. Fail loud, skip cleanly.
         if !XHCI_CNR_OK.load(Ordering::Acquire) {
-            serial_println!("xHCI: init_pointers SKIPPED — controller never left Not-Ready (CNR=1)");
+            crate::bootlog_println!("xHCI: init_pointers SKIPPED — controller never left Not-Ready (CNR=1)");
             return;
         }
         unsafe {
@@ -5400,7 +5400,7 @@ impl XhciController {
 
             let dcbaap_reg = (self.op_base + 0x30) as *mut u64;
             write_reg64(dcbaap_reg, dcbaap_ptr as u64);
-            serial_println!("xHCI: DCBAAP set to {:#x}", dcbaap_ptr as u64);
+            crate::bootlog_println!("xHCI: DCBAAP set to {:#x}", dcbaap_ptr as u64);
             x200_witness(self.op_base, "DCBAAP", dcbaap_ptr as u64);
 
             // 1b. SCRATCHPAD BUFFERS (xHCI spec 4.20). If the controller advertises Max Scratchpad
@@ -5438,7 +5438,7 @@ impl XhciController {
                     || (arr as usize) < heap_lo
                     || (arr as usize) + max_scratchpad * 8 > heap_hi
                 {
-                    serial_println!(
+                    crate::bootlog_println!(
                         "xHCI: scratchpad: array alloc unusable (arr={:#x} page_bytes={:#x} heap=[{:#x},{:#x})); skipping",
                         arr as u64, page_bytes, heap_lo, heap_hi
                     );
@@ -5470,7 +5470,7 @@ impl XhciController {
                         // it then DMA-writes into bus page 0 (exactly the 0x…0200 FillWrite RAS
                         // shape). Publishing nothing is the lesser failure: the controller may
                         // raise HSE, but it cannot wild-write. Loud + unconditional by design.
-                        serial_println!(
+                        crate::bootlog_println!(
                             "xHCI: X200 FLAG !! scratchpad: only {}/{} buffers allocated — NOT publishing DCBAA[0] (zero entries would be fetched as buffer pointers)",
                             filled, max_scratchpad
                         );
@@ -5481,14 +5481,14 @@ impl XhciController {
                         dma_coherency::clean(arr as usize, max_scratchpad * 8);
                         dma_coherency::clean(dcbaap_ptr as usize, core::mem::size_of::<u64>());
                         x200_witness(self.op_base, "DCBAA[0](scratchpad-array)", arr as u64);
-                        serial_println!(
+                        crate::bootlog_println!(
                             "xHCI: scratchpad: {} buffer(s) x {} bytes; DCBAA[0]={:#x} (heap PA in [{:#x},{:#x}))",
                             max_scratchpad, page_bytes, arr as u64, heap_lo, heap_hi
                         );
                     }
                 }
             } else {
-                serial_println!("xHCI: scratchpad: controller requests 0 buffers (none needed).");
+                crate::bootlog_println!("xHCI: scratchpad: controller requests 0 buffers (none needed).");
             }
 
             // 2. Set Command Ring Control Register (CRCR)
@@ -5497,7 +5497,7 @@ impl XhciController {
             let crcr_reg = (self.op_base + 0x18) as *mut u64;
             let crcr_value = ring_phys_addr | 1;
             write_reg64(crcr_reg, crcr_value);
-            serial_println!("xHCI: CRCR set to {:#x}", crcr_value);
+            crate::bootlog_println!("xHCI: CRCR set to {:#x}", crcr_value);
             x200_witness(self.op_base, "CRCR(command-ring)", ring_phys_addr);
         }
     }
@@ -5542,7 +5542,7 @@ impl XhciController {
 
             // Interrupter 0 Base = RuntimeBase + 0x20
             let ir0_base = runtime_base + 0x20;
-            serial_println!("xHCI: RuntimeBase={:#x}, IR0 Base={:#x}", runtime_base, ir0_base);
+            crate::bootlog_println!("xHCI: RuntimeBase={:#x}, IR0 Base={:#x}", runtime_base, ir0_base);
 
             // 2. Heap-allocate + fill the Event Ring Segment Table (ERST) in the HEAP-GUARD-vetted,
             //    firewall-clean DMA window (mirrors the DCBAA / scratchpad allocations above). Never
@@ -5580,7 +5580,7 @@ impl XhciController {
             // High-dword-first (write_erdp): even at init, guarantee the controller latches a
             // complete pointer under the PIUSB-21 32-bit split — never a stale/mirrored high.
             write_erdp(erdp_ptr, event_ring_phys); // Pointer to the RING, not the table
-            serial_println!("[xhciint] ERDP initialized to {:#018x} (hi-first, EHB clear)", event_ring_phys);
+            crate::bootlog_println!("[xhciint] ERDP initialized to {:#018x} (hi-first, EHB clear)", event_ring_phys);
             x200_witness(self.op_base, "ERSTBA", erst_table_phys);
             x200_witness(self.op_base, "ERST[0].ring(event-ring)", event_ring_phys);
             x200_witness(self.op_base, "ERDP", event_ring_phys);
@@ -5605,7 +5605,7 @@ impl XhciController {
             let iman = core::ptr::read_volatile(iman_ptr);
             core::ptr::write_volatile(iman_ptr, (iman & !0x1) | 0x2);
 
-            serial_println!("xHCI: Interrupter 0 enabled (IMAN.IE set, interrupt-driven).");
+            crate::bootlog_println!("xHCI: Interrupter 0 enabled (IMAN.IE set, interrupt-driven).");
         }
     }
 
@@ -5613,7 +5613,7 @@ impl XhciController {
         // PIUSB-10: if CNR never cleared, do NOT set CONFIG/RS=1 on a not-ready controller — fail
         // loud and skip so RS never latches into a controller that dropped its ring/interrupter setup.
         if !XHCI_CNR_OK.load(Ordering::Acquire) {
-            serial_println!("xHCI: start SKIPPED — controller never left Not-Ready (CNR=1); RS=1 not issued");
+            crate::bootlog_println!("xHCI: start SKIPPED — controller never left Not-Ready (CNR=1); RS=1 not issued");
             return;
         }
         unsafe {
@@ -5623,7 +5623,7 @@ impl XhciController {
             let config_ptr = (self.op_base + 0x38) as *mut u32;
             let config = core::ptr::read_volatile(config_ptr);
             core::ptr::write_volatile(config_ptr, (config & !0xFF) | (self.max_slots as u32));
-            serial_println!("xHCI: CONFIG register set to {} (MaxSlotsEn).", self.max_slots);
+            crate::bootlog_println!("xHCI: CONFIG register set to {} (MaxSlotsEn).", self.max_slots);
 
             // Write USBCMD: bit 0 = RS (Run/Stop), bit 2 = INTE (Interrupter Enable).
             // INTE is the global gate for host-system interrupts; without it QEMU never
@@ -5645,7 +5645,7 @@ impl XhciController {
             let _ = wait_until(
                 || (core::ptr::read_volatile(usbsts_ptr) & 1) == 0,
                 hw_wait_budget(), "USBSTS.HCH=0 (run)");
-            serial_println!("xHCI: Controller Started!");
+            crate::bootlog_println!("xHCI: Controller Started!");
             // BPACE (M4): RS=1 latched and USBSTS.HCH cleared — the controller is RUNNING. `d=`
             // from `xhci-ptrs` is CONFIG.MaxSlotsEn plus the run handshake, budget-bounded.
             crate::bootpace::record("xhci-run");
@@ -5676,7 +5676,7 @@ impl XhciController {
                 let dcbaap_raw = core::ptr::read_volatile((self.op_base + 0x30) as *const u64);
                 let usbcmd_rb = core::ptr::read_volatile(usbcmd_ptr);
                 let usbsts_rb = core::ptr::read_volatile(usbsts_ptr);
-                serial_println!(
+                crate::bootlog_println!(
                     "xHCI: [aarch64] RS=1 witness: USBCMD={:#x}(RS={} INTE={}) USBSTS={:#x}(HCH={} HSE={} CNR={} HCE={}) CRCR={:#018x}(CRR={} CS={} CA={} RCS={}) DCBAAP={:#018x} DCBAAP_raw64={:#018x}",
                     usbcmd_rb, usbcmd_rb & 1, (usbcmd_rb >> 2) & 1,
                     usbsts_rb, usbsts_rb & 1, (usbsts_rb >> 2) & 1, (usbsts_rb >> 11) & 1, (usbsts_rb >> 12) & 1,
@@ -5688,7 +5688,7 @@ impl XhciController {
                     let erstsz = core::ptr::read_volatile((ir0 + 0x08) as *const u32);
                     let erstba = read_reg64((ir0 + 0x10) as *const u64);
                     let erdp = read_reg64((ir0 + 0x18) as *const u64);
-                    serial_println!(
+                    crate::bootlog_println!(
                         "xHCI: [aarch64] RS=1 witness: IR0={:#x} IMAN={:#x}(IP={} IE={}) ERSTSZ={} ERSTBA={:#018x} ERDP={:#018x}(EHB={}) ERST[0].ring={:#018x}",
                         ir0, iman, iman & 1, (iman >> 1) & 1, erstsz, erstba, erdp, (erdp >> 3) & 1,
                         // Heap ERST (JETSON-XCARVE): read ERST[0].ring through the pointer we
@@ -5702,7 +5702,7 @@ impl XhciController {
             // captured as self.max_ports. The previous code read bits 0:7, which is
             // MaxSlots (64 here) — powering 64 nonexistent ports.
             let max_ports = self.max_ports;
-            serial_println!("xHCI: Max Ports = {}", max_ports);
+            crate::bootlog_println!("xHCI: Max Ports = {}", max_ports);
 
             // CCSTRIM: remember, per port, whether WE applied VBUS here (PP was 0) or found it
             // already on. This is the discriminator the CCSMARGIN line was missing, and it decides
@@ -5725,11 +5725,11 @@ impl XhciController {
 
                 // Bit 9: PP (Port Power)
                 if (status & (1 << 9)) == 0 {
-                    serial_println!("xHCI: Powering on Port {}", i);
+                    crate::bootlog_println!("xHCI: Powering on Port {}", i);
                     core::ptr::write_volatile(portsc_ptr, status | (1 << 9));
                     pp_applied[i as usize] = true;
                 } else {
-                    serial_println!("xHCI: Port {} already powered. Status: {:#x}", i, status);
+                    crate::bootlog_println!("xHCI: Port {} already powered. Status: {:#x}", i, status);
                 }
             }
             // BPACE (M4): every root port is powered — the SETTLE'S OWN START. This is the stamp
@@ -5945,7 +5945,7 @@ impl XhciController {
                     .store(ccs_first[i as usize] == CCS_NEVER, Ordering::Relaxed);
             }
             CCS_LATE_ARMED.store(true, Ordering::Release);
-            serial_println!("xHCI: port settle complete before CCS scan (settle_ms={})", settle_ms);
+            crate::bootlog_println!("xHCI: port settle complete before CCS scan (settle_ms={})", settle_ms);
             // BPACE: the fixed pre-enumeration settle (`hw_wait_budget()/4` — ~0.5 s of wall clock
             // and nothing else).
             //
@@ -6025,7 +6025,7 @@ impl XhciController {
                     Some((l, port)) => {
                         let margin = settle_ms as i64 - l as i64;
                         let _ = write!(line, "] latest={} margin_ms={} result=CCSMARGIN", l, margin);
-                        serial_println!("{}", line);
+                        crate::bootlog_println!("{}", line);
                         // The negative case, stated as a state and not left as a small integer.
                         // BLOWN: the at-deadline sweep was the first sample to see CCS=1 — this
                         // port reached the initial scan with no headroom at all, and one slower
@@ -6034,12 +6034,12 @@ impl XhciController {
                         // the USB 2.0 floor means the floor is where the population actually
                         // lives. Both are findings; only BLOWN is a failure.
                         if margin <= 0 {
-                            serial_println!(
+                            crate::bootlog_println!(
                                 "xHCI: !! ccs-margin BLOWN port={} latest={} settle_ms={} margin_ms={} \
                                  (deadline sweep was the first CCS=1; no headroom) result=CCSMARGIN-BLOWN",
                                 port, l, settle_ms, margin);
                         } else if margin <= (settle_ms / 5) as i64 {
-                            serial_println!(
+                            crate::bootlog_println!(
                                 "xHCI: !! ccs-margin TIGHT port={} latest={} settle_ms={} margin_ms={} \
                                  (under a fifth of budget left) result=CCSMARGIN-TIGHT",
                                 port, l, settle_ms, margin);
@@ -6082,7 +6082,7 @@ impl XhciController {
                 let pls = (s >> 5) & 0xF;
                 let cas = (s & (1 << 24)) != 0;
                 if cas || ((s & 1) == 0 && (pls == 6 || pls == 10)) {
-                    serial_println!(
+                    crate::bootlog_println!(
                         "xHCI: USB3 port {} needs a WARM reset (CAS={} PLS={} PORTSC={:#010x}).",
                         i, cas as u8, pls, s);
                     self.write_portsc(i, (1 << 9) | (1u32 << 31));
@@ -6111,7 +6111,7 @@ impl XhciController {
                 for i in polling_candidates {
                     let s = self.read_portsc(i);
                     if (s & 1) == 0 && (s >> 5) & 0xF == 7 && (s & (1 << 24)) == 0 {
-                        serial_println!("xHCI: USB3 port {} stuck in Polling (debounced); warm-resetting.", i);
+                        crate::bootlog_println!("xHCI: USB3 port {} stuck in Polling (debounced); warm-resetting.", i);
                         self.write_portsc(i, (1 << 9) | (1u32 << 31));
                     }
                 }
@@ -6128,7 +6128,7 @@ impl XhciController {
 
                 // Bit 0: CCS (Current Connect Status)
                 if (status & 1) != 0 {
-                    serial_println!("xHCI: Port {} connected (Status: {:#x}); queued for enumeration.", i, status);
+                    crate::bootlog_println!("xHCI: Port {} connected (Status: {:#x}); queued for enumeration.", i, status);
                     // CCSTRIM: the initial scan HAS this port, so it never fell to the recovery
                     // path and owes no late report — disarm it. (A USB3 link that finished
                     // training during the Polling debounce lands here: the settle was short for
@@ -6163,7 +6163,7 @@ impl XhciController {
         // PORTSC offset math AND collide with the "no port" sentinel in enumerating_port;
         // port > MaxPorts would read/W1C-write MMIO beyond the port register array.
         if port_id == 0 || port_id > self.max_ports {
-            serial_println!("xHCI: port status change with bogus port {}; ignoring.", port_id);
+            crate::bootlog_println!("xHCI: port status change with bogus port {}; ignoring.", port_id);
             return;
         }
         let portsc = self.read_portsc(port_id);
@@ -6173,7 +6173,7 @@ impl XhciController {
         }
         self.clear_port_change(port_id, changes);
         if changes & !((1 << 17) | (1 << 19) | (1 << 21)) != 0 {
-            serial_println!(
+            crate::bootlog_println!(
                 "xHCI: [Port {}] change bits {:#x} cleared (PORTSC={:#010x}).",
                 port_id, changes, portsc);
         }
@@ -6192,7 +6192,7 @@ impl XhciController {
                         // Reset succeeded. Don't touch the device yet: USB demands ~10 ms of
                         // reset-recovery (TRSTRCY) before it must accept transactions, and
                         // Linux waits ~50 ms. service_enum() issues ENABLE_SLOT after the gate.
-                        serial_println!("xHCI: [Port {}] reset complete (PED=1); settling before enable.", port_id);
+                        crate::bootlog_println!("xHCI: [Port {}] reset complete (PED=1); settling before enable.", port_id);
                         self.set_enum_stage("reset-settle");
                     } else {
                         // PRC/WRC with PED=0 = the reset positively FAILED (4.19.5): recover
@@ -6202,7 +6202,7 @@ impl XhciController {
                         self.recover_enumeration("reset-failed", 0);
                     }
                 } else {
-                    serial_println!(
+                    crate::bootlog_println!(
                         "xHCI: [Port {}] reset change in stage '{}'; ignoring (duplicate).",
                         port_id, self.enum_stage);
                 }
@@ -6213,7 +6213,7 @@ impl XhciController {
                 let has_slot = self.slots.iter().enumerate()
                     .any(|(i, s)| i != 0 && s.active && s.port_id == port_id);
                 if !has_slot && !self.ports_to_enumerate.contains(&port_id) {
-                    serial_println!("xHCI: [Port {}] unsolicited reset complete; queuing for enumeration.", port_id);
+                    crate::bootlog_println!("xHCI: [Port {}] unsolicited reset complete; queuing for enumeration.", port_id);
                     self.ports_to_enumerate.push(port_id);
                     if !self.enum_active {
                         self.start_next_port();
@@ -6250,7 +6250,7 @@ impl XhciController {
                         .wrapping_sub(CCS_SETTLE_START.load(Ordering::Relaxed))
                         / Self::cycles_per_ms();
                     let settle_ms = CCS_SETTLE_MS_LIVE.load(Ordering::Relaxed);
-                    serial_println!(
+                    crate::bootlog_println!(
                         "xHCI: !! ccs-margin LATE port={} t_seen_ms={} settle_ms={} short_by_ms<={} \
                          (missed the initial CCS scan; recovered via CSC; t_seen is drain time, an \
                          upper bound) result=CCSMARGIN-LATE",
@@ -6278,19 +6278,19 @@ impl XhciController {
                         if !self.requeue_after_settle.contains(&port_id) {
                             self.requeue_after_settle.push(port_id);
                         }
-                        serial_println!("xHCI: [Port {}] reconnect during enumeration; deferring re-queue until it settles.", port_id);
+                        crate::bootlog_println!("xHCI: [Port {}] reconnect during enumeration; deferring re-queue until it settles.", port_id);
                     } else {
                         // (a) reset side-effect — CCS never dropped; swallow (loop guard).
-                        serial_println!("xHCI: [Port {}] CSC during enumeration (reset side-effect, CCS stable); not re-queuing.", port_id);
+                        crate::bootlog_println!("xHCI: [Port {}] CSC during enumeration (reset side-effect, CCS stable); not re-queuing.", port_id);
                     }
                 } else if has_slot {
                     // A CSC on a still-present, already-enumerated device with no disconnect edge:
                     // a spurious connect-change (bounce that never dropped CCS). Re-enumerating a
                     // live device would disrupt it; leave it be.
-                    serial_println!("xHCI: [Port {}] connect-change on an active device (no disconnect); not re-queuing.", port_id);
+                    crate::bootlog_println!("xHCI: [Port {}] connect-change on an active device (no disconnect); not re-queuing.", port_id);
                 } else {
                     // (c) genuine hot-plug on an idle port.
-                    serial_println!("xHCI: [Port {}] device connected (hot-plug); queuing for enumeration.", port_id);
+                    crate::bootlog_println!("xHCI: [Port {}] device connected (hot-plug); queuing for enumeration.", port_id);
                     if !self.ports_to_enumerate.contains(&port_id) {
                         self.ports_to_enumerate.push(port_id);
                     }
@@ -6306,10 +6306,10 @@ impl XhciController {
                 // device isn't lost if it comes back before the enum gives up.
                 if port_id == self.enumerating_port {
                     self.enum_saw_disconnect = true;
-                    serial_println!("xHCI: [Port {}] device left during its own enumeration; will re-queue after settle.", port_id);
+                    crate::bootlog_println!("xHCI: [Port {}] device left during its own enumeration; will re-queue after settle.", port_id);
                 } else {
                     let disposed = self.dispose_disconnected_slots(port_id);
-                    serial_println!("xHCI: [Port {}] device disconnected ({} slot(s) torn down).", port_id, disposed);
+                    crate::bootlog_println!("xHCI: [Port {}] device disconnected ({} slot(s) torn down).", port_id, disposed);
                 }
             }
         }
@@ -6377,7 +6377,7 @@ impl XhciController {
             if !self.slots_to_disable.iter().any(|(s, _)| *s == i as u8) {
                 self.slots_to_disable.push((i as u8, 0));
             }
-            serial_println!("xHCI: [Port {}] slot {} torn down on disconnect; queued for DISABLE_SLOT.", port, i);
+            crate::bootlog_println!("xHCI: [Port {}] slot {} torn down on disconnect; queued for DISABLE_SLOT.", port, i);
             n += 1;
         }
         n
@@ -6412,10 +6412,10 @@ impl XhciController {
                     .any(|(i, s)| i != 0 && s.active && s.port_id == port);
                 if has_slot {
                     let disposed = self.dispose_disconnected_slots(port);
-                    serial_println!("xHCI: [Port {}] deferred re-plug: disposed {} stale slot(s) before re-enumeration.", port, disposed);
+                    crate::bootlog_println!("xHCI: [Port {}] deferred re-plug: disposed {} stale slot(s) before re-enumeration.", port, disposed);
                 }
                 if !self.ports_to_enumerate.contains(&port) {
-                    serial_println!("xHCI: [Port {}] re-queuing deferred hot re-plug for enumeration.", port);
+                    crate::bootlog_println!("xHCI: [Port {}] re-queuing deferred hot re-plug for enumeration.", port);
                     self.ports_to_enumerate.push(port);
                 }
             }
@@ -6441,12 +6441,12 @@ impl XhciController {
                 let pls = (portsc >> 5) & 0xF;
                 let cas = (portsc & (1 << 24)) != 0;
                 if self.port_major(port) == 3 && (cas || pls == 6 || pls == 10) {
-                    serial_println!(
+                    crate::bootlog_println!(
                         "xHCI: Port {} disconnected but link stuck (CAS={} PLS={}); warm-resetting.",
                         port, cas as u8, pls);
                     self.write_portsc(port, (1 << 9) | (1u32 << 31));
                 } else {
-                    serial_println!("xHCI: Port {} no longer connected; skipping.", port);
+                    crate::bootlog_println!("xHCI: Port {} no longer connected; skipping.", port);
                 }
                 continue;
             }
@@ -6454,7 +6454,7 @@ impl XhciController {
             self.enumerating_port = port;
             self.enum_saw_disconnect = false; // M1: fresh disconnect tracking per enumeration
             self.enum_resets = 1;
-            serial_println!("xHCI: === Enumerating Port {} (PORTSC={:#x}) ===", port, portsc);
+            crate::bootlog_println!("xHCI: === Enumerating Port {} (PORTSC={:#x}) ===", port, portsc);
             // BPACE: this port's enumeration begins. Paired with the `-done` stamp at the top of
             // this function, `d=` across the pair is the per-port enumeration cost — the number that
             // says whether the boot's USB time is one slow device or the debounce paid N times.
@@ -6490,7 +6490,7 @@ impl XhciController {
             // 50 ms TRSTRCY reset-settle is untouched on both paths.
             self.enum_cmd_phys = 0;
             if boot_scan {
-                serial_println!(
+                crate::bootlog_println!(
                     "xHCI: [enum port {}] initial boot scan — attach already stable through the settle; skipping the 100 ms connect debounce.",
                     port);
                 self.issue_enum_reset(port);
@@ -6504,7 +6504,7 @@ impl XhciController {
         self.enum_cmd_phys = 0;
         self.enum_resets = 0;
         self.set_enum_stage("idle");
-        serial_println!("xHCI: Port enumeration queue drained.");
+        crate::bootlog_println!("xHCI: Port enumeration queue drained.");
     }
 
     /// Unwedge and advance the enumeration FSM after the current port's enumeration FAILED —
@@ -6582,7 +6582,7 @@ impl XhciController {
             if !self.slots_to_disable.iter().any(|(s, _)| *s == i as u8) {
                 self.slots_to_disable.push((i as u8, 0));
             }
-            serial_println!("xHCI: [recovery] slot {} (port {}) queued for DISABLE_SLOT.", i, port);
+            crate::bootlog_println!("xHCI: [recovery] slot {} (port {}) queued for DISABLE_SLOT.", i, port);
         }
 
         // Retry with a fresh reset (bounded), or give up and advance the queue. Retry when the
@@ -6596,17 +6596,17 @@ impl XhciController {
         let link_recoverable = self.port_major(port) == 3 && (cas || pls == 6 || pls == 10);
         if ((portsc & 1) != 0 || link_recoverable) && self.enum_resets < 3 {
             self.enum_resets += 1;
-            serial_println!(
+            crate::bootlog_println!(
                 "xHCI: [recovery] retrying port {} (reset {} of 3) after a settle.",
                 port, self.enum_resets);
             self.enum_cmd_phys = 0;
             self.set_enum_stage("retry-wait");
         } else {
-            serial_println!("xHCI: [recovery] giving up on port {}; advancing the queue.", port);
+            crate::bootlog_println!("xHCI: [recovery] giving up on port {}; advancing the queue.", port);
             // The final verdict, photographable even after the boot log scrolls: dump the
             // topology summary (with the last-stall record) to serial on every give-up.
             for line in self.port_slot_summary() {
-                serial_println!("xHCI: {}", line);
+                crate::bootlog_println!("xHCI: {}", line);
             }
             self.enumerating_port = 0;
             self.start_next_port();
@@ -6628,7 +6628,7 @@ impl XhciController {
         // swallowed, silently losing the retry. Rewind to await-reset and let the polling
         // backstop / watchdog pick up the completion of the reset already running.
         if (portsc & (1 << 4)) != 0 {
-            serial_println!("xHCI: [enum port {}] reset already in progress; waiting for it.", port);
+            crate::bootlog_println!("xHCI: [enum port {}] reset already in progress; waiting for it.", port);
             self.enum_cmd_phys = 0;
             self.set_enum_stage("await-reset");
             return;
@@ -6647,12 +6647,12 @@ impl XhciController {
         self.enum_cmd_phys = 0;
         self.set_enum_stage("await-reset");
         if warm {
-            serial_println!(
+            crate::bootlog_println!(
                 "xHCI: [enum port {}] issuing WARM reset (CAS={} PLS={} attempt {}).",
                 port, cas as u8, pls, self.enum_resets);
             self.write_portsc(port, (1 << 9) | (1u32 << 31));
         } else {
-            serial_println!("xHCI: [enum port {}] issuing hot reset (attempt {}).", port, self.enum_resets);
+            crate::bootlog_println!("xHCI: [enum port {}] issuing hot reset (attempt {}).", port, self.enum_resets);
             self.write_portsc(port, (1 << 9) | (1 << 4));
         }
     }
@@ -6674,7 +6674,7 @@ impl XhciController {
             // the id for the retry enumeration). Never disable a slot that is active again;
             // if it truly needs tearing down, recovery will re-queue it.
             if self.slots[slot as usize].active {
-                serial_println!("xHCI: DISABLE_SLOT slot {} skipped (id re-allocated and live).", slot);
+                crate::bootlog_println!("xHCI: DISABLE_SLOT slot {} skipped (id re-allocated and live).", slot);
                 continue;
             }
             let trb = Trb {
@@ -6684,7 +6684,7 @@ impl XhciController {
             };
             match self.run_command_sync(trb) {
                 Ok((code, _)) => {
-                    serial_println!("xHCI: DISABLE_SLOT slot {} -> code {}.", slot, code);
+                    crate::bootlog_println!("xHCI: DISABLE_SLOT slot {} -> code {}.", slot, code);
                     if code == 1 {
                         unsafe {
                             if !self.dcbaap.is_null() {
@@ -6740,7 +6740,7 @@ impl XhciController {
                     // stage or recovers on failure) — but NO stage may age unwatched.
                     self.recover_enumeration("watchdog-timeout", 0);
                 } else if age >= 50 * per_ms {
-                    serial_println!("xHCI: [enum port {}] settle done; requesting slot.", port);
+                    crate::bootlog_println!("xHCI: [enum port {}] settle done; requesting slot.", port);
                     self.enable_slot(port);
                 }
             }
@@ -6768,7 +6768,7 @@ impl XhciController {
                 // Polling backstop for a lost/suppressed Port Status Change event.
                 let portsc = self.read_portsc(port);
                 if portsc & ((1 << 21) | (1 << 19)) != 0 {
-                    serial_println!(
+                    crate::bootlog_println!(
                         "xHCI: [enum port {}] reset change latched but no event was delivered; polling fallback.",
                         port);
                     self.handle_port_status(port);
@@ -6778,7 +6778,7 @@ impl XhciController {
             }
             "enable-slot" | "address-device" | "configure-eps" => {
                 if age >= hw_wait_budget() / 2 {
-                    serial_println!(
+                    crate::bootlog_println!(
                         "xHCI: WATCHDOG: port {} stuck at '{}' (cmd={:#x}).",
                         port, self.enum_stage, self.enum_cmd_phys);
                     // XHCI-COHERENCE (was JB3 boot-8, tegra-only; now general aarch64): on a
@@ -6812,7 +6812,7 @@ impl XhciController {
                                 core::ptr::read_volatile((self.op_base + 0x04) as *const u32),
                             )
                         };
-                        serial_println!(
+                        crate::bootlog_println!(
                             "xHCI: [aarch64] enable-slot stall witness: cmd_trb={:#x} CRCR={:#018x}(CRR={} CS={} CA={} RCS={}) USBCMD={:#x}(RS={}) USBSTS={:#x}(HCH={} HSE={} CNR={} HCE={}) => {}",
                             self.enum_cmd_phys, crcr, (crcr >> 3) & 1, (crcr >> 1) & 1, (crcr >> 2) & 1, crcr & 1,
                             usbcmd, usbcmd & 1,
@@ -6827,7 +6827,7 @@ impl XhciController {
                                 .map(|r| r.has_event())
                                 .unwrap_or(false)
                         };
-                        serial_println!(
+                        crate::bootlog_println!(
                             "xHCI: [aarch64] event ring after dc-civac: {}",
                             if landed {
                                 "EVENT PRESENT — writes LAND, CPU snoop broken (coherency)"
@@ -7002,20 +7002,20 @@ impl XhciController {
             let hcsparams1 = core::ptr::read_volatile(hcsparams1_ptr);
             let max_slots = hcsparams1 & 0xFF; // Bits 0-7
 
-            serial_println!("xHCI: Hardware supports {} Device Slots.", max_slots);
+            crate::bootlog_println!("xHCI: Hardware supports {} Device Slots.", max_slots);
 
             // 2. WRITE CONFIG REGISTER (Offset 0x38 from OPERATIONAL BASE)
             // Bits 0-7: MaxSlotsEn
             let config_ptr = (self.op_base + 0x38) as *mut u32;
             core::ptr::write_volatile(config_ptr, max_slots);
 
-            serial_println!("xHCI: CONFIG register set to {}.", max_slots);
+            crate::bootlog_println!("xHCI: CONFIG register set to {}.", max_slots);
 
             // 3. RUN
             let usbcmd_ptr = self.op_base as *mut u32;
             let usbsts_ptr = (self.op_base + 0x04) as *const u32;
 
-            serial_println!("xHCI: Starting Engine (INTERRUPTS DISABLED)...");
+            crate::bootlog_println!("xHCI: Starting Engine (INTERRUPTS DISABLED)...");
             let cmd = core::ptr::read_volatile(usbcmd_ptr);
             // UNA-19-POLLING: Clear Bit 2 (INTE) to disable interrupts (Polling Mode)
             // Set Bit 0 (Run)
@@ -7026,12 +7026,12 @@ impl XhciController {
             let _ = wait_until(
                 || (core::ptr::read_volatile(usbsts_ptr) & 1) == 0,
                 hw_wait_budget(), "USBSTS.HCH=0 (run)");
-            serial_println!("xHCI: ENGINE RUNNING (HCHalted cleared).");
+            crate::bootlog_println!("xHCI: ENGINE RUNNING (HCHalted cleared).");
         }
     }
 
     pub fn enable_slot(&mut self, port_id: u8) {
-        serial_println!("xHCI: Sending ENABLE_SLOT command for Port {}...", port_id);
+        crate::bootlog_println!("xHCI: Sending ENABLE_SLOT command for Port {}...", port_id);
 
         // TRB Type 9 = Enable Slot
         // Control: (Type 9 << 10)
@@ -7102,7 +7102,7 @@ impl XhciController {
     }
     pub fn address_device(&mut self, slot_id: u8, port_id: u8) {
         unsafe {
-            serial_println!("xHCI: Addressing Device (Slot {}, Port {})...", slot_id, port_id);
+            crate::bootlog_println!("xHCI: Addressing Device (Slot {}, Port {})...", slot_id, port_id);
 
             // 0. Allocate Contexts and Ring
             let input_layout = core::alloc::Layout::from_size_align(core::mem::size_of::<InputContext>(), 64).unwrap();
@@ -7136,7 +7136,7 @@ impl XhciController {
             // XHCI-COHERENCE: producer boundary — the controller reads DCBAA[slot] to locate the
             // output context during ADDRESS_DEVICE; clean the 8-byte entry to DRAM. No-op x86.
             dma_coherency::clean(dcbaap_ptr.add(slot_id as usize) as usize, core::mem::size_of::<u64>());
-            serial_println!("xHCI: DCBAAP[{}] linked to {:#x}", slot_id, output_ctx_phys);
+            crate::bootlog_println!("xHCI: DCBAAP[{}] linked to {:#x}", slot_id, output_ctx_phys);
             x200_witness(self.op_base, &alloc::format!("DCBAA[{}](out-ctx,root)", slot_id), output_ctx_phys);
 
             // 2. FILL INPUT CONTEXT (MANUAL OFFSET CALCULATION)
@@ -7172,7 +7172,7 @@ impl XhciController {
                     if self.fs_ep0_mps64[(port_id as usize) & 31] { 64 } else { 8 }
                 }
             };
-            serial_println!("xHCI: Port {} speed {} -> EP0 MPS {}", port_id, speed, mps0);
+            crate::bootlog_println!("xHCI: Port {} speed {} -> EP0 MPS {}", port_id, speed, mps0);
             let slot_ctx_ptr = base_ptr.add(CTX_WORDS);
             slot_ctx_ptr.add(0).write_volatile((1 << 27) | ((speed & 0xF) << 20)); // Context Entries=1 + Speed
             slot_ctx_ptr.add(1).write_volatile((port_id as u32) << 16); // Root Hub Port Number
@@ -7185,7 +7185,7 @@ impl XhciController {
             x200_witness(self.op_base, &alloc::format!("slot{} ep0 TRdeq(root)", slot_id), ep0_ring_phys);
             ep0_ctx_ptr.add(4).write_volatile(8); // Average TRB Length = 8
 
-            serial_println!("xHCI: Input Context Initialized (Manual Offsets). Phys={:#x}", input_ctx_phys);
+            crate::bootlog_println!("xHCI: Input Context Initialized (Manual Offsets). Phys={:#x}", input_ctx_phys);
 
             // 4. SEND ADDRESS DEVICE COMMAND
             let trb = Trb {
@@ -7220,7 +7220,7 @@ impl XhciController {
             // DCI = endpoint_number * 2 + (1 for IN, 0 for OUT).
             let in_dci = ((in_addr & 0x0F) * 2) + 1;
             let out_dci = (out_addr & 0x0F) * 2;
-            serial_println!("xHCI: Configuring Bulk Endpoints for Slot {} (IN {:#x} dci{} mps{}, OUT {:#x} dci{} mps{})...",
+            crate::bootlog_println!("xHCI: Configuring Bulk Endpoints for Slot {} (IN {:#x} dci{} mps{}, OUT {:#x} dci{} mps{})...",
                 slot_id, in_addr, in_dci, in_mps, out_addr, out_dci, out_mps);
 
             // 1. GET POINTERS
@@ -7294,7 +7294,7 @@ impl XhciController {
 
             x200_witness(self.op_base, &alloc::format!("slot{} bulk-in TRdeq", slot_id), bulk_in_phys);
             x200_witness(self.op_base, &alloc::format!("slot{} bulk-out TRdeq", slot_id), bulk_out_phys);
-            serial_println!("xHCI: Input Context Configured for Bulk Transport.");
+            crate::bootlog_println!("xHCI: Input Context Configured for Bulk Transport.");
             input_ctx_virt as u64
         }
     }
@@ -7331,7 +7331,7 @@ impl XhciController {
         match self.run_command_sync(trb) {
             Ok((1, _)) => true,
             Ok((c, _)) => {
-                serial_println!("xHCI: downstream Configure-Endpoint code {} (slot {})", c, slot_id);
+                crate::bootlog_println!("xHCI: downstream Configure-Endpoint code {} (slot {})", c, slot_id);
                 false
             }
             Err(_) => {
@@ -8234,7 +8234,7 @@ impl XhciController {
                 serial_println!(
                     ":: BOT: resync stage=read-state dci={} dir={} ok=no why=ep-unusable epstate={}->{} ::",
                     dci, dir, ep_state, ep_state);
-                serial_println!("xHCI: BOT recover: endpoint unusable (slot {} dci {} state {})", slot_id, dci, ep_state);
+                crate::bootlog_println!("xHCI: BOT recover: endpoint unusable (slot {} dci {} state {})", slot_id, dci, ep_state);
                 return false;
             }
         }
@@ -8869,7 +8869,7 @@ impl XhciController {
             // device's own residue claim at CSW validation below, which is the check that has
             // teeth: host and device disagreeing about how much moved IS a phase fault.
             if data_out && moved != data_len {
-                serial_println!(
+                crate::bootlog_println!(
                     "xHCI: BOT OUT data stage moved {} of {} bytes — phase fault (BOT 1.0 §6.7.3 case 9)",
                     moved, data_len);
                 return Err(BotError::TransferError(if code == 1 { 13 } else { code }));
@@ -8983,7 +8983,7 @@ impl XhciController {
 
             if sig != 0x53425355 {
                 BOT_BAD_SIG.fetch_add(1, Ordering::Relaxed);
-                serial_println!("xHCI: BOT bad CSW signature {:#x} (boot total {})",
+                crate::bootlog_println!("xHCI: BOT bad CSW signature {:#x} (boot total {})",
                     sig, BOT_BAD_SIG.load(Ordering::Relaxed));
                 hexdump("bad-sig");
                 // PIUSB-38: a garbage CSW (after a data-phase stall, the resync attempt did not land a
@@ -9017,7 +9017,7 @@ impl XhciController {
                     data_moved, residue, device_moved, bstatus,
                     if fault { "phase-fault" } else { "advisory-on-failed-csw" });
                 if fault {
-                    serial_println!(
+                    crate::bootlog_println!(
                         "xHCI: BOT CSW residue disagrees with the transfer event (dtl {}, host moved {}, device says {} moved) — phase fault",
                         data_len, data_moved, device_moved);
                     hexdump("residue-disagree");
@@ -9625,7 +9625,7 @@ impl XhciController {
         };
         if ep_addr == 0 { return; }
         let dci = ((ep_addr as u32) & 0x0F) * 2 + if ep_in { 1 } else { 0 };
-        serial_println!("xHCI: [usbw] bulk STALL recovery slot {} ep {:#04x} (dci {})", slot_id, ep_addr, dci);
+        crate::bootlog_println!("xHCI: [usbw] bulk STALL recovery slot {} ep {:#04x} (dci {})", slot_id, ep_addr, dci);
 
         // 1+2) Host-side: Reset Endpoint (Halted -> Stopped) + Set TR Dequeue past the faulted TRB.
         //      `resync_bulk_ep` is the single host-side implementation, shared with the class-level
@@ -9637,7 +9637,7 @@ impl XhciController {
         //    address (with the direction bit for an IN endpoint).
         match self.sync_control(slot_id, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false) {
             Ok(1) => {}
-            other => serial_println!("xHCI: [usbw] CLEAR_FEATURE(HALT) unexpected {:?}", other),
+            other => crate::bootlog_println!("xHCI: [usbw] CLEAR_FEATURE(HALT) unexpected {:?}", other),
         }
     }
 
@@ -9695,7 +9695,7 @@ impl XhciController {
         let in_dci = ((in_ep & 0x0F) * 2) + 1;
         let out_dci = (out_ep & 0x0F) * 2;
         BOT_RECOVER_COUNT.fetch_add(1, Ordering::Relaxed);
-        serial_println!(
+        crate::bootlog_println!(
             "xHCI: [usbw] FULL BOT reset-recovery slot {} (intf {}, bulk in {:#04x}/out {:#04x})",
             slot_id, intf, in_ep, out_ep);
         serial_println!(
@@ -9719,8 +9719,8 @@ impl XhciController {
         // 1) Bulk-Only Mass Storage Reset (class, targets the MSC interface).
         let reset_res = self.sync_control(slot_id, 0x21, 0xFF, 0x0000, intf as u16, 0, 0, false);
         let reset_ok = match reset_res {
-            Ok(1) => { serial_println!("xHCI: [usbw] Bulk-Only Mass Storage Reset OK (slot {})", slot_id); true }
-            other => { serial_println!("xHCI: [usbw] Bulk-Only Mass Storage Reset unexpected {:?}", other); false }
+            Ok(1) => { crate::bootlog_println!("xHCI: [usbw] Bulk-Only Mass Storage Reset OK (slot {})", slot_id); true }
+            other => { crate::bootlog_println!("xHCI: [usbw] Bulk-Only Mass Storage Reset unexpected {:?}", other); false }
         };
         {
             // BOTEV: the class reset rides EP0, so its failure has three shapes — an error
@@ -9745,7 +9745,7 @@ impl XhciController {
             match r {
                 Ok(1) => {}
                 other => {
-                    serial_println!("xHCI: [usbw] CLEAR_FEATURE(HALT) ep {:#04x} unexpected {:?}", ep_addr, other);
+                    crate::bootlog_println!("xHCI: [usbw] CLEAR_FEATURE(HALT) ep {:#04x} unexpected {:?}", ep_addr, other);
                     halts_ok = false;
                 }
             }
@@ -12570,9 +12570,9 @@ impl XhciController {
         let setcfg = self.sync_control(slot, 0x00, 0x09, 1, 0, 0, 0, false);
         space_add(SP_SETCFG, t_setcfg);
         match setcfg {
-            Ok(1) => serial_println!("xHCI: storage SET_CONFIGURATION(1) OK (slot {})", slot),
+            Ok(1) => crate::bootlog_println!("xHCI: storage SET_CONFIGURATION(1) OK (slot {})", slot),
             other => {
-                serial_println!("xHCI: storage SET_CONFIGURATION unexpected {:?} (slot {})", other, slot);
+                crate::bootlog_println!("xHCI: storage SET_CONFIGURATION unexpected {:?} (slot {})", other, slot);
                 self.storage_set_note(slot, "SET_CONFIGURATION failed");
                 return Err(BotError::Stall);
             }
@@ -13086,7 +13086,7 @@ impl XhciController {
         if SPACE_ARMED_AT.load(Ordering::Relaxed) != 0 {
             space_add(SP_WAIT, SPACE_ARMED_AT.load(Ordering::Relaxed));
         }
-        serial_println!("xHCI: === STORAGE BRING-UP (TUR/INQUIRY/READ CAPACITY) ===");
+        crate::bootlog_println!("xHCI: === STORAGE BRING-UP (TUR/INQUIRY/READ CAPACITY) ===");
         // BPACE: the SCSI bring-up chain begins. `d=` between this and `stor-ready` is the whole
         // TUR/INQUIRY/READ-CAPACITY negotiation — every one of whose stages is an awaited BOT
         // transaction, i.e. the phase the pump quantisation of §17.4 taxes hardest.
@@ -13097,7 +13097,7 @@ impl XhciController {
         let brought_up = self.bring_up_storage(slot);
         SPACE_ACTIVE.store(false, Ordering::Relaxed);
         match brought_up {
-            Ok(()) => serial_println!("xHCI: storage ready."),
+            Ok(()) => crate::bootlog_println!("xHCI: storage ready."),
             Err(e) => {
                 serial_println!("xHCI: storage bring-up failed: {:?}", e);
                 Self::space_report(false);
@@ -13164,16 +13164,16 @@ impl XhciController {
         let lun0 = self.slots[slot as usize].bot_lun;
         let lba0_ok = match self.storage_read10_on(slot, lun0, 0, 1) {
             Ok(res) => {
-                serial_println!("xHCI: READ(10) LBA0 CSW status={:?} residue={}", res.status, res.residue);
+                crate::bootlog_println!("xHCI: READ(10) LBA0 CSW status={:?} residue={}", res.status, res.residue);
                 if let Some(p) = self.storage_data_ptr_on(slot) {
                     unsafe {
                         let data = core::slice::from_raw_parts(p as *const u8, 512);
                         let sig = core::str::from_utf8(&data[0..21]).unwrap_or("INVALID");
-                        serial_println!("xHCI: SECTOR 0 SIGNATURE: {}", sig);
+                        crate::bootlog_println!("xHCI: SECTOR 0 SIGNATURE: {}", sig);
                         if sig == "UNA-OS-DISK-001-ALPHA" {
-                            serial_println!("xHCI: >>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<");
+                            crate::bootlog_println!("xHCI: >>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<");
                         }
-                        serial_println!("xHCI: [IRQ] xHCI interrupts taken so far: {}",
+                        crate::bootlog_println!("xHCI: [IRQ] xHCI interrupts taken so far: {}",
                             XHCI_IRQ_COUNT.load(Ordering::Relaxed));
                         // PIUSB-25: Pi mass-storage enumeration + LBA0 read-proof witness. aarch64-gated
                         // (byte-identical x86 codegen — nothing here changes the BOT/CSW core path; the
@@ -13564,7 +13564,7 @@ impl XhciController {
             if slot == 0 {
                 return;
             }
-            serial_println!("xHCI: === FTDI CONSOLE BRING-UP (SET_CONFIG + vendor setup) ===");
+            crate::bootlog_println!("xHCI: === FTDI CONSOLE BRING-UP (SET_CONFIG + vendor setup) ===");
             // SET_CONFIGURATION(1) — put the device in the CONFIGURED state so its bulk endpoints go
             // active. bmRequestType 0x00 (host->device | standard | device), bRequest 0x09 — the exact
             // call `bring_up_storage` makes.
@@ -13770,7 +13770,7 @@ impl XhciController {
         // live end to end.
         if !self.ftdi_pass_logged && self.ftdi_tx_total > 0 {
             self.ftdi_pass_logged = true;
-            serial_println!(
+            crate::bootlog_println!(
                 ":: U2.5: FTDI TX mirror -> PASS ({} boot bytes replayed) ::",
                 self.ftdi_tx_total
             );
@@ -14085,7 +14085,7 @@ impl XhciController {
             // EP0 pump budget, stalling the main loop. (Hub-downstream slots carry port_id 0 -> no
             // root PORTSC to consult -> treat as present.)
             if port != 0 && (self.read_portsc(port) & 1) == 0 {
-                serial_println!("xHCI: SET_PROTOCOL(boot) skipped for slot {} (device disconnected).", slot);
+                crate::bootlog_println!("xHCI: SET_PROTOCOL(boot) skipped for slot {} (device disconnected).", slot);
                 continue;
             }
             // All HID interfaces of one device share a single control endpoint (EP0). A STALL on one
@@ -14155,11 +14155,11 @@ impl XhciController {
     fn set_hid_boot_protocol(&mut self, slot: u8, intf: u8, what: &str) -> bool {
         match self.sync_control(slot, 0x21, 0x0B, 0x0000, intf as u16, 0, 0, false) {
             Ok(1) => {
-                serial_println!("xHCI: SET_PROTOCOL(boot) OK for {} (slot {}, iface {}).", what, slot, intf);
+                crate::bootlog_println!("xHCI: SET_PROTOCOL(boot) OK for {} (slot {}, iface {}).", what, slot, intf);
                 true
             }
             Ok(code) => {
-                serial_println!(
+                crate::bootlog_println!(
                     "xHCI: SET_PROTOCOL(boot) for {} (slot {}, iface {}) returned code {} (device may lack boot protocol / EP0 halted).",
                     what, slot, intf, code
                 );
@@ -14203,14 +14203,14 @@ impl XhciController {
         if hub_slot == 0 || self.slots[hub_slot as usize].ep0_ring.is_none() {
             return;
         }
-        serial_println!("xHCI: === HUB BRING-UP (slot {}) ===", hub_slot);
+        crate::bootlog_println!("xHCI: === HUB BRING-UP (slot {}) ===", hub_slot);
         let buf = self.slots[hub_slot as usize].descriptor_buffer as u64;
 
         // 1. SET_CONFIGURATION(1) so the hub's ports become controllable.
         //    bmRequestType 0x00 (H2D, standard, device), bRequest 9 (SET_CONFIGURATION).
         match self.sync_control(hub_slot, 0x00, 0x09, 1, 0, 0, 0, false) {
-            Ok(1) => serial_println!("xHCI: HUB slot {} SET_CONFIGURATION(1) -> code 1 (OK)", hub_slot),
-            Ok(c) => serial_println!("xHCI: HUB slot {} SET_CONFIGURATION(1) -> code {}", hub_slot, c),
+            Ok(1) => crate::bootlog_println!("xHCI: HUB slot {} SET_CONFIGURATION(1) -> code 1 (OK)", hub_slot),
+            Ok(c) => crate::bootlog_println!("xHCI: HUB slot {} SET_CONFIGURATION(1) -> code {}", hub_slot, c),
             Err(_) => { serial_println!("xHCI: HUB slot {} SET_CONFIGURATION(1) timed out", hub_slot); return; }
         }
 
@@ -14235,7 +14235,7 @@ impl XhciController {
             let p = buf as *const u8;
             (*p.add(2), (*p.add(3) as u16) | ((*p.add(4) as u16) << 8))
         };
-        serial_println!("xHCI: HUB slot {} speed {} ({}) desc-type {:#04x}: {} downstream ports (characteristics {:#06x})",
+        crate::bootlog_println!("xHCI: HUB slot {} speed {} ({}) desc-type {:#04x}: {} downstream ports (characteristics {:#06x})",
             hub_slot, hub_speed, if is_ss { "SS" } else { "HS/FS" }, hub_desc_type, nbr_ports, characteristics);
         // A hub reporting 0 ports strands every device behind it — treat as a failed bring-up
         // rather than silently marking a 0-port hub (which the downstream walk would no-op over).
@@ -14261,10 +14261,10 @@ impl XhciController {
         // xHCI Route String is 20 bits = 5 nibbles = at most 5 hub tiers. A hub already at depth 5
         // has no nibble left for its children — stop the descent here rather than aliasing tier 1.
         if hub_depth >= 5 {
-            serial_println!(
+            crate::bootlog_println!(
                 "xHCI: HUB slot {} at max USB tier depth ({}); not descending further.",
                 hub_slot, hub_depth);
-            serial_println!("xHCI: === HUB slot {} bring-up complete ===", hub_slot);
+            crate::bootlog_println!("xHCI: === HUB slot {} bring-up complete ===", hub_slot);
             return;
         }
 
@@ -14282,8 +14282,8 @@ impl XhciController {
         if is_ss {
             let depth = hub_depth as u16;
             match self.sync_control(hub_slot, 0x20, 0x0C, depth, 0, 0, 0, false) {
-                Ok(1) => serial_println!("xHCI: HUB slot {} SET_HUB_DEPTH({}) -> code 1 (OK)", hub_slot, depth),
-                Ok(c) => serial_println!("xHCI: HUB slot {} SET_HUB_DEPTH({}) -> code {}", hub_slot, depth, c),
+                Ok(1) => crate::bootlog_println!("xHCI: HUB slot {} SET_HUB_DEPTH({}) -> code 1 (OK)", hub_slot, depth),
+                Ok(c) => crate::bootlog_println!("xHCI: HUB slot {} SET_HUB_DEPTH({}) -> code {}", hub_slot, depth, c),
                 Err(_) => serial_println!("xHCI: HUB slot {} SET_HUB_DEPTH({}) timed out", hub_slot, depth),
             }
         }
@@ -14324,7 +14324,7 @@ impl XhciController {
             if pstatus & 1 == 0 {
                 continue; // nothing connected
             }
-            serial_println!("xHCI: HUB slot {} port {}: device connected; enumerating...", hub_slot, port);
+            crate::bootlog_println!("xHCI: HUB slot {} port {}: device connected; enumerating...", hub_slot, port);
             if let Some(mut speed) = self.reset_downstream_port(hub_slot, port, buf, is_ss) {
                 // ORIN-USB-FIX (R22 sitting-2): a SuperSpeed hub's wPortStatus does NOT carry
                 // the USB2 LS/HS speed bits — bit 9 is PORT_POWER on an SS hub, which
@@ -14336,7 +14336,7 @@ impl XhciController {
                 // (service_hub_changes) already does. Boot-walk / hot-plug now agree.
                 if is_ss {
                     speed = 4;
-                    serial_println!(
+                    crate::bootlog_println!(
                         "xHCI: HUB slot {} port {} is a SuperSpeed port (speed forced to SS).",
                         hub_slot, port);
                 }
@@ -14356,7 +14356,7 @@ impl XhciController {
         // devices were already enumerated by the walk above; this covers everything after.
         self.configure_hub_interrupt_ep(hub_slot);
 
-        serial_println!("xHCI: === HUB slot {} bring-up complete ===", hub_slot);
+        crate::bootlog_println!("xHCI: === HUB slot {} bring-up complete ===", hub_slot);
     }
 
     /// Mark a slot as a USB hub in its slot context (Hub bit, Number of Ports, TT Think Time) via
@@ -14392,7 +14392,7 @@ impl XhciController {
             (base_ptr.add(1).read_volatile(), dw0 & 0xFFFFF, (dw0 >> 20) & 0xF)
         };
         // One-line input-context summary of what we are about to submit (metal verdict aid).
-        serial_println!(
+        crate::bootlog_println!(
             "xHCI: HUB slot {} configure-input: route {:#x} speed {} ({}) ports {} hub-bit 1 ttt {} add-flags {:#x}",
             hub_slot, hub_route, hub_speed, if is_ss { "SS" } else { "HS/FS" }, nbr_ports, ttt, add_flags);
         let trb = Trb {
@@ -14406,7 +14406,7 @@ impl XhciController {
                 // route-scoped disconnect teardown can recognise this slot and size its bitmap.
                 self.slots[hub_slot as usize].is_hub = true;
                 self.slots[hub_slot as usize].hub_nbr_ports = nbr_ports;
-                serial_println!("xHCI: HUB slot {} marked as hub ({} ports)", hub_slot, nbr_ports);
+                crate::bootlog_println!("xHCI: HUB slot {} marked as hub ({} ports)", hub_slot, nbr_ports);
                 true
             }
             Ok((c, _)) => {
@@ -14521,19 +14521,19 @@ impl XhciController {
             }
             let elapsed = crate::arch::now_cycles().wrapping_sub(start);
             if trained {
-                serial_println!(
+                crate::bootlog_println!(
                     "xHCI: HUB port {} SS link trained (status {:#x} PLS={} U0, {} polls, {} cyc, attempt {})",
                     port, pstatus, pls, polls, elapsed, attempt);
                 break;
             }
-            serial_println!(
+            crate::bootlog_println!(
                 "xHCI: HUB port {} SS link not trained (status {:#x} PLS={} PED={}, {} polls, {} cyc, attempt {}); {}",
                 port, pstatus, pls, (pstatus >> 1) & 1, polls, elapsed, attempt,
                 if attempt + 1 < max_attempts { "retrying warm reset" } else { "giving up" });
         }
 
         if pstatus & (1 << 1) == 0 {
-            serial_println!("xHCI: HUB port {} did not enable after reset (status {:#x})", port, pstatus);
+            crate::bootlog_println!("xHCI: HUB port {} did not enable after reset (status {:#x})", port, pstatus);
             return None;
         }
         // Hub port status speed decode is USB2-only: bit 9 = Low Speed, bit 10 = High Speed, else Full
@@ -14543,7 +14543,7 @@ impl XhciController {
         let speed = if is_ss {
             4
         } else if pstatus & (1 << 9) != 0 { 2u32 } else if pstatus & (1 << 10) != 0 { 3 } else { 1 };
-        serial_println!("xHCI: HUB port {} reset OK (status {:#x}, {} reset, xHCI speed {})",
+        crate::bootlog_println!("xHCI: HUB port {} reset OK (status {:#x}, {} reset, xHCI speed {})",
             port, pstatus, if is_ss { "warm" } else { "hot" }, speed);
         Some(speed)
     }
@@ -14597,7 +14597,7 @@ impl XhciController {
         let (ep_addr, mps, interval) = match Self::parse_hub_int_ep(buf) {
             Some(v) => v,
             None => {
-                serial_println!("xHCI: HUB slot {} exposes no interrupt-IN status-change endpoint; hot-plug servicing disabled for it.", hub_slot);
+                crate::bootlog_println!("xHCI: HUB slot {} exposes no interrupt-IN status-change endpoint; hot-plug servicing disabled for it.", hub_slot);
                 return;
             }
         };
@@ -14657,12 +14657,12 @@ impl XhciController {
             Ok((1, _)) => {
                 self.slots[hub_slot as usize].hub_int_ep = ep_addr;
                 self.slots[hub_slot as usize].hub_int_mps = mps; #[cfg(feature = "witness")] xhcihub_statchg(input_ctx_virt as usize, dci, hub_slot, self.slots[hub_slot as usize].hub_nbr_ports, mps, 1); // XHCIHUB — record the SUCCESS arm's facts for the scorer at the tail of this file. The dwords are re-read out of the input context we just submitted rather than recomputed, so the witness reports the bytes the xHC was actually handed. ⚠ FOLDED.
-                serial_println!(
+                crate::bootlog_println!(
                     "xHCI: HUB slot {} status-change endpoint configured (ep {:#04x} mps {} dci {}); hot-plug armed.",
                     hub_slot, ep_addr, mps, dci);
                 self.queue_hub_change_read(hub_slot);
             }
-            Ok((c, _)) => { #[cfg(feature = "witness")] xhcihub_statchg(input_ctx_virt as usize, dci, hub_slot, self.slots[hub_slot as usize].hub_nbr_ports, mps, c); serial_println!("xHCI: HUB slot {} status-change Configure-Endpoint code {}", hub_slot, c) } // XHCIHUB — the REJECT arm: `c` is the completion code the scorer prints as `statchg=FAILED(<cc>)` (17 = Parameter Error, 8 = Bandwidth Error on the Orin bench). ⚠ FOLDED — the arm stays one line.
+            Ok((c, _)) => { #[cfg(feature = "witness")] xhcihub_statchg(input_ctx_virt as usize, dci, hub_slot, self.slots[hub_slot as usize].hub_nbr_ports, mps, c); crate::bootlog_println!("xHCI: HUB slot {} status-change Configure-Endpoint code {}", hub_slot, c) } // XHCIHUB — the REJECT arm: `c` is the completion code the scorer prints as `statchg=FAILED(<cc>)` (17 = Parameter Error, 8 = Bandwidth Error on the Orin bench). ⚠ FOLDED — the arm stays one line.
             Err(_) => { #[cfg(feature = "witness")] xhcihub_statchg(input_ctx_virt as usize, dci, hub_slot, self.slots[hub_slot as usize].hub_nbr_ports, mps, 0); serial_println!("xHCI: HUB slot {} status-change Configure-Endpoint timed out", hub_slot) } // XHCIHUB — cc 0 is not a real xHCI completion code (0 = Invalid), so the scorer prints `FAILED(0)` for a TIMEOUT and it cannot be confused with a code the controller returned. ⚠ FOLDED.
         }
     }
@@ -14752,7 +14752,7 @@ impl XhciController {
             if oc.is_null() { 0 } else { (*(oc as *const u32) >> 20) & 0xF }
         };
         let is_ss = hub_speed >= 4;
-        serial_println!(
+        crate::bootlog_println!(
             "xHCI: HUB slot {} port {} status: wPortStatus={:#06x} wPortChange={:#06x} ({})",
             hub_slot, port, wstatus, wchange, if is_ss { "SS" } else { "HS/FS" });
 
@@ -14767,7 +14767,7 @@ impl XhciController {
                 (s.route_string, s.route_depth, s.port_id)
             };
             if hub_depth >= 5 {
-                serial_println!(
+                crate::bootlog_println!(
                     "xHCI: HUB slot {} port {} connect ignored (hub at max USB tier depth {}).",
                     hub_slot, port, hub_depth);
             } else {
@@ -14792,12 +14792,12 @@ impl XhciController {
                         && self.slots[i].parent_hub_port == port
                 });
                 if stale {
-                    serial_println!(
+                    crate::bootlog_println!(
                         "xHCI: HUB slot {} port {} connect: stale slot(s) still claim this port (coalesced re-plug) — tearing down before re-enumeration.",
                         hub_slot, port);
                     self.disconnect_hub_port(hub_slot, port);
                 }
-                serial_println!("xHCI: HUB slot {} port {} connect: resetting + enumerating downstream device.", hub_slot, port);
+                crate::bootlog_println!("xHCI: HUB slot {} port {} connect: resetting + enumerating downstream device.", hub_slot, port);
                 // reset_downstream_port issues CLEAR C_PORT_CONNECTION + SET PORT_RESET, awaits
                 // C_PORT_RESET (bounded/paced), clears it, and reads the trained speed.
                 if let Some(mut speed) = self.reset_downstream_port(hub_slot, port, buf, is_ss) {
@@ -14805,20 +14805,20 @@ impl XhciController {
                         // SS hub ports are always SuperSpeed (the HS/FS speed bits don't apply);
                         // best-effort per XENUM-2 — the metal HS/FS mouse/keyboard path is exact.
                         speed = 4;
-                        serial_println!("xHCI: HUB slot {} port {} is a SuperSpeed port (speed forced to SS).", hub_slot, port);
+                        crate::bootlog_println!("xHCI: HUB slot {} port {} is a SuperSpeed port (speed forced to SS).", hub_slot, port);
                     }
                     let child_route = hub_route | (((port as u32).min(15)) << (4 * hub_depth));
                     let child_depth = hub_depth + 1;
                     self.enumerate_downstream(hub_slot, port, root_hub_port, child_route, child_depth, speed);
                 } else {
-                    serial_println!("xHCI: HUB slot {} port {} did not enable after reset; leaving unconfigured.", hub_slot, port);
+                    crate::bootlog_println!("xHCI: HUB slot {} port {} did not enable after reset; leaving unconfigured.", hub_slot, port);
                 }
             }
         } else if c_connection && !connected {
             // M3: the device on this downstream port left. Tear down its slot subtree.
             self.disconnect_hub_port(hub_slot, port);
         } else {
-            serial_println!("xHCI: HUB slot {} port {}: no actionable connection change.", hub_slot, port);
+            crate::bootlog_println!("xHCI: HUB slot {} port {}: no actionable connection change.", hub_slot, port);
         }
 
         // Deassert every latched change on this port so the Status Change Endpoint can report the
@@ -14842,7 +14842,7 @@ impl XhciController {
             // Witness: prove the full change word was acknowledged (acked mask == set change bits,
             // reserved bits excepted) so the Status Change Endpoint can quiesce. A residual
             // (wchange & !acked & known-selectable) would be the storm signature.
-            serial_println!(
+            crate::bootlog_println!(
                 "xHCI: HUB slot {} port {} acked change bits {:#06x} of wPortChange {:#06x} ({}) — Status Change Endpoint quiesced.",
                 hub_slot, port, acked, wchange, if is_ss { "SS" } else { "HS/FS" });
         }
@@ -14930,12 +14930,12 @@ impl XhciController {
             if !self.slots_to_disable.iter().any(|(s, _)| *s == i as u8) {
                 self.slots_to_disable.push((i as u8, 0));
             }
-            serial_println!(
+            crate::bootlog_println!(
                 "xHCI: HUB slot {} port {} disconnect: slot {} (route {:#x} tier {}) in subtree; queued for DISABLE_SLOT.",
                 hub_slot, port, i, route, depth);
             torn += 1;
         }
-        serial_println!(
+        crate::bootlog_println!(
             "xHCI: HUB slot {} port {} disconnect: {} slot(s) torn down (scope: root-port {} route-prefix {:#x} mask {:#x}, root + sibling ports + other trees untouched).",
             hub_slot, port, torn, hub_root_port, child_prefix & prefix_mask, prefix_mask);
     }
@@ -15036,12 +15036,12 @@ impl XhciController {
             match self.run_command_sync(trb) {
                 Ok((1, _)) => {
                     if attempt > 1 {
-                        serial_println!("xHCI: downstream ADDRESS_DEVICE code 1 (attempt {} of {})",
+                        crate::bootlog_println!("xHCI: downstream ADDRESS_DEVICE code 1 (attempt {} of {})",
                             attempt, XENUM_ADDR_RETRIES);
                     }
                     return true;
                 }
-                Ok((c, _)) => serial_println!("xHCI: downstream ADDRESS_DEVICE code {} (attempt {} of {})",
+                Ok((c, _)) => crate::bootlog_println!("xHCI: downstream ADDRESS_DEVICE code {} (attempt {} of {})",
                     c, attempt, XENUM_ADDR_RETRIES),
                 Err(_) => serial_println!("xHCI: downstream ADDRESS_DEVICE timed out (attempt {} of {})",
                     attempt, XENUM_ADDR_RETRIES),
@@ -15082,7 +15082,7 @@ impl XhciController {
         if !self.slots_to_disable.iter().any(|(s, _)| *s == slot_id) {
             self.slots_to_disable.push((slot_id, 0));
         }
-        serial_println!("xHCI: downstream slot {} disposed (unenumerated); queued for DISABLE_SLOT.", slot_id);
+        crate::bootlog_println!("xHCI: downstream slot {} disposed (unenumerated); queued for DISABLE_SLOT.", slot_id);
     }
 
     /// XENUM-4: update a hub-downstream slot's EP0 Max Packet Size in place with an Evaluate Context
@@ -15100,7 +15100,7 @@ impl XhciController {
             let input_ctx_virt = self.slots[slot_id as usize].input_context;
             let output_ctx_virt = self.slots[slot_id as usize].output_context;
             if input_ctx_virt.is_null() || output_ctx_virt.is_null() {
-                serial_println!("xHCI: downstream slot {} Evaluate Context skipped (null context); disposing.", slot_id);
+                crate::bootlog_println!("xHCI: downstream slot {} Evaluate Context skipped (null context); disposing.", slot_id);
                 return false;
             }
             let base_ptr = input_ctx_virt as *mut u32;
@@ -15130,11 +15130,11 @@ impl XhciController {
         };
         match self.run_command_sync(trb) {
             Ok((1, _)) => {
-                serial_println!("xHCI: downstream slot {} EP0 MPS updated via Evaluate Context ({}).", slot_id, mps0);
+                crate::bootlog_println!("xHCI: downstream slot {} EP0 MPS updated via Evaluate Context ({}).", slot_id, mps0);
                 true
             }
             Ok((c, _)) => {
-                serial_println!("xHCI: downstream slot {} Evaluate Context code {}; disposing.", slot_id, c);
+                crate::bootlog_println!("xHCI: downstream slot {} Evaluate Context code {}; disposing.", slot_id, c);
                 false
             }
             Err(_) => {
@@ -15200,7 +15200,7 @@ impl XhciController {
                 if (real_mps0 == 8 || real_mps0 == 16 || real_mps0 == 32 || real_mps0 == 64)
                     && real_mps0 != programmed
                 {
-                    serial_println!(
+                    crate::bootlog_println!(
                         "xHCI: downstream slot {} MPS0 learned {} (programmed {}); Evaluate Context.",
                         slot_id, real_mps0, programmed);
                     // XENUM-4: apply the learned MPS0 in place via an Evaluate Context command
@@ -15247,7 +15247,7 @@ impl XhciController {
                     desc_ok = true;
                     break;
                 }
-                serial_println!(
+                crate::bootlog_println!(
                     "xHCI: downstream slot {} device-descriptor bad read (got {} of 18, bLength={} type={:#x} vid={:04x} pid={:04x}, attempt {} of {}); retrying.",
                     slot_id, got, blen, dtype, dvid, dpid, attempt, XENUM_DESC_RETRIES);
             }
@@ -15255,7 +15255,7 @@ impl XhciController {
             for _ in 0..200 { if !self.drain_event_ring_once() { crate::hlt(); } }
         }
         if !desc_ok {
-            serial_println!(
+            crate::bootlog_println!(
                 "xHCI: downstream slot {} device-descriptor never read valid after {} attempts; leaving unconfigured.",
                 slot_id, XENUM_DESC_RETRIES);
             self.dispose_downstream_slot(slot_id as u8);
@@ -15265,7 +15265,7 @@ impl XhciController {
             let p = buf as *const u8;
             (*p.add(4), (*p.add(8) as u16) | ((*p.add(9) as u16) << 8), (*p.add(10) as u16) | ((*p.add(11) as u16) << 8))
         }; self.slots[slot_id as usize].vid = vid; self.slots[slot_id as usize].pid = pid; #[cfg(feature = "witness")] xhcihub_downstream(slot_id, vid, pid); // XHCIHUB (rmbp 2026-09-15, LEDGER S2) — **STORE the identity, do not merely print it.** Until this line `slots[].vid/.pid` were written from exactly ONE place, the root-port path's intercepted device-descriptor event (`>>> VENDOR ID` in the enumeration dispatch), and a hub-downstream device never reaches it: this function decoded vid/pid into LOCALS for the line below and dropped them. Every later reader of the slot therefore saw zeros — `:: MOUSE-1: … vid:pid=0000:0000` for a pointer whose enumeration line one row above names `vid=0627 pid=0001` (QEMU, measured at 2051470a) or `vid=1c4f pid=0034` (Orin bench, RENDER2-AUDIT N3), and the `no driver for device class` line reads the same fields. It is NOT cosmetic-only: `bot_ident` builds `BotDevIdent` from these fields, and its `anonymous()` guard — "a device this driver cannot name is charged nothing" — turned the ENTIRE retry ledger off for R24 boot6's hub-downstream SD reader (84 pump TIMEOUTs at the full uncut budget, `BOT: PARKED` never printed; see `BotDevIdent`'s type doc in this file, whose "from ONE place" sentence this line retires). The KEY is untouched: `same_place` still compares port+route only, exactly as R24 requires — this populates the descriptive half that was always meant to be filled in. Stored AFTER the bounded retry loop above has proved the descriptor read good (got 18 of 18, bLength >= 18, type 0x01, and NOT vid==0 && pid==0), so a zero here can only mean a device that genuinely reports zeros, never a short or early read. ⚠ FOLDED onto the closing brace — no line added; this file is compiled into the Pi's kernel8.img.
-        serial_println!("xHCI: HUB downstream slot {} device class={:#x} vid={:04x} pid={:04x} (route {:#x} tier {})",
+        crate::bootlog_println!("xHCI: HUB downstream slot {} device class={:#x} vid={:04x} pid={:04x} (route {:#x} tier {})",
             slot_id, class, vid, pid, route_string, depth);
 
         // A hub behind this hub (device-level class 0x09): queue it for its own bring-up so the
@@ -15273,7 +15273,7 @@ impl XhciController {
         // the downstream port walk; its slot already carries the extended route/depth. Mirrors the
         // root-port HUB DETECTED push. No config-descriptor read here — bring_up_hub SET_CONFIGs.
         if class == 0x09 {
-            serial_println!("xHCI: >>> HUB-BEHIND-HUB DETECTED (slot {}, tier {}) <<<", slot_id, depth);
+            crate::bootlog_println!("xHCI: >>> HUB-BEHIND-HUB DETECTED (slot {}, tier {}) <<<", slot_id, depth);
             self.hubs_pending.push(slot_id as u8);
             return;
         }
@@ -15288,7 +15288,7 @@ impl XhciController {
         // used to be HID-only, leaving a hubbed MSC device `other/unconfigured` forever (the
         // photographed metal failure). One storage device is supported, mirroring the root path.
         if let Some(((in_addr, in_mps), (out_addr, out_mps), msc_intf)) = self.parse_msc_config(buf) {
-            serial_println!(
+            crate::bootlog_println!(
                 "xHCI: >>> HUB DOWNSTREAM MASS STORAGE (slot {}, bulk in {:#x}/{} out {:#x}/{}) <<<",
                 slot_id, in_addr, in_mps, out_addr, out_mps);
             // STORSLOT: this arm used to READ `if self.storage_slot != 0 { ...ignoring... }` —
@@ -15325,7 +15325,7 @@ impl XhciController {
                         ":: STORSLOT: storage records FULL ({} devices) — hubbed slot {} configured its endpoints but is NOT brought up ::",
                         STORAGE_SLOTS, slot_id),
                 }
-                serial_println!("xHCI: Endpoints Configured (Slot {}). Storage ready.", slot_id);
+                crate::bootlog_println!("xHCI: Endpoints Configured (Slot {}). Storage ready.", slot_id);
             }
             return;
         }
@@ -15337,7 +15337,7 @@ impl XhciController {
         if self.record_hid_interfaces(slot_id, buf) {
             self.configure_hid_endpoints(slot_id, false);
         } else {
-            serial_println!("xHCI: HUB downstream slot {}: no HID interrupt endpoint", slot_id);
+            crate::bootlog_println!("xHCI: HUB downstream slot {}: no HID interrupt endpoint", slot_id);
         }
     }
 
@@ -15438,7 +15438,7 @@ impl XhciController {
                         let already_ptr = self.slots[slot_id as usize].is_mouse;
                         if current_intf_protocol == 1 {
                             if !already_kbd {
-                                serial_println!("xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {} <<<", ep_addr, ep_mps, ep_interval);
+                                crate::bootlog_println!("xHCI: >>> KEYBOARD INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {} <<<", ep_addr, ep_mps, ep_interval);
                                 self.slots[slot_id as usize].keyboard_ep = ep_addr;
                                 self.slots[slot_id as usize].keyboard_mps = ep_mps;
                                 self.slots[slot_id as usize].keyboard_interval = ep_interval;
@@ -15446,12 +15446,12 @@ impl XhciController {
                                 self.slots[slot_id as usize].is_keyboard = true;
                                 found_hid_ep = true;
                             } else {
-                                serial_println!("xHCI: (ignoring extra keyboard HID interface, ep {:#x})", ep_addr);
+                                crate::bootlog_println!("xHCI: (ignoring extra keyboard HID interface, ep {:#x})", ep_addr);
                             }
                         } else if current_intf_protocol == 2 {
                             // Boot mouse: the real pointer. Record it, overriding any earlier
                             // ambiguous proto-0 pointer on the same device.
-                            serial_println!("xHCI: >>> POINTER INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {}, RELATIVE boot-mouse (proto 2) <<<", ep_addr, ep_mps, ep_interval);
+                            crate::bootlog_println!("xHCI: >>> POINTER INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {}, RELATIVE boot-mouse (proto 2) <<<", ep_addr, ep_mps, ep_interval);
                             self.slots[slot_id as usize].mouse_ep = ep_addr;
                             self.slots[slot_id as usize].mouse_mps = ep_mps;
                             self.slots[slot_id as usize].mouse_interval = ep_interval;
@@ -15464,7 +15464,7 @@ impl XhciController {
                             // If this is actually a consumer-control interface, decoding it as
                             // absolute is the known proto-0 limitation — but it can't clobber a
                             // real mouse.
-                            serial_println!("xHCI: >>> POINTER INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {}, ABSOLUTE tablet (proto {}) <<<",
+                            crate::bootlog_println!("xHCI: >>> POINTER INTERRUPT IN EP FOUND: {:#x}, MPS: {}, Interval: {}, ABSOLUTE tablet (proto {}) <<<",
                                 ep_addr, ep_mps, ep_interval, current_intf_protocol);
                             self.slots[slot_id as usize].mouse_ep = ep_addr;
                             self.slots[slot_id as usize].mouse_mps = ep_mps;
@@ -15474,7 +15474,7 @@ impl XhciController {
                             self.slots[slot_id as usize].mouse_is_relative = false;
                             found_hid_ep = true;
                         } else {
-                            serial_println!("xHCI: (ignoring extra non-pointer HID interface, proto {}, ep {:#x})", current_intf_protocol, ep_addr);
+                            crate::bootlog_println!("xHCI: (ignoring extra non-pointer HID interface, proto {}, ep {:#x})", current_intf_protocol, ep_addr);
                         }
                         found_hid = false; // one interrupt-IN EP per interface; next iface re-arms
                     }
@@ -15492,7 +15492,7 @@ impl XhciController {
         let hcsparams1 = core::ptr::read_volatile(hcsparams1_ptr);
         let max_ports = (hcsparams1 >> 24) & 0xFF; // Top 8 bits
 
-        serial_println!("xHCI: Scanning {} Ports...", max_ports);
+        crate::bootlog_println!("xHCI: Scanning {} Ports...", max_ports);
 
         // 2. ITERATE PORTS
         for i in 0..max_ports {
@@ -15501,7 +15501,7 @@ impl XhciController {
 
             // Check CCS (Current Connect Status) - Bit 0
             if (port_csc & 1) != 0 {
-                serial_println!("xHCI: [PORT {}] DEVICE DETECTED! (Status: {:#x})", port_id, port_csc);
+                crate::bootlog_println!("xHCI: [PORT {}] DEVICE DETECTED! (Status: {:#x})", port_id, port_csc);
 
                 // 3. RESET PORT (The Handshake)
                 // Write 1 to PR (Port Reset) - Bit 4
@@ -15509,7 +15509,7 @@ impl XhciController {
                 let reset_cmd = port_csc | (1 << 4);
                 self.write_portsc(port_id, reset_cmd);
 
-                serial_println!("xHCI: [PORT {}] Reset Signal Sent. Waiting for Enable...", port_id);
+                crate::bootlog_println!("xHCI: [PORT {}] Reset Signal Sent. Waiting for Enable...", port_id);
             }
         }
     }
@@ -15546,7 +15546,7 @@ impl XhciController {
             // (address_device then programmed 64, so the full read won't babble) — go straight
             // through, which also prevents a learn/retry loop.
             if JB10_FS_EVAL_CTX && speed == 1 && !self.fs_ep0_mps64[(port as usize) & 31] {
-                serial_println!(
+                crate::bootlog_println!(
                     "xHCI: [usb fs-mps] slot {} (FS port {}): learning MPS0 before full descriptor.",
                     slot_id, port);
                 self.enum_cmd_phys = 0;
@@ -15575,12 +15575,12 @@ impl XhciController {
             return;
         }
         let mps0 = unsafe { *(buf as *const u8).add(7) }; // bMaxPacketSize0
-        serial_println!("xHCI: [usb fs-mps] slot {} bMaxPacketSize0 = {}", slot_id, mps0);
+        crate::bootlog_println!("xHCI: [usb fs-mps] slot {} bMaxPacketSize0 = {}", slot_id, mps0);
         // Phase 2: if it exceeds the guessed 8, patch EP0 MPS0 in place via Evaluate Context.
         // Only the legal FS values are accepted; anything else falls back rather than program junk.
         if mps0 > 8 {
             if mps0 != 16 && mps0 != 32 && mps0 != 64 {
-                serial_println!(
+                crate::bootlog_println!(
                     "xHCI: [usb fs-mps] slot {} illegal bMaxPacketSize0 {}; falling back.",
                     slot_id, mps0);
                 self.fs_ep0_mps64[(port as usize) & 31] = true;
@@ -15638,16 +15638,16 @@ impl XhciController {
         };
         match self.run_command_sync(trb) {
             Ok((1, _)) => {
-                serial_println!("xHCI: [usb fs-mps] slot {} EP0 MPS0 -> {} (Evaluate Context OK)", slot_id, mps0);
+                crate::bootlog_println!("xHCI: [usb fs-mps] slot {} EP0 MPS0 -> {} (Evaluate Context OK)", slot_id, mps0);
                 true
             }
-            Ok((c, _)) => { serial_println!("xHCI: [usb fs-mps] slot {} Evaluate Context code {}", slot_id, c); false }
+            Ok((c, _)) => { crate::bootlog_println!("xHCI: [usb fs-mps] slot {} Evaluate Context code {}", slot_id, c); false }
             Err(_) => { serial_println!("xHCI: [usb fs-mps] slot {} Evaluate Context timed out", slot_id); false }
         }
     }
 
     pub fn request_device_descriptor(&mut self, slot_id: u8) {
-        serial_println!("xHCI: Requesting Device Descriptor for Slot {}...", slot_id);
+        crate::bootlog_println!("xHCI: Requesting Device Descriptor for Slot {}...", slot_id);
         // Root-FSM-only caller (the hub path reads descriptors via sync_control). An EP0
         // transfer, not a command — clear the command tracking, note the stage.
         self.enum_cmd_phys = 0;
@@ -15700,7 +15700,7 @@ impl XhciController {
     }
 
     pub fn request_configuration_descriptor(&mut self, slot_id: u8) {
-        serial_println!("xHCI: Requesting Configuration Descriptor for Slot {}...", slot_id);
+        crate::bootlog_println!("xHCI: Requesting Configuration Descriptor for Slot {}...", slot_id);
         // Root-FSM-only caller (see request_device_descriptor).
         self.enum_cmd_phys = 0;
         self.set_enum_stage("cfg-desc");
@@ -15776,7 +15776,7 @@ impl XhciController {
             )
         };
         if !has_kbd && !has_mouse {
-            serial_println!("xHCI: configure_hid_endpoints(slot {}): no HID endpoints; skipping.", slot_id);
+            crate::bootlog_println!("xHCI: configure_hid_endpoints(slot {}): no HID endpoints; skipping.", slot_id);
             if root_fsm {
                 self.start_next_port();
             }
@@ -15877,7 +15877,7 @@ impl XhciController {
             max_dci = mdci;
         }
 
-        serial_println!(
+        crate::bootlog_println!(
             "xHCI: Configuring HID Endpoints for Slot {} ({}{}{}) in one Configure-Endpoint (max DCI {}).",
             slot_id,
             if has_kbd { "keyboard" } else { "" },
@@ -15910,7 +15910,7 @@ impl XhciController {
     /// the caller (the command dispatch) sets the enum stage when this is the root FSM's.
     pub fn send_set_configuration(&mut self, slot_id: u8, config_val: u8) {
         unsafe {
-            serial_println!("xHCI: Sending SET_CONFIGURATION({}) to Slot {}", config_val, slot_id);
+            crate::bootlog_println!("xHCI: Sending SET_CONFIGURATION({}) to Slot {}", config_val, slot_id);
             let setup_trb = Trb {
                 parameter: 0x0000000000000900 | ((config_val as u64) << 16), // bmRequestType=0, bRequest=9 (SET_CONFIGURATION), wValue=config_val
                 status: 8, // Length 8
@@ -16009,11 +16009,11 @@ impl XhciController {
             // for a completion that never arrives and burn the EP0 pump budget (same guard as
             // `service_hid_setproto`). Hub-downstream slots carry port_id 0 -> treat as present.
             if port != 0 && (self.read_portsc(port) & 1) == 0 {
-                serial_println!("xHCI: HID un-halt skipped for slot {} (device disconnected).", slot);
+                crate::bootlog_println!("xHCI: HID un-halt skipped for slot {} (device disconnected).", slot);
                 continue;
             }
             let dci: u32 = ((ep_addr as u32) & 0x0F) * 2 + if (ep_addr & 0x80) != 0 { 1 } else { 0 };
-            serial_println!(
+            crate::bootlog_println!(
                 "xHCI: [usb39] un-halting {} interrupt-IN slot {} ep {:#04x} (dci {})",
                 if is_mouse { "pointer" } else { "keyboard" }, slot, ep_addr, dci);
 
@@ -16022,7 +16022,7 @@ impl XhciController {
                 control: (14 << 10) | (dci << 16) | ((slot as u32) << 24) };
             match self.run_command_sync(reset_trb) {
                 Ok((1, _)) => {}
-                other => serial_println!("xHCI: [usb39] Reset Endpoint unexpected {:?}", other),
+                other => crate::bootlog_println!("xHCI: [usb39] Reset Endpoint unexpected {:?}", other),
             }
             // 2) Set TR Dequeue Pointer to the ring's current enqueue slot (past the faulted TRB).
             if let Some((phys, dcs)) = deq {
@@ -16030,13 +16030,13 @@ impl XhciController {
                     control: (16 << 10) | (dci << 16) | ((slot as u32) << 24) };
                 match self.run_command_sync(deq_trb) {
                     Ok((1, _)) => {}
-                    other => serial_println!("xHCI: [usb39] Set TR Dequeue unexpected {:?}", other),
+                    other => crate::bootlog_println!("xHCI: [usb39] Set TR Dequeue unexpected {:?}", other),
                 }
             }
             // 3) Device-side CLEAR_FEATURE(ENDPOINT_HALT); wIndex = full endpoint address.
             match self.sync_control(slot, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false) {
                 Ok(1) => {}
-                other => serial_println!("xHCI: [usb39] CLEAR_FEATURE(HALT) unexpected {:?}", other),
+                other => crate::bootlog_println!("xHCI: [usb39] CLEAR_FEATURE(HALT) unexpected {:?}", other),
             }
             // 4) The host ring dequeue moved; the old expectation is stale. Clear it so the first
             //    completion after recovery is accepted, then arm the read.
@@ -16683,7 +16683,7 @@ fn xhcihub_downstream(slot_id: u8, vid: u16, pid: u16) {
     XHCIHUB_DOWN.fetch_add(1, Ordering::Relaxed);
     if vid == 0 && pid == 0 {
         XHCIHUB_ANON.fetch_add(1, Ordering::Relaxed);
-        serial_println!("xHCI: XHCIHUB: downstream slot {} still anonymous (vid:pid=0000:0000)", slot_id);
+        crate::bootlog_println!("xHCI: XHCIHUB: downstream slot {} still anonymous (vid:pid=0000:0000)", slot_id);
     }
 }
 
@@ -17163,6 +17163,7 @@ impl XhciController {
     /// After the descriptor walk of a non-storage, non-FTDI device: configure the ECM bulk pair, or
     /// request the device's other configuration, or leave the slot to the stock path.
     fn usbnet_after_walk(&mut self, slot_id: u8, is_usbnet: bool, bulk_in: Option<(u8, u16)>, bulk_out: Option<(u8, u16)>) {
+        let (bulk_in, bulk_out) = usbnet::first_bulk(slot_id, bulk_in, bulk_out); // USBNET7: the AX88179 pair is the FIRST of each direction (OUT 0x03, not 0x05)
         if is_usbnet && usbnet::walk_is_candidate(slot_id) {
             match (bulk_in, bulk_out) {
                 (Some((ia, im)), Some((oa, om))) => {
@@ -17210,7 +17211,7 @@ impl XhciController {
         if self.usbnet_configuring_slot != 0 && self.usbnet_configuring_slot == slot_id {
             self.usbnet_configuring_slot = 0;
             usbnet::configured(slot_id);
-            serial_println!("xHCI: USBNET Endpoints Configured (Slot {}). Link bring-up pending.", slot_id);
+            crate::bootlog_println!("xHCI: USBNET Endpoints Configured (Slot {}). Link bring-up pending.", slot_id);
             return true;
         }
         false
@@ -17247,6 +17248,7 @@ impl XhciController {
             if code == 1 || code == 13 {
                 let rxl = usbnet::rx_len(); // USBNET5 M1: 20/24/26 KiB for the AX88179, 2 KiB for ECM
                 let n = rxl.saturating_sub(residue as usize);
+                usbnet::note_xfer(n); // USBNET7: every IN completion counted, the sub-4-byte ones too (they were silent)
                 dma_coherency::inval(rx_phys as usize, rxl);
                 let frame = unsafe { core::slice::from_raw_parts(rx_phys as *const u8, n.min(rxl)) };
                 if usbnet::kind() == usbnet::KIND_AX88179 { usbnet::deliver_ax(frame); } else { usbnet::deliver(frame); }
@@ -17265,6 +17267,7 @@ impl XhciController {
                 }
             };
             usbnet::arm(in_dci, wait_trb_phys);
+            usbnet::note_arm(1, in_ep); // USBNET7: `[usbnet] rx_arm n= ep= mps=` once, then a counter
             self.ring_doorbell(slot, in_dci as u32);
         }
 
@@ -17410,6 +17413,13 @@ impl XhciController {
                 if !self.ax_write_rb(slot, "MEDIUM_STATUS_MODE", usbnet::ax::REG_MEDIUM_STATUS_MODE, &m.to_le_bytes()) {
                     serial_println!("[usbnet] MEDIUM_STATUS_MODE rewrite refused for {:#06x}", m);
                 }
+                // USBNET7 M2: Linux `ax88179_link_reset` rewrites the bulk-IN queue control with the medium, and usbnet open's
+                // `set_rx_mode` (re)writes RX_CTL START once the MAC runs at the negotiated speed. Both are read back on the
+                // `regs when=linkup` line just below (no new boot line, R80).
+                let q = usbnet::qctrl();
+                if !self.ax_write(slot, usbnet::ax::REG_RX_BULKIN_QCTRL, &q) || !self.ax_write(slot, usbnet::ax::REG_RX_CTL, &usbnet::ax::RX_CTL_RUN.to_le_bytes()) {
+                    serial_println!("[usbnet] link-up QCTRL/RX_CTL rewrite refused");
+                }
                 self.usbnet_ax_regs(slot, "linkup"); // USBNET5 M2: the RX-side registers as the part holds them once the link is negotiated
             }
         }
@@ -17457,27 +17467,35 @@ impl XhciController {
         Self::ax_wait_ms(100);
         let mut mac = [0u8; 6];
         if !self.ax_read(slot, REG_NODE_ID, &mut mac) || !usbnet::set_mac_bytes(&mac) { usbnet::set_up(slot, false, Some("NODE_ID")); return; }
+        if !self.ax_write_rb(slot, "NODE_ID", REG_NODE_ID, &mac) { usbnet::set_up(slot, false, Some("NODE_ID write")); return; } // USBNET7: Linux ax88179_get_mac_addr writes the station address back right here, before the queue setup
         let mut link = [0u8; 1];
         let _ = self.ax_read(slot, REG_PHYSICAL_LINK_STATUS, &mut link);
         let qctrl = if usbnet::out_mps() >= 1024 || link[0] & 0x04 != 0 { BULKIN_QCTRL_SS } else if link[0] & 0x02 != 0 { BULKIN_QCTRL_HS } else { BULKIN_QCTRL_FS };
         let rxbuf = usbnet::set_rx_len_from_qctrl(&qctrl); // USBNET5 M1: post 1024*(q[3]+2) bytes per bulk-IN TD, as Linux rx_urb_size
+        usbnet::set_qctrl(&qctrl); // USBNET7: the tuple is rewritten at link-up (Linux link_reset)
         serial_println!("[usbnet] rx buf={} qctrl={:02x?}", rxbuf, qctrl);
         if !self.ax_write_rb(slot, "RX_BULKIN_QCTRL", REG_RX_BULKIN_QCTRL, &qctrl) { usbnet::set_up(slot, false, Some("RX_BULKIN_QCTRL")); return; }
         if !self.ax_write_rb(slot, "PAUSE_WATERLVL_LOW", REG_PAUSE_WATERLVL_LOW, &[0x34]) || !self.ax_write_rb(slot, "PAUSE_WATERLVL_HIGH", REG_PAUSE_WATERLVL_HIGH, &[0x52]) { usbnet::set_up(slot, false, Some("PAUSE_WATERLVL")); return; }
         if !self.ax_write_rb(slot, "RXCOE_CTL", REG_RXCOE_CTL, &[0]) || !self.ax_write_rb(slot, "TXCOE_CTL", REG_TXCOE_CTL, &[0]) { usbnet::set_up(slot, false, Some("COE_CTL")); return; }
-        if !self.ax_write_rb(slot, "MONITOR_MODE", REG_MONITOR_MODE, &[0]) { usbnet::set_up(slot, false, Some("MONITOR_MODE")); return; }
-        // USBNET6 M1: the order is PHY up -> medium -> node id -> RX_CTL START (receive enabled last, once everything it filters on is set).
-        // PHY: advertise 10/100 + pause and 1000 full (MII ADVERTISE, CTRL1000), then restart autoneg (BMCR).
-        let phy_ok = self.ax_phy_write(slot, MII_ADVERTISE, ADVERTISE_ALL_PAUSE) && self.ax_phy_write(slot, MII_CTRL1000, ADVERTISE_1000FULL) && self.ax_phy_write(slot, MII_BMCR, BMCR_ANEG_RESTART);
-        if !self.ax_write_rb(slot, "MEDIUM_STATUS_MODE", REG_MEDIUM_STATUS_MODE, &MEDIUM_RUN.to_le_bytes()) { usbnet::set_up(slot, false, Some("MEDIUM_STATUS_MODE")); return; }
-        if !self.ax_write_rb(slot, "NODE_ID", REG_NODE_ID, &mac) { usbnet::set_up(slot, false, Some("NODE_ID write")); return; } // Linux ax88179_get_mac_addr writes the station address back
+        // USBNET7 M2 (B328): Linux `ax88179_reset` order, which boot 19 flew and received on — RX_CTL START, then MONITOR, then
+        // MEDIUM (RECEIVE_EN), and the PHY autoneg restart LAST. USBNET6 had moved the PHY restart first and RX_CTL after MEDIUM
+        // and a NODE_ID write; boot 20 then received nothing with every readback identical to boot 19's.
         if !self.ax_write_rb(slot, "RX_CTL", REG_RX_CTL, &RX_CTL_RUN.to_le_bytes()) { usbnet::set_up(slot, false, Some("RX_CTL")); return; }
+        if !self.ax_write_rb(slot, "MONITOR_MODE", REG_MONITOR_MODE, &[0]) { usbnet::set_up(slot, false, Some("MONITOR_MODE")); return; }
+        if !self.ax_write_rb(slot, "MEDIUM_STATUS_MODE", REG_MEDIUM_STATUS_MODE, &MEDIUM_RUN.to_le_bytes()) { usbnet::set_up(slot, false, Some("MEDIUM_STATUS_MODE")); return; }
+        // PHY: advertise 10/100 + pause and 1000 full (MII ADVERTISE, CTRL1000), then restart autoneg (BMCR); each read back onto
+        // the `ax88179 link_status=` line below.
+        let phy_ok = self.ax_phy_write(slot, MII_ADVERTISE, ADVERTISE_ALL_PAUSE) && self.ax_phy_write(slot, MII_CTRL1000, ADVERTISE_1000FULL) && self.ax_phy_write(slot, MII_BMCR, BMCR_ANEG_RESTART);
+        let adv_rb = self.ax_phy_read(slot, MII_ADVERTISE).unwrap_or(0xffff);
+        let c1000_rb = self.ax_phy_read(slot, MII_CTRL1000).unwrap_or(0xffff);
+        let bmcr_rb = self.ax_phy_read(slot, MII_BMCR).unwrap_or(0xffff);
         usbnet::poll_start(crate::arch::ms(), link[0]);
         let mut medium = [0u8; 2];
         let _ = self.ax_read(slot, REG_MEDIUM_STATUS_MODE, &mut medium);
         serial_println!(
-            "[usbnet] ax88179 link_status={:#04x} medium(readback)={:#06x} qctrl={} phy_aneg={} — UNFLOWN register map, confirm on the bench",
-            link[0], u16::from_le_bytes(medium), if qctrl == BULKIN_QCTRL_SS { "ss" } else { "hs" }, phy_ok as u8
+            "[usbnet] ax88179 link_status={:#04x} medium(readback)={:#06x} qctrl={} phy_aneg={} adv={:#06x}/{:#06x} ctrl1000={:#06x}/{:#06x} bmcr={:#06x}/{:#06x} — UNFLOWN register map, confirm on the bench",
+            link[0], u16::from_le_bytes(medium), if qctrl == BULKIN_QCTRL_SS { "ss" } else { "hs" }, phy_ok as u8,
+            ADVERTISE_ALL_PAUSE, adv_rb, ADVERTISE_1000FULL, c1000_rb, BMCR_ANEG_RESTART, bmcr_rb
         );
         usbnet::set_up(slot, phy_ok, None); // USBNET6 M1: the per-register `[usbnet] reg` lines above replace the bring-up `regs` dump
     }
@@ -17533,4 +17551,19 @@ impl usbnet::ax_xport::AxTransport for XhciAx<'_> {
     fn reg_read(&mut self, reg: u16, out: &mut [u8]) -> bool { self.c.ax_read(self.slot, reg, out) }
     fn reg_write(&mut self, reg: u16, data: &[u8]) -> bool { self.c.ax_write(self.slot, reg, data) }
     fn wait_ms(&mut self, ms: u64) { XhciController::ax_wait_ms(ms) }
+}
+
+/// USBNET7 M3: the link's bulk-IN ring as the controller holds it, for the `tests usbnet` FAIL dump —
+/// (TR Dequeue Pointer raw from the output endpoint context, our enqueue index, our cycle bit, the endpoint state).
+#[cfg(feature = "usbnet")]
+impl XhciController {
+    pub fn usbnet_ring_state(&self) -> Option<(u64, usize, bool, u8)> {
+        let slot = usbnet::slot();
+        if slot == 0 { return None; }
+        let s = &self.slots[slot as usize];
+        if s.bulk_in_ep == 0 { return None; }
+        let dci = ((s.bulk_in_ep & 0x0F) * 2) + 1;
+        let r = s.bulk_in_ring.as_ref()?;
+        Some((self.ep_ctx_deq(slot, dci), r.enqueue_index(), r.cycle_bit(), self.ep_state_of(slot, dci)))
+    }
 }

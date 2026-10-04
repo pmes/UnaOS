@@ -1167,6 +1167,8 @@ fi
 # Kept in sync with crates/kernel/Cargo.toml AND builder/src/main.rs (the four-place trap); the map
 # line is parser-conformant so the KNOB→BUILDER WIRING CHECK covers it.
 [ -n "${UNAOS_KEPLER_VBLANK:-}" ] && _feats="${_feats}nvidia-kepler-vblank,"
+# KVBLANK8 (B318): UNAOS_KVBLANK_TRACE=1 prints the vblank interrupt path at takeover (implies nvidia-kepler-vblank). x86-only. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_KVBLANK_TRACE:-}" ] && _feats="${_feats}kvblank_trace,"
 # R0 / RTWIT: UNAOS_RTWIT=1 arms the WORST-CASE RULER (`rtwit`) — the `[rtwit]` tail instruments
 # (input→present latency, per-lock max hold, max interrupt-mask span). MAXes only, never a mean; pure
 # measurement, changes no scheduling/locking/present behaviour. x86_64-only in effect (the real impl is
@@ -1221,14 +1223,14 @@ fi
 [ -n "${UNAOS_LINUXABI:-}" ] && _feats="${_feats}linuxabi,"
 # BANDY3: UNAOS_BUSREG=1 arms fulfiller registration on the bus wire (crate::bus_route; `tests bandy3`). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_BUSREG:-}" ] && _feats="${_feats}busreg,"
-# VEINCORE (B304): UNAOS_VEIN=1 arms the chat verbs' kernel relay plumbing (crate::vein_bus: `vein` verb, `tests vein`); implies busreg. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
-[ -n "${UNAOS_VEIN:-}" ] && _feats="${_feats}vein,"
 # LUMENBIN: UNAOS_LUMEN=1 arms the Lumen chat window's dock pin by default and `tests lumen` (crate::lumen). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_LUMEN:-}" ] && _feats="${_feats}lumen,"
 # NETRING3 (B306): UNAOS_NETRING3=1 arms SYS_GETRANDOM 56 / SYS_RESOLVE 57 for ring 3 and `tests net`. Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_NETRING3:-}" ] && _feats="${_feats}netring3,"
 # BRIGHTFLOOR: UNAOS_PREFS_RESET=1 resets system.display.* to defaults at every login (the safe-mode boot knob; `[prefs] display reset=1 reason=knob`). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_PREFS_RESET:-}" ] && _feats="${_feats}prefs_reset,"
+# KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the Kepler copy-engine blitter under the compositor (video/blitter.rs; cpu is selected until KBLIT binds its channel, `[wc] blitter=cpu reason=…`). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.
+[ "${UNAOS_WC_BLITTER:-}" = "gpu" ] && _feats="${_feats}wc_gpublit,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
@@ -3516,6 +3518,11 @@ EOF
     return $rc
 }
 
+# PROFILE (rmbp-ledger B331, M2): the kernel's symbol table, written BESIDE the ELF the link step just produced
+# (address-sorted, demangled, one line per defined symbol) for `tools/flame` to resolve `prof dump` samples
+# against. The kernel embeds nothing; a missing llvm-nm warns and never fails the build.
+emit_kernel_syms() { "$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin/llvm-nm" -n -C --defined-only "$1" > "$2" 2>/dev/null && echo -e "${COLOR_GREEN}  • symbols: $2 ($(wc -l < "$2") lines)${COLOR_RESET}" || echo -e "${COLOR_YELLOW}  • symbols: llvm-nm failed on $1 — no $2 (prof dump stays unresolved)${COLOR_RESET}"; }
+
 build_kernel_x86_64() {
     echo -e "${COLOR_YELLOW}⚡ Building x86_64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"
@@ -3524,6 +3531,7 @@ build_kernel_x86_64() {
       $NIGHTLY_FLAGS $KERNEL_FEATURES
     cd "$WORKSPACE_DIR"
     gate_x86_rodata_no_code "${WORKSPACE_DIR}/target/x86_64-unaos/release/unaos-kernel"
+    emit_kernel_syms "${WORKSPACE_DIR}/target/x86_64-unaos/release/unaos-kernel" "${WORKSPACE_DIR}/target/kernel.syms"  # PROFILE M2
     # BANNER-ARTIFACT: beside the other post-build artifact gate, on the ELF cargo just wrote, with
     # the list THIS compile was handed (x86 keeps the full $KERNEL_FEATURES — the `arm_features`
     # strip is aarch64-only).
@@ -3598,6 +3606,7 @@ print("model=fixed span=%d cap=16384" % (hi - lo)); sys.exit(0 if hi - lo <= 163
 PY
 )" || { echo -e "${COLOR_RED}ERROR: ${lbl} does not fit its ring-3 window: ${out}${COLOR_RESET}"; exit 1; }
     echo -e "   ${lbl}: ${sz} B file, ${out}"
+    bash "${WORKSPACE_DIR}/scripts/elf-entry-check.sh" "$f" || { echo -e "${COLOR_RED}ERROR: ${lbl} cannot run at its entry (LUMENCRASH gate, scripts/elf-entry-check.sh)${COLOR_RESET}"; exit 1; }   # LUMENCRASH M4 (B326): a GOT load through a discarded .got, a dangling RIP-relative target, or a ring-0 instruction at entry is refused here, not as a #GP on metal
 }
 
 # WINX-5: build the x86_64 static ELF64 EL0 PERSISTENCE program (crates/user-stat → target/STAT-X86.ELF).
@@ -3747,8 +3756,8 @@ build_user_pulse_x86() {
 }
 
 # BANDY3 M3: build the x86_64 static ELF64 ring-3 FULFILLER (crates/user-prefs → target/PREFS-X86.ELF), staged
-# as APPS/PREFS.BIN by the builder. The exact shape of build_user_pulse_x86 above (same linker-script SHAPE, same
-# four assertions, same explicit --target). PREFS.BIN registers Principia's PrefGet/PrefList bus verbs and
+# as APPS/PREFS.ELF by the builder. The exact shape of build_user_pulse_x86 above (same linker-script SHAPE, same
+# four assertions, same explicit --target). PREFS.ELF registers Principia's PrefGet/PrefList bus verbs and
 # answers the requests the kernel relays to it (UNAOS_BUSREG=1; knob off it prints its refusal and exits).
 # LUMENBIN: this function was spelled `build_user_pulse_x86` — a second definition that SHADOWED the PULSE
 # builder above (bash keeps the last one) and left `build_user_prefs_x86` undefined, so every caller below
@@ -3774,58 +3783,31 @@ build_user_prefs_x86() {
     echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 Principia prefs fulfiller program: PREFS-X86.ELF (${psz} B)${COLOR_RESET}"
 }
 
-# VEINCORE (B304): build the x86_64 static ELF64 ring-3 CHAT FULFILLER (crates/user-vein → target/VEIN-X86.ELF),
-# staged as APPS/VEIN.BIN by the builder. The exact shape of build_user_prefs_x86 above. VEIN.BIN registers the
-# chat verbs 130..=133 and answers ChatSend through vein_core's Echo / Relay providers (UNAOS_VEIN=1).
-build_user_vein_x86() {
-    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
-    echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 Vein chat fulfiller static-ELF program (crates/user-vein → target/VEIN-X86.ELF)...${COLOR_RESET}"
-    mkdir -p "${WORKSPACE_DIR}/target"
-    cd "$WORKSPACE_DIR/crates/user-vein"
-    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-vein/user-vein-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
-      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
-    cd "$WORKSPACE_DIR"
-    "$TOOLBIN/llvm-objcopy" --strip-all \
-      "${WORKSPACE_DIR}/crates/user-vein/target/x86_64-unknown-none/release/user-vein" \
-      "${WORKSPACE_DIR}/target/VEIN-X86.ELF"
-    [ -s "${WORKSPACE_DIR}/target/VEIN-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: VEIN-X86.ELF missing/empty — x86 VEIN build failed${COLOR_RESET}"; exit 1; }
-    local fmag; fmag="$(head -c 4 "${WORKSPACE_DIR}/target/VEIN-X86.ELF" | od -An -tx1 | tr -d ' \n')"
-    [ "$fmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: VEIN-X86.ELF does not start with the ELF magic; first 4 bytes = ${fmag}${COLOR_RESET}"; exit 1; }
-    local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/VEIN-X86.ELF" | tr -d ' \n')"
-    [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: VEIN-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
-    local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/VEIN-X86.ELF" | tr -d ' ')"
-    [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: VEIN-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
-    echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 Vein chat fulfiller program: VEIN-X86.ELF (${psz} B)${COLOR_RESET}"
-}
-
-# LUMENBIN (B305): build the x86_64 static ELF64 ring-3 CHAT WINDOW (crates/user-lumen → target/LUMEN-X86.ELF),
-# staged as APPS/LUMEN.BIN by the builder. The exact shape of build_user_prefs_x86 above (same linker-script
-# SHAPE, same four assertions, same explicit --target). Built on every x86 media run like PREFS.BIN: the
-# image is inert until launched (`lumen` / `bg /apps/LUMEN.BIN`); UNAOS_LUMEN=1 adds the dock pin and the
-# `tests lumen` fixture. Its link script asserts the 16 KiB window's stack headroom itself.
+# LUMENAPP (B323, R82): build LUMEN.ELF — Lumen as ONE program that talks to the provider itself (crates/
+# user-lumen linking vein_core + vein_ring3: DNS, TCP, TLS 1.3, the Messages API). Linked at the ELF-window
+# VA (user-lumen-x86.ld, the user-big shape: no PHDRS, so lld fills PT_GNU_STACK from -z stack-size) — the
+# BIGAPPS relink RING3WIN owed for LUMEN. target/LUMEN-X86.ELF, staged by the builder as APPS/LUMEN.ELF.
+# Inert until launched (`lumen`); UNAOS_LUMEN=1 adds the dock pin and the `tests lumen` fixture.
 build_user_lumen_x86() {
     local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
-    echo -e "${COLOR_YELLOW}⚡ Building x86 EL0 Lumen chat window static-ELF program (crates/user-lumen → target/LUMEN-X86.ELF)...${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 Lumen app (crates/user-lumen → target/LUMEN-X86.ELF, ELF window)...${COLOR_RESET}"
     mkdir -p "${WORKSPACE_DIR}/target"
     cd "$WORKSPACE_DIR/crates/user-lumen"
-    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000" \
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
       cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
     cd "$WORKSPACE_DIR"
     "$TOOLBIN/llvm-objcopy" --strip-all \
       "${WORKSPACE_DIR}/crates/user-lumen/target/x86_64-unknown-none/release/user-lumen" \
       "${WORKSPACE_DIR}/target/LUMEN-X86.ELF"
     [ -s "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: LUMEN-X86.ELF missing/empty — x86 LUMEN build failed${COLOR_RESET}"; exit 1; }
-    local fmag; fmag="$(head -c 4 "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" | od -An -tx1 | tr -d ' \n')"
-    [ "$fmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: LUMEN-X86.ELF does not start with the ELF magic; first 4 bytes = ${fmag}${COLOR_RESET}"; exit 1; }
     local pmach; pmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" | tr -d ' \n')"
     [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: LUMEN-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
-    local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" | tr -d ' ')"
-    [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: LUMEN-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
-    echo -e "${COLOR_GREEN}✅ x86 static-ELF EL0 Lumen chat window program: LUMEN-X86.ELF (${psz} B)${COLOR_RESET}"
+    user_elf_window_check "${WORKSPACE_DIR}/target/LUMEN-X86.ELF" "LUMEN-X86.ELF"
+    echo -e "${COLOR_GREEN}✅ x86 ring-3 Lumen app: LUMEN-X86.ELF${COLOR_RESET}"
 }
 
 # NETRING3 M3 (B306): build the x86_64 static ELF64 ring-3 network client (crates/user-net → target/NET-X86.ELF),
-# staged as APPS/NET.BIN by the builder. The exact shape of build_user_prefs_x86 above. NET.BIN draws entropy,
+# staged as APPS/NET.ELF by the builder. The exact shape of build_user_prefs_x86 above. NET.ELF draws entropy,
 # resolves api.anthropic.com, connects :80 and prints the status line (UNAOS_NETRING3=1; knob off the two new
 # syscalls answer the unknown-syscall default and it says so in its verdict line).
 build_user_net_x86() {
@@ -3846,11 +3828,12 @@ build_user_net_x86() {
     [ "$pmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF e_machine is ${pmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
     local psz; psz="$(wc -c < "${WORKSPACE_DIR}/target/NET-X86.ELF" | tr -d ' ')"
     [ "$psz" -le 16384 ] || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF ${psz} bytes > the 16384-byte EL0 user window${COLOR_RESET}"; exit 1; }
+    bash "${WORKSPACE_DIR}/scripts/elf-entry-check.sh" "${WORKSPACE_DIR}/target/NET-X86.ELF" || { echo -e "${COLOR_RED}ERROR: NET-X86.ELF cannot run at its entry (LUMENCRASH gate)${COLOR_RESET}"; exit 1; }   # LUMENCRASH M4 (B326)
     echo -e "${COLOR_GREEN}✅ x86 static-ELF ring-3 network client program: NET-X86.ELF (${psz} B)${COLOR_RESET}"
 }
 
-# RING3WIN M4 (B316): build BIG.BIN — the ELF-window proof program (crates/user-big → target/BIG-X86.ELF),
-# staged as APPS/BIG.BIN by the builder; `tests ring3win` runs it. x86 only. Unlike its siblings it links at
+# RING3WIN M4 (B316): build BIG.ELF — the ELF-window proof program (crates/user-big → target/BIG-X86.ELF),
+# staged as APPS/BIG.ELF by the builder; `tests ring3win` runs it. x86 only. Unlike its siblings it links at
 # the ABSOLUTE ELF-window VA (crates/user-big/user-big-x86.ld, no PHDRS) and declares a 256 KiB stack with
 # `-z stack-size`, which lld writes into PT_GNU_STACK's p_memsz — the kernel's stack request.
 build_user_big_x86() {
@@ -3898,6 +3881,7 @@ build_kernel_aarch64() {
     # describes the aarch64 artifact, because `arm_features` above strips smolnet/kbdwit/deadman out
     # of every aarch64 compile while the banner still names them.
     banner_artifact_check "${WORKSPACE_DIR}/target/aarch64-unaos/release/unaos-kernel" "${_af#--features }" aarch64
+    emit_kernel_syms "${WORKSPACE_DIR}/target/aarch64-unaos/release/unaos-kernel" "${WORKSPACE_DIR}/target/kernel-aarch64.syms"  # PROFILE M2
     echo -e "${COLOR_GREEN}✅ aarch64 Kernel Built.${COLOR_RESET}"
 }
 
@@ -3908,10 +3892,9 @@ launch_x86_64() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
-    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
-    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     build_kernel_x86_64
 
     echo -e "${COLOR_CYAN}⚡ Launching x86_64 via Builder (kernel + bootloader + QEMU)...${COLOR_RESET}"
@@ -4877,10 +4860,9 @@ test_x86_64() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
-    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
-    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     build_kernel_x86_64
 
     # VPERF: UNAOS_QMP_SHOT=<png path> arms a QMP framebuffer screendump of the headless x86 run
@@ -5310,8 +5292,8 @@ test_x86_64() {
 #                  the dispatcher it calls. The STUB half — register constraints, clobber lists, and
 #                  the per-arch `cfg` blocks around them — is still hand-written per crate and is
 #                  still exactly what these legs exist to catch.
-#   user-lumen     BOTH type-checked (LUMENBIN). x86 media only (LUMEN-X86.ELF): on aarch64 the text passes 8 KiB,
-#                  the data page lands at 0x3000 and the crate's own link assert refuses the image.
+#   user-lumen     BOTH type-checked (LUMENBIN; LUMENAPP B323). x86 media only (LUMEN-X86.ELF, ELF window): the
+#                  aarch64 loader has no ELF window yet, and TLS (vein_ring3) is x86_64-only; aarch64 image owed.
 #
 # Fields (whitespace-separated; the 4th field runs to end-of-line):
 #   1 crate dir under crates/
@@ -5341,15 +5323,13 @@ USER_CHECK_MATRIX=(
   "user-pulse    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-prefs    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-prefs/user-prefs-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-big      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-big/user-big-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
-  "user-vein     x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-vein/user-vein-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
-  "user-lumen    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
+  "user-lumen    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-blob     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld"
   "user-elf      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-stat     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-vug      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-vug/user-vug.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-pulse    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-pulse/user-pulse.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
-  "user-vein     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-vein/user-vein.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-lumen    aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-lumen/user-lumen.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
 )
 
@@ -6604,7 +6584,7 @@ KERNEL_CFG_MATRIX=(
   # feature table, the board union, the unnamed-knob set, `x86_cfg_universe` and the derived mix-leg
   # count are all unchanged. Board legs +1 (40 -> 41, counted from the runner's own banner, not from
   # the prose figures above — those are older and were not re-derived here); gate +1.
-  "arm-tegra-supstate-el0-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,supstate,busreg,vein"
+  "arm-tegra-supstate-el0-desk ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,supstate,busreg"
 
   # GA10B-PROBE1 armed (appended 2026-08-25) — `ga10bprobe1` gates `arch/aarch64/ga10b_probe.rs` (the
   # whole first-probe-rung module) and its one appended call site in `tegra_early_stop`. Without a leg
@@ -8781,10 +8761,9 @@ esp_x86() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
-    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
-    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     cd "$WORKSPACE_DIR/builder"
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -8792,6 +8771,7 @@ esp_x86() {
     # itself), so the .rodata gate runs here too — on the STAGED image, which is the ELF the
     # firmware actually loads. A gate that only covers the QEMU path is not a gate on the boot media.
     gate_x86_rodata_no_code "${WORKSPACE_DIR}/target/x86_64_esp/kernel.elf"
+    emit_kernel_syms "${WORKSPACE_DIR}/target/x86_64_esp/kernel.elf" "${WORKSPACE_DIR}/target/kernel.syms"  # PROFILE M2: the staged ELF the firmware loads
     # BANNERCERT — the banner this run printed is now a CLAIM the artifact has to answer for.
     # `$_feats` is the very string the `⚡ kernel features:` line was composed from at script load
     # (top of file), so this asks the produced ELF whether it carries a certifying string for each
@@ -8842,10 +8822,9 @@ vm_image() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
-    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
-    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     cd "$WORKSPACE_DIR/builder"
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -8888,10 +8867,9 @@ fat_img() {
     build_user_stat_x86    # WINX-5: target/STAT-X86.ELF — staged as STAT.ELF for `run`/`bg`
     build_user_vug_x86     # WINX-7: target/VUG-X86.ELF — staged as VUG.ELF for `run`/`bg`
     build_user_pulse_x86   # PULSE-1: target/PULSE-X86.ELF — staged as PULSE.ELF for `run`/`bg`
-    build_user_vein_x86    # VEINCORE: target/VEIN-X86.ELF — staged as APPS/VEIN.BIN
-    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.BIN
-    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.BIN
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.BIN. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.BIN
+    build_user_lumen_x86   # LUMENBIN: target/LUMEN-X86.ELF — staged as APPS/LUMEN.ELF
+    build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
+    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
         esp_x86
@@ -11091,13 +11069,9 @@ kernel8() {
         K8_FEATS="${K8_FEATS},busreg"
         echo -e "${COLOR_YELLOW}  • UNAOS_BUSREG: BANDY3 fulfiller registration on the bus wire (register verb 127, registrable tags 128..=255, kernel relay; tests bandy3)${COLOR_RESET}"
     fi
-    if [ -n "${UNAOS_VEIN:-}" ]; then
-        K8_FEATS="${K8_FEATS},vein"
-        echo -e "${COLOR_YELLOW}  • UNAOS_VEIN: VEINCORE chat verbs 130..=133 owned by ring-3 VEIN.BIN (kernel relay plumbing: vein verb, tests vein)${COLOR_RESET}"
-    fi
     if [ -n "${UNAOS_LUMEN:-}" ]; then
         K8_FEATS="${K8_FEATS},lumen"
-        echo -e "${COLOR_YELLOW}  • UNAOS_LUMEN: LUMENBIN — the lumen dock pin in the default set (the Pi image carries no LUMEN.BIN yet: its aarch64 text exceeds the window; tests lumen is x86)${COLOR_RESET}"
+        echo -e "${COLOR_YELLOW}  • UNAOS_LUMEN: LUMENBIN — the lumen dock pin in the default set (the Pi image carries no LUMEN.ELF yet: its aarch64 text exceeds the window; tests lumen is x86)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_NETRING3:-}" ]; then
         K8_FEATS="${K8_FEATS},netring3"

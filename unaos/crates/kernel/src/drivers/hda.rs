@@ -1031,7 +1031,7 @@ fn take(bus: u8, slot: u8, func: u8, vend: u16, devid: u16, a: &mut Audit) -> Op
 /// firmware left running would keep DMAing across the reset window on some silicon), `CRST` is
 /// driven low and observed low, then driven high and observed high, and the specification's 521 µs
 /// codec-discovery window is waited out before `STATESTS` is read.
-fn reset(base: u64, a: &mut Audit) -> Option<u16> {
+fn reset(base: u64, a: &mut Audit) -> Option<u16> { #[cfg(feature = "hda-tone")] if let Some(s) = amp::warm(base) { return Some(s); } // AUDIO8 (B329) M1: while the speaker amp is HELD the link is not reset (a CRST is a codec reset: GPIO/pin/power drop = the pop); the stream is still reset per run by stream::rearm's SRST
     w8(base, REG_CORBCTL, 0);
     w8(base, REG_RIRBCTL, 0);
     a.ctrl += 2;
@@ -1744,8 +1744,8 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     let mut gpio_saved: Option<(u8, u8, u8, u8, u8)> = None;
     let mut gpio_final: u8 = 0; // HDATONE6: the GPIO data readback after the drive, for the witness
     let mut pin_actual = [0xFu8; PAIR_MAX]; // HDATONE6 M2: each member pin's ACTUAL power state after settle (+ fallback)
-    match afg {
-        None => serial_println!("[hda] gpio afg=none caps=0 -> none (no audio function group answered)"),
+    match afg.filter(|_| !amp::held()) { // AUDIO8 (B329) M1: the GPIO is driven only by the run that RAISES the amp; held runs skip the block
+        None => if amp::held() { gpio_final = amp::gpio_now(); } else { serial_println!("[hda] gpio afg=none caps=0 -> none (no audio function group answered)") },
         Some(fg) => {
             let caps = rings.cmd(cad, fg, VERB_GET_PARAMETER, PARAM_GPIO_COUNT, a).unwrap_or(0);
             a.verbs_get += 1;
@@ -1809,7 +1809,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     }
 
     // ── Save every register this run changes. ───────────────────────────────────────────────────
-    let saved_ctl = (r8(base, sd + SD_CTL) as u32) | ((r8(base, sd + SD_CTL + 1) as u32) << 8)
+    amp::note(rings, base, cad, &paths[..np], gpio_saved.take(), gpio_final, a); let saved_ctl = (r8(base, sd + SD_CTL) as u32) | ((r8(base, sd + SD_CTL + 1) as u32) << 8)
         | ((r8(base, sd + SD_CTL + 2) as u32) << 16);
     let saved_fmt_reg = r16(base, sd + SD_FMT);
     let saved_bdpl = r32(base, sd + SD_BDPL);
@@ -2062,7 +2062,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     );
 
     // ── RUN. ────────────────────────────────────────────────────────────────────────────────────
-    let lpib0 = r32(base, sd + SD_LPIB); #[cfg(feature = "hda-sie")] let sie_saved = sie_arm(base, iss, a); // HDASIE (B207): INTCTL.SIE[desc] set — and ONLY that bit; GIE/CIE stay as read — immediately before RUN, so the question B130 left (does SIE gate the SDnSTS.BCIS LATCH on the 7-series PCH the way RIRBCTL.RINTCTL gates RINTFL?) is answered by the `bcis=` this very run prints. Same-line, cfg-gated: knob-off bytes unchanged.
+    amp::ramp_prep(rings, cad, &paths[..np], a); let lpib0 = r32(base, sd + SD_LPIB); #[cfg(feature = "hda-sie")] let sie_saved = sie_arm(base, iss, a); // HDASIE (B207): INTCTL.SIE[desc] set — and ONLY that bit; GIE/CIE stay as read — immediately before RUN, so the question B130 left (does SIE gate the SDnSTS.BCIS LATCH on the 7-series PCH the way RIRBCTL.RINTCTL gates RINTFL?) is answered by the `bcis=` this very run prints. Same-line, cfg-gated: knob-off bytes unchanged.
     w8(base, sd + SD_CTL, SDCTL_IOCE as u8 | SDCTL_RUN as u8);
     a.stream += 1;
     let ctl_running = (r8(base, sd + SD_CTL) as u32)
@@ -2091,7 +2091,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
         }
     }
     serial_println!("[hda] run ctl={:#010x} readback={:#010x} run_bit={} reasserts={}", ctl_running, run_ctl, (run_ctl & SDCTL_RUN != 0) as u8, run_reasserts);
-    let t0 = crate::arch::now_cycles();
+    amp::ramp(rings, true, a); let t0 = crate::arch::now_cycles(); // AUDIO8 (B329) M2: the DAC out amp ramps 0 -> the rearm's gain over ~10 ms after RUN
     let mut stall_reasserts = 0u32;
     let mut bcis = 0u32;
     let mut lpib_max = lpib0;
@@ -2139,7 +2139,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     }
     let run_ms = elapsed_ms(t0);
     let lpib_end = r32(base, sd + SD_LPIB);
-    let sts_end = r8(base, sd + SD_STS);
+    let sts_end = r8(base, sd + SD_STS); amp::ramp(rings, false, a); // AUDIO8 (B329) M2: ramp down and mute BEFORE the stream stops
 
     // ── STOP, then restore every register this function changed. ────────────────────────────────
     w8(base, sd + SD_CTL, 0);
@@ -2163,7 +2163,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     w8(base, sd + SD_CTL, (saved_ctl & 0xFF) as u8 & !(SDCTL_RUN as u8));
     a.stream += 9; #[cfg(feature = "hda-sie")] sie_restore(base, iss, sie_saved, bcis, a); // HDASIE (B207): INTCTL back to the value read before the arm, with a readback, after the stream is stopped and reset — the mirror-order restore every other register on these lines gets.
 
-    for m in 0..np {
+    for m in 0..(if amp::held() { 0 } else { np }) { // AUDIO8 (B329) M1: no per-run codec restore while the amp is held (amp::shutdown restores the pins)
         let p = paths[m];
         if s[m].strm_ok && rings.cmd(cad, p.dac, VERB_SET_STREAM_CHANNEL, s[m].strm as u32, a).is_some() {
             a.verbs_set += 1;
@@ -2194,7 +2194,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
         }
     }
     // The GPIO set goes back in the mirror order of the drive: data, then direction, then enable.
-    eapd_restore(rings, cad, &paths, np, &eapd_before, a); if let Some((fg, mask, d0, dir0, en0)) = gpio_saved {
+    if !amp::held() { eapd_restore(rings, cad, &paths, np, &eapd_before, a); } if let Some((fg, mask, d0, dir0, en0)) = gpio_saved {
         if rings.cmd(cad, fg, VERB_SET_GPIO_DATA, d0 as u32, a).is_some() {
             a.verbs_set += 1;
         }
@@ -2254,7 +2254,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
         (run_ctl & SDCTL_RUN != 0) as u8, run_readback_ok as u8, if dac_d0 { "D0" } else { "D3" }, settled_max, gpio_final, (gpio_final >> 1) & 1, (gpio_final >> 3) & 1, pin_hex(pin_actual[0]), if np > 1 { pin_hex(pin_actual[1]) } else { '-' }, run_reasserts, stall_reasserts,
         disc.sdfmt, &disc.chan[..np], &disc.eapd[..np], disc.vendor >> 16, disc.vendor & 0xFFFF
     );
-    stream::verdict_tone(advanced); a.line("tone");
+    stream::verdict_tone(advanced); amp::amp_release(amp::TONE); amp::witness(); a.line("tone");
 }
 
 // ===================== BOOTSLOW (rmbp-ledger B201) — THE PROBE, AFTER THE ROOT =====================
@@ -2621,7 +2621,7 @@ pub mod powerdown {
     use core::sync::atomic::Ordering;
     /// Clear RUN on every stream descriptor (input then output engines) of the controller the volume path captured.
     /// `false` = no controller was captured (nothing to stop), never a failure.
-    pub fn stop() -> bool {
+    pub fn stop() -> bool { #[cfg(feature = "hda-tone")] amp::shutdown(); // AUDIO8 (B329): drop a held amp, restore the member pins — the only widget-path restore
         let base = vol::BASE.load(Ordering::Relaxed);
         if base == 0 { return false; }
         let gcap = r32(base, 0x00) & 0xFFFF;
@@ -2637,3 +2637,8 @@ pub mod powerdown {
 #[cfg(feature = "hda-tone")]
 #[path = "hda_stream.rs"]
 pub mod stream;
+// AUDIO8 (B329): the speaker amp as a HELD state (raised by the first play, dropped after an idle hold-off), the DAC
+// out-amp ramp, and the AUDIO8 witness. Tail statement, so no existing line moves.
+#[cfg(feature = "hda-tone")]
+#[path = "hda_amp.rs"]
+pub mod amp;

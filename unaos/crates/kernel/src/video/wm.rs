@@ -2673,7 +2673,7 @@ pub fn close(id: WinId) -> bool {
     // F4 — same barrier as `close_owner`: this row's surface may be under an in-flight blit.
     let barrier = DrainBarrier::drain();
     #[cfg(feature = "witness")]
-    serial_println!("[wc-a] close win={}", id);
+    crate::census_println!("[wc-a] close win={}", id);
     // WC-J — reclaim the closed window's own box AND every box the re-tile takes from a survivor.
     // `erase` above only covers the first; without the second, closing one of several windows leaves a
     // full copy of each survivor standing at its previous tile for the rest of the boot.
@@ -6444,7 +6444,7 @@ fn composite_inner() -> CursorTail {
     #[cfg(feature = "witness")]
     if drawn > 0 && !COMPOSITE_WITNESSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
         let live = rows.iter().filter(|r| r.used).count();
-        serial_println!("[wc-a] composite windows={} drawn={}", live, drawn);
+        crate::census_println!("[wc-a] composite windows={} drawn={}", live, drawn);
     }
     // WC-C — the SIDE-BY-SIDE witness. The arc's claim is "two user programs, two windows, both on the
     // panel at once"; a screenshot shows it to a human but proves nothing to a gate, and the per-window
@@ -7142,7 +7142,7 @@ fn verify_window(
         // the WINDOW, which is what a reader is asking. See the note in `WCD_ABORT_MAX`.
         let retry = aborts <= WCD_ABORT_MAX;
         let fst = if bad_cache > 0 || bad_ram > 0 { first } else { first_moved };
-        serial_println!(
+        crate::census_println!(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} rect={}x{}+{}+{} fills={}->{} fact={}/{} desk={}->{} dact={}/{} aborts={}/{} retry={} -> SKIP (teardown)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
@@ -7279,7 +7279,7 @@ fn verify_window(
         // rides this line even when the abort did not fire. ~~Two cfg'd emissions rather than a shim:
         // aarch64 has no interlock and its line must stay byte-identical to the pre-interlock wire.~~
         // DESKHALF — ONE emission now, both arches; the twin's slot is below.
-        serial_println!(
+        crate::census_println!(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} cksum_pre={:#018x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> LIVE (unverifiable)",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
@@ -7308,7 +7308,7 @@ fn verify_window(
         // routine red. Printing the reading keeps the verdict where the gates expect it and makes the
         // exposure visible.
         // DESKHALF — ONE emission now, both arches; the twin's slot is below.
-        serial_println!(
+        crate::census_println!(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache=0 bad_ram=0 ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=none fills={}->{} fact={}/{} desk={}->{} dact={}/{} stable={} -> PASS",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, yn(ram_indep), moved, sprite_px, nonzero,
@@ -7336,7 +7336,7 @@ fn verify_window(
         // the desktop layer from the line, which is the whole point of printing a term this witness
         // has deliberately declined to abort on.
         // DESKHALF — ONE emission, and THIS is the arm the port was for; see below.
-        serial_println!(
+        crate::census_println!(
             "[wc-d] verify win={} surf={}x{} band={} scale={}x at ({},{}) panel={}x{} checked={}{} bad_cache={} bad_ram={} ram_indep={} moved={} sprite_px={} nonzero={} occluded={} occ={}/{} cksum={:#018x} first=({},{}) got={:#08x} want={:#08x} fills={}->{} fact={}/{} desk={}->{} dact={}/{} -> FAIL",
             r.id, r.w, r.h, band, r.scale, r.x, r.y, info.width, info.height,
             checked, coverage, bad_cache, bad_ram, yn(ram_indep), moved, sprite_px, nonzero,
@@ -7831,7 +7831,7 @@ fn verify_reference(
     let info = fb.info();
     if r.surf == 0 || r.scale == 0 || r.stride < 4 || r.x >= info.width || r.y >= info.height {
         wcd_seal(i);
-        serial_println!("[wc-d] verify win={} -> SKIP (degenerate row/geometry)", r.id);
+        crate::census_println!("[wc-d] verify win={} -> SKIP (degenerate row/geometry)", r.id);
         return None;
     }
     // The same bounds `draw_window` blitted under — verify exactly what was drawn, never more.
@@ -7839,7 +7839,7 @@ fn verify_reference(
     let rows = (info.height - r.y).div_ceil(r.scale).min(r.h).min(r.surf_len / r.stride);
     if cols == 0 || rows == 0 {
         wcd_seal(i);
-        serial_println!("[wc-d] verify win={} -> SKIP (no visible content rect)", r.id);
+        crate::census_println!("[wc-d] verify win={} -> SKIP (no visible content rect)", r.id);
         return None;
     }
     // WC-D/PAYGO — the lattice COLLAPSES on a rect narrower than its own step, for the reason
@@ -7921,7 +7921,7 @@ fn verify_reference(
                 // the battery on the spot), so the bad counts are zero by construction; `moved`
                 // decides PASS against LIVE exactly as the closing chunk would have.
                 let mv = WCD_ACC_MOVED[i].load(Relaxed);
-                serial_println!(
+                crate::census_println!(
                     "[wc-d] verify win={} surf={}x{} band=none scale={}x at ({},{}) panel={}x{} checked={} coverage=shrunk bad_cache=0 bad_ram=0 ram_indep=no moved={} sprite_px={} nonzero={} occluded={} cksum={:#018x} first=none -> {}",
                     r.id, r.w, r.h, r.scale, r.x, r.y, info.width, info.height,
                     WCD_ACC_CHECKED[i].load(Relaxed), mv,
@@ -8002,7 +8002,7 @@ fn verify_reference(
     // restructuring — the owed-tail milestone's scope, not this one's.
     let mut want: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     if want.try_reserve_exact((row1 - row0) * cols).is_err() {
-        if wcd_oom_say(i) { serial_println!(
+        if wcd_oom_say(i) { crate::census_println!(
             "[wc-d] verify win={} -> SKIP (no memory for {}x{} source snapshot){}",
             r.id, cols, row1 - row0, WcdHeapNote
         ); } // WCDFLOOD (SO30) — ⚠ LINE-NEUTRAL rewrite, 4 lines in and 4 out. LATCHED per window id: the FIRST OOM skip a window takes speaks, every later one only COUNTS, into `[comp2] wcd_skips=`. The hand-back four lines down is correct and is kept — but it is also what turned this from "one line per window, ever" into one line per PASS, and render13 boot 1 put 46 161 copies of it on a 115 200-baud wire (68 B each = 3.14 MB = ~36 % of that boot's entire 767 s UART budget). A producer that outruns the UART fills the 64-slot staging ring (`serial_ring::SLOTS`), and the ring is drained IRQ-MASKED and INLINE by whichever core prints next — here, the compositing core itself, from inside the blit loop. That is the drag stall: see the WCDFLOOD block at this file's tail for the byte arithmetic and the wire that convicts it.
@@ -10521,7 +10521,7 @@ fn wcpar_emit(span: u64) {
     // fleet, not just how many. `max` names the busiest core's share — a fleet pinned to one core (the
     // pre-pool world, or a single-vug boot) reads `cores=1`, and a spread fleet reads its true width.
     let max = counts.iter().copied().max().unwrap_or(0);
-    serial_println!(
+    crate::census_println!(
         "[wcpar] cores={} total={} max={} c0={} c1={} c2={} c3={} c4={} c5={} c6={} c7={} span={}ms",
         cores,
         total,
@@ -12737,7 +12737,7 @@ fn note_cursor_tail(tail: CursorTail) {
         }
     };
     if CUR3_SAMPLED.fetch_add(1, Relaxed) < CUR3_SAMPLES {
-        serial_println!(
+        crate::bootlog_println!(
             "[cursor3] present tail={} offers={} taken={} -> {}",
             name,
             CUR3_OFFERS.load(Relaxed),
@@ -12796,7 +12796,7 @@ fn cursor3_rollup(scope: &str) {
     };
     let disjoint = CUR6_DECL_DISJOINT.load(Relaxed);
     let partial = CUR6_DECL_PARTIAL.load(Relaxed);
-    serial_println!(
+    crate::bootlog_println!(
         "[cursor3] rollup scope={} planned={} offers={} taken={} adopt={} repaint={} settle={} ensure={} straddle={} disjoint={} partial={} lock={} budget={} stale={} -> {}",
         scope, planned, offers, taken, adopt, repaint, settle, ensure, straddle, disjoint, partial,
         lock, budget, stale, verdict
@@ -13465,7 +13465,7 @@ fn comp2_emit(span: u64) {
             .saturating_mul(100)
             .saturating_div(span_us)
     };
-    serial_println!(
+    crate::census_println!(
         "[comp2] rollup passes={} pass_us={} max_us={} sprite_us={} wait_us={} blit_us={} compose_us={} present_us={} cache_us={} bytes_pp={} dmg_px_pp={} box_px_pp={} straddle_us={} wcd_us={} wcd_skips={} util_pct={} rate={}.{}/s span={}ms",
         passes,
         us(pass_cyc),
@@ -14373,7 +14373,7 @@ fn wcn_emit(scope: &str, span: u64, force: bool) {
         // the reader to discard good blocks.
         let qmin = wcn_frame_q(l.gap_min);
         let qmax = wcn_frame_q(l.gap_max);
-        serial_println!(
+        crate::census_println!(
             "[wcn] win={} asid={:#x} live={} above={} att={} comp={} hid={} bel={} rate={}.{}/s comp_rate={}.{}/s active={}ms parked={}ms gap={}..{}ms z={} pre={} drg={} dout={} dkpx={} drly={} q={}.{}..{}.{}",
             l.id,
             l.asid,
@@ -14597,7 +14597,7 @@ fn crispy_witness() {
         return;
     }
     use super::theme;
-    serial_println!(
+    crate::bootlog_println!(
         "[crispy] theme=us-crispy-modern@0787ba9f frame={} bevel={} title_h={} radius={} ctrl={} gap={} face={:#08x} keyline={:#08x} bevels={:#08x}/{:#08x} title_act={:#08x}->{:#08x} title_ina={:#08x}->{:#08x} ink={:#08x}/{:#08x} ctrls={:#08x}/{:#08x}/{:#08x} gloss_q16={}/{}/{} desktop={:#08x}",
         theme::FRAME,
         theme::BEVEL,
@@ -14626,7 +14626,7 @@ fn crispy_witness() {
     // The resolved title ramp's two ENDPOINT rows, computed by the interpolator that will draw
     // them — so the capture carries the gloss's effect and not only its inputs. Row 0 is the top
     // stop with the full gloss over it; row `TITLE_H-1` is the bottom stop with none.
-    serial_println!(
+    crate::bootlog_println!(
         "[crispy] ramp act row0={:#08x} rowN={:#08x} ina row0={:#08x} rowN={:#08x}",
         title_row_color(0, theme::TITLE_HEIGHT, true),
         title_row_color(theme::TITLE_HEIGHT - 1, theme::TITLE_HEIGHT, true),
@@ -15296,7 +15296,7 @@ fn controls_declined_drain() {
             .is_ok()
         {
             CTRL_DECL_SPOKE_AT[i].fetch_add(1, Relaxed);
-            serial_println!(
+            crate::bootlog_println!(
                 "[wm] controls-declined win={} owner={:#x} bw={} floor={}",
                 i,
                 CTRL_DECL_OWNER[i].load(Relaxed),
@@ -19527,7 +19527,7 @@ pub fn reserve_stage(info: &unaos_boot_info::FrameBufferInfo) -> usize {
     #[cfg(not(feature = "witness"))]
     let _ = (reserved, short);
     #[cfg(feature = "witness")]
-    serial_println!(
+    crate::bootlog_println!(
         "[wedge12] stage-reserve panel={}x{}x{} want={} got={} entries={} reserved={} short={} \
          secondary={} -> {}",
         info.width,
@@ -20067,7 +20067,7 @@ fn band_flush(id: u32) {
             let (bands, walked, used) =
                 (f[1].load(Relaxed), f[4].load(Relaxed), f[5].load(Relaxed));
             let a = cb_amp_x100(walked, used);
-            serial_println!(
+            crate::census_println!(
                 "[wc-b] win={} span={} bh={} bands={} chrome_paints={} chrome_rows={} chrome_rows_used={} amp={}.{:02}x -> {}",
                 id,
                 f[2].load(Relaxed),
@@ -20100,7 +20100,7 @@ fn band_flush(id: u32) {
     let (walked, used) = (CB_TOT_WALK.load(Relaxed), CB_TOT_USED.load(Relaxed));
     let a = cb_amp_x100(walked, used);
     let banded = CB_BANDED.load(Relaxed);
-    serial_println!(
+    crate::census_println!(
         "[wc-b] rollup presents={} banded={} maxbands={} chrome_rows={} chrome_rows_used={} amp={}.{:02}x -> {}",
         presents,
         banded,
@@ -20172,7 +20172,7 @@ fn chromeband_fixture(r: &Window, pw: usize, ph: usize) {
     // an exhausted heap declines instead of panicking from the compositor.
     let mut scratch: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     if scratch.try_reserve(need).is_err() {
-        serial_println!("[wc-b] fixture -> SKIP (scratch {} bytes unavailable)", need);
+        crate::census_println!("[wc-b] fixture -> SKIP (scratch {} bytes unavailable)", need);
         return;
     }
     scratch.resize(need, 0);
@@ -20201,7 +20201,7 @@ fn chromeband_fixture(r: &Window, pw: usize, ph: usize) {
     }
     let (walked, used) = chrome_rows_take();
     let a = cb_amp_x100(walked, used);
-    serial_println!(
+    crate::census_println!(
         "[wc-b] fixture geom={}x{} chunk_rows={} bands={} chrome_paints={} chrome_rows={} chrome_rows_used={} amp={}.{:02}x -> {}",
         FIX_BW, FIX_BH, chunk_rows, bands, bands, walked, used,
         a / 100, a % 100,
@@ -21222,7 +21222,7 @@ fn stage_window(
         // tear-free contract is unchanged — a span is as atomic as a row was. What changes is only
         // which bytes are published, and the bytes withheld are bytes the pass is about to overwrite
         // from the window that owns them.
-        comp_mark(r.id, 33); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let par = clip.n == 0 && super::wcpar::par_blit(fb, &stage[..rows * row_bytes], row_bytes, (by + band) * fb_row + bx * bpp, fb_row, rows); #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] let par = false;
+        comp_mark(r.id, 33); let par = clip.n == 0 && super::blitter::present_band(r.id, fb, &layer, bx, by + band, bw, rows); // KCOMP (B321) — the no-clip present goes through the selected blitter (CpuBlitter = WCPAR's par_blit, then the traced row loop it replaced); `par` false leaves the inline loop below to copy
         for y in 0..rows {
             let src = y * row_bytes;
             let py = by + band + y;
@@ -23690,7 +23690,7 @@ fn create_inner(
     #[cfg(feature = "witness")]
     if !compat {
         if let Some(i) = info(id) {
-            serial_println!(
+            crate::census_println!(
                 "[wc-a] create win={} asid={:#x} surf={}x{} stride={} scale={}x at ({},{}) z={}",
                 i.id, i.owner_asid, i.w, i.h, stride, i.scale, i.x, i.y, i.z
             );
@@ -24039,7 +24039,7 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         static LAST_TOP: AtomicUsize = AtomicUsize::new(usize::MAX);
         if wtop != 0 && LAST_TOP.swap(wtop, Relaxed) != wtop {
-            serial_println!(
+            crate::bootlog_println!(
                 "[wm] tile-top top={} usable_h={} cy0={} panel={}x{}",
                 wtop,
                 usable_h,
@@ -24214,13 +24214,13 @@ fn place(_created: WinId) -> (usize, [(usize, usize, usize, usize); MAX_WINDOWS]
         static LAST_SIG: AtomicUsize = AtomicUsize::new(0);
         if np > 0 && LAST_SIG.swap(sig, Relaxed) != sig {
             match alias {
-                None => serial_println!(
+                None => crate::bootlog_println!(
                     "[wm] tile-fit n={} panel={}x{} work={}+{} scale={} rows={} shrunk={} clamped={} alias=none -> DISTINCT",
                     np, pw, ph, wtop, usable_h, smax, flow_rows,
                     if cap == usize::MAX { "no" } else { "yes" },
                     clamped
                 ),
-                Some((a, b)) => serial_println!(
+                Some((a, b)) => crate::bootlog_println!(
                     "[wm] tile-fit n={} panel={}x{} work={}+{} scale={} rows={} shrunk={} clamped={} alias=win={}(asid={:#x})/win={}(asid={:#x}) at ({},{}) {}x{} -> ALIASED",
                     np, pw, ph, wtop, usable_h, smax, flow_rows,
                     if cap == usize::MAX { "no" } else { "yes" },
@@ -24417,7 +24417,7 @@ pub fn retile_on_ready() -> usize {
     // front of is the build with no witnesses, and this line only ever appears on a boot that
     // actually created a window before its panel — a fact worth having in every capture that has
     // it. Silent by construction on every other boot: the `n == 0` return above is above it.
-    serial_println!(
+    crate::bootlog_println!(
         "[wm] retile-on-ready panel={}x{} rows={} ids={:?} wxh_scale={:?} (0,0,0)=vanished",
         info.width,
         info.height,
@@ -26535,7 +26535,7 @@ fn winid_close_witness(
     {
         return;
     }
-    serial_println!(
+    crate::bootlog_println!(
         "[wm] close win={} gen={} route={} holders-cleared={} names={},{},{},{}",
         id,
         winid_gen(id),
@@ -26609,7 +26609,7 @@ fn winid_alloc_witness(id: WinId, generation: u32, owner: u64, title: &[u8], src
     if WINID_ALLOC_LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= WINID_LOG_MAX {
         return;
     }
-    serial_println!(
+    crate::bootlog_println!(
         "[wm] alloc win={} gen={} owner={:#x} title=\"{}\" from={}",
         id,
         generation,
@@ -27027,7 +27027,7 @@ fn close_scope_witness(win: WinId, owner: u64, next_focus: u64) {
             }
         }
     }
-    serial_println!(
+    crate::bootlog_println!(
         "[wm] close-scope win={} owner={:#x} next_focus={:#x} shell_z={} visible_after={:?} hidden_after={:?}",
         win,
         owner,
@@ -28184,7 +28184,7 @@ fn wcd_oom_say(i: usize) -> bool {
 /// `said=48 want_said=2 -> FAIL`, with 24 copies of the literal per `win=` on the wire. `-> FAIL` is in
 /// `arroyo`'s `FAULT_PATTERNS`, so the run reds on the text as well as on the verdict.
 #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wc"))]
-pub fn wcd_oom_latch_selftest() {
+pub fn wcd_oom_latch_selftest() { if crate::tests::defer("wcdlatch", wcd_oom_latch_selftest) { return; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests wcdlatch` fires it.
     use core::sync::atomic::Ordering::Relaxed;
     static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if DONE.swap(true, Relaxed) {
@@ -28201,7 +28201,7 @@ pub fn wcd_oom_latch_selftest() {
                 said += 1;
                 // The literal, character for character with `verify_reference`'s, so the wire tally
                 // in the doc block above is a tally of the SHIPPING line and not of a fixture's copy.
-                serial_println!(
+                crate::census_println!(
                     "[wc-d] verify win={} -> SKIP (no memory for {}x{} source snapshot)",
                     i,
                     8 * (n + 1),
@@ -28655,7 +28655,7 @@ fn serwire_emit(max_cyc: u64, span: u64, passes: u64) {
     // guarded: `max_us >= SERWIRE_ARM_US > 0` by the test above, so the divisor cannot be zero, and
     // the guard is kept anyway because a future threshold of 0 must not fault the compositor.
     let share_pct = drain_us.saturating_mul(100) / max_us.max(1);
-    serial_println!(
+    crate::census_println!(
         "[serwire] arm max_us={} span_ms={} passes={} drains={} drain_us={} drain_b={} maxdrain_us={} maxdrain_b={} cap_b={} share_pct={} -> {}",
         max_us,
         span,
@@ -28809,7 +28809,7 @@ fn blitwire_note(max_cyc: u64, passes: u64, loop_cyc: u64, wit_cyc: u64, wit_n: 
     let loop_us = super::wcg::cycles_to_us(loop_cyc);
     let wit_us = super::wcg::cycles_to_us(wit_cyc);
     let (net_us, raw_bus, net_bus, ok) = blitwire_calc(loop_us, wit_us, bytes);
-    serial_println!(
+    crate::census_println!(
         "[blitwire] arm max_us={} passes={} loop_us={} wit_us={} wit_n={} wcd_us={} wit_pct={} bytes={} raw_bus={} net_bus={} floor_bus={} -> {}",
         max_us,
         passes,
@@ -28840,7 +28840,7 @@ fn blitwire_note(max_cyc: u64, passes: u64, loop_cyc: u64, wit_cyc: u64, wit_n: 
 /// acquitting branch, and the whole point of the instrument is that only metal can say which of B
 /// and C the bracket actually reads.
 #[cfg(feature = "witness")]
-pub fn blitwire_selftest() {
+pub fn blitwire_selftest() { if crate::tests::defer("blitwire", blitwire_selftest) { return; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests blitwire` fires it.
     use core::sync::atomic::Ordering::Relaxed;
     static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if DONE.swap(true, Relaxed) {
@@ -28979,7 +28979,7 @@ fn wcd_skip_roll_one(i: usize) -> Option<u32> {
     if WCD_OOM_ROLLED[i].compare_exchange(r, p, AcqRel, Relaxed).is_err() {
         return None;
     }
-    serial_println!(
+    crate::census_println!(
         "[wc-d] skip-rollup win={} reason=no-memory passes={} since_ms={}",
         i,
         p,
@@ -29019,7 +29019,7 @@ fn wcd_skip_rollup() {
 /// per-pass print) and this reads `printed=16 rolled=0 … -> FAIL` on both ids, with 16 SKIP lines per
 /// id on the wire.
 #[cfg(all(target_arch = "x86_64", feature = "witness", feature = "wc"))]
-pub fn wcd_skip_latch_check() {
+pub fn wcd_skip_latch_check() { if crate::tests::defer("wcdskip", wcd_skip_latch_check) { return; } // QUIETBOOT2 (B325, R80): a boot fixture — `tests wcdskip` fires it.
     use core::sync::atomic::Ordering::Relaxed;
     static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if DONE.swap(true, Relaxed) {
@@ -29037,7 +29037,7 @@ pub fn wcd_skip_latch_check() {
             if wcd_oom_say(i) {
                 printed += 1;
                 // The shipping literal, character for character (`verify_reference`), as WCDLATCH does.
-                serial_println!(
+                crate::census_println!(
                     "[wc-d] verify win={} -> SKIP (no memory for {}x{} source snapshot)",
                     i,
                     8 * (n + 1),
@@ -29526,7 +29526,7 @@ fn wcd_heap_tick() {
     }
     let (lo, hi) = crate::allocator::heap_bounds();
     let c = crate::allocator::heap_census(0x1000);
-    serial_println!(
+    crate::census_println!(
         ":: HEAP: size={} used={} free={} largest={} -> PASS ::",
         hi.saturating_sub(lo), c.used, c.free, c.largest_run
     );
@@ -30059,3 +30059,26 @@ pub fn modal_top_held() -> bool {
     MODAL_WIN.load(core::sync::atomic::Ordering::Acquire) != WIN_NONE
 }
 
+
+/// KCOMP — one present row for `blitter::CpuBlitter`'s serial arm: the row gauge, then the traced blit —
+/// exactly the pair `stage_window`'s inline loop ran per row (WCSER-H / WEDGESRC keep naming the row).
+pub(super) fn kcomp_row(fb: &super::FrameBuffer, byte_offset: usize, src: &[u8], py: usize) {
+    comp_mark_row(py);
+    blit_traced(fb, byte_offset, src);
+}
+
+/// PROFILE M4 (rmbp-ledger B331) — the `[comp2]` split's raw counters for `prof top`'s three compositor
+/// rows: `[passes, loop_cyc, cache_cyc, compose_cyc, present_cyc]`. LOADS, never swaps: `comp2_emit`
+/// owns the drain, and `prof` reads a delta against its own baseline (falling back to the since-drain
+/// value when a rollup drained in between). `blit = loop - cache`, exactly as the rollup prints it.
+#[cfg(feature = "witness")]
+pub fn prof_comp2() -> [u64; 5] {
+    use core::sync::atomic::Ordering::Relaxed;
+    [
+        C2_PASSES.load(Relaxed),
+        C2_LOOP_CYC.load(Relaxed),
+        C2_CACHE_CYC.load(Relaxed),
+        C2_COMPOSE_CYC.load(Relaxed),
+        C2_PRESENT_CYC.load(Relaxed),
+    ]
+}

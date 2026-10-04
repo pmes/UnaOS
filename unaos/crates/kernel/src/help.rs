@@ -79,7 +79,6 @@ pub static DOCS: &[VerbDoc] = &[
     d("activity", "windows", "open the activity monitor window (q closes, k kills the selected process)", "activity", &["activity"]),
     d("settings", "windows", "open the settings window", "settings", &["settings"]),
     d("pref", "windows", "read or set a preference in Principia's store (<home>/.config/unaos/preferences.toml)", "pref get <ns.key> | pref set <ns.key> <value> | pref list [<ns>]", &["pref list system", "pref get system.display.brightness", "pref set system.display.idle_min 5"]),
-    d("vein", "system", "the chat verbs' relay: who owns them (VEIN.BIN), or hand VEIN.BIN a relay answer line", "vein [status] | vein rsp <conv> <seq> <0|1> <base64|->", &["vein status", "vein rsp 7 0 1 aGk="]), // VEINCORE (B304)
     d("shortcuts", "windows", "print the desktop keyboard shortcuts", "shortcuts", &["shortcuts"]),
     d("wallpaper", "windows", "set the desktop backdrop from a PNG (<= 4 MB), or `off` for the flat colour", "wallpaper <path.png> | wallpaper off", &["wallpaper /home/ann/SKY.PNG", "wallpaper off"]),
     d("screenshot", "windows", "capture the panel to SCREEN<n>.PNG at the volume root", "screenshot", &["screenshot"]),
@@ -139,7 +138,7 @@ pub static DOCS: &[VerbDoc] = &[
     d("play", "audio", "stream a WAV file to the sound device, or stop playback", "play <path.wav> | play stop", &["play /home/ann/TUNE.WAV", "play stop"]),
     // ── tests ──
     d("tests", "tests", "run the desktop test fixtures (all, one by name, or list them); refused until first-boot setup is done", "tests [name] | tests list", &["tests list", "tests helpdoc", "tests"]),
-    d("census", "tests", "start, stop or list the periodic samplers (all off at boot, R80)", "census list | census start <name>|all | census stop [<name>|all]", &["census list", "census start serial", "census stop"]),
+    d("census", "tests", "start, stop or list the periodic samplers (all off at boot, R80)", "census list | census start <name>|all | census stop [<name>|all]", &["census list", "census start serial", "census stop"]), d("prof", "tests", "the sampling profiler: arm it on the timer interrupt, then read where the time went (off at boot, R80)", "prof [status] | prof start [hz] | prof stop | prof top [n] | prof dump | prof sys | prof tasks", &["prof start", "prof stop", "prof top 20", "prof tasks"]),
     d("tste", "tests", "run the in-OS self-test suite: a PASS/FAIL/SKIP table", "tste", &["tste"]),
     d("selftest", "tests", "alias of tste", "selftest", &["selftest"]),
     // ── self-host ──
@@ -189,6 +188,7 @@ fn list(console: &mut Console) {
 }
 
 fn help_one(console: &mut Console, w: &str) {
+    if let Some(l) = midden_core::gated_off_line(w) { return console.println(&l); } // GATED-OFF (TESTFIX4, B330): the doc row stays, the build lacks the verb
     match find(&w.to_ascii_lowercase()) {
         Some(x) => print_text(console, &render(x)),
         None => console.println(&alloc::format!("help: no help for `{}` (try `help`)", w)),
@@ -197,6 +197,7 @@ fn help_one(console: &mut Console, w: &str) {
 
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn man_one(console: &mut Console, w: &str) {
+    if let Some(l) = midden_core::gated_off_line(w) { return console.println(&l); } // GATED-OFF (TESTFIX4, B330)
     match find(&w.to_ascii_lowercase()) {
         Some(x) => match crate::video::fileview::open_text(&alloc::format!("man:{}", x.name), &render(x)) {
             Ok(_) => console.println(&alloc::format!("man: {} - window open", x.name)),

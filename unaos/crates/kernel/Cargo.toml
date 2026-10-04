@@ -275,6 +275,10 @@ nvidia-kepler-kfunwedge = ["nvidia-kepler", "nvidia-kepler-fifo"]
 # builder/src/main.rs and scripts/banner-cert.sh; `x86-all` names the feature, which is what puts
 # the knob under `./arroyo check`'s KNOB→BUILDER WIRING CHECK.
 nvidia-kepler-vblank = ["nvidia-kepler", "beam"]
+# KVBLANK8 (rmbp-ledger B318): UNAOS_KVBLANK_TRACE=1 prints the whole vblank interrupt path at rung 3's arm, 100 ms
+# after the first ISR and at 2 s, plus a 1 s 60 Hz census and `:: KVBLANK8: lost_at=… ::`. The trace only; the
+# KVBLANK8 fix and `tests kvblank8` are unconditional under nvidia-kepler-vblank. OFF => the trace task is not compiled.
+kvblank_trace = ["nvidia-kepler-vblank"]
 # WC-X86: bring the window compositor (`video::wm`) up on the x86 panel path. Compiles
 # `video/desktop_uefi.rs` — the activation seam and the one kernel-drawn demo window — plus fbcon's
 # CONSOLE-WINDOW route (`panel_console_window_open`: the kernel console becomes an ordinary row in
@@ -3719,19 +3723,13 @@ ioapic = []
 # tags exactly as before and nothing of the router is compiled. Kept in sync with `unaos/arroyo` (the
 # x86 `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 busreg = []
-# LUMENBIN (rmbp-ledger B305): UNAOS_LUMEN=1 arms the Lumen chat window's desktop presence — the `lumen` dock
-# pin joins the DEFAULT pin set (video/dock.rs DP_ALL) — and the `tests lumen` fixture (crate::lumen; x86 +
-# `wc`: LUMEN.BIN driven with synthetic keys, its witness block read out of its slot). The program itself
-# (APPS/LUMEN.BIN, crates/user-lumen) and the `lumen` verb exist on every build. Kept in sync with
-# `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
-lumen = []
-
-# VEINCORE (rmbp-ledger B304; docs/dev/evidence/rmbp-1004/VEINCORE.md): UNAOS_VEIN=1 arms the CHAT verbs'
-# kernel side — relay plumbing only (the verbs are OWNED by ring 3: APPS/VEIN.BIN): `bus_route::inject`
-# reached from the `vein` shell verb (`vein rsp …`, the bench relay companion's answer line) and the
-# `tests vein` fixture. Implies `busreg`. Off: nothing of crate::vein_bus is compiled. Kept in sync with
-# `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
-vein = ["busreg"]
+# LUMENBIN (rmbp-ledger B305), reshaped by LUMENAPP (B323, R82): UNAOS_LUMEN=1 arms the Lumen app's desktop
+# presence — the `lumen` dock pin joins the DEFAULT pin set (video/dock.rs DP_ALL) — and the ring-3-free
+# `tests lumen` fixture (crate::lumen: LUMEN.ELF staged, accepted by the loader in the ELF-window model,
+# windowed app note; provider/key by vein_core's shared rule). The program itself (APPS/LUMEN.ELF,
+# crates/user-lumen, ONE program that talks to the provider) and the `lumen` verb exist on every build.
+# Kept in sync with `unaos/arroyo` (the `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
+lumen = ["dep:vein_core"]
 
 # NETRING3 (rmbp-ledger B306): UNAOS_NETRING3=1 arms ring-3 entropy and name resolution — `SYS_GETRANDOM`
 # (56, the SHA-256 DRBG on top of `rand.rs`, whose cfg and `hash`'s widen to this feature) and
@@ -3746,6 +3744,14 @@ netring3 = []
 # half (Shift held at Log In) needs no knob. Both arches. Kept in sync with `unaos/arroyo` (the x86
 # `_feats` arm and the `K8_FEATS` arm) and `unaos/builder/src/main.rs`.
 prefs_reset = []
+
+# KCOMP (rmbp-ledger B321; docs/dev/evidence/rmbp-1005/KCOMP.md): UNAOS_WC_BLITTER=gpu asks the compositor
+# for the Kepler copy-engine blitter (video/blitter.rs GpuBlitter). Until KBLIT binds its channel the probe
+# answers `kblit-channel-absent` and the CPU blitter is selected (`[wc] blitter=cpu reason=…` once at the
+# compositor ignition); any GPU blit error falls back to the CPU for that frame (`gpu_fallback=`). x86 only,
+# pairs with UNAOS_WC=1. Off: the probe answers `feature-off` and nothing else changes. Kept in sync with
+# `unaos/arroyo` (the x86 `_feats` arm) and `unaos/builder/src/main.rs`.
+wc_gpublit = []
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
@@ -3775,9 +3781,9 @@ midden_core = { path = "../../libs/sys/midden_core", default-features = false }
 # PREFS (rmbp-ledger B300): Principia's shared preference core — value model + TOML subset codec, the
 # same crate `handlers/principia` links. no_std + alloc, zero deps; arch-neutral.
 prefs_core = { path = "../../libs/sys/prefs_core" }
-# VEINCORE (B304): Vein's shared no_std core — the chat bus codec the `vein` shell verb and `tests vein`
-# use (the same crate VEIN.BIN and handlers/vein link). Zero deps; only reached under feature `vein`.
-vein_core = { path = "../../libs/sys/vein_core" }
+# LUMENAPP (B323): Vein's shared no_std core — `tests lumen` applies the SAME provider/key rule the ring-3
+# LUMEN.ELF applies (vein_core::prefs::plan). Zero deps; only under feature `lumen`.
+vein_core = { path = "../../libs/sys/vein_core", default-features = false, optional = true }
 # SELFINSTALL2 (rmbp-ledger B310): Amber Bytes' shared disk-layout core — GPT encode/decode, the partition
 # Plan, the FAT32 BPB, the clone plan — the same crate `tools/una-card` and `handlers/amber_bytes` link.
 # no_std + alloc, zero deps; arch-neutral (install/gpt.rs and install/fat32.rs are its kernel callers).
