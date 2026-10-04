@@ -1852,6 +1852,13 @@ fn stage_rollup(id: u32, i: usize, scope: &str, taken: u32) {
         STALL_PRESENT_US,
         verdict
     );
+    // KVBLANK8 M3 — the vblank ISR's delivery rate beside every rollup (`vbl_isr=60` = the interrupt paces; `vbl_src=`
+    // is the source the beam wait trusts). A line of its own so the rollup's arity is untouched.
+    #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-vblank"))]
+    {
+        let (r, src) = crate::drivers::gpu::kepler_vblank::vbl_isr_rate();
+        serial_println!("[wc-h] vbl win={} vbl_isr={} vbl_src={}", id, r, src);
+    }
     // Re-arm the refresh from AFTER the serial write, so `CENSUS_PERIOD_US` bounds the time this
     // instrument occupies the composite path and not merely the gap between line starts. All three
     // stores happen on every emission — including the two latched ones — so the first refresh is

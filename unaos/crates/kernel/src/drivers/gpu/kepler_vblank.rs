@@ -1867,6 +1867,7 @@ fn irq_source() -> bool {
     if SIM_MODE.load(Ordering::Relaxed) != 0 || !IRQ_KEPT.load(Ordering::Relaxed) || IRQ_DEMOTED.load(Ordering::Relaxed) {
         return false;
     }
+    if kv8_self_masked() { return false; } // KVBLANK8 M3: this core is the MSI's target with IF=0 — its own ISR cannot run.
     let last = ISR_LAST_CYC.load(Ordering::Relaxed);
     last != 0 && crate::arch::now_cycles().saturating_sub(last) <= us_to_cycles(3 * 16_667)
 }
@@ -2316,4 +2317,41 @@ fn kv8_isr_exit(bar0: usize, head: usize) {
             KV8_PMC_REARM_RB.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+// ── KVBLANK8 M3 — pacing on the ISR when it is live, and the rate the glass shows ─────────────────────────────────
+//
+// `beam::hold` runs IRQ-masked on the presenting core. When that core is also the MSI's destination, the ISR cannot run
+// until the hold returns, so an irq-trusting wait there could only give up — and ONE give-up demoted the source for the
+// whole boot (`IRQ_DEMOTED`). [`irq_source`] now refuses the ISR counter on exactly that core, so the caller's `counter()`
+// and the wait's `counter()` agree (same core, same IF) and the sampler serves it; every other core paces on the
+// ISR's event counter. `tests kvblank8` PASS clears the demotion and keeps the vector live.
+
+/// This core has interrupts masked AND is the cpu the MSI is addressed to.
+#[inline]
+fn kv8_self_masked() -> bool {
+    let d1 = KV8_DEST1.load(Ordering::Relaxed);
+    d1 != 0 && !x86_64::instructions::interrupts::are_enabled() && crate::arch::percpu::this_cpu().apic_id & 0xFF == d1 - 1
+}
+
+static KV8_RATE_MS: AtomicU64 = AtomicU64::new(0);
+static KV8_RATE_AT: AtomicU64 = AtomicU64::new(0);
+static KV8_RATE: AtomicU64 = AtomicU64::new(0);
+
+/// ISR deliveries per second, re-measured at most once a second, and the source the vblank wait trusts right now.
+/// For the `[wc-h] vbl` line beside each rollup.
+pub fn vbl_isr_rate() -> (u64, &'static str) {
+    let now = crate::arch::ms();
+    let last = KV8_RATE_MS.load(Ordering::Relaxed);
+    let dt = now.saturating_sub(last);
+    if last == 0 || dt >= 1_000 {
+        let c = IRQ_COUNT.load(Ordering::Relaxed);
+        let c0 = KV8_RATE_AT.swap(c, Ordering::Relaxed);
+        KV8_RATE_MS.store(now.max(1), Ordering::Relaxed);
+        if last != 0 {
+            KV8_RATE.store(c.saturating_sub(c0) * 1_000 / dt.max(1), Ordering::Relaxed);
+        }
+    }
+    let src = if IRQ_KEPT.load(Ordering::Relaxed) && !IRQ_DEMOTED.load(Ordering::Relaxed) && ISR_LAST_CYC.load(Ordering::Relaxed) != 0 { "irq" } else { "poll" };
+    (KV8_RATE.load(Ordering::Relaxed), src)
 }
