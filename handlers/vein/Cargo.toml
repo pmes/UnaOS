@@ -19,6 +19,9 @@ bandy = { path = "../../libs/bandy" }
 gneiss_pal = { path = "../../libs/gneiss_pal" }
 unafs = { path = "../../unaos/libs/fs/unafs" }
 elessar = { path = "../../libs/elessar" }
+# VEINCORE (B304): the shared no_std core — conversation model, pure context assembler, chat bus codec —
+# the SAME crate the ring-3 VEIN.BIN and the kernel link.
+vein_core = { path = "../../unaos/libs/sys/vein_core" }
 quartzite = { path = "../../libs/quartzite" }
 matrix = { path = "../../handlers/matrix" }
 # VEINPROV (B303): the provider choice is a preference — read from Principia's store, namespace `vein`.

@@ -166,8 +166,8 @@ pub fn frame_parse(frame: &[u8]) -> Result<BusHdr, BusDecodeErr> {
         return Err(BusDecodeErr::Truncated);
     }
     let status = i32::from_le_bytes([frame[12], frame[13], frame[14], frame[15]]);
-    if kind == BUS_KIND_REPLY && status != 0 && body_len != 0 {
-        return Err(BusDecodeErr::Malformed); // an error reply is its errno — never errno + bytes
+    if kind == BUS_KIND_REPLY && status != 0 && status != una_abi::BUS_STATUS_MORE && body_len != 0 {
+        return Err(BusDecodeErr::Malformed); // an error reply is its errno — never errno + bytes. VEINCORE: BUS_STATUS_MORE (+1, never an errno) is a non-final frame of a multi-frame answer and carries its body
     }
     let mut principal = [0u8; 32];
     principal.copy_from_slice(&frame[16..48]);

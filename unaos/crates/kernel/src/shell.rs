@@ -6163,7 +6163,7 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
         // neither cold-boot-ready nor honest. The console line goes out BEFORE each call because a
         // successful reset/off kills the machine mid-instruction — same last-line discipline as
         // `acpi_power::poweroff`.
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "battery" => { crate::video::powerui::shell_verb(console); } // POWERMENU M2
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] "battery" => { crate::video::powerui::shell_verb(console); } #[cfg(all(feature = "vein", any(feature = "aarch64_el0", target_arch = "x86_64")))] "vein" => { crate::vein_bus::shell_verb(console, &args); } // VEINCORE (B304): `vein status` / `vein rsp …` (the relay companion's answer line). POWERMENU M2
         "shutdown" | "off" => {
             console.println("shutting down: invoking the platform firmware mechanism...");
             crate::power::shutdown();

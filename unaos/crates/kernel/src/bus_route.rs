@@ -87,6 +87,9 @@ pub static REGISTERED: AtomicU32 = AtomicU32::new(0);
 pub static RELAYED: AtomicU32 = AtomicU32::new(0);
 pub static REPLIED: AtomicU32 = AtomicU32::new(0);
 pub static ORPHAN: AtomicU32 = AtomicU32::new(0);
+/// VEINCORE: non-final (BUS_STATUS_MORE) frames relayed, and kernel-injected requests.
+pub static MORE: AtomicU32 = AtomicU32::new(0);
+pub static INJECTED: AtomicU32 = AtomicU32::new(0);
 
 /// What the dispatcher does with a REQUEST after `route_request`.
 pub enum Route {
@@ -283,7 +286,7 @@ fn take_pending(pred: impl Fn(&Pend) -> bool) -> Option<Pend> {
 }
 
 fn deliver(ops: &Ops, p: &Pend, status: i32, body: &[u8]) -> bool {
-    let body: &[u8] = if status == 0 { body } else { &[] };
+    let body: &[u8] = if status == 0 || status == una_abi::BUS_STATUS_MORE { body } else { &[] };
     let mut frame = alloc::vec![0u8; crate::bus::BUS_HDR_LEN + body.len()];
     crate::bus::build_reply(p.verb, p.caller_corr, status, kernel_reply_principal(), body, &mut frame);
     (ops.push)(p.caller_row, frame.into_boxed_slice())
@@ -307,6 +310,15 @@ pub fn fulfiller_reply(ops: &Ops, row: usize, rgen: u64, hdr: &crate::bus::BusHd
     }
     if !(ops.has_room)(p.caller_row) {
         return EAGAIN; // pending kept — the fulfiller may retry
+    }
+    // VEINCORE (B304): the `more` flag. A BUS_STATUS_MORE frame is one non-final frame of a multi-frame
+    // answer: delivered WITH its body, the pending entry LEFT OPEN for the next; status 0 / an errno closes.
+    if hdr.status == una_abi::BUS_STATUS_MORE {
+        if !deliver(ops, &p, hdr.status, &frame[crate::bus::BUS_HDR_LEN..]) {
+            return EAGAIN;
+        }
+        MORE.fetch_add(1, Ordering::Relaxed);
+        return 0;
     }
     if take_pending(|q| q.relay == relay).is_none() {
         return ENOENT; // raced the fulfiller's own exit sweep
@@ -500,4 +512,53 @@ pub fn selftest(fx: &Fixture) {
     } else {
         serial_println!(":: BANDY3: registered={} relayed={} replied={} orphan={} w={:#05x}/{:#05x} verbs={}/{} -> FAIL ::", rg, rl, rp, or, w, ALL, vg, vl);
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// VEINCORE (rmbp-ledger B304): the kernel as a mailbox-less CALLER. The serial wire is the shell
+// (SERIALDOOR) and ring 3 has no console read, so a relay companion's answer arrives as a shell line
+// (`vein rsp …`) and the kernel hands it to the verb's fulfiller as a REQUEST: corr 0, principal = the
+// RESERVED KERNEL record (kind 4, the rest zero — a ring-3 caller is always stamped otherwise), no
+// pending entry (fire-and-forget: a reply to corr 0 finds no relay and is -ENOENT to the fulfiller).
+// Relay plumbing only — the kernel neither reads nor shapes the body.
+// ---------------------------------------------------------------------------------------------
+
+/// Whether a live ring-3 row owns `verb`.
+pub fn is_owned(ops: &Ops, verb: u8) -> bool {
+    lookup(ops, verb).is_some()
+}
+
+/// The live row owning `verb` (a fixture must never scratch over a running fulfiller's row).
+pub fn owner_row(ops: &Ops, verb: u8) -> Option<usize> {
+    lookup(ops, verb).map(|(row, _)| row)
+}
+
+/// Push `REQUEST(verb, corr 0, KERNEL principal, body)` into `verb`'s fulfiller's mailbox. 0, or
+/// `-EINVAL` (a kernel tag / an over-ceiling body), `-ENOENT` (unowned), `-EAGAIN` (mailbox full).
+pub fn inject(ops: &Ops, verb: u8, body: &[u8]) -> i64 {
+    if verb < BUS_VERB_FULFIL_MIN || body.len() > crate::bus::BUS_BODY_MAX {
+        return EINVAL;
+    }
+    let Some((row, _)) = lookup(ops, verb) else {
+        return ENOENT;
+    };
+    if !(ops.has_room)(row) {
+        return EAGAIN;
+    }
+    let mut frame = alloc::vec![0u8; crate::bus::BUS_HDR_LEN + body.len()];
+    let h = crate::bus::BusHdr {
+        kind: crate::bus::BUS_KIND_REQUEST,
+        verb,
+        corr: 0,
+        status: 0,
+        principal: kernel_reply_principal(),
+        body_len: body.len() as u32,
+    };
+    crate::bus::hdr_write(&h, &mut frame);
+    frame[crate::bus::BUS_HDR_LEN..].copy_from_slice(body);
+    if !(ops.push)(row, frame.into_boxed_slice()) {
+        return EAGAIN;
+    }
+    INJECTED.fetch_add(1, Ordering::Relaxed);
+    0
 }

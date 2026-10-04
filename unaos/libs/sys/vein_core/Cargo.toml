@@ -1,0 +1,16 @@
+[package]
+name = "vein_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Vein's shared core: the conversation model, the pure context assembler and the chat bus codec — shared by Ring 0, the ring-3 VEIN.BIN and the host Vein handler."
+
+# VEINCORE (rmbp-ledger B304, ROADMAP §3b): the midden_core / prefs_core shape. `#![no_std]`,
+# `#![forbid(unsafe_code)]`, NO dependencies. A member of the ROOT host workspace (handlers/vein links it),
+# a path dep of the kernel (feature `vein`) and of crates/user-vein (default-features = false: the wire
+# codec and the providers need no allocator; the conversation model and the assembler need `alloc`).
+[features]
+default = ["alloc"]
+alloc = []
+
+[dependencies]
