@@ -134,7 +134,7 @@ pub(super) fn to_play() {
 }
 
 /// A stream closed. The last close starts the idle hold-off.
-pub(super) fn release(who: u32) {
+pub(super) fn amp_release(who: u32) {
     let prev = OPEN.fetch_and(!who, Ordering::AcqRel);
     if prev & !who == 0 && prev & who != 0 {
         IDLE_SINCE.store(crate::arch::ms(), Ordering::Relaxed);

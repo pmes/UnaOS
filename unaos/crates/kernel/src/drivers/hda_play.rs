@@ -197,7 +197,7 @@ pub fn stop() {
         if s.armed { hw_stop(&mut s); }
         s.armed = false; s.running = false; s.done = true;
     }
-    super::amp::release(super::amp::PLAY); // AUDIO8 (B329): idempotent — a stop with nothing armed still closes the owner bit
+    super::amp::amp_release(super::amp::PLAY); // AUDIO8 (B329): idempotent — a stop with nothing armed still closes the owner bit
     ACTIVE.store(false, Ordering::Release);
     *WAV.lock() = None; // after the ST guard drops: wav_pump takes WAV then ST, so never the other order
 }
@@ -212,7 +212,7 @@ fn hw_stop(s: &mut St) {
     w8(b, sd + SD_CTL, 0);
     wait_us(10_000, || r8(b, sd + SD_CTL) & SDCTL_SRST as u8 == 0);
     w8(b, sd + SD_STS, SDSTS_BCIS | SDSTS_FIFOE | SDSTS_DESE);
-    super::amp::release(super::amp::PLAY); // AUDIO8 (B329) M1: the last close starts the amp's idle hold-off
+    super::amp::amp_release(super::amp::PLAY); // AUDIO8 (B329) M1: the last close starts the amp's idle hold-off
 }
 
 fn refill(s: &mut St, i: usize, prefill: bool) {

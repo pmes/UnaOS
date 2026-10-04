@@ -13,7 +13,7 @@
 //! question asked in advance at one site; nothing said WHERE the machine spends its time. This does:
 //! the timer interrupt both arches already take records, when armed, what it interrupted.
 //!
-//! * **Sampler (M1).** [`on_tick_x86`] (folded onto the x86 timer ISR's `note_tick()` line) and
+//! * **Sampler (M1).** [`sample_tick`] (folded onto the x86 timer ISR's `note_tick()` line) and
 //!   [`on_tick_arm`] (folded onto aarch64 `timer::on_tick`'s tail) record `(rip, task id, ring, cpu)`
 //!   into THIS CPU's ring of [`CAP`] samples every `div`-th tick. One writer per ring (the owning CPU,
 //!   interrupts masked), published through `LEN` with Release; a full ring counts `dropped` and never
@@ -123,7 +123,7 @@ fn record(rip: u64, ring: u8) {
 /// x86 timer ISR hook: `rip` of the interrupted context, `user` = it was ring 3.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-pub fn on_tick_x86(rip: u64, user: bool) {
+pub fn sample_tick(rip: u64, user: bool) {
     if ARMED.load(Relaxed) {
         record(rip, if user { 3 } else { 0 });
     }

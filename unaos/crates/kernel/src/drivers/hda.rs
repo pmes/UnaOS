@@ -2254,7 +2254,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
         (run_ctl & SDCTL_RUN != 0) as u8, run_readback_ok as u8, if dac_d0 { "D0" } else { "D3" }, settled_max, gpio_final, (gpio_final >> 1) & 1, (gpio_final >> 3) & 1, pin_hex(pin_actual[0]), if np > 1 { pin_hex(pin_actual[1]) } else { '-' }, run_reasserts, stall_reasserts,
         disc.sdfmt, &disc.chan[..np], &disc.eapd[..np], disc.vendor >> 16, disc.vendor & 0xFFFF
     );
-    stream::verdict_tone(advanced); amp::release(amp::TONE); amp::witness(); a.line("tone");
+    stream::verdict_tone(advanced); amp::amp_release(amp::TONE); amp::witness(); a.line("tone");
 }
 
 // ===================== BOOTSLOW (rmbp-ledger B201) — THE PROBE, AFTER THE ROOT =====================
