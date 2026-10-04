@@ -357,6 +357,8 @@ fn skipped_names() -> alloc::string::String {
     let mut s = alloc::string::String::new();
     for n in SKIPPED.lock().iter().flatten() { if !s.is_empty() { s.push(','); } s.push_str(n); }
     s
+}
+
 /// QUIETBOOT2 (B325, R80) — [`defer`] for a fixture that sits on a path the boot passes MANY times (a service
 /// pass, a paint): the caller's own `latch` makes every call after the first one relaxed swap, no table scan.
 /// Same answer as `defer`: `false` (run the body) under `tests-at-boot` or while `tests` is running it.
