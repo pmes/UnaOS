@@ -155,7 +155,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
     crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } #[cfg(all(feature = "vein", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static VN: AtomicBool = AtomicBool::new(false); if !VN.swap(true, Ordering::AcqRel) { register("vein", crate::arch::syscall::vein_selftest); } } ensure_attr(); // VEINCORE (B304): `tests vein`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
-    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
         static LDONE: AtomicBool = AtomicBool::new(false);
@@ -320,5 +320,13 @@ fn ensure_kvblank8() {
     {
         static DONE: AtomicBool = AtomicBool::new(false);
         if !DONE.swap(true, Ordering::AcqRel) { register("kvblank8", crate::drivers::gpu::kepler_vblank::kvblank8_selftest); }
+/// GEN7R8 (B320, R80): register `tests gen7` — the Ivy Bridge ladder's rung R8 (the BCS blit at the
+/// panel's geometry into scratch) — exactly once, on a `gen7r8` (`UNAOS_IVB3D_R8`) build. The boot only
+/// stashes R8's inputs at R7's tail; this fixture runs the rung and prints `:: GEN7R8: … ::`.
+fn ensure_gen7() {
+    #[cfg(all(target_arch = "x86_64", feature = "gen7r8"))]
+    {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, Ordering::AcqRel) { register("gen7", crate::drivers::gpu::gen7::r8_test); }
     }
 }
