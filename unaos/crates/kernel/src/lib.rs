@@ -272,3 +272,7 @@ pub mod lumen;
 // EXECNAME (rmbp-ledger B322): `tests exec`, the bare-name resolve + launch-note witness over the staged x86 programs. Tail statement, so no existing line moves.
 #[cfg(target_arch = "x86_64")]
 pub mod execname;
+// SELFDIAG (rmbp-ledger B324, R82): the boot log on disk (`bootwit`) and the diagnosis program's kernel half —
+// SYS_PATH_READ/WRITE fulfilment and `tests selfdiag` (`selfdiag`). Tail statements, so no existing line moves.
+#[cfg(feature = "selfdiag")]
+pub mod bootwit;

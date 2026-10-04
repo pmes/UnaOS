@@ -119,7 +119,7 @@ fn emit_src(args: fmt::Arguments, nl: bool, user: bool) {
         lb.n += 1;
     }
     let line = core::str::from_utf8(&lb.b[..lb.n]).unwrap_or("[serial] utf8?\n");
-    LINES.fetch_add(1, Relaxed); tag_note(&lb.b[..lb.n]); // QUIETBOOT M4: per-tag tally until the `:: BOOT:` line (same-line fold).
+    LINES.fetch_add(1, Relaxed); tag_note(&lb.b[..lb.n]); #[cfg(feature = "selfdiag")] crate::bootwit::note(&lb.b[..lb.n]); // SELFDIAG M1 (B324): the boot-log tap. QUIETBOOT M4: per-tag tally until the `:: BOOT:` line (same-line fold).
     if user { SRC_USER.fetch_add(1, Relaxed); } else { SRC_EMIT.fetch_add(1, Relaxed); }
 
     let masked = irq_masked();
