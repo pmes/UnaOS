@@ -26,3 +26,10 @@ preceded by `[winlist] show-desktop restore moved=<n>`; on a build without insta
 `:: TESTS: ran= pass= fail= failed=[…] skipped=[…] ::`; `HELPVERB … missing=[] … -> PASS`.
 
 Owed: metal `tests` on boot 21 confirms windowlist and helpdoc.
+
+## Legs (inline, from 4e48ab03 + M1..M3)
+- x86 metal shape (wc,…,installdemo,instgui,witness): `cargo +nightly check` exit 0.
+- x86 metal shape WITHOUT installdemo (and without `instgui`, which implies it): exit 0.
+- aarch64 `login,loginst,virt_el0` (user_blob.bin head 280080d2): exit 0.
+- `cargo test -p midden_core`: exit 0 (23 passed); `--features installdemo,login`: exit 0 (23 passed).
+- charter-check: exit 0.
