@@ -8995,7 +8995,7 @@ pub(crate) fn exec_resolve_display(word: &str) -> Option<String> {
 }
 
 /// QUIETBOOT2 (B325, R80): `tests x86bind` — the X86BIND root-binding fixture against the live mount table, settled.
-#[cfg(feature = "witness")]
+#[cfg(all(target_arch = "x86_64", feature = "witness"))]
 fn x86bind_test() {
     x86bind_witness(&vfs_mount_table(), true);
 }
