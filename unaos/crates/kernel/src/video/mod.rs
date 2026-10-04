@@ -1167,3 +1167,7 @@ pub mod powerui;
 // BRIGHTFLOOR (B312): THE one backlight writer — floor, gmux register, readback. Same gate as brightkeys.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod backlight;
+
+// KCOMP (B321): the compositor's one blitter interface — CpuBlitter (WCPAR inside) today, the Kepler
+// copy engine's GpuBlitter when KBLIT lands. Every compositing build; see the module head.
+pub mod blitter;

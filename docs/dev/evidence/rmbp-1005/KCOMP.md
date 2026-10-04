@@ -12,7 +12,7 @@ aperture, fanned over the APs by WCPAR. There was no interface under it: the cop
 
 **Seam.** `video/blitter.rs` — `trait Blitter { blit(&BlitJob) -> Result<Fence, BlitErr>; wait(Fence,
 timeout_us); name() }` over the compositor's own surface descriptor (`FrameBuffer` + where it lives:
-`Mem::Ram | Mem::Bar1`). `CpuBlitter` IS the code that ran before (WCPAR's `par_blit` band fan-out
+`Mem::Ram | Mem::Scanout` (Scanout = BAR1 on the rMBP)). `CpuBlitter` IS the code that ran before (WCPAR's `par_blit` band fan-out
 first, the per-row `blit_traced` loop when it declines). `GpuBlitter` is a stub returning
 `BlitErr::Unavailable`; the one function KBLIT fills is named below. FALLBACK: any `BlitErr` from
 the GPU blitter re-runs the job on the CPU blitter in the same frame and counts `gpu_fallback` —
@@ -76,5 +76,5 @@ and `GpuBlitter::wait` polls that fence (a semaphore release the CE writes after
 What the GPU path needs that the CPU path does not: the SOURCE in GPU-visible memory. The staging
 band is kernel heap; the CE reads it only through a sysmem mapping in the channel's VM (or windows
 compose straight into a VRAM band). That mapping is KBLIT's to establish; `Surface::mem` carries
-`Mem::Ram` vs `Mem::Bar1` so the GPU blitter can refuse (`BlitErr::Unsupported` → fallback) a
+`Mem::Ram` vs `Mem::Scanout` so the GPU blitter can refuse (`BlitErr::Unsupported` → fallback) a
 source it cannot address.

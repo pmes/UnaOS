@@ -172,3 +172,4 @@ UNAOS_NET4_RINGDUMP   ENV   option_env! at arch/aarch64/rtl8168_tegra.rs:2461 an
 UNAOS_NET4_BUF1   ENV   option_env! at arch/aarch64/rtl8168_tegra.rs:2947 and :3151 (the single-buffer RX classification arm of the same hunt); orin debugging knob set by hand, named by no verb
 UNAOS_NET4_DHCP_MS   ENV   option_env! at arch/aarch64/rtl8168_tegra.rs:5522 (the NET4 driver-DHCP wait in ms, parsed at build time); orin tuning knob set by hand, named by no verb
 UNAOS_LINUXABI   NA   --evidence: linuxabi lives only in arch/x86_64/linuxabi (x86 mod tree), 0 Pi-live; the Linux-compat layer is an x86 rung.
+UNAOS_WC_BLITTER   NA   --evidence: wc_gpublit 2 sites, 0 Pi-live — both are the two arms of `GpuBlitter::probe` in video/blitter.rs, each inside `all(target_arch = "x86_64", feature = "wc_gpublit")` (one negated: the `feature-off` answer every Pi build takes). The subject is the GK107 copy engine of a discrete NVIDIA part (KBLIT); a Pi 4 has none. KCOMP (B321).

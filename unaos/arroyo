@@ -1229,6 +1229,8 @@ fi
 [ -n "${UNAOS_NETRING3:-}" ] && _feats="${_feats}netring3,"
 # BRIGHTFLOOR: UNAOS_PREFS_RESET=1 resets system.display.* to defaults at every login (the safe-mode boot knob; `[prefs] display reset=1 reason=knob`). Both arches (the K8_FEATS arm is in kernel8()). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_PREFS_RESET:-}" ] && _feats="${_feats}prefs_reset,"
+# KCOMP (B321): UNAOS_WC_BLITTER=gpu asks for the Kepler copy-engine blitter under the compositor (video/blitter.rs; cpu is selected until KBLIT binds its channel, `[wc] blitter=cpu reason=…`). x86-only (the k8-reach NA row). Kept in sync with builder/src/main.rs.
+[ "${UNAOS_WC_BLITTER:-}" = "gpu" ] && _feats="${_feats}wc_gpublit,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"
