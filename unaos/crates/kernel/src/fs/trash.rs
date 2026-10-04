@@ -1,21 +1,38 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
+//! CHARTER: Matrix — kernel-by-ruling R50
+//!
 //! TRASH (R75) — a desktop Trash. `/home/<user>/.Trash/` is created on first use through the mount
 //! table under the user's namespace (DIRNS); `trash` MOVES an entry there with the same `rename`
-//! the shell's `mv` uses (LFNMV2; a collision appends `~1`, `~2`); `.Trash/.index` is a text file of
-//! `original-path<TAB>trashed-name<TAB>unix-time` lines (appended on trash, rewritten on restore/empty).
-//! Quarry's menu and the shell's `trash` verb call these same bodies. Each op prints
-//! `[trash] op=trash|restore|empty path= ok= reason=`.
+//! the shell's `mv` uses (LFNMV2; a collision appends `~1`, `~2`). Quarry's menu and the shell's
+//! `trash` verb call these same bodies.
+//!
+//! TRASHTIME (B308, audit B288/B294): WHAT a trashed object is depends on the volume, chosen in ONE
+//! function, [`store`]:
+//! * **attrs** — a volume with object ids (UnaFS): the object itself carries `una:trash-origin`
+//!   (the original absolute path), `una:trash-time` (unix seconds, Int) and `una:trash-by` (the
+//!   session user), key literals from `una-abi` (Matrix's host Finder stamps the same ones). The
+//!   rename into `.Trash/` is a rekey, so the inode id survives; the listing is
+//!   `query("una:trash-origin != \"\"")` scoped to the Trash's direct children; restore moves the
+//!   id's CURRENT path back (a renamed trashed item still restores); empty drops the keys with the
+//!   unlink. No index file is written.
+//! * **index** — the FAT FALLBACK (no attributes): `.Trash/.index`, one
+//!   `original-path<TAB>trashed-name<TAB>unix-time` line per item (appended on trash, rewritten on
+//!   restore/empty).
+//!
+//! Each op prints `[trash] store=attrs|index op=trash|restore|empty path= ok= reason=`.
 
-use crate::fs::vfs::{MountTable, NodeKind, KERNEL_PRINCIPAL};
+use crate::fs::vfs::{AttrValue, MountTable, NodeKind, KERNEL_PRINCIPAL};
 use alloc::string::String;
 use alloc::vec::Vec;
+use una_abi::{ATTR_KEY_TRASH_BY, ATTR_KEY_TRASH_ORIGIN, ATTR_KEY_TRASH_TIME, TRASH_DIR_NAME, TRASH_QUERY};
 
 const P: &str = KERNEL_PRINCIPAL;
 const INDEX: &str = ".index";
-const DIRNAME: &str = ".Trash";
+const DIRNAME: &str = TRASH_DIR_NAME;
 const MAX_TREE_DEPTH: usize = 6;
+const KEYS: [&str; 3] = [ATTR_KEY_TRASH_ORIGIN, ATTR_KEY_TRASH_TIME, ATTR_KEY_TRASH_BY];
 
 fn mt() -> MountTable {
     crate::shell::vfs_mount_table()
@@ -75,18 +92,48 @@ fn starts_ci(path: &str, prefix: &str) -> bool {
         && (path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/')
 }
 
-/// One index line.
+/// Where a trashed object's record lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Store {
+    /// On the object: `una:trash-*` attributes (a volume with object ids — UnaFS).
+    Attrs,
+    /// The FAT fallback: `.Trash/.index`.
+    Index,
+}
+
+impl Store {
+    pub fn name(self) -> &'static str {
+        match self {
+            Store::Attrs => "attrs",
+            Store::Index => "index",
+        }
+    }
+}
+
+/// THE one choice (TRASHTIME): attributes where the home volume gives objects an identity, else the
+/// `.index` fallback.
+pub fn store() -> Store {
+    match mt().stat(&home_base()) {
+        Ok(st) if st.id.is_some() => Store::Attrs,
+        _ => Store::Index,
+    }
+}
+
+/// One trashed item.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub orig: String,
     pub name: String,
     pub when: u64,
+    /// The object's inode id on an attribute store (`None` on the index fallback).
+    pub id: Option<u64>,
 }
 
 fn log(op: &str, path: &str, r: &Result<(), String>) {
+    let s = store().name();
     match r {
-        Ok(()) => serial_println!("[trash] op={} path={} ok=1 reason=-", op, path),
-        Err(e) => serial_println!("[trash] op={} path={} ok=0 reason={}", op, path, e),
+        Ok(()) => serial_println!("[trash] store={} op={} path={} ok=1 reason=-", s, op, path),
+        Err(e) => serial_println!("[trash] store={} op={} path={} ok=0 reason={}", s, op, path, e),
     }
 }
 
@@ -125,18 +172,44 @@ fn parse(text: &str) -> Vec<Entry> {
         let mut it = l.split('\t');
         if let (Some(o), Some(n), Some(w)) = (it.next(), it.next(), it.next()) {
             if !o.is_empty() && !n.is_empty() {
-                v.push(Entry { orig: String::from(o), name: String::from(n), when: w.trim().parse().unwrap_or(0) });
+                v.push(Entry { orig: String::from(o), name: String::from(n), when: w.trim().parse().unwrap_or(0), id: None });
             }
         }
     }
     v
 }
 
-/// The index, parsed. Empty when there is none.
+/// The attribute store's listing: the query, scoped to the direct children of this user's Trash.
+fn attr_entries(t: &MountTable) -> Vec<Entry> {
+    let td = trash_dir();
+    let mut v = Vec::new();
+    for (id, path) in t.query(TRASH_QUERY, P).unwrap_or_default() {
+        if !parent(&path).eq_ignore_ascii_case(&td) {
+            continue; // another user's Trash, or a stamped object moved out by hand
+        }
+        let orig = match t.get_attr(&path, ATTR_KEY_TRASH_ORIGIN, P) {
+            Ok(AttrValue::Str(s)) => s,
+            _ => continue,
+        };
+        let when = match t.get_attr(&path, ATTR_KEY_TRASH_TIME, P) {
+            Ok(AttrValue::Int(i)) if i > 0 => i as u64,
+            _ => 0,
+        };
+        v.push(Entry { orig, name: String::from(leaf(&path)), when, id: Some(id) });
+    }
+    v
+}
+
+/// What the Trash holds. Empty when there is nothing.
 pub fn entries() -> Vec<Entry> {
     let t = mt();
-    let b = read_all(&t, &index_path());
-    parse(core::str::from_utf8(&b).unwrap_or(""))
+    match store() {
+        Store::Attrs => attr_entries(&t),
+        Store::Index => {
+            let b = read_all(&t, &index_path());
+            parse(core::str::from_utf8(&b).unwrap_or(""))
+        }
+    }
 }
 
 /// How many items the Trash holds.
@@ -182,6 +255,21 @@ fn move_logged(t: &MountTable, src: &str, dst: &str) -> Result<(), String> {
     r.map_err(err_s)
 }
 
+/// Drop the three trash keys from the object at `path` (absent keys are not an error).
+fn strip_keys(t: &MountTable, path: &str) {
+    for k in KEYS {
+        let _ = t.remove_attr(path, k, P);
+    }
+}
+
+/// Stamp the three trash keys on the object at `path`.
+fn stamp_keys(t: &MountTable, path: &str, when: u64) -> Result<(), String> {
+    let by = session_user().unwrap_or_else(|| String::from(KERNEL_PRINCIPAL));
+    t.set_attr(path, ATTR_KEY_TRASH_ORIGIN, AttrValue::Str(String::from(path)), P).map_err(err_s)?;
+    t.set_attr(path, ATTR_KEY_TRASH_TIME, AttrValue::Int(when as i64), P).map_err(err_s)?;
+    t.set_attr(path, ATTR_KEY_TRASH_BY, AttrValue::Str(by), P).map_err(err_s)
+}
+
 /// Move `path` into the Trash. Returns the trashed name.
 pub fn trash(path: &str) -> Result<String, String> {
     let r = trash_inner(path);
@@ -219,11 +307,30 @@ fn trash_inner(path: &str) -> Result<String, String> {
         }
         name = alloc::format!("{}~{}", leaf(path), n);
     }
-    move_logged(&t, path, &join(&td, &name))?;
-    let e = Entry { orig: String::from(path), name: name.clone(), when: crate::clock::unix_now().unwrap_or(0) };
-    if let Err(why) = append_index(&t, &e) {
-        let _ = move_logged(&t, &join(&td, &name), path); // never leave an unindexed item
-        return Err(alloc::format!("index: {}", why));
+    let when = crate::clock::unix_now().unwrap_or(0);
+    let dst = join(&td, &name);
+    match store() {
+        Store::Attrs => {
+            // The record goes ON the object first, then the rekeying rename: a failure between the
+            // two leaves a stamped object outside the Trash, which the scoped query ignores and the
+            // strip below removes.
+            if let Err(why) = stamp_keys(&t, path, when) {
+                strip_keys(&t, path);
+                return Err(alloc::format!("attrs: {}", why));
+            }
+            if let Err(why) = move_logged(&t, path, &dst) {
+                strip_keys(&t, path);
+                return Err(why);
+            }
+        }
+        Store::Index => {
+            move_logged(&t, path, &dst)?;
+            let e = Entry { orig: String::from(path), name: name.clone(), when, id: None };
+            if let Err(why) = append_index(&t, &e) {
+                let _ = move_logged(&t, &dst, path); // never leave an unindexed item
+                return Err(alloc::format!("index: {}", why));
+            }
+        }
     }
     Ok(name)
 }
@@ -248,9 +355,22 @@ fn restore_inner(name: &str) -> Result<String, String> {
     if t.stat(&orig).is_ok() {
         return Err(alloc::format!("{} already exists", orig));
     }
-    move_logged(&t, &join(&trash_dir(), &es[i].name), &orig)?;
-    es.remove(i);
-    write_index(&t, &es)?;
+    match es[i].id {
+        Some(id) => {
+            // The id's CURRENT path, from the query that just named it (renamed items included).
+            let cur = join(&trash_dir(), &es[i].name);
+            if t.stat(&cur).ok().and_then(|s| s.id) != Some(id) {
+                return Err(String::from("trashed object moved"));
+            }
+            move_logged(&t, &cur, &orig)?;
+            strip_keys(&t, &orig);
+        }
+        None => {
+            move_logged(&t, &join(&trash_dir(), &es[i].name), &orig)?;
+            es.remove(i);
+            write_index(&t, &es)?;
+        }
+    }
     Ok(orig)
 }
 
@@ -284,15 +404,22 @@ fn empty_inner(td: &str) -> Result<usize, String> {
     if t.stat(td).is_err() {
         return Ok(0);
     }
+    let s = store();
     let mut n = 0usize;
     for e in t.read_dir(td).map_err(err_s)? {
         if e.name == "." || e.name == ".." || e.name.eq_ignore_ascii_case(INDEX) {
             continue;
         }
-        delete_tree(&t, &join(td, &e.name), 0)?;
+        let p = join(td, &e.name);
+        if s == Store::Attrs {
+            strip_keys(&t, &p); // the keys leave the attribute index with the object
+        }
+        delete_tree(&t, &p, 0)?;
         n += 1;
     }
-    write_index(&t, &[])?;
+    if s == Store::Index {
+        write_index(&t, &[])?;
+    }
     Ok(n)
 }
 
@@ -305,7 +432,7 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
             for e in &es {
                 console.println(&alloc::format!("{}  <- {}  @{}", e.name, e.orig, e.when));
             }
-            console.println(&alloc::format!("{} item(s) in {}", es.len(), trash_dir()));
+            console.println(&alloc::format!("{} item(s) in {} (store={})", es.len(), trash_dir(), store().name()));
         }
         Some("restore") => match args.get(1) {
             Some(n) => match restore(n) {
@@ -332,8 +459,10 @@ fn listed(t: &MountTable, dir: &str, name: &str) -> bool {
     t.read_dir(dir).map(|v| v.iter().any(|e| e.name.eq_ignore_ascii_case(name))).unwrap_or(false)
 }
 
-/// `:: TRASH: trashed= restored= emptied= index_ok= -> PASS ::` — create a scratch file under home,
-/// trash it, restore it, trash it again, empty; the listing (and the index) is verified at each step.
+/// `:: TRASH: store=<attrs|index> trashed= restored= emptied= query_ok= -> PASS ::` — create a
+/// scratch file under home, trash it, (attrs: rename it inside the Trash,) restore it, trash it
+/// again, empty; the listing and the store (the query by inode id, or the `.index`) are verified at
+/// each step. Runs the UNAFSTIME fixture first (same home, same registration).
 pub fn selftest() {
     let t = mt();
     let base = home_base();
@@ -341,30 +470,56 @@ pub fn selftest() {
         serial_println!(":: TRASH: base={} reason=no-home -> SKIP ::", base);
         return;
     }
+    crate::fs::unafstime::selftest(&base);
+    let s = store();
     let td = trash_dir();
     let name = "TRASHFX.TXT";
+    let moved = "TRASHFX2.TXT";
     let path = join(&base, name);
     let _ = empty(); // a clean slate (also creates nothing when absent)
     if t.stat(&path).is_ok() {
         let _ = t.unlink(&path, P);
     }
     let _ = t.create(&path, NodeKind::File, P).and_then(|_| t.write(&path, 0, b"trash me", P));
-    let (mut trashed, mut restored, mut emptied, mut index_ok) = (0u32, 0u32, 0u32, 0u32);
+    let id0 = t.stat(&path).ok().and_then(|st| st.id);
+    let (mut trashed, mut restored, mut emptied, mut query_ok) = (0u32, 0u32, 0u32, 0u32);
     // trash
-    let tn = trash(&path);
+    let mut tn = trash(&path);
     if let Ok(n) = &tn {
         let es = entries();
-        if !listed(&t, &base, name) && listed(&t, &td, n) && es.len() == 1 && es[0].orig == path && es[0].name == *n {
+        let shape = !listed(&t, &base, name) && listed(&t, &td, n) && es.len() == 1 && es[0].orig == path && es[0].name == *n;
+        let store_ok = match s {
+            // found by the query, as the SAME object, and no index file written
+            Store::Attrs => es.first().and_then(|e| e.id) == id0 && id0.is_some() && t.stat(&index_path()).is_err(),
+            Store::Index => true,
+        };
+        if shape && store_ok {
             trashed += 1;
-            index_ok += 1;
+            query_ok += 1;
+        }
+    }
+    // attrs: a rename INSIDE the Trash keeps the object restorable (identity, not name)
+    if s == Store::Attrs {
+        if let Ok(n) = &tn {
+            let ok = t.rename(&join(&td, n), &join(&td, moved), P).is_ok()
+                && entries().iter().any(|e| e.name.eq_ignore_ascii_case(moved) && e.id == id0);
+            if ok {
+                tn = Ok(String::from(moved));
+            } else {
+                query_ok = 0;
+            }
         }
     }
     // restore
     if let Ok(n) = &tn {
         let rs = restore(n);
-        if rs.is_ok() && listed(&t, &base, name) && !listed(&t, &td, n) && entries().is_empty() && t.read(&path, 0, 16).map(|b| b == b"trash me").unwrap_or(false) {
+        let back = rs.is_ok() && listed(&t, &base, name) && !listed(&t, &td, n) && entries().is_empty() && t.read(&path, 0, 16).map(|b| b == b"trash me").unwrap_or(false);
+        let same = match s {
+            Store::Attrs => t.stat(&path).ok().and_then(|st| st.id) == id0 && t.get_attr(&path, ATTR_KEY_TRASH_ORIGIN, P).is_err(),
+            Store::Index => true,
+        };
+        if back && same {
             restored += 1;
-            index_ok += 1;
         }
     }
     // trash again, then empty
@@ -376,7 +531,7 @@ pub fn selftest() {
     if let (Ok(n), Ok(n2)) = (&em, &tn2) {
         if *n == 1 && !listed(&t, &td, n2) && !listed(&t, &base, name) && count() == 0 {
             emptied += 1;
-            index_ok += 1;
+            query_ok += 1;
         }
     }
     // a collision gets ~1
@@ -386,6 +541,16 @@ pub fn selftest() {
     let c2 = trash(&path);
     let coll = matches!((&c1, &c2), (Ok(a), Ok(b)) if a != b && b.ends_with("~1"));
     let _ = empty();
-    let pass = trashed == 2 && restored == 1 && emptied == 1 && index_ok == 3 && coll;
-    serial_println!(":: TRASH: trashed={} restored={} emptied={} index_ok={} -> {} ::", trashed, restored, emptied, index_ok, if pass { "PASS" } else { "FAIL" });
+    let none_left = match s {
+        Store::Attrs => !t.query(TRASH_QUERY, P).unwrap_or_default().iter().any(|(_, p)| parent(p).eq_ignore_ascii_case(&td)),
+        Store::Index => count() == 0,
+    };
+    if none_left {
+        query_ok += 1;
+    }
+    let pass = trashed == 2 && restored == 1 && emptied == 1 && query_ok == 3 && coll;
+    serial_println!(
+        ":: TRASH: store={} trashed={} restored={} emptied={} query_ok={} -> {} ::",
+        s.name(), trashed, restored, emptied, query_ok, if pass { "PASS" } else { "FAIL" }
+    );
 }
