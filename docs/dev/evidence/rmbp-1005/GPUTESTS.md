@@ -69,3 +69,14 @@ Boot: no `:: gen7:` line, no `vblank-intr vector` line (unless `UNAOS_KVBLANK_TR
 - The compositor's "first need" does not arm rung 3; it paces on the poll source until `tests kvblank8`.
 - KBLIT's identity page table still indexes PT entries from the window's first page, not from the PDE's
   VA origin ([EXT-UNPINNED], as KBLIT wrote it); a metal `advanced=1` is what tests it.
+
+## Results (at bda22d69, legs run inline from `unaos/crates/kernel`, target/ removed after each)
+
+- x86 metal shape + every GPU feature (`…,nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,
+  nvidia-kepler-ce,kvblank_trace,wc_gpublit,intel-ivb,unaos_ivb,gen7,gen7r8`): `cargo check` exit 0.
+  No new warning in a touched file (the `kepler_ce` `M_*` constants and `igpu` `gtt_offset` predate the arc).
+- x86 metal shape alone: exit 0.
+- aarch64 login shape (`login,loginst,virt_el0`, user blob head `28 00 80 d2`): exit 0; the same plus
+  `nvidia-kepler-ce,wc_gpublit`: exit 0 with no `kepler_ce` diagnostic (the module is not lexed).
+- `knob-parity.sh` 0 · `k8-reach.py` 0 (`UNAOS_TZ_MIN` deferred, a cross-branch row) ·
+  `fixture-reachable.sh` 0 · `knob-hygiene.sh` 0 · `charter-check.sh` 0.
