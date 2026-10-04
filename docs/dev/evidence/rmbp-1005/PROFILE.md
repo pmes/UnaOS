@@ -65,3 +65,25 @@ Real stacks (frame-pointer walk; depth 1 today); task NAMES in `prof tasks` (ids
 safe cross-core tid->name lookup); ring-3 symbolization (ring-3 samples are counted, their RIPs are user
 addresses `tools/flame` reports as `[ring3]`); `SYS_PROF` for ring 3; linuxabi syscalls are not timed
 (they return before the hook).
+
+## Status (executor, 2026-10-04)
+
+M1..M4 committed on `exec-rmbp-profile`. Compile legs (inline, `cargo +nightly check --release`): x86 metal
+shape exit 0, aarch64 `login,loginst,virt_el0` exit 0, plus aarch64 `+witness` and x86 knob-off exit 0;
+`cargo test -p midden_core` exit 0; `python3 tools/flame --self-test` exit 0; the arroyo syms line run on a
+linked metal-shape ELF wrote 9406 lines with `unaos_prof_anchor` present (link base 0: the kernel is PIE).
+GATE-VERBS 100/100, GATE-KNOB OK (no new feature), GATE-LINENEUTRAL moved-above-panic=0, charter-check 0.
+
+The wire a metal run should print (`tests prof`, then `prof top 5`, `prof dump`):
+
+    :: TESTS: run prof ::
+    [prof] test top_pct=<p>% cpu=0 cpu_samples=<~1000> in_load=<~1000> load=0x... anchor=0x... span_ms=<~1000> cpus_sampled=<n>
+    :: PROFILE: hz=1000 samples=<n> dropped=0 top=0x... -> PASS ::
+    [prof] summary armed=no hz=1000 samples=<n> dropped=0 span_ms=<~1000> cap=4096 anchor=0x...
+    [prof] top rank=1 samples=<n> pct=<p>% ring=0 bucket=0x... anchor-0x...
+    [prof] top row=wc:present mean_us=<n> passes=<n> src=window
+    [prof] top row=wc:compose mean_us=<n> passes=<n> src=window
+    [prof] top row=wc:blit mean_us=<n> passes=<n> src=window
+    [prof] cpu=<c> task=<tid> ring=<0|3> rip=0x...   (x samples, then `[prof] dump end samples=<n>`)
+
+Host side: capture the serial log, then `tools/flame <log> --syms unaos/target/kernel.syms --svg prof.svg`.
